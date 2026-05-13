@@ -74,6 +74,9 @@ COMMIT-LIST.md
 *.db-wal
 config.json
 
+# ===== GitHub Actions (macOS CI not yet ready) =====
+.github/
+
 # ===== OS =====
 .DS_Store
 Thumbs.db
