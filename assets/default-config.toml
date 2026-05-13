@@ -1,0 +1,42 @@
+# 飞音语音输入 · 默认配置文件
+# 首次安装时自动复制到 %APPDATA%\voice-ime\config.toml
+# 修改配置请使用程序内置设置界面
+
+ui_language = "Chinese"
+auto_learn_threshold = 2
+auto_start = false
+
+[llm]
+api_url = ""
+api_key = ""
+model = ""
+system_prompt = ""
+enabled = false
+connectivity_verified = false
+
+[hotkey]
+vk_code = 120
+modifiers = 0
+display_name = "F9"
+mode = "Toggle"
+
+[audio]
+silence_threshold = 0.01
+transcription_language = "zh"
+chinese_script = "Simplified"
+overlay_opacity = 1.0
+input_device = ""
+enable_streaming = true
+
+[injection]
+use_clipboard = true
+clipboard_delay_ms = 150
+
+[translation]
+enabled = false
+vk_code = 163
+display_name = "Right Ctrl"
+target_language = "English"
+
+[punctuation]
+enabled = true

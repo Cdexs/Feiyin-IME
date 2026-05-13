@@ -1,0 +1,3 @@
+[env]
+# sherpa-onnx 预编译库路径 (shared-MD 版本)
+SHERPA_ONNX_LIB_DIR = "D:\\Workspace\\CodeLab\\voice-ime\\vendor\\sherpa-onnx\\sherpa-onnx-v1.12.38-win-x64-shared-MD-Release\\lib"

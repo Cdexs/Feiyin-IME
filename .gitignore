@@ -1,0 +1,80 @@
+# ===== Build artifacts =====
+/target
+/src-tauri/target
+/poc/target
+patches/**/target/
+vendor/**/target/
+
+# ===== Frontend build =====
+/dist
+/ui/dist
+/ui/node_modules
+node_modules
+
+# ===== AI models (too large for git) =====
+/models
+
+# ===== Runtime DLLs =====
+/sherpa-onnx-lib
+
+# ===== Large vendor binaries =====
+/vendor/sherpa-onnx/*-Release.tar.bz2
+/vendor/sherpa-onnx/*-Release/
+/vendor/whisper-rs-sys/
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+
+# ===== AI agent configs (internal) =====
+/collab
+/logs
+/tasks
+/.claude
+/memory
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+QWEN.md
+/.codex
+/.qwen
+
+# ===== Design draft icons =====
+src-tauri/icons/preview-*.png
+src-tauri/icons/preview2-*.png
+src-tauri/icons/icon-new.png
+src-tauri/icons/icon-source.png
+src-tauri/icons/icon-v2.png
+src-tauri/icons/icon-v3.png
+src-tauri/icons/icon-final.png
+src-tauri/icons/tray-source.png
+ui/public/icons/icon-source.png
+ui/public/icons/tray-source.png
+
+# ===== Publish directory (large binaries, not for git) =====
+/Publish/*
+!/Publish/.gitkeep
+
+# ===== Miscellaneous =====
+nul
+src/main*副本*.rs
+tests/录音.m4a
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+/poc
+COMMIT-LIST.md
+
+# ===== User app data =====
+*.db
+*.db-shm
+*.db-wal
+config.json
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini

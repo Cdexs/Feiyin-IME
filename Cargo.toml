@@ -1,0 +1,124 @@
+[package]
+name = "voice-ime"
+version = "0.5.3"
+edition = "2021"
+
+[[bin]]
+name = "voice-ime"
+path = "src/main.rs"
+
+[[bin]]
+name = "crash-reporter"
+path = "src/bin/crash-reporter.rs"
+
+[dependencies]
+# Async runtime (cross-platform)
+tokio = { version = "1", features = ["rt", "time"] }
+
+# Audio capture (cross-platform)
+cpal = "0.15"
+
+# sherpa-onnx for Paraformer ASR (v0.3.2)
+sherpa-onnx = { version = "1.12", default-features = false, features = ["shared"] }
+
+# Offline translation via CTranslate2. Tokenization stays on the Rust side.
+ctranslate2 = { version = "2.1.1", default-features = false, features = ["tokenizers"] }
+ctranslate2-sys = { version = "0.1.5", features = ["crt-dynamic", "shared", "ruy"] }
+tokenizers = "0.22.1"
+sentencepiece = "0.13.1"
+
+# HTTP client for LLM API (cross-platform)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Serialization (cross-platform)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# SQLite for word library (cross-platform)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# GUI for crash reporter (cross-platform)
+eframe = "0.29"
+egui = "0.29"
+
+# System tray (cross-platform)
+tray-icon = "0.19"
+
+# Logging (cross-platform)
+log = "0.4"
+env_logger = "0.11"
+
+# Error handling (cross-platform)
+anyhow = "1"
+
+# Config/data directory (cross-platform)
+dirs = "5"
+
+# Thread communication (cross-platform)
+crossbeam-channel = "0.5"
+
+# Config file watching and atomic writes (cross-platform)
+notify = "8.2.0"
+atomic-write-file = "0.3.0"
+
+# Image for tray icon (cross-platform)
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+
+# Chinese script conversion (cross-platform)
+zhconv = { version = "0.4.1", default-features = false, features = ["compress", "opencc"] }
+
+# Crash reporting (cross-platform)
+backtrace = "0.3"
+chrono = "0.4"
+
+# Email sending (SMTP, cross-platform)
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "native-tls"] }
+
+# Windows-specific dependencies
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_Security",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Accessibility",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+] }
+
+# macOS dependencies (Phase 3 placeholder)
+[target.'cfg(target_os = "macos")'.dependencies]
+# Phase 4: Platform-specific crates for macOS implementation
+core-foundation = "0.10"
+core-graphics = "0.25"
+enigo = "0.2.1"
+# objc2 = "0.5"  # Objective-C bindings for NSWindow transparent overlay (Phase 4)
+# cocoa = "0.26"  # Cocoa framework bindings (Phase 4)
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+# crash-reporter 独立优化：体积优先
+[profile.release-crash]
+inherits = "release"
+opt-level = "s"
+
+[patch.crates-io]
+cmake = { path = "vendor/cmake" }
+ctranslate2-sys = { path = "patches/ctranslate2-sys" }
+esaxx-rs = { path = "patches/esaxx-rs" }

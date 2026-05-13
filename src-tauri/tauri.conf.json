@@ -1,0 +1,60 @@
+{
+  "build": {
+    "beforeDevCommand": "cd ui && npm run dev",
+    "beforeBuildCommand": "cd ui && npm run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../ui/dist"
+  },
+  "productName": "飞音语音输入",
+  "version": "0.5.3",
+  "identifier": "com.feiyin.voice-ime",
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "csp": null,
+      "capabilities": ["default"]
+    },
+    "windows": [
+      {
+        "label": "main",
+        "fullscreen": false,
+        "resizable": false,
+        "maximizable": false,
+        "shadow": true,
+        "decorations": true,
+        "transparent": false,
+        "title": "飞音语音输入",
+        "width": 1179,
+        "height": 720,
+        "center": true,
+        "useHttpsScheme": true
+      },
+      {
+        "label": "overlay",
+        "url": "overlay.html",
+        "title": "",
+        "width": 320,
+        "height": 100,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "resizable": false,
+        "fullscreen": false,
+        "useHttpsScheme": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["msi"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}
