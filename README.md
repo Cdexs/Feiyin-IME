@@ -1,5 +1,7 @@
 # 飞音语音输入 · Feiyin Voice Input
 
+**[English](README.en.md) | 中文**
+
 > Windows 托盘驻留式语音输入工具，热键触发，本地 ASR + LLM 优化，开箱即用。
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](https://github.com/Cdexs/Feiyin-IME)
