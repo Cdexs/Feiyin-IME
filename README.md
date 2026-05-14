@@ -1,11 +1,11 @@
-# 飞音语音输入 · Feiyin Voice Input
+# 飞音智能语音输入 · Feiyin Smart Voice Input
 
 **[English](README.en.md) | 中文**
 
 > Windows 托盘驻留式语音输入工具，热键触发，本地 ASR + LLM 优化，开箱即用。
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](https://github.com/Cdexs/Feiyin-IME)
-[![Version](https://img.shields.io/badge/version-v0.5.3-green)](https://github.com/Cdexs/Feiyin-IME/releases)
+[![Version](https://img.shields.io/badge/version-v0.5.4-green)](https://github.com/Cdexs/Feiyin-IME/releases)
 [![License](https://img.shields.io/badge/license-MIT-orange)](LICENSE)
 
 ---
@@ -162,6 +162,7 @@ build.bat
 
 | 版本 | 主要特性 |
 |------|---------|
+| v0.5.4 | exe 重命名（feiyin-ime）/ 新橙色图标 / GitHub 版本自动检测 / About UI 全面改善 / ESC 修复 / 录音 overlay 不抢焦 |
 | v0.5.3 | 长文本分段翻译 / 麦克风静音检测 / 全路径 exe 目录化 / 标点补全 / 繁体中文 UI |
 | v0.5.2 | SQLite 词库 / LLM 词条学习 / 多语言 UI |
 | v0.5.1 | Tauri v2 升级 |

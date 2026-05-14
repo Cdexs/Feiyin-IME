@@ -1,11 +1,11 @@
-# Feiyin Voice Input
+# Feiyin Smart Voice Input
 
 **English | [中文](README.md)**
 
 > A Windows system-tray voice input tool. Hotkey-triggered, local ASR + LLM optimization, ready to use out of the box.
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](https://github.com/Cdexs/Feiyin-IME)
-[![Version](https://img.shields.io/badge/version-v0.5.3-green)](https://github.com/Cdexs/Feiyin-IME/releases)
+[![Version](https://img.shields.io/badge/version-v0.5.4-green)](https://github.com/Cdexs/Feiyin-IME/releases)
 [![License](https://img.shields.io/badge/license-MIT-orange)](LICENSE)
 
 ---
@@ -150,6 +150,7 @@ build.bat
 
 | Version | Highlights |
 |---------|-----------|
+| v0.5.4 | exe rename (feiyin-ime) / new orange icon / GitHub version check / About UI redesign / ESC fix / overlay no focus-steal |
 | v0.5.3 | Long-text segmented translation / mic mute detection / exe-relative paths / punctuation / Traditional Chinese UI |
 | v0.5.2 | SQLite wordbook / LLM auto-learning / multi-language UI |
 | v0.5.1 | Tauri v2 upgrade |
