@@ -5,8 +5,8 @@
     "devUrl": "http://localhost:1420",
     "frontendDist": "../ui/dist"
   },
-  "productName": "飞音语音输入",
-  "version": "0.5.3",
+  "productName": "飞音智能语音输入",
+  "version": "0.5.4",
   "identifier": "com.feiyin.voice-ime",
   "app": {
     "withGlobalTauri": true,
@@ -23,7 +23,7 @@
         "shadow": true,
         "decorations": true,
         "transparent": false,
-        "title": "飞音语音输入",
+        "title": "飞音智能语音输入",
         "width": 1179,
         "height": 720,
         "center": true,
@@ -54,7 +54,7 @@
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
-      "icons/icon.ico"
+      "icons/icon-settings.ico"
     ]
   }
 }

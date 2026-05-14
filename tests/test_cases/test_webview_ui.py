@@ -10,7 +10,7 @@ WebView2 UI 自动化测试（Playwright + CDP）
 使用 Playwright 通过 CDP 连接 WebView2，替代 pyautogui 坐标点击。
 
 前置条件：
-- 启动 voice-ime.exe 时设置环境变量：
+- 启动 feiyin-ime.exe 时设置环境变量：
   WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=9222"
 """
 
@@ -34,16 +34,16 @@ def voice_ime_with_cdp(exe_path: Path):
     """
     Module 级 fixture：启动带 CDP 的 voice-ime-ui 进程
 
-    直接启动 Tauri UI 配置窗口（voice-ime-ui.exe），
+    直接启动 Tauri UI 配置窗口（feiyin-ime-ui.exe），
     不再依赖主程序的 --settings-ui 参数。
     """
     kill_existing_voice_ime()
 
     import subprocess
-    # 直接启动 voice-ime-ui.exe
-    ui_exe = exe_path.parent / "voice-ime-ui.exe"
+    # 直接启动 feiyin-ime-ui.exe
+    ui_exe = exe_path.parent / "feiyin-ime-ui.exe"
     if not ui_exe.exists():
-        pytest.skip(f"voice-ime-ui.exe not found: {ui_exe}")
+        pytest.skip(f"feiyin-ime-ui.exe not found: {ui_exe}")
 
     process = subprocess.Popen(
         [str(ui_exe)],

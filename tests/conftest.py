@@ -31,7 +31,7 @@ TESTS_DIR = Path(__file__).parent
 SCREENSHOTS_DIR = TESTS_DIR / "screenshots"
 
 # 默认 exe 路径
-DEFAULT_EXE_PATH = PROJECT_ROOT / "target" / "release" / "voice-ime.exe"
+DEFAULT_EXE_PATH = PROJECT_ROOT / "target" / "release" / "feiyin-ime.exe"
 
 # 从环境变量获取配置
 EXE_PATH = Path(os.getenv("VOICE_IME_EXE", str(DEFAULT_EXE_PATH)))
@@ -76,10 +76,10 @@ def wait_for_condition(
 
 
 def kill_existing_voice_ime() -> None:
-    """Kill any running voice-ime.exe instances (for single-instance tests)."""
+    """Kill any running feiyin-ime.exe instances (for single-instance tests)."""
     subprocess.run(
         ["powershell", "-Command",
-         "Get-Process voice-ime -ErrorAction SilentlyContinue | Stop-Process -Force"],
+         "Get-Process feiyin-ime -ErrorAction SilentlyContinue | Stop-Process -Force"],
         capture_output=True,
     )
     time.sleep(0.5)
@@ -212,9 +212,9 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 @pytest.fixture(scope="session")
 def exe_path() -> Path:
-    """返回 voice-ime.exe 路径"""
+    """返回 feiyin-ime.exe 路径"""
     if not EXE_PATH.exists():
-        pytest.fail(f"voice-ime.exe not found: {EXE_PATH}")
+        pytest.fail(f"feiyin-ime.exe not found: {EXE_PATH}")
     return EXE_PATH
 
 
@@ -229,7 +229,7 @@ def screenshots_dir() -> Path:
 @pytest.fixture(scope="session")
 def session_voice_ime_process(exe_path: Path) -> Generator[Optional[subprocess.Popen], None, None]:
     """
-    session 级 voice-ime.exe 进程 fixture（优化4）
+    session 级 feiyin-ime.exe 进程 fixture（优化4）
 
     整个测试会话只启动一次进程，显著减少重复启动开销。
     各测试通过 function 级 wrapper 引用此进程。
@@ -254,7 +254,7 @@ def session_voice_ime_process(exe_path: Path) -> Generator[Optional[subprocess.P
             description="process initialization"
         )
         if not initialized or process.poll() is not None:
-            pytest.fail(f"voice-ime.exe failed to initialize, exit code: {process.returncode}")
+            pytest.fail(f"feiyin-ime.exe failed to initialize, exit code: {process.returncode}")
 
         yield process
 
@@ -272,7 +272,7 @@ def session_voice_ime_process(exe_path: Path) -> Generator[Optional[subprocess.P
 @pytest.fixture
 def voice_ime_process(session_voice_ime_process) -> Generator[Optional[subprocess.Popen], None, None]:
     """
-    function 级 voice-ime.exe 进程 wrapper（引用 session 级进程）
+    function 级 feiyin-ime.exe 进程 wrapper（引用 session 级进程）
 
     使用方式：
         def test_example(voice_ime_process):
@@ -308,7 +308,7 @@ def isolated_voice_ime_process(exe_path: Path) -> Generator[Optional[subprocess.
             description="process initialization"
         )
         if not initialized or process.poll() is not None:
-            pytest.fail(f"voice-ime.exe exited immediately with code: {process.returncode}")
+            pytest.fail(f"feiyin-ime.exe exited immediately with code: {process.returncode}")
 
         yield process
 
@@ -473,7 +473,7 @@ def cdp_browser():
     """
     Session 级 Playwright 浏览器，连接到 WebView2 CDP
 
-    前置条件：启动 voice-ime.exe 前需设置环境变量
+    前置条件：启动 feiyin-ime.exe 前需设置环境变量
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=9222"
 
     使用方式：

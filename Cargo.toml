@@ -1,10 +1,10 @@
 [package]
 name = "voice-ime"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 
 [[bin]]
-name = "voice-ime"
+name = "feiyin-ime"
 path = "src/main.rs"
 
 [[bin]]
@@ -28,7 +28,7 @@ tokenizers = "0.22.1"
 sentencepiece = "0.13.1"
 
 # HTTP client for LLM API (cross-platform)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 
 # Serialization (cross-platform)
 serde = { version = "1", features = ["derive"] }
@@ -103,6 +103,9 @@ core-graphics = "0.25"
 enigo = "0.2.1"
 # objc2 = "0.5"  # Objective-C bindings for NSWindow transparent overlay (Phase 4)
 # cocoa = "0.26"  # Cocoa framework bindings (Phase 4)
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winres = "0.1"
 
 [profile.release]
 opt-level = 3

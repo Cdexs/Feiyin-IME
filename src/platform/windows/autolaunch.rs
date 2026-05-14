@@ -10,7 +10,7 @@ use windows::Win32::System::Registry::{
 };
 
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-const APP_NAME: &str = "voice-ime";
+const APP_NAME: &str = "feiyin-ime";
 
 /// Enable auto-launch on system startup
 pub fn enable() -> Result<()> {

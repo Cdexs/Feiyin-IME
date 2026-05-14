@@ -27,14 +27,14 @@ from pathlib import Path
 import pytest
 
 
-UI_EXE_NAME = "voice-ime-ui.exe"
+UI_EXE_NAME = "feiyin-ime-ui.exe"
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 TARGET_RELEASE = PROJECT_ROOT / "target" / "release"
 UI_EXE_PATH = TARGET_RELEASE / UI_EXE_NAME
 
 
 def kill_existing_ui() -> None:
-    """Kill any running voice-ime-ui.exe instances."""
+    """Kill any running feiyin-ime-ui.exe instances."""
     subprocess.run(
         ["taskkill", "/F", "/IM", UI_EXE_NAME, "/T"],
         capture_output=True,

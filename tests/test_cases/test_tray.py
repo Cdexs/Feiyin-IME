@@ -53,7 +53,7 @@ class TestTrayIcon:
         try:
             # 等待进程初始化
             time.sleep(3)
-            assert process.poll() is None, "voice-ime.exe should be running"
+            assert process.poll() is None, "feiyin-ime.exe should be running"
 
             # 验证托盘图标（通过系统托盘枚举）
             # 注意：Windows 托盘图标检测需要 Win32 API
@@ -83,10 +83,10 @@ class TestTrayMenuSettings:
             assert process.poll() is None
 
             # 通过 --settings-ui 参数直接打开设置窗口（模拟托盘菜单行为）
-            settings_exe = exe_path.parent / "voice-ime-ui.exe"
+            settings_exe = exe_path.parent / "feiyin-ime-ui.exe"
             if not settings_exe.exists():
                 # 开发环境备用路径
-                settings_exe = exe_path.parent.parent / "src-tauri" / "target" / "release" / "voice-ime-ui.exe"
+                settings_exe = exe_path.parent.parent / "src-tauri" / "target" / "release" / "feiyin-ime-ui.exe"
 
             if settings_exe.exists():
                 settings_proc = subprocess.Popen(
@@ -134,7 +134,7 @@ class TestTrayMenuExit:
                 timeout=5.0,
                 description="process exit after terminate"
             )
-            assert exited, "voice-ime.exe should exit after terminate"
+            assert exited, "feiyin-ime.exe should exit after terminate"
 
         except Exception:
             process.kill()
@@ -158,12 +158,12 @@ class TestTrayDoubleClickSettings:
             time.sleep(3)
             assert process.poll() is None
 
-            settings_exe = exe_path.parent / "voice-ime-ui.exe"
+            settings_exe = exe_path.parent / "feiyin-ime-ui.exe"
             if not settings_exe.exists():
-                settings_exe = exe_path.parent.parent / "src-tauri" / "target" / "release" / "voice-ime-ui.exe"
+                settings_exe = exe_path.parent.parent / "src-tauri" / "target" / "release" / "feiyin-ime-ui.exe"
 
             if not settings_exe.exists():
-                pytest.skip("voice-ime-ui.exe not found")
+                pytest.skip("feiyin-ime-ui.exe not found")
 
             # 循环 3 次验证打开/关闭设置窗口
             for i in range(3):

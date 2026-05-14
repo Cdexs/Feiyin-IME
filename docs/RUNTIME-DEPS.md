@@ -1,7 +1,7 @@
 # 主程序运行依赖清单 · voice-ime
 
 > 生成日期：2026-05-13
-> 说明：列出 voice-ime.exe 正常运行所必须的全部外部文件，按部署位置分组。
+> 说明：列出 feiyin-ime.exe 正常运行所必须的全部外部文件，按部署位置分组。
 
 ---
 
@@ -9,8 +9,8 @@
 
 | 文件 | 大小（参考）| 说明 |
 |------|------------|------|
-| `voice-ime.exe` | ~10.8MB | 主程序（Win32 controller + ASR + 托盘）|
-| `voice-ime-ui.exe` | ~18.6MB | 设置界面（Tauri + React）|
+| `feiyin-ime.exe` | ~10.9MB | 主程序（Win32 controller + ASR + 托盘）|
+| `feiyin-ime-ui.exe` | ~8.65MB | 设置界面（Tauri + React）|
 | `crash-reporter.exe` | ~24.7MB | 崩溃报告独立程序 |
 
 ---
@@ -93,8 +93,8 @@
 
 ```
 Publish/
-├── voice-ime.exe               # 主程序
-├── voice-ime-ui.exe            # 设置界面
+├── feiyin-ime.exe               # 主程序
+├── feiyin-ime-ui.exe            # 设置界面
 ├── crash-reporter.exe          # 崩溃报告
 ├── sherpa-onnx-c-api.dll       # ASR 核心 DLL
 ├── sherpa-onnx-cxx-api.dll     # ASR C++ DLL
@@ -130,8 +130,8 @@ Publish/
 
 | 类型 | 文件 | 大小 |
 |------|------|------|
-| EXE | voice-ime.exe | 10.8MB |
-| EXE | voice-ime-ui.exe | 18.6MB |
+| EXE | feiyin-ime.exe | 10.9MB |
+| EXE | feiyin-ime-ui.exe | 8.65MB |
 | EXE | crash-reporter.exe | 24.7MB |
 | DLL | sherpa-onnx-c-api.dll | 3.9MB |
 | DLL | sherpa-onnx-cxx-api.dll | 104KB |

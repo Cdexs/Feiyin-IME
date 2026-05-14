@@ -566,3 +566,38 @@ pub fn get(lang: UiLanguage) -> &'static Strings {
         UiLanguage::English => &EN,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// UI-I18N-002: get(TraditionalChinese) 返回繁体中文字符串
+    #[test]
+    fn get_traditional_chinese_returns_zh_tw_strings() {
+        let strings = get(UiLanguage::TraditionalChinese);
+        assert_eq!(strings.app_title, "飛音語音輸入");
+        assert_eq!(strings.tab_general, "通用");
+        assert_eq!(strings.tab_voice, "語音輸入");
+        assert_eq!(strings.tray_menu_settings, "設定 (Settings)");
+        assert_eq!(strings.dialog_save, "儲存");
+        assert_eq!(strings.error_mic_muted, "麥克風已靜音，請取消靜音後重試。");
+    }
+
+    /// UI-I18N-003: get(Chinese) 返回简体中文字符串
+    #[test]
+    fn get_chinese_returns_zh_strings() {
+        let strings = get(UiLanguage::Chinese);
+        assert_eq!(strings.app_title, "飞音语音输入");
+        assert_eq!(strings.dialog_save, "保存");
+        assert_eq!(strings.error_mic_muted, "麦克风已静音，请取消静音后重试。");
+    }
+
+    /// UI-I18N-004: get(English) 返回英文字符串
+    #[test]
+    fn get_english_returns_en_strings() {
+        let strings = get(UiLanguage::English);
+        assert_eq!(strings.app_title, "Feiyin Voice Input");
+        assert_eq!(strings.dialog_save, "Save");
+        assert_eq!(strings.error_mic_muted, "Microphone is muted. Please unmute and try again.");
+    }
+}

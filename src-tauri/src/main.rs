@@ -7,6 +7,7 @@ mod crash;
 mod i18n;
 mod llm;
 mod overlay;
+mod version_check;
 mod wordbook;
 
 use audio::get_input_devices;
@@ -97,7 +98,7 @@ fn is_main_process_running() -> bool {
                     .position(|&ch| ch == 0)
                     .unwrap_or(entry.szExeFile.len());
                 let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
-                if name.eq_ignore_ascii_case("voice-ime.exe") {
+                if name.eq_ignore_ascii_case("feiyin-ime.exe") {
                     found = true;
                     break;
                 }
@@ -125,6 +126,9 @@ fn main() {
         .setup(|_app| {
             if let Some(main) = _app.get_webview_window("main") {
                 let _ = main.set_maximizable(false);
+                if let Ok(icon) = tauri::image::Image::from_bytes(include_bytes!("../icons/128x128.png")) {
+                    let _ = main.set_icon(icon);
+                }
             }
 
             // MAC-013: macOS 透明 Overlay 配置
@@ -147,6 +151,9 @@ fn main() {
             test_llm_connection,
             get_audio_devices,
             check_hotkey_available,
+            version_check::get_version_info,
+            version_check::force_check_latest_version,
+            version_check::open_url_in_browser,
             wordbook::get_wordbook_entries,
             wordbook::get_wordbook_stats,
             wordbook::add_wordbook_entry,

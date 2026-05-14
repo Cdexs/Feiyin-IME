@@ -16,10 +16,10 @@ fn test_reporter_exe_exists() {
         .join("release");
 
     // 主程序
-    let main_exe = target_dir.join("voice-ime.exe");
+    let main_exe = target_dir.join("feiyin-ime.exe");
     assert!(
         main_exe.exists(),
-        "voice-ime.exe should exist in target/release"
+        "feiyin-ime.exe should exist in target/release"
     );
 
     // 独立 crash reporter（新名称）
@@ -34,7 +34,7 @@ fn test_reporter_exe_exists() {
 #[test]
 fn test_reporter_command_line_arg() {
     // 验证 --crash-reporter 参数能被正确识别
-    let args: Vec<String> = vec!["voice-ime.exe".to_string(), "--crash-reporter".to_string()];
+    let args: Vec<String> = vec!["feiyin-ime.exe".to_string(), "--crash-reporter".to_string()];
 
     let is_reporter = args.iter().any(|arg| arg == "--crash-reporter");
     assert!(is_reporter, "Should detect --crash-reporter flag");

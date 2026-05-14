@@ -15,6 +15,7 @@ mod text_normalizer;
 mod transcription;
 mod translation;
 mod ui;
+mod version_check;
 mod wordbook;
 use anyhow::{anyhow, Result};
 use config::AppConfig;
@@ -74,9 +75,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ShowWindow, TrackPopupMenu, TranslateMessage, CREATESTRUCTW,
     CW_USEDEFAULT, GWLP_USERDATA, HMENU, IDC_ARROW, LWA_ALPHA, MF_SEPARATOR, MF_STRING, MSG,
     PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_LBUTTONUP, WM_NCCREATE, WM_PAINT, WM_TIMER, WNDCLASSW, WNDCLASS_STYLES,
-    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_POPUP,
+    SW_SHOW, SW_SHOWNA, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_NCCREATE, WM_PAINT, WM_TIMER, WNDCLASSW,
+    WNDCLASS_STYLES, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_OVERLAPPED, WS_POPUP,
 };
 #[derive(Debug, Clone)]
 enum PipelineEvent {
@@ -427,14 +429,14 @@ fn encode_wide(text: &str) -> Vec<u16> {
         .collect()
 }
 fn spawn_settings_process() -> Result<Child> {
-    // DEC-013: 鍚姩 Tauri Settings 瀛愯繘绋?(voice-ime-ui.exe)
+    // DEC-013: 启动 Tauri Settings 子进程(feiyin-ime-ui.exe)
     let exe_path = std::env::current_exe()?;
     let exe_dir = exe_path
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    // Spawn settings UI process (voice-ime-ui.exe)
-    let ui_exe = exe_dir.join("voice-ime-ui.exe");
+    // Spawn settings UI process (feiyin-ime-ui.exe)
+    let ui_exe = exe_dir.join("feiyin-ime-ui.exe");
     // Copy release exe to debug location if needed (src-tauri/target/release to src-tauri/target/debug)
     let project_root = exe_dir
         .parent() // target/release -> target/debug -> target/
@@ -444,7 +446,7 @@ fn spawn_settings_process() -> Result<Child> {
             root.join("src-tauri")
                 .join("target")
                 .join("release")
-                .join("voice-ime-ui.exe")
+                .join("feiyin-ime-ui.exe")
         })
         .unwrap_or_else(|| ui_exe.clone());
     let dev_ui_exe = if dev_ui_exe_release.exists() {
@@ -455,7 +457,7 @@ fn spawn_settings_process() -> Result<Child> {
                 root.join("src-tauri")
                     .join("target")
                     .join("debug")
-                    .join("voice-ime-ui.exe")
+.join("feiyin-ime-ui.exe")
             })
             .unwrap_or_else(|| ui_exe.clone())
     };
@@ -463,13 +465,13 @@ fn spawn_settings_process() -> Result<Child> {
         ui_exe
     } else if dev_ui_exe.exists() {
         log::info!(
-            "Using development path for voice-ime-ui.exe: {}",
+            "Using development path for feiyin-ime-ui.exe: {}",
             dev_ui_exe.display()
         );
         dev_ui_exe
     } else {
         return Err(anyhow!(
-            "voice-ime-ui.exe not found. Please build the Tauri UI first (npm run tauri build or cargo build in src-tauri)."
+            "feiyin-ime-ui.exe not found. Please build the Tauri UI first (npm run tauri build or cargo build in src-tauri)."
         ));
     };
     log::info!("Spawning Tauri Settings UI from: {}", target_exe.display());
@@ -640,7 +642,7 @@ fn run_overlay_thread(
     let hwnd = unsafe {
         let window_title = encode_wide("飞音语音输入 Overlay");
         CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE,
             PCWSTR(class_name.as_ptr()),
             PCWSTR(window_title.as_ptr()),
             WS_POPUP,
@@ -710,7 +712,7 @@ fn run_overlay_thread(
                             request.size[1],
                             SWP_NOACTIVATE | SWP_NOZORDER,
                         )?;
-                        let _ = ShowWindow(hwnd, SW_SHOW);
+                        let _ = ShowWindow(hwnd, SW_SHOWNA);
                         // overlay window receives keyboard input via WM_KEYDOWN (ESC to cancel)
                         let _ = InvalidateRect(hwnd, None, true);
                         // Set auto-close timer if needed
@@ -1953,7 +1955,7 @@ fn process_controller_events(
     }
     if is_recording.load(Ordering::Acquire) {
         let esc = unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) };
-        if (esc as u16) & 0x0001 != 0 {
+        if (esc as u16) & 0x8000u16 != 0 {
             cancel_signal.store(true, Ordering::Release);
             stop_recording_signal.store(true, Ordering::Release);
             let ui_language = clone_runtime_config(runtime_config).ui_language;
@@ -2184,6 +2186,7 @@ fn spawn_worker_thread(
                     );
                     is_recording.store(false, Ordering::Release);
                     if cancel_signal.load(Ordering::Acquire) {
+                        log::warn!("Recording ended with cancel_signal=true, skipping transcription (user cancelled or race condition)");
                         send_event(&event_tx, PipelineEvent::Cancelled);
                         continue;
                     }
@@ -2223,6 +2226,7 @@ fn spawn_worker_thread(
                         cached_punctuation = None;
                     }
                     let translation_engine = cached_translation.as_ref().map(|(_, e)| e);
+                    log::debug!("Starting run_pipeline: cancel_signal={}", cancel_signal.load(Ordering::Relaxed));
                     run_pipeline(
                         samples_result,
                         transcriber,
@@ -2305,6 +2309,10 @@ fn run_controller(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
         let _ = SetTimer(controller_hwnd, CONTROLLER_TIMER_ID, 15, None);
         let _ = PostMessageW(controller_hwnd, WM_APP_INIT_TRAY, WPARAM(0), LPARAM(0));
     }
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let _ = version_check::check_and_cache();
+    });
     log::info!("Controller initialized, entering message loop");
     let mut tray: Option<TrayIcon> = None;
     let mut settings_child: Option<Child> = None;
@@ -2483,7 +2491,7 @@ fn main() -> Result<()> {
     // Mutex 蹇呴』鍦ㄦ暣涓▼搴忚繍琛屾湡闂翠繚鎸佹墦寮€
     #[cfg(target_os = "windows")]
     {
-        let mutex_name = "Global\\voice-ime-single-instance-mutex";
+        let mutex_name = "Global\\feiyin-ime-single-instance-mutex";
         let mutex_name_wide: Vec<u16> = mutex_name
             .encode_utf16()
             .chain(std::iter::once(0))
@@ -2546,6 +2554,7 @@ fn run_pipeline(
         }
         Ok(samples) => {
             if cancel_signal.load(Ordering::Relaxed) {
+                log::warn!("Pipeline skipped: cancel_signal was true after recording completed (possible race condition)");
                 send_event(event_tx, PipelineEvent::Cancelled);
                 return;
             }

@@ -565,6 +565,28 @@ clipboard_delay_ms = 150
         );
     }
 
+    /// UI-I18N-001: TraditionalChinese 序列化/反序列化正确
+    #[test]
+    fn ui_language_traditional_chinese_serializes_correctly() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+        let mut cfg = AppConfig::default();
+        cfg.ui_language = UiLanguage::TraditionalChinese;
+
+        cfg.save_to(&env.config_path()).expect("save should succeed");
+        let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
+
+        assert_eq!(loaded.ui_language, UiLanguage::TraditionalChinese);
+
+        // Verify TOML contains the expected string value
+        let content = std::fs::read_to_string(env.config_path()).expect("file should be readable");
+        assert!(
+            content.contains(r#"ui_language = "TraditionalChinese""#),
+            "TOML should contain TraditionalChinese variant name, got:\n{}",
+            content
+        );
+    }
+
     /// WATCHER-002: 频繁修改不会导致重复 reload（debounce 验证）
     #[test]
     #[ignore = "requires notify file watcher with debounce (TEST-SYNC-CONFIG-WATCHER-001 P2)"]
