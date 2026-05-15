@@ -2,10 +2,10 @@
 
 **[English](README.en.md) | 中文**
 
-> Windows 托盘驻留式语音输入工具，热键触发，本地 ASR + LLM 优化，开箱即用。
+> 桌面端智能语音输入工具，使用最新本地ASR模型，速度快、准确率高！支持标点符号自动补全，支持语音录入中英互译，支持LLM后端优化输出！
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](https://github.com/Cdexs/Feiyin-IME)
-[![Version](https://img.shields.io/badge/version-v0.5.4-green)](https://github.com/Cdexs/Feiyin-IME/releases)
+[![Version](https://img.shields.io/badge/version-v0.5.3-green)](https://github.com/Cdexs/Feiyin-IME/releases)
 [![License](https://img.shields.io/badge/license-MIT-orange)](LICENSE)
 
 ---
@@ -15,14 +15,13 @@
 | 功能 | 说明 |
 |------|------|
 | 🎙️ **全局热键录音** | Toggle / PTT 双模式，可自定义热键组合 |
-| 🧠 **本地语音识别** | SenseVoice 多语言模型（中 / 英 / 日 / 韩 / 粤），INT8 量化 |
+| 🧠 **本地语音识别** | SenseVoice 多语言模型（中 / 英 / 日 / 韩 / 粤） |
 | ✨ **LLM 文本优化** | OpenAI 兼容接口，纠错 + 标点 + 格式化 |
 | 🔤 **本地离线翻译** | opus-mt CT2 模型，中 ↔ 英双向互译，长文本自动分段 |
 | 🔡 **标点自动补全** | CT-Transformer ONNX，识别后自动添加标点 |
-| 📖 **用户词库** | 自定义词条映射 + 自动学习高频纠错对，SQLite 持久化 |
+| 📖 **用户词库** | 自定义词条映射 + 自动学习高频纠错对 |
 | 🔇 **麦克风静音检测** | 热键前 + 录音中双场景检测，静音时立即提示 |
 | 🌐 **多语言 UI** | 简体中文 / 繁体中文 / English |
-| 💥 **崩溃报告** | 独立 crash-reporter 进程，本地存储 + 邮件上报 |
 
 ---
 
@@ -31,22 +30,23 @@
 ### 系统要求
 
 - Windows 10 / Windows 11（64位）
-- WebView2 运行时（Win10 用户若缺失，程序启动时自动引导安装）
+- WebView2 运行时
 - 麦克风设备
 
 ### 安装运行
 
 1. 下载并解压发布包到任意目录
-2. 双击 `voice-ime.exe` 启动，托盘出现飞音图标
-3. 按默认热键 **F9** 开始录音，再按 F9 结束并输入文字
-4. 右键托盘图标 → **设置** 配置热键 / LLM / 翻译等选项
+2. 双击 `feiyin-ime.exe` 启动，托盘出现飞音图标
+3. 点击托盘菜单“配置”进入配置界面，设置语音输入热键（建议设置右ctrl、右alt键）
+4. 配置界面设置翻译、LLM优化(需要自行准备相关LLM API/Key信息)等配置
+5. 按热键呼出录音窗口，开始语音输入
 
 ### 目录结构（发布包）
 
 ```
 Feiyin-IME/
-├── voice-ime.exe           # 主程序
-├── voice-ime-ui.exe        # 设置界面（Tauri + React）
+├── feiyin-ime.exe           # 主程序
+├── feiyin-ime-ui.exe        # 设置界面（Tauri + React）
 ├── crash-reporter.exe      # 崩溃报告程序
 ├── *.dll                   # 运行时依赖库
 ├── config.toml             # 用户配置（首次启动自动生成）
@@ -99,32 +99,6 @@ enabled = true
 
 ---
 
-## 技术架构
-
-```
-voice-ime.exe (Win32 Controller)
-├── Win32 消息循环 + RegisterHotKey 全局热键
-├── 系统托盘 (tray-icon)
-├── Win32 GDI 录音悬浮窗 (Overlay)
-│   ├── 录音状态：波形 + 麦克风图标
-│   ├── 处理状态：Shimmer 扫光动效
-│   └── 错误状态：红圈 + 提示文字
-├── WASAPI 音频采集 (cpal)
-├── SenseVoice ASR (sherpa-onnx)
-├── LLM 文本优化 (reqwest / OpenAI API)
-├── CT-Transformer 标点补全 (sherpa-onnx ONNX)
-├── opus-mt 翻译引擎 (CTranslate2)
-└── SQLite 用户词库 (rusqlite)
-
-voice-ime-ui.exe (Tauri + React)
-└── 配置界面（由主程序子进程拉起）
-
-crash-reporter.exe
-└── 独立崩溃上报程序
-```
-
----
-
 ## 构建
 
 ### 环境要求
@@ -156,19 +130,6 @@ build.bat
 | 词库数据库 | `{exe目录}/wordbook.sqlite` |
 | AI 模型 | `{exe目录}/models/` |
 
----
-
-## 版本历史
-
-| 版本 | 主要特性 |
-|------|---------|
-| v0.5.4 | exe 重命名（feiyin-ime）/ 新橙色图标 / GitHub 版本自动检测 / About UI 全面改善 / ESC 修复 / 录音 overlay 不抢焦 |
-| v0.5.3 | 长文本分段翻译 / 麦克风静音检测 / 全路径 exe 目录化 / 标点补全 / 繁体中文 UI |
-| v0.5.2 | SQLite 词库 / LLM 词条学习 / 多语言 UI |
-| v0.5.1 | Tauri v2 升级 |
-| v0.5.0 | macOS 跨平台架构抽象 |
-| v0.4.0 | UI 框架升级：eframe → Tauri + React |
-| v0.3.x | Win32 架构重构 / Paraformer ASR / 崩溃报告 |
 
 ---
 
