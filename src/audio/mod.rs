@@ -3,9 +3,10 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
 use crossbeam_channel::Sender;
+use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::Duration;
 
@@ -36,6 +37,7 @@ struct WarmInputStream {
     sample_format: SampleFormat,
     sample_rate: u32,
     channels: usize,
+    pre_roll: Arc<Mutex<VecDeque<Vec<f32>>>>,
     rx: crossbeam_channel::Receiver<Vec<f32>>,
     stream_failed: Arc<AtomicBool>,
     _stream: Stream,
@@ -115,6 +117,16 @@ impl AudioCapture {
             "[Latency] drain_pre_roll completed at +{:.1}ms",
             t_record.elapsed().as_secs_f64() * 1000.0
         );
+        let idle_cleared = {
+            let mut n = 0usize;
+            while warm.rx.try_recv().is_ok() { n += 1; }
+            n
+        };
+        log::info!(
+            "[Latency] channel cleared {} idle chunks at +{:.1}ms",
+            idle_cleared,
+            t_record.elapsed().as_secs_f64() * 1000.0
+        );
         warm.stream_failed.store(false, Ordering::Release);
 
         log::info!(
@@ -178,16 +190,31 @@ impl AudioCapture {
         let (tx, rx) = crossbeam_channel::bounded::<Vec<f32>>(256);
         let tx_err: Sender<Vec<f32>> = tx.clone();
         let stream_failed = Arc::new(AtomicBool::new(false));
+        let pre_roll = Arc::new(Mutex::new(VecDeque::<Vec<f32>>::new()));
+        let max_pre_roll_samples = pre_roll_samples(sample_rate, PRE_ROLL_MS);
 
         let stream = match sample_format {
             SampleFormat::F32 => {
                 let tx_audio = tx.clone();
                 let tx_stream_err = tx_err.clone();
                 let stream_failed = Arc::clone(&stream_failed);
+                let pre_roll_cb = Arc::clone(&pre_roll);
+                let max_pr = max_pre_roll_samples;
                 device.build_input_stream(
                     &config,
                     move |data: &[f32], _| {
-                        let _ = tx_audio.try_send(downmix_to_mono(data, channels, |sample| sample));
+                        let chunk = downmix_to_mono(data, channels, |sample| sample);
+                        {
+                            let mut pr = pre_roll_cb.lock().unwrap();
+                            pr.push_back(chunk.clone());
+                            let mut total: usize = pr.iter().map(|c| c.len()).sum();
+                            while total > max_pr {
+                                if let Some(dropped) = pr.pop_front() {
+                                    total -= dropped.len();
+                                }
+                            }
+                        }
+                        let _ = tx_audio.try_send(chunk);
                     },
                     move |err| {
                         log::error!("Audio stream error: {}", err);
@@ -201,12 +228,25 @@ impl AudioCapture {
                 let tx_audio = tx.clone();
                 let tx_stream_err = tx_err.clone();
                 let stream_failed = Arc::clone(&stream_failed);
+                let pre_roll_cb = Arc::clone(&pre_roll);
+                let max_pr = max_pre_roll_samples;
                 device.build_input_stream(
                     &config,
                     move |data: &[i16], _| {
-                        let _ = tx_audio.try_send(downmix_to_mono(data, channels, |sample| {
+                        let chunk = downmix_to_mono(data, channels, |sample| {
                             sample as f32 / i16::MAX as f32
-                        }));
+                        });
+                        {
+                            let mut pr = pre_roll_cb.lock().unwrap();
+                            pr.push_back(chunk.clone());
+                            let mut total: usize = pr.iter().map(|c| c.len()).sum();
+                            while total > max_pr {
+                                if let Some(dropped) = pr.pop_front() {
+                                    total -= dropped.len();
+                                }
+                            }
+                        }
+                        let _ = tx_audio.try_send(chunk);
                     },
                     move |err| {
                         log::error!("Audio stream error: {}", err);
@@ -220,12 +260,25 @@ impl AudioCapture {
                 let tx_audio = tx.clone();
                 let tx_stream_err = tx_err.clone();
                 let stream_failed = Arc::clone(&stream_failed);
+                let pre_roll_cb = Arc::clone(&pre_roll);
+                let max_pr = max_pre_roll_samples;
                 device.build_input_stream(
                     &config,
                     move |data: &[u16], _| {
-                        let _ = tx_audio.try_send(downmix_to_mono(data, channels, |sample| {
+                        let chunk = downmix_to_mono(data, channels, |sample| {
                             (sample as f32 / u16::MAX as f32) * 2.0 - 1.0
-                        }));
+                        });
+                        {
+                            let mut pr = pre_roll_cb.lock().unwrap();
+                            pr.push_back(chunk.clone());
+                            let mut total: usize = pr.iter().map(|c| c.len()).sum();
+                            while total > max_pr {
+                                if let Some(dropped) = pr.pop_front() {
+                                    total -= dropped.len();
+                                }
+                            }
+                        }
+                        let _ = tx_audio.try_send(chunk);
                     },
                     move |err| {
                         log::error!("Audio stream error: {}", err);
@@ -257,6 +310,7 @@ impl AudioCapture {
             sample_format,
             sample_rate,
             channels,
+            pre_roll,
             rx,
             stream_failed,
             _stream: stream,
@@ -285,17 +339,15 @@ impl WarmInputStream {
     }
 
     fn drain_pre_roll(&self, pre_roll_ms: u64) -> Vec<Vec<f32>> {
-        let mut pending = Vec::new();
-        while let Ok(chunk) = self.rx.try_recv() {
-            if !chunk.is_empty() {
-                pending.push(chunk);
-            }
-        }
+        let chunks: Vec<Vec<f32>> = {
+            let mut pr = self.pre_roll.lock().unwrap();
+            pr.drain(..).filter(|c: &Vec<f32>| !c.is_empty()).collect()
+        };
 
-        let drained_chunks = pending.len();
-        let drained_samples = pending.iter().map(Vec::len).sum::<usize>();
+        let drained_chunks = chunks.len();
+        let drained_samples = chunks.iter().map(Vec::len).sum::<usize>();
         let max_samples = pre_roll_samples(self.sample_rate, pre_roll_ms);
-        let retained = retain_recent_samples(pending, max_samples);
+        let retained = retain_recent_samples(chunks, max_samples);
         let retained_samples = retained.iter().map(Vec::len).sum::<usize>();
 
         log::info!(
@@ -864,5 +916,54 @@ mod tests {
             !i18n::get(UiLanguage::English).error_mic_muted.is_empty(),
             "EN error_mic_muted must not be empty"
         );
+    }
+
+    // ============================================================
+    // TEST-SYNC-PREROLL-001: pre-roll ring buffer unit tests
+    // ============================================================
+
+    /// PREROLL-RINGBUF-001:
+    /// Verify that `retain_recent_samples` discards the *oldest* chunks and
+    /// keeps the newest ones when the total exceeds the sample budget.
+    #[test]
+    fn retain_recent_samples_keeps_newest_not_oldest() {
+        // 7 chunks x 1600 samples = 11200 > limit(9600)
+        // The oldest chunk (index 0, values 0.0) must be evicted.
+        let chunks: Vec<Vec<f32>> = (0u32..7)
+            .map(|i| vec![i as f32; 1_600])
+            .collect();
+        let limit = pre_roll_samples(16_000, PRE_ROLL_MS); // 9600
+        let retained = retain_recent_samples(chunks, limit);
+        // Oldest chunk discarded
+        assert_eq!(retained[0][0], 1.0, "oldest chunk must be evicted");
+        // Newest chunk retained
+        assert_eq!(retained.last().unwrap()[0], 6.0, "newest chunk must be retained");
+    }
+
+    /// PREROLL-RINGBUF-001:
+    /// Verify that the `idle_cleared` drain loop on an empty channel terminates
+    /// immediately (0 iterations) without deadlocking or panicking.
+    #[test]
+    fn idle_channel_drain_terminates_on_empty_channel() {
+        let (_tx, rx) = crossbeam_channel::bounded::<Vec<f32>>(4);
+        let mut n = 0usize;
+        while rx.try_recv().is_ok() { n += 1; }
+        assert_eq!(n, 0, "empty channel drain must yield 0 iterations");
+    }
+
+    /// PREROLL-RINGBUF-001:
+    /// Verify that the `idle_cleared` drain loop correctly clears all pending
+    /// chunks from the channel, leaving room for new data.
+    #[test]
+    fn idle_channel_drain_clears_all_pending_chunks() {
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<f32>>(4);
+        tx.send(vec![0.1; 100]).unwrap();
+        tx.send(vec![0.2; 100]).unwrap();
+        tx.send(vec![0.3; 100]).unwrap();
+        let mut n = 0usize;
+        while rx.try_recv().is_ok() { n += 1; }
+        assert_eq!(n, 3, "idle drain must clear exactly 3 chunks");
+        // After draining, the channel must have room for new data.
+        assert!(tx.try_send(vec![0.4; 100]).is_ok(), "channel must have room after drain");
     }
 }

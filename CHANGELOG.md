@@ -9,6 +9,9 @@
 
 | 编号 | 说明 | 负责人 | 完成时间 |
 | --- | --- | --- | --- |
+| TEST-EXEC-PREROLL-001 | PREROLL-RINGBUF-001 全量测试 + 出包：273 PASS / 0 FAIL / 2 IGNORED，smoke 4/4，feiyin-ime.exe 10.99MB，Publish/ 同步 | tester-1 | 2026-05-23 |
+| TEST-SYNC-PREROLL-001 | 新增 3 个 audio 单元测试（ring buffer 淘汰最旧/channel drain 语义验证） | tester-1 | 2026-05-23 |
+| PREROLL-RINGBUF-001 | 首字丢失根治修复：WarmInputStream 引入环形缓冲区，drain_pre_roll 改读 Mutex<VecDeque>，record() 开始时清空录音 channel，cargo check 0 errors | coder-1 | 2026-05-23 |
 | TEST-SYNC-RENAME-001 | 测试文件同步旧 exe 名替换（voice-ime→feiyin-ime），4 个 Python 测试文件精确替换，config 目录路径保护，未执行构建/测试 | tester-1 | 2026-05-14 |
 | TITLEBAR-ICON-FIX-001 | Tauri setup hook 加 set_icon() 设置标题栏橙色麦克风图标，cargo check 0 errors | coder-1 | 2026-05-14 |
 | ICON-EMBED-001 | feiyin-ime.exe 嵌橙色麦克风图标 + feiyin-ime-ui.exe 用齿轮 ICO，cargo check 0 errors | coder-1 | 2026-05-14 |

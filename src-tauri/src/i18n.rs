@@ -113,8 +113,16 @@ pub struct Strings {
     pub preview_title: &'static str,
     pub preview_close: &'static str,
     pub preview_esc_hint: &'static str,
+    pub preview_title_bar: &'static str,
     pub auto_saved: &'static str,
     pub save_failed: &'static str,
+    pub overlay_error: &'static str,
+    pub error_network_timeout: &'static str,
+    pub error_api_unavailable: &'static str,
+    pub error_model_init: &'static str,
+    pub error_microphone: &'static str,
+    pub error_mic_muted: &'static str,
+    pub error_transcription_empty: &'static str,
 }
 
 static ZH: Strings = Strings {
@@ -251,8 +259,16 @@ Return ONLY the processed text. No explanations."#,
     preview_title: "语音输入结果",
     preview_close: "关闭",
     preview_esc_hint: "(按Esc 取消)",
+    preview_title_bar: "输入文本",
     auto_saved: "已自动保存",
     save_failed: "保存失败：",
+    overlay_error: "识别出错",
+    error_network_timeout: "网络超时，请重试。",
+    error_api_unavailable: "服务不可用，请检查网络或 API 设置。",
+    error_model_init: "语音模型初始化失败。",
+    error_microphone: "麦克风不可用。",
+    error_mic_muted: "麦克风已静音，请取消静音后重试。",
+    error_transcription_empty: "识别结果为空。",
 };
 
 static ZH_TW: Strings = Strings {
@@ -388,8 +404,16 @@ Return ONLY the processed text. No explanations."#,
     preview_title: "語音輸入結果",
     preview_close: "關閉",
     preview_esc_hint: "(按Esc 取消)",
+    preview_title_bar: "輸入文字",
     auto_saved: "已自動儲存",
     save_failed: "儲存失敗：",
+    overlay_error: "識別出錯",
+    error_network_timeout: "網路超時，請重試。",
+    error_api_unavailable: "服務不可用，請檢查網路或 API 設定。",
+    error_model_init: "語音模型初始化失敗。",
+    error_microphone: "麥克風不可用。",
+    error_mic_muted: "麥克風已靜音，請取消靜音後重試。",
+    error_transcription_empty: "識別結果為空。",
 };
 
 static EN: Strings = Strings {
