@@ -551,6 +551,14 @@ Return ONLY the processed text. No explanations."#,
     preview_esc_hint: "(Press Esc to cancel)",
     auto_saved: "Auto saved",
     save_failed: "Save failed: ",
+    preview_title_bar: "Input Text",
+    overlay_error: "Recognition Error",
+    error_network_timeout: "Network timeout, please retry.",
+    error_api_unavailable: "Service unavailable, check network or API settings.",
+    error_model_init: "Voice model initialization failed.",
+    error_microphone: "Microphone unavailable.",
+    error_mic_muted: "Microphone is muted, please unmute and retry.",
+    error_transcription_empty: "Recognition result is empty.",
 };
 
 pub fn get(lang: UiLanguage) -> &'static Strings {

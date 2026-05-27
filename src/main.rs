@@ -2527,6 +2527,36 @@ fn main() -> Result<()> {
     }
     Ok(())
 }
+
+/// FIRSTCHAR-FIX-006 (R3): Find the effective keep-start point in 16kHz samples
+/// by locating speech onset and backtracking a margin to preserve weak aspirated
+/// consonants.  Returns the sample index at which to begin keeping audio;
+/// everything before this index is leading silence to be trimmed.
+///
+/// - Scans in 160-sample (10ms@16kHz) windows for RMS exceeding `threshold`
+/// - Backtracks `backtrack_samples` from the onset to include consonant attack
+/// - If no speech is detected, returns 0 (keep everything — "speak before key" case)
+/// - If speech starts before `backtrack_samples`, returns 0 (no trimming needed)
+fn find_speech_onset_with_backtrack(samples: &[f32], threshold: f32, backtrack_samples: usize) -> usize {
+    let window_size = 160; // 10ms @ 16kHz
+    let mut onset: Option<usize> = None;
+    let mut idx = 0;
+    while idx + window_size <= samples.len() {
+        let window = &samples[idx..idx + window_size];
+        let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
+        if rms > threshold {
+            onset = Some(idx);
+            break;
+        }
+        idx += window_size;
+    }
+
+    match onset {
+        Some(on) => on.saturating_sub(backtrack_samples),
+        None => 0,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(target_os = "windows")]
 fn run_pipeline(
@@ -2558,12 +2588,41 @@ fn run_pipeline(
                 send_event(event_tx, PipelineEvent::Cancelled);
                 return;
             }
-            // HOTKEY-LATENCY-V2-001: prepend 3200 zero-samples (200ms @16kHz)
-            // as silence head to help ASR model with initial context framing
-            let mut padded = Vec::with_capacity(3200 + samples.len());
-            padded.resize(3200, 0.0f32);
-            padded.extend_from_slice(&samples);
-            log::info!("Transcribing {} samples (with 3200-sample silence head)", padded.len());
+            // FIRSTCHAR-FIX-006 (R3): Regulate leading silence before transcription.
+            // Old: prepend fixed 3200-sample (200ms) silence head. With ~600ms
+            // pre_roll silence already in samples, total leading silence could
+            // reach ~800ms, drowning weak aspirated consonants like /pʰ/.
+            //
+            // New approach:
+            // 1. Find speech onset in the 16kHz samples (energy gate)
+            // 2. Backtrack 200ms from onset as the keep-start — guarantees
+            //    aspirated consonant (~60–100ms) is fully preserved
+            // 3. Trim silence before keep-start
+            // 4. Prepend only 50ms silence head (SenseVoice is an offline model
+            //    that does not require long leading silence for frame alignment;
+            //    50ms is just a minimal acoustic padding)
+            //
+            // Result: total leading silence ~250ms instead of ~800ms.
+            const SILENCE_HEAD_SAMPLES: usize = 800; // 50ms @ 16kHz
+            const SPEECH_ONSET_BACKTRACK_SAMPLES: usize = 3200; // 200ms @ 16kHz
+            const SPEECH_ENERGY_THRESHOLD: f32 = 0.008; // lower than VAD threshold to catch weak consonants
+
+            let keep_start = find_speech_onset_with_backtrack(
+                &samples,
+                SPEECH_ENERGY_THRESHOLD,
+                SPEECH_ONSET_BACKTRACK_SAMPLES,
+            );
+            let trimmed = &samples[keep_start..];
+            let mut padded = Vec::with_capacity(SILENCE_HEAD_SAMPLES + trimmed.len());
+            padded.resize(SILENCE_HEAD_SAMPLES, 0.0f32);
+            padded.extend_from_slice(trimmed);
+            log::info!(
+                "Transcribing {} samples (silence_head={}ms, trimmed leading silence by {} samples / {:.0}ms)",
+                padded.len(),
+                SILENCE_HEAD_SAMPLES as f64 / 16.0,
+                keep_start,
+                keep_start as f64 / 16.0,
+            );
             let transcribing_msg = i18n::get(config.ui_language).overlay_transcribing;
             send_event(
                 event_tx,
@@ -3040,6 +3099,7 @@ mod macos_stubs {
 
 #[cfg(test)]
 mod overlay_shimmer_tests {
+    use super::find_speech_onset_with_backtrack;
     #[test]
     fn shimmer_triangle_wave_midpoint() {
         let phase: f32 = 0.5;
@@ -3185,29 +3245,82 @@ mod overlay_shimmer_tests {
 
     #[test]
     fn asr_silence_head_prepended() {
-        // HOTKEY-LATENCY-V2-001: run_pipeline prepends 3200 zero-samples before transcribe
-        let silence_head_len: usize = 3200;
+        // FIRSTCHAR-FIX-006 (R3): run_pipeline prepends 800 zero-samples (50ms@16kHz)
+        // as minimal acoustic padding for the offline SenseVoice model.
+        let silence_head_len: usize = 800;
         let original_samples: usize = 3200;
-        let padded = Vec::with_capacity(silence_head_len + original_samples);
-        let mut padded = padded;
+        let mut padded = Vec::with_capacity(silence_head_len + original_samples);
         padded.resize(silence_head_len, 0.0f32);
         padded.extend_from_slice(&vec![1.0f32; original_samples]);
         assert_eq!(padded.len(), silence_head_len + original_samples,
             "Padded length must be silence_head + original");
         assert!(padded.iter().take(silence_head_len).all(|&s| s == 0.0),
-            "First 3200 samples must be silence (zero)");
+            "First 800 samples must be silence (zero)");
         assert_eq!(padded[silence_head_len], 1.0,
             "Original audio must begin after silence head");
     }
 
     #[test]
-    fn asr_silence_head_is_200ms_at_16khz() {
-        // HOTKEY-LATENCY-V2-001: 3200 samples = 200ms @ 16kHz
+    fn asr_silence_head_is_50ms_at_16khz() {
+        // FIRSTCHAR-FIX-006 (R3): 800 samples = 50ms @ 16kHz
         let sample_rate: u32 = 16000;
-        let silence_head: usize = 3200;
+        let silence_head: usize = 800;
         let duration_ms = (silence_head as f64 / sample_rate as f64) * 1000.0;
-        assert!((duration_ms - 200.0).abs() < 1.0,
-            "3200 samples at 16kHz must be ~200ms (got {:.1}ms)", duration_ms);
+        assert!((duration_ms - 50.0).abs() < 1.0,
+            "800 samples at 16kHz must be ~50ms (got {:.1}ms)", duration_ms);
+    }
+
+    #[test]
+    fn speech_onset_with_backtrack_trims_leading_silence() {
+        // FIRSTCHAR-FIX-006 (R3): find_speech_onset_with_backtrack trims silence
+        // before the speech onset while preserving 200ms backtrack margin.
+        // Construct: 4800-sample silence + 3200-sample speech = 8000 total @ 16kHz
+        let mut samples = vec![0.0f32; 8000];
+        for i in 4800..8000 {
+            samples[i] = 0.1;
+        }
+        // Energy onset at ~4800, backtrack 3200 (200ms) → keep_start = 1600
+        let keep_start = find_speech_onset_with_backtrack(&samples, 0.008, 3200);
+        assert_eq!(keep_start, 1600, "should trim silence before backtrack margin, got {}", keep_start);
+        // Verify speech is preserved
+        assert!(samples[keep_start..].iter().any(|&s| s > 0.05),
+            "speech must be present after trimming");
+    }
+
+    #[test]
+    fn speech_onset_with_backtrack_preserves_aspirated_consonant() {
+        // FIRSTCHAR-FIX-006 (R3): weak consonant at onset must not be trimmed.
+        // Simulate: silence → weak breath (aspirated consonant ~100ms) → strong vowel
+        let mut samples = vec![0.0f32; 9600]; // 600ms @ 16kHz
+        // Weak breath from sample 3200–4800 (100ms of low-energy consonant)
+        for i in 3200..4800 {
+            samples[i] = 0.005; // below threshold 0.008 — aspirated consonant is very quiet
+        }
+        // Strong vowel from sample 4800 onward
+        for i in 4800..9600 {
+            samples[i] = 0.1;
+        }
+        // Energy onset should detect at ~4800 (strong vowel), backtrack 3200 → keep_start = 1600
+        let keep_start = find_speech_onset_with_backtrack(&samples, 0.008, 3200);
+        assert!(keep_start <= 3200,
+            "keep_start must include weak breath consonant, got {} (consonant starts at 3200)",
+            keep_start);
+    }
+
+    #[test]
+    fn speech_onset_with_backtrack_keeps_all_when_no_silence() {
+        // FIRSTCHAR-FIX-006 (R3): "speak before key" — pre_roll already has speech
+        let samples = vec![0.1f32; 3200]; // all speech, no silence
+        let keep_start = find_speech_onset_with_backtrack(&samples, 0.008, 3200);
+        assert_eq!(keep_start, 0, "no leading silence: must keep everything (saturating_sub to 0)");
+    }
+
+    #[test]
+    fn speech_onset_with_backtrack_no_speech_returns_zero() {
+        // FIRSTCHAR-FIX-006 (R3): no speech detected → keep everything
+        let samples = vec![0.0f32; 3200]; // all silence
+        let keep_start = find_speech_onset_with_backtrack(&samples, 0.008, 3200);
+        assert_eq!(keep_start, 0, "no speech detected: must not trim anything");
     }
 
     // === OVERLAY-FIX-005: Processing phase stepping + Preview window layout ===

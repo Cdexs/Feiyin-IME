@@ -9,6 +9,23 @@
 
 | 编号 | 说明 | 负责人 | 完成时间 |
 | --- | --- | --- | --- |
+| FIRSTCHAR-FIX-006 | R2+R3打包：前导静音规整（find_speech_onset_with_backtrack+静音头200→50ms）+ find_speech_anchor 回溯150ms，6新增测试+7旧测试更新，cargo check 0 errors / cargo test 295/0/2 | coder-1 | 2026-05-27 |
+| FIRSTCHAR-FIX-005 | 降采样抗混叠根治送气清声母首字识别错误：resample_anti_alias（Hann窗sinc低通+FIR多相），RecordingState改为存储原生采样率，collect_recording末尾整段重采样，max_frames/log/capacity修复，find_speech_anchor窗口缩放，7新增测试+1重命名+6参数更新，cargo check 0 errors / cargo test 289/0/2 | coder-1 | 2026-05-27 |
+| TEST-EXEC-FIRSTCHAR-004 | FIRSTCHAR-FIX-004 出包：feiyin-ime.exe 10.99MB（12:47 构建，含修正）+ Publish 同步；orchestrator 独立验证 cargo test 282/0/4，audio 32/32 含 2 个 D3 新测试全 PASS（tester-1 kimi-k2.6 卡死，由 orchestrator 接管验证） | orchestrator | 2026-05-26 |
+| FIRSTCHAR-FIX-004-REVIEW | 验收修正：drain cutoff 由 record_start（ensure_stream 后捕获）改为 t_record（函数开头/热键触发时刻），消除冷启动重建期间首字被误清隐患，cargo check 0 errors | orchestrator | 2026-05-26 |
+| FIRSTCHAR-FIX-004 | D3 时间戳精确清空：channel chunk 携带 Instant 时间戳（type AudioChunk），idle drain 只清热键触发前 chunk，精确保留热键后首字音频，collect_recording 新增 post_hotkey_chunks 参数，5 测试更新+2 新增 | coder-1 | 2026-05-26 |
+| TEST-EXEC-FIRSTCHAR-003 | 仅主程序出包：FIRSTCHAR-FIX-003，cargo test 282/0/2，smoke 4/4，feiyin-ime.exe 10.99MB，Publish/已同步 | tester-1 | 2026-05-26 |
+| TEST-EXEC-FIRSTCHAR-002 | 仅主程序出包：FIRSTCHAR-FIX-002，cargo test 282/0/2，smoke 4/4，feiyin-ime.exe 10.99MB，Publish/已同步 | tester-1 | 2026-05-25 |
+| BUILD-RELEASE-20260525 | 出包：FIRSTCHAR-FIX-001 + TEST-WRITE-FIRSTCHAR-001 + I18N-FIX-EN-001，286 PASS / 0 FAIL / 2 IGNORED，smoke 4/4，feiyin-ime.exe 10.99MB / feiyin-ime-ui.exe 8.56MB / crash-reporter.exe 23.68MB，Publish/已同步 | tester-1 | 2026-05-25 |
+| TEST-EXEC-FIRSTCHAR-001 | 首字识别全量测试执行：cargo test 286/0/2，smoke 4/4，时间戳验证 ✅，全回归通过 | tester-1 | 2026-05-25 |
+| TEST-WRITE-FIRSTCHAR-001 | 首字识别测试收紧：1 旧断言收紧(cleared_samples<budget) + 4 边界测试，cargo test 261/0/2 | coder-1 | 2026-05-25 |
+| TEST-SYNC-FIRSTCHAR-001 | 首字识别测试同步审查：审查 5 个现有用例，建议收紧 1 断言 + 设计 4 新边界用例 | tester-1 | 2026-05-25 |
+| FIRSTCHAR-FIX-003 | idle_clear 改为无限清空（full drain），消除 256-channel 满载时 196 陈旧 chunk 残留，cargo check 0 errors，test 261/0/4 | coder-1 | 2026-05-25 |
+| FIRSTCHAR-FIX-002 | idle_clear 从样本预算改为 chunk 数量匹配（消除 WASAPI chunk size 不对齐导致多清一个 chunk），cargo check 0 errors，test 261/0/4 | coder-1 | 2026-05-25 |
+| I18N-FIX-EN-001 | 修复 EN Strings 缺少 8 字段导致 Tauri 编译失败，cargo check 0 errors | coder-1 | 2026-05-25 |
+| TEST-WRITE-FIRSTCHAR-001 | 首字识别测试收紧：1 旧断言收紧(cleared_samples<budget) + 4 边界测试(short_buffer/exact_boundary/all_speech/exact_budget)，cargo test 261/0/2 | coder-1 | 2026-05-25 |
+| FIRSTCHAR-FIX-001 | 首字识别修复：idle_cleared 限量清空 + prime trim 保头部 + find_speech_anchor 函数，cargo check 0 errors，test 259/0/2 | coder-1 | 2026-05-25 |
+| RESEARCH-FIRSTCHAR-001 | 首字识别不稳定根因研究：6候选+5方向，C1竞争窗口最高概率，报告输出 result.md | coder-1 | 2026-05-25 |
 | TEST-EXEC-PREROLL-001 | PREROLL-RINGBUF-001 全量测试 + 出包：273 PASS / 0 FAIL / 2 IGNORED，smoke 4/4，feiyin-ime.exe 10.99MB，Publish/ 同步 | tester-1 | 2026-05-23 |
 | TEST-SYNC-PREROLL-001 | 新增 3 个 audio 单元测试（ring buffer 淘汰最旧/channel drain 语义验证） | tester-1 | 2026-05-23 |
 | PREROLL-RINGBUF-001 | 首字丢失根治修复：WarmInputStream 引入环形缓冲区，drain_pre_roll 改读 Mutex<VecDeque>，record() 开始时清空录音 channel，cargo check 0 errors | coder-1 | 2026-05-23 |
@@ -212,3 +229,7 @@ HOTKEY-LATENCY-FIX-001 | 热键录音视觉延迟 + 偶发首字丢失修复：�
 | UI-ABOUT-FONT-GAP-001 | About 版本卡片 gap 8→48px（6倍间距）+ 检查更新按钮 fontFamily:inherit（对齐侧边栏 Segoe UI Variable 字体） | coder-2 | 2026-05-14 |
 | VERSION-BUMP-001 | 版本号 0.5.3 → 0.5.4（Cargo.toml / src-tauri/Cargo.toml / tauri.conf.json 三处） | coder-1 | 2026-05-14 |
 | BUILD-RELEASE-20260514K | 出包：VERSION-BUMP-001（v0.5.4），270 PASS / 0 FAIL，feiyin-ime.exe 10.98MB / feiyin-ime-ui.exe 8.75MB / crash-reporter.exe 24.84MB，git push 34331c1 | tester-1 | 2026-05-14 |
+| TEST-SYNC-FIRSTCHAR-001 | FIRSTCHAR-FIX-001 测试审查：5 个现有用例审查、1 处断言收紧建议、4 个新增边界用例设计、3 项不可自动化目视验收建议 | tester-1 | 2026-05-25 |
+| TEST-EXEC-FIRSTCHAR-001 | FIRSTCHAR-FIX-001 全量构建出包：Step 1~7 完整执行，cargo test 286 PASS / 0 FAIL / 2 IGNORED，smoke 4/4 PASS，feiyin-ime.exe 10.99MB / feiyin-ime-ui.exe 8.56MB / crash-reporter.exe 23.68MB | tester-1 | 2026-05-25 |
+| TEST-EXEC-FIRSTCHAR-002 | FIRSTCHAR-FIX-002 构建出包（仅 Rust 主程序，无前端改动）：cargo test 282 PASS / 0 FAIL / 2 IGNORED，smoke 4/4 PASS，feiyin-ime.exe 10.99MB / crash-reporter.exe 23.68MB，供 Gavin 端测"派发"识别 | tester-1 | 2026-05-25 |
+| TEST-EXEC-FIRSTCHAR-003 | FIRSTCHAR-FIX-003 构建出包（idle_clear 改为 full drain）：cargo test 282 PASS / 0 FAIL / 2 IGNORED，smoke 4/4 PASS，feiyin-ime.exe 10.99MB / crash-reporter.exe 23.68MB，供 Gavin 端测"派对"/"派发"短词识别 | tester-1 | 2026-05-26 |
