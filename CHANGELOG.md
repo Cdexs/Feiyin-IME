@@ -5,6 +5,12 @@
 
 ---
 
+## v0.6.1 - B-002-FIX 下载引导卡修复（2026-07-07）
+
+| 编号 | 说明 | 负责人 | 完成时间 |
+| --- | --- | --- | --- |
+| ASR-DUAL-B-002-FIX | `<a target="_blank">` → invoke('open_url_in_browser') + URL 文本 `<code>` 渲染 + 独立复制按钮状态（copiedField） + 三语 i18n + 4 Vitest 用例（ASR-UI-009/010/011），npm build ✅ 35/35 PASS | coder-2 | 2026-07-07 |
+
 ## v0.6.0 - ASR 双模型 + 正式出包（2026-07-06）
 
 | 编号 | 说明 | 负责人 | 完成时间 |

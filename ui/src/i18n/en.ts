@@ -37,6 +37,7 @@ export const en = {
   voice_asr_model_accuracy: 'Higher Accuracy',
   voice_asr_model_download_required: 'To use the “Higher Accuracy” model, please download the model first.',
   voice_asr_model_download_url: 'Download Model',
+  voice_asr_model_open_download: 'Open Download Page',
   voice_asr_model_target_dir: 'Target Directory',
   voice_asr_model_manual_download: 'You can also download the model manually and place it in this directory.',
   voice_copy: 'Copy',

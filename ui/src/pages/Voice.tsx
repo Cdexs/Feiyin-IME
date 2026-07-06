@@ -16,7 +16,7 @@ interface AccuracyModelInfo {
 const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
   const [devices, setDevices] = useState<string[]>([]);
   const [modelInfo, setModelInfo] = useState<AccuracyModelInfo | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [copiedField, setCopiedField] = useState<'url' | 'dir' | null>(null);
   const t = getTranslations(config.ui_language);
 
   const asrModel = config.audio?.asr_model ?? "performance";
@@ -83,13 +83,23 @@ const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
     }
   };
 
+  const handleCopyUrl = async () => {
+    const url = modelInfo?.download_url;
+    if (!url) return;
+    const ok = await copyToClipboard(url);
+    if (ok) {
+      setCopiedField('url');
+      setTimeout(() => setCopiedField(null), 2000);
+    }
+  };
+
   const handleCopyPath = async () => {
     const path = modelInfo?.model_dir;
     if (!path) return;
     const ok = await copyToClipboard(path);
     if (ok) {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      setCopiedField('dir');
+      setTimeout(() => setCopiedField(null), 2000);
     } else {
       window.alert(t.voice_asr_model_manual_download);
     }
@@ -171,14 +181,26 @@ const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
               <p className="asr-model-alert-title">{t.voice_asr_model_download_required}</p>
               <div className="asr-model-field">
                 <span className="asr-model-label">{t.voice_asr_model_download_url}</span>
-                <a
-                  href={modelInfo!.download_url}
-                  target="_blank"
-                  rel="noopener noreferrer"
+                <button
+                  type="button"
+                  onClick={() => invoke('open_url_in_browser', { url: modelInfo!.download_url }).catch(() => {})}
                   className="btn btn-primary btn-sm"
                 >
-                  {t.voice_asr_model_download_url}
-                </a>
+                  {t.voice_asr_model_open_download}
+                </button>
+              </div>
+              <div className="asr-model-field">
+                <span className="asr-model-label">{t.voice_asr_model_download_url}</span>
+                <div className="asr-model-path-row">
+                  <code className="asr-model-path">{modelInfo!.download_url}</code>
+                  <button
+                    type="button"
+                    onClick={handleCopyUrl}
+                    className="btn btn-secondary btn-sm"
+                  >
+                    {copiedField === 'url' ? t.voice_copied : t.voice_copy}
+                  </button>
+                </div>
               </div>
               <div className="asr-model-field">
                 <span className="asr-model-label">{t.voice_asr_model_target_dir}</span>
@@ -189,7 +211,7 @@ const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
                     onClick={handleCopyPath}
                     className="btn btn-secondary btn-sm"
                   >
-                    {copied ? t.voice_copied : t.voice_copy}
+                    {copiedField === 'dir' ? t.voice_copied : t.voice_copy}
                   </button>
                 </div>
               </div>

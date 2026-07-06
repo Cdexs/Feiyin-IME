@@ -37,6 +37,7 @@ export const zhHans = {
   voice_asr_model_accuracy: '准确率更高',
   voice_asr_model_download_required: '选择“准确率更高”模型后，需先下载模型才能启用该模式。',
   voice_asr_model_download_url: '下载模型',
+  voice_asr_model_open_download: '打开下载页',
   voice_asr_model_target_dir: '目标存放目录',
   voice_asr_model_manual_download: '也可自行下载后放置到该目录。',
   voice_copy: '复制',

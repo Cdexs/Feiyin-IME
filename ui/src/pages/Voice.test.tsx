@@ -236,10 +236,85 @@ describe("VoicePage — ASR Model", () => {
     renderVoice({ audio: { asr_model: "accuracy" } });
 
     await waitFor(() => {
-      expect(screen.getByText(/复制/i)).toBeInTheDocument();
+      expect(screen.getAllByText('复制', { exact: true })).toHaveLength(2);
     });
 
-    fireEvent.click(screen.getByText(/复制/i));
+    const copyBtns = screen.getAllByText('复制', { exact: true });
+    fireEvent.click(copyBtns[1]);
+
+    await waitFor(() => {
+      expect(mockClipboard.writeText).toHaveBeenCalledWith("C:\\models\\accuracy");
+    });
+  });
+
+  it("ASR-UI-009: download button calls open_url_in_browser", async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_audio_devices") return [];
+      if (cmd === "check_accuracy_model_ready") {
+        return { ready: false, model_dir: "C:\\models\\accuracy", download_url: "https://example.com/model" };
+      }
+      return null;
+    });
+
+    renderVoice({ audio: { asr_model: "accuracy" } });
+
+    await waitFor(() => {
+      expect(screen.getByText('打开下载页')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('打开下载页'));
+
+    await waitFor(() => {
+      expect(mockedInvoke).toHaveBeenCalledWith('open_url_in_browser', { url: "https://example.com/model" });
+    });
+  });
+
+  it("ASR-UI-010: displays download URL as visible code element", async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_audio_devices") return [];
+      if (cmd === "check_accuracy_model_ready") {
+        return { ready: false, model_dir: "C:\\models\\accuracy", download_url: "https://example.com/model" };
+      }
+      return null;
+    });
+
+    renderVoice({ audio: { asr_model: "accuracy" } });
+
+    await waitFor(() => {
+      const codeElem = screen.getByText("https://example.com/model");
+      expect(codeElem).toBeInTheDocument();
+      expect(codeElem.tagName).toBe("CODE");
+    });
+  });
+
+  it("ASR-UI-011: URL and dir copy states are independent", async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_audio_devices") return [];
+      if (cmd === "check_accuracy_model_ready") {
+        return { ready: false, model_dir: "C:\\models\\accuracy", download_url: "https://example.com/model" };
+      }
+      return null;
+    });
+
+    renderVoice({ audio: { asr_model: "accuracy" } });
+
+    await waitFor(() => {
+      expect(screen.getAllByText('复制', { exact: true })).toHaveLength(2);
+    });
+
+    const copyBtns = screen.getAllByText('复制', { exact: true });
+    fireEvent.click(copyBtns[0]);
+
+    await waitFor(() => {
+      expect(mockClipboard.writeText).toHaveBeenCalledWith("https://example.com/model");
+      expect(screen.getByText('已复制')).toBeInTheDocument();
+      expect(screen.getAllByText('复制', { exact: true })).toHaveLength(1);
+    });
+
+    mockClipboard.writeText.mockClear();
+
+    const remaining = screen.getAllByText('复制', { exact: true });
+    fireEvent.click(remaining[0]);
 
     await waitFor(() => {
       expect(mockClipboard.writeText).toHaveBeenCalledWith("C:\\models\\accuracy");
