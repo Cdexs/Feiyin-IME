@@ -146,10 +146,18 @@ pub struct AudioConfig {
     /// Enable streaming ASR mode (2-pass: streaming + offline correction)
     #[serde(default)]
     pub enable_streaming: bool,
+    /// ASR 模型选择（DEC-025）："performance"(默认,179MB CTC) | "accuracy"(972MB native+hotwords)
+    /// 旧配置无此字段时 serde default 等效于 "performance"，行为与直换前完全一致
+    #[serde(default = "default_asr_model")]
+    pub asr_model: String,
 }
 
 fn default_overlay_opacity() -> f32 {
     1.0
+}
+
+fn default_asr_model() -> String {
+    "performance".to_string()
 }
 
 impl Default for AudioConfig {
@@ -161,6 +169,7 @@ impl Default for AudioConfig {
             overlay_opacity: default_overlay_opacity(),
             input_device: String::new(),
             enable_streaming: false, // 默认使用 offline 模式
+            asr_model: default_asr_model(),
         }
     }
 }
@@ -778,5 +787,82 @@ clipboard_delay_ms = 150
         cfg.save_to(&env.config_path()).expect("save should succeed");
         let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
         assert!(loaded.punctuation.enabled, "explicit true should survive roundtrip");
+    }
+
+    // ============================================================
+    // ASR-DUAL-B-001 双模型配置兼容性测试
+    // ============================================================
+
+    /// ASR-CONFIG-001: 默认 asr_model 为 "performance"
+    #[test]
+    fn asr_model_default_is_performance() {
+        let cfg = AppConfig::default();
+        assert_eq!(
+            cfg.audio.asr_model, "performance",
+            "default asr_model must be 'performance'"
+        );
+    }
+
+    /// ASR-CONFIG-002: 旧 config.toml（无 asr_model 字段）加载时使用默认 "performance"
+    /// 保证向后兼容：行为与直换前完全一致（除默认模型本体更换外）
+    #[test]
+    fn asr_model_missing_field_uses_default_performance() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        let old_toml = r#"
+ui_language = "Chinese"
+auto_learn_threshold = 2
+auto_start = false
+
+[llm]
+api_url = "https://api.openai.com/v1"
+api_key = ""
+model = "gpt-4o-mini"
+system_prompt = "prompt"
+enabled = true
+connectivity_verified = false
+
+[hotkey]
+vk_code = 120
+modifiers = 0
+display_name = "F9"
+mode = "Toggle"
+
+[audio]
+silence_threshold = 0.01
+transcription_language = "zh"
+chinese_script = "Simplified"
+overlay_opacity = 1.0
+input_device = ""
+enable_streaming = false
+
+[injection]
+use_clipboard = true
+clipboard_delay_ms = 150
+"#;
+        std::fs::write(&env.config_path(), old_toml).unwrap();
+        let loaded = AppConfig::load_from(&env.config_path()).expect("should load old config");
+        assert_eq!(
+            loaded.audio.asr_model, "performance",
+            "missing asr_model field should default to 'performance'"
+        );
+    }
+
+    /// ASR-CONFIG-003: asr_model="accuracy" 可正确序列化/反序列化
+    #[test]
+    fn asr_model_accuracy_roundtrip() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        let mut cfg = AppConfig::default();
+        cfg.audio.asr_model = "accuracy".to_string();
+
+        cfg.save_to(&env.config_path()).expect("save should succeed");
+        let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
+        assert_eq!(
+            loaded.audio.asr_model, "accuracy",
+            "accuracy setting should survive roundtrip"
+        );
     }
 }

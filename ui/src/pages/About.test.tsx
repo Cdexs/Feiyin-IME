@@ -15,14 +15,14 @@ describe("AboutPage", () => {
 
   it("renders page title in Chinese", () => {
     render(<AboutPage config={mockConfig} updateConfig={mockUpdateConfig} />);
-    const title = screen.getByText("飞音语音输入");
+    const title = screen.getByText("飞音智能语音输入");
     expect(title).toBeInTheDocument();
   });
 
   it("renders page title in English", () => {
     const enConfig = { ...mockConfig, ui_language: "English" };
     render(<AboutPage config={enConfig} updateConfig={mockUpdateConfig} />);
-    const title = screen.getByText("Feiyin Voice Input");
+    const title = screen.getByText("Feiyin Smart Voice Input");
     expect(title).toBeInTheDocument();
   });
 

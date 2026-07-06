@@ -2083,6 +2083,55 @@ fn set_auto_start(enabled: bool) -> Result<()> {
     }
     Ok(())
 }
+/// ASR-DUAL-B-001: 加载 hotwords 字符串（仅 accuracy 模式需要）
+/// 从 wordbook 读取所有 corrected 词条，按 id 排序保证哈希稳定，构建逗号分隔字符串
+/// performance 模式返回 None（不支持 hotwords）
+#[cfg(target_os = "windows")]
+fn load_hotwords_for_accuracy(config: &AppConfig) -> Option<String> {
+    if transcription::AsrModel::from_config(&config.audio.asr_model)
+        != transcription::AsrModel::Accuracy
+    {
+        return None;
+    }
+    match wordbook::Wordbook::open() {
+        Ok(wb) => match wb.list_all() {
+            Ok(entries) => {
+                // list_all 已按 id DESC 排序，确定性顺序
+                let pairs: Vec<(String, String)> = entries
+                    .into_iter()
+                    .map(|e| (e.raw, e.corrected))
+                    .collect();
+                let s = transcription::build_hotwords_string(&pairs);
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to load wordbook for hotwords: {}", e);
+                None
+            }
+        },
+        Err(e) => {
+            log::warn!("Failed to open wordbook for hotwords: {}", e);
+            None
+        }
+    }
+}
+
+/// ASR-DUAL-B-001: 计算 hotwords 字符串的版本号（用于对比是否需要重建）
+#[cfg(target_os = "windows")]
+fn compute_hotwords_version(hotwords: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    let count = hotwords.split(',').filter(|s| !s.trim().is_empty()).count();
+    count.hash(&mut hasher);
+    hotwords.hash(&mut hasher);
+    hasher.finish()
+}
+
 #[cfg(target_os = "windows")]
 fn spawn_worker_thread(
     worker_rx: crossbeam_channel::Receiver<WorkerCommand>,
@@ -2113,11 +2162,17 @@ fn spawn_worker_thread(
         // PERF-BATCH-001 TASK-1: Pre-initialize Transcriber at startup.
         // Previously created inside the Start handler, loading ONNX models on every recording (~1-2s delay).
         // Now created once and reused across all recording sessions.
+        //
+        // DEC-025 双模型架构：transcriber 可热重载（asr_model 变更或词库变更触发）。
+        // 重建异步进行，期间继续用旧实例不阻塞录音。
         let config = clone_runtime_config(&runtime_config);
-        let transcriber = match transcription::Transcriber::new(
+        let initial_hotwords = load_hotwords_for_accuracy(&config);
+        let mut transcriber = match transcription::Transcriber::new(
             &model_dir,
             config.audio.enable_streaming,
             config.audio.transcription_language.clone(),
+            transcription::AsrModel::from_config(&config.audio.asr_model),
+            initial_hotwords.as_deref(),
         ) {
             Ok(t) => Some(t),
             Err(err) => {
@@ -2125,6 +2180,21 @@ fn spawn_worker_thread(
                 None
             }
         };
+
+        // ASR-DUAL-B-001: 热重载 channel —— 后台线程构建结果（成功=新实例，失败=Err）经此送回。
+        // 失败也必须回消息，用于清除 in_flight 标志，否则构建中窗口会重复 spawn 重建线程。
+        let (asr_reload_tx, asr_reload_rx) =
+            crossbeam_channel::bounded::<Result<transcription::Transcriber, String>>(1);
+        // 重建进行中标志：spawn 时置 true，收到成功/失败消息时清除。
+        // 防止 ~6s 构建窗口内每次 Start 都重复 spawn（并发加载多个 972MB 模型）。
+        let mut asr_reload_in_flight = false;
+        // 当前已生效的 asr_model + hotwords_version，用于对比是否需要重建
+        let mut active_asr_model: transcription::AsrModel = transcription::AsrModel::from_config(
+            &config.audio.asr_model,
+        );
+        let mut active_hotwords_version: u64 =
+            transcriber.as_ref().map(|t| t.hotwords_version()).unwrap_or(0);
+        let mut active_language: String = config.audio.transcription_language.clone();
 
         // PERF-INIT-001: Pre-initialize LlmClient once; update_config() before each use.
         let mut llm_client = llm::LlmClient::new(config.llm.clone());
@@ -2152,6 +2222,23 @@ fn spawn_worker_thread(
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             };
+            // ASR-DUAL-B-001: 非阻塞检查热重载结果（后台线程构建完成后送回）
+            match asr_reload_rx.try_recv() {
+                Ok(Ok(new_transcriber)) => {
+                    log::info!("ASR transcriber hot-reload completed, swapping instance");
+                    active_asr_model = new_transcriber.asr_model();
+                    active_hotwords_version = new_transcriber.hotwords_version();
+                    active_language = new_transcriber.language().to_string();
+                    transcriber = Some(new_transcriber);
+                    asr_reload_in_flight = false;
+                }
+                Ok(Err(e)) => {
+                    // active_* 保持旧值，下次 Start 对比仍不一致 → 自然重试
+                    log::warn!("ASR transcriber hot-reload failed: {}, keeping old instance", e);
+                    asr_reload_in_flight = false;
+                }
+                Err(_) => {}
+            }
             match cmd {
                 None => {
                     // HOTKEY-STREAM-PREWARM-001: idle health check pre-rebuilds
@@ -2171,6 +2258,60 @@ fn spawn_worker_thread(
                     } else {
                         Some(config.audio.input_device.as_str())
                     };
+
+                    // ASR-DUAL-B-001: 检查是否需要热重载 transcriber
+                    // 触发条件：asr_model 变更 / transcription_language 变更 / accuracy 模式下词库变更
+                    let desired_asr_model =
+                        transcription::AsrModel::from_config(&config.audio.asr_model);
+                    let desired_hotwords = load_hotwords_for_accuracy(&config);
+                    let desired_hotwords_version = match &desired_hotwords {
+                        Some(h) => compute_hotwords_version(h),
+                        None => 0,
+                    };
+                    let needs_reload = active_asr_model != desired_asr_model
+                        || active_language != config.audio.transcription_language
+                        || (desired_asr_model == transcription::AsrModel::Accuracy
+                            && active_hotwords_version != desired_hotwords_version);
+                    if needs_reload && !asr_reload_in_flight {
+                        log::info!(
+                            "Triggering ASR transcriber hot-reload: model {:?}->{:?}, lang {}->{}, hotwords_version {}->{}",
+                            active_asr_model,
+                            desired_asr_model,
+                            active_language,
+                            config.audio.transcription_language,
+                            active_hotwords_version,
+                            desired_hotwords_version
+                        );
+                        asr_reload_in_flight = true;
+                        let reload_model_dir = model_dir.clone();
+                        let reload_streaming = config.audio.enable_streaming;
+                        let reload_language = config.audio.transcription_language.clone();
+                        let reload_hotwords = desired_hotwords.clone();
+                        let reload_tx = asr_reload_tx.clone();
+                        std::thread::spawn(move || {
+                            let t_build = std::time::Instant::now();
+                            match transcription::Transcriber::new(
+                                &reload_model_dir,
+                                reload_streaming,
+                                reload_language,
+                                desired_asr_model,
+                                reload_hotwords.as_deref(),
+                            ) {
+                                Ok(new_t) => {
+                                    log::info!(
+                                        "ASR transcriber rebuild completed in {:.1}s",
+                                        t_build.elapsed().as_secs_f64()
+                                    );
+                                    let _ = reload_tx.send(Ok(new_t));
+                                }
+                                Err(e) => {
+                                    // 失败也必须回消息，worker 侧据此清除 in_flight 标志
+                                    let _ = reload_tx.send(Err(e.to_string()));
+                                }
+                            }
+                        });
+                    }
+
                     log::info!("[Latency] worker received Start command");
                     let samples_result = audio_capture.record(
                         Arc::clone(&stop_recording_signal),
@@ -2628,21 +2769,24 @@ fn run_pipeline(
                 event_tx,
                 PipelineEvent::Processing(transcribing_msg.to_string()),
             );
-            match transcriber.transcribe(
+            match transcriber.transcribe_with_punct_info(
                 &padded,
-                &config.audio.transcription_language,
                 config.audio.chinese_script,
             ) {
                 Err(e) => {
                     log::error!("Transcription error: {}", e);
                     send_event(event_tx, PipelineEvent::Error(e.to_string()));
                 }
-                Ok(raw_text) => {
+                Ok((raw_text, native_punctuated)) => {
                     if cancel_signal.load(Ordering::Relaxed) {
                         send_event(event_tx, PipelineEvent::Cancelled);
                         return;
                     }
-                    log::info!("Transcribed: {}", raw_text);
+                    log::info!(
+                        "Transcribed: {} (native_punctuated={})",
+                        raw_text,
+                        native_punctuated
+                    );
                     // Skip downstream processing when transcription output is empty.
                     if raw_text.trim().is_empty() {
                         log::warn!("Transcription result is empty, skipping LLM and injection");
@@ -2779,11 +2923,12 @@ fn run_pipeline(
                             config.audio.chinese_script,
                         )
                     };
-                    // PUNCT-INTEGRATION-001: Apply local punctuation when:
-                    // - auto_punct=true (config.punctuation.enabled)
-                    // - LLM did NOT handle the text (LLM adds its own punctuation)
-                    // - Translation was NOT requested this recording (CT2 output already has punctuation)
-                    let final_text = if config.punctuation.enabled && !llm_handled && !translate_requested {
+                    // PUNCT-INTEGRATION-001 + ASR-PUNCT-OPT-001: 标点决策
+                    // 条件：auto_punct=true && LLM 未处理 && 非翻译 && 非native自带标点
+                    // - native_punctuated=true（accuracy native 成功）→ 跳过标点引擎（省一次推理）
+                    // - native_punctuated=false（performance/兜底/混合）→ 照常走标点引擎
+                    // - auto_punct=false && native_punctuated=true → 后处理剥标点（修复"关了开关 native 照样出标点"缺口）
+                    let final_text = if config.punctuation.enabled && !llm_handled && !translate_requested && !native_punctuated {
                         if let Some(ref mut engine) = punctuation_engine {
                             match engine.add_punctuation(&final_text) {
                                 Some(punctuated) => {
@@ -2799,6 +2944,13 @@ fn run_pipeline(
                             log::debug!("Punctuation engine not available, skipping");
                             final_text
                         }
+                    } else if !config.punctuation.enabled && native_punctuated && !llm_handled && !translate_requested {
+                        // ASR-PUNCT-OPT-001: 用户关了自动标点但 native 自带标点 → 剥离
+                        let stripped = transcription::strip_punctuation(&final_text);
+                        if stripped != final_text {
+                            log::info!("Stripped native punctuation (auto_punct=false): '{}' -> '{}'", final_text, stripped);
+                        }
+                        stripped
                     } else {
                         final_text
                     };

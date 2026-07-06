@@ -13,6 +13,7 @@ mod wordbook;
 use audio::get_input_devices;
 use config::{AppConfig, LlmConfig};
 use llm::LlmClient;
+use serde::Serialize;
 use tauri::Manager;
 
 #[tauri::command]
@@ -69,6 +70,36 @@ fn check_hotkey_available(vk_code: u32, modifiers: u32) -> bool {
         }
         ok
     }
+}
+
+/// ASR-DUAL-B-003: 检测 accuracy 模型是否已就位（供前端下载引导用）
+/// 返回 JSON: { ready, model_dir, download_url }
+/// 与 coder-2 前端接口契约，command 名与字段名不得擅改
+#[tauri::command]
+fn check_accuracy_model_ready() -> AccuracyModelStatus {
+    let model_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("models");
+    let dir = model_dir.join("sherpa-onnx-funasr-nano-int8-2025-12-30");
+    let enc = dir.join("encoder_adaptor.int8.onnx");
+    let llm = dir.join("llm.int8.onnx");
+    let emb = dir.join("embedding.int8.onnx");
+    let tok = dir.join("Qwen3-0.6B");
+    let ready = dir.exists() && enc.exists() && llm.exists() && emb.exists() && tok.exists();
+    AccuracyModelStatus {
+        ready,
+        model_dir: dir.display().to_string(),
+        download_url: "https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models".to_string(),
+    }
+}
+
+#[derive(Serialize)]
+struct AccuracyModelStatus {
+    ready: bool,
+    model_dir: String,
+    download_url: String,
 }
 
 #[cfg(target_os = "windows")]
@@ -151,6 +182,7 @@ fn main() {
             test_llm_connection,
             get_audio_devices,
             check_hotkey_available,
+            check_accuracy_model_ready,
             version_check::get_version_info,
             version_check::force_check_latest_version,
             version_check::open_url_in_browser,

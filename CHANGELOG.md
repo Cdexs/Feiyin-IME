@@ -5,10 +5,42 @@
 
 ---
 
-## v0.5.4 - 进行中
+## v0.6.0 - ASR 双模型 + 正式出包（2026-07-06）
 
 | 编号 | 说明 | 负责人 | 完成时间 |
 | --- | --- | --- | --- |
+| ASR-SWAP-A-001 | 默认模型直换 179MB FunASR Nano CTC（ensure_sensevoice_model 目录名更换），PoC bin 对照验证 blank_penalty 0.5 无副作用保留，5 语识别正常首字完整，cargo check 0 errors | coder-1 | 2026-07-06 |
+| ASR-DUAL-B-001 | 后端双模型架构：AsrModel enum（performance/accuracy）+ Transcriber 重构 + 异步热重载（channel+后台线程+unsafe impl Send）+ accuracy 分支 native 模型 + config 层 hotwords（词库哈希版本号感知）+ hallucination 兜底（常驻 performance recognizer 重转）+ 14 单测，cargo test 314/0/4 | coder-1 | 2026-07-06 |
+| ASR-DUAL-B-003 | Tauri 后端同步：src-tauri/config.rs AudioConfig 加 asr_model 字段（防 round-trip 丢字段）+ check_accuracy_model_ready command（{ready,model_dir,download_url} 接口契约），i18n 评估无需改动，cargo check src-tauri 0 errors | coder-1 | 2026-07-06 |
+| HOTRELOAD-FIX-001 | 热重载并发防护修正（Orchestrator 验收发现并直接修正）：asr_reload_in_flight 标志 + channel 传 Result（失败回信号）+ active 状态统一 swap 更新 + Transcriber::language() getter，防 6s 构建窗口重复 spawn 并发加载 972MB 模型 | Orchestrator | 2026-07-06 |
+| TEST-SYNC/EXEC-ASR-DUAL-001 | Rust 单测审查无缺口 + cargo test 314/0/4 + Vitest 32/0 + 完整出包 + Publish 同步 254MB 新模型；产物同步错误被验收拦截，BUILD-FIX 修正（feiyin-ime-ui.exe 正确同步、三处陈旧 voice-ime-ui.exe 删除） | tester-1 | 2026-07-06 |
+| VERSION-BUMP-003 | 版本号 0.5.4 → 0.6.0（Gavin 指示）：根 Cargo.toml + src-tauri/Cargo.toml + tauri.conf.json，中文 productName 完好，cargo check 双侧 0 errors | coder-1 | 2026-07-06 |
+| BUILD-RELEASE-0.6.0 | 0.6.0 完整出包：npm build + Tauri UI + 主程序全量构建，Step 4 cp 正确（feiyin-ime-ui.exe），Publish 三 exe 同步，ProductVersion 0.6.0 核实通过，冒烟 13s 无崩溃；文档债务补齐（result.md BUILD-FIX 记录 + troubleshooting BUILD-FIX-SYNC-001 + CHANGELOG） | tester-1 | 2026-07-06 |
+| ASR-NATIVE-LONG-001 | accuracy 长音频空输出根因调查（max_total_len=512 KV cache 限制，~28s 以上截断生成 0 token）+ 兜底加固（空输出/hallucination/n-gram 环路检测→fallback→Err，绝不静默注入垃圾）+ is_repetitive_garbage 函数 + 8 单测 + 分段转录调研报告（推荐 VAD 分段），cargo check 0 errors / cargo test 323/0/4 | coder-1 | 2026-07-06 |
+| ASR-LONG-AUDIO-001 | VAD 分段转录根治 native 长音频上限（DEC-026 路径A）：新增 src/transcription/vad.rs（VadSegmenter 懒加载 + 分段纯函数 + 14 单测）+ mod.rs accuracy 长音频(>24s) VAD 切分逐段转录拼接（段≤20s+200ms padding+三重兜底+拼接），performance 分支不碰，VAD 缺失降级单次转录，silero VAD 模型 643KB，PoC bin 验证 30/60/90s 切分正常，cargo test 337/0/4；附 RESEARCH-ASR-PUNCT-001 标点研究结论（CTC 无标点不可替代，native 自带标点 accuracy 可省） | coder-1 | 2026-07-06 |
+| ASR-PUNCT-OPT-001 | accuracy 模式启用模型自带标点（跳过标点引擎）：transcribe_with_punct_info 返回(text,native_punctuated) + 标点决策追加!native_punctuated + strip_punctuation 函数（中英标点剥离，保守不剥小数点/URL）+ 12 单测，performance 零改动，兜底来源判定基于文本出处非配置，cargo test 348/0/5 | coder-1 | 2026-07-06 |
+| TEST-EXEC-NATIVE-LONG-001 | 测试执行 + 出包：cargo test 323/0/4（+8 repetitive_garbage 单测）✅，仅主程序出包（11,065,856 B, 21:06），ProductVersion 0.6.0 核实通过，冒烟 13s 无崩溃；仅更新 feiyin-ime.exe，Tauri UI 沿用现有 | tester-1 | 2026-07-06 |
+
+## v0.5.4 - research (2026-07-06)
+
+| 编号 | 说明 | 负责人 | 完成时间 |
+| --- | --- | --- | --- |
+| RESEARCH-QWEN3ASR-001 | Qwen3-ASR-0.6B 替换可行性研究：结论观望（有条件 go），发现更优候选 FunASR Nano int8（179MB，支持 hotwords），sherpa-onnx 1.12.38 原生支持无需升级依赖；Qwen3-ASR 体积 938MB 超红线；附阶段二 PoC 设计 | coder-1 | 2026-07-06 |
+| POC-QWEN3ASR-002A | FunASR Nano PoC：下载两套模型（179MB CTC+802.7MB原生）+ PoC bin（src/bin/poc_funasr_nano.rs）+ V1 RTF（native 4线程 0.185✅/2线程 0.223⚠️）+ V3 内存（native 1.6GB✅远低于预估4-5GB）+ hotwords 通路验证（config层实证纠正紫菜→酯✅，create_stream_with_hotwords对非transducer报错）+ 研究报告勘误 | coder-1 | 2026-07-06 |
+| POC-QWEN3ASR-002A-FIX | PoC bin 增加 --model-dir 参数（002B 基线组加载生产模型），0 warnings，生产模型加载验证（zh.wav 丢"开"复现 FIRSTCHAR 痛点） | coder-1 | 2026-07-06 |
+| POC-QWEN3ASR-002B | V2 hotwords 送气短词纠偏对比（40 wav × 4 组）：✅ PASS——(d) native+hotwords 首字 80% vs (a) 生产 70%（+10pp 达标）vs (c) native 62.5%（+17.5pp）；(b) 179MB CTC 黑马 75% 零风险；发现 native decoder hallucination 风险（qidian_v1 RTF 2.66 乱码）+ hotwords 推理延迟翻倍；报告 collab/research/poc-funasr-nano-B.md | tester-1 | 2026-07-06 |
+| ASR-DUAL-B-002 | 配置界面 ASR 模型选择 + 下载引导：Voice.tsx 新增 performance/accuracy 单选 + check_accuracy_model_ready 调用 + 未下载提示卡（下载链接/目标目录/一键复制）+ 三语 i18n + 7 项 Vitest 用例，npm build 通过；Note：全量 Vitest 仍有 2 个 About.test.tsx 既有失败与本任务无关 | coder-2 | 2026-07-06 |
+| TEST-SYNC-ASR-DUAL-B002 | 测试同步：Voice.test.tsx 审查补缺（新增 ASR-UI-008 useEffect 重检测）+ About.test.tsx 产品名期望修正（飞音智能语音输入/Feiyin Smart Voice Input）+ E2E 评估无需改动；边界遵守 ✅ | tester-1 | 2026-07-06 |
+| TEST-SYNC-ASR-DUAL-001 + TEST-EXEC-ASR-DUAL-001 | 测试同步（Rust 单测 4 检查点全覆盖无缺口）+ 测试执行（cargo test 314/0/4 ✅ + Vitest 32/0 ✅）+ 完整出包（npm+Tauri UI+主程序）+ Publish 同步（含 254MB 新模型目录）+ 运行时冒烟通过 | tester-1 | 2026-07-06 |
+
+## v0.5.4 - patch (2026-05-28)
+
+| 编号 | 说明 | 负责人 | 完成时间 |
+| --- | --- | --- | --- |
+| BUILD-RELEASE-VERSION-REVERT-001 | 版本号回退到 0.5.4 后完整出包（前端+Tauri UI+主程序全重建），两 exe winres ProductVersion 均为 0.5.4，cargo test 295/0/2，smoke 4/4，feiyin-ime.exe + feiyin-ime-ui.exe (16:43)，Publish/已同步 | tester-1 | 2026-05-28 |
+| VERSION-REVERT-001 | 版本号回退 0.5.5 → 0.5.4（Cargo.toml + src-tauri/Cargo.toml + tauri.conf.json），cargo check 0 errors | coder-1 | 2026-05-28 |
+| TEST-EXEC-VERSION-BUMP-002 | 0.5.5 完整出包（前端+Tauri UI+主程序全重建），两 exe winres 属性版本号均确认 0.5.5，cargo test 295/0/2，smoke 4/4，feiyin-ime.exe + feiyin-ime-ui.exe (21:05)，Publish/已同步 | tester-1 | 2026-05-27 |
+| VERSION-BUMP-002 | 版本号 0.5.4 → 0.5.5（Cargo.toml + src-tauri/Cargo.toml + tauri.conf.json），cargo check 0 errors | coder-1 | 2026-05-27 |
 | FIRSTCHAR-FIX-006 | R2+R3打包：前导静音规整（find_speech_onset_with_backtrack+静音头200→50ms）+ find_speech_anchor 回溯150ms，6新增测试+7旧测试更新，cargo check 0 errors / cargo test 295/0/2 | coder-1 | 2026-05-27 |
 | FIRSTCHAR-FIX-005 | 降采样抗混叠根治送气清声母首字识别错误：resample_anti_alias（Hann窗sinc低通+FIR多相），RecordingState改为存储原生采样率，collect_recording末尾整段重采样，max_frames/log/capacity修复，find_speech_anchor窗口缩放，7新增测试+1重命名+6参数更新，cargo check 0 errors / cargo test 289/0/2 | coder-1 | 2026-05-27 |
 | TEST-EXEC-FIRSTCHAR-004 | FIRSTCHAR-FIX-004 出包：feiyin-ime.exe 10.99MB（12:47 构建，含修正）+ Publish 同步；orchestrator 独立验证 cargo test 282/0/4，audio 32/32 含 2 个 D3 新测试全 PASS（tester-1 kimi-k2.6 卡死，由 orchestrator 接管验证） | orchestrator | 2026-05-26 |

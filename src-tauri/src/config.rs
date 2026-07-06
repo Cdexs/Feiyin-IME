@@ -102,10 +102,19 @@ pub struct AudioConfig {
     /// Enable streaming ASR mode (2-pass: streaming + offline correction)
     #[serde(default)]
     pub enable_streaming: bool,
+    /// ASR 模型选择（DEC-025）："performance"(默认) | "accuracy"
+    /// 必须与主程序 src/config/mod.rs AudioConfig.asr_model 同步，
+    /// 否则配置界面保存时会静默丢弃主程序写入的 asr_model（round-trip 数据丢失）
+    #[serde(default = "default_asr_model")]
+    pub asr_model: String,
 }
 
 fn default_overlay_opacity() -> f32 {
     0.75
+}
+
+fn default_asr_model() -> String {
+    "performance".to_string()
 }
 
 impl Default for AudioConfig {
@@ -117,6 +126,7 @@ impl Default for AudioConfig {
             overlay_opacity: default_overlay_opacity(),
             input_device: String::new(),
             enable_streaming: false, // 默认使用 offline 模式
+            asr_model: default_asr_model(),
         }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "feiyin-ime-ui"
-version = "0.5.4"
+version = "0.6.1"
 description = "Settings UI for voice-ime"
 authors = ["you"]
 edition = "2021"

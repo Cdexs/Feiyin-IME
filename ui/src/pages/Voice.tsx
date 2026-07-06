@@ -7,13 +7,27 @@ interface Props {
   updateConfig: (cfg: any) => void;
 }
 
+interface AccuracyModelInfo {
+  ready: boolean;
+  model_dir: string;
+  download_url: string;
+}
+
 const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
   const [devices, setDevices] = useState<string[]>([]);
+  const [modelInfo, setModelInfo] = useState<AccuracyModelInfo | null>(null);
+  const [copied, setCopied] = useState(false);
   const t = getTranslations(config.ui_language);
+
+  const asrModel = config.audio?.asr_model ?? "performance";
 
   useEffect(() => {
     loadDevices();
   }, []);
+
+  useEffect(() => {
+    checkAccuracyModelReady();
+  }, [asrModel]);
 
   const loadDevices = async () => {
     try {
@@ -24,12 +38,64 @@ const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
     }
   };
 
+  const checkAccuracyModelReady = async () => {
+    try {
+      const info = await invoke<AccuracyModelInfo>("check_accuracy_model_ready");
+      setModelInfo(info);
+    } catch (e) {
+      console.warn("Failed to check accuracy model readiness:", e);
+      setModelInfo(null);
+    }
+  };
+
   const handleAudioChange = (field: string, value: any) => {
     updateConfig({
       ...config,
       audio: { ...config.audio, [field]: value }
     });
   };
+
+  const copyToClipboard = async (text: string): Promise<boolean> => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (e) {
+      console.warn("Clipboard API failed:", e);
+    }
+
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    textarea.style.pointerEvents = "none";
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+      const ok = document.execCommand("copy");
+      return ok;
+    } catch (e) {
+      console.warn("execCommand copy failed:", e);
+      return false;
+    } finally {
+      document.body.removeChild(textarea);
+    }
+  };
+
+  const handleCopyPath = async () => {
+    const path = modelInfo?.model_dir;
+    if (!path) return;
+    const ok = await copyToClipboard(path);
+    if (ok) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } else {
+      window.alert(t.voice_asr_model_manual_download);
+    }
+  };
+
+  const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.ready;
 
   return (
     <div className="settings-page">
@@ -45,7 +111,7 @@ const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
             className="select-input"
           >
             <option value="">{t.voice_default_device}</option>
-            {devices.map(d => <option key={d} value={d}>{d}</option>)}
+            {devices?.map(d => <option key={d} value={d}>{d}</option>)}
           </select>
         </div>
       </section>
@@ -65,6 +131,73 @@ const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
             <option value="ko">{t.voice_language_ko}</option>
             <option value="yue">{t.voice_language_yue}</option>
           </select>
+        </div>
+      </section>
+
+      <section className="settings-section">
+        <h3 className="section-title">{t.voice_asr_model}</h3>
+        <div className="card">
+          <div className="radio-group">
+            <label className={`radio-card ${asrModel === 'performance' ? 'active' : ''}`}>
+              <input
+                type="radio"
+                name="asr_model"
+                checked={asrModel === 'performance'}
+                onChange={() => handleAudioChange('asr_model', 'performance')}
+                className="radio-input"
+              />
+              <span className="custom-radio"></span>
+              <div className="radio-content">
+                <span className="radio-title">{t.voice_asr_model_performance}</span>
+              </div>
+            </label>
+            <label className={`radio-card ${asrModel === 'accuracy' ? 'active' : ''}`}>
+              <input
+                type="radio"
+                name="asr_model"
+                checked={asrModel === 'accuracy'}
+                onChange={() => handleAudioChange('asr_model', 'accuracy')}
+                className="radio-input"
+              />
+              <span className="custom-radio"></span>
+              <div className="radio-content">
+                <span className="radio-title">{t.voice_asr_model_accuracy}</span>
+              </div>
+            </label>
+          </div>
+
+          {showAccuracyAlert && (
+            <div className="asr-model-alert">
+              <p className="asr-model-alert-title">{t.voice_asr_model_download_required}</p>
+              <div className="asr-model-field">
+                <span className="asr-model-label">{t.voice_asr_model_download_url}</span>
+                <a
+                  href={modelInfo!.download_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="btn btn-primary btn-sm"
+                >
+                  {t.voice_asr_model_download_url}
+                </a>
+              </div>
+              <div className="asr-model-field">
+                <span className="asr-model-label">{t.voice_asr_model_target_dir}</span>
+                <div className="asr-model-path-row">
+                  <code className="asr-model-path">{modelInfo!.model_dir}</code>
+                  <button
+                    type="button"
+                    onClick={handleCopyPath}
+                    className="btn btn-secondary btn-sm"
+                  >
+                    {copied ? t.voice_copied : t.voice_copy}
+                  </button>
+                </div>
+              </div>
+              <p className="form-hint" style={{ marginTop: '8px' }}>
+                {t.voice_asr_model_manual_download}
+              </p>
+            </div>
+          )}
         </div>
       </section>
 
