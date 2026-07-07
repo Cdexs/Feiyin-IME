@@ -42,6 +42,7 @@ fn main() {
     println!("repeat     : {}", cfg.repeat);
     println!("hotwords   : {:?}", cfg.hotwords);
     println!("blank_penalty: {}", cfg.blank_penalty);
+    println!("rule_fsts  : {:?}", cfg.rule_fsts);
     println!();
 
     // Build recognizer config by model type
@@ -49,6 +50,7 @@ fn main() {
     recognizer_config.model_config.num_threads = cfg.threads;
     recognizer_config.model_config.provider = Some("cpu".to_string());
     recognizer_config.model_config.debug = false;
+    recognizer_config.rule_fsts = cfg.rule_fsts.clone();
 
     if cfg.model_type == "sensevoice" {
         let model_path = model_root.join("model.int8.onnx");
@@ -74,10 +76,10 @@ fn main() {
                 tokenizer: Some(tok.to_str().unwrap().to_string()),
                 system_prompt: Some("You are a helpful assistant.".to_string()),
                 user_prompt: Some("语音转写:".to_string()),
-                max_new_tokens: 0, // 0 = use model default
-            temperature: 1.0,
-            top_p: 1.0,
-            seed: 42,
+                max_new_tokens: cfg.max_new_tokens,
+            temperature: cfg.temperature,
+            top_p: cfg.top_p,
+            seed: cfg.seed,
             language: None, // None = auto detect
             itn: 1,
             hotwords: cfg.hotwords.clone(),
@@ -148,6 +150,11 @@ struct PocConfig {
     threads: i32,
     repeat: usize,
     blank_penalty: f32,
+    rule_fsts: Option<String>,
+    temperature: f32,
+    top_p: f32,
+    seed: i32,
+    max_new_tokens: i32,
 }
 
 fn parse_args(args: &[String]) -> Result<PocConfig, String> {
@@ -158,6 +165,11 @@ fn parse_args(args: &[String]) -> Result<PocConfig, String> {
     let mut threads: i32 = 4;
     let mut repeat: usize = 1;
     let mut blank_penalty: f32 = 0.0;
+    let mut rule_fsts: Option<String> = None;
+    let mut temperature: f32 = 1.0;
+    let mut top_p: f32 = 1.0;
+    let mut seed: i32 = 42;
+    let mut max_new_tokens: i32 = 0;
 
     let mut i = 1;
     while i < args.len() {
@@ -213,6 +225,49 @@ fn parse_args(args: &[String]) -> Result<PocConfig, String> {
                     .parse()
                     .map_err(|_| "invalid --blank-penalty".to_string())?;
             }
+            "--rule-fsts" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--rule-fsts requires value".into());
+                }
+                rule_fsts = Some(args[i].clone());
+            }
+            "--temperature" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--temperature requires value".into());
+                }
+                temperature = args[i]
+                    .parse()
+                    .map_err(|_| "invalid --temperature".to_string())?;
+            }
+            "--top-p" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--top-p requires value".into());
+                }
+                top_p = args[i]
+                    .parse()
+                    .map_err(|_| "invalid --top-p".to_string())?;
+            }
+            "--seed" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--seed requires value".into());
+                }
+                seed = args[i]
+                    .parse()
+                    .map_err(|_| "invalid --seed".to_string())?;
+            }
+            "--max-new-tokens" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--max-new-tokens requires value".into());
+                }
+                max_new_tokens = args[i]
+                    .parse()
+                    .map_err(|_| "invalid --max-new-tokens".to_string())?;
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -239,6 +294,11 @@ fn parse_args(args: &[String]) -> Result<PocConfig, String> {
         threads,
         repeat,
         blank_penalty,
+        rule_fsts,
+        temperature,
+        top_p,
+        seed,
+        max_new_tokens,
     })
 }
 
@@ -263,6 +323,6 @@ fn resolve_model_root(model_type: &str) -> PathBuf {
 
 fn print_usage() {
     eprintln!(
-        "Usage: poc_funasr_nano [wav...] [--model-type sensevoice|funasr-nano] [--model-dir <path>] [--hotwords \"w1,w2\"] [--threads N] [--repeat N] [--blank-penalty F]"
+        "Usage: poc_funasr_nano [wav...] [--model-type sensevoice|funasr-nano] [--model-dir <path>] [--hotwords \"w1,w2\"] [--threads N] [--repeat N] [--blank-penalty F] [--rule-fsts <path>] [--temperature F] [--top-p F] [--seed N] [--max-new-tokens N]"
     );
 }

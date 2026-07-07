@@ -63,6 +63,13 @@ impl VadSegmenter {
     }
 
     /// 对音频做 VAD 分段，返回切分后的段样本列表（已含 padding）。
+    ///
+    /// FIX-VAD-STATE-RESET-001: detector 在 Transcriber 生命周期内复用。
+    /// `clear()` 仅清空段队列，不重置内部全局样本游标。第二次长音频
+    /// 调用时 seg.start() 返回累计的绝对坐标（接着上次音频末尾），
+    /// 导致 build_padded_segments slice 越界 panic（crash.json 实测
+    /// range start 812992 out of range for slice of length 770400）。
+    /// 修复：segment() 末尾 `clear()` 后调 `reset()`，将游标归零。
     pub fn segment(&self, samples: &[f32]) -> Vec<Vec<f32>> {
         // 喂样本：silero VAD 按 window_size=512 块处理
         let win = VAD_WINDOW_SIZE as usize;
@@ -84,13 +91,16 @@ impl VadSegmenter {
             })
         })
         .collect();
+        // FIX-VAD-STATE-RESET-001: clear 清段队列 + reset 归零全局样本游标，
+        // 确保下次 segment() 调用的 seg.start() 从 0 开始（相对本次音频）。
         self.detector.clear();
+        self.detector.reset();
 
         if raw.is_empty() {
             return Vec::new();
         }
 
-        // 合并 + padding + 从原音频提取
+        // 合并 + padding + 从原音频提取（纵深防御：内部对越界段做过滤/clamp）
         build_padded_segments(&raw, samples.len(), samples)
     }
 }
@@ -117,6 +127,11 @@ fn find_silero_vad_model(model_dir: &Path) -> Option<PathBuf> {
 /// 2. 单段自身 > SEGMENT_MAX_SECS（VAD max_speech_duration 已硬切，兜底）→ 硬切
 /// 3. 每段前后加 SEGMENT_PADDING_SAMPLES，padding 区填 0（静音保护边界音节）
 /// 4. padding 不超出原音频边界，相邻段 padding 不重叠
+///
+/// FIX-VAD-STATE-RESET-001 纵深防御：对 raw 段做边界过滤——
+/// - start >= total_samples 的段丢弃并 log warn（detector 游标未重置导致越界）
+/// - end 超界 clamp 到 total_samples
+/// - 任何情况下不允许 slice 越界
 pub fn build_padded_segments(
     raw: &[(usize, usize)],
     total_samples: usize,
@@ -128,11 +143,25 @@ pub fn build_padded_segments(
     let max_seg_samples = (SEGMENT_MAX_SECS * 16000.0) as usize;
     let pad = SEGMENT_PADDING_SAMPLES;
 
-    // 第一步：合并相邻短段 → (start, end) 列表
+    // 第一步：边界过滤 + 合并相邻短段 → (start, end) 列表
+    // FIX-VAD-STATE-RESET-001: 丢弃 start 越界的段（detector 游标未重置
+    // 致 seg.start() 返回跨音频累计坐标），clamp end 越界段
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for &(start, len) in raw {
-        let end = start + len;
-        if len >= max_seg_samples {
+        if start >= total_samples {
+            log::warn!(
+                "VAD segment start {} >= total_samples {}, dropping (detector cursor not reset?)",
+                start,
+                total_samples
+            );
+            continue;
+        }
+        let end = (start + len).min(total_samples);
+        let clamped_len = end - start;
+        if clamped_len == 0 {
+            continue;
+        }
+        if clamped_len >= max_seg_samples {
             // 单段超上限：硬切
             let mut pos = start;
             while pos < end {
@@ -150,6 +179,10 @@ pub fn build_padded_segments(
             }
         }
         merged.push((start, end));
+    }
+
+    if merged.is_empty() {
+        return Vec::new();
     }
 
     // 第二步：加 padding 并提取样本
@@ -187,7 +220,7 @@ pub fn build_padded_segments(
         if pad_start < start {
             seg.extend(std::iter::repeat(0.0f32).take(start - pad_start));
         }
-        // 主段（start 到 end）：从原音频取
+        // 主段（start 到 end）：从原音频取（end 已 clamp 到 total_samples，安全）
         seg.extend_from_slice(&full_audio[start..end.min(total_samples)]);
         // padding 区（end 到 pad_end）填 0
         if end < pad_end {
@@ -202,6 +235,34 @@ pub fn build_padded_segments(
 pub fn should_segment(samples: &[f32]) -> bool {
     let secs = samples.len() as f64 / 16000.0;
     secs > SEGMENT_TRIGGER_SECS
+}
+
+/// ASR-SINGLE-MODEL-001（DEC-027）：朴素等分切段。
+///
+/// VAD segmenter 不可用时的兜底分段策略：按 SEGMENT_MAX_SECS 硬切，
+/// 保证 accuracy 长音频在 VAD 模型缺失时仍可用（禁止 >28s 整段喂 native，
+/// max_total_len=512 是未定义行为区）。
+///
+/// 与 VAD 分段的差异：
+/// - 无语音活动检测，静音段也被转录（native 模型对静音输出空，join 后自动过滤）
+/// - 无 padding（朴素切分不需保护边界音节，段间边界可能在句中）
+/// - 最后一段可能 < SEGMENT_MAX_SECS
+///
+/// 边界覆盖保证：start..end 步进 max_seg_samples，最后一段包含余量，
+/// 全部样本被覆盖，无遗漏。
+pub fn naive_chunk(samples: &[f32]) -> Vec<Vec<f32>> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let max_seg_samples = (SEGMENT_MAX_SECS * 16000.0) as usize;
+    let mut result = Vec::new();
+    let mut offset = 0usize;
+    while offset < samples.len() {
+        let end = (offset + max_seg_samples).min(samples.len());
+        result.push(samples[offset..end].to_vec());
+        offset = end;
+    }
+    result
 }
 
 /// 拼接分段文本（中文直接连接；段尾/段首均为拉丁字母间补空格）
@@ -335,6 +396,201 @@ mod tests {
     fn find_silero_missing_returns_none() {
         let tmp = std::env::temp_dir().join("vad-nonexist-xyz-test");
         assert!(find_silero_vad_model(&tmp).is_none());
+    }
+
+    // ============================================================
+    // FIX-VAD-STATE-RESET-001: 越界防御 + 连续调用测试
+    // ============================================================
+
+    #[test]
+    fn build_padded_drops_start_out_of_range() {
+        // 模拟 crash.json 场景：raw 段 start 超出 total_samples
+        // 第二次音频只有 770400 samples，但 detector 游标未 reset 致 start=812992
+        let audio: Vec<f32> = (0..770400).map(|i| i as f32).collect();
+        let raw = vec![(812992, 16000)]; // start 越界
+        let result = build_padded_segments(&raw, 770400, &audio);
+        assert!(result.is_empty(), "out-of-range start segment must be dropped, not panic");
+    }
+
+    #[test]
+    fn build_padded_clamps_end_out_of_range() {
+        // end 越界（start 在界内，start+len 超出 total）→ clamp 不 panic
+        let audio: Vec<f32> = (0..32000).map(|i| i as f32).collect();
+        let raw = vec![(16000, 32000)]; // start=16000 在界内，end=48000 越界
+        let result = build_padded_segments(&raw, 32000, &audio);
+        assert_eq!(result.len(), 1, "end-clamped segment must be kept");
+        // 段内容 = audio[16000..32000]（clamped end）+ 末尾 padding
+        // pad_start = 16000 - 3200 = 12800, pad_end = min(32000+3200, 32000) = 32000
+        // seg = [12800..16000 zeros] + [16000..32000 audio] = 19200 samples
+        assert_eq!(result[0].len(), 19200);
+        // padding 区为 0
+        assert_eq!(result[0][0], 0.0);
+        assert_eq!(result[0][3199], 0.0);
+        // 主段起始 = audio[16000]
+        assert_eq!(result[0][3200], audio[16000]);
+    }
+
+    #[test]
+    fn build_padded_mixed_in_range_and_out_of_range() {
+        // 混合：第一个段在界内，第二个段 start 越界（detector 游标累计）
+        let audio: Vec<f32> = (0..50000).map(|i| i as f32).collect();
+        let raw = vec![(0, 16000), (60000, 16000)]; // 第二段 start 越界
+        let result = build_padded_segments(&raw, 50000, &audio);
+        assert_eq!(result.len(), 1, "only in-range segment kept, out-of-range dropped");
+    }
+
+    #[test]
+    fn build_padded_all_out_of_range_returns_empty() {
+        // 全部段 start 越界 → 返回空，不 panic
+        let audio: Vec<f32> = vec![0.0; 1000];
+        let raw = vec![(1000, 100), (2000, 100), (3000, 100)];
+        let result = build_padded_segments(&raw, 1000, &audio);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn build_padded_zero_len_after_clamp_skipped() {
+        // start 恰好等于 total_samples → 边界丢弃；start 在界内但 len=0 → clamp 后 0 长度跳过
+        let audio: Vec<f32> = vec![0.0; 1000];
+        let raw = vec![(500, 0), (1000, 100)]; // 0 长 + 边界
+        let result = build_padded_segments(&raw, 1000, &audio);
+        assert!(result.is_empty(), "zero-length and boundary segments skipped");
+    }
+
+    #[test]
+    #[ignore = "requires working ORT runtime (vendor ORT 1.17.1 may not support API v24)"]
+    fn vad_segmenter_consecutive_calls_no_panic() {
+        // FIX-VAD-STATE-RESET-001 核心测试：连续两次 segment() 调用，
+        // 第二次段起点必须在第二次音频范围内（验证 reset 归零游标）。
+        // 使用真实 silero VAD 模型（若存在）；否则跳过。
+        let project_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let model_dir = project_root.join("models");
+        let segmenter = match VadSegmenter::try_new(&model_dir) {
+            Some(s) => s,
+            None => {
+                eprintln!("skip: silero_vad.onnx not found at {}, VAD model required", model_dir.display());
+                return;
+            }
+        };
+
+        // 合成第一段长音频：30s 含两个语音段（用 sine 模拟语音能量）
+        let audio1: Vec<f32> = (0..480000)
+            .map(|i| {
+                let t = i as f32 / 16000.0;
+                // 0-10s 有语音 + 10-20s 静音 + 20-30s 有语音
+                if (5.0..=10.0).contains(&t) || (25.0..=30.0).contains(&t) {
+                    (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.3
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+
+        // 合成第二段长音频：40s（比第一段长，验证游标归零后起点在界内）
+        let audio2: Vec<f32> = (0..640000)
+            .map(|i| {
+                let t = i as f32 / 16000.0;
+                if (5.0..=15.0).contains(&t) || (25.0..=35.0).contains(&t) {
+                    (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.3
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+
+        // 第一次调用：不应 panic
+        let segs1 = segmenter.segment(&audio1);
+        assert!(!segs1.is_empty(), "first call should produce segments");
+
+        // 第二次调用：核心断言——不应 panic，段起点必须在 audio2 范围内
+        // 旧 bug：seg.start() 返回 480000+（接着 audio1 末尾），slice 越界 panic
+        let segs2 = segmenter.segment(&audio2);
+        assert!(!segs2.is_empty(), "second call should produce segments");
+        // 每段长度 ≤ SEGMENT_MAX_SECS + padding 裕量
+        for seg in &segs2 {
+            let seg_secs = seg.len() as f64 / 16000.0;
+            assert!(
+                seg_secs <= SEGMENT_MAX_SECS + 0.5,
+                "segment {:.1}s exceeds {}s limit",
+                seg_secs,
+                SEGMENT_MAX_SECS
+            );
+        }
+    }
+
+    // ============================================================
+    // ASR-SINGLE-MODEL-001: naive_chunk 朴素等分切段测试
+    // ============================================================
+
+    #[test]
+    fn naive_chunk_empty() {
+        let result = naive_chunk(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn naive_chunk_exact_one_segment() {
+        // 恰好 20s = 320000 samples → 1 段
+        let samples: Vec<f32> = (0..320000).map(|i| i as f32).collect();
+        let result = naive_chunk(&samples);
+        assert_eq!(result.len(), 1, "exactly 20s must be 1 segment");
+        assert_eq!(result[0].len(), 320000);
+        // 覆盖完整性：第一段从 0 开始
+        assert_eq!(result[0][0], 0.0);
+        assert_eq!(result[0][319999], 319999.0);
+    }
+
+    #[test]
+    fn naive_chunk_just_over_one_segment() {
+        // 20.1s = 321600 samples → 2 段（320000 + 1600）
+        let samples: Vec<f32> = (0..321600).map(|i| i as f32).collect();
+        let result = naive_chunk(&samples);
+        assert_eq!(result.len(), 2, "20.1s must be 2 segments");
+        assert_eq!(result[0].len(), 320000, "first segment = 20s");
+        assert_eq!(result[1].len(), 1600, "second segment = 0.1s remainder");
+        // 覆盖完整性：第二段从 320000 开始
+        assert_eq!(result[1][0], 320000.0);
+        assert_eq!(result[1][1599], 321599.0);
+    }
+
+    #[test]
+    fn naive_chunk_60s_three_segments() {
+        // 60s = 960000 samples → 3 段（各 20s）
+        let samples: Vec<f32> = (0..960000).map(|i| i as f32).collect();
+        let result = naive_chunk(&samples);
+        assert_eq!(result.len(), 3, "60s must be 3 segments");
+        for seg in &result {
+            assert_eq!(seg.len(), 320000, "each segment = 20s");
+        }
+        // 覆盖完整性：段连续无遗漏
+        assert_eq!(result[0][0], 0.0);
+        assert_eq!(result[1][0], 320000.0);
+        assert_eq!(result[2][0], 640000.0);
+        assert_eq!(result[2][319999], 959999.0);
+    }
+
+    #[test]
+    fn naive_chunk_coverage_completeness() {
+        // 验证所有样本被覆盖，无遗漏、无重复
+        let samples: Vec<f32> = (0..500000).map(|i| i as f32).collect();
+        let result = naive_chunk(&samples);
+        let mut covered: Vec<f32> = Vec::new();
+        for seg in &result {
+            covered.extend_from_slice(seg);
+        }
+        assert_eq!(covered.len(), 500000, "all samples must be covered");
+        assert_eq!(covered, samples, "coverage must be exact, no gaps/overlaps");
+    }
+
+    #[test]
+    fn naive_chunk_uneven_remainder() {
+        // 50s = 800000 samples → 2 段 20s + 1 段 10s
+        let samples: Vec<f32> = (0..800000).map(|i| i as f32).collect();
+        let result = naive_chunk(&samples);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].len(), 320000);
+        assert_eq!(result[1].len(), 320000);
+        assert_eq!(result[2].len(), 160000, "last segment = 10s remainder");
     }
 
     /// 集成验证：真实 VAD 模型切分长音频（30/60/90s）

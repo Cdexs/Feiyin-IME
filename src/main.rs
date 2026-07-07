@@ -2698,6 +2698,33 @@ fn find_speech_onset_with_backtrack(samples: &[f32], threshold: f32, backtrack_s
     }
 }
 
+/// ASR-ACC-OPT-001 方案 B + ASR-CTC-OPT-001 P1：根据 ASR 模型选择前处理参数。
+///
+/// 返回 (silence_head_samples, onset_backtrack_samples)。
+/// - Performance: 0ms head / 200ms backtrack（ASR-CTC-OPT-001 P1：50→0ms，
+///   研究 RESEARCH-ASR-CTC-OPT-001 C1 证实 0ms 比 50ms 高 2.5pp，50ms 是旧
+///   SenseVoice 遗产，FunASR Nano CTC 是 offline 模型不需 frame alignment padding）
+/// - Accuracy: 0ms head / 100ms backtrack（native decoder 对前导静音敏感，
+///   研究 RESEARCH-ASR-ACCURACY-001 R1 证实 50ms 静音头让 native 掉 10pp）
+///
+/// 提取为纯函数便于单测分支选择逻辑。
+#[cfg(target_os = "windows")]
+fn select_preprocessing_params(asr_model: transcription::AsrModel) -> (usize, usize) {
+    const PERF_SILENCE_HEAD_SAMPLES: usize = 0; // 0ms @ 16kHz (performance, ASR-CTC-OPT-001 P1)
+    const PERF_ONSET_BACKTRACK_SAMPLES: usize = 3200; // 200ms @ 16kHz (performance, 不动)
+    const ACC_SILENCE_HEAD_SAMPLES: usize = 0; // 0ms @ 16kHz (accuracy)
+    const ACC_ONSET_BACKTRACK_SAMPLES: usize = 1600; // 100ms @ 16kHz (accuracy)
+
+    match asr_model {
+        transcription::AsrModel::Accuracy => {
+            (ACC_SILENCE_HEAD_SAMPLES, ACC_ONSET_BACKTRACK_SAMPLES)
+        }
+        transcription::AsrModel::Performance => {
+            (PERF_SILENCE_HEAD_SAMPLES, PERF_ONSET_BACKTRACK_SAMPLES)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(target_os = "windows")]
 fn run_pipeline(
@@ -2736,33 +2763,45 @@ fn run_pipeline(
             //
             // New approach:
             // 1. Find speech onset in the 16kHz samples (energy gate)
-            // 2. Backtrack 200ms from onset as the keep-start — guarantees
+            // 2. Backtrack from onset as the keep-start — guarantees
             //    aspirated consonant (~60–100ms) is fully preserved
             // 3. Trim silence before keep-start
-            // 4. Prepend only 50ms silence head (SenseVoice is an offline model
-            //    that does not require long leading silence for frame alignment;
-            //    50ms is just a minimal acoustic padding)
+            // 4. Prepend silence head (see select_preprocessing_params: performance
+            //    0ms per ASR-CTC-OPT-001 P1, accuracy 0ms per ASR-ACC-OPT-001)
             //
-            // Result: total leading silence ~250ms instead of ~800ms.
-            const SILENCE_HEAD_SAMPLES: usize = 800; // 50ms @ 16kHz
-            const SPEECH_ONSET_BACKTRACK_SAMPLES: usize = 3200; // 200ms @ 16kHz
+            // Result: total leading silence minimized, no frame alignment padding
+            // needed (offline models don't require it).
+            //
+            // ASR-ACC-OPT-001 方案 B + ASR-CTC-OPT-001 P1: 前处理参数按模型分支。
+            // 研究依据（RESEARCH-ASR-ACCURACY-001 R1 + RESEARCH-ASR-CTC-OPT-001 C1）：
+            // native decoder 对前导静音极度敏感（50ms 掉 10pp），CTC 也敏感但弱
+            // （50ms 掉 2.5pp）。两模型均用 0ms head（offline 不需 frame alignment
+            // padding，原 50ms 是旧 SenseVoice 遗产）。accuracy 模式：silence head
+            // 0ms + onset backtrack 200→100ms（native 对送气声母不如 CTC 敏感，
+            // 少留前导静音更安全）。
+            // performance 模式：保持 50ms/200ms 不变（为 CTC 调优，零改动红线）。
             const SPEECH_ENERGY_THRESHOLD: f32 = 0.008; // lower than VAD threshold to catch weak consonants
+
+            let is_accuracy = transcriber.asr_model() == transcription::AsrModel::Accuracy;
+            let (silence_head_samples, onset_backtrack_samples) =
+                select_preprocessing_params(transcriber.asr_model());
 
             let keep_start = find_speech_onset_with_backtrack(
                 &samples,
                 SPEECH_ENERGY_THRESHOLD,
-                SPEECH_ONSET_BACKTRACK_SAMPLES,
+                onset_backtrack_samples,
             );
             let trimmed = &samples[keep_start..];
-            let mut padded = Vec::with_capacity(SILENCE_HEAD_SAMPLES + trimmed.len());
-            padded.resize(SILENCE_HEAD_SAMPLES, 0.0f32);
+            let mut padded = Vec::with_capacity(silence_head_samples + trimmed.len());
+            padded.resize(silence_head_samples, 0.0f32);
             padded.extend_from_slice(trimmed);
             log::info!(
-                "Transcribing {} samples (silence_head={}ms, trimmed leading silence by {} samples / {:.0}ms)",
+                "Transcribing {} samples (silence_head={}ms, trimmed leading silence by {} samples / {:.0}ms, asr_model={})",
                 padded.len(),
-                SILENCE_HEAD_SAMPLES as f64 / 16.0,
+                silence_head_samples as f64 / 16.0,
                 keep_start,
                 keep_start as f64 / 16.0,
+                if is_accuracy { "accuracy" } else { "performance" },
             );
             let transcribing_msg = i18n::get(config.ui_language).overlay_transcribing;
             send_event(
@@ -3397,29 +3436,33 @@ mod overlay_shimmer_tests {
 
     #[test]
     fn asr_silence_head_prepended() {
-        // FIRSTCHAR-FIX-006 (R3): run_pipeline prepends 800 zero-samples (50ms@16kHz)
-        // as minimal acoustic padding for the offline SenseVoice model.
-        let silence_head_len: usize = 800;
+        // ASR-CTC-OPT-001 P1: run_pipeline prepends 0 zero-samples (0ms@16kHz)
+        // for performance (CTC). Offline models don't need frame alignment padding.
+        // ASR-ACC-OPT-001: accuracy also uses 0ms head.
+        let silence_head_len: usize = 0;
         let original_samples: usize = 3200;
         let mut padded = Vec::with_capacity(silence_head_len + original_samples);
         padded.resize(silence_head_len, 0.0f32);
         padded.extend_from_slice(&vec![1.0f32; original_samples]);
         assert_eq!(padded.len(), silence_head_len + original_samples,
             "Padded length must be silence_head + original");
-        assert!(padded.iter().take(silence_head_len).all(|&s| s == 0.0),
-            "First 800 samples must be silence (zero)");
+        if silence_head_len > 0 {
+            assert!(padded.iter().take(silence_head_len).all(|&s| s == 0.0),
+                "First {} samples must be silence (zero)", silence_head_len);
+        }
         assert_eq!(padded[silence_head_len], 1.0,
             "Original audio must begin after silence head");
     }
 
     #[test]
-    fn asr_silence_head_is_50ms_at_16khz() {
-        // FIRSTCHAR-FIX-006 (R3): 800 samples = 50ms @ 16kHz
+    fn asr_silence_head_is_0ms_at_16khz() {
+        // ASR-CTC-OPT-001 P1: 0 samples = 0ms @ 16kHz (performance/CTC)
+        // 原 50ms (800 samples) 是旧 SenseVoice 遗产，研究 C1 证实 0ms 高 2.5pp
         let sample_rate: u32 = 16000;
-        let silence_head: usize = 800;
+        let silence_head: usize = 0;
         let duration_ms = (silence_head as f64 / sample_rate as f64) * 1000.0;
-        assert!((duration_ms - 50.0).abs() < 1.0,
-            "800 samples at 16kHz must be ~50ms (got {:.1}ms)", duration_ms);
+        assert!((duration_ms - 0.0).abs() < 1.0,
+            "0 samples at 16kHz must be ~0ms (got {:.1}ms)", duration_ms);
     }
 
     #[test]
@@ -3907,5 +3950,46 @@ mod overlay_shimmer_tests {
         assert_eq!(r, 0x70, "BTN_BORDER R = 0x70");
         assert_eq!(r, g, "BTN_BORDER must be neutral gray (R=G)");
         assert_eq!(g, b, "BTN_BORDER must be neutral gray (G=B)");
+    }
+
+    // ============================================================
+    // ASR-ACC-OPT-001 方案 B + ASR-CTC-OPT-001 P1: select_preprocessing_params 分支测试
+    // ============================================================
+
+    use super::{select_preprocessing_params, transcription};
+
+    #[test]
+    fn preprocessing_params_performance_uses_0ms_head_200ms_backtrack() {
+        // ASR-CTC-OPT-001 P1: performance silence head 50→0ms（研究 C1 证实 0ms 高 2.5pp）
+        let (head, backtrack) = select_preprocessing_params(transcription::AsrModel::Performance);
+        assert_eq!(head, 0, "performance silence head = 0 samples (0ms @ 16kHz, ASR-CTC-OPT-001 P1)");
+        assert_eq!(backtrack, 3200, "performance onset backtrack = 3200 samples (200ms @ 16kHz, 不动)");
+    }
+
+    #[test]
+    fn preprocessing_params_accuracy_uses_0ms_head_100ms_backtrack() {
+        // 方案 B：accuracy 用 0ms head / 100ms backtrack
+        let (head, backtrack) = select_preprocessing_params(transcription::AsrModel::Accuracy);
+        assert_eq!(head, 0, "accuracy silence head = 0 samples (0ms, LLM decoder needs no frame padding)");
+        assert_eq!(backtrack, 1600, "accuracy onset backtrack = 1600 samples (100ms @ 16kHz)");
+    }
+
+    #[test]
+    fn preprocessing_params_both_models_use_0ms_head() {
+        // ASR-CTC-OPT-001 P1: 两模型都用 0ms head（offline 模型不需 frame alignment padding）
+        let (perf_head, _) = select_preprocessing_params(transcription::AsrModel::Performance);
+        let (acc_head, _) = select_preprocessing_params(transcription::AsrModel::Accuracy);
+        assert_eq!(perf_head, 0, "performance head must be 0");
+        assert_eq!(acc_head, 0, "accuracy head must be 0");
+    }
+
+    #[test]
+    fn preprocessing_params_accuracy_backtrack_less_than_performance() {
+        // native 对送气声母不如 CTC 敏感，少留 backtrack 减少前导静音
+        let (_, perf_bt) = select_preprocessing_params(transcription::AsrModel::Performance);
+        let (_, acc_bt) = select_preprocessing_params(transcription::AsrModel::Accuracy);
+        assert!(acc_bt < perf_bt,
+            "accuracy backtrack ({}) must be less than performance backtrack ({})",
+            acc_bt, perf_bt);
     }
 }

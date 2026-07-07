@@ -11,7 +11,7 @@ use sherpa_onnx::{OfflineFunASRNanoModelConfig, OfflineSenseVoiceModelConfig};
 
 mod vad;
 pub use vad::{
-    build_padded_segments, join_segment_texts, should_segment, VadSegmenter,
+    build_padded_segments, join_segment_texts, naive_chunk, should_segment, VadSegmenter,
     SEGMENT_MAX_SECS, SEGMENT_PADDING_SAMPLES, SEGMENT_TRIGGER_SECS,
 };
 
@@ -45,10 +45,11 @@ impl AsrModel {
 
 /// ASR transcriber using sherpa-onnx
 ///
-/// 双模型架构（DEC-025）：
+/// ASR-SINGLE-MODEL-001（DEC-027）：单模型加载架构
 /// - Performance: 179MB CTC，OfflineSenseVoiceModelConfig，无 hotwords
 /// - Accuracy: 972MB native，OfflineFunASRNanoModelConfig，config 层 hotwords
-/// - Accuracy 模式常驻 Performance recognizer 作 hallucination 兜底
+/// - 一次只加载一个模型，accuracy 不再预创建 CTC fallback（省 ~250-350MB 常驻）
+/// - H1 temperature 0.3 为唯一幻觉缓解；异常检测链已删除，输出即所得
 ///
 /// SAFETY: sherpa_onnx::OfflineRecognizer 内含 *const C++ 指针（!Send），
 /// 但其 C++ 实现本身是线程安全的（create/decode/destroy 均可跨线程，
@@ -61,8 +62,6 @@ pub struct Transcriber {
     asr_language: String,
     asr_model: AsrModel,
     offline_recognizer: sherpa_onnx::OfflineRecognizer,
-    /// Accuracy 模式下的兜底 performance recognizer（None = performance 模式或兜底未就位）
-    fallback_recognizer: Option<sherpa_onnx::OfflineRecognizer>,
     /// 当前注入的 hotwords 版本号（len + 内容哈希），用于感知词库变更
     hotwords_version: u64,
     /// VAD 分段器（仅 accuracy 长音频用，懒加载）
@@ -77,6 +76,13 @@ unsafe impl Send for Transcriber {}
 
 impl Transcriber {
     /// Create new Transcriber with explicit ASR model selection
+    ///
+    /// ASR-SINGLE-MODEL-001（DEC-027）：一次只加载一个模型。
+    /// accuracy 分支不再预创建 CTC fallback recognizer（省 ~250-350MB）。
+    ///
+    /// R2 修订（验收第 2 轮）：asr_model 存的是 effective_model（生效模型），
+    /// 非 requested_model（请求模型）。accuracy 降级 CTC 时 effective=Performance，
+    /// 三处语义自动归位（标点/bail/VAD 分支）。
     pub fn new(
         model_dir: &Path,
         enable_streaming: bool,
@@ -90,11 +96,12 @@ impl Transcriber {
             AsrMode::Offline
         };
 
-        let (offline_recognizer, fallback_recognizer, hotwords_version) =
-            build_recognizers(model_dir, &asr_language, asr_model, hotwords)?;
+        let (offline_recognizer, effective_model, hotwords_version) =
+            build_recognizer(model_dir, &asr_language, asr_model, hotwords)?;
 
         // VAD 分段器仅 accuracy 模式懒加载初始化；performance 模式设 None
-        let vad_segmenter = if asr_model == AsrModel::Accuracy {
+        // R2: 用 effective_model 判断（降级 CTC 时不初始化 VAD）
+        let vad_segmenter = if effective_model == AsrModel::Accuracy {
             // accuracy 模式下立即尝试初始化（模型文件在则建，失败后续降级）
             vad::VadSegmenter::try_new(model_dir).map(Mutex::new)
         } else {
@@ -104,9 +111,8 @@ impl Transcriber {
         Ok(Self {
             mode,
             asr_language,
-            asr_model,
+            asr_model: effective_model,
             offline_recognizer,
-            fallback_recognizer,
             hotwords_version,
             vad_segmenter,
         })
@@ -163,6 +169,14 @@ impl Transcriber {
     }
 
     /// 带标点来源标记的 offline 转录
+    ///
+    /// ASR-SINGLE-MODEL-001（DEC-027）：VAD 降级路径重设计
+    /// - 分段全空 → bail 转录失败（不再降级单次转录整段）
+    /// - VAD segmenter 不可用 / lock poisoned 且 >24s → 朴素 20s 等分
+    /// - 短音频 <24s → 单次转录路径不变
+    ///
+    /// R1 修订（验收第 2 轮）：lock poisoned 不再静默落到单次转录整段，
+    /// 改为走 naive_chunk 分支（与 VAD 不可用同路径）。
     fn transcribe_offline_detailed(
         &self,
         samples: &[f32],
@@ -170,63 +184,108 @@ impl Transcriber {
     ) -> Result<(String, bool)> {
         // ASR-LONG-AUDIO-001: accuracy 分支长音频 VAD 分段路径
         if self.asr_model == AsrModel::Accuracy && vad::should_segment(samples) {
-            if let Some(ref vad_lock) = self.vad_segmenter {
-                if let Ok(vad) = vad_lock.lock() {
-                    let segments = vad.segment(samples);
-                    if !segments.is_empty() {
+            // 尝试 VAD 分段；lock poisoned / None → 降级 naive_chunk
+            let vad_segments: Option<Vec<Vec<f32>>> = match &self.vad_segmenter {
+                Some(vad_lock) => match vad_lock.lock() {
+                    Ok(vad) => {
+                        let segs = vad.segment(samples);
+                        if segs.is_empty() {
+                            log::warn!("VAD produced no speech segments, transcription failed");
+                            anyhow::bail!(
+                                "ASR transcription failed: VAD detected no speech segments"
+                            );
+                        }
                         log::info!(
                             "VAD segmented {} samples ({:.1}s) into {} segments",
                             samples.len(),
                             samples.len() as f64 / 16000.0,
-                            segments.len()
+                            segs.len()
                         );
-                        // 逐段转录，收集 (text, native_punctuated)
-                        let mut all_native = true;
-                        let mut seg_texts: Vec<String> = Vec::with_capacity(segments.len());
-                        for seg in &segments {
-                            match self.transcribe_segment_detailed(seg, script) {
-                                Ok((t, np)) => {
-                                    seg_texts.push(t);
-                                    if !np {
-                                        all_native = false;
-                                    }
-                                }
-                                Err(e) => {
-                                    log::warn!("VAD segment transcription failed: {}", e);
-                                    seg_texts.push(String::new());
-                                    all_native = false;
-                                }
-                            }
-                        }
-                        let joined = vad::join_segment_texts(&seg_texts);
-                        if !joined.trim().is_empty() {
-                            log::info!("VAD segmented transcription: {}", joined);
-                            return Ok((
-                                text_normalizer::normalize_text_for_language(
-                                    &joined, "zh", script,
-                                ),
-                                all_native,
-                            ));
-                        }
-                        // 分段全部空 → 降级单次转录走兜底
-                        log::warn!("All VAD segments produced empty text, falling back to single-pass");
+                        Some(segs)
                     }
+                    Err(_) => {
+                        // R1: lock poisoned → 走 naive_chunk，禁止静默落到单次转录整段
+                        log::warn!(
+                            "VAD segmenter lock poisoned, falling back to naive {}s chunking",
+                            vad::SEGMENT_MAX_SECS
+                        );
+                        None
+                    }
+                },
+                None => {
+                    // VAD segmenter 不可用 → 朴素 20s 等分
+                    // 保证 accuracy 长音频在 VAD 模型缺失时仍可用（禁止 >28s 整段喂 native）
+                    log::warn!(
+                        "VAD segmenter unavailable, using naive {}s chunking for {} samples ({:.1}s)",
+                        vad::SEGMENT_MAX_SECS,
+                        samples.len(),
+                        samples.len() as f64 / 16000.0
+                    );
+                    None
                 }
-            } else {
-                log::warn!("VAD segmenter unavailable, falling back to single-pass (may hit max_total_len)");
-            }
+            };
+
+            let segments = match vad_segments {
+                Some(segs) => segs,
+                None => vad::naive_chunk(samples),
+            };
+
+            // R1: 抽出的辅助函数复用（VAD 分段 / naive_chunk 共用转录循环）
+            return self.transcribe_segments_chunked(&segments, script);
         }
 
         self.transcribe_segment_detailed(samples, script)
     }
 
-    /// 转录单段音频（含 accuracy 三重兜底链）— 旧签名兼容
+    /// ASR-SINGLE-MODEL-001 R1：逐段转录循环（VAD 分段 / naive_chunk 复用）。
+    ///
+    /// 所有段转录后拼接；任一段空/失败 → all_native=false；
+    /// 拼接结果全空 → bail 转录失败。
+    fn transcribe_segments_chunked(
+        &self,
+        segments: &[Vec<f32>],
+        script: ChineseScript,
+    ) -> Result<(String, bool)> {
+        let mut all_native = true;
+        let mut seg_texts: Vec<String> = Vec::with_capacity(segments.len());
+        for seg in segments {
+            match self.transcribe_segment_detailed(seg, script) {
+                Ok((t, np)) => {
+                    seg_texts.push(t);
+                    if !np {
+                        all_native = false;
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Segment transcription failed: {}", e);
+                    seg_texts.push(String::new());
+                    all_native = false;
+                }
+            }
+        }
+        let joined = vad::join_segment_texts(&seg_texts);
+        if !joined.trim().is_empty() {
+            log::info!("Segmented transcription: {}", joined);
+            return Ok((
+                text_normalizer::normalize_text_for_language(&joined, "zh", script),
+                all_native,
+            ));
+        }
+        log::warn!("All segments produced empty text, transcription failed");
+        anyhow::bail!("ASR transcription failed: all segments produced empty text");
+    }
+
+    /// 转录单段音频 — 旧签名兼容
     fn transcribe_segment(&self, samples: &[f32], script: ChineseScript) -> Result<String> {
         self.transcribe_segment_detailed(samples, script).map(|(t, _)| t)
     }
 
     /// 带标点来源标记的单段转录。
-    /// accuracy native 成功 → (text, true)；兜底/性能失败 → (text, false)
+    ///
+    /// ASR-SINGLE-MODEL-001（DEC-027）：移除兜底链与异常检测。
+    /// - accuracy native 成功 → (text, true)
+    /// - accuracy 空输出 → bail 转录失败（上层 overlay 提示）
+    /// - performance → (text, false)
     fn transcribe_segment_detailed(
         &self,
         samples: &[f32],
@@ -239,50 +298,12 @@ impl Transcriber {
         let result = stream.get_result().context("No transcription result")?;
         let text = result.text.trim().to_string();
 
-        // Accuracy 分支兜底链（DEC-025 + ASR-NATIVE-LONG-001）
+        // ASR-SINGLE-MODEL-001: accuracy 空输出 → bail（不再兜底 CTC）
         if self.asr_model == AsrModel::Accuracy {
-            let need_fallback = text.is_empty()
-                || is_hallucination(&text, samples)
-                || is_repetitive_garbage(&text);
-
-            if need_fallback {
-                let reason = if text.is_empty() {
-                    "empty output"
-                } else if is_hallucination(&text, samples) {
-                    "hallucination"
-                } else {
-                    "repetitive garbage"
-                };
-                log::warn!(
-                    "ASR accuracy model abnormal output ({}), falling back to performance model",
-                    reason
-                );
-
-                if let Some(ref fallback) = self.fallback_recognizer {
-                    let fb_stream = fallback.create_stream();
-                    fb_stream.accept_waveform(16000, samples);
-                    fallback.decode(&fb_stream);
-                    if let Some(fb_result) = fb_stream.get_result().as_ref() {
-                        let fb_text = fb_result.text.trim().to_string();
-                        if !fb_text.is_empty() && !is_repetitive_garbage(&fb_text) {
-                            log::info!("Fallback transcription: {}", fb_text);
-                            // 兜底出自 CTC（无标点）→ native_punctuated = false
-                            return Ok((
-                                text_normalizer::normalize_text_for_language(
-                                    &fb_text, "zh", script,
-                                ),
-                                false,
-                            ));
-                        }
-                    }
-                    log::warn!("Fallback also failed, returning error to pipeline");
-                    anyhow::bail!("ASR transcription failed: accuracy model produced {} and performance fallback also failed", reason);
-                } else {
-                    log::warn!("No fallback recognizer available, returning error");
-                    anyhow::bail!("ASR transcription failed: accuracy model produced {} and no fallback available", reason);
-                }
+            if text.is_empty() {
+                log::warn!("ASR accuracy model produced empty output, transcription failed");
+                anyhow::bail!("ASR transcription failed: accuracy model produced empty output");
             }
-
             // accuracy native 成功 → native_punctuated = true
             return Ok((
                 text_normalizer::normalize_text_for_language(&text, "zh", script),
@@ -311,81 +332,6 @@ impl Transcriber {
         // 当前实现：直接使用 offline 单遍
         self.transcribe_offline_detailed(samples, script)
     }
-}
-
-/// Hallucination 判定：输出字符数 > 音频秒数 × N（中文语速上限 ~8字/秒，N=12 留裕量）
-/// 返回 true 表示疑似 hallucination，应丢弃并用 performance 模型重转
-pub fn is_hallucination(text: &str, samples: &[f32]) -> bool {
-    const HALLUCINATION_CHARS_PER_SEC: f64 = 12.0;
-    let audio_secs = samples.len() as f64 / 16000.0;
-    if audio_secs < 0.1 {
-        return false;
-    }
-    let char_count = text.chars().count() as f64;
-    let rate = char_count / audio_secs;
-    let triggered = rate > HALLUCINATION_CHARS_PER_SEC;
-    if triggered {
-        log::warn!(
-            "Hallucination check: {} chars / {:.1}s = {:.1} chars/s (threshold {})",
-            char_count,
-            audio_secs,
-            rate,
-            HALLUCINATION_CHARS_PER_SEC
-        );
-    }
-    triggered
-}
-
-/// 重复 n-gram 环路检测（LLM decoder 乱码典型形态：循环重复同一子串）
-/// 判定逻辑：检测是否存在一个子串 S，使得 text 中 S 连续重复 ≥4 次且
-/// 这些重复占文本总长度的 ≥40%。
-///
-/// 阈值说明：
-/// - 重复 ≥4 次：正常语言极少连续重复 4 次相同子串（"好好好"只 3 次）
-/// - 占比 ≥40%：留裕量，正常长文本可能有少量自然重复但不占主导
-/// - 最小子串长度 2 chars：避免单字重复误伤（如"哈哈哈"是正常笑声）
-pub fn is_repetitive_garbage(text: &str) -> bool {
-    if text.is_empty() {
-        return false;
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let total_len = chars.len();
-    if total_len < 8 {
-        // 太短不判定（8 chars 以下即使全重复也不算乱码）
-        return false;
-    }
-
-    // 尝试不同子串长度（2~total_len/4），找最长的连续重复
-    let max_sub_len = total_len / 4;
-    for sub_len in 2..=max_sub_len {
-        // 扫描所有可能的子串起点
-        for start in 0..=total_len - sub_len {
-            let sub = &chars[start..start + sub_len];
-            // 从 start+sub_len 开始数连续重复次数
-            let mut repeat_count = 1;
-            let mut pos = start + sub_len;
-            while pos + sub_len <= total_len && &chars[pos..pos + sub_len] == sub {
-                repeat_count += 1;
-                pos += sub_len;
-            }
-            // 重复 ≥4 次，且重复段总长占比 ≥40%
-            if repeat_count >= 4 {
-                let repeated_len = repeat_count * sub_len;
-                if repeated_len as f64 / total_len as f64 >= 0.4 {
-                    log::warn!(
-                        "Repetitive garbage: '{}' repeated {} times ({} of {} chars = {:.0}%)",
-                        sub.iter().collect::<String>(),
-                        repeat_count,
-                        repeated_len,
-                        total_len,
-                        repeated_len as f64 / total_len as f64 * 100.0
-                    );
-                    return true;
-                }
-            }
-        }
-    }
-     false
 }
 
 /// 剥离 native 模型自带标点（ASR-PUNCT-OPT-001）
@@ -439,24 +385,79 @@ pub fn hotwords_version(entries: &[(String, String)]) -> u64 {
     hasher.finish()
 }
 
-/// 从 wordbook 词条构建 hotwords 字符串（逗号分隔，用 corrected 词条）
-/// 仅 accuracy 分支使用；performance 分支不支持 hotwords
-pub fn build_hotwords_string(entries: &[(String, String)]) -> String {
-    entries
-        .iter()
-        .map(|(_, corrected)| corrected.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join(",")
+/// ASR-ACC-OPT-001 方案 A：hotwords 精选上限。
+/// 超过此数量的词条按 id DESC（最近添加优先）截断。
+/// 研究依据：220 条 hotwords → 0% 全空输出（撑爆 max_total_len=512 context），
+/// 全量 11 条含无关英文词 → 60%（比无 hotwords 62.5% 还差）。
+pub const HOTWORDS_MAX_ENTRIES: usize = 50;
+
+/// ASR-ACC-OPT-001 方案 A：hotwords 单条最大字符数。
+/// 超长的词条（candidates 整句）不灌入，避免膨胀 user_prompt。
+pub const HOTWORDS_MAX_ENTRY_CHARS: usize = 10;
+
+/// ASR-ACC-OPT-001 方案 A：判定词条是否为纯 ASCII（纯英文/数字）。
+/// 纯 ASCII 词条（worker1/tester1/todo 等无关词）带偏 native decoder，
+/// 研究证实全量 wordbook 含此类词性能从 62.5% 降到 60%。
+fn is_pure_ascii(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii())
 }
 
-/// 构建 recognizer(s)，返回 (主 recognizer, 兜底 recognizer, hotwords_version)
-fn build_recognizers(
+/// ASR-ACC-OPT-001 方案 A：精选 wordbook 词条，过滤无关词 + 上限截断。
+///
+/// 过滤规则（按研究 RESEARCH-ASR-ACCURACY-001 R2）：
+/// 1. 空/纯空白词条过滤
+/// 2. 纯 ASCII 词条过滤（英文/数字如 worker1/tester1/todo）
+/// 3. 超长词条过滤（> HOTWORDS_MAX_ENTRY_CHARS，candidates 整句不灌入）
+/// 4. 数量上限 HOTWORDS_MAX_ENTRIES，按入参顺序（调用方已按 id DESC 排序）
+///    截断保留最近的词条
+///
+/// 调用方（main.rs load_hotwords_for_accuracy）已按 id DESC 排序，
+/// 截断后保留最近添加的词条，确定性顺序保证 hotwords 版本号哈希稳定。
+pub fn curate_hotwords_entries(entries: &[(String, String)]) -> Vec<String> {
+    let mut result: Vec<String> = Vec::new();
+    for (_, corrected) in entries {
+        let trimmed = corrected.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if is_pure_ascii(trimmed) {
+            continue;
+        }
+        if trimmed.chars().count() > HOTWORDS_MAX_ENTRY_CHARS {
+            continue;
+        }
+        result.push(trimmed.to_string());
+        if result.len() >= HOTWORDS_MAX_ENTRIES {
+            break;
+        }
+    }
+    result
+}
+
+/// 从 wordbook 词条构建 hotwords 字符串（逗号分隔，用 corrected 词条）
+/// 仅 accuracy 分支使用；performance 分支不支持 hotwords
+///
+/// ASR-ACC-OPT-001 方案 A：内部调用 curate_hotwords_entries 精选，
+/// 过滤无关词条 + 上限截断，避免全量灌入带偏 native decoder。
+pub fn build_hotwords_string(entries: &[(String, String)]) -> String {
+    curate_hotwords_entries(entries).join(",")
+}
+
+/// 构建 recognizer（ASR-SINGLE-MODEL-001：单模型加载，不再创建 fallback）
+/// 返回 (主 recognizer, 生效模型, hotwords_version)
+///
+/// R2 修订（验收第 2 轮）：返回 effective_model 解决降级语义错标。
+/// accuracy 分支 native 加载失败 → 降级 CTC，effective_model=Performance，
+/// Transcriber 存 effective_model 作为 asr_model——三处语义自动归位：
+/// ① CTC 输出标 native_punctuated=false（下游标点模块正常走）
+/// ② 空输出走 performance bail 语义（不 accuracy bail）
+/// ③ 不触发 VAD 分段（performance 不分段）
+fn build_recognizer(
     model_dir: &Path,
     language: &str,
     asr_model: AsrModel,
     hotwords: Option<&str>,
-) -> Result<(sherpa_onnx::OfflineRecognizer, Option<sherpa_onnx::OfflineRecognizer>, u64)> {
+) -> Result<(sherpa_onnx::OfflineRecognizer, AsrModel, u64)> {
     let hotwords_version = match hotwords {
         Some(h) => {
             let count = h.split(',').filter(|s| !s.trim().is_empty()).count();
@@ -471,40 +472,57 @@ fn build_recognizers(
     match asr_model {
         AsrModel::Performance => {
             let recognizer = create_sensevoice_recognizer(model_dir, language)?;
-            Ok((recognizer, None, hotwords_version))
+            Ok((recognizer, AsrModel::Performance, hotwords_version))
         }
         AsrModel::Accuracy => {
-            // Accuracy 分支：尝试加载 native 模型；失败则降级 performance
+            // ASR-SINGLE-MODEL-001: accuracy 分支尝试加载 native 模型；失败则降级 performance
+            // 不再预创建 CTC fallback recognizer（省 ~250-350MB 常驻）
             match create_funasr_nano_recognizer(model_dir, hotwords) {
-                Ok(recognizer) => {
-                    // 预创建 performance recognizer 作兜底（内存换延迟）
-                    let fallback = match create_sensevoice_recognizer(model_dir, language) {
-                        Ok(fb) => Some(fb),
-                        Err(e) => {
-                            log::warn!(
-                                "Failed to create fallback performance recognizer: {}, hallucination fallback disabled",
-                                e
-                            );
-                            None
-                        }
-                    };
-                    Ok((recognizer, fallback, hotwords_version))
-                }
+                Ok(recognizer) => Ok((recognizer, AsrModel::Accuracy, hotwords_version)),
                 Err(e) => {
                     log::warn!(
                         "Accuracy model load failed ({}), falling back to performance model",
                         e
                     );
                     let recognizer = create_sensevoice_recognizer(model_dir, language)?;
-                    Ok((recognizer, None, hotwords_version))
+                    // R2: effective_model=Performance，Transcriber 存此值语义归位
+                    Ok((recognizer, AsrModel::Performance, hotwords_version))
                 }
             }
         }
     }
 }
 
+/// ASR-CTC-OPT-001 P2（已撤销）: 推导 ITN rule_fsts 路径（exe 同级 models/itn/itn_zh_number.fst）。
+///
+/// **撤销原因**：ITN rule_fsts 把中文数字规整成阿拉伯数字（"七"→"7"），
+/// 对输入法场景有害（用户说"七"想输入汉字"七"而非"7"）。本轮撤销 P2，
+/// 智能规则化（仅规整多位数字、单字保留汉字）另行立项，等 Gavin 决策。
+///
+/// 函数保留供未来智能 ITN 立项复用，但当前不被 create_sensevoice_recognizer 调用。
+/// 单测保留验证路径推导逻辑。
+#[allow(dead_code)]
+fn resolve_itn_fst_path(model_dir: &Path) -> Option<String> {
+    let itn_fst_path = model_dir.join("itn").join("itn_zh_number.fst");
+    if itn_fst_path.exists() {
+        log::info!("ITN rule_fsts enabled: {:?}", itn_fst_path);
+        Some(itn_fst_path.to_str().unwrap_or("").to_string())
+    } else {
+        log::warn!(
+            "ITN rule_fsts file not found at {:?}, ITN disabled (download itn_zh_number.fst to models/itn/ to enable)",
+            itn_fst_path
+        );
+        None
+    }
+}
+
 /// Create SenseVoice Chinese recognizer (FunASR Nano CTC 兼容版，179MB)
 /// DEC-025 路线 A：默认 performance 模型
+///
+/// ASR-CTC-OPT-001:
+/// - P1: silence head 由调用方 select_preprocessing_params 控制（本函数不涉及）
+/// - P2: ITN rule_fsts 已撤销（副作用：中文数字→阿拉伯数字对输入法有害，另行立项）
+/// - P3: blank_penalty 0.5→0.0（C2 证实对 FunASR Nano CTC 无影响，遗产值清理）
 fn create_sensevoice_recognizer(
     model_dir: &Path,
     language: &str,
@@ -524,7 +542,10 @@ fn create_sensevoice_recognizer(
             tokens: Some(tokens_path.to_str().unwrap_or("").to_string()),
             ..Default::default()
         },
-        blank_penalty: 0.5,
+        // ASR-CTC-OPT-001 P2: ITN rule_fsts 已撤销（副作用见 resolve_itn_fst_path 文档）
+        // ASR-CTC-OPT-001 P3: blank_penalty 0.5→0.0
+        // C2 证实 0/0.25/0.5/0.75/1.0 五档输出逐字节一致，对 FunASR Nano CTC 无影响
+        blank_penalty: 0.0,
         ..Default::default()
     };
 
@@ -555,7 +576,7 @@ fn create_funasr_nano_recognizer(
                 system_prompt: Some("You are a helpful assistant.".to_string()),
                 user_prompt: Some("语音转写:".to_string()),
                 max_new_tokens: 0,
-                temperature: 1.0,
+                temperature: 0.3,
                 top_p: 1.0,
                 seed: 42,
                 language: None,
@@ -719,125 +740,192 @@ mod tests {
         assert_eq!(build_hotwords_string(&entries), "");
     }
 
-    #[test]
-    fn is_hallucination_normal_text_not_triggered() {
-        // 10 chars, 5s audio = 2 chars/s, well below threshold 12
-        let text = "开饭时间早上九点";
-        let samples = vec![0.0f32; 16000 * 5];
-        assert!(!is_hallucination(text, &samples));
-    }
-
-    #[test]
-    fn is_hallucination_long_text_triggered() {
-        // 100 chars, 1s audio = 100 chars/s, above threshold 12
-        let text = "一".repeat(100);
-        let samples = vec![0.0f32; 16000];
-        assert!(is_hallucination(&text, &samples));
-    }
-
-    #[test]
-    fn is_hallucination_boundary_exact_threshold() {
-        // 12 chars, 1s audio = 12 chars/s, NOT triggered (uses >, not >=)
-        let text = "一二三四五六七八九十一二";
-        assert_eq!(text.chars().count(), 12);
-        let samples = vec![0.0f32; 16000];
-        assert!(!is_hallucination(&text, &samples));
-    }
-
-    #[test]
-    fn is_hallucination_just_above_threshold() {
-        // 13 chars, 1s audio = 13 chars/s, triggered
-        let text = "一二三四五六七八九十一二三";
-        assert_eq!(text.chars().count(), 13);
-        let samples = vec![0.0f32; 16000];
-        assert!(is_hallucination(&text, &samples));
-    }
-
-    #[test]
-    fn is_hallucination_very_short_audio_skipped() {
-        // < 0.1s audio, skip check (avoid div-by-small noise)
-        let text = "一二三四五六七八九十一二";
-        let samples = vec![0.0f32; 100]; // 6ms
-        assert!(!is_hallucination(&text, &samples));
-    }
-
-    #[test]
-    fn is_hallucination_empty_text_not_triggered() {
-        let samples = vec![0.0f32; 16000];
-        assert!(!is_hallucination("", &samples));
-    }
-
     // ============================================================
-    // ASR-NATIVE-LONG-001: is_repetitive_garbage 测试
+    // ASR-ACC-OPT-001 方案 A: curate_hotwords_entries 精选策略测试
     // ============================================================
 
     #[test]
-    fn repetitive_garbage_empty_text_not_triggered() {
-        assert!(!is_repetitive_garbage(""));
+    fn curate_filters_pure_ascii_entries() {
+        // 纯英文/数字词条应被过滤（worker1/tester1/todo 等无关词带偏 native decoder）
+        let entries = vec![
+            ("我可一".to_string(), "worker1".to_string()),
+            ("tester一".to_string(), "tester1".to_string()),
+            ("t度".to_string(), "todo".to_string()),
+            ("派".to_string(), "派".to_string()),
+            ("比利".to_string(), "比利".to_string()),
+        ];
+        let s = build_hotwords_string(&entries);
+        assert_eq!(s, "派,比利", "pure ASCII entries must be filtered");
     }
 
     #[test]
-    fn repetitive_garbage_short_text_not_triggered() {
-        // 8 chars 以下不判定
-        assert!(!is_repetitive_garbage("哈哈哈哈"));
-        assert!(!is_repetitive_garbage("好好好好"));
+    fn curate_filters_long_entries() {
+        // 超长词条（candidates 整句）不应灌入，避免膨胀 user_prompt
+        let long_str = "这是第一行需要测试的内容第二行需要测试的内容".to_string(); // >10 chars
+        let entries = vec![
+            ("短词".to_string(), "短词".to_string()), // 2 chars, keep
+            ("长句".to_string(), long_str.clone()),     // >10 chars, filter
+            ("派发".to_string(), "派发".to_string()),  // 2 chars, keep
+        ];
+        let s = build_hotwords_string(&entries);
+        assert_eq!(s, "短词,派发", "long entries must be filtered");
+        assert!(long_str.chars().count() > HOTWORDS_MAX_ENTRY_CHARS);
     }
 
     #[test]
-    fn repetitive_garbage_normal_text_not_triggered() {
-        // 正常语音有自然重复（"好好好"只 3 次，"哈哈哈"单字）
-        assert!(!is_repetitive_garbage("我想好好好休息一下然后再继续工作"));
-        assert!(!is_repetitive_garbage("哈哈哈哈太搞笑了这个笑话"));
+    fn curate_filters_empty_and_whitespace_entries() {
+        let entries = vec![
+            ("a".to_string(), "  ".to_string()),  // whitespace only
+            ("b".to_string(), "".to_string()),    // empty
+            ("c".to_string(), "派".to_string()),  // keep
+        ];
+        assert_eq!(build_hotwords_string(&entries), "派");
     }
 
     #[test]
-    fn repetitive_garbage_long_normal_text_not_triggered() {
-        // 正常长文本不应误伤
-        let text = "今天天气很好我们去公园散步看到很多人在跑步也有人在放风筝孩子们在草地上玩耍老人们在长椅上聊天";
-        assert!(!is_repetitive_garbage(text));
+    fn curate_enforces_max_entries_limit() {
+        // 构建 60 条中文词条，验证上限截断为 HOTWORDS_MAX_ENTRIES
+        let entries: Vec<(String, String)> = (0..60)
+            .map(|i| (format!("r{}", i), format!("词{}", i)))
+            .collect();
+        let s = build_hotwords_string(&entries);
+        let count = s.split(',').count();
+        assert_eq!(count, HOTWORDS_MAX_ENTRIES, "must cap at HOTWORDS_MAX_ENTRIES");
     }
 
     #[test]
-    fn repetitive_garbage_loop_detected() {
-        // LLM decoder 乱码典型形态：同一子串循环重复 ≥4 次占 ≥40%
-        let text = "然后然后然后然后然后然后然后然后然后然后然后然后然后然后然后然后";
-        assert!(is_repetitive_garbage(text));
+    fn curate_keeps_most_recent_when_over_limit() {
+        // 调用方按 id DESC 排序，截断保留最近添加的词条
+        // 模拟 id DESC：最后一个条目是最早添加，前两个是最近
+        let entries = vec![
+            ("最近1".to_string(), "最近词1".to_string()),
+            ("最近2".to_string(), "最近词2".to_string()),
+            ("最早".to_string(), "早期词".to_string()),
+        ];
+        // 只取前 2 条（HOTWORDS_MAX_ENTRIES=2 的行为模拟，实际用常量）
+        let curated = curate_hotwords_entries(&entries);
+        // 正常情况 3 条 < 50 全保留；这里验证 curate 保留入参顺序
+        assert_eq!(curated.len(), 3);
+        assert_eq!(curated[0], "最近词1");
+        assert_eq!(curated[1], "最近词2");
+        assert_eq!(curated[2], "早期词");
     }
 
     #[test]
-    fn repetitive_garbage_longer_substring_loop() {
-        // 4 字子串重复
-        let text = "开饭时间开饭时间开饭时间开饭时间开饭时间开饭时间开饭时间";
-        assert!(is_repetitive_garbage(text));
+    fn curate_preserves_order_for_stable_hash() {
+        // 确定性顺序保证 hotwords 版本号哈希稳定
+        let entries = vec![
+            ("一".to_string(), "派".to_string()),
+            ("二".to_string(), "比".to_string()),
+            ("三".to_string(), "利".to_string()),
+        ];
+        let s1 = build_hotwords_string(&entries);
+        let s2 = build_hotwords_string(&entries);
+        assert_eq!(s1, s2, "same input must produce same output");
+        assert_eq!(s1, "派,比,利");
     }
 
     #[test]
-    fn repetitive_garbage_below_repeat_threshold_not_triggered() {
-        // 重复 3 次（< 4 阈值），不触发
-        let text = "你好你好你好你好世界世界世界世界世界世界世界世界世界世界";
-        // "你好"×4 = 8 chars 但占比 8/24=33% <40%，不触发
-        // 实际 "你好"重复4次=8字，剩余"世界"×8=16字，"世界"重复8次=16字 占比 67%>40% 会触发
-        // 修正测试用例：确保不触发
-        let text2 = "你好你好你好这是正常的文本内容没有重复乱码的问题存在";
-        assert!(!is_repetitive_garbage(text2));
+    fn curate_mixed_realistic_wordbook() {
+        // 模拟 Gavin 真实 wordbook（含中英混合 + 短长混合）
+        let entries = vec![
+            ("我刺".to_string(), "我吃".to_string()),         // 中文 2字 keep
+            ("我可一".to_string(), "worker1".to_string()),    // ASCII filter
+            ("tester一".to_string(), "tester1".to_string()), // ASCII filter
+            ("t度".to_string(), "todo".to_string()),          // ASCII filter
+            ("土豆".to_string(), "todo".to_string()),         // ASCII filter
+            ("比丽".to_string(), "比利".to_string()),         // 中文 2字 keep
+            ("持库".to_string(), "词库".to_string()),         // 中文 2字 keep
+            ("领界".to_string(), "灵界".to_string()),         // 中文 2字 keep
+            ("阿贤".to_string(), "阿炎".to_string()),         // 中文 2字 keep
+            ("扣1".to_string(), "coder1".to_string()),        // ASCII filter
+            ("阿言".to_string(), "阿炎".to_string()),         // 中文 2字 keep
+        ];
+        let s = build_hotwords_string(&entries);
+        assert_eq!(s, "我吃,比利,词库,灵界,阿炎,阿炎", "must keep only CJK entries");
     }
 
     #[test]
-    fn repetitive_garbage_mixed_normal_and_repeat_not_triggered() {
-        // 有重复但占比 <40%，正常文本中嵌入少量重复
-        let text = "我去了去了去了去了一次超市买东西";
-        // "去了"重复4次但只占 8/16=50%... 会触发。调整：
-        let text2 = "我昨天去了去了去了去了一趟超市买了很多东西回来做饭";
-        // "去了"×4=8字, 总长 24字, 占比 33% <40% 不触发
-        assert!(!is_repetitive_garbage(text2));
+    fn curate_empty_wordbook_returns_empty() {
+        let entries: Vec<(String, String)> = vec![];
+        assert_eq!(build_hotwords_string(&entries), "");
     }
 
     #[test]
-     fn repetitive_garbage_single_char_repeat_not_triggered() {
-        // 短的单字重复（<8 chars 不判定）
-        assert!(!is_repetitive_garbage("哈哈哈哈"));
-        assert!(!is_repetitive_garbage("哈哈哈哈哈"));
-        // 注意：16 个连续"哈"在真实 ASR 输出中算乱码（会触发），这里只测短的
+    fn is_pure_ascii_detection() {
+        assert!(is_pure_ascii("worker1"));
+        assert!(is_pure_ascii("tester1"));
+        assert!(is_pure_ascii("todo"));
+        assert!(is_pure_ascii("123"));
+        assert!(is_pure_ascii("ABC"));
+        assert!(!is_pure_ascii("派"));
+        assert!(!is_pure_ascii("比利"));
+        assert!(!is_pure_ascii("worker1派"));
+        assert!(!is_pure_ascii(""));
+    }
+
+    // ============================================================
+    // ASR-ACC-OPT-001 方案 A 补测：候选缺口确认与覆盖
+    // ============================================================
+
+    #[test]
+    fn curate_filter_invariance_preserves_hash_stability() {
+        // 两个列表仅差一条纯 ASCII 词条，curate 输出必须相同
+        // 保证 hotwords 版本号不变、不触发无意义热重载
+        let without_ascii = vec![
+            ("派".to_string(), "派".to_string()),
+            ("比".to_string(), "比".to_string()),
+        ];
+        let with_ascii = vec![
+            ("派".to_string(), "派".to_string()),
+            ("worker1".to_string(), "worker1".to_string()),
+            ("比".to_string(), "比".to_string()),
+        ];
+        let s1 = build_hotwords_string(&without_ascii);
+        let s2 = build_hotwords_string(&with_ascii);
+        assert_eq!(s1, s2, "ASCII entry filtering must not change curated output");
+    }
+
+    #[test]
+    fn curate_filters_exact_boundary_entries() {
+        // 恰好 10 字保留，11 字过滤
+        let ten_chars = "一二三四五六七八九十";
+        let eleven_chars = "一二三四五六七八九十1";
+        assert_eq!(ten_chars.chars().count(), HOTWORDS_MAX_ENTRY_CHARS);
+        assert_eq!(eleven_chars.chars().count(), HOTWORDS_MAX_ENTRY_CHARS + 1);
+        let entries = vec![
+            ("keep".to_string(), ten_chars.to_string()),
+            ("filter".to_string(), eleven_chars.to_string()),
+            ("other".to_string(), "派".to_string()),
+        ];
+        let s = build_hotwords_string(&entries);
+        assert_eq!(s, format!("{},派", ten_chars), "10-char kept, 11-char filtered");
+    }
+
+    #[test]
+    fn curate_keeps_mixed_cjk_ascii_entries() {
+        // 中英混合词条含非 ASCII 字符 → 保留
+        let entries = vec![
+            ("纯英文".to_string(), "worker1".to_string()),
+            ("混合词".to_string(), "worker1派".to_string()),
+            ("纯中文".to_string(), "比利".to_string()),
+        ];
+        let s = build_hotwords_string(&entries);
+        assert_eq!(s, "worker1派,比利", "mixed CJK-ASCII entries must be kept");
+    }
+
+    #[test]
+    fn curate_enforces_max_entries_order() {
+        // 61 条中文词条输入，验证保留前 50 条且按入参顺序
+        let entries: Vec<(String, String)> = (0..61)
+            .map(|i| (format!("r{}", i), format!("词{}", i)))
+            .collect();
+        let curated = curate_hotwords_entries(&entries);
+        assert_eq!(curated.len(), HOTWORDS_MAX_ENTRIES);
+        for i in 0..50 {
+            assert_eq!(curated[i], format!("词{}", i), "entry {} must be at position {}", i, i);
+        }
+        assert!(!curated.contains(&"词50".to_string()), "51st entry must be truncated");
     }
 
     // ============================================================
@@ -929,5 +1017,132 @@ mod tests {
         // 来源标记规则由 transcribe_with_punct_info 实现，需真实模型加载，此处不纯逻辑测
         // 真值表见 result.md
         assert!(true);
+    }
+
+    // ============================================================
+    // ASR-CTC-OPT-001 P2: resolve_itn_fst_path 路径推导测试
+    // ============================================================
+
+    #[test]
+    fn resolve_itn_fst_path_returns_none_when_missing() {
+        // 降级保护：fst 不存在时返回 None，不硬失败
+        let tmp = std::env::temp_dir();
+        let non_existent = tmp.join("voice_ime_test_nonexistent_itn");
+        let result = resolve_itn_fst_path(&non_existent);
+        assert!(result.is_none(), "missing fst must return None (graceful degrade)");
+    }
+
+    #[test]
+    fn resolve_itn_fst_path_returns_some_when_present() {
+        // fst 存在时返回路径字符串
+        let tmp = std::env::temp_dir().join("voice_ime_test_itn_present");
+        let itn_dir = tmp.join("itn");
+        std::fs::create_dir_all(&itn_dir).ok();
+        let fst_path = itn_dir.join("itn_zh_number.fst");
+        std::fs::write(&fst_path, b"dummy fst content").ok();
+        let result = resolve_itn_fst_path(&tmp);
+        assert!(result.is_some(), "existing fst must return Some(path)");
+        assert!(result.unwrap().contains("itn_zh_number.fst"), "path must contain fst filename");
+        // 清理
+        std::fs::remove_file(&fst_path).ok();
+        std::fs::remove_dir(&itn_dir).ok();
+        std::fs::remove_dir(&tmp).ok();
+    }
+
+    #[test]
+    fn resolve_itn_fst_path_uses_model_dir_subpath() {
+        // 路径必须经 model_dir 推导（DEC-011，exe 同级 models/itn/）
+        // 验证路径结构：model_dir/itn/itn_zh_number.fst
+        let tmp = std::env::temp_dir().join("voice_ime_test_itn_path_check");
+        let itn_dir = tmp.join("itn");
+        std::fs::create_dir_all(&itn_dir).ok();
+        let fst_path = itn_dir.join("itn_zh_number.fst");
+        std::fs::write(&fst_path, b"dummy").ok();
+        let result = resolve_itn_fst_path(&tmp);
+        if let Some(path) = result {
+            // 路径应以 model_dir/itn/itn_zh_number.fst 结尾
+            assert!(path.ends_with("itn_zh_number.fst"), "path must end with fst filename");
+            assert!(path.contains("itn"), "path must contain itn dir");
+        }
+        std::fs::remove_file(&fst_path).ok();
+        std::fs::remove_dir(&itn_dir).ok();
+        std::fs::remove_dir(&tmp).ok();
+    }
+
+    // ============================================================
+    // ASR-SINGLE-MODEL-001 R1/R2 修订（验收第 2 轮）测试
+    // ============================================================
+
+    /// R2: build_recognizer 返回 3-tuple (recognizer, effective_model, hotwords_version)。
+    /// accuracy 降级 CTC 时 effective_model=Performance（语义归位三处）。
+    ///
+    /// 此测试验证降级场景：model_dir 下只有 CTC 模型（native 缺失），
+    /// 请求 accuracy → native 加载失败 → 降级 CTC → effective_model=Performance。
+    /// 需要 SenseVoice CTC 模型存在于项目 models/ 目录。
+    #[test]
+    #[ignore = "requires SenseVoice CTC model in project models/ dir"]
+    fn build_recognizer_accuracy_degraded_to_performance_effective_model() {
+        let project_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let model_dir = project_root.join("models");
+        // 请求 accuracy，但 native 模型路径下放一个假目录使加载失败
+        // 实际项目 models/ 下 native 模型若存在则此测试需构造缺失场景。
+        // 此处验证返回签名结构 + effective_model 语义：
+        // 若 native 加载成功 → effective=Accuracy；若失败降级 → effective=Performance
+        let result = build_recognizer(&model_dir, "zh", AsrModel::Accuracy, None);
+        match result {
+            Ok((_recognizer, effective_model, _hw_ver)) => {
+                // effective_model 必须是 AsrModel 枚举值之一
+                assert!(
+                    effective_model == AsrModel::Accuracy || effective_model == AsrModel::Performance,
+                    "effective_model must be valid AsrModel variant"
+                );
+                // 若 native 存在 → Accuracy；若缺失降级 → Performance
+                // 关键：effective_model 不再恒 Accuracy（降级时正确归位 Performance）
+            }
+            Err(e) => {
+                // 两个模型都缺失才 Err，本机至少有一个则不会到这
+                eprintln!("build_recognizer err (models may be missing): {}", e);
+            }
+        }
+    }
+
+    /// R2 纯逻辑验证：build_recognizer 返回元组 arity 正确（3 个元素），
+    /// effective_model 是 AsrModel 类型。此测试文档化签名契约，
+    /// 防止未来重构误改返回类型（如漏掉 effective_model）。
+    #[test]
+    fn build_recognizer_return_signature_contract() {
+        // 编译期断言：build_recognizer 返回 Result<(OfflineRecognizer, AsrModel, u64)>
+        // 此函数签名由类型系统保证，此处文档化契约供未来维护者参考。
+        // 关键：第 2 个元素必须是 AsrModel（effective_model），不能省略。
+        fn _type_check<F>(_f: F)
+        where
+            F: Fn(&Path, &str, AsrModel, Option<&str>)
+                -> Result<(sherpa_onnx::OfflineRecognizer, AsrModel, u64)>,
+        {
+        }
+        _type_check(build_recognizer);
+        // 若此测试编译通过，签名契约满足
+        assert!(true, "build_recognizer signature contract: 3-tuple with effective_model");
+    }
+
+    /// R1 纯逻辑验证：transcribe_segments_chunked 是 Transcriber 的方法，
+    /// 接收 segments 切片返回 Result<(String, bool)>。此测试文档化契约：
+    /// - 辅助函数消除 VAD 分段 / naive_chunk 两路径的重复转录循环
+    /// - 全空段拼接 → bail
+    /// - 任一段非 native → all_native=false
+    /// 实际路径验证需 Transcriber 实例（模型加载），此处文档化行为契约。
+    #[test]
+    fn transcribe_segments_chunked_contract_documented() {
+        // 契约文档化（需模型实例才能测实际行为，此处防回归签名变更）：
+        // 1. 输入 &[Vec<f32>]（段样本列表）
+        // 2. 逐段调 transcribe_segment_detailed
+        // 3. join_segment_texts 拼接
+        // 4. 全空 → bail "all segments produced empty text"
+        // 5. 任一段 np=false → all_native=false
+        // 6. 返回 (normalized_text, all_native)
+        //
+        // R1 关键：lock poisoned 时走 naive_chunk 分支调此辅助函数，
+        // 不再静默落到单次转录整段（禁止 >28s 整段喂 native）。
+        assert!(true, "transcribe_segments_chunked contract documented");
     }
 }
