@@ -5,7 +5,7 @@
 > A Windows system-tray voice input tool. Hotkey-triggered, local ASR + LLM optimization, ready to use out of the box.
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](https://github.com/Cdexs/Feiyin-IME)
-[![Version](https://img.shields.io/badge/version-v0.5.4-green)](https://github.com/Cdexs/Feiyin-IME/releases)
+[![Version](https://img.shields.io/badge/version-v0.6.2-green)](https://github.com/Cdexs/Feiyin-IME/releases)
 [![License](https://img.shields.io/badge/license-MIT-orange)](LICENSE)
 
 ---

@@ -6,12 +6,12 @@ use super::cache::WordbookEntry;
 
 const MIGRATION_001: &str = include_str!("../../migrations/001_wordbook.sql");
 const MIGRATION_002: &str = include_str!("../../migrations/002_wordbook_candidates.sql");
+const MIGRATION_003: &str = include_str!("../../migrations/003_wordbook_singleword.sql");
 
 #[derive(Debug, Clone)]
 pub struct StoredWordbookEntry {
     pub id: i64,
-    pub raw: String,
-    pub corrected: String,
+    pub word: String,
     pub source: String,
     pub created_at: String,
 }
@@ -19,14 +19,13 @@ pub struct StoredWordbookEntry {
 pub fn load_entries() -> Result<Vec<WordbookEntry>> {
     let conn = open_connection()?;
     let mut stmt =
-        conn.prepare("SELECT raw, corrected, source, created_at FROM wordbook ORDER BY id ASC")?;
+        conn.prepare("SELECT word, source, created_at FROM wordbook ORDER BY id ASC")?;
     let entries = stmt
         .query_map([], |row| {
             Ok(WordbookEntry {
-                raw: row.get(0)?,
-                corrected: row.get(1)?,
-                source: row.get(2)?,
-                created_at: row.get(3)?,
+                word: row.get(0)?,
+                source: row.get(1)?,
+                created_at: row.get(2)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -36,15 +35,14 @@ pub fn load_entries() -> Result<Vec<WordbookEntry>> {
 pub fn load_word_entries() -> Result<Vec<StoredWordbookEntry>> {
     let conn = open_connection()?;
     let mut stmt = conn
-        .prepare("SELECT id, raw, corrected, source, created_at FROM wordbook ORDER BY id DESC")?;
+        .prepare("SELECT id, word, source, created_at FROM wordbook ORDER BY id DESC")?;
     let entries = stmt
         .query_map([], |row| {
             Ok(StoredWordbookEntry {
                 id: row.get(0)?,
-                raw: row.get(1)?,
-                corrected: row.get(2)?,
-                source: row.get(3)?,
-                created_at: row.get(4)?,
+                word: row.get(1)?,
+                source: row.get(2)?,
+                created_at: row.get(3)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -55,15 +53,14 @@ pub fn get_entry_by_id(id: i64) -> Result<Option<StoredWordbookEntry>> {
     let conn = open_connection()?;
     let entry = conn
         .query_row(
-            "SELECT id, raw, corrected, source, created_at FROM wordbook WHERE id = ?1",
+            "SELECT id, word, source, created_at FROM wordbook WHERE id = ?1",
             params![id],
             |row| {
                 Ok(StoredWordbookEntry {
                     id: row.get(0)?,
-                    raw: row.get(1)?,
-                    corrected: row.get(2)?,
-                    source: row.get(3)?,
-                    created_at: row.get(4)?,
+                    word: row.get(1)?,
+                    source: row.get(2)?,
+                    created_at: row.get(3)?,
                 })
             },
         )
@@ -74,19 +71,16 @@ pub fn get_entry_by_id(id: i64) -> Result<Option<StoredWordbookEntry>> {
 pub fn insert_entry(entry: &WordbookEntry) -> Result<bool> {
     let conn = open_connection()?;
     let changed = conn.execute(
-        "INSERT OR IGNORE INTO wordbook (raw, corrected, source, created_at)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![entry.raw, entry.corrected, entry.source, entry.created_at],
+        "INSERT OR IGNORE INTO wordbook (word, source, created_at)
+         VALUES (?1, ?2, ?3)",
+        params![entry.word, entry.source, entry.created_at],
     )?;
     Ok(changed > 0)
 }
 
-pub fn delete_entry(raw: &str, corrected: &str) -> Result<bool> {
+pub fn delete_entry(word: &str) -> Result<bool> {
     let conn = open_connection()?;
-    let changed = conn.execute(
-        "DELETE FROM wordbook WHERE raw = ?1 AND corrected = ?2",
-        params![raw, corrected],
-    )?;
+    let changed = conn.execute("DELETE FROM wordbook WHERE word = ?1", params![word])?;
     Ok(changed > 0)
 }
 
@@ -96,19 +90,19 @@ pub fn delete_entry_by_id(id: i64) -> Result<bool> {
     Ok(changed > 0)
 }
 
-pub fn upsert_candidate(raw: &str, corrected: &str) -> Result<u32> {
+pub fn upsert_candidate(word: &str) -> Result<u32> {
     let conn = open_connection()?;
-    upsert_candidate_in_conn(&conn, raw, corrected)
+    upsert_candidate_in_conn(&conn, word)
 }
 
-pub fn get_candidate_count(raw: &str, corrected: &str) -> Result<u32> {
+pub fn get_candidate_count(word: &str) -> Result<u32> {
     let conn = open_connection()?;
-    get_candidate_count_in_conn(&conn, raw, corrected)
+    get_candidate_count_in_conn(&conn, word)
 }
 
-pub fn delete_candidate(raw: &str, corrected: &str) -> Result<bool> {
+pub fn delete_candidate(word: &str) -> Result<bool> {
     let conn = open_connection()?;
-    delete_candidate_in_conn(&conn, raw, corrected)
+    delete_candidate_in_conn(&conn, word)
 }
 
 fn open_connection() -> Result<Connection> {
@@ -130,6 +124,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "UPDATE wordbook SET source = 'system' WHERE source NOT IN ('system', 'user')",
         [],
     )?;
+    conn.execute_batch(MIGRATION_003)?;
+    finalize_singleword_migration(conn)?;
+    conn.execute(
+        "UPDATE wordbook SET source = 'system' WHERE source NOT IN ('system', 'user')",
+        [],
+    )?;
     Ok(())
 }
 
@@ -144,6 +144,8 @@ fn import_legacy_words(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
+    // Legacy 'words' table has raw/corrected columns
+    // Insert into wordbook (raw, corrected) form — migration 003 will convert to single-word
     conn.execute(
         "INSERT OR IGNORE INTO wordbook (raw, corrected, source, created_at)
          SELECT raw, corrected, 'user', datetime(created_at, 'unixepoch')
@@ -152,9 +154,56 @@ fn import_legacy_words(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // 迁移完成后删除旧表，防止下次连接重复导入导致已删除词条复活
     conn.execute_batch("DROP TABLE IF EXISTS words;")?;
 
+    Ok(())
+}
+
+/// WORDBOOK-SINGLEWORD-001-CORE: Conditional table replacement
+/// Only replaces old wordbook table (with raw/corrected columns) with new single-word table.
+/// If already migrated (no raw column), cleans up stale temp tables.
+/// Data migration is done in Rust (not SQL) to avoid column-reference errors on re-run.
+fn finalize_singleword_migration(conn: &Connection) -> Result<()> {
+    let has_raw_column: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('wordbook') WHERE name = 'raw'",
+        [],
+        |row| row.get(0),
+    )?;
+
+    if has_raw_column == 0 {
+        // Already migrated: wordbook table has 'word' column, not 'raw'
+        // Clean up any stale wordbook_new/wordbook_candidates_new tables from interrupted runs
+        conn.execute_batch("DROP TABLE IF EXISTS wordbook_new;")?;
+        conn.execute_batch("DROP TABLE IF EXISTS wordbook_candidates_new;")?;
+        return Ok(());
+    }
+
+    // Old table has raw/corrected columns -> migrate data then replace
+
+    // 1. Migrate wordbook data: take corrected side, trim, dedup (INSERT OR IGNORE handles dedup)
+    conn.execute(
+        "INSERT OR IGNORE INTO wordbook_new (word, source, created_at)
+         SELECT DISTINCT TRIM(corrected), source, created_at
+         FROM wordbook
+         WHERE TRIM(corrected) != ''",
+        [],
+    )?;
+
+    // 2. Migrate candidates: take corrected side, trim, dedup (count takes MAX)
+    conn.execute(
+        "INSERT OR IGNORE INTO wordbook_candidates_new (word, count, last_seen)
+         SELECT TRIM(corrected), MAX(count), last_seen
+         FROM wordbook_candidates
+         WHERE TRIM(corrected) != ''
+         GROUP BY TRIM(corrected)",
+        [],
+    )?;
+
+    // 3. Replace old tables with new ones
+    conn.execute_batch("DROP TABLE IF EXISTS wordbook_candidates;")?;
+    conn.execute_batch("DROP TABLE IF EXISTS wordbook;")?;
+    conn.execute_batch("ALTER TABLE wordbook_new RENAME TO wordbook;")?;
+    conn.execute_batch("ALTER TABLE wordbook_candidates_new RENAME TO wordbook_candidates;")?;
     Ok(())
 }
 
@@ -166,24 +215,24 @@ fn db_path() -> PathBuf {
         .join("wordbook.sqlite")
 }
 
-fn upsert_candidate_in_conn(conn: &Connection, raw: &str, corrected: &str) -> Result<u32> {
+fn upsert_candidate_in_conn(conn: &Connection, word: &str) -> Result<u32> {
     conn.execute(
-        "INSERT INTO wordbook_candidates (raw, corrected, count, last_seen)
-         VALUES (?1, ?2, 1, datetime('now'))
-         ON CONFLICT(raw, corrected) DO UPDATE SET
+        "INSERT INTO wordbook_candidates (word, count, last_seen)
+         VALUES (?1, 1, datetime('now'))
+         ON CONFLICT(word) DO UPDATE SET
              count = wordbook_candidates.count + 1,
              last_seen = datetime('now')",
-        params![raw, corrected],
+        params![word],
     )?;
 
-    get_candidate_count_in_conn(conn, raw, corrected)
+    get_candidate_count_in_conn(conn, word)
 }
 
-fn get_candidate_count_in_conn(conn: &Connection, raw: &str, corrected: &str) -> Result<u32> {
+fn get_candidate_count_in_conn(conn: &Connection, word: &str) -> Result<u32> {
     let count = conn
         .query_row(
-            "SELECT count FROM wordbook_candidates WHERE raw = ?1 AND corrected = ?2",
-            params![raw, corrected],
+            "SELECT count FROM wordbook_candidates WHERE word = ?1",
+            params![word],
             |row| row.get(0),
         )
         .optional()?
@@ -191,10 +240,10 @@ fn get_candidate_count_in_conn(conn: &Connection, raw: &str, corrected: &str) ->
     Ok(count)
 }
 
-fn delete_candidate_in_conn(conn: &Connection, raw: &str, corrected: &str) -> Result<bool> {
+fn delete_candidate_in_conn(conn: &Connection, word: &str) -> Result<bool> {
     let changed = conn.execute(
-        "DELETE FROM wordbook_candidates WHERE raw = ?1 AND corrected = ?2",
-        params![raw, corrected],
+        "DELETE FROM wordbook_candidates WHERE word = ?1",
+        params![word],
     )?;
     Ok(changed > 0)
 }
@@ -206,17 +255,20 @@ mod tests {
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().expect("in-memory db");
-        conn.execute_batch(MIGRATION_001).expect("migration");
+        conn.execute_batch(MIGRATION_001).expect("migration 001");
         conn.execute_batch(MIGRATION_002)
-            .expect("candidate migration");
+            .expect("candidate migration 002");
+        // Simulate the init flow: legacy import then migration 003 + finalize
+        conn.execute_batch(MIGRATION_003).expect("migration 003");
+        finalize_singleword_migration(&conn).expect("finalize singleword migration");
         conn
     }
 
-    fn insert(conn: &Connection, raw: &str, corrected: &str) -> i64 {
+    fn insert(conn: &Connection, word: &str) -> i64 {
         conn.execute(
-            "INSERT INTO wordbook (raw, corrected, source, created_at) \
-             VALUES (?1, ?2, 'user', '2024-01-01T00:00:00Z')",
-            rusqlite::params![raw, corrected],
+            "INSERT INTO wordbook (word, source, created_at) \
+             VALUES (?1, 'user', '2024-01-01T00:00:00Z')",
+            rusqlite::params![word],
         )
         .expect("insert");
         conn.last_insert_rowid()
@@ -225,7 +277,7 @@ mod tests {
     #[test]
     fn test_delete_by_id_removes_entry() {
         let conn = setup();
-        let id = insert(&conn, "原词", "修正词");
+        let id = insert(&conn, "测试词");
 
         let changed = conn
             .execute("DELETE FROM wordbook WHERE id = ?1", rusqlite::params![id])
@@ -257,8 +309,8 @@ mod tests {
     #[test]
     fn test_delete_by_id_does_not_affect_other_entries() {
         let conn = setup();
-        let id1 = insert(&conn, "词条A", "修正A");
-        let _id2 = insert(&conn, "词条B", "修正B");
+        let id1 = insert(&conn, "词条A");
+        let _id2 = insert(&conn, "词条B");
 
         conn.execute("DELETE FROM wordbook WHERE id = ?1", rusqlite::params![id1])
             .expect("delete");
@@ -273,13 +325,13 @@ mod tests {
     fn test_upsert_candidate_accumulates_count() {
         let conn = setup();
 
-        let first = upsert_candidate_in_conn(&conn, "原词", "修正词").expect("first insert");
-        let second = upsert_candidate_in_conn(&conn, "原词", "修正词").expect("second insert");
+        let first = upsert_candidate_in_conn(&conn, "测试词").expect("first insert");
+        let second = upsert_candidate_in_conn(&conn, "测试词").expect("second insert");
 
         assert_eq!(first, 1, "first observation should create count=1");
         assert_eq!(second, 2, "second observation should increment count");
         assert_eq!(
-            get_candidate_count_in_conn(&conn, "原词", "修正词").expect("count"),
+            get_candidate_count_in_conn(&conn, "测试词").expect("count"),
             2
         );
     }
@@ -287,29 +339,27 @@ mod tests {
     #[test]
     fn test_delete_candidate_clears_row() {
         let conn = setup();
-        upsert_candidate_in_conn(&conn, "原词", "修正词").expect("insert");
+        upsert_candidate_in_conn(&conn, "测试词").expect("insert");
 
-        let deleted = delete_candidate_in_conn(&conn, "原词", "修正词").expect("delete");
+        let deleted = delete_candidate_in_conn(&conn, "测试词").expect("delete");
         assert!(deleted, "candidate row should be deleted");
         assert_eq!(
-            get_candidate_count_in_conn(&conn, "原词", "修正词").expect("count"),
+            get_candidate_count_in_conn(&conn, "测试词").expect("count"),
             0
         );
     }
 
     // ============================================================
-    // 频率计数器阈值逻辑测试（WORDBOOK-FREQ-001 / TEST-SYNC-FREQ-001）
+    // Frequency counter threshold tests (single-word version)
     // ============================================================
 
-    /// FREQ-001: 第一次检测差异，count=1，不写入正式词库
     #[test]
     fn freq_001_first_detection_count_1_no_write() {
         let conn = setup();
 
-        let count = upsert_candidate_in_conn(&conn, "原词", "修正词").expect("first record");
+        let count = upsert_candidate_in_conn(&conn, "测试词").expect("first record");
         assert_eq!(count, 1, "first detection should have count=1");
 
-        // 验证正式词库无此词条
         let wordbook_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM wordbook", [], |r| r.get(0))
             .expect("count");
@@ -319,26 +369,21 @@ mod tests {
         );
     }
 
-    /// FREQ-002: 第二次检测同一差异，count=2，不写入正式词库（默认阈值=3）
     #[test]
     fn freq_002_second_detection_count_2_no_write() {
         let conn = setup();
 
-        // 第一次
-        let count1 = upsert_candidate_in_conn(&conn, "原词", "修正词").expect("record 1");
+        let count1 = upsert_candidate_in_conn(&conn, "测试词").expect("record 1");
         assert_eq!(count1, 1);
 
-        // 第二次
-        let count2 = upsert_candidate_in_conn(&conn, "原词", "修正词").expect("record 2");
+        let count2 = upsert_candidate_in_conn(&conn, "测试词").expect("record 2");
         assert_eq!(count2, 2, "second detection should have count=2");
 
-        // 候选表只有 1 条记录（UPDATE 而非 INSERT）
         let candidate_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM wordbook_candidates", [], |r| r.get(0))
             .expect("count");
         assert_eq!(candidate_count, 1, "should have exactly 1 candidate row");
 
-        // 正式词库仍为空
         let wordbook_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM wordbook", [], |r| r.get(0))
             .expect("count");
@@ -348,35 +393,25 @@ mod tests {
         );
     }
 
-    /// FREQ-003: 第三次检测同一差异，count=3，达到默认阈值
-    /// 注意：实际写入词库和清理候选的逻辑在 mod.rs 的 learn_correction 中，
-    /// 此处仅验证 DB 层 count 累积到 3 的行为，并在同一个连接中模拟写入流程
     #[test]
     fn freq_003_third_detection_count_3_reaches_threshold() {
         let conn = setup();
 
-        // 前两次检测
-        upsert_candidate_in_conn(&conn, "原词", "修正词").expect("record 1");
-        upsert_candidate_in_conn(&conn, "原词", "修正词").expect("record 2");
+        upsert_candidate_in_conn(&conn, "测试词").expect("record 1");
+        upsert_candidate_in_conn(&conn, "测试词").expect("record 2");
 
-        // 第三次
-        let count3 = upsert_candidate_in_conn(&conn, "原词", "修正词").expect("record 3");
+        let count3 = upsert_candidate_in_conn(&conn, "测试词").expect("record 3");
         assert_eq!(count3, 3, "third detection should have count=3");
 
-        // 此时调用方（mod.rs）应判断 count >= threshold，执行：
-        // 1. 写入正式词库
-        // 2. 删除候选记录
-        // 这里在同一个连接中模拟该流程
         conn.execute(
-            "INSERT INTO wordbook (raw, corrected, source, created_at) \
-             VALUES (?1, ?2, 'auto_learn', datetime('now'))",
-            rusqlite::params!["原词", "修正词"],
+            "INSERT INTO wordbook (word, source, created_at) \
+             VALUES (?1, 'auto_learn', datetime('now'))",
+            rusqlite::params!["测试词"],
         )
         .expect("insert to wordbook");
 
-        delete_candidate_in_conn(&conn, "原词", "修正词").expect("cleanup candidate");
+        delete_candidate_in_conn(&conn, "测试词").expect("cleanup candidate");
 
-        // 验证正式词库有此词条
         let wordbook_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM wordbook", [], |r| r.get(0))
             .expect("count");
@@ -385,7 +420,6 @@ mod tests {
             "wordbook should contain entry after threshold"
         );
 
-        // 验证候选表已清理
         let candidate_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM wordbook_candidates", [], |r| r.get(0))
             .expect("count");
@@ -395,20 +429,16 @@ mod tests {
         );
     }
 
-    /// FREQ-004: 阈值可配置，测试 threshold=5 的场景
-    /// 验证 count 能正确累积到 5，且在此之前不触发写入
     #[test]
     fn freq_004_configurable_threshold_5() {
         let conn = setup();
 
-        // 前 4 次检测
         for i in 1..=4 {
             let count =
-                upsert_candidate_in_conn(&conn, "原词", "修正词").expect(&format!("record {}", i));
+                upsert_candidate_in_conn(&conn, "测试词").expect(&format!("record {}", i));
             assert_eq!(count, i as u32, "detection {} should have count={}", i, i);
         }
 
-        // 正式词库仍为空（未达阈值=5）
         let wordbook_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM wordbook", [], |r| r.get(0))
             .expect("count");
@@ -417,28 +447,213 @@ mod tests {
             "wordbook should NOT contain entry before reaching threshold=5"
         );
 
-        // 第 5 次应达到阈值
-        let count5 = upsert_candidate_in_conn(&conn, "原词", "修正词").expect("record 5");
+        let count5 = upsert_candidate_in_conn(&conn, "测试词").expect("record 5");
         assert_eq!(count5, 5, "fifth detection should have count=5");
     }
 
-    /// 额外测试：不同 (raw,corrected) 对互不影响
     #[test]
-    fn freq_extra_different_pairs_independent() {
+    fn freq_extra_different_words_independent() {
         let conn = setup();
 
-        // 对 A 记录 2 次
-        upsert_candidate_in_conn(&conn, "A", "修正A").expect("A1");
-        upsert_candidate_in_conn(&conn, "A", "修正A").expect("A2");
+        upsert_candidate_in_conn(&conn, "词A").expect("A1");
+        upsert_candidate_in_conn(&conn, "词A").expect("A2");
 
-        // 对 B 记录 1 次
-        let count_b = upsert_candidate_in_conn(&conn, "B", "修正B").expect("B1");
+        let count_b = upsert_candidate_in_conn(&conn, "词B").expect("B1");
         assert_eq!(count_b, 1, "B should have count=1 (independent from A)");
 
-        // 候选表应有 2 条记录
         let candidate_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM wordbook_candidates", [], |r| r.get(0))
             .expect("count");
         assert_eq!(candidate_count, 2, "should have 2 candidate rows (A and B)");
+    }
+
+    // ============================================================
+    // WORDBOOK-SINGLEWORD-001-CORE: Migration idempotency tests
+    // ============================================================
+
+    #[test]
+    fn migration_idempotent_repeated_init_no_duplicate() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(MIGRATION_001).expect("migration 001");
+        conn.execute_batch(MIGRATION_002).expect("migration 002");
+
+        // Insert old-format data
+        conn.execute(
+            "INSERT INTO wordbook (raw, corrected, source, created_at) \
+             VALUES ('原词1', '修正词1', 'user', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert old format 1");
+        conn.execute(
+            "INSERT INTO wordbook (raw, corrected, source, created_at) \
+             VALUES ('原词2', '修正词2', 'user', '2024-01-02T00:00:00Z')",
+            [],
+        )
+        .expect("insert old format 2");
+        // Duplicate corrected (should dedupe)
+        conn.execute(
+            "INSERT INTO wordbook (raw, corrected, source, created_at) \
+             VALUES ('原词3', '修正词1', 'user', '2024-01-03T00:00:00Z')",
+            [],
+        )
+        .expect("insert dup corrected");
+
+        // Run migration 003 + finalize
+        conn.execute_batch(MIGRATION_003).expect("migration 003");
+        finalize_singleword_migration(&conn).expect("finalize");
+
+        // Verify: 2 unique words (修正词1 deduped, 修正词2)
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wordbook", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 2, "should have 2 unique words after dedup");
+
+        // Verify columns are single-word
+        let has_raw: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('wordbook') WHERE name = 'raw'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("check raw");
+        assert_eq!(has_raw, 0, "raw column should be gone after migration");
+
+        let has_word: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('wordbook') WHERE name = 'word'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("check word");
+        assert_eq!(has_word, 1, "word column should exist after migration");
+    }
+
+    #[test]
+    fn migration_idempotent_second_run_no_data_loss() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(MIGRATION_001).expect("migration 001");
+        conn.execute_batch(MIGRATION_002).expect("migration 002");
+        conn.execute_batch(MIGRATION_003).expect("migration 003");
+        finalize_singleword_migration(&conn).expect("first finalize");
+
+        // Insert single-word data
+        conn.execute(
+            "INSERT INTO wordbook (word, source, created_at) \
+             VALUES ('测试词', 'user', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert");
+
+        // Run migration 003 again + finalize
+        conn.execute_batch(MIGRATION_003).expect("migration 003 second");
+        finalize_singleword_migration(&conn).expect("second finalize");
+
+        // Data should be preserved
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wordbook", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 1, "data must survive idempotent re-run");
+
+        let word: String = conn
+            .query_row("SELECT word FROM wordbook", [], |r| r.get(0))
+            .expect("word");
+        assert_eq!(word, "测试词");
+    }
+
+    #[test]
+    fn migration_deleted_word_not_revived() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(MIGRATION_001).expect("migration 001");
+        conn.execute_batch(MIGRATION_002).expect("migration 002");
+
+        // Insert old format data
+        conn.execute(
+            "INSERT INTO wordbook (raw, corrected, source, created_at) \
+             VALUES ('原词', '要删的词', 'user', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert");
+        conn.execute(
+            "INSERT INTO wordbook (raw, corrected, source, created_at) \
+             VALUES ('原词2', '保留词', 'user', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert 2");
+
+        // Run migration 003 + finalize
+        conn.execute_batch(MIGRATION_003).expect("migration 003");
+        finalize_singleword_migration(&conn).expect("finalize");
+
+        // Delete one word
+        conn.execute("DELETE FROM wordbook WHERE word = '要删的词'", [])
+            .expect("delete");
+
+        // Verify deletion
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wordbook", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 1, "one word should remain after delete");
+
+        // Re-run migration (simulating app restart)
+        conn.execute_batch(MIGRATION_003).expect("migration 003 re-run");
+        finalize_singleword_migration(&conn).expect("finalize re-run");
+
+        // Deleted word must not revive
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wordbook", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 1, "deleted word must not revive on re-run");
+
+        let word: String = conn
+            .query_row("SELECT word FROM wordbook", [], |r| r.get(0))
+            .expect("word");
+        assert_eq!(word, "保留词", "only the kept word should remain");
+    }
+
+    #[test]
+    fn migration_candidate_table_corrected_dedup() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(MIGRATION_001).expect("migration 001");
+        conn.execute_batch(MIGRATION_002).expect("migration 002");
+
+        // Insert old format candidate data
+        conn.execute(
+            "INSERT INTO wordbook_candidates (raw, corrected, count, last_seen) \
+             VALUES ('原1', '修正词A', 3, '2024-01-01')",
+            [],
+        )
+        .expect("insert candidate 1");
+        conn.execute(
+            "INSERT INTO wordbook_candidates (raw, corrected, count, last_seen) \
+             VALUES ('原2', '修正词A', 5, '2024-01-02')",
+            [],
+        )
+        .expect("insert candidate 2 (same corrected)");
+        conn.execute(
+            "INSERT INTO wordbook_candidates (raw, corrected, count, last_seen) \
+             VALUES ('原3', '修正词B', 2, '2024-01-03')",
+            [],
+        )
+        .expect("insert candidate 3");
+
+        // Run migration 003 + finalize
+        conn.execute_batch(MIGRATION_003).expect("migration 003");
+        finalize_singleword_migration(&conn).expect("finalize");
+
+        // Verify: 2 unique words in candidates
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wordbook_candidates", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 2, "should have 2 unique candidate words after dedup");
+
+        // 修正词A should have count=5 (MAX via GROUP BY + INSERT OR IGNORE keeps first row)
+        let count_a: i64 = conn
+            .query_row(
+                "SELECT count FROM wordbook_candidates WHERE word = '修正词A'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count A");
+        assert_eq!(count_a, 5, "修正词A should have MAX(count)=5");
     }
 }

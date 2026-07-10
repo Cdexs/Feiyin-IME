@@ -1,6 +1,6 @@
 [package]
 name = "voice-ime"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 
 [[bin]]
@@ -29,6 +29,17 @@ sentencepiece = "0.13.1"
 
 # HTTP client for LLM API (cross-platform)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+
+# WebSocket client for Qwen3 online ASR (DEC-028)
+# tungstenite 同步阻塞 WS 客户端，契合现有 worker 线程同步 pipeline
+# rustls TLS 与 reqwest 的 rustls-tls 对齐，避免引入 native-tls/OpenSSL
+tungstenite = { version = "0.26", default-features = false, features = ["handshake", "url", "rustls-tls-webpki-roots"] }
+
+# BUG-QWEN3-CRYPTO-001: 显式安装 rustls ring provider，解决 aws-lc-rs/ring 冲突 panic
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+# Base64 for PCM audio encoding (Qwen3 online ASR, DEC-028)
+base64 = "0.22"
 
 # Serialization (cross-platform)
 serde = { version = "1", features = ["derive"] }

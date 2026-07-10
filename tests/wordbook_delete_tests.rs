@@ -4,7 +4,7 @@
 //! - DEL-001: 删除已存在的用户词条
 //! - DEL-002: 删除不存在的词条
 //! - DEL-003: 删除含前后空格的词条
-//! - DEL-004: 删除空 raw/corrected 的请求
+//! - DEL-004: 删除空词条的请求
 //! - DEL-005: DB 删除成功但 Cache 未命中
 //! - DEL-006: DB 和 Cache 都不存在
 //! - DEL-007: 删除系统来源的词条
@@ -50,11 +50,10 @@ fn wordbook_command_path() -> PathBuf {
 fn test_delete_existing_user_entry() {
     let db_content = std::fs::read_to_string(wordbook_db_path()).expect("Should read db.rs");
 
-    // 验证 DELETE 语句使用 raw + corrected 组合条件
+    // WORDBOOK-SINGLEWORD-001-CORE: delete by word (single-word model)
     assert!(
-        db_content.contains("DELETE FROM wordbook WHERE raw = ?")
-            && db_content.contains("corrected = ?"),
-        "delete_entry should use both raw and corrected as conditions"
+        db_content.contains("DELETE FROM wordbook WHERE word = ?"),
+        "delete_entry should use word as condition (single-word model)"
     );
 
     // 验证通过 affected rows > 0 判断删除成功
@@ -76,16 +75,16 @@ fn test_delete_nonexistent_entry() {
     );
 }
 
-/// DEL-003: 删除含前后空格的词条 — 验证 trim() 在 Command 层处理
+/// DEL-003: 添加/删除含前后空格的词条 — 验证 add 侧 trim() 在 Command 层处理
 #[test]
-fn test_delete_with_leading_trailing_spaces() {
+fn test_add_with_leading_trailing_spaces() {
     let cmd_content =
         std::fs::read_to_string(wordbook_command_path()).expect("Should read wordbook.rs");
 
-    // 验证 Command 层对 raw 和 corrected 做了 trim
+    // Verify trim() is present
     assert!(
-        cmd_content.contains("raw.trim()") && cmd_content.contains("corrected.trim()"),
-        "delete_wordbook_entry should trim raw and corrected parameters"
+        cmd_content.contains("word.trim()"),
+        "add_wordbook_entry should trim word parameter"
     );
 }
 
@@ -127,23 +126,23 @@ fn test_delete_both_db_and_cache_miss() {
 // 3. Tauri Command 层删除测试
 // ============================================================
 
-/// DEL-004: 删除空 raw/corrected 的请求 — validate_pair 拦截
+/// DEL-004: 删除空词条的请求 — validate_word 拦截
 #[test]
-fn test_delete_empty_raw_or_corrected() {
+fn test_delete_empty_word() {
     let cmd_content =
         std::fs::read_to_string(wordbook_command_path()).expect("Should read wordbook.rs");
 
-    // 验证存在 validate_pair 函数做参数校验
+    // 验证存在 validate_word 函数做参数校验
     assert!(
-        cmd_content.contains("fn validate_pair") || cmd_content.contains("validate_pair("),
-        "delete_wordbook_entry should call validate_pair for parameter validation"
+        cmd_content.contains("fn validate_word") || cmd_content.contains("validate_word("),
+        "add_wordbook_entry should call validate_word for parameter validation"
     );
 
-    // 验证 validate_pair 检查非空
-    let validate_section = cmd_content.split("fn validate_pair").nth(1).unwrap_or("");
+    // 验证 validate_word 检查非空
+    let validate_section = cmd_content.split("fn validate_word").nth(1).unwrap_or("");
     assert!(
-        validate_section.contains("is_empty()") || validate_section.contains(".trim().is_empty()"),
-        "validate_pair should reject empty raw or corrected"
+        validate_section.contains("is_empty()"),
+        "validate_word should reject empty word"
     );
 }
 
@@ -155,8 +154,8 @@ fn test_delete_system_entry() {
 
     // 验证删除逻辑不检查 source 字段（系统/用户词条一视同仁）
     assert!(
-        !cmd_content.contains("source") || !cmd_content.split("delete_wordbook_entry").nth(1).unwrap_or("").contains("source"),
-        "delete_wordbook_entry should not check source field — system and user entries treated equally"
+        !cmd_content.contains("source") || !cmd_content.split("delete_wordbook_entry_by_id").nth(1).unwrap_or("").contains("source"),
+        "delete_wordbook_entry_by_id should not check source field — system and user entries treated equally"
     );
 }
 

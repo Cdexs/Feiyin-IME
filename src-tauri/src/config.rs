@@ -102,11 +102,19 @@ pub struct AudioConfig {
     /// Enable streaming ASR mode (2-pass: streaming + offline correction)
     #[serde(default)]
     pub enable_streaming: bool,
-    /// ASR 模型选择（DEC-025）："performance"(默认) | "accuracy"
+    /// ASR 模型选择（DEC-025 / DEC-028）："performance"(默认) | "accuracy" | "qwen3_online"
     /// 必须与主程序 src/config/mod.rs AudioConfig.asr_model 同步，
     /// 否则配置界面保存时会静默丢弃主程序写入的 asr_model（round-trip 数据丢失）
     #[serde(default = "default_asr_model")]
     pub asr_model: String,
+    /// Qwen3 online ASR API key (DEC-028)
+    #[serde(default)]
+    pub qwen3_api_key: String,
+    /// Qwen3 online ASR service URL. Stored in config only; not exposed in UI.
+    #[serde(default = "default_qwen3_asr_url")]
+    pub qwen3_asr_url: String,
+    #[serde(default = "default_qwen3_asr_model")]
+    pub qwen3_asr_model: String,
 }
 
 fn default_overlay_opacity() -> f32 {
@@ -116,6 +124,15 @@ fn default_overlay_opacity() -> f32 {
 fn default_asr_model() -> String {
     "performance".to_string()
 }
+
+fn default_qwen3_asr_url() -> String {
+    "wss://dashscope.aliyuncs.com/api-ws/v1/realtime".to_string()
+}
+
+fn default_qwen3_asr_model() -> String {
+    "qwen3-asr-flash-realtime".to_string()
+}
+
 
 impl Default for AudioConfig {
     fn default() -> Self {
@@ -127,6 +144,9 @@ impl Default for AudioConfig {
             input_device: String::new(),
             enable_streaming: false, // 默认使用 offline 模式
             asr_model: default_asr_model(),
+            qwen3_api_key: String::new(),
+            qwen3_asr_url: default_qwen3_asr_url(),
+            qwen3_asr_model: default_qwen3_asr_model(),
         }
     }
 }
@@ -167,6 +187,7 @@ pub enum UiLanguage {
     Chinese,
     TraditionalChinese,
     English,
+    Japanese,
 }
 
 impl Default for UiLanguage {

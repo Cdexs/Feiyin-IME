@@ -15,8 +15,8 @@ const mockConfig = {
 };
 
 const mockEntries = [
-  { id: 1, raw: "原词1", corrected: "修正1", source: "user", created_at: "2024-01-01" },
-  { id: 2, raw: "原词2", corrected: "修正2", source: "user", created_at: "2024-01-01" },
+  { id: 1, word: "词条1", source: "user", created_at: "2024-01-01" },
+  { id: 2, word: "词条2", source: "user", created_at: "2024-01-01" },
 ];
 
 function renderWordbook() {
@@ -79,6 +79,32 @@ describe("WordbookPage — handleDelete", () => {
     await waitFor(() => {
       const remaining = screen.queryAllByTitle("删除");
       expect(remaining).toHaveLength(1);
+    });
+  });
+
+  it("ADD-UNIT-005: 调用 add_wordbook_entry 时传入单单词参数", async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_wordbook_entries") return mockEntries;
+      if (cmd === "add_wordbook_entry") return null;
+      return null;
+    });
+
+    renderWordbook();
+    const userTab = await screen.findByText("用户词库");
+    fireEvent.click(userTab);
+
+    const addBtn = await screen.findByTitle("添加词条");
+    fireEvent.click(addBtn);
+
+    const wordInput = document.querySelector('input[placeholder="输入词条"]') as HTMLInputElement;
+    fireEvent.change(wordInput, { target: { value: "  专业术语  " } });
+
+    const footerBtn = document.querySelector(".modal-footer .btn-primary") as HTMLButtonElement;
+    expect(footerBtn).toBeInTheDocument();
+    fireEvent.click(footerBtn);
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("add_wordbook_entry", { word: "专业术语" });
     });
   });
 
@@ -188,11 +214,9 @@ describe("WordbookPage — Add Entry Modal", () => {
     const closeBtn = header?.querySelector(".modal-close");
     expect(closeBtn).toBeInTheDocument();
 
-    // 4. 必须有原词和修正词输入框
-    const rawInput = document.querySelector('input[placeholder="输入原词"]');
-    const correctedInput = document.querySelector('input[placeholder="输入修正词"]');
-    expect(rawInput).toBeInTheDocument();
-    expect(correctedInput).toBeInTheDocument();
+    // 4. 必须有词条输入框
+    const wordInput = document.querySelector('input[placeholder="输入词条"]');
+    expect(wordInput).toBeInTheDocument();
   });
 
   it("ADD-UNIT-002: 点击关闭按钮或遮罩层关闭弹窗", async () => {
@@ -226,14 +250,9 @@ describe("WordbookPage — Add Entry Modal", () => {
     expect(footerBtn).toBeInTheDocument();
     expect(footerBtn.disabled).toBe(true);
 
-    // 输入原词后仍禁用（修正词仍为空）
-    const rawInput = document.querySelector('input[placeholder="输入原词"]') as HTMLInputElement;
-    fireEvent.change(rawInput, { target: { value: "test" } });
-    expect(footerBtn.disabled).toBe(true);
-
-    // 两者都输入后启用
-    const correctedInput = document.querySelector('input[placeholder="输入修正词"]') as HTMLInputElement;
-    fireEvent.change(correctedInput, { target: { value: "correct" } });
+    // 输入词条后启用
+    const wordInput = document.querySelector('input[placeholder="输入词条"]') as HTMLInputElement;
+    fireEvent.change(wordInput, { target: { value: "test" } });
     expect(footerBtn.disabled).toBe(false);
   });
 

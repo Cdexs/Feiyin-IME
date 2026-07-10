@@ -6,7 +6,7 @@ use super::db;
 
 #[derive(Debug, Clone)]
 pub struct WordbookCache {
-    entries: HashMap<(String, String), WordbookEntry>,
+    entries: HashMap<String, WordbookEntry>,
     stats: WordbookStats,
 }
 
@@ -19,8 +19,7 @@ pub struct WordbookStats {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WordbookEntry {
-    pub raw: String,
-    pub corrected: String,
+    pub word: String,
     pub source: String,
     pub created_at: String,
 }
@@ -31,23 +30,21 @@ impl WordbookCache {
         Ok(Self::from_entries(entries))
     }
 
-    pub fn add_entry(&mut self, raw: &str, corrected: &str, source: &str) -> Result<bool> {
-        let (raw, corrected) = validate_entry(raw, corrected, source)?;
+    pub fn add_entry(&mut self, word: &str, source: &str) -> Result<bool> {
+        let word = validate_entry(word, source)?;
 
-        let key = key(&raw, &corrected);
-        if self.entries.contains_key(&key) {
+        if self.entries.contains_key(&word) {
             return Ok(false);
         }
 
         let entry = WordbookEntry {
-            raw: raw.clone(),
-            corrected: corrected.clone(),
+            word: word.clone(),
             source: source.to_string(),
             created_at: Utc::now().to_rfc3339(),
         };
 
         if db::insert_entry(&entry)? {
-            self.entries.insert(key, entry);
+            self.entries.insert(word, entry);
             self.recalculate_stats();
             return Ok(true);
         }
@@ -55,18 +52,13 @@ impl WordbookCache {
         Ok(false)
     }
 
-    pub fn remove_entry(&mut self, raw: &str, corrected: &str) -> Result<bool> {
-        let raw = raw.trim().to_string();
-        let corrected = corrected.trim().to_string();
+    pub fn remove_entry(&mut self, word: &str) -> Result<bool> {
+        let word = word.trim().to_string();
 
-        log::debug!(
-            "[wordbook] remove_entry: raw='{}', corrected='{}'",
-            raw,
-            corrected
-        );
+        log::debug!("[wordbook] remove_entry: word='{}'", word);
 
-        let removed_from_db = db::delete_entry(&raw, &corrected)?;
-        let removed_from_cache = self.entries.remove(&key(&raw, &corrected)).is_some();
+        let removed_from_db = db::delete_entry(&word)?;
+        let removed_from_cache = self.entries.remove(&word).is_some();
 
         log::debug!(
             "[wordbook] remove_result: db={}, cache={}",
@@ -82,20 +74,19 @@ impl WordbookCache {
         Ok(false)
     }
 
-    pub fn get_all_mappings(&self) -> Vec<WordbookEntry> {
+    pub fn get_all_words(&self) -> Vec<WordbookEntry> {
         let mut entries: Vec<_> = self.entries.values().cloned().collect();
         entries.sort_by(|a, b| {
-            a.raw
-                .cmp(&b.raw)
-                .then_with(|| a.corrected.cmp(&b.corrected))
+            a.word
+                .cmp(&b.word)
                 .then_with(|| a.source.cmp(&b.source))
         });
         entries
     }
 
     #[allow(dead_code)]
-    pub fn exists(&self, raw: &str, corrected: &str) -> bool {
-        self.entries.contains_key(&key(raw, corrected))
+    pub fn exists(&self, word: &str) -> bool {
+        self.entries.contains_key(word.trim())
     }
 
     #[allow(dead_code)]
@@ -107,7 +98,7 @@ impl WordbookCache {
         let mut cache = Self {
             entries: entries
                 .into_iter()
-                .map(|entry| ((entry.raw.clone(), entry.corrected.clone()), entry))
+                .map(|entry| (entry.word.clone(), entry))
                 .collect(),
             stats: WordbookStats::default(),
         };
@@ -133,21 +124,13 @@ impl WordbookCache {
     }
 }
 
-fn validate_entry(raw: &str, corrected: &str, source: &str) -> Result<(String, String)> {
-    let raw = raw.trim().to_string();
-    let corrected = corrected.trim().to_string();
-    if raw.is_empty() {
-        bail!("wordbook raw text cannot be empty");
-    }
-    if corrected.is_empty() {
-        bail!("wordbook corrected text cannot be empty");
+fn validate_entry(word: &str, source: &str) -> Result<String> {
+    let word = word.trim().to_string();
+    if word.is_empty() {
+        bail!("wordbook word cannot be empty");
     }
     if !matches!(source, "system" | "user") {
         bail!("wordbook source must be either system or user");
     }
-    Ok((raw, corrected))
-}
-
-fn key(raw: &str, corrected: &str) -> (String, String) {
-    (raw.to_string(), corrected.to_string())
+    Ok(word)
 }

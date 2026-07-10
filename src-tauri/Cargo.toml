@@ -1,6 +1,6 @@
 [package]
 name = "feiyin-ime-ui"
-version = "0.6.1"
+version = "0.6.2"
 description = "Settings UI for voice-ime"
 authors = ["you"]
 edition = "2021"
@@ -24,6 +24,11 @@ crossbeam-channel = "0.5"
 atomic-write-file = "0.3.0"
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Diagnostics_ToolHelp"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+
+# BUG-QWEN3-CRYPTO-001: 显式安装 rustls ring provider，解决 aws-lc-rs/ring 冲突 panic
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

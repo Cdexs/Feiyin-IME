@@ -21,24 +21,22 @@ impl Wordbook {
         })
     }
 
-    /// Manually add or update a word pair as a user-sourced mapping.
-    pub fn add(&self, raw: &str, corrected: &str) -> Result<()> {
-        self.cache.borrow_mut().add_entry(raw, corrected, "user")?;
+    /// Manually add a word as a user-sourced entry.
+    pub fn add(&self, word: &str) -> Result<()> {
+        self.cache.borrow_mut().add_entry(word, "user")?;
         Ok(())
     }
 
-    /// Delete a word pair by id.
+    /// Delete a word by id.
     #[allow(dead_code)]
     pub fn delete(&self, id: i64) -> Result<()> {
         if let Some(entry) = db::get_entry_by_id(id)? {
-            self.cache
-                .borrow_mut()
-                .remove_entry(&entry.raw, &entry.corrected)?;
+            self.cache.borrow_mut().remove_entry(&entry.word)?;
         }
         Ok(())
     }
 
-    /// List all word pairs for UI display.
+    /// List all words for UI display.
     #[allow(dead_code)]
     pub fn list_all(&self) -> Result<Vec<WordEntry>> {
         let entries = db::load_word_entries()?;
@@ -46,64 +44,41 @@ impl Wordbook {
             .into_iter()
             .map(|entry| WordEntry {
                 id: entry.id,
-                raw: entry.raw,
-                corrected: entry.corrected,
+                word: entry.word,
                 source: entry.source,
                 created_at: entry.created_at,
             })
             .collect())
     }
 
-    /// Apply word substitutions to a text string.
-    pub fn apply(&self, text: &str) -> Result<String> {
-        let mut entries = self.cache.borrow().get_all_mappings();
-        entries.sort_by(|a, b| {
-            b.raw
-                .chars()
-                .count()
-                .cmp(&a.raw.chars().count())
-                .then_with(|| a.raw.cmp(&b.raw))
-                .then_with(|| a.corrected.cmp(&b.corrected))
-        });
-
-        let mut result = text.to_string();
-        for entry in &entries {
-            if !entry.raw.is_empty() {
-                result = result.replace(&entry.raw, &entry.corrected);
-            }
-        }
-        Ok(result)
-    }
-
     /// Learn a correction by comparing original ASR output with edited text.
+    /// WORDBOOK-SINGLEWORD-001-CORE: produces corrected-side word for single-word model.
     #[allow(dead_code)]
     pub fn learn_correction(&self, original: &str, edited: &str, threshold: u32) -> Result<()> {
-        let Some((raw_part, corrected_part)) = extract_correction_pair(original, edited) else {
+        let Some(corrected_part) = extract_correction_word(original, edited) else {
             return Ok(());
         };
 
-        self.learn_suggestion(&raw_part, &corrected_part, threshold)
+        self.learn_suggestion(&corrected_part, threshold)
     }
 
-    pub fn learn_suggestion(&self, raw: &str, corrected: &str, threshold: u32) -> Result<()> {
-        let raw = raw.trim();
-        let corrected = corrected.trim();
-        if raw.is_empty() || corrected.is_empty() || raw == corrected {
+    pub fn learn_suggestion(&self, word: &str, threshold: u32) -> Result<()> {
+        let word = word.trim();
+        if word.is_empty() {
             return Ok(());
         }
 
-        if self.cache.borrow().exists(raw, corrected) {
-            let _ = db::delete_candidate(raw, corrected);
+        if self.cache.borrow().exists(word) {
+            let _ = db::delete_candidate(word);
             return Ok(());
         }
 
         let threshold = threshold.max(1);
-        let count = db::upsert_candidate(raw, corrected)?;
+        let count = db::upsert_candidate(word)?;
         if count < threshold {
             log::info!(
-                "Auto-learn candidate observed: '{}' -> '{}' ({}/{})",
-                raw,
-                corrected,
+                "Auto-learn candidate observed: '{}' ({}/{})",
+                word,
                 count,
                 threshold
             );
@@ -111,22 +86,22 @@ impl Wordbook {
         }
 
         log::info!(
-            "Auto-learning promoted after threshold: '{}' -> '{}' ({}/{})",
-            raw,
-            corrected,
+            "Auto-learning promoted after threshold: '{}' ({}/{})",
+            word,
             count,
             threshold
         );
-        self.cache
-            .borrow_mut()
-            .add_entry(raw, corrected, "system")?;
-        let _ = db::delete_candidate(raw, corrected);
+        self.cache.borrow_mut().add_entry(word, "system")?;
+        let _ = db::delete_candidate(word);
 
         Ok(())
     }
 }
 
-fn extract_correction_pair(original: &str, edited: &str) -> Option<(String, String)> {
+/// WORDBOOK-SINGLEWORD-001-CORE: Extract corrected-side word from original vs edited text.
+/// Preserves the diff extraction logic but returns only the corrected part (the word to learn).
+/// This is for future WORDBOOK-CORRECTION-UI-001 纠错入口 reuse.
+fn extract_correction_word(original: &str, edited: &str) -> Option<String> {
     if original == edited {
         return None;
     }
@@ -153,14 +128,18 @@ fn extract_correction_pair(original: &str, edited: &str) -> Option<(String, Stri
         return None;
     }
 
-    let raw_part = orig_words[common_prefix..orig_mid_end].join("");
     let corrected_part = edit_words[common_prefix..edit_mid_end].join("");
 
-    if raw_part.is_empty() || corrected_part.is_empty() || raw_part == corrected_part {
+    if corrected_part.is_empty() {
         return None;
     }
 
-    Some((raw_part, corrected_part))
+    let trimmed = corrected_part.trim().to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(trimmed)
 }
 
 fn tokenize(text: &str) -> Vec<String> {
@@ -171,24 +150,41 @@ fn tokenize(text: &str) -> Vec<String> {
 #[allow(dead_code)]
 pub struct WordEntry {
     pub id: i64,
-    pub raw: String,
-    pub corrected: String,
+    pub word: String,
     pub source: String,
     pub created_at: String,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::extract_correction_pair;
+    use super::extract_correction_word;
 
     #[test]
-    fn test_extract_correction_pair_uses_changed_middle_segment() {
-        let pair = extract_correction_pair("我想用微型免", "我想用voice ime");
-        assert_eq!(pair, Some(("微型免".to_string(), "voice ime".to_string())));
+    fn test_extract_correction_word_uses_changed_middle_segment() {
+        let word = extract_correction_word("我想用微型免", "我想用voice ime");
+        assert_eq!(word, Some("voice ime".to_string()));
     }
 
     #[test]
-    fn test_extract_correction_pair_returns_none_for_identical_text() {
-        assert_eq!(extract_correction_pair("一样", "一样"), None);
+    fn test_extract_correction_word_returns_none_for_identical_text() {
+        assert_eq!(extract_correction_word("一样", "一样"), None);
+    }
+
+    #[test]
+    fn test_extract_correction_word_returns_corrected_side() {
+        let word = extract_correction_word("我吃了苹果", "我吃了梨");
+        assert_eq!(word, Some("梨".to_string()));
+    }
+
+    #[test]
+    fn test_extract_correction_word_trims_whitespace() {
+        let word = extract_correction_word("测试", " 测试词 ");
+        assert_eq!(word, Some("测试词".to_string()));
+    }
+
+    #[test]
+    fn test_extract_correction_word_empty_corrected_returns_none() {
+        let word = extract_correction_word("测试", "  ");
+        assert_eq!(word, None);
     }
 }

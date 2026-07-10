@@ -150,7 +150,7 @@ class TestWordbookModuleAvailability:
         )
 
     def test_wordbook_entry_struct(self):
-        """验证 WordEntry 结构体字段完整"""
+        """验证 WordEntry 结构体字段完整（单词模式）"""
         source = _read_file_safe(WORDBOOK_MOD_PATH)
         if not source:
             pytest.skip("wordbook/mod.rs not found")
@@ -158,19 +158,25 @@ class TestWordbookModuleAvailability:
         assert "pub struct WordEntry" in source, (
             "Wordbook should define WordEntry struct"
         )
-        assert "pub raw: String" in source, (
-            "WordEntry should have raw field"
+        assert "pub word: String" in source, (
+            "WordEntry should have word field (single-word model)"
         )
-        assert "pub corrected: String" in source, (
-            "WordEntry should have corrected field"
+        assert "pub source: String" in source, (
+            "WordEntry should have source field"
+        )
+        assert "pub id: i64" in source, (
+            "WordEntry should have id field"
         )
 
-    def test_wordbook_applies_to_text(self):
-        """验证词库模块提供 apply 方法（用于文本替换）"""
+    def test_wordbook_can_add_entry(self):
+        """验证词库模块提供 add 方法（添加单单词）"""
         source = _read_file_safe(WORDBOOK_MOD_PATH)
         if not source:
             pytest.skip("wordbook/mod.rs not found")
 
-        assert "pub fn apply" in source, (
-            "Wordbook should have apply() method for text substitution"
+        assert "pub fn add" in source, (
+            "Wordbook should have add() method for single-word entry"
+        )
+        assert "word: &str" in source, (
+            "Wordbook add() should accept a single word parameter"
         )

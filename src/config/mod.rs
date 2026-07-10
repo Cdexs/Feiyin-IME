@@ -146,10 +146,22 @@ pub struct AudioConfig {
     /// Enable streaming ASR mode (2-pass: streaming + offline correction)
     #[serde(default)]
     pub enable_streaming: bool,
-    /// ASR 模型选择（DEC-025）："performance"(默认,179MB CTC) | "accuracy"(972MB native+hotwords)
+    /// ASR 模型选择（DEC-025 + DEC-028）：
+    /// "performance"(默认,179MB CTC) | "accuracy"(972MB native+hotwords) | "qwen3_online"(在线 ASR)
     /// 旧配置无此字段时 serde default 等效于 "performance"，行为与直换前完全一致
     #[serde(default = "default_asr_model")]
     pub asr_model: String,
+    /// Qwen3 在线 ASR API Key（DEC-028，仅 qwen3_online 模式用）
+    #[serde(default)]
+    pub qwen3_api_key: String,
+    /// Qwen3 在线 ASR 服务 URL（DEC-028，仅配置文件持有，不在 UI 显示）
+    /// 默认北京 region：wss://dashscope.aliyuncs.com/api-ws/v1/realtime
+    #[serde(default = "default_qwen3_asr_url")]
+    pub qwen3_asr_url: String,
+    /// Qwen3 在线 ASR 模型 ID（DEC-028，2026-07-07 从硬编码改为配置读取）
+    /// 默认：qwen3-asr-flash-realtime
+    #[serde(default = "default_qwen3_asr_model")]
+    pub qwen3_asr_model: String,
 }
 
 fn default_overlay_opacity() -> f32 {
@@ -158,6 +170,14 @@ fn default_overlay_opacity() -> f32 {
 
 fn default_asr_model() -> String {
     "performance".to_string()
+}
+
+fn default_qwen3_asr_url() -> String {
+    "wss://dashscope.aliyuncs.com/api-ws/v1/realtime".to_string()
+}
+
+fn default_qwen3_asr_model() -> String {
+    "qwen3-asr-flash-realtime".to_string()
 }
 
 impl Default for AudioConfig {
@@ -170,6 +190,9 @@ impl Default for AudioConfig {
             input_device: String::new(),
             enable_streaming: false, // 默认使用 offline 模式
             asr_model: default_asr_model(),
+            qwen3_api_key: String::new(),
+            qwen3_asr_url: default_qwen3_asr_url(),
+            qwen3_asr_model: default_qwen3_asr_model(),
         }
     }
 }
@@ -863,6 +886,138 @@ clipboard_delay_ms = 150
         assert_eq!(
             loaded.audio.asr_model, "accuracy",
             "accuracy setting should survive roundtrip"
+        );
+    }
+
+    // ============================================================
+    // TEST-SYNC-QWEN3-001: Qwen3 配置字段 serde 测试
+    // ============================================================
+
+    /// QWEN3-CONFIG-001: qwen3 三个字段默认值序列化/反序列化正确
+    #[test]
+    fn qwen3_fields_default_values_roundtrip() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        let cfg = AppConfig::default();
+        cfg.save_to(&env.config_path()).expect("save should succeed");
+        let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
+
+        assert_eq!(loaded.audio.qwen3_api_key, "", "qwen3_api_key default should be empty");
+        assert_eq!(
+            loaded.audio.qwen3_asr_url,
+            "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+            "qwen3_asr_url default should match config/mod.rs"
+        );
+        assert_eq!(
+            loaded.audio.qwen3_asr_model,
+            "qwen3-asr-flash-realtime",
+            "qwen3_asr_model default should match config/mod.rs"
+        );
+    }
+
+    /// QWEN3-CONFIG-002: qwen3_api_key 非空值往返正确
+    #[test]
+    fn qwen3_api_key_custom_value_roundtrip() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        let mut cfg = AppConfig::default();
+        cfg.audio.qwen3_api_key = "sk-test-key-123456".to_string();
+
+        cfg.save_to(&env.config_path()).expect("save should succeed");
+        let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
+        assert_eq!(
+            loaded.audio.qwen3_api_key, "sk-test-key-123456",
+            "qwen3_api_key custom value should survive roundtrip"
+        );
+    }
+
+    /// QWEN3-CONFIG-003: 旧 config.toml（无 qwen3 字段）加载时使用默认值
+    /// 保证向后兼容：DEC-028 新增字段不破坏现有配置
+    #[test]
+    fn qwen3_fields_missing_in_old_config_uses_defaults() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        let old_toml = r#"
+ui_language = "Chinese"
+auto_learn_threshold = 2
+auto_start = false
+
+[llm]
+api_url = "https://api.openai.com/v1"
+api_key = ""
+model = "gpt-4o-mini"
+system_prompt = "prompt"
+enabled = true
+connectivity_verified = false
+
+[hotkey]
+vk_code = 120
+modifiers = 0
+display_name = "F9"
+mode = "Toggle"
+
+[audio]
+silence_threshold = 0.01
+transcription_language = "zh"
+chinese_script = "Simplified"
+overlay_opacity = 1.0
+input_device = ""
+enable_streaming = false
+asr_model = "performance"
+
+[injection]
+use_clipboard = true
+clipboard_delay_ms = 150
+"#;
+        std::fs::write(&env.config_path(), old_toml).unwrap();
+        let loaded = AppConfig::load_from(&env.config_path()).expect("should load old config");
+        assert_eq!(loaded.audio.qwen3_api_key, "", "missing qwen3_api_key should default to empty");
+        assert_eq!(
+            loaded.audio.qwen3_asr_url,
+            "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+            "missing qwen3_asr_url should default to config/mod.rs"
+        );
+        assert_eq!(
+            loaded.audio.qwen3_asr_model,
+            "qwen3-asr-flash-realtime",
+            "missing qwen3_asr_model should default to config/mod.rs"
+        );
+    }
+
+    /// QWEN3-CONFIG-004: qwen3_asr_url 自定义值往返正确
+    #[test]
+    fn qwen3_asr_url_custom_value_roundtrip() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        let mut cfg = AppConfig::default();
+        cfg.audio.qwen3_asr_url = "wss://custom.example.com/realtime".to_string();
+
+        cfg.save_to(&env.config_path()).expect("save should succeed");
+        let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
+        assert_eq!(
+            loaded.audio.qwen3_asr_url, "wss://custom.example.com/realtime",
+            "qwen3_asr_url custom value should survive roundtrip"
+        );
+    }
+
+    /// QWEN3-CONFIG-005: qwen3_asr_model 自定义值往返正确
+    #[test]
+    fn qwen3_asr_model_custom_value_roundtrip() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        let mut cfg = AppConfig::default();
+        cfg.audio.qwen3_asr_model = "qwen3-asr-flash-demo".to_string();
+
+        cfg.save_to(&env.config_path()).expect("save should succeed");
+        let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
+        assert_eq!(
+            loaded.audio.qwen3_asr_model, "qwen3-asr-flash-demo",
+            "qwen3_asr_model custom value should survive roundtrip"
         );
     }
 }

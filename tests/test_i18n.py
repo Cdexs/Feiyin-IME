@@ -90,19 +90,17 @@ class TestI18nSystemPromptRule6:
         if not prompt:
             pytest.skip("Could not extract default_system_prompt_en from i18n.rs")
 
-        # 检查是否包含 <wordbook> 标签格式说明
-        # 在功能实现前，此测试可能失败或跳过
+        # 检查是否包含 wordbook 相关描述
         has_wordbook_tag = "<wordbook>" in prompt or "wordbook" in prompt.lower()
         assert has_wordbook_tag, (
-            "default_system_prompt_en should contain <wordbook> format description "
-            "(requires WORDBOOK-003+004 implementation)"
+            "default_system_prompt_en should contain wordbook format description"
         )
 
     @pytest.mark.smoke
-    def test_i18n_rule6_prompt_contains_entry_example(self):
-        """I18N-RULE6-003: 提示词包含 <entry raw=... corrected=.../> 示例
+    def test_i18n_rule6_prompt_contains_example(self):
+        """I18N-RULE6-003: 提示词包含词库示例
 
-        注意：此用例依赖 WORDBOOK-003+004 功能。
+        提示词描述 wordbook 映射示例（非 XML 格式），用于 LLM 理解术语替换逻辑。
         """
         source = _read_i18n_source()
         prompt = _extract_default_prompt_en(source)
@@ -110,13 +108,13 @@ class TestI18nSystemPromptRule6:
         if not prompt:
             pytest.skip("Could not extract default_system_prompt_en from i18n.rs")
 
-        # 检查是否包含 entry 示例
-        has_entry_example = (
-            '<entry raw=' in prompt or 'entry raw=' in prompt.lower()
+        # 检查是否包含 wordbook 映射示例文本
+        has_example = (
+            "wordbook contains" in prompt.lower()
+            or "contains wordbook" in prompt.lower()
         )
-        assert has_entry_example, (
-            "default_system_prompt_en should contain <entry raw=... corrected=.../> example "
-            "(requires WORDBOOK-003+004 implementation)"
+        assert has_example, (
+            "default_system_prompt_en should contain wordbook mapping example"
         )
 
 

@@ -7,6 +7,7 @@ mod crash;
 mod i18n;
 mod llm;
 mod overlay;
+mod qwen3;
 mod version_check;
 mod wordbook;
 
@@ -70,6 +71,15 @@ fn check_hotkey_available(vk_code: u32, modifiers: u32) -> bool {
         }
         ok
     }
+}
+
+/// ASR-QWEN3-UI-001: verify that the provided Qwen3 API key can authenticate
+/// to the realtime ASR WebSocket endpoint. Returns a short success string or an
+/// error message suitable for display in the settings UI.
+#[tauri::command]
+async fn test_qwen3_asr_connection(api_key: String) -> Result<String, String> {
+    let cfg = AppConfig::load().map_err(|e| format!("failed to load config: {e}"))?;
+    qwen3::test_qwen3_asr_connection(api_key, &cfg.audio.qwen3_asr_url, &cfg.audio.qwen3_asr_model).await
 }
 
 /// ASR-DUAL-B-003: 检测 accuracy 模型是否已就位（供前端下载引导用）
@@ -146,6 +156,10 @@ fn is_main_process_running() -> bool {
 }
 
 fn main() {
+    // BUG-QWEN3-CRYPTO-001: 进程级 rustls ring provider 安装（任何 TLS 使用之前）
+    // 重复安装返回 Err 属正常（幂等容忍），不得 unwrap
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     #[cfg(target_os = "windows")]
     if !is_main_process_running() {
         std::process::exit(1);
@@ -180,6 +194,7 @@ fn main() {
             get_config,
             save_config,
             test_llm_connection,
+            test_qwen3_asr_connection,
             get_audio_devices,
             check_hotkey_available,
             check_accuracy_model_ready,
@@ -189,7 +204,6 @@ fn main() {
             wordbook::get_wordbook_entries,
             wordbook::get_wordbook_stats,
             wordbook::add_wordbook_entry,
-            wordbook::delete_wordbook_entry,
             wordbook::delete_wordbook_entry_by_id,
             overlay::show_recording_overlay,
             overlay::hide_recording_overlay,

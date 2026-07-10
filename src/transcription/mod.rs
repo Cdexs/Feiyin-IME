@@ -10,6 +10,7 @@ use crate::{config::ChineseScript, text_normalizer};
 use sherpa_onnx::{OfflineFunASRNanoModelConfig, OfflineSenseVoiceModelConfig};
 
 mod vad;
+pub mod qwen3_online;
 pub use vad::{
     build_padded_segments, join_segment_texts, naive_chunk, should_segment, VadSegmenter,
     SEGMENT_MAX_SECS, SEGMENT_PADDING_SAMPLES, SEGMENT_TRIGGER_SECS,
@@ -24,19 +25,23 @@ pub enum AsrMode {
     Streaming,
 }
 
-/// ASR 模型选择（DEC-025）
+/// ASR 模型选择（DEC-025 + DEC-028）
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AsrModel {
     /// 性能最优：179MB FunASR Nano CTC 兼容版（OfflineSenseVoiceModelConfig，无 hotwords）
     Performance,
     /// 准确率更高：972MB FunASR Nano native（OfflineFunASRNanoModelConfig，config 层 hotwords）
     Accuracy,
+    /// Qwen3 在线 ASR（DEC-028）：零本地 ASR 内存，WebSocket 实时协议
+    Qwen3Online,
 }
 
 impl AsrModel {
     pub fn from_config(s: &str) -> Self {
         if s.eq_ignore_ascii_case("accuracy") {
             AsrModel::Accuracy
+        } else if s.eq_ignore_ascii_case("qwen3_online") {
+            AsrModel::Qwen3Online
         } else {
             AsrModel::Performance
         }
@@ -45,11 +50,12 @@ impl AsrModel {
 
 /// ASR transcriber using sherpa-onnx
 ///
-/// ASR-SINGLE-MODEL-001（DEC-027）：单模型加载架构
+/// ASR-SINGLE-MODEL-001（DEC-027）+ DEC-028：多模式 ASR 架构
 /// - Performance: 179MB CTC，OfflineSenseVoiceModelConfig，无 hotwords
 /// - Accuracy: 972MB native，OfflineFunASRNanoModelConfig，config 层 hotwords
-/// - 一次只加载一个模型，accuracy 不再预创建 CTC fallback（省 ~250-350MB 常驻）
-/// - H1 temperature 0.3 为唯一幻觉缓解；异常检测链已删除，输出即所得
+/// - Qwen3Online: 零本地 ASR 内存，WebSocket 实时协议（DEC-028）
+/// - 本地模式一次只加载一个模型；accuracy 不再预创建 CTC fallback
+/// - H1 temperature 0.1 为 accuracy 唯一幻觉缓解（2026-07-08 Gavin 拍板下调 0.3→0.1，RESEARCH-ASR-ACCURACY-002 证实越低越好）；异常检测链已删除
 ///
 /// SAFETY: sherpa_onnx::OfflineRecognizer 内含 *const C++ 指针（!Send），
 /// 但其 C++ 实现本身是线程安全的（create/decode/destroy 均可跨线程，
@@ -61,12 +67,18 @@ pub struct Transcriber {
     mode: AsrMode,
     asr_language: String,
     asr_model: AsrModel,
-    offline_recognizer: sherpa_onnx::OfflineRecognizer,
+    /// 本地 ASR recognizer（Performance/Accuracy 模式用；Qwen3Online 为 None）
+    offline_recognizer: Option<sherpa_onnx::OfflineRecognizer>,
     /// 当前注入的 hotwords 版本号（len + 内容哈希），用于感知词库变更
     hotwords_version: u64,
     /// VAD 分段器（仅 accuracy 长音频用，懒加载）
     /// 用 Mutex<Option> 因为 VAD 在首次长音频时才初始化
     vad_segmenter: Option<Mutex<vad::VadSegmenter>>,
+    /// Qwen3 在线 ASR 配置（仅 Qwen3Online 模式用）
+    qwen3_url: String,
+    qwen3_api_key: String,
+    /// Qwen3 在线 ASR 模型 ID（DEC-028，从配置文件读取，2026-07-07 移出硬编码）
+    qwen3_asr_model: String,
 }
 
 // SAFETY: Transcriber 持有的 OfflineRecognizer 内部为 *const C++ 指针。
@@ -77,24 +89,50 @@ unsafe impl Send for Transcriber {}
 impl Transcriber {
     /// Create new Transcriber with explicit ASR model selection
     ///
-    /// ASR-SINGLE-MODEL-001（DEC-027）：一次只加载一个模型。
-    /// accuracy 分支不再预创建 CTC fallback recognizer（省 ~250-350MB）。
+    /// ASR-SINGLE-MODEL-001（DEC-027）+ DEC-028：多模式 ASR
+    /// - Performance/Accuracy：加载本地模型（单模型，不预创建 fallback）
+    /// - Qwen3Online：不加载任何本地模型（零本地 ASR 内存），存 url+key
     ///
-    /// R2 修订（验收第 2 轮）：asr_model 存的是 effective_model（生效模型），
-    /// 非 requested_model（请求模型）。accuracy 降级 CTC 时 effective=Performance，
-    /// 三处语义自动归位（标点/bail/VAD 分支）。
+    /// R2 修订（验收第 2 轮）：asr_model 存的是 effective_model（生效模型）。
+    /// accuracy 降级 CTC 时 effective=Performance，语义自动归位。
+    /// DEC-028：qwen3_online 模式 key 空 → bail 明确错误（UI 侧保证 key 非空才允许选中，后端防御）
     pub fn new(
         model_dir: &Path,
         enable_streaming: bool,
         asr_language: String,
         asr_model: AsrModel,
         hotwords: Option<&str>,
+        qwen3_url: &str,
+        qwen3_api_key: &str,
+        qwen3_asr_model: &str,
     ) -> Result<Self> {
         let mode = if enable_streaming {
             AsrMode::Streaming
         } else {
             AsrMode::Offline
         };
+
+        // DEC-028: qwen3_online 模式不加载本地模型
+        if asr_model == AsrModel::Qwen3Online {
+            if qwen3_api_key.trim().is_empty() {
+                anyhow::bail!("Qwen3 ASR 配置失败：API Key 为空（请在设置中配置 Qwen3 API Key）");
+            }
+            log::info!(
+                "Qwen3 online ASR mode: no local model loaded, url={}",
+                qwen3_url
+            );
+            return Ok(Self {
+                mode,
+                asr_language,
+                asr_model,
+                offline_recognizer: None,
+                hotwords_version: 0,
+                vad_segmenter: None,
+                qwen3_url: qwen3_url.to_string(),
+                qwen3_api_key: qwen3_api_key.to_string(),
+                qwen3_asr_model: qwen3_asr_model.to_string(),
+            });
+        }
 
         let (offline_recognizer, effective_model, hotwords_version) =
             build_recognizer(model_dir, &asr_language, asr_model, hotwords)?;
@@ -112,9 +150,12 @@ impl Transcriber {
             mode,
             asr_language,
             asr_model: effective_model,
-            offline_recognizer,
+            offline_recognizer: Some(offline_recognizer),
             hotwords_version,
             vad_segmenter,
+            qwen3_url: String::new(),
+            qwen3_api_key: String::new(),
+            qwen3_asr_model: String::new(),
         })
     }
 
@@ -150,13 +191,25 @@ impl Transcriber {
     /// 标记规则：
     /// - performance → 恒 false
     /// - accuracy 单次 native 成功 → true
-    /// - accuracy 兜底触发（fallback 出文本）→ false（CTC 无标点）
-    /// - VAD 分段：所有段均 native 成功才 true；任一段兜底 → false
+    /// - accuracy VAD 分段：所有段均 native 成功才 true；任一段兜底 → false
+    /// - qwen3_online → true（DEC-028：在线模型输出自带标点）
     pub fn transcribe_with_punct_info(
         &self,
         samples: &[f32],
         script: ChineseScript,
     ) -> Result<(String, bool)> {
+        // DEC-028: qwen3_online 模式走在线转录路径
+        if self.asr_model == AsrModel::Qwen3Online {
+            let lang = if self.asr_language == "auto" {
+                None
+            } else {
+                Some(self.asr_language.as_str())
+            };
+            let text = qwen3_online::transcribe_online(&self.qwen3_url, &self.qwen3_api_key, &self.qwen3_asr_model, samples, lang)?;
+            // Qwen3 输出自带标点 → native_punctuated=true（跳过标点引擎）
+            let normalized = text_normalizer::normalize_text_for_language(&text, "zh", script);
+            return Ok((normalized, true));
+        }
         match self.mode {
             AsrMode::Offline => self.transcribe_offline_detailed(samples, script),
             AsrMode::Streaming => self.transcribe_2pass_detailed(samples, script),
@@ -286,14 +339,16 @@ impl Transcriber {
     /// - accuracy native 成功 → (text, true)
     /// - accuracy 空输出 → bail 转录失败（上层 overlay 提示）
     /// - performance → (text, false)
+    /// - qwen3_online 不走此路径（transcribe_with_punct_info 已路由）
     fn transcribe_segment_detailed(
         &self,
         samples: &[f32],
         script: ChineseScript,
     ) -> Result<(String, bool)> {
-        let stream = self.offline_recognizer.create_stream();
+        let recognizer = self.offline_recognizer.as_ref().context("No local ASR recognizer (qwen3_online mode should not reach here)")?;
+        let stream = recognizer.create_stream();
         stream.accept_waveform(16000, samples);
-        self.offline_recognizer.decode(&stream);
+        recognizer.decode(&stream);
 
         let result = stream.get_result().context("No transcription result")?;
         let text = result.text.trim().to_string();
@@ -375,12 +430,11 @@ pub fn strip_punctuation(text: &str) -> String {
     result.trim().to_string()
 }
 /// entries 须按确定性顺序（调用方按 id 排序）保证哈希稳定
-pub fn hotwords_version(entries: &[(String, String)]) -> u64 {
+pub fn hotwords_version(entries: &[String]) -> u64 {
     let mut hasher = DefaultHasher::new();
     entries.len().hash(&mut hasher);
-    for (raw, corrected) in entries {
-        raw.hash(&mut hasher);
-        corrected.hash(&mut hasher);
+    for word in entries {
+        word.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -389,7 +443,9 @@ pub fn hotwords_version(entries: &[(String, String)]) -> u64 {
 /// 超过此数量的词条按 id DESC（最近添加优先）截断。
 /// 研究依据：220 条 hotwords → 0% 全空输出（撑爆 max_total_len=512 context），
 /// 全量 11 条含无关英文词 → 60%（比无 hotwords 62.5% 还差）。
-pub const HOTWORDS_MAX_ENTRIES: usize = 50;
+/// ASR-ACC-TUNE-001（2026-07-08 Gavin 拍板）：50→20，002/003 实测 hw=50 比 hw=20
+/// 退化 -2.5pp，10-20 为最优区间。
+pub const HOTWORDS_MAX_ENTRIES: usize = 20;
 
 /// ASR-ACC-OPT-001 方案 A：hotwords 单条最大字符数。
 /// 超长的词条（candidates 整句）不灌入，避免膨胀 user_prompt。
@@ -413,10 +469,10 @@ fn is_pure_ascii(s: &str) -> bool {
 ///
 /// 调用方（main.rs load_hotwords_for_accuracy）已按 id DESC 排序，
 /// 截断后保留最近添加的词条，确定性顺序保证 hotwords 版本号哈希稳定。
-pub fn curate_hotwords_entries(entries: &[(String, String)]) -> Vec<String> {
+pub fn curate_hotwords_entries(entries: &[String]) -> Vec<String> {
     let mut result: Vec<String> = Vec::new();
-    for (_, corrected) in entries {
-        let trimmed = corrected.trim();
+    for word in entries {
+        let trimmed = word.trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -434,12 +490,12 @@ pub fn curate_hotwords_entries(entries: &[(String, String)]) -> Vec<String> {
     result
 }
 
-/// 从 wordbook 词条构建 hotwords 字符串（逗号分隔，用 corrected 词条）
+/// 从 wordbook 词条构建 hotwords 字符串（逗号分隔）
 /// 仅 accuracy 分支使用；performance 分支不支持 hotwords
 ///
 /// ASR-ACC-OPT-001 方案 A：内部调用 curate_hotwords_entries 精选，
 /// 过滤无关词条 + 上限截断，避免全量灌入带偏 native decoder。
-pub fn build_hotwords_string(entries: &[(String, String)]) -> String {
+pub fn build_hotwords_string(entries: &[String]) -> String {
     curate_hotwords_entries(entries).join(",")
 }
 
@@ -489,6 +545,11 @@ fn build_recognizer(
                     Ok((recognizer, AsrModel::Performance, hotwords_version))
                 }
             }
+        }
+        AsrModel::Qwen3Online => {
+            // DEC-028: qwen3_online 不加载本地模型，Transcriber::new() 已提前返回，
+            // 此分支不应被触达
+            unreachable!("Qwen3Online should be handled in Transcriber::new() before build_recognizer")
         }
     }
 }
@@ -576,7 +637,7 @@ fn create_funasr_nano_recognizer(
                 system_prompt: Some("You are a helpful assistant.".to_string()),
                 user_prompt: Some("语音转写:".to_string()),
                 max_new_tokens: 0,
-                temperature: 0.3,
+                temperature: 0.1,
                 top_p: 1.0,
                 seed: 42,
                 language: None,
@@ -668,14 +729,13 @@ mod tests {
         assert_eq!(AsrModel::from_config("ACCURACY"), AsrModel::Accuracy);
         assert_eq!(AsrModel::from_config(""), AsrModel::Performance);
         assert_eq!(AsrModel::from_config("garbage"), AsrModel::Performance);
+        assert_eq!(AsrModel::from_config("qwen3_online"), AsrModel::Qwen3Online);
+        assert_eq!(AsrModel::from_config("QWEN3_ONLINE"), AsrModel::Qwen3Online);
     }
 
     #[test]
     fn hotwords_version_stable_for_same_input() {
-        let entries = vec![
-            ("派".to_string(), "派".to_string()),
-            ("对".to_string(), "队".to_string()),
-        ];
+        let entries = vec!["派".to_string(), "队".to_string()];
         let v1 = hotwords_version(&entries);
         let v2 = hotwords_version(&entries);
         assert_eq!(v1, v2, "same input must produce same hash");
@@ -683,8 +743,8 @@ mod tests {
 
     #[test]
     fn hotwords_version_changes_on_content_change() {
-        let e1 = vec![("派".to_string(), "派".to_string())];
-        let e2 = vec![("派".to_string(), "湃".to_string())];
+        let e1 = vec!["派".to_string()];
+        let e2 = vec!["湃".to_string()];
         assert_ne!(
             hotwords_version(&e1),
             hotwords_version(&e2),
@@ -694,11 +754,8 @@ mod tests {
 
     #[test]
     fn hotwords_version_changes_on_len_change() {
-        let e1 = vec![("a".to_string(), "b".to_string())];
-        let e2 = vec![
-            ("a".to_string(), "b".to_string()),
-            ("c".to_string(), "d".to_string()),
-        ];
+        let e1 = vec!["a".to_string()];
+        let e2 = vec!["a".to_string(), "b".to_string()];
         assert_ne!(
             hotwords_version(&e1),
             hotwords_version(&e2),
@@ -708,14 +765,8 @@ mod tests {
 
     #[test]
     fn hotwords_version_order_sensitive() {
-        let e1 = vec![
-            ("a".to_string(), "b".to_string()),
-            ("c".to_string(), "d".to_string()),
-        ];
-        let e2 = vec![
-            ("c".to_string(), "d".to_string()),
-            ("a".to_string(), "b".to_string()),
-        ];
+        let e1 = vec!["a".to_string(), "b".to_string()];
+        let e2 = vec!["b".to_string(), "a".to_string()];
         assert_ne!(
             hotwords_version(&e1),
             hotwords_version(&e2),
@@ -724,11 +775,11 @@ mod tests {
     }
 
     #[test]
-    fn build_hotwords_string_joins_corrected_non_empty() {
+    fn build_hotwords_string_joins_non_empty() {
         let entries = vec![
-            ("派".to_string(), "派".to_string()),
-            ("对".to_string(), "队".to_string()),
-            ("x".to_string(), "  ".to_string()), // empty after trim
+            "派".to_string(),
+            "队".to_string(),
+            "  ".to_string(), // empty after trim
         ];
         let s = build_hotwords_string(&entries);
         assert_eq!(s, "派,队");
@@ -736,23 +787,23 @@ mod tests {
 
     #[test]
     fn build_hotwords_string_empty_entries() {
-        let entries: Vec<(String, String)> = vec![];
+        let entries: Vec<String> = vec![];
         assert_eq!(build_hotwords_string(&entries), "");
     }
 
     // ============================================================
     // ASR-ACC-OPT-001 方案 A: curate_hotwords_entries 精选策略测试
+    // WORDBOOK-SINGLEWORD-001-CORE: 单词化（&[String]）
     // ============================================================
 
     #[test]
     fn curate_filters_pure_ascii_entries() {
-        // 纯英文/数字词条应被过滤（worker1/tester1/todo 等无关词带偏 native decoder）
         let entries = vec![
-            ("我可一".to_string(), "worker1".to_string()),
-            ("tester一".to_string(), "tester1".to_string()),
-            ("t度".to_string(), "todo".to_string()),
-            ("派".to_string(), "派".to_string()),
-            ("比利".to_string(), "比利".to_string()),
+            "worker1".to_string(),
+            "tester1".to_string(),
+            "todo".to_string(),
+            "派".to_string(),
+            "比利".to_string(),
         ];
         let s = build_hotwords_string(&entries);
         assert_eq!(s, "派,比利", "pure ASCII entries must be filtered");
@@ -760,12 +811,11 @@ mod tests {
 
     #[test]
     fn curate_filters_long_entries() {
-        // 超长词条（candidates 整句）不应灌入，避免膨胀 user_prompt
-        let long_str = "这是第一行需要测试的内容第二行需要测试的内容".to_string(); // >10 chars
+        let long_str = "这是第一行需要测试的内容第二行需要测试的内容".to_string();
         let entries = vec![
-            ("短词".to_string(), "短词".to_string()), // 2 chars, keep
-            ("长句".to_string(), long_str.clone()),     // >10 chars, filter
-            ("派发".to_string(), "派发".to_string()),  // 2 chars, keep
+            "短词".to_string(),
+            long_str.clone(),
+            "派发".to_string(),
         ];
         let s = build_hotwords_string(&entries);
         assert_eq!(s, "短词,派发", "long entries must be filtered");
@@ -775,19 +825,16 @@ mod tests {
     #[test]
     fn curate_filters_empty_and_whitespace_entries() {
         let entries = vec![
-            ("a".to_string(), "  ".to_string()),  // whitespace only
-            ("b".to_string(), "".to_string()),    // empty
-            ("c".to_string(), "派".to_string()),  // keep
+            "  ".to_string(),
+            "".to_string(),
+            "派".to_string(),
         ];
         assert_eq!(build_hotwords_string(&entries), "派");
     }
 
     #[test]
     fn curate_enforces_max_entries_limit() {
-        // 构建 60 条中文词条，验证上限截断为 HOTWORDS_MAX_ENTRIES
-        let entries: Vec<(String, String)> = (0..60)
-            .map(|i| (format!("r{}", i), format!("词{}", i)))
-            .collect();
+        let entries: Vec<String> = (0..60).map(|i| format!("词{}", i)).collect();
         let s = build_hotwords_string(&entries);
         let count = s.split(',').count();
         assert_eq!(count, HOTWORDS_MAX_ENTRIES, "must cap at HOTWORDS_MAX_ENTRIES");
@@ -795,16 +842,12 @@ mod tests {
 
     #[test]
     fn curate_keeps_most_recent_when_over_limit() {
-        // 调用方按 id DESC 排序，截断保留最近添加的词条
-        // 模拟 id DESC：最后一个条目是最早添加，前两个是最近
         let entries = vec![
-            ("最近1".to_string(), "最近词1".to_string()),
-            ("最近2".to_string(), "最近词2".to_string()),
-            ("最早".to_string(), "早期词".to_string()),
+            "最近词1".to_string(),
+            "最近词2".to_string(),
+            "早期词".to_string(),
         ];
-        // 只取前 2 条（HOTWORDS_MAX_ENTRIES=2 的行为模拟，实际用常量）
         let curated = curate_hotwords_entries(&entries);
-        // 正常情况 3 条 < 50 全保留；这里验证 curate 保留入参顺序
         assert_eq!(curated.len(), 3);
         assert_eq!(curated[0], "最近词1");
         assert_eq!(curated[1], "最近词2");
@@ -813,12 +856,7 @@ mod tests {
 
     #[test]
     fn curate_preserves_order_for_stable_hash() {
-        // 确定性顺序保证 hotwords 版本号哈希稳定
-        let entries = vec![
-            ("一".to_string(), "派".to_string()),
-            ("二".to_string(), "比".to_string()),
-            ("三".to_string(), "利".to_string()),
-        ];
+        let entries = vec!["派".to_string(), "比".to_string(), "利".to_string()];
         let s1 = build_hotwords_string(&entries);
         let s2 = build_hotwords_string(&entries);
         assert_eq!(s1, s2, "same input must produce same output");
@@ -827,19 +865,17 @@ mod tests {
 
     #[test]
     fn curate_mixed_realistic_wordbook() {
-        // 模拟 Gavin 真实 wordbook（含中英混合 + 短长混合）
         let entries = vec![
-            ("我刺".to_string(), "我吃".to_string()),         // 中文 2字 keep
-            ("我可一".to_string(), "worker1".to_string()),    // ASCII filter
-            ("tester一".to_string(), "tester1".to_string()), // ASCII filter
-            ("t度".to_string(), "todo".to_string()),          // ASCII filter
-            ("土豆".to_string(), "todo".to_string()),         // ASCII filter
-            ("比丽".to_string(), "比利".to_string()),         // 中文 2字 keep
-            ("持库".to_string(), "词库".to_string()),         // 中文 2字 keep
-            ("领界".to_string(), "灵界".to_string()),         // 中文 2字 keep
-            ("阿贤".to_string(), "阿炎".to_string()),         // 中文 2字 keep
-            ("扣1".to_string(), "coder1".to_string()),        // ASCII filter
-            ("阿言".to_string(), "阿炎".to_string()),         // 中文 2字 keep
+            "我吃".to_string(),
+            "worker1".to_string(),
+            "tester1".to_string(),
+            "todo".to_string(),
+            "比利".to_string(),
+            "词库".to_string(),
+            "灵界".to_string(),
+            "阿炎".to_string(),
+            "coder1".to_string(),
+            "阿炎".to_string(),
         ];
         let s = build_hotwords_string(&entries);
         assert_eq!(s, "我吃,比利,词库,灵界,阿炎,阿炎", "must keep only CJK entries");
@@ -847,7 +883,7 @@ mod tests {
 
     #[test]
     fn curate_empty_wordbook_returns_empty() {
-        let entries: Vec<(String, String)> = vec![];
+        let entries: Vec<String> = vec![];
         assert_eq!(build_hotwords_string(&entries), "");
     }
 
@@ -870,17 +906,8 @@ mod tests {
 
     #[test]
     fn curate_filter_invariance_preserves_hash_stability() {
-        // 两个列表仅差一条纯 ASCII 词条，curate 输出必须相同
-        // 保证 hotwords 版本号不变、不触发无意义热重载
-        let without_ascii = vec![
-            ("派".to_string(), "派".to_string()),
-            ("比".to_string(), "比".to_string()),
-        ];
-        let with_ascii = vec![
-            ("派".to_string(), "派".to_string()),
-            ("worker1".to_string(), "worker1".to_string()),
-            ("比".to_string(), "比".to_string()),
-        ];
+        let without_ascii = vec!["派".to_string(), "比".to_string()];
+        let with_ascii = vec!["派".to_string(), "worker1".to_string(), "比".to_string()];
         let s1 = build_hotwords_string(&without_ascii);
         let s2 = build_hotwords_string(&with_ascii);
         assert_eq!(s1, s2, "ASCII entry filtering must not change curated output");
@@ -888,15 +915,14 @@ mod tests {
 
     #[test]
     fn curate_filters_exact_boundary_entries() {
-        // 恰好 10 字保留，11 字过滤
         let ten_chars = "一二三四五六七八九十";
         let eleven_chars = "一二三四五六七八九十1";
         assert_eq!(ten_chars.chars().count(), HOTWORDS_MAX_ENTRY_CHARS);
         assert_eq!(eleven_chars.chars().count(), HOTWORDS_MAX_ENTRY_CHARS + 1);
         let entries = vec![
-            ("keep".to_string(), ten_chars.to_string()),
-            ("filter".to_string(), eleven_chars.to_string()),
-            ("other".to_string(), "派".to_string()),
+            ten_chars.to_string(),
+            eleven_chars.to_string(),
+            "派".to_string(),
         ];
         let s = build_hotwords_string(&entries);
         assert_eq!(s, format!("{},派", ten_chars), "10-char kept, 11-char filtered");
@@ -904,11 +930,10 @@ mod tests {
 
     #[test]
     fn curate_keeps_mixed_cjk_ascii_entries() {
-        // 中英混合词条含非 ASCII 字符 → 保留
         let entries = vec![
-            ("纯英文".to_string(), "worker1".to_string()),
-            ("混合词".to_string(), "worker1派".to_string()),
-            ("纯中文".to_string(), "比利".to_string()),
+            "worker1".to_string(),
+            "worker1派".to_string(),
+            "比利".to_string(),
         ];
         let s = build_hotwords_string(&entries);
         assert_eq!(s, "worker1派,比利", "mixed CJK-ASCII entries must be kept");
@@ -916,16 +941,13 @@ mod tests {
 
     #[test]
     fn curate_enforces_max_entries_order() {
-        // 61 条中文词条输入，验证保留前 50 条且按入参顺序
-        let entries: Vec<(String, String)> = (0..61)
-            .map(|i| (format!("r{}", i), format!("词{}", i)))
-            .collect();
+        let entries: Vec<String> = (0..25).map(|i| format!("词{}", i)).collect();
         let curated = curate_hotwords_entries(&entries);
         assert_eq!(curated.len(), HOTWORDS_MAX_ENTRIES);
-        for i in 0..50 {
+        for i in 0..20 {
             assert_eq!(curated[i], format!("词{}", i), "entry {} must be at position {}", i, i);
         }
-        assert!(!curated.contains(&"词50".to_string()), "51st entry must be truncated");
+        assert!(!curated.contains(&"词20".to_string()), "21st entry must be truncated");
     }
 
     // ============================================================

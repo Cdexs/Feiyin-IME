@@ -376,6 +376,9 @@ def app_config() -> dict:
             "silence_threshold": 0.01,
             "silence_duration_ms": 1500,
             "max_record_seconds": 30,
+            "qwen3_api_key": "",
+            "qwen3_asr_url": "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+            "qwen3_asr_model": "qwen3-asr-flash-realtime",
         },
         "llm": {"enabled": False},
     }

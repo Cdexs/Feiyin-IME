@@ -289,6 +289,65 @@ class TestSidebarLayout:
             main_content.evaluate("el => el.style.overflowY = ''")
 
 
+class TestVoiceAsrModelSelect:
+    """Voice 页 ASR 模型下拉选择框测试（TEST-SYNC-QWEN3-001）"""
+
+    def test_asr_model_select_exists(self, main_page) -> None:
+        """测试 ASR 模型选择下拉框存在"""
+        # 先点击语音 Tab
+        voice_tab = main_page.locator('text="语音"').first
+        if voice_tab.count() > 0:
+            voice_tab.click()
+            time.sleep(0.5)
+        else:
+            pytest.skip("Voice tab not found")
+
+        # 查找 ASR 模型选择下拉框
+        select = main_page.locator('select.select-input').first
+        if select.count() == 0:
+            pytest.skip("ASR model select not found")
+
+        # 验证有 3 个选项（performance/accuracy/qwen3_online）
+        options = select.locator('option')
+        assert options.count() == 3, (
+            f"Expected 3 ASR model options, found {options.count()}"
+        )
+
+        # 验证选项值
+        values = options.evaluate_all("els => els.map(el => el.value)")
+        assert "performance" in values, "performance option must exist"
+        assert "accuracy" in values, "accuracy option must exist"
+        assert "qwen3_online" in values, "qwen3_online option must exist"
+
+    def test_asr_model_select_can_switch(self, main_page) -> None:
+        """测试 ASR 模型选择下拉框可切换"""
+        voice_tab = main_page.locator('text="语音"').first
+        if voice_tab.count() > 0:
+            voice_tab.click()
+            time.sleep(0.5)
+        else:
+            pytest.skip("Voice tab not found")
+
+        select = main_page.locator('select.select-input').first
+        if select.count() == 0:
+            pytest.skip("ASR model select not found")
+
+        # 切换到 accuracy
+        select.select_option("accuracy")
+        time.sleep(0.2)
+        assert select.input_value() == "accuracy", "select should now show accuracy"
+
+        # 切换到 qwen3_online
+        select.select_option("qwen3_online")
+        time.sleep(0.2)
+        assert select.input_value() == "qwen3_online", "select should now show qwen3_online"
+
+        # 切换回 performance
+        select.select_option("performance")
+        time.sleep(0.2)
+        assert select.input_value() == "performance", "select should now show performance"
+
+
 class TestPageContent:
     """页面内容验证测试"""
 
@@ -321,3 +380,148 @@ class TestPageContent:
                 pass
         # 无图片也算通过
         assert True
+
+
+class TestWordbookPage:
+    """词库页面 E2E 测试（WORDBOOK-SINGLEWORD-001）
+
+    覆盖：
+    - 词库页面存在并可导航
+    - 单输入框添加弹窗布局
+    - 切换到用户词库页 Tab（添加按钮可用）
+    - 添加弹窗中包含单个输入框
+    - 添加按钮在输入为空时禁用
+    """
+
+    def _navigate_to_wordbook(self, main_page) -> bool:
+        """导航到词库页面，返回是否成功"""
+        wordbook_nav = main_page.locator('.sidebar-nav-item').filter(
+            has_text='词库'
+        ).or_(
+            main_page.locator('.sidebar-nav-item').filter(has_text='Wordbook')
+        ).first
+        if wordbook_nav.count() == 0:
+            return False
+        wordbook_nav.click()
+        import time
+        time.sleep(0.5)
+        return True
+
+    def test_wordbook_sidebar_nav_exists(self, main_page) -> None:
+        """测试词库侧边栏导航项存在"""
+        nav_items = main_page.locator('.sidebar-nav-item')
+        count = nav_items.count()
+        assert count >= 1, "Sidebar navigation should exist"
+
+        wordbook_nav = nav_items.filter(has_text='词库').or_(
+            nav_items.filter(has_text='Wordbook')
+        )
+        assert wordbook_nav.count() > 0, (
+            "Wordbook sidebar nav item should exist"
+        )
+
+    def test_wordbook_stats_visible(self, main_page) -> None:
+        """测试词库统计栏可见"""
+        if not self._navigate_to_wordbook(main_page):
+            pytest.skip("Could not navigate to wordbook page")
+
+        stats = main_page.locator('.wordbook-stats')
+        assert stats.count() > 0, "Wordbook stats bar should be visible"
+
+    def test_wordbook_tabs_exist(self, main_page) -> None:
+        """测试词库页面 Tab 切换存在"""
+        if not self._navigate_to_wordbook(main_page):
+            pytest.skip("Could not navigate to wordbook page")
+
+        tabs = main_page.locator('.wordbook-tab')
+        # 应该有系统/用户两个 Tab
+        assert tabs.count() >= 2, (
+            f"Expected at least 2 wordbook tabs, found {tabs.count()}"
+        )
+
+    def test_wordbook_user_tab_enables_add_button(self, main_page) -> None:
+        """测试切换到用户词库 Tab 后添加按钮启用"""
+        if not self._navigate_to_wordbook(main_page):
+            pytest.skip("Could not navigate to wordbook page")
+
+        # 点击用户词库 Tab
+        user_tabs = main_page.locator('.wordbook-tab').filter(
+            has_text='用户'
+        ).or_(
+            main_page.locator('.wordbook-tab').filter(has_text='User')
+        )
+        if user_tabs.count() == 0:
+            pytest.skip("User tab not found by text, trying second tab")
+
+        # 降级：点击第二个 .wordbook-tab
+        if user_tabs.count() == 0:
+            all_tabs = main_page.locator('.wordbook-tab')
+            if all_tabs.count() >= 2:
+                all_tabs.nth(1).click()
+            else:
+                pytest.skip("Cannot find user tab")
+        else:
+            user_tabs.first.click()
+
+        import time
+        time.sleep(0.3)
+
+        # 添加按钮应存在且启用
+        add_btn = main_page.locator('.wordbook-add-inline')
+        assert add_btn.count() > 0, "Add button should exist on user tab"
+        assert add_btn.is_enabled(), "Add button should be enabled on user tab"
+
+    def test_wordbook_add_modal_has_single_input(self, main_page) -> None:
+        """测试添加弹窗包含单个输入框（单词模式）"""
+        if not self._navigate_to_wordbook(main_page):
+            pytest.skip("Could not navigate to wordbook page")
+
+        # 切换到用户 Tab
+        all_tabs = main_page.locator('.wordbook-tab')
+        if all_tabs.count() >= 2:
+            all_tabs.nth(1).click()
+        else:
+            pytest.skip("Not enough tabs")
+
+        import time
+        time.sleep(0.3)
+
+        # 点击添加按钮
+        add_btn = main_page.locator('.wordbook-add-inline')
+        if add_btn.count() == 0 or not add_btn.is_enabled():
+            pytest.skip("Add button not available")
+        add_btn.click()
+        time.sleep(0.3)
+
+        # 验证添加弹窗存在
+        modal = main_page.locator('.modal-wordbook-add')
+        assert modal.count() > 0, "Add modal should be visible after clicking +"
+
+        # 验证弹窗包含单个输入框
+        inputs = modal.locator('input[type="text"]')
+        assert inputs.count() == 1, (
+            f"Add modal should have exactly 1 text input (single-word mode), got {inputs.count()}"
+        )
+
+        # 验证添加按钮初始状态为禁用（输入为空）
+        add_submit = modal.locator('.btn-primary.btn-accent')
+        assert add_submit.count() > 0, "Add submit button should exist in modal"
+        assert add_submit.is_disabled(), (
+            "Add button should be disabled when input is empty"
+        )
+
+    def test_wordbook_delete_button_exists_on_entries(self, main_page) -> None:
+        """测试词条条目包含删除按钮"""
+        if not self._navigate_to_wordbook(main_page):
+            pytest.skip("Could not navigate to wordbook page")
+
+        # 查看是否有词条条目
+        labels = main_page.locator('.wordbook-label')
+        if labels.count() == 0:
+            pytest.skip("No wordbook entries to test delete button")
+
+        # 每个词条应有删除按钮
+        delete_btns = main_page.locator('.wordbook-label-delete')
+        assert delete_btns.count() > 0, (
+            "Wordbook entries should have delete buttons"
+        )

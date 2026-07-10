@@ -8,6 +8,7 @@ mod crash;
 mod hotkey; // Deprecated: use platform::HotkeyListener instead
 mod i18n;
 mod injection; // Deprecated: use platform::inject_text instead
+mod itn;
 mod llm;
 mod platform; // MAC-001+003: Platform abstraction layer
 mod punctuation;
@@ -2084,7 +2085,7 @@ fn set_auto_start(enabled: bool) -> Result<()> {
     Ok(())
 }
 /// ASR-DUAL-B-001: 加载 hotwords 字符串（仅 accuracy 模式需要）
-/// 从 wordbook 读取所有 corrected 词条，按 id 排序保证哈希稳定，构建逗号分隔字符串
+/// 从 wordbook 读取所有单词，按 id 排序保证哈希稳定，构建逗号分隔字符串
 /// performance 模式返回 None（不支持 hotwords）
 #[cfg(target_os = "windows")]
 fn load_hotwords_for_accuracy(config: &AppConfig) -> Option<String> {
@@ -2097,11 +2098,8 @@ fn load_hotwords_for_accuracy(config: &AppConfig) -> Option<String> {
         Ok(wb) => match wb.list_all() {
             Ok(entries) => {
                 // list_all 已按 id DESC 排序，确定性顺序
-                let pairs: Vec<(String, String)> = entries
-                    .into_iter()
-                    .map(|e| (e.raw, e.corrected))
-                    .collect();
-                let s = transcription::build_hotwords_string(&pairs);
+                let words: Vec<String> = entries.into_iter().map(|e| e.word).collect();
+                let s = transcription::build_hotwords_string(&words);
                 if s.is_empty() {
                     None
                 } else {
@@ -2173,6 +2171,9 @@ fn spawn_worker_thread(
             config.audio.transcription_language.clone(),
             transcription::AsrModel::from_config(&config.audio.asr_model),
             initial_hotwords.as_deref(),
+            &config.audio.qwen3_asr_url,
+            &config.audio.qwen3_api_key,
+            &config.audio.qwen3_asr_model,
         ) {
             Ok(t) => Some(t),
             Err(err) => {
@@ -2195,6 +2196,10 @@ fn spawn_worker_thread(
         let mut active_hotwords_version: u64 =
             transcriber.as_ref().map(|t| t.hotwords_version()).unwrap_or(0);
         let mut active_language: String = config.audio.transcription_language.clone();
+        // R2-4: qwen3 配置跟踪，用于热重载对比
+        let mut active_qwen3_url: String = config.audio.qwen3_asr_url.clone();
+        let mut active_qwen3_api_key: String = config.audio.qwen3_api_key.clone();
+        let mut active_qwen3_asr_model: String = config.audio.qwen3_asr_model.clone();
 
         // PERF-INIT-001: Pre-initialize LlmClient once; update_config() before each use.
         let mut llm_client = llm::LlmClient::new(config.llm.clone());
@@ -2229,6 +2234,11 @@ fn spawn_worker_thread(
                     active_asr_model = new_transcriber.asr_model();
                     active_hotwords_version = new_transcriber.hotwords_version();
                     active_language = new_transcriber.language().to_string();
+                    // R2-4: 同步 qwen3 跟踪值（仅 Qwen3Online 模式有实际值）
+                    let fresh = clone_runtime_config(&runtime_config);
+                    active_qwen3_url = fresh.audio.qwen3_asr_url;
+                    active_qwen3_api_key = fresh.audio.qwen3_api_key;
+                    active_qwen3_asr_model = fresh.audio.qwen3_asr_model;
                     transcriber = Some(new_transcriber);
                     asr_reload_in_flight = false;
                 }
@@ -2260,7 +2270,8 @@ fn spawn_worker_thread(
                     };
 
                     // ASR-DUAL-B-001: 检查是否需要热重载 transcriber
-                    // 触发条件：asr_model 变更 / transcription_language 变更 / accuracy 模式下词库变更
+                    // 触发条件：asr_model 变更 / transcription_language 变更 /
+                    // accuracy 模式下词库变更 / qwen3 配置变更 / transcriber 未初始化自愈
                     let desired_asr_model =
                         transcription::AsrModel::from_config(&config.audio.asr_model);
                     let desired_hotwords = load_hotwords_for_accuracy(&config);
@@ -2268,25 +2279,39 @@ fn spawn_worker_thread(
                         Some(h) => compute_hotwords_version(h),
                         None => 0,
                     };
+                    // R2-4: transcriber.is_none() 时无条件尝试重建（启动失败自愈）
+                    let needs_rebuild = transcriber.is_none() && !asr_reload_in_flight;
+                    // R2-4: qwen3 配置变更（key 改错后修正、url/model 变更）
+                    let qwen3_changed = desired_asr_model == transcription::AsrModel::Qwen3Online
+                        && (active_qwen3_url != config.audio.qwen3_asr_url
+                            || active_qwen3_api_key != config.audio.qwen3_api_key
+                            || active_qwen3_asr_model != config.audio.qwen3_asr_model);
                     let needs_reload = active_asr_model != desired_asr_model
                         || active_language != config.audio.transcription_language
                         || (desired_asr_model == transcription::AsrModel::Accuracy
-                            && active_hotwords_version != desired_hotwords_version);
+                            && active_hotwords_version != desired_hotwords_version)
+                        || qwen3_changed
+                        || needs_rebuild;
                     if needs_reload && !asr_reload_in_flight {
                         log::info!(
-                            "Triggering ASR transcriber hot-reload: model {:?}->{:?}, lang {}->{}, hotwords_version {}->{}",
+                            "Triggering ASR transcriber hot-reload: model {:?}->{:?}, lang {}->{}, hotwords_version {}->{}, qwen3_changed={}, needs_rebuild={}",
                             active_asr_model,
                             desired_asr_model,
                             active_language,
                             config.audio.transcription_language,
                             active_hotwords_version,
-                            desired_hotwords_version
+                            desired_hotwords_version,
+                            qwen3_changed,
+                            needs_rebuild,
                         );
                         asr_reload_in_flight = true;
                         let reload_model_dir = model_dir.clone();
                         let reload_streaming = config.audio.enable_streaming;
                         let reload_language = config.audio.transcription_language.clone();
                         let reload_hotwords = desired_hotwords.clone();
+                        let reload_qwen3_url = config.audio.qwen3_asr_url.clone();
+                        let reload_qwen3_key = config.audio.qwen3_api_key.clone();
+                        let reload_qwen3_model = config.audio.qwen3_asr_model.clone();
                         let reload_tx = asr_reload_tx.clone();
                         std::thread::spawn(move || {
                             let t_build = std::time::Instant::now();
@@ -2296,6 +2321,9 @@ fn spawn_worker_thread(
                                 reload_language,
                                 desired_asr_model,
                                 reload_hotwords.as_deref(),
+                                &reload_qwen3_url,
+                                &reload_qwen3_key,
+                                &reload_qwen3_model,
                             ) {
                                 Ok(new_t) => {
                                     log::info!(
@@ -2571,6 +2599,10 @@ fn run_controller(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
     Ok(())
 }
 fn main() -> Result<()> {
+    // BUG-QWEN3-CRYPTO-001: 进程级 rustls ring provider 安装（任何 TLS 使用之前）
+    // 重复安装返回 Err 属正常（幂等容忍），不得 unwrap
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let args: Vec<String> = std::env::args().collect();
     let debug_mode = args.iter().any(|arg| arg == "-debug" || arg == "--debug");
     // Set log level and output based on debug mode
@@ -2722,6 +2754,11 @@ fn select_preprocessing_params(asr_model: transcription::AsrModel) -> (usize, us
         transcription::AsrModel::Performance => {
             (PERF_SILENCE_HEAD_SAMPLES, PERF_ONSET_BACKTRACK_SAMPLES)
         }
+        transcription::AsrModel::Qwen3Online => {
+            // DEC-028: qwen3_online 沿用 performance 前处理参数（0ms head / 200ms backtrack）
+            // 在线模型对前导静音不敏感，但保持与 CTC 一致的前处理行为
+            (PERF_SILENCE_HEAD_SAMPLES, PERF_ONSET_BACKTRACK_SAMPLES)
+        }
     }
 }
 
@@ -2835,9 +2872,8 @@ fn run_pipeline(
                         );
                         return;
                     }
-                    let text = wordbook::Wordbook::open()
-                        .and_then(|wb| wb.apply(&raw_text))
-                        .unwrap_or_else(|_| raw_text.clone());
+                    // ITN-SMART-001: 智能数字规整（转录后/LLM 前，三模型统一生效）
+                    let text = itn::normalize_numbers(&raw_text);
                     // OPT-002: Skip if text is not effective (empty or filler-only)
                     if !text_normalizer::is_effective_text(&text) {
                         log::info!(
@@ -3187,12 +3223,11 @@ fn learn_llm_suggestions(
     };
     for suggestion in suggestions {
         if let Err(err) =
-            wordbook.learn_suggestion(&suggestion.raw, &suggestion.corrected, auto_learn_threshold)
+            wordbook.learn_suggestion(&suggestion.word, auto_learn_threshold)
         {
             log::debug!(
-                "Skipping LLM suggestion '{}' -> '{}': {}",
-                suggestion.raw,
-                suggestion.corrected,
+                "Skipping LLM suggestion '{}': {}",
+                suggestion.word,
                 err
             );
         }
@@ -3285,6 +3320,16 @@ mod macos_stubs {
         thread::spawn(|| {
             // Stub: macOS worker not implemented
         })
+    }
+}
+
+#[cfg(test)]
+mod rustls_provider_tests {
+    /// BUG-QWEN3-CRYPTO-001: 进程级 ring provider 重复安装不 panic（幂等性）
+    #[test]
+    fn install_default_provider_is_idempotent() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::ring::default_provider().install_default();
     }
 }
 
@@ -3991,5 +4036,18 @@ mod overlay_shimmer_tests {
         assert!(acc_bt < perf_bt,
             "accuracy backtrack ({}) must be less than performance backtrack ({})",
             acc_bt, perf_bt);
+    }
+
+    #[test]
+    fn preprocessing_params_qwen3_online_follows_performance() {
+        // DEC-028: qwen3_online 沿用 performance 前处理参数（0ms head / 200ms backtrack）
+        let (q3_head, q3_bt) = select_preprocessing_params(transcription::AsrModel::Qwen3Online);
+        let (perf_head, perf_bt) = select_preprocessing_params(transcription::AsrModel::Performance);
+        assert_eq!(q3_head, perf_head,
+            "qwen3_online silence head ({}) must equal performance head ({})",
+            q3_head, perf_head);
+        assert_eq!(q3_bt, perf_bt,
+            "qwen3_online backtrack ({}) must equal performance backtrack ({})",
+            q3_bt, perf_bt);
     }
 }

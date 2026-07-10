@@ -5,7 +5,7 @@
 > 桌面端智能语音输入工具，使用最新本地ASR模型，速度快、准确率高！支持标点符号自动补全，支持语音录入中英互译，支持LLM后端优化输出！
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](https://github.com/Cdexs/Feiyin-IME)
-[![Version](https://img.shields.io/badge/version-v0.5.4-green)](https://github.com/Cdexs/Feiyin-IME/releases)
+[![Version](https://img.shields.io/badge/version-v0.6.2-green)](https://github.com/Cdexs/Feiyin-IME/releases)
 [![License](https://img.shields.io/badge/license-MIT-orange)](LICENSE)
 
 ---

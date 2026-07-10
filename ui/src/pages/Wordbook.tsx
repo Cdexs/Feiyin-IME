@@ -4,8 +4,7 @@ import { getTranslations } from '../i18n';
 
 interface Entry {
   id: number;
-  raw: string;
-  corrected: string;
+  word: string;
   source: 'system' | 'user';
 }
 
@@ -42,8 +41,7 @@ const WordbookPage: React.FC<Props> = ({ config }) => {
   const [entries, setEntries] = useState<Entry[]>([]);
   const [loading, setLoading] = useState(true);
   const [showAddModal, setShowAddModal] = useState(false);
-  const [newRaw, setNewRaw] = useState('');
-  const [newCorrected, setNewCorrected] = useState('');
+  const [newWord, setNewWord] = useState('');
   const [errorDialog, setErrorDialog] = useState<ErrorDialogState>(closeErrorDialogState);
 
   useEffect(() => {
@@ -83,13 +81,13 @@ const WordbookPage: React.FC<Props> = ({ config }) => {
   };
 
   const handleAdd = async () => {
-    if (!newRaw.trim() || !newCorrected.trim()) return;
+    const word = newWord.trim();
+    if (!word) return;
 
     try {
-      await invoke('add_wordbook_entry', { raw: newRaw.trim(), corrected: newCorrected.trim() });
+      await invoke('add_wordbook_entry', { word });
       await loadEntries();
-      setNewRaw('');
-      setNewCorrected('');
+      setNewWord('');
       setShowAddModal(false);
     } catch (e) {
       setErrorDialog({
@@ -153,7 +151,7 @@ const WordbookPage: React.FC<Props> = ({ config }) => {
           <div className="wordbook-labels">
             {filteredEntries.map(entry => (
               <span className="wordbook-label" key={entry.id}>
-                <span className="wordbook-label-text">{entry.corrected}</span>
+                <span className="wordbook-label-text">{entry.word}</span>
                 <button
                   className="wordbook-label-delete"
                   onClick={() => handleDelete(entry.id)}
@@ -184,24 +182,14 @@ const WordbookPage: React.FC<Props> = ({ config }) => {
             </div>
             <div className="modal-body">
               <div className="form-group">
-                <label className="form-label">{t.wordbook_original}</label>
+                <label className="form-label">{t.wordbook_word}</label>
                 <input
                   className="input"
                   type="text"
-                  value={newRaw}
-                  onChange={e => setNewRaw(e.target.value)}
-                  placeholder={t.wordbook_original_placeholder}
+                  value={newWord}
+                  onChange={e => setNewWord(e.target.value)}
+                  placeholder={t.wordbook_word_placeholder}
                   autoFocus
-                />
-              </div>
-              <div className="form-group">
-                <label className="form-label">{t.wordbook_replacement}</label>
-                <input
-                  className="input"
-                  type="text"
-                  value={newCorrected}
-                  onChange={e => setNewCorrected(e.target.value)}
-                  placeholder={t.wordbook_replacement_placeholder}
                 />
               </div>
               <div className="modal-hint">
@@ -211,7 +199,7 @@ const WordbookPage: React.FC<Props> = ({ config }) => {
             </div>
             <div className="modal-footer">
               <button className="btn btn-secondary" onClick={() => setShowAddModal(false)}>{t.wordbook_cancel}</button>
-              <button className="btn btn-primary btn-accent" onClick={handleAdd} disabled={!newRaw.trim() || !newCorrected.trim()}>{t.wordbook_add}</button>
+              <button className="btn btn-primary btn-accent" onClick={handleAdd} disabled={!newWord.trim()}>{t.wordbook_add}</button>
             </div>
           </div>
         </div>

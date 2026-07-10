@@ -5,6 +5,47 @@
 
 ---
 
+## v0.6.2 - 词库单词化 + 智能数字规整（2026-07-10）
+
+| 编号 | 说明 | 负责人 | 完成时间 |
+| --- | --- | --- | --- |
+| ITN-SMART-001 | 智能数字规整模块：中文数字→阿拉伯数字（进位组合/小数点/逐位串），含时间/货币/单位/百分比/分数/序数/经纬度语境引擎 + 成语/专名/虚词保护 + 规则数据文件分离（itn-rules.toml 外置，DEC-030） | coder-1 | 2026-07-10 |
+| WORDBOOK-SINGLEWORD-001-CORE | 词库单词化改造·后端核心：词对(raw→corrected)→单词(word)模式；migration 003 幂等迁移（corrected 侧去重导入）+ finalize 条件替换旧表；wordbook cache/db/mod 全部单词化 + 删除 apply() 文本替换；LLM SuggestionEntry 单词化 + prompt 词汇表 + 向后兼容旧格式解析；transcription curate/build/version 签名 &[String]；main.rs 移除 apply 步骤 + hotwords/learn 适配单词；8 文件改动，cargo check 0 errors + cargo test 357+9+24 全绿（含 4 迁移幂等性单测）；src-tauri 编译损坏属预期（Phase2 coder-2 跟进） | coder-1 | 2026-07-10 |
+| WORDBOOK-SINGLEWORD-001-UI | 词库单词化改造·Tauri+UI 层：WordbookEntry 结构改为 {id,word,source,created_at}；add_wordbook_entry 单参数 word，删除无调用 delete_wordbook_entry 统一走 delete_wordbook_entry_by_id；src-tauri/src/i18n.rs wordbook 文案单词化；Wordbook.tsx 原词+修正词双输入框改为单「词条」输入框 + invoke 单参数；三语言 i18n 同步（wordbook_word/wordbook_word_placeholder/wordbook_add_hint 语义更新，删除原词/修正词相关 key）；Wordbook.test.tsx 适配 + 新增 ADD-UNIT-005 单参数断言；cargo check src-tauri 0 errors / Vitest 44/44 / npm run build PASS；未碰版本号与主 crate | coder-2 | 2026-07-10 |
+| TEST-SYNC-062-001 | WORDBOOK-SINGLEWORD-001 + ITN-SMART-001 测试用例对齐：修复 wordbook_delete_tests.rs 4 处旧断言（validate_pair→validate_word/delete 锚点）；更新 test_wordbook_integration/llm/i18n 3 文件残留旧格式断言；新增 test_webview_ui.py TestWordbookPage 6 条 E2E 用例；残留扫描 7 模式全部清理；生产代码零改动 | tester-1 | 2026-07-10 |
+| TEST-EXEC-062-001 | 0.6.2 全量出包：cargo test 404/0/6 + Tauri 38/0/0 + Vitest 44/44 全绿；构建三件套 0 errors；Publish 三 exe+itn-rules.toml 字节一致核验通过；ProductVersion 0.6.2.0/0.6.2；冒烟 Responding=True WS 309MB；migration 003 生效确认 (word 列, 4 条目)；Playwright 20 SKIP (CDP 未就绪) | tester-1 | 2026-07-10 |
+
+## v0.6.1 - ASR accuracy 调参 E1+E2（2026-07-08）
+
+| 编号 | 说明 | 负责人 | 完成时间 |
+| --- | --- | --- | --- |
+| ASR-ACC-TUNE-001 | E1 temperature 0.3→0.1（Gavin 直接指定终值）+ E2 HOTWORDS_MAX_ENTRIES 50→20；仅 src/transcription/mod.rs 单文件，注释含决策出处，单测符号断言自动适配；performance/qwen3 零影响；自验 cargo test 369 全绿 + 主控独立 cargo check | coder-1 | 2026-07-08 |
+| TEST-SYNC-ACC-TUNE-001 | 零改动——6 模式残留扫描零命中（测试资产无 hotwords 上限/temperature 硬编码），E2E 缺口论证无需补；主控独立扫描核验一致；result.md 首轮空文件（MSYS 路径写入静默失败 [COLLAB-WRITE-001]，随 EXEC 补填） | tester-1 | 2026-07-08 |
+| TEST-EXEC-ACC-TUNE-001 | cargo test 405/0/8 无回归 + 仅主程序重建（1m51s 0 errors）+ Publish 同步 SHA256 一致 + ProductVersion 0.6.1.0 不变 + 冒烟 Responding=True（456MB，qwen3 配置零本地模型属预期）；UI/crash-reporter 未触碰 | tester-1 | 2026-07-08 |
+| ~~RESEARCH-TEMP-SWEEP-001~~ | 已取消（Gavin 拍板直接定 0.1，不等扫描；中间数据保留 collab/research/） | - | 2026-07-08 |
+
+## v0.6.1 - ASR accuracy 质量研究勘误（2026-07-08）
+
+| 编号 | 说明 | 负责人 | 完成时间 |
+| --- | --- | --- | --- |
+| RESEARCH-ASR-ACCURACY-003 | Gavin 真实语料（56s 自录朗读）双模型同源 A/B（Windows 生产同栈）：**未复现体感**——A2 native+VAD CER 0.0271 优于 A1 CTC 0.0724（低 63%），专有名词 93% vs 67%；实锤 native >28s 整段空输出（A3 para3 26.5s max_total_len 截断），反证生产 VAD 分段是必要防护（naive_chunk ≤20s 有单测）；归因第三分支，剩余嫌疑三层（a 应用采集链/b 短指令语料形态【最高】/c 标点后处理路径差异）；F1 DEBUG-AUDIO-DUMP + F2 短指令多样本待 Gavin 拍板，E1-E4 继续挂起；方法论教训：Python sherpa max_new_tokens=0 语义陷阱（Python=0 token vs Rust=不限） | coder-1 | 2026-07-08 |
+| RESEARCH-ASR-ACCURACY-002 | accuracy vs performance 深挖研究（纯研究零生产改动）：**推翻 001 核心结论**——001 实验脚本漏传 --temperature（PoC 默认 1.0 vs 生产 0.3），native 数据被低估 20pp；生产等价条件实测 accuracy CER 0.15/first 85% 全面优于 CTC 0.3553/70%；生效性审计 6 项全 PASS（ASR-ACC-OPT-001 优化真实生效，todo 遗留项5"降级用 accuracy 参数"描述不符实际无 bug）；参数扫描给出 E1 temp 0.3→0.2（+2.5pp 低风险）/E2 hotwords 上限 50→20/E3 backtrack 100→50ms/E4 temp→0.0（需大样本验证）四方案待 Gavin 拍板；001 报告已加勘误注；方法论教训：PoC 脚本必须对照生产代码逐参数核对 | coder-1 | 2026-07-08 |
+
+## v0.6.1 - DEC-028 Qwen3 在线 ASR 接入（2026-07-08）
+
+| 编号 | 说明 | 负责人 | 完成时间 |
+| --- | --- | --- | --- |
+| ASR-QWEN3-BACKEND-001 | qwen3-asr-flash-realtime WS 后端（qwen3_online 模块 457 行）：官方 Realtime 协议（session.update pcm+sample_rate+modalities+language 条件传参）+ 整段上传手动 commit + 静默超时 10s/硬上限 max(30s,音频×0.5) + 连接 5s 超时 + fail-fast 不降级；config 四字段；AsrModel 三值；qwen3 模式零本地模型（recognizer Option 化）；热重载感知 qwen3 配置变更+None 自愈（R2-4）；含 R1/R2 两轮修订 | coder-1 | 2026-07-08 |
+| ASR-QWEN3-UI-001 | Voice 页单选框→下拉三选项（本地-快速/本地-长音频/Qwen3在线）+ 品牌色说明 + API Key 密码框/测试连接三态按钮 + 空 key 离开自动回退（prevModelRef+latestRef）+ 三语 i18n 10 键 + src-tauri config 同步与 test_qwen3_asr_connection command + accuracy 文案改长音频定位（消化 todo 遗留④）；含 R1（前端未落盘打回）/R2（回退双缺陷）两轮修订 | coder-2 | 2026-07-08 |
+| BUG-QWEN3-CRYPTO-001 | P0 崩溃修复：rustls 0.23 CryptoProvider 未确定 panic（src-tauri 零 provider feature）；两 manifest +rustls ring 直接依赖 + 两进程 main() 入口 install_default + 幂等单测 | coder-1 | 2026-07-08 |
+| BUG-QWEN3-WS-HANDSHAKE-001 | P0 修复：src-tauri 测试连接手工 Request::builder 缺 WS 握手头（Sec-WebSocket-Key 协议错误）→ into_client_request 标准写法 + build_ws_request 纯函数 + 握手头存在性单测 | coder-2 | 2026-07-08 |
+| BUG-QWEN3-STATUS-001 | P0 修复：qwen3_online.rs 握手后 status.is_success()（仅 2xx）把 WS 升级成功 101 误判为"连接被拒绝"→ 删除误判块 + debug_assert(101)；Gavin debug 日志钉死 | Orchestrator | 2026-07-08 |
+| TLS-ROOTS-FIX | P0 修复：两处 tungstenite 内部 feature __rustls-tls 无根证书库（RootCertStore 空，运行时 UnknownIssuer 必失败）→ rustls-tls-webpki-roots | Orchestrator | 2026-07-08 |
+| TEST-SYNC-QWEN3-001 | 测试同步：残留扫描 4 模式全零；6 缺口 4 补 2 免（config serde 5 + preprocessing Qwen3Online 1 + from_config 2 断言 + Playwright 下拉 2 + conftest 三字段），生产零改动 | tester-1 | 2026-07-08 |
+| TEST-EXEC-QWEN3-001~005 | 五轮测试执行与出包：终态 405/0/8 + Vitest 43/43 + 完整构建（001/003）与增量重建（002 根证书 / 004 UI 握手 / 005 主程序 101）+ Publish 同步 + 冒烟；004/005 期间守护 Gavin 端测现场（决策 B 不杀实例不碰 config）；构建中修 4 处编译阻塞（user-event 依赖/tsc 未用变量/feature 名/close API） | tester-1 | 2026-07-08 |
+| UI-INPUT-STYLE-FIX | API Key 输入框 className input-field（无定义类）→ input，与下拉框同宽等高 | coder-2 | 2026-07-08 |
+| 端测 | Gavin 全链端测通过（测试连接 + 热键转录，工作空间 endpoint wss://<workspace>.cn-beijing.maas.aliyuncs.com）；后续使用中发现问题另行立项 | Gavin | 2026-07-08 |
+
 ## v0.6.1 - B-002-FIX 下载引导卡修复（2026-07-07）
 
 | 编号 | 说明 | 负责人 | 完成时间 |
@@ -23,6 +64,7 @@
 | TEST-EXEC-HALLUC-FIX-001 | 测试执行+出包：cargo test 379/0/5（≥基线368+11），仅主程序cargo build --release 1m16s 0 errors，ProductVersion 0.6.1.0不变，crash-reporter同步Publish成功，冒烟PID 25256 Responding=True；feiyin-ime.exe因Gavin -debug实例锁定未覆盖（红线不杀） | tester-1 | 2026-07-07 |
 | HALLUC-FIX-PUBLISH-SYNC | 收尾同步+新包真实冒烟：Gavin关闭-debug后补Publish同步（19:36），启动无参实例PID 27012 Responding=True 759.4MB，测试实例已清理；红线全遵守 | tester-1 | 2026-07-07 |
 | TEST-EXEC-VAD-SINGLEMODEL-001 | 测试执行+出包：cargo test 366/0/7（VAD reset + 单模型+去CTC兜底），仅主程序build --release 1m44s 0 errors，Publish同步21:07，冒烟PID 26648 Responding=True 759.1MB，红线全遵守 | tester-1 | 2026-07-07 |
+| ASR-QWEN3-UI-001 | Qwen3 在线 ASR UI（DEC-028）：Voice 页 radio-group → select 三选项下拉（performance/accuracy/qwen3_online）+ 品牌色描述文字 + 消化 todo 遗留④ accuracy 文案改"长音频"定位 + Qwen3 API Key 输入（password）+ 测试连接按钮（invoke test_qwen3_asr_connection）+ 空 key 回退 prevModel（unmount 检测）+ 三语 i18n + 5 新增 Vitest 用例（ASR-UI-012~016），npm test 35/35 PASS | coder-2 | 2026-07-07 |
 
 ## v0.6.0 - ASR 双模型 + 正式出包（2026-07-06）
 
@@ -288,3 +330,49 @@ HOTKEY-LATENCY-FIX-001 | 热键录音视觉延迟 + 偶发首字丢失修复：�
 | FIX-VAD-STATE-RESET-001 | 修复 accuracy 长音频第二次转录 VAD detector 游标未重置致 slice 越界 panic（P0）：segment() 末尾 clear 后加 reset() + build_padded_segments 纵深防御（越界段丢弃/clamp）+ 6 新增单测；cargo check 0 errors / cargo test 384 passed 0 failed 6 ignored | coder-1 | 2026-07-07 |
 | ASR-SINGLE-MODEL-001 | 实施 DEC-027（accuracy 单模型加载 + 去 CTC 兜底 + 删异常检测链）：Transcriber 去 fallback_recognizer + 删 need_fallback 兜底链 + 删三函数及 26 测试 + VAD 降级重设计（分段全空 bail / VAD 不可用朴素 20s 等分）+ 6 naive_chunk 单测；cargo check 0 errors / cargo test 364 passed 0 failed 6 ignored | coder-1 | 2026-07-07 |
 | ASR-SINGLE-MODEL-001-R2 | 验收第 2 轮修订：R1 lock poisoned 走 naive_chunk 分支（抽 transcribe_segments_chunked 辅助函数消除重复）+ R2 build_recognizer 返回 effective_model（降级 CTC 语义归位三处）+ 顺手注释更新 + 3 新增单测；cargo check 0 errors / cargo test 366 passed 0 failed 7 ignored | coder-1 | 2026-07-07 |
+| ASR-QWEN3-BACKEND-001 | Qwen3 在线 ASR 后端续做：模型 ID 从硬编码改为配置文件读取（`qwen3_asr_model` 字段）+ WS 读写超时 10s 保护（防 worker 线程无限阻塞）+ 审计逐条 DEC-028 7 条通过；cargo check 0 errors / cargo test qwen3_online 21/0/1 | coder-1 | 2026-07-07 |
+
+## [0.6.0] - 2026-07-07 (work-in-progress)
+
+### Added (ASR Qwen3 UI + Backend)
+- Frontend: ASR model radio-group replaced with `<select>` dropdown; brand-color description text for each model
+- Frontend: Qwen3 Online model section: password-input API Key + Test Connection button (testing/success/failed states) + empty-key hint
+- Frontend: 16 ASR UI tests (ASR-UI-001~016 incl. 5 Qwen3 tests) + 7 PUNCT UI tests
+- Backend: `qwen3_asr_model` config field with serde default
+- Backend: `test_qwen3_asr_connection` now reads URL + model from config instead of hardcoding
+
+### Fixed (R2)
+- [R2-1 P0] Empty-key fallback: fixed prevModelRef recording timing (moved to handleAsrModelChange) + stale closure (use latestRef)
+- [R2-2 P1] Cleaned up 3 temp files left from R1 delivery
+- [R2-3 P2] Fixed Voice.tsx indentation for new code (2-space consistent)
+
+### Tests
+- Added 3 FALLBACK tests covering real user-flow: switch-to-qwen3→unmount scenarios
+- Total: 43 tests (26 Voice, 2 App, 9 Wordbook, 6 other)
+
+### Fixed (BUG-QWEN3-WS-HANDSHAKE-001)
+- src-tauri/src/qwen3.rs: use `IntoClientRequest::into_client_request()` to generate proper WebSocket handshake headers (Sec-WebSocket-Key, Upgrade, Connection, etc.)
+- Removed manual `Request::builder()` path that caused "Missing, duplicated or incorrect header sec-websocket-key"
+- Added `build_ws_request()` helper with unit test verifying handshake headers presence
+
+
+### 2026-07-08 — RESEARCH-ASR-ACCURACY-002 完成
+- **任务**：accuracy 优化落地后仍不敌 performance 的深挖研究（调用层生效性审计 + CER 对比 + 调优空间扫描）
+- **负责人**：coder-1
+- **性质**：纯研究，生产代码零改动
+- **核心结论**：推翻 RESEARCH-ASR-ACCURACY-001 结论——001 PoC 脚本漏传 --temperature（默认1.0）与生产 temp=0.3 不可比；生产等价条件下 accuracy CER=0.15/first=85% 优于 CTC CER=0.3553/first=70%；生效性审计6项全PASS无BUG；建议 temp 0.3→0.2（+2.5pp低风险）
+
+
+### 2026-07-08 — RESEARCH-ASR-ACCURACY-003 完成
+- **任务**：Gavin 真实语料双模型同源 A/B（分化根因终审）
+- **负责人**：coder-1
+- **性质**：纯研究，生产代码零改动
+- **核心结论**：未复现 Gavin performance 更优体感——A2 native+VAD CER=0.0271 优于 A1 CTC CER=0.0724（低63%），专有名词 93% vs 67%；A3 para3 空输出实锤 max_total_len 截断（反向证明 VAD 分段是 native 长音频必要条件）；剩余嫌疑三层（采集链/语料形态/后处理），建议 DEBUG-AUDIO-DUMP-001 排查采集链
+
+
+### 2026-07-08 — ASR-ACC-TUNE-001 完成
+- **任务**：E1 temperature 0.3→0.1 + E2 HOTWORDS_MAX_ENTRIES 50→20（Gavin 拍板）
+- **负责人**：coder-1
+- **改动**：src/transcription/mod.rs（L641 temp + L447 hotwords 上限 + 注释/单测同步）
+- **自验**：cargo check 0 errors / cargo test 全绿（345+24 passed 0 failed）
+- **影响**：仅 accuracy 分支；performance/qwen3 零影响

@@ -64,26 +64,25 @@ class TestLlmWordbookInjection:
 
     # ---- LLM-WB-INJECT-002 ----
     def test_inject_entry_format(self):
-        """LLM-WB-INJECT-002: 词库有条目时，格式为 <entry raw="X" corrected="Y"/>
+        """LLM-WB-INJECT-002: 词库有条目时，格式为 <word>word</word>
 
-        验证 LLM 构建请求中使用正确的 entry 格式。
+        验证 LLM 构建请求中使用新的单词格式。
         """
         source = _read_llm_source()
 
         has_entry_format = (
-            '<entry raw=' in source
-            or 'entry raw=' in source.lower()
-            or 'corrected=' in source.lower()
+            '<word>' in source
+            or '<word >' in source.lower()
         )
 
         if not has_entry_format:
             pytest.skip(
-                "LLM module does not yet use <entry raw=... corrected=.../> format "
-                "(requires WORDBOOK-003+004 implementation)"
+                "LLM module does not yet use <word>word</word> format "
+                "(requires WORDBOOK-SINGLEWORD-001 implementation)"
             )
 
         assert has_entry_format, (
-            "LLM request should format wordbook entries as <entry raw=\"X\" corrected=\"Y\"/>"
+            "LLM request should format wordbook entries as <word>word</word>"
         )
 
     # ---- LLM-WB-INJECT-003 ----

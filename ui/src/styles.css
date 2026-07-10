@@ -650,6 +650,13 @@ input, textarea, [contenteditable="true"] {
 }
 
 .radio-desc {
+
+.asr-model-desc {
+  font-size: 12px;
+  color: var(--brand-primary);
+  line-height: 1.5;
+}
+
   font-size: 12px;
   color: var(--system-text-secondary);
 }
