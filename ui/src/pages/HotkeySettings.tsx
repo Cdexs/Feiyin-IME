@@ -80,31 +80,6 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
   const translationInputRef = useRef<HTMLDivElement>(null);
 
   const translation = config.translation ?? { enabled: false, vk_code: 0, display_name: '', target_language: 'Chinese' };
-  const transcriptionLang = String(config.audio?.transcription_language ?? 'zh').toLowerCase();
-  const sourceIsZh = transcriptionLang.startsWith('zh');
-  const sourceIsEn = transcriptionLang === 'en' || transcriptionLang.startsWith('en-');
-  const targetLanguageOptions = React.useMemo(() => {
-    if (sourceIsZh) return ['English'];
-    if (sourceIsEn) return ['Chinese'];
-    return ['Chinese', 'English'];
-  }, [sourceIsZh, sourceIsEn]);
-  const effectiveTargetLanguage = targetLanguageOptions.includes(translation.target_language)
-    ? translation.target_language
-    : targetLanguageOptions[0];
-  const targetLanguageHint = sourceIsZh
-    ? t.hotkey_translation_hint_zh
-    : sourceIsEn
-      ? t.hotkey_translation_hint_en
-      : null;
-
-  React.useEffect(() => {
-    if (translation.target_language !== effectiveTargetLanguage) {
-      updateConfig({
-        ...config,
-        translation: { ...translation, target_language: effectiveTargetLanguage }
-      });
-    }
-  }, [translation.target_language, effectiveTargetLanguage]);
 
   const applyVoiceHotkey = (vkCode: number, modifiers: number) => {
     const newHotkey = {
@@ -228,13 +203,6 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
     });
   };
 
-  const handleTargetLanguageChange = (target_language: string) => {
-    updateConfig({
-      ...config,
-      translation: { ...translation, target_language }
-    });
-  };
-
   const currentVoiceDisplayName = getHotkeyDisplayName(
     config.hotkey.vk_code,
     config.hotkey.modifiers
@@ -315,17 +283,6 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
             </div>
             {translation.enabled && translation.vk_code === 0 && (
               <div style={{ color: 'var(--status-warning)', fontSize: '13px', marginTop: '8px' }}>{t.hotkey_set_first}</div>
-            )}
-          </div>
-
-          <div className="card" style={{ marginBottom: '12px' }}>
-            <div className="section-subtitle" style={{ marginBottom: '12px' }}>{t.hotkey_target_language}</div>
-            <select value={effectiveTargetLanguage} onChange={(e) => handleTargetLanguageChange(e.target.value)} className="select-input">
-              {targetLanguageOptions.includes('Chinese') && <option value="Chinese">{t.hotkey_target_chinese}</option>}
-              {targetLanguageOptions.includes('English') && <option value="English">{t.hotkey_target_english}</option>}
-            </select>
-            {targetLanguageHint && (
-              <p style={{ color: 'rgba(0, 0, 0, 0.5)', fontSize: '12px', lineHeight: '1.5', margin: '8px 0 0' }}>{targetLanguageHint}</p>
             )}
           </div>
 

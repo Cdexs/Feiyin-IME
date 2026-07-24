@@ -2,8 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
-const GITHUB_API_URL: &str =
-    "https://api.github.com/repos/Cdexs/Feiyin-IME/releases/latest";
+const GITHUB_API_URL: &str = "https://api.github.com/repos/Cdexs/Feiyin-IME/releases/latest";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CACHE_FILE: &str = "version_check.json";
 const USER_AGENT_PREFIX: &str = "feiyin-ime/";
@@ -88,11 +87,7 @@ fn fetch_latest_release() -> Result<GithubRelease, reqwest::Error> {
     let client = reqwest::blocking::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()?;
-    let resp: GithubRelease = client
-        .get(&url)
-        .header("User-Agent", &ua)
-        .send()?
-        .json()?;
+    let resp: GithubRelease = client.get(&url).header("User-Agent", &ua).send()?.json()?;
     Ok(resp)
 }
 

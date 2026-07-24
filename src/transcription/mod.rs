@@ -9,8 +9,8 @@ use crate::{config::ChineseScript, text_normalizer};
 // Re-export SenseVoice config for convenience
 use sherpa_onnx::{OfflineFunASRNanoModelConfig, OfflineSenseVoiceModelConfig};
 
-mod vad;
 pub mod qwen3_online;
+mod vad;
 pub use vad::{
     build_padded_segments, join_segment_texts, naive_chunk, should_segment, VadSegmenter,
     SEGMENT_MAX_SECS, SEGMENT_PADDING_SAMPLES, SEGMENT_TRIGGER_SECS,
@@ -179,7 +179,8 @@ impl Transcriber {
         _language: &str,
         script: ChineseScript,
     ) -> Result<String> {
-        self.transcribe_with_punct_info(samples, script).map(|(text, _)| text)
+        self.transcribe_with_punct_info(samples, script)
+            .map(|(text, _)| text)
     }
 
     /// 转录并返回标点来源标记（ASR-PUNCT-OPT-001）
@@ -205,9 +206,15 @@ impl Transcriber {
             } else {
                 Some(self.asr_language.as_str())
             };
-            let text = qwen3_online::transcribe_online(&self.qwen3_url, &self.qwen3_api_key, &self.qwen3_asr_model, samples, lang)?;
+            let text = qwen3_online::transcribe_online(
+                &self.qwen3_url,
+                &self.qwen3_api_key,
+                &self.qwen3_asr_model,
+                samples,
+                lang,
+            )?;
             // Qwen3 输出自带标点 → native_punctuated=true（跳过标点引擎）
-            let normalized = text_normalizer::normalize_text_for_language(&text, "zh", script);
+            let normalized = text_normalizer::normalize_text_for_language(&text, script);
             return Ok((normalized, true));
         }
         match self.mode {
@@ -218,7 +225,8 @@ impl Transcriber {
 
     /// Single-pass offline transcription (higher accuracy) — 旧签名兼容
     fn transcribe_offline(&self, samples: &[f32], script: ChineseScript) -> Result<String> {
-        self.transcribe_offline_detailed(samples, script).map(|(t, _)| t)
+        self.transcribe_offline_detailed(samples, script)
+            .map(|(t, _)| t)
     }
 
     /// 带标点来源标记的 offline 转录
@@ -320,7 +328,7 @@ impl Transcriber {
         if !joined.trim().is_empty() {
             log::info!("Segmented transcription: {}", joined);
             return Ok((
-                text_normalizer::normalize_text_for_language(&joined, "zh", script),
+                text_normalizer::normalize_text_for_language(&joined, script),
                 all_native,
             ));
         }
@@ -330,7 +338,8 @@ impl Transcriber {
 
     /// 转录单段音频 — 旧签名兼容
     fn transcribe_segment(&self, samples: &[f32], script: ChineseScript) -> Result<String> {
-        self.transcribe_segment_detailed(samples, script).map(|(t, _)| t)
+        self.transcribe_segment_detailed(samples, script)
+            .map(|(t, _)| t)
     }
 
     /// 带标点来源标记的单段转录。
@@ -345,7 +354,10 @@ impl Transcriber {
         samples: &[f32],
         script: ChineseScript,
     ) -> Result<(String, bool)> {
-        let recognizer = self.offline_recognizer.as_ref().context("No local ASR recognizer (qwen3_online mode should not reach here)")?;
+        let recognizer = self
+            .offline_recognizer
+            .as_ref()
+            .context("No local ASR recognizer (qwen3_online mode should not reach here)")?;
         let stream = recognizer.create_stream();
         stream.accept_waveform(16000, samples);
         recognizer.decode(&stream);
@@ -361,21 +373,22 @@ impl Transcriber {
             }
             // accuracy native 成功 → native_punctuated = true
             return Ok((
-                text_normalizer::normalize_text_for_language(&text, "zh", script),
+                text_normalizer::normalize_text_for_language(&text, script),
                 true,
             ));
         }
 
         // performance 分支 → native_punctuated = false（CTC 无标点）
         Ok((
-            text_normalizer::normalize_text_for_language(&text, "zh", script),
+            text_normalizer::normalize_text_for_language(&text, script),
             false,
         ))
     }
 
     /// 2-pass streaming transcription — 旧签名兼容
     fn transcribe_2pass(&self, samples: &[f32], script: ChineseScript) -> Result<String> {
-        self.transcribe_2pass_detailed(samples, script).map(|(t, _)| t)
+        self.transcribe_2pass_detailed(samples, script)
+            .map(|(t, _)| t)
     }
 
     /// 带标点来源标记的 2-pass 转录
@@ -403,8 +416,8 @@ pub fn strip_punctuation(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut result = String::with_capacity(chars.len());
     let punct_set: &[char] = &[
-        '，', '。', '！', '？', '；', '：', '、', '\u{201C}', '\u{201D}', '\u{2018}', '\u{2019}', '…', '—',
-        ',', '!', '?', ';', ':', '"', '\'', '(', ')', '[', ']',
+        '，', '。', '！', '？', '；', '：', '、', '\u{201C}', '\u{201D}', '\u{2018}', '\u{2019}',
+        '…', '—', ',', '!', '?', ';', ':', '"', '\'', '(', ')', '[', ']',
     ];
     for (i, &c) in chars.iter().enumerate() {
         if punct_set.contains(&c) {
@@ -549,7 +562,9 @@ fn build_recognizer(
         AsrModel::Qwen3Online => {
             // DEC-028: qwen3_online 不加载本地模型，Transcriber::new() 已提前返回，
             // 此分支不应被触达
-            unreachable!("Qwen3Online should be handled in Transcriber::new() before build_recognizer")
+            unreachable!(
+                "Qwen3Online should be handled in Transcriber::new() before build_recognizer"
+            )
         }
     }
 }
@@ -812,11 +827,7 @@ mod tests {
     #[test]
     fn curate_filters_long_entries() {
         let long_str = "这是第一行需要测试的内容第二行需要测试的内容".to_string();
-        let entries = vec![
-            "短词".to_string(),
-            long_str.clone(),
-            "派发".to_string(),
-        ];
+        let entries = vec!["短词".to_string(), long_str.clone(), "派发".to_string()];
         let s = build_hotwords_string(&entries);
         assert_eq!(s, "短词,派发", "long entries must be filtered");
         assert!(long_str.chars().count() > HOTWORDS_MAX_ENTRY_CHARS);
@@ -824,11 +835,7 @@ mod tests {
 
     #[test]
     fn curate_filters_empty_and_whitespace_entries() {
-        let entries = vec![
-            "  ".to_string(),
-            "".to_string(),
-            "派".to_string(),
-        ];
+        let entries = vec!["  ".to_string(), "".to_string(), "派".to_string()];
         assert_eq!(build_hotwords_string(&entries), "派");
     }
 
@@ -837,7 +844,10 @@ mod tests {
         let entries: Vec<String> = (0..60).map(|i| format!("词{}", i)).collect();
         let s = build_hotwords_string(&entries);
         let count = s.split(',').count();
-        assert_eq!(count, HOTWORDS_MAX_ENTRIES, "must cap at HOTWORDS_MAX_ENTRIES");
+        assert_eq!(
+            count, HOTWORDS_MAX_ENTRIES,
+            "must cap at HOTWORDS_MAX_ENTRIES"
+        );
     }
 
     #[test]
@@ -878,7 +888,10 @@ mod tests {
             "阿炎".to_string(),
         ];
         let s = build_hotwords_string(&entries);
-        assert_eq!(s, "我吃,比利,词库,灵界,阿炎,阿炎", "must keep only CJK entries");
+        assert_eq!(
+            s, "我吃,比利,词库,灵界,阿炎,阿炎",
+            "must keep only CJK entries"
+        );
     }
 
     #[test]
@@ -910,7 +923,10 @@ mod tests {
         let with_ascii = vec!["派".to_string(), "worker1".to_string(), "比".to_string()];
         let s1 = build_hotwords_string(&without_ascii);
         let s2 = build_hotwords_string(&with_ascii);
-        assert_eq!(s1, s2, "ASCII entry filtering must not change curated output");
+        assert_eq!(
+            s1, s2,
+            "ASCII entry filtering must not change curated output"
+        );
     }
 
     #[test]
@@ -925,7 +941,11 @@ mod tests {
             "派".to_string(),
         ];
         let s = build_hotwords_string(&entries);
-        assert_eq!(s, format!("{},派", ten_chars), "10-char kept, 11-char filtered");
+        assert_eq!(
+            s,
+            format!("{},派", ten_chars),
+            "10-char kept, 11-char filtered"
+        );
     }
 
     #[test]
@@ -945,9 +965,18 @@ mod tests {
         let curated = curate_hotwords_entries(&entries);
         assert_eq!(curated.len(), HOTWORDS_MAX_ENTRIES);
         for i in 0..20 {
-            assert_eq!(curated[i], format!("词{}", i), "entry {} must be at position {}", i, i);
+            assert_eq!(
+                curated[i],
+                format!("词{}", i),
+                "entry {} must be at position {}",
+                i,
+                i
+            );
         }
-        assert!(!curated.contains(&"词20".to_string()), "21st entry must be truncated");
+        assert!(
+            !curated.contains(&"词20".to_string()),
+            "21st entry must be truncated"
+        );
     }
 
     // ============================================================
@@ -987,7 +1016,10 @@ mod tests {
 
     #[test]
     fn strip_punctuation_no_punct() {
-        assert_eq!(strip_punctuation("没有任何标点的文本"), "没有任何标点的文本");
+        assert_eq!(
+            strip_punctuation("没有任何标点的文本"),
+            "没有任何标点的文本"
+        );
     }
 
     #[test]
@@ -1021,10 +1053,7 @@ mod tests {
     #[test]
     fn strip_punctuation_collapses_spaces() {
         // 标点剥离后连续空格压缩
-        assert_eq!(
-            strip_punctuation("你好，  世界！"),
-            "你好 世界"
-        );
+        assert_eq!(strip_punctuation("你好，  世界！"), "你好 世界");
     }
 
     // ============================================================
@@ -1051,7 +1080,10 @@ mod tests {
         let tmp = std::env::temp_dir();
         let non_existent = tmp.join("voice_ime_test_nonexistent_itn");
         let result = resolve_itn_fst_path(&non_existent);
-        assert!(result.is_none(), "missing fst must return None (graceful degrade)");
+        assert!(
+            result.is_none(),
+            "missing fst must return None (graceful degrade)"
+        );
     }
 
     #[test]
@@ -1064,7 +1096,10 @@ mod tests {
         std::fs::write(&fst_path, b"dummy fst content").ok();
         let result = resolve_itn_fst_path(&tmp);
         assert!(result.is_some(), "existing fst must return Some(path)");
-        assert!(result.unwrap().contains("itn_zh_number.fst"), "path must contain fst filename");
+        assert!(
+            result.unwrap().contains("itn_zh_number.fst"),
+            "path must contain fst filename"
+        );
         // 清理
         std::fs::remove_file(&fst_path).ok();
         std::fs::remove_dir(&itn_dir).ok();
@@ -1083,7 +1118,10 @@ mod tests {
         let result = resolve_itn_fst_path(&tmp);
         if let Some(path) = result {
             // 路径应以 model_dir/itn/itn_zh_number.fst 结尾
-            assert!(path.ends_with("itn_zh_number.fst"), "path must end with fst filename");
+            assert!(
+                path.ends_with("itn_zh_number.fst"),
+                "path must end with fst filename"
+            );
             assert!(path.contains("itn"), "path must contain itn dir");
         }
         std::fs::remove_file(&fst_path).ok();
@@ -1115,7 +1153,8 @@ mod tests {
             Ok((_recognizer, effective_model, _hw_ver)) => {
                 // effective_model 必须是 AsrModel 枚举值之一
                 assert!(
-                    effective_model == AsrModel::Accuracy || effective_model == AsrModel::Performance,
+                    effective_model == AsrModel::Accuracy
+                        || effective_model == AsrModel::Performance,
                     "effective_model must be valid AsrModel variant"
                 );
                 // 若 native 存在 → Accuracy；若缺失降级 → Performance
@@ -1138,13 +1177,20 @@ mod tests {
         // 关键：第 2 个元素必须是 AsrModel（effective_model），不能省略。
         fn _type_check<F>(_f: F)
         where
-            F: Fn(&Path, &str, AsrModel, Option<&str>)
-                -> Result<(sherpa_onnx::OfflineRecognizer, AsrModel, u64)>,
+            F: Fn(
+                &Path,
+                &str,
+                AsrModel,
+                Option<&str>,
+            ) -> Result<(sherpa_onnx::OfflineRecognizer, AsrModel, u64)>,
         {
         }
         _type_check(build_recognizer);
         // 若此测试编译通过，签名契约满足
-        assert!(true, "build_recognizer signature contract: 3-tuple with effective_model");
+        assert!(
+            true,
+            "build_recognizer signature contract: 3-tuple with effective_model"
+        );
     }
 
     /// R1 纯逻辑验证：transcribe_segments_chunked 是 Transcriber 的方法，

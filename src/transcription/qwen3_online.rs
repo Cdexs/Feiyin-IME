@@ -128,8 +128,14 @@ pub fn extract_error(msg: &serde_json::Value) -> Option<String> {
     let msg_type = msg.get("type")?.as_str()?;
     if msg_type == "error" {
         let error = msg.get("error")?;
-        let message = error.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
-        let code = error.get("code").and_then(|c| c.as_str()).unwrap_or("unknown");
+        let message = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        let code = error
+            .get("code")
+            .and_then(|c| c.as_str())
+            .unwrap_or("unknown");
         Some(format!("server error [{}]: {}", code, message))
     } else {
         None
@@ -194,7 +200,9 @@ pub fn transcribe_online(
         .to_socket_addrs()
         .context("Qwen3 ASR 网络失败：DNS 解析失败")?;
     let socket_addrs: Vec<_> = addrs.collect();
-    let addr = socket_addrs.first().context("Qwen3 ASR 网络失败：DNS 未返回地址")?;
+    let addr = socket_addrs
+        .first()
+        .context("Qwen3 ASR 网络失败：DNS 未返回地址")?;
     let tcp = TcpStream::connect_timeout(addr, CONNECT_TIMEOUT)
         .context("Qwen3 ASR 网络失败：连接超时")?;
     tcp.set_read_timeout(Some(CONNECT_TIMEOUT))
@@ -206,8 +214,8 @@ pub fn transcribe_online(
     let request = ClientRequestBuilder::new(uri)
         .with_header("Authorization", format!("Bearer {}", api_key))
         .with_header("OpenAI-Beta", "realtime=v1");
-    let (mut ws_socket, response) = client_tls_with_config(request, tcp, None, None)
-        .map_err(|e| match e {
+    let (mut ws_socket, response) =
+        client_tls_with_config(request, tcp, None, None).map_err(|e| match e {
             HandshakeError::Failure(e) => map_connect_error(&e),
             HandshakeError::Interrupted(_) => {
                 anyhow!("Qwen3 ASR 网络失败：TLS 握手意外中断")
@@ -218,12 +226,20 @@ pub fn transcribe_online(
     // 鉴权失败（401/403）等异常由 tungstenite 握手层以 Err 返回（map_connect_error 处理），
     // 能走到这里 status 必为 101。曾误用 is_success()（仅认 2xx）把成功握手判为
     // "HTTP 101 - 连接被拒绝"（BUG-QWEN3-STATUS-001，2026-07-08 Gavin 端测暴露）。
-    debug_assert_eq!(response.status().as_u16(), 101, "post-handshake status must be 101");
+    debug_assert_eq!(
+        response.status().as_u16(),
+        101,
+        "post-handshake status must be 101"
+    );
     let _ = &response;
 
     // 设置 socket 读写超时（10s tick），作为静默超时 + 硬上限的计时粒度
-    set_socket_timeouts(&mut ws_socket, Duration::from_secs(10), Duration::from_secs(10))
-        .context("Qwen3 ASR 网络失败：设置 socket 超时失败")?;
+    set_socket_timeouts(
+        &mut ws_socket,
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+    )
+    .context("Qwen3 ASR 网络失败：设置 socket 超时失败")?;
 
     // 1. send session.update（官方 schema 对齐）
     let session_update = build_session_update_message(language);
@@ -232,7 +248,11 @@ pub fn transcribe_online(
     // 2. 逐块 input_audio_buffer.append
     let pcm = f32_to_pcm16_le(samples_16k);
     let chunks = chunk_pcm_to_base64(&pcm);
-    log::info!("Qwen3 ASR uploading {} chunks ({}ms each)", chunks.len(), CHUNK_SAMPLES as u64 * 1000 / 16000);
+    log::info!(
+        "Qwen3 ASR uploading {} chunks ({}ms each)",
+        chunks.len(),
+        CHUNK_SAMPLES as u64 * 1000 / 16000
+    );
     for chunk in &chunks {
         let append_msg = build_append_message(chunk);
         send_json(&mut ws_socket, &append_msg)?;
@@ -377,7 +397,10 @@ mod tests {
         assert_eq!(msg["session"]["input_audio_format"], "pcm");
         assert_eq!(msg["session"]["sample_rate"], 16000);
         assert!(msg["session"]["turn_detection"].is_null());
-        assert_eq!(msg["session"]["input_audio_transcription"]["language"], "zh");
+        assert_eq!(
+            msg["session"]["input_audio_transcription"]["language"],
+            "zh"
+        );
     }
 
     #[test]
@@ -388,14 +411,19 @@ mod tests {
         assert_eq!(msg["session"]["sample_rate"], 16000);
         assert_eq!(msg["session"]["modalities"][0], "text");
         // language=None 时应有 modalities/format/sample_rate，无 input_audio_transcription
-        assert!(msg["session"].get("input_audio_transcription").is_none(),
-            "language=None must omit input_audio_transcription entirely");
+        assert!(
+            msg["session"].get("input_audio_transcription").is_none(),
+            "language=None must omit input_audio_transcription entirely"
+        );
     }
 
     #[test]
     fn build_session_update_uses_specified_language() {
         let msg = build_session_update_message(Some("en"));
-        assert_eq!(msg["session"]["input_audio_transcription"]["language"], "en");
+        assert_eq!(
+            msg["session"]["input_audio_transcription"]["language"],
+            "en"
+        );
     }
 
     #[test]
@@ -409,7 +437,11 @@ mod tests {
     fn build_commit_message_has_only_type() {
         let msg = build_commit_message();
         assert_eq!(msg["type"], "input_audio_buffer.commit");
-        assert_eq!(msg.as_object().unwrap().len(), 1, "commit msg must have only type field");
+        assert_eq!(
+            msg.as_object().unwrap().len(),
+            1,
+            "commit msg must have only type field"
+        );
     }
 
     #[test]
@@ -440,7 +472,11 @@ mod tests {
         let pcm = f32_to_pcm16_le(&samples);
         assert_eq!(pcm.len(), 12800);
         let chunks = chunk_pcm_to_base64(&pcm);
-        assert_eq!(chunks.len(), 2, "6400 samples must split into 2 chunks of 3200 samples");
+        assert_eq!(
+            chunks.len(),
+            2,
+            "6400 samples must split into 2 chunks of 3200 samples"
+        );
         // 每块 base64 解码后应 6400 bytes
         let engine = base64::engine::general_purpose::STANDARD;
         let decoded0 = engine.decode(&chunks[0]).unwrap();
@@ -465,7 +501,11 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         let engine = base64::engine::general_purpose::STANDARD;
         let decoded1 = engine.decode(&chunks[1]).unwrap();
-        assert_eq!(decoded1.len(), 1600, "remainder chunk = 800 samples × 2 bytes");
+        assert_eq!(
+            decoded1.len(),
+            1600,
+            "remainder chunk = 800 samples × 2 bytes"
+        );
     }
 
     #[test]
@@ -562,40 +602,77 @@ mod tests {
 
     #[test]
     fn is_read_timeout_detects_timed_out() {
-        let err = WsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"));
-        assert!(is_read_timeout(&err), "TimedOut must be detected as read timeout");
+        let err = WsError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out",
+        ));
+        assert!(
+            is_read_timeout(&err),
+            "TimedOut must be detected as read timeout"
+        );
     }
 
     #[test]
     fn is_read_timeout_detects_would_block() {
-        let err = WsError::Io(std::io::Error::new(std::io::ErrorKind::WouldBlock, "would block"));
-        assert!(is_read_timeout(&err), "WouldBlock must be detected as read timeout");
+        let err = WsError::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "would block",
+        ));
+        assert!(
+            is_read_timeout(&err),
+            "WouldBlock must be detected as read timeout"
+        );
     }
 
     #[test]
     fn is_read_timeout_returns_false_for_other_io_errors() {
-        let err = WsError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"));
-        assert!(!is_read_timeout(&err), "ConnectionReset must NOT be detected as read timeout");
+        let err = WsError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+        assert!(
+            !is_read_timeout(&err),
+            "ConnectionReset must NOT be detected as read timeout"
+        );
     }
 
     #[test]
     fn is_read_timeout_returns_false_for_non_io_errors() {
         let err = WsError::Protocol(tungstenite::error::ProtocolError::WrongHttpMethod);
-        assert!(!is_read_timeout(&err), "Protocol error must NOT be detected as read timeout");
+        assert!(
+            !is_read_timeout(&err),
+            "Protocol error must NOT be detected as read timeout"
+        );
     }
 
     #[test]
     fn transcribe_online_empty_api_key_bails() {
-        let result = transcribe_online("wss://example.com", "", "qwen3-asr-flash-realtime", &[0.0; 16000], None);
+        let result = transcribe_online(
+            "wss://example.com",
+            "",
+            "qwen3-asr-flash-realtime",
+            &[0.0; 16000],
+            None,
+        );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("鉴权失败"), "empty key must bail with auth failure, got: {}", err);
+        assert!(
+            err.contains("鉴权失败"),
+            "empty key must bail with auth failure, got: {}",
+            err
+        );
         assert!(err.contains("API Key 为空"));
     }
 
     #[test]
     fn transcribe_online_empty_samples_bails() {
-        let result = transcribe_online("wss://example.com", "sk-test", "qwen3-asr-flash-realtime", &[], None);
+        let result = transcribe_online(
+            "wss://example.com",
+            "sk-test",
+            "qwen3-asr-flash-realtime",
+            &[],
+            None,
+        );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("音频样本为空"));

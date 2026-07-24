@@ -15,8 +15,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, KillTimer, MsgWaitForMultipleObjects, PeekMessageW, PostMessageW,
-    PostThreadMessageW, QS_ALLINPUT, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK,
-    KBDLLHOOKSTRUCT, MSG, PM_REMOVE, WH_KEYBOARD_LL, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_QUIT,
+    PostThreadMessageW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
+    MSG, PM_REMOVE, QS_ALLINPUT, WH_KEYBOARD_LL, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_QUIT,
     WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
 };
 
@@ -353,9 +353,7 @@ fn run_listener(
 
         // PERF-BATCH-001 TASK-2: Use MsgWaitForMultipleObjects instead of PeekMessageW+sleep.
         // Blocks with zero CPU during idle, wakes instantly on any window message.
-        let _ = unsafe {
-            MsgWaitForMultipleObjects(Some(&[]), false, 10, QS_ALLINPUT)
-        };
+        let _ = unsafe { MsgWaitForMultipleObjects(Some(&[]), false, 10, QS_ALLINPUT) };
 
         while unsafe { PeekMessageW(&mut msg, HWND::default(), 0, 0, PM_REMOVE) }.as_bool() {
             if msg.message == WM_QUIT {

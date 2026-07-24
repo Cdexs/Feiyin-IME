@@ -12,7 +12,7 @@ describe("App", () => {
 
     // Verify sidebar navigation items
     expect(screen.getByText("语音输入")).toBeInTheDocument();
-    expect(screen.getByText("优化模型")).toBeInTheDocument();
+    expect(screen.getByText("格式化输出")).toBeInTheDocument();
     expect(screen.getByText("词库")).toBeInTheDocument();
     expect(screen.getByText("关于")).toBeInTheDocument();
   });

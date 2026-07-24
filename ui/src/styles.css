@@ -1522,3 +1522,131 @@ input[type="range"]::-moz-range-thumb {
     max-width: 100%;
   }
 }
+
+
+/* === FORMAT-UI-POLISH-001: LLM API Configuration Card === */
+.llm-api-card {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.llm-form-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.llm-form-field {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.llm-form-field.row-inline {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.llm-form-label {
+  width: 72px;
+  min-width: 72px;
+  text-align: right;
+  font-size: 14px;
+  color: var(--system-text-secondary);
+  line-height: 1.4;
+}
+
+.llm-input {
+  flex: 1;
+  width: 100%;
+  min-width: 0;
+  padding: 8px 12px;
+  font-size: 14px;
+  border: 1px solid var(--system-border-strong);
+  border-radius: var(--radius-control);
+  background: var(--mica-alt-bg);
+  color: var(--system-text-primary);
+  outline: none;
+  transition: border-color var(--animation-fast), box-shadow var(--animation-fast);
+}
+
+.llm-input:focus {
+  border-color: var(--brand-primary);
+  box-shadow: 0 0 0 2px rgba(255, 107, 53, 0.15);
+}
+
+.llm-input::placeholder {
+  color: var(--system-text-tertiary);
+}
+
+.llm-model-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+}
+
+.llm-model-row .llm-input {
+  flex: 1;
+}
+
+.llm-test-btn {
+  white-space: nowrap;
+  padding: 8px 16px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.llm-status-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: var(--radius-control);
+  font-size: 13px;
+  font-weight: 500;
+  background-color: var(--system-fill-rest);
+  color: var(--system-text-secondary);
+  width: fit-content;
+}
+
+.llm-status-bar.success {
+  background-color: #dcfce7;
+  color: #166534;
+}
+
+.llm-status-bar.failed {
+  background-color: #fee2e2;
+  color: #991b1b;
+}
+
+.llm-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: currentColor;
+}
+
+.llm-result-badge {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  border-radius: var(--radius-control);
+  font-size: 13px;
+  word-break: break-all;
+}
+
+.llm-result-badge.success {
+  background-color: #dcfce7;
+  color: #166534;
+}
+
+.llm-result-badge.error {
+  background-color: #fee2e2;
+  color: #991b1b;
+}

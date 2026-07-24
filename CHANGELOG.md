@@ -5,6 +5,20 @@
 
 ---
 
+## v0.7.1 - Bug 修复 + 优化批次（2026-07-24）
+
+> 本批次含 REBUILD-LOST-001（07-24 git 事故重做）+ v0.7.1 新增项。coder-1 负责的后端部分代码在 07-24 前已全部落地并验收，本表为文档闭环补录（上次 session 在验收记录环节被中断）。三处版本号已对齐 0.7.1。
+
+| 编号 | 说明 | 负责人 | 完成时间 |
+| --- | --- | --- | --- |
+| REBUILD-LOST-001-BACKEND | git 事故后端重做 7 项（按原始顺序）：① FORMAT-LLM-001-CORE（build_format_instruction_block F1/F2/F3 + flatten_multiline + FormatFailed 事件 + i18n 三语 + version 0.6.2→0.7.0）② ITN-SMART-002（consumed>=2 算法根治单字保护 + itn-rules.toml [protect.historical] 95 条历史词）③ SCENE-SENSE-001-CORE（F4 场景注入+三道防线裁决+SceneConfig 隐藏字段）④ FMT-LLM-002（超时 [6s]→[8s,15s] + F3 OVERRIDES/MUST 两分支）⑤ FMT-LLM-004（防编造守卫 strip_fabricated_email_lines/is_fabricated_salutation/is_fabricated_closing 中英文）⑥ FMT-LLM-005（normalize_script_only 替代 fix_asr_english_case 保留 LLM 大小写）⑦ LANG-AUTO-001-CORE（contains_han 内容检测替代配置门控 + SCENE-AI-AGENT-001 CORE 4 处硬编码替换）；主控独立核实 7 项全命中 + cargo check 0 errors | coder-1 | 2026-07-24 |
+| TEMP-CELSIUS-001 | 摄氏度符号识别：语音含"摄氏"关键词时输出 °C 符号，裸"度"不变；复核确认重做过程中未受影响 | coder-1 | 2026-07-24 |
+| FMT-EMPTY-CORRECTED-001 | Bug 修复：空/噪声语音格式化返回字面量 "<corrected></corrected>"；实现位置在 optimize() 而非 try_once()（功能等价且避免与重试逻辑冲突，更合理）；单测 parse_empty_corrected_tag_returns_full_response_text 通过 | coder-1 | 2026-07-24 |
+| FMT-EMAIL-I18N-001 | 邮件称呼/祝福语中英日韩优化：scene-rules.toml email style 补日韩称呼（拝啓 X様/X様/〇〇様 + X님/안녕하십니까 X님）+ 日韩祝福（よろしくお願いいたします/敬具 + 감사합니다/이상）+ 标点规则（日韩 ':' 而非逗号）；src/llm/mod.rs:757-843 防编造守卫 is_fabricated_salutation/closing 补日韩模式（四语言防护对称）+ 8 条新增单测（日韩各 4 条：salutation/closing 检测 + strip + keep_input）；依赖 FMT-LLM-004 先落地（已重做完成） | coder-1 | 2026-07-24 |
+| FIX-REBUILD-REGRESSION-001 | ASR-HIDE-ACCURACY-001-CORE 迁移逻辑补回：REBUILD-LOST-001-BACKEND 重做过程中 asr_model_accuracy_roundtrip 测试断言方向被意外改回"保留accuracy"；src/config/mod.rs:370-434 补回 accuracy→performance 静默迁移逻辑（load + load_from 两路径，日志 "ASR-HIDE-ACCURACY-001: migrating legacy asr_model='accuracy' -> 'performance'"）+ 单测 asr_model_accuracy_migrates_to_performance / asr_model_performance_unchanged_by_migration 断言迁移方向正确 | coder-1 | 2026-07-24 |
+
+---
+
 ## v0.6.2 - 词库单词化 + 智能数字规整（2026-07-10）
 
 | 编号 | 说明 | 负责人 | 完成时间 |

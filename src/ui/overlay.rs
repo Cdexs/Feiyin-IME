@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 /// Each bar tracks both current RMS and a decaying peak value.
 #[derive(Debug, Clone)]
 pub struct PeakLevel {
-    pub current: f32,   // Current RMS value (0.0–1.0)
-    pub peak: f32,      // Peak value (decays over time)
+    pub current: f32, // Current RMS value (0.0–1.0)
+    pub peak: f32,    // Peak value (decays over time)
 }
 
 impl PeakLevel {
@@ -70,7 +70,9 @@ pub fn push_level(buf: &AudioLevelBuf, rms: f32) {
 pub enum OverlayStatus {
     Recording,
     /// Waveform gravity-fall transition before showing Processing overlay.
-    FallingToProcessing { message: String },
+    FallingToProcessing {
+        message: String,
+    },
     Processing(String),
     /// Focus was lost; show text preview with copy button.
     FocusLost {
@@ -104,7 +106,10 @@ mod tests {
         assert_eq!(buf.lock().unwrap().len(), 2);
 
         clear_levels(&buf);
-        assert!(buf.lock().unwrap().is_empty(), "clear_levels must empty the buffer");
+        assert!(
+            buf.lock().unwrap().is_empty(),
+            "clear_levels must empty the buffer"
+        );
     }
 
     #[test]
@@ -126,7 +131,7 @@ mod tests {
     fn push_level_clamps_current_and_peak() {
         let buf = new_audio_level_buf();
         push_level(&buf, -0.5); // negative
-        push_level(&buf, 1.5);  // > 1.0
+        push_level(&buf, 1.5); // > 1.0
         let q = buf.lock().unwrap();
         assert_eq!(q[0].current, 0.0, "negative RMS must be clamped to 0.0");
         assert_eq!(q[1].current, 1.0, "RMS > 1.0 must be clamped to 1.0");
@@ -156,7 +161,11 @@ mod tests {
 
         warmup_levels(&buf);
         let q = buf.lock().unwrap();
-        assert_eq!(q.len(), 8, "warmup_levels must replace existing entries with 8 warmup entries");
+        assert_eq!(
+            q.len(),
+            8,
+            "warmup_levels must replace existing entries with 8 warmup entries"
+        );
         assert!(
             q.iter().all(|lvl| lvl.current == 0.03),
             "warmup must overwrite old high-level values"
@@ -165,7 +174,10 @@ mod tests {
 
     #[test]
     fn peak_level_update_and_decay() {
-        let mut peak = PeakLevel { current: 0.0, peak: 0.0 };
+        let mut peak = PeakLevel {
+            current: 0.0,
+            peak: 0.0,
+        };
 
         peak.update(0.5, 0.1);
         assert_eq!(peak.current, 0.5);
@@ -174,15 +186,29 @@ mod tests {
         peak.update(0.3, 0.1);
         // peak decays: 0.5 * 0.9 = 0.45, clamped to 0.3
         assert_eq!(peak.current, 0.3);
-        assert!((peak.peak - 0.45).abs() < 0.001, "peak must decay when current < peak");
+        assert!(
+            (peak.peak - 0.45).abs() < 0.001,
+            "peak must decay when current < peak"
+        );
     }
 
     #[test]
     fn peak_level_display_value() {
-        let mut peak = PeakLevel { current: 0.2, peak: 0.6 };
-        assert_eq!(peak.display_value(), 0.6, "display_value must return the peak value");
+        let mut peak = PeakLevel {
+            current: 0.2,
+            peak: 0.6,
+        };
+        assert_eq!(
+            peak.display_value(),
+            0.6,
+            "display_value must return the peak value"
+        );
 
         peak.update(0.8, 0.1);
-        assert_eq!(peak.display_value(), 0.8, "display_value must update to new higher peak");
+        assert_eq!(
+            peak.display_value(),
+            0.8,
+            "display_value must update to new higher peak"
+        );
     }
 }

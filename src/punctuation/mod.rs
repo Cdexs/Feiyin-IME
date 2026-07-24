@@ -53,7 +53,10 @@ impl PunctuationEngine {
 
 fn convert_punctuation_for_english(text: &str) -> String {
     let ascii_letter_count = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
-    let total_chars = text.chars().filter(|c| c.is_alphanumeric() || *c == ' ').count();
+    let total_chars = text
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == ' ')
+        .count();
     if total_chars == 0 {
         return text.to_string();
     }
@@ -112,7 +115,10 @@ mod tests {
         // First add some punctuation marks to verify they stay
         let input_punct = "ab，中文。";
         let output = convert_punctuation_for_english(input_punct);
-        assert_eq!(output, input_punct, "Exactly 50% ratio should NOT convert (threshold is >0.5)");
+        assert_eq!(
+            output, input_punct,
+            "Exactly 50% ratio should NOT convert (threshold is >0.5)"
+        );
     }
 
     #[test]
@@ -128,7 +134,10 @@ mod tests {
         // Function should return text as-is
         let input = "，。？！";
         let output = convert_punctuation_for_english(input);
-        assert_eq!(output, input, "Punctuation-only text should be returned unchanged");
+        assert_eq!(
+            output, input,
+            "Punctuation-only text should be returned unchanged"
+        );
     }
 
     #[test]
@@ -136,7 +145,10 @@ mod tests {
         // 7 letters + 1 number + 1 space + 2 punct = 11 chars, 7 letters = 63.6%
         let input = "abcdefg，h1。";
         let output = convert_punctuation_for_english(input);
-        assert_eq!(output, "abcdefg,h1.", "Ratio > 0.5 should convert to half-width");
+        assert_eq!(
+            output, "abcdefg,h1.",
+            "Ratio > 0.5 should convert to half-width"
+        );
     }
 
     #[test]

@@ -88,9 +88,10 @@ impl Default for HotkeyConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AudioConfig {
     pub silence_threshold: f32,
-    /// ASR transcription language: "zh", "en", "ja", "ko", "auto", etc.
+    /// Deprecated (LANG-AUTO-001): kept for serde compatibility only. Runtime no
+    /// longer reads this field; language is auto-detected from the transcribed text.
     pub transcription_language: String,
-    /// Chinese output script (only applies when transcription_language is "zh").
+    /// Chinese output script. Used for zhconv normalization based on actual text content.
     #[serde(default)]
     pub chinese_script: ChineseScript,
     /// Opacity of the recording overlay window (0.3 – 1.0).  Default 0.75.
@@ -218,7 +219,9 @@ pub struct TranslationConfig {
     pub vk_code: u32,
     /// Display name for the hotkey (e.g., "Left Ctrl").
     pub display_name: String,
-    /// Target language for translation.
+    /// Deprecated (LANG-AUTO-001): kept for serde compatibility only. Runtime no
+    /// longer reads this field; translation direction is inferred from the
+    /// transcribed text content.
     pub target_language: TranslationLanguage,
 }
 
@@ -263,6 +266,29 @@ pub struct AppConfig {
     pub translation: TranslationConfig,
     #[serde(default)]
     pub punctuation: PunctuationConfig,
+    #[serde(default)]
+    pub scene: SceneConfig,
+}
+
+fn default_scene_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SceneConfig {
+    #[serde(default = "default_scene_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub send_window_title: bool,
+}
+
+impl Default for SceneConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_scene_enabled(),
+            send_window_title: false,
+        }
+    }
 }
 
 impl Default for AppConfig {
@@ -277,6 +303,7 @@ impl Default for AppConfig {
             auto_start: false,
             translation: TranslationConfig::default(),
             punctuation: PunctuationConfig::default(),
+            scene: SceneConfig::default(),
         }
     }
 }
@@ -305,6 +332,11 @@ impl AppConfig {
         }
         if cfg.auto_learn_threshold == 0 {
             cfg.auto_learn_threshold = default_auto_learn_threshold();
+        }
+        // ASR-HIDE-ACCURACY-001-UI: deprecated "accuracy" model is no longer exposed in UI.
+        // Migrate any existing config silently to "performance" so that UI and main process agree.
+        if cfg.audio.asr_model == "accuracy" {
+            cfg.audio.asr_model = default_asr_model();
         }
 
         Ok(cfg)
@@ -343,7 +375,91 @@ impl AppConfig {
         if cfg.auto_learn_threshold == 0 {
             cfg.auto_learn_threshold = default_auto_learn_threshold();
         }
+        // ASR-HIDE-ACCURACY-001-UI: mirror migration for load_from path.
+        if cfg.audio.asr_model == "accuracy" {
+            cfg.audio.asr_model = default_asr_model();
+        }
 
         Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_minimal_cfg_with_asr_model(asr_model: &str) -> AppConfig {
+        AppConfig {
+            audio: AudioConfig {
+                silence_threshold: 0.01,
+                transcription_language: "zh".to_string(),
+                chinese_script: ChineseScript::Simplified,
+                overlay_opacity: 0.75,
+                input_device: String::new(),
+                enable_streaming: false,
+                asr_model: asr_model.to_string(),
+                qwen3_api_key: String::new(),
+                qwen3_asr_url: default_qwen3_asr_url(),
+                qwen3_asr_model: default_qwen3_asr_model(),
+            },
+            llm: LlmConfig::default(),
+            hotkey: HotkeyConfig::default(),
+            injection: InjectionConfig::default(),
+            ui_language: UiLanguage::Chinese,
+            auto_learn_threshold: default_auto_learn_threshold(),
+            auto_start: false,
+            translation: TranslationConfig::default(),
+            punctuation: PunctuationConfig::default(),
+            scene: SceneConfig::default(),
+        }
+    }
+
+    fn temp_config_path(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("voice-ime-config-test-{}", name));
+        path
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_from_migrates_accuracy_to_performance() {
+        let path = temp_config_path("accuracy");
+        cleanup(&path);
+        let mut cfg = make_minimal_cfg_with_asr_model("accuracy");
+        cfg.llm.system_prompt = default_system_prompt();
+        cfg.save_to(&path).unwrap();
+
+        let loaded = AppConfig::load_from(&path).unwrap();
+        cleanup(&path);
+        assert_eq!(loaded.audio.asr_model, "performance");
+    }
+
+    #[test]
+    fn load_from_keeps_performance_untouched() {
+        let path = temp_config_path("performance");
+        cleanup(&path);
+        let mut cfg = make_minimal_cfg_with_asr_model("performance");
+        cfg.llm.system_prompt = default_system_prompt();
+        cfg.save_to(&path).unwrap();
+
+        let loaded = AppConfig::load_from(&path).unwrap();
+        cleanup(&path);
+        assert_eq!(loaded.audio.asr_model, "performance");
+    }
+
+    #[test]
+    fn load_from_keeps_qwen3_online_untouched() {
+        let path = temp_config_path("qwen3_online");
+        cleanup(&path);
+        let mut cfg = make_minimal_cfg_with_asr_model("qwen3_online");
+        cfg.llm.system_prompt = default_system_prompt();
+        cfg.save_to(&path).unwrap();
+
+        let loaded = AppConfig::load_from(&path).unwrap();
+        cleanup(&path);
+        assert_eq!(loaded.audio.asr_model, "qwen3_online");
     }
 }

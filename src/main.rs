@@ -12,6 +12,7 @@ mod itn;
 mod llm;
 mod platform; // MAC-001+003: Platform abstraction layer
 mod punctuation;
+mod scene;
 mod text_normalizer;
 mod transcription;
 mod translation;
@@ -48,13 +49,13 @@ use windows::Win32::Graphics::Dwm::{
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BeginPaint, BitBlt, BLENDFUNCTION, Chord, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
+    AlphaBlend, BeginPaint, BitBlt, Chord, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
     CreatePen, CreateRectRgn, CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject,
-    DrawTextW, Ellipse, EndPaint, FillRect, GetStockObject, InvalidateRect, LineTo,
-    MoveToEx, Rectangle, RoundRect, SelectObject, SetBkMode, SetBrushOrgEx, SetStretchBltMode,
-    SetTextColor, SetWindowRgn, StretchBlt, UpdateWindow,
-    CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS,
-    DT_LEFT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, FF_DONTCARE, FW_NORMAL,
+    DrawTextW, Ellipse, EndPaint, FillRect, GetStockObject, InvalidateRect, LineTo, MoveToEx,
+    Rectangle, RoundRect, SelectObject, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor,
+    SetWindowRgn, StretchBlt, UpdateWindow, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION,
+    CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH, DRAW_TEXT_FORMAT, DT_CENTER,
+    DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, FF_DONTCARE, FW_NORMAL,
     HALFTONE, HDC, HFONT, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_NULL, PS_SOLID, SRCCOPY,
     TRANSPARENT,
 };
@@ -73,13 +74,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetClientRect, GetForegroundWindow, GetMessageW, GetSystemMetrics, KillTimer,
     LoadCursorW, MsgWaitForMultipleObjects, PeekMessageW, PostMessageW, PostQuitMessage,
     RegisterClassW, SetForegroundWindow, SetLayeredWindowAttributes, SetTimer, SetWindowPos,
-    ShowWindow, TrackPopupMenu, TranslateMessage, CREATESTRUCTW,
-    CW_USEDEFAULT, GWLP_USERDATA, HMENU, IDC_ARROW, LWA_ALPHA, MF_SEPARATOR, MF_STRING, MSG,
-    PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOW, SW_SHOWNA, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_NCCREATE, WM_PAINT, WM_TIMER, WNDCLASSW,
-    WNDCLASS_STYLES, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_OVERLAPPED, WS_POPUP,
+    ShowWindow, TrackPopupMenu, TranslateMessage, CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA,
+    HMENU, IDC_ARROW, LWA_ALPHA, MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN,
+    SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNA, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP,
+    WM_NCCREATE, WM_PAINT, WM_TIMER, WNDCLASSW, WNDCLASS_STYLES, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_POPUP,
 };
 #[derive(Debug, Clone)]
 enum PipelineEvent {
@@ -89,6 +89,9 @@ enum PipelineEvent {
     Cancelled,
     FocusLost(String),
     Error(String),
+    /// FORMAT-LLM-001-CORE (DEC-031-③): LLM 格式化失败，原文已注入兜底。
+    /// overlay 显示 2500ms 提示后自动复位 tray 到 Idle（防卡在"处理中"）。
+    FormatFailed,
 }
 // LATENCY-001: send event and immediately wake controller via PostMessageW
 fn send_event(tx: &crossbeam_channel::Sender<PipelineEvent>, event: PipelineEvent) {
@@ -458,7 +461,7 @@ fn spawn_settings_process() -> Result<Child> {
                 root.join("src-tauri")
                     .join("target")
                     .join("debug")
-.join("feiyin-ime-ui.exe")
+                    .join("feiyin-ime-ui.exe")
             })
             .unwrap_or_else(|| ui_exe.clone())
     };
@@ -767,7 +770,8 @@ fn run_overlay_thread(
                         let half = (half.max(1)) as f32;
                         let all_settled = if let Ok(mut levels) = state.audio_buf.lock() {
                             for (bar_idx, lv) in levels.iter_mut().enumerate() {
-                                let dist_from_center = ((bar_idx as f32 - half) / half).abs().min(1.0);
+                                let dist_from_center =
+                                    ((bar_idx as f32 - half) / half).abs().min(1.0);
                                 let bar_gravity = GRAVITY_RATE * (0.5 + 1.5 * dist_from_center);
                                 lv.current *= 1.0 - bar_gravity;
                                 lv.peak = lv.peak * (1.0 - bar_gravity * 0.5);
@@ -1209,15 +1213,15 @@ fn draw_recording_overlay(
     let half = bc / 2; // 16
     let total_bar_width = bc * bw + (bc - 1) * bgap;
     let wl = sep_l_x + 12 + (ww - total_bar_width) / 2; // centered start
-    // WAVEFORM-HEIGHT-FIX-001: increased heights + gain for visible waveform
-    let maxh = 48;     // from 40 - taller max height
+                                                        // WAVEFORM-HEIGHT-FIX-001: increased heights + gain for visible waveform
+    let maxh = 48; // from 40 - taller max height
     let static_h = 12; // from 6 - taller static bars
-    let minh = 8;      // from 3 - taller minimum bars
-    let gain = 2.5;    // RMS gain multiplier
+    let minh = 8; // from 3 - taller minimum bars
+    let gain = 2.5; // RMS gain multiplier
     let by = cy;
     const DECAY_RATE: f32 = 0.02; // Peak decay per frame at 60fps
-    // OVERLAY-LOCK-SCOPE-001: snapshot display values under lock (apply decay),
-    // then release lock for GDI drawing — prevents audio thread push_level() blocking
+                                  // OVERLAY-LOCK-SCOPE-001: snapshot display values under lock (apply decay),
+                                  // then release lock for GDI drawing — prevents audio thread push_level() blocking
     let snapshot: Vec<f32> = if let Ok(mut levels) = state.audio_buf.lock() {
         for level in levels.iter_mut() {
             level.update(level.current, DECAY_RATE);
@@ -1242,10 +1246,11 @@ fn draw_recording_overlay(
     // Left half: bars spread from center outward to the left
     for i in 0..half {
         let v = snapshot.get(i as usize).copied().unwrap_or(0.0);
-        let weight: f32 = 0.4 + 0.6
-            * (std::f32::consts::FRAC_PI_2 * i as f32 / (half - 1).max(1) as f32)
-                .cos()
-                .powi(2);
+        let weight: f32 = 0.4
+            + 0.6
+                * (std::f32::consts::FRAC_PI_2 * i as f32 / (half - 1).max(1) as f32)
+                    .cos()
+                    .powi(2);
         let v_gain = (v * gain * weight).min(1.0);
         let bh = if v_gain > 0.01 {
             (minh as f32 + v_gain * (maxh - minh) as f32) as i32
@@ -1274,10 +1279,11 @@ fn draw_recording_overlay(
     // Right half: bars spread from center outward to the right (mirror)
     for i in 0..half {
         let v = snapshot.get(i as usize).copied().unwrap_or(0.0);
-        let weight: f32 = 0.4 + 0.6
-            * (std::f32::consts::FRAC_PI_2 * i as f32 / (half - 1).max(1) as f32)
-                .cos()
-                .powi(2);
+        let weight: f32 = 0.4
+            + 0.6
+                * (std::f32::consts::FRAC_PI_2 * i as f32 / (half - 1).max(1) as f32)
+                    .cos()
+                    .powi(2);
         let v_gain = (v * gain * weight).min(1.0);
         let bh = if v_gain > 0.01 {
             (minh as f32 + v_gain * (maxh - minh) as f32) as i32
@@ -1412,19 +1418,32 @@ fn draw_processing_overlay(
         let tmp_bmp = CreateCompatibleBitmap(hdc, slice_w, win_h);
         let old_bmp = SelectObject(tmp_dc, tmp_bmp);
         let brush = CreateSolidBrush(COLORREF(0xD8D8D8));
-        let _ = FillRect(tmp_dc, &RECT { left: 0, top: 0, right: slice_w, bottom: win_h }, brush);
+        let _ = FillRect(
+            tmp_dc,
+            &RECT {
+                left: 0,
+                top: 0,
+                right: slice_w,
+                bottom: win_h,
+            },
+            brush,
+        );
         let _ = DeleteObject(brush);
 
         for i in 0..SLICES {
             let t = (i as f32 / (SLICES - 1) as f32) * 2.0 - 1.0; // -1.0 to 1.0
             let alpha = ((-3.0_f32 * t * t).exp() * 150.0) as u8; // TUNE: 200→150 slightly more transparent per Gavin
-            if alpha == 0 { continue; }
+            if alpha == 0 {
+                continue;
+            }
 
             let x_dst = beam_cx - GLOW_HALF + i * slice_w;
             let x1 = x_dst.max(rect.left + 1);
             let x2 = (x_dst + slice_w).min(rect.right - 1);
             let w = x2 - x1;
-            if w <= 0 { continue; }
+            if w <= 0 {
+                continue;
+            }
 
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
@@ -1433,8 +1452,16 @@ fn draw_processing_overlay(
                 AlphaFormat: 0,
             };
             let _ = AlphaBlend(
-                hdc, x1, rect.top + 1, w, win_h,
-                tmp_dc, 0, 0, slice_w, win_h,
+                hdc,
+                x1,
+                rect.top + 1,
+                w,
+                win_h,
+                tmp_dc,
+                0,
+                0,
+                slice_w,
+                win_h,
                 blend,
             );
         }
@@ -1575,7 +1602,12 @@ fn draw_preview_overlay(
     unsafe {
         let _ = SetTextColor(hdc, COLORREF(0xF2F2F2));
     }
-    draw_text(hdc, text, &mut text_rect, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
+    draw_text(
+        hdc,
+        text,
+        &mut text_rect,
+        DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS,
+    );
     // Bottom buttons (centered)
     let btn_w = 45; // FIX-006-6: shrink 25%
     let btn_h = 18; // FIX-006-6: shrink 25%
@@ -1942,7 +1974,9 @@ fn process_controller_events(
                         config.audio.overlay_opacity,
                         config.ui_language,
                         OverlayStatus::FallingToProcessing {
-                            message: i18n::get(config.ui_language).overlay_transcribing.to_string(),
+                            message: i18n::get(config.ui_language)
+                                .overlay_transcribing
+                                .to_string(),
                         },
                     );
                 }
@@ -1970,7 +2004,12 @@ fn process_controller_events(
         match event {
             PipelineEvent::RecordingStarted => {
                 set_tray_state(tray, TrayState::Recording, ui_language);
-                show_overlay(overlay_handle, opacity, ui_language, OverlayStatus::Recording);
+                show_overlay(
+                    overlay_handle,
+                    opacity,
+                    ui_language,
+                    OverlayStatus::Recording,
+                );
             }
             PipelineEvent::Processing(message) => {
                 set_tray_state(tray, TrayState::Processing, ui_language);
@@ -2010,6 +2049,22 @@ fn process_controller_events(
                     opacity: 0.95,
                     ui_language: config.ui_language,
                     auto_close_ms: 2000,
+                }));
+            }
+            // FORMAT-LLM-001-CORE (DEC-031-③): LLM 格式化失败提示。
+            // 历史教训：必须显式复位 tray 状态到 Idle，否则会卡在"处理中"。
+            PipelineEvent::FormatFailed => {
+                log::warn!("LLM formatting failed; raw text injected as fallback");
+                set_tray_state(tray, TrayState::Idle, ui_language);
+                let hint = i18n::get(ui_language).format_failed_hint;
+                let (pos, size) = overlay_geometry(&OverlayStatus::Error(hint.to_string()));
+                overlay_handle.send(OverlayCommand::Show(OverlayRequest {
+                    status: OverlayStatus::Error(hint.to_string()),
+                    pos,
+                    size,
+                    opacity: 0.9,
+                    ui_language,
+                    auto_close_ms: 2500,
                 }));
             }
         }
@@ -2168,7 +2223,7 @@ fn spawn_worker_thread(
         let mut transcriber = match transcription::Transcriber::new(
             &model_dir,
             config.audio.enable_streaming,
-            config.audio.transcription_language.clone(),
+            "auto".to_string(),
             transcription::AsrModel::from_config(&config.audio.asr_model),
             initial_hotwords.as_deref(),
             &config.audio.qwen3_asr_url,
@@ -2190,12 +2245,12 @@ fn spawn_worker_thread(
         // 防止 ~6s 构建窗口内每次 Start 都重复 spawn（并发加载多个 972MB 模型）。
         let mut asr_reload_in_flight = false;
         // 当前已生效的 asr_model + hotwords_version，用于对比是否需要重建
-        let mut active_asr_model: transcription::AsrModel = transcription::AsrModel::from_config(
-            &config.audio.asr_model,
-        );
-        let mut active_hotwords_version: u64 =
-            transcriber.as_ref().map(|t| t.hotwords_version()).unwrap_or(0);
-        let mut active_language: String = config.audio.transcription_language.clone();
+        let mut active_asr_model: transcription::AsrModel =
+            transcription::AsrModel::from_config(&config.audio.asr_model);
+        let mut active_hotwords_version: u64 = transcriber
+            .as_ref()
+            .map(|t| t.hotwords_version())
+            .unwrap_or(0);
         // R2-4: qwen3 配置跟踪，用于热重载对比
         let mut active_qwen3_url: String = config.audio.qwen3_asr_url.clone();
         let mut active_qwen3_api_key: String = config.audio.qwen3_api_key.clone();
@@ -2205,13 +2260,15 @@ fn spawn_worker_thread(
         let mut llm_client = llm::LlmClient::new(config.llm.clone());
 
         // PERF-INIT-001: Pre-initialize TranslationEngine once; hot-reload only on config change.
-        let mut cached_translation: Option<(config::TranslationLanguage, translation::TranslationEngine)> =
-            if config.translation.enabled {
-                load_translation_engine_for_target(&model_dir, config.translation.target_language)
-                    .map(|engine| (config.translation.target_language, engine))
-            } else {
-                None
-            };
+        let mut cached_translation: Option<(
+            config::TranslationLanguage,
+            translation::TranslationEngine,
+        )> = if config.translation.enabled {
+            load_translation_engine_for_target(&model_dir, config.translation.target_language)
+                .map(|engine| (config.translation.target_language, engine))
+        } else {
+            None
+        };
 
         // PUNCT-INTEGRATION-001: Pre-initialize PunctuationEngine once.
         let mut cached_punctuation: Option<punctuation::PunctuationEngine> =
@@ -2233,7 +2290,6 @@ fn spawn_worker_thread(
                     log::info!("ASR transcriber hot-reload completed, swapping instance");
                     active_asr_model = new_transcriber.asr_model();
                     active_hotwords_version = new_transcriber.hotwords_version();
-                    active_language = new_transcriber.language().to_string();
                     // R2-4: 同步 qwen3 跟踪值（仅 Qwen3Online 模式有实际值）
                     let fresh = clone_runtime_config(&runtime_config);
                     active_qwen3_url = fresh.audio.qwen3_asr_url;
@@ -2244,7 +2300,10 @@ fn spawn_worker_thread(
                 }
                 Ok(Err(e)) => {
                     // active_* 保持旧值，下次 Start 对比仍不一致 → 自然重试
-                    log::warn!("ASR transcriber hot-reload failed: {}, keeping old instance", e);
+                    log::warn!(
+                        "ASR transcriber hot-reload failed: {}, keeping old instance",
+                        e
+                    );
                     asr_reload_in_flight = false;
                 }
                 Err(_) => {}
@@ -2286,19 +2345,17 @@ fn spawn_worker_thread(
                         && (active_qwen3_url != config.audio.qwen3_asr_url
                             || active_qwen3_api_key != config.audio.qwen3_api_key
                             || active_qwen3_asr_model != config.audio.qwen3_asr_model);
+                    // LANG-AUTO-001: language 恒为 "auto"，移除语言变更监听
                     let needs_reload = active_asr_model != desired_asr_model
-                        || active_language != config.audio.transcription_language
                         || (desired_asr_model == transcription::AsrModel::Accuracy
                             && active_hotwords_version != desired_hotwords_version)
                         || qwen3_changed
                         || needs_rebuild;
                     if needs_reload && !asr_reload_in_flight {
                         log::info!(
-                            "Triggering ASR transcriber hot-reload: model {:?}->{:?}, lang {}->{}, hotwords_version {}->{}, qwen3_changed={}, needs_rebuild={}",
+                            "Triggering ASR transcriber hot-reload: model {:?}->{:?}, hotwords_version {}->{}, qwen3_changed={}, needs_rebuild={}",
                             active_asr_model,
                             desired_asr_model,
-                            active_language,
-                            config.audio.transcription_language,
                             active_hotwords_version,
                             desired_hotwords_version,
                             qwen3_changed,
@@ -2307,7 +2364,7 @@ fn spawn_worker_thread(
                         asr_reload_in_flight = true;
                         let reload_model_dir = model_dir.clone();
                         let reload_streaming = config.audio.enable_streaming;
-                        let reload_language = config.audio.transcription_language.clone();
+                        let reload_language = "auto".to_string();
                         let reload_hotwords = desired_hotwords.clone();
                         let reload_qwen3_url = config.audio.qwen3_asr_url.clone();
                         let reload_qwen3_key = config.audio.qwen3_api_key.clone();
@@ -2364,7 +2421,10 @@ fn spawn_worker_thread(
                         Some(t) => t,
                         None => {
                             log::error!("Transcriber not initialized at startup");
-                            send_event(&event_tx, PipelineEvent::Error("Transcriber unavailable".into()));
+                            send_event(
+                                &event_tx,
+                                PipelineEvent::Error("Transcriber unavailable".into()),
+                            );
                             continue;
                         }
                     };
@@ -2382,8 +2442,11 @@ fn spawn_worker_thread(
                     };
                     if needs_reload {
                         cached_translation = if config.translation.enabled {
-                            load_translation_engine_for_target(&model_dir, config.translation.target_language)
-                                .map(|engine| (config.translation.target_language, engine))
+                            load_translation_engine_for_target(
+                                &model_dir,
+                                config.translation.target_language,
+                            )
+                            .map(|engine| (config.translation.target_language, engine))
                         } else {
                             None
                         };
@@ -2395,7 +2458,10 @@ fn spawn_worker_thread(
                         cached_punctuation = None;
                     }
                     let translation_engine = cached_translation.as_ref().map(|(_, e)| e);
-                    log::debug!("Starting run_pipeline: cancel_signal={}", cancel_signal.load(Ordering::Relaxed));
+                    log::debug!(
+                        "Starting run_pipeline: cancel_signal={}",
+                        cancel_signal.load(Ordering::Relaxed)
+                    );
                     run_pipeline(
                         samples_result,
                         transcriber,
@@ -2710,7 +2776,11 @@ fn main() -> Result<()> {
 /// - Backtracks `backtrack_samples` from the onset to include consonant attack
 /// - If no speech is detected, returns 0 (keep everything — "speak before key" case)
 /// - If speech starts before `backtrack_samples`, returns 0 (no trimming needed)
-fn find_speech_onset_with_backtrack(samples: &[f32], threshold: f32, backtrack_samples: usize) -> usize {
+fn find_speech_onset_with_backtrack(
+    samples: &[f32],
+    threshold: f32,
+    backtrack_samples: usize,
+) -> usize {
     let window_size = 160; // 10ms @ 16kHz
     let mut onset: Option<usize> = None;
     let mut idx = 0;
@@ -2845,10 +2915,7 @@ fn run_pipeline(
                 event_tx,
                 PipelineEvent::Processing(transcribing_msg.to_string()),
             );
-            match transcriber.transcribe_with_punct_info(
-                &padded,
-                config.audio.chinese_script,
-            ) {
+            match transcriber.transcribe_with_punct_info(&padded, config.audio.chinese_script) {
                 Err(e) => {
                     log::error!("Transcription error: {}", e);
                     send_event(event_tx, PipelineEvent::Error(e.to_string()));
@@ -2868,7 +2935,11 @@ fn run_pipeline(
                         log::warn!("Transcription result is empty, skipping LLM and injection");
                         send_event(
                             event_tx,
-                            PipelineEvent::Error(i18n::get(config.ui_language).error_transcription_empty.to_string()),
+                            PipelineEvent::Error(
+                                i18n::get(config.ui_language)
+                                    .error_transcription_empty
+                                    .to_string(),
+                            ),
                         );
                         return;
                     }
@@ -2882,18 +2953,35 @@ fn run_pipeline(
                         send_event(event_tx, PipelineEvent::Cancelled);
                         return;
                     }
-                    // TRANS-008 B閺傝顢嶉敍姝祌anslate=true 閺冭绱濋崡鏇燁偧 LLM 鐠嬪啰鏁ら崥灞炬缁剧娀鏁?缂堟槒鐦?
-                    // translate=false 閺冭绱濋崢鐔告箒 LLM optimize 鐠侯垰绶炴稉宥呭綁
+                    // SCENE-SENSE-001-CORE (DEC-031-⑤): 录音完成阶段采集前台窗口场景信号，
+                    // 供 LLM prompt F4 段注入 + multiline_safe 格式安全裁决。
+                    // target_hwnd 即录音启动时捕获的前台窗口，此处复用同一 HWND 采集。
+                    // 失败一律降级为 Unknown（不注入 F4，multiline_safe=false 保守）。
+                    let scene_context = if config.scene.enabled {
+                        match platform::capture_scene_signals(target_hwnd) {
+                            Some((exe, title)) => scene::classify_scene(&exe, &title),
+                            None => scene::SceneContext::unknown(),
+                        }
+                    } else {
+                        scene::SceneContext::unknown()
+                    };
+                    let multiline_safe = scene_context.multiline_safe;
+                    let send_window_title = config.scene.send_window_title;
+                    // TRANS-008 B方案: translate=true 时走 LLM optimize+translate；translate=false 走 LLM optimize
+                    // translate=false 閺冭绱濋崢鐔告箒 LLM optimize 鐠侯垰绶炴稉宥呭綁
                     let mut llm_handled = false;
+                    // FORMAT-LLM-001-CORE (DEC-031): set when LLM formatting call
+                    // failed. Raw text still gets injected (fallback), but we
+                    // surface a brief "formatting failed" overlay hint after
+                    // injection so the user knows to check LLM config.
+                    let mut format_failed = false;
                     let translate_requested = translate.load(Ordering::Acquire);
-                    let translation_allowed = should_translate_for_language(
-                        &config.audio.transcription_language,
-                        config.translation.target_language,
-                    );
+                    // LANG-AUTO-001: 翻译方向按内容（contains_han）判定，不依赖 language 配置
+                    let translation_allowed =
+                        should_translate_for_language(&text, config.translation.target_language);
                     if translate_requested && config.translation.enabled && !translation_allowed {
                         log::info!(
-                            "Translation skipped: source language '{}' does not require target {:?}",
-                            config.audio.transcription_language,
+                            "Translation skipped: source text does not require target {:?} (content-based)",
                             config.translation.target_language
                         );
                     }
@@ -2907,10 +2995,8 @@ fn run_pipeline(
                             event_tx,
                             PipelineEvent::Processing(processing_msg.to_string()),
                         );
-                        let script_instruction = text_normalizer::script_instruction(
-                            &config.audio.transcription_language,
-                            config.audio.chinese_script,
-                        );
+                        let script_instruction =
+                            text_normalizer::script_instruction(&text, config.audio.chinese_script);
                         if should_try_llm_translate(
                             config.llm.enabled,
                             config.llm.connectivity_verified,
@@ -2937,7 +3023,6 @@ fn run_pipeline(
                                         || {
                                             text_normalizer::normalize_text_for_language(
                                                 &text,
-                                                &config.audio.transcription_language,
                                                 config.audio.chinese_script,
                                             )
                                         },
@@ -2949,40 +3034,44 @@ fn run_pipeline(
                             try_nllb_translate(&text, translation_engine).unwrap_or_else(|| {
                                 text_normalizer::normalize_text_for_language(
                                     &text,
-                                    &config.audio.transcription_language,
                                     config.audio.chinese_script,
                                 )
                             })
                         }
                     } else if config.llm.enabled && !text.trim().is_empty() {
-                        // translate=false閿涙艾甯張?LLM optimize 鐠侯垰绶炴稉宥呭綁
+                        // translate=false閿涙艾甯張?LLM optimize 鐠侯垰绶炴稉宥呭綁
                         let processing_msg = i18n::get(config.ui_language).overlay_processing;
                         send_event(
                             event_tx,
                             PipelineEvent::Processing(processing_msg.to_string()),
                         );
-                        let script_instruction = text_normalizer::script_instruction(
-                            &config.audio.transcription_language,
-                            config.audio.chinese_script,
-                        );
-                        let llm_result =
-                            rt.block_on(llm_client.optimize(&text, script_instruction, config.punctuation.enabled));
+                        let script_instruction =
+                            text_normalizer::script_instruction(&text, config.audio.chinese_script);
+                        let llm_result = rt.block_on(llm_client.optimize(
+                            &text,
+                            script_instruction,
+                            config.punctuation.enabled,
+                            Some(&scene_context),
+                            multiline_safe,
+                            send_window_title,
+                        ));
                         match llm_result {
                             Ok(result) => {
                                 log::info!("LLM optimized: {}", result.text);
                                 learn_llm_suggestions(&result.suggestions, runtime_config);
                                 llm_handled = true;
-                                text_normalizer::normalize_text_for_language(
+                                // FMT-LLM-005: LLM 成功路径用 normalize_script_only（仅简繁，不动大小写）。
+                                // LLM 输出大小写是正确意图（如"Dear Mr. Wang,"），fix_asr_english_case 会打回小写破坏。
+                                text_normalizer::normalize_script_only(
                                     &result.text,
-                                    &config.audio.transcription_language,
                                     config.audio.chinese_script,
                                 )
                             }
                             Err(e) => {
                                 log::warn!("LLM optimization error: {}", e);
+                                format_failed = true;
                                 text_normalizer::normalize_text_for_language(
                                     &text,
-                                    &config.audio.transcription_language,
                                     config.audio.chinese_script,
                                 )
                             }
@@ -2994,7 +3083,6 @@ fn run_pipeline(
                         );
                         text_normalizer::normalize_text_for_language(
                             &text,
-                            &config.audio.transcription_language,
                             config.audio.chinese_script,
                         )
                     };
@@ -3003,15 +3091,25 @@ fn run_pipeline(
                     // - native_punctuated=true（accuracy native 成功）→ 跳过标点引擎（省一次推理）
                     // - native_punctuated=false（performance/兜底/混合）→ 照常走标点引擎
                     // - auto_punct=false && native_punctuated=true → 后处理剥标点（修复"关了开关 native 照样出标点"缺口）
-                    let final_text = if config.punctuation.enabled && !llm_handled && !translate_requested && !native_punctuated {
+                    let final_text = if config.punctuation.enabled
+                        && !llm_handled
+                        && !translate_requested
+                        && !native_punctuated
+                    {
                         if let Some(ref mut engine) = punctuation_engine {
                             match engine.add_punctuation(&final_text) {
                                 Some(punctuated) => {
-                                    log::info!("Local punctuation applied: '{}' -> '{}'", final_text, punctuated);
+                                    log::info!(
+                                        "Local punctuation applied: '{}' -> '{}'",
+                                        final_text,
+                                        punctuated
+                                    );
                                     punctuated
                                 }
                                 None => {
-                                    log::warn!("Local punctuation returned None, keeping original text");
+                                    log::warn!(
+                                        "Local punctuation returned None, keeping original text"
+                                    );
                                     final_text
                                 }
                             }
@@ -3019,11 +3117,19 @@ fn run_pipeline(
                             log::debug!("Punctuation engine not available, skipping");
                             final_text
                         }
-                    } else if !config.punctuation.enabled && native_punctuated && !llm_handled && !translate_requested {
+                    } else if !config.punctuation.enabled
+                        && native_punctuated
+                        && !llm_handled
+                        && !translate_requested
+                    {
                         // ASR-PUNCT-OPT-001: 用户关了自动标点但 native 自带标点 → 剥离
                         let stripped = transcription::strip_punctuation(&final_text);
                         if stripped != final_text {
-                            log::info!("Stripped native punctuation (auto_punct=false): '{}' -> '{}'", final_text, stripped);
+                            log::info!(
+                                "Stripped native punctuation (auto_punct=false): '{}' -> '{}'",
+                                final_text,
+                                stripped
+                            );
                         }
                         stripped
                     } else {
@@ -3059,6 +3165,11 @@ fn run_pipeline(
                         }
                         maybe_learn_user_edit(&final_text, text_snapshot, runtime_config);
                         send_event(event_tx, PipelineEvent::Done);
+                        // FORMAT-LLM-001-CORE (DEC-031-③): LLM 格式化失败 → 注入兜底原文后
+                        // 发 FormatFailed overlay 提示（2500ms），让用户知道检查 LLM 配置。
+                        if format_failed {
+                            send_event(event_tx, PipelineEvent::FormatFailed);
+                        }
                     }
                 }
             }
@@ -3069,16 +3180,14 @@ fn run_pipeline(
 fn should_try_llm_translate(llm_enabled: bool, connectivity_verified: bool) -> bool {
     llm_enabled && connectivity_verified
 }
+/// LANG-AUTO-001: 翻译方向按内容（contains_han）判定，不依赖 transcription_language 配置。
+/// - target=English → 含汉字才需翻译；纯英文文本无需翻译。
+/// - target=Chinese → 不含汉字才需翻译；纯英文文本需翻译。
 #[cfg(target_os = "windows")]
-fn should_translate_for_language(
-    transcription_language: &str,
-    target: config::TranslationLanguage,
-) -> bool {
-    let source = transcription_language.trim().to_ascii_lowercase();
-    let source_is_chinese = source.starts_with("zh");
-    let source_is_english = source == "en" || source.starts_with("en-");
+fn should_translate_for_language(text: &str, target: config::TranslationLanguage) -> bool {
+    let source_is_chinese = text_normalizer::contains_han(text);
     match target {
-        config::TranslationLanguage::English => !source_is_english,
+        config::TranslationLanguage::English => source_is_chinese,
         config::TranslationLanguage::Chinese => !source_is_chinese,
     }
 }
@@ -3139,42 +3248,70 @@ mod pipeline_logic_tests {
     /// No cached engine + enabled = needs reload (first load)
     #[test]
     fn translation_needs_reload_when_none_and_enabled() {
-        assert!(translation_needs_reload(&None, true, TranslationLanguage::English));
-        assert!(translation_needs_reload(&None, true, TranslationLanguage::Chinese));
+        assert!(translation_needs_reload(
+            &None,
+            true,
+            TranslationLanguage::English
+        ));
+        assert!(translation_needs_reload(
+            &None,
+            true,
+            TranslationLanguage::Chinese
+        ));
     }
 
     /// No cached engine + disabled = no reload needed
     #[test]
     fn translation_no_reload_when_none_and_disabled() {
-        assert!(!translation_needs_reload(&None, false, TranslationLanguage::English));
+        assert!(!translation_needs_reload(
+            &None,
+            false,
+            TranslationLanguage::English
+        ));
     }
 
     /// Cached engine + disabled = needs reload (to clear cache)
     #[test]
     fn translation_needs_reload_when_cached_but_disabled() {
         let cached = Some(TranslationLanguage::English);
-        assert!(translation_needs_reload(&cached, false, TranslationLanguage::English));
+        assert!(translation_needs_reload(
+            &cached,
+            false,
+            TranslationLanguage::English
+        ));
     }
 
     /// Cached engine + same target + enabled = no reload needed
     #[test]
     fn translation_no_reload_when_cached_same_target() {
         let cached = Some(TranslationLanguage::English);
-        assert!(!translation_needs_reload(&cached, true, TranslationLanguage::English));
+        assert!(!translation_needs_reload(
+            &cached,
+            true,
+            TranslationLanguage::English
+        ));
     }
 
     /// Cached engine + different target = needs reload (direction changed)
     #[test]
     fn translation_needs_reload_when_cached_different_target() {
         let cached = Some(TranslationLanguage::English);
-        assert!(translation_needs_reload(&cached, true, TranslationLanguage::Chinese));
+        assert!(translation_needs_reload(
+            &cached,
+            true,
+            TranslationLanguage::Chinese
+        ));
     }
 
     /// Cached Chinese + switch to English = needs reload
     #[test]
     fn translation_needs_reload_chinese_to_english() {
         let cached = Some(TranslationLanguage::Chinese);
-        assert!(translation_needs_reload(&cached, true, TranslationLanguage::English));
+        assert!(translation_needs_reload(
+            &cached,
+            true,
+            TranslationLanguage::English
+        ));
     }
 }
 fn maybe_learn_user_edit(
@@ -3222,14 +3359,8 @@ fn learn_llm_suggestions(
         }
     };
     for suggestion in suggestions {
-        if let Err(err) =
-            wordbook.learn_suggestion(&suggestion.word, auto_learn_threshold)
-        {
-            log::debug!(
-                "Skipping LLM suggestion '{}': {}",
-                suggestion.word,
-                err
-            );
+        if let Err(err) = wordbook.learn_suggestion(&suggestion.word, auto_learn_threshold) {
+            log::debug!("Skipping LLM suggestion '{}': {}", suggestion.word, err);
         }
     }
 }
@@ -3399,8 +3530,14 @@ mod overlay_shimmer_tests {
         const BG_DARK_BLUE: u16 = 0x1800;
         // Verify these match the expected #181A18 color
         assert_eq!(BG_DARK_RED, 0x1800, "Red channel must match #18 in BG_DARK");
-        assert_eq!(BG_DARK_GREEN, 0x1A00, "Green channel must match #1A in BG_DARK");
-        assert_eq!(BG_DARK_BLUE, 0x1800, "Blue channel must match #18 in BG_DARK");
+        assert_eq!(
+            BG_DARK_GREEN, 0x1A00,
+            "Green channel must match #1A in BG_DARK"
+        );
+        assert_eq!(
+            BG_DARK_BLUE, 0x1800,
+            "Blue channel must match #18 in BG_DARK"
+        );
         // Verify it is NOT black (the old value)
         assert!(BG_DARK_RED != 0x0000, "Must not be black");
         assert!(BG_DARK_GREEN != 0x0000, "Must not be black");
@@ -3412,8 +3549,10 @@ mod overlay_shimmer_tests {
         // OVERLAY-FIX-004: both endpoints (left and right) must use identical BG_DARK
         let left_endpoint = (0x1800u16, 0x1A00u16, 0x1800u16);
         let right_endpoint = (0x1800u16, 0x1A00u16, 0x1800u16);
-        assert_eq!(left_endpoint, right_endpoint,
-            "Left and right gradient endpoints must be symmetric BG_DARK");
+        assert_eq!(
+            left_endpoint, right_endpoint,
+            "Left and right gradient endpoints must be symmetric BG_DARK"
+        );
     }
 
     #[test]
@@ -3425,9 +3564,18 @@ mod overlay_shimmer_tests {
         let endpoint_r: u16 = 0x1800;
         let endpoint_g: u16 = 0x1A00;
         let endpoint_b: u16 = 0x1800;
-        assert!(midpoint_r > endpoint_r, "Midpoint must be brighter than endpoints (R)");
-        assert!(midpoint_g > endpoint_g, "Midpoint must be brighter than endpoints (G)");
-        assert!(midpoint_b > endpoint_b, "Midpoint must be brighter than endpoints (B)");
+        assert!(
+            midpoint_r > endpoint_r,
+            "Midpoint must be brighter than endpoints (R)"
+        );
+        assert!(
+            midpoint_g > endpoint_g,
+            "Midpoint must be brighter than endpoints (G)"
+        );
+        assert!(
+            midpoint_b > endpoint_b,
+            "Midpoint must be brighter than endpoints (B)"
+        );
     }
 
     #[test]
@@ -3444,9 +3592,15 @@ mod overlay_shimmer_tests {
         let height = bottom - top;
         assert_eq!(width, 28, "Mic body width must be 28px");
         assert_eq!(height, 49, "Mic body height must be 49px");
-        assert_eq!(ellipse_w, 28, "Ellipse width must match body width for fully rounded ends");
+        assert_eq!(
+            ellipse_w, 28,
+            "Ellipse width must match body width for fully rounded ends"
+        );
         assert_eq!(ellipse_h, 28, "Ellipse height must be 28px");
-        assert!(ellipse_w <= width, "Ellipse width must not exceed body width");
+        assert!(
+            ellipse_w <= width,
+            "Ellipse width must not exceed body width"
+        );
     }
 
     #[test]
@@ -3464,7 +3618,10 @@ mod overlay_shimmer_tests {
         let base_center = (base_left + base_right) / 2;
         assert_eq!(stem_x, base_center, "Stem must be centered on base");
         let body_bottom: i32 = 53;
-        assert_eq!(stem_top, body_bottom, "Stem must connect to mic body bottom");
+        assert_eq!(
+            stem_top, body_bottom,
+            "Stem must connect to mic body bottom"
+        );
     }
 
     #[test]
@@ -3474,8 +3631,11 @@ mod overlay_shimmer_tests {
         let circ_size: i32 = 18;
         let circ_l_offset: i32 = 6;
         let sep_l_x: i32 = 30;
-        assert_eq!(circ_l_offset + circ_size + circ_l_offset, sep_l_x,
-            "Separator x must equal left_margin(6) + icon(18) + right_margin(6)");
+        assert_eq!(
+            circ_l_offset + circ_size + circ_l_offset,
+            sep_l_x,
+            "Separator x must equal left_margin(6) + icon(18) + right_margin(6)"
+        );
         assert_eq!(circ_size, 18, "circ_size must be 18px after ENLARGE-001");
     }
 
@@ -3489,14 +3649,22 @@ mod overlay_shimmer_tests {
         let mut padded = Vec::with_capacity(silence_head_len + original_samples);
         padded.resize(silence_head_len, 0.0f32);
         padded.extend_from_slice(&vec![1.0f32; original_samples]);
-        assert_eq!(padded.len(), silence_head_len + original_samples,
-            "Padded length must be silence_head + original");
+        assert_eq!(
+            padded.len(),
+            silence_head_len + original_samples,
+            "Padded length must be silence_head + original"
+        );
         if silence_head_len > 0 {
-            assert!(padded.iter().take(silence_head_len).all(|&s| s == 0.0),
-                "First {} samples must be silence (zero)", silence_head_len);
+            assert!(
+                padded.iter().take(silence_head_len).all(|&s| s == 0.0),
+                "First {} samples must be silence (zero)",
+                silence_head_len
+            );
         }
-        assert_eq!(padded[silence_head_len], 1.0,
-            "Original audio must begin after silence head");
+        assert_eq!(
+            padded[silence_head_len], 1.0,
+            "Original audio must begin after silence head"
+        );
     }
 
     #[test]
@@ -3506,8 +3674,11 @@ mod overlay_shimmer_tests {
         let sample_rate: u32 = 16000;
         let silence_head: usize = 0;
         let duration_ms = (silence_head as f64 / sample_rate as f64) * 1000.0;
-        assert!((duration_ms - 0.0).abs() < 1.0,
-            "0 samples at 16kHz must be ~0ms (got {:.1}ms)", duration_ms);
+        assert!(
+            (duration_ms - 0.0).abs() < 1.0,
+            "0 samples at 16kHz must be ~0ms (got {:.1}ms)",
+            duration_ms
+        );
     }
 
     #[test]
@@ -3521,10 +3692,16 @@ mod overlay_shimmer_tests {
         }
         // Energy onset at ~4800, backtrack 3200 (200ms) → keep_start = 1600
         let keep_start = find_speech_onset_with_backtrack(&samples, 0.008, 3200);
-        assert_eq!(keep_start, 1600, "should trim silence before backtrack margin, got {}", keep_start);
+        assert_eq!(
+            keep_start, 1600,
+            "should trim silence before backtrack margin, got {}",
+            keep_start
+        );
         // Verify speech is preserved
-        assert!(samples[keep_start..].iter().any(|&s| s > 0.05),
-            "speech must be present after trimming");
+        assert!(
+            samples[keep_start..].iter().any(|&s| s > 0.05),
+            "speech must be present after trimming"
+        );
     }
 
     #[test]
@@ -3532,7 +3709,7 @@ mod overlay_shimmer_tests {
         // FIRSTCHAR-FIX-006 (R3): weak consonant at onset must not be trimmed.
         // Simulate: silence → weak breath (aspirated consonant ~100ms) → strong vowel
         let mut samples = vec![0.0f32; 9600]; // 600ms @ 16kHz
-        // Weak breath from sample 3200–4800 (100ms of low-energy consonant)
+                                              // Weak breath from sample 3200–4800 (100ms of low-energy consonant)
         for i in 3200..4800 {
             samples[i] = 0.005; // below threshold 0.008 — aspirated consonant is very quiet
         }
@@ -3542,9 +3719,11 @@ mod overlay_shimmer_tests {
         }
         // Energy onset should detect at ~4800 (strong vowel), backtrack 3200 → keep_start = 1600
         let keep_start = find_speech_onset_with_backtrack(&samples, 0.008, 3200);
-        assert!(keep_start <= 3200,
+        assert!(
+            keep_start <= 3200,
             "keep_start must include weak breath consonant, got {} (consonant starts at 3200)",
-            keep_start);
+            keep_start
+        );
     }
 
     #[test]
@@ -3552,7 +3731,10 @@ mod overlay_shimmer_tests {
         // FIRSTCHAR-FIX-006 (R3): "speak before key" — pre_roll already has speech
         let samples = vec![0.1f32; 3200]; // all speech, no silence
         let keep_start = find_speech_onset_with_backtrack(&samples, 0.008, 3200);
-        assert_eq!(keep_start, 0, "no leading silence: must keep everything (saturating_sub to 0)");
+        assert_eq!(
+            keep_start, 0,
+            "no leading silence: must keep everything (saturating_sub to 0)"
+        );
     }
 
     #[test]
@@ -3570,7 +3752,10 @@ mod overlay_shimmer_tests {
         // OVERLAY-FIX-005: phase increments by 0.015 per WM_PAINT frame
         let phase: f32 = 0.0;
         let new_phase = (phase + 0.015) % 2.0;
-        assert!((new_phase - 0.015).abs() < 0.001, "Phase must increment by 0.015");
+        assert!(
+            (new_phase - 0.015).abs() < 0.001,
+            "Phase must increment by 0.015"
+        );
     }
 
     #[test]
@@ -3578,7 +3763,10 @@ mod overlay_shimmer_tests {
         // OVERLAY-FIX-005: phase wraps at 2.0 (not 1.0)
         let phase: f32 = 1.990;
         let new_phase = (phase + 0.015) % 2.0;
-        assert!(new_phase < 0.01, "Phase must wrap to near 0 when exceeding 2.0");
+        assert!(
+            new_phase < 0.01,
+            "Phase must wrap to near 0 when exceeding 2.0"
+        );
     }
 
     #[test]
@@ -3587,7 +3775,10 @@ mod overlay_shimmer_tests {
         // At phase=1.0, p should be 1.0 (peak)
         let phase: f32 = 1.0;
         let p = if phase <= 1.0 { phase } else { 2.0 - phase };
-        assert!((p - 1.0).abs() < 0.001, "Triangle wave must peak at phase=1.0");
+        assert!(
+            (p - 1.0).abs() < 0.001,
+            "Triangle wave must peak at phase=1.0"
+        );
     }
 
     #[test]
@@ -3595,7 +3786,10 @@ mod overlay_shimmer_tests {
         // OVERLAY-FIX-005: at phase=1.5, p = 2.0 - 1.5 = 0.5 (descending)
         let phase: f32 = 1.5;
         let p = if phase <= 1.0 { phase } else { 2.0 - phase };
-        assert!((p - 0.5).abs() < 0.001, "Triangle wave must descend at phase>1.0");
+        assert!(
+            (p - 0.5).abs() < 0.001,
+            "Triangle wave must descend at phase>1.0"
+        );
     }
 
     #[test]
@@ -3603,7 +3797,10 @@ mod overlay_shimmer_tests {
         // OVERLAY-FIX-005: at phase=1.985 (just before wrap), p = 2.0 - 1.985 = 0.015
         let phase: f32 = 1.985;
         let p = if phase <= 1.0 { phase } else { 2.0 - phase };
-        assert!((p - 0.015).abs() < 0.001, "Triangle wave near wrap must be near 0");
+        assert!(
+            (p - 0.015).abs() < 0.001,
+            "Triangle wave near wrap must be near 0"
+        );
     }
 
     #[test]
@@ -3616,11 +3813,17 @@ mod overlay_shimmer_tests {
         let total_w = btn_w * 2 + gap;
         let btn_left = (window_width - total_w) / 2;
         assert_eq!(total_w, 130, "Total button width must be 130px");
-        assert_eq!(btn_left, 95, "Buttons must be centered at x=95 in 320px window");
+        assert_eq!(
+            btn_left, 95,
+            "Buttons must be centered at x=95 in 320px window"
+        );
         // Verify symmetry: left margin == right margin
         let left_margin = btn_left;
         let right_margin = window_width - (btn_left + total_w);
-        assert_eq!(left_margin, right_margin, "Left and right margins must be equal");
+        assert_eq!(
+            left_margin, right_margin,
+            "Left and right margins must be equal"
+        );
     }
 
     #[test]
@@ -3632,17 +3835,28 @@ mod overlay_shimmer_tests {
         let title_close_right = window_right - 8;
         let title_close_top = 5;
         let title_close_bottom = 23;
-        assert_eq!(title_close_right - title_close_left, 18, "Close button must be 18px wide");
-        assert_eq!(title_close_bottom - title_close_top, 18, "Close button must be 18px tall");
-        assert_eq!(title_close_left, window_right - close_btn_space,
-            "Close button must be positioned close_btn_space from right edge");
+        assert_eq!(
+            title_close_right - title_close_left,
+            18,
+            "Close button must be 18px wide"
+        );
+        assert_eq!(
+            title_close_bottom - title_close_top,
+            18,
+            "Close button must be 18px tall"
+        );
+        assert_eq!(
+            title_close_left,
+            window_right - close_btn_space,
+            "Close button must be positioned close_btn_space from right edge"
+        );
     }
 
     #[test]
     fn preview_brand_orange_color_value() {
         // OVERLAY-FIX-005: BRAND_ORANGE = #FF6B00 used for title, X button, and buttons
         const BRAND_ORANGE: u32 = 0x006BFF; // COLORREF format: 0x00BBGGRR
-        // Verify it is orange (high R, medium G, low B)
+                                            // Verify it is orange (high R, medium G, low B)
         let r = BRAND_ORANGE & 0xFF;
         let g = (BRAND_ORANGE >> 8) & 0xFF;
         let b = (BRAND_ORANGE >> 16) & 0xFF;
@@ -3659,7 +3873,10 @@ mod overlay_shimmer_tests {
         const GRAVITY_RATE: f32 = 0.25;
         let level: f32 = 1.0;
         let after_one = level * GRAVITY_RATE;
-        assert!((after_one - 0.25).abs() < 0.001, "After 1 frame, level must be 0.25");
+        assert!(
+            (after_one - 0.25).abs() < 0.001,
+            "After 1 frame, level must be 0.25"
+        );
     }
 
     #[test]
@@ -3683,15 +3900,24 @@ mod overlay_shimmer_tests {
             level *= GRAVITY_RATE;
         }
         // 2.0 * 0.25^4 = 2.0 / 256 = 0.0078125
-        assert!((level - 0.0078125).abs() < 0.0001, "Decay must be multiplicative from any start");
+        assert!(
+            (level - 0.0078125).abs() < 0.0001,
+            "Decay must be multiplicative from any start"
+        );
     }
 
     #[test]
     fn waveform_gravity_rate_constant_value() {
         // WAVEFORM-FIX-002: GRAVITY_RATE = 0.25 (center), edge = 0.25*(0.5+1.5*1)=0.5
         const GRAVITY_RATE: f32 = 0.25;
-        assert!((GRAVITY_RATE - 0.25).abs() < 0.001, "GRAVITY_RATE must be 0.25");
-        assert!(GRAVITY_RATE > 0.0 && GRAVITY_RATE < 1.0, "GRAVITY_RATE must be between 0 and 1 for decay");
+        assert!(
+            (GRAVITY_RATE - 0.25).abs() < 0.001,
+            "GRAVITY_RATE must be 0.25"
+        );
+        assert!(
+            GRAVITY_RATE > 0.0 && GRAVITY_RATE < 1.0,
+            "GRAVITY_RATE must be between 0 and 1 for decay"
+        );
     }
 
     #[test]
@@ -3701,9 +3927,18 @@ mod overlay_shimmer_tests {
         const GRAVITY_RATE: f32 = 0.25;
         let center_gravity = GRAVITY_RATE * (0.5 + 1.5 * 0.0);
         let edge_gravity = GRAVITY_RATE * (0.5 + 1.5 * 1.0);
-        assert!((center_gravity - 0.125).abs() < 0.001, "Center gravity must be 0.125");
-        assert!((edge_gravity - 0.5).abs() < 0.001, "Edge gravity must be 0.5");
-        assert!(edge_gravity > center_gravity, "Edge must decay faster than center");
+        assert!(
+            (center_gravity - 0.125).abs() < 0.001,
+            "Center gravity must be 0.125"
+        );
+        assert!(
+            (edge_gravity - 0.5).abs() < 0.001,
+            "Edge gravity must be 0.5"
+        );
+        assert!(
+            edge_gravity > center_gravity,
+            "Edge must decay faster than center"
+        );
     }
 
     #[test]
@@ -3712,8 +3947,15 @@ mod overlay_shimmer_tests {
         // At i=0 (center): cos(0) = 1, weight = 0.4 + 0.6*1 = 1.0
         let half: usize = 32;
         let i: usize = 0;
-        let weight = 0.4 + 0.6 * (std::f64::consts::FRAC_PI_2 * i as f64 / (half - 1) as f64).cos().powi(2);
-        assert!((weight - 1.0).abs() < 0.001, "Center bar (i=0) must have weight=1.0");
+        let weight = 0.4
+            + 0.6
+                * (std::f64::consts::FRAC_PI_2 * i as f64 / (half - 1) as f64)
+                    .cos()
+                    .powi(2);
+        assert!(
+            (weight - 1.0).abs() < 0.001,
+            "Center bar (i=0) must have weight=1.0"
+        );
     }
 
     #[test]
@@ -3721,8 +3963,15 @@ mod overlay_shimmer_tests {
         // WAVEFORM-FIX-001: at i=half-1 (edge): cos(π/2) = 0, weight = 0.4
         let half: usize = 32;
         let i: usize = half - 1;
-        let weight = 0.4 + 0.6 * (std::f64::consts::FRAC_PI_2 * i as f64 / (half - 1) as f64).cos().powi(2);
-        assert!((weight - 0.4).abs() < 0.001, "Edge bar (i=half-1) must have weight=0.4");
+        let weight = 0.4
+            + 0.6
+                * (std::f64::consts::FRAC_PI_2 * i as f64 / (half - 1) as f64)
+                    .cos()
+                    .powi(2);
+        assert!(
+            (weight - 0.4).abs() < 0.001,
+            "Edge bar (i=half-1) must have weight=0.4"
+        );
     }
 
     #[test]
@@ -3731,9 +3980,16 @@ mod overlay_shimmer_tests {
         let half: usize = 32;
         let mut prev_weight = 1.0;
         for i in 1..half {
-            let weight = 0.4 + 0.6 * (std::f64::consts::FRAC_PI_2 * i as f64 / (half - 1) as f64).cos().powi(2);
-            assert!(weight <= prev_weight + 0.001,
-                "Weight must decrease monotonically from center to edge (i={})", i);
+            let weight = 0.4
+                + 0.6
+                    * (std::f64::consts::FRAC_PI_2 * i as f64 / (half - 1) as f64)
+                        .cos()
+                        .powi(2);
+            assert!(
+                weight <= prev_weight + 0.001,
+                "Weight must decrease monotonically from center to edge (i={})",
+                i
+            );
             prev_weight = weight;
         }
     }
@@ -3746,7 +4002,11 @@ mod overlay_shimmer_tests {
         let i: usize = half / 2;
         let angle = std::f64::consts::FRAC_PI_2 * i as f64 / (half - 1) as f64;
         let weight = 0.4 + 0.6 * angle.cos().powi(2);
-        assert!((weight - 0.685).abs() < 0.01, "Midpoint bar must have weight≈0.685 (actual={:.4})", weight);
+        assert!(
+            (weight - 0.685).abs() < 0.01,
+            "Midpoint bar must have weight≈0.685 (actual={:.4})",
+            weight
+        );
     }
 
     #[test]
@@ -3754,9 +4014,16 @@ mod overlay_shimmer_tests {
         // WAVEFORM-FIX-001: all weights must be in [0.4, 1.0]
         let half: usize = 32;
         for i in 0..half {
-            let weight = 0.4 + 0.6 * (std::f64::consts::FRAC_PI_2 * i as f64 / (half - 1) as f64).cos().powi(2);
-            assert!(weight >= 0.4 - 0.001 && weight <= 1.0 + 0.001,
-                "Weight must be in [0.4, 1.0] range (i={})", i);
+            let weight = 0.4
+                + 0.6
+                    * (std::f64::consts::FRAC_PI_2 * i as f64 / (half - 1) as f64)
+                        .cos()
+                        .powi(2);
+            assert!(
+                weight >= 0.4 - 0.001 && weight <= 1.0 + 0.001,
+                "Weight must be in [0.4, 1.0] range (i={})",
+                i
+            );
         }
     }
 
@@ -3774,7 +4041,10 @@ mod overlay_shimmer_tests {
         assert_eq!(b, 0x06, "BORDER_GRAY blue must be 0x06");
         // Verify darker than old value (0x171513)
         let old_gray: u32 = 0x131517;
-        assert!(BORDER_GRAY < old_gray, "New BORDER_GRAY must be darker than old 0x171513");
+        assert!(
+            BORDER_GRAY < old_gray,
+            "New BORDER_GRAY must be darker than old 0x171513"
+        );
     }
 
     #[test]
@@ -3782,7 +4052,10 @@ mod overlay_shimmer_tests {
         // FIX-007: CIRC_BORDER must match BORDER_GRAY (0x060607)
         const BORDER_GRAY: u32 = 0x060607;
         const CIRC_BORDER: u32 = 0x060607;
-        assert_eq!(BORDER_GRAY, CIRC_BORDER, "CIRC_BORDER must match BORDER_GRAY");
+        assert_eq!(
+            BORDER_GRAY, CIRC_BORDER,
+            "CIRC_BORDER must match BORDER_GRAY"
+        );
     }
 
     #[test]
@@ -3791,10 +4064,12 @@ mod overlay_shimmer_tests {
         let levels_len: usize = 64;
         let half: usize = 32;
         let idx_center = levels_len.saturating_sub(1 + 0);
-        assert_eq!(idx_center, levels_len - 1,
-            "center bar i=0 must map to newest sample (len-1)");
-        assert_eq!(idx_center, 63,
-            "for len=64 newest sample index is 63");
+        assert_eq!(
+            idx_center,
+            levels_len - 1,
+            "center bar i=0 must map to newest sample (len-1)"
+        );
+        assert_eq!(idx_center, 63, "for len=64 newest sample index is 63");
     }
 
     #[test]
@@ -3803,10 +4078,12 @@ mod overlay_shimmer_tests {
         let levels_len: usize = 64;
         let half: usize = 32;
         let idx_edge = levels_len.saturating_sub(1 + (half - 1));
-        assert_eq!(idx_edge, levels_len - half,
-            "edge bar i=half-1 must map to len-half (oldest of left half)");
-        assert_eq!(idx_edge, 32,
-            "for len=64,half=32 edge maps to idx 32");
+        assert_eq!(
+            idx_edge,
+            levels_len - half,
+            "edge bar i=half-1 must map to len-half (oldest of left half)"
+        );
+        assert_eq!(idx_edge, 32, "for len=64,half=32 edge maps to idx 32");
     }
 
     #[test]
@@ -3815,13 +4092,16 @@ mod overlay_shimmer_tests {
         let levels_len: usize = 64;
         let half: usize = 32;
         let start_idx = levels_len.saturating_sub(half);
-        assert_eq!(start_idx, 32,
-            "start_idx for len=64,half=32 is 32");
+        assert_eq!(start_idx, 32, "start_idx for len=64,half=32 is 32");
         let idx_right_first = start_idx + 0;
-        assert_eq!(idx_right_first, 32,
-            "right half first bar (i=0) must start at start_idx");
-        assert!(idx_right_first < levels_len,
-            "right half index must be within bounds");
+        assert_eq!(
+            idx_right_first, 32,
+            "right half first bar (i=0) must start at start_idx"
+        );
+        assert!(
+            idx_right_first < levels_len,
+            "right half index must be within bounds"
+        );
     }
 
     #[test]
@@ -3834,8 +4114,11 @@ mod overlay_shimmer_tests {
         ];
         for (len, half, expected) in test_cases {
             let start_idx = len.saturating_sub(half);
-            assert_eq!(start_idx, expected,
-                "start_idx for len={},half={} must be {}", len, half, expected);
+            assert_eq!(
+                start_idx, expected,
+                "start_idx for len={},half={} must be {}",
+                len, half, expected
+            );
         }
     }
 
@@ -3844,24 +4127,39 @@ mod overlay_shimmer_tests {
         // WAVEFORM-FIX-002: edge gravity(0.5) / center gravity(0.125) = 4x
         const GRAVITY_RATE: f32 = 0.25;
         let center_gravity = GRAVITY_RATE * (0.5 + 1.5 * 0.0); // 0.125
-        let edge_gravity = GRAVITY_RATE * (0.5 + 1.5 * 1.0);   // 0.5
+        let edge_gravity = GRAVITY_RATE * (0.5 + 1.5 * 1.0); // 0.5
         let ratio = edge_gravity / center_gravity;
-        assert!((ratio - 4.0).abs() < 0.001,
-            "edge must fall {:.1}x faster than center, got {:.2}x", 4.0, ratio);
+        assert!(
+            (ratio - 4.0).abs() < 0.001,
+            "edge must fall {:.1}x faster than center, got {:.2}x",
+            4.0,
+            ratio
+        );
     }
 
     #[test]
     fn shimmer_period_is_800ms() {
         // SHIMMER-SPEED-002: period changed from 1200ms to 800ms
         let period_ms: u64 = 800;
-        assert_eq!(period_ms, 800,
-            "shimmer period must be 800ms after SHIMMER-SPEED-002");
-        assert_eq!((0u64 % period_ms) as f32 / period_ms as f32, 0.0,
-            "start phase must be 0");
-        assert_eq!((400u64 % period_ms) as f32 / period_ms as f32, 0.5,
-            "mid-period phase must be 0.5");
-        assert_eq!((800u64 % period_ms) as f32 / period_ms as f32, 0.0,
-            "full-period phase must wrap to 0");
+        assert_eq!(
+            period_ms, 800,
+            "shimmer period must be 800ms after SHIMMER-SPEED-002"
+        );
+        assert_eq!(
+            (0u64 % period_ms) as f32 / period_ms as f32,
+            0.0,
+            "start phase must be 0"
+        );
+        assert_eq!(
+            (400u64 % period_ms) as f32 / period_ms as f32,
+            0.5,
+            "mid-period phase must be 0.5"
+        );
+        assert_eq!(
+            (800u64 % period_ms) as f32 / period_ms as f32,
+            0.0,
+            "full-period phase must wrap to 0"
+        );
     }
 
     #[test]
@@ -3871,7 +4169,11 @@ mod overlay_shimmer_tests {
         let period_ms: u64 = 800;
         for ms in [0u64, 1, 200, 399, 400, 798, 799, 800, 801, 1600] {
             let phase = (ms % period_ms) as f32 / period_ms as f32;
-            assert!(phase >= 0.0 && phase < 1.0, "phase must be in [0,1) for ms={}", ms);
+            assert!(
+                phase >= 0.0 && phase < 1.0,
+                "phase must be in [0,1) for ms={}",
+                ms
+            );
         }
         // Verify monotonic within one period
         let p1 = (200u64 % period_ms) as f32 / period_ms as f32;
@@ -3880,7 +4182,10 @@ mod overlay_shimmer_tests {
         // Verify wrap: ms=0 and ms=800 both give phase=0.0
         let p_start = (0u64 % period_ms) as f32 / period_ms as f32;
         let p_wrap = (period_ms % period_ms) as f32 / period_ms as f32;
-        assert!((p_start - p_wrap).abs() < 0.0001, "phase must wrap at period boundary");
+        assert!(
+            (p_start - p_wrap).abs() < 0.0001,
+            "phase must wrap at period boundary"
+        );
     }
 
     #[test]
@@ -3916,10 +4221,16 @@ mod overlay_shimmer_tests {
         let travel: f32 = 290.0;
         // At phase=0.0: beam_cx starts off-screen left
         let beam_cx_start = rect_left - glow_half + (travel * 0.0) as i32;
-        assert_eq!(beam_cx_start, -45, "beam_cx at phase=0 must be -45 (off-screen left)");
+        assert_eq!(
+            beam_cx_start, -45,
+            "beam_cx at phase=0 must be -45 (off-screen left)"
+        );
         // At phase=1.0: beam_cx ends off-screen right
         let beam_cx_end = rect_left - glow_half + (travel * 1.0) as i32;
-        assert_eq!(beam_cx_end, 245, "beam_cx at phase=1 must be 245 (right edge + 45)");
+        assert_eq!(
+            beam_cx_end, 245,
+            "beam_cx at phase=1 must be 245 (right edge + 45)"
+        );
         // At phase=0.5: beam is mid-window, outermost slice visible after clamping
         let beam_cx_mid = rect_left - glow_half + (travel * 0.5) as i32;
         let x1 = (beam_cx_mid - glow_half).max(rect_left + 1);
@@ -3944,8 +4255,15 @@ mod overlay_shimmer_tests {
         // at t=1.0 (edge), alpha = exp(-3)*200 ~ 10
         let t_edge: f32 = 1.0;
         let alpha_edge = ((-3.0_f32 * t_edge * t_edge).exp() * 200.0) as u8;
-        assert!(alpha_edge < 15, "Edge alpha must be very low (<15): {}", alpha_edge);
-        assert!(alpha_edge < alpha, "Edge alpha must be less than center alpha");
+        assert!(
+            alpha_edge < 15,
+            "Edge alpha must be very low (<15): {}",
+            alpha_edge
+        );
+        assert!(
+            alpha_edge < alpha,
+            "Edge alpha must be less than center alpha"
+        );
     }
 
     #[test]
@@ -3974,8 +4292,10 @@ mod overlay_shimmer_tests {
         assert_eq!(r, g, "Gray requires R=G");
         assert_eq!(g, b, "Gray requires G=B");
         // Verify it is NOT orange
-        assert!(r != 0xFF || g != 0x6B || b != 0x00,
-            "Close button must not be BRAND_ORANGE");
+        assert!(
+            r != 0xFF || g != 0x6B || b != 0x00,
+            "Close button must not be BRAND_ORANGE"
+        );
     }
 
     #[test]
@@ -3985,9 +4305,14 @@ mod overlay_shimmer_tests {
         const BORDER_GRAY: u32 = 0x060607;
         const BTN_BORDER: u32 = 0x707070;
         // Sum channels as proxy for brightness (since both are gray-ish)
-        let gray_sum = (BORDER_GRAY & 0xFF) + ((BORDER_GRAY >> 8) & 0xFF) + ((BORDER_GRAY >> 16) & 0xFF);
-        let btn_sum = (BTN_BORDER & 0xFF) + ((BTN_BORDER >> 8) & 0xFF) + ((BTN_BORDER >> 16) & 0xFF);
-        assert!(btn_sum > gray_sum * 4, "BTN_BORDER must be at least 4x brighter than BORDER_GRAY");
+        let gray_sum =
+            (BORDER_GRAY & 0xFF) + ((BORDER_GRAY >> 8) & 0xFF) + ((BORDER_GRAY >> 16) & 0xFF);
+        let btn_sum =
+            (BTN_BORDER & 0xFF) + ((BTN_BORDER >> 8) & 0xFF) + ((BTN_BORDER >> 16) & 0xFF);
+        assert!(
+            btn_sum > gray_sum * 4,
+            "BTN_BORDER must be at least 4x brighter than BORDER_GRAY"
+        );
         // Verify BTN_BORDER is neutral gray
         let r = BTN_BORDER & 0xFF;
         let g = (BTN_BORDER >> 8) & 0xFF;
@@ -4007,16 +4332,28 @@ mod overlay_shimmer_tests {
     fn preprocessing_params_performance_uses_0ms_head_200ms_backtrack() {
         // ASR-CTC-OPT-001 P1: performance silence head 50→0ms（研究 C1 证实 0ms 高 2.5pp）
         let (head, backtrack) = select_preprocessing_params(transcription::AsrModel::Performance);
-        assert_eq!(head, 0, "performance silence head = 0 samples (0ms @ 16kHz, ASR-CTC-OPT-001 P1)");
-        assert_eq!(backtrack, 3200, "performance onset backtrack = 3200 samples (200ms @ 16kHz, 不动)");
+        assert_eq!(
+            head, 0,
+            "performance silence head = 0 samples (0ms @ 16kHz, ASR-CTC-OPT-001 P1)"
+        );
+        assert_eq!(
+            backtrack, 3200,
+            "performance onset backtrack = 3200 samples (200ms @ 16kHz, 不动)"
+        );
     }
 
     #[test]
     fn preprocessing_params_accuracy_uses_0ms_head_100ms_backtrack() {
         // 方案 B：accuracy 用 0ms head / 100ms backtrack
         let (head, backtrack) = select_preprocessing_params(transcription::AsrModel::Accuracy);
-        assert_eq!(head, 0, "accuracy silence head = 0 samples (0ms, LLM decoder needs no frame padding)");
-        assert_eq!(backtrack, 1600, "accuracy onset backtrack = 1600 samples (100ms @ 16kHz)");
+        assert_eq!(
+            head, 0,
+            "accuracy silence head = 0 samples (0ms, LLM decoder needs no frame padding)"
+        );
+        assert_eq!(
+            backtrack, 1600,
+            "accuracy onset backtrack = 1600 samples (100ms @ 16kHz)"
+        );
     }
 
     #[test]
@@ -4033,21 +4370,29 @@ mod overlay_shimmer_tests {
         // native 对送气声母不如 CTC 敏感，少留 backtrack 减少前导静音
         let (_, perf_bt) = select_preprocessing_params(transcription::AsrModel::Performance);
         let (_, acc_bt) = select_preprocessing_params(transcription::AsrModel::Accuracy);
-        assert!(acc_bt < perf_bt,
+        assert!(
+            acc_bt < perf_bt,
             "accuracy backtrack ({}) must be less than performance backtrack ({})",
-            acc_bt, perf_bt);
+            acc_bt,
+            perf_bt
+        );
     }
 
     #[test]
     fn preprocessing_params_qwen3_online_follows_performance() {
         // DEC-028: qwen3_online 沿用 performance 前处理参数（0ms head / 200ms backtrack）
         let (q3_head, q3_bt) = select_preprocessing_params(transcription::AsrModel::Qwen3Online);
-        let (perf_head, perf_bt) = select_preprocessing_params(transcription::AsrModel::Performance);
-        assert_eq!(q3_head, perf_head,
+        let (perf_head, perf_bt) =
+            select_preprocessing_params(transcription::AsrModel::Performance);
+        assert_eq!(
+            q3_head, perf_head,
             "qwen3_online silence head ({}) must equal performance head ({})",
-            q3_head, perf_head);
-        assert_eq!(q3_bt, perf_bt,
+            q3_head, perf_head
+        );
+        assert_eq!(
+            q3_bt, perf_bt,
             "qwen3_online backtrack ({}) must equal performance backtrack ({})",
-            q3_bt, perf_bt);
+            q3_bt, perf_bt
+        );
     }
 }

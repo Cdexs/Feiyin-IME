@@ -1,15 +1,17 @@
 use crate::config::ChineseScript;
 use zhconv::{zhconv, Variant};
 
-pub fn normalize_text_for_language(text: &str, language: &str, script: ChineseScript) -> String {
+/// LANG-AUTO-001: normalize_text_for_language 现按内容（contains_han）门控简繁转换，
+/// 不再依赖 language 配置（语言配置恒为 "auto"）。language 参数已删除。
+pub fn normalize_text_for_language(text: &str, script: ChineseScript) -> String {
     if text.trim().is_empty() {
         return text.to_string();
     }
 
     let mut result = text.to_string();
 
-    // 中文简繁转换
-    if is_chinese_language(language) {
+    // 中文简繁转换（按内容含汉字判定，不依赖 language 配置）
+    if contains_han(&result) {
         let variant = match script {
             ChineseScript::Simplified => Variant::ZhCN,
             ChineseScript::Traditional => Variant::ZhTW,
@@ -21,6 +23,36 @@ pub fn normalize_text_for_language(text: &str, language: &str, script: ChineseSc
     result = fix_asr_english_case(&result);
 
     result
+}
+
+/// FMT-LLM-005: 仅做中文简繁转换，不做 fix_asr_english_case 大小写后处理。
+/// 用于 LLM optimize 成功路径——LLM 输出的大小写是正确意图（如 "Dear Mr. Wang,"），
+/// 二次 normalize 会用 fix_asr_english_case 打回小写（"Dear mr. wang,"），破坏 LLM 成果。
+/// 与 ASR 原文/LLM 失败兜底路径（仍用 normalize_text_for_language）区分开。
+pub fn normalize_script_only(text: &str, script: ChineseScript) -> String {
+    if text.trim().is_empty() {
+        return text.to_string();
+    }
+    // 仅当内容含汉字时才做简繁转换（contains_han 判定，避免对纯英文文本误转）
+    if contains_han(text) {
+        let variant = match script {
+            ChineseScript::Simplified => Variant::ZhCN,
+            ChineseScript::Traditional => Variant::ZhTW,
+        };
+        return zhconv(text, variant);
+    }
+    text.to_string()
+}
+
+/// LANG-AUTO-001: 内容检测——文本是否含 CJK 汉字。
+/// 覆盖：CJK 统一表意文字 (U+4E00-9FFF) + 扩展 A 区 (U+3400-4DBF) + 兼容区 (U+F900-FAFF)。
+/// 替代旧的 is_chinese_language(language) 配置门控——语言配置恒为 "auto"，判定靠内容。
+pub fn contains_han(text: &str) -> bool {
+    text.chars().any(|c| {
+        ('\u{4E00}'..='\u{9FFF}').contains(&c)
+            || ('\u{3400}'..='\u{4DBF}').contains(&c)
+            || ('\u{F900}'..='\u{FAFF}').contains(&c)
+    })
 }
 
 /// 修复 ASR 输出的英文大小写问题
@@ -118,8 +150,10 @@ fn fix_pure_english_case(text: &str) -> String {
     result
 }
 
-pub fn script_instruction(language: &str, script: ChineseScript) -> Option<&'static str> {
-    if !is_chinese_language(language) {
+/// LANG-AUTO-001: script_instruction 改按内容（contains_han）门控。
+/// 旧签名 (language, script) 改为 (text, script)，language 参数被 text 替代。
+pub fn script_instruction(text: &str, script: ChineseScript) -> Option<&'static str> {
+    if !contains_han(text) {
         return None;
     }
 
@@ -127,10 +161,6 @@ pub fn script_instruction(language: &str, script: ChineseScript) -> Option<&'sta
         ChineseScript::Simplified => "请将最终输出转换为简体中文（中国大陆简体字）。",
         ChineseScript::Traditional => "请将最终输出转换为繁体中文（台湾正体字）。",
     })
-}
-
-fn is_chinese_language(language: &str) -> bool {
-    language.trim().eq_ignore_ascii_case("zh") || language.trim().starts_with("zh-")
 }
 
 /// OPT-002: Check if text contains effective content (not empty or filler-only).
@@ -163,26 +193,120 @@ pub fn is_effective_text(text: &str) -> bool {
 mod tests {
     use super::*;
 
+    // ============================================================
+    // normalize_text_for_language（LANG-AUTO-001：按内容 contains_han 门控）
+    // ============================================================
+
     #[test]
     fn normalizes_to_simplified_chinese() {
-        let text = normalize_text_for_language("阿拉伯聯合酋長國", "zh", ChineseScript::Simplified);
+        // 含汉字 → 简繁转换生效（不依赖 language 参数）
+        let text = normalize_text_for_language("阿拉伯聯合酋長國", ChineseScript::Simplified);
         assert_eq!(text, "阿拉伯联合酋长国");
     }
 
     #[test]
     fn normalizes_to_traditional_chinese() {
-        let text =
-            normalize_text_for_language("阿拉伯联合酋长国", "zh", ChineseScript::Traditional);
+        let text = normalize_text_for_language("阿拉伯联合酋长国", ChineseScript::Traditional);
         assert_eq!(text, "阿拉伯聯合酋長國");
     }
 
     #[test]
-    fn leaves_non_chinese_language_unchanged() {
-        let text = normalize_text_for_language("阿拉伯聯合酋長國", "en", ChineseScript::Simplified);
-        assert_eq!(text, "阿拉伯聯合酋長國");
+    fn leaves_non_chinese_content_unchanged() {
+        // LANG-AUTO-001: 纯英文文本不含汉字 → 不做简繁转换（但仍做 fix_asr_english_case 大小写后处理）
+        let text = normalize_text_for_language("HELLO WORLD", ChineseScript::Simplified);
+        assert_eq!(text, "Hello world");
     }
 
-    // ASR 英文大小写测试
+    #[test]
+    fn mixed_chinese_english_normalizes_script_only() {
+        // 含汉字 → 简繁转换；英文混合词经 fix_asr_english_case → lowercase
+        let text = normalize_text_for_language("你好 WORLD", ChineseScript::Simplified);
+        assert_eq!(text, "你好 world");
+    }
+
+    // ============================================================
+    // normalize_script_only（FMT-LLM-005：仅简繁，不动大小写）
+    // ============================================================
+
+    #[test]
+    fn normalize_script_only_preserves_english_case() {
+        // 含汉字 → 简繁转换；英文大小写保持不变（关键：LLM 成功路径保护）
+        let text = normalize_script_only("Dear Mr. Wang, 你好", ChineseScript::Simplified);
+        assert_eq!(text, "Dear Mr. Wang, 你好");
+    }
+
+    #[test]
+    fn normalize_script_only_traditional() {
+        // zhconv ZhTW: "台湾" → "臺灣"；英文大小写保持不变
+        let text = normalize_script_only("台湾 World", ChineseScript::Traditional);
+        assert_eq!(text, "臺灣 World");
+    }
+
+    #[test]
+    fn normalize_script_only_pure_english_unchanged() {
+        // 纯英文不含汉字 → 原样返回
+        let text = normalize_script_only("Dear Mr. Wang,", ChineseScript::Simplified);
+        assert_eq!(text, "Dear Mr. Wang,");
+    }
+
+    // ============================================================
+    // contains_han（LANG-AUTO-001：内容检测）
+    // ============================================================
+
+    #[test]
+    fn contains_han_basic_chinese() {
+        assert!(contains_han("你好"));
+        assert!(contains_han("hello 你好"));
+        assert!(contains_han("日本語"));
+    }
+
+    #[test]
+    fn contains_han_pure_english_false() {
+        assert!(!contains_han("hello world"));
+        assert!(!contains_han("HELLO 123"));
+    }
+
+    #[test]
+    fn contains_han_empty() {
+        assert!(!contains_han(""));
+        assert!(!contains_han("   "));
+    }
+
+    #[test]
+    fn contains_han_extension_a() {
+        // CJK 扩展 A 区字符（U+3400-U+4DBF）也应命中
+        assert!(contains_han("㐀㐁"));
+    }
+
+    // ============================================================
+    // script_instruction（LANG-AUTO-001：按内容门控）
+    // ============================================================
+
+    #[test]
+    fn script_instruction_chinese_content_returns_instruction() {
+        let instr = script_instruction("你好", ChineseScript::Simplified);
+        assert!(instr.is_some());
+        assert!(instr.unwrap().contains("简体中文"));
+    }
+
+    #[test]
+    fn script_instruction_pure_english_returns_none() {
+        let instr = script_instruction("hello world", ChineseScript::Simplified);
+        assert!(
+            instr.is_none(),
+            "pure English should not get script instruction"
+        );
+    }
+
+    #[test]
+    fn script_instruction_traditional() {
+        let instr = script_instruction("你好", ChineseScript::Traditional);
+        assert!(instr.unwrap().contains("繁体中文"));
+    }
+
+    // ============================================================
+    // ASR 英文大小写测试（fix_asr_english_case，回归）
+    // ============================================================
     #[test]
     fn fix_mixed_chinese_english() {
         assert_eq!(fix_asr_english_case("你好 WORLD"), "你好 world");

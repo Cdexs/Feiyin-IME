@@ -12,27 +12,67 @@ const LlmPage: React.FC<Props> = ({ config, updateConfig }) => {
   const [testing, setTesting] = useState(false);
   const t = getTranslations(config.ui_language);
 
+  const llm = config.llm || {};
+
   const handleLlmChange = (field: string, value: any) => {
     updateConfig({
       ...config,
-      llm: { ...config.llm, [field]: value }
+      llm: { ...llm, [field]: value }
     });
+  };
+
+  // FORMAT-LLM-001-UI: any change to api_url/api_key/model resets connectivity_verified
+  const handleResetVerifiedChange = (field: string, value: any) => {
+    updateConfig({
+      ...config,
+      llm: { ...llm, [field]: value, connectivity_verified: false }
+    });
+  };
+
+  const canEnable =
+    (llm.connectivity_verified === true) &&
+    (llm.api_url || '').trim().length > 0 &&
+    (llm.api_key || '').trim().length > 0 &&
+    (llm.model || '').trim().length > 0;
+
+  const gateHintText =
+    "请先完整填写接口地址、接口密钥、模型名称，并通过连接测试。";
+
+  const handleToggleEnabled = (checked: boolean) => {
+    if (checked && !canEnable) {
+      return;
+    }
+    handleLlmChange('enabled', checked);
   };
 
   const handleTest = async () => {
     setTesting(true);
     setTestResult(null);
     try {
-      const res = await invoke<string>("test_llm_connection", { config: config.llm });
-      setTestResult({ msg: `Success: ${res}`, success: true });
+      const res = await invoke<string>("test_llm_connection", { config: llm });
+      setTestResult({ msg: `${t.llm_test_success}: ${res}`, success: true });
       handleLlmChange('connectivity_verified', true);
-    } catch (e) {
-      setTestResult({ msg: `Failed: ${e}`, success: false });
+    } catch (e: any) {
+      setTestResult({ msg: `${t.llm_test_failed}: ${typeof e === 'string' ? e : e?.message || String(e)}`, success: false });
       handleLlmChange('connectivity_verified', false);
     } finally {
       setTesting(false);
     }
   };
+
+  const statusClass =
+    llm.connectivity_verified === true
+      ? 'success'
+      : llm.connectivity_verified === false
+      ? 'failed'
+      : '';
+
+  const statusText =
+    llm.connectivity_verified === true
+      ? t.llm_test_success
+      : llm.connectivity_verified === false
+      ? t.llm_test_failed
+      : '未测试';
 
   return (
     <div className="settings-page">
@@ -42,97 +82,78 @@ const LlmPage: React.FC<Props> = ({ config, updateConfig }) => {
         <label className="toggle-switch card" style={{ border: 'none', boxShadow: 'none', padding: '8px 0', marginBottom: 0 }}>
           <input
             type="checkbox"
-            checked={config.llm.enabled}
-            onChange={(e) => handleLlmChange('enabled', e.target.checked)}
+            checked={llm.enabled}
+            onChange={(e) => handleToggleEnabled(e.target.checked)}
             className="toggle-input"
           />
           <span className="toggle-track"></span>
           <span className="toggle-label" style={{ fontWeight: 600 }}>{t.llm_enable}</span>
         </label>
-        <p className="form-hint" style={{ color: '#FF6B35', marginTop: '4px', paddingLeft: '8px' }}>{t.llm_enable_hint}</p>
+        {!canEnable && (
+          <p className="form-hint" style={{ color: '#FF6B35', marginTop: '4px', paddingLeft: '8px' }}>{gateHintText}</p>
+        )}
       </section>
 
       <section className="settings-section">
         <h3 className="section-title">{t.llm_api_config}</h3>
-        <div className="card">
-          <div style={{ display: 'flex', gap: '16px', marginBottom: '12px' }}>
-            <div className="form-row" style={{ flex: 2, marginBottom: 0 }}>
-              <label className="form-label">{t.llm_api_url}</label>
-              <div className="form-control" style={{ maxWidth: '100%' }}>
-                <input
-                  type="text"
-                  value={config.llm.api_url}
-                  onChange={(e) => handleLlmChange('api_url', e.target.value)}
-                  className="input"
-                  placeholder="https://api.openai.com/v1"
-                />
-              </div>
-            </div>
-            <div className="form-row" style={{ flex: 1, marginBottom: 0 }}>
-              <label className="form-label" style={{ minWidth: 'auto' }}>{t.llm_api_key}</label>
-              <div className="form-control" style={{ maxWidth: '100%' }}>
-                <input
-                  type="password"
-                  value={config.llm.api_key}
-                  onChange={(e) => handleLlmChange('api_key', e.target.value)}
-                  className="input"
-                  placeholder="sk-..."
-                />
-              </div>
-            </div>
-          </div>
-
-          <div className="form-row">
-            <label className="form-label">{t.llm_model}</label>
-            <div className="form-control">
+        <div className="card llm-api-card">
+          <div className="llm-form-grid">
+            <div className="llm-form-field">
+              <label className="llm-form-label">{t.llm_api_url}</label>
               <input
                 type="text"
-                value={config.llm.model}
-                onChange={(e) => handleLlmChange('model', e.target.value)}
-                className="input"
-                style={{ maxWidth: '200px' }}
+                value={llm.api_url || ''}
+                onChange={(e) => handleResetVerifiedChange('api_url', e.target.value)}
+                className="llm-input"
+                placeholder="https://api.openai.com/v1"
               />
             </div>
-          </div>
 
-          <div className="form-row" style={{ marginTop: '20px' }}>
-            <label className="form-label"></label>
-            <div className="form-control">
-              <button
-                onClick={handleTest}
-                disabled={testing}
-                className="btn btn-primary"
-                style={{ width: '100%', maxWidth: '200px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}
-              >
-                <span>{testing ? t.llm_testing : t.llm_test_connection}</span>
-                <span
-                  style={{
-                    display: "inline-block",
-                    width: "10px",
-                    height: "10px",
-                    borderRadius: "2px",
-                    backgroundColor:
-                      config.llm.connectivity_verified === true
-                        ? "#10b981"
-                        : config.llm.connectivity_verified === false
-                        ? "#ef4444"
-                        : "#9ca3af",
-                    flexShrink: 0,
-                    alignSelf: "center",
-                  }}
+            <div className="llm-form-field">
+              <label className="llm-form-label">{t.llm_api_key}</label>
+              <input
+                type="password"
+                value={llm.api_key || ''}
+                onChange={(e) => handleResetVerifiedChange('api_key', e.target.value)}
+                className="llm-input"
+                placeholder="sk-..."
+              />
+            </div>
+
+            <div className="llm-form-field">
+              <label className="llm-form-label">{t.llm_model}</label>
+              <div className="llm-model-row">
+                <input
+                  type="text"
+                  value={llm.model || ''}
+                  onChange={(e) => handleResetVerifiedChange('model', e.target.value)}
+                  className="llm-input"
+                  placeholder="gpt-4o-mini"
                 />
-              </button>
-
-              {testResult && (
-                <div
-                  className={`badge ${testResult.success ? 'badge-success' : 'badge-error'}`}
-                  style={{ marginTop: '12px', padding: '10px', wordBreak: 'break-all', borderRadius: '6px', width: '100%', boxSizing: 'border-box' }}
+                <button
+                  onClick={handleTest}
+                  disabled={testing}
+                  className="btn btn-primary llm-test-btn"
                 >
-                  {testResult.msg}
-                </div>
-              )}
+                  {testing ? t.llm_testing : t.llm_test_connection}
+                </button>
+              </div>
+            </div>
+
+            <div className="llm-form-field">
+              <label className="llm-form-label"></label>
+              <div className={`llm-status-bar ${statusClass}`}>
+                <span className="llm-status-dot"></span>
+                <span>{statusText}</span>
+              </div>
             </div>
           </div>
+
+          {testResult && (
+            <div className={`llm-result-badge ${testResult.success ? 'success' : 'error'}`}>
+              {testResult.msg}
+            </div>
+          )}
         </div>
       </section>
     </div>

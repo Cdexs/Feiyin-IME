@@ -123,6 +123,8 @@ pub struct Strings {
     pub error_microphone: &'static str,
     pub error_mic_muted: &'static str,
     pub error_transcription_empty: &'static str,
+    /// FORMAT-LLM-001-CORE (DEC-031-③): LLM 格式化失败后 overlay 提示文本。
+    pub format_failed_hint: &'static str,
 }
 
 static ZH: Strings = Strings {
@@ -268,6 +270,7 @@ Return ONLY the processed text. No explanations."#,
     error_microphone: "麦克风不可用。",
     error_mic_muted: "麦克风已静音，请取消静音后重试。",
     error_transcription_empty: "识别结果为空。",
+    format_failed_hint: "优化失败，已输出原文。",
 };
 
 static ZH_TW: Strings = Strings {
@@ -413,6 +416,7 @@ Return ONLY the processed text. No explanations."#,
     error_microphone: "麥克風不可用。",
     error_mic_muted: "麥克風已靜音，請取消靜音後重試。",
     error_transcription_empty: "識別結果為空。",
+    format_failed_hint: "優化失敗，已輸出原文。",
 };
 
 static EN: Strings = Strings {
@@ -557,6 +561,7 @@ Return ONLY the processed text. No explanations."#,
     error_microphone: "Microphone is unavailable.",
     error_mic_muted: "Microphone is muted. Please unmute and try again.",
     error_transcription_empty: "Transcription result is empty.",
+    format_failed_hint: "Optimization failed, original text used.",
 };
 
 pub fn get(lang: UiLanguage) -> &'static Strings {
@@ -598,6 +603,9 @@ mod tests {
         let strings = get(UiLanguage::English);
         assert_eq!(strings.app_title, "Feiyin Voice Input");
         assert_eq!(strings.dialog_save, "Save");
-        assert_eq!(strings.error_mic_muted, "Microphone is muted. Please unmute and try again.");
+        assert_eq!(
+            strings.error_mic_muted,
+            "Microphone is muted. Please unmute and try again."
+        );
     }
 }

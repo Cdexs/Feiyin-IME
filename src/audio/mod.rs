@@ -12,17 +12,17 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::BOOL;
 #[cfg(target_os = "windows")]
+use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+#[cfg(target_os = "windows")]
 use windows::Win32::Media::Audio::{
     eCapture, eMultimedia, IMMDeviceEnumerator, MMDeviceEnumerator,
 };
-#[cfg(target_os = "windows")]
-use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 
 const PRE_ROLL_MS: u64 = 600; // HOTKEY-LATENCY-V2-001: 500→600ms to collect more initial audio for cold start
 const PRIME_TIMEOUT_MS: u64 = 450; // HOTKEY-LATENCY-V2-001: 350→450ms for deeper cold-start audio collection
-const PRIME_TICK_MS: u64 = 20;     // HOTKEY-LATENCY-FIX-001: recv_timeout tick, allows up to 17 ticks before timeout
+const PRIME_TICK_MS: u64 = 20; // HOTKEY-LATENCY-FIX-001: recv_timeout tick, allows up to 17 ticks before timeout
 
 type AudioChunk = (Instant, Vec<f32>);
 
@@ -458,7 +458,9 @@ fn collect_recording(
                     // expected: may need multiple ticks
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    return Err(anyhow::anyhow!("Audio input stream disconnected during prime"));
+                    return Err(anyhow::anyhow!(
+                        "Audio input stream disconnected during prime"
+                    ));
                 }
             }
             total_wait_ms += PRIME_TICK_MS;
@@ -487,7 +489,8 @@ fn collect_recording(
             // The first speech-active sample is found with a simple energy gate; if
             // no speech is found the very first sample is used as the anchor.
             if prime_samples.len() > target_samples {
-                let speech_anchor = find_speech_anchor(&prime_samples, silence_threshold, sample_rate);
+                let speech_anchor =
+                    find_speech_anchor(&prime_samples, silence_threshold, sample_rate);
                 let end = (speech_anchor + target_samples).min(prime_samples.len());
                 let start = end.saturating_sub(target_samples);
                 prime_samples = prime_samples[start..end].to_vec();
@@ -602,7 +605,11 @@ fn collect_recording(
             state.all_samples.len(),
             state.sample_rate
         );
-        Ok(resample_anti_alias(&state.all_samples, state.sample_rate, 16000))
+        Ok(resample_anti_alias(
+            &state.all_samples,
+            state.sample_rate,
+            16000,
+        ))
     } else {
         Ok(state.all_samples)
     }
@@ -849,7 +856,10 @@ pub fn is_mic_muted() -> bool {
                 Ok(e) => e,
                 Err(_) => return false,
             };
-        endpoint.GetMute().map(|b: BOOL| b.as_bool()).unwrap_or(false)
+        endpoint
+            .GetMute()
+            .map(|b: BOOL| b.as_bool())
+            .unwrap_or(false)
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -987,21 +997,47 @@ mod tests {
         // Case 1: empty pre_roll -> prime consumes the first chunk from channel
         tx.send((Instant::now(), vec![0.1f32; 100])).unwrap();
         let result = collect_recording(
-            &rx, &failed, Arc::clone(&stop), 0.01, 100, 0, None, 16000, vec![], vec![],
+            &rx,
+            &failed,
+            Arc::clone(&stop),
+            0.01,
+            100,
+            0,
+            None,
+            16000,
+            vec![],
+            vec![],
         );
-        assert!(result.is_ok(), "Empty pre-roll with audio chunk must complete OK");
-        assert_eq!(result.unwrap().len(), 100,
-            "Prime must consume the available chunk when pre_roll is empty");
+        assert!(
+            result.is_ok(),
+            "Empty pre-roll with audio chunk must complete OK"
+        );
+        assert_eq!(
+            result.unwrap().len(),
+            100,
+            "Prime must consume the available chunk when pre_roll is empty"
+        );
 
         // Case 2: non-empty pre_roll -> prime skipped, pre_roll chunks processed instead
         tx.send((Instant::now(), vec![0.2f32; 50])).unwrap();
         let result2 = collect_recording(
-            &rx, &failed, Arc::clone(&stop), 0.01, 100, 0, None, 16000,
-            vec![vec![0.3f32; 80]], vec![],
+            &rx,
+            &failed,
+            Arc::clone(&stop),
+            0.01,
+            100,
+            0,
+            None,
+            16000,
+            vec![vec![0.3f32; 80]],
+            vec![],
         );
         assert!(result2.is_ok(), "Non-empty pre-roll must complete OK");
-        assert_eq!(result2.unwrap().len(), 80,
-            "Non-empty pre-roll must skip prime and process provided chunks");
+        assert_eq!(
+            result2.unwrap().len(),
+            80,
+            "Non-empty pre-roll must skip prime and process provided chunks"
+        );
     }
 
     #[test]
@@ -1110,7 +1146,9 @@ mod tests {
             "ZH error_mic_muted must not be empty"
         );
         assert!(
-            !i18n::get(UiLanguage::TraditionalChinese).error_mic_muted.is_empty(),
+            !i18n::get(UiLanguage::TraditionalChinese)
+                .error_mic_muted
+                .is_empty(),
             "ZH_TW error_mic_muted must not be empty"
         );
         assert!(
@@ -1130,15 +1168,17 @@ mod tests {
     fn retain_recent_samples_keeps_newest_not_oldest() {
         // 7 chunks x 1600 samples = 11200 > limit(9600)
         // The oldest chunk (index 0, values 0.0) must be evicted.
-        let chunks: Vec<Vec<f32>> = (0u32..7)
-            .map(|i| vec![i as f32; 1_600])
-            .collect();
+        let chunks: Vec<Vec<f32>> = (0u32..7).map(|i| vec![i as f32; 1_600]).collect();
         let limit = pre_roll_samples(16_000, PRE_ROLL_MS); // 9600
         let retained = retain_recent_samples(chunks, limit);
         // Oldest chunk discarded
         assert_eq!(retained[0][0], 1.0, "oldest chunk must be evicted");
         // Newest chunk retained
-        assert_eq!(retained.last().unwrap()[0], 6.0, "newest chunk must be retained");
+        assert_eq!(
+            retained.last().unwrap()[0],
+            6.0,
+            "newest chunk must be retained"
+        );
     }
 
     /// FIRSTCHAR-FIX-004 (D3): timestamp-based drain terminates on empty channel
@@ -1162,7 +1202,10 @@ mod tests {
             }
         }
         assert_eq!(idle_cleared, 0, "empty channel must yield 0 cleared chunks");
-        assert!(post_hotkey.is_empty(), "empty channel must yield 0 post-hotkey chunks");
+        assert!(
+            post_hotkey.is_empty(),
+            "empty channel must yield 0 post-hotkey chunks"
+        );
     }
 
     /// TEST-WRITE-FIRSTCHAR-001 / FIRSTCHAR-FIX-004 (D3):
@@ -1172,9 +1215,12 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded::<AudioChunk>(4);
         let record_start = Instant::now();
         // 3 pre-hotkey chunks — must be cleared
-        tx.send((record_start - Duration::from_millis(30), vec![0.1f32; 100])).unwrap();
-        tx.send((record_start - Duration::from_millis(20), vec![0.2f32; 100])).unwrap();
-        tx.send((record_start - Duration::from_millis(10), vec![0.3f32; 100])).unwrap();
+        tx.send((record_start - Duration::from_millis(30), vec![0.1f32; 100]))
+            .unwrap();
+        tx.send((record_start - Duration::from_millis(20), vec![0.2f32; 100]))
+            .unwrap();
+        tx.send((record_start - Duration::from_millis(10), vec![0.3f32; 100]))
+            .unwrap();
         let mut idle_cleared: usize = 0;
         let mut post_hotkey: Vec<Vec<f32>> = Vec::new();
         loop {
@@ -1192,7 +1238,10 @@ mod tests {
         }
         assert_eq!(idle_cleared, 3, "must clear all 3 pre-hotkey chunks");
         assert!(post_hotkey.is_empty(), "no post-hotkey chunks expected");
-        assert!(tx.try_send((Instant::now(), vec![0.4f32; 100])).is_ok(), "channel must have room after drain");
+        assert!(
+            tx.try_send((Instant::now(), vec![0.4f32; 100])).is_ok(),
+            "channel must have room after drain"
+        );
     }
 
     // ============================================================
@@ -1212,13 +1261,17 @@ mod tests {
     #[test]
     fn find_speech_anchor_finds_first_active_window() {
         let mut samples = vec![0.0f32; 12800]; // 800ms @ 16kHz
-        // Inject speech at sample 4000 (250ms in)
+                                               // Inject speech at sample 4000 (250ms in)
         for i in 4000..4160 {
             samples[i] = 0.1;
         }
         let anchor = find_speech_anchor(&samples, 0.01, 16000);
         // Energy onset is at 4000; backtrack 150ms@16kHz = 2400 samples → anchor = 1600
-        assert_eq!(anchor, 1600, "anchor should be onset(4000) - backtrack(2400) = 1600, got {}", anchor);
+        assert_eq!(
+            anchor, 1600,
+            "anchor should be onset(4000) - backtrack(2400) = 1600, got {}",
+            anchor
+        );
     }
 
     /// FIRSTCHAR-FIX-001/006: find_speech_anchor at very start returns 0 (can't backtrack further)
@@ -1227,7 +1280,10 @@ mod tests {
         let mut samples = vec![0.05f32; 1600]; // above threshold throughout
         samples[0] = 0.1;
         let anchor = find_speech_anchor(&samples, 0.01, 16000);
-        assert_eq!(anchor, 0, "speech at very start should anchor at 0 (saturating_sub)");
+        assert_eq!(
+            anchor, 0,
+            "speech at very start should anchor at 0 (saturating_sub)"
+        );
     }
 
     /// FIRSTCHAR-FIX-004 (D3): timestamp-based drain clears 120 pre-hotkey chunks
@@ -1238,11 +1294,16 @@ mod tests {
         let record_start = Instant::now();
         // 120 pre-hotkey chunks — all must be cleared
         for i in 0..120u32 {
-            tx.send((record_start - Duration::from_millis(1200 - i as u64), vec![i as f32; 100])).unwrap();
+            tx.send((
+                record_start - Duration::from_millis(1200 - i as u64),
+                vec![i as f32; 100],
+            ))
+            .unwrap();
         }
         // 2 post-hotkey chunks — must be preserved
         tx.send((record_start, vec![120.0f32; 100])).unwrap();
-        tx.send((record_start + Duration::from_millis(5), vec![121.0f32; 100])).unwrap();
+        tx.send((record_start + Duration::from_millis(5), vec![121.0f32; 100]))
+            .unwrap();
 
         let mut idle_cleared: usize = 0;
         let mut post_hotkey: Vec<Vec<f32>> = Vec::new();
@@ -1261,8 +1322,14 @@ mod tests {
         }
         assert_eq!(idle_cleared, 120, "must clear all 120 pre-hotkey chunks");
         assert_eq!(post_hotkey.len(), 2, "must preserve 2 post-hotkey chunks");
-        assert_eq!(post_hotkey[0][0], 120.0, "first post-hotkey chunk preserved");
-        assert_eq!(post_hotkey[1][0], 121.0, "second post-hotkey chunk preserved");
+        assert_eq!(
+            post_hotkey[0][0], 120.0,
+            "first post-hotkey chunk preserved"
+        );
+        assert_eq!(
+            post_hotkey[1][0], 121.0,
+            "second post-hotkey chunk preserved"
+        );
     }
 
     /// FIRSTCHAR-FIX-001: prime trim preserves beginning (speech anchor)
@@ -1285,8 +1352,10 @@ mod tests {
         let trimmed = &samples[start..end];
         assert_eq!(trimmed.len(), target, "trimmed length should equal target");
         // The speech onset (sample 0-799) should be preserved
-        assert!(trimmed.iter().take(800).any(|&s| s > 0.05),
-            "speech onset must be preserved in trimmed output");
+        assert!(
+            trimmed.iter().take(800).any(|&s| s > 0.05),
+            "speech onset must be preserved in trimmed output"
+        );
     }
 
     /// FIRSTCHAR-FIX-001 boundary: find_speech_anchor with buffer shorter than window
@@ -1294,8 +1363,11 @@ mod tests {
     fn find_speech_anchor_short_buffer_returns_zero() {
         // Buffer of 50 samples — shorter than any window (even 160 at 16kHz / 480 at 48kHz)
         let samples = vec![0.5f32; 50];
-        assert_eq!(find_speech_anchor(&samples, 0.01, 16000), 0,
-            "buffer shorter than window must return anchor 0");
+        assert_eq!(
+            find_speech_anchor(&samples, 0.01, 16000),
+            0,
+            "buffer shorter than window must return anchor 0"
+        );
     }
 
     /// FIRSTCHAR-FIX-001/006 boundary: find_speech_anchor exact window boundary
@@ -1307,7 +1379,10 @@ mod tests {
             samples[i] = 0.1;
         }
         let anchor = find_speech_anchor(&samples, 0.01, 16000);
-        assert_eq!(anchor, 0, "speech at window[0] must return anchor 0 (saturating_sub)");
+        assert_eq!(
+            anchor, 0,
+            "speech at window[0] must return anchor 0 (saturating_sub)"
+        );
     }
 
     /// FIRSTCHAR-FIX-001 boundary: find_speech_anchor entire buffer above threshold
@@ -1326,7 +1401,11 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded::<AudioChunk>(256);
         // 30 pre-hotkey chunks
         for i in 0..30u32 {
-            tx.send((record_start - Duration::from_millis(300 - i as u64), vec![i as f32; 100])).unwrap();
+            tx.send((
+                record_start - Duration::from_millis(300 - i as u64),
+                vec![i as f32; 100],
+            ))
+            .unwrap();
         }
         let mut idle_cleared: usize = 0;
         let mut post_hotkey: Vec<Vec<f32>> = Vec::new();
@@ -1453,7 +1532,8 @@ mod tests {
         assert!(
             aa_max < linear_max,
             "AA output peak ({:.3}) should be less than linear ({:.3}) due to alias suppression",
-            aa_max, linear_max
+            aa_max,
+            linear_max
         );
     }
 
@@ -1468,7 +1548,9 @@ mod tests {
             assert!(
                 (a - b).abs() < 1e-6,
                 "passthrough sample {} mismatch: {} vs {}",
-                i, a, b
+                i,
+                a,
+                b
             );
         }
     }
@@ -1479,12 +1561,20 @@ mod tests {
         // 48000 → 16000 is 3:1 ratio
         let input: Vec<f32> = vec![0.0; 4800]; // 100ms at 48kHz
         let output = resample_anti_alias(&input, 48000, 16000);
-        assert_eq!(output.len(), 1600, "48→16kHz of 4800 samples should yield 1600");
+        assert_eq!(
+            output.len(),
+            1600,
+            "48→16kHz of 4800 samples should yield 1600"
+        );
 
         // 16000 → 16000 identity
         let input2: Vec<f32> = vec![0.0; 1600];
         let output2 = resample_anti_alias(&input2, 16000, 16000);
-        assert_eq!(output2.len(), 1600, "16→16kHz passthrough should yield same length");
+        assert_eq!(
+            output2.len(),
+            1600,
+            "16→16kHz passthrough should yield same length"
+        );
     }
 
     /// Verify that the windowed-sinc filter actually attenuates content
@@ -1539,7 +1629,11 @@ mod tests {
         }
         let anchor_48k = find_speech_anchor(&samples, 0.01, 48000);
         // Onset at 14400, backtrack 7200 → anchor = 7200
-        assert_eq!(anchor_48k, 7200, "48kHz: onset(14400) - backtrack(7200) = 7200, got {}", anchor_48k);
+        assert_eq!(
+            anchor_48k, 7200,
+            "48kHz: onset(14400) - backtrack(7200) = 7200, got {}",
+            anchor_48k
+        );
 
         // At 16kHz: backtrack = 150ms = 2400 samples
         // Create same-duration signal with speech at sample 4800 (= 300ms)
@@ -1549,7 +1643,11 @@ mod tests {
         }
         let anchor_16k = find_speech_anchor(&samples_16k, 0.01, 16000);
         // Onset at 4800, backtrack 2400 → anchor = 2400
-        assert_eq!(anchor_16k, 2400, "16kHz: onset(4800) - backtrack(2400) = 2400, got {}", anchor_16k);
+        assert_eq!(
+            anchor_16k, 2400,
+            "16kHz: onset(4800) - backtrack(2400) = 2400, got {}",
+            anchor_16k
+        );
     }
 
     /// Verify that max_frames uses sample_rate correctly (not hardcoded 16000).
@@ -1576,7 +1674,7 @@ mod tests {
     #[test]
     fn find_speech_anchor_backtrack_includes_aspirated_consonant() {
         let mut samples = vec![0.0f32; 12800]; // 800ms @ 16kHz
-        // Weak breath (aspirated /pʰ/) at sample 2400–4800 (150ms very low energy)
+                                               // Weak breath (aspirated /pʰ/) at sample 2400–4800 (150ms very low energy)
         for i in 2400..4800 {
             samples[i] = 0.003; // below threshold 0.01
         }
@@ -1587,20 +1685,25 @@ mod tests {
         let anchor = find_speech_anchor(&samples, 0.01, 16000);
         // Energy onset at 4800, backtrack 2400 → anchor = 2400
         // This includes the weak breath that was below threshold
-        assert!(anchor <= 2400,
+        assert!(
+            anchor <= 2400,
             "anchor must include weak aspirated consonant, got {} (consonant starts at 2400)",
-            anchor);
+            anchor
+        );
     }
 
     /// R2: find_speech_anchor saturates to 0 when onset < backtrack margin
     #[test]
     fn find_speech_anchor_backtrack_saturates_at_zero() {
         let mut samples = vec![0.0f32; 6400]; // 400ms @ 16kHz
-        // Speech at sample 1600 (100ms), backtrack 2400 would go below 0
+                                              // Speech at sample 1600 (100ms), backtrack 2400 would go below 0
         for i in 1600..3200 {
             samples[i] = 0.1;
         }
         let anchor = find_speech_anchor(&samples, 0.01, 16000);
-        assert_eq!(anchor, 0, "backtrack saturating_sub must return 0 when onset < margin");
+        assert_eq!(
+            anchor, 0,
+            "backtrack saturating_sub must return 0 when onset < margin"
+        );
     }
 }

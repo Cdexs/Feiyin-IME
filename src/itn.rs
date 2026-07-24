@@ -142,6 +142,10 @@ struct Protect {
     function_words: ProtectList,
     #[serde(default)]
     classifiers: ProtectList,
+    /// ITN-SMART-002: 含数字的历史/文化/民俗词汇（"五代十国""三皇五帝"等）。
+    /// 与 proper_nouns 功能相同（整词保护不转），独立分组便于维护与注释。
+    #[serde(default)]
+    historical: ProtectList,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -171,6 +175,8 @@ struct CompiledRules {
     convert_single_digit_with_classifier: bool,
     below_zero_style: String,
     large_amount_keep_wan_yi: bool,
+    /// ITN-SMART-002: 含数字的历史/文化/民俗词汇保护集
+    historical_set: HashSet<String>,
 }
 
 impl CompiledRules {
@@ -215,6 +221,7 @@ impl CompiledRules {
             convert_single_digit_with_classifier: r.switches.convert_single_digit_with_classifier,
             below_zero_style: r.switches.below_zero_style,
             large_amount_keep_wan_yi: r.switches.large_amount_keep_wan_yi,
+            historical_set: r.protect.historical.words.iter().cloned().collect(),
         }
     }
 
@@ -242,6 +249,18 @@ impl CompiledRules {
             }
         }
         best
+    }
+
+    /// TEMP-CELSIUS-001: 查找最长匹配的单位词，返回 (字符长度, 单位词原文)。
+    /// 供调用方判定是否含"摄氏"关键词触发 °C 符号替换。
+    fn match_unit_word<'a>(&self, chars: &'a [char], pos: usize) -> Option<(usize, String)> {
+        if pos >= chars.len() {
+            return None;
+        }
+        let rest: String = chars[pos..].iter().collect();
+        let len = self.match_unit_len(&rest)?;
+        let word: String = chars[pos..pos + len].iter().collect();
+        Some((len, word))
     }
 
     /// 查找最长匹配的日期后缀长度
@@ -327,14 +346,27 @@ fn compile_rules_from_content(content: &str) -> CompiledRules {
 // ============================================================
 
 const DIGIT_MAP: &[(&str, char)] = &[
-    ("零", '0'), ("〇", '0'), ("一", '1'), ("幺", '1'), ("二", '2'),
-    ("两", '2'), ("三", '3'), ("四", '4'), ("五", '5'),
-    ("六", '6'), ("七", '7'), ("八", '8'), ("九", '9'),
+    ("零", '0'),
+    ("〇", '0'),
+    ("一", '1'),
+    ("幺", '1'),
+    ("二", '2'),
+    ("两", '2'),
+    ("三", '3'),
+    ("四", '4'),
+    ("五", '5'),
+    ("六", '6'),
+    ("七", '7'),
+    ("八", '8'),
+    ("九", '9'),
 ];
 
 const UNIT_MAP: &[(&str, u64)] = &[
-    ("十", 10), ("百", 100), ("千", 1000),
-    ("万", 10000), ("亿", 100000000),
+    ("十", 10),
+    ("百", 100),
+    ("千", 1000),
+    ("万", 10000),
+    ("亿", 100000000),
 ];
 
 fn is_digit_char(ch: char) -> bool {
@@ -370,7 +402,11 @@ fn is_cn_unit_char(ch: char) -> bool {
 /// 支持进位组合（三百二十五 = 325）、小数点（三点一四 = 3.14）、逐位串（幺三八 = 138）
 /// rules = Some(r) 时启用 large_amount_keep_wan_yi 检查：万/亿后紧跟单位时不消费万/亿
 /// 返回 (数字字符串, 消费字符数)
-fn parse_cn_number(chars: &[char], start: usize, rules: Option<&CompiledRules>) -> Option<(String, usize)> {
+fn parse_cn_number(
+    chars: &[char],
+    start: usize,
+    rules: Option<&CompiledRules>,
+) -> Option<(String, usize)> {
     if start >= chars.len() {
         return None;
     }
@@ -493,8 +529,7 @@ fn parse_cn_number(chars: &[char], start: usize, rules: Option<&CompiledRules>) 
                         {
                             break;
                         }
-                        let consumed_text: String =
-                            chars[after_point..after_num].iter().collect();
+                        let consumed_text: String = chars[after_point..after_num].iter().collect();
                         if consumed_text.contains('十')
                             || consumed_text.contains('百')
                             || consumed_text.contains('千')
@@ -513,9 +548,7 @@ fn parse_cn_number(chars: &[char], start: usize, rules: Option<&CompiledRules>) 
                     }
                 }
                 // 点后无数字 → 不是小数点（句尾或时间单位）
-                if idx + 1 >= chars.len()
-                    || chinese_digit_char(chars[idx + 1]).is_none()
-                {
+                if idx + 1 >= chars.len() || chinese_digit_char(chars[idx + 1]).is_none() {
                     break;
                 }
                 section += digit;
@@ -559,7 +592,9 @@ fn parse_cn_number(chars: &[char], start: usize, rules: Option<&CompiledRules>) 
 
     // 检查是否解析到了有效数字
     if result == 0 {
-        let zero_count = (start..idx).filter(|&k| chars[k] == '零' || chars[k] == '〇').count();
+        let zero_count = (start..idx)
+            .filter(|&k| chars[k] == '零' || chars[k] == '〇')
+            .count();
         if zero_count > 0 {
             let zeros: String = (0..zero_count).map(|_| '0').collect();
             return Some((zeros, idx - start));
@@ -679,7 +714,9 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
                 if consumed > 0 {
                     // 检查后面是否有时间后缀
                     let after_num = after + consumed;
-                    if after_num < chars.len() && r.is_date_suffix(&chars[after_num..].iter().collect::<String>()) {
+                    if after_num < chars.len()
+                        && r.is_date_suffix(&chars[after_num..].iter().collect::<String>())
+                    {
                         for ch in &chars[i..after] {
                             result.push(*ch);
                         }
@@ -717,6 +754,15 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
                             }
                             result.push_str(&num_str);
                         }
+                        // TEMP-CELSIUS-001: 摄氏关键词 → 输出 °C 符号
+                        // 与 below_zero_style 联动（minus→"-10°C"，text→"零下10°C"）
+                        if let Some((unit_len, unit_word)) = r.match_unit_word(&chars, after_num) {
+                            if unit_word.contains("摄氏") {
+                                result.push_str("°C");
+                                i = after_num + unit_len;
+                                continue;
+                            }
+                        }
                         i = after + consumed;
                         continue;
                     }
@@ -743,12 +789,21 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
                     };
 
                     // 判定语境
-                    let should_convert = decide_conversion(
-                        &num_str, consumed, &chars, i, after_num, &after_str, r,
-                    );
+                    let should_convert =
+                        decide_conversion(&num_str, consumed, &chars, i, after_num, &after_str, r);
 
                     if should_convert {
                         result.push_str(&num_str);
+                        // TEMP-CELSIUS-001: 摄氏关键词 → 输出 °C 符号
+                        // 仅当匹配单位词含"摄氏"时替换（"三十摄氏度"→"30°C"，
+                        // "三十度"→"30度" 不变）。after_num 处即单位起点。
+                        if let Some((unit_len, unit_word)) = r.match_unit_word(&chars, after_num) {
+                            if unit_word.contains("摄氏") {
+                                result.push_str("°C");
+                                i = after_num + unit_len;
+                                continue;
+                            }
+                        }
                         i = after_num;
                         continue;
                     }
@@ -765,8 +820,10 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
 }
 
 /// 判定是否应该转换
+/// ITN-SMART-002: `num_str` 不再用于位数判定（改用 consumed 源汉字数），
+/// 保留参数以维持调用签名稳定，便于未来扩展（如逐位串特殊处理）。
 fn decide_conversion(
-    num_str: &str,
+    _num_str: &str,
     consumed: usize,
     chars: &[char],
     start: usize,
@@ -786,18 +843,30 @@ fn decide_conversion(
     // (已在前面处理)
 
     // 数字长度 > 1（多位数）→ 转
-    let digit_count = num_str.chars().filter(|c| c.is_ascii_digit()).count();
-    if digit_count >= 2 {
+    // ITN-SMART-002: 改用源汉字消耗数（consumed）而非输出位数
+    // （num_str digit_count）。原实现用输出位数会让单字"十"→"10"（两位输出）
+    // 误判为多位数，绕过下方单字保护，导致"五代十国"→"五代10国"。
+    // consumed 统计的是源文本被 parse_cn_number 吃掉的汉字数：
+    //   "十"        → consumed=1（单字，走单字保护路径）
+    //   "二十五"    → consumed=2（多位，转）
+    //   "三百二"    → consumed=3（多位，转）
+    //   "幺三八"    → consumed=3（逐位串，转）
+    // 符合 DEC-030"单字数字无单位语境保留汉字"原则。
+    if consumed >= 2 {
         return true;
     }
 
     // 单字数字：检查后面是否是通用量词
-    if digit_count == 1 {
+    if consumed == 1 {
         if r.convert_single_digit_with_classifier {
             return true;
         }
         // 检查是否跟通用量词 → 不转
-        if let Some(cls) = r.classifier_set.iter().find(|c| after_str.starts_with(c.as_str())) {
+        if let Some(cls) = r
+            .classifier_set
+            .iter()
+            .find(|c| after_str.starts_with(c.as_str()))
+        {
             let _ = cls;
             return false; // 保留"三个人"
         }
@@ -833,6 +902,13 @@ fn check_protection(chars: &[char], start: usize, r: &CompiledRules) -> Option<u
         }
     }
 
+    // ITN-SMART-002: 历史/文化/民俗词汇（"五代十国"等）
+    for hist in &r.historical_set {
+        if rest.starts_with(hist.as_str()) {
+            return Some(hist.chars().count());
+        }
+    }
+
     // 虚词"一"的搭配
     for fw in &r.function_word_set {
         if rest.starts_with(fw.as_str()) {
@@ -844,7 +920,11 @@ fn check_protection(chars: &[char], start: usize, r: &CompiledRules) -> Option<u
 }
 
 /// 尝试解析分数 "X分之Y"（中文：Y 为分子，X 为分母。如"三分之一"=1/3）
-fn try_parse_fraction(chars: &[char], start: usize, r: &CompiledRules) -> Option<(String, String, usize)> {
+fn try_parse_fraction(
+    chars: &[char],
+    start: usize,
+    r: &CompiledRules,
+) -> Option<(String, String, usize)> {
     let pattern_chars: Vec<char> = r.fraction_pattern.chars().collect();
 
     // 先找 "分之" 的位置
@@ -859,7 +939,8 @@ fn try_parse_fraction(chars: &[char], start: usize, r: &CompiledRules) -> Option
             if let Some((denom_val, d_consumed)) = parse_cn_number(denom_chars, 0, Some(r)) {
                 if d_consumed == denom_chars.len() {
                     let num_start = pos + pattern_chars.len();
-                    if let Some((num_val, n_consumed)) = parse_cn_number(chars, num_start, Some(r)) {
+                    if let Some((num_val, n_consumed)) = parse_cn_number(chars, num_start, Some(r))
+                    {
                         if n_consumed > 0 {
                             let total = num_start + n_consumed - start;
                             return Some((num_val, denom_val, total));
@@ -1072,6 +1153,171 @@ mod tests {
     #[test]
     fn unit_below_zero_text() {
         assert_eq!(normalize_test("零下十度"), "零下10度");
+    }
+
+    // ============================================================
+    // ITN-SMART-002: 单字 十/百/千 无语境保留（算法根治验证）
+    // ============================================================
+
+    #[test]
+    fn itn_smart_002_single_shi_no_context_preserved() {
+        // "十" 单字无单位/日期/序数语境 → 保留（原实现会误转"10"）
+        assert_eq!(normalize_test("十"), "十");
+    }
+
+    #[test]
+    fn itn_smart_002_single_bai_no_context_preserved() {
+        assert_eq!(normalize_test("百"), "百");
+    }
+
+    #[test]
+    fn itn_smart_002_single_qian_no_context_preserved() {
+        assert_eq!(normalize_test("千"), "千");
+    }
+
+    #[test]
+    fn itn_smart_002_single_shi_with_unit_converts() {
+        // "十元" 有货币单位 → 转
+        assert_eq!(normalize_test("十元"), "10元");
+    }
+
+    #[test]
+    fn itn_smart_002_single_shi_with_date_suffix_converts() {
+        // "十点" 有日期后缀 → 转
+        assert_eq!(normalize_test("十点"), "10点");
+    }
+
+    #[test]
+    fn itn_smart_002_single_shi_with_classifier_preserved() {
+        // "十个人" 单字+量词，开关 false → 保留
+        assert_eq!(normalize_test("十个人"), "十个人");
+    }
+
+    #[test]
+    fn itn_smart_002_multi_digit_still_converts() {
+        // "二十五""十五""三百二" consumed≥2 → 转
+        assert_eq!(normalize_test("二十五"), "25");
+        assert_eq!(normalize_test("十五"), "15");
+        assert_eq!(normalize_test("三百二"), "302");
+    }
+
+    #[test]
+    fn itn_smart_002_multi_digit_with_unit_unchanged() {
+        assert_eq!(normalize_test("二十五块"), "25块");
+    }
+
+    // ============================================================
+    // ITN-SMART-002: 历史/文化/民俗词汇保护
+    // ============================================================
+
+    #[test]
+    fn itn_smart_002_wudai_shiguo_preserved() {
+        // Gavin 端测 bug 原 case："五代十国"→"五代10国"
+        assert_eq!(normalize_test("五代十国"), "五代十国");
+    }
+
+    #[test]
+    fn itn_smart_002_wudai_shiguo_in_sentence() {
+        assert_eq!(
+            normalize_test("历史上五代十国时期战乱频仍"),
+            "历史上五代十国时期战乱频仍"
+        );
+    }
+
+    #[test]
+    fn itn_smart_002_sanhuang_wudi_preserved() {
+        assert_eq!(normalize_test("三皇五帝"), "三皇五帝");
+    }
+
+    #[test]
+    fn itn_smart_002_wuhu_shiliuguo_preserved() {
+        assert_eq!(normalize_test("五胡十六国"), "五胡十六国");
+    }
+
+    #[test]
+    fn itn_smart_002_sanshiliuji_preserved() {
+        assert_eq!(normalize_test("三十六计"), "三十六计");
+    }
+
+    #[test]
+    fn itn_smart_002_ershisi_jieqi_preserved() {
+        assert_eq!(normalize_test("二十四节气"), "二十四节气");
+    }
+
+    #[test]
+    fn itn_smart_002_sishu_wujing_preserved() {
+        assert_eq!(normalize_test("四书五经"), "四书五经");
+    }
+
+    #[test]
+    fn itn_smart_002_historical_rules_file_loaded() {
+        // 验证 historical 分组从 itn-rules.toml 正确加载
+        let r = rules();
+        assert!(r.historical_set.contains("五代十国"));
+        assert!(r.historical_set.contains("三皇五帝"));
+        assert!(r.historical_set.contains("二十四节气"));
+        assert!(r.historical_set.contains("四书五经"));
+    }
+
+    #[test]
+    fn itn_smart_002_historical_in_mixed_sentence() {
+        // 混合句：历史词保护 + 普通数字仍转
+        assert_eq!(
+            normalize_test("他研究五代十国历史，写了三百五十页"),
+            "他研究五代十国历史，写了350页"
+        );
+    }
+
+    // ============================================================
+    // TEMP-CELSIUS-001: 摄氏度符号 °C（仅"摄氏"关键词触发）
+    // ============================================================
+
+    #[test]
+    fn temp_celsius_basic() {
+        // "三十摄氏度" → "30°C"
+        assert_eq!(normalize_test("三十摄氏度"), "30°C");
+    }
+
+    #[test]
+    fn temp_celsius_in_sentence() {
+        // "今天三十摄氏度" → "今天30°C"
+        assert_eq!(normalize_test("今天三十摄氏度"), "今天30°C");
+    }
+
+    #[test]
+    fn temp_bare_degree_not_converted() {
+        // 裸"度"不转 °C（避免误判角度等其他语境）
+        assert_eq!(normalize_test("今天三十度"), "今天30度");
+    }
+
+    #[test]
+    fn temp_celsius_below_zero_text_style() {
+        // "零下十摄氏度" + text 风格 → "零下10°C"
+        assert_eq!(normalize_test("零下十摄氏度"), "零下10°C");
+    }
+
+    #[test]
+    fn temp_celsius_below_zero_minus_style() {
+        let custom = r#"
+[switches]
+below_zero_style = "minus"
+[units.temperature]
+words = ["度", "摄氏度"]
+"#;
+        // "零下十摄氏度" + minus 风格 → "-10°C"
+        assert_eq!(normalize_with(custom, "零下十摄氏度"), "-10°C");
+    }
+
+    #[test]
+    fn temp_bare_degree_below_zero_unchanged() {
+        // "零下十度" 仍为"零下10度"，不受摄氏逻辑影响
+        assert_eq!(normalize_test("零下十度"), "零下10度");
+    }
+
+    #[test]
+    fn temp_celsius_single_digit() {
+        // "五摄氏度" → "5°C"（单字+温度单位 → 转）
+        assert_eq!(normalize_test("五摄氏度"), "5°C");
     }
 
     // ============================================================

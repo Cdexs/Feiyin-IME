@@ -409,7 +409,10 @@ mod tests {
         let audio: Vec<f32> = (0..770400).map(|i| i as f32).collect();
         let raw = vec![(812992, 16000)]; // start 越界
         let result = build_padded_segments(&raw, 770400, &audio);
-        assert!(result.is_empty(), "out-of-range start segment must be dropped, not panic");
+        assert!(
+            result.is_empty(),
+            "out-of-range start segment must be dropped, not panic"
+        );
     }
 
     #[test]
@@ -436,7 +439,11 @@ mod tests {
         let audio: Vec<f32> = (0..50000).map(|i| i as f32).collect();
         let raw = vec![(0, 16000), (60000, 16000)]; // 第二段 start 越界
         let result = build_padded_segments(&raw, 50000, &audio);
-        assert_eq!(result.len(), 1, "only in-range segment kept, out-of-range dropped");
+        assert_eq!(
+            result.len(),
+            1,
+            "only in-range segment kept, out-of-range dropped"
+        );
     }
 
     #[test]
@@ -454,7 +461,10 @@ mod tests {
         let audio: Vec<f32> = vec![0.0; 1000];
         let raw = vec![(500, 0), (1000, 100)]; // 0 长 + 边界
         let result = build_padded_segments(&raw, 1000, &audio);
-        assert!(result.is_empty(), "zero-length and boundary segments skipped");
+        assert!(
+            result.is_empty(),
+            "zero-length and boundary segments skipped"
+        );
     }
 
     #[test]
@@ -468,7 +478,10 @@ mod tests {
         let segmenter = match VadSegmenter::try_new(&model_dir) {
             Some(s) => s,
             None => {
-                eprintln!("skip: silero_vad.onnx not found at {}, VAD model required", model_dir.display());
+                eprintln!(
+                    "skip: silero_vad.onnx not found at {}, VAD model required",
+                    model_dir.display()
+                );
                 return;
             }
         };
@@ -605,9 +618,7 @@ mod tests {
             .unwrap_or_else(|| panic!("VAD model should be present at {}", model_dir.display()));
 
         // 读取 long_30s/60s/90s.wav（需提前用 target/long_audio_test 脚本生成）
-        let test_dir = project_root
-            .join("target")
-            .join("long_audio_test");
+        let test_dir = project_root.join("target").join("long_audio_test");
 
         for secs in [30, 60, 90] {
             let wav_path = test_dir.join(format!("long_{}s.wav", secs));

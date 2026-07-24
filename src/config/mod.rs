@@ -274,6 +274,40 @@ pub struct AppConfig {
     pub translation: TranslationConfig,
     #[serde(default)]
     pub punctuation: PunctuationConfig,
+    /// SCENE-SENSE-001-CORE (DEC-031-⑤): 场景感知配置。
+    /// 纯本地采集（进程名+窗口标题），默认开启；未命中安全降级 Unknown。
+    /// send_window_title 控制窗口标题是否上送 LLM（隐私敏感，默认关）。
+    /// 字段定义与 src-tauri/src/config.rs 的 SceneConfig 保持一致。
+    #[serde(default)]
+    pub scene: SceneConfig,
+}
+
+/// SCENE-SENSE-001-CORE (DEC-031-⑤): 场景感知配置。
+/// 纯本地采集（进程名+窗口标题），默认开启；未命中安全降级 Unknown。
+/// send_window_title 控制窗口标题是否上送 LLM（隐私敏感，默认关）。
+/// 与 src-tauri/src/config.rs 的 SceneConfig 字段保持一致。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SceneConfig {
+    /// 场景感知总开关。false 时完全走 Phase 1 现状路径（含 flatten），零行为变化。
+    #[serde(default = "default_scene_enabled")]
+    pub enabled: bool,
+    /// 窗口标题上送 LLM（隐私敏感，默认关）。
+    /// true 时 F4 段可含截断标题（上限 50 字符）以提升场景判断。
+    #[serde(default)]
+    pub send_window_title: bool,
+}
+
+fn default_scene_enabled() -> bool {
+    true
+}
+
+impl Default for SceneConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_scene_enabled(),
+            send_window_title: false,
+        }
+    }
 }
 
 impl Default for AppConfig {
@@ -288,6 +322,7 @@ impl Default for AppConfig {
             auto_start: false,
             translation: TranslationConfig::default(),
             punctuation: PunctuationConfig::default(),
+            scene: SceneConfig::default(),
         }
     }
 }
@@ -328,6 +363,20 @@ impl AppConfig {
         cfg.llm.system_prompt_en = None;
         if cfg.auto_learn_threshold == 0 {
             cfg.auto_learn_threshold = default_auto_learn_threshold();
+        }
+
+        // ASR-HIDE-ACCURACY-001-CORE: 存量 accuracy 配置静默迁移为 performance。
+        // 背景：UI 已隐藏 accuracy 下拉选项，存量用户配置若仍是 accuracy 会致下拉空白+后台跑 accuracy 不一致。
+        // 迁移：load 时检测到 asr_model=="accuracy" 静默改写为 "performance" 并落盘保存。
+        if cfg.audio.asr_model == "accuracy" {
+            log::info!(
+                "ASR-HIDE-ACCURACY-001: migrating legacy asr_model='accuracy' -> 'performance'"
+            );
+            cfg.audio.asr_model = "performance".to_string();
+            // 落盘保存迁移后的配置（避免下次启动重复迁移 + UI 与后台一致）
+            if let Err(e) = cfg.save() {
+                log::warn!("ASR-HIDE-ACCURACY-001: failed to persist migrated config: {}", e);
+            }
         }
 
         Ok(cfg)
@@ -376,6 +425,19 @@ impl AppConfig {
         cfg.llm.system_prompt_en = None;
         if cfg.auto_learn_threshold == 0 {
             cfg.auto_learn_threshold = default_auto_learn_threshold();
+        }
+
+        // ASR-HIDE-ACCURACY-001-CORE: 存量 accuracy 配置静默迁移为 performance（load_from 同 load）。
+        let migrated_from_accuracy = cfg.audio.asr_model == "accuracy";
+        if migrated_from_accuracy {
+            log::info!(
+                "ASR-HIDE-ACCURACY-001: migrating legacy asr_model='accuracy' -> 'performance' (load_from)"
+            );
+            cfg.audio.asr_model = "performance".to_string();
+            // 落盘保存迁移后的配置（与 load 保持一致）
+            if let Err(e) = cfg.save_to(path) {
+                log::warn!("ASR-HIDE-ACCURACY-001: failed to persist migrated config: {}", e);
+            }
         }
 
         Ok(cfg)
@@ -605,7 +667,8 @@ clipboard_delay_ms = 150
         let mut cfg = AppConfig::default();
         cfg.ui_language = UiLanguage::TraditionalChinese;
 
-        cfg.save_to(&env.config_path()).expect("save should succeed");
+        cfg.save_to(&env.config_path())
+            .expect("save should succeed");
         let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
 
         assert_eq!(loaded.ui_language, UiLanguage::TraditionalChinese);
@@ -731,14 +794,20 @@ clipboard_delay_ms = 150
     #[test]
     fn punctuation_config_default_enabled() {
         let cfg = PunctuationConfig::default();
-        assert!(cfg.enabled, "PunctuationConfig should be enabled by default");
+        assert!(
+            cfg.enabled,
+            "PunctuationConfig should be enabled by default"
+        );
     }
 
     /// PUNCT-CONFIG-002: AppConfig 默认包含 PunctuationConfig
     #[test]
     fn app_config_default_includes_punctuation() {
         let cfg = AppConfig::default();
-        assert!(cfg.punctuation.enabled, "AppConfig default should have punctuation enabled");
+        assert!(
+            cfg.punctuation.enabled,
+            "AppConfig default should have punctuation enabled"
+        );
     }
 
     /// PUNCT-CONFIG-003: PunctuationConfig save/load 往返正确
@@ -754,7 +823,10 @@ clipboard_delay_ms = 150
             .expect("save should succeed");
         let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
 
-        assert!(!loaded.punctuation.enabled, "disabled punctuation should survive roundtrip");
+        assert!(
+            !loaded.punctuation.enabled,
+            "disabled punctuation should survive roundtrip"
+        );
     }
 
     /// PUNCT-CONFIG-004: 旧 config.toml（无 punctuation 字段）加载时使用默认值 enabled=true
@@ -795,7 +867,10 @@ clipboard_delay_ms = 150
 "#;
         std::fs::write(&env.config_path(), old_toml).unwrap();
         let loaded = AppConfig::load_from(&env.config_path()).expect("should load old config");
-        assert!(loaded.punctuation.enabled, "missing punctuation field should default to true");
+        assert!(
+            loaded.punctuation.enabled,
+            "missing punctuation field should default to true"
+        );
     }
 
     /// PUNCT-CONFIG-005: PunctuationConfig 显式 enabled=true 可正常序列化
@@ -807,9 +882,13 @@ clipboard_delay_ms = 150
         let mut cfg = AppConfig::default();
         cfg.punctuation.enabled = true;
 
-        cfg.save_to(&env.config_path()).expect("save should succeed");
+        cfg.save_to(&env.config_path())
+            .expect("save should succeed");
         let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
-        assert!(loaded.punctuation.enabled, "explicit true should survive roundtrip");
+        assert!(
+            loaded.punctuation.enabled,
+            "explicit true should survive roundtrip"
+        );
     }
 
     // ============================================================
@@ -872,20 +951,65 @@ clipboard_delay_ms = 150
         );
     }
 
-    /// ASR-CONFIG-003: asr_model="accuracy" 可正确序列化/反序列化
+    /// ASR-HIDE-ACCURACY-001-CORE: 存量 accuracy 配置加载时静默迁移为 performance
+    /// 原断言"accuracy 原样往返保留"方向是错的（UI 已隐藏 accuracy，存量配置应迁移）。
     #[test]
-    fn asr_model_accuracy_roundtrip() {
+    fn asr_model_accuracy_migrates_to_performance() {
         let _guard = TEST_MUTEX.lock().unwrap();
         let env = TestEnv::new();
 
         let mut cfg = AppConfig::default();
         cfg.audio.asr_model = "accuracy".to_string();
 
-        cfg.save_to(&env.config_path()).expect("save should succeed");
+        cfg.save_to(&env.config_path())
+            .expect("save should succeed");
+        let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
+        // 迁移后应是 performance（不是 accuracy）
+        assert_eq!(
+            loaded.audio.asr_model, "performance",
+            "ASR-HIDE-ACCURACY-001: legacy 'accuracy' must migrate to 'performance' on load"
+        );
+        // 落盘后再次加载应保持 performance（不重复迁移）
+        let reloaded = AppConfig::load_from(&env.config_path()).expect("reload should succeed");
+        assert_eq!(
+            reloaded.audio.asr_model, "performance",
+            "migrated config should persist 'performance' on disk"
+        );
+    }
+
+    /// ASR-HIDE-ACCURACY-001-CORE: performance 值零回归（不受迁移影响）
+    #[test]
+    fn asr_model_performance_unchanged_by_migration() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        let mut cfg = AppConfig::default();
+        cfg.audio.asr_model = "performance".to_string();
+
+        cfg.save_to(&env.config_path())
+            .expect("save should succeed");
         let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
         assert_eq!(
-            loaded.audio.asr_model, "accuracy",
-            "accuracy setting should survive roundtrip"
+            loaded.audio.asr_model, "performance",
+            "performance must be unchanged by accuracy migration logic"
+        );
+    }
+
+    /// ASR-HIDE-ACCURACY-001-CORE: qwen3_online 值零回归（不受迁移影响）
+    #[test]
+    fn asr_model_qwen3_online_unchanged_by_migration() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        let mut cfg = AppConfig::default();
+        cfg.audio.asr_model = "qwen3_online".to_string();
+
+        cfg.save_to(&env.config_path())
+            .expect("save should succeed");
+        let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
+        assert_eq!(
+            loaded.audio.asr_model, "qwen3_online",
+            "qwen3_online must be unchanged by accuracy migration logic"
         );
     }
 
@@ -900,18 +1024,20 @@ clipboard_delay_ms = 150
         let env = TestEnv::new();
 
         let cfg = AppConfig::default();
-        cfg.save_to(&env.config_path()).expect("save should succeed");
+        cfg.save_to(&env.config_path())
+            .expect("save should succeed");
         let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
 
-        assert_eq!(loaded.audio.qwen3_api_key, "", "qwen3_api_key default should be empty");
         assert_eq!(
-            loaded.audio.qwen3_asr_url,
-            "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+            loaded.audio.qwen3_api_key, "",
+            "qwen3_api_key default should be empty"
+        );
+        assert_eq!(
+            loaded.audio.qwen3_asr_url, "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
             "qwen3_asr_url default should match config/mod.rs"
         );
         assert_eq!(
-            loaded.audio.qwen3_asr_model,
-            "qwen3-asr-flash-realtime",
+            loaded.audio.qwen3_asr_model, "qwen3-asr-flash-realtime",
             "qwen3_asr_model default should match config/mod.rs"
         );
     }
@@ -925,7 +1051,8 @@ clipboard_delay_ms = 150
         let mut cfg = AppConfig::default();
         cfg.audio.qwen3_api_key = "sk-test-key-123456".to_string();
 
-        cfg.save_to(&env.config_path()).expect("save should succeed");
+        cfg.save_to(&env.config_path())
+            .expect("save should succeed");
         let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
         assert_eq!(
             loaded.audio.qwen3_api_key, "sk-test-key-123456",
@@ -974,15 +1101,16 @@ clipboard_delay_ms = 150
 "#;
         std::fs::write(&env.config_path(), old_toml).unwrap();
         let loaded = AppConfig::load_from(&env.config_path()).expect("should load old config");
-        assert_eq!(loaded.audio.qwen3_api_key, "", "missing qwen3_api_key should default to empty");
         assert_eq!(
-            loaded.audio.qwen3_asr_url,
-            "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+            loaded.audio.qwen3_api_key, "",
+            "missing qwen3_api_key should default to empty"
+        );
+        assert_eq!(
+            loaded.audio.qwen3_asr_url, "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
             "missing qwen3_asr_url should default to config/mod.rs"
         );
         assert_eq!(
-            loaded.audio.qwen3_asr_model,
-            "qwen3-asr-flash-realtime",
+            loaded.audio.qwen3_asr_model, "qwen3-asr-flash-realtime",
             "missing qwen3_asr_model should default to config/mod.rs"
         );
     }
@@ -996,7 +1124,8 @@ clipboard_delay_ms = 150
         let mut cfg = AppConfig::default();
         cfg.audio.qwen3_asr_url = "wss://custom.example.com/realtime".to_string();
 
-        cfg.save_to(&env.config_path()).expect("save should succeed");
+        cfg.save_to(&env.config_path())
+            .expect("save should succeed");
         let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
         assert_eq!(
             loaded.audio.qwen3_asr_url, "wss://custom.example.com/realtime",
@@ -1013,7 +1142,8 @@ clipboard_delay_ms = 150
         let mut cfg = AppConfig::default();
         cfg.audio.qwen3_asr_model = "qwen3-asr-flash-demo".to_string();
 
-        cfg.save_to(&env.config_path()).expect("save should succeed");
+        cfg.save_to(&env.config_path())
+            .expect("save should succeed");
         let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
         assert_eq!(
             loaded.audio.qwen3_asr_model, "qwen3-asr-flash-demo",

@@ -1,0 +1,275 @@
+# scene-rules.toml — SCENE-SENSE-001-CORE 场景感知规则配置
+#
+# 本文件是场景分类的规则数据，与 src/scene/mod.rs 算法分离。
+# 内置默认通过 include_str! 嵌入同一份文件；运行时 exe 同级存在则覆盖。
+# Gavin 可手动编辑此文件调整规则，无需改代码。
+#
+# 匹配优先级：exe 精确匹配（不区分大小写）→ 标题关键词 → Unknown。
+# Unknown = 不注入 F4 场景段，multiline_safe 按 false 保守处理（等同 Phase 1）。
+#
+# 字段说明：
+#   kind          = 场景类别（chat/email/ide_terminal/doc/browser）
+#   exe           = 进程 exe 名列表（不区分大小写精确匹配）
+#   title_keywords= 窗口标题关键词（兜底匹配，主要用于浏览器场景细分）
+#   style         = 风格指令（写入 LLM prompt F4 段，不含 exe 名/标题）
+#   multiline_safe= 多行注入是否安全（false 时禁用 F3 结构重组 + flatten 单行化 + 强制剪贴板）
+#   bundle_id     = macOS 预留字段（Phase 4 实施，当前忽略）
+#
+# DEC-031-⑤: 词表尽可能详细，不限于每类 5-8 个。
+
+# ============================================================
+# 聊天/即时通讯（multiline_safe=false，Enter=发送，多行注入危险）
+# ============================================================
+
+[[scene]]
+kind = "chat"
+style = "Natural conversational tone, short and direct. Keep it casual. Do NOT use lists, headings, or formal written structure."
+multiline_safe = false
+exe = [
+    "WeChat.exe",          # 微信 3.x（旧版）
+    "Weixin.exe",          # 微信 4.x（新版，2024+ 重构版进程名改为 Weixin）
+    "WeChatAppEx.exe",      # 微信小程序
+    "QQ.exe",              # QQ（经典版）
+    "QQNT.exe",            # QQ NT 架构（新版 QQ 桌面端）
+    "TIM.exe",             # TIM（QQ 商务版）
+    "Telegram.exe",        # Telegram
+    "DingTalk.exe",        # 钉钉
+    "DingTalkLite.exe",    # 钉钉 Lite（macOS/精简版，如有 Windows 版）
+    "Slack.exe",           # Slack
+    "Lark.exe",            # 飞书（国际版）
+    "Feishu.exe",          # 飞书（国内版）
+    "LarkShell.exe",       # 飞书 Shell 辅助进程（新版飞书可能用此名）
+    "Discord.exe",         # Discord
+    "WhatsApp.exe",        # WhatsApp 桌面版
+    "Line.exe",            # LINE
+    "Teams.exe",           # Microsoft Teams（classic 经典版）
+    "ms-teams.exe",        # Microsoft Teams（new 新版，WebView2 重构）
+    "Skype.exe",           # Skype（2025-05 已停服，保留兼容旧版）
+    "WXWork.exe",          # 企业微信
+    "WXWorkApp.exe",       # 企业微信（新版可能用此名）
+    "AliWangWang.exe",     # 阿里旺旺
+    "BaiduHi.exe",         # 百度 Hi
+    "Zalo.exe",            # Zalo（越南）
+    "Signal.exe",          # Signal
+    "YY.exe",              # YY 语音
+    "Momo.exe",            # 陌陌
+    "DouyinIM.exe",        # 抖音 IM（如有）
+    "Messenger.exe",       # Facebook Messenger 桌面版
+    "KakaoTalk.exe",       # KakaoTalk（韩国）
+    "Viber.exe",           # Viber
+    "ICQ.exe",             # ICQ New
+    "Element.exe",         # Element（Matrix 客户端）
+]
+
+[[scene]]
+kind = "chat"
+style = "Natural conversational tone, short and direct. Keep it casual. Do NOT use lists, headings, or formal written structure."
+multiline_safe = false
+title_keywords = [
+    "微信", "WeChat", "QQ", "Telegram", "钉钉", "DingTalk",
+    "Slack", "飞书", "Lark", "Discord", "WhatsApp", "Teams",
+]
+
+# ============================================================
+# AI Agent / 助手桌面应用（multiline_safe=false，输入框 Enter=发送，多行注入危险）
+# CLI 类 Agent（claude code/codex cli/opencode cli/aider 等）跑在终端内，
+# 前台进程=终端 exe，已由 ide_terminal 词表 + conhost/OpenConsole 补条覆盖；
+# 仅当有官方独立桌面壳时才在此列入 exe 条目。
+# ============================================================
+
+[[scene]]
+kind = "chat"
+style = "The dictated text is a prompt or instruction addressed to an AI assistant or coding agent. Keep the intent and wording intact. Preserve technical terms, code identifiers, file paths, and English words as-is. Clear and direct. Do NOT use lists, headings, or greetings; output as a single message."
+multiline_safe = false
+exe = [
+    # --- 国际 AI 助手桌面版 ---
+    "Claude.exe",              # Anthropic Claude 桌面版（MS Store 包 Claude，AppxManifest Executable=app\Claude.exe；本机核实）
+    "ChatGPT.exe",             # OpenAI ChatGPT/Codex 桌面版（MS Store 包 OpenAI.Codex，AppxManifest Executable=app/ChatGPT.exe；本机核实）
+    "Codex.exe",               # OpenAI Codex 桌面版独立入口（同 OpenAI.Codex 包内 Codex.exe；本机核实）
+    "OpenCode.exe",            # OpenCode 桌面版（anomalyco/opencode desktop，安装路径 Programs/@opencode-aidesktop/OpenCode.exe；本机核实）
+    "CherryStudio.exe",        # Cherry Studio（CherryHQ/cherry-studio，electron-builder.yml executableName=CherryStudio；核实）
+    "Chatbox.exe",             # Chatbox（chatboxai/chatbox，electron-builder.yml productName=Chatbox；核实）
+    "jan.exe",                 # Jan（janhq/jan，README 明确 Windows=jan.exe；核实）
+    "AnythingLLMDesktop.exe",  # AnythingLLM Desktop（Mintplex-Labs/anything-llm release 资产 AnythingLLMDesktop.exe；核实）
+    # --- 国产 AI 助手桌面版 ---
+    "yuanbao.exe",             # 腾讯元宝（本机快捷方式 target=D:\Tencent\Yuanbao\yuanbao.exe；核实）
+    # --- MS Store PWA 形态（Gemini/Copilot/DeepSeek/claude.ai 等）---
+    # 前台进程为 msedge.exe（已在 browser exe 列表），靠下方 title_keywords 兜底，不在此列 exe 条目
+]
+title_keywords = [
+    # 浏览器网页版 / PWA 兜底（浏览器开 claude.ai / chatgpt.com 等时靠窗口标题命中）
+    "ChatGPT", "Claude", "Gemini", "Copilot", "Perplexity", "DeepSeek",
+    "Kimi", "豆包", "通义千问", "文心一言", "元宝", "Grok", "Poe",
+]
+
+# ============================================================
+# 邮件客户端（multiline_safe=true，多行正文安全）
+# ============================================================
+
+[[scene]]
+kind = "email"
+style = "Formal email writing style. The dictation may be ANY FRAGMENT of an email (often body text only). Format ONLY what was spoken — NEVER add a salutation, closing, signature, greeting, or any sentence the speaker did not say; do NOT complete the text into a full email. IF (and only if) the spoken text itself begins with a salutation (Chinese: 尊敬的X / X您好; English: Dear X,; Japanese: 拝啓 X様 / X様 / 〇〇様; Korean: X님 / 안녕하십니까 X님, etc.): put it on its own line ending with a colon — '：' for Chinese, ':' for English/Japanese/Korean — NEVER a comma or period — and start the body on the next line. IF the spoken text itself ends with a closing courtesy (Chinese: 祝好 / 顺祝商祺; English: Best regards,; Japanese: よろしくお願いいたします / 敬具; Korean: 감사합니다 / 이상, etc.): place it on its own line; the pair 此致/敬礼 goes on two separate lines; Japanese 敬具/前略 and Korean 이상 go on their own lines. Body in complete sentences. When the speech contains enumeration markers (第一/第二/首先/其次/最后 / firstly/secondly / まず/次に/最後に / 첫째/둘째/마지막으로 etc.), MUST split into numbered list lines."
+multiline_safe = true
+exe = [
+    "OUTLOOK.EXE",         # Outlook（classic 经典版）
+    "olk.exe",             # Outlook（new 新版，2024+ Win11 默认，WebView2 重构）
+    "Foxmail.exe",         # Foxmail
+    "thunderbird.exe",     # Thunderbird
+    "MailMaster.exe",      # 网易邮箱大师
+    "YoMail.exe",          # YoMail
+    "Mail.exe",            # Windows 10/11 自带邮件（旧版 UWP）
+    "HxOutlook.exe",       # Outlook 辅助进程（新版 Outlook 后台进程）
+    "eMClient.exe",        # eM Client
+    "Spark.exe",           # Spark Mail
+    "NewMailEngine.exe",   # 火狐邮件（如有）
+]
+
+[[scene]]
+kind = "email"
+style = "Formal email writing style. The dictation may be ANY FRAGMENT of an email (often body text only). Format ONLY what was spoken — NEVER add a salutation, closing, signature, greeting, or any sentence the speaker did not say; do NOT complete the text into a full email. IF (and only if) the spoken text itself begins with a salutation (Chinese: 尊敬的X / X您好; English: Dear X,; Japanese: 拝啓 X様 / X様 / 〇〇様; Korean: X님 / 안녕하십니까 X님, etc.): put it on its own line ending with a colon — '：' for Chinese, ':' for English/Japanese/Korean — NEVER a comma or period — and start the body on the next line. IF the spoken text itself ends with a closing courtesy (Chinese: 祝好 / 顺祝商祺; English: Best regards,; Japanese: よろしくお願いいたします / 敬具; Korean: 감사합니다 / 이상, etc.): place it on its own line; the pair 此致/敬礼 goes on two separate lines; Japanese 敬具/前略 and Korean 이상 go on their own lines. Body in complete sentences. When the speech contains enumeration markers (第一/第二/首先/其次/最后 / firstly/secondly / まず/次に/最後に / 첫째/둘째/마지막으로 etc.), MUST split into numbered list lines."
+multiline_safe = true
+title_keywords = [
+    "Outlook", "Foxmail", "Thunderbird", "邮件", "邮箱",
+    "Mail", "Gmail", "Inbox", "收件箱", "发件箱",
+]
+
+# ============================================================
+# IDE / 编辑器 / 终端（multiline_safe=false，终端多行=逐行执行命令，危险）
+# ============================================================
+
+[[scene]]
+kind = "ide_terminal"
+style = "Technical style. Preserve English for technical terms, code identifiers, and jargon. No pleasantries."
+multiline_safe = false
+exe = [
+    # IDE
+    "Code.exe",            # VS Code
+    "Code - Insiders.exe", # VS Code Insiders
+    "cursor.exe",          # Cursor
+    "Windsurf.exe",        # Windsurf
+    "idea64.exe",          # IntelliJ IDEA
+    "idea.exe",            # IntelliJ IDEA
+    "pycharm64.exe",       # PyCharm
+    "pycharm.exe",         # PyCharm
+    "webstorm64.exe",      # WebStorm
+    "webstorm.exe",        # WebStorm
+    "goland64.exe",        # GoLand
+    "goland.exe",          # GoLand
+    "rustrover64.exe",     # RustRover
+    "rustrover.exe",       # RustRover
+    "clion64.exe",         # CLion
+    "clion.exe",           # CLion
+    "phpstorm64.exe",      # PhpStorm
+    "phpstorm.exe",        # PhpStorm
+    "rubymine64.exe",      # RubyMine
+    "rubymine.exe",        # RubyMine
+    "rider64.exe",         # Rider
+    "rider.exe",           # Rider
+    "devenv.exe",          # Visual Studio
+    "Zed.exe",             # Zed
+    "SublimeText.exe",     # Sublime Text
+    "sublime_text.exe",    # Sublime Text（Linux 命名）
+    "gvim.exe",            # Vim / gvim
+    "vim.exe",             # Vim
+    "notepad++.exe",       # Notepad++
+    "HBuilderX.exe",       # HBuilderX
+    # 终端
+    "WindowsTerminal.exe", # Windows Terminal
+    "cmd.exe",             # 命令提示符
+    "powershell.exe",      # PowerShell
+    "pwsh.exe",            # PowerShell 7
+    "ConEmu64.exe",        # ConEmu
+    "ConEmu.exe",          # ConEmu
+    "Cmder.exe",           # Cmder
+    "Alacritty.exe",       # Alacritty
+    "wezterm-gui.exe",     # WezTerm
+    "mintty.exe",          # mintty（Git Bash 默认终端）
+    "putty.exe",           # PuTTY
+    "Xshell.exe",          # Xshell
+    "Xshell6.exe",         # Xshell 6
+    "Xshell7.exe",         # Xshell 7
+    "Xshell8.exe",         # Xshell 8
+    "SecureCRT.exe",       # SecureCRT
+    "MobaXterm.exe",       # MobaXterm
+    "MobaXterm1.exe",      # MobaXterm（个人版）
+    "Tabby.exe",           # Tabby Terminal
+    "Hyper.exe",           # Hyper Terminal
+    # --- 经典控制台宿主（CLI 类 Agent 命中路径）---
+    # cmd/powershell 在经典控制台直启时前台窗口属主是 conhost 而非 shell 进程；
+    # 这是 claude code/codex cli/opencode cli/aider 等 CLI Agent 的实际命中路径之一。
+    "conhost.exe",         # Windows 经典控制台宿主（cmd/powershell 默认）
+    "OpenConsole.exe",     # Windows Terminal / WezTerm 等附带的 OpenConsole 宿主
+]
+
+# ============================================================
+# 文档/笔记（multiline_safe=true，允许多行结构化输出）
+# ============================================================
+
+[[scene]]
+kind = "doc"
+style = "Formal written style. When the speech contains enumeration markers (第一/第二/首先/其次/最后/几点/几个方面 etc.), MUST split into numbered list lines. Structured output (paragraphs, lists) is required where enumeration is present."
+multiline_safe = true
+exe = [
+    "Notepad.exe",         # Windows 记事本（Win10/11，匹配不区分大小写）
+    "wordpad.exe",         # 写字板
+    "WINWORD.EXE",         # Microsoft Word
+    "wps.exe",             # WPS 文字
+    "wpsoffice.exe",       # WPS Office
+    "Obsidian.exe",        # Obsidian
+    "Notion.exe",          # Notion 桌面版
+    "Typora.exe",          # Typora
+    "ONENOTE.EXE",         # OneNote 桌面版
+    "印象笔记.exe",          # 印象笔记（Evernote 中国版）
+    "Evernote.exe",        # Evernote 国际版
+    "语雀.exe",             # 语雀桌面版
+    "FeishuDocs.exe",      # 飞书文档（独立客户端，如有）
+    "XMind.exe",           # XMind
+    "mubu.exe",            # 幕布
+    "Joplin.exe",          # Joplin
+    "Logseq.exe",          # Logseq
+    "siyuan.exe",          # 思源笔记
+    "Affine.exe",          # AFFiNE
+    "AppFlowy.exe",        # AppFlowy
+    "Anytype.exe",         # Anytype
+    "Obsidian-helper.exe", # Obsidian 辅助进程
+]
+title_keywords = [
+    # 浏览器网页文档编辑器兜底
+    "Google Docs", "腾讯文档", "石墨文档", "飞书文档", "Notion",
+    "语雀", "Online Doc", "Office Online",
+]
+
+# ============================================================
+# 浏览器（multiline_safe=false 保守，靠 title_keywords 细分邮箱/文档场景）
+# ============================================================
+
+[[scene]]
+kind = "browser"
+style = "Web-friendly tone. Keep it concise. Output as a single line; do NOT use lists or multi-line formatting."
+multiline_safe = false
+exe = [
+    "chrome.exe",          # Google Chrome
+    "msedge.exe",          # Microsoft Edge
+    "firefox.exe",         # Mozilla Firefox
+    "opera.exe",           # Opera
+    "brave.exe",           # Brave
+    "vivaldi.exe",         # Vivaldi
+    "360se.exe",           # 360 安全浏览器
+    "360chrome.exe",       # 360 极速浏览器
+    "QQBrowser.exe",       # QQ 浏览器
+    "sogou_explorer.exe",  # 搜狗浏览器
+    "Maxthon.exe",         # 傲游浏览器
+    "Waterfox.exe",        # Waterfox
+    "librewolf.exe",       # LibreWolf
+    "thorium.exe",         # Thorium
+    "Supermium.exe",       # Supermium
+    "centbrowser.exe",     # Cent Browser
+    "chromium.exe",        # Chromium
+]
+title_keywords = [
+    # 邮箱场景兜底（浏览器网页邮箱）
+    "Outlook", "Gmail", "Yahoo Mail", "邮件", "邮箱", "Mail",
+    # 文档场景兜底（网页文档编辑器）
+    "Google Docs", "腾讯文档", "石墨文档", "飞书文档", "Notion",
+    "语雀", "Online Doc",
+]

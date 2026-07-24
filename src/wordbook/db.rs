@@ -18,8 +18,7 @@ pub struct StoredWordbookEntry {
 
 pub fn load_entries() -> Result<Vec<WordbookEntry>> {
     let conn = open_connection()?;
-    let mut stmt =
-        conn.prepare("SELECT word, source, created_at FROM wordbook ORDER BY id ASC")?;
+    let mut stmt = conn.prepare("SELECT word, source, created_at FROM wordbook ORDER BY id ASC")?;
     let entries = stmt
         .query_map([], |row| {
             Ok(WordbookEntry {
@@ -34,8 +33,8 @@ pub fn load_entries() -> Result<Vec<WordbookEntry>> {
 
 pub fn load_word_entries() -> Result<Vec<StoredWordbookEntry>> {
     let conn = open_connection()?;
-    let mut stmt = conn
-        .prepare("SELECT id, word, source, created_at FROM wordbook ORDER BY id DESC")?;
+    let mut stmt =
+        conn.prepare("SELECT id, word, source, created_at FROM wordbook ORDER BY id DESC")?;
     let entries = stmt
         .query_map([], |row| {
             Ok(StoredWordbookEntry {
@@ -434,8 +433,7 @@ mod tests {
         let conn = setup();
 
         for i in 1..=4 {
-            let count =
-                upsert_candidate_in_conn(&conn, "测试词").expect(&format!("record {}", i));
+            let count = upsert_candidate_in_conn(&conn, "测试词").expect(&format!("record {}", i));
             assert_eq!(count, i as u32, "detection {} should have count={}", i, i);
         }
 
@@ -545,7 +543,8 @@ mod tests {
         .expect("insert");
 
         // Run migration 003 again + finalize
-        conn.execute_batch(MIGRATION_003).expect("migration 003 second");
+        conn.execute_batch(MIGRATION_003)
+            .expect("migration 003 second");
         finalize_singleword_migration(&conn).expect("second finalize");
 
         // Data should be preserved
@@ -595,7 +594,8 @@ mod tests {
         assert_eq!(count, 1, "one word should remain after delete");
 
         // Re-run migration (simulating app restart)
-        conn.execute_batch(MIGRATION_003).expect("migration 003 re-run");
+        conn.execute_batch(MIGRATION_003)
+            .expect("migration 003 re-run");
         finalize_singleword_migration(&conn).expect("finalize re-run");
 
         // Deleted word must not revive

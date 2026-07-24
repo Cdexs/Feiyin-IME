@@ -323,9 +323,7 @@ fn segment_text(text: &str) -> Vec<String> {
     for s in sentences {
         buf.push_str(s);
         sentence_count += 1;
-        if buf.chars().count() >= MAX_SEGMENT_CHARS
-            || sentence_count >= MAX_SENTENCES_PER_SEGMENT
-        {
+        if buf.chars().count() >= MAX_SEGMENT_CHARS || sentence_count >= MAX_SENTENCES_PER_SEGMENT {
             segments.push(buf.clone());
             buf.clear();
             sentence_count = 0;
@@ -388,20 +386,18 @@ impl MarianModel {
             let parts: Vec<String> = segments
                 .iter()
                 .enumerate()
-                .filter_map(|(i, seg)| {
-                    match self.translate_segment(seg) {
-                        Ok(translated) if !translated.is_empty() => {
-                            log::info!("CT2 segment {}/{} done", i + 1, segments.len());
-                            Some(translated)
-                        }
-                        Ok(_) => {
-                            log::warn!("CT2 segment {}/{} returned empty", i + 1, segments.len());
-                            None
-                        }
-                        Err(e) => {
-                            log::error!("CT2 segment {}/{} failed: {}", i + 1, segments.len(), e);
-                            None
-                        }
+                .filter_map(|(i, seg)| match self.translate_segment(seg) {
+                    Ok(translated) if !translated.is_empty() => {
+                        log::info!("CT2 segment {}/{} done", i + 1, segments.len());
+                        Some(translated)
+                    }
+                    Ok(_) => {
+                        log::warn!("CT2 segment {}/{} returned empty", i + 1, segments.len());
+                        None
+                    }
+                    Err(e) => {
+                        log::error!("CT2 segment {}/{} failed: {}", i + 1, segments.len(), e);
+                        None
                     }
                 })
                 .collect();
@@ -421,7 +417,10 @@ impl MarianModel {
             return Ok(String::new());
         }
 
-        log::debug!("CT2 translating segment with model at {}", self.path.display());
+        log::debug!(
+            "CT2 translating segment with model at {}",
+            self.path.display()
+        );
         let source_tokens = self.tokenizer.encode(text)?;
         log::info!("CT2 source tokens: {:?}", source_tokens);
 
@@ -820,21 +819,32 @@ mod tests {
     fn segment_text_returns_single_segment_for_short_text() {
         let text = "你好世界。";
         let segments = segment_text(text);
-        assert_eq!(segments.len(), 1, "short single-sentence should not be segmented");
+        assert_eq!(
+            segments.len(),
+            1,
+            "short single-sentence should not be segmented"
+        );
     }
 
     #[test]
     fn segment_text_returns_single_segment_for_two_short_sentences() {
         let text = "你好。再见。";
         let segments = segment_text(text);
-        assert_eq!(segments.len(), 1, "two short sentences under char threshold should merge");
+        assert_eq!(
+            segments.len(),
+            1,
+            "two short sentences under char threshold should merge"
+        );
     }
 
     #[test]
     fn segment_text_splits_long_text_into_multiple_segments() {
         let text = "今天天气很好。我去公园散步了。看见了很多花。非常漂亮。我很开心。明天还要去。";
         let segments = segment_text(text);
-        assert!(segments.len() >= 2, "long text should be split into multiple segments");
+        assert!(
+            segments.len() >= 2,
+            "long text should be split into multiple segments"
+        );
         for seg in &segments {
             assert!(
                 seg.chars().count() <= MAX_SEGMENT_CHARS + 20,

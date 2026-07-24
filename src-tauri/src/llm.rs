@@ -67,7 +67,8 @@ impl LlmClient {
     }
 
     pub async fn probe(&self) -> Result<String> {
-        ensure!(self.config.enabled, "LLM optimization is disabled");
+        // FORMAT-LLM-001-UI: remove enabled check to break the "must test to enable /
+        // must enable to test" deadlock. Basic URL/key/model validation remains.
         ensure!(!self.config.api_url.trim().is_empty(), "API URL is empty");
         ensure!(!self.config.api_key.trim().is_empty(), "API key is empty");
         ensure!(!self.config.model.trim().is_empty(), "Model is empty");

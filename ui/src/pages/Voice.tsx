@@ -180,25 +180,6 @@ const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.rea
       </section>
 
       <section className="settings-section">
-        <h3 className="section-title">{t.voice_input_language}</h3>
-        <div className="card">
-          <p className="form-hint" style={{ marginBottom: '12px' }}>{t.voice_input_language_hint}</p>
-          <select
-            value={config.audio.transcription_language || 'zh'}
-            onChange={(e) => handleAudioChange('transcription_language', e.target.value)}
-            className="select-input"
-          >
-            <option value="zh">{t.voice_language_zh}</option>
-            <option value="en">{t.voice_language_en}</option>
-            <option value="ja">{t.voice_language_ja}</option>
-            <option value="ko">{t.voice_language_ko}</option>
-            <option value="yue">{t.voice_language_yue}</option>
-          </select>
-        </div>
-      </section>
-
-
-      <section className="settings-section">
         <h3 className="section-title">{t.voice_asr_model}</h3>
         <div className="card">
           <select
@@ -207,7 +188,6 @@ const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.rea
             className="select-input"
           >
             <option value="performance">{t.voice_asr_model_performance}</option>
-            <option value="accuracy">{t.voice_asr_model_accuracy}</option>
             <option value="qwen3_online">{t.voice_asr_model_qwen3}</option>
           </select>
 

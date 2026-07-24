@@ -111,7 +111,7 @@ fn collect_runtime_info(config: &AppConfig) -> RuntimeInfo {
         mode: mode.to_string(),
         llm_enabled: config.llm.enabled,
         llm_verified: config.llm.connectivity_verified,
-        asr_model: config.audio.transcription_language.clone(),
+        asr_model: config.audio.asr_model.clone(),
     }
 }
 

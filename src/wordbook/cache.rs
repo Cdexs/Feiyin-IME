@@ -76,11 +76,7 @@ impl WordbookCache {
 
     pub fn get_all_words(&self) -> Vec<WordbookEntry> {
         let mut entries: Vec<_> = self.entries.values().cloned().collect();
-        entries.sort_by(|a, b| {
-            a.word
-                .cmp(&b.word)
-                .then_with(|| a.source.cmp(&b.source))
-        });
+        entries.sort_by(|a, b| a.word.cmp(&b.word).then_with(|| a.source.cmp(&b.source)));
         entries
     }
 

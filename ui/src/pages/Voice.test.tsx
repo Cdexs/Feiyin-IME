@@ -139,25 +139,25 @@ describe('VoicePage - PUNCT-UI-001', () => {
         expect(
           screen.getByText(zhHans.voice_asr_model as string)
         ).toBeInTheDocument();
-        const select = screen.getAllByRole('combobox')[2];
+        const select = screen.getAllByRole('combobox')[1];
         expect(select).toBeInTheDocument();
       });
     });
 
-    it('ASR-UI-002: select has three options', async () => {
+    it('ASR-UI-002: select has two options', async () => {
       render(<VoicePage config={baseConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
-        const select = screen.getAllByRole('combobox')[2];
+        const select = screen.getAllByRole('combobox')[1];
         expect(select).toBeInTheDocument();
         const options = select.querySelectorAll('option');
-        expect(options.length).toBe(3);
+        expect(options.length).toBe(2);
       });
     });
 
     it('ASR-UI-003: default selected value is "performance"', async () => {
       render(<VoicePage config={baseConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
-        const select = screen.getAllByRole('combobox')[2] as HTMLSelectElement;
+        const select = screen.getAllByRole('combobox')[1] as HTMLSelectElement;
         expect(select.value).toBe('performance');
       });
     });
@@ -169,11 +169,11 @@ describe('VoicePage - PUNCT-UI-001', () => {
           screen.getByText(zhHans.voice_asr_model_performance as string)
         ).toBeInTheDocument();
         expect(
-          screen.getByText(zhHans.voice_asr_model_accuracy as string)
-        ).toBeInTheDocument();
-        expect(
           screen.getByText(zhHans.voice_asr_model_qwen3 as string)
         ).toBeInTheDocument();
+        expect(
+          screen.queryByText(zhHans.voice_asr_model_accuracy as string)
+        ).not.toBeInTheDocument();
       });
     });
 
@@ -181,11 +181,11 @@ describe('VoicePage - PUNCT-UI-001', () => {
       const updateConfig = vi.fn();
       render(<VoicePage config={baseConfig} updateConfig={updateConfig} />);
       await waitFor(() => {
-        const select = screen.getAllByRole('combobox')[2];
-        fireEvent.change(select, { target: { value: 'accuracy' } });
+        const select = screen.getAllByRole('combobox')[1];
+        fireEvent.change(select, { target: { value: 'qwen3_online' } });
         expect(updateConfig).toHaveBeenCalledWith(
           expect.objectContaining({
-            audio: expect.objectContaining({ asr_model: 'accuracy' }),
+            audio: expect.objectContaining({ asr_model: 'qwen3_online' }),
           })
         );
       });
@@ -200,7 +200,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
       });
     });
 
-    it('ASR-UI-007: description shows correct text for accuracy model', async () => {
+    it('ASR-UI-007: description shows correct text for performance model', async () => {
       render(<VoicePage config={baseConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
         expect(screen.getByText(zhHans.voice_asr_model_performance_desc as string)).toBeInTheDocument();
@@ -310,7 +310,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
       const updateFn = vi.fn((cfg: any) => { currentConfig = cfg; });
       const { rerender, unmount } = render(<VoicePage config={currentConfig} updateConfig={updateFn} />);
       // Simulate user selecting qwen3_online via dropdown
-      const select = screen.getAllByRole('combobox')[2];
+      const select = screen.getAllByRole('combobox')[1];
       fireEvent.change(select, { target: { value: 'qwen3_online' } });
       // updateFn was called with new config; re-render as parent would
       expect(updateFn).toHaveBeenCalled();
@@ -332,7 +332,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
       let currentConfig = JSON.parse(JSON.stringify(baseConfig));
       const updateFn = vi.fn((cfg: any) => { currentConfig = cfg; });
       const { rerender, unmount } = render(<VoicePage config={currentConfig} updateConfig={updateFn} />);
-      const select = screen.getAllByRole('combobox')[2];
+      const select = screen.getAllByRole('combobox')[1];
       fireEvent.change(select, { target: { value: 'qwen3_online' } });
       // Re-render with key set
       const qwenKeyConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen3_online', qwen3_api_key: 'sk-test-key'}};
