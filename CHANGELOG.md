@@ -16,6 +16,10 @@
 | FMT-EMPTY-CORRECTED-001 | Bug 修复：空/噪声语音格式化返回字面量 "<corrected></corrected>"；实现位置在 optimize() 而非 try_once()（功能等价且避免与重试逻辑冲突，更合理）；单测 parse_empty_corrected_tag_returns_full_response_text 通过 | coder-1 | 2026-07-24 |
 | FMT-EMAIL-I18N-001 | 邮件称呼/祝福语中英日韩优化：scene-rules.toml email style 补日韩称呼（拝啓 X様/X様/〇〇様 + X님/안녕하십니까 X님）+ 日韩祝福（よろしくお願いいたします/敬具 + 감사합니다/이상）+ 标点规则（日韩 ':' 而非逗号）；src/llm/mod.rs:757-843 防编造守卫 is_fabricated_salutation/closing 补日韩模式（四语言防护对称）+ 8 条新增单测（日韩各 4 条：salutation/closing 检测 + strip + keep_input）；依赖 FMT-LLM-004 先落地（已重做完成） | coder-1 | 2026-07-24 |
 | FIX-REBUILD-REGRESSION-001 | ASR-HIDE-ACCURACY-001-CORE 迁移逻辑补回：REBUILD-LOST-001-BACKEND 重做过程中 asr_model_accuracy_roundtrip 测试断言方向被意外改回"保留accuracy"；src/config/mod.rs:370-434 补回 accuracy→performance 静默迁移逻辑（load + load_from 两路径，日志 "ASR-HIDE-ACCURACY-001: migrating legacy asr_model='accuracy' -> 'performance'"）+ 单测 asr_model_accuracy_migrates_to_performance / asr_model_performance_unchanged_by_migration 断言迁移方向正确 | coder-1 | 2026-07-24 |
+| FORMAT-LLM-001-UI | LLM 设置页格式化输出 UI：Llm.tsx 更名"格式化输出"区块 + connectivity_verified 开启门槛校验（连接验证通过后才允许启用格式化）+ api_url/api_key/model 改动重置校验状态（防配置漂移后沿用过期验证）；src-tauri/src/llm.rs probe() 删除 enabled 死锁检查（格式化开关与连接校验解耦） | coder-2 | 2026-07-24 |
+| FORMAT-UI-POLISH-001 | LLM 设置页样式精修：Llm.tsx API URL/Key 输入框独占整行（避免拥挤）+ 状态条独立成块 + styles.css 新增 llm-api-card 等 CSS 类（卡片化布局，视觉层次清晰） | coder-2 | 2026-07-24 |
+| LANG-AUTO-001-UI | 语言自动 UI 清理：Voice.tsx 删输入语言区块 + HotkeySettings.tsx 删目标语言派生逻辑 + i18n 三语删 11 key + src-tauri/src/config.rs 加 Deprecated 注释 + **修复 src/crash:114 asr_model 误填 transcription_language 的 bug**（崩溃报告字段错填修复）+ Voice.test.tsx combobox 索引调整适配删除后的选项顺序 | coder-2 | 2026-07-24 |
+| GIT-AUDIT-001 | git 仓库同步状态只读审计：核对本地代码是否完整提交并推送到 GitHub；严格 5 类只读命令（status/diff/log/show/fetch）无任何写操作；结论：远程领先本地=空✅，本地领先远程=1 提交 f2240b7 未推送，未提交改动经 -w 核实仅 CHANGELOG +3 行真实（其余 15 文件系 CRLF↔LF 行尾符差异误报），未跟踪文件 nth=1（0 字节误产物）；git 事故重做成果已完整落盘无丢失，唯一缺口=f2240b7 未推送 | coder-1 | 2026-07-24 |
 
 ---
 
