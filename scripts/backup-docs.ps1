@@ -45,9 +45,9 @@ $Targets = @(
 
 # 排除项：
 #   inbox/outbox/acks/drafts —— Worker 收发件箱与临时产物，无留存价值
-#   audio-002B / audio-real-gavin —— PoC 原始录音 785 个 wav 共 62MB，
-#     内容静态（不会再变），不适合进 30 份轮转快照；这两份资产需要的是
-#     一次性归档副本，不是滚动备份（见 memory: 资产勿删）
+#   audio-002B / audio-real-gavin —— PoC 原始录音 785 个 wav 共 62MB。
+#     Gavin 2026-07-25 明确：不属于不可再生资产，后续需要可以重新录制，
+#     无需备份也无需归档，丢失可接受。故永久排除，不要再"好心"加回来。
 $ExcludeDirs = @('inbox', 'outbox', 'acks', 'drafts', 'audio-002B', 'audio-real-gavin')
 
 $stamp    = Get-Date -Format 'yyyyMMdd_HHmm'
