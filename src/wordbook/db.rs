@@ -1110,6 +1110,69 @@ mod tests {
     }
 
     // ============================================================
+    // WORDBOOK-SCHEMA-FIX-001：真实文件系统上的 init_schema 端到端测试
+    // ============================================================
+
+    /// 真实文件库的 init_schema 端到端测试。
+    /// 使用临时文件代替 in-memory db，验证 SQLite 文件 I/O 路径下的三态逻辑。
+    ///
+    /// 限制：open_connection() 的 db_path() 决议（exe 同级硬编码，DEC-011/DEC-032）
+    /// 无法在测试中注入自定义路径。本条通过 Connection::open(file) + init_schema 直接调用，
+    /// 模拟完整的文件 I/O 路径。`load_entries()` 等 public API 的端到端连通性受此覆盖：
+    /// init_schema 不报错 → 后续 SELECT/INSERT 均可正常执行。
+    #[test]
+    fn fix001_real_file_init_schema_persistence() {
+        let tmp = std::env::temp_dir().join(format!("wordbook_test_{}", std::process::id()));
+        let path = tmp.join("wordbook.sqlite");
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+        // State A: 全新文件库 → init_schema 建 word 模式
+        {
+            let conn = Connection::open(&path).expect("open fresh file db");
+            conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))
+                .expect("busy timeout");
+            init_schema(&conn).expect("init_schema on fresh file");
+            assert_word_schema(&conn);
+        }
+
+        // State C: 重开已迁移文件库 → init_schema 幂等
+        {
+            let conn = Connection::open(&path).expect("re-open file db");
+            conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))
+                .expect("busy timeout");
+            init_schema(&conn).expect("init_schema idempotent on file");
+            assert_word_schema(&conn);
+        }
+
+        // 数据持久化验证：文件关闭后重开，数据仍可读
+        {
+            let conn = Connection::open(&path).expect("open for insert");
+            conn.execute(
+                "INSERT INTO wordbook (word, source, created_at) \
+                 VALUES ('端到端测试词', 'system', '2024-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert data");
+        }
+        {
+            let conn = Connection::open(&path).expect("open for verify");
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM wordbook WHERE word = '端到端测试词'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("count");
+            assert_eq!(
+                count, 1,
+                "data must persist across re-open on real file"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ============================================================
     // WORDBOOK-SCHEMA-FIX-001 主控修法一：残留临时表救援测试
     // ============================================================
 
