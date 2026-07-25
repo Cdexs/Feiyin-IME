@@ -33,6 +33,8 @@ __pycache__/
 /collab
 /logs
 /tasks
+# 协作文档快照备份（scripts/backup-docs.ps1 产出，每日计划任务轮转 30 份）
+/Backup
 /.claude
 /memory
 CLAUDE.md

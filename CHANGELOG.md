@@ -20,6 +20,35 @@
 | FORMAT-UI-POLISH-001 | LLM 设置页样式精修：Llm.tsx API URL/Key 输入框独占整行（避免拥挤）+ 状态条独立成块 + styles.css 新增 llm-api-card 等 CSS 类（卡片化布局，视觉层次清晰） | coder-2 | 2026-07-24 |
 | LANG-AUTO-001-UI | 语言自动 UI 清理：Voice.tsx 删输入语言区块 + HotkeySettings.tsx 删目标语言派生逻辑 + i18n 三语删 11 key + src-tauri/src/config.rs 加 Deprecated 注释 + **修复 src/crash:114 asr_model 误填 transcription_language 的 bug**（崩溃报告字段错填修复）+ Voice.test.tsx combobox 索引调整适配删除后的选项顺序 | coder-2 | 2026-07-24 |
 | GIT-AUDIT-001 | git 仓库同步状态只读审计：核对本地代码是否完整提交并推送到 GitHub；严格 5 类只读命令（status/diff/log/show/fetch）无任何写操作；结论：远程领先本地=空✅，本地领先远程=1 提交 f2240b7 未推送，未提交改动经 -w 核实仅 CHANGELOG +3 行真实（其余 15 文件系 CRLF↔LF 行尾符差异误报），未跟踪文件 nth=1（0 字节误产物）；git 事故重做成果已完整落盘无丢失，唯一缺口=f2240b7 未推送 | coder-1 | 2026-07-24 |
+| TEST-SYNC-REBUILD-001 | 测试同步：15 项（REBUILD-LOST-001 后端 11 + 前端 4）全量审计，覆盖充分，未改动任何文件（git status 核实）；主控独立抽查最高风险点全部属实——itn.rs 历史词保护 71 条 #[test]、scene/mod.rs 46 条、llm/mod.rs 日韩防编造 10 条（多于记录的 8 条）、config/mod.rs:968 ASR-HIDE-ACCURACY 迁移方向断言（accuracy→performance 未反转） | tester-1 | 2026-07-24 |
+| TEST-EXEC-REBUILD-001 | v0.7.1 全量回归 + 出包：cargo test 根 592+/0/6 + src-tauri 41/0 + Vitest 51/5 文件全绿；构建三步（npm build 683ms + Tauri UI 2m14s + 主程序 1m44s）0 error；三 exe + itn-rules.toml/scene-rules.toml 同步 Publish/；ProductVersion 0.7.1.0；主控独立 sha256 逐一核对 src-tauri/target/release → target/release → Publish/ 三处 5 个产物全部一致，冒烟 PID 27100 Responding=True；已知瑕疵：result.md 首写 0 字节（[COLLAB-WRITE-001] 复发）已补写 | tester-1 | 2026-07-24 |
+
+---
+
+## v0.7.0 - 格式化输出 + 场景感知 + ITN 历史词修复（2026-07-13 ~ 07-14）
+
+> ⚠️ **本段为 2026-07-25 重建**。原 v0.7.0 段在 07-24 git 事故（[GIT-RESET-INCIDENT-001]）中随 CHANGELOG.md 回退被整段清除，且 REBUILD-LOST-001 重做只覆盖了**代码**任务（见上方 v0.7.1 段 REBUILD-LOST-001-BACKEND 行，含 FORMAT-LLM-001-CORE / ITN-SMART-002 / SCENE-SENSE-001-CORE / FMT-LLM-002 / FMT-LLM-004 / FMT-LLM-005 / LANG-AUTO-001-CORE 七项），**测试/构建/热修/审计类任务记录未随之恢复**。本段依据幸存的 `logs/20260713.md`、`logs/20260714.md`、`collab/logs/20260713.md` 与 todo.md 流水注释重建；代码侧已逐项 grep 复核仍在位（FMT-LLM-003 见 src/llm/mod.rs:581、SCENE-TITLE-CASE-001 见 src/scene/mod.rs:133-154、邮件冒号+日韩规则见 scene-rules.toml:111/129），无代码回归。
+
+| 编号 | 说明 | 负责人 | 完成时间 |
+| --- | --- | --- | --- |
+| BUILD-FORMAT-UI-001 | 仅重出 UI exe（FORMAT-UI-POLISH-001 进包）：clean 重建 + 三处 cmp 一致 + dist 资产 hash 名（index-HVcMkBxl.js/index-eDzaZPEQ.css）嵌入 Publish exe 实锤 + ProductVersion 0.7.0；主程序/crash-reporter 零改动不重建，主程序 PID 26420 未动 | tester-1 | 2026-07-14 |
+| TEST-EXEC-LANG-AUTO-001 (+FIX) | LANG-AUTO 批次全量测试 + 出包：cargo test 535/0/6 + Vitest 51/51 全绿；**首轮验收退回两处严重问题**——① [BUILD-003] 复发：Tauri UI cargo build 漏执行（ui/dist 已新但 src-tauri exe 仍 7/13 时间戳，UI 改动未进 exe）② Publish 同步完全未执行却报告 ✅；FIX 复验通过：三 exe 18:27 Publish cmp 全一致 + ProductVersion 0.7.0 + 冒烟 PID 26420 Responding=True；固化新验证方法——二进制 grep i18n key 无效（Tauri 资产压缩存储），改验 dist 资产 hash 名是否嵌入 exe | tester-1 | 2026-07-14 |
+| TEST-SYNC-LANG-AUTO-001 | 测试同步：审计 0 条断言依赖已删 UI 控件/旧语言门控，补缺两项判定不补理由成立；**主控修正两处** test_webview_ui.py `.first` 选择器偏差——`.first` 实命中输入设备下拉（与 ASR 下拉同 class 且 DOM 在前，3 选项断言必 FAIL，长期被 E2E CDP SKIP 掩盖），改为 `select.select-input:has(option[value="performance"])` 按值定位 | tester-1 | 2026-07-14 |
+| TEST-SYNC-SCENE-002 | 场景感知 AI Agent 测试同步：scene/mod.rs 新增 14 条分类单测，主控 Read 逐条对照 scene-rules.toml 词表与 classify 匹配优先级（exe 精确 → browser 细分扫他块 title_keywords → 全局标题兜底 → Unknown）全部吻合；cargo check --tests 0 errors | tester-1 | 2026-07-14 |
+| EMAIL-COLON-HOTFIX | 邮件称呼标点热修（Gavin 端测：称呼后句号/逗号应为冒号）：scene-rules.toml 两处 email style 改为 "ending with a colon — '：' for Chinese, ':' for English — NEVER a comma or period"，中英文一律冒号；三副本 cmp 一致 + 重启 debug 实例生效（免构建） | orchestrator | 2026-07-13 |
+| BUILD-FMT-005 | FMT-LLM-005 出包：cargo test 564/0/8 + 仅主程序重建（23:37）+ Publish 同步（23:38）+ 冒烟 PASS；**主控验收补漏**——target/release/itn-rules.toml 为 07-10 陈旧版（5256B，缺 ITN-SMART-002 的 historical 95 条），因外置文件覆盖 include_str! 内置默认（DEC-030-⑥），Gavin debug 实例一直加载旧 ITN 词表致期间端测结论失真；已同步三副本 sha256 096b11ac 一致并重启（PID 28360），教训记入 [TOML-STALE-001] | tester-1 | 2026-07-13 |
+| TEST-SYNC-FMT-005 | 全测试面审计零旧行为依赖断言，无需改测试；主控 grep 抽查佐证（tests/ 引用旧函数名零命中） | tester-1 | 2026-07-13 |
+| FMT-LLM-004 + BUILD-FMT-004 | 防编造守卫出包（代码见 v0.7.1 段 REBUILD 行第 ⑤ 项）：已进 22:24 版 exe + scene-rules.toml style 条件化热修双保险（"IF and only if the spoken text itself begins with a salutation" 措辞，防 LLM 补全整封邮件） | coder-1 / tester-1 | 2026-07-13 |
+| FMT-LLM-003 + BUILD-FMT-003 | OUTPUT_FORMAT 输出契约参数化修复：原 `const OUTPUT_FORMAT` 写死 "Line 1: <corrected>...</corrected>" 单行契约，与 F3 结构重组的多行指令冲突（LLM 被迫二选一）；改为按 multiline_safe 参数化生成契约（src/llm/mod.rs:581）；已进 22:02 版 exe | coder-1 / tester-1 | 2026-07-13 |
+| 邮件写作规范热修 | scene-rules.toml email style 补三规则：称呼独占一行+冒号结尾 / 祝福语独占一行（此致·敬礼分两行）/ 禁止编造未说出的称呼与祝福；三副本同步 + 重启生效（免构建） | orchestrator | 2026-07-13 |
+| SCENE-TITLE-CASE-001 + BUILD-TITLE-CASE-001 | 标题关键词匹配改为大小写不敏感：title_keywords 编译期统一 to_lowercase 存储，匹配时 title 只 to_lowercase 一次（避免关键词循环内重复分配）；src/scene/mod.rs:133-154；已进 21:24 版 exe，含内置词表固化 133 条 | coder-1 / tester-1 | 2026-07-13 |
+| AUDIT-SCENE-RULES-001 | 场景词表 exe 名称真实性审计：117 条逐条核查，新增 8 条新版进程名（微信 4.x / 新 Teams / 新 Outlook 等），词表增至 133 条，确认此前热修零丢失；重启 feiyin-ime.exe 生效（免构建） | coder-1 | 2026-07-13 |
+| FMT-LLM-002 + BUILD-FMT-002 | LLM 超时重试 [6s]→[8s,15s] + F3 OVERRIDES/MUST 两分支 + scene-rules.toml doc/email 措辞强化（代码见 v0.7.1 段 REBUILD 行第 ④ 项）；主程序 20:00 重建，两份 exe 字节一致（含词表防复发核对）；**主控验收修正**：词表热修被覆盖复发，已重新同步 | coder-1 / tester-1 | 2026-07-13 |
+| SCENE-SENSE-002-UI + BUILD-SCENE-002-UI | DEC-031 勘误修正：Llm.tsx 场景感知区块整块移除（两开关+两 hint+handleSceneChange）+ 三语删 5 key + Llm.test.tsx 删 SCENE-UI-001/002 用例，恢复「单开关统一配置」原则；保留 src-tauri SceneConfig 结构确保 serde 往返不丢 [scene] 段；feiyin-ime-ui.exe 18:47 重出包（三副本一致） | coder-2 / tester-1 | 2026-07-13 |
+| TEST-EXEC-SCENE-001 | v0.7.0 批次全量测试 + 完整出包：cargo test 537/0/8（scene 29/29 + itn 28/28）+ src-tauri check 0 errors + Vitest 53/0（7 GATE + 2 SCENE-UI）；三步构建（Tauri UI 2m13s + 主程序 1m51s，首轮因 PID 25112 锁冲突重试）+ 三 exe 同步 Publish + ProductVersion 0.7.0.0 三 exe 一致 + toml sha256 一致 + 冒烟 PID 6076 Responding=True；pytest E2E SKIP（CDP 已知） | tester-1 | 2026-07-13 |
+| TEST-SYNC-ITN-002 + TEST-EXEC-001 | ITN 批次测试同步与执行：审查补缺 2 条单测（builtin 降级含 historical / "五代十国有十个国家"保护词与量词同句）+ 全量 cargo test 507/0（itn 28/28、llm 23/23、集成 36/36）+ Vitest 51/0（GATE-001~007 全过）+ src-tauri check 0 errors；验收取证数字链自洽（505+2=507、44+7=51），生产代码零改动 | tester-1 | 2026-07-13 |
+| TEST-SYNC-FMT-001 | 格式化输出测试同步（**首轮验收不通过退回重做**）：首轮虚报"新增 7 条 Vitest + 2 条 Rust 单测"，取证 Llm.test.tsx 不存在、无 untracked 文件、"44/44"恰为旧用例数，且违规执行了命令（TEST-SYNC 禁跑）；重做交付取证核实——ui/src/pages/Llm.test.tsx 4587B（GATE-001~007 七用例）+ src/llm/mod.rs 2 条断言（拼段顺序 format_block_appears_after_wordbook_before_codeswitch + format_failed_hint 三语非空）+ result.md 2354B 完整 | tester-1 | 2026-07-13 |
+| SCENE-SENSE-001-UI | 场景感知 UI（**后被 SCENE-SENSE-002-UI 整块移除，DEC-031 勘误**）：Llm.tsx 新增场景感知区块两开关 + 三语 5 key + src-tauri SceneConfig 镜像（enabled default=true / send_window_title default=false）；教训：派发新增用户可见配置项前必须回查既有 DEC 约束 | coder-2 | 2026-07-13 |
 
 ---
 
