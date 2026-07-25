@@ -70,7 +70,10 @@ fn main() {
                     let n = seg.n();
                     let seg_secs = n as f64 / 16000.0;
                     let start_secs = start as f64 / 16000.0;
-                    println!("  seg {}: start={:.2}s, dur={:.2}s", seg_count, start_secs, seg_secs);
+                    println!(
+                        "  seg {}: start={:.2}s, dur={:.2}s",
+                        seg_count, start_secs, seg_secs
+                    );
                     if seg_secs > max_seg_secs {
                         max_seg_secs = seg_secs;
                     }
@@ -81,7 +84,10 @@ fn main() {
             }
         }
         detector.clear();
-        println!("  total {} segments, max segment {:.2}s", seg_count, max_seg_secs);
+        println!(
+            "  total {} segments, max segment {:.2}s",
+            seg_count, max_seg_secs
+        );
     }
 }
 

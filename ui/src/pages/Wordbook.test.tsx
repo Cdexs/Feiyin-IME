@@ -108,7 +108,7 @@ describe("WordbookPage — handleDelete", () => {
     });
   });
 
-  it("DEL-UNIT-003: 删除失败时弹窗显示固定文字删除失败！", async () => {
+  it("DEL-UNIT-003: 删除失败时弹窗显示标题和透传后端错误", async () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === "get_wordbook_entries") return mockEntries;
       if (cmd === "delete_wordbook_entry_by_id") throw new Error("词库条目不存在");
@@ -123,7 +123,8 @@ describe("WordbookPage — handleDelete", () => {
     fireEvent.click(deleteButtons[0]);
 
     await waitFor(() => {
-      expect(screen.getByText("删除失败！")).toBeInTheDocument();
+      expect(screen.getByText("删除失败")).toBeInTheDocument();
+      expect(screen.getByText("词库条目不存在")).toBeInTheDocument();
     });
   });
 
@@ -173,6 +174,89 @@ describe("WordbookPage — handleDelete", () => {
     await waitFor(() => {
       const remaining = screen.queryAllByTitle("删除");
       expect(remaining).toHaveLength(1);
+    });
+  });
+});
+
+describe("WordbookPage — load states", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("LOAD-UNIT-001: 加载失败时显示错误弹框、失败状态页和重试按钮", async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_wordbook_entries") throw new Error("open database failed");
+      return null;
+    });
+
+    renderWordbook();
+
+    await waitFor(() => {
+      // 弹框标题是 h3.modal-title，空状态标题是 .wordbook-empty-title
+      const titles = screen.getAllByText("加载失败");
+      expect(titles.length).toBeGreaterThanOrEqual(1);
+      expect(screen.getByText("open database failed")).toBeInTheDocument();
+    });
+
+    // 关闭弹框后，失败状态页仍可看到重试按钮
+    const okBtn = await screen.findByText("确定");
+    fireEvent.click(okBtn);
+
+    await waitFor(() => {
+      expect(screen.queryByText("open database failed")).not.toBeInTheDocument();
+      expect(screen.getByText(/无法读取词条列表/)).toBeInTheDocument();
+      expect(screen.getByText("重试")).toBeInTheDocument();
+    });
+  });
+
+  it("LOAD-UNIT-002: 加载成功但当前 Tab 无条目时显示空状态", async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_wordbook_entries") return [];
+      return null;
+    });
+
+    renderWordbook();
+
+    await waitFor(() => {
+      expect(screen.getByText("暂无系统词条")).toBeInTheDocument();
+    });
+
+    const userTab = await screen.findByText("用户词库");
+    fireEvent.click(userTab);
+
+    await waitFor(() => {
+      expect(screen.getByText(/暂无用户词条/)).toBeInTheDocument();
+    });
+  });
+
+  it("LOAD-UNIT-003: 加载失败时点击重试会重新调用 get_wordbook_entries", async () => {
+    let calls = 0;
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_wordbook_entries") {
+        calls++;
+        if (calls === 1) throw new Error("open database failed");
+        return mockEntries;
+      }
+      return null;
+    });
+
+    renderWordbook();
+
+    await waitFor(() => {
+      expect(screen.getByText("重试")).toBeInTheDocument();
+    });
+
+    const retryBtn = screen.getByText("重试");
+    fireEvent.click(retryBtn);
+
+    // 默认 activeTab 为 system，mockEntries 全为 user，需切到用户词库才能看到条目
+    const userTab = await screen.findByText("用户词库");
+    fireEvent.click(userTab);
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledTimes(2);
+      expect(screen.queryByText("重试")).not.toBeInTheDocument();
+      expect(screen.getAllByTitle("删除")).toHaveLength(2);
     });
   });
 });

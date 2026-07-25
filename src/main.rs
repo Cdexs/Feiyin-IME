@@ -3354,7 +3354,10 @@ fn learn_llm_suggestions(
     let wordbook = match wordbook::Wordbook::open() {
         Ok(wordbook) => wordbook,
         Err(err) => {
-            log::debug!("Skipping LLM wordbook suggestions: {}", err);
+            // WORDBOOK-SCHEMA-FIX-001: 打不开词库是功能整体失效（非崩溃），从 debug!
+            // 提升为 warn! —— 原 debug! 在 info 级运行日志中 0 条痕迹，正是本 P0 bug
+            // 潜伏至今的原因之一。单个建议词被跳过属正常业务分支，保持 debug! 不抬高。
+            log::warn!("Wordbook open failed, LLM auto-learning disabled: {}", err);
             return;
         }
     };

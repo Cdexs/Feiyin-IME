@@ -1,12 +1,38 @@
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use super::cache::WordbookEntry;
 
 const MIGRATION_001: &str = include_str!("../../migrations/001_wordbook.sql");
 const MIGRATION_002: &str = include_str!("../../migrations/002_wordbook_candidates.sql");
 const MIGRATION_003: &str = include_str!("../../migrations/003_wordbook_singleword.sql");
+
+/// WORDBOOK-SCHEMA-FIX-001: 全新库直接建 word 模式 schema（不执行 001/002 的旧表 DDL、
+/// 不执行 legacy import）。复用 003 的 word 列定义但用最终表名，避免两处 schema 定义漂移。
+const WORD_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS wordbook (\
+\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\
+\n    word TEXT NOT NULL,\
+\n    source TEXT NOT NULL,\
+\n    created_at TEXT NOT NULL\
+\n);\
+\n\
+\nCREATE UNIQUE INDEX IF NOT EXISTS idx_wordbook_new_unique ON wordbook(word);\
+\n\
+\nCREATE TABLE IF NOT EXISTS wordbook_candidates (\
+\n    word TEXT NOT NULL,\
+\n    count INTEGER NOT NULL DEFAULT 1,\
+\n    last_seen TEXT NOT NULL,\
+\n    PRIMARY KEY (word)\
+\n);\
+\n";
+
+/// WORDBOOK-SCHEMA-FIX-001: 并发保护。主程序自动学习写入与设置界面 UI 读取是两个
+/// 进程访问同一库文件，写事务期间对方读会拿到 SQLITE_BUSY 而立即失败（无重试）。
+/// 3000ms 足以覆盖正常的写事务时长，且不会让进程长时间挂起。
+const BUSY_TIMEOUT_MS: u64 = 3000;
 
 #[derive(Debug, Clone)]
 pub struct StoredWordbookEntry {
@@ -111,24 +137,170 @@ fn open_connection() -> Result<Connection> {
     }
 
     let conn = Connection::open(&path)?;
+    // WORDBOOK-SCHEMA-FIX-001: 并发保护。主程序自动学习写入与设置界面 UI 读取是两个
+    // 进程访问同一库文件，写事务期间对方读会拿到 SQLITE_BUSY 而立即失败。3s 超时
+    // 足以覆盖正常写事务，且不让进程长时间挂起。仅加 busy_timeout，不动 journal 模式
+    // （WAL 会产生 -wal/-shm 文件涉及 Publish 产物清单，本次边界外）。
+    conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
     init_schema(&conn)?;
     Ok(conn)
 }
 
+/// WORDBOOK-SCHEMA-FIX-001: 按库的实际 schema 状态条件化执行。
+///
+/// 三态判定（pragma_table_info + sqlite_master 双查）：
+/// - **A 全新库**（wordbook 表不存在）→ 直接建 word 模式 schema，不执行 001/002/legacy import
+/// - **B 旧库（词对）**（有 raw 列）→ 完整迁移链 001→002→import_legacy_words→source 归一化→003→finalize→source 归一化
+/// - **C 已迁移**（有 word 列）→ 完全跳过 001/002/legacy import，只做幂等保障
+///
+/// 状态 C 必须零写事务（除真的缺索引/缺表时）——原实现每次 open 都跑 DDL + 两条
+/// UPDATE，属写放大，且与主程序并发时抬高锁冲突概率。source 归一化改为先 SELECT
+/// 判断有无非法值，有才 UPDATE。
+///
+/// 索引名保持 `idx_wordbook_new_unique` 不变（003 迁移的历史产物，现存库就叫这个名字，
+/// 不要为"名字好看"去 drop/recreate，风险大收益低）。
+///
+/// **残留临时表救援（主控修法一）**：003 迁移中途崩溃可能留下 wordbook_new /
+/// wordbook_candidates_new 残留。清理前必须先判断：若真表 wordbook 不存在而
+/// wordbook_new 存在 → 这是「崩在 DROP 之后 RENAME 之前」的状态，正确动作是
+/// ALTER TABLE wordbook_new RENAME TO wordbook 救回数据，而非 DROP（否则唯一副本
+/// 销毁，用户词库静默清空不可恢复）。只有真表存在时，wordbook_new 才是无用半成品，
+/// 方可安全 DROP。candidates 侧独立判断同理。
 fn init_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(MIGRATION_001)?;
-    conn.execute_batch(MIGRATION_002)?;
-    import_legacy_words(conn)?;
-    conn.execute(
-        "UPDATE wordbook SET source = 'system' WHERE source NOT IN ('system', 'user')",
+    // 残留临时表救援：先判断真表是否存在，不存在而 _new 存在 → 救回，而非 DROP
+    recover_stale_temp_tables(conn)?;
+
+    // 三态判定：先查 wordbook 表是否存在
+    let table_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'wordbook'",
         [],
+        |row| row.get(0),
     )?;
-    conn.execute_batch(MIGRATION_003)?;
-    finalize_singleword_migration(conn)?;
-    conn.execute(
-        "UPDATE wordbook SET source = 'system' WHERE source NOT IN ('system', 'user')",
+
+    if table_exists == 0 {
+        // 状态 A：全新库 → 直接建 word 模式 schema，不执行 001/002/legacy import
+        conn.execute_batch(WORD_SCHEMA)?;
+        return Ok(());
+    }
+
+    // 表存在 → 查列名判 B（有 raw）vs C（有 word）
+    let has_raw: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('wordbook') WHERE name = 'raw'",
         [],
+        |row| row.get(0),
     )?;
+
+    if has_raw > 0 {
+        // 状态 B：旧库（词对）→ 完整迁移链
+        // 001/002：表已存在会跳过 DDL，索引存在故 CREATE INDEX 也安全（幂等）
+        conn.execute_batch(MIGRATION_001)?;
+        conn.execute_batch(MIGRATION_002)?;
+        import_legacy_words(conn)?;
+        normalize_source(conn)?;
+        conn.execute_batch(MIGRATION_003)?;
+        finalize_singleword_migration(conn)?;
+        normalize_source(conn)?;
+        return Ok(());
+    }
+
+    // 状态 C：已迁移（有 word 列，无 raw 列）→ 幂等保障，不执行 001/002/legacy import
+    // 1. 确保 word 模式唯一索引存在（idx_wordbook_new_unique，003 历史产物名字保持不变）
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_wordbook_new_unique ON wordbook(word);",
+    )?;
+    // 2. 确保 wordbook_candidates(word) 表存在
+    let candidates_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'wordbook_candidates'",
+        [],
+        |row| row.get(0),
+    )?;
+    if candidates_exists == 0 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS wordbook_candidates (\
+             \n    word TEXT NOT NULL,\
+             \n    count INTEGER NOT NULL DEFAULT 1,\
+             \n    last_seen TEXT NOT NULL,\
+             \n    PRIMARY KEY (word)\
+             \n);",
+        )?;
+    }
+    // 3. source 归一化：先 SELECT 判断有无非法值，有才 UPDATE（避免写放大）
+    normalize_source(conn)?;
+
+    Ok(())
+}
+
+/// WORDBOOK-SCHEMA-FIX-001（主控修法一）：残留临时表救援。
+/// 003 迁移中途崩溃可能留下 wordbook_new / wordbook_candidates_new 残留。清理逻辑：
+/// - 真表 wordbook 不存在 而 wordbook_new 存在 → 救回（RENAME _new → 真表），非 DROP
+/// - 真表 wordbook 存在 而 wordbook_new 存在 → _new 是无用半成品副本，安全 DROP
+/// candidates 侧独立判断同理（可能只有一侧处于中间态）
+fn recover_stale_temp_tables(conn: &Connection) -> Result<()> {
+    // wordbook 侧
+    let wordbook_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='wordbook'",
+        [],
+        |r| r.get(0),
+    )?;
+    let wordbook_new_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='wordbook_new'",
+        [],
+        |r| r.get(0),
+    )?;
+    if wordbook_new_exists > 0 {
+        if wordbook_exists == 0 {
+            // 真表不存在而 _new 有数据 → 救回，不 DROP（否则唯一副本销毁）
+            log::warn!(
+                "WORDBOOK-SCHEMA-FIX-001: recovering wordbook_new (interrupted migration detected, true table missing) — renaming to wordbook to rescue data"
+            );
+            conn.execute_batch("ALTER TABLE wordbook_new RENAME TO wordbook;")?;
+        } else {
+            // 真表存在 → _new 是半成品副本，安全 DROP
+            conn.execute_batch("DROP TABLE IF EXISTS wordbook_new;")?;
+        }
+    }
+
+    // candidates 侧（独立判断，可能只有一侧处于中间态）
+    let cand_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='wordbook_candidates'",
+        [],
+        |r| r.get(0),
+    )?;
+    let cand_new_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='wordbook_candidates_new'",
+        [],
+        |r| r.get(0),
+    )?;
+    if cand_new_exists > 0 {
+        if cand_exists == 0 {
+            log::warn!(
+                "WORDBOOK-SCHEMA-FIX-001: recovering wordbook_candidates_new (interrupted migration detected, true table missing) — renaming to wordbook_candidates to rescue data"
+            );
+            conn.execute_batch(
+                "ALTER TABLE wordbook_candidates_new RENAME TO wordbook_candidates;",
+            )?;
+        } else {
+            conn.execute_batch("DROP TABLE IF EXISTS wordbook_candidates_new;")?;
+        }
+    }
+    Ok(())
+}
+
+/// WORDBOOK-SCHEMA-FIX-001: source 归一化（先 SELECT 判断有无非法值，有才 UPDATE）。
+/// 原实现每次 open 都无条件执行两条 UPDATE，属写放大且与主程序并发时抬高锁冲突概率。
+/// 保留既有兜底能力（'auto' 等非法值 → 'system'），不因条件化而丢。
+fn normalize_source(conn: &Connection) -> Result<()> {
+    let bad_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM wordbook WHERE source NOT IN ('system', 'user')",
+        [],
+        |row| row.get(0),
+    )?;
+    if bad_count > 0 {
+        conn.execute(
+            "UPDATE wordbook SET source = 'system' WHERE source NOT IN ('system', 'user')",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -198,11 +370,17 @@ fn finalize_singleword_migration(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // 3. Replace old tables with new ones
-    conn.execute_batch("DROP TABLE IF EXISTS wordbook_candidates;")?;
-    conn.execute_batch("DROP TABLE IF EXISTS wordbook;")?;
-    conn.execute_batch("ALTER TABLE wordbook_new RENAME TO wordbook;")?;
-    conn.execute_batch("ALTER TABLE wordbook_candidates_new RENAME TO wordbook_candidates;")?;
+    // 3. Replace old tables with new ones — 用事务包裹消除「旧表已删、新表未改名」中间态
+    // WORDBOOK-SCHEMA-FIX-001（主控修法二）：SQLite DDL 支持事务，用 unchecked_transaction
+    // 把四步 DROP+RENAME 包成一个原子单元，若中途崩溃会回滚，中间态不持久化到磁盘。
+    // 原实现四条独立 execute_batch，若进程在 DROP wordbook 与 RENAME wordbook_new 之间被杀，
+    // wordbook 表不存在而 wordbook_new holding 唯一数据副本 → 不可逆数据丢失。
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("DROP TABLE IF EXISTS wordbook_candidates;")?;
+    tx.execute_batch("DROP TABLE IF EXISTS wordbook;")?;
+    tx.execute_batch("ALTER TABLE wordbook_new RENAME TO wordbook;")?;
+    tx.execute_batch("ALTER TABLE wordbook_candidates_new RENAME TO wordbook_candidates;")?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -655,5 +833,490 @@ mod tests {
             )
             .expect("count A");
         assert_eq!(count_a, 5, "修正词A should have MAX(count)=5");
+    }
+
+    // ============================================================
+    // WORDBOOK-SCHEMA-FIX-001: init_schema 三态条件化测试
+    // ============================================================
+
+    /// 辅助：断言当前 schema 是 word 模式（有 word 列、无 raw 列、有 idx_wordbook_new_unique）
+    fn assert_word_schema(conn: &Connection) {
+        let has_word: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('wordbook') WHERE name = 'word'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("check word column");
+        assert_eq!(has_word, 1, "word column must exist");
+
+        let has_raw: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('wordbook') WHERE name = 'raw'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("check raw column");
+        assert_eq!(has_raw, 0, "raw column must NOT exist in word mode");
+
+        let has_idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_wordbook_new_unique'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("check index");
+        assert_eq!(has_idx, 1, "idx_wordbook_new_unique must exist");
+
+        // 旧索引 idx_wordbook_unique 不应存在（防有人把旧索引又建回来）
+        let has_old_idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_wordbook_unique'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("check old index");
+        assert_eq!(has_old_idx, 0, "legacy idx_wordbook_unique must NOT exist");
+    }
+
+    /// 状态 C 幂等：建好 word 模式库 → 连续 init_schema 两次 → 均 Ok，且第二次无 schema 变化
+    /// **这条直接锁死本 bug 不复发，最重要**
+    #[test]
+    fn fix001_state_c_idempotent_consecutive_init() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        // 先建好 word 模式库（模拟已迁移状态）
+        conn.execute_batch(WORD_SCHEMA).expect("build word schema");
+        conn.execute(
+            "INSERT INTO wordbook (word, source, created_at) \
+             VALUES ('风无心', 'system', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert data");
+
+        // 第一次 init_schema（状态 C）
+        init_schema(&conn).expect("first init on migrated db");
+        assert_word_schema(&conn);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wordbook", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 1, "data must survive first init");
+
+        // 第二次 init_schema（状态 C，验证幂等）
+        init_schema(&conn).expect("second init must be idempotent");
+        assert_word_schema(&conn);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wordbook", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 1, "data must survive second init");
+    }
+
+    /// 状态 C 修复本 bug 的核心断言：模拟真实失败场景
+    /// 旧实现会执行 MIGRATION_001 的 CREATE INDEX ON wordbook(raw,corrected) → no such column
+    #[test]
+    fn fix001_state_c_does_not_execute_migration_001_index() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        // 模拟 003 迁移完成后的真实状态：wordbook(word) + idx_wordbook_new_unique
+        conn.execute_batch(WORD_SCHEMA).expect("build word schema");
+
+        // 旧实现会在这里因 MIGRATION_001 的 CREATE INDEX ON wordbook(raw,corrected) 失败
+        // 新实现状态 C 必须跳过 001/002，不报错
+        init_schema(&conn).expect("init on migrated db must not fail");
+        assert_word_schema(&conn);
+    }
+
+    /// 状态 B 迁移：构造 raw/corrected 旧表 + 若干词对数据 → init_schema → 断言变为 word 模式、
+    /// 数据按 corrected 侧去重导入、候选表 count 保留
+    #[test]
+    fn fix001_state_b_migrates_old_pair_table_to_word_mode() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        // 构造旧词对库（001 + 002）
+        conn.execute_batch(MIGRATION_001).expect("migration 001");
+        conn.execute_batch(MIGRATION_002).expect("migration 002");
+        // 插入旧词对数据（含重复 corrected 测去重）
+        conn.execute(
+            "INSERT INTO wordbook (raw, corrected, source, created_at) \
+             VALUES ('风无星', '风无心', 'user', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert 1");
+        conn.execute(
+            "INSERT INTO wordbook (raw, corrected, source, created_at) \
+             VALUES ('风无腥', '风无心', 'user', '2024-01-02T00:00:00Z')",
+            [],
+        )
+        .expect("insert 2 (dup corrected)");
+        conn.execute(
+            "INSERT INTO wordbook (raw, corrected, source, created_at) \
+             VALUES ('吉皮提', 'GPT', 'user', '2024-01-03T00:00:00Z')",
+            [],
+        )
+        .expect("insert 3");
+        // 插入旧候选数据
+        conn.execute(
+            "INSERT INTO wordbook_candidates (raw, corrected, count, last_seen) \
+             VALUES ('风无星', '风无心', 3, '2024-01-01')",
+            [],
+        )
+        .expect("insert candidate 1");
+
+        // 执行 init_schema（状态 B → 完整迁移链）
+        init_schema(&conn).expect("init on old pair db");
+
+        // 断言：word 模式
+        assert_word_schema(&conn);
+        // 断言：2 个唯一词（风无心 去重 + GPT）
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wordbook", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 2, "should have 2 unique words after dedup");
+        // 断言：风无心 在库
+        let has_word: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM wordbook WHERE word = '风无心'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("check word");
+        assert_eq!(has_word, 1);
+        // 断言：候选表 count 保留
+        let cand_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wordbook_candidates", [], |r| r.get(0))
+            .expect("cand count");
+        assert_eq!(cand_count, 1, "candidates should be migrated with count");
+        let cand_word_count: i64 = conn
+            .query_row(
+                "SELECT count FROM wordbook_candidates WHERE word = '风无心'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("cand count for word");
+        assert_eq!(cand_word_count, 3, "candidate count must be preserved");
+    }
+
+    /// 状态 A 全新：空库 → init_schema → 直接是 word 模式，且不存在 idx_wordbook_unique
+    #[test]
+    fn fix001_state_a_fresh_db_gets_word_mode_directly() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        // 空库，无任何表 → 状态 A
+        init_schema(&conn).expect("init on fresh db");
+        assert_word_schema(&conn);
+        // 确认 wordbook_candidates 表存在
+        let cand_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='wordbook_candidates'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("check candidates");
+        assert_eq!(cand_exists, 1, "wordbook_candidates must exist in fresh db");
+    }
+
+    /// 状态 C 下 source 归一化：插入一条 source='auto' 的记录 → init_schema → 变成 'system'
+    /// （保留既有兜底能力，不能因条件化而丢）
+    #[test]
+    fn fix001_state_c_normalizes_invalid_source() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(WORD_SCHEMA).expect("build word schema");
+        // 插入非法 source
+        conn.execute(
+            "INSERT INTO wordbook (word, source, created_at) \
+             VALUES ('测试词', 'auto', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert bad source");
+
+        init_schema(&conn).expect("init with bad source");
+        let source: String = conn
+            .query_row(
+                "SELECT source FROM wordbook WHERE word = '测试词'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("source");
+        assert_eq!(
+            source, "system",
+            "invalid source 'auto' must be normalized to 'system'"
+        );
+    }
+
+    /// 状态 C 下无非法 source 时 init_schema 不写事务（幂等保障，避免写放大）
+    #[test]
+    fn fix001_state_c_no_write_when_source_already_valid() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(WORD_SCHEMA).expect("build word schema");
+        conn.execute(
+            "INSERT INTO wordbook (word, source, created_at) \
+             VALUES ('测试词', 'system', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert valid source");
+
+        // 连续 init_schema 两次，均不应报错（幂等）
+        init_schema(&conn).expect("first init");
+        init_schema(&conn).expect("second init");
+
+        // 数据不变
+        let source: String = conn
+            .query_row(
+                "SELECT source FROM wordbook WHERE word = '测试词'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("source");
+        assert_eq!(source, "system");
+    }
+
+    /// 第四种状态：003 迁移中途崩溃留下 wordbook_new 残留 + 旧 wordbook(raw) 表并存
+    /// init_schema 应先清理残留临时表，再走完整 B 迁移链
+    #[test]
+    fn fix001_state_d_interrupted_migration_with_stale_temp_tables() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        // 构造旧词对库
+        conn.execute_batch(MIGRATION_001).expect("migration 001");
+        conn.execute_batch(MIGRATION_002).expect("migration 002");
+        conn.execute(
+            "INSERT INTO wordbook (raw, corrected, source, created_at) \
+             VALUES ('原词', '保留词', 'user', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert old data");
+        // 模拟 003 部分执行后崩溃：wordbook_new 临时表残留（003 已建表但未完成 finalize）
+        conn.execute_batch(MIGRATION_003)
+            .expect("migration 003 partial");
+        // 此时 wordbook_new + wordbook_candidates_new 残留 + 旧 wordbook(raw) 并存
+
+        // init_schema 应先清理残留临时表，再走 B 迁移链
+        init_schema(&conn).expect("init with stale temp tables");
+
+        assert_word_schema(&conn);
+        // 数据正确迁移
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wordbook", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 1, "data must be migrated despite stale temp tables");
+        let word: String = conn
+            .query_row("SELECT word FROM wordbook", [], |r| r.get(0))
+            .expect("word");
+        assert_eq!(word, "保留词");
+        // 残留临时表已清理
+        let temp_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE '%_new'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("temp count");
+        assert_eq!(temp_count, 0, "stale _new temp tables must be cleaned up");
+    }
+
+    // ============================================================
+    // WORDBOOK-SCHEMA-FIX-001 主控修法一：残留临时表救援测试
+    // ============================================================
+
+    /// ① 构造「wordbook 不存在 + wordbook_new 有数据」→ init_schema → 数据被救回 wordbook
+    /// **直接锁死数据丢失**：原实现会 DROP wordbook_new 销毁唯一副本
+    #[test]
+    fn fix001_recover_wordbook_new_when_true_table_missing() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        // 模拟崩在「DROP wordbook 之后 RENAME 之前」：wordbook 不存在，wordbook_new 有数据
+        conn.execute_batch(WORD_SCHEMA).expect("build word schema");
+        conn.execute_batch("ALTER TABLE wordbook RENAME TO wordbook_new;")
+            .expect("simulate post-DROP pre-RENAME");
+        // 此时 wordbook 表不存在，wordbook_new holding 唯一数据副本
+        conn.execute(
+            "INSERT INTO wordbook_new (word, source, created_at) \
+             VALUES ('风无心', 'system', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert into wordbook_new");
+
+        // init_schema 必须救回（RENAME），而非 DROP
+        init_schema(&conn).expect("init must rescue wordbook_new");
+
+        // 断言：数据已救回到 wordbook，条目数正确
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wordbook", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 1, "data must be rescued to wordbook");
+        let word: String = conn
+            .query_row("SELECT word FROM wordbook", [], |r| r.get(0))
+            .expect("word");
+        assert_eq!(word, "风无心");
+        // 残留临时表已不存在
+        let temp_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='wordbook_new'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("temp count");
+        assert_eq!(temp_count, 0, "wordbook_new must be gone after rescue");
+    }
+
+    /// ② 构造「wordbook 真表存在 + wordbook_new 残留」→ init_schema → 残留被清理且真表数据未受影响
+    #[test]
+    fn fix001_drop_wordbook_new_when_true_table_present() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        // 真表 wordbook 存在且有数据
+        conn.execute_batch(WORD_SCHEMA).expect("build word schema");
+        conn.execute(
+            "INSERT INTO wordbook (word, source, created_at) \
+             VALUES ('真表数据', 'system', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert into wordbook");
+        // 构造残留 wordbook_new（半成品副本）
+        conn.execute_batch(
+            "CREATE TABLE wordbook_new (id INTEGER PRIMARY KEY, word TEXT, source TEXT, created_at TEXT);",
+        )
+        .expect("create stale wordbook_new");
+        conn.execute(
+            "INSERT INTO wordbook_new (word, source, created_at) \
+             VALUES ('半成品', 'user', '2024-01-02T00:00:00Z')",
+            [],
+        )
+        .expect("insert into stale wordbook_new");
+
+        // init_schema 应 DROP 残留 wordbook_new（真表存在 → _new 是无用半成品）
+        init_schema(&conn).expect("init with stale wordbook_new and true table present");
+
+        // 真表数据未受影响
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wordbook", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 1, "true table data must be preserved");
+        let word: String = conn
+            .query_row("SELECT word FROM wordbook", [], |r| r.get(0))
+            .expect("word");
+        assert_eq!(word, "真表数据");
+        // 残留已清理
+        let temp_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='wordbook_new'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("temp count");
+        assert_eq!(temp_count, 0, "stale wordbook_new must be dropped");
+    }
+
+    /// ③ candidates 侧同构造：wordbook_candidates 不存在 + wordbook_candidates_new 有数据 → 救回
+    #[test]
+    fn fix001_recover_candidates_new_when_true_table_missing() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        // 模拟崩在「DROP candidates 之后 RENAME 之前」
+        conn.execute_batch(WORD_SCHEMA).expect("build word schema");
+        // wordbook 真表存在（不受影响），但 candidates 被 DROP 了，candidates_new holding 数据
+        conn.execute_batch("ALTER TABLE wordbook_candidates RENAME TO wordbook_candidates_new;")
+            .expect("simulate candidates post-DROP pre-RENAME");
+        conn.execute(
+            "INSERT INTO wordbook_candidates_new (word, count, last_seen) \
+             VALUES ('风无心', 3, '2024-01-01')",
+            [],
+        )
+        .expect("insert into candidates_new");
+        // wordbook 也有数据（不应受 candidates 救援影响）
+        conn.execute(
+            "INSERT INTO wordbook (word, source, created_at) \
+             VALUES ('风无心', 'system', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert into wordbook");
+
+        // init_schema 应救回 candidates（RENAME），而非 DROP
+        init_schema(&conn).expect("init must rescue candidates_new");
+
+        // 断言：candidates 数据已救回
+        let cand_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wordbook_candidates", [], |r| r.get(0))
+            .expect("cand count");
+        assert_eq!(cand_count, 1, "candidates data must be rescued");
+        let cand_word_count: i64 = conn
+            .query_row(
+                "SELECT count FROM wordbook_candidates WHERE word = '风无心'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("cand word count");
+        assert_eq!(cand_word_count, 3, "candidate count must be preserved");
+        // wordbook 真表未受影响
+        let wb_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wordbook", [], |r| r.get(0))
+            .expect("wb count");
+        assert_eq!(wb_count, 1, "wordbook true table must be unaffected");
+        // 残留已不存在
+        let temp_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='wordbook_candidates_new'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("temp count");
+        assert_eq!(temp_count, 0, "candidates_new must be gone after rescue");
+    }
+
+    // ============================================================
+    // WORDBOOK-SCHEMA-FIX-001：schema 定义漂移防护对齐单测
+    // ============================================================
+
+    /// 对齐单测：分别构造状态 A（空库）与状态 B（旧词对库）跑完 init_schema，
+    /// 对比两者最终 schema 是否一致。用 pragma_table_info(wordbook) 列名有序列表 +
+    /// sqlite_master 中该表的索引名集合做断言。将来任何人只改一处 schema 定义，
+    /// 测试立刻红，漂移风险被机制化消除。
+    #[test]
+    fn fix001_schema_alignment_state_a_equals_state_b() {
+        // 状态 A：空库 → init_schema
+        let conn_a = Connection::open_in_memory().expect("in-memory db A");
+        init_schema(&conn_a).expect("init state A");
+        let cols_a: Vec<String> = conn_a
+            .prepare("SELECT name FROM pragma_table_info('wordbook') ORDER BY cid")
+            .expect("prepare A")
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query A")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect A");
+        let idx_a: Vec<String> = conn_a
+            .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='wordbook' ORDER BY name")
+            .expect("prepare idx A")
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query idx A")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect idx A");
+
+        // 状态 B：旧词对库 → init_schema
+        let conn_b = Connection::open_in_memory().expect("in-memory db B");
+        conn_b.execute_batch(MIGRATION_001).expect("migration 001");
+        conn_b.execute_batch(MIGRATION_002).expect("migration 002");
+        conn_b
+            .execute(
+                "INSERT INTO wordbook (raw, corrected, source, created_at) \
+                 VALUES ('原词', '保留词', 'user', '2024-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert old data");
+        init_schema(&conn_b).expect("init state B");
+        let cols_b: Vec<String> = conn_b
+            .prepare("SELECT name FROM pragma_table_info('wordbook') ORDER BY cid")
+            .expect("prepare B")
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query B")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect B");
+        let idx_b: Vec<String> = conn_b
+            .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='wordbook' ORDER BY name")
+            .expect("prepare idx B")
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query idx B")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect idx B");
+
+        assert_eq!(
+            cols_a, cols_b,
+            "wordbook columns must be identical between state A and state B"
+        );
+        assert_eq!(
+            idx_a, idx_b,
+            "wordbook index names must be identical between state A and state B"
+        );
     }
 }

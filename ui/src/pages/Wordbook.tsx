@@ -40,6 +40,7 @@ const WordbookPage: React.FC<Props> = ({ config }) => {
   const [activeTab, setActiveTab] = useState<'system' | 'user'>('system');
   const [entries, setEntries] = useState<Entry[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadFailed, setLoadFailed] = useState(false);
   const [showAddModal, setShowAddModal] = useState(false);
   const [newWord, setNewWord] = useState('');
   const [errorDialog, setErrorDialog] = useState<ErrorDialogState>(closeErrorDialogState);
@@ -49,11 +50,22 @@ const WordbookPage: React.FC<Props> = ({ config }) => {
   }, []);
 
   const loadEntries = async () => {
+    setLoading(true);
+    setLoadFailed(false);
     try {
       const data = await invoke<Entry[]>('get_wordbook_entries');
       setEntries(data);
     } catch (e) {
       console.error('Failed to load wordbook entries:', e);
+      setLoadFailed(true);
+      setErrorDialog({
+        show: true,
+        title: t.wordbook_load_failed,
+        message: sanitizeDialogMessage(
+          e instanceof Error ? e.message : String(e ?? ''),
+          t.wordbook_load_failed_fallback
+        ),
+      });
     } finally {
       setLoading(false);
     }
@@ -74,8 +86,11 @@ const WordbookPage: React.FC<Props> = ({ config }) => {
     } catch (e) {
       setErrorDialog({
         show: true,
-        title: '',
-        message: t.wordbook_delete_failed,
+        title: t.wordbook_delete_failed_title,
+        message: sanitizeDialogMessage(
+          e instanceof Error ? e.message : String(e ?? ''),
+          t.wordbook_delete_failed
+        ),
       });
     }
   };
@@ -147,6 +162,22 @@ const WordbookPage: React.FC<Props> = ({ config }) => {
       <div className="wordbook-content">
         {loading ? (
           <div className="wordbook-loading">{t.wordbook_loading}</div>
+        ) : loadFailed ? (
+          <div className="wordbook-empty wordbook-empty-failed">
+            <div className="wordbook-empty-icon">⚠</div>
+            <div className="wordbook-empty-title">{t.wordbook_load_failed}</div>
+            <div className="wordbook-empty-desc">{t.wordbook_load_failed_hint}</div>
+            <button className="btn btn-primary btn-accent" onClick={loadEntries}>
+              {t.wordbook_retry}
+            </button>
+          </div>
+        ) : filteredEntries.length === 0 ? (
+          <div className="wordbook-empty">
+            <div className="wordbook-empty-icon">📝</div>
+            <div className="wordbook-empty-title">
+              {activeTab === 'system' ? t.wordbook_empty_system : t.wordbook_empty_user}
+            </div>
+          </div>
         ) : (
           <div className="wordbook-labels">
             {filteredEntries.map(entry => (

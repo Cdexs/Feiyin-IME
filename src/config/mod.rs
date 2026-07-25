@@ -375,7 +375,10 @@ impl AppConfig {
             cfg.audio.asr_model = "performance".to_string();
             // 落盘保存迁移后的配置（避免下次启动重复迁移 + UI 与后台一致）
             if let Err(e) = cfg.save() {
-                log::warn!("ASR-HIDE-ACCURACY-001: failed to persist migrated config: {}", e);
+                log::warn!(
+                    "ASR-HIDE-ACCURACY-001: failed to persist migrated config: {}",
+                    e
+                );
             }
         }
 
@@ -436,7 +439,10 @@ impl AppConfig {
             cfg.audio.asr_model = "performance".to_string();
             // 落盘保存迁移后的配置（与 load 保持一致）
             if let Err(e) = cfg.save_to(path) {
-                log::warn!("ASR-HIDE-ACCURACY-001: failed to persist migrated config: {}", e);
+                log::warn!(
+                    "ASR-HIDE-ACCURACY-001: failed to persist migrated config: {}",
+                    e
+                );
             }
         }
 

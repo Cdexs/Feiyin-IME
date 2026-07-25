@@ -14,6 +14,11 @@ const MAX_ATTEMPTS: usize = ATTEMPT_TIMEOUTS.len();
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_millis(250);
 
+// WORDBOOK-AUTOLEARN-FIX-001-C: 词库建议词过滤上限（具名 const，端测后可一行调整）。
+// CJK 8 字比 DEC-029 hotwords 选取门槛 10 字更严（入库错了要人工删，故意收紧）。
+const MAX_CJK_CHARS: usize = 8;
+const MAX_TOTAL_CHARS: usize = 24;
+
 #[derive(Serialize)]
 struct ChatRequest {
     model: String,
@@ -356,12 +361,19 @@ impl LlmClient {
             .await?;
 
         // 解析双标签：从 <corrected> 后解析词库建议，从 <translated> 获取翻译结果
+        // WORDBOOK-AUTOLEARN-FIX-001-C: 交叉校验用 <corrected> 标签内文本（extract 一次）。
+        let corrected_text_for_filter = extract_corrected_tag(&response_text);
         let suggestions = {
-            let mut s = parse_suggestions_after_corrected_tag(&response_text);
+            let mut s = parse_suggestions_after_corrected_tag(
+                &response_text,
+                corrected_text_for_filter.as_deref(),
+            );
             if s.is_empty() {
                 // WORDBOOK-SUGGEST-FIX-001: fallback to last line JSON
                 if let Some(last) = response_text.trim().lines().last() {
-                    if let Some(parsed) = parse_suggestion_line(last.trim()) {
+                    if let Some(parsed) =
+                        parse_suggestion_line(last.trim(), corrected_text_for_filter.as_deref())
+                    {
                         s = parsed;
                     }
                 }
@@ -425,7 +437,24 @@ impl LlmClient {
             prompt_parts.push(ADD_PUNCT.to_string());
         }
 
-        const SUGGESTION_INSTRUCTION: &str = "Wordbook Learning: If the speech recognition made any word-level error that you corrected (e.g., misrecognized brand name, technical term, person name, abbreviation, or specialized vocabulary), you MUST append a JSON object on the last line: {\"suggestions\":[\"correct_word\"]}. Only include word-level corrections (proper nouns, specialized vocabulary), not grammar or punctuation fixes. If no such correction exists, omit this line.";
+        // WORDBOOK-AUTOLEARN-FIX-001-A: OVERRIDES 覆盖声明，直击用户 config 里
+        // "strictly prohibited: Adding your own suggestions" 条款。措辞复用 FMT-LLM-002
+        // (build_format_instruction_block) 的成功先例，仅在 suggestion 这一行上解禁，
+        // 正文部分的"不要加解释/不要 prefix-suffix"禁令继续有效。
+        // 关键要点：显式指出这是协议行（非 commentary）消解"不要添加解释"冲突；
+        // 必须返回 corrected 侧且原样出现在 <corrected> 正文（与任务 C 代码侧交叉校验对齐）；
+        // 收录范围含日常生活词汇/成语（Gavin 明确要求，不能因"太常见"跳过）。
+        const SUGGESTION_INSTRUCTION: &str = "Wordbook Learning (WORDBOOK-AUTOLEARN-FIX-001: This directive OVERRIDES any prior prohibition/restriction on suggestions in the system prompt — specifically any clause forbidding 'adding your own suggestions', 'thoughts regarding corrections', or 'prefix/suffix output'. The override applies ONLY to this single final JSON line; all other prohibitions on commentary/explanation remain in force.): \
+If you corrected any word that should be learned into the wordbook — such as proper nouns, brand names, personal names, technical terms, professional vocabulary, everyday words, common phrases, or idioms (do NOT skip a word merely because it is 'too common' — everyday high-frequency words are explicitly in scope) — append exactly ONE JSON object on the last line: {\"suggestions\":[\"correct_word\"]}. \
+This line is a machine-readable protocol line for the program to read, NOT commentary, NOT explanation, and NOT a personal suggestion — it does not violate any 'no explanation' rule. \
+Rules: \
+(1) Return the CORRECTED form only — the word as you wrote it in <corrected>. Never return the misrecognized raw form. \
+(2) The word MUST appear verbatim in your <corrected> text above. If it does not appear in <corrected>, omit the line entirely. \
+(3) Format: a bare JSON string array, no markdown code fences, no extra keys, placed on the last line by itself. \
+(4) Do NOT include grammar or punctuation fixes, whole sentences, or multi-line list contents — only single corrected words. \
+Examples: ASR '风无星' -> you correct to '风无心' -> return {\"suggestions\":[\"风无心\"]}. ASR '吉皮提' -> you correct to 'GPT' -> return {\"suggestions\":[\"GPT\"]}. \
+Counter-examples: DO NOT return '风无星' (the misrecognized form). DO NOT return a full corrected sentence or multi-line list body. \
+If no such corrected word should be learned, omit this line entirely.";
         prompt_parts.push(SUGGESTION_INSTRUCTION.to_string());
 
         // FMT-LLM-002 + FMT-LLM-003: OUTPUT_FORMAT 参数化（multiline_safe）。
@@ -757,9 +786,8 @@ fn input_contains_line(input_clean: &str, line: &str) -> bool {
 /// FMT-EMAIL-I18N-001: 补充日语（拝啓/様/よろしく）/韩语（님/안녕）模式，保持四语言防护对称。
 fn is_fabricated_salutation(line: &str) -> bool {
     // 中文称呼：尊敬的X/亲爱的X/各位X + 尾部 ：:，,
-    let cn_salutation = line.starts_with("尊敬的")
-        || line.starts_with("亲爱的")
-        || line.starts_with("各位");
+    let cn_salutation =
+        line.starts_with("尊敬的") || line.starts_with("亲爱的") || line.starts_with("各位");
     if cn_salutation && line.chars().count() <= 35 {
         return true;
     }
@@ -953,8 +981,10 @@ fn parse_suggestions_from_response(raw_text: &str) -> OptimizeResult {
         };
     }
 
+    // 有 <corrected> 标签分支：交叉校验用 extracted corrected 文本
     if let Some(corrected_text) = extract_corrected_tag(trimmed) {
-        let suggestions = parse_suggestions_after_corrected_tag(trimmed);
+        let suggestions =
+            parse_suggestions_after_corrected_tag(trimmed, Some(corrected_text.as_str()));
 
         return OptimizeResult {
             text: corrected_text,
@@ -965,7 +995,9 @@ fn parse_suggestions_from_response(raw_text: &str) -> OptimizeResult {
     let lines: Vec<&str> = trimmed.lines().collect();
     let last_line = lines.last().map(|line| line.trim()).unwrap_or("");
 
-    if let Some(suggestions) = parse_suggestion_line(last_line) {
+    // 无标签兜底分支：交叉校验用扣掉最后一行后的 text
+    let fallback_text: String = lines[..lines.len().saturating_sub(1)].join("\n");
+    if let Some(suggestions) = parse_suggestion_line(last_line, Some(fallback_text.as_str())) {
         if suggestions.is_empty() {
             return OptimizeResult {
                 text: trimmed.to_string(),
@@ -973,9 +1005,8 @@ fn parse_suggestions_from_response(raw_text: &str) -> OptimizeResult {
             };
         }
 
-        let text = lines[..lines.len().saturating_sub(1)].join("\n");
         return OptimizeResult {
-            text: text.trim().to_string(),
+            text: fallback_text.trim().to_string(),
             suggestions,
         };
     }
@@ -986,8 +1017,13 @@ fn parse_suggestions_from_response(raw_text: &str) -> OptimizeResult {
     }
 }
 
-/// 从 </corrected> 标签后的内容中解析词库建议 JSON
-fn parse_suggestions_after_corrected_tag(text: &str) -> Vec<SuggestionEntry> {
+/// 从 </corrected> 标签后的内容中解析词库建议 JSON。
+/// WORDBOOK-AUTOLEARN-FIX-001-C: `corrected_text` 透传给 `parse_suggestion_line`
+/// → `normalize_suggestions` 做正文交叉校验。调用方负责传入已 extract 的 corrected 文本。
+fn parse_suggestions_after_corrected_tag(
+    text: &str,
+    corrected_text: Option<&str>,
+) -> Vec<SuggestionEntry> {
     let after_tag = text
         .find("</corrected>")
         .map(|index| text[index + "</corrected>".len()..].trim())
@@ -1001,7 +1037,7 @@ fn parse_suggestions_after_corrected_tag(text: &str) -> Vec<SuggestionEntry> {
 
     after_tag
         .lines()
-        .find_map(|line| parse_suggestion_line(line.trim()))
+        .find_map(|line| parse_suggestion_line(line.trim(), corrected_text))
         .unwrap_or_default()
 }
 
@@ -1039,7 +1075,11 @@ fn extract_translated_tag(text: &str) -> Option<String> {
     }
 }
 
-fn parse_suggestion_line(line: &str) -> Option<Vec<SuggestionEntry>> {
+/// WORDBOOK-AUTOLEARN-FIX-001-C: `corrected_text` 透传给 `normalize_suggestions` 做正文交叉校验。
+/// - 有 `<corrected>` 标签分支 → 传 extracted corrected 文本
+/// - 无标签兜底分支 → 传扣掉最后一行后的 text
+/// - `None` → 跳过交叉校验，仅做结构性过滤
+fn parse_suggestion_line(line: &str, corrected_text: Option<&str>) -> Option<Vec<SuggestionEntry>> {
     if !line.starts_with('{') || !line.ends_with('}') {
         return None;
     }
@@ -1057,7 +1097,7 @@ fn parse_suggestion_line(line: &str) -> Option<Vec<SuggestionEntry>> {
     }
 
     if let Ok(envelope) = serde_json::from_str::<StringEnvelope>(line) {
-        return Some(normalize_suggestions(envelope.suggestions));
+        return Some(normalize_suggestions(envelope.suggestions, corrected_text));
     }
 
     // Fall back to old object format (backward compat with LLM returning {raw,corrected})
@@ -1067,17 +1107,112 @@ fn parse_suggestion_line(line: &str) -> Option<Vec<SuggestionEntry>> {
         .into_iter()
         .filter_map(|r| r.into_suggestion())
         .collect();
-    Some(normalize_suggestions(words))
+    Some(normalize_suggestions(words, corrected_text))
 }
 
-fn normalize_suggestions(words: Vec<String>) -> Vec<SuggestionEntry> {
+/// WORDBOOK-AUTOLEARN-FIX-001-C: normalize + 结构性过滤 + 正文交叉校验。
+///
+/// 关键铁律：**归一化结果仅用于比较，入库一律存 LLM 返回的原形**，绝不能存归一化后的小写形式。
+/// 否则 "GPT" 会变成 "gpt" 进词库，再喂回 LLM 词汇表会把纠正方向带反（比漏学更严重的污染）。
+///
+/// `corrected_text`：纠正后的正文，用于交叉校验"建议词必须出现在纠正后正文中"。
+///   - 有 `<corrected>` 标签分支 → 传 extracted corrected 文本
+///   - 无标签兜底分支 → 传扣掉最后一行后的 text
+///   - `None`（无法取得正文时） → 跳过交叉校验，仅做结构性过滤（向后兼容）
+///
+/// 过滤规则（顺序：结构性 → 长度 → 正文交叉校验）：
+///   1. trim + 空白折叠
+///   2. 拒绝含换行 `\n`/`\r`（实测有整段列表正文被当成词）
+///   3. 拒绝句末/分句标点 `。！？，；、：""''` 中英文引号（词内连接符 `·` `-` 等放行，否则
+///      `史蒂夫·乔布斯` 和 `GPT-4` 会被误杀）
+///   4. 拒绝纯数字 / 纯标点 / 纯空白（无信息量）
+///   5. 拒绝中文单字（长度 1 的纯 CJK 字符；DEC-029 hotwords 亦有类似取舍）
+///   6. 长度上限：CJK 字符数 ≤ `MAX_CJK_CHARS` 且 总字符数 ≤ `MAX_TOTAL_CHARS`
+///   7. 正文交叉校验：归一化后词未出现在归一化后正文中 → 拒绝（剔除错字侧与编造）
+///
+/// Gavin 明确不要加"通用词/常见词"过滤——日常生活词汇要支持。
+fn normalize_suggestions(words: Vec<String>, corrected_text: Option<&str>) -> Vec<SuggestionEntry> {
     let mut seen = HashSet::new();
     let mut normalized = Vec::new();
+
+    let normalized_text = corrected_text
+        .map(normalize_for_compare)
+        .unwrap_or_default();
 
     for word in words {
         let word = word.trim();
         if word.is_empty() {
             continue;
+        }
+
+        // 规则 2：含换行 → 拒绝（整段列表正文）
+        if word.contains('\n') || word.contains('\r') {
+            log::info!(
+                "WORDBOOK-AUTOLEARN-FIX-001-C: rejected suggestion (has_newline): {:?}",
+                word
+            );
+            continue;
+        }
+
+        // 规则 3：句末/分句标点黑名单（词内连接符放行）
+        if has_sentence_punct(word) {
+            log::info!(
+                "WORDBOOK-AUTOLEARN-FIX-001-C: rejected suggestion (has_sentence_punct): {:?}",
+                word
+            );
+            continue;
+        }
+
+        // 规则 4：纯数字 / 纯标点 / 纯空白
+        if is_pure_digits_or_punct_or_space(word) {
+            log::info!(
+                "WORDBOOK-AUTOLEARN-FIX-001-C: rejected suggestion (pure_digits_or_punct_or_space): {:?}",
+                word
+            );
+            continue;
+        }
+
+        // 规则 5：中文单字
+        if is_single_cjk(word) {
+            log::info!(
+                "WORDBOOK-AUTOLEARN-FIX-001-C: rejected suggestion (single_cjk): {:?}",
+                word
+            );
+            continue;
+        }
+
+        // 规则 6：长度上限
+        let cjk_count = count_cjk(word);
+        let total_chars = word.chars().count();
+        if cjk_count > MAX_CJK_CHARS {
+            log::info!(
+                "WORDBOOK-AUTOLEARN-FIX-001-C: rejected suggestion (too_long_cjk: {}>{}): {:?}",
+                cjk_count,
+                MAX_CJK_CHARS,
+                word
+            );
+            continue;
+        }
+        if total_chars > MAX_TOTAL_CHARS {
+            log::info!(
+                "WORDBOOK-AUTOLEARN-FIX-001-C: rejected suggestion (too_long_total: {}>{}): {:?}",
+                total_chars,
+                MAX_TOTAL_CHARS,
+                word
+            );
+            continue;
+        }
+
+        // 规则 7：正文交叉校验（有 corrected_text 时）
+        if !normalized_text.is_empty() {
+            let normalized_word = normalize_for_compare(word);
+            if normalized_word.is_empty() || !normalized_text.contains(&normalized_word) {
+                log::info!(
+                    "WORDBOOK-AUTOLEARN-FIX-001-C: rejected suggestion (not_in_corrected_text): {:?}",
+                    word
+                );
+                continue;
+            }
         }
 
         if seen.insert(word.to_string()) {
@@ -1088,6 +1223,84 @@ fn normalize_suggestions(words: Vec<String>) -> Vec<SuggestionEntry> {
     }
 
     normalized
+}
+
+/// 归一化用于交叉校验比较。强度（主控批准中等）：
+///   - trim + 折叠连续空白为单空格
+///   - to_lowercase（覆盖 "GPT." → "gpt" vs 正文 "GPT" → "gpt" 这类大小写/尾标点变体）
+///   - 不拆词、不改字符、不去连接符
+/// 铁律：仅用于比较，**绝不存入词库**（见 normalize_suggestions 文档）。
+fn normalize_for_compare(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            for lc in c.to_lowercase() {
+                out.push(lc);
+            }
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// 句末/分句标点黑名单。词内连接符与撇号（`·`、`-`、`_`、`'`、`’`）**放行**，
+/// 否则 `史蒂夫·乔布斯` / `GPT-4` / `O'Brien` / `don't` / `it's` 会被误杀——
+/// 英文所有格与缩写属 Gavin 明确要求收录的日常生活用语。
+///
+/// 主控验收修正（2026-07-25）：原实现把 ASCII 撇号 `'`(U+0027) 列入黑名单，
+/// 与本函数注释自相矛盾（注释声称放行），实测 `O'Brien` / `don't` 被拒；
+/// 且弯撇号 `’`(U+2019) 反而放行，两者行为不一致。已移除撇号条目；
+/// 同时去掉 `"`(U+0022) 与 `'`(U+0027) 各自的重复项（原意应为直/弯引号，
+/// 但弯引号已由 `“`/`”` 单独覆盖，重复的 ASCII 项是无效条目）。
+fn has_sentence_punct(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(
+            c,
+            '。' | '！'
+                | '？'
+                | '，'
+                | '；'
+                | '、'
+                | '：'
+                | '"'
+                | '“'
+                | '”'
+                | '.'
+                | '!'
+                | '?'
+                | ','
+                | ';'
+                | ':'
+        )
+    })
+}
+
+/// 纯数字 / 纯标点 / 纯空白 → 无信息量。
+fn is_pure_digits_or_punct_or_space(s: &str) -> bool {
+    !s.chars()
+        .any(|c| c.is_alphanumeric() && !c.is_ascii_digit())
+}
+
+/// 长度 1 的纯 CJK 字符 → 拒绝（无信息量且易误伤）。
+fn is_single_cjk(s: &str) -> bool {
+    s.chars().count() == 1
+        && s.chars()
+            .next()
+            .map(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c))
+            .unwrap_or(false)
+}
+
+/// 统计 CJK 范围字符数（用于长度上限的 CJK 判据）。
+fn count_cjk(s: &str) -> usize {
+    s.chars()
+        .filter(|c| ('\u{4E00}'..='\u{9FFF}').contains(c))
+        .count()
 }
 
 #[cfg(test)]
@@ -1416,11 +1629,13 @@ mod tests {
 
     #[test]
     fn parse_corrected_tag_with_suggestions() {
-        let raw = "<corrected>正常文本。</corrected>\n{\"suggestions\":[\"新词\"]}";
+        // WORDBOOK-AUTOLEARN-FIX-001-C: 建议词必须出现在纠正后正文中（交叉校验）。
+        // 用真实案例：正文含 "风无心"，建议词 "风无心" 通过。
+        let raw = "<corrected>风无心是个人物</corrected>\n{\"suggestions\":[\"风无心\"]}";
         let result = parse_suggestions_from_response(raw);
-        assert_eq!(result.text, "正常文本。");
+        assert_eq!(result.text, "风无心是个人物");
         assert_eq!(result.suggestions.len(), 1);
-        assert_eq!(result.suggestions[0].word, "新词");
+        assert_eq!(result.suggestions[0].word, "风无心");
     }
 
     // ============================================================
@@ -1625,6 +1840,7 @@ mod tests {
     }
 
     /// WORDBOOK-SUGGEST-FIX-001: SUGGESTION_INSTRUCTION is appended unconditionally.
+    /// WORDBOOK-AUTOLEARN-FIX-001-A: 措辞改为 OVERRIDES 覆盖声明版本。
     #[test]
     fn suggestions_instruction_always_appended() {
         let config = LlmConfig {
@@ -1633,7 +1849,7 @@ mod tests {
         };
         let client = LlmClient::new(config);
 
-        // Regardless of punctuation flag, the MUST instruction is present.
+        // Regardless of punctuation flag, the instruction is present.
         for punct_enabled in [true, false] {
             let request =
                 client.build_optimize_request("raw text", None, punct_enabled, None, false, false);
@@ -1645,15 +1861,22 @@ mod tests {
             assert!(
                 system_message
                     .content
-                    .contains("you MUST append a JSON object on the last line"),
+                    .contains("append exactly ONE JSON object on the last line"),
                 "SUGGESTION_INSTRUCTION must always be present (punctuation_enabled={})",
+                punct_enabled
+            );
+            assert!(
+                system_message.content.contains(
+                    "This directive OVERRIDES any prior prohibition/restriction on suggestions"
+                ),
+                "OVERRIDES cover clause must always be present (punctuation_enabled={})",
                 punct_enabled
             );
             assert!(
                 system_message
                     .content
-                    .contains("Only include word-level corrections"),
-                "Suggestion restriction clause must always be present (punctuation_enabled={})",
+                    .contains("do NOT skip a word merely because it is 'too common'"),
+                "Everyday-words-in-scope clause must always be present (punctuation_enabled={})",
                 punct_enabled
             );
         }
@@ -1664,7 +1887,7 @@ mod tests {
     fn parse_suggestions_after_corrected_tag_fallbacks_to_last_line() {
         // Old format (backward compat): {raw,corrected} → takes corrected as word
         let response = "<corrected>词库</corrected>\n{\"suggestions\":[{\"raw\":\"词裤\",\"corrected\":\"词库\"}]}";
-        let suggestions = parse_suggestions_after_corrected_tag(response);
+        let suggestions = parse_suggestions_after_corrected_tag(response, Some("词库"));
         assert_eq!(
             suggestions,
             vec![SuggestionEntry {
@@ -1677,7 +1900,7 @@ mod tests {
     #[test]
     fn parse_suggestions_after_corrected_tag_no_json_returns_empty() {
         let response = "<corrected>词库</corrected>\nplain text after tag";
-        let suggestions = parse_suggestions_after_corrected_tag(response);
+        let suggestions = parse_suggestions_after_corrected_tag(response, Some("词库"));
         assert!(suggestions.is_empty());
     }
 
@@ -1690,10 +1913,10 @@ mod tests {
 
         // Simulate the fallback logic from optimize_and_translate() Lines 293-298
         let suggestions = {
-            let mut s = parse_suggestions_after_corrected_tag(response_text);
+            let mut s = parse_suggestions_after_corrected_tag(response_text, Some("hello"));
             if s.is_empty() {
                 if let Some(last) = response_text.trim().lines().last() {
-                    if let Some(parsed) = parse_suggestion_line(last.trim()) {
+                    if let Some(parsed) = parse_suggestion_line(last.trim(), Some("hello")) {
                         s = parsed;
                     }
                 }
@@ -1761,9 +1984,10 @@ mod tests {
     #[test]
     fn parses_trailing_json_suggestions_line() {
         // New format: {"suggestions":["PPT"]}
+        // WORDBOOK-AUTOLEARN-FIX-001-C: 正文必须含 PPT 才能通过交叉校验。
         let result =
-            parse_suggestions_from_response("Corrected text.\n{\"suggestions\":[\"PPT\"]}");
-        assert_eq!(result.text, "Corrected text.");
+            parse_suggestions_from_response("Use PPT for slides.\n{\"suggestions\":[\"PPT\"]}");
+        assert_eq!(result.text, "Use PPT for slides.");
         assert_eq!(
             result.suggestions,
             vec![SuggestionEntry {
@@ -1787,10 +2011,11 @@ mod tests {
     fn filters_empty_and_duplicate_suggestions() {
         // New format: {"suggestions":[" PPT ","PPT","PPT",""]}
         // Should dedupe to ["PPT"] (trim + dedup + remove empty)
+        // WORDBOOK-AUTOLEARN-FIX-001-C: 正文必须含 PPT 才能通过交叉校验。
         let result = parse_suggestions_from_response(
-            "Corrected text.\n{\"suggestions\":[\" PPT \",\"PPT\",\"PPT\",\"\"]}",
+            "Use PPT for slides.\n{\"suggestions\":[\" PPT \",\"PPT\",\"PPT\",\"\"]}",
         );
-        assert_eq!(result.text, "Corrected text.");
+        assert_eq!(result.text, "Use PPT for slides.");
         assert_eq!(
             result.suggestions,
             vec![SuggestionEntry {
@@ -1981,10 +2206,11 @@ mod tests {
 
     #[test]
     fn parses_new_word_format_multiple_suggestions() {
+        // WORDBOOK-AUTOLEARN-FIX-001-C: 正文必须含 PPT/API/GPT 才能通过交叉校验。
         let result = parse_suggestions_from_response(
-            "Corrected text.\n{\"suggestions\":[\"PPT\",\"API\",\"GPT\"]}",
+            "Use PPT, API and GPT.\n{\"suggestions\":[\"PPT\",\"API\",\"GPT\"]}",
         );
-        assert_eq!(result.text, "Corrected text.");
+        assert_eq!(result.text, "Use PPT, API and GPT.");
         assert_eq!(result.suggestions.len(), 3);
         assert!(result.suggestions.contains(&SuggestionEntry {
             word: "PPT".to_string()
@@ -2050,5 +2276,234 @@ mod tests {
                 .contains("{\"suggestions\":[\"correct_word\"]}"),
             "SUGGESTION_INSTRUCTION must use new word format"
         );
+    }
+
+    // ============================================================
+    // WORDBOOK-AUTOLEARN-FIX-001-C: 入库前过滤（正文交叉校验 + 结构性过滤）
+    // ============================================================
+
+    /// 正文交叉校验：建议词出现在正文中 → 保留（真实案例 风无心）
+    #[test]
+    fn fix001_keeps_suggestion_in_corrected_text() {
+        let result = parse_suggestions_from_response(
+            "<corrected>风无心是个人物</corrected>\n{\"suggestions\":[\"风无心\"]}",
+        );
+        assert_eq!(result.suggestions.len(), 1);
+        assert_eq!(result.suggestions[0].word, "风无心");
+    }
+
+    /// 正文交叉校验：建议词未出现在正文中 → 拒绝（错字侧 风无星）
+    #[test]
+    fn fix001_rejects_suggestion_not_in_corrected_text() {
+        // 正文是 "风无心"，建议词 "风无星" 是已被改掉的错字侧 → 必须拒绝
+        let result = parse_suggestions_from_response(
+            "<corrected>风无心是个人物</corrected>\n{\"suggestions\":[\"风无星\"]}",
+        );
+        assert!(result.suggestions.is_empty(), "错字侧应被交叉校验剔除");
+    }
+
+    /// 日常生活词汇出现在正文时必须保留（防未来"优化"成过滤通用词）
+    #[test]
+    fn fix001_keeps_everyday_word_in_corrected_text() {
+        // 时代 / 吉他 / 惊心动魄 都是 Gavin 明确要保留的日常词
+        let result = parse_suggestions_from_response(
+            "<corrected>这个时代让人惊心动魄的吉他曲</corrected>\n{\"suggestions\":[\"时代\",\"吉他\",\"惊心动魄\"]}",
+        );
+        assert_eq!(result.suggestions.len(), 3);
+        let words: Vec<&str> = result.suggestions.iter().map(|s| s.word.as_str()).collect();
+        assert!(words.contains(&"时代"));
+        assert!(words.contains(&"吉他"));
+        assert!(words.contains(&"惊心动魄"));
+    }
+
+    /// 拒绝含换行的整段列表正文
+    #[test]
+    fn fix001_rejects_multiline_suggestion() {
+        let result = parse_suggestions_from_response(
+            "<corrected>第一点\n第二点</corrected>\n{\"suggestions\":[\"第一点\n第二点\"]}",
+        );
+        assert!(result.suggestions.is_empty(), "含换行的整段正文应被拒绝");
+    }
+
+    /// 长度上限边界：中文 8 字保留 / 9 字拒绝
+    #[test]
+    fn fix001_length_limit_cjk_8_kept_9_rejected() {
+        // 8 字 CJK 在正文中 → 保留
+        let text_8 = "一二三四五六七八";
+        let raw = format!(
+            "<corrected>{}</corrected>\n{{\"suggestions\":[\"{}\"]}}",
+            text_8, text_8
+        );
+        let result = parse_suggestions_from_response(&raw);
+        assert_eq!(result.suggestions.len(), 1, "8 字 CJK 应保留");
+        // 9 字 CJK → 拒绝
+        let result = parse_suggestions_from_response(
+            "<corrected>一二三四五六七八九</corrected>\n{\"suggestions\":[\"一二三四五六七八九\"]}",
+        );
+        assert!(result.suggestions.is_empty(), "9 字 CJK 应拒绝");
+    }
+
+    /// 长度上限边界：ASCII 24 字符保留 / 25 字符拒绝
+    #[test]
+    fn fix001_length_limit_ascii_24_kept_25_rejected() {
+        // 24 字符 ASCII 在正文中 → 保留
+        let word_24 = "a".repeat(24);
+        let raw = format!(
+            "<corrected>{}</corrected>\n{{\"suggestions\":[\"{}\"]}}",
+            word_24, word_24
+        );
+        let result = parse_suggestions_from_response(&raw);
+        assert_eq!(result.suggestions.len(), 1, "24 字符 ASCII 应保留");
+        // 25 字符 ASCII → 拒绝
+        let word_25 = "a".repeat(25);
+        let raw = format!(
+            "<corrected>{}</corrected>\n{{\"suggestions\":[\"{}\"]}}",
+            word_25, word_25
+        );
+        let result = parse_suggestions_from_response(&raw);
+        assert!(result.suggestions.is_empty(), "25 字符 ASCII 应拒绝");
+    }
+
+    /// 拒绝句读（含 。！？，；、： 中英文引号）
+    #[test]
+    fn fix001_rejects_sentence_punct() {
+        // 词内连接符（· -）放行，句末标点拒绝
+        let result = parse_suggestions_from_response(
+            "<corrected>这是一句话。</corrected>\n{\"suggestions\":[\"一句话。\"]}",
+        );
+        assert!(result.suggestions.is_empty(), "含句末标点应拒绝");
+    }
+
+    /// 词内连接符 · - _ 必须放行（史蒂夫·乔布斯 / GPT-4 / snake_case 不误杀）
+    #[test]
+    fn fix001_keeps_intra_word_connector() {
+        let result = parse_suggestions_from_response(
+            "<corrected>史蒂夫·乔布斯与 GPT-4 using snake_case</corrected>\n{\"suggestions\":[\"史蒂夫·乔布斯\",\"GPT-4\",\"snake_case\"]}",
+        );
+        assert_eq!(result.suggestions.len(), 3, "词内连接符 · - _ 不应误杀");
+        let words: Vec<&str> = result.suggestions.iter().map(|s| s.word.as_str()).collect();
+        assert!(words.contains(&"史蒂夫·乔布斯"));
+        assert!(words.contains(&"GPT-4"));
+        assert!(words.contains(&"snake_case"));
+    }
+
+    /// 拒绝纯数字
+    #[test]
+    fn fix001_rejects_pure_digits() {
+        let result = parse_suggestions_from_response(
+            "<corrected>这是5</corrected>\n{\"suggestions\":[\"5\"]}",
+        );
+        assert!(result.suggestions.is_empty(), "纯数字应拒绝");
+    }
+
+    /// 拒绝中文单字
+    #[test]
+    fn fix001_rejects_single_cjk() {
+        let result = parse_suggestions_from_response(
+            "<corrected>奔向远方</corrected>\n{\"suggestions\":[\"奔\"]}",
+        );
+        assert!(result.suggestions.is_empty(), "中文单字应拒绝");
+    }
+
+    /// 大小写折叠：正文 "GPT" 应匹配建议词 "gpt" 变体（但入库存原形）
+    #[test]
+    fn fix001_case_fold_match_keeps_original_form() {
+        // 建议 LLM 返回 "gpt"（小写变体），正文是 "GPT"
+        // 归一化后两边都是 "gpt" → 命中保留；但入库存的是 LLM 返回的原形 "gpt"
+        let result = parse_suggestions_from_response(
+            "<corrected>Use GPT for it</corrected>\n{\"suggestions\":[\"gpt\"]}",
+        );
+        assert_eq!(result.suggestions.len(), 1, "大小写变体应通过交叉校验");
+        assert_eq!(
+            result.suggestions[0].word, "gpt",
+            "入库存 LLM 返回的原形，非归一化后形式"
+        );
+    }
+
+    /// 尾标点变体：建议词 "GPT." 含句末标点 → 直接拒绝（结构性规则先于交叉校验）
+    #[test]
+    fn fix001_trailing_punct_rejected_by_structure() {
+        let result = parse_suggestions_from_response(
+            "<corrected>Use GPT for it</corrected>\n{\"suggestions\":[\"GPT.\"]}",
+        );
+        // "GPT." 含句末标点 → 规则 3 直接拒绝（不是因交叉校验）
+        assert!(result.suggestions.is_empty(), "含句末标点的建议词应拒绝");
+    }
+
+    /// 旧格式 {raw,corrected} 兼容分支仍可解析（不得回归）
+    #[test]
+    fn fix001_backward_compat_old_raw_corrected_format_still_works() {
+        // 老格式 {raw,corrected} → 取 corrected 作为 word，且通过交叉校验
+        let result = parse_suggestions_from_response(
+            "<corrected>词库</corrected>\n{\"suggestions\":[{\"raw\":\"词裤\",\"corrected\":\"词库\"}]}",
+        );
+        assert_eq!(result.text, "词库");
+        assert_eq!(result.suggestions.len(), 1);
+        assert_eq!(result.suggestions[0].word, "词库");
+    }
+
+    /// 无标签兜底分支也走交叉校验
+    #[test]
+    fn fix001_fallback_branch_cross_check() {
+        // 无 <corrected> 标签，建议词 "PPT" 出现在正文 "Use PPT" → 保留
+        let result =
+            parse_suggestions_from_response("Use PPT for slides.\n{\"suggestions\":[\"PPT\"]}");
+        assert_eq!(result.suggestions.len(), 1);
+        assert_eq!(result.suggestions[0].word, "PPT");
+        // 无标签兜底分支，建议词 "XYZ" 不在正文 "Use PPT" → 拒绝
+        let result =
+            parse_suggestions_from_response("Use PPT for slides.\n{\"suggestions\":[\"XYZ\"]}");
+        assert!(result.suggestions.is_empty(), "兜底分支也必须走交叉校验");
+    }
+
+    // ============================================================
+    // WORDBOOK-AUTOLEARN-FIX-001-C — 主控验收修正：has_sentence_punct 撇号放行
+    // ============================================================
+
+    /// 英文所有格与缩写保留：O'Brien / don't / it's
+    /// has_sentence_punct 原黑名单误含 ASCII 撇号 ' (U+0027)，主控已移除。
+    #[test]
+    fn fix001_keeps_apostrophe_words() {
+        let result = parse_suggestions_from_response(
+            "<corrected>O'Brien said don't touch it's fine</corrected>\n{\"suggestions\":[\"O'Brien\",\"don't\",\"it's\"]}",
+        );
+        assert_eq!(result.suggestions.len(), 3, "英文所有格与缩写应全部保留");
+        let words: Vec<&str> = result.suggestions.iter().map(|s| s.word.as_str()).collect();
+        assert!(words.contains(&"O'Brien"));
+        assert!(words.contains(&"don't"));
+        assert!(words.contains(&"it's"));
+    }
+
+    /// 弯撇号版本 it's 同样保留（直/弯撇号行为一致）
+    #[test]
+    fn fix001_keeps_curly_apostrophe() {
+        let result = parse_suggestions_from_response(
+            "<corrected>it\u{2019}s fine</corrected>\n{\"suggestions\":[\"it\u{2019}s\"]}",
+        );
+        assert_eq!(result.suggestions.len(), 1, "弯撇号 it\u{2019}s 应保留");
+        assert_eq!(result.suggestions[0].word, "it\u{2019}s");
+    }
+
+    /// 句末标点变体均被拒绝（。 / . / ， / ,）——防未来有人把整个黑名单删空
+    #[test]
+    fn fix001_rejects_ending_punct_variants() {
+        for (label, punct_word) in [
+            ("句号", "一句话。"),
+            ("英文句点", "word."),
+            ("中文逗", "word，"),
+            ("英文逗", "word,"),
+        ] {
+            let raw = format!(
+                "<corrected>this is {} context</corrected>\n{{\"suggestions\":[\"{}\"]}}",
+                punct_word, punct_word
+            );
+            let result = parse_suggestions_from_response(&raw);
+            assert!(
+                result.suggestions.is_empty(),
+                "{}（{:?}）应被拒绝",
+                label,
+                punct_word
+            );
+        }
     }
 }

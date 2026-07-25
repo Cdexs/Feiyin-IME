@@ -60,8 +60,7 @@ fn main() {
             language: Some("auto".to_string()),
             use_itn: true,
         };
-        recognizer_config.model_config.tokens =
-            Some(tokens_path.to_str().unwrap().to_string());
+        recognizer_config.model_config.tokens = Some(tokens_path.to_str().unwrap().to_string());
         recognizer_config.blank_penalty = cfg.blank_penalty;
     } else {
         // funasr-nano native
@@ -70,13 +69,13 @@ fn main() {
         let emb = model_root.join("embedding.int8.onnx");
         let tok = model_root.join("Qwen3-0.6B");
         recognizer_config.model_config.funasr_nano = OfflineFunASRNanoModelConfig {
-                encoder_adaptor: Some(enc.to_str().unwrap().to_string()),
-                llm: Some(llm.to_str().unwrap().to_string()),
-                embedding: Some(emb.to_str().unwrap().to_string()),
-                tokenizer: Some(tok.to_str().unwrap().to_string()),
-                system_prompt: Some("You are a helpful assistant.".to_string()),
-                user_prompt: Some("语音转写:".to_string()),
-                max_new_tokens: cfg.max_new_tokens,
+            encoder_adaptor: Some(enc.to_str().unwrap().to_string()),
+            llm: Some(llm.to_str().unwrap().to_string()),
+            embedding: Some(emb.to_str().unwrap().to_string()),
+            tokenizer: Some(tok.to_str().unwrap().to_string()),
+            system_prompt: Some("You are a helpful assistant.".to_string()),
+            user_prompt: Some("语音转写:".to_string()),
+            max_new_tokens: cfg.max_new_tokens,
             temperature: cfg.temperature,
             top_p: cfg.top_p,
             seed: cfg.seed,
@@ -119,10 +118,7 @@ fn main() {
             let secs = t0.elapsed().as_secs_f64();
             sum_secs += secs;
             let result = stream.get_result();
-            let text = result
-                .as_ref()
-                .map(|r| r.text.clone())
-                .unwrap_or_default();
+            let text = result.as_ref().map(|r| r.text.clone()).unwrap_or_default();
             let rtf = secs / audio_dur;
             println!(
                 "  run {}: {:.3}s, RTF={:.4}, text={}",
@@ -205,7 +201,9 @@ fn parse_args(args: &[String]) -> Result<PocConfig, String> {
                 if i >= args.len() {
                     return Err("--threads requires value".into());
                 }
-                threads = args[i].parse().map_err(|_| "invalid --threads".to_string())?;
+                threads = args[i]
+                    .parse()
+                    .map_err(|_| "invalid --threads".to_string())?;
             }
             "--repeat" => {
                 i += 1;
@@ -246,18 +244,14 @@ fn parse_args(args: &[String]) -> Result<PocConfig, String> {
                 if i >= args.len() {
                     return Err("--top-p requires value".into());
                 }
-                top_p = args[i]
-                    .parse()
-                    .map_err(|_| "invalid --top-p".to_string())?;
+                top_p = args[i].parse().map_err(|_| "invalid --top-p".to_string())?;
             }
             "--seed" => {
                 i += 1;
                 if i >= args.len() {
                     return Err("--seed requires value".into());
                 }
-                seed = args[i]
-                    .parse()
-                    .map_err(|_| "invalid --seed".to_string())?;
+                seed = args[i].parse().map_err(|_| "invalid --seed".to_string())?;
             }
             "--max-new-tokens" => {
                 i += 1;

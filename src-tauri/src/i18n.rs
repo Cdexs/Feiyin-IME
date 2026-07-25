@@ -217,9 +217,9 @@ static ZH: Strings = Strings {
 
 Example: If wordbook contains "PPT -> 演示文稿" and input contains "PPT", output should use "演示文稿" (or keep "PPT" depending on mapping direction).
 
-7. **Wordbook Suggestions**: After the corrected text, if you detect a stable correction pair that should be learned into the wordbook, append exactly one JSON object on a new final line:
-{"suggestions":[{"raw":"...","corrected":"..."}]}
-Only use this JSON line for suggestions. If there are no suggestions, omit it entirely.
+7. **Wordbook Suggestions**: After the corrected text, if you corrected any word that should be learned into the wordbook — such as proper nouns, brand names, personal names, technical terms, professional vocabulary, everyday words, common phrases, or idioms — append exactly one JSON object on a new final line:
+{"suggestions":["correct_word"]}
+Only return the corrected form, and the word MUST appear verbatim in your <corrected> text above. Never return the misrecognized raw form. Only use this JSON line for suggestions. If there are no suggestions, omit it entirely.
 
 Return ONLY the processed text. No explanations."#,
     dialog_save: "保存",
@@ -361,9 +361,9 @@ static ZH_TW: Strings = Strings {
 
 Example: If wordbook contains "PPT -> 演示文稿" and input contains "PPT", output should use "演示文稿" (or keep "PPT" depending on mapping direction).
 
-7. **Wordbook Suggestions**: After the corrected text, if you detect a stable correction pair that should be learned into the wordbook, append exactly one JSON object on a new final line:
-{"suggestions":[{"raw":"...","corrected":"..."}]}
-Only use this JSON line for suggestions. If there are no suggestions, omit it entirely.
+7. **Wordbook Suggestions**: After the corrected text, if you corrected any word that should be learned into the wordbook — such as proper nouns, brand names, personal names, technical terms, professional vocabulary, everyday words, common phrases, or idioms — append exactly one JSON object on a new final line:
+{"suggestions":["correct_word"]}
+Only return the corrected form, and the word MUST appear verbatim in your <corrected> text above. Never return the misrecognized raw form. Only use this JSON line for suggestions. If there are no suggestions, omit it entirely.
 
 Return ONLY the processed text. No explanations."#,
     dialog_save: "儲存",
@@ -505,9 +505,9 @@ static EN: Strings = Strings {
 
 Example: If wordbook contains "PPT -> 演示文稿" and input contains "PPT", output should use "演示文稿" (or keep "PPT" depending on mapping direction).
 
-7. **Wordbook Suggestions**: After the corrected text, if you detect a stable correction pair that should be learned into the wordbook, append exactly one JSON object on a new final line:
-{"suggestions":[{"raw":"...","corrected":"..."}]}
-Only use this JSON line for suggestions. If there are no suggestions, omit it entirely.
+7. **Wordbook Suggestions**: After the corrected text, if you corrected any word that should be learned into the wordbook — such as proper nouns, brand names, personal names, technical terms, professional vocabulary, everyday words, common phrases, or idioms — append exactly one JSON object on a new final line:
+{"suggestions":["correct_word"]}
+Only return the corrected form, and the word MUST appear verbatim in your <corrected> text above. Never return the misrecognized raw form. Only use this JSON line for suggestions. If there are no suggestions, omit it entirely.
 
 Return ONLY the processed text. No explanations."#,
     dialog_save: "Save",
