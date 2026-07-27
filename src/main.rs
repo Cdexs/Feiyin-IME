@@ -2967,6 +2967,19 @@ fn run_pipeline(
                     };
                     let multiline_safe = scene_context.multiline_safe;
                     let send_window_title = config.scene.send_window_title;
+                    // SCENE-OBS-001: 场景感知可观测性日志。
+                    // 隐私红线：禁止打印 window_title（send_window_title 默认 false 是刻意隐私边界，
+                    // 日志同样遵守）。f4_injected 判据与 build_scene_prompt_block 的 None 条件一致：
+                    // 非 Unknown 且 style_hint 非空（不重复调用 build_scene_prompt_block 产生副作用）。
+                    let f4_injected =
+                        !scene_context.is_unknown() && !scene_context.style_hint.trim().is_empty();
+                    log::info!(
+                        "Scene context: app_exe={:?}, kind={}, multiline_safe={}, f4_injected={}",
+                        scene_context.app_exe,
+                        scene_context.scene.as_str(),
+                        multiline_safe,
+                        f4_injected,
+                    );
                     // TRANS-008 B方案: translate=true 时走 LLM optimize+translate；translate=false 走 LLM optimize
                     // translate=false 閺冭绱濋崢鐔告箒 LLM optimize 鐠侯垰绶炴稉宥呭綁
                     let mut llm_handled = false;
@@ -2995,8 +3008,10 @@ fn run_pipeline(
                             event_tx,
                             PipelineEvent::Processing(processing_msg.to_string()),
                         );
-                        let script_instruction =
-                            text_normalizer::script_instruction(&text, config.audio.chinese_script);
+                        let script_instruction = text_normalizer::script_instruction_for_translate(
+                            &text,
+                            config.audio.chinese_script,
+                        );
                         if should_try_llm_translate(
                             config.llm.enabled,
                             config.llm.connectivity_verified,

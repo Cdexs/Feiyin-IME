@@ -252,7 +252,7 @@ impl CompiledRules {
     }
 
     /// TEMP-CELSIUS-001: 查找最长匹配的单位词，返回 (字符长度, 单位词原文)。
-    /// 供调用方判定是否含"摄氏"关键词触发 °C 符号替换。
+    /// 供调用方判定是否含"摄氏"关键词触发 ℃ 符号替换。
     fn match_unit_word<'a>(&self, chars: &'a [char], pos: usize) -> Option<(usize, String)> {
         if pos >= chars.len() {
             return None;
@@ -754,11 +754,11 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
                             }
                             result.push_str(&num_str);
                         }
-                        // TEMP-CELSIUS-001: 摄氏关键词 → 输出 °C 符号
-                        // 与 below_zero_style 联动（minus→"-10°C"，text→"零下10°C"）
+                        // TEMP-CELSIUS-001: 摄氏关键词 → 输出 ℃ 符号
+                        // 与 below_zero_style 联动（minus→"-10℃"，text→"零下10℃"）
                         if let Some((unit_len, unit_word)) = r.match_unit_word(&chars, after_num) {
                             if unit_word.contains("摄氏") {
-                                result.push_str("°C");
+                                result.push_str("℃");
                                 i = after_num + unit_len;
                                 continue;
                             }
@@ -794,12 +794,12 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
 
                     if should_convert {
                         result.push_str(&num_str);
-                        // TEMP-CELSIUS-001: 摄氏关键词 → 输出 °C 符号
-                        // 仅当匹配单位词含"摄氏"时替换（"三十摄氏度"→"30°C"，
+                        // TEMP-CELSIUS-001: 摄氏关键词 → 输出 ℃ 符号
+                        // 仅当匹配单位词含"摄氏"时替换（"三十摄氏度"→"30℃"，
                         // "三十度"→"30度" 不变）。after_num 处即单位起点。
                         if let Some((unit_len, unit_word)) = r.match_unit_word(&chars, after_num) {
                             if unit_word.contains("摄氏") {
-                                result.push_str("°C");
+                                result.push_str("℃");
                                 i = after_num + unit_len;
                                 continue;
                             }
@@ -1269,31 +1269,31 @@ mod tests {
     }
 
     // ============================================================
-    // TEMP-CELSIUS-001: 摄氏度符号 °C（仅"摄氏"关键词触发）
+    // TEMP-CELSIUS-001: 摄氏度符号 ℃（仅"摄氏"关键词触发）
     // ============================================================
 
     #[test]
     fn temp_celsius_basic() {
-        // "三十摄氏度" → "30°C"
-        assert_eq!(normalize_test("三十摄氏度"), "30°C");
+        // "三十摄氏度" → "30℃"
+        assert_eq!(normalize_test("三十摄氏度"), "30℃");
     }
 
     #[test]
     fn temp_celsius_in_sentence() {
-        // "今天三十摄氏度" → "今天30°C"
-        assert_eq!(normalize_test("今天三十摄氏度"), "今天30°C");
+        // "今天三十摄氏度" → "今天30℃"
+        assert_eq!(normalize_test("今天三十摄氏度"), "今天30℃");
     }
 
     #[test]
     fn temp_bare_degree_not_converted() {
-        // 裸"度"不转 °C（避免误判角度等其他语境）
+        // 裸"度"不转 ℃（避免误判角度等其他语境）
         assert_eq!(normalize_test("今天三十度"), "今天30度");
     }
 
     #[test]
     fn temp_celsius_below_zero_text_style() {
-        // "零下十摄氏度" + text 风格 → "零下10°C"
-        assert_eq!(normalize_test("零下十摄氏度"), "零下10°C");
+        // "零下十摄氏度" + text 风格 → "零下10℃"
+        assert_eq!(normalize_test("零下十摄氏度"), "零下10℃");
     }
 
     #[test]
@@ -1304,8 +1304,8 @@ below_zero_style = "minus"
 [units.temperature]
 words = ["度", "摄氏度"]
 "#;
-        // "零下十摄氏度" + minus 风格 → "-10°C"
-        assert_eq!(normalize_with(custom, "零下十摄氏度"), "-10°C");
+        // "零下十摄氏度" + minus 风格 → "-10℃"
+        assert_eq!(normalize_with(custom, "零下十摄氏度"), "-10℃");
     }
 
     #[test]
@@ -1316,8 +1316,8 @@ words = ["度", "摄氏度"]
 
     #[test]
     fn temp_celsius_single_digit() {
-        // "五摄氏度" → "5°C"（单字+温度单位 → 转）
-        assert_eq!(normalize_test("五摄氏度"), "5°C");
+        // "五摄氏度" → "5℃"（单字+温度单位 → 转）
+        assert_eq!(normalize_test("五摄氏度"), "5℃");
     }
 
     // ============================================================

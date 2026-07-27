@@ -26,8 +26,17 @@
 | FORMAT-UI-POLISH-001 | LLM 设置页样式精修：Llm.tsx API URL/Key 输入框独占整行（避免拥挤）+ 状态条独立成块 + styles.css 新增 llm-api-card 等 CSS 类（卡片化布局，视觉层次清晰） | coder-2 | 2026-07-24 |
 | LANG-AUTO-001-UI | 语言自动 UI 清理：Voice.tsx 删输入语言区块 + HotkeySettings.tsx 删目标语言派生逻辑 + i18n 三语删 11 key + src-tauri/src/config.rs 加 Deprecated 注释 + **修复 src/crash:114 asr_model 误填 transcription_language 的 bug**（崩溃报告字段错填修复）+ Voice.test.tsx combobox 索引调整适配删除后的选项顺序 | coder-2 | 2026-07-24 |
 | GIT-AUDIT-001 | git 仓库同步状态只读审计：核对本地代码是否完整提交并推送到 GitHub；严格 5 类只读命令（status/diff/log/show/fetch）无任何写操作；结论：远程领先本地=空✅，本地领先远程=1 提交 f2240b7 未推送，未提交改动经 -w 核实仅 CHANGELOG +3 行真实（其余 15 文件系 CRLF↔LF 行尾符差异误报），未跟踪文件 nth=1（0 字节误产物）；git 事故重做成果已完整落盘无丢失，唯一缺口=f2240b7 未推送 | coder-1 | 2026-07-24 |
+## v0.7.2-dev — 2026-07-27 批次（测试同步）
+
+| 编号 | 说明 | 负责人 | 完成时间 |
+| --- | --- | --- | --- |
+| TEST-SYNC-20260727 | 测试同步（P0~P3）：P0=补 6 条 strip_asr_special_tokens 边界测试（串首/串尾/已有空格/全角标点/连续多 token/空串）；P1=补 2 条 normalize 函数对含假名日文汉字零改变断言（龍→龙、亞→亚）；P2=审计旧措辞断言无精确字符串绑定；P3=评估 Vitest/pytest 无需同步；仅改 `src/transcription/mod.rs` + `src/text_normalizer.rs` `#[cfg(test)]` 块；cargo check --tests 0 errors | tester-1 | 2026-07-27 |
+| TEST-EXEC-20260727 | 全量回归：Step 1 ✅ 672 PASS / 0 FAIL / 8 IGNORED（主程序）；Step 1b ✅ 53 PASS / 0 FAIL / 0 IGNORED（Tauri 后端）；Step 2/3/4 SKIP（全 Rust 改动、不出包）；4 类高风险用例全部 PASS；不出包 | tester-1 | 2026-07-27 |
+
 | TEST-SYNC-REBUILD-001 | 测试同步：15 项（REBUILD-LOST-001 后端 11 + 前端 4）全量审计，覆盖充分，未改动任何文件（git status 核实）；主控独立抽查最高风险点全部属实——itn.rs 历史词保护 71 条 #[test]、scene/mod.rs 46 条、llm/mod.rs 日韩防编造 10 条（多于记录的 8 条）、config/mod.rs:968 ASR-HIDE-ACCURACY 迁移方向断言（accuracy→performance 未反转） | tester-1 | 2026-07-24 |
 | TEST-EXEC-REBUILD-001 | v0.7.1 全量回归 + 出包：cargo test 根 592+/0/6 + src-tauri 41/0 + Vitest 51/5 文件全绿；构建三步（npm build 683ms + Tauri UI 2m14s + 主程序 1m44s）0 error；三 exe + itn-rules.toml/scene-rules.toml 同步 Publish/；ProductVersion 0.7.1.0；主控独立 sha256 逐一核对 src-tauri/target/release → target/release → Publish/ 三处 5 个产物全部一致，冒烟 PID 27100 Responding=True；已知瑕疵：result.md 首写 0 字节（[COLLAB-WRITE-001] 复发）已补写 | tester-1 | 2026-07-24 |
+| ASR-NOSPEECH-FILTER-001 | ASR 特殊 token 过滤：在 `src/transcription/mod.rs` 新增 `Transcriber::strip_asr_special_tokens`，精确剥离 `<|...|>` 形态富文本标记（覆盖 nospeech/zh/en/ja/ko/NEUTRAL/HAPPY/Speech/woitn/withitn 等），不误伤正常文本中的 `<`/`>`；qwen3_online 与本地模型路径统一在 normalize 前调用，剥离后为空则 bail 走既有空转录提示；新增 7 条单测覆盖纯 token/混合/多 token 连续/正文夹 token/正常文本不误伤/不完整形态不剥离；`cargo test strip_asr_special_tokens` 7/7 PASS，`cargo check` 0 errors | coder-2 | 2026-07-27 |
+| ITN-CELSIUS-002-SYMBOL | 摄氏度符号统一：在 `src/itn.rs` 两处输出由 `°C`（U+00B0 + 拉丁 C）改为 `℃`（U+2103 单字符）；触发条件与 `itn-rules.toml` 配置保持不动，裸"度"仍不转；同步更新 7 条单测断言；`cargo test temp_celsius` 5/5 PASS，`cargo check` 0 errors | coder-2 | 2026-07-27 |
 
 ---
 
@@ -429,3 +438,13 @@ HOTKEY-LATENCY-FIX-001 | 热键录音视觉延迟 + 偶发首字丢失修复：�
 - **改动**：src/transcription/mod.rs（L641 temp + L447 hotwords 上限 + 注释/单测同步）
 - **自验**：cargo check 0 errors / cargo test 全绿（345+24 passed 0 failed）
 - **影响**：仅 accuracy 分支；performance/qwen3 零影响
+
+---
+
+## 2026-07-27 — coder-1 三项同域批次（场景可观测性 + 中日韩夹杂保护 + 数字符号保护）
+
+| 编号 | 说明 | 负责人 | 完成时间 |
+| --- | --- | --- | --- |
+| SCENE-OBS-001 | 场景感知可观测性：src/main.rs 补 scene_context 日志（app_exe/kind/multiline_safe/f4_injected，隐私红线不打印 window_title）；src/llm/mod.rs F4 注入分支补整块 log::info!（原 system_prompt 打印 take(200) 截断永远打不出 F4）；cargo check 0 errors / cargo test 662 passed 0 failed | coder-1 | 2026-07-27 |
+| LANG-MIXED-001 | 中日/中韩夹杂被强行翻译成中文修复：src/text_normalizer.rs 新增 contains_kana/contains_hangul 探针；script_instruction 拆为 optimize 路径（含假名/谚文返回纯保护措辞不含中文简繁字样、纯中文/中英含「不要翻译」）+ script_instruction_for_translate 翻译路径（含假名/谚文返回 None、纯中文只字形约束绝不含「不要翻译」防翻译功能回归）；normalize_script_only + normalize_text_for_language 都跳过 zhconv；main.rs 翻译路径调用点改用 script_instruction_for_translate；新增 26 条单测含六类覆盖 + 翻译路径回归护栏 6 条 | coder-1 | 2026-07-27 |
+| ITN-CELSIUS-002-PROMPT | LLM 改写回汉字单位保护条款：src/llm/mod.rs 模块级 UNIT_SYMBOL_PROTECTION（optimize 路径）+ UNIT_SYMBOL_PROTECTION_TRANSLATE（翻译路径限定 <corrected> 行）两条 const，禁止 LLM 把已规整的 30°C/50%/3.5kg 等符号改写回中文表述；optimize + optimize_and_translate 两条 LLM 路径都追加（补强3）；运行时追加指令路径实现（未改 default_system_prompt，存量 config 生效）；保护条款不用 OVERRIDES 关键字避免与 SUGGESTION_INSTRUCTION 冲突；新增 5 条单测含翻译路径不含「不要翻译」语义强制验收 | coder-1 | 2026-07-27 |

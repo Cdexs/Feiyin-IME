@@ -182,7 +182,58 @@ impl Transcriber {
         self.transcribe_with_punct_info(samples, script)
             .map(|(text, _)| text)
     }
-
+    /// 剥离 ASR 特殊 token（ASR-NOSPEECH-FILTER-001）。
+    ///
+    /// FunASR/SenseVoice/Qwen3 等模型常输出富文本标记，如：
+    /// `<|nospeech|>`, `<|zh|>`, `<|en|>`, `<|ja|>`, `<|ko|>`,
+    /// `<|NEUTRAL|>`, `<|HAPPY|>`, `<|Speech|>`, `<|woitn|>`, `<|withitn|>` 等。
+    /// 这些标记不应进入下游文本处理/注入。
+    ///
+    /// 规则：精确匹配 `<|...|>` 配对形态（内部不含 `|` 与 `<`、`>`），
+    /// 仅剥离完整 token，不误伤正常文本中的孤立 `<` 或 `>`。
+    /// 多个连续 token 合并为一个空白分隔边界，避免产生多余空格。
+    pub fn strip_asr_special_tokens(text: &str) -> String {
+        let mut result = String::with_capacity(text.len());
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+        let mut pending_space = false; // 标记前一个 token 结束后是否欠一个空格
+        while i < chars.len() {
+            if chars[i] == '<' && chars.get(i + 1) == Some(&'|') {
+                // 寻找结束 `|>`
+                let mut j = i + 2;
+                while j + 1 < chars.len() && !(chars[j] == '|' && chars[j + 1] == '>') {
+                    // token 内部不得含另一个 `<` 或 `>` 或 `|`，否则不是合法 token
+                    if chars[j] == '<' || chars[j] == '>' || chars[j] == '|' {
+                        break;
+                    }
+                    j += 1;
+                }
+                if j + 1 < chars.len() && chars[j] == '|' && chars[j + 1] == '>' && j > i + 2 {
+                    // 合法非空 `<|...|>` token：直接跳过，仅记录后续可能需要空格
+                    pending_space = !result.is_empty();
+                    i = j + 2;
+                    continue;
+                }
+            }
+            // 普通字符：若欠空格且当前非空白，按两侧字符类型决定是否补空格。
+            // 【主控修正 2026-07-27】仅当 token 两侧均为 ASCII 字母/数字时才补空格
+            // （防止英文单词被 token 分隔后粘连成 helloworld）；CJK 两侧一律不补——
+            // 中文无词间空格，补了会把「你<|NEUTRAL|>好」污染成「你 好」并一路注入。
+            if pending_space && chars[i] != ' ' {
+                let prev_is_ascii_word = result
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c.is_ascii_alphanumeric());
+                if prev_is_ascii_word && chars[i].is_ascii_alphanumeric() {
+                    result.push(' ');
+                }
+            }
+            pending_space = false;
+            result.push(chars[i]);
+            i += 1;
+        }
+        result
+    }
     /// 转录并返回标点来源标记（ASR-PUNCT-OPT-001）
     ///
     /// 返回 `(text, native_punctuated)`：
@@ -213,8 +264,19 @@ impl Transcriber {
                 samples,
                 lang,
             )?;
+            // ASR-NOSPEECH-FILTER-001: 剥离特殊 token（如 <|nospeech|>）
+            let cleaned = Self::strip_asr_special_tokens(&text);
+            let trimmed = cleaned.trim();
+            if trimmed.is_empty() {
+                log::warn!(
+                    "ASR qwen3_online output only contained special tokens, transcription failed"
+                );
+                anyhow::bail!(
+                    "ASR transcription failed: qwen3_online output only contained special tokens"
+                );
+            }
             // Qwen3 输出自带标点 → native_punctuated=true（跳过标点引擎）
-            let normalized = text_normalizer::normalize_text_for_language(&text, script);
+            let normalized = text_normalizer::normalize_text_for_language(trimmed, script);
             return Ok((normalized, true));
         }
         match self.mode {
@@ -364,6 +426,9 @@ impl Transcriber {
 
         let result = stream.get_result().context("No transcription result")?;
         let text = result.text.trim().to_string();
+
+        // ASR-NOSPEECH-FILTER-001: 剥离特殊 token（如 <|nospeech|>）
+        let text = Self::strip_asr_special_tokens(&text);
 
         // ASR-SINGLE-MODEL-001: accuracy 空输出 → bail（不再兜底 CTC）
         if self.asr_model == AsrModel::Accuracy {
@@ -1212,5 +1277,173 @@ mod tests {
         // R1 关键：lock poisoned 时走 naive_chunk 分支调此辅助函数，
         // 不再静默落到单次转录整段（禁止 >28s 整段喂 native）。
         assert!(true, "transcribe_segments_chunked contract documented");
+    }
+
+    // ============================================================
+    // ASR-NOSPEECH-FILTER-001: 特殊 token 剥离测试
+    // ============================================================
+
+    #[test]
+    fn strip_asr_special_tokens_pure_token() {
+        assert_eq!(Transcriber::strip_asr_special_tokens("<|nospeech|>"), "");
+    }
+
+    #[test]
+    fn strip_asr_special_tokens_token_with_text() {
+        assert_eq!(Transcriber::strip_asr_special_tokens("<|zh|>你好"), "你好");
+    }
+
+    #[test]
+    fn strip_asr_special_tokens_text_with_token() {
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("你好<|nospeech|>"),
+            "你好"
+        );
+    }
+
+    #[test]
+    fn strip_asr_special_tokens_multiple_tokens() {
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("<|zh|><|nospeech|>你好"),
+            "你好"
+        );
+    }
+
+    #[test]
+    fn strip_asr_special_tokens_mixed_with_text() {
+        // 【主控修正 2026-07-27】CJK 之间剥离 token 后不得插入空格
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("<|zh|>你<|NEUTRAL|>好<|nospeech|>"),
+            "你好"
+        );
+    }
+
+    #[test]
+    fn strip_asr_special_tokens_keeps_ascii_word_boundary() {
+        // 英文单词被 token 分隔时必须补空格，否则粘连成 helloworld
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("hello<|NEUTRAL|>world"),
+            "hello world"
+        );
+        // 数字同理
+        assert_eq!(Transcriber::strip_asr_special_tokens("1<|zh|>2"), "1 2");
+    }
+
+    #[test]
+    fn strip_asr_special_tokens_no_space_at_cjk_ascii_boundary() {
+        // 中英边界不补空格：ASR 原文没有空格就不应凭空造出来
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("中文<|NEUTRAL|>abc"),
+            "中文abc"
+        );
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("abc<|NEUTRAL|>中文"),
+            "abc中文"
+        );
+    }
+
+    #[test]
+    fn strip_asr_special_tokens_normal_text_unchanged() {
+        // 孤立 < 或 > 不应被误伤
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("小于号<和大于号>"),
+            "小于号<和大于号>"
+        );
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("他说：1 < 2 且 3 > 1"),
+            "他说：1 < 2 且 3 > 1"
+        );
+    }
+
+    #[test]
+    fn strip_asr_special_tokens_incomplete_not_stripped() {
+        // 不完整的 token 形态不应误删
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("<|nospeech"),
+            "<|nospeech"
+        );
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("|nospeech|>"),
+            "|nospeech|>"
+        );
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("<|no|speech|>"),
+            "<|no|speech|>"
+        );
+    }
+
+    // ============================================================
+    // P0-TEST-SYNC-20260727: 空格边界缺口补充
+    // ============================================================
+
+    #[test]
+    fn strip_asr_special_tokens_token_start_ascii() {
+        // token 位于串首 + 后接 ASCII → 无前导空格
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("<|NEUTRAL|>hello"),
+            "hello"
+        );
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("<|zh|>world"),
+            "world"
+        );
+    }
+
+    #[test]
+    fn strip_asr_special_tokens_token_end_ascii() {
+        // token 位于串尾（ASCII 在前）→ 无后置空格
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("hello<|NEUTRAL|>"),
+            "hello"
+        );
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("world<|nospeech|>"),
+            "world"
+        );
+    }
+
+    #[test]
+    fn strip_asr_special_tokens_existing_space_near_token() {
+        // token 相邻已有空格 → 不再添加额外空格
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("hello <|NEUTRAL|>world"),
+            "hello world"
+        );
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("hello<|NEUTRAL|> world"),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn strip_asr_special_tokens_fullwidth_punct_near_token() {
+        // 全角标点与 token 相邻 → 不产生空格（全角非 ascii_alphanumeric）
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("hello<|NEUTRAL|>！"),
+            "hello！"
+        );
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("你好<|NEUTRAL|>，"),
+            "你好，"
+        );
+    }
+
+    #[test]
+    fn strip_asr_special_tokens_consecutive_between_ascii() {
+        // 连续多 token 夹在英文单词中间 → 只产生一个空格
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("hello<|NEUTRAL|><|OTHER|>world"),
+            "hello world"
+        );
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("count<|zh|><|nospeech|><|en|>123"),
+            "count 123"
+        );
+    }
+
+    #[test]
+    fn strip_asr_special_tokens_empty() {
+        // 空串：幂等返回空串
+        assert_eq!(Transcriber::strip_asr_special_tokens(""), "");
     }
 }

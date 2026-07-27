@@ -1163,10 +1163,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .expect("count");
-            assert_eq!(
-                count, 1,
-                "data must persist across re-open on real file"
-            );
+            assert_eq!(count, 1, "data must persist across re-open on real file");
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
