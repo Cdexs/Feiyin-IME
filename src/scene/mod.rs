@@ -855,4 +855,158 @@ exe = ["browser.exe"]
         let scene = classify_builtin("CONHOST.EXE", "");
         assert_eq!(scene.scene, SceneKind::IdeTerminal);
     }
+
+    // ============================================================
+    // TEST-SYNC-SCENE-COVERAGE-001: scene-rules.toml 解析 + 新增条目 + 浏览器细分回归
+    // ============================================================
+
+    /// P0-1: BUILTIN_RULES 解析必须成功（直接 toml::from_str，不用 compile_rules_from_content）
+    #[test]
+    fn builtin_rules_parse_ok() {
+        let parsed = toml::from_str::<Rules>(BUILTIN_RULES);
+        assert!(
+            parsed.is_ok(),
+            "scene-rules.toml 解析失败，场景感知会静默降级为全 Unknown: {:?}",
+            parsed.err()
+        );
+        let rules = parsed.unwrap();
+        assert_eq!(rules.scene.len(), 8, "[[scene]] 块数应为 8");
+        let total: usize = rules.scene.iter().map(|s| s.exe.len()).sum();
+        assert!(
+            total >= 160,
+            "exe 条目总数异常偏少（当前应为 165），疑似数组被截断: {}",
+            total
+        );
+    }
+
+    /// P0-2: 特殊字符条目——The Bat!.exe（含 !）→ Email
+    #[test]
+    fn special_char_bang_exe_classify_email() {
+        let rules = compile_rules_from_content(BUILTIN_RULES);
+        let scene = rules.classify("The Bat!.exe", "");
+        assert_eq!(scene.scene, SceneKind::Email);
+        assert!(scene.multiline_safe);
+    }
+
+    /// P0-2: 特殊字符条目——Koodo Reader.exe（含空格）→ Doc
+    #[test]
+    fn special_char_space_exe_classify_doc() {
+        let rules = compile_rules_from_content(BUILTIN_RULES);
+        let scene = rules.classify("Koodo Reader.exe", "");
+        assert_eq!(scene.scene, SceneKind::Doc);
+        assert!(scene.multiline_safe);
+    }
+
+    /// P0-3: doc 块 title_keywords 浏览器细分——chrome + Jira 标题 → Doc
+    #[test]
+    fn browser_subclass_jira_to_doc() {
+        let scene = classify_builtin("chrome.exe", "PROJ-123 · Jira");
+        assert_eq!(scene.scene, SceneKind::Doc);
+        assert!(scene.multiline_safe);
+    }
+
+    /// P0-3: chrome + TAPD 标题 → Doc
+    #[test]
+    fn browser_subclass_tapd_to_doc() {
+        let scene = classify_builtin("chrome.exe", "TAPD - 迭代需求");
+        assert_eq!(scene.scene, SceneKind::Doc);
+        assert!(scene.multiline_safe);
+    }
+
+    /// P0-3: chrome + 禅道 标题 → Doc
+    #[test]
+    fn browser_subclass_zentao_to_doc() {
+        let scene = classify_builtin("chrome.exe", "禅道 · 任务 #456");
+        assert_eq!(scene.scene, SceneKind::Doc);
+        assert!(scene.multiline_safe);
+    }
+
+    /// P0-3: chrome + Teambition 标题 → Doc
+    #[test]
+    fn browser_subclass_teambition_to_doc() {
+        let scene = classify_builtin("chrome.exe", "Teambition - 项目文档");
+        assert_eq!(scene.scene, SceneKind::Doc);
+        assert!(scene.multiline_safe);
+    }
+
+    /// P0-4: 反向护栏——browser 自身的 title_keywords 不参与浏览器细分
+    /// 已知：browser 块的 title_keywords 与 email/doc 块完全重叠，无唯一词。
+    /// 改用构造内联 fixture：browser 块含独有关键词 X，chrome + X 仍为 Browser。
+    #[test]
+    fn browser_own_title_keyword_does_not_subclass() {
+        let custom = r#"
+[[scene]]
+kind = "browser"
+style = "Web tone."
+multiline_safe = false
+exe = ["browser.exe"]
+title_keywords = ["UniqueBrowserOnlyKeyword"]
+
+[[scene]]
+kind = "doc"
+style = "Doc tone."
+multiline_safe = true
+title_keywords = ["doc_keyword"]
+"#;
+        // browser.exe + 标题含 browser 独有的关键词 → 仍为 Browser（非 doc）
+        let rules = compile_rules_from_content(custom);
+        let scene = rules.classify("browser.exe", "UniqueBrowserOnlyKeyword page");
+        assert_eq!(
+            scene.scene,
+            SceneKind::Browser,
+            "browser own title_keywords must not trigger reclassification"
+        );
+        assert!(!scene.multiline_safe);
+    }
+
+    /// P0-5: Figma.exe → Browser（Gavin 拍板归 browser，非 ide_terminal）
+    #[test]
+    fn figma_classify_browser() {
+        let scene = classify_builtin("Figma.exe", "");
+        assert_eq!(scene.scene, SceneKind::Browser);
+        assert!(!scene.multiline_safe);
+    }
+
+    /// P0-5: ChatGLM.exe → Chat（新旧名并存）
+    #[test]
+    fn chatglm_classify_chat() {
+        let scene = classify_builtin("ChatGLM.exe", "");
+        assert_eq!(scene.scene, SceneKind::Chat);
+        assert!(!scene.multiline_safe);
+    }
+
+    /// P0-5: GLM.exe → Chat（新旧名并存）
+    #[test]
+    fn glm_classify_chat() {
+        let scene = classify_builtin("GLM.exe", "");
+        assert_eq!(scene.scene, SceneKind::Chat);
+        assert!(!scene.multiline_safe);
+    }
+
+    /// P0-5: Zoom.exe → Chat 且 multiline_safe=false（视频会议 Enter=发送）
+    #[test]
+    fn zoom_classify_chat() {
+        let scene = classify_builtin("Zoom.exe", "");
+        assert_eq!(scene.scene, SceneKind::Chat);
+        assert!(!scene.multiline_safe);
+    }
+
+    /// P0-5: wemeetapp.exe → Chat 且 multiline_safe=false（视频会议 Enter=发送）
+    #[test]
+    fn wemeetapp_classify_chat() {
+        let scene = classify_builtin("wemeetapp.exe", "");
+        assert_eq!(scene.scene, SceneKind::Chat);
+        assert!(!scene.multiline_safe);
+    }
+
+    /// P1: 大小写不敏感——OneNote.exe 与 ONENOTE.EXE 均命中 Doc
+    #[test]
+    fn case_insensitive_onenote_doc() {
+        let scene_lower = classify_builtin("OneNote.exe", "");
+        let scene_upper = classify_builtin("ONENOTE.EXE", "");
+        assert_eq!(scene_lower.scene, SceneKind::Doc);
+        assert_eq!(scene_upper.scene, SceneKind::Doc);
+        assert_eq!(scene_lower.scene, scene_upper.scene);
+        assert!(scene_lower.multiline_safe);
+    }
 }

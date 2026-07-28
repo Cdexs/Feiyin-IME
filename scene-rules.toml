@@ -34,7 +34,7 @@ exe = [
     "TIM.exe",             # TIM（QQ 商务版）
     "Telegram.exe",        # Telegram
     "DingTalk.exe",        # 钉钉
-    "DingTalkLite.exe",    # 钉钉 Lite（macOS/精简版，如有 Windows 版）
+    "DingTalkLite.exe",    # ⚠️未证实：钉钉 Lite（RESEARCH-SCENE-COVERAGE-001 核实无 Windows Lite 版，保留防特定渠道包存在）
     "Slack.exe",           # Slack
     "Lark.exe",            # 飞书（国际版）
     "Feishu.exe",          # 飞书（国内版）
@@ -44,21 +44,26 @@ exe = [
     "Line.exe",            # LINE
     "Teams.exe",           # Microsoft Teams（classic 经典版）
     "ms-teams.exe",        # Microsoft Teams（new 新版，WebView2 重构）
-    "Skype.exe",           # Skype（2025-05 已停服，保留兼容旧版）
+    "Skype.exe",           # Skype（2025-05 已停服，微软已引导迁移至 Teams；保留兼容旧版）
     "WXWork.exe",          # 企业微信
-    "WXWorkApp.exe",       # 企业微信（新版可能用此名）
+    "WXWorkApp.exe",       # ⚠️未证实：企业微信（RESEARCH-SCENE-COVERAGE-001 核实进程名始终为 WXWork.exe，保留防特定版本存在）
     "AliWangWang.exe",     # 阿里旺旺
     "BaiduHi.exe",         # 百度 Hi
     "Zalo.exe",            # Zalo（越南）
     "Signal.exe",          # Signal
     "YY.exe",              # YY 语音
     "Momo.exe",            # 陌陌
-    "DouyinIM.exe",        # 抖音 IM（如有）
+    "DouyinIM.exe",        # ⚠️未证实：抖音 IM（RESEARCH-SCENE-COVERAGE-001 核实无实证，保留防特定版本存在）
     "Messenger.exe",       # Facebook Messenger 桌面版
     "KakaoTalk.exe",       # KakaoTalk（韩国）
     "Viber.exe",           # Viber
     "ICQ.exe",             # ICQ New
     "Element.exe",         # Element（Matrix 客户端）
+    # --- 视频会议（归 chat：会议聊天区 Enter=发送、多行危险，与 IM 同构）---
+    "Zoom.exe",            # ⚠️未证实：Zoom 会议（官网有 Windows 包，exe 名未实测；待 debug.log 的 Scene context 实证）
+    "wemeetapp.exe",       # ⚠️未证实：腾讯会议（官网 meeting.tencent.com 有 Windows 包，exe 名未实测）
+    # --- 项目管理（评论 Enter=发送，保守归 chat）---
+    "Linear.exe",          # ⚠️未证实：Linear 桌面版（官网 linear.app 有 Windows 包，exe 名未实测）
 ]
 
 [[scene]]
@@ -93,6 +98,15 @@ exe = [
     "AnythingLLMDesktop.exe",  # AnythingLLM Desktop（Mintplex-Labs/anything-llm release 资产 AnythingLLMDesktop.exe；核实）
     # --- 国产 AI 助手桌面版 ---
     "yuanbao.exe",             # 腾讯元宝（本机快捷方式 target=D:\Tencent\Yuanbao\yuanbao.exe；核实）
+    "Doubao.exe",              # ⚠️未证实：豆包桌面版（官网 doubao.com 有 Windows 包，exe 名未实测；待 debug.log 的 Scene context 实证）
+    "Kimi.exe",                # ⚠️未证实：Kimi 桌面版（官网 kimi.com 有 Windows 包，exe 名未实测）
+    "Tongyi.exe",              # ⚠️未证实：通义千问桌面版（官网 tongyi.aliyun.com 有 Windows 包，exe 名未实测）
+    "Wenxin.exe",              # ⚠️未证实：文心一言桌面版（官网 yiyan.baidu.com 有 Windows 包，exe 名未实测）
+    "ChatGLM.exe",             # ⚠️未证实：智谱清言桌面版 旧名（官网 chatglm.cn 有 Windows 包，exe 名未实测；新旧名并存保留）
+    "GLM.exe",                 # ⚠️未证实：智谱 GLM 桌面版 新名（品牌迁移至 z.ai，exe 名未实测；新旧名并存保留）
+    "NanoSearch.exe",          # ⚠️未证实：纳米搜索桌面版（官网 nano.ai 有 Windows 包，exe 名未实测）
+    # --- 国际 AI 助手桌面版（补充）---
+    "Perplexity.exe",          # ⚠️未证实：Perplexity 桌面版（官网 perplexity.ai MS Store 包，exe 名未实测）
     # --- MS Store PWA 形态（Gemini/Copilot/DeepSeek/claude.ai 等）---
     # 前台进程为 msedge.exe（已在 browser exe 列表），靠下方 title_keywords 兜底，不在此列 exe 条目
 ]
@@ -121,7 +135,11 @@ exe = [
     "HxOutlook.exe",       # Outlook 辅助进程（新版 Outlook 后台进程）
     "eMClient.exe",        # eM Client
     "Spark.exe",           # Spark Mail
-    "NewMailEngine.exe",   # 火狐邮件（如有）
+    "NewMailEngine.exe",   # ⚠️未证实：疑似不存在（Mozilla 邮件产品为 Thunderbird，已单列；原注释「火狐邮件」系事实错误）
+    # --- 新增邮件客户端 ---
+    "CalendarApp.Gui.Win10.exe", # ✅实测：OneCalendar（MSIX 包 64885BlueEdge.OneCalendar，AppxManifest Executable=CalendarApp.Gui.Win10.exe）
+    "Mailbird.exe",        # ⚠️未证实：Mailbird（官网 mailbird.com 有 Windows 包，exe 名未实测）
+    "The Bat!.exe",        # ⚠️未证实：The Bat!（官网 ritlabs.com 有 Windows 包，exe 名未实测）
 ]
 
 [[scene]]
@@ -189,6 +207,7 @@ exe = [
     "Xshell6.exe",         # Xshell 6
     "Xshell7.exe",         # Xshell 7
     "Xshell8.exe",         # Xshell 8
+    "Xagent.exe",          # ✅实测：Xshell 8 配套（本机 D:\xshell\Xagent.exe 与 D:\xftp\Xagent.exe 均存在，Xagent 取代部分 Xftp 功能）
     "SecureCRT.exe",       # SecureCRT
     "MobaXterm.exe",       # MobaXterm
     "MobaXterm1.exe",      # MobaXterm（个人版）
@@ -199,6 +218,10 @@ exe = [
     # 这是 claude code/codex cli/opencode cli/aider 等 CLI Agent 的实际命中路径之一。
     "conhost.exe",         # Windows 经典控制台宿主（cmd/powershell 默认）
     "OpenConsole.exe",     # Windows Terminal / WezTerm 等附带的 OpenConsole 宿主
+    # --- 新增终端/Shell ---
+    "wezterm.exe",         # ✅实测：WezTerm（本机 %LocalAppData%\Programs\WezTerm\wezterm.exe，gui 入口 wezterm-gui.exe 已在表内）
+    "git-bash.exe",        # ✅实测：Git Bash MSYS2 启动器（本机 C:\Program Files\Git\git-bash.exe，实际前台窗口通常为已在表内的 mintty.exe，此条为补漏）
+    "Nu.exe",              # ⚠️未证实：Nushell（官网 nushell.sh 有 Windows zip 包含 nu.exe，exe 名未实测）
 ]
 
 # ============================================================
@@ -222,7 +245,7 @@ exe = [
     "印象笔记.exe",          # 印象笔记（Evernote 中国版）
     "Evernote.exe",        # Evernote 国际版
     "语雀.exe",             # 语雀桌面版
-    "FeishuDocs.exe",      # 飞书文档（独立客户端，如有）
+    "FeishuDocs.exe",      # ⚠️未证实：飞书文档独立客户端（RESEARCH-SCENE-COVERAGE-001 核实飞书文档集成在 Feishu.exe 内，保留防特定版本存在）
     "XMind.exe",           # XMind
     "mubu.exe",            # 幕布
     "Joplin.exe",          # Joplin
@@ -231,12 +254,17 @@ exe = [
     "Affine.exe",          # AFFiNE
     "AppFlowy.exe",        # AppFlowy
     "Anytype.exe",         # Anytype
-    "Obsidian-helper.exe", # Obsidian 辅助进程
+    "Obsidian-helper.exe", # ⚠️未证实：本机实测 Obsidian 安装目录只有 Obsidian.exe，Electron 子进程名同为 Obsidian.exe
+    # --- 新增文档/笔记客户端 ---
+    "MarkText.exe",        # ✅实测：MarkText Markdown 编辑器（本机 %LocalAppData%\Programs\MarkText\MarkText.exe）
+    "Koodo Reader.exe",    # ✅实测：Koodo Reader 电子书阅读器（本机 %LocalAppData%\Programs\koodo-reader\Koodo Reader.exe，含空格）
 ]
 title_keywords = [
     # 浏览器网页文档编辑器兜底
     "Google Docs", "腾讯文档", "石墨文档", "飞书文档", "Notion",
     "语雀", "Online Doc", "Office Online",
+    # 项目管理/工单网页版兜底（浏览器开 Jira/TAPD/禅道/Teambition → 重分类为 doc，多行结构化输出）
+    "Jira", "TAPD", "禅道", "Teambition",
 ]
 
 # ============================================================
@@ -265,6 +293,8 @@ exe = [
     "Supermium.exe",       # Supermium
     "centbrowser.exe",     # Cent Browser
     "chromium.exe",        # Chromium
+    # --- 设计工具（归 browser：设计文案非代码，web-friendly 风格更贴切，multiline_safe 同为 false）---
+    "Figma.exe",           # ⚠️未证实：Figma 桌面版（官网 figma.com 有 Windows 包，exe 名未实测）
 ]
 title_keywords = [
     # 邮箱场景兜底（浏览器网页邮箱）
