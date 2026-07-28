@@ -32,6 +32,7 @@
 | --- | --- | --- | --- |
 | TEST-SYNC-20260727 | 测试同步（P0~P3）：P0=补 6 条 strip_asr_special_tokens 边界测试（串首/串尾/已有空格/全角标点/连续多 token/空串）；P1=补 2 条 normalize 函数对含假名日文汉字零改变断言（龍→龙、亞→亚）；P2=审计旧措辞断言无精确字符串绑定；P3=评估 Vitest/pytest 无需同步；仅改 `src/transcription/mod.rs` + `src/text_normalizer.rs` `#[cfg(test)]` 块；cargo check --tests 0 errors | tester-1 | 2026-07-27 |
 | TEST-EXEC-20260727 | 全量回归：Step 1 ✅ 672 PASS / 0 FAIL / 8 IGNORED（主程序）；Step 1b ✅ 53 PASS / 0 FAIL / 0 IGNORED（Tauri 后端）；Step 2/3/4 SKIP（全 Rust 改动、不出包）；4 类高风险用例全部 PASS；不出包 | tester-1 | 2026-07-27 |
+| BUILD-RELEASE-v0.7.2 | 出包：Step 0 ✅ 清理进程 / Step 1 ✅ npm build 1.93s / Step 2 ✅ Tauri UI 2m12s / Step 3 ✅ 主程序 2m25s / Step 4 ✅ 同步 Publish/ (3 exe + 2 toml) / Step 5 ✅ 冒烟 PID 21584 Responding=True；sha256 三处一致、ProductVersion 0.7.2.0、TOML 三副本一致 | tester-1 | 2026-07-27 |
 
 | TEST-SYNC-REBUILD-001 | 测试同步：15 项（REBUILD-LOST-001 后端 11 + 前端 4）全量审计，覆盖充分，未改动任何文件（git status 核实）；主控独立抽查最高风险点全部属实——itn.rs 历史词保护 71 条 #[test]、scene/mod.rs 46 条、llm/mod.rs 日韩防编造 10 条（多于记录的 8 条）、config/mod.rs:968 ASR-HIDE-ACCURACY 迁移方向断言（accuracy→performance 未反转） | tester-1 | 2026-07-24 |
 | TEST-EXEC-REBUILD-001 | v0.7.1 全量回归 + 出包：cargo test 根 592+/0/6 + src-tauri 41/0 + Vitest 51/5 文件全绿；构建三步（npm build 683ms + Tauri UI 2m14s + 主程序 1m44s）0 error；三 exe + itn-rules.toml/scene-rules.toml 同步 Publish/；ProductVersion 0.7.1.0；主控独立 sha256 逐一核对 src-tauri/target/release → target/release → Publish/ 三处 5 个产物全部一致，冒烟 PID 27100 Responding=True；已知瑕疵：result.md 首写 0 字节（[COLLAB-WRITE-001] 复发）已补写 | tester-1 | 2026-07-24 |
