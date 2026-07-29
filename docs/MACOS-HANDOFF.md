@@ -16,9 +16,14 @@
 5. 你们要实现的 TODO 清单（§5）
 6. 仓库工程约定（§6）
 
-**深入信息看这两份**（本仓库内，不必外求）：
+**深入信息看这三份**（本仓库内，不必外求）：
 - `docs/MACOS-PORT-ASSESSMENT.md` — 移植可行性评估，含 P0-P3 缺口全景与工作量估算
 - `docs/BUILD-MACOS.md` — macOS 构建环境依赖清单与当前可编译状态
+- `docs/MACOS-BRANCH-AUDIT.md` — **macOS cfg 分支静态审计（雷区清单）**。逐块核对了所有
+  `#[cfg(target_os = "macos")]` 分支的 API 签名与锁定 crate 版本是否匹配，按
+  P0/P1/P2/P3 分级并标注置信度。**结论：唯一会阻塞编译的是
+  `src/crash/reporter.rs:369`**（`egui::FontData::from_bytes` 在 egui 0.29.1 中不存在，
+  应为 `from_owned`）。你们第一次跑 `cargo check` 前先读它，可少走一轮弯路
 
 ---
 
