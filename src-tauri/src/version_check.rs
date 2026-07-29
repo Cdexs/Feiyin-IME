@@ -2,8 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
-const GITHUB_API_URL: &str =
-    "https://api.github.com/repos/Cdexs/Feiyin-IME/releases/latest";
+const GITHUB_API_URL: &str = "https://api.github.com/repos/Cdexs/Feiyin-IME/releases/latest";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CACHE_FILE: &str = "version_check.json";
 const USER_AGENT_PREFIX: &str = "voice-ime/";
@@ -65,13 +64,7 @@ fn parse_version(v: &str) -> Vec<u64> {
     let stripped = v.trim_start_matches('v');
     stripped
         .split('.')
-        .filter_map(|s| {
-            s.split('-')
-                .next()
-                .unwrap_or("")
-                .parse()
-                .ok()
-        })
+        .filter_map(|s| s.split('-').next().unwrap_or("").parse().ok())
         .collect()
 }
 

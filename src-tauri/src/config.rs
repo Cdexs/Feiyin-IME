@@ -134,7 +134,6 @@ fn default_qwen3_asr_model() -> String {
     "qwen3-asr-flash-realtime".to_string()
 }
 
-
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
@@ -245,9 +244,7 @@ pub struct PunctuationConfig {
 
 impl Default for PunctuationConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-        }
+        Self { enabled: true }
     }
 }
 

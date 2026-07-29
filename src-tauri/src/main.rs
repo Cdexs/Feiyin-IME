@@ -39,6 +39,7 @@ fn get_audio_devices() -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
+#[cfg(target_os = "windows")]
 fn check_hotkey_available(vk_code: u32, modifiers: u32) -> bool {
     // polling 路径�?VK 码（右侧修饰键变体）无法通过 RegisterHotKey 检测，视为可用
     if matches!(vk_code, 0xA0..=0xA5) {
@@ -71,6 +72,14 @@ fn check_hotkey_available(vk_code: u32, modifiers: u32) -> bool {
         }
         ok
     }
+}
+
+#[tauri::command]
+#[cfg(not(target_os = "windows"))]
+fn check_hotkey_available(_vk_code: u32, _modifiers: u32) -> bool {
+    // TODO(macOS team): replace with a real CGEventTap-based availability check if needed.
+    // Returning true keeps the UI from blocking valid keys on non-Windows platforms.
+    true
 }
 
 /// ASR-QWEN3-UI-001: verify that the provided Qwen3 API key can authenticate

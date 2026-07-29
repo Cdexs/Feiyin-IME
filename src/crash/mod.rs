@@ -96,6 +96,7 @@ fn get_system_info() -> SystemInfo {
 }
 
 /// 获取 Windows 版本信息（通过注册表，Win7 兼容）
+#[cfg(target_os = "windows")]
 fn get_windows_version() -> String {
     use windows::core::{w, PCWSTR};
     use windows::Win32::System::Registry::{
@@ -167,6 +168,18 @@ fn get_windows_version() -> String {
             format!("Windows {} (Build {})", display, build)
         }
     }
+}
+
+/// 非 Windows 平台的版本信息占位（MACOS-COMPAT-001-CORE）。
+///
+/// 调用点 `get_system_info()` 不变（Windows 零影响）。
+/// macOS 真实版本检测由 macOS 侧团队后续实现（DEC-033 分工边界）。
+#[cfg(not(target_os = "windows"))]
+fn get_windows_version() -> String {
+    format!(
+        "{} (version detection not implemented)",
+        std::env::consts::OS
+    )
 }
 
 /// 启动独立 crash reporter 进程。

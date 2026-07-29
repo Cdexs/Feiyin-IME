@@ -28,8 +28,7 @@ fn build_ws_request(ws_uri: &str, api_key: &str) -> Result<Request<()>, String> 
     let bearer = format!("Bearer {}", api_key.trim());
     request.headers_mut().insert(
         "Authorization",
-        HeaderValue::from_str(&bearer)
-            .map_err(|e| format!("invalid API key header: {e}"))?,
+        HeaderValue::from_str(&bearer).map_err(|e| format!("invalid API key header: {e}"))?,
     );
     request
         .headers_mut()
@@ -102,8 +101,10 @@ fn parse_error_detail(text: &str) -> String {
     serde_json::from_str::<Value>(text)
         .ok()
         .and_then(|v| {
-            v.get("error")
-                .and_then(|e| e.get("message").and_then(|m| m.as_str().map(|s| s.to_string())))
+            v.get("error").and_then(|e| {
+                e.get("message")
+                    .and_then(|m| m.as_str().map(|s| s.to_string()))
+            })
         })
         .unwrap_or_else(|| text.to_string())
 }

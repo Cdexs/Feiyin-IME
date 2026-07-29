@@ -5,8 +5,10 @@
 mod audio;
 mod config;
 mod crash;
+#[cfg(target_os = "windows")]
 mod hotkey; // Deprecated: use platform::HotkeyListener instead
 mod i18n;
+#[cfg(target_os = "windows")]
 mod injection; // Deprecated: use platform::inject_text instead
 mod itn;
 mod llm;

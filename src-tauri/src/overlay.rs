@@ -33,10 +33,14 @@ pub fn create_overlay_window(app: &tauri::AppHandle, config: OverlayConfig) -> R
         return Err("Overlay window already exists".into());
     }
 
-    let _window = WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("overlay.html".into()))
+    let builder = WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("overlay.html".into()))
         .title("Recording Overlay")
-        .inner_size(config.width, config.height)
-        .transparent(true)
+        .inner_size(config.width, config.height);
+
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.transparent(true);
+
+    let _window = builder
         .decorations(false)
         .always_on_top(config.always_on_top)
         .skip_taskbar(true)
