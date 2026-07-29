@@ -18,9 +18,20 @@ struct ChatRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
-    /// 关闭推理模式（SiliconFlow/DeepSeek 等模型的 thinking 模式），大幅减少延迟
+    /// 关闭推理模式（SiliconFlow/Qwen3 系），大幅减少延迟。
+    /// 对 DeepSeek 无效（静默忽略未知字段），DeepSeek 靠下方 `thinking` 字段。
     #[serde(skip_serializing_if = "Option::is_none")]
     enable_thinking: Option<bool>,
+    /// DeepSeek 官方思维链开关（FIX-COT-LEAK-001-P0-1）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingConfig>,
+}
+
+/// DeepSeek 思维链控制参数（FIX-COT-LEAK-001-P0-1）。
+#[derive(Serialize)]
+struct ThinkingConfig {
+    #[serde(rename = "type")]
+    thinking_type: String,
 }
 
 #[derive(Serialize)]
@@ -84,6 +95,9 @@ impl LlmClient {
             max_tokens: Some(5),
             stream: Some(false),
             enable_thinking: Some(false), // 关闭推理模式，快速响应
+            thinking: Some(ThinkingConfig {
+                thinking_type: "disabled".to_string(),
+            }),
         };
 
         let mut last_err: Option<reqwest::Error> = None;
@@ -165,12 +179,9 @@ fn extract_text(chat: ChatResponse) -> Option<String> {
 
     for choice in chat.choices {
         if let Some(message) = choice.message {
+            // FIX-COT-LEAK-001-P0-2: 只取 content，不再回落 reasoning_content。
             if let Some(content) = message.content.filter(|s| !s.trim().is_empty()) {
                 parts.push(content);
-            } else if let Some(reasoning) =
-                message.reasoning_content.filter(|s| !s.trim().is_empty())
-            {
-                parts.push(reasoning);
             }
             continue;
         }
@@ -178,9 +189,6 @@ fn extract_text(chat: ChatResponse) -> Option<String> {
         if let Some(delta) = choice.delta {
             if let Some(content) = delta.content.filter(|s| !s.trim().is_empty()) {
                 parts.push(content);
-            } else if let Some(reasoning) = delta.reasoning_content.filter(|s| !s.trim().is_empty())
-            {
-                parts.push(reasoning);
             }
         }
     }

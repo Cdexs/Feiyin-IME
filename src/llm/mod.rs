@@ -39,9 +39,23 @@ struct ChatRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
-    /// 关闭推理模式（SiliconFlow/DeepSeek 等模型的 thinking 模式），大幅减少延迟
+    /// 关闭推理模式（SiliconFlow/Qwen3 系），大幅减少延迟。
+    /// 对 DeepSeek 无效（静默忽略未知字段），DeepSeek 靠下方 `thinking` 字段。
     #[serde(skip_serializing_if = "Option::is_none")]
     enable_thinking: Option<bool>,
+    /// DeepSeek 官方思维链开关（FIX-COT-LEAK-001-P0-1）。
+    /// `{"type":"disabled"}` 关闭思维链；DeepSeek 对未知字段静默忽略，
+    /// 故与 `enable_thinking` 双发对两侧均零副作用。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingConfig>,
+}
+
+/// DeepSeek 思维链控制参数（FIX-COT-LEAK-001-P0-1）。
+/// `type` 是 Rust 关键字，serde rename 为 "type"。
+#[derive(Serialize)]
+struct ThinkingConfig {
+    #[serde(rename = "type")]
+    thinking_type: String,
 }
 
 #[derive(Serialize)]
@@ -53,12 +67,18 @@ struct RequestMessage {
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    // FIX-COT-LEAK-001-P0-5: usage 原本完全未解析，无法观测 token 消耗/截断。
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
 struct Choice {
     message: Option<ResponseMessage>,
     delta: Option<ResponseDelta>,
+    // FIX-COT-LEAK-001-P0-5: finish_reason 原本完全未解析，无法区分 stop/length/content_filter。
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +91,26 @@ struct ResponseMessage {
 struct ResponseDelta {
     content: Option<String>,
     reasoning_content: Option<String>,
+}
+
+/// FIX-COT-LEAK-001-P0-5: usage 统计，用于观测 token 消耗与 CoT 占比。
+/// 全部 #[serde(default)] + Option，因流式响应中间 chunk 的 usage 为 null。
+#[derive(Deserialize)]
+struct Usage {
+    #[serde(default)]
+    prompt_tokens: Option<u32>,
+    #[serde(default)]
+    completion_tokens: Option<u32>,
+    #[serde(default)]
+    total_tokens: Option<u32>,
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +263,43 @@ impl LlmClient {
                             "LLM format failure: empty or literal <corrected> tag in parsed text"
                         ));
                     }
+                    // FIX-COT-LEAK-001-P0-4 判据 A：无任何字母/数字/CJK → CoT 泄漏截断为纯标点。
+                    // 零语种依赖、近乎零误报。Gavin 13:19 "..."根因之一即此。
+                    if lacks_any_substantive_char(trimmed) {
+                        log::warn!(
+                            "LLM response lacks any alphanumeric/CJK char (criterion A), treating as format failure: {:?}",
+                            trimmed.chars().take(100).collect::<String>()
+                        );
+                        return Err(anyhow!(
+                            "LLM format failure: criterion A (no alphanumeric/CJK char)"
+                        ));
+                    }
+                    // FIX-COT-LEAK-001-P0-4 判据 B：**主控降级为只观测、不拒绝**。
+                    //
+                    // 原设计为「输入≥20字符且输出<输入15% → 判格式失败」。主控实跑 coder-1 自己
+                    // 配套的防误伤单测后否决了拒绝行为——那条单测反而证明了阈值不安全：
+                    //   合法 F1 语气词去除："嗯那个就是说吧我觉得呢这个嘛其实就是嗯那个怎么说呢就是我觉得吧"
+                    //   （31 字）→「我觉得」（3 字）= **9.7%**，低于 15% 会被误杀；
+                    //   而真实故障案例（2026-07-29 13:19）"..." ≈ 6%。
+                    // 两者只差约 3.7 个百分点，**比例判据无法在「合法重度压缩」与「故障」间划出可靠边界**。
+                    //
+                    // 误伤代价还不对称：语气词最密集的语音恰是最需要格式化的场景，一旦误杀就退回
+                    // 注入满是语气词的原文，用户体感更差。而实际故障模式（纯标点）已由判据 A 覆盖，
+                    // 且 P0-1/P0-2/P0-3 三层已堵死 CoT 进入输出的路径，B 属第四层冗余防御。
+                    //
+                    // 故保留比例计算**仅作可观测性**：命中时打 warn 进 debug.log，积累真实数据后
+                    // 再决定是否需要更聪明的判据（如「输出字符与输入字符的重合度」）。
+                    if text.chars().count() >= 20 {
+                        let ratio = trimmed.chars().count() as f32 / text.chars().count() as f32;
+                        if ratio < 0.15 {
+                            log::warn!(
+                                "LLM response compressed below 15% of input (criterion B, observe-only, NOT rejected): in_len={}, out_len={}, ratio={:.3}",
+                                text.chars().count(),
+                                trimmed.chars().count(),
+                                ratio
+                            );
+                        }
+                    }
                     return Ok(result);
                 }
                 Err(e) if e.is_connect() || e.is_timeout() => {
@@ -284,6 +361,9 @@ impl LlmClient {
             max_tokens: Some(512),
             stream: None,
             enable_thinking: Some(false),
+            thinking: Some(ThinkingConfig {
+                thinking_type: "disabled".to_string(),
+            }),
         };
 
         let response_text = self
@@ -291,7 +371,19 @@ impl LlmClient {
             .await?;
 
         if let Some(translated) = extract_translated_tag(&response_text) {
-            return Ok(translated);
+            // FIX-COT-LEAK-001-P0-4 判据 A：翻译路径同样适用（零语种依赖）。
+            // 判据 B 不扩展到翻译路径（英译中可合法大幅压缩，15% 会误伤）。
+            let trimmed = translated.trim();
+            if trimmed.is_empty() || lacks_any_substantive_char(trimmed) {
+                log::warn!(
+                    "LLM translate response empty or lacks alphanumeric/CJK (criterion A): {:?}",
+                    trimmed.chars().take(100).collect::<String>()
+                );
+                return Err(anyhow!(
+                    "LLM translate format failure: criterion A (empty or no alphanumeric/CJK)"
+                ));
+            }
+            return Ok(trimmed.to_string());
         }
 
         Ok(response_text.trim().to_string())
@@ -367,6 +459,9 @@ impl LlmClient {
             max_tokens: Some(512),
             stream: None,
             enable_thinking: Some(false),
+            thinking: Some(ThinkingConfig {
+                thinking_type: "disabled".to_string(),
+            }),
         };
 
         let response_text = self
@@ -396,6 +491,19 @@ impl LlmClient {
         let translated = extract_translated_tag(&response_text)
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| response_text.trim().to_string());
+
+        // FIX-COT-LEAK-001-P0-4 判据 A：翻译结果同样适用（零语种依赖）。
+        // 判据 B 不扩展到翻译路径（英译中可合法大幅压缩，15% 会误伤）。
+        let trimmed_translated = translated.trim();
+        if trimmed_translated.is_empty() || lacks_any_substantive_char(trimmed_translated) {
+            log::warn!(
+                "LLM optimize+translate response empty or lacks alphanumeric/CJK (criterion A): {:?}",
+                trimmed_translated.chars().take(100).collect::<String>()
+            );
+            return Err(anyhow!(
+                "LLM optimize+translate format failure: criterion A (empty or no alphanumeric/CJK)"
+            ));
+        }
 
         Ok(OptimizeResult {
             text: translated,
@@ -519,6 +627,9 @@ If no such corrected word should be learned, omit this line entirely.";
             max_tokens: Some(512), // 语音输入优化不需要太多输出
             stream: Some(false),
             enable_thinking: Some(false), // 关闭推理模式，大幅减少延迟
+            thinking: Some(ThinkingConfig {
+                thinking_type: "disabled".to_string(),
+            }),
         }
     }
 
@@ -597,6 +708,32 @@ If no such corrected word should be learned, omit this line entirely.";
 
         let response = response.error_for_status()?;
         let chat: ChatResponse = response.json().await?;
+        // FIX-COT-LEAK-001-P0-5: 日志 finish_reason / usage，便于排查 length 截断 vs 超时 vs content_filter。
+        let finish_reason = chat
+            .choices
+            .first()
+            .and_then(|c| c.finish_reason.as_deref())
+            .unwrap_or("<none>");
+        let (prompt_t, completion_t, reasoning_t) = chat
+            .usage
+            .as_ref()
+            .map(|u| {
+                (
+                    u.prompt_tokens,
+                    u.completion_tokens,
+                    u.completion_tokens_details
+                        .as_ref()
+                        .and_then(|d| d.reasoning_tokens),
+                )
+            })
+            .unwrap_or((None, None, None));
+        log::info!(
+            "LLM response meta: finish_reason={}, prompt_tokens={:?}, completion_tokens={:?}, reasoning_tokens={:?}",
+            finish_reason,
+            prompt_t,
+            completion_t,
+            reasoning_t
+        );
         Ok(extract_text(chat).unwrap_or_default())
     }
 }
@@ -964,12 +1101,12 @@ fn extract_text(chat: ChatResponse) -> Option<String> {
 
     for choice in chat.choices {
         if let Some(message) = choice.message {
+            // FIX-COT-LEAK-001-P0-2: 只取 content，不再回落 reasoning_content。
+            // content 空意味着 token 耗尽/内容过滤，回落到 CoT 会把"模型自言自语"
+            // 当成答案注入用户输入框（Gavin 13:19 "..."根因）。
+            // reasoning_content 仍被解析（见 ResponseMessage），供 P0-5 日志观测。
             if let Some(content) = message.content.filter(|s| !s.trim().is_empty()) {
                 parts.push(content);
-            } else if let Some(reasoning) =
-                message.reasoning_content.filter(|s| !s.trim().is_empty())
-            {
-                parts.push(reasoning);
             }
             continue;
         }
@@ -977,9 +1114,6 @@ fn extract_text(chat: ChatResponse) -> Option<String> {
         if let Some(delta) = choice.delta {
             if let Some(content) = delta.content.filter(|s| !s.trim().is_empty()) {
                 parts.push(content);
-            } else if let Some(reasoning) = delta.reasoning_content.filter(|s| !s.trim().is_empty())
-            {
-                parts.push(reasoning);
             }
         }
     }
@@ -1044,8 +1178,10 @@ fn parse_suggestions_after_corrected_tag(
     text: &str,
     corrected_text: Option<&str>,
 ) -> Vec<SuggestionEntry> {
+    // FIX-COT-LEAK-001-P0-3: 用 rfind 取最后一个闭标签，与 extract_corrected_tag 的末对标签一致。
+    // 否则 CoT 里复述模板含 </corrected> 时，suggestions 会从 CoT 之后的位置解析而非真答案之后。
     let after_tag = text
-        .find("</corrected>")
+        .rfind("</corrected>")
         .map(|index| text[index + "</corrected>".len()..].trim())
         .unwrap_or("");
 
@@ -1061,15 +1197,25 @@ fn parse_suggestions_after_corrected_tag(
         .unwrap_or_default()
 }
 
+/// FIX-COT-LEAK-001-P0-4 判据 A：结果是否不含任何字母、数字或 CJK 字符。
+/// 任何合法的语音转录结果（无论语种）必然至少含一个字母/数字/汉字。
+/// `"..."`、`"。。。"`、`"---"` 这类纯标点结果一定是异常（CoT 泄漏截断等）。
+/// 零语种依赖、近乎零误报，适用于 optimize / optimize_and_translate / translate 全路径。
+fn lacks_any_substantive_char(text: &str) -> bool {
+    !text.chars().any(|c| {
+        c.is_alphanumeric() || ('\u{4E00}'..='\u{9FFF}').contains(&c) // CJK 统一表意
+    })
+}
+
 fn extract_corrected_tag(text: &str) -> Option<String> {
     let open = "<corrected>";
     let close = "</corrected>";
-    let start = text.find(open)? + open.len();
-    let end = text.find(close)?;
-    if end <= start {
-        return None;
-    }
-
+    // FIX-COT-LEAK-001-P0-3: 用 rfind 取最后一个开标签，再在其后找配对闭标签。
+    // 真正的答案永远在思维链之后；CoT 里若复述模板占位（如"输出 <corrected>...</corrected>"），
+    // 首对标签会抓到 CoT 里的占位而非真答案（Gavin 13:19 "..."根因之一）。
+    let start = text.rfind(open)? + open.len();
+    let end = text[start..].find(close).map(|i| start + i)?;
+    // end 在 start 之后已由切片查找保证，无需再判 end <= start
     let content = text[start..end].trim().to_string();
     if content.is_empty() {
         None
@@ -1326,11 +1472,11 @@ fn count_cjk(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_format_instruction_block, build_output_format, extract_translated_tag,
-        flatten_multiline, is_fabricated_closing, is_fabricated_salutation, is_two_line_closing,
-        parse_suggestion_line, parse_suggestions_after_corrected_tag,
-        parse_suggestions_from_response, strip_fabricated_email_lines, LlmClient, OptimizeResult,
-        SuggestionEntry, ATTEMPT_TIMEOUTS,
+        build_format_instruction_block, build_output_format, extract_corrected_tag,
+        extract_translated_tag, flatten_multiline, is_fabricated_closing, is_fabricated_salutation,
+        is_two_line_closing, lacks_any_substantive_char, parse_suggestion_line,
+        parse_suggestions_after_corrected_tag, parse_suggestions_from_response,
+        strip_fabricated_email_lines, LlmClient, OptimizeResult, SuggestionEntry, ATTEMPT_TIMEOUTS,
     };
     use crate::config::LlmConfig;
 
@@ -2682,5 +2828,148 @@ mod tests {
                 punct_word
             );
         }
+    }
+
+    // ============================================================
+    // FIX-COT-LEAK-001-P0-4: 判据 A/B 防误伤单测
+    // ============================================================
+
+    #[test]
+    fn criterion_a_rejects_pure_punctuation() {
+        // 纯标点应被判据 A 拦截
+        assert!(lacks_any_substantive_char("..."));
+        assert!(lacks_any_substantive_char("。。。"));
+        assert!(lacks_any_substantive_char("---"));
+        assert!(lacks_any_substantive_char("，。！？"));
+        assert!(lacks_any_substantive_char("")); // 空也判
+    }
+
+    #[test]
+    fn criterion_a_passes_normal_text() {
+        // 含字母/数字/CJK 的正常文本不应被误判
+        assert!(!lacks_any_substantive_char("hello"));
+        assert!(!lacks_any_substantive_char("你好"));
+        assert!(!lacks_any_substantive_char("GPU分为8核"));
+        assert!(!lacks_any_substantive_char("30°C"));
+        assert!(!lacks_any_substantive_char("2026-07-30"));
+        assert!(!lacks_any_substantive_char("嗯那个我觉得吧")); // 语气词密集也含汉字，不判
+    }
+
+    #[test]
+    fn criterion_a_passes_mixed_lang_with_minimal_substantive() {
+        // 即便只有一个实义字符也应通过（实义 = 字母/数字/CJK，标点不算）
+        // 主控修正：原有 `assert!(!lacks_any_substantive_char("。"))` 是错的——
+        // `。`(U+3002) 是标点，既非 alphanumeric 也不在 CJK 4E00-9FFF 区，
+        // 故它「不含实义字符」为真，该断言必然失败，且与
+        // `criterion_a_rejects_pure_punctuation` 中 `，。！？` 的断言直接矛盾。
+        // 已替换为真正只含一个实义字符的用例。
+        assert!(!lacks_any_substantive_char("。好"));
+        assert!(!lacks_any_substantive_char("a..."));
+        assert!(!lacks_any_substantive_char("...1"));
+        // 反向锁死：纯标点仍必须被判为「无实义字符」
+        assert!(lacks_any_substantive_char("。"));
+    }
+
+    // 判据 B 为什么被主控降级为「只观测、不拒绝」——本测试即证据。
+    //
+    // coder-1 原本写这条测试是为了证明「15% 阈值不会误伤合法 F1 语气词压缩」，
+    // 断言 `ratio >= 0.15`。主控实跑后该断言**失败**：31 字语气词密集输入压到
+    // 3 字 = 9.7% < 15%，**证明了阈值恰恰会误伤**（与作者预期相反）。
+    // 该测试从未被执行过——`cargo check --tests` 只编译不运行。
+    //
+    // 现改为断言真实比例，把「比例判据划不出可靠边界」这一事实钉死：
+    // 合法重度压缩 9.7% vs 真实故障案例（2026-07-29 13:19 "...")≈6%，仅差 3.7 个百分点。
+    #[test]
+    fn criterion_b_ratio_cannot_separate_legit_compression_from_failure() {
+        // 合法场景：F1 语气词去除的最激进压缩
+        let input = "嗯那个就是说吧我觉得呢这个嘛其实就是嗯那个怎么说呢就是我觉得吧";
+        let compressed = "我觉得";
+        let legit_ratio = compressed.chars().count() as f32 / input.chars().count() as f32;
+        assert!(
+            legit_ratio < 0.15,
+            "合法 F1 压缩比 {:.3} 确实低于 15% —— 这正是判据 B 不能用于拒绝的原因",
+            legit_ratio
+        );
+        // 故障场景（13:19 实测）：约 50 字输入 → "..." 3 字
+        let failure_ratio = 3.0_f32 / 50.0_f32;
+        // 两者差距极小，任何单一阈值都无法安全区分
+        assert!(
+            (legit_ratio - failure_ratio).abs() < 0.05,
+            "合法压缩 {:.3} 与故障 {:.3} 仅差 {:.3}，比例判据无法可靠区分",
+            legit_ratio,
+            failure_ratio,
+            (legit_ratio - failure_ratio).abs()
+        );
+    }
+
+    #[test]
+    fn criterion_b_extreme_filler_below_threshold() {
+        // 更极端：纯语气词长输入压到 1 字，比例远低于 15%。
+        // 保留此用例作为「比例判据触发面过宽」的补充证据：
+        // 该输入若被判失败，用户拿到的是满是语气词的原文，体感更差。
+        let input = "嗯啊那个嗯那个嗯啊就是嗯啊那个嗯那个吧嗯啊嗯那个";
+        let compressed = "嗯";
+        let ratio = compressed.chars().count() as f32 / input.chars().count() as f32;
+        assert!(
+            ratio < 0.15,
+            "纯语气词长输入（{}字）压到 1 字 ratio={:.3}，比例判据会触发——故只观测不拒绝",
+            input.chars().count(),
+            ratio
+        );
+    }
+
+    // ============================================================
+    // FIX-COT-LEAK-001-P0-1: ChatRequest 双发序列化护栏（TEST-COT-LEAK-001）
+    // ============================================================
+
+    #[test]
+    fn chat_request_dual_send_enable_thinking_and_thinking() {
+        // P0-1: enable_thinking 与 thinking 同时存在，确保双发不会因重构被误删其一。
+        let config = LlmConfig::default();
+        let client = LlmClient::new(config);
+        let request =
+            client.build_optimize_request("test", None, true, None, false, false);
+        let value = serde_json::to_value(&request).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(
+            obj.contains_key("enable_thinking"),
+            "enable_thinking must be present in ChatRequest"
+        );
+        assert!(
+            obj.contains_key("thinking"),
+            "thinking must be present in ChatRequest"
+        );
+        assert_eq!(
+            obj["enable_thinking"], false,
+            "enable_thinking must be false"
+        );
+        assert_eq!(
+            obj["thinking"]["type"], "disabled",
+            "thinking.type must be disabled"
+        );
+    }
+
+    // ============================================================
+    // FIX-COT-LEAK-001-P0-3: extract_corrected_tag 末对标签单测
+    // ============================================================
+
+    #[test]
+    fn extract_corrected_tag_takes_last_pair() {
+        // CoT 里复述模板占位 + 真答案，应取最后一对（真答案）
+        let raw = "我需要输出 <corrected>...</corrected> 格式。\n<corrected>真正的答案</corrected>";
+        assert_eq!(extract_corrected_tag(raw), Some("真正的答案".to_string()));
+    }
+
+    #[test]
+    fn extract_corrected_tag_single_pair_unchanged() {
+        let raw = "<corrected>唯一答案</corrected>";
+        assert_eq!(extract_corrected_tag(raw), Some("唯一答案".to_string()));
+    }
+
+    #[test]
+    fn extract_corrected_tag_malformed_returns_none() {
+        // 最后一个开标签后无配对闭标签
+        let raw = "<corrected>answer</corrected> 然后 <corrected>无闭标签";
+        assert_eq!(extract_corrected_tag(raw), None);
     }
 }
