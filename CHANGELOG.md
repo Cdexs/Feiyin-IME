@@ -4,6 +4,9 @@
 > 详细记录见 logs/YYYYMMDD.md
 
 ---
+| NPMLOCK-UNIFY-001 | corepack 钉住 npm@11.16.0（packageManager 字段入仓库），零改动 lock 即通过 npm ci，五步全 PASS | coder-1 | 2026-07-30 |
+| ITN-CELSIUS-003 + REFACTOR-DERIVE-TARGET-001 + REFACTOR-SHARE-TRANSDIR-001 | ITN 独立通道：阿拉伯数字+摄氏度→℃（修复 LLM 自转阿拉伯后 ℃ 仍无）；提取 derive_translation_target 到 translation 模块；ensure_translation_direction + load_for_direction + remember_translation_direction 移至平台中立模块（DEC-033 合规） | coder-1 | 2026-07-30 |
+| ITN-REORDER-001 + TRANS-BIDIR-001 | ITN 调用位置后移（三分支后/标点前，修复 ASR 同音错字时 ℃ 不触发）+ 翻译方向由内容自动判定（contains_han->English 否则 Chinese，移除 config 门控，单槽位引擎换向 + 方向缓存持久化） | coder-1 | 2026-07-30 |
 
 ## v0.7.1 - Bug 修复 + 优化批次（2026-07-24）
 

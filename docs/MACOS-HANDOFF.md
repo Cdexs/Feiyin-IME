@@ -97,7 +97,99 @@ Gavin 2026-07-29 决定**暂不启用 GitHub CI/CD**，维持本地平台构建�
 
 本仓库为公开仓库，标准 GitHub-hosted runner 含 macOS **免费且不限量**，该防线的成本障碍并不存在——若未来改变主意，可零成本启用。但**当前这道防线不存在**，上述人工约定是**唯一可执行的保障**。请重视。
 
-> 研究结论（`collab/research/macos-dualplatform-refactor-001.md`）：双平台 CI 是防止签名漂移的唯一可靠防线。此处平实陈述事实，供你们判断风险。
+> 研究结论（`collab/research/macos-dualplatform-refactor-001.md`）：双平台 CI 是防止签名漂移的唯一可靠防线。此处平实陈述事实，供你判断风险。
+
+### 2.4 提交署名规范（Gavin 硬要求）
+
+**禁止在 commit message 中添加任何 AI 署名**，包括 `Co-Authored-By: Claude ...`、`Generated with ...` 等。提交作者统一为：
+
+```
+Gavin.S <cdexs@hotmail.com>
+```
+
+> **为什么之前你们不知道这条**：该规则此前只存在于 Gavin 用户级的 `~/.claude/CLAUDE.md`（不在仓库内），你们无从得知。提交 `a38a315` 带了 `Co-Authored-By: Claude Opus 5` —— **不要求返工**（改历史比留着更危险，见 2.5），后续提交遵守即可。这条现在写进仓库，就是为了终结「规则只在一侧可见」这类问题。
+
+### 2.5 git 破坏性命令禁令【致命，两侧同等适用】
+
+**唯一允许的 git 命令**：`status` / `diff` / `log` / `show`（只读排查）。
+
+**绝对禁止**（无一例外）：
+
+| 命令 | |
+|---|---|
+| `git reset`（含 `--hard`/`--mixed`/裸用） | `git checkout -- <path>` / `git restore <path>` |
+| `git clean`（含 `-f`/`-fd`） | `git stash`（含 `pop`/`drop`/`clear`） |
+| `git commit --amend` | 任何强制覆盖历史的操作 |
+
+**背景**：2026-07-24 Windows 侧一个 Agent 为排查一个测试失败，误判他人未提交的改动为「自己误触」，执行批量 `git checkout --` + `git stash`/`pop`，**导致工作区回退两周、11 个已验收批次的改动全部丢失**（`collab/troubleshooting.md [GIT-RESET-INCIDENT-001]`）。
+
+**遇到「这个改动是不是我误触的」这类疑惑时的正确做法**：先用 `git diff` / `git status` 摸清范围 → **报给人类决策**，绝不自己清理。双平台单仓库下这条风险更高：你看到的「非预期改动」很可能是**对侧团队的正常提交**。
+
+### 2.6 共享业务逻辑必须放平台中立模块【本节 2026-07-30 新增】
+
+**规则**：任何**不含平台 API 调用**的业务逻辑，一律放进平台中立模块，**不得**放进带 `#[cfg(target_os = "...")]` 的区域。
+
+**主控 2026-07-30 实测的平台中立模块清单**（`grep -c target_os` 结果为 **0**，可直接双侧复用）：
+
+| 模块 | 内容 |
+|---|---|
+| `src/itn.rs` | 数字/单位规整规则 |
+| `src/translation/mod.rs` | 翻译引擎与方向逻辑 |
+| `src/text_normalizer.rs` | 简繁/脚本/语种探针 |
+| `src/config/mod.rs` | AppConfig 与持久化 |
+| `src/llm/mod.rs` | LLM 请求与解析 |
+
+**反面实例（本方自查发现并已纠正）**：Windows 侧 2026-07-30 实现翻译双向化时，把 `ensure_translation_direction()`（比较缓存方向与目标方向，不一致则重建引擎）和 `persist_translation_direction()`（写 AppConfig 字段并 save）两个函数放进了 `src/main.rs` 且带 `#[cfg(target_os = "windows")]`。**这两个函数体内没有任何一行是平台相关的** —— 若不纠正，你们要用就得各自重写一份，正是本文档 2.1 所述的漂移温床。已挪入平台中立模块，`main.rs` 内**只保留调用点**。
+
+**请两侧共同遵守此模式**：平台特有的部分留在 `platform/` 与 cfg 区，业务逻辑上移到共享模块。
+
+### 2.7 共享文档共编约定与引用纪律【2026-07-30 新增】
+
+`collab/` 与 `logs/` 已于 2026-07-30 移出 `.gitignore` 并入库（Gavin 决定），两侧从此共享同一份治理文档。随之而来的约定：
+
+**共编约定**：
+
+- **只追加自己那侧的条目，不重排、不改写他方段落**（你们提交 `a38a315` 做到了「DEC-033 正文逐行未改动，仅追加附则三」，这正是标准做法）
+- 冲突时**保留双方内容**，不要择一丢弃（本方合并 `CHANGELOG.md` 冲突即按此处理）
+- 高冲突文件：`collab/todo.md`、`collab/handoffs.md`、`CHANGELOG.md`、`logs/YYYYMMDD.md`
+
+**引用纪律（两次踩坑后立此条）**：
+
+1. **跨团队引用只许引仓库内实际存在的文件**。历史事故：你们文档曾引用 `collab/troubleshooting.md [NPM-CI-LOCK-DESYNC-001]` 与 `[NPM-LOCK-CROSSPLAT-001]`，而当时 `collab/` 尚未入库，本方**根本读不到**；反之本方的 DEC 编号你们也看不到
+2. **引用决策编号前先确认它在仓库里存在**。历史事故：`DEC-034` 被新立时，本方 `decisions.md` 只到 DEC-033，双方各自记录同一约束（已由 Gavin 拍板合并，DEC-034 编号作废留作墓碑）
+3. 不确定某编号是否存在时，`grep -n "DEC-0xx" collab/decisions.md` 一秒可查
+
+**排除在入库范围外的三类**（请遵循同一边界，勿提交）：
+
+| 排除项 | 理由 |
+|---|---|
+| `collab/research/audio-*/` | PoC 语音语料 62MB / 829 个 wav，含 Gavin 本人真实录音；本仓库为**公开仓库** |
+| `collab/inbox|outbox|acks|drafts/` | 任务派发/结果/ACK 属瞬时 IPC，两侧各自本地，入库必冲突（outbox 另含 2.8MB 截图） |
+| `desktop.ini` | Windows 资源管理器产物 |
+
+### 2.8 管线顺序契约（DEC-035）【代码层面无法共享，必须靠本条传递】
+
+**这是本文档中唯一「代码里读不到、只能靠文档传递」的行为契约，请特别重视。**
+
+Windows 侧 `run_pipeline`（`src/main.rs`，整个函数在 `#[cfg(target_os = "windows")]` 内）的处理顺序为：
+
+```
+ASR raw_text
+  → is_effective_text 门控（吃 raw_text）
+  → 场景采集
+  → 三分支：(a) LLM 成功 / (b) LLM 失败兜底 / (c) LLM 关闭
+  → itn::normalize_numbers(final_text)      ← 必须在此位置
+  → 本地标点引擎（仅 !llm_handled 时运行）
+  → 注入
+```
+
+**三条硬约束**：
+
+1. **ITN 必须在 LLM 之后**。原因：ASR 会把「摄氏」误听成「摄息/摄斯/摄四」（Windows 侧实测 11 次温度类听写只有 2 次听对），ITN 的 ℃ 规则字面匹配「摄氏」，**只有等 LLM 纠正错字之后**才可能触发
+2. **ITN 必须在标点引擎之前**。原因：标点模型（CT-Transformer）在 ASR 转写风格文本上训练，若先加 ℃/阿拉伯数字再喂给它，输入即分布外。**模型的分布外退化无法用规则修复，只能观测**；而 ITN 是确定性规则引擎，输入域变化可用规则+单测补齐。**把不确定性留给可控的一侧**
+3. **三条路径都必须经过 ITN**。特别是 (b) LLM 运行时失败兜底 —— 漏了这条，用户会看到纯汉字数字（「四十摄氏度」），**比不修更差**
+
+**若你们实现 macOS 管线时把 ITN 放回 LLM 之前，℃ 缺失的 bug 会在 macOS 上完整复现一遍。** 完整决策记录见 `collab/decisions.md` **DEC-035**（该条同时声明 DEC-030「转录后/LLM 前」的原文已作废）。
 
 ---
 
@@ -214,9 +306,23 @@ rm -rf cpu_features   # 只删非空的那些；空目录不必删，clone 可�
 
 ## 6 · 仓库工程约定
 
-### 6.1 npm 双平台冲突
+### 6.1 npm 双平台冲突【2026-07-30 依实测大幅修订，原表述已过时】
 
-`ui/package-lock.json` 双平台冲突：macOS 上 `npm install` 会删掉 win32 可选依赖条目，导致 Windows 侧 `npm ci` 失败。**约定两侧统一用 `npm ci`**（依据 `docs/BUILD-MACOS.md` §六）。
+**原表述**（「macOS 上 `npm install` 会删掉 win32 条目，约定两侧统一用 `npm ci`」）**不准确**，实测修订如下：
+
+| 实测事实 | 证据 |
+|---|---|
+| `npm ci` 在**两个平台都跑不了**，不是 Windows 独有 | Windows 侧复现 EUSAGE：`Invalid: lock file's @emnapi/wasi-threads@1.2.2 does not satisfy @1.2.3`（node v24.11.1 / npm 11.6.2） |
+| macOS 侧 `npm install --package-lock-only` 修复后，**Windows 侧 `npm ci` 依然失败**，报缺 25 条 `@esbuild` 平台条目 | Windows 侧 2026-07-30 实测 |
+| **顶层 12 条 win32 条目其实一直都在**，丢的是 `vitest/node_modules/@esbuild/*` 嵌套副本 | 两份 lock 逐条比对 |
+| **两份 lock 的包版本完全一致**（vite 5.4.21 / vitest 4.1.5 / esbuild 0.21.5 / 嵌套 vite 8.0.9），无任何依赖漂移 | 逐键比对 |
+| 差别纯粹是**两个 npm 小版本对 lock 完整性的记录方式不同** | macOS npm 11.16.0 生成 235 条、含 emnapi 2 条但**无**嵌套 esbuild；Windows npm 11.6.2 生成 259 条、含 23 条嵌套 esbuild 但**无** emnapi 2 条 |
+
+**结论：任何一侧单独生成的 lock 都无法同时满足对方的 `npm ci`。** 「让另一侧重算再提交」只会来回摆动。
+
+**真正的解法**：统一两侧 node/npm 版本（`packageManager` 字段 / `.nvmrc` 钉死），由统一版本的一侧重算 lock，另一侧只做验证。**Windows 侧当初判断「大版本相同、漂移风险低」是错的，你们 §8-1 的顾虑成立** —— 此结论已由实测推翻并在此更正。
+
+当前状态与后续步骤见 `docs/MACOS-NPMLOCK-COORDINATION.md`（你们起草）与 `docs/MACOS-NPMLOCK-WINDOWS-REPLY.md`（本方回执，含五步验证清单与对其步骤 4 的更正）。**Gavin 尚未拍板是否升级 Windows 侧 node，本项阻塞中。**
 
 ### 6.2 构建发布走本地流程
 

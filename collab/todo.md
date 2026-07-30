@@ -20,6 +20,27 @@
 
 ---
 
+## ✅ ITN 顺序反转 + ℃ 独立通道 + 翻译双向化 批次闭环（2026-07-30 19:40）
+
+> 来源：Gavin 端测两项反馈 —— ①「说摄氏度输出没转成 ℃」②「开了翻译按热键输出没译成英文」
+> 决策：**DEC-035**（ITN 位置反转，DEC-030-① 原文作废）
+
+| 编号 | 内容 | 负责人 | 状态 |
+| --- | --- | --- | --- |
+| ITN-REORDER-001 | ITN 从「LLM 前」移到「三分支后、标点前」，一处覆盖三条路径 | coder-1 | ✅ 已验收（**主控修 1 处**：重建失败返回方向不符旧引擎 → 改为返回 None，防注入幻觉译文） |
+| ITN-CELSIUS-003 | ITN 新增**独立于中文数字路径**的单位符号通道（`40摄氏度`/`40°C`→`40℃`），`itn-rules.toml` 新增 `[[unit_symbols.rules]]` 三条；`44度` 绝不转 | coder-1 | ✅ 已验收 |
+| TRANS-BIDIR-001 | 方向按内容自动判定，删除 `should_translate_for_language` 门控；单槽位引擎换向；`target_language` 语义改「上次方向缓存」 | coder-1 | ✅ 已验收 |
+| REFACTOR-DERIVE-TARGET-001 / REFACTOR-SHARE-TRANSDIR-001 | 三个函数移入平台中立模块（`translation/mod.rs` / `config/mod.rs`）去 cfg 门控，macOS 可直接复用 | coder-1 | ✅ 已验收 |
+| TEST-SYNC ×2 轮 | 两条失效断言修正 + ITN 新域 7 条 + 方向矩阵 5 条 + 3 条测试随函数搬入中立模块 | tester-1 | ✅ 已验收 |
+| TEST-EXEC ×2 轮 | **717 passed / 0 failed / 8 ignored**（分项 28+653+3+12+10+2+9 自洽 = `--list` 725）+ Tauri 53/0 + Vitest 54/0 + toml 三副本一致 | tester-1 | ✅ 已验收 |
+| NPMLOCK-UNIFY-001 | corepack 钉 `packageManager: npm@11.16.0`；**零改动假设成立，lock 一字节未改** | coder-1 | ✅ 已验收（**主控修 1 处表述**：默认 npm 仍 11.6.2） |
+
+**⚠️ 首轮 TEST-EXEC 6 个失败的根因（重要教训，已写入 troubleshooting 备查）**：`normalize_test` 测试助手只调 `normalize_with_rules`，**绕过公共入口 `normalize_numbers` 的第二阶段** —— **96 条断言长期在测一条非公共路径**。生产代码无误。主控改助手直调公共入口后全绿。与 `builtin_rules_parse_ok` 那个「内联 fixture 覆盖不到真实 toml」的黑洞属同一类缺陷。
+
+**npm 环境收口（2026-07-30 19:41）**：`corepack enable npm` 需写 `C:\Program Files\nodejs` 会 EPERM（Gavin 两次尝试均未生效，主控实证）。改用免提权方案 —— shim 装到 `%USERPROFILE%\bin` + 前置用户级 PATH，全新进程实测 `npm --version` = **11.16.0**。
+
+---
+
 ## ✅ 已并入 macOS 团队首批交付并通过 Windows 零回归验收（2026-07-30 14:40）
 
 **合并**：`e9296ba`（并入 `5e3ed89`/`6f0b51e`/`4b2126b`/`b04596b`），本地 **ahead 2 未 push**（等 Gavin 指令）。
