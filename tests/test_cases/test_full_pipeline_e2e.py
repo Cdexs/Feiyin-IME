@@ -20,10 +20,11 @@
 import os
 import subprocess
 import time
-import win32clipboard
 from pathlib import Path
 
 import pytest
+
+win32clipboard = pytest.importorskip("win32clipboard")
 import pyautogui
 
 from ..conftest import kill_existing_voice_ime, wait_for_condition

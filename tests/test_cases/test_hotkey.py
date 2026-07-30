@@ -11,10 +11,14 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 import pytest
+
+if sys.platform != "win32":
+    pytest.skip("Win32-only tests", allow_module_level=True)
 
 from ..conftest import kill_existing_voice_ime, wait_for_condition
 from ..sendinput_hotkey import (
