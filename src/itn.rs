@@ -1601,6 +1601,119 @@ words = ["度", "摄氏度"]
     }
 
     // ============================================================
+    // ITN-GEOMETRIC-001: 几何图形 + 「角」族复合词白名单
+    // ============================================================
+    //
+    // 根因：「角」(itn-rules.toml:23 units.currency) 的 is_unit 用
+    // s.starts_with(u) → 「角形」被判为单位语境 → 单字数字被转。
+    // 「边」不在任何单位词表，故四边形本来不受影响，但仍纳入白名单作为护栏。
+    //
+    // 全部断言使用 normalize_test（公共入口 normalize_numbers，
+    // 包含 normalize_with_rules + normalize_unit_symbols 两阶段）。
+
+    /// P0-1: 几何图形主修复目标
+    #[test]
+    fn geometric_triangle_protected() {
+        assert_eq!(normalize_test("三角形"), "三角形");
+    }
+    #[test]
+    fn geometric_quadrilateral_protected() {
+        assert_eq!(normalize_test("四边形"), "四边形");
+    }
+    #[test]
+    fn geometric_pentagon_protected() {
+        assert_eq!(normalize_test("五边形"), "五边形");
+    }
+    #[test]
+    fn geometric_hexagon_protected() {
+        assert_eq!(normalize_test("六边形"), "六边形");
+    }
+
+    /// P0-2: 八角形（主控补漏项）— 注意 check_protection 是整词前缀匹配，
+    /// 白名单「八角形」不影响裸「八角」的货币转换
+    #[test]
+    fn geometric_octagon_protected() {
+        assert_eq!(normalize_test("八角形"), "八角形");
+    }
+
+    /// P0-3: 白名单不外溢 — 裸「八角」不在白名单内，走正常货币转换。
+    /// 通过代码分析（src/itn.rs:1010 decide_conversion）：
+    ///   parse_cn_number("八") → ("8", 1)
+    ///   is_unit("角") → true（角 ∈ units.currency）
+    ///   返回 true → 得到 "8角"
+    /// 这是白名单不误伤合法货币转换的护栏。
+    #[test]
+    fn geometric_bajiao_not_protected_currency_conversion() {
+        assert_eq!(normalize_test("八角"), "8角");
+    }
+
+    /// P0-4: 「角」族复合词白名单
+    #[test]
+    fn geometric_angle_compound_san_jiao_zhou() {
+        assert_eq!(normalize_test("三角洲"), "三角洲");
+    }
+    #[test]
+    fn geometric_angle_compound_san_jiao_zhai() {
+        assert_eq!(normalize_test("三角债"), "三角债");
+    }
+    #[test]
+    fn geometric_angle_compound_san_jiao_lian() {
+        assert_eq!(normalize_test("三角恋"), "三角恋");
+    }
+    #[test]
+    fn geometric_angle_compound_san_jiao_han_shu() {
+        assert_eq!(normalize_test("三角函数"), "三角函数");
+    }
+
+    /// P0-5: 反向护栏 — 合法转换未被误伤
+    /// 三十度 → 30度（decide_conversion: consumed=2 ≥ 2 → 转）
+    /// 五公斤 → 5公斤（decide_conversion: is_unit("公斤") → 转）
+    /// 三角 → 3角（单字+货币单位，参见 P0-3 同理）
+    /// 三分之一 → 1/3（fraction 模式，先于 check_protection 运行）
+    #[test]
+    fn geometric_legitimate_conversion_not_harmed() {
+        assert_eq!(normalize_test("三十度"), "30度");
+        assert_eq!(normalize_test("五公斤"), "5公斤");
+        assert_eq!(normalize_test("三角"), "3角");
+        assert_eq!(normalize_test("三分之一"), "1/3");
+    }
+
+    /// P1-1: 非数字前缀 + 白名单（以「正」「等腰」等开头，
+    /// check_protection 扫描到内部「三角形」时命中白名单）
+    #[test]
+    fn geometric_special_triangle_prefix() {
+        assert_eq!(normalize_test("正三角形"), "正三角形");
+        assert_eq!(normalize_test("等腰三角形"), "等腰三角形");
+        assert_eq!(normalize_test("直角三角形"), "直角三角形");
+    }
+
+    /// P1-2: 多位数字 + 白名单
+    #[test]
+    fn geometric_multi_digit_polyhedron() {
+        assert_eq!(normalize_test("十二面体"), "十二面体");
+        assert_eq!(normalize_test("二十面体"), "二十面体");
+    }
+
+    /// P1-3: 匹配顺序隐患护栏（注释说明）
+    ///
+    /// 无法用测试表达：check_protection（src/itn.rs:1063）遍历 HashSet，
+    /// 迭代顺序未定义（因 proper_noun_set 是 HashSet<String>）。
+    /// 当前 itn-rules.toml 无互相为前缀的条目冲突：
+    ///   - 「三角」族（三角洲/三角债/三角恋…）起点相同但「三角」不在白名单内
+    ///   - 同一几何图形组内各条目互不为前缀
+    ///
+    /// 隐患：若将来有人同时加入「三角」和「三角洲」，此二条互为前缀关系，
+    /// 而 HashSet 迭代顺序未定义 → 先遍历到「三角」则匹配 2 字，「三角洲」
+    /// 的保护被截断为「三角」+「洲」单独处理。但「洲」无单位语境 → 不会被误转，
+    /// 只是保护不完全。修复方法：entry 加入时确保无前缀重叠，或改用 BTreeSet
+    /// 并实现最长匹配优先。当前无实例，无法写确定性测试。
+    #[test]
+    fn geometric_order_hazard_documented() {
+        // 本条仅为确保注释可见（空断言），隐患已在文档中记录
+        assert!(true);
+    }
+
+    // ============================================================
     // 保护：虚词"一"
     // ============================================================
 
