@@ -1916,3 +1916,34 @@ pyautogui 0.9.54 / psutil / pytest-timeout / python-dotenv），但**装好 ≠ 
 本次 Worker 报告的自验是 `pytest --collect-only → 5/7 test_config tests 可发现` ——
 那是**限定到单个文件的窄范围运行**，两道坎都被遮住。
 **环境类验收的准绳应为「仓库根裸跑 + `tests/` 全量收集」两条都过**，而非挑一个能过的范围证明可用。
+
+---
+
+## [NPM-LOCK-CROSSPLAT-001] 补充修正（2026-07-30 macOS 侧实测）：`+39/−462` 这个特征数字会误导
+
+本条原文记载：在 macOS 上跑 `npm install` 会把 lock 里 win32 的 optional 依赖条目
+「**整段删除**」，实测 diff 为 **+39 / −462 行**。
+
+**2026-07-30 执行 `MACOS-NPMLOCK` 修复时发现：`npm install --package-lock-only` 产生的 diff
+也恰好是 `+39 / −462`，但它并不删除任何 win32 条目。** 逐条核验：
+
+| 核验项 | 结果 |
+| --- | --- |
+| 12 个**顶层** win32 包条目（`@esbuild/win32-*` / `@rolldown/binding-win32-*` / `@rollup/rollup-win32-*` / `@tauri-apps/cli-win32-*`） | HEAD 与修复后 `comm` 逐条比对，**丢失数 0** |
+| 被删的 26 个包条目 | 23 个是 `vitest/node_modules/@esbuild/*` **嵌套副本**（被 npm 11 去重到仍然存在的顶层同名条目），3 个是 `netbsd-arm64` / `openbsd-arm64` / `openharmony-arm64` 冷门平台 |
+| 新增 | `@emnapi/core`、`@emnapi/runtime` —— 正是 EUSAGE 报缺的两个 |
+
+**教训（这才是本补充的价值）**：
+
+1. **不要用 diff 行数判断 lock 是否被破坏。** `-  "node_modules/vitest/node_modules/@esbuild/win32-x64"`
+   这样的行看起来像「win32 条目被删」，实际删的是嵌套副本，顶层同名条目仍在。
+   本条原文的「整段删除」判断很可能就是这样读出来的
+2. **唯一可靠的判据是：比对顶层包条目是否丢失**：
+
+       git show HEAD:ui/package-lock.json | grep -oE '"node_modules/@[^/"]*/[^"]*win32[^"]*"' | sort -u > /tmp/a
+       grep -oE '"node_modules/@[^/"]*/[^"]*win32[^"]*"' ui/package-lock.json | sort -u > /tmp/b
+       comm -23 /tmp/a /tmp/b        # 有输出才是真丢失
+
+3. **本条对 `npm install` 的禁令仍然有效** —— 未在 macOS 上重跑 `npm install` 做对照实验
+   （风险不对称：真破坏了就得再修一轮）。故**不能断言原记载有误**，只能确认
+   `--package-lock-only` 是安全的，且 `+39/−462` 不构成「被破坏」的证据
