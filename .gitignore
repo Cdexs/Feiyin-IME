@@ -20,6 +20,8 @@ node_modules
 # ===== Large vendor binaries =====
 /vendor/sherpa-onnx/*-Release.tar.bz2
 /vendor/sherpa-onnx/*-Release/
+/vendor/sherpa-onnx/*-shared-lib.tar.bz2
+/vendor/sherpa-onnx/*-shared-lib/
 /vendor/whisper-rs-sys/
 
 # ===== Python =====
