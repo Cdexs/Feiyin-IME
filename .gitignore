@@ -40,6 +40,11 @@ __pycache__/
 #   ② 任务派发/结果/ACK 等瞬时 IPC（两侧各自本地，入库必冲突；outbox 另含 2.8MB 截图二进制）
 #   ③ Windows 资源管理器产生的 desktop.ini
 /collab/research/audio-*/
+#   ④ 词库派生的中间数据（RESEARCH-ITN-LEXICON-001，972KB）：派生自 jieba/CC-CEDICT/THUOCL，
+#      **许可证尚未取得原文证据**（CC-CEDICT 为 CC BY-SA，share-alike 有传染性）。
+#      在许可证结论落实前一律不入库；最终产物只以「净化后的词条」形式进 itn-rules.toml，
+#      并在文档致谢来源。此前该目录处于「未跟踪但未被忽略」状态，`git add -A` 会误提交（2026-07-30 主控发现）。
+/collab/research/data/
 /collab/inbox/
 /collab/outbox/
 /collab/acks/

@@ -1,5 +1,20 @@
 # handoffs · voice-ime
 
+## 2026-07-30 — tester-1 — BUILD-RELEASE-20260730-002 ✅ v0.7.3 全量出包完成
+
+- **来源**：Gavin 指令「基于目前的修改，出包吧」+「连 1386 条一起出包」
+- **范围**：三步全量构建（npm build + Tauri UI + 主程序）+ Publish/ 同步 + itn-rules.toml 三副本
+- **产物**：
+  - feiyin-ime.exe: 11,798,016 B（+86KB, sha256 `74e4b56a`）
+  - feiyin-ime-ui.exe: 10,026,496 B（sha256 `16acff20`, ProductVersion 0.7.3）
+  - crash-reporter.exe: 24,858,624 B（sha256 `cc2ee873`）
+- **决定性探针**：4 串（八里庄北里/一个十七八岁/三角剖分/一个九十度）target/release + Publish 两副本全部 8/8 命中
+- **itn-rules.toml 三副本 sha256** `9f36efcb` 一致（33,252 B，含 1386 条 unit_collisions）
+- **cargo test itn::**：96 passed, 1 failed（time_half 预期失败，不作修复）
+- **冒烟实例**：PID 23276, Responding=True, 零 panic
+- **红线遵守**：未改版本号/源文件/未 cargo clean/无 git 破坏命令
+- **详情**：`collab/outbox/tester-1/result.md`（非空）
+
 ## 2026-07-30 — coder-1 — AUDIT-MACOS-BRANCH-001 ✅ 完成（纯审计，零代码改动）
 
 - **范围**：`src/` 与 `src-tauri/src/` 内所有 `#[cfg(target_os = "macos")]` / `#[cfg(not(target_os = "windows"))]` / `#[cfg(unix)]` / `#[cfg(target_family = "unix")]` 分支的静态 API/签名审计

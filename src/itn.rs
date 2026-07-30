@@ -6,7 +6,7 @@
 //! 核心流程：扫描文本 → 识别中文数字段 → 判定语境（单位/日期/序数/百分比/分数/小数）→
 //!   决定是否转换 → 保护白名单优先 → 输出转换结果。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use serde::Deserialize;
@@ -148,6 +148,9 @@ struct Protect {
     /// 与 proper_nouns 功能相同（整词保护不转），独立分组便于维护与注释。
     #[serde(default)]
     historical: ProtectList,
+    /// ITN-COLLISION-TYPEA-002: 单位前缀碰撞保护词（机器派生，jieba+THUOCL）
+    #[serde(default)]
+    unit_collisions: ProtectList,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -193,6 +196,9 @@ struct CompiledRules {
     large_amount_keep_wan_yi: bool,
     /// ITN-SMART-002: 含数字的历史/文化/民俗词汇保护集
     historical_set: HashSet<String>,
+    /// ITN-COLLISION-TYPEA-002: 单位前缀碰撞保护词，按首字分桶
+    /// 桶内按字符数降序排列（保证确定性最长匹配）
+    unit_collision_map: HashMap<char, Vec<String>>,
     /// ITN-CELSIUS-003: 单位符号规整规则（阿拉伯数字 + trigger → replacement）
     /// 按 trigger 字符长度降序排列（最长匹配优先）
     unit_symbol_rules: Vec<(String, String)>,
@@ -241,6 +247,19 @@ impl CompiledRules {
             below_zero_style: r.switches.below_zero_style,
             large_amount_keep_wan_yi: r.switches.large_amount_keep_wan_yi,
             historical_set: r.protect.historical.words.iter().cloned().collect(),
+            unit_collision_map: {
+                let mut map: HashMap<char, Vec<String>> = HashMap::new();
+                for w in &r.protect.unit_collisions.words {
+                    if let Some(first) = w.chars().next() {
+                        map.entry(first).or_default().push(w.clone());
+                    }
+                }
+                // 桶内按字符数降序排序，确保最长匹配优先
+                for bucket in map.values_mut() {
+                    bucket.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
+                }
+                map
+            },
             unit_symbol_rules: {
                 let mut rules: Vec<(String, String)> = r
                     .unit_symbols
@@ -1088,6 +1107,20 @@ fn check_protection(chars: &[char], start: usize, r: &CompiledRules) -> Option<u
     for fw in &r.function_word_set {
         if rest.starts_with(fw.as_str()) {
             return Some(fw.chars().count());
+        }
+    }
+
+    // ITN-COLLISION-TYPEA-002: 单位前缀碰撞保护（机器派生词表，优先级低于上方人工分组）
+    if let Some(bucket) = r.unit_collision_map.get(&chars[start]) {
+        let remaining = chars.len() - start;
+        for w in bucket {
+            let n = w.chars().count();
+            if n > remaining {
+                continue; // 桶内已按长度降序，可直接跳过更长的
+            }
+            if rest.starts_with(w.as_str()) {
+                return Some(n);
+            }
         }
     }
 
