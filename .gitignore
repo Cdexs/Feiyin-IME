@@ -32,7 +32,20 @@ __pycache__/
 .venv/
 
 # ===== AI agent configs (internal) =====
-/collab
+# collab/ 已于 2026-07-30 移出忽略并入库（Gavin 决定：便于 Windows / macOS 两侧团队信息对称交流）。
+# 入库范围 = 协作文档：todo / handoffs(+archive) / decisions / troubleshooting / progress /
+#            build-test-guide / research/*.md
+# 以下三类仍不入库，理由见 docs/MACOS-NPMLOCK-WINDOWS-REPLY.md §5.1：
+#   ① PoC 语音语料（62MB / 829 wav，含 Gavin 本人真实录音；本仓库为公开仓库，且会让全新 clone 暴涨）
+#   ② 任务派发/结果/ACK 等瞬时 IPC（两侧各自本地，入库必冲突；outbox 另含 2.8MB 截图二进制）
+#   ③ Windows 资源管理器产生的 desktop.ini
+/collab/research/audio-*/
+/collab/inbox/
+/collab/outbox/
+/collab/acks/
+/collab/drafts/
+/collab/**/desktop.ini
+/collab/desktop.ini
 /logs
 /tasks
 # 协作文档快照备份（scripts/backup-docs.ps1 产出，每日计划任务轮转 30 份）
