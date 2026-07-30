@@ -121,7 +121,7 @@ impl TapContext {
         let primary_now_pressed =
             primary_key_pressed(event_type, flags, binding.primary_modifier_flag);
         let modifiers_ok = modifiers_match(flags, binding.modifiers, binding.primary_modifier_flag);
-        let is_repeat = event_type == CGEventType::KeyDown
+        let is_repeat = matches!(event_type, CGEventType::KeyDown)
             && event.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT) != 0;
 
         match binding.mode {
@@ -254,7 +254,7 @@ fn run_listener(
     let source = tap
         .mach_port()
         .create_runloop_source(0)
-        .ok_or_else(|| anyhow!("CFMachPort create_runloop_source failed"))?;
+        .map_err(|_| anyhow!("CFMachPort create_runloop_source failed"))?;
 
     let run_loop = CFRunLoop::get_current();
     run_loop_ptr.store(

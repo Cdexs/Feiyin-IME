@@ -20,6 +20,8 @@ node_modules
 # ===== Large vendor binaries =====
 /vendor/sherpa-onnx/*-Release.tar.bz2
 /vendor/sherpa-onnx/*-Release/
+/vendor/sherpa-onnx/*-shared-lib.tar.bz2
+/vendor/sherpa-onnx/*-shared-lib/
 /vendor/whisper-rs-sys/
 
 # ===== Python =====
@@ -43,6 +45,14 @@ GEMINI.md
 QWEN.md
 /.codex
 /.qwen
+
+# ===== Tauri 生成物：macOS 平台 schema =====
+# macOS 上 cargo check / build 会生成 gen/schemas/macOS-schema.json。
+# 其内容与已入库的 windows-schema.json / desktop-schema.json 逐字节相同
+# （三者 md5 均为 2d534822642d73cf19e511b7b77c91f1），入库只是多一份 113 KB 重复副本。
+# 注：同目录的 acl-manifests / capabilities / desktop-schema / windows-schema 仍为跟踪状态，
+# 本条只排除 macOS 侧新产生的这一份（Gavin 2026-07-30 决定）。
+src-tauri/gen/schemas/macOS-schema.json
 
 # ===== Design draft icons =====
 src-tauri/icons/preview-*.png
