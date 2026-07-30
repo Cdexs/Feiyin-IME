@@ -459,3 +459,38 @@
   2. **契约注释块**（同上）：平台相关类型差异显式标注，新增 stub 遵循「名称 + arity 相同，类型可平台化」原则
   3. **交接纪律**（写入 `docs/MACOS-HANDOFF.md`）：任何一侧改动 platform 层导出面，**必须同步更新 `platform/mod.rs` 的两份清单**，并在 PR 描述中声明
   4. **两侧各自本地 `cargo check`**：只能验证本平台，防不住对侧——这是无 CI 状态下的固有缺口，需靠纪律弥补
+
+---
+
+## DEC-034 · 跨平台兼容规范为首要约束；单仓库 + 两端并行开发【Gavin 2026-07-30 拍板】
+
+> **状态：已生效。** 由 Gavin 2026-07-30 在 macOS 侧交接时口头拍板，取代 DEC-033「待批准」状态中关于协作方式的部分。
+
+- **背景**：Windows 侧团队于 2026-07-30 完成 MACOS-COMPAT-001 双平台接缝适配（提交 `292eeb0`），并交付四份交接文档（`docs/MACOS-HANDOFF.md` / `MACOS-PORT-ASSESSMENT.md` / `BUILD-MACOS.md` / `MACOS-BRANCH-AUDIT.md`）。macOS 侧于同日 checkout 完成（`695e50e` → `2c98976`）。
+
+- **Gavin 原话要点**：
+  1. 后续 macOS 端开发基于**一个代码仓 + 两端并行**的方式进行
+  2. **核心通用代码两边共享**
+  3. Windows / macOS 的**本地专用代码由两端人员各自开发**
+  4. 但**必须遵守跨平台兼容规范**——**从架构设计、技术选型、到方案、代码设计与开发，都必须遵照这个首要约束规范**
+
+- **决策**：
+  1. **「跨平台兼容」是本项目的首要约束**，优先级高于单平台的实现便利性。任何架构决策、技术选型、实施方案、代码设计在提出时**必须先论证其跨平台后果**，不得以「本平台能跑」为充分理由
+  2. 单仓库、两端各自本地构建、Git 同步 —— 明确采用（DEC-033 评估结论 1 落地）
+  3. 共享核心（`src/` 中 `transcription` / `llm` / `wordbook` / `itn` / `scene` / `translation` / `config` / `crash` / `text_normalizer` / `i18n` / `version_check` / `punctuation`，约 59%）**两端共有**，改动方对两平台后果负责
+  4. `platform/windows/**` 由 Windows 侧负责，`platform/macos/**` 由 macOS 侧负责；**但两侧导出面（`src/platform/mod.rs` 的两份显式清单）是共有契约，任一侧改动导出面必须同步更新两份清单并在提交信息中声明**
+
+- **与 DEC-000 的关系**（重要，避免解读冲突）：
+  - DEC-000「目标系统 Win10/11、所有技术选型必须满足 Win10/11 兼容性」**对 Windows 平台层继续有效**，是 Windows 侧的下位约束
+  - 但 DEC-000 原文的「**最高优先级**」定位**由本条接管**：最高优先级现为「跨平台兼容」，Win10/11 兼容性是其在 Windows 侧的具体要求之一
+  - **本条不改写 DEC-000 正文**（DEC-033 开放问题 2 仍待 Gavin 决定是否要动措辞），仅明确优先级关系
+
+- **执行要求（对所有 Agent）**：
+  1. 任何涉及共享代码的任务书，必须包含「对另一平台的影响评估」一节；主控派发前自查，Worker 收到后可就此提异议
+  2. **改 `AppConfig` 结构（`src/config/mod.rs`）是最高风险动作**——两侧平台层都消费它，改字段名在 Windows 上照样编译通过而 macOS 直接炸（DEC-033 风险地图）。此类改动必须显式列出两侧平台层调用点
+  3. 新增 macOS stub 遵守 `src/platform/mod.rs:51` 的 stub 设计原则：**名称 + arity 与 Windows 侧相同，仅参数类型平台化**；arity 差异是最后手段
+  4. **当前无 CI 防线**（DEC-033 附则二：Gavin 2026-07-29 决定暂不启用 GitHub CI/CD）。故上述人工约定是唯一可执行保障，且「一侧破坏另一侧」在提交时不会暴露。`#[cfg]` 切掉的代码编译器不做类型检查，trait 也防不住——这是机制性事实，不是纪律问题
+
+- **影响**：
+  - `CLAUDE.md` 通篇以 Windows 为前提（构建命令、备份脚本 PowerShell、git 凭证路径 `C:\Users\Aaron-GMK\...`），与本条冲突，**需重写为双平台版本**（待 Gavin 排期）
+  - `collab/build-test-guide.md` 全文以 Windows 为前提（pywinauto / `.exe` / PowerShell），macOS 侧 tester-1 的 Step 3/4 无对应实现，**需补 macOS 章节后才能派发测试执行类任务**

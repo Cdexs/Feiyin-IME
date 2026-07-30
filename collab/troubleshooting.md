@@ -1714,3 +1714,205 @@ rm -rf cpu_features        # 只删非空的那些；空目录不必删，clone 
 2. **Worker 报「网络问题、非我代码问题」时，主控必须自己查一遍环境**。coder-1 的判断"非代码问题"正确，但"网络失败"的归因错误，导致他提出的两个方案（跳过验证 / 等网络恢复）**都无法解决问题**
 3. **macOS 团队会撞上完全相同的坑**（同一份 build.rs、同一个 helper crate），BUILD-MACOS.md §二 称 CTranslate2 "是整个构建里最耗时的一步"却未提此陷阱。**必须写进 `docs/MACOS-HANDOFF.md`**
 4. 环境类阻塞属主控职责，不要让 Worker 反复重试消耗轮次
+
+---
+
+## [CRLF-CROSSPLAT-001] ⚠️ macOS 侧编辑把 CRLF 整文件改写为 LF，制造 4800 行幽灵 diff【提交前必查】
+
+**状态**：🟡 已识别，未处理（2026-07-30 主控启动巡检发现；改动仍悬在工作区）
+
+- **现象**：`git status` 显示 18 个文件被修改、`git diff --stat` 报 **+4816 / −4805**（`ui/src/styles.css` 单文件 3304 行、`src-tauri/src/i18n.rs` 1138 行）。看上去像一次大规模重构，实则**内容零改动**
+- **证伪方法（一条命令）**：
+  ```bash
+  git diff --stat --ignore-cr-at-eol
+  ```
+  结果只剩 **3 个文件 / +13 / −2** —— 即 15 个文件是纯行尾符改写（CRLF → LF），真实改动仅
+  `.gitignore`（+2，sherpa-onnx macOS 包排除）、`CHANGELOG.md`（+2，07-28 出包与磁盘清理记录）、
+  `scripts/build-macos.sh`（+11/−2，REPO_ROOT + source env-macos.sh + 旧名 voice-ime→feiyin-ime）
+- **根因**：仓库**无 `.gitattributes`**，`core.autocrlf` / `core.eol` **均未设置** → git 原样存储字节。
+  历史文件由 Windows 侧以 CRLF 提交；macOS 侧任何编辑器/工具一旦整文件重写就落成 LF，全文件每行皆变
+- **危害**：
+  1. 若照此提交，历史里出现 4800 行无意义 diff，`git blame` / `git log -p` 对这批文件永久失效
+  2. 真实的 13 行改动被埋在噪声里，code review 无从进行
+  3. Windows 侧 pull 后再被工具改回 CRLF，形成**两平台来回翻转的提交战争**（与
+     [NPM-LOCK-CROSSPLAT-001] 的 package-lock 互删属同一类跨平台锁抖动）
+- **处理规则（两平台都适用）**：
+  1. **提交前必跑** `git diff --stat --ignore-cr-at-eol`，与 `git diff --stat` 对比。数字差距大 = 存在行尾噪声
+  2. 只提交真实改动文件（逐个 `git add <file>`），**不要 `git add -A`**
+  3. 行尾噪声文件**不得**用 `git checkout --` 批量还原（[GIT-RESET-INCIDENT-001] 禁令）；
+     正确做法是不 add 它们、让其继续悬在工作区，或由 Gavin 拍板后一次性统一行尾
+- **根治方案（需 Gavin 拍板，勿擅自执行）**：加 `.gitattributes` 写 `* text=auto eol=lf`（或 `eol=crlf`）
+  统一全仓行尾。**代价是一次涉及全仓的规范化提交**，会一次性冲掉大量 `git blame` 归属，
+  且必须在两平台无未提交改动时做。**在拍板前，本条只作为提交前检查项使用**
+
+---
+
+## [TOML-SECTION-DRIFT-001] 🔴 条件依赖段头插在表中间，会把后续依赖静默改判为单平台【两侧都必读】
+
+**状态**：🟡 已定位，修复进行中（2026-07-30 发现于 macOS 侧 cargo check 基线）
+
+- **现象**：macOS 上 `cargo check --manifest-path src-tauri/Cargo.toml` 报 7 个错误（3 个逻辑类）——
+  `src-tauri/src/qwen3.rs:1,5-8,25` 找不到 `futures_util` / `tokio_tungstenite`，
+  `src-tauri/src/main.rs:170` 找不到 `rustls`。而这三个 crate **明明写在 Cargo.toml 里**。
+
+- **根因**：提交 `292eeb0` 把 `windows` 依赖移入条件依赖段时，**把段头插在了 `[dependencies]` 表的中间**：
+
+      [dependencies]
+      ...
+      chrono = { ... }
+
+      [target.'cfg(target_os = "windows")'.dependencies]     ← 段头插在这里
+      windows = { ... }
+
+      tokio-tungstenite = { ... }    ← 本意是共享依赖，实际已归属上面的 Windows 段
+      futures-util = "0.3"           ← 同上
+      rustls = { ... }               ← 同上
+
+  **TOML 语义：段头之后的所有键都归属该段，直到下一个段头。** 中间的空行、注释都不构成分隔。
+  于是三个本应共享的依赖被静默改判为 Windows 专属。
+  改动前原文可用 `git show 292eeb0^:src-tauri/Cargo.toml` 核对，三者确实都在 `[dependencies]` 内。
+
+- **为什么在 Windows 侧完全不可见（本条的核心教训）**：
+  在 Windows 上 `cfg(target_os = "windows")` 命中，三个依赖照常解析，`cargo check` **0 errors**。
+  提交信息里那句「`cargo check --manifest-path src-tauri/Cargo.toml` 0 errors」**是真的，但它拦不住这个错**。
+  破坏只在对侧平台显形 —— 与 DEC-033/DEC-034 描述的 cfg 漂移是同一类风险，
+  但**发生在依赖清单层而非代码层**。
+
+- **危害不止编译失败**：`rustls` 那行是 `BUG-QWEN3-CRYPTO-001` 的修复
+  （`src-tauri/src/main.rs:170` 进程级安装 ring provider，须在任何 TLS 使用之前）。
+  被划成 Windows-only 意味着 **macOS 侧连这个 crypto 修复一起丢了**，
+  而 qwen3 在线 ASR 是跨平台功能。**编译错误只是症状，功能缺失才是实害。**
+
+- **为什么静态审计查不出**：`docs/MACOS-BRANCH-AUDIT.md` 的方法是扫描源文件里所有
+  `#[cfg(...)]` 分支。而 `qwen3.rs` 与 `main.rs:170` 的代码**本身没有任何 cfg 守卫**——
+  漂移在 `Cargo.toml` 里。**「依赖层 cfg」与「代码层 cfg」的同步缺口，是源码级 cfg 审计的结构性盲区。**
+
+- **修复**：把 `[target.'cfg(...)'.dependencies]` 段**整体移到所有共享依赖之后**，
+  只留 `windows` 在其中。不要反过来给 `qwen3.rs` 加 cfg —— 那会真的砍掉 macOS 的功能，方向相反。
+
+- **预防规则（两侧都适用）**：
+  1. **新增任何 `[target.'cfg(...)'.dependencies]` 段，一律追加到文件的依赖声明末尾**，
+     绝不插在既有 `[dependencies]` 表中间
+  2. 改完 `Cargo.toml` 的段结构后，**必须肉眼确认段头之后到下一个段头之间的每一行都确实是该平台专属的**
+  3. 本地 `cargo check` 通过**不构成**「没有破坏对侧」的证据——这正是无 CI 状态下的固有缺口（DEC-034）
+
+---
+
+## [SHELL-BASHSOURCE-ZSH-001] ⚠️ `${BASH_SOURCE[0]}` 在 zsh 下为空，而 macOS 默认 shell 就是 zsh【macOS 侧必读】
+
+**状态**：🟢 仓库内已修（2026-07-30 MACOS-PR1-SCRIPTS-001）；协作框架侧未修
+
+- **机制**：`BASH_SOURCE` 是 **bash 专有数组变量，zsh 不提供**。脚本里常见的自定位写法
+  `_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"`，在 zsh 下 `${BASH_SOURCE[0]}` 为空 →
+  `dirname ""` 得 `.` → `./..` → **解析成当前工作目录的父目录**，而不是脚本所在目录的父目录。
+  **不报错、静默得到错误路径**，这是它最难查的地方。
+
+- **本项目的两处实例**：
+
+  | 位置 | 后果 | 状态 |
+  | --- | --- | --- |
+  | `scripts/env-macos.sh:11` | `SHERPA_ONNX_LIB_DIR` 指向仓库**父目录**下不存在的路径 → `sherpa-onnx-sys` 的 build.rs 直接 panic。**即 `docs/BUILD-MACOS.md` §一 教给所有新人的 `source scripts/env-macos.sh` 在 macOS 默认 shell 下一直是坏的** | ✅ 已修 |
+  | `collab/lib/env.sh:17`（协作框架，不在本仓库） | `$COLLAB` 解析成 `/Users/gavinsun/Workspace`，`dispatch.sh` 报「task.md 为空」 | ❌ 未修，绕法：用 `bash -c 'source .../dispatch.sh; dispatch <id>'` 调用 |
+
+- **修法**：`${BASH_SOURCE[0]:-$0}` —— bash 下 `BASH_SOURCE[0]` 优先；zsh 下 `source` 时 `$0` 即脚本路径。
+  一处改动，双 shell 兼容。
+
+- **验证方式（必须双 shell 各跑一次，只测 bash 会漏）**：
+
+      bash -c 'source scripts/env-macos.sh && echo "$SHERPA_ONNX_LIB_DIR" && ls "$SHERPA_ONNX_LIB_DIR" | head -3'
+      zsh  -c 'source scripts/env-macos.sh && echo "$SHERPA_ONNX_LIB_DIR" && ls "$SHERPA_ONNX_LIB_DIR" | head -3'
+
+  反向验证（确认 bug 真实存在）：在 zsh 下手工跑旧写法，应得到仓库的**父目录**：
+
+      zsh -c 'echo "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"'
+
+- **推广**：macOS 侧新增任何需要自定位的 shell 脚本，一律用 `${BASH_SOURCE[0]:-$0}`，
+  并在两种 shell 下各验证一次。Windows 侧的 `.ps1` 脚本不受影响。
+
+---
+
+## [NPM-CI-LOCK-DESYNC-001] ⚠️ `npm ci` 在两个平台都跑不了：lock 与 package.json 长期失同步
+
+**状态**：🟡 已定位，未修（2026-07-30 发现；修复需两侧协同，待 Gavin 决策）
+
+- **现象**：`cd ui && npm ci` 报 `EUSAGE`：
+
+      Missing: @emnapi/core@1.11.3 from lock file
+      Missing: @emnapi/runtime@1.11.3 from lock file
+      Invalid: lock file's @emnapi/wasi-threads@1.2.2 does not satisfy @emnapi/wasi-threads@1.2.3
+
+- **性质**：三者均为**传递依赖**（`package.json` 里没有也不该有 `emnapi`，它经由 tauri/wasm 相关链路引入），
+  lock 的传递树相对声明范围已陈旧。`git log -- ui/package-lock.json` 只有两次提交
+  （`680d78f` 初始 + `f10c1e0` v0.6.2），即**该失同步长期存在、非任何一次改动引入**。
+
+- **影响面（重要）**：`docs/MACOS-HANDOFF.md` §6.1 提出的「两侧统一用 `npm ci`」跨平台约定，
+  **当前在任何一个平台上都无法执行 —— Windows 侧同样会 EUSAGE**。这不是 macOS 独有问题。
+
+- **限度（不必恐慌）**：只卡**全新 clone**。现有 `ui/node_modules/` 完好，
+  `npm run build` / `npx tsc --noEmit` 均正常（2026-07-30 实测 48 modules 通过）。
+
+- **不可接受的「修法」**：直接 `npm install`。它会按当前平台裁剪 lock 里的 optional 依赖
+  （见 `[NPM-LOCK-CROSSPLAT-001]`，实测 +39/−462 行），把对侧平台的二进制条目整段删掉，
+  提交回去就轮到对侧 `npm ci` 失败。`npm install --no-save` **同样不行**——
+  它只是不写 `package.json`，npm 9+ 仍会重写 lock。
+
+- **当前的临时处置**（`scripts/setup-macos.sh`，2026-07-30）：调用 `npm ci`，
+  **失败时响亮报错并 `exit 1`**，打印指向本条的说明，**绝不 fallback 到 `npm install`**。
+  宁可让新人看到明确错误，也不要给他一个静默破坏对侧的 lock。
+
+- **待决**：谁来修、用什么方式（`--package-lock-only` 是否能保住全平台 optional 并集需实测）、
+  如何验证两平台都能 `npm ci`。**属共享文件，单侧修完对侧仍可能失败，建议与 Windows 侧协同。**
+
+---
+
+## [PYTEST-MACOS-COLLECT-001] ⚠️ macOS 上 pytest 收集期即崩：CT2 源码树 + Windows-only import【首次跑 pytest 前必读】
+
+**状态**：🟡 已定位，未修（2026-07-30 macOS 测试环境部署后主控核查发现）
+
+macOS 测试环境已装好（`voice-ime/.venv`：pytest 9.1.1 / playwright 1.61.0 + Chromium 149 /
+pyautogui 0.9.54 / psutil / pytest-timeout / python-dotenv），但**装好 ≠ 能跑**，有两道坎：
+
+### 坎 1：仓库根目录裸跑 `pytest` 直接 INTERNALERROR
+
+    36 tests collected, 24 errors
+    INTERNALERROR> SystemExit: 0
+      → target/debug/CTranslate2-4.6.0/third_party/ruy/third_party/googletest/
+         googlemock/scripts/generator/cpp/gmock_class_test.py
+
+- **根因**：pytest 递归走进 **CTranslate2 源码树里 googletest 自带的 Python 脚本**，
+  那些脚本 import 阶段就 `sys.exit(0)`，把 collection 整个打崩。24 个错误全部来自 `target/debug`
+- **为什么配置没拦住**：`pytest.ini` 位于 **`tests/` 下而非仓库根**，根目录调用时其
+  `testpaths = tests/` 不生效
+- **⚠️ 已实测：`pytest -c tests/pytest.ini` 也照样崩** —— `-c` 只指定配置文件，
+  **不改变收集根目录**。这是最容易想当然踩空的一步
+- **可用的临时办法**：显式限定路径 `pytest tests/`（但仍有坎 2）
+- **根治方向**：仓库根加 `pytest.ini`（或 `pyproject.toml` 的 `[tool.pytest.ini_options]`），
+  至少配 `testpaths = tests/` + `norecursedirs = target .venv node_modules vendor patches`
+- **为什么 Windows 侧没暴露**：CT2 源码树是构建时下载到 `target/<profile>/` 的，
+  且 Windows 侧走 `build-test-guide.md` 的既定流程、未在仓库根裸跑 pytest
+
+### 坎 2：2 个 Windows-only 测试文件在 import 阶段炸，中断整个收集
+
+限定 `pytest tests/` 后：
+
+    147/156 tests collected (9 deselected), 2 errors
+    !!!!!! Interrupted: 2 errors during collection !!!!!!
+
+| 文件 | 报错 |
+|---|---|
+| `tests/test_cases/test_hotkey.py` | `AttributeError: module 'ctypes' has no attribute 'WinDLL'` |
+| `tests/test_cases/test_full_pipeline_e2e.py` | `ModuleNotFoundError: No module named 'win32clipboard'` |
+
+- **关键点：这是 error 不是 skip**。收集期中断会导致**后面 147 条测试一条都跑不了**，
+  不是「跳过两个、其余照跑」
+- **修法**：在这两个文件顶部加平台守卫，例如
+  `pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Win32-only")`；
+  但注意 `pytest.mark.skipif` **拦不住模块级 import**，若 `import win32clipboard` 写在文件顶层，
+  需改为函数内延迟 import，或用 `pytest.importorskip("win32clipboard")`
+- macOS 侧已有三个专有用例可作对照：`tests/test_cases/test_{hotkey,injection,overlay}_macos.py`
+
+### 教训（验收口径）
+
+本次 Worker 报告的自验是 `pytest --collect-only → 5/7 test_config tests 可发现` ——
+那是**限定到单个文件的窄范围运行**，两道坎都被遮住。
+**环境类验收的准绳应为「仓库根裸跑 + `tests/` 全量收集」两条都过**，而非挑一个能过的范围证明可用。

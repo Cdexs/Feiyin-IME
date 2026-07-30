@@ -91,3 +91,44 @@
 > 2026-07-27 及更早条目已归档至 handoffs-archive.md（2026-07-28 归档，见 worker-guide.md §九文档防膨胀）。
 
 > 只保留当天条目，>200 行时归档到 handoffs-archive.md。
+
+## 2026-07-30 — coder-1 — MACOS-PR1-SCRIPTS-001（macOS 构建脚本入库，第一个 PR）✅ 代码层完成（待主控验收）
+
+- **来源**：Windows 侧明确交接请求（docs/MACOS-HANDOFF.md §4.2）—— setup-macos.sh / env-macos.sh 本机存在但从未提交，全新 clone 无法在 macOS 起步构建
+- **范围**：只碰 `scripts/` 下三文件，未碰 src/src-tauri/ui/docs/.cargo/.gitignore/版本号/ui/package-lock.json
+- **改动**：
+  1. **C 项（env-macos.sh:11，本任务最重要）**：`${BASH_SOURCE[0]}` → `${BASH_SOURCE[0]:-$0}`，修 zsh 下路径推导失效（zsh 不设 BASH_SOURCE → 回退 $0；macOS 默认 shell 即 zsh）。bash+zsh 双验证通过，均指向仓库内 `vendor/sherpa-onnx/sherpa-onnx-v1.12.38-osx-arm64-shared-lib/lib` 且列出 dylib。修复前 zsh 实测指向仓库父目录（不存在），sherpa-onnx-sys build.rs 会 panic。采用主控推荐写法（非 zsh 专有 ${(%):-%x} 分支），最小改动面。
+  2. **A 项（setup-macos.sh:58-67）**：`npm install` → `npm ci`（消灭破坏 Windows 侧 lock 的动作，DEC-034），并简化掉原 Windows-marker 检测 + node_modules 存在性判断（npm ci 自身清空 node_modules，两段皆 no-op；marker 检测只看 @esbuild/win32-x64 覆盖不全）。无条件 npm ci 从语义保证平台正确。
+  3. **B 项（build-macos.sh）**：保留既有工作区改动（+10/−3，REPO_ROOT+cd / source env / 产物名 feiyin-ime），零触碰。
+- **阻塞上报与主控裁定**：实跑 npm ci 报 EUSAGE（ui/package-lock.json 与 package.json 既有失同步，@emnapi/core@1.11.3 / @emnapi/runtime@1.11.3 缺失、@emnapi/wasi-threads 1.2.2≠1.2.3，自初始提交 680d78f 即如此）。主控独立复现后裁定 B+C：脚本仍改 npm ci，失败时响亮报错 + exit 1 + 指向 MACOS-FIX-NPMLOCK-001，绝不 fallback npm install；验收标准 3 改为粘 EUSAGE 证据不要求成功；修 lock 另立 MACOS-FIX-NPMLOCK-001 上报 Gavin。A（npm install --no-save）否决（npm 9+ 仍重写 lock）。
+- **自验**：验收标准 1-7 全过。git diff --stat ui/package-lock.json 为空（最关键）；git status 改动只在 scripts/ 下（其他 M/?? 项为既有工作区状态非本任务产生）；三脚本 UTF-8 无 BOM；C 项 bash+zsh 双验证均指向实际 lib 目录。
+- **遗留（报告未改）**：build-macos.sh 无可执行位（644，既有状态，D 项只报告不修改，建议后续 chmod +x）；npm ci 既有失同步另立 MACOS-FIX-NPMLOCK-001。
+- **边界**：未跑 cargo check/build/test；未 git commit/push/add；未用 git 破坏性命令；未运行 npm install；UTF-8 无 BOM 用 edit 工具；未改版本号未出包未碰 Publish/
+- **详情**：`collab/outbox/coder-1/result.md`（13109 字节非空）
+
+## 2026-07-30 — tester-1 — MACOS-CARGOCHECK-BASELINE-001 ✅ macOS 编译错误基线取证完成
+
+- **来源**：主控派发基线取证任务（依 DEC-033 §执行前提：装工具链→实跑 cargo check→拿完整错误清单）
+- **范围**：零文件改动。macOS 15.7.8 arm64 上执行 `cargo check --all-targets` + `src-tauri` + 前端
+- **关键产出**：
+  - ✅ 主程序 4 个独特错误（hotkey.rs:124 E0369 / hotkey.rs:257 E0599 / crash/reporter.rs:369 E0599 / main.rs:4349 E0432 test-only）
+  - ✅ src-tauri 7 个错误（3 逻辑类：qwen3 依赖链 + rustls，皆因 Cargo.toml 条件依赖与代码 cfg 不匹配）
+  - ✅ 前端 0 errors, `package-lock.json` 零改动
+  - ✅ **最大发现**：两份既有文档都未预测到的 src-tauri qwen3 依赖链错误（MACOS-BRANCH-AUDIT.md 只查 `#[cfg]` 分支未查 Cargo.toml 条件依赖）
+  - CT2 增量编译，未触发全量重编
+  - `git status --porcelain` 与开工时完全一致
+- **边界**：未修复任何错误、未 cargo build --release、未出包、未 npm install、未 cargo clean、未使用 git 破坏性命令
+- **详情**：`collab/outbox/tester-1/result.md`
+
+## 2026-07-30 — coder-2 — MACOS-FIX-COMPILE-001 ✅ 修三处 macOS 编译阻塞
+
+- **来源**：主控基于 MACOS-CARGOCHECK-BASELINE-001 的实测错误清单派发修复任务
+- **范围**：仅改 `src/crash/reporter.rs`（macOS 块内 FontData 构造）+ `src/platform/macos/hotkey.rs`（两处 API 误用）
+- **改动**：
+  1. `reporter.rs:369` — `FontData::from_bytes` 不存在 → `from_owned(font_data)`；删除 `.ok().unwrap_or_default()` 链式调用（`from_owned` 直接返 `FontData` 非 `Result`）
+  2. `hotkey.rs:124` — `CGEventType` 无 `PartialEq`，`==` 编译不过 → `matches!(event_type, CGEventType::KeyDown)`
+  3. `hotkey.rs:257` — `create_runloop_source` 返回 `Result` 但用 `Option` 的 `.ok_or_else()` → `.map_err(|_| anyhow!(...))?`
+- **自验**：`cargo check` 0 errors；Windows cfg 块未碰；UTF-8 无 BOM
+- **边界**：未改 config/Cargo.toml/版本号；未改 platform/mod.rs 导出；未 cargo build --release/clean；无 git 破坏命令
+
+> 只保留当天条目，>200 行时归档到 handoffs-archive.md。

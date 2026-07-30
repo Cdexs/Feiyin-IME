@@ -285,6 +285,38 @@
 | macOS 交接文档与分支审计 | `docs/MACOS-HANDOFF.md`（242 行，平台契约/协作硬约定/CT2 构建陷阱/checkout 缺口/TODO 索引）+ `docs/MACOS-BRANCH-AUDIT.md`（15 处 cfg 分支静态审计：**P0×1** `crash/reporter.rs:369` 调用 `egui 0.29.1` 不存在的 `FontData::from_bytes`，macOS 必然编译失败；P1×8 含 `main.rs:3419-3475 mod macos_stubs` 空实现；P2×4；P3×2）｜ 2026-07-30 |
 | 思维链泄漏五环修复（P0） | DeepSeek 推理模型把 CoT 泄漏进输入框（实测约 7 次 1 次，最坏整句变 `...`）根治：**P0-1** 请求体双发 `thinking:{"type":"disabled"}`（DeepSeek 官方开关）+ 保留 `enable_thinking`（SiliconFlow/Qwen3 用，避免回归），4 处注入点 ｜ **P0-2** `extract_text` 移除「content 空回落 `reasoning_content`」（这是 CoT 被当答案的真正入口）｜ **P0-3** `extract_corrected_tag` 改 `rfind` 取末对标签，防 CoT 里的模板占位劫持 ｜ **P0-4** 新增 `lacks_any_substantive_char()` 拒绝纯标点结果；**比例判据经实跑证伪后降级为只观测不拒绝**（合法重度压缩 9.7% vs 故障 6%，仅差 3.7pp 划不出可靠边界，误伤代价不对称）｜ **P0-5** 补 `finish_reason` + `usage`（含 `reasoning_tokens`）日志，`length` 截断今后可直接从日志判定 ｜ 2026-07-30 |
 
+## macOS 双平台 · A 阶段（2026-07-29~30）· ✅ 编译打通
+
+> 治理约束：**DEC-034**（跨平台兼容为首要约束 + 单仓库两端并行）｜ 版本号未动，仍 v0.7.2
+> 交接文档（仓库内受 git 管辖）：`docs/MACOS-HANDOFF.md` / `MACOS-PORT-ASSESSMENT.md` / `BUILD-MACOS.md` / `MACOS-BRANCH-AUDIT.md`
+
+**里程碑：macOS 侧从「20 个源码错误、连编都编不过」到「主程序 + 全测试目标 + Tauri 后端 + 前端 全部 0 errors」。**
+
+| 阶段 | 内容 | 结果 |
+| --- | --- | --- |
+| 07-29 环境 | rustup 1.97.1 / cmake 4.4.1 / Xcode CLT clang 17 / Node 24 / sherpa-onnx osx-arm64 预编译包 | 324 个依赖 crate（含全部 C/C++）编译通过；环境不再是瓶颈 |
+| 07-30 接缝 | Windows 侧交付 MACOS-COMPAT-001（`292eeb0`）：废除 `platform/mod.rs` glob 导出改 15 符号显式清单、`mod hotkey`/`mod injection` 加 cfg、`crash::get_windows_version` 补非 Windows 占位、src-tauri 三处 cfg 隔离 | 8 类实测阻塞消化 5 类 |
+| 07-30 基线 | macOS 侧首次实跑 `cargo check` 取权威错误清单（`MACOS-CARGOCHECK-BASELINE-001`） | 主程序 4 独特错误 / src-tauri 7 / 前端 0 |
+| 07-30 修复 | 三处 API 修正（`6f0b51e`）+ 依赖段位回归修复 + 脚本入库（`5e3ed89`）+ ignore 收尾（`4b2126b`） | **`cargo check --all-targets` 0 errors；`cargo check --manifest-path src-tauri` 0 errors；`tsc --noEmit` + `vite build` 0 errors** |
+
+**本阶段两个关键发现**（均为「只有真编一次才能发现」的类型，已各自立 troubleshooting 条目）：
+
+1. **`[TOML-SECTION-DRIFT-001]`（🔴 Windows 侧改动引入的回归）**：`292eeb0` 把
+   `[target.'cfg(target_os = "windows")'.dependencies]` 段头插在 `[dependencies]` 表中间，
+   按 TOML 语义把其后的 `tokio-tungstenite` / `futures-util` / `rustls` 三个共享依赖静默改判为 Windows 专属。
+   **在 Windows 上 cfg 命中、cargo check 0 errors，完全不可见**。且 `rustls` 那行是 BUG-QWEN3-CRYPTO-001
+   的 ring provider 修复 —— 不只是编译失败，macOS 侧连该 TLS 修复一起丢了。
+   源码级 cfg 审计查不出它（漂移在依赖清单层，代码里没有 cfg 可扫）
+2. **`[SHELL-BASHSOURCE-ZSH-001]`**：`${BASH_SOURCE[0]}` 在 zsh 下为空，而 macOS 默认 shell 就是 zsh
+   → `docs/BUILD-MACOS.md` 教给所有新人的 `source scripts/env-macos.sh` 一直是坏的（静默解析到仓库父目录）
+
+**未解决/待排期**：
+- `[NPM-CI-LOCK-DESYNC-001]`：`ui/package-lock.json` 与 `package.json` 长期失同步，**两平台的 `npm ci` 都跑不了**
+  （只卡全新 clone，现有 node_modules 与 `npm run build` 正常）。需两侧协同修
+- **B/C/D 阶段未开工**：`src/main.rs:2761` 的 `fn main()` 在非 Windows 分支仍只打一行 warn 就返回 ——
+  **能编译 ≠ 能运行**，主控入口 / 事件循环 / tray / overlay / Accessibility 权限 / `.app` 打包全部待实现
+- 无 CI 防线（DEC-033 附则二 Gavin 决定暂不启用），「本地 cargo check 通过」不构成「没破坏对侧」的证据
+
 ## 版本构建产物
 
 | 版本 | 日期 | feiyin-ime.exe | feiyin-ime-ui.exe | crash-reporter.exe | 测试 |

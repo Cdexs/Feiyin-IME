@@ -103,6 +103,69 @@
 
 ## 进行中
 
+### 2026-07-30 · macOS 侧交接接管（已完成 checkout + 独立核验，**任务尚未派发**）
+
+> 来源：Windows 侧团队完成 MACOS-COMPAT-001 双平台接缝适配 + 四份交接文档 → Gavin 指令「checkout 最新代码，先做好交接、理清项目，暂不派发任务」
+> 治理约束：**DEC-034**（跨平台兼容为首要约束 + 单仓库两端并行）
+> 交接文档（均在仓库内、受 git 管辖）：`docs/MACOS-HANDOFF.md`（入职材料，250 行）/ `docs/MACOS-PORT-ASSESSMENT.md` / `docs/BUILD-MACOS.md` / `docs/MACOS-BRANCH-AUDIT.md`（cfg 分支静态审计）
+
+**checkout 结果**：`695e50e` → `2c98976`（fast-forward，4 个提交），`main...origin/main` 已同步。工作区保留 macOS 侧两处真实改动（`.gitignore` +2 / `scripts/build-macos.sh` +11−2）+ 三个未跟踪文件。
+
+**主控独立核验（未采信交接文档结论，逐项查证源码）**：
+
+- ✅ **平台契约属实**：`src/platform/mod.rs:61/71` 两份显式清单各 15 个符号，glob 导出已废除；macOS 侧 15 个符号**逐一 grep 全部存在**，无遗漏
+- ✅ **8 项 07-29 实测阻塞项中 5 项已由 Windows 侧修复**：`mod hotkey` / `mod injection` 加 `#[cfg(target_os="windows")]`（消 10 个 E0432）、`src/crash/mod.rs` 补 `get_windows_version()` 非 Windows 占位、`src-tauri/Cargo.toml` 的 `windows` 依赖移入 `[target.'cfg(target_os = "windows")'.dependencies]`、`src-tauri/src/main.rs` 补 `check_hotkey_available` 非 Windows 分支、`src-tauri/src/overlay.rs` 的 `.transparent(true)` 改 `#[cfg(not(target_os="macos"))]`
+- ✅ **审计的 P0 属实**：`src/crash/reporter.rs:369` 确为 `egui::FontData::from_bytes(...)` 而 `Cargo.lock` 中 egui = **0.29.1**；同文件 `:347` 的 `include_bytes!("C:/Windows/Fonts/msyh.ttc")` 在 `#[cfg(target_os="windows")]` 块内，macOS 不展开，**不构成第二个 P0**（审计未误报）
+- ✅ **审计的依赖版本基线正确**：`Cargo.lock` 同时存在 core-graphics 0.23.2 与 0.25.0、core-foundation 0.9.4 与 0.10.1，但根 crate `Cargo.toml:112-114` 为 macOS 声明的是 `core-graphics = "0.25"` / `core-foundation = "0.10"` / `enigo = "0.2.1"`，与审计核对基线一致（旧版本属其他 crate 的传递依赖）
+- ❌ **主控修正 · 审计头条结论低估 2 项**：`docs/MACOS-BRANCH-AUDIT.md` §1/§2/§5 称「**唯一**会阻塞编译的是 `crash/reporter.rs:369`」。**实际剩 3 项**——另两项是 `src/platform/macos/hotkey.rs:124`（`CGEventType` 不支持 `==`）与 `:257`（`create_runloop_source` 返回 `Result` 却调 `.ok_or_else`）。依据：① 这两项是 macOS 侧 07-29 **真实 `cargo check` 实测所得**，已记录在同一仓库的 `docs/BUILD-MACOS.md` §四（审计的参考资料清单里就有这份文档）；② `git log -- src/platform/macos/hotkey.rs` 显示该文件**自初始提交 680d78f 以来从未被改动**，Windows 侧本批次未碰它，故错误必然仍在；③ 审计 §3 表格自己写明 `create_runloop_source` 返回 `Result<CFRunLoopSource, ()>`，却把该调用点列为「签名匹配」——**与调用处的 `.ok_or_else` 自相矛盾**。根因是审计自述的「仅静态阅读 + docs.rs，未在 macOS 上运行 cargo check」，属方法固有局限而非疏忽，但**头条结论的措辞会误导下游按「只剩 1 个错误」排期**
+- ⚠️ **工具链未就绪**：`cargo` / `rustc` 不在 PATH（rustup 装在用户目录，需 `source scripts/env-macos.sh`），故本次核验全为静态查证，**未实跑 cargo check**
+- ✅ **CT2 构建树完好（好消息）**：`target/debug` 1.6G 存活，`CTranslate2-4.6.0/third_party/` 下 7 个子目录**全部非空**（cpu_features 14 / cutlass 22 / cxxopts 12 / googletest 12 / ruy 11 / spdlog 13 / thrust 17），**未处于 [CT2-SUBMODULE-DEADLOCK-001] 的残缺态**；sherpa-onnx 四个 dylib 已在 `target/debug/`。下次 `cargo check` 不需要重编 CT2
+
+**待派发任务（已理清，等 Gavin 下令）**：
+
+| 编号 | 内容 | 影响文件 | 建议负责人 | 状态 |
+| --- | --- | --- | --- | --- |
+| MACOS-PR1-SCRIPTS-001 | **Windows 侧明确交接请求**（`docs/MACOS-HANDOFF.md` §4.2）：`setup-macos.sh` + `env-macos.sh` 入库 + `build-macos.sh` 占位替换；派发后追加 C 项（修 `env-macos.sh` 的 zsh 路径失效）与 A 项（`npm install`→`npm ci`） | `scripts/{setup,env,build}-macos.sh` | coder-1 | ✅ **已验收** |
+| MACOS-FIX-TAURI-DEPS-001 | 修 `292eeb0` 的依赖段位回归（`tokio-tungstenite`/`futures-util`/`rustls` 被误划 Windows 专属）+ 收掉 `src/main.rs:4349` 既有 test import 错误 | `src-tauri/Cargo.toml` + `src/main.rs` | coder-2 | 🔄 **进行中**（Gavin 2026-07-30 拍板「自己修」，不退回 Windows 侧） |
+
+**PR1 验收记录（2026-07-30 主控独立取证）**：
+
+- **C 项（本任务最有价值的改动）**：`env-macos.sh:11` 改为 `${BASH_SOURCE[0]:-$0}`。**主控独立双 shell 复跑通过**——bash 与 zsh 下 `source` 后 `$SHERPA_ONNX_LIB_DIR` 均指向仓库内实际存在的 lib 目录并能列出 dylib。**另做反向验证**：在 zsh 下手工执行修复前的写法，得到 `/Users/gavinsun/Workspace/CodeLab`（**仓库的父目录**），与诊断完全吻合 → 证明该 bug 真实存在且已被修复。意义：`docs/BUILD-MACOS.md` §一 教给所有新人的 `source scripts/env-macos.sh` 此前在 macOS 默认 shell 下是失效的
+- **A 项**：`npm install` → `npm ci`，且按主控裁定实现为**失败时响亮报错 + exit 1 + 指向 MACOS-FIX-NPMLOCK-001，绝不 fallback 到 npm install**，注释中援引 `[NPM-LOCK-CROSSPLAT-001]` 与 DEC-034。同时按 `npm ci` 自带清空 node_modules 的语义简化了原第 61-64 行的手工清理逻辑
+- **B 项**：`build-macos.sh` 工作区既有改动（REPO_ROOT / source env / `voice-ime`→`feiyin-ime`）完好保留，未回退
+- **三脚本 `bash -n` 语法检查全过；UTF-8 无 BOM**（首三字节均 `23 21 2f`）
+- **`ui/package-lock.json` 零改动**（主控独立 `git diff --stat` 确认为空）——跨平台红线守住
+- **边界合规**：`git status` 中 `scripts/` 外无本任务改动
+- **过程亮点**：coder-1 在撞上 `npm ci` EUSAGE 后**没有自行降级为 `npm install` 交差，而是停下来上报三个选项请主控裁定**，符合 worker-guide §七「主动沟通比默默出错代价更低」
+
+**衍生立项 · MACOS-FIX-NPMLOCK-001（待 Gavin 决策）**：`ui/package-lock.json` 与 `package.json` 长期失同步（`npm ci` 报 EUSAGE：`@emnapi/core@1.11.3`、`@emnapi/runtime@1.11.3` 缺失，`@emnapi/wasi-threads` 锁定 1.2.2 不满足 1.2.3），均为传递依赖；`git log -- ui/package-lock.json` 仅两次提交（`680d78f` 初始 + `f10c1e0` v0.6.2），即**该缺陷长期存在于两个平台**。**后果**：`docs/MACOS-HANDOFF.md` §6.1 提出的「两侧统一用 npm ci」约定当前在**任何平台都无法执行**，Windows 侧同样会 EUSAGE。**限度**：只卡全新 clone，现有 `node_modules` 完好、`npm run build` 正常。**难点**：修 lock 需在某一平台跑 `npm install`，而这正是 `[NPM-LOCK-CROSSPLAT-001]` 警告的动作，需决定由哪侧执行、是否用 `--package-lock-only`、以及如何验证两平台都能 `npm ci`。**建议与 Windows 侧协同处理**（属共享文件，单侧修完对侧仍可能失败）。
+| MACOS-CARGOCHECK-BASELINE-001 | 拿真实错误清单：`source scripts/env-macos.sh` 后跑三处 `cargo check`（主程序 / `src-tauri` / crash-reporter bin），产出完整错误清单。**这是 DEC-033 §执行前提与评估报告 §11 共同指定的第一步** | — | tester-1 | ✅ **已验收** |
+| MACOS-FIX-COMPILE-001 | 修 3 项编译阻塞：`crash/reporter.rs:369` → `FontData::from_owned`（连带删 `.ok().unwrap_or_default()`）；`hotkey.rs:124` → `matches!`；`:257` → `.map_err` | `src/crash/reporter.rs` + `src/platform/macos/hotkey.rs` | coder-2 | ✅ **已验收** |
+
+**BASELINE 验收记录（2026-07-30 主控独立取证）**：
+
+- **质量高，逐条给了 rustc 原始输出**（含 note/help），未压缩成结论。三处预测错误**全部实测复现且行号一字不差**：E0599 `reporter.rs:369`（rustc 直接提示只有 `from_static`/`from_owned`）、E0369 `hotkey.rs:124`（`CGEventType does not implement PartialEq`）、E0599 `hotkey.rs:257`
+- **✅ 校准了审计头条结论**：`docs/MACOS-BRANCH-AUDIT.md` 称「唯一阻塞是 `reporter.rs:369`」，实测主程序 **4 个独特错误**、src-tauri **7 个**。主控派发前的预判（低估 2 项）得到实证
+- **🔴 最大发现：查出 Windows 侧本次改动引入的真实回归**（主控已独立复核 `git show 292eeb0 -- src-tauri/Cargo.toml` 确认）。Windows 侧把 `[target.'cfg(target_os = "windows")'.dependencies]` 段头**插在了 `[dependencies]` 表中间**，按 TOML 语义，排在其后的 `tokio-tungstenite` / `futures-util` / `rustls` **三个依赖被静默划为 Windows 专属** → macOS 上 `qwen3.rs` + `main.rs:170` 共 7 个错误。**在 Windows 上 cfg 命中、三者照常解析、`cargo check` 0 errors —— 该回归在 Windows 侧完全不可见**，其提交信息里「src-tauri 0 errors」为真却拦不住它。**且不止编译问题**：`rustls` 那行是 BUG-QWEN3-CRYPTO-001 的 ring provider 修复，被划成 Windows-only 等于 macOS 侧丢了这个 TLS 修复
+- **tester-1 的根因诊断正确且指出了审计的方法盲区**：审计方法是扫源码 `#[cfg]` 分支，而本次漂移发生在**依赖清单层**，源码里没有 cfg 可扫。这是 DEC-034 机制的新变种（「依赖层 cfg 与代码层 cfg 同步缺口」），已记入 troubleshooting
+- **另查出既有问题（非本次引入，主控查 git log 确认）**：`src/main.rs:4349` 的 `#[cfg(test)]` 块无条件 import 了被 `cfg(windows)` 门控的 `select_preprocessing_params`（E0432），只影响 macOS 上 `cargo test`，不阻塞 release 构建
+- **红线遵守确认**：零文件改动（`git status --porcelain` 与开工时一致）、未出包、未 `npm install`（`package-lock.json` 零改动）、未 `cargo clean`、未用 git 破坏性命令
+- **诚信记录（正面）**：主动披露了 `env-macos.sh` 的 `BASH_SOURCE` bug 与自己的手工绕过方式，没有把「手工设了变量」隐去当成脚本可用
+
+**FIX-COMPILE 验收记录（2026-07-30 主控独立取证）**：
+
+- **三处改动 Read 逐一核对，全部正确**：`from_owned(font_data)` 且**连带的 `.ok().unwrap_or_default()` 已删除**（这是最易漏的一处，Gavin 特别确认过）；`matches!(event_type, CGEventType::KeyDown)`；`.map_err(|_| anyhow!(...))`
+- **主控独立复跑取证（未采信汇报）**：`cargo check` **0 errors** 属实；`cargo check --all-targets` 只剩 `main.rs:4349` 那一个既有 E0432，**未引入任何新错误**
+- **Windows 侧零影响已验证**：`reporter.rs:347` 的 `include_bytes!("C:/Windows/Fonts/msyh.ttc")` 仍在原处，`git diff` 中 `msyh.ttc` 命中数 **0** —— DEC-034 与 DEC-033 第 4 条硬约束遵守
+- **⚠️ 一处越界（判定为可接受，不回滚）**：`src/llm/mod.rs` 出现 +3/−2 改动，位于 `mod tests`（起于 `:1473`）内，系 `build_optimize_request` 调用由两行压成一行。按 `[FMT-COLLATERAL-001]` 三步法定性：**去空白后 md5 逐字节相同**（`1e3970f6…`），零逻辑改动，属 `cargo fmt` 全量连带，保留不回滚
+- **⚠️ 但任务书要求的是 `cargo fmt -- <两个文件>`，仍出现全量连带** —— 这是同一指令第二次未被遵守（上一次见 07-27 TEST-SYNC 验收记录）。后续派发需改为更强的措辞或改由主控自行 fmt
+- **CHANGELOG.md +2**：两项任务的完成记录，属 worker-guide 规定的完成联动流程，非越界
+
+**边界评估（已做，供派发时直接用）**：三项任务文件级零重叠——PR1 只碰 `scripts/`，BASELINE 零改动，FIX 只碰 `src/crash/reporter.rs` + `src/platform/macos/hotkey.rs`。PR1 与 BASELINE 可并行，唯一注意点是 PR1 不得在 BASELINE 运行期间改动 `env-macos.sh` 内容（tester-1 要 source 它）。
+
+**已知非阻塞遗留**：`src-tauri/gen/schemas/macOS-schema.json` 为 Tauri 生成物、当前未跟踪且未被 `.gitignore` 覆盖，需判断是入库还是加 ignore。
+
+
 > **2026-07-30 主控取证结论：本节原列的三个批次已全部闭环，无进行中的代码任务。** 三个 Worker（coder-1 / coder-2 / tester-1）当前空闲待派发。历史验收记录保留在下方备查。
 
 ### 2026-07-29 · MACOS-COMPAT-001 双平台兼容适配（A 阶段实施，Gavin 指令派发）
