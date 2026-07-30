@@ -46,7 +46,8 @@ __pycache__/
 /collab/drafts/
 /collab/**/desktop.ini
 /collab/desktop.ini
-/logs
+# logs/ 已于 2026-07-30 移出忽略并入库（Gavin 决定：两侧团队都要跟踪代码改动记录）。
+# 内容 = 每日代码级改动日志 logs/YYYYMMDD.md（53 份，约 780KB，纯文本）。
 /tasks
 # 协作文档快照备份（scripts/backup-docs.ps1 产出，每日计划任务轮转 30 份）
 /Backup
