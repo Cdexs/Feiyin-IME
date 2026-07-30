@@ -322,36 +322,6 @@ fn reload_runtime_config(shared_config: &Arc<RwLock<AppConfig>>) {
         Err(err) => log::warn!("Failed to reload config: {}", err),
     }
 }
-#[cfg(target_os = "windows")]
-fn load_translation_engine_for_target(
-    model_dir: &Path,
-    target: config::TranslationLanguage,
-) -> Option<translation::TranslationEngine> {
-    if !translation::TranslationEngine::is_available(model_dir, target) {
-        log::info!(
-            "Translation model files not found for {:?}, offline engine disabled",
-            target
-        );
-        return None;
-    }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        translation::TranslationEngine::new(model_dir, target)
-    }));
-    match result {
-        Ok(Ok(engine)) => {
-            log::info!("Offline translation engine loaded ({:?})", target);
-            Some(engine)
-        }
-        Ok(Err(e)) => {
-            log::warn!("Translation engine load failed for {:?}: {}", target, e);
-            None
-        }
-        Err(_) => {
-            log::warn!("Translation engine load panicked for {:?}", target);
-            None
-        }
-    }
-}
 fn is_config_watch_event(event: &notify::Event, config_path: &Path) -> bool {
     let Some(config_name) = config_path.file_name() else {
         return false;
@@ -2266,8 +2236,11 @@ fn spawn_worker_thread(
             config::TranslationLanguage,
             translation::TranslationEngine,
         )> = if config.translation.enabled {
-            load_translation_engine_for_target(&model_dir, config.translation.target_language)
-                .map(|engine| (config.translation.target_language, engine))
+            translation::TranslationEngine::load_for_direction(
+                &model_dir,
+                config.translation.target_language,
+            )
+            .map(|engine| (config.translation.target_language, engine))
         } else {
             None
         };
@@ -2444,7 +2417,7 @@ fn spawn_worker_thread(
                     };
                     if needs_reload {
                         cached_translation = if config.translation.enabled {
-                            load_translation_engine_for_target(
+                            translation::TranslationEngine::load_for_direction(
                                 &model_dir,
                                 config.translation.target_language,
                             )
@@ -2459,7 +2432,6 @@ fn spawn_worker_thread(
                     } else if !config.punctuation.enabled {
                         cached_punctuation = None;
                     }
-                    let translation_engine = cached_translation.as_ref().map(|(_, e)| e);
                     log::debug!(
                         "Starting run_pipeline: cancel_signal={}",
                         cancel_signal.load(Ordering::Relaxed)
@@ -2472,7 +2444,8 @@ fn spawn_worker_thread(
                         &cancel_signal,
                         &config,
                         &runtime_config,
-                        translation_engine,
+                        &mut cached_translation,
+                        &model_dir,
                         cached_punctuation.as_mut(),
                         HWND(start.target_hwnd.0 as *mut std::ffi::c_void),
                         &event_tx,
@@ -2844,7 +2817,8 @@ fn run_pipeline(
     cancel_signal: &AtomicBool,
     config: &AppConfig,
     runtime_config: &Arc<RwLock<AppConfig>>,
-    translation_engine: Option<&translation::TranslationEngine>,
+    cached_translation: &mut Option<(config::TranslationLanguage, translation::TranslationEngine)>,
+    model_dir: &Path,
     mut punctuation_engine: Option<&mut punctuation::PunctuationEngine>,
     target_hwnd: HWND,
     event_tx: &crossbeam_channel::Sender<PipelineEvent>,
@@ -2945,10 +2919,12 @@ fn run_pipeline(
                         );
                         return;
                     }
-                    // ITN-SMART-001: 智能数字规整（转录后/LLM 前，三模型统一生效）
-                    let text = itn::normalize_numbers(&raw_text);
-                    // OPT-002: Skip if text is not effective (empty or filler-only)
-                    if !text_normalizer::is_effective_text(&text) {
+                    // OPT-002: Skip if text is not effective (empty or filler-only).
+                    // Note: previously fed ITN output here; ITN moved post-LLM (ITN-REORDER-001),
+                    // so raw_text is used now. ITN only converts Chinese numerals to Arabic and
+                    // adds ℃ etc. — it never adds/removes semantic characters, so filler detection
+                    // results are identical (fillers 啊呃嗯… are not numerals).
+                    if !text_normalizer::is_effective_text(&raw_text) {
                         log::info!(
                             "Skipping pipeline: transcription not effective (empty or filler only)"
                         );
@@ -2991,27 +2967,35 @@ fn run_pipeline(
                     // injection so the user knows to check LLM config.
                     let mut format_failed = false;
                     let translate_requested = translate.load(Ordering::Acquire);
-                    // LANG-AUTO-001: 翻译方向按内容（contains_han）判定，不依赖 language 配置
-                    let translation_allowed =
-                        should_translate_for_language(&text, config.translation.target_language);
-                    if translate_requested && config.translation.enabled && !translation_allowed {
+                    // TRANS-BIDIR-001: 翻译方向由内容自动判定，不再由 config.translation.target_language 门控。
+                    // target_language 字段保留仅为「上次使用方向缓存」（启动时据此预载引擎）。
+                    // REFACTOR-DERIVE-TARGET-001: 提取为 translation::derive_translation_target（平台中立，可单测）
+                    let derived_target = translation::derive_translation_target(&raw_text);
+                    if translate_requested && config.translation.enabled {
                         log::info!(
-                            "Translation skipped: source text does not require target {:?} (content-based)",
+                            "Translation direction derived: {:?} (target_language cache={:?})",
+                            derived_target,
                             config.translation.target_language
                         );
                     }
                     let final_text = if translate_requested
                         && config.translation.enabled
-                        && !text.trim().is_empty()
-                        && translation_allowed
+                        && !raw_text.trim().is_empty()
                     {
                         let processing_msg = i18n::get(config.ui_language).overlay_processing;
                         send_event(
                             event_tx,
                             PipelineEvent::Processing(processing_msg.to_string()),
                         );
+                        // REFACTOR-SHARE-TRANSDIR-001: function moved to translation/mod.rs (platform-neutral)
+                        let effective_engine: Option<&translation::TranslationEngine> =
+                            translation::ensure_translation_direction(
+                                cached_translation,
+                                &model_dir,
+                                derived_target,
+                            );
                         let script_instruction = text_normalizer::script_instruction_for_translate(
-                            &text,
+                            &raw_text,
                             config.audio.chinese_script,
                         );
                         if should_try_llm_translate(
@@ -3020,8 +3004,8 @@ fn run_pipeline(
                         ) {
                             // B: LLM optimization failed (non-critical), continue with raw result
                             match rt.block_on(llm_client.optimize_and_translate(
-                                &text,
-                                config.translation.target_language,
+                                &raw_text,
+                                derived_target,
                                 script_instruction,
                                 config.punctuation.enabled,
                             )) {
@@ -3036,10 +3020,10 @@ fn run_pipeline(
                                         "LLM optimize+translate failed, trying offline: {}",
                                         e
                                     );
-                                    try_nllb_translate(&text, translation_engine).unwrap_or_else(
+                                    try_nllb_translate(&raw_text, effective_engine).unwrap_or_else(
                                         || {
                                             text_normalizer::normalize_text_for_language(
-                                                &text,
+                                                &raw_text,
                                                 config.audio.chinese_script,
                                             )
                                         },
@@ -3047,25 +3031,26 @@ fn run_pipeline(
                                 }
                             }
                         } else {
-                            // LLM optimization success, use corrected text
-                            try_nllb_translate(&text, translation_engine).unwrap_or_else(|| {
+                            // LLM not eligible, use offline engine directly
+                            try_nllb_translate(&raw_text, effective_engine).unwrap_or_else(|| {
                                 text_normalizer::normalize_text_for_language(
-                                    &text,
+                                    &raw_text,
                                     config.audio.chinese_script,
                                 )
                             })
                         }
-                    } else if config.llm.enabled && !text.trim().is_empty() {
-                        // translate=false閿涙艾甯張?LLM optimize 鐠侯垰绶炴稉宥呭綁
+                    } else if config.llm.enabled && !raw_text.trim().is_empty() {
                         let processing_msg = i18n::get(config.ui_language).overlay_processing;
                         send_event(
                             event_tx,
                             PipelineEvent::Processing(processing_msg.to_string()),
                         );
-                        let script_instruction =
-                            text_normalizer::script_instruction(&text, config.audio.chinese_script);
+                        let script_instruction = text_normalizer::script_instruction(
+                            &raw_text,
+                            config.audio.chinese_script,
+                        );
                         let llm_result = rt.block_on(llm_client.optimize(
-                            &text,
+                            &raw_text,
                             script_instruction,
                             config.punctuation.enabled,
                             Some(&scene_context),
@@ -3088,7 +3073,7 @@ fn run_pipeline(
                                 log::warn!("LLM optimization error: {}", e);
                                 format_failed = true;
                                 text_normalizer::normalize_text_for_language(
-                                    &text,
+                                    &raw_text,
                                     config.audio.chinese_script,
                                 )
                             }
@@ -3099,10 +3084,44 @@ fn run_pipeline(
                             "LLM disabled or text empty, using transcription result directly"
                         );
                         text_normalizer::normalize_text_for_language(
-                            &text,
+                            &raw_text,
                             config.audio.chinese_script,
                         )
                     };
+                    // REFACTOR-SHARE-TRANSDIR-001: persist via AppConfig method (platform-neutral)
+                    // + runtime lock/save (Windows runtime concern, inline here in cfg(windows) run_pipeline)
+                    if translate_requested
+                        && config.translation.enabled
+                        && !raw_text.trim().is_empty()
+                    {
+                        let needs_save = match runtime_config.write() {
+                            Ok(mut cfg) => cfg.remember_translation_direction(derived_target),
+                            Err(poisoned) => {
+                                let mut cfg = poisoned.into_inner();
+                                cfg.remember_translation_direction(derived_target)
+                            }
+                        };
+                        if needs_save {
+                            if let Ok(cfg) = runtime_config.read() {
+                                log::info!(
+                                    "Persisting translation direction cache to {:?}",
+                                    derived_target
+                                );
+                                if let Err(e) = cfg.save() {
+                                    log::warn!(
+                                        "Failed to persist translation direction cache: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // ITN-REORDER-001: 智能数字规整移至三分支产出之后、本地标点之前。
+                    // 原位置（DEC-030「转录后/LLM 前」）已于 2026-07-30 反转，理由见 DEC-035。
+                    // 一处覆盖三条路径：①LLM 成功路径——LLM 纠正了 ASR 同音错字（如「摄息」→「摄氏」）
+                    //   后 ITN 才能匹配「摄氏」触发 ℃；②LLM 失败兜底——与原行为一致；③LLM 关闭——与原行为一致。
+                    // 对翻译路径（英文输出）：ITN 是 no-op（英文无中文数字/单位词），幂等安全。
+                    let final_text = itn::normalize_numbers(&final_text);
                     // PUNCT-INTEGRATION-001 + ASR-PUNCT-OPT-001: 标点决策
                     // 条件：auto_punct=true && LLM 未处理 && 非翻译 && 非native自带标点
                     // - native_punctuated=true（accuracy native 成功）→ 跳过标点引擎（省一次推理）
@@ -3200,14 +3219,6 @@ fn should_try_llm_translate(llm_enabled: bool, connectivity_verified: bool) -> b
 /// LANG-AUTO-001: 翻译方向按内容（contains_han）判定，不依赖 transcription_language 配置。
 /// - target=English → 含汉字才需翻译；纯英文文本无需翻译。
 /// - target=Chinese → 不含汉字才需翻译；纯英文文本需翻译。
-#[cfg(target_os = "windows")]
-fn should_translate_for_language(text: &str, target: config::TranslationLanguage) -> bool {
-    let source_is_chinese = text_normalizer::contains_han(text);
-    match target {
-        config::TranslationLanguage::English => source_is_chinese,
-        config::TranslationLanguage::Chinese => !source_is_chinese,
-    }
-}
 #[cfg(target_os = "windows")]
 fn try_nllb_translate(
     text: &str,

@@ -115,6 +115,9 @@ pub struct TranslationConfig {
     /// Virtual key code for the translation modifier. 0 = unset.
     pub vk_code: u32,
     pub display_name: String,
+    /// TRANS-BIDIR-001: direction is now auto-derived from content (contains_han).
+    /// This field is retained as a "last-used direction cache" for engine preloading
+    /// at startup — it is NOT a user-facing setting and no longer gates translation.
     pub target_language: TranslationLanguage,
 }
 
@@ -388,6 +391,22 @@ impl AppConfig {
     pub fn save(&self) -> Result<()> {
         let path = Self::config_path();
         self.save_to(&path)
+    }
+
+    /// TRANS-BIDIR-001 / REFACTOR-SHARE-TRANSDIR-001: Update the cached last-used
+    /// translation direction. Platform-neutral (DEC-033) — macOS side can call this
+    /// directly. Returns true if the value changed (caller may use this to decide
+    /// whether to save).
+    ///
+    /// This does NOT save to disk — saving is the caller's responsibility (platform
+    /// runtime concern: Windows uses config_path(), macOS may differ).
+    pub fn remember_translation_direction(&mut self, direction: TranslationLanguage) -> bool {
+        if self.translation.target_language != direction {
+            self.translation.target_language = direction;
+            true
+        } else {
+            false
+        }
     }
 
     /// Save config to an explicit path (useful for tests and tooling).
@@ -1154,6 +1173,41 @@ clipboard_delay_ms = 150
         assert_eq!(
             loaded.audio.qwen3_asr_model, "qwen3-asr-flash-demo",
             "qwen3_asr_model custom value should survive roundtrip"
+        );
+    }
+
+    // ============================================================
+    // TEST-SYNC-ITN-TRANS-001: AppConfig::remember_translation_direction
+    // 搬迁自 main.rs（REFACTOR-SHARE-TRANSDIR-001）
+    // ============================================================
+
+    /// 方向未变时返回 false（调用方据此跳过 save）
+    #[test]
+    fn remember_direction_returns_false_when_unchanged() {
+        let mut cfg = AppConfig::default();
+        cfg.translation.target_language = TranslationLanguage::English;
+        assert!(
+            !cfg.remember_translation_direction(TranslationLanguage::English),
+            "same direction should return false"
+        );
+        assert_eq!(
+            cfg.translation.target_language,
+            TranslationLanguage::English
+        );
+    }
+
+    /// 方向变化时更新字段并返回 true
+    #[test]
+    fn remember_direction_updates_and_returns_true_when_changed() {
+        let mut cfg = AppConfig::default();
+        cfg.translation.target_language = TranslationLanguage::English;
+        assert!(
+            cfg.remember_translation_direction(TranslationLanguage::Chinese),
+            "changed direction should return true"
+        );
+        assert_eq!(
+            cfg.translation.target_language,
+            TranslationLanguage::Chinese
         );
     }
 }

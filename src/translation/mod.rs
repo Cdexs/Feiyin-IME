@@ -15,6 +15,7 @@ use ctranslate2_sys::{
 use sentencepiece::SentencePieceProcessor;
 
 use crate::config::TranslationLanguage;
+use crate::text_normalizer::contains_han;
 
 const ZH_EN_SUBDIR: &str = "opus-mt-zh-en";
 const EN_ZH_SUBDIR: &str = "opus-mt-en-zh";
@@ -43,6 +44,27 @@ const MAX_SEGMENT_CHARS: usize = 200;
 const MAX_SENTENCES_PER_SEGMENT: usize = 3;
 const SINGLE_BATCH_SIZE: usize = 1;
 const BATCH_TYPE_EXAMPLES: c_int = 0;
+
+/// TRANS-BIDIR-001 / REFACTOR-DERIVE-TARGET-001: Derive translation target direction
+/// from content. Platform-neutral business logic (no cfg gating) — macOS side
+/// can reuse directly, zero drift (DEC-033).
+///
+/// - Contains Han characters (incl. Japanese kanji) → translate to English
+/// - Other (English, pure digits, etc.) → translate to Chinese
+///
+/// Known semantic boundary (documented, not solved here):
+/// - Japanese kanji triggers `contains_han` → judged as Chinese → translated to
+///   English. Better than the old "silently skip" but imperfect; LANG-MIXED-001
+///   kana/hangul probes exist for future refinement.
+/// - Pure digits/punctuation with no Han and no Latin → judged Chinese direction,
+///   harmless no-op (no content to translate).
+pub fn derive_translation_target(text: &str) -> TranslationLanguage {
+    if contains_han(text) {
+        TranslationLanguage::English
+    } else {
+        TranslationLanguage::Chinese
+    }
+}
 
 struct MarianModel {
     path: PathBuf,
@@ -507,6 +529,95 @@ impl TranslationEngine {
     pub fn direction(&self) -> TranslationLanguage {
         self.direction
     }
+
+    /// REFACTOR-SHARE-TRANSDIR-001: Load an engine for the given direction, with
+    /// panic-guard and availability check. Platform-neutral (DEC-033). Returns
+    /// None if model files missing or load fails (best-effort, non-panicking).
+    pub fn load_for_direction(model_dir: &Path, target: TranslationLanguage) -> Option<Self> {
+        if !Self::is_available(model_dir, target) {
+            log::info!(
+                "Translation model files not found for {:?}, offline engine disabled",
+                target
+            );
+            return None;
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Self::new(model_dir, target)
+        }));
+        match result {
+            Ok(Ok(engine)) => {
+                log::info!("Offline translation engine loaded ({:?})", target);
+                Some(engine)
+            }
+            Ok(Err(e)) => {
+                log::warn!("Translation engine load failed for {:?}: {}", target, e);
+                None
+            }
+            Err(_) => {
+                log::warn!("Translation engine load panicked for {:?}", target);
+                None
+            }
+        }
+    }
+}
+
+/// TRANS-BIDIR-001 / REFACTOR-SHARE-TRANSDIR-001: Ensure the cached offline
+/// translation engine matches the derived target direction. Single-slot: if
+/// direction differs, rebuild and replace the cached engine (old one dropped).
+/// If rebuild fails, return None (caller injects original text — never drops
+/// user speech, never injects garbage from a wrong-direction engine).
+///
+/// Platform-neutral (DEC-033) — macOS side can reuse directly. All platform
+/// specifics (worker thread, model_dir resolution) stay at the caller.
+///
+/// Concurrency: caller must ensure single-threaded access to cached_translation
+/// (the Windows caller does this via worker thread sequential execution).
+pub fn ensure_translation_direction<'a>(
+    cached_translation: &'a mut Option<(TranslationLanguage, TranslationEngine)>,
+    model_dir: &Path,
+    derived_target: TranslationLanguage,
+) -> Option<&'a TranslationEngine> {
+    // If cached direction already matches, no rebuild needed.
+    let needs_rebuild = match cached_translation {
+        Some((lang, _)) => *lang != derived_target,
+        None => true,
+    };
+    if !needs_rebuild {
+        return cached_translation.as_ref().map(|(_, e)| e);
+    }
+    // Direction mismatch (or no engine cached): rebuild for derived direction.
+    let t_start = std::time::Instant::now();
+    log::info!(
+        "Translation engine direction mismatch: cached={:?}, derived={:?}; rebuilding…",
+        cached_translation.as_ref().map(|(lang, _)| *lang),
+        derived_target
+    );
+    let new_engine = TranslationEngine::load_for_direction(model_dir, derived_target);
+    let elapsed = t_start.elapsed();
+    match new_engine {
+        Some(engine) => {
+            log::info!(
+                "Translation engine reloaded for {:?} in {:.2}s",
+                derived_target,
+                elapsed.as_secs_f64()
+            );
+            *cached_translation = Some((derived_target, engine));
+            cached_translation.as_ref().map(|(_, e)| e)
+        }
+        None => {
+            log::warn!(
+                "Translation engine rebuild failed for {:?} after {:.2}s; \
+                 skipping translation (original text will be injected)",
+                derived_target,
+                elapsed.as_secs_f64()
+            );
+            // Return None — do NOT hand out the old wrong-direction engine.
+            // Wrong-direction output is garbage, strictly worse than injecting
+            // the original text. The old engine is kept in cache (still valid
+            // for its own direction on the next same-direction call).
+            None
+        }
+    }
 }
 
 fn append_model_files(
@@ -957,6 +1068,91 @@ mod tests {
         assert!(
             segments.len() >= 2,
             "6 sentences should split into at least 2 segments due to MAX_SENTENCES_PER_SEGMENT=3"
+        );
+    }
+
+    // ============================================================
+    // TEST-SYNC-ITN-TRANS-001: derive_translation_target 断言矩阵
+    // ============================================================
+
+    /// 方向判定纯函数——输入文本 → TranslationLanguage
+    /// 日文汉字（日本語の漢字）是已知语义边界：contains_han 对日文汉字为真，
+    /// 故推导为 English。这比旧的"静默跳过"好，但不是完美解；未来可通过
+    /// LANG-MIXED-001 kana/hangul 探针精化。
+    #[test]
+    fn derive_target_chinese_text_returns_english() {
+        assert_eq!(
+            derive_translation_target("你好世界"),
+            TranslationLanguage::English
+        );
+        assert_eq!(
+            derive_translation_target("温度是四十摄氏度"),
+            TranslationLanguage::English
+        );
+    }
+
+    #[test]
+    fn derive_target_english_text_returns_chinese() {
+        assert_eq!(
+            derive_translation_target("hello world"),
+            TranslationLanguage::Chinese
+        );
+        assert_eq!(
+            derive_translation_target("The temperature is 40 degrees."),
+            TranslationLanguage::Chinese
+        );
+    }
+
+    #[test]
+    fn derive_target_mixed_text_returns_english() {
+        assert_eq!(
+            derive_translation_target("你好 world"),
+            TranslationLanguage::English
+        );
+    }
+
+    #[test]
+    fn derive_target_japanese_kanji_returns_english_known_boundary() {
+        // 已知语义边界：日文汉字被 contains_han 判定为真 → English。
+        // 非 bug，是已知取舍。未来需结合 contains_kana 精化。
+        assert_eq!(
+            derive_translation_target("日本語の漢字"),
+            TranslationLanguage::English
+        );
+    }
+
+    #[test]
+    fn derive_target_non_han_returns_chinese() {
+        assert_eq!(
+            derive_translation_target("12345"),
+            TranslationLanguage::Chinese
+        );
+        assert_eq!(
+            derive_translation_target("。，！"),
+            TranslationLanguage::Chinese
+        );
+        assert_eq!(derive_translation_target(""), TranslationLanguage::Chinese);
+    }
+
+    // ============================================================
+    // TEST-SYNC-ITN-TRANS-001: ensure_translation_direction 测试
+    // REFACTOR-SHARE-TRANSDIR-001: 从 main.rs 搬迁至此（平台中立）
+    // ============================================================
+
+    /// 重建失败分支 → 必须返回 None（主控修正护栏）。
+    /// cached=None + model_dir 不存在 → is_available=false → 返回 None。
+    /// 方向一致不重建和缓存错方向+重建失败这两条路径需要真实
+    /// TranslationEngine 实例（依赖 CTranslate2 FFI + 模型文件），
+    /// 无法在纯单元测试中构造。
+    #[test]
+    fn ensure_direction_returns_none_when_rebuild_unavailable() {
+        let mut cached: Option<(TranslationLanguage, TranslationEngine)> = None;
+        let model_dir = Path::new("/nonexistent/voice-ime-models");
+        let result =
+            ensure_translation_direction(&mut cached, model_dir, TranslationLanguage::English);
+        assert!(
+            result.is_none(),
+            "must return None when rebuild fails — never pass a direction-mismatched old engine"
         );
     }
 }

@@ -34,6 +34,8 @@ struct Rules {
     fraction: Fraction,
     #[serde(default)]
     protect: Protect,
+    #[serde(default)]
+    unit_symbols: UnitSymbols,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -154,6 +156,20 @@ struct ProtectList {
     words: Vec<String>,
 }
 
+/// ITN-CELSIUS-003: 单位符号规整规则（独立于中文数字转换路径）。
+/// 对已是阿拉伯数字的文本生效：数字 + trigger → 数字 + replacement。
+#[derive(Debug, Clone, Deserialize, Default)]
+struct UnitSymbols {
+    #[serde(default)]
+    rules: Vec<UnitSymbolRule>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct UnitSymbolRule {
+    trigger: String,
+    replacement: String,
+}
+
 // ============================================================
 // 编译后规则（HashSet 加速查询）
 // ============================================================
@@ -177,6 +193,9 @@ struct CompiledRules {
     large_amount_keep_wan_yi: bool,
     /// ITN-SMART-002: 含数字的历史/文化/民俗词汇保护集
     historical_set: HashSet<String>,
+    /// ITN-CELSIUS-003: 单位符号规整规则（阿拉伯数字 + trigger → replacement）
+    /// 按 trigger 字符长度降序排列（最长匹配优先）
+    unit_symbol_rules: Vec<(String, String)>,
 }
 
 impl CompiledRules {
@@ -222,6 +241,17 @@ impl CompiledRules {
             below_zero_style: r.switches.below_zero_style,
             large_amount_keep_wan_yi: r.switches.large_amount_keep_wan_yi,
             historical_set: r.protect.historical.words.iter().cloned().collect(),
+            unit_symbol_rules: {
+                let mut rules: Vec<(String, String)> = r
+                    .unit_symbols
+                    .rules
+                    .iter()
+                    .map(|rule| (rule.trigger.clone(), rule.replacement.clone()))
+                    .collect();
+                // Longest trigger first for correct matching
+                rules.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()));
+                rules
+            },
         }
     }
 
@@ -624,11 +654,18 @@ fn parse_negative_prefix(chars: &[char], start: usize) -> Option<(bool, usize)> 
 
 /// 智能数字规整：将中文数字转为阿拉伯数字，保护单字/成语/专有名词。
 ///
-/// 位置：转录后/LLM 前，三模型统一生效。
-/// 幂等：已是阿拉伯数字的输入逐字节不变。
+/// 位置：三分支产出后、本地标点前（ITN-REORDER-001，2026-07-30 反转，理由见 DEC-035）。
+/// 幂等：`f(f(x)) == f(x)`。
+///
+/// 注意：自 ITN-CELSIUS-003 起，已是阿拉伯数字的文本仍会做单位符号规整
+/// （如 `40摄氏度` → `40℃`），故「逐字节不变」不再字面成立。幂等性保持
+/// （`40℃` 再跑一遍仍 `40℃`，因 `℃` 不匹配任何 unit_symbols trigger）。
 pub fn normalize_numbers(text: &str) -> String {
     let r = rules();
-    normalize_with_rules(text, r)
+    let after_cn = normalize_with_rules(text, r);
+    // ITN-CELSIUS-003: 独立通道——对已是阿拉伯数字的文本做单位符号规整。
+    // 在中文数字转换之后运行，不依赖中文数字解析路径。
+    normalize_unit_symbols(&after_cn, r)
 }
 
 fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
@@ -819,7 +856,145 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
     result
 }
 
-/// 判定是否应该转换
+/// ITN-CELSIUS-003: 单位符号规整（独立通道，对已是阿拉伯数字的文本生效）。
+///
+/// 扫描文本中的阿拉伯数字序列（含可选负号/小数点），当其后紧跟一个
+/// `unit_symbols` trigger（如「摄氏度」「摄氏」「°C」）时，将 trigger
+/// 替换为对应的 replacement（如「℃」），数字部分原样保留。
+///
+/// 幂等：`40℃` 不含任何 trigger → 不变；`40摄氏度` → `40℃` → 再跑仍 `40℃`。
+/// 「度」单独不在此列（角度/温度同形，Gavin 2026-07-27 拍板）。
+///
+/// 负数前缀联动 below_zero_style：
+/// - `-10摄氏度` → minus 风格 `-10℃` / text 风格 `-10℃`（负号已是阿拉伯形式，保留）
+/// - `零下10摄氏度` → minus 风格 `-10℃` / text 风格 `零下10℃`
+fn normalize_unit_symbols(text: &str, r: &CompiledRules) -> String {
+    if r.unit_symbol_rules.is_empty() {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut result = String::with_capacity(chars.len());
+    let mut i = 0;
+
+    while i < chars.len() {
+        // ITN-CELSIUS-003: try to match Arabic digits (with optional 零下/- prefix)
+        // followed by a unit symbol trigger (摄氏度/摄氏/°C → ℃)
+        if let Some((output, input_len)) = try_match_arabic_symbol(&chars, i, r) {
+            result.push_str(&output);
+            i += input_len;
+            continue;
+        }
+        result.push(chars[i]);
+        i += 1;
+    }
+
+    result
+}
+
+/// ITN-CELSIUS-003: Match Arabic digits (optionally preceded by 零下/-) followed by
+/// a unit symbol trigger. Returns (output_string, input_chars_consumed) on match.
+/// Handles below_zero_style for 零下 prefix.
+fn try_match_arabic_symbol(
+    chars: &[char],
+    pos: usize,
+    r: &CompiledRules,
+) -> Option<(String, usize)> {
+    try_match_neg_prefix_arabic_symbol(chars, pos, r)
+        .or_else(|| try_match_plain_arabic_symbol(chars, pos, r))
+}
+
+/// Match 零下 + Arabic digits + symbol trigger
+fn try_match_neg_prefix_arabic_symbol(
+    chars: &[char],
+    pos: usize,
+    r: &CompiledRules,
+) -> Option<(String, usize)> {
+    let neg_prefix: Vec<char> = "零下".chars().collect();
+    if pos + neg_prefix.len() > chars.len() {
+        return None;
+    }
+    if &chars[pos..pos + neg_prefix.len()] != neg_prefix.as_slice() {
+        return None;
+    }
+    let after_prefix = pos + neg_prefix.len();
+    let (digits_str, digits_len) = scan_arabic_digits(&chars[after_prefix..])?;
+    if digits_len == 0 {
+        return None;
+    }
+    let after_digits = after_prefix + digits_len;
+    let (trigger_len, replacement) = match_symbol_trigger(&chars[after_digits..], r)?;
+    let output = if r.below_zero_style == "minus" {
+        format!("-{}{}", digits_str, replacement)
+    } else {
+        format!("零下{}{}", digits_str, replacement)
+    };
+    let input_len = neg_prefix.len() + digits_len + trigger_len;
+    Some((output, input_len))
+}
+
+/// Match plain Arabic digits (+ optional leading -) + symbol trigger
+fn try_match_plain_arabic_symbol(
+    chars: &[char],
+    pos: usize,
+    r: &CompiledRules,
+) -> Option<(String, usize)> {
+    let mut start = pos;
+    let mut has_minus = false;
+    // Optional leading minus sign
+    if pos < chars.len() && chars[pos] == '-' {
+        has_minus = true;
+        start = pos + 1;
+    }
+    let (digits_str, digits_len) = scan_arabic_digits(&chars[start..])?;
+    if digits_len == 0 {
+        return None;
+    }
+    let after_digits = start + digits_len;
+    let (trigger_len, replacement) = match_symbol_trigger(&chars[after_digits..], r)?;
+    let output = if has_minus {
+        format!("-{}{}", digits_str, replacement)
+    } else {
+        format!("{}{}", digits_str, replacement)
+    };
+    let input_len = (start - pos) + digits_len + trigger_len;
+    Some((output, input_len))
+}
+
+/// Scan a run of ASCII digits (optionally with one decimal point). Returns (string, char_count).
+fn scan_arabic_digits(chars: &[char]) -> Option<(String, usize)> {
+    let mut s = String::new();
+    let mut count = 0;
+    let mut seen_dot = false;
+    for &c in chars {
+        if c.is_ascii_digit() {
+            s.push(c);
+            count += 1;
+        } else if c == '.' && !seen_dot && count > 0 {
+            // Allow one decimal point (e.g., 40.5摄氏度)
+            seen_dot = true;
+            s.push(c);
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    if count == 0 {
+        None
+    } else {
+        Some((s, count))
+    }
+}
+
+/// Match the longest unit_symbol trigger at the given position. Returns (trigger_char_len, replacement).
+fn match_symbol_trigger(chars: &[char], r: &CompiledRules) -> Option<(usize, String)> {
+    let rest: String = chars.iter().collect();
+    for (trigger, replacement) in &r.unit_symbol_rules {
+        if rest.starts_with(trigger.as_str()) {
+            return Some((trigger.chars().count(), replacement.clone()));
+        }
+    }
+    None
+}
 /// ITN-SMART-002: `num_str` 不再用于位数判定（改用 consumed 源汉字数），
 /// 保留参数以维持调用签名稳定，便于未来扩展（如逐位串特殊处理）。
 fn decide_conversion(
@@ -998,9 +1173,16 @@ mod tests {
     use super::*;
 
     /// 使用内置规则测试
+    /// 主控修正（TEST-EXEC 2026-07-30）：本助手原先只调 `normalize_with_rules`，
+    /// **绕过了公共入口 `normalize_numbers` 的第二阶段** `normalize_unit_symbols`
+    /// （ITN-CELSIUS-003 新增）。后果：96 条断言长期测的是一条**非公共路径**，
+    /// 新通道对它们全部不可见 —— TEST-EXEC 的 6 个失败即由此而来（生产代码是对的）。
+    ///
+    /// 已改为直接调用公共入口。**测试必须走生产入口**，否则测试面与真实行为会静默分叉：
+    /// 这与同日 `builtin_rules_parse_ok` 之前那个「单测全用内联 fixture、覆盖不到真实 toml」
+    /// 的黑洞属同一类缺陷。
     fn normalize_test(text: &str) -> String {
-        let r = rules();
-        normalize_with_rules(text, r)
+        normalize_numbers(text)
     }
 
     /// 使用自定义规则测试（模拟文件覆盖）
@@ -1519,5 +1701,114 @@ below_zero_style = "minus"
 words = ["度"]
 "#;
         assert_eq!(normalize_with(custom, "零下十度"), "-10度");
+    }
+
+    // ============================================================
+    // ITN-REORDER-001: LLM 成品输入域 — 新位置后 ITN 的新输入特征
+    // ============================================================
+
+    /// 带标点输入：全角标点不破坏数字/单位边界判定，ITN-CELSIUS-003 后
+    /// 阿拉伯数字后的摄氏度 trigger 也会被规整为 ℃。
+    #[test]
+    fn itn_new_domain_with_punctuation() {
+        assert_eq!(normalize_test("温度是40摄氏度。"), "温度是40℃。");
+        assert_eq!(
+            normalize_test("明天最高40摄氏度，最低25摄氏度。"),
+            "明天最高40℃，最低25℃。"
+        );
+    }
+
+    /// 汉字+标点混合：中文数字转换为阿拉伯数字，全角标点保留在原位
+    #[test]
+    fn itn_new_domain_cn_with_punct() {
+        assert_eq!(normalize_test("温度是四十摄氏度。"), "温度是40℃。");
+    }
+
+    /// 多行输入：逐行处理，换行符不丢失
+    #[test]
+    fn itn_new_domain_multiline() {
+        // 主控修正（TEST-EXEC 2026-07-30）：原期待值 "第一行25\n第二行30" 漏算了序数规则 ——
+        // `itn-rules.toml:85-86` 的 `[ordinal] prefix = "第"` 会把「第一/第二」转成「第1/第2」
+        // （DEC-030-③ 明列序数为覆盖场景）。故本例实际考察**两条规则跨换行同时生效**：
+        // 序数（第一→第1）+ 多位数字（二十五→25），且 `\n` 原样保留。
+        assert_eq!(
+            normalize_test("第一行二十五\n第二行三十"),
+            "第1行25\n第2行30"
+        );
+        assert_eq!(normalize_test("你好\n世界"), "你好\n世界");
+    }
+
+    /// 中英混排/技术术语：不被误改（回归风险最高的一类）
+    #[test]
+    fn itn_new_domain_tech_terms() {
+        assert_eq!(normalize_test("按F4键"), "按F4键");
+        assert_eq!(normalize_test("Ctrl+2"), "Ctrl+2");
+        assert_eq!(normalize_test("v0.7.2"), "v0.7.2");
+        assert_eq!(normalize_test("esbuild 0.21.5"), "esbuild 0.21.5");
+    }
+
+    /// 纯英文输入（翻译路径输出）：no-op 逐字节不变
+    #[test]
+    fn itn_new_domain_pure_english() {
+        assert_eq!(
+            normalize_test("The temperature is 40 degrees."),
+            "The temperature is 40 degrees."
+        );
+    }
+
+    // ============================================================
+    // ITN-CELSIUS-003: 单位符号独立通道（normalize_unit_symbols）
+    // ============================================================
+
+    /// P0-1: 最长匹配优先——"摄氏度"（3 字）优先于"摄氏"（2 字），
+    /// 若排序被破坏会退化为"40℃度"。
+    #[test]
+    fn unit_symbol_longest_match_first() {
+        assert_eq!(normalize_test("40摄氏度"), "40℃");
+    }
+
+    /// P0-2: 必须有阿拉伯数字前缀——纯单位词不触发替换
+    #[test]
+    fn unit_symbol_requires_digit_prefix() {
+        assert_eq!(normalize_test("摄氏度是温度单位"), "摄氏度是温度单位");
+        assert_eq!(normalize_test("摄氏"), "摄氏");
+    }
+
+    /// P0-3: "度"（无"摄氏"）绝不转——角度/温度同形，Gavin 2026-07-27 拍板
+    #[test]
+    fn unit_symbol_bare_degree_unchanged() {
+        assert_eq!(normalize_test("44度"), "44度");
+        assert_eq!(normalize_test("转90度"), "转90度");
+        assert_eq!(normalize_test("温度是44度。"), "温度是44度。");
+    }
+
+    /// P0-4: 幂等——两遍归一化结果与一遍相同；℃ 本身不触发任何 trigger
+    #[test]
+    fn unit_symbol_idempotent() {
+        let once = normalize_test("温度是四十摄氏度");
+        let twice = normalize_test(&once);
+        assert_eq!(once, twice, "f(f(x)) == f(x)");
+        assert_eq!(normalize_test("40℃"), "40℃");
+    }
+
+    /// P0-5: °C (U+00B0 + C) → ℃ (U+2103)
+    #[test]
+    fn unit_symbol_degree_c_to_celsius() {
+        assert_eq!(normalize_test("40°C"), "40℃");
+    }
+
+    /// P1-1: 负号/零下联动——"-"前缀保持原有负号，"零下"按 below_zero_style
+    /// (default="text") 输出"零下X℃"
+    #[test]
+    fn unit_symbol_negative_and_below_zero() {
+        assert_eq!(normalize_test("-10摄氏度"), "-10℃");
+        assert_eq!(normalize_test("零下10摄氏度"), "零下10℃");
+    }
+
+    /// P1-3: 端到端形态——LLM 输出含"摄氏度"时，ITN 补 ℃ 符号
+    /// （即本批次修复的目标形态，亦由 itn_new_domain_with_punctuation 覆盖）
+    #[test]
+    fn unit_symbol_e2e_llm_output() {
+        assert_eq!(normalize_test("温度是40摄氏度。"), "温度是40℃。");
     }
 }
