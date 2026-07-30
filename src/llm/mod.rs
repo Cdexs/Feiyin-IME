@@ -2927,8 +2927,7 @@ mod tests {
         // P0-1: enable_thinking 与 thinking 同时存在，确保双发不会因重构被误删其一。
         let config = LlmConfig::default();
         let client = LlmClient::new(config);
-        let request =
-            client.build_optimize_request("test", None, true, None, false, false);
+        let request = client.build_optimize_request("test", None, true, None, false, false);
         let value = serde_json::to_value(&request).unwrap();
         let obj = value.as_object().unwrap();
         assert!(

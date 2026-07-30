@@ -366,9 +366,7 @@ pub fn run() {
                     if let Ok(font_data) = std::fs::read(font_path) {
                         fonts.font_data.insert(
                             "PingFangSC".to_owned(),
-                            egui::FontData::from_bytes(font_data)
-                                .ok()
-                                .unwrap_or_default(),
+                            egui::FontData::from_owned(font_data),
                         );
                         fonts
                             .families

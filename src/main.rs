@@ -4346,8 +4346,12 @@ mod overlay_shimmer_tests {
     // ASR-ACC-OPT-001 方案 B + ASR-CTC-OPT-001 P1: select_preprocessing_params 分支测试
     // ============================================================
 
-    use super::{select_preprocessing_params, transcription};
+    #[cfg(target_os = "windows")]
+    use super::select_preprocessing_params;
+    #[allow(unused_imports)]
+    use super::transcription;
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn preprocessing_params_performance_uses_0ms_head_200ms_backtrack() {
         // ASR-CTC-OPT-001 P1: performance silence head 50→0ms（研究 C1 证实 0ms 高 2.5pp）
@@ -4362,6 +4366,7 @@ mod overlay_shimmer_tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn preprocessing_params_accuracy_uses_0ms_head_100ms_backtrack() {
         // 方案 B：accuracy 用 0ms head / 100ms backtrack
@@ -4376,6 +4381,7 @@ mod overlay_shimmer_tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn preprocessing_params_both_models_use_0ms_head() {
         // ASR-CTC-OPT-001 P1: 两模型都用 0ms head（offline 模型不需 frame alignment padding）
@@ -4385,6 +4391,7 @@ mod overlay_shimmer_tests {
         assert_eq!(acc_head, 0, "accuracy head must be 0");
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn preprocessing_params_accuracy_backtrack_less_than_performance() {
         // native 对送气声母不如 CTC 敏感，少留 backtrack 减少前导静音
@@ -4398,6 +4405,7 @@ mod overlay_shimmer_tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn preprocessing_params_qwen3_online_follows_performance() {
         // DEC-028: qwen3_online 沿用 performance 前处理参数（0ms head / 200ms backtrack）
