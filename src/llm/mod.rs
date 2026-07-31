@@ -26,8 +26,8 @@ const MAX_TOTAL_CHARS: usize = 24;
 // 不使用 OVERRIDES 关键字，避免与 suggestion 的覆盖声明冲突。
 // 提到模块级以便单测验证内容（optimize 路径用 UNIT_SYMBOL_PROTECTION，
 // 翻译路径用 UNIT_SYMBOL_PROTECTION_TRANSLATE，后者限定在 <corrected> 行内）。
-const UNIT_SYMBOL_PROTECTION: &str = "Number & Unit Symbol Preservation: The input text already contains normalized numbers and unit symbols (e.g., 30°C, 50%, 3.5kg, 2026-07-27, 12:30). You MUST preserve these exactly as written — do NOT rewrite them back into Chinese word forms (e.g., do NOT turn 30°C into 30摄氏度), do NOT change the notation style, and do NOT convert symbols to words or words to symbols.";
-const UNIT_SYMBOL_PROTECTION_TRANSLATE: &str = "\nNumber & Unit Symbol Preservation: The input text already contains normalized numbers and unit symbols (e.g., 30°C, 50%, 3.5kg, 2026-07-27, 12:30). In the <corrected> line, you MUST preserve these exactly as written — do NOT rewrite them back into Chinese word forms (e.g., do NOT turn 30°C into 30摄氏度), do NOT change the notation style.";
+const UNIT_SYMBOL_PROTECTION: &str = "Number & Unit Symbol Preservation: The input text already contains normalized numbers and unit symbols (e.g., 30°C, 50%, 3.5kg, 2026-07-27, 12:30). You MUST preserve these exactly as written — do NOT rewrite them back into Chinese word forms (e.g., do NOT turn 30°C into 30摄氏度), do NOT change the notation style, do NOT convert symbols to words or words to symbols, and do NOT recalculate, round, or re-express any numeric, time, or date value. You MUST NOT substitute one date/time expression for another (e.g., 4:45 MUST stay 4:45 — never 4:30 or 16:45; 明天 MUST stay 明天 — never 今天).";
+const UNIT_SYMBOL_PROTECTION_TRANSLATE: &str = "\nNumber & Unit Symbol Preservation: The input text already contains normalized numbers and unit symbols (e.g., 30°C, 50%, 3.5kg, 2026-07-27, 12:30). In the <corrected> line, you MUST preserve these exactly as written — do NOT rewrite them back into Chinese word forms (e.g., do NOT turn 30°C into 30摄氏度), do NOT change the notation style, and do NOT recalculate, round, or re-express any numeric, time, or date value. You MUST NOT substitute one date/time expression for another (e.g., 4:45 MUST stay 4:45 — never 4:30 or 16:45; 明天 MUST stay 明天 — never 今天).";
 
 #[derive(Serialize)]
 struct ChatRequest {
@@ -746,6 +746,8 @@ If no such corrected word should be learned, omit this line entirely.";
 /// Collapses newlines (`\r\n` and `\n`) in LLM output to a single "；" separator,
 /// merges consecutive newlines into one, and trims leading/trailing separators.
 /// Idempotent: input without newlines is returned unchanged (after trim).
+/// ITN-V2-PROMPT-002: Guard against separator doubling — if the accumulated output
+/// already ends with a separator or terminal punctuation, do NOT append another "；".
 fn flatten_multiline(text: &str) -> String {
     if !text.contains('\n') {
         return text.trim().to_string();
@@ -756,12 +758,30 @@ fn flatten_multiline(text: &str) -> String {
         if trimmed.is_empty() {
             continue;
         }
-        if !out.is_empty() {
+        if !out.is_empty() && !ends_with_separator_or_terminal(&out) {
             out.push('；');
         }
         out.push_str(trimmed);
     }
     out
+}
+
+/// ITN-V2-PROMPT-002: Returns true if `s` ends with a separator or terminal punctuation.
+/// Covers Chinese and English punctuation (full-width and half-width).
+fn ends_with_separator_or_terminal(s: &str) -> bool {
+    s.ends_with('；')
+        || s.ends_with('、')
+        || s.ends_with('，')
+        || s.ends_with('。')
+        || s.ends_with('！')
+        || s.ends_with('？')
+        || s.ends_with('…')
+        || s.ends_with('：')
+        || s.ends_with(';')
+        || s.ends_with(',')
+        || s.ends_with('.')
+        || s.ends_with('!')
+        || s.ends_with('?')
 }
 
 /// FMT-LLM-003: OUTPUT_FORMAT 输出契约参数化（multiline_safe）。
@@ -774,9 +794,9 @@ fn flatten_multiline(text: &str) -> String {
 fn build_output_format(multiline_safe: bool) -> &'static str {
     if multiline_safe {
         "Output format (mandatory):\n\
-        The <corrected> block MAY span multiple lines (e.g., numbered lists) — put the \
-        opening <corrected> and closing </corrected> around the whole text. After the \
-        closing tag, optionally ONE final line {\"suggestions\":[\"correct_word\"]}.\n\
+        The <corrected> block MAY span multiple lines (e.g., numbered lists with \"1. \", \"2. \", or bullet lists with \"• \"). Put the opening <corrected> and closing \
+        </corrected> around the whole text. After the closing tag, optionally ONE final line \
+        {\"suggestions\":[\"correct_word\"]}.\n\
         Output NOTHING else. No explanations, no commentary, no \"corrected to\", \
         no \"based on\", no \"the corrected text is\". If you add any text outside the \
         <corrected> tags, it will be discarded."
@@ -811,18 +831,29 @@ fn build_format_instruction_block(multiline_safe: bool) -> &'static str {
         (e.g., \"周三开会……不对，周四\" → \"周四开会\"), keep the final corrected version \
         and drop the retracted fragment. Clean up immediate stutters \
         (repeated adjacent words like \"我我我\" → \"我\").\
-        \nF3. Auto-Formatting: When the speech contains enumeration markers \
-        (第一/第二/第三, 首先/其次/最后, 几点/几个方面, one/two/three, firstly/secondly, \
-        step 1/2, etc.), you MUST split the content into numbered list lines inside \
-        <corrected> tags. DO NOT compress or summarize content. DO NOT delete any \
-        semantic content. DO NOT add information the user did not say. Preserve every \
-        factual point the speaker made; only restructure surface form.\
+        \nF3. Smart Lists: ONLY use a list when the speech EXPLICITLY contains enumeration markers. \
+        If unsure, DO NOT use a list — keep the text as a continuous paragraph. \
+        Over-formatting normal speech into lists is a regression.\
+        \nF3a. Ordered list (when the speech has explicit SEQUENCE or order): \
+        If the speech contains markers such as 第一/第二/第三, 一是/二是/三是, \
+        首先/其次/最后, 然后/接着/再次, 第X点, one/two/three, firstly/secondly, step 1/2, etc., \
+        you MUST split the content into numbered list lines using the exact prefix \"1. \", \"2. \", \"3. \" inside \
+        <corrected> tags. DO NOT use \"1)\" or Markdown \"#\" headings.\
+        \nF3b. Bullet list (when the speech lists items WITHOUT a clear order): \
+        If the speech contains markers such as 有的…有的…, 比如, 包括, 诸如, 还有, 另外, 以及, \
+        for example, including, also, additionally, etc., and the listed items are parallel but NOT sequential, \
+        you MUST split the content into bullet list lines using the exact prefix \"• \" (U+2022) inside \
+        <corrected> tags. DO NOT use \"- \", \"* \", or \"#\".\
+        \nF3c. Examples: \"第一点xxx，第二点yyy\" → \"1. xxx\\n2. yyy\"; \"首先xxx，然后yyy，最后zzz\" → \"1. xxx\\n2. yyy\\n3. zzz\"; \"有的xxx，有的yyy\" → \"• xxx\\n• yyy\"; \"今天天气不错我们去公园吧\" → keep as a continuous paragraph, NO list.\
+        \nF3d. Constraints: DO NOT compress or summarize content. DO NOT delete any semantic content. \
+        DO NOT add information the user did not say. Preserve every factual point the speaker made; \
+        only restructure surface form.\
         \nApply F1/F2/F3 to the text inside <corrected> tags. The output stays as a single \
         corrected text block; multi-line lists are allowed inside <corrected> when F3 applies."
     } else {
         // multiline_safe=false：F3 改为显式单行指令（防 LLM 自作主张生成多行）
         // FMT-LLM-002: 加 Override 显式覆盖默认 system_prompt Rule 4/5 的 Markdown
-        // formatting/list 指令（Rule 4/5 鼓励 headings/paragraph breaks/lists，
+        // formatting 指令（Rule 4/5 鼓励 headings/paragraph breaks/lists，
         // 与此处"单行"指令直接冲突，Override 消解歧义）。
         "Formatted Output (FMT-LLM-002: This block OVERRIDES any prior formatting/list/Markdown \
         instructions in the system prompt for the corrected text):\
@@ -835,10 +866,16 @@ fn build_format_instruction_block(multiline_safe: bool) -> &'static str {
         and drop the retracted fragment. Clean up immediate stutters \
         (repeated adjacent words like \"我我我\" → \"我\").\
         \nF3. Single-line Output: Output as a single continuous line. DO NOT use lists, \
-        line breaks, or multi-line formatting. If the speech contains enumeration \
-        (第一点/第二点, firstly/secondly), join items inline with appropriate \
-        separators (e.g., commas). DO NOT compress or summarize content. \
-        DO NOT delete any semantic content. Preserve every factual point the speaker made.\
+        line breaks, or multi-line formatting. DO NOT output \"• \", \"1. \", or \"2. \" on separate lines, \
+        because those will be flattened into unreadable inline text. \
+        If the speech contains explicit ordered enumeration (第一点/第二点, first/second, etc.), \
+        keep the sequence markers inline and join items with appropriate separators. \
+        If the speech lists parallel items WITHOUT a clear order (有的…有的…, 比如/包括, etc.), \
+        join them inline using Chinese enumeration separators: use \"、\" for short noun/phrase items \
+        (typically ≤6 characters with no internal punctuation, e.g., \"苹果、香蕉、橘子\"), and use \"；\" \
+        for longer clauses that contain predicates or internal punctuation (e.g., \"早上要开会；下午要写报告；晚上还要改方案\"). \
+        DO NOT compress or summarize content. DO NOT delete any semantic content. \
+        Preserve every factual point the speaker made.\
         \nApply F1/F2/F3 to the text inside <corrected> tags. The output MUST be a single \
         line with no line breaks inside <corrected>."
     }
@@ -1516,6 +1553,44 @@ mod tests {
     }
 
     #[test]
+    fn build_output_format_multi_line_mentions_numbered_and_bullet() {
+        // ITN-V2 P1 F3 规格（Gavin 2026-07-31）：multiline_safe=true 分支必须同时提及
+        // numbered 与 bullet，防 FMT-LLM-003 类契约压制复现（只提一种会让 LLM 只产出一种列表）。
+        let fmt = build_output_format(true);
+        assert!(fmt.contains("numbered lists"), "true 分支必须提及 numbered");
+        assert!(fmt.contains("bullet lists"), "true 分支必须提及 bullet");
+        assert!(fmt.contains("1. "), "必须引用编号前缀示例");
+        assert!(fmt.contains("• "), "必须引用 bullet 前缀示例");
+        assert!(!fmt.contains("1)"), "符号禁令不得把 1) 当合法编号形式");
+    }
+
+    #[test]
+    fn build_format_instruction_block_four_quadrants() {
+        // ITN-V2 P1 F3 列表四象限（Gavin 2026-07-31 规格）：
+        //   multiline_safe=true ｜ 有先后 → "1. "/"2. "/"3. " 换行
+        //   multiline_safe=true ｜ 无先后 → "• "（U+2022）换行
+        //   false ｜ 有先后 → 内联保留序号语义；无先后 → 「、」短名词 /「；」较长小句
+        let safe = build_format_instruction_block(true);
+        assert!(safe.contains("\"1. \""), "有序列表须用 \"1. \" 前缀");
+        assert!(safe.contains("\"2. \""), "有序列表须用 \"2. \" 前缀");
+        assert!(safe.contains("\"3. \""), "有序列表须用 \"3. \" 前缀");
+        assert!(safe.contains("• "), "无序列表须用 \"• \" (U+2022)");
+        // 符号禁令：1) / - / * / # 一律禁止
+        assert!(safe.contains("\"1)\""), "符号禁令须出现 1) 的禁止声明");
+        assert!(safe.contains("Markdown \"#\""), "符号禁令须出现 # 的禁止声明");
+        assert!(safe.contains("\"- \""), "符号禁令须出现 - 的禁止声明");
+        assert!(safe.contains("\"* \""), "符号禁令须出现 * 的禁止声明");
+
+        let inline = build_format_instruction_block(false);
+        assert!(inline.contains("、"), "单行路径须用「、」连接短名词短语");
+        assert!(inline.contains("；"), "单行路径须用「；」连接较长小句");
+        assert!(
+            inline.contains("keep the sequence markers inline"),
+            "有先后须内联保留序号语义"
+        );
+    }
+
+    #[test]
     fn flatten_multiline_no_newline_unchanged() {
         // 无换行 → trim 后原样返回
         assert_eq!(flatten_multiline("hello world"), "hello world");
@@ -1536,6 +1611,61 @@ mod tests {
     fn flatten_multiline_idempotent() {
         let once = flatten_multiline("a\nb\nc");
         let twice = flatten_multiline(&once);
+        assert_eq!(once, twice);
+    }
+
+    // ITN-V2-PROMPT-002: 畸形消除实证（4 条） + 反向护栏（1 条）
+    #[test]
+    fn flatten_multiline_guard_semicolon_doubling() {
+        // 行尾已有分号 → 不再叠加；
+        assert_eq!(
+            flatten_multiline("早上要开会；\n下午要写报告"),
+            "早上要开会；下午要写报告"
+        );
+    }
+
+    #[test]
+    fn flatten_multiline_guard_comma_doubling() {
+        // 行尾已有顿号 → 不再叠加；
+        assert_eq!(flatten_multiline("苹果、香蕉、\n橘子"), "苹果、香蕉、橘子");
+    }
+
+    #[test]
+    fn flatten_multiline_guard_period_doubling() {
+        // 行尾已有句号 → 不再叠加；
+        assert_eq!(flatten_multiline("xxx。\nyyy"), "xxx。yyy");
+    }
+
+    #[test]
+    fn flatten_multiline_guard_no_false_positive() {
+        // 反向护栏：正常无尾分隔符的多行仍须正确加；
+        assert_eq!(
+            flatten_multiline("正常一行\n正常两行"),
+            "正常一行；正常两行"
+        );
+    }
+
+    #[test]
+    fn flatten_multiline_guard_halfwidth_separators() {
+        // TEST-SYNC-ITN-V2-001 (C类补强)：ends_with_separator_or_terminal 亦覆盖
+        // 半角分隔符（; , . ! ?），守卫不得只在全角上生效。
+        assert_eq!(
+            flatten_multiline("First line;\nSecond line"),
+            "First line;Second line"
+        );
+        assert_eq!(flatten_multiline("Alpha,\nBeta."), "Alpha,Beta.");
+        assert_eq!(flatten_multiline("aaa,\nbbb"), "aaa,bbb");
+        // 反向护栏：无半角分隔符的正常多行仍须加；
+        assert_eq!(flatten_multiline("plain\nline"), "plain；line");
+    }
+
+    #[test]
+    fn flatten_multiline_guard_idempotent_after_guard() {
+        // 幂等性：guard 后 flatten(flatten(x)) == flatten(x)
+        let input = "aaa；\nbbb、\nccc。\nddd\neee";
+        let once = flatten_multiline(input);
+        let twice = flatten_multiline(&once);
+        assert_eq!(once, "aaa；bbb、ccc。ddd；eee");
         assert_eq!(once, twice);
     }
 
@@ -2034,6 +2164,30 @@ mod tests {
                 tr.contains(example),
                 "translate path protection missing example {}",
                 example
+            );
+        }
+    }
+
+    #[test]
+    fn both_path_protection_fact_preservation_clauses() {
+        // ITN-V2 P1 事实保全条款（两条路径均须具备）：禁止重算/取整/重新表述数值、
+        // 时间、日期；4:45 不得变 4:30、明天 不得变 今天。
+        for directive in [super::UNIT_SYMBOL_PROTECTION, super::UNIT_SYMBOL_PROTECTION_TRANSLATE] {
+            assert!(
+                directive.contains("recalculate"),
+                "必须禁止重算数值（recalculate）"
+            );
+            assert!(
+                directive.contains("4:45"),
+                "必须含 4:45 反例（不得变 4:30）"
+            );
+            assert!(
+                directive.contains("4:30"),
+                "必须含被禁止的目标形态 4:30"
+            );
+            assert!(
+                directive.contains("明天"),
+                "必须含 明天 反例（不得变 今天）"
             );
         }
     }

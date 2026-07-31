@@ -2931,6 +2931,14 @@ fn run_pipeline(
                         send_event(event_tx, PipelineEvent::Cancelled);
                         return;
                     }
+                    // ITN-V2-001 (R1 主通道)：ITN 从「LLM 后」回移到「LLM 前」。
+                    // Gavin 2026-07-31 指令：LLM 会曲解原始数字表达（如「四点三刻」→「4:30」，
+                    // 信息被销毁），故主通道在 LLM 之前先把中文数字→阿拉伯 + 单位符号定型，
+                    // LLM 拿到的已是成形数字，UNIT_SYMBOL_PROTECTION 指令恢复生效。
+                    // 补丁通道（normalize_unit_symbols_only）仍在 LLM 后兜底（见 :3124），
+                    // 捞回 LLM 纠正 ASR 同音错字后的「40摄氏度」→「40℃」。
+                    // 放在 is_effective_text 之后：ITN 不增删语义字符，filler 判定不变。
+                    let pre_llm_text = itn::normalize_numbers(&raw_text);
                     // SCENE-SENSE-001-CORE (DEC-031-⑤): 录音完成阶段采集前台窗口场景信号，
                     // 供 LLM prompt F4 段注入 + multiline_safe 格式安全裁决。
                     // target_hwnd 即录音启动时捕获的前台窗口，此处复用同一 HWND 采集。
@@ -3004,7 +3012,7 @@ fn run_pipeline(
                         ) {
                             // B: LLM optimization failed (non-critical), continue with raw result
                             match rt.block_on(llm_client.optimize_and_translate(
-                                &raw_text,
+                                &pre_llm_text,
                                 derived_target,
                                 script_instruction,
                                 config.punctuation.enabled,
@@ -3020,24 +3028,25 @@ fn run_pipeline(
                                         "LLM optimize+translate failed, trying offline: {}",
                                         e
                                     );
-                                    try_nllb_translate(&raw_text, effective_engine).unwrap_or_else(
-                                        || {
+                                    try_nllb_translate(&pre_llm_text, effective_engine)
+                                        .unwrap_or_else(|| {
                                             text_normalizer::normalize_text_for_language(
-                                                &raw_text,
+                                                &pre_llm_text,
                                                 config.audio.chinese_script,
                                             )
-                                        },
-                                    )
+                                        })
                                 }
                             }
                         } else {
                             // LLM not eligible, use offline engine directly
-                            try_nllb_translate(&raw_text, effective_engine).unwrap_or_else(|| {
-                                text_normalizer::normalize_text_for_language(
-                                    &raw_text,
-                                    config.audio.chinese_script,
-                                )
-                            })
+                            try_nllb_translate(&pre_llm_text, effective_engine).unwrap_or_else(
+                                || {
+                                    text_normalizer::normalize_text_for_language(
+                                        &pre_llm_text,
+                                        config.audio.chinese_script,
+                                    )
+                                },
+                            )
                         }
                     } else if config.llm.enabled && !raw_text.trim().is_empty() {
                         let processing_msg = i18n::get(config.ui_language).overlay_processing;
@@ -3050,7 +3059,7 @@ fn run_pipeline(
                             config.audio.chinese_script,
                         );
                         let llm_result = rt.block_on(llm_client.optimize(
-                            &raw_text,
+                            &pre_llm_text,
                             script_instruction,
                             config.punctuation.enabled,
                             Some(&scene_context),
@@ -3072,8 +3081,10 @@ fn run_pipeline(
                             Err(e) => {
                                 log::warn!("LLM optimization error: {}", e);
                                 format_failed = true;
+                                // ITN-V2-001 (R1)：兜底用主通道产物（已含数字转换），
+                                // 与 DEC-035 之前行为一致（属改进）。
                                 text_normalizer::normalize_text_for_language(
-                                    &raw_text,
+                                    &pre_llm_text,
                                     config.audio.chinese_script,
                                 )
                             }
@@ -3084,7 +3095,7 @@ fn run_pipeline(
                             "LLM disabled or text empty, using transcription result directly"
                         );
                         text_normalizer::normalize_text_for_language(
-                            &raw_text,
+                            &pre_llm_text,
                             config.audio.chinese_script,
                         )
                     };
@@ -3116,12 +3127,15 @@ fn run_pipeline(
                             }
                         }
                     }
-                    // ITN-REORDER-001: 智能数字规整移至三分支产出之后、本地标点之前。
-                    // 原位置（DEC-030「转录后/LLM 前」）已于 2026-07-30 反转，理由见 DEC-035。
-                    // 一处覆盖三条路径：①LLM 成功路径——LLM 纠正了 ASR 同音错字（如「摄息」→「摄氏」）
-                    //   后 ITN 才能匹配「摄氏」触发 ℃；②LLM 失败兜底——与原行为一致；③LLM 关闭——与原行为一致。
-                    // 对翻译路径（英文输出）：ITN 是 no-op（英文无中文数字/单位词），幂等安全。
-                    let final_text = itn::normalize_numbers(&final_text);
+                    // ITN-V2-001 (R1 补丁通道)：三分支产出 final_text 之后、本地标点之前。
+                    // 主通道已在 LLM 之前跑过完整 normalize_numbers（见上方 pre_llm_text），
+                    // 此处仅运行第二阶段 normalize_unit_symbols_only，捞回 LLM 纠正 ASR
+                    // 同音错字后的单位符号（如「摄息」→「摄氏」后「40摄氏度」→「40℃」）。
+                    // 不重跑 normalize_with_rules（第一阶段）：中文数字已在主通道定型，且 LLM
+                    // 输出可能含阿拉伯数字，重跑中文数字转换是 no-op；单位符号规整才是补丁价值。
+                    // 幂等安全：主通道产出「40℃」，补丁通道对「℃」不匹配任何 trigger → 不变。
+                    // 对翻译路径（英文输出）：本函数是 no-op（英文无中文单位词）。
+                    let final_text = itn::normalize_unit_symbols_only(&final_text);
                     // PUNCT-INTEGRATION-001 + ASR-PUNCT-OPT-001: 标点决策
                     // 条件：auto_punct=true && LLM 未处理 && 非翻译 && 非native自带标点
                     // - native_punctuated=true（accuracy native 成功）→ 跳过标点引擎（省一次推理）

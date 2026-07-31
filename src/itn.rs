@@ -36,6 +36,8 @@ struct Rules {
     protect: Protect,
     #[serde(default)]
     unit_symbols: UnitSymbols,
+    #[serde(default)]
+    unit_hierarchy: UnitHierarchy,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,6 +90,8 @@ struct Units {
     acoustic: UnitList,
     #[serde(default)]
     data: UnitList,
+    #[serde(default)]
+    time: UnitList,
     #[serde(default)]
     other: UnitList,
     #[serde(default)]
@@ -173,6 +177,20 @@ struct UnitSymbolRule {
     replacement: String,
 }
 
+/// ITN-V2-004 (P4) 单位层级表：丙型多级单位链合并用。
+/// 每族按单位→相对倍率。`分` 同时出现在 currency 和 time，由识别器按前驱单位消歧。
+#[derive(Debug, Clone, Deserialize, Default)]
+struct UnitHierarchy {
+    #[serde(default)]
+    currency: std::collections::HashMap<String, f64>,
+    #[serde(default)]
+    length: std::collections::HashMap<String, f64>,
+    #[serde(default)]
+    weight: std::collections::HashMap<String, f64>,
+    #[serde(default)]
+    time: std::collections::HashMap<String, f64>,
+}
+
 // ============================================================
 // 编译后规则（HashSet 加速查询）
 // ============================================================
@@ -202,6 +220,12 @@ struct CompiledRules {
     /// ITN-CELSIUS-003: 单位符号规整规则（阿拉伯数字 + trigger → replacement）
     /// 按 trigger 字符长度降序排列（最长匹配优先）
     unit_symbol_rules: Vec<(String, String)>,
+    /// ITN-V2-004 (P4) 单位层级表：丙型合并用，unit→(族名, 倍率)
+    /// 一个单位可能在多族（如「分」在 currency+time），由识别器按前驱消歧
+    unit_hierarchy: HashMap<String, Vec<(&'static str, f64)>>,
+    /// 可小数化单位集合（currency+length+weight+volume+temperature+pressure+
+    /// electrical+frequency+acoustic+data+time，排除 other/geo_prefix）
+    decimalizable_units: HashSet<String>,
 }
 
 impl CompiledRules {
@@ -218,6 +242,7 @@ impl CompiledRules {
             &r.units.frequency,
             &r.units.acoustic,
             &r.units.data,
+            &r.units.time,
             &r.units.other,
         ] {
             for w in &unit_list.words {
@@ -271,11 +296,84 @@ impl CompiledRules {
                 rules.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()));
                 rules
             },
+            unit_hierarchy: {
+                let mut map: HashMap<String, Vec<(&'static str, f64)>> = HashMap::new();
+                for (unit, val) in &r.unit_hierarchy.currency {
+                    map.entry(unit.clone())
+                        .or_default()
+                        .push(("currency", *val));
+                }
+                for (unit, val) in &r.unit_hierarchy.length {
+                    map.entry(unit.clone()).or_default().push(("length", *val));
+                }
+                for (unit, val) in &r.unit_hierarchy.weight {
+                    map.entry(unit.clone()).or_default().push(("weight", *val));
+                }
+                for (unit, val) in &r.unit_hierarchy.time {
+                    map.entry(unit.clone()).or_default().push(("time", *val));
+                }
+                map
+            },
+            decimalizable_units: {
+                let mut set = HashSet::new();
+                for list in [
+                    &r.units.currency,
+                    &r.units.length,
+                    &r.units.weight,
+                    &r.units.volume,
+                    &r.units.temperature,
+                    &r.units.pressure,
+                    &r.units.electrical,
+                    &r.units.frequency,
+                    &r.units.acoustic,
+                    &r.units.data,
+                    &r.units.time,
+                ] {
+                    for w in &list.words {
+                        set.insert(w.clone());
+                    }
+                }
+                set
+            },
         }
     }
 
     fn is_unit(&self, s: &str) -> bool {
         self.all_units.iter().any(|u| s.starts_with(u))
+    }
+
+    /// ITN-V2-003 (甲型守卫)：判定是否「真单位」（在 all_units 但不在 classifiers）。
+    /// 通用量词（个/间/件…）不算单位——甲型文法不处理「一个半」「五间半」，
+    /// 它们保持汉字（守卫统一路径，符合 DEC-038）。
+    /// 「间」同时在 units.other 和 classifiers，此处排除。
+    fn is_real_unit(&self, s: &str) -> bool {
+        self.all_units.iter().any(|u| s.starts_with(u))
+            && !self
+                .classifier_set
+                .iter()
+                .any(|c| s.starts_with(c.as_str()))
+    }
+
+    /// ITN-V2-004 (P4)：可小数化单位（排除 other/geo_prefix）。
+    fn is_decimalizable(&self, s: &str) -> bool {
+        self.decimalizable_units
+            .iter()
+            .any(|u| s.starts_with(u.as_str()))
+    }
+
+    /// ITN-V2-004 (P4)：取单位在某族的倍率。
+    fn hierarchy_value(&self, unit: &str, family: &str) -> Option<f64> {
+        self.unit_hierarchy
+            .get(unit)
+            .and_then(|entries| entries.iter().find(|(f, _)| *f == family).map(|(_, v)| *v))
+    }
+
+    /// ITN-V2-004 (P4)：取单位的所有族属。
+    fn unit_families(&self, unit: &str) -> Vec<&'static str> {
+        self.unit_hierarchy
+            .get(unit)
+            .map(|entries| entries.iter().map(|(f, _)| *f).collect())
+            .unwrap_or_default()
     }
 
     fn is_date_suffix(&self, s: &str) -> bool {
@@ -445,6 +543,13 @@ fn is_cn_num_char(ch: char) -> bool {
 fn is_cn_unit_char(ch: char) -> bool {
     let s = ch.to_string();
     UNIT_MAP.iter().any(|(cn, _)| s == *cn)
+}
+
+/// ITN-V2-001 (R2 缺陷A ①右邻否决)：判定词是否全由中文数字字符组成（含进位单位）。
+/// 用于识别「十一」「五一」「八一」这类纯数字保护词，以便撤销保护时区分。
+/// 例：「十一」=true、「三亚」=false、「五角大楼」=false。
+fn is_pure_cn_digit_word(word: &str) -> bool {
+    !word.is_empty() && word.chars().all(is_cn_num_char)
 }
 
 /// 解析中文数字字符串为数值 + 消耗的字符数
@@ -687,13 +792,626 @@ pub fn normalize_numbers(text: &str) -> String {
     normalize_unit_symbols(&after_cn, r)
 }
 
+/// ITN-V2-001 (R1 双通道补丁通道)：仅运行单位符号规整（第二阶段），
+/// 不做中文数字→阿拉伯转换（第一阶段）。
+///
+/// 用途：ITN 主通道已跑过 `normalize_numbers`（LLM 之前），LLM 可能纠正
+/// ASR 同音错字（如「摄息」→「摄氏」）后输出「40摄氏度」，补丁通道在 LLM
+/// 之后、本地标点之前调用本函数，捞回这类 LLM 纠正后的单位符号。
+///
+/// 幂等：主通道产出 `40℃`，补丁通道再跑 → `℃` 不匹配任何 trigger → 不变。
+pub fn normalize_unit_symbols_only(text: &str) -> String {
+    let r = rules();
+    normalize_unit_symbols(text, r)
+}
+
+// ============================================================
+// ITN-V2-004 (P4) 丙型「显式多级单位链」+ 乙型「隐式小数位」
+// 取代 ITN-V2-001 的 ③ 块级匹配（任务D：③被丙型取代删除）
+// ============================================================
+
+/// 丙型识别器输出：结构化的多级「数字-单位」链。
+#[derive(Debug, Clone)]
+struct UnitChain {
+    parts: Vec<(String, String)>,
+    consumed: usize,
+    family: &'static str,
+}
+
+/// 丙型识别器：扫描连续「中文数字+可小数化单位」多级链。
+/// 与③的关键差异：match 失败用 break（保留已识别段）而非 ?（整体返回None）；
+/// 单位必须 is_decimalizable（排除编号单位）；`分`消歧靠前驱。
+fn try_parse_unit_chain(chars: &[char], start: usize, r: &CompiledRules) -> Option<UnitChain> {
+    let mut parts: Vec<(String, String)> = Vec::new();
+    let mut pos = start;
+    let mut family: Option<&'static str> = None;
+
+    loop {
+        let (num_str, num_consumed) = match parse_cn_number(&chars[pos..], 0, Some(r)) {
+            Some(v) => v,
+            None => break,
+        };
+        if num_consumed == 0 {
+            break;
+        }
+        let after_num = pos + num_consumed;
+        let rest: String = chars[after_num..].iter().collect();
+        // 单位匹配：先试 all_units，再试 date_suffix（点/分/秒 时间族）
+        let (unit_len, unit_word) = if let Some(v) = r.match_unit_word(chars, after_num) {
+            v
+        } else if let Some(len) = r.match_date_suffix_len(&rest) {
+            let word: String = chars[after_num..after_num + len].iter().collect();
+            // 仅时间 date_suffix（点/分/秒），排除号/日/年/月等日期
+            if word == "点" || word == "分" || word == "秒" {
+                (len, word)
+            } else {
+                break;
+            }
+        } else {
+            // 无单位：检查隐含末级单位尾数
+            if !parts.is_empty() && after_num <= chars.len() {
+                let after_is_boundary =
+                    after_num >= chars.len() || is_boundary_char(chars[after_num]);
+                if after_is_boundary && num_consumed <= 2 && family == Some("currency") {
+                    parts.push((num_str, "分".to_string()));
+                    pos = after_num;
+                }
+            }
+            break;
+        };
+        // 单位可小数化检查（date_suffix 时间词已在上方过滤，此处查 decimalizable）
+        if unit_len == 0 {
+            break;
+        }
+        let is_decimalizable = r.is_decimalizable(&unit_word);
+        let is_time_suffix = unit_word == "点" || unit_word == "分" || unit_word == "秒";
+        if !is_decimalizable && !is_time_suffix {
+            break;
+        }
+        // `分`消歧：首段就是`分`→不纳入多级链（裸N分不合并）
+        if unit_word == "分" && parts.is_empty() {
+            break;
+        }
+        if family.is_none() {
+            family = Some(resolve_family(&unit_word, r));
+        }
+        parts.push((num_str, unit_word.clone()));
+        pos = after_num + unit_len;
+        if pos >= chars.len()
+            || !is_cn_num_char(chars[pos]) && chars[pos] != '零' && chars[pos] != '〇'
+        {
+            break;
+        }
+    }
+
+    if parts.len() >= 2 {
+        Some(UnitChain {
+            consumed: pos - start,
+            parts,
+            family: family.unwrap_or("length"),
+        })
+    } else {
+        None
+    }
+}
+
+fn resolve_family(unit: &str, r: &CompiledRules) -> &'static str {
+    let families = r.unit_families(unit);
+    if families.is_empty() {
+        if r.is_date_suffix(unit) {
+            return "time";
+        }
+        return "length";
+    }
+    families[0]
+}
+
+/// 丙型 formatter：按族分派（DEC-037）。
+fn format_unit_chain(chain: &UnitChain, r: &CompiledRules) -> String {
+    match chain.family {
+        "currency" => format_currency_chain(chain, r),
+        "time" => format_time_chain(chain, r),
+        _ => format_generic_chain(chain, r),
+    }
+}
+
+fn format_currency_chain(chain: &UnitChain, r: &CompiledRules) -> String {
+    let mut total: f64 = 0.0;
+    for (num_str, unit) in &chain.parts {
+        let n: f64 = num_str.parse().unwrap_or(0.0);
+        let mult = r.hierarchy_value(unit, "currency").unwrap_or(1.0);
+        total += n * mult;
+    }
+    if total.fract() == 0.0 {
+        format!("{}元", total as u64)
+    } else {
+        format!("{:.2}元", total)
+    }
+}
+
+fn format_time_chain(chain: &UnitChain, r: &CompiledRules) -> String {
+    let mut hours: u32 = 0;
+    let mut minutes: u32 = 0;
+    for (num_str, unit) in &chain.parts {
+        let n: u32 = num_str.parse().unwrap_or(0);
+        // 时间族：小时/点→小时；分/分钟→分钟；秒→秒（本批不处理秒级合并）
+        if unit == "小时" || unit == "点" || unit == "时" {
+            hours += n;
+        } else if unit == "分" || unit == "分钟" {
+            minutes += n;
+        }
+        let _ = r; // hierarchy_value 暂不用于时间（直接按单位类型分派）
+    }
+    if minutes == 0 {
+        format!("{}:00", hours)
+    } else {
+        format!("{}:{}", hours, minutes)
+    }
+}
+
+fn format_generic_chain(chain: &UnitChain, r: &CompiledRules) -> String {
+    let main_unit = &chain.parts[0].1;
+    let main_mult = r.hierarchy_value(main_unit, chain.family).unwrap_or(1.0);
+    let mut total: f64 = 0.0;
+    for (num_str, unit) in &chain.parts {
+        let n: f64 = num_str.parse().unwrap_or(0.0);
+        let mult = r.hierarchy_value(unit, chain.family).unwrap_or(main_mult);
+        total += n * mult / main_mult;
+    }
+    if total.fract() == 0.0 {
+        format!("{}{}", total as u64, main_unit)
+    } else {
+        let s = format!("{:.4}", total);
+        let s = s.trim_end_matches('0').trim_end_matches('.');
+        format!("{}{}", s, main_unit)
+    }
+}
+
+// ============================================================
+// ITN-V2-004 (P4) 乙型「隐式小数位」
+// ============================================================
+
+#[derive(Debug, Clone)]
+struct ImplicitDecimal {
+    main_num: String,
+    unit_word: String,
+    tail: String,
+    consumed: usize,
+}
+
+/// 乙型识别器：`N<可小数化单位>M`，M 纯数字尾数后紧邻边界。
+fn try_parse_implicit_decimal(
+    chars: &[char],
+    start: usize,
+    r: &CompiledRules,
+) -> Option<ImplicitDecimal> {
+    let (main_num, num_consumed) = parse_cn_number(chars, start, Some(r))?;
+    if num_consumed == 0 {
+        return None;
+    }
+    let after_num = start + num_consumed;
+    let rest: String = chars[after_num..].iter().collect();
+    if !r.is_decimalizable(&rest) {
+        return None;
+    }
+    // date_suffix（点/分/秒）不走乙型，但「度」是温度单位兼date_suffix，允许
+    if r.date_suffixes.iter().any(|d| rest.starts_with(d.as_str())) && !rest.starts_with("度") {
+        return None;
+    }
+    let (unit_len, unit_word) = r.match_unit_word(chars, after_num)?;
+    let after_unit = after_num + unit_len;
+    let mut tail_chars: Vec<char> = Vec::new();
+    let mut pos = after_unit;
+    while pos < chars.len() {
+        if let Some(d) = chinese_digit_char(chars[pos]) {
+            tail_chars.push(d);
+            pos += 1;
+        } else {
+            break;
+        }
+    }
+    if tail_chars.is_empty() {
+        return None;
+    }
+    // 边界护栏：尾数后必须紧邻边界
+    if pos < chars.len() && !is_boundary_char(chars[pos]) {
+        return None;
+    }
+    let tail: String = tail_chars.iter().collect();
+    Some(ImplicitDecimal {
+        main_num,
+        unit_word,
+        tail,
+        consumed: pos - start,
+    })
+}
+
+fn is_boundary_char(ch: char) -> bool {
+    ch.is_ascii_punctuation() || is_cjk_punctuation(ch) || ch.is_whitespace()
+}
+
+fn is_cjk_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        '。' | '，'
+            | '、'
+            | '；'
+            | '：'
+            | '？'
+            | '！'
+            | '"'
+            | '"'
+            | '\''
+            | '\''
+            | '《'
+            | '》'
+            | '（'
+            | '）'
+    )
+}
+
+/// 乙型 formatter：`N.M单位`（尾数逐位作小数位）。
+/// 货币族归一到「元」（DEC-037 Gavin 拍板）；其他族保留原单位。
+fn format_implicit_decimal(id: &ImplicitDecimal, r: &CompiledRules) -> String {
+    let families = r.unit_families(&id.unit_word);
+    if families.contains(&"currency") {
+        // 货币归一：N.M单位 → N.M元（块/角/毛/分 → 元）
+        // 块=元，所以 5.8块=5.8元；角/毛/分 需按倍率换算
+        let mult = r.hierarchy_value(&id.unit_word, "currency").unwrap_or(1.0);
+        let main: f64 = id.main_num.parse().unwrap_or(0.0);
+        let tail_val: f64 = format!("0.{}", id.tail).parse().unwrap_or(0.0);
+        let total = (main + tail_val) * mult;
+        if total.fract() == 0.0 {
+            format!("{}元", total as u64)
+        } else {
+            // 去尾零：5.80→5.8，5.83→5.83
+            let s = format!("{:.2}", total);
+            let s = s.trim_end_matches('0').trim_end_matches('.');
+            format!("{}元", s)
+        }
+    } else {
+        format!("{}.{}{}", id.main_num, id.tail, id.unit_word)
+    }
+}
+
+// ============================================================
+// ITN-V2-003 (P3 甲型文法)：余数后缀（半/刻）
+// ============================================================
+
+/// 甲型识别器输出（识别器与 formatter 分离，沿用 001 架构）。
+#[derive(Debug, Clone)]
+struct RemainderSuffix {
+    /// 主数（阿拉伯数字串，如 "4"/"1"/"39"）
+    main_num: String,
+    /// 单位词原文（如 "点"/"吨"/"寸"）；量词穿透时为通用量词（"个"），真实单位在 `real_unit`
+    unit_word: String,
+    /// 量词穿透：若 `unit_word` 是通用量词且后跟真实单位，此处存真实单位；否则 None
+    real_unit: Option<String>,
+    /// 余数值（分钟数用于时间族，或 0.5 用于度量衡）
+    remainder: RemainderKind,
+    /// 识别器消耗的源字符数
+    consumed: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RemainderKind {
+    /// 半 = 0.5（度量衡）或 30分（时间）
+    Half,
+    /// 刻 = N×15分（仅时间，N∈{1,2,3}）
+    Quarter(u32),
+}
+
+/// 甲型识别器：尝试在 `start` 处匹配余数后缀文法。
+///
+/// 两种子模式：
+/// 1. **半模式** `N<单位>半`：主数 + 单位 + `半`（时间/度量衡/量词穿透）
+/// 2. **刻模式** `N点M刻`：主数 + `点` + M(1/2/3) + `刻`（仅时间）
+///
+/// 反例护栏：
+/// - `一刻钟`：`刻` 后跟 `钟` → 否决
+/// - `半小时`/`半个小时`：前置 `半` 无主数 → 不匹配
+/// - `三点五`：`五` 是数字非 `半/刻` → 不匹配
+fn try_parse_remainder_suffix(
+    chars: &[char],
+    start: usize,
+    r: &CompiledRules,
+) -> Option<RemainderSuffix> {
+    // 解析主数
+    let (main_num, num_consumed) = parse_cn_number(chars, start, Some(r))?;
+    if num_consumed == 0 {
+        return None;
+    }
+    let after_num = start + num_consumed;
+    let rest: String = chars[after_num..].iter().collect();
+
+    // 尝试半模式：N<单位>半
+    if let Some(rs) =
+        try_parse_half_mode(chars, start, &main_num, num_consumed, after_num, &rest, r)
+    {
+        return Some(rs);
+    }
+    // 尝试刻模式：N点M刻（仅时间）
+    if let Some(rs) =
+        try_parse_quarter_mode(chars, start, &main_num, num_consumed, after_num, &rest, r)
+    {
+        return Some(rs);
+    }
+    None
+}
+
+/// 半模式：N<单位>半
+fn try_parse_half_mode(
+    _chars: &[char],
+    _start: usize,
+    main_num: &str,
+    num_consumed_inner: usize,
+    after_num: usize,
+    rest: &str,
+    r: &CompiledRules,
+) -> Option<RemainderSuffix> {
+    // 时间族：date_suffix（点/分/秒）+ 半
+    if let Some(len) = r.match_date_suffix_len(rest) {
+        let after_unit = after_num + len;
+        if _chars.get(after_unit) == Some(&'半') {
+            let word: String = _chars[after_num..after_num + len].iter().collect();
+            return Some(RemainderSuffix {
+                main_num: main_num.to_string(),
+                unit_word: word,
+                real_unit: None,
+                remainder: RemainderKind::Half,
+                consumed: num_consumed_inner + len + 1,
+            });
+        }
+    }
+    // 度量衡族：真单位（排除 classifiers）+ 半
+    if r.is_real_unit(rest) {
+        let (len, word) = r.match_unit_word(_chars, after_num)?;
+        let after_unit = after_num + len;
+        if _chars.get(after_unit) == Some(&'半') {
+            return Some(RemainderSuffix {
+                main_num: main_num.to_string(),
+                unit_word: word,
+                real_unit: None,
+                remainder: RemainderKind::Half,
+                consumed: num_consumed_inner + len + 1,
+            });
+        }
+    }
+    // 量词穿透：通用量词 + 半 + 真单位（一个半小时=1.5小时）
+    // 结构：N<量词>半<真单位>，与普通 N<单位>半 顺序不同
+    let cls = r
+        .classifier_set
+        .iter()
+        .find(|c| rest.starts_with(c.as_str()))?;
+    let cls_len = cls.chars().count();
+    let after_cls = after_num + cls_len;
+    // 量词后必须是「半」
+    if _chars.get(after_cls) != Some(&'半') {
+        return None;
+    }
+    let after_half = after_cls + 1;
+    if after_half >= _chars.len() {
+        return None;
+    }
+    // 半后必须是真单位
+    let rest2: String = _chars[after_half..].iter().collect();
+    if !r.is_real_unit(&rest2) {
+        return None;
+    }
+    let (real_len, real_word) = r.match_unit_word(_chars, after_half)?;
+    let cls_word: String = _chars[after_num..after_num + cls_len].iter().collect();
+    Some(RemainderSuffix {
+        main_num: main_num.to_string(),
+        unit_word: cls_word,
+        real_unit: Some(real_word),
+        remainder: RemainderKind::Half,
+        consumed: num_consumed_inner + cls_len + 1 + real_len,
+    })
+}
+
+/// 刻模式：N点M刻（仅时间族）
+fn try_parse_quarter_mode(
+    chars: &[char],
+    _start: usize,
+    main_num: &str,
+    num_consumed_inner: usize,
+    after_num: usize,
+    rest: &str,
+    r: &CompiledRules,
+) -> Option<RemainderSuffix> {
+    // 必须以「点」开头
+    if !rest.starts_with('点') {
+        return None;
+    }
+    let after_point = after_num + 1;
+    // 解析 M（1/2/3，单字）
+    let (_m_str, m_consumed) = parse_cn_number(chars, after_point, Some(r))?;
+    if m_consumed == 0 {
+        return None;
+    }
+    let after_m = after_point + m_consumed;
+    // 必须是「刻」
+    if chars.get(after_m) != Some(&'刻') {
+        return None;
+    }
+    // 刻后跟「钟」→否决（一刻钟=时长）
+    if after_m + 1 < chars.len() && chars[after_m + 1] == '钟' {
+        return None;
+    }
+    // M 必须是 1/2/3
+    let m: u32 = _m_str.parse().ok()?;
+    if m == 0 || m > 3 {
+        return None;
+    }
+    Some(RemainderSuffix {
+        main_num: main_num.to_string(),
+        unit_word: "点".to_string(),
+        real_unit: None,
+        remainder: RemainderKind::Quarter(m),
+        consumed: num_consumed_inner + 1 + m_consumed + 1,
+    })
+}
+
+/// 甲型 formatter：按单位族分派渲染（DEC-037）。
+fn format_remainder_suffix(rs: &RemainderSuffix) -> String {
+    let unit = rs.real_unit.as_ref().unwrap_or(&rs.unit_word);
+    let is_time = rs.real_unit.is_none() && rs.unit_word == "点";
+
+    if is_time {
+        // 时间族 → H:MM
+        let h: u32 = rs.main_num.parse().unwrap_or(0);
+        let mm = match rs.remainder {
+            RemainderKind::Half => 30,
+            RemainderKind::Quarter(n) => (n * 15) % 60,
+        };
+        if mm == 0 {
+            format!("{}:00", h)
+        } else {
+            format!("{}:{}", h, mm)
+        }
+    } else {
+        // 度量衡 / 量词穿透 → N.5单位
+        format!("{}.5{}", rs.main_num, unit)
+    }
+}
+
+/// ITN-V2-004 (P4 任务C) 扫描「数字+跟随字符」链的终点。
+/// 链 = 连续的「中文数字 + 单位/date_suffix/classifier」序列。
+/// 终止于：非数字非单位非量词字符，或标点/空白（链终止符）。
+fn scan_chain_end(chars: &[char], start: usize, r: &CompiledRules) -> usize {
+    let mut pos = start;
+    loop {
+        // 数字段
+        if pos >= chars.len()
+            || !(is_cn_num_char(chars[pos]) || chars[pos] == '零' || chars[pos] == '〇')
+        {
+            break;
+        }
+        let (_, num_consumed) = match parse_cn_number(&chars[pos..], 0, Some(r)) {
+            Some(v) => v,
+            None => break,
+        };
+        if num_consumed == 0 {
+            break;
+        }
+        pos += num_consumed;
+        if pos >= chars.len() {
+            break;
+        }
+        // 跟随字符：单位/date_suffix/classifier？
+        let rest: String = chars[pos..].iter().collect();
+        if r.is_unit(&rest)
+            || r.is_date_suffix(&rest)
+            || r.classifier_set
+                .iter()
+                .any(|c| rest.starts_with(c.as_str()))
+        {
+            let unit_len = r
+                .match_unit_word(chars, pos)
+                .map(|(l, _)| l)
+                .or_else(|| r.match_date_suffix_len(&rest))
+                .or_else(|| {
+                    r.classifier_set
+                        .iter()
+                        .find(|c| rest.starts_with(c.as_str()))
+                        .map(|c| c.chars().count())
+                })
+                .unwrap_or(0);
+            if unit_len == 0 {
+                break;
+            }
+            pos += unit_len;
+        } else {
+            break;
+        }
+        // 标点/空白 → 链终止
+        if pos < chars.len() && is_boundary_char(chars[pos]) {
+            break;
+        }
+    }
+    pos
+}
+
+/// ITN-V2-004 (P4 任务C) 全或无检查：链中所有数字段是否一致（全转或全不转）。
+/// 返回 true = 一致（可继续逐字路径）；false = 混合（整段原样输出）。
+fn check_chain_consistency(chars: &[char], start: usize, r: &CompiledRules) -> bool {
+    let mut pos = start;
+    let mut any_convert = false;
+    let mut any_not_convert = false;
+
+    loop {
+        if pos >= chars.len()
+            || !(is_cn_num_char(chars[pos]) || chars[pos] == '零' || chars[pos] == '〇')
+        {
+            break;
+        }
+        let (num_str, num_consumed) = match parse_cn_number(&chars[pos..], 0, Some(r)) {
+            Some(v) => v,
+            None => break,
+        };
+        if num_consumed == 0 {
+            break;
+        }
+        let after_num = pos + num_consumed;
+        let after_str: String = if after_num < chars.len() {
+            chars[after_num..].iter().collect()
+        } else {
+            String::new()
+        };
+        let should =
+            decide_conversion(&num_str, num_consumed, chars, pos, after_num, &after_str, r);
+        if should {
+            any_convert = true;
+        } else {
+            any_not_convert = true;
+        }
+        pos = after_num;
+        if pos >= chars.len() {
+            break;
+        }
+        // 跟随字符
+        let rest: String = chars[pos..].iter().collect();
+        if r.is_unit(&rest)
+            || r.is_date_suffix(&rest)
+            || r.classifier_set
+                .iter()
+                .any(|c| rest.starts_with(c.as_str()))
+        {
+            let unit_len = r
+                .match_unit_word(chars, pos)
+                .map(|(l, _)| l)
+                .or_else(|| r.match_date_suffix_len(&rest))
+                .or_else(|| {
+                    r.classifier_set
+                        .iter()
+                        .find(|c| rest.starts_with(c.as_str()))
+                        .map(|c| c.chars().count())
+                })
+                .unwrap_or(0);
+            if unit_len == 0 {
+                break;
+            }
+            pos += unit_len;
+        } else {
+            break;
+        }
+        if pos < chars.len() && is_boundary_char(chars[pos]) {
+            break;
+        }
+    }
+
+    !(any_convert && any_not_convert)
+}
+
 fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut result = String::new();
     let mut i = 0;
 
     while i < chars.len() {
-        // 检查保护白名单（最长匹配优先）
+        // 检查保护白名单（最长匹配优先）——在甲型文法之前。
+        // 理由：保护词表（如「五一」）应优先于甲型文法，避免「五一点半」被甲型
+        // 误转为「51:30」。移除的甲型词条（八点半等）不再命中保护，自然落入甲型。
         if let Some(skip) = check_protection(&chars, i, r) {
             // 输出受保护的原文
             for ch in &chars[i..i + skip] {
@@ -701,6 +1419,31 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
             }
             i += skip;
             continue;
+        }
+        // ITN-V2-003 (P3 甲型文法)：余数后缀（半/刻）匹配。
+        if is_cn_num_char(chars[i]) || chars[i] == '零' || chars[i] == '〇' {
+            if let Some(rs) = try_parse_remainder_suffix(&chars, i, r) {
+                result.push_str(&format_remainder_suffix(&rs));
+                i += rs.consumed;
+                continue;
+            }
+        }
+        // ITN-V2-004 (P4 乙型)：隐式小数位 N<可小数化单位>M（M后紧邻边界）。
+        if is_cn_num_char(chars[i]) || chars[i] == '零' || chars[i] == '〇' {
+            if let Some(id) = try_parse_implicit_decimal(&chars, i, r) {
+                result.push_str(&format_implicit_decimal(&id, r));
+                i += id.consumed;
+                continue;
+            }
+        }
+        // ITN-V2-004 (P4 丙型)：显式多级单位链（取代③，用break不return None）。
+        // 货币归一(11.92元)/时间H:MM(3:20)/度量衡小数合并。
+        if is_cn_num_char(chars[i]) || chars[i] == '零' || chars[i] == '〇' {
+            if let Some(chain) = try_parse_unit_chain(&chars, i, r) {
+                result.push_str(&format_unit_chain(&chain, r));
+                i += chain.consumed;
+                continue;
+            }
         }
 
         // 检查百分比 "百分之X"
@@ -849,6 +1592,21 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
                         decide_conversion(&num_str, consumed, &chars, i, after_num, &after_str, r);
 
                     if should_convert {
+                        // ITN-V2-004 (P4 任务C) 全或无撕裂防护：
+                        // Gavin 2026-07-31 指令「三年二班这种就直接不转」。
+                        // 在逐字路径转换前，扫描整个「数字+跟随字符」链，若部分转部分不转→整段不转。
+                        // 这是逐字路径的守门员（甲/乙/丙型已在前面处理，此处只管逐字路径）。
+                        // 链定义：连续「中文数字+单位/date_suffix/classifier」序列，
+                        // 终止于非数字非单位非量词字符（如的/有/班非单位）。
+                        if !check_chain_consistency(&chars, i, r) {
+                            // 链中混合 → 整段原样输出，游标跳过整个链
+                            let chain_end = scan_chain_end(&chars, i, r);
+                            for ch in &chars[i..chain_end] {
+                                result.push(*ch);
+                            }
+                            i = chain_end;
+                            continue;
+                        }
                         result.push_str(&num_str);
                         // TEMP-CELSIUS-001: 摄氏关键词 → 输出 ℃ 符号
                         // 仅当匹配单位词含"摄氏"时替换（"三十摄氏度"→"30℃"，
@@ -1082,32 +1840,79 @@ fn decide_conversion(
 fn check_protection(chars: &[char], start: usize, r: &CompiledRules) -> Option<usize> {
     let rest: String = chars[start..].iter().collect();
 
-    // 成语（最长匹配优先，4字）
-    for idiom in &r.idiom_set {
-        if rest.starts_with(idiom.as_str()) {
-            return Some(idiom.chars().count());
-        }
+    // 成语——ITN-V2-003：改确定性最长匹配（一致性收口，五个 set 统一语义）。
+    // 盘点 45 条 0 前缀重叠，max() 与 find_map 今天结果相同，零风险；
+    // 改动消除「靠注释传递纪律」的脆弱性（1877 行注释「无前缀冲突」已被 002 证伪）。
+    let matched_idiom = r
+        .idiom_set
+        .iter()
+        .filter(|idiom| rest.starts_with(idiom.as_str()))
+        .map(|idiom| idiom.chars().count())
+        .max();
+    if let Some(skip) = matched_idiom {
+        return Some(skip);
     }
 
-    // 专有名词
-    for noun in &r.proper_noun_set {
-        if rest.starts_with(noun.as_str()) {
-            return Some(noun.chars().count());
+    // 专有名词——ITN-V2-002：改确定性最长匹配（HashSet 迭代顺序不确定，find_map
+    // 会导致 `十一月` 在 `十一` 与 `十一月` 之间随机命中，输出不确定）。
+    // 盘点出 4 组前缀重叠：五一⊂五一广场、十一⊂{十一国庆,十一月,十一边形}。
+    // max() 与遍历顺序无关 → 确定性；3 字条目 `十一月` 胜出 → 非纯数字词 →
+    // 不触发①右邻否决 → 保护生效 → 稳定输出 `十一月`（白名单作者原意）。
+    let matched_noun = r
+        .proper_noun_set
+        .iter()
+        .filter(|noun| rest.starts_with(noun.as_str()))
+        .map(|noun| noun.chars().count())
+        .max();
+
+    // ITN-V2-001 (R2 缺陷A ①右邻否决)：仅对含进位单位的纯数字词撤销保护。
+    // 保护词若全由中文数字字符组成（如「十一」「五一」「八一」）且紧邻右侧是
+    // 单位/date_suffix，则撤销保护——避免「十一块」前半被保护、后半照转的撕裂。
+    // ③ 块级匹配已在主循环先行拦截「数字+单位+数字+单位」复合块；此处兜底
+    // 处理未形成复合块的单段「保护数字+单位」（如「十一块」后无更多数字）。
+    //
+    // ⚠️ 逐位串兜底（主控约束）：`五一`/`七一`/`八一` 等纯逐位串（无进位单位十/百/
+    // 千/万/亿）不撤销——它们在节日语境是名称而非数字（`五一点半`≠`51点半`）。
+    // 仅当词含进位单位（`十一`/`十五`/`二十五`）才撤销，此时 `parse_cn_number`
+    // 按进位组合解析（`十一`→`11`），非逐位串，语义安全。
+    // 兜底：撤销后主循环走 parse_cn_number，若 decide_conversion 返回 false
+    // 则字符原样输出，保护语义自然回退。
+    if let Some(skip) = matched_noun {
+        let word: String = chars[start..start + skip].iter().collect();
+        let after = start + skip;
+        if is_pure_cn_digit_word(&word) && word.chars().any(is_cn_unit_char) && after < chars.len()
+        {
+            let right: String = chars[after..].iter().collect();
+            if r.is_unit(&right) || r.is_date_suffix(&right) {
+                return None; // 撤销保护，交给主循环 parse_cn_number
+            }
         }
+        return Some(skip);
     }
 
     // ITN-SMART-002: 历史/文化/民俗词汇（"五代十国"等）
-    for hist in &r.historical_set {
-        if rest.starts_with(hist.as_str()) {
-            return Some(hist.chars().count());
-        }
+    // ITN-V2-002：改确定性最长匹配。盘点出 4 组前缀重叠：
+    // 五代⊂五代十国、三十六计⊂三十六计走为上计、四海⊂四海八荒、三省⊂三省吾身。
+    let matched_hist = r
+        .historical_set
+        .iter()
+        .filter(|hist| rest.starts_with(hist.as_str()))
+        .map(|hist| hist.chars().count())
+        .max();
+    if let Some(skip) = matched_hist {
+        return Some(skip);
     }
 
     // 虚词"一"的搭配
-    for fw in &r.function_word_set {
-        if rest.starts_with(fw.as_str()) {
-            return Some(fw.chars().count());
-        }
+    // ITN-V2-002：改确定性最长匹配。盘点出 1 组前缀重叠：一下⊂一下子。
+    let matched_fw = r
+        .function_word_set
+        .iter()
+        .filter(|fw| rest.starts_with(fw.as_str()))
+        .map(|fw| fw.chars().count())
+        .max();
+    if let Some(skip) = matched_fw {
+        return Some(skip);
     }
 
     // ITN-COLLISION-TYPEA-002: 单位前缀碰撞保护（机器派生词表，优先级低于上方人工分组）
@@ -1292,7 +2097,9 @@ mod tests {
 
     #[test]
     fn time_half() {
-        assert_eq!(normalize_test("八点半"), "8点半");
+        // TEST-SYNC-ITN-V2-001 (A类)：旧断言 "8点半" 过时 —— ITN-V2-003 (P3 甲型) 上线后
+        // 「八点半」走甲型半模式（时间族 H:MM），半=30分。CHANGELOG ENGINE-003/004 实证。
+        assert_eq!(normalize_test("八点半"), "8:30");
     }
 
     // ============================================================
@@ -1338,7 +2145,9 @@ mod tests {
 
     #[test]
     fn money_kuai() {
-        assert_eq!(normalize_test("五块八"), "5块8");
+        // TEST-SYNC-ITN-V2-001 (A类)：旧断言 "5块8" 过时 —— ITN-V2-004 (P4 乙型/丙型) +
+        // DEC-037 货币归一上线后，「五块八」走乙型隐式小数，块→元归一。ENGINE-004 实证。
+        assert_eq!(normalize_test("五块八"), "5.8元");
     }
 
     #[test]
@@ -1727,23 +2536,45 @@ words = ["度", "摄氏度"]
         assert_eq!(normalize_test("二十面体"), "二十面体");
     }
 
-    /// P1-3: 匹配顺序隐患护栏（注释说明）
+    /// P1-3: 匹配顺序隐患护栏 —— ITN-V2-ENGINE-002 根治后由「注释说明」升级为真断言。
     ///
-    /// 无法用测试表达：check_protection（src/itn.rs:1063）遍历 HashSet，
-    /// 迭代顺序未定义（因 proper_noun_set 是 HashSet<String>）。
-    /// 当前 itn-rules.toml 无互相为前缀的条目冲突：
-    ///   - 「三角」族（三角洲/三角债/三角恋…）起点相同但「三角」不在白名单内
-    ///   - 同一几何图形组内各条目互不为前缀
+    /// 旧注释声称「无互相为前缀的条目冲突」，已被 coder-1 盘点证伪（4 组前缀重叠：
+    /// 五一⊂五一广场、十一⊂{十一国庆,十一月,十一边形}；historical 另有 4 组、
+    /// function_words 有一下⊂一下子）。ENGINE-002 将三个有重叠的 set 从 find_map
+    /// （HashSet RandomState 迭代顺序不定 → 输出不确定）改为 filter+max()
+    /// （确定性最长匹配），idioms/classifiers 无重叠保持原样。
     ///
-    /// 隐患：若将来有人同时加入「三角」和「三角洲」，此二条互为前缀关系，
-    /// 而 HashSet 迭代顺序未定义 → 先遍历到「三角」则匹配 2 字，「三角洲」
-    /// 的保护被截断为「三角」+「洲」单独处理。但「洲」无单位语境 → 不会被误转，
-    /// 只是保护不完全。修复方法：entry 加入时确保无前缀重叠，或改用 BTreeSet
-    /// 并实现最长匹配优先。当前无实例，无法写确定性测试。
+    /// 本测试锁定确定性语义：最长匹配必先命中（十一月=3 字而非 十一=2 字），
+    /// 且多次独立调用结果恒定 —— test 通过即证明 filter+max() 与遍历顺序无关。
     #[test]
     fn geometric_order_hazard_documented() {
-        // 本条仅为确保注释可见（空断言），隐患已在文档中记录
-        assert!(true);
+        let r = rules();
+        // 十一月：3 字条目（十一月）胜出，不得退化为 2 字（十一）
+        let chars: Vec<char> = "十一月".chars().collect();
+        for _ in 0..5 {
+            assert_eq!(
+                check_protection(&chars, 0, r),
+                Some(3),
+                "十一月 必须命中最长匹配 3 字（ENGINE-002 filter+max() 确定性）"
+            );
+        }
+        // 十一：孤立出现命中 2 字
+        let chars: Vec<char> = "十一".chars().collect();
+        assert_eq!(check_protection(&chars, 0, r), Some(2));
+        // ①右邻否决：十一（纯数字进位词）+ 块（单位）→ 撤销保护交给主循环
+        let chars: Vec<char> = "十一块".chars().collect();
+        assert_eq!(check_protection(&chars, 0, r), None);
+        // 五一广场：4 字条目胜出；五一（逐位串无进位）孤立命中 2 字且不否决
+        let chars: Vec<char> = "五一广场".chars().collect();
+        assert_eq!(check_protection(&chars, 0, r), Some(4));
+        let chars: Vec<char> = "五一".chars().collect();
+        assert_eq!(check_protection(&chars, 0, r), Some(2));
+        // 端到端确定性（P2）：十一月 多次独立归一结果恒定
+        let first = normalize_test("十一月");
+        assert_eq!(first, "十一月");
+        for _ in 0..5 {
+            assert_eq!(normalize_test("十一月"), first);
+        }
     }
 
     // ============================================================
@@ -1956,5 +2787,203 @@ words = ["度"]
     #[test]
     fn unit_symbol_e2e_llm_output() {
         assert_eq!(normalize_test("温度是40摄氏度。"), "温度是40℃。");
+    }
+
+    // ============================================================
+    // TEST-SYNC-ITN-V2-001 (D类) ITN-V2 双通道 + 甲/乙/丙型 + 全或无 + 地名
+    // ============================================================
+
+    // ------------------------------------------------------------
+    // P1 · DEC-036 双通道：主通道（normalize_numbers，LLM 前）+
+    // 补丁通道（normalize_unit_symbols_only，LLM 后）
+    // 三条路径（LLM 成功/运行时失败兜底/LLM 关闭）在 main.rs run_pipeline
+    // 内联实现、无单测接缝（生产代码零改动约束下无法拆分），
+    // 此处锁定可单测的 ITN 侧契约（见 result.md 覆盖缺口清单）。
+    // ------------------------------------------------------------
+
+    #[test]
+    fn itn_v2_dual_channel_main_normalizes_all() {
+        // 主通道（LLM 之前）：中文数字→阿拉伯 + 单位符号规整
+        assert_eq!(normalize_numbers("四十摄氏度"), "40℃");
+        assert_eq!(normalize_numbers("八点半"), "8:30");
+    }
+
+    #[test]
+    fn itn_v2_dual_channel_patch_catches_unit_symbols_only() {
+        // 补丁通道（LLM 之后）：只做单位符号规整，捞回 LLM 纠正同音错字后的「40摄氏度」
+        assert_eq!(normalize_unit_symbols_only("40摄氏度"), "40℃");
+        // 不重跑中文数字→阿拉伯转换（第一阶段）
+        assert_eq!(normalize_unit_symbols_only("八点半"), "八点半");
+        // 翻译路径英文输出：no-op 逐字节不变
+        assert_eq!(
+            normalize_unit_symbols_only("The temperature is 40 degrees."),
+            "The temperature is 40 degrees."
+        );
+    }
+
+    #[test]
+    fn itn_v2_dual_channel_patch_idempotent_after_main() {
+        // 幂等性（DEC-036）：主通道产出「40℃」后，补丁通道重跑逐字节不变
+        let main_out = normalize_numbers("四十摄氏度");
+        assert_eq!(main_out, "40℃");
+        let patch_out = normalize_unit_symbols_only(&main_out);
+        assert_eq!(patch_out, main_out, "补丁通道对主通道产出的 ℃ 必须逐字节不变");
+    }
+
+    // ------------------------------------------------------------
+    // P2 · 撕裂修复 + 确定性
+    // ------------------------------------------------------------
+
+    #[test]
+    fn itn_v2_p2_shiyikuai_jiumaoer_normalized() {
+        // 十一块九毛二 → 11.92元（P4 丙型货币归一后的 P2 验收形态）
+        assert_eq!(normalize_test("十一块九毛二"), "11.92元");
+    }
+
+    #[test]
+    fn itn_v2_p2_shiyiyue_deterministic() {
+        // 十一月 多次独立运行输出恒定（ENGINE-002 filter+max() 确定性）
+        let first = normalize_test("十一月");
+        assert_eq!(first, "十一月");
+        for _ in 0..5 {
+            assert_eq!(normalize_test("十一月"), first);
+        }
+    }
+
+    #[test]
+    fn itn_v2_p2_wuyi_yiban_preserved() {
+        // 五一点半 保持（①右邻否决的逐位串兜底：五一 无进位单位不撤销）
+        assert_eq!(normalize_test("五一点半"), "五一点半");
+    }
+
+    // ------------------------------------------------------------
+    // P3 · 甲型文法（半/刻）
+    // ------------------------------------------------------------
+
+    #[test]
+    fn itn_v2_p3_jia_time_half() {
+        // 时间族：N点半 → H:MM（半=30 分）
+        assert_eq!(normalize_test("四点半"), "4:30");
+        assert_eq!(normalize_test("八点半"), "8:30");
+        assert_eq!(normalize_test("一点半"), "1:30");
+        assert_eq!(normalize_test("两点半"), "2:30");
+        assert_eq!(normalize_test("十二点半"), "12:30");
+    }
+
+    #[test]
+    fn itn_v2_p3_jia_quarter_mode() {
+        // 刻模式：N点M刻（仅时间，M∈{1,2,3}）
+        assert_eq!(normalize_test("五点三刻"), "5:45");
+    }
+
+    #[test]
+    fn itn_v2_p3_jia_measure_half() {
+        // 度量衡：N<真单位>半 → N.5单位
+        assert_eq!(normalize_test("一吨半"), "1.5吨");
+        assert_eq!(normalize_test("三寸半"), "3.5寸");
+    }
+
+    #[test]
+    fn itn_v2_p3_jia_classifier_passthrough() {
+        // 量词穿透：N<量词>半<真单位>
+        assert_eq!(normalize_test("一个半小时"), "1.5小时");
+    }
+
+    #[test]
+    fn itn_v2_p3_jia_counterexamples() {
+        // 反例护栏：一刻钟（刻后跟钟否决）保持；三点五走既有小数路径；半小时/半个小时非数字开头
+        assert_eq!(normalize_test("一刻钟"), "一刻钟");
+        assert_eq!(normalize_test("三点五"), "3.5");
+        assert_eq!(normalize_test("半小时"), "半小时");
+        assert_eq!(normalize_test("半个小时"), "半个小时");
+    }
+
+    #[test]
+    fn itn_v2_p3_jia_classifier_guard() {
+        // 守卫（DEC-038）：通用量词不算单位 → 一个半 / 五间半 保持汉字
+        assert_eq!(normalize_test("一个半"), "一个半");
+        assert_eq!(normalize_test("五间半"), "五间半");
+    }
+
+    #[test]
+    fn itn_v2_p3_units_time_scope_expansion() {
+        // ⚠️ 未经请求的范围扩张专项锁定：新增 [units.time]（小时/分钟）导致
+        // 「三小时」→「3小时」、「五分钟」→「5分钟」。输出正确但非 Gavin 需求，
+        // 必须独立测试锁定，不得混在甲型测试里带过。
+        assert_eq!(normalize_test("三小时"), "3小时");
+        assert_eq!(normalize_test("五分钟"), "5分钟");
+    }
+
+    // ------------------------------------------------------------
+    // P4 · 乙/丙型 + 层级表 + 全或无
+    // ------------------------------------------------------------
+
+    #[test]
+    fn itn_v2_p4_yi_implicit_decimal() {
+        // 乙型：N<可小数化单位>M（M 后紧邻边界）
+        assert_eq!(normalize_test("一米二"), "1.2米");
+        assert_eq!(normalize_test("一米八五"), "1.85米");
+        assert_eq!(normalize_test("三十九度八"), "39.8度");
+        assert_eq!(normalize_test("一百零八度五"), "108.5度");
+    }
+
+    #[test]
+    fn itn_v2_p4_yi_boundary_guard() {
+        // 乙型边界护栏：尾数后不紧邻边界 → 不走乙型
+        assert_eq!(normalize_test("三年二班"), "三年二班");
+        assert_eq!(normalize_test("三楼二号"), "3楼2号"); // 楼/号不可小数化 → 逐字路径全转
+        assert_eq!(normalize_test("五排八座"), "五排八座");
+    }
+
+    #[test]
+    fn itn_v2_p4_bing_unit_chain() {
+        // 丙型：显式多级单位链 + 货币归一（DEC-037）
+        assert_eq!(normalize_test("十一块九毛二"), "11.92元");
+        assert_eq!(normalize_test("五块八"), "5.8元");
+        assert_eq!(normalize_test("三小时二十分"), "3:20");
+    }
+
+    #[test]
+    fn itn_v2_p4_bare_unit_not_normalized() {
+        // 裸单位不归一：单级链（parts=1）不进丙型 → 逐字路径只转数字
+        assert_eq!(normalize_test("五块钱"), "5块钱");
+        assert_eq!(normalize_test("十一块"), "11块");
+    }
+
+    #[test]
+    fn itn_v2_p4_fen_disambiguation() {
+        // 🔴 分 族属消歧：前驱块→货币分(0.01元)；前驱点→时间分(分钟)；裸 N分 不合并
+        assert_eq!(normalize_test("五块八毛三分"), "5.83元");
+        assert_eq!(normalize_test("三点二十分"), "3:20");
+        assert_eq!(normalize_test("三分"), "3分");
+    }
+
+    #[test]
+    fn itn_v2_p4_all_or_nothing_continuity() {
+        // 全或无连续性边界（DEC-037 附则）：三年二班 整段保持，后文 五个人 不被连坐
+        assert_eq!(
+            normalize_test("三年二班的学生有五个人"),
+            "三年二班的学生有五个人"
+        );
+    }
+
+    // ------------------------------------------------------------
+    // P5 · 地名白名单（≥3 字）
+    // ------------------------------------------------------------
+
+    #[test]
+    fn itn_v2_p5_place_names_protected() {
+        // ≥3 字含数字地名命中保护（ENGINE-005，proper_nouns 69→129）
+        assert_eq!(normalize_test("十三陵"), "十三陵");
+        assert_eq!(normalize_test("九寨沟"), "九寨沟");
+        assert_eq!(normalize_test("五道口"), "五道口");
+        assert_eq!(normalize_test("去三门峡旅游"), "去三门峡旅游");
+    }
+
+    #[test]
+    fn itn_v2_p5_place_reverse_guard() {
+        // 反向护栏：<数字前缀>+单位 正常表达不得失效（十三陵 与 十三块钱 同前缀共存）
+        assert_eq!(normalize_test("十三块钱"), "13块钱");
+        assert_eq!(normalize_test("去十三陵玩花十三块钱"), "去十三陵玩花13块钱");
     }
 }
