@@ -1,5 +1,35 @@
 # handoffs · voice-ime
 
+## 2026-07-31 — coder-2 — ITN-V2-PROMPT-002 ✅ 修复 flatten_multiline 分隔符叠加畸形（P2 补丁）
+
+- **来源**：主控验收 ITN-V2-PROMPT-001 时独立取证发现 `flatten_multiline` 与新指令的接缝缺陷
+- **范围**：仅 `src/llm/mod.rs`（`flatten_multiline` + 新增守卫函数 + 5 条单测）
+- **改动**：
+  1. `flatten_multiline(:751)` 推入 `；` 前新增守卫：若 `out` 末字符已是分隔符或终止标点（`；、，。！？…：;,.!?`），则不再追加 `；`。
+  2. 新增 `ends_with_separator_or_terminal(:771)`，覆盖中英全角/半角共 13 种标点。
+  3. 补 5 条单测：`guard_semicolon_doubling` / `guard_comma_doubling` / `guard_period_doubling` / `guard_no_false_positive`（反向护栏） / `guard_idempotent_after_guard`。
+- **畸形消除实证**：
+  - `早上要开会；\n下午要写报告` → `早上要开会；下午要写报告`（旧：`；；`）
+  - `苹果、香蕉、\n橘子` → `苹果、香蕉、橘子`（旧：`、；`）
+  - `xxx。\nyyy` → `xxx。yyy`（旧：`。；`）
+  - 反向护栏：`正常一行\n正常两行` → `正常一行；正常两行`（无尾标时仍正确加 `；`）
+- **自验**：`cargo check` / `cargo check --tests` 0 errors；`cargo test --bin feiyin-ime flatten_multiline` 9 passed / 0 failed（4 既有 + 5 新增）。幂等性 `flatten(flatten(x)) == flatten(x)` 通过。
+- **边界**：`src/itn.rs`/`itn-rules.toml`/`scene-rules.toml` 零触碰；未 `cargo build --release`/出包/启动 exe；未 `npm install`/`npm ci`；未改版本号；未用 git 破坏命令
+- **下游需知**：本补丁与 ITN-V2-PROMPT-001 的 F3 假分支指令配套——新指令提高了行尾带分隔符的概率，而 `flatten_multiline` 的守卫是确定性兜底。两者合起来才完整闭合。
+
+## 2026-07-31 — coder-2 — ITN-V2-PROMPT-001 ✅ LLM 指令强化 + 列表智能 + scene-rules.toml 审查
+
+- **来源**：Gavin 2026-07-31 需求 1（LLM 改写数值/时间）+ 需求 4（列表智能），任务书见 `collab/inbox/coder-2/task.md`
+- **范围**：仅 `src/llm/mod.rs` + `scene-rules.toml` 审查（零改动）
+- **改动**：
+  1. `UNIT_SYMBOL_PROTECTION`（:29）追加事实保全语义——禁止数值重算、时间替换、日期改写；同步 `UNIT_SYMBOL_PROTECTION_TRANSLATE`（:30）追加等价语义，不引入「不要翻译」语义（单测 `translate_path_unit_symbol_protection_no_do_not_translate_semantics` 仍过）。
+  2. `build_output_format(:774)` 真分支补上 bullet 列表契约（"numbered lists with \"1. \", \"2. \", or bullet lists with \"• \""）。
+  3. `build_format_instruction_block(:797)` 真分支重构为 F3 Smart Lists（有序 F3a + 无序 F3b + few-shot F3c + 约束 F3d），含保守默认（"If unsure, DO NOT use a list"）；假分支追加单行内联分隔规则（顿号「、」/ 分号「；」判据 + 符号禁令）。
+- **scene-rules.toml 审查结论**：现有 doc 块（:240-270）已含 Notepad.exe/wordpad.exe，multiline_safe=true 已生效；经逐一扫描 false 分类下应用，无高置信可改判候选（记事本/写字板已在 doc；终端/IDE/聊天/浏览器均 Enter=发送或无法确证）。报告为「现有 doc/email 覆盖已充分，无需改动」。
+- **自验**：`cargo check` 0 errors；`cargo check --tests` 0 errors；`cargo test` 666 passed / 1 failed（time_half，ITN-COLLISION-TYPEA-002 预期既有失败）/ 6 ignored。`unit_symbol_protection` 4 条单测全过。
+- **边界**：`src/itn.rs`/`itn-rules.toml`/`src/main.rs` 零触碰（coder-1 文件域）；未 `cargo build --release`/出包/启动 exe；未 `npm install`/`npm ci`；未改版本号；未用 git 破坏命令
+- **下游需知**：coder-1 本批次并行改动 `src/itn.rs`+`itn-rules.toml`+`src/main.rs`（ITN 回移 LLM 前），两方改动配套。tester-1 无需额外 TEST-SYNC（本任务未改测试文件），但需关注 `time_half` 仍为预期失败。
+
 ## 2026-07-30 — tester-1 — BUILD-RELEASE-20260730-002 ✅ v0.7.3 全量出包完成
 
 - **来源**：Gavin 指令「基于目前的修改，出包吧」+「连 1386 条一起出包」
@@ -145,5 +175,97 @@
   3. `hotkey.rs:257` — `create_runloop_source` 返回 `Result` 但用 `Option` 的 `.ok_or_else()` → `.map_err(|_| anyhow!(...))?`
 - **自验**：`cargo check` 0 errors；Windows cfg 块未碰；UTF-8 无 BOM
 - **边界**：未改 config/Cargo.toml/版本号；未改 platform/mod.rs 导出；未 cargo build --release/clean；无 git 破坏命令
+
+## 2026-07-31 — coder-1 — RESEARCH-ITN-V2-001 ✅ 完成（纯研究，零代码改动）
+
+- **来源**：Gavin 2026-07-31 四项需求（ITN 位置回移 / 转换不彻底 / 含数字地名扩充 / 列表智能）
+- **范围**：纯研究零改动，产出设计文档供 Gavin 拍板。未碰任何 .rs/.toml/.ts 源文件
+- **主交付**：`collab/research/itn-v2-design-001.md`（24795 字节）
+- **摘要**：`collab/outbox/coder-1/result.md`（2286 字节非空）
+- **主控取证复核**：6 条事实全部 ✅ 确认。补充发现：`UNIT_SYMBOL_PROTECTION` 指令已存在于 `src/llm/mod.rs:29` 并已在 optimize 路径注入（`:560`），主控 R1 第五点「新增 prompt 硬约束」前提需修正为「强化已有指令」
+- **R1**：同意双通道框架；`normalize_unit_symbols` 幂等性 `cargo test --bin feiyin-ime unit_symbol` 11/11 实测通过；修正第五点为追加「禁止时间换算」一句
+- **R2**：同意路径③块级匹配优先为主；**兜底异议**：建议①右邻否决替代主控的②块锁定（②全汉字与「不像机器翻译」诉求冲突）；给出甲/乙/丙三型余数后缀文法 + 否决规则 + 后缀位数决定小数位数算法
+- **R3**：强制绑定 R2 缺陷A 先修。许可证沿用 Type A 结论。候选约 60-80 条 ≥3 字专名，2 字词建议不加
+- **R4**：同意 LLM 判定 + 保守默认 + few-shot。列表只在 multiline_safe=true（邮件/文档）放开。有序用 `1.2.3.`，无序用 `• `（仅 multiline_safe=true）
+- **待 Gavin 拍板 7 项**：Q1 R1双通道实施 / Q2 R2输出形态 / Q3 货币形态 / Q4 R2路径 / Q5 R3 2字词 / Q6 R4无序符号 / Q7 R4判据
+- **方案协商**：R1 同意（修正第五点）；R2 路径③同意但兜底异议（②→①）；其余无异议
+- **红线**：零代码改动；未 cargo build --release/出包/启动 exe；仅 cargo test 只读验证；未用 git 破坏命令；UTF-8 用 write 工具；WebFetch 尝试（jieba/THUOCL 404，用既有许可证结论 + 事实性数据归纳替代）
+
+## 2026-07-31 — coder-1 — ITN-V2-ENGINE-001 ✅ 代码层完成（待主控验收）
+
+- **来源**：Gavin 2026-07-31 需求1+2 ｜ 设计依据：itn-v2-design-001.md + itn-v2-merged-final.md（含3条我稿没有的结论）
+- **范围**：R1 双通道 + 缺陷A 撕裂修复 + 任务C盘点。文件域 `src/itn.rs`+`itn-rules.toml`+`src/main.rs` 独占
+- **改动**：
+  1. **R1 双通道**：`src/itn.rs` 新增 `pub fn normalize_unit_symbols_only`（补丁通道包装）；`src/main.rs:2933` 新增主通道 `pre_llm_text = itn::normalize_numbers(&raw_text)`，三分支输入改用 `pre_llm_text`（optimize/optimize_and_translate/兜底/关闭四路径全覆盖），`:3124` 补丁通道改 `normalize_unit_symbols_only`
+  2. **③块级匹配**：`src/itn.rs` 新增 `CompositeBlock` 结构体 + `try_parse_composite_block`（识别器，≥2段数字+单位）+ `format_composite_block_p2`（P2 formatter，逐段转换保留原单位词）。主循环 `check_protection` 之前调用。**识别器与 formatter 分离**（主控约束一），P4 只换 formatter
+  3. **①右邻否决**：`check_protection` 命中专有名词后，若词含进位单位（十/百/千/万/亿）且右邻是单位/date_suffix→撤销保护。逐位串兜底：`五一`/`七一`等无进位单位词不撤销（避免`51点半`）
+  4. **任务C盘点**：`collab/research/itn-v2-inventory-001.md`。甲型6条（一吨半/一点半/三寸半/六点半/八点半/九点半，P3须成对移除）、乙型0条、丙型12条（全成语，不移除）
+- **Gavin 三实例实测**（P3 基线）：`十一块九毛二`→`11块9毛2`✅消除撕裂；`四点半`→`4点半`（现状，P3甲型文法→`4:30`）；`四点三刻`→`4点3刻`（现状，P3→`4:45`）
+- **①护栏实测**：`十一块`→`11块`✅；`十一国庆`→`十一国庆`✅；`五一点半`→`五一点半`✅（逐位串不撤销）
+- **验收**：cargo check + cargo check --tests 0 errors；cargo test itn:: 96 passed/1 failed（`time_half` 既有红 v0.7.3 遗留，非本批引入）；cargo fmt 仅 itn.rs+main.rs（mtime 证明 llm/mod.rs 19:05 早于 fmt 19:22 未被连带）
+- **LLM对4点3刻联合验证点**：主通道产出`4点3刻`喂 LLM，coder-2 同批加事实保全条款护住，待合并验收主控重点核查
+- **边界**：`itn-rules.toml` 零改动（任务C只盘点）；`src/llm/mod.rs`/`scene-rules.toml` 零触碰（coder-2 文件域）；未 cargo build --release/出包/启动 exe；无 git 破坏命令；UTF-8 用 edit 工具
+- **详情**：`collab/outbox/coder-1/result.md`（4396 字节非空）+ `collab/research/itn-v2-inventory-001.md`
+
+## 2026-07-31 — coder-1 — ITN-V2-ENGINE-002 ✅ 代码层完成（待主控验收）
+
+- **来源**：主控验收 ITN-V2-ENGINE-001 时独立取证发现——①右邻否决激活了 HashSet 迭代顺序不确定性，`十一月` 两次运行可能输出 `十一月` 或 `11月`
+- **根因**：`check_protection` 用 `find_map`（首个匹配），`proper_noun_set` 是 `HashSet`（RandomState 随机种子），4 组前缀重叠（十一⊂{十一国庆,十一月,十一边形}）致 `十一月` 随机命中 `十一`（撤销保护→`11月`）或 `十一月`（保护→`十一月`）
+- **改动**：`src/itn.rs` +170/−12。`check_protection` 中 proper_nouns/historical/function_words 三个有重叠的 set 从 `find_map` 改 `filter+max()`（确定性最长匹配）；idioms/classifiers 无重叠保持原样加注释
+- **五set盘点**：idioms 45条0重叠、proper_nouns 69条4重叠、historical 94条4重叠（五代⊂五代十国等）、function_words 19条1重叠（一下⊂一下子）、classifiers 27条0重叠
+- **确定性实证**：5次独立进程 cargo test，`十一月`/`五一广场`/`五代十国` 5/5 恒定输出
+- **改后行为**：`十一月` 稳定→`十一月`（3字胜出，非纯数字词，不触发①右邻否决，保护生效，白名单作者原意）
+- **附带发现**：`src/itn.rs:1877` 测试注释「无前缀条目冲突」错误（实测4组），只报告不修改（测试归 tester-1）
+- **验收**：cargo check+--tests 0 errors；cargo test itn:: 96/1（time_half 既有红）；cargo fmt 仅 itn.rs 无连带
+- **边界**：本次只动 src/itn.rs；src/main.rs 是 ENGINE-001 遗留（未提交）、src/llm/mod.rs 是 coder-2 并行（mtime 19:31），均非本次引入；itn-rules.toml/scene-rules.toml 零改动
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-1/result.md`（3705 字节非空，工作区级）
+
+## 2026-07-31 — coder-1 — ITN-V2-ENGINE-003 ✅ 代码层完成（待主控验收）
+
+- **来源**：DEC-037(输出形态按单位族分治)+DEC-038(保护词表不得承载规则性语法族) ｜ P3 甲型文法+成对移除
+- **范围**：`src/itn.rs`+`itn-rules.toml`。甲型文法(半/刻)+移除9条保护词条+idioms改max()
+- **改动**：
+  1. **甲型文法**：`RemainderSuffix`/`try_parse_remainder_suffix`(识别器，半模式N<单位>半+刻模式N点M刻)+`format_remainder_suffix`(formatter，时间族H:MM/度量衡N.5单位/量词穿透N.5真单位)。识别器formatter分离(沿用001架构)
+  2. **守卫**：`is_real_unit`(在all_units但不在classifiers)。个/间双重归属时排除→一个半/五间半无真单位→甲型不触发→保持汉字(DEC-038统一路径)
+  3. **主循环顺序**：保护→甲型→③（保护优先避免五一点半被甲型误转51:30；①右邻否决让十一块撤销保护后③仍能触发）
+  4. **移除9条**：一个半/一吨半/一点半/三寸半/两岁半/九点半/五间半/八点半/六点半。一大半保留。同名变体(一点半滴等)未误删
+  5. **新增[units.time]**(小时/分钟)：量词穿透所需(一个半小时单位取小时)
+  6. **idioms改max()**：五set统一语义，classifiers不改(布尔判断)
+- **实测**：甲型9实例全过(四点半→4:30/五点三刻→5:45/八点半→8:30/一个半小时→1.5小时等)；反例4护栏全过(一刻钟保持/三点五→3.5/半小时保持)；回归3护栏全过(十一块九毛二→11块9毛2/五一点半保持/十一月保持)
+- **P2遗留复验**：三楼二号→3楼2号(③命中，注释论断错误已订正)；五排八座保持；三年二班→3年二班
+- **接缝**：normalize_unit_symbols_only对4:30/1.5吨不破坏，无冲突
+- **验收**：cargo check+--tests 0 errors；cargo test itn:: 96/1（time_half**预期变红**：断言8点半实际8:30，断言过时待TEST-SYNC）；cargo fmt仅itn.rs
+- **边界**：本次只动src/itn.rs+itn-rules.toml；main.rs是ENGINE-001遗留/llm/mod.rs是coder-2并行；scene-rules.toml零触碰
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-1/result.md`（4789字节非空，工作区级）
+
+## 2026-07-31 — coder-1 — ITN-V2-ENGINE-004 ✅ 代码层完成（待主控验收）
+
+- **来源**：DEC-037(货币归一)+DEC-038 ｜ P4 乙/丙型文法+单位层级表+全或无。**ITN-V2风险最高一批**
+- **范围**：`src/itn.rs`+`itn-rules.toml`。删除③，新增乙型(隐式小数位)+丙型(多级单位链)+单位层级表+`分`消歧+任务C全或无
+- **改动**：
+  1. **任务D删除③**：CompositeBlock/try_parse_composite_block/format_composite_block_p2 删除，丙型取代。`?`→`break`修正
+  2. **任务B丙型**：UnitChain/try_parse_unit_chain(break不return None，单位可小数化或时间date_suffix点/分/秒)+format_unit_chain(货币归一11.92元/时间H:MM 3:20/度量衡小数合并)。隐含末级`分`补全(九毛二→9毛2分)
+  3. **任务A乙型**：ImplicitDecimal/try_parse_implicit_decimal(N<可小数化单位>M，M后紧邻边界)+format_implicit_decimal(货币归一5.8元/其他N.M单位)。边界护栏is_boundary_char
+  4. **单位层级表**：`[unit_hierarchy.*]`(currency/length/weight/time)，`decimalizable_units`(排除other/geo_prefix)，`hierarchy_value`/`unit_families`
+  5. **`分`消歧**：前驱块/毛→货币族(分=0.01元)，前驱点/小时→时间族(分=分钟)，裸N分不合并
+  6. **任务C全或无**：check_chain_consistency/scan_chain_end，逐字路径守门员(甲/乙/丙型已在前面处理)。链=连续数字+单位/date_suffix/classifier，混合→整段保持。主控硬约束遵守：任务C非全流程守门员
+  7. **主循环顺序**：保护→甲型→乙型→丙型→逐字(含全或无前置)
+- **实测**：乙型4全过(一米二→1.2米等)；丙型4全过(十一块九毛二→11.92元/五块八→5.8元/三小时二十分→3:20)；分消歧3全过；全或无5+连续性边界全过；回归9全过；裸单位2全过
+- **验收**：cargo check+--tests 0 errors；cargo test itn:: 95/2（time_half+money_kuai均断言过时待TEST-SYNC：8点半→8:30/5块8→5.8元）；交叉归属盘点无新增；cargo fmt仅itn.rs
+- **边界**：本次只动itn.rs+itn-rules.toml；llm/mod.rs/scene-rules.toml零触碰；测试文件零改动
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-1/result.md`（4512字节非空，工作区级）
+
+## 2026-08-01 — coder-1 — ITN-V2-ENGINE-005 ✅ 代码层完成（待主控验收，ITN-V2 最后一个代码任务）
+
+- **来源**：Gavin 2026-07-31 需求3 ｜ P5 含数字地名白名单扩充
+- **范围**：仅 `itn-rules.toml`（+69，零 Rust 改动）。`[protect.proper_nouns]` 新增 60 条 ≥3 字含数字地名
+- **改动**：行政区划24条（十三陵/九寨沟/三门峡/五指山/二连浩特等）+景点36条（五道口/四姑娘山/三清山/一江山岛等）。并入 proper_nouns（人工组），不并入 unit_collisions（DEC-038）
+- **反向护栏**：60/60 全过（每词数字前缀+单位仍正常转换，如十三块钱→13块钱）。甲型/乙丙型/①右邻否决交互检查无冲突
+- **盘点**：前缀重叠无新增阻断（确定性最长匹配）；交叉归属无新增跨组冲突
+- **全回归**：11条全过（十一块九毛二→11.92元/四点半→4:30/一米二→1.2米等）
+- **验收**：cargo check 0 errors；cargo test itn:: 95/2（time_half+money_kuai 断言过时待TEST-SYNC）
+- **边界**：仅 itn-rules.toml；src/itn.rs/llm/mod.rs 是前批/coder-2 遗留；测试文件零改动
+- **ITN-V2 全部代码任务收口**：P1-P5 完成，后续 TEST-SYNC→TEST-EXEC→出包
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-1/result.md`（3863字节非空，工作区级）+ `logs/20260801.md`
 
 > 只保留当天条目，>200 行时归档到 handoffs-archive.md。
