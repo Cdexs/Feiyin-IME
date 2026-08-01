@@ -194,12 +194,12 @@ pub fn script_instruction(text: &str, script: ChineseScript) -> Option<&'static 
 
     // LANG-MIXED-001: 含假名/谚文 → 纯保护措辞（不含中文简繁字样，只保留防翻译语义）
     if contains_kana(text) || contains_hangul(text) {
-        return Some("保留输入中各语种的原文形态，不要将任何内容翻译成其他语言。");
+        return Some("Preserve the original form of every language in the input. Do NOT translate any content into another language.");
     }
 
     Some(match script {
-        ChineseScript::Simplified => "请将输出中的中文部分统一为简体中文（中国大陆简体字）字形；不要翻译任何非中文内容，英文、日文、韩文一律保留原文原样。",
-        ChineseScript::Traditional => "请将输出中的中文部分统一为繁体中文（台湾正体字）字形；不要翻译任何非中文内容，英文、日文、韩文一律保留原文原样。",
+        ChineseScript::Simplified => "Normalize the Chinese parts of the output to Simplified Chinese (Mainland China standard glyphs). Do NOT translate any non-Chinese content — English, Japanese and Korean text MUST be preserved exactly as spoken.",
+        ChineseScript::Traditional => "Normalize the Chinese parts of the output to Traditional Chinese (Taiwan standard glyphs). Do NOT translate any non-Chinese content — English, Japanese and Korean text MUST be preserved exactly as spoken.",
     })
 }
 
@@ -221,8 +221,8 @@ pub fn script_instruction_for_translate(text: &str, script: ChineseScript) -> Op
     }
 
     Some(match script {
-        ChineseScript::Simplified => "请将输出中的中文部分统一为简体中文（中国大陆简体字）字形。",
-        ChineseScript::Traditional => "请将输出中的中文部分统一为繁体中文（台湾正体字）字形。",
+        ChineseScript::Simplified => "Normalize the Chinese parts of the output to Simplified Chinese (Mainland China standard glyphs).",
+        ChineseScript::Traditional => "Normalize the Chinese parts of the output to Traditional Chinese (Taiwan standard glyphs).",
     })
 }
 

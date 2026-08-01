@@ -1,5 +1,14 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — coder-1 — PROMPT-EN-UNIFY-013 ✅ `extra_instruction` 英文化（系统提示词纯英文）
+
+- **来源**：Gavin 指令「系统提示应该用纯英文」。基线 `3490c2a`（ahead 29）
+- **范围**：`src/text_normalizer.rs` 指令字符串 5 条英文化（**任务书说 4 条，实际 5 条**——`:197` 假名/谚文纯保护措辞也一并英文化，否则系统提示仍不纯英文）；简繁转换逻辑零改动
+- **改动**：主路径 Simp/Trad 保留「不要翻译非中文」子句；翻译路径 Simp/Trad 不含（两组差异保持，翻译路径绝不可注入防翻译语义）
+- **验证**：text_normalizer:: 49/10（10 红全断言中文子串过时归 TEST-SYNC）；双 cargo check 0 errors；全量 702/18（另 8 红为 coder-2 llm 既有红条，与本改动无关——src/llm/mod.rs 对指令零引用）
+- **效果**：LLM 是否仍正确简繁归一单测无法验证，**需 Gavin 端测确认**（建议：说含繁体字形的话看是否归一简体）
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-1/result.md`（非空）+ `logs/20260801.md`
+
 ## 2026-08-01 — coder-2 — FORMAT-F3-UNIFY-I18N-012 ✅ F3 与输出契约合并到 prompt 最末 + 枚举标记四语穷举
 
 - **来源**：Gavin 2026-08-01 指令——「系统提示应该用纯英文，但在提示词里把各种枚举情况、枚举的用词、措辞都说到，并明确要求考虑中文、英文、日文、韩文的输入场景」。背景：连续两轮措辞层修复（F3 DECISION RULE、MAY→MUST）均失败（prompt_tokens +271 证明新文本已加载仍被压制），主控定论根因是**结构**——prompt 里三处谈格式靠位置争优先级。基线 `3490c2a`（ahead 29）
