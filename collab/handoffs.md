@@ -1,5 +1,16 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — coder-1 — FIX-SCENE-WEBTITLE-007 ✅ 飞书云文档误判修复 + 全部 web 关键词真实标题复核（纯数据免构建）
+
+- **来源**：Gavin 端测实测——浏览器打开飞书文档真实标题「飞书云文档」，被 chat 块 `飞书` 截走 → 错判聊天。基线 `3d1f4bb`（ahead 18）
+- **范围**：`scene-rules.toml`（doc title_keywords +2）+ `collab/research/scene-webtitle-audit-007.md`（新增审计报告）；零 Rust 改动
+- **改动 1**：+`飞书云文档`（Gavin 端测实证真实标题，5>2 最长匹配胜出 doc）；`飞书文档` 保留
+- **改动 2**：+`云文档`（规则性兜底 DEC-038，3>2 胜出；实证 `WPS云文档` 真实标题存在）
+- **改动 3**：doc 35 + email 12 条 web 关键词全量真实标题复核（3 子代理 WebFetch 取证）。关键发现：滴答清单 CN 站用 TickTick / Hotmail 302→Outlook 永不含 / Obsidian Publish 真实标题无此串 / Office Online+Online Doc 不出现 / Foxmail+Thunderbird 无 web 版 / 邮件+发件箱 中文标题不用。**危险等级**：仅钉钉/飞书两族有 chat 截走风险（已确认安全），其余落 browser(false) 保守降级或已被兜住
+- **验证**：临时测试 3 条全过后删除（git diff src/scene/mod.rs 空输出自证）；scene:: 70/0；双 cargo check 0 errors
+- **下游需知**：复核发现的其他不命中项（Obsidian Publish/滴答清单/Hotmail/Office Online/Online Doc/邮件/发件箱/Google 文档 CN 等）**只列不改**，等主控逐条裁定；审计报告在 `collab/research/scene-webtitle-audit-007.md`
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-1/result.md`（非空）+ `logs/20260801.md`
+
 ## 2026-08-01 — coder-2 — FORMAT-INLINE-SEP-I18N-006 ✅ 单行内联分隔符按语言本地化
 
 - **来源**：Gavin 2026-08-01 需求——`multiline_safe=false` 单行分支的 parallel items 段写死 `Chinese enumeration separators`，在微信/浏览器里说英文会得到 `apple、banana、orange`（英文句塞全角顿号）。基线 `c2b20a3`（ahead 17）
