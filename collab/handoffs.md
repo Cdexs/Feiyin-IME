@@ -1,5 +1,16 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — tester-1 — TEST-EXEC + BUILD-RELEASE-20260801-004 ✅ 场景感知大批次收口出包（阶段四+五）
+
+- **来源**：主控合并 5 提交（8e65239 场景覆盖扩展+Markdown `- ` / bf2e188+8ce1be2 TEST-SYNC+Linear 改判 / 1dbd767 标题关键词最长匹配 / bcc5aa4 词表修错+邮件/macOS/Whiteboard / eb7b8e1 window_title 日志）。基线 `eb7b8e1`（ahead 16 未 push）
+- **Step A 全绿**：`cargo test` 779/0/8（+8 自洽）；src-tauri 53/0/0；scene:: 70/0；llm:: 110/0；`--list` 交叉验证总数 779+8 自洽；6 条点名测试全绿（含上轮红 `scene_md003_chrome_title_subclass` 最长匹配修复转绿）
+- **A6/A7 SKIP**：零前端/零 UI 原生窗口改动（理由写入 result）
+- **Step B**：构建 2m03s 未 cargo clean；Publish/ 同步 feiyin-ime.exe（37e4be23/11,893,248B）+ crash-reporter.exe（f044894a），ui.exe 未动；`scene-rules.toml` 三副本同步 `f6d7261b…`；`itn-rules.toml` 三副本仍 `93ab3972…`
+- **Step C**：C1 数据五条探针全≥1 + 对照 Notepad=1；C2 `"- "`=1、`"• "`=0；C3 `window_title=`=1；两副本 sha256 三 exe 全一致；版本 0.7.3.0；mtime 链成立；冒烟 PID 28360 Responding=True 零 panic
+- **⚠️ 偏差上报**：旧 exe（56aff156）在 C1/C3 预验证前被新构建覆盖 → 改用「旧源码等价证明」（ae8d034 状态无探针串）替代二进制预验证，已在 result.md 说明；若主控要求二进制级请指正
+- **待确认**：window_title 日志格式需 Gavin 首次语音后核验（C3 二进制探针 + 源码证明是更强保证）
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/tester-1/result.md`（WSL Python，94 行）+ `logs/20260801.md` §31
+
 ## 2026-08-01 — coder-2 — OBS-SCENE-TITLE-005 ✅ 场景日志补记 window_title（Gavin 裁定解除日志侧禁令）
 
 - **来源**：主控从 414 次真实听写统计出场景分布（chrome→browser 151 次 36% 最大单一场景且 multiline_safe=false），但日志不记 window_title，本批新增的 Google Keep/金山文档/HackMD 等 20 多条 web 关键词全是凭想象猜的。补标题日志后按频次数据驱动补词。基线 `bcc5aa4`（ahead 15）
