@@ -1508,6 +1508,27 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
         // 检查日期时间前缀 "上午X点" "下午X点"
         if let Some(prefix_len) = match_date_prefix(&chars, i, r) {
             let after = i + prefix_len;
+            // ITN-V2-FIX-TIMEPREFIX-001：文法优先让位 —— 若数字位置能被甲/乙/丙型识别，
+            // 只输出前缀并把游标交还主循环，让下一轮迭代正常走文法分支（如「下午四点三刻」→
+            // 甲型刻模式产出 4:45）。否则时段词分支会抢先消费数字导致甲型被跳过。
+            // 主控修正：必须用 get() 越界安全取字符。match_date_prefix 只做 starts_with，
+            // 对前缀之后是否还有字符无任何要求 —— 文本恰好以时段词结尾（「改到明天下午」
+            // 「那就晚上」）时 after == chars.len()，直接索引 chars[after] 会 panic。
+            if chars
+                .get(after)
+                .is_some_and(|c| is_cn_num_char(*c) || *c == '零' || *c == '〇')
+            {
+                if try_parse_remainder_suffix(&chars, after, r).is_some()
+                    || try_parse_implicit_decimal(&chars, after, r).is_some()
+                    || try_parse_unit_chain(&chars, after, r).is_some()
+                {
+                    for ch in &chars[i..after] {
+                        result.push(*ch);
+                    }
+                    i = after;
+                    continue;
+                }
+            }
             // 前缀后跟数字+时间后缀
             if let Some((num_str, consumed)) = parse_cn_number(&chars, after, Some(r)) {
                 if consumed > 0 {
@@ -2830,7 +2851,10 @@ words = ["度"]
         let main_out = normalize_numbers("四十摄氏度");
         assert_eq!(main_out, "40℃");
         let patch_out = normalize_unit_symbols_only(&main_out);
-        assert_eq!(patch_out, main_out, "补丁通道对主通道产出的 ℃ 必须逐字节不变");
+        assert_eq!(
+            patch_out, main_out,
+            "补丁通道对主通道产出的 ℃ 必须逐字节不变"
+        );
     }
 
     // ------------------------------------------------------------
