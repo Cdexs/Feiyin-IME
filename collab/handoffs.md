@@ -1,5 +1,16 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — coder-2 — FIX-OUTPUTFORMAT-MUST-010 ✅ `build_output_format` 的 `MAY` 改条件式 `MUST`
+
+- **来源**：Gavin 端测——F3b 修复（`1b2697b`）出包后**仍然不出列表**。日志 12:39:17Z（晚于 BUILD-006 20:25:56）`prompt_tokens` 2390→2661（+271）证明新 F3 文本已加载，3 个「比如说」仍输出整段连续文本。主控定位真根因：`build_output_format` 的 `MAY` 在 recency 最高位软化 F3 的命令式 `MUST`。基线 `43984d7`（ahead 25）
+- **范围**：仅 `src/llm/mod.rs` `build_output_format` 真分支文本 + 函数注释（+10/−2），零逻辑改动
+- **改动**：`The <corrected> block MAY span multiple lines` → `This block does NOT relax rule F3's MUST. When F3 applies (see F3a/F3b above), the <corrected> block MUST span multiple lines, e.g., numbered lists with "1. ", "2. ", or bullet lists with "- ". When F3 does NOT apply (no enumeration or exemplification), output a single continuous paragraph.`——条件式 `MUST`（F3 适用必须多行）+ 反向声明 + 保留两种形态举例；`<corrected>` 包裹/suggestions JSON/`Output NOTHING else` 一字未改
+- **历史对照**：FMT-LLM-003 注释记录同一 bug（拼装位置 recency 压制 F3 MUST split）当初只修了一半——参数化时用了许可式 `MAY`，本次补上命令式对齐 + 反向声明（呼应 FMT-LLM-002 的 `This block OVERRIDES...` 正向声明模式）
+- **验证**：`cargo check` + `cargo check --tests` 双 0 errors；`cargo test --bin feiyin-ime llm::` **111 passed / 1 failed**（唯一红 `build_output_format_multi_line_when_multiline_safe:1565` 断言 `contains("MAY span multiple lines")`——**预期红**，断言检查旧措辞 `MAY` 本任务正是改掉它，归 tester-1 TEST-SYNC，未改断言；任务书点名的 `mentions_numbered_and_bullet` 未红，`"- "` 断言仍绿）；UTF-8 Python 验证无 mojibake
+- **⚠️ cargo fmt 连带 1 处**：既有测试块 :1728 一条 `assert!` 长行被 rustfmt 重排（零逻辑变化，[FMT-COLLATERAL-001] 保留）
+- **边界**：`multiline_safe=false` 单行分支 / F3 段落 / `prompt_parts` 拼装顺序 / ANTI_HALLUCINATION 零改动；`src/scene/mod.rs`/`scene-rules.toml`/`src/itn.rs`/`itn-rules.toml`/`src/main.rs`/`src-tauri/**`/`ui/**` 零触碰；未构建/出包/启动 exe；未改版本号（0.7.3）；未用 git 破坏命令；UTF-8 用 edit 工具
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-2/result.md`（非空）
+
 ## 2026-08-01 — tester-1 — TEST-SYNC追补+TEST-EXEC+BUILD-RELEASE-20260801-006 ✅ 三段收口出包
 
 - **来源**：唯一提交 1b2697b（F3b 举例枚举修复，纯 prompt 文本）。基线 `1b2697b`（ahead 24 未 push）

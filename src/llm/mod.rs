@@ -791,10 +791,16 @@ fn ends_with_separator_or_terminal(s: &str) -> bool {
 /// 根因：原 const OUTPUT_FORMAT 写死 "Line 1: <corrected>...</corrected>" 单行契约，
 /// 拼装位置在 F3/F4 之后（recency 优先级最高），压制了 F3 的 MUST split 多行指令。
 /// Email 场景（multiline_safe=true）列举语音未拆列表即此 bug。
+///
+/// FIX-OUTPUTFORMAT-MUST-010（2026-08-01）：FMT-LLM-003 参数化时新措辞用了许可式
+/// `MAY`，与 F3 的命令式 `MUST` 未对齐——同一个 bug 换形态复现（Gavin 端测：3 个
+/// 「比如说」仍输出整段连续文本）。本次改为条件式 `MUST`（F3 适用时必须多行，否则
+/// 单段落）+ 显式反向声明 `This block does NOT relax rule F3's MUST`，消除 recency
+/// 软化。
 fn build_output_format(multiline_safe: bool) -> &'static str {
     if multiline_safe {
         "Output format (mandatory):\n\
-        The <corrected> block MAY span multiple lines (e.g., numbered lists with \"1. \", \"2. \", or bullet lists with \"- \"). Put the opening <corrected> and closing \
+        This block does NOT relax rule F3's MUST. When F3 applies (see F3a/F3b above), the <corrected> block MUST span multiple lines, e.g., numbered lists with \"1. \", \"2. \", or bullet lists with \"- \". When F3 does NOT apply (no enumeration or exemplification), output a single continuous paragraph. Put the opening <corrected> and closing \
         </corrected> around the whole text. After the closing tag, optionally ONE final line \
         {\"suggestions\":[\"correct_word\"]}.\n\
         Output NOTHING else. No explanations, no commentary, no \"corrected to\", \
@@ -1722,7 +1728,9 @@ mod tests {
             "总纲须含 enumeration OR exemplification"
         );
         assert!(
-            !safe.contains("ONLY use a list when the speech EXPLICITLY contains enumeration markers."),
+            !safe.contains(
+                "ONLY use a list when the speech EXPLICITLY contains enumeration markers."
+            ),
             "旧措辞不得只剩 enumeration markers（须为 OR exemplification 版本）"
         );
         // b. DECISION RULE + 2 OR MORE parallel items（锚定要求侧）
