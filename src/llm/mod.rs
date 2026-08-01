@@ -1556,13 +1556,35 @@ mod tests {
     fn build_output_format_single_line_when_not_multiline_safe() {
         let fmt = build_output_format(false);
         assert!(fmt.contains("Line 1: <corrected>"));
-        assert!(!fmt.contains("MAY span multiple lines"));
+        // TEST-SYNC-007 0b：假绿换锚点。
+        // ⚠️ 教训（本项目第三次同类）：契约措辞变更时，断言必须跟着换锚点，否则会退化
+        // 成恒真的假绿。旧断言 `!contains("MAY span multiple lines")` 在 FIX-OUTPUTFORMAT-
+        // MUST-010 后该串全文件已消失，断言不再守卫任何东西（恒真）。换锚点断言单行分支
+        // 不含【新】的多行措辞 MUST span multiple lines。
+        assert!(
+            !fmt.contains("MUST span multiple lines"),
+            "单行分支不得含新的 MUST span multiple lines 多行措辞"
+        );
     }
 
     #[test]
     fn build_output_format_multi_line_when_multiline_safe() {
         let fmt = build_output_format(true);
-        assert!(fmt.contains("MAY span multiple lines"));
+        // TEST-SYNC-007 0a：FIX-OUTPUTFORMAT-MUST-010 契约 MAY→条件式 MUST（Gavin 端测
+        // 3 个「比如说」仍输出连续文本，recency 软化复现）。锚定新契约 + 反向声明 +
+        // 负向护栏防退回许可式措辞。
+        assert!(
+            fmt.contains("MUST span multiple lines"),
+            "多行分支须为条件式 MUST span multiple lines"
+        );
+        assert!(
+            fmt.contains("does NOT relax rule F3's MUST"),
+            "须含反向声明 does NOT relax rule F3's MUST（本次修复核心句，必须锁住）"
+        );
+        assert!(
+            !fmt.contains("MAY span multiple lines"),
+            "不得退回许可式 MAY span multiple lines（防 recency 软化复现）"
+        );
         assert!(!fmt.contains("Line 1:"));
     }
 

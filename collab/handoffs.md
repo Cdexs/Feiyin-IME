@@ -1,5 +1,15 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — tester-1 — TEST-SYNC追补+TEST-EXEC+BUILD-RELEASE-20260801-007 ✅ 三段收口出包
+
+- **来源**：唯一提交 a9bc9b9（输出契约 MAY→条件式 MUST）。基线 `a9bc9b9`（ahead 26 未 push）
+- **Step 0 追补**：0a 🔴 真红 `build_output_format_multi_line_when_multiline_safe` 旧断言 `MAY span multiple lines` → 锚定新契约（MUST span multiple lines + does NOT relax rule F3's MUST + 负向护栏 !MAY）；0b ⭐ 假绿 `build_output_format_single_line_when_not_multiline_safe` 旧 `!MAY` 已恒真（串全消失）→ 换锚点 `!MUST span multiple lines`，注释写明「契约措辞变更时断言必须跟着换锚点」第三次同类教训；0c 核实既有 numbered/bullet 覆盖；cargo check 0 errors
+- **Step A 全绿**：783/0/8（基线一致，Step 0 改完恢复全绿）；src-tauri 53/0/0；llm:: 112/0；--list 791=783+8 自洽；点名 3/3（含 0a/0b 两个改后测试）
+- **B0-pre 构建前探针预验证**：旧 exe a70d5c8c 两新探针=0 + MAY 判别力对照=1 + Notepad=1
+- **Step B**：构建 2m07s；Publish 同步 feiyin-ime.exe（c4cfe76c/11,897,344B）+ crash-reporter（33694d69），ui 未动；两 toml 三副本只验证未变（2d1811c5/93ab3972）
+- **Step C**：新 exe 探针全过 + MAY 判别力对照 1→0；两副本 sha256 三 exe 全一致；0.7.3.0；mtime 20:54:24 > llm 20:48:52；冒烟 PID 25308 零 panic
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/tester-1/result.md`（WSL Python，88 行）+ `logs/20260801.md` §34
+
 ## 2026-08-01 — coder-2 — FIX-OUTPUTFORMAT-MUST-010 ✅ `build_output_format` 的 `MAY` 改条件式 `MUST`
 
 - **来源**：Gavin 端测——F3b 修复（`1b2697b`）出包后**仍然不出列表**。日志 12:39:17Z（晚于 BUILD-006 20:25:56）`prompt_tokens` 2390→2661（+271）证明新 F3 文本已加载，3 个「比如说」仍输出整段连续文本。主控定位真根因：`build_output_format` 的 `MAY` 在 recency 最高位软化 F3 的命令式 `MUST`。基线 `43984d7`（ahead 25）
