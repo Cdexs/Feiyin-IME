@@ -1,5 +1,19 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — coder-1 — ITN-V2-LEXICON-006-C ✅ 移除 5 条 2 字遮蔽词条
+
+- **来源**：ENGINE-006-B-R2 定位 `二分` 前缀遮蔽 → 主控核查全部 5 条 2 字词条 → Gavin 拍板删除
+- **范围**：仅 `itn-rules.toml`（删 5 词），`src/itn.rs` **零改动**
+- **改动**：`itn-rules.toml:499` 删除 `"三元"/"九度"/"二分"/"五类"/"四大"`，保留 `"零点幕"/"零点能"`
+- **V1 正向**：二分钟→2分钟 ✅（红1 闭合）、三元钱→3元钱 ✅、九度电→9度电 ✅、五类人→五类人（如实）、四大件→四大件（如实）
+- **V2 反向护栏**：13 条更长词条（二分查找/二分图/二分法/二分之一/二分音符/三元催化/三元及第/三元桥/四大发明/四大皆空/四大名捕/九度OJ/五类分子）全部 PROTECTED ✅
+- **V3 裸词代价**：二分→2分、三元→3元、四大→四大（大非单位）、九度→9度、五类→五类（类非单位）
+- **V4 回归**：13/13 全过 ✅
+- **V5 cargo test itn::**：119 passed / 0 failed（118 既有 + 1 临时，临时已删后 118/0）
+- **验收**：git diff itn-rules.toml = 1 insertion/1 deletion（只删 5 词）；git diff src/itn.rs 空输出（零改动）；cargo check --tests 0 errors；git status 无垃圾文件
+- **边界**：未碰 src/itn.rs/llm/scene-rules/main.rs/src-tauri/ui；未 cargo build --release/出包；无 git 破坏命令；UTF-8 用 edit 工具
+- **详情**：`collab/outbox/coder-1/result.md`
+
 ## 2026-08-01 — coder-1 — ITN-V2-ENGINE-006-B-R2 ✅ 返工：A2 根因取证 + B 扫描形状纠正
 
 - **来源**：主控验收 006-B 打回 A2（根因事实错误+表格是推理非实测）和 B（正扫漏掉非单位尾串族）
