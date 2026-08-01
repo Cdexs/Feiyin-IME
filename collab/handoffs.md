@@ -1,5 +1,15 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — tester-1 — TEST-SYNC追补+TEST-EXEC+BUILD-RELEASE-20260801-006 ✅ 三段收口出包
+
+- **来源**：唯一提交 1b2697b（F3b 举例枚举修复，纯 prompt 文本）。基线 `1b2697b`（ahead 24 未 push）
+- **Step 0 追补**：`build_format_instruction_block_f3_exemplification_enumeration` 五条断言——a 总纲 enumeration OR exemplification + 负向护栏（不得只剩旧措辞）；b DECISION RULE + 2 OR MORE parallel items；c ⭐保守默认双向（If unsure, DO NOT use a list 且 both directions are equally wrong，注释写明 Gavin 07-31 保守默认 + 本次对称化来龙去脉，防只留单向）；d may be FULL SENTENCES；e 正向 比如说 长句 few-shot + 负向 a single 比如 is a mere example；cargo check 0 errors
+- **Step A 全绿**：783/0/8（+1）；src-tauri 53/0/0；llm:: 112/0；--list 791=783+8 自洽；点名 3/3（含新 F3 断言）
+- **B0-pre 构建前探针预验证**：旧 exe bef8958d 四探针全 0 + 对照 Notepad=1；判别力注 enumeration markers 旧=4 不可作对照（与任务书一致）
+- **Step B**：构建 2m08s；Publish 同步 feiyin-ime.exe（a70d5c8c/11,897,344B）+ crash-reporter（2cac1bee），ui 未动；两 toml 三副本只验证未变（2d1811c5/93ab3972）
+- **Step C**：新 exe 探针四条全≥1 + Notepad=1；两副本 sha256 三 exe 全一致；0.7.3.0；mtime 20:26:04 > llm 20:20:18；冒烟 PID 17436 零 panic
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/tester-1/result.md`（WSL Python，80 行）+ `logs/20260801.md` §33
+
 ## 2026-08-01 — coder-2 — FORMAT-F3B-EXEMPLIFY-009 ✅ 修 F3b 无序列表在「比如说」式举例枚举下不触发
 
 - **来源**：Gavin 端测发现——同一场景（Notepad/kind=document/multiline_safe=true）两条相隔 52 秒的对照：有序枚举 F3a 正常出 `1. 2. 3.`，无序枚举 F3b 未触发（`比如说啊...` 4 连举例输出整段连续文本零列表）。基线 `2920fa1`（ahead 23）

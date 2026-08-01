@@ -1699,6 +1699,63 @@ mod tests {
         );
     }
 
+    /// TEST-SYNC 追补 006：F3 举例枚举修复契约（1b2697b）。
+    /// 来龙去脉：Gavin 端测 52 秒内同场景对照（Notepad/kind=document/multiline_safe=true/
+    /// f4_injected=true 全同）——12:08:09 有序枚举（一个是…一个是…）正确出 1.2.3.4. 列表，
+    /// 12:09:01 无序枚举（比如说…比如说…还有…）却整段连续文本零列表。根因四连：
+    /// ①总纲只要 enumeration markers、F3b 触发词却是 exemplification 类（比如/诸如/for
+    ///   example），自相矛盾 → LLM 判「举例非枚举」走保守路线；
+    /// ②保守默认单向——只警告过度列表化，未警告漏列表；
+    /// ③few-shot 不对称（无序仅 1 条超短占位）；
+    /// ④F3b 未说明列表项可为完整长句。
+    ///
+    /// ⭐ 本测试 c 项是防回归核心：Gavin 2026-07-31 拍板过「保守默认」（If unsure, DO NOT
+    /// use a list）。本次 1b2697b 是**对称化而非弱化**——保留保守默认原文，同时补上反方向
+    /// 警告（漏列真正的并列枚举同样是回归）。若将来有人为修「过度列表化」把对称句删掉，
+    /// 就会退回本次修的这个 bug（12:09:01 那种）。c 项断言必须双侧都在。
+    #[test]
+    fn build_format_instruction_block_f3_exemplification_enumeration() {
+        let safe = build_format_instruction_block(true);
+        // a. 总纲：enumeration OR exemplification（锚定要求侧）；负向护栏不得只剩旧措辞
+        assert!(
+            safe.contains("enumeration OR exemplification"),
+            "总纲须含 enumeration OR exemplification"
+        );
+        assert!(
+            !safe.contains("ONLY use a list when the speech EXPLICITLY contains enumeration markers."),
+            "旧措辞不得只剩 enumeration markers（须为 OR exemplification 版本）"
+        );
+        // b. DECISION RULE + 2 OR MORE parallel items（锚定要求侧）
+        assert!(safe.contains("DECISION RULE"), "须含 DECISION RULE");
+        assert!(
+            safe.contains("2 OR MORE parallel items"),
+            "DECISION RULE 须含 2 OR MORE parallel items 判据"
+        );
+        // c. 保守默认双向（本测试防回归核心，两侧缺一即退化）
+        assert!(
+            safe.contains("If unsure, DO NOT use a list"),
+            "保守默认单向必须保留（Gavin 2026-07-31 拍板）"
+        );
+        assert!(
+            safe.contains("both directions are equally wrong"),
+            "对称警告必须存在——漏列真正并列枚举同样是回归（1b2697b 对称化核心）"
+        );
+        // d. F3b 列表项可为完整长句
+        assert!(
+            safe.contains("may be FULL SENTENCES"),
+            "F3b 须说明列表项可为完整长句"
+        );
+        // e. F3c 正向长句 few-shot + 负向单例反例（锚定要求侧）
+        assert!(
+            safe.contains("比如说有些学生头发过长"),
+            "F3c 须含正向 比如说 长句 few-shot"
+        );
+        assert!(
+            safe.contains("a single 比如 is a mere example"),
+            "F3c 须含负向单例反例（a single 比如 is a mere example）"
+        );
+    }
+
     #[test]
     fn flatten_multiline_no_newline_unchanged() {
         // 无换行 → trim 后原样返回
