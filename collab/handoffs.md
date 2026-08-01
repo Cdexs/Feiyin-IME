@@ -1,5 +1,15 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — tester-1 — TEST-SYNC + TEST-EXEC + BUILD-RELEASE-20260801-008 ✅ 三轮收口（本轮 18 红最多）
+
+- **来源**：2 提交 b60517a（F3 与输出契约合并到最末 + 四语标记穷举）+ 978afa7（系统提示词全英文）。基线 `978afa7`（ahead 31 未 push）
+- **Step 0**：0a llm:: 8 红换锚点函数（build_format_instruction_block 只剩 F1/F2，F3/输出契约在 build_output_format）+锚定串更新；0b text_normalizer:: 10 红+1 隐形假绿改英文断言 + 2 新守卫（翻译路径不得含 Do NOT translate [LANG-MIXED-001]、5 指令串无 CJK [Gavin 纯英文]）；0c 四语标记；0d ⭐结构护栏（走 build_optimize_request 真实组装断言格式契约在 ANTI_HALLUCINATION 后且末段，注释写五次段落顺序教训）；cargo check 0 errors
+- **Step A 全绿**：788/0/8（+4）；src-tauri 53/0/0；llm:: 114/0（104/8→全绿）；text_normalizer:: 61/0；--list 796=788+8 自洽；点名 3/3（0d 结构护栏/mastodon/memos）
+- **B0-pre 构建前探针预验证**：旧 exe c4cfe76c 四新探针=0 + 旧中文串判别力=1 + Notepad=1
+- **Step B**：两处实例无运行；构建 2m05s；Publish 同步 feiyin-ime.exe（fb74146b/11,901,440B）+ crash-reporter（9fb4022a），ui 未动；两 toml 三副本未变（910b2c1f/93ab3972）
+- **Step C**：四新探针全≥1 + 旧中文串=0（判别力 1→0）；两副本 sha256 三 exe 全一致；0.7.3.0；mtime 23:48:31 > llm 23:43:14 > normalizer 23:41:59；冒烟 PID 21408 零 panic
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/tester-1/result.md`（WSL Python，106 行）+ `logs/20260801.md` §36
+
 ## 2026-08-01 — coder-1 — PROMPT-EN-UNIFY-013 ✅ `extra_instruction` 英文化（系统提示词纯英文）
 
 - **来源**：Gavin 指令「系统提示应该用纯英文」。基线 `3490c2a`（ahead 29）

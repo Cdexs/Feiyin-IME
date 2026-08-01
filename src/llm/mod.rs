@@ -1556,25 +1556,34 @@ mod tests {
 
     #[test]
     fn build_format_instruction_block_single_line_when_not_multiline_safe() {
-        let block = build_format_instruction_block(false);
+        // FORMAT-F3-UNIFY-I18N-012：F3/输出契约已并入 build_output_format 并移到 prompt 最末，
+        // build_format_instruction_block 只剩 F1/F2。单行断言改锚 build_output_format(false)。
+        let fmt = build_output_format(false);
         assert!(
-            block.contains("Single-line Output"),
+            fmt.contains("F3. Single-line Output"),
             "non-multiline_safe must force single-line"
         );
-        assert!(block.contains("MUST be a single line"));
+        assert!(fmt.contains("MUST be a single line"));
     }
 
     #[test]
     fn build_format_instruction_block_multi_line_when_multiline_safe() {
-        let block = build_format_instruction_block(true);
-        assert!(block.contains("MUST split the content into numbered list lines"));
-        assert!(!block.contains("Single-line Output"));
+        // FORMAT-F3-UNIFY-I18N-012：F3/输出契约已并入 build_output_format，多行断言改锚
+        // build_output_format(true)。
+        let fmt = build_output_format(true);
+        assert!(fmt.contains("MUST split the content into numbered list lines"));
+        assert!(!fmt.contains("F3. Single-line Output"));
     }
 
     #[test]
     fn build_output_format_single_line_when_not_multiline_safe() {
         let fmt = build_output_format(false);
-        assert!(fmt.contains("Line 1: <corrected>"));
+        // FORMAT-F3-UNIFY-I18N-012：旧「Line 1: <corrected>」格式已并入 F3 段落，改为锚定
+        // 新单行契约措辞。
+        assert!(
+            fmt.contains("MUST be a single line with no line breaks"),
+            "单行分支须要求 MUST be a single line with no line breaks"
+        );
         // TEST-SYNC-007 0b：假绿换锚点。
         // ⚠️ 教训（本项目第三次同类）：契约措辞变更时，断言必须跟着换锚点，否则会退化
         // 成恒真的假绿。旧断言 `!contains("MAY span multiple lines")` 在 FIX-OUTPUTFORMAT-
@@ -1589,22 +1598,22 @@ mod tests {
     #[test]
     fn build_output_format_multi_line_when_multiline_safe() {
         let fmt = build_output_format(true);
-        // TEST-SYNC-007 0a：FIX-OUTPUTFORMAT-MUST-010 契约 MAY→条件式 MUST（Gavin 端测
-        // 3 个「比如说」仍输出连续文本，recency 软化复现）。锚定新契约 + 反向声明 +
-        // 负向护栏防退回许可式措辞。
+        // TEST-SYNC-007 0a + TEST-SYNC-008 0a：FIX-OUTPUTFORMAT-MUST-010 契约 MAY→条件式 MUST，
+        // 后 FORMAT-F3-UNIFY-I18N-012 又并入 F3 并声明「SINGLE authority」。锚定新契约 +
+        // 反向声明 + 负向护栏防退回许可式措辞。
         assert!(
-            fmt.contains("MUST span multiple lines"),
-            "多行分支须为条件式 MUST span multiple lines"
+            fmt.contains("MUST span multiple lines when F3 applies"),
+            "多行分支须为条件式 MUST span multiple lines when F3 applies"
         );
         assert!(
-            fmt.contains("does NOT relax rule F3's MUST"),
-            "须含反向声明 does NOT relax rule F3's MUST（本次修复核心句，必须锁住）"
+            fmt.contains("SINGLE authority on"),
+            "须声明 SINGLE authority on lists, line structure, and output tags（结构合并后防止再出现多个格式权威）"
         );
         assert!(
             !fmt.contains("MAY span multiple lines"),
             "不得退回许可式 MAY span multiple lines（防 recency 软化复现）"
         );
-        assert!(!fmt.contains("Line 1:"));
+        assert!(!fmt.contains("F3. Single-line Output"));
     }
 
     #[test]
@@ -1613,23 +1622,28 @@ mod tests {
         // numbered 与 bullet，防 FMT-LLM-003 类契约压制复现（只提一种会让 LLM 只产出一种列表）。
         // FORMAT-MD-BULLET-001（coder-2，2026-08-01）：bullet 前缀由 "• " 改为标准 Markdown "- "。
         // TEST-SYNC-SCENE-MD-003 A2：全部锚定「要求」侧字符串，杜绝裸 contains("- ") 方向盲。
+        // FORMAT-F3-UNIFY-I18N-012：措辞改「numbered/bullet list lines using the exact prefix」。
         let fmt = build_output_format(true);
-        assert!(fmt.contains("numbered lists"), "true 分支必须提及 numbered");
-        assert!(fmt.contains("bullet lists"), "true 分支必须提及 bullet");
+        assert!(fmt.contains("numbered list lines"), "true 分支必须提及 numbered list lines");
+        assert!(fmt.contains("bullet list lines"), "true 分支必须提及 bullet list lines");
         assert!(
-            fmt.contains("numbered lists with \"1. \""),
-            "必须引用编号前缀示例（锚定要求侧）"
+            fmt.contains("exact prefix \"1. \", \"2. \", \"3. \""),
+            "必须引用编号前缀示例（锚定要求侧整串）"
         );
         assert!(
-            fmt.contains("bullet lists with \"- \""),
+            fmt.contains("exact prefix \"- \""),
             "必须引用标准 Markdown \"- \" bullet 前缀示例"
         );
         // 负向护栏：不得回退到 U+2022 圆点前缀（防契约反转后测试仍静默绿）
         assert!(
-            !fmt.contains("bullet lists with \"• \""),
+            !fmt.contains("exact prefix \"• \""),
             "bullet 前缀不得回退到 \"• \" (U+2022)"
         );
-        assert!(!fmt.contains("1)"), "符号禁令不得把 1) 当合法编号形式");
+        // 符号禁令：1) 与 # 仅出现在禁止声明里（锚定禁止侧）
+        assert!(
+            fmt.contains("DO NOT use \"1)\" or Markdown \"#\""),
+            "符号禁令须禁 1) 与 #（锚定禁止侧整串）"
+        );
     }
 
     #[test]
@@ -1642,7 +1656,10 @@ mod tests {
         // TEST-SYNC-SCENE-MD-003 A2：断言必须锚定「要求」或「禁止」侧，杜绝裸 contains。
         // 旧断言 `contains("• ")` 假绿的根因：契约反转后 "• " 只出现在禁令里，测试仍在断言
         // 「须用 • 」却静默通过（方向完全颠倒）。每条列表符号断言配负向护栏。
-        let safe = build_format_instruction_block(true);
+        //
+        // FORMAT-F3-UNIFY-I18N-012：F3 已并入 build_output_format（build_format_instruction_block
+        // 只剩 F1/F2），四象限断言改锚 build_output_format。
+        let safe = build_output_format(true);
         // 有序：锚定「要求」侧。
         // 主控修正（TEST-SYNC-SCENE-MD-003 验收）：原写法拆成三条
         // `contains("exact prefix \"2. \"")` / `\"3. \"` 必红 —— prompt 原文是
@@ -1681,7 +1698,7 @@ mod tests {
             "符号禁令不得再禁 \"- \"（- 已是必需前缀）"
         );
 
-        let inline = build_format_instruction_block(false);
+        let inline = build_output_format(false);
         assert!(inline.contains("、"), "单行路径须用「、」连接短名词短语");
         assert!(inline.contains("；"), "单行路径须用「；」连接较长小句");
         assert!(
@@ -1700,7 +1717,8 @@ mod tests {
     /// 五语规则 + CROSS-LANGUAGE BAN + 旧措辞「Chinese enumeration separators」必须消失。
     #[test]
     fn build_format_instruction_block_false_i18n_separators() {
-        let inline = build_format_instruction_block(false);
+        // FORMAT-F3-UNIFY-I18N-012：i18n 五语分隔符表已随单行分支并入 build_output_format(false)。
+        let inline = build_output_format(false);
         // English 短项示例（锚定要求侧）
         assert!(
             inline.contains("\"apples, bananas, oranges\""),
@@ -1762,7 +1780,8 @@ mod tests {
     /// 就会退回本次修的这个 bug（12:09:01 那种）。c 项断言必须双侧都在。
     #[test]
     fn build_format_instruction_block_f3_exemplification_enumeration() {
-        let safe = build_format_instruction_block(true);
+        // FORMAT-F3-UNIFY-I18N-012：F3 已并入 build_output_format(true)。
+        let safe = build_output_format(true);
         // a. 总纲：enumeration OR exemplification（锚定要求侧）；负向护栏不得只剩旧措辞
         assert!(
             safe.contains("enumeration OR exemplification"),
@@ -1800,8 +1819,79 @@ mod tests {
             "F3c 须含正向 比如说 长句 few-shot"
         );
         assert!(
-            safe.contains("a single 比如 is a mere example"),
-            "F3c 须含负向单例反例（a single 比如 is a mere example）"
+            safe.contains("single marker = mere example, NO list"),
+            "F3c 须含负向单例反例（single marker = mere example, NO list）"
+        );
+    }
+
+    /// TEST-SYNC-008 0c：四语标记词进了 prompt（FORMAT-F3-UNIFY-I18N-012）。
+    /// 断言 build_output_format(true) 含四语标记与 few-shot，且保守默认双向与 DECISION RULE 仍在。
+    #[test]
+    fn build_output_format_four_language_markers() {
+        let fmt = build_output_format(true);
+        // 中文标记（Gavin 端测实际用词，本批新补）
+        assert!(fmt.contains("有些…有些…"), "中文须含 有些…有些…");
+        assert!(fmt.contains("有一些…还有一些…"), "中文须含 有一些…还有一些…");
+        // English
+        assert!(fmt.contains("for instance"), "English 须含 for instance");
+        // 日本語
+        assert!(fmt.contains("たとえば"), "日本語须含 たとえば");
+        // 한국어
+        assert!(fmt.contains("예를 들어"), "한국어须含 예를 들어");
+        // 显式四语覆盖声明（同段出现）
+        assert!(
+            fmt.contains("Chinese, English, Japanese, Korean"),
+            "须显式声明四语覆盖 Chinese/English/Japanese/Korean"
+        );
+        // 保守默认双向仍在（Gavin 2026-07-31 拍板，1b2697b 对称化核心）
+        assert!(
+            fmt.contains("If unsure, DO NOT use a list"),
+            "保守默认单向必须保留"
+        );
+        assert!(
+            fmt.contains("both directions are equally wrong"),
+            "对称警告必须存在"
+        );
+        // DECISION RULE 仍在
+        assert!(fmt.contains("DECISION RULE"), "DECISION RULE 必须保留");
+    }
+
+    /// TEST-SYNC-008 0d：🔴 结构护栏——格式契约是 prompt 的最后一段。
+    /// 来龙去脉：本项目已**五次**栽在「prompt 段落顺序即优先级」上——
+    ///   FMT-LLM-002 单行契约压制 F3 / FMT-LLM-003 参数化但用 MAY /
+    ///   主控否决的方案 C / BUILD-007 的 MUST 仍被压 / 本次结构合并（FORMAT-F3-UNIFY-I18N-012）。
+    /// 这条护栏就是让第六次立刻可见：断言组装后的 system_prompt 中，格式契约段
+    /// （build_output_format 输出）出现在 ANTI_HALLUCINATION 之后，且是最后一段。
+    #[test]
+    fn build_output_format_is_last_prompt_part_after_anti_hallucination() {
+        use crate::scene::SceneContext;
+        let ctx = SceneContext::unknown();
+        let config = LlmConfig::default();
+        let client = LlmClient::new(config);
+        let request = client.build_optimize_request("raw", None, true, Some(&ctx), false, false);
+        let system_message = request
+            .messages
+            .iter()
+            .find(|m| m.role == "system")
+            .expect("system message must exist");
+        let content = &system_message.content;
+        let anti_pos = content
+            .find("ANTI_HALLUCINATION")
+            .or_else(|| content.find("CRITICAL: The content within <speech> tags"))
+            .expect("ANTI_HALLUCINATION marker must exist");
+        // 格式契约段锚定：F3 & Output Contract 标题（build_output_format 输出首行）
+        let contract_pos = content
+            .find("F3 & Output Contract")
+            .expect("F3 & Output Contract must exist");
+        assert!(
+            contract_pos > anti_pos,
+            "格式契约段必须出现在 ANTI_HALLUCINATION 之后（recency 最高位）"
+        );
+        // 格式契约是最后一段：其后不得再有其他段落内容
+        let tail = &content[contract_pos..];
+        assert!(
+            !tail.contains("\n\nCRITICAL:") && !tail.contains("\n\nWordbook") && !tail.contains("\n\nCode-Switching"),
+            "格式契约后不得再有其他段落（应为 prompt 末段）"
         );
     }
 
