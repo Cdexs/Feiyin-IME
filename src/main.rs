@@ -2954,17 +2954,24 @@ fn run_pipeline(
                     let multiline_safe = scene_context.multiline_safe;
                     let send_window_title = config.scene.send_window_title;
                     // SCENE-OBS-001: 场景感知可观测性日志。
-                    // 隐私红线：禁止打印 window_title（send_window_title 默认 false 是刻意隐私边界，
-                    // 日志同样遵守）。f4_injected 判据与 build_scene_prompt_block 的 None 条件一致：
+                    // 决策变更记录（2026-08-01）：原隐私红线「禁止打印 window_title」
+                    // 出自 SCENE-OBS-001，Gavin 2026-08-01 裁定解除——debug.log 为纯本地
+                    // 文件、不外发，故本地日志可记录 window_title 以支撑数据驱动的场景词表
+                    // 优化（OBS-SCENE-TITLE-005）。
+                    // ⚠️ 边界没有全解：本次只解除「本地日志」侧。send_window_title
+                    //（控制标题上送 LLM）的隐私边界完全不变，仍默认 false——外发与本地
+                    // 记录是两件事，后续不得据此放行标题给 LLM。
+                    // f4_injected 判据与 build_scene_prompt_block 的 None 条件一致：
                     // 非 Unknown 且 style_hint 非空（不重复调用 build_scene_prompt_block 产生副作用）。
                     let f4_injected =
                         !scene_context.is_unknown() && !scene_context.style_hint.trim().is_empty();
                     log::info!(
-                        "Scene context: app_exe={:?}, kind={}, multiline_safe={}, f4_injected={}",
+                        "Scene context: app_exe={:?}, kind={}, multiline_safe={}, f4_injected={}, window_title={:?}",
                         scene_context.app_exe,
                         scene_context.scene.as_str(),
                         multiline_safe,
                         f4_injected,
+                        scene_context.window_title,
                     );
                     // TRANS-008 B方案: translate=true 时走 LLM optimize+translate；translate=false 走 LLM optimize
                     // translate=false 閺冭绱濋崢鐔告箒 LLM optimize 鐠侯垰绶炴稉宥呭綁

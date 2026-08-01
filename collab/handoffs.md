@@ -1,5 +1,16 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — coder-2 — OBS-SCENE-TITLE-005 ✅ 场景日志补记 window_title（Gavin 裁定解除日志侧禁令）
+
+- **来源**：主控从 414 次真实听写统计出场景分布（chrome→browser 151 次 36% 最大单一场景且 multiline_safe=false），但日志不记 window_title，本批新增的 Google Keep/金山文档/HackMD 等 20 多条 web 关键词全是凭想象猜的。补标题日志后按频次数据驱动补词。基线 `bcc5aa4`（ahead 15）
+- **范围**：仅 `src/main.rs` 一处日志 + 其上方注释（+10/−3），零逻辑改动
+- **注释改写（决策变更记录，四要素）**：① 原红线「禁止打印 window_title」出自 SCENE-OBS-001 ② Gavin 2026-08-01 裁定解除 ③ 理由：debug.log 为纯本地文件不外发 ④ **⚠️ 边界没有全解**：`send_window_title`（控制标题上送 LLM）的隐私边界完全不变，仍默认 false——外发与本地记录是两件事，已写入注释焊死
+- **日志追加**：`Scene context: ... f4_injected={}, window_title={:?}`——字段在**末尾**（既有字段顺序/名称零变化，主控 grep 统计脚本向后兼容），用 `{:?}` 自动加引号并转义（防标题内换行/引号破坏日志行）
+- **验证**：`cargo check` + `cargo check --tests` 双 0 errors；`cargo test --bin feiyin-ime` **715 passed / 0 failed / 6 ignored** 零新增红条；`cargo fmt -- src/main.rs` 零连带（diff 仅 13 行，全部为本任务注释+日志）
+- **边界**：`send_window_title` 逻辑零改动；`src/llm/mod.rs`/`src/scene/mod.rs`/`scene-rules.toml`/`src/itn.rs`/`src-tauri/**`/`ui/**` 零触碰；未启动 exe（PID 23604 是 Gavin 在用实例）；未构建/出包；未改版本号（0.7.3）；未用 git 破坏命令；UTF-8 用 edit 工具
+- **⚠️ 观察（非本任务）**：`:2970` 有一条既有 mojibake 注释（`閺冭绱濋崢鐔告箒`），非本批引入，未处理
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-2/result.md`（非空）
+
 ## 2026-08-01 — coder-1 — DATA-SCENE-COVERAGE-004 ✅ 词表修错 + Windows/macOS 自带应用 + 邮件覆盖补全（纯数据免构建）
 
 - **来源**：Gavin 2026-08-01 追加需求，插在出包之前（与场景/Markdown 批次合并构建）。基线 `1dbd767`（ahead 14）
