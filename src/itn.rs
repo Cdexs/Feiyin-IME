@@ -2116,7 +2116,11 @@ mod tests {
 
     #[test]
     fn time_afternoon() {
-        assert_eq!(normalize_test("下午三点五十分"), "下午3点50分");
+        // TEST-SYNC-ITN-V2-007：断言更新。ITN-V2-FIX-TIMEPREFIX-001（时段词前缀
+        // 不再抢先消费数字）落地后，「下午三点五十分」在时段词分支让位给丙型
+        // try_parse_unit_chain 接管 → 产出 `下午3:50`（DEC-037 时间族归一为 H:MM
+        // 通用书写形式）。旧值 `下午3点50分` 是时段词分支抢先消费产物，已过时。
+        assert_eq!(normalize_test("下午三点五十分"), "下午3:50");
     }
 
     #[test]
@@ -3119,5 +3123,82 @@ words = ["度"]
         assert_eq!(normalize_test("四大名捕"), "四大名捕");
         assert_eq!(normalize_test("九度OJ"), "九度OJ");
         assert_eq!(normalize_test("五类分子"), "五类分子");
+    }
+
+    // ============================================================
+    // TEST-SYNC-ITN-V2-007 · 时段词前缀修复（ITN-V2-FIX-TIMEPREFIX-001）
+    // ============================================================
+    // 根因：主循环时段词分支（:1509）在甲型（:1425）之后，但甲型在时段词首字
+    // 位置匹配不上（不是数字），游标落到时段词分支后被整体消费「前缀+数字」并
+    // 跳到时间后缀 →「四点三刻」再无机会进入甲型 → 输出 `4点3刻` 而非 `4:45`。
+    // 修复：时段词分支匹配前缀后、消费数字前，先在数字位置试甲/乙/丙型，命中
+    // 则只输出前缀、游标交还主循环，复用无前缀时的同一条处理路径。
+    //
+    // ⚠️ 本轮规格要求（TEST-SYNC-ITN-V2-007 §二）：用例必须带真实语流上下文
+    // （时段词前缀 / 前后文 / 句中位置），裸串断言只能作为补充。这是本项目第二例
+    // 「测试全绿但生产不生效」—— 旧用例 `itn_v2_p3_jia_quarter_mode` 断言裸串
+    // `五点三刻`→`5:45`，真实语流 `下午四点三刻在...` 却被时段词分支抢先消费。
+    // 故本组 T7/T8/T9 全部带前缀/上下文，仅 T10 保留裸串作反向护栏补充。
+    //
+    // 期望值来源：T7/T8/T10 锚点来自 coder-1 真机 `cargo test` 实测；T9 边界用例为
+    // 不变式保持（前缀后无数字，任何路径都不可能触发转换），由代码走查验证，非推断。
+
+    // T7 · 时段词 × 刻模式（修复的核心命中场景）
+    #[test]
+    fn itn_v2_007_t7_period_quarter_mode() {
+        assert_eq!(normalize_test("下午四点三刻见面"), "下午4:45见面");
+        // ⭐ Gavin 原句：`八里庄` 必须仍受保护（itn-rules.toml:485）
+        assert_eq!(
+            normalize_test("每天下午四点三刻在八里庄见面"),
+            "每天下午4:45在八里庄见面"
+        );
+        assert_eq!(normalize_test("晚上七点三刻"), "晚上7:45");
+    }
+
+    // T8 · ⭐ 时段词 × 半模式（7 个时段词全覆盖，爆炸半径的另一半）
+    // 上午/下午/凌晨/晚上/中午/傍晚/清晨 一个都不能少 —— 少测一个就等于给那个
+    // 词留一条无人看守的路径。
+    #[test]
+    fn itn_v2_007_t8_period_half_mode_all_7() {
+        assert_eq!(normalize_test("上午八点半"), "上午8:30");
+        assert_eq!(normalize_test("下午四点半"), "下午4:30");
+        assert_eq!(normalize_test("凌晨两点半"), "凌晨2:30");
+        assert_eq!(normalize_test("晚上七点半"), "晚上7:30");
+        assert_eq!(normalize_test("中午十二点半"), "中午12:30");
+        assert_eq!(normalize_test("傍晚六点半"), "傍晚6:30");
+        assert_eq!(normalize_test("清晨五点半"), "清晨5:30");
+    }
+
+    // T9 · ⭐⭐ 边界护栏：文本以时段词结尾（主控在验收中拦下的 panic）
+    // match_date_prefix 只做 starts_with，对前缀之后是否还有字符无任何要求。
+    // 文本恰好以时段词结尾时 after == chars.len()，守卫若用 chars[after] 直接
+    // 索引会 panic（index out of bounds）。修复已改用 chars.get(after).is_some_and。
+    // 成因与本批修的 bug 同源 —— 既有 124 条用例没有任何一条以时段词结尾，
+    // 本组写为显式边界护栏锁死，防止将来有人重构回 chars[after] 直索引。
+    #[test]
+    fn itn_v2_007_t9_period_word_at_end_boundary() {
+        assert_eq!(normalize_test("改到明天下午"), "改到明天下午");
+        assert_eq!(normalize_test("那就晚上"), "那就晚上");
+        // 最极端情形：整串就是一个时段词
+        assert_eq!(normalize_test("凌晨"), "凌晨");
+        assert_eq!(normalize_test("上午"), "上午");
+        assert_eq!(normalize_test("中午"), "中午");
+        assert_eq!(normalize_test("傍晚"), "傍晚");
+        assert_eq!(normalize_test("清晨"), "清晨");
+    }
+
+    // T10 · 反向护栏（既有行为不得回归）
+    // 正向/负向路径 + 裸串补充（裸串已有 P3 覆盖，此处仅作本批回归锚点）。
+    #[test]
+    fn itn_v2_007_t10_period_regression_guards() {
+        // 时段词正向路径不变：前缀后数字+时间后缀仍转
+        assert_eq!(normalize_test("下午四点"), "下午4点");
+        // 负向路径不变：前缀后非时间后缀 → 不转
+        assert_eq!(normalize_test("下午三个人"), "下午三个人");
+        // 裸串仍过（补充形态，P3 已有裸串覆盖）
+        assert_eq!(normalize_test("五点三刻"), "5:45");
+        assert_eq!(normalize_test("四点半"), "4:30");
+        // `刻`+`钟` 否决仍生效（一刻钟=时长，不转）—— 命中保护表 itn-rules.toml:420
+        assert_eq!(normalize_test("一刻钟"), "一刻钟");
     }
 }

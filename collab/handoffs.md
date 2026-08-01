@@ -1,5 +1,29 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — tester-1 — TEST-EXEC-ITN-V2-007 + BUILD-RELEASE-20260801-002 ✅ 回归全绿 + 出包完成
+
+- **Step A 全量回归（硬门槛通过）**：cargo test **771/0/8**（main 707 + crash-reporter 28 + 集成 36）+ src-tauri **53/0/0** + itn:: **128**（124+4）；交叉验证 128+585+30+36=779=771+8 自洽
+- **点名确认**：`time_afternoon` 红转绿（`下午3:50`）✅ + `itn_v2_007_t9_period_word_at_end_boundary` 通过 ✅（锁死 `chars[after]` 越界 panic，修正生效）→ 才进 Step B
+- **A4/A5 SKIP**：本批仅 src/itn.rs Rust 逻辑，零前端/UI/原生窗口改动；ui/ + src-tauri/ M 文件为前序批次遗留
+- **出包**：`cargo build --release` 1m47s 0 errors（无 clean）；同步 Publish/feiyin-ime.exe + crash-reporter.exe；feiyin-ime-ui.exe 未动
+- **C1 决定性判据**：feiyin-ime.exe 新 sha `56aff156b4dac107…` ≠ 8092cf38 ✅；ui 仍 16acff20 ✅；⚠️ crash-reporter sha 变 `1b02838b…`（src/crash/reporter.rs 07-30 CRLF churn，`--ignore-space-at-eol` 零差异真内容未变，增量重编漂移，非本批引入）
+- **C2**：两副本逐一一致；feiyin-ime.exe 11,875,328 B（上轮 11,878,912，−3,584B 守卫代码量级）；**C3** toml 三副本全一致（itn 93ab3972 / scene 7b01b33c）；**C4** 0.7.3.0 三处版本号 0.7.3；**C5** mtime exe(13:47)>src/itn.rs(13:37)
+- **C6**：新实例 **PID 23604** `-debug` Responding=True 零 panic；ITN 懒加载确认（无新 ITN 行，待 Gavin 首次语音触发，上轮机制一致）
+- **改动**：本批仅 `src/itn.rs`（+82/−1 全测试模块，生产零改动）；39 个 M 文件全为前序批次遗留
+- **端测确认点**：时段词+刻/半短语（如 `下午四点三刻`→`下午4:45`）；Gavin 首次语音后 debug.log 出现晚于 05:49:36Z 的 `ITN rules loaded` 行
+- **详情**：`collab/outbox/tester-1/result.md`
+
+## 2026-08-01 — tester-1 — TEST-SYNC-ITN-V2-007 ✅ 时段词前缀修复测试同步（阶段三）
+
+- **来源**：ITN-V2-FIX-TIMEPREFIX-001（`8c7f9d2`，main ahead 7）——时段词分支抢先消费数字致甲型被跳过（`下午四点三刻`→`4点3刻`）
+- **A 断言更新**：`src/itn.rs:2118` `time_afternoon` 旧值`下午3点50分`（抢先消费产物）→`下午3:50`（DEC-037 H:MM）——主控验收确认断言过时非回归
+- **B 新增 4 组测试**（文件尾 :3145+）：T7 刻模式 3 条（含 Gavin 原句+`八里庄`保护）｜T8 半模式 7 时段词全覆盖｜T9 ⭐⭐ 以时段词结尾边界护栏（锁死 `chars.get(after).is_some_and` panic，含整串即时段词）｜T10 反向护栏 5 条（正向/负向/裸串锚点/`一刻钟`保护）
+- **规格落实**：ITN 文法测试必须带真实语流上下文（本批新规格），裸串仅 T10 补充；`normalize_test` 直调生产入口 :2046-2048
+- **评估项 C**：负数/经纬度前缀暂不补护栏——语义保留（`零下3度半`/`东经38度半`）非值错误，断言欠佳行为反而「洗白」，P6 修复后随修复写测试
+- **自验**：`cargo check --tests` 0 errors；`cargo fmt -- src/itn.rs` 后 `--check` 0 diff；fmt 影响面仅 src/itn.rs；git diff +81/−1 两 hunk 均在 mod tests 内，生产代码零改动
+- **边界**：未跑 cargo test/build/pytest/exe；未改生产代码/规则/配置/版本号；工作树其余 M 文件为前序批次遗留未触碰
+- **详情**：`collab/outbox/tester-1/result.md`（已覆盖本任务）；**阶段四可跑** `cargo test itn::`，预期 time_afternoon 红转绿 + T7-T10 全绿
+
 ## 2026-08-01 — coder-1 — ITN-V2-FIX-TIMEPREFIX-001 ✅ 时段词前缀抢先消费导致甲型文法被跳过
 
 - **来源**：Gavin 端测反馈「下午四点三刻见面」输出「下午4:30见面」

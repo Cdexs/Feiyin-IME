@@ -4,9 +4,11 @@
 > 详细记录见 logs/YYYYMMDD.md
 
 ---
+| TEST-EXEC-ITN-V2-007 + BUILD-RELEASE-20260801-002 | 时段词修复回归+出包（阶段四+五，Step A 全绿才出包）：cargo test 771/0/8 + itn:: 128（124+4）+ src-tauri 53/0/0 交叉自洽；time_afternoon 红转绿 + itn_v2_007_t9 边界护栏点名通过；cargo build --release 1m47s；C1 feiyin-ime.exe 新 sha 56aff156≠8092cf（构建吃到改动）+ ui 仍 16acff（未误建）+ crash-reporter 哈希漂移（CRLF churn 增量重编）；C2 两副本一致 11,875,328B；C3 toml 三副本全一致；C4 0.7.3.0；C6 新实例 PID 23604 Responding=True 0 panic；生产代码零改动（测试块 +82/−1）| tester-1 | 2026-08-01 |
 | BUILD-RELEASE-20260801-001 | v0.7.3 出包（仅主程序，UI/npm 跳过）：cargo build --release 1m51s 0 errors；V1 决定性探针（一/五/八分钟 旧 exe=1→新 exe=0，对照一刻钟=1）；V2 exe 两副本 sha256 一致；V3 toml 三副本 sha256=93ab3972 一致 [TOML-STALE-001] 闭环；V4 版本 0.7.3.0；V5 mtime 晚于源码；V6 新实例 PID 20000 Responding=True 0 panic（ITN 懒加载证据链完整）；零源文件改动 | tester-1 | 2026-08-01 |
 | TEST-EXEC-ITN-V2-006 | 全量回归（阶段四）：cargo test 767/0/8 + itn:: 124/0（--list 交叉验证 775=767+8 自洽）+ src-tauri 53/0/0；R1 T3 四条多位数期望全实证（三十五台→35台 等，consumed>=2 守卫零回归）；R3 实例 22556 Responding=True debug.log 零 panic；0 红条，出包就绪 | tester-1 | 2026-08-01 |
 | TEST-SYNC-ITN-V2-006 | 测试同步（ENGINE-006 is_real_unit + LEXICON-006-C）：src/itn.rs 测试块 +107/−0 纯新增 6 条单测（双隶属量词保持汉字 / 真单位仍转 / 多位数 consumed>=2 护栏补齐 / N分钟 10 条红1闭合 / 2字词移除恢复 / 13 条更长词条保护）；cargo check --tests 0 errors，阶段三未跑 cargo test，T3 四条期望列待 TEST-EXEC 确认 | tester-1 | 2026-08-01 |
+| TEST-SYNC-ITN-V2-007 | 时段词前缀修复测试同步（ITN-V2-FIX-TIMEPREFIX-001）：src/itn.rs 测试块 +81/−1（time_afternoon 断言 →下午3:50 + 4 组 T7-T10：刻/半模式带真实语流上下文、7 时段词全覆盖、以时段词结尾的边界护栏锁死 chars.get panic、反向护栏 5 条含八里庄/一刻钟保护）；cargo check --tests 0 errors + cargo fmt 0 diff，生产代码零改动；评估项 C 结论暂不补负数/经纬度护栏（语义保留非值错误，P6 修复后随修复写测试）| tester-1 | 2026-08-01 |
 | ITN-V2-FIX-TIMEPREFIX-001 | 时段词前缀抢先消费致甲型文法被跳过：match_date_prefix分支内新增文法优先让位(甲/乙/丙命中则只输出前缀交还游标)；V1 3/3含Gavin原句+V2 7时段词半模式+V3 6反向护栏+V4 13回归全过；cargo test itn:: 123/1(time_afternoon断言过时归TEST-SYNC) | coder-1 | 2026-08-01 |
 | ITN-V2-LEXICON-006-C | 移除 5 条 2 字遮蔽词条(三元/九度/二分/五类/四大)：二分钟→2分钟红1闭合+三元钱→3元钱+九度电→9度电；13条反向护栏全保护；13条回归全过；cargo test itn:: 118/0 | coder-1 | 2026-08-01 |
 | ITN-V2-ENGINE-006-B-R2 | 返工：A2 二分钟真根因(`二分`前缀遮蔽非保护词条移除)+11条N分钟实测10/11通过(临时test已删git diff 5/2自证)；B 反向分组算法复现130随机子集(15/15校验一致)+逐族🔴/⚪分类(75能产/55专名) | coder-1 | 2026-08-01 |
