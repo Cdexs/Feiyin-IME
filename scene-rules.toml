@@ -146,7 +146,7 @@ style = "Formal email writing style. The dictation may be ANY FRAGMENT of an ema
 multiline_safe = true
 title_keywords = [
     "Outlook", "Foxmail", "Thunderbird", "邮件", "邮箱",
-    "Mail", "Gmail", "Inbox", "收件箱", "发件箱",
+    "Mail", "Gmail", "Inbox", "收件箱", "发件箱", "Yahoo Mail", # FIX-SCENE-TITLE-LONGEST-001：从 browser 块移入（网页邮箱应归 email，且其比 Mail/Inbox 严格更长，留在 browser 会被方案 A 的严格更长胜出坐实错分类）
 ]
 
 # ============================================================
@@ -395,7 +395,10 @@ exe = [
 ]
 title_keywords = [
     # 邮箱场景兜底（浏览器网页邮箱）
-    "Outlook", "Gmail", "Yahoo Mail", "邮件", "邮箱", "Mail",
+    # FIX-SCENE-TITLE-LONGEST-001 特批：Yahoo Mail 已移入 email 块（见 :149）——
+    # 它比 email 块的 Mail/Inbox 严格更长，留在本块会让 UnknownApp + "Yahoo Mail - Inbox"
+    # 被判为 browser(false) 而非 email(true)，被方案 A 的「严格更长胜出」坐实错分类。
+    "Outlook", "Gmail", "邮件", "邮箱", "Mail",
     # 文档场景兜底（网页文档编辑器）
     "Google Docs", "腾讯文档", "石墨文档", "飞书文档", "Notion",
     "语雀", "Online Doc",

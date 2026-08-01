@@ -156,24 +156,18 @@ impl CompiledRules {
         // 优先级 1：exe 精确匹配
         for rule in &self.rules {
             if rule.exe_lower.contains(&exe_lower) {
-                // 浏览器细分：exe 命中 Browser 后，检查其他场景 title_keywords 覆盖
+                // 浏览器细分：exe 命中 Browser 后，检查其他场景 title_keywords 覆盖。
+                // FIX-SCENE-TITLE-LONGEST-001：改确定性最长匹配（见 find_longest_title_rule
+                // 注释，与 ITN-V2-ENGINE-002 filter+max() 同源）。
                 if rule.kind == SceneKind::Browser && !title.is_empty() {
-                    for other_rule in &self.rules {
-                        if other_rule.kind == SceneKind::Browser {
-                            continue; // 跳过浏览器自身的 title_keywords
-                        }
-                        for kw in &other_rule.title_keywords {
-                            // SCENE-TITLE-CASE-001: 大小写不敏感匹配
-                            if title_lower.contains(kw.as_str()) {
-                                return SceneContext {
-                                    scene: other_rule.kind,
-                                    app_exe: exe.to_string(),
-                                    window_title: title.to_string(),
-                                    multiline_safe: other_rule.multiline_safe,
-                                    style_hint: other_rule.style.clone(),
-                                };
-                            }
-                        }
+                    if let Some(other_rule) = self.find_longest_title_rule(&title_lower, true) {
+                        return SceneContext {
+                            scene: other_rule.kind,
+                            app_exe: exe.to_string(),
+                            window_title: title.to_string(),
+                            multiline_safe: other_rule.multiline_safe,
+                            style_hint: other_rule.style.clone(),
+                        };
                     }
                 }
                 return SceneContext {
@@ -187,20 +181,18 @@ impl CompiledRules {
         }
 
         // 优先级 2：标题关键词（exe 未命中任何规则时）
+        // FIX-SCENE-TITLE-LONGEST-001：改确定性最长匹配。此路径**不排除 Browser**——
+        // exe 未命中任何规则时，browser 自身的 title_keywords 是合法候选（与改动 1
+        // 浏览器细分「跳过自身」的语义差异见 find_longest_title_rule 注释）。
         if !title.is_empty() {
-            for rule in &self.rules {
-                for kw in &rule.title_keywords {
-                    // SCENE-TITLE-CASE-001: 大小写不敏感匹配
-                    if title_lower.contains(kw.as_str()) {
-                        return SceneContext {
-                            scene: rule.kind,
-                            app_exe: exe.to_string(),
-                            window_title: title.to_string(),
-                            multiline_safe: rule.multiline_safe,
-                            style_hint: rule.style.clone(),
-                        };
-                    }
-                }
+            if let Some(matched) = self.find_longest_title_rule(&title_lower, false) {
+                return SceneContext {
+                    scene: matched.kind,
+                    app_exe: exe.to_string(),
+                    window_title: title.to_string(),
+                    multiline_safe: matched.multiline_safe,
+                    style_hint: matched.style.clone(),
+                };
             }
         }
 
@@ -212,6 +204,63 @@ impl CompiledRules {
             multiline_safe: false,
             style_hint: String::new(),
         }
+    }
+
+    /// 在全部 rule 的 title_keywords 中做**确定性最长匹配**，返回命中且字符数最长的那条所属 rule。
+    ///
+    /// FIX-SCENE-TITLE-LONGEST-001：此前的遍历是「按 toml 块顺序首匹配即返回」，短词
+    /// （chat 块的 `钉钉`/`飞书`）排在长词（doc 块的 `钉钉文档`/`飞书文档`）之前时，
+    /// 长词永远轮不到，导致 `chrome.exe + 钉钉文档 - 协作` 被误判为 chat。
+    ///
+    /// 处置方式与 ITN-V2-ENGINE-002 / [ITN-PREFIX-SHADOW-001] 同源：`src/itn.rs`
+    /// `check_protection` 对 `十一月`⊂`十一` 这类前缀遮蔽也是改为确定性最长匹配
+    /// （`filter` + `max()`），规则性碰撞用规则解决，不用词表补丁（DEC-038）。
+    ///
+    /// - `exclude_browser=true`：跳过 Browser 块 —— SCENE-SENSE-001 浏览器细分语义
+    ///   「浏览器不参与自身细分」（改动 1 用）。
+    /// - `exclude_browser=false`：不排除 Browser —— exe 未命中任何规则时 browser 自身
+    ///   的 title_keywords 是合法候选（改动 2 / 优先级 2 兜底用）。
+    ///
+    /// 比较用 `kw.chars().count()`（字符数）而非字节数，中文关键词必须正确计长。
+    /// `title_lower` 只计算一次由调用方传入（SCENE-TITLE-CASE-001 既有优化，不退化）。
+    ///
+    /// 平局打破规则（主控 2026-08-01 裁定，方案 A）：browser 是**通用保守兜底场景**，
+    /// 它的 title_keywords 多与 email/doc 等具体场景共享（见 browser 块注释「邮箱场景
+    /// 兜底」）。两处候选同长时若仍按「取迭代靠后的块」，browser 块排在 toml 末尾必然
+    /// 胜出，`UnknownApp + 收件箱 - Outlook` 会被误判为 browser。故：**同长时具体场景
+    /// 优先于 browser，browser 仅当其关键词严格更长才胜出**。与 DEC-038「规则性问题用
+    /// 规则解决」一致，且可推广到未来任何「通用兜底块」。
+    ///
+    /// 平局确定性：比较键为 `(len, 非browser=1/browser=0)`，`>` 严格序、无 `>=` 覆盖，
+    /// 迭代顺序稳定 → 结果确定可预期，不随机漂移。
+    fn find_longest_title_rule(
+        &self,
+        title_lower: &str,
+        exclude_browser: bool,
+    ) -> Option<&CompiledRule> {
+        let mut best: Option<(&CompiledRule, usize, bool)> = None;
+        for rule in &self.rules {
+            if exclude_browser && rule.kind == SceneKind::Browser {
+                continue;
+            }
+            for kw in &rule.title_keywords {
+                if title_lower.contains(kw.as_str()) {
+                    let len = kw.chars().count();
+                    let is_browser = rule.kind == SceneKind::Browser;
+                    // 比较键 (len, !is_browser)：len 主序，平局时非 browser 优先
+                    let better = match best {
+                        None => true,
+                        Some((_, best_len, best_is_browser)) => {
+                            len > best_len || (len == best_len && !is_browser && best_is_browser)
+                        }
+                    };
+                    if better {
+                        best = Some((rule, len, is_browser));
+                    }
+                }
+            }
+        }
+        best.map(|(rule, _, _)| rule)
     }
 }
 

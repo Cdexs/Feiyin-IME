@@ -1,5 +1,23 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — coder-2 — FIX-SCENE-TITLE-LONGEST-001 ✅ 标题关键词改确定性最长匹配（+方案 A 平局打破 + Yahoo Mail 特批移动）
+
+- **来源**：tester-1 在 TEST-EXEC-SCENE-MD-003 发现真生产碰撞（`chrome + 钉钉文档 - 协作` 被 chat 块 `钉钉` 遮蔽 → false）并停手上报。主控裁定方案 (c) 确定性最长匹配。基线 `8ce1be2`（ahead 13）
+- **范围**：`src/scene/mod.rs`（生产段）+ `scene-rules.toml`（**特批一条** Yahoo Mail 移动）。`src/llm/mod.rs` 零触碰
+- **改动 1（浏览器细分）**：`:160-177` 改调 `find_longest_title_rule(&title_lower, true)`——所有非 Browser 块 title_keywords 中选命中且字符数最长者，用它所属 rule 分类。`exclude_browser=true` 保留 SCENE-SENSE-001「浏览器不参与自身细分」设计
+- **改动 2（优先级 2 兜底）**：`:191-204` 改调 `find_longest_title_rule(&title_lower, false)`——**不排除 Browser**（exe 未命中任何规则时 browser 自身 title_keywords 是合法候选）
+- **新增辅助函数 `find_longest_title_rule`**：遍历全部 rule.title_keywords，`chars().count()`（字符数非字节数）确定性最长匹配。注释引用 ITN-V2-ENGINE-002 / [ITN-PREFIX-SHADOW-001] 先例 + DEC-038
+- **方案 A 平局打破（主控 2026-08-01 裁定）**：初版「平局取靠后块」会让 browser 块（toml 末尾）赢过 email/doc——`UnknownApp + 收件箱 - Outlook` 变 Browser。裁定：**同长时具体场景优先于 browser，browser 仅严格更长才胜出**。比较键 `(len, 非browser=1/browser=0)`
+- **Yahoo Mail 特批移动（scene-rules.toml）**：browser 块 title_keywords 的 `Yahoo Mail` 移入 email 块。主控逐条比对发现它比 email 块的 Mail(4)/Inbox(5) 严格更长（9字符），采纳 A 后 `UnknownApp + Yahoo Mail - Inbox` 会被 A 的「严格更长胜出」错判给 browser(false)。**仅此一条，未顺手改别的**
+- **验证**：`cargo test --bin feiyin-ime scene::` **70 passed / 0 failed**（临时验证测试已删）；`cargo check` + `cargo check --tests` 双 0 errors；`cargo fmt -- src/scene/mod.rs` 零连带
+- **V1 修复实证**：`chrome + 钉钉文档 - 协作` → doc/true（本批新增碰撞）；`chrome + 飞书文档` → doc/true（**历史遗留缺陷**，自 SCENE-SENSE-001 起 `飞书` 遮蔽 `飞书文档`，一直错着）
+- **V2 反向护栏**：`钉钉`/`飞书`/`微信网页版` → chat/false；`百度一下` → browser/false 全过
+- **V3 既有不回归**：Google Docs/Gmail/Jira/Confluence/SiYuan 全过
+- **V4 兜底路径**：`UnknownApp + 收件箱-Outlook`/`inbox`/`GMAIL` → email/true；`UnknownApp + Yahoo Mail - Inbox` → **email/true**（特批验证）；`UnknownApp + Online Doc` → doc（平局非 browser 胜出）；`UnknownApp + 百度一下` → Unknown（browser 无独有词）
+- **⚠️ 观察点（供主控后续裁定，本批不动）**：browser 块 title_keywords 移走 Yahoo Mail 后**全部是 email/doc 的重复条目**（Outlook/Gmail/邮件/邮箱/Mail/Google Docs/腾讯文档/石墨文档/飞书文档/Notion/语雀/Online Doc 均在 email 或 doc 块）。采纳 A 后它们永远赢不了平局（同长非 browser 优先），等于死条目——优先级 2 兜底中 browser 无独有词可命中，纯浏览器标题退化为 Unknown。是否清理待定
+- **边界**：`src/llm/mod.rs`/`src/itn.rs`/`itn-rules.toml`/`src/main.rs`/`src-tauri/**`/`ui/**` 零触碰；未构建/出包/启动 exe；未改版本号（0.7.3）；未用 git 破坏命令；UTF-8 用 edit 工具
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-2/result.md`（非空）
+
 ## 2026-08-01 — tester-1 — TEST-SYNC-SCENE-MD-003 ✅ 场景扩展 + Markdown 列表测试同步（阶段三，只写测试）
 
 - **来源**：IMPL-SCENE-MULTILINE-002（coder-1）+ FORMAT-MD-BULLET-001（coder-2）+ Gavin 2026-08-01 裁定（编辑生成类放开多行、无序用标准 Markdown）。基线 `8e65239`（main ahead 10 未 push）
