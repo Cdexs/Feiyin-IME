@@ -869,15 +869,17 @@ fn build_output_format(multiline_safe: bool) -> String {
         \nF3a. Ordered list (when the speech has explicit SEQUENCE or order and items are LONG): \
         you MUST split the content into numbered list lines using the exact prefix \"1. \", \"2. \", \"3. \" \
         inside <corrected> tags. DO NOT use \"1)\" or Markdown \"#\" headings.\
-        \nF3b. Bullet list (when the speech lists items WITHOUT a clear order): \
+        \nF3b. Bullet list (when the speech lists items WITHOUT a clear order AND items are LONG): \
         you MUST split the content into bullet list lines using the exact prefix \"- \" inside \
         <corrected> tags. DO NOT use \"* \", \"• \", or \"#\". \
-        List items may be FULL SENTENCES or longer clauses — they do NOT need to be short noun \
-        phrases. Narrative exemplification (e.g., several \"比如说\" clauses each introducing a \
+        List items here are FULL SENTENCES or longer clauses. SHORT noun phrases MUST NOT be \
+        bulleted — per F3-item form above they are joined INLINE with the enumeration separator. \
+        Narrative exemplification (e.g., several \"比如说\" clauses each introducing a \
         distinct example of a stated problem) is exactly the case for a bullet list.\
         \nF3c. Examples:\
         \n- Chinese ordered: \"第一点xxx，第二点yyy\" → \"1. xxx\\n2. yyy\"; \"首先xxx，然后yyy，最后zzz\" → \"1. xxx\\n2. yyy\\n3. zzz\".\
         \n- Chinese unordered: \"有的xxx，有的yyy\" → \"- xxx\\n- yyy\"; \"比如说有些学生头发过长，比如说还有些学生奇装异服，还有些学生说脏话\" → \"- 有些学生头发过长\\n- 还有些学生奇装异服\\n- 还有些学生说脏话\".\
+        \n- Chinese SHORT items inline (enumeration confirmed but NO list): \"今天出去买菜了，买了3斤土豆，一个西瓜，20斤大米，还有3斤香蕉\" → \"今天出去买菜了，买了3斤土豆、一个西瓜、20斤大米、还有3斤香蕉\".\
         \n- English unordered: \"For example, some students keep their hair too long; for example, some wear inappropriate clothes; also, some use bad language\" → \"- Some students keep their hair too long\\n- Some wear inappropriate clothes\\n- Some use bad language\".\
         \n- Japanese unordered: \"たとえば、髪が長すぎる学生がいます。たとえば、奇抜な服装の学生もいます。また、悪い言葉を使う学生もいます\" → \"- 髪が長すぎる学生がいます\\n- 奇抜な服装の学生もいます\\n- 悪い言葉を使う学生もいます\".\
         \n- Korean unordered: \"예를 들어, 머리가 너무 긴 학생들이 있습니다. 예를 들어, 특이한 복장을 한 학생들도 있습니다. 또, 나쁜 말을 쓰는 학생들도 있습니다\" → \"- 머리가 너무 긴 학생들이 있습니다\\n- 특이한 복장을 한 학생들도 있습니다\\n- 나쁜 말을 쓰는 학생들도 있습니다\".\
@@ -885,8 +887,9 @@ fn build_output_format(multiline_safe: bool) -> String {
         \nF3d. Constraints: DO NOT compress or summarize content. DO NOT delete any semantic \
         content. DO NOT add information the user did not say. Preserve every factual point the \
         speaker made; only restructure surface form.\
-        \nOutput format: the <corrected> block MUST span multiple lines when F3 applies; when F3 \
-        does NOT apply, output a single continuous paragraph. Put the opening <corrected> and \
+        \nOutput format: the <corrected> block MUST span multiple lines when F3 applies AND \
+        F3-item form routes the items to a LIST; when F3 does NOT apply, or when F3-item form \
+        routes SHORT items INLINE, output a single continuous paragraph. Put the opening <corrected> and \
         closing </corrected> around the whole text. After the closing tag, optionally ONE final \
         line {{\"suggestions\":[\"correct_word\"]}}.\n\
         Output NOTHING else. No explanations, no commentary, no \"corrected to\", no \"based on\", \
