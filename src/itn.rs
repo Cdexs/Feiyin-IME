@@ -1783,8 +1783,11 @@ fn decide_conversion(
     after_str: &str,
     r: &CompiledRules,
 ) -> bool {
-    // 如果后面有单位 → 转
-    if r.is_unit(after_str) {
+    // 如果后面有真单位（排除 classifiers）→ 转
+    // ITN-V2-006 (红2修复)：从 is_unit 改为 is_real_unit，使双隶属词（间/条/次/名/台/辆/句/篇）
+    // 在逐字路径与甲型路径行为一致。`五间半`→`间`在 all_units+classifier_set →
+    // is_real_unit 返回 false → 不转 → 保持汉字。符合 DEC-030「单字数字+通用量词保留汉字」。
+    if r.is_real_unit(after_str) {
         return true;
     }
     // 如果后面有日期后缀 → 转

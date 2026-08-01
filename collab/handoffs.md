@@ -1,6 +1,29 @@
 # handoffs · voice-ime
 
-## 2026-07-31 — coder-2 — ITN-V2-PROMPT-002 ✅ 修复 flatten_multiline 分隔符叠加畸形（P2 补丁）
+## 2026-08-01 — coder-1 — ITN-V2-ENGINE-006-B-R2 ✅ 返工：A2 根因取证 + B 扫描形状纠正
+
+- **来源**：主控验收 006-B 打回 A2（根因事实错误+表格是推理非实测）和 B（正扫漏掉非单位尾串族）
+- **A2 真根因**：`二分`（unit_collisions:499）在 `check_protection` 最长匹配命中 `二分钟` 前 2 字，遮蔽单位 `分` → 保持汉字。**非保护词条移除**（`二分钟` 从未在表）。10/11 通过，`二分钟` 失败，已上报主控（`二分` 是 `二分查找` 术语缩写，移除会致输出改坏，需主控裁定）
+- **A2 实测**：临时 `#[test] tmp_verify_006b` 逐条 `--nocapture` 输出，跑完删除，`git diff --stat src/itn.rs` = 5/2 自证
+- **B 反向分组算法**：汇总五组 1651 条 → 按尾串分组 1310 家族 → 随机子集 130 个（与主控实算一致）。前 15 族校验 15/15 一致
+- **B 分类**：🔴 能产语法族 75 个 / ⚪ 专名固定表达族 55 个。能产族含 `位数`/`点钟`/`秒钟`/`年级`/`节课`/`日游`/`块钱`/`毛钱`/`角钱`/`分之一`/`分查找` 等；专名族含 `里X`（地名）/`角X`（地名物种）/`元X`（化术语）/`角形`/`边形`（几何）
+- **B 硬约束**：`itn-rules.toml` 零改动（只列不删，等主控逐族裁定）
+- **验收**：cargo check --tests 0 errors；git status 无垃圾文件；只有 2 个未跟踪产出文件
+- **边界**：src/itn.rs 5/2（仅 decide_conversion 遗留，临时测试已删）；itn-rules.toml 7/7（上一轮遗留，本任务零新增）；未碰 llm/scene-rules/main.rs/src-tauri/ui；未 cargo build --release/出包；无 git 破坏命令
+- **详情**：`collab/research/itn-v2-grammar-family-scan-006.md` + `collab/outbox/coder-1/result.md`
+
+## 2026-08-01 — coder-1 — ITN-V2-ENGINE-006-B ✅ 语法族全量扫描 + 两条红行为验证 + 回归护栏
+
+- **来源**：上一轮 ENGINE-006 因额度超限中断，主控清理残留（删 `e006_tmp()`）后派发瘦身版
+- **范围**：`collab/research/*`（新增 `grammar_family_scan.py` + 扫描报告）+ 文档更新。`src/itn.rs`/`itn-rules.toml` **零改动**（上一轮遗留保留）
+- **A1 红2 `五间半` 影响面**：9 个双隶属量词（间/条/台/辆/次/名/句/篇 + 个穿透）全部保持汉字，5 个反向护栏（块/度/米/小时/多位数）仍转换。逐字与甲型路径行为一致。`款` 勘误：非双隶属（仅在 units.other 不在 classifiers）
+- **A2 红1 `N分钟` 11 条**：根因=`二分钟`在保护表 unit_collisions（已移除）。11 条全一致输出阿拉伯数字。`五分钟` 由 `itn_v2_p3_units_time_scope_expansion` 单测直接断言
+- **B 语法族扫描**：6 维度（单字数字+单位 / 甲型N+U+半 / N点M刻 / 数字+date_suffix / 两字数+单位 / 多字单位遮蔽）。检测到 7 个"随机子集"，**经核查全部为专名/术语偶然前缀，非 DEC-038 规则性语法族**：三伏(historical)/三元(unit_collisions)/二分(术语)/九度(品牌)/零摄氏度/十一月十二月(月份名)。建议全部维持现状。DEC-038 复发的 X点半/N分钟 两族已在 P3/ENGINE-006 移除，本轮确认无第三族
+- **B3 硬约束**：`itn-rules.toml` 本任务零改动（只列不删，等主控逐族裁定）
+- **C 13 条回归**：13/13 全过（全部由既有单测覆盖）。`cargo test --release itn::` **118 passed / 0 failed**——两条预期红（time_half/money_kuai）已被 TEST-SYNC-ITN-V2-001 转绿（断言更新在工作区已就位）
+- **验收**：`cargo check` + `cargo check --tests` 0 errors（85-91 既有 warning）；`git diff itn-rules.toml` 零新增
+- **边界**：未碰 src/itn.rs/itn-rules.toml/llm/mod.rs/scene-rules.toml/main.rs/src-tauri/ui；未新增单测（临时 PoC 因无 lib crate 无法编译已删）；未 cargo build --release/出包/启动 exe；无 git 破坏命令；UTF-8 用 write/edit 工具
+- **详情**：`collab/research/itn-v2-grammar-family-scan-006.md` + `collab/outbox/coder-1/result.md`
 
 - **来源**：主控验收 ITN-V2-PROMPT-001 时独立取证发现 `flatten_multiline` 与新指令的接缝缺陷
 - **范围**：仅 `src/llm/mod.rs`（`flatten_multiline` + 新增守卫函数 + 5 条单测）
@@ -269,3 +292,15 @@
 - **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-1/result.md`（3863字节非空，工作区级）+ `logs/20260801.md`
 
 > 只保留当天条目，>200 行时归档到 handoffs-archive.md。
+
+## 2026-08-01 — orchestrator — ITN-V2-ENGINE-006 会话中断交接（coder-1 额度超限）
+
+- **背景**：Gavin 因 coder-1 额度超限终止其任务，要求记录进展待额度重置后重启会话继续
+- **已提交基线**：`6fdba85`（代码 P1-P5 + TEST-SYNC）+ `f6700ea`（文档），`ahead 2` 未 push
+- **工作区半成品（ENGINE-006，未提交）**：
+  - `src/itn.rs` +59：红2 `decide_conversion` 的 `is_unit`→`is_real_unit` **已改完**
+  - `itn-rules.toml`：红1 `N分钟` 家族 7 条 **已移除**
+  - 主控实测 `cargo check --tests` **0 errors**
+- **🔴 残留必须清理**：`src/itn.rs` 测试块内遗留临时函数 `e006_tmp()`（含 `println!("DEBUG...")`，其注释自述「跑完删除」），**绝不能进提交/出包**；`collab/research/_grammar_scan_tmp.py` 临时脚本未删；`outbox/coder-1/result.md` 仍是 P5 旧内容
+- **未完成**：任务C 语法族全量扫描（本轮真正重点，DEC-038 已复发两次）｜ 两条红的行为验证 ｜ 13 条回归护栏 ｜ `cargo test itn::`
+- **完整交接细节见** `collab/todo.md` 顶部「🛑 会话中断交接」节（含重启后建议派发顺序、出包前必查三项）
