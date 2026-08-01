@@ -1,5 +1,14 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — tester-1 — TEST-SYNC-MEMOS-011 + 三副本同步 ✅ 免构建
+
+- **来源**：DATA-SCENE-MEMOS-011（coder-1，doc title_keywords + Memos/- Memos）。基线 `f18633d`（ahead 28 未 push）
+- **Step 0 追补**：`scene_md011_memos_to_doc`（chrome+Memos→doc/true；chrome+我的笔记 - Memos→doc/true 最长匹配）+ 守卫价值注释（Gavin 指令推翻不收、误伤→doc 优雅降级、删掉会撞红勿删）；cargo check 0 errors；既有 mastodon 护栏点名仍绿
+- **Step A 全绿**：scene:: 73/0（+1）；全量 784/0/8（+1 自洽）；--list 792=784+8 自洽；点名 3/3（mastodon/builtin_rules_parse_ok/ide_terminal_blocks_disjoint）；A4 SKIP（零 src-tauri/前端/UI）
+- **Step B 三副本同步**：scene-rules.toml 二进制 cp 同步 → 三副本全 `910b2c1f…`；副作用记录（exe 内置默认仍旧，外置优先，下次出包对齐）；**未重启实例**（Gavin PID 29368 未触碰）
+- **Step C**：itn 仍 93ab3972；三 exe 六副本全未变（c4cfe76c/33694d69/16acff20，未误建）；git status 仅 +16 测试块
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/tester-1/result.md`（WSL Python，52 行）+ `logs/20260801.md` §35
+
 ## 2026-08-01 — coder-1 — DATA-SCENE-MEMOS-011 ✅ 收录 Memos 到 doc 块（Gavin 指令推翻「不收」结论）
 
 - **来源**：Gavin 指令「把浏览器标题含 Memos 单词的软件设到笔记软件分类（支持 MD 输出）」。基线 `c9a9734`（ahead 27）

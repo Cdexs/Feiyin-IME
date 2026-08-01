@@ -1391,4 +1391,20 @@ title_keywords = ["doc_keyword"]
         assert_eq!(s.scene, SceneKind::Email, "已发送 应 email");
         assert!(s.multiline_safe, "已发送 email 应 true");
     }
+
+    /// TEST-SYNC-MEMOS-011：Memos 收录 doc（DATA-SCENE-MEMOS-011，Gavin 2026-08-01 指令）。
+    /// ⚠️ 守卫价值：Gavin 指令推翻了 RESEARCH-SCENE-MULTILINE-002 的「不收」结论（当时因
+    /// 特异性低判不收）。误伤面（英文文章标题含 leaked memos/company memos 等）落「误伤→doc」
+    /// 只多给多行与列表文本，仍属优雅降级可接受，已知且记录在案。
+    /// 若将来有人以「特异性低」为由删掉它，这条测试会撞红——那正是它的守卫价值，勿删。
+    #[test]
+    fn scene_md011_memos_to_doc() {
+        let s = classify_builtin("chrome.exe", "Memos");
+        assert_eq!(s.scene, SceneKind::Doc, "Memos 应 doc");
+        assert!(s.multiline_safe, "Memos 应 true");
+        // 更具体后缀形式：- Memos 最长匹配优先胜出
+        let s = classify_builtin("chrome.exe", "我的笔记 - Memos");
+        assert_eq!(s.scene, SceneKind::Doc, "我的笔记 - Memos 应 doc");
+        assert!(s.multiline_safe, "我的笔记 - Memos 应 true");
+    }
 }
