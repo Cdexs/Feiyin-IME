@@ -62,8 +62,6 @@ exe = [
     # --- 视频会议（归 chat：会议聊天区 Enter=发送、多行危险，与 IM 同构）---
     "Zoom.exe",            # ⚠️未证实：Zoom 会议（官网有 Windows 包，exe 名未实测；待 debug.log 的 Scene context 实证）
     "wemeetapp.exe",       # ⚠️未证实：腾讯会议（官网 meeting.tencent.com 有 Windows 包，exe 名未实测）
-    # --- 项目管理（评论 Enter=发送，保守归 chat）---
-    "Linear.exe",          # ⚠️未证实：Linear 桌面版（官网 linear.app 有 Windows 包，exe 名未实测）
 ]
 
 [[scene]]
@@ -315,6 +313,7 @@ exe = [
     "TodoApp.exe",         # ⚠️惯例推测：Microsoft To Do（UWP，包名 Microsoft.Todos，前台进程名待端测核实，参照改动 1 StickyNotes 处理方式）
     "ClickUp.exe",         # ⚠️惯例推测：ClickUp 桌面版（Electron 产物名 = 产品名，官网有 Windows 包，exe 名未实测）
     "Any.do.exe",          # ⚠️惯例推测：Any.do 桌面版（Electron 产物名，官网有 Windows 包，exe 名未实测）
+    "Linear.exe",           # ⚠️未证实：Linear 桌面版（官网 linear.app 有 Windows 包，exe 名未实测）。Gavin 2026-08-01 改判：Linear 是项目/任务管理工具非聊天工具，从 chat 块移入 doc
     "Focalboard.exe",      # ⚠️惯例推测：Focalboard（Mattermost 看板，官网有 Windows 包，exe 名未实测）
     # --- IMPL-SCENE-MULTILINE-002 改动 9：第三方即时贴 / 桌面便签 ---
     # ⚠️风险评估（主控）：便签本身是多行自由文本控件，Enter=换行不是提交，本批风险最低，可放心收录。
