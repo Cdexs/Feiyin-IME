@@ -85,6 +85,121 @@ f6700ea  docs(itn): ITN 二代决策记录、研究稿与协作文档同步
 
 ---
 
+## 📋 待排期 · SCENE-FORMAT-DIMS-001 拆分 `multiline_safe` 为格式能力多维度（Gavin 2026-08-01：先建 todo，后续排期）
+
+> 性质：**内部架构重构**，无用户可见配置项。需一次构建。
+> 前置：无。可随时启动。**风险点是它动的正是刚稳定下来的 prompt 构建链。**
+
+### 问题
+
+`multiline_safe`（单 bool）在 `src/main.rs:3073` 传入 `build_optimize_request` 后，**一个人决定了三件事**：
+
+| 它控制 | 位置 |
+| --- | --- |
+| `<corrected>` 能否跨行 | `build_output_format(multiline_safe)`（`src/llm/mod.rs:795`） |
+| F3 用多行列表还是单行内联 | `build_format_instruction_block(multiline_safe)`（`:818`） |
+| 是否 `flatten_multiline` 压成一行 | `src/llm/mod.rs:660` |
+
+**这几个问题的答案并不总是一致。已实际撞上一次**：代码编辑器要换行、不要 `- ` 项目符号 —— 当时只能用「方案 A：接受列表」绕过（Gavin 2026-08-01 拍板）。
+
+### 需求矩阵（主控已梳理）
+
+| 场景 | 换行 | 列表 | `#` 标题 | 表格 |
+| --- | --- | --- | --- | --- |
+| Markdown 编辑器 | ✅ | ✅ `- ` | ✅ 想要 | ✅ 想要 |
+| 代码编辑器 | ✅ | ❌ 不想要 | ❌ | ❌ |
+| Word / WPS | ✅ | ✅（会自动转项目符号） | ❌ | 视情况 |
+| 记事本 | ✅ | `- ` 仅字面字符 | ❌ | ❌ |
+| 邮件 | ✅ | ✅ | ❌ | ❌ |
+
+### 设计草案
+
+```toml
+newline    = true          # 能否多行注入
+lists      = true          # 能否用列表
+list_style = "markdown"    # markdown(- / 1.) | plain(• / 1.) | none
+headings   = false         # 能否用 # 标题
+tables     = false
+```
+
+### 影响面
+
+`scene-rules.toml` schema ｜ `SceneRule`（`src/scene/mod.rs:94`）｜ `SceneContext`（`:55`）｜ 解析与传递 ｜ `build_output_format` / `build_format_instruction_block` 从 bool 参数改结构体 ｜ 相关测试。
+
+### 实施前必查
+
+1. **回查 DEC-031 单开关原则** —— 主控初判不触碰（这是内部规则数据，非用户可见开关），但须正式确认
+2. 跨平台：`src/scene/mod.rs` 与 `src/llm/mod.rs` 均为平台中立模块，对 macOS 透明，不违反 DEC-033
+3. **迁移成本随词表增长而上升** —— 现已 9 个 scene 块，越晚做越贵
+
+### 附带清理（本项一并处理）
+
+`scene-rules.toml:15` 注释称 `multiline_safe` 还控制「强制剪贴板」，**主控 grep 注入侧代码零引用，该句为过时描述**，一并订正。
+
+---
+
+## 📋 待排期 · SCENE-FOCUS-PROBE-001 焦点控件类型探测（UIA / AX）（Gavin 2026-08-01：先建 todo，后续排期）
+
+> 性质：**架构级新能力**，跨平台，需完整评估。
+> 🔴 **前置硬门槛：必须先做 PoC，PoC 不通过则不立项。**
+
+### 问题：只有窗口级信号，要判断的却是控件级行为
+
+场景识别拿到的是 `(进程名, 窗口标题)`，**两者都是窗口级**。而「Enter 是换行还是提交」取决于**当前焦点控件**：
+
+| 应用 | 同一窗口内的分歧 |
+| --- | --- |
+| VS Code / Cursor | 编辑器（Enter=换行）／集成终端（Enter=执行）／AI 面板（Enter=发送） |
+| Todo 软件 | 快速添加框（Enter=建任务）／详情备注（Enter=换行） |
+| 设计软件 | 文本图层（Enter=换行）／评论框（Enter=发送） |
+| 浏览器 | 文档编辑区／评论框／搜索框 |
+
+**当前所有残留误判风险的总根源。** 现在是「按应用整体赌一个答案」。
+
+### 技术路径
+
+| 平台 | API | 信号 |
+| --- | --- | --- |
+| Windows | `IUIAutomation::GetFocusedElement()` | `ControlType`：`UIA_EditControlTypeId` ≈ 单行；`UIA_DocumentControlTypeId` ≈ 多行。辅以控件 ClassName（如 Windows Terminal 的 `TermControl`） |
+| macOS | `AXUIElement` → `AXFocusedUIElement` | `AXRole`：**`AXTextField` = 单行、`AXTextArea` = 多行**。信号比 Windows 更干净 |
+
+接缝已存在：`capture_scene_signals` 两平台签名同形（Windows `src/platform/windows/scene.rs:22`，macOS `src/platform/macos/mod.rs:79` 仍为 stub）。
+
+### 🔴 PoC 必须先回答的三个问题
+
+1. **Chrome / Electron 能否拿到有意义的焦点控件类型？**
+   Chrome 默认不开放完整无障碍树（只在检测到读屏器时启用），Electron 应用同理。
+   **而 `chrome.exe` 占真实听写量的 36%（151/414，主控 2026-08-01 从 debug.log 实测）。拿不到 = 方案价值砍半。这是头号风险。**
+2. **耗时**：跨进程 COM 查询通常 5–50ms，但**对无响应应用可能挂住** → 超时与降级策略是否可行
+3. **VS Code 编辑器 vs 集成终端**能否区分 —— 这是最想解决的那个用例
+
+**PoC 规模：半天量级，只验上述三点，不写生产代码。**
+
+### 其他约束
+
+- 跨平台：Windows COM + macOS AX 两套实现，DEC-033 要求不得只产出仅 Windows 可编译的新代码
+- 隐私：**严格只取控件类型，绝不读取控件内容**
+- 失败降级：拿不到信号时必须退回现有 `(exe, title)` 判定，不得阻塞管线
+
+### 与 SCENE-FORMAT-DIMS-001 的关系
+
+两者正交但互补：本项解决「**当前焦点适合什么**」，前者解决「**适合的东西怎么表达**」。建议**先做拆维度**（收益确定、成本有界），本项走 PoC 门禁。
+
+---
+
+## 📋 待裁定 · 领域级泛化关键词第二批（coder-1 建议，主控未采纳未否决）
+
+coder-1 在 DATA-SCENE-GENERIC-008 中评估后建议的候选：**`思维导图` / `白板` / `表格`**。
+
+已评估并**否决**的：`笔记`（小红书网页标题大量含之，社交类判 doc 方向反了；「笔记本电脑」购物页同样命中）、`文档`（帮助/API/产品文档等阅读页覆盖过宽，失去判别意义）。
+
+**裁定判据（主控 2026-08-01 定）**：看误伤会落到哪个方向 ——
+- 误伤 → **doc**：只多给多行与列表，文本仍正确，属优雅降级，**可放宽**
+- 误伤 → **把 chat 类应用判成 doc**：多行注入发帖/发消息框，可能把一条拆成多条发出，**必须卡严**
+
+待 Gavin 拍板。
+
+---
 ## 📋 待排期 · ITN-V2-P6 能产语法族批量收口（Gavin 2026-08-01：先出包，P6 另立）
 
 > 依据：`collab/research/itn-v2-grammar-family-scan-006.md` 的 130 族分类结果
