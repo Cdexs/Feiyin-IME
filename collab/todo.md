@@ -1,8 +1,7 @@
 # 任务列表 · voice-ime
 
-> 当前版本：**v0.7.3**（三处版本号均 0.7.3，2026-07-30 主控复核于 `a07a089` 后重新取证：`Cargo.toml` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json`）
-> ✅ **产物已是最新**（2026-08-01 12:51，BUILD-RELEASE-20260801-001）：`feiyin-ime.exe` `8092cf38` / `crash-reporter.exe` `b02ca32c` 重建，`feiyin-ime-ui.exe` `16acff20` 沿用 07-30（`ui/`+`src-tauri/` 零改动）。两副本 sha256 逐一一致，`itn-rules.toml` 三副本 `93ab3972` / `scene-rules.toml` 三副本 `7b01b33c` 均已同步。**首次含完整 ITN 二代 P1-P5 + ENGINE-006 + LEXICON-006-C**。冒烟实例 **PID 20000** 运行中，待 Gavin 端测。
-> ⏳ **本地 ahead 5 未 push**（Gavin 只授权提交）：`5799c02` / `05de1bc` / `b462f83` / `f6700ea` / `6fdba85`。详见下方「ITN-V2 全批次闭环」节。
+> ✅ **产物已是最新**（2026-08-01 13:47，BUILD-RELEASE-20260801-002）：`feiyin-ime.exe` `56aff156` / `crash-reporter.exe` `1b02838b` 重建，`feiyin-ime-ui.exe` `16acff20` 沿用 07-30。两副本 sha256 逐一一致，`itn-rules.toml` 三副本 `93ab3972` / `scene-rules.toml` 三副本 `7b01b33c` 一致。**含完整 ITN 二代 P1-P5 + ENGINE-006 + LEXICON-006-C + FIX-TIMEPREFIX-001**。冒烟实例 **PID 23604** 运行中，待 Gavin 端测。
+> ⏳ **本地 ahead 8 未 push**（Gavin 只授权提交）：`98c2e9e` / `8c7f9d2` / `5360850` / `5799c02` / `05de1bc` / `b462f83` / `f6700ea` / `6fdba85`。
 > 端测方式（2026-07-25 Gavin 指示）：Gavin 已在**实际日常使用中自行测试**，端测项不再列入本文档；发现 bug 或优化点由 Gavin 邀请重新开单。
 
 ## 文档更新规则
