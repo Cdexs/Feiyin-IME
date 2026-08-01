@@ -1577,7 +1577,10 @@ mod tests {
         assert!(safe.contains("• "), "无序列表须用 \"• \" (U+2022)");
         // 符号禁令：1) / - / * / # 一律禁止
         assert!(safe.contains("\"1)\""), "符号禁令须出现 1) 的禁止声明");
-        assert!(safe.contains("Markdown \"#\""), "符号禁令须出现 # 的禁止声明");
+        assert!(
+            safe.contains("Markdown \"#\""),
+            "符号禁令须出现 # 的禁止声明"
+        );
         assert!(safe.contains("\"- \""), "符号禁令须出现 - 的禁止声明");
         assert!(safe.contains("\"* \""), "符号禁令须出现 * 的禁止声明");
 
@@ -2172,7 +2175,10 @@ mod tests {
     fn both_path_protection_fact_preservation_clauses() {
         // ITN-V2 P1 事实保全条款（两条路径均须具备）：禁止重算/取整/重新表述数值、
         // 时间、日期；4:45 不得变 4:30、明天 不得变 今天。
-        for directive in [super::UNIT_SYMBOL_PROTECTION, super::UNIT_SYMBOL_PROTECTION_TRANSLATE] {
+        for directive in [
+            super::UNIT_SYMBOL_PROTECTION,
+            super::UNIT_SYMBOL_PROTECTION_TRANSLATE,
+        ] {
             assert!(
                 directive.contains("recalculate"),
                 "必须禁止重算数值（recalculate）"
@@ -2181,10 +2187,7 @@ mod tests {
                 directive.contains("4:45"),
                 "必须含 4:45 反例（不得变 4:30）"
             );
-            assert!(
-                directive.contains("4:30"),
-                "必须含被禁止的目标形态 4:30"
-            );
+            assert!(directive.contains("4:30"), "必须含被禁止的目标形态 4:30");
             assert!(
                 directive.contains("明天"),
                 "必须含 明天 反例（不得变 今天）"

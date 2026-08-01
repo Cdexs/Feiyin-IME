@@ -1,5 +1,19 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — tester-1 — TEST-EXEC-ITN-V2-006 ✅ 全量回归通过，0 红条
+
+- **任务**：阶段四执行测试（阶段三 TEST-SYNC 的 6 条测试验收通过后执行）
+- **Step 1 `cargo test`**：**767 passed / 0 failed / 8 ignored**（07-30 基线 717/0/8 → +50）
+- **`--list` 交叉验证**：775 = 767 + 8 自洽；`cargo test itn::` = **124/0**（118 基线 + 6 新增），`--list` 独立计数同 124
+- **Step 1b src-tauri**：**53 / 0 / 0**（与基线一致）
+- **Step 2/3/4 SKIP**：本批仅 src/itn.rs（零前端/零 UI/零窗口行为）；pytest 无覆盖 ITN 输出链路的用例，理由在 result.md §五
+- **R1 🔴 实证**：T3 四条多位数期望**全部通过**（三十五台→35台 / 二十三条→23条 / 一百二十次→120次 / 二十五间→25间）。`consumed>=2` 守卫（src/itn.rs:1810）在 `is_real_unit` 之后正确兜住多位数 → **is_real_unit 收紧零回归**，断言无需改
+- **R2**：0 红条
+- **R3**：实例 PID 22556（feiyin-ime.exe）Responding=True；debug.log 2.0MB 零 panic；未重建/未新起 release 实例（仍 v0.7.3，运行时验证留待出包）
+- **零代码改动**：本批只执行测试。42 个 M 文件均为既有批次遗留（src/itn.rs +107/−0 为 TEST-SYNC 阶段、src/llm/mod.rs +9/−6 为上轮 fmt 连带已裁定保留、其余 P1-P5）。无 untracked、无垃圾
+- **红线遵守**：未出包、未改生产代码、未 cargo clean、未改版本号、未用 git 破坏命令
+- **下一步**：✅ 出包就绪，等主控下达出包指令
+
 ## 2026-08-01 — coder-1 — ITN-V2-LEXICON-006-C ✅ 移除 5 条 2 字遮蔽词条
 
 - **来源**：ENGINE-006-B-R2 定位 `二分` 前缀遮蔽 → 主控核查全部 5 条 2 字词条 → Gavin 拍板删除

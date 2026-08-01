@@ -2989,4 +2989,111 @@ words = ["度"]
         assert_eq!(normalize_test("十三块钱"), "13块钱");
         assert_eq!(normalize_test("去十三陵玩花十三块钱"), "去十三陵玩花13块钱");
     }
+
+    // ============================================================
+    // TEST-SYNC-ITN-V2-006 · ENGINE-006 + LEXICON-006-C 测试同步
+    // ============================================================
+    // 覆盖对象：
+    //  - ENGINE-006 (b462f83)：decide_conversion 判据 is_unit → is_real_unit，
+    //    双隶属量词（间/条/次/名/台/辆/句/篇）后单字数字保持汉字（DEC-030）。
+    //  - LEXICON-006-C (05de1bc)：移除 5 条 2 字遮蔽词条（三元/九度/二分/五类/四大）
+    //    + N分钟 家族 7 条，闭合红1（二分钟→2分钟）。
+    // 期望值全部来自 coder-1 真实 cargo test 实测，非推断。
+
+    // T1 · 双隶属量词保持汉字（ENGINE-006 正向）
+    // 判定路径：decide_conversion → is_real_unit(after_str)=false（词在 all_units 且
+    // 在 classifier_set）→ is_date_suffix=false → consumed<2 → classifier 分支 return false
+    #[test]
+    fn itn_v2_006_t1_dual_classifier_single_digit_preserved() {
+        assert_eq!(normalize_test("三条"), "三条");
+        assert_eq!(normalize_test("五台"), "五台");
+        assert_eq!(normalize_test("两辆"), "两辆");
+        assert_eq!(normalize_test("三次"), "三次");
+        assert_eq!(normalize_test("五名"), "五名");
+        assert_eq!(normalize_test("两句"), "两句");
+        assert_eq!(normalize_test("三篇"), "三篇");
+        // 甲型路径守卫（P3 既有覆盖，此处作为 T1 完整组保留）
+        assert_eq!(normalize_test("五间半"), "五间半");
+        assert_eq!(normalize_test("一个半"), "一个半");
+    }
+
+    // T2 · 真单位仍转换（ENGINE-006 反向护栏）
+    // 判定路径：is_real_unit=true（词在 all_units 且不在 classifier_set）→ 转
+    #[test]
+    fn itn_v2_006_t2_real_unit_still_converts() {
+        assert_eq!(normalize_test("五块"), "5块");
+        assert_eq!(normalize_test("三度"), "3度");
+        assert_eq!(normalize_test("五米"), "5米");
+        assert_eq!(normalize_test("三小时"), "3小时");
+        assert_eq!(normalize_test("十三块钱"), "13块钱");
+    }
+
+    // T3 · ⭐ 多位数不受判据收紧影响（最重要的护栏，consumed>=2 分支零覆盖→补齐）
+    // 判定路径：is_real_unit=false（双隶属量词）→ is_date_suffix=false →
+    // consumed>=2 return true（src/itn.rs:1810，在 is_real_unit 之后）→ 转
+    // 这证明 is_real_unit 收紧只影响单字数字，不误伤多位数表达。
+    #[test]
+    fn itn_v2_006_t3_multi_digit_unaffected_by_guard() {
+        assert_eq!(normalize_test("三十五台"), "35台");
+        assert_eq!(normalize_test("二十三条"), "23条");
+        assert_eq!(normalize_test("一百二十次"), "120次");
+        // 补充组合：多位数 + 双隶属量词「间」（units.other + classifiers 双隶属）
+        assert_eq!(normalize_test("二十五间"), "25间");
+    }
+
+    // T4 · N分钟 家族一致性（ENGINE-006 + LEXICON-006-C 联合）
+    // 红1 闭合判定项：二分钟→2分钟。一/七/两/五/八/六/四分钟 7 条从
+    // unit_collisions 移除（b462f83），二/三/九/十分钟本就不在表内。
+    // 移除后 N分钟 走逐字路径：分钟 ∈ units.time 且 ∉ classifier_set →
+    // is_real_unit=true → 转。五分钟 已由 itn_v2_p3_units_time_scope_expansion 覆盖，不重复。
+    #[test]
+    fn itn_v2_006_t4_minute_family_consistent() {
+        // 红1 闭合判定项（单独成条）
+        assert_eq!(normalize_test("二分钟"), "2分钟");
+        // 其余 9 条家族一致性
+        assert_eq!(normalize_test("一分钟"), "1分钟");
+        assert_eq!(normalize_test("三分钟"), "3分钟");
+        assert_eq!(normalize_test("四分钟"), "4分钟");
+        assert_eq!(normalize_test("六分钟"), "6分钟");
+        assert_eq!(normalize_test("七分钟"), "7分钟");
+        assert_eq!(normalize_test("八分钟"), "8分钟");
+        assert_eq!(normalize_test("九分钟"), "9分钟");
+        assert_eq!(normalize_test("十分钟"), "10分钟");
+        assert_eq!(normalize_test("两分钟"), "2分钟");
+    }
+
+    // T5 · 5 条 2 字词删除后的正向恢复（LEXICON-006-C）
+    // 三元/九度/二分/五类/四大 移除后各自遮蔽的能产族恢复转换；
+    // 五类人/四大件 因「类」「大」非单位仍保持汉字。
+    #[test]
+    fn itn_v2_006_t5_two_char_word_removal_recovery() {
+        // 红1（同 T4，此处重复锁定，LEXICON-006-C 移除点）
+        assert_eq!(normalize_test("二分钟"), "2分钟");
+        assert_eq!(normalize_test("三元钱"), "3元钱");
+        assert_eq!(normalize_test("九度电"), "9度电");
+        // 反向：非单位后缀保持汉字
+        assert_eq!(normalize_test("五类人"), "五类人");
+        assert_eq!(normalize_test("四大件"), "四大件");
+    }
+
+    // T6 · ⭐ 更长同前缀词条仍受保护（LEXICON-006-C 反向护栏，13 条）
+    // 锁「确定性最长匹配」（ENGINE-002 filter+max）架构假设：
+    // 移除 2 字遮蔽词条后，同前缀更长条目（二分* 26/三元* 17/四大* 17 等）
+    // 原样保留、仍受保护。将来若有人改动 check_protection，这组是第一道警报。
+    #[test]
+    fn itn_v2_006_t6_longer_same_prefix_still_protected() {
+        assert_eq!(normalize_test("二分查找"), "二分查找");
+        assert_eq!(normalize_test("二分图"), "二分图");
+        assert_eq!(normalize_test("二分法"), "二分法");
+        assert_eq!(normalize_test("二分之一"), "二分之一");
+        assert_eq!(normalize_test("二分音符"), "二分音符");
+        assert_eq!(normalize_test("三元催化"), "三元催化");
+        assert_eq!(normalize_test("三元及第"), "三元及第");
+        assert_eq!(normalize_test("三元桥"), "三元桥");
+        assert_eq!(normalize_test("四大发明"), "四大发明");
+        assert_eq!(normalize_test("四大皆空"), "四大皆空");
+        assert_eq!(normalize_test("四大名捕"), "四大名捕");
+        assert_eq!(normalize_test("九度OJ"), "九度OJ");
+        assert_eq!(normalize_test("五类分子"), "五类分子");
+    }
 }
