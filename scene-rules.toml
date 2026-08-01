@@ -133,11 +133,27 @@ exe = [
     "HxOutlook.exe",       # Outlook 辅助进程（新版 Outlook 后台进程）
     "eMClient.exe",        # eM Client
     "Spark.exe",           # Spark Mail
-    "NewMailEngine.exe",   # ⚠️未证实：疑似不存在（Mozilla 邮件产品为 Thunderbird，已单列；原注释「火狐邮件」系事实错误）
     # --- 新增邮件客户端 ---
     "CalendarApp.Gui.Win10.exe", # ✅实测：OneCalendar（MSIX 包 64885BlueEdge.OneCalendar，AppxManifest Executable=CalendarApp.Gui.Win10.exe）
     "Mailbird.exe",        # ⚠️未证实：Mailbird（官网 mailbird.com 有 Windows 包，exe 名未实测）
     "The Bat!.exe",        # ⚠️未证实：The Bat!（官网 ritlabs.com 有 Windows 包，exe 名未实测）
+    # --- DATA-SCENE-COVERAGE-004 新增：邮件桌面客户端（3c，三级证据标注，六条必收多候选名并存）---
+    # 口径：exe 是精确集合匹配，多写一个不命中的名字零副作用，漏写才会静默失效（Todo.exe 教训）。
+    "BlueMail.exe",        # 📄file.net 实测：BlueMail（Blix Inc，C:\Program Files\BlueMail\）；⚠️Win11 下部分版本 exe 名可能变化（file.net 用户评论），另有 Windows Store 包 BlueMail.BlueMailEmail
+    "Blue Mail.exe",       # ⚠️候选名并存：BlueMail 含空格变体
+    "Mailspring.exe",      # 📄官方 getmailspring.com 支持 Windows 原生桌面版；⚠️进程名惯例（Electron 产物名 = 产品名，未实测）
+    "Mailspring Native.exe", # ⚠️候选名并存：部分安装产物变体
+    "Postbox.exe",         # 📄官方 postbox-inc.com 支持 macOS+Windows；⚠️已被 eM Client 收购，进程名惯例（未实测）
+    "claws-mail.exe",      # 📄官方 claws-mail.org 有 Windows 构建（GTK 邮件客户端）；⚠️进程名按 Unix 惯例小写带连字符，未实测
+    "ClawsMail.exe",       # ⚠️候选名并存：驼峰拼写变体
+    "Canary Mail.exe",     # 📄官方 canarymail.io 支持 Windows 桌面版；⚠️进程名惯例（Electron 产物名含空格），未实测
+    "CanaryMail.exe",      # ⚠️候选名并存：无空格变体
+    "ZohoMail.exe",        # ⚠️未证实：Zoho Mail 桌面版（官方 zoho.com/mail 有桌面客户端，exe 名未实测）
+    "Zoho Mail.exe",       # ⚠️候选名并存：Zoho Mail 含空格变体
+    # --- DATA-SCENE-COVERAGE-004 新增：macOS 自带 Mail（双形式并存）---
+    # 注意：此处的 Mail（无 .exe）是 macOS 自带邮件，与上方 Mail.exe（Windows 10/11 自带邮件）是不同字符串，可共存，勿误删其一。
+    "Mail",                # macOS 自带邮件 Mail（localizedName 形式 A，无 .exe 后缀）
+    "com.apple.mail",      # macOS 自带邮件 Mail（bundleIdentifier 形式 B）
 ]
 
 [[scene]]
@@ -147,6 +163,7 @@ multiline_safe = true
 title_keywords = [
     "Outlook", "Foxmail", "Thunderbird", "邮件", "邮箱",
     "Mail", "Gmail", "Inbox", "收件箱", "发件箱", "Yahoo Mail", # FIX-SCENE-TITLE-LONGEST-001：从 browser 块移入（网页邮箱应归 email，且其比 Mail/Inbox 严格更长，留在 browser 会被方案 A 的严格更长胜出坐实错分类）
+    "Hotmail", # DATA-SCENE-COVERAGE-004：Outlook.com 旧品牌，老用户书签/标题仍为 Hotmail（7 字符比 Mail 长，最长匹配下正确胜出）
 ]
 
 # ============================================================
@@ -199,6 +216,12 @@ exe = [
     "wezterm.exe",         # ✅实测：WezTerm（本机 %LocalAppData%\Programs\WezTerm\wezterm.exe，gui 入口 wezterm-gui.exe 已在表内）
     "git-bash.exe",        # ✅实测：Git Bash MSYS2 启动器（本机 C:\Program Files\Git\git-bash.exe，实际前台窗口通常为已在表内的 mintty.exe，此条为补漏）
     "Nu.exe",              # ⚠️未证实：Nushell（官网 nushell.sh 有 Windows zip 包含 nu.exe，exe 名未实测）
+    # --- DATA-SCENE-COVERAGE-004 新增：macOS 终端（双形式并存，必须进 false 块）---
+    # 与 Windows 终端同理：多行 = 逐行执行命令，危险。macOS 侧 stub 未生效，但不能留将来一实现就出事的坑。
+    "Terminal",            # macOS 自带终端 Terminal（localizedName 形式 A，无 .exe 后缀）
+    "com.apple.Terminal",  # macOS 自带终端 Terminal（bundleIdentifier 形式 B）
+    "iTerm2",              # macOS iTerm2（localizedName 形式 A）
+    "com.googlecode.iterm2", # macOS iTerm2（bundleIdentifier 形式 B）
 ]
 
 # ============================================================
@@ -255,6 +278,10 @@ exe = [
     "Insight4.exe",        # ⚠️惯例推测：Source Insight 4.x 历史进程名
     "Insight3.exe",        # ⚠️惯例推测：Source Insight 3.5 进程名（官网旧版下载 Si3586Setup.exe）
     "SourceInsight.exe",   # ⚠️惯例推测：通用候选名并存（精确集合匹配，多不命中零副作用）
+    # --- DATA-SCENE-COVERAGE-004 新增：macOS Xcode（双形式并存）---
+    # Gavin 早先点名要 Xcode，此前因「macOS 独占」搁置；现按本方案纳入（编辑器非终端）。macOS 侧 stub 未生效，先预置。
+    "Xcode",               # macOS Xcode（localizedName 形式 A）
+    "com.apple.dt.Xcode",  # macOS Xcode（bundleIdentifier 形式 B）
 ]
 
 # ============================================================
@@ -294,6 +321,8 @@ exe = [
     # --- IMPL-SCENE-MULTILINE-002 新增 ---
     "StickyNotesStub.exe", # ✅包实测：Windows 便笺（UWP，Microsoft.MicrosoftStickyNotes_4.0.6104.0_x64__8wekyb3d8bbwe，AppxManifest Executable=StickyNotesStub.exe）；⚠️名含 Stub 疑为启动器，实际前台进程名待端测确认
     "Microsoft.Notes.exe", # ⚠️旧名并存，防 Stub 非前台进程时静默失效
+    # --- DATA-SCENE-COVERAGE-004 新增：Windows 自带应用 ---
+    "MicrosoftWhiteboard.exe", # ✅本机实测：Microsoft Whiteboard（UWP，包 Microsoft.Whiteboard，AppxManifest Executable="MicrosoftWhiteboard\MicrosoftWhiteboard.exe"，取 basename）
     # --- IMPL-SCENE-MULTILINE-002 改动 7：常见 Markdown 笔记/编辑软件补充（允许 WebSearch 取证，证据三级标注）---
     "Zettlr.exe",          # 📄官方支持 Windows x64（GitHub）；⚠️进程名惯例（Electron 产物名 = 产品名，未实测）
     "vnote.exe",           # 📄官方发布 VNote-4.1.0-win64.zip；⚠️进程名惯例（Qt 产物名 vnote.exe，未实测）
@@ -310,7 +339,8 @@ exe = [
     # Gavin 已知悉此代价并同意落地；端测后若嫌脏可单独把某些 todo 应用回退（纯数据改动，免构建）。
     "Todoist.exe",         # 📄file.net 实测：Todoist for Windows（AppData\Local\Todoist\WindowsDesktopApp），官方有 Windows 下载
     "TickTick.exe",        # 📄file.net 实测：TickTick / 滴答清单（Appest.com），官方有 Windows 下载
-    "TodoApp.exe",         # ⚠️惯例推测：Microsoft To Do（UWP，包名 Microsoft.Todos，前台进程名待端测核实，参照改动 1 StickyNotes 处理方式）
+    "TodoApp.exe",         # ⚠️旧名并存：Microsoft To Do 候选名保留（多一个不命中的名字零副作用）
+    "Todo.exe",            # ✅本机实测：Microsoft To Do（UWP，包 Microsoft.Todos，AppxManifest Executable="Todo.exe"）—— DATA-SCENE-COVERAGE-004 修错：原 TodoApp.exe 永不命中，真实 exe 是 Todo.exe
     "ClickUp.exe",         # ⚠️惯例推测：ClickUp 桌面版（Electron 产物名 = 产品名，官网有 Windows 包，exe 名未实测）
     "Any.do.exe",          # ⚠️惯例推测：Any.do 桌面版（Electron 产物名，官网有 Windows 包，exe 名未实测）
     "Linear.exe",           # ⚠️未证实：Linear 桌面版（官网 linear.app 有 Windows 包，exe 名未实测）。Gavin 2026-08-01 改判：Linear 是项目/任务管理工具非聊天工具，从 chat 块移入 doc
@@ -325,6 +355,21 @@ exe = [
     "7StickyNotes.exe",    # ⚠️惯例推测：7 Sticky Notes（Electron 产物名惯例，未实测）
     "jingyeqian.exe",      # ⚠️惯例推测：敬业签（官网 jingyeqian.com 有 Windows 客户端，进程名按拼音惯例推测，未实测）
     "StickyNotes.exe",     # ⚠️未证实：file.net 指为第三方「Virtual Sticky Notes」(Logan K) 或旧版内置便签候选名，doc 块多不命中零副作用
+    # --- DATA-SCENE-COVERAGE-004 新增：macOS 自带应用（双形式并存：localizedName + bundleIdentifier）---
+    # macOS 侧 capture_scene_signals 现为 stub（src/platform/macos/mod.rs:79 return None），条目暂不生效；
+    # 双形式并存化解「第一槽位放 localizedName 还是 bundleIdentifier」未定项，macOS 团队实现时任一形式均命中。
+    # 注意：exe 是精确集合匹配，这些 macOS 名永不命中 Windows 进程，零影响。
+    # 勿把 macOS 应用名加进 title_keywords（子串匹配，Notes/Mail/Pages 通用词会大面积误伤）。
+    "Notes",               # macOS 备忘录（localizedName 形式 A）
+    "com.apple.Notes",     # macOS 备忘录（bundleIdentifier 形式 B）
+    "Reminders",           # macOS 提醒事项（localizedName 形式 A）
+    "com.apple.reminders", # macOS 提醒事项（bundleIdentifier 形式 B）
+    "Stickies",            # macOS 便笺（localizedName 形式 A）—— 注意与 Windows 第三方 stickies.exe 是不同字符串
+    "com.apple.Stickies",  # macOS 便笺（bundleIdentifier 形式 B）
+    "TextEdit",            # macOS 文本编辑（localizedName 形式 A）
+    "com.apple.TextEdit",  # macOS 文本编辑（bundleIdentifier 形式 B）
+    "Pages",               # macOS Pages（localizedName 形式 A）
+    "com.apple.iWork.Pages", # macOS Pages（bundleIdentifier 形式 B）
 ]
 title_keywords = [
     # 浏览器网页文档编辑器兜底

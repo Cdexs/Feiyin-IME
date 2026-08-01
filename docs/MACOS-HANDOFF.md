@@ -316,6 +316,29 @@ rm -rf cpu_features   # 只删非空的那些；空目录不必删，clone 可�
 
 > ⚠️ `docs/BUILD-MACOS.md` §四 记录了 2 个 macOS 编译错误（`hotkey.rs:124` CGEventType 不支持 `==`、`hotkey.rs:257` Result 无 `ok_or_else`），属 core-graphics 0.25 API 变更，需改 `matches!` / 转 u32 比较 / `.map_err`。请在跑通 `cargo check` 时一并处理。
 
+### 5.6 场景词表已预置 macOS 自带应用（DATA-SCENE-COVERAGE-004）【2026-08-01 新增】
+
+`scene-rules.toml` 已预置 macOS 自带应用，**双形式并存**（每个应用两条）：
+
+| 形式 A（localizedName） | 形式 B（bundleIdentifier） | 归属 |
+|---|---|---|
+| `Notes` | `com.apple.Notes` | doc |
+| `Reminders` | `com.apple.reminders` | doc |
+| `Stickies` | `com.apple.Stickies` | doc |
+| `TextEdit` | `com.apple.TextEdit` | doc |
+| `Pages` | `com.apple.iWork.Pages` | doc |
+| `Mail` | `com.apple.mail` | email |
+| `Xcode` | `com.apple.dt.Xcode` | ide_terminal（`multiline_safe=true`） |
+| `Terminal` | `com.apple.Terminal` | ide_terminal（`multiline_safe=false`） |
+| `iTerm2` | `com.googlecode.iterm2` | ide_terminal（`multiline_safe=false`） |
+
+实现 `capture_scene_signals`（`src/platform/macos/mod.rs:79` 现为 stub 直接 `return None`）时，**第一槽位返回任一形式均可命中**——双形式并存正是为了化解「第一槽位放 `localizedName` 还是 `bundleIdentifier`」的未定项。当前 macOS 侧永不命中（exe 是精确集合匹配），对 Windows 零影响。
+
+**两条硬提醒**：
+
+1. **新增 macOS 应用时，终端类必须进 `multiline_safe=false` 块**（多行 = 逐行执行命令，危险）—— Terminal / iTerm2 已按此归入 false 块，Xcode 是编辑器非终端归 true 块。
+2. **不要往 `title_keywords` 加 macOS 应用名**——那是子串匹配，`Notes` / `Mail` / `Pages` 这类通用词进标题匹配会大面积误伤（如任何含 "Notes" 的网页标题都会被重分类为 doc）。macOS 应用只走 `exe` 精确匹配。
+
 ---
 
 ## 6 · 仓库工程约定

@@ -1,5 +1,20 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — coder-1 — DATA-SCENE-COVERAGE-004 ✅ 词表修错 + Windows/macOS 自带应用 + 邮件覆盖补全（纯数据免构建）
+
+- **来源**：Gavin 2026-08-01 追加需求，插在出包之前（与场景/Markdown 批次合并构建）。基线 `1dbd767`（ahead 14）
+- **范围**：`scene-rules.toml` + `docs/MACOS-HANDOFF.md`；零 Rust 生产代码改动（`src/scene/mod.rs` 最长匹配版本未触碰）
+- **改动 1**：doc 块 `TodoApp.exe` → 新增 `Todo.exe`（✅主控实测 Microsoft To Do AppxManifest Executable），`TodoApp.exe` 按新旧名并存保留
+- **改动 2**：doc 块 +`MicrosoftWhiteboard.exe`（✅实测）；核实 `olk.exe` 在位未重复
+- **改动 3a**：删死条目 `NewMailEngine.exe`（注释自述疑似不存在 + 原始依据系事实错误）
+- **改动 3b**：email title_keywords +`Hotmail`（7 字符 > Mail 4，最长匹配胜出，无遮蔽）
+- **改动 3c**：六款邮件客户端多候选名并存（BlueMail/Mailspring/Postbox/ClawsMail/CanaryMail/ZohoMail，均带证据等级；⚠️候选名标注待端测核实）
+- **改动 4**：macOS 九应用双形式（localizedName + bundleIdentifier）入各块 exe：doc 五 + email Mail + true 块 Xcode + false 块 Terminal/iTerm2；**未往 title_keywords 加任何 macOS 名**
+- **改动 5**：`docs/MACOS-HANDOFF.md` §5.6 增补
+- **验证**：临时测试 6 条全过后删除（`git diff src/scene/mod.rs` 空输出自证）；`cargo test scene::` **70 passed / 0 failed**；双 `cargo check` 0 errors
+- **下游需知**：macOS 侧 `capture_scene_signals` 仍是 stub，这些条目暂不生效但预置就位；tester-1 出包时无需特殊处理（纯数据）
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-1/result.md`（非空）+ `logs/20260801.md`
+
 ## 2026-08-01 — coder-2 — FIX-SCENE-TITLE-LONGEST-001 ✅ 标题关键词改确定性最长匹配（+方案 A 平局打破 + Yahoo Mail 特批移动）
 
 - **来源**：tester-1 在 TEST-EXEC-SCENE-MD-003 发现真生产碰撞（`chrome + 钉钉文档 - 协作` 被 chat 块 `钉钉` 遮蔽 → false）并停手上报。主控裁定方案 (c) 确定性最长匹配。基线 `8ce1be2`（ahead 13）
