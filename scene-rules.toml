@@ -164,6 +164,7 @@ title_keywords = [
     "Outlook", "Foxmail", "Thunderbird", "邮件", "邮箱",
     "Mail", "Gmail", "Inbox", "收件箱", "发件箱", "Yahoo Mail", # FIX-SCENE-TITLE-LONGEST-001：从 browser 块移入（网页邮箱应归 email，且其比 Mail/Inbox 严格更长，留在 browser 会被方案 A 的严格更长胜出坐实错分类）
     "Hotmail", # DATA-SCENE-COVERAGE-004：Outlook.com 旧品牌，老用户书签/标题仍为 Hotmail（7 字符比 Mail 长，最长匹配下正确胜出）
+    "已发送", # DATA-SCENE-GENERIC-008：审计实证——中文邮箱发件夹标题用「已发送」而非「发件箱」（现有 发件箱 实证不命中）
 ]
 
 # ============================================================
@@ -355,6 +356,12 @@ exe = [
     "7StickyNotes.exe",    # ⚠️惯例推测：7 Sticky Notes（Electron 产物名惯例，未实测）
     "jingyeqian.exe",      # ⚠️惯例推测：敬业签（官网 jingyeqian.com 有 Windows 客户端，进程名按拼音惯例推测，未实测）
     "StickyNotes.exe",     # ⚠️未证实：file.net 指为第三方「Virtual Sticky Notes」(Logan K) 或旧版内置便签候选名，doc 块多不命中零副作用
+    # --- DATA-SCENE-GENERIC-008 新增：WPS便签（Gavin 点名）---
+    # WPS 套件的便签组件。WPS Office office6 目录惯例（wps.exe 文字/et.exe 表格/wpp.exe 演示），
+    # 便签组件独立 exe 名无公开文档，本机无 WPS 安装无法实测 → 多候选名并存，待端测经 debug.log 核实。
+    "wpsnote.exe",         # ⚠️惯例推测：WPS便签组件候选名（office6 目录按组件命名惯例推断，未实测）
+    "WPSNote.exe",         # ⚠️候选名并存：驼峰拼写变体
+    "wpsnotepad.exe",      # ⚠️候选名并存：notepad 拼写变体
     # --- DATA-SCENE-COVERAGE-004 新增：macOS 自带应用（双形式并存：localizedName + bundleIdentifier）---
     # macOS 侧 capture_scene_signals 现为 stub（src/platform/macos/mod.rs:79 return None），条目暂不生效；
     # 双形式并存化解「第一槽位放 localizedName 还是 bundleIdentifier」未定项，macOS 团队实现时任一形式均命中。
@@ -375,6 +382,14 @@ title_keywords = [
     # 浏览器网页文档编辑器兜底
     "Google Docs", "腾讯文档", "石墨文档", "飞书文档", "Notion",
     "语雀", "Online Doc", "Office Online",
+    # DATA-SCENE-GENERIC-008：Google 文档（中文界面真实标题），现有 Google Docs 只命中英文界面
+    "Google 文档",          # ✅审计实证：Google Docs 中文界面标题是「Google 文档」
+    # DATA-SCENE-GENERIC-008：Office Online/Online Doc 实证不出现在现行标题（office.com 已跳 m365.cloud.microsoft），
+    # 真实文档页标题是 "{标题} - Word Online" / Excel Online / PowerPoint Online，或新版 Microsoft 365。
+    "Word Online",         # ✅审计实证：在线 Word 文档页真实标题
+    "Excel Online",        # ✅审计实证：在线 Excel 表格页真实标题
+    "PowerPoint Online",   # ✅审计实证：在线 PPT 页真实标题
+    "Microsoft 365",       # ✅审计实证：office.com 现跳转 m365.cloud.microsoft，新版标题含 Microsoft 365
     # FIX-SCENE-WEBTITLE-007：Gavin 端测实测——真实飞书文档标题是「飞书云文档」不是「飞书文档」（中间多个云字 contains 不命中）。
     # 若只有 飞书文档 则被 chat 块 飞书(2) 截走 → 错判聊天。飞书云文档(5) > 飞书(2) 最长匹配正确胜出 doc。
     # 飞书文档 保留（可能存在其他标题变体，多不命中零副作用）。
@@ -383,6 +398,14 @@ title_keywords = [
     # 3 字 > 钉钉/飞书(2) 最长匹配胜出 doc；覆盖飞书云文档/腾讯云文档/华为云文档/WPS云文档整类。
     # 特异性评估：窗口标题出现「云文档」几乎必是文档编辑场景，误伤概率极低（详见 audit 报告）。
     "云文档",                # 规则性兜底：飞书云文档/腾讯云文档/华为云文档/WPS云文档 等整类
+    # DATA-SCENE-GENERIC-008：Gavin 指令——领域级泛化关键词
+    # 便签/待办 中文特异性高（误伤面小），To Do 带空格躲开 Mastodon(m-as-todo-n) 与西语/葡语 todo(=全部)。
+    # 🔴 主控实证：不收裸 todo（Mastodon 是社交类，判 doc 方向反了；todo 在 ES/PT 意为「全部」是高频词）。
+    "便签",                # 领域泛化：WPS便签 / 各类网页便签（Enter=换行非提交，doc 安全）
+    "待办",                # 领域泛化：各类 Todo 网页（快速添加 Enter=创建任务，Gavin 已知悉）
+    "To Do",               # 领域泛化：Microsoft To Do / 各类 to-do 标题（带空格，躲 Mastodon/西语）
+    # DATA-SCENE-GENERIC-008：WPS云文档 显式补充（虽被 云文档 覆盖，多一条零副作用更明确）
+    "WPS云文档",            # WPS 云文档网页版（Gavin 点名）
     # 项目管理/工单网页版兜底（浏览器开 Jira/TAPD/禅道/Teambition → 重分类为 doc，多行结构化输出）
     "Jira", "TAPD", "禅道", "Teambition",
     # --- IMPL-SCENE-MULTILINE-002 新增（高特异性产品专有名，子串匹配误伤评估见 research 报告）---

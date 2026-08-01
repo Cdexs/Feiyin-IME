@@ -1,5 +1,17 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — coder-1 — DATA-SCENE-GENERIC-008 ✅ 领域级泛化关键词 + 审计发现的补充项（纯数据免构建）
+
+- **来源**：Gavin 指令（金山/WPS 类加入 doc + 云文档泛化 + todo/便签泛化）+ 主控 todo 实证修正 + FIX-SCENE-WEBTITLE-007 审计落地。基线 `453eea7`（ahead 19）
+- **范围**：`scene-rules.toml`（doc title_keywords +10 / email +1 / doc exe +3）；零 Rust 改动
+- **改动 1**：doc title_keywords +`便签`/`待办`/`To Do`；`云文档` 核实在位。**🔴 不收裸 `todo`**（Mastodon 社交类方向反 + 西语/葡语高频词）——`To Do` 带空格躲开
+- **改动 2**：`WPS云文档` 显式补 + `金山文档` 核实；**WPS便签桌面 exe** +3 候选（wpsnote/WPSNote/wpsnotepad，⚠️推测待端测）
+- **改动 3**：doc +`Google 文档`/`Word Online`/`Excel Online`/`PowerPoint Online`/`Microsoft 365`；email +`已发送`（审计实证发件夹用此）；死条目保留不删
+- **改动 4**：`笔记`/`文档` 均**不收**（小红书/笔记本电脑/帮助文档误伤，与主控一致）；建议候选 `思维导图`/`白板`（表格泛词倾向不收）——**只列不收**
+- **验证**：临时测试 5 条全过（含 V4 Mastodon+西语 todo 反向护栏），交付前删除（git diff src/scene/mod.rs 空输出自证）；scene:: 70/0；双 cargo check 0 errors
+- **下游需知**：WPS便签 exe 是 ⚠️推测，需端测经 debug.log 核实真实进程名后补正确条目；改动 4 候选等主控与 Gavin 裁定
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-1/result.md`（非空）+ `logs/20260801.md`
+
 ## 2026-08-01 — coder-1 — FIX-SCENE-WEBTITLE-007 ✅ 飞书云文档误判修复 + 全部 web 关键词真实标题复核（纯数据免构建）
 
 - **来源**：Gavin 端测实测——浏览器打开飞书文档真实标题「飞书云文档」，被 chat 块 `飞书` 截走 → 错判聊天。基线 `3d1f4bb`（ahead 18）
