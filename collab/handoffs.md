@@ -1,5 +1,51 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — coder-1 — IMPL-SCENE-MULTILINE-002 ✅ 场景词表落地（纯数据，免构建）
+
+- **来源**：研究 `collab/research/scene-multiline-coverage-002.md` + Gavin 2026-08-01 拍板（方案 A + 推测项后补）+ 主控三批修正/追加（同 kind 多块、Gavin 推翻 R3 L2 结论、Todo/便签追加）
+- **范围**：`scene-rules.toml`（唯一数据文件）+ `src/scene/mod.rs` 测试块（临时验证，主控裁定保留转 tester-1 TEST-SYNC）；生产代码零改动
+- **改动 1**：doc 块 exe +2（StickyNotesStub.exe ✅包实测 / Microsoft.Notes.exe ⚠️旧名并存）
+- **改动 2**：doc 块 title_keywords +9（Google Keep/思源笔记/SiYuan/Obsidian Publish/金山文档/钉钉文档/Roam Research/Confluence/Anytype；SiYuan 为 Gavin 端测实证追加第 9 条）
+- **改动 3+4**：新增第二个 ide_terminal(true) 块 32 条（28 条 Gavin 裁定：纯编辑器 3 + GUI IDE 7 + JetBrains 全家 18 + Source Insight 4）；原 false 块删除全部 GUI IDE/编辑器，保留纯终端 26 条 + vim/gvim（模态编辑器不放开）
+- **改动 5**：新块放在原 false 块之后（两块 exe 互斥无竞争）
+- **改动 6**：Source Insight 4 候选名并存（sourceinsight4.exe 📄官方 / Insight4/Insight3/SourceInsight ⚠️推测）
+- **改动 7**：Markdown 笔记/编辑软件补 doc（Zettlr/vnote/trilium 📄 + Standard Notes 📄 + Boostnote/Inkdrop/YoudaoNote/WizNote ⚠️ + wiz.exe ⚠️）+ web 关键词（HackMD/StackEdit/Dillinger/Trilium/Standard Notes）
+- **改动 8**：Todo/任务管理补 doc（Todoist/TickTick 📄file.net + TodoApp/ClickUp/Any.do/Focalboard ⚠️）+ web 关键词（Todoist/TickTick/滴答清单/Trello/Asana/ClickUp/Google Tasks/Microsoft To Do/Any.do）；**Linear/Height 通用词不收**（主控倾向一致）；⚠️已知行为：快速添加框 Enter=创建任务、多行建多条带 `- ` 前缀，Gavin 已知悉同意，已写进块注释
+- **改动 9**：第三方便签补 doc（SimpleStickyNotes/Simple Sticky Notes/stickies/notezilla 📄 + PNotes/7StickyNotes/jingyeqian/StickyNotes ⚠️）；便签 Enter=换行非提交，风险最低
+- **Linear.exe 改判建议（未动）**：现处 chat 块 :66，属项目/任务管理工具，建议移 doc，标 ⚠️未证实，由主控裁定
+- **验证**：临时测试 13 条全过（V2 32 条 true 块 / V3 24 条 false 块 + 27 条 doc / V4 chrome title 细分 17 例 / V5 StickyNotes 解析）；`cargo test --bin feiyin-ime scene::` **65 passed / 2 failed**（两条均为既有断言被设计变更作废：`builtin_rules_parse_ok:873` 硬编码块数==8 现为 9；`classify_vscode_to_ide:365` 断言 VS Code false 现为 Gavin 裁定 true —— **归 tester-1 TEST-SYNC**，按红线未改既有断言）；cargo check 0 errors
+- **边界**：`src/scene/mod.rs` 测试块 +5 个测试函数 0 删除（主控裁定保留）；`src/llm/mod.rs` 既有 diff 非本任务所为；未构建/出包/启动 exe；未改版本号；UTF-8 用 edit 工具
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-1/result.md`（非空）+ `logs/20260801.md`
+
+## 2026-08-01 — coder-2 — FORMAT-MD-BULLET-001 ✅ 无序列表改用标准 Markdown `- `（F3b/F3c/单行禁令）
+
+- **来源**：Gavin 2026-08-01 拍板「有序与无序都要是标准 Markdown」。基线 `ae8d034`（ahead 9）
+- **范围**：仅 `src/llm/mod.rs`（5 处 prompt 字符串，+5/−5 纯文本改动零逻辑）
+- **改动**：
+  1. `build_output_format(:797)` 真分支：`bullet lists with "• "` → `"... "- ")`（改 1）
+  2. F3b(:845)：前缀 `"• " (U+2022)` → `"- "`（改 2）
+  3. F3b(:846)：禁令 `DO NOT use "- ", "* ", or "#"` → `DO NOT use "* ", "• ", or "#"`（改 3，`- ` 从禁令移除变要求前缀，`• ` 入禁令防 LLM 沿用旧习惯，`*`/`#` 继续禁）
+  4. F3c(:847)：示例 `"• xxx\n• yyy"` → `"- xxx\n- yyy"`（改 4）
+  5. `multiline_safe=false` 单行分支(:869)：禁令补 `"- "` → `DO NOT output "- ", "• ", "1. ", or "2. "`（改 5，**最容易漏的一条，已确认就位**）
+- **验证**：`cargo check` / `cargo check --tests` 双 0 errors；`cargo test --bin feiyin-ime llm::` **109 passed / 1 failed**（唯一红 = `build_output_format_multi_line_mentions_numbered_and_bullet:1563` 断言 `fmt.contains("• ")`，**预期红，归 tester-1 TEST-SYNC**）；`build_format_instruction_block_four_quadrants` 意外保持绿——`:1577` 断言 `safe.contains("• ")` 现在匹配的是**禁令**里的 `• ` 而非要求前缀，断言语义仍成立（确认 F3b 段存在 bullet 指令），非异常；`cargo fmt -- src/llm/mod.rs` 后 diff 仍 +5/−5 零连带
+- **任务书指定必过测试**：`unit_symbol_protection` 系列 4 条 / `both_path_protection_fact_preservation_clauses` / `flatten_multiline` 系列 9 条 / `translate_path_unit_symbol_protection_no_do_not_translate_semantics` 全部 ok
+- **V1 grep 自证**：生产 prompt 中 `• ` 仅 :846/:869 两处禁令；测试块 :1563/:1571/:1577 三处保持原样归 tester-1
+- **边界**：`scene-rules.toml` 零触碰（coder-1 并行中）；`src/itn.rs`/`itn-rules.toml`/`src/main.rs`/`src-tauri/**`/`ui/**` 零触碰；未构建/出包/启动 exe；未改版本号；未用 git 破坏命令；UTF-8 用 edit 工具
+- **下游需知**：三条预期红仅实测 1 条（`:1563`），`:1577` 绿因禁令含 `• `；tester-1 做 TEST-SYNC 时若想把 `:1577` 也收口可改断言为检查禁令文本，但**断言当前仍绿，非必须**
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-2/result.md`（非空）
+
+## 2026-08-01 — coder-1 — RESEARCH-SCENE-MULTILINE-002 ✅ 场景感知多行输出覆盖面研究（纯研究零改动）
+
+- **来源**：Gavin 2026-08-01 两批需求（文字编辑/笔记/办公类 web 版 + IDE/设计软件）
+- **范围**：`collab/research/scene-multiline-coverage-002.md`，零代码改动
+- **R1**：✅本机实测 `StickyNotesStub.exe`（Windows 便笺）；Google Keep/memos/OpenDesign/MasterGo 无桌面版；墨刀/Axure/即时设计进程名未证实；Sketch/Xcode macOS 独占不加
+- **R2**（⭐重点）：建议收录 8 条 web 关键词（Google Keep/思源笔记/Obsidian Publish/金山文档/钉钉文档/Roam Research/Confluence/Anytype，高特异性）；建议不收 4 条（memos/Craft/Bear/Coda，特异性低误伤大）
+- **R3**（⭐⭐重点）：L1 Notepad++/Sublime 可安全放开 multiline_safe=true（无内置终端）；L2 VS Code/JetBrains 全家等做不到可靠区分编辑器 vs 终端（UIA 违反 DEC-033 + 性能 + 适配成本），维持 false；Zed 归 L2
+- **R4**（⭐⭐⭐）：推荐方案 C（免构建，L1 放开 + style 字段软约束压制 bullet），方案 B 需出包但硬约束
+- **R5**：Figma 维持 browser（Gavin 既有决策 + 评论框风险）；设计软件统一归 browser
+- **落地建议**：免构建批次（R2 8条+R1 Sticky Notes+R3 L1 放开+R4 方案C）；需出包（R4 方案B，若端测后方案C无效）
+- **详情**：`collab/research/scene-multiline-coverage-002.md` + `collab/outbox/coder-1/result.md`
+
 ## 2026-08-01 — tester-1 — TEST-EXEC-ITN-V2-007 + BUILD-RELEASE-20260801-002 ✅ 回归全绿 + 出包完成
 
 - **Step A 全量回归（硬门槛通过）**：cargo test **771/0/8**（main 707 + crash-reporter 28 + 集成 36）+ src-tauri **53/0/0** + itn:: **128**（124+4）；交叉验证 128+585+30+36=779=771+8 自洽

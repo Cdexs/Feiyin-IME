@@ -152,7 +152,13 @@ title_keywords = [
 ]
 
 # ============================================================
-# IDE / 编辑器 / 终端（multiline_safe=false，终端多行=逐行执行命令，危险）
+# 纯终端 + 模态编辑器（multiline_safe=false）
+# ============================================================
+# 纯终端：多行 = 逐行执行命令，危险
+# vim/gvim 是模态编辑器：注入字符在 normal 模式下被当命令键执行（d 删除行、x 删字符）→ 会真实改坏文件，
+# 风险量级不同于 GUI IDE，故不随本批放开（主控裁定，已告知 Gavin）。
+# GUI IDE/编辑器（VS Code/Cursor/Windsurf/Zed/JetBrains 全家/devenv/HBuilderX/Notepad++/Sublime Text）
+# 已移至下方 multiline_safe=true 块（Gavin 2026-08-01 裁定代码/文字编辑生成类软件放开多行，方案 A）。
 # ============================================================
 
 [[scene]]
@@ -160,44 +166,17 @@ kind = "ide_terminal"
 style = "Technical style. Preserve English for technical terms, code identifiers, and jargon. No pleasantries."
 multiline_safe = false
 exe = [
-    # IDE
-    "Code.exe",            # VS Code
-    "Code - Insiders.exe", # VS Code Insiders
-    "cursor.exe",          # Cursor
-    "Windsurf.exe",        # Windsurf
-    "idea64.exe",          # IntelliJ IDEA
-    "idea.exe",            # IntelliJ IDEA
-    "pycharm64.exe",       # PyCharm
-    "pycharm.exe",         # PyCharm
-    "webstorm64.exe",      # WebStorm
-    "webstorm.exe",        # WebStorm
-    "goland64.exe",        # GoLand
-    "goland.exe",          # GoLand
-    "rustrover64.exe",     # RustRover
-    "rustrover.exe",       # RustRover
-    "clion64.exe",         # CLion
-    "clion.exe",           # CLion
-    "phpstorm64.exe",      # PhpStorm
-    "phpstorm.exe",        # PhpStorm
-    "rubymine64.exe",      # RubyMine
-    "rubymine.exe",        # RubyMine
-    "rider64.exe",         # Rider
-    "rider.exe",           # Rider
-    "devenv.exe",          # Visual Studio
-    "Zed.exe",             # Zed
-    "SublimeText.exe",     # Sublime Text
-    "sublime_text.exe",    # Sublime Text（Linux 命名）
-    "gvim.exe",            # Vim / gvim
-    "vim.exe",             # Vim
-    "notepad++.exe",       # Notepad++
-    "HBuilderX.exe",       # HBuilderX
-    # 终端
+    # 纯终端（6 条核心）
     "WindowsTerminal.exe", # Windows Terminal
     "cmd.exe",             # 命令提示符
     "powershell.exe",      # PowerShell
     "pwsh.exe",            # PowerShell 7
     "ConEmu64.exe",        # ConEmu
     "ConEmu.exe",          # ConEmu
+    # 模态编辑器（注入字符被当命令键执行会改坏文件，不放开）
+    "vim.exe",             # Vim
+    "gvim.exe",            # Vim / gvim
+    # 其余纯终端（同属 multiline_safe=false，防止落入 Unknown）
     "Cmder.exe",           # Cmder
     "Alacritty.exe",       # Alacritty
     "wezterm-gui.exe",     # WezTerm
@@ -222,6 +201,62 @@ exe = [
     "wezterm.exe",         # ✅实测：WezTerm（本机 %LocalAppData%\Programs\WezTerm\wezterm.exe，gui 入口 wezterm-gui.exe 已在表内）
     "git-bash.exe",        # ✅实测：Git Bash MSYS2 启动器（本机 C:\Program Files\Git\git-bash.exe，实际前台窗口通常为已在表内的 mintty.exe，此条为补漏）
     "Nu.exe",              # ⚠️未证实：Nushell（官网 nushell.sh 有 Windows zip 包含 nu.exe，exe 名未实测）
+]
+
+# ============================================================
+# 代码/文字编辑生成类软件（multiline_safe=true，放开多行）
+# IMPL-SCENE-MULTILINE-002：Gavin 2026-08-01 裁定 + 方案 A 拍板
+# 原话：「传统类的代码/文字编辑软件、IDE（比如 VisualStudio / jetbrains 等）应该按照
+#       multiline-safe=true 来处理……他们毕竟不同于最新的 claude/codex 这种基于对话的
+#       环境，他们属于代码/文字编辑生成类软件。」
+# 主控已完整陈述内置终端风险（口述中文散句注入集成终端的实际后果是 command not found
+# 噪音而非破坏），Gavin 听取后重申 → 按 Gavin 判断执行。
+# 接受 F3 Smart Lists 会插列表（方案 A）。
+# 技术风格沿用 ide_terminal（保留英文术语/代码标识符）。
+# classify 首个匹配即返回，故以下条目已从上方 multiline_safe=false 块删除，否则此块永不命中。
+# ============================================================
+
+[[scene]]
+kind = "ide_terminal"
+style = "Technical style. Preserve English for technical terms, code identifiers, and jargon. No pleasantries."
+multiline_safe = true
+exe = [
+    # 纯编辑器（无内置终端）
+    "notepad++.exe",       # Notepad++（NppExec 插件终端是可选且独立弹窗）
+    "sublime_text.exe",    # Sublime Text（Linux 命名，Terminus 插件终端是可选且独立面板）
+    "SublimeText.exe",     # Sublime Text（Windows 命名）
+    # GUI IDE / 现代编辑器（Gavin 裁定放开）
+    "Code.exe",            # VS Code
+    "Code - Insiders.exe", # VS Code Insiders
+    "cursor.exe",          # Cursor
+    "Windsurf.exe",        # Windsurf
+    "Zed.exe",             # Zed
+    "HBuilderX.exe",       # HBuilderX
+    "devenv.exe",          # Visual Studio
+    # JetBrains 全家桶（新旧命名并存）
+    "idea64.exe",          # IntelliJ IDEA
+    "idea.exe",            # IntelliJ IDEA
+    "pycharm64.exe",       # PyCharm
+    "pycharm.exe",         # PyCharm
+    "webstorm64.exe",      # WebStorm
+    "webstorm.exe",        # WebStorm
+    "goland64.exe",        # GoLand
+    "goland.exe",          # GoLand
+    "rustrover64.exe",     # RustRover
+    "rustrover.exe",       # RustRover
+    "clion64.exe",         # CLion
+    "clion.exe",           # CLion
+    "phpstorm64.exe",      # PhpStorm
+    "phpstorm.exe",        # PhpStorm
+    "rubymine64.exe",      # RubyMine
+    "rubymine.exe",        # RubyMine
+    "rider64.exe",         # Rider
+    "rider.exe",           # Rider
+    # --- Source Insight（Gavin 2026-08-01 追加：纯代码阅读/编辑工具，无内置终端，属 L1）---
+    "sourceinsight4.exe",  # 📄官方证据：官网下载 sourceinsight40150_5809-setup.exe，社区文档确认主程序名 sourceinsight4.exe（Source Insight 4.x）
+    "Insight4.exe",        # ⚠️惯例推测：Source Insight 4.x 历史进程名
+    "Insight3.exe",        # ⚠️惯例推测：Source Insight 3.5 进程名（官网旧版下载 Si3586Setup.exe）
+    "SourceInsight.exe",   # ⚠️惯例推测：通用候选名并存（精确集合匹配，多不命中零副作用）
 ]
 
 # ============================================================
@@ -258,6 +293,39 @@ exe = [
     # --- 新增文档/笔记客户端 ---
     "MarkText.exe",        # ✅实测：MarkText Markdown 编辑器（本机 %LocalAppData%\Programs\MarkText\MarkText.exe）
     "Koodo Reader.exe",    # ✅实测：Koodo Reader 电子书阅读器（本机 %LocalAppData%\Programs\koodo-reader\Koodo Reader.exe，含空格）
+    # --- IMPL-SCENE-MULTILINE-002 新增 ---
+    "StickyNotesStub.exe", # ✅包实测：Windows 便笺（UWP，Microsoft.MicrosoftStickyNotes_4.0.6104.0_x64__8wekyb3d8bbwe，AppxManifest Executable=StickyNotesStub.exe）；⚠️名含 Stub 疑为启动器，实际前台进程名待端测确认
+    "Microsoft.Notes.exe", # ⚠️旧名并存，防 Stub 非前台进程时静默失效
+    # --- IMPL-SCENE-MULTILINE-002 改动 7：常见 Markdown 笔记/编辑软件补充（允许 WebSearch 取证，证据三级标注）---
+    "Zettlr.exe",          # 📄官方支持 Windows x64（GitHub）；⚠️进程名惯例（Electron 产物名 = 产品名，未实测）
+    "vnote.exe",           # 📄官方发布 VNote-4.1.0-win64.zip；⚠️进程名惯例（Qt 产物名 vnote.exe，未实测）
+    "trilium.exe",         # 📄官方 GitHub README：「unzip the package and run the trilium executable」
+    "Standard Notes.exe",  # 📄file.net 实测进程名 Standard Notes.exe（官方有 Windows 下载，注意含空格）
+    "Boostnote.exe",       # 📄官方有 Windows 桌面版；⚠️进程名惯例（Electron 产物名，未实测）
+    "Inkdrop.exe",         # 📄官方跨平台含 Windows；⚠️进程名惯例（Electron 产物名，未实测）
+    "YoudaoNote.exe",      # 📄官方/微软商店有 Windows 客户端（有道云笔记）；⚠️进程名惯例（未实测）
+    "WizNote.exe",         # 📄官方有 Windows 客户端（为知笔记）；⚠️进程名惯例（未实测）
+    "wiz.exe",             # ⚠️惯例推测：WizNote X 新版候选名并存（精确集合匹配，多不命中零副作用）
+    # --- IMPL-SCENE-MULTILINE-002 改动 8：常见 Todo / 任务管理软件 ---
+    # ⚠️已知行为（写进端测核对，不阻塞落地）：todo 主输入是「快速添加」单行框，Enter=创建任务。
+    # 放开多行后，一次口述枚举会创建多条任务，且每条名称带 "- " 前缀（如 "- 买菜"）。
+    # Gavin 已知悉此代价并同意落地；端测后若嫌脏可单独把某些 todo 应用回退（纯数据改动，免构建）。
+    "Todoist.exe",         # 📄file.net 实测：Todoist for Windows（AppData\Local\Todoist\WindowsDesktopApp），官方有 Windows 下载
+    "TickTick.exe",        # 📄file.net 实测：TickTick / 滴答清单（Appest.com），官方有 Windows 下载
+    "TodoApp.exe",         # ⚠️惯例推测：Microsoft To Do（UWP，包名 Microsoft.Todos，前台进程名待端测核实，参照改动 1 StickyNotes 处理方式）
+    "ClickUp.exe",         # ⚠️惯例推测：ClickUp 桌面版（Electron 产物名 = 产品名，官网有 Windows 包，exe 名未实测）
+    "Any.do.exe",          # ⚠️惯例推测：Any.do 桌面版（Electron 产物名，官网有 Windows 包，exe 名未实测）
+    "Focalboard.exe",      # ⚠️惯例推测：Focalboard（Mattermost 看板，官网有 Windows 包，exe 名未实测）
+    # --- IMPL-SCENE-MULTILINE-002 改动 9：第三方即时贴 / 桌面便签 ---
+    # ⚠️风险评估（主控）：便签本身是多行自由文本控件，Enter=换行不是提交，本批风险最低，可放心收录。
+    "SimpleStickyNotes.exe", # 📄官方安装包名 Setup_SimpleStickyNotes.exe（官方站 simplestickynotes.com）；产物名惯例
+    "Simple Sticky Notes.exe", # ⚠️惯例推测：含空格候选名并存
+    "stickies.exe",        # 📄file.net 实测：Stickies（Zhorn Software，默认装于 Program Files (x86)\Stickies）；⚠️此名亦关联 EPLAN/Band-in-a-Box，均为低频软件可接受
+    "notezilla.exe",       # 📄ProcessLibrary 实测：NoteZilla（桌面便签）
+    "PNotes.exe",          # ⚠️惯例推测：PNotes（Windows 便签工具，官网未核实 exe 名）
+    "7StickyNotes.exe",    # ⚠️惯例推测：7 Sticky Notes（Electron 产物名惯例，未实测）
+    "jingyeqian.exe",      # ⚠️惯例推测：敬业签（官网 jingyeqian.com 有 Windows 客户端，进程名按拼音惯例推测，未实测）
+    "StickyNotes.exe",     # ⚠️未证实：file.net 指为第三方「Virtual Sticky Notes」(Logan K) 或旧版内置便签候选名，doc 块多不命中零副作用
 ]
 title_keywords = [
     # 浏览器网页文档编辑器兜底
@@ -265,6 +333,36 @@ title_keywords = [
     "语雀", "Online Doc", "Office Online",
     # 项目管理/工单网页版兜底（浏览器开 Jira/TAPD/禅道/Teambition → 重分类为 doc，多行结构化输出）
     "Jira", "TAPD", "禅道", "Teambition",
+    # --- IMPL-SCENE-MULTILINE-002 新增（高特异性产品专有名，子串匹配误伤评估见 research 报告）---
+    "Google Keep",         # 📄WebFetch 实测 keep.google.com 标题含 "Google Keep"
+    "思源笔记",             # ✅Gavin 端测实证：思源笔记网页版标题为英文 SiYuan，中文名一并保留（中英并存，漏加 = 静默失效）
+    "SiYuan",              # ✅Gavin 端测实证（2026-08-01 修订新增第 9 条）：思源笔记网页版标题就是英文 SiYuan
+    "Obsidian Publish",    # 📄官方：Obsidian Publish 站点标题格式 "[站点名] - Obsidian Publish"
+    "金山文档",             # WPS 云文档网页版
+    "钉钉文档",             # 钉钉文档网页版
+    "Roam Research",       # 📄官方：标题含 "Roam Research"
+    "Confluence",          # 📄官方：Atlassian Confluence 标题含 "Confluence"
+    "Anytype",             # Anytype web 版
+    # --- IMPL-SCENE-MULTILINE-002 改动 7：Markdown web 版关键词（高特异性专有名才收）---
+    "HackMD",              # 📄web 版 Markdown 协作编辑（hackmd.io），高特异性专有名
+    "StackEdit",           # 📄web 版 Markdown 编辑器（stackedit.io），高特异性专有名
+    "Dillinger",           # 📄web 版 Markdown 编辑器（dillinger.io），高特异性专有名
+    "Trilium",             # 📄自托管 Trilium 网页版（标题含 Trilium）
+    "Standard Notes",      # 📄web 版 app.standardnotes.com，高特异性专有名
+    # --- IMPL-SCENE-MULTILINE-002 改动 8：Todo web 版关键词（多数 todo 以网页版为主）---
+    # R2 四字段特异性评估：以下均为高特异性产品专有名，子串匹配误伤风险低。
+    # Trello/Asana/ClickUp 是独特品牌词；Todoist/TickTick/滴答清单 独特；
+    # Google Tasks / Microsoft To Do 带命名空间前缀更安全；Any.do 独特。
+    # 不收：Linear / Height（通用英文词，主控倾向一致）——仅建议 Linear.exe 桌面版改判 doc，见报告。
+    "Todoist",             # 📄todoist.com 网页版标题含 Todoist
+    "TickTick",            # 📄ticktick.com 网页版标题含 TickTick
+    "滴答清单",             # 滴答清单（TickTick 中文名，网页版标题含中文名）
+    "Trello",              # 📄trello.com 网页版标题含 Trello
+    "Asana",               # 📄asana.com 网页版标题含 Asana
+    "ClickUp",             # 📄clickup.com 网页版标题含 ClickUp
+    "Google Tasks",        # 📄tasks.google.com 标题含 Google Tasks（带命名空间，误伤低）
+    "Microsoft To Do",     # 📄todo.microsoft.com 标题含 Microsoft To Do（带命名空间，误伤低）
+    "Any.do",              # 📄any.do 网页版标题含 Any.do
 ]
 
 # ============================================================

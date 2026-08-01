@@ -1009,4 +1009,106 @@ title_keywords = ["doc_keyword"]
         assert_eq!(scene_lower.scene, scene_upper.scene);
         assert!(scene_lower.multiline_safe);
     }
+
+    // ============================================================
+    // TEMP-IMPL-SCENE-MULTILINE-002：临时验证（交付后必删）
+    // ============================================================
+
+    const TEMP_TRUE_EXES: &[&str] = &[
+        "notepad++.exe", "sublime_text.exe", "SublimeText.exe",
+        "Code.exe", "Code - Insiders.exe", "cursor.exe", "Windsurf.exe",
+        "Zed.exe", "HBuilderX.exe", "devenv.exe",
+        "idea64.exe", "idea.exe", "pycharm64.exe", "pycharm.exe",
+        "webstorm64.exe", "webstorm.exe", "goland64.exe", "goland.exe",
+        "rustrover64.exe", "rustrover.exe", "clion64.exe", "clion.exe",
+        "phpstorm64.exe", "phpstorm.exe", "rubymine64.exe", "rubymine.exe",
+        "rider64.exe", "rider.exe",
+        "sourceinsight4.exe", "Insight4.exe", "Insight3.exe", "SourceInsight.exe",
+    ];
+
+    const TEMP_FALSE_EXES: &[&str] = &[
+        "WindowsTerminal.exe", "cmd.exe", "powershell.exe", "pwsh.exe",
+        "ConEmu64.exe", "ConEmu.exe", "vim.exe", "gvim.exe",
+        "Cmder.exe", "Alacritty.exe", "wezterm-gui.exe", "mintty.exe",
+        "putty.exe", "Xshell.exe", "Xshell8.exe", "SecureCRT.exe",
+        "MobaXterm.exe", "Tabby.exe", "Hyper.exe", "conhost.exe",
+        "OpenConsole.exe", "wezterm.exe", "git-bash.exe", "Nu.exe",
+    ];
+
+    const TEMP_DOC_TRUE_EXES: &[&str] = &[
+        "Notepad.exe", "siyuan.exe", "wps.exe", "Obsidian.exe",
+        "Zettlr.exe", "vnote.exe", "trilium.exe", "Standard Notes.exe",
+        "Boostnote.exe", "Inkdrop.exe", "YoudaoNote.exe", "WizNote.exe",
+        "wiz.exe",
+        "Todoist.exe", "TickTick.exe", "TodoApp.exe", "ClickUp.exe",
+        "Any.do.exe", "Focalboard.exe",
+        "SimpleStickyNotes.exe", "Simple Sticky Notes.exe",
+        "stickies.exe", "notezilla.exe", "PNotes.exe",
+        "7StickyNotes.exe", "jingyeqian.exe", "StickyNotes.exe",
+    ];
+
+    #[test]
+    fn temp_v2_true_block_all() {
+        for exe in TEMP_TRUE_EXES {
+            let s = classify_builtin(exe, "");
+            assert_eq!(s.scene, SceneKind::IdeTerminal, "{exe} 应 ide_terminal");
+            assert!(s.multiline_safe, "{exe} 应 multiline_safe=true（新块生效）");
+        }
+    }
+
+    #[test]
+    fn temp_v3_false_block_all() {
+        for exe in TEMP_FALSE_EXES {
+            let s = classify_builtin(exe, "");
+            assert_eq!(s.scene, SceneKind::IdeTerminal, "{exe} 应 ide_terminal");
+            assert!(!s.multiline_safe, "{exe} 应 multiline_safe=false");
+        }
+    }
+
+    #[test]
+    fn temp_v3_doc_untouched() {
+        for exe in TEMP_DOC_TRUE_EXES {
+            let s = classify_builtin(exe, "");
+            assert_eq!(s.scene, SceneKind::Doc, "{exe} 应 doc");
+            assert!(s.multiline_safe, "{exe} doc 应 true");
+        }
+    }
+
+    #[test]
+    fn temp_v4_chrome_title_subclass() {
+        for (title, expect_kind) in [
+            ("Google Keep - 我的笔记", SceneKind::Doc),
+            ("金山文档 - 我的表格", SceneKind::Doc),
+            ("Confluence - 团队空间", SceneKind::Doc),
+            ("HackMD - 协作笔记", SceneKind::Doc),
+            ("StackEdit - Markdown", SceneKind::Doc),
+            ("Dillinger - editor", SceneKind::Doc),
+            ("Trilium - my notes", SceneKind::Doc),
+            ("Standard Notes - web", SceneKind::Doc),
+            ("SiYuan - 思源笔记", SceneKind::Doc),
+            ("Todoist - 任务清单", SceneKind::Doc),
+            ("滴答清单 - 我的待办", SceneKind::Doc),
+            ("Trello - 看板", SceneKind::Doc),
+            ("Asana - projects", SceneKind::Doc),
+            ("ClickUp - tasks", SceneKind::Doc),
+            ("Google Tasks - 我的待办", SceneKind::Doc),
+            ("Microsoft To Do - 待办", SceneKind::Doc),
+            ("Any.do - todos", SceneKind::Doc),
+        ] {
+            let s = classify_builtin("chrome.exe", title);
+            assert_eq!(s.scene, expect_kind, "title={title}");
+            assert!(s.multiline_safe, "title={title} 重分类为 doc 应 true");
+        }
+        let normal = classify_builtin("chrome.exe", "随便一个网页");
+        assert_eq!(normal.scene, SceneKind::Browser, "普通标题应维持 browser");
+        assert!(!normal.multiline_safe);
+    }
+
+    #[test]
+    fn temp_v5_sticky_notes_parse() {
+        let r = toml::from_str::<Rules>(BUILTIN_RULES).unwrap();
+        let doc = r.scene.iter().find(|s| s.kind == "doc").expect("doc 块存在");
+        assert!(doc.exe.iter().any(|e| e.eq_ignore_ascii_case("StickyNotesStub.exe")), "StickyNotesStub.exe 应在 doc 词表");
+        assert!(doc.exe.iter().any(|e| e.eq_ignore_ascii_case("Microsoft.Notes.exe")), "Microsoft.Notes.exe 应在 doc 词表");
+    }
 }

@@ -794,7 +794,7 @@ fn ends_with_separator_or_terminal(s: &str) -> bool {
 fn build_output_format(multiline_safe: bool) -> &'static str {
     if multiline_safe {
         "Output format (mandatory):\n\
-        The <corrected> block MAY span multiple lines (e.g., numbered lists with \"1. \", \"2. \", or bullet lists with \"• \"). Put the opening <corrected> and closing \
+        The <corrected> block MAY span multiple lines (e.g., numbered lists with \"1. \", \"2. \", or bullet lists with \"- \"). Put the opening <corrected> and closing \
         </corrected> around the whole text. After the closing tag, optionally ONE final line \
         {\"suggestions\":[\"correct_word\"]}.\n\
         Output NOTHING else. No explanations, no commentary, no \"corrected to\", \
@@ -842,9 +842,9 @@ fn build_format_instruction_block(multiline_safe: bool) -> &'static str {
         \nF3b. Bullet list (when the speech lists items WITHOUT a clear order): \
         If the speech contains markers such as 有的…有的…, 比如, 包括, 诸如, 还有, 另外, 以及, \
         for example, including, also, additionally, etc., and the listed items are parallel but NOT sequential, \
-        you MUST split the content into bullet list lines using the exact prefix \"• \" (U+2022) inside \
-        <corrected> tags. DO NOT use \"- \", \"* \", or \"#\".\
-        \nF3c. Examples: \"第一点xxx，第二点yyy\" → \"1. xxx\\n2. yyy\"; \"首先xxx，然后yyy，最后zzz\" → \"1. xxx\\n2. yyy\\n3. zzz\"; \"有的xxx，有的yyy\" → \"• xxx\\n• yyy\"; \"今天天气不错我们去公园吧\" → keep as a continuous paragraph, NO list.\
+        you MUST split the content into bullet list lines using the exact prefix \"- \" inside \
+        <corrected> tags. DO NOT use \"* \", \"• \", or \"#\".\
+        \nF3c. Examples: \"第一点xxx，第二点yyy\" → \"1. xxx\\n2. yyy\"; \"首先xxx，然后yyy，最后zzz\" → \"1. xxx\\n2. yyy\\n3. zzz\"; \"有的xxx，有的yyy\" → \"- xxx\\n- yyy\"; \"今天天气不错我们去公园吧\" → keep as a continuous paragraph, NO list.\
         \nF3d. Constraints: DO NOT compress or summarize content. DO NOT delete any semantic content. \
         DO NOT add information the user did not say. Preserve every factual point the speaker made; \
         only restructure surface form.\
@@ -866,7 +866,7 @@ fn build_format_instruction_block(multiline_safe: bool) -> &'static str {
         and drop the retracted fragment. Clean up immediate stutters \
         (repeated adjacent words like \"我我我\" → \"我\").\
         \nF3. Single-line Output: Output as a single continuous line. DO NOT use lists, \
-        line breaks, or multi-line formatting. DO NOT output \"• \", \"1. \", or \"2. \" on separate lines, \
+        line breaks, or multi-line formatting. DO NOT output \"- \", \"• \", \"1. \", or \"2. \" on separate lines, \
         because those will be flattened into unreadable inline text. \
         If the speech contains explicit ordered enumeration (第一点/第二点, first/second, etc.), \
         keep the sequence markers inline and join items with appropriate separators. \
