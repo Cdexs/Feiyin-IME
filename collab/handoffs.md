@@ -1,5 +1,29 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — coder-2 — FORMAT-F3-UNIFY-I18N-012 ✅ F3 与输出契约合并到 prompt 最末 + 枚举标记四语穷举
+
+- **来源**：Gavin 2026-08-01 指令——「系统提示应该用纯英文，但在提示词里把各种枚举情况、枚举的用词、措辞都说到，并明确要求考虑中文、英文、日文、韩文的输入场景」。背景：连续两轮措辞层修复（F3 DECISION RULE、MAY→MUST）均失败（prompt_tokens +271 证明新文本已加载仍被压制），主控定论根因是**结构**——prompt 里三处谈格式靠位置争优先级。基线 `3490c2a`（ahead 29）
+- **范围**：仅 `src/llm/mod.rs`。`src/text_normalizer.rs` 零触碰（coder-1 并行改 extra_instruction 英文化）
+- **改动 A · 结构合并**：
+  - `build_format_instruction_block` 只留 F1/F2（filler + self-correction，与格式无关，留原位 :554）；参数改 `_multiline_safe`
+  - `build_output_format` 重写为**合并的 F3+输出契约**（全仓唯一谈格式/列表/标签的地方），调用点从 :589 移到 **:596（ANTI_HALLUCINATION 之后，最末，recency 最高）**
+  - **放置理由**：ANTI_HALLUCINATION 约束「语音不是问题、只重排返回」，与格式排版正交，放其前面不影响效力；格式段获最高 recency（本批修复目标）
+  - `multiline_safe=false` 分支同样合并（单行契约 + i18n 五语分隔符表，**一字未改**）
+- **改动 B · 枚举标记四语穷举**（Gavin 指令核心）：指令散文全英文；标记词用目标语言原文——
+  - 中文有序：第一/第二/第三、第一点/第二点、一是/二是/三是、首先/其次/再次/最后、然后/接着、一来/二来、其一/其二
+  - 中文无序：比如/比如说/例如/譬如/像、有的…有的…、**有些…有些…**、**有一些…还有一些…**、一些…一些…、还有/另外/此外/以及/包括/诸如/等等、一方面…另一方面、一类是…一类是
+  - English 有序：first/second/third、firstly/secondly/lastly、step 1/2/3、point one/two、to begin with、next、finally
+  - English 无序：for example/for instance/such as/like/including/includes/also/another/additionally/moreover/besides/as well as/e.g./etc./some… some…/one… another…
+  - 日本語：第一に/第二に/第三に、まず/次に/それから/最後に、一つ目/二つ目/三つ目、たとえば/例えば、など/とか、また/さらに/そのほか、〜や〜、ある人は…ある人は…、一つは…もう一つは…
+  - 한국어：첫째/둘째/셋째、먼저/다음으로/마지막으로、첫 번째/두 번째、우선、그다음、예를 들어/예컨대、등、그리고/또한/게다가、~같은、뿐만 아니라、어떤 사람은…어떤 사람은…
+- **DECISION RULE 跨语言**：改为语言无关表述 + 每语一组「1 次 vs ≥2 次」对照（Chinese 比如/English for example/Japanese たとえば/Korean 예를 들어）
+- **few-shot**：中文保留既有（2 有序 + 2 无序含 `比如说` 长句 + 单例负向）；**en/ja/ko 各 1 条无序正向**（长句形态）+ **非中文负向例各 1 条**（单 for example/たとえば/예를 들어 不列表）
+- **改动 C · 四语覆盖声明**：合并段开头显式声明适用于 Chinese/English/Japanese/Korean 四种输入语言，按输入文本主体语言选用对应标记集
+- **验证**：`cargo check` + `cargo check --tests` 双 0 errors；`cargo test --bin feiyin-ime llm::` **104 passed / 8 failed**——8 红全部**断言过时**（F3/i18n 表从 `build_format_instruction_block` 移到 `build_output_format`，测试仍指向旧位置/旧措辞），逐条判定无真回归，归 tester-1 TEST-SYNC 未改断言；UTF-8 Python 验证无 mojibake（U+FFFD=0）；四语标记/few-shot/跨语言 DECISION RULE/覆盖声明全部 Python 核对 PASS；i18n 五语表 6 串核对 PASS 一字未改；fmt 零测试块连带（3 hunk 全在改动区域）
+- **⚠️ 8 条红清单**（供 tester-1）：`build_format_instruction_block_single_line_when_not_multiline_safe`(:1560) / `build_output_format_single_line_when_not_multiline_safe`(:1577 断言 Line 1:) / `build_output_format_multi_line_when_multiline_safe`(:1599) / `build_output_format_multi_line_mentions_numbered_and_bullet`(:1617 断言 numbered lists 措辞) / `build_format_instruction_block_multi_line_when_multiline_safe`(:1570) / `build_format_instruction_block_four_quadrants`(:1651) / `build_format_instruction_block_false_i18n_separators`(:1705) / `build_format_instruction_block_f3_exemplification_enumeration`(:1767)——断言全部从 `build_format_instruction_block` 迁到 `build_output_format`
+- **边界**：`src/text_normalizer.rs`/`src/scene/mod.rs`/`scene-rules.toml`/`src/itn.rs`/`itn-rules.toml`/`src/main.rs`/`src-tauri/**`/`ui/**` 零触碰；未构建/出包/启动 exe；未改版本号（0.7.3）；未用 git 破坏命令；UTF-8 用 edit 工具
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-2/result.md`（非空）
+
 ## 2026-08-01 — tester-1 — TEST-SYNC-MEMOS-011 + 三副本同步 ✅ 免构建
 
 - **来源**：DATA-SCENE-MEMOS-011（coder-1，doc title_keywords + Memos/- Memos）。基线 `f18633d`（ahead 28 未 push）
