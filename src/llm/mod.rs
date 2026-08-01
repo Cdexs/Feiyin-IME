@@ -1556,11 +1556,24 @@ mod tests {
     fn build_output_format_multi_line_mentions_numbered_and_bullet() {
         // ITN-V2 P1 F3 规格（Gavin 2026-07-31）：multiline_safe=true 分支必须同时提及
         // numbered 与 bullet，防 FMT-LLM-003 类契约压制复现（只提一种会让 LLM 只产出一种列表）。
+        // FORMAT-MD-BULLET-001（coder-2，2026-08-01）：bullet 前缀由 "• " 改为标准 Markdown "- "。
+        // TEST-SYNC-SCENE-MD-003 A2：全部锚定「要求」侧字符串，杜绝裸 contains("- ") 方向盲。
         let fmt = build_output_format(true);
         assert!(fmt.contains("numbered lists"), "true 分支必须提及 numbered");
         assert!(fmt.contains("bullet lists"), "true 分支必须提及 bullet");
-        assert!(fmt.contains("1. "), "必须引用编号前缀示例");
-        assert!(fmt.contains("• "), "必须引用 bullet 前缀示例");
+        assert!(
+            fmt.contains("numbered lists with \"1. \""),
+            "必须引用编号前缀示例（锚定要求侧）"
+        );
+        assert!(
+            fmt.contains("bullet lists with \"- \""),
+            "必须引用标准 Markdown \"- \" bullet 前缀示例"
+        );
+        // 负向护栏：不得回退到 U+2022 圆点前缀（防契约反转后测试仍静默绿）
+        assert!(
+            !fmt.contains("bullet lists with \"• \""),
+            "bullet 前缀不得回退到 \"• \" (U+2022)"
+        );
         assert!(!fmt.contains("1)"), "符号禁令不得把 1) 当合法编号形式");
     }
 
@@ -1568,21 +1581,50 @@ mod tests {
     fn build_format_instruction_block_four_quadrants() {
         // ITN-V2 P1 F3 列表四象限（Gavin 2026-07-31 规格）：
         //   multiline_safe=true ｜ 有先后 → "1. "/"2. "/"3. " 换行
-        //   multiline_safe=true ｜ 无先后 → "• "（U+2022）换行
+        //   multiline_safe=true ｜ 无先后 → "- "（标准 Markdown，FORMAT-MD-BULLET-001）换行
         //   false ｜ 有先后 → 内联保留序号语义；无先后 → 「、」短名词 /「；」较长小句
+        //
+        // TEST-SYNC-SCENE-MD-003 A2：断言必须锚定「要求」或「禁止」侧，杜绝裸 contains。
+        // 旧断言 `contains("• ")` 假绿的根因：契约反转后 "• " 只出现在禁令里，测试仍在断言
+        // 「须用 • 」却静默通过（方向完全颠倒）。每条列表符号断言配负向护栏。
         let safe = build_format_instruction_block(true);
-        assert!(safe.contains("\"1. \""), "有序列表须用 \"1. \" 前缀");
-        assert!(safe.contains("\"2. \""), "有序列表须用 \"2. \" 前缀");
-        assert!(safe.contains("\"3. \""), "有序列表须用 \"3. \" 前缀");
-        assert!(safe.contains("• "), "无序列表须用 \"• \" (U+2022)");
-        // 符号禁令：1) / - / * / # 一律禁止
-        assert!(safe.contains("\"1)\""), "符号禁令须出现 1) 的禁止声明");
+        // 有序：锚定「要求」侧。
+        // 主控修正（TEST-SYNC-SCENE-MD-003 验收）：原写法拆成三条
+        // `contains("exact prefix \"2. \"")` / `\"3. \"` 必红 —— prompt 原文是
+        // `the exact prefix "1. ", "2. ", "3. " inside`，「exact prefix」只紧邻
+        // 第一个前缀，后两个前面没有该锚点。锚定整串才既方向安全又真实存在。
+        assert!(
+            safe.contains("exact prefix \"1. \", \"2. \", \"3. \""),
+            "有序列表须用 \"1. \"/\"2. \"/\"3. \" 前缀（锚定要求侧整串）"
+        );
+        // 无序：锚定「要求」侧 → 标准 Markdown "- "
+        assert!(
+            safe.contains("exact prefix \"- \""),
+            "无序列表须用标准 Markdown \"- \" 前缀"
+        );
+        // 负向护栏：不得要求 U+2022 圆点前缀（防契约回退）
+        assert!(
+            !safe.contains("exact prefix \"• \""),
+            "不得回退到 U+2022 圆点前缀"
+        );
+        // 符号禁令（锚定「禁止」侧）：1) / * / • / # 一律禁止
+        assert!(
+            safe.contains("DO NOT use \"1)\""),
+            "符号禁令须出现 1) 的禁止声明"
+        );
+        assert!(
+            safe.contains("DO NOT use \"* \", \"• \""),
+            "符号禁令须同时禁 * 与 •（FORMAT-MD-BULLET-001）"
+        );
         assert!(
             safe.contains("Markdown \"#\""),
             "符号禁令须出现 # 的禁止声明"
         );
-        assert!(safe.contains("\"- \""), "符号禁令须出现 - 的禁止声明");
-        assert!(safe.contains("\"* \""), "符号禁令须出现 * 的禁止声明");
+        // 负向护栏：- 已从禁令移除（现为必需前缀），禁令不得再出现 DO NOT use "- "
+        assert!(
+            !safe.contains("DO NOT use \"- \""),
+            "符号禁令不得再禁 \"- \"（- 已是必需前缀）"
+        );
 
         let inline = build_format_instruction_block(false);
         assert!(inline.contains("、"), "单行路径须用「、」连接短名词短语");
@@ -1590,6 +1632,11 @@ mod tests {
         assert!(
             inline.contains("keep the sequence markers inline"),
             "有先后须内联保留序号语义"
+        );
+        // C4：单行分支禁令须同时含 "- " 与 "• "（改动 5 补的，最易漏，专门断言）
+        assert!(
+            inline.contains("DO NOT output \"- \", \"• \""),
+            "单行禁令须同时禁 \"- \" 与 \"• \"（防漏）"
         );
     }
 

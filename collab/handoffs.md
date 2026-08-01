@@ -1,5 +1,19 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — tester-1 — TEST-SYNC-SCENE-MD-003 ✅ 场景扩展 + Markdown 列表测试同步（阶段三，只写测试）
+
+- **来源**：IMPL-SCENE-MULTILINE-002（coder-1）+ FORMAT-MD-BULLET-001（coder-2）+ Gavin 2026-08-01 裁定（编辑生成类放开多行、无序用标准 Markdown）。基线 `8e65239`（main ahead 10 未 push）
+- **范围**：仅 `src/scene/mod.rs` + `src/llm/mod.rs` 的 `#[cfg(test)]` 块；生产代码零改动；`scene-rules.toml` 未碰
+- **A1**：`classify_vscode_to_ide` :361 `!multiline_safe`→`multiline_safe`（Code.exe 现属 true 块）；`builtin_rules_parse_ok` :873 块数 8→9（第 2 条红定位依据：toml 现 9 块 + §23 日志实测 65/2）
+- **A2**：一红两假绿全重写为锚定上下文断言 —— 真红 `fmt.contains("• ")` → `"bullet lists with \"- \""` + 负向护栏；假绿 :1577（`• ` 仅存于禁令、message 方向相反）→ 锚定要求侧 `exact prefix "- "` + 禁止侧 `DO NOT use "* ", "• "` + 负向 `!exact prefix "• "`；假绿 :1583（`- ` 已成必需前缀、断言「被禁止」方向颠倒）→ 负向 `!contains("DO NOT use \"- \"")`；两处过时注释同步更新
+- **B**：`TEMP_*`/`temp_v2/v3/v4/v5_*` → `SCENE_MD003_*`/`scene_md003_*`；集合恒等复核（TRUE32=FALSE28=DOC29 全对齐 toml）；⭐新增 `scene_md003_ide_terminal_blocks_disjoint` 两块 exe 互不相交断言（首匹配静默失效护栏）
+- **C1**：IMPL 新增 23 条 title_keywords 逐一入测 → doc/true；反向护栏 chrome+普通标题 → browser/false
+- **C2**：doc 新增 exe 29 条（Markdown 13/Todo 6/便签 10，含 StickyNotesStub/Microsoft.Notes）→ doc/true
+- **C3**：vim/gvim、cmd/powershell/WindowsTerminal/putty、WeChat/QQ/DingTalk/Feishu → false；Figma → browser
+- **C4**：true 分支四象限 `1. `+`- `；false 分支禁令同含 `- `/`• `（专门断言）
+- **自验**：`cargo check --tests` 0 errors；`cargo fmt -- src/scene/mod.rs src/llm/mod.rs` 限定范围零改写；git diff 自证零连带（其余 37 个已改文件为会话前 CRLF/LF 差异，未触碰）
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/tester-1/result.md`（WSL Python 写，非空）+ `logs/20260801.md` §30
+
 ## 2026-08-01 — coder-1 — IMPL-SCENE-MULTILINE-002 ✅ 场景词表落地（纯数据，免构建）
 
 - **来源**：研究 `collab/research/scene-multiline-coverage-002.md` + Gavin 2026-08-01 拍板（方案 A + 推测项后补）+ 主控三批修正/追加（同 kind 多块、Gavin 推翻 R3 L2 结论、Todo/便签追加）

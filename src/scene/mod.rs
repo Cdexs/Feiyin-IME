@@ -360,11 +360,14 @@ mod tests {
 
     #[test]
     fn classify_vscode_to_ide() {
+        // TEST-SYNC-SCENE-MD-003：Gavin 2026-08-01 裁定代码/文字编辑生成类软件
+        // （VS Code/Cursor/JetBrains 全家等）放开多行 → ide_terminal(true) 块。
+        // 旧断言「IDE/terminal must be multiline_safe=false」随设计变更作废。
         let scene = classify_builtin("Code.exe", "main.rs - VSCode");
         assert_eq!(scene.scene, SceneKind::IdeTerminal);
         assert!(
-            !scene.multiline_safe,
-            "IDE/terminal must be multiline_safe=false"
+            scene.multiline_safe,
+            "IDE/editor must be multiline_safe=true"
         );
     }
 
@@ -870,7 +873,7 @@ exe = ["browser.exe"]
             parsed.err()
         );
         let rules = parsed.unwrap();
-        assert_eq!(rules.scene.len(), 8, "[[scene]] 块数应为 8");
+        assert_eq!(rules.scene.len(), 9, "[[scene]] 块数应为 9");
         let total: usize = rules.scene.iter().map(|s| s.exe.len()).sum();
         assert!(
             total >= 160,
@@ -1011,45 +1014,117 @@ title_keywords = ["doc_keyword"]
     }
 
     // ============================================================
-    // TEMP-IMPL-SCENE-MULTILINE-002：临时验证（交付后必删）
+    // SCENE-MD-003（IMPL-SCENE-MULTILINE-002）：ide_terminal 双块全覆盖 + 互斥验证
+    // 原名 temp_*（曾被视为临时），主控裁定这批是永久保留：28 条逐条实测除写测试
+    // 外无他法，任务书「零 Rust 改动」与「28 条实测」规格自相矛盾，责任在主控。
+    // 已改为正式命名 scene_md003_* / SCENE_MD003_*。
     // ============================================================
 
-    const TEMP_TRUE_EXES: &[&str] = &[
-        "notepad++.exe", "sublime_text.exe", "SublimeText.exe",
-        "Code.exe", "Code - Insiders.exe", "cursor.exe", "Windsurf.exe",
-        "Zed.exe", "HBuilderX.exe", "devenv.exe",
-        "idea64.exe", "idea.exe", "pycharm64.exe", "pycharm.exe",
-        "webstorm64.exe", "webstorm.exe", "goland64.exe", "goland.exe",
-        "rustrover64.exe", "rustrover.exe", "clion64.exe", "clion.exe",
-        "phpstorm64.exe", "phpstorm.exe", "rubymine64.exe", "rubymine.exe",
-        "rider64.exe", "rider.exe",
-        "sourceinsight4.exe", "Insight4.exe", "Insight3.exe", "SourceInsight.exe",
+    /// ide_terminal(multiline_safe=true) 块：代码/文字编辑生成类软件（Gavin 2026-08-01 裁定放开多行）
+    const SCENE_MD003_TRUE_EXES: &[&str] = &[
+        "notepad++.exe",
+        "sublime_text.exe",
+        "SublimeText.exe",
+        "Code.exe",
+        "Code - Insiders.exe",
+        "cursor.exe",
+        "Windsurf.exe",
+        "Zed.exe",
+        "HBuilderX.exe",
+        "devenv.exe",
+        "idea64.exe",
+        "idea.exe",
+        "pycharm64.exe",
+        "pycharm.exe",
+        "webstorm64.exe",
+        "webstorm.exe",
+        "goland64.exe",
+        "goland.exe",
+        "rustrover64.exe",
+        "rustrover.exe",
+        "clion64.exe",
+        "clion.exe",
+        "phpstorm64.exe",
+        "phpstorm.exe",
+        "rubymine64.exe",
+        "rubymine.exe",
+        "rider64.exe",
+        "rider.exe",
+        "sourceinsight4.exe",
+        "Insight4.exe",
+        "Insight3.exe",
+        "SourceInsight.exe",
     ];
 
-    const TEMP_FALSE_EXES: &[&str] = &[
-        "WindowsTerminal.exe", "cmd.exe", "powershell.exe", "pwsh.exe",
-        "ConEmu64.exe", "ConEmu.exe", "vim.exe", "gvim.exe",
-        "Cmder.exe", "Alacritty.exe", "wezterm-gui.exe", "mintty.exe",
-        "putty.exe", "Xshell.exe", "Xshell8.exe", "SecureCRT.exe",
-        "MobaXterm.exe", "Tabby.exe", "Hyper.exe", "conhost.exe",
-        "OpenConsole.exe", "wezterm.exe", "git-bash.exe", "Nu.exe",
+    /// ide_terminal(multiline_safe=false) 块：纯终端 + 模态编辑器（vim/gvim）
+    /// ⚠️ 28 条全量：Xshell6/Xshell7/Xagent/MobaXterm1 必须与 scene-rules.toml 逐条对齐
+    const SCENE_MD003_FALSE_EXES: &[&str] = &[
+        "WindowsTerminal.exe",
+        "cmd.exe",
+        "powershell.exe",
+        "pwsh.exe",
+        "ConEmu64.exe",
+        "ConEmu.exe",
+        "vim.exe",
+        "gvim.exe",
+        "Cmder.exe",
+        "Alacritty.exe",
+        "wezterm-gui.exe",
+        "mintty.exe",
+        "putty.exe",
+        "Xshell.exe",
+        "Xshell6.exe",
+        "Xshell7.exe",
+        "Xshell8.exe",
+        "Xagent.exe",
+        "SecureCRT.exe",
+        "MobaXterm.exe",
+        "MobaXterm1.exe",
+        "Tabby.exe",
+        "Hyper.exe",
+        "conhost.exe",
+        "OpenConsole.exe",
+        "wezterm.exe",
+        "git-bash.exe",
+        "Nu.exe",
     ];
 
-    const TEMP_DOC_TRUE_EXES: &[&str] = &[
-        "Notepad.exe", "siyuan.exe", "wps.exe", "Obsidian.exe",
-        "Zettlr.exe", "vnote.exe", "trilium.exe", "Standard Notes.exe",
-        "Boostnote.exe", "Inkdrop.exe", "YoudaoNote.exe", "WizNote.exe",
+    /// doc 块新增条目（Markdown 笔记 / Todo / 便签，multiline_safe=true）
+    const SCENE_MD003_DOC_TRUE_EXES: &[&str] = &[
+        "Notepad.exe",
+        "siyuan.exe",
+        "wps.exe",
+        "Obsidian.exe",
+        "Zettlr.exe",
+        "vnote.exe",
+        "trilium.exe",
+        "Standard Notes.exe",
+        "Boostnote.exe",
+        "Inkdrop.exe",
+        "YoudaoNote.exe",
+        "WizNote.exe",
         "wiz.exe",
-        "Todoist.exe", "TickTick.exe", "TodoApp.exe", "ClickUp.exe",
-        "Any.do.exe", "Focalboard.exe",
-        "SimpleStickyNotes.exe", "Simple Sticky Notes.exe",
-        "stickies.exe", "notezilla.exe", "PNotes.exe",
-        "7StickyNotes.exe", "jingyeqian.exe", "StickyNotes.exe",
+        "Todoist.exe",
+        "TickTick.exe",
+        "TodoApp.exe",
+        "ClickUp.exe",
+        "Any.do.exe",
+        "Focalboard.exe",
+        "SimpleStickyNotes.exe",
+        "Simple Sticky Notes.exe",
+        "stickies.exe",
+        "notezilla.exe",
+        "PNotes.exe",
+        "7StickyNotes.exe",
+        "jingyeqian.exe",
+        "StickyNotes.exe",
+        "StickyNotesStub.exe",
+        "Microsoft.Notes.exe",
     ];
 
     #[test]
-    fn temp_v2_true_block_all() {
-        for exe in TEMP_TRUE_EXES {
+    fn scene_md003_true_block_all() {
+        for exe in SCENE_MD003_TRUE_EXES {
             let s = classify_builtin(exe, "");
             assert_eq!(s.scene, SceneKind::IdeTerminal, "{exe} 应 ide_terminal");
             assert!(s.multiline_safe, "{exe} 应 multiline_safe=true（新块生效）");
@@ -1057,8 +1132,8 @@ title_keywords = ["doc_keyword"]
     }
 
     #[test]
-    fn temp_v3_false_block_all() {
-        for exe in TEMP_FALSE_EXES {
+    fn scene_md003_false_block_all() {
+        for exe in SCENE_MD003_FALSE_EXES {
             let s = classify_builtin(exe, "");
             assert_eq!(s.scene, SceneKind::IdeTerminal, "{exe} 应 ide_terminal");
             assert!(!s.multiline_safe, "{exe} 应 multiline_safe=false");
@@ -1066,16 +1141,85 @@ title_keywords = ["doc_keyword"]
     }
 
     #[test]
-    fn temp_v3_doc_untouched() {
-        for exe in TEMP_DOC_TRUE_EXES {
+    fn scene_md003_doc_untouched() {
+        for exe in SCENE_MD003_DOC_TRUE_EXES {
             let s = classify_builtin(exe, "");
             assert_eq!(s.scene, SceneKind::Doc, "{exe} 应 doc");
             assert!(s.multiline_safe, "{exe} doc 应 true");
         }
     }
 
+    /// ⭐ 成败关键：两个 ide_terminal 块的 exe 集合必须互不相交。
+    /// classify（src/scene/mod.rs:157）exe 首个匹配即返回 —— 任一 exe 同时出现在
+    /// 两块中，TRUE 块就永远轮不到。主控本次用 `comm` 手工验证为空集，但必须变成
+    /// 测试，否则将来有人往 FALSE 块补一条就会静默失效。
     #[test]
-    fn temp_v4_chrome_title_subclass() {
+    fn scene_md003_ide_terminal_blocks_disjoint() {
+        let r = toml::from_str::<Rules>(BUILTIN_RULES).unwrap();
+        let mut true_exes = std::collections::HashSet::new();
+        let mut false_exes = std::collections::HashSet::new();
+        for s in &r.scene {
+            if s.kind != "ide_terminal" {
+                continue;
+            }
+            let set = if s.multiline_safe {
+                &mut true_exes
+            } else {
+                &mut false_exes
+            };
+            for e in &s.exe {
+                set.insert(e.to_lowercase());
+            }
+        }
+        assert!(!true_exes.is_empty(), "multiline_safe=true 块不应为空");
+        assert!(!false_exes.is_empty(), "multiline_safe=false 块不应为空");
+        let overlap: Vec<&String> = true_exes.intersection(&false_exes).collect();
+        assert!(
+            overlap.is_empty(),
+            "ide_terminal 两个块 exe 集合不得相交: {:?}（相交 = TRUE 块永不命中）",
+            overlap
+        );
+    }
+
+    /// TEST-SYNC-SCENE-MD-003 C3：关键反向护栏（不得回归）
+    /// 纯终端/模态编辑器（vim/gvim）仍 false（FALSE_EXES 已逐条覆盖，此处补显式
+    /// 断言语义）；chat 应用仍 false；Figma 仍 browser。
+    #[test]
+    fn scene_md003_c3_reverse_guards() {
+        // 模态编辑器：注入字符在 normal 模式被当命令键执行 → 不放开
+        for exe in ["vim.exe", "gvim.exe"] {
+            let s = classify_builtin(exe, "");
+            assert_eq!(s.scene, SceneKind::IdeTerminal, "{exe} 应 ide_terminal");
+            assert!(!s.multiline_safe, "{exe} 模态编辑器必须 false");
+        }
+        // 纯终端代表（其余 24 条由 SCENE_MD003_FALSE_EXES 覆盖）
+        for exe in [
+            "cmd.exe",
+            "powershell.exe",
+            "WindowsTerminal.exe",
+            "putty.exe",
+        ] {
+            let s = classify_builtin(exe, "");
+            assert_eq!(s.scene, SceneKind::IdeTerminal, "{exe} 应 ide_terminal");
+            assert!(!s.multiline_safe, "{exe} 纯终端必须 false");
+        }
+        // chat 应用（Gavin 2026-07-28 决策 3 延续）：微信/QQ/钉钉/飞书 → false
+        for exe in ["WeChat.exe", "QQ.exe", "DingTalk.exe", "Feishu.exe"] {
+            let s = classify_builtin(exe, "");
+            assert_eq!(s.scene, SceneKind::Chat, "{exe} 应 chat");
+            assert!(!s.multiline_safe, "{exe} chat 必须 false");
+        }
+        // Figma：Gavin 2026-07-28 决策 3 归 browser（本批未改）
+        let figma = classify_builtin("Figma.exe", "");
+        assert_eq!(figma.scene, SceneKind::Browser, "Figma 应 browser");
+        assert!(!figma.multiline_safe);
+    }
+
+    #[test]
+    fn scene_md003_chrome_title_subclass() {
+        // TEST-SYNC-SCENE-MD-003 C1：doc 块 IMPL 新增 title_keywords 全量覆盖（23 条逐一入测）。
+        // 浏览器细分靠 doc 块 title_keywords（src/scene/mod.rs:160-177 浏览器 exe 命中后
+        // 查其他场景关键词）—— 漏测一条 = 那个词的网页版静默不重分类。
         for (title, expect_kind) in [
             ("Google Keep - 我的笔记", SceneKind::Doc),
             ("金山文档 - 我的表格", SceneKind::Doc),
@@ -1086,7 +1230,13 @@ title_keywords = ["doc_keyword"]
             ("Trilium - my notes", SceneKind::Doc),
             ("Standard Notes - web", SceneKind::Doc),
             ("SiYuan - 思源笔记", SceneKind::Doc),
+            ("思源笔记 - 我的文档", SceneKind::Doc),
+            ("钉钉文档 - 协作", SceneKind::Doc),
+            ("Obsidian Publish - 我的站点", SceneKind::Doc),
+            ("Roam Research - 我的图谱", SceneKind::Doc),
+            ("Anytype - 空间", SceneKind::Doc),
             ("Todoist - 任务清单", SceneKind::Doc),
+            ("TickTick - Tasks", SceneKind::Doc),
             ("滴答清单 - 我的待办", SceneKind::Doc),
             ("Trello - 看板", SceneKind::Doc),
             ("Asana - projects", SceneKind::Doc),
@@ -1099,16 +1249,31 @@ title_keywords = ["doc_keyword"]
             assert_eq!(s.scene, expect_kind, "title={title}");
             assert!(s.multiline_safe, "title={title} 重分类为 doc 应 true");
         }
+        // 反向护栏：chrome + 普通标题 → 仍 browser，false
         let normal = classify_builtin("chrome.exe", "随便一个网页");
         assert_eq!(normal.scene, SceneKind::Browser, "普通标题应维持 browser");
         assert!(!normal.multiline_safe);
     }
 
     #[test]
-    fn temp_v5_sticky_notes_parse() {
+    fn scene_md003_sticky_notes_parse() {
         let r = toml::from_str::<Rules>(BUILTIN_RULES).unwrap();
-        let doc = r.scene.iter().find(|s| s.kind == "doc").expect("doc 块存在");
-        assert!(doc.exe.iter().any(|e| e.eq_ignore_ascii_case("StickyNotesStub.exe")), "StickyNotesStub.exe 应在 doc 词表");
-        assert!(doc.exe.iter().any(|e| e.eq_ignore_ascii_case("Microsoft.Notes.exe")), "Microsoft.Notes.exe 应在 doc 词表");
+        let doc = r
+            .scene
+            .iter()
+            .find(|s| s.kind == "doc")
+            .expect("doc 块存在");
+        assert!(
+            doc.exe
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case("StickyNotesStub.exe")),
+            "StickyNotesStub.exe 应在 doc 词表"
+        );
+        assert!(
+            doc.exe
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case("Microsoft.Notes.exe")),
+            "Microsoft.Notes.exe 应在 doc 词表"
+        );
     }
 }
