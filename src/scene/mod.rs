@@ -1090,6 +1090,7 @@ title_keywords = ["doc_keyword"]
     ];
 
     /// doc 块新增条目（Markdown 笔记 / Todo / 便签，multiline_safe=true）
+    /// 含 Linear.exe（Gavin 2026-08-01 改判：项目/任务管理工具非聊天工具，从 chat 移入 doc）
     const SCENE_MD003_DOC_TRUE_EXES: &[&str] = &[
         "Notepad.exe",
         "siyuan.exe",
@@ -1110,6 +1111,7 @@ title_keywords = ["doc_keyword"]
         "ClickUp.exe",
         "Any.do.exe",
         "Focalboard.exe",
+        "Linear.exe",
         "SimpleStickyNotes.exe",
         "Simple Sticky Notes.exe",
         "stickies.exe",
@@ -1147,6 +1149,18 @@ title_keywords = ["doc_keyword"]
             assert_eq!(s.scene, SceneKind::Doc, "{exe} 应 doc");
             assert!(s.multiline_safe, "{exe} doc 应 true");
         }
+    }
+
+    /// TEST-EXEC-SCENE-MD-003 Step 0：Linear.exe 改判 doc（Gavin 2026-08-01）。
+    /// Linear 是项目/任务管理工具非聊天工具，原归 chat(false) 属分类错误，
+    /// 现与 Todoist/TickTick/ClickUp/Any.do 同列 doc 块 Todo 段。
+    #[test]
+    fn scene_md003_linear_reclassified_to_doc() {
+        let s = classify_builtin("Linear.exe", "");
+        assert_eq!(s.scene, SceneKind::Doc, "Linear.exe 应重分类为 doc");
+        assert!(s.multiline_safe, "Linear.exe doc 应 true");
+        // 反向护栏：不得回归 chat
+        assert_ne!(s.scene, SceneKind::Chat, "Linear.exe 不得再归 chat");
     }
 
     /// ⭐ 成败关键：两个 ide_terminal 块的 exe 集合必须互不相交。
