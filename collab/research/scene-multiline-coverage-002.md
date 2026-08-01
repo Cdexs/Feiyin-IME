@@ -46,6 +46,8 @@
 | --- | --- | --- | --- | --- | --- |
 | 1 | Google Keep | `Google Keep: Online Notes and Digital Notebook Lists | Google Workspace`（📄WebFetch 实测 `keep.google.com`）| `Google Keep` | 高 | 未发现（"Google Keep" 作为完整词组只出现在 Keep 相关页面）|
 | 2 | memos | `memos`（📄官方：自托管应用，标题通常就是 `memos` 或 `Memos`）| `memos` | **低** | 🔴 `Memos - Reddit`、`Memos of a...`、`memos blog` 等非目标页面会命中。**建议不收** |
+
+> 🔄 **DATA-SCENE-MEMOS-011 更新批注（2026-08-01）**：上述「不收」结论已被 **Gavin 指令推翻**。Gavin 明确要求收录「浏览器标题含 Memos 单词」的软件到笔记软件分类（Memos 支持 Markdown 输出，应享受 doc 场景多行/列表能力）。主控 2026-08-01 误伤判据：Memos 的误伤（英文文章标题含 `leaked memos`/`company memos`）属「误伤→doc」方向——只多给多行与列表，文本仍正确，属优雅降级**可接受**；非「chat 判成 doc」方向反。**已落地**：`scene-rules.toml` doc 块 title_keywords 收录 `Memos`（✅实测 demo.usememos.com 标题即 "Memos"）+ `- Memos`（更具体后缀形式，最长匹配优先）。原「不收」结论保留存档，决策变更可追溯。
 | 3 | 思源笔记 web | `思源笔记 - [文档名]`（⚠️推测：思源 web 版通常以 `思源笔记` 开头，但思源也支持自定义服务器标题）| `思源笔记` | 高 | 未发现（"思源笔记"是产品专有名）|
 | 4 | Obsidian Publish | `Site Name - Obsidian Publish`（📄官方：Obsidian Publish 站点标题格式 `[站点名] - Obsidian Publish`）| `Obsidian Publish` | 高 | 未发现（"Obsidian Publish" 是产品专有名）|
 | 5 | 金山文档/WPS 云文档 | `文档名 - 金山文档`（⚠️推测：WPS 云文档网页版标题通常含 `金山文档`）| `金山文档` | 高 | 未发现（"金山文档"是产品专有名）|

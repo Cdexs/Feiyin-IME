@@ -438,6 +438,13 @@ title_keywords = [
     "Google Tasks",        # 📄tasks.google.com 标题含 Google Tasks（带命名空间，误伤低）
     "Microsoft To Do",     # 📄todo.microsoft.com 标题含 Microsoft To Do（带命名空间，误伤低）
     "Any.do",              # 📄any.do 网页版标题含 Any.do
+    # --- DATA-SCENE-MEMOS-011：Memos（Gavin 2026-08-01 指令收录）---
+    # 产品：github.com/usememos/memos，自托管 Markdown 笔记服务（Docker 部署，无 Windows 桌面版）。
+    # 🔴 Gavin 指令推翻 RESEARCH-SCENE-MULTILINE-002 的「不收」结论（当时因特异性低判不收）。
+    # 误伤判据（主控 2026-08-01）：Memos 误伤（英文文章标题含 leaked memos/company memos）落「误伤→doc」，
+    # 只多给多行与列表文本仍正确，属优雅降级可接受；非「chat 判成 doc」方向反。详见 scene-multiline-coverage-002.md 追加批注。
+    "Memos",               # ✅实测：demo.usememos.com 标题即 "Memos"；usememos.com 官网标题含 "Memos"。⚠️误伤面：英文文章标题含 memos（leaked memos 等）会一并命中，落 doc 优雅降级可接受
+    "- Memos",             # ⚠️更具体后缀形式（如 "我的笔记 - Memos"），最长匹配优先胜出，与裸 Memos 并存零副作用
 ]
 
 # ============================================================

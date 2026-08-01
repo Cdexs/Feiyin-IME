@@ -1,5 +1,16 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — coder-1 — DATA-SCENE-MEMOS-011 ✅ 收录 Memos 到 doc 块（Gavin 指令推翻「不收」结论）
+
+- **来源**：Gavin 指令「把浏览器标题含 Memos 单词的软件设到笔记软件分类（支持 MD 输出）」。基线 `c9a9734`（ahead 27）
+- **范围**：`scene-rules.toml`（doc title_keywords +2）+ `collab/research/scene-multiline-coverage-002.md`（原「不收」行追加批注）；零 Rust 改动
+- **改动 1**：+`Memos`（✅实测 demo.usememos.com 标题即 "Memos"；注释含来源/Gavin 指令/误伤面）。🔴 Gavin 指令推翻 RESEARCH-SCENE-MULTILINE-002「不收」结论——误伤（leaked memos 等）属「误伤→doc」优雅降级可接受，非 chat 方向反
+- **改动 2**：+`- Memos`（更具体后缀形态，最长匹配优先，与裸 Memos 并存零副作用）
+- **改动 3**：**无 Windows 桌面版**（Docker 自托管 web，GitHub releases 无客户端产物），仅 web 关键词覆盖
+- **审计批注**：scene-multiline-coverage-002.md:48 原「建议不收」追加 🔄 更新批注（不删原结论，决策可追溯）
+- **验证**：临时测试 2 条全过后删除（V2 Memos→doc/true / V3 Mastodon+飞书+百度 反向护栏）；scene:: 72/0；双 cargo check 0 errors
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-1/result.md`（非空）+ `logs/20260801.md`
+
 ## 2026-08-01 — tester-1 — TEST-SYNC追补+TEST-EXEC+BUILD-RELEASE-20260801-007 ✅ 三段收口出包
 
 - **来源**：唯一提交 a9bc9b9（输出契约 MAY→条件式 MUST）。基线 `a9bc9b9`（ahead 26 未 push）
