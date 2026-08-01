@@ -1,5 +1,16 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — tester-1 — BUILD-RELEASE-20260801-001 ✅ v0.7.3 出包完成
+
+- **构建**：`cargo build --release` 1m51s 0 errors（仅主程序，UI/npm 按主控范围裁定跳过）
+- **V1 决定性探针**：预验证旧 exe 一/五/八分钟 均=1（方法有效）→ 新 exe 均=**0**，对照 `一刻钟` 新旧均=1。被删 N分钟 词条已从新 exe 内置词表消失
+- **V2**：feiyin-ime.exe `8092cf38...` / crash-reporter.exe `b02ca32c...` 两副本 sha256 一致；**V3**：toml 三副本 sha256 全=`93ab39724534...`（任务书新版哈希）✅ `[TOML-STALE-001]` 闭环
+- **V4**：ProductVersion = **0.7.3.0**（版本红线守住）；**V5**：产物 mtime 12:51:47 晚于源码 ✅
+- **V6**：新实例 **PID 20000** `-debug` 启动，Responding=True，0 panic。⚠️ ITN 经 OnceLock 懒加载（仅首次语音触发），新实例尚无 ITN 日志行；证据链完整（加载路径优先读 exe 同级 toml src/itn.rs:441-448 + Step3 同步 12:52:07 早于实例启动 12:52:27 + V3 文件已新 + V1 内置已新）。Gavin 端测首次语音后日志将出现晚于 12:52:07 的 `ITN rules loaded` 行
+- **Publish/**：feiyin-ime.exe + crash-reporter.exe + itn-rules.toml（新版）已同步；feiyin-ime-ui.exe 未动（范围裁定）
+- **零源文件改动**：42 个 M 文件全为既有批次遗留；HEAD=`5799c02`；无 untracked/垃圾文件
+- **下一步**：Gavin 端测 → 确认后由主控决定 push / 升版
+
 ## 2026-08-01 — tester-1 — TEST-EXEC-ITN-V2-006 ✅ 全量回归通过，0 红条
 
 - **任务**：阶段四执行测试（阶段三 TEST-SYNC 的 6 条测试验收通过后执行）

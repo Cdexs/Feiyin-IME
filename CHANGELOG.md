@@ -4,6 +4,7 @@
 > 详细记录见 logs/YYYYMMDD.md
 
 ---
+| BUILD-RELEASE-20260801-001 | v0.7.3 出包（仅主程序，UI/npm 跳过）：cargo build --release 1m51s 0 errors；V1 决定性探针（一/五/八分钟 旧 exe=1→新 exe=0，对照一刻钟=1）；V2 exe 两副本 sha256 一致；V3 toml 三副本 sha256=93ab3972 一致 [TOML-STALE-001] 闭环；V4 版本 0.7.3.0；V5 mtime 晚于源码；V6 新实例 PID 20000 Responding=True 0 panic（ITN 懒加载证据链完整）；零源文件改动 | tester-1 | 2026-08-01 |
 | TEST-EXEC-ITN-V2-006 | 全量回归（阶段四）：cargo test 767/0/8 + itn:: 124/0（--list 交叉验证 775=767+8 自洽）+ src-tauri 53/0/0；R1 T3 四条多位数期望全实证（三十五台→35台 等，consumed>=2 守卫零回归）；R3 实例 22556 Responding=True debug.log 零 panic；0 红条，出包就绪 | tester-1 | 2026-08-01 |
 | TEST-SYNC-ITN-V2-006 | 测试同步（ENGINE-006 is_real_unit + LEXICON-006-C）：src/itn.rs 测试块 +107/−0 纯新增 6 条单测（双隶属量词保持汉字 / 真单位仍转 / 多位数 consumed>=2 护栏补齐 / N分钟 10 条红1闭合 / 2字词移除恢复 / 13 条更长词条保护）；cargo check --tests 0 errors，阶段三未跑 cargo test，T3 四条期望列待 TEST-EXEC 确认 | tester-1 | 2026-08-01 |
 | ITN-V2-LEXICON-006-C | 移除 5 条 2 字遮蔽词条(三元/九度/二分/五类/四大)：二分钟→2分钟红1闭合+三元钱→3元钱+九度电→9度电；13条反向护栏全保护；13条回归全过；cargo test itn:: 118/0 | coder-1 | 2026-08-01 |

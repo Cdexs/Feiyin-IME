@@ -288,7 +288,7 @@
 | 跨平台共享化重构 | `derive_translation_target` / `ensure_translation_direction` / `remember_translation_direction` 三个纯业务逻辑函数从 `#[cfg(target_os="windows")]` 的 `main.rs` 移入平台中立模块（`translation/mod.rs` / `config/mod.rs`），macOS 侧可直接复用、零重写；配套测试随之搬入中立模块，macOS 侧也能跑到（DEC-033 附则三） ｜ 2026-07-30 |
 | 思维链泄漏五环修复（P0） | DeepSeek 推理模型把 CoT 泄漏进输入框（实测约 7 次 1 次，最坏整句变 `...`）根治：**P0-1** 请求体双发 `thinking:{"type":"disabled"}`（DeepSeek 官方开关）+ 保留 `enable_thinking`（SiliconFlow/Qwen3 用，避免回归），4 处注入点 ｜ **P0-2** `extract_text` 移除「content 空回落 `reasoning_content`」（这是 CoT 被当答案的真正入口）｜ **P0-3** `extract_corrected_tag` 改 `rfind` 取末对标签，防 CoT 里的模板占位劫持 ｜ **P0-4** 新增 `lacks_any_substantive_char()` 拒绝纯标点结果；**比例判据经实跑证伪后降级为只观测不拒绝**（合法重度压缩 9.7% vs 故障 6%，仅差 3.7pp 划不出可靠边界，误伤代价不对称）｜ **P0-5** 补 `finish_reason` + `usage`（含 `reasoning_tokens`）日志，`length` 截断今后可直接从日志判定 ｜ 2026-07-30 |
 
-## v0.7.3 增补 · ITN 二代重构（2026-07-31，进行中）
+## ✅ v0.7.3 增补 · ITN 二代重构（2026-07-31 起，2026-08-01 闭环并出包）
 
 | 功能 | 说明 |
 | --- | --- |
@@ -418,6 +418,10 @@
 | v0.7.2 | 2026-07-28 | 11,603,456B (18:42/Publish 18:43) | 沿用 07-27 20:31（10,027,008B）| 24,858,624B (18:41/Publish 18:43) | 686 PASS / 0 FAIL / 8 IGNORED + src-tauri 53/0 + Vitest/pytest SKIP（**仅重建主程序**，把 IMPL-SCENE-COVERAGE-001 的 144→165 条场景词表经 `include_str!` 嵌入内置默认；跳过 Tauri UI 构建，`src-tauri/**` 与 `ui/**` 零改动；提交 695e50e；**版本号维持 0.7.2 不升版**，ProductVersion 0.7.2.0；sha256 `e35679bd…` 两副本一致 + crash-reporter `8bfabfb5…` 两副本一致 + scene-rules.toml 三副本 `7b01b33c…` 一致；主控独立换 6 个探针字符串复查嵌入结果全部命中）|
 
 | v0.7.2 | 2026-07-30 | 11,615,744B `8da29081…` (13:13/Publish 13:13) | 10,026,496B `d9db29e3…` (13:02/Publish 13:13) | 24,858,624B `950e1474…` (13:12/Publish 13:13) | 695 PASS / 0 FAIL / 8 IGNORED + src-tauri 53/0（于 `ff492ef` 批次执行，本次纯构建无代码改动故未重跑）（**全量三步出包**：MACOS-COMPAT-001 跨平台重构 + FIX-COT-LEAK-001-P0 思维链泄漏五环修复 + macOS 审计文档；提交 `292eeb0`/`ff492ef`/`2c98976`；**版本号维持 0.7.2 不升版**，ProductVersion 0.7.2.0；**全量重编** 主程序 10m02s + Tauri UI 2m51s + npm 1.55s，CT2 陷阱未触发；三 exe 两副本 sha256 逐一一致且全异于旧值；**主控决定性探针** `grep -ac "LLM response meta"` 0→1 证明新代码就位，另换 Tauri 侧独有串 `enable_thinking`/`reasoning_content`/`disabled` 补证 UI exe 镜像；scene/itn toml 三副本一致；UI 内嵌 dist 资产 index-BNQZfcUG.css/index-CTgGziQm.js 命中）|
+
+| v0.7.3 | 2026-07-30 23:00 | 11,798,016B `74e4b56a…` (23:00/Publish 23:00) | 10,026,496B `16acff20…` | 24,858,624B `cc2ee873…` | itn 96 PASS / 1 FAIL（`time_half` 预期红，Gavin 明确不以测试通过为出包前提）（**BUILD-RELEASE-20260730-002**：ITN-COLLISION-TYPEA-002 单位碰撞保护词表 1386 条 + 几何术语白名单；**版本号 0.7.2→0.7.3**，主程序 ProductVersion 0.7.3.0、UI 0.7.3（此前 UI 停在 0.7.2 故本次必须重建 Tauri UI）；两副本 sha256 逐一一致；**`itn-rules.toml` 三副本 `9f36efcb…` 一致**（33,252 B，本次最关键——漏同步则外置旧 toml 9,689 B 静默赢过新内置默认，1386 条完全不生效而日志正常，[TOML-STALE-001]）；主控 8/8 决定性探针命中且旧 exe 对照为 0；冒烟 PID 23276）|
+
+| v0.7.3 | 2026-08-01 12:51 | 11,878,912B `8092cf38…` (12:51:47/Publish 12:52:07) | 沿用 07-30 23:00（10,026,496B `16acff20…`）| 24,858,624B `b02ca32c…` | **767 PASS / 0 FAIL / 8 IGNORED**（`--list` 775 自洽）+ `itn::` **124/0** + src-tauri **53/0/0** + Vitest/pytest SKIP（零前端改动）（**BUILD-RELEASE-20260801-001**：**首次把完整 ITN 二代 P1-P5 打进 exe** + ENGINE-006 双隶属量词守卫 + LEXICON-006-C 移除 5 条 2 字遮蔽词；提交 `6fdba85`/`f6700ea`/`b462f83`/`05de1bc`/`5799c02`，**ahead 5 未 push**；**版本号维持 0.7.3 不升版**，ProductVersion 0.7.3.0；**仅重建主程序**，`ui/`+`src-tauri/` 自 `0adb819` 零改动经 `git diff --stat` 取证故跳过 Tauri UI；构建 1m51s 0 errors；**决定性探针反向设计**——本批无新增代码字符串，改用「被删的词应消失」：`一分钟`/`五分钟`/`八分钟` 旧 exe=1 → 新 exe 两副本=0，对照探针 `一刻钟`=1、`二分查找`=3 证明方法有效；`itn-rules.toml` 三副本 `93ab3972…` 一致、`scene-rules.toml` 三副本 `7b01b33c…` 一致；冒烟 PID 20000 Responding=True 零 panic）|
 
 > **⚠️ 同版本号三构建（v0.7.2 可追溯性缺口，已扩大）**：07-27 20:31（内置词表 144 条，`7fbb1e4b…`，已被覆盖）/ 07-28 18:42（词表 165 条，`e35679bd…`）/ **07-30 13:13（含跨平台重构 + LLM 五环修复，`8da29081…`，当前 Publish 中的）** 三版主程序内容不同，但 ProductVersion 均为 0.7.2.0，只能靠 sha256 区分。系遵守「版本号禁止擅改」的必然结果（Gavin 三次出包指令均未授权升版），待 Gavin 定夺是否升 0.7.3 重出包。**注意：重出包需全量重编（含 CTranslate2 C++），实测 07-30 为 10m02s + 2m51s，不再是 2 分钟。**
 >
