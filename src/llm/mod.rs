@@ -1644,6 +1644,52 @@ mod tests {
         );
     }
 
+    /// TEST-SYNC 追补 0c：单行内联分隔符按语言本地化（3d1f4bb）。
+    /// 锚定「要求」侧原文，不用方向盲裸 contains——沿用 TEST-SYNC-SCENE-MD-003 立的规矩。
+    /// 五语规则 + CROSS-LANGUAGE BAN + 旧措辞「Chinese enumeration separators」必须消失。
+    #[test]
+    fn build_format_instruction_block_false_i18n_separators() {
+        let inline = build_format_instruction_block(false);
+        // English 短项示例（锚定要求侧）
+        assert!(
+            inline.contains("\"apples, bananas, oranges\""),
+            "English 短项示例须为半角逗号+空格"
+        );
+        // English 长句示例（分号）
+        assert!(
+            inline.contains("\"I have a meeting in the morning; I need to write the report in the afternoon\""),
+            "English 长句示例须用半角分号"
+        );
+        // 日语示例（tōten 逗号，锚定要求侧）
+        assert!(
+            inline.contains("\"朝は会議があり、午後は報告書を書きます\""),
+            "日语示例须用全角顿号"
+        );
+        // 韩语示例（半角逗号）
+        assert!(
+            inline.contains("\"아침에는 회의가 있고, 오후에는 보고서를 작성합니다\""),
+            "韩语示例须用半角逗号"
+        );
+        // CROSS-LANGUAGE BAN 标题存在
+        assert!(
+            inline.contains("CROSS-LANGUAGE BAN"),
+            "须含 CROSS-LANGUAGE BAN 标题"
+        );
+        // 中文示例仍在（既有断言 0d 依赖，防回归）
+        assert!(inline.contains("苹果、香蕉、橘子"), "中文短项示例须保留");
+        assert!(inline.contains("早上要开会；下午要写报告；晚上还要改方案"), "中文长句示例须保留");
+        // 负向护栏：旧措辞「Chinese enumeration separators」已删除（判别力对照）
+        assert!(
+            !inline.contains("Chinese enumeration separators"),
+            "旧措辞 Chinese enumeration separators 已删除，不得复活"
+        );
+        // 负向护栏：新措辞锚定
+        assert!(
+            inline.contains("CONVENTIONAL IN THE LANGUAGE OF THE TEXT"),
+            "须改为按文本语言惯例的分隔符措辞"
+        );
+    }
+
     #[test]
     fn flatten_multiline_no_newline_unchanged() {
         // 无换行 → trim 后原样返回

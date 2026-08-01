@@ -1339,4 +1339,56 @@ title_keywords = ["doc_keyword"]
             "Microsoft.Notes.exe 应在 doc 词表"
         );
     }
+
+    /// TEST-SYNC 追补 0a：Mastodon 永久反向护栏。
+    /// ⚠️ 本测试存在的唯一理由：DATA-SCENE-GENERIC-008 曾想把裸 `todo` 收为 doc 泛化关键词，
+    /// 主控实证否决——`Mastodon` 含子串 m-as-**todo**-n（大小写不敏感），是社交网络而非文档，
+    /// 收裸 `todo` 会把它判成 doc（multiline_safe=true），方向完全反了；西语/葡语 `todo`（=「全部」）
+    /// 也是高频误伤。最终改收 `To Do`（带空格）+ `待办`。
+    /// 若将来有人把裸 `todo` 加进 `title_keywords`，此测试立刻撞红——这是本测试唯一的守卫价值，
+    /// 注释不明者勿删（看似冗余实则防回归）。
+    #[test]
+    fn scene_md005_mastodon_not_doc() {
+        for title in ["Mastodon - 首页", "Mastodon Social"] {
+            let s = classify_builtin("chrome.exe", title);
+            assert_ne!(
+                s.scene,
+                SceneKind::Doc,
+                "title={title} 含 todo 子串（Mastodon）但不得判 doc"
+            );
+            assert!(!s.multiline_safe, "title={title} 不得放开多行");
+        }
+        // 正向对照：带空格的 To Do 仍应命中 doc/true——证明没因噎废食把真目标也挡掉
+        let s = classify_builtin("chrome.exe", "Microsoft To Do - 我的待办");
+        assert_eq!(s.scene, SceneKind::Doc, "Microsoft To Do 应 doc");
+        assert!(s.multiline_safe, "Microsoft To Do 应 true");
+    }
+
+    /// TEST-SYNC 追补 0b：本批新增关键词覆盖（DATA-SCENE-GENERIC-008 + FIX-SCENE-WEBTITLE-007）。
+    /// chrome.exe + 标题 → doc/true；UnknownApp + 已发送 → email/true。
+    #[test]
+    fn scene_md005_new_doc_keywords() {
+        for title in [
+            "飞书云文档 - 协作",
+            "WPS云文档 - 我的表格",
+            "腾讯云文档 - 共享",
+            "便签 - 我的备忘",
+            "待办 - 今日任务",
+            "Google 文档 - 报告",
+            "报告 - Word Online",
+            "Microsoft 365 - 首页",
+        ] {
+            let s = classify_builtin("chrome.exe", title);
+            assert_eq!(s.scene, SceneKind::Doc, "title={title} 应 doc");
+            assert!(s.multiline_safe, "title={title} 应 true");
+        }
+        // 云文档 泛化兜底（DEC-038 规则性泛化）：3 字 > 钉钉/飞书(2) 最长匹配胜出
+        let s = classify_builtin("chrome.exe", "华为云文档 - 团队空间");
+        assert_eq!(s.scene, SceneKind::Doc, "云文档 泛化应 doc");
+        // UnknownApp + 已发送 → email/true（中文邮箱发件夹标题审计实证）
+        // 注：标题避开邮件客户端 exe 名（如 Thunderbird），确保走「已发送」关键词路径
+        let s = classify_builtin("UnknownApp.exe", "已发送");
+        assert_eq!(s.scene, SceneKind::Email, "已发送 应 email");
+        assert!(s.multiline_safe, "已发送 email 应 true");
+    }
 }

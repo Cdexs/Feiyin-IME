@@ -1,5 +1,15 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — tester-1 — TEST-SYNC追补+TEST-EXEC+BUILD-RELEASE-20260801-005 ✅ 三段收口出包
+
+- **来源**：3 提交（3d1f4bb 单行分隔符按语言本地化 / 453eea7 飞书云文档+云文档泛化+47 条审计 / 1501d90 便签/待办/To Do+Google 文档+Office Online+已发送+wpsnote）。基线 `1501d90`（ahead 20 未 push）
+- **Step 0 追补**：⭐`scene_md005_mastodon_not_doc`（Mastodon m-as-todo-n 不得判 doc，注释写明存在理由 + 正向对照 Microsoft To Do→doc/true）；`scene_md005_new_doc_keywords`（8 关键词+云文档泛化+已发送→email）；`build_format_instruction_block_false_i18n_separators`（五语+日/韩示例+CROSS-LANGUAGE BAN+负向护栏）；cargo check --tests 0 errors
+- **Step A 全绿**：782/0/8（+3）；src-tauri 53/0/0；scene:: 72/0；llm:: 111/0；--list 790=782+8 自洽；点名 4/4（含 Mastodon 护栏）
+- **B0-pre 构建前探针预验证**（流程改进落实）：2 条恒真探针换新并上报（`云文档`/`便签` 被 toml 注释污染，include_str 连注释嵌入；换 `腾讯云文档`/`WPS云文档`/`wpsnote`/`wpsnotepad`）
+- **Step B**：构建 2m00s；Publish 同步 feiyin-ime.exe（bef8958d/11,897,344B）+ crash-reporter（65ed992a），ui 未动；scene-rules.toml 三副本 2d1811c5；itn 仍 93ab3972
+- **Step C**：C1 12 条≥1 + C2 3 条≥1 + `Chinese enumeration separators` 判别力对照 1→0 + Notepad=1；两副本 sha256 三 exe 全一致；0.7.3.0；mtime 链成立；冒烟 PID 17844 零 panic
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/tester-1/result.md`（WSL Python，93 行）+ `logs/20260801.md` §32
+
 ## 2026-08-01 — coder-1 — DATA-SCENE-GENERIC-008 ✅ 领域级泛化关键词 + 审计发现的补充项（纯数据免构建）
 
 - **来源**：Gavin 指令（金山/WPS 类加入 doc + 云文档泛化 + todo/便签泛化）+ 主控 todo 实证修正 + FIX-SCENE-WEBTITLE-007 审计落地。基线 `453eea7`（ahead 19）
