@@ -1,5 +1,21 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — coder-2 — FORMAT-F3B-EXEMPLIFY-009 ✅ 修 F3b 无序列表在「比如说」式举例枚举下不触发
+
+- **来源**：Gavin 端测发现——同一场景（Notepad/kind=document/multiline_safe=true）两条相隔 52 秒的对照：有序枚举 F3a 正常出 `1. 2. 3.`，无序枚举 F3b 未触发（`比如说啊...` 4 连举例输出整段连续文本零列表）。基线 `2920fa1`（ahead 23）
+- **范围**：仅 `src/llm/mod.rs` F3 段落（总纲 + F3b + F3c），零逻辑改动
+- **6 项改动**：
+  1. 总纲（:834）`enumeration markers` → `enumeration OR exemplification markers`，消除与 F3b 触发词（比如/诸如/for example）的矛盾
+  2. 保守默认对称化（:836-838）：保留「过度列表化是回归」+ 加「明明并列多项却不列表化同样是回归」，两个方向都警告
+  3. **DECISION RULE（:835，本次修复核心）**：标记出现一次（单个 `比如`）= 举例，保持段落；同一标记并列出现 ≥2 项 = 枚举，必须列表
+  4. F3b（:849-850）：列表项可为完整长句/从句，不必是短名词短语；叙述性举例并列（多个 `比如说` 各引一例）正是 bullet list 的适用场景
+  5. F3c 补无序长句正向 few-shot：`比如说有些学生头发过长，比如说还有些学生奇装异服，还有些学生说脏话` → `- 有些学生头发过长\n- 还有些学生奇装异服\n- 还有些学生说脏话`（贴近 Gavin 真实语流形态）
+  6. F3c 补负向单例：`今天雨下得很大，比如早上那阵就特别急` → NO list（守住保守默认）
+- **验证**：`cargo check` + `cargo check --tests` 双 0 errors；`cargo test --bin feiyin-ime llm::` **111 passed / 0 failed** 零红条；UTF-8 Python 验证无 mojibake
+- **⚠️ cargo fmt 连带 2 处**：`cargo fmt -- src/llm/mod.rs` 后既有测试块 :1661/:1683 两条长 `assert!` 断言行被 rustfmt 重排为多行（零逻辑变化，按 [FMT-COLLATERAL-001] 惯例保留不回滚）
+- **边界**：`src/scene/mod.rs`/`scene-rules.toml`/`src/itn.rs`/`itn-rules.toml`/`src/main.rs`/`src-tauri/**`/`ui/**` 零触碰；F3a/单行分支/F3d 零改动；未构建/出包/启动 exe；未改版本号（0.7.3）；未用 git 破坏命令；UTF-8 用 edit 工具
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-2/result.md`（非空）
+
 ## 2026-08-01 — tester-1 — TEST-SYNC追补+TEST-EXEC+BUILD-RELEASE-20260801-005 ✅ 三段收口出包
 
 - **来源**：3 提交（3d1f4bb 单行分隔符按语言本地化 / 453eea7 飞书云文档+云文档泛化+47 条审计 / 1501d90 便签/待办/To Do+Google 文档+Office Online+已发送+wpsnote）。基线 `1501d90`（ahead 20 未 push）

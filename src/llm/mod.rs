@@ -831,9 +831,11 @@ fn build_format_instruction_block(multiline_safe: bool) -> &'static str {
         (e.g., \"周三开会……不对，周四\" → \"周四开会\"), keep the final corrected version \
         and drop the retracted fragment. Clean up immediate stutters \
         (repeated adjacent words like \"我我我\" → \"我\").\
-        \nF3. Smart Lists: ONLY use a list when the speech EXPLICITLY contains enumeration markers. \
+        \nF3. Smart Lists: ONLY use a list when the speech EXPLICITLY contains enumeration OR exemplification markers (e.g., 第一/第二, 一是/二是, 首先/其次, or 有的…有的…, 比如, 包括, 诸如, 还有, 另外, 以及, for example, including, also, additionally, etc.). \
+        DECISION RULE: a marker appearing ONCE (e.g., a single \"比如\") signals a mere example — keep it as a continuous paragraph; the SAME marker appearing in 2 OR MORE parallel items (e.g., several \"比如\" clauses listing distinct items) signals an enumeration — you MUST use a list. \
         If unsure, DO NOT use a list — keep the text as a continuous paragraph. \
-        Over-formatting normal speech into lists is a regression.\
+        Over-formatting normal speech into lists is a regression. \
+        However, failing to list a genuine parallel enumeration (2+ distinct items) is ALSO a regression — both directions are equally wrong.\
         \nF3a. Ordered list (when the speech has explicit SEQUENCE or order): \
         If the speech contains markers such as 第一/第二/第三, 一是/二是/三是, \
         首先/其次/最后, 然后/接着/再次, 第X点, one/two/three, firstly/secondly, step 1/2, etc., \
@@ -843,8 +845,10 @@ fn build_format_instruction_block(multiline_safe: bool) -> &'static str {
         If the speech contains markers such as 有的…有的…, 比如, 包括, 诸如, 还有, 另外, 以及, \
         for example, including, also, additionally, etc., and the listed items are parallel but NOT sequential, \
         you MUST split the content into bullet list lines using the exact prefix \"- \" inside \
-        <corrected> tags. DO NOT use \"* \", \"• \", or \"#\".\
-        \nF3c. Examples: \"第一点xxx，第二点yyy\" → \"1. xxx\\n2. yyy\"; \"首先xxx，然后yyy，最后zzz\" → \"1. xxx\\n2. yyy\\n3. zzz\"; \"有的xxx，有的yyy\" → \"- xxx\\n- yyy\"; \"今天天气不错我们去公园吧\" → keep as a continuous paragraph, NO list.\
+        <corrected> tags. DO NOT use \"* \", \"• \", or \"#\". \
+        List items may be FULL SENTENCES or longer clauses — they do NOT need to be short noun phrases. \
+        Narrative exemplification (e.g., several \"比如说\" clauses each introducing a distinct example of a stated problem) is exactly the case for a bullet list.\
+        \nF3c. Examples: \"第一点xxx，第二点yyy\" → \"1. xxx\\n2. yyy\"; \"首先xxx，然后yyy，最后zzz\" → \"1. xxx\\n2. yyy\\n3. zzz\"; \"有的xxx，有的yyy\" → \"- xxx\\n- yyy\"; \"比如说有些学生头发过长，比如说还有些学生奇装异服，还有些学生说脏话\" → \"- 有些学生头发过长\\n- 还有些学生奇装异服\\n- 还有些学生说脏话\"; \"今天雨下得很大，比如早上那阵就特别急\" → keep as a continuous paragraph, NO list (a single 比如 is a mere example); \"今天天气不错我们去公园吧\" → keep as a continuous paragraph, NO list.\
         \nF3d. Constraints: DO NOT compress or summarize content. DO NOT delete any semantic content. \
         DO NOT add information the user did not say. Preserve every factual point the speaker made; \
         only restructure surface form.\
@@ -1657,7 +1661,9 @@ mod tests {
         );
         // English 长句示例（分号）
         assert!(
-            inline.contains("\"I have a meeting in the morning; I need to write the report in the afternoon\""),
+            inline.contains(
+                "\"I have a meeting in the morning; I need to write the report in the afternoon\""
+            ),
             "English 长句示例须用半角分号"
         );
         // 日语示例（tōten 逗号，锚定要求侧）
@@ -1677,7 +1683,10 @@ mod tests {
         );
         // 中文示例仍在（既有断言 0d 依赖，防回归）
         assert!(inline.contains("苹果、香蕉、橘子"), "中文短项示例须保留");
-        assert!(inline.contains("早上要开会；下午要写报告；晚上还要改方案"), "中文长句示例须保留");
+        assert!(
+            inline.contains("早上要开会；下午要写报告；晚上还要改方案"),
+            "中文长句示例须保留"
+        );
         // 负向护栏：旧措辞「Chinese enumeration separators」已删除（判别力对照）
         assert!(
             !inline.contains("Chinese enumeration separators"),
