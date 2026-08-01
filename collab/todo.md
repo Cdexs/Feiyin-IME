@@ -1,7 +1,7 @@
 # 任务列表 · voice-ime
 
-> ✅ **产物已是最新**（2026-08-01 13:47，BUILD-RELEASE-20260801-002）：`feiyin-ime.exe` `56aff156` / `crash-reporter.exe` `1b02838b` 重建，`feiyin-ime-ui.exe` `16acff20` 沿用 07-30。两副本 sha256 逐一一致，`itn-rules.toml` 三副本 `93ab3972` / `scene-rules.toml` 三副本 `7b01b33c` 一致。**含完整 ITN 二代 P1-P5 + ENGINE-006 + LEXICON-006-C + FIX-TIMEPREFIX-001**。冒烟实例 **PID 23604** 运行中，待 Gavin 端测。
-> ⏳ **本地 ahead 8 未 push**（Gavin 只授权提交）：`98c2e9e` / `8c7f9d2` / `5360850` / `5799c02` / `05de1bc` / `b462f83` / `f6700ea` / `6fdba85`。
+> 🔴 **产物已过期**（2026-08-02 00:4x 主控核实）：`Publish/feiyin-ime.exe` 时间戳 **08-01 23:48**（BUILD-RELEASE-20260801-008，基线 `bba7f08`），而 `src/llm/mod.rs` 已到 **08-02**。`3b4b622`（014 短项内联）+ `a03b89c`（015 F3b 对称收口）**均未进 exe**，Gavin 端测不到买菜格式修复。ITN-016 完成后需出包。
+> ⏳ **本地 ahead 34 未 push**（Gavin 只授权提交，不授权 push）。
 > 端测方式（2026-07-25 Gavin 指示）：Gavin 已在**实际日常使用中自行测试**，端测项不再列入本文档；发现 bug 或优化点由 Gavin 邀请重新开单。
 
 ## 文档更新规则
@@ -11,6 +11,30 @@
 3. **测试同步/构建/出包任务归入 CHANGELOG**，不在此文档详列
 4. **新任务产生时立即写入**，不批量补
 5. **不列端测跟踪项**（Gavin 自行使用中测试，有问题会重新开单）
+
+---
+
+## 🔄 进行中 · 2026-08-02 格式与 ITN 双线批次
+
+| 编号 | 内容 | 负责人 | 状态 |
+| --- | --- | --- | --- |
+| FORMAT-F3-SHORTITEM-014 | 多行分支补「短项内联 / 长句列表」分流 + 四语措辞补充 | coder-2 | ✅ 已提交 `3b4b622` |
+| FORMAT-F3-SHORTITEM-015 | F3b 与输出契约对称补 LONG 限定，收口 014 的 recency 冲突 | coder-2 | ✅ 已提交 `a03b89c` |
+| ITN-FIX-GRADECLASS-016 | 年级班级简写（一三班/初二三班/高一四班）被逐位串误合并 | coder-1 | 🔄 进行中 |
+| TEST-SYNC-016 | 015 断言更新（`:1856` may be FULL SENTENCES 过时）+ 016 年级班级用例 + 反向护栏 | tester-1 | ⏸ 待 016 完成 |
+| TEST-EXEC + BUILD | 全量回归 → 出包（含 014/015/016 三项，Gavin 一次端测完） | tester-1 | ⏸ 待 TEST-SYNC |
+
+### 015 的由来（主控验收查出，非 Worker 自报）
+
+014 引入 `F3-item form`（SHORT 内联 / LONG 列表）后**只给 F3a 补了 LONG 限定**，F3b 与末段 Output format 仍无条件要求 bullet/多行，且位置更靠后 —— 即 `src/llm/mod.rs:813-817` 注释自陈的「后段软化前段」失败模式。Gavin 买菜用例（无序 + 短名词短语）恰好命中，若不修则端测照旧被拆 4 行。
+
+### 016 根因（主控 Read 取证，coder-1 已纠正主控机制方案）
+
+- `src/itn.rs:582` 逐位串判据 `serial_len >= 2 && !next_is_unit`：「一三」后跟「班」（非进位单位）→ 合并为 `13`
+- `:1831` `consumed >= 2` 直接判转；「班」不在 `[protect.classifiers]`；全或无因「班」非单位在此终止链，拦不住
+- **修法走规则层不走词表**（DEC-038）：2 位逐位串后紧跟班级后缀 → `parse_cn_number` **直接 return None**
+- ⚠️ **主控原方案「跳过 early return 落进位组合路径」已作废** —— coder-1 指出会因 `digit` 被覆盖产出 (3,2) → 「3班」撕裂
+- 🔍 **DEC-038 活样本**：`五一` 在 `[protect.proper_nouns]:159` 而「一三」不在 → 同构表达一对一错，正是不该用加词表方式修的证据
 
 ---
 

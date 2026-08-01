@@ -155,6 +155,12 @@ struct Protect {
     /// ITN-COLLISION-TYPEA-002: 单位前缀碰撞保护词（机器派生，jieba+THUOCL）
     #[serde(default)]
     unit_collisions: ProtectList,
+    /// ITN-FIX-GRADECLASS-016: 紧跟 2 位逐位串时抑制合并的后缀（年级班级简写等语法族）。
+    /// 当 serial_len == 2 且紧随其后的字符命中本表时，不做逐位串合并（如「一三班」→
+    /// 「13班」是错的，应为「一三班」= 一年级三班）。DEC-038：保护词表不得承载
+    /// 规则性语法族，本表只承载「抑制后缀」这一规则参数，不逐条枚举 N 年级 M 班。
+    #[serde(default)]
+    serial_suffixes: ProtectList,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -226,6 +232,9 @@ struct CompiledRules {
     /// 可小数化单位集合（currency+length+weight+volume+temperature+pressure+
     /// electrical+frequency+acoustic+data+time，排除 other/geo_prefix）
     decimalizable_units: HashSet<String>,
+    /// ITN-FIX-GRADECLASS-016: 紧跟 2 位逐位串时抑制合并的后缀集合
+    /// （年级班级简写等语法族，如「班」）
+    serial_suffix_set: HashSet<String>,
 }
 
 impl CompiledRules {
@@ -335,6 +344,7 @@ impl CompiledRules {
                 }
                 set
             },
+            serial_suffix_set: r.protect.serial_suffixes.words.iter().cloned().collect(),
         }
     }
 
@@ -565,7 +575,7 @@ fn parse_cn_number(
         return None;
     }
 
-    // 先检测逐位串模式：连续≥3个纯数字字符（零/〇/一/二/三/四/五/六/七/八/九/幺/两）
+    // 先检测逐位串模式：连续≥2个纯数字字符（零/〇/一/二/三/四/五/六/七/八/九/幺/两）
     // 且后面不跟进位单位（十百千万亿）
     let mut serial_len = 0usize;
     for k in start..chars.len() {
@@ -578,6 +588,33 @@ fn parse_cn_number(
     // 检查逐位串后面是否跟进位单位
     let serial_end = start + serial_len;
     let next_is_unit = serial_end < chars.len() && is_cn_unit_char(chars[serial_end]);
+
+    // ITN-FIX-GRADECLASS-016: 年级班级简写守卫 —— 当 serial_len == 2 且紧随其后的
+    // 字符命中 serial_suffixes（如「班」）时，不做逐位串合并，直接返回 None。
+    //
+    // 为什么 return None 而非「跳过 :582 的 early return 落进位组合路径」：
+    // 进位组合路径对「一三」这类连续纯数字会按「末位 digit 覆盖」解析（digit 被
+    // 反复覆盖只留最后一个），产出 ("3", 2) → 「一三班」→「3班」撕裂。return None
+    // 后主循环 :1600 的 `if let Some(...)` 短路，字符逐个走「普通字符」单字路径，
+    // 「班」既非单位也非量词 → 保持汉字，输出「一三班」。
+    //
+    // 为什么限定 serial_len == 2：
+    //   - 「一三/五一/二三/一四」全部是 2 位，语义是两个不同层级的数字（年级+班号）
+    //     被误当成一个两位数
+    //   - 进位组合路径不受影响 → 「十三班」（十非逐位串首字符）仍转
+    //   - ≥3 位逐位串（三零二房间/二零二六/幺三八零零）完全不进入本守卫
+    if serial_len == 2 && serial_end < chars.len() {
+        if let Some(r) = rules {
+            let after_serial: String = chars[serial_end..].iter().collect();
+            if r
+                .serial_suffix_set
+                .iter()
+                .any(|s| after_serial.starts_with(s.as_str()))
+            {
+                return None;
+            }
+        }
+    }
 
     if serial_len >= 2 && !next_is_unit {
         let digits: Vec<char> = (start..serial_end)

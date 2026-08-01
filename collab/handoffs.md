@@ -1,5 +1,18 @@
 # handoffs · voice-ime
 
+## 2026-08-02 — coder-1 — ITN-FIX-GRADECLASS-016 ✅ 年级班级简写被逐位串误合并
+
+- **来源**：Gavin 2026-08-02 端测 `我是一三班的学生`（=一年级三班）被转 `13班`；同类 五一班/初二三班/高一四班。基线 `a03b89c`（ahead 34）
+- **根因**：`parse_cn_number` 逐位串 `serial_len>=2 && !next_is_unit` 把「一三」当两位数 + `decide_conversion` `consumed>=2` 无条件转；「班」不在 classifiers。`五一` 在 proper_nouns:`一三` 不在 = DEC-038 随机覆盖病症
+- **方案协商（重要）**：主控原方案「跳 :582 early return 落进位组合路径」经分析会产出 `("3",2)`（进位路径末位 digit 覆盖）→`3班`撕裂。协商采纳正确落点——**守卫命中时 `parse_cn_number` 直接 `return None`**（主循环 :1600 `if let Some` 短路，字符走单字路径，班非单位/量词→全汉字）。主控 ACK 采纳原方案作废
+- **改动**：`itn-rules.toml` +7 新增 `[protect.serial_suffixes]`(words=["班"])；`src/itn.rs` +38/−1（Protect/CompiledRules 加字段 + from_rules 填充 + parse_cn_number 守卫 `serial_len==2 && 后继命中 serial_suffixes`→None + 订正过时注释 ≥3→≥2 不改实现）
+- **主控复核点已实读确认**：① 链扫描 :830/:1290/:1348 三处 None 均 `break` 推进无死循环，且守卫 None 短路使 :1622 永不到达（chain_end==i 空转不可能）② 甲乙丙型 :988/:1120/:1228 `?` 传播期望行为，既有断言零误伤
+- **验证**：目标 4 条全汉字（一三班/五一班/初二三班/高一四班）；反向护栏 10 条全过（九八年→98年、三零二房间→302、二零二六→2026、幺三八零零→13800、三年二班保持、**十三班→13班 现行为实测未改**、一班/三班保持、五一/五一广场保护）；`cargo test --bin feiyin-ime itn::` **128 passed / 0 failed**；双 cargo check 0 errors；UTF-8 U+FFFD=0
+- **🔴 全量唯一红条（非本任务引入）**：`llm::tests::build_format_instruction_block_f3_exemplification_enumeration`（src/llm/mod.rs:1856 断言旧措辞 `may be FULL SENTENCES`，现文案 :875 为 `List items here are FULL SENTENCES or longer clauses`）——coder-2 015 改动措辞未同步断言。`git status --short src/llm/mod.rs` 空输出证明工作区零改动，红条在 HEAD 即存在，**归 tester-1 TEST-SYNC 换锚点**
+- **边界**：仅 `src/itn.rs` + `itn-rules.toml`（45 insertions/1 deletion）；`src/llm/mod.rs`/`scene*`/`main.rs`/`src-tauri/**`/`ui/**` 零触碰；未构建/出包/启动 exe；未改版本号（0.7.3）；未用 git 破坏命令；UTF-8 用 edit 工具
+- **下游需知**：本次改 `itn-rules.toml`，tester-1 出包时需三副本同步（`[TOML-STALE-001]` 纪律）；端测观察点 `一三班` 类保持汉字、`十三班` 仍 `13班`
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-1/result.md`（非空）+ `logs/20260802.md`
+
 ## 2026-08-02 — coder-2 — FORMAT-F3-SHORTITEM-015 ✅ F3b 与输出契约对称补 LONG 限定（收口 014 的 recency 冲突）
 
 - **来源**：主控独立 Read 取证——014 的 F3-item form（SHORT→内联）位于 F3a/F3b 之前，下游两处仍无条件要求 bullet/多行且 recency 更高（`src/llm/mod.rs` 注释 :813-817「后段软化前段」失败模式），Gavin 买菜用例（无序+短名词短语）恰好命中。基线 `3b4b622`（ahead 32）
