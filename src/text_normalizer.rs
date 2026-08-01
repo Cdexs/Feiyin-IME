@@ -657,7 +657,8 @@ mod tests {
     #[test]
     fn translate_path_never_contains_do_not_translate() {
         for script in [ChineseScript::Simplified, ChineseScript::Traditional] {
-            let s = script_instruction_for_translate("你好世界", script).expect("translate path should give instruction");
+            let s = script_instruction_for_translate("你好世界", script)
+                .expect("translate path should give instruction");
             assert!(
                 !s.contains("Do NOT translate"),
                 "translate path must never contain Do NOT translate (LANG-MIXED-001)"

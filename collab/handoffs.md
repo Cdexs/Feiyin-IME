@@ -1,5 +1,18 @@
 # handoffs · voice-ime
 
+## 2026-08-02 — coder-2 — FORMAT-F3-SHORTITEM-014 ✅ 多行分支补「短项内联 / 长句列表」分流 + 四语措辞补充
+
+- **来源**：Gavin 2026-08-02 端测——`今天出去买菜了，买了3斤土豆，一个西瓜，20斤大米，还有3斤香蕉`（msedge/Memos/multiline_safe=true）被拆成四行 `- ` 列表，但这是短名词短语清单，应顿号内联。主控定位：短项 `、`/长句 `；` 规则只存在于 `multiline_safe=false` 分支，`true` 分支没有「短 vs 长」区分。基线 `bba7f08`（ahead 32）
+- **范围**：仅 `src/llm/mod.rs` 的 `build_output_format`（真/假两分支 + 新增共享常量）。`src/text_normalizer.rs` 零触碰（coder-1 并行）
+- **改动 A · 短项内联/长项列表分流（重点）**：DECISION RULE 之后新增 **F3-item form**——数量 ≥2 确认枚举后按项目形态分流：SHORT（无谓语、无内部标点、≤6 字/词）→ **内联分隔符，不做列表**（含 Gavin 用例 `买了3斤土豆、一个西瓜、20斤大米、还有3斤香蕉`）；LONG（含谓语或内部标点）→ **列表**（`1. `/`- `）。边界：混合长短按多数项决定、不确定用列表；有序短项保留序号词（`第一个土豆，第二个西瓜` 内联）
+- **改动 B · 四语措辞补充**：中文 `再者/最后一点/另外一点/第X条`；English `in addition/plus/and then/namely`；日本語（有序最薄仅 3 组，补 `①②③/最初に/続いて/それに/加えて/ほかにも`）；한국어 `또/이어서/끝으로/아울러`。**单行分支标记词同步补齐**至与多行分支覆盖一致（Python 核对 18 词 count=2 全 OK）
+- **分隔符表抽共享常量 `INLINE_SEPARATOR_RULES`**：两分支 `format!(..., INLINE_SEPARATOR_RULES)` 共用，保证分隔符规则**字面一致**（避免两套说法漂移）。为此 `build_output_format` 返回类型 `&'static str` → `String`（真分支需运行时拼接常量）
+- **精简意识**：真分支 6371 / 假分支 3345 字符（HEAD 版 4297/2649，增长主要为分流规则 + 四语补充词，均紧凑列举未造句）
+- **验证**：`cargo check` + `cargo check --tests` 双 0 errors；`cargo test --bin feiyin-ime llm::` **114 passed / 0 failed** **零红条**（tester-1 已把断言锚到 build_output_format，我的改动保留全部关键措辞：`1. `/`- ` 符号、保守默认双向、DECISION RULE、四语标记、负向示例；新增分流不破坏任何断言）；UTF-8 Python 验证无 mojibake（U+FFFD=0）；18 个补充词两分支覆盖一致
+- **⚠️ cargo fmt 连带 3 处**：既有测试块 :1659/:1872/:1934 三条 `assert!` 长行被 rustfmt 重排（零逻辑变化，[FMT-COLLATERAL-001] 保留）
+- **边界**：`src/text_normalizer.rs`/`src/scene/mod.rs`/`scene-rules.toml`/`src/itn.rs`/`itn-rules.toml`/`src/main.rs`/`src-tauri/**`/`ui/**` 零触碰；未构建/出包/启动 exe；未改版本号（0.7.3）；未用 git 破坏命令；UTF-8 用 edit 工具
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-2/result.md`（非空）
+
 ## 2026-08-01 — tester-1 — TEST-SYNC + TEST-EXEC + BUILD-RELEASE-20260801-008 ✅ 三轮收口（本轮 18 红最多）
 
 - **来源**：2 提交 b60517a（F3 与输出契约合并到最末 + 四语标记穷举）+ 978afa7（系统提示词全英文）。基线 `978afa7`（ahead 31 未 push）

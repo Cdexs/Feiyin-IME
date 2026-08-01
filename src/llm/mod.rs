@@ -787,7 +787,26 @@ fn ends_with_separator_or_terminal(s: &str) -> bool {
         || s.ends_with('?')
 }
 
-/// FMT-LLM-003 + FMT-LLM-002 + FORMAT-F3-UNIFY-I18N-012: 合并后的「F3 列表规则 + 输出契约」。
+/// FORMAT-F3-SHORTITEM-014: 内联枚举分隔符五语表（共享常量）。
+/// 多行分支（短项内联）与单行分支共用——保证两处分隔符规则字面一致，避免两套说法漂移。
+const INLINE_SEPARATOR_RULES: &str = "\
+        \nInline enumeration separators CONVENTIONAL IN THE LANGUAGE OF THE TEXT:\
+        \n- Chinese / Cantonese: use \"、\" for short noun/phrase items (typically ≤6 characters \
+        with no internal punctuation, e.g., \"苹果、香蕉、橘子\"), and use \"；\" for longer clauses \
+        that contain predicates or internal punctuation (e.g., \"早上要开会；下午要写报告；晚上还要改方案\").\
+        \n- English: use \", \" (half-width comma + space) for short items (e.g., \"apples, \
+        bananas, oranges\"), and use \"; \" (half-width semicolon + space) for longer clauses \
+        (e.g., \"I have a meeting in the morning; I need to write the report in the afternoon\").\
+        \n- Japanese: use \"、\" (tōten) for BOTH short items AND longer clauses — Japanese rarely \
+        uses the semicolon; chain clauses with the tōten instead (e.g., \"朝は会議があり、午後は報告書を書きます\").\
+        \n- Korean: use \", \" (half-width comma + space) for BOTH short items AND longer clauses \
+        — Korean likewise rarely uses the semicolon (e.g., \"아침에는 회의가 있고, 오후에는 보고서를 작성합니다\").\
+        \nCROSS-LANGUAGE BAN: NEVER use full-width \"、\" or \"；\" in English text; NEVER use \
+        half-width \",\" or \";\" in Chinese text. For mixed-language text, use the separators of \
+        the PRIMARY language of the sentence (consistent with the \"primary language\" concept used \
+        elsewhere in this prompt).";
+
+/// FMT-LLM-003 + FMT-LLM-002 + FORMAT-F3-UNIFY-I18N-012 + FORMAT-F3-SHORTITEM-014: 合并后的「F3 列表规则 + 输出契约」。
 /// 本函数是 prompt 中**唯一**谈格式/列表/输出标签的地方（F3 与 build_output_format 已合并）。
 ///
 /// 历史（为何合并）：
@@ -801,19 +820,24 @@ fn ends_with_separator_or_terminal(s: &str) -> bool {
 /// 用词、措辞都说到，并明确要求考虑中文、英文、日文、韩文的输入场景」。指令散文为英文，标记词
 /// 与 few-shot 用目标语言原文（数据非指令）。
 ///
-/// - `multiline_safe=true`：<corrected> 块可多行（F3 适用时必须列表）。
+/// - `multiline_safe=true`：<corrected> 块可多行（F3 适用时必须列表/短项内联）。
 /// - `multiline_safe=false`：单行契约 + 内联分隔符规则（i18n 五语表）。
-fn build_output_format(multiline_safe: bool) -> &'static str {
+///
+/// 返回 `String`（非 `&'static str`）：真分支需在运行时拼接共享的 `INLINE_SEPARATOR_RULES`
+/// 常量，保证两分支的分隔符规则字面一致（FORMAT-F3-SHORTITEM-014）。
+fn build_output_format(multiline_safe: bool) -> String {
     if multiline_safe {
-        "F3 & Output Contract (FORMAT-F3-UNIFY-I18N-012: this block is the SINGLE authority on \
-        lists, line structure, and output tags; it applies to all supported input languages: \
-        Chinese, English, Japanese, Korean — select the marker set and list form according to the \
-        PRIMARY language of the input text):\
+        format!("F3 & Output Contract (FORMAT-F3-UNIFY-I18N-012 + FORMAT-F3-SHORTITEM-014: this block is \
+        the SINGLE authority on lists, line structure, and output tags; it applies to all \
+        supported input languages: Chinese, English, Japanese, Korean — select the marker set and \
+        list form according to the PRIMARY language of the input text):\
         \nF3. Smart Lists: ONLY use a list when the speech EXPLICITLY contains enumeration OR \
         exemplification markers (ordered: 第一/第二/第三, 第一点/第二点, 一是/二是/三是, 首先/其次/再次/最后, \
-        然后/接着, 一来/二来, 其一/其二, first/second/third, firstly/secondly/lastly, step 1/2/3, \
-        point one/two, to begin with, next, finally, 第一に/第二に/第三に, まず/次に/それから/最後に, \
-        一つ目/二つ目/三つ目, 첫째/둘째/셋째, 먼저/다음으로/마지막으로, 첫 번째/두 번째, 우선, 그다음; \
+        然后/接着, 一来/二来, 其一/其二, 再者, 最后一点, 另外一点, 第X条, first/second/third, \
+        firstly/secondly/lastly, step 1/2/3, point one/two, to begin with, next, finally, \
+        in addition, plus, and then, namely, 第一に/第二に/第三に, まず/次に/それから/最後に, \
+        一つ目/二つ目/三つ目, ①②③, 最初に, 続いて, それに, 加えて, ほかにも, \
+        첫째/둘째/셋째, 먼저/다음으로/마지막으로, 첫 번째/두 번째, 우선, 그다음, 또, 이어서, 끝으로, 아울러; \
         unordered: 比如/比如说/例如/譬如/像, 有的…有的…, 有些…有些…, 有一些…还有一些…, 一些…一些…, \
         还有/另外/此外/以及/包括/诸如/等等, 一方面…另一方面, 一类是…一类是, for example/for instance/such as/like/\
         including/includes/also/another/additionally/moreover/besides/as well as/e.g./etc./some… some…/\
@@ -830,7 +854,19 @@ fn build_output_format(multiline_safe: bool) -> &'static str {
         Over-formatting normal speech into lists is a regression. \
         However, failing to list a genuine parallel enumeration (2+ distinct items) is ALSO a \
         regression — both directions are equally wrong.\
-        \nF3a. Ordered list (when the speech has explicit SEQUENCE or order): \
+        \nF3-item form: after the DECISION RULE confirms an enumeration (2+ items), split by item \
+        form:\
+        - SHORT items (noun/phrases: no predicate, no internal punctuation, ≤6 characters/words) \
+        → join INLINE with the enumeration separator of the language (see separator table below), \
+        do NOT make a list. E.g. Chinese \"买了3斤土豆，一个西瓜，20斤大米，还有3斤香蕉\" → \
+        \"买了3斤土豆、一个西瓜、20斤大米、还有3斤香蕉\".\
+        - LONG items (full clauses with a predicate or internal punctuation) → make a list \
+        (ordered \"1. \" or bullet \"- \"). E.g. \"- 有些学生头发过长\".\
+        Mixed short/long: follow the MAJORITY form; if still uncertain, use a list (lists are \
+        safer for long items). Ordered enumeration with short items: join INLINE but KEEP the \
+        sequence markers (e.g., \"第一个土豆，第二个西瓜\" stays inline with 第一个/第二个).\
+        {}\
+        \nF3a. Ordered list (when the speech has explicit SEQUENCE or order and items are LONG): \
         you MUST split the content into numbered list lines using the exact prefix \"1. \", \"2. \", \"3. \" \
         inside <corrected> tags. DO NOT use \"1)\" or Markdown \"#\" headings.\
         \nF3b. Bullet list (when the speech lists items WITHOUT a clear order): \
@@ -852,46 +888,45 @@ fn build_output_format(multiline_safe: bool) -> &'static str {
         \nOutput format: the <corrected> block MUST span multiple lines when F3 applies; when F3 \
         does NOT apply, output a single continuous paragraph. Put the opening <corrected> and \
         closing </corrected> around the whole text. After the closing tag, optionally ONE final \
-        line {\"suggestions\":[\"correct_word\"]}.\n\
+        line {{\"suggestions\":[\"correct_word\"]}}.\n\
         Output NOTHING else. No explanations, no commentary, no \"corrected to\", no \"based on\", \
         no \"the corrected text is\". If you add any text outside the <corrected> tags, it will be \
-        discarded."
+        discarded.",
+        INLINE_SEPARATOR_RULES,
+    )
     } else {
-        "F3 & Output Contract (FORMAT-F3-UNIFY-I18N-012: this block is the SINGLE authority on \
-        lists, line structure, and output tags; it applies to all supported input languages: \
-        Chinese, English, Japanese, Korean — select the marker set and list form according to the \
-        PRIMARY language of the input text):\
+        format!("F3 & Output Contract (FORMAT-F3-UNIFY-I18N-012 + FORMAT-F3-SHORTITEM-014: this block is \
+        the SINGLE authority on lists, line structure, and output tags; it applies to all \
+        supported input languages: Chinese, English, Japanese, Korean — select the marker set and \
+        list form according to the PRIMARY language of the input text):\
         \nF3. Single-line Output: Output as a single continuous line. DO NOT use lists, line \
         breaks, or multi-line formatting. DO NOT output \"- \", \"• \", \"1. \", or \"2. \" on \
         separate lines, because those will be flattened into unreadable inline text. \
-        If the speech contains explicit ordered enumeration (ordered markers: 第一点/第二点, \
-        first/second, 第一に/第二に, 첫째/둘째, etc.), keep the sequence markers inline and join \
-        items with appropriate separators. \
+        If the speech contains explicit ordered enumeration (ordered markers: 第一/第二/第三, \
+        第一点/第二点, 一是/二是/三是, 首先/其次/再次/最后, 然后/接着, 一来/二来, 其一/其二, 再者, 最后一点, \
+        另外一点, 第X条, first/second/third, firstly/secondly/lastly, step 1/2/3, point one/two, \
+        to begin with, next, finally, in addition, plus, and then, namely, 第一に/第二に/第三に, \
+        まず/次に/それから/最後に, 一つ目/二つ目/三つ目, ①②③, 最初に, 続いて, それに, 加えて, ほかにも, \
+        첫째/둘째/셋째, 먼저/다음으로/마지막으로, 첫 번째/두 번째, 우선, 그다음, 또, 이어서, 끝으로, 아울러, etc.), \
+        keep the sequence markers inline and join items with appropriate separators. \
         If the speech lists parallel items WITHOUT a clear order (unordered markers: 有的…有的…, \
-        比如/包括, for example/including, たとえば/など, 예를 들어/그리고, etc.), join them inline \
-        using the enumeration separators CONVENTIONAL IN THE LANGUAGE OF THE TEXT, per this table:\
-        \n- Chinese / Cantonese: use \"、\" for short noun/phrase items (typically ≤6 characters \
-        with no internal punctuation, e.g., \"苹果、香蕉、橘子\"), and use \"；\" for longer clauses \
-        that contain predicates or internal punctuation (e.g., \"早上要开会；下午要写报告；晚上还要改方案\").\
-        \n- English: use \", \" (half-width comma + space) for short items (e.g., \"apples, \
-        bananas, oranges\"), and use \"; \" (half-width semicolon + space) for longer clauses \
-        (e.g., \"I have a meeting in the morning; I need to write the report in the afternoon\").\
-        \n- Japanese: use \"、\" (tōten) for BOTH short items AND longer clauses — Japanese rarely \
-        uses the semicolon; chain clauses with the tōten instead (e.g., \"朝は会議があり、午後は報告書を書きます\").\
-        \n- Korean: use \", \" (half-width comma + space) for BOTH short items AND longer clauses \
-        — Korean likewise rarely uses the semicolon (e.g., \"아침에는 회의가 있고, 오후에는 보고서를 작성합니다\").\
-        \nCROSS-LANGUAGE BAN: NEVER use full-width \"、\" or \"；\" in English text; NEVER use \
-        half-width \",\" or \";\" in Chinese text. For mixed-language text, use the separators of \
-        the PRIMARY language of the sentence (consistent with the \"primary language\" concept used \
-        elsewhere in this prompt).\
+        有些…有些…, 有一些…还有一些…, 一些…一些…, 比如/比如说/例如/譬如/像, 还有/另外/此外/以及/包括/诸如/等等, \
+        一方面…另一方面, 一类是…一类是, for example/for instance/such as/like/including/includes/also/\
+        another/additionally/moreover/besides/as well as/e.g./etc./some… some…/one… another…, \
+        たとえば/例えば, など/とか, また/さらに/そのほか, 〜や〜, ある人は…ある人は…, 一つは…もう一つは…, \
+        예를 들어/예컨대, 등, 그리고/또한/게다가, ~같은, 뿐만 아니라, 어떤 사람은…어떤 사람은…, etc.), join \
+        them inline using the enumeration separators CONVENTIONAL IN THE LANGUAGE OF THE TEXT:\
+        {}\
         DO NOT compress or summarize content. DO NOT delete any semantic content. Preserve every \
         factual point the speaker made.\
         \nOutput format: the <corrected> content MUST be a single line with no line breaks. Put the \
         opening <corrected> and closing </corrected> around the whole text. After the closing tag, \
-        optionally ONE final line {\"suggestions\":[\"correct_word\"]}.\n\
+        optionally ONE final line {{\"suggestions\":[\"correct_word\"]}}.\n\
         Output NOTHING else. No explanations, no commentary, no \"corrected to\", no \"based on\", \
         no \"the corrected text is\". If you add any text outside the <corrected> tags, it will be \
-        discarded."
+        discarded.",
+        INLINE_SEPARATOR_RULES,
+    )
     }
 }
 
@@ -1624,8 +1659,14 @@ mod tests {
         // TEST-SYNC-SCENE-MD-003 A2：全部锚定「要求」侧字符串，杜绝裸 contains("- ") 方向盲。
         // FORMAT-F3-UNIFY-I18N-012：措辞改「numbered/bullet list lines using the exact prefix」。
         let fmt = build_output_format(true);
-        assert!(fmt.contains("numbered list lines"), "true 分支必须提及 numbered list lines");
-        assert!(fmt.contains("bullet list lines"), "true 分支必须提及 bullet list lines");
+        assert!(
+            fmt.contains("numbered list lines"),
+            "true 分支必须提及 numbered list lines"
+        );
+        assert!(
+            fmt.contains("bullet list lines"),
+            "true 分支必须提及 bullet list lines"
+        );
         assert!(
             fmt.contains("exact prefix \"1. \", \"2. \", \"3. \""),
             "必须引用编号前缀示例（锚定要求侧整串）"
@@ -1831,7 +1872,10 @@ mod tests {
         let fmt = build_output_format(true);
         // 中文标记（Gavin 端测实际用词，本批新补）
         assert!(fmt.contains("有些…有些…"), "中文须含 有些…有些…");
-        assert!(fmt.contains("有一些…还有一些…"), "中文须含 有一些…还有一些…");
+        assert!(
+            fmt.contains("有一些…还有一些…"),
+            "中文须含 有一些…还有一些…"
+        );
         // English
         assert!(fmt.contains("for instance"), "English 须含 for instance");
         // 日本語
@@ -1890,7 +1934,9 @@ mod tests {
         // 格式契约是最后一段：其后不得再有其他段落内容
         let tail = &content[contract_pos..];
         assert!(
-            !tail.contains("\n\nCRITICAL:") && !tail.contains("\n\nWordbook") && !tail.contains("\n\nCode-Switching"),
+            !tail.contains("\n\nCRITICAL:")
+                && !tail.contains("\n\nWordbook")
+                && !tail.contains("\n\nCode-Switching"),
             "格式契约后不得再有其他段落（应为 prompt 末段）"
         );
     }
