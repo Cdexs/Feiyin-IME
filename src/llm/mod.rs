@@ -871,9 +871,13 @@ fn build_format_instruction_block(multiline_safe: bool) -> &'static str {
         If the speech contains explicit ordered enumeration (第一点/第二点, first/second, etc.), \
         keep the sequence markers inline and join items with appropriate separators. \
         If the speech lists parallel items WITHOUT a clear order (有的…有的…, 比如/包括, etc.), \
-        join them inline using Chinese enumeration separators: use \"、\" for short noun/phrase items \
-        (typically ≤6 characters with no internal punctuation, e.g., \"苹果、香蕉、橘子\"), and use \"；\" \
-        for longer clauses that contain predicates or internal punctuation (e.g., \"早上要开会；下午要写报告；晚上还要改方案\"). \
+        join them inline using the enumeration separators CONVENTIONAL IN THE LANGUAGE OF THE TEXT, \
+        per this table:\
+        \n- Chinese / Cantonese: use \"、\" for short noun/phrase items (typically ≤6 characters with no internal punctuation, e.g., \"苹果、香蕉、橘子\"), and use \"；\" for longer clauses that contain predicates or internal punctuation (e.g., \"早上要开会；下午要写报告；晚上还要改方案\").\
+        \n- English: use \", \" (half-width comma + space) for short items (e.g., \"apples, bananas, oranges\"), and use \"; \" (half-width semicolon + space) for longer clauses (e.g., \"I have a meeting in the morning; I need to write the report in the afternoon\").\
+        \n- Japanese: use \"、\" (tōten) for BOTH short items AND longer clauses — Japanese rarely uses the semicolon; chain clauses with the tōten instead (e.g., \"朝は会議があり、午後は報告書を書きます\").\
+        \n- Korean: use \", \" (half-width comma + space) for BOTH short items AND longer clauses — Korean likewise rarely uses the semicolon (e.g., \"아침에는 회의가 있고, 오후에는 보고서를 작성합니다\").\
+        \nCROSS-LANGUAGE BAN: NEVER use full-width \"、\" or \"；\" in English text; NEVER use half-width \",\" or \";\" in Chinese text. For mixed-language text, use the separators of the PRIMARY language of the sentence (consistent with the \"primary language\" concept used elsewhere in this prompt).\
         DO NOT compress or summarize content. DO NOT delete any semantic content. \
         Preserve every factual point the speaker made.\
         \nApply F1/F2/F3 to the text inside <corrected> tags. The output MUST be a single \

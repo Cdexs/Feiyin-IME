@@ -1,5 +1,22 @@
 # handoffs · voice-ime
 
+## 2026-08-01 — coder-2 — FORMAT-INLINE-SEP-I18N-006 ✅ 单行内联分隔符按语言本地化
+
+- **来源**：Gavin 2026-08-01 需求——`multiline_safe=false` 单行分支的 parallel items 段写死 `Chinese enumeration separators`，在微信/浏览器里说英文会得到 `apple、banana、orange`（英文句塞全角顿号）。基线 `c2b20a3`（ahead 17）
+- **范围**：仅 `src/llm/mod.rs` `build_format_instruction_block(false)` 单行分支 parallel items 段（:873-876 → :873-880），`multiline_safe=true` 分支零改动
+- **改动**：写死的中文两级体系改为语言条件化表格——
+  - Chinese/Cantonese：短 `、` / 长 `；`（保留原示例）
+  - English：短 `, ` / 长 `; `（半角 + 空格）
+  - Japanese：短长**都用 `、`**（tōten 兼任，日文罕用分号）
+  - Korean：短长**都用 `, `**（韩文同样罕用分号）
+  - **CROSS-LANGUAGE BAN**：英文文本禁全角 `、`/`；`，中文文本禁半角 `,`/`;`
+  - 混排以主体语言为准（与 CODESWITCH_FIX 的 primary language 概念一致）
+  - few-shot 示例 4 条（zh/en/ja/ko 各一，含长句）
+- **主控排版考据采纳**：日韩罕用分号、强用会产出一看就是机翻的文本；日语长句靠动词连用形 + `、` 串联（示例 `朝は会議があり、午後は報告書を書きます`）
+- **验证**：`cargo check` + `cargo check --tests` 双 0 errors；`cargo test --bin feiyin-ime llm::` **110 passed / 0 failed**（`build_format_instruction_block_four_quadrants` 断言 `、`/`；` 仍绿，中文示例保留）；`cargo fmt -- src/llm/mod.rs` 零连带（+7/−3 恰为目标段）；日韩字符 Python 验证无 mojibake
+- **边界**：`src/scene/mod.rs`/`scene-rules.toml`/`src/itn.rs`/`itn-rules.toml`/`src/main.rs`/`src-tauri/**`/`ui/**` 零触碰；未构建/出包/启动 exe；未改版本号（0.7.3）；未用 git 破坏命令；UTF-8 用 edit 工具
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-2/result.md`（非空）
+
 ## 2026-08-01 — tester-1 — TEST-EXEC + BUILD-RELEASE-20260801-004 ✅ 场景感知大批次收口出包（阶段四+五）
 
 - **来源**：主控合并 5 提交（8e65239 场景覆盖扩展+Markdown `- ` / bf2e188+8ce1be2 TEST-SYNC+Linear 改判 / 1dbd767 标题关键词最长匹配 / bcc5aa4 词表修错+邮件/macOS/Whiteboard / eb7b8e1 window_title 日志）。基线 `eb7b8e1`（ahead 16 未 push）
