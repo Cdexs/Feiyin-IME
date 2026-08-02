@@ -1,8 +1,18 @@
 # handoffs · voice-ime
 
+## 2026-08-02 — tester-1 — TEST-SYNC-016 ✅ 015 + 016 测试同步（阶段三，零命令执行）
+
+- **来源**：两提交 `ae452fb`（015，F3b/Output format 对称补 LONG 限定）+ `81cf51a`（016，年级班级简写守卫）。基线 `81cf51a`（ahead 35）
+- **A 过时断言**：`build_format_instruction_block_f3_exemplification_enumeration` d 项换锚（`may be FULL SENTENCES` → `List items here are FULL SENTENCES or longer clauses` + `SHORT noun phrases MUST NOT be bulleted` + 负向护栏）。意图=长句 AND 短项禁止 bullet 两侧缺一即退化
+- **B 015 覆盖 6 条**：item_form_short_long_split / f3a_f3b_long_symmetry / output_contract_short_inline_exception / f3c_short_inline_example / ⭐item_form_structural_guard（SHORT 内联与 LONG 限定同时存在，写 recency 软化教训）/ false_unchanged_drift_guard
+- **C 016 覆盖 6 条**：T1 正向 4 条（一三班/五一班/初二三班/高一四班 全汉字）｜T2 句子形态｜T3 反向护栏 8 条（含 **十三班→13班** code 走查 + coder-1 实测双重确认）｜T4 proper_nouns 保护｜T5 班非数字后｜⭐T6 降级（缺 serial_suffixes 旧 toml → 一三班→13班，锁 [TOML-STALE-001]）
+- **自验**：锚点与生产文本字节比对全过；负向锚点生产代码确认缺席；括号平衡；UTF-8 U+FFFD=0；`git diff -w` 真实 diff `+265/−3` 全在测试块，生产零改动
+- **边界**：未跑任何命令（阶段三禁执行）；未构建/出包/启动 exe；未改版本号（0.7.3）；未用 git 破坏命令；UTF-8 用 edit 工具
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/tester-1/result.md`（非空）+ `logs/20260802.md`
+
 ## 2026-08-02 — coder-1 — ITN-FIX-GRADECLASS-016 ✅ 年级班级简写被逐位串误合并
 
-- **来源**：Gavin 2026-08-02 端测 `我是一三班的学生`（=一年级三班）被转 `13班`；同类 五一班/初二三班/高一四班。基线 `a03b89c`（ahead 34）
+- **来源**：Gavin 2026-08-02 端测 `我是一三班的学生`（=一年级三班）被转 `13班`；同类 五一班/初二三班/高一四班。基线 `ae452fb`（ahead 34）
 - **根因**：`parse_cn_number` 逐位串 `serial_len>=2 && !next_is_unit` 把「一三」当两位数 + `decide_conversion` `consumed>=2` 无条件转；「班」不在 classifiers。`五一` 在 proper_nouns:`一三` 不在 = DEC-038 随机覆盖病症
 - **方案协商（重要）**：主控原方案「跳 :582 early return 落进位组合路径」经分析会产出 `("3",2)`（进位路径末位 digit 覆盖）→`3班`撕裂。协商采纳正确落点——**守卫命中时 `parse_cn_number` 直接 `return None`**（主循环 :1600 `if let Some` 短路，字符走单字路径，班非单位/量词→全汉字）。主控 ACK 采纳原方案作废
 - **改动**：`itn-rules.toml` +7 新增 `[protect.serial_suffixes]`(words=["班"])；`src/itn.rs` +38/−1（Protect/CompiledRules 加字段 + from_rules 填充 + parse_cn_number 守卫 `serial_len==2 && 后继命中 serial_suffixes`→None + 订正过时注释 ≥3→≥2 不改实现）

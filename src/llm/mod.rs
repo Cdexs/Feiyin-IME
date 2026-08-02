@@ -1852,10 +1852,21 @@ mod tests {
             safe.contains("both directions are equally wrong"),
             "对称警告必须存在——漏列真正并列枚举同样是回归（1b2697b 对称化核心）"
         );
-        // d. F3b 列表项可为完整长句
+        // d. F3b 列表项为长句 + 短名词短语禁止 bullet（015 语义反转：两侧缺一即退化）
+        // 015 把旧措辞「may be FULL SENTENCES」反转为「List items here are FULL SENTENCES
+        // or longer clauses. SHORT noun phrases MUST NOT be bulleted」，断言须锚新措辞，
+        // 且同时要求两侧——只留长句说明、删掉短项禁止，或反过来，都算退化。
         assert!(
-            safe.contains("may be FULL SENTENCES"),
-            "F3b 须说明列表项可为完整长句"
+            safe.contains("List items here are FULL SENTENCES or longer clauses"),
+            "F3b 须说明列表项为完整长句/长从句（015 反转后新措辞）"
+        );
+        assert!(
+            safe.contains("SHORT noun phrases MUST NOT be bulleted"),
+            "F3b 须同时声明短名词短语禁止 bullet（015 反转核心，指回 F3-item form 内联）"
+        );
+        assert!(
+            !safe.contains("may be FULL SENTENCES"),
+            "旧措辞 may be FULL SENTENCES 已删除，不得复活"
         );
         // e. F3c 正向长句 few-shot + 负向单例反例（锚定要求侧）
         assert!(
@@ -1901,6 +1912,167 @@ mod tests {
         );
         // DECISION RULE 仍在
         assert!(fmt.contains("DECISION RULE"), "DECISION RULE 必须保留");
+    }
+
+    /// TEST-SYNC-016 B1：F3-item form 段存在，且含 SHORT / LONG 两侧规则。
+    /// FORMAT-F3-SHORTITEM-014 引入「短项内联/长句列表」二维分流。多行分支此前
+    /// 只有「数量 ≥2 判枚举」一维，没有「项目长度 → 列表 or 内联」第二维，
+    /// 导致 Gavin 买菜用例被拆成四行 `- ` 列表。本断言锚定要求侧两侧规则。
+    #[test]
+    fn build_output_format_item_form_short_long_split() {
+        let fmt = build_output_format(true);
+        assert!(
+            fmt.contains("F3-item form"),
+            "true 分支须含 F3-item form 分流段（014 第二维：项目长度 → 列表 or 内联）"
+        );
+        // SHORT 侧：锚定「要求」侧——内联 + 不建列表
+        assert!(
+            fmt.contains("SHORT items"),
+            "F3-item form 须含 SHORT 侧规则"
+        );
+        assert!(
+            fmt.contains("join INLINE with the enumeration separator"),
+            "SHORT 侧须要求内联（join INLINE with the enumeration separator）"
+        );
+        assert!(
+            fmt.contains("do NOT make a list"),
+            "SHORT 侧须声明 do NOT make a list（防短项仍被列表化）"
+        );
+        // LONG 侧：锚定「要求」侧——建列表（整串锚点防「do NOT make a list」子串假绿）
+        assert!(
+            fmt.contains("LONG items (full clauses with a predicate or internal punctuation) → make a list"),
+            "LONG 侧须给出完整小句判据并要求 make a list（整串锚点防假绿）"
+        );
+    }
+
+    /// TEST-SYNC-016 B2：F3b 标题含 "AND items are LONG"，与 F3a 的 "items are LONG" 对称。
+    /// 015 收口 014 的 recency 冲突：014 只给 F3a 补了 LONG 限定，F3b 仍无条件要求
+    /// bullet —— 后段（F3b/Output format 位置更靠后）软化前段（F3-item form）。
+    /// 本断言锁死两侧对称，防止未来只改一侧。
+    #[test]
+    fn build_output_format_f3a_f3b_long_symmetry() {
+        let fmt = build_output_format(true);
+        // F3a 有序列表：要求侧锚点「SEQUENCE or order and items are LONG」
+        assert!(
+            fmt.contains("SEQUENCE or order and items are LONG"),
+            "F3a 须限定 items are LONG（与 F3b 对称）"
+        );
+        // F3b 无序列表：要求侧锚点「WITHOUT a clear order AND items are LONG」
+        assert!(
+            fmt.contains("WITHOUT a clear order AND items are LONG"),
+            "F3b 标题须限定 AND items are LONG（015 收口 recency 冲突的关键锚点）"
+        );
+    }
+
+    /// TEST-SYNC-016 B3：Output format 段含 SHORT 内联例外，且不再是无条件多行。
+    /// 015 改后契约：MUST span multiple lines 仅当 F3 适用**且** F3-item form 路由到
+    /// LIST；F3 不适用或路由 SHORT 内联时输出单段。旧契约「无条件 MUST」会让短项
+    /// 也强制多行，软化 F3-item form 的内联指令。
+    #[test]
+    fn build_output_format_output_contract_short_inline_exception() {
+        let fmt = build_output_format(true);
+        // 条件式 MUST：锚定「AND F3-item form routes the items to a LIST」
+        assert!(
+            fmt.contains("MUST span multiple lines when F3 applies AND F3-item form routes the items to a LIST"),
+            "多行须为条件式：F3 适用 AND 路由到 LIST（015 契约锚点）"
+        );
+        // SHORT 内联例外：锚定「routes SHORT items INLINE」
+        assert!(
+            fmt.contains("routes SHORT items INLINE"),
+            "Output format 须含 SHORT 内联例外（routes SHORT items INLINE）"
+        );
+        // 负向护栏：不得退回旧的无条件多行契约（旧措辞「when F3 applies;」直连分号）
+        assert!(
+            !fmt.contains("MUST span multiple lines when F3 applies;"),
+            "不得退回无条件 MUST span multiple lines（旧契约直接以分号结束）"
+        );
+    }
+
+    /// TEST-SYNC-016 B4：F3c 含买菜内联正向示例（Gavin 原句，顿号形态）。
+    /// 015 补 F3c 短项内联示例，消除五条示例全产列表的隐性倾向——LLM 会照示例形态
+    /// 输出，若全是列表示例则短项也会被列表化。锚定「要求」侧顿号形态。
+    #[test]
+    fn build_output_format_f3c_short_inline_example() {
+        let fmt = build_output_format(true);
+        assert!(
+            fmt.contains("买了3斤土豆、一个西瓜、20斤大米、还有3斤香蕉"),
+            "F3c 须含买菜内联正向示例（顿号形态，Gavin 原句）"
+        );
+        // 反向护栏：同一示例不得被写成列表形态
+        assert!(
+            !fmt.contains("买了3斤土豆\n"),
+            "买菜示例不得以换行列表形态出现（防示例与规则矛盾）"
+        );
+    }
+
+    /// TEST-SYNC-016 B5：⭐ 结构护栏——F3 家族长度限定必须同步（本批最重要的护栏）。
+    ///
+    /// 教训（015 根因）：014 引入 F3-item form 时只给 F3a 补了 LONG 限定，漏了 F3b
+    /// 与末段 Output format。F3 家族在 prompt 里是**顺序敏感**的——位置更靠后的段落
+    /// recency 更高、会软化前段：F3b/Output format 无条件要求 bullet/多行，把 F3-item
+    /// form 的「SHORT 内联」指令压掉了。正是 :813-817 注释记载的「后段软化前段」失败
+    /// 模式的第三次复现（FMT-LLM-002/003 之后）。
+    ///
+    /// 单点断言抓不到这种「只改一侧」：必须断言 F3-item form 的 SHORT 内联规则与
+    /// F3b/Output format 的 LONG 限定**同时存在**。F3 家族任一处加长度限定，其余处
+    /// 必须同步，否则后段 recency 更高会软化前段。
+    #[test]
+    fn build_output_format_item_form_structural_guard() {
+        let fmt = build_output_format(true);
+        // ① F3-item form 的 SHORT 内联规则
+        assert!(
+            fmt.contains("SHORT items") && fmt.contains("do NOT make a list"),
+            "F3-item form SHORT 侧须声明内联不列表"
+        );
+        // ② F3b 的 LONG 限定（标题 + 正文禁止短项 bullet）
+        assert!(
+            fmt.contains("WITHOUT a clear order AND items are LONG"),
+            "F3b 标题须限定 LONG"
+        );
+        assert!(
+            fmt.contains("SHORT noun phrases MUST NOT be bulleted"),
+            "F3b 正文须禁止短名词短语 bullet（与 F3-item form 内联呼应）"
+        );
+        // ③ Output format 的 LIST 路由限定 + SHORT 内联例外
+        assert!(
+            fmt.contains("MUST span multiple lines when F3 applies AND F3-item form routes the items to a LIST"),
+            "Output format 须限定 LIST 路由才多行"
+        );
+        assert!(
+            fmt.contains("routes SHORT items INLINE"),
+            "Output format 须含 SHORT 内联例外"
+        );
+    }
+
+    /// TEST-SYNC-016 B6：build_output_format(false) 单行分支零改动防漂移。
+    /// 015/014 全部改动都在 true 分支（F3-item form / F3a-b LONG 限定 / 买菜示例）。
+    /// 单行分支共享的 INLINE_SEPARATOR_RULES 常量未动。本断言锁死单行分支不被
+    /// 误并入多行措辞（若未来有人把 true 分支内容照抄进 false 分支，立刻可见）。
+    #[test]
+    fn build_output_format_false_unchanged_drift_guard() {
+        let inline = build_output_format(false);
+        // 单行契约仍在（既有断言 build_output_format_single_line_when_not_multiline_safe 已锚）
+        assert!(
+            inline.contains("MUST be a single line with no line breaks"),
+            "单行分支须仍要求 MUST be a single line with no line breaks"
+        );
+        // 不得混入多行分支独有措辞：F3-item form / SHORT/LONG 分流 / 买菜内联示例
+        assert!(
+            !inline.contains("F3-item form"),
+            "单行分支不得含 F3-item form（014 分流为多行分支专属）"
+        );
+        assert!(
+            !inline.contains("SHORT items"),
+            "单行分支不得含 SHORT items 分流措辞"
+        );
+        assert!(
+            !inline.contains("LONG items"),
+            "单行分支不得含 LONG items 分流措辞"
+        );
+        assert!(
+            !inline.contains("routes SHORT items INLINE"),
+            "单行分支不得含 routes SHORT items INLINE（多行契约例外）"
+        );
     }
 
     /// TEST-SYNC-008 0d：🔴 结构护栏——格式契约是 prompt 的最后一段。

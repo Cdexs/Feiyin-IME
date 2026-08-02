@@ -3238,4 +3238,94 @@ words = ["度"]
         // `刻`+`钟` 否决仍生效（一刻钟=时长，不转）—— 命中保护表 itn-rules.toml:420
         assert_eq!(normalize_test("一刻钟"), "一刻钟");
     }
+
+    // ============================================================
+    // TEST-SYNC-016 · ITN-FIX-GRADECLASS-016 年级班级简写守卫
+    // ============================================================
+    // 覆盖对象（2d7703d）：新增 [protect.serial_suffixes] = ["班"]。
+    // 机制：serial_len == 2（「一三/五一/二三/一四」两位逐位串）且紧随其后命中
+    // serial_suffixes 时，parse_cn_number 直接 return None → 主循环走单字路径，
+    // 「班」既非单位也非量词 → 整串保持汉字。限定 serial_len == 2 使进位组合
+    // 路径（十三班）、≥3 位逐位串（三零二房间/二零二六/幺三八零零）不受影响。
+    //
+    // 期望值来源：code 走查 + 既有断言锚点（九八年/三零二房间/二零二六/幺三八零零
+    // 沿用既有断言；十三班为 code 走查判断——十非逐位串首字符，走进位组合路径，
+    // 不受本守卫影响，行为与修前一致，非凭猜）。
+
+    // T1 · 正向：目标 4 条全汉字（Gavin 端测原话用例）
+    #[test]
+    fn itn_v2_016_t1_grade_class_serial_preserved() {
+        assert_eq!(normalize_test("一三班"), "一三班");
+        assert_eq!(normalize_test("五一班"), "五一班");
+        assert_eq!(normalize_test("初二三班"), "初二三班");
+        assert_eq!(normalize_test("高一四班"), "高一四班");
+    }
+
+    // T2 · 正向句子形态：整句无阿拉伯数字（Gavin 原句）
+    #[test]
+    fn itn_v2_016_t2_sentence_form_no_digits() {
+        assert_eq!(normalize_test("我是一三班的学生"), "我是一三班的学生");
+        assert_eq!(normalize_test("他在五一班上课"), "他在五一班上课");
+    }
+
+    // T3 · 反向护栏：既有行为必须保持不变
+    #[test]
+    fn itn_v2_016_t3_reverse_guards() {
+        // 九八年 → 98年（serial_len=2 但「年」不在 serial_suffixes，仍逐位合并）
+        assert_eq!(normalize_test("九八年"), "98年");
+        // ≥3 位逐位串不进守卫
+        assert_eq!(normalize_test("三零二房间"), "302房间");
+        assert_eq!(normalize_test("二零二六"), "2026");
+        assert_eq!(normalize_test("幺三八零零"), "13800");
+        // 全或无路径（三年二班）与本守卫互不干扰
+        assert_eq!(normalize_test("三年二班"), "三年二班");
+        // 十三班：十非逐位串首字符（走进位组合路径），守卫不触发 → 仍转（修前行为）
+        assert_eq!(normalize_test("十三班"), "13班");
+        // 单字+班：serial_len=1，不进守卫，单字数字无单位语境不转
+        assert_eq!(normalize_test("一班"), "一班");
+        assert_eq!(normalize_test("三班"), "三班");
+    }
+
+    // T4 · proper_nouns 保护不受影响（五一/五一广场 走保护路径，与守卫无关）
+    #[test]
+    fn itn_v2_016_t4_proper_noun_protection_intact() {
+        assert_eq!(normalize_test("五一广场"), "五一广场");
+        assert_eq!(normalize_test("五一"), "五一");
+        assert_eq!(normalize_test("五一放假"), "五一放假");
+    }
+
+    // T5 · 边界：班出现在非数字后不受影响
+    #[test]
+    fn itn_v2_016_t5_ban_not_after_digit_untouched() {
+        assert_eq!(normalize_test("上班"), "上班");
+        assert_eq!(normalize_test("班车"), "班车");
+        assert_eq!(normalize_test("今天上班坐班车"), "今天上班坐班车");
+    }
+
+    // T6 · ⭐ 降级测试：serial_suffixes 缺失（serde default → 空集）行为回到修前。
+    // 锁死 [TOML-STALE-001] 的失效形态——外置旧 toml（无 [protect.serial_suffixes]
+    // 段）会让本修复静默失效（「一三班」→「13班」），有断言才能在回归时看见。
+    #[test]
+    fn itn_v2_016_t6_downgrade_without_serial_suffixes() {
+        // 构造一个「旧 toml」：仅含 proper_nouns 等既有分组，缺 serial_suffixes 段
+        let old_rules = r#"
+[switches]
+[units.other]
+words = ["岁", "楼", "层", "号", "房间", "倍", "页", "章", "节", "条", "款", "名", "次", "台", "辆", "间", "句", "篇"]
+[units.time]
+words = ["小时", "分钟"]
+[units.currency]
+words = ["元", "块", "角", "毛", "分"]
+[protect.proper_nouns]
+words = ["五一", "五一广场"]
+[protect.classifiers]
+words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "辆", "间", "句", "篇", "本", "部", "场", "组", "批", "种", "类", "段", "堆", "瓶", "盒", "包", "箱"]
+"#;
+        // 缺 serial_suffixes → 空集 → 「一三班」退回逐位合并（修前行为 = 错误行为）
+        assert_eq!(normalize_with(old_rules, "一三班"), "13班");
+        // 反向对照：proper_nouns 保护不受缺段影响（五一/五一广场 仍保汉字）
+        assert_eq!(normalize_with(old_rules, "五一广场"), "五一广场");
+        // 反向对照：≥3 位逐位串在缺段时仍正常合并
+        assert_eq!(normalize_with(old_rules, "三零二房间"), "302房间");
+    }
 }
