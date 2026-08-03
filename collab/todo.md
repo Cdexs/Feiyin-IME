@@ -1,33 +1,10 @@
 # 任务列表 · voice-ime
 
-> ✅ **产物已更新**（2026-08-03 13:06）：`Publish/feiyin-ime.exe` / `feiyin-ime-ui.exe` / `crash-reporter.exe` 已重建，包含 `9eb80b7`(017) + `790e316`(018) + TEST-SYNC-019（B 批 T1-T4 4 条测试）。三 exe 两副本 sha256 一致，两 toml 三副本一致（itn-rules.toml 37,291B），ProductVersion 0.7.3.0/0.7.3。
-> ⏳ **本地 ahead 37 未 push**（Gavin 只授权提交，不授权 push）。
+> ✅ **产物已更新**（2026-08-03 **17:42**，BUILD-012）：`Publish/feiyin-ime.exe` `DB07CEFD8D51` / `feiyin-ime-ui.exe` `46D0F31E149D` / `crash-reporter.exe` `699ED9656958`，包含 017/018/020/021/**023**（四语标记清单恢复扩充）。三 exe 两副本 sha256 一致，两 toml 三副本一致（`scene-rules.toml` `7C1F0620` / `itn-rules.toml` `ED77A912`），ProductVersion 0.7.3.0/0.7.3。**⏭ 待 Gavin 端测。**
+> ⏳ **本地 ahead 41 未 push**（最新 `7a1329e`，Gavin 只授权提交，不授权 push）。
 > 端测方式（2026-07-25 Gavin 指示）：Gavin 已在**实际日常使用中自行测试**，端测项不再列入本文档；发现 bug 或优化点由 Gavin 邀请重新开单。
 
-## ✅ 已完成 · TEST-EXEC-024 + BUILD-012-VERIFY（2026-08-03 18:29 派发 tester-1）
-
-> **背景**：上一次 session 因程序崩溃中断，tester-1 的 TEST-SYNC-024 与出包环节未收口（Gavin 18:3x 指令续做）。
-> **状态**：✅ 已完成（tester-1，2026-08-03 18:3x）。
-
-| 项 | 崩溃前状态（主控 18:2x 独立取证） |
-| --- | --- |
-| HEAD | `fe69f23`（023 恢复并扩充四语标记清单，17:28 提交） |
-| `src/llm/mod.rs` | TEST-SYNC-024 已落地**未提交**，`-w` diff `+90/−8` 全在 `mod tests`（2 断言换锚 + 2 新测试 + 删 `for instance` 反向护栏），生产代码零改动 |
-| 三 exe | 17:41–17:42 已构建并同步 Publish，两副本 sha256 全一致 |
-| 两 toml | 三副本全一致（`scene-rules.toml` `7C1F0620` / `itn-rules.toml` `ED77A912`） |
-| 探针 | 正向 `markers DIFFER`=5 / `for instance`=5 / `はじめに`=2 / `가령`=2；反向 `the SAME marker`=0 / `already contains normalized numbers`=0 → **17:42 构建确含 023** |
-| ❌ 缺口 | TEST-EXEC 无记录 ｜ ProductVersion/冒烟未核 ｜ 五文档零更新 ｜ `result.md` 0 字节 |
-
-**本次派发范围**：Step A 全量回归 → Step B 出包验收七项（默认不重建）→ Step C 五文档 + troubleshooting 收口 → Step D result.md。
-**验收后动作**：主控独立复核 → 统一 git commit（本地 ahead 未 push，Gavin 只授权提交）。
-
-**完成结果**：
-- Step A：752/0/6 + llm::131/0/0 + itn::139/0/0 + src-tauri 53/0/0 + --list 758 自洽，零红条
-- Step B：7 项独立复核全过（sha256 / toml / ProductVersion / mtime / 正向探针 8/8 / 反向探针 4/4 / 冒烟 PID 11088）
-- Step C：五文档 + troubleshooting 已更新
-- Step D：result.md 2839 bytes 已写入
-
----
+> ✅ **TEST-EXEC-024 + BUILD-012-VERIFY 已闭环并提交 `7a1329e`**（崩溃中断续做，tester-1 2026-08-03 18:3x，主控 18:4x 独立验收）。详见 CHANGELOG / `logs/20260803.md`（规则 3：测试同步与出包不在本文档详列）。**全部 Worker 空闲待命。**
 
 ## 文档更新规则
 
