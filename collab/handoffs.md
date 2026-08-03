@@ -1,5 +1,13 @@
 # handoffs · voice-ime
 
+## 2026-08-03 — tester-1 — TEST-SYNC-024 + TEST-EXEC + BUILD-012-VERIFY ✅ 023 续做收口（session 崩溃中断后）
+
+- **来源**：上一 session 崩溃中断，TEST-SYNC-024（`src/llm/mod.rs` +90/−8，全在 `mod tests`）与 BUILD-012（17:42 产物已存在）未收口。Gavin 18:3x 指令续做。
+- **Step A TEST-EXEC**：`cargo test --bin feiyin-ime` 752/0/6（+2 来自 TEST-SYNC-024）/ `llm::` 131/0/0（vs BUILD-011 基线 129/0/0）/ `itn::` 139/0/0 / `src-tauri` 53/0/0 / `--list` 758=752+6 自洽。零红条，无需换锚。
+- **Step B BUILD-012-VERIFY（默认不重建）**：独立复核 7 项全过——三 exe sha256 两副本一致（`DB07CEFD8D51`/`46D0F31E149D`/`699ED9656958`）/ 两 toml 三副本一致（`7C1F0620`/`ED77A912`）/ ProductVersion 0.7.3.0/0.7.3 / mtime 链通过 / 正向探针 8/8 ≥1 / 反向探针 4/4 =0 / 冒烟 PID 11088 Responding=True 零 panic。
+- **Step C 文档收口**：`logs/20260803.md` + `handoffs.md` + `CHANGELOG.md` + `todo.md` + `troubleshooting.md` 五处已更新。
+- **边界**：生产代码零改动；版本号未改；未用 git 破坏性命令；UTF-8 用 Python `codecs.open` 写入。
+
 ## 2026-08-03 — coder-2 — FORMAT-F3-SEMANTIC-021 + PROMPT-ARCH-020 + FORMAT-F3-MARKERS-023 ✅
 
 ### 021 + 020（F3 判据语义化 + 翻译路径假前提修复）

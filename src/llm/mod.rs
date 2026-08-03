@@ -2308,9 +2308,10 @@ mod tests {
             "旧措辞 may be FULL SENTENCES 已删除，不得复活"
         );
         // e. F3c 正向长句 few-shot + 负向单例反例（锚定要求侧）
+        // 023 改为 markers DIFFER 形态：比如/再比如/还有就是
         assert!(
-            safe.contains("比如说有些学生头发过长"),
-            "F3c 须含正向 比如说 长句 few-shot"
+            safe.contains("再比如还有些学生奇装异服"),
+            "F3c 须含正向 markers DIFFER 长句 few-shot（023 恢复形态）"
         );
         assert!(
             safe.contains("single marker = mere example, NO list"),
@@ -2329,8 +2330,9 @@ mod tests {
             fmt.contains("有一些…还有一些…"),
             "中文须含 有一些…还有一些…"
         );
-        // English（主控精简判据：保留结构性标记 for example，语义自明的单词标记 for instance 已删除）
+        // English（023 已恢复 for instance，保留 for example）
         assert!(fmt.contains("for example"), "English 须含 for example");
+        assert!(fmt.contains("for instance"), "English 须含 for instance（023 恢复）");
         // 日本語
         assert!(fmt.contains("たとえば"), "日本語须含 たとえば");
         // 한국어
@@ -2355,6 +2357,90 @@ mod tests {
         assert!(
             !fmt.contains("the SAME marker"),
             "旧判据 the SAME marker 已删除，不得复活（语义并列取代字面重复）"
+        );
+    }
+
+    /// TEST-SYNC-024 P1：023 恢复标记清单完整性护栏。
+    /// 021 精简后被删的标记在 023 已恢复，补数据驱动断言锁死高风险项。
+    #[test]
+    fn build_output_format_marker_recovery_023() {
+        let fmt = build_output_format(true);
+        // 021 精简误删过的高风险标记（按语言分组，便于扩充）
+        let markers: &[(&str, &str)] = &[
+            // 中文有序
+            ("第一点/第二点", "中文有序"),
+            ("一是/二是/三是", "中文有序"),
+            ("然后/接着", "中文有序"),
+            ("一来/二来", "中文有序"),
+            ("其一/其二", "中文有序"),
+            // English 有序
+            ("step 1/2/3", "English 有序"),
+            ("to begin with", "English 有序"),
+            ("namely", "English 有序"),
+            // 日本語有序
+            ("一つ目/二つ目/三つ目", "日本語有序"),
+            ("最初に", "日本語有序"),
+            ("続いて", "日本語有序"),
+            ("はじめに", "日本語有序"),
+            ("つづいて", "日本語有序"),
+            ("おわりに", "日本語有序"),
+            // 한국어有序
+            ("먼저/다음으로/마지막으로", "한국어有序"),
+            ("첫 번째/두 번째", "한국어有序"),
+            ("우선", "한국어有序"),
+            ("아울러", "한국어有序"),
+            ("첫 번째로/두 번째로", "한국어有序"),
+            ("처음으로", "한국어有序"),
+            ("마무리로", "한국어有序"),
+            // English 无序
+            ("for instance", "English 无序"),
+            ("such as", "English 无序"),
+            ("as well as", "English 无序"),
+            // 日本語无序
+            ("など/とか", "日本語无序"),
+            ("〜や〜", "日本語无序"),
+            // 한국어无序
+            ("예컨대", "한국어无序"),
+            ("뿐만 아니라", "한국어无序"),
+            ("가령", "한국어无序"),
+            ("이를테면", "한국어无序"),
+        ];
+        for (marker, category) in markers {
+            assert!(
+                fmt.contains(marker),
+                "023 恢复标记清单须含 {}（category={}）",
+                marker,
+                category
+            );
+        }
+    }
+
+    /// TEST-SYNC-024 P2：per-language contrast 四语 markers DIFFER 形态护栏。
+    /// 023 恢复 contrast 为四语各一组，且必须是 markers DIFFER 形态。
+    #[test]
+    fn build_output_format_contrast_markers_differ() {
+        let fmt = build_output_format(true);
+        // 四语各含 markers DIFFER 正向示例
+        assert!(
+            fmt.contains("markers DIFFER (比如/再比如/还有就是)"),
+            "中文 contrast 须为 markers DIFFER 形态"
+        );
+        assert!(
+            fmt.contains("markers DIFFER (for example/also/plus)"),
+            "English contrast 须为 markers DIFFER 形态"
+        );
+        assert!(
+            fmt.contains("markers DIFFER (たとえば/また/さらに)"),
+            "日本語 contrast 须为 markers DIFFER 形态"
+        );
+        assert!(
+            fmt.contains("markers DIFFER (예를 들어/또/게다가)"),
+            "한국어 contrast 须为 markers DIFFER 形态"
+        );
+        // 四语各含单例反例（1 example → paragraph）
+        assert!(
+            fmt.contains("1 example → paragraph"),
+            "contrast 须含单例反例（1 example → paragraph）"
         );
     }
 
@@ -4252,10 +4338,6 @@ mod tests {
         assert!(fmt.contains("一つは…もう一つは…"), "日本語须含 一つは…もう一つは…");
         // 한국어结构性句式
         assert!(fmt.contains("어떤 사람은…어떤 사람은…"), "한국어须含 어떤 사람은…어떤 사람은…");
-        // 反向护栏：语义自明的单词标记 for instance 已删除
-        assert!(
-            !fmt.contains("for instance"),
-            "语义自明的单词标记 for instance 已删除（结构性句式保留）"
-        );
+        // 023 按 Gavin 指示恢复并扩充标记清单，for instance 已恢复，反向护栏删除
     }
 }

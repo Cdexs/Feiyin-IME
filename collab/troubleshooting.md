@@ -2194,3 +2194,39 @@ ITN-COLLISION-TYPEB-001（29,774 条，单位首字开头）出自**同一挖掘
 - 主控收到端测 bug 报告，**先检查文本是否语法自洽**；出现语法突兀的词（本例「已经」）先怀疑是 ASR 音近错误，用错误值反推校验
 - Worker 汇报「按报告原文测是正确的」时，**主控必须回到错误值做算术复核**，不得据此缩小修复范围
 - 拿不准时**直接问 Gavin 原话**（本例一句话就确认了）
+
+---
+
+## [SESSION-CRASH-RECOVERY-001] ⚠️ session 崩溃中断后的状态判定方法【必读】
+
+**状态**：🟢 已固化为流程（2026-08-03 / orchestrator + tester-1）
+
+### 问题
+
+session 崩溃中断后，Worker 的改动和构建产物可能已落地但文档收口全部缺失。如何区分「做了没记」与「没做」？
+
+### 判定三件套
+
+| 检查项 | 方法 | 判定 |
+|--------|------|------|
+| **sha256 两副本一致** | `sha256sum target/release/*.exe` vs `sha256sum Publish/*.exe` | 若一致 → 构建确实发生过且已同步；若不一致 → 可能只做了部分或完全未做 |
+| **mtime 链** | `stat` 产物 vs 最新源文件 | 产物时间 > 源文件时间 → 构建覆盖了最新代码；反之 → 产物是旧的 |
+| **正反向探针** | `strings` 或 PowerShell `regex::Matches` 在 exe 内搜索 | 正向（新增内容 ≥1）+ 反向（删除内容 =0）→ 构建确实包含预期改动；任一不满足 → 需重建 |
+
+### 实践结论（TEST-EXEC-024 + BUILD-012-VERIFY，2026-08-03）
+
+- 三 exe sha256 两副本一致（`DB07CEFD8D51`/`46D0F31E149D`/`699ED9656958`）
+- mtime 产物 17:42 > 源文件 17:33 > scene-rules.toml 16:32
+- 正向探针 `markers DIFFER`=8 / `for instance`=5 / `TWO OR MORE spans stand in a PARALLEL`=5 / `はじめに`=2 / `가령`=2 / `이를테면`=2 / `to start with`=2 / `其次是`=2
+- 反向探针 `the SAME marker`=0 / `already contains normalized numbers`=0 / `This directive OVERRIDES`=0 / `Use headings`=0
+
+**结论**：三件套全部通过 → 「产物在但文档缺」是「做了没记」，不是「没做」。默认不重建，只补验证和文档。
+
+### 规则
+
+- 崩溃中断后，**Orchestrator 必须先独立取证**（用三件套），不能假设「没记录 = 没做」
+- 若三件套通过 → 派发续做任务给 tester-1，范围 = 验证 + 文档收口，**默认不重建**
+- 若三件套任一不通过 → 按正常流程重建
+- 该方法论须记入 `troubleshooting.md` 供 future session 参考
+
+
