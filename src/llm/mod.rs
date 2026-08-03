@@ -1041,14 +1041,27 @@ fn f3_rules_text(multiline_safe: bool) -> String {
         \nF3. Smart Lists: ONLY use a list when the speech EXPLICITLY contains enumeration OR \
         exemplification markers (ILLUSTRATIVE, NOT EXHAUSTIVE — the lists below calibrate your \
         recognition; apply the F3-semantic fallback below for markers outside these lists). \
-        Ordered examples: 第X/第X点/首先/其次/最后, first/second/finally, 第一に/まず/次に/最後に, \
-        첫째/둘째/마지막으로; \
-        unordered examples (single-word markers): 比如/例如/还有/另外/此外, for example/also/another, \
-        たとえば/また, 예를 들어/또/게다가; \
+        Ordered examples: 第一/第二/第三, 第一点/第二点, 一是/二是/三是, 首先/其次/再次/最后, \
+        然后/接着, 一来/二来, 其一/其二, 再者, 最后一点, 另外一点, 第X条, 其次是/接下来/紧接着/第X方面, \
+        first/second/third, firstly/secondly/lastly, step 1/2/3, point one/two, \
+        to begin with, next, finally, in addition, plus, and then, namely, to start with, \
+        in conclusion, \
+        第一に/第二に/第三に, まず/次に/それから/最後に, 一つ目/二つ目/三つ目, ①②③, \
+        最初に, 続いて, それに, 加えて, ほかにも, はじめに, つづいて, おわりに, \
+        첫째/둘째/셋째, 먼저/다음으로/마지막으로, 첫 번째/두 번째, 우선, 그다음, 또, \
+        이어서, 끝으로, 아울러, 첫 번째로/두 번째로, 처음으로, 마무리로; \
+        unordered examples (single-word markers): 比如/比如说/例如/譬如/像, \
+        还有/另外/此外/以及/包括/诸如/等等, 像是/好比/譬如说/诸如此类/之类的/还有一点/再一个/另一个, \
+        for example/for instance/such as/like/including/includes/also/another/additionally/\
+        moreover/besides/as well as/e.g./etc., among them, things like, \
+        たとえば/例えば, など/とか, また/さらに/そのほか, 例を挙げると, あるいは, \
+        예를 들어/예컨대, 등, 그리고/또한/게다가, ~같은, 뿐만 아니라, 가령, 이를테면; \
         unordered structural patterns (paired/parallel sentence frames — NO single marker, easily \
         missed, treat as enumeration when the parallel relation holds): \
-        有的…有的…/有些…有些…/有一些…还有一些…/一些…一些…/一方面…另一方面/一类是…一类是, some…some…/one…another…, \
-        〜や〜/ある人は…ある人は…/一つは…もう一つは…, 어떤 사람은…어떤 사람은…).\
+        有的…有的…/有些…有些…/有一些…还有一些…/一些…一些…/一方面…另一方面/一方面…二方面/一类是…一类是, \
+        some…some…/one…another…/for one thing…for another, \
+        〜や〜/ある人は…ある人は…/一つは…もう一つは…, 〜とか〜とか, \
+        어떤 사람은…어떤 사람은…/하나는…다른 하나는).\
         DECISION RULE: the decisive test is SEMANTIC, not lexical. Do TWO OR MORE spans stand in a \
         PARALLEL relation — each filling the same syntactic slot, each contributing one coordinate \
         member to a set introduced by the surrounding context? If yes, it IS an enumeration and you \
@@ -1069,8 +1082,11 @@ fn f3_rules_text(multiline_safe: bool) -> String {
         — parallelism alone suffices. Conversely, a single span introduced by an example marker \
         remains a mere example: keep it as a continuous paragraph. Parallelism, not marker \
         presence, decides.\
-        \nContrast (language-agnostic; markers vary across languages but the parallel-relation test is the same): \
-        Chinese \"建议从以下方面入手：比如英语学习要多读多背，再比如多听一些视频的节目，还有就是要多出去和别人交流\" → 3 parallel items, markers vary (比如/再比如/还有就是) → bullet list; vs \"今天雨下得很大，比如早上那阵就特别急\" → 1 example → paragraph. \
+        \nContrast (semantic parallelism, not marker repetition; markers may DIFFER across items): \
+        Chinese \"建议从以下方面入手：比如英语学习要多读多背，再比如多听一些视频的节目，还有就是要多出去和别人交流\" → 3 parallel items, markers DIFFER (比如/再比如/还有就是) → bullet list; vs \"今天雨下得很大，比如早上那阵就特别急\" → 1 example → paragraph. \
+        English \"A few things help: for example reading more, also listening to podcasts, plus talking to people\" → 3 parallel items, markers DIFFER (for example/also/plus) → bullet list; vs \"The rain was heavy today, for example this morning it was especially intense\" → 1 example → paragraph. \
+        Japanese \"いくつか方法があります。たとえば本をもっと読むこと、またポッドキャストを聞くこと、さらに人と話すことです\" → 3 parallel items, markers DIFFER (たとえば/また/さらに) → bullet list; vs \"今日は雨がひどくて、たとえば今朝は特に激しかった\" → 1 example → paragraph. \
+        Korean \"몇 가지 방법이 있습니다. 예를 들어 책을 많이 읽고, 또 팟캐스트를 듣고, 게다가 사람들과 대화하는 것입니다\" → 3 parallel items, markers DIFFER (예를 들어/또/게다가) → bullet list; vs \"오늘 비가 많이 왔는데, 예를 들어 오늘 아침은 특히 심했어요\" → 1 example → paragraph. \
         Apply the same parallel-relation test to any language: 2+ coordinate members → list; a single example → paragraph.\
         If unsure, DO NOT use a list — keep the text as a continuous paragraph. \
         Over-formatting normal speech into lists is a regression. \
@@ -1100,11 +1116,11 @@ fn f3_rules_text(multiline_safe: bool) -> String {
         distinct example of a stated problem) is exactly the case for a bullet list.\
         \nF3c. Examples:\
         \n- Chinese ordered: \"第一点xxx，第二点yyy\" → \"1. xxx\\n2. yyy\"; \"首先xxx，然后yyy，最后zzz\" → \"1. xxx\\n2. yyy\\n3. zzz\".\
-        \n- Chinese unordered: \"有的xxx，有的yyy\" → \"- xxx\\n- yyy\"; \"比如说有些学生头发过长，比如说还有些学生奇装异服，还有些学生说脏话\" → \"- 有些学生头发过长\\n- 还有些学生奇装异服\\n- 还有些学生说脏话\".\
+        \n- Chinese unordered (markers DIFFER): \"比如有些学生头发过长，再比如还有些学生奇装异服，还有些学生说脏话\" → \"- 有些学生头发过长\\n- 还有些学生奇装异服\\n- 还有些学生说脏话\".\
         \n- Chinese SHORT items inline (enumeration confirmed but NO list): \"今天出去买菜了，买了3斤土豆，一个西瓜，20斤大米，还有3斤香蕉\" → \"今天出去买菜了，买了3斤土豆、一个西瓜、20斤大米、还有3斤香蕉\".\
-        \n- English unordered: \"For example, some students keep their hair too long; for example, some wear inappropriate clothes; also, some use bad language\" → \"- Some students keep their hair too long\\n- Some wear inappropriate clothes\\n- Some use bad language\".\
-        \n- Japanese unordered: \"たとえば、髪が長すぎる学生がいます。また、奇抜な服装の学生もいます。さらに、悪い言葉を使う学生もいます\" → \"- 髪が長すぎる学生がいます\\n- 奇抜な服装の学生もいます\\n- 悪い言葉を使う学生もいます\".\
-        \n- Korean unordered: \"예를 들어, 머리가 너무 긴 학생들이 있습니다. 또, 특이한 복장을 한 학생들도 있습니다. 게다가, 나쁜 말을 쓰는 학생들도 있습니다\" → \"- 머리가 너무 긴 학생들이 있습니다\\n- 특이한 복장을 한 학생들도 있습니다\\n- 나쁜 말을 쓰하는 학생들도 있습니다\".\
+        \n- English unordered (markers DIFFER): \"For example, some students keep their hair too long; also, some wear inappropriate clothes; plus, some use bad language\" → \"- Some students keep their hair too long\\n- Some wear inappropriate clothes\\n- Some use bad language\".\
+        \n- Japanese unordered (markers DIFFER): \"たとえば、髪が長すぎる学生がいます。また、奇抜な服装の学生もいます。さらに、悪い言葉を使う学生もいます\" → \"- 髪が長すぎる学生がいます\\n- 奇抜な服装の学生もいます\\n- 悪い言葉を使う学生もいます\".\
+        \n- Korean unordered (markers DIFFER): \"예를 들어, 머리가 너무 긴 학생들이 있습니다. 또, 특이한 복장을 한 학생들도 있습니다. 게다가, 나쁜 말을 쓰는 학생들도 있습니다\" → \"- 머리가 너무 긴 학생들이 있습니다\\n- 특이한 복장을 한 학생들도 있습니다\\n- 나쁜 말을 쓰는 학생들도 있습니다\".\
         \n- Negative (single marker = mere example, NO list): Chinese \"今天雨下得很大，比如早上那阵就特别急\" → keep as a continuous paragraph, NO list; English \"The rain was heavy today, for example this morning it was especially intense\" → NO list; Japanese \"今日は雨がひどくて、たとえば今朝は特に激しかった\" → NO list; Korean \"오늘 비가 많이 왔는데, 예를 들어 오늘 아침은 특히 심했어요\" → NO list; \"今天天气不错我们去公园吧\" → NO list.\
         \n- Negative (discourse-marker \"比如\" as a verbal tic, NO parallelism, NO list): Chinese \"我觉得比如说这样不太好\" → keep as a continuous paragraph, NO list (only ONE span, no second parallel item).\
         \n- Negative (single-item illustration, NO list): Chinese \"很多水果都不错，比如苹果\" → keep as a continuous paragraph, NO list (only ONE example, no enumeration).\
@@ -1120,13 +1136,27 @@ fn f3_rules_text(multiline_safe: bool) -> String {
         breaks, or multi-line formatting. DO NOT output \"- \", \"• \", \"1. \", or \"2. \" on \
         separate lines, because those will be flattened into unreadable inline text. \
         If the speech contains explicit ordered enumeration (ordered markers, ILLUSTRATIVE: \
-        第X/第X点/首先/其次/最后, first/second/finally, 第一に/まず/次に/最後に, 첫째/둘째/마지막으로, etc.), \
+        第一/第二/第三, 第一点/第二点, 一是/二是/三是, 首先/其次/再次/最后, 然后/接着, 一来/二来, \
+        其一/其二, 再者, 最后一点, 另外一点, 第X条, 其次是/接下来/紧接着/第X方面, \
+        first/second/third, firstly/secondly/lastly, step 1/2/3, point one/two, \
+        to begin with, next, finally, in addition, plus, and then, namely, to start with, \
+        in conclusion, 第一に/第二に/第三に, まず/次に/それから/最後に, 一つ目/二つ目/三つ目, ①②③, \
+        最初に, 続いて, それに, 加えて, ほかにも, はじめに, つづいて, おわりに, \
+        첫째/둘째/셋째, 먼저/다음으로/마지막으로, 첫 번째/두 번째, 우선, 그다음, 또, 이어서, 끝으로, \
+        아울러, 첫 번째로/두 번째로, 처음으로, 마무리로, etc.), \
         keep the sequence markers inline and join items with appropriate separators. \
         If the speech lists parallel items WITHOUT a clear order (unordered markers, ILLUSTRATIVE: \
-        single-word 比如/例如/还有/另外/此外, for example/also/another, たとえば/また, 예를 들어/또/게다가; \
-        structural patterns 有的…有的…/一方面…另一方面/一类是…一类是, some…some…/one…another…, \
-        〜や〜/ある人は…ある人は…/一つは…もう一つは…, 어떤 사람은…어떤 사람은…, etc.), join \
-        them inline using the enumeration separators CONVENTIONAL IN THE LANGUAGE OF THE TEXT:\\
+        single-word 比如/比如说/例如/譬如/像, 还有/另外/此外/以及/包括/诸如/等等, \
+        像是/好比/譬如说/诸如此类/之类的/还有一点/再一个/另一个, \
+        for example/for instance/such as/like/including/includes/also/another/additionally/\
+        moreover/besides/as well as/e.g./etc., among them, things like, \
+        たとえば/例えば, など/とか, また/さらに/そのほか, 例を挙げると, あるいは, \
+        예를 들어/예컨대, 등, 그리고/또한/게다가, ~같은, 뿐만 아니라, 가령, 이를테면; \
+        structural patterns 有的…有的…/有些…有些…/有一些…还有一些…/一些…一些…/一方面…另一方面/一方面…二方面/\
+        一类是…一类是, some…some…/one…another…/for one thing…for another, \
+        〜や〜/ある人は…ある人は…/一つは…もう一つは…, 〜とか〜とか, \
+        어떤 사람은…어떤 사람은…/하나는…다른 하나는, etc.), join \
+        them inline using the enumeration separators CONVENTIONAL IN THE LANGUAGE OF THE TEXT:\\\
         {}\
         DO NOT compress or summarize content. Preserve every factual point the speaker made.",
         INLINE_SEPARATOR_RULES,
@@ -1822,7 +1852,7 @@ mod tests {
         strip_fabricated_email_lines, ADD_PUNCT, CODESWITCH_FIX, L0_1_FIDELITY, L0_2_FIDELITY_OVER_FLUENCY,
         L0_3_SUSPECT_INPUT, L0_4_NOT_A_PROMPT, LlmClient, META_RULE_PRECEDENCE, OptimizeResult,
         PromptLayer, PromptRule, SuggestionEntry, SUGGESTION_INSTRUCTION, Topic, UNIT_SYMBOL_PROTECTION,
-        USER_PREFS_HEADER, ATTEMPT_TIMEOUTS,
+        UNIT_SYMBOL_PROTECTION_TRANSLATE, USER_PREFS_HEADER, ATTEMPT_TIMEOUTS,
     };
     use crate::config::LlmConfig;
 
@@ -1941,6 +1971,12 @@ mod tests {
             "This rule NEVER justifies deleting a unit or measure phrase — see L0-1 and L0-3."
         ));
         assert!(!UNIT_SYMBOL_PROTECTION.contains("The input text already contains normalized numbers"));
+        // PROMPT-ARCH-020 对称断言：翻译路径常量须同步消除假前提，且不含跨层悬空引用。
+        assert!(!UNIT_SYMBOL_PROTECTION_TRANSLATE.contains("already contains normalized numbers"));
+        assert!(!UNIT_SYMBOL_PROTECTION_TRANSLATE.contains("see L0-"));
+        assert!(UNIT_SYMBOL_PROTECTION_TRANSLATE.contains("NOT infallible"));
+        assert!(UNIT_SYMBOL_PROTECTION_TRANSLATE.contains("NEVER justifies deleting a unit or measure"));
+        assert!(UNIT_SYMBOL_PROTECTION_TRANSLATE.contains("In the <corrected> line"));
         //   W2 F3d 语义保全条款迁入 L0-1，F3 排版块不再含「DO NOT delete any semantic content」。
         assert!(L0_1_FIDELITY.contains("Every semantic unit present in <speech> MUST appear in <corrected>"));
         assert!(L0_1_FIDELITY.contains("This rule OVERRIDES every formatting, style, and number-preservation rule below"));
@@ -2240,11 +2276,11 @@ mod tests {
             ),
             "旧措辞不得只剩 enumeration markers（须为 OR exemplification 版本）"
         );
-        // b. DECISION RULE + 2 OR MORE parallel items（锚定要求侧）
+        // b. DECISION RULE + TWO OR MORE spans stand in a PARALLEL relation（锚定要求侧）
         assert!(safe.contains("DECISION RULE"), "须含 DECISION RULE");
         assert!(
-            safe.contains("2 OR MORE parallel items"),
-            "DECISION RULE 须含 2 OR MORE parallel items 判据"
+            safe.contains("TWO OR MORE spans stand in a PARALLEL"),
+            "DECISION RULE 须含 TWO OR MORE spans stand in a PARALLEL relation 判据"
         );
         // c. 保守默认双向（本测试防回归核心，两侧缺一即退化）
         assert!(
@@ -2293,8 +2329,8 @@ mod tests {
             fmt.contains("有一些…还有一些…"),
             "中文须含 有一些…还有一些…"
         );
-        // English
-        assert!(fmt.contains("for instance"), "English 须含 for instance");
+        // English（主控精简判据：保留结构性标记 for example，语义自明的单词标记 for instance 已删除）
+        assert!(fmt.contains("for example"), "English 须含 for example");
         // 日本語
         assert!(fmt.contains("たとえば"), "日本語须含 たとえば");
         // 한국어
@@ -2315,6 +2351,11 @@ mod tests {
         );
         // DECISION RULE 仍在
         assert!(fmt.contains("DECISION RULE"), "DECISION RULE 必须保留");
+        // 022 反向护栏：旧判据 "the SAME marker" 已删除，不得复活
+        assert!(
+            !fmt.contains("the SAME marker"),
+            "旧判据 the SAME marker 已删除，不得复活（语义并列取代字面重复）"
+        );
     }
 
     /// TEST-SYNC-016 B1：F3-item form 段存在，且含 SHORT / LONG 两侧规则。
@@ -4158,11 +4199,14 @@ mod tests {
             len > 500,
             "正常 prompt 长度应远大于 500 字符"
         );
-        // 实测基线 ~13271（018 落地后），FORMAT-F3-SEMANTIC-021 + PROMPT-ARCH-020 后 ~14700，
-        // 阈值 16000 留约 1200 余量——撞阈值时必须逐段解释增长来源，不得无说明上调。
+        // 定位变更（DEC-039 修正，Gavin 2026-08-03 决策）：从「控制膨胀」改为「探测异常暴涨」。
+        // Gavin 指示提示词「越充分越好」，上下文窗口远大于提示词长度，长度不再是主要矛盾
+        // （且 018 分层已从结构上消除「后段软化前段」，长度不再影响优先级）。
+        // 本测试只拦截数量级错误（意外重复拼接、循环注入），不作为长度预算。
+        // 上界 40000 = 约当前 10 倍，足够发现异常暴涨；下界 500 防空串。
         assert!(
-            len < 16000,
-            "prompt 不应异常膨胀超过 16000 字符（实测 {}）",
+            len < 40000,
+            "prompt 异常暴涨超过 40000 字符（实测 {}），疑似意外重复拼接或循环注入",
             len
         );
     }
@@ -4189,5 +4233,29 @@ mod tests {
         // 最后一个开标签后无配对闭标签
         let raw = "<corrected>answer</corrected> 然后 <corrected>无闭标签";
         assert_eq!(extract_corrected_tag(raw), None);
+    }
+
+    /// TEST-SYNC-022 P3：结构性句式必保（主控精简判据的护栏）。
+    /// 语义自明的单词标记可删，结构性呼应句式必保。
+    #[test]
+    fn build_output_format_structural_patterns_preserved() {
+        let fmt = build_output_format(true);
+        // 中文结构性句式
+        assert!(fmt.contains("有的…有的…"), "中文须含 有的…有的…");
+        assert!(fmt.contains("一方面…另一方面"), "中文须含 一方面…另一方面");
+        assert!(fmt.contains("一类是…一类是"), "中文须含 一类是…一类是");
+        // English 结构性句式
+        assert!(fmt.contains("some…some…"), "English 须含 some…some…");
+        assert!(fmt.contains("one…another…"), "English 须含 one…another…");
+        // 日本語结构性句式
+        assert!(fmt.contains("ある人は…ある人は…"), "日本語须含 ある人は…ある人は…");
+        assert!(fmt.contains("一つは…もう一つは…"), "日本語须含 一つは…もう一つは…");
+        // 한국어结构性句式
+        assert!(fmt.contains("어떤 사람은…어떤 사람은…"), "한국어须含 어떤 사람은…어떤 사람은…");
+        // 反向护栏：语义自明的单词标记 for instance 已删除
+        assert!(
+            !fmt.contains("for instance"),
+            "语义自明的单词标记 for instance 已删除（结构性句式保留）"
+        );
     }
 }

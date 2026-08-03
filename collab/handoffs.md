@@ -1,5 +1,19 @@
 # handoffs · voice-ime
 
+## 2026-08-03 — coder-2 — FORMAT-F3-SEMANTIC-021 + PROMPT-ARCH-020 + FORMAT-F3-MARKERS-023 ✅
+
+### 021 + 020（F3 判据语义化 + 翻译路径假前提修复）
+**文件**：`src/llm/mod.rs` + `scene-rules.toml`（3 处 F4）
+**改动**：F3 DECISION RULE 从「标记字面重复」改为「语义并列」（`TWO OR MORE spans stand in a PARALLEL relation`）+ 新增 F3-semantic fallback 兜底授权（DEC-039 四语义齐全）+ F4 三处补无序族与 ILLUSTRATIVE 措辞 + 2 条负向 few-shot + 翻译路径常量补完整 SUSPECT 语义（不悬空引用 L0）+ T4 阈值 15000→16000。
+**验证**：cargo check/check --tests 双 0 errors；llm:: 127/2/0（两条红归 tester-1 断言锚旧字面）；UTF-8 U+FFFD=0；T4=15469<16000。
+**主控验收**：6 项全过，长度净增 +2198 接受。已提交。
+
+### 023（恢复并扩充四语枚举标记清单，Gavin 推翻 021 精简）
+**文件**：`src/llm/mod.rs`
+**改动**：恢复 `9eb80b7` 完整清单 132 标记短语 0 遗漏 + 四语扩充（中 `其次是/接下来/像是/好比` 等 / 英 `to start with/among them` 等 / 日 `はじめに/例を挙げると` 等 / 韩 `첫 번째로/가령` 等 / 结构性句式 4 新增）+ per-language contrast 恢复四语改用标记不同形态演示语义并列 + F3c 四语 unordered 改标记不同形态（修正韩语错别字 `쓰하는`→`쓰는`）+ T4 阈值 16000→40000 定位变更为探测异常暴涨。
+**验证**：cargo check/check --tests 双 0 errors；llm:: 127/2/0（两条红归 tester-1：①`!contains("for instance")` 反向断言与恢复冲突 ②`contains("比如说有些学生头发过长")` 旧字面，F3c 改为标记不同形态）；UTF-8 U+FFFD=0；T4=17672<40000。
+**移交说明**：tester-1 需改 2 条断言（删除 `for instance` 反向断言 + 换锚 `比如说` 为新字面）；兜底授权与保守默认双向原样保留。
+
 ## 2026-08-03 — tester-1 — TEST-SYNC-019 + TEST-EXEC + BUILD-010 ✅ 三段串行收口
 
 - **来源**：两提交 `790e316`（018，提示词分层契约重构）+ `9eb80b7`（017，货币/度量链数值静默改错修复）。基线 `9eb80b7`（ahead 38）
