@@ -1,5 +1,17 @@
 # handoffs · voice-ime
 
+## 2026-08-03 — tester-1 — TEST-SYNC-019 + TEST-EXEC + BUILD-010 ✅ 三段串行收口
+
+- **来源**：两提交 `790e316`（018，提示词分层契约重构）+ `9eb80b7`（017，货币/度量链数值静默改错修复）。基线 `9eb80b7`（ahead 38）
+- **P1 红条换锚**：`suggestions_instruction_always_appended` 第2条 assert 从已删除的 `This directive OVERRIDES...` 声明换锚为 `SUGGESTION_INSTRUCTION` 的 `(1) Return the CORRECTED form only`。设计变更致断言过时，非回归，生产代码零改动
+- **P2 017 复核**：coder-1 5 组测试（T1-T5）充分性确认——六条端测/死数据锁/虚指护栏/反向护栏全覆盖。016 班级简写 5 条在既有测试中已覆盖，未新增
+- **P3 018 复核**：守恒夹具 4 条非空壳（双向比对+白名单显式化）/ L0 置顶 / UNIT_SYMBOL_PROTECTION 假前提已修 / i18n 三处 §2/§4/§5/§7 已裁
+- **P4 B 批契约测试**：新增 T1（Topic 跨层唯一归属，同层重复允许）/ T2（矛盾对层号小的赢）/ T3（层序+层内插入序）/ T4（长度预算，实测 ~11500 字符，阈值 15000）。编译时修正 2 处：Topic derive Hash + PromptRule/Topic import
+- **阶段四 TEST-EXEC**：`cargo test --bin feiyin-ime` 749/0/6 ✅ | `itn::` 139/0/0 ✅（与 coder-1 自报一致）| `src-tauri` 53/0/0 ✅ | `--list` 755 自洽
+- **阶段五 BUILD-010**：三步全量构建 + Publish/ 同步。三 exe sha256 两副本一致；两 toml 三副本一致（itn-rules.toml 37,291B 含 017 改动）；ProductVersion 0.7.3.0/0.7.3；mtime 链通过；探针有效（新增串命中 ≥1，旧措辞命中 0）；冒烟 PID 728 零 panic
+- **边界**：`src/llm/mod.rs` +1 derive (Hash) / +2 import / +1 assert 换锚 / +4 测试；生产代码零改动；版本号未改；未用 git 破坏性命令；UTF-8 用 edit 工具
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/tester-1/result.md`（非空）+ `logs/20260803.md`
+
 ## 2026-08-02 — tester-1 — TEST-SYNC-016 ✅ 015 + 016 测试同步（阶段三，零命令执行）
 
 - **来源**：两提交 `ae452fb`（015，F3b/Output format 对称补 LONG 限定）+ `81cf51a`（016，年级班级简写守卫）。基线 `81cf51a`（ahead 35）

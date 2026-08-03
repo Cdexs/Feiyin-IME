@@ -1,7 +1,6 @@
 # 任务列表 · voice-ime
 
-> 🔴 **产物已过期**（2026-08-03 12:3x 主控用 mtime + commit 时间戳重新核实，**订正下方旧记录**）：`Publish/feiyin-ime.exe` 实际时间戳 **08-02 01:35**，晚于 `81cf51a`(016) 的 08-02 01:00 → **014/015/016 三批其实已经在包里**。真正缺的是 **017（未提交）+ 018（`790e316`，08-03 01:00）两批**。
-> ~~旧记录（已作废）：exe 时间戳 08-01 23:48，014/015 未进 exe~~ —— 该记录写于 08-02 00:4x，之后 01:35 又出过一次包但没回写文档，属**文档失准**，非事实。教训：出包后必须立即回写产物时间戳。
+> ✅ **产物已更新**（2026-08-03 13:06）：`Publish/feiyin-ime.exe` / `feiyin-ime-ui.exe` / `crash-reporter.exe` 已重建，包含 `9eb80b7`(017) + `790e316`(018) + TEST-SYNC-019（B 批 T1-T4 4 条测试）。三 exe 两副本 sha256 一致，两 toml 三副本一致（itn-rules.toml 37,291B），ProductVersion 0.7.3.0/0.7.3。
 > ⏳ **本地 ahead 37 未 push**（Gavin 只授权提交，不授权 push）。
 > 端测方式（2026-07-25 Gavin 指示）：Gavin 已在**实际日常使用中自行测试**，端测项不再列入本文档；发现 bug 或优化点由 Gavin 邀请重新开单。
 
@@ -52,21 +51,41 @@
 
 | 编号 | 内容 | 负责人 | 状态 |
 | --- | --- | --- | --- |
-| ITN-FIX-CURRENCY-017 | RC-A（`两`消歧）/ RC-B（余数链边界终止）修复 | coder-1 | 🔄 **代码已完成，收口中**（08-03 12:3x 主控核实：`cargo check --tests` 0 errors；实现 4 函数 + 5 组测试在工作区**未提交**；coder-1 自报 `itn::` 139/0、六条端测全绿、反向护栏 17 条全绿，**数字待阶段四 tester-1 独立复核**）。收口项：补 result.md（现 0 字节）+ 立即 commit |
+| ITN-FIX-CURRENCY-017 | RC-A（`两`消歧）/ RC-B（余数链边界终止）修复 | coder-1 | ✅ **已完成，未提交**（工作区 `src/itn.rs` + `itn-rules.toml`） |
 | PROMPT-ARCH-018 | A+C 合并：分层结构 + 元规则句 + L0 四条 + 基座裁剪（i18n **三处**）+ 删两处 OVERRIDE 补丁 | coder-2 | ✅ **已提交 `790e316`**（08-03 01:00），主控 5 项独立验收全过，详见 `logs/20260803.md` |
-| TEST-SYNC-019 | 017/018 断言同步 + **B 批契约测试**（T1 Topic 唯一归属 / T2 矛盾对 / T3 层序 / T4 长度预算） | tester-1 | ⏸ 阶段三，待 017 收口后派发（018 已具备条件） |
+| TEST-SYNC-019 | 017/018 断言同步 + **B 批契约测试**（T1 Topic 唯一归属 / T2 矛盾对 / T3 层序 / T4 长度预算） | tester-1 | ✅ **已完成**（红条换锚 + 017/018 复核 + T1-T4 新增 4 条） |
+| TEST-EXEC | 全量回归验证 | tester-1 | ✅ **749/0/6** + itn::139/0/0 + src-tauri 53/0/0 |
+| BUILD-010 | 出包（017+018 一次端测完） | tester-1 | ✅ **已完成**（2026-08-03 13:06，三 exe + 两 toml 三副本一致，ProductVersion 0.7.3.0/0.7.3） |
 
-#### TEST-SYNC-019 已知待办（持续累积，派发前勿删减）
+---
 
-| 项 | 说明 | 来源 |
+## 🔴 P1 新开 · PROMPT-ARCH-020 翻译路径假前提未修（018 只修了一半）
+
+> **来源**：主控 2026-08-03 BUILD-010 出包验收时用**反向探针**查出（`already contains normalized numbers` 在新 exe 里仍 =1，而 018 声称已修）。**非 Worker 自报，非测试发现** —— 749 条测试全绿也没抓到，因为没有任何断言覆盖翻译路径的这条常量。
+
+### 事实
+
+| 常量 | 位置 | 状态 |
 | --- | --- | --- |
-| `suggestions_instruction_always_appended`（`src/llm/mod.rs:3187`） | 断言锚定 `SUGGESTION_INSTRUCTION` 的 OVERRIDES 覆盖声明，而 018 任务书**明确要求删除该声明**（冲突源消失后失去存在理由）→ 设计变更致断言过时，需换锚 | tester-1 2026-08-03 定向核查发现 |
-| `prompt_arch_018_step1_gate_*` 4 条 | coder-2 WIP 自验测试，随 018 交付收敛，**非红条**，不处理 | 同上 |
-| 017 侧新增断言 | 虚指护栏（一两个人/三两个人/两三个人/三两天）；`units.weight` 死数据锁死（`一斤二两 == 1斤2两` 且 `!= 1.2斤`）；四条 RC-B（含 `一块两毛二一斤`） | 主控派发条件 |
-| 018 侧新增断言 | 文本守恒双向（无丢失/无夹带/白名单显式化）+ 重排清单 | 主控 checkpoint 替代方案 |
-| TEST-EXEC + BUILD-010 | 全量回归 → 出包（017+018 一次端测完） | tester-1 | ⏸ 阶段四 |
+| `UNIT_SYMBOL_PROTECTION`（主路径） | `src/llm/mod.rs:32` | ✅ 018 已修：改为 `may have been pre-processed by an automatic number-normalizer that is NOT infallible (see L0-3)`，并追加 `This rule NEVER justifies deleting a unit or measure phrase — see L0-1 and L0-3.` |
+| `UNIT_SYMBOL_PROTECTION_TRANSLATE`（**翻译路径**） | `src/llm/mod.rs:33` | ❌ **原样未动**：仍为 `The input text already contains normalized numbers and unit symbols`，且**缺 L0-1/L0-3 对齐句** |
 
-**边界评估已做**：017 动 `src/itn.rs`+`itn-rules.toml`；018 动 `src/llm/mod.rs`+`src/i18n.rs`。**文件级零重叠**。B 批测试落在 `src/llm/mod.rs` 测试块，与 018 生产代码同文件 → 依三阶段规则**必须等 018 完成后串行派发**，不与代码任务并行。
+### 为什么这是真缺陷（主控代码取证）
+
+`src/main.rs:2941` `let pre_llm_text = itn::normalize_numbers(&raw_text);` 位于翻译分支判定（`:2984` `translate_requested`）**之前**；`:3021` `optimize_and_translate(...)` 与 `:3038`/`:3049` 的 `try_nllb_translate(&pre_llm_text, ...)` 用的都是这份已 ITN 处理的文本。
+
+**结论**：翻译路径与主路径吃同一份 ITN 输出，假前提同样为假。**Gavin 若用翻译功能说「一块八一斤」，2026-08-02 那个「LLM 删掉『斤』输出 2.80元。」的静默改错会原样复现** —— 而且翻译路径连「本条款绝不授权删除单位/量词短语」这句兜底都没有。
+
+### 修复方案（派发时用）
+
+1. `UNIT_SYMBOL_PROTECTION_TRANSLATE` 开头同样改为「输入可能经过不可靠的自动数字规范化，见 L0-3」
+2. 末尾同样追加「本条款绝不授权删除单位或量词短语，见 L0-1/L0-3」
+3. **保留翻译路径特有的 `In the <corrected> line` 限定**（两常量的差异是刻意设计，见 `:28` 注释，不得抹平）
+4. 确认翻译路径是否也注入 L0 四条 —— 若未注入，则 `see L0-3` 是悬空引用，需一并处理（**这是本项真正的架构问题，优先查清**）
+
+### 测试缺口（一并补）
+
+现有断言只覆盖 `UNIT_SYMBOL_PROTECTION`（`:1918` 有 `assert!(!...contains("already contains normalized numbers"))`），**翻译路径常量无任何等价断言** —— 这正是它逃过 749 条测试的原因。补对称断言。
 
 ---
 

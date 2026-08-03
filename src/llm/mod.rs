@@ -30,7 +30,21 @@ const MAX_TOTAL_CHARS: usize = 24;
 //   ① 开头「The input text already contains normalized numbers」是假前提（ITN 会出错）→ 指向 L0-3；
 //   ② 末尾追加一句「本条款绝不授权删除单位/量词短语」，与 L0-1/L0-3 对齐。
 const UNIT_SYMBOL_PROTECTION: &str = "Number & Unit Symbol Preservation: The input may have been pre-processed by an automatic number-normalizer that is NOT infallible (see L0-3 SUSPECT INPUT). When the input does contain normalized numbers and unit symbols (e.g., 30°C, 50%, 3.5kg, 2026-07-27, 12:30), you MUST preserve these exactly as written — do NOT rewrite them back into Chinese word forms (e.g., do NOT turn 30°C into 30摄氏度), do NOT change the notation style, do NOT convert symbols to words or words to symbols, and do NOT recalculate, round, or re-express any numeric, time, or date value. You MUST NOT substitute one date/time expression for another (e.g., 4:45 MUST stay 4:45 — never 4:30 or 16:45; 明天 MUST stay 明天 — never 今天). This rule NEVER justifies deleting a unit or measure phrase — see L0-1 and L0-3.";
-const UNIT_SYMBOL_PROTECTION_TRANSLATE: &str = "\nNumber & Unit Symbol Preservation: The input text already contains normalized numbers and unit symbols (e.g., 30°C, 50%, 3.5kg, 2026-07-27, 12:30). In the <corrected> line, you MUST preserve these exactly as written — do NOT rewrite them back into Chinese word forms (e.g., do NOT turn 30°C into 30摄氏度), do NOT change the notation style, and do NOT recalculate, round, or re-express any numeric, time, or date value. You MUST NOT substitute one date/time expression for another (e.g., 4:45 MUST stay 4:45 — never 4:30 or 16:45; 明天 MUST stay 明天 — never 今天).";
+// PROMPT-ARCH-020: 翻译路径与主路径吃同一份 ITN 输出（src/main.rs:2941 normalize_numbers 在
+// translate_requested 判定之前），假前提同样为假 → 08-02「2.80元斤 → 删『斤』」静默改错会在翻译下复现。
+// 经查 optimize_and_translate(:631-699) 独立拼装 system_content，不走 build_prompt_layers/render，
+// **未注入 L0 四条**——故本常量不写 'see L0-3' 悬空引用，而是自带完整 SUSPECT 语义（与主路径 L0-3 同向）。
+// 主控裁定 2026-08-03：不注入 L0 不是范围问题而是语义必然——L0-1 要求语义单元原样出现，与翻译本质相悖。
+const UNIT_SYMBOL_PROTECTION_TRANSLATE: &str = "\nNumber & Unit Symbol Preservation: The input may have been pre-processed by \
+an automatic number-normalizer that is NOT infallible — if a number appears inconsistent with its context \
+(e.g., a price and a measure phrase that do not agree), do NOT delete the conflicting part, do NOT recompute \
+the number, and do NOT drop the measure phrase; preserve the inconsistency verbatim so the user can see and fix it. \
+In the <corrected> line, when the input does contain normalized numbers and unit symbols (e.g., 30°C, 50%, 3.5kg, \
+2026-07-27, 12:30), you MUST preserve these exactly as written — do NOT rewrite them back into Chinese word forms \
+(e.g., do NOT turn 30°C into 30摄氏度), do NOT change the notation style, and do NOT recalculate, round, or re-express \
+any numeric, time, or date value. You MUST NOT substitute one date/time expression for another (e.g., 4:45 MUST stay \
+4:45 — never 4:30 or 16:45; 明天 MUST stay 明天 — never 今天). This rule NEVER justifies deleting a unit or measure \
+phrase, even when the sentence reads awkwardly — preserve the unit so the user can see and fix it.";
 
 // PROMPT-ARCH-018 步骤 1: 原 build_optimize_request 内联的四段文本提升为模块级 const。
 // 文本逐字未改（byte-identical 检查点依赖本批纯搬家）。迁移自 :556/:564/:575/:589。
@@ -193,7 +207,7 @@ pub struct LlmClient {
 // ============================================================
 
 /// 提示词规则的语义主题。一个 Topic 只能归属一个 layer（T1 契约测试）。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 enum Topic {
     Fidelity,
     OutputTag,
@@ -1025,24 +1039,39 @@ fn f3_rules_text(multiline_safe: bool) -> String {
         supported input languages: Chinese, English, Japanese, Korean — select the marker set and \
         list form according to the PRIMARY language of the input text):\
         \nF3. Smart Lists: ONLY use a list when the speech EXPLICITLY contains enumeration OR \
-        exemplification markers (ordered: 第一/第二/第三, 第一点/第二点, 一是/二是/三是, 首先/其次/再次/最后, \
-        然后/接着, 一来/二来, 其一/其二, 再者, 最后一点, 另外一点, 第X条, first/second/third, \
-        firstly/secondly/lastly, step 1/2/3, point one/two, to begin with, next, finally, \
-        in addition, plus, and then, namely, 第一に/第二に/第三に, まず/次に/それから/最後に, \
-        一つ目/二つ目/三つ目, ①②③, 最初に, 続いて, それに, 加えて, ほかにも, \
-        첫째/둘째/셋째, 먼저/다음으로/마지막으로, 첫 번째/두 번째, 우선, 그다음, 또, 이어서, 끝으로, 아울러; \
-        unordered: 比如/比如说/例如/譬如/像, 有的…有的…, 有些…有些…, 有一些…还有一些…, 一些…一些…, \
-        还有/另外/此外/以及/包括/诸如/等等, 一方面…另一方面, 一类是…一类是, for example/for instance/such as/like/\
-        including/includes/also/another/additionally/moreover/besides/as well as/e.g./etc./some… some…/\
-        one… another…, たとえば/例えば, など/とか, また/さらに/そのほか, 〜や〜, ある人は…ある人は…, \
-        一つは…もう一つは…, 예를 들어/예컨대, 등, 그리고/또한/게다가, ~같은, 뿐만 아니라, \
-        어떤 사람은…어떤 사람은…).\
-        DECISION RULE: a marker appearing ONCE signals a mere example — keep the text as a \
-        continuous paragraph; the SAME marker appearing in 2 OR MORE parallel items signals an \
-        enumeration — you MUST use a list. Per-language contrast (1 example vs 2+ parallel items): \
-        Chinese \"比如...\" (1) vs \"比如说A，比如说B\" (2+); English \"for example...\" (1) vs \
-        \"for example A, for example B\" (2+); Japanese \"たとえば…\" (1) vs \"たとえばA、たとえばB\" (2+); \
-        Korean \"예를 들어…\" (1) vs \"예를 들어 A, 예를 들어 B\" (2+).\
+        exemplification markers (ILLUSTRATIVE, NOT EXHAUSTIVE — the lists below calibrate your \
+        recognition; apply the F3-semantic fallback below for markers outside these lists). \
+        Ordered examples: 第X/第X点/首先/其次/最后, first/second/finally, 第一に/まず/次に/最後に, \
+        첫째/둘째/마지막으로; \
+        unordered examples (single-word markers): 比如/例如/还有/另外/此外, for example/also/another, \
+        たとえば/また, 예를 들어/또/게다가; \
+        unordered structural patterns (paired/parallel sentence frames — NO single marker, easily \
+        missed, treat as enumeration when the parallel relation holds): \
+        有的…有的…/有些…有些…/有一些…还有一些…/一些…一些…/一方面…另一方面/一类是…一类是, some…some…/one…another…, \
+        〜や〜/ある人は…ある人は…/一つは…もう一つは…, 어떤 사람은…어떤 사람은…).\
+        DECISION RULE: the decisive test is SEMANTIC, not lexical. Do TWO OR MORE spans stand in a \
+        PARALLEL relation — each filling the same syntactic slot, each contributing one coordinate \
+        member to a set introduced by the surrounding context? If yes, it IS an enumeration and you \
+        MUST format it as a list. The markers need NOT be identical: speakers rarely repeat a \
+        marker verbatim — they vary it (e.g., 比如…再比如…还有就是… / for example… also… plus… / \
+        たとえば…また…さらに… / 예를 들어…또…게다가…). A single span introduced by an example marker \
+        remains a mere example: keep it as a continuous paragraph. Parallelism, not marker presence \
+        or marker repetition, decides.\
+        \nF3-semantic fallback (DEC-039, authority to reason beyond the lists above): \
+        The marker inventories above are ILLUSTRATIVE, NOT EXHAUSTIVE. Every language invents \
+        enumeration patterns no fixed list can cover, and speakers rarely repeat a marker verbatim \
+        — they vary it. You MUST therefore apply your own language understanding, not lexical \
+        matching alone. The decisive test is SEMANTIC, not lexical: do TWO OR MORE spans stand in \
+        a PARALLEL relation — each filling the same syntactic slot, each contributing one \
+        coordinate member to a set introduced by the surrounding context? If yes, it IS an \
+        enumeration and you MUST format it as a list, EVEN IF (a) the markers differ from one \
+        another, (b) the markers are absent from the lists above, or (c) no marker appears at all \
+        — parallelism alone suffices. Conversely, a single span introduced by an example marker \
+        remains a mere example: keep it as a continuous paragraph. Parallelism, not marker \
+        presence, decides.\
+        \nContrast (language-agnostic; markers vary across languages but the parallel-relation test is the same): \
+        Chinese \"建议从以下方面入手：比如英语学习要多读多背，再比如多听一些视频的节目，还有就是要多出去和别人交流\" → 3 parallel items, markers vary (比如/再比如/还有就是) → bullet list; vs \"今天雨下得很大，比如早上那阵就特别急\" → 1 example → paragraph. \
+        Apply the same parallel-relation test to any language: 2+ coordinate members → list; a single example → paragraph.\
         If unsure, DO NOT use a list — keep the text as a continuous paragraph. \
         Over-formatting normal speech into lists is a regression. \
         However, failing to list a genuine parallel enumeration (2+ distinct items) is ALSO a \
@@ -1074,9 +1103,11 @@ fn f3_rules_text(multiline_safe: bool) -> String {
         \n- Chinese unordered: \"有的xxx，有的yyy\" → \"- xxx\\n- yyy\"; \"比如说有些学生头发过长，比如说还有些学生奇装异服，还有些学生说脏话\" → \"- 有些学生头发过长\\n- 还有些学生奇装异服\\n- 还有些学生说脏话\".\
         \n- Chinese SHORT items inline (enumeration confirmed but NO list): \"今天出去买菜了，买了3斤土豆，一个西瓜，20斤大米，还有3斤香蕉\" → \"今天出去买菜了，买了3斤土豆、一个西瓜、20斤大米、还有3斤香蕉\".\
         \n- English unordered: \"For example, some students keep their hair too long; for example, some wear inappropriate clothes; also, some use bad language\" → \"- Some students keep their hair too long\\n- Some wear inappropriate clothes\\n- Some use bad language\".\
-        \n- Japanese unordered: \"たとえば、髪が長すぎる学生がいます。たとえば、奇抜な服装の学生もいます。また、悪い言葉を使う学生もいます\" → \"- 髪が長すぎる学生がいます\\n- 奇抜な服装の学生もいます\\n- 悪い言葉を使う学生もいます\".\
-        \n- Korean unordered: \"예를 들어, 머리가 너무 긴 학생들이 있습니다. 예를 들어, 특이한 복장을 한 학생들도 있습니다. 또, 나쁜 말을 쓰는 학생들도 있습니다\" → \"- 머리가 너무 긴 학생들이 있습니다\\n- 특이한 복장을 한 학생들도 있습니다\\n- 나쁜 말을 쓰는 학생들도 있습니다\".\
+        \n- Japanese unordered: \"たとえば、髪が長すぎる学生がいます。また、奇抜な服装の学生もいます。さらに、悪い言葉を使う学生もいます\" → \"- 髪が長すぎる学生がいます\\n- 奇抜な服装の学生もいます\\n- 悪い言葉を使う学生もいます\".\
+        \n- Korean unordered: \"예를 들어, 머리가 너무 긴 학생들이 있습니다. 또, 특이한 복장을 한 학생들도 있습니다. 게다가, 나쁜 말을 쓰는 학생들도 있습니다\" → \"- 머리가 너무 긴 학생들이 있습니다\\n- 특이한 복장을 한 학생들도 있습니다\\n- 나쁜 말을 쓰하는 학생들도 있습니다\".\
         \n- Negative (single marker = mere example, NO list): Chinese \"今天雨下得很大，比如早上那阵就特别急\" → keep as a continuous paragraph, NO list; English \"The rain was heavy today, for example this morning it was especially intense\" → NO list; Japanese \"今日は雨がひどくて、たとえば今朝は特に激しかった\" → NO list; Korean \"오늘 비가 많이 왔는데, 예를 들어 오늘 아침은 특히 심했어요\" → NO list; \"今天天气不错我们去公园吧\" → NO list.\
+        \n- Negative (discourse-marker \"比如\" as a verbal tic, NO parallelism, NO list): Chinese \"我觉得比如说这样不太好\" → keep as a continuous paragraph, NO list (only ONE span, no second parallel item).\
+        \n- Negative (single-item illustration, NO list): Chinese \"很多水果都不错，比如苹果\" → keep as a continuous paragraph, NO list (only ONE example, no enumeration).\
         \nF3d. Constraints: DO NOT compress or summarize content. DO NOT add information the user did not say. Preserve every factual point the speaker made; only restructure surface form.",
         INLINE_SEPARATOR_RULES,
     )
@@ -1088,20 +1119,14 @@ fn f3_rules_text(multiline_safe: bool) -> String {
         \nF3. Single-line Output: Output as a single continuous line. DO NOT use lists, line \
         breaks, or multi-line formatting. DO NOT output \"- \", \"• \", \"1. \", or \"2. \" on \
         separate lines, because those will be flattened into unreadable inline text. \
-        If the speech contains explicit ordered enumeration (ordered markers: 第一/第二/第三, \
-        第一点/第二点, 一是/二是/三是, 首先/其次/再次/最后, 然后/接着, 一来/二来, 其一/其二, 再者, 最后一点, \
-        另外一点, 第X条, first/second/third, firstly/secondly/lastly, step 1/2/3, point one/two, \
-        to begin with, next, finally, in addition, plus, and then, namely, 第一に/第二に/第三に, \
-        まず/次に/それから/最後に, 一つ目/二つ目/三つ目, ①②③, 最初に, 続いて, それに, 加えて, ほかにも, \
-        첫째/둘째/셋째, 먼저/다음으로/마지막으로, 첫 번째/두 번째, 우선, 그다음, 또, 이어서, 끝으로, 아울러, etc.), \
+        If the speech contains explicit ordered enumeration (ordered markers, ILLUSTRATIVE: \
+        第X/第X点/首先/其次/最后, first/second/finally, 第一に/まず/次に/最後に, 첫째/둘째/마지막으로, etc.), \
         keep the sequence markers inline and join items with appropriate separators. \
-        If the speech lists parallel items WITHOUT a clear order (unordered markers: 有的…有的…, \
-        有些…有些…, 有一些…还有一些…, 一些…一些…, 比如/比如说/例如/譬如/像, 还有/另外/此外/以及/包括/诸如/等等, \
-        一方面…另一方面, 一类是…一类是, for example/for instance/such as/like/including/includes/also/\
-        another/additionally/moreover/besides/as well as/e.g./etc./some… some…/one… another…, \
-        たとえば/例えば, など/とか, また/さらに/そのほか, 〜や〜, ある人は…ある人は…, 一つは…もう一つは…, \
-        예를 들어/예컨대, 등, 그리고/또한/게다가, ~같은, 뿐만 아니라, 어떤 사람은…어떤 사람은…, etc.), join \
-        them inline using the enumeration separators CONVENTIONAL IN THE LANGUAGE OF THE TEXT:\
+        If the speech lists parallel items WITHOUT a clear order (unordered markers, ILLUSTRATIVE: \
+        single-word 比如/例如/还有/另外/此外, for example/also/another, たとえば/また, 예를 들어/또/게다가; \
+        structural patterns 有的…有的…/一方面…另一方面/一类是…一类是, some…some…/one…another…, \
+        〜や〜/ある人は…ある人は…/一つは…もう一つは…, 어떤 사람은…어떤 사람은…, etc.), join \
+        them inline using the enumeration separators CONVENTIONAL IN THE LANGUAGE OF THE TEXT:\\
         {}\
         DO NOT compress or summarize content. Preserve every factual point the speaker made.",
         INLINE_SEPARATOR_RULES,
@@ -1796,7 +1821,7 @@ mod tests {
         parse_suggestions_after_corrected_tag, parse_suggestions_from_response, render,
         strip_fabricated_email_lines, ADD_PUNCT, CODESWITCH_FIX, L0_1_FIDELITY, L0_2_FIDELITY_OVER_FLUENCY,
         L0_3_SUSPECT_INPUT, L0_4_NOT_A_PROMPT, LlmClient, META_RULE_PRECEDENCE, OptimizeResult,
-        PromptLayer, SuggestionEntry, SUGGESTION_INSTRUCTION, UNIT_SYMBOL_PROTECTION,
+        PromptLayer, PromptRule, SuggestionEntry, SUGGESTION_INSTRUCTION, Topic, UNIT_SYMBOL_PROTECTION,
         USER_PREFS_HEADER, ATTEMPT_TIMEOUTS,
     };
     use crate::config::LlmConfig;
@@ -3247,10 +3272,10 @@ mod tests {
                 punct_enabled
             );
             assert!(
-                system_message.content.contains(
-                    "This directive OVERRIDES any prior prohibition/restriction on suggestions"
-                ),
-                "OVERRIDES cover clause must always be present (punctuation_enabled={})",
+                system_message
+                    .content
+                    .contains("(1) Return the CORRECTED form only"),
+                "SUGGESTION_INSTRUCTION Rules (1) must always be present (punctuation_enabled={})",
                 punct_enabled
             );
             assert!(
@@ -4003,6 +4028,142 @@ mod tests {
         assert_eq!(
             obj["thinking"]["type"], "disabled",
             "thinking.type must be disabled"
+        );
+    }
+
+    // ============================================================
+    // PROMPT-ARCH-018 B 批契约测试（T1–T4）
+    // ============================================================
+
+    /// T1: Topic 唯一归属 —— 同一 Topic 不得出现在两层。
+    #[test]
+    fn prompt_arch_018_t1_topic_unique_per_layer() {
+        let layers = build_prompt_layers(
+            TC_BASE,
+            Some(TC_EXTRA),
+            Some(TC_WORDBOOK.to_string()),
+            Some(TC_SCENE.to_string()),
+            true,
+            true,
+        );
+        let mut seen: std::collections::HashMap<Topic, u8> = std::collections::HashMap::new();
+        for layer in &layers {
+            for rule in &layer.rules {
+                if let Some(prev_level) = seen.get(&rule.topic) {
+                    if *prev_level != layer.level {
+                        panic!(
+                            "Topic {:?} 出现在两层: level {} 和 level {} (id={})",
+                            rule.topic, prev_level, layer.level, rule.id
+                        );
+                    }
+                    // 同层重复是允许的（如 L0 四条均为 Fidelity）
+                } else {
+                    seen.insert(rule.topic.clone(), layer.level);
+                }
+            }
+        }
+    }
+
+    /// T3: 层序 —— render() 输出严格按 level 升序，层内保持插入序。
+    #[test]
+    fn prompt_arch_018_t3_layer_order_ascending() {
+        let layers = build_prompt_layers(
+            TC_BASE,
+            Some(TC_EXTRA),
+            Some(TC_WORDBOOK.to_string()),
+            Some(TC_SCENE.to_string()),
+            true,
+            true,
+        );
+        let rendered = render(&layers);
+        let mut last_level: i8 = -1;
+        let mut last_pos = 0usize;
+        for layer in &layers {
+            assert!(
+                layer.level as i8 > last_level || layer.level == 0,
+                "层序应严格升序（或同一层内保持插入序）"
+            );
+            for rule in &layer.rules {
+                let pos = rendered
+                    .find(&rule.text)
+                    .unwrap_or_else(|| panic!("规则 {} 必须在渲染输出中存在", rule.id));
+                assert!(
+                    pos >= last_pos,
+                    "层内插入序：{} 的位置 {} 不能早于前一规则位置 {}",
+                    rule.id,
+                    pos,
+                    last_pos
+                );
+                last_pos = pos;
+            }
+            last_level = layer.level as i8;
+        }
+        // 顶部元规则断言
+        assert!(rendered.starts_with(META_RULE_PRECEDENCE));
+    }
+
+    /// T2: 矛盾对 —— 构造语义冲突规则，断言层号小的赢。
+    #[test]
+    fn prompt_arch_018_t2_smaller_level_wins() {
+        let mut layers = vec![
+            PromptLayer {
+                level: 0,
+                rules: vec![PromptRule {
+                    id: "l0_fidelity",
+                    topic: Topic::Fidelity,
+                    text: "L0: preserve original".to_string(),
+                }],
+            },
+            PromptLayer {
+                level: 1,
+                rules: vec![PromptRule {
+                    id: "l1_contract",
+                    topic: Topic::OutputTag,
+                    text: "L1: output format".to_string(),
+                }],
+            },
+            PromptLayer {
+                level: 2,
+                rules: vec![PromptRule {
+                    id: "l2_override",
+                    topic: Topic::Fidelity,
+                    text: "L2: rewrite freely".to_string(),
+                }],
+            },
+        ];
+        // 故意打乱插入序，验证 render 按 level 升序排列
+        layers.reverse();
+        let rendered = render(&layers);
+        let pos_l0 = rendered.find("L0: preserve original").unwrap();
+        let pos_l1 = rendered.find("L1: output format").unwrap();
+        let pos_l2 = rendered.find("L2: rewrite freely").unwrap();
+        assert!(pos_l0 < pos_l1 && pos_l1 < pos_l2, "层号小的必须在前面");
+    }
+
+    /// T4: 长度预算 —— 渲染结果长度在合理区间（排除空串或异常膨胀）。
+    #[test]
+    fn prompt_arch_018_t4_length_budget() {
+        let layers = build_prompt_layers(
+            TC_BASE,
+            Some(TC_EXTRA),
+            Some(TC_WORDBOOK.to_string()),
+            Some(TC_SCENE.to_string()),
+            true,
+            true,
+        );
+        let rendered = render(&layers);
+        let len = rendered.len();
+        println!("prompt_arch_018_t4_length_budget: rendered.len() = {}", len);
+        assert!(
+            len > 500,
+            "正常 prompt 长度应远大于 500 字符"
+        );
+        // 实测基线 ~13271（018 落地后），FORMAT-F3-SEMANTIC-021 + PROMPT-ARCH-020 后 ~14700，
+        // 阈值 16000 留约 1200 余量——撞阈值时必须逐段解释增长来源，不得无说明上调。
+        assert!(
+            len < 16000,
+            "prompt 不应异常膨胀超过 16000 字符（实测 {}）",
+            len
         );
     }
 

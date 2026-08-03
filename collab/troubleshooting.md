@@ -1250,6 +1250,18 @@ Gavin 用 `-debug` 实测 "派发"（Publish/debug.log 17:47）：
 - **两起案例均无上下文损失**，中断后续做成功；无需重启 Worker
 - **注意**：ACK_FAIL ≠ 僵死。coder-2 三次 ACK_FAIL 均为"收任务直接开工不回 ACK"的行为模式（进程活跃），先 capture-pane 判定再处置
 
+### 补充（2026-08-03，coder-1）：🔴 **Escape 唤醒法失效的顽固形态 + 静默吞消息**
+
+- **现象**：coder-1 完成 017 自验后进入冻结，spinner 计时器锁死在 `4m 17s` 不再走动，状态行 `54.3K (27%)` 恒定；两次间隔 15s 的 capture-pane md5 **完全一致**，判定冻结成立
+- **与已知形态的差别（关键）**：
+  1. **Escape 唤醒失效**——第一次 Escape 后 spinner 短暂消失（误以为已恢复），约 10s 后画面**原样回退**到 `4m 17s`；再试 `Escape ×2 + Enter` 完全无效
+  2. **消息被静默吞掉，且屏幕无任何痕迹**——期间主控发出 4 条消息（`/permissions Full Access` + dispatch 通知 + 2 条纠正），输入框既不显示文本也不显示 QUEUED，pane 内容零变化。**不像已记录形态那样"滞留输入队列显示 QUEUED"，而是完全无痕**
+  3. 底部同时显示两个模型名（`DeepSeek V4 Flash Free` 与 `glm-5.2 Ollama Cloud`），疑似模型切换/fallback 期间卡死，但**未确证**
+- **危害**：主控会以为消息已送达 Worker。本次是 Gavin 主动提醒「coder1 没收到你的协作消息」才发现——**`tmux send-keys` 返回成功 ≠ Worker 收到**，这一条已在 `feedback_collab_dispatch_timing` 记过，本次是更隐蔽的版本（连屏幕痕迹都没有）
+- **本次处置**：判定 coder-1 无待办任务（017 已由主控提交 `9eb80b7`）、不在关键路径上（tester-1 正常运行），故**不重启、不注入上下文**，留待需要时再处理。避免为一个闲置 Worker 打断正在跑的回归
+- **待验证的处置手段**（下次遇到可依次尝试）：`send-keys -t <pane> C-c` / `q` / 直接 `respawn-pane`；本次未试，因无收益
+- **主控侧强制纪律（本次新增）**：向 Worker 发送**任何**关键消息后，必须 `capture-pane` 确认屏幕有变化，才能认为送达；不得凭 `send-keys` 退出码判断
+
 ---
 
 ## [TOML-STALE-001] ⚠️ target/release 外置规则 toml 陈旧会静默覆盖新内置默认【必读】
