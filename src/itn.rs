@@ -919,12 +919,25 @@ fn try_parse_unit_chain(chars: &[char], start: usize, r: &CompiledRules) -> Opti
             }
         } else {
             // 无单位：检查隐含末级单位尾数
+            // ITN-FIX-CHAIN-TEAR-026：去掉 after_is_boundary 检查，数值合成与后继识别正交。
             if !parts.is_empty() && after_num <= chars.len() {
-                let after_is_boundary =
-                    after_num >= chars.len() || is_boundary_char(chars[after_num]);
-                if after_is_boundary && num_consumed <= 2 && family == Some("currency") {
-                    parts.push((num_str, "分".to_string()));
-                    pos = after_num;
+                // 隐式尾数单位取决于链内最后一个显式单位的层级：
+                //   块/元(≥1.0) → 隐式尾数=毛(0.1) → 五块一=5.1元
+                //   毛/角(=0.1) → 隐式尾数=分(0.01) → 三块四毛八=3.48元
+                //   分(=0.01)   → 已到最小单位，不再吸收隐式尾数
+                let (_, last_unit) = parts.last().unwrap();
+                if let Some(last_val) = r.hierarchy_value(last_unit, "currency") {
+                    let implicit_unit = if last_val >= 1.0 {
+                        "毛"
+                    } else if last_val == 0.1 {
+                        "分"
+                    } else {
+                        ""
+                    };
+                    if !implicit_unit.is_empty() && num_consumed <= 2 {
+                        parts.push((num_str, implicit_unit.to_string()));
+                        pos = after_num;
+                    }
                 }
             }
             break;
@@ -977,7 +990,11 @@ fn try_parse_unit_chain(chars: &[char], start: usize, r: &CompiledRules) -> Opti
         }
     }
 
-    if parts.len() >= 2 {
+    // ITN-FIX-CHAIN-TEAR-026：允许单段 currency 链（如「五块」=1段），否则逐字路径
+    // 会撕裂成「5块」+「8」（只转数字不转单位）。currency 族在 format_unit_chain
+    // 中会归一到「元」，所以单段「五块」→「5元」是合法且预期的行为。
+    // 约束：单段非主单位（角/毛/分）在 format_currency_chain 中保留原单位。
+    if parts.len() >= 2 || (parts.len() == 1 && family == Some("currency")) {
         Some(UnitChain {
             consumed: pos - start,
             parts,
@@ -1071,6 +1088,23 @@ fn format_unit_chain(chain: &UnitChain, r: &CompiledRules) -> String {
 }
 
 fn format_currency_chain(chain: &UnitChain, r: &CompiledRules) -> String {
+    // ITN-FIX-CHAIN-TEAR-026-B (Gavin 方案 C)：单段 currency 链一律保留原单位
+    //（五块→5块 / 八角→8角 / 五块一斤→5块一斤），不归一到元；多段链才归一到元
+    //（五块一→5.1元 / 一块八毛五→1.85元）。
+    //
+    // 判定依据是段数（parts.len()），不是有没有 per_unit。单段说明用户明确用了某个
+    // 货币单位（块/角/毛），系统不替他改写表达；多段才有合成数值的必要，此时归一到
+    // 元是计算结果而非改写。
+    if chain.parts.len() == 1 {
+        let (num_str, unit) = &chain.parts[0];
+        let body = format!("{}{}", num_str, unit);
+        // 单段链同样可带 per_unit（如「五块一斤」→ 单价限定词仍原样保留）
+        match &chain.per_unit {
+            Some(per) => format!("{}{}", body, per),
+            None => body,
+        }
+    } else {
+
     let mut total: f64 = 0.0;
     for (num_str, unit) in &chain.parts {
         let n: f64 = num_str.parse().unwrap_or(0.0);
@@ -1080,12 +1114,17 @@ fn format_currency_chain(chain: &UnitChain, r: &CompiledRules) -> String {
     let body = if total.fract() == 0.0 {
         format!("{}元", total as u64)
     } else {
-        format!("{:.2}元", total)
+        // ITN-FIX-CHAIN-TEAR-026 条件B：去尾随零，与乙型 format_implicit_decimal 行为一致。
+        // 5.80 → 5.8，1.00 → 1，5.01 → 5.01。
+        let s = format!("{:.2}", total);
+        let s = s.trim_end_matches('0').trim_end_matches('.');
+        format!("{}元", s)
     };
     // ITN-FIX-CURRENCY-017 条件3：追加单价限定词（原样汉字，如 1.22元一斤）
     match &chain.per_unit {
         Some(per) => format!("{}{}", body, per),
         None => body,
+    }
     }
 }
 
@@ -3532,8 +3571,9 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
         assert_eq!(normalize_test("这个西瓜是一块两毛二一斤"), "这个西瓜是1.22元一斤");
         assert_eq!(normalize_test("一块两毛二一斤"), "1.22元一斤");
         assert_eq!(normalize_test("这个水果是三块四毛八一斤"), "这个水果是3.48元一斤");
-        assert_eq!(normalize_test("这个西瓜是一块八毛一斤"), "这个西瓜是1.80元一斤");
-        assert_eq!(normalize_test("这个西瓜是一块八一斤"), "这个西瓜是1.80元一斤");
+        // ITN-FIX-CHAIN-TEAR-026 条件B：尾零去除（一块八毛一斤 → 1.8元一斤，不是 1.80）
+        assert_eq!(normalize_test("这个西瓜是一块八毛一斤"), "这个西瓜是1.8元一斤");
+        assert_eq!(normalize_test("这个西瓜是一块八一斤"), "这个西瓜是1.8元一斤");
         assert_eq!(normalize_test("这个重量是三斤六两五"), "这个重量是3斤6两5");
     }
 
@@ -3586,5 +3626,71 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
         assert_eq!(normalize_test("半斤八两"), "半斤八两");
         assert_eq!(normalize_test("四点半"), "4:30");
         assert_eq!(normalize_test("一个半小时"), "1.5小时");
+    }
+
+    // ============================================================
+    // ITN-FIX-CHAIN-TEAR-026 新增测试（2026-08-03）
+    // ============================================================
+
+    // T6 · 条件A 撕裂修复（未知后继 + 货币链独立收口）
+    #[test]
+    fn itn_v2_026_t6_chain_tear_fixed() {
+        // 未知后继不应撕裂：数值合成与后继识别正交
+        assert_eq!(normalize_test("五块一以斤"), "5.1元以斤");
+        assert_eq!(normalize_test("五块一已经"), "5.1元已经");
+        // 已知后继（单价限定词）保持捕获
+        assert_eq!(normalize_test("五块一一斤"), "5.1元一斤");
+        // ITN-FIX-CHAIN-TEAR-026-B (Gavin 方案 C)：单段链一律保留原单位，与 per_unit 无关。
+        // 五块一斤 = 1 段（"五块"）+ per_unit "一斤" → 单段保留原单位 → 5块一斤
+        assert_eq!(normalize_test("五块一斤"), "5块一斤");
+        // 完整链 + 单价限定词
+        assert_eq!(normalize_test("五块一毛二一斤"), "5.12元一斤");
+        assert_eq!(normalize_test("一块两毛二"), "1.22元");
+        assert_eq!(normalize_test("一块两毛二一斤"), "1.22元一斤");
+    }
+
+    // T7 · 条件B 尾零去除（format_currency_chain 与 format_implicit_decimal 行为一致）
+    #[test]
+    fn itn_v2_026_t7_trailing_zero_removed() {
+        assert_eq!(normalize_test("五块一"), "5.1元");     // 原 5.10元 → 修复
+        // 单段链保持原单位（不归一到元）
+        assert_eq!(normalize_test("五块"), "5块");        // 保持不变
+        assert_eq!(normalize_test("八角"), "8角");          // 保持原单位
+        assert_eq!(normalize_test("二十五块"), "25块");    // 保持原单位
+        assert_eq!(normalize_test("一块两毛二"), "1.22元"); // 保持不变（两位有效）
+        assert_eq!(normalize_test("五块一毛二"), "5.12元"); // 保持不变
+        assert_eq!(normalize_test("一块八"), "1.8元");     // 原 1.80元 → 修复
+        assert_eq!(normalize_test("一块八一斤"), "1.8元一斤");
+    }
+
+    // T8 · 交叉（条件A+B 叠加 + 017 单价限定词）
+    #[test]
+    fn itn_v2_026_t8_combined() {
+        assert_eq!(normalize_test("三块四毛八一斤"), "3.48元一斤");
+    }
+
+    // T9 · ITN-FIX-CHAIN-TEAR-026-B (Gavin 方案 C) 核心差异锁死：
+    // 段数决定是否归一，与 per_unit 无关。
+    //   五块一斤 = 1 段（"五块"）+ per_unit "一斤" → 单段保留原单位 → 5块一斤
+    //   五块一   = 2 段（"五块" + 隐式"一毛"）    → 多段归一到元 → 5.1元
+    //   五块     = 1 段（"五块"）无 per_unit       → 单段保留原单位 → 5块
+    #[test]
+    fn itn_v2_026_t9_scheme_c_segment_count_rule() {
+        assert_eq!(normalize_test("五块一斤"), "5块一斤");
+        assert_eq!(normalize_test("五块一"), "5.1元");
+        assert_eq!(normalize_test("五块"), "5块");
+    }
+
+    // T10 · DEC-038 保护词护栏（026 放开单段 currency 链后的主要风险面）
+    // 本断言锁定的是 DEC-038 随机覆盖下的现状行为，不代表期望行为，P6 批次会整体重构。
+    #[test]
+    fn itn_v2_026_t10_dec038_protected_word_guards() {
+        // 以下词条行为由 itn-rules.toml 保护词表随机覆盖决定，026-B 不应改变它们
+        assert_eq!(normalize_test("五毛钱"), "五毛钱");
+        assert_eq!(normalize_test("三毛钱"), "三毛钱");
+        assert_eq!(normalize_test("一块钱"), "一块钱");
+        assert_eq!(normalize_test("三块钱"), "三块钱");
+        assert_eq!(normalize_test("三元钱"), "三元钱");
+        assert_eq!(normalize_test("五块钱"), "五块钱");
     }
 }
