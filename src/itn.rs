@@ -555,6 +555,21 @@ fn is_cn_unit_char(ch: char) -> bool {
     UNIT_MAP.iter().any(|(cn, _)| s == *cn)
 }
 
+/// ITN-FIX-CURRENCY-017：判定当前位置的「两」是否应视为重量单位而非数字2。
+/// 前置条件：前有数字/进位字符（idx > start，即两 不是数字首位）。
+/// 后接单位词（斤/块/毛/克/两 等 all_units）→ 两 是数字2（两块/三块两毛五）；
+/// 后接非单位（数字/名词/边界）→ 两 是重量单位（二两/六两五/二十五两/三两银子）。
+/// 进位单位（百/千/万）由进位组合路径自行继续，此处不误判（一亿两 → 两 单位）。
+fn two_is_unit(chars: &[char], idx: usize, start: usize, r: &CompiledRules) -> bool {
+    if chars[idx] != '两' || idx <= start {
+        return false;
+    }
+    if r.match_unit_word(chars, idx + 1).is_some() {
+        return false;
+    }
+    true
+}
+
 /// ITN-V2-001 (R2 缺陷A ①右邻否决)：判定词是否全由中文数字字符组成（含进位单位）。
 /// 用于识别「十一」「五一」「八一」这类纯数字保护词，以便撤销保护时区分。
 /// 例：「十一」=true、「三亚」=false、「五角大楼」=false。
@@ -580,6 +595,14 @@ fn parse_cn_number(
     let mut serial_len = 0usize;
     for k in start..chars.len() {
         if chinese_digit_char(chars[k]).is_some() {
+            // ITN-FIX-CURRENCY-017：两 兼重量单位 → 以单位词开头时终止逐位串扫描。
+            // 二两/二十五两 的「两」不再被吞进逐位串（否则 → 22/222）。`两斤` 首位不受影响
+            // （两 是数字2，交给进位组合路径）。当前词表仅「两」命中单位前缀，故等价于判两。
+            if let Some(r) = rules {
+                if r.match_unit_word(chars, k).is_some() {
+                    break;
+                }
+            }
             serial_len += 1;
         } else {
             break;
@@ -642,6 +665,13 @@ fn parse_cn_number(
     while idx < chars.len() {
         let ch = chars[idx];
         if let Some(d) = chinese_digit_char(ch) {
+            // ITN-FIX-CURRENCY-017：两 在「前有数字 + 后接非单位」时是重量单位 → 终止数字。
+            // 二十五两 → 25、六两五 → 6（两 不吞）；两斤/两百/三块两毛五 → 首位或后接单位 → 按数字2。
+            if let Some(r) = rules {
+                if ch == '两' && two_is_unit(chars, idx, start, r) {
+                    break;
+                }
+            }
             digit = d.to_digit(10).unwrap() as u64;
             has_digit = true;
             idx += 1;
@@ -853,6 +883,9 @@ struct UnitChain {
     parts: Vec<(String, String)>,
     consumed: usize,
     family: &'static str,
+    /// ITN-FIX-CURRENCY-017：货币链后的单价限定词（如「一斤」），原样汉字保留。
+    /// 仅 currency 族链在终止点后紧跟 weight 族单位时设置（`三块四毛八一斤`→`3.48元一斤`）。
+    per_unit: Option<String>,
 }
 
 /// 丙型识别器：扫描连续「中文数字+可小数化单位」多级链。
@@ -909,8 +942,31 @@ fn try_parse_unit_chain(chars: &[char], start: usize, r: &CompiledRules) -> Opti
         if unit_word == "分" && parts.is_empty() {
             break;
         }
-        if family.is_none() {
-            family = Some(resolve_family(&unit_word, r));
+        // ITN-FIX-CURRENCY-017 条件3：族一致性校验。多族单位（如「分」∈currency+time）
+        // 优先消歧为当前链族，避免 time 链（两点五分）被「分」解析成 currency 误判不一致。
+        let unit_fam = resolve_family_consistent(&unit_word, family.unwrap_or(""), r);
+        if let Some(cur) = family {
+            if unit_fam != cur {
+                // 族不一致 → 终止链。currency 链终止点后紧跟 weight 族单位 →
+                // 捕获单价限定词（如「一斤」），原样汉字保留在 per_unit。
+                if cur == "currency" && unit_fam == "weight" {
+                    if let Some(chain) = capture_price_per_unit(
+                        chars,
+                        start,
+                        after_num,
+                        unit_len,
+                        &num_str,
+                        num_consumed,
+                        &mut parts,
+                        r,
+                    ) {
+                        return Some(chain);
+                    }
+                }
+                break;
+            }
+        } else {
+            family = Some(unit_fam);
         }
         parts.push((num_str, unit_word.clone()));
         pos = after_num + unit_len;
@@ -926,6 +982,7 @@ fn try_parse_unit_chain(chars: &[char], start: usize, r: &CompiledRules) -> Opti
             consumed: pos - start,
             parts,
             family: family.unwrap_or("length"),
+            per_unit: None,
         })
     } else {
         None
@@ -943,11 +1000,72 @@ fn resolve_family(unit: &str, r: &CompiledRules) -> &'static str {
     families[0]
 }
 
+/// ITN-FIX-CURRENCY-017 条件3：多族单位（如「分」∈currency+time）优先消歧为当前链族，
+/// 避免 time 链（两点五分）被「分」解析成 currency 而误判族不一致导致链被截断。
+fn resolve_family_consistent(unit: &str, cur: &str, r: &CompiledRules) -> &'static str {
+    let fams = r.unit_families(unit);
+    if let Some(f) = fams.iter().copied().find(|f| *f == cur) {
+        f
+    } else if fams.is_empty() {
+        resolve_family(unit, r)
+    } else {
+        fams[0]
+    }
+}
+
+/// ITN-FIX-CURRENCY-017 条件3：捕获 currency 链终止点后的单价限定词（weight 族单位，如「一斤」），
+/// 返回带 per_unit 的完整链，供 try_parse_unit_chain 直接 return。
+///
+/// 拆分规则：紧邻 weight 单位的最后一个汉字数字归 per_unit 数量（原样汉字保留），
+/// 其前数字作为货币链隐式尾位（`一块两毛二一斤` → [1块,2毛] + 隐式 二=2分 + per_unit 一斤）。
+fn capture_price_per_unit(
+    chars: &[char],
+    start: usize,
+    after_num: usize,
+    unit_len: usize,
+    num_str: &str,
+    num_consumed: usize,
+    parts: &mut Vec<(String, String)>,
+    r: &CompiledRules,
+) -> Option<UnitChain> {
+    if num_consumed == 0 || parts.is_empty() || !num_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // 隐式尾位单位：链内最后一个显式货币单位的下一位（块/元 → 毛，毛/角 → 分）
+    let tail_unit = {
+        let (_, last_unit) = parts.last()?;
+        let last_val = r.hierarchy_value(last_unit, "currency")?;
+        if last_val >= 1.0 {
+            "毛"
+        } else if last_val == 0.1 {
+            "分"
+        } else {
+            return None;
+        }
+    };
+    // 隐式尾位数字 = parse 数字串去掉最后一位（逐位串下 num_str 即源数字序列）
+    if num_consumed >= 2 {
+        let tail_digits = &num_str[..num_str.len() - 1];
+        parts.push((tail_digits.to_string(), tail_unit.to_string()));
+    }
+    // per_unit = 紧邻单位的最后一个源字符 + 单位词，原样汉字保留
+    let per_unit_str: String = chars[after_num - 1..after_num + unit_len].iter().collect();
+    let consumed = after_num + unit_len - start;
+    Some(UnitChain {
+        consumed,
+        parts: std::mem::take(parts),
+        family: "currency",
+        per_unit: Some(per_unit_str),
+    })
+}
+
 /// 丙型 formatter：按族分派（DEC-037）。
 fn format_unit_chain(chain: &UnitChain, r: &CompiledRules) -> String {
     match chain.family {
         "currency" => format_currency_chain(chain, r),
         "time" => format_time_chain(chain, r),
+        // ITN-FIX-CURRENCY-017 条件2：weight 族不走通用小数合成，走零乘法拼接
+        "weight" => format_weight_chain(chain),
         _ => format_generic_chain(chain, r),
     }
 }
@@ -959,11 +1077,29 @@ fn format_currency_chain(chain: &UnitChain, r: &CompiledRules) -> String {
         let mult = r.hierarchy_value(unit, "currency").unwrap_or(1.0);
         total += n * mult;
     }
-    if total.fract() == 0.0 {
+    let body = if total.fract() == 0.0 {
         format!("{}元", total as u64)
     } else {
         format!("{:.2}元", total)
+    };
+    // ITN-FIX-CURRENCY-017 条件3：追加单价限定词（原样汉字，如 1.22元一斤）
+    match &chain.per_unit {
+        Some(per) => format!("{}{}", body, per),
+        None => body,
     }
+}
+
+/// ITN-FIX-CURRENCY-017 条件2 (候选甲，主控 2026-08-03 拍板)：weight 族链逐 parts 零乘法拼接。
+/// 一斤二两 → 1斤2两（不合成 1.2斤）。末位裸数字（三斤六两五 的 5）不进入本链，由逐字路径自然补出。
+/// ⚠️ unit_hierarchy.weight 中 斤/两 的 value 不参与本函数计算（死数据锁死）—— 若未来接回通用
+/// 小数 formatter，必须先同步更新本函数，否则 一斤二两 会静默变 1.2斤（见 itn-rules.toml 注释）。
+fn format_weight_chain(chain: &UnitChain) -> String {
+    let mut out = String::new();
+    for (num_str, unit) in &chain.parts {
+        out.push_str(num_str);
+        out.push_str(unit);
+    }
+    out
 }
 
 fn format_time_chain(chain: &UnitChain, r: &CompiledRules) -> String {
@@ -1041,6 +1177,12 @@ fn try_parse_implicit_decimal(
     let mut pos = after_unit;
     while pos < chars.len() {
         if let Some(d) = chinese_digit_char(chars[pos]) {
+            // ITN-FIX-CURRENCY-017：尾数遇到单位词开头 → 终止。`一斤二两` 的「两」是重量
+            // 单位而非小数位（两=2 兼数字，会被 chinese_digit_char 吞进尾数 → 1.22斤）。
+            // `三块两毛` 的「两」同理：乙型让位，由丙型按显式链 [3块,2毛] 处理。
+            if r.match_unit_word(chars, pos).is_some() {
+                break;
+            }
             tail_chars.push(d);
             pos += 1;
         } else {
@@ -1841,6 +1983,11 @@ fn decide_conversion(
     after_str: &str,
     r: &CompiledRules,
 ) -> bool {
+    // ITN-FIX-CURRENCY-017 条件1：虚指数量短语（一两个/三两天/三两句话/三两个人）整体保汉字。
+    // 置于最前：即使「两」已注册为重量单位（下方 is_real_unit 会命中），虚指语境也不转。
+    if is_virtual_two_phrase(chars, start) {
+        return false;
+    }
     // 如果后面有真单位（排除 classifiers）→ 转
     // ITN-V2-006 (红2修复)：从 is_unit 改为 is_real_unit，使双隶属词（间/条/次/名/台/辆/句/篇）
     // 在逐字路径与甲型路径行为一致。`五间半`→`间`在 all_units+classifier_set →
@@ -1883,6 +2030,16 @@ fn decide_conversion(
             let _ = cls;
             return false; // 保留"三个人"
         }
+        // ITN-FIX-CURRENCY-017 条件1 后续数字护栏：`两三天` 的「三」在虚指短语内 → 不转。
+        // 无此护栏时，unit_preceded 会因「两」已注册为重量单位而把「三」误转成 3（两3天）。
+        // 仅命中 两+[一二三]+量词 结构，`六两五` 的「五」（∉一二三）不受影响，仍由逐字转 5。
+        if start > 0 && chars[start - 1] == '两' && matches!(chars[start], '一' | '二' | '三') {
+            let after_d: String = chars[start + 1..].iter().collect();
+            const QUANT2: &[&str] = &["个", "只", "天", "句", "次", "回"];
+            if QUANT2.iter().any(|q| after_d.starts_with(q)) {
+                return false;
+            }
+        }
         // 检查前面是否是单位（货币/量纲后小数模式："五块八" → "5块8"）
         if start > 0 {
             let before_text: String = chars[..start].iter().collect();
@@ -1894,6 +2051,35 @@ fn decide_conversion(
         return false;
     }
 
+    false
+}
+
+/// ITN-FIX-CURRENCY-017 条件1 虚指护栏：近似数量短语整体保汉字。
+/// 覆盖主控指定族：一两个人、两三个人、三两个人、一两个、两三天、三两天、三两句话。
+/// 两种模式：
+/// - A: `[一二三] 两 <量词>`（三两个人/三两天/三两句话/一两个）
+/// - B: `两 [一二三] <量词>`（两三个人/两三天）
+/// 量词集合与条件一致（个/只/天/句/次/回 等）。注意：`三两酒`（三+两+酒）不在集合内 →
+/// 「酒」非量词 → 仍按重量转 3两酒，虚指护栏不误伤真实度量。
+fn is_virtual_two_phrase(chars: &[char], start: usize) -> bool {
+    if start + 2 > chars.len() {
+        return false;
+    }
+    const QUANT: &[&str] = &["个", "只", "天", "句", "次", "回"];
+    // 模式A: [一二三] 两 <量词>
+    if matches!(chars[start], '一' | '二' | '三') && chars.get(start + 1) == Some(&'两') {
+        let after_two: String = chars[start + 2..].iter().collect();
+        if QUANT.iter().any(|q| after_two.starts_with(q)) {
+            return true;
+        }
+    }
+    // 模式B: 两 [一二三] <量词>（量词紧跟数字后，如 两三个人/两三天）
+    if chars[start] == '两' && matches!(chars.get(start + 1), Some('一' | '二' | '三')) {
+        let after_q: String = chars[start + 2..].iter().collect();
+        if QUANT.iter().any(|q| after_q.starts_with(q)) {
+            return true;
+        }
+    }
     false
 }
 
@@ -3327,5 +3513,78 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
         assert_eq!(normalize_with(old_rules, "五一广场"), "五一广场");
         // 反向对照：≥3 位逐位串在缺段时仍正常合并
         assert_eq!(normalize_with(old_rules, "三零二房间"), "302房间");
+    }
+
+    // ============================================================
+    // ITN-FIX-CURRENCY-017 (P0) 货币/度量链数值算错（Gavin 6 条端测）
+    // 根因：
+    //   RC-A `一斤二两`→1.22斤 / `三斤六两五`→3.625斤 —— 乙型尾数扫描把「两」（兼数字2）
+    //   吞进小数尾；丙型 weight 链又走通用小数合成。
+    //   RC-B `一块两毛二一斤`→22.20元 —— 丙型不查族一致性，把 weight 单位拼进 currency 链。
+    // 方案（主控 2026-08-03 拍板候选甲 + 三条件）：两 消歧为重量单位、丙型族一致性终止 +
+    // per_unit 捕获、weight 链零乘法拼接、虚指短语护栏。
+    // ============================================================
+
+    // T1 · 六条端测逐条修复（Gavin 原句）
+    #[test]
+    fn itn_v2_017_t1_six_bugs_fixed() {
+        assert_eq!(normalize_test("一斤二两"), "1斤2两");
+        assert_eq!(normalize_test("这个西瓜是一块两毛二一斤"), "这个西瓜是1.22元一斤");
+        assert_eq!(normalize_test("一块两毛二一斤"), "1.22元一斤");
+        assert_eq!(normalize_test("这个水果是三块四毛八一斤"), "这个水果是3.48元一斤");
+        assert_eq!(normalize_test("这个西瓜是一块八毛一斤"), "这个西瓜是1.80元一斤");
+        assert_eq!(normalize_test("这个西瓜是一块八一斤"), "这个西瓜是1.80元一斤");
+        assert_eq!(normalize_test("这个重量是三斤六两五"), "这个重量是3斤6两5");
+    }
+
+    // T2 · 条件2 锁死断言：斤/两 的 hierarchy value 不参与计算（死数据）。
+    // 一斤二两 必须等于 1斤2两，且显式断言 != 1.2斤（通用小数 formatter 误接会静默变 1.2斤）。
+    #[test]
+    fn itn_v2_017_t2_weight_lock_dead_data() {
+        assert_eq!(normalize_test("一斤二两"), "1斤2两");
+        assert_ne!(normalize_test("一斤二两"), "1.2斤");
+        assert_ne!(normalize_test("一斤二两"), "1.22斤");
+        assert_eq!(normalize_test("三斤六两五"), "3斤6两5");
+        assert_ne!(normalize_test("三斤六两五"), "3.625斤");
+    }
+
+    // T3 · 两 消歧为重量单位：裸 N两 / 重量语境正常转
+    #[test]
+    fn itn_v2_017_t3_liang_as_weight_unit() {
+        assert_eq!(normalize_test("二两"), "2两");
+        assert_eq!(normalize_test("三两"), "3两");
+        assert_eq!(normalize_test("五两"), "5两");
+        assert_eq!(normalize_test("二十五两"), "25两");
+        assert_eq!(normalize_test("三两银子"), "3两银子");
+        assert_eq!(normalize_test("一斤二两半"), "1斤2两半");
+    }
+
+    // T4 · 条件1 虚指护栏：近似数量短语整体保汉字（一两个人/两三个人/三两天/三两句话…）
+    #[test]
+    fn itn_v2_017_t4_virtual_two_phrase_guards() {
+        assert_eq!(normalize_test("一两个人"), "一两个人");
+        assert_eq!(normalize_test("两三个人"), "两三个人");
+        assert_eq!(normalize_test("三两个人"), "三两个人");
+        assert_eq!(normalize_test("一两个"), "一两个");
+        assert_eq!(normalize_test("两三天"), "两三天");
+        assert_eq!(normalize_test("三两天"), "三两天");
+        assert_eq!(normalize_test("三两句话"), "三两句话");
+        // 反向护栏：量词集合外（酒）不误伤 → 仍按重量转
+        assert_eq!(normalize_test("三两酒"), "3两酒");
+    }
+
+    // T5 · 既有行为必须保持不变（反向护栏）
+    #[test]
+    fn itn_v2_017_t5_reverse_guards() {
+        assert_eq!(normalize_test("两个人"), "两个人");
+        assert_eq!(normalize_test("两本书"), "两本书");
+        assert_eq!(normalize_test("两块二"), "2.2元");
+        assert_eq!(normalize_test("五块八"), "5.8元");
+        assert_eq!(normalize_test("一块八毛五"), "1.85元");
+        assert_eq!(normalize_test("十一块九毛二"), "11.92元");
+        assert_eq!(normalize_test("一米二"), "1.2米");
+        assert_eq!(normalize_test("半斤八两"), "半斤八两");
+        assert_eq!(normalize_test("四点半"), "4:30");
+        assert_eq!(normalize_test("一个半小时"), "1.5小时");
     }
 }
