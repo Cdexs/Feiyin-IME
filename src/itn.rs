@@ -962,31 +962,52 @@ fn parse_cn_number(
     Some((result.to_string(), idx - start))
 }
 
-/// ITN-FIX-BIGNUM-027-E (DEC-042 补完)：数量级锚定格式化。
+/// ITN-FIX-BIGNUM-027-E (DEC-042 补完) / ITN-FIX-BIGNUM-027-G-1 (DEC-042 补充二)：
+/// 数量级锚定格式化。
 ///
-/// 将纯数值按 DEC-042 规则格式化为带万/亿后缀的字符串：
-/// - 锚定单位是亿 → 输出 "{整数}.{小数}亿"（去尾零，无小数则 "{整数}亿"）
+/// 将纯数值按 DEC-042 规则格式化为带万/亿/万亿后缀的字符串：
+/// - 锚定单位是亿 → 先判升万亿（DEC-042 补充二），再算亿层表达：
+///   - 亿层 ≥1 万亿 且 升万亿后小数位 ≤1 → 升到万亿（如 1000000000000 → "1万亿"）
+///   - 否则保持亿层（如 300000000 → "3亿"）
 /// - 锚定单位是万 → 先算万层表达，再判升亿：
 ///   - 万层 ≥1 亿 且 升亿后小数位 ≤1 → 升到亿（如 350000000 → "3.5亿"）
 ///   - 否则保持万层（如 30000000 → "3000万"）
 ///
-/// DEC-042 四条规则：
-/// 1. 判定语言中明确提到的最小单位（由调用方通过 unit_char 传入，即最后一个结算的大单位）
-/// 2. 量级分界在万：万/亿 → 带后缀；千/百/十/个 → 普通数字（后者不走本函数）
-/// 3. 升亿阈值：万层 ≥1 亿 且 升亿后小数位 ≤1 → 升亿
+/// 三级升级链（逐级升，阈值判据一致：升级后小数位 ≤1）：
+/// 1. 万 → 亿：万层 ≥1 亿 且 升亿后小数 ≤1 位
+/// 2. 亿 → 万亿：亿层 ≥1 万亿 且 升万亿后小数 ≤1 位（DEC-042 补充二，027-G-1）
+///
+/// DEC-042 四条规则 + 补充二：
+/// 1. 判定语言中明确提到的最小单位（由调用方通过 unit_char 传入）
+/// 2. 量级分界在万：万/亿/万亿 → 带后缀；千/百/十/个 → 普通数字
+/// 3. 升级阈值：下层 ≥ 上层 且 升级后小数位 ≤1 → 升级
 /// 4. 比最小单位更小的成分用小数位表示
 fn format_dec042_magnitude(result: u64, unit_char: char) -> String {
-    const YI: u64 = 100_000_000;
-    const WAN: u64 = 10_000;
+    const WAN_YI: u64 = 1_000_000_000_000; // 1e12
+    const YI: u64 = 100_000_000; // 1e8
+    const WAN: u64 = 10_000; // 1e4
 
     if unit_char == '亿' {
-        // 本就在亿层，直接格式化
+        // DEC-042 补充二（027-G-1）：判升万亿
+        if result >= WAN_YI {
+            let wanyi_int = result / WAN_YI;
+            let wanyi_rem = result % WAN_YI;
+            if wanyi_rem == 0 {
+                return format!("{}万亿", wanyi_int);
+            }
+            let dec_str = format!("{:012}", wanyi_rem);
+            let trimmed = dec_str.trim_end_matches('0');
+            if trimmed.len() <= 1 {
+                return format!("{}.{}万亿", wanyi_int, trimmed);
+            }
+            // 小数位 >1 → 不升万亿，保持亿层
+        }
+        // 亿层格式化
         let yi_int = result / YI;
         let yi_rem = result % YI;
         if yi_rem == 0 {
             return format!("{}亿", yi_int);
         }
-        // 小数部分：补齐 8 位去尾零
         let dec_str = format!("{:08}", yi_rem);
         let trimmed = dec_str.trim_end_matches('0');
         format!("{}.{}亿", yi_int, trimmed)

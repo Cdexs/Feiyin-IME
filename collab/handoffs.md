@@ -1,3 +1,12 @@
+## 2026-08-04 — coder-1 — ITN-FIX-BIGNUM-027-G 万亿层(DEC-042补充二)+专名白名单(DEC-044)
+
+- **来源**：Gavin端测。基线ade02e1
+- **G-1**：format_dec042_magnitude加升万亿(≥1e12且≤1位小数)。一万亿→1万亿。G-2：itn-rules.toml proper_nouns+十万个为什么。前缀遮蔽自查无误伤
+- **验证**：基线itn:: 212/0/0 → 207/5(5条一万亿预期内绿转红,mod tests归tester-1)；cargo check + --tests双0；UTF-8两文件OK；DEC-043九条全绿
+- **边界**：src/itn.rs+itn-rules.toml；mod tests零改动；is_unit/format_currency_chain/format_weight_chain本体零改动；未构建/出包；未改版本号；UTF-8用edit工具
+- **下游**：tester-1需更新5条一万亿断言；itn-rules.toml三副本同步；MACOS-HANDOFF 2.9.4已更新
+- **详情**：result.md（7111 B 非空）+ logs/20260804.md
+
 ## 2026-08-04 — tester-1 — TEST-EXEC-027 + BUILD-014 S1-S5补测落地→全量回归→027全批首次出包
 
 - **来源**：TEST-SYNC-027 补测清单落地 + 阶段四执行 + 阶段五出包。基线 HEAD `d115965`（027-F）。三段串行
