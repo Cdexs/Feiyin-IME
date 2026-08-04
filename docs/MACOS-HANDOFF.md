@@ -45,6 +45,8 @@
 
 > 本批次已通过编译器验证：主控后台 `cargo check` 0 errors（4m43s），显式清单无遗漏（依据 `collab/handoffs.md` 2026-07-29 MACOS-COMPAT-001-CORE 条目）。
 
+> 🍎 **【macOS 侧追加·2026-08-04】符号数已从 15 增至 17**，新增 `foreground_window_id`、`capture_scene_signals_by_id` 两个契约符号（两侧均已实现，`platform/mod.rs` 两份清单同步更新）。**本节表格未改写你们的原文**，增补详情与动因见 **§2.10-A**。
+
 ### 1.2 平台相关类型差异（刻意保留，不是遗漏）
 
 以下 API 在两侧签名不同，**调用方必须在 `#[cfg]` 分支内使用**（依据 `src/platform/mod.rs` 契约注释块）：
@@ -224,6 +226,16 @@ ASR raw_text
 
 完整决策记录见 `collab/decisions.md` **DEC-036**（部分推翻 DEC-035：第 1/2 条单点位置结论作废，第 3/4 条继续有效）、**DEC-037**（输出形态按单位族分治）、**DEC-038**（保护词表不得承载规则性语法族）。
 
+> 🍎 **【macOS 侧追加·2026-08-04，本节末段结论已变更】**
+>
+> 上一段「**故本节四条约束在代码层无法共享，是纯文档契约 —— 编译器不会帮你们兜底**」**自 macOS 侧 `MACOS-P4-NEUTRAL-001` 起不再成立**（本段不改写你们原文，仅在此追加更正）。
+>
+> `run_pipeline` 已改为 `#[cfg(target_os = "windows")]` 薄封装，函数体整体搬入**无 cfg 的平台中立 `run_pipeline_core`**。你们 2026-08-04 推送的双通道 ITN 代码（`pre_llm_text = itn::normalize_numbers(...)` 主通道 + `itn::normalize_unit_symbols_only(...)` 补丁通道）合并后**已落在 `run_pipeline_core` 内**，macOS 侧编译的是同一份代码。
+>
+> **含义：本节四条硬约束中的第 1/2/3 条（双通道位置、两通道均在标点前、三路径全覆盖）现已由代码共享强制保证，不再依赖文档纪律。** 第 4 条（prompt 侧 `UNIT_SYMBOL_PROTECTION` 配套条款）本就在平台中立的 `src/llm/mod.rs` 内，同样共享。
+>
+> 详见 **§2.10-A**。
+
 ---
 
 ### 2.9 ITN 数字输出形态契约（DEC-041/042/043）【2026-08-04 新增，行为已变更】
@@ -323,6 +335,98 @@ Gavin 2026-08-04 拍板：**判定语言中明确提到的最小单位，输出�
 四个月内至少四次（016/026/027-A/027-C），**全部由 Gavin 端测撞出，没有一次是测试先抓到** —— 因为单测按设计场景写，缺陷只在设计场景之外显形。027-F 则是 tester-1 走查先发现（首次非端测），主控复核后判定为真风险。
 
 **确立的防御规则**：任何「隐式/省略成分补全」类规则，必须显式声明适用边界，并配反向护栏测试证明它在边界外不生效。**只测生效侧 = 没测。** macOS 侧若新增此类规则，请同样遵守。
+
+---
+
+### 2.10 · 🍎 macOS 侧跨端影响评估【本节由 macOS 侧维护，倒序追加】
+
+> 依据 §2.7「跨端影响评估强制条款」（Gavin 2026-08-04 指令，两侧同等适用）。
+> 本节是 macOS → Windows 方向的影响回执，**每批开发/构建完成后即追加，不批量补**。
+> 格式：改动了什么 · 行为前后对比 · 对 Windows 侧的具体影响 · 是否需要你们同步改动。
+
+---
+
+#### 2.10-A · Phase 4 阶段 A/B 批次（2026-08-04，合并提交 `cc12381`）
+
+**本批次结论一句话**：Windows 侧**无需任何同步改动**，但**平台契约面扩大了 2 个符号**，且 **§1.1 / §2.8 两处原文结论需按上方追加块更新认知**。
+
+##### ① 🔴 平台契约变化（必须知晓）· 15 → 17 个符号
+
+| 新增符号 | Windows 侧实现 | macOS 侧实现 | 位置 |
+| --- | --- | --- | --- |
+| `foreground_window_id() -> WindowId` | `GetForegroundWindow().0 as usize` | 第一版返 `0`（表「无法判定焦点」） | `platform/windows/event_loop.rs` / `platform/macos/mod.rs` |
+| `capture_scene_signals_by_id(id: WindowId)` | 转 `HWND` 后委托既有 `capture_scene_signals` | 委托既有 `capture_scene_signals(usize)` | `platform/windows/scene.rs` / `platform/macos/mod.rs` |
+
+同时 `platform/mod.rs` 新增 `pub type WindowId = usize;`（不透明窗口标识，两侧语义各自定义）。
+
+**对 Windows 侧的影响**：**纯新增**。`git diff --numstat -- src/platform/windows/` 三个文件删除列均为 **0**（`12/0`、`3/0`、`7/0`），既有 Windows 函数的签名、行为、调用点**一行未改**。`capture_scene_signals(HWND)` 与 `create_controller_window()` 等既有 15 个符号完全保留。
+
+**需要你们做什么**：**不需要改代码**。但按 §2.7 引用纪律，若你们后续再动 `platform/` 导出面，两份清单现在是 **17 项**，请以 `src/platform/mod.rs` 实际内容为准。
+
+##### ② 🔴 §2.8 的「纯文档契约」结论已作废（本批次最重要的一条）
+
+`run_pipeline` 改为薄封装 + 平台中立 `run_pipeline_core`，**402 行业务逻辑（ASR 前处理 → 转录 → 场景采集 → 翻译/优化三分支 → ITN 双通道 → 标点 → 注入 → 词库学习）现为双侧共享**。
+
+| 项 | 变更前 | 变更后 |
+| --- | --- | --- |
+| `run_pipeline` | 整函数 `#[cfg(target_os="windows")]` | **保持** `cfg(windows)` + `target_hwnd: HWND` 签名不变，函数体缩为一行委托 |
+| 业务逻辑主体 | 在 `run_pipeline` 内，macOS 不可见 | 移入 `run_pipeline_core`（无 cfg），**macOS 编译同一份** |
+| `spawn_worker_thread:2450` 调用点 | — | **一字未改**（薄封装设计即为此） |
+| DEC-036 双通道顺序约束 | 纯文档契约 | **代码层共享强制** |
+
+**对 Windows 侧的影响**：**行为零改动**。自证方式——函数体为整段搬运，`git diff` 中该函数体内部仅有 2 个平台接触点 hunk（`capture_scene_signals` → `_by_id`、`GetForegroundWindow` → `foreground_window_id`），其余逐字节保留；`focus_lost` 判据 `!target_hwnd.0.is_null() && current!=target` 等价改写为 `target_hwnd != 0 && current_id != target_hwnd`。
+
+**macOS 侧已用反证法验证 `run_pipeline_core` 确实在 macOS 上参与编译**：往其签名注入一个不存在的类型后 `cargo check` 报 `E0425 cannot find type`，证明并非被 cfg 静默跳过（验证后已还原）。
+
+**需要你们做什么**：**不需要改代码**。但请注意：**今后你们改 `run_pipeline_core` 内的任何逻辑，会直接作用于 macOS 侧**，不再是「只影响自己」。这正是 §2.7 判定标准第一行「改动落在平台中立模块 → 必须记」的情形。
+
+##### ③ 平台中立辅助函数去 cfg（3 个）
+
+`select_preprocessing_params` / `should_try_llm_translate` / `try_nllb_translate` 三个函数上方的 `#[cfg(target_os = "windows")]` 已删除（它们是纯 Rust 逻辑、零平台 API，被 `run_pipeline_core` 调用）。
+
+**对 Windows 侧的影响：可证明的 no-op。** 为 Windows 编译时该 cfg 恒为真、item 本就被无条件包含；删除属性后仍被包含，**两种情况下 Windows 侧 AST 逐字节相同**。
+
+**连带收益**：`select_preprocessing_params` 的 5 个 `#[test]`（你们在 `6f0b51e` 为其加的 cfg 门控）已解封，**macOS 侧测试盲区由 22 条降至 17 条**。
+
+##### ④ macOS 专属缺陷修复（对 Windows 无影响，仅备查）
+
+`src/platform/macos/hotkey.rs` 的 `KEYBOARD_EVENTS` 移除了 `CGEventType::TapDisabledByTimeout`(0xFFFFFFFE) 与 `TapDisabledByUserInput`(0xFFFFFFFF)。这两个是 core-graphics 标注的 "out of band" 事件，本不该进 `eventMask`；其判别值远超 u64 位宽，进入 `CGEventMaskBit!(1 << etype)` 后**debug 下 panic、release 下按 `&63` 掩码静默设错第 62/63 位**。实机探针实测：修复前热键监听线程启动即 panic，一个事件都收不到。
+
+**这是 DEC-017 实现自 2026-04 以来首次实机验证暴露的真 bug。**
+
+##### ⑤ ⚠️ 构建依赖变化（`Cargo.toml` / `Cargo.lock` 是共享文件，按 §2.7 必须记）
+
+| 依赖 | 位置 | 对 Windows 的影响 |
+| --- | --- | --- |
+| `objc2` / `objc2-app-kit` / `objc2-foundation` / `core-foundation-sys` / `libc` | `[target.'cfg(target_os = "macos")'.dependencies]` 段内（`Cargo.toml:115-119`） | **无**。条件依赖，Windows 不编译。**段落边界已自查**，其后即空行 + `[target.'cfg(target_os="windows")'.build-dependencies]`，未触发 `[TOML-SECTION-DRIFT-001]` |
+| ⚠️ `ctrlc = "3.4"` | **被误加进 `[dependencies]` 主表** | **有影响，正在修**。这是为 macOS controller 的 SIGINT 处理引入的跨平台依赖，Windows 侧会一并编译进二进制。macOS 侧已定位，将移入 macOS 专属段或直接移除（Windows 侧本就无 SIGINT 处理器，tray-first 应用靠托盘菜单退出）。**在此如实记录，不隐去。** |
+
+`Cargo.lock` 因上述依赖新增而变更 —— 这是双平台共享文件，你们下次 pull 后 `cargo build` 会重新解析，属预期。
+
+##### ⑥ 📌 DEC 编号撞车（已由 macOS 侧让号，请知悉）
+
+两侧在 2026-08-04 同日并行新立决策，撞了 **DEC-036 / DEC-037** 两个号：
+
+| 编号 | Windows 侧（保留，主线先推送） | macOS 侧（已改号） |
+| --- | --- | --- |
+| DEC-036 | ITN 改双通道 | → 改为 **DEC-045** · macOS 浮层必须是独立窗口 |
+| DEC-037 | ITN 输出形态按单位族分治 | → 改为 **DEC-046** · macOS 事件宿主用 objc2 + NSApplication + CFRunLoop |
+
+**处置原则**：以先推送到 `origin/main` 的一侧为准，后合并方让号。macOS 侧已同步更新 `decisions.md` 与全部引用文档。
+
+**这是 §2.7 引用纪律第 2 条「引用决策编号前先确认它在仓库里存在」的一个新变种** —— 不只是"编号是否存在"，并行开发时还要防"同一编号被两侧同时占用"。**建议约定：新立 DEC 前先 `git fetch && grep -n "^## DEC-" origin/main:collab/decisions.md` 取最大号再 +1**，或按平台分段（如 macOS 侧从 DEC-100 起）。请你们拍板取哪种，本侧配合。
+
+##### ⑦ 当前 macOS 侧真实状态（供你们评估，勿按 §5.2 旧表判断）
+
+| 项 | §5.2 旧记载 | 实测现状（2026-08-04） |
+| --- | --- | --- |
+| 主控入口 | 非 Windows 分支仅 warn 返回 | **正在实现中**（`MACOS-P4-HOST-001`，NSApplication + CFRunLoop，未验收） |
+| 事件循环 | `run_message_loop()` 为 stub | 同上，`src/platform/macos/event_loop.rs` 已创建 |
+| 管线 | `mod macos_stubs` 占位，无实现 | **后段已可复用**（`run_pipeline_core`）；**前段接线未完成**（`spawn_worker_thread` 仍 `cfg(windows)`，待 `MACOS-P4-NEUTRAL-002`） |
+| Accessibility 弹窗 | stub，只打日志 | **仍是 stub，实机探针已确认属实**，待 `MACOS-P4-PERM-001` |
+| Overlay | 无对等实现 | **仍无**。已按 Gavin 拍板（DEC-045）定为**必须实现独立窗口，不得用托盘图标替代**，规格对齐你们的 240×36 / 320×140 + 水平居中底部上移 64px + 三态指示灯 |
+| 录音 / ASR 链路 | 未验证 | ✅ **实机已验证可用**：cpal 实录 RMS 0.108 非零；SenseVoice 转录正确（RTF 0.0458），无 dyld 错误 |
+| DEC-015（Tauri 作事件宿主） | §5.2 仍引用 | **已复议作废**，改用 objc2 + NSApplication + CFRunLoop 直驱（DEC-046）。理由：主程序至今不依赖 tauri，为借一个 run loop 拖进 WebView 不划算；且 DEC-045 要求真实 AppKit 窗口，objc2 无论如何都要引 |
 
 ---
 
