@@ -36,6 +36,8 @@ struct Rules {
     protect: Protect,
     #[serde(default)]
     unit_symbols: UnitSymbols,
+    #[serde(default)]
+    unit_hierarchy: UnitHierarchy,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,6 +90,8 @@ struct Units {
     acoustic: UnitList,
     #[serde(default)]
     data: UnitList,
+    #[serde(default)]
+    time: UnitList,
     #[serde(default)]
     other: UnitList,
     #[serde(default)]
@@ -151,6 +155,12 @@ struct Protect {
     /// ITN-COLLISION-TYPEA-002: 单位前缀碰撞保护词（机器派生，jieba+THUOCL）
     #[serde(default)]
     unit_collisions: ProtectList,
+    /// ITN-FIX-GRADECLASS-016: 紧跟 2 位逐位串时抑制合并的后缀（年级班级简写等语法族）。
+    /// 当 serial_len == 2 且紧随其后的字符命中本表时，不做逐位串合并（如「一三班」→
+    /// 「13班」是错的，应为「一三班」= 一年级三班）。DEC-038：保护词表不得承载
+    /// 规则性语法族，本表只承载「抑制后缀」这一规则参数，不逐条枚举 N 年级 M 班。
+    #[serde(default)]
+    serial_suffixes: ProtectList,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -171,6 +181,20 @@ struct UnitSymbols {
 struct UnitSymbolRule {
     trigger: String,
     replacement: String,
+}
+
+/// ITN-V2-004 (P4) 单位层级表：丙型多级单位链合并用。
+/// 每族按单位→相对倍率。`分` 同时出现在 currency 和 time，由识别器按前驱单位消歧。
+#[derive(Debug, Clone, Deserialize, Default)]
+struct UnitHierarchy {
+    #[serde(default)]
+    currency: std::collections::HashMap<String, f64>,
+    #[serde(default)]
+    length: std::collections::HashMap<String, f64>,
+    #[serde(default)]
+    weight: std::collections::HashMap<String, f64>,
+    #[serde(default)]
+    time: std::collections::HashMap<String, f64>,
 }
 
 // ============================================================
@@ -202,6 +226,15 @@ struct CompiledRules {
     /// ITN-CELSIUS-003: 单位符号规整规则（阿拉伯数字 + trigger → replacement）
     /// 按 trigger 字符长度降序排列（最长匹配优先）
     unit_symbol_rules: Vec<(String, String)>,
+    /// ITN-V2-004 (P4) 单位层级表：丙型合并用，unit→(族名, 倍率)
+    /// 一个单位可能在多族（如「分」在 currency+time），由识别器按前驱消歧
+    unit_hierarchy: HashMap<String, Vec<(&'static str, f64)>>,
+    /// 可小数化单位集合（currency+length+weight+volume+temperature+pressure+
+    /// electrical+frequency+acoustic+data+time，排除 other/geo_prefix）
+    decimalizable_units: HashSet<String>,
+    /// ITN-FIX-GRADECLASS-016: 紧跟 2 位逐位串时抑制合并的后缀集合
+    /// （年级班级简写等语法族，如「班」）
+    serial_suffix_set: HashSet<String>,
 }
 
 impl CompiledRules {
@@ -218,6 +251,7 @@ impl CompiledRules {
             &r.units.frequency,
             &r.units.acoustic,
             &r.units.data,
+            &r.units.time,
             &r.units.other,
         ] {
             for w in &unit_list.words {
@@ -271,11 +305,85 @@ impl CompiledRules {
                 rules.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()));
                 rules
             },
+            unit_hierarchy: {
+                let mut map: HashMap<String, Vec<(&'static str, f64)>> = HashMap::new();
+                for (unit, val) in &r.unit_hierarchy.currency {
+                    map.entry(unit.clone())
+                        .or_default()
+                        .push(("currency", *val));
+                }
+                for (unit, val) in &r.unit_hierarchy.length {
+                    map.entry(unit.clone()).or_default().push(("length", *val));
+                }
+                for (unit, val) in &r.unit_hierarchy.weight {
+                    map.entry(unit.clone()).or_default().push(("weight", *val));
+                }
+                for (unit, val) in &r.unit_hierarchy.time {
+                    map.entry(unit.clone()).or_default().push(("time", *val));
+                }
+                map
+            },
+            decimalizable_units: {
+                let mut set = HashSet::new();
+                for list in [
+                    &r.units.currency,
+                    &r.units.length,
+                    &r.units.weight,
+                    &r.units.volume,
+                    &r.units.temperature,
+                    &r.units.pressure,
+                    &r.units.electrical,
+                    &r.units.frequency,
+                    &r.units.acoustic,
+                    &r.units.data,
+                    &r.units.time,
+                ] {
+                    for w in &list.words {
+                        set.insert(w.clone());
+                    }
+                }
+                set
+            },
+            serial_suffix_set: r.protect.serial_suffixes.words.iter().cloned().collect(),
         }
     }
 
     fn is_unit(&self, s: &str) -> bool {
         self.all_units.iter().any(|u| s.starts_with(u))
+    }
+
+    /// ITN-V2-003 (甲型守卫)：判定是否「真单位」（在 all_units 但不在 classifiers）。
+    /// 通用量词（个/间/件…）不算单位——甲型文法不处理「一个半」「五间半」，
+    /// 它们保持汉字（守卫统一路径，符合 DEC-038）。
+    /// 「间」同时在 units.other 和 classifiers，此处排除。
+    fn is_real_unit(&self, s: &str) -> bool {
+        self.all_units.iter().any(|u| s.starts_with(u))
+            && !self
+                .classifier_set
+                .iter()
+                .any(|c| s.starts_with(c.as_str()))
+    }
+
+    /// ITN-V2-004 (P4)：可小数化单位（排除 other/geo_prefix）。
+    fn is_decimalizable(&self, s: &str) -> bool {
+        self.decimalizable_units
+            .iter()
+            .any(|u| s.starts_with(u.as_str()))
+    }
+
+    /// ITN-V2-004 (P4)：取单位在某族的倍率。
+    fn hierarchy_value(&self, unit: &str, family: &str) -> Option<f64> {
+        self.unit_hierarchy
+            .get(unit)
+            .and_then(|entries| entries.iter().find(|(f, _)| *f == family).map(|(_, v)| *v))
+    }
+
+    /// ITN-V2-004 (P4)：取单位的所有族属。
+    fn unit_families(&self, unit: &str) -> Vec<&'static str> {
+        self.unit_hierarchy
+            .get(unit)
+            .map(|entries| entries.iter().map(|(f, _)| *f).collect())
+            .unwrap_or_default()
     }
 
     fn is_date_suffix(&self, s: &str) -> bool {
@@ -447,6 +555,49 @@ fn is_cn_unit_char(ch: char) -> bool {
     UNIT_MAP.iter().any(|(cn, _)| s == *cn)
 }
 
+/// ITN-FIX-CURRENCY-017：判定当前位置的「两」是否应视为重量单位而非数字2。
+/// 前置条件：前有数字/进位字符（idx > start，即两 不是数字首位）。
+/// 后接单位词（斤/块/毛/克/两 等 all_units）→ 两 是数字2（两块/三块两毛五）；
+/// 后接非单位（数字/名词/边界）→ 两 是重量单位（二两/六两五/二十五两/三两银子）。
+/// 进位单位（百/千/万）由进位组合路径自行继续，此处不误判（一亿两 → 两 单位）。
+///
+/// ITN-FIX-BIGNUM-027-C-2：原注释声称「进位单位由进位组合路径自行继续，此处不误判」，
+/// 但实现只查 `match_unit_word`（all_units：斤/吨/块等），进位单位（十/百/千/万/亿）
+/// 不在 all_units → `两千` 的「两」被误判为单位 → parse_cn_number :677 break，
+/// 致「一亿两千三百四十五万...」亿结算后中断在后段。本修复补齐注释原意：
+/// 「两」后紧跟进位单位（is_cn_unit_char：十/百/千/万/亿）→ 两 是数字2，不是单位。
+///
+/// 适用边界：只在 idx > start（两非首位）且后继字符是进位单位时生效。
+///   - 一亿两千...：「两」idx=2>start=0，后「千」进位单位 → 两是数字2 → 不break ✓
+///   - 一斤二两：「两」后是句尾 → 不命中 → 维持两是单位 → 1斤2两 ✓
+///   - 二两：「两」后句尾 → 不命中 → 2两 ✓
+///   - 二十五两：「两」后句尾 → 不命中 → 25两 ✓
+///   - 两百：「两」idx=0==start → two_is_unit 首位返回false → 200 ✓（首位不进本逻辑）
+///   - 二两半：「两」后「半」非进位单位 → 不命中 → 2.5两 ✓
+///   - 三块两毛五：「两」后「毛」∈all_units → match_unit_word 命中先返回false → 3.25元 ✓
+///   - 六两五：「两」后「五」数字非进位单位 → 不命中 → 6.5两 ✓
+fn two_is_unit(chars: &[char], idx: usize, start: usize, r: &CompiledRules) -> bool {
+    if chars[idx] != '两' || idx <= start {
+        return false;
+    }
+    // ITN-FIX-BIGNUM-027-C-2：「两」后跟进位单位（十/百/千/万/亿）→ 两是数字2。
+    //   见函数注释。先于 all_units 检查，因进位单位不在 all_units。
+    if idx + 1 < chars.len() && is_cn_unit_char(chars[idx + 1]) {
+        return false;
+    }
+    if r.match_unit_word(chars, idx + 1).is_some() {
+        return false;
+    }
+    true
+}
+
+/// ITN-V2-001 (R2 缺陷A ①右邻否决)：判定词是否全由中文数字字符组成（含进位单位）。
+/// 用于识别「十一」「五一」「八一」这类纯数字保护词，以便撤销保护时区分。
+/// 例：「十一」=true、「三亚」=false、「五角大楼」=false。
+fn is_pure_cn_digit_word(word: &str) -> bool {
+    !word.is_empty() && word.chars().all(is_cn_num_char)
+}
+
 /// 解析中文数字字符串为数值 + 消耗的字符数
 /// 支持进位组合（三百二十五 = 325）、小数点（三点一四 = 3.14）、逐位串（幺三八 = 138）
 /// rules = Some(r) 时启用 large_amount_keep_wan_yi 检查：万/亿后紧跟单位时不消费万/亿
@@ -460,11 +611,19 @@ fn parse_cn_number(
         return None;
     }
 
-    // 先检测逐位串模式：连续≥3个纯数字字符（零/〇/一/二/三/四/五/六/七/八/九/幺/两）
+    // 先检测逐位串模式：连续≥2个纯数字字符（零/〇/一/二/三/四/五/六/七/八/九/幺/两）
     // 且后面不跟进位单位（十百千万亿）
     let mut serial_len = 0usize;
     for k in start..chars.len() {
         if chinese_digit_char(chars[k]).is_some() {
+            // ITN-FIX-CURRENCY-017：两 兼重量单位 → 以单位词开头时终止逐位串扫描。
+            // 二两/二十五两 的「两」不再被吞进逐位串（否则 → 22/222）。`两斤` 首位不受影响
+            // （两 是数字2，交给进位组合路径）。当前词表仅「两」命中单位前缀，故等价于判两。
+            if let Some(r) = rules {
+                if r.match_unit_word(chars, k).is_some() {
+                    break;
+                }
+            }
             serial_len += 1;
         } else {
             break;
@@ -473,6 +632,33 @@ fn parse_cn_number(
     // 检查逐位串后面是否跟进位单位
     let serial_end = start + serial_len;
     let next_is_unit = serial_end < chars.len() && is_cn_unit_char(chars[serial_end]);
+
+    // ITN-FIX-GRADECLASS-016: 年级班级简写守卫 —— 当 serial_len == 2 且紧随其后的
+    // 字符命中 serial_suffixes（如「班」）时，不做逐位串合并，直接返回 None。
+    //
+    // 为什么 return None 而非「跳过 :582 的 early return 落进位组合路径」：
+    // 进位组合路径对「一三」这类连续纯数字会按「末位 digit 覆盖」解析（digit 被
+    // 反复覆盖只留最后一个），产出 ("3", 2) → 「一三班」→「3班」撕裂。return None
+    // 后主循环 :1600 的 `if let Some(...)` 短路，字符逐个走「普通字符」单字路径，
+    // 「班」既非单位也非量词 → 保持汉字，输出「一三班」。
+    //
+    // 为什么限定 serial_len == 2：
+    //   - 「一三/五一/二三/一四」全部是 2 位，语义是两个不同层级的数字（年级+班号）
+    //     被误当成一个两位数
+    //   - 进位组合路径不受影响 → 「十三班」（十非逐位串首字符）仍转
+    //   - ≥3 位逐位串（三零二房间/二零二六/幺三八零零）完全不进入本守卫
+    if serial_len == 2 && serial_end < chars.len() {
+        if let Some(r) = rules {
+            let after_serial: String = chars[serial_end..].iter().collect();
+            if r
+                .serial_suffix_set
+                .iter()
+                .any(|s| after_serial.starts_with(s.as_str()))
+            {
+                return None;
+            }
+        }
+    }
 
     if serial_len >= 2 && !next_is_unit {
         let digits: Vec<char> = (start..serial_end)
@@ -494,12 +680,30 @@ fn parse_cn_number(
     let mut has_digit = false;
     // false=刚处理完大单位后没看到零，true=看到零后大单位隐式失效
     let mut zero_since_big = false;
+    // ITN-FIX-BIGNUM-027-A：万/亿之后是否已消费过进位单位（十/百/千）。
+    //   隐式千位补全（「两万五」=25000）的适用边界：万/亿之后 + 该段内无零 +
+    //   该段内无进位单位。三条件缺一即不该套 +1000。完整进位链后的末尾单字是
+    //   个位，不是省略的「几千」（一千零四十六万八千七百四十一 → 末尾「一」
+    //   被 +1000 得 10469740，应为 10468741）。万/亿结算时重置为 false（新段开始）。
+    let mut unit_since_big = false;
     // 最近看到的大单位
     let mut big_unit_seen = false;
+    // ITN-FIX-BIGNUM-027-D (DEC-042)：记录最近的大单位及其结算前系数，用于
+    //   隐式补全场景保留锚定单位。万/亿分支结算时记录 (单位字符, 结算前 result+section
+    //   的值除以大单位倍率后的系数)。仅用于隐式分支（孤立单字数字无后继单位时）
+    //   输出 "{系数}.{digit}{大单位名}"。
+    let mut big_unit_anchor: Option<(char, u64)> = None;
 
     while idx < chars.len() {
         let ch = chars[idx];
         if let Some(d) = chinese_digit_char(ch) {
+            // ITN-FIX-CURRENCY-017：两 在「前有数字 + 后接非单位」时是重量单位 → 终止数字。
+            // 二十五两 → 25、六两五 → 6（两 不吞）；两斤/两百/三块两毛五 → 首位或后接单位 → 按数字2。
+            if let Some(r) = rules {
+                if ch == '两' && two_is_unit(chars, idx, start, r) {
+                    break;
+                }
+            }
             digit = d.to_digit(10).unwrap() as u64;
             has_digit = true;
             idx += 1;
@@ -510,51 +714,111 @@ fn parse_cn_number(
                 section += (if has_digit { digit } else { 1 }) * 10;
                 digit = 0;
                 has_digit = false;
+                // ITN-FIX-BIGNUM-027-A：万/亿后已消费进位单位，末尾单字必为个位
+                if big_unit_seen {
+                    unit_since_big = true;
+                }
             }
             '百' | '佰' => {
                 section += digit * 100;
                 digit = 0;
                 has_digit = false;
+                if big_unit_seen {
+                    unit_since_big = true;
+                }
             }
             '千' | '仟' => {
                 section += digit * 1000;
                 digit = 0;
                 has_digit = false;
+                if big_unit_seen {
+                    unit_since_big = true;
+                }
             }
             '万' | '萬' => {
                 // large_amount_keep_wan_yi：万/亿后紧跟单位时不消费万/亿
                 if let Some(rules) = rules {
                     if rules.large_amount_keep_wan_yi && idx + 1 < chars.len() {
                         let after_big: String = chars[idx + 1..].iter().collect();
-                        if rules.is_unit(&after_big) {
+                        // ITN-FIX-BIGNUM-027-C：消歧「亿/万后首字是中文数字 + 其后跟进位单位」
+                        // 的情况 —— 这是新数字串开头（如「一亿两千...」的「两」是数字2，
+                        // 后跟「千」进位单位），不是「数字+单位」（如「一亿吨」的「一」后跟
+                        // 「吨」非进位单位）。后者维持现有 break 行为（保留「一亿吨」汉字）。
+                        //
+                        // 适用边界：after_big 首字命中 chinese_digit_char（含「两」，「两」
+                        // 既是数字2又是重量单位，017 引入此歧义）**且** 第二字是进位单位
+                        // （is_cn_unit_char：十/百/千/万/亿）→ 判定新数字串，不 break。
+                        // 否则（首字非数字 / 首字数字但后非进位单位 / 单字无第二字）→
+                        // 维持 is_unit 原判定。
+                        //
+                        // 反例自验：
+                        //   - 五万吨：「吨」非中文数字 → 维持 break → 「五万吨」保留 ✓
+                        //   - 一亿吨：「吨」非中文数字 → 维持 break → 「一亿吨」保留 ✓
+                        //   - 三万元：「元」非中文数字 → 维持 break → 「三万元」保留 ✓
+                        //   - 一亿两千...：「两」是数字 + 「千」进位单位 → 不 break → 亿结算 ✓
+                        //   - 一亿两千万：「两」数字 + 「千」进位 → 不 break → 1.2e8 ✓
+                        //   - 一亿两（两后无字）：无第二字 → 维持 is_unit 判定 → break（保守）
+                        //
+                        // 不动 is_unit 函数本体（整个保护词表机制建立其上）。
+                        let big_starts_new_number = chars.len() > idx + 2
+                            && chinese_digit_char(chars[idx + 1]).is_some()
+                            && is_cn_unit_char(chars[idx + 2]);
+                        if !big_starts_new_number && rules.is_unit(&after_big) {
                             break;
                         }
                     }
                 }
                 section += digit;
-                result = (result + section) * 10000;
+                // ITN-FIX-BIGNUM-027-B：万级进位不再把已结算的 result 卷进乘法。
+                //   旧式 `result = (result + section) * 10000` 在「亿+万」嵌套时把亿结算值
+                //   也乘 1e4，差 4 个数量级（一亿两千三百四十五万 → 1e12，应为 1.2345e8）。
+                //   亿分支 :724 保持 `result = (result + section) * 1e8` 不变——亿是最大
+                //   单位，其前一切是它的系数（反例「一万亿」：万 result += 1e4 → 亿
+                //   (1e4+0)*1e8 = 1e12 ✓）。万级不是最大单位，其前 result 是已结算的
+                //   更大单位值，应当累加而非卷乘。单独「两千三百四十五万」时 result=0，
+                //   `0 + 2345*1e4` 与旧式 `(0+2345)*1e4` 等价，零回归。
+                result += section * 10000;
+                // ITN-FIX-BIGNUM-027-D (DEC-042)：记录万级锚定单位 + 系数（结算前
+                //   result+section 除以万倍率）。用于隐式补全场景输出 "X.Y万"。
+                //   系数 = result/1e4（section 已在上方 += 到 result 之前的 section 值，
+                //   但 result 此时已含 section*1e4，故系数 = result/1e4）。
+                big_unit_anchor = Some(('万', result / 10000));
                 section = 0;
                 digit = 0;
                 has_digit = false;
                 big_unit_seen = true;
                 zero_since_big = false;
+                unit_since_big = false; // 027-A：新段开始，重置进位单位消费标记
             }
             '亿' | '億' => {
                 if let Some(rules) = rules {
                     if rules.large_amount_keep_wan_yi && idx + 1 < chars.len() {
                         let after_big: String = chars[idx + 1..].iter().collect();
-                        if rules.is_unit(&after_big) {
+                        // ITN-FIX-BIGNUM-027-C：同万分支消歧（见 :714 注释）
+                        let big_starts_new_number = chars.len() > idx + 2
+                            && chinese_digit_char(chars[idx + 1]).is_some()
+                            && is_cn_unit_char(chars[idx + 2]);
+                        if !big_starts_new_number && rules.is_unit(&after_big) {
                             break;
                         }
                     }
                 }
                 section += digit;
+                // ITN-FIX-BIGNUM-027-B：亿分支保持 (result+section)*1e8 不变。
+                //   亿是最大单位，其前一切（含已结算的万级值）都是它的系数。
+                //   反例自验「一万亿」：万分支 result += 1*1e4 = 1e4 → 亿分支
+                //   (1e4 + 0)*1e8 = 1e12 ✓。若改为 += 会错成 1e4。
                 result = (result + section) * 100000000;
+                // ITN-FIX-BIGNUM-027-D (DEC-042)：记录亿级锚定单位 + 系数。
+                //   系数 = (result 结算前值 + section) / 1e8。上方已结算，result 现为
+                //   (旧result+section)*1e8，故系数 = result/1e8。
+                big_unit_anchor = Some(('亿', result / 100000000));
                 section = 0;
                 digit = 0;
                 has_digit = false;
                 big_unit_seen = true;
                 zero_since_big = false;
+                unit_since_big = false; // 027-A：新段开始，重置进位单位消费标记
             }
             '零' | '〇' => {
                 digit = 0;
@@ -626,11 +890,24 @@ fn parse_cn_number(
 
     // 循环结束：处理末尾挂起的数字
     if has_digit {
-        if big_unit_seen && !zero_since_big {
-            // 大单位后单字数字 → 隐式单位
-            // "两万五" = 25000（五→五千）
-            // "三亿五" = 350000000（五→五千万）
-            section += digit * 1000;
+        if big_unit_seen && !zero_since_big && !unit_since_big {
+            // ITN-FIX-BIGNUM-027-A：隐式千位补全 —— 适用边界三条件：
+            //   ① big_unit_seen：万/亿大单位已出现（否则无隐式千位语境）
+            //   ② !zero_since_big：大单位后该段内无零
+            //   ③ !unit_since_big：大单位后未消费过任何进位单位（十/百/千）。
+            //      完整进位链后的末尾单字是个位，不是省略的「几千」。
+            //
+            // ITN-FIX-BIGNUM-027-E (DEC-042 补完)：隐式补全的乘数取决于锚定单位：
+            //   - 万级（如「两万五」）→ 末尾五=五千 = digit*1e3
+            //   - 亿级（如「三亿五」）→ 末尾五=五千万 = digit*1e7
+            //   （DEC-042 规则4：比最小单位更小的成分用小数位表示。亿的最小成分是
+            //    千万=0.1亿，万的最小成分是千=0.1万）
+            //   非孤立（后继有 all_units 单位）→ 维持纯数字（保护下游 .parse()）
+            let multiplier = match big_unit_anchor {
+                Some(('亿', _)) => 10_000_000u64,
+                _ => 1_000u64,
+            };
+            section += digit * multiplier;
         } else {
             section += digit;
         }
@@ -638,6 +915,37 @@ fn parse_cn_number(
     }
 
     result += section;
+
+    // ITN-FIX-BIGNUM-027-E (DEC-042 补完, Gavin 2026-08-04)：
+    //   数量级锚定最小单位 —— 当语言中明确提到的最小单位落在万/亿时，保留锚定
+    //   单位后缀输出（如「三亿」→「3亿」、「三千万」→「3000万」），不展开为纯
+    //   阿拉伯数字。量级分界在万：最小单位落万/亿 → 带后缀；落千/百/十/个 → 普通数字。
+    //   升亿阈值：万层数值 ≥1 亿 且 升亿后小数位 ≤1 → 升到亿；否则保持万层。
+    //
+    //   适用边界（与 027-D 孤立判定合并）：
+    //   ① big_unit_seen：万/亿大单位已结算
+    //   ② !unit_since_big：大单位后未消费进位单位（千/百/十）→ 最小单位是万/亿
+    //      （若消费了进位单位，最小单位是千/百/十/个 → 普通数字，不走 DEC-042）
+    //   ③ 孤立：末尾无 all_units 度量衡单位（后继有单位 → 非孤立 → 维持纯数字，
+    //      保护下游 .parse() 消费方：UnitChain format_currency_chain/format_unit_chain
+    //      对 num_str .parse()，仅孤立时返回带单位串，而孤立时 UnitChain 不可达）
+    //
+    //   large_amount_keep_wan_yi 的 break 在结算前 → big_unit_seen=false → 不走
+    //   DEC-042（「三万元」「一亿吨」保持汉字，large_amount_keep_wan_yi 保守行为不变）
+    //
+    //   DEC-043：只动数量级层。format_currency_chain / format_weight_chain 一行不碰。
+    if big_unit_seen && !unit_since_big {
+        let is_isolated = idx >= chars.len() || !rules.is_some_and(|r| {
+            let rest: String = chars[idx..].iter().collect();
+            r.is_unit(&rest)
+        });
+        if is_isolated {
+            if let Some((unit_char, _coeff)) = big_unit_anchor {
+                let formatted = format_dec042_magnitude(result, unit_char);
+                return Some((formatted, idx - start));
+            }
+        }
+    }
 
     // 检查是否解析到了有效数字
     if result == 0 {
@@ -652,6 +960,84 @@ fn parse_cn_number(
     }
 
     Some((result.to_string(), idx - start))
+}
+
+/// ITN-FIX-BIGNUM-027-E (DEC-042 补完) / ITN-FIX-BIGNUM-027-G-1 (DEC-042 补充二)：
+/// 数量级锚定格式化。
+///
+/// 将纯数值按 DEC-042 规则格式化为带万/亿/万亿后缀的字符串：
+/// - 锚定单位是亿 → 先判升万亿（DEC-042 补充二），再算亿层表达：
+///   - 亿层 ≥1 万亿 且 升万亿后小数位 ≤1 → 升到万亿（如 1000000000000 → "1万亿"）
+///   - 否则保持亿层（如 300000000 → "3亿"）
+/// - 锚定单位是万 → 先算万层表达，再判升亿：
+///   - 万层 ≥1 亿 且 升亿后小数位 ≤1 → 升到亿（如 350000000 → "3.5亿"）
+///   - 否则保持万层（如 30000000 → "3000万"）
+///
+/// 三级升级链（逐级升，阈值判据一致：升级后小数位 ≤1）：
+/// 1. 万 → 亿：万层 ≥1 亿 且 升亿后小数 ≤1 位
+/// 2. 亿 → 万亿：亿层 ≥1 万亿 且 升万亿后小数 ≤1 位（DEC-042 补充二，027-G-1）
+///
+/// DEC-042 四条规则 + 补充二：
+/// 1. 判定语言中明确提到的最小单位（由调用方通过 unit_char 传入）
+/// 2. 量级分界在万：万/亿/万亿 → 带后缀；千/百/十/个 → 普通数字
+/// 3. 升级阈值：下层 ≥ 上层 且 升级后小数位 ≤1 → 升级
+/// 4. 比最小单位更小的成分用小数位表示
+fn format_dec042_magnitude(result: u64, unit_char: char) -> String {
+    const WAN_YI: u64 = 1_000_000_000_000; // 1e12
+    const YI: u64 = 100_000_000; // 1e8
+    const WAN: u64 = 10_000; // 1e4
+
+    if unit_char == '亿' {
+        // DEC-042 补充二（027-G-1）：判升万亿
+        if result >= WAN_YI {
+            let wanyi_int = result / WAN_YI;
+            let wanyi_rem = result % WAN_YI;
+            if wanyi_rem == 0 {
+                return format!("{}万亿", wanyi_int);
+            }
+            let dec_str = format!("{:012}", wanyi_rem);
+            let trimmed = dec_str.trim_end_matches('0');
+            if trimmed.len() <= 1 {
+                return format!("{}.{}万亿", wanyi_int, trimmed);
+            }
+            // 小数位 >1 → 不升万亿，保持亿层
+        }
+        // 亿层格式化
+        let yi_int = result / YI;
+        let yi_rem = result % YI;
+        if yi_rem == 0 {
+            return format!("{}亿", yi_int);
+        }
+        let dec_str = format!("{:08}", yi_rem);
+        let trimmed = dec_str.trim_end_matches('0');
+        format!("{}.{}亿", yi_int, trimmed)
+    } else {
+        // 万层，判升亿
+        if result >= YI {
+            // 升亿判定：小数位 ≤1
+            let yi_int = result / YI;
+            let yi_rem = result % YI;
+            if yi_rem == 0 {
+                return format!("{}亿", yi_int);
+            }
+            let dec_str = format!("{:08}", yi_rem);
+            let trimmed = dec_str.trim_end_matches('0');
+            // 小数位 = trimmed 长度
+            if trimmed.len() <= 1 {
+                return format!("{}.{}亿", yi_int, trimmed);
+            }
+            // 小数位 >1 → 不升亿，保持万层
+        }
+        // 万层表达
+        let wan_int = result / WAN;
+        let wan_rem = result % WAN;
+        if wan_rem == 0 {
+            return format!("{}万", wan_int);
+        }
+        let dec_str = format!("{:04}", wan_rem);
+        let trimmed = dec_str.trim_end_matches('0');
+        format!("{}.{}万", wan_int, trimmed)
+    }
 }
 
 /// 解析"零下X"或"负X"前缀
@@ -687,13 +1073,785 @@ pub fn normalize_numbers(text: &str) -> String {
     normalize_unit_symbols(&after_cn, r)
 }
 
+/// ITN-V2-001 (R1 双通道补丁通道)：仅运行单位符号规整（第二阶段），
+/// 不做中文数字→阿拉伯转换（第一阶段）。
+///
+/// 用途：ITN 主通道已跑过 `normalize_numbers`（LLM 之前），LLM 可能纠正
+/// ASR 同音错字（如「摄息」→「摄氏」）后输出「40摄氏度」，补丁通道在 LLM
+/// 之后、本地标点之前调用本函数，捞回这类 LLM 纠正后的单位符号。
+///
+/// 幂等：主通道产出 `40℃`，补丁通道再跑 → `℃` 不匹配任何 trigger → 不变。
+pub fn normalize_unit_symbols_only(text: &str) -> String {
+    let r = rules();
+    normalize_unit_symbols(text, r)
+}
+
+// ============================================================
+// ITN-V2-004 (P4) 丙型「显式多级单位链」+ 乙型「隐式小数位」
+// 取代 ITN-V2-001 的 ③ 块级匹配（任务D：③被丙型取代删除）
+// ============================================================
+
+/// 丙型识别器输出：结构化的多级「数字-单位」链。
+#[derive(Debug, Clone)]
+struct UnitChain {
+    parts: Vec<(String, String)>,
+    consumed: usize,
+    family: &'static str,
+    /// ITN-FIX-CURRENCY-017：货币链后的单价限定词（如「一斤」），原样汉字保留。
+    /// 仅 currency 族链在终止点后紧跟 weight 族单位时设置（`三块四毛八一斤`→`3.48元一斤`）。
+    per_unit: Option<String>,
+}
+
+/// 丙型识别器：扫描连续「中文数字+可小数化单位」多级链。
+/// 与③的关键差异：match 失败用 break（保留已识别段）而非 ?（整体返回None）；
+/// 单位必须 is_decimalizable（排除编号单位）；`分`消歧靠前驱。
+fn try_parse_unit_chain(chars: &[char], start: usize, r: &CompiledRules) -> Option<UnitChain> {
+    let mut parts: Vec<(String, String)> = Vec::new();
+    let mut pos = start;
+    let mut family: Option<&'static str> = None;
+
+    loop {
+        let (num_str, num_consumed) = match parse_cn_number(&chars[pos..], 0, Some(r)) {
+            Some(v) => v,
+            None => break,
+        };
+        if num_consumed == 0 {
+            break;
+        }
+        let after_num = pos + num_consumed;
+        let rest: String = chars[after_num..].iter().collect();
+        // 单位匹配：先试 all_units，再试 date_suffix（点/分/秒 时间族）
+        let (unit_len, unit_word) = if let Some(v) = r.match_unit_word(chars, after_num) {
+            v
+        } else if let Some(len) = r.match_date_suffix_len(&rest) {
+            let word: String = chars[after_num..after_num + len].iter().collect();
+            // 仅时间 date_suffix（点/分/秒），排除号/日/年/月等日期
+            if word == "点" || word == "分" || word == "秒" {
+                (len, word)
+            } else {
+                break;
+            }
+            } else {
+                // 无单位：检查隐含末级单位尾数
+                // ITN-FIX-CHAIN-TEAR-026：去掉 after_is_boundary 检查，数值合成与后继识别正交。
+                if !parts.is_empty() && after_num <= chars.len() {
+                    // 隐式尾数单位取决于链内最后一个显式单位的层级：
+                    //   块/元(≥1.0) → 隐式尾数=毛(0.1) → 五块一=5.1元
+                    //   毛/角(=0.1) → 隐式尾数=分(0.01) → 三块四毛八=3.48元
+                    //   分(=0.01)   → 已到最小单位，不再吸收隐式尾数
+                    let (_, last_unit) = parts.last().unwrap();
+                    if let Some(last_val) = r.hierarchy_value(last_unit, "currency") {
+                        let implicit_unit = if last_val >= 1.0 {
+                            "毛"
+                        } else if last_val == 0.1 {
+                            "分"
+                        } else {
+                            ""
+                        };
+                        // ITN-FIX-BIGNUM-027-F：纯数字校验 —— 027-E 后 parse_cn_number
+                        //   可能返回带单位串（如 "3亿"），num_consumed 恰好 ≤2 可穿过门控 →
+                        //   带单位串进 parts → format_currency_chain 的 .parse::<f64>()
+                        //   静默归零（第四种失败模式）。此处加纯数字校验对齐
+                        //   capture_price_per_unit:1241 先例：非纯 ASCII 数字则跳过吸收，
+                        //   由主循环独立解析（走 DEC-042 锚定路径）。
+                        if !implicit_unit.is_empty() && num_consumed <= 2
+                            && num_str.bytes().all(|b| b.is_ascii_digit())
+                        {
+                            parts.push((num_str, implicit_unit.to_string()));
+                            pos = after_num;
+                        }
+                    }
+                }
+                break;
+            };
+        // 单位可小数化检查（date_suffix 时间词已在上方过滤，此处查 decimalizable）
+        if unit_len == 0 {
+            break;
+        }
+        let is_decimalizable = r.is_decimalizable(&unit_word);
+        let is_time_suffix = unit_word == "点" || unit_word == "分" || unit_word == "秒";
+        if !is_decimalizable && !is_time_suffix {
+            break;
+        }
+        // `分`消歧：首段就是`分`→不纳入多级链（裸N分不合并）
+        if unit_word == "分" && parts.is_empty() {
+            break;
+        }
+        // ITN-FIX-CURRENCY-017 条件3：族一致性校验。多族单位（如「分」∈currency+time）
+        // 优先消歧为当前链族，避免 time 链（两点五分）被「分」解析成 currency 误判不一致。
+        let unit_fam = resolve_family_consistent(&unit_word, family.unwrap_or(""), r);
+        if let Some(cur) = family {
+            if unit_fam != cur {
+                // 族不一致 → 终止链。currency 链终止点后紧跟 weight 族单位 →
+                // 捕获单价限定词（如「一斤」），原样汉字保留在 per_unit。
+                if cur == "currency" && unit_fam == "weight" {
+                    if let Some(chain) = capture_price_per_unit(
+                        chars,
+                        start,
+                        after_num,
+                        unit_len,
+                        &num_str,
+                        num_consumed,
+                        &mut parts,
+                        r,
+                    ) {
+                        return Some(chain);
+                    }
+                }
+                break;
+            }
+        } else {
+            family = Some(unit_fam);
+        }
+        parts.push((num_str, unit_word.clone()));
+        pos = after_num + unit_len;
+        if pos >= chars.len()
+            || !is_cn_num_char(chars[pos]) && chars[pos] != '零' && chars[pos] != '〇'
+        {
+            break;
+        }
+    }
+
+    // ITN-FIX-CHAIN-TEAR-026：允许单段 currency 链（如「五块」=1段），否则逐字路径
+    // 会撕裂成「5块」+「8」（只转数字不转单位）。currency 族在 format_unit_chain
+    // 中会归一到「元」，所以单段「五块」→「5元」是合法且预期的行为。
+    // 约束：单段非主单位（角/毛/分）在 format_currency_chain 中保留原单位。
+    if parts.len() >= 2 || (parts.len() == 1 && family == Some("currency")) {
+        Some(UnitChain {
+            consumed: pos - start,
+            parts,
+            family: family.unwrap_or("length"),
+            per_unit: None,
+        })
+    } else {
+        None
+    }
+}
+
+fn resolve_family(unit: &str, r: &CompiledRules) -> &'static str {
+    let families = r.unit_families(unit);
+    if families.is_empty() {
+        if r.is_date_suffix(unit) {
+            return "time";
+        }
+        return "length";
+    }
+    families[0]
+}
+
+/// ITN-FIX-CURRENCY-017 条件3：多族单位（如「分」∈currency+time）优先消歧为当前链族，
+/// 避免 time 链（两点五分）被「分」解析成 currency 而误判族不一致导致链被截断。
+fn resolve_family_consistent(unit: &str, cur: &str, r: &CompiledRules) -> &'static str {
+    let fams = r.unit_families(unit);
+    if let Some(f) = fams.iter().copied().find(|f| *f == cur) {
+        f
+    } else if fams.is_empty() {
+        resolve_family(unit, r)
+    } else {
+        fams[0]
+    }
+}
+
+/// ITN-FIX-CURRENCY-017 条件3：捕获 currency 链终止点后的单价限定词（weight 族单位，如「一斤」），
+/// 返回带 per_unit 的完整链，供 try_parse_unit_chain 直接 return。
+///
+/// 拆分规则：紧邻 weight 单位的最后一个汉字数字归 per_unit 数量（原样汉字保留），
+/// 其前数字作为货币链隐式尾位（`一块两毛二一斤` → [1块,2毛] + 隐式 二=2分 + per_unit 一斤）。
+fn capture_price_per_unit(
+    chars: &[char],
+    start: usize,
+    after_num: usize,
+    unit_len: usize,
+    num_str: &str,
+    num_consumed: usize,
+    parts: &mut Vec<(String, String)>,
+    r: &CompiledRules,
+) -> Option<UnitChain> {
+    if num_consumed == 0 || parts.is_empty() || !num_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // 隐式尾位单位：链内最后一个显式货币单位的下一位（块/元 → 毛，毛/角 → 分）
+    let tail_unit = {
+        let (_, last_unit) = parts.last()?;
+        let last_val = r.hierarchy_value(last_unit, "currency")?;
+        if last_val >= 1.0 {
+            "毛"
+        } else if last_val == 0.1 {
+            "分"
+        } else {
+            return None;
+        }
+    };
+    // 隐式尾位数字 = parse 数字串去掉最后一位（逐位串下 num_str 即源数字序列）
+    if num_consumed >= 2 {
+        let tail_digits = &num_str[..num_str.len() - 1];
+        parts.push((tail_digits.to_string(), tail_unit.to_string()));
+    }
+    // per_unit = 紧邻单位的最后一个源字符 + 单位词，原样汉字保留
+    let per_unit_str: String = chars[after_num - 1..after_num + unit_len].iter().collect();
+    let consumed = after_num + unit_len - start;
+    Some(UnitChain {
+        consumed,
+        parts: std::mem::take(parts),
+        family: "currency",
+        per_unit: Some(per_unit_str),
+    })
+}
+
+/// 丙型 formatter：按族分派（DEC-037）。
+fn format_unit_chain(chain: &UnitChain, r: &CompiledRules) -> String {
+    match chain.family {
+        "currency" => format_currency_chain(chain, r),
+        "time" => format_time_chain(chain, r),
+        // ITN-FIX-CURRENCY-017 条件2：weight 族不走通用小数合成，走零乘法拼接
+        "weight" => format_weight_chain(chain),
+        _ => format_generic_chain(chain, r),
+    }
+}
+
+fn format_currency_chain(chain: &UnitChain, r: &CompiledRules) -> String {
+    // ITN-FIX-CHAIN-TEAR-026-B (Gavin 方案 C)：单段 currency 链一律保留原单位
+    //（五块→5块 / 八角→8角 / 五块一斤→5块一斤），不归一到元；多段链才归一到元
+    //（五块一→5.1元 / 一块八毛五→1.85元）。
+    //
+    // 判定依据是段数（parts.len()），不是有没有 per_unit。单段说明用户明确用了某个
+    // 货币单位（块/角/毛），系统不替他改写表达；多段才有合成数值的必要，此时归一到
+    // 元是计算结果而非改写。
+    if chain.parts.len() == 1 {
+        let (num_str, unit) = &chain.parts[0];
+        let body = format!("{}{}", num_str, unit);
+        // 单段链同样可带 per_unit（如「五块一斤」→ 单价限定词仍原样保留）
+        match &chain.per_unit {
+            Some(per) => format!("{}{}", body, per),
+            None => body,
+        }
+    } else {
+
+    let mut total: f64 = 0.0;
+    for (num_str, unit) in &chain.parts {
+        let n: f64 = num_str.parse().unwrap_or(0.0);
+        let mult = r.hierarchy_value(unit, "currency").unwrap_or(1.0);
+        total += n * mult;
+    }
+    let body = if total.fract() == 0.0 {
+        format!("{}元", total as u64)
+    } else {
+        // ITN-FIX-CHAIN-TEAR-026 条件B：去尾随零，与乙型 format_implicit_decimal 行为一致。
+        // 5.80 → 5.8，1.00 → 1，5.01 → 5.01。
+        let s = format!("{:.2}", total);
+        let s = s.trim_end_matches('0').trim_end_matches('.');
+        format!("{}元", s)
+    };
+    // ITN-FIX-CURRENCY-017 条件3：追加单价限定词（原样汉字，如 1.22元一斤）
+    match &chain.per_unit {
+        Some(per) => format!("{}{}", body, per),
+        None => body,
+    }
+    }
+}
+
+/// ITN-FIX-CURRENCY-017 条件2 (候选甲，主控 2026-08-03 拍板)：weight 族链逐 parts 零乘法拼接。
+/// 一斤二两 → 1斤2两（不合成 1.2斤）。末位裸数字（三斤六两五 的 5）不进入本链，由逐字路径自然补出。
+/// ⚠️ unit_hierarchy.weight 中 斤/两 的 value 不参与本函数计算（死数据锁死）—— 若未来接回通用
+/// 小数 formatter，必须先同步更新本函数，否则 一斤二两 会静默变 1.2斤（见 itn-rules.toml 注释）。
+fn format_weight_chain(chain: &UnitChain) -> String {
+    let mut out = String::new();
+    for (num_str, unit) in &chain.parts {
+        out.push_str(num_str);
+        out.push_str(unit);
+    }
+    out
+}
+
+fn format_time_chain(chain: &UnitChain, r: &CompiledRules) -> String {
+    let mut hours: u32 = 0;
+    let mut minutes: u32 = 0;
+    for (num_str, unit) in &chain.parts {
+        let n: u32 = num_str.parse().unwrap_or(0);
+        // 时间族：小时/点→小时；分/分钟→分钟；秒→秒（本批不处理秒级合并）
+        if unit == "小时" || unit == "点" || unit == "时" {
+            hours += n;
+        } else if unit == "分" || unit == "分钟" {
+            minutes += n;
+        }
+        let _ = r; // hierarchy_value 暂不用于时间（直接按单位类型分派）
+    }
+    if minutes == 0 {
+        format!("{}:00", hours)
+    } else {
+        format!("{}:{}", hours, minutes)
+    }
+}
+
+fn format_generic_chain(chain: &UnitChain, r: &CompiledRules) -> String {
+    let main_unit = &chain.parts[0].1;
+    let main_mult = r.hierarchy_value(main_unit, chain.family).unwrap_or(1.0);
+    let mut total: f64 = 0.0;
+    for (num_str, unit) in &chain.parts {
+        let n: f64 = num_str.parse().unwrap_or(0.0);
+        let mult = r.hierarchy_value(unit, chain.family).unwrap_or(main_mult);
+        total += n * mult / main_mult;
+    }
+    if total.fract() == 0.0 {
+        format!("{}{}", total as u64, main_unit)
+    } else {
+        let s = format!("{:.4}", total);
+        let s = s.trim_end_matches('0').trim_end_matches('.');
+        format!("{}{}", s, main_unit)
+    }
+}
+
+// ============================================================
+// ITN-V2-004 (P4) 乙型「隐式小数位」
+// ============================================================
+
+#[derive(Debug, Clone)]
+struct ImplicitDecimal {
+    main_num: String,
+    unit_word: String,
+    tail: String,
+    consumed: usize,
+}
+
+/// 乙型识别器：`N<可小数化单位>M`，M 纯数字尾数后紧邻边界。
+fn try_parse_implicit_decimal(
+    chars: &[char],
+    start: usize,
+    r: &CompiledRules,
+) -> Option<ImplicitDecimal> {
+    let (main_num, num_consumed) = parse_cn_number(chars, start, Some(r))?;
+    if num_consumed == 0 {
+        return None;
+    }
+    let after_num = start + num_consumed;
+    let rest: String = chars[after_num..].iter().collect();
+    if !r.is_decimalizable(&rest) {
+        return None;
+    }
+    // date_suffix（点/分/秒）不走乙型，但「度」是温度单位兼date_suffix，允许
+    if r.date_suffixes.iter().any(|d| rest.starts_with(d.as_str())) && !rest.starts_with("度") {
+        return None;
+    }
+    let (unit_len, unit_word) = r.match_unit_word(chars, after_num)?;
+    let after_unit = after_num + unit_len;
+    let mut tail_chars: Vec<char> = Vec::new();
+    let mut pos = after_unit;
+    while pos < chars.len() {
+        if let Some(d) = chinese_digit_char(chars[pos]) {
+            // ITN-FIX-CURRENCY-017：尾数遇到单位词开头 → 终止。`一斤二两` 的「两」是重量
+            // 单位而非小数位（两=2 兼数字，会被 chinese_digit_char 吞进尾数 → 1.22斤）。
+            // `三块两毛` 的「两」同理：乙型让位，由丙型按显式链 [3块,2毛] 处理。
+            if r.match_unit_word(chars, pos).is_some() {
+                break;
+            }
+            tail_chars.push(d);
+            pos += 1;
+        } else {
+            break;
+        }
+    }
+    if tail_chars.is_empty() {
+        return None;
+    }
+    // 边界护栏：尾数后必须紧邻边界
+    if pos < chars.len() && !is_boundary_char(chars[pos]) {
+        return None;
+    }
+    let tail: String = tail_chars.iter().collect();
+    Some(ImplicitDecimal {
+        main_num,
+        unit_word,
+        tail,
+        consumed: pos - start,
+    })
+}
+
+fn is_boundary_char(ch: char) -> bool {
+    ch.is_ascii_punctuation() || is_cjk_punctuation(ch) || ch.is_whitespace()
+}
+
+fn is_cjk_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        '。' | '，'
+            | '、'
+            | '；'
+            | '：'
+            | '？'
+            | '！'
+            | '"'
+            | '"'
+            | '\''
+            | '\''
+            | '《'
+            | '》'
+            | '（'
+            | '）'
+    )
+}
+
+/// 乙型 formatter：`N.M单位`（尾数逐位作小数位）。
+/// 货币族归一到「元」（DEC-037 Gavin 拍板）；其他族保留原单位。
+fn format_implicit_decimal(id: &ImplicitDecimal, r: &CompiledRules) -> String {
+    let families = r.unit_families(&id.unit_word);
+    if families.contains(&"currency") {
+        // 货币归一：N.M单位 → N.M元（块/角/毛/分 → 元）
+        // 块=元，所以 5.8块=5.8元；角/毛/分 需按倍率换算
+        let mult = r.hierarchy_value(&id.unit_word, "currency").unwrap_or(1.0);
+        let main: f64 = id.main_num.parse().unwrap_or(0.0);
+        let tail_val: f64 = format!("0.{}", id.tail).parse().unwrap_or(0.0);
+        let total = (main + tail_val) * mult;
+        if total.fract() == 0.0 {
+            format!("{}元", total as u64)
+        } else {
+            // 去尾零：5.80→5.8，5.83→5.83
+            let s = format!("{:.2}", total);
+            let s = s.trim_end_matches('0').trim_end_matches('.');
+            format!("{}元", s)
+        }
+    } else {
+        format!("{}.{}{}", id.main_num, id.tail, id.unit_word)
+    }
+}
+
+// ============================================================
+// ITN-V2-003 (P3 甲型文法)：余数后缀（半/刻）
+// ============================================================
+
+/// 甲型识别器输出（识别器与 formatter 分离，沿用 001 架构）。
+#[derive(Debug, Clone)]
+struct RemainderSuffix {
+    /// 主数（阿拉伯数字串，如 "4"/"1"/"39"）
+    main_num: String,
+    /// 单位词原文（如 "点"/"吨"/"寸"）；量词穿透时为通用量词（"个"），真实单位在 `real_unit`
+    unit_word: String,
+    /// 量词穿透：若 `unit_word` 是通用量词且后跟真实单位，此处存真实单位；否则 None
+    real_unit: Option<String>,
+    /// 余数值（分钟数用于时间族，或 0.5 用于度量衡）
+    remainder: RemainderKind,
+    /// 识别器消耗的源字符数
+    consumed: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RemainderKind {
+    /// 半 = 0.5（度量衡）或 30分（时间）
+    Half,
+    /// 刻 = N×15分（仅时间，N∈{1,2,3}）
+    Quarter(u32),
+}
+
+/// 甲型识别器：尝试在 `start` 处匹配余数后缀文法。
+///
+/// 两种子模式：
+/// 1. **半模式** `N<单位>半`：主数 + 单位 + `半`（时间/度量衡/量词穿透）
+/// 2. **刻模式** `N点M刻`：主数 + `点` + M(1/2/3) + `刻`（仅时间）
+///
+/// 反例护栏：
+/// - `一刻钟`：`刻` 后跟 `钟` → 否决
+/// - `半小时`/`半个小时`：前置 `半` 无主数 → 不匹配
+/// - `三点五`：`五` 是数字非 `半/刻` → 不匹配
+fn try_parse_remainder_suffix(
+    chars: &[char],
+    start: usize,
+    r: &CompiledRules,
+) -> Option<RemainderSuffix> {
+    // 解析主数
+    let (main_num, num_consumed) = parse_cn_number(chars, start, Some(r))?;
+    if num_consumed == 0 {
+        return None;
+    }
+    let after_num = start + num_consumed;
+    let rest: String = chars[after_num..].iter().collect();
+
+    // 尝试半模式：N<单位>半
+    if let Some(rs) =
+        try_parse_half_mode(chars, start, &main_num, num_consumed, after_num, &rest, r)
+    {
+        return Some(rs);
+    }
+    // 尝试刻模式：N点M刻（仅时间）
+    if let Some(rs) =
+        try_parse_quarter_mode(chars, start, &main_num, num_consumed, after_num, &rest, r)
+    {
+        return Some(rs);
+    }
+    None
+}
+
+/// 半模式：N<单位>半
+fn try_parse_half_mode(
+    _chars: &[char],
+    _start: usize,
+    main_num: &str,
+    num_consumed_inner: usize,
+    after_num: usize,
+    rest: &str,
+    r: &CompiledRules,
+) -> Option<RemainderSuffix> {
+    // 时间族：date_suffix（点/分/秒）+ 半
+    if let Some(len) = r.match_date_suffix_len(rest) {
+        let after_unit = after_num + len;
+        if _chars.get(after_unit) == Some(&'半') {
+            let word: String = _chars[after_num..after_num + len].iter().collect();
+            return Some(RemainderSuffix {
+                main_num: main_num.to_string(),
+                unit_word: word,
+                real_unit: None,
+                remainder: RemainderKind::Half,
+                consumed: num_consumed_inner + len + 1,
+            });
+        }
+    }
+    // 度量衡族：真单位（排除 classifiers）+ 半
+    if r.is_real_unit(rest) {
+        let (len, word) = r.match_unit_word(_chars, after_num)?;
+        let after_unit = after_num + len;
+        if _chars.get(after_unit) == Some(&'半') {
+            return Some(RemainderSuffix {
+                main_num: main_num.to_string(),
+                unit_word: word,
+                real_unit: None,
+                remainder: RemainderKind::Half,
+                consumed: num_consumed_inner + len + 1,
+            });
+        }
+    }
+    // 量词穿透：通用量词 + 半 + 真单位（一个半小时=1.5小时）
+    // 结构：N<量词>半<真单位>，与普通 N<单位>半 顺序不同
+    let cls = r
+        .classifier_set
+        .iter()
+        .find(|c| rest.starts_with(c.as_str()))?;
+    let cls_len = cls.chars().count();
+    let after_cls = after_num + cls_len;
+    // 量词后必须是「半」
+    if _chars.get(after_cls) != Some(&'半') {
+        return None;
+    }
+    let after_half = after_cls + 1;
+    if after_half >= _chars.len() {
+        return None;
+    }
+    // 半后必须是真单位
+    let rest2: String = _chars[after_half..].iter().collect();
+    if !r.is_real_unit(&rest2) {
+        return None;
+    }
+    let (real_len, real_word) = r.match_unit_word(_chars, after_half)?;
+    let cls_word: String = _chars[after_num..after_num + cls_len].iter().collect();
+    Some(RemainderSuffix {
+        main_num: main_num.to_string(),
+        unit_word: cls_word,
+        real_unit: Some(real_word),
+        remainder: RemainderKind::Half,
+        consumed: num_consumed_inner + cls_len + 1 + real_len,
+    })
+}
+
+/// 刻模式：N点M刻（仅时间族）
+fn try_parse_quarter_mode(
+    chars: &[char],
+    _start: usize,
+    main_num: &str,
+    num_consumed_inner: usize,
+    after_num: usize,
+    rest: &str,
+    r: &CompiledRules,
+) -> Option<RemainderSuffix> {
+    // 必须以「点」开头
+    if !rest.starts_with('点') {
+        return None;
+    }
+    let after_point = after_num + 1;
+    // 解析 M（1/2/3，单字）
+    let (_m_str, m_consumed) = parse_cn_number(chars, after_point, Some(r))?;
+    if m_consumed == 0 {
+        return None;
+    }
+    let after_m = after_point + m_consumed;
+    // 必须是「刻」
+    if chars.get(after_m) != Some(&'刻') {
+        return None;
+    }
+    // 刻后跟「钟」→否决（一刻钟=时长）
+    if after_m + 1 < chars.len() && chars[after_m + 1] == '钟' {
+        return None;
+    }
+    // M 必须是 1/2/3
+    let m: u32 = _m_str.parse().ok()?;
+    if m == 0 || m > 3 {
+        return None;
+    }
+    Some(RemainderSuffix {
+        main_num: main_num.to_string(),
+        unit_word: "点".to_string(),
+        real_unit: None,
+        remainder: RemainderKind::Quarter(m),
+        consumed: num_consumed_inner + 1 + m_consumed + 1,
+    })
+}
+
+/// 甲型 formatter：按单位族分派渲染（DEC-037）。
+fn format_remainder_suffix(rs: &RemainderSuffix) -> String {
+    let unit = rs.real_unit.as_ref().unwrap_or(&rs.unit_word);
+    let is_time = rs.real_unit.is_none() && rs.unit_word == "点";
+
+    if is_time {
+        // 时间族 → H:MM
+        let h: u32 = rs.main_num.parse().unwrap_or(0);
+        let mm = match rs.remainder {
+            RemainderKind::Half => 30,
+            RemainderKind::Quarter(n) => (n * 15) % 60,
+        };
+        if mm == 0 {
+            format!("{}:00", h)
+        } else {
+            format!("{}:{}", h, mm)
+        }
+    } else {
+        // 度量衡 / 量词穿透 → N.5单位
+        format!("{}.5{}", rs.main_num, unit)
+    }
+}
+
+/// ITN-V2-004 (P4 任务C) 扫描「数字+跟随字符」链的终点。
+/// 链 = 连续的「中文数字 + 单位/date_suffix/classifier」序列。
+/// 终止于：非数字非单位非量词字符，或标点/空白（链终止符）。
+fn scan_chain_end(chars: &[char], start: usize, r: &CompiledRules) -> usize {
+    let mut pos = start;
+    loop {
+        // 数字段
+        if pos >= chars.len()
+            || !(is_cn_num_char(chars[pos]) || chars[pos] == '零' || chars[pos] == '〇')
+        {
+            break;
+        }
+        let (_, num_consumed) = match parse_cn_number(&chars[pos..], 0, Some(r)) {
+            Some(v) => v,
+            None => break,
+        };
+        if num_consumed == 0 {
+            break;
+        }
+        pos += num_consumed;
+        if pos >= chars.len() {
+            break;
+        }
+        // 跟随字符：单位/date_suffix/classifier？
+        let rest: String = chars[pos..].iter().collect();
+        if r.is_unit(&rest)
+            || r.is_date_suffix(&rest)
+            || r.classifier_set
+                .iter()
+                .any(|c| rest.starts_with(c.as_str()))
+        {
+            let unit_len = r
+                .match_unit_word(chars, pos)
+                .map(|(l, _)| l)
+                .or_else(|| r.match_date_suffix_len(&rest))
+                .or_else(|| {
+                    r.classifier_set
+                        .iter()
+                        .find(|c| rest.starts_with(c.as_str()))
+                        .map(|c| c.chars().count())
+                })
+                .unwrap_or(0);
+            if unit_len == 0 {
+                break;
+            }
+            pos += unit_len;
+        } else {
+            break;
+        }
+        // 标点/空白 → 链终止
+        if pos < chars.len() && is_boundary_char(chars[pos]) {
+            break;
+        }
+    }
+    pos
+}
+
+/// ITN-V2-004 (P4 任务C) 全或无检查：链中所有数字段是否一致（全转或全不转）。
+/// 返回 true = 一致（可继续逐字路径）；false = 混合（整段原样输出）。
+fn check_chain_consistency(chars: &[char], start: usize, r: &CompiledRules) -> bool {
+    let mut pos = start;
+    let mut any_convert = false;
+    let mut any_not_convert = false;
+
+    loop {
+        if pos >= chars.len()
+            || !(is_cn_num_char(chars[pos]) || chars[pos] == '零' || chars[pos] == '〇')
+        {
+            break;
+        }
+        let (num_str, num_consumed) = match parse_cn_number(&chars[pos..], 0, Some(r)) {
+            Some(v) => v,
+            None => break,
+        };
+        if num_consumed == 0 {
+            break;
+        }
+        let after_num = pos + num_consumed;
+        let after_str: String = if after_num < chars.len() {
+            chars[after_num..].iter().collect()
+        } else {
+            String::new()
+        };
+        let should =
+            decide_conversion(&num_str, num_consumed, chars, pos, after_num, &after_str, r);
+        if should {
+            any_convert = true;
+        } else {
+            any_not_convert = true;
+        }
+        pos = after_num;
+        if pos >= chars.len() {
+            break;
+        }
+        // 跟随字符
+        let rest: String = chars[pos..].iter().collect();
+        if r.is_unit(&rest)
+            || r.is_date_suffix(&rest)
+            || r.classifier_set
+                .iter()
+                .any(|c| rest.starts_with(c.as_str()))
+        {
+            let unit_len = r
+                .match_unit_word(chars, pos)
+                .map(|(l, _)| l)
+                .or_else(|| r.match_date_suffix_len(&rest))
+                .or_else(|| {
+                    r.classifier_set
+                        .iter()
+                        .find(|c| rest.starts_with(c.as_str()))
+                        .map(|c| c.chars().count())
+                })
+                .unwrap_or(0);
+            if unit_len == 0 {
+                break;
+            }
+            pos += unit_len;
+        } else {
+            break;
+        }
+        if pos < chars.len() && is_boundary_char(chars[pos]) {
+            break;
+        }
+    }
+
+    !(any_convert && any_not_convert)
+}
+
 fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut result = String::new();
     let mut i = 0;
 
     while i < chars.len() {
-        // 检查保护白名单（最长匹配优先）
+        // 检查保护白名单（最长匹配优先）——在甲型文法之前。
+        // 理由：保护词表（如「五一」）应优先于甲型文法，避免「五一点半」被甲型
+        // 误转为「51:30」。移除的甲型词条（八点半等）不再命中保护，自然落入甲型。
         if let Some(skip) = check_protection(&chars, i, r) {
             // 输出受保护的原文
             for ch in &chars[i..i + skip] {
@@ -701,6 +1859,31 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
             }
             i += skip;
             continue;
+        }
+        // ITN-V2-003 (P3 甲型文法)：余数后缀（半/刻）匹配。
+        if is_cn_num_char(chars[i]) || chars[i] == '零' || chars[i] == '〇' {
+            if let Some(rs) = try_parse_remainder_suffix(&chars, i, r) {
+                result.push_str(&format_remainder_suffix(&rs));
+                i += rs.consumed;
+                continue;
+            }
+        }
+        // ITN-V2-004 (P4 乙型)：隐式小数位 N<可小数化单位>M（M后紧邻边界）。
+        if is_cn_num_char(chars[i]) || chars[i] == '零' || chars[i] == '〇' {
+            if let Some(id) = try_parse_implicit_decimal(&chars, i, r) {
+                result.push_str(&format_implicit_decimal(&id, r));
+                i += id.consumed;
+                continue;
+            }
+        }
+        // ITN-V2-004 (P4 丙型)：显式多级单位链（取代③，用break不return None）。
+        // 货币归一(11.92元)/时间H:MM(3:20)/度量衡小数合并。
+        if is_cn_num_char(chars[i]) || chars[i] == '零' || chars[i] == '〇' {
+            if let Some(chain) = try_parse_unit_chain(&chars, i, r) {
+                result.push_str(&format_unit_chain(&chain, r));
+                i += chain.consumed;
+                continue;
+            }
         }
 
         // 检查百分比 "百分之X"
@@ -765,6 +1948,27 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
         // 检查日期时间前缀 "上午X点" "下午X点"
         if let Some(prefix_len) = match_date_prefix(&chars, i, r) {
             let after = i + prefix_len;
+            // ITN-V2-FIX-TIMEPREFIX-001：文法优先让位 —— 若数字位置能被甲/乙/丙型识别，
+            // 只输出前缀并把游标交还主循环，让下一轮迭代正常走文法分支（如「下午四点三刻」→
+            // 甲型刻模式产出 4:45）。否则时段词分支会抢先消费数字导致甲型被跳过。
+            // 主控修正：必须用 get() 越界安全取字符。match_date_prefix 只做 starts_with，
+            // 对前缀之后是否还有字符无任何要求 —— 文本恰好以时段词结尾（「改到明天下午」
+            // 「那就晚上」）时 after == chars.len()，直接索引 chars[after] 会 panic。
+            if chars
+                .get(after)
+                .is_some_and(|c| is_cn_num_char(*c) || *c == '零' || *c == '〇')
+            {
+                if try_parse_remainder_suffix(&chars, after, r).is_some()
+                    || try_parse_implicit_decimal(&chars, after, r).is_some()
+                    || try_parse_unit_chain(&chars, after, r).is_some()
+                {
+                    for ch in &chars[i..after] {
+                        result.push(*ch);
+                    }
+                    i = after;
+                    continue;
+                }
+            }
             // 前缀后跟数字+时间后缀
             if let Some((num_str, consumed)) = parse_cn_number(&chars, after, Some(r)) {
                 if consumed > 0 {
@@ -849,6 +2053,21 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
                         decide_conversion(&num_str, consumed, &chars, i, after_num, &after_str, r);
 
                     if should_convert {
+                        // ITN-V2-004 (P4 任务C) 全或无撕裂防护：
+                        // Gavin 2026-07-31 指令「三年二班这种就直接不转」。
+                        // 在逐字路径转换前，扫描整个「数字+跟随字符」链，若部分转部分不转→整段不转。
+                        // 这是逐字路径的守门员（甲/乙/丙型已在前面处理，此处只管逐字路径）。
+                        // 链定义：连续「中文数字+单位/date_suffix/classifier」序列，
+                        // 终止于非数字非单位非量词字符（如的/有/班非单位）。
+                        if !check_chain_consistency(&chars, i, r) {
+                            // 链中混合 → 整段原样输出，游标跳过整个链
+                            let chain_end = scan_chain_end(&chars, i, r);
+                            for ch in &chars[i..chain_end] {
+                                result.push(*ch);
+                            }
+                            i = chain_end;
+                            continue;
+                        }
                         result.push_str(&num_str);
                         // TEMP-CELSIUS-001: 摄氏关键词 → 输出 ℃ 符号
                         // 仅当匹配单位词含"摄氏"时替换（"三十摄氏度"→"30℃"，
@@ -1025,8 +2244,16 @@ fn decide_conversion(
     after_str: &str,
     r: &CompiledRules,
 ) -> bool {
-    // 如果后面有单位 → 转
-    if r.is_unit(after_str) {
+    // ITN-FIX-CURRENCY-017 条件1：虚指数量短语（一两个/三两天/三两句话/三两个人）整体保汉字。
+    // 置于最前：即使「两」已注册为重量单位（下方 is_real_unit 会命中），虚指语境也不转。
+    if is_virtual_two_phrase(chars, start) {
+        return false;
+    }
+    // 如果后面有真单位（排除 classifiers）→ 转
+    // ITN-V2-006 (红2修复)：从 is_unit 改为 is_real_unit，使双隶属词（间/条/次/名/台/辆/句/篇）
+    // 在逐字路径与甲型路径行为一致。`五间半`→`间`在 all_units+classifier_set →
+    // is_real_unit 返回 false → 不转 → 保持汉字。符合 DEC-030「单字数字+通用量词保留汉字」。
+    if r.is_real_unit(after_str) {
         return true;
     }
     // 如果后面有日期后缀 → 转
@@ -1064,6 +2291,16 @@ fn decide_conversion(
             let _ = cls;
             return false; // 保留"三个人"
         }
+        // ITN-FIX-CURRENCY-017 条件1 后续数字护栏：`两三天` 的「三」在虚指短语内 → 不转。
+        // 无此护栏时，unit_preceded 会因「两」已注册为重量单位而把「三」误转成 3（两3天）。
+        // 仅命中 两+[一二三]+量词 结构，`六两五` 的「五」（∉一二三）不受影响，仍由逐字转 5。
+        if start > 0 && chars[start - 1] == '两' && matches!(chars[start], '一' | '二' | '三') {
+            let after_d: String = chars[start + 1..].iter().collect();
+            const QUANT2: &[&str] = &["个", "只", "天", "句", "次", "回"];
+            if QUANT2.iter().any(|q| after_d.starts_with(q)) {
+                return false;
+            }
+        }
         // 检查前面是否是单位（货币/量纲后小数模式："五块八" → "5块8"）
         if start > 0 {
             let before_text: String = chars[..start].iter().collect();
@@ -1078,36 +2315,112 @@ fn decide_conversion(
     false
 }
 
+/// ITN-FIX-CURRENCY-017 条件1 虚指护栏：近似数量短语整体保汉字。
+/// 覆盖主控指定族：一两个人、两三个人、三两个人、一两个、两三天、三两天、三两句话。
+/// 两种模式：
+/// - A: `[一二三] 两 <量词>`（三两个人/三两天/三两句话/一两个）
+/// - B: `两 [一二三] <量词>`（两三个人/两三天）
+/// 量词集合与条件一致（个/只/天/句/次/回 等）。注意：`三两酒`（三+两+酒）不在集合内 →
+/// 「酒」非量词 → 仍按重量转 3两酒，虚指护栏不误伤真实度量。
+fn is_virtual_two_phrase(chars: &[char], start: usize) -> bool {
+    if start + 2 > chars.len() {
+        return false;
+    }
+    const QUANT: &[&str] = &["个", "只", "天", "句", "次", "回"];
+    // 模式A: [一二三] 两 <量词>
+    if matches!(chars[start], '一' | '二' | '三') && chars.get(start + 1) == Some(&'两') {
+        let after_two: String = chars[start + 2..].iter().collect();
+        if QUANT.iter().any(|q| after_two.starts_with(q)) {
+            return true;
+        }
+    }
+    // 模式B: 两 [一二三] <量词>（量词紧跟数字后，如 两三个人/两三天）
+    if chars[start] == '两' && matches!(chars.get(start + 1), Some('一' | '二' | '三')) {
+        let after_q: String = chars[start + 2..].iter().collect();
+        if QUANT.iter().any(|q| after_q.starts_with(q)) {
+            return true;
+        }
+    }
+    false
+}
+
 /// 检查保护白名单，返回匹配长度（0=未匹配）
 fn check_protection(chars: &[char], start: usize, r: &CompiledRules) -> Option<usize> {
     let rest: String = chars[start..].iter().collect();
 
-    // 成语（最长匹配优先，4字）
-    for idiom in &r.idiom_set {
-        if rest.starts_with(idiom.as_str()) {
-            return Some(idiom.chars().count());
-        }
+    // 成语——ITN-V2-003：改确定性最长匹配（一致性收口，五个 set 统一语义）。
+    // 盘点 45 条 0 前缀重叠，max() 与 find_map 今天结果相同，零风险；
+    // 改动消除「靠注释传递纪律」的脆弱性（1877 行注释「无前缀冲突」已被 002 证伪）。
+    let matched_idiom = r
+        .idiom_set
+        .iter()
+        .filter(|idiom| rest.starts_with(idiom.as_str()))
+        .map(|idiom| idiom.chars().count())
+        .max();
+    if let Some(skip) = matched_idiom {
+        return Some(skip);
     }
 
-    // 专有名词
-    for noun in &r.proper_noun_set {
-        if rest.starts_with(noun.as_str()) {
-            return Some(noun.chars().count());
+    // 专有名词——ITN-V2-002：改确定性最长匹配（HashSet 迭代顺序不确定，find_map
+    // 会导致 `十一月` 在 `十一` 与 `十一月` 之间随机命中，输出不确定）。
+    // 盘点出 4 组前缀重叠：五一⊂五一广场、十一⊂{十一国庆,十一月,十一边形}。
+    // max() 与遍历顺序无关 → 确定性；3 字条目 `十一月` 胜出 → 非纯数字词 →
+    // 不触发①右邻否决 → 保护生效 → 稳定输出 `十一月`（白名单作者原意）。
+    let matched_noun = r
+        .proper_noun_set
+        .iter()
+        .filter(|noun| rest.starts_with(noun.as_str()))
+        .map(|noun| noun.chars().count())
+        .max();
+
+    // ITN-V2-001 (R2 缺陷A ①右邻否决)：仅对含进位单位的纯数字词撤销保护。
+    // 保护词若全由中文数字字符组成（如「十一」「五一」「八一」）且紧邻右侧是
+    // 单位/date_suffix，则撤销保护——避免「十一块」前半被保护、后半照转的撕裂。
+    // ③ 块级匹配已在主循环先行拦截「数字+单位+数字+单位」复合块；此处兜底
+    // 处理未形成复合块的单段「保护数字+单位」（如「十一块」后无更多数字）。
+    //
+    // ⚠️ 逐位串兜底（主控约束）：`五一`/`七一`/`八一` 等纯逐位串（无进位单位十/百/
+    // 千/万/亿）不撤销——它们在节日语境是名称而非数字（`五一点半`≠`51点半`）。
+    // 仅当词含进位单位（`十一`/`十五`/`二十五`）才撤销，此时 `parse_cn_number`
+    // 按进位组合解析（`十一`→`11`），非逐位串，语义安全。
+    // 兜底：撤销后主循环走 parse_cn_number，若 decide_conversion 返回 false
+    // 则字符原样输出，保护语义自然回退。
+    if let Some(skip) = matched_noun {
+        let word: String = chars[start..start + skip].iter().collect();
+        let after = start + skip;
+        if is_pure_cn_digit_word(&word) && word.chars().any(is_cn_unit_char) && after < chars.len()
+        {
+            let right: String = chars[after..].iter().collect();
+            if r.is_unit(&right) || r.is_date_suffix(&right) {
+                return None; // 撤销保护，交给主循环 parse_cn_number
+            }
         }
+        return Some(skip);
     }
 
     // ITN-SMART-002: 历史/文化/民俗词汇（"五代十国"等）
-    for hist in &r.historical_set {
-        if rest.starts_with(hist.as_str()) {
-            return Some(hist.chars().count());
-        }
+    // ITN-V2-002：改确定性最长匹配。盘点出 4 组前缀重叠：
+    // 五代⊂五代十国、三十六计⊂三十六计走为上计、四海⊂四海八荒、三省⊂三省吾身。
+    let matched_hist = r
+        .historical_set
+        .iter()
+        .filter(|hist| rest.starts_with(hist.as_str()))
+        .map(|hist| hist.chars().count())
+        .max();
+    if let Some(skip) = matched_hist {
+        return Some(skip);
     }
 
     // 虚词"一"的搭配
-    for fw in &r.function_word_set {
-        if rest.starts_with(fw.as_str()) {
-            return Some(fw.chars().count());
-        }
+    // ITN-V2-002：改确定性最长匹配。盘点出 1 组前缀重叠：一下⊂一下子。
+    let matched_fw = r
+        .function_word_set
+        .iter()
+        .filter(|fw| rest.starts_with(fw.as_str()))
+        .map(|fw| fw.chars().count())
+        .max();
+    if let Some(skip) = matched_fw {
+        return Some(skip);
     }
 
     // ITN-COLLISION-TYPEA-002: 单位前缀碰撞保护（机器派生词表，优先级低于上方人工分组）
@@ -1240,7 +2553,8 @@ mod tests {
 
     #[test]
     fn multi_digit_25000() {
-        assert_eq!(normalize_test("两万五"), "25000");
+        // ITN-FIX-BIGNUM-027-D (DEC-042)：隐式补全保留锚定单位，「两万五」从 25000 → 2.5万
+        assert_eq!(normalize_test("两万五"), "2.5万");
     }
 
     #[test]
@@ -1287,12 +2601,18 @@ mod tests {
 
     #[test]
     fn time_afternoon() {
-        assert_eq!(normalize_test("下午三点五十分"), "下午3点50分");
+        // TEST-SYNC-ITN-V2-007：断言更新。ITN-V2-FIX-TIMEPREFIX-001（时段词前缀
+        // 不再抢先消费数字）落地后，「下午三点五十分」在时段词分支让位给丙型
+        // try_parse_unit_chain 接管 → 产出 `下午3:50`（DEC-037 时间族归一为 H:MM
+        // 通用书写形式）。旧值 `下午3点50分` 是时段词分支抢先消费产物，已过时。
+        assert_eq!(normalize_test("下午三点五十分"), "下午3:50");
     }
 
     #[test]
     fn time_half() {
-        assert_eq!(normalize_test("八点半"), "8点半");
+        // TEST-SYNC-ITN-V2-001 (A类)：旧断言 "8点半" 过时 —— ITN-V2-003 (P3 甲型) 上线后
+        // 「八点半」走甲型半模式（时间族 H:MM），半=30分。CHANGELOG ENGINE-003/004 实证。
+        assert_eq!(normalize_test("八点半"), "8:30");
     }
 
     // ============================================================
@@ -1338,7 +2658,9 @@ mod tests {
 
     #[test]
     fn money_kuai() {
-        assert_eq!(normalize_test("五块八"), "5块8");
+        // TEST-SYNC-ITN-V2-001 (A类)：旧断言 "5块8" 过时 —— ITN-V2-004 (P4 乙型/丙型) +
+        // DEC-037 货币归一上线后，「五块八」走乙型隐式小数，块→元归一。ENGINE-004 实证。
+        assert_eq!(normalize_test("五块八"), "5.8元");
     }
 
     #[test]
@@ -1727,23 +3049,45 @@ words = ["度", "摄氏度"]
         assert_eq!(normalize_test("二十面体"), "二十面体");
     }
 
-    /// P1-3: 匹配顺序隐患护栏（注释说明）
+    /// P1-3: 匹配顺序隐患护栏 —— ITN-V2-ENGINE-002 根治后由「注释说明」升级为真断言。
     ///
-    /// 无法用测试表达：check_protection（src/itn.rs:1063）遍历 HashSet，
-    /// 迭代顺序未定义（因 proper_noun_set 是 HashSet<String>）。
-    /// 当前 itn-rules.toml 无互相为前缀的条目冲突：
-    ///   - 「三角」族（三角洲/三角债/三角恋…）起点相同但「三角」不在白名单内
-    ///   - 同一几何图形组内各条目互不为前缀
+    /// 旧注释声称「无互相为前缀的条目冲突」，已被 coder-1 盘点证伪（4 组前缀重叠：
+    /// 五一⊂五一广场、十一⊂{十一国庆,十一月,十一边形}；historical 另有 4 组、
+    /// function_words 有一下⊂一下子）。ENGINE-002 将三个有重叠的 set 从 find_map
+    /// （HashSet RandomState 迭代顺序不定 → 输出不确定）改为 filter+max()
+    /// （确定性最长匹配），idioms/classifiers 无重叠保持原样。
     ///
-    /// 隐患：若将来有人同时加入「三角」和「三角洲」，此二条互为前缀关系，
-    /// 而 HashSet 迭代顺序未定义 → 先遍历到「三角」则匹配 2 字，「三角洲」
-    /// 的保护被截断为「三角」+「洲」单独处理。但「洲」无单位语境 → 不会被误转，
-    /// 只是保护不完全。修复方法：entry 加入时确保无前缀重叠，或改用 BTreeSet
-    /// 并实现最长匹配优先。当前无实例，无法写确定性测试。
+    /// 本测试锁定确定性语义：最长匹配必先命中（十一月=3 字而非 十一=2 字），
+    /// 且多次独立调用结果恒定 —— test 通过即证明 filter+max() 与遍历顺序无关。
     #[test]
     fn geometric_order_hazard_documented() {
-        // 本条仅为确保注释可见（空断言），隐患已在文档中记录
-        assert!(true);
+        let r = rules();
+        // 十一月：3 字条目（十一月）胜出，不得退化为 2 字（十一）
+        let chars: Vec<char> = "十一月".chars().collect();
+        for _ in 0..5 {
+            assert_eq!(
+                check_protection(&chars, 0, r),
+                Some(3),
+                "十一月 必须命中最长匹配 3 字（ENGINE-002 filter+max() 确定性）"
+            );
+        }
+        // 十一：孤立出现命中 2 字
+        let chars: Vec<char> = "十一".chars().collect();
+        assert_eq!(check_protection(&chars, 0, r), Some(2));
+        // ①右邻否决：十一（纯数字进位词）+ 块（单位）→ 撤销保护交给主循环
+        let chars: Vec<char> = "十一块".chars().collect();
+        assert_eq!(check_protection(&chars, 0, r), None);
+        // 五一广场：4 字条目胜出；五一（逐位串无进位）孤立命中 2 字且不否决
+        let chars: Vec<char> = "五一广场".chars().collect();
+        assert_eq!(check_protection(&chars, 0, r), Some(4));
+        let chars: Vec<char> = "五一".chars().collect();
+        assert_eq!(check_protection(&chars, 0, r), Some(2));
+        // 端到端确定性（P2）：十一月 多次独立归一结果恒定
+        let first = normalize_test("十一月");
+        assert_eq!(first, "十一月");
+        for _ in 0..5 {
+            assert_eq!(normalize_test("十一月"), first);
+        }
     }
 
     // ============================================================
@@ -1956,5 +3300,1318 @@ words = ["度"]
     #[test]
     fn unit_symbol_e2e_llm_output() {
         assert_eq!(normalize_test("温度是40摄氏度。"), "温度是40℃。");
+    }
+
+    // ============================================================
+    // TEST-SYNC-ITN-V2-001 (D类) ITN-V2 双通道 + 甲/乙/丙型 + 全或无 + 地名
+    // ============================================================
+
+    // ------------------------------------------------------------
+    // P1 · DEC-036 双通道：主通道（normalize_numbers，LLM 前）+
+    // 补丁通道（normalize_unit_symbols_only，LLM 后）
+    // 三条路径（LLM 成功/运行时失败兜底/LLM 关闭）在 main.rs run_pipeline
+    // 内联实现、无单测接缝（生产代码零改动约束下无法拆分），
+    // 此处锁定可单测的 ITN 侧契约（见 result.md 覆盖缺口清单）。
+    // ------------------------------------------------------------
+
+    #[test]
+    fn itn_v2_dual_channel_main_normalizes_all() {
+        // 主通道（LLM 之前）：中文数字→阿拉伯 + 单位符号规整
+        assert_eq!(normalize_numbers("四十摄氏度"), "40℃");
+        assert_eq!(normalize_numbers("八点半"), "8:30");
+    }
+
+    #[test]
+    fn itn_v2_dual_channel_patch_catches_unit_symbols_only() {
+        // 补丁通道（LLM 之后）：只做单位符号规整，捞回 LLM 纠正同音错字后的「40摄氏度」
+        assert_eq!(normalize_unit_symbols_only("40摄氏度"), "40℃");
+        // 不重跑中文数字→阿拉伯转换（第一阶段）
+        assert_eq!(normalize_unit_symbols_only("八点半"), "八点半");
+        // 翻译路径英文输出：no-op 逐字节不变
+        assert_eq!(
+            normalize_unit_symbols_only("The temperature is 40 degrees."),
+            "The temperature is 40 degrees."
+        );
+    }
+
+    #[test]
+    fn itn_v2_dual_channel_patch_idempotent_after_main() {
+        // 幂等性（DEC-036）：主通道产出「40℃」后，补丁通道重跑逐字节不变
+        let main_out = normalize_numbers("四十摄氏度");
+        assert_eq!(main_out, "40℃");
+        let patch_out = normalize_unit_symbols_only(&main_out);
+        assert_eq!(
+            patch_out, main_out,
+            "补丁通道对主通道产出的 ℃ 必须逐字节不变"
+        );
+    }
+
+    // ------------------------------------------------------------
+    // P2 · 撕裂修复 + 确定性
+    // ------------------------------------------------------------
+
+    #[test]
+    fn itn_v2_p2_shiyikuai_jiumaoer_normalized() {
+        // 十一块九毛二 → 11.92元（P4 丙型货币归一后的 P2 验收形态）
+        assert_eq!(normalize_test("十一块九毛二"), "11.92元");
+    }
+
+    #[test]
+    fn itn_v2_p2_shiyiyue_deterministic() {
+        // 十一月 多次独立运行输出恒定（ENGINE-002 filter+max() 确定性）
+        let first = normalize_test("十一月");
+        assert_eq!(first, "十一月");
+        for _ in 0..5 {
+            assert_eq!(normalize_test("十一月"), first);
+        }
+    }
+
+    #[test]
+    fn itn_v2_p2_wuyi_yiban_preserved() {
+        // 五一点半 保持（①右邻否决的逐位串兜底：五一 无进位单位不撤销）
+        assert_eq!(normalize_test("五一点半"), "五一点半");
+    }
+
+    // ------------------------------------------------------------
+    // P3 · 甲型文法（半/刻）
+    // ------------------------------------------------------------
+
+    #[test]
+    fn itn_v2_p3_jia_time_half() {
+        // 时间族：N点半 → H:MM（半=30 分）
+        assert_eq!(normalize_test("四点半"), "4:30");
+        assert_eq!(normalize_test("八点半"), "8:30");
+        assert_eq!(normalize_test("一点半"), "1:30");
+        assert_eq!(normalize_test("两点半"), "2:30");
+        assert_eq!(normalize_test("十二点半"), "12:30");
+    }
+
+    #[test]
+    fn itn_v2_p3_jia_quarter_mode() {
+        // 刻模式：N点M刻（仅时间，M∈{1,2,3}）
+        assert_eq!(normalize_test("五点三刻"), "5:45");
+    }
+
+    #[test]
+    fn itn_v2_p3_jia_measure_half() {
+        // 度量衡：N<真单位>半 → N.5单位
+        assert_eq!(normalize_test("一吨半"), "1.5吨");
+        assert_eq!(normalize_test("三寸半"), "3.5寸");
+    }
+
+    #[test]
+    fn itn_v2_p3_jia_classifier_passthrough() {
+        // 量词穿透：N<量词>半<真单位>
+        assert_eq!(normalize_test("一个半小时"), "1.5小时");
+    }
+
+    #[test]
+    fn itn_v2_p3_jia_counterexamples() {
+        // 反例护栏：一刻钟（刻后跟钟否决）保持；三点五走既有小数路径；半小时/半个小时非数字开头
+        assert_eq!(normalize_test("一刻钟"), "一刻钟");
+        assert_eq!(normalize_test("三点五"), "3.5");
+        assert_eq!(normalize_test("半小时"), "半小时");
+        assert_eq!(normalize_test("半个小时"), "半个小时");
+    }
+
+    #[test]
+    fn itn_v2_p3_jia_classifier_guard() {
+        // 守卫（DEC-038）：通用量词不算单位 → 一个半 / 五间半 保持汉字
+        assert_eq!(normalize_test("一个半"), "一个半");
+        assert_eq!(normalize_test("五间半"), "五间半");
+    }
+
+    #[test]
+    fn itn_v2_p3_units_time_scope_expansion() {
+        // ⚠️ 未经请求的范围扩张专项锁定：新增 [units.time]（小时/分钟）导致
+        // 「三小时」→「3小时」、「五分钟」→「5分钟」。输出正确但非 Gavin 需求，
+        // 必须独立测试锁定，不得混在甲型测试里带过。
+        assert_eq!(normalize_test("三小时"), "3小时");
+        assert_eq!(normalize_test("五分钟"), "5分钟");
+    }
+
+    // ------------------------------------------------------------
+    // P4 · 乙/丙型 + 层级表 + 全或无
+    // ------------------------------------------------------------
+
+    #[test]
+    fn itn_v2_p4_yi_implicit_decimal() {
+        // 乙型：N<可小数化单位>M（M 后紧邻边界）
+        assert_eq!(normalize_test("一米二"), "1.2米");
+        assert_eq!(normalize_test("一米八五"), "1.85米");
+        assert_eq!(normalize_test("三十九度八"), "39.8度");
+        assert_eq!(normalize_test("一百零八度五"), "108.5度");
+    }
+
+    #[test]
+    fn itn_v2_p4_yi_boundary_guard() {
+        // 乙型边界护栏：尾数后不紧邻边界 → 不走乙型
+        assert_eq!(normalize_test("三年二班"), "三年二班");
+        assert_eq!(normalize_test("三楼二号"), "3楼2号"); // 楼/号不可小数化 → 逐字路径全转
+        assert_eq!(normalize_test("五排八座"), "五排八座");
+    }
+
+    #[test]
+    fn itn_v2_p4_bing_unit_chain() {
+        // 丙型：显式多级单位链 + 货币归一（DEC-037）
+        assert_eq!(normalize_test("十一块九毛二"), "11.92元");
+        assert_eq!(normalize_test("五块八"), "5.8元");
+        assert_eq!(normalize_test("三小时二十分"), "3:20");
+    }
+
+    #[test]
+    fn itn_v2_p4_bare_unit_not_normalized() {
+        // 裸单位不归一：单级链（parts=1）不进丙型 → 逐字路径只转数字
+        assert_eq!(normalize_test("五块钱"), "5块钱");
+        assert_eq!(normalize_test("十一块"), "11块");
+    }
+
+    #[test]
+    fn itn_v2_p4_fen_disambiguation() {
+        // 🔴 分 族属消歧：前驱块→货币分(0.01元)；前驱点→时间分(分钟)；裸 N分 不合并
+        assert_eq!(normalize_test("五块八毛三分"), "5.83元");
+        assert_eq!(normalize_test("三点二十分"), "3:20");
+        assert_eq!(normalize_test("三分"), "3分");
+    }
+
+    #[test]
+    fn itn_v2_p4_all_or_nothing_continuity() {
+        // 全或无连续性边界（DEC-037 附则）：三年二班 整段保持，后文 五个人 不被连坐
+        assert_eq!(
+            normalize_test("三年二班的学生有五个人"),
+            "三年二班的学生有五个人"
+        );
+    }
+
+    // ------------------------------------------------------------
+    // P5 · 地名白名单（≥3 字）
+    // ------------------------------------------------------------
+
+    #[test]
+    fn itn_v2_p5_place_names_protected() {
+        // ≥3 字含数字地名命中保护（ENGINE-005，proper_nouns 69→129）
+        assert_eq!(normalize_test("十三陵"), "十三陵");
+        assert_eq!(normalize_test("九寨沟"), "九寨沟");
+        assert_eq!(normalize_test("五道口"), "五道口");
+        assert_eq!(normalize_test("去三门峡旅游"), "去三门峡旅游");
+    }
+
+    #[test]
+    fn itn_v2_p5_place_reverse_guard() {
+        // 反向护栏：<数字前缀>+单位 正常表达不得失效（十三陵 与 十三块钱 同前缀共存）
+        assert_eq!(normalize_test("十三块钱"), "13块钱");
+        assert_eq!(normalize_test("去十三陵玩花十三块钱"), "去十三陵玩花13块钱");
+    }
+
+    // ============================================================
+    // TEST-SYNC-ITN-V2-006 · ENGINE-006 + LEXICON-006-C 测试同步
+    // ============================================================
+    // 覆盖对象：
+    //  - ENGINE-006 (b462f83)：decide_conversion 判据 is_unit → is_real_unit，
+    //    双隶属量词（间/条/次/名/台/辆/句/篇）后单字数字保持汉字（DEC-030）。
+    //  - LEXICON-006-C (05de1bc)：移除 5 条 2 字遮蔽词条（三元/九度/二分/五类/四大）
+    //    + N分钟 家族 7 条，闭合红1（二分钟→2分钟）。
+    // 期望值全部来自 coder-1 真实 cargo test 实测，非推断。
+
+    // T1 · 双隶属量词保持汉字（ENGINE-006 正向）
+    // 判定路径：decide_conversion → is_real_unit(after_str)=false（词在 all_units 且
+    // 在 classifier_set）→ is_date_suffix=false → consumed<2 → classifier 分支 return false
+    #[test]
+    fn itn_v2_006_t1_dual_classifier_single_digit_preserved() {
+        assert_eq!(normalize_test("三条"), "三条");
+        assert_eq!(normalize_test("五台"), "五台");
+        assert_eq!(normalize_test("两辆"), "两辆");
+        assert_eq!(normalize_test("三次"), "三次");
+        assert_eq!(normalize_test("五名"), "五名");
+        assert_eq!(normalize_test("两句"), "两句");
+        assert_eq!(normalize_test("三篇"), "三篇");
+        // 甲型路径守卫（P3 既有覆盖，此处作为 T1 完整组保留）
+        assert_eq!(normalize_test("五间半"), "五间半");
+        assert_eq!(normalize_test("一个半"), "一个半");
+    }
+
+    // T2 · 真单位仍转换（ENGINE-006 反向护栏）
+    // 判定路径：is_real_unit=true（词在 all_units 且不在 classifier_set）→ 转
+    #[test]
+    fn itn_v2_006_t2_real_unit_still_converts() {
+        assert_eq!(normalize_test("五块"), "5块");
+        assert_eq!(normalize_test("三度"), "3度");
+        assert_eq!(normalize_test("五米"), "5米");
+        assert_eq!(normalize_test("三小时"), "3小时");
+        assert_eq!(normalize_test("十三块钱"), "13块钱");
+    }
+
+    // T3 · ⭐ 多位数不受判据收紧影响（最重要的护栏，consumed>=2 分支零覆盖→补齐）
+    // 判定路径：is_real_unit=false（双隶属量词）→ is_date_suffix=false →
+    // consumed>=2 return true（src/itn.rs:1810，在 is_real_unit 之后）→ 转
+    // 这证明 is_real_unit 收紧只影响单字数字，不误伤多位数表达。
+    #[test]
+    fn itn_v2_006_t3_multi_digit_unaffected_by_guard() {
+        assert_eq!(normalize_test("三十五台"), "35台");
+        assert_eq!(normalize_test("二十三条"), "23条");
+        assert_eq!(normalize_test("一百二十次"), "120次");
+        // 补充组合：多位数 + 双隶属量词「间」（units.other + classifiers 双隶属）
+        assert_eq!(normalize_test("二十五间"), "25间");
+    }
+
+    // T4 · N分钟 家族一致性（ENGINE-006 + LEXICON-006-C 联合）
+    // 红1 闭合判定项：二分钟→2分钟。一/七/两/五/八/六/四分钟 7 条从
+    // unit_collisions 移除（b462f83），二/三/九/十分钟本就不在表内。
+    // 移除后 N分钟 走逐字路径：分钟 ∈ units.time 且 ∉ classifier_set →
+    // is_real_unit=true → 转。五分钟 已由 itn_v2_p3_units_time_scope_expansion 覆盖，不重复。
+    #[test]
+    fn itn_v2_006_t4_minute_family_consistent() {
+        // 红1 闭合判定项（单独成条）
+        assert_eq!(normalize_test("二分钟"), "2分钟");
+        // 其余 9 条家族一致性
+        assert_eq!(normalize_test("一分钟"), "1分钟");
+        assert_eq!(normalize_test("三分钟"), "3分钟");
+        assert_eq!(normalize_test("四分钟"), "4分钟");
+        assert_eq!(normalize_test("六分钟"), "6分钟");
+        assert_eq!(normalize_test("七分钟"), "7分钟");
+        assert_eq!(normalize_test("八分钟"), "8分钟");
+        assert_eq!(normalize_test("九分钟"), "9分钟");
+        assert_eq!(normalize_test("十分钟"), "10分钟");
+        assert_eq!(normalize_test("两分钟"), "2分钟");
+    }
+
+    // T5 · 5 条 2 字词删除后的正向恢复（LEXICON-006-C）
+    // 三元/九度/二分/五类/四大 移除后各自遮蔽的能产族恢复转换；
+    // 五类人/四大件 因「类」「大」非单位仍保持汉字。
+    #[test]
+    fn itn_v2_006_t5_two_char_word_removal_recovery() {
+        // 红1（同 T4，此处重复锁定，LEXICON-006-C 移除点）
+        assert_eq!(normalize_test("二分钟"), "2分钟");
+        assert_eq!(normalize_test("三元钱"), "3元钱");
+        assert_eq!(normalize_test("九度电"), "9度电");
+        // 反向：非单位后缀保持汉字
+        assert_eq!(normalize_test("五类人"), "五类人");
+        assert_eq!(normalize_test("四大件"), "四大件");
+    }
+
+    // T6 · ⭐ 更长同前缀词条仍受保护（LEXICON-006-C 反向护栏，13 条）
+    // 锁「确定性最长匹配」（ENGINE-002 filter+max）架构假设：
+    // 移除 2 字遮蔽词条后，同前缀更长条目（二分* 26/三元* 17/四大* 17 等）
+    // 原样保留、仍受保护。将来若有人改动 check_protection，这组是第一道警报。
+    #[test]
+    fn itn_v2_006_t6_longer_same_prefix_still_protected() {
+        assert_eq!(normalize_test("二分查找"), "二分查找");
+        assert_eq!(normalize_test("二分图"), "二分图");
+        assert_eq!(normalize_test("二分法"), "二分法");
+        assert_eq!(normalize_test("二分之一"), "二分之一");
+        assert_eq!(normalize_test("二分音符"), "二分音符");
+        assert_eq!(normalize_test("三元催化"), "三元催化");
+        assert_eq!(normalize_test("三元及第"), "三元及第");
+        assert_eq!(normalize_test("三元桥"), "三元桥");
+        assert_eq!(normalize_test("四大发明"), "四大发明");
+        assert_eq!(normalize_test("四大皆空"), "四大皆空");
+        assert_eq!(normalize_test("四大名捕"), "四大名捕");
+        assert_eq!(normalize_test("九度OJ"), "九度OJ");
+        assert_eq!(normalize_test("五类分子"), "五类分子");
+    }
+
+    // ============================================================
+    // TEST-SYNC-ITN-V2-007 · 时段词前缀修复（ITN-V2-FIX-TIMEPREFIX-001）
+    // ============================================================
+    // 根因：主循环时段词分支（:1509）在甲型（:1425）之后，但甲型在时段词首字
+    // 位置匹配不上（不是数字），游标落到时段词分支后被整体消费「前缀+数字」并
+    // 跳到时间后缀 →「四点三刻」再无机会进入甲型 → 输出 `4点3刻` 而非 `4:45`。
+    // 修复：时段词分支匹配前缀后、消费数字前，先在数字位置试甲/乙/丙型，命中
+    // 则只输出前缀、游标交还主循环，复用无前缀时的同一条处理路径。
+    //
+    // ⚠️ 本轮规格要求（TEST-SYNC-ITN-V2-007 §二）：用例必须带真实语流上下文
+    // （时段词前缀 / 前后文 / 句中位置），裸串断言只能作为补充。这是本项目第二例
+    // 「测试全绿但生产不生效」—— 旧用例 `itn_v2_p3_jia_quarter_mode` 断言裸串
+    // `五点三刻`→`5:45`，真实语流 `下午四点三刻在...` 却被时段词分支抢先消费。
+    // 故本组 T7/T8/T9 全部带前缀/上下文，仅 T10 保留裸串作反向护栏补充。
+    //
+    // 期望值来源：T7/T8/T10 锚点来自 coder-1 真机 `cargo test` 实测；T9 边界用例为
+    // 不变式保持（前缀后无数字，任何路径都不可能触发转换），由代码走查验证，非推断。
+
+    // T7 · 时段词 × 刻模式（修复的核心命中场景）
+    #[test]
+    fn itn_v2_007_t7_period_quarter_mode() {
+        assert_eq!(normalize_test("下午四点三刻见面"), "下午4:45见面");
+        // ⭐ Gavin 原句：`八里庄` 必须仍受保护（itn-rules.toml:485）
+        assert_eq!(
+            normalize_test("每天下午四点三刻在八里庄见面"),
+            "每天下午4:45在八里庄见面"
+        );
+        assert_eq!(normalize_test("晚上七点三刻"), "晚上7:45");
+    }
+
+    // T8 · ⭐ 时段词 × 半模式（7 个时段词全覆盖，爆炸半径的另一半）
+    // 上午/下午/凌晨/晚上/中午/傍晚/清晨 一个都不能少 —— 少测一个就等于给那个
+    // 词留一条无人看守的路径。
+    #[test]
+    fn itn_v2_007_t8_period_half_mode_all_7() {
+        assert_eq!(normalize_test("上午八点半"), "上午8:30");
+        assert_eq!(normalize_test("下午四点半"), "下午4:30");
+        assert_eq!(normalize_test("凌晨两点半"), "凌晨2:30");
+        assert_eq!(normalize_test("晚上七点半"), "晚上7:30");
+        assert_eq!(normalize_test("中午十二点半"), "中午12:30");
+        assert_eq!(normalize_test("傍晚六点半"), "傍晚6:30");
+        assert_eq!(normalize_test("清晨五点半"), "清晨5:30");
+    }
+
+    // T9 · ⭐⭐ 边界护栏：文本以时段词结尾（主控在验收中拦下的 panic）
+    // match_date_prefix 只做 starts_with，对前缀之后是否还有字符无任何要求。
+    // 文本恰好以时段词结尾时 after == chars.len()，守卫若用 chars[after] 直接
+    // 索引会 panic（index out of bounds）。修复已改用 chars.get(after).is_some_and。
+    // 成因与本批修的 bug 同源 —— 既有 124 条用例没有任何一条以时段词结尾，
+    // 本组写为显式边界护栏锁死，防止将来有人重构回 chars[after] 直索引。
+    #[test]
+    fn itn_v2_007_t9_period_word_at_end_boundary() {
+        assert_eq!(normalize_test("改到明天下午"), "改到明天下午");
+        assert_eq!(normalize_test("那就晚上"), "那就晚上");
+        // 最极端情形：整串就是一个时段词
+        assert_eq!(normalize_test("凌晨"), "凌晨");
+        assert_eq!(normalize_test("上午"), "上午");
+        assert_eq!(normalize_test("中午"), "中午");
+        assert_eq!(normalize_test("傍晚"), "傍晚");
+        assert_eq!(normalize_test("清晨"), "清晨");
+    }
+
+    // T10 · 反向护栏（既有行为不得回归）
+    // 正向/负向路径 + 裸串补充（裸串已有 P3 覆盖，此处仅作本批回归锚点）。
+    #[test]
+    fn itn_v2_007_t10_period_regression_guards() {
+        // 时段词正向路径不变：前缀后数字+时间后缀仍转
+        assert_eq!(normalize_test("下午四点"), "下午4点");
+        // 负向路径不变：前缀后非时间后缀 → 不转
+        assert_eq!(normalize_test("下午三个人"), "下午三个人");
+        // 裸串仍过（补充形态，P3 已有裸串覆盖）
+        assert_eq!(normalize_test("五点三刻"), "5:45");
+        assert_eq!(normalize_test("四点半"), "4:30");
+        // `刻`+`钟` 否决仍生效（一刻钟=时长，不转）—— 命中保护表 itn-rules.toml:420
+        assert_eq!(normalize_test("一刻钟"), "一刻钟");
+    }
+
+    // ============================================================
+    // TEST-SYNC-016 · ITN-FIX-GRADECLASS-016 年级班级简写守卫
+    // ============================================================
+    // 覆盖对象（2d7703d）：新增 [protect.serial_suffixes] = ["班"]。
+    // 机制：serial_len == 2（「一三/五一/二三/一四」两位逐位串）且紧随其后命中
+    // serial_suffixes 时，parse_cn_number 直接 return None → 主循环走单字路径，
+    // 「班」既非单位也非量词 → 整串保持汉字。限定 serial_len == 2 使进位组合
+    // 路径（十三班）、≥3 位逐位串（三零二房间/二零二六/幺三八零零）不受影响。
+    //
+    // 期望值来源：code 走查 + 既有断言锚点（九八年/三零二房间/二零二六/幺三八零零
+    // 沿用既有断言；十三班为 code 走查判断——十非逐位串首字符，走进位组合路径，
+    // 不受本守卫影响，行为与修前一致，非凭猜）。
+
+    // T1 · 正向：目标 4 条全汉字（Gavin 端测原话用例）
+    #[test]
+    fn itn_v2_016_t1_grade_class_serial_preserved() {
+        assert_eq!(normalize_test("一三班"), "一三班");
+        assert_eq!(normalize_test("五一班"), "五一班");
+        assert_eq!(normalize_test("初二三班"), "初二三班");
+        assert_eq!(normalize_test("高一四班"), "高一四班");
+    }
+
+    // T2 · 正向句子形态：整句无阿拉伯数字（Gavin 原句）
+    #[test]
+    fn itn_v2_016_t2_sentence_form_no_digits() {
+        assert_eq!(normalize_test("我是一三班的学生"), "我是一三班的学生");
+        assert_eq!(normalize_test("他在五一班上课"), "他在五一班上课");
+    }
+
+    // T3 · 反向护栏：既有行为必须保持不变
+    #[test]
+    fn itn_v2_016_t3_reverse_guards() {
+        // 九八年 → 98年（serial_len=2 但「年」不在 serial_suffixes，仍逐位合并）
+        assert_eq!(normalize_test("九八年"), "98年");
+        // ≥3 位逐位串不进守卫
+        assert_eq!(normalize_test("三零二房间"), "302房间");
+        assert_eq!(normalize_test("二零二六"), "2026");
+        assert_eq!(normalize_test("幺三八零零"), "13800");
+        // 全或无路径（三年二班）与本守卫互不干扰
+        assert_eq!(normalize_test("三年二班"), "三年二班");
+        // 十三班：十非逐位串首字符（走进位组合路径），守卫不触发 → 仍转（修前行为）
+        assert_eq!(normalize_test("十三班"), "13班");
+        // 单字+班：serial_len=1，不进守卫，单字数字无单位语境不转
+        assert_eq!(normalize_test("一班"), "一班");
+        assert_eq!(normalize_test("三班"), "三班");
+    }
+
+    // T4 · proper_nouns 保护不受影响（五一/五一广场 走保护路径，与守卫无关）
+    #[test]
+    fn itn_v2_016_t4_proper_noun_protection_intact() {
+        assert_eq!(normalize_test("五一广场"), "五一广场");
+        assert_eq!(normalize_test("五一"), "五一");
+        assert_eq!(normalize_test("五一放假"), "五一放假");
+    }
+
+    // T5 · 边界：班出现在非数字后不受影响
+    #[test]
+    fn itn_v2_016_t5_ban_not_after_digit_untouched() {
+        assert_eq!(normalize_test("上班"), "上班");
+        assert_eq!(normalize_test("班车"), "班车");
+        assert_eq!(normalize_test("今天上班坐班车"), "今天上班坐班车");
+    }
+
+    // T6 · ⭐ 降级测试：serial_suffixes 缺失（serde default → 空集）行为回到修前。
+    // 锁死 [TOML-STALE-001] 的失效形态——外置旧 toml（无 [protect.serial_suffixes]
+    // 段）会让本修复静默失效（「一三班」→「13班」），有断言才能在回归时看见。
+    #[test]
+    fn itn_v2_016_t6_downgrade_without_serial_suffixes() {
+        // 构造一个「旧 toml」：仅含 proper_nouns 等既有分组，缺 serial_suffixes 段
+        let old_rules = r#"
+[switches]
+[units.other]
+words = ["岁", "楼", "层", "号", "房间", "倍", "页", "章", "节", "条", "款", "名", "次", "台", "辆", "间", "句", "篇"]
+[units.time]
+words = ["小时", "分钟"]
+[units.currency]
+words = ["元", "块", "角", "毛", "分"]
+[protect.proper_nouns]
+words = ["五一", "五一广场"]
+[protect.classifiers]
+words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "辆", "间", "句", "篇", "本", "部", "场", "组", "批", "种", "类", "段", "堆", "瓶", "盒", "包", "箱"]
+"#;
+        // 缺 serial_suffixes → 空集 → 「一三班」退回逐位合并（修前行为 = 错误行为）
+        assert_eq!(normalize_with(old_rules, "一三班"), "13班");
+        // 反向对照：proper_nouns 保护不受缺段影响（五一/五一广场 仍保汉字）
+        assert_eq!(normalize_with(old_rules, "五一广场"), "五一广场");
+        // 反向对照：≥3 位逐位串在缺段时仍正常合并
+        assert_eq!(normalize_with(old_rules, "三零二房间"), "302房间");
+    }
+
+    // ============================================================
+    // ITN-FIX-CURRENCY-017 (P0) 货币/度量链数值算错（Gavin 6 条端测）
+    // 根因：
+    //   RC-A `一斤二两`→1.22斤 / `三斤六两五`→3.625斤 —— 乙型尾数扫描把「两」（兼数字2）
+    //   吞进小数尾；丙型 weight 链又走通用小数合成。
+    //   RC-B `一块两毛二一斤`→22.20元 —— 丙型不查族一致性，把 weight 单位拼进 currency 链。
+    // 方案（主控 2026-08-03 拍板候选甲 + 三条件）：两 消歧为重量单位、丙型族一致性终止 +
+    // per_unit 捕获、weight 链零乘法拼接、虚指短语护栏。
+    // ============================================================
+
+    // T1 · 六条端测逐条修复（Gavin 原句）
+    #[test]
+    fn itn_v2_017_t1_six_bugs_fixed() {
+        assert_eq!(normalize_test("一斤二两"), "1斤2两");
+        assert_eq!(normalize_test("这个西瓜是一块两毛二一斤"), "这个西瓜是1.22元一斤");
+        assert_eq!(normalize_test("一块两毛二一斤"), "1.22元一斤");
+        assert_eq!(normalize_test("这个水果是三块四毛八一斤"), "这个水果是3.48元一斤");
+        // ITN-FIX-CHAIN-TEAR-026 条件B：尾零去除（一块八毛一斤 → 1.8元一斤，不是 1.80）
+        assert_eq!(normalize_test("这个西瓜是一块八毛一斤"), "这个西瓜是1.8元一斤");
+        assert_eq!(normalize_test("这个西瓜是一块八一斤"), "这个西瓜是1.8元一斤");
+        assert_eq!(normalize_test("这个重量是三斤六两五"), "这个重量是3斤6两5");
+    }
+
+    // T2 · 条件2 锁死断言：斤/两 的 hierarchy value 不参与计算（死数据）。
+    // 一斤二两 必须等于 1斤2两，且显式断言 != 1.2斤（通用小数 formatter 误接会静默变 1.2斤）。
+    #[test]
+    fn itn_v2_017_t2_weight_lock_dead_data() {
+        assert_eq!(normalize_test("一斤二两"), "1斤2两");
+        assert_ne!(normalize_test("一斤二两"), "1.2斤");
+        assert_ne!(normalize_test("一斤二两"), "1.22斤");
+        assert_eq!(normalize_test("三斤六两五"), "3斤6两5");
+        assert_ne!(normalize_test("三斤六两五"), "3.625斤");
+    }
+
+    // T3 · 两 消歧为重量单位：裸 N两 / 重量语境正常转
+    #[test]
+    fn itn_v2_017_t3_liang_as_weight_unit() {
+        assert_eq!(normalize_test("二两"), "2两");
+        assert_eq!(normalize_test("三两"), "3两");
+        assert_eq!(normalize_test("五两"), "5两");
+        assert_eq!(normalize_test("二十五两"), "25两");
+        assert_eq!(normalize_test("三两银子"), "3两银子");
+        assert_eq!(normalize_test("一斤二两半"), "1斤2两半");
+    }
+
+    // T4 · 条件1 虚指护栏：近似数量短语整体保汉字（一两个人/两三个人/三两天/三两句话…）
+    #[test]
+    fn itn_v2_017_t4_virtual_two_phrase_guards() {
+        assert_eq!(normalize_test("一两个人"), "一两个人");
+        assert_eq!(normalize_test("两三个人"), "两三个人");
+        assert_eq!(normalize_test("三两个人"), "三两个人");
+        assert_eq!(normalize_test("一两个"), "一两个");
+        assert_eq!(normalize_test("两三天"), "两三天");
+        assert_eq!(normalize_test("三两天"), "三两天");
+        assert_eq!(normalize_test("三两句话"), "三两句话");
+        // 反向护栏：量词集合外（酒）不误伤 → 仍按重量转
+        assert_eq!(normalize_test("三两酒"), "3两酒");
+    }
+
+    // T5 · 既有行为必须保持不变（反向护栏）
+    #[test]
+    fn itn_v2_017_t5_reverse_guards() {
+        assert_eq!(normalize_test("两个人"), "两个人");
+        assert_eq!(normalize_test("两本书"), "两本书");
+        assert_eq!(normalize_test("两块二"), "2.2元");
+        assert_eq!(normalize_test("五块八"), "5.8元");
+        assert_eq!(normalize_test("一块八毛五"), "1.85元");
+        assert_eq!(normalize_test("十一块九毛二"), "11.92元");
+        assert_eq!(normalize_test("一米二"), "1.2米");
+        assert_eq!(normalize_test("半斤八两"), "半斤八两");
+        assert_eq!(normalize_test("四点半"), "4:30");
+        assert_eq!(normalize_test("一个半小时"), "1.5小时");
+    }
+
+    // ============================================================
+    // ITN-FIX-CHAIN-TEAR-026 新增测试（2026-08-03）
+    // ============================================================
+
+    // T6 · 条件A 撕裂修复（未知后继 + 货币链独立收口）
+    #[test]
+    fn itn_v2_026_t6_chain_tear_fixed() {
+        // 未知后继不应撕裂：数值合成与后继识别正交
+        assert_eq!(normalize_test("五块一以斤"), "5.1元以斤");
+        assert_eq!(normalize_test("五块一已经"), "5.1元已经");
+        // 已知后继（单价限定词）保持捕获
+        assert_eq!(normalize_test("五块一一斤"), "5.1元一斤");
+        // ITN-FIX-CHAIN-TEAR-026-B (Gavin 方案 C)：单段链一律保留原单位，与 per_unit 无关。
+        // 五块一斤 = 1 段（"五块"）+ per_unit "一斤" → 单段保留原单位 → 5块一斤
+        assert_eq!(normalize_test("五块一斤"), "5块一斤");
+        // 完整链 + 单价限定词
+        assert_eq!(normalize_test("五块一毛二一斤"), "5.12元一斤");
+        assert_eq!(normalize_test("一块两毛二"), "1.22元");
+        assert_eq!(normalize_test("一块两毛二一斤"), "1.22元一斤");
+    }
+
+    // T7 · 条件B 尾零去除（format_currency_chain 与 format_implicit_decimal 行为一致）
+    #[test]
+    fn itn_v2_026_t7_trailing_zero_removed() {
+        assert_eq!(normalize_test("五块一"), "5.1元");     // 原 5.10元 → 修复
+        // 单段链保持原单位（不归一到元）
+        assert_eq!(normalize_test("五块"), "5块");        // 保持不变
+        assert_eq!(normalize_test("八角"), "8角");          // 保持原单位
+        assert_eq!(normalize_test("二十五块"), "25块");    // 保持原单位
+        assert_eq!(normalize_test("一块两毛二"), "1.22元"); // 保持不变（两位有效）
+        assert_eq!(normalize_test("五块一毛二"), "5.12元"); // 保持不变
+        assert_eq!(normalize_test("一块八"), "1.8元");     // 原 1.80元 → 修复
+        assert_eq!(normalize_test("一块八一斤"), "1.8元一斤");
+    }
+
+    // T8 · 交叉（条件A+B 叠加 + 017 单价限定词）
+    #[test]
+    fn itn_v2_026_t8_combined() {
+        assert_eq!(normalize_test("三块四毛八一斤"), "3.48元一斤");
+    }
+
+    // T9 · ITN-FIX-CHAIN-TEAR-026-B (Gavin 方案 C) 核心差异锁死：
+    // 段数决定是否归一，与 per_unit 无关。
+    //   五块一斤 = 1 段（"五块"）+ per_unit "一斤" → 单段保留原单位 → 5块一斤
+    //   五块一   = 2 段（"五块" + 隐式"一毛"）    → 多段归一到元 → 5.1元
+    //   五块     = 1 段（"五块"）无 per_unit       → 单段保留原单位 → 5块
+    #[test]
+    fn itn_v2_026_t9_scheme_c_segment_count_rule() {
+        assert_eq!(normalize_test("五块一斤"), "5块一斤");
+        assert_eq!(normalize_test("五块一"), "5.1元");
+        assert_eq!(normalize_test("五块"), "5块");
+    }
+
+    // T10 · DEC-038 保护词护栏（026 放开单段 currency 链后的主要风险面）
+    // 本断言锁定的是 DEC-038 随机覆盖下的现状行为，不代表期望行为，P6 批次会整体重构。
+    #[test]
+    fn itn_v2_026_t10_dec038_protected_word_guards() {
+        // 以下词条行为由 itn-rules.toml 保护词表随机覆盖决定，026-B 不应改变它们
+        // 在保护词表中的条目（保持汉字）：
+        assert_eq!(normalize_test("五毛钱"), "五毛钱");
+        assert_eq!(normalize_test("一块钱"), "一块钱");
+        assert_eq!(normalize_test("二块钱"), "二块钱");
+        assert_eq!(normalize_test("六块钱"), "六块钱");
+        assert_eq!(normalize_test("八块钱"), "八块钱");
+        assert_eq!(normalize_test("一毛钱"), "一毛钱");
+        assert_eq!(normalize_test("一角钱"), "一角钱");
+        assert_eq!(normalize_test("五角钱"), "五角钱");
+        // 不在保护词表中的条目（026 单段 currency 链转数字，现状锁定）：
+        assert_eq!(normalize_test("三毛钱"), "3毛钱");
+        assert_eq!(normalize_test("三块钱"), "3块钱");
+        assert_eq!(normalize_test("三元钱"), "3元钱");
+        assert_eq!(normalize_test("五块钱"), "5块钱");
+    }
+
+    // ============================================================
+    // ITN-FIX-CHAIN-TEAR-026 反向护栏（B1-B5 五组歧义）
+    // 026 改动 B 允许单段 currency 链后，以下用例可能被误转。
+    // 本组断言锁定现状行为，不代表期望行为。
+    // 若走查发现某条现状是误转，在断言前标注 TODO-026-REGRESSION。
+    // ============================================================
+
+    // B1 · 「块」量词义/虚指（非货币语境）
+    #[test]
+    fn itn_v2_026_b1_kuai_ambiguity() {
+        // 保护词表命中 → 保持汉字
+        assert_eq!(normalize_test("一块儿去"), "一块儿去");
+        assert_eq!(normalize_test("一块钱"), "一块钱");
+        // 非保护词表 → 单段 currency 链转数字（现状锁定，非货币语境可能误转）
+        assert_eq!(normalize_test("一块石头"), "1块石头");
+        assert_eq!(normalize_test("掰成两块"), "掰成2块");
+        assert_eq!(normalize_test("三块木板"), "3块木板");
+    }
+
+    // B2 · 「角」歧义（几何/方位/货币）
+    #[test]
+    fn itn_v2_026_b2_jiao_ambiguity() {
+        // 保护词表命中 → 保持汉字
+        assert_eq!(normalize_test("八角茴香"), "八角茴香");
+        assert_eq!(normalize_test("三角形"), "三角形");
+        assert_eq!(normalize_test("一角钱"), "一角钱");
+        // 非保护词表 → 单段 currency 链转数字（现状锁定）
+        assert_eq!(normalize_test("四角"), "4角");
+        assert_eq!(normalize_test("墙角"), "墙角");  // 墙非数字，不触发
+    }
+
+    // B3 · 「分」歧义（分数/时间/评分/货币）
+    #[test]
+    fn itn_v2_026_b3_fen_ambiguity() {
+        // 保护词表命中 → 保持汉字
+        assert_eq!(normalize_test("一分为二"), "一分为二");
+        // 分数路径 → 1/3
+        assert_eq!(normalize_test("三分之一"), "1/3");
+        // 非保护词表 → 单段 currency/time 链转数字（现状锁定）
+        assert_eq!(normalize_test("打了三分"), "打了3分");
+        assert_eq!(normalize_test("五分熟"), "5分熟");
+        // 时间语境 → 正确转数字
+        assert_eq!(normalize_test("三分钟"), "3分钟");
+    }
+
+    // B4 · 「元」歧义（数学/纪年/货币）
+    #[test]
+    fn itn_v2_026_b4_yuan_ambiguity() {
+        // 保护词表命中 → 保持汉字
+        // 实测：三元一次方程 不在保护词表（unit_collisions 中无此条目），
+        // 单段 currency 链捕获「三元」→「3元一次方程」。现状锁定。
+        assert_eq!(normalize_test("三元一次方程"), "3元一次方程");
+        // 实测：一元二次 同样被单段 currency 链捕获 →「1元二次」。现状锁定。
+        assert_eq!(normalize_test("一元二次"), "1元二次");
+        assert_eq!(normalize_test("三元钱"), "3元钱");
+        // 非数字开头 → 不触发
+        assert_eq!(normalize_test("公元"), "公元");
+    }
+
+    // B5 · 「毛」歧义（成语/专名/货币）
+    #[test]
+    fn itn_v2_026_b5_mao_ambiguity() {
+        // 保护词表命中 → 保持汉字
+        assert_eq!(normalize_test("一毛不拔"), "一毛不拔");
+        // 非保护词表 → 单段 currency 链转数字（现状锁定）
+        // TODO-026-REGRESSION: "三毛"（人名）被转 "3毛"，非货币语境误转
+        assert_eq!(normalize_test("三毛"), "3毛");
+        // "九牛一毛" 实测保持汉字（"九牛"非数字开头，不触发丙型链）
+        assert_eq!(normalize_test("九牛一毛"), "九牛一毛");
+    }
+
+    // ============================================================
+    // ITN-FIX-CHAIN-TEAR-026 交叉回归护栏（C1-C4）
+    // ============================================================
+
+    // C1 · 017 六条端测用例全部复核（尾零去除已同步）
+    #[test]
+    fn itn_v2_026_c1_017_six_bugs_still_fixed() {
+        assert_eq!(normalize_test("一斤二两"), "1斤2两");
+        assert_eq!(normalize_test("一块两毛二一斤"), "1.22元一斤");
+        assert_eq!(normalize_test("三块四毛八一斤"), "3.48元一斤");
+        assert_eq!(normalize_test("一块八毛一斤"), "1.8元一斤");
+        assert_eq!(normalize_test("一块八一斤"), "1.8元一斤");
+        assert_eq!(normalize_test("三斤六两五"), "3斤6两5");
+    }
+
+    // C2 · 尾零边界：total.fract()==0.0 走整数分支不去尾零
+    #[test]
+    fn itn_v2_026_c2_trailing_zero_boundary() {
+        // fract()==0.0 → 整数分支，不去尾零
+        assert_eq!(normalize_test("五块"), "5块");          // 单段，5.0 → 5块
+        // 实测：五块零 → 丙型链捕获「五块」+ 隐式尾数「零」=0毛 → total=5.0 → 5元
+        assert_eq!(normalize_test("五块零"), "5元");
+        // 多段链 fract()==0.0 → 整数元
+        assert_eq!(normalize_test("五块零毛"), "5元");
+        // 多段链 fract()!=0.0 → 去尾零
+        assert_eq!(normalize_test("五块零一"), "5.01元");    // 5.01 保留
+        assert_eq!(normalize_test("五块一"), "5.1元");       // 5.10 → 5.1
+        assert_eq!(normalize_test("五块零毛一"), "5.01元");  // 5.01 保留
+        // 边界：0.05 元
+        assert_eq!(normalize_test("五分"), "5分");           // 单段保留原单位
+    }
+
+    // C3 · weight 族不受 026 影响（只动 currency）
+    #[test]
+    fn itn_v2_026_c3_weight_unchanged() {
+        assert_eq!(normalize_test("三斤六两五"), "3斤6两5");
+        assert_eq!(normalize_test("一斤二两"), "1斤2两");
+        assert_eq!(normalize_test("二两"), "2两");
+        assert_eq!(normalize_test("五斤"), "5斤");           // 单段 weight 链不受影响
+    }
+
+    // C4 · 016 班级简写零回归（026 只动 currency 族）
+    #[test]
+    fn itn_v2_026_c4_grade_class_unchanged() {
+        assert_eq!(normalize_test("一三班"), "一三班");
+        assert_eq!(normalize_test("五一班"), "五一班");
+        assert_eq!(normalize_test("初二三班"), "初二三班");
+        assert_eq!(normalize_test("高一四班"), "高一四班");
+    }
+
+    // ============================================================
+    // ITN-FIX-BIGNUM-027 · 大额数字进位缺陷（027-A 末尾隐式千位越界 + 027-B 万级公式错误）
+    // ============================================================
+    //
+    // 027-A：末尾挂起单字套隐式千位的守卫条件不完整 —— 只检查「万/亿后有没有零」，
+    //        没检查万/亿后是否已消费过进位单位（千/百/十）。完整进位链后的末尾单字是
+    //        个位，不是省略的「几千」。典型：一千零四十六万八千七百四十一 →
+    //        末尾「一」被套 +1000 得 10469740（应为 10468741）。
+    //
+    // 027-B：万分支 result = (result + section) * 10000 把已结算的亿也卷进乘法。
+    //        一亿两千三百四十五万 → (1e8 + 2345)*10000 = 1.0e12（应为 1.2345e8）。
+    //        亿分支必须保持 (result+section)*1e8 不变（亿是最大单位，其前一切是它的
+    //        系数；反例「一万亿」：万 += 1*1e4 → 亿 (1e4+0)*1e8 = 1e12 ✓）。
+    //
+    // 027-C（另开单，本轮不修）：large_amount_keep_wan_yi 用 is_unit 的 starts_with
+    //        判定「亿/万后是否跟单位」，但「两」既是数字又是重量单位（017 引入），
+    //        「一亿两千...」的「两」被 is_unit 命中 → 亿分支 break，金额蒸发为「1」。
+    //        受 027-C 阻断本轮不可达的用例：一亿两千三百四十五万六千七百八十九 /
+    //        一亿两千三百四十五万（亿后首字是「两」即 break）。
+    //
+    // 缺陷模式（Gavin 指令「从机制上解决」）：026 的 after_is_boundary 耦合、016 的
+    // 逐位串判据、027-A 的隐式千位 —— 同属一类：**局部特例规则没有约束自己的适用
+    // 范围，在更长的上下文里越界生效**。027-A 的修法是显式声明适用边界：增加
+    // `unit_since_big` 状态位，万/亿后一旦消费过任何进位单位（千/百/十），末尾单字
+    // 必为个位，禁止套隐式千位。
+
+    // 027-A · 末尾挂起单字隐式千位边界守卫
+    //   隐式千位补全的适用边界：「万/亿之后 + 该段内无零 + 该段内无进位单位」。
+    //   三条件缺一即不该套 +1000。
+    #[test]
+    fn itn_v2_027_a_bug_repro_10468741() {
+        // Gavin 端测 bug：一千零四十六万八千七百四十一 → 10469740（错）应为 10468741
+        // 万后走完 千→百→十 完整进位链，末尾「一」是个位，不该套隐式千位
+        assert_eq!(normalize_test("一千零四十六万八千七百四十一"), "10468741");
+    }
+
+    #[test]
+    fn itn_v2_027_a_full_chain_35241() {
+        // 三万五千二百四十一：万后走完 千→百→十，末尾「一」是个位
+        assert_eq!(normalize_test("三万五千二百四十一"), "35241");
+    }
+
+    #[test]
+    fn itn_v2_027_a_full_chain_87653() {
+        // 八万七千六百五十三：末尾「十三」含十位，十分支置 unit_since_big=true，
+        // 循环结束前 has_digit=false（十三被十分支消费）→ 不进末尾分支，走正常结算
+        assert_eq!(normalize_test("八万七千六百五十三"), "87653");
+    }
+
+    // 027-A · 隐式千位仍生效（最易改坏）
+    // ITN-FIX-BIGNUM-027-D (DEC-042)：两万五/五万三 从展开 → 保留锚定单位
+    #[test]
+    fn itn_v2_027_a_implicit_wan_still_works() {
+        assert_eq!(normalize_test("两万五"), "2.5万"); // DEC-042 保留锚定单位
+        assert_eq!(normalize_test("五万三"), "5.3万"); // DEC-042 保留锚定单位
+        assert_eq!(normalize_test("两万五千"), "25000"); // 万后有千（进位单位）→ 不进隐式分支 → 展开
+    }
+
+    // 027-A · 原本正确的路径不得回归
+    #[test]
+    fn itn_v2_027_a_zero_path_unchanged() {
+        // 三万五千二百零一：有零 zero_since_big=true 走 else 分支，原本就对
+        assert_eq!(normalize_test("三万五千二百零一"), "35201");
+    }
+
+    #[test]
+    fn itn_v2_027_a_wan_end_no_remainder() {
+        assert_eq!(normalize_test("一千零四十六万"), "1046万"); // DEC-042 变更
+    }
+
+    #[test]
+    fn itn_v2_027_a_wan_qian_no_tail() {
+        assert_eq!(normalize_test("五万三千"), "53000");
+    }
+
+    // 027-B · 万级进位公式修复（result+=section*10000，不再把 result 卷进乘法）
+    //   以下用例在 parse_cn_number 层面验证（生产规则下部分受 027-C 阻断，
+    //   见各用例注释）。rules=None 的隔离验证见 itn_v2_027_b_formula_no_rules。
+    #[test]
+    fn itn_v2_027_b_wan_only_no_regression() {
+        // 两千三百四十五万：result=0，(0+2345)*1e4 == 0+2345*1e4，原本就对，不得回归
+        assert_eq!(normalize_test("两千三百四十五万"), "2345万"); // DEC-042 变更
+    }
+
+    #[test]
+    fn itn_v2_027_b_yi_branch_unchanged() {
+        // 一万亿：万分支 += 1*1e4=1e4，亿分支 (1e4+0)*1e8 = 1e12 ✓（亿分支不得改坏）
+        // 027-G-1 (DEC-042 补充二)：1e12 ≥ 1 万亿 且 rem=0 → 升万亿
+        assert_eq!(normalize_test("一万亿"), "1万亿"); // DEC-042 补充二 变更
+    }
+
+    #[test]
+    fn itn_v2_027_b_shi_yi() {
+        assert_eq!(normalize_test("十亿"), "10亿"); // DEC-042 变更
+    }
+
+    #[test]
+    fn itn_v2_027_b_yi_alone() {
+        assert_eq!(normalize_test("一亿"), "1亿"); // DEC-042 变更
+    }
+
+    // 027-B · 公式修复后可达的亿+万嵌套用例（亿后无「两」单位阻断）
+    #[test]
+    fn itn_v2_027_b_yi_wan_no_liang() {
+        // 一千二百三十四亿五千万：亿后是「五」非「两」，亿正常结算，万分支修复后 += 5e3*1e4
+        assert_eq!(normalize_test("一千二百三十四亿五千万"), "1234.5亿"); // DEC-042 变更
+    }
+
+    #[test]
+    fn itn_v2_027_b_yi_wan_with_zero() {
+        // 三亿零五万：亿后「零」非单位，亿正常结算 3e8，零置 zero_since_big=true，
+        // 五万 section=5，万分支修复后 result += 5*1e4 = 300050000
+        assert_eq!(normalize_test("三亿零五万"), "30005万"); // DEC-042 变更
+    }
+
+    // 027-B 隔离验证（rules=None，禁用 large_amount_keep_wan_yi，纯粹验证万级公式）
+    // 此测试用 compile_rules_from_content 无法直接禁用开关，改为直接调 parse_cn_number
+    // 传 None。验证 027-B 公式修复对亿+万嵌套的正确性，不受 027-C 阻断干扰。
+    #[test]
+    fn itn_v2_027_b_formula_no_rules() {
+        let cases: &[(&str, &str)] = &[
+            ("一亿两千三百四十五万六千七百八十九", "123456789"), // 不变
+            ("一亿两千三百四十五万", "12345万"), // DEC-042 变更
+            ("两千三百四十五万", "2345万"), // DEC-042 变更
+            ("一万亿", "1万亿"), // DEC-042 补充二 变更
+            ("一千二百三十四亿五千万", "1234.5亿"), // DEC-042 变更
+            ("三亿零五万", "30005万"), // DEC-042 变更
+            ("十亿", "10亿"), // DEC-042 变更
+            ("一亿", "1亿"), // DEC-042 变更
+        ];
+        for (input, expected) in cases {
+            let chars: Vec<char> = input.chars().collect();
+            let (got, consumed) =
+                parse_cn_number(&chars, 0, None).unwrap_or(("NONE".to_string(), 0));
+            assert_eq!(got.as_str(), *expected, "input: {}", input);
+            // 消费字符数应等于输入长度（证明完整解析）
+            assert_eq!(consumed, chars.len(), "input: {}, consumed mismatch", input);
+        }
+    }
+
+    // 027-C 阻断标注：以下 2 条在生产规则下因「亿后跟两」被 large_amount_keep_wan_yi
+    // 的 is_unit starts_with 命中而 break，027-B 公式修复无法触及。待 027-C 另开单修复
+    // is_unit 消歧后可达。本轮不在测试中断言（避免误判 027-B 未修好）。
+    //   - 一亿两千三百四十五万六千七百八十九 → 期望 123456789（027-C 修复后）
+    //   - 一亿两千三百四十五万 → 期望 123450000（027-C 修复后）
+
+    // 4.6 注释-实现不符 → ITN-FIX-BIGNUM-027-D (DEC-042) 修复：三亿五 从 300005000 → 3.5亿
+    //   旧注释「五→五千万=350000000」与旧实现「×1e3=300005000」均不符 DEC-042，
+    //   DEC-042 改为保留锚定单位「3.5亿」。此测试从「确认不符」变为「验证 DEC-042」。
+    #[test]
+    fn itn_v2_027_a_yi_ji_comment_impl_mismatch() {
+        assert_eq!(normalize_test("三亿五"), "3.5亿");
+    }
+
+    // ============================================================
+    // ITN-FIX-BIGNUM-027-C · large_amount_keep_wan_yi 消歧（亿/万后首字是数字+后跟进位单位→不break）
+    // ============================================================
+
+    // 027-C 第一阻断点：large_amount_keep_wan_yi 的 is_unit starts_with 把「两」误判单位
+    //   修复：after_big 首字是中文数字 + 第二字是进位单位 → 新数字串，不 break
+    #[test]
+    fn itn_v2_027c_yi_wan_lian_qian() {
+        // 一亿两千三百四十五万六千七百八十九：亿后「两」是数字2，后「千」进位单位
+        assert_eq!(normalize_test("一亿两千三百四十五万六千七百八十九"), "123456789");
+    }
+
+    #[test]
+    fn itn_v2_027c_yi_wan_no_tail() {
+        assert_eq!(normalize_test("一亿两千三百四十五万"), "12345万"); // DEC-042 变更
+    }
+
+    #[test]
+    fn itn_v2_027c_yi_liang_qian_wan() {
+        // 一亿两千万：亿后「两」数字 + 「千」进位 → 不break 亿结算 → 万结算
+        assert_eq!(normalize_test("一亿两千万"), "1.2亿"); // DEC-042 变更
+    }
+
+    #[test]
+    fn itn_v2_027c_liang_yi_san_qian_wan() {
+        // 两亿三千万：「两」在首位（idx==start），two_is_unit 首位返回false → 两是数字2
+        // 亿后「三」数字 + 「千」进位 → 不break。不受 027-C 改动影响（首位路径不同）
+        assert_eq!(normalize_test("两亿三千万"), "2.3亿"); // DEC-042 变更
+    }
+
+    // 027-C-2 第二阻断点：two_is_unit 实现没检查进位单位，只查 all_units
+    //   修复：两后紧跟 is_cn_unit_char（十/百/千/万/亿）→ 返回false（两是数字2）
+    //   符合函数注释「进位单位由进位组合路径自行继续，此处不误判」原意
+
+    // 4.2 large_amount_keep_wan_yi 原有行为保住（6 条）
+    #[test]
+    fn itn_v2_027c_keep_wan_yi_wu_wan_dun() {
+        // 「五万吨」：「吨」非中文数字 → 维持 break → 保留汉字
+        assert_eq!(normalize_test("五万吨"), "五万吨");
+    }
+
+    #[test]
+    fn itn_v2_027c_keep_wan_yi_yi_yi_dun() {
+        // 「一亿吨」：「吨」非中文数字 → 维持 break → 保留汉字
+        assert_eq!(normalize_test("一亿吨"), "一亿吨");
+    }
+
+    #[test]
+    fn itn_v2_027c_keep_wan_yi_san_wan_yuan() {
+        // 「三万元」：「元」非中文数字 → 维持 break → 保留汉字
+        assert_eq!(normalize_test("三万元"), "三万元");
+    }
+
+    #[test]
+    fn itn_v2_027c_keep_liang_jin() {
+        // 「两斤」：两在首位 idx==start，two_is_unit 返回false → 两是数字2
+        assert_eq!(normalize_test("两斤"), "2斤");
+    }
+
+    #[test]
+    fn itn_v2_027c_keep_er_liang() {
+        // 「二两」：两后句尾无进位单位 → two_is_unit=true → 两是单位 → 2两
+        assert_eq!(normalize_test("二两"), "2两");
+    }
+
+    #[test]
+    fn itn_v2_027c_keep_yi_jin_er_liang() {
+        // 「一斤二两」：017 端测原始用例，两后句尾 → 1斤2两
+        assert_eq!(normalize_test("一斤二两"), "1斤2两");
+    }
+
+    // 017 全套零回归（two_is_unit 改动的最大风险面）
+    #[test]
+    fn itn_v2_027c_017_no_regression() {
+        assert_eq!(normalize_test("一斤二两"), "1斤2两");   // 两后句尾
+        assert_eq!(normalize_test("二两"), "2两");           // 两后句尾
+        assert_eq!(normalize_test("二十五两"), "25两");      // 两后句尾
+        assert_eq!(normalize_test("两斤"), "2斤");           // 两首位 idx==start
+        assert_eq!(normalize_test("三两"), "3两");           // 两后句尾
+        assert_eq!(normalize_test("二两半"), "2.5两");      // 两后「半」非进位单位
+        assert_eq!(normalize_test("一两"), "1两");           // 两后句尾
+        assert_eq!(normalize_test("半斤八两"), "半斤八两"); // 两后句尾（且整体成语保护）
+        assert_eq!(normalize_test("六两五"), "6.5两");      // 两后「五」数字非进位单位
+        assert_eq!(normalize_test("三块两毛五"), "3.25元"); // 两后「毛」∈all_units 先返回false
+        assert_eq!(normalize_test("两百"), "200");          // 两首位 idx==start
+        assert_eq!(normalize_test("两块"), "2块");          // 两首位
+        assert_eq!(normalize_test("两吨"), "2吨");          // 两首位
+        assert_eq!(normalize_test("一两半"), "1.5两");      // 两后「半」非进位单位
+    }
+
+    // 027-A/B 成果不回归（6 条）
+    // ITN-FIX-BIGNUM-027-D (DEC-042)：两万五 从 25000 → 2.5万（设计变更非回归）
+    #[test]
+    fn itn_v2_027c_ab_no_regression() {
+        assert_eq!(normalize_test("一千零四十六万八千七百四十一"), "10468741");
+        assert_eq!(normalize_test("两万五"), "2.5万"); // DEC-042 变更
+        assert_eq!(normalize_test("一万亿"), "1万亿"); // DEC-042 补充二 变更
+        assert_eq!(normalize_test("一千二百三十四亿五千万"), "1234.5亿"); // DEC-042 变更
+        assert_eq!(normalize_test("三亿零五万"), "30005万"); // DEC-042 变更
+        assert_eq!(normalize_test("两千三百四十五万"), "2345万"); // DEC-042 变更
+    }
+
+    // 第六节#4 丙型 UnitChain result 丢弃实测结论（只测不改）
+    //   结论：#4 不是真缺陷。丙型链每段调 parse_cn_number 消费一段（含万/亿大单位
+    //   结算到 result），UnitChain 只取 section 级值。但实测「三万五千块钱」→「35000块钱」
+    //   正确：parse_cn_number 一次性消费「三万五千」（万结算），块由下一段处理。
+    //   「一亿两千万元」受 027-C 阻断（亿后两 break），027-C 修复后应正确。
+    //   丙型链不直接处理万/亿大单位（那是 parse_cn_number 内部），UnitChain 的 parts
+    //   是「数字+单位」对（如 35000+块），不含万/亿层级 → result 丢弃不影响丙型正确性。
+    #[test]
+    fn itn_v2_027c_unit_chain_drop_no_bug() {
+        // 丙型链正确处理含万级数字
+        assert_eq!(normalize_test("三万五千块钱"), "35000块钱");
+        assert_eq!(normalize_test("五百块"), "500块");
+        assert_eq!(normalize_test("三块四毛八一斤"), "3.48元一斤");
+        assert_eq!(normalize_test("五块一斤"), "5块一斤");
+        assert_eq!(normalize_test("一百二十块三毛"), "120.3元");
+    }
+
+    // ============================================================
+    // ITN-FIX-BIGNUM-027-D (DEC-042) · 隐式补全保留锚定单位（行为变更）
+    // ============================================================
+
+    // 4.1 隐式补全 → 保留锚定单位（本次变更）
+    #[test]
+    fn itn_v2_027d_implicit_anchor_wan() {
+        assert_eq!(normalize_test("两万五"), "2.5万"); // 原 25000
+        assert_eq!(normalize_test("五万三"), "5.3万"); // 原 53000
+        assert_eq!(normalize_test("一万五"), "1.5万");
+    }
+
+    #[test]
+    fn itn_v2_027d_implicit_anchor_yi() {
+        assert_eq!(normalize_test("三亿五"), "3.5亿"); // 原 300005000（4.6 不符）
+        assert_eq!(normalize_test("三亿七"), "3.7亿");
+    }
+
+    // 4.2 完整表达 → 照常展开（不得受影响）
+    #[test]
+    fn itn_v2_027d_full_expression_expand() {
+        assert_eq!(normalize_test("两万五千"), "25000");       // 千=进位单位 → unit_since_big=true → 不进隐式分支
+        assert_eq!(normalize_test("三亿五千万"), "3.5亿"); // DEC-042 变更
+        assert_eq!(normalize_test("一亿两千三百四十五万六千七百八十九"), "123456789");
+        assert_eq!(normalize_test("一千零四十六万八千七百四十一"), "10468741");
+        assert_eq!(normalize_test("三万五千二百四十一"), "35241");
+        assert_eq!(normalize_test("一千二百三十四亿五千万"), "1234.5亿"); // DEC-042 变更
+    }
+
+    // 4.3 零/无补全路径（不得受影响）
+    #[test]
+    fn itn_v2_027d_zero_no_fill_paths() {
+        assert_eq!(normalize_test("三万五千二百零一"), "35201"); // 有零 → zero_since_big=true
+        assert_eq!(normalize_test("三亿零五万"), "30005万"); // DEC-042 变更
+        assert_eq!(normalize_test("一万亿"), "1万亿"); // DEC-042 补充二 变更
+        assert_eq!(normalize_test("两千三百四十五万"), "2345万"); // DEC-042 变更
+        assert_eq!(normalize_test("十亿"), "10亿"); // DEC-042 变更
+        assert_eq!(normalize_test("一亿"), "1亿"); // DEC-042 变更
+    }
+
+    // 调用点安全：隐式补全后跟单位时不保留锚定（保护下游 .parse() 消费方）
+    #[test]
+    fn itn_v2_027d_call_site_safety_unit_after_digit() {
+        assert_eq!(normalize_test("三万五块"), "35000块");
+        assert_eq!(normalize_test("三万五块钱"), "35000块钱");
+        assert_eq!(normalize_test("两万五元"), "25000元");
+        assert_eq!(normalize_test("两万五斤"), "25000斤");
+        assert_eq!(normalize_test("三亿五吨"), "350000000吨"); // DEC-042 亿级隐式补全×1e7
+        assert_eq!(normalize_test("五万三角"), "53000角");
+    }
+
+    // ============================================================
+    // ITN-FIX-BIGNUM-027-E (DEC-042 补完) · 数量级锚定最小单位全面落地
+    // ============================================================
+
+    // 3.1 单一量级（从亿到个）
+    #[test]
+    fn itn_v2_027e_single_magnitude() {
+        assert_eq!(normalize_test("三亿"), "3亿");
+        assert_eq!(normalize_test("三千万"), "3000万");
+        assert_eq!(normalize_test("三百万"), "300万");
+        assert_eq!(normalize_test("三十万"), "30万");
+        assert_eq!(normalize_test("三万"), "3万");
+        assert_eq!(normalize_test("三千"), "3000");
+        assert_eq!(normalize_test("三百"), "300");
+        assert_eq!(normalize_test("三十"), "30");
+        // 「三」单字无单位 → 单字保护保持汉字（DEC-042 不适用，无量级单位）
+    }
+
+    // 3.2 混合量级 + 升亿判定
+    #[test]
+    fn itn_v2_027e_mixed_magnitude_promote_yi() {
+        assert_eq!(normalize_test("三亿五千万"), "3.5亿");           // 升亿 1 位小数
+        assert_eq!(normalize_test("一千二百三十四亿五千万"), "1234.5亿"); // 升亿 1 位
+    }
+
+    #[test]
+    fn itn_v2_027e_mixed_magnitude_keep_wan() {
+        assert_eq!(normalize_test("一亿两千三百四十五万"), "12345万"); // 4 位小数 → 不升
+        assert_eq!(normalize_test("一亿零三万"), "10003万");           // 4 位 → 不升
+        assert_eq!(normalize_test("三千五百万"), "3500万");            // 不足 1 亿
+        assert_eq!(normalize_test("三十五万"), "35万");               // 不足 1 亿
+    }
+
+    #[test]
+    fn itn_v2_027e_mixed_implicit_anchor() {
+        assert_eq!(normalize_test("三亿五"), "3.5亿"); // 027-D 已实现，亿级隐式补全×1e7
+        assert_eq!(normalize_test("两万五"), "2.5万"); // 027-D 已实现，万级隐式补全×1e3
+    }
+
+    // 3.3 最小单位落千及以下（不带后缀，不得受影响）
+    #[test]
+    fn itn_v2_027e_below_wan_no_suffix() {
+        assert_eq!(normalize_test("两万五千"), "25000");    // 千=进位单位 → unit_since_big=true
+        assert_eq!(normalize_test("三万五千"), "35000");
+        assert_eq!(normalize_test("三千五百"), "3500");
+        assert_eq!(normalize_test("一千零四十六万八千七百四十一"), "10468741");
+        assert_eq!(normalize_test("一亿两千三百四十五万六千七百八十九"), "123456789");
+        assert_eq!(normalize_test("三万五千二百四十一"), "35241");
+        assert_eq!(normalize_test("三万五千二百零一"), "35201");
+    }
+
+    // 第四节变更断言验证（DEC-042 设计变更非回归）
+    #[test]
+    fn itn_v2_027e_section4_changes() {
+        assert_eq!(normalize_test("一亿"), "1亿");               // 旧 100000000
+        assert_eq!(normalize_test("十亿"), "10亿");              // 旧 1000000000
+        assert_eq!(normalize_test("两千三百四十五万"), "2345万"); // 旧 23450000
+        assert_eq!(normalize_test("一千二百三十四亿五千万"), "1234.5亿"); // 旧 123450000000
+        assert_eq!(normalize_test("三亿五千万"), "3.5亿");       // 旧 350000000
+        assert_eq!(normalize_test("三亿零五万"), "30005万");     // 旧 300050000
+        assert_eq!(normalize_test("一万亿"), "1万亿");           // 旧 1000000000000（027-G-1 DEC-042 补充二）
+    }
+
+    // 第八节 4 组零回归
+    #[test]
+    fn itn_v2_027e_zero_regression_017_weight() {
+        assert_eq!(normalize_test("一斤二两"), "1斤2两");
+        assert_eq!(normalize_test("二两半"), "2.5两");
+    }
+
+    #[test]
+    fn itn_v2_027e_zero_regression_026_currency() {
+        assert_eq!(normalize_test("五块一斤"), "5块一斤");
+        assert_eq!(normalize_test("五块一"), "5.1元");
+        assert_eq!(normalize_test("一块两毛二"), "1.22元");
+    }
+
+    #[test]
+    fn itn_v2_027e_zero_regression_016_grade_class() {
+        assert_eq!(normalize_test("一三班"), "一三班");
+    }
+
+    #[test]
+    fn itn_v2_027e_zero_regression_dec038_protect() {
+        assert_eq!(normalize_test("五毛钱"), "五毛钱");
+        assert_eq!(normalize_test("三毛钱"), "3毛钱");
+    }
+
+    // ==== TEST-EXEC-027 补测 S1：升亿 2 位边界（DEC-042 补完版） ====
+    // 规则：恰好 1 位小数 → 万层可升亿；恰好 2 位小数 → 保留万层不升。
+    #[test]
+    fn itn_v2_027_exec_s1_promote_yi_one_decimal() {
+        assert_eq!(normalize_test("一亿五千万"), "1.5亿");
+    }
+
+    #[test]
+    fn itn_v2_027_exec_s1_keep_wan_two_decimal() {
+        assert_eq!(normalize_test("一亿两千五百万"), "12500万");
+    }
+
+    #[test]
+    fn itn_v2_027_exec_s1_mixed_3yi_500wan() {
+        assert_eq!(normalize_test("三亿五百万"), "30500万");
+    }
+
+    // ==== TEST-EXEC-027 补测 S2：C-only 隔离（DEC-042 孤立判定） ====
+    #[test]
+    fn itn_v2_027_exec_s2_c_only_isolation() {
+        assert_eq!(normalize_test("一亿三千万"), "1.3亿");
+    }
+
+    // ==== TEST-EXEC-027 补测 S3：B1-B5 契约护栏 ====
+    // B1 货币链：带单位万/亿表达必须走展开路径，返回纯数字，绝不可带单位串。
+    #[test]
+    fn itn_v2_027_exec_s3_b1_currency_wan() {
+        assert_eq!(normalize_test("两万五千元"), "25000元");
+        assert_eq!(normalize_test("两千三百四十五万元"), "2345万元");
+        assert_eq!(normalize_test("五万三块钱"), "53000块钱");
+        assert_eq!(normalize_test("三万块"), "三万块");
+    }
+
+    #[test]
+    fn itn_v2_027_exec_s3_b1_currency_yi() {
+        assert_eq!(normalize_test("三亿五元"), "350000000元");
+    }
+
+    // B2 重量链：万/亿层重量数值全展开，零乘法拼接保持原单位。
+    #[test]
+    fn itn_v2_027_exec_s3_b2_weight() {
+        assert_eq!(normalize_test("三万五千斤"), "35000斤");
+        assert_eq!(normalize_test("两千三百四十五万吨"), "2345万吨");
+        assert_eq!(normalize_test("三亿五克"), "350000000克");
+    }
+
+    // B3 量词/词素边界：万前是量词时保持中文原样。
+    #[test]
+    fn itn_v2_027_exec_s3_b3_classifier() {
+        assert_eq!(normalize_test("三十万个"), "30万个");
+        assert_eq!(normalize_test("两千三百四十五万人"), "2345万人");
+        assert_eq!(normalize_test("五万台"), "五万台");
+        assert_eq!(normalize_test("十万次"), "十万次");
+    }
+
+    // B4 标点收尾：万/亿层孤立 + 标点 → 升亿/保留万并保留标点。
+    #[test]
+    fn itn_v2_027_exec_s3_b4_punct_end() {
+        assert_eq!(normalize_test("三千万。"), "3000万。");
+        assert_eq!(normalize_test("两千三百四十五万，"), "2345万，");
+        assert_eq!(normalize_test("三亿五"), "3.5亿");
+    }
+
+    // B5 歧义后缀：左右/以上/多 保持万层 + 后缀。
+    #[test]
+    fn itn_v2_027_exec_s3_b5_ambiguous_suffix() {
+        assert_eq!(normalize_test("三千万左右"), "3000万左右");
+        assert_eq!(normalize_test("两千三百四十五万以上"), "2345万以上");
+        assert_eq!(normalize_test("三亿多"), "3亿多");
+    }
+
+    // ==== TEST-EXEC-027 补测 S4：big_unit_seen 反向（无大单位时尾数累加） ====
+    #[test]
+    fn itn_v2_027_exec_s4_big_unit_seen_reverse() {
+        assert_eq!(normalize_test("五百三"), "503");
+        assert_eq!(normalize_test("三百二"), "302");
+    }
+
+    // ==== TEST-EXEC-027 补测 S5：静默归零钉现状（027-F 修复后值） ====
+    // 027-F 在隐式尾数吸收处加 num_str 纯数字校验，带单位串不再被吸收进 parts，
+    // 由主循环独立解析 → 走 DEC-042 锚定路径，杜绝 format_currency_chain 归零。
+    #[test]
+    fn itn_v2_027_exec_s5_zeroing_fixed_implicit_tail() {
+        assert_eq!(normalize_test("五块一万"), "5块1万");
+        assert_eq!(normalize_test("五块三亿"), "5块3亿");
+        assert_eq!(normalize_test("三毛五亿"), "3毛5亿");
+        assert_eq!(normalize_test("一块三亿。"), "1块3亿。");
+    }
+
+    // ==== TEST-EXEC-027 补测 D 组回归补充 ====
+    #[test]
+    fn itn_v2_027_exec_d1_regression_octal() {
+        assert_eq!(normalize_test("八角"), "8角");
+    }
+
+    #[test]
+    fn itn_v2_027_exec_d2_regression_weight_chain_tail() {
+        assert_eq!(normalize_test("三斤六两五"), "3斤6两5");
+    }
+
+    #[test]
+    fn itn_v2_027_exec_d3_regression_grade_class() {
+        assert_eq!(normalize_test("五一班"), "五一班");
+        assert_eq!(normalize_test("初二三班"), "初二三班");
+        assert_eq!(normalize_test("高一四班"), "高一四班");
+    }
+
+    #[test]
+    fn itn_v2_027_exec_d5_regression_money_word() {
+        assert_eq!(normalize_test("一块钱"), "一块钱");
+    }
+
+    // ==== TEST-EXEC-027-G 补测 A2：万亿层（DEC-042 补充二 / 027-G-1） ====
+    // 三级升级链：万 → 亿 → 万亿。阈值判据一致：升级后小数位 ≤1 才升。
+    #[test]
+    fn itn_v2_027g_a2_wanyi_integer() {
+        assert_eq!(normalize_test("一万亿"), "1万亿");
+        assert_eq!(normalize_test("三万亿"), "3万亿");
+    }
+
+    #[test]
+    fn itn_v2_027g_a2_wanyi_promote_one_decimal() {
+        assert_eq!(normalize_test("一万五千亿"), "1.5万亿");
+    }
+
+    // 升万亿阈值边界另一侧：恰好 2 位小数 → 不升，保持亿层。
+    #[test]
+    fn itn_v2_027g_a2_keep_yi_two_decimal() {
+        assert_eq!(normalize_test("一万两千三百亿"), "12300亿");
+    }
+
+    #[test]
+    fn itn_v2_027g_a2_below_wanyi_unchanged() {
+        assert_eq!(normalize_test("十亿"), "10亿");
+        assert_eq!(normalize_test("一千二百三十四亿五千万"), "1234.5亿");
+    }
+
+    // ==== TEST-EXEC-027-G 补测 A3：专名白名单（DEC-044 / 027-G-2） ====
+    #[test]
+    fn itn_v2_027g_a3_proper_noun_positive() {
+        assert_eq!(normalize_test("十万个为什么"), "十万个为什么");
+        assert_eq!(normalize_test("我买了一本十万个为什么"), "我买了一本十万个为什么");
+    }
+
+    // 反向护栏：加词条不得挡住普通「十万个」（个 非单位 → 十万锚定 10万）。
+    #[test]
+    fn itn_v2_027g_a3_proper_noun_reverse_guard() {
+        assert_eq!(normalize_test("十万个人"), "10万个人");
+    }
+
+    // 前缀遮蔽自查 [ITN-PREFIX-SHADOW-001]：裸「十万」「十万块钱」不受新词条影响。
+    #[test]
+    fn itn_v2_027g_a3_no_prefix_shadow() {
+        assert_eq!(normalize_test("十万"), "10万");
+        assert_eq!(normalize_test("十万块钱"), "十万块钱");
     }
 }

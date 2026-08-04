@@ -194,12 +194,12 @@ pub fn script_instruction(text: &str, script: ChineseScript) -> Option<&'static 
 
     // LANG-MIXED-001: 含假名/谚文 → 纯保护措辞（不含中文简繁字样，只保留防翻译语义）
     if contains_kana(text) || contains_hangul(text) {
-        return Some("保留输入中各语种的原文形态，不要将任何内容翻译成其他语言。");
+        return Some("Preserve the original form of every language in the input. Do NOT translate any content into another language.");
     }
 
     Some(match script {
-        ChineseScript::Simplified => "请将输出中的中文部分统一为简体中文（中国大陆简体字）字形；不要翻译任何非中文内容，英文、日文、韩文一律保留原文原样。",
-        ChineseScript::Traditional => "请将输出中的中文部分统一为繁体中文（台湾正体字）字形；不要翻译任何非中文内容，英文、日文、韩文一律保留原文原样。",
+        ChineseScript::Simplified => "Normalize the Chinese parts of the output to Simplified Chinese (Mainland China standard glyphs). Do NOT translate any non-Chinese content — English, Japanese and Korean text MUST be preserved exactly as spoken.",
+        ChineseScript::Traditional => "Normalize the Chinese parts of the output to Traditional Chinese (Taiwan standard glyphs). Do NOT translate any non-Chinese content — English, Japanese and Korean text MUST be preserved exactly as spoken.",
     })
 }
 
@@ -221,8 +221,8 @@ pub fn script_instruction_for_translate(text: &str, script: ChineseScript) -> Op
     }
 
     Some(match script {
-        ChineseScript::Simplified => "请将输出中的中文部分统一为简体中文（中国大陆简体字）字形。",
-        ChineseScript::Traditional => "请将输出中的中文部分统一为繁体中文（台湾正体字）字形。",
+        ChineseScript::Simplified => "Normalize the Chinese parts of the output to Simplified Chinese (Mainland China standard glyphs).",
+        ChineseScript::Traditional => "Normalize the Chinese parts of the output to Traditional Chinese (Taiwan standard glyphs).",
     })
 }
 
@@ -349,7 +349,7 @@ mod tests {
     fn script_instruction_chinese_content_returns_instruction() {
         let instr = script_instruction("你好", ChineseScript::Simplified);
         assert!(instr.is_some());
-        assert!(instr.unwrap().contains("简体中文"));
+        assert!(instr.unwrap().contains("Simplified Chinese"));
     }
 
     #[test]
@@ -364,7 +364,7 @@ mod tests {
     #[test]
     fn script_instruction_traditional() {
         let instr = script_instruction("你好", ChineseScript::Traditional);
-        assert!(instr.unwrap().contains("繁体中文"));
+        assert!(instr.unwrap().contains("Traditional Chinese"));
     }
 
     // ============================================================
@@ -447,18 +447,17 @@ mod tests {
         );
         let s = instr.unwrap();
         assert!(
-            !s.contains("简体中文"),
-            "protection must not mention 简体中文"
+            !s.contains("Simplified Chinese"),
+            "protection must not mention Simplified Chinese"
         );
         assert!(
-            !s.contains("繁体中文"),
-            "protection must not mention 繁体中文"
+            !s.contains("Traditional Chinese"),
+            "protection must not mention Traditional Chinese"
         );
         assert!(
-            s.contains("不要"),
+            s.contains("Do NOT translate"),
             "protection must retain do-not-translate guard"
         );
-        assert!(s.contains("翻译"));
     }
 
     #[test]
@@ -467,10 +466,9 @@ mod tests {
         let instr = script_instruction("你好 안녕하세요", ChineseScript::Simplified);
         assert!(instr.is_some());
         let s = instr.unwrap();
-        assert!(!s.contains("简体中文"));
-        assert!(!s.contains("繁体中文"));
-        assert!(s.contains("不要"));
-        assert!(s.contains("翻译"));
+        assert!(!s.contains("Simplified Chinese"));
+        assert!(!s.contains("Traditional Chinese"));
+        assert!(s.contains("Do NOT translate"));
     }
 
     #[test]
@@ -479,8 +477,8 @@ mod tests {
         let instr = script_instruction("你好 world", ChineseScript::Simplified);
         assert!(instr.is_some());
         let s = instr.unwrap();
-        assert!(s.contains("简体中文"));
-        assert!(s.contains("不要翻译"));
+        assert!(s.contains("Simplified Chinese"));
+        assert!(s.contains("Do NOT translate any non-Chinese content"));
     }
 
     #[test]
@@ -489,8 +487,8 @@ mod tests {
         let instr = script_instruction("日本語テスト", ChineseScript::Simplified);
         assert!(instr.is_some(), "pure JP with kanji should get protection");
         let s = instr.unwrap();
-        assert!(!s.contains("简体中文"));
-        assert!(s.contains("不要"));
+        assert!(!s.contains("Simplified Chinese"));
+        assert!(s.contains("Do NOT translate"));
     }
 
     #[test]
@@ -506,7 +504,7 @@ mod tests {
         // 纯中文简体：无假名无谚文 → 字形统一 + 不要翻译
         let instr = script_instruction("你好世界", ChineseScript::Simplified);
         assert!(instr.is_some());
-        assert!(instr.unwrap().contains("简体中文"));
+        assert!(instr.unwrap().contains("Simplified Chinese"));
     }
 
     #[test]
@@ -515,8 +513,8 @@ mod tests {
         let instr = script_instruction("你好世界", ChineseScript::Traditional);
         assert!(instr.is_some());
         let s = instr.unwrap();
-        assert!(s.contains("繁体中文"));
-        assert!(s.contains("不要翻译"));
+        assert!(s.contains("Traditional Chinese"));
+        assert!(s.contains("Do NOT translate any non-Chinese content"));
     }
 
     // ============================================================
@@ -610,13 +608,13 @@ mod tests {
         let instr = script_instruction_for_translate("你好世界", ChineseScript::Simplified);
         assert!(instr.is_some());
         let s = instr.unwrap();
-        assert!(s.contains("简体中文"));
+        assert!(s.contains("Simplified Chinese"));
         assert!(
-            !s.contains("不要翻译"),
+            !s.contains("Do NOT translate"),
             "translate path must NOT contain do-not-translate"
         );
         assert!(
-            !s.contains("保留原文"),
+            !s.contains("Preserve the original form"),
             "translate path must NOT contain protection-only wording"
         );
     }
@@ -626,8 +624,8 @@ mod tests {
         let instr = script_instruction_for_translate("你好世界", ChineseScript::Traditional);
         assert!(instr.is_some());
         let s = instr.unwrap();
-        assert!(s.contains("繁体中文"));
-        assert!(!s.contains("不要翻译"));
+        assert!(s.contains("Traditional Chinese"));
+        assert!(!s.contains("Do NOT translate"));
     }
 
     #[test]
@@ -652,12 +650,55 @@ mod tests {
         assert!(instr.is_none());
     }
 
+    /// TEST-SYNC-008 0b 新守卫①：翻译路径不得含 Do NOT translate。
+    /// ⚠️ LANG-MIXED-001 的既有硬要求：翻译路径注入「不要翻译」会阻断翻译功能
+    /// （用户按翻译热键时被自己的指令打回）——删掉会让翻译热键失效，属回归。
+    /// 显式锁定：translate 路径的简繁两条指令串都不得含 Do NOT translate。
+    #[test]
+    fn translate_path_never_contains_do_not_translate() {
+        for script in [ChineseScript::Simplified, ChineseScript::Traditional] {
+            let s = script_instruction_for_translate("你好世界", script)
+                .expect("translate path should give instruction");
+            assert!(
+                !s.contains("Do NOT translate"),
+                "translate path must never contain Do NOT translate (LANG-MIXED-001)"
+            );
+        }
+    }
+
+    /// TEST-SYNC-008 0b 新守卫②：5 条指令串不得出现中日韩字符（Gavin 2026-08-01：系统提示应纯英文）。
+    /// 覆盖两条 optimize + 两条 translate + 一条保护措辞，共 5 个 &'static str。
+    /// 注释里的中文不算（仅测返回的指令串本身）。将来有人往指令串里加中文会撞红。
+    #[test]
+    fn script_instructions_are_pure_english_no_cjk() {
+        use crate::text_normalizer::contains_kana;
+        let cases: Vec<&str> = vec![
+            script_instruction("你好", ChineseScript::Simplified).unwrap(),
+            script_instruction("你好", ChineseScript::Traditional).unwrap(),
+            script_instruction("你好 こんにちは", ChineseScript::Simplified).unwrap(), // 保护措辞
+            script_instruction_for_translate("你好世界", ChineseScript::Simplified).unwrap(),
+            script_instruction_for_translate("你好世界", ChineseScript::Traditional).unwrap(),
+        ];
+        for s in cases {
+            assert!(
+                !contains_kana(s) && !contains_hangul(s),
+                "指令串必须纯英文：{:?}",
+                s
+            );
+            assert!(
+                !s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                "指令串不得含汉字：{:?}",
+                s
+            );
+        }
+    }
+
     #[test]
     fn translate_path_instruction_no_kana_no_hangul_mixed_cn_en() {
         // 中英混合：翻译路径只字形约束
         let instr = script_instruction_for_translate("你好 world", ChineseScript::Simplified);
         assert!(instr.is_some());
-        assert!(!instr.unwrap().contains("不要翻译"));
+        assert!(!instr.unwrap().contains("Do NOT translate"));
     }
 
     // ============================================================

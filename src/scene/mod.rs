@@ -156,24 +156,18 @@ impl CompiledRules {
         // 优先级 1：exe 精确匹配
         for rule in &self.rules {
             if rule.exe_lower.contains(&exe_lower) {
-                // 浏览器细分：exe 命中 Browser 后，检查其他场景 title_keywords 覆盖
+                // 浏览器细分：exe 命中 Browser 后，检查其他场景 title_keywords 覆盖。
+                // FIX-SCENE-TITLE-LONGEST-001：改确定性最长匹配（见 find_longest_title_rule
+                // 注释，与 ITN-V2-ENGINE-002 filter+max() 同源）。
                 if rule.kind == SceneKind::Browser && !title.is_empty() {
-                    for other_rule in &self.rules {
-                        if other_rule.kind == SceneKind::Browser {
-                            continue; // 跳过浏览器自身的 title_keywords
-                        }
-                        for kw in &other_rule.title_keywords {
-                            // SCENE-TITLE-CASE-001: 大小写不敏感匹配
-                            if title_lower.contains(kw.as_str()) {
-                                return SceneContext {
-                                    scene: other_rule.kind,
-                                    app_exe: exe.to_string(),
-                                    window_title: title.to_string(),
-                                    multiline_safe: other_rule.multiline_safe,
-                                    style_hint: other_rule.style.clone(),
-                                };
-                            }
-                        }
+                    if let Some(other_rule) = self.find_longest_title_rule(&title_lower, true) {
+                        return SceneContext {
+                            scene: other_rule.kind,
+                            app_exe: exe.to_string(),
+                            window_title: title.to_string(),
+                            multiline_safe: other_rule.multiline_safe,
+                            style_hint: other_rule.style.clone(),
+                        };
                     }
                 }
                 return SceneContext {
@@ -187,20 +181,18 @@ impl CompiledRules {
         }
 
         // 优先级 2：标题关键词（exe 未命中任何规则时）
+        // FIX-SCENE-TITLE-LONGEST-001：改确定性最长匹配。此路径**不排除 Browser**——
+        // exe 未命中任何规则时，browser 自身的 title_keywords 是合法候选（与改动 1
+        // 浏览器细分「跳过自身」的语义差异见 find_longest_title_rule 注释）。
         if !title.is_empty() {
-            for rule in &self.rules {
-                for kw in &rule.title_keywords {
-                    // SCENE-TITLE-CASE-001: 大小写不敏感匹配
-                    if title_lower.contains(kw.as_str()) {
-                        return SceneContext {
-                            scene: rule.kind,
-                            app_exe: exe.to_string(),
-                            window_title: title.to_string(),
-                            multiline_safe: rule.multiline_safe,
-                            style_hint: rule.style.clone(),
-                        };
-                    }
-                }
+            if let Some(matched) = self.find_longest_title_rule(&title_lower, false) {
+                return SceneContext {
+                    scene: matched.kind,
+                    app_exe: exe.to_string(),
+                    window_title: title.to_string(),
+                    multiline_safe: matched.multiline_safe,
+                    style_hint: matched.style.clone(),
+                };
             }
         }
 
@@ -212,6 +204,63 @@ impl CompiledRules {
             multiline_safe: false,
             style_hint: String::new(),
         }
+    }
+
+    /// 在全部 rule 的 title_keywords 中做**确定性最长匹配**，返回命中且字符数最长的那条所属 rule。
+    ///
+    /// FIX-SCENE-TITLE-LONGEST-001：此前的遍历是「按 toml 块顺序首匹配即返回」，短词
+    /// （chat 块的 `钉钉`/`飞书`）排在长词（doc 块的 `钉钉文档`/`飞书文档`）之前时，
+    /// 长词永远轮不到，导致 `chrome.exe + 钉钉文档 - 协作` 被误判为 chat。
+    ///
+    /// 处置方式与 ITN-V2-ENGINE-002 / [ITN-PREFIX-SHADOW-001] 同源：`src/itn.rs`
+    /// `check_protection` 对 `十一月`⊂`十一` 这类前缀遮蔽也是改为确定性最长匹配
+    /// （`filter` + `max()`），规则性碰撞用规则解决，不用词表补丁（DEC-038）。
+    ///
+    /// - `exclude_browser=true`：跳过 Browser 块 —— SCENE-SENSE-001 浏览器细分语义
+    ///   「浏览器不参与自身细分」（改动 1 用）。
+    /// - `exclude_browser=false`：不排除 Browser —— exe 未命中任何规则时 browser 自身
+    ///   的 title_keywords 是合法候选（改动 2 / 优先级 2 兜底用）。
+    ///
+    /// 比较用 `kw.chars().count()`（字符数）而非字节数，中文关键词必须正确计长。
+    /// `title_lower` 只计算一次由调用方传入（SCENE-TITLE-CASE-001 既有优化，不退化）。
+    ///
+    /// 平局打破规则（主控 2026-08-01 裁定，方案 A）：browser 是**通用保守兜底场景**，
+    /// 它的 title_keywords 多与 email/doc 等具体场景共享（见 browser 块注释「邮箱场景
+    /// 兜底」）。两处候选同长时若仍按「取迭代靠后的块」，browser 块排在 toml 末尾必然
+    /// 胜出，`UnknownApp + 收件箱 - Outlook` 会被误判为 browser。故：**同长时具体场景
+    /// 优先于 browser，browser 仅当其关键词严格更长才胜出**。与 DEC-038「规则性问题用
+    /// 规则解决」一致，且可推广到未来任何「通用兜底块」。
+    ///
+    /// 平局确定性：比较键为 `(len, 非browser=1/browser=0)`，`>` 严格序、无 `>=` 覆盖，
+    /// 迭代顺序稳定 → 结果确定可预期，不随机漂移。
+    fn find_longest_title_rule(
+        &self,
+        title_lower: &str,
+        exclude_browser: bool,
+    ) -> Option<&CompiledRule> {
+        let mut best: Option<(&CompiledRule, usize, bool)> = None;
+        for rule in &self.rules {
+            if exclude_browser && rule.kind == SceneKind::Browser {
+                continue;
+            }
+            for kw in &rule.title_keywords {
+                if title_lower.contains(kw.as_str()) {
+                    let len = kw.chars().count();
+                    let is_browser = rule.kind == SceneKind::Browser;
+                    // 比较键 (len, !is_browser)：len 主序，平局时非 browser 优先
+                    let better = match best {
+                        None => true,
+                        Some((_, best_len, best_is_browser)) => {
+                            len > best_len || (len == best_len && !is_browser && best_is_browser)
+                        }
+                    };
+                    if better {
+                        best = Some((rule, len, is_browser));
+                    }
+                }
+            }
+        }
+        best.map(|(rule, _, _)| rule)
     }
 }
 
@@ -360,11 +409,14 @@ mod tests {
 
     #[test]
     fn classify_vscode_to_ide() {
+        // TEST-SYNC-SCENE-MD-003：Gavin 2026-08-01 裁定代码/文字编辑生成类软件
+        // （VS Code/Cursor/JetBrains 全家等）放开多行 → ide_terminal(true) 块。
+        // 旧断言「IDE/terminal must be multiline_safe=false」随设计变更作废。
         let scene = classify_builtin("Code.exe", "main.rs - VSCode");
         assert_eq!(scene.scene, SceneKind::IdeTerminal);
         assert!(
-            !scene.multiline_safe,
-            "IDE/terminal must be multiline_safe=false"
+            scene.multiline_safe,
+            "IDE/editor must be multiline_safe=true"
         );
     }
 
@@ -870,7 +922,7 @@ exe = ["browser.exe"]
             parsed.err()
         );
         let rules = parsed.unwrap();
-        assert_eq!(rules.scene.len(), 8, "[[scene]] 块数应为 8");
+        assert_eq!(rules.scene.len(), 9, "[[scene]] 块数应为 9");
         let total: usize = rules.scene.iter().map(|s| s.exe.len()).sum();
         assert!(
             total >= 160,
@@ -1008,5 +1060,351 @@ title_keywords = ["doc_keyword"]
         assert_eq!(scene_upper.scene, SceneKind::Doc);
         assert_eq!(scene_lower.scene, scene_upper.scene);
         assert!(scene_lower.multiline_safe);
+    }
+
+    // ============================================================
+    // SCENE-MD-003（IMPL-SCENE-MULTILINE-002）：ide_terminal 双块全覆盖 + 互斥验证
+    // 原名 temp_*（曾被视为临时），主控裁定这批是永久保留：28 条逐条实测除写测试
+    // 外无他法，任务书「零 Rust 改动」与「28 条实测」规格自相矛盾，责任在主控。
+    // 已改为正式命名 scene_md003_* / SCENE_MD003_*。
+    // ============================================================
+
+    /// ide_terminal(multiline_safe=true) 块：代码/文字编辑生成类软件（Gavin 2026-08-01 裁定放开多行）
+    const SCENE_MD003_TRUE_EXES: &[&str] = &[
+        "notepad++.exe",
+        "sublime_text.exe",
+        "SublimeText.exe",
+        "Code.exe",
+        "Code - Insiders.exe",
+        "cursor.exe",
+        "Windsurf.exe",
+        "Zed.exe",
+        "HBuilderX.exe",
+        "devenv.exe",
+        "idea64.exe",
+        "idea.exe",
+        "pycharm64.exe",
+        "pycharm.exe",
+        "webstorm64.exe",
+        "webstorm.exe",
+        "goland64.exe",
+        "goland.exe",
+        "rustrover64.exe",
+        "rustrover.exe",
+        "clion64.exe",
+        "clion.exe",
+        "phpstorm64.exe",
+        "phpstorm.exe",
+        "rubymine64.exe",
+        "rubymine.exe",
+        "rider64.exe",
+        "rider.exe",
+        "sourceinsight4.exe",
+        "Insight4.exe",
+        "Insight3.exe",
+        "SourceInsight.exe",
+    ];
+
+    /// ide_terminal(multiline_safe=false) 块：纯终端 + 模态编辑器（vim/gvim）
+    /// ⚠️ 28 条全量：Xshell6/Xshell7/Xagent/MobaXterm1 必须与 scene-rules.toml 逐条对齐
+    const SCENE_MD003_FALSE_EXES: &[&str] = &[
+        "WindowsTerminal.exe",
+        "cmd.exe",
+        "powershell.exe",
+        "pwsh.exe",
+        "ConEmu64.exe",
+        "ConEmu.exe",
+        "vim.exe",
+        "gvim.exe",
+        "Cmder.exe",
+        "Alacritty.exe",
+        "wezterm-gui.exe",
+        "mintty.exe",
+        "putty.exe",
+        "Xshell.exe",
+        "Xshell6.exe",
+        "Xshell7.exe",
+        "Xshell8.exe",
+        "Xagent.exe",
+        "SecureCRT.exe",
+        "MobaXterm.exe",
+        "MobaXterm1.exe",
+        "Tabby.exe",
+        "Hyper.exe",
+        "conhost.exe",
+        "OpenConsole.exe",
+        "wezterm.exe",
+        "git-bash.exe",
+        "Nu.exe",
+    ];
+
+    /// doc 块新增条目（Markdown 笔记 / Todo / 便签，multiline_safe=true）
+    /// 含 Linear.exe（Gavin 2026-08-01 改判：项目/任务管理工具非聊天工具，从 chat 移入 doc）
+    const SCENE_MD003_DOC_TRUE_EXES: &[&str] = &[
+        "Notepad.exe",
+        "siyuan.exe",
+        "wps.exe",
+        "Obsidian.exe",
+        "Zettlr.exe",
+        "vnote.exe",
+        "trilium.exe",
+        "Standard Notes.exe",
+        "Boostnote.exe",
+        "Inkdrop.exe",
+        "YoudaoNote.exe",
+        "WizNote.exe",
+        "wiz.exe",
+        "Todoist.exe",
+        "TickTick.exe",
+        "TodoApp.exe",
+        "ClickUp.exe",
+        "Any.do.exe",
+        "Focalboard.exe",
+        "Linear.exe",
+        "SimpleStickyNotes.exe",
+        "Simple Sticky Notes.exe",
+        "stickies.exe",
+        "notezilla.exe",
+        "PNotes.exe",
+        "7StickyNotes.exe",
+        "jingyeqian.exe",
+        "StickyNotes.exe",
+        "StickyNotesStub.exe",
+        "Microsoft.Notes.exe",
+    ];
+
+    #[test]
+    fn scene_md003_true_block_all() {
+        for exe in SCENE_MD003_TRUE_EXES {
+            let s = classify_builtin(exe, "");
+            assert_eq!(s.scene, SceneKind::IdeTerminal, "{exe} 应 ide_terminal");
+            assert!(s.multiline_safe, "{exe} 应 multiline_safe=true（新块生效）");
+        }
+    }
+
+    #[test]
+    fn scene_md003_false_block_all() {
+        for exe in SCENE_MD003_FALSE_EXES {
+            let s = classify_builtin(exe, "");
+            assert_eq!(s.scene, SceneKind::IdeTerminal, "{exe} 应 ide_terminal");
+            assert!(!s.multiline_safe, "{exe} 应 multiline_safe=false");
+        }
+    }
+
+    #[test]
+    fn scene_md003_doc_untouched() {
+        for exe in SCENE_MD003_DOC_TRUE_EXES {
+            let s = classify_builtin(exe, "");
+            assert_eq!(s.scene, SceneKind::Doc, "{exe} 应 doc");
+            assert!(s.multiline_safe, "{exe} doc 应 true");
+        }
+    }
+
+    /// TEST-EXEC-SCENE-MD-003 Step 0：Linear.exe 改判 doc（Gavin 2026-08-01）。
+    /// Linear 是项目/任务管理工具非聊天工具，原归 chat(false) 属分类错误，
+    /// 现与 Todoist/TickTick/ClickUp/Any.do 同列 doc 块 Todo 段。
+    #[test]
+    fn scene_md003_linear_reclassified_to_doc() {
+        let s = classify_builtin("Linear.exe", "");
+        assert_eq!(s.scene, SceneKind::Doc, "Linear.exe 应重分类为 doc");
+        assert!(s.multiline_safe, "Linear.exe doc 应 true");
+        // 反向护栏：不得回归 chat
+        assert_ne!(s.scene, SceneKind::Chat, "Linear.exe 不得再归 chat");
+    }
+
+    /// ⭐ 成败关键：两个 ide_terminal 块的 exe 集合必须互不相交。
+    /// classify（src/scene/mod.rs:157）exe 首个匹配即返回 —— 任一 exe 同时出现在
+    /// 两块中，TRUE 块就永远轮不到。主控本次用 `comm` 手工验证为空集，但必须变成
+    /// 测试，否则将来有人往 FALSE 块补一条就会静默失效。
+    #[test]
+    fn scene_md003_ide_terminal_blocks_disjoint() {
+        let r = toml::from_str::<Rules>(BUILTIN_RULES).unwrap();
+        let mut true_exes = std::collections::HashSet::new();
+        let mut false_exes = std::collections::HashSet::new();
+        for s in &r.scene {
+            if s.kind != "ide_terminal" {
+                continue;
+            }
+            let set = if s.multiline_safe {
+                &mut true_exes
+            } else {
+                &mut false_exes
+            };
+            for e in &s.exe {
+                set.insert(e.to_lowercase());
+            }
+        }
+        assert!(!true_exes.is_empty(), "multiline_safe=true 块不应为空");
+        assert!(!false_exes.is_empty(), "multiline_safe=false 块不应为空");
+        let overlap: Vec<&String> = true_exes.intersection(&false_exes).collect();
+        assert!(
+            overlap.is_empty(),
+            "ide_terminal 两个块 exe 集合不得相交: {:?}（相交 = TRUE 块永不命中）",
+            overlap
+        );
+    }
+
+    /// TEST-SYNC-SCENE-MD-003 C3：关键反向护栏（不得回归）
+    /// 纯终端/模态编辑器（vim/gvim）仍 false（FALSE_EXES 已逐条覆盖，此处补显式
+    /// 断言语义）；chat 应用仍 false；Figma 仍 browser。
+    #[test]
+    fn scene_md003_c3_reverse_guards() {
+        // 模态编辑器：注入字符在 normal 模式被当命令键执行 → 不放开
+        for exe in ["vim.exe", "gvim.exe"] {
+            let s = classify_builtin(exe, "");
+            assert_eq!(s.scene, SceneKind::IdeTerminal, "{exe} 应 ide_terminal");
+            assert!(!s.multiline_safe, "{exe} 模态编辑器必须 false");
+        }
+        // 纯终端代表（其余 24 条由 SCENE_MD003_FALSE_EXES 覆盖）
+        for exe in [
+            "cmd.exe",
+            "powershell.exe",
+            "WindowsTerminal.exe",
+            "putty.exe",
+        ] {
+            let s = classify_builtin(exe, "");
+            assert_eq!(s.scene, SceneKind::IdeTerminal, "{exe} 应 ide_terminal");
+            assert!(!s.multiline_safe, "{exe} 纯终端必须 false");
+        }
+        // chat 应用（Gavin 2026-07-28 决策 3 延续）：微信/QQ/钉钉/飞书 → false
+        for exe in ["WeChat.exe", "QQ.exe", "DingTalk.exe", "Feishu.exe"] {
+            let s = classify_builtin(exe, "");
+            assert_eq!(s.scene, SceneKind::Chat, "{exe} 应 chat");
+            assert!(!s.multiline_safe, "{exe} chat 必须 false");
+        }
+        // Figma：Gavin 2026-07-28 决策 3 归 browser（本批未改）
+        let figma = classify_builtin("Figma.exe", "");
+        assert_eq!(figma.scene, SceneKind::Browser, "Figma 应 browser");
+        assert!(!figma.multiline_safe);
+    }
+
+    #[test]
+    fn scene_md003_chrome_title_subclass() {
+        // TEST-SYNC-SCENE-MD-003 C1：doc 块 IMPL 新增 title_keywords 全量覆盖（23 条逐一入测）。
+        // 浏览器细分靠 doc 块 title_keywords（src/scene/mod.rs:160-177 浏览器 exe 命中后
+        // 查其他场景关键词）—— 漏测一条 = 那个词的网页版静默不重分类。
+        for (title, expect_kind) in [
+            ("Google Keep - 我的笔记", SceneKind::Doc),
+            ("金山文档 - 我的表格", SceneKind::Doc),
+            ("Confluence - 团队空间", SceneKind::Doc),
+            ("HackMD - 协作笔记", SceneKind::Doc),
+            ("StackEdit - Markdown", SceneKind::Doc),
+            ("Dillinger - editor", SceneKind::Doc),
+            ("Trilium - my notes", SceneKind::Doc),
+            ("Standard Notes - web", SceneKind::Doc),
+            ("SiYuan - 思源笔记", SceneKind::Doc),
+            ("思源笔记 - 我的文档", SceneKind::Doc),
+            ("钉钉文档 - 协作", SceneKind::Doc),
+            ("Obsidian Publish - 我的站点", SceneKind::Doc),
+            ("Roam Research - 我的图谱", SceneKind::Doc),
+            ("Anytype - 空间", SceneKind::Doc),
+            ("Todoist - 任务清单", SceneKind::Doc),
+            ("TickTick - Tasks", SceneKind::Doc),
+            ("滴答清单 - 我的待办", SceneKind::Doc),
+            ("Trello - 看板", SceneKind::Doc),
+            ("Asana - projects", SceneKind::Doc),
+            ("ClickUp - tasks", SceneKind::Doc),
+            ("Google Tasks - 我的待办", SceneKind::Doc),
+            ("Microsoft To Do - 待办", SceneKind::Doc),
+            ("Any.do - todos", SceneKind::Doc),
+        ] {
+            let s = classify_builtin("chrome.exe", title);
+            assert_eq!(s.scene, expect_kind, "title={title}");
+            assert!(s.multiline_safe, "title={title} 重分类为 doc 应 true");
+        }
+        // 反向护栏：chrome + 普通标题 → 仍 browser，false
+        let normal = classify_builtin("chrome.exe", "随便一个网页");
+        assert_eq!(normal.scene, SceneKind::Browser, "普通标题应维持 browser");
+        assert!(!normal.multiline_safe);
+    }
+
+    #[test]
+    fn scene_md003_sticky_notes_parse() {
+        let r = toml::from_str::<Rules>(BUILTIN_RULES).unwrap();
+        let doc = r
+            .scene
+            .iter()
+            .find(|s| s.kind == "doc")
+            .expect("doc 块存在");
+        assert!(
+            doc.exe
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case("StickyNotesStub.exe")),
+            "StickyNotesStub.exe 应在 doc 词表"
+        );
+        assert!(
+            doc.exe
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case("Microsoft.Notes.exe")),
+            "Microsoft.Notes.exe 应在 doc 词表"
+        );
+    }
+
+    /// TEST-SYNC 追补 0a：Mastodon 永久反向护栏。
+    /// ⚠️ 本测试存在的唯一理由：DATA-SCENE-GENERIC-008 曾想把裸 `todo` 收为 doc 泛化关键词，
+    /// 主控实证否决——`Mastodon` 含子串 m-as-**todo**-n（大小写不敏感），是社交网络而非文档，
+    /// 收裸 `todo` 会把它判成 doc（multiline_safe=true），方向完全反了；西语/葡语 `todo`（=「全部」）
+    /// 也是高频误伤。最终改收 `To Do`（带空格）+ `待办`。
+    /// 若将来有人把裸 `todo` 加进 `title_keywords`，此测试立刻撞红——这是本测试唯一的守卫价值，
+    /// 注释不明者勿删（看似冗余实则防回归）。
+    #[test]
+    fn scene_md005_mastodon_not_doc() {
+        for title in ["Mastodon - 首页", "Mastodon Social"] {
+            let s = classify_builtin("chrome.exe", title);
+            assert_ne!(
+                s.scene,
+                SceneKind::Doc,
+                "title={title} 含 todo 子串（Mastodon）但不得判 doc"
+            );
+            assert!(!s.multiline_safe, "title={title} 不得放开多行");
+        }
+        // 正向对照：带空格的 To Do 仍应命中 doc/true——证明没因噎废食把真目标也挡掉
+        let s = classify_builtin("chrome.exe", "Microsoft To Do - 我的待办");
+        assert_eq!(s.scene, SceneKind::Doc, "Microsoft To Do 应 doc");
+        assert!(s.multiline_safe, "Microsoft To Do 应 true");
+    }
+
+    /// TEST-SYNC 追补 0b：本批新增关键词覆盖（DATA-SCENE-GENERIC-008 + FIX-SCENE-WEBTITLE-007）。
+    /// chrome.exe + 标题 → doc/true；UnknownApp + 已发送 → email/true。
+    #[test]
+    fn scene_md005_new_doc_keywords() {
+        for title in [
+            "飞书云文档 - 协作",
+            "WPS云文档 - 我的表格",
+            "腾讯云文档 - 共享",
+            "便签 - 我的备忘",
+            "待办 - 今日任务",
+            "Google 文档 - 报告",
+            "报告 - Word Online",
+            "Microsoft 365 - 首页",
+        ] {
+            let s = classify_builtin("chrome.exe", title);
+            assert_eq!(s.scene, SceneKind::Doc, "title={title} 应 doc");
+            assert!(s.multiline_safe, "title={title} 应 true");
+        }
+        // 云文档 泛化兜底（DEC-038 规则性泛化）：3 字 > 钉钉/飞书(2) 最长匹配胜出
+        let s = classify_builtin("chrome.exe", "华为云文档 - 团队空间");
+        assert_eq!(s.scene, SceneKind::Doc, "云文档 泛化应 doc");
+        // UnknownApp + 已发送 → email/true（中文邮箱发件夹标题审计实证）
+        // 注：标题避开邮件客户端 exe 名（如 Thunderbird），确保走「已发送」关键词路径
+        let s = classify_builtin("UnknownApp.exe", "已发送");
+        assert_eq!(s.scene, SceneKind::Email, "已发送 应 email");
+        assert!(s.multiline_safe, "已发送 email 应 true");
+    }
+
+    /// TEST-SYNC-MEMOS-011：Memos 收录 doc（DATA-SCENE-MEMOS-011，Gavin 2026-08-01 指令）。
+    /// ⚠️ 守卫价值：Gavin 指令推翻了 RESEARCH-SCENE-MULTILINE-002 的「不收」结论（当时因
+    /// 特异性低判不收）。误伤面（英文文章标题含 leaked memos/company memos 等）落「误伤→doc」
+    /// 只多给多行与列表文本，仍属优雅降级可接受，已知且记录在案。
+    /// 若将来有人以「特异性低」为由删掉它，这条测试会撞红——那正是它的守卫价值，勿删。
+    #[test]
+    fn scene_md011_memos_to_doc() {
+        let s = classify_builtin("chrome.exe", "Memos");
+        assert_eq!(s.scene, SceneKind::Doc, "Memos 应 doc");
+        assert!(s.multiline_safe, "Memos 应 true");
+        // 更具体后缀形式：- Memos 最长匹配优先胜出
+        let s = classify_builtin("chrome.exe", "我的笔记 - Memos");
+        assert_eq!(s.scene, SceneKind::Doc, "我的笔记 - Memos 应 doc");
+        assert!(s.multiline_safe, "我的笔记 - Memos 应 true");
     }
 }

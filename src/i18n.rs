@@ -200,30 +200,11 @@ static ZH: Strings = Strings {
    - Internet slang and colloquial expressions
    - Any word that makes sense in context, even if informal
 
-2. **Punctuation**: Add appropriate punctuation if the input lacks it. Rules:
-   - End every sentence/statement with a period (.)
-   - End every question with a question mark (?)
-     - Chinese: detect 吗/呢/吧/什么/谁/哪/怎么
-     - English: detect What/Where/When/Who/Why/How/Is/Are/Do/Can/Would/Will at start, or questioning tone
-     - Other languages: detect question words or questioning semantics
-   - Use commas (,) at pause points, clause separations, and list items
-   - Use exclamation marks (!) for emphatic/urgent expressions
+2. **Filler Removal**: Remove filler words (um, uh, 嗯, 啊, 那个, 就是说) that add no semantic value. Keep words serving grammatical/semantic purposes.
 
-3. **Filler Removal**: Remove filler words (um, uh, 嗯, 啊, 那个, 就是说) that add no semantic value. Keep words serving grammatical/semantic purposes.
+3. **Wordbook Priority**: Before applying any correction, check the provided <wordbook> mappings. If a phrase matches a wordbook entry, use the mapped replacement EXACTLY. These are user-defined preferences that override default correction logic.
 
-4. **Markdown Formatting**: Use headings and paragraph breaks where semantically appropriate.
-
-5. **List Formatting**: Convert enumeration (第一点/第二点, firstly/secondly) to Markdown lists.
-
-6. **Wordbook Priority**: Before applying any correction, check the provided <wordbook> mappings. If a phrase matches a wordbook entry, use the mapped replacement EXACTLY. These are user-defined preferences that override default correction logic.
-
-Example: If wordbook contains "PPT -> 演示文稿" and input contains "PPT", output should use "演示文稿" (or keep "PPT" depending on mapping direction).
-
-7. **Wordbook Suggestions**: After the corrected text, if you corrected any word that should be learned into the wordbook — such as proper nouns, brand names, personal names, technical terms, professional vocabulary, everyday words, common phrases, or idioms — append exactly one JSON object on a new final line:
-{"suggestions":["correct_word"]}
-Only return the corrected form, and the word MUST appear verbatim in your <corrected> text above. Never return the misrecognized raw form. Only use this JSON line for suggestions. If there are no suggestions, omit it entirely.
-
-Return ONLY the processed text. No explanations."#,
+Example: If wordbook contains "PPT -> 演示文稿" and input contains "PPT", output should use "演示文稿" (or keep "PPT" depending on mapping direction)."#,
     dialog_save: "保存",
     dialog_cancel: "取消",
     wordbook_section: "词库管理",
@@ -346,30 +327,11 @@ static ZH_TW: Strings = Strings {
    - Internet slang and colloquial expressions
    - Any word that makes sense in context, even if informal
 
-2. **Punctuation**: Add appropriate punctuation if the input lacks it. Rules:
-   - End every sentence/statement with a period (.)
-   - End every question with a question mark (?)
-     - Chinese: detect 嗎/呢/吧/什麼/誰/哪/怎麼
-     - English: detect What/Where/When/Who/Why/How/Is/Are/Do/Can/Would/Will at start, or questioning tone
-     - Other languages: detect question words or questioning semantics
-   - Use commas (,) at pause points, clause separations, and list items
-   - Use exclamation marks (!) for emphatic/urgent expressions
+2. **Filler Removal**: Remove filler words (um, uh, 嗯, 啊, 那個, 就是說) that add no semantic value. Keep words serving grammatical/semantic purposes.
 
-3. **Filler Removal**: Remove filler words (um, uh, 嗯, 啊, 那個, 就是說) that add no semantic value. Keep words serving grammatical/semantic purposes.
+3. **Wordbook Priority**: Before applying any correction, check the provided <wordbook> mappings. If a phrase matches a wordbook entry, use the mapped replacement EXACTLY. These are user-defined preferences that override default correction logic.
 
-4. **Markdown Formatting**: Use headings and paragraph breaks where semantically appropriate.
-
-5. **List Formatting**: Convert enumeration (第一點/第二點, firstly/secondly) to Markdown lists.
-
-6. **Wordbook Priority**: Before applying any correction, check the provided <wordbook> mappings. If a phrase matches a wordbook entry, use the mapped replacement EXACTLY. These are user-defined preferences that override default correction logic.
-
-Example: If wordbook contains "PPT -> 演示文稿" and input contains "PPT", output should use "演示文稿" (or keep "PPT" depending on mapping direction).
-
-7. **Wordbook Suggestions**: After the corrected text, if you corrected any word that should be learned into the wordbook — such as proper nouns, brand names, personal names, technical terms, professional vocabulary, everyday words, common phrases, or idioms — append exactly one JSON object on a new final line:
-{"suggestions":["correct_word"]}
-Only return the corrected form, and the word MUST appear verbatim in your <corrected> text above. Never return the misrecognized raw form. Only use this JSON line for suggestions. If there are no suggestions, omit it entirely.
-
-Return ONLY the processed text. No explanations."#,
+Example: If wordbook contains "PPT -> 演示文稿" and input contains "PPT", output should use "演示文稿" (or keep "PPT" depending on mapping direction)."#,
     dialog_save: "儲存",
     dialog_cancel: "取消",
     wordbook_section: "詞庫管理",
@@ -491,30 +453,11 @@ static EN: Strings = Strings {
    - Internet slang and colloquial expressions
    - Any word that makes sense in context, even if informal
 
-2. **Punctuation**: Add appropriate punctuation if the input lacks it. Rules:
-   - End every sentence/statement with a period (.)
-   - End every question with a question mark (?)
-     - Chinese: detect 吗/呢/吧/什么/谁/哪/怎么
-     - English: detect What/Where/When/Who/Why/How/Is/Are/Do/Can/Would/Will at start, or questioning tone
-     - Other languages: detect question words or questioning semantics
-   - Use commas (,) at pause points, clause separations, and list items
-   - Use exclamation marks (!) for emphatic/urgent expressions
+2. **Filler Removal**: Remove filler words (um, uh, 嗯, 啊, 那个, 就是说) that add no semantic value. Keep words serving grammatical/semantic purposes.
 
-3. **Filler Removal**: Remove filler words (um, uh, 嗯, 啊, 那个, 就是说) that add no semantic value. Keep words serving grammatical/semantic purposes.
+3. **Wordbook Priority**: Before applying any correction, check the provided <wordbook> mappings. If a phrase matches a wordbook entry, use the mapped replacement EXACTLY. These are user-defined preferences that override default correction logic.
 
-4. **Markdown Formatting**: Use headings and paragraph breaks where semantically appropriate.
-
-5. **List Formatting**: Convert enumeration (第一点/第二点, firstly/secondly) to Markdown lists.
-
-6. **Wordbook Priority**: Before applying any correction, check the provided <wordbook> mappings. If a phrase matches a wordbook entry, use the mapped replacement EXACTLY. These are user-defined preferences that override default correction logic.
-
-Example: If wordbook contains "PPT -> 演示文稿" and input contains "PPT", output should use "演示文稿" (or keep "PPT" depending on mapping direction).
-
-7. **Wordbook Suggestions**: After the corrected text, if you corrected any word that should be learned into the wordbook — such as proper nouns, brand names, personal names, technical terms, professional vocabulary, everyday words, common phrases, or idioms — append exactly one JSON object on a new final line:
-{"suggestions":["correct_word"]}
-Only return the corrected form, and the word MUST appear verbatim in your <corrected> text above. Never return the misrecognized raw form. Only use this JSON line for suggestions. If there are no suggestions, omit it entirely.
-
-Return ONLY the processed text. No explanations."#,
+Example: If wordbook contains "PPT -> 演示文稿" and input contains "PPT", output should use "演示文稿" (or keep "PPT" depending on mapping direction)."#,
     dialog_save: "Save",
     dialog_cancel: "Cancel",
     wordbook_section: "Word Library",
