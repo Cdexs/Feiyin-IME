@@ -1,10 +1,49 @@
 # 任务列表 · voice-ime
 
 > ✅ **产物已更新**（2026-08-03 **17:42**，BUILD-012）：`Publish/feiyin-ime.exe` `DB07CEFD8D51` / `feiyin-ime-ui.exe` `46D0F31E149D` / `crash-reporter.exe` `699ED9656958`，包含 017/018/020/021/**023**（四语标记清单恢复扩充）。三 exe 两副本 sha256 一致，两 toml 三副本一致（`scene-rules.toml` `7C1F0620` / `itn-rules.toml` `ED77A912`），ProductVersion 0.7.3.0/0.7.3。**⏭ 待 Gavin 端测。**
-> ⏳ **本地 ahead 41 未 push**（最新 `7a1329e`，Gavin 只授权提交，不授权 push）。
+> 🔴 **2026-08-04 主控核查：上方产物不含 ITN-FIX-CHAIN-TEAR-026** —— 产物 mtime `17:42:42` 早于 `src/itn.rs` `23:47:25` 整 6 小时。026 需 BUILD-013 才进 exe，详见下方 P0 节。
+> ⏳ **本地 ahead 43 未 push**（最新 `9edc839`，Gavin 只授权提交，不授权 push）。
 > 端测方式（2026-07-25 Gavin 指示）：Gavin 已在**实际日常使用中自行测试**，端测项不再列入本文档；发现 bug 或优化点由 Gavin 邀请重新开单。
 
-> ✅ **TEST-EXEC-024 + BUILD-012-VERIFY 已闭环并提交 `7a1329e`**（崩溃中断续做，tester-1 2026-08-03 18:3x，主控 18:4x 独立验收）。详见 CHANGELOG / `logs/20260803.md`（规则 3：测试同步与出包不在本文档详列）。**全部 Worker 空闲待命。**
+> ✅ **TEST-EXEC-024 + BUILD-012-VERIFY 已闭环并提交 `7a1329e`**（崩溃中断续做，tester-1 2026-08-03 18:3x，主控 18:4x 独立验收）。详见 CHANGELOG / `logs/20260803.md`（规则 3：测试同步与出包不在本文档详列）。
+
+---
+
+## 🔴 P0 进行中 · ITN-FIX-CHAIN-TEAR-026 收口（2026-08-04，崩溃中断遗留）
+
+> **发现方式**：Gavin 2026-08-04 问「上次会话是否有测试或出包任务未完成」，主控独立取证查出。**非 Worker 自报** —— coder-1 写了 CHANGELOG/decisions/troubleshooting/logs，唯独 todo.md 与 handoffs.md 无条目，且改动全部悬空未提交，是 `[DOC-STATE-DRIFT-001]` 的又一次复现。
+
+### 三件套判定（`[SESSION-CRASH-RECOVERY-001]`）
+
+| 项 | 数据 | 判定 |
+| --- | --- | --- |
+| sha256 两副本 | `db07cefd8d51` target == Publish | ✅ 一致，但那是 BUILD-012（017/018/020/021/023） |
+| **mtime 链** | 产物 **17:42:42** ＜ `src/itn.rs` **23:47:25** | 🔴 **产物早于源文件 6 小时 → 026 未进 exe** |
+
+**结论**：与 08-03 那次「做了没记」相反，本次是**代码做了、测试与出包都没做**，必须走完整流程。
+
+### 026 生产改动（主控 Read 取证）
+
+| 编号 | 位置 | 改动 |
+| --- | --- | --- |
+| A | `try_parse_unit_chain` 无单位分支 | 去 `after_is_boundary` 耦合；隐式尾数单位按前级层级动态决定（块/元→毛，毛/角→分） |
+| B | `try_parse_unit_chain` 返回判据 | 允许单段 currency 链（原 `parts.len()>=2`）🔴 **行为大幅放开，主要风险面** |
+| C | `format_currency_chain` | 单段保原单位不归一到元（Gavin 方案 C，判据是段数非 `per_unit`）+ 多段去尾零 |
+
+### 任务分解
+
+| 编号 | 内容 | 负责人 | 状态 |
+| --- | --- | --- | --- |
+| ITN-FIX-CHAIN-TEAR-026 / 026-B | 货币链撕裂 + 尾零 + 单段保原单位 | coder-1 | ✅ 已完成，主控 08-04 补提交 `9edc839` |
+| TEST-SYNC-026 | T6-T10 复核 + T10 补至 12 词条 + **B1-B5 五组歧义反向护栏**（块/角/分/元/毛 非货币义误转风险）+ C1-C4 交叉回归 | tester-1 | 🔄 **进行中**（08-04 派发，已 ACK） |
+| TEST-EXEC-026 | 全量回归（`--bin feiyin-ime` + `itn::` + `src-tauri`） | tester-1 | 🔜 阶段四待派发 |
+| BUILD-013 | 出包（026 首次进 exe） | tester-1 | 🔜 阶段五待派发 |
+
+### 端测观察点（出包后给 Gavin）
+
+`五块一斤`→`5块一斤` ｜ `八角`→`8角` ｜ `二十五块`→`25块` ｜ `五块一`→`5.1元`（不再 `5.10元`）｜ `一块八一斤`→`1.8元一斤` ｜ `三块四毛八一斤`→`3.48元一斤`
+
+---
 
 ## 文档更新规则
 

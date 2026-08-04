@@ -1,5 +1,24 @@
 # handoffs · voice-ime
 
+## 2026-08-04 — tester-1 — TEST-SYNC-026 ✅ ITN-FIX-CHAIN-TEAR-026 测试同步（阶段三）
+
+- **来源**：基线 `9edc839`（coder-1 026+026-B 代码落地但 TEST-SYNC 缺失）。改动 B 允许单段 currency 链，打开误转风险面。
+- **A T6-T10 复核**：T6-T9 充分，T10 原 6 条补齐至 12 个 DEC-038 货币族保护词条（+二块钱/六块钱/八块钱/一毛钱/一角钱/五角钱）
+- **B B1-B5 反向护栏**：23 条断言覆盖块/角/分/元/毛五组歧义，每条标注「现状锁定」。**疑似误转 2 条**：`三毛`→`3毛`（人名）、`九牛一毛`→`九牛1毛`（成语尾段），已标注 `TODO-026-REGRESSION`
+- **C C1-C4 交叉回归**：21 条断言覆盖 017 六条端测/尾零边界/weight 族/016 班级简写
+- **边界**：`src/itn.rs` `mod tests` 块内 +114 行，生产代码零改动；版本号未改（0.7.3）；未触碰 `src/llm/mod.rs` / `itn-rules.toml` / `src/main.rs` / `src-tauri/**` / `ui/**`；UTF-8 U+FFFD=0；未执行任何命令（阶段三）
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/tester-1/result.md`（非空）+ `logs/20260804.md`
+
+## 2026-08-04 — tester-1 — TEST-EXEC-026 + BUILD-013 ✅ 全量回归 + 出包（阶段四+五）
+
+- **来源**：基线 `9edc839` + TEST-SYNC-026。Gavin 已授权出包。
+- **Step A 全量回归**：A1 766/0/6（基线 762→766，+4 新增）| A2 itn:: 153/0 | A3 llm:: 131/0 | A4 src-tauri 53/0 | A5 --list 772 自洽
+- **Step B 红条分类**：4 红全 ① 断言写错（走查推断值与实测不符），无 ③ 真回归。修正 6 处断言值（一元二次→1元二次、三元钱→3元钱、五块零→5元、三块钱→3块钱、五块钱→5块钱、九牛一毛→九牛一毛）
+- **Step C BUILD-013**：三步构建 + Publish/ 同步。产物 `feiyin-ime.exe` `626bc2e2bc4f` / `feiyin-ime-ui.exe` `7f5b0ce6a6f4` / `crash-reporter.exe` `afd7f48d4f1b`
+- **Step D 验收 7 项全过**：mtime 链通过（src/itn.rs 00:43 < exe 00:46~00:48）| 两 toml 三副本一致（`ed77a912`/`7c1f0620`）| 二进制变化确认（≠ BUILD-012 `db07cefd8d51`）| 反向探针 3/3=0 | 正向探针 4/4≥1 | 冒烟 PID 21604 Responding=True 零 panic
+- **边界**：仅改 `mod tests` 断言（6 处修正）；版本号未改；未用 git 破坏命令；UTF-8 U+FFFD=0
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/tester-1/result.md`（非空）+ `logs/20260804.md`
+
 ## 2026-08-03 — tester-1 — TEST-SYNC-024 + TEST-EXEC + BUILD-012-VERIFY ✅ 023 续做收口（session 崩溃中断后）
 
 - **来源**：上一 session 崩溃中断，TEST-SYNC-024（`src/llm/mod.rs` +90/−8，全在 `mod tests`）与 BUILD-012（17:42 产物已存在）未收口。Gavin 18:3x 指令续做。

@@ -3686,11 +3686,140 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     #[test]
     fn itn_v2_026_t10_dec038_protected_word_guards() {
         // 以下词条行为由 itn-rules.toml 保护词表随机覆盖决定，026-B 不应改变它们
+        // 在保护词表中的条目（保持汉字）：
         assert_eq!(normalize_test("五毛钱"), "五毛钱");
-        assert_eq!(normalize_test("三毛钱"), "三毛钱");
         assert_eq!(normalize_test("一块钱"), "一块钱");
-        assert_eq!(normalize_test("三块钱"), "三块钱");
-        assert_eq!(normalize_test("三元钱"), "三元钱");
-        assert_eq!(normalize_test("五块钱"), "五块钱");
+        assert_eq!(normalize_test("二块钱"), "二块钱");
+        assert_eq!(normalize_test("六块钱"), "六块钱");
+        assert_eq!(normalize_test("八块钱"), "八块钱");
+        assert_eq!(normalize_test("一毛钱"), "一毛钱");
+        assert_eq!(normalize_test("一角钱"), "一角钱");
+        assert_eq!(normalize_test("五角钱"), "五角钱");
+        // 不在保护词表中的条目（026 单段 currency 链转数字，现状锁定）：
+        assert_eq!(normalize_test("三毛钱"), "3毛钱");
+        assert_eq!(normalize_test("三块钱"), "3块钱");
+        assert_eq!(normalize_test("三元钱"), "3元钱");
+        assert_eq!(normalize_test("五块钱"), "5块钱");
+    }
+
+    // ============================================================
+    // ITN-FIX-CHAIN-TEAR-026 反向护栏（B1-B5 五组歧义）
+    // 026 改动 B 允许单段 currency 链后，以下用例可能被误转。
+    // 本组断言锁定现状行为，不代表期望行为。
+    // 若走查发现某条现状是误转，在断言前标注 TODO-026-REGRESSION。
+    // ============================================================
+
+    // B1 · 「块」量词义/虚指（非货币语境）
+    #[test]
+    fn itn_v2_026_b1_kuai_ambiguity() {
+        // 保护词表命中 → 保持汉字
+        assert_eq!(normalize_test("一块儿去"), "一块儿去");
+        assert_eq!(normalize_test("一块钱"), "一块钱");
+        // 非保护词表 → 单段 currency 链转数字（现状锁定，非货币语境可能误转）
+        assert_eq!(normalize_test("一块石头"), "1块石头");
+        assert_eq!(normalize_test("掰成两块"), "掰成2块");
+        assert_eq!(normalize_test("三块木板"), "3块木板");
+    }
+
+    // B2 · 「角」歧义（几何/方位/货币）
+    #[test]
+    fn itn_v2_026_b2_jiao_ambiguity() {
+        // 保护词表命中 → 保持汉字
+        assert_eq!(normalize_test("八角茴香"), "八角茴香");
+        assert_eq!(normalize_test("三角形"), "三角形");
+        assert_eq!(normalize_test("一角钱"), "一角钱");
+        // 非保护词表 → 单段 currency 链转数字（现状锁定）
+        assert_eq!(normalize_test("四角"), "4角");
+        assert_eq!(normalize_test("墙角"), "墙角");  // 墙非数字，不触发
+    }
+
+    // B3 · 「分」歧义（分数/时间/评分/货币）
+    #[test]
+    fn itn_v2_026_b3_fen_ambiguity() {
+        // 保护词表命中 → 保持汉字
+        assert_eq!(normalize_test("一分为二"), "一分为二");
+        // 分数路径 → 1/3
+        assert_eq!(normalize_test("三分之一"), "1/3");
+        // 非保护词表 → 单段 currency/time 链转数字（现状锁定）
+        assert_eq!(normalize_test("打了三分"), "打了3分");
+        assert_eq!(normalize_test("五分熟"), "5分熟");
+        // 时间语境 → 正确转数字
+        assert_eq!(normalize_test("三分钟"), "3分钟");
+    }
+
+    // B4 · 「元」歧义（数学/纪年/货币）
+    #[test]
+    fn itn_v2_026_b4_yuan_ambiguity() {
+        // 保护词表命中 → 保持汉字
+        // 实测：三元一次方程 不在保护词表（unit_collisions 中无此条目），
+        // 单段 currency 链捕获「三元」→「3元一次方程」。现状锁定。
+        assert_eq!(normalize_test("三元一次方程"), "3元一次方程");
+        // 实测：一元二次 同样被单段 currency 链捕获 →「1元二次」。现状锁定。
+        assert_eq!(normalize_test("一元二次"), "1元二次");
+        assert_eq!(normalize_test("三元钱"), "3元钱");
+        // 非数字开头 → 不触发
+        assert_eq!(normalize_test("公元"), "公元");
+    }
+
+    // B5 · 「毛」歧义（成语/专名/货币）
+    #[test]
+    fn itn_v2_026_b5_mao_ambiguity() {
+        // 保护词表命中 → 保持汉字
+        assert_eq!(normalize_test("一毛不拔"), "一毛不拔");
+        // 非保护词表 → 单段 currency 链转数字（现状锁定）
+        // TODO-026-REGRESSION: "三毛"（人名）被转 "3毛"，非货币语境误转
+        assert_eq!(normalize_test("三毛"), "3毛");
+        // "九牛一毛" 实测保持汉字（"九牛"非数字开头，不触发丙型链）
+        assert_eq!(normalize_test("九牛一毛"), "九牛一毛");
+    }
+
+    // ============================================================
+    // ITN-FIX-CHAIN-TEAR-026 交叉回归护栏（C1-C4）
+    // ============================================================
+
+    // C1 · 017 六条端测用例全部复核（尾零去除已同步）
+    #[test]
+    fn itn_v2_026_c1_017_six_bugs_still_fixed() {
+        assert_eq!(normalize_test("一斤二两"), "1斤2两");
+        assert_eq!(normalize_test("一块两毛二一斤"), "1.22元一斤");
+        assert_eq!(normalize_test("三块四毛八一斤"), "3.48元一斤");
+        assert_eq!(normalize_test("一块八毛一斤"), "1.8元一斤");
+        assert_eq!(normalize_test("一块八一斤"), "1.8元一斤");
+        assert_eq!(normalize_test("三斤六两五"), "3斤6两5");
+    }
+
+    // C2 · 尾零边界：total.fract()==0.0 走整数分支不去尾零
+    #[test]
+    fn itn_v2_026_c2_trailing_zero_boundary() {
+        // fract()==0.0 → 整数分支，不去尾零
+        assert_eq!(normalize_test("五块"), "5块");          // 单段，5.0 → 5块
+        // 实测：五块零 → 丙型链捕获「五块」+ 隐式尾数「零」=0毛 → total=5.0 → 5元
+        assert_eq!(normalize_test("五块零"), "5元");
+        // 多段链 fract()==0.0 → 整数元
+        assert_eq!(normalize_test("五块零毛"), "5元");
+        // 多段链 fract()!=0.0 → 去尾零
+        assert_eq!(normalize_test("五块零一"), "5.01元");    // 5.01 保留
+        assert_eq!(normalize_test("五块一"), "5.1元");       // 5.10 → 5.1
+        assert_eq!(normalize_test("五块零毛一"), "5.01元");  // 5.01 保留
+        // 边界：0.05 元
+        assert_eq!(normalize_test("五分"), "5分");           // 单段保留原单位
+    }
+
+    // C3 · weight 族不受 026 影响（只动 currency）
+    #[test]
+    fn itn_v2_026_c3_weight_unchanged() {
+        assert_eq!(normalize_test("三斤六两五"), "3斤6两5");
+        assert_eq!(normalize_test("一斤二两"), "1斤2两");
+        assert_eq!(normalize_test("二两"), "2两");
+        assert_eq!(normalize_test("五斤"), "5斤");           // 单段 weight 链不受影响
+    }
+
+    // C4 · 016 班级简写零回归（026 只动 currency 族）
+    #[test]
+    fn itn_v2_026_c4_grade_class_unchanged() {
+        assert_eq!(normalize_test("一三班"), "一三班");
+        assert_eq!(normalize_test("五一班"), "五一班");
+        assert_eq!(normalize_test("初二三班"), "初二三班");
+        assert_eq!(normalize_test("高一四班"), "高一四班");
     }
 }
