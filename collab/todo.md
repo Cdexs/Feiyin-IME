@@ -52,9 +52,37 @@ if big_unit_seen && !zero_since_big {
 | 027-B | 万分支 `result += section*10000`，不再把已结算的亿卷进乘法 | coder-1 | ✅ 同上 |
 | 027-C | `large_amount_keep_wan_yi` 加 `big_starts_new_number` 消歧 | coder-1 | ✅ 提交 `967cd8d`（itn:: 168→181） |
 | 027-C-2 | `two_is_unit` 补齐注释原意（两后跟进位单位→非单位） | coder-1 | ✅ 同上 |
-| **027-D** | **DEC-042 隐式补全保留锚定单位（三亿五→3.5亿）** | coder-1 | 🔄 **进行中**（08-04 派发，已 ACK，正在盘点调用点） |
-| TEST-SYNC-027 | 覆盖 A/B/C/C-2/D 全批 | tester-1 | 🔜 阶段三待派发（等 027-D 完成） |
-| BUILD-014 | 出包（027 全批 + 026 已在包外） | tester-1 | 🔜 阶段五待派发 |
+| 027-D | DEC-042 初版：隐式补全保留锚定单位 | coder-1 | ✅ 提交 `e79ed05`（itn:: 181→186） |
+| **027-E** | **DEC-042 修订版：最小明确单位 + 万层升亿 + 全面适用** | coder-1 | ⏸ **暂停派发**（额度用尽，等 Gavin 指令） |
+| TEST-SYNC-027 | 覆盖 A/B/C/C-2/D/E 全批 | tester-1 | ⏸ 暂停（027-E 会改断言，现在做要返工） |
+| BUILD-014 | 出包（026 + 027 全批一次端测） | tester-1 | ⏸ 暂停 |
+
+### ⏸ 2026-08-04 全线暂停（Gavin 指令）
+
+> **Gavin 原话**：「先暂停派发任务，因为额度用尽了。要等待额度重置，等我指令」
+
+**Worker 状态**：
+
+| Worker | 模型 | 状态 |
+| --- | --- | --- |
+| coder-1 | `glm-5.2` Ollama Cloud | 空闲待命（186K/19%） |
+| coder-2 | `kimi-k2.7-code` Ollama Cloud | 空闲待命（112K/43%） |
+| tester-1 | **`DeepSeek V4 Flash Free (New)` OpenCode Zen** | 空闲待命，**上下文已重建** |
+
+**tester-1 重启记录**：原模型 `ollama-cloud/deepseek-v4-flash` 触发账号 session usage limit（退避拉到 2 分钟，`attempt #7`）。按 Gavin 指令换 `opencode/deepseek-v4-flash-free` 重启。
+
+⚠️ **重启踩坑（值得记）**：`opencode -s <session> -m <model>` 恢复会话时 **`-m` 不生效** —— session 内已存的模型配置优先级更高，底栏仍显示旧模型。**要换模型只能全新启动**（`opencode -m <model>`），代价是丢失会话上下文（本次丢 222.3K/21%，已用注入消息重建）。
+
+### 🔜 额度恢复后的执行顺序
+
+```
+① 027-E（coder-1）—— DEC-042 修订版，范围远大于 027-D
+② TEST-SYNC-027（tester-1）—— 覆盖 A/B/C/C-2/D/E 全批
+③ TEST-EXEC-027（tester-1）
+④ BUILD-014 出包 —— 026 + 027 全批，Gavin 一次端测
+```
+
+**为什么 TEST-SYNC 必须等 027-E**：027-E 会变更 `一亿`/`十亿`/`两千三百四十五万`/`一千二百三十四亿五千万` 等多条既有断言，现在写测试届时要重写，违反三阶段规则（代码全部完成后才 TEST-SYNC）。
 
 ### Gavin 需求「数字要支持从亿到个位数这个量级的跨度」达成情况
 
