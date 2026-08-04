@@ -1,3 +1,15 @@
+## 2026-08-04 — coder-1 — ITN-FIX-BIGNUM-027-A + 027-B ✅ 大额数字进位缺陷修复（027-C 发现另开单）
+
+- **来源**：Gavin 2026-08-04 端测「一千零四十六万八千七百四十一」→`10469740`（应为 `10468741`），第四种失败模式（数值静默改错）。Gavin 新指令「数字要支持从亿到个位的量级跨度」倒逼主控复查出 027-B（万级公式，差 4 个数量级）。基线 `ad8bbd0`（ahead 41）
+- **方案协商**：coder-1 实测发现 027-C（公告8用例中2条因「两」∈units.weight 被 large_amount_keep_wan_yi 的 is_unit starts_with 命中在亿分支 break，027-B 公式修复不可触及）。主控拍板本轮仅修 A+B，027-C 另开单（is_unit 是 ITN 最核心公共函数，动它风险最高）
+- **027-A 改动**：新增 `unit_since_big` 状态位；十/百/千分支在 `big_unit_seen` 时置 true；万/亿结算重置 false；末尾判据 `big_unit_seen && !zero_since_big && !unit_since_big`。隐式千位补全适用边界显式声明：万/亿后 + 该段内无零 + 该段内无进位单位
+- **027-B 改动**：万分支 `result = (result + section) * 10000` → `result += section * 10000`；亿分支保持 `(result+section)*1e8` 不变（亿是最大单位，反例「一万亿」验证）
+- **4.6 确认**：「三亿五」代码乘 1000 得 `300005000` ≠ 注释 `350000000`（五→五千万），注释-实现不符，只报不改
+- **验证**：基线 `itn::` 153/0/0 → 改后 **168/0/0**（+15 新增，零绿转红）；cargo check + --tests 双 0 errors；UTF-8 U+FFFD=0；4.2/4.3/4.4 共 11 条逐条通过；027-B 8 用例 4 条生产规则可达全过 + 2 条 027-C 阻断标注 + rules=None 隔离验证 8/8 全过
+- **同模式盘点**：4 条（亿级隐式单位 4.6 / 027-C large_amount_keep_wan_yi / 十分支无前导默认1 边界 / 丙型 UnitChain 大单位 result 丢弃），只列不改
+- **边界**：仅 `src/itn.rs`（生产 +191/-5 含注释，测试 +15）；`itn-rules.toml`/`src/llm/mod.rs`/`src/main.rs`/`src-tauri/**`/`ui/**`/`scene-rules.toml` 零触碰；未构建/出包/启动 exe；未改版本号（0.7.3）；未用 git 破坏命令；UTF-8 用 edit 工具
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-1/result.md`（14497 B 非空）+ `logs/20260804.md`
+
 # handoffs · voice-ime
 
 ## 2026-08-04 — tester-1 — TEST-SYNC-026 ✅ ITN-FIX-CHAIN-TEAR-026 测试同步（阶段三）

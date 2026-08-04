@@ -659,6 +659,12 @@ fn parse_cn_number(
     let mut has_digit = false;
     // false=刚处理完大单位后没看到零，true=看到零后大单位隐式失效
     let mut zero_since_big = false;
+    // ITN-FIX-BIGNUM-027-A：万/亿之后是否已消费过进位单位（十/百/千）。
+    //   隐式千位补全（「两万五」=25000）的适用边界：万/亿之后 + 该段内无零 +
+    //   该段内无进位单位。三条件缺一即不该套 +1000。完整进位链后的末尾单字是
+    //   个位，不是省略的「几千」（一千零四十六万八千七百四十一 → 末尾「一」
+    //   被 +1000 得 10469740，应为 10468741）。万/亿结算时重置为 false（新段开始）。
+    let mut unit_since_big = false;
     // 最近看到的大单位
     let mut big_unit_seen = false;
 
@@ -682,16 +688,26 @@ fn parse_cn_number(
                 section += (if has_digit { digit } else { 1 }) * 10;
                 digit = 0;
                 has_digit = false;
+                // ITN-FIX-BIGNUM-027-A：万/亿后已消费进位单位，末尾单字必为个位
+                if big_unit_seen {
+                    unit_since_big = true;
+                }
             }
             '百' | '佰' => {
                 section += digit * 100;
                 digit = 0;
                 has_digit = false;
+                if big_unit_seen {
+                    unit_since_big = true;
+                }
             }
             '千' | '仟' => {
                 section += digit * 1000;
                 digit = 0;
                 has_digit = false;
+                if big_unit_seen {
+                    unit_since_big = true;
+                }
             }
             '万' | '萬' => {
                 // large_amount_keep_wan_yi：万/亿后紧跟单位时不消费万/亿
@@ -704,12 +720,21 @@ fn parse_cn_number(
                     }
                 }
                 section += digit;
-                result = (result + section) * 10000;
+                // ITN-FIX-BIGNUM-027-B：万级进位不再把已结算的 result 卷进乘法。
+                //   旧式 `result = (result + section) * 10000` 在「亿+万」嵌套时把亿结算值
+                //   也乘 1e4，差 4 个数量级（一亿两千三百四十五万 → 1e12，应为 1.2345e8）。
+                //   亿分支 :724 保持 `result = (result + section) * 1e8` 不变——亿是最大
+                //   单位，其前一切是它的系数（反例「一万亿」：万 result += 1e4 → 亿
+                //   (1e4+0)*1e8 = 1e12 ✓）。万级不是最大单位，其前 result 是已结算的
+                //   更大单位值，应当累加而非卷乘。单独「两千三百四十五万」时 result=0，
+                //   `0 + 2345*1e4` 与旧式 `(0+2345)*1e4` 等价，零回归。
+                result += section * 10000;
                 section = 0;
                 digit = 0;
                 has_digit = false;
                 big_unit_seen = true;
                 zero_since_big = false;
+                unit_since_big = false; // 027-A：新段开始，重置进位单位消费标记
             }
             '亿' | '億' => {
                 if let Some(rules) = rules {
@@ -721,12 +746,17 @@ fn parse_cn_number(
                     }
                 }
                 section += digit;
+                // ITN-FIX-BIGNUM-027-B：亿分支保持 (result+section)*1e8 不变。
+                //   亿是最大单位，其前一切（含已结算的万级值）都是它的系数。
+                //   反例自验「一万亿」：万分支 result += 1*1e4 = 1e4 → 亿分支
+                //   (1e4 + 0)*1e8 = 1e12 ✓。若改为 += 会错成 1e4。
                 result = (result + section) * 100000000;
                 section = 0;
                 digit = 0;
                 has_digit = false;
                 big_unit_seen = true;
                 zero_since_big = false;
+                unit_since_big = false; // 027-A：新段开始，重置进位单位消费标记
             }
             '零' | '〇' => {
                 digit = 0;
@@ -798,10 +828,22 @@ fn parse_cn_number(
 
     // 循环结束：处理末尾挂起的数字
     if has_digit {
-        if big_unit_seen && !zero_since_big {
-            // 大单位后单字数字 → 隐式单位
-            // "两万五" = 25000（五→五千）
-            // "三亿五" = 350000000（五→五千万）
+        if big_unit_seen && !zero_since_big && !unit_since_big {
+            // ITN-FIX-BIGNUM-027-A：隐式千位补全 —— 适用边界三条件：
+            //   ① big_unit_seen：万/亿大单位已出现（否则无隐式千位语境）
+            //   ② !zero_since_big：大单位后该段内无零（「两万五」→五=五千 ✓；
+            //      「三万五千二百零一」零置 zero_since_big=true，走 else 分支）
+            //   ③ !unit_since_big：大单位后未消费过任何进位单位（十/百/千）。
+            //      完整进位链后的末尾单字是个位，不是省略的「几千」。
+            //      「一千零四十六万八千七百四十一」万后走完 千→百→十，末尾「一」
+            //      是个位，旧代码套 +1000 得 10469740（应为 10468741）。
+            //
+            // 适用：「两万五」=25000 / 「三亿五」=300005000（五→五千，亿后无进位单位）
+            //   ⚠️ 「三亿五」=300005000 与注释「350000000（五→五千万）」不符——
+            //      注释声称五→五千万但代码乘 1000（→五千）。这是 4.6 标注的独立
+            //      注释-实现不符缺陷，本轮只报告不修（混改会让零回归失去判别力）。
+            // 不适用：完整进位链末尾单字 / 大单位后有零的末尾单字 / 无大单位
+            //   反向护栏测试：itn_v2_027_a_implicit_wan_still_works / _zero_path_unchanged
             section += digit * 1000;
         } else {
             section += digit;
@@ -3821,5 +3863,157 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
         assert_eq!(normalize_test("五一班"), "五一班");
         assert_eq!(normalize_test("初二三班"), "初二三班");
         assert_eq!(normalize_test("高一四班"), "高一四班");
+    }
+
+    // ============================================================
+    // ITN-FIX-BIGNUM-027 · 大额数字进位缺陷（027-A 末尾隐式千位越界 + 027-B 万级公式错误）
+    // ============================================================
+    //
+    // 027-A：末尾挂起单字套隐式千位的守卫条件不完整 —— 只检查「万/亿后有没有零」，
+    //        没检查万/亿后是否已消费过进位单位（千/百/十）。完整进位链后的末尾单字是
+    //        个位，不是省略的「几千」。典型：一千零四十六万八千七百四十一 →
+    //        末尾「一」被套 +1000 得 10469740（应为 10468741）。
+    //
+    // 027-B：万分支 result = (result + section) * 10000 把已结算的亿也卷进乘法。
+    //        一亿两千三百四十五万 → (1e8 + 2345)*10000 = 1.0e12（应为 1.2345e8）。
+    //        亿分支必须保持 (result+section)*1e8 不变（亿是最大单位，其前一切是它的
+    //        系数；反例「一万亿」：万 += 1*1e4 → 亿 (1e4+0)*1e8 = 1e12 ✓）。
+    //
+    // 027-C（另开单，本轮不修）：large_amount_keep_wan_yi 用 is_unit 的 starts_with
+    //        判定「亿/万后是否跟单位」，但「两」既是数字又是重量单位（017 引入），
+    //        「一亿两千...」的「两」被 is_unit 命中 → 亿分支 break，金额蒸发为「1」。
+    //        受 027-C 阻断本轮不可达的用例：一亿两千三百四十五万六千七百八十九 /
+    //        一亿两千三百四十五万（亿后首字是「两」即 break）。
+    //
+    // 缺陷模式（Gavin 指令「从机制上解决」）：026 的 after_is_boundary 耦合、016 的
+    // 逐位串判据、027-A 的隐式千位 —— 同属一类：**局部特例规则没有约束自己的适用
+    // 范围，在更长的上下文里越界生效**。027-A 的修法是显式声明适用边界：增加
+    // `unit_since_big` 状态位，万/亿后一旦消费过任何进位单位（千/百/十），末尾单字
+    // 必为个位，禁止套隐式千位。
+
+    // 027-A · 末尾挂起单字隐式千位边界守卫
+    //   隐式千位补全的适用边界：「万/亿之后 + 该段内无零 + 该段内无进位单位」。
+    //   三条件缺一即不该套 +1000。
+    #[test]
+    fn itn_v2_027_a_bug_repro_10468741() {
+        // Gavin 端测 bug：一千零四十六万八千七百四十一 → 10469740（错）应为 10468741
+        // 万后走完 千→百→十 完整进位链，末尾「一」是个位，不该套隐式千位
+        assert_eq!(normalize_test("一千零四十六万八千七百四十一"), "10468741");
+    }
+
+    #[test]
+    fn itn_v2_027_a_full_chain_35241() {
+        // 三万五千二百四十一：万后走完 千→百→十，末尾「一」是个位
+        assert_eq!(normalize_test("三万五千二百四十一"), "35241");
+    }
+
+    #[test]
+    fn itn_v2_027_a_full_chain_87653() {
+        // 八万七千六百五十三：末尾「十三」含十位，十分支置 unit_since_big=true，
+        // 循环结束前 has_digit=false（十三被十分支消费）→ 不进末尾分支，走正常结算
+        assert_eq!(normalize_test("八万七千六百五十三"), "87653");
+    }
+
+    // 027-A · 隐式千位仍生效（最易改坏）
+    #[test]
+    fn itn_v2_027_a_implicit_wan_still_works() {
+        assert_eq!(normalize_test("两万五"), "25000"); // 万后无进位单位，五→五千
+        assert_eq!(normalize_test("五万三"), "53000"); // 万后无进位单位，三→三千
+        assert_eq!(normalize_test("两万五千"), "25000"); // 万后有千但无末尾单字
+    }
+
+    // 027-A · 原本正确的路径不得回归
+    #[test]
+    fn itn_v2_027_a_zero_path_unchanged() {
+        // 三万五千二百零一：有零 zero_since_big=true 走 else 分支，原本就对
+        assert_eq!(normalize_test("三万五千二百零一"), "35201");
+    }
+
+    #[test]
+    fn itn_v2_027_a_wan_end_no_remainder() {
+        assert_eq!(normalize_test("一千零四十六万"), "10460000");
+    }
+
+    #[test]
+    fn itn_v2_027_a_wan_qian_no_tail() {
+        assert_eq!(normalize_test("五万三千"), "53000");
+    }
+
+    // 027-B · 万级进位公式修复（result+=section*10000，不再把 result 卷进乘法）
+    //   以下用例在 parse_cn_number 层面验证（生产规则下部分受 027-C 阻断，
+    //   见各用例注释）。rules=None 的隔离验证见 itn_v2_027_b_formula_no_rules。
+    #[test]
+    fn itn_v2_027_b_wan_only_no_regression() {
+        // 两千三百四十五万：result=0，(0+2345)*1e4 == 0+2345*1e4，原本就对，不得回归
+        assert_eq!(normalize_test("两千三百四十五万"), "23450000");
+    }
+
+    #[test]
+    fn itn_v2_027_b_yi_branch_unchanged() {
+        // 一万亿：万分支 += 1*1e4=1e4，亿分支 (1e4+0)*1e8 = 1e12 ✓（亿分支不得改坏）
+        assert_eq!(normalize_test("一万亿"), "1000000000000");
+    }
+
+    #[test]
+    fn itn_v2_027_b_shi_yi() {
+        assert_eq!(normalize_test("十亿"), "1000000000");
+    }
+
+    #[test]
+    fn itn_v2_027_b_yi_alone() {
+        assert_eq!(normalize_test("一亿"), "100000000");
+    }
+
+    // 027-B · 公式修复后可达的亿+万嵌套用例（亿后无「两」单位阻断）
+    #[test]
+    fn itn_v2_027_b_yi_wan_no_liang() {
+        // 一千二百三十四亿五千万：亿后是「五」非「两」，亿正常结算，万分支修复后 += 5e3*1e4
+        assert_eq!(normalize_test("一千二百三十四亿五千万"), "123450000000");
+    }
+
+    #[test]
+    fn itn_v2_027_b_yi_wan_with_zero() {
+        // 三亿零五万：亿后「零」非单位，亿正常结算 3e8，零置 zero_since_big=true，
+        // 五万 section=5，万分支修复后 result += 5*1e4 = 300050000
+        assert_eq!(normalize_test("三亿零五万"), "300050000");
+    }
+
+    // 027-B 隔离验证（rules=None，禁用 large_amount_keep_wan_yi，纯粹验证万级公式）
+    // 此测试用 compile_rules_from_content 无法直接禁用开关，改为直接调 parse_cn_number
+    // 传 None。验证 027-B 公式修复对亿+万嵌套的正确性，不受 027-C 阻断干扰。
+    #[test]
+    fn itn_v2_027_b_formula_no_rules() {
+        let cases: &[(&str, &str)] = &[
+            ("一亿两千三百四十五万六千七百八十九", "123456789"),
+            ("一亿两千三百四十五万", "123450000"),
+            ("两千三百四十五万", "23450000"),
+            ("一万亿", "1000000000000"),
+            ("一千二百三十四亿五千万", "123450000000"),
+            ("三亿零五万", "300050000"),
+            ("十亿", "1000000000"),
+            ("一亿", "100000000"),
+        ];
+        for (input, expected) in cases {
+            let chars: Vec<char> = input.chars().collect();
+            let (got, consumed) =
+                parse_cn_number(&chars, 0, None).unwrap_or(("NONE".to_string(), 0));
+            assert_eq!(got.as_str(), *expected, "input: {}", input);
+            // 消费字符数应等于输入长度（证明完整解析）
+            assert_eq!(consumed, chars.len(), "input: {}, consumed mismatch", input);
+        }
+    }
+
+    // 027-C 阻断标注：以下 2 条在生产规则下因「亿后跟两」被 large_amount_keep_wan_yi
+    // 的 is_unit starts_with 命中而 break，027-B 公式修复无法触及。待 027-C 另开单修复
+    // is_unit 消歧后可达。本轮不在测试中断言（避免误判 027-B 未修好）。
+    //   - 一亿两千三百四十五万六千七百八十九 → 期望 123456789（027-C 修复后）
+    //   - 一亿两千三百四十五万 → 期望 123450000（027-C 修复后）
+
+    // 4.6 注释-实现不符确认（只报不改）：「三亿五」代码乘 1000 得 300005000，
+    // 注释声称「五→五千万」=350000000。本轮不修（独立缺陷，混改失去判别力）。
+    #[test]
+    fn itn_v2_027_a_yi_ji_comment_impl_mismatch() {
+        // 确认注释与实现不符，且本轮未改（027-A 守卫不影响亿后无进位单位的隐式千位）
+        assert_eq!(normalize_test("三亿五"), "300005000");
     }
 }
