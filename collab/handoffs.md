@@ -1,3 +1,15 @@
+## 2026-08-04 — tester-1 — TEST-EXEC-027 + BUILD-014 S1-S5补测落地→全量回归→027全批首次出包
+
+- **来源**：TEST-SYNC-027 补测清单落地 + 阶段四执行 + 阶段五出包。基线 HEAD `d115965`（027-F）。三段串行
+- **Step A**：src/itn.rs mod tests 新增 **16 条**补测（S1 升亿 2 位边界成对 一亿五千万→1.5亿/一亿两千五百万→12500万/三亿五百万→30500万；S2 C-only 一亿三千万→1.3亿；S3 B1-B5 契约护栏 6 条；S4 五百三→503/三百二→302；S5 静默归零钉现状 4 条按 027-F 修复后值；D 组回归 6 条）。S5 三条 Step A 禁命令按 027-F 修复后代码路径走查推导，Step B 实测全部一次命中。生产代码零改动
+- **Step B**：B1 全量 825/0/6；B2 itn:: 212/0（基线 196+16）；B3 llm:: 131/0；B4 src-tauri 53/0/0；B5 --list 831 自洽。无红条。DEC-043 三类零回归全维持（货币/重量/016 班级）。Vitest/pytest SKIP（零前端零 UI）
+- **Step C**：清理进程→npm build 1.94s→Tauri UI 1m57s→主程序 2m27s→UI 同步 target/release→Publish 同步→toml 三副本核验（itn-rules `ed77a912…`/scene-rules `7c1f0620…` 三处一致）→版本号未改
+- **Step D 七判据全过**：mtime 链过（src/itn.rs 18:00:39 < 三 exe）；sha256 两副本一致；新 feiyin-ime.exe `0e13cff5…`≠BUILD-013 `626bc2e2bc4f`；反向探针 3/3=0；正向探针 4/4≥1；ProductVersion 0.7.3.0/0.7.3/0.7.3.0；冒烟 PID 22336 Responding=True 零 panic 无残留
+- **产物**：feiyin-ime.exe `0e13cff59320…` 18:08:02 / feiyin-ime-ui.exe `cf7bddae7c87…` 18:05:30 / crash-reporter.exe `eb9c04e288de…` 18:06:59（Publish 三 exe 18:08:07）
+- **⚠️ 事故**：py open('w') 未指定 encoding 截断过 src/itn.rs（GBK locale），已用 git show HEAD 恢复 + 重 apply + 重跑 B1/B2 确认零差异；生产代码零受损；已记 lessons.md
+- **边界**：仅 src/itn.rs（mod tests）+ 文档；未提交；未改版本号；UTF-8 用 edit 工具
+- **详情**：result.md（26668 B）+ logs/20260804.md + CHANGELOG.md + docs/MACOS-HANDOFF.md
+
 ## 2026-08-04 — coder-1 — ITN-FIX-BIGNUM-027-F 修027-E引入的静默归零（P0阻塞出包）
 
 - **来源**：tester-1走查申报，主控复核真风险。027-E后带单位串进隐式尾数吸收→.parse()归零。基线91c84ac

@@ -308,6 +308,8 @@ Gavin 2026-08-04 拍板：**判定语言中明确提到的最小单位，输出�
 
 **027-F 跨端提示**：`parse_cn_number` 契约变化后（027-D/E 返回带单位串），macOS 侧若复用同一份 `src/itn.rs`，隐式尾数吸收处（`:1130`）的纯数字校验已共享修复。但若 macOS 侧有**独立的数字消费逻辑**（如 AX 无障碍读屏提取数字），需同样校验 `parse_cn_number` 返回值是否纯数字后再做数值运算。
 
+**BUILD-014 产物状态（tester-1 补记，2026-08-04）**：027 全批（A/B/C/C-2/D/E/F）已在 Windows 侧完成全量回归（itn:: 212/0）并首次进入 release 产物（feiyin-ime.exe `0e13cff5…`），平台中立模块 `src/itn.rs` 行为与上表一致；macOS 侧沿用共享修复即可，无新增平台差异。
+
 **共同模式**（见 `collab/troubleshooting.md` 的 `[ITN-LOCAL-RULE-OVERREACH-001]`）：
 
 > **局部特例规则没有约束自己的适用范围，在更长的上下文里越界生效。**

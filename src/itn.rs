@@ -4435,4 +4435,116 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
         assert_eq!(normalize_test("五毛钱"), "五毛钱");
         assert_eq!(normalize_test("三毛钱"), "3毛钱");
     }
+
+    // ==== TEST-EXEC-027 补测 S1：升亿 2 位边界（DEC-042 补完版） ====
+    // 规则：恰好 1 位小数 → 万层可升亿；恰好 2 位小数 → 保留万层不升。
+    #[test]
+    fn itn_v2_027_exec_s1_promote_yi_one_decimal() {
+        assert_eq!(normalize_test("一亿五千万"), "1.5亿");
+    }
+
+    #[test]
+    fn itn_v2_027_exec_s1_keep_wan_two_decimal() {
+        assert_eq!(normalize_test("一亿两千五百万"), "12500万");
+    }
+
+    #[test]
+    fn itn_v2_027_exec_s1_mixed_3yi_500wan() {
+        assert_eq!(normalize_test("三亿五百万"), "30500万");
+    }
+
+    // ==== TEST-EXEC-027 补测 S2：C-only 隔离（DEC-042 孤立判定） ====
+    #[test]
+    fn itn_v2_027_exec_s2_c_only_isolation() {
+        assert_eq!(normalize_test("一亿三千万"), "1.3亿");
+    }
+
+    // ==== TEST-EXEC-027 补测 S3：B1-B5 契约护栏 ====
+    // B1 货币链：带单位万/亿表达必须走展开路径，返回纯数字，绝不可带单位串。
+    #[test]
+    fn itn_v2_027_exec_s3_b1_currency_wan() {
+        assert_eq!(normalize_test("两万五千元"), "25000元");
+        assert_eq!(normalize_test("两千三百四十五万元"), "2345万元");
+        assert_eq!(normalize_test("五万三块钱"), "53000块钱");
+        assert_eq!(normalize_test("三万块"), "三万块");
+    }
+
+    #[test]
+    fn itn_v2_027_exec_s3_b1_currency_yi() {
+        assert_eq!(normalize_test("三亿五元"), "350000000元");
+    }
+
+    // B2 重量链：万/亿层重量数值全展开，零乘法拼接保持原单位。
+    #[test]
+    fn itn_v2_027_exec_s3_b2_weight() {
+        assert_eq!(normalize_test("三万五千斤"), "35000斤");
+        assert_eq!(normalize_test("两千三百四十五万吨"), "2345万吨");
+        assert_eq!(normalize_test("三亿五克"), "350000000克");
+    }
+
+    // B3 量词/词素边界：万前是量词时保持中文原样。
+    #[test]
+    fn itn_v2_027_exec_s3_b3_classifier() {
+        assert_eq!(normalize_test("三十万个"), "30万个");
+        assert_eq!(normalize_test("两千三百四十五万人"), "2345万人");
+        assert_eq!(normalize_test("五万台"), "五万台");
+        assert_eq!(normalize_test("十万次"), "十万次");
+    }
+
+    // B4 标点收尾：万/亿层孤立 + 标点 → 升亿/保留万并保留标点。
+    #[test]
+    fn itn_v2_027_exec_s3_b4_punct_end() {
+        assert_eq!(normalize_test("三千万。"), "3000万。");
+        assert_eq!(normalize_test("两千三百四十五万，"), "2345万，");
+        assert_eq!(normalize_test("三亿五"), "3.5亿");
+    }
+
+    // B5 歧义后缀：左右/以上/多 保持万层 + 后缀。
+    #[test]
+    fn itn_v2_027_exec_s3_b5_ambiguous_suffix() {
+        assert_eq!(normalize_test("三千万左右"), "3000万左右");
+        assert_eq!(normalize_test("两千三百四十五万以上"), "2345万以上");
+        assert_eq!(normalize_test("三亿多"), "3亿多");
+    }
+
+    // ==== TEST-EXEC-027 补测 S4：big_unit_seen 反向（无大单位时尾数累加） ====
+    #[test]
+    fn itn_v2_027_exec_s4_big_unit_seen_reverse() {
+        assert_eq!(normalize_test("五百三"), "503");
+        assert_eq!(normalize_test("三百二"), "302");
+    }
+
+    // ==== TEST-EXEC-027 补测 S5：静默归零钉现状（027-F 修复后值） ====
+    // 027-F 在隐式尾数吸收处加 num_str 纯数字校验，带单位串不再被吸收进 parts，
+    // 由主循环独立解析 → 走 DEC-042 锚定路径，杜绝 format_currency_chain 归零。
+    #[test]
+    fn itn_v2_027_exec_s5_zeroing_fixed_implicit_tail() {
+        assert_eq!(normalize_test("五块一万"), "5块1万");
+        assert_eq!(normalize_test("五块三亿"), "5块3亿");
+        assert_eq!(normalize_test("三毛五亿"), "3毛5亿");
+        assert_eq!(normalize_test("一块三亿。"), "1块3亿。");
+    }
+
+    // ==== TEST-EXEC-027 补测 D 组回归补充 ====
+    #[test]
+    fn itn_v2_027_exec_d1_regression_octal() {
+        assert_eq!(normalize_test("八角"), "8角");
+    }
+
+    #[test]
+    fn itn_v2_027_exec_d2_regression_weight_chain_tail() {
+        assert_eq!(normalize_test("三斤六两五"), "3斤6两5");
+    }
+
+    #[test]
+    fn itn_v2_027_exec_d3_regression_grade_class() {
+        assert_eq!(normalize_test("五一班"), "五一班");
+        assert_eq!(normalize_test("初二三班"), "初二三班");
+        assert_eq!(normalize_test("高一四班"), "高一四班");
+    }
+
+    #[test]
+    fn itn_v2_027_exec_d5_regression_money_word() {
+        assert_eq!(normalize_test("一块钱"), "一块钱");
+    }
 }
