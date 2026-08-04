@@ -4133,7 +4133,8 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     #[test]
     fn itn_v2_027_b_yi_branch_unchanged() {
         // 一万亿：万分支 += 1*1e4=1e4，亿分支 (1e4+0)*1e8 = 1e12 ✓（亿分支不得改坏）
-        assert_eq!(normalize_test("一万亿"), "10000亿"); // DEC-042 变更
+        // 027-G-1 (DEC-042 补充二)：1e12 ≥ 1 万亿 且 rem=0 → 升万亿
+        assert_eq!(normalize_test("一万亿"), "1万亿"); // DEC-042 补充二 变更
     }
 
     #[test]
@@ -4169,7 +4170,7 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
             ("一亿两千三百四十五万六千七百八十九", "123456789"), // 不变
             ("一亿两千三百四十五万", "12345万"), // DEC-042 变更
             ("两千三百四十五万", "2345万"), // DEC-042 变更
-            ("一万亿", "10000亿"), // DEC-042 变更
+            ("一万亿", "1万亿"), // DEC-042 补充二 变更
             ("一千二百三十四亿五千万", "1234.5亿"), // DEC-042 变更
             ("三亿零五万", "30005万"), // DEC-042 变更
             ("十亿", "10亿"), // DEC-042 变更
@@ -4295,7 +4296,7 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     fn itn_v2_027c_ab_no_regression() {
         assert_eq!(normalize_test("一千零四十六万八千七百四十一"), "10468741");
         assert_eq!(normalize_test("两万五"), "2.5万"); // DEC-042 变更
-        assert_eq!(normalize_test("一万亿"), "10000亿"); // DEC-042 变更
+        assert_eq!(normalize_test("一万亿"), "1万亿"); // DEC-042 补充二 变更
         assert_eq!(normalize_test("一千二百三十四亿五千万"), "1234.5亿"); // DEC-042 变更
         assert_eq!(normalize_test("三亿零五万"), "30005万"); // DEC-042 变更
         assert_eq!(normalize_test("两千三百四十五万"), "2345万"); // DEC-042 变更
@@ -4352,7 +4353,7 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     fn itn_v2_027d_zero_no_fill_paths() {
         assert_eq!(normalize_test("三万五千二百零一"), "35201"); // 有零 → zero_since_big=true
         assert_eq!(normalize_test("三亿零五万"), "30005万"); // DEC-042 变更
-        assert_eq!(normalize_test("一万亿"), "10000亿"); // DEC-042 变更
+        assert_eq!(normalize_test("一万亿"), "1万亿"); // DEC-042 补充二 变更
         assert_eq!(normalize_test("两千三百四十五万"), "2345万"); // DEC-042 变更
         assert_eq!(normalize_test("十亿"), "10亿"); // DEC-042 变更
         assert_eq!(normalize_test("一亿"), "1亿"); // DEC-042 变更
@@ -4429,7 +4430,7 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
         assert_eq!(normalize_test("一千二百三十四亿五千万"), "1234.5亿"); // 旧 123450000000
         assert_eq!(normalize_test("三亿五千万"), "3.5亿");       // 旧 350000000
         assert_eq!(normalize_test("三亿零五万"), "30005万");     // 旧 300050000
-        assert_eq!(normalize_test("一万亿"), "10000亿");         // 旧 1000000000000
+        assert_eq!(normalize_test("一万亿"), "1万亿");           // 旧 1000000000000（027-G-1 DEC-042 补充二）
     }
 
     // 第八节 4 组零回归
@@ -4567,5 +4568,50 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     #[test]
     fn itn_v2_027_exec_d5_regression_money_word() {
         assert_eq!(normalize_test("一块钱"), "一块钱");
+    }
+
+    // ==== TEST-EXEC-027-G 补测 A2：万亿层（DEC-042 补充二 / 027-G-1） ====
+    // 三级升级链：万 → 亿 → 万亿。阈值判据一致：升级后小数位 ≤1 才升。
+    #[test]
+    fn itn_v2_027g_a2_wanyi_integer() {
+        assert_eq!(normalize_test("一万亿"), "1万亿");
+        assert_eq!(normalize_test("三万亿"), "3万亿");
+    }
+
+    #[test]
+    fn itn_v2_027g_a2_wanyi_promote_one_decimal() {
+        assert_eq!(normalize_test("一万五千亿"), "1.5万亿");
+    }
+
+    // 升万亿阈值边界另一侧：恰好 2 位小数 → 不升，保持亿层。
+    #[test]
+    fn itn_v2_027g_a2_keep_yi_two_decimal() {
+        assert_eq!(normalize_test("一万两千三百亿"), "12300亿");
+    }
+
+    #[test]
+    fn itn_v2_027g_a2_below_wanyi_unchanged() {
+        assert_eq!(normalize_test("十亿"), "10亿");
+        assert_eq!(normalize_test("一千二百三十四亿五千万"), "1234.5亿");
+    }
+
+    // ==== TEST-EXEC-027-G 补测 A3：专名白名单（DEC-044 / 027-G-2） ====
+    #[test]
+    fn itn_v2_027g_a3_proper_noun_positive() {
+        assert_eq!(normalize_test("十万个为什么"), "十万个为什么");
+        assert_eq!(normalize_test("我买了一本十万个为什么"), "我买了一本十万个为什么");
+    }
+
+    // 反向护栏：加词条不得挡住普通「十万个」（个 非单位 → 十万锚定 10万）。
+    #[test]
+    fn itn_v2_027g_a3_proper_noun_reverse_guard() {
+        assert_eq!(normalize_test("十万个人"), "10万个人");
+    }
+
+    // 前缀遮蔽自查 [ITN-PREFIX-SHADOW-001]：裸「十万」「十万块钱」不受新词条影响。
+    #[test]
+    fn itn_v2_027g_a3_no_prefix_shadow() {
+        assert_eq!(normalize_test("十万"), "10万");
+        assert_eq!(normalize_test("十万块钱"), "十万块钱");
     }
 }

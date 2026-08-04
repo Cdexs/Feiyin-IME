@@ -314,6 +314,8 @@ Gavin 2026-08-04 拍板：**判定语言中明确提到的最小单位，输出�
 
 **BUILD-014 产物状态（tester-1 补记，2026-08-04）**：027 全批（A/B/C/C-2/D/E/F）已在 Windows 侧完成全量回归（itn:: 212/0）并首次进入 release 产物（feiyin-ime.exe `0e13cff5…`），平台中立模块 `src/itn.rs` 行为与上表一致；macOS 侧沿用共享修复即可，无新增平台差异。
 
+**BUILD-015 产物状态（tester-1 补记，2026-08-04）**：027-G（万亿层 + 十万个为什么白名单）已完成全量回归（itn:: 219/0）并进入 release 产物（feiyin-ime.exe `d29b8325…`），itn-rules.toml 三副本 `b208271b…` 一致（新词条进包）；macOS 侧沿用共享 `src/itn.rs` 与 `itn-rules.toml` 即可，无新增平台差异。
+
 **共同模式**（见 `collab/troubleshooting.md` 的 `[ITN-LOCAL-RULE-OVERREACH-001]`）：
 
 > **局部特例规则没有约束自己的适用范围，在更长的上下文里越界生效。**
