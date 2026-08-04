@@ -1110,31 +1110,39 @@ fn try_parse_unit_chain(chars: &[char], start: usize, r: &CompiledRules) -> Opti
             } else {
                 break;
             }
-        } else {
-            // 无单位：检查隐含末级单位尾数
-            // ITN-FIX-CHAIN-TEAR-026：去掉 after_is_boundary 检查，数值合成与后继识别正交。
-            if !parts.is_empty() && after_num <= chars.len() {
-                // 隐式尾数单位取决于链内最后一个显式单位的层级：
-                //   块/元(≥1.0) → 隐式尾数=毛(0.1) → 五块一=5.1元
-                //   毛/角(=0.1) → 隐式尾数=分(0.01) → 三块四毛八=3.48元
-                //   分(=0.01)   → 已到最小单位，不再吸收隐式尾数
-                let (_, last_unit) = parts.last().unwrap();
-                if let Some(last_val) = r.hierarchy_value(last_unit, "currency") {
-                    let implicit_unit = if last_val >= 1.0 {
-                        "毛"
-                    } else if last_val == 0.1 {
-                        "分"
-                    } else {
-                        ""
-                    };
-                    if !implicit_unit.is_empty() && num_consumed <= 2 {
-                        parts.push((num_str, implicit_unit.to_string()));
-                        pos = after_num;
+            } else {
+                // 无单位：检查隐含末级单位尾数
+                // ITN-FIX-CHAIN-TEAR-026：去掉 after_is_boundary 检查，数值合成与后继识别正交。
+                if !parts.is_empty() && after_num <= chars.len() {
+                    // 隐式尾数单位取决于链内最后一个显式单位的层级：
+                    //   块/元(≥1.0) → 隐式尾数=毛(0.1) → 五块一=5.1元
+                    //   毛/角(=0.1) → 隐式尾数=分(0.01) → 三块四毛八=3.48元
+                    //   分(=0.01)   → 已到最小单位，不再吸收隐式尾数
+                    let (_, last_unit) = parts.last().unwrap();
+                    if let Some(last_val) = r.hierarchy_value(last_unit, "currency") {
+                        let implicit_unit = if last_val >= 1.0 {
+                            "毛"
+                        } else if last_val == 0.1 {
+                            "分"
+                        } else {
+                            ""
+                        };
+                        // ITN-FIX-BIGNUM-027-F：纯数字校验 —— 027-E 后 parse_cn_number
+                        //   可能返回带单位串（如 "3亿"），num_consumed 恰好 ≤2 可穿过门控 →
+                        //   带单位串进 parts → format_currency_chain 的 .parse::<f64>()
+                        //   静默归零（第四种失败模式）。此处加纯数字校验对齐
+                        //   capture_price_per_unit:1241 先例：非纯 ASCII 数字则跳过吸收，
+                        //   由主循环独立解析（走 DEC-042 锚定路径）。
+                        if !implicit_unit.is_empty() && num_consumed <= 2
+                            && num_str.bytes().all(|b| b.is_ascii_digit())
+                        {
+                            parts.push((num_str, implicit_unit.to_string()));
+                            pos = after_num;
+                        }
                     }
                 }
-            }
-            break;
-        };
+                break;
+            };
         // 单位可小数化检查（date_suffix 时间词已在上方过滤，此处查 decimalizable）
         if unit_len == 0 {
             break;

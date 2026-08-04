@@ -1,3 +1,13 @@
+## 2026-08-04 — coder-1 — ITN-FIX-BIGNUM-027-F 修027-E引入的静默归零（P0阻塞出包）
+
+- **来源**：tester-1走查申报，主控复核真风险。027-E后带单位串进隐式尾数吸收→.parse()归零。基线91c84ac
+- **改动**：隐式尾数吸收处+1行纯数字校验(对齐capture_price_per_unit:1241)；is_unit/format_currency_chain/format_weight_chain本体零改动；mod tests零改动
+- **调用点重盘**：try_parse_unit_chain内3消费点，仅隐式尾数吸收漏网已修
+- **验证**：基线itn:: 196/0/0 → 196/0/0零绿转红；cargo check + --tests双0；UTF-8 OK；四条bug恢复(五块三亿→5块3亿)；026正主6条+DEC-042四条全过
+- **MACOS-HANDOFF**：2.9.4节新增027-D/E/F+跨端提示
+- **边界**：仅src/itn.rs(+1行)+docs/MACOS-HANDOFF.md；未构建/出包；未改版本号；UTF-8用edit工具
+- **详情**：result.md（6318 B 非空）+ logs/20260804.md
+
 ## 2026-08-04 — coder-1 — ITN-FIX-BIGNUM-027-E (DEC-042 补完) 数量级锚定最小单位全面落地
 
 - **来源**：Gavin 否定027-D二分，DEC-042补完全面适用。基线 f489e5b
