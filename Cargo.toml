@@ -69,6 +69,9 @@ dirs = "5"
 # Thread communication (cross-platform)
 crossbeam-channel = "0.5"
 
+# SIGINT/SIGTERM handler (cross-platform; used by macOS controller loop)
+ctrlc = "3.4"
+
 # Config file watching and atomic writes (cross-platform)
 notify = "8.2.0"
 atomic-write-file = "0.3.0"
@@ -112,8 +115,12 @@ windows = { version = "0.58", features = [
 core-foundation = "0.10"
 core-graphics = "0.25"
 enigo = "0.2.1"
-# objc2 = "0.5"  # Objective-C bindings for NSWindow transparent overlay (Phase 4)
-# cocoa = "0.26"  # Cocoa framework bindings (Phase 4)
+# MACOS-P4-HOST-001: NSApplication + CFRunLoop 直驱事件宿主
+objc2 = "0.5"
+objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSRunningApplication"] }
+objc2-foundation = "0.2"
+core-foundation-sys = "0.8"
+libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winres = "0.1"

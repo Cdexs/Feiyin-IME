@@ -29,6 +29,13 @@ pub fn capture_scene_signals(hwnd: HWND) -> Option<(String, String)> {
     Some((exe, title))
 }
 
+/// MACOS-P4-NEUTRAL-001: 平台中立 by-id 版本，供 `run_pipeline_core` 调用。
+/// 将 `WindowId`（usize）还原为 `HWND` 后委托给既有 `capture_scene_signals`。
+/// 语义等价：`id == 0` 对应 `HWND::null()`，`capture_scene_signals` 内部 `is_null()` 判据自然降级返回 `None`。
+pub fn capture_scene_signals_by_id(id: crate::platform::WindowId) -> Option<(String, String)> {
+    capture_scene_signals(HWND(id as *mut std::ffi::c_void))
+}
+
 /// 获取窗口所属进程的 exe 全路径，再提取文件名。
 fn capture_process_exe(hwnd: HWND) -> Option<String> {
     unsafe {

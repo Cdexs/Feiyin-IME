@@ -14,3 +14,6 @@ pub use injection::{
     FocusedTextSnapshot,
 };
 pub use scene::capture_scene_signals;
+// MACOS-P4-NEUTRAL-001: 新增 re-export，保持既有 use 行逐字不动（Windows 侧纯新增红线）。
+pub use event_loop::foreground_window_id;
+pub use scene::capture_scene_signals_by_id;

@@ -15,6 +15,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HMENU,
     MSG, SW_HIDE, WM_DESTROY, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
+// MACOS-P4-NEUTRAL-001: 单独导入以保持既有 use 块逐行不动（Windows 侧纯新增红线）。
+use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
 const CONTROLLER_CLASS_NAME: &str = "voice-ime-controller-window";
 
@@ -68,6 +70,16 @@ pub fn destroy_controller_window(hwnd: HWND) -> Result<()> {
     }
     log::info!("Controller window destroyed");
     Ok(())
+}
+
+/// MACOS-P4-NEUTRAL-001: 返回当前前台窗口的不透明标识。
+///
+/// 语义与 `main.rs` 原 `:3178` 的 `unsafe { GetForegroundWindow() }` 逐字等价，
+/// 仅把 `HWND` 转成 `usize` 供平台中立代码（`run_pipeline_core`）使用。
+/// 无前台窗口时 `GetForegroundWindow()` 返回 `HWND::null()`（`.0 == ptr::null()`），
+/// 转成 `usize` 为 0。
+pub fn foreground_window_id() -> crate::platform::WindowId {
+    unsafe { GetForegroundWindow().0 as usize }
 }
 
 /// Run the Win32 message loop

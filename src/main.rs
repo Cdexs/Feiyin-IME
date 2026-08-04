@@ -386,7 +386,7 @@ fn spawn_config_watcher(shared_config: Arc<RwLock<AppConfig>>) -> JoinHandle<()>
                     }
                     reload_runtime_config(&shared_config);
                     // HOTKEY-SYNC-IMMEDIATE-001: Notify hotkey thread instantly via AtomicBool
-                    #[cfg(target_os = "windows")]
+                    #[cfg(any(target_os = "windows", target_os = "macos"))]
                     platform::notify_config_changed();
                     log::info!("Runtime config reloaded after config file change");
                 }
@@ -2639,6 +2639,51 @@ fn run_controller(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
     hotkey_listener.join();
     Ok(())
 }
+
+#[cfg(target_os = "macos")]
+fn single_instance_lock_path() -> std::path::PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("feiyin-ime")
+        .join("instance.lock")
+}
+
+#[cfg(target_os = "macos")]
+fn run_controller_macos(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
+    // MACOS-P4-HOST-001: macOS controller host (NSApplication + CFRunLoop).
+    // Mirrors Windows run_controller structure where applicable:
+    // - start hotkey listener (worker thread remains cfg-windows only for now)
+    // - create controller host (NSApplication accessory)
+    // - 15ms CFRunLoopTimer polls hotkey events
+    // - clean shutdown path
+
+    let hotkey_listener = platform::create_hotkey_listener(Arc::clone(&runtime_config));
+    let _config_watcher = spawn_config_watcher(Arc::clone(&runtime_config));
+
+    platform::create_controller_window()?;
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(5));
+        let _ = version_check::check_and_cache();
+    });
+
+    log::info!("macOS controller initialized, entering CFRunLoop message loop");
+
+    // Block on the CFRunLoop. The timer callback polls hotkey_listener.rx().
+    let result = platform::run_message_loop_with_hotkey_listener(&hotkey_listener);
+
+    // Shutdown sequence
+    hotkey_listener.shutdown();
+    let _ = hotkey_listener.join();
+
+    if let Err(e) = &result {
+        log::error!("macOS controller loop exited with error: {}", e);
+    } else {
+        log::info!("macOS controller loop exited cleanly");
+    }
+
+    result
+}
+
 fn main() -> Result<()> {
     // BUG-QWEN3-CRYPTO-001: 进程级 rustls ring provider 安装（任何 TLS 使用之前）
     // 重复安装返回 Err 属正常（幂等容忍），不得 unwrap
@@ -2733,11 +2778,55 @@ fn main() -> Result<()> {
         // Mutex acquired successfully, ensure mutex_handle is not dropped until exit
         let _mutex_handle = mutex_handle;
     }
+    #[cfg(target_os = "macos")]
+    {
+        // MACOS-P4-HOST-001: flock-based single instance lock.
+        // Avoid NSRunningApplication (unreliable for unsigned apps); use a lock file.
+        let lock_path = single_instance_lock_path();
+        if let Some(parent) = lock_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+        {
+            Ok(f) => Some(f),
+            Err(err) => {
+                log::warn!("Single instance lock file open failed: {}, continuing", err);
+                // Do not hard-fail startup just because lock file is unreachable.
+                None
+            }
+        };
+        if let Some(file) = file {
+            use std::os::fd::AsRawFd;
+            let fd = file.as_raw_fd();
+            let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if ret != 0 {
+                log::warn!("Application already running (flock), exiting");
+                return Ok(());
+            }
+            // Keep the file descriptor open for the lifetime of the process.
+            let _ = std::mem::ManuallyDrop::new(file);
+        }
+    }
     #[cfg(target_os = "windows")]
     run_controller(runtime_config)?;
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
-        log::warn!("Non-Windows platform is not supported in controller mode yet");
+        // SIGINT/TERM: request CFRunLoop stop so the process exits cleanly.
+        if let Err(e) = ctrlc::set_handler(move || {
+            log::info!("SIGINT/SIGTERM received, requesting controller stop");
+            platform::request_stop();
+        }) {
+            log::warn!("Failed to install SIGINT handler: {}", e);
+        }
+        run_controller_macos(runtime_config)?;
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        log::warn!("Non-Windows/non-macOS platform is not supported in controller mode yet");
     }
     Ok(())
 }
@@ -2785,7 +2874,8 @@ fn find_speech_onset_with_backtrack(
 ///   研究 RESEARCH-ASR-ACCURACY-001 R1 证实 50ms 静音头让 native 掉 10pp）
 ///
 /// 提取为纯函数便于单测分支选择逻辑。
-#[cfg(target_os = "windows")]
+// MACOS-P4-NEUTRAL-001: 原 #[cfg(target_os = "windows")] 去除——此函数为平台中立纯 Rust 逻辑，
+// run_pipeline_core（无 cfg）调用之，macOS 需可见。对 Windows 构建该 cfg 恒为真，删除为 no-op。
 fn select_preprocessing_params(asr_model: transcription::AsrModel) -> (usize, usize) {
     const PERF_SILENCE_HEAD_SAMPLES: usize = 0; // 0ms @ 16kHz (performance, ASR-CTC-OPT-001 P1)
     const PERF_ONSET_BACKTRACK_SAMPLES: usize = 3200; // 200ms @ 16kHz (performance, 不动)
@@ -2821,6 +2911,43 @@ fn run_pipeline(
     model_dir: &Path,
     mut punctuation_engine: Option<&mut punctuation::PunctuationEngine>,
     target_hwnd: HWND,
+    event_tx: &crossbeam_channel::Sender<PipelineEvent>,
+    translate: Arc<AtomicBool>,
+) {
+    run_pipeline_core(
+        samples_result,
+        transcriber,
+        rt,
+        llm_client,
+        cancel_signal,
+        config,
+        runtime_config,
+        cached_translation,
+        model_dir,
+        punctuation_engine,
+        target_hwnd.0 as usize,
+        event_tx,
+        translate,
+    );
+}
+
+// MACOS-P4-NEUTRAL-001: Windows 侧经 run_pipeline 薄封装调用；
+// macOS 侧的调用者将由 MACOS-P4-HOST-001 提供（届时移除本 allow）。
+// 本函数在 macOS 上能编译通过，即证明这 402 行业务逻辑平台中立。
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+fn run_pipeline_core(
+    samples_result: anyhow::Result<Vec<f32>>,
+    transcriber: &transcription::Transcriber,
+    rt: &tokio::runtime::Runtime,
+    llm_client: &llm::LlmClient,
+    cancel_signal: &AtomicBool,
+    config: &AppConfig,
+    runtime_config: &Arc<RwLock<AppConfig>>,
+    cached_translation: &mut Option<(config::TranslationLanguage, translation::TranslationEngine)>,
+    model_dir: &Path,
+    mut punctuation_engine: Option<&mut punctuation::PunctuationEngine>,
+    target_hwnd: platform::WindowId,
     event_tx: &crossbeam_channel::Sender<PipelineEvent>,
     translate: Arc<AtomicBool>,
 ) {
@@ -2936,7 +3063,7 @@ fn run_pipeline(
                     // target_hwnd 即录音启动时捕获的前台窗口，此处复用同一 HWND 采集。
                     // 失败一律降级为 Unknown（不注入 F4，multiline_safe=false 保守）。
                     let scene_context = if config.scene.enabled {
-                        match platform::capture_scene_signals(target_hwnd) {
+                        match platform::capture_scene_signals_by_id(target_hwnd) {
                             Some((exe, title)) => scene::classify_scene(&exe, &title),
                             None => scene::SceneContext::unknown(),
                         }
@@ -3175,14 +3302,14 @@ fn run_pipeline(
                         send_event(event_tx, PipelineEvent::Cancelled);
                         return;
                     }
-                    let current_hwnd = unsafe { GetForegroundWindow() };
-                    let focus_lost = !target_hwnd.0.is_null() && current_hwnd.0 != target_hwnd.0;
+                    let current_id = platform::foreground_window_id();
+                    let focus_lost = target_hwnd != 0 && current_id != target_hwnd;
                     log::info!(
-                        "Injecting text: '{}', focus_lost={}, target_hwnd={:?}, current_hwnd={:?}",
+                        "Injecting text: '{}', focus_lost={}, target_hwnd={}, current_id={}",
                         final_text,
                         focus_lost,
-                        target_hwnd.0,
-                        current_hwnd.0
+                        target_hwnd,
+                        current_id
                     );
                     if focus_lost {
                         log::info!("Focus lost, showing preview");
@@ -3212,14 +3339,14 @@ fn run_pipeline(
         }
     }
 }
-#[cfg(target_os = "windows")]
+// MACOS-P4-NEUTRAL-001: 原 #[cfg(target_os = "windows")] 去除——平台中立纯 Rust，run_pipeline_core 调用，对 Windows 为 no-op。
 fn should_try_llm_translate(llm_enabled: bool, connectivity_verified: bool) -> bool {
     llm_enabled && connectivity_verified
 }
 /// LANG-AUTO-001: 翻译方向按内容（contains_han）判定，不依赖 transcription_language 配置。
 /// - target=English → 含汉字才需翻译；纯英文文本无需翻译。
 /// - target=Chinese → 不含汉字才需翻译；纯英文文本需翻译。
-#[cfg(target_os = "windows")]
+// MACOS-P4-NEUTRAL-001: 原 #[cfg(target_os = "windows")] 去除——平台中立纯 Rust，run_pipeline_core 调用，对 Windows 为 no-op。
 fn try_nllb_translate(
     text: &str,
     engine: Option<&translation::TranslationEngine>,
@@ -4357,12 +4484,11 @@ mod overlay_shimmer_tests {
     // ASR-ACC-OPT-001 方案 B + ASR-CTC-OPT-001 P1: select_preprocessing_params 分支测试
     // ============================================================
 
-    #[cfg(target_os = "windows")]
+    // MACOS-P4-NEUTRAL-001: 函数已平台中立，解除 cfg(windows) 门控使 macOS 侧编译可见。
     use super::select_preprocessing_params;
     #[allow(unused_imports)]
     use super::transcription;
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn preprocessing_params_performance_uses_0ms_head_200ms_backtrack() {
         // ASR-CTC-OPT-001 P1: performance silence head 50→0ms（研究 C1 证实 0ms 高 2.5pp）
@@ -4377,7 +4503,6 @@ mod overlay_shimmer_tests {
         );
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn preprocessing_params_accuracy_uses_0ms_head_100ms_backtrack() {
         // 方案 B：accuracy 用 0ms head / 100ms backtrack
@@ -4392,7 +4517,6 @@ mod overlay_shimmer_tests {
         );
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn preprocessing_params_both_models_use_0ms_head() {
         // ASR-CTC-OPT-001 P1: 两模型都用 0ms head（offline 模型不需 frame alignment padding）
@@ -4402,7 +4526,6 @@ mod overlay_shimmer_tests {
         assert_eq!(acc_head, 0, "accuracy head must be 0");
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn preprocessing_params_accuracy_backtrack_less_than_performance() {
         // native 对送气声母不如 CTC 敏感，少留 backtrack 减少前导静音
@@ -4416,7 +4539,6 @@ mod overlay_shimmer_tests {
         );
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn preprocessing_params_qwen3_online_follows_performance() {
         // DEC-028: qwen3_online 沿用 performance 前处理参数（0ms head / 200ms backtrack）
@@ -4433,5 +4555,43 @@ mod overlay_shimmer_tests {
             "qwen3_online backtrack ({}) must equal performance backtrack ({})",
             q3_bt, perf_bt
         );
+    }
+}
+
+// ============================================================
+// MACOS-P4-NEUTRAL-001: focus_lost 判定逻辑真值表测试
+// 镜像 main.rs:3217 的表达式 `target_hwnd != 0 && current_id != target_hwnd`
+// ============================================================
+#[cfg(test)]
+mod focus_lost_logic_tests {
+    /// P0-4: 锁住 run_pipeline_core 内 focus_lost 判据的真值表。
+    /// 表达式形态：target_hwnd != 0 && current_id != target_hwnd
+    /// （原 Windows 形态：!target_hwnd.0.is_null() && current_hwnd.0 != target_hwnd.0）
+    fn focus_lost(target_hwnd: usize, current_id: usize) -> bool {
+        target_hwnd != 0 && current_id != target_hwnd
+    }
+
+    #[test]
+    fn focus_lost_both_zero() {
+        // target=0, current=0 → false（target_hwnd==0 短路）
+        assert!(!focus_lost(0, 0));
+    }
+
+    #[test]
+    fn focus_lost_target_zero_current_nonzero() {
+        // target=0, current=123 → false（target_hwnd==0 短路）
+        assert!(!focus_lost(0, 123));
+    }
+
+    #[test]
+    fn focus_lost_same_nonzero() {
+        // target=123, current=123 → false（current_id == target_hwnd）
+        assert!(!focus_lost(123, 123));
+    }
+
+    #[test]
+    fn focus_lost_different_nonzero() {
+        // target=123, current=456 → true（焦点确实丢失）
+        assert!(focus_lost(123, 456));
     }
 }

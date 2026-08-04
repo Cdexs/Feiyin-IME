@@ -1,5 +1,16 @@
 # handoffs · voice-ime
 
+## 2026-08-04 — coder-2 — MACOS-P4-FIXHOTKEY-001 ✅ 修 CGEventTap 事件掩码越界（P0）
+
+- **来源**：`MACOS-P4-PROBE-001` 实机探针 A4 FAIL：listener 线程因 `KEYBOARD_EVENTS` 含 `TapDisabledByTimeout/UserInput` 在 `CGEventMaskBit!` 计算中 panic
+- **范围**：仅改 `src/platform/macos/hotkey.rs:28-38` 的 `KEYBOARD_EVENTS` 常量，移除两个带外事件，保留 `:102-103` 回调分支与 `:272-275` 重启逻辑
+- **根因**：`TapDisabledByTimeout = 0xFFFFFFFE` / `TapDisabledByUserInput = 0xFFFFFFFF` 是 core-graphics 标注的 "out of band" 通知，不应放入 event mask；其判别值远超 `u64` 位宽，`1_u64 << 0xFFFFFFFE` 在 debug 下 panic、release 下静默产生错误位
+- **验证**：`source scripts/env-macos.sh && cargo check` → 0 errors；`cargo check --all-targets` → 0 errors
+- **红线**：未碰 `src/main.rs` / `src/platform/mod.rs` / `src/platform/macos/mod.rs`（coder-1 并行占用）；未改 Windows 任何文件；未 `cargo build --release` / 出包 / 运行 exe；未使用 git 破坏性命令；UTF-8 无 BOM
+- **下游**：本修复为热键实机复测前置条件；A5 accessibility stub 仍待 `MACOS-P4-ACCESSIBILITY-001`
+
+---
+
 ## 2026-07-30 — tester-1 — BUILD-RELEASE-20260730-002 ✅ v0.7.3 全量出包完成
 
 - **来源**：Gavin 指令「基于目前的修改，出包吧」+「连 1386 条一起出包」
@@ -147,3 +158,45 @@
 - **边界**：未改 config/Cargo.toml/版本号；未改 platform/mod.rs 导出；未 cargo build --release/clean；无 git 破坏命令
 
 > 只保留当天条目，>200 行时归档到 handoffs-archive.md。
+
+## 2026-08-04 — tester-1 — MACOS-P4-PROBE-001 ✅ 五项探针完成（A1/A2/A5 PASS，A4 FAIL，A3 部分 PASS）
+
+- **来源**：主控派发 Phase 4 首项探针任务，验证「录音能不能录、模型能不能跑、热键能不能收」三大假设
+- **范围**：零源文件改动（`src/` / `src-tauri/` / `ui/` / Cargo.toml / 版本号文件全部未碰），仅临时创建 `src/bin/probe_mic.rs` + `src/bin/ui/overlay.rs`（#[path] 挂载探针），跑完已删除
+- **核心结论**：
+  - **A1 cpal 录音**: PASS — 能录（RMS=0.108048 非零），系统默认麦克风「外置麦克风」正常采集
+  - **A2 sherpa-onnx 转录**: PASS — SenseVoice 模型加载 0.594s，转写 0.256s，RTF=0.0458，文本正确「开饭时间早上九点至下午五点」，无 dyld/@rpath 错误
+  - **A3 TCC 终端 vs .app**: 部分 PASS — Terminal（com.apple.Terminal）与 .app（com.voice-ime.probe-mic）TCC 主体不同，.app 未阻塞但生产环境仍需引导授权
+  - **A4 CGEventTap 热键**: **FAIL** — `KEYBOARD_EVENTS` 包含 `TapDisabledByTimeout(0xFFFFFFFE)` / `TapDisabledByUserInput(0xFFFFFFFF)`，导致 `CGEventMaskBit` 宏触发 `1_u64 << 0xFFFFFFFE` panic（core-graphics-0.25.0/src/event.rs:627）。DEC-017 首次实机暴露 bug
+  - **A5 辅助功能弹窗**: PASS — `ax_is_process_trusted_with_prompt()` 确为 stub（仅 `log::info!`），未调用真实 `AXIsProcessTrustedWithOptions`
+- **方案协商**：tester-1 发现 binary-only crate 问题并上报（无 src/lib.rs），主控裁定采用 #[path] 方案③，实测编译通过并成功挂载 audio/platform 模块
+- **Phase 4 下游影响**：A1/A2 成立 → 后段管线可复用；A4 FAIL → 需修 `hotkey.rs:28-34` KEYBOARD_EVENTS 后才能进入热键测试；A5 stub → 需补真实 FFI
+- **边界**：零源文件改动，临时探针已删除，git status src/ / src-tauri/ / ui/ / Cargo.toml 全部 clean，未使用 git 破坏性命令
+- **详情**：`collab/outbox/tester-1/result.md`（10,353 字节）
+
+## 2026-08-04 — coder-1 — MACOS-P4-NEUTRAL-001 ✅ run_pipeline 管线去平台化完成（402 行业务逻辑变双侧可复用）
+
+- **范围**：把 `run_pipeline`（src/main.rs，原 :2812-3214，402 行）从 Windows 专属变为平台中立。`spawn_worker_thread` 经主控裁定本轮完全不动。
+- **方案协商两轮**：
+  - 第5接触点（我提出）：`spawn_worker_thread` 参数耦合 `WorkerCommand`/`StartCmd`/`SendHwnd`（均带 `#[cfg(windows)]`），且 `SendHwnd` 还服务 overlay 线程。**裁定 B**：本轮不动，另立 MACOS-P4-NEUTRAL-002。
+  - 第6接触点（我提出）：`run_pipeline` body 调用 3 个 `#[cfg(windows)]` 辅助函数（select_preprocessing_params/should_try_llm_translate/try_nllb_translate，均平台中立纯 Rust）。主控穷举核查 29 个 cfg 门控函数仅此 3 个被调用。**裁定 A**：删 3 行 cfg 属性（对 Windows 构建为可证明 no-op），函数体不动。
+- **改动**（6 文件）：main.rs（run_pipeline→薄封装委托 run_pipeline_core + 删3行cfg属性）/ platform/mod.rs（WindowId=usize + 2 新导出）/ windows/{scene,event_loop,mod}.rs（纯新增3函数+2 re-export，Windows 零删除）/ macos/mod.rs（纯新增2函数，foreground_window_id 返回0降级）。
+- **验证**：body 去空白 md5 自证逐字节保留（仅2接触点改动，0 mismatch）；Windows `git diff --numstat` 删除列全 0；`cargo check` + `--all-targets` 均 0 errors；两份导出清单各 17 符号逐一对应；6 文件无 BOM。
+- **衍生收益（本轮不做）**：select_preprocessing_params 去 cfg 后，6f0b51e 的 5 个 #[test] 具备 macOS 跑条件，TEST-SYNC 解除可减 22 条盲区中 5 条。
+- **红线遵守**：未破坏 Windows 既有功能；未碰 macos/hotkey.rs（coder-2 并行）；未动 spawn_worker_thread/macos_stubs/三类型/translation_needs_reload；未 build --release/出包/碰 Publish；未改版本号/Cargo.toml；未 npm install/cargo clean；未用 git 破坏命令；UTF-8 无 BOM。
+- **详情**：`collab/outbox/coder-1/result.md`（8746 字节，非空）
+
+## 2026-08-04 — tester-1 — TEST-SYNC-P4-NEUTRAL-001 ✅ 测试同步完成（阶段三，13 条测试，cargo check --tests 0 errors）
+
+- **来源**：主控派发 TEST-SYNC 任务（阶段三），覆盖 FIXHOTKEY + NEUTRAL 两批改动的测试同步
+- **范围**：仅改 `#[cfg(test)]` 块 + 6 行 cfg 属性，零生产代码改动
+- **P0-1 解除 cfg 门控**：`src/main.rs` 解除 `select_preprocessing_params` 的 6 处 `#[cfg(target_os = "windows")]`（1 use + 5 test）。函数平台中立确认安全。盲区从 22 条降至 17 条
+- **P0-2 KEYBOARD_EVENTS 护栏**：`src/platform/macos/hotkey.rs` 新增 2 条测试——判别值 <64 安全范围 + 显式黑名单断言不包含 TapDisabled* 带外事件
+- **P0-3 foreground_window_id 契约**：`src/platform/macos/mod.rs` 新增 1 条测试，断言第一版返回 0，注释标注「将来真实实现时会变红」
+- **P0-4 focus_lost 真值表**：`src/main.rs` 新增 4 条测试，镜像 `run_pipeline_core:3217` 表达式 `target_hwnd != 0 && current_id != target_hwnd`
+- **P1 capture_scene_signals_by_id 降级**：`src/platform/macos/mod.rs` 新增 1 条测试，断言 stub 恒返 None
+- **新增测试函数**：8 条全新 + 5 条解封 = **13 条** macOS 首次可见
+- **编译验证**：`cargo check --tests` 0 errors，6.72s
+- **红线遵守**：零生产代码改动；未执行 cargo test / cargo build --release / pytest；未触碰 src/platform/windows/、Cargo.toml、版本号；未使用 git 破坏性命令
+- **详情**：`collab/outbox/tester-1/result.md`（9,110 字节）
+- **下游预告**：TEST-EXEC 阶段将执行 `cargo test --no-fail-fast` + A4 热键实机复测
