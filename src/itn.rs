@@ -688,6 +688,11 @@ fn parse_cn_number(
     let mut unit_since_big = false;
     // 最近看到的大单位
     let mut big_unit_seen = false;
+    // ITN-FIX-BIGNUM-027-D (DEC-042)：记录最近的大单位及其结算前系数，用于
+    //   隐式补全场景保留锚定单位。万/亿分支结算时记录 (单位字符, 结算前 result+section
+    //   的值除以大单位倍率后的系数)。仅用于隐式分支（孤立单字数字无后继单位时）
+    //   输出 "{系数}.{digit}{大单位名}"。
+    let mut big_unit_anchor: Option<(char, u64)> = None;
 
     while idx < chars.len() {
         let ch = chars[idx];
@@ -773,6 +778,11 @@ fn parse_cn_number(
                 //   更大单位值，应当累加而非卷乘。单独「两千三百四十五万」时 result=0，
                 //   `0 + 2345*1e4` 与旧式 `(0+2345)*1e4` 等价，零回归。
                 result += section * 10000;
+                // ITN-FIX-BIGNUM-027-D (DEC-042)：记录万级锚定单位 + 系数（结算前
+                //   result+section 除以万倍率）。用于隐式补全场景输出 "X.Y万"。
+                //   系数 = result/1e4（section 已在上方 += 到 result 之前的 section 值，
+                //   但 result 此时已含 section*1e4，故系数 = result/1e4）。
+                big_unit_anchor = Some(('万', result / 10000));
                 section = 0;
                 digit = 0;
                 has_digit = false;
@@ -799,6 +809,10 @@ fn parse_cn_number(
                 //   反例自验「一万亿」：万分支 result += 1*1e4 = 1e4 → 亿分支
                 //   (1e4 + 0)*1e8 = 1e12 ✓。若改为 += 会错成 1e4。
                 result = (result + section) * 100000000;
+                // ITN-FIX-BIGNUM-027-D (DEC-042)：记录亿级锚定单位 + 系数。
+                //   系数 = (result 结算前值 + section) / 1e8。上方已结算，result 现为
+                //   (旧result+section)*1e8，故系数 = result/1e8。
+                big_unit_anchor = Some(('亿', result / 100000000));
                 section = 0;
                 digit = 0;
                 has_digit = false;
@@ -886,13 +900,45 @@ fn parse_cn_number(
             //      「一千零四十六万八千七百四十一」万后走完 千→百→十，末尾「一」
             //      是个位，旧代码套 +1000 得 10469740（应为 10468741）。
             //
-            // 适用：「两万五」=25000 / 「三亿五」=300005000（五→五千，亿后无进位单位）
-            //   ⚠️ 「三亿五」=300005000 与注释「350000000（五→五千万）」不符——
-            //      注释声称五→五千万但代码乘 1000（→五千）。这是 4.6 标注的独立
-            //      注释-实现不符缺陷，本轮只报告不修（混改会让零回归失去判别力）。
-            // 不适用：完整进位链末尾单字 / 大单位后有零的末尾单字 / 无大单位
-            //   反向护栏测试：itn_v2_027_a_implicit_wan_still_works / _zero_path_unchanged
-            section += digit * 1000;
+            // ITN-FIX-BIGNUM-027-D (DEC-042, Gavin 2026-08-04 拍板)：
+            //   隐式补全的适用边界再加一条「末尾单字后无任何单位」—— 若后继有单位
+            //   （如「两万五元」「三万五块」），这是完整「数字+单位」表达，照常展开
+            //   （+1000 → 25000 → 25000元）。仅当末尾单字是**孤立的**（其后无单位，
+            //   如「三亿五」「两万五」），才保留锚定单位输出 "系数.digit大单位名"
+            //   （如 "3.5亿" / "2.5万"）。Gavin：「用户口述的锚是亿，系统应保留该
+            //   单位、用小数表达系数，而不是替他换一种记法」。
+            //
+            //   孤立判定：循环在 `_ => break` 处终止，idx 指向 break 字符。
+            //   若 idx >= chars.len()（无后继）或 chars[idx..] 不以 any all_units
+            //   开头 → 孤立 → DEC-042 保留锚定单位。否则（后继是单位）→ 非孤立 →
+            //   维持 +1000 展开（保护下游 .parse() 消费方：parse_cn_number 契约
+            //   「返回纯数字」不变，仅在孤立时返回带单位串）。
+            //
+            //   调用点安全：UnitChain / format_currency_chain / format_unit_chain
+            //   对 num_str 执行 .parse::<f64>()。它们只在「数字后跟单位」时才消费
+            //   num_str —— 而孤立情况下后继无单位，UnitChain 不会命中（after_num
+            //   无单位 → break → parts 空 → 返回 None → 走主循环 push_str，不 parse）。
+            //   主循环 :1939 push_str 是字符串拼接，不 parse → 安全。
+            let after_digit_is_unit = idx < chars.len() && rules.is_some_and(|r| {
+                let rest: String = chars[idx..].iter().collect();
+                r.is_unit(&rest)
+            });
+            if !after_digit_is_unit {
+                // 孤立单字 → DEC-042 保留锚定单位
+                if let Some((unit_char, coeff)) = big_unit_anchor {
+                    // 系数 = 大单位结算前的 result 值（已记录在 anchor）
+                    // 输出 "{coeff}.{digit}{unit_char}"
+                    // 例：三亿五 → coeff=3, digit=5, unit=亿 → "3.5亿"
+                    //     两万五 → coeff=2, digit=5, unit=万 → "2.5万"
+                    return Some((format!("{}.{}{}", coeff, digit, unit_char), idx - start));
+                }
+                // big_unit_anchor 为 None（理论不可达，big_unit_seen=true 时必已记录）
+                // 兜底：维持 +1000
+                section += digit * 1000;
+            } else {
+                // 非孤立（后继有单位）→ 维持 +1000 展开，parse_cn_number 返回纯数字
+                section += digit * 1000;
+            }
         } else {
             section += digit;
         }
@@ -2421,7 +2467,8 @@ mod tests {
 
     #[test]
     fn multi_digit_25000() {
-        assert_eq!(normalize_test("两万五"), "25000");
+        // ITN-FIX-BIGNUM-027-D (DEC-042)：隐式补全保留锚定单位，「两万五」从 25000 → 2.5万
+        assert_eq!(normalize_test("两万五"), "2.5万");
     }
 
     #[test]
@@ -3963,11 +4010,12 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     }
 
     // 027-A · 隐式千位仍生效（最易改坏）
+    // ITN-FIX-BIGNUM-027-D (DEC-042)：两万五/五万三 从展开 → 保留锚定单位
     #[test]
     fn itn_v2_027_a_implicit_wan_still_works() {
-        assert_eq!(normalize_test("两万五"), "25000"); // 万后无进位单位，五→五千
-        assert_eq!(normalize_test("五万三"), "53000"); // 万后无进位单位，三→三千
-        assert_eq!(normalize_test("两万五千"), "25000"); // 万后有千但无末尾单字
+        assert_eq!(normalize_test("两万五"), "2.5万"); // DEC-042 保留锚定单位
+        assert_eq!(normalize_test("五万三"), "5.3万"); // DEC-042 保留锚定单位
+        assert_eq!(normalize_test("两万五千"), "25000"); // 万后有千（进位单位）→ 不进隐式分支 → 展开
     }
 
     // 027-A · 原本正确的路径不得回归
@@ -4057,12 +4105,12 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     //   - 一亿两千三百四十五万六千七百八十九 → 期望 123456789（027-C 修复后）
     //   - 一亿两千三百四十五万 → 期望 123450000（027-C 修复后）
 
-    // 4.6 注释-实现不符确认（只报不改）：「三亿五」代码乘 1000 得 300005000，
-    // 注释声称「五→五千万」=350000000。本轮不修（独立缺陷，混改失去判别力）。
+    // 4.6 注释-实现不符 → ITN-FIX-BIGNUM-027-D (DEC-042) 修复：三亿五 从 300005000 → 3.5亿
+    //   旧注释「五→五千万=350000000」与旧实现「×1e3=300005000」均不符 DEC-042，
+    //   DEC-042 改为保留锚定单位「3.5亿」。此测试从「确认不符」变为「验证 DEC-042」。
     #[test]
     fn itn_v2_027_a_yi_ji_comment_impl_mismatch() {
-        // 确认注释与实现不符，且本轮未改（027-A 守卫不影响亿后无进位单位的隐式千位）
-        assert_eq!(normalize_test("三亿五"), "300005000");
+        assert_eq!(normalize_test("三亿五"), "3.5亿");
     }
 
     // ============================================================
@@ -4156,10 +4204,11 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     }
 
     // 027-A/B 成果不回归（6 条）
+    // ITN-FIX-BIGNUM-027-D (DEC-042)：两万五 从 25000 → 2.5万（设计变更非回归）
     #[test]
     fn itn_v2_027c_ab_no_regression() {
         assert_eq!(normalize_test("一千零四十六万八千七百四十一"), "10468741");
-        assert_eq!(normalize_test("两万五"), "25000");
+        assert_eq!(normalize_test("两万五"), "2.5万"); // DEC-042 变更
         assert_eq!(normalize_test("一万亿"), "1000000000000");
         assert_eq!(normalize_test("一千二百三十四亿五千万"), "123450000000");
         assert_eq!(normalize_test("三亿零五万"), "300050000");
@@ -4181,5 +4230,58 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
         assert_eq!(normalize_test("三块四毛八一斤"), "3.48元一斤");
         assert_eq!(normalize_test("五块一斤"), "5块一斤");
         assert_eq!(normalize_test("一百二十块三毛"), "120.3元");
+    }
+
+    // ============================================================
+    // ITN-FIX-BIGNUM-027-D (DEC-042) · 隐式补全保留锚定单位（行为变更）
+    // ============================================================
+
+    // 4.1 隐式补全 → 保留锚定单位（本次变更）
+    #[test]
+    fn itn_v2_027d_implicit_anchor_wan() {
+        assert_eq!(normalize_test("两万五"), "2.5万"); // 原 25000
+        assert_eq!(normalize_test("五万三"), "5.3万"); // 原 53000
+        assert_eq!(normalize_test("一万五"), "1.5万");
+    }
+
+    #[test]
+    fn itn_v2_027d_implicit_anchor_yi() {
+        assert_eq!(normalize_test("三亿五"), "3.5亿"); // 原 300005000（4.6 不符）
+        assert_eq!(normalize_test("三亿七"), "3.7亿");
+    }
+
+    // 4.2 完整表达 → 照常展开（不得受影响）
+    #[test]
+    fn itn_v2_027d_full_expression_expand() {
+        assert_eq!(normalize_test("两万五千"), "25000");       // 千=进位单位 → unit_since_big=true → 不进隐式分支
+        assert_eq!(normalize_test("三亿五千万"), "350000000"); // 千万=进位单位
+        assert_eq!(normalize_test("一亿两千三百四十五万六千七百八十九"), "123456789");
+        assert_eq!(normalize_test("一千零四十六万八千七百四十一"), "10468741");
+        assert_eq!(normalize_test("三万五千二百四十一"), "35241");
+        assert_eq!(normalize_test("一千二百三十四亿五千万"), "123450000000");
+    }
+
+    // 4.3 零/无补全路径（不得受影响）
+    #[test]
+    fn itn_v2_027d_zero_no_fill_paths() {
+        assert_eq!(normalize_test("三万五千二百零一"), "35201"); // 有零 → zero_since_big=true
+        assert_eq!(normalize_test("三亿零五万"), "300050000");    // 零 → else 分支
+        assert_eq!(normalize_test("一万亿"), "1000000000000");
+        assert_eq!(normalize_test("两千三百四十五万"), "23450000"); // 无末尾挂起
+        assert_eq!(normalize_test("十亿"), "1000000000");
+        assert_eq!(normalize_test("一亿"), "100000000");
+    }
+
+    // 调用点安全：隐式补全后跟单位时不保留锚定（保护下游 .parse() 消费方）
+    #[test]
+    fn itn_v2_027d_call_site_safety_unit_after_digit() {
+        // 这些用例末尾单字后有单位 → 非孤立 → 维持 +1000 展开 → parse_cn_number 返回纯数字
+        // 下游 format_currency_chain/format_unit_chain 的 .parse::<f64>() 不崩
+        assert_eq!(normalize_test("三万五块"), "35000块");
+        assert_eq!(normalize_test("三万五块钱"), "35000块钱");
+        assert_eq!(normalize_test("两万五元"), "25000元");
+        assert_eq!(normalize_test("两万五斤"), "25000斤");
+        assert_eq!(normalize_test("三亿五吨"), "300005000吨");
+        assert_eq!(normalize_test("五万三角"), "53000角");
     }
 }
