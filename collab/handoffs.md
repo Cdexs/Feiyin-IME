@@ -1,3 +1,15 @@
+## 2026-08-04 — coder-1 — ITN-FIX-BIGNUM-027-C + 027-C-2 ✅ 「两」误判致亿级金额蒸发修复
+
+- **来源**：接续 027-A/B（已提交 `136f70f`）。027-A/B 修完后 `一亿两千...` 仍错，027-C 是最后一块。基线 `136f70f`（ahead 42）
+- **方案协商**：coder-1 实测发现两个阻断点（主控原分析只定位第一处 large_amount_keep_wan_yi）。修第一处后亿能结算但 :677 two_is_unit 在「两」break。主控拍板扩范围 027-C-2 一并修
+- **027-C 改动**：large_amount_keep_wan_yi 万/亿分支加 `big_starts_new_number` 消歧——after_big 首字是数字+第二字进位单位→不break
+- **027-C-2 改动**：two_is_unit 加「两后跟 is_cn_unit_char→返回false」，补齐注释原意「进位单位由进位组合路径自行继续此处不误判」。is_unit 本体零改动（git diff 自证）
+- **第三处注释-实现不符**：two_is_unit 注释说不误判进位单位但实现只查 all_units。连同 4.6 亿级、geometric_order_hazard 共 3 处，主控要求汇总判断系统性
+- **第六节#4 实测**：不是真缺陷——丙型链 parse_cn_number 内部已折叠万/亿到 result，不丢弃
+- **验证**：基线 `itn::` 168/0/0 → **181/0/0**（+13 新增零绿转红）；cargo check + --tests 双 0；UTF-8 U+FFFD=0；is_unit git diff 空；017 全套 14 条逐条零回归（先实测现状再写断言）；4.2 六条 + 4.3 四条 + 4.4 六条逐条通过
+- **边界**：仅 `src/itn.rs`（两处消歧 + 13 测试）；is_unit 本体零改动；未构建/出包/启动 exe；未改版本号（0.7.3）；未用 git 破坏命令；UTF-8 用 edit 工具
+- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-1/result.md`（12757 B 非空）+ `logs/20260804.md`
+
 ## 2026-08-04 — coder-1 — ITN-FIX-BIGNUM-027-A + 027-B ✅ 大额数字进位缺陷修复（027-C 发现另开单）
 
 - **来源**：Gavin 2026-08-04 端测「一千零四十六万八千七百四十一」→`10469740`（应为 `10468741`），第四种失败模式（数值静默改错）。Gavin 新指令「数字要支持从亿到个位的量级跨度」倒逼主控复查出 027-B（万级公式，差 4 个数量级）。基线 `ad8bbd0`（ahead 41）

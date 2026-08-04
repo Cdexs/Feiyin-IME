@@ -560,8 +560,29 @@ fn is_cn_unit_char(ch: char) -> bool {
 /// 后接单位词（斤/块/毛/克/两 等 all_units）→ 两 是数字2（两块/三块两毛五）；
 /// 后接非单位（数字/名词/边界）→ 两 是重量单位（二两/六两五/二十五两/三两银子）。
 /// 进位单位（百/千/万）由进位组合路径自行继续，此处不误判（一亿两 → 两 单位）。
+///
+/// ITN-FIX-BIGNUM-027-C-2：原注释声称「进位单位由进位组合路径自行继续，此处不误判」，
+/// 但实现只查 `match_unit_word`（all_units：斤/吨/块等），进位单位（十/百/千/万/亿）
+/// 不在 all_units → `两千` 的「两」被误判为单位 → parse_cn_number :677 break，
+/// 致「一亿两千三百四十五万...」亿结算后中断在后段。本修复补齐注释原意：
+/// 「两」后紧跟进位单位（is_cn_unit_char：十/百/千/万/亿）→ 两 是数字2，不是单位。
+///
+/// 适用边界：只在 idx > start（两非首位）且后继字符是进位单位时生效。
+///   - 一亿两千...：「两」idx=2>start=0，后「千」进位单位 → 两是数字2 → 不break ✓
+///   - 一斤二两：「两」后是句尾 → 不命中 → 维持两是单位 → 1斤2两 ✓
+///   - 二两：「两」后句尾 → 不命中 → 2两 ✓
+///   - 二十五两：「两」后句尾 → 不命中 → 25两 ✓
+///   - 两百：「两」idx=0==start → two_is_unit 首位返回false → 200 ✓（首位不进本逻辑）
+///   - 二两半：「两」后「半」非进位单位 → 不命中 → 2.5两 ✓
+///   - 三块两毛五：「两」后「毛」∈all_units → match_unit_word 命中先返回false → 3.25元 ✓
+///   - 六两五：「两」后「五」数字非进位单位 → 不命中 → 6.5两 ✓
 fn two_is_unit(chars: &[char], idx: usize, start: usize, r: &CompiledRules) -> bool {
     if chars[idx] != '两' || idx <= start {
+        return false;
+    }
+    // ITN-FIX-BIGNUM-027-C-2：「两」后跟进位单位（十/百/千/万/亿）→ 两是数字2。
+    //   见函数注释。先于 all_units 检查，因进位单位不在 all_units。
+    if idx + 1 < chars.len() && is_cn_unit_char(chars[idx + 1]) {
         return false;
     }
     if r.match_unit_word(chars, idx + 1).is_some() {
@@ -714,7 +735,30 @@ fn parse_cn_number(
                 if let Some(rules) = rules {
                     if rules.large_amount_keep_wan_yi && idx + 1 < chars.len() {
                         let after_big: String = chars[idx + 1..].iter().collect();
-                        if rules.is_unit(&after_big) {
+                        // ITN-FIX-BIGNUM-027-C：消歧「亿/万后首字是中文数字 + 其后跟进位单位」
+                        // 的情况 —— 这是新数字串开头（如「一亿两千...」的「两」是数字2，
+                        // 后跟「千」进位单位），不是「数字+单位」（如「一亿吨」的「一」后跟
+                        // 「吨」非进位单位）。后者维持现有 break 行为（保留「一亿吨」汉字）。
+                        //
+                        // 适用边界：after_big 首字命中 chinese_digit_char（含「两」，「两」
+                        // 既是数字2又是重量单位，017 引入此歧义）**且** 第二字是进位单位
+                        // （is_cn_unit_char：十/百/千/万/亿）→ 判定新数字串，不 break。
+                        // 否则（首字非数字 / 首字数字但后非进位单位 / 单字无第二字）→
+                        // 维持 is_unit 原判定。
+                        //
+                        // 反例自验：
+                        //   - 五万吨：「吨」非中文数字 → 维持 break → 「五万吨」保留 ✓
+                        //   - 一亿吨：「吨」非中文数字 → 维持 break → 「一亿吨」保留 ✓
+                        //   - 三万元：「元」非中文数字 → 维持 break → 「三万元」保留 ✓
+                        //   - 一亿两千...：「两」是数字 + 「千」进位单位 → 不 break → 亿结算 ✓
+                        //   - 一亿两千万：「两」数字 + 「千」进位 → 不 break → 1.2e8 ✓
+                        //   - 一亿两（两后无字）：无第二字 → 维持 is_unit 判定 → break（保守）
+                        //
+                        // 不动 is_unit 函数本体（整个保护词表机制建立其上）。
+                        let big_starts_new_number = chars.len() > idx + 2
+                            && chinese_digit_char(chars[idx + 1]).is_some()
+                            && is_cn_unit_char(chars[idx + 2]);
+                        if !big_starts_new_number && rules.is_unit(&after_big) {
                             break;
                         }
                     }
@@ -740,7 +784,11 @@ fn parse_cn_number(
                 if let Some(rules) = rules {
                     if rules.large_amount_keep_wan_yi && idx + 1 < chars.len() {
                         let after_big: String = chars[idx + 1..].iter().collect();
-                        if rules.is_unit(&after_big) {
+                        // ITN-FIX-BIGNUM-027-C：同万分支消歧（见 :714 注释）
+                        let big_starts_new_number = chars.len() > idx + 2
+                            && chinese_digit_char(chars[idx + 1]).is_some()
+                            && is_cn_unit_char(chars[idx + 2]);
+                        if !big_starts_new_number && rules.is_unit(&after_big) {
                             break;
                         }
                     }
@@ -4015,5 +4063,123 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     fn itn_v2_027_a_yi_ji_comment_impl_mismatch() {
         // 确认注释与实现不符，且本轮未改（027-A 守卫不影响亿后无进位单位的隐式千位）
         assert_eq!(normalize_test("三亿五"), "300005000");
+    }
+
+    // ============================================================
+    // ITN-FIX-BIGNUM-027-C · large_amount_keep_wan_yi 消歧（亿/万后首字是数字+后跟进位单位→不break）
+    // ============================================================
+
+    // 027-C 第一阻断点：large_amount_keep_wan_yi 的 is_unit starts_with 把「两」误判单位
+    //   修复：after_big 首字是中文数字 + 第二字是进位单位 → 新数字串，不 break
+    #[test]
+    fn itn_v2_027c_yi_wan_lian_qian() {
+        // 一亿两千三百四十五万六千七百八十九：亿后「两」是数字2，后「千」进位单位
+        assert_eq!(normalize_test("一亿两千三百四十五万六千七百八十九"), "123456789");
+    }
+
+    #[test]
+    fn itn_v2_027c_yi_wan_no_tail() {
+        assert_eq!(normalize_test("一亿两千三百四十五万"), "123450000");
+    }
+
+    #[test]
+    fn itn_v2_027c_yi_liang_qian_wan() {
+        // 一亿两千万：亿后「两」数字 + 「千」进位 → 不break 亿结算 → 万结算
+        assert_eq!(normalize_test("一亿两千万"), "120000000");
+    }
+
+    #[test]
+    fn itn_v2_027c_liang_yi_san_qian_wan() {
+        // 两亿三千万：「两」在首位（idx==start），two_is_unit 首位返回false → 两是数字2
+        // 亿后「三」数字 + 「千」进位 → 不break。不受 027-C 改动影响（首位路径不同）
+        assert_eq!(normalize_test("两亿三千万"), "230000000");
+    }
+
+    // 027-C-2 第二阻断点：two_is_unit 实现没检查进位单位，只查 all_units
+    //   修复：两后紧跟 is_cn_unit_char（十/百/千/万/亿）→ 返回false（两是数字2）
+    //   符合函数注释「进位单位由进位组合路径自行继续，此处不误判」原意
+
+    // 4.2 large_amount_keep_wan_yi 原有行为保住（6 条）
+    #[test]
+    fn itn_v2_027c_keep_wan_yi_wu_wan_dun() {
+        // 「五万吨」：「吨」非中文数字 → 维持 break → 保留汉字
+        assert_eq!(normalize_test("五万吨"), "五万吨");
+    }
+
+    #[test]
+    fn itn_v2_027c_keep_wan_yi_yi_yi_dun() {
+        // 「一亿吨」：「吨」非中文数字 → 维持 break → 保留汉字
+        assert_eq!(normalize_test("一亿吨"), "一亿吨");
+    }
+
+    #[test]
+    fn itn_v2_027c_keep_wan_yi_san_wan_yuan() {
+        // 「三万元」：「元」非中文数字 → 维持 break → 保留汉字
+        assert_eq!(normalize_test("三万元"), "三万元");
+    }
+
+    #[test]
+    fn itn_v2_027c_keep_liang_jin() {
+        // 「两斤」：两在首位 idx==start，two_is_unit 返回false → 两是数字2
+        assert_eq!(normalize_test("两斤"), "2斤");
+    }
+
+    #[test]
+    fn itn_v2_027c_keep_er_liang() {
+        // 「二两」：两后句尾无进位单位 → two_is_unit=true → 两是单位 → 2两
+        assert_eq!(normalize_test("二两"), "2两");
+    }
+
+    #[test]
+    fn itn_v2_027c_keep_yi_jin_er_liang() {
+        // 「一斤二两」：017 端测原始用例，两后句尾 → 1斤2两
+        assert_eq!(normalize_test("一斤二两"), "1斤2两");
+    }
+
+    // 017 全套零回归（two_is_unit 改动的最大风险面）
+    #[test]
+    fn itn_v2_027c_017_no_regression() {
+        assert_eq!(normalize_test("一斤二两"), "1斤2两");   // 两后句尾
+        assert_eq!(normalize_test("二两"), "2两");           // 两后句尾
+        assert_eq!(normalize_test("二十五两"), "25两");      // 两后句尾
+        assert_eq!(normalize_test("两斤"), "2斤");           // 两首位 idx==start
+        assert_eq!(normalize_test("三两"), "3两");           // 两后句尾
+        assert_eq!(normalize_test("二两半"), "2.5两");      // 两后「半」非进位单位
+        assert_eq!(normalize_test("一两"), "1两");           // 两后句尾
+        assert_eq!(normalize_test("半斤八两"), "半斤八两"); // 两后句尾（且整体成语保护）
+        assert_eq!(normalize_test("六两五"), "6.5两");      // 两后「五」数字非进位单位
+        assert_eq!(normalize_test("三块两毛五"), "3.25元"); // 两后「毛」∈all_units 先返回false
+        assert_eq!(normalize_test("两百"), "200");          // 两首位 idx==start
+        assert_eq!(normalize_test("两块"), "2块");          // 两首位
+        assert_eq!(normalize_test("两吨"), "2吨");          // 两首位
+        assert_eq!(normalize_test("一两半"), "1.5两");      // 两后「半」非进位单位
+    }
+
+    // 027-A/B 成果不回归（6 条）
+    #[test]
+    fn itn_v2_027c_ab_no_regression() {
+        assert_eq!(normalize_test("一千零四十六万八千七百四十一"), "10468741");
+        assert_eq!(normalize_test("两万五"), "25000");
+        assert_eq!(normalize_test("一万亿"), "1000000000000");
+        assert_eq!(normalize_test("一千二百三十四亿五千万"), "123450000000");
+        assert_eq!(normalize_test("三亿零五万"), "300050000");
+        assert_eq!(normalize_test("两千三百四十五万"), "23450000");
+    }
+
+    // 第六节#4 丙型 UnitChain result 丢弃实测结论（只测不改）
+    //   结论：#4 不是真缺陷。丙型链每段调 parse_cn_number 消费一段（含万/亿大单位
+    //   结算到 result），UnitChain 只取 section 级值。但实测「三万五千块钱」→「35000块钱」
+    //   正确：parse_cn_number 一次性消费「三万五千」（万结算），块由下一段处理。
+    //   「一亿两千万元」受 027-C 阻断（亿后两 break），027-C 修复后应正确。
+    //   丙型链不直接处理万/亿大单位（那是 parse_cn_number 内部），UnitChain 的 parts
+    //   是「数字+单位」对（如 35000+块），不含万/亿层级 → result 丢弃不影响丙型正确性。
+    #[test]
+    fn itn_v2_027c_unit_chain_drop_no_bug() {
+        // 丙型链正确处理含万级数字
+        assert_eq!(normalize_test("三万五千块钱"), "35000块钱");
+        assert_eq!(normalize_test("五百块"), "500块");
+        assert_eq!(normalize_test("三块四毛八一斤"), "3.48元一斤");
+        assert_eq!(normalize_test("五块一斤"), "5块一斤");
+        assert_eq!(normalize_test("一百二十块三毛"), "120.3元");
     }
 }
