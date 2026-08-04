@@ -83,7 +83,13 @@ pub use macos::{
     copy_text_to_clipboard, create_controller_window, destroy_controller_window, disable, enable,
     foreground_window_id, inject_text, is_enabled, notify_config_changed, read_text_from_hwnd,
     request_stop, run_message_loop, run_message_loop_with_hotkey_listener, FocusedTextSnapshot,
-    HotkeyEvent, HotkeyListener,
+    HotkeyEvent, HotkeyListener, TrayCommand,
+};
+// TRAY-001: macOS status bar tray (NSStatusItem) — 单独导出，避免在顶行列表混淆。
+#[cfg(target_os = "macos")]
+pub use macos::{
+    build_tray, clear_tray_handle, poll_pending_tray_states, register_tray_handle,
+    request_tray_state,
 };
 
 use std::sync::{Arc, RwLock};

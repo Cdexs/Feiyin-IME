@@ -651,13 +651,70 @@ coder-1 在 DATA-SCENE-GENERIC-008 中评估后建议的候选：**`思维导图
 | D | MACOS-P4-SCENE-001 | `capture_scene_signals` 真实现（NSWorkspace + AXUIElement） | coder-1 | ⏸ |
 | D | MACOS-P4-PERM-001 | `AXIsProcessTrustedWithOptions` 真实现（现为只打 log 的假实现） | coder-2 | ⏸ |
 | D | MACOS-P4-AUTOLAUNCH-001 | 自启动（建议 SMAppService） | 待定 | ⏸ |
-| D | MACOS-P4-READBACK-001 | AX 回读（**macOS 相对 Windows 的能力优势**，Win 侧 `WM_GETTEXT` 已失效） | 待定 | ⏸ |
+| **P1** | **MACOS-P4-AXINJECT-001** | **辅助功能 API 直写替代剪贴板注入**（解决剪贴板被污染/图片被覆盖）—— **Gavin 2026-08-05 拍板独立 P1，不与 READBACK 捆绑**，详见下方专节 | 待定 | ⏸ |
+| D | MACOS-P4-READBACK-001 | AX 回读（学习路径）—— ⚠️ **主控已收回「相对 Windows 的能力优势」表述**：300ms 观察窗 + Word/Google Docs 读不到 + 全文 diff 昂贵，三重打折后产出存疑；建议优先考虑 `WORDBOOK-CORRECTION-UI-001` 显式纠错路线 | 待定 | ⏸ **降级** |
 | ~~E~~ | ~~MACOS-P4-OVERLAY-001~~ | 已上移至阶段 C（DEC-045） | — | ↑ |
 | E | MACOS-P4-BUNDLE-001 | `.app` 打包 + Info.plist TCC 声明 + 签名/公证 | 待定 | ⏸ |
 
 **边界评估结论**：阶段 B 独占 `src/main.rs`，期间禁止任何其他任务碰它；阶段 C 的 HOST 与 TRAY **必须串行**；阶段 D 的 SCENE / PERM / AUTOLAUNCH **可三路并行**，唯一交汇点 `macos/mod.rs` 的 re-export 行由主控统一改一次。
 
 **⏳ 阻塞在 Gavin 决策上的 5 项**（详见方案 §4）：① 阶段 B 归属与 Windows 零回归验证方 ② 事件宿主选型（**建议复议 DEC-015 的 Tauri，改用 winit**）③ 四个浮层是否进第一版 ④ Apple Developer 账号 ⑤ AX 回读是否提前。
+
+---
+
+## 🍎 [macOS 侧·待排期] MACOS-P4-AXINJECT-001 · 辅助功能 API 直写替代剪贴板注入
+
+> **⚠️ 本条仅适用于 macOS 侧，Windows 侧无需处理**（Windows 走 SendInput / 剪贴板双通道，机制不同、无此缺陷）。
+> 来源：Gavin 2026-08-04 端测关切「现在的回写方式确实会污染剪贴板，干扰到用户剪贴板输入」。
+> 参照：竞品 **Typeless** 官方文档明示其用 Accessibility 权限「paste text into any text field」，**不经剪贴板**（[installation-and-setup](https://www.typeless.com/help/installation-and-setup)）。
+
+### 现状与缺陷（主控实测 `src/platform/macos/injection.rs:49-64`）
+
+当前 `inject_via_clipboard` 流程：`pbpaste` 存旧内容 → `pbcopy` 写新文本 → sleep 50ms → enigo 发 Cmd+V → sleep `delay_ms` → `pbcopy` 恢复旧内容。
+
+**已有恢复逻辑，但存在四个真实缺陷（按严重度排序）**：
+
+| # | 缺陷 | 后果 |
+| --- | --- | --- |
+| **1** | **`get_clipboard_text()` 只用 `pbpaste`，仅支持纯文本**（`:119-134`） | 用户剪贴板里若是**图片 / 富文本 / 文件 / 多格式数据**，`old_content` 取不到 → `None` → **恢复分支根本不执行** → **用户原剪贴板内容被永久覆盖丢失**。这不是"污染"，是**数据丢失** |
+| 2 | 恢复是尽力而为（`let _ = set_clipboard_text(&old)`，忽略错误） | 恢复失败无感知、无日志 |
+| 3 | 约 **100ms+ 时间窗**内剪贴板是我们的内容 | 用户此刻手动粘贴会拿到错误内容 |
+| 4 | **剪贴板历史工具**（Paste / Maccy / Raycast 等）会记录每一次写入 | 每次听写都往用户剪贴板历史里塞一条垃圾，长期使用体验很差 |
+
+### 目标方案
+
+用 **AXUIElement 直写**替代剪贴板通道：取焦点元素（`kAXFocusedUIElementAttribute`）→ `AXUIElementSetAttributeValue` 写 `kAXValueAttribute`，或用 `kAXSelectedTextAttribute` 做插入。**全程不碰剪贴板。**
+
+### 实施要点
+
+- **保留剪贴板通道作为兜底**：AX 对某些 App（Electron / 部分 Java App / 未实现 AX 的自绘控件）不可用，失败时回退现有 `inject_via_clipboard`，与 DEC-018「clipboard-first + enigo fallback」的分层思路一致，只是把优先级改为 **AX → 剪贴板 → enigo.text()**
+- **权限已具备**：辅助功能权限本就是热键（CGEventTap）的前置条件，`MACOS-P4-PERM-001` 已补全授权弹窗，**不需要新增任何权限申请**
+- **保底路径不受 App 差异影响**：AX 写不进去就回退现有剪贴板通道，**最坏情况等同现状，不会更差**
+
+### 🔴 与 `MACOS-P4-READBACK-001` **不得捆绑**（Gavin 2026-08-05 拍板：AXINJECT-001 独立 P1）
+
+> **主控此前建议"两者合并为一个批次"，该建议已作废并收回。** 它们只是碰巧用同一套 `AXUIElement` API，但**价值与风险完全不同**，捆绑会让高价值的直写被低价值的回读拖累。
+
+| 项 | 价值 | 依赖 |
+| --- | --- | --- |
+| **AXINJECT-001（本条，注入）** | **高且确定**。解决真实数据丢失 + 剪贴板历史污染。**只需"写得进去"，有剪贴板兜底** | 无 |
+| `READBACK-001`（回读，学习） | **存疑**，见下 | 受三重打折 |
+
+**主控收回的一处过乐观表述**：此前写「macOS 的 AX 能真正读回，是本平台相对 Windows 的能力优势」。**该表述不准确**，实测复核后三点打折：
+
+1. **观察窗只有 300ms**（`main.rs:161` `AUTO_LEARN_OBSERVE_MS = 300`，`:3662` sleep 后即读一次就结束）。用户不可能在 300ms 内看完注入文本、发现错字并改掉——**真实纠错发生在数秒后，这条路径设计上就抓不到几乎任何真实纠错**。此缺陷与平台无关，Windows 侧同样存在
+2. **AX 覆盖面确实比 `WM_GETTEXT` 广**（原生 NSTextView / 备忘录 / Safari 输入框可读，而 `WM_GETTEXT` 在现代应用基本全废），**但读不到 Microsoft Word（非原生 AX 文本控件）与 Google Docs（编辑面是 canvas）** —— 而这恰是长文写作主场
+3. **全文 diff 代价高**：`extract_changed_text`（`main.rs`）走公共前缀+后缀夹逼，**数学上对整篇文档成立、不需要知道光标位置**，但要把全文 `chars().collect::<Vec<char>>()` **两次**（before/after）。50 页文档每次听写数十 MB 临时分配
+
+**→ 真要修好「注入后纠错学习」，正确路线不是 AX 回读，而是既有待排期项 `WORDBOOK-CORRECTION-UI-001`**（注入后浮层显示「纠错」小按钮，用户点了才进编辑）：**显式交互，不猜、不轮询、不受 App 差异影响，且没有时间窗问题**。
+
+### 影响文件（预估）
+
+`src/platform/macos/injection.rs`（主体）+ 可能新增 `src/platform/macos/ax.rs`。**不碰 `src/platform/windows/**`，不碰平台中立模块，对 Windows 侧零影响。**
+
+### 优先级：**P1 独立排期**（Gavin 2026-08-05 拍板）
+
+**不阻塞当前闭环** —— pbcopy+Cmd+V 现在能工作。但 Gavin 日常使用会持续被缺陷 1（复制的图片被永久覆盖）与缺陷 4（剪贴板历史被塞垃圾）硌到，**Phase 4 主体交付后立即排期，不等 READBACK**。
 
 ---
 

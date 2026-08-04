@@ -14,9 +14,9 @@ use anyhow::{anyhow, Result};
 use core_foundation_sys::base::kCFAllocatorDefault;
 use core_foundation_sys::runloop::{
     kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoopAddSource, CFRunLoopAddTimer,
-    CFRunLoopGetCurrent, CFRunLoopRunInMode, CFRunLoopSourceContext, CFRunLoopSourceCreate,
-    CFRunLoopSourceRef, CFRunLoopSourceSignal, CFRunLoopStop, CFRunLoopTimerContext,
-    CFRunLoopTimerCreate, CFRunLoopTimerRef, CFRunLoopWakeUp, CFRunLoopRef,
+    CFRunLoopGetCurrent, CFRunLoopRef, CFRunLoopRunInMode, CFRunLoopSourceContext,
+    CFRunLoopSourceCreate, CFRunLoopSourceRef, CFRunLoopSourceSignal, CFRunLoopStop,
+    CFRunLoopTimerContext, CFRunLoopTimerCreate, CFRunLoopTimerRef, CFRunLoopWakeUp,
 };
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::MainThreadMarker;
@@ -48,9 +48,8 @@ static CONTROLLER_CTX: AtomicPtr<ControllerContext> = AtomicPtr::new(ptr::null_m
 /// in the Dock or Cmd+Tab switcher. This is the macOS equivalent of Windows'
 /// hidden `WS_EX_TOOLWINDOW` controller window.
 pub fn create_controller_window() -> Result<()> {
-    let _mtm = MainThreadMarker::new().ok_or_else(|| {
-        anyhow!("create_controller_window must be called on the main thread")
-    })?;
+    let _mtm = MainThreadMarker::new()
+        .ok_or_else(|| anyhow!("create_controller_window must be called on the main thread"))?;
     let app = NSApplication::sharedApplication(_mtm);
     // Accessory policy: tray-first, no main window, no Dock icon.
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
@@ -192,6 +191,9 @@ extern "C" fn wake_source_perform(_info: *const c_void) {
 }
 
 extern "C" fn controller_timer_callback(_timer: CFRunLoopTimerRef, _info: *mut c_void) {
+    // TRAY-001: apply pending tray state updates (requested from any thread).
+    crate::platform::macos::tray::poll_pending_tray_states();
+
     let ctx_ptr = CONTROLLER_CTX.load(Ordering::Acquire);
     if ctx_ptr.is_null() {
         return;

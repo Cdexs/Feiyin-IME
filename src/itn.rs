@@ -650,8 +650,7 @@ fn parse_cn_number(
     if serial_len == 2 && serial_end < chars.len() {
         if let Some(r) = rules {
             let after_serial: String = chars[serial_end..].iter().collect();
-            if r
-                .serial_suffix_set
+            if r.serial_suffix_set
                 .iter()
                 .any(|s| after_serial.starts_with(s.as_str()))
             {
@@ -935,10 +934,11 @@ fn parse_cn_number(
     //
     //   DEC-043：只动数量级层。format_currency_chain / format_weight_chain 一行不碰。
     if big_unit_seen && !unit_since_big {
-        let is_isolated = idx >= chars.len() || !rules.is_some_and(|r| {
-            let rest: String = chars[idx..].iter().collect();
-            r.is_unit(&rest)
-        });
+        let is_isolated = idx >= chars.len()
+            || !rules.is_some_and(|r| {
+                let rest: String = chars[idx..].iter().collect();
+                r.is_unit(&rest)
+            });
         if is_isolated {
             if let Some((unit_char, _coeff)) = big_unit_anchor {
                 let formatted = format_dec042_magnitude(result, unit_char);
@@ -1131,39 +1131,40 @@ fn try_parse_unit_chain(chars: &[char], start: usize, r: &CompiledRules) -> Opti
             } else {
                 break;
             }
-            } else {
-                // 无单位：检查隐含末级单位尾数
-                // ITN-FIX-CHAIN-TEAR-026：去掉 after_is_boundary 检查，数值合成与后继识别正交。
-                if !parts.is_empty() && after_num <= chars.len() {
-                    // 隐式尾数单位取决于链内最后一个显式单位的层级：
-                    //   块/元(≥1.0) → 隐式尾数=毛(0.1) → 五块一=5.1元
-                    //   毛/角(=0.1) → 隐式尾数=分(0.01) → 三块四毛八=3.48元
-                    //   分(=0.01)   → 已到最小单位，不再吸收隐式尾数
-                    let (_, last_unit) = parts.last().unwrap();
-                    if let Some(last_val) = r.hierarchy_value(last_unit, "currency") {
-                        let implicit_unit = if last_val >= 1.0 {
-                            "毛"
-                        } else if last_val == 0.1 {
-                            "分"
-                        } else {
-                            ""
-                        };
-                        // ITN-FIX-BIGNUM-027-F：纯数字校验 —— 027-E 后 parse_cn_number
-                        //   可能返回带单位串（如 "3亿"），num_consumed 恰好 ≤2 可穿过门控 →
-                        //   带单位串进 parts → format_currency_chain 的 .parse::<f64>()
-                        //   静默归零（第四种失败模式）。此处加纯数字校验对齐
-                        //   capture_price_per_unit:1241 先例：非纯 ASCII 数字则跳过吸收，
-                        //   由主循环独立解析（走 DEC-042 锚定路径）。
-                        if !implicit_unit.is_empty() && num_consumed <= 2
-                            && num_str.bytes().all(|b| b.is_ascii_digit())
-                        {
-                            parts.push((num_str, implicit_unit.to_string()));
-                            pos = after_num;
-                        }
+        } else {
+            // 无单位：检查隐含末级单位尾数
+            // ITN-FIX-CHAIN-TEAR-026：去掉 after_is_boundary 检查，数值合成与后继识别正交。
+            if !parts.is_empty() && after_num <= chars.len() {
+                // 隐式尾数单位取决于链内最后一个显式单位的层级：
+                //   块/元(≥1.0) → 隐式尾数=毛(0.1) → 五块一=5.1元
+                //   毛/角(=0.1) → 隐式尾数=分(0.01) → 三块四毛八=3.48元
+                //   分(=0.01)   → 已到最小单位，不再吸收隐式尾数
+                let (_, last_unit) = parts.last().unwrap();
+                if let Some(last_val) = r.hierarchy_value(last_unit, "currency") {
+                    let implicit_unit = if last_val >= 1.0 {
+                        "毛"
+                    } else if last_val == 0.1 {
+                        "分"
+                    } else {
+                        ""
+                    };
+                    // ITN-FIX-BIGNUM-027-F：纯数字校验 —— 027-E 后 parse_cn_number
+                    //   可能返回带单位串（如 "3亿"），num_consumed 恰好 ≤2 可穿过门控 →
+                    //   带单位串进 parts → format_currency_chain 的 .parse::<f64>()
+                    //   静默归零（第四种失败模式）。此处加纯数字校验对齐
+                    //   capture_price_per_unit:1241 先例：非纯 ASCII 数字则跳过吸收，
+                    //   由主循环独立解析（走 DEC-042 锚定路径）。
+                    if !implicit_unit.is_empty()
+                        && num_consumed <= 2
+                        && num_str.bytes().all(|b| b.is_ascii_digit())
+                    {
+                        parts.push((num_str, implicit_unit.to_string()));
+                        pos = after_num;
                     }
                 }
-                break;
-            };
+            }
+            break;
+        };
         // 单位可小数化检查（date_suffix 时间词已在上方过滤，此处查 decimalizable）
         if unit_len == 0 {
             break;
@@ -1326,27 +1327,26 @@ fn format_currency_chain(chain: &UnitChain, r: &CompiledRules) -> String {
             None => body,
         }
     } else {
-
-    let mut total: f64 = 0.0;
-    for (num_str, unit) in &chain.parts {
-        let n: f64 = num_str.parse().unwrap_or(0.0);
-        let mult = r.hierarchy_value(unit, "currency").unwrap_or(1.0);
-        total += n * mult;
-    }
-    let body = if total.fract() == 0.0 {
-        format!("{}元", total as u64)
-    } else {
-        // ITN-FIX-CHAIN-TEAR-026 条件B：去尾随零，与乙型 format_implicit_decimal 行为一致。
-        // 5.80 → 5.8，1.00 → 1，5.01 → 5.01。
-        let s = format!("{:.2}", total);
-        let s = s.trim_end_matches('0').trim_end_matches('.');
-        format!("{}元", s)
-    };
-    // ITN-FIX-CURRENCY-017 条件3：追加单价限定词（原样汉字，如 1.22元一斤）
-    match &chain.per_unit {
-        Some(per) => format!("{}{}", body, per),
-        None => body,
-    }
+        let mut total: f64 = 0.0;
+        for (num_str, unit) in &chain.parts {
+            let n: f64 = num_str.parse().unwrap_or(0.0);
+            let mult = r.hierarchy_value(unit, "currency").unwrap_or(1.0);
+            total += n * mult;
+        }
+        let body = if total.fract() == 0.0 {
+            format!("{}元", total as u64)
+        } else {
+            // ITN-FIX-CHAIN-TEAR-026 条件B：去尾随零，与乙型 format_implicit_decimal 行为一致。
+            // 5.80 → 5.8，1.00 → 1，5.01 → 5.01。
+            let s = format!("{:.2}", total);
+            let s = s.trim_end_matches('0').trim_end_matches('.');
+            format!("{}元", s)
+        };
+        // ITN-FIX-CURRENCY-017 条件3：追加单价限定词（原样汉字，如 1.22元一斤）
+        match &chain.per_unit {
+            Some(per) => format!("{}{}", body, per),
+            None => body,
+        }
     }
 }
 
@@ -3791,12 +3791,24 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     #[test]
     fn itn_v2_017_t1_six_bugs_fixed() {
         assert_eq!(normalize_test("一斤二两"), "1斤2两");
-        assert_eq!(normalize_test("这个西瓜是一块两毛二一斤"), "这个西瓜是1.22元一斤");
+        assert_eq!(
+            normalize_test("这个西瓜是一块两毛二一斤"),
+            "这个西瓜是1.22元一斤"
+        );
         assert_eq!(normalize_test("一块两毛二一斤"), "1.22元一斤");
-        assert_eq!(normalize_test("这个水果是三块四毛八一斤"), "这个水果是3.48元一斤");
+        assert_eq!(
+            normalize_test("这个水果是三块四毛八一斤"),
+            "这个水果是3.48元一斤"
+        );
         // ITN-FIX-CHAIN-TEAR-026 条件B：尾零去除（一块八毛一斤 → 1.8元一斤，不是 1.80）
-        assert_eq!(normalize_test("这个西瓜是一块八毛一斤"), "这个西瓜是1.8元一斤");
-        assert_eq!(normalize_test("这个西瓜是一块八一斤"), "这个西瓜是1.8元一斤");
+        assert_eq!(
+            normalize_test("这个西瓜是一块八毛一斤"),
+            "这个西瓜是1.8元一斤"
+        );
+        assert_eq!(
+            normalize_test("这个西瓜是一块八一斤"),
+            "这个西瓜是1.8元一斤"
+        );
         assert_eq!(normalize_test("这个重量是三斤六两五"), "这个重量是3斤6两5");
     }
 
@@ -3875,14 +3887,14 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     // T7 · 条件B 尾零去除（format_currency_chain 与 format_implicit_decimal 行为一致）
     #[test]
     fn itn_v2_026_t7_trailing_zero_removed() {
-        assert_eq!(normalize_test("五块一"), "5.1元");     // 原 5.10元 → 修复
-        // 单段链保持原单位（不归一到元）
-        assert_eq!(normalize_test("五块"), "5块");        // 保持不变
-        assert_eq!(normalize_test("八角"), "8角");          // 保持原单位
-        assert_eq!(normalize_test("二十五块"), "25块");    // 保持原单位
+        assert_eq!(normalize_test("五块一"), "5.1元"); // 原 5.10元 → 修复
+                                                       // 单段链保持原单位（不归一到元）
+        assert_eq!(normalize_test("五块"), "5块"); // 保持不变
+        assert_eq!(normalize_test("八角"), "8角"); // 保持原单位
+        assert_eq!(normalize_test("二十五块"), "25块"); // 保持原单位
         assert_eq!(normalize_test("一块两毛二"), "1.22元"); // 保持不变（两位有效）
         assert_eq!(normalize_test("五块一毛二"), "5.12元"); // 保持不变
-        assert_eq!(normalize_test("一块八"), "1.8元");     // 原 1.80元 → 修复
+        assert_eq!(normalize_test("一块八"), "1.8元"); // 原 1.80元 → 修复
         assert_eq!(normalize_test("一块八一斤"), "1.8元一斤");
     }
 
@@ -3953,7 +3965,7 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
         assert_eq!(normalize_test("一角钱"), "一角钱");
         // 非保护词表 → 单段 currency 链转数字（现状锁定）
         assert_eq!(normalize_test("四角"), "4角");
-        assert_eq!(normalize_test("墙角"), "墙角");  // 墙非数字，不触发
+        assert_eq!(normalize_test("墙角"), "墙角"); // 墙非数字，不触发
     }
 
     // B3 · 「分」歧义（分数/时间/评分/货币）
@@ -4015,17 +4027,17 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     #[test]
     fn itn_v2_026_c2_trailing_zero_boundary() {
         // fract()==0.0 → 整数分支，不去尾零
-        assert_eq!(normalize_test("五块"), "5块");          // 单段，5.0 → 5块
-        // 实测：五块零 → 丙型链捕获「五块」+ 隐式尾数「零」=0毛 → total=5.0 → 5元
+        assert_eq!(normalize_test("五块"), "5块"); // 单段，5.0 → 5块
+                                                   // 实测：五块零 → 丙型链捕获「五块」+ 隐式尾数「零」=0毛 → total=5.0 → 5元
         assert_eq!(normalize_test("五块零"), "5元");
         // 多段链 fract()==0.0 → 整数元
         assert_eq!(normalize_test("五块零毛"), "5元");
         // 多段链 fract()!=0.0 → 去尾零
-        assert_eq!(normalize_test("五块零一"), "5.01元");    // 5.01 保留
-        assert_eq!(normalize_test("五块一"), "5.1元");       // 5.10 → 5.1
-        assert_eq!(normalize_test("五块零毛一"), "5.01元");  // 5.01 保留
-        // 边界：0.05 元
-        assert_eq!(normalize_test("五分"), "5分");           // 单段保留原单位
+        assert_eq!(normalize_test("五块零一"), "5.01元"); // 5.01 保留
+        assert_eq!(normalize_test("五块一"), "5.1元"); // 5.10 → 5.1
+        assert_eq!(normalize_test("五块零毛一"), "5.01元"); // 5.01 保留
+                                                            // 边界：0.05 元
+        assert_eq!(normalize_test("五分"), "5分"); // 单段保留原单位
     }
 
     // C3 · weight 族不受 026 影响（只动 currency）
@@ -4034,7 +4046,7 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
         assert_eq!(normalize_test("三斤六两五"), "3斤6两5");
         assert_eq!(normalize_test("一斤二两"), "1斤2两");
         assert_eq!(normalize_test("二两"), "2两");
-        assert_eq!(normalize_test("五斤"), "5斤");           // 单段 weight 链不受影响
+        assert_eq!(normalize_test("五斤"), "5斤"); // 单段 weight 链不受影响
     }
 
     // C4 · 016 班级简写零回归（026 只动 currency 族）
@@ -4168,13 +4180,13 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     fn itn_v2_027_b_formula_no_rules() {
         let cases: &[(&str, &str)] = &[
             ("一亿两千三百四十五万六千七百八十九", "123456789"), // 不变
-            ("一亿两千三百四十五万", "12345万"), // DEC-042 变更
-            ("两千三百四十五万", "2345万"), // DEC-042 变更
-            ("一万亿", "1万亿"), // DEC-042 补充二 变更
-            ("一千二百三十四亿五千万", "1234.5亿"), // DEC-042 变更
-            ("三亿零五万", "30005万"), // DEC-042 变更
-            ("十亿", "10亿"), // DEC-042 变更
-            ("一亿", "1亿"), // DEC-042 变更
+            ("一亿两千三百四十五万", "12345万"),                 // DEC-042 变更
+            ("两千三百四十五万", "2345万"),                      // DEC-042 变更
+            ("一万亿", "1万亿"),                                 // DEC-042 补充二 变更
+            ("一千二百三十四亿五千万", "1234.5亿"),              // DEC-042 变更
+            ("三亿零五万", "30005万"),                           // DEC-042 变更
+            ("十亿", "10亿"),                                    // DEC-042 变更
+            ("一亿", "1亿"),                                     // DEC-042 变更
         ];
         for (input, expected) in cases {
             let chars: Vec<char> = input.chars().collect();
@@ -4209,7 +4221,10 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     #[test]
     fn itn_v2_027c_yi_wan_lian_qian() {
         // 一亿两千三百四十五万六千七百八十九：亿后「两」是数字2，后「千」进位单位
-        assert_eq!(normalize_test("一亿两千三百四十五万六千七百八十九"), "123456789");
+        assert_eq!(
+            normalize_test("一亿两千三百四十五万六千七百八十九"),
+            "123456789"
+        );
     }
 
     #[test]
@@ -4274,20 +4289,20 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     // 017 全套零回归（two_is_unit 改动的最大风险面）
     #[test]
     fn itn_v2_027c_017_no_regression() {
-        assert_eq!(normalize_test("一斤二两"), "1斤2两");   // 两后句尾
-        assert_eq!(normalize_test("二两"), "2两");           // 两后句尾
-        assert_eq!(normalize_test("二十五两"), "25两");      // 两后句尾
-        assert_eq!(normalize_test("两斤"), "2斤");           // 两首位 idx==start
-        assert_eq!(normalize_test("三两"), "3两");           // 两后句尾
-        assert_eq!(normalize_test("二两半"), "2.5两");      // 两后「半」非进位单位
-        assert_eq!(normalize_test("一两"), "1两");           // 两后句尾
+        assert_eq!(normalize_test("一斤二两"), "1斤2两"); // 两后句尾
+        assert_eq!(normalize_test("二两"), "2两"); // 两后句尾
+        assert_eq!(normalize_test("二十五两"), "25两"); // 两后句尾
+        assert_eq!(normalize_test("两斤"), "2斤"); // 两首位 idx==start
+        assert_eq!(normalize_test("三两"), "3两"); // 两后句尾
+        assert_eq!(normalize_test("二两半"), "2.5两"); // 两后「半」非进位单位
+        assert_eq!(normalize_test("一两"), "1两"); // 两后句尾
         assert_eq!(normalize_test("半斤八两"), "半斤八两"); // 两后句尾（且整体成语保护）
-        assert_eq!(normalize_test("六两五"), "6.5两");      // 两后「五」数字非进位单位
+        assert_eq!(normalize_test("六两五"), "6.5两"); // 两后「五」数字非进位单位
         assert_eq!(normalize_test("三块两毛五"), "3.25元"); // 两后「毛」∈all_units 先返回false
-        assert_eq!(normalize_test("两百"), "200");          // 两首位 idx==start
-        assert_eq!(normalize_test("两块"), "2块");          // 两首位
-        assert_eq!(normalize_test("两吨"), "2吨");          // 两首位
-        assert_eq!(normalize_test("一两半"), "1.5两");      // 两后「半」非进位单位
+        assert_eq!(normalize_test("两百"), "200"); // 两首位 idx==start
+        assert_eq!(normalize_test("两块"), "2块"); // 两首位
+        assert_eq!(normalize_test("两吨"), "2吨"); // 两首位
+        assert_eq!(normalize_test("一两半"), "1.5两"); // 两后「半」非进位单位
     }
 
     // 027-A/B 成果不回归（6 条）
@@ -4340,9 +4355,12 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     // 4.2 完整表达 → 照常展开（不得受影响）
     #[test]
     fn itn_v2_027d_full_expression_expand() {
-        assert_eq!(normalize_test("两万五千"), "25000");       // 千=进位单位 → unit_since_big=true → 不进隐式分支
+        assert_eq!(normalize_test("两万五千"), "25000"); // 千=进位单位 → unit_since_big=true → 不进隐式分支
         assert_eq!(normalize_test("三亿五千万"), "3.5亿"); // DEC-042 变更
-        assert_eq!(normalize_test("一亿两千三百四十五万六千七百八十九"), "123456789");
+        assert_eq!(
+            normalize_test("一亿两千三百四十五万六千七百八十九"),
+            "123456789"
+        );
         assert_eq!(normalize_test("一千零四十六万八千七百四十一"), "10468741");
         assert_eq!(normalize_test("三万五千二百四十一"), "35241");
         assert_eq!(normalize_test("一千二百三十四亿五千万"), "1234.5亿"); // DEC-042 变更
@@ -4391,16 +4409,16 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     // 3.2 混合量级 + 升亿判定
     #[test]
     fn itn_v2_027e_mixed_magnitude_promote_yi() {
-        assert_eq!(normalize_test("三亿五千万"), "3.5亿");           // 升亿 1 位小数
+        assert_eq!(normalize_test("三亿五千万"), "3.5亿"); // 升亿 1 位小数
         assert_eq!(normalize_test("一千二百三十四亿五千万"), "1234.5亿"); // 升亿 1 位
     }
 
     #[test]
     fn itn_v2_027e_mixed_magnitude_keep_wan() {
         assert_eq!(normalize_test("一亿两千三百四十五万"), "12345万"); // 4 位小数 → 不升
-        assert_eq!(normalize_test("一亿零三万"), "10003万");           // 4 位 → 不升
-        assert_eq!(normalize_test("三千五百万"), "3500万");            // 不足 1 亿
-        assert_eq!(normalize_test("三十五万"), "35万");               // 不足 1 亿
+        assert_eq!(normalize_test("一亿零三万"), "10003万"); // 4 位 → 不升
+        assert_eq!(normalize_test("三千五百万"), "3500万"); // 不足 1 亿
+        assert_eq!(normalize_test("三十五万"), "35万"); // 不足 1 亿
     }
 
     #[test]
@@ -4412,11 +4430,14 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     // 3.3 最小单位落千及以下（不带后缀，不得受影响）
     #[test]
     fn itn_v2_027e_below_wan_no_suffix() {
-        assert_eq!(normalize_test("两万五千"), "25000");    // 千=进位单位 → unit_since_big=true
+        assert_eq!(normalize_test("两万五千"), "25000"); // 千=进位单位 → unit_since_big=true
         assert_eq!(normalize_test("三万五千"), "35000");
         assert_eq!(normalize_test("三千五百"), "3500");
         assert_eq!(normalize_test("一千零四十六万八千七百四十一"), "10468741");
-        assert_eq!(normalize_test("一亿两千三百四十五万六千七百八十九"), "123456789");
+        assert_eq!(
+            normalize_test("一亿两千三百四十五万六千七百八十九"),
+            "123456789"
+        );
         assert_eq!(normalize_test("三万五千二百四十一"), "35241");
         assert_eq!(normalize_test("三万五千二百零一"), "35201");
     }
@@ -4424,13 +4445,13 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     // 第四节变更断言验证（DEC-042 设计变更非回归）
     #[test]
     fn itn_v2_027e_section4_changes() {
-        assert_eq!(normalize_test("一亿"), "1亿");               // 旧 100000000
-        assert_eq!(normalize_test("十亿"), "10亿");              // 旧 1000000000
+        assert_eq!(normalize_test("一亿"), "1亿"); // 旧 100000000
+        assert_eq!(normalize_test("十亿"), "10亿"); // 旧 1000000000
         assert_eq!(normalize_test("两千三百四十五万"), "2345万"); // 旧 23450000
         assert_eq!(normalize_test("一千二百三十四亿五千万"), "1234.5亿"); // 旧 123450000000
-        assert_eq!(normalize_test("三亿五千万"), "3.5亿");       // 旧 350000000
-        assert_eq!(normalize_test("三亿零五万"), "30005万");     // 旧 300050000
-        assert_eq!(normalize_test("一万亿"), "1万亿");           // 旧 1000000000000（027-G-1 DEC-042 补充二）
+        assert_eq!(normalize_test("三亿五千万"), "3.5亿"); // 旧 350000000
+        assert_eq!(normalize_test("三亿零五万"), "30005万"); // 旧 300050000
+        assert_eq!(normalize_test("一万亿"), "1万亿"); // 旧 1000000000000（027-G-1 DEC-042 补充二）
     }
 
     // 第八节 4 组零回归
@@ -4599,7 +4620,10 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     #[test]
     fn itn_v2_027g_a3_proper_noun_positive() {
         assert_eq!(normalize_test("十万个为什么"), "十万个为什么");
-        assert_eq!(normalize_test("我买了一本十万个为什么"), "我买了一本十万个为什么");
+        assert_eq!(
+            normalize_test("我买了一本十万个为什么"),
+            "我买了一本十万个为什么"
+        );
     }
 
     // 反向护栏：加词条不得挡住普通「十万个」（个 非单位 → 十万锚定 10万）。

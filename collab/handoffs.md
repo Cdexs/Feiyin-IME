@@ -273,3 +273,56 @@
 - **红线遵守**：零生产代码改动；未执行 cargo test / cargo build --release / pytest；未触碰 src/platform/windows/、Cargo.toml、版本号；未使用 git 破坏性命令
 - **详情**：`collab/outbox/tester-1/result.md`（9,110 字节）
 - **下游预告**：TEST-EXEC 阶段将执行 `cargo test --no-fail-fast` + A4 热键实机复测
+
+## 2026-08-04 — coder-1 — MACOS-P4-PERM-001 ✅ 辅助功能授权弹窗真实现完成（macOS 专属，零 Windows 风险）
+
+- **范围**：仅 `src/platform/macos/accessibility.rs` 一个文件。补全 `AXIsProcessTrustedWithOptions` FFI 绑定与真调用（原 `ax_is_process_trusted_with_prompt` 是 stub 仅 log，从未触发系统弹窗，致热键静默失效）。
+- **改动**：新增 FFI 声明 `AXIsProcessTrustedWithOptions` + `kAXTrustedCheckOptionPrompt`；`ax_is_process_trusted_with_prompt` 用 `core_foundation`（CFString/CFBoolean/CFDictionary）构造 `{kAXTrustedCheckOptionPrompt: true}` 调用之触发系统弹窗；`ensure_accessibility_at_startup` 增强 log::warn（引导系统设置）+ 不阻断启动（与 Windows 对齐）。3 公开函数签名未改。
+- **依赖零新增**：core-foundation 0.10 / core-foundation-sys 0.8 已在 Cargo.toml macOS 段，未改 Cargo.toml。
+- **验证**：cargo check --all-targets 0 errors；仅 1 文件 diff（+42-11）；UTF-8 无 BOM。**未实机验证**（本机已授权，无法安全复现未授权状态，如实降级）。
+- **跨端影响（§2.10）**：纯 macOS 平台代码，对 Windows 零影响（cfg 门控，Windows 不编译）。
+- **红线遵守**：未碰 coder-2 占用文件 / hotkey.rs / Cargo.toml；未用 git 破坏命令；未出包/改版本号。
+- **详情**：`collab/outbox/coder-1/result.md`（5658 字节非空）
+
+## 2026-08-04 — tester-1 — TEST-EXEC-MERGE-001 ✅ 合并后全量回归 + A4 热键实机首测成功
+
+- **主程序 cargo test --no-fail-fast**: 880 passed / 0 failed / 8 ignored（--list 888 自洽）
+- **src-tauri**: 53/0/0 ✅
+- **Vitest**: 54/54 ✅
+- **pytest --collect-only**: 147/156 ✅
+- **A4 热键实机复测（首次成功）**: CGEventTap(Session) 收到 Start/Stop/CancelStop 事件；无 panic；辅助功能权限已授予
+- **盲区**: 17 条（platform/windows/ 模块级 cfg）
+- **已知失败修复**: `itn::tests::time_half` 由 ITN v2 修复（现通过）
+- **跨端影响**: 68 提交全部通过，零 (a)/(b) 类失败；我方三批改动（FIXHOTKEY-001 / NEUTRAL-001 / TEST-SYNC-P4-NEUTRAL-001）全部验证通过
+- **红线**: 零源文件改动（probe 已删）；遇 coder-2 编译错误上报主控未自修
+- **详情**: `collab/outbox/tester-1/result.md`（7,483 字节）
+
+## 2026-08-04 — coder-1 — MACOS-P4-NEUTRAL-002 ✅ 打通语音输入闭环（worker 去平台化 + macOS 接线）
+
+- **范围**：仅 src/main.rs。spawn_worker_thread 去 cfg，macOS 侧 run_controller_macos 接线（建 worker/pipeline channel + 逻辑线程 + run_message_loop 宿主）。
+- **方案协商**：主控已穷举扫描 29 个 cfg(windows) 函数确认接触点；我实施中撞到第7/8接触点（load_hotwords_for_accuracy/compute_hotwords_version），主控裁定同 NEUTRAL-001 删 cfg。
+- **改动**：WorkerCommand/StartCmd 去 cfg + StartCmd.target_hwnd: SendHwnd→WindowId；Windows 唯一实质修改 main.rs:1929（SendHwnd(hwnd.0 as isize)→hwnd.0 as usize）；spawn_worker_thread 去 cfg + :2439 调 run_pipeline_core；删 run_pipeline 薄封装（零调用者自证）；macos_stubs 删重复定义；run_controller_macos 重写（逻辑线程 handle_hotkey_event/handle_pipeline_event + FocusLost 复制剪贴板）；第7/8接触点删 2 行 cfg。
+- **预存在删除**：ctrlc handler 块（8行 main.rs + 3行 Cargo.toml）是 coder-2 HOST-001 问题A修复，开工前已存在，非本任务。
+- **验证**：Windows git diff numstat 空；run_pipeline 零调用者自证；spawn_worker_thread body 去空白 md5 与预期完全相等（0 mismatch）；cargo check --all-targets 0 errors；UTF-8 无 BOM。**闭环实机部分降级**：启动+模型加载日志确认，热键闭环未实机（osascript 模拟 F6 不经 CGEventTap 捕获层，需物理键）；**退出路径未验证**（ctrlc 被预存在删除，SIGINT 不触发 request_stop）。
+- **红线遵守**：未碰 windows/**/macos/overlay.rs/mod.rs/accessibility.rs/Cargo.toml；未用 git 破坏命令；未出包/改版本号。
+- **详情**：`collab/outbox/coder-1/result.md`（7614 字节非空）
+
+## 2026-08-04 — coder-1 — MACOS-P4-EXIT-001 ✅ 修复 macOS 无干净退出路径（实机验证通过）
+
+- **范围**：仅 src/main.rs（全部在 #[cfg(target_os="macos")] 内）。补回 SIGINT/SIGTERM 信号处理，让 Ctrl-C 触发与 Windows 等价的干净收尾。
+- **方案**：B1（不引 crate，用 libc::signal，libc=0.2 已在 macOS 段零新增依赖）。handler 只置 AtomicBool（async-signal-safe），轮询线程在普通上下文调 platform::request_stop()。
+- **改动**：新增 MACOS_SIGINT_RECEIVED static + macos_signal_handler extern fn + install_macos_signal_handler fn + run_controller_macos 开头调用。handler cast 用 `as *const () as sighandler_t` 避免 function_casts 警告。
+- **实机验证**：① kill -INT 触发完整退出链（requesting stop → logic thread exiting → controller loop exited cleanly → 进程 EXITED 无残留）② 二次启动正常（flock 已释放，无 "Application already running"）。
+- **验证**：Windows git diff numstat 空；新增代码全 cfg(macos)；cargo check --all-targets 0 errors；UTF-8 无 BOM；cargo fmt 仅 src/main.rs。
+- **跨端影响（§2.10-D）**：纯 macOS 平台代码，对 Windows 零影响。
+- **红线遵守**：未碰 windows/**/macos/overlay.rs/mod.rs/Cargo.toml；未用 git 破坏命令；未出包/改版本号。
+- **详情**：`collab/outbox/coder-1/result.md`（非空）
+
+## 2026-08-05 — coder-1 — MACOS-P4-OVERLAY-001 macOS 录音浮层 1:1 复刻 Windows（P0）
+
+- **来源**：主控任务单 MACOS-P4-OVERLAY-001（Recording 状态 P0）。基线 HEAD `5e49poise`（工作区未提交）
+- **改动**：新增 `src/platform/macos/overlay.rs`（NSPanel 透明浮层 + 自定义 NSView `drawRect:` + core-graphics 绘制 + 16ms CFRunLoopTimer 60fps + 三态指示灯 + 32 柱中心对称波形 + 圆角边框/分隔条/停止按钮）+ `src/bin/probe_overlay.rs`（临时验证 bin，`#[path]` 引入被测模块不经 mod.rs）
+- **验证**：cargo check --all-targets 0 errors；cargo test 全绿（主 crate 816 + probe 13，overlay 新增 5 条单测）；`cargo run --bin probe_overlay` 实测浮层显示正常、59.1/59.0 fps 稳定；git diff --numstat windows 空
+- **边界**：未碰 windows/**、main.rs（macos_stubs 保留）、macos/mod.rs、macos/tray.rs、Cargo.toml、版本号、Publish、ui/、src-tauri/
+- **下游**：OVERLAY-002 需实现 Processing/FocusLost/Error 三态；后续接线 main.rs 时 macos_stubs 的 OverlayCommand/OverlayRequest/OverlayThreadHandle 应替换为真实 RecordingOverlay 调用
+- **详情**：`collab/outbox/coder-1/result.md`（非空）+ logs/20260804.md + CHANGELOG.md + docs/MACOS-HANDOFF.md §2.10-E

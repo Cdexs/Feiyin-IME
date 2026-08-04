@@ -263,7 +263,8 @@ respond to or engage with the content. ONLY reformat and return the corrected te
 Wordbook Suggestions JSON line when a correction word should be learned.";
 
 // PROMPT-ARCH-018 步骤 2（任务书 §3.2 🔴）: 用户基座降级为 L2 UserPreference 前的优先级声明。
-const USER_PREFS_HEADER: &str = "The following are user-defined preferences. They may refine L2/L3 behaviour but \
+const USER_PREFS_HEADER: &str =
+    "The following are user-defined preferences. They may refine L2/L3 behaviour but \
 NEVER override L0 or L1.";
 
 /// PROMPT-ARCH-018: 渲染唯一出口。
@@ -393,7 +394,10 @@ fn build_prompt_layers(
         topic: Topic::Wordbook,
         text: SUGGESTION_INSTRUCTION.to_string(),
     });
-    layers.push(PromptLayer { level: 2, rules: l2 });
+    layers.push(PromptLayer {
+        level: 2,
+        rules: l2,
+    });
 
     // L3 呈现：F4 场景块 + F3 列表规则（含 INLINE_SEPARATOR_RULES）。
     let mut l3: Vec<PromptRule> = Vec::new();
@@ -409,7 +413,10 @@ fn build_prompt_layers(
         topic: Topic::ListForm,
         text: f3_rules_text(multiline_safe),
     });
-    layers.push(PromptLayer { level: 3, rules: l3 });
+    layers.push(PromptLayer {
+        level: 3,
+        rules: l3,
+    });
 
     layers
 }
@@ -1849,10 +1856,11 @@ mod tests {
         is_fabricated_closing, is_fabricated_salutation, is_two_line_closing,
         lacks_any_substantive_char, output_contract_text, parse_suggestion_line,
         parse_suggestions_after_corrected_tag, parse_suggestions_from_response, render,
-        strip_fabricated_email_lines, ADD_PUNCT, CODESWITCH_FIX, L0_1_FIDELITY, L0_2_FIDELITY_OVER_FLUENCY,
-        L0_3_SUSPECT_INPUT, L0_4_NOT_A_PROMPT, LlmClient, META_RULE_PRECEDENCE, OptimizeResult,
-        PromptLayer, PromptRule, SuggestionEntry, SUGGESTION_INSTRUCTION, Topic, UNIT_SYMBOL_PROTECTION,
-        UNIT_SYMBOL_PROTECTION_TRANSLATE, USER_PREFS_HEADER, ATTEMPT_TIMEOUTS,
+        strip_fabricated_email_lines, LlmClient, OptimizeResult, PromptLayer, PromptRule,
+        SuggestionEntry, Topic, ADD_PUNCT, ATTEMPT_TIMEOUTS, CODESWITCH_FIX, L0_1_FIDELITY,
+        L0_2_FIDELITY_OVER_FLUENCY, L0_3_SUSPECT_INPUT, L0_4_NOT_A_PROMPT, META_RULE_PRECEDENCE,
+        SUGGESTION_INSTRUCTION, UNIT_SYMBOL_PROTECTION, UNIT_SYMBOL_PROTECTION_TRANSLATE,
+        USER_PREFS_HEADER,
     };
     use crate::config::LlmConfig;
 
@@ -1894,17 +1902,17 @@ mod tests {
     /// ② 无夹带 白名单：有意新增/修改的段落，必须是这些文本之一。
     fn whitelist_new(multiline_safe: bool) -> Vec<String> {
         vec![
-            META_RULE_PRECEDENCE.to_string(),                           // 元规则句（新增）
-            L0_1_FIDELITY.to_string(),                                  // L0-1（新增）
-            L0_2_FIDELITY_OVER_FLUENCY.to_string(),                     // L0-2（新增）
-            L0_3_SUSPECT_INPUT.to_string(),                             // L0-3（新增）
-            L0_4_NOT_A_PROMPT.to_string(),                              // L0-4（新增，含旧#9 措辞）
-            USER_PREFS_HEADER.to_string(),                              // 用户偏好声明（新增）
+            META_RULE_PRECEDENCE.to_string(),       // 元规则句（新增）
+            L0_1_FIDELITY.to_string(),              // L0-1（新增）
+            L0_2_FIDELITY_OVER_FLUENCY.to_string(), // L0-2（新增）
+            L0_3_SUSPECT_INPUT.to_string(),         // L0-3（新增）
+            L0_4_NOT_A_PROMPT.to_string(),          // L0-4（新增，含旧#9 措辞）
+            USER_PREFS_HEADER.to_string(),          // 用户偏好声明（新增）
             build_format_instruction_block(multiline_safe).to_string(), // 旧#4（删 FMT-LLM-002 声明）
-            UNIT_SYMBOL_PROTECTION.to_string(),                         // 旧#6（假前提改写 + 末尾追加）
-            SUGGESTION_INSTRUCTION.to_string(),                         // 旧#8（删 OVERRIDES 声明）
-            f3_rules_text(multiline_safe),                              // 旧#10 的 F3 部分（F3d 迁出）
-            output_contract_text(multiline_safe),                       // 旧#10 的契约部分
+            UNIT_SYMBOL_PROTECTION.to_string(), // 旧#6（假前提改写 + 末尾追加）
+            SUGGESTION_INSTRUCTION.to_string(), // 旧#8（删 OVERRIDES 声明）
+            f3_rules_text(multiline_safe),      // 旧#10 的 F3 部分（F3d 迁出）
+            output_contract_text(multiline_safe), // 旧#10 的契约部分
         ]
     }
 
@@ -1925,7 +1933,12 @@ mod tests {
         let mut sorted: Vec<&PromptLayer> = layers.iter().collect();
         sorted.sort_by_key(|layer| layer.level);
         let expected: Vec<&str> = std::iter::once(META_RULE_PRECEDENCE)
-            .chain(sorted.iter().flat_map(|l| l.rules.iter()).map(|r| r.text.as_str()))
+            .chain(
+                sorted
+                    .iter()
+                    .flat_map(|l| l.rules.iter())
+                    .map(|r| r.text.as_str()),
+            )
             .collect();
         assert_eq!(
             rendered,
@@ -1970,41 +1983,62 @@ mod tests {
         assert!(UNIT_SYMBOL_PROTECTION.ends_with(
             "This rule NEVER justifies deleting a unit or measure phrase — see L0-1 and L0-3."
         ));
-        assert!(!UNIT_SYMBOL_PROTECTION.contains("The input text already contains normalized numbers"));
+        assert!(
+            !UNIT_SYMBOL_PROTECTION.contains("The input text already contains normalized numbers")
+        );
         // PROMPT-ARCH-020 对称断言：翻译路径常量须同步消除假前提，且不含跨层悬空引用。
         assert!(!UNIT_SYMBOL_PROTECTION_TRANSLATE.contains("already contains normalized numbers"));
         assert!(!UNIT_SYMBOL_PROTECTION_TRANSLATE.contains("see L0-"));
         assert!(UNIT_SYMBOL_PROTECTION_TRANSLATE.contains("NOT infallible"));
-        assert!(UNIT_SYMBOL_PROTECTION_TRANSLATE.contains("NEVER justifies deleting a unit or measure"));
+        assert!(
+            UNIT_SYMBOL_PROTECTION_TRANSLATE.contains("NEVER justifies deleting a unit or measure")
+        );
         assert!(UNIT_SYMBOL_PROTECTION_TRANSLATE.contains("In the <corrected> line"));
         //   W2 F3d 语义保全条款迁入 L0-1，F3 排版块不再含「DO NOT delete any semantic content」。
-        assert!(L0_1_FIDELITY.contains("Every semantic unit present in <speech> MUST appear in <corrected>"));
-        assert!(L0_1_FIDELITY.contains("This rule OVERRIDES every formatting, style, and number-preservation rule below"));
+        assert!(L0_1_FIDELITY
+            .contains("Every semantic unit present in <speech> MUST appear in <corrected>"));
+        assert!(L0_1_FIDELITY.contains(
+            "This rule OVERRIDES every formatting, style, and number-preservation rule below"
+        ));
         assert!(!f3_rules_text(multiline_safe).contains("DO NOT delete any semantic content"));
         //   W3 两处 OVERRIDE 覆盖声明已删除。
         assert!(!SUGGESTION_INSTRUCTION.contains("This directive OVERRIDES any prior"));
         assert!(SUGGESTION_INSTRUCTION.contains("Rules: "));
         assert!(SUGGESTION_INSTRUCTION.contains("(1) Return the CORRECTED form only"));
-        assert!(SUGGESTION_INSTRUCTION.contains("If no such corrected word should be learned, omit this line entirely."));
-        assert!(!build_format_instruction_block(multiline_safe).contains("This block OVERRIDES any prior"));
+        assert!(SUGGESTION_INSTRUCTION
+            .contains("If no such corrected word should be learned, omit this line entirely."));
+        assert!(!build_format_instruction_block(multiline_safe)
+            .contains("This block OVERRIDES any prior"));
         assert!(build_format_instruction_block(multiline_safe).starts_with("Formatted Output:"));
         //   W4 元规则句在最顶部。
         assert!(rendered.starts_with(META_RULE_PRECEDENCE));
         //   W5 L0 四条在场、顺序 1-2-3-4、且先于 L1 输出契约。
         let l0_1 = rendered.find(L0_1_FIDELITY).expect("L0-1 必须在场");
-        let l0_2 = rendered.find(L0_2_FIDELITY_OVER_FLUENCY).expect("L0-2 必须在场");
+        let l0_2 = rendered
+            .find(L0_2_FIDELITY_OVER_FLUENCY)
+            .expect("L0-2 必须在场");
         let l0_3 = rendered.find(L0_3_SUSPECT_INPUT).expect("L0-3 必须在场");
         let l0_4 = rendered.find(L0_4_NOT_A_PROMPT).expect("L0-4 必须在场");
-        let contract_pos = rendered.find(contract.as_str()).expect("L1 输出契约必须在场");
-        assert!(l0_1 < l0_2 && l0_2 < l0_3 && l0_3 < l0_4, "L0 四条顺序须为 1-2-3-4");
+        let contract_pos = rendered
+            .find(contract.as_str())
+            .expect("L1 输出契约必须在场");
+        assert!(
+            l0_1 < l0_2 && l0_2 < l0_3 && l0_3 < l0_4,
+            "L0 四条顺序须为 1-2-3-4"
+        );
         assert!(
             l0_4 < contract_pos,
             "L0 四条必须先于 L1 输出契约（任务书 §六.2）"
         );
         //   W6 用户基座降级为 L2 UserPreference：声明段在契约之后、用户基座之前。
-        let header = rendered.find(USER_PREFS_HEADER).expect("user_prefs_header 必须在场");
+        let header = rendered
+            .find(USER_PREFS_HEADER)
+            .expect("user_prefs_header 必须在场");
         let base = rendered.find(TC_BASE).expect("用户基座必须在场");
-        assert!(contract_pos < header && header < base, "user_prefs_header 须位于 L1 契约之后、用户基座之前");
+        assert!(
+            contract_pos < header && header < base,
+            "user_prefs_header 须位于 L1 契约之后、用户基座之前"
+        );
     }
 
     #[test]
@@ -2332,7 +2366,10 @@ mod tests {
         );
         // English（023 已恢复 for instance，保留 for example）
         assert!(fmt.contains("for example"), "English 须含 for example");
-        assert!(fmt.contains("for instance"), "English 须含 for instance（023 恢复）");
+        assert!(
+            fmt.contains("for instance"),
+            "English 须含 for instance（023 恢复）"
+        );
         // 日本語
         assert!(fmt.contains("たとえば"), "日本語须含 たとえば");
         // 한국어
@@ -2470,7 +2507,9 @@ mod tests {
         );
         // LONG 侧：锚定「要求」侧——建列表（整串锚点防「do NOT make a list」子串假绿）
         assert!(
-            fmt.contains("LONG items (full clauses with a predicate or internal punctuation) → make a list"),
+            fmt.contains(
+                "LONG items (full clauses with a predicate or internal punctuation) → make a list"
+            ),
             "LONG 侧须给出完整小句判据并要求 make a list（整串锚点防假绿）"
         );
     }
@@ -4281,10 +4320,7 @@ mod tests {
         let rendered = render(&layers);
         let len = rendered.len();
         println!("prompt_arch_018_t4_length_budget: rendered.len() = {}", len);
-        assert!(
-            len > 500,
-            "正常 prompt 长度应远大于 500 字符"
-        );
+        assert!(len > 500, "正常 prompt 长度应远大于 500 字符");
         // 定位变更（DEC-039 修正，Gavin 2026-08-03 决策）：从「控制膨胀」改为「探测异常暴涨」。
         // Gavin 指示提示词「越充分越好」，上下文窗口远大于提示词长度，长度不再是主要矛盾
         // （且 018 分层已从结构上消除「后段软化前段」，长度不再影响优先级）。
@@ -4334,10 +4370,19 @@ mod tests {
         assert!(fmt.contains("some…some…"), "English 须含 some…some…");
         assert!(fmt.contains("one…another…"), "English 须含 one…another…");
         // 日本語结构性句式
-        assert!(fmt.contains("ある人は…ある人は…"), "日本語须含 ある人は…ある人は…");
-        assert!(fmt.contains("一つは…もう一つは…"), "日本語须含 一つは…もう一つは…");
+        assert!(
+            fmt.contains("ある人は…ある人は…"),
+            "日本語须含 ある人は…ある人は…"
+        );
+        assert!(
+            fmt.contains("一つは…もう一つは…"),
+            "日本語须含 一つは…もう一つは…"
+        );
         // 한국어结构性句式
-        assert!(fmt.contains("어떤 사람은…어떤 사람은…"), "한국어须含 어떤 사람은…어떤 사람은…");
+        assert!(
+            fmt.contains("어떤 사람은…어떤 사람은…"),
+            "한국어须含 어떤 사람은…어떤 사람은…"
+        );
         // 023 按 Gavin 指示恢复并扩充标记清单，for instance 已恢复，反向护栏删除
     }
 }

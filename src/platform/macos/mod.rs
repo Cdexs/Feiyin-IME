@@ -4,17 +4,18 @@
 //! - global hotkey listening via `CGEventTap + CFRunLoop`
 //! - text injection via `enigo`
 //! - clipboard helpers via `pbcopy` / `pbpaste`
+//! - status bar tray via `NSStatusItem` (MACOS-P4-TRAY-001)
 //!
 //! Still pending:
 //! - focused text snapshot / readback
 //! - auto-launch
-//! - controller/event-loop host
 //! - scene signal capture (MACOS-COMPAT-001-CORE stub only)
 
 pub mod accessibility;
 pub mod event_loop;
 mod hotkey;
 mod injection;
+mod tray;
 
 use anyhow::{anyhow, Result};
 use std::sync::{Arc, RwLock};
@@ -27,6 +28,10 @@ pub use hotkey::{HotkeyEvent, HotkeyListener};
 pub use injection::{
     capture_focused_text_snapshot, copy_text_to_clipboard, inject_text, read_text_from_hwnd,
     FocusedTextSnapshot,
+};
+pub use tray::{
+    build_tray, clear_tray_handle, poll_pending_tray_states, register_tray_handle,
+    request_tray_state, StatusBarTray, TrayCommand,
 };
 
 /// macOS auto-launch stubs (Phase 3)
@@ -102,7 +107,10 @@ mod macos_platform_contract_tests {
     #[test]
     fn foreground_window_id_returns_zero_in_first_version() {
         let id = foreground_window_id();
-        assert_eq!(id, 0, "MACOS-P4-NEUTRAL-001 第一版: foreground_window_id 应返回 0 表示无法判定焦点");
+        assert_eq!(
+            id, 0,
+            "MACOS-P4-NEUTRAL-001 第一版: foreground_window_id 应返回 0 表示无法判定焦点"
+        );
     }
 
     /// P1: capture_scene_signals_by_id 降级语义。

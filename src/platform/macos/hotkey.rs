@@ -475,7 +475,8 @@ mod keyboard_events_tests {
             assert!(
                 v < 64,
                 "CGEventType {:?} = {} 超出 CGEventMaskBit 的 1<<n 安全范围 (n < 64)",
-                e, v
+                e,
+                v
             );
         }
     }
@@ -485,7 +486,10 @@ mod keyboard_events_tests {
     fn keyboard_events_never_includes_tap_disabled_variants() {
         for e in KEYBOARD_EVENTS {
             assert!(
-                !matches!(e, CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput),
+                !matches!(
+                    e,
+                    CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+                ),
                 "KEYBOARD_EVENTS 包含带外事件 {:?}，会触发 MACOS-P4-PROBE-001 的 panic",
                 e
             );

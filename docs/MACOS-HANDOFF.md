@@ -422,11 +422,204 @@ Gavin 2026-08-04 拍板：**判定语言中明确提到的最小单位，输出�
 | --- | --- | --- |
 | 主控入口 | 非 Windows 分支仅 warn 返回 | **正在实现中**（`MACOS-P4-HOST-001`，NSApplication + CFRunLoop，未验收） |
 | 事件循环 | `run_message_loop()` 为 stub | 同上，`src/platform/macos/event_loop.rs` 已创建 |
+
+---
+
+#### 2.10-B · TEST-EXEC-MERGE-001 全量回归结论（2026-08-04，tester-1）
+
+**本批次结论一句话**：Windows 侧 68 提交合并（`cc12381`）叠加我方 `run_pipeline_core` 重构后，**macOS 侧全绿**，包括此前一直红的 `itn::tests::time_half`。
+
+##### ① 全量回归数字（`cargo test --no-fail-fast`）
+
+| 层级 | passed | failed | ignored |
+| --- | --- | --- | --- |
+| 主程序 bin | 816 | **0** | 6 |
+| crash-reporter bin | 28 | 0 | 2 |
+| 集成测试 ×5 | 36 | 0 | 0 |
+| **合计** | **880** | **0** | **8** |
+| `--list` 总数 | — | — | **888** |
+
+分项之和 = 880 + 8 = **888 = `--list` 实测值**，数字链自洽。07-31 基线为 701/1/8（`time_half` 失败），本次新增 **179 条**（主要来自 ITN v2 重构新增测试 + 解封 5 条 `select_preprocessing_params` 测试）+ `time_half` 修复。
+
+##### ② `itn::tests::time_half` 状态变更
+
+- **07-31 基线**: FAIL（`八点半` → `8点半`，`[ITN-PREFIX-SHADOW-001]`）
+- **本次**: PASS（`八点半` → `8:30`，ITN v2 `027-B/D/E` 系列重构已修复前缀遮蔽）
+- **归类**: (c) 既有遗留，**但已由上游修复，不再是失败**
+- **对 Windows 侧**: 该修复来自 `origin/main` 的 ITN v2 批次，macOS 侧共享同一份 `src/itn.rs`，自动继承
+
+##### ③ 测试盲区复算（22 → 17）
+
+| 来源 | 条数 | 门控方式 |
+| --- | --- | --- |
+| `platform/windows/hotkey.rs` | 15 | 模块级 cfg(windows) |
+| `platform/windows/scene.rs` | 2 | 同上 |
+| `main.rs pipeline_logic_tests` | **0**（原为 7，TEST-SYNC-P4-NEUTRAL-001 已解封） | — |
+| **合计** | **17** | — |
+
+`pipeline_logic_tests` 的 7 条已去除 `#[cfg(all(test, target_os = "windows"))]`，现 macOS 可见。
+
+##### ④ A4 热键实机复测（首次成功）
+
+`MACOS-P4-PROBE-001` 的 A4 项当时卡在 `CGEventMaskBit!` `1 << etype` overflow panic（debug 必崩），`MACOS-P4-FIXHOTKEY-001` 修复根因后，本次 **首次有条件真正验证** CGEventTap 全局按键捕获：
+
+- 辅助功能权限已授予（`ensure_accessibility_at_startup()` 无 "not granted" 警告）
+- 自动注入 F9 keydown/500ms/keyup → 收到 `Start` + `Stop`（hold > 300ms）
+- 自动注入短 tap → 收到 `Start` + `CancelStop`（hold < 300ms）
+- **无 panic**：`KEYBOARD_EVENTS [CGEventType; 3]`（剔除 `TapDisabledByTimeout`/`TapDisabledByUserInput`）已生效
+- 这是 DEC-017 实现自 2026-04 以来**首次实机验证成功**（此前因 panic 从未走到事件接收）
+
+##### ⑤ 对 Windows 侧的影响
+
+- **68 提交（itn.rs +4411 / llm/mod.rs +1683 / scene/mod.rs +464）全部通过**，零 (a) 跨平台缺陷、零 (b) 测试平台假设问题
+- 我方三批改动（FIXHOTKEY-001 / NEUTRAL-001 / TEST-SYNC-P4-NEUTRAL-001）全部验证通过
+- **不需要 Windows 侧做任何同步改动**
+
+##### ⑥ ⚠️ 瞬时编译中断说明
+
+`cargo test -- --list` 复跑时遭遇 coder-2 在途改动（`MACOS-P4-NEUTRAL-002`：`spawn_worker_thread` 去 cfg 过程中，`load_hotwords_for_accuracy`/`compute_hotwords_version` 仍为 cfg(windows)，导致 3 个编译错误）。**该中断为瞬时状态**，主控已裁定按此前干净运行（880/0/8）出报告，不归入回归结论。
 | 管线 | `mod macos_stubs` 占位，无实现 | **后段已可复用**（`run_pipeline_core`）；**前段接线未完成**（`spawn_worker_thread` 仍 `cfg(windows)`，待 `MACOS-P4-NEUTRAL-002`） |
 | Accessibility 弹窗 | stub，只打日志 | **仍是 stub，实机探针已确认属实**，待 `MACOS-P4-PERM-001` |
 | Overlay | 无对等实现 | **仍无**。已按 Gavin 拍板（DEC-045）定为**必须实现独立窗口，不得用托盘图标替代**，规格对齐你们的 240×36 / 320×140 + 水平居中底部上移 64px + 三态指示灯 |
 | 录音 / ASR 链路 | 未验证 | ✅ **实机已验证可用**：cpal 实录 RMS 0.108 非零；SenseVoice 转录正确（RTF 0.0458），无 dyld 错误 |
 | DEC-015（Tauri 作事件宿主） | §5.2 仍引用 | **已复议作废**，改用 objc2 + NSApplication + CFRunLoop 直驱（DEC-046）。理由：主程序至今不依赖 tauri，为借一个 run loop 拖进 WebView 不划算；且 DEC-045 要求真实 AppKit 窗口，objc2 无论如何都要引 |
+
+---
+
+#### 2.10-B · MACOS-P4-PERM-001 辅助功能授权弹窗真实现（2026-08-04，coder-1）
+
+**本批次结论一句话**：**纯 macOS 平台代码，对 Windows 零影响**——无需 Windows 侧任何同步改动。
+
+##### 改动了什么
+
+- 文件：`src/platform/macos/accessibility.rs`（仅此一个文件，`+42 -11`）
+- 内容：`ax_is_process_trusted_with_prompt` 原 stub（仅 log，从未调 API）补全为真实现——新增 FFI 声明 `AXIsProcessTrustedWithOptions` + `kAXTrustedCheckOptionPrompt`，用 `core_foundation`（CFString/CFBoolean/CFDictionary）构造 `{kAXTrustedCheckOptionPrompt: true}` 调用之触发系统授权弹窗。`ensure_accessibility_at_startup` 增强 `log::warn` 引导 + 不阻断启动。
+
+##### 行为前后对比
+
+| 状态 | 前（stub） | 后（真实现） |
+| --- | --- | --- |
+| 未授权时 | 仅一行日志，无弹窗，热键静默失效 | 系统弹窗「辅助功能」授权请求出现，用户可直达系统设置 |
+| 启动阻断 | 否 | 否（不变，与 Windows 对齐） |
+
+##### 对 Windows 侧的具体影响
+
+**零影响**。该文件仅调用 macOS 专属 framework（ApplicationServices + CoreFoundation），在 Windows 编译时被 `#[cfg(target_os="macos")]` 门控不参与编译。Windows 侧无 accessibility 概念、无对应文件、无调用点。
+
+##### 是否需要 Windows 侧同步改动
+
+**否**。平台契约面未变（未新增/修改 `platform/mod.rs` 导出符号，未改共享类型）。本任务不涉及任何共享代码。
+
+##### 验证
+
+`cargo check --all-targets` → 0 errors（macOS 侧）。未实机验证（本机已授权，无法安全复现未授权状态，如实降级——代码层完成）。
+
+---
+
+#### 2.10-C · MACOS-P4-NEUTRAL-002 打通语音输入闭环（2026-08-04，coder-1）
+
+**本批次结论一句话**：改了一处 Windows 既有调用点、删了一个 Windows 可见函数、改了两个共享类型定义——但 **Windows 行为零改动**，无需 Windows 侧任何同步改动。
+
+##### 改动了什么
+
+- 文件：`src/main.rs`（仅此一个）
+- Windows 既有调用点修改：main.rs:1929 `target_hwnd: SendHwnd(hwnd.0 as isize)` → `target_hwnd: hwnd.0 as usize`（语义等价：原本存 isize 再 :2440 转回 HWND，现在存 usize，转换在 `run_pipeline_core` 内部由既有契约处理）
+- Windows 可见函数删除：`run_pipeline` 薄封装（:2897-2929，零调用者，删除是行为中性，不产生新 dead_code）
+- 共享类型定义修改：`StartCmd`/`WorkerCommand` 去 `#[cfg(windows)]`（对 Windows 构建为 no-op）；`StartCmd.target_hwnd` 类型 `SendHwnd → platform::WindowId`
+- macOS 侧新增：`run_controller_macos` 重写 + `handle_hotkey_event`/`handle_pipeline_event` 辅助函数；`macos_stubs` 删重复定义（SendHwnd/StartCmd/WorkerCommand/spawn_worker_thread）
+- 第 7/8 接触点：`load_hotwords_for_accuracy`/`compute_hotwords_version` 去 cfg（对 Windows 为 no-op）
+
+##### 行为前后对比
+
+| 路径 | 前 | 后 |
+| --- | --- | --- |
+| Windows run_controller | SendHwnd(hwnd.0 as isize) → spawn_worker_thread → run_pipeline(HWND(...)) → run_pipeline_core | hwnd.0 as usize → spawn_worker_thread → run_pipeline_core(target_hwnd)（少一次 HWND 包装转换，语义等价） |
+| macOS run_controller_macos | 注释「worker thread remains cfg-windows only」，热键事件只 log 不接 | worker 线程起来，hotkey→worker→run_pipeline_core→注入闭环可达（代码层） |
+
+##### 对 Windows 侧的具体影响
+
+**行为零改动**。三处「修改」均为中性：
+- :1929 类型转换等价（isize↔usize 同宽度，转换位置变但结果不变）
+- `run_pipeline` 薄封装零调用者删除（`run_pipeline_core` 是原 body 逐字搬入，NEUTRAL-001 已自证）
+- 三类型 cfg 删除对 Windows 为可证明 no-op（cfg 恒为真，item 本就被无条件包含）
+
+##### 是否需要 Windows 侧同步改动
+
+**否**。平台契约面未变（`platform/mod.rs` 导出符号未新增/修改，`WindowId` 已由 NEUTRAL-001 定义）。
+
+##### 已知限制（macOS 侧）
+
+1. `foreground_window_id()` 返回 0 → `focus_lost` 恒 false（NEUTRAL-001 降级继承），本轮接受，不实现真实版本。
+2. 退出路径：原 ctrlc 处理器已被 coder-2 HOST-001 问题A修复移除（预存在删除，非本任务），SIGINT 不触发 `request_stop()`。建议补退出机制（属 HOST-001/OVERLAY-001 范畴）。
+
+##### 验证
+
+`cargo check --all-targets` → 0 errors。`cargo run --bin feiyin-ime` 启动成功（模型加载 + hotkey listener + CFRunLoop 宿主日志确认）。热键闭环未实机（osascript 模拟 F6 不经 CGEventTap 捕获层，需物理键）。spawn_worker_thread body 去空白 md5 自证逐字节保留（仅 :2439-2440 两接触点改动，0 mismatch）。
+
+---
+
+#### 2.10-D · MACOS-P4-EXIT-001 修复 macOS 无干净退出路径（2026-08-04，coder-1）
+
+**本批次结论一句话**：**纯 macOS 平台代码，对 Windows 零影响**——无需 Windows 侧任何同步改动。
+
+##### 改动了什么
+
+- 文件：`src/main.rs`（仅此一个）
+- 内容：补回 SIGINT/SIGTERM 信号处理（HOST-001 问题 A 移除 ctrlc 的补救）。B1 方案：不引 crate，用 `libc::signal`（`libc = "0.2"` 已在 macOS 段）。新增 `MACOS_SIGINT_RECEIVED` static + `macos_signal_handler` extern fn + `install_macos_signal_handler` fn，全部 `#[cfg(target_os="macos")]`。`run_controller_macos` 开头调用。
+- 语义：handler 只置 AtomicBool（async-signal-safe），轮询线程在普通上下文调 `platform::request_stop()`（CFRunLoop API 非 async-signal-safe，不在 handler 内调）。
+
+##### 行为前后对比
+
+| 状态 | 前（无信号处理） | 后（B1） |
+| --- | --- | --- |
+| SIGINT | 无反应，只能 `kill -9`，worker 不 join、资源不释放 | handler 置 flag → 轮询线程调 request_stop → CFRunLoopStop → run_controller_macos 收尾（worker Shutdown+join + hotkey shutdown+join）→ 进程退出 + flock 释放 |
+
+##### 对 Windows 侧的具体影响
+
+**零影响**。所有新增代码均在 `#[cfg(target_os = "macos")]` 内，Windows 编译时不参与。`libc::signal` / `SIGINT` / `SIGTERM` 仅 macOS 可见。未改 `Cargo.toml`（选 B1 零依赖）。
+
+##### 是否需要 Windows 侧同步改动
+
+**否**。平台契约面未变（未新增/修改 `platform/mod.rs` 导出符号，仅调用既有 `platform::request_stop()`）。
+
+##### 实机验证
+
+① `cargo run` → `kill -INT $PID` → 完整退出链：`SIGINT/SIGTERM received, requesting controller stop` → `macOS logic thread exiting` → `macOS controller loop exited cleanly` → 进程 EXITED，无残留。② 退出后立即再启动：正常运行（flock 已释放，无 "Application already running"）。
+
+---
+
+#### 2.10-E · MACOS-P4-OVERLAY-001 macOS 录音浮层 1:1 复刻 Windows（2026-08-05，coder-1）
+
+**本批次结论一句话**：**新增纯 macOS 新文件，对 Windows 零影响**——无需 Windows 侧任何同步改动。
+
+##### 改动了什么
+
+- 文件：`src/platform/macos/overlay.rs`（新增）+ `src/bin/probe_overlay.rs`（临时验证 bin）
+- 内容：macOS 录音浮层（Recording 状态 P0）。`NSPanel`（`NSBorderlessWindowMask | NSNonactivatingPanelMask`，≈ Windows `WS_POPUP|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE`）+ `setLevel(NSStatusWindowLevel)`（≈ TOPMOST）+ 透明背景（≈ LAYERED）。自定义 `OverlayView`（`declare_class!` 子类化 NSView，`isFlipped`→true 左上原点 + `drawRect:`）经 `NSGraphicsContext::graphicsPort()` → `CGContext` 用 core-graphics 绘制。60fps 由 16ms `CFRunLoopTimer` 驱动。
+- 视觉 1:1：240×36 / 圆角 10 / 底部上方 64px / `#0D0F11` 背景 + `#070606` 边框（COLORREF 0x060607=0x00BBGGRR→RGB #070606，返工修正 R/B）/ 18px 三态指示灯（红>橙>灰）/ 32 柱中心对称波形（3px 宽 2px 间隔，maxh 48 / static 12 / min 8，gain 2.5，衰减 0.02）/ 左右分隔条 + 停止按钮（对应 Windows `main.rs:1304-1344`）。
+- API：`RecordingOverlay::new(levels)` / `show()` / `hide()` / `is_visible()` / `stats()`（性能快照）/ `destroy()`，Drop 自动收尾。
+
+##### 行为前后对比
+
+| 状态 | 前（无 macOS overlay） | 后（OVERLAY-001） |
+| --- | --- | --- |
+| 录音浮层 | macOS 无浮层（main.rs macos_stubs 空实现） | 240×36 透明浮层显示主屏底部上方 64px，三态指示灯 + 60fps 波形动画，视觉与 Windows 一致 |
+
+##### 对 Windows 侧的具体影响
+
+**零影响**。新增文件为 `src/platform/macos/overlay.rs`（纯 macOS 代码，cfg 门控），未触碰 `src/main.rs`、`platform/mod.rs`、`windows/**`。Cargo.toml 的 overlay feature（`NSPanel`/`NSWindow`/`NSView`/`NSResponder`/`NSScreen`/`NSColor`/`NSGraphics`）由主控添加，本任务未改该文件。
+
+##### 是否需要 Windows 侧同步改动
+
+**否**。未新增/修改 `platform/mod.rs` 导出符号。接线（替换 main.rs macos_stubs 的 OverlayCommand/OverlayRequest/OverlayThreadHandle 为真实调用）留给后续任务。
+
+##### 实机验证（2026-08-05 返工后修订）
+
+`cargo run --bin probe_overlay 30`（音频模拟线程 16ms 推流 + 主线程 `NSRunLoop runUntilDate:`，与真实主线程一致）→ 30s 无 panic，真实渲染 **1876 帧 ≈ 62.5 fps**。**性能四项**：① avg 帧间隔 **16.00 ms**（max 18.03ms）② avg 单帧绘制 **0.022 ms**（max 0.083ms，要求 <5ms）③ 录音期间 CPU **1.3–1.5%** ④ 音频 push 间隔 avg 16.003ms/max 23.989ms **无丢帧**。`cargo check --all-targets` 0 errors；`cargo test --bin probe_overlay` 13 passed；`cargo fmt --check` clean。
+
+> **初版测量口径勘误**：初版报告的"59.1/59.0 fps"是 probe 自身 push 计数（当时 `sleep` 泵不出 CFRunLoopTimer，overlay 从未真正渲染）。本次 runUntilDate 实测为真实帧率。同时修复初版隐藏缺陷：`ACTIVE_OVERLAY` 存 `new()` 栈帧指针，move 后悬垂 → run loop 下 drawRect SIGBUS，重构为 `OverlayIvars` 直接持有 `Arc<AudioLevelBuf>` 消除裸指针。
+>
+> **⚠️ 指示灯形状待主控裁定**：Windows `main.rs:1099-1167` 实际是麦克风图标（pill 28×49 全圆角 + stem + base，4x 超采样缩 18px）非纯圆；规格表写"直径 18px"。当前实现为实心圆。基准以规格表为准还是 Windows 代码为准，待主控裁定。
 
 ---
 
