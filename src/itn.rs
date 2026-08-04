@@ -893,52 +893,21 @@ fn parse_cn_number(
         if big_unit_seen && !zero_since_big && !unit_since_big {
             // ITN-FIX-BIGNUM-027-A：隐式千位补全 —— 适用边界三条件：
             //   ① big_unit_seen：万/亿大单位已出现（否则无隐式千位语境）
-            //   ② !zero_since_big：大单位后该段内无零（「两万五」→五=五千 ✓；
-            //      「三万五千二百零一」零置 zero_since_big=true，走 else 分支）
+            //   ② !zero_since_big：大单位后该段内无零
             //   ③ !unit_since_big：大单位后未消费过任何进位单位（十/百/千）。
             //      完整进位链后的末尾单字是个位，不是省略的「几千」。
-            //      「一千零四十六万八千七百四十一」万后走完 千→百→十，末尾「一」
-            //      是个位，旧代码套 +1000 得 10469740（应为 10468741）。
             //
-            // ITN-FIX-BIGNUM-027-D (DEC-042, Gavin 2026-08-04 拍板)：
-            //   隐式补全的适用边界再加一条「末尾单字后无任何单位」—— 若后继有单位
-            //   （如「两万五元」「三万五块」），这是完整「数字+单位」表达，照常展开
-            //   （+1000 → 25000 → 25000元）。仅当末尾单字是**孤立的**（其后无单位，
-            //   如「三亿五」「两万五」），才保留锚定单位输出 "系数.digit大单位名"
-            //   （如 "3.5亿" / "2.5万"）。Gavin：「用户口述的锚是亿，系统应保留该
-            //   单位、用小数表达系数，而不是替他换一种记法」。
-            //
-            //   孤立判定：循环在 `_ => break` 处终止，idx 指向 break 字符。
-            //   若 idx >= chars.len()（无后继）或 chars[idx..] 不以 any all_units
-            //   开头 → 孤立 → DEC-042 保留锚定单位。否则（后继是单位）→ 非孤立 →
-            //   维持 +1000 展开（保护下游 .parse() 消费方：parse_cn_number 契约
-            //   「返回纯数字」不变，仅在孤立时返回带单位串）。
-            //
-            //   调用点安全：UnitChain / format_currency_chain / format_unit_chain
-            //   对 num_str 执行 .parse::<f64>()。它们只在「数字后跟单位」时才消费
-            //   num_str —— 而孤立情况下后继无单位，UnitChain 不会命中（after_num
-            //   无单位 → break → parts 空 → 返回 None → 走主循环 push_str，不 parse）。
-            //   主循环 :1939 push_str 是字符串拼接，不 parse → 安全。
-            let after_digit_is_unit = idx < chars.len() && rules.is_some_and(|r| {
-                let rest: String = chars[idx..].iter().collect();
-                r.is_unit(&rest)
-            });
-            if !after_digit_is_unit {
-                // 孤立单字 → DEC-042 保留锚定单位
-                if let Some((unit_char, coeff)) = big_unit_anchor {
-                    // 系数 = 大单位结算前的 result 值（已记录在 anchor）
-                    // 输出 "{coeff}.{digit}{unit_char}"
-                    // 例：三亿五 → coeff=3, digit=5, unit=亿 → "3.5亿"
-                    //     两万五 → coeff=2, digit=5, unit=万 → "2.5万"
-                    return Some((format!("{}.{}{}", coeff, digit, unit_char), idx - start));
-                }
-                // big_unit_anchor 为 None（理论不可达，big_unit_seen=true 时必已记录）
-                // 兜底：维持 +1000
-                section += digit * 1000;
-            } else {
-                // 非孤立（后继有单位）→ 维持 +1000 展开，parse_cn_number 返回纯数字
-                section += digit * 1000;
-            }
+            // ITN-FIX-BIGNUM-027-E (DEC-042 补完)：隐式补全的乘数取决于锚定单位：
+            //   - 万级（如「两万五」）→ 末尾五=五千 = digit*1e3
+            //   - 亿级（如「三亿五」）→ 末尾五=五千万 = digit*1e7
+            //   （DEC-042 规则4：比最小单位更小的成分用小数位表示。亿的最小成分是
+            //    千万=0.1亿，万的最小成分是千=0.1万）
+            //   非孤立（后继有 all_units 单位）→ 维持纯数字（保护下游 .parse()）
+            let multiplier = match big_unit_anchor {
+                Some(('亿', _)) => 10_000_000u64,
+                _ => 1_000u64,
+            };
+            section += digit * multiplier;
         } else {
             section += digit;
         }
@@ -946,6 +915,37 @@ fn parse_cn_number(
     }
 
     result += section;
+
+    // ITN-FIX-BIGNUM-027-E (DEC-042 补完, Gavin 2026-08-04)：
+    //   数量级锚定最小单位 —— 当语言中明确提到的最小单位落在万/亿时，保留锚定
+    //   单位后缀输出（如「三亿」→「3亿」、「三千万」→「3000万」），不展开为纯
+    //   阿拉伯数字。量级分界在万：最小单位落万/亿 → 带后缀；落千/百/十/个 → 普通数字。
+    //   升亿阈值：万层数值 ≥1 亿 且 升亿后小数位 ≤1 → 升到亿；否则保持万层。
+    //
+    //   适用边界（与 027-D 孤立判定合并）：
+    //   ① big_unit_seen：万/亿大单位已结算
+    //   ② !unit_since_big：大单位后未消费进位单位（千/百/十）→ 最小单位是万/亿
+    //      （若消费了进位单位，最小单位是千/百/十/个 → 普通数字，不走 DEC-042）
+    //   ③ 孤立：末尾无 all_units 度量衡单位（后继有单位 → 非孤立 → 维持纯数字，
+    //      保护下游 .parse() 消费方：UnitChain format_currency_chain/format_unit_chain
+    //      对 num_str .parse()，仅孤立时返回带单位串，而孤立时 UnitChain 不可达）
+    //
+    //   large_amount_keep_wan_yi 的 break 在结算前 → big_unit_seen=false → 不走
+    //   DEC-042（「三万元」「一亿吨」保持汉字，large_amount_keep_wan_yi 保守行为不变）
+    //
+    //   DEC-043：只动数量级层。format_currency_chain / format_weight_chain 一行不碰。
+    if big_unit_seen && !unit_since_big {
+        let is_isolated = idx >= chars.len() || !rules.is_some_and(|r| {
+            let rest: String = chars[idx..].iter().collect();
+            r.is_unit(&rest)
+        });
+        if is_isolated {
+            if let Some((unit_char, _coeff)) = big_unit_anchor {
+                let formatted = format_dec042_magnitude(result, unit_char);
+                return Some((formatted, idx - start));
+            }
+        }
+    }
 
     // 检查是否解析到了有效数字
     if result == 0 {
@@ -960,6 +960,63 @@ fn parse_cn_number(
     }
 
     Some((result.to_string(), idx - start))
+}
+
+/// ITN-FIX-BIGNUM-027-E (DEC-042 补完)：数量级锚定格式化。
+///
+/// 将纯数值按 DEC-042 规则格式化为带万/亿后缀的字符串：
+/// - 锚定单位是亿 → 输出 "{整数}.{小数}亿"（去尾零，无小数则 "{整数}亿"）
+/// - 锚定单位是万 → 先算万层表达，再判升亿：
+///   - 万层 ≥1 亿 且 升亿后小数位 ≤1 → 升到亿（如 350000000 → "3.5亿"）
+///   - 否则保持万层（如 30000000 → "3000万"）
+///
+/// DEC-042 四条规则：
+/// 1. 判定语言中明确提到的最小单位（由调用方通过 unit_char 传入，即最后一个结算的大单位）
+/// 2. 量级分界在万：万/亿 → 带后缀；千/百/十/个 → 普通数字（后者不走本函数）
+/// 3. 升亿阈值：万层 ≥1 亿 且 升亿后小数位 ≤1 → 升亿
+/// 4. 比最小单位更小的成分用小数位表示
+fn format_dec042_magnitude(result: u64, unit_char: char) -> String {
+    const YI: u64 = 100_000_000;
+    const WAN: u64 = 10_000;
+
+    if unit_char == '亿' {
+        // 本就在亿层，直接格式化
+        let yi_int = result / YI;
+        let yi_rem = result % YI;
+        if yi_rem == 0 {
+            return format!("{}亿", yi_int);
+        }
+        // 小数部分：补齐 8 位去尾零
+        let dec_str = format!("{:08}", yi_rem);
+        let trimmed = dec_str.trim_end_matches('0');
+        format!("{}.{}亿", yi_int, trimmed)
+    } else {
+        // 万层，判升亿
+        if result >= YI {
+            // 升亿判定：小数位 ≤1
+            let yi_int = result / YI;
+            let yi_rem = result % YI;
+            if yi_rem == 0 {
+                return format!("{}亿", yi_int);
+            }
+            let dec_str = format!("{:08}", yi_rem);
+            let trimmed = dec_str.trim_end_matches('0');
+            // 小数位 = trimmed 长度
+            if trimmed.len() <= 1 {
+                return format!("{}.{}亿", yi_int, trimmed);
+            }
+            // 小数位 >1 → 不升亿，保持万层
+        }
+        // 万层表达
+        let wan_int = result / WAN;
+        let wan_rem = result % WAN;
+        if wan_rem == 0 {
+            return format!("{}万", wan_int);
+        }
+        let dec_str = format!("{:04}", wan_rem);
+        let trimmed = dec_str.trim_end_matches('0');
+        format!("{}.{}万", wan_int, trimmed)
+    }
 }
 
 /// 解析"零下X"或"负X"前缀
@@ -4027,7 +4084,7 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
 
     #[test]
     fn itn_v2_027_a_wan_end_no_remainder() {
-        assert_eq!(normalize_test("一千零四十六万"), "10460000");
+        assert_eq!(normalize_test("一千零四十六万"), "1046万"); // DEC-042 变更
     }
 
     #[test]
@@ -4041,37 +4098,37 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     #[test]
     fn itn_v2_027_b_wan_only_no_regression() {
         // 两千三百四十五万：result=0，(0+2345)*1e4 == 0+2345*1e4，原本就对，不得回归
-        assert_eq!(normalize_test("两千三百四十五万"), "23450000");
+        assert_eq!(normalize_test("两千三百四十五万"), "2345万"); // DEC-042 变更
     }
 
     #[test]
     fn itn_v2_027_b_yi_branch_unchanged() {
         // 一万亿：万分支 += 1*1e4=1e4，亿分支 (1e4+0)*1e8 = 1e12 ✓（亿分支不得改坏）
-        assert_eq!(normalize_test("一万亿"), "1000000000000");
+        assert_eq!(normalize_test("一万亿"), "10000亿"); // DEC-042 变更
     }
 
     #[test]
     fn itn_v2_027_b_shi_yi() {
-        assert_eq!(normalize_test("十亿"), "1000000000");
+        assert_eq!(normalize_test("十亿"), "10亿"); // DEC-042 变更
     }
 
     #[test]
     fn itn_v2_027_b_yi_alone() {
-        assert_eq!(normalize_test("一亿"), "100000000");
+        assert_eq!(normalize_test("一亿"), "1亿"); // DEC-042 变更
     }
 
     // 027-B · 公式修复后可达的亿+万嵌套用例（亿后无「两」单位阻断）
     #[test]
     fn itn_v2_027_b_yi_wan_no_liang() {
         // 一千二百三十四亿五千万：亿后是「五」非「两」，亿正常结算，万分支修复后 += 5e3*1e4
-        assert_eq!(normalize_test("一千二百三十四亿五千万"), "123450000000");
+        assert_eq!(normalize_test("一千二百三十四亿五千万"), "1234.5亿"); // DEC-042 变更
     }
 
     #[test]
     fn itn_v2_027_b_yi_wan_with_zero() {
         // 三亿零五万：亿后「零」非单位，亿正常结算 3e8，零置 zero_since_big=true，
         // 五万 section=5，万分支修复后 result += 5*1e4 = 300050000
-        assert_eq!(normalize_test("三亿零五万"), "300050000");
+        assert_eq!(normalize_test("三亿零五万"), "30005万"); // DEC-042 变更
     }
 
     // 027-B 隔离验证（rules=None，禁用 large_amount_keep_wan_yi，纯粹验证万级公式）
@@ -4080,14 +4137,14 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     #[test]
     fn itn_v2_027_b_formula_no_rules() {
         let cases: &[(&str, &str)] = &[
-            ("一亿两千三百四十五万六千七百八十九", "123456789"),
-            ("一亿两千三百四十五万", "123450000"),
-            ("两千三百四十五万", "23450000"),
-            ("一万亿", "1000000000000"),
-            ("一千二百三十四亿五千万", "123450000000"),
-            ("三亿零五万", "300050000"),
-            ("十亿", "1000000000"),
-            ("一亿", "100000000"),
+            ("一亿两千三百四十五万六千七百八十九", "123456789"), // 不变
+            ("一亿两千三百四十五万", "12345万"), // DEC-042 变更
+            ("两千三百四十五万", "2345万"), // DEC-042 变更
+            ("一万亿", "10000亿"), // DEC-042 变更
+            ("一千二百三十四亿五千万", "1234.5亿"), // DEC-042 变更
+            ("三亿零五万", "30005万"), // DEC-042 变更
+            ("十亿", "10亿"), // DEC-042 变更
+            ("一亿", "1亿"), // DEC-042 变更
         ];
         for (input, expected) in cases {
             let chars: Vec<char> = input.chars().collect();
@@ -4127,20 +4184,20 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
 
     #[test]
     fn itn_v2_027c_yi_wan_no_tail() {
-        assert_eq!(normalize_test("一亿两千三百四十五万"), "123450000");
+        assert_eq!(normalize_test("一亿两千三百四十五万"), "12345万"); // DEC-042 变更
     }
 
     #[test]
     fn itn_v2_027c_yi_liang_qian_wan() {
         // 一亿两千万：亿后「两」数字 + 「千」进位 → 不break 亿结算 → 万结算
-        assert_eq!(normalize_test("一亿两千万"), "120000000");
+        assert_eq!(normalize_test("一亿两千万"), "1.2亿"); // DEC-042 变更
     }
 
     #[test]
     fn itn_v2_027c_liang_yi_san_qian_wan() {
         // 两亿三千万：「两」在首位（idx==start），two_is_unit 首位返回false → 两是数字2
         // 亿后「三」数字 + 「千」进位 → 不break。不受 027-C 改动影响（首位路径不同）
-        assert_eq!(normalize_test("两亿三千万"), "230000000");
+        assert_eq!(normalize_test("两亿三千万"), "2.3亿"); // DEC-042 变更
     }
 
     // 027-C-2 第二阻断点：two_is_unit 实现没检查进位单位，只查 all_units
@@ -4209,10 +4266,10 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     fn itn_v2_027c_ab_no_regression() {
         assert_eq!(normalize_test("一千零四十六万八千七百四十一"), "10468741");
         assert_eq!(normalize_test("两万五"), "2.5万"); // DEC-042 变更
-        assert_eq!(normalize_test("一万亿"), "1000000000000");
-        assert_eq!(normalize_test("一千二百三十四亿五千万"), "123450000000");
-        assert_eq!(normalize_test("三亿零五万"), "300050000");
-        assert_eq!(normalize_test("两千三百四十五万"), "23450000");
+        assert_eq!(normalize_test("一万亿"), "10000亿"); // DEC-042 变更
+        assert_eq!(normalize_test("一千二百三十四亿五千万"), "1234.5亿"); // DEC-042 变更
+        assert_eq!(normalize_test("三亿零五万"), "30005万"); // DEC-042 变更
+        assert_eq!(normalize_test("两千三百四十五万"), "2345万"); // DEC-042 变更
     }
 
     // 第六节#4 丙型 UnitChain result 丢弃实测结论（只测不改）
@@ -4254,34 +4311,120 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     #[test]
     fn itn_v2_027d_full_expression_expand() {
         assert_eq!(normalize_test("两万五千"), "25000");       // 千=进位单位 → unit_since_big=true → 不进隐式分支
-        assert_eq!(normalize_test("三亿五千万"), "350000000"); // 千万=进位单位
+        assert_eq!(normalize_test("三亿五千万"), "3.5亿"); // DEC-042 变更
         assert_eq!(normalize_test("一亿两千三百四十五万六千七百八十九"), "123456789");
         assert_eq!(normalize_test("一千零四十六万八千七百四十一"), "10468741");
         assert_eq!(normalize_test("三万五千二百四十一"), "35241");
-        assert_eq!(normalize_test("一千二百三十四亿五千万"), "123450000000");
+        assert_eq!(normalize_test("一千二百三十四亿五千万"), "1234.5亿"); // DEC-042 变更
     }
 
     // 4.3 零/无补全路径（不得受影响）
     #[test]
     fn itn_v2_027d_zero_no_fill_paths() {
         assert_eq!(normalize_test("三万五千二百零一"), "35201"); // 有零 → zero_since_big=true
-        assert_eq!(normalize_test("三亿零五万"), "300050000");    // 零 → else 分支
-        assert_eq!(normalize_test("一万亿"), "1000000000000");
-        assert_eq!(normalize_test("两千三百四十五万"), "23450000"); // 无末尾挂起
-        assert_eq!(normalize_test("十亿"), "1000000000");
-        assert_eq!(normalize_test("一亿"), "100000000");
+        assert_eq!(normalize_test("三亿零五万"), "30005万"); // DEC-042 变更
+        assert_eq!(normalize_test("一万亿"), "10000亿"); // DEC-042 变更
+        assert_eq!(normalize_test("两千三百四十五万"), "2345万"); // DEC-042 变更
+        assert_eq!(normalize_test("十亿"), "10亿"); // DEC-042 变更
+        assert_eq!(normalize_test("一亿"), "1亿"); // DEC-042 变更
     }
 
     // 调用点安全：隐式补全后跟单位时不保留锚定（保护下游 .parse() 消费方）
     #[test]
     fn itn_v2_027d_call_site_safety_unit_after_digit() {
-        // 这些用例末尾单字后有单位 → 非孤立 → 维持 +1000 展开 → parse_cn_number 返回纯数字
-        // 下游 format_currency_chain/format_unit_chain 的 .parse::<f64>() 不崩
         assert_eq!(normalize_test("三万五块"), "35000块");
         assert_eq!(normalize_test("三万五块钱"), "35000块钱");
         assert_eq!(normalize_test("两万五元"), "25000元");
         assert_eq!(normalize_test("两万五斤"), "25000斤");
-        assert_eq!(normalize_test("三亿五吨"), "300005000吨");
+        assert_eq!(normalize_test("三亿五吨"), "350000000吨"); // DEC-042 亿级隐式补全×1e7
         assert_eq!(normalize_test("五万三角"), "53000角");
+    }
+
+    // ============================================================
+    // ITN-FIX-BIGNUM-027-E (DEC-042 补完) · 数量级锚定最小单位全面落地
+    // ============================================================
+
+    // 3.1 单一量级（从亿到个）
+    #[test]
+    fn itn_v2_027e_single_magnitude() {
+        assert_eq!(normalize_test("三亿"), "3亿");
+        assert_eq!(normalize_test("三千万"), "3000万");
+        assert_eq!(normalize_test("三百万"), "300万");
+        assert_eq!(normalize_test("三十万"), "30万");
+        assert_eq!(normalize_test("三万"), "3万");
+        assert_eq!(normalize_test("三千"), "3000");
+        assert_eq!(normalize_test("三百"), "300");
+        assert_eq!(normalize_test("三十"), "30");
+        // 「三」单字无单位 → 单字保护保持汉字（DEC-042 不适用，无量级单位）
+    }
+
+    // 3.2 混合量级 + 升亿判定
+    #[test]
+    fn itn_v2_027e_mixed_magnitude_promote_yi() {
+        assert_eq!(normalize_test("三亿五千万"), "3.5亿");           // 升亿 1 位小数
+        assert_eq!(normalize_test("一千二百三十四亿五千万"), "1234.5亿"); // 升亿 1 位
+    }
+
+    #[test]
+    fn itn_v2_027e_mixed_magnitude_keep_wan() {
+        assert_eq!(normalize_test("一亿两千三百四十五万"), "12345万"); // 4 位小数 → 不升
+        assert_eq!(normalize_test("一亿零三万"), "10003万");           // 4 位 → 不升
+        assert_eq!(normalize_test("三千五百万"), "3500万");            // 不足 1 亿
+        assert_eq!(normalize_test("三十五万"), "35万");               // 不足 1 亿
+    }
+
+    #[test]
+    fn itn_v2_027e_mixed_implicit_anchor() {
+        assert_eq!(normalize_test("三亿五"), "3.5亿"); // 027-D 已实现，亿级隐式补全×1e7
+        assert_eq!(normalize_test("两万五"), "2.5万"); // 027-D 已实现，万级隐式补全×1e3
+    }
+
+    // 3.3 最小单位落千及以下（不带后缀，不得受影响）
+    #[test]
+    fn itn_v2_027e_below_wan_no_suffix() {
+        assert_eq!(normalize_test("两万五千"), "25000");    // 千=进位单位 → unit_since_big=true
+        assert_eq!(normalize_test("三万五千"), "35000");
+        assert_eq!(normalize_test("三千五百"), "3500");
+        assert_eq!(normalize_test("一千零四十六万八千七百四十一"), "10468741");
+        assert_eq!(normalize_test("一亿两千三百四十五万六千七百八十九"), "123456789");
+        assert_eq!(normalize_test("三万五千二百四十一"), "35241");
+        assert_eq!(normalize_test("三万五千二百零一"), "35201");
+    }
+
+    // 第四节变更断言验证（DEC-042 设计变更非回归）
+    #[test]
+    fn itn_v2_027e_section4_changes() {
+        assert_eq!(normalize_test("一亿"), "1亿");               // 旧 100000000
+        assert_eq!(normalize_test("十亿"), "10亿");              // 旧 1000000000
+        assert_eq!(normalize_test("两千三百四十五万"), "2345万"); // 旧 23450000
+        assert_eq!(normalize_test("一千二百三十四亿五千万"), "1234.5亿"); // 旧 123450000000
+        assert_eq!(normalize_test("三亿五千万"), "3.5亿");       // 旧 350000000
+        assert_eq!(normalize_test("三亿零五万"), "30005万");     // 旧 300050000
+        assert_eq!(normalize_test("一万亿"), "10000亿");         // 旧 1000000000000
+    }
+
+    // 第八节 4 组零回归
+    #[test]
+    fn itn_v2_027e_zero_regression_017_weight() {
+        assert_eq!(normalize_test("一斤二两"), "1斤2两");
+        assert_eq!(normalize_test("二两半"), "2.5两");
+    }
+
+    #[test]
+    fn itn_v2_027e_zero_regression_026_currency() {
+        assert_eq!(normalize_test("五块一斤"), "5块一斤");
+        assert_eq!(normalize_test("五块一"), "5.1元");
+        assert_eq!(normalize_test("一块两毛二"), "1.22元");
+    }
+
+    #[test]
+    fn itn_v2_027e_zero_regression_016_grade_class() {
+        assert_eq!(normalize_test("一三班"), "一三班");
+    }
+
+    #[test]
+    fn itn_v2_027e_zero_regression_dec038_protect() {
+        assert_eq!(normalize_test("五毛钱"), "五毛钱");
+        assert_eq!(normalize_test("三毛钱"), "3毛钱");
     }
 }

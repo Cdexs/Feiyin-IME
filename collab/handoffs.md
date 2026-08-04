@@ -1,3 +1,11 @@
+## 2026-08-04 — coder-1 — ITN-FIX-BIGNUM-027-E (DEC-042 补完) 数量级锚定最小单位全面落地
+
+- **来源**：Gavin 否定027-D二分，DEC-042补完全面适用。基线 f489e5b
+- **改动**：新增format_dec042_magnitude+隐式分支乘数修正(亿×1e7/万×1e3)+孤立判定统一；12条旧断言更新；10条新测试。is_unit/format_currency_chain/format_weight_chain本体零改动
+- **验证**：基线 itn:: 186/0/0 → 196/0/0（+10新增，12条预期内绿转红，174条预期外全绿）；cargo check + --tests 双0；UTF-8 OK；调用点安全6条全过；第八节4组零回归8条全绿
+- **边界**：仅 src/itn.rs；DEC-043合规(三套逻辑并存不统一)；未构建/出包；未改版本号；UTF-8用edit工具
+- **详情**：result.md（10353 B 非空）+ logs/20260804.md
+
 ## 2026-08-04 — coder-1 — ITN-FIX-BIGNUM-027-D (DEC-042) 隐式补全保留锚定单位（行为变更）
 
 - **来源**：Gavin DEC-042 拍板。基线 967cd8d（027-C 已提交）
