@@ -646,12 +646,19 @@ coder-1 在 DATA-SCENE-GENERIC-008 中评估后建议的候选：**`思维导图
 | B | TEST-SYNC-P4-NEUTRAL-001 | 契约单测 + macOS 可达性烟测 | tester-1 | ⏸ |
 | C | MACOS-P4-HOST-001 | macOS 事件宿主 + 主循环 + 单实例锁 | coder-2 | ⏸ **选型待拍板** |
 | C | MACOS-P4-TRAY-001 | macOS 托盘（**不可与 HOST 并行**） | coder-1 | ⏸ |
-| C | **MACOS-P4-OVERLAY-001** | **四个浮层独立窗口（录音 P0 / 处理中 / 失焦返显 / 错误），NSPanel 对齐 Win32 规格** —— **DEC-045，Gavin 2026-08-04 拍板，已从阶段 E 提到阶段 C** | 待定 | ⏸ |
+| C | **MACOS-P4-OVERLAY-001** | 录音浮层（Recording，P0）NSPanel 1:1 复刻 Win32 | coder-1 | ✅ **已验收**（2026-08-05，返工后主控独立取证：BORDER_GRAY `#070606` 已修正、性能四项已补数、SIGBUS 悬垂指针真缺陷已重构、probe 已删、工作区干净，提交 `d7b9f39`） |
+| C | **MACOS-P4-OVERLAY-WIRE-001** | **浮层接线**：接进模块树 + 跨线程请求通道 + 15ms timer 主线程应用 + PipelineEvent 七分支映射 | coder-1 | ✅ **接线部分已验收**（主控独立取证：`mod overlay;` 已加、overlay 5 条单测**首次真进测试二进制**（主控自跑 `--list` 确认）、Windows 导出块零改动、七分支齐全）。⚠️ **实机闭环仍降级**，转入 CFGGATE-001 C 项 |
+| **P0** | **MACOS-P4-CFGGATE-001** | 🔴 **修 macOS 专用函数缺 cfg 门控致 Windows 编译必炸**：`main.rs:2880/:2930` 无 `#[cfg]` 却引用 `request_tray_state`（TRAY-001 既有）+ `request_overlay`/`OverlayRequest`（WIRE-001 新增 7 处）。**Windows 侧已编不过一天多无人察觉**。含 11 个 macOS 专属符号全量扫描 + 实机重试 | coder-1 | ✅ **已验收**（主控**自写脚本独立重扫**，非采信 Worker 表：11 符号全部落 cfg(macos) item 内、未门控引用点 **0**；`cargo check --all-targets` CARGO_EXIT=0 / error 0；diff 恰好 +2 行；**主控追加全仓扫描**确认 macos 目录与 main.rs 之外零引用。🟢 **Windows 编译阻塞解除**） |
+| C | TEST-SYNC-P4-OVERLAY-WIRE-001 | 阶段三**预研**（只读零改动，产出写 outbox）：5 条单测走查 + 七分支真值表 + 线程契约 + 盲区预估 | tester-1 | 🔄 **进行中**（与 WIRE-001 并行安全，因零文件落地） |
+| C | MACOS-P4-OVERLAY-002 | 处理中 / 失焦返显 / 错误三态浮层 + **指示灯形状裁定**（Windows 实为麦克风图标，现实现为实心圆，主控裁定本轮不动） | 待定 | ⏸ |
 | ~~C~~ | ~~MACOS-P4-FEEDBACK-001~~ | ~~托盘状态替代浮层~~ → **已按 DEC-036 取消替代定位**（Gavin：不能用托盘图标代替录音窗口，不符合用户体验） | — | ❌ 作废 |
 | D | MACOS-P4-SCENE-001 | `capture_scene_signals` 真实现（NSWorkspace + AXUIElement） | coder-1 | ⏸ |
 | D | MACOS-P4-PERM-001 | `AXIsProcessTrustedWithOptions` 真实现（现为只打 log 的假实现） | coder-2 | ⏸ |
 | D | MACOS-P4-AUTOLAUNCH-001 | 自启动（建议 SMAppService） | 待定 | ⏸ |
-| **P1** | **MACOS-P4-AXINJECT-001** | **辅助功能 API 直写替代剪贴板注入**（解决剪贴板被污染/图片被覆盖）—— **Gavin 2026-08-05 拍板独立 P1，不与 READBACK 捆绑**，详见下方专节 | 待定 | ⏸ |
+| **P1** | **MACOS-P4-AXINJECT-001** | **辅助功能 API 直写替代剪贴板注入**（解决剪贴板被污染/图片被永久覆盖）—— Gavin 2026-08-05 拍板独立 P1；**同日 12:1x 派发 coder-2**。三条主控裁定：①必须 `kAXSelectedTextAttribute`，**严禁** `kAXValueAttribute`（会抹掉用户已输入内容）②必须 `AXUIElementSetMessagingTimeout(0.5)`（否则无响应 App 会挂死 pipeline worker 线程）③必须检查 `AXError` 返回码 | coder-2 | ✅ **已验收**（三条裁定逐条 Read 核对全部落实；CARGO_EXIT=0/error 0；仅 `injection.rs` +122/−1）。🔴 **但主控 review 查出静默丢词风险** → 见下行 002 |
+| **P1** | **MACOS-P4-AXINJECT-002** | 🔴 **堵 AX 静默丢词**：部分实现 AX 的 App（Electron/Java Swing）接受 `SetAttributeValue` 并返回成功却不真插入 → `inject_text` 拿 Ok 即 return、**永不走剪贴板兜底** → 用户整段话消失。**推翻了 001 立项前提「最坏等同现状」**。修法：`AXUIElementIsAttributeSettable` 预检 + AX 成功日志带 `AXRole`。已否定两条歧路（写后读回：选区塌缩读回空串不可作判据；role 白名单：误伤自定义控件） | coder-2 | 🔄 **进行中** |
+| C | **MACOS-P4-OVERLAY-WIRE-002** | 抽纯函数 `overlay_request_for_event` 使七分支真值表可单测（**强制穷举 match，禁 `_ =>` 通配符**——通配符会让将来新增 PipelineEvent 变体静默落进 Hide）。由来：tester-1 预研指出映射内联在 handler 里夹三种副作用、单测调不动 | coder-1 | 🔄 **进行中** |
+| C | TEST-SYNC-P4-OVERLAY-WIRE-001 预研 | ✅ **已交付**（13683 B）。**核心发现（主控复核认同）：overlay 现有 5 条单测 4 条凑数 1 条半有效** —— `decay_rate_matches_windows` 是 `assert_eq!(常量, 它自己的字面量)`；三条波形测试独立重算公式不调生产路径，且 `lx<rx`／`8<=16` 恒真。**本次接线目前零真护栏** | tester-1 | ✅ 预研完成，阶段三待 WIRE-002 交付 |
 | D | MACOS-P4-READBACK-001 | AX 回读（学习路径）—— ⚠️ **主控已收回「相对 Windows 的能力优势」表述**：300ms 观察窗 + Word/Google Docs 读不到 + 全文 diff 昂贵，三重打折后产出存疑；建议优先考虑 `WORDBOOK-CORRECTION-UI-001` 显式纠错路线 | 待定 | ⏸ **降级** |
 | ~~E~~ | ~~MACOS-P4-OVERLAY-001~~ | 已上移至阶段 C（DEC-045） | — | ↑ |
 | E | MACOS-P4-BUNDLE-001 | `.app` 打包 + Info.plist TCC 声明 + 签名/公证 | 待定 | ⏸ |

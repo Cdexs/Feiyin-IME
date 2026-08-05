@@ -2708,8 +2708,9 @@ fn run_controller_macos(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
     // - 不用 run_message_loop_with_hotkey_listener（其 timer callback 只 log，不处理业务）；
     //   改用 run_message_loop() 做纯 CFRunLoop 宿主（CONTROLLER_CTX 为 null 时 timer 空转），
     //   hotkey 事件由本函数 spawn 的逻辑线程独立轮询——无竞争，因不共享 rx。
-    // - overlay/录音浮层归 MACOS-P4-OVERLAY-001，本轮 PipelineEvent 仅打日志；
-    //   但 FocusLost 必须把文本复制到剪贴板（platform::copy_text_to_clipboard），
+    // - overlay/录音浮层：OVERLAY-WIRE-001 已接入 handle_pipeline_event
+    //   （request_overlay → 主线程 15ms timer 应用 Show/Hide）；
+    //   FocusLost 必须把文本复制到剪贴板（platform::copy_text_to_clipboard），
     //   否则用户整段转写会静默丢失。
     // - foreground_window_id() 在 macOS 当前返回 0（NEUTRAL-001 第一版降级），
     //   → focus_lost 恒 false（总是直接注入、不走失焦预览）。本轮接受此降级。
@@ -2742,6 +2743,17 @@ fn run_controller_macos(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
     let _config_watcher = spawn_config_watcher(Arc::clone(&runtime_config));
 
     platform::create_controller_window()?;
+
+    // OVERLAY-WIRE-001: 把共享 audio_buf 交给浮层模块（方案②，主线程一次性存入）。
+    // 必须是同一个 Arc——音频线程（:2733 spawn_worker_thread）正在往里写，浮层读它画波形。
+    // OVERLAY-002-A: 一并注入停止/取消信号，供浮层停止按钮（mouseDown）触发取消录音。
+    // OVERLAY-003: 注入 ui_language，供 Preview 浮层按钮/标题按语言取 i18n 文案。
+    platform::init_overlay_levels(
+        Arc::clone(&audio_buf),
+        Arc::clone(&stop_recording_signal),
+        Arc::clone(&cancel_signal),
+        clone_runtime_config(&runtime_config).ui_language,
+    );
 
     // MACOS-P4-TRAY-001: status bar tray (NSStatusItem) + menu.
     // 必须在 create_controller_window（NSApplication finishLaunching）之后建——
@@ -2857,6 +2869,10 @@ fn run_controller_macos(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
     }
     drop(tray);
 
+    // OVERLAY-WIRE-001: 显式销毁浮层（主线程，run_message_loop 已退出）。
+    // thread_local 进程退出时会 drop，但显式调用保证退出链清晰、日志可辨。
+    platform::shutdown_overlay();
+
     if let Err(e) = &result {
         log::error!("macOS controller loop exited with error: {}", e);
     } else {
@@ -2868,6 +2884,7 @@ fn run_controller_macos(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
 
 /// MACOS-P4-NEUTRAL-002: macOS 侧 hotkey 事件处理。
 /// 镜像 Windows process_controller_events 对 HotkeyEvent::Start/Stop/CancelStop 的处理逻辑。
+#[cfg(target_os = "macos")]
 fn handle_hotkey_event(
     event: platform::HotkeyEvent,
     worker_tx: &crossbeam_channel::Sender<WorkerCommand>,
@@ -2913,10 +2930,53 @@ fn handle_hotkey_event(
     }
 }
 
+/// OVERLAY-WIRE-002: PipelineEvent → 录音浮层指令的纯映射（无副作用，供单测锁死真值表）。
+/// OVERLAY-002: 三态浮层映射 —— RecordingStarted → Show；Processing → ShowProcessing(文案)；
+/// Error / FormatFailed → ShowError{文案, auto_close_ms}（Error 2000ms / FormatFailed 2500ms）；
+/// 其余 → Hide。
+/// OVERLAY-003: FocusLost(text) → ShowPreview(text)（失焦返显浮层，不自动关闭）。
+/// 🔴 穷举 match 禁止 `_ => Hide` 通配符：将来 PipelineEvent 新增变体时编译器强制作者做决定，
+/// 而非静默落进 Hide（本批次一路踩过来的同一类病：局部规则不声明适用边界）。
+#[cfg(target_os = "macos")]
+fn overlay_request_for_event(event: &PipelineEvent) -> platform::OverlayRequest {
+    match event {
+        PipelineEvent::RecordingStarted => platform::OverlayRequest::Show,
+        PipelineEvent::Processing(message) => {
+            platform::OverlayRequest::ShowProcessing(message.clone())
+        }
+        PipelineEvent::Error(message) => platform::OverlayRequest::ShowError {
+            message: message.clone(),
+            auto_close_ms: 2000,
+        },
+        PipelineEvent::FormatFailed => platform::OverlayRequest::ShowError {
+            message: String::new(), // 文案由 handle_pipeline_event 按 ui_language 补齐
+            auto_close_ms: 2500,
+        },
+        PipelineEvent::FocusLost(text) => platform::OverlayRequest::ShowPreview(text.clone()),
+        PipelineEvent::Done | PipelineEvent::Cancelled => platform::OverlayRequest::Hide,
+    }
+}
+
 /// MACOS-P4-NEUTRAL-002: macOS 侧 PipelineEvent 消费。
-/// 本轮仅打日志（overlay 归 OVERLAY-001）；FocusLost 必须复制剪贴板防丢词。
 /// TRAY-001: 同步更新托盘状态（经 request_tray_state → 主线程 timer 应用）。
+/// OVERLAY-WIRE-001/002: 同步驱动录音浮层（经 request_overlay → 主线程 timer 应用）。
+/// OVERLAY-002 三态：RecordingStarted → Show；Processing → ShowProcessing；
+/// Error/FormatFailed → ShowError（Error 2000ms / FormatFailed 2500ms 自动关闭）。
+/// OVERLAY-003：FocusLost → ShowPreview（失焦返显浮层，不自动关闭）；Done/Cancelled → Hide。
+/// overlay 指令由纯函数 `overlay_request_for_event` 统一计算（可单测锁死真值表）；
+/// 仅 FormatFailed 的文案在调用侧按 ui_language 补齐。
+#[cfg(target_os = "macos")]
 fn handle_pipeline_event(event: &PipelineEvent, ui_language: config::UiLanguage) {
+    // OVERLAY-002: FormatFailed 的展示文案依赖 ui_language，纯函数拿不到，这里补齐后发请求。
+    // 其余事件直接用纯函数的映射结果（overlay_request_for_event 是唯一决策源）。
+    let req = match event {
+        PipelineEvent::FormatFailed => platform::OverlayRequest::ShowError {
+            message: i18n::get(ui_language).format_failed_hint.to_string(),
+            auto_close_ms: 2500,
+        },
+        _ => overlay_request_for_event(event),
+    };
+    platform::request_overlay(req);
     match event {
         PipelineEvent::RecordingStarted => {
             log::info!("macOS pipeline: RecordingStarted");
@@ -2935,8 +2995,10 @@ fn handle_pipeline_event(event: &PipelineEvent, ui_language: config::UiLanguage)
             platform::request_tray_state(TrayState::Idle, ui_language);
         }
         PipelineEvent::FocusLost(text) => {
+            // OVERLAY-003: FocusLost 现在真实可达（SCENE-002 让 foreground_window_id 返回真值）。
+            // 预览浮层已展示文本；剪贴板兜底保留 —— 用户没点复制就关掉浮层时的最后防丢词保险。
             log::warn!(
-                "macOS pipeline: FocusLost (focus_lost 恒 false 降级，理论上不应触发；复制到剪贴板防丢词): {}",
+                "macOS pipeline: FocusLost (复制到剪贴板兜底 + 预览浮层展示): {}",
                 text
             );
             platform::request_tray_state(TrayState::Idle, ui_language);
@@ -4820,5 +4882,74 @@ mod focus_lost_logic_tests {
     fn focus_lost_different_nonzero() {
         // target=123, current=456 → true（焦点确实丢失）
         assert!(focus_lost(123, 456));
+    }
+}
+
+/// OVERLAY-WIRE-002：PipelineEvent → overlay 指令七分支真值表（macOS）。
+/// 调用真实 overlay_request_for_event 与真实 PipelineEvent 各变体，逐分支断言。
+/// OVERLAY-002/003 契约（已对照生产 overlay_request_for_event 核验）：
+///   RecordingStarted → Show；Processing(msg) → ShowProcessing(msg)（载荷透传）；
+///   FocusLost(text) → ShowPreview(text)（OVERLAY-003 Preview 态已实现，原「无对应浮层故 Hide」已过时）；
+///   Error(msg) → ShowError{msg, auto_close_ms:2000}；FormatFailed → ShowError{空文案, auto_close_ms:2500}；
+///   Done/Cancelled → Hide。禁加 _ => 兜底，保证每新增事件都必须显式归边。
+#[cfg(target_os = "macos")]
+#[cfg(test)]
+mod overlay_wire_tests {
+    use super::*;
+    use crate::platform::OverlayRequest;
+
+    /// 七个分支逐条断言（穷举覆盖，一个不落），带载荷变体连载荷一并断言，
+    /// 防「传错文本」类缺陷（只断变体不断载荷会漏掉）。
+    #[test]
+    fn overlay_request_for_event_truth_table() {
+        assert_eq!(
+            overlay_request_for_event(&PipelineEvent::RecordingStarted),
+            OverlayRequest::Show,
+            "RecordingStarted 必须映射为 Show"
+        );
+
+        let processing_msg = "处理中".to_string();
+        assert_eq!(
+            overlay_request_for_event(&PipelineEvent::Processing(processing_msg.clone())),
+            OverlayRequest::ShowProcessing(processing_msg),
+            "Processing 必须映射为 ShowProcessing 且载荷原文透传"
+        );
+
+        let preview_text = "失焦返显文本".to_string();
+        assert_eq!(
+            overlay_request_for_event(&PipelineEvent::FocusLost(preview_text.clone())),
+            OverlayRequest::ShowPreview(preview_text),
+            "FocusLost 必须映射为 ShowPreview 且 text 必须等于事件原文（OVERLAY-003 Preview 态已实现）"
+        );
+
+        let error_msg = "录音出错".to_string();
+        assert_eq!(
+            overlay_request_for_event(&PipelineEvent::Error(error_msg.clone())),
+            OverlayRequest::ShowError {
+                message: error_msg,
+                auto_close_ms: 2000,
+            },
+            "Error 必须映射为 ShowError{{message, auto_close_ms:2000}} 且载荷原文透传"
+        );
+
+        assert_eq!(
+            overlay_request_for_event(&PipelineEvent::FormatFailed),
+            OverlayRequest::ShowError {
+                message: String::new(), // 纯函数内空文案，由 handle_pipeline_event 按 ui_language 补齐
+                auto_close_ms: 2500,
+            },
+            "FormatFailed 必须映射为 ShowError{{空文案, auto_close_ms:2500}}"
+        );
+
+        assert_eq!(
+            overlay_request_for_event(&PipelineEvent::Done),
+            OverlayRequest::Hide,
+            "Done 必须映射为 Hide"
+        );
+        assert_eq!(
+            overlay_request_for_event(&PipelineEvent::Cancelled),
+            OverlayRequest::Hide,
+            "Cancelled 必须映射为 Hide"
+        );
     }
 }

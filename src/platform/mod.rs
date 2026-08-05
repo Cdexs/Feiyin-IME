@@ -92,6 +92,11 @@ pub use macos::{
     request_tray_state,
 };
 
+// OVERLAY-WIRE-001: macOS recording overlay (NSPanel + CGContext) 跨线程请求通道。
+// 仿 tray 模式单独导出；poll_pending_overlay 走 event_loop 内部路径不导出。
+#[cfg(target_os = "macos")]
+pub use macos::{init_overlay_levels, request_overlay, shutdown_overlay, OverlayRequest};
+
 use std::sync::{Arc, RwLock};
 
 use crate::config::AppConfig;

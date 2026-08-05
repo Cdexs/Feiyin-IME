@@ -326,3 +326,71 @@
 - **边界**：未碰 windows/**、main.rs（macos_stubs 保留）、macos/mod.rs、macos/tray.rs、Cargo.toml、版本号、Publish、ui/、src-tauri/
 - **下游**：OVERLAY-002 需实现 Processing/FocusLost/Error 三态；后续接线 main.rs 时 macos_stubs 的 OverlayCommand/OverlayRequest/OverlayThreadHandle 应替换为真实 RecordingOverlay 调用
 - **详情**：`collab/outbox/coder-1/result.md`（非空）+ logs/20260804.md + CHANGELOG.md + docs/MACOS-HANDOFF.md §2.10-E
+
+## 2026-08-05 — coder-1 — MACOS-P4-OVERLAY-WIRE-001 ✅ 录音浮层接线（Phase 4「完整体验」最后一块）
+
+- **来源**：主控派发，基线 HEAD `d7b9f39`（工作区干净）。把 OVERLAY-001 交付的孤儿 overlay.rs 接进 run_controller_macos 的 PipelineEvent 消费路径
+- **方案协商**：提 1 点异议（§3.A.3 vs §5 矛盾，platform/mod.rs 导出）。主控裁定补丁 R1 允许，仿 TRAY-001 模式加独立 macOS cfg 块，三条硬约束（不碰 Windows 块/不进共享清单/poll 不导出）。其余全同意
+- **改动 5 文件**：macos/mod.rs（mod overlay + 导出）/ macos/overlay.rs（OverlayRequest + PENDING_REQUEST + OVERLAY_LEVELS + thread_local OVERLAY + init/request/poll/shutdown 四函数 + 摘 hide/is_visible 的 allow）/ macos/event_loop.rs（timer callback 加 poll）/ platform/mod.rs（macOS cfg 块导出，Windows 块零触碰）/ main.rs（init_overlay_levels + handle_pipeline_event 七分支 request_overlay + shutdown_overlay + 订正注释）
+- **关键设计**：线程模型照搬 tray（任意线程 request→Mutex / 主线程 15ms timer poll 消费）；生命周期 B（Show→new 含 16ms timer / Hide→destroy invalidate）；thread_local 规避不 Send/Sync；levels Arc::clone 保留供多次 Show 复用
+- **验证**：cargo check --all-targets 0 errors（如实列 dead code warning 为 OVERLAY-002 保留）；cargo test 821/0/6（platform::macos::overlay 5 条单测首次真实运行，--list grep overlay=14）；cargo fmt clean；git diff windows 空；platform/mod.rs 自证仅 macOS cfg 块
+- **实机降级**：CT2 dylib 缺失致 dyld 加载失败（docs/MACOS-HANDOFF §3.1/§五已记，非本任务引入），未用 osascript 模拟（任务书禁止）。静态走查确认路径完整可达
+- **边界**：仅 5 文件；Windows/Cargo.toml/版本号/Publish/ui/src-tauri 零触碰；未 build --release/出包/npm；未用 git 破坏命令；未建临时 probe；UTF-8 无 BOM
+- **下游**：实机闭环需 CT2 dylib 部署（tester-1 出包时）或 Gavin 物理热键端测；OVERLAY-002 接入后 dead code warning 自然消除；macos_stubs 的旧 Overlay 占位本轮未删（归 OVERLAY-002 或清理单）
+- **详情**：result.md + logs/20260805.md + CHANGELOG.md
+
+## 2026-08-05 — coder-1 — MACOS-P4-CFGGATE-001 ✅ 修 macOS 专用函数缺 cfg 门控致 Windows 编译必炸（P0）
+
+- **来源**：主控取证，WIRE-001 验收通过后查出。基线 WIRE-001 工作区未提交
+- **缺陷**：src/main.rs handle_hotkey_event(:2880)/handle_pipeline_event(:2930) 无 cfg 门控，后者引用 request_tray_state(7处,TRAY-001既有)/request_overlay(7处,WIRE-001新增)/OverlayRequest(7处) Windows 侧均不存在必 E0425。WIRE-001 把违规点1变8
+- **改动**：1 文件 2 行，两函数各加 #[cfg(target_os="macos")]。安全性：唯一调用点在 cfg(macos) run_controller_macos 内
+- **B 项扫描**：11 macOS专属符号逐个判定，唯一漏网=handle_pipeline_event 已修；反向扫描无交叉
+- **验证**：cargo check 0 err / cargo test --no-fail-fast 821/0/6 / fmt clean / git diff windows 空
+- **C 项实机**：主控纠正 CT2 dylib 确在 target/release，DYLD_LIBRARY_PATH 指向后 debug 二进制启动链完整 RUNNING 零 panic、kill -INT 干净退出。浮层 Show/Hide 降级（无法物理按键），需 Gavin 亲按 F6
+- **边界**：仅 src/main.rs 2 行；未 build --release/出包/npm；未用 git 破坏命令；UTF-8 无 BOM
+- **详情**：result.md + logs/20260805.md + CHANGELOG.md
+
+## 2026-08-05 — coder-1 — MACOS-P4-OVERLAY-WIRE-002 ✅ 抽出七分支纯函数使真值表可测
+
+- **来源**：tester-1 预研建议，主控采纳。基线 CFGGATE-001 后工作区
+- **改动 2 文件**：main.rs 新增 overlay_request_for_event 纯函数（穷举 match 无通配符）+ handle_pipeline_event 改 match 前统一调一次；overlay.rs OverlayRequest derive 加 PartialEq/Eq
+- **验证**：cargo check 0err / cargo test --no-fail-fast 821/0/6(与基线逐数一致) / fmt clean / git diff windows 空 / 行为等价自证七分支一致
+- **边界**：仅 main.rs + overlay.rs derive；未碰 injection.rs(coder-2 AXINJECT 域)；未写测试(tester-1 阶段三)；未出包/改版本号/npm；UTF-8 无 BOM
+- **下游**：tester-1 可对 overlay_request_for_event 落 7 条成对真断言锁死接线核心逻辑
+- **详情**：result.md + logs/20260805.md + CHANGELOG.md
+
+## 2026-08-05 — coder-1 — MACOS-P4-OVERLAY-WIRE-003 ✅ 修 poll_pending_overlay 注释声称 try-lock 但实现是阻塞 lock
+
+- **来源**：主控取证，注释-实现不符。基线 WIRE-002 后工作区
+- **方案**：A（改实现对齐注释）。timer 回调结构上不可能阻塞 > 实测通常不阻塞
+- **改动**：1 文件 1 行 + 注释。overlay.rs PENDING_REQUEST.lock()→try_lock()；OVERLAY_LEVELS.lock() 保持阻塞加注释说明
+- **验证**：cargo check 0err / cargo test --no-fail-fast 821/0/6(与基线一致) / fmt clean / 本轮仅动 overlay.rs(injection.rs 是 coder-2 并行)
+- **边界**：仅 overlay.rs；未碰 injection.rs/main.rs/Cargo.toml/windows；未写测试；未出包/改版本号/npm；UTF-8 无 BOM
+- **下游**：overlay.rs 已腾出，tester-1 阶段三可开始
+- **详情**：result.md + logs/20260805.md + CHANGELOG.md
+
+## 2026-08-05 — coder-1 — MACOS-P4-SCENE-001 ✅ 场景感知真实现（stub → real）+ foreground_window_id 真实现
+
+- **来源**：任务书 MACOS-P4-SCENE-001 + 主控补丁 R1（D 项）。基线 WIRE-003 后工作区
+- **改动 3 文件**：新建 `src/platform/macos/scene.rs`（AX+proc_pidpath+NSWorkspace msg_send）；`mod.rs` 接线 + stub 改委托 + `foreground_window_id()` 真实现；`scene-rules.toml` 每个 exe 数组纯追加 macOS 可执行名
+- **关键决策**：NSWorkspace feature 未启用（禁改 Cargo.toml）且任务书 D-1 方法名有误 → 用 objc2 `msg_send` 动态调 `sharedWorkspace.frontmostApplication.processIdentifier`，失败降级 AX；AX 常量是 `#define CFSTR` 宏非导出符号 → 改 `CFString::new` 字面量；D-2 用 pid 定位消除「切窗口取错场景」局限
+- **实测证据**：临时探针 7 个 App 真实 (exe,title)（Safari/Code/Microsoft Word/Claude/Terminal/Microsoft Edge/Xcode），classify 14 用例全命中；探针跑完已删
+- **验证**：cargo check 0 err / cargo test **827/2/6** / fmt clean / toml 9 scenes 合法 / git diff windows 空
+- **🔴 2 failed 绊线（D-3 预期）**：`foreground_window_id_returns_zero_in_first_version`（left=824≠0）+ `capture_scene_signals_by_id_returns_none_for_zero_id`（不再恒 None）。未改测试，归 tester-1
+- **🔴 行为变更（D-4 报 Gavin）**：focus_lost 从恒 false 变真实生效，录音途中切窗口→文本改走 FocusLost 分支
+- **边界**：仅 3 允许文件；未碰 main.rs/overlay.rs/injection.rs/Cargo.toml/windows/platform/mod.rs；未出包/改版本号/npm；UTF-8 无 BOM
+- **下游（TOML-STALE-001）**：scene-rules.toml 三副本（根/target/release/Publish）出包必须同步，归 tester-1
+- **详情**：outbox/coder-1/result.md + logs/20260805.md + CHANGELOG.md
+
+## 2026-08-05 — coder-1 — MACOS-P4-SCENE-002 ✅ 焦点身份 pid → CGWindowID（窗口级）
+
+- **来源**：Gavin 指令（「力度必须要提到窗口级」）。基线 SCENE-001 交付后
+- **改动 1 文件**：仅 `src/platform/macos/scene.rs`。`foreground_window_id()` 返 CGWindowID（frontmost pid + CGWindowList + layer==0 过滤）；`capture_scene_signals(id)` id 语义 pid→CGWindowID（`window_id_to_owner_pid` 反查，找不到降级实时查 frontmost）
+- **关键决策**：用 core-graphics 0.25 `copy_window_info` 现有 API；不读 `kCGWindowName`（屏幕录制权限，红线）；`dict?` 陷阱修复（continue 非提前返回）；mod.rs 无需改（一行委托已存在）
+- **实测证据**：Terminal 同 pid 双窗口（2230/690）AXRaise 切换 → foreground_window_id 正确变化（**窗口级决定性证据**）；56 窗含 12 个非 0 layer 被排除；B 项时序 id=690 切前台后仍取原窗口 exe/title；不存在 id 降级
+- **验证**：cargo check 0 err（scene）/ cargo test **836/1/6** / fmt clean / 本轮仅 scene.rs
+- **🔴 1 failed 非本任务引入**：`overlay_wire_tests`（coder-2 在途，Processing→ShowProcessing 语义）。中途 `foreground_window_id_contract` 红（tester-1 存活 pid 断言因 SCENE-002 pid→CGWindowID 暂过期），终态已通过（tester-1 换锚完成）
+- **🔴 行为变更（报 Gavin）**：同应用多窗口切窗口 `focus_lost` 现在能正确判出（此前 pid 相同判不出）
+- **边界**：仅 scene.rs；未碰 mod.rs/main.rs/overlay.rs/injection.rs/Cargo.toml/windows；未读 kCGWindowName/未用私有 API/未写测试；探针已删；UTF-8 无 BOM
+- **下游**：foreground_window_id_contract 换锚已确认通过；主控协调 coder-2 overlay 并行冲突（overlay_wire_tests 仍红）
+- **详情**：outbox/coder-1/result.md + logs/20260805.md + CHANGELOG.md

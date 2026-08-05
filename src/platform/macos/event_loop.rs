@@ -194,6 +194,10 @@ extern "C" fn controller_timer_callback(_timer: CFRunLoopTimerRef, _info: *mut c
     // TRAY-001: apply pending tray state updates (requested from any thread).
     crate::platform::macos::tray::poll_pending_tray_states();
 
+    // OVERLAY-WIRE-001: apply pending overlay requests (requested from any thread).
+    // try-lock 形态，绝不阻塞 timer 回调（仿 tray 轮询）。
+    crate::platform::macos::overlay::poll_pending_overlay();
+
     let ctx_ptr = CONTROLLER_CTX.load(Ordering::Acquire);
     if ctx_ptr.is_null() {
         return;
