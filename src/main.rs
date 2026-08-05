@@ -2760,17 +2760,18 @@ fn run_controller_macos(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
     // NSStatusBar 要求 app 已启动。菜单命令（OpenSettings/Exit）经 channel 送逻辑
     // 线程处理；tray 状态更新经 request_tray_state → 主线程 15ms timer 轮询应用。
     let (tray_cmd_tx, tray_cmd_rx) = crossbeam_channel::unbounded::<platform::TrayCommand>();
-    let tray = match platform::build_tray(
+    // TRAY-FIX-001: 不再把 `&tray` 存进裸指针静态量（tray 随后被 move，指针悬垂 →
+    // 15ms timer 解引用野指针 SIGABRT）。改用 thread_local 持有所有权：
+    // set_tray 将 tray 交给 tray.rs 的 thread_local，主线程 timer 轮询直接取用。
+    match platform::build_tray(
         clone_runtime_config(&runtime_config).ui_language,
         tray_cmd_tx,
     ) {
         Ok(tray) => {
-            platform::register_tray_handle(&tray);
-            Some(tray)
+            platform::set_tray(tray);
         }
         Err(e) => {
             log::error!("Failed to build macOS tray: {}", e);
-            None
         }
     };
 
@@ -2863,11 +2864,9 @@ fn run_controller_macos(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
     let _ = worker_join.join();
     // 逻辑线程在 worker_tx drop 后会因 send 失败或 rx disconnected 退出
     let _ = logic_handle.join();
-    // TRAY-001: 清理 tray 句柄 + drop 移除状态栏图标
-    if let Some(tray) = tray.as_ref() {
-        platform::clear_tray_handle(tray);
-    }
-    drop(tray);
+    // TRAY-FIX-001: 显式销毁 tray（thread_local 取走并 drop，移除状态栏图标）。
+    // 与 shutdown_overlay 同构：thread_local 进程退出时会 drop，显式调用保证退出链清晰。
+    platform::shutdown_tray();
 
     // OVERLAY-WIRE-001: 显式销毁浮层（主线程，run_message_loop 已退出）。
     // thread_local 进程退出时会 drop，但显式调用保证退出链清晰、日志可辨。

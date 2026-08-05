@@ -85,11 +85,10 @@ pub use macos::{
     request_stop, run_message_loop, run_message_loop_with_hotkey_listener, FocusedTextSnapshot,
     HotkeyEvent, HotkeyListener, TrayCommand,
 };
-// TRAY-001: macOS status bar tray (NSStatusItem) — 单独导出，避免在顶行列表混淆。
+// TRAY-FIX-001: macOS status bar tray (NSStatusItem) — 单独导出，避免在顶行列表混淆。
 #[cfg(target_os = "macos")]
 pub use macos::{
-    build_tray, clear_tray_handle, poll_pending_tray_states, register_tray_handle,
-    request_tray_state,
+    build_tray, poll_pending_tray_states, request_tray_state, set_tray, shutdown_tray,
 };
 
 // OVERLAY-WIRE-001: macOS recording overlay (NSPanel + CGContext) 跨线程请求通道。

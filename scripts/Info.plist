@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh_CN</string>
+	<key>CFBundleDisplayName</key>
+	<string>飞音智能语音输入</string>
+	<key>CFBundleExecutable</key>
+	<string>feiyin-ime</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.feiyin.voice-ime</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>feiyin-ime</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.7.3</string>
+	<key>CFBundleVersion</key>
+	<string>0.7.3</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAccessibilityUsageDescription</key>
+	<string>飞音智能语音输入需要辅助功能权限以监听全局快捷键并将识别文本直接输入到当前应用。</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>飞音智能语音输入需要使用 AppleEvents 注入识别文本。</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSInputMonitoringUsageDescription</key>
+	<string>飞音智能语音输入需要输入监控权限以监听全局快捷键。</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>飞音智能语音输入需要使用麦克风采集语音以进行语音识别。</string>
+</dict>
+</plist>

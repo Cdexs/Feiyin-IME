@@ -394,3 +394,28 @@
 - **边界**：仅 scene.rs；未碰 mod.rs/main.rs/overlay.rs/injection.rs/Cargo.toml/windows；未读 kCGWindowName/未用私有 API/未写测试；探针已删；UTF-8 无 BOM
 - **下游**：foreground_window_id_contract 换锚已确认通过；主控协调 coder-2 overlay 并行冲突（overlay_wire_tests 仍红）
 - **详情**：outbox/coder-1/result.md + logs/20260805.md + CHANGELOG.md
+
+## 2026-08-05 — coder-2 — MACOS-P4-BUNDLE-001 ✅ .app 打包 + Info.plist + 自签名（本地调试，不做公证）
+
+- **来源**：主控 16:09 派发（16:10 ACK，本 session replace 后完成）。
+- **改动 2 文件**：新建 `scripts/Info.plist`（CFBundleIdentifier=com.feiyin.voice-ime / LSUIElement=true / TCC 四条声明：麦克风·辅助功能·输入监控·AppleEvents）+ 重写 `scripts/build-macos.sh`。
+- **关键设计**：
+  - 新增 Tauri UI release 构建（`--features custom-protocol`，防空白页）+ cp 到 target/release（补原脚本缺口）
+  - Step4 打包 `dist/飞音智能语音输入.app`：三二进制 + 7 dylib + itn/scene-rules + models + icon.icns
+  - **dylib 解析关键**：主程序无 LC_RPATH → `install_name_tool -add_rpath @loader_path`；codesign 必须在 install_name_tool 之后
+  - models 两模式：默认 symlink 指向仓库（本地省 1.8G，宽松验证）；`--copy-models` 复制进 bundle（严格验证，可分发）
+  - 版本号从 Cargo.toml 单一来源，PlistBuddy 副本上同步
+- **验证**：bash -n / plutil -lint / /tmp 实测 dylib 加载 + ad-hoc 签名 + verify 全 PASS（详见 result.md）
+- **边界**：未碰 Rust 源码 / src-tauri / ui / Cargo.toml / 版本号 / Publish；未 build --release（归 tester-1）；未用 git 破坏命令；UTF-8 无 BOM
+- **下游**：tester-1 可 `bash scripts/build-macos.sh` 全链出包；⚠️ ad-hoc 重签后 TCC 授权需重新授权（§4-4）
+- **详情**：`/Users/gavinsun/Workspace/CodeLab/collab/outbox/coder-2/result.md`（非空）
+
+## 2026-08-05 — coder-2 — MACOS-P4-BUNDLE-002 ✅ 签名改自签名证书（ad-hoc → Feiyin Dev）
+
+- **来源**：主控返工任务书（BUNDLE-001 其余已验收）。Gavin 拍板禁止 ad-hoc（cdhash 变 → TCC 授权失效）。
+- **改动 1 文件**：`scripts/build-macos.sh`。① `CODESIGN_IDENTITY` 可配置（默认 Feiyin Dev）② 证书检查去 `-v`（GUI 自签名证书 NOT_TRUSTED，`-v` 会误判不存在）③ 去 `--deep` 改先内后外 + `--timestamp=none` ④ 无证书明确报错禁止退化 ad-hoc ⑤ 文件头注释同步。
+- **额外修复**：`.toml` 数据文件原放 MacOS/ → codesign 外层签名报 "code object is not signed at all"；改放 Resources/ + MacOS/ 内相对 symlink（itn/scene-rules），签名 exit 0 + strict verify 过 + 运行时 exe_dir 可读。
+- **密码框问题**：GUI 创建证书后私钥 ACL 不含 codesign → 弹框。解法 `security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k <登录密码> login.keychain-db`，之后全链免密。
+- **实机验证**：用户跑 `bash scripts/build-macos.sh` Build completed；`dist/飞音智能语音输入.app` Authority=**Feiyin Dev**（非 adhoc）✅ Identifier=com.feiyin.voice-ime ✅ verify OK ✅ 二次重签 TCC 稳定 ✅。
+- **边界**：只改 build-macos.sh；未碰 Info.plist/src/**/Cargo.toml/版本号/Publish；未用 git 破坏命令；UTF-8 无 BOM。
+- **详情**：`/Users/gavinsun/Workspace/CodeLab/collab/outbox/coder-2/result.md`（非空）

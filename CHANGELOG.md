@@ -572,3 +572,5 @@ HOTKEY-LATENCY-FIX-001 | 热键录音视觉延迟 + 偶发首字丢失修复：�
 
 - TEST-SYNC-P4-OVERLAY-WIRE-001 | 阶段三只读预研：overlay 接线测试设计（线程契约/请求通道/真值表/非阻塞/Windows零回归）+ 现有5条单测走查判定凑数 | tester-1 | 2026-08-05
 | MACOS-P4-OVERLAY-WIRE-003 | 修 poll_pending_overlay 注释声称 try-lock 但实现是阻塞 lock：src/platform/macos/overlay.rs PENDING_REQUEST.lock()→try_lock()（对齐注释，timer 回调结构上不可能阻塞；漏一拍15ms后补取无感知）；OVERLAY_LEVELS.lock() 保持阻塞但加注释如实说明（只在建浮层时走到/微秒级临界区/无竞争/timer不阻塞由PENDING_REQUEST try_lock守住）。选方案A(改实现对齐注释)。验证：cargo check 0err/cargo test --no-fail-fast 821/0/6(与基线一致)/fmt clean/本轮仅动overlay.rs。注释-实现不符是本项目第三次踩的同类病 | coder-1 | 2026-08-05 |
+| MACOS-P4-BUNDLE-001 | .app 打包 + Info.plist + ad-hoc 自签名（本地调试，不做公证）：新建 scripts/Info.plist（TCC 声明 ×4 + LSUIElement）+ 重写 scripts/build-macos.sh（Tauri UI custom-protocol 构建 + dylib @loader_path 注入 + 两模式 models + 签名验证） | coder-2 | 2026-08-05 |
+| MACOS-P4-BUNDLE-002 | 签名从 ad-hoc 改自签名证书 Feiyin Dev（禁止 ad-hoc）：build-macos.sh 加 CODESIGN_IDENTITY + 证书检查去 -v + 去 --deep 先内后外 + toml 数据文件改 Resources+相对symlink | coder-2 | 2026-08-05 |

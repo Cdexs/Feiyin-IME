@@ -31,8 +31,8 @@ pub use injection::{
     FocusedTextSnapshot,
 };
 pub use tray::{
-    build_tray, clear_tray_handle, poll_pending_tray_states, register_tray_handle,
-    request_tray_state, StatusBarTray, TrayCommand,
+    build_tray, poll_pending_tray_states, request_tray_state, set_tray, shutdown_tray,
+    StatusBarTray, TrayCommand,
 };
 
 // OVERLAY-WIRE-001: recording overlay (NSPanel + CGContext) — 跨线程请求通道。

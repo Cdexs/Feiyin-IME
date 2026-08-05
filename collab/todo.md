@@ -661,7 +661,7 @@ coder-1 在 DATA-SCENE-GENERIC-008 中评估后建议的候选：**`思维导图
 | C | TEST-SYNC-P4-OVERLAY-WIRE-001 预研 | ✅ **已交付**（13683 B）。**核心发现（主控复核认同）：overlay 现有 5 条单测 4 条凑数 1 条半有效** —— `decay_rate_matches_windows` 是 `assert_eq!(常量, 它自己的字面量)`；三条波形测试独立重算公式不调生产路径，且 `lx<rx`／`8<=16` 恒真。**本次接线目前零真护栏** | tester-1 | ✅ 预研完成，阶段三待 WIRE-002 交付 |
 | D | MACOS-P4-READBACK-001 | AX 回读（学习路径）—— ⚠️ **主控已收回「相对 Windows 的能力优势」表述**：300ms 观察窗 + Word/Google Docs 读不到 + 全文 diff 昂贵，三重打折后产出存疑；建议优先考虑 `WORDBOOK-CORRECTION-UI-001` 显式纠错路线 | 待定 | ⏸ **降级** |
 | ~~E~~ | ~~MACOS-P4-OVERLAY-001~~ | 已上移至阶段 C（DEC-045） | — | ↑ |
-| E | MACOS-P4-BUNDLE-001 | `.app` 打包 + Info.plist TCC 声明 + 签名/公证 | 待定 | ⏸ |
+| E | MACOS-P4-BUNDLE-001/002 | `.app` 打包 + Info.plist TCC 声明 + 自签名证书（BUNDLE-002 已改自签名，禁 ad-hoc） | coder-2 | ✅ **已完成**（BUNDLE-002 2026-08-05：`build-macos.sh` 自签名 Feiyin Dev，实机 Build completed + Authority=Feiyin Dev；详见 outbox/coder-2/result.md）。⚠️ 公证仍不可做（无 Apple Developer 账号） |
 
 **边界评估结论**：阶段 B 独占 `src/main.rs`，期间禁止任何其他任务碰它；阶段 C 的 HOST 与 TRAY **必须串行**；阶段 D 的 SCENE / PERM / AUTOLAUNCH **可三路并行**，唯一交汇点 `macos/mod.rs` 的 re-export 行由主控统一改一次。
 

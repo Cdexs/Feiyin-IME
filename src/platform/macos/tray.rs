@@ -19,7 +19,6 @@ use objc2_app_kit::{NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableSta
 use objc2_foundation::{MainThreadMarker, NSData, NSString};
 use std::ffi::c_void;
 use std::io::Cursor;
-use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::OnceLock;
 
 use crate::config::UiLanguage;
@@ -46,10 +45,15 @@ static TRAY_STATE_CHANNEL: OnceLock<(
     crossbeam_channel::Receiver<TrayStateUpdate>,
 )> = OnceLock::new();
 
-/// Raw pointer to the live `StatusBarTray`. Main-thread only; set after build,
-/// cleared on drop. The timer callback dereferences it only while the run loop
-/// is active (tray outlives the loop).
-static TRAY_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+// 主线程 tray 单例。TRAY-FIX-001: 原 `TRAY_HANDLE` 裸指针存 `&tray`（main.rs 局部变量），
+// build_tray 返回后 tray 被 move 进 Option，指针立即悬垂 → 15ms timer 每秒 66 次解引用
+// 野指针，objc2 msg_send_check 断言失败即 SIGABRT（Gavin 端测崩溃）。
+// 改为 thread_local 持有所有权（与 overlay.rs 的 `OVERLAY: RefCell<Option<_>>` 完全同构，
+// 那套已验证可用）：天然保证「只有主线程能碰」，规避 `Retained<NSStatusItem>` 非 Send/Sync
+// 的静态存储限制，且所有权随 thread_local 生命周期托管，不存在悬垂窗口。
+thread_local! {
+    static TRAY: std::cell::RefCell<Option<StatusBarTray>> = const { std::cell::RefCell::new(None) };
+}
 
 /// Handle to the macOS status bar item. Dropping it removes the icon.
 pub struct StatusBarTray {
@@ -111,23 +115,26 @@ pub fn build_tray(
     })
 }
 
-/// Register the live tray handle so the main-thread timer poller can update it.
-///
-/// The tray must outlive the run loop (it is owned by the controller on the main
-/// thread). Call `clear_tray_handle` once the run loop exits.
-pub fn register_tray_handle(tray: &StatusBarTray) {
-    TRAY_HANDLE.store(
-        tray as *const StatusBarTray as *mut c_void,
-        Ordering::Release,
-    );
+/// 将建好的 tray 交予主线程 thread_local 持有。所有权随 thread_local 托管，
+/// 规避裸指针悬垂（TRAY-FIX-001）。必须主线程调用（build_tray 同为要求）。
+pub fn set_tray(tray: StatusBarTray) {
+    TRAY.with(|cell| {
+        if cell.borrow().is_some() {
+            log::warn!("macOS tray: set_tray called with an existing tray, replacing it");
+        }
+        *cell.borrow_mut() = Some(tray);
+    });
 }
 
-/// Clear the registered tray handle.
-pub fn clear_tray_handle(tray: &StatusBarTray) {
-    let current = TRAY_HANDLE.load(Ordering::Acquire);
-    if current == tray as *const StatusBarTray as *mut c_void {
-        TRAY_HANDLE.store(std::ptr::null_mut(), Ordering::Release);
-    }
+/// 主线程退出前显式销毁 tray（run_controller_macos shutdown 段调用）。
+/// thread_local 在进程退出时本会 drop，但显式调用保证退出链清晰、日志可辨
+/// （与 overlay.rs `shutdown_overlay` 同构）。
+pub fn shutdown_tray() {
+    TRAY.with(|cell| {
+        if cell.borrow_mut().take().is_some() {
+            log::info!("macOS tray destroyed on shutdown");
+        }
+    });
 }
 
 /// Request a tray state update from any thread. Applied on the main thread by
@@ -138,25 +145,24 @@ pub fn request_tray_state(state: TrayState, ui_language: UiLanguage) {
     }
 }
 
-/// Drain pending tray state updates and apply them to the registered tray.
+/// Drain pending tray state updates and apply them to the tray.
 ///
 /// Must be called on the main thread. Called from the CFRunLoop timer callback.
 pub fn poll_pending_tray_states() {
     let Some((_, rx)) = TRAY_STATE_CHANNEL.get() else {
         return;
     };
-    let handle = TRAY_HANDLE.load(Ordering::Acquire);
-    if handle.is_null() {
-        // Tray not registered yet; drain so we don't apply stale states later.
-        while rx.try_recv().is_ok() {}
-        return;
-    }
-    // SAFETY: the tray lives on the main thread for the whole run loop, and this
-    // poller is only invoked from the main thread.
-    let tray = unsafe { &*(handle as *const StatusBarTray) };
-    while let Ok(update) = rx.try_recv() {
-        set_tray_state(tray, update.state, update.ui_language);
-    }
+    TRAY.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some(tray) = slot.as_mut() else {
+            // Tray not registered yet; drain so we don't apply stale states later.
+            while rx.try_recv().is_ok() {}
+            return;
+        };
+        while let Ok(update) = rx.try_recv() {
+            set_tray_state(tray, update.state, update.ui_language);
+        }
+    });
 }
 
 /// Update tooltip and icon for the given tray state.
