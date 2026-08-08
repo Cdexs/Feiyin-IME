@@ -1131,6 +1131,24 @@ mod tests {
         assert_eq!(strip_punctuation("你好，  世界！"), "你好 世界");
     }
 
+    /// TEST-SYNC-030 3.3 补充：strip_punctuation 全量参数化——PUNCT_CHARS 每个成员
+    /// 命中的语义都是「换成一个空格」（A2），不是直接删除。用「词 + 标点 + 词」夹持
+    /// 验证命中标点产生空格（句末等产生的位置由后续 trim 清理不在本用例覆盖）。
+    #[test]
+    fn strip_punctuation_every_char_replaces_with_space() {
+        use crate::punctuation::PUNCT_CHARS;
+        // '.' 有「数字间/域名」保护逻辑，单独测（两侧为汉字时不豁免 → 也是空格）。
+        for &c in PUNCT_CHARS {
+            let input = format!("测试{c}测试");
+            let out = strip_punctuation(&input);
+            assert_eq!(
+                out,
+                "测试 测试",
+                "PUNCT_CHARS 成员 {c:?} 应被替换为单个空格（A2），而非删除"
+            );
+        }
+    }
+
     // ============================================================
     // ASR-PUNCT-OPT-001: 标点决策来源标记逻辑测试
     // ============================================================

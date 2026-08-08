@@ -1952,7 +1952,7 @@ mod tests {
         SuggestionEntry, Topic, ADD_PUNCT, ATTEMPT_TIMEOUTS, CODESWITCH_FIX, L0_1_FIDELITY,
         L0_2_FIDELITY_OVER_FLUENCY, L0_3_SUSPECT_INPUT, L0_4_NOT_A_PROMPT, META_RULE_PRECEDENCE,
         NO_PUNCT, SUGGESTION_INSTRUCTION, UNIT_SYMBOL_PROTECTION, UNIT_SYMBOL_PROTECTION_TRANSLATE,
-        USER_PREFS_HEADER,
+        USER_PREFS_HEADER, INLINE_SEPARATOR_RULES, INLINE_SEPARATOR_RULES_NO_PUNCT,
     };
     use crate::config::LlmConfig;
 
@@ -2707,6 +2707,108 @@ mod tests {
         // 输入侧（ASR 原话）两开关都保持含「，」，示例意义是展示输入→输出变换。
         assert!(on.contains("今天出去买菜了，买了3斤土豆，一个西瓜"));
         assert!(off.contains("今天出去买菜了，买了3斤土豆，一个西瓜"));
+    }
+
+    /// TEST-SYNC-030 3.1：`f3_rules_text(multiline_safe, punctuation_enabled)` 四组合矩阵。
+    ///
+    /// coder-1 只加了 `f3c_inline_example_follows_punctuation_switch` 一条（多行分支的
+    /// 买菜示例）。本用例补齐 2×2 全矩阵：两分支（多行/单行）× 两开关（开/关）必须
+    /// 各自切到正确的分隔符常量与正确形态的示例，防止某一格漏切（单行分支尤其易漏）。
+    #[test]
+    fn f3_rules_text_punctuation_switch_4way_matrix() {
+        // (true, true) 多行+开：原常量 + 顿号连接示例
+        let tt = f3_rules_text(true, true);
+        assert!(
+            tt.contains("苹果、香蕉、橘子"),
+            "(true,true) 须含分隔符常量原文示例"
+        );
+        assert!(
+            tt.contains("买了3斤土豆、一个西瓜、20斤大米、还有3斤香蕉"),
+            "(true,true) F3-item 示例输出侧须用 、"
+        );
+
+        // (true, false) 多行+关：NO_PUNCT 常量 + 空格连接示例，输入侧仍含「，」
+        let tf = f3_rules_text(true, false);
+        assert!(
+            tf.contains("苹果 香蕉 橘子"),
+            "(true,false) 须含 NO_PUNCT 空格分隔示例"
+        );
+        assert!(
+            tf.contains("买了3斤土豆 一个西瓜 20斤大米 还有3斤香蕉"),
+            "(true,false) F3-item 示例输出侧须空格连接"
+        );
+        assert!(
+            tf.contains("今天出去买菜了，买了3斤土豆，一个西瓜"),
+            "(true,false) F3c 输入侧「，」须保留（ASR 原话，刻意不动）"
+        );
+
+        // (false, true) 单行+开：单行分支同样切到原常量
+        let ft = f3_rules_text(false, true);
+        assert!(
+            ft.contains("苹果、香蕉、橘子"),
+            "(false,true) 单行分支须切到原分隔符常量（FORMAT-F3-SHORTITEM-014 共享）"
+        );
+
+        // (false, false) 单行+关：单行分支同样切到 NO_PUNCT 版
+        let ff = f3_rules_text(false, false);
+        assert!(
+            ff.contains("苹果 香蕉 橘子"),
+            "(false,false) 单行分支须切到 NO_PUNCT 空格分隔版"
+        );
+        assert!(
+            !ff.contains("苹果、香蕉、橘子"),
+            "(false,false) 单行分支不得残留顿号分隔示例"
+        );
+    }
+
+    /// TEST-SYNC-030 3.2：⭐「规则与示例不打架」机制性护栏（修正版，主控 2026-08-08 确认）。
+    ///
+    /// 任务书原句「punct=false 时完整输出不得出现 、 ；」在措辞上是**不可满足**的：
+    /// - `INLINE_SEPARATOR_RULES_NO_PUNCT` 禁令上下文自身就点名 `、 ；`（“MUST NOT
+    ///   contain  、 ；”）——这条字面是**允许**的，否则规则没法说自己禁什么。
+    /// - 多行模板的固定日本语例句（`たとえば本をもっと読むこと、また…`）里也有 `、`，
+    ///  与开关无关（固定文本，on/off 两分支逐字相同）。
+    ///
+    /// 所以修正版护栏锁定的是「开关切换不得在 off 分支引入任何**新的**顿号/分号」：
+    /// 把 off 输出的三处切换点（分隔符常量 + 两处买菜示例）手工改回 on 版本后，
+    /// 必须与 on 输出**逐字相等**。一旦将来有人往 off 分支的示例或规则里新加 `、`
+    /// （030-C 被打回的根因：改了规则没改示例），重建后的字符串与 on 不相等，立刻红。
+    #[test]
+    fn f3_rules_punct_off_switch_reconstructs_to_on() {
+        for multiline_safe in [true, false] {
+            let on = f3_rules_text(multiline_safe, true);
+            let off = f3_rules_text(multiline_safe, false);
+
+            // 手工回播：off 输出的三处开关差异全部改回 on 形态。
+            // 顺序敏感：F3c 的 off 串包含 F3-item 串作子串，必须先替换外层 F3c，再替换内层。
+            let rebuilt = off
+                .replacen(
+                    INLINE_SEPARATOR_RULES_NO_PUNCT,
+                    INLINE_SEPARATOR_RULES,
+                    1,
+                )
+                .replace(
+                    "今天出去买菜了 买了3斤土豆 一个西瓜 20斤大米 还有3斤香蕉",
+                    "今天出去买菜了，买了3斤土豆、一个西瓜、20斤大米、还有3斤香蕉",
+                )
+                .replace(
+                    "买了3斤土豆 一个西瓜 20斤大米 还有3斤香蕉",
+                    "买了3斤土豆、一个西瓜、20斤大米、还有3斤香蕉",
+                );
+            assert_eq!(
+                rebuilt, on,
+                "multiline_safe={multiline_safe}: off 分支新增的顿号/分号只能来自禁令上下文与固定模板，\
+                 任何额外示例标点都会使重建结果 ≠ on"
+            );
+
+            // 方向性 sanity：off 分支的顿号+分号总数必须严格小于 on（off 无示例顿号、
+            // 禁令常量顿号/分号也少于 on 常量：NO_PUNCT 4 、/3 ； vs INLINE 6 、/4 ；）。
+            let count_punct = |s: &str| s.chars().filter(|&c| c == '、' || c == '；').count();
+            assert!(
+                count_punct(&off) < count_punct(&on),
+                "multiline_safe={multiline_safe}: off 分支顿号/分号总数应严格小于 on"
+            );
+        }
     }
 
     /// TEST-SYNC-016 B5：⭐ 结构护栏——F3 家族长度限定必须同步（本批最重要的护栏）。

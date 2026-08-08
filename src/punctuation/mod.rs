@@ -327,6 +327,49 @@ mod tests {
         assert_eq!(count_units("，。！？"), 0);
     }
 
+    /// TEST-SYNC-030 3.3：口语口补齐（Gavin 2026-08-08 拍板口径）。
+    /// - 韩文按空格分词：Hangul 音节不在 CJK/假名范围 → 走「空格分段计 1」分支
+    /// - 日文假名逐字符计
+    /// - 中英混合边界 + 内部数字
+    /// - 纯数字（小数点是标点，重置词边界）
+    /// - 阈值边界恰好 5 与 6：分别为 apply_l2_postprocess 的 ≤5 判据上下沿
+    #[test]
+    fn test_count_units_korean_space_segmented() {
+        assert_eq!(count_units("안녕 세계"), 2);
+        assert_eq!(count_units("안녕하세요"), 1);
+        assert_eq!(count_units("처음 뵙겠습니다"), 2);
+    }
+
+    #[test]
+    fn test_count_units_japanese_kana_per_char() {
+        assert_eq!(count_units("ありがとう"), 5);
+        assert_eq!(count_units("こんにちは"), 5);
+        assert_eq!(count_units("アリガトウ"), 5);
+    }
+
+    #[test]
+    fn test_count_units_zh_en_digit_mixed() {
+        // 我用(2) + GPT(1词) + 写了(2) + 3(1词) + 个方案(3) = 9
+        assert_eq!(count_units("我用GPT写了3个方案"), 9);
+    }
+
+    #[test]
+    fn test_count_units_pure_digits_decimal() {
+        // 3(1) .(标点重置) 14(1) = 2
+        assert_eq!(count_units("3.14"), 2);
+        assert_eq!(count_units("3.14.15"), 3);
+    }
+
+    #[test]
+    fn test_count_units_threshold_boundary_5_and_6() {
+        // 阈值边界：恰 5 与 6 各一条，锁死 L2 用 ≤5 而非 <5（配合缺口 1 规格表）。
+        assert_eq!(count_units("一二三四五"), 5);
+        assert_eq!(count_units("一二三四五六"), 6);
+        assert_eq!(count_units("hello"), 1);
+        assert_eq!(count_units("hello world foo bar baz"), 5);
+        assert_eq!(count_units("hello world foo bar baz qux"), 6);
+    }
+
     #[test]
     fn test_strip_trailing_punctuation_single() {
         assert_eq!(strip_trailing_punctuation("好吗？"), "好吗");
@@ -375,7 +418,7 @@ mod tests {
         assert_eq!(strip_trailing_punctuation("（好的）。"), "（好的）");
     }
 
-    #[test]
+#[test]
     fn test_strip_trailing_punctuation_comma_dash() {
         // 逗号/分号/半角冒号等句末出现的标点也剥（TRAILING 集合含之）
         assert_eq!(strip_trailing_punctuation("好的，"), "好的");
@@ -388,6 +431,33 @@ mod tests {
         // 短句「重点：」也剥 → 「重点」，与「重点，」行为一致
         assert_eq!(strip_trailing_punctuation("重点："), "重点");
         assert_eq!(strip_trailing_punctuation("好的："), "好的");
+    }
+
+    /// TEST-SYNC-030 3.4 补充：TRAILING_PUNCT_CHARS 全量参数化——每个成员都必须能剥。
+    /// 用「文本 + 目标字符」包裹，锁定集合内每个终结标点单独在句末时都剥掉（A2 验收谱系）。
+    #[test]
+    fn test_strip_trailing_punctuation_every_member_strips() {
+        for &c in TRAILING_PUNCT_CHARS {
+            let input = format!("测试文本{c}");
+            let out = strip_trailing_punctuation(&input);
+            assert_eq!(
+                out, "测试文本",
+                "TRAILING_PUNCT_CHARS 成员 {c:?} 句末应被剥掉"
+            );
+        }
+    }
+
+    /// 030-A-2 反向参数化：成对符号右半 + `·` 逐字符确认不被剥（与 partition 护栏对照）。
+    #[test]
+    fn test_strip_trailing_punctuation_non_members_kept() {
+        for c in ['）', '】', '》', '」', '』', '\u{201D}', '\'', ')', ']', '·'] {
+            let input = format!("测试{c}");
+            assert_eq!(
+                strip_trailing_punctuation(&input),
+                input.as_str(),
+                "成对右半/间隔号 {c:?} 不剥"
+            );
+        }
     }
 
     #[test]
@@ -444,6 +514,30 @@ mod tests {
     fn test_effective_punctuation_fullwidth_colon_time() {
         assert!(!has_effective_punctuation("3：30 开会"));
         assert!(has_effective_punctuation("3：30 开会，请准时。"));
+    }
+
+    /// TEST-SYNC-030 3.4：DEC-047 已知边界钉现状（主控 2026-08-08 确认口径）。
+    /// 补 coder-2 已钉的两条之外的边界：
+    /// - `https://a.com` 的 `:` → 前是 `s`（ASCII 字母）、后是 `/`（非字母数字）→
+    ///   不是两侧 ASCII 夹持 → 不计词内豁免 → 判 true。
+    /// - 位置 0 的标点（`。你好`）→ 前驱取 `' '` 哨兵、后继非 ASCII → 不豁免 → true。
+    /// - 空串 → false。
+    #[test]
+    fn test_effective_punctuation_url_colon_single_sided() {
+        assert!(has_effective_punctuation("https://a.com"));
+        assert!(has_effective_punctuation("https://example.com/path"));
+    }
+
+    #[test]
+    fn test_effective_punctuation_punct_at_position_zero() {
+        assert!(has_effective_punctuation("。你好"));
+        assert!(has_effective_punctuation("！提醒"));
+        assert!(has_effective_punctuation("，等等"));
+    }
+
+    #[test]
+    fn test_effective_punctuation_empty_string() {
+        assert!(!has_effective_punctuation(""));
     }
 
     /// PUNCT_CHARS ↔ TRAILING_PUNCT_CHARS 逐字符对照护栏（030-A-2 验收返工补）。

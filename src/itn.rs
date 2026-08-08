@@ -4673,7 +4673,7 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
         assert_eq!(normalize_test("千百万"), "千百万");
     }
 
-    #[test]
+#[test]
     fn itn_v2_031_wanyi_guard_pass_through_regression() {
         // 守卫放行的对照组：大单位前确有数字，行为必须与 027-E/DEC-042 一致，零回归。
         assert_eq!(normalize_test("一万"), "1万");
@@ -4688,5 +4688,38 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
         assert_eq!(normalize_test("两万五"), "2.5万");
         assert_eq!(normalize_test("三千万"), "3000万");
         assert_eq!(normalize_test("两万五百"), "20500");
+    }
+
+    // ==== TEST-SYNC-030 3.5：031 跨模块交叉回归 ====
+    // coder-2 同文件内已钉 25 条；这里补「跨模块」地层：全部经公共入口 normalize_numbers
+    // （= normalize_test），覆盖 026 货币链 / 017 重量链 / 016 班级简写各抽 2 条，
+    // 确认 031 万/亿守卫的加入对这三族零回归。
+
+    /// 026 货币链交叉回归（抽 2）：货币链的 万/亿 大单位路径不受 031 守卫回退影响。
+    #[test]
+    fn itn_v2_031_cross_module_026_currency_regression() {
+        assert_eq!(normalize_test("五块八"), "5.8元");
+        assert_eq!(normalize_test("十一块九毛二"), "11.92元");
+    }
+
+    /// 017 重量链交叉回归（抽 2）：重量链不涉万/亿，守卫不得影响该路径。
+    #[test]
+    fn itn_v2_031_cross_module_017_weight_regression() {
+        assert_eq!(normalize_test("一斤二两"), "1斤2两");
+        assert_eq!(normalize_test("三斤六两五"), "3斤6两5");
+    }
+
+    /// 016 班级简写交叉回归（抽 2）：「一三班」式逐位串不因万/亿守卫误转。
+    #[test]
+    fn itn_v2_031_cross_module_016_grade_class_regression() {
+        assert_eq!(normalize_test("一三班"), "一三班");
+        assert_eq!(normalize_test("高一四班"), "高一四班");
+    }
+
+    /// 交叉主案：「万一」经完整 ITN 链后仍是汉字，且整体 normalize_numbers 幂等健全。
+    #[test]
+    fn itn_v2_031_cross_module_wanyi_full_chain() {
+        assert_eq!(normalize_test("万一"), "万一");
+        assert_eq!(normalize_test("万一下雨呢"), "万一下雨呢");
     }
 }
