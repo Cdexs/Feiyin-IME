@@ -3564,7 +3564,8 @@ fn run_pipeline_core(
                     // 条件：auto_punct=true && LLM 未处理 && 非翻译 && 非native自带标点
                     // - native_punctuated=true（accuracy native 成功）→ 跳过标点引擎（省一次推理）
                     // - native_punctuated=false（performance/兜底/混合）→ 照常走标点引擎
-                    // - auto_punct=false && native_punctuated=true → 后处理剥标点（修复"关了开关 native 照样出标点"缺口）
+                    // - 本分支只负责「加标点」；「剥离」职责已移交下方 L2 后处理补位块
+                    //   （PUNCT-GOVERNANCE-030-A），对全部产出源一视同仁，无来源判据。
                     let final_text = if config.punctuation.enabled
                         && !llm_handled
                         && !translate_requested
@@ -3591,16 +3592,32 @@ fn run_pipeline_core(
                             log::debug!("Punctuation engine not available, skipping");
                             final_text
                         }
-                    } else if !config.punctuation.enabled
-                        && native_punctuated
-                        && !llm_handled
-                        && !translate_requested
-                    {
-                        // ASR-PUNCT-OPT-001: 用户关了自动标点但 native 自带标点 → 剥离
+                    } else {
+                        final_text
+                    };
+                    // PUNCT-GOVERNANCE-030-A L2 后处理补位（架构定位：L1 源头控制为主，L2 补位）
+                    // 只负责两件 L1 物理上够不着的事：
+                    //   (a) 开关关闭 → 全文剥标点（Qwen3 在线 ASR / 本地 native / NLLB 翻译不可控源兜底）
+                    //   (b) 开关开启且字/词数 <= 5 → 剥末尾标点（Gavin 2026-08-08 短句规则）
+                    // 🔴 本块不含任何来源判据（llm_handled/native_punctuated）/（LLM 翻译），
+                    //    对 6 个产出源一视同仁，将来新增产出源自动受控。
+                    let final_text = if !config.punctuation.enabled {
                         let stripped = transcription::strip_punctuation(&final_text);
                         if stripped != final_text {
                             log::info!(
                                 "Stripped native punctuation (auto_punct=false): '{}' -> '{}'",
+                                final_text,
+                                stripped
+                            );
+                        }
+                        stripped
+                    } else if punctuation::count_units(&final_text)
+                        <= punctuation::SHORT_TEXT_UNIT_THRESHOLD
+                    {
+                        let stripped = punctuation::strip_trailing_punctuation(&final_text);
+                        if stripped != final_text {
+                            log::info!(
+                                "Stripped trailing punctuation (<=5 units): '{}' -> '{}'",
                                 final_text,
                                 stripped
                             );

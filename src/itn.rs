@@ -767,6 +767,17 @@ fn parse_cn_number(
                         }
                     }
                 }
+                // ITN-FIX-WANYI-031：大单位前必须已有数字，否则整串不是数字表达。
+                // 「万一」「亿万」「百万富翁」「千万」等固定词的首字是大单位，
+                // digit/section/result 全空时 027-E 锚点机制会产出零系数锚点
+                // 如 ('万',0)，再经隐式补全 / DEC-042 输出 "0.1万"/"0万"。
+                // 对照：百/千分支不设锚点，且末尾 result==0 被函数尾部
+                // `if result == 0 { return None }` 拒，故无此洞；万/亿因锚点
+                // 机制必须在此源头拒绝。
+                // 任一非空（有数字/已被进位单位结算/已有 result）则放行。
+                if !has_digit && section == 0 && result == 0 {
+                    return None;
+                }
                 section += digit;
                 // ITN-FIX-BIGNUM-027-B：万级进位不再把已结算的 result 卷进乘法。
                 //   旧式 `result = (result + section) * 10000` 在「亿+万」嵌套时把亿结算值
@@ -801,6 +812,10 @@ fn parse_cn_number(
                             break;
                         }
                     }
+                }
+                // ITN-FIX-WANYI-031：同万分支守卫（见上方 ITN-FIX-WANYI-031 注释）。
+                if !has_digit && section == 0 && result == 0 {
+                    return None;
                 }
                 section += digit;
                 // ITN-FIX-BIGNUM-027-B：亿分支保持 (result+section)*1e8 不变。
@@ -4637,5 +4652,41 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     fn itn_v2_027g_a3_no_prefix_shadow() {
         assert_eq!(normalize_test("十万"), "10万");
         assert_eq!(normalize_test("十万块钱"), "十万块钱");
+    }
+
+    #[test]
+    fn itn_v2_031_wanyi_guard_no_decimal_conversion() {
+        // ITN-FIX-WANYI-031：大单位（万/亿）前必须有数字，否则整串不是数字表达。
+        // 固定词/口语首字是大单位时不再被 027-E 锚点机制转成 "0.1万"/"0万"。
+        assert_eq!(normalize_test("万一"), "万一");
+        assert_eq!(normalize_test("亿万"), "亿万");
+        assert_eq!(normalize_test("万一下雨呢"), "万一下雨呢");
+        assert_eq!(normalize_test("万一不是"), "万一不是");
+        assert_eq!(normalize_test("万一不小心"), "万一不小心");
+        assert_eq!(normalize_test("亿万富翁"), "亿万富翁");
+        assert_eq!(normalize_test("百万"), "百万");
+        assert_eq!(normalize_test("千万"), "千万");
+        assert_eq!(normalize_test("万万没想到"), "万万没想到");
+        assert_eq!(normalize_test("千千万万"), "千千万万");
+        assert_eq!(normalize_test("万事如意"), "万事如意");
+        assert_eq!(normalize_test("万无一失"), "万无一失");
+        assert_eq!(normalize_test("千百万"), "千百万");
+    }
+
+    #[test]
+    fn itn_v2_031_wanyi_guard_pass_through_regression() {
+        // 守卫放行的对照组：大单位前确有数字，行为必须与 027-E/DEC-042 一致，零回归。
+        assert_eq!(normalize_test("一万"), "1万");
+        assert_eq!(normalize_test("十万"), "10万");
+        assert_eq!(normalize_test("一百万"), "100万");
+        assert_eq!(normalize_test("一千万"), "1000万");
+        assert_eq!(normalize_test("三百万"), "300万");
+        assert_eq!(normalize_test("三亿五"), "3.5亿");
+        assert_eq!(normalize_test("一万亿"), "1万亿");
+        assert_eq!(normalize_test("一千零四十六万八千七百四十一"), "10468741");
+        assert_eq!(normalize_test("一亿两千三百四十五万六千七百八十九"), "123456789");
+        assert_eq!(normalize_test("两万五"), "2.5万");
+        assert_eq!(normalize_test("三千万"), "3000万");
+        assert_eq!(normalize_test("两万五百"), "20500");
     }
 }

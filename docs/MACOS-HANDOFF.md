@@ -328,6 +328,24 @@ Gavin 2026-08-04 拍板：**判定语言中明确提到的最小单位，输出�
 
 **BUILD-015 产物状态（tester-1 补记，2026-08-04）**：027-G（万亿层 + 十万个为什么白名单）已完成全量回归（itn:: 219/0）并进入 release 产物（feiyin-ime.exe `d29b8325…`），itn-rules.toml 三副本 `b208271b…` 一致（新词条进包）；macOS 侧沿用共享 `src/itn.rs` 与 `itn-rules.toml` 即可，无新增平台差异。
 
+**ITN-FIX-WANYI-031 跨端提示（coder-1 补记，2026-08-08）**：`parse_cn_number` 万/億 分支加了前置守卫
+`if !has_digit && section == 0 && result == 0 { return None; }`（:778/:817）——「万一/亿万/百万/千万」这类
+固定词不再被数字化（此前输出 `0.1万`/`0万`）。macOS 侧编译同一份 `src/itn.rs` 自动继承，无平台差异。
+对照组（一万→10000、十万→100000、三亿五→3.5亿、一万亿→1万亿、一亿两千三百四十五万六千七百八十九→123456789）
+全部零回归，itn:: 221/0。`itn-rules.toml` 零改动。
+
+**PUNCT-GOVERNANCE-030-A/A-2 跨端提示（coder-2 补记，2026-08-08）**：`src/punctuation/mod.rs` + `src/transcription/mod.rs` 是平台中立模块（`run_pipeline_core` 已去平台化，L2 后处理块位于平台共享代码），macOS 侧编译同一份代码，无需镜像。两件事需知晓：
+- **030-A**：L2 后处理补位块（`src/main.rs` 共享段）对 6 个产出源一视同仁，删除了来源判据；`count_units`（CJK/假名按字、其余按空格分词）与 `strip_trailing_punctuation`（短句 ≤5 剥末尾标点，直接删除不留空格）为新增平台中立函数。
+- **030-A-2**：`strip_trailing_punctuation` 改用 `TRAILING_PUNCT_CHARS`（不含成对符号右半，保护 `"好"`/`）` 不剥）；`native_punctuated` 由假设改为实测 `has_effective_punctuation`（对 `PUNCT_CHARS` 全集合做「词内嵌豁免」：`3.14`/`don't`/`3:30`/`example.com` 内的标点因两侧 ASCII 字母数字夹持不计为有效标点）。**若你们改 prompt 或调用标点判据，请与新函数保持同一口径**，别为单字符特例打补丁（防 ITN-LOCAL-RULE-OVERREACH-001，详见 troubleshooting）。
+
+**PUNCT-GOVERNANCE-030-B/C 跨端提示（coder-1 补记，2026-08-08）**：`src/llm/mod.rs` 是平台中立模块。
+030-B：标点开关的槽位条件替换（false 时注入 `NO_PUNCT` 禁句，翻译路径同步改 `step1_correct`）。
+030-C：`f3_rules_text` 新增 `punctuation_enabled` 参数，false 时枚举分隔符切换到
+`INLINE_SEPARATOR_RULES_NO_PUNCT`（半角空格连接、禁 、；，；两个全角 + 两个半角逗分号），
+**且多行分支的 F3c 买菜示例输出侧同步条件化**（punct=false 为空格连接版，输入侧 ASR 原话保持不动），
+L1/L2 口径统一无双改写。macOS 侧编译同一份代码，无需镜像；`_NO_PUNCT` 与新示例变量是新产物，
+若你们改了 prompt 文本需重新对齐两侧。
+
 **共同模式**（见 `collab/troubleshooting.md` 的 `[ITN-LOCAL-RULE-OVERREACH-001]`）：
 
 > **局部特例规则没有约束自己的适用范围，在更长的上下文里越界生效。**

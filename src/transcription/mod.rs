@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::{config::ChineseScript, text_normalizer};
+use crate::{config::ChineseScript, punctuation, text_normalizer};
 
 // Re-export SenseVoice config for convenience
 use sherpa_onnx::{OfflineFunASRNanoModelConfig, OfflineSenseVoiceModelConfig};
@@ -244,7 +244,10 @@ impl Transcriber {
     /// - performance → 恒 false
     /// - accuracy 单次 native 成功 → true
     /// - accuracy VAD 分段：所有段均 native 成功才 true；任一段兜底 → false
-    /// - qwen3_online → true（DEC-028：在线模型输出自带标点）
+    /// - qwen3_online → 实测输出是否含**有效标点**（PUNCT-GOVERNANCE-030-A-2：
+    ///   官方 API 无标点参数，不再假定必然带标点；用 `has_effective_punctuation`
+    ///   统一「词内嵌豁免」判据 —— `3.14`/`don't`/`3:30`/`example.com` 的词内
+    ///   标点不算，真句末标点才算；真有标点才跳过标点引擎）
     pub fn transcribe_with_punct_info(
         &self,
         samples: &[f32],
@@ -275,9 +278,15 @@ impl Transcriber {
                     "ASR transcription failed: qwen3_online output only contained special tokens"
                 );
             }
-            // Qwen3 输出自带标点 → native_punctuated=true（跳过标点引擎）
+            // PUNCT-GOVERNANCE-030-A-2（主控 c 方案）：Qwen3 是否带标点是模型行为，
+            // 官方 API 无标点参数（主控 2026-08-08 核实），不能假定必然带标点 ——
+            // 短句/单词场景常无尾标点。实测输出决定标记：真有**有效标点**才跳过
+            // 标点引擎，否则照常走引擎补标点。判据统一走 `has_effective_punctuation`
+            // （词内嵌豁免：3.14 小数点 / don't 撇号 / 3:30 冒号 / example.com 域名点
+            // 因被 ASCII 字母数字夹持不计为标点，避免误判 native=true 跳过引擎）。
             let normalized = text_normalizer::normalize_text_for_language(trimmed, script);
-            return Ok((normalized, true));
+            let native_punctuated = punctuation::has_effective_punctuation(&normalized);
+            return Ok((normalized, native_punctuated));
         }
         match self.mode {
             AsrMode::Offline => self.transcribe_offline_detailed(samples, script),
@@ -467,39 +476,37 @@ impl Transcriber {
     }
 }
 
-/// 剥离 native 模型自带标点（ASR-PUNCT-OPT-001）
+/// 剥离 native 模型自带标点（ASR-PUNCT-OPT-001 + PUNCT-GOVERNANCE-030-A A1/A2）
 ///
 /// 用于 accuracy 模式 + 用户关闭自动标点（punctuation.enabled=false）场景：
 /// native 输出自带标点，用户关了开关但 native 照样出标点 → 剥离使其与 CTC 行为一致。
 ///
-/// 剥离字符集：中文标点（，。！？；：、""''…—）+ 英文标点（,.!?;:"'()[]）
-/// **不剥离**：小数点（.）在数字间（如 3.14）、URL/路径中的 / . - _ ~
+/// 剥离字符集：`punctuation::PUNCT_CHARS`（中文标点、中文括号/书名号/间隔号
+/// + 英文标点 + 半角句点 .）。
+/// **保护不剥离**：小数点（.）在数字间（如 3.14）、域名/URL 中的点（example.com）。
 ///
-/// 注意：此函数保守处理——只剥离明确的句末/句中标点符号，
-/// 不处理数字间小数点（避免破坏"3.14"等数值）。
+/// 行为（A2，Gavin 2026-08-08）：命中标点 **push 一个空格**（而非删除），
+/// 末尾连续空格合一（:505 逻辑保留）+ trim。保证句中标点造成的词间粘连被空格承接。
 pub fn strip_punctuation(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut result = String::with_capacity(chars.len());
-    let punct_set: &[char] = &[
-        '，', '。', '！', '？', '；', '：', '、', '\u{201C}', '\u{201D}', '\u{2018}', '\u{2019}',
-        '…', '—', ',', '!', '?', ';', ':', '"', '\'', '(', ')', '[', ']',
-    ];
     for (i, &c) in chars.iter().enumerate() {
-        if punct_set.contains(&c) {
-            // 保护数字间的小数点（前后均为数字/空格+数字）
-            if c == '.' {
-                let prev = chars.get(i.wrapping_sub(1)).copied().unwrap_or(' ');
-                let next = chars.get(i + 1).copied().unwrap_or(' ');
-                if prev.is_ascii_digit() && next.is_ascii_digit() {
-                    result.push(c);
-                    continue;
-                }
-            }
-            // 保护句末省略号模式：连续的 . 不处理为单独标点
-            // （. 不在 punct_set 中，所以无需特殊处理）
+        if !punctuation::is_punctuation(c) {
+            result.push(c);
             continue;
         }
-        result.push(c);
+        // 保护：小数点 / 域名点（前后均为 ASCII 字母或数字）
+        // 覆盖现有 :490 数字间小数点逻辑 + example.com 域名点（URL 场景实测结论）
+        if c == '.' {
+            let prev = chars.get(i.wrapping_sub(1)).copied().unwrap_or(' ');
+            let next = chars.get(i + 1).copied().unwrap_or(' ');
+            if prev.is_ascii_alphanumeric() && next.is_ascii_alphanumeric() {
+                result.push(c);
+                continue;
+            }
+        }
+        // A2: 命中标点 push 空格（而非 continue 跳过）
+        result.push(' ');
     }
     // 清理剥离后可能产生的连续空格（标点前后原有空格）
     while result.contains("  ") {
@@ -1050,10 +1057,11 @@ mod tests {
 
     #[test]
     fn strip_punctuation_chinese() {
-        // 标点直接删除，不加空格
+        // 标点替换为空格（A2），不是直接删除。
+        // 句末标点产生的多余空格由 trim 清理。
         assert_eq!(
             strip_punctuation("周末要不要去露营？最近天气超舒服。"),
-            "周末要不要去露营最近天气超舒服"
+            "周末要不要去露营 最近天气超舒服"
         );
     }
 
@@ -1068,9 +1076,10 @@ mod tests {
 
     #[test]
     fn strip_punctuation_mixed() {
+        // 中英混合，标点替换为空格
         assert_eq!(
             strip_punctuation("今天很好，very nice！"),
-            "今天很好very nice"
+            "今天很好 very nice"
         );
     }
 
@@ -1111,8 +1120,9 @@ mod tests {
     #[test]
     fn strip_punctuation_quotes() {
         // 中文引号 \u{201C} \u{201D} 和单引号 \u{2018} \u{2019}
+        // 引号位置替换为空格（A2）
         let input = "\u{201C}\u{4F60}\u{597D}\u{201D}\u{4ED6}\u{8BF4}";
-        assert_eq!(strip_punctuation(input), "你好他说");
+        assert_eq!(strip_punctuation(input), "你好 他说");
     }
 
     #[test]
@@ -1133,6 +1143,28 @@ mod tests {
         // 来源标记规则由 transcribe_with_punct_info 实现，需真实模型加载，此处不纯逻辑测
         // 真值表见 result.md
         assert!(true);
+    }
+
+    #[test]
+    fn qwen3_native_punctuated_detection() {
+        // PUNCT-GOVERNANCE-030-A-2：qwen3 native_punctuated = 输出是否含**有效标点**
+        // （实测，非恒 true；主控 c 方案统一调用 has_effective_punctuation）
+        use crate::punctuation::has_effective_punctuation;
+        // 带句末标点 → true（跳过标点引擎，行为不变）
+        assert!(has_effective_punctuation("今天天气不错。"));
+        assert!(has_effective_punctuation("OK? 好的。"));
+        // 无标点 → false（走标点引擎补标点，修复目标）
+        assert!(!has_effective_punctuation("好的"));
+        assert!(!has_effective_punctuation("谢谢"));
+        // 🔴 词内嵌入误判修复（c 方案）：PUNCT_CHARS 含半角 `.`，纯数字 3.14
+        //   旧判据 is_punctuation 误判「带标点」→ native_punctuated=true → 跳过引擎。
+        //   新判据 has_effective_punctuation 做「前后 ASCII 字母数字夹持则豁免」：
+        //   3.14 / went's 撇号 / 3:30 冒号 / example.com 域名点全部不再计价点。
+        assert!(!has_effective_punctuation("3.14"));
+        assert!(!has_effective_punctuation("圆周率是3.14"));
+        assert!(!has_effective_punctuation("I don't know"));
+        assert!(!has_effective_punctuation("3:30 开会"));
+        assert!(!has_effective_punctuation("example.com"));
     }
 
     // ============================================================
