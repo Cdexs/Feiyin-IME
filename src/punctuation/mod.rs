@@ -614,4 +614,76 @@ mod tests {
             );
         }
     }
+
+    // ============================================================
+    // TEST-SYNC-030-B · 函数 1: apply_l2_postprocess 判定矩阵（030-E 纯函数）
+    // 判定矩阵（tester-1 规格）：每条同时断言 String 与 L2Action 两个维度。
+    // 语意红线（主控裁定，已写进 doc）：L2Action = 走了哪条分支，不是「是否变化」。
+    // ============================================================
+    #[test]
+    fn test_apply_l2_postprocess_disabled_strips_all() {
+        // 行 1：开关关闭 → 全文剥标点（换空格、连续空格合一、trim），action=StripAll
+        let (out, action) = apply_l2_postprocess("周末能去爬山", false);
+        assert_eq!(out, "周末能去爬山");
+        assert_eq!(action, L2Action::StripAll);
+        // 行 1 附加：标点换空格 + 连续空格合一 + trim
+        let (out, action) = apply_l2_postprocess("周末 ，能去爬山", false);
+        assert_eq!(out, "周末 能去爬山");
+        assert_eq!(action, L2Action::StripAll);
+        // 行 2：开关关闭、句末标点 → 剥成「再见」
+        let (out, action) = apply_l2_postprocess("再见。", false);
+        assert_eq!(out, "再见");
+        assert_eq!(action, L2Action::StripAll);
+    }
+
+    #[test]
+    fn test_apply_l2_postprocess_short_strip_trailing() {
+        // 行 3：开关开启、≤5 单位 + 句末标点 → 直接删末尾，不留空格
+        let (out, action) = apply_l2_postprocess("再见。", true);
+        assert_eq!(out, "再见");
+        assert_eq!(action, L2Action::StripTrailing);
+        // 行 4：开关开启、≤5 单位 + 感叹号
+        let (out, action) = apply_l2_postprocess("好的！", true);
+        assert_eq!(out, "好的");
+        assert_eq!(action, L2Action::StripTrailing);
+    }
+
+    #[test]
+    fn test_apply_l2_postprocess_long_noop() {
+        // 行 5：开关开启、>5 单位 → 完全 no-op（最大回归风险点：长句逐字符不动）
+        let input = "这个方案不错，我们下周再评审。";
+        let (out, action) = apply_l2_postprocess(input, true);
+        assert_eq!(out, input);
+        assert_eq!(action, L2Action::NoOp);
+        // 行 6：开关开启、>5 单位，即使带末尾标点与内部数字也不动
+        let input = "圆周率是3.14";
+        let (out, action) = apply_l2_postprocess(input, true);
+        assert_eq!(out, input);
+        assert_eq!(action, L2Action::NoOp);
+    }
+
+    #[test]
+    fn test_apply_l2_postprocess_threshold_boundary() {
+        // 行 7：恰 5 单位 + 句末标点 → 走 ≤5 分支剥末尾
+        let (out, action) = apply_l2_postprocess("一二三四五。", true);
+        assert_eq!(out, "一二三四五");
+        assert_eq!(action, L2Action::StripTrailing);
+        // 行 8：恰 6 单位 + 句末标点 → 走 >5 no-op
+        let input = "一二三四五六。";
+        let (out, action) = apply_l2_postprocess(input, true);
+        assert_eq!(out, input);
+        assert_eq!(action, L2Action::NoOp);
+    }
+
+    #[test]
+    fn test_apply_l2_postprocess_action_is_branch_not_change() {
+        // 行 9：开关关闭、文本本无标点 → 输出=入参但 action 是 StripAll（不是 NoOp）
+        let (out, action) = apply_l2_postprocess("好的", false);
+        assert_eq!(out, "好的");
+        assert_eq!(action, L2Action::StripAll);
+        // 行 10：开关开启、≤5 且本无末尾标点 → 输出=入参但 action 是 StripTrailing（不是 NoOp）
+        let (out, action) = apply_l2_postprocess("好的", true);
+        assert_eq!(out, "好的");
+        assert_eq!(action, L2Action::StripTrailing);
+    }
 }

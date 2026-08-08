@@ -4653,4 +4653,146 @@ mod tests {
         );
         // 023 按 Gavin 指示恢复并扩充标记清单，for instance 已恢复，反向护栏删除
     }
+
+    // ============================================================
+    // TEST-SYNC-030-B · 函数 2: build_translate_system_content（030-D 纯函数）
+    // 缺口 2（翻译路径 NO_PUNCT/ADD_PUNCT 双向明确化，5 条）+ 缺口 3（Step 1 双分支，2 条）
+    // + target_desc 映射（030-D 把 match 移入函数后新解锁可测点，2 条）。
+    // ============================================================
+
+    /// 缺口 2 · 1：开关关闭 → 含 NO_PUNCT 全文（禁止句必须在场，不得退回空串）。
+    #[test]
+    fn build_translate_system_content_off_contains_full_no_punct() {
+        let content = super::build_translate_system_content(
+            crate::config::TranslationLanguage::Chinese,
+            false,
+            None,
+            None,
+        );
+        assert!(
+            content.contains(NO_PUNCT),
+            "翻译路径 false 分支须含 NO_PUNCT 全文"
+        );
+    }
+
+    /// 缺口 2 · 2：开关开启 → 含 ADD_PUNCT 全文，且不含 NO_PUNCT。
+    #[test]
+    fn build_translate_system_content_on_contains_add_punct_not_no_punct() {
+        let content = super::build_translate_system_content(
+            crate::config::TranslationLanguage::Chinese,
+            true,
+            None,
+            None,
+        );
+        assert!(
+            content.contains(ADD_PUNCT),
+            "翻译路径 true 分支须含 ADD_PUNCT 全文"
+        );
+        assert!(
+            !content.contains(NO_PUNCT),
+            "翻译路径 true 分支不得含 NO_PUNCT"
+        );
+    }
+
+    /// 缺口 2 · 3/4：数字与单位符号保护条款两开关均在场（不得被标点指令挤掉）。
+    #[test]
+    fn build_translate_system_content_unit_symbol_protection_present_both() {
+        let on = super::build_translate_system_content(
+            crate::config::TranslationLanguage::Chinese,
+            true,
+            None,
+            None,
+        );
+        let off = super::build_translate_system_content(
+            crate::config::TranslationLanguage::Chinese,
+            false,
+            None,
+            None,
+        );
+        assert!(
+            on.contains(UNIT_SYMBOL_PROTECTION_TRANSLATE),
+            "true 分支须保留 UNIT_SYMBOL_PROTECTION_TRANSLATE"
+        );
+        assert!(
+            off.contains(UNIT_SYMBOL_PROTECTION_TRANSLATE),
+            "false 分支须保留 UNIT_SYMBOL_PROTECTION_TRANSLATE"
+        );
+    }
+
+    /// 缺口 2 · 5：防 contains 弱断言漏网——NO_PUNCT 必须且只能在 false 分支
+    /// 出现一次（不零散重复），true 分支连特有片段都不得泄漏。
+    #[test]
+    fn build_translate_system_content_no_punct_fragments_never_leak() {
+        let no_punct_frag = "actively REMOVE every existing punctuation mark";
+        let on = super::build_translate_system_content(
+            crate::config::TranslationLanguage::Chinese,
+            true,
+            None,
+            None,
+        );
+        let off = super::build_translate_system_content(
+            crate::config::TranslationLanguage::Chinese,
+            false,
+            None,
+            None,
+        );
+        assert!(
+            !on.contains(no_punct_frag),
+            "NO_PUNCT 特有片段不得泄漏到 true 分支"
+        );
+        assert_eq!(
+            off.matches(NO_PUNCT).count(),
+            1,
+            "false 分支 NO_PUNCT 须恰好出现一次"
+        );
+        assert_eq!(
+            on.matches(NO_PUNCT).count(),
+            0,
+            "true 分支不得出现 NO_PUNCT"
+        );
+    }
+
+    /// 缺口 3 · Step 1 修正指令双分支：true 要求修标点，false 去掉 punctuation 字样。
+    #[test]
+    fn build_translate_system_content_step1_correct_switch() {
+        let on = super::build_translate_system_content(
+            crate::config::TranslationLanguage::Chinese,
+            true,
+            None,
+            None,
+        );
+        let off = super::build_translate_system_content(
+            crate::config::TranslationLanguage::Chinese,
+            false,
+            None,
+            None,
+        );
+        assert!(
+            on.contains("fix errors, punctuation, grammar"),
+            "true 分支 Step1 须修正标点"
+        );
+        assert!(
+            !off.contains("fix errors, punctuation, grammar"),
+            "false 分支 Step1 不得要求修正标点（与 NO_PUNCT 一致）"
+        );
+    }
+
+    /// target_desc 映射（030-D 把 match 移入函数后新解锁可测点）。
+    #[test]
+    fn build_translate_system_content_target_desc_mapping() {
+        let zh = super::build_translate_system_content(
+            crate::config::TranslationLanguage::Chinese,
+            true,
+            None,
+            None,
+        );
+        let en = super::build_translate_system_content(
+            crate::config::TranslationLanguage::English,
+            true,
+            None,
+            None,
+        );
+        assert!(zh.contains("into Chinese"), "Chinese 须渲染成 into Chinese");
+        assert!(en.contains("into English"), "English 须渲染成 into English");
+    }
 }
