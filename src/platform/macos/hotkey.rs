@@ -25,12 +25,16 @@ use crate::config::{AppConfig, HotkeyMode};
 
 const CONFIG_POLL_INTERVAL_SECS: f64 = 0.25;
 const SHORT_PRESS_THRESHOLD: Duration = Duration::from_millis(300);
-const KEYBOARD_EVENTS: [CGEventType; 5] = [
+// 只订阅真实键盘事件。TapDisabledByTimeout / TapDisabledByUserInput 是
+// core-graphics 明确标注的 "out of band" 事件（event.rs:226-229），系统无论
+// mask 是否包含都会投递给回调，且其判别值 0xFFFFFFFE / 0xFFFFFFFF 远超 u64 位宽，
+// 一旦进入 CGEventMaskBit!(1 << etype) 会导致 debug 下 panic、release 下掩码错位。
+// 回调侧的重新启用逻辑见 :102-103 与 :272-275，不受本改动影响。
+// 依据：MACOS-P4-PROBE-001 实机取证（2026-08-04）
+const KEYBOARD_EVENTS: [CGEventType; 3] = [
     CGEventType::KeyDown,
     CGEventType::KeyUp,
     CGEventType::FlagsChanged,
-    CGEventType::TapDisabledByTimeout,
-    CGEventType::TapDisabledByUserInput,
 ];
 
 #[derive(Debug, Clone)]
@@ -222,6 +226,15 @@ impl HotkeyListener {
     }
 
     pub fn join(mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for HotkeyListener {
+    fn drop(&mut self) {
+        self.shutdown();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -445,4 +458,41 @@ fn vk_to_mac_keycode(vk_code: u32) -> Option<u16> {
         0xC0 => KeyCode::ANSI_GRAVE,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod keyboard_events_tests {
+    use super::*;
+
+    /// MACOS-P4-PROBE-001 直接护栏：KEYBOARD_EVENTS 必须不包含任何
+    /// core-graphics 标明的 "out of band" 事件（TapDisabledByTimeout / TapDisabledByUserInput）。
+    /// 这两个事件的判别值 0xFFFFFFFE / 0xFFFFFFFF 远超 u64 位宽，一旦进入
+    /// CGEventMaskBit!(1 << etype) 会导致 debug 下 panic、release 下掩码错位。
+    #[test]
+    fn keyboard_events_excludes_out_of_band_types() {
+        for e in KEYBOARD_EVENTS {
+            let v = e as u64;
+            assert!(
+                v < 64,
+                "CGEventType {:?} = {} 超出 CGEventMaskBit 的 1<<n 安全范围 (n < 64)",
+                e,
+                v
+            );
+        }
+    }
+
+    /// 额外护栏：显式断言黑名单事件不在数组中（比 `< 64` 更有语义）。
+    #[test]
+    fn keyboard_events_never_includes_tap_disabled_variants() {
+        for e in KEYBOARD_EVENTS {
+            assert!(
+                !matches!(
+                    e,
+                    CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+                ),
+                "KEYBOARD_EVENTS 包含带外事件 {:?}，会触发 MACOS-P4-PROBE-001 的 panic",
+                e
+            );
+        }
+    }
 }

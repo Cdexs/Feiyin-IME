@@ -62,6 +62,16 @@ exe = [
     # --- 视频会议（归 chat：会议聊天区 Enter=发送、多行危险，与 IM 同构）---
     "Zoom.exe",            # ⚠️未证实：Zoom 会议（官网有 Windows 包，exe 名未实测；待 debug.log 的 Scene context 实证）
     "wemeetapp.exe",       # ⚠️未证实：腾讯会议（官网 meeting.tencent.com 有 Windows 包，exe 名未实测）
+    # --- MACOS-P4-SCENE-001 追加：macOS 可执行名（proc_pidpath basename，实测格式见 result.md）---
+    "WeChat",              # macOS 微信（MACOS-P4-SCENE-001 实测规范：可执行名无 .exe 后缀）
+    "Weixin",              # macOS 微信 4.x（重构版可执行名）
+    "QQ",                  # macOS QQ
+    "Telegram",            # macOS Telegram
+    "Slack",               # macOS Slack
+    "Discord",             # macOS Discord
+    "Lark",                # macOS 飞书（国际版）
+    "DingTalk",            # macOS 钉钉
+    "WeChatHelper",        # macOS 微信辅助进程（多进程不命中零副作用，保留防微信主进程名变异）
 ]
 
 [[scene]]
@@ -107,6 +117,9 @@ exe = [
     "Perplexity.exe",          # ⚠️未证实：Perplexity 桌面版（官网 perplexity.ai MS Store 包，exe 名未实测）
     # --- MS Store PWA 形态（Gemini/Copilot/DeepSeek/claude.ai 等）---
     # 前台进程为 msedge.exe（已在 browser exe 列表），靠下方 title_keywords 兜底，不在此列 exe 条目
+    # --- MACOS-P4-SCENE-001 追加：macOS 可执行名（实测：Claude.app/Contents/MacOS/Claude）---
+    "Claude",                # macOS Claude 桌面版（本机实测 exe=Claude）
+    "ChatGPT",               # macOS ChatGPT/Codex 桌面版（可执行名惯例，未实测）
 ]
 title_keywords = [
     # 浏览器网页版 / PWA 兜底（浏览器开 claude.ai / chatgpt.com 等时靠窗口标题命中）
@@ -154,6 +167,11 @@ exe = [
     # 注意：此处的 Mail（无 .exe）是 macOS 自带邮件，与上方 Mail.exe（Windows 10/11 自带邮件）是不同字符串，可共存，勿误删其一。
     "Mail",                # macOS 自带邮件 Mail（localizedName 形式 A，无 .exe 后缀）
     "com.apple.mail",      # macOS 自带邮件 Mail（bundleIdentifier 形式 B）
+    # --- MACOS-P4-SCENE-001 追加：macOS 可执行名（实测格式见 result.md；含空格的可执行名照原样写）---
+    "Microsoft Outlook",   # macOS Outlook（本机实测可执行名含空格，同 Microsoft Word/Microsoft Edge 命名规律）
+    "Outlook",             # macOS Outlook（无空格变体并存，防部分版本）
+    "Spark",               # macOS Spark Mail（可执行名惯例）
+    "Foxmail",             # macOS Foxmail（可执行名惯例）
 ]
 
 [[scene]]
@@ -223,6 +241,10 @@ exe = [
     "com.apple.Terminal",  # macOS 自带终端 Terminal（bundleIdentifier 形式 B）
     "iTerm2",              # macOS iTerm2（localizedName 形式 A）
     "com.googlecode.iterm2", # macOS iTerm2（bundleIdentifier 形式 B）
+    # --- MACOS-P4-SCENE-001 追加：macOS 可执行名（实测：Terminal.app/Contents/MacOS/Terminal）---
+    "Warp",                # macOS Warp 终端（可执行名惯例）
+    "Alacritty",           # macOS Alacritty（可执行名惯例）
+    "kitty",               # macOS kitty 终端（可执行名惯例）
 ]
 
 # ============================================================
@@ -283,6 +305,13 @@ exe = [
     # Gavin 早先点名要 Xcode，此前因「macOS 独占」搁置；现按本方案纳入（编辑器非终端）。macOS 侧 stub 未生效，先预置。
     "Xcode",               # macOS Xcode（localizedName 形式 A）
     "com.apple.dt.Xcode",  # macOS Xcode（bundleIdentifier 形式 B）
+    # --- MACOS-P4-SCENE-001 追加：macOS 可执行名（实测：VS Code exe=Code、Xcode exe=Xcode）---
+    "Code",                # macOS VS Code（本机实测 exe=Code，与 Windows Code.exe 是不同字符串）
+    "Cursor",              # macOS Cursor（可执行名惯例）
+    "Zed",                 # macOS Zed（可执行名惯例）
+    "Sublime Text",        # macOS Sublime Text（含空格可执行名，实测规范）
+    "IntelliJ IDEA",       # macOS IntelliJ IDEA（含空格可执行名）
+    "PyCharm",             # macOS PyCharm（可执行名惯例）
 ]
 
 # ============================================================
@@ -377,6 +406,12 @@ exe = [
     "com.apple.TextEdit",  # macOS 文本编辑（bundleIdentifier 形式 B）
     "Pages",               # macOS Pages（localizedName 形式 A）
     "com.apple.iWork.Pages", # macOS Pages（bundleIdentifier 形式 B）
+    # --- MACOS-P4-SCENE-001 追加：macOS 可执行名（实测：Microsoft Word exe=Microsoft Word 含空格）---
+    "Microsoft Word",      # macOS Microsoft Word（本机实测 exe=Microsoft Word，含空格）
+    "Obsidian",            # macOS Obsidian（可执行名惯例）
+    "Notion",              # macOS Notion（可执行名惯例）
+    "Bear",                # macOS Bear 笔记（可执行名惯例）
+    "Typora",              # macOS Typora（可执行名惯例）
 ]
 title_keywords = [
     # 浏览器网页文档编辑器兜底
@@ -475,6 +510,12 @@ exe = [
     "chromium.exe",        # Chromium
     # --- 设计工具（归 browser：设计文案非代码，web-friendly 风格更贴切，multiline_safe 同为 false）---
     "Figma.exe",           # ⚠️未证实：Figma 桌面版（官网 figma.com 有 Windows 包，exe 名未实测）
+    # --- MACOS-P4-SCENE-001 追加：macOS 可执行名（实测：Safari、Microsoft Edge 含空格）---
+    "Safari",              # macOS Safari（本机实测 exe=Safari）
+    "Google Chrome",       # macOS Google Chrome（含空格可执行名）
+    "Microsoft Edge",      # macOS Microsoft Edge（本机实测 exe=Microsoft Edge，含空格）
+    "Firefox",             # macOS Firefox（可执行名惯例）
+    "Arc",                 # macOS Arc 浏览器（可执行名惯例）
 ]
 title_keywords = [
     # 邮箱场景兜底（浏览器网页邮箱）

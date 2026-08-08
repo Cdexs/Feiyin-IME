@@ -1407,4 +1407,133 @@ title_keywords = ["doc_keyword"]
         assert_eq!(s.scene, SceneKind::Doc, "我的笔记 - Memos 应 doc");
         assert!(s.multiline_safe, "我的笔记 - Memos 应 true");
     }
+
+    // ============================================================
+    // TEST-SYNC-P4-SCENE-001: macOS 应用名分类护栏（coder-1 追加 41 行规则，落成测试）
+    // 输入均为空标题 → 纯 exe 精确匹配路径（不触发浏览器细分 title_keywords 干扰），
+    // 专门锁「含空格可执行名」「与 Windows 不同字符串」「macOS 条目与 .exe 命名互斥」。
+    // ============================================================
+
+    /// 含空格可执行名：macOS 浏览器（exe = Safari / Google Chrome / Microsoft Edge）
+    #[test]
+    fn p4_scene_macos_browsers_with_spaces() {
+        for (exe, label) in [
+            ("Safari", "Safari"),
+            ("Google Chrome", "Google Chrome（含空格）"),
+            ("Microsoft Edge", "Microsoft Edge（含空格）"),
+        ] {
+            let s = classify_builtin(exe, "");
+            assert_eq!(s.scene, SceneKind::Browser, "{label} 应 browser");
+            assert!(!s.multiline_safe, "{label} browser 应 false");
+        }
+    }
+
+    /// macOS 编辑器：Code（与 Windows Code.exe 是不同字符串，必须各自命中）
+    #[test]
+    fn p4_scene_macos_editor_code_bare() {
+        let s = classify_builtin("Code", "");
+        assert_eq!(
+            s.scene,
+            SceneKind::IdeTerminal,
+            "macOS Code 应 ide_terminal"
+        );
+        assert!(s.multiline_safe, "macOS Code 编辑器应 true（新块生效）");
+        // 反向护栏：Code 不能因为多了/少了 .exe 而串到 Windows 条目或漏判
+        let win = classify_builtin("Code.exe", "");
+        assert_eq!(
+            win.scene,
+            SceneKind::IdeTerminal,
+            "Windows Code.exe 仍 ide_terminal"
+        );
+        assert!(win.multiline_safe, "Windows Code.exe 仍 true");
+    }
+
+    /// macOS 终端 Terminal（ide_terminal multiline_safe=false 块，与编辑器块必须区分）
+    #[test]
+    fn p4_scene_macos_terminal_pure_terminal() {
+        let s = classify_builtin("Terminal", "");
+        assert_eq!(
+            s.scene,
+            SceneKind::IdeTerminal,
+            "macOS Terminal 应 ide_terminal"
+        );
+        assert!(!s.multiline_safe, "macOS Terminal 纯终端应 false");
+        // macOS 追加的终端类同块条目（Warp/Alacritty/kitty）一并钉住
+        for exe in ["Warp", "Alacritty", "kitty"] {
+            let s = classify_builtin(exe, "");
+            assert_eq!(s.scene, SceneKind::IdeTerminal, "{exe} 应 ide_terminal");
+            assert!(!s.multiline_safe, "{exe} 纯终端应 false");
+        }
+    }
+
+    /// macOS 文档：Microsoft Word（含空格）
+    #[test]
+    fn p4_scene_macos_word_doc() {
+        let s = classify_builtin("Microsoft Word", "");
+        assert_eq!(s.scene, SceneKind::Doc, "macOS Microsoft Word 应 doc");
+        assert!(s.multiline_safe, "macOS Microsoft Word doc 应 true");
+    }
+
+    /// macOS AI 助手：Claude（chat 块）
+    #[test]
+    fn p4_scene_macos_claude_chat() {
+        let s = classify_builtin("Claude", "");
+        assert_eq!(s.scene, SceneKind::Chat, "macOS Claude 应 chat");
+        assert!(!s.multiline_safe, "macOS Claude chat 应 false");
+    }
+
+    /// macOS IDE：Xcode（ide_terminal true 块）
+    #[test]
+    fn p4_scene_macos_xcode_ide() {
+        let s = classify_builtin("Xcode", "");
+        assert_eq!(
+            s.scene,
+            SceneKind::IdeTerminal,
+            "macOS Xcode 应 ide_terminal"
+        );
+        assert!(s.multiline_safe, "macOS Xcode IDE 应 true");
+    }
+
+    /// 反向护栏：Safari.exe（不存在的组合）不得命中 macOS 条目 Safari
+    /// exe_lower 精确匹配：集合里有 "safari"（macOS），但没有 "safari.exe" → 不命中 → Unknown
+    #[test]
+    fn p4_scene_macos_reverse_guard_bare_vs_dot_exe() {
+        let s = classify_builtin("Safari.exe", "");
+        assert_eq!(
+            s.scene,
+            SceneKind::Unknown,
+            "Safari.exe 不应命中 macOS 条目 Safari（精确匹配，.exe 是不同字符串）"
+        );
+        assert!(!s.multiline_safe, "Safari.exe Unknown 应 false");
+        // 正向对照：bare Safari 仍命中 browser
+        let s = classify_builtin("Safari", "");
+        assert_eq!(s.scene, SceneKind::Browser, "Safari 仍应 browser");
+    }
+
+    /// 🔴 零回归护栏（最重要）：追加 macOS 条目后，Windows 侧既有匹配不得被破坏
+    #[test]
+    fn p4_scene_zero_regression_windows_names() {
+        // chat：WeChat.exe（大写 WECHAT.EXE 一并覆盖大小写不敏感）
+        for exe in ["WeChat.exe", "WECHAT.EXE"] {
+            let s = classify_builtin(exe, "");
+            assert_eq!(s.scene, SceneKind::Chat, "{exe} 应仍 chat（回归）");
+            assert!(!s.multiline_safe, "{exe} chat 应 false");
+        }
+        // email：OUTLOOK.EXE
+        let s = classify_builtin("OUTLOOK.EXE", "");
+        assert_eq!(s.scene, SceneKind::Email, "OUTLOOK.EXE 应仍 email（回归）");
+        assert!(s.multiline_safe, "OUTLOOK.EXE email 应 true");
+        // ide_terminal：WindowsTerminal.exe（false 块）
+        let s = classify_builtin("WindowsTerminal.exe", "");
+        assert_eq!(
+            s.scene,
+            SceneKind::IdeTerminal,
+            "WindowsTerminal.exe 应仍 ide_terminal（回归）"
+        );
+        assert!(!s.multiline_safe, "WindowsTerminal.exe 纯终端应 false");
+        // doc：WINWORD.EXE
+        let s = classify_builtin("WINWORD.EXE", "");
+        assert_eq!(s.scene, SceneKind::Doc, "WINWORD.EXE 应仍 doc（回归）");
+        assert!(s.multiline_safe, "WINWORD.EXE doc 应 true");
+    }
 }

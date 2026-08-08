@@ -818,6 +818,36 @@
 
 - **下一步**：Gavin 2026-08-04 决定切换 LLM 模型做端测。换模型属高风险变更（`[LLM-COT-LEAK-001]` 教训 4），换后须主动看一轮 `debug.log`。
 
+---
+
+## DEC-045 · macOS 侧浮层必须是独立窗口，与 Windows 侧实现一致，禁止用托盘图标代替
+
+- **背景**：2026-08-04 macOS 侧 Phase 4 规划中，主控曾建议「录音窗口 / 处理中窗口降级为托盘图标状态，浮层整体不进第一版」，理由是 Win32 侧四个浮层共约 1,184 行 GDI，是 Phase 4 最大单块工作量。
+- **决策（2026-08-04 Gavin 拍板，推翻主控建议）**：
+  1. **录音必须有独立窗口**，**不能用托盘图标代替**——「不符合用户体验」
+  2. **必须和 Windows 侧的实现一致**
+- **适用范围**：与 Gavin 同日重申的「macOS 侧功能实现要参考 Windows 侧，做到尽量一致」一并适用于四个浮层（录音 / 处理中 / 失焦返显 / 错误信息）。**录音窗口为 P0**，其余三个按同一原则对齐。
+- **影响**：
+  - `MACOS-P4-OVERLAY-001` 从阶段 E（收尾）提到 **阶段 C（核心）**，与事件宿主同批
+  - 原 `MACOS-P4-FEEDBACK-001`（托盘状态 + 系统通知替代层）**取消其"替代浮层"的定位**；系统通知若保留，只能是浮层之外的补充，不得作为浮层的替身
+  - macOS 侧需引入 AppKit 窗口能力（`Cargo.toml:115-116` 预留的 `objc2` / `cocoa` 注释即为此准备）
+- **Windows 侧影响**：**零**。本决策只新增 macOS 实现，不触碰任何 Win32 绘制代码（DEC-033 第 4 条红线，Gavin 2026-08-04 第三次重申）。
+- **主控提取的 Windows 侧规格基线**（macOS 实现的对齐依据，全部实测自 `src/main.rs`）：
+
+  | 项 | Windows 实测值 | 出处 |
+  | --- | --- | --- |
+  | 录音 / 落波 / 处理中 / 错误 窗口尺寸 | **240 × 36** | `:549` `:551` |
+  | 失焦返显窗口尺寸 | **320 × 140** | `:553` |
+  | 窗口定位 | **水平居中；底部上移 64px**（`x=(screen_w-w)/2`, `y=(screen_h-h-64).max(0)`） | `overlay_geometry:1731-1744` |
+  | 窗口样式 | `WS_POPUP` + `WS_EX_TOOLWINDOW｜WS_EX_TOPMOST｜WS_EX_LAYERED｜WS_EX_NOACTIVATE` | `run_overlay_thread` 内 `CreateWindowExW` |
+  | 圆角 | DWM 圆角，不可用时回落 `SetWindowRgn`；绘制圆角半径 `CORNER_RADIUS=10` | 同上 + `:1062` |
+  | 透明度 | `SetLayeredWindowAttributes(LWA_ALPHA)`，alpha 可变 | 同上 |
+  | 录音窗配色 | 背景 `#0D0F11`／边框 `#070606`／品牌橙 `#FF6B00`／故障红 `#FF0000`／静音灰 `#808080` | `draw_recording_overlay:1056-1060`（COLORREF 为 `0x00BBGGRR`，此处已转 RGB） |
+  | 音频指示灯 | 18px 圆点，左边距 6px，垂直居中，4× 超采样抗锯齿 | `:1092-1094` |
+  | 指示灯三态优先级 | **红（缓冲为空＝设备故障）> 橙（level>0.01 有音频）> 灰（设备正常但静音）** | `:1097-1114` |
+
+  **macOS 对应物建议**（待 `MACOS-P4-OVERLAY-001` 任务书细化）：`NSPanel`（`.nonactivatingPanel` + borderless）≈ `WS_EX_NOACTIVATE`＋`WS_POPUP`；`window.level = .statusBar` ≈ `WS_EX_TOPMOST`；`collectionBehavior = [.canJoinAllSpaces, .stationary]`；`isOpaque=false` + `backgroundColor=.clear` ≈ `WS_EX_LAYERED`；不进 Dock / 不进 Mission Control ≈ `WS_EX_TOOLWINDOW`。
+
 - **决策时间**：2026-08-04
 
 ---
@@ -1064,5 +1094,28 @@ Gavin 原话是「万层如果能**被亿整除**就升到亿」。严格数学�
 ### 四、落点
 
 `itn-rules.toml` 的 `[protect.proper_nouns]`（人工组），**不是** `[protect.unit_collisions]`（机器派生组）。
+## DEC-046 · macOS 事件宿主改用 objc2 + NSApplication + CFRunLoop 直驱（**DEC-015 复议，其"以 Tauri 为宿主"作废**）
 
+- **背景**：DEC-015（2026-04-19）定「macOS 用 Tauri 作事件主机，不引入 objc2/NSRunLoop」。**该决策的前提到 2026-08-04 已不成立**：
+  1. 主程序 `feiyin-ime` 至今**不依赖 tauri**（实测根 `Cargo.toml` 无 tauri 依赖，tauri 只在 `src-tauri/` 的 Settings UI 子进程内）。照 DEC-015 原文执行 = 为借一个 run loop 把整个 WebView 运行时拖进主程序
+  2. **DEC-036 已要求四个浮层必须是独立窗口**，AppKit 窗口能力成为硬需求 → `objc2` 无论如何都要引，再套一层抽象纯属冗余
+- **主控对「winit 是不是 macOS 的事件循环机制」的澄清（Gavin 2026-08-04 追问）**：**不是。** winit 是 Rust 的**跨平台**窗口/事件循环库，在 macOS 上通过 `objc2` 驱动 NSApplication。macOS 的原生机制是 **`NSApplication`（AppKit）持有主线程 run loop + `NSRunLoop`/`CFRunLoop` + `NSEvent`**。
+- **决策（2026-08-04 Gavin 拍板「事件宿主选型按你建议方案来」）**：**objc2 + NSApplication + CFRunLoop 直驱**，不引入 winit / tao / 完整 Tauri。
+- **理由**：
+  1. **与 Gavin「参考 Windows 做到尽量一致」总纲最贴**，结构一一对应：
+
+     | Windows 侧 | macOS 对应物 |
+     | --- | --- |
+     | 隐藏 controller 窗口（DEC-001） | `NSApplication` |
+     | `GetMessageW` 主循环（`main.rs:2531`） | `NSApplication.run()` / CFRunLoop |
+     | 15ms `WM_TIMER` 轮询（`:2519`） | `CFRunLoopTimer` |
+     | `WM_APP_HOTKEY_EVENT` / `WM_APP_PIPELINE_EVENT` 唤醒 | `CFRunLoopSource` signal |
+
+  2. **仓库已有 CFRunLoop 可工作先例**：`src/platform/macos/hotkey.rs`（DEC-017）在独立线程上建 CFRunLoop 驱动 CGEventTap（`:259` `CFRunLoop::get_current()`、`:220` `.stop()`）
+  3. `core-foundation 0.10` / `core-graphics 0.25` 已是既有 macOS 依赖，无需新增
+  4. `Cargo.toml:115-116` 预留的 `objc2` / `cocoa` 注释原文即标注 "Phase 4 NSWindow transparent overlay"，与本决策同源
+  5. winit 的价值是跨平台，但**我们只会在 macOS 用它**（Windows 侧按红线不动），跨平台性在此收益为零
+- **⚠️ 待验证的唯一风险点**：`tray-icon 0.19` 在 macOS 上要求有活跃的 NSApplication，其官方示例基于 winit/tao。**自建 NSApplication 时它能否正常工作需实测**，已列为 `MACOS-P4-HOST-001` 的第一道验证关卡。**若实测不通，退回 winit 作为兜底**，届时另立决策记录。
+- **`cargo tree -i winit` 实测存档**：winit 0.30.13 确在依赖树内，但来源是 `eframe 0.29.1 → voice-ime`，而 `eframe`/`egui` 全仓**唯一使用者是 `src/crash/reporter.rs`**（crash-reporter 的 GUI），与 tray-icon 及管线代码无关。
+- **Windows 侧影响**：**零**。Windows 继续走 Win32 消息循环，本决策只新增 macOS 实现。
 - **决策时间**：2026-08-04

@@ -679,6 +679,192 @@ coder-1 在 DATA-SCENE-GENERIC-008 中评估后建议的候选：**`思维导图
 **⚠️ 主控自我修正（需回写 troubleshooting `[ITN-PREFIX-SHADOW-001]`）**：2026-07-30 写入的「误保护 = 优雅降级」结论**仅在语义单元内不含其他可转数字时成立**。`十一块九毛二` 是反例——`check_protection` 命中后只前移游标不锁定后续（`src/itn.rs:697-703`），后半段照转 → 产出一半汉字一半数字的**撕裂**。撕裂是第三种失败模式，比误保护严重。
 
 **待 Gavin 拍板三项（研究交付时一并呈报）**：① R2-C 货币目标形态（`11块9毛2` 保口语 vs `11.92元` 规范化）② R4 列表场景覆盖策略（维持现状 / 放开聊天类【危险】/ 单行降级保留序号 / 扩大 doc 识别面）③ R1 是否同时实施 F0 事实保全硬约束
+## 🍎 [macOS 侧] 2026-08-04 · Phase 4 管线实现规划（**规划稿，尚未派发**）
+
+> 来源：Gavin 2026-08-04 指令「把 macOS 侧管线 Phase 4 的任务规划出来」
+> **完整方案见 `collab/research/macos-phase4-plan-001.md`**（含逐任务的影响文件 / 具体改动 / 验收标准 / 边界矩阵）
+> 基线：`0adb819`（v0.7.3），主控本次逐文件实测，未采信既有文档结论
+
+**🔑 核心发现（改变了任务分解方式）**：`run_pipeline`（`main.rs:2812-3214`，402 行）与 `spawn_worker_thread`（`:2161-2459`，299 行）虽整体被 `#[cfg(target_os="windows")]` 门控，但**平台接触点分别只有 4 个和 1 个**，其余全是平台中立业务逻辑。**约 700 行核心管线可一次性转为双侧共享**，macOS 侧无需重写任何业务逻辑。这同时修正了 `docs/MACOS-HANDOFF.md` §2.8「管线代码层无法共享」的表述——那是当前状态，不是固有属性。
+
+| 阶段 | 编号 | 内容 | 建议负责人 | 状态 |
+| --- | --- | --- | --- | --- |
+| A | MACOS-P4-PROBE-001 | 实机可行性探针：cpal 实录 / sherpa-onnx 实跑 / TCC 权限 / CGEventTap 实收 / AX 授权弹窗 | tester-1 | ✅ **已验收**（A1/A2/A5 PASS，**A4 FAIL 查出真 bug**，A3 强度不足待复验） |
+| A+ | MACOS-P4-FIXHOTKEY-001 | 修 `KEYBOARD_EVENTS` 事件掩码越界（A4 的下游修复） | coder-2 | ✅ **已验收**（2026-08-04，主控独立复跑 `cargo check --all-targets` 0 errors） |
+| B | MACOS-P4-NEUTRAL-001 | 管线去平台化：`HWND`→`WindowId(usize)`、新增契约符号 `foreground_window_id`、去 cfg 门控 | coder-1 | ⏸ **归属待拍板** |
+| B | TEST-SYNC-P4-NEUTRAL-001 | 契约单测 + macOS 可达性烟测 | tester-1 | ⏸ |
+| C | MACOS-P4-HOST-001 | macOS 事件宿主 + 主循环 + 单实例锁 | coder-2 | ⏸ **选型待拍板** |
+| C | MACOS-P4-TRAY-001 | macOS 托盘（**不可与 HOST 并行**） | coder-1 | ⏸ |
+| C | **MACOS-P4-OVERLAY-001** | 录音浮层（Recording，P0）NSPanel 1:1 复刻 Win32 | coder-1 | ✅ **已验收**（2026-08-05，返工后主控独立取证：BORDER_GRAY `#070606` 已修正、性能四项已补数、SIGBUS 悬垂指针真缺陷已重构、probe 已删、工作区干净，提交 `d7b9f39`） |
+| C | **MACOS-P4-OVERLAY-WIRE-001** | **浮层接线**：接进模块树 + 跨线程请求通道 + 15ms timer 主线程应用 + PipelineEvent 七分支映射 | coder-1 | ✅ **接线部分已验收**（主控独立取证：`mod overlay;` 已加、overlay 5 条单测**首次真进测试二进制**（主控自跑 `--list` 确认）、Windows 导出块零改动、七分支齐全）。⚠️ **实机闭环仍降级**，转入 CFGGATE-001 C 项 |
+| **P0** | **MACOS-P4-CFGGATE-001** | 🔴 **修 macOS 专用函数缺 cfg 门控致 Windows 编译必炸**：`main.rs:2880/:2930` 无 `#[cfg]` 却引用 `request_tray_state`（TRAY-001 既有）+ `request_overlay`/`OverlayRequest`（WIRE-001 新增 7 处）。**Windows 侧已编不过一天多无人察觉**。含 11 个 macOS 专属符号全量扫描 + 实机重试 | coder-1 | ✅ **已验收**（主控**自写脚本独立重扫**，非采信 Worker 表：11 符号全部落 cfg(macos) item 内、未门控引用点 **0**；`cargo check --all-targets` CARGO_EXIT=0 / error 0；diff 恰好 +2 行；**主控追加全仓扫描**确认 macos 目录与 main.rs 之外零引用。🟢 **Windows 编译阻塞解除**） |
+| C | TEST-SYNC-P4-OVERLAY-WIRE-001 | 阶段三**预研**（只读零改动，产出写 outbox）：5 条单测走查 + 七分支真值表 + 线程契约 + 盲区预估 | tester-1 | 🔄 **进行中**（与 WIRE-001 并行安全，因零文件落地） |
+| C | MACOS-P4-OVERLAY-002 | 处理中 / 失焦返显 / 错误三态浮层 + **指示灯形状裁定**（Windows 实为麦克风图标，现实现为实心圆，主控裁定本轮不动） | 待定 | ⏸ |
+| ~~C~~ | ~~MACOS-P4-FEEDBACK-001~~ | ~~托盘状态替代浮层~~ → **已按 DEC-036 取消替代定位**（Gavin：不能用托盘图标代替录音窗口，不符合用户体验） | — | ❌ 作废 |
+| D | MACOS-P4-SCENE-001 | `capture_scene_signals` 真实现（NSWorkspace + AXUIElement） | coder-1 | ⏸ |
+| D | MACOS-P4-PERM-001 | `AXIsProcessTrustedWithOptions` 真实现（现为只打 log 的假实现） | coder-2 | ⏸ |
+| D | MACOS-P4-AUTOLAUNCH-001 | 自启动（建议 SMAppService） | 待定 | ⏸ |
+| **P1** | **MACOS-P4-AXINJECT-001** | **辅助功能 API 直写替代剪贴板注入**（解决剪贴板被污染/图片被永久覆盖）—— Gavin 2026-08-05 拍板独立 P1；**同日 12:1x 派发 coder-2**。三条主控裁定：①必须 `kAXSelectedTextAttribute`，**严禁** `kAXValueAttribute`（会抹掉用户已输入内容）②必须 `AXUIElementSetMessagingTimeout(0.5)`（否则无响应 App 会挂死 pipeline worker 线程）③必须检查 `AXError` 返回码 | coder-2 | ✅ **已验收**（三条裁定逐条 Read 核对全部落实；CARGO_EXIT=0/error 0；仅 `injection.rs` +122/−1）。🔴 **但主控 review 查出静默丢词风险** → 见下行 002 |
+| **P1** | **MACOS-P4-AXINJECT-002** | 🔴 **堵 AX 静默丢词**：部分实现 AX 的 App（Electron/Java Swing）接受 `SetAttributeValue` 并返回成功却不真插入 → `inject_text` 拿 Ok 即 return、**永不走剪贴板兜底** → 用户整段话消失。**推翻了 001 立项前提「最坏等同现状」**。修法：`AXUIElementIsAttributeSettable` 预检 + AX 成功日志带 `AXRole`。已否定两条歧路（写后读回：选区塌缩读回空串不可作判据；role 白名单：误伤自定义控件） | coder-2 | 🔄 **进行中** |
+| C | **MACOS-P4-OVERLAY-WIRE-002** | 抽纯函数 `overlay_request_for_event` 使七分支真值表可单测（**强制穷举 match，禁 `_ =>` 通配符**——通配符会让将来新增 PipelineEvent 变体静默落进 Hide）。由来：tester-1 预研指出映射内联在 handler 里夹三种副作用、单测调不动 | coder-1 | 🔄 **进行中** |
+| C | TEST-SYNC-P4-OVERLAY-WIRE-001 预研 | ✅ **已交付**（13683 B）。**核心发现（主控复核认同）：overlay 现有 5 条单测 4 条凑数 1 条半有效** —— `decay_rate_matches_windows` 是 `assert_eq!(常量, 它自己的字面量)`；三条波形测试独立重算公式不调生产路径，且 `lx<rx`／`8<=16` 恒真。**本次接线目前零真护栏** | tester-1 | ✅ 预研完成，阶段三待 WIRE-002 交付 |
+| D | MACOS-P4-READBACK-001 | AX 回读（学习路径）—— ⚠️ **主控已收回「相对 Windows 的能力优势」表述**：300ms 观察窗 + Word/Google Docs 读不到 + 全文 diff 昂贵，三重打折后产出存疑；建议优先考虑 `WORDBOOK-CORRECTION-UI-001` 显式纠错路线 | 待定 | ⏸ **降级** |
+| ~~E~~ | ~~MACOS-P4-OVERLAY-001~~ | 已上移至阶段 C（DEC-045） | — | ↑ |
+| E | MACOS-P4-BUNDLE-001/002 | `.app` 打包 + Info.plist TCC 声明 + 自签名证书（BUNDLE-002 已改自签名，禁 ad-hoc） | coder-2 | ✅ **已完成**（BUNDLE-002 2026-08-05：`build-macos.sh` 自签名 Feiyin Dev，实机 Build completed + Authority=Feiyin Dev；详见 outbox/coder-2/result.md）。⚠️ 公证仍不可做（无 Apple Developer 账号） |
+
+**边界评估结论**：阶段 B 独占 `src/main.rs`，期间禁止任何其他任务碰它；阶段 C 的 HOST 与 TRAY **必须串行**；阶段 D 的 SCENE / PERM / AUTOLAUNCH **可三路并行**，唯一交汇点 `macos/mod.rs` 的 re-export 行由主控统一改一次。
+
+**⏳ 阻塞在 Gavin 决策上的 5 项**（详见方案 §4）：① 阶段 B 归属与 Windows 零回归验证方 ② 事件宿主选型（**建议复议 DEC-015 的 Tauri，改用 winit**）③ 四个浮层是否进第一版 ④ Apple Developer 账号 ⑤ AX 回读是否提前。
+
+---
+
+## 🍎 [macOS 侧·待排期] MACOS-P4-AXINJECT-001 · 辅助功能 API 直写替代剪贴板注入
+
+> **⚠️ 本条仅适用于 macOS 侧，Windows 侧无需处理**（Windows 走 SendInput / 剪贴板双通道，机制不同、无此缺陷）。
+> 来源：Gavin 2026-08-04 端测关切「现在的回写方式确实会污染剪贴板，干扰到用户剪贴板输入」。
+> 参照：竞品 **Typeless** 官方文档明示其用 Accessibility 权限「paste text into any text field」，**不经剪贴板**（[installation-and-setup](https://www.typeless.com/help/installation-and-setup)）。
+
+### 现状与缺陷（主控实测 `src/platform/macos/injection.rs:49-64`）
+
+当前 `inject_via_clipboard` 流程：`pbpaste` 存旧内容 → `pbcopy` 写新文本 → sleep 50ms → enigo 发 Cmd+V → sleep `delay_ms` → `pbcopy` 恢复旧内容。
+
+**已有恢复逻辑，但存在四个真实缺陷（按严重度排序）**：
+
+| # | 缺陷 | 后果 |
+| --- | --- | --- |
+| **1** | **`get_clipboard_text()` 只用 `pbpaste`，仅支持纯文本**（`:119-134`） | 用户剪贴板里若是**图片 / 富文本 / 文件 / 多格式数据**，`old_content` 取不到 → `None` → **恢复分支根本不执行** → **用户原剪贴板内容被永久覆盖丢失**。这不是"污染"，是**数据丢失** |
+| 2 | 恢复是尽力而为（`let _ = set_clipboard_text(&old)`，忽略错误） | 恢复失败无感知、无日志 |
+| 3 | 约 **100ms+ 时间窗**内剪贴板是我们的内容 | 用户此刻手动粘贴会拿到错误内容 |
+| 4 | **剪贴板历史工具**（Paste / Maccy / Raycast 等）会记录每一次写入 | 每次听写都往用户剪贴板历史里塞一条垃圾，长期使用体验很差 |
+
+### 目标方案
+
+用 **AXUIElement 直写**替代剪贴板通道：取焦点元素（`kAXFocusedUIElementAttribute`）→ `AXUIElementSetAttributeValue` 写 `kAXValueAttribute`，或用 `kAXSelectedTextAttribute` 做插入。**全程不碰剪贴板。**
+
+### 实施要点
+
+- **保留剪贴板通道作为兜底**：AX 对某些 App（Electron / 部分 Java App / 未实现 AX 的自绘控件）不可用，失败时回退现有 `inject_via_clipboard`，与 DEC-018「clipboard-first + enigo fallback」的分层思路一致，只是把优先级改为 **AX → 剪贴板 → enigo.text()**
+- **权限已具备**：辅助功能权限本就是热键（CGEventTap）的前置条件，`MACOS-P4-PERM-001` 已补全授权弹窗，**不需要新增任何权限申请**
+- **保底路径不受 App 差异影响**：AX 写不进去就回退现有剪贴板通道，**最坏情况等同现状，不会更差**
+
+### 🔴 与 `MACOS-P4-READBACK-001` **不得捆绑**（Gavin 2026-08-05 拍板：AXINJECT-001 独立 P1）
+
+> **主控此前建议"两者合并为一个批次"，该建议已作废并收回。** 它们只是碰巧用同一套 `AXUIElement` API，但**价值与风险完全不同**，捆绑会让高价值的直写被低价值的回读拖累。
+
+| 项 | 价值 | 依赖 |
+| --- | --- | --- |
+| **AXINJECT-001（本条，注入）** | **高且确定**。解决真实数据丢失 + 剪贴板历史污染。**只需"写得进去"，有剪贴板兜底** | 无 |
+| `READBACK-001`（回读，学习） | **存疑**，见下 | 受三重打折 |
+
+**主控收回的一处过乐观表述**：此前写「macOS 的 AX 能真正读回，是本平台相对 Windows 的能力优势」。**该表述不准确**，实测复核后三点打折：
+
+1. **观察窗只有 300ms**（`main.rs:161` `AUTO_LEARN_OBSERVE_MS = 300`，`:3662` sleep 后即读一次就结束）。用户不可能在 300ms 内看完注入文本、发现错字并改掉——**真实纠错发生在数秒后，这条路径设计上就抓不到几乎任何真实纠错**。此缺陷与平台无关，Windows 侧同样存在
+2. **AX 覆盖面确实比 `WM_GETTEXT` 广**（原生 NSTextView / 备忘录 / Safari 输入框可读，而 `WM_GETTEXT` 在现代应用基本全废），**但读不到 Microsoft Word（非原生 AX 文本控件）与 Google Docs（编辑面是 canvas）** —— 而这恰是长文写作主场
+3. **全文 diff 代价高**：`extract_changed_text`（`main.rs`）走公共前缀+后缀夹逼，**数学上对整篇文档成立、不需要知道光标位置**，但要把全文 `chars().collect::<Vec<char>>()` **两次**（before/after）。50 页文档每次听写数十 MB 临时分配
+
+**→ 真要修好「注入后纠错学习」，正确路线不是 AX 回读，而是既有待排期项 `WORDBOOK-CORRECTION-UI-001`**（注入后浮层显示「纠错」小按钮，用户点了才进编辑）：**显式交互，不猜、不轮询、不受 App 差异影响，且没有时间窗问题**。
+
+### 影响文件（预估）
+
+`src/platform/macos/injection.rs`（主体）+ 可能新增 `src/platform/macos/ax.rs`。**不碰 `src/platform/windows/**`，不碰平台中立模块，对 Windows 侧零影响。**
+
+### 优先级：**P1 独立排期**（Gavin 2026-08-05 拍板）
+
+**不阻塞当前闭环** —— pbcopy+Cmd+V 现在能工作。但 Gavin 日常使用会持续被缺陷 1（复制的图片被永久覆盖）与缺陷 4（剪贴板历史被塞垃圾）硌到，**Phase 4 主体交付后立即排期，不等 READBACK**。
+
+---
+
+## 🍎 [macOS 侧] 2026-07-31 · 接收 v0.7.3 并启动编译基线取证
+
+> 本节由 **macOS 侧主控**追加（遵守 `docs/MACOS-HANDOFF.md` §2.7 共编约定：只追加己方条目，不改写对侧段落）。
+> 已 pull `a38a315` → `0adb819`（5 提交，21 文件 +1804/−89），版本号三处实测同步为 **0.7.3**。
+
+### ✅ 已闭环
+
+| 编号 | 内容 | 影响文件 | 负责人 | 状态 |
+| --- | --- | --- | --- | --- |
+| MACOS-CARGOCHECK-BASELINE-002 | **纯取证零改动**：`source scripts/env-macos.sh` 后跑三处 `cargo check`（主程序 `--all-targets` / `src-tauri` / crash-reporter bin）+ 前端只读构建，产出 v0.7.3 在 macOS 上的完整错误清单 | — | tester-1 | ✅ **已验收**（2026-07-31，含主控一处计数修正） |
+
+**🎉 核心结论：v0.7.3 在 macOS 上编译零错误——主程序 `--all-targets` 0 / `src-tauri` 0 / crash-reporter 0 / 前端 build 成功。Windows 侧本批 5 个提交未引入任何跨平台破坏，无 (a) 类平台中立模块错误，无 (b) 类 cfg 门控漂移。**
+
+**主控独立取证（未采信汇报表格，详见 `logs/20260731.md`）**：
+
+- **主控亲自复跑 `cargo check --all-targets` → 0 errors**（`Finished dev profile in 8.32s`，exit=0），**亲自复跑 `src-tauri` → 0 errors / 13 warnings** 与汇报逐字吻合。这是本次验收的决定性证据
+- **`AppConfig` 零字段改动经字段级双向 grep 核实**：新增 `pub xxx:` 字段 **0**、删除 **0**；+54 行的实体是平台中立方法 `remember_translation_direction()` + 2 条单测。**DEC-033 附则三点名的最高风险面本批次未被触碰**
+- **既有 E0432 消失的归因正确**：主控 `git show 6f0b51e -- src/main.rs` 核实，该提交给 `use super::select_preprocessing_params` 及其下 5 个 `#[test]` 各加了 `#[cfg(target_os = "windows")]`，且刻意未把同 use 语句里的 `transcription` 一起 cfg 掉（避免误伤其他测试）
+- **诚信记录（正面）**：tester-1 **未顺着任务书预设走**。主控在任务书里写的是「既有 E0432 会换行号出现，属既有」，它实测后给出「该错误已整体消失」并追查到 `6f0b51e` 这个正确出处，而非套用主控框架交差
+- **边界合规**：`git status --porcelain` 仅主控自己的 `M collab/todo.md` + `?? logs/20260731.md`；源文件、版本号、`ui/package-lock.json` 零改动
+- **❌ 主控修正一处**：汇报称 `src/main.rs:2962` 有乱码注释残留，属实但**计数不全，实际 5 处**（`2483 / 2673 / 2689 / 2722 / 2962`）。已据此更新下方 MOJIBAKE-COMMENT-001
+
+**⚠️ 验证陷阱（供后续验收避坑）**：存在**两个同名 outbox**——`CodeLab/collab/outbox/tester-1/result.md` 是 dispatch.sh 实际写入路径（本次 13095 字节，正确）；`voice-ime/collab/outbox/tester-1/result.md` 是项目内同名目录，仍停留在 07-30 的旧任务文件。主控首次误取后者，一度怀疑 [COLLAB-WRITE-001] 复发，**实际未复发**。后续一律以前者为准，项目内陈旧副本建议清理。
+
+**下游**：原预设的 `MACOS-FIX-COMPILE-002` **无需派发**——零错误，无可修。
+
+| 编号 | 内容 | 影响文件 | 负责人 | 状态 |
+| --- | --- | --- | --- | --- |
+| MACOS-TESTEXEC-V073-001 | **测试执行零改动**：主程序 `cargo test` + `src-tauri` + Vitest + pytest `--collect-only`；**并量化跨平台测试盲区**；定向复核 `time_half` 与 ITN 1386 条词表 | — | tester-1 | ✅ **已验收**（2026-07-31，含主控两处实质补正） |
+
+**🎉 核心结论：v0.7.3 在 macOS 上唯一失败是既有的 `itn::tests::time_half`，且属 Gavin 明知并接受的取舍。** 完整数字（主控 `--no-fail-fast` 取得）：**701 passed / 1 failed / 8 ignored = 710**，与 `--list` 实测 710 完全自洽。`src-tauri` **53/0/0**、Vitest **54/54**、pytest 收集 147/156 无回归——三项主控均亲自复跑确认。
+
+**❌ 主控补正一（本次验收最有价值的一项）· 汇报的「全量」实际不全**：`cargo test` **默认在首个失败 target 处中止**，后续测试二进制不执行。汇报的 `637/1/6` **只是主程序 bin 一个 target**，其后 crash-reporter bin（28/0/2）与 5 个集成测试（3+12+10+2+9）**在其会话中从未运行**，共 **66 条**。汇报中其实已有未被察觉的内部矛盾：`637+1+6=644` 而同报告 `--list` 为 710，差 66 无人解释。**结论方向未变（确实只 1 个失败），但此前被验证的范围不足。**
+
+> **⚠️ 派发纪律（即刻生效）**：**后续所有测试执行类任务的任务书必须强制要求 `cargo test --no-fail-fast`**。否则在存在任一失败时，「全量回归通过」是不成立的断言。
+
+**🔍 `time_half` 根因主控已定位到确切行号**：断言在 `src/itn.rs:1295`（`normalize_test("八点半")` 期望 `"8点半"`）；根因是 `itn-rules.toml:432` 的 **`[protect.unit_collisions]`** 分组内含 **`"八点半"`**——正是 `0adb819` 本批次新增的 1386 条 Type A 碰撞保护词表，保护该词导致「八」不再转「8」。**这不是缺陷，是 Gavin 2026-07-30 明知并接受的取舍**（[ITN-PREFIX-SHADOW-001]，「明知前缀遮蔽缺陷仍照常落地」「不以测试通过为出包前提」）。断言与词表均为平台中立文件，**Windows 侧同样红，与平台无关的判断成立**。三个待选处置（改断言 / 从词表剔 `八点半` / 保持现状）仍待 Gavin 端测后决定。
+
+**❌ 主控补正二 · 盲区数应为 22 非 23，占比应为 ~3.0% 非 3.27%**：
+
+| 来源 | 条数 | 门控方式 |
+| --- | --- | --- |
+| `src/main.rs` | **5**（汇报记 6） | 逐条 `#[cfg(target_os = "windows")]`，与 `6f0b51e` 实际只给 5 个 `#[test]` 加 cfg 吻合 |
+| `src/platform/windows/hotkey.rs` | 15 | **模块级**——`src/platform/mod.rs:58-59` 的 `#[cfg(target_os = "windows")] mod windows;` |
+| `src/platform/windows/scene.rs` | 2 | 同上（汇报记作「scene 2」，实为同一模块级门控，非独立 scene 模块） |
+| **合计** | **22** | 另核实被门控的 `mod hotkey`/`mod injection`（`main.rs:9/12`）内 `#[test]` 均为 0 |
+
+占比口径：汇报的 3.27% 用了分母 703（**Windows v0.7.2 的 `--list`**），与 v0.7.3 macOS 数字混用。正确为 `22/(710+22)` ≈ **3.0%**。
+
+**💡 盲区的实质分布比占比更重要**：22 条中 **17 条（77%）集中在 `platform/windows/`**，即**热键与场景采集**。这两块 macOS 有各自独立实现（`platform/macos/hotkey.rs` 等），**其行为在本侧零测试覆盖** —— 补 macOS 管线时这里是首要补测目标。
+
+**📌 附带核实：TEST-FIX-002/003 应从下方遗留表移除**——主控核实 `ui/src/test/setup.ts:18` 的 `vi.mock("@tauri-apps/api/core", ...)` 早在 **`f10c1e0`（v0.6.2）** 即存在，非近期修复，**这两条遗留记录长期过时**。本次 macOS 侧 54/54 全绿可作移除依据（建议 Windows 侧复核一致后删除）。
+
+**边界合规**：`git status --porcelain` 仅主控自己的 `M collab/todo.md` + `?? logs/20260731.md`；源文件/测试文件/版本号/`ui/package-lock.json` 全部零改动；未 npm install、未出包、未 cargo clean、未执行 pytest 用例、未用 git 破坏性命令。
+
+**派发动因（Gavin 2026-07-31 选定）**：编译过 ≠ 行为对。本批次带进 1386 条 ITN 碰撞保护词表 + ITN 顺序反转（DEC-035）+ 翻译双向化，均未在 macOS 上跑过测试。
+
+**任务书的核心设计 —— 目标 B「量化跨平台测试盲区」**：当前无 CI 防线，`#[cfg(target_os = "windows")]` 门控的测试在 macOS 上**根本不会编译进测试二进制**，故 macOS 上「全绿」覆盖不到的那部分行为**永远不会在本侧暴露**。**我们至今不知道这个盲区有多大**。要求产出：macOS `--list` 实际条数 / ignored 数 / 被 cfg 门控掉的条数 / **盲区占比**，并列出**哪些模块在 macOS 上完全无测试覆盖**。这是本任务相对常规回归的独特价值。
+
+**主控派发时已明确的判据**：**failed 数是唯一判据，passed 数低于 Windows 基线属正常**（cfg 门控必然导致 macOS 跑到的条数更少），不得当成回归上报。Windows v0.7.2 对照基线：主程序 695/0/8、src-tauri 53/0/0、Vitest 54/54。参考量级：全仓 `src/` 共 676 处 `#[test]`（`llm/mod.rs` 103 / `itn.rs` 97 / `translation/mod.rs` 32 / `config/mod.rs` 27）。
+
+**要求按三类归因每个失败**：**(a)** 真实跨平台缺陷 ｜ **(b)** 测试自身的平台假设（写死 Windows 路径/分隔符/换行符）｜ **(c)** 既有遗留（TEST-FIX-002/003、`time_half`）。三类处置方式完全不同。
+
+**已明示为能力缺口而非跳过**：`collab/build-test-guide.md` 的 Step 3/4（pytest smoke / E2E）全文以 Windows 为前提（pywinauto / `.exe` / PowerShell 截图 / `RegisterHotKey` 模拟），**macOS 侧目前没有可用的 GUI/E2E 测试实现**。本轮 pytest 只做 `--collect-only`（确认 `2051993` 解锁的 147 条仍能正常收集，防收集期回归）。补 macOS 章节仍是 DEC-033 附则三列出的待排期文档缺口。
+
+**派发动因**：本次 pull 大改的正是**双侧共享的平台中立模块**——`src/itn.rs` **+451**、`src/main.rs` **151 行变动**、`src/translation/mod.rs` **+196**、`src/config/mod.rs` **+54**——而**这 5 个提交在 macOS 上从未编译过**。DEC-033 附则二警告的「破坏在提交那刻发生、切机器那刻才暴露」窗口正在此处，当前无 CI 防线。
+
+**对比基线**（`2c98976` + MACOS-FIX-COMPILE-001 后实测）：`cargo check` **0 errors**；`--all-targets` 仅剩 1 个既有 test-only E0432（`select_preprocessing_params`，原 `main.rs:4349`，本次行号必然已漂移）。
+
+**要求 Worker 按两类定性每个新错误**：**(a)** 平台中立模块自身的编译错误 ｜ **(b)** cfg 门控漂移（Windows 侧新增符号只在 `cfg(windows)` 下存在）。两类修复方式不同，(b) 属 DEC-033 接缝问题需回报对侧或补 stub。特别核查 `AppConfig` +54 行是否新增/改名字段（DEC-033 附则三第 2 条点名的最高风险动作）。
+
+**下游**：错误清单 → `MACOS-FIX-COMPILE-002`（尚未派发）。
+
+### 主控已核实的 Windows 侧交接要点
+
+| 项 | 主控独立取证结论 |
+| --- | --- |
+| **DEC-035 管线顺序契约**（`MACOS-HANDOFF.md` §2.8） | ✅ 确为**纯文档契约**——`src/main.rs:3431` 的 `mod macos_stubs` 仍在，`run_pipeline` 整个函数在 `#[cfg(target_os = "windows")]` 内，**代码层无法共享**。本方将来实现管线时若把 ITN 放回 LLM 之前，℃ 缺失缺陷会在 macOS 完整复现 |
+| **§2.6 平台中立模块清单** | ✅ `grep -c target_os` 实测为 **0** 属实：`itn.rs` / `translation/mod.rs` / `text_normalizer.rs` / `config/mod.rs` / `llm/mod.rs` 五个模块可双侧直接复用 |
+| **§2.4 禁止 AI 署名** | 已知悉。规则原只在 Gavin 用户级 `~/.claude/CLAUDE.md`，本方此前无从得知；`a38a315` 已带 `Co-Authored-By`，对方明确**不要求返工**，后续遵守 |
+| **DEC-030-① 已作废** | 已知悉：ITN「转录后 / LLM 前挂入管线」的原文自 DEC-035 起作废，任何 Agent 不得依 DEC-030 原文把 ITN 挪回 LLM 之前 |
+
+### ⏳ 阻塞在 Gavin 决策上
+
+| 项 | 说明 |
+| --- | --- |
+| **npm lock 双平台失同步** | Windows 侧 §6.1 已依实测**推翻**原「两侧统一 `npm ci`」约定，并更正了自己「大版本相同、漂移风险低」的原判断。实测：任何一侧单独生成的 lock 都无法同时满足对方 `npm ci`，差异纯粹是 npm 11.6.2 与 11.16.0 记录 lock 完整性的方式不同（**包版本逐键比对完全一致，无依赖漂移**）。真正解法是钉死两侧 node/npm 版本；对方已用免提权 shim 把 Windows 侧收口到 11.16.0。**待 Gavin 拍板是否升级 Windows 侧 node，本项阻塞中。**本方在此期间**禁止任何 Worker 执行 `npm install` / `npm ci`** |
+
+### 📌 附带发现（协作框架缺陷，未修复）
+
+`collab/lib/env.sh:17` 用 `${BASH_SOURCE[0]}` 推导 `COLLAB` 路径，**zsh 下失效**（zsh 不设 `BASH_SOURCE`）→ 变量为空 → `COLLAB` 被推导成当前目录的父目录，`dispatch` 报路径错误。**与 2026-07-30 coder-1 在 `scripts/env-macos.sh:11` 修掉的是同一个 bug**（修法为 `${BASH_SOURCE[0]:-$0}`）。macOS 默认 shell 即 zsh，凡从 zsh 直接 `source dispatch.sh` 均会踩到。主控当前用 `bash -c` 绕过，**未改动该文件**（属 `collab/` 框架，在本仓库之外）。
 
 ---
 
@@ -1299,7 +1485,7 @@ coder-1 在 DATA-SCENE-GENERIC-008 中评估后建议的候选：**`思维导图
 | TEST-FIX-003 | Wordbook.test.tsx `getByRole("dialog")` 无 role 属性时报错 | `ui/src/pages/Wordbook.test.tsx` | 低 |
 | TECH-DEBT-001 | parse_version 实现不一致：主程序先 split('-') 再 split('.')，Tauri 侧先 split('.') 再 split('-')，prerelease 处理结果有差异 | `src/version_check/mod.rs` + `src-tauri/src/version_check.rs` | 低 |
 | ACC-DEGRADE-UI-001 | accuracy 静默降级 performance 时 UI 仍显示 accuracy（可观测性缺口，Gavin 环境不触发；accuracy 已隐藏后影响进一步收窄） | `src/transcription/mod.rs:532-547` | 低 |
-| MOJIBAKE-COMMENT-001 | `main.rs` ~L2996 TRANS-008 段既有 mojibake 注释（历史编码损伤，非功能影响），归入待清理小项（LANG-AUTO-001-CORE 验收时发现，2026-07-14） | `src/main.rs` | 低 |
+| MOJIBAKE-COMMENT-001 | `main.rs` 既有 mojibake 注释（历史编码损伤，非功能影响），归入待清理小项（LANG-AUTO-001-CORE 验收时发现，2026-07-14）。**2026-07-31 macOS 侧主控全文件扫描更正计数：实际 5 处** —— `2483 / 2673 / 2689 / 2722 / 2962`（原记「~L2996 一处」偏少）。已核实为既有（基线 `a38a315` 即存在），且 `0adb819` 批次已顺手清掉另一处同源乱码。清理时须以 UTF-8 无 BOM 读写 | `src/main.rs` | 低 |
 
 ---
 

@@ -16,10 +16,20 @@
 //! | 模块 | 符号 |
 //! |---|---|
 //! | autolaunch | `enable`, `disable`, `is_enabled` |
-//! | event_loop | `create_controller_window`, `destroy_controller_window`, `run_message_loop` |
+//! | event_loop | `create_controller_window`, `destroy_controller_window`, `run_message_loop`, `foreground_window_id` |
 //! | hotkey | `notify_config_changed`, `HotkeyEvent`, `HotkeyListener` |
 //! | injection | `capture_focused_text_snapshot`, `copy_text_to_clipboard`, `inject_text`, `read_text_from_hwnd`, `FocusedTextSnapshot` |
-//! | scene | `capture_scene_signals` |
+//! | scene | `capture_scene_signals`, `capture_scene_signals_by_id` |
+//!
+//! ### 平台中立符号（两侧签名完全一致，共享代码可直接调用）
+//!
+//! - `WindowId` — 不透明窗口标识类型别名（`pub type WindowId = usize;`），
+//!   两侧语义各自定义。Windows 侧是 `HWND.0 as usize`，macOS 侧第一版返回 0
+//!   表示「无法判定焦点」（见 `foreground_window_id`）。
+//! - `capture_scene_signals_by_id(id: WindowId) -> Option<(String, String)>`
+//!   — 由 `capture_scene_signals` 派生的 by-id 版本，供平台中立代码调用。
+//! - `foreground_window_id() -> WindowId`
+//!   — 返回当前前台窗口的 `WindowId`。macOS 第一版返回 0（降级语义）。
 //!
 //! ### 平台相关类型差异（刻意保留，不是遗漏）
 //!
@@ -59,25 +69,45 @@
 mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::{
-    capture_focused_text_snapshot, capture_scene_signals, copy_text_to_clipboard,
-    create_controller_window, destroy_controller_window, disable, enable, inject_text, is_enabled,
-    notify_config_changed, read_text_from_hwnd, run_message_loop, FocusedTextSnapshot, HotkeyEvent,
-    HotkeyListener,
+    capture_focused_text_snapshot, capture_scene_signals, capture_scene_signals_by_id,
+    copy_text_to_clipboard, create_controller_window, destroy_controller_window, disable, enable,
+    foreground_window_id, inject_text, is_enabled, notify_config_changed, read_text_from_hwnd,
+    run_message_loop, FocusedTextSnapshot, HotkeyEvent, HotkeyListener,
 };
 
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{
-    capture_focused_text_snapshot, capture_scene_signals, copy_text_to_clipboard,
-    create_controller_window, destroy_controller_window, disable, enable, inject_text, is_enabled,
-    notify_config_changed, read_text_from_hwnd, run_message_loop, FocusedTextSnapshot, HotkeyEvent,
-    HotkeyListener,
+    capture_focused_text_snapshot, capture_scene_signals, capture_scene_signals_by_id,
+    copy_text_to_clipboard, create_controller_window, destroy_controller_window, disable, enable,
+    foreground_window_id, inject_text, is_enabled, notify_config_changed, read_text_from_hwnd,
+    request_stop, run_message_loop, run_message_loop_with_hotkey_listener, FocusedTextSnapshot,
+    HotkeyEvent, HotkeyListener, TrayCommand,
 };
+// TRAY-FIX-001: macOS status bar tray (NSStatusItem) — 单独导出，避免在顶行列表混淆。
+#[cfg(target_os = "macos")]
+pub use macos::{
+    build_tray, poll_pending_tray_states, request_tray_state, set_tray, shutdown_tray,
+};
+
+// OVERLAY-WIRE-001: macOS recording overlay (NSPanel + CGContext) 跨线程请求通道。
+// 仿 tray 模式单独导出；poll_pending_overlay 走 event_loop 内部路径不导出。
+#[cfg(target_os = "macos")]
+pub use macos::{init_overlay_levels, request_overlay, shutdown_overlay, OverlayRequest};
 
 use std::sync::{Arc, RwLock};
 
 use crate::config::AppConfig;
+
+/// 不透明窗口标识类型（两侧语义各自定义）。
+///
+/// - Windows 侧：`HWND.0 as usize`（裸指针转数值）。
+/// - macOS 侧：第一版返回 0 表示「无法判定焦点」，与 Windows 侧
+///   `target_hwnd` 为空（`is_null()`）时的降级语义一致。
+///
+/// 供平台中立代码（如 `run_pipeline_core`）使用，避免直接接触 `HWND`。
+pub type WindowId = usize;
 
 /// Create platform-specific hotkey listener
 #[cfg(target_os = "macos")]

@@ -73,6 +73,18 @@
 # handoffs · voice-ime
 
 ## 2026-08-04 — tester-1 — TEST-SYNC-026 ✅ ITN-FIX-CHAIN-TEAR-026 测试同步（阶段三）
+## 2026-08-04 — coder-2 — MACOS-P4-FIXHOTKEY-001 ✅ 修 CGEventTap 事件掩码越界（P0）
+
+- **来源**：`MACOS-P4-PROBE-001` 实机探针 A4 FAIL：listener 线程因 `KEYBOARD_EVENTS` 含 `TapDisabledByTimeout/UserInput` 在 `CGEventMaskBit!` 计算中 panic
+- **范围**：仅改 `src/platform/macos/hotkey.rs:28-38` 的 `KEYBOARD_EVENTS` 常量，移除两个带外事件，保留 `:102-103` 回调分支与 `:272-275` 重启逻辑
+- **根因**：`TapDisabledByTimeout = 0xFFFFFFFE` / `TapDisabledByUserInput = 0xFFFFFFFF` 是 core-graphics 标注的 "out of band" 通知，不应放入 event mask；其判别值远超 `u64` 位宽，`1_u64 << 0xFFFFFFFE` 在 debug 下 panic、release 下静默产生错误位
+- **验证**：`source scripts/env-macos.sh && cargo check` → 0 errors；`cargo check --all-targets` → 0 errors
+- **红线**：未碰 `src/main.rs` / `src/platform/mod.rs` / `src/platform/macos/mod.rs`（coder-1 并行占用）；未改 Windows 任何文件；未 `cargo build --release` / 出包 / 运行 exe；未使用 git 破坏性命令；UTF-8 无 BOM
+- **下游**：本修复为热键实机复测前置条件；A5 accessibility stub 仍待 `MACOS-P4-ACCESSIBILITY-001`
+
+---
+
+## 2026-07-30 — tester-1 — BUILD-RELEASE-20260730-002 ✅ v0.7.3 全量出包完成
 
 - **来源**：基线 `9edc839`（coder-1 026+026-B 代码落地但 TEST-SYNC 缺失）。改动 B 允许单段 currency 链，打开误转风险面。
 - **A T6-T10 复核**：T6-T9 充分，T10 原 6 条补齐至 12 个 DEC-038 货币族保护词条（+二块钱/六块钱/八块钱/一毛钱/一角钱/五角钱）
@@ -217,3 +229,193 @@
 - **边界**：`src/text_normalizer.rs`/`src/scene/mod.rs`/`scene-rules.toml`/`src/itn.rs`/`itn-rules.toml`/`src/main.rs`/`src-tauri/**`/`ui/**` 零触碰；未构建/出包/启动 exe；未改版本号（0.7.3）；未用 git 破坏命令；UTF-8 用 edit 工具
 - **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-2/result.md`（非空）
 
+
+> 只保留当天条目，>200 行时归档到 handoffs-archive.md。
+
+## 2026-08-04 — tester-1 — MACOS-P4-PROBE-001 ✅ 五项探针完成（A1/A2/A5 PASS，A4 FAIL，A3 部分 PASS）
+
+- **来源**：主控派发 Phase 4 首项探针任务，验证「录音能不能录、模型能不能跑、热键能不能收」三大假设
+- **范围**：零源文件改动（`src/` / `src-tauri/` / `ui/` / Cargo.toml / 版本号文件全部未碰），仅临时创建 `src/bin/probe_mic.rs` + `src/bin/ui/overlay.rs`（#[path] 挂载探针），跑完已删除
+- **核心结论**：
+  - **A1 cpal 录音**: PASS — 能录（RMS=0.108048 非零），系统默认麦克风「外置麦克风」正常采集
+  - **A2 sherpa-onnx 转录**: PASS — SenseVoice 模型加载 0.594s，转写 0.256s，RTF=0.0458，文本正确「开饭时间早上九点至下午五点」，无 dyld/@rpath 错误
+  - **A3 TCC 终端 vs .app**: 部分 PASS — Terminal（com.apple.Terminal）与 .app（com.voice-ime.probe-mic）TCC 主体不同，.app 未阻塞但生产环境仍需引导授权
+  - **A4 CGEventTap 热键**: **FAIL** — `KEYBOARD_EVENTS` 包含 `TapDisabledByTimeout(0xFFFFFFFE)` / `TapDisabledByUserInput(0xFFFFFFFF)`，导致 `CGEventMaskBit` 宏触发 `1_u64 << 0xFFFFFFFE` panic（core-graphics-0.25.0/src/event.rs:627）。DEC-017 首次实机暴露 bug
+  - **A5 辅助功能弹窗**: PASS — `ax_is_process_trusted_with_prompt()` 确为 stub（仅 `log::info!`），未调用真实 `AXIsProcessTrustedWithOptions`
+- **方案协商**：tester-1 发现 binary-only crate 问题并上报（无 src/lib.rs），主控裁定采用 #[path] 方案③，实测编译通过并成功挂载 audio/platform 模块
+- **Phase 4 下游影响**：A1/A2 成立 → 后段管线可复用；A4 FAIL → 需修 `hotkey.rs:28-34` KEYBOARD_EVENTS 后才能进入热键测试；A5 stub → 需补真实 FFI
+- **边界**：零源文件改动，临时探针已删除，git status src/ / src-tauri/ / ui/ / Cargo.toml 全部 clean，未使用 git 破坏性命令
+- **详情**：`collab/outbox/tester-1/result.md`（10,353 字节）
+
+## 2026-08-04 — coder-1 — MACOS-P4-NEUTRAL-001 ✅ run_pipeline 管线去平台化完成（402 行业务逻辑变双侧可复用）
+
+- **范围**：把 `run_pipeline`（src/main.rs，原 :2812-3214，402 行）从 Windows 专属变为平台中立。`spawn_worker_thread` 经主控裁定本轮完全不动。
+- **方案协商两轮**：
+  - 第5接触点（我提出）：`spawn_worker_thread` 参数耦合 `WorkerCommand`/`StartCmd`/`SendHwnd`（均带 `#[cfg(windows)]`），且 `SendHwnd` 还服务 overlay 线程。**裁定 B**：本轮不动，另立 MACOS-P4-NEUTRAL-002。
+  - 第6接触点（我提出）：`run_pipeline` body 调用 3 个 `#[cfg(windows)]` 辅助函数（select_preprocessing_params/should_try_llm_translate/try_nllb_translate，均平台中立纯 Rust）。主控穷举核查 29 个 cfg 门控函数仅此 3 个被调用。**裁定 A**：删 3 行 cfg 属性（对 Windows 构建为可证明 no-op），函数体不动。
+- **改动**（6 文件）：main.rs（run_pipeline→薄封装委托 run_pipeline_core + 删3行cfg属性）/ platform/mod.rs（WindowId=usize + 2 新导出）/ windows/{scene,event_loop,mod}.rs（纯新增3函数+2 re-export，Windows 零删除）/ macos/mod.rs（纯新增2函数，foreground_window_id 返回0降级）。
+- **验证**：body 去空白 md5 自证逐字节保留（仅2接触点改动，0 mismatch）；Windows `git diff --numstat` 删除列全 0；`cargo check` + `--all-targets` 均 0 errors；两份导出清单各 17 符号逐一对应；6 文件无 BOM。
+- **衍生收益（本轮不做）**：select_preprocessing_params 去 cfg 后，6f0b51e 的 5 个 #[test] 具备 macOS 跑条件，TEST-SYNC 解除可减 22 条盲区中 5 条。
+- **红线遵守**：未破坏 Windows 既有功能；未碰 macos/hotkey.rs（coder-2 并行）；未动 spawn_worker_thread/macos_stubs/三类型/translation_needs_reload；未 build --release/出包/碰 Publish；未改版本号/Cargo.toml；未 npm install/cargo clean；未用 git 破坏命令；UTF-8 无 BOM。
+- **详情**：`collab/outbox/coder-1/result.md`（8746 字节，非空）
+
+## 2026-08-04 — tester-1 — TEST-SYNC-P4-NEUTRAL-001 ✅ 测试同步完成（阶段三，13 条测试，cargo check --tests 0 errors）
+
+- **来源**：主控派发 TEST-SYNC 任务（阶段三），覆盖 FIXHOTKEY + NEUTRAL 两批改动的测试同步
+- **范围**：仅改 `#[cfg(test)]` 块 + 6 行 cfg 属性，零生产代码改动
+- **P0-1 解除 cfg 门控**：`src/main.rs` 解除 `select_preprocessing_params` 的 6 处 `#[cfg(target_os = "windows")]`（1 use + 5 test）。函数平台中立确认安全。盲区从 22 条降至 17 条
+- **P0-2 KEYBOARD_EVENTS 护栏**：`src/platform/macos/hotkey.rs` 新增 2 条测试——判别值 <64 安全范围 + 显式黑名单断言不包含 TapDisabled* 带外事件
+- **P0-3 foreground_window_id 契约**：`src/platform/macos/mod.rs` 新增 1 条测试，断言第一版返回 0，注释标注「将来真实实现时会变红」
+- **P0-4 focus_lost 真值表**：`src/main.rs` 新增 4 条测试，镜像 `run_pipeline_core:3217` 表达式 `target_hwnd != 0 && current_id != target_hwnd`
+- **P1 capture_scene_signals_by_id 降级**：`src/platform/macos/mod.rs` 新增 1 条测试，断言 stub 恒返 None
+- **新增测试函数**：8 条全新 + 5 条解封 = **13 条** macOS 首次可见
+- **编译验证**：`cargo check --tests` 0 errors，6.72s
+- **红线遵守**：零生产代码改动；未执行 cargo test / cargo build --release / pytest；未触碰 src/platform/windows/、Cargo.toml、版本号；未使用 git 破坏性命令
+- **详情**：`collab/outbox/tester-1/result.md`（9,110 字节）
+- **下游预告**：TEST-EXEC 阶段将执行 `cargo test --no-fail-fast` + A4 热键实机复测
+
+## 2026-08-04 — coder-1 — MACOS-P4-PERM-001 ✅ 辅助功能授权弹窗真实现完成（macOS 专属，零 Windows 风险）
+
+- **范围**：仅 `src/platform/macos/accessibility.rs` 一个文件。补全 `AXIsProcessTrustedWithOptions` FFI 绑定与真调用（原 `ax_is_process_trusted_with_prompt` 是 stub 仅 log，从未触发系统弹窗，致热键静默失效）。
+- **改动**：新增 FFI 声明 `AXIsProcessTrustedWithOptions` + `kAXTrustedCheckOptionPrompt`；`ax_is_process_trusted_with_prompt` 用 `core_foundation`（CFString/CFBoolean/CFDictionary）构造 `{kAXTrustedCheckOptionPrompt: true}` 调用之触发系统弹窗；`ensure_accessibility_at_startup` 增强 log::warn（引导系统设置）+ 不阻断启动（与 Windows 对齐）。3 公开函数签名未改。
+- **依赖零新增**：core-foundation 0.10 / core-foundation-sys 0.8 已在 Cargo.toml macOS 段，未改 Cargo.toml。
+- **验证**：cargo check --all-targets 0 errors；仅 1 文件 diff（+42-11）；UTF-8 无 BOM。**未实机验证**（本机已授权，无法安全复现未授权状态，如实降级）。
+- **跨端影响（§2.10）**：纯 macOS 平台代码，对 Windows 零影响（cfg 门控，Windows 不编译）。
+- **红线遵守**：未碰 coder-2 占用文件 / hotkey.rs / Cargo.toml；未用 git 破坏命令；未出包/改版本号。
+- **详情**：`collab/outbox/coder-1/result.md`（5658 字节非空）
+
+## 2026-08-04 — tester-1 — TEST-EXEC-MERGE-001 ✅ 合并后全量回归 + A4 热键实机首测成功
+
+- **主程序 cargo test --no-fail-fast**: 880 passed / 0 failed / 8 ignored（--list 888 自洽）
+- **src-tauri**: 53/0/0 ✅
+- **Vitest**: 54/54 ✅
+- **pytest --collect-only**: 147/156 ✅
+- **A4 热键实机复测（首次成功）**: CGEventTap(Session) 收到 Start/Stop/CancelStop 事件；无 panic；辅助功能权限已授予
+- **盲区**: 17 条（platform/windows/ 模块级 cfg）
+- **已知失败修复**: `itn::tests::time_half` 由 ITN v2 修复（现通过）
+- **跨端影响**: 68 提交全部通过，零 (a)/(b) 类失败；我方三批改动（FIXHOTKEY-001 / NEUTRAL-001 / TEST-SYNC-P4-NEUTRAL-001）全部验证通过
+- **红线**: 零源文件改动（probe 已删）；遇 coder-2 编译错误上报主控未自修
+- **详情**: `collab/outbox/tester-1/result.md`（7,483 字节）
+
+## 2026-08-04 — coder-1 — MACOS-P4-NEUTRAL-002 ✅ 打通语音输入闭环（worker 去平台化 + macOS 接线）
+
+- **范围**：仅 src/main.rs。spawn_worker_thread 去 cfg，macOS 侧 run_controller_macos 接线（建 worker/pipeline channel + 逻辑线程 + run_message_loop 宿主）。
+- **方案协商**：主控已穷举扫描 29 个 cfg(windows) 函数确认接触点；我实施中撞到第7/8接触点（load_hotwords_for_accuracy/compute_hotwords_version），主控裁定同 NEUTRAL-001 删 cfg。
+- **改动**：WorkerCommand/StartCmd 去 cfg + StartCmd.target_hwnd: SendHwnd→WindowId；Windows 唯一实质修改 main.rs:1929（SendHwnd(hwnd.0 as isize)→hwnd.0 as usize）；spawn_worker_thread 去 cfg + :2439 调 run_pipeline_core；删 run_pipeline 薄封装（零调用者自证）；macos_stubs 删重复定义；run_controller_macos 重写（逻辑线程 handle_hotkey_event/handle_pipeline_event + FocusLost 复制剪贴板）；第7/8接触点删 2 行 cfg。
+- **预存在删除**：ctrlc handler 块（8行 main.rs + 3行 Cargo.toml）是 coder-2 HOST-001 问题A修复，开工前已存在，非本任务。
+- **验证**：Windows git diff numstat 空；run_pipeline 零调用者自证；spawn_worker_thread body 去空白 md5 与预期完全相等（0 mismatch）；cargo check --all-targets 0 errors；UTF-8 无 BOM。**闭环实机部分降级**：启动+模型加载日志确认，热键闭环未实机（osascript 模拟 F6 不经 CGEventTap 捕获层，需物理键）；**退出路径未验证**（ctrlc 被预存在删除，SIGINT 不触发 request_stop）。
+- **红线遵守**：未碰 windows/**/macos/overlay.rs/mod.rs/accessibility.rs/Cargo.toml；未用 git 破坏命令；未出包/改版本号。
+- **详情**：`collab/outbox/coder-1/result.md`（7614 字节非空）
+
+## 2026-08-04 — coder-1 — MACOS-P4-EXIT-001 ✅ 修复 macOS 无干净退出路径（实机验证通过）
+
+- **范围**：仅 src/main.rs（全部在 #[cfg(target_os="macos")] 内）。补回 SIGINT/SIGTERM 信号处理，让 Ctrl-C 触发与 Windows 等价的干净收尾。
+- **方案**：B1（不引 crate，用 libc::signal，libc=0.2 已在 macOS 段零新增依赖）。handler 只置 AtomicBool（async-signal-safe），轮询线程在普通上下文调 platform::request_stop()。
+- **改动**：新增 MACOS_SIGINT_RECEIVED static + macos_signal_handler extern fn + install_macos_signal_handler fn + run_controller_macos 开头调用。handler cast 用 `as *const () as sighandler_t` 避免 function_casts 警告。
+- **实机验证**：① kill -INT 触发完整退出链（requesting stop → logic thread exiting → controller loop exited cleanly → 进程 EXITED 无残留）② 二次启动正常（flock 已释放，无 "Application already running"）。
+- **验证**：Windows git diff numstat 空；新增代码全 cfg(macos)；cargo check --all-targets 0 errors；UTF-8 无 BOM；cargo fmt 仅 src/main.rs。
+- **跨端影响（§2.10-D）**：纯 macOS 平台代码，对 Windows 零影响。
+- **红线遵守**：未碰 windows/**/macos/overlay.rs/mod.rs/Cargo.toml；未用 git 破坏命令；未出包/改版本号。
+- **详情**：`collab/outbox/coder-1/result.md`（非空）
+
+## 2026-08-05 — coder-1 — MACOS-P4-OVERLAY-001 macOS 录音浮层 1:1 复刻 Windows（P0）
+
+- **来源**：主控任务单 MACOS-P4-OVERLAY-001（Recording 状态 P0）。基线 HEAD `5e49poise`（工作区未提交）
+- **改动**：新增 `src/platform/macos/overlay.rs`（NSPanel 透明浮层 + 自定义 NSView `drawRect:` + core-graphics 绘制 + 16ms CFRunLoopTimer 60fps + 三态指示灯 + 32 柱中心对称波形 + 圆角边框/分隔条/停止按钮）+ `src/bin/probe_overlay.rs`（临时验证 bin，`#[path]` 引入被测模块不经 mod.rs）
+- **验证**：cargo check --all-targets 0 errors；cargo test 全绿（主 crate 816 + probe 13，overlay 新增 5 条单测）；`cargo run --bin probe_overlay` 实测浮层显示正常、59.1/59.0 fps 稳定；git diff --numstat windows 空
+- **边界**：未碰 windows/**、main.rs（macos_stubs 保留）、macos/mod.rs、macos/tray.rs、Cargo.toml、版本号、Publish、ui/、src-tauri/
+- **下游**：OVERLAY-002 需实现 Processing/FocusLost/Error 三态；后续接线 main.rs 时 macos_stubs 的 OverlayCommand/OverlayRequest/OverlayThreadHandle 应替换为真实 RecordingOverlay 调用
+- **详情**：`collab/outbox/coder-1/result.md`（非空）+ logs/20260804.md + CHANGELOG.md + docs/MACOS-HANDOFF.md §2.10-E
+
+## 2026-08-05 — coder-1 — MACOS-P4-OVERLAY-WIRE-001 ✅ 录音浮层接线（Phase 4「完整体验」最后一块）
+
+- **来源**：主控派发，基线 HEAD `d7b9f39`（工作区干净）。把 OVERLAY-001 交付的孤儿 overlay.rs 接进 run_controller_macos 的 PipelineEvent 消费路径
+- **方案协商**：提 1 点异议（§3.A.3 vs §5 矛盾，platform/mod.rs 导出）。主控裁定补丁 R1 允许，仿 TRAY-001 模式加独立 macOS cfg 块，三条硬约束（不碰 Windows 块/不进共享清单/poll 不导出）。其余全同意
+- **改动 5 文件**：macos/mod.rs（mod overlay + 导出）/ macos/overlay.rs（OverlayRequest + PENDING_REQUEST + OVERLAY_LEVELS + thread_local OVERLAY + init/request/poll/shutdown 四函数 + 摘 hide/is_visible 的 allow）/ macos/event_loop.rs（timer callback 加 poll）/ platform/mod.rs（macOS cfg 块导出，Windows 块零触碰）/ main.rs（init_overlay_levels + handle_pipeline_event 七分支 request_overlay + shutdown_overlay + 订正注释）
+- **关键设计**：线程模型照搬 tray（任意线程 request→Mutex / 主线程 15ms timer poll 消费）；生命周期 B（Show→new 含 16ms timer / Hide→destroy invalidate）；thread_local 规避不 Send/Sync；levels Arc::clone 保留供多次 Show 复用
+- **验证**：cargo check --all-targets 0 errors（如实列 dead code warning 为 OVERLAY-002 保留）；cargo test 821/0/6（platform::macos::overlay 5 条单测首次真实运行，--list grep overlay=14）；cargo fmt clean；git diff windows 空；platform/mod.rs 自证仅 macOS cfg 块
+- **实机降级**：CT2 dylib 缺失致 dyld 加载失败（docs/MACOS-HANDOFF §3.1/§五已记，非本任务引入），未用 osascript 模拟（任务书禁止）。静态走查确认路径完整可达
+- **边界**：仅 5 文件；Windows/Cargo.toml/版本号/Publish/ui/src-tauri 零触碰；未 build --release/出包/npm；未用 git 破坏命令；未建临时 probe；UTF-8 无 BOM
+- **下游**：实机闭环需 CT2 dylib 部署（tester-1 出包时）或 Gavin 物理热键端测；OVERLAY-002 接入后 dead code warning 自然消除；macos_stubs 的旧 Overlay 占位本轮未删（归 OVERLAY-002 或清理单）
+- **详情**：result.md + logs/20260805.md + CHANGELOG.md
+
+## 2026-08-05 — coder-1 — MACOS-P4-CFGGATE-001 ✅ 修 macOS 专用函数缺 cfg 门控致 Windows 编译必炸（P0）
+
+- **来源**：主控取证，WIRE-001 验收通过后查出。基线 WIRE-001 工作区未提交
+- **缺陷**：src/main.rs handle_hotkey_event(:2880)/handle_pipeline_event(:2930) 无 cfg 门控，后者引用 request_tray_state(7处,TRAY-001既有)/request_overlay(7处,WIRE-001新增)/OverlayRequest(7处) Windows 侧均不存在必 E0425。WIRE-001 把违规点1变8
+- **改动**：1 文件 2 行，两函数各加 #[cfg(target_os="macos")]。安全性：唯一调用点在 cfg(macos) run_controller_macos 内
+- **B 项扫描**：11 macOS专属符号逐个判定，唯一漏网=handle_pipeline_event 已修；反向扫描无交叉
+- **验证**：cargo check 0 err / cargo test --no-fail-fast 821/0/6 / fmt clean / git diff windows 空
+- **C 项实机**：主控纠正 CT2 dylib 确在 target/release，DYLD_LIBRARY_PATH 指向后 debug 二进制启动链完整 RUNNING 零 panic、kill -INT 干净退出。浮层 Show/Hide 降级（无法物理按键），需 Gavin 亲按 F6
+- **边界**：仅 src/main.rs 2 行；未 build --release/出包/npm；未用 git 破坏命令；UTF-8 无 BOM
+- **详情**：result.md + logs/20260805.md + CHANGELOG.md
+
+## 2026-08-05 — coder-1 — MACOS-P4-OVERLAY-WIRE-002 ✅ 抽出七分支纯函数使真值表可测
+
+- **来源**：tester-1 预研建议，主控采纳。基线 CFGGATE-001 后工作区
+- **改动 2 文件**：main.rs 新增 overlay_request_for_event 纯函数（穷举 match 无通配符）+ handle_pipeline_event 改 match 前统一调一次；overlay.rs OverlayRequest derive 加 PartialEq/Eq
+- **验证**：cargo check 0err / cargo test --no-fail-fast 821/0/6(与基线逐数一致) / fmt clean / git diff windows 空 / 行为等价自证七分支一致
+- **边界**：仅 main.rs + overlay.rs derive；未碰 injection.rs(coder-2 AXINJECT 域)；未写测试(tester-1 阶段三)；未出包/改版本号/npm；UTF-8 无 BOM
+- **下游**：tester-1 可对 overlay_request_for_event 落 7 条成对真断言锁死接线核心逻辑
+- **详情**：result.md + logs/20260805.md + CHANGELOG.md
+
+## 2026-08-05 — coder-1 — MACOS-P4-OVERLAY-WIRE-003 ✅ 修 poll_pending_overlay 注释声称 try-lock 但实现是阻塞 lock
+
+- **来源**：主控取证，注释-实现不符。基线 WIRE-002 后工作区
+- **方案**：A（改实现对齐注释）。timer 回调结构上不可能阻塞 > 实测通常不阻塞
+- **改动**：1 文件 1 行 + 注释。overlay.rs PENDING_REQUEST.lock()→try_lock()；OVERLAY_LEVELS.lock() 保持阻塞加注释说明
+- **验证**：cargo check 0err / cargo test --no-fail-fast 821/0/6(与基线一致) / fmt clean / 本轮仅动 overlay.rs(injection.rs 是 coder-2 并行)
+- **边界**：仅 overlay.rs；未碰 injection.rs/main.rs/Cargo.toml/windows；未写测试；未出包/改版本号/npm；UTF-8 无 BOM
+- **下游**：overlay.rs 已腾出，tester-1 阶段三可开始
+- **详情**：result.md + logs/20260805.md + CHANGELOG.md
+
+## 2026-08-05 — coder-1 — MACOS-P4-SCENE-001 ✅ 场景感知真实现（stub → real）+ foreground_window_id 真实现
+
+- **来源**：任务书 MACOS-P4-SCENE-001 + 主控补丁 R1（D 项）。基线 WIRE-003 后工作区
+- **改动 3 文件**：新建 `src/platform/macos/scene.rs`（AX+proc_pidpath+NSWorkspace msg_send）；`mod.rs` 接线 + stub 改委托 + `foreground_window_id()` 真实现；`scene-rules.toml` 每个 exe 数组纯追加 macOS 可执行名
+- **关键决策**：NSWorkspace feature 未启用（禁改 Cargo.toml）且任务书 D-1 方法名有误 → 用 objc2 `msg_send` 动态调 `sharedWorkspace.frontmostApplication.processIdentifier`，失败降级 AX；AX 常量是 `#define CFSTR` 宏非导出符号 → 改 `CFString::new` 字面量；D-2 用 pid 定位消除「切窗口取错场景」局限
+- **实测证据**：临时探针 7 个 App 真实 (exe,title)（Safari/Code/Microsoft Word/Claude/Terminal/Microsoft Edge/Xcode），classify 14 用例全命中；探针跑完已删
+- **验证**：cargo check 0 err / cargo test **827/2/6** / fmt clean / toml 9 scenes 合法 / git diff windows 空
+- **🔴 2 failed 绊线（D-3 预期）**：`foreground_window_id_returns_zero_in_first_version`（left=824≠0）+ `capture_scene_signals_by_id_returns_none_for_zero_id`（不再恒 None）。未改测试，归 tester-1
+- **🔴 行为变更（D-4 报 Gavin）**：focus_lost 从恒 false 变真实生效，录音途中切窗口→文本改走 FocusLost 分支
+- **边界**：仅 3 允许文件；未碰 main.rs/overlay.rs/injection.rs/Cargo.toml/windows/platform/mod.rs；未出包/改版本号/npm；UTF-8 无 BOM
+- **下游（TOML-STALE-001）**：scene-rules.toml 三副本（根/target/release/Publish）出包必须同步，归 tester-1
+- **详情**：outbox/coder-1/result.md + logs/20260805.md + CHANGELOG.md
+
+## 2026-08-05 — coder-1 — MACOS-P4-SCENE-002 ✅ 焦点身份 pid → CGWindowID（窗口级）
+
+- **来源**：Gavin 指令（「力度必须要提到窗口级」）。基线 SCENE-001 交付后
+- **改动 1 文件**：仅 `src/platform/macos/scene.rs`。`foreground_window_id()` 返 CGWindowID（frontmost pid + CGWindowList + layer==0 过滤）；`capture_scene_signals(id)` id 语义 pid→CGWindowID（`window_id_to_owner_pid` 反查，找不到降级实时查 frontmost）
+- **关键决策**：用 core-graphics 0.25 `copy_window_info` 现有 API；不读 `kCGWindowName`（屏幕录制权限，红线）；`dict?` 陷阱修复（continue 非提前返回）；mod.rs 无需改（一行委托已存在）
+- **实测证据**：Terminal 同 pid 双窗口（2230/690）AXRaise 切换 → foreground_window_id 正确变化（**窗口级决定性证据**）；56 窗含 12 个非 0 layer 被排除；B 项时序 id=690 切前台后仍取原窗口 exe/title；不存在 id 降级
+- **验证**：cargo check 0 err（scene）/ cargo test **836/1/6** / fmt clean / 本轮仅 scene.rs
+- **🔴 1 failed 非本任务引入**：`overlay_wire_tests`（coder-2 在途，Processing→ShowProcessing 语义）。中途 `foreground_window_id_contract` 红（tester-1 存活 pid 断言因 SCENE-002 pid→CGWindowID 暂过期），终态已通过（tester-1 换锚完成）
+- **🔴 行为变更（报 Gavin）**：同应用多窗口切窗口 `focus_lost` 现在能正确判出（此前 pid 相同判不出）
+- **边界**：仅 scene.rs；未碰 mod.rs/main.rs/overlay.rs/injection.rs/Cargo.toml/windows；未读 kCGWindowName/未用私有 API/未写测试；探针已删；UTF-8 无 BOM
+- **下游**：foreground_window_id_contract 换锚已确认通过；主控协调 coder-2 overlay 并行冲突（overlay_wire_tests 仍红）
+- **详情**：outbox/coder-1/result.md + logs/20260805.md + CHANGELOG.md
+
+## 2026-08-05 — coder-2 — MACOS-P4-BUNDLE-001 ✅ .app 打包 + Info.plist + 自签名（本地调试，不做公证）
+
+- **来源**：主控 16:09 派发（16:10 ACK，本 session replace 后完成）。
+- **改动 2 文件**：新建 `scripts/Info.plist`（CFBundleIdentifier=com.feiyin.voice-ime / LSUIElement=true / TCC 四条声明：麦克风·辅助功能·输入监控·AppleEvents）+ 重写 `scripts/build-macos.sh`。
+- **关键设计**：
+  - 新增 Tauri UI release 构建（`--features custom-protocol`，防空白页）+ cp 到 target/release（补原脚本缺口）
+  - Step4 打包 `dist/飞音智能语音输入.app`：三二进制 + 7 dylib + itn/scene-rules + models + icon.icns
+  - **dylib 解析关键**：主程序无 LC_RPATH → `install_name_tool -add_rpath @loader_path`；codesign 必须在 install_name_tool 之后
+  - models 两模式：默认 symlink 指向仓库（本地省 1.8G，宽松验证）；`--copy-models` 复制进 bundle（严格验证，可分发）
+  - 版本号从 Cargo.toml 单一来源，PlistBuddy 副本上同步
+- **验证**：bash -n / plutil -lint / /tmp 实测 dylib 加载 + ad-hoc 签名 + verify 全 PASS（详见 result.md）
+- **边界**：未碰 Rust 源码 / src-tauri / ui / Cargo.toml / 版本号 / Publish；未 build --release（归 tester-1）；未用 git 破坏命令；UTF-8 无 BOM
+- **下游**：tester-1 可 `bash scripts/build-macos.sh` 全链出包；⚠️ ad-hoc 重签后 TCC 授权需重新授权（§4-4）
+- **详情**：`/Users/gavinsun/Workspace/CodeLab/collab/outbox/coder-2/result.md`（非空）
+
+## 2026-08-05 — coder-2 — MACOS-P4-BUNDLE-002 ✅ 签名改自签名证书（ad-hoc → Feiyin Dev）
+
+- **来源**：主控返工任务书（BUNDLE-001 其余已验收）。Gavin 拍板禁止 ad-hoc（cdhash 变 → TCC 授权失效）。
+- **改动 1 文件**：`scripts/build-macos.sh`。① `CODESIGN_IDENTITY` 可配置（默认 Feiyin Dev）② 证书检查去 `-v`（GUI 自签名证书 NOT_TRUSTED，`-v` 会误判不存在）③ 去 `--deep` 改先内后外 + `--timestamp=none` ④ 无证书明确报错禁止退化 ad-hoc ⑤ 文件头注释同步。
+- **额外修复**：`.toml` 数据文件原放 MacOS/ → codesign 外层签名报 "code object is not signed at all"；改放 Resources/ + MacOS/ 内相对 symlink（itn/scene-rules），签名 exit 0 + strict verify 过 + 运行时 exe_dir 可读。
+- **密码框问题**：GUI 创建证书后私钥 ACL 不含 codesign → 弹框。解法 `security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k <登录密码> login.keychain-db`，之后全链免密。
+- **实机验证**：用户跑 `bash scripts/build-macos.sh` Build completed；`dist/飞音智能语音输入.app` Authority=**Feiyin Dev**（非 adhoc）✅ Identifier=com.feiyin.voice-ime ✅ verify OK ✅ 二次重签 TCC 稳定 ✅。
+- **边界**：只改 build-macos.sh；未碰 Info.plist/src/**/Cargo.toml/版本号/Publish；未用 git 破坏命令；UTF-8 无 BOM。
+- **详情**：`/Users/gavinsun/Workspace/CodeLab/collab/outbox/coder-2/result.md`（非空）

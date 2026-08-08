@@ -116,7 +116,8 @@ enum AppCommand {
     ShowTrayMenu { x: i32, y: i32 },
 }
 #[derive(Debug)]
-#[cfg(target_os = "windows")]
+// MACOS-P4-NEUTRAL-002: 去 cfg——run_pipeline_core 已中立，worker 线程需在 macOS 起来。
+// 对 Windows 构建该 cfg 恒为真，删除为 no-op（同 NEUTRAL-001 三辅助函数论证）。
 enum WorkerCommand {
     Start(StartCmd),
     Shutdown,
@@ -150,9 +151,11 @@ struct SendHwnd(isize);
 #[cfg(target_os = "windows")]
 unsafe impl Send for SendHwnd {}
 #[derive(Debug, Clone)]
-#[cfg(target_os = "windows")]
+// MACOS-P4-NEUTRAL-002: 去 cfg + target_hwnd 类型 SendHwnd → platform::WindowId（usize）。
+// 原 SendHwnd(isize) 仍保留 #[cfg(windows)]（overlay 线程 :565/:589/:641 仍用它），
+// 故 StartCmd 不再引用 SendHwnd，净安全性提升（worker 路径不再经 unsafe Send 包装）。
 struct StartCmd {
-    target_hwnd: SendHwnd,
+    target_hwnd: platform::WindowId,
     translate: Arc<AtomicBool>,
 }
 const AUTO_LEARN_OBSERVE_MS: u64 = 300;
@@ -178,6 +181,11 @@ const MENU_CMD_SETTINGS: u32 = 1001;
 const MENU_CMD_EXIT: u32 = 1002;
 #[cfg(target_os = "windows")]
 static MENU_VISIBLE: AtomicBool = AtomicBool::new(false);
+// TRAY-001: 设置 UI 二进制名（平台差异：Windows 带 .exe，macOS 裸二进制）。
+#[cfg(target_os = "windows")]
+const SETTINGS_UI_EXE_NAME: &str = "feiyin-ime-ui.exe";
+#[cfg(target_os = "macos")]
+const SETTINGS_UI_EXE_NAME: &str = "feiyin-ime-ui";
 // LATENCY-001: static storage for controller HWND, set at controller startup
 #[cfg(target_os = "windows")]
 static CONTROLLER_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
@@ -386,7 +394,7 @@ fn spawn_config_watcher(shared_config: Arc<RwLock<AppConfig>>) -> JoinHandle<()>
                     }
                     reload_runtime_config(&shared_config);
                     // HOTKEY-SYNC-IMMEDIATE-001: Notify hotkey thread instantly via AtomicBool
-                    #[cfg(target_os = "windows")]
+                    #[cfg(any(target_os = "windows", target_os = "macos"))]
                     platform::notify_config_changed();
                     log::info!("Runtime config reloaded after config file change");
                 }
@@ -405,14 +413,15 @@ fn encode_wide(text: &str) -> Vec<u16> {
         .collect()
 }
 fn spawn_settings_process() -> Result<Child> {
-    // DEC-013: 启动 Tauri Settings 子进程(feiyin-ime-ui.exe)
+    // DEC-013: 启动 Tauri Settings 子进程。二进制名平台化：Windows=feiyin-ime-ui.exe,
+    // macOS=feiyin-ime-ui（TRAY-001 修复硬编码 .exe）。
     let exe_path = std::env::current_exe()?;
     let exe_dir = exe_path
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    // Spawn settings UI process (feiyin-ime-ui.exe)
-    let ui_exe = exe_dir.join("feiyin-ime-ui.exe");
+    // Spawn settings UI process (feiyin-ime-ui)
+    let ui_exe = exe_dir.join(SETTINGS_UI_EXE_NAME);
     // Copy release exe to debug location if needed (src-tauri/target/release to src-tauri/target/debug)
     let project_root = exe_dir
         .parent() // target/release -> target/debug -> target/
@@ -422,7 +431,7 @@ fn spawn_settings_process() -> Result<Child> {
             root.join("src-tauri")
                 .join("target")
                 .join("release")
-                .join("feiyin-ime-ui.exe")
+                .join(SETTINGS_UI_EXE_NAME)
         })
         .unwrap_or_else(|| ui_exe.clone());
     let dev_ui_exe = if dev_ui_exe_release.exists() {
@@ -433,7 +442,7 @@ fn spawn_settings_process() -> Result<Child> {
                 root.join("src-tauri")
                     .join("target")
                     .join("debug")
-                    .join("feiyin-ime-ui.exe")
+                    .join(SETTINGS_UI_EXE_NAME)
             })
             .unwrap_or_else(|| ui_exe.clone())
     };
@@ -441,13 +450,15 @@ fn spawn_settings_process() -> Result<Child> {
         ui_exe
     } else if dev_ui_exe.exists() {
         log::info!(
-            "Using development path for feiyin-ime-ui.exe: {}",
+            "Using development path for {}: {}",
+            SETTINGS_UI_EXE_NAME,
             dev_ui_exe.display()
         );
         dev_ui_exe
     } else {
         return Err(anyhow!(
-            "feiyin-ime-ui.exe not found. Please build the Tauri UI first (npm run tauri build or cargo build in src-tauri)."
+            "{} not found. Please build the Tauri UI first (npm run tauri build or cargo build in src-tauri).",
+            SETTINGS_UI_EXE_NAME
         ));
     };
     log::info!("Spawning Tauri Settings UI from: {}", target_exe.display());
@@ -1927,7 +1938,7 @@ fn process_controller_events(
                     set_tray_state(tray, TrayState::Recording, config.ui_language);
 
                     let _ = worker_tx.send(WorkerCommand::Start(StartCmd {
-                        target_hwnd: SendHwnd(hwnd.0 as isize),
+                        target_hwnd: hwnd.0 as usize,
                         translate,
                     }));
                     log::info!(
@@ -2114,7 +2125,7 @@ fn set_auto_start(enabled: bool) -> Result<()> {
 /// ASR-DUAL-B-001: 加载 hotwords 字符串（仅 accuracy 模式需要）
 /// 从 wordbook 读取所有单词，按 id 排序保证哈希稳定，构建逗号分隔字符串
 /// performance 模式返回 None（不支持 hotwords）
-#[cfg(target_os = "windows")]
+// MACOS-P4-NEUTRAL-002: 原 #[cfg(target_os = "windows")] 去除——平台中立纯 Rust（AsrModel 判定 + wordbook 读取 + build_hotwords_string），spawn_worker_thread（已去 cfg）调用，对 Windows 为 no-op。
 fn load_hotwords_for_accuracy(config: &AppConfig) -> Option<String> {
     if transcription::AsrModel::from_config(&config.audio.asr_model)
         != transcription::AsrModel::Accuracy
@@ -2146,7 +2157,7 @@ fn load_hotwords_for_accuracy(config: &AppConfig) -> Option<String> {
 }
 
 /// ASR-DUAL-B-001: 计算 hotwords 字符串的版本号（用于对比是否需要重建）
-#[cfg(target_os = "windows")]
+// MACOS-P4-NEUTRAL-002: 原 #[cfg(target_os = "windows")] 去除——平台中立纯 Rust（DefaultHasher 哈希），spawn_worker_thread（已去 cfg）调用，对 Windows 为 no-op。
 fn compute_hotwords_version(hotwords: &str) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -2157,7 +2168,8 @@ fn compute_hotwords_version(hotwords: &str) -> u64 {
     hasher.finish()
 }
 
-#[cfg(target_os = "windows")]
+// MACOS-P4-NEUTRAL-002: 去 cfg——WorkerCommand/StartCmd 已中立，worker 线程 macOS 侧接线需此函数可见。
+// 对 Windows 构建该 cfg 恒为真，删除为 no-op。
 fn spawn_worker_thread(
     worker_rx: crossbeam_channel::Receiver<WorkerCommand>,
     event_tx: crossbeam_channel::Sender<PipelineEvent>,
@@ -2436,7 +2448,7 @@ fn spawn_worker_thread(
                         "Starting run_pipeline: cancel_signal={}",
                         cancel_signal.load(Ordering::Relaxed)
                     );
-                    run_pipeline(
+                    run_pipeline_core(
                         samples_result,
                         transcriber,
                         &rt,
@@ -2447,7 +2459,7 @@ fn spawn_worker_thread(
                         &mut cached_translation,
                         &model_dir,
                         cached_punctuation.as_mut(),
-                        HWND(start.target_hwnd.0 as *mut std::ffi::c_void),
+                        start.target_hwnd,
                         &event_tx,
                         start.translate,
                     );
@@ -2639,6 +2651,371 @@ fn run_controller(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
     hotkey_listener.join();
     Ok(())
 }
+
+#[cfg(target_os = "macos")]
+fn single_instance_lock_path() -> std::path::PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("feiyin-ime")
+        .join("instance.lock")
+}
+
+// MACOS-P4-EXIT-001: macOS 信号处理（SIGINT/SIGTERM）→ 干净退出。
+// handler 只置 AtomicBool（async-signal-safe 唯一允许动作），轮询线程在普通
+// 线程上下文调 platform::request_stop()（CFRunLoopSignalSource/WakeUp 非 async-signal-safe，
+// 不能在 handler 内调）。零新增依赖（libc 已在 macOS 段）。
+#[cfg(target_os = "macos")]
+static MACOS_SIGINT_RECEIVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+extern "C" fn macos_signal_handler(_signum: i32) {
+    // async-signal-safe：只置 AtomicBool，不做任何其他事。
+    MACOS_SIGINT_RECEIVED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// MACOS-P4-EXIT-001: 注册 SIGINT/SIGTERM handler + 启动轮询线程调 request_stop。
+/// 全部代码在 `#[cfg(target_os = "macos")]` 内，Windows 零影响。
+#[cfg(target_os = "macos")]
+fn install_macos_signal_handler() {
+    use std::sync::atomic::Ordering;
+    unsafe {
+        // libc::signal: 注册 handler，返回旧 handler（忽略）。SIGINT=2, SIGTERM=15。
+        // SA_RESTART 语义由 macOS 默认提供（signal() 设 SA_RESTART）。
+        // 先 cast to pointer 再 cast to sighandler_t（避免 function_casts 警告）。
+        let handler = macos_signal_handler as *const () as libc::sighandler_t;
+        let _ = libc::signal(libc::SIGINT, handler);
+        let _ = libc::signal(libc::SIGTERM, handler);
+    }
+    // 轮询线程：检测 SIGINT_RECEIVED 后在普通上下文调 request_stop（安全）。
+    std::thread::spawn(move || loop {
+        if MACOS_SIGINT_RECEIVED.load(Ordering::Acquire) {
+            log::info!("SIGINT/SIGTERM received, requesting controller stop");
+            platform::request_stop();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn run_controller_macos(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
+    // MACOS-P4-HOST-001 + NEUTRAL-002: macOS controller host.
+    // 结构镜像 Windows run_controller：建 channel → spawn_worker_thread（已中立）→
+    // 逻辑线程处理 hotkey 事件 + 消费 pipeline_event_rx → CFRunLoop 宿主保持进程常驻。
+    //
+    // 关键差异（vs Windows run_controller）：
+    // - 不用 run_message_loop_with_hotkey_listener（其 timer callback 只 log，不处理业务）；
+    //   改用 run_message_loop() 做纯 CFRunLoop 宿主（CONTROLLER_CTX 为 null 时 timer 空转），
+    //   hotkey 事件由本函数 spawn 的逻辑线程独立轮询——无竞争，因不共享 rx。
+    // - overlay/录音浮层：OVERLAY-WIRE-001 已接入 handle_pipeline_event
+    //   （request_overlay → 主线程 15ms timer 应用 Show/Hide）；
+    //   FocusLost 必须把文本复制到剪贴板（platform::copy_text_to_clipboard），
+    //   否则用户整段转写会静默丢失。
+    // - foreground_window_id() 在 macOS 当前返回 0（NEUTRAL-001 第一版降级），
+    //   → focus_lost 恒 false（总是直接注入、不走失焦预览）。本轮接受此降级。
+    // - MACOS-P4-EXIT-001: 信号处理（SIGINT/SIGTERM）——handler 只置 AtomicBool（async-signal-safe），
+    //   轮询线程在普通上下文调 platform::request_stop()（非 handler，安全）。
+
+    install_macos_signal_handler();
+
+    let audio_buf = ui::overlay::new_audio_level_buf();
+    let stop_recording_signal = Arc::new(AtomicBool::new(false));
+    let cancel_signal = Arc::new(AtomicBool::new(false));
+    let is_recording = Arc::new(AtomicBool::new(false));
+    let (worker_tx, worker_rx) = crossbeam_channel::unbounded::<WorkerCommand>();
+    let (pipeline_event_tx, pipeline_event_rx) = crossbeam_channel::unbounded::<PipelineEvent>();
+
+    // spawn_worker_thread 现已中立（NEUTRAL-002 去 cfg），macOS 侧可调用。
+    let worker_join = spawn_worker_thread(
+        worker_rx,
+        pipeline_event_tx,
+        Arc::clone(&runtime_config),
+        Arc::clone(&audio_buf),
+        Arc::clone(&stop_recording_signal),
+        Arc::clone(&cancel_signal),
+        Arc::clone(&is_recording),
+    );
+    // Wait briefly for worker thread init (ASR model preload).
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let hotkey_listener = platform::create_hotkey_listener(Arc::clone(&runtime_config));
+    let _config_watcher = spawn_config_watcher(Arc::clone(&runtime_config));
+
+    platform::create_controller_window()?;
+
+    // OVERLAY-WIRE-001: 把共享 audio_buf 交给浮层模块（方案②，主线程一次性存入）。
+    // 必须是同一个 Arc——音频线程（:2733 spawn_worker_thread）正在往里写，浮层读它画波形。
+    // OVERLAY-002-A: 一并注入停止/取消信号，供浮层停止按钮（mouseDown）触发取消录音。
+    // OVERLAY-003: 注入 ui_language，供 Preview 浮层按钮/标题按语言取 i18n 文案。
+    platform::init_overlay_levels(
+        Arc::clone(&audio_buf),
+        Arc::clone(&stop_recording_signal),
+        Arc::clone(&cancel_signal),
+        clone_runtime_config(&runtime_config).ui_language,
+    );
+
+    // MACOS-P4-TRAY-001: status bar tray (NSStatusItem) + menu.
+    // 必须在 create_controller_window（NSApplication finishLaunching）之后建——
+    // NSStatusBar 要求 app 已启动。菜单命令（OpenSettings/Exit）经 channel 送逻辑
+    // 线程处理；tray 状态更新经 request_tray_state → 主线程 15ms timer 轮询应用。
+    let (tray_cmd_tx, tray_cmd_rx) = crossbeam_channel::unbounded::<platform::TrayCommand>();
+    // TRAY-FIX-001: 不再把 `&tray` 存进裸指针静态量（tray 随后被 move，指针悬垂 →
+    // 15ms timer 解引用野指针 SIGABRT）。改用 thread_local 持有所有权：
+    // set_tray 将 tray 交给 tray.rs 的 thread_local，主线程 timer 轮询直接取用。
+    match platform::build_tray(
+        clone_runtime_config(&runtime_config).ui_language,
+        tray_cmd_tx,
+    ) {
+        Ok(tray) => {
+            platform::set_tray(tray);
+        }
+        Err(e) => {
+            log::error!("Failed to build macOS tray: {}", e);
+        }
+    };
+
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(5));
+        let _ = version_check::check_and_cache();
+    });
+
+    // 逻辑线程：处理 hotkey 事件 + 消费 pipeline_event_rx。
+    // 镜像 Windows process_controller_events 对 HotkeyEvent::Start/Stop/CancelStop 的处理。
+    // 独立持有 hotkey_rx 的克隆（crossbeam Receiver 可 Clone），与 listener 本身解耦，
+    // listener 留在本函数作用域供 shutdown/join。
+    let logic_runtime_config = Arc::clone(&runtime_config);
+    let logic_worker_tx = worker_tx.clone();
+    let logic_stop_recording = Arc::clone(&stop_recording_signal);
+    let logic_cancel_signal = Arc::clone(&cancel_signal);
+    let logic_is_recording = Arc::clone(&is_recording);
+    let logic_hotkey_rx = hotkey_listener.rx().clone();
+    let logic_tray_cmd_rx = tray_cmd_rx.clone();
+    let logic_handle = thread::spawn(move || {
+        loop {
+            // 退出判据：worker_tx 已 drop（主线程在 shutdown 时 drop）→ send 失败即退出。
+            // 用非阻塞轮询避免阻塞主线程 shutdown。
+            crossbeam_channel::select! {
+                recv(logic_hotkey_rx) -> event => {
+                    match event {
+                        Ok(ev) => handle_hotkey_event(
+                            ev,
+                            &logic_worker_tx,
+                            &logic_stop_recording,
+                            &logic_cancel_signal,
+                            &logic_is_recording,
+                            &logic_runtime_config,
+                        ),
+                        Err(crossbeam_channel::RecvError) => {
+                            log::info!("macOS logic thread: hotkey_rx disconnected, exiting");
+                            break;
+                        }
+                    }
+                }
+                recv(logic_tray_cmd_rx) -> cmd => {
+                    match cmd {
+                        Ok(platform::TrayCommand::OpenSettings) => {
+                            log::info!("macOS tray: open settings requested");
+                            match spawn_settings_process() {
+                                Ok(child) => {
+                                    log::info!(
+                                        "macOS settings process spawned, pid={}",
+                                        child.id()
+                                    );
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to spawn settings process: {}", e);
+                                }
+                            }
+                        }
+                        Ok(platform::TrayCommand::Exit) => {
+                            log::info!("macOS tray: exit requested, requesting controller stop");
+                            platform::request_stop();
+                            break;
+                        }
+                        Err(crossbeam_channel::RecvError) => {
+                            log::info!("macOS logic thread: tray_cmd_rx disconnected, exiting");
+                            break;
+                        }
+                    }
+                }
+                default(std::time::Duration::from_millis(50)) => {}
+            }
+            // 消费 pipeline 事件（本轮仅打日志，FocusLost 复制剪贴板）
+            let logic_ui_language = clone_runtime_config(&logic_runtime_config).ui_language;
+            while let Ok(event) = pipeline_event_rx.try_recv() {
+                handle_pipeline_event(&event, logic_ui_language);
+            }
+        }
+        log::info!("macOS logic thread exiting");
+    });
+
+    log::info!("macOS controller initialized, entering CFRunLoop message loop");
+
+    // CFRunLoop 宿主（保持进程常驻）。CONTROLLER_CTX 为 null，timer 空转。
+    let result = platform::run_message_loop();
+
+    // Shutdown sequence
+    hotkey_listener.shutdown();
+    let _ = hotkey_listener.join();
+    // 通知 worker 退出 + join
+    let _ = worker_tx.send(WorkerCommand::Shutdown);
+    drop(worker_tx);
+    let _ = worker_join.join();
+    // 逻辑线程在 worker_tx drop 后会因 send 失败或 rx disconnected 退出
+    let _ = logic_handle.join();
+    // TRAY-FIX-001: 显式销毁 tray（thread_local 取走并 drop，移除状态栏图标）。
+    // 与 shutdown_overlay 同构：thread_local 进程退出时会 drop，显式调用保证退出链清晰。
+    platform::shutdown_tray();
+
+    // OVERLAY-WIRE-001: 显式销毁浮层（主线程，run_message_loop 已退出）。
+    // thread_local 进程退出时会 drop，但显式调用保证退出链清晰、日志可辨。
+    platform::shutdown_overlay();
+
+    if let Err(e) = &result {
+        log::error!("macOS controller loop exited with error: {}", e);
+    } else {
+        log::info!("macOS controller loop exited cleanly");
+    }
+
+    result
+}
+
+/// MACOS-P4-NEUTRAL-002: macOS 侧 hotkey 事件处理。
+/// 镜像 Windows process_controller_events 对 HotkeyEvent::Start/Stop/CancelStop 的处理逻辑。
+#[cfg(target_os = "macos")]
+fn handle_hotkey_event(
+    event: platform::HotkeyEvent,
+    worker_tx: &crossbeam_channel::Sender<WorkerCommand>,
+    stop_recording_signal: &Arc<AtomicBool>,
+    cancel_signal: &Arc<AtomicBool>,
+    is_recording: &Arc<AtomicBool>,
+    _runtime_config: &Arc<RwLock<AppConfig>>,
+) {
+    match event {
+        platform::HotkeyEvent::Start { translate } => {
+            log::info!(
+                "macOS controller received hotkey start (translate={})",
+                translate.load(Ordering::Acquire)
+            );
+            if is_recording.load(Ordering::Acquire) {
+                // 已在录音 → 停止（PTT 释放）
+                stop_recording_signal.store(true, Ordering::Release);
+            } else {
+                // 开始录音
+                cancel_signal.store(false, Ordering::Release);
+                stop_recording_signal.store(false, Ordering::Release);
+                // NEUTRAL-001 降级：foreground_window_id() 返回 0 → focus_lost 恒 false。
+                let target_hwnd = platform::foreground_window_id();
+                let _ = worker_tx.send(WorkerCommand::Start(StartCmd {
+                    target_hwnd,
+                    translate,
+                }));
+                log::info!(
+                    "[Latency] worker command sent (target_hwnd={})",
+                    target_hwnd
+                );
+            }
+        }
+        platform::HotkeyEvent::Stop => {
+            log::info!("macOS controller received hotkey stop");
+            stop_recording_signal.store(true, Ordering::Release);
+        }
+        platform::HotkeyEvent::CancelStop => {
+            log::info!("macOS controller received hotkey cancel-stop (PTT held < 300ms)");
+            cancel_signal.store(true, Ordering::Release);
+            stop_recording_signal.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// OVERLAY-WIRE-002: PipelineEvent → 录音浮层指令的纯映射（无副作用，供单测锁死真值表）。
+/// OVERLAY-002: 三态浮层映射 —— RecordingStarted → Show；Processing → ShowProcessing(文案)；
+/// Error / FormatFailed → ShowError{文案, auto_close_ms}（Error 2000ms / FormatFailed 2500ms）；
+/// 其余 → Hide。
+/// OVERLAY-003: FocusLost(text) → ShowPreview(text)（失焦返显浮层，不自动关闭）。
+/// 🔴 穷举 match 禁止 `_ => Hide` 通配符：将来 PipelineEvent 新增变体时编译器强制作者做决定，
+/// 而非静默落进 Hide（本批次一路踩过来的同一类病：局部规则不声明适用边界）。
+#[cfg(target_os = "macos")]
+fn overlay_request_for_event(event: &PipelineEvent) -> platform::OverlayRequest {
+    match event {
+        PipelineEvent::RecordingStarted => platform::OverlayRequest::Show,
+        PipelineEvent::Processing(message) => {
+            platform::OverlayRequest::ShowProcessing(message.clone())
+        }
+        PipelineEvent::Error(message) => platform::OverlayRequest::ShowError {
+            message: message.clone(),
+            auto_close_ms: 2000,
+        },
+        PipelineEvent::FormatFailed => platform::OverlayRequest::ShowError {
+            message: String::new(), // 文案由 handle_pipeline_event 按 ui_language 补齐
+            auto_close_ms: 2500,
+        },
+        PipelineEvent::FocusLost(text) => platform::OverlayRequest::ShowPreview(text.clone()),
+        PipelineEvent::Done | PipelineEvent::Cancelled => platform::OverlayRequest::Hide,
+    }
+}
+
+/// MACOS-P4-NEUTRAL-002: macOS 侧 PipelineEvent 消费。
+/// TRAY-001: 同步更新托盘状态（经 request_tray_state → 主线程 timer 应用）。
+/// OVERLAY-WIRE-001/002: 同步驱动录音浮层（经 request_overlay → 主线程 timer 应用）。
+/// OVERLAY-002 三态：RecordingStarted → Show；Processing → ShowProcessing；
+/// Error/FormatFailed → ShowError（Error 2000ms / FormatFailed 2500ms 自动关闭）。
+/// OVERLAY-003：FocusLost → ShowPreview（失焦返显浮层，不自动关闭）；Done/Cancelled → Hide。
+/// overlay 指令由纯函数 `overlay_request_for_event` 统一计算（可单测锁死真值表）；
+/// 仅 FormatFailed 的文案在调用侧按 ui_language 补齐。
+#[cfg(target_os = "macos")]
+fn handle_pipeline_event(event: &PipelineEvent, ui_language: config::UiLanguage) {
+    // OVERLAY-002: FormatFailed 的展示文案依赖 ui_language，纯函数拿不到，这里补齐后发请求。
+    // 其余事件直接用纯函数的映射结果（overlay_request_for_event 是唯一决策源）。
+    let req = match event {
+        PipelineEvent::FormatFailed => platform::OverlayRequest::ShowError {
+            message: i18n::get(ui_language).format_failed_hint.to_string(),
+            auto_close_ms: 2500,
+        },
+        _ => overlay_request_for_event(event),
+    };
+    platform::request_overlay(req);
+    match event {
+        PipelineEvent::RecordingStarted => {
+            log::info!("macOS pipeline: RecordingStarted");
+            platform::request_tray_state(TrayState::Recording, ui_language);
+        }
+        PipelineEvent::Processing(msg) => {
+            log::info!("macOS pipeline: Processing({})", msg);
+            platform::request_tray_state(TrayState::Processing, ui_language);
+        }
+        PipelineEvent::Done => {
+            log::info!("macOS pipeline: Done (text injected)");
+            platform::request_tray_state(TrayState::Idle, ui_language);
+        }
+        PipelineEvent::Cancelled => {
+            log::info!("macOS pipeline: Cancelled");
+            platform::request_tray_state(TrayState::Idle, ui_language);
+        }
+        PipelineEvent::FocusLost(text) => {
+            // OVERLAY-003: FocusLost 现在真实可达（SCENE-002 让 foreground_window_id 返回真值）。
+            // 预览浮层已展示文本；剪贴板兜底保留 —— 用户没点复制就关掉浮层时的最后防丢词保险。
+            log::warn!(
+                "macOS pipeline: FocusLost (复制到剪贴板兜底 + 预览浮层展示): {}",
+                text
+            );
+            platform::request_tray_state(TrayState::Idle, ui_language);
+            if let Err(e) = platform::copy_text_to_clipboard(text) {
+                log::error!("macOS FocusLost: copy_text_to_clipboard failed: {}", e);
+            }
+        }
+        PipelineEvent::Error(msg) => {
+            log::error!("macOS pipeline: Error({})", msg);
+            platform::request_tray_state(TrayState::Error, ui_language);
+        }
+        PipelineEvent::FormatFailed => {
+            log::warn!("macOS pipeline: FormatFailed (LLM 格式化失败，原文已注入兜底)");
+            platform::request_tray_state(TrayState::Idle, ui_language);
+        }
+    }
+}
+
 fn main() -> Result<()> {
     // BUG-QWEN3-CRYPTO-001: 进程级 rustls ring provider 安装（任何 TLS 使用之前）
     // 重复安装返回 Err 属正常（幂等容忍），不得 unwrap
@@ -2733,11 +3110,48 @@ fn main() -> Result<()> {
         // Mutex acquired successfully, ensure mutex_handle is not dropped until exit
         let _mutex_handle = mutex_handle;
     }
+    #[cfg(target_os = "macos")]
+    {
+        // MACOS-P4-HOST-001: flock-based single instance lock.
+        // Avoid NSRunningApplication (unreliable for unsigned apps); use a lock file.
+        let lock_path = single_instance_lock_path();
+        if let Some(parent) = lock_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+        {
+            Ok(f) => Some(f),
+            Err(err) => {
+                log::warn!("Single instance lock file open failed: {}, continuing", err);
+                // Do not hard-fail startup just because lock file is unreachable.
+                None
+            }
+        };
+        if let Some(file) = file {
+            use std::os::fd::AsRawFd;
+            let fd = file.as_raw_fd();
+            let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if ret != 0 {
+                log::warn!("Application already running (flock), exiting");
+                return Ok(());
+            }
+            // Keep the file descriptor open for the lifetime of the process.
+            let _ = std::mem::ManuallyDrop::new(file);
+        }
+    }
     #[cfg(target_os = "windows")]
     run_controller(runtime_config)?;
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
-        log::warn!("Non-Windows platform is not supported in controller mode yet");
+        run_controller_macos(runtime_config)?;
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        log::warn!("Non-Windows/non-macOS platform is not supported in controller mode yet");
     }
     Ok(())
 }
@@ -2785,7 +3199,8 @@ fn find_speech_onset_with_backtrack(
 ///   研究 RESEARCH-ASR-ACCURACY-001 R1 证实 50ms 静音头让 native 掉 10pp）
 ///
 /// 提取为纯函数便于单测分支选择逻辑。
-#[cfg(target_os = "windows")]
+// MACOS-P4-NEUTRAL-001: 原 #[cfg(target_os = "windows")] 去除——此函数为平台中立纯 Rust 逻辑，
+// run_pipeline_core（无 cfg）调用之，macOS 需可见。对 Windows 构建该 cfg 恒为真，删除为 no-op。
 fn select_preprocessing_params(asr_model: transcription::AsrModel) -> (usize, usize) {
     const PERF_SILENCE_HEAD_SAMPLES: usize = 0; // 0ms @ 16kHz (performance, ASR-CTC-OPT-001 P1)
     const PERF_ONSET_BACKTRACK_SAMPLES: usize = 3200; // 200ms @ 16kHz (performance, 不动)
@@ -2807,9 +3222,11 @@ fn select_preprocessing_params(asr_model: transcription::AsrModel) -> (usize, us
     }
 }
 
+// MACOS-P4-NEUTRAL-001/002: run_pipeline 薄封装已删除（零调用者，自证见 result.md）。
+// macOS 侧的调用者由 run_controller_macos 经 spawn_worker_thread 间接调用本函数（NEUTRAL-002 接线）。
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
-#[cfg(target_os = "windows")]
-fn run_pipeline(
+fn run_pipeline_core(
     samples_result: anyhow::Result<Vec<f32>>,
     transcriber: &transcription::Transcriber,
     rt: &tokio::runtime::Runtime,
@@ -2820,7 +3237,7 @@ fn run_pipeline(
     cached_translation: &mut Option<(config::TranslationLanguage, translation::TranslationEngine)>,
     model_dir: &Path,
     mut punctuation_engine: Option<&mut punctuation::PunctuationEngine>,
-    target_hwnd: HWND,
+    target_hwnd: platform::WindowId,
     event_tx: &crossbeam_channel::Sender<PipelineEvent>,
     translate: Arc<AtomicBool>,
 ) {
@@ -2944,7 +3361,7 @@ fn run_pipeline(
                     // target_hwnd 即录音启动时捕获的前台窗口，此处复用同一 HWND 采集。
                     // 失败一律降级为 Unknown（不注入 F4，multiline_safe=false 保守）。
                     let scene_context = if config.scene.enabled {
-                        match platform::capture_scene_signals(target_hwnd) {
+                        match platform::capture_scene_signals_by_id(target_hwnd) {
                             Some((exe, title)) => scene::classify_scene(&exe, &title),
                             None => scene::SceneContext::unknown(),
                         }
@@ -3196,14 +3613,14 @@ fn run_pipeline(
                         send_event(event_tx, PipelineEvent::Cancelled);
                         return;
                     }
-                    let current_hwnd = unsafe { GetForegroundWindow() };
-                    let focus_lost = !target_hwnd.0.is_null() && current_hwnd.0 != target_hwnd.0;
+                    let current_id = platform::foreground_window_id();
+                    let focus_lost = target_hwnd != 0 && current_id != target_hwnd;
                     log::info!(
-                        "Injecting text: '{}', focus_lost={}, target_hwnd={:?}, current_hwnd={:?}",
+                        "Injecting text: '{}', focus_lost={}, target_hwnd={}, current_id={}",
                         final_text,
                         focus_lost,
-                        target_hwnd.0,
-                        current_hwnd.0
+                        target_hwnd,
+                        current_id
                     );
                     if focus_lost {
                         log::info!("Focus lost, showing preview");
@@ -3233,14 +3650,14 @@ fn run_pipeline(
         }
     }
 }
-#[cfg(target_os = "windows")]
+// MACOS-P4-NEUTRAL-001: 原 #[cfg(target_os = "windows")] 去除——平台中立纯 Rust，run_pipeline_core 调用，对 Windows 为 no-op。
 fn should_try_llm_translate(llm_enabled: bool, connectivity_verified: bool) -> bool {
     llm_enabled && connectivity_verified
 }
 /// LANG-AUTO-001: 翻译方向按内容（contains_han）判定，不依赖 transcription_language 配置。
 /// - target=English → 含汉字才需翻译；纯英文文本无需翻译。
 /// - target=Chinese → 不含汉字才需翻译；纯英文文本需翻译。
-#[cfg(target_os = "windows")]
+// MACOS-P4-NEUTRAL-001: 原 #[cfg(target_os = "windows")] 去除——平台中立纯 Rust，run_pipeline_core 调用，对 Windows 为 no-op。
 fn try_nllb_translate(
     text: &str,
     engine: Option<&translation::TranslationEngine>,
@@ -3452,23 +3869,13 @@ fn extract_changed_text(before: &str, after: &str) -> Option<String> {
 mod macos_stubs {
     use super::*;
     // Stub types (placeholder for Windows types, not actual Win32 implementations)
+    // MACOS-P4-NEUTRAL-002: StartCmd/WorkerCommand/SendHwnd/spawn_worker_thread 已删除——
+    // 真实定义已去 cfg（StartCmd/WorkerCommand/spawn_worker_thread）或保留 cfg(windows)
+    // （SendHwnd 仍服务 overlay 线程 :565/:589/:641），不再需要此处占位。
     #[derive(Debug, Clone)]
     pub struct OverlayCommand;
     #[derive(Debug, Clone)]
     pub struct OverlayRequest;
-    #[derive(Debug, Clone, Copy)]
-    pub struct SendHwnd(isize);
-    unsafe impl Send for SendHwnd {}
-    #[derive(Debug, Clone)]
-    pub struct StartCmd {
-        pub target_hwnd: SendHwnd,
-        pub translate: Arc<AtomicBool>,
-    }
-    #[derive(Debug)]
-    pub enum WorkerCommand {
-        Start(StartCmd),
-        Shutdown,
-    }
     pub struct OverlayThreadHandle;
     impl OverlayThreadHandle {
         pub fn send(&self, _command: OverlayCommand) {
@@ -3490,19 +3897,6 @@ mod macos_stubs {
     ) {
         let (_, rx) = crossbeam_channel::unbounded();
         (OverlayThreadHandle, rx) // Stub: macOS overlay not implemented
-    }
-    pub fn spawn_worker_thread(
-        _worker_rx: crossbeam_channel::Receiver<WorkerCommand>,
-        _event_tx: crossbeam_channel::Sender<PipelineEvent>,
-        _runtime_config: Arc<RwLock<AppConfig>>,
-        _audio_buf: AudioLevelBuf,
-        _stop_recording_signal: Arc<AtomicBool>,
-        _cancel_signal: Arc<AtomicBool>,
-        _is_recording: Arc<AtomicBool>,
-    ) -> JoinHandle<()> {
-        thread::spawn(|| {
-            // Stub: macOS worker not implemented
-        })
     }
 }
 
@@ -4378,12 +4772,11 @@ mod overlay_shimmer_tests {
     // ASR-ACC-OPT-001 方案 B + ASR-CTC-OPT-001 P1: select_preprocessing_params 分支测试
     // ============================================================
 
-    #[cfg(target_os = "windows")]
+    // MACOS-P4-NEUTRAL-001: 函数已平台中立，解除 cfg(windows) 门控使 macOS 侧编译可见。
     use super::select_preprocessing_params;
     #[allow(unused_imports)]
     use super::transcription;
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn preprocessing_params_performance_uses_0ms_head_200ms_backtrack() {
         // ASR-CTC-OPT-001 P1: performance silence head 50→0ms（研究 C1 证实 0ms 高 2.5pp）
@@ -4398,7 +4791,6 @@ mod overlay_shimmer_tests {
         );
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn preprocessing_params_accuracy_uses_0ms_head_100ms_backtrack() {
         // 方案 B：accuracy 用 0ms head / 100ms backtrack
@@ -4413,7 +4805,6 @@ mod overlay_shimmer_tests {
         );
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn preprocessing_params_both_models_use_0ms_head() {
         // ASR-CTC-OPT-001 P1: 两模型都用 0ms head（offline 模型不需 frame alignment padding）
@@ -4423,7 +4814,6 @@ mod overlay_shimmer_tests {
         assert_eq!(acc_head, 0, "accuracy head must be 0");
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn preprocessing_params_accuracy_backtrack_less_than_performance() {
         // native 对送气声母不如 CTC 敏感，少留 backtrack 减少前导静音
@@ -4437,7 +4827,6 @@ mod overlay_shimmer_tests {
         );
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn preprocessing_params_qwen3_online_follows_performance() {
         // DEC-028: qwen3_online 沿用 performance 前处理参数（0ms head / 200ms backtrack）
@@ -4453,6 +4842,113 @@ mod overlay_shimmer_tests {
             q3_bt, perf_bt,
             "qwen3_online backtrack ({}) must equal performance backtrack ({})",
             q3_bt, perf_bt
+        );
+    }
+}
+
+// ============================================================
+// MACOS-P4-NEUTRAL-001: focus_lost 判定逻辑真值表测试
+// 镜像 main.rs:3217 的表达式 `target_hwnd != 0 && current_id != target_hwnd`
+// ============================================================
+#[cfg(test)]
+mod focus_lost_logic_tests {
+    /// P0-4: 锁住 run_pipeline_core 内 focus_lost 判据的真值表。
+    /// 表达式形态：target_hwnd != 0 && current_id != target_hwnd
+    /// （原 Windows 形态：!target_hwnd.0.is_null() && current_hwnd.0 != target_hwnd.0）
+    fn focus_lost(target_hwnd: usize, current_id: usize) -> bool {
+        target_hwnd != 0 && current_id != target_hwnd
+    }
+
+    #[test]
+    fn focus_lost_both_zero() {
+        // target=0, current=0 → false（target_hwnd==0 短路）
+        assert!(!focus_lost(0, 0));
+    }
+
+    #[test]
+    fn focus_lost_target_zero_current_nonzero() {
+        // target=0, current=123 → false（target_hwnd==0 短路）
+        assert!(!focus_lost(0, 123));
+    }
+
+    #[test]
+    fn focus_lost_same_nonzero() {
+        // target=123, current=123 → false（current_id == target_hwnd）
+        assert!(!focus_lost(123, 123));
+    }
+
+    #[test]
+    fn focus_lost_different_nonzero() {
+        // target=123, current=456 → true（焦点确实丢失）
+        assert!(focus_lost(123, 456));
+    }
+}
+
+/// OVERLAY-WIRE-002：PipelineEvent → overlay 指令七分支真值表（macOS）。
+/// 调用真实 overlay_request_for_event 与真实 PipelineEvent 各变体，逐分支断言。
+/// OVERLAY-002/003 契约（已对照生产 overlay_request_for_event 核验）：
+///   RecordingStarted → Show；Processing(msg) → ShowProcessing(msg)（载荷透传）；
+///   FocusLost(text) → ShowPreview(text)（OVERLAY-003 Preview 态已实现，原「无对应浮层故 Hide」已过时）；
+///   Error(msg) → ShowError{msg, auto_close_ms:2000}；FormatFailed → ShowError{空文案, auto_close_ms:2500}；
+///   Done/Cancelled → Hide。禁加 _ => 兜底，保证每新增事件都必须显式归边。
+#[cfg(target_os = "macos")]
+#[cfg(test)]
+mod overlay_wire_tests {
+    use super::*;
+    use crate::platform::OverlayRequest;
+
+    /// 七个分支逐条断言（穷举覆盖，一个不落），带载荷变体连载荷一并断言，
+    /// 防「传错文本」类缺陷（只断变体不断载荷会漏掉）。
+    #[test]
+    fn overlay_request_for_event_truth_table() {
+        assert_eq!(
+            overlay_request_for_event(&PipelineEvent::RecordingStarted),
+            OverlayRequest::Show,
+            "RecordingStarted 必须映射为 Show"
+        );
+
+        let processing_msg = "处理中".to_string();
+        assert_eq!(
+            overlay_request_for_event(&PipelineEvent::Processing(processing_msg.clone())),
+            OverlayRequest::ShowProcessing(processing_msg),
+            "Processing 必须映射为 ShowProcessing 且载荷原文透传"
+        );
+
+        let preview_text = "失焦返显文本".to_string();
+        assert_eq!(
+            overlay_request_for_event(&PipelineEvent::FocusLost(preview_text.clone())),
+            OverlayRequest::ShowPreview(preview_text),
+            "FocusLost 必须映射为 ShowPreview 且 text 必须等于事件原文（OVERLAY-003 Preview 态已实现）"
+        );
+
+        let error_msg = "录音出错".to_string();
+        assert_eq!(
+            overlay_request_for_event(&PipelineEvent::Error(error_msg.clone())),
+            OverlayRequest::ShowError {
+                message: error_msg,
+                auto_close_ms: 2000,
+            },
+            "Error 必须映射为 ShowError{{message, auto_close_ms:2000}} 且载荷原文透传"
+        );
+
+        assert_eq!(
+            overlay_request_for_event(&PipelineEvent::FormatFailed),
+            OverlayRequest::ShowError {
+                message: String::new(), // 纯函数内空文案，由 handle_pipeline_event 按 ui_language 补齐
+                auto_close_ms: 2500,
+            },
+            "FormatFailed 必须映射为 ShowError{{空文案, auto_close_ms:2500}}"
+        );
+
+        assert_eq!(
+            overlay_request_for_event(&PipelineEvent::Done),
+            OverlayRequest::Hide,
+            "Done 必须映射为 Hide"
+        );
+        assert_eq!(
+            overlay_request_for_event(&PipelineEvent::Cancelled),
+            OverlayRequest::Hide,
+            "Cancelled 必须映射为 Hide"
         );
     }
 }
