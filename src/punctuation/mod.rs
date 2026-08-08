@@ -138,6 +138,42 @@ pub fn strip_trailing_punctuation(text: &str) -> String {
     s.trim_end().to_string()
 }
 
+/// L2 后处理走过的分支（PUNCT-GOVERNANCE-030-E，日志方案 C）
+///
+/// 供调用方区分「剥了哪条分支」打对应日志；也与 `apply_l2_postprocess` 返回值
+/// 一起供单测断言「判定走了哪条」，避免只用字符串相等（文本本就无末尾标点时会
+/// 与 no-op 结果相同，字符串断言失去判别力）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L2Action {
+    /// (a) 开关关闭 → 全文剥标点
+    StripAll,
+    /// (b) 开关开启且字/词数 <= 5 → 剥末尾标点
+    StripTrailing,
+    /// (c) 其余 → 原样返回
+    NoOp,
+}
+
+/// L2 后处理决策（PUNCT-GOVERNANCE-030-E：纯函数，从 run_pipeline_core 抽出以便单测）
+///
+/// 判定矩阵（tester-1 规格，行为较 main.rs 内联版零变更）：
+/// (a) `punctuation_enabled=false` → `transcription::strip_punctuation`（标点换空格、
+///     连续空格合一、trim），action = `StripAll`
+/// (b) `true` 且 `count_units <= SHORT_TEXT_UNIT_THRESHOLD` → `strip_trailing_punctuation`
+///     （直接删除不留空格），action = `StripTrailing`
+/// (c) 其余 → 原样返回，action = `NoOp`（**最大回归风险点**：>5 单位的长句必须逐字符不动）
+///
+/// note：返回值与 action 是否「实际改动」无关——`StripAll`/`StripTrailing` 分支若文本
+/// 本就无标点会返回原串（日志侧按 `!=` 判定是否打，沿用现码行为）。
+pub fn apply_l2_postprocess(text: &str, punctuation_enabled: bool) -> (String, L2Action) {
+    if !punctuation_enabled {
+        (transcription::strip_punctuation(text), L2Action::StripAll)
+    } else if count_units(text) <= SHORT_TEXT_UNIT_THRESHOLD {
+        (strip_trailing_punctuation(text), L2Action::StripTrailing)
+    } else {
+        (text.to_string(), L2Action::NoOp)
+    }
+}
+
 pub struct PunctuationEngine {
     punct: sherpa_onnx::OfflinePunctuation,
 }
@@ -418,7 +454,7 @@ mod tests {
         assert_eq!(strip_trailing_punctuation("（好的）。"), "（好的）");
     }
 
-#[test]
+    #[test]
     fn test_strip_trailing_punctuation_comma_dash() {
         // 逗号/分号/半角冒号等句末出现的标点也剥（TRAILING 集合含之）
         assert_eq!(strip_trailing_punctuation("好的，"), "好的");
@@ -450,7 +486,9 @@ mod tests {
     /// 030-A-2 反向参数化：成对符号右半 + `·` 逐字符确认不被剥（与 partition 护栏对照）。
     #[test]
     fn test_strip_trailing_punctuation_non_members_kept() {
-        for c in ['）', '】', '》', '」', '』', '\u{201D}', '\'', ')', ']', '·'] {
+        for c in [
+            '）', '】', '》', '」', '』', '\u{201D}', '\'', ')', ']', '·',
+        ] {
             let input = format!("测试{c}");
             assert_eq!(
                 strip_trailing_punctuation(&input),

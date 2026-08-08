@@ -4673,7 +4673,7 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
         assert_eq!(normalize_test("千百万"), "千百万");
     }
 
-#[test]
+    #[test]
     fn itn_v2_031_wanyi_guard_pass_through_regression() {
         // 守卫放行的对照组：大单位前确有数字，行为必须与 027-E/DEC-042 一致，零回归。
         assert_eq!(normalize_test("一万"), "1万");
@@ -4684,7 +4684,10 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
         assert_eq!(normalize_test("三亿五"), "3.5亿");
         assert_eq!(normalize_test("一万亿"), "1万亿");
         assert_eq!(normalize_test("一千零四十六万八千七百四十一"), "10468741");
-        assert_eq!(normalize_test("一亿两千三百四十五万六千七百八十九"), "123456789");
+        assert_eq!(
+            normalize_test("一亿两千三百四十五万六千七百八十九"),
+            "123456789"
+        );
         assert_eq!(normalize_test("两万五"), "2.5万");
         assert_eq!(normalize_test("三千万"), "3000万");
         assert_eq!(normalize_test("两万五百"), "20500");

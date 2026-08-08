@@ -1142,8 +1142,7 @@ mod tests {
             let input = format!("测试{c}测试");
             let out = strip_punctuation(&input);
             assert_eq!(
-                out,
-                "测试 测试",
+                out, "测试 测试",
                 "PUNCT_CHARS 成员 {c:?} 应被替换为单个空格（A2），而非删除"
             );
         }

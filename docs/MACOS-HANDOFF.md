@@ -145,6 +145,8 @@ Gavin.S <cdexs@hotmail.com>
 
 **请两侧共同遵守此模式**：平台特有的部分留在 `platform/` 与 cfg 区，业务逻辑上移到共享模块。
 
+**PUNCT-GOVERNANCE-030-D 更新（2026-08-08）**：`src/llm/mod.rs` 翻译路径的 `system_content` 装配已抽为模块级私有纯函数 `build_translate_system_content(target: TranslationLanguage, punctuation_enabled, wordbook_block: Option<String>, extra_instruction: Option<&str>) -> String`（`impl LlmClient` 之后的模块级区域，**无任何 `#[cfg]`**，两端同为 cfg 自由区编译）。Windows 侧 `optimize_and_translate` 改调用此纯函数；macOS 侧复用同文件自动生效，**无需任何移植**。该函数零行为变更是硬验收项：抽取前后 24 组合逐字节相同（临时断言验证后已删）。若 macOS 侧将来要加翻译路径 prompt 测试（TEST-SYNC-030-B），直接单测此纯函数即可，无需 mock HTTP。
+
 ### 2.7 共享文档共编约定与引用纪律【2026-07-30 新增】
 
 `collab/` 与 `logs/` 已于 2026-07-30 移出 `.gitignore` 并入库（Gavin 决定），两侧从此共享同一份治理文档。随之而来的约定：
@@ -333,6 +335,8 @@ Gavin 2026-08-04 拍板：**判定语言中明确提到的最小单位，输出�
 固定词不再被数字化（此前输出 `0.1万`/`0万`）。macOS 侧编译同一份 `src/itn.rs` 自动继承，无平台差异。
 对照组（一万→10000、十万→100000、三亿五→3.5亿、一万亿→1万亿、一亿两千三百四十五万六千七百八十九→123456789）
 全部零回归，itn:: 221/0。`itn-rules.toml` 零改动。
+
+**PUNCT-GOVERNANCE-030-E 跨端提示（coder-2 补记，2026-08-08）**：L2 后处理判定已从 `run_pipeline_core`（平台共享代码）抽为纯函数 `punctuation::apply_l2_postprocess(text, punctuation_enabled) -> (String, L2Action)`（`src/punctuation/mod.rs`）。判定矩阵：(a) 开关关 → `strip_punctuation`；(b) 开且 ≤5 单位 → `strip_trailing`；(c) 其余 → 原样。`main.rs` L2 块只留打日志。macOS 侧编译同一份代码自动继承；`L2Action` 枚举（StripAll/StripTrailing/NoOp）是新增公开类型，若你们在平台代码调用 L2 逻辑请直接用该函数，勿再内联判定（保持零回归护栏可测）。
 
 **PUNCT-GOVERNANCE-030-A/A-2 跨端提示（coder-2 补记，2026-08-08）**：`src/punctuation/mod.rs` + `src/transcription/mod.rs` 是平台中立模块（`run_pipeline_core` 已去平台化，L2 后处理块位于平台共享代码），macOS 侧编译同一份代码，无需镜像。两件事需知晓：
 - **030-A**：L2 后处理补位块（`src/main.rs` 共享段）对 6 个产出源一视同仁，删除了来源判据；`count_units`（CJK/假名按字、其余按空格分词）与 `strip_trailing_punctuation`（短句 ≤5 剥末尾标点，直接删除不留空格）为新增平台中立函数。

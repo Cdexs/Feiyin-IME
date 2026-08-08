@@ -3601,31 +3601,33 @@ fn run_pipeline_core(
                     //   (b) 开关开启且字/词数 <= 5 → 剥末尾标点（Gavin 2026-08-08 短句规则）
                     // 🔴 本块不含任何来源判据（llm_handled/native_punctuated）/（LLM 翻译），
                     //    对 6 个产出源一视同仁，将来新增产出源自动受控。
-                    let final_text = if !config.punctuation.enabled {
-                        let stripped = transcription::strip_punctuation(&final_text);
-                        if stripped != final_text {
-                            log::info!(
-                                "Stripped native punctuation (auto_punct=false): '{}' -> '{}'",
-                                final_text,
-                                stripped
-                            );
+                    // PUNCT-GOVERNANCE-030-E：判定逻辑已抽为纯函数 apply_l2_postprocess
+                    //   （src/punctuation/mod.rs，可单测）；本侧只保留日志（日志方案 C：
+                    //   按 L2Action 分支打对应文案，且沿用「输出变化才打」的 != 判定）。
+                    let (l2_text, l2_action) =
+                        punctuation::apply_l2_postprocess(&final_text, config.punctuation.enabled);
+                    match l2_action {
+                        punctuation::L2Action::StripAll => {
+                            if l2_text != final_text {
+                                log::info!(
+                                    "Stripped native punctuation (auto_punct=false): '{}' -> '{}'",
+                                    final_text,
+                                    l2_text
+                                );
+                            }
                         }
-                        stripped
-                    } else if punctuation::count_units(&final_text)
-                        <= punctuation::SHORT_TEXT_UNIT_THRESHOLD
-                    {
-                        let stripped = punctuation::strip_trailing_punctuation(&final_text);
-                        if stripped != final_text {
-                            log::info!(
-                                "Stripped trailing punctuation (<=5 units): '{}' -> '{}'",
-                                final_text,
-                                stripped
-                            );
+                        punctuation::L2Action::StripTrailing => {
+                            if l2_text != final_text {
+                                log::info!(
+                                    "Stripped trailing punctuation (<=5 units): '{}' -> '{}'",
+                                    final_text,
+                                    l2_text
+                                );
+                            }
                         }
-                        stripped
-                    } else {
-                        final_text
-                    };
+                        punctuation::L2Action::NoOp => {}
+                    }
+                    let final_text = l2_text;
                     if cancel_signal.load(Ordering::Relaxed) {
                         send_event(event_tx, PipelineEvent::Cancelled);
                         return;
