@@ -358,6 +358,21 @@
 1. ✅ **018 只修了一半 → 新开 PROMPT-ARCH-020（已闭环）**：缺陷由**出包后的反向探针**查出（`already contains normalized numbers` 在 BUILD-010 的新 exe 里仍 =1），**非测试、非 Worker 自报** —— 749 条测试全绿也没抓到，因为翻译路径常量**无任何等价断言**。修复随 021 合批落地，TEST-SYNC-022 补 5 条对称断言，BUILD-011/012 反向探针 =0。**方法论固化**：反向探针（「本该消失的字符串是否真的消失」）对「修改不彻底」类缺陷比正向探针更有判别力，已列为出包验收固定项
 2. ⚠️ **exe 产物记录长期失准**：`todo.md` 顶部挂着「014/015 未进 exe」的过时结论，实际 08-02 01:35 已出过一次包含 014/015/016 的产物但未回写文档。已订正并加入纪律：**出包后立即回写产物时间戳**
 
+### ✅ LLM 连接池僵尸连接修复（LLM-CONN-POOL-028，2026-08-08，未出包）
+
+> 触发：Gavin 端测发现 LLM 优化间歇性 0ms 失败（请求未上网络即挂）。非 ITN，平台中立批次。
+
+**根因**：`reqwest::Client::builder()` 只设 `connect_timeout`，吃全局默认 `pool_idle_timeout=90s`；DeepSeek 服务端 keep-alive 约 60s 关连接 → 60-90s 窗口内池中残留「服务端已关、客户端以为活着」的死连接，复用即失败。实测失败时间点 62.5/67.9/72.3/72.8s（<60s 与 >98s 成功）与该窗口假说吻合——**这是「默认值比服务端行为慢」类缺陷，单测天然测不出，只能靠真实网络规模暴露**。
+
+**修复（`src/llm/mod.rs` + `src-tauri/src/llm.rs` 镜像）**：
+1. `POOL_IDLE_TIMEOUT=30s`（新增具名常量，必须 < 服务端 ~60s keep-alive 留足余量）+ builder `.pool_idle_timeout()`——空闲超过 30s 的连接由池主动关闭，不再进复用窗口
+2. 重试判据放宽 `e.is_connect() || e.is_timeout()` → `+ e.is_request()`——`is_request()` = reqwest `Kind::Request` 桶（client.rs 构造点 150/156/3071），覆盖**连接复用失败**这一类曾经漏判的错误；body→`Kind::Body`、decode→`Kind::Decode`、builder→`Kind::Builder`、status→`Kind::Status` 各自独立桶，主控担忧的「覆盖过宽」经 reqwest-0.12.28 error.rs 源码核证不成立
+3. 新增 `fmt_error_chain`（逐层 `Error::source()` 展开），三处错误日志改用完整链路——解决 reqwest `Display` 只输出最外层错误、底层 hyper 连接关闭原因被吞导致的排障盲区
+
+**决策**：采纳主控 `is_request()` 方案，不选 source-chain 备选（hyper-util legacy `ChannelClosed/SendRequest` 包装致链接判定在不同 hyper 版本下不稳定，error.rs Kind 桶在 reqwest 层稳定）。
+
+**验证**：cargo fmt clean / cargo check 0err（13.5s，pre-existing warnings）/ src-tauri check 0err（33.56s）/ `llm::` 131/0 / src-tauri 53/0。**仅改两文件**，现有值 CONNECT_TIMEOUT/ATTEMPT_TIMEOUTS/MAX_ATTEMPTS 未动；未出包。
+
 ---
 
 ## macOS 双平台 · A 阶段（2026-07-29~30）· ✅ 编译打通

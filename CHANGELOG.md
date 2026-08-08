@@ -574,3 +574,7 @@ HOTKEY-LATENCY-FIX-001 | 热键录音视觉延迟 + 偶发首字丢失修复：�
 | MACOS-P4-OVERLAY-WIRE-003 | 修 poll_pending_overlay 注释声称 try-lock 但实现是阻塞 lock：src/platform/macos/overlay.rs PENDING_REQUEST.lock()→try_lock()（对齐注释，timer 回调结构上不可能阻塞；漏一拍15ms后补取无感知）；OVERLAY_LEVELS.lock() 保持阻塞但加注释如实说明（只在建浮层时走到/微秒级临界区/无竞争/timer不阻塞由PENDING_REQUEST try_lock守住）。选方案A(改实现对齐注释)。验证：cargo check 0err/cargo test --no-fail-fast 821/0/6(与基线一致)/fmt clean/本轮仅动overlay.rs。注释-实现不符是本项目第三次踩的同类病 | coder-1 | 2026-08-05 |
 | MACOS-P4-BUNDLE-001 | .app 打包 + Info.plist + ad-hoc 自签名（本地调试，不做公证）：新建 scripts/Info.plist（TCC 声明 ×4 + LSUIElement）+ 重写 scripts/build-macos.sh（Tauri UI custom-protocol 构建 + dylib @loader_path 注入 + 两模式 models + 签名验证） | coder-2 | 2026-08-05 |
 | MACOS-P4-BUNDLE-002 | 签名从 ad-hoc 改自签名证书 Feiyin Dev（禁止 ad-hoc）：build-macos.sh 加 CODESIGN_IDENTITY + 证书检查去 -v + 去 --deep 先内后外 + toml 数据文件改 Resources+相对symlink | coder-2 | 2026-08-05 |
+
+## 2026-08-08
+
+| LLM-CONN-POOL-028 | LLM 连接池僵尸连接修复（Gavin 端测触发）：reqwest client 只设 connect_timeout，吃默认 pool_idle_timeout=90s；DeepSeek 服务端 keep-alive ~60s → 60-90s 窗口内死连接复用即 0ms 失败（实测失败点 62.5/67.9/72.3/72.8s 吻合）。`src/llm/mod.rs`：①新增 POOL_IDLE_TIMEOUT=30s（< keep-alive 余量）+ builder .pool_idle_timeout ②重试判据 +e.is_request()（Kind::Request 桶覆盖连接复用失败，其余桶独立不误吞）③新增 fmt_error_chain 打印完整 source chain，三处日志改用。`src-tauri/src/llm.rs` 镜像同三处。cargo fmt clean / cargo check 0err / src-tauri check 0err / llm:: 131/0 / src-tauri 53/0。未出包 | coder-1 | 2026-08-08 |

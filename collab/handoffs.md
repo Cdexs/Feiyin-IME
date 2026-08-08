@@ -1,4 +1,15 @@
-## 2026-08-04 — coder-1 — ITN-FIX-BIGNUM-027-G 万亿层(DEC-042补充二)+专名白名单(DEC-044)
+## 2026-08-08 — coder-1 — LLM-CONN-POOL-028 ✅ 连接池僵尸连接修复（reqwest pool_idle_timeout + is_request 重试 + 错误链路日志）
+
+- **来源**：Gavin 端测发现 LLM 优化间歇性 0ms 失败（未上网络即挂）。基线 merge `7e76465`
+- **根因**：reqwest builder 只设 connect_timeout，吃默认 pool_idle_timeout=90s；DeepSeek 服务端 keep-alive ~60s → 60-90s 窗口内死连接复用即 0ms 失败（实测失败点 62.5/67.9/72.3/72.8s 吻合）
+- **改动 `src/llm/mod.rs`**：① 新增 `POOL_IDLE_TIMEOUT=30s`（必须 < keep-alive 余量，CONNECT_TIMEOUT 旁注释写明）+ builder `.pool_idle_timeout` ② 重试判据 `e.is_connect()||e.is_timeout()` → `+ e.is_request()`（`Kind::Request` 桶覆盖连接复用失败；body→Body/decode→Decode/builder→Builder/status→Status 独立桶不误吞，已核 reqwest-0.12.28 error.rs）③ 新增 `fmt_error_chain`（逐层 source() 展开），三处日志改用
+- **镜像 `src-tauri/src/llm.rs`**：`POOL_IDLE_TIMEOUT` + `.pool_idle_timeout` + `is_retryable_error` 加 `is_request()`
+- **验证**：cargo fmt clean / cargo check 0err（13.5s，pre-existing warnings）/ src-tauri check 0err（33.56s）/ `llm::` 131/0 / src-tauri 53/0
+- **边界**：未改 CONNECT_TIMEOUT/ATTEMPT_TIMEOUTS/MAX_ATTEMPTS 现有值；未碰 itn.rs/prompt/无关逻辑；未 build --release；未出包；UTF-8 用 edit 工具
+- **下游**：Gavin 端测验证间歇失败消失；docs/MACOS-HANDOFF §2.9.5 已记跨端说明（macOS 复用同文件自动同步）
+- **详情**：outbox/coder-1/result.md + logs/20260808.md + CHANGELOG.md
+
+## 2026-08-04 — coder-1 — ITN-FIX-BIGNUM-027-G 万亿级(DEC-042补充二)+专名白名单(DEC-044)
 
 - **来源**：Gavin端测。基线ade02e1
 - **G-1**：format_dec042_magnitude加升万亿(≥1e12且≤1位小数)。一万亿→1万亿。G-2：itn-rules.toml proper_nouns+十万个为什么。前缀遮蔽自查无误伤

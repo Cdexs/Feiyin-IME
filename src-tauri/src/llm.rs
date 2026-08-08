@@ -6,6 +6,9 @@ use crate::config::LlmConfig;
 
 const ATTEMPT_TIMEOUTS: [Duration; 1] = [Duration::from_secs(6)];
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+// LLM-CONN-POOL-028 镜像: 与主进程同一缺陷（src/llm/mod.rs）。设置界面连接测试同样受
+// reqwest 默认 pool_idle_timeout=90s 与 DeepSeek 服务端 keep-alive ~60s 的窗口影响。
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Serialize)]
@@ -72,6 +75,7 @@ impl LlmClient {
     pub fn new(config: LlmConfig) -> Self {
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .build()
             .expect("Failed to build HTTP client");
         Self { client, config }
@@ -157,7 +161,7 @@ impl LlmClient {
 }
 
 fn is_retryable_error(error: &reqwest::Error) -> bool {
-    error.is_connect() || error.is_timeout()
+    error.is_connect() || error.is_timeout() || error.is_request()
 }
 
 fn probe_error_message(error: &reqwest::Error) -> String {

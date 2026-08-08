@@ -336,6 +336,24 @@ Gavin 2026-08-04 拍板：**判定语言中明确提到的最小单位，输出�
 
 **确立的防御规则**：任何「隐式/省略成分补全」类规则，必须显式声明适用边界，并配反向护栏测试证明它在边界外不生效。**只测生效侧 = 没测。** macOS 侧若新增此类规则，请同样遵守。
 
+#### 2.9.5 LLM 连接池僵尸连接（LLM-CONN-POOL-028，2026-08-08，非 ITN）
+
+> 本小节非 ITN，属独立批次，记录在共享模块 `src/llm/mod.rs` 的缺陷与修复，供 macOS 侧知晓。
+
+**缺陷**：Gavin 端测发现 LLM 优化间歇性 0ms 失败（请求未上网络即挂）。根因：`reqwest::Client::builder()` 只设 `connect_timeout`，吃全局默认 `pool_idle_timeout=90s`；DeepSeek 服务端 keep-alive 约 60s 关连接 → 60-90s 窗口内池中残留「服务端已关、客户端以为活着」的死连接，复用即失败。
+
+**修复（macOS 侧编译同一份 `src/llm/mod.rs`，自动同步）**：
+
+1. `POOL_IDLE_TIMEOUT=30s`（新增具名常量，必须 < 服务端 ~60s 留足余量）+ builder `.pool_idle_timeout(POOL_IDLE_TIMEOUT)`
+2. 重试判据放宽：`e.is_connect() || e.is_timeout()` → `+ e.is_request()`（`is_request()` = reqwest `Kind::Request`，覆盖连接复用失败类错误；body→`Kind::Body`、decode→`Kind::Decode`、builder→`Kind::Builder`、status→`Kind::Status` 各自独立桶，不会被误吞）
+3. 错误日志打印完整 source chain（`fmt_error_chain`，逐层 `Error::source()` 展开），解决 Display 吞链路导致的排障盲区
+
+**src-tauri/src/llm.rs 同步镜像**：同一 `pool_idle_timeout(30s)` + `is_retryable_error` 加 `is_request()`。macOS 设置界面若复用该文件（Tauri UI 默认全平台共享）会自动同步。
+
+**行为前后对比**：空闲间隔 60-90s 的 LLM 请求从此类 0ms 失败 → 正常请求；重试覆盖连接复用失败；debug.log 错误行可看到完整 error chain。
+
+**不需要 macOS 侧独立改动**：本修复全部在平台中立模块内，无平台 API，无契约变化。仅提示：若 macOS 侧 LLM 服务商 keep-alive 比 60s 更短，可自行下调 `POOL_IDLE_TIMEOUT`（需小于服务端 keep-alive 的余量原则不变）。
+
 ---
 
 ### 2.10 · 🍎 macOS 侧跨端影响评估【本节由 macOS 侧维护，倒序追加】

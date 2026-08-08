@@ -12,7 +12,23 @@ use crate::wordbook::{WordbookCache, WordbookEntry};
 const ATTEMPT_TIMEOUTS: [Duration; 2] = [Duration::from_secs(8), Duration::from_secs(15)];
 const MAX_ATTEMPTS: usize = ATTEMPT_TIMEOUTS.len();
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+// LLM-CONN-POOL-028: 连接池空闲连接超时。必须显著小于服务端 keep-alive（DeepSeek ~60s）：
+// reqwest 默认 pool_idle_timeout=90s，60-90s 窗口内池中残留「服务端已关、客户端以为活着」的死连接，
+// 复用立即 0ms 失败。取 30s 留足余量，让客户端在服务端关闭前主动拆除空闲连接。
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_DELAY: Duration = Duration::from_millis(250);
+
+// LLM-CONN-POOL-028: reqwest 的 Display 只输出最外层错误，底层 source chain 被吞，
+// 导致「连接复用死连接」这类根因在 debug.log 里不可见。此函数逐层展开完整链条。
+fn fmt_error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = Vec::new();
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        parts.push(err.to_string());
+        cur = err.source();
+    }
+    parts.join(" | ")
+}
 
 // WORDBOOK-AUTOLEARN-FIX-001-C: 词库建议词过滤上限（具名 const，端测后可一行调整）。
 // CJK 8 字比 DEC-029 hotwords 选取门槛 10 字更严（入库错了要人工删，故意收紧）。
@@ -425,6 +441,7 @@ impl LlmClient {
     pub fn new(config: LlmConfig) -> Self {
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .build()
             .expect("Failed to build HTTP client");
         Self { client, config }
@@ -557,17 +574,17 @@ impl LlmClient {
                     }
                     return Ok(result);
                 }
-                Err(e) if e.is_connect() || e.is_timeout() => {
+                Err(e) if e.is_connect() || e.is_timeout() || e.is_request() => {
                     log::warn!(
                         "LLM attempt {}/{} timed out or failed: {}",
                         attempt,
                         MAX_ATTEMPTS,
-                        e
+                        fmt_error_chain(&e)
                     );
                     last_err = Some(e);
                 }
                 Err(e) => {
-                    log::error!("LLM non-retryable error: {}", e);
+                    log::error!("LLM non-retryable error: {}", fmt_error_chain(&e));
                     return Err(anyhow!(e));
                 }
             }
@@ -577,7 +594,7 @@ impl LlmClient {
         log::error!(
             "LLM unreachable after {} attempts, falling back to raw text: {}",
             MAX_ATTEMPTS,
-            e
+            fmt_error_chain(&e)
         );
         Err(anyhow!(e))
     }
