@@ -2,10 +2,59 @@
 
 > ✅ **产物已更新**（2026-08-03 **17:42**，BUILD-012）：`Publish/feiyin-ime.exe` `DB07CEFD8D51` / `feiyin-ime-ui.exe` `46D0F31E149D` / `crash-reporter.exe` `699ED9656958`，包含 017/018/020/021/**023**（四语标记清单恢复扩充）。三 exe 两副本 sha256 一致，两 toml 三副本一致（`scene-rules.toml` `7C1F0620` / `itn-rules.toml` `ED77A912`），ProductVersion 0.7.3.0/0.7.3。**⏭ 待 Gavin 端测。**
 > 🔴 **2026-08-04 主控核查：上方产物不含 ITN-FIX-CHAIN-TEAR-026** —— 产物 mtime `17:42:42` 早于 `src/itn.rs` `23:47:25` 整 6 小时。026 需 BUILD-013 才进 exe，详见下方 P0 节。
-> ⏳ **本地 ahead 43 未 push**（最新 `9edc839`，Gavin 只授权提交，不授权 push）。
+> ⏳ **本地 ahead 2 未 push**（最新 `480a23c`，Gavin 只授权提交，不授权 push）。
+> ✅ **2026-08-08 已合并 origin/main 的 6 个 macOS Phase 4 提交**（merge `7e76465`，+6694/−281，零冲突，`cargo check` 0 error）。mac 端顺带跑了全库 `cargo fmt`，后续改动须保持 rustfmt 风格。
 > 端测方式（2026-07-25 Gavin 指示）：Gavin 已在**实际日常使用中自行测试**，端测项不再列入本文档；发现 bug 或优化点由 Gavin 邀请重新开单。
 
 > ✅ **TEST-EXEC-024 + BUILD-012-VERIFY 已闭环并提交 `7a1329e`**（崩溃中断续做，tester-1 2026-08-03 18:3x，主控 18:4x 独立验收）。详见 CHANGELOG / `logs/20260803.md`（规则 3：测试同步与出包不在本文档详列）。
+
+---
+
+## 🔄 2026-08-08 当前批次（Gavin 端测 + 需求）
+
+### ✅ 已闭环 · LLM-CONN-POOL-028 连接池僵尸连接致 0ms 请求失败
+
+提交 `480a23c`。根因：`reqwest` 默认 `pool_idle_timeout=90s` ＞ DeepSeek 服务端 keep-alive ~60s，
+60–90s 空闲窗口内池中残留死连接，取出即 0ms 失败。判据是空闲间隔：<60s 全成功、
+62.5/67.9/72.3/72.8s 四次全失败、>98s（含 4244s）全成功。
+修复三层：`POOL_IDLE_TIMEOUT=30s` / 重试判据补 `is_request()` / `fmt_error_chain` 展开 source chain。
+**主控无法在验收阶段自证** —— 依赖「服务端 keep-alive ≈60s」的反推，真正判据是端测后 0ms 失败是否绝迹。
+
+### 🔄 PUNCT-GOVERNANCE-030 标点子系统治理（架构稿 `research/punctuation-architecture-001.md`）
+
+> **起因**：Gavin 提「开启自动补标点时字/词数 ≤5 不加末尾标点」，主控给了补丁式方案被 Gavin 打回：
+> 「每一个功能都要从架构程度全局层面来设计方案，不能像补丁式的这样来设计方案」。
+> 盘点后发现**标点有 6 个产出源，开关只完全控制 1 个**。教训见 `.claude/tasks/lessons.md` 2026-08-08 条。
+
+架构：**L1 源头控制为主，L2 后处理补位**（Gavin 指示：能在源头关的就别产出后再剥）。
+源头可控性已核实：在线 Qwen3 ASR（官方文档无标点参数）/ 本地 Accuracy native（模型内建）/
+本地 NLLB（seq2seq 无参数）**三条物理上不可控**，L2 不可省。
+
+| 编号 | 内容 | 负责人 | 文件域 | 状态 |
+| --- | --- | --- | --- | --- |
+| 030-A | L2 后处理：`count_units` + `strip_trailing_punctuation` + `strip_punctuation` 改造（标点位置留空格）+ 收口点删除来源判据 | coder-2 | `main.rs` `transcription/` `punctuation/` | 🔄 进行中 |
+| 030-B | L1 源头：LLM 提示词双向明确化（true 明确补足+优化，false 明确禁止，**不留空**） | coder-1 | `llm/mod.rs` | 🔄 进行中 |
+| 030-C | L3 列表分隔符 `、；` 条件化（B6 拆出，视 coder-1 影响面评估决定） | 待定 | `llm/mod.rs` | ⏸ 待协商 |
+| TEST-SYNC-030 | 测试同步 | tester-1 | | 🔜 阶段三 |
+
+Gavin 拍板口径：阈值 ≤5 ｜ 中日文数字符/英韩文数词、混合相加 ｜ 短句末尾标点全剥含问号感叹号 ｜
+开关关闭时任何标点都剥（含引号括号、列表分隔符）且**标点位置留空格** ｜ 翻译两条引擎都算 ｜
+≤5 规则只在开关开启时生效、放后处理点。
+
+### 🔄 ITN-PROBE-031 「万一」→「0.1万」类缺陷探测（2026-08-08 Gavin 端测）
+
+**现象**：`万一` 被转成 `0.1万`。「万一」是中文常用词，不该数字化。
+
+**主控代码追踪（待 tester-1 实测确认）**：`parse_cn_number` 中 `万`/`亿` 分支缺
+「大单位前必须有数字」的前置守卫。`万一` → `digit=0` 照常结算 → `big_unit_anchor=Some(('万',0))`
++ `big_unit_seen=true` → 末尾「一」命中隐式千位 `+1*1000` → DEC-042 输出 `0.1万`。
+
+对照：`百`/`千` 分支（`:721`/`:729`）同样无守卫，但不设锚点、`result==0` 被拒，**歪打正着没出事**。
+`万`/`亿` 是 027-E 引入锚点机制后才把洞暴露出来。
+
+**这是一类不是一个词** —— 疑与 todo 里挂了很久的 `:682` 十分支默认 1（`十分`→`10分`）同族。
+tester-1 正跑 A/B/C/D/E 五组探测（万亿开头 / 百千开头 / 十开头 / 零回归基线 / 保护词表现状），
+**只测不改**，拿到实测边界后主控再定修法。禁止走词表（DEC-038）。
 
 ---
 
