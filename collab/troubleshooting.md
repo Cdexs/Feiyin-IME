@@ -17,6 +17,31 @@
 - **配套**：本条与 [VERSION-DRIFT-001]（版本号不能只信 handoffs 文字）同源，都指向同一条底层原则——**文档是索引不是事实源，事实源永远是文件系统与 git**
 - **降低复发**：worker-guide §12 已要求验收后尽快 commit；本条追加要求——**出包/提交完成后的文档同步与产物动作视为同一个不可分事务**，宁可先写文档再动手，也不要留下"做完没记"的窗口
 
+### [DOC-STATE-DRIFT-001] 补充（2026-08-09）：第二种形态 —— 不是 session 中断，是**部分更新**
+
+**状态**：🟢 已用「收尾自证表」堵住（2026-08-09 Gavin 拍板加入任务书）
+
+- **现象**：2026-08-09 一天之内，同一 Worker（tester-1）**连续三次任务**（TEST-EXEC-030 / BUILD-015
+  及其收尾）均只更新 `CHANGELOG.md` + `logs/20260809.md` **两份**，
+  `handoffs.md` / `progress.md` / `todo.md` **零条目**，三次全部由主控代记
+- **与原条目的区别**：原条目是 session 崩溃造成的**全有全无**；本形态是 Worker 正常完成任务、
+  文档**部分更新**。危害在于「看起来更新了」——CHANGELOG 有记录，粗看不像漏，
+  只有主控逐份 grep 才会发现 handoffs/progress 是空的
+- **根因（关键，不是 Worker 偷懒）**：「任务完成后更新五文档」写在 **worker-guide 的通用规则**里，
+  **不在任务书的完成判据里**。Worker 每次读的是 task.md，通用规则是启动时读过一遍的背景。
+  **规则读过就忘，判据才会逐条打钩。**
+- **修复（2026-08-09 Gavin 拍板「改任务书」）**：
+  1. `worker-guide.md` §6 新增**「收尾自证表」**——八行表格，逐份文档打 ✅/❌，
+     允许填 ❌ 但**必须写理由**；不允许留空、省略整表、或填 ✅ 实际没写
+  2. 新建 `collab/docs/task-book-template.md`——主控派发骨架，含常备红线表、
+     常备验收项（出包类七项）、**派发前主控自检三条**（边界评估 / 方案评估 / 提示词类三处同步）
+  3. 主控侧配套：验收时先 `grep` 五文档核对 ✅ 属实；
+     **填 ✅ 实际没写 → 按 `[TESTER-FABRICATED-REPORT-001]` 处理，不当笔误**
+- **⚠️ 遗留风险（待处理）**：`/d/Workspace/CodeLab/collab/` **不在任何 git 仓库内**
+  （`git rev-parse` 报 not a git repository），worker-guide.md 与新建的 task-book-template.md
+  **零版本历史、零备份**。`scripts/backup-docs.ps1` 只覆盖 `voice-ime/collab`，不含工作区级 collab。
+  一次误删即永久丢失，与 `[GIT-RESET-INCIDENT-001]` 后果同级
+
 ---
 
 ## [VERSION-DRIFT-001] 根 Cargo.toml 版本号与 handoffs 记录不符
