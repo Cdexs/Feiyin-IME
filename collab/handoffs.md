@@ -2,6 +2,44 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-08-09 21:2x — tester-1 — BUILD-015 ✅ 030 全批 + 031 首次出包（⚠️ handoffs/progress 主控代记）
+
+> ⚠️ **[DOC-STATE-DRIFT-001] 今日第三次**：tester-1 完成后仍只更 `CHANGELOG.md` + `logs/20260809.md`，
+> `handoffs.md` / `progress.md` 零条目。主控代记，保留问责链。
+
+- **基线**：HEAD `faa672d`。构建前产物为 08-04 19:0x（不含 030/031），本次是 030/031 **首次进 exe**
+- **四步构建**：Step1 清进程 → Step2 npm build + Tauri UI（`--features custom-protocol`）**2m01s**
+  → Step3 主程序 **2m24s** → Step4 同步 Publish
+- **七项核验全过（主控已逐项独立复算，非采信表格）**：
+
+  | # | 项 | 主控独立复算结果 |
+  | --- | --- | --- |
+  | ① | 六 exe 时间戳 | target 21:09/21:11/21:12 ｜ Publish 三份 21:13，**全为今天** ✅ |
+  | ② | 三 exe sha256 两副本 | `831c254d…`／`14411dee…`／`9fa58f9b…` 三对全等 ✅ |
+  | ③ | 两 toml 三副本 | scene `0a3a0b9a…`×3 ｜ itn `b208271b…`×3 ✅（**修复见下**） |
+  | ④ | ProductVersion | feiyin `0.7.3.0` ｜ ui `0.7.3` ｜ crash `0.7.3.0`，版本号未动 ✅ |
+  | ⑤ | UI 嵌入新前端 | ui.exe 晚于 `ui/dist/` ✅ |
+  | ⑥ | 冒烟启动 | PID 24024 `Responding=True` @21:20:57，**测后已 Stop-Process 清理**（主控复查无进程属预期，非虚报）✅ |
+  | ⑦ | 产物大小 | 11957248 / 10026496 / 24857600 —— 主程序较 08-04 基线 **+17408B（+17KB）**，UI 与 crash **与基线完全相同**（本批零前端零 crash 改动）✅ |
+
+- **🔴 本次最有价值的发现（tester-1 例行核对抓到）**：`scene-rules.toml` 的 `Publish/` 与
+  `target/release/` 两副本仍是 **08-03 版 41714B**，根目录已是 **45591B**（差 3877B 实质内容）。
+  已 cp 根目录版收敛三副本。**这是 `[TOML-STALE-001]` 的第二次发作，且是一条全新来路** ——
+  toml 由 macOS 端 `f96c817`（08-05）改动，经 merge `7e76465`（08-08）进入本端，
+  **本端从未编辑过该文件**，故不会有任何「该同步了」的触发点。窗口内恰好没出包，未流到 Gavin 手上
+- **根因升级**：`build-test-guide.md` Step 4 原文**只 cp 三个 exe，完全没提 toml**，三副本规范只写在
+  troubleshooting 里没落到可执行步骤 → 靠人记就一定会漏
+- **主控已落地的两项流程修复**：
+  1. Step 4 补入 toml 同步命令 + 三副本 sha256 验证 + 「不得同步」清单（`config.toml`/`wordbook.sqlite`/`debug.log`/`version_check.json` 属 Gavin 运行时数据）
+  2. `[TOML-STALE-001]` 新增第 3 条强制规则：**跨端 merge 后的首次出包必须显式核对两 toml 三副本**，
+     自查命令 `git log --oneline <上次出包commit>..HEAD -- scene-rules.toml itn-rules.toml`
+- **顺带修正文档错误（tester-1 提出，主控核实采纳）**：`build-test-guide.md` 的产物大小基准
+  ~31MB/~22MB 是 **DEC-021 体积优化之前**的旧值，与实测（11.9/10.0MB）长期不符，已按实测改写，
+  并改口径为「与上次出包逐一对照，不作硬阈值」；构建耗时 ~47s 亦改为实测 ~4m30s
+- **零生产代码改动**，版本号未动（0.7.3）
+- **下游**：⏭ **交 Gavin 端测**（`Publish/feiyin-ime.exe`）
+- **详情**：`outbox/tester-1/result.md`（8280B）+ `CHANGELOG.md` + `logs/20260809.md`
+
 ## 2026-08-09 20:5x — tester-1 — TEST-EXEC-030 ✅ 全量回归零红条（⚠️ 本条 handoffs 与 progress 为**主控代记**）
 
 > ⚠️ **[DOC-STATE-DRIFT-001] 又一次复现**：tester-1 完成后只更新了 `CHANGELOG.md` 与 `logs/20260809.md`

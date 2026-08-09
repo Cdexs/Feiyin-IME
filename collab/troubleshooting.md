@@ -1332,6 +1332,32 @@ Gavin 用 `-debug` 实测 "派发"（Publish/debug.log 17:47）：
   1. 任何外置规则 toml（itn-rules/scene-rules）修改后，必须同步**三副本**并 sha256 逐一核验，不能只对比其中两处
   2. 出包/验收时把「三副本 toml sha256 一致」列入固定检查项（本次 tester-1 例行核对发现，值得保持）
 
+### [TOML-STALE-001] 第二次发作（2026-08-09 BUILD-015）：**新增「跨端 merge 带入」这条来路**
+
+**状态**：🟢 出包前拦截（tester-1 例行核对发现 —— 上面第 2 条规则第二次立功）
+
+- **现象**：`Publish/scene-rules.toml` 与 `target/release/scene-rules.toml` 仍是 **08-03 版 41714B**，
+  而仓库根 `./scene-rules.toml` 已是 **45591B**，差 **3877B 实质内容**（不是行尾差异）
+- **🔴 与 07-13 那次的关键不同 —— 这是一条全新的来路**：
+  | | 07-13 首次 | 08-09 本次 |
+  | --- | --- | --- |
+  | toml 怎么变的 | **本端 Worker 主动改**（ITN-SMART-002 加 95 条） | **另一端（macOS）改，经 merge 进来** |
+  | 为什么会漏 | 同步清单漏了三副本之一 | **本端根本没人"改过" toml** —— 没有任何一次本端编辑动作会触发"该同步了"的意识 |
+  | 追溯 | 改动即在本端 handoffs 里 | 变更藏在 `f96c817`（macOS Phase 4，08-05）→ merge `7e76465`（08-08），**本端 CHANGELOG 无痕** |
+- **本次侥幸未流出**：08-08 merge 到 08-09 出包之间**恰好没有出过包**，故 Gavin 手上的旧包不受影响。
+  但若 BUILD-015 不做第 3 项核验，**就会随包发出**，且属于「用户看不见」的静默失效
+  （场景感知规则少 3877B，表现为部分场景不匹配，无任何报错）
+- **根因升级**：`build-test-guide.md` 的 Step 4「同步到 Publish/」**原文只 cp 三个 exe，完全没提 toml**。
+  三副本规范只写在本条 troubleshooting 里，**没有落到出包流程的可执行步骤中** —— 靠人记，就一定会漏
+- **本次修复（已落地）**：
+  1. `build-test-guide.md` Step 4 补入 toml 同步命令 + 三副本 sha256 验证命令 + 「不要同步的文件」清单
+     （`config.toml`/`wordbook.sqlite`/`debug.log`/`version_check.json` 属 Gavin 运行时数据，不得覆盖）
+  2. 出包任务书固定把「两 toml 三副本一致」列为第 3 项核验
+- **新增强制规则（第 3 条）**：
+  > **任何一次跨端 merge 之后的首次出包，必须显式核对两个 toml 的三副本 hash。**
+  > 判据不是「本端有没有改过 toml」，而是「merge 有没有带进 toml 改动」——
+  > 用 `git log --oneline <上次出包 commit>..HEAD -- scene-rules.toml itn-rules.toml` 一条命令即可自查。
+
 ## [COLLAB-ACK-001] ⚠️ dispatch.sh ACK_FAIL 误报：Worker ack 文件 0 字节
 
 **状态**：🔴 已定位根因，待修复（2026-07-14）

@@ -60,8 +60,35 @@ cargo build --release
 cp target/release/feiyin-ime.exe Publish/
 cp target/release/feiyin-ime-ui.exe Publish/
 cp target/release/crash-reporter.exe Publish/
-ls -la Publish/*.exe
+# 🔴 规则 toml 必须一并同步（见下方「toml 三副本」强制项）
+cp scene-rules.toml Publish/ && cp scene-rules.toml target/release/
+cp itn-rules.toml   Publish/ && cp itn-rules.toml   target/release/
+ls -la Publish/*.exe Publish/*.toml target/release/*.toml
 ```
+
+#### 🔴 toml 三副本同步【2026-08-09 BUILD-015 补入，此前本步骤只同步 exe，是缺陷】
+
+`scene-rules.toml` / `itn-rules.toml` 各有**三副本**：仓库根 `./`、`Publish/`、`target/release/`。
+**根目录是唯一权威源**（受 git 管辖），另两处是运行时副本。
+
+依据 `[TOML-STALE-001]`：`target/release` 下陈旧的外置 toml 会**静默覆盖新的内置默认** ——
+即用户实际跑的规则不是代码里的规则，且**无任何报错**。
+
+**验证命令（三处 hash 必须相同）**：
+```bash
+sha256sum ./scene-rules.toml Publish/scene-rules.toml target/release/scene-rules.toml
+sha256sum ./itn-rules.toml   Publish/itn-rules.toml   target/release/itn-rules.toml
+```
+
+⚠️ **最容易漏的场景**：toml 由**另一端（macOS）改动后经 merge 进来**。此时本端源码没动、
+`cargo build` 一切正常，但运行时副本仍是合并前的旧版。
+**2026-08-09 BUILD-015 实际发生过**：`scene-rules.toml` 于 `f96c817`（macOS Phase 4 场景感知，08-05）
+变更，经 merge `7e76465`（08-08）进入本端，而 `Publish/` 与 `target/release/` 两副本仍停留在 **08-03 版**
+（41714B vs 新版 45591B，差 3877B 实质内容）。该窗口内恰好没有出包，故未流到 Gavin 手上，
+但**若本次不检查就会随包发出**。
+
+> **不要同步的文件**：`Publish/` 同时是 Gavin 的运行目录，`config.toml`、`wordbook.sqlite`、
+> `debug.log`、`version_check.json` 属**用户运行时数据**，一律不得从 `target/release/` 覆盖过去。
 
 **PowerShell：**
 
@@ -76,12 +103,21 @@ Get-ChildItem -Path "Publish\*.exe" | Select-Object Name, LastWriteTime, Length
 
 ### 预期构建时间 & 产物大小
 
-| 步骤               | 耗时       | 产物大小       |
-| ---------------- | -------- | ---------- |
-| npm build        | ~600ms   | ~181 KB    |
-| Tauri UI release | ~20s     | ~22 MB     |
-| 主程序 release      | ~27s     | ~31 MB     |
-| **合计**           | **~47s** | **~53 MB** |
+> 🔴 **2026-08-09 BUILD-015 实测修正**：下表原值（~22MB / ~31MB / 合计 ~47s）是 **DEC-021 体积优化
+> （拆分 crash-reporter + ASR 可选化）之前**的旧基准，已连续多次与实测不符，误导 Worker 把正常产物
+> 判为「异常缩水」。现改为实测值。
+
+| 步骤               | 耗时（实测）    | 产物              | 大小（实测）       |
+| ---------------- | --------- | --------------- | ------------ |
+| npm build        | ~600ms    | `ui/dist/`      | ~181 KB      |
+| Tauri UI release | **~2m00s** | `feiyin-ime-ui.exe`  | **~10.0 MB** |
+| 主程序 release      | **~2m25s** | `feiyin-ime.exe`     | **~11.9 MB** |
+| （同批产出）           | —         | `crash-reporter.exe` | **~24.9 MB** |
+| **合计**           | **~4m30s** | 三 exe            | **~46.8 MB** |
+
+**判定口径**：与**上一次出包**的大小逐一对照，同量级即正常；不要拿本表当硬阈值。
+2026-08-09 实测 `feiyin-ime.exe` 较 08-04 基线 **+17KB**（030/031 增量），
+`feiyin-ime-ui.exe` 与 `crash-reporter.exe` 大小**与基线完全相同**（本批零前端、零 crash 模块改动，属正常）。
 
 ### ⚠️ 已知注意事项
 

@@ -357,7 +357,13 @@
 > —— `itn::` 225 ｜ `punctuation::` 43 ｜ `transcription::` 105+4ign ｜ `llm::` 140 ｜ 主 crate 全量 958+8ign
 > ｜ src-tauri 53 ｜ `--list` 自洽 966==966。四族零回归（017 重量／026 货币／027 大额 DEC-042／031 万一守卫）全绿。
 > 主控**未采信汇总表格**，用源码 `#[test]` 计数逐项复算，六个数字全部吻合（详见 `logs/20260809.md`）。
-> 🔜 **BUILD-015 待出包**。
+> ✅ **BUILD-015 已出包**（2026-08-09 21:13，主控七项独立复算全过）：`Publish/` 三 exe
+> `feiyin-ime.exe` `831c254d…` / `feiyin-ime-ui.exe` `14411dee…` / `crash-reporter.exe` `9fa58f9b…`，
+> 两副本 sha256 全等；两 toml 三副本一致（`scene-rules.toml` `0a3a0b9a…` / `itn-rules.toml` `b208271b…`）；
+> ProductVersion 0.7.3.0/0.7.3。**030/031 首次进 exe。⏭ 待 Gavin 端测。**
+> 🔴 出包时拦截到 `scene-rules.toml` 两副本停留 08-03 旧版（41714B vs 45591B，差 3877B），
+> 系 macOS 端 `f96c817` 经 merge `7e76465` 带入而本端未同步 —— `[TOML-STALE-001]` 第二次发作、
+> 全新来路。已收敛并把 toml 同步补进 `build-test-guide.md` Step 4。
 
 | 功能 | 说明 |
 | --- | --- |
