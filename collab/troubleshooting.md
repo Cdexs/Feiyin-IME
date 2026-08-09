@@ -1863,6 +1863,35 @@ rm -rf cpu_features        # 只删非空的那些；空目录不必删，clone 
   统一全仓行尾。**代价是一次涉及全仓的规范化提交**，会一次性冲掉大量 `git blame` 归属，
   且必须在两平台无未提交改动时做。**在拍板前，本条只作为提交前检查项使用**
 
+### [CRLF-CROSSPLAT-001] 补充（2026-08-09，TEST-EXEC-030 A0 异议裁决）
+
+**三条新事实，改写了本条的部分前提：**
+
+1. **`core.autocrlf` 已不再是「未设置」** —— 2026-08-09 实测 `git config --get core.autocrlf` = **`true`**
+   （`.gitattributes` 仍无）。设置时间与设置人未知。后果：Windows 侧 checkout 自动转 CRLF、提交自动转 LF，
+   于是 `git ls-files --eol` 出现 **`i/lf w/crlf` 14 个 / `i/crlf w/crlf` 0 个**，而 `git diff` **为空**。
+   即：本条 07-30 描述的「4800 行幽灵 diff」在当前配置下**已不会再发生**，但**行尾状态仍是分裂的**。
+
+2. **`git status` 会报「M」但 `git diff` 为空 —— 这是索引 stat 缓存的瞬时态，不是真改动。**
+   tester-1 首跑报 14 文件 M；主控随后复查，`git status --short -- src/` **完全为空**。
+   原因：`git status` 自身会刷新索引 stat 缓存，第一次跑把陈旧条目暴露出来、同时修好，第二次就干净了。
+   **判定方法**：见到 M 先复跑一次 `git status`，再看 `git diff`（无 flag）是否为空。两次不一致 = stat 缓存陈旧，非真改动。
+
+3. 🔴 **不要用 `git diff -w` 作为「无改动」的判据**（本次 tester-1 的方法论错误，已纠正）：
+   | 判据 | 会吞掉什么 | 能否作放行依据 |
+   | --- | --- | --- |
+   | `git diff -w` | **所有空白差异，含真实的纯空白改动** | ❌ 不能 |
+   | `git diff --ignore-cr-at-eol` | 仅行尾 CR | ⚠️ 可作定性，不可作放行 |
+   | **`git diff`（无 flag）** | 什么都不吞 | ✅ **唯一放行判据** |
+
+   **为什么在本项目特别致命**：`src/llm/mod.rs` 大量内容是**提示词字符串常量**，字面量内部的空格
+   是语义的一部分 —— 改一个空格就改了送给 LLM 的提示词，而 `-w` 会把这种改动完全隐藏。
+   同理适用于 `src/scene/` 词表、`itn-rules.toml` / `scene-rules.toml`。
+
+**固化规则**：Worker 上报「工作区干净」时，必须给出**无 flag `git diff` 的输出**；
+主控验收时不接受 `-w` / `--ignore-*` 系列作为唯一证据。行尾噪声文件一律**不碰**
+（禁行尾归一化、禁 `git add` / `checkout` / `stash`，依据 [GIT-RESET-INCIDENT-001]）。
+
 ---
 
 ## [TOML-SECTION-DRIFT-001] 🔴 条件依赖段头插在表中间，会把后续依赖静默改判为单平台【两侧都必读】

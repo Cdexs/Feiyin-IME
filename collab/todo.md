@@ -10,6 +10,90 @@
 
 ---
 
+## 🛑 2026-08-09 00:30 会话中断交接 —— 下次会话从这里开始
+
+> **中断原因**：tester-1 额度用尽（Gavin 指令：记下状态，下次会话重新派发）。
+
+### 断点状态（主控已取证，非推测）
+
+| 项 | 状态 |
+| --- | --- |
+| 工作区 | ✅ **干净**（`git status -- src/ docs/ CHANGELOG.md` 为空），无悬空改动 |
+| HEAD | `d2ee6b3`，本批四个 commit 全部落地，**本地 ahead 未 push**（push 需 Gavin 明确指示） |
+| tester-1 产出 | ❌ **零**（`outbox/tester-1/result.md` 0 字节）—— TEST-EXEC-030 未开跑或无产出 |
+| coder-1 / coder-2 | 空闲，本批任务全部结案 |
+
+### 本批四个 commit
+
+| commit | 内容 |
+| --- | --- |
+| `94bfb0b` | 030-A/A-2/B/B-2/C + 031（功能主体） |
+| `5fc390d` | TEST-SYNC-030（+17 用例） |
+| `201bb4f` | 030-D/E（抽两个纯函数，纯重构零行为变更） |
+| `d2ee6b3` | TEST-SYNC-030-B（+19 用例） |
+
+### ✅ 2026-08-09 20:5x TEST-EXEC-030 已完成并通过主控独立验收 —— 🔜 下一步 BUILD-015 出包
+
+**结果：A0–A7 零 FAIL，四族零回归全绿。** `itn::` 225 ｜ `punctuation::` 43 ｜ `transcription::` 105+4ign
+｜ `llm::` 140 ｜ 主 crate 958+8ign ｜ src-tauri 53 ｜ `--list` 自洽 966==966。零生产代码改动。
+
+**主控独立复算（未采信汇总表格）**：用源码 `#[test]` 计数逐项验证，六个数字全部吻合 ——
+`itn.rs`=225／`punctuation/mod.rs`=43／`llm/mod.rs`=140／transcription 三文件 54+28+27=109／
+src-tauri 22+5+26=53（`#[path]` 引入 `wordbook/mod.rs`+`wordbook/db.rs`）／总数 900+30+36=966。
+
+**`itn::` 用例数争议已裁定为 225**：旧记录 212 失效，coder-1 报的 219→221 为 TEST-SYNC-030-B 之前的中间态。
+
+⚠️ **[DOC-STATE-DRIFT-001] 复现**：tester-1 只更 CHANGELOG + logs 两份，handoffs 与 progress 零条目，主控代记（已标注）。
+
+📌 **只报不改遗留**：`examples/probe_031.rs`（08-08 031 探测残留，未清理未入库）。因 cargo 会自动发现
+`examples/`，它会被 `cargo check --all-targets` / `cargo test` 连带编译。**处置待 Gavin 拍板**（删除／入库／保留），
+主控不擅自删（依据「不可逆操作必须单独成轮」）。
+
+---
+
+### 📜 2026-08-09 19:38 派发记录（已完成，保留供追溯）
+
+> 🔴 **交接记录有一处不符，已更正**：handoffs 写「任务书原样可用」，但 `inbox/tester-1/task.md`
+> 在 19:33 新 session 启动时**已被清空为 0 字节**。主控已按原设计**重写**任务书（7030B），
+> 含 A0–A7 步骤、红条三分类纪律（①测试写错可改／②预期内行为变更须给来源依据／③真回归一律上报不动）、
+> 四族零回归专项（017 重量链／026 货币链／027 大额数字+DEC-042／031 万一守卫）、
+> 红线（禁生产代码改动、禁出包、禁 git 破坏性命令、禁 PowerShell 改 UTF-8、禁虚报须贴原始摘要行）。
+> 另要求 tester-1 给出 `itn::` **实跑用例数**，裁定 coder-1 报的 219→221 与 handoffs 记录不符一事。
+
+**三 Worker 启动状态（19:3x 实测）**：coder-1 `%2` / coder-2 `%1` / tester-1 `%3` 全部存活并已 ACK 就绪，
+均为 `DeepSeek V4 Flash Free · OpenCode Zen`（与本文件旧记录的 glm-5.2 / kimi-k2.7 已不同）。
+coder-1 为 **OpenCode 类型非 Codex**，故未发 `/permissions Full Access`。
+本轮 tester-1 独占 `src/`，coder-1/coder-2 已通知空闲待命勿动 `src/` → 零文件级重叠。
+
+**基线数字**（供对照）：`itn::` 221 ｜ `llm::` 134+9 ｜ `punctuation::` 38+10 ｜
+`transcription::` 105 ｜ src-tauri 53。Vitest/pytest 本批 SKIP（零前端零 UI 改动）。
+
+**回归风险最高的三处**：① `strip_punctuation` 标点由「删除」改为「换空格」（行为变更，
+既有断言大概率绿转红，属②类不是③类）；② `main.rs` L2 收口块删来源判据 + 抽纯函数；
+③ `itn.rs` 万/亿分支新增守卫。
+
+**之后**：TEST-EXEC 通过 → BUILD-015 出包（**主控须明确下达「现在可以出包」**）→ Gavin 端测。
+
+### 🔴 待 Gavin 拍板：阶段三规则开例外
+
+**同一根因本批发作三次**，第三次已从「diff 变脏」升级为「主干编译失败」：
+
+| # | 任务 | 后果 |
+| --- | --- | --- |
+| ① | TEST-SYNC-030 | 代码非 rustfmt-clean，被后续 coder 的 `cargo fmt` 连带归一，污染两个 commit 的 diff |
+| ② | 同上 | 同上 |
+| ③ | TEST-SYNC-030-B | `src/llm/mod.rs:4776` 多一个 `}`，**整个 crate 编译失败**，主控提交前 `cargo check` 才发现并修掉 |
+
+**根因**：三阶段规则明令阶段三「禁止执行任何命令」，`cargo check` 也在禁止之列 →
+tester-1 连括号配没配对都无从知道，**交付前不可能自查**。
+
+**主控建议**：阶段三开白名单例外，只允许 `cargo fmt` + `cargo check`。
+理由：规则要防的是「测到半成品、拿到假结果」，而 `fmt` 只格式化、`check` 只做类型检查，
+**都不执行测试、不产出二进制**，与该风险无关；禁止它们反而直接导致交付物编译不过。
+⏸ **Gavin 未拍板前规则不变**，继续由主控在提交前兜底。
+
+---
+
 ## 🔄 2026-08-08 当前批次（Gavin 端测 + 需求）
 
 ### ✅ 已闭环 · LLM-CONN-POOL-028 连接池僵尸连接致 0ms 请求失败
@@ -32,10 +116,49 @@
 
 | 编号 | 内容 | 负责人 | 文件域 | 状态 |
 | --- | --- | --- | --- | --- |
-| 030-A | L2 后处理：`count_units` + `strip_trailing_punctuation` + `strip_punctuation` 改造（标点位置留空格）+ 收口点删除来源判据 | coder-2 | `main.rs` `transcription/` `punctuation/` | 🔄 进行中 |
-| 030-B | L1 源头：LLM 提示词双向明确化（true 明确补足+优化，false 明确禁止，**不留空**） | coder-1 | `llm/mod.rs` | 🔄 进行中 |
-| 030-C | L3 列表分隔符 `、；` 条件化（B6 拆出，视 coder-1 影响面评估决定） | 待定 | `llm/mod.rs` | ⏸ 待协商 |
-| TEST-SYNC-030 | 测试同步 | tester-1 | | 🔜 阶段三 |
+| 030-A | L2 后处理：`count_units` + `strip_trailing_punctuation` + `strip_punctuation` 改造（标点位置留空格）+ 收口点删除来源判据 | coder-2 | `main.rs` `transcription/` `punctuation/` | 🟡 **代码在工作区，未验证未提交** |
+| 030-B | L1 源头：LLM 提示词双向明确化（true 明确补足+优化，false 明确禁止，**不留空**） | coder-1 | `llm/mod.rs` | 🟡 **代码在工作区，未验证未提交** |
+| 030-A-2 | ① `strip_trailing_punctuation` 剥成对符号右半（`（笑）`→`（笑`）→ 拆 `TRAILING_PUNCT_CHARS`；② `native_punctuated` 硬编码 `true` → `has_effective_punctuation` 实测（见下方 DEC 待补） | coder-2 | `punctuation/` `transcription/` | ✅ 已验证（c 方案，验收清单全绿，待 TEST-SYNC-030） |
+| 030-B-2 | 修 030-B 引入的「文本守恒」契约红（`NO_PUNCT` 不在 `whitelist_new`，`assert_text_conservation(*,false)` 两条必 FAIL） | coder-1 | `llm/mod.rs` | ✅ 主控复验通过 |
+| 030-C | L3 列表分隔符 `、；` 条件化 —— 新增 `INLINE_SEPARATOR_RULES_NO_PUNCT`，`f3_rules_text` 加 `punctuation_enabled` 参数 | coder-1 | `llm/mod.rs` | ✅ 主控复验通过（打回 1 轮） |
+| TEST-SYNC-030 | 测试同步 3.1~3.5 + 分隔符切换护栏（修正版）；缺口 1/2/3 改交「用例规格表」不写代码 | tester-1 | 各 `mod tests` | 🔄 阶段三进行中 |
+| 030-D | 抽 `build_translate_system_content`（`optimize_and_translate` 内联且 async+HTTP，不可单测） | coder-1 | `llm/mod.rs` | 🔜 等 TEST-SYNC-030 交规格表 |
+| 030-E | 抽 `apply_l2_postprocess`（L2 收口块内联在 `run_pipeline_core`，不可单测） | coder-2 | `punctuation/` `main.rs` | ✅ 已验证（日志方案 C，8 条矩阵实测，待 TEST-SYNC-030-B） |
+| TEST-SYNC-030-B | 按 tester-1 自己的规格表把缺口 1/2/3 落成真测试 | tester-1 | | 🔜 等 030-D/E |
+| TEST-EXEC-030 | 全量回归 | tester-1 | | 🔜 阶段四 |
+| BUILD-015 | 出包（030 全批 + 031 一次端测） | tester-1 | | 🔜 阶段五 |
+
+> **🔴 tester-1 2026-08-08 提的两条异议，主控核实后全部采纳（主控方案有错）**：
+> ① 原护栏「punct=false 时 `f3_rules_text` 完整输出不得含 `、`/`；`」**物理上不可能通过** ——
+> `INLINE_SEPARATOR_RULES_NO_PUNCT` 正文字面就含这两个字符（禁令句 `do NOT use "、" or "；"`
+> + CROSS-LANGUAGE 句），加上日文示例输入侧的 `、`。改为**常量级 + 片段级双断言**：
+> 断言整常量在场/不在场（锁整体切换）+ 已知 `、` 连接输出片段黑名单（锁具体示例），不碰输入侧 `，`。
+> ② 缺口 1/2/3 的目标逻辑确实内联在 `async fn optimize_and_translate`（紧接发 HTTP）与
+> `run_pipeline_core` 中，**不可单测**，须抽纯函数。但 tester-1 提的 `#[ignore]` 骨架方案不可行 ——
+> `#[ignore]` 的测试仍要编译，引用尚不存在的函数会让整个 crate 编译失败。
+> 故改为三段串行：规格表 → 抽函数（030-D/E）→ TEST-SYNC-030-B，保证同一文件同一时刻只有一个写者。
+
+> 🔴 **2026-08-08 18:5x 新 session 主控 `git diff` 取证**：上一 session 中断，030-A/030-B 代码**已落在工作区但从未收口** ——
+> `src/punctuation/mod.rs` +145（`PUNCT_CHARS`/`is_punctuation`/`count_units`/`strip_trailing_punctuation` + 10 条单测）、
+> `src/transcription/mod.rs` `strip_punctuation` 重写（标点→空格 + 域名点保护，3 条旧断言已改）、
+> `src/main.rs` L2 补位块（删来源判据 + ≤5 剥末尾标点）、`src/llm/mod.rs` `NO_PUNCT` 常量 + 槽位条件替换 + 翻译路径 B4/B5。
+> **缺口**：无 `cargo check`/`cargo test` 证据、handoffs/CHANGELOG/logs 零条目、未提交。
+> 这是 `[DOC-STATE-DRIFT-001]` 第 N 次复现，主控本轮**不采信任何未取证的完成度**，须走：编译验证 → 主控 Read 验收 → TEST-SYNC-030 → TEST-EXEC。
+> 另：`src/itn.rs` 也在 `git status` 里，但 `git diff --stat` 为空 = 仅行尾差异，非 031 改动（031 是只测不改）。
+
+### 🔴 030-C 打回教训（主控 2026-08-08 验收查出，值得记）
+
+coder-1 首版只换了**分隔符规则常量**，却没动 `f3_rules_text` 里写死的 **F3c/F3-item 示例**——
+开关关闭时同一个 L3 块里一边写「`、` is FORBIDDEN」，一边拿 `、` 连接的示例教模型，
+违反 DEC-040「裁决点必须唯一、层内不得存在歧义」。
+
+**这是本批次同一个病的第三次发作**：
+① 030-A 只改 `PUNCT_CHARS` 不改 `strip_trailing_punctuation` 的成对符号；
+② 030-B 只改常量不改 `whitelist_new` 契约名单（两条断言必红）；
+③ 030-C 只改规则不改示例。
+
+> **共性：改了「说什么」，没改「示范什么」/「校验什么」。**
+> 派发提示词类任务时，任务书必须显式列出「规则文本 + 示例 + 契约断言」三处同步检查项。
 
 Gavin 拍板口径：阈值 ≤5 ｜ 中日文数字符/英韩文数词、混合相加 ｜ 短句末尾标点全剥含问号感叹号 ｜
 开关关闭时任何标点都剥（含引号括号、列表分隔符）且**标点位置留空格** ｜ 翻译两条引擎都算 ｜
@@ -53,8 +176,17 @@ Gavin 拍板口径：阈值 ≤5 ｜ 中日文数字符/英韩文数词、混合
 `万`/`亿` 是 027-E 引入锚点机制后才把洞暴露出来。
 
 **这是一类不是一个词** —— 疑与 todo 里挂了很久的 `:682` 十分支默认 1（`十分`→`10分`）同族。
-tester-1 正跑 A/B/C/D/E 五组探测（万亿开头 / 百千开头 / 十开头 / 零回归基线 / 保护词表现状），
-**只测不改**，拿到实测边界后主控再定修法。禁止走词表（DEC-038）。
+> ✅ **2026-08-08 19:1x coder-1 已实现，主控 Read 验收通过（代码层）**：万/亿两分支对称加守卫
+> `if !has_digit && section == 0 && result == 0 { return None; }`，位置在 `large_amount_keep_wan_yi`
+> 判定之后、`section += digit` 之前。新增 25 条断言（13 条固定词保汉字 + 12 条放行组零回归）。
+> ⏳ **未收口**：① coder-1 报的基线 `itn:: 219→221` 与 handoffs 记录的 `212/0` 对不上，已要求说明；
+> ② 全量回归归 tester-1（阶段四）；③ 只报不改项：`零万` 类输入 `has_digit=true` 会绕过守卫，
+> 仍产零系数锚点，非真实中文表达，优先级低。
+
+**2026-08-08 18:5x 主控 Read 代码复核确认根因成立**（`itn.rs:770/779/784`），Gavin 指示直接修，
+不再等 tester-1 五组探测。**已派发 coder-1（Step A）**：万/亿分支入口加守卫
+`if !has_digit && section == 0 && result == 0 { return None; }` —— 走机制层，禁止走词表（DEC-038）。
+同族词 `亿万`/`百万`/`千万` 一并实测；`:682` 十分支默认 1（`十分`→`10分`）只报不改（避免混改污染零回归判别力）。
 
 ---
 

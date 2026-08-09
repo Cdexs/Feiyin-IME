@@ -348,6 +348,29 @@
 
 **出包**：2026-08-03 13:06（BUILD-010，含 017+018）／17:07（BUILD-011，含 021+020）／17:42（BUILD-012，含 023）／**2026-08-04 00:48（BUILD-013，含 026+026-B，当前 Publish 产物）**。三 exe 两副本 sha256 一致 + 两 toml 三副本一致（`scene-rules.toml` `7C1F0620`／`itn-rules.toml` `ED77A912`）+ ProductVersion 0.7.3.0 + mtime 链通过。**详见 CHANGELOG，出包/测试同步不在本文档记录（规则 7）**
 
+---
+
+## 🔄 v0.7.3 增补三 · 标点子系统治理 + 大数守卫（2026-08-08，**代码闭环，回归与出包未做**）
+
+> 版本号 0.7.3 全程未动。四个 commit：`94bfb0b` / `5fc390d` / `201bb4f` / `d2ee6b3`，**本地 ahead 未 push**。
+> ✅ **TEST-EXEC-030 已完成**（2026-08-09 20:5x，tester-1 执行 / 主控独立复算验收）：A0–A7 **零 FAIL**
+> —— `itn::` 225 ｜ `punctuation::` 43 ｜ `transcription::` 105+4ign ｜ `llm::` 140 ｜ 主 crate 全量 958+8ign
+> ｜ src-tauri 53 ｜ `--list` 自洽 966==966。四族零回归（017 重量／026 货币／027 大额 DEC-042／031 万一守卫）全绿。
+> 主控**未采信汇总表格**，用源码 `#[test]` 计数逐项复算，六个数字全部吻合（详见 `logs/20260809.md`）。
+> 🔜 **BUILD-015 待出包**。
+
+| 功能 | 说明 |
+| --- | --- |
+| **标点开关全源治理（030-A/A-2/B/B-2/C/D/E）** | 起因 Gavin 提「开自动标点时字/词数 ≤5 不加末尾标点」，主控给补丁式方案被打回：「每一个功能都要从架构程度全局层面来设计方案」。盘点发现**标点有 6 个产出源、开关只完全控制 1 个**。架构定为 **L1 源头控制为主、L2 后处理补位**（Gavin：能在源头关的就别产出后再剥）。L1：LLM optimize/translate 补 `NO_PUNCT` 明确禁止句（原为「什么都不说」）、`step1_correct` 硬编码条件化、列表分隔符切 `INLINE_SEPARATOR_RULES_NO_PUNCT`（空格连接禁 `、；,;`）；L2：`main.rs` 收口块**删除全部来源判据**（`llm_handled`/`native_punctuated`/`translate`），6 源一视同仁、将来新增第 7 源自动受控。已核实 Qwen3 在线 ASR／本地 native／NLLB 三条源头物理不可控（阿里云 `session.update` 无标点参数），故 L2 不可省 ｜ 2026-08-08 |
+| **短句 ≤5 不加末尾标点** | `count_units`（中日逐字／英韩按空格词／混合相加，Gavin 口径）+ `strip_trailing_punctuation`（末尾直接删除不留空格，区别于全文剥离的换空格）。阈值 `SHORT_TEXT_UNIT_THRESHOLD=5`，仅开关开启时生效 ｜ 2026-08-08 |
+| **成对符号不再被剥（030-A-2）** | `strip_trailing_punctuation` 原用全量 `PUNCT_CHARS`，会把 `（笑）`剥成`（笑`、`他说“好”`剥成`他说“好`，留下孤儿左半。拆出 `TRAILING_PUNCT_CHARS` 只含句末终结标点 ｜ 2026-08-08 |
+| **Qwen3 `native_punctuated` 由假设改为实测（DEC-047）** | 原硬编码 `true`。官方 API 确无标点参数（源头关不掉成立），但「模型必定输出标点」是假设——假设为假时标点引擎被跳过，**用户开着开关却拿不到标点**。改用 `has_effective_punctuation`：对 `PUNCT_CHARS` 全集合统一「词内嵌豁免」，`3.14`／`don't`／`3:30`／`example.com` 不计为标点 ｜ 2026-08-08 |
+| **「万一」→`0.1万` 修复（031）** | Gavin 端测。`itn.rs` 万/亿分支缺「大单位前必须有数字」守卫，`digit=0` 照常结算产出零系数锚点 `('万',0)`，末尾单字再命中隐式千位。百/千分支不设锚点故未暴露——是 027-E 锚点机制把洞暴露出来。修法走机制层不走词表（DEC-038），`亿万`/`百万`/`千万`/`万万没想到` 等同族一并覆盖 ｜ 2026-08-08 |
+
+**累积**：`src/punctuation/mod.rs` +436 ｜ `src/llm/mod.rs` +341 ｜ `src/main.rs` +33 ｜ `src/transcription/mod.rs` +95 ｜ `src/itn.rs` +58
+
+---
+
 ### BUILD-013 的两处方法论（2026-08-04）
 
 1. **崩溃遗留的反向判定**：Gavin 问「上次会话是否有测试或出包任务未完成」，主控用 `[SESSION-CRASH-RECOVERY-001]` 三件套取证——sha256 两副本一致（构建发生过）**但 mtime 链不通过**（产物 `17:42` ＜ `src/itn.rs` `23:47`，差 6 小时）→ 判定 026 代码已落地、**测试与出包均未做**，与 08-03 那次「做了没记」相反。此前 todo/handoffs 均无 026 条目，只有 CHANGELOG/decisions/logs 有 —— **单看文档会误判为无遗留**。

@@ -1,3 +1,51 @@
+# handoffs · voice-ime
+
+> 只保留当天条目；历史条目见 `handoffs-archive.md`。
+
+## 2026-08-09 20:5x — tester-1 — TEST-EXEC-030 ✅ 全量回归零红条（⚠️ 本条 handoffs 与 progress 为**主控代记**）
+
+> ⚠️ **[DOC-STATE-DRIFT-001] 又一次复现**：tester-1 完成后只更新了 `CHANGELOG.md` 与 `logs/20260809.md`
+> 两份，**`handoffs.md` 与 `progress.md` 零条目**。本条及 progress 增补三的收尾由主控代记，保留问责链。
+
+- **任务**：030 全批（A/A-2/B/B-2/C/D/E）+ 031 阶段四全量回归，只跑不改。基线 HEAD `d2ee6b3`
+- **A0 起点自证**：HEAD 对 ✅ ｜ `cargo fmt --check` clean ｜ `cargo check --all-targets` 0 error（51.79s）
+  ｜ 曾报 `src/` 14 文件 M → 主控独立取证判为 `[CRLF-CROSSPLAT-001]` 行尾噪声 + git stat 缓存瞬时态，**放行未处理**
+- **A1–A7 全绿零 FAIL**：`itn::` **225** ｜ `punctuation::` **43** ｜ `transcription::` **105 passed + 4 ignored**
+  ｜ `llm::` **140** ｜ 主 crate 全量 **958 + 8 ignored** ｜ src-tauri **53** ｜ `--list` 自洽 **966 == 966**
+- **四族零回归**：① 017 重量链 ② 026 货币链 ③ 027 大额 DEC-042 ④ 031 万一守卫（13 固定词保汉字 + 12 放行组 + 5 跨模块）**全绿**
+- **`itn::` 用例数裁定**：实跑双口径 **225**。handoffs 旧记录 212 失效；coder-1 报的 219→221 为**中间态**
+  （TEST-SYNC-030-B 之前）。**主控用源码 `#[test]` 计数独立复算 = 225，与实跑一致，裁定成立**
+- **主控独立验收**（不采信汇总表格，依据 `[TESTER-FABRICATED-REPORT-001]`）：六个数字全部用源码计数复算吻合 ——
+  `itn.rs`=225 ｜ `punctuation/mod.rs`=43 ｜ `llm/mod.rs`=140 ｜ transcription 三文件 54+28+27=**109**（=105+4ign）
+  ｜ src-tauri 22 + `#[path]` 引入的 `wordbook/mod.rs` 5 + `wordbook/db.rs` 26 = **53**
+  ｜ 总数 900(feiyin-ime) + 30(crash-reporter) + 36(tests/*.rs 逐文件 3/12/10/2/9 全对) = **966**
+- **零生产代码改动**：`git status -- src/` 空，测试断言亦未改（无 ①② 类红条需处理）
+- **遗留（只报不改）**：`examples/probe_031.rs`（08-08 031 探测残留，未清理、未入库）—— 处置待 Gavin 拍板
+- **下游**：🔜 **BUILD-015 出包**，主控下达指令后执行
+- **详情**：`outbox/tester-1/result.md`（9071B）+ `CHANGELOG.md` + `logs/20260809.md`
+
+## 2026-08-09 00:30 — orchestrator — 🛑 会话中断交接（tester-1 额度用尽）
+
+- **断点**：TEST-EXEC-030（阶段四）已派发但 tester-1 零产出（`outbox/tester-1/result.md` 0 字节）即中断
+- **工作区**：✅ 干净，无悬空改动。HEAD `d2ee6b3`，本批四 commit 全部落地，**本地 ahead 未 push**
+- **下次第一件事**：清空 `outbox/tester-1/result.md` → `dispatch tester-1`。任务书 `collab/inbox/tester-1/task.md` **已写好可原样复用**（含 A0–A7、红条三分类纪律、四族零回归专项）
+  - 🔴 **2026-08-09 19:38 更正**：该任务书在新 session 启动（19:33）时**已被清空为 0 字节，无法复用**，主控已重写（7030B）并派发。教训：跨 session 不可假定 `inbox/*/task.md` 存活，交接时应把任务书正文落到 `collab/drafts/` 或 todo 内，而非只留 inbox 路径引用
+- **基线数字**：`itn::` 221 ｜ `llm::` 134+9 ｜ `punctuation::` 38+10 ｜ `transcription::` 105 ｜ src-tauri 53 ｜ Vitest/pytest SKIP
+- **⚠️ 本批至中断为止一次 `cargo test` 都没跑过** —— 只有 `cargo check --all-targets`（主控实跑 0 error）+ `cargo fmt --check` 通过 + 各 Worker 局部自验。全量回归有红是正常的（`strip_punctuation` 由「删标点」改「换空格」属行为变更）
+- **待 Gavin 拍板**：阶段三是否开白名单例外（只允许 `cargo fmt` + `cargo check`）—— 同一根因本批发作三次，第三次致主干编译失败
+- **详情**：`collab/todo.md` 顶部交接节 + `logs/20260808.md` 末节 + `collab/progress.md` v0.7.3 增补三
+
+## 2026-08-08 — coder-1 — PUNCT-GOVERNANCE-030-D ✅ 翻译路径 system_content 抽纯函数（零行为变更）
+
+- **来源**：tester-1 走查发现翻译路径 zero 断言（PROMPT-ARCH-020 复发形态）。基线 `5fc390d`
+- **改动 `src/llm/mod.rs`**：`optimize_and_translate` 内联的 `system_content` 装配抽为模块级**私有**自由函数 `fn build_translate_system_content(target: TranslationLanguage, punctuation_enabled: bool, wordbook_block: Option<String>, extra_instruction: Option<&str>) -> String`（impl 块之后）。函数内做 `target→target_desc` match、`step1_correct` 双形态、`punct_instruction` 双形态、wordbook/extra 的 `\n\n` 前缀拼接、六参 format!；**无 await/无请求/无 I/O/无 self**（`build_wordbook_prompt_block` 的 SQLite I/O 留调用侧传入）
+- **签名定案**：弃 `text`（实测不参与构造，仅进 `<speech>` 用户消息）；`target` 传 Copy 枚举；`wordbook_block` 传 `Option<String>` 直传（省调用侧临时 let）；`extra_instruction` 函数内 trim+非空过滤+前缀。签名 tmux 发主控确认，批准用私有 fn（与 `f3_rules_text` 一致）
+- **逐字节验证**：临时断言按旧内联实现逐字重建参考函数，穷举 2目标×2标点×2wordbook×3extra=24 组合 `old==new` 全 PASS，验证后删除
+- **缺口 3**：`step1_correct` 双分支 / target_desc 映射 / punct 双形态全部可在返回值断言（TEST-SYNC-030-B 归 tester-1 补写，本任务不新增测试）
+- **验收**：cargo check --all-targets 0err（13s）/ `cargo test llm::` 134/0（temp 测试删后重跑）/ rustfmt 未动 / 仅改 mod.rs / 未 build --release / 未出包 / 未 commit
+- **边界**：`translate()`（:616）自身另段内联 system prompt 不在本任务范围；未碰 main.rs / punctuation/mod.rs / coder-2 在途文件
+- **详情**：outbox/coder-1/result.md + logs/20260808.md + CHANGELOG.md
+
 ## 2026-08-08 — coder-1 — LLM-CONN-POOL-028 ✅ 连接池僵尸连接修复（reqwest pool_idle_timeout + is_request 重试 + 错误链路日志）
 
 - **来源**：Gavin 端测发现 LLM 优化间歇性 0ms 失败（未上网络即挂）。基线 merge `7e76465`
@@ -9,424 +57,3 @@
 - **下游**：Gavin 端测验证间歇失败消失；docs/MACOS-HANDOFF §2.9.5 已记跨端说明（macOS 复用同文件自动同步）
 - **详情**：outbox/coder-1/result.md + logs/20260808.md + CHANGELOG.md
 
-## 2026-08-04 — coder-1 — ITN-FIX-BIGNUM-027-G 万亿级(DEC-042补充二)+专名白名单(DEC-044)
-
-- **来源**：Gavin端测。基线ade02e1
-- **G-1**：format_dec042_magnitude加升万亿(≥1e12且≤1位小数)。一万亿→1万亿。G-2：itn-rules.toml proper_nouns+十万个为什么。前缀遮蔽自查无误伤
-- **验证**：基线itn:: 212/0/0 → 207/5(5条一万亿预期内绿转红,mod tests归tester-1)；cargo check + --tests双0；UTF-8两文件OK；DEC-043九条全绿
-- **边界**：src/itn.rs+itn-rules.toml；mod tests零改动；is_unit/format_currency_chain/format_weight_chain本体零改动；未构建/出包；未改版本号；UTF-8用edit工具
-- **下游**：tester-1需更新5条一万亿断言；itn-rules.toml三副本同步；MACOS-HANDOFF 2.9.4已更新
-- **详情**：result.md（7111 B 非空）+ logs/20260804.md
-
-## 2026-08-04 — tester-1 — TEST-EXEC-027 + BUILD-014 S1-S5补测落地→全量回归→027全批首次出包
-
-- **来源**：TEST-SYNC-027 补测清单落地 + 阶段四执行 + 阶段五出包。基线 HEAD `d115965`（027-F）。三段串行
-- **Step A**：src/itn.rs mod tests 新增 **16 条**补测（S1 升亿 2 位边界成对 一亿五千万→1.5亿/一亿两千五百万→12500万/三亿五百万→30500万；S2 C-only 一亿三千万→1.3亿；S3 B1-B5 契约护栏 6 条；S4 五百三→503/三百二→302；S5 静默归零钉现状 4 条按 027-F 修复后值；D 组回归 6 条）。S5 三条 Step A 禁命令按 027-F 修复后代码路径走查推导，Step B 实测全部一次命中。生产代码零改动
-- **Step B**：B1 全量 825/0/6；B2 itn:: 212/0（基线 196+16）；B3 llm:: 131/0；B4 src-tauri 53/0/0；B5 --list 831 自洽。无红条。DEC-043 三类零回归全维持（货币/重量/016 班级）。Vitest/pytest SKIP（零前端零 UI）
-- **Step C**：清理进程→npm build 1.94s→Tauri UI 1m57s→主程序 2m27s→UI 同步 target/release→Publish 同步→toml 三副本核验（itn-rules `ed77a912…`/scene-rules `7c1f0620…` 三处一致）→版本号未改
-- **Step D 七判据全过**：mtime 链过（src/itn.rs 18:00:39 < 三 exe）；sha256 两副本一致；新 feiyin-ime.exe `0e13cff5…`≠BUILD-013 `626bc2e2bc4f`；反向探针 3/3=0；正向探针 4/4≥1；ProductVersion 0.7.3.0/0.7.3/0.7.3.0；冒烟 PID 22336 Responding=True 零 panic 无残留
-- **产物**：feiyin-ime.exe `0e13cff59320…` 18:08:02 / feiyin-ime-ui.exe `cf7bddae7c87…` 18:05:30 / crash-reporter.exe `eb9c04e288de…` 18:06:59（Publish 三 exe 18:08:07）
-- **⚠️ 事故**：py open('w') 未指定 encoding 截断过 src/itn.rs（GBK locale），已用 git show HEAD 恢复 + 重 apply + 重跑 B1/B2 确认零差异；生产代码零受损；已记 lessons.md
-- **边界**：仅 src/itn.rs（mod tests）+ 文档；未提交；未改版本号；UTF-8 用 edit 工具
-- **详情**：result.md（26668 B）+ logs/20260804.md + CHANGELOG.md + docs/MACOS-HANDOFF.md
-
-## 2026-08-04 — coder-1 — ITN-FIX-BIGNUM-027-F 修027-E引入的静默归零（P0阻塞出包）
-
-- **来源**：tester-1走查申报，主控复核真风险。027-E后带单位串进隐式尾数吸收→.parse()归零。基线91c84ac
-- **改动**：隐式尾数吸收处+1行纯数字校验(对齐capture_price_per_unit:1241)；is_unit/format_currency_chain/format_weight_chain本体零改动；mod tests零改动
-- **调用点重盘**：try_parse_unit_chain内3消费点，仅隐式尾数吸收漏网已修
-- **验证**：基线itn:: 196/0/0 → 196/0/0零绿转红；cargo check + --tests双0；UTF-8 OK；四条bug恢复(五块三亿→5块3亿)；026正主6条+DEC-042四条全过
-- **MACOS-HANDOFF**：2.9.4节新增027-D/E/F+跨端提示
-- **边界**：仅src/itn.rs(+1行)+docs/MACOS-HANDOFF.md；未构建/出包；未改版本号；UTF-8用edit工具
-- **详情**：result.md（6318 B 非空）+ logs/20260804.md
-
-## 2026-08-04 — coder-1 — ITN-FIX-BIGNUM-027-E (DEC-042 补完) 数量级锚定最小单位全面落地
-
-- **来源**：Gavin 否定027-D二分，DEC-042补完全面适用。基线 f489e5b
-- **改动**：新增format_dec042_magnitude+隐式分支乘数修正(亿×1e7/万×1e3)+孤立判定统一；12条旧断言更新；10条新测试。is_unit/format_currency_chain/format_weight_chain本体零改动
-- **验证**：基线 itn:: 186/0/0 → 196/0/0（+10新增，12条预期内绿转红，174条预期外全绿）；cargo check + --tests 双0；UTF-8 OK；调用点安全6条全过；第八节4组零回归8条全绿
-- **边界**：仅 src/itn.rs；DEC-043合规(三套逻辑并存不统一)；未构建/出包；未改版本号；UTF-8用edit工具
-- **详情**：result.md（10353 B 非空）+ logs/20260804.md
-
-## 2026-08-04 — coder-1 — ITN-FIX-BIGNUM-027-D (DEC-042) 隐式补全保留锚定单位（行为变更）
-
-- **来源**：Gavin DEC-042 拍板。基线 967cd8d（027-C 已提交）
-- **方案评估**：盘点 14 调用点，UnitChain 的 .parse() 若返回带单位串会崩，加孤立判定规避
-- **改动**：big_unit_anchor 记录 + 隐式分支孤立判定 + 4 条旧断言更新 + 5 条新测试；is_unit 本体零改动
-- **验证**：基线 itn:: 181/0/0 → 186/0/0（+5，4 条预期内绿转红，177 条预期外全绿）；cargo check + --tests 双 0；UTF-8 OK；调用点安全 6 条全过
-- **边界**：仅 src/itn.rs；is_unit 本体零改动；未构建/出包；未改版本号；UTF-8 用 edit 工具
-- **详情**：result.md（11499 B 非空）+ logs/20260804.md
-
-## 2026-08-04 — coder-1 — ITN-FIX-BIGNUM-027-C + 027-C-2 ✅ 「两」误判致亿级金额蒸发修复
-
-- **来源**：接续 027-A/B（已提交 `136f70f`）。027-A/B 修完后 `一亿两千...` 仍错，027-C 是最后一块。基线 `136f70f`（ahead 42）
-- **方案协商**：coder-1 实测发现两个阻断点（主控原分析只定位第一处 large_amount_keep_wan_yi）。修第一处后亿能结算但 :677 two_is_unit 在「两」break。主控拍板扩范围 027-C-2 一并修
-- **027-C 改动**：large_amount_keep_wan_yi 万/亿分支加 `big_starts_new_number` 消歧——after_big 首字是数字+第二字进位单位→不break
-- **027-C-2 改动**：two_is_unit 加「两后跟 is_cn_unit_char→返回false」，补齐注释原意「进位单位由进位组合路径自行继续此处不误判」。is_unit 本体零改动（git diff 自证）
-- **第三处注释-实现不符**：two_is_unit 注释说不误判进位单位但实现只查 all_units。连同 4.6 亿级、geometric_order_hazard 共 3 处，主控要求汇总判断系统性
-- **第六节#4 实测**：不是真缺陷——丙型链 parse_cn_number 内部已折叠万/亿到 result，不丢弃
-- **验证**：基线 `itn::` 168/0/0 → **181/0/0**（+13 新增零绿转红）；cargo check + --tests 双 0；UTF-8 U+FFFD=0；is_unit git diff 空；017 全套 14 条逐条零回归（先实测现状再写断言）；4.2 六条 + 4.3 四条 + 4.4 六条逐条通过
-- **边界**：仅 `src/itn.rs`（两处消歧 + 13 测试）；is_unit 本体零改动；未构建/出包/启动 exe；未改版本号（0.7.3）；未用 git 破坏命令；UTF-8 用 edit 工具
-- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-1/result.md`（12757 B 非空）+ `logs/20260804.md`
-
-## 2026-08-04 — coder-1 — ITN-FIX-BIGNUM-027-A + 027-B ✅ 大额数字进位缺陷修复（027-C 发现另开单）
-
-- **来源**：Gavin 2026-08-04 端测「一千零四十六万八千七百四十一」→`10469740`（应为 `10468741`），第四种失败模式（数值静默改错）。Gavin 新指令「数字要支持从亿到个位的量级跨度」倒逼主控复查出 027-B（万级公式，差 4 个数量级）。基线 `ad8bbd0`（ahead 41）
-- **方案协商**：coder-1 实测发现 027-C（公告8用例中2条因「两」∈units.weight 被 large_amount_keep_wan_yi 的 is_unit starts_with 命中在亿分支 break，027-B 公式修复不可触及）。主控拍板本轮仅修 A+B，027-C 另开单（is_unit 是 ITN 最核心公共函数，动它风险最高）
-- **027-A 改动**：新增 `unit_since_big` 状态位；十/百/千分支在 `big_unit_seen` 时置 true；万/亿结算重置 false；末尾判据 `big_unit_seen && !zero_since_big && !unit_since_big`。隐式千位补全适用边界显式声明：万/亿后 + 该段内无零 + 该段内无进位单位
-- **027-B 改动**：万分支 `result = (result + section) * 10000` → `result += section * 10000`；亿分支保持 `(result+section)*1e8` 不变（亿是最大单位，反例「一万亿」验证）
-- **4.6 确认**：「三亿五」代码乘 1000 得 `300005000` ≠ 注释 `350000000`（五→五千万），注释-实现不符，只报不改
-- **验证**：基线 `itn::` 153/0/0 → 改后 **168/0/0**（+15 新增，零绿转红）；cargo check + --tests 双 0 errors；UTF-8 U+FFFD=0；4.2/4.3/4.4 共 11 条逐条通过；027-B 8 用例 4 条生产规则可达全过 + 2 条 027-C 阻断标注 + rules=None 隔离验证 8/8 全过
-- **同模式盘点**：4 条（亿级隐式单位 4.6 / 027-C large_amount_keep_wan_yi / 十分支无前导默认1 边界 / 丙型 UnitChain 大单位 result 丢弃），只列不改
-- **边界**：仅 `src/itn.rs`（生产 +191/-5 含注释，测试 +15）；`itn-rules.toml`/`src/llm/mod.rs`/`src/main.rs`/`src-tauri/**`/`ui/**`/`scene-rules.toml` 零触碰；未构建/出包/启动 exe；未改版本号（0.7.3）；未用 git 破坏命令；UTF-8 用 edit 工具
-- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-1/result.md`（14497 B 非空）+ `logs/20260804.md`
-
-# handoffs · voice-ime
-
-## 2026-08-04 — tester-1 — TEST-SYNC-026 ✅ ITN-FIX-CHAIN-TEAR-026 测试同步（阶段三）
-## 2026-08-04 — coder-2 — MACOS-P4-FIXHOTKEY-001 ✅ 修 CGEventTap 事件掩码越界（P0）
-
-- **来源**：`MACOS-P4-PROBE-001` 实机探针 A4 FAIL：listener 线程因 `KEYBOARD_EVENTS` 含 `TapDisabledByTimeout/UserInput` 在 `CGEventMaskBit!` 计算中 panic
-- **范围**：仅改 `src/platform/macos/hotkey.rs:28-38` 的 `KEYBOARD_EVENTS` 常量，移除两个带外事件，保留 `:102-103` 回调分支与 `:272-275` 重启逻辑
-- **根因**：`TapDisabledByTimeout = 0xFFFFFFFE` / `TapDisabledByUserInput = 0xFFFFFFFF` 是 core-graphics 标注的 "out of band" 通知，不应放入 event mask；其判别值远超 `u64` 位宽，`1_u64 << 0xFFFFFFFE` 在 debug 下 panic、release 下静默产生错误位
-- **验证**：`source scripts/env-macos.sh && cargo check` → 0 errors；`cargo check --all-targets` → 0 errors
-- **红线**：未碰 `src/main.rs` / `src/platform/mod.rs` / `src/platform/macos/mod.rs`（coder-1 并行占用）；未改 Windows 任何文件；未 `cargo build --release` / 出包 / 运行 exe；未使用 git 破坏性命令；UTF-8 无 BOM
-- **下游**：本修复为热键实机复测前置条件；A5 accessibility stub 仍待 `MACOS-P4-ACCESSIBILITY-001`
-
----
-
-## 2026-07-30 — tester-1 — BUILD-RELEASE-20260730-002 ✅ v0.7.3 全量出包完成
-
-- **来源**：基线 `9edc839`（coder-1 026+026-B 代码落地但 TEST-SYNC 缺失）。改动 B 允许单段 currency 链，打开误转风险面。
-- **A T6-T10 复核**：T6-T9 充分，T10 原 6 条补齐至 12 个 DEC-038 货币族保护词条（+二块钱/六块钱/八块钱/一毛钱/一角钱/五角钱）
-- **B B1-B5 反向护栏**：23 条断言覆盖块/角/分/元/毛五组歧义，每条标注「现状锁定」。**疑似误转 2 条**：`三毛`→`3毛`（人名）、`九牛一毛`→`九牛1毛`（成语尾段），已标注 `TODO-026-REGRESSION`
-- **C C1-C4 交叉回归**：21 条断言覆盖 017 六条端测/尾零边界/weight 族/016 班级简写
-- **边界**：`src/itn.rs` `mod tests` 块内 +114 行，生产代码零改动；版本号未改（0.7.3）；未触碰 `src/llm/mod.rs` / `itn-rules.toml` / `src/main.rs` / `src-tauri/**` / `ui/**`；UTF-8 U+FFFD=0；未执行任何命令（阶段三）
-- **详情**：`/d/Workspace/CodeLab/collab/outbox/tester-1/result.md`（非空）+ `logs/20260804.md`
-
-## 2026-08-04 — tester-1 — TEST-EXEC-026 + BUILD-013 ✅ 全量回归 + 出包（阶段四+五）
-
-- **来源**：基线 `9edc839` + TEST-SYNC-026。Gavin 已授权出包。
-- **Step A 全量回归**：A1 766/0/6（基线 762→766，+4 新增）| A2 itn:: 153/0 | A3 llm:: 131/0 | A4 src-tauri 53/0 | A5 --list 772 自洽
-- **Step B 红条分类**：4 红全 ① 断言写错（走查推断值与实测不符），无 ③ 真回归。修正 6 处断言值（一元二次→1元二次、三元钱→3元钱、五块零→5元、三块钱→3块钱、五块钱→5块钱、九牛一毛→九牛一毛）
-- **Step C BUILD-013**：三步构建 + Publish/ 同步。产物 `feiyin-ime.exe` `626bc2e2bc4f` / `feiyin-ime-ui.exe` `7f5b0ce6a6f4` / `crash-reporter.exe` `afd7f48d4f1b`
-- **Step D 验收 7 项全过**：mtime 链通过（src/itn.rs 00:43 < exe 00:46~00:48）| 两 toml 三副本一致（`ed77a912`/`7c1f0620`）| 二进制变化确认（≠ BUILD-012 `db07cefd8d51`）| 反向探针 3/3=0 | 正向探针 4/4≥1 | 冒烟 PID 21604 Responding=True 零 panic
-- **边界**：仅改 `mod tests` 断言（6 处修正）；版本号未改；未用 git 破坏命令；UTF-8 U+FFFD=0
-- **详情**：`/d/Workspace/CodeLab/collab/outbox/tester-1/result.md`（非空）+ `logs/20260804.md`
-
-## 2026-08-03 — tester-1 — TEST-SYNC-024 + TEST-EXEC + BUILD-012-VERIFY ✅ 023 续做收口（session 崩溃中断后）
-
-- **来源**：上一 session 崩溃中断，TEST-SYNC-024（`src/llm/mod.rs` +90/−8，全在 `mod tests`）与 BUILD-012（17:42 产物已存在）未收口。Gavin 18:3x 指令续做。
-- **Step A TEST-EXEC**：`cargo test --bin feiyin-ime` 752/0/6（+2 来自 TEST-SYNC-024）/ `llm::` 131/0/0（vs BUILD-011 基线 129/0/0）/ `itn::` 139/0/0 / `src-tauri` 53/0/0 / `--list` 758=752+6 自洽。零红条，无需换锚。
-- **Step B BUILD-012-VERIFY（默认不重建）**：独立复核 7 项全过——三 exe sha256 两副本一致（`DB07CEFD8D51`/`46D0F31E149D`/`699ED9656958`）/ 两 toml 三副本一致（`7C1F0620`/`ED77A912`）/ ProductVersion 0.7.3.0/0.7.3 / mtime 链通过 / 正向探针 8/8 ≥1 / 反向探针 4/4 =0 / 冒烟 PID 11088 Responding=True 零 panic。
-- **Step C 文档收口**：`logs/20260803.md` + `handoffs.md` + `CHANGELOG.md` + `todo.md` + `troubleshooting.md` 五处已更新。
-- **边界**：生产代码零改动；版本号未改；未用 git 破坏性命令；UTF-8 用 Python `codecs.open` 写入。
-
-## 2026-08-03 — coder-2 — FORMAT-F3-SEMANTIC-021 + PROMPT-ARCH-020 + FORMAT-F3-MARKERS-023 ✅
-
-### 021 + 020（F3 判据语义化 + 翻译路径假前提修复）
-**文件**：`src/llm/mod.rs` + `scene-rules.toml`（3 处 F4）
-**改动**：F3 DECISION RULE 从「标记字面重复」改为「语义并列」（`TWO OR MORE spans stand in a PARALLEL relation`）+ 新增 F3-semantic fallback 兜底授权（DEC-039 四语义齐全）+ F4 三处补无序族与 ILLUSTRATIVE 措辞 + 2 条负向 few-shot + 翻译路径常量补完整 SUSPECT 语义（不悬空引用 L0）+ T4 阈值 15000→16000。
-**验证**：cargo check/check --tests 双 0 errors；llm:: 127/2/0（两条红归 tester-1 断言锚旧字面）；UTF-8 U+FFFD=0；T4=15469<16000。
-**主控验收**：6 项全过，长度净增 +2198 接受。已提交。
-
-### 023（恢复并扩充四语枚举标记清单，Gavin 推翻 021 精简）
-**文件**：`src/llm/mod.rs`
-**改动**：恢复 `9eb80b7` 完整清单 132 标记短语 0 遗漏 + 四语扩充（中 `其次是/接下来/像是/好比` 等 / 英 `to start with/among them` 等 / 日 `はじめに/例を挙げると` 等 / 韩 `첫 번째로/가령` 等 / 结构性句式 4 新增）+ per-language contrast 恢复四语改用标记不同形态演示语义并列 + F3c 四语 unordered 改标记不同形态（修正韩语错别字 `쓰하는`→`쓰는`）+ T4 阈值 16000→40000 定位变更为探测异常暴涨。
-**验证**：cargo check/check --tests 双 0 errors；llm:: 127/2/0（两条红归 tester-1：①`!contains("for instance")` 反向断言与恢复冲突 ②`contains("比如说有些学生头发过长")` 旧字面，F3c 改为标记不同形态）；UTF-8 U+FFFD=0；T4=17672<40000。
-**移交说明**：tester-1 需改 2 条断言（删除 `for instance` 反向断言 + 换锚 `比如说` 为新字面）；兜底授权与保守默认双向原样保留。
-
-## 2026-08-03 — tester-1 — TEST-SYNC-019 + TEST-EXEC + BUILD-010 ✅ 三段串行收口
-
-- **来源**：两提交 `790e316`（018，提示词分层契约重构）+ `9eb80b7`（017，货币/度量链数值静默改错修复）。基线 `9eb80b7`（ahead 38）
-- **P1 红条换锚**：`suggestions_instruction_always_appended` 第2条 assert 从已删除的 `This directive OVERRIDES...` 声明换锚为 `SUGGESTION_INSTRUCTION` 的 `(1) Return the CORRECTED form only`。设计变更致断言过时，非回归，生产代码零改动
-- **P2 017 复核**：coder-1 5 组测试（T1-T5）充分性确认——六条端测/死数据锁/虚指护栏/反向护栏全覆盖。016 班级简写 5 条在既有测试中已覆盖，未新增
-- **P3 018 复核**：守恒夹具 4 条非空壳（双向比对+白名单显式化）/ L0 置顶 / UNIT_SYMBOL_PROTECTION 假前提已修 / i18n 三处 §2/§4/§5/§7 已裁
-- **P4 B 批契约测试**：新增 T1（Topic 跨层唯一归属，同层重复允许）/ T2（矛盾对层号小的赢）/ T3（层序+层内插入序）/ T4（长度预算，实测 ~11500 字符，阈值 15000）。编译时修正 2 处：Topic derive Hash + PromptRule/Topic import
-- **阶段四 TEST-EXEC**：`cargo test --bin feiyin-ime` 749/0/6 ✅ | `itn::` 139/0/0 ✅（与 coder-1 自报一致）| `src-tauri` 53/0/0 ✅ | `--list` 755 自洽
-- **阶段五 BUILD-010**：三步全量构建 + Publish/ 同步。三 exe sha256 两副本一致；两 toml 三副本一致（itn-rules.toml 37,291B 含 017 改动）；ProductVersion 0.7.3.0/0.7.3；mtime 链通过；探针有效（新增串命中 ≥1，旧措辞命中 0）；冒烟 PID 728 零 panic
-- **边界**：`src/llm/mod.rs` +1 derive (Hash) / +2 import / +1 assert 换锚 / +4 测试；生产代码零改动；版本号未改；未用 git 破坏性命令；UTF-8 用 edit 工具
-- **详情**：`/d/Workspace/CodeLab/collab/outbox/tester-1/result.md`（非空）+ `logs/20260803.md`
-
-## 2026-08-02 — tester-1 — TEST-SYNC-016 ✅ 015 + 016 测试同步（阶段三，零命令执行）
-
-- **来源**：两提交 `ae452fb`（015，F3b/Output format 对称补 LONG 限定）+ `81cf51a`（016，年级班级简写守卫）。基线 `81cf51a`（ahead 35）
-- **A 过时断言**：`build_format_instruction_block_f3_exemplification_enumeration` d 项换锚（`may be FULL SENTENCES` → `List items here are FULL SENTENCES or longer clauses` + `SHORT noun phrases MUST NOT be bulleted` + 负向护栏）。意图=长句 AND 短项禁止 bullet 两侧缺一即退化
-- **B 015 覆盖 6 条**：item_form_short_long_split / f3a_f3b_long_symmetry / output_contract_short_inline_exception / f3c_short_inline_example / ⭐item_form_structural_guard（SHORT 内联与 LONG 限定同时存在，写 recency 软化教训）/ false_unchanged_drift_guard
-- **C 016 覆盖 6 条**：T1 正向 4 条（一三班/五一班/初二三班/高一四班 全汉字）｜T2 句子形态｜T3 反向护栏 8 条（含 **十三班→13班** code 走查 + coder-1 实测双重确认）｜T4 proper_nouns 保护｜T5 班非数字后｜⭐T6 降级（缺 serial_suffixes 旧 toml → 一三班→13班，锁 [TOML-STALE-001]）
-- **自验**：锚点与生产文本字节比对全过；负向锚点生产代码确认缺席；括号平衡；UTF-8 U+FFFD=0；`git diff -w` 真实 diff `+265/−3` 全在测试块，生产零改动
-- **边界**：未跑任何命令（阶段三禁执行）；未构建/出包/启动 exe；未改版本号（0.7.3）；未用 git 破坏命令；UTF-8 用 edit 工具
-- **详情**：`/d/Workspace/CodeLab/collab/outbox/tester-1/result.md`（非空）+ `logs/20260802.md`
-
-## 2026-08-02 — coder-1 — ITN-FIX-GRADECLASS-016 ✅ 年级班级简写被逐位串误合并
-
-- **来源**：Gavin 2026-08-02 端测 `我是一三班的学生`（=一年级三班）被转 `13班`；同类 五一班/初二三班/高一四班。基线 `ae452fb`（ahead 34）
-- **根因**：`parse_cn_number` 逐位串 `serial_len>=2 && !next_is_unit` 把「一三」当两位数 + `decide_conversion` `consumed>=2` 无条件转；「班」不在 classifiers。`五一` 在 proper_nouns:`一三` 不在 = DEC-038 随机覆盖病症
-- **方案协商（重要）**：主控原方案「跳 :582 early return 落进位组合路径」经分析会产出 `("3",2)`（进位路径末位 digit 覆盖）→`3班`撕裂。协商采纳正确落点——**守卫命中时 `parse_cn_number` 直接 `return None`**（主循环 :1600 `if let Some` 短路，字符走单字路径，班非单位/量词→全汉字）。主控 ACK 采纳原方案作废
-- **改动**：`itn-rules.toml` +7 新增 `[protect.serial_suffixes]`(words=["班"])；`src/itn.rs` +38/−1（Protect/CompiledRules 加字段 + from_rules 填充 + parse_cn_number 守卫 `serial_len==2 && 后继命中 serial_suffixes`→None + 订正过时注释 ≥3→≥2 不改实现）
-- **主控复核点已实读确认**：① 链扫描 :830/:1290/:1348 三处 None 均 `break` 推进无死循环，且守卫 None 短路使 :1622 永不到达（chain_end==i 空转不可能）② 甲乙丙型 :988/:1120/:1228 `?` 传播期望行为，既有断言零误伤
-- **验证**：目标 4 条全汉字（一三班/五一班/初二三班/高一四班）；反向护栏 10 条全过（九八年→98年、三零二房间→302、二零二六→2026、幺三八零零→13800、三年二班保持、**十三班→13班 现行为实测未改**、一班/三班保持、五一/五一广场保护）；`cargo test --bin feiyin-ime itn::` **128 passed / 0 failed**；双 cargo check 0 errors；UTF-8 U+FFFD=0
-- **🔴 全量唯一红条（非本任务引入）**：`llm::tests::build_format_instruction_block_f3_exemplification_enumeration`（src/llm/mod.rs:1856 断言旧措辞 `may be FULL SENTENCES`，现文案 :875 为 `List items here are FULL SENTENCES or longer clauses`）——coder-2 015 改动措辞未同步断言。`git status --short src/llm/mod.rs` 空输出证明工作区零改动，红条在 HEAD 即存在，**归 tester-1 TEST-SYNC 换锚点**
-- **边界**：仅 `src/itn.rs` + `itn-rules.toml`（45 insertions/1 deletion）；`src/llm/mod.rs`/`scene*`/`main.rs`/`src-tauri/**`/`ui/**` 零触碰；未构建/出包/启动 exe；未改版本号（0.7.3）；未用 git 破坏命令；UTF-8 用 edit 工具
-- **下游需知**：本次改 `itn-rules.toml`，tester-1 出包时需三副本同步（`[TOML-STALE-001]` 纪律）；端测观察点 `一三班` 类保持汉字、`十三班` 仍 `13班`
-- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-1/result.md`（非空）+ `logs/20260802.md`
-
-## 2026-08-02 — coder-2 — FORMAT-F3-SHORTITEM-015 ✅ F3b 与输出契约对称补 LONG 限定（收口 014 的 recency 冲突）
-
-- **来源**：主控独立 Read 取证——014 的 F3-item form（SHORT→内联）位于 F3a/F3b 之前，下游两处仍无条件要求 bullet/多行且 recency 更高（`src/llm/mod.rs` 注释 :813-817「后段软化前段」失败模式），Gavin 买菜用例（无序+短名词短语）恰好命中。基线 `3b4b622`（ahead 32）
-- **范围**：仅 `src/llm/mod.rs` 的 `build_output_format` 真分支（4 处文本：3 语义 + 1 示例）；假分支零改动
-- **改动 1**：F3b 标题补 `AND items are LONG`，与 F3a :869 `items are LONG` 对称
-- **改动 2**：F3b 正文 `List items may be FULL SENTENCES ... do NOT need to be short noun phrases` → 语义反转 `List items here are FULL SENTENCES ... SHORT noun phrases MUST NOT be bulleted — per F3-item form above they are joined INLINE with the enumeration separator`（`Narrative exemplification` 句保留）
-- **改动 3**：Output format 行 `MUST span multiple lines when F3 applies` → `when F3 applies AND F3-item form routes the items to a LIST`，补 `or when F3-item form routes SHORT items INLINE, output a single continuous paragraph`
-- **改动 4**：F3c 插入 Chinese SHORT items inline 正向示例（买菜句 → 顿号内联，与 Gavin 端测用例一致）
-- **验证**：`cargo check` + `cargo check --tests` 双 0 errors；`cargo test --bin feiyin-ime llm::` **113 passed / 1 failed**——唯一红 `build_format_instruction_block_f3_exemplification_enumeration:1856` 断言 `may be FULL SENTENCES`，**断言过时**（改动2 明确删除该措辞），归 tester-1 TEST-SYNC 换锚点，未改断言；Python 解码核对全 PASS（`AND items are LONG`/`MUST NOT be bulleted`/买菜示例/`Narrative exemplification` 保留/`routes SHORT items INLINE`）；全文件不再含 `they do NOT need to be short noun phrases`；UTF-8 无 mojibake；字符数（解码后）`build_output_format(true)` 5183→5511（+328）
-- **设计约束遵守**：F3-item form 本体零改动；段落位置零移动；`INLINE_SEPARATOR_RULES` 一字未改；:891-894 JSON `{{ }}` 转义保留
-- **边界**：`src/text_normalizer.rs`/`src/scene/mod.rs`/`scene-rules.toml`/`src/itn.rs`/`itn-rules.toml`/`src/main.rs`/`src-tauri/**`/`ui/**` 零触碰；未构建/出包/启动 exe；未改版本号（0.7.3）；未用 git 破坏命令（仅 `git show` 只读对比）；UTF-8 用 edit 工具
-- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-2/result.md`（非空）
-
-## 2026-08-02 — coder-2 — FORMAT-F3-SHORTITEM-014 ✅ 多行分支补「短项内联 / 长句列表」分流 + 四语措辞补充
-
-- **来源**：Gavin 2026-08-02 端测——`今天出去买菜了，买了3斤土豆，一个西瓜，20斤大米，还有3斤香蕉`（msedge/Memos/multiline_safe=true）被拆成四行 `- ` 列表，但这是短名词短语清单，应顿号内联。主控定位：短项 `、`/长句 `；` 规则只存在于 `multiline_safe=false` 分支，`true` 分支没有「短 vs 长」区分。基线 `bba7f08`（ahead 32）
-- **范围**：仅 `src/llm/mod.rs` 的 `build_output_format`（真/假两分支 + 新增共享常量）。`src/text_normalizer.rs` 零触碰（coder-1 并行）
-- **改动 A · 短项内联/长项列表分流（重点）**：DECISION RULE 之后新增 **F3-item form**——数量 ≥2 确认枚举后按项目形态分流：SHORT（无谓语、无内部标点、≤6 字/词）→ **内联分隔符，不做列表**（含 Gavin 用例 `买了3斤土豆、一个西瓜、20斤大米、还有3斤香蕉`）；LONG（含谓语或内部标点）→ **列表**（`1. `/`- `）。边界：混合长短按多数项决定、不确定用列表；有序短项保留序号词（`第一个土豆，第二个西瓜` 内联）
-- **改动 B · 四语措辞补充**：中文 `再者/最后一点/另外一点/第X条`；English `in addition/plus/and then/namely`；日本語（有序最薄仅 3 组，补 `①②③/最初に/続いて/それに/加えて/ほかにも`）；한국어 `또/이어서/끝으로/아울러`。**单行分支标记词同步补齐**至与多行分支覆盖一致（Python 核对 18 词 count=2 全 OK）
-- **分隔符表抽共享常量 `INLINE_SEPARATOR_RULES`**：两分支 `format!(..., INLINE_SEPARATOR_RULES)` 共用，保证分隔符规则**字面一致**（避免两套说法漂移）。为此 `build_output_format` 返回类型 `&'static str` → `String`（真分支需运行时拼接常量）
-- **精简意识**：真分支 6371 / 假分支 3345 字符（HEAD 版 4297/2649，增长主要为分流规则 + 四语补充词，均紧凑列举未造句）
-- **验证**：`cargo check` + `cargo check --tests` 双 0 errors；`cargo test --bin feiyin-ime llm::` **114 passed / 0 failed** **零红条**（tester-1 已把断言锚到 build_output_format，我的改动保留全部关键措辞：`1. `/`- ` 符号、保守默认双向、DECISION RULE、四语标记、负向示例；新增分流不破坏任何断言）；UTF-8 Python 验证无 mojibake（U+FFFD=0）；18 个补充词两分支覆盖一致
-- **⚠️ cargo fmt 连带 3 处**：既有测试块 :1659/:1872/:1934 三条 `assert!` 长行被 rustfmt 重排（零逻辑变化，[FMT-COLLATERAL-001] 保留）
-- **边界**：`src/text_normalizer.rs`/`src/scene/mod.rs`/`scene-rules.toml`/`src/itn.rs`/`itn-rules.toml`/`src/main.rs`/`src-tauri/**`/`ui/**` 零触碰；未构建/出包/启动 exe；未改版本号（0.7.3）；未用 git 破坏命令；UTF-8 用 edit 工具
-- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-2/result.md`（非空）
-
-## 2026-08-01 — tester-1 — TEST-SYNC + TEST-EXEC + BUILD-RELEASE-20260801-008 ✅ 三轮收口（本轮 18 红最多）
-
-- **来源**：2 提交 b60517a（F3 与输出契约合并到最末 + 四语标记穷举）+ 978afa7（系统提示词全英文）。基线 `978afa7`（ahead 31 未 push）
-- **Step 0**：0a llm:: 8 红换锚点函数（build_format_instruction_block 只剩 F1/F2，F3/输出契约在 build_output_format）+锚定串更新；0b text_normalizer:: 10 红+1 隐形假绿改英文断言 + 2 新守卫（翻译路径不得含 Do NOT translate [LANG-MIXED-001]、5 指令串无 CJK [Gavin 纯英文]）；0c 四语标记；0d ⭐结构护栏（走 build_optimize_request 真实组装断言格式契约在 ANTI_HALLUCINATION 后且末段，注释写五次段落顺序教训）；cargo check 0 errors
-- **Step A 全绿**：788/0/8（+4）；src-tauri 53/0/0；llm:: 114/0（104/8→全绿）；text_normalizer:: 61/0；--list 796=788+8 自洽；点名 3/3（0d 结构护栏/mastodon/memos）
-- **B0-pre 构建前探针预验证**：旧 exe c4cfe76c 四新探针=0 + 旧中文串判别力=1 + Notepad=1
-- **Step B**：两处实例无运行；构建 2m05s；Publish 同步 feiyin-ime.exe（fb74146b/11,901,440B）+ crash-reporter（9fb4022a），ui 未动；两 toml 三副本未变（910b2c1f/93ab3972）
-- **Step C**：四新探针全≥1 + 旧中文串=0（判别力 1→0）；两副本 sha256 三 exe 全一致；0.7.3.0；mtime 23:48:31 > llm 23:43:14 > normalizer 23:41:59；冒烟 PID 21408 零 panic
-- **详情**：`/d/Workspace/CodeLab/collab/outbox/tester-1/result.md`（WSL Python，106 行）+ `logs/20260801.md` §36
-
-## 2026-08-01 — coder-1 — PROMPT-EN-UNIFY-013 ✅ `extra_instruction` 英文化（系统提示词纯英文）
-
-- **来源**：Gavin 指令「系统提示应该用纯英文」。基线 `3490c2a`（ahead 29）
-- **范围**：`src/text_normalizer.rs` 指令字符串 5 条英文化（**任务书说 4 条，实际 5 条**——`:197` 假名/谚文纯保护措辞也一并英文化，否则系统提示仍不纯英文）；简繁转换逻辑零改动
-- **改动**：主路径 Simp/Trad 保留「不要翻译非中文」子句；翻译路径 Simp/Trad 不含（两组差异保持，翻译路径绝不可注入防翻译语义）
-- **验证**：text_normalizer:: 49/10（10 红全断言中文子串过时归 TEST-SYNC）；双 cargo check 0 errors；全量 702/18（另 8 红为 coder-2 llm 既有红条，与本改动无关——src/llm/mod.rs 对指令零引用）
-- **效果**：LLM 是否仍正确简繁归一单测无法验证，**需 Gavin 端测确认**（建议：说含繁体字形的话看是否归一简体）
-- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-1/result.md`（非空）+ `logs/20260801.md`
-
-## 2026-08-01 — coder-2 — FORMAT-F3-UNIFY-I18N-012 ✅ F3 与输出契约合并到 prompt 最末 + 枚举标记四语穷举
-
-- **来源**：Gavin 2026-08-01 指令——「系统提示应该用纯英文，但在提示词里把各种枚举情况、枚举的用词、措辞都说到，并明确要求考虑中文、英文、日文、韩文的输入场景」。背景：连续两轮措辞层修复（F3 DECISION RULE、MAY→MUST）均失败（prompt_tokens +271 证明新文本已加载仍被压制），主控定论根因是**结构**——prompt 里三处谈格式靠位置争优先级。基线 `3490c2a`（ahead 29）
-- **范围**：仅 `src/llm/mod.rs`。`src/text_normalizer.rs` 零触碰（coder-1 并行改 extra_instruction 英文化）
-- **改动 A · 结构合并**：
-  - `build_format_instruction_block` 只留 F1/F2（filler + self-correction，与格式无关，留原位 :554）；参数改 `_multiline_safe`
-  - `build_output_format` 重写为**合并的 F3+输出契约**（全仓唯一谈格式/列表/标签的地方），调用点从 :589 移到 **:596（ANTI_HALLUCINATION 之后，最末，recency 最高）**
-  - **放置理由**：ANTI_HALLUCINATION 约束「语音不是问题、只重排返回」，与格式排版正交，放其前面不影响效力；格式段获最高 recency（本批修复目标）
-  - `multiline_safe=false` 分支同样合并（单行契约 + i18n 五语分隔符表，**一字未改**）
-- **改动 B · 枚举标记四语穷举**（Gavin 指令核心）：指令散文全英文；标记词用目标语言原文——
-  - 中文有序：第一/第二/第三、第一点/第二点、一是/二是/三是、首先/其次/再次/最后、然后/接着、一来/二来、其一/其二
-  - 中文无序：比如/比如说/例如/譬如/像、有的…有的…、**有些…有些…**、**有一些…还有一些…**、一些…一些…、还有/另外/此外/以及/包括/诸如/等等、一方面…另一方面、一类是…一类是
-  - English 有序：first/second/third、firstly/secondly/lastly、step 1/2/3、point one/two、to begin with、next、finally
-  - English 无序：for example/for instance/such as/like/including/includes/also/another/additionally/moreover/besides/as well as/e.g./etc./some… some…/one… another…
-  - 日本語：第一に/第二に/第三に、まず/次に/それから/最後に、一つ目/二つ目/三つ目、たとえば/例えば、など/とか、また/さらに/そのほか、〜や〜、ある人は…ある人は…、一つは…もう一つは…
-  - 한국어：첫째/둘째/셋째、먼저/다음으로/마지막으로、첫 번째/두 번째、우선、그다음、예를 들어/예컨대、등、그리고/또한/게다가、~같은、뿐만 아니라、어떤 사람은…어떤 사람은…
-- **DECISION RULE 跨语言**：改为语言无关表述 + 每语一组「1 次 vs ≥2 次」对照（Chinese 比如/English for example/Japanese たとえば/Korean 예를 들어）
-- **few-shot**：中文保留既有（2 有序 + 2 无序含 `比如说` 长句 + 单例负向）；**en/ja/ko 各 1 条无序正向**（长句形态）+ **非中文负向例各 1 条**（单 for example/たとえば/예를 들어 不列表）
-- **改动 C · 四语覆盖声明**：合并段开头显式声明适用于 Chinese/English/Japanese/Korean 四种输入语言，按输入文本主体语言选用对应标记集
-- **验证**：`cargo check` + `cargo check --tests` 双 0 errors；`cargo test --bin feiyin-ime llm::` **104 passed / 8 failed**——8 红全部**断言过时**（F3/i18n 表从 `build_format_instruction_block` 移到 `build_output_format`，测试仍指向旧位置/旧措辞），逐条判定无真回归，归 tester-1 TEST-SYNC 未改断言；UTF-8 Python 验证无 mojibake（U+FFFD=0）；四语标记/few-shot/跨语言 DECISION RULE/覆盖声明全部 Python 核对 PASS；i18n 五语表 6 串核对 PASS 一字未改；fmt 零测试块连带（3 hunk 全在改动区域）
-- **⚠️ 8 条红清单**（供 tester-1）：`build_format_instruction_block_single_line_when_not_multiline_safe`(:1560) / `build_output_format_single_line_when_not_multiline_safe`(:1577 断言 Line 1:) / `build_output_format_multi_line_when_multiline_safe`(:1599) / `build_output_format_multi_line_mentions_numbered_and_bullet`(:1617 断言 numbered lists 措辞) / `build_format_instruction_block_multi_line_when_multiline_safe`(:1570) / `build_format_instruction_block_four_quadrants`(:1651) / `build_format_instruction_block_false_i18n_separators`(:1705) / `build_format_instruction_block_f3_exemplification_enumeration`(:1767)——断言全部从 `build_format_instruction_block` 迁到 `build_output_format`
-- **边界**：`src/text_normalizer.rs`/`src/scene/mod.rs`/`scene-rules.toml`/`src/itn.rs`/`itn-rules.toml`/`src/main.rs`/`src-tauri/**`/`ui/**` 零触碰；未构建/出包/启动 exe；未改版本号（0.7.3）；未用 git 破坏命令；UTF-8 用 edit 工具
-- **详情**：`/d/Workspace/CodeLab/collab/outbox/coder-2/result.md`（非空）
-
-
-> 只保留当天条目，>200 行时归档到 handoffs-archive.md。
-
-## 2026-08-04 — tester-1 — MACOS-P4-PROBE-001 ✅ 五项探针完成（A1/A2/A5 PASS，A4 FAIL，A3 部分 PASS）
-
-- **来源**：主控派发 Phase 4 首项探针任务，验证「录音能不能录、模型能不能跑、热键能不能收」三大假设
-- **范围**：零源文件改动（`src/` / `src-tauri/` / `ui/` / Cargo.toml / 版本号文件全部未碰），仅临时创建 `src/bin/probe_mic.rs` + `src/bin/ui/overlay.rs`（#[path] 挂载探针），跑完已删除
-- **核心结论**：
-  - **A1 cpal 录音**: PASS — 能录（RMS=0.108048 非零），系统默认麦克风「外置麦克风」正常采集
-  - **A2 sherpa-onnx 转录**: PASS — SenseVoice 模型加载 0.594s，转写 0.256s，RTF=0.0458，文本正确「开饭时间早上九点至下午五点」，无 dyld/@rpath 错误
-  - **A3 TCC 终端 vs .app**: 部分 PASS — Terminal（com.apple.Terminal）与 .app（com.voice-ime.probe-mic）TCC 主体不同，.app 未阻塞但生产环境仍需引导授权
-  - **A4 CGEventTap 热键**: **FAIL** — `KEYBOARD_EVENTS` 包含 `TapDisabledByTimeout(0xFFFFFFFE)` / `TapDisabledByUserInput(0xFFFFFFFF)`，导致 `CGEventMaskBit` 宏触发 `1_u64 << 0xFFFFFFFE` panic（core-graphics-0.25.0/src/event.rs:627）。DEC-017 首次实机暴露 bug
-  - **A5 辅助功能弹窗**: PASS — `ax_is_process_trusted_with_prompt()` 确为 stub（仅 `log::info!`），未调用真实 `AXIsProcessTrustedWithOptions`
-- **方案协商**：tester-1 发现 binary-only crate 问题并上报（无 src/lib.rs），主控裁定采用 #[path] 方案③，实测编译通过并成功挂载 audio/platform 模块
-- **Phase 4 下游影响**：A1/A2 成立 → 后段管线可复用；A4 FAIL → 需修 `hotkey.rs:28-34` KEYBOARD_EVENTS 后才能进入热键测试；A5 stub → 需补真实 FFI
-- **边界**：零源文件改动，临时探针已删除，git status src/ / src-tauri/ / ui/ / Cargo.toml 全部 clean，未使用 git 破坏性命令
-- **详情**：`collab/outbox/tester-1/result.md`（10,353 字节）
-
-## 2026-08-04 — coder-1 — MACOS-P4-NEUTRAL-001 ✅ run_pipeline 管线去平台化完成（402 行业务逻辑变双侧可复用）
-
-- **范围**：把 `run_pipeline`（src/main.rs，原 :2812-3214，402 行）从 Windows 专属变为平台中立。`spawn_worker_thread` 经主控裁定本轮完全不动。
-- **方案协商两轮**：
-  - 第5接触点（我提出）：`spawn_worker_thread` 参数耦合 `WorkerCommand`/`StartCmd`/`SendHwnd`（均带 `#[cfg(windows)]`），且 `SendHwnd` 还服务 overlay 线程。**裁定 B**：本轮不动，另立 MACOS-P4-NEUTRAL-002。
-  - 第6接触点（我提出）：`run_pipeline` body 调用 3 个 `#[cfg(windows)]` 辅助函数（select_preprocessing_params/should_try_llm_translate/try_nllb_translate，均平台中立纯 Rust）。主控穷举核查 29 个 cfg 门控函数仅此 3 个被调用。**裁定 A**：删 3 行 cfg 属性（对 Windows 构建为可证明 no-op），函数体不动。
-- **改动**（6 文件）：main.rs（run_pipeline→薄封装委托 run_pipeline_core + 删3行cfg属性）/ platform/mod.rs（WindowId=usize + 2 新导出）/ windows/{scene,event_loop,mod}.rs（纯新增3函数+2 re-export，Windows 零删除）/ macos/mod.rs（纯新增2函数，foreground_window_id 返回0降级）。
-- **验证**：body 去空白 md5 自证逐字节保留（仅2接触点改动，0 mismatch）；Windows `git diff --numstat` 删除列全 0；`cargo check` + `--all-targets` 均 0 errors；两份导出清单各 17 符号逐一对应；6 文件无 BOM。
-- **衍生收益（本轮不做）**：select_preprocessing_params 去 cfg 后，6f0b51e 的 5 个 #[test] 具备 macOS 跑条件，TEST-SYNC 解除可减 22 条盲区中 5 条。
-- **红线遵守**：未破坏 Windows 既有功能；未碰 macos/hotkey.rs（coder-2 并行）；未动 spawn_worker_thread/macos_stubs/三类型/translation_needs_reload；未 build --release/出包/碰 Publish；未改版本号/Cargo.toml；未 npm install/cargo clean；未用 git 破坏命令；UTF-8 无 BOM。
-- **详情**：`collab/outbox/coder-1/result.md`（8746 字节，非空）
-
-## 2026-08-04 — tester-1 — TEST-SYNC-P4-NEUTRAL-001 ✅ 测试同步完成（阶段三，13 条测试，cargo check --tests 0 errors）
-
-- **来源**：主控派发 TEST-SYNC 任务（阶段三），覆盖 FIXHOTKEY + NEUTRAL 两批改动的测试同步
-- **范围**：仅改 `#[cfg(test)]` 块 + 6 行 cfg 属性，零生产代码改动
-- **P0-1 解除 cfg 门控**：`src/main.rs` 解除 `select_preprocessing_params` 的 6 处 `#[cfg(target_os = "windows")]`（1 use + 5 test）。函数平台中立确认安全。盲区从 22 条降至 17 条
-- **P0-2 KEYBOARD_EVENTS 护栏**：`src/platform/macos/hotkey.rs` 新增 2 条测试——判别值 <64 安全范围 + 显式黑名单断言不包含 TapDisabled* 带外事件
-- **P0-3 foreground_window_id 契约**：`src/platform/macos/mod.rs` 新增 1 条测试，断言第一版返回 0，注释标注「将来真实实现时会变红」
-- **P0-4 focus_lost 真值表**：`src/main.rs` 新增 4 条测试，镜像 `run_pipeline_core:3217` 表达式 `target_hwnd != 0 && current_id != target_hwnd`
-- **P1 capture_scene_signals_by_id 降级**：`src/platform/macos/mod.rs` 新增 1 条测试，断言 stub 恒返 None
-- **新增测试函数**：8 条全新 + 5 条解封 = **13 条** macOS 首次可见
-- **编译验证**：`cargo check --tests` 0 errors，6.72s
-- **红线遵守**：零生产代码改动；未执行 cargo test / cargo build --release / pytest；未触碰 src/platform/windows/、Cargo.toml、版本号；未使用 git 破坏性命令
-- **详情**：`collab/outbox/tester-1/result.md`（9,110 字节）
-- **下游预告**：TEST-EXEC 阶段将执行 `cargo test --no-fail-fast` + A4 热键实机复测
-
-## 2026-08-04 — coder-1 — MACOS-P4-PERM-001 ✅ 辅助功能授权弹窗真实现完成（macOS 专属，零 Windows 风险）
-
-- **范围**：仅 `src/platform/macos/accessibility.rs` 一个文件。补全 `AXIsProcessTrustedWithOptions` FFI 绑定与真调用（原 `ax_is_process_trusted_with_prompt` 是 stub 仅 log，从未触发系统弹窗，致热键静默失效）。
-- **改动**：新增 FFI 声明 `AXIsProcessTrustedWithOptions` + `kAXTrustedCheckOptionPrompt`；`ax_is_process_trusted_with_prompt` 用 `core_foundation`（CFString/CFBoolean/CFDictionary）构造 `{kAXTrustedCheckOptionPrompt: true}` 调用之触发系统弹窗；`ensure_accessibility_at_startup` 增强 log::warn（引导系统设置）+ 不阻断启动（与 Windows 对齐）。3 公开函数签名未改。
-- **依赖零新增**：core-foundation 0.10 / core-foundation-sys 0.8 已在 Cargo.toml macOS 段，未改 Cargo.toml。
-- **验证**：cargo check --all-targets 0 errors；仅 1 文件 diff（+42-11）；UTF-8 无 BOM。**未实机验证**（本机已授权，无法安全复现未授权状态，如实降级）。
-- **跨端影响（§2.10）**：纯 macOS 平台代码，对 Windows 零影响（cfg 门控，Windows 不编译）。
-- **红线遵守**：未碰 coder-2 占用文件 / hotkey.rs / Cargo.toml；未用 git 破坏命令；未出包/改版本号。
-- **详情**：`collab/outbox/coder-1/result.md`（5658 字节非空）
-
-## 2026-08-04 — tester-1 — TEST-EXEC-MERGE-001 ✅ 合并后全量回归 + A4 热键实机首测成功
-
-- **主程序 cargo test --no-fail-fast**: 880 passed / 0 failed / 8 ignored（--list 888 自洽）
-- **src-tauri**: 53/0/0 ✅
-- **Vitest**: 54/54 ✅
-- **pytest --collect-only**: 147/156 ✅
-- **A4 热键实机复测（首次成功）**: CGEventTap(Session) 收到 Start/Stop/CancelStop 事件；无 panic；辅助功能权限已授予
-- **盲区**: 17 条（platform/windows/ 模块级 cfg）
-- **已知失败修复**: `itn::tests::time_half` 由 ITN v2 修复（现通过）
-- **跨端影响**: 68 提交全部通过，零 (a)/(b) 类失败；我方三批改动（FIXHOTKEY-001 / NEUTRAL-001 / TEST-SYNC-P4-NEUTRAL-001）全部验证通过
-- **红线**: 零源文件改动（probe 已删）；遇 coder-2 编译错误上报主控未自修
-- **详情**: `collab/outbox/tester-1/result.md`（7,483 字节）
-
-## 2026-08-04 — coder-1 — MACOS-P4-NEUTRAL-002 ✅ 打通语音输入闭环（worker 去平台化 + macOS 接线）
-
-- **范围**：仅 src/main.rs。spawn_worker_thread 去 cfg，macOS 侧 run_controller_macos 接线（建 worker/pipeline channel + 逻辑线程 + run_message_loop 宿主）。
-- **方案协商**：主控已穷举扫描 29 个 cfg(windows) 函数确认接触点；我实施中撞到第7/8接触点（load_hotwords_for_accuracy/compute_hotwords_version），主控裁定同 NEUTRAL-001 删 cfg。
-- **改动**：WorkerCommand/StartCmd 去 cfg + StartCmd.target_hwnd: SendHwnd→WindowId；Windows 唯一实质修改 main.rs:1929（SendHwnd(hwnd.0 as isize)→hwnd.0 as usize）；spawn_worker_thread 去 cfg + :2439 调 run_pipeline_core；删 run_pipeline 薄封装（零调用者自证）；macos_stubs 删重复定义；run_controller_macos 重写（逻辑线程 handle_hotkey_event/handle_pipeline_event + FocusLost 复制剪贴板）；第7/8接触点删 2 行 cfg。
-- **预存在删除**：ctrlc handler 块（8行 main.rs + 3行 Cargo.toml）是 coder-2 HOST-001 问题A修复，开工前已存在，非本任务。
-- **验证**：Windows git diff numstat 空；run_pipeline 零调用者自证；spawn_worker_thread body 去空白 md5 与预期完全相等（0 mismatch）；cargo check --all-targets 0 errors；UTF-8 无 BOM。**闭环实机部分降级**：启动+模型加载日志确认，热键闭环未实机（osascript 模拟 F6 不经 CGEventTap 捕获层，需物理键）；**退出路径未验证**（ctrlc 被预存在删除，SIGINT 不触发 request_stop）。
-- **红线遵守**：未碰 windows/**/macos/overlay.rs/mod.rs/accessibility.rs/Cargo.toml；未用 git 破坏命令；未出包/改版本号。
-- **详情**：`collab/outbox/coder-1/result.md`（7614 字节非空）
-
-## 2026-08-04 — coder-1 — MACOS-P4-EXIT-001 ✅ 修复 macOS 无干净退出路径（实机验证通过）
-
-- **范围**：仅 src/main.rs（全部在 #[cfg(target_os="macos")] 内）。补回 SIGINT/SIGTERM 信号处理，让 Ctrl-C 触发与 Windows 等价的干净收尾。
-- **方案**：B1（不引 crate，用 libc::signal，libc=0.2 已在 macOS 段零新增依赖）。handler 只置 AtomicBool（async-signal-safe），轮询线程在普通上下文调 platform::request_stop()。
-- **改动**：新增 MACOS_SIGINT_RECEIVED static + macos_signal_handler extern fn + install_macos_signal_handler fn + run_controller_macos 开头调用。handler cast 用 `as *const () as sighandler_t` 避免 function_casts 警告。
-- **实机验证**：① kill -INT 触发完整退出链（requesting stop → logic thread exiting → controller loop exited cleanly → 进程 EXITED 无残留）② 二次启动正常（flock 已释放，无 "Application already running"）。
-- **验证**：Windows git diff numstat 空；新增代码全 cfg(macos)；cargo check --all-targets 0 errors；UTF-8 无 BOM；cargo fmt 仅 src/main.rs。
-- **跨端影响（§2.10-D）**：纯 macOS 平台代码，对 Windows 零影响。
-- **红线遵守**：未碰 windows/**/macos/overlay.rs/mod.rs/Cargo.toml；未用 git 破坏命令；未出包/改版本号。
-- **详情**：`collab/outbox/coder-1/result.md`（非空）
-
-## 2026-08-05 — coder-1 — MACOS-P4-OVERLAY-001 macOS 录音浮层 1:1 复刻 Windows（P0）
-
-- **来源**：主控任务单 MACOS-P4-OVERLAY-001（Recording 状态 P0）。基线 HEAD `5e49poise`（工作区未提交）
-- **改动**：新增 `src/platform/macos/overlay.rs`（NSPanel 透明浮层 + 自定义 NSView `drawRect:` + core-graphics 绘制 + 16ms CFRunLoopTimer 60fps + 三态指示灯 + 32 柱中心对称波形 + 圆角边框/分隔条/停止按钮）+ `src/bin/probe_overlay.rs`（临时验证 bin，`#[path]` 引入被测模块不经 mod.rs）
-- **验证**：cargo check --all-targets 0 errors；cargo test 全绿（主 crate 816 + probe 13，overlay 新增 5 条单测）；`cargo run --bin probe_overlay` 实测浮层显示正常、59.1/59.0 fps 稳定；git diff --numstat windows 空
-- **边界**：未碰 windows/**、main.rs（macos_stubs 保留）、macos/mod.rs、macos/tray.rs、Cargo.toml、版本号、Publish、ui/、src-tauri/
-- **下游**：OVERLAY-002 需实现 Processing/FocusLost/Error 三态；后续接线 main.rs 时 macos_stubs 的 OverlayCommand/OverlayRequest/OverlayThreadHandle 应替换为真实 RecordingOverlay 调用
-- **详情**：`collab/outbox/coder-1/result.md`（非空）+ logs/20260804.md + CHANGELOG.md + docs/MACOS-HANDOFF.md §2.10-E
-
-## 2026-08-05 — coder-1 — MACOS-P4-OVERLAY-WIRE-001 ✅ 录音浮层接线（Phase 4「完整体验」最后一块）
-
-- **来源**：主控派发，基线 HEAD `d7b9f39`（工作区干净）。把 OVERLAY-001 交付的孤儿 overlay.rs 接进 run_controller_macos 的 PipelineEvent 消费路径
-- **方案协商**：提 1 点异议（§3.A.3 vs §5 矛盾，platform/mod.rs 导出）。主控裁定补丁 R1 允许，仿 TRAY-001 模式加独立 macOS cfg 块，三条硬约束（不碰 Windows 块/不进共享清单/poll 不导出）。其余全同意
-- **改动 5 文件**：macos/mod.rs（mod overlay + 导出）/ macos/overlay.rs（OverlayRequest + PENDING_REQUEST + OVERLAY_LEVELS + thread_local OVERLAY + init/request/poll/shutdown 四函数 + 摘 hide/is_visible 的 allow）/ macos/event_loop.rs（timer callback 加 poll）/ platform/mod.rs（macOS cfg 块导出，Windows 块零触碰）/ main.rs（init_overlay_levels + handle_pipeline_event 七分支 request_overlay + shutdown_overlay + 订正注释）
-- **关键设计**：线程模型照搬 tray（任意线程 request→Mutex / 主线程 15ms timer poll 消费）；生命周期 B（Show→new 含 16ms timer / Hide→destroy invalidate）；thread_local 规避不 Send/Sync；levels Arc::clone 保留供多次 Show 复用
-- **验证**：cargo check --all-targets 0 errors（如实列 dead code warning 为 OVERLAY-002 保留）；cargo test 821/0/6（platform::macos::overlay 5 条单测首次真实运行，--list grep overlay=14）；cargo fmt clean；git diff windows 空；platform/mod.rs 自证仅 macOS cfg 块
-- **实机降级**：CT2 dylib 缺失致 dyld 加载失败（docs/MACOS-HANDOFF §3.1/§五已记，非本任务引入），未用 osascript 模拟（任务书禁止）。静态走查确认路径完整可达
-- **边界**：仅 5 文件；Windows/Cargo.toml/版本号/Publish/ui/src-tauri 零触碰；未 build --release/出包/npm；未用 git 破坏命令；未建临时 probe；UTF-8 无 BOM
-- **下游**：实机闭环需 CT2 dylib 部署（tester-1 出包时）或 Gavin 物理热键端测；OVERLAY-002 接入后 dead code warning 自然消除；macos_stubs 的旧 Overlay 占位本轮未删（归 OVERLAY-002 或清理单）
-- **详情**：result.md + logs/20260805.md + CHANGELOG.md
-
-## 2026-08-05 — coder-1 — MACOS-P4-CFGGATE-001 ✅ 修 macOS 专用函数缺 cfg 门控致 Windows 编译必炸（P0）
-
-- **来源**：主控取证，WIRE-001 验收通过后查出。基线 WIRE-001 工作区未提交
-- **缺陷**：src/main.rs handle_hotkey_event(:2880)/handle_pipeline_event(:2930) 无 cfg 门控，后者引用 request_tray_state(7处,TRAY-001既有)/request_overlay(7处,WIRE-001新增)/OverlayRequest(7处) Windows 侧均不存在必 E0425。WIRE-001 把违规点1变8
-- **改动**：1 文件 2 行，两函数各加 #[cfg(target_os="macos")]。安全性：唯一调用点在 cfg(macos) run_controller_macos 内
-- **B 项扫描**：11 macOS专属符号逐个判定，唯一漏网=handle_pipeline_event 已修；反向扫描无交叉
-- **验证**：cargo check 0 err / cargo test --no-fail-fast 821/0/6 / fmt clean / git diff windows 空
-- **C 项实机**：主控纠正 CT2 dylib 确在 target/release，DYLD_LIBRARY_PATH 指向后 debug 二进制启动链完整 RUNNING 零 panic、kill -INT 干净退出。浮层 Show/Hide 降级（无法物理按键），需 Gavin 亲按 F6
-- **边界**：仅 src/main.rs 2 行；未 build --release/出包/npm；未用 git 破坏命令；UTF-8 无 BOM
-- **详情**：result.md + logs/20260805.md + CHANGELOG.md
-
-## 2026-08-05 — coder-1 — MACOS-P4-OVERLAY-WIRE-002 ✅ 抽出七分支纯函数使真值表可测
-
-- **来源**：tester-1 预研建议，主控采纳。基线 CFGGATE-001 后工作区
-- **改动 2 文件**：main.rs 新增 overlay_request_for_event 纯函数（穷举 match 无通配符）+ handle_pipeline_event 改 match 前统一调一次；overlay.rs OverlayRequest derive 加 PartialEq/Eq
-- **验证**：cargo check 0err / cargo test --no-fail-fast 821/0/6(与基线逐数一致) / fmt clean / git diff windows 空 / 行为等价自证七分支一致
-- **边界**：仅 main.rs + overlay.rs derive；未碰 injection.rs(coder-2 AXINJECT 域)；未写测试(tester-1 阶段三)；未出包/改版本号/npm；UTF-8 无 BOM
-- **下游**：tester-1 可对 overlay_request_for_event 落 7 条成对真断言锁死接线核心逻辑
-- **详情**：result.md + logs/20260805.md + CHANGELOG.md
-
-## 2026-08-05 — coder-1 — MACOS-P4-OVERLAY-WIRE-003 ✅ 修 poll_pending_overlay 注释声称 try-lock 但实现是阻塞 lock
-
-- **来源**：主控取证，注释-实现不符。基线 WIRE-002 后工作区
-- **方案**：A（改实现对齐注释）。timer 回调结构上不可能阻塞 > 实测通常不阻塞
-- **改动**：1 文件 1 行 + 注释。overlay.rs PENDING_REQUEST.lock()→try_lock()；OVERLAY_LEVELS.lock() 保持阻塞加注释说明
-- **验证**：cargo check 0err / cargo test --no-fail-fast 821/0/6(与基线一致) / fmt clean / 本轮仅动 overlay.rs(injection.rs 是 coder-2 并行)
-- **边界**：仅 overlay.rs；未碰 injection.rs/main.rs/Cargo.toml/windows；未写测试；未出包/改版本号/npm；UTF-8 无 BOM
-- **下游**：overlay.rs 已腾出，tester-1 阶段三可开始
-- **详情**：result.md + logs/20260805.md + CHANGELOG.md
-
-## 2026-08-05 — coder-1 — MACOS-P4-SCENE-001 ✅ 场景感知真实现（stub → real）+ foreground_window_id 真实现
-
-- **来源**：任务书 MACOS-P4-SCENE-001 + 主控补丁 R1（D 项）。基线 WIRE-003 后工作区
-- **改动 3 文件**：新建 `src/platform/macos/scene.rs`（AX+proc_pidpath+NSWorkspace msg_send）；`mod.rs` 接线 + stub 改委托 + `foreground_window_id()` 真实现；`scene-rules.toml` 每个 exe 数组纯追加 macOS 可执行名
-- **关键决策**：NSWorkspace feature 未启用（禁改 Cargo.toml）且任务书 D-1 方法名有误 → 用 objc2 `msg_send` 动态调 `sharedWorkspace.frontmostApplication.processIdentifier`，失败降级 AX；AX 常量是 `#define CFSTR` 宏非导出符号 → 改 `CFString::new` 字面量；D-2 用 pid 定位消除「切窗口取错场景」局限
-- **实测证据**：临时探针 7 个 App 真实 (exe,title)（Safari/Code/Microsoft Word/Claude/Terminal/Microsoft Edge/Xcode），classify 14 用例全命中；探针跑完已删
-- **验证**：cargo check 0 err / cargo test **827/2/6** / fmt clean / toml 9 scenes 合法 / git diff windows 空
-- **🔴 2 failed 绊线（D-3 预期）**：`foreground_window_id_returns_zero_in_first_version`（left=824≠0）+ `capture_scene_signals_by_id_returns_none_for_zero_id`（不再恒 None）。未改测试，归 tester-1
-- **🔴 行为变更（D-4 报 Gavin）**：focus_lost 从恒 false 变真实生效，录音途中切窗口→文本改走 FocusLost 分支
-- **边界**：仅 3 允许文件；未碰 main.rs/overlay.rs/injection.rs/Cargo.toml/windows/platform/mod.rs；未出包/改版本号/npm；UTF-8 无 BOM
-- **下游（TOML-STALE-001）**：scene-rules.toml 三副本（根/target/release/Publish）出包必须同步，归 tester-1
-- **详情**：outbox/coder-1/result.md + logs/20260805.md + CHANGELOG.md
-
-## 2026-08-05 — coder-1 — MACOS-P4-SCENE-002 ✅ 焦点身份 pid → CGWindowID（窗口级）
-
-- **来源**：Gavin 指令（「力度必须要提到窗口级」）。基线 SCENE-001 交付后
-- **改动 1 文件**：仅 `src/platform/macos/scene.rs`。`foreground_window_id()` 返 CGWindowID（frontmost pid + CGWindowList + layer==0 过滤）；`capture_scene_signals(id)` id 语义 pid→CGWindowID（`window_id_to_owner_pid` 反查，找不到降级实时查 frontmost）
-- **关键决策**：用 core-graphics 0.25 `copy_window_info` 现有 API；不读 `kCGWindowName`（屏幕录制权限，红线）；`dict?` 陷阱修复（continue 非提前返回）；mod.rs 无需改（一行委托已存在）
-- **实测证据**：Terminal 同 pid 双窗口（2230/690）AXRaise 切换 → foreground_window_id 正确变化（**窗口级决定性证据**）；56 窗含 12 个非 0 layer 被排除；B 项时序 id=690 切前台后仍取原窗口 exe/title；不存在 id 降级
-- **验证**：cargo check 0 err（scene）/ cargo test **836/1/6** / fmt clean / 本轮仅 scene.rs
-- **🔴 1 failed 非本任务引入**：`overlay_wire_tests`（coder-2 在途，Processing→ShowProcessing 语义）。中途 `foreground_window_id_contract` 红（tester-1 存活 pid 断言因 SCENE-002 pid→CGWindowID 暂过期），终态已通过（tester-1 换锚完成）
-- **🔴 行为变更（报 Gavin）**：同应用多窗口切窗口 `focus_lost` 现在能正确判出（此前 pid 相同判不出）
-- **边界**：仅 scene.rs；未碰 mod.rs/main.rs/overlay.rs/injection.rs/Cargo.toml/windows；未读 kCGWindowName/未用私有 API/未写测试；探针已删；UTF-8 无 BOM
-- **下游**：foreground_window_id_contract 换锚已确认通过；主控协调 coder-2 overlay 并行冲突（overlay_wire_tests 仍红）
-- **详情**：outbox/coder-1/result.md + logs/20260805.md + CHANGELOG.md
-
-## 2026-08-05 — coder-2 — MACOS-P4-BUNDLE-001 ✅ .app 打包 + Info.plist + 自签名（本地调试，不做公证）
-
-- **来源**：主控 16:09 派发（16:10 ACK，本 session replace 后完成）。
-- **改动 2 文件**：新建 `scripts/Info.plist`（CFBundleIdentifier=com.feiyin.voice-ime / LSUIElement=true / TCC 四条声明：麦克风·辅助功能·输入监控·AppleEvents）+ 重写 `scripts/build-macos.sh`。
-- **关键设计**：
-  - 新增 Tauri UI release 构建（`--features custom-protocol`，防空白页）+ cp 到 target/release（补原脚本缺口）
-  - Step4 打包 `dist/飞音智能语音输入.app`：三二进制 + 7 dylib + itn/scene-rules + models + icon.icns
-  - **dylib 解析关键**：主程序无 LC_RPATH → `install_name_tool -add_rpath @loader_path`；codesign 必须在 install_name_tool 之后
-  - models 两模式：默认 symlink 指向仓库（本地省 1.8G，宽松验证）；`--copy-models` 复制进 bundle（严格验证，可分发）
-  - 版本号从 Cargo.toml 单一来源，PlistBuddy 副本上同步
-- **验证**：bash -n / plutil -lint / /tmp 实测 dylib 加载 + ad-hoc 签名 + verify 全 PASS（详见 result.md）
-- **边界**：未碰 Rust 源码 / src-tauri / ui / Cargo.toml / 版本号 / Publish；未 build --release（归 tester-1）；未用 git 破坏命令；UTF-8 无 BOM
-- **下游**：tester-1 可 `bash scripts/build-macos.sh` 全链出包；⚠️ ad-hoc 重签后 TCC 授权需重新授权（§4-4）
-- **详情**：`/Users/gavinsun/Workspace/CodeLab/collab/outbox/coder-2/result.md`（非空）
-
-## 2026-08-05 — coder-2 — MACOS-P4-BUNDLE-002 ✅ 签名改自签名证书（ad-hoc → Feiyin Dev）
-
-- **来源**：主控返工任务书（BUNDLE-001 其余已验收）。Gavin 拍板禁止 ad-hoc（cdhash 变 → TCC 授权失效）。
-- **改动 1 文件**：`scripts/build-macos.sh`。① `CODESIGN_IDENTITY` 可配置（默认 Feiyin Dev）② 证书检查去 `-v`（GUI 自签名证书 NOT_TRUSTED，`-v` 会误判不存在）③ 去 `--deep` 改先内后外 + `--timestamp=none` ④ 无证书明确报错禁止退化 ad-hoc ⑤ 文件头注释同步。
-- **额外修复**：`.toml` 数据文件原放 MacOS/ → codesign 外层签名报 "code object is not signed at all"；改放 Resources/ + MacOS/ 内相对 symlink（itn/scene-rules），签名 exit 0 + strict verify 过 + 运行时 exe_dir 可读。
-- **密码框问题**：GUI 创建证书后私钥 ACL 不含 codesign → 弹框。解法 `security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k <登录密码> login.keychain-db`，之后全链免密。
-- **实机验证**：用户跑 `bash scripts/build-macos.sh` Build completed；`dist/飞音智能语音输入.app` Authority=**Feiyin Dev**（非 adhoc）✅ Identifier=com.feiyin.voice-ime ✅ verify OK ✅ 二次重签 TCC 稳定 ✅。
-- **边界**：只改 build-macos.sh；未碰 Info.plist/src/**/Cargo.toml/版本号/Publish；未用 git 破坏命令；UTF-8 无 BOM。
-- **详情**：`/Users/gavinsun/Workspace/CodeLab/collab/outbox/coder-2/result.md`（非空）

@@ -1119,3 +1119,42 @@ Gavin 原话是「万层如果能**被亿整除**就升到亿」。严格数学�
 - **`cargo tree -i winit` 实测存档**：winit 0.30.13 确在依赖树内，但来源是 `eframe 0.29.1 → voice-ime`，而 `eframe`/`egui` 全仓**唯一使用者是 `src/crash/reporter.rs`**（crash-reporter 的 GUI），与 tray-icon 及管线代码无关。
 - **Windows 侧影响**：**零**。Windows 继续走 Win32 消息循环，本决策只新增 macOS 实现。
 - **决策时间**：2026-08-04
+
+---
+
+## DEC-047 · 「是否含标点」的判据全子系统统一：词内嵌豁免，不另立「句子级标点」分类
+
+**背景**（PUNCT-GOVERNANCE-030-A-2，2026-08-08）
+
+`src/transcription/mod.rs:279` 长期把 Qwen3 在线 ASR 的 `native_punctuated` **硬编码为 `true`**。主控核实阿里云官方文档后确认：`qwen3-asr-flash-realtime` 的 `session.update` 确无任何标点参数（只有 `modalities` / `input_audio_format` / `sample_rate` / `input_audio_transcription.{language,corpus}` / `turn_detection`），**源头关不掉成立**；但「模型必定输出标点」是假设而非事实 —— 短句/单词场景常无尾标点。假设为假时 `main.rs:3569` 的 `!native_punctuated` 门控会**跳过标点引擎**，用户开着自动标点开关却拿不到标点。
+
+改为实测后暴露判据问题：直接用 `punctuation::is_punctuation` 扫描，`3.14` 的小数点会被判成标点。
+
+**两个候选方案**
+
+| | 主控初版 | coder-2 反提案（**采纳**） |
+| --- | --- | --- |
+| 思路 | 新增 `has_sentence_punctuation`：全角标点即判定；半角终结符仅在句末位置（后接空白或结尾）才算；引号括号一律不算 | 新增 `has_effective_punctuation`：对 `PUNCT_CHARS` **全集合**统一施加「词内嵌豁免」—— 标点字符两侧都是 ASCII 字母/数字则视为嵌入字符，不计；任一无夹持的标点出现即 true |
+| 同族覆盖 | 分类式，按字符类别列举 | 一条规则同时豁免 `3.14` 的 `.`、`don't` 的 `'`、`3:30` 的 `:` |
+
+**决策：采纳 coder-2 方案。**
+
+**原因**（主控被说服，原方案撤回）：
+
+1. **不引入第二套分类**。初版凭空造出「句子级标点 vs 字符级标点」两个概念，本质是在同一子系统里维护两套「什么算标点」的定义。
+2. **检测器与剥离器口径统一**（决定性理由）。`strip_punctuation` 本就有 ASCII 夹持保护，采纳后两个函数对同一字符给出同一答案；初版会让检测器说「不是标点」而剥离器说「是」，子系统内口径分裂 —— 这正是本次 030 治理批次要消除的东西。
+3. 同族覆盖等价，实现更小。
+
+**已知接受边界**（记录在案，不得当 bug 重修）：
+
+| 输入 | 本决策口径 | 初版口径 | 裁定 |
+| --- | --- | --- | --- |
+| `他说“好”`（中文引号，无句号） | `true` → 跳过标点引擎 | `false` → 走引擎补句号 | **接受本决策口径** —— 引号无句号不是用户会报的缺陷，两方案真实撞到的三个同族均已覆盖 |
+| `https://…` | `:` 右侧为 `/` 单侧夹持 → 计为标点 | 同 | 接受，与 `strip_punctuation` 对 `:` 的保守口径一致，语音转写出 URL 概率近零 |
+| `３.１４`（全角数字） | 两侧非 ASCII → 不豁免 → `true` | — | 只报不改，与半角行为不一致，优先级低 |
+
+**适用范围限制**：本轮 `has_effective_punctuation` **只在 `transcription` 的 Qwen3 分支使用**，不替换其他调用点（扩大改动面会让零回归验证失去判别力）。`accuracy native`（`:439`）与 `performance`（`:446`）两分支的标记各有依据，不动。
+
+**跨平台**：`src/transcription/mod.rs` 与 `src/punctuation/mod.rs` 均为平台中立模块，macOS 编译同一份代码，`run_pipeline_core` 已去平台化 → **两端同时生效**，须记入 `docs/MACOS-HANDOFF.md`。
+
+**决策时间**：2026-08-08

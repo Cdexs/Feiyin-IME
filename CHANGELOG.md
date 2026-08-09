@@ -583,4 +583,8 @@ HOTKEY-LATENCY-FIX-001 | 热键录音视觉延迟 + 偶发首字丢失修复：�
 
 ## 2026-08-08
 
-| LLM-CONN-POOL-028 | LLM 连接池僵尸连接修复（Gavin 端测触发）：reqwest client 只设 connect_timeout，吃默认 pool_idle_timeout=90s；DeepSeek 服务端 keep-alive ~60s → 60-90s 窗口内死连接复用即 0ms 失败（实测失败点 62.5/67.9/72.3/72.8s 吻合）。`src/llm/mod.rs`：①新增 POOL_IDLE_TIMEOUT=30s（< keep-alive 余量）+ builder .pool_idle_timeout ②重试判据 +e.is_request()（Kind::Request 桶覆盖连接复用失败，其余桶独立不误吞）③新增 fmt_error_chain 打印完整 source chain，三处日志改用。`src-tauri/src/llm.rs` 镜像同三处。cargo fmt clean / cargo check 0err / src-tauri check 0err / llm:: 131/0 / src-tauri 53/0。未出包 | coder-1 | 2026-08-08 |
+| LLM-CONN-POOL-028 | LLM 连接池僵尸连接修复（Gavin 端测触发）：reqwest client 只设 connect_timeout，兜底 pool_idle_timeout=90s；DeepSeek 服务端 keep-alive ~60s → 60-90s 窗口内死连接复用即 0ms 失败（实测失败点 62.5/67.9/72.3/72.8s 吻合）。`src/llm/mod.rs`：①新增 POOL_IDLE_TIMEOUT=30s（< keep-alive 余量）+ builder .pool_idle_timeout ②重试判据 +e.is_request() ③新增 fmt_error_chain。`src-tauri/src/llm.rs` 镜像。llm:: 131/0 / src-tauri 53/0。未出包 | coder-1 | 2026-08-08 |
+
+## 2026-08-09
+
+| TEST-EXEC-030 | **030 全批 + 031 全量回归执行（阶段四，只跑不改）**：A0 起点自证（HEAD d2ee6b3；`cargo fmt --check` clean；`cargo check --all-targets` 0 error）→ A1 itn:: 225/0 → A2 punctuation:: 43/0 → A3 transcription:: 105/0/4 → A4 llm:: 140/0 → A5 主 crate 全量 958/0/8 → A6 src-tauri 53/0 → A7 `--list` 自洽（30+900+3+12+10+2+9=966 == 实跑 958+8=966），**零 FAIL，无红条**。四族零回归专项逐条实测全绿：① 017 重量链（`一斤二两`→`1斤2两`/`二两半`→`2.5两`/`两斤`→`2斤`）② 026 货币链（`五块一斤`→`5块一斤`/`八角`→`8角`/`五块一`→`5.1元`/`三块四毛八一斤`→`3.48元一斤`）③ 027 DEC-042 大额（`一千零四十六万八千七百四十一`→`10468741`/`一亿两千三百四十五万六千七百八十九`→`123456789`/`三亿五`→`3.5亿`）④ 031 万一守卫 13 固定词全保汉字 + 12 放行组零回归 + 跨模块 5 条。**itn:: 实跑双口径 225**（裁定基准：handoffs 的 212 失效，以 225 为准；221→225 来自 TEST-SYNC-030/030-B +4）。结论：**无阻塞项，可进入 BUILD-015（待主控下达出包指令）**。Vitest/pytest 本批 SKIP（零前端零 UI 改动）。A0 曾报 14 文件行尾 M，主控独立取证为 CRLF/LF 噪声放行，未处理（[CRLF-CROSSPLAT-001]）。零生产代码改动 | tester-1 | 2026-08-09 |
