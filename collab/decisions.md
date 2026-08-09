@@ -1158,3 +1158,49 @@ Gavin 原话是「万层如果能**被亿整除**就升到亿」。严格数学�
 **跨平台**：`src/transcription/mod.rs` 与 `src/punctuation/mod.rs` 均为平台中立模块，macOS 编译同一份代码，`run_pipeline_core` 已去平台化 → **两端同时生效**，须记入 `docs/MACOS-HANDOFF.md`。
 
 **决策时间**：2026-08-08
+
+---
+
+## DEC-048 · 阶段三（TEST-SYNC）开命令白名单：只放 `cargo fmt` + `cargo check`
+
+**背景**（2026-08-09 Gavin 拍板）
+
+五阶段测试工作流中，阶段三 TEST-SYNC 原本**禁止执行任何命令**，`cargo check` 也在禁止之列。
+后果是 tester-1 **交付前不可能自查** —— 连括号配没配对都无从知道。
+
+**2026-08-08 PUNCT-GOVERNANCE-030 一批之内，同一根因引爆三次，且逐次升级**：
+
+| # | 任务 | 后果 |
+| --- | --- | --- |
+| ① | TEST-SYNC-030 | 代码非 rustfmt-clean，被后续 coder 的 `cargo fmt` 连带归一，污染两个 commit 的 diff |
+| ② | 同上 | 同上 |
+| ③ | TEST-SYNC-030-B | `src/llm/mod.rs:4776` 多一个 `}`，**整个 crate 编译失败**，靠主控提交前 `cargo check` 才发现 |
+
+**决策：开白名单例外，只允许 `cargo fmt` 与 `cargo check`（含 `--all-targets`）两条命令。**
+
+**原因**
+
+1. **与规则要防的风险无关**。阶段三禁令要防的是「测到半成品、拿到假结果」与「提前出包」。
+   `cargo fmt` 只格式化、`cargo check` 只做类型检查，**都不执行测试、不产出二进制**。
+2. **禁止它们直接导致交付物编译不过** —— 规则本身在制造它要防的那类问题。
+3. 代价近零：`cargo check` 约 13–50s。
+
+**边界（写成白名单而非「允许只读命令」的理由）**
+
+| 允许 | 禁止 |
+| --- | --- |
+| `cargo fmt` | `cargo test`（含任何过滤参数） |
+| `cargo check` / `cargo check --all-targets` | `cargo build` / `cargo build --release` |
+| | 其余一切执行类命令 |
+
+**只有上面两个命令名可用，不做推广解释。** 若写成「允许只读命令」，
+「我只是 check 一下」会滑向「我顺手跑个测试」，口子守不住。
+
+**连带修正**：项目级 `.claude/CLAUDE.md` 第 3 节此前写作「三阶段」且**阶段一为并行**
+（代码任务与 TEST-SYNC 同时派发），与 `worker-guide.md` 2026-05-05 起执行的
+「五阶段禁止并行」**长期冲突**。本次一并改正为五阶段全串行，以该节为准。
+
+**落地位置**：`.claude/CLAUDE.md` §3 ｜ `collab/docs/worker-guide.md` §二-3
+｜ `collab/docs/task-book-template.md` 常备红线表
+
+**决策时间**：2026-08-09
