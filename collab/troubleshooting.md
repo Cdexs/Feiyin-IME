@@ -2462,7 +2462,12 @@ Gavin 端测：说「比如…再比如…还有就是…」这类无序枚举�
 | ④ | LLM 是否输出了列表 | ❌ **LLM 自己没做** | `completion_tokens=44`，响应文本与输入逐字近乎相同 |
 | ⑤ | 是否被后处理剥掉 | ❌ 不是 | `LLM response text` → `LLM optimized` → `Injecting text` **三行完全一致** |
 
-**为什么 030 全批在结构上不可能是元凶**：030-A/B/C 的每一处提示词改动都挂在
+> 🔴 **2026-08-14 二次更正（Gavin 追问触发）**：下面这段「030 全批结构性排除」的结论
+> **不完全成立**。主控当时只核对了「分支结构有没有变」，**没核对常量本体有没有变**。
+> 逐常量比对后发现 **`ADD_PUNCT` 被 030 批次（`94bfb0b`）改过，而它走的正是 `true` 分支**。
+> 完整比对见本节末「与 08-03 成功实验的逐字比对」。以下段落保留原文以存问责链。
+
+**为什么 030 的这三处在结构上不可能是元凶**：030-A/B/C 的这三处提示词改动挂在
 `punctuation_enabled == false` 分支上 ——
 
 - `src/llm/mod.rs:414` L2 槽位：`true → ADD_PUNCT`（**原常量未动**），030-B 只把 false 分支从留空改为 `NO_PUNCT`
@@ -2518,9 +2523,79 @@ macOS 端 `f96c817` 的新版同步进包。已 `git diff f96c817^ f96c817 -- sc
 **这也顺带解释了「无序标记处在临界点」这个老观察**：临界点是**模型能力的临界点**，
 它会随模型能力整体平移，但不会消失。换更强的模型只是把线往外推。
 
-**下次实验必须带上的对照**：IN-D 在 `deepseek-v4-pro` 与更强模型上的表现差异 ——
-若更强模型能过，则「能力边界」结论进一步夯实，路线就是继续升模型而非改提示词；
-若更强模型也过不去，则说明 IN-D 触发的是**另一类机制**，与 IN-B/C 不同源。
+### 九、与 08-03 成功实验的逐字比对（2026-08-14，Gavin 追问「确认提示词模块有没有问题」）
+
+**Gavin 的判据很准**：他以前在 `deepseek-v4-pro` 上测过、无序列表是正常出的，
+现在同一个模型不出了。那么只要证明**提示词逐字未变**，就能把责任归到模型侧；
+若变了，责任在我们。于是做了完整比对。
+
+**基线锚点先定死**：阶段六模型探测实验的产物时间戳为 `08-03 23:24/23:28`，
+当天三个提交（`4c8f830` 16:50 / `fe69f23` 17:28 / `7a1329e` 18:46）**全部早于它**。
+故「成功时的提示词」= **`7a1329e`**。比对区间 `7a1329e..HEAD`。
+
+**⚠️ 先排除一个假线索**：`collab/research/scene_f4_document.txt`（08-03 快照）只有 442 字符，
+今天日志里的 F4 块是 985 字符，看似「场景块膨胀一倍」。**这是假象** ——
+该快照是从截断的日志行抠出来的，正文停在 `split into list lines — use \` 处，本身就是残的。
+**不可作为判据。** 正确做法是走 git 历史。
+
+#### 比对结果（`punctuation_enabled = true` 路径）
+
+| 组件 | 结果 | 判据 |
+| --- | --- | --- |
+| F4 场景块（`scene-rules.toml` 的 `kind = "doc"` style） | ✅ **完全相同** | `4c8f830` 与 `HEAD` 的该 style 行 md5 均为 `12cdec618a848d10a8392e40953dbd26`，1042 字节 |
+| F3 列表规则块（`f3_rules_text`） | ✅ **渲染结果相同** | 函数体确实改了，但改动是**纯参数化**：写死的 `"买了3斤土豆、一个西瓜…"`、`"今天出去买菜了…"`、`INLINE_SEPARATOR_RULES` 被抽成 `{}` 占位符，而 `true` 分支填回去的**正是同一批字面量** |
+| `INLINE_SEPARATOR_RULES` | ✅ 相同 | md5 `bfb2a1c3f55d` |
+| `META_RULE_PRECEDENCE` | ✅ 相同 | |
+| `UNIT_SYMBOL_PROTECTION` / `_TRANSLATE` | ✅ 相同 | |
+| `CODESWITCH_FIX` | ✅ 相同 | |
+| `SUGGESTION_INSTRUCTION` | ✅ 相同 | |
+| `USER_PREFS_HEADER` | ✅ 内容相同 | 仅 rustfmt 换行重排，字符串正文逐字未变 |
+| 分层装配逻辑 | ✅ 结构等价 | 旧 `if punctuation_enabled { push(ADD_PUNCT) }` → 新 `push(if punctuation_enabled {ADD_PUNCT} else {NO_PUNCT})`，`true` 时行为相同 |
+| **`ADD_PUNCT`** | 🔴 **变了** | 见下 |
+
+#### 🔴 唯一的实质变化：`ADD_PUNCT` 多了一句
+
+```diff
+- "Punctuation: Add appropriate punctuation marks based on semantic context and sentence
+-  boundaries (commas, periods, question marks, exclamation marks as appropriate)."
++ "Punctuation: Add appropriate punctuation marks based on semantic context and sentence
++  boundaries (commas, periods, question marks, exclamation marks as appropriate).
++  Also correct punctuation the ASR may have inserted incorrectly or might be missing:
++  fix it so the text reads naturally."
+```
+
+**引入提交**：`94bfb0b`（2026-08-08，`PUNCT-GOVERNANCE-030 标点子系统治理 + ITN-FIX-WANYI-031`）
+—— **就是 Gavin 一开始怀疑的那批**。`git log -S` 定位，唯一命中。
+
+**所以准确结论是**：
+
+> 从 08-03 成功实验到 2026-08-14 失败，在自动标点开启的路径上，
+> **整个系统提示词有且仅有这一处实质文字变化**，它出自 030 批次。
+> Gavin 的怀疑方向**部分成立**，主控最初的「030 全批排除」结论**过宽，已更正**。
+
+**⚠️ 仍未证实的是因果**：这句话讲的是标点修正，**字面上与列表无关**。
+但它落在 L2 层、且带有「fix it so the text reads naturally」这种偏向「顺滑成文」的措辞，
+**是否会把模型推向散文形态、压制列表化 —— 没有实验证据，不得当成结论。**
+
+#### 下一步：一个能一锤定音的实验（成本极低）
+
+固定模型 `deepseek-v4-pro`、固定输入（IN-D 买菜句）、固定其余提示词，**只切换这一句**：
+
+| 组 | `ADD_PUNCT` | 跑几次 |
+| --- | --- | --- |
+| A | 带新加的那句（现状） | 3 |
+| B | 去掉那句（回到 08-03 原文） | 3 |
+
+- **B 出列表、A 不出** → 就是这句话干的，责任在我们，改回或改写即可
+- **A/B 都不出** → 提示词侧清白，责任在模型侧输出不稳定，与 IN-B/IN-C 一并交给「能力边界」结论
+- **A/B 都出** → 说明 IN-D 的失败本身不稳定（偶发），需先加大重复次数再谈机制
+
+**补充对照（同批做掉，边际成本近乎为零）**：把 IN-B / IN-C 也跑一遍 A/B ——
+它们在 08-03 的 v4-pro 上是 3/3 成功的**已知基准**，若今天 A 组它们也退化了，
+则「这句话导致回归」的证据强度立刻拉满；若它们今天仍 3/3，则问题范围收窄到 IN-D 这类输入。
+
+**原「下次实验必须带上的对照」仍然有效**：IN-D 在 `deepseek-v4-pro` 与更强模型上的表现差异 ——
+但**优先级排在上面这个 A/B 之后**，因为 A/B 能直接判定责任归属，而换模型只能给出规避方案。
 
 ---
 
