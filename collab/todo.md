@@ -49,6 +49,40 @@
 
 ---
 
+## 🔄 进行中 · TEST-PROMPT-AB-033 `ADD_PUNCT` 单变量 A/B（2026-08-14 派发 tester-1）
+
+> **来路**：Gavin 08-14 端测「无序枚举不出列表」+ 追问「以前 v4-pro 能出，同一模型现在不能，
+> 要确认是提示词模块的问题还是模型侧不稳定」。
+
+**主控已完成逐组件比对（`7a1329e`→`HEAD`，`punctuation_enabled=true` 路径）**：
+除 `ADD_PUNCT` 外**全部逐字未变**（scene doc style md5 `12cdec61…` 相同；`f3_rules_text`
+改动为纯参数化、true 分支填回同一批字面量；其余常量与分层装配等价）。
+
+🔴 **唯一实质变化**：`ADD_PUNCT` 被 `94bfb0b`（030 批次）加了一句
+`Also correct punctuation the ASR may have inserted incorrectly or might be missing:
+fix it so the text reads naturally.` —— **Gavin 怀疑方向部分成立，主控原「030 全批排除」结论已更正**。
+
+**实验设计（24 次调用，模型锁死 `deepseek-v4-pro`）**：
+
+| 组 | SCENE_F4 | ADD_PUNCT | 输入 | 次数 | 回答什么 |
+| --- | --- | --- | --- | --- | --- |
+| G0 | ❌ | 旧 | IN-B/IN-C | 各 3 | **模型侧是否漂移**（复刻 08-03，当时 3/3） |
+| G1 | ✅ doc | 新 | IN-D/IN-B/IN-C | 各 3 | 今天线上真实表现 |
+| G2 | ✅ doc | 旧 | IN-D/IN-B/IN-C | 各 3 | 只回退那一句是否恢复 |
+
+> 🔴 **G0 是关键组**：`harness_025f.py` 的 `build_sys_prompt()` **没拼 `SCENE_F4`**，
+> 即 08-03 成功实验不含场景块、今天生产含 —— 这是第二个混淆变量，不设 G0 就会把两变量混在一起。
+
+**保真度门禁**：G1 组装长度须对齐生产实测 `system_prompt (len=22055)`，偏差 >±5% 须停下报告。
+
+**红线**：零生产代码改动（`git status -- src/` 结束须为空）、禁出包、禁 git 破坏性命令、
+禁换模型、不得只给汇总表（须贴原始输出）。
+
+**判定表已写入任务书**，结论按表下，不自由发挥。任务书：`collab/inbox/tester-1/task.md`（9005B，两处路径已同步）。
+**文件域**：仅 `collab/research/`，与 032（`src/itn.rs`）零重叠，coder-1/coder-2 空闲未占用。
+
+---
+
 ## 📋 待派发 · ITN-IDIOM-COVER-032 量级单位字成语零覆盖（2026-08-09 主控取证发现）
 
 > **来路**：`examples/probe_031.rs`（031 临时探测程序）删除前，主控核查其覆盖词的测试情况时发现。
