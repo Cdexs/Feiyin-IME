@@ -1271,3 +1271,78 @@ Gavin 原话：「**先保持现状：吃不准的不走列表化处理，避免
   08-14 0/3）是**独立问题**，本决策不涉及。是否上回归看门测试待定
 - **场景块是正向变量**（同日同模型：无场景块 IN-B 0/3、含场景块 3/3）机制未明，
   本决策不涉及
+
+---
+
+## DEC-050 · 流式上屏走 overlay 浮层预览，**否决 TSF 组合文本（TIP）路线**
+
+**日期**：2026-08-14 ｜ **决策人**：Gavin ｜ **依据**：`RESEARCH-TSF-036`
+
+### 背景
+
+换用 `qwen-audio-3.0-asr-flash-streaming` 流式 ASR 后，目标是
+「**边录边显示，最终格式优化输出**」。Gavin 初始设想用**「组合文本」（Composition Text）**
+模拟系统输入法的预输入效果 —— 在目标应用光标处显示带下划线的未提交文本，
+松开热键后整段送 LLM 格式化，再正式注入。
+
+**该设想的架构优点成立**：组合文本是「未提交」态，替换它不算重写已提交内容，
+用户心智与系统输入法一致，且 **LLM 仍拿整段优化，F3 跨句能力完整保留**。
+
+### 可行性调研结论（主控已用微软官方文档独立复核）
+
+**跨进程插入 TSF 组合文本，必须注册成活动 TIP（Text Input Processor），
+且用户必须把系统输入法切换到飞音。** 官方原文（[TSF Architecture](https://learn.microsoft.com/en-us/windows/win32/tsf/architecture)）：
+
+> "A text service is implemented as a **COM in-proc server** that registers itself with TSF.
+> **When registered, the user interacts with the text service using the language bar or keyboard shortcuts.**"
+>
+> "A text service **never interacts directly with an application**. All communication passes through
+> the TSF manager. The TSF manager is implemented by the operating system and **cannot be replaced**."
+
+绕开路径亦全部堵死：`ImmSetCompositionString`（IMM32）同样要求飞音是活动 IME；
+UI Automation 的 `TextPattern` / `ValuePattern` 是辅助功能 API，只能读写**最终文本**，无组合态。
+
+**顺带纠错**：Gavin 引用的「VoxType 在 Windows 上用此机制」不成立 ——
+[VoxType](https://voxtype.io/) 是 Linux/macOS 项目；Windows 上的近名项目
+（[cubhe/VoiceType](https://github.com/cubhe/VoiceType)、微软商店 Voice Type）
+均为「松开后粘贴到活动输入框」，非 TSF 组合文本。**无现成 Windows 参考实现。**
+
+### 决策
+
+**走 overlay 浮层预览（方案丙），否决 TIP 路线。** 并**复用现有录音 overlay 窗口**。
+
+### 原因
+
+1. 🔴 **崩溃影响面不可接受**。TIP 是 in-proc COM 组件，会被加载进
+   Word / Chrome / VS Code。**飞音一个 panic 可能带走用户正在写的文档**。
+   当前形态下飞音崩了只需重启托盘，两者风险量级完全不同。
+2. **产品形态被迫改变**。绿色 exe 免安装保不住，须改为安装包 + 注册表注册 + 代码签名，
+   且 32/64 位各出一套（老应用加载 32 位 TIP）。
+3. **附带工程沉重**。TIP 必须做**全键盘透传**，否则用户切到飞音后无法正常打字。
+4. **交互倒退**。用户必须先把系统输入法切到飞音才生效，与现有「托盘常驻 + 全局热键即用」
+   的零摩擦体验冲突（DEC-004）。
+5. **收益有限**。Gavin 的目标表述是「边录边**显示**」，overlay 完全满足；
+   TIP 的增量收益仅为「预览位置从浮层挪到光标处」，与上述代价不成比例。
+
+### 影响
+
+- **不注册 TIP，不引入 TSF 依赖**，`src/platform/windows/` 无新增 COM 组件
+- 预览改由**现有 overlay 窗口**承载，交互设计见 `DESIGN-OVERLAY-037`
+- **最终注入路径不变**：松开热键 → 整段送 LLM 格式化 → 注入到 `target_hwnd`
+  —— 与现有管线一致，`F3` 跨句格式化能力**不受任何削弱**
+- **PoC 不做**：核心问题已由官方架构文档直接回答，PoC 只能重复验证已知答案
+
+### 🔴 由本决策引出的新设计约束（`DESIGN-OVERLAY-037` 处理）
+
+overlay 现以 `WS_EX_NOACTIVATE` 创建（`src/main.rs:632`），**刻意不能获焦** ——
+因为 `target_hwnd` 在热键按下时用 `GetForegroundWindow()` 抓取（`:1907`/`:2909`），
+overlay 抢焦点会使注入失去目标。
+
+而 Gavin 要求「用户可在 overlay 中键入光标并手动编辑」，**这必须能获焦**。
+两者对撞，解法与降级（尤其**目标为管理员权限进程时 UIPI 限制导致无法 `SetForegroundWindow`**）
+由 037 给出。
+
+### 未来若要重提 TIP 路线
+
+**先读本条**。除非以下前提之一发生变化，否则不重开调研：
+① Windows 提供了 out-of-proc 的 TIP 宿主机制；② 产品定位主动改为「真·输入法」并接受宿主崩溃风险。
