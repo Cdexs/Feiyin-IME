@@ -1,0 +1,102 @@
+{
+  "call_count": 12,
+  "sys_prompt_len": 17616,
+  "results": {
+    "deepseek-v4-pro": {
+      "IN-B": [
+        {
+          "content": "<corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。\n- 有些同学下课之后徘徊在校园里不走，三五成群。\n- 有的同学烫发、染黄头发、染头发，这个不符合校规。\n- 有的同学不遵守课堂纪律，顶撞老师。\n上面的现象都是一些不好的，希望大家听到了之后要及时纠正。</corrected>",
+          "finish_reason": "stop",
+          "prompt_tokens": 4966,
+          "completion_tokens": 77,
+          "latency_ms": 1716.6
+        },
+        {
+          "content": "<corrected>\n今天的讲话是要指出我们现在学校里面出现的一些现象。\n- 有些同学下课之后徘徊在校园里不走，三五成群。\n- 有的同学烫发、染黄头发、染头发，这个不符合校规。\n- 有的同学不遵守课堂纪律，顶撞老师。\n上面的现象都是一些不好的，希望大家听到了之后要及时纠正。\n</corrected>",
+          "finish_reason": "stop",
+          "prompt_tokens": 4966,
+          "completion_tokens": 78,
+          "latency_ms": 2203.9
+        },
+        {
+          "content": "<corrected>\n今天的讲话是要指出我们现在学校里面出现的一些现象。\n- 有些同学下课之后徘徊在校园里不走，三五成群。\n- 有的同学烫发、染黄头发、染头发，这个不符合校规。\n- 有的同学不遵守课堂纪律，顶撞老师。\n上面的现象都是一些不好的，希望大家听到了之后要及时纠正。\n</corrected>",
+          "finish_reason": "stop",
+          "prompt_tokens": 4966,
+          "completion_tokens": 78,
+          "latency_ms": 1835.0
+        }
+      ],
+      "IN-C": [
+        {
+          "content": "<corrected>\n我现在就要说出我们公司的一些不好的现象：\n- 有的同事迟到早退，不遵守公司的规章制度\n- 有的上班时间摸鱼玩手机\n- 还有的同事呢，就是工作的这个成果呀不及时提交，不及时审核，造成了一定的损失\n\n上面这些啊都需要注意。\n</corrected>",
+          "finish_reason": "stop",
+          "prompt_tokens": 4947,
+          "completion_tokens": 68,
+          "latency_ms": 2556.5
+        },
+        {
+          "content": "<corrected>\n我现在就要说出我们公司的一些不好的现象：\n- 有的同事迟到早退，不遵守公司的规章制度\n- 有的上班时间摸鱼玩手机\n- 有的同事工作成果不及时提交，不及时审核，造成了一定的损失\n上面这些都需要注意。\n</corrected>",
+          "finish_reason": "stop",
+          "prompt_tokens": 4947,
+          "completion_tokens": 61,
+          "latency_ms": 1790.7
+        },
+        {
+          "content": "<corrected>\n我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度，比如还有的上班时间摸鱼玩手机，还有的同事呢就是，工作的这个成果不及时提交，不及时审核，造成了一定的损失，上面这些都需要注意。\n</corrected>",
+          "finish_reason": "stop",
+          "prompt_tokens": 4947,
+          "completion_tokens": 63,
+          "latency_ms": 2172.5
+        }
+      ]
+    },
+    "deepseek-v4-flash": {
+      "IN-B": [
+        {
+          "content": "<corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如说，有些同学下课之后徘徊在校园里不走，三五成群。还有，有的同学烫发、染黄头发，这个不符合校规。比如还有，有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希望大家听到了之后要及时纠正。</corrected>",
+          "finish_reason": "stop",
+          "prompt_tokens": 4966,
+          "completion_tokens": 75,
+          "latency_ms": 1325.3
+        },
+        {
+          "content": "<corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如有些同学下课之后徘徊在校园里不走，三五成群。还有，比如有的同学烫发、染黄头发、染头发，这个不符合校规。比如还有，有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希望大家听到了之后要及时纠正。</corrected>",
+          "finish_reason": "stop",
+          "prompt_tokens": 4966,
+          "completion_tokens": 78,
+          "latency_ms": 1757.4
+        },
+        {
+          "content": "<corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如，有些同学下课之后徘徊在校园里不走，三五成群。还有，有的同学烫发、染黄头发，这不符合校规。再比如，有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希望大家听到了之后要及时纠正。</corrected>",
+          "finish_reason": "stop",
+          "prompt_tokens": 4966,
+          "completion_tokens": 75,
+          "latency_ms": 1043.5
+        }
+      ],
+      "IN-C": [
+        {
+          "content": "<corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>",
+          "finish_reason": "stop",
+          "prompt_tokens": 4947,
+          "completion_tokens": 57,
+          "latency_ms": 1092.7
+        },
+        {
+          "content": "<corrected>我现在就要说出我们公司的一些不好的现象：\n- 有的同事迟到早退，不遵守公司的规章制度\n- 有的上班时间摸鱼玩手机\n- 有的同事工作成果不及时提交、不及时审核，造成了一定的损失\n\n上面这些都需要注意。</corrected>",
+          "finish_reason": "stop",
+          "prompt_tokens": 4947,
+          "completion_tokens": 60,
+          "latency_ms": 1523.1
+        },
+        {
+          "content": "<corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>",
+          "finish_reason": "stop",
+          "prompt_tokens": 4947,
+          "completion_tokens": 57,
+          "latency_ms": 1235.3
+        }
+      ]
+    }
+  }
+}

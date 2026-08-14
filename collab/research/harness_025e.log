@@ -1,0 +1,177 @@
+BASE SYS prompt_len=17616
+  V10 prompt_len=17616
+  V11 prompt_len=17840
+  V12 prompt_len=17840
+
+============================================================
+VARIANT V10 -- prompt_len=17616
+============================================================
+  [V10][IN-A] run 1/3... OK fr=stop pt=4923 ct=43 cls=bullet
+    RAW: <corrected>建议从以下方面入手：\n- 英语学习要多读多背\n- 多听一些视频的节目\n- 多出去和别人交流，增长自己的口语能力</corrected>
+  [V10][IN-A] run 2/3... OK fr=stop pt=4923 ct=43 cls=bullet
+    RAW: <corrected>建议从以下方面入手：\n- 英语学习要多读多背\n- 多听一些视频的节目\n- 多出去和别人交流，增长自己的口语能力</corrected>
+  [V10][IN-A] run 3/3... OK fr=stop pt=4923 ct=43 cls=bullet
+    RAW: <corrected>建议从以下方面入手：\n- 英语学习要多读多背\n- 多听一些视频的节目\n- 多出去和别人交流，增长自己的口语能力</corrected>
+  [V10][IN-B] run 1/3... OK fr=stop pt=4966 ct=85 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如有些同学下课之后徘徊在校园里不走，三五成群。还有，比如有的同学烫发、染黄头发，这个不符合校规。比如还有，有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，
+  [V10][IN-B] run 2/3... OK fr=stop pt=4966 ct=75 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如有些同学下课之后徘徊在校园里不走，三五成群。还有，比如有的同学烫发、染黄头发，这个不符合校规。比如还有，有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，
+  [V10][IN-B] run 3/3... OK fr=stop pt=4966 ct=75 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如有些同学下课之后徘徊在校园里不走，三五成群。还有，比如有的同学烫发、染黄头发，这不符合校规。再比如，有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希望
+  [V10][IN-C] run 1/3... OK fr=stop pt=4947 ct=58 cls=para
+    RAW: <corrected>\n我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。\n</correcte
+  [V10][IN-C] run 2/3... OK fr=stop pt=4947 ct=57 cls=para
+    RAW: <corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>
+  [V10][IN-C] run 3/3... OK fr=stop pt=4947 ct=57 cls=para
+    RAW: <corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>
+  [V10][C1] run 1/3... OK fr=stop pt=4919 ct=41 cls=ordered
+    RAW: <corrected>现在有三点现象要注意：\n1. 程序会崩溃退出。\n2. 输出的字符都是乱字符。\n3. 运行一段时间之后就会异常报错。</corrected>
+  [V10][C1] run 2/3... OK fr=stop pt=4919 ct=41 cls=ordered
+    RAW: <corrected>现在有三点现象要注意：\n1. 程序会崩溃退出\n2. 输出的字符都是乱字符\n3. 运行一段时间之后就会异常报错</corrected>
+  [V10][C1] run 3/3... OK fr=stop pt=4919 ct=41 cls=ordered
+    RAW: <corrected>现在有三点现象要注意：\n1. 程序会崩溃退出。\n2. 输出的字符都是乱码。\n3. 运行一段时间之后就会异常报错。</corrected>
+  [V10][C2] run 1/3... OK fr=stop pt=4896 ct=21 cls=para
+    RAW: <corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>
+  [V10][C2] run 2/3... OK fr=stop pt=4896 ct=21 cls=para
+    RAW: <corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>
+  [V10][C2] run 3/3... OK fr=stop pt=4896 ct=21 cls=para
+    RAW: <corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>
+  [V10][C3] run 1/3... OK fr=stop pt=4919 ct=41 cls=inline
+    RAW: <corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、一斤半的西瓜，还有八斤的土豆。</corrected>
+  [V10][C3] run 2/3... OK fr=stop pt=4919 ct=42 cls=inline
+    RAW: <corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、还有一斤半的西瓜、还有八斤的土豆。</corrected>
+  [V10][C3] run 3/3... OK fr=stop pt=4919 ct=42 cls=inline
+    RAW: <corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、还有一斤半的西瓜、还有八斤的土豆。</corrected>
+  [V10][C4] run 1/3... OK fr=stop pt=4909 ct=33 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象，就是有些同学不遵守课堂纪律，这个问题很严重，希望大家注意。</corrected>
+  [V10][C4] run 2/3... OK fr=stop pt=4909 ct=33 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象，就是有些同学不遵守课堂纪律，这个问题很严重，希望大家注意。</corrected>
+  [V10][C4] run 3/3... OK fr=stop pt=4909 ct=33 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象，就是有些同学不遵守课堂纪律，这个问题很严重，希望大家注意。</corrected>
+
+============================================================
+VARIANT V11 -- prompt_len=17840
+============================================================
+  [V11][IN-A] run 1/3... OK fr=stop pt=5035 ct=52 cls=bullet
+    RAW: <corrected>建议从以下方面入手：\n- 英语学习要多读多背\n- 多听一些视频的节目\n- 多出去和别人交流，增长自己的口语能力</corrected>\n{"suggestions":["口语"]}
+  [V11][IN-A] run 2/3... OK fr=stop pt=5035 ct=43 cls=bullet
+    RAW: <corrected>建议从以下方面入手：\n- 英语学习要多读多背\n- 多听一些视频的节目\n- 多出去和别人交流，增长自己的口语能力</corrected>
+  [V11][IN-A] run 3/3... OK fr=stop pt=5035 ct=43 cls=bullet
+    RAW: <corrected>建议从以下方面入手：\n- 英语学习要多读多背\n- 多听一些视频的节目\n- 多出去和别人交流，增长自己的口语能力</corrected>
+  [V11][IN-B] run 1/3... OK fr=stop pt=5078 ct=74 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如说有些同学下课之后徘徊在校园里不走，三五成群；再比如有的同学烫发、染黄头发、染头发，这个不符合校规；还有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希
+  [V11][IN-B] run 2/3... OK fr=stop pt=5078 ct=74 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如说有些同学下课之后徘徊在校园里不走，三五成群；再比如有的同学烫发、染黄头发、染头发，这个不符合校规；还有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希
+  [V11][IN-B] run 3/3... OK fr=stop pt=5078 ct=72 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如有些同学下课之后徘徊在校园里不走，三五成群；还有的同学烫发、染黄头发、染头发，这个不符合校规；还有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希望大家
+  [V11][IN-C] run 1/3... OK fr=stop pt=5059 ct=57 cls=para
+    RAW: <corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>
+  [V11][IN-C] run 2/3... OK fr=stop pt=5059 ct=57 cls=para
+    RAW: <corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>
+  [V11][IN-C] run 3/3... OK fr=stop pt=5059 ct=57 cls=para
+    RAW: <corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作的成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>
+  [V11][C1] run 1/3... OK fr=stop pt=5031 ct=51 cls=ordered
+    RAW: <corrected>现在有三点现象要注意：\n1. 程序会崩溃退出\n2. 输出的字符都是乱码\n3. 运行一段时间之后就会异常报错</corrected>\n{"suggestions":["乱码"]}
+  [V11][C1] run 2/3... OK fr=stop pt=5031 ct=41 cls=ordered
+    RAW: <corrected>现在有三点现象要注意：\n1. 程序会崩溃退出\n2. 输出的字符都是乱码\n3. 运行一段时间之后就会异常报错</corrected>
+  [V11][C1] run 3/3... OK fr=stop pt=5031 ct=41 cls=ordered
+    RAW: <corrected>现在有三点现象要注意：\n1. 程序会崩溃退出\n2. 输出的字符都是乱字符\n3. 运行一段时间之后就会异常报错</corrected>
+  [V11][C2] run 1/3... OK fr=stop pt=5008 ct=21 cls=para
+    RAW: <corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>
+  [V11][C2] run 2/3... OK fr=stop pt=5008 ct=21 cls=para
+    RAW: <corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>
+  [V11][C2] run 3/3... OK fr=stop pt=5008 ct=21 cls=para
+    RAW: <corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>
+  [V11][C3] run 1/3... OK fr=stop pt=5031 ct=42 cls=inline
+    RAW: <corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、还有一斤半的西瓜、还有八斤的土豆。</corrected>
+  [V11][C3] run 2/3... OK fr=stop pt=5031 ct=42 cls=inline
+    RAW: <corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、还有一斤半的西瓜、还有八斤的土豆。</corrected>
+  [V11][C3] run 3/3... OK fr=stop pt=5031 ct=42 cls=inline
+    RAW: <corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、还有一斤半的西瓜、还有八斤的土豆。</corrected>
+  [V11][C4] run 1/3... OK fr=stop pt=5021 ct=33 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象，就是有些同学不遵守课堂纪律，这个问题很严重，希望大家注意。</corrected>
+  [V11][C4] run 2/3... OK fr=stop pt=5021 ct=33 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象，就是有些同学不遵守课堂纪律，这个问题很严重，希望大家注意。</corrected>
+  [V11][C4] run 3/3... OK fr=stop pt=5021 ct=33 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象，就是有些同学不遵守课堂纪律，这个问题很严重，希望大家注意。</corrected>
+
+============================================================
+VARIANT V12 -- prompt_len=17840
+============================================================
+  [V12][IN-A] run 1/3... OK fr=stop pt=5035 ct=52 cls=bullet
+    RAW: <corrected>建议从以下方面入手：\n- 英语学习要多读多背\n- 多听一些视频的节目\n- 多出去和别人交流，增长自己的口语能力</corrected>\n{"suggestions":["口语"]}
+  [V12][IN-A] run 2/3... OK fr=stop pt=5035 ct=53 cls=bullet
+    RAW: <corrected>建议从以下方面入手：\n- 英语学习要多读多背\n- 多听一些视频的节目\n- 多出去和别人交流，增长自己的口语能力</corrected>\n{"suggestions":["口语能力"]}
+  [V12][IN-A] run 3/3... OK fr=stop pt=5035 ct=43 cls=bullet
+    RAW: <corrected>建议从以下方面入手：\n- 英语学习要多读多背\n- 多听一些视频的节目\n- 多出去和别人交流，增长自己的口语能力</corrected>
+  [V12][IN-B] run 1/3... OK fr=stop pt=5078 ct=72 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如说有些同学下课之后徘徊在校园里不走，三五成群；还有的同学烫发、染黄头发、染头发，这个不符合校规；还有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希望大
+  [V12][IN-B] run 2/3... OK fr=stop pt=5078 ct=72 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如说有些同学下课之后徘徊在校园里不走，三五成群；还有的同学烫发、染黄头发、染头发，这个不符合校规；还有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希望大
+  [V12][IN-B] run 3/3... OK fr=stop pt=5078 ct=74 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如说有些同学下课之后徘徊在校园里不走，三五成群；再比如有的同学烫发、染黄头发、染头发，这个不符合校规；还有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希
+  [V12][IN-C] run 1/3... OK fr=stop pt=5059 ct=57 cls=para
+    RAW: <corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>
+  [V12][IN-C] run 2/3... OK fr=stop pt=5059 ct=70 cls=bullet
+    RAW: <corrected>我现在就要说出我们公司的一些不好的现象：\n- 有的同事迟到早退，不遵守公司的规章制度\n- 有的上班时间摸鱼玩手机\n- 有的同事工作成果不及时提交，不及时审核，造成了一定的损失\n\n上面这些都需要注意。</cor
+  [V12][IN-C] run 3/3... OK fr=stop pt=5059 ct=57 cls=para
+    RAW: <corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>
+  [V12][C1] run 1/3... OK fr=stop pt=5031 ct=41 cls=ordered
+    RAW: <corrected>现在有三点现象要注意：\n1. 程序会崩溃退出\n2. 输出的字符都是乱码\n3. 运行一段时间之后就会异常报错</corrected>
+  [V12][C1] run 2/3... OK fr=stop pt=5031 ct=41 cls=ordered
+    RAW: <corrected>现在有三点现象要注意：\n1. 程序会崩溃退出\n2. 输出的字符都是乱字符\n3. 运行一段时间之后就会异常报错</corrected>
+  [V12][C1] run 3/3... OK fr=stop pt=5031 ct=41 cls=ordered
+    RAW: <corrected>现在有三点现象要注意：\n1. 程序会崩溃退出\n2. 输出的字符都是乱字符\n3. 运行一段时间之后就会异常报错</corrected>
+  [V12][C2] run 1/3... OK fr=stop pt=5008 ct=21 cls=para
+    RAW: <corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>
+  [V12][C2] run 2/3... OK fr=stop pt=5008 ct=21 cls=para
+    RAW: <corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>
+  [V12][C2] run 3/3... OK fr=stop pt=5008 ct=21 cls=para
+    RAW: <corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>
+  [V12][C3] run 1/3... OK fr=stop pt=5031 ct=41 cls=inline
+    RAW: <corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、一斤半的西瓜，还有八斤的土豆。</corrected>
+  [V12][C3] run 2/3... OK fr=stop pt=5031 ct=41 cls=inline
+    RAW: <corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、一斤半的西瓜，还有八斤的土豆。</corrected>
+  [V12][C3] run 3/3... OK fr=stop pt=5031 ct=42 cls=inline
+    RAW: <corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、还有一斤半的西瓜、还有八斤的土豆。</corrected>
+  [V12][C4] run 1/3... OK fr=stop pt=5021 ct=33 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象，就是有些同学不遵守课堂纪律，这个问题很严重，希望大家注意。</corrected>
+  [V12][C4] run 2/3... OK fr=stop pt=5021 ct=33 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象，就是有些同学不遵守课堂纪律，这个问题很严重，希望大家注意。</corrected>
+  [V12][C4] run 3/3... OK fr=stop pt=5021 ct=33 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象，就是有些同学不遵守课堂纪律，这个问题很严重，希望大家注意。</corrected>
+
+
+Total API calls: 63
+Saved to: D:\Workspace\CodeLab\voice-ime\collab\research\prompt-f3-fix-verify-025e.json
+
+============================================================
+SUMMARY
+============================================================
+
+V10:
+  IN-A: 3b/0o/0p/0i = LIST [OK]
+  IN-B: 0b/0o/3p/0i = PARA [DEAD]
+  IN-C: 0b/0o/3p/0i = PARA [DEAD]
+  C1: 0b/3o/0p/0i = ORDERED [OK]
+  C2: 0b/0o/3p/0i = PARA [OK]
+  C3: 0b/0o/0p/3i = INLINE [OK]
+  C4: 0b/0o/3p/0i = PARA [OK]
+
+V11:
+  IN-A: 3b/0o/0p/0i = LIST [OK]
+  IN-B: 0b/0o/3p/0i = PARA [DEAD]
+  IN-C: 0b/0o/3p/0i = PARA [DEAD]
+  C1: 0b/3o/0p/0i = ORDERED [OK]
+  C2: 0b/0o/3p/0i = PARA [OK]
+  C3: 0b/0o/0p/3i = INLINE [OK]
+  C4: 0b/0o/3p/0i = PARA [OK]
+
+V12:
+  IN-A: 3b/0o/0p/0i = LIST [OK]
+  IN-B: 0b/0o/3p/0i = PARA [DEAD]
+  IN-C: 1b/0o/2p/0i = PARA [DEAD]
+  C1: 0b/3o/0p/0i = ORDERED [OK]
+  C2: 0b/0o/3p/0i = PARA [OK]
+  C3: 0b/0o/0p/3i = INLINE [OK]
+  C4: 0b/0o/3p/0i = PARA [OK]

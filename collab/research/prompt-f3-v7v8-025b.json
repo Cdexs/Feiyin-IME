@@ -1,0 +1,478 @@
+{
+  "baseline": {
+    "IN-B": [
+      {
+        "content": "<corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如有些同学下课之后徘徊在校园里不走，三五成群。还有，有的同学烫发、染黄头发，这个不符合校规。比如还有，有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希望大家听到了之后要及时纠正。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4966,
+        "completion_tokens": 74,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如，有些同学下课之后徘徊在校园里不走，三五成群。还有，有的同学烫发、染黄头发，这不符合校规。再比如，有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希望大家听到了之后要及时纠正。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4966,
+        "completion_tokens": 75,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如有些同学下课之后徘徊在校园里不走，三五成群。还有，比如有的同学烫发、染黄头发，这个不符合校规。比如还有，有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希望大家听到了之后要及时纠正。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4966,
+        "completion_tokens": 75,
+        "class": "para"
+      }
+    ],
+    "IN-C": [
+      {
+        "content": "<corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4947,
+        "completion_tokens": 57,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4947,
+        "completion_tokens": 57,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度，还有的上班时间摸鱼玩手机，还有的同事工作的成果不及时提交、不及时审核，造成了一定的损失，上面这些都需要注意。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4947,
+        "completion_tokens": 57,
+        "class": "para"
+      }
+    ]
+  },
+  "V7": {
+    "IN-B": [
+      {
+        "content": "<corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如有些同学下课之后徘徊在校园里不走，三五成群；还有的同学烫发、染黄头发，这不符合校规；还有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希望大家听到了之后要及时纠正。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4969,
+        "completion_tokens": 69,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如有些同学下课之后徘徊在校园里不走，三五成群。还有比如有的同学烫发、染黄头发，这个不符合校规。比如还有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希望大家听到了之后要及时纠正。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4969,
+        "completion_tokens": 72,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如有些同学下课之后徘徊在校园里不走，三五成群。还有比如有的同学烫发、染黄头发，这个不符合校规。比如还有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希望大家听到了之后要及时纠正。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4969,
+        "completion_tokens": 72,
+        "class": "para"
+      }
+    ],
+    "IN-C": [
+      {
+        "content": "<corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4950,
+        "completion_tokens": 57,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4950,
+        "completion_tokens": 57,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>我现在就要说出我们公司的一些不好的现象：\n- 有的同事迟到早退，不遵守公司的规章制度\n- 有的上班时间摸鱼玩手机\n- 有的同事工作成果不及时提交、不及时审核，造成了一定的损失\n\n上面这些都需要注意。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4950,
+        "completion_tokens": 60,
+        "class": "bullet"
+      }
+    ]
+  },
+  "V8": {
+    "IN-B": [
+      {
+        "content": "<corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如有些同学下课之后徘徊在校园里不走，三五成群。还有，比如有的同学烫发、染黄头发，这个不符合校规。比如还有，有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希望大家听到了之后要及时纠正。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4966,
+        "completion_tokens": 75,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如说，有些同学下课之后徘徊在校园里不走，三五成群。还有，比如有的同学烫发、染黄头发，这个不符合校规。再比如，有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希望大家听到了之后要及时纠正。</corrected>\n{\"suggestions\":[\"校规\"]}",
+        "finish_reason": "stop",
+        "prompt_tokens": 4966,
+        "completion_tokens": 86,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如有些同学下课之后徘徊在校园里不走，三五成群。还有，比如有的同学烫发、染黄头发、染头发，这个不符合校规。比如还有，有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希望大家听到了之后要及时纠正。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4966,
+        "completion_tokens": 78,
+        "class": "para"
+      }
+    ],
+    "IN-C": [
+      {
+        "content": "<corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4947,
+        "completion_tokens": 57,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4947,
+        "completion_tokens": 57,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4947,
+        "completion_tokens": 57,
+        "class": "para"
+      }
+    ]
+  },
+  "V7+V8": {
+    "IN-B": [
+      {
+        "content": "<corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如，有些同学下课之后徘徊在校园里不走，三五成群。还有，有的同学烫发、染黄头发，这不符合校规。再比如，有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希望大家听到了之后要及时纠正。</corrected>\n{\"suggestions\":[\"校规\"]}",
+        "finish_reason": "stop",
+        "prompt_tokens": 4969,
+        "completion_tokens": 85,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如有些同学下课之后徘徊在校园里不走，三五成群；还有的同学烫发、染黄头发，这不符合校规；还有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希望大家听到了之后要及时纠正。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4969,
+        "completion_tokens": 69,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如，有些同学下课之后徘徊在校园里不走，三五成群；还有，有的同学烫发、染黄头发，这不符合校规；再比如，有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，希望大家听到了之后要及时纠正。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4969,
+        "completion_tokens": 75,
+        "class": "para"
+      }
+    ],
+    "IN-C": [
+      {
+        "content": "<corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4950,
+        "completion_tokens": 57,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4950,
+        "completion_tokens": 57,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>我现在就要说出我们公司的一些不好的现象：\n- 有的同事迟到早退，不遵守公司的规章制度\n- 有的上班时间摸鱼玩手机\n- 有的同事工作成果不及时提交、不及时审核，造成了一定的损失\n\n上面这些都需要注意。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4950,
+        "completion_tokens": 60,
+        "class": "bullet"
+      }
+    ]
+  },
+  "baseline_C": {
+    "C1": [
+      {
+        "content": "<corrected>现在有三点现象要注意：\n1. 程序会崩溃退出。\n2. 输出的字符都是乱码。\n3. 运行一段时间之后就会异常报错。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4919,
+        "completion_tokens": 41,
+        "class": "ordered"
+      },
+      {
+        "content": "<corrected>现在有三点现象要注意：\n1. 程序会崩溃退出。\n2. 输出的字符都是乱字符。\n3. 运行一段时间之后就会异常报错。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4919,
+        "completion_tokens": 41,
+        "class": "ordered"
+      },
+      {
+        "content": "<corrected>现在有三点现象要注意：\n1. 程序会崩溃退出。\n2. 输出的字符都是乱码。\n3. 运行一段时间之后就会异常报错。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4919,
+        "completion_tokens": 41,
+        "class": "ordered"
+      }
+    ],
+    "C2": [
+      {
+        "content": "<corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4896,
+        "completion_tokens": 21,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4896,
+        "completion_tokens": 21,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4896,
+        "completion_tokens": 21,
+        "class": "para"
+      }
+    ],
+    "C3": [
+      {
+        "content": "<corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、还有一斤半的西瓜、还有八斤的土豆。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4919,
+        "completion_tokens": 42,
+        "class": "inline"
+      },
+      {
+        "content": "<corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、还有一斤半的西瓜、还有八斤的土豆。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4919,
+        "completion_tokens": 42,
+        "class": "inline"
+      },
+      {
+        "content": "<corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、还有一斤半的西瓜、还有八斤的土豆。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4919,
+        "completion_tokens": 42,
+        "class": "inline"
+      }
+    ]
+  },
+  "V7_C": {
+    "C1": [
+      {
+        "content": "<corrected>现在有三点现象要注意：\n1. 程序会崩溃退出。\n2. 输出的字符都是乱码。\n3. 运行一段时间之后就会异常报错。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4922,
+        "completion_tokens": 41,
+        "class": "ordered"
+      },
+      {
+        "content": "<corrected>现在有三点现象要注意：\n1. 程序会崩溃退出。\n2. 输出的字符都是乱字符。\n3. 运行一段时间之后就会异常报错。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4922,
+        "completion_tokens": 41,
+        "class": "ordered"
+      },
+      {
+        "content": "<corrected>现在有三点现象要注意：\n1. 程序会崩溃退出\n2. 输出的字符都是乱码\n3. 运行一段时间之后就会异常报错</corrected>\n{\"suggestions\":[\"乱码\"]}",
+        "finish_reason": "stop",
+        "prompt_tokens": 4922,
+        "completion_tokens": 51,
+        "class": "ordered"
+      }
+    ],
+    "C2": [
+      {
+        "content": "<corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4899,
+        "completion_tokens": 21,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4899,
+        "completion_tokens": 21,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4899,
+        "completion_tokens": 21,
+        "class": "para"
+      }
+    ],
+    "C3": [
+      {
+        "content": "<corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、还有一斤半的西瓜、还有八斤的土豆。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4922,
+        "completion_tokens": 42,
+        "class": "inline"
+      },
+      {
+        "content": "<corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、还有一斤半的西瓜、还有八斤的土豆。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4922,
+        "completion_tokens": 42,
+        "class": "inline"
+      },
+      {
+        "content": "<corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、还有一斤半的西瓜、还有八斤的土豆。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4922,
+        "completion_tokens": 42,
+        "class": "inline"
+      }
+    ]
+  },
+  "V8_C": {
+    "C1": [
+      {
+        "content": "<corrected>现在有三点现象要注意：\n1. 程序会崩溃退出。\n2. 输出的字符都是乱码。\n3. 运行一段时间之后就会异常报错。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4919,
+        "completion_tokens": 41,
+        "class": "ordered"
+      },
+      {
+        "content": "<corrected>现在有三点现象要注意：\n1. 程序会崩溃退出。\n2. 输出的字符都是乱码。\n3. 运行一段时间之后就会异常报错。</corrected>\n{\"suggestions\":[\"乱码\"]}",
+        "finish_reason": "stop",
+        "prompt_tokens": 4919,
+        "completion_tokens": 51,
+        "class": "ordered"
+      },
+      {
+        "content": "<corrected>现在有三点现象要注意：\n1. 程序会崩溃退出\n2. 输出的字符都是乱字符\n3. 运行一段时间之后就会异常报错</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4919,
+        "completion_tokens": 41,
+        "class": "ordered"
+      }
+    ],
+    "C2": [
+      {
+        "content": "<corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4896,
+        "completion_tokens": 21,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4896,
+        "completion_tokens": 21,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4896,
+        "completion_tokens": 21,
+        "class": "para"
+      }
+    ],
+    "C3": [
+      {
+        "content": "<corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、还有一斤半的西瓜、还有八斤的土豆。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4919,
+        "completion_tokens": 42,
+        "class": "inline"
+      },
+      {
+        "content": "<corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、还有一斤半的西瓜、还有八斤的土豆。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4919,
+        "completion_tokens": 42,
+        "class": "inline"
+      },
+      {
+        "content": "<corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、还有一斤半的西瓜、还有八斤的土豆。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4919,
+        "completion_tokens": 42,
+        "class": "inline"
+      }
+    ]
+  },
+  "V7+V8_C": {
+    "C1": [
+      {
+        "content": "<corrected>现在有三点现象要注意：\n1. 程序会崩溃退出\n2. 输出的字符都是乱码\n3. 运行一段时间之后就会异常报错</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4922,
+        "completion_tokens": 41,
+        "class": "ordered"
+      },
+      {
+        "content": "<corrected>现在有三点现象要注意：\n1. 程序会崩溃退出。\n2. 输出的字符都是乱码。\n3. 运行一段时间之后就会异常报错。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4922,
+        "completion_tokens": 41,
+        "class": "ordered"
+      },
+      {
+        "content": "<corrected>现在有三点现象要注意：\n1. 程序会崩溃退出。\n2. 输出的字符都是乱码。\n3. 运行一段时间之后就会异常报错。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4922,
+        "completion_tokens": 41,
+        "class": "ordered"
+      }
+    ],
+    "C2": [
+      {
+        "content": "<corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4899,
+        "completion_tokens": 21,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4899,
+        "completion_tokens": 21,
+        "class": "para"
+      },
+      {
+        "content": "<corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4899,
+        "completion_tokens": 21,
+        "class": "para"
+      }
+    ],
+    "C3": [
+      {
+        "content": "<corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、还有一斤半的西瓜、还有八斤的土豆。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4922,
+        "completion_tokens": 42,
+        "class": "inline"
+      },
+      {
+        "content": "<corrected>今天到菜场去买菜，买了好多菜：三斤土豆、两斤八两的番茄、一斤半的西瓜、还有八斤的土豆。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4922,
+        "completion_tokens": 40,
+        "class": "inline"
+      },
+      {
+        "content": "<corrected>今天到菜场去买菜，买了好多菜，然后三斤土豆、两斤八两的番茄、还有一斤半的西瓜、还有八斤的土豆。</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 4922,
+        "completion_tokens": 42,
+        "class": "inline"
+      }
+    ]
+  }
+}

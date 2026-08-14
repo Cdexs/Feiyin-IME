@@ -1,0 +1,27 @@
+{
+  "V9-full": {
+    "IN-A": [
+      {
+        "content": "<corrected>建议从以下方面入手：\n- 英语学习要多读多背\n- 多听视频节目\n- 多出去和别人交流</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 5059,
+        "completion_tokens": 36,
+        "class": "bullet"
+      },
+      {
+        "content": "<corrected>建议从以下方面入手：\n- 英语学习要多读多背\n- 多听视频节目\n- 多出去和别人交流</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 5059,
+        "completion_tokens": 36,
+        "class": "bullet"
+      },
+      {
+        "content": "<corrected>建议从以下方面入手：\n- 英语学习要多读多背\n- 多听视频节目\n- 多出去和别人交流</corrected>",
+        "finish_reason": "stop",
+        "prompt_tokens": 5059,
+        "completion_tokens": 36,
+        "class": "bullet"
+      }
+    ]
+  }
+}

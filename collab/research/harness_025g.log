@@ -1,0 +1,46 @@
+SYS prompt_len=17616
+
+============================================================
+MODEL deepseek-v4-pro
+============================================================
+  [deepseek-v4-pro][IN-B] run 1/3... lat=1716.6ms pt=4966 ct=77 fr=stop
+  [deepseek-v4-pro][IN-B] run 2/3... lat=2203.9ms pt=4966 ct=78 fr=stop
+  [deepseek-v4-pro][IN-B] run 3/3... lat=1835.0ms pt=4966 ct=78 fr=stop
+  [deepseek-v4-pro][IN-C] run 1/3... lat=2556.5ms pt=4947 ct=68 fr=stop
+  [deepseek-v4-pro][IN-C] run 2/3... lat=1790.7ms pt=4947 ct=61 fr=stop
+  [deepseek-v4-pro][IN-C] run 3/3... lat=2172.5ms pt=4947 ct=63 fr=stop
+
+============================================================
+MODEL deepseek-v4-flash
+============================================================
+  [deepseek-v4-flash][IN-B] run 1/3... lat=1325.3ms pt=4966 ct=75 fr=stop
+  [deepseek-v4-flash][IN-B] run 2/3... lat=1757.4ms pt=4966 ct=78 fr=stop
+  [deepseek-v4-flash][IN-B] run 3/3... lat=1043.5ms pt=4966 ct=75 fr=stop
+  [deepseek-v4-flash][IN-C] run 1/3... lat=1092.7ms pt=4947 ct=57 fr=stop
+  [deepseek-v4-flash][IN-C] run 2/3... lat=1523.1ms pt=4947 ct=60 fr=stop
+  [deepseek-v4-flash][IN-C] run 3/3... lat=1235.3ms pt=4947 ct=57 fr=stop
+
+
+Total API calls: 12
+
+============================================================
+LATENCY SUMMARY
+============================================================
+
+deepseek-v4-pro:
+  IN-B:
+    latency: min=1716.6ms / median=1835.0ms / max=2203.9ms
+    tokens:  prompt=4966 / completion=78
+  IN-C:
+    latency: min=1790.7ms / median=2172.5ms / max=2556.5ms
+    tokens:  prompt=4947 / completion=64
+
+deepseek-v4-flash:
+  IN-B:
+    latency: min=1043.5ms / median=1325.3ms / max=1757.4ms
+    tokens:  prompt=4966 / completion=76
+  IN-C:
+    latency: min=1092.7ms / median=1235.3ms / max=1523.1ms
+    tokens:  prompt=4947 / completion=58
+
+Saved to: D:\Workspace\CodeLab\voice-ime\collab\research\prompt-f3-model-latency-025g.json

@@ -1,0 +1,69 @@
+SYS prompt_len=17616
+
+============================================================
+MODEL deepseek-v4-pro (Priority target)
+============================================================
+  [deepseek-v4-pro][IN-B] run 1/3... pt=4966 ct=77 cls=bullet
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。\n- 有些同学下课之后徘徊在校园里不走，三五成群。\n- 有的同学烫发、染黄头发、染头发，这个不符合校规。\n- 有的同学不遵守课堂纪律，顶撞老师。\n上面的现象都是
+  [deepseek-v4-pro][IN-B] run 2/3... pt=4966 ct=77 cls=bullet
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。\n- 有些同学下课之后徘徊在校园里不走，三五成群。\n- 有的同学烫发、染黄头发、染头发，这个不符合校规。\n- 有的同学不遵守课堂纪律，顶撞老师。\n上面的现象都是
+  [deepseek-v4-pro][IN-B] run 3/3... pt=4966 ct=77 cls=bullet
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。\n- 有些同学下课之后徘徊在校园里不走，三五成群。\n- 有的同学烫发、染黄头发、染头发，这个不符合校规。\n- 有的同学不遵守课堂纪律，顶撞老师。\n上面的现象都是
+  → 3b/0o/0p
+  [deepseek-v4-pro][IN-C] run 1/3... pt=4947 ct=66 cls=bullet
+    RAW: <corrected>\n我现在就要说出我们公司的一些不好的现象：\n- 有的同事迟到早退，不遵守公司的规章制度\n- 有的上班时间摸鱼玩手机\n- 还有的同事呢，就是工作的这个成果不及时提交，不及时审核，造成了一定的损失\n上面这些都需要
+  [deepseek-v4-pro][IN-C] run 2/3... pt=4947 ct=61 cls=bullet
+    RAW: <corrected>\n我现在就要说出我们公司的一些不好的现象：\n- 有的同事迟到早退，不遵守公司的规章制度\n- 有的上班时间摸鱼玩手机\n- 有的同事工作成果不及时提交，不及时审核，造成了一定的损失\n上面这些都需要注意。\n</c
+  [deepseek-v4-pro][IN-C] run 3/3... pt=4947 ct=61 cls=bullet
+    RAW: <corrected>\n我现在就要说出我们公司的一些不好的现象：\n- 有的同事迟到早退，不遵守公司的规章制度\n- 有的上班时间摸鱼玩手机\n- 有的同事工作成果不及时提交，不及时审核，造成了一定的损失\n上面这些都需要注意。\n</c
+  → 3b/0o/0p
+  [deepseek-v4-pro][C2] run 1/3... pt=4896 ct=21 cls=para
+    RAW: <corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>
+  [deepseek-v4-pro][C2] run 2/3... pt=4896 ct=21 cls=para
+    RAW: <corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>
+  [deepseek-v4-pro][C2] run 3/3... pt=4896 ct=21 cls=para
+    RAW: <corrected>今天雨下得很大，比如早上那阵就特别急。</corrected>
+  → 0b/0o/3p
+  [deepseek-v4-pro][C4] run 1/3... pt=4909 ct=34 cls=para
+    RAW: <corrected>今天的讲话呢是要指出我们现在学校里面出现的一些现象，就是有些同学不遵守课堂纪律，这个问题很严重，希望大家注意。</corrected>
+  [deepseek-v4-pro][C4] run 2/3... pt=4909 ct=34 cls=para
+    RAW: <corrected>今天的讲话呢是要指出我们现在学校里面出现的一些现象，就是有些同学不遵守课堂纪律，这个问题很严重，希望大家注意。</corrected>
+  [deepseek-v4-pro][C4] run 3/3... pt=4909 ct=34 cls=para
+    RAW: <corrected>今天的讲话呢是要指出我们现在学校里面出现的一些现象，就是有些同学不遵守课堂纪律，这个问题很严重，希望大家注意。</corrected>
+  → 0b/0o/3p
+
+============================================================
+MODEL deepseek-chat (Light对照)
+============================================================
+  [deepseek-chat][IN-B] run 1/3... pt=4966 ct=75 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如有些同学下课之后徘徊在校园里不走，三五成群。还有，比如有的同学烫发、染黄头发，这个不符合校规。比如还有，有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好的，
+  [deepseek-chat][IN-B] run 2/3... pt=4966 ct=76 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如说，有些同学下课之后徘徊在校园里不走，三五成群。还有，比如有的同学烫发、染黄头发，这个不符合校规。比如还有，有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好
+  [deepseek-chat][IN-B] run 3/3... pt=4966 ct=76 cls=para
+    RAW: <corrected>今天的讲话是要指出我们现在学校里面出现的一些现象。比如说，有些同学下课之后徘徊在校园里不走，三五成群；还有，比如有的同学烫发、染黄头发，这个不符合校规；比如还有，有的同学不遵守课堂纪律，顶撞老师。上面的现象都是一些不好
+  → 0b/0o/3p
+  [deepseek-chat][IN-C] run 1/3... pt=4947 ct=57 cls=para
+    RAW: <corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>
+  [deepseek-chat][IN-C] run 2/3... pt=4947 ct=57 cls=para
+    RAW: <corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>
+  [deepseek-chat][IN-C] run 3/3... pt=4947 ct=57 cls=para
+    RAW: <corrected>我现在就要说出我们公司的一些不好的现象，比如有的同事迟到早退，不遵守公司的规章制度；还有的上班时间摸鱼玩手机；还有的同事工作成果不及时提交、不及时审核，造成了一定的损失。上面这些都需要注意。</corrected>
+  → 0b/0o/3p
+
+
+Total API calls: 18
+Saved to: D:\Workspace\CodeLab\voice-ime\collab\research\prompt-f3-model-probe-025f.json
+
+============================================================
+SUMMARY
+============================================================
+
+deepseek-v4-pro:
+  IN-B: 3b/0o/0p = LIST [OK]
+  IN-C: 3b/0o/0p = LIST [OK]
+  C2: 0b/0o/3p = PARA [OK]
+  C4: 0b/0o/3p = PARA [OK]
+
+deepseek-chat:
+  IN-B: 0b/0o/3p = PARA [UNEXPECTED]
+  IN-C: 0b/0o/3p = PARA [UNEXPECTED]

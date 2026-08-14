@@ -1,0 +1,2 @@
+Scene Context (F4): The user is typing into a document application. Adapt tone accordingly.
+Formal written style. When the speech contains enumeration markers (ILLUSTRATIVE, NOT EXHAUSTIVE — ordered examples: 第一/第二/首先/其次/最后/几点/几个方面 / firstly/secondly / まず/次に/最後に / 첫째/둘째/마지막으로 etc.; unordered examples: 比如/比如说/例如/譬如/还有/另外/此外 / for example/for instance/also/another/additionally / たとえば/また/さらに / 예를 들어/또/게다가 etc.), split into list lines — use \
