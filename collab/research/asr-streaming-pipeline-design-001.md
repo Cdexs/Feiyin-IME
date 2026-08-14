@@ -320,8 +320,8 @@ A→B 串行（同文件域 `src/transcription/`），C 可与 B 并行。
 ```
 src/wordbook/mod.rs  Wordbook::list_all() → Vec<WordEntry>
   → 按 source 分层权重：
-    source = "user"（手工添加）→ weight = 5
-    source = "system"（自动学习）→ weight = 4
+    source = "user"（手工添加，专名领域词）→ weight = 5
+    source = "system"（历史 bug 沉淀保护词，非自动学习）→ weight = 4
   → 长度过滤（见 4.2）
   → build vocabulary JSON: {"词1": 5, "词2": 4, ...}
   → run-task payload.parameters.vocabulary

@@ -847,3 +847,27 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 - 本批次（MACOS-COMPAT-001）已落地接缝：主程序侧 4 文件 + Tauri 侧（coder-2 并行任务）。编译验证 `cargo check` 0 errors（主控后台跑通，4m43s，86 warnings 无一条指向 platform/ 或 crash/）
 
 依据：`docs/MACOS-PORT-ASSESSMENT.md` §6 代码结构量化；`collab/handoffs.md` 2026-07-29 MACOS-COMPAT-001-CORE 条目。
+
+---
+
+## §ASR-038-A · Qwen-Audio-3.0 流式 ASR 模块新增（2026-08-14）
+
+### 改动范围
+
+| 文件 | 动作 | 平台中立？ |
+|---|---|---|
+| `src/transcription/qwen_inference.rs` | **新建** 1076 行 | ✅ 是（纯 Rust + tungstenite WS，无 Win32 API） |
+| `src/transcription/mod.rs` | `AsrModel` 枚举新增 `QwenAudioOnline` 变体 + `from_config` 映射 + `build_recognizer` match 分支 | ✅ 是 |
+| `src/config/mod.rs` | `AudioConfig` 新增 `qwen_asr_url` / `qwen_asr_model` 字段 + 默认值 | ✅ 是 |
+| `src/main.rs:3210` | `select_preprocessing_params` match 新增 `QwenAudioOnline` 或模式分支 | ⚠️ 在 `#[cfg(target_os="windows")]` 内，但改动是纯枚举 match 逻辑 |
+
+### 对 macOS 的影响
+
+1. **`AsrModel` 枚举新增变体**：macOS 侧消费 `AsrModel` 的 match 分支需同步——`build_recognizer`（`transcription/mod.rs:639`）已用或模式覆盖 `Qwen3Online | QwenAudioOnline`，macOS 编译同一份代码无需额外改动。
+2. **`AudioConfig` 新增字段**：`qwen_asr_url` / `qwen_asr_model` 带 `#[serde(default)]`，macOS 侧 `config.rs` 镜像（`src-tauri/src/config.rs`）需在批次 C 同步新增，本批未碰 `src-tauri/`。
+3. **`qwen_inference.rs` 平台中立**：模块内零 Win32 API 调用，依赖 `tungstenite`（跨平台 WS 客户端）+ `serde_json`，macOS 编译同一份代码可直接复用。
+4. **`main.rs:3210`**：`select_preprocessing_params` 在 `#[cfg(target_os="windows")]` 内，macOS 侧不编译此函数。但 `AsrModel` 枚举本身是平台中立的——macOS 侧若有 match `AsrModel` 的代码，编译器会要求覆盖新变体。本批已确认 `build_recognizer` 是 macOS 可达的唯一 match 点，已覆盖。
+
+### 结论
+
+**macOS 侧无需同步改动即可编译通过**（`AsrModel` 枚举的 match 已覆盖、config 字段带 serde default）。`src-tauri/src/config.rs` 的字段镜像属批次 C 任务，与本批解耦。

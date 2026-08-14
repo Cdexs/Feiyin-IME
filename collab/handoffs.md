@@ -2,6 +2,22 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-08-14 — coder-1 — ASR-038-A ✅ qwen_inference.rs 流式 ASR 模块实施（第一次动生产代码）
+
+- **来源**：RESEARCH-ASR-038 设计定稿 + 交叉复核通过。基线 HEAD `35a2a74`
+- **改动 4 文件**：
+  - `src/transcription/qwen_inference.rs` 新建 1076 行（Inference API 流式实现 + 45 单测）
+  - `src/transcription/mod.rs` +10/-5（AsrModel 枚举 + from_config + build_recognizer 或模式）
+  - `src/config/mod.rs` +19（qwen_asr_url/qwen_asr_model + serde default）
+  - `src/main.rs:3210` +3/-3（select_preprocessing_params 或模式，主控授权）
+- **验收**：cargo fmt clean / cargo check 0 error / cargo check --all-targets 0 error / 45 单测全绿
+- **热词**：user=5 / system=4，wordbook_candidates 表禁止注入，超限过滤防御保留
+- **language_hints**：固定 ["zh","en","ja","ko"]，不读 transcription_language（已废弃）
+- **遗留待批次 B**：select_preprocessing_params 的 silence_head/onset_backtrack 是批处理概念，流式下是否适用存疑
+- **跨端**：MACOS-HANDOFF.md §ASR-038-A 已追加，平台中立模块 macOS 无需同步改动
+- **版本号未动**（已是 0.8.0）
+- **详情**：outbox/coder-1/result.md + logs/20260814.md
+
 ## 2026-08-14 — coder-2 — DESIGN-OVERLAY-037 ✅ 流式预览 overlay 交互设计（纯设计零代码改动）
 
 - **来源**：Gavin 新交互架构（流式输出 + 组合文本预输入 + 松键后 LLM 格式化）。

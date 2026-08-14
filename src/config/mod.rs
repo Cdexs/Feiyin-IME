@@ -165,6 +165,15 @@ pub struct AudioConfig {
     /// 默认：qwen3-asr-flash-realtime
     #[serde(default = "default_qwen3_asr_model")]
     pub qwen3_asr_model: String,
+    /// Qwen-Audio-3.0 在线流式 ASR 服务 URL（RESEARCH-ASR-038，仅配置文件，不在 UI 显示）
+    /// 默认北京 region：wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference
+    /// WorkspaceId 取值与 qwen3_asr_url 一致（同一百炼账号同一 workspace）
+    #[serde(default = "default_qwen_asr_url")]
+    pub qwen_asr_url: String,
+    /// Qwen-Audio-3.0 在线流式 ASR 模型 ID（RESEARCH-ASR-038）
+    /// 默认：qwen-audio-3.0-asr-flash-streaming
+    #[serde(default = "default_qwen_asr_model")]
+    pub qwen_asr_model: String,
 }
 
 fn default_overlay_opacity() -> f32 {
@@ -183,6 +192,14 @@ fn default_qwen3_asr_model() -> String {
     "qwen3-asr-flash-realtime".to_string()
 }
 
+fn default_qwen_asr_url() -> String {
+    "wss://dashscope.aliyuncs.com/api-ws/v1/inference".to_string()
+}
+
+fn default_qwen_asr_model() -> String {
+    "qwen-audio-3.0-asr-flash-streaming".to_string()
+}
+
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
@@ -196,6 +213,8 @@ impl Default for AudioConfig {
             qwen3_api_key: String::new(),
             qwen3_asr_url: default_qwen3_asr_url(),
             qwen3_asr_model: default_qwen3_asr_model(),
+            qwen_asr_url: default_qwen_asr_url(),
+            qwen_asr_model: default_qwen_asr_model(),
         }
     }
 }

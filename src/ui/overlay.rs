@@ -69,6 +69,11 @@ pub fn push_level(buf: &AudioLevelBuf, rms: f32) {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OverlayStatus {
     Recording,
+    /// ASR-038-B: 录音中带流式预览文本（数据字段，渲染由 C-overlay 批实现）
+    /// production 端写入 streaming_text，消费端读取并绘制
+    RecordingWithText {
+        text: String,
+    },
     /// Waveform gravity-fall transition before showing Processing overlay.
     FallingToProcessing {
         message: String,

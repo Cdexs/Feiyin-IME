@@ -86,6 +86,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 #[derive(Debug, Clone)]
 enum PipelineEvent {
     RecordingStarted,
+    /// ASR-038-B: 流式 ASR 增量文本（display_text 全量，供 overlay 整段覆盖）
+    StreamingText(String),
     Processing(String),
     Done,
     Cancelled,
@@ -133,6 +135,9 @@ enum OverlayCommand {
 enum OverlayUiEvent {
     CancelRequested,
     PreviewCopied,
+    /// ASR-038-B: 用户点击 overlay 文本区进入编辑态（DESIGN-OVERLAY-037 §6）
+    /// ASR 侧接收后：关 WebSocket → 丢弃 StreamingAsrState → 置 pipeline_cancelled=true
+    EditRequested,
 }
 #[derive(Debug, Clone)]
 #[cfg(target_os = "windows")]
@@ -733,7 +738,7 @@ fn run_overlay_thread(
         if let Ok(mut state) = shared_state.lock() {
             if let Some(request) = state.request.clone() {
                 match request.status {
-                    OverlayStatus::Recording => {
+                    OverlayStatus::Recording | OverlayStatus::RecordingWithText { .. } => {
                         // recording state needs waveform refresh
                         if !MENU_VISIBLE.load(Ordering::Acquire) {
                             unsafe {
@@ -1003,7 +1008,7 @@ fn draw_overlay_to_dc(
 
     if let Some(request) = &state.request {
         match &request.status {
-            OverlayStatus::Recording => {
+            OverlayStatus::Recording | OverlayStatus::RecordingWithText { .. } => {
                 apply_overlay_window_region(hwnd, rect, None, true);
                 cancel_btn_rect = Some(draw_recording_overlay(
                     hdc,
@@ -1741,7 +1746,9 @@ fn draw_error_overlay(
 #[cfg(target_os = "windows")]
 fn overlay_geometry(status: &OverlayStatus) -> ([i32; 2], [i32; 2]) {
     let size = match status {
-        OverlayStatus::Recording => RECORDING_OVERLAY_SIZE,
+        OverlayStatus::Recording | OverlayStatus::RecordingWithText { .. } => {
+            RECORDING_OVERLAY_SIZE
+        }
         OverlayStatus::FallingToProcessing { .. } => RECORDING_OVERLAY_SIZE,
         OverlayStatus::Processing(_) => STATUS_OVERLAY_SIZE,
         OverlayStatus::FocusLost { .. } => PREVIEW_OVERLAY_SIZE,
@@ -1994,6 +2001,16 @@ fn process_controller_events(
                     OverlayStatus::Recording,
                 );
             }
+            PipelineEvent::StreamingText(text) => {
+                // ASR-038-B: 流式 ASR 增量文本推送到 overlay
+                // overlay 侧 16ms timer 自然节流，生产端不额外节流（DESIGN-OVERLAY-037 §5.2）
+                show_overlay(
+                    overlay_handle,
+                    opacity,
+                    ui_language,
+                    OverlayStatus::RecordingWithText { text },
+                );
+            }
             PipelineEvent::Processing(message) => {
                 set_tray_state(tray, TrayState::Processing, ui_language);
                 show_overlay(
@@ -2063,6 +2080,13 @@ fn process_controller_events(
             }
             OverlayUiEvent::PreviewCopied => {
                 overlay_handle.send(OverlayCommand::Hide);
+            }
+            OverlayUiEvent::EditRequested => {
+                // ASR-038-B: 用户点击 overlay 文本区进入编辑态
+                // 停录音 + 取消 pipeline（关 WebSocket 由 ASR 线程检测 cancel_signal 处理）
+                cancel_signal.store(true, Ordering::Relaxed);
+                stop_recording_signal.store(true, Ordering::Relaxed);
+                // overlay 进入编辑态由 C-overlay 批实现渲染，本批只做信号传递
             }
         }
     }
@@ -2952,6 +2976,7 @@ fn overlay_request_for_event(event: &PipelineEvent) -> platform::OverlayRequest 
             auto_close_ms: 2500,
         },
         PipelineEvent::FocusLost(text) => platform::OverlayRequest::ShowPreview(text.clone()),
+        PipelineEvent::StreamingText(_) => platform::OverlayRequest::Show, // macOS 侧流式文本暂不渲染
         PipelineEvent::Done | PipelineEvent::Cancelled => platform::OverlayRequest::Hide,
     }
 }
@@ -3012,6 +3037,10 @@ fn handle_pipeline_event(event: &PipelineEvent, ui_language: config::UiLanguage)
         PipelineEvent::FormatFailed => {
             log::warn!("macOS pipeline: FormatFailed (LLM 格式化失败，原文已注入兜底)");
             platform::request_tray_state(TrayState::Idle, ui_language);
+        }
+        PipelineEvent::StreamingText(text) => {
+            // ASR-038-B: macOS 侧流式文本暂不渲染（C-overlay 批后续实现）
+            log::debug!("macOS pipeline: StreamingText ({} chars)", text.len());
         }
     }
 }
@@ -3214,9 +3243,9 @@ fn select_preprocessing_params(asr_model: transcription::AsrModel) -> (usize, us
         transcription::AsrModel::Performance => {
             (PERF_SILENCE_HEAD_SAMPLES, PERF_ONSET_BACKTRACK_SAMPLES)
         }
-        transcription::AsrModel::Qwen3Online => {
-            // DEC-028: qwen3_online 沿用 performance 前处理参数（0ms head / 200ms backtrack）
-            // 在线模型对前导静音不敏感，但保持与 CTC 一致的前处理行为
+        transcription::AsrModel::Qwen3Online | transcription::AsrModel::QwenAudioOnline => {
+            // DEC-028 / RESEARCH-ASR-038: 在线 ASR 模型承袭 Qwen3Online 既有先例
+            // （在线模型对前导静音不敏感，保持与 CTC 一致的前处理行为）
             (PERF_SILENCE_HEAD_SAMPLES, PERF_ONSET_BACKTRACK_SAMPLES)
         }
     }
@@ -4968,6 +4997,13 @@ mod overlay_wire_tests {
             overlay_request_for_event(&PipelineEvent::Cancelled),
             OverlayRequest::Hide,
             "Cancelled 必须映射为 Hide"
+        );
+
+        // ASR-038-B: StreamingText → Show（macOS 侧流式文本暂不渲染，只维持 overlay 可见）
+        assert_eq!(
+            overlay_request_for_event(&PipelineEvent::StreamingText("测试文本".to_string())),
+            OverlayRequest::Show,
+            "StreamingText 必须映射为 Show（macOS 侧暂不渲染流式文本）"
         );
     }
 }

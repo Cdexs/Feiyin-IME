@@ -10,6 +10,7 @@ use crate::{config::ChineseScript, punctuation, text_normalizer};
 use sherpa_onnx::{OfflineFunASRNanoModelConfig, OfflineSenseVoiceModelConfig};
 
 pub mod qwen3_online;
+pub mod qwen_inference;
 mod vad;
 pub use vad::{
     build_padded_segments, join_segment_texts, naive_chunk, should_segment, VadSegmenter,
@@ -32,8 +33,10 @@ pub enum AsrModel {
     Performance,
     /// 准确率更高：972MB FunASR Nano native（OfflineFunASRNanoModelConfig，config 层 hotwords）
     Accuracy,
-    /// Qwen3 在线 ASR（DEC-028）：零本地 ASR 内存，WebSocket 实时协议
+    /// Qwen3 在线 ASR（DEC-028）：零本地 ASR 内存，WebSocket Realtime 协议
     Qwen3Online,
+    /// Qwen-Audio-3.0 在线流式 ASR（RESEARCH-ASR-038）：DashScope Inference 协议，支持即时热词
+    QwenAudioOnline,
 }
 
 impl AsrModel {
@@ -42,6 +45,8 @@ impl AsrModel {
             AsrModel::Accuracy
         } else if s.eq_ignore_ascii_case("qwen3_online") {
             AsrModel::Qwen3Online
+        } else if s.eq_ignore_ascii_case("qwen_audio_online") {
+            AsrModel::QwenAudioOnline
         } else {
             AsrModel::Performance
         }
@@ -113,12 +118,13 @@ impl Transcriber {
         };
 
         // DEC-028: qwen3_online 模式不加载本地模型
-        if asr_model == AsrModel::Qwen3Online {
+        if asr_model == AsrModel::Qwen3Online || asr_model == AsrModel::QwenAudioOnline {
             if qwen3_api_key.trim().is_empty() {
-                anyhow::bail!("Qwen3 ASR 配置失败：API Key 为空（请在设置中配置 Qwen3 API Key）");
+                anyhow::bail!("在线 ASR 配置失败：API Key 为空（请在设置中配置 API Key）");
             }
             log::info!(
-                "Qwen3 online ASR mode: no local model loaded, url={}",
+                "Online ASR mode: no local model loaded, model={:?}, url={}",
+                asr_model,
                 qwen3_url
             );
             return Ok(Self {
@@ -284,6 +290,30 @@ impl Transcriber {
             // 标点引擎，否则照常走引擎补标点。判据统一走 `has_effective_punctuation`
             // （词内嵌豁免：3.14 小数点 / don't 撇号 / 3:30 冒号 / example.com 域名点
             // 因被 ASCII 字母数字夹持不计为标点，避免误判 native=true 跳过引擎）。
+            let normalized = text_normalizer::normalize_text_for_language(trimmed, script);
+            let native_punctuated = punctuation::has_effective_punctuation(&normalized);
+            return Ok((normalized, native_punctuated));
+        }
+        // ASR-038-B: QwenAudioOnline 流式路径（非流式回退：录完整段再发）
+        // 流式管线在 main.rs 的 run_streaming_pipeline 中直接调用 qwen_inference::transcribe_streaming，
+        // 此分支仅用于非流式回退（如模型切换过渡期）
+        if self.asr_model == AsrModel::QwenAudioOnline {
+            let vocabulary = crate::transcription::load_wordbook_vocabulary();
+            let text = qwen_inference::transcribe_streaming(
+                &self.qwen3_url, // 复用 qwen3_url 字段（URL 在 config 层区分）
+                &self.qwen3_api_key,
+                &self.qwen3_asr_model, // 复用 qwen3_asr_model 字段
+                samples,
+                &vocabulary,
+                |_| {}, // 非流式回退不推增量
+            )?;
+            let cleaned = Self::strip_asr_special_tokens(&text);
+            let trimmed = cleaned.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!(
+                    "ASR transcription failed: qwen_audio_online output is empty"
+                );
+            }
             let normalized = text_normalizer::normalize_text_for_language(trimmed, script);
             let native_punctuated = punctuation::has_effective_punctuation(&normalized);
             return Ok((normalized, native_punctuated));
@@ -631,11 +661,11 @@ fn build_recognizer(
                 }
             }
         }
-        AsrModel::Qwen3Online => {
-            // DEC-028: qwen3_online 不加载本地模型，Transcriber::new() 已提前返回，
-            // 此分支不应被触达
+        AsrModel::Qwen3Online | AsrModel::QwenAudioOnline => {
+            // DEC-028 / RESEARCH-ASR-038: 在线 ASR 模式不加载本地模型，
+            // Transcriber::new() 已提前返回，此分支不应被触达
             unreachable!(
-                "Qwen3Online should be handled in Transcriber::new() before build_recognizer"
+                "online ASR models should be handled in Transcriber::new() before build_recognizer"
             )
         }
     }
@@ -1277,9 +1307,51 @@ mod tests {
             Err(e) => {
                 // 两个模型都缺失才 Err，本机至少有一个则不会到这
                 eprintln!("build_recognizer err (models may be missing): {}", e);
-            }
         }
     }
+}
+
+/// ASR-038-B: 从 wordbook 表加载热词 vocabulary（调用链证明）
+///
+/// **调用链**：
+/// `wordbook::Wordbook::list_all()` → `db::load_word_entries()`（只查 `wordbook` 表）
+/// → 转换为 `qwen_inference::VocabEntry` → `qwen_inference::build_vocabulary()`
+///
+/// 🔴 **数据源保证**：`Wordbook::list_all()` 只查 `wordbook` 表（`db::load_word_entries()`），
+/// **不查 `wordbook_candidates` 表**（163 条未确认候选，禁止注入）。
+/// `wordbook_candidates` 由 `db::upsert_candidate` / `db::load_candidates` 管理，
+/// 本函数不调用这些接口。
+///
+/// 权重：user=5（专名领域词）、system=4（历史 bug 沉淀保护词）、未知=3
+/// 超限词条由 `build_vocabulary` 内部过滤（跳过 ASR 但保留给 LLM）
+pub fn load_wordbook_vocabulary() -> serde_json::Value {
+    match crate::wordbook::Wordbook::open() {
+        Ok(wb) => match wb.list_all() {
+            Ok(entries) => {
+                let vocab_entries: Vec<qwen_inference::VocabEntry> = entries
+                    .into_iter()
+                    .map(|e| qwen_inference::VocabEntry {
+                        word: e.word,
+                        source: e.source,
+                    })
+                    .collect();
+                log::info!(
+                    "ASR vocabulary loaded from wordbook table: {} entries",
+                    vocab_entries.len()
+                );
+                qwen_inference::build_vocabulary(&vocab_entries)
+            }
+            Err(e) => {
+                log::warn!("Failed to load wordbook for ASR vocabulary: {}", e);
+                serde_json::json!({})
+            }
+        },
+        Err(e) => {
+            log::warn!("Failed to open wordbook for ASR vocabulary: {}", e);
+            serde_json::json!({})
+        }
+    }
+}
 
     /// R2 纯逻辑验证：build_recognizer 返回元组 arity 正确（3 个元素），
     /// effective_model 是 AsrModel 类型。此测试文档化签名契约，
