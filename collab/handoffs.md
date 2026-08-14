@@ -2,6 +2,74 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-08-14 — coder-2 — DESIGN-OVERLAY-037 ✅ 流式预览 overlay 交互设计（纯设计零代码改动）
+
+- **来源**：Gavin 新交互架构（流式输出 + 组合文本预输入 + 松键后 LLM 格式化）。
+  TSF 路径被判死（RESEARCH-TSF-036）后，主控要求出 overlay 回退方案。基线 HEAD `35a2a74`
+- **任务性质**：纯设计文档，禁止改任何代码
+- **核心结论**：
+  - **复用现有 Win32 GDI overlay（DEC-003），不新建窗口**
+  - **双阶段窗口样式**：录音/流式显示阶段保持 `WS_EX_NOACTIVATE`；用户接管编辑阶段动态移除该样式并内嵌 `EDIT` 子控件
+  - **编辑实现推荐 Win32 `EDIT` 控件 + 子类化去边框**：中文 IME 支持是决定性因素
+  - **PTT/Toggle 编辑时机（Gavin 拍板）**：录音中用户点击 overlay 文本区即进入编辑态，不等松开热键；编辑态内再次松开热键为空操作（`pipeline_cancelled` 拦截）
+  - **窗口几何**：文本从客户区中央起排，随文本量以屏幕中心为锚点扩宽，上限 = 当前显示器工作区宽度 × 65%；超上限后文本区内部左滚
+  - **焦点归还**：提交时先 `SetForegroundWindow(target_hwnd)`；UIPI 失败则降级为复制到剪贴板 + `FocusLost` 预览提示
+  - **颜色语义（Gavin 拍板）**：语音文本专用白色 `COLORREF(0xFFFFFF)`，**不引入下划线**，整段流式文本统一白色；提交按钮用品牌橙
+  - **EDIT 控件精确规格**：尺寸 (42, 10)-(191, 26)、高 16px、背景 `BG_DARK`、文本白、无边框、无滚动条、选中高亮 `BRAND_ORANGE`、字体 `create_clear_type_font(-12)`
+  - **托盘状态**：编辑态期间托盘仍为 `Recording`，不随 2500ms 自动复位为 Idle
+- **交付物**：`voice-ime/collab/research/overlay-streaming-preview-design-001.md` + `/d/Workspace/CodeLab/collab/outbox/coder-2/result.md`
+- **零生产代码改动**：`git diff --ignore-cr-at-eol --numstat -- src/` == 0，版本号未动
+- **下游**：设计已按 Gavin 拍板修订完成，待主控三轮验收
+- **详情**：本条目 + `outbox/coder-2/result.md` + `logs/20260814.md`
+
+## 2026-08-14 — coder-1 — RESEARCH-ASR-038 ✅ 035 流式化重做 + VAD 计费门控 + 热词注入链路（纯设计零代码改动）
+
+- **来源**：Gavin 推翻 035「录完整段再发」前提，要求真流式「边录边显示」。基线 HEAD `35a2a74`
+- **设计产出**：`collab/research/asr-streaming-pipeline-design-001.md`（469 行）
+  - 计费口径：文档未覆盖，按保守设计（墙钟会话时长）
+  - VAD 门控：只做①入口门控（滚动 VAD 确认有语音才建连，2s 无条件建连保底），②暂不做，③自然行为
+  - speech_detected 不换（RMS 管停录 / Silero 管建连并存）
+  - 流式管线：音频采集+ASR并发，StreamingAsrState 维护已确认句+当前句，松键后整段交 LLM（F3 跨句保留）
+  - overlay 接口：PipelineEvent::StreamingText 推增量，EditRequested → 关 WS + 丢弃 + pipeline_cancelled
+  - 热词注入：全量注入（~15条），source 分权重（user=5/system=4），超限丢弃 ASR 保留 LLM
+  - 参数调优：max_sentence_silence=800ms，全部配置文件级不暴露（DEC-031 通过）
+  - 分批 A→B 串行 C 并行
+- **零生产代码改动**：`git diff --ignore-cr-at-eol --numstat -- src/` == 0，版本号未动
+- **下游**：方案待主控复核 + Gavin 拍板后排期实施批次 ASR-038-A/B/C
+- **详情**：`outbox/coder-1/result.md`（工作区级+项目级两处）+ 方案文档 + `logs/20260814.md`
+
+## 2026-08-14 — coder-1 — RESEARCH-TSF-036 ✅ Windows TSF 组合文本可行性调研（纯研究零代码改动）
+
+- **来源**：Gavin 新交互架构（流式输出 + 组合文本预输入 + 松键后 LLM 格式化）。基线 HEAD `35a2a74`
+- **核心问题**：跨进程插入 TSF 组合文本，飞音是否必须注册成活动的 TIP？
+- **三选一结论：丙（判死 TSF，走 overlay 回退方案）**
+  - A1 答案：是，必须注册成活动 TIP（官方架构文档：text service 是 in-proc COM server，被加载进目标进程）
+  - TIP 崩溃直接拖垮宿主应用（in-proc COM 无进程隔离）
+  - 绿色免安装形态不能保持（需写注册表 + 代码签名 + DLL 注册）
+  - 无绕开路径（IMM32 同样要求活动 IME；UI Automation 无组合态）
+  - 产品形态不可逆变更（托盘工具→真·输入法，与现有交互根本冲突）
+  - 工程量 ~30-80 人天，PoC 不值得做（核心问题已有文档级答案）
+  - 回退方案 = overlay 浮层实时显示 + 松键后注入（与当前体验一致，无退化）
+- **跨平台抽象**：`CompositionText` trait 已设计（begin/update/commit/cancel），三端映射已给，但结论为丙暂不落地
+- **零生产代码改动**：`git diff --ignore-cr-at-eol --numstat -- src/` == 0，版本号未动
+- **下游**：方案待主控复核 + Gavin 拍板（是否接受 overlay 回退 / 是否走 TIP / 是否做 PoC）
+- **详情**：`outbox/coder-1/result.md` + 方案文档 + `logs/20260814.md`
+
+## 2026-08-14 — coder-1 — RESEARCH-ASR-035 ✅ qwen-audio-3.0-asr-flash-streaming 接入研究（纯研究零代码改动）
+
+- **来源**：Gavin 2026-08-14 指令（换在线 ASR + VAD 门控 + 热词/上下文 + 降噪研究）。基线 HEAD `35a2a74`
+- **研究产出**：`collab/research/asr-qwen-audio-3.0-integration-001.md`（~650 行方案文档）
+  - A 协议层 6 问全答（run-task/二进制帧/服务端事件/分片/鉴权/WorkspaceId）
+  - B 能力层 5 问全答（即时热词无需预建词表 / 上下文 400 字符限制 / language_hints 数组 / 标点自带无独立开关 / PCM 16kHz 直接兼容）
+  - C 商务层 3 问（按时长计费非 token / 限流文档未覆盖 / GA + 北京 region + 同一 API key）
+  - D 降噪 7 问 + 三选一建议 A（不做，端测后视情况转 B 用 nnnoiseless）
+  - 整合方案：新写 `qwen_inference.rs` 保留旧模块 / VAD 门控复用 VadSegmenter / 热词复用 wordbook / 上下文 v1 不上
+  - DEC-031 核对通过 / 跨平台结论 / 影响文件清单 / 风险与回退 / 分批建议 A→B→C
+  - 7 个未解问题待 Gavin 拍板
+- **零生产代码改动**：`git diff --ignore-cr-at-eol --numstat -- src/` == 0，版本号未动
+- **下游**：方案待主控复核 + Gavin 拍板后，由主控排期实施批次 ASR-035-A/B/C
+- **详情**：`outbox/coder-1/result.md` + 方案文档 + `logs/20260814.md`
+
 ## 2026-08-09 21:2x — tester-1 — BUILD-015 ✅ 030 全批 + 031 首次出包（⚠️ handoffs/progress 主控代记）
 
 > ⚠️ **[DOC-STATE-DRIFT-001] 今日第三次**：tester-1 完成后仍只更 `CHANGELOG.md` + `logs/20260809.md`，
