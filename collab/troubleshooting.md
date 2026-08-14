@@ -2597,6 +2597,34 @@ macOS 端 `f96c817` 的新版同步进包。已 `git diff f96c817^ f96c817 -- sc
 **原「下次实验必须带上的对照」仍然有效**：IN-D 在 `deepseek-v4-pro` 与更强模型上的表现差异 ——
 但**优先级排在上面这个 A/B 之后**，因为 A/B 能直接判定责任归属，而换模型只能给出规避方案。
 
+### 十、🔴 阶段六实验**本身就不是生产保真的**（2026-08-14 tester-1 停手报告触发查出）
+
+派发 A/B 实验后，tester-1 按任务书门禁停手上报，主控复核后确认了一件**削弱阶段六结论的事**：
+
+| 项 | 阶段六实验（`harness_025f.py`） | 生产真实 |
+| --- | --- | --- |
+| 场景块 `SCENE_F4` | **完全不含**（`prompt-parts-025-full.json` 里有该键，但 `build_sys_prompt()` 根本没拼它） | 含，**1119 B** |
+| 快照里那个 `SCENE_F4` 键 | 452 B，开头 `Scene-Specific Formatting Rules (Document):` —— **手工构造的占位块** | 开头 `Scene Context (F4): The user is typing into a document application.`（`build_scene_prompt_block` 输出），**首 token 即不同** |
+| `EXTRA_INSTRUCTION` | 空串 | 213 B（判据：`system_prompt len` == `msg[0] content_len` == 22055） |
+| 部件顺序 | `WORDBOOK` 排在 `SUGGESTION` **之后** | L2 顺序为 `USER_PREFS → BASE_PROMPT → EXTRA → WORDBOOK → F1F2 → CODESWITCH → UNIT_SYMBOL → ADD_PUNCT → SUGGESTION`；L3 为 `SCENE_F4 → F3_TRUE`（`src/llm/mod.rs:356-443`） |
+| 总长 | 20220 B（−8.3%） | 22055 B |
+
+**所以阶段六「`deepseek-v4-pro` 让 IN-B/IN-C 由 0/3 转 3/3」这个结论，
+严格说只对那个手工拼装的提示词成立，对生产未必成立。**
+Gavin 据此把生产模型升到 v4-pro，而生产提示词与实验提示词并不同 ——
+这解释了「实验说解决了、生产仍会出问题」这个表面矛盾的一种可能。
+
+**主控本次任务书的缺陷也在此**：7.3 假定「快照 = 今天的提示词」。
+该假定对**源码常量**成立（git 比对已证），对**快照 JSON 本身不成立**。
+已下发 7.3 修订版：G1/G2 改用生产真实 F4 + 补 `EXTRA_INSTRUCTION` + 按生产层序组装
+（实测 21556 B，−2.3%，通过 ±5% 门禁）；**G0 保持原样复刻阶段六配置**，
+因为它的参照系是「那次实验」而非「今天生产」，这是它能独立判定模型漂移的前提。
+
+> **方法论**：实验脚本与生产装配之间**不存在自动一致性保证**。
+> 只要实验是「按部件手工重拼」而非「调用生产同一函数」，就必须**显式校验总长与层序**，
+> 否则结论的外部效度无从谈起。本次靠「保真度门禁」这一条兜住了 ——
+> 门禁的价值不在于它挡下了什么，而在于**它逼出了一个没人想到要查的事实**。
+
 ---
 
 ## [ITN-LOCAL-RULE-OVERREACH-001] 🔴 局部特例规则不约束适用范围，在更长上下文里越界生效【改 ITN 前必读】
