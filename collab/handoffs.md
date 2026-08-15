@@ -2,6 +2,21 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-08-15 — tester-1 — TEST-SYNC-038-B + TEST-EXEC-038 ✅ 用例补全 + 全量回归（生产零改动）
+
+- **来源**：主控合并派单（TEST-SYNC-038-B 阶段三写用例 + TEST-EXEC-038 阶段四全量回归，串行执行）。基线 HEAD `ee4d472`（5 提交：`4f3b41b` → `0c5f5ec` → `c76a4c3` → `26e8565` → `ee4d472`）
+- **阶段三新增 6 条真测用例（仅 3 测试文件 +164 行）**：
+  - `src/config/mod.rs`：`asr_online_url_serde_alias_reads_legacy_qwen_asr_url` / `asr_online_model_serde_alias_reads_legacy_qwen_asr_model`（041-B 改名后 url/model alias 缺覆盖补齐）/ `asr_model_qwen3_online_migrates_via_load_path`（迁移 load() 路径，与既有 load_from 测试互补，两处迁移独立副本均实测落盘）
+  - `src/transcription/mod.rs`：`asr_model_exactly_three_variants_with_stable_mapping`（AsrModel 三变体穷举 match 编译期护栏 + from_config 正反向，防误删 Accuracy）
+  - `src-tauri/src/config.rs`：`mirror_asr_fields_match_main_config_literals` / `mirror_asr_online_url_model_serde_alias_reads_legacy_fields`（镜像一致性护栏，防 038-A 静默丢弃复现）
+- **可测性判定（交主控排期）**：038-C overlay 五覆盖点（Hide 守卫 / OVERLAY_EDITING 抑制 / 置位时序 / 托盘保持 / 100ms 节流）全内联 Win32 消息循环，**不可纯单测**，建议抽 `should_suppress_hide` / `should_resize` 纯函数（039-D 先例）；main.rs 规格表热键下沿/硬上限/旧路径已由 039-D 纯函数与既有用例覆盖，Toggle 二次按下等 3 条需 E2E
+- **阶段四全绿**：A0-A4 全 PASS；主 crate 1014 passed / 0 failed（src/main.rs 941 + crash-reporter 37 + 集成 36）；src-tauri 55；Vitest 54；`--list` 自洽（1025 = 1014 + 11 ignored）；红条三分类 ③0/①0/②0
+- **验收**：`cargo fmt` clean / `cargo check --all-targets` 0 error / src-tauri check 0 error / 生产代码零改动自证（`git diff -w` 仅 3 测试文件）；主控复算 diff hunk 起点全部晚于 `#[cfg(test)]` 行，越界 hunk = 0 ✅
+- **版本号未动**（已是 0.8.0）
+- **详情**：outbox/tester-1/result.md + logs/20260815.md + CHANGELOG.md
+
+---
+
 ## 2026-08-15 — coder-1 — ASR-041-B ✅ 清除旧在线 ASR 代码路径 + 字段改名通用名
 
 - **来源**：Gavin 指令「连代码一起清掉」+「qwen3_api_key 改成通用名」+ 主控追加「qwen_asr_url/model 也改通用名」+「镜像侧补字段」。基线 HEAD `26e8565`

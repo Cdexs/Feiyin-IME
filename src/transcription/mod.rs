@@ -1595,4 +1595,31 @@ mod tests {
         // 空串：幂等返回空串
         assert_eq!(Transcriber::strip_asr_special_tokens(""), "");
     }
+
+    /// ASR-041-B-补: AsrModel 恰好三变体（Performance/Accuracy/QwenAudioOnline）。
+    /// Gavin 明确保留 Accuracy，防将来误删该变体。
+    /// 用穷举 match 而非断言计数：删任一变体 → 本 match 编译失败（比 `== 3` 强）。
+    /// 每个变体都走一遍 from_config 正反向，钉住字符串 ↔ 变体映射不被破坏。
+    #[test]
+    fn asr_model_exactly_three_variants_with_stable_mapping() {
+        // 穷举三变体：新增/删除变体都会在此编译失败（编译期护栏）
+        let _exhaustive: fn(AsrModel) = |m| match m {
+            AsrModel::Performance | AsrModel::Accuracy | AsrModel::QwenAudioOnline => (),
+        };
+
+        // from_config 正反向映射（大小写不敏感，041-B 改名后仍是 qwen_audio_online）
+        assert_eq!(AsrModel::from_config("performance"), AsrModel::Performance);
+        assert_eq!(AsrModel::from_config("accuracy"), AsrModel::Accuracy);
+        assert_eq!(
+            AsrModel::from_config("qwen_audio_online"),
+            AsrModel::QwenAudioOnline
+        );
+        assert_eq!(
+            AsrModel::from_config("QwEn_AuDiO_oNlInE"),
+            AsrModel::QwenAudioOnline
+        );
+        // 未知字符串回落 Performance（不 panic）
+        assert_eq!(AsrModel::from_config("qwen3_online"), AsrModel::Performance);
+        assert_eq!(AsrModel::from_config(""), AsrModel::Performance);
+    }
 }

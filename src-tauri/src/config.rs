@@ -462,4 +462,60 @@ mod tests {
         cleanup(&path);
         assert_eq!(loaded.audio.asr_model, "qwen3_online");
     }
+
+    /// TEST-SYNC-038-B: src-tauri 镜像与主程序 config 字段一致性护栏。
+    /// 038-A 曾因镜像缺字段导致设置界面保存时静默丢弃（round-trip 数据丢失），
+    /// 041-B 已补。本测试用「字符串字面值」钉住镜像的 4 个 ASR 字段默认值，
+    /// 必须与 src/config/mod.rs 的对应字面值逐字符一致 —— 任何一侧漂移即红。
+    /// 这属于跨 crate 一致性，无法直接引用主 crate 类型，只能用字面值对照。
+    #[test]
+    fn mirror_asr_fields_match_main_config_literals() {
+        let cfg = AppConfig::default();
+        // 字段默认值（对应主程序 src/config/mod.rs 的 default_asr_model / default_asr_online_url / default_asr_online_model）
+        assert_eq!(
+            cfg.audio.asr_model, "performance",
+            "mirror asr_model default must match main config"
+        );
+        assert_eq!(
+            cfg.audio.asr_online_url,
+            "wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference",
+            "mirror asr_online_url default must match main config (round-trip data loss guard)"
+        );
+        assert_eq!(
+            cfg.audio.asr_online_model,
+            "qwen-audio-3.0-asr-flash-streaming",
+            "mirror asr_online_model default must match main config"
+        );
+        // alias 字段名同步（镜像缺 alias 也会静默丢数据，041-B 已补）
+        assert_eq!(cfg.audio.asr_online_api_key, "");
+    }
+
+    /// TEST-SYNC-038-B: 镜像 alias 实测 —— 含旧字段名 qwen_asr_url / qwen_asr_model 的
+    /// toml 必须能读入镜像（与主 config 的 alias 行为对齐）。
+    #[test]
+    fn mirror_asr_online_url_model_serde_alias_reads_legacy_fields() {
+        let path = temp_config_path("mirror_alias");
+        cleanup(&path);
+        let mut cfg = make_minimal_cfg_with_asr_model("qwen_audio_online");
+        cfg.llm.system_prompt = default_system_prompt();
+        cfg.save_to(&path).unwrap();
+
+        let toml_content = std::fs::read_to_string(&path).unwrap();
+        let patched = toml_content
+            .replace("asr_online_url", "qwen_asr_url")
+            .replace("asr_online_model", "qwen_asr_model");
+        std::fs::write(&path, patched).unwrap();
+
+        let loaded = AppConfig::load_from(&path).unwrap();
+        cleanup(&path);
+        assert_eq!(
+            loaded.audio.asr_online_url,
+            "wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference",
+            "mirror serde alias must read legacy 'qwen_asr_url'"
+        );
+        assert_eq!(
+            loaded.audio.asr_online_model, "qwen-audio-3.0-asr-flash-streaming",
+            "mirror serde alias must read legacy 'qwen_asr_model'"
+        );
+    }
 }

@@ -438,8 +438,9 @@ PTT 录音中点击即进编辑态（不等松键）｜流式文本白色不加�
 | **ASR-038-A** | `qwen_inference.rs` 新建（流式协议 + 二进制帧 + 热词 + 四语） | `src/transcription/` 新文件 | coder-1 | ✅ **主控独立复现验收通过** |
 | **ASR-038-B** | VAD 入口门控 + 管线改造（边录边发 + 增量接收） | `src/audio/`、`src/main.rs`、`src/transcription/`、`src/ui/overlay.rs`（仅数据字段） | coder-1 | 🟡 **真流式核心已实施**（C-1 VadSegmenter滚动方法 + C-2 record_streaming + C-3 transcribe_streaming_realtime + C-4 worker接线 + 040-A埋点）。编译已通 / 949+32测试全绿。待主控终验（重点验FIRSTCHAR等价+record零改动+040-A四段覆盖） |
 | ASR-038-C | overlay 流式显示 + 编辑态 + EDIT 控件 | `src/main.rs`、`src/ui/overlay.rs`（绘制与交互） | coder-2 | 🔜 等 B（**同动 `src/main.rs`，零并行空间**） |
-| TEST-SYNC-038 | 测试同步（阶段三） | 各 `mod tests` | tester-1 | 🔜 等 B 验收 |
-| TEST-EXEC-038 | 全量回归（阶段四） | — | tester-1 | 🔜 |
+| TEST-SYNC-038 | 测试同步（阶段三） | 各 `mod tests` | tester-1 | ✅ **已验收**（返工一轮）：10 用例 + 039-D 纯函数护栏 |
+| TEST-SYNC-038-B | main.rs 规格表 + 038-C 覆盖点 + 041/041-B 用例补全 | 3 测试文件 | tester-1 | ✅ **已复算通过**（主控）：新增 6 用例，生产零改动，038-C 判不可纯单测（建议抽纯函数） |
+| TEST-EXEC-038 | 全量回归（阶段四） | — | tester-1 | ✅ **已复算通过**（主控）：A0-A4 全 PASS，1014/55/54，红条三分类 ③0/①0/②0，待主控提交 |
 | BUILD-016 | v0.8.0 首包（阶段五） | — | tester-1 | 🔜 |
 | **ASR-041** | 在线 ASR 模型换代 UI 选项 + 存量配置静默迁移 | `ui/src/pages/Voice.tsx`、`ui/src/i18n/*.ts`、`ui/src/pages/Voice.test.tsx`、`src/config/mod.rs` | coder-1 | ✅ 已验证（UI 下拉指向 qwen_audio_online + 三份 i18n 去 Qwen3 字样 + 存量 qwen3_online 静默迁移 + 17 处测试同步） |
 | **ASR-041-B** | 清除旧在线 ASR 代码路径 + 字段改名通用名 | `src/transcription/**`、`src/config/mod.rs`、`src/main.rs`、`ui/src/**`、`src-tauri/src/config.rs`、`src-tauri/src/main.rs` | coder-1 | ✅ 已验证（删 Qwen3Online 枚举+qwen3_online.rs(686行)+qwen3_asr 配置+热重载+match 臂+测试；f32_to_pcm16_le 搬家；三字段改通用名+alias；镜像补字段；存量迁移保留） |

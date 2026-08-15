@@ -197,6 +197,23 @@ DNS 解析 (to_socket_addrs，阻塞系统调用，无缓存)
 
 ---
 
+## ✅ 已结案（主控标注） · TEST-SYNC-038-B + TEST-EXEC-038（tester-1，2026-08-15）
+
+> ✅ **2026-08-15 tester-1 交付 + 主控独立复算通过**（基线 `ee4d472`），等主控统一提交。
+>
+> **阶段三（TEST-SYNC-038-B）新增 6 条真测用例**（仅 3 测试文件 +164 行，生产零改动）：
+> - `src/config/mod.rs`：`asr_online_url/model` legacy alias 真读 ×2 + `qwen3_online→qwen_audio_online` 迁移 load() 路径 ×1
+> - `src/transcription/mod.rs`：`AsrModel` 三变体穷举 match 编译期护栏 ×1
+> - `src-tauri/src/config.rs`：镜像与主 config 字面值一致性 ×2
+>
+> **可测性判定**：038-C overlay 五覆盖点全内联 Win32 消息循环，判不可纯单测（理由 + 抽纯函数建议交主控排期）；main.rs 规格表热键下沿/硬上限/旧路径已由 039-D 纯函数与既有用例覆盖。
+>
+> **阶段四（TEST-EXEC-038）全绿**：A0-A4 全 PASS；主 crate 1014 passed/0 failed；src-tauri 55；Vitest 54；`--list` 自洽（1025 = 950+39+36）；红条三分类 ③0/①0/②0。
+>
+> **残差 3 对账**（主控源码 1028 vs 实跑 1025）：crash-reporter bin 经 `#[path]` 重复引入 config(36)+i18n(3)，`--list` 分 target 明细 = feiyin-ime 950 / crash-reporter 39 / 集成 36，实跑合计 1025；源码去重计数把重复引入的 3 处 cfg 门控差异算入即约 1028，不影响结论。
+
+---
+
 ## ✅ 已结案（主控标注） · TRANS-HOTKEY-039 翻译热键全链失效（2026-08-15）
 
 > ✅ **2026-08-15 主控终验通过并提交 `4f3b41b`**（打回一轮后）。

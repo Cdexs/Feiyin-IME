@@ -1239,6 +1239,87 @@ clipboard_delay_ms = 150
         );
     }
 
+    /// ASR-041-B-补: `asr_online_url` 的 serde alias —— 含旧字段名 `qwen_asr_url` 的 toml
+    /// 必须把 URL 读入 `asr_online_url`（否则 038-A 时代配置在设置界面保存后静默丢失）。
+    /// 对照已验证的 `asr_online_api_key` alias（QWEN3-CONFIG-004 同族）补齐 url 侧。
+    #[test]
+    fn asr_online_url_serde_alias_reads_legacy_qwen_asr_url() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+        let mut cfg = AppConfig::default();
+        cfg.audio.asr_online_url =
+            "wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference"
+                .to_string();
+        cfg.save_to(&env.config_path())
+            .expect("save should succeed");
+        // 把保存的 toml 里的 asr_online_url 改回旧字段名 qwen_asr_url
+        let toml_content = std::fs::read_to_string(&env.config_path()).expect("read toml");
+        let patched = toml_content.replace("asr_online_url", "qwen_asr_url");
+        std::fs::write(&env.config_path(), patched).expect("write patched toml");
+        let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
+        assert_eq!(
+            loaded.audio.asr_online_url,
+            "wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference",
+            "serde alias must read legacy 'qwen_asr_url' field into 'asr_online_url'"
+        );
+    }
+
+    /// ASR-041-B-补: `asr_online_model` 的 serde alias —— 含旧字段名 `qwen_asr_model` 的 toml
+    /// 必须把模型名读入 `asr_online_model`（与 url alias 同族，一并对齐防漂移）。
+    #[test]
+    fn asr_online_model_serde_alias_reads_legacy_qwen_asr_model() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+        let mut cfg = AppConfig::default();
+        cfg.audio.asr_online_model = "qwen-audio-3.0-asr-flash-streaming".to_string();
+        cfg.save_to(&env.config_path())
+            .expect("save should succeed");
+        // 把保存的 toml 里的 asr_online_model 改回旧字段名 qwen_asr_model
+        let toml_content = std::fs::read_to_string(&env.config_path()).expect("read toml");
+        let patched = toml_content.replace("asr_online_model", "qwen_asr_model");
+        std::fs::write(&env.config_path(), patched).expect("write patched toml");
+        let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
+        assert_eq!(
+            loaded.audio.asr_online_model, "qwen-audio-3.0-asr-flash-streaming",
+            "serde alias must read legacy 'qwen_asr_model' field into 'asr_online_model'"
+        );
+    }
+
+    /// ASR-041-补: load() 路径的 qwen3_online → qwen_audio_online 迁移。
+    /// load_from() 已由 `asr_model_qwen3_online_migrates_to_qwen_audio_online` 覆盖，
+    /// 但 load() 是独立实现（自身读文件 + 迁移 + save 落盘），必须独立测，防两处漂移。
+    /// 注意：load() 用 config_path()（current_exe 同级 config.toml），测试进程的
+    /// current_exe 是 target/debug/deps/ 下的测试二进制，写这里不污染用户配置；
+    /// 用 TEST_MUTEX 串行化防并行冲突。
+    #[test]
+    fn asr_model_qwen3_online_migrates_via_load_path() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let path = crate::config::AppConfig::config_path();
+        let existed = path.exists();
+        // 写一份 asr_model=qwen3_online 的 toml
+        let mut cfg = AppConfig::default();
+        cfg.audio.asr_model = "qwen3_online".to_string();
+        cfg.save_to(&path).expect("save should succeed");
+        let loaded = AppConfig::load().expect("load should succeed");
+        // 迁移生效
+        assert_eq!(
+            loaded.audio.asr_model, "qwen_audio_online",
+            "load() path must migrate legacy 'qwen3_online' to 'qwen_audio_online'"
+        );
+        // 落盘后再次 load 应保持 qwen_audio_online（迁移幂等）
+        let reloaded = AppConfig::load().expect("reload should succeed");
+        assert_eq!(
+            reloaded.audio.asr_model, "qwen_audio_online",
+            "load() migration must be idempotent on disk"
+        );
+        // 清理：恢复现场（删除或还原为默认配置）
+        if existed {
+            let _ = AppConfig::default().save_to(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
     // ============================================================
     // ASR-038-B: QwenAudioOnline Inference API 配置（独立于 Qwen3Online Realtime）
     // 三条端点缺陷的回归防护：
