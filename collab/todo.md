@@ -1,5 +1,17 @@
 # 任务列表 · voice-ime
 
+## ✅ 已结案（主控复算通过） · BUILD-016 v0.8.0 首包出包（tester-1，2026-08-16）
+
+> ✅ **2026-08-16 tester-1 完成**（基线 `be76fc1`，Gavin 已下达出包指令），主控将独立复算后交 Gavin 端测。
+>
+> - **构建**：Step 1 清进程（feiyin-ime PID 23888）→ Step 2 npm build（新 `index-DkzLqu_f.js`）+ Tauri UI release 2m14s（cp 到 target/release/）→ Step 3 主程序 2m40s → Step 4 同步 Publish/（三 exe + scene/itn 两 toml；config.toml 等运行时数据未覆盖）
+> - **七项核验全 PASS**（详见 outbox/tester-1/result.md，机器实测）：① 六 exe 时间戳 00:45-00:48 ② 三 exe 两副本 sha256 逐一相等 ③ 两 toml 三副本一致（`0a3a0b9…`/`b208271…`）④ ProductVersion 0.8.0.0/0.8.0/0.8.0.0 ⑤ 新前端 `index-DkzLqu_f.js` 嵌 ui.exe / 旧名 `CTgGziQm` 0（i18n 裸串 grep 0 系 Tauri 压缩已知行为）⑥ 冒烟 PID 30276 Responding=True 无 panic 已清理 ⑦ 主程序 +149504B / UI 0B / crash +2048B 已解释
+> - **🔴 双探针**：正向 `qwen-audio-3.0-asr-flash-streaming` / `api-ws/v1/inference` 各 1 命中；反向 `api-ws/v1/realtime` / `qwen3-asr-flash-realtime` 0 命中——新 ASR 进包 + 旧引擎清干净
+> - **产物**：`Publish/feiyin-ime.exe` 12,106,752B / `feiyin-ime-ui.exe` 10,026,496B / `crash-reporter.exe` 24,859,648B
+> - **Gavin 端测重点**（`-debug` 跑）：新端点连通性 / usage.duration 计费口径 / 040-A 四段连接耗时 / VAD 门控行为 → ASR-PERF-040-B/C 优化数据源
+
+---
+
 ## 🛑 2026-08-15 会话暂停交接 —— 下次从这里开始
 
 > **暂停原因**：coder-2 token 额度用尽（Gavin 指令：暂停开发，额度恢复后继续，完成再通知主控）。
