@@ -865,4 +865,25 @@ mod tests {
         assert_eq!(VAD_STREAMING_THRESHOLD, 0.3);
         assert_eq!(VAD_THRESHOLD, 0.5);
     }
+
+    /// C-1: vad_window_size() 必须导出 512（32ms @16kHz），供 qwen_inference 逐窗口切片
+    #[test]
+    fn vad_window_size_is_512() {
+        assert_eq!(vad_window_size(), 512);
+        assert_eq!(VAD_WINDOW_SIZE, 512);
+    }
+
+    /// C-1 覆盖点1：try_new_for_streaming 模型缺失返回 None（降级总是建连）
+    /// 与 try_new 行为保持一致 —— 两条工厂都必须走 find_silero_vad_model 兜底
+    #[test]
+    fn vad_streaming_and_batch_factories_agree_on_missing_model() {
+        let dir = std::path::Path::new("nonexistent-vad-model-dir-2");
+        assert_eq!(
+            VadSegmenter::try_new_for_streaming(dir).is_some(),
+            VadSegmenter::try_new(dir).is_some(),
+            "both factories must degrade identically when model missing"
+        );
+        assert!(VadSegmenter::try_new_for_streaming(dir).is_none());
+        assert!(VadSegmenter::try_new(dir).is_none());
+    }
 }

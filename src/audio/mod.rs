@@ -1847,6 +1847,94 @@ mod tests {
         );
     }
 
+    // ============================================================
+    // ASR-038-B (C-2): record() 批量路径零改动回归护栏
+    // record_streaming() 是新增平行方法；record() 旧路径必须保持
+    // "pre_roll → post_hotkey → 实时 chunk" 的拼装顺序与静音停录语义。
+    // 主控向 Gavin 背书过「旧路径不动不回归」，以下断言钉住该契约。
+    // ============================================================
+
+    /// C-2 覆盖点3：record() 路径（collect_recording）对非空 pre_roll +
+    /// post_hotkey + 实时 chunk 按顺序拼装，静音 chunk 触发停录后返回完整样本。
+    #[test]
+    fn collect_recording_preserves_pre_roll_then_hotkey_then_live_order() {
+        let (tx, rx) = crossbeam_channel::bounded::<AudioChunk>(2);
+        let stop = Arc::new(AtomicBool::new(false));
+        let failed = AtomicBool::new(false);
+        // pre_roll = 4 个 0.1 样本（语音），post_hotkey = 4 个 0.2 样本（语音）
+        let pre_roll = vec![vec![0.1f32; 4]];
+        let post_hotkey = vec![vec![0.2f32; 4]];
+        // 实时 chunk：静音（0.001 < threshold 0.01），触发 speech_detected 后的静音停录
+        tx.send((Instant::now(), vec![0.001f32; 4])).unwrap();
+        let result = collect_recording(
+            &rx,
+            &failed,
+            Arc::clone(&stop),
+            0.01,
+            0,
+            10,
+            None,
+            16000,
+            pre_roll,
+            post_hotkey,
+        );
+        assert!(result.is_ok(), "record() path must complete OK");
+        let samples = result.unwrap();
+        assert_eq!(
+            samples.len(),
+            12,
+            "pre_roll(4)+hotkey(4)+live(4) must all be preserved"
+        );
+        // 峰值 0.2 → gain = 0.8/0.2 = 4x，静音段 0.001*4=0.004
+        // 断言顺序：pre_roll → post_hotkey → 实时(channel) 逐段，每段内部均匀
+        for s in &samples[0..4] {
+            assert!(
+                (s - 0.4).abs() < 1e-4,
+                "pre-roll chunk scaled to 0.4, got {}",
+                s
+            );
+        }
+        for s in &samples[4..8] {
+            assert!(
+                (s - 0.8).abs() < 1e-4,
+                "post-hotkey chunk scaled to 0.8, got {}",
+                s
+            );
+        }
+        for s in &samples[8..12] {
+            assert!(
+                (s - 0.004).abs() < 1e-5,
+                "live silence chunk scaled to 0.004, got {}",
+                s
+            );
+        }
+    }
+
+    /// C-2 覆盖点3：record() 路径停在 stream_failed（与 record_streaming 各自的失败路径平行）。
+    #[test]
+    fn collect_recording_fails_when_stream_failed() {
+        let (tx, rx) = crossbeam_channel::bounded::<AudioChunk>(2);
+        let stop = Arc::new(AtomicBool::new(false));
+        let failed = AtomicBool::new(true);
+        tx.send((Instant::now(), vec![0.1f32; 4])).unwrap();
+        let result = collect_recording(
+            &rx,
+            &failed,
+            Arc::clone(&stop),
+            0.01,
+            0,
+            10,
+            None,
+            16000,
+            vec![vec![0.2f32; 4]],
+            vec![],
+        );
+        assert!(
+            result.is_err(),
+            "stream_failed must abort record() path with an error"
+        );
+    }
+
     /// R2: find_speech_anchor saturates to 0 when onset < backtrack margin
     #[test]
     fn find_speech_anchor_backtrack_saturates_at_zero() {

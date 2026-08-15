@@ -1313,4 +1313,40 @@ clipboard_delay_ms = 150
             TranslationLanguage::Chinese
         );
     }
+
+    /// ASR-038-B-007: 两个 ASR 端点默认值必须不同 —— Inference(qwen_asr_url)
+    /// 与 Realtime(qwen3_asr_url) 不混用（缺陷①的配置层回归护栏）
+    #[test]
+    fn qwen_asr_url_differs_from_qwen3_asr_url_default() {
+        let cfg = AppConfig::default();
+        assert_ne!(
+            cfg.audio.qwen_asr_url, cfg.audio.qwen3_asr_url,
+            "qwen_asr_url (Inference) and qwen3_asr_url (Realtime) must be distinct endpoints"
+        );
+        assert!(
+            cfg.audio.qwen3_asr_url.contains("dashscope.aliyuncs.com"),
+            "qwen3_asr_url is the Realtime host (dashscope), got: {}",
+            cfg.audio.qwen3_asr_url
+        );
+        assert!(
+            cfg.audio.qwen3_asr_url.ends_with("/api-ws/v1/realtime"),
+            "qwen3_asr_url is the /realtime path, got: {}",
+            cfg.audio.qwen3_asr_url
+        );
+        assert!(
+            cfg.audio.qwen_asr_url.ends_with("/api-ws/v1/inference"),
+            "qwen_asr_url is the /inference path, got: {}",
+            cfg.audio.qwen_asr_url
+        );
+    }
+
+    /// ASR-038-B-008: MAX_RECORD_SECONDS 是录音/轮询硬上限的唯一权威来源，
+    /// 039 的 translate poll 硬上限 = MAX_RECORD_SECONDS + 5 依赖此值不被随意改动。
+    #[test]
+    fn max_record_seconds_is_300() {
+        assert_eq!(
+            MAX_RECORD_SECONDS, 300,
+            "MAX_RECORD_SECONDS must stay 300s (translate poll hard cap derives from it)"
+        );
+    }
 }

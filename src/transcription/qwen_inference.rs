@@ -1560,4 +1560,54 @@ mod tests {
         assert!(vocab.get("3").is_none());
         assert!(vocab.get("6").is_none());
     }
+
+    // ============================================================
+    // ASR-038-B (C-3): transcribe_streaming_realtime 入口防御
+    // 网络路径无法单测（测试链路走真实 ws），但入口前置检查必须钉住：
+    //  - 空 API Key → 立即 bail，绝不触网
+    // ============================================================
+
+    /// C-3: transcribe_streaming_realtime 空 API Key 立即 bail（与 transcribe_streaming 平行防御）
+    #[test]
+    fn transcribe_streaming_realtime_empty_api_key_bails() {
+        let (_tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
+        let result = transcribe_streaming_realtime(
+            "wss://example.com",
+            "",
+            "model",
+            rx,
+            &serde_json::json!({}),
+            std::path::Path::new("nonexistent-model-dir"),
+            None,
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("API Key 为空"),
+            "empty API key must bail before any network I/O"
+        );
+    }
+
+    /// C-3: 流式常量钉住 —— 模型默认值必须与 config 默认一致，防两端点/两模型配置漂移
+    #[test]
+    fn streaming_inference_constants_match_defaults() {
+        assert_eq!(
+            DEFAULT_MODEL, "qwen-audio-3.0-asr-flash-streaming",
+            "DEFAULT_MODEL must match config default (ASR-038-B-002)"
+        );
+        assert_eq!(
+            AUDIO_CHUNK_BYTES, 3200,
+            "chunk size 3200 bytes (100ms @16kHz 16bit)"
+        );
+        assert_eq!(
+            SILENCE_TIMEOUT,
+            std::time::Duration::from_secs(10),
+            "SILENCE_TIMEOUT must stay 10s"
+        );
+        assert_eq!(
+            CONNECT_TIMEOUT,
+            std::time::Duration::from_secs(5),
+            "CONNECT_TIMEOUT must stay 5s, 040-A 分段埋点依赖此上限"
+        );
+    }
 }

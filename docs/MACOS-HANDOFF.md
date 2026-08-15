@@ -318,6 +318,50 @@ Gavin 2026-08-04 拍板：**判定语言中明确提到的最小单位，输出�
 | 027-C-2 | `two_is_unit` 只查 `all_units`，进位单位不在表内 → 「两千」仍被误判 | 同上 |
 | 027-D | DEC-042 隐式补全保留锚定单位（`三亿五`→`3.5亿`），027-D 仅孤立场景 | 行为变更 |
 | 027-E | DEC-042 补完全面落地（`三亿`→`3亿`，最小单位落万/亿带后缀） | **行为变更** |
+
+---
+
+### 2.10 Overlay 流式预览 + 编辑态（ASR-038-C）【2026-08-15 新增，Windows 侧实现】
+
+**影响范围**：`src/ui/overlay.rs`（新增状态枚举）、`src/main.rs`（Windows 侧 overlay 线程与主控事件处理）。**macOS 侧 `src/platform/macos/overlay.rs` 未改动，但产品交互契约已变更，必须同步评估。**
+
+#### 2.10.1 新增产品状态
+
+Windows 侧新增两个 `OverlayStatus` 变体：
+
+- `RecordingWithText { text }`：录音过程中显示流式 ASR 文本。
+- `StreamingEditing { text }`：用户在录音过程中点击 overlay 文本区，接管编辑；停止录音与后续 pipeline，进入可编辑状态。
+- `EditSubmitting { text }`：编辑提交中过渡态，用于 overlay 复位动画。
+
+#### 2.10.2 核心交互契约
+
+1. **按下热键**：overlay 以 `Recording` 态出现（尺寸 240×36，居中，不抢焦点）。
+2. **流式文本到达**：overlay 切换到 `RecordingWithText`，文本在客户区中央显示；窗口宽度随文本量扩展，上限为当前显示器工作区宽度的 65%；超过上限后文本在可视区内向左滚动，最新文字紧贴右边缘。
+3. **用户点击文本区**：overlay 进入 `StreamingEditing`；同时：
+   - 移除 `WS_EX_NOACTIVATE`，使 overlay 可获焦；
+   - 创建 Win32 `EDIT` 子控件接管输入/IME；
+   - 停止音频采集并取消 ASR/pipeline（不进入 `Processing`）；
+   - 托盘仍显示 `Recording`，表示本次语音输入尚未结束。
+4. **编辑提交（Enter 或点击提交按钮）**：把 EDIT 内容原样注入录音开始时的目标窗口；若无法取回焦点（UIPI），降级为复制到剪贴板并显示 `FocusLost` 预览。
+5. **编辑取消（ESC 或点击停止按钮）**：隐藏 overlay，托盘恢复 Idle。
+6. **重新按下热键**：overlay 必须重置为初始 `Recording` 态（尺寸、样式、NOACTIVATE 全部复位）。
+
+#### 2.10.3 macOS 侧待实现项
+
+- 在 `OverlayStatus` 中新增同样变体（已落在平台中立 `src/ui/overlay.rs`，macOS 侧编译同一份代码，无需重定义）。
+- `src/platform/macos/overlay.rs` 需要实现对应行为：
+  - 在 `Recording` overlay 内叠加只读流式文本；
+  - 点击文本区切换到可编辑控件（`NSTextField` / `NSTextView`）；
+  - 窗口尺寸动态扩展 + 65% 上限 + 内部滚动；
+  - 提交按钮 / Enter 提交 / ESC 取消；
+  - 编辑提交后调用 `platform::inject_text` 或 `copy_text_to_clipboard` + `FocusLost` 预览降级。
+- 与 Windows 侧保持一致的状态流转：录音中点击即进入编辑，不等松开热键。
+
+#### 2.10.4 对 Windows 侧的反向约束
+
+- `OverlayStatus` 枚举是共享类型，macOS 侧编译同一份定义，**禁止从 Windows 侧删除或重命名新变体**。
+- 新增 `OverlayCommand::UpdateStreamingText`、`EnterEditMode` 是 Windows-only 内部命令，不影响 macOS 平台契约。
+- 新增 `OverlayUiEvent::SubmitRequested(String, platform::WindowId)` 仅 Windows 侧使用；macOS 侧若采用不同事件模型，不强制对齐签名，但**语义**（提交文本 + 目标窗口）必须一致。
 | 027-F | 027-E 引入的静默归零：隐式尾数吸收未做纯数字校验，带单位串进 `format_currency_chain` 的 `.parse()` 静默归零（`五块三亿`→`5元`） | **金额静默改错** |
 | 027-G-1 | DEC-042 补充二：万亿层升级链（`一万亿`→`1万亿`，亿层 ≥1e12 且 ≤1位小数升万亿） | **行为变更** |
 | 027-G-2 | DEC-044：`十万个为什么`加专名白名单（书名兼俗语，`itn-rules.toml` proper_nouns +1 条） | 数据变更 |
@@ -996,3 +1040,21 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 **不裁剪反而更安全的理由**：FIRSTCHAR-FIX 001~006 六轮才把首字率从 ~20% 压到 ~54%，根因就是裁剪截断了送气声母。真流式不裁剪，从机制上消除了这个风险。VAD 入口门控 + pre-roll 补发保证首字不丢。
 
 **端测观察点**：真流式模式下，若发现费用异常增加（相对非流式回退），可考虑在 transcribe_streaming_realtime 的 pre-roll 补发阶段加能量门控（低于阈值的 pre-roll chunk 不发），但这会重新引入送气声母风险，需端测权衡。
+
+---
+
+## §TRANS-HOTKEY-039-D · 抽判据纯函数 + 清理死常量（Windows 侧，2026-08-15）
+
+### 改动范围
+
+仅 `src/platform/windows/hotkey.rs`（+90/-6）：
+- 新增 `hotkey_mode_to_u32(mode: HotkeyMode) -> u32` 纯函数（PTT=1/Toggle=0）
+- 新增 `should_stop_translate_poll_on_keyup(mode: u32) -> bool` 纯函数
+- `keyboard_hook_proc` 的 `if mode == 1` → 调 `should_stop_translate_poll_on_keyup(mode)`
+- `install_keyboard_hook` 的 `if mode == PushToTalk { 1 } else { 0 }` → 调 `hotkey_mode_to_u32(mode)`
+- 删死常量 `TRANSLATE_WINDOW_MS`（全库零使用）
+- +4 真护栏测试（调生产函数）
+
+### 对 macOS 的影响
+
+**已评估，对 macOS 无影响**。`hotkey.rs` 全部位于 `#[cfg(target_os = "windows")]` 门控内，macOS 侧不编译此文件。`HotkeyMode` 枚举本身是平台中立的（config 层定义），但两个新纯函数只在 Windows 的 hotkey 模块内使用，macOS 侧无对应调用点。`TRANSLATE_WINDOW_MS` 原本也只在 Windows 侧使用，删除不影响 macOS。

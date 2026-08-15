@@ -2,6 +2,31 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-08-15 — coder-1 — TRANS-HOTKEY-039-D ✅ 抽判据纯函数 + 清理死常量
+
+- **来源**：主控验收 TEST-SYNC-038 时发现假护栏（tester-1 闭包自述同义反复，与生产零耦合）。基线 HEAD `4f3b41b` + 在途改动
+- **文件域**：仅 `src/platform/windows/hotkey.rs`（+90/-6）
+- **三件事**：
+  - ① 抽 `should_stop_translate_poll_on_keyup(mode: u32) -> bool`：PTT 抬起停、Toggle 抬起不停。钩子 `:213` 调用替换 `if mode == 1`
+  - ② 抽 `hotkey_mode_to_u32(mode: HotkeyMode) -> u32`：PTT=1/Toggle=0。`install_keyboard_hook` 调用替换内联 `if mode == PushToTalk { 1 } else { 0 }`。消除三处各自硬编码 1/0 的漂移风险
+  - ③ 删死常量 `TRANSLATE_WINDOW_MS`（:30 定义，全库零使用，独立 grep 取证确认）
+- **真护栏**：+4 测试调 `hotkey_mode_to_u32` + `should_stop_translate_poll_on_keyup` 两个生产函数，把判据语义改错或映射改错测试会变红。替换 tester-1 的假护栏 `target_mode_mapping_pushes_to_talk_to_1_toggle_to_0`。**护住范围**：判据语义与映射漂移；调用点结构性放置仍无自动护栏（把 store(true) 移出 if 块判据函数仍返回正确值测试照样绿），依赖 code review，原因是钩子回调不可单测
+- **行为零变更**：PTT 抬起仍停、Toggle 抬起仍不停
+- **验收**：cargo fmt clean / cargo check --all-targets 0 error / cargo test hotkey 23 passed 0 failed
+- **版本号未动**（已是 0.8.0）
+- **详情**：outbox/coder-1/result.md + logs/20260815.md + CHANGELOG.md
+
+## 2026-08-15 — tester-1 — TEST-SYNC-038 ✅ 阶段三：ASR-038-B + TRANS-HOTKEY-039 测试用例（只写测试，零生产改动）
+
+- **来源**：TEST-SYNC-038 阶段三任务书（inbox/tester-1/task.md）。基线 HEAD `4f3b41b`；命令白名单仅 `cargo fmt` + `cargo check --all-targets`；6 允许文件域；**main.rs 禁碰**（coder-2 ASR-038-C 在途）
+- **7 项覆盖对标**：#1 vad 流式降级=基线已覆盖（补 `vad_window_size_is_512` + 双工厂降级一致）；#2 record_streaming pre-roll=部分→补音序拼装；**#3 record() 零改动=补 `collect_recording_preserves_pre_roll_then_hotkey_then_live_order` + `collect_recording_fails_when_stream_failed`（直接调生产 collect_recording 钉旧路径契约）**；#4 端点配置=基线已覆盖；#5 两套端点不混淆=补 config 默认值显式不同；**#6 硬上限=补 `translate_poll_hard_deadline_is_max_record_plus_5`（MAX_RECORD_SECONDS+5=305 + 四常量）**；**#7 WM_KEYUP/mode==0=补 `target_mode_mapping_pushes_to_talk_to_1_toggle_to_0`（Toggle→0 不置 TRANSLATE_POLL_STOP）**
+- **新增 10 用例（5 文件）**：audio/mod.rs×2、windows/hotkey.rs×2、config/mod.rs×2、qwen_inference.rs×2（C-3 空 key bail + 常量）、vad.rs×2
+- **移交 main.rs 的用例规格表**（网络/硬件/键盘钩子路径，038-C 完成后另派 038-B 执行）：热键下沿实际操作（039 验收）、Toggle 二次按下停录、PTT 松键即停、硬上限 305s 兜底、block 式 record() 下沿打断回归、qwen3/qwen_asr 双通道并存——规格表已写入 `outbox/tester-1/result.md` 第三节
+- **验证**：`cargo fmt` clean / `cargo check --all-targets` 0 error（中途 main.rs coder-2 WIP 有 GetDC/adjust_overlay/EditSubmitting 瞬态 error，git stash 自证非本任务引入，重跑归零）/ 未触碰 main.rs/macos/**/tests/**
+- **🔴 验收返工（主控意见已闭环）**：① #7 由 ✅ 降 ⚠️——`target_mode_mapping_pushes_to_talk_to_1_toggle_to_0` 的 map/stops_on_keyup 闭包是测试内自声明、与生产（:226-229/:197）零耦合（有人移出 store(true) 照样绿）；真护栏=抽生产侧纯函数（主控另开单），当前为意图文档化。② 删 `assert_eq!(TRANSLATE_WINDOW_MS, 500)`——该常量已死（生产零使用，500ms 被硬上限取代），列入 result.md「待清理死代码」交主控。
+- **版本号未动**（已是 0.8.0）
+- **详情**：`outbox/tester-1/result.md` + `logs/20260815.md` + CHANGELOG.md
+
 ## 2026-08-15 — coder-2 — TRANS-HOTKEY-039 ✅ 翻译热键全链失效修复（P0）
 
 - **来源**：Gavin 端测报翻译热键 100% 不生效，主控全链取证后派发。基线 HEAD `4b3c63f` + coder-1 ASR-038-B 在途改动

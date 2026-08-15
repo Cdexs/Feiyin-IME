@@ -1,5 +1,113 @@
 # 任务列表 · voice-ime
 
+## 🛑 2026-08-15 会话暂停交接 —— 下次从这里开始
+
+> **暂停原因**：coder-2 token 额度用尽（Gavin 指令：暂停开发，额度恢复后继续，完成再通知主控）。
+
+### 断点状态（主控实测取证，非推测）
+
+| 项 | 状态 |
+| --- | --- |
+| 编译 | ✅ **`cargo check --all-targets` 0 error**（暂停前实测） |
+| 工作区 | ✅ 已全部提交，无悬空改动 |
+| coder-2 上下文 | ⚠️ 从 82% **掉到 32%** —— session 被压缩或重启，**恢复时必须重新注入任务上下文** |
+| coder-1 / tester-1 | ✅ 空闲，本轮任务全部结案 |
+
+### 各任务状态
+
+| 任务 | 负责人 | 状态 |
+| --- | --- | --- |
+| ASR-038-B 真流式（C-1~C-4 + 040-A 埋点） | coder-1 | ✅ **已验收已提交** `4f3b41b` |
+| TRANS-HOTKEY-039 翻译热键 | coder-2 | ✅ **已验收已提交** `4f3b41b` |
+| TEST-SYNC-038 测试同步（10 用例） | tester-1 | ✅ **已验收**（返工一轮） |
+| TRANS-HOTKEY-039-D 抽纯函数补真护栏 | coder-1 | ✅ **已验收**（更正一处过强结论） |
+| **ASR-038-C overlay 边说边上屏** | coder-2 | 🔴 **WIP 未验收 —— 有 1 个 P0，见下** |
+
+### 🔴 ASR-038-C 恢复开发时必须先修的三项（主控代码验收查出）
+
+**① P0：编辑态一进就被销毁，headline 功能失效**
+
+证据链（四步全部主控 Read 取证）：
+
+```
+main.rs:2834  EditRequested 处理里 cancel_signal.store(true)
+main.rs:3289  流式 worker 检测到 cancel_signal → send_event(PipelineEvent::Cancelled)
+main.rs:2758  Done | Cancelled 分支 → overlay_handle.send(OverlayCommand::Hide)
+main.rs:993   Hide 处理 → destroy_edit_control() + state.request = None（无任何守卫）
+```
+
+→ 用户点 overlay 文本区进编辑态，**EDIT 控件刚建好就被销毁，overlay 消失**。
+
+> 037 设计里本有 `pipeline_cancelled` 拦这个，但**全库只出现在 `main.rs:153` 的文档注释里，从未实现**。
+> **修法（双保险，建议都做）**：① 主控侧维护编辑态标志，编辑态时 `Done|Cancelled` 不发 `Hide`；
+> ② overlay 侧 `Hide` 加守卫，`status == StreamingEditing` 时忽略。
+
+**② 托盘状态**：037 要求编辑态期间托盘保持 `Recording`，但 `:2758` 的 `Cancelled` 分支
+`set_tray_state(Idle)`。与 ① 同根因，一并修。
+
+**③ 100ms 尺寸节流缺失**：`:2741` 注释引 037 §5.2 称「靠 16ms timer 自然节流」——
+但 16ms timer 节流的是**重绘频率**，挡不住**窗口宽度每帧都变**。037 §5.2 与风险表第 4 条
+明确要求第二道尺寸节流防抖。**请补。**
+
+### ✅ ASR-038-C 已做对的部分（恢复时不要重做）
+
+`StreamingText`/`EditRequested` 双向接线 ｜ 双阶段样式 `remove_noactivate`/`restore_noactivate` ｜
+`EDIT` 子类化 ｜ UIPI 降级到剪贴板 ｜ 白色 `0xFFFFFF` + 品牌橙 `0x006BFF` ｜
+65% 宽度上限 `STREAMING_OVERLAY_MAX_SCREEN_RATIO` ｜ `cargo check` 0 error
+
+> 📌 **EDIT 几何他做得比设计稿好**：037 写死 `(42,10)-(191,26)`，他改成按边距从 overlay rect 推导
+> （`STREAMING_TEXT_LEFT_MARGIN = 42` 与规格吻合）。窗口随文字变宽时硬编码那版会错位，
+> 他这版能自适应。**这是正确的偏离，不要改回去。**
+
+### 🔴 另一个独立缺口：新 ASR 引擎【没有任何途径被启用】
+
+| 层 | 状态 |
+| --- | --- |
+| Rust 后端 | ✅ 认 `qwen_audio_online`（`transcription/mod.rs:48`） |
+| **UI 下拉** | ❌ **`qwen_audio_online` 在 `ui/src` 里零命中** |
+| Gavin 的 config | ❌ `asr_model = "qwen3_online"`（旧 Realtime 引擎） |
+
+**后果**：即使 038-C 修好、包也出了，端测跑的仍是**旧引擎** ——
+新协议 / 真流式 / VAD 计费门控 / 热词注入 / 040-A 埋点**一样都不会触发**。
+
+> 与今天的端点三缺陷同类：**后端做完了，开关没装上。**
+> **待办**：① 补 UI 下拉选项（`ui/`，可派 coder-1，与 coder-2 文件域零重叠）；
+> ② 端测前可先手改 `config.toml` 的 `asr_model = "qwen_audio_online"` 抢先验证新引擎连通性。
+
+### 模型 ID 核对（Gavin 2026-08-15 特别确认，三处一致）
+
+**新引擎 = `qwen-audio-3.0-asr-flash-streaming`**
+（`qwen_inference.rs:47` `DEFAULT_MODEL` / `config/mod.rs:203` / `transcription/mod.rs:948,957` 断言）
+
+| | 旧（现役） | 新（集成中） |
+| --- | --- | --- |
+| 模型 ID | `qwen3-asr-flash-realtime` | **`qwen-audio-3.0-asr-flash-streaming`** |
+| 配置项 | `qwen3_asr_model` | **`qwen_asr_model`** |
+| API / 路径 | Realtime `/api-ws/v1/realtime` | **Inference `/api-ws/v1/inference`** |
+| model 位置 | URL query | **payload 内** |
+| 音频帧 | base64 文本帧 | **二进制帧 3200B/片** |
+| `asr_model` 枚举 | `qwen3_online` | **`qwen_audio_online`** |
+
+两套完全并存，WorkspaceId（`llm-kudx4dj2bfqn4gr2`）与 API key 共用，仅路径与协议不同。
+**今天的端点三缺陷根因就是两边命名太像，A 批写成了「用新协议连旧端点」。**
+
+### 恢复后的执行顺序（Gavin 已拍板）
+
+```
+① coder-2 恢复 → 修 038-C 三项 → 主控验收
+② 补 UI 下拉选项（qwen_audio_online）
+③ tester-1：TEST-SYNC-038-B（main.rs 用例，规格表已在 outbox/tester-1/result.md）
+      ↓ 串行
+④ tester-1：TEST-EXEC-038 全量回归（阶段四，本批从未跑过全量）
+⑤ BUILD-016 出包（阶段五，主控须请示 Gavin 后执行）
+```
+
+> ⚠️ **出包后建议 Gavin 首次用 `-debug` 跑**：新端点连通性 / 计费口径（`usage.duration` 是
+> 上传音频时长还是墙钟会话时长，官方文档未覆盖）/ 040-A 四段耗时 / VAD 门控实际行为
+> —— 这四项**只有 debug.log 能给答案**，且是 040-B/C 连接优化的唯一数据来源。
+
+---
+
 > ✅ **产物已更新**（2026-08-03 **17:42**，BUILD-012）：`Publish/feiyin-ime.exe` `DB07CEFD8D51` / `feiyin-ime-ui.exe` `46D0F31E149D` / `crash-reporter.exe` `699ED9656958`，包含 017/018/020/021/**023**（四语标记清单恢复扩充）。三 exe 两副本 sha256 一致，两 toml 三副本一致（`scene-rules.toml` `7C1F0620` / `itn-rules.toml` `ED77A912`），ProductVersion 0.7.3.0/0.7.3。**⏭ 待 Gavin 端测。**
 > 🔴 **2026-08-04 主控核查：上方产物不含 ITN-FIX-CHAIN-TEAR-026** —— 产物 mtime `17:42:42` 早于 `src/itn.rs` `23:47:25` 整 6 小时。026 需 BUILD-013 才进 exe，详见下方 P0 节。
 > ⏳ **本地 ahead 2 未 push**（最新 `2447dbb`，Gavin 只授权提交，不授权 push）。
@@ -89,7 +197,26 @@ DNS 解析 (to_socket_addrs，阻塞系统调用，无缓存)
 
 ---
 
-## 🔄 验收中（已打回一轮） · TRANS-HOTKEY-039 翻译热键全链失效（2026-08-15）
+## ✅ 已结案（主控标注） · TRANS-HOTKEY-039 翻译热键全链失效（2026-08-15）
+
+> ✅ **2026-08-15 主控终验通过并提交 `4f3b41b`**（打回一轮后）。
+> `cargo fmt --check` clean ｜ `cargo check --all-targets` **0 error**（主控独立复算）｜
+> 五文档 + `MACOS-HANDOFF` grep 全部命中 ｜ 收尾自证表九行填满 ｜ coder-1 在途改动未被误伤。
+>
+> ⏭ **待 Gavin 端测**：修好后 UI 上热键会**显示为 "Left Shift"** —— 那不是又坏了，
+> 是它第一次说实话（config 存的本来就是 `160` = 左 Shift）。**要用右 Shift 需重新录制一次。**
+> 另：根因 B 修好后「录音中途按翻译键」才真正可用（原先只有 500ms 窗口）。
+
+### ✅ TRANS-HOTKEY-039-D 抽判据纯函数 + 清理死常量（coder-1，2026-08-15）
+
+- **来源**：主控验收 TEST-SYNC-038 时发现假护栏（tester-1 闭包自述同义反复）
+- **改动**：仅 `src/platform/windows/hotkey.rs`（+90/-6）
+  - ① 抽 `should_stop_translate_poll_on_keyup(mode: u32) -> bool` 纯函数
+  - ② 抽 `hotkey_mode_to_u32(mode: HotkeyMode) -> u32` 纯函数（消除三处硬编码 1/0 漂移）
+  - ③ 删死常量 `TRANSLATE_WINDOW_MS`（全库零使用）
+  - +4 真护栏测试（调生产函数，把 store(true) 移出 if 门控或映射改错会变红）
+- **验收**：cargo fmt clean / cargo check --all-targets 0 error / cargo test hotkey 23/0
+- **行为零变更**：PTT 抬起仍停、Toggle 抬起仍不停
 
 > 🔴 **2026-08-15 主控更正状态**：coder-2 曾把本节标为「✅ 已结案」，但**当时主控已打回**，
 > Toggle 回归尚未修复。**状态不实，已改回「验收中」。**

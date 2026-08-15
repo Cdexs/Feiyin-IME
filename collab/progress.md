@@ -434,6 +434,7 @@ PTT 录音中点击即进编辑态（不等松键）｜流式文本白色不加�
 | 批次 | 内容 | 文件域 | 负责人 | 状态 |
 | --- | --- | --- | --- | --- |
 | **TRANS-HOTKEY-039** | 翻译热键全链失效修复（VK_TO_LABEL Shift 标签修正 + 轮询跟随录音生命周期 + 硬上限兜底 + flag 日志 + 6 处终止路径通知） | `ui/src/pages/HotkeySettings.tsx`、`src/platform/windows/hotkey.rs`、跨 `src/main.rs` 6 处调用 | coder-2 | ✅ 已验证 |
+| **TRANS-HOTKEY-039-D** | 抽判据纯函数补真回归护栏 + 清理死常量 | `src/platform/windows/hotkey.rs` | coder-1 | ✅ 已验证（should_stop_translate_poll_on_keyup + hotkey_mode_to_u32 纯函数 + 删 TRANSLATE_WINDOW_MS + 4 真护栏测试） |
 | **ASR-038-A** | `qwen_inference.rs` 新建（流式协议 + 二进制帧 + 热词 + 四语） | `src/transcription/` 新文件 | coder-1 | ✅ **主控独立复现验收通过** |
 | **ASR-038-B** | VAD 入口门控 + 管线改造（边录边发 + 增量接收） | `src/audio/`、`src/main.rs`、`src/transcription/`、`src/ui/overlay.rs`（仅数据字段） | coder-1 | 🟡 **真流式核心已实施**（C-1 VadSegmenter滚动方法 + C-2 record_streaming + C-3 transcribe_streaming_realtime + C-4 worker接线 + 040-A埋点）。编译已通 / 949+32测试全绿。待主控终验（重点验FIRSTCHAR等价+record零改动+040-A四段覆盖） |
 | ASR-038-C | overlay 流式显示 + 编辑态 + EDIT 控件 | `src/main.rs`、`src/ui/overlay.rs`（绘制与交互） | coder-2 | 🔜 等 B（**同动 `src/main.rs`，零并行空间**） |

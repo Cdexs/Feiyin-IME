@@ -69,7 +69,7 @@ pub fn push_level(buf: &AudioLevelBuf, rms: f32) {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OverlayStatus {
     Recording,
-    /// ASR-038-B: 录音中带流式预览文本（数据字段，渲染由 C-overlay 批实现）
+    /// ASR-038-B/C: 录音中带流式预览文本（数据字段，渲染由 C-overlay 批实现）
     /// production 端写入 streaming_text，消费端读取并绘制
     RecordingWithText {
         text: String,
@@ -79,6 +79,12 @@ pub enum OverlayStatus {
         message: String,
     },
     Processing(String),
+    /// ASR-038-C: 用户接管编辑态（录音中点击文本区进入）。
+    /// 携带当前流式/已编辑文本，由 overlay 线程内嵌 EDIT 控件渲染。
+    StreamingEditing {
+        text: String,
+    },
+
     /// Focus was lost; show text preview with copy button.
     FocusLost {
         text: String,

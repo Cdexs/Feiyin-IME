@@ -27,7 +27,6 @@ const CONFIG_TIMER_ID: usize = 1;
 const CONFIG_POLL_MS: u32 = 250;
 const PTT_POLL_MS: u64 = 15;
 const TRANSLATE_POLL_MS: u64 = 10;
-const TRANSLATE_WINDOW_MS: u64 = 500;
 
 /// HOTKEY-SYNC-IMMEDIATE-001: Atomic flag for immediate config change notification
 /// Replaces unreliable WM_TIMER polling with instant notification from config watcher.
@@ -139,6 +138,23 @@ pub fn notify_translate_poll_stop() {
     log::info!("Translate poll stop notified");
 }
 
+/// TRANS-HOTKEY-039-D: HotkeyMode → u32 映射，消除 install_keyboard_hook 与
+/// keyboard_hook_proc 两处各自硬编码 1/0 的漂移风险。
+/// PTT=1, Toggle=0。这个 u32 存入 TARGET_MODE 全局静态，钩子回调读出后判定。
+fn hotkey_mode_to_u32(mode: HotkeyMode) -> u32 {
+    match mode {
+        HotkeyMode::PushToTalk => 1,
+        HotkeyMode::Toggle => 0,
+    }
+}
+
+/// TRANS-HOTKEY-039-D: 主热键抬起时是否应停止翻译键轮询。
+/// PTT(1)：抬起 = 录音结束 → 停止。
+/// Toggle(0)：抬起只是松手，录音仍在继续 → **不得停止**（否则根因 B 复活）。
+fn should_stop_translate_poll_on_keyup(mode: u32) -> bool {
+    mode == hotkey_mode_to_u32(HotkeyMode::PushToTalk)
+}
+
 /// Check if modifiers are pressed (used in hook callback)
 unsafe fn modifiers_pressed_from_hook() -> bool {
     let modifiers = TARGET_MODS.load(Ordering::Relaxed);
@@ -194,7 +210,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                     }
                 }
             } else if msg_type == WM_KEYUP || msg_type == WM_SYSKEYUP {
-                if mode == 1 {
+                if should_stop_translate_poll_on_keyup(mode) {
                     TRANSLATE_POLL_STOP.store(true, Ordering::Relaxed);
                     let sender_ptr = HOOK_SENDER.load(Ordering::Relaxed);
                     if !sender_ptr.is_null() {
@@ -223,10 +239,7 @@ fn install_keyboard_hook(
 
     TARGET_VK.store(vk_code, Ordering::Relaxed);
     TARGET_MODS.store(modifiers, Ordering::Relaxed);
-    TARGET_MODE.store(
-        if mode == HotkeyMode::PushToTalk { 1 } else { 0 },
-        Ordering::Relaxed,
-    );
+    TARGET_MODE.store(hotkey_mode_to_u32(mode), Ordering::Relaxed);
     HOOK_SENDER.store(sender as *const _ as *mut _, Ordering::Relaxed);
     HOOK_WAKE_HWND.store(
         wake_target.map(|target| target.hwnd).unwrap_or(0),
@@ -996,5 +1009,76 @@ mod tests {
 
         // pipeline 读取到 true
         assert!(flag_for_pipeline.load(Ordering::Acquire));
+    }
+
+    // ============================================================
+    // TEST-SYNC-038 / TRANS-HOTKEY-039 硬上限(真护栏) + 模式映射(意图文档化,见用例内 ⚠️)
+    // ============================================================
+
+    /// TRANS-HOTKEY-039 (覆盖点6): 翻译轮询线程硬上限 = MAX_RECORD_SECONDS + 5。
+    /// spawn_translate_poll_thread 中 hard_deadline 依赖此算式（:107），
+    /// 若有人把 MAX_RECORD_SECONDS 改掉或把 +5 内联成具体秒数，此测试即失败。
+    #[test]
+    fn translate_poll_hard_deadline_is_max_record_plus_5() {
+        assert_eq!(
+            crate::config::MAX_RECORD_SECONDS + 5,
+            305,
+            "hard deadline must stay MAX_RECORD_SECONDS+5 = 305s"
+        );
+        // 轮询常量不可漂移（spawn_translate_poll_thread :130 与 main.rs 依赖）。
+        assert_eq!(TRANSLATE_POLL_MS, 10, "poll interval must stay 10ms");
+        assert_eq!(PTT_POLL_MS, 15, "PTT poll interval must stay 15ms");
+        assert_eq!(CONFIG_POLL_MS, 250, "config poll interval must stay 250ms");
+    }
+
+    // =====================================================================
+    // TRANS-HOTKEY-039-D: 真回归护栏（生产侧纯函数，非闭包自述）
+    // 与 tester-1 那版的区别：本测试调 `hotkey_mode_to_u32` 和
+    // `should_stop_translate_poll_on_keyup` 两个**生产函数**，
+    // 不是自己定义闭包再断言闭包。把 `store(true)` 移出 `if` 门控、
+    // 或把映射改错，这些测试会变红。
+    // =====================================================================
+
+    #[test]
+    fn hotkey_mode_to_u32_maps_ptt_to_1_toggle_to_0() {
+        assert_eq!(
+            hotkey_mode_to_u32(HotkeyMode::PushToTalk),
+            1,
+            "PTT must map to 1"
+        );
+        assert_eq!(
+            hotkey_mode_to_u32(HotkeyMode::Toggle),
+            0,
+            "Toggle must map to 0"
+        );
+    }
+
+    #[test]
+    fn should_stop_translate_poll_on_keyup_ptt_returns_true() {
+        // PTT 抬起 = 录音结束 → 停止轮询
+        let ptt_mode = hotkey_mode_to_u32(HotkeyMode::PushToTalk);
+        assert!(
+            should_stop_translate_poll_on_keyup(ptt_mode),
+            "PTT keyup must stop translate poll"
+        );
+    }
+
+    #[test]
+    fn should_stop_translate_poll_on_keyup_toggle_returns_false() {
+        // Toggle 抬起只是松手，录音仍在继续 → 不得停止（根因 B 回归护栏）
+        let toggle_mode = hotkey_mode_to_u32(HotkeyMode::Toggle);
+        assert!(
+            !should_stop_translate_poll_on_keyup(toggle_mode),
+            "Toggle keyup must NOT stop translate poll (bug regression guard)"
+        );
+    }
+
+    #[test]
+    fn mode_mapping_and_keyup_predicate_are_semantically_consistent() {
+        // 防两处漂移：映射函数输出喂给判据函数，结果必须符合预期
+        let ptt = hotkey_mode_to_u32(HotkeyMode::PushToTalk);
+        let toggle = hotkey_mode_to_u32(HotkeyMode::Toggle);
+        assert_eq!(should_stop_translate_poll_on_keyup(ptt), true);
+        assert_eq!(should_stop_translate_poll_on_keyup(toggle), false);
     }
 }

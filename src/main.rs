@@ -51,15 +51,16 @@ use windows::Win32::Graphics::Dwm::{
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
-    AlphaBlend, BeginPaint, BitBlt, Chord, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
+    AlphaBlend, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
     CreatePen, CreateRectRgn, CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject,
-    DrawTextW, Ellipse, EndPaint, FillRect, GetStockObject, InvalidateRect, LineTo, MoveToEx,
-    Rectangle, RoundRect, SelectObject, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor,
-    SetWindowRgn, StretchBlt, UpdateWindow, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION,
-    CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH, DRAW_TEXT_FORMAT, DT_CENTER,
-    DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, FF_DONTCARE, FW_NORMAL,
-    HALFTONE, HDC, HFONT, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_NULL, PS_SOLID, SRCCOPY,
-    TRANSPARENT,
+    DrawTextW, Ellipse, EndPaint, FillRect, GetDC, GetMonitorInfoW, GetStockObject,
+    GetTextExtentPoint32W, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, Rectangle,
+    ReleaseDC, RestoreDC, RoundRect, SaveDC, SelectClipRgn, SelectObject, SetBkColor, SetBkMode,
+    SetBrushOrgEx, SetStretchBltMode, SetTextColor, SetWindowRgn, StretchBlt, UpdateWindow,
+    AC_SRC_OVER, BLENDFUNCTION, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH,
+    DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
+    FF_DONTCARE, FW_NORMAL, HALFTONE, HDC, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_NULL, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -69,19 +70,30 @@ use windows::Win32::System::Registry::{
     KEY_WRITE, REG_SZ,
 };
 #[cfg(target_os = "windows")]
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, SetActiveWindow, SetFocus, VK_ESCAPE, VK_RETURN,
+};
+
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::WindowsAndMessaging::{
+    ES_AUTOHSCROLL, ES_MULTILINE, GWLP_WNDPROC, WINDOW_STYLE,
+};
+#[cfg(target_os = "windows")]
+const EM_SETSEL_MSG: u32 = 0x00B1; // EM_SETSEL
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetClientRect, GetForegroundWindow, GetMessageW, GetSystemMetrics, KillTimer,
-    LoadCursorW, MsgWaitForMultipleObjects, PeekMessageW, PostMessageW, PostQuitMessage,
-    RegisterClassW, SetForegroundWindow, SetLayeredWindowAttributes, SetTimer, SetWindowPos,
-    ShowWindow, TrackPopupMenu, TranslateMessage, CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA,
-    HMENU, IDC_ARROW, LWA_ALPHA, MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN,
-    SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNA, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP,
-    WM_NCCREATE, WM_PAINT, WM_TIMER, WNDCLASSW, WNDCLASS_STYLES, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_POPUP,
+    DispatchMessageW, GetClientRect, GetForegroundWindow, GetMessageW, GetSystemMetrics,
+    GetWindowLongPtrW, KillTimer, LoadCursorW, MsgWaitForMultipleObjects, PeekMessageW,
+    PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetLayeredWindowAttributes,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage,
+    CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA, GWL_EXSTYLE, HMENU, IDC_ARROW, LWA_ALPHA,
+    MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN, SM_CYSCREEN,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
+    SW_SHOWNA, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CTLCOLOREDIT, WM_DESTROY,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_NCCREATE, WM_PAINT, WM_TIMER, WNDCLASSW,
+    WNDCLASS_STYLES, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
 };
 #[derive(Debug, Clone)]
 enum PipelineEvent {
@@ -128,6 +140,8 @@ enum WorkerCommand {
 #[cfg(target_os = "windows")]
 enum OverlayCommand {
     Show(OverlayRequest),
+    /// ASR-038-C: 从 Recording/RecordingWithText 进入 StreamingEditing 态
+    EnterEditMode,
     Hide,
     Shutdown,
 }
@@ -135,9 +149,11 @@ enum OverlayCommand {
 enum OverlayUiEvent {
     CancelRequested,
     PreviewCopied,
-    /// ASR-038-B: 用户点击 overlay 文本区进入编辑态（DESIGN-OVERLAY-037 §6）
+    /// ASR-038-B/C: 用户点击 overlay 文本区进入编辑态（DESIGN-OVERLAY-037 §6）
     /// ASR 侧接收后：关 WebSocket → 丢弃 StreamingAsrState → 置 pipeline_cancelled=true
     EditRequested,
+    /// ASR-038-C: 用户完成编辑，提交 EDIT 控件内容 + 原始目标窗口句柄回主控
+    SubmitRequested(String, platform::WindowId),
 }
 #[derive(Debug, Clone)]
 #[cfg(target_os = "windows")]
@@ -149,6 +165,8 @@ struct OverlayRequest {
     ui_language: config::UiLanguage,
     /// Auto close after this duration (milliseconds), 0 means no auto close
     auto_close_ms: u32,
+    /// ASR-038-C: 本次录音开始时捕获的目标窗口，用于编辑提交后归还焦点 / 注入文本
+    target_hwnd: platform::WindowId,
 }
 #[derive(Debug, Clone, Copy)]
 #[cfg(target_os = "windows")]
@@ -417,6 +435,166 @@ fn encode_wide(text: &str) -> Vec<u16> {
         .chain(std::iter::once(0))
         .collect()
 }
+
+#[cfg(target_os = "windows")]
+fn get_window_text(hwnd: HWND) -> Result<String> {
+    let mut len = unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(hwnd) };
+    if len < 0 {
+        len = 0;
+    }
+    let mut buffer: Vec<u16> = vec![0; len as usize + 1];
+    let copied =
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut buffer) };
+    if copied > 0 {
+        let wide = &buffer[..copied as usize];
+        Ok(String::from_utf16_lossy(wide))
+    } else {
+        Ok(String::new())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn get_window_client_rect(hwnd: HWND) -> RECT {
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut rect);
+    }
+    rect
+}
+
+#[cfg(target_os = "windows")]
+fn remove_noactivate(hwnd: HWND) {
+    unsafe {
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let new_ex_style = ex_style & !(WS_EX_NOACTIVATE.0 as isize);
+        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex_style);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE,
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn restore_noactivate(hwnd: HWND) {
+    unsafe {
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let new_ex_style = ex_style | (WS_EX_NOACTIVATE.0 as isize);
+        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex_style);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE,
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn state_guard_edit_hwnd(state: &Arc<Mutex<OverlayWindowState>>) -> Option<HWND> {
+    if let Ok(state) = state.lock() {
+        state.edit_hwnd
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn create_edit_control(hwnd: HWND, state: &mut OverlayWindowState, rect: &RECT, text: &str) {
+    if state.edit_hwnd.is_some() {
+        return;
+    }
+    let hinstance = unsafe { GetModuleHandleW(None) }.unwrap_or_default();
+    let class_name = encode_wide("EDIT");
+    let title = encode_wide(text);
+    let edit_left = rect.left + STREAMING_TEXT_LEFT_MARGIN;
+    let edit_top = rect.top + STREAMING_TEXT_TOP_MARGIN;
+    let edit_right = rect.right - STREAMING_TEXT_RIGHT_MARGIN;
+    let edit_bottom = rect.bottom - STREAMING_TEXT_BOTTOM_MARGIN;
+    let edit_w = (edit_right - edit_left).max(1);
+    let edit_h = (edit_bottom - edit_top).max(1);
+    let edit_hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_NOACTIVATE, // child, keep NOACTIVATE so it doesn't steal from parent
+            PCWSTR(class_name.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE((ES_AUTOHSCROLL | ES_MULTILINE) as u32),
+            edit_left,
+            edit_top,
+            edit_w,
+            edit_h,
+            hwnd,
+            HMENU::default(),
+            HINSTANCE(hinstance.0),
+            None,
+        )
+    };
+    match edit_hwnd {
+        Ok(edit_hwnd) => {
+            state.edit_hwnd = Some(edit_hwnd);
+            // Background brush for WM_CTLCOLOREDIT
+            state.edit_bg_brush = Some(unsafe { CreateSolidBrush(OVERLAY_BG_DARK) });
+            // Subclass EDIT to suppress default border via WM_NCPAINT
+            let old_proc = unsafe {
+                SetWindowLongPtrW(edit_hwnd, GWLP_WNDPROC, edit_subclass_wnd_proc as isize)
+            };
+            state.edit_old_wndproc = Some(unsafe {
+                std::mem::transmute::<isize, windows::Win32::UI::WindowsAndMessaging::WNDPROC>(
+                    old_proc,
+                )
+            });
+            log::info!("ASR-038-C: created EDIT control for streaming editing");
+        }
+        Err(e) => {
+            log::error!("ASR-038-C: failed to create EDIT control: {}", e);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn edit_subclass_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == windows::Win32::UI::WindowsAndMessaging::WM_NCPAINT {
+        return LRESULT(0);
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+#[cfg(target_os = "windows")]
+fn destroy_edit_control(state: &mut OverlayWindowState) {
+    if let Some(edit_hwnd) = state.edit_hwnd.take() {
+        // Restore original window procedure if we have it
+        if let Some(old_proc) = state.edit_old_wndproc.take() {
+            unsafe {
+                let _ = SetWindowLongPtrW(edit_hwnd, GWLP_WNDPROC, unsafe {
+                    std::mem::transmute::<windows::Win32::UI::WindowsAndMessaging::WNDPROC, isize>(
+                        old_proc,
+                    )
+                });
+            }
+        }
+        unsafe {
+            let _ = DestroyWindow(edit_hwnd);
+        }
+    }
+    if let Some(brush) = state.edit_bg_brush.take() {
+        unsafe {
+            let _ = DeleteObject(brush);
+        }
+    }
+}
 fn spawn_settings_process() -> Result<Child> {
     // DEC-013: 启动 Tauri Settings 子进程。二进制名平台化：Windows=feiyin-ime-ui.exe,
     // macOS=feiyin-ime-ui（TRAY-001 修复硬编码 .exe）。
@@ -555,18 +733,45 @@ struct OverlayWindowState {
     cancel_btn_rect: Option<RECT>,
     close_btn_rect: Option<RECT>, // close button area (focus-lost preview)
     title_close_btn_rect: Option<RECT>, // title bar close button (focus-lost preview)
+    /// ASR-038-C: 提交按钮区域（编辑态）
+    submit_btn_rect: Option<RECT>,
+    /// ASR-038-C: 文本点击区域（录音/流式态进入编辑态）
+    text_hit_rect: Option<RECT>,
     shimmer_phase: f32,
+    /// ASR-038-C: 内嵌 EDIT 控件句柄，编辑态使用
+    edit_hwnd: Option<HWND>,
+    /// ASR-038-C: EDIT 控件子类化前原窗口过程，用于卸载时恢复
+    edit_old_wndproc: Option<windows::Win32::UI::WindowsAndMessaging::WNDPROC>,
+    /// ASR-038-C: 用于 WM_CTLCOLOREDIT 返回的背景画刷（BG_DARK）
+    edit_bg_brush: Option<windows::Win32::Graphics::Gdi::HBRUSH>,
 }
 #[cfg(target_os = "windows")]
 struct OverlayWindowData {
     state: Arc<Mutex<OverlayWindowState>>,
 }
+// ASR-038-C: shared overlay color constants (module level so helpers/wnd_proc can see them)
+#[cfg(target_os = "windows")]
+const OVERLAY_BRAND_ORANGE: COLORREF = COLORREF(0x006BFF); // #FF6B00
+#[cfg(target_os = "windows")]
+const OVERLAY_BG_DARK: COLORREF = COLORREF(0x110F0D);
+#[cfg(target_os = "windows")]
+const OVERLAY_TEXT_WHITE: COLORREF = COLORREF(0xFFFFFF);
 #[cfg(target_os = "windows")]
 const RECORDING_OVERLAY_SIZE: [i32; 2] = [240, 36]; // Recording window
 #[cfg(target_os = "windows")]
 const STATUS_OVERLAY_SIZE: [i32; 2] = [240, 36]; // Processing window adjusted height
 #[cfg(target_os = "windows")]
 const PREVIEW_OVERLAY_SIZE: [i32; 2] = [320, 140]; // UI-OPT-003: increased height for title bar
+#[cfg(target_os = "windows")]
+const STREAMING_TEXT_LEFT_MARGIN: i32 = 42; // left fixed: mic icon area + separator
+#[cfg(target_os = "windows")]
+const STREAMING_TEXT_RIGHT_MARGIN: i32 = 49; // right fixed: submit + stop buttons
+#[cfg(target_os = "windows")]
+const STREAMING_TEXT_TOP_MARGIN: i32 = 10; // keep inside 10px rounded-corner region
+#[cfg(target_os = "windows")]
+const STREAMING_TEXT_BOTTOM_MARGIN: i32 = 10;
+#[cfg(target_os = "windows")]
+const STREAMING_OVERLAY_MAX_SCREEN_RATIO: f32 = 0.65;
 #[cfg(target_os = "windows")]
 fn spawn_overlay_thread(
     audio_buf: AudioLevelBuf,
@@ -626,7 +831,12 @@ fn run_overlay_thread(
         cancel_btn_rect: None,
         close_btn_rect: None,
         title_close_btn_rect: None,
+        submit_btn_rect: None,
+        text_hit_rect: None,
         shimmer_phase: 0.0,
+        edit_hwnd: None,
+        edit_old_wndproc: None,
+        edit_bg_brush: None,
     }));
     let window_data = Box::new(OverlayWindowData {
         state: Arc::clone(&shared_state),
@@ -682,15 +892,29 @@ fn run_overlay_thread(
         }
         while let Ok(command) = command_rx.try_recv() {
             match command {
-                OverlayCommand::Show(request) => {
+                OverlayCommand::Show(mut request) => {
                     if let Ok(mut state) = shared_state.lock() {
+                        // ASR-038-C: clean up any lingering EDIT control when a fresh overlay appears
+                        destroy_edit_control(&mut state);
+                        restore_noactivate(hwnd);
                         state.request = Some(request.clone());
                         state.cancel_btn_rect = None;
                         state.close_btn_rect = None;
                         state.title_close_btn_rect = None;
+                        state.submit_btn_rect = None;
+                        state.text_hit_rect = None;
                         if request.status == OverlayStatus::Recording {
                             ui::overlay::warmup_levels(&state.audio_buf);
                         }
+                        // ASR-038-C: dynamic width for streaming text / editing
+                        let (new_pos, new_size) = adjust_overlay_pos_size_for_text(
+                            hwnd,
+                            &request.status,
+                            &request.pos,
+                            &request.size,
+                        );
+                        request.pos = new_pos;
+                        request.size = new_size;
                     }
                     unsafe {
                         let alpha = (request.opacity.clamp(0.1, 1.0) * 255.0).round() as u8;
@@ -713,18 +937,78 @@ fn run_overlay_thread(
                         }
                     }
                 }
+                OverlayCommand::EnterEditMode => {
+                    if let Ok(mut state) = shared_state.lock() {
+                        let text = state
+                            .request
+                            .as_ref()
+                            .and_then(|r| match &r.status {
+                                OverlayStatus::RecordingWithText { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        state.request = state.request.as_mut().map(|r| {
+                            r.status = OverlayStatus::StreamingEditing { text: text.clone() };
+                            r.clone()
+                        });
+                        // Remove NOACTIVATE so overlay can receive focus/IME
+                        remove_noactivate(hwnd);
+                        let rect = get_window_client_rect(hwnd);
+                        create_edit_control(hwnd, &mut state, &rect, &text);
+                        // Expand window to fit current text before focusing
+                        let (new_pos, new_size) = adjust_overlay_pos_size_for_text(
+                            hwnd,
+                            &state.request.as_ref().unwrap().status,
+                            &[0, 0],
+                            &RECORDING_OVERLAY_SIZE,
+                        );
+                        unsafe {
+                            let _ = SetWindowPos(
+                                hwnd,
+                                None,
+                                new_pos[0],
+                                new_pos[1],
+                                new_size[0],
+                                new_size[1],
+                                SWP_NOZORDER,
+                            );
+                        }
+                    }
+                    unsafe {
+                        let _ = ShowWindow(hwnd, SW_SHOW);
+                        let _ = SetActiveWindow(hwnd);
+                        if let Some(edit_hwnd) = state_guard_edit_hwnd(&shared_state) {
+                            let _ = SetFocus(edit_hwnd);
+                            // Select all text for quick replacement
+                            let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                                edit_hwnd,
+                                EM_SETSEL_MSG,
+                                WPARAM(0),
+                                LPARAM(-1i32 as isize),
+                            );
+                        }
+                        let _ = InvalidateRect(hwnd, None, true);
+                    }
+                }
                 OverlayCommand::Hide => {
                     if let Ok(mut state) = shared_state.lock() {
+                        destroy_edit_control(&mut state);
                         state.request = None;
                         state.cancel_btn_rect = None;
                         state.close_btn_rect = None;
                         state.title_close_btn_rect = None;
+                        state.submit_btn_rect = None;
+                        state.text_hit_rect = None;
                     }
+                    restore_noactivate(hwnd);
                     unsafe {
                         let _ = ShowWindow(hwnd, SW_HIDE);
                     }
                 }
                 OverlayCommand::Shutdown => {
+                    if let Ok(mut state) = shared_state.lock() {
+                        destroy_edit_control(&mut state);
+                    }
                     unsafe {
                         DestroyWindow(hwnd)?;
                     }
@@ -738,8 +1022,10 @@ fn run_overlay_thread(
         if let Ok(mut state) = shared_state.lock() {
             if let Some(request) = state.request.clone() {
                 match request.status {
-                    OverlayStatus::Recording | OverlayStatus::RecordingWithText { .. } => {
-                        // recording state needs waveform refresh
+                    OverlayStatus::Recording
+                    | OverlayStatus::RecordingWithText { .. }
+                    | OverlayStatus::StreamingEditing { .. } => {
+                        // recording / editing state needs waveform refresh or edit chrome update
                         if !MENU_VISIBLE.load(Ordering::Acquire) {
                             unsafe {
                                 let _ = InvalidateRect(hwnd, None, true);
@@ -807,13 +1093,15 @@ fn run_overlay_thread(
             }
         }
         // OVERLAY-WAKE-001: message-driven wait replaces thread::sleep(100)
-        // - Active overlay (Recording/Processing): short timeout for animation (~25fps)
+        // - Active overlay (Recording/Processing/Editing): short timeout for animation (~25fps)
         // - Idle (no overlay): block until woken by message or channel command
         let has_active_overlay = if let Ok(state) = shared_state.lock() {
             state.request.as_ref().map_or(false, |r| {
                 matches!(
                     r.status,
                     OverlayStatus::Recording
+                        | OverlayStatus::RecordingWithText { .. }
+                        | OverlayStatus::StreamingEditing { .. }
                         | OverlayStatus::FallingToProcessing { .. }
                         | OverlayStatus::Processing(_)
                 )
@@ -861,22 +1149,38 @@ unsafe extern "system" fn overlay_wnd_proc(
             return LRESULT(1); // TRUE = background already erased
         }
         WM_KEYDOWN => {
-            // ESC key interrupts current processing (recording, transcription, or LLM optimization)
+            // ASR-038-C: when EDIT control is active, Enter submits; ESC cancels editing.
             if wparam.0 == VK_ESCAPE.0 as usize {
                 if let Ok(state) = data.state.lock() {
                     if state.request.is_some() {
                         let _ = state.event_tx.send(OverlayUiEvent::CancelRequested);
                     }
                 }
+            } else if wparam.0 == VK_RETURN.0 as usize {
+                if let Ok(state) = data.state.lock() {
+                    if let Some(ref request) = state.request {
+                        if matches!(request.status, OverlayStatus::StreamingEditing { .. }) {
+                            if let Some(edit_hwnd) = state.edit_hwnd {
+                                if let Ok(text) = get_window_text(edit_hwnd) {
+                                    let _ = state.event_tx.send(OverlayUiEvent::SubmitRequested(
+                                        text,
+                                        request.target_hwnd,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
             }
             return LRESULT(0);
         }
         WM_LBUTTONUP => {
-            if let Ok(state) = data.state.lock() {
+            if let Ok(mut state) = data.state.lock() {
                 if let Some(ref request) = state.request {
+                    let (x, y) = lparam_point(lparam);
+                    let target_hwnd = request.target_hwnd;
                     match &request.status {
                         OverlayStatus::FocusLost { text, .. } => {
-                            let (x, y) = lparam_point(lparam);
                             // UI-OPT-003: close button (bottom or title bar) -> close without copy
                             if state
                                 .close_btn_rect
@@ -899,9 +1203,23 @@ unsafe extern "system" fn overlay_wnd_proc(
                                 let _ = state.event_tx.send(OverlayUiEvent::PreviewCopied);
                             }
                         }
-                        _ => {
-                            let (x, y) = lparam_point(lparam);
+                        OverlayStatus::StreamingEditing { .. } => {
+                            // ASR-038-C: submit button click -> submit edited text
                             if state
+                                .submit_btn_rect
+                                .as_ref()
+                                .is_some_and(|rect| rect_contains(rect, x, y))
+                            {
+                                if let Some(edit_hwnd) = state.edit_hwnd {
+                                    if let Ok(text) = get_window_text(edit_hwnd) {
+                                        let _ = state.event_tx.send(
+                                            OverlayUiEvent::SubmitRequested(text, target_hwnd),
+                                        );
+                                    }
+                                }
+                            }
+                            // stop/cancel button -> cancel editing
+                            else if state
                                 .cancel_btn_rect
                                 .as_ref()
                                 .is_some_and(|rect| rect_contains(rect, x, y))
@@ -909,10 +1227,37 @@ unsafe extern "system" fn overlay_wnd_proc(
                                 let _ = state.event_tx.send(OverlayUiEvent::CancelRequested);
                             }
                         }
+                        _ => {
+                            // ASR-038-C: click in text area enters edit mode; stop button cancels.
+                            if state
+                                .cancel_btn_rect
+                                .as_ref()
+                                .is_some_and(|rect| rect_contains(rect, x, y))
+                            {
+                                let _ = state.event_tx.send(OverlayUiEvent::CancelRequested);
+                            } else if state
+                                .text_hit_rect
+                                .as_ref()
+                                .is_some_and(|rect| rect_contains(rect, x, y))
+                            {
+                                let _ = state.event_tx.send(OverlayUiEvent::EditRequested);
+                            }
+                        }
                     }
                 }
             }
             return LRESULT(0);
+        }
+        WM_CTLCOLOREDIT => {
+            // ASR-038-C: customize EDIT control background/text color to match overlay theme
+            if let Ok(state) = data.state.lock() {
+                if let Some(brush) = state.edit_bg_brush {
+                    let hdc = HDC(wparam.0 as *mut std::ffi::c_void);
+                    let _ = SetBkColor(hdc, OVERLAY_BG_DARK);
+                    let _ = SetTextColor(hdc, OVERLAY_TEXT_WHITE);
+                    return LRESULT(brush.0 as isize);
+                }
+            }
         }
         WM_PAINT => {
             // Double-buffer: draw to memory DC first, then BitBlt to screen
@@ -942,11 +1287,13 @@ unsafe extern "system" fn overlay_wnd_proc(
                     .unwrap_or_default()
                     .as_millis() as u64;
                 state.shimmer_phase = (_shimmer_ms % 800) as f32 / 800.0; // SHIMMER-SPEED-002: 1200→800ms
-                let (cancel_rect, close_rect, title_close_rect) =
+                let (cancel_rect, close_rect, title_close_rect, submit_rect, text_hit_rect) =
                     draw_overlay_to_dc(hwnd, mem_dc, &rect, &state);
                 state.cancel_btn_rect = cancel_rect;
                 state.close_btn_rect = close_rect;
                 state.title_close_btn_rect = title_close_rect;
+                state.submit_btn_rect = submit_rect;
+                state.text_hit_rect = text_hit_rect;
             }
 
             // Copy to screen DC (one-shot, no flicker)
@@ -991,7 +1338,13 @@ fn draw_overlay_to_dc(
     hdc: HDC,
     rect: &RECT,
     state: &OverlayWindowState,
-) -> (Option<RECT>, Option<RECT>, Option<RECT>) {
+) -> (
+    Option<RECT>,
+    Option<RECT>,
+    Option<RECT>,
+    Option<RECT>,
+    Option<RECT>,
+) {
     // Double-buffer: hdc is memory DC, rect is already computed
 
     // Create ClearType font (Segoe UI, ~9pt)
@@ -1005,10 +1358,12 @@ fn draw_overlay_to_dc(
     let mut cancel_btn_rect = None;
     let mut close_btn_rect = None;
     let mut title_close_btn_rect = None;
+    let mut submit_btn_rect = None;
+    let mut text_hit_rect = None;
 
     if let Some(request) = &state.request {
         match &request.status {
-            OverlayStatus::Recording | OverlayStatus::RecordingWithText { .. } => {
+            OverlayStatus::Recording => {
                 apply_overlay_window_region(hwnd, rect, None, true);
                 cancel_btn_rect = Some(draw_recording_overlay(
                     hdc,
@@ -1016,6 +1371,14 @@ fn draw_overlay_to_dc(
                     state,
                     request.ui_language,
                 ));
+            }
+            OverlayStatus::RecordingWithText { text } => {
+                apply_overlay_window_region(hwnd, rect, None, true);
+                let (cr, sr, thr) =
+                    draw_recording_overlay_with_text(hdc, rect, state, request.ui_language, text);
+                cancel_btn_rect = Some(cr);
+                submit_btn_rect = Some(sr);
+                text_hit_rect = Some(thr);
             }
             OverlayStatus::FallingToProcessing { .. } => {
                 apply_overlay_window_region(hwnd, rect, None, true);
@@ -1035,6 +1398,13 @@ fn draw_overlay_to_dc(
                     request.ui_language,
                     state.shimmer_phase,
                 );
+            }
+            OverlayStatus::StreamingEditing { .. } => {
+                apply_overlay_window_region(hwnd, rect, None, true);
+                // ASR-038-C: visual chrome for editing mode (EDIT control draws text itself)
+                let (cr, sr) = draw_editing_overlay_chrome(hdc, rect, request.ui_language);
+                cancel_btn_rect = Some(cr);
+                submit_btn_rect = Some(sr);
             }
             OverlayStatus::FocusLost { text, .. } => {
                 apply_overlay_window_region(hwnd, rect, Some(10), false);
@@ -1058,7 +1428,13 @@ fn draw_overlay_to_dc(
         let _ = DeleteObject(font);
     }
 
-    (cancel_btn_rect, close_btn_rect, title_close_btn_rect)
+    (
+        cancel_btn_rect,
+        close_btn_rect,
+        title_close_btn_rect,
+        submit_btn_rect,
+        text_hit_rect,
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -1350,6 +1726,262 @@ fn draw_recording_overlay(
     }
     cr
 }
+
+#[cfg(target_os = "windows")]
+fn draw_recording_overlay_with_text(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: &RECT,
+    state: &OverlayWindowState,
+    _ui_language: config::UiLanguage,
+    text: &str,
+) -> (RECT, RECT, RECT) {
+    // ASR-038-C: reuse existing recording chrome for background/border/waveform/stop button
+    let cancel_rect = draw_recording_overlay(hdc, rect, state, _ui_language);
+
+    const BORDER_GRAY: COLORREF = COLORREF(0x060607);
+    const CORNER_RADIUS: i32 = 10;
+    let cy = rect.top + (rect.bottom - rect.top) / 2;
+
+    // Text region dimensions
+    let text_left = rect.left + STREAMING_TEXT_LEFT_MARGIN;
+    let text_right = rect.right - STREAMING_TEXT_RIGHT_MARGIN;
+    let text_top = rect.top + STREAMING_TEXT_TOP_MARGIN;
+    let text_bottom = rect.bottom - STREAMING_TEXT_BOTTOM_MARGIN;
+    let visible_w = (text_right - text_left).max(1);
+
+    // Measure full text width
+    let text_width = measure_text_width(hdc, text);
+
+    // Scroll offset so newest text stays at the right edge once text overflows
+    let scroll_x = (text_width - visible_w).max(0);
+
+    // Setup clip region for text area using SaveDC/RestoreDC
+    unsafe {
+        let _ = SaveDC(hdc);
+    }
+    let clip = unsafe { CreateRectRgn(text_left, text_top, text_right, text_bottom) };
+    unsafe {
+        let _ = SelectClipRgn(hdc, clip);
+        let _ = DeleteObject(clip);
+    }
+
+    unsafe {
+        let _ = SetTextColor(hdc, OVERLAY_TEXT_WHITE);
+    }
+    let mut text_rect = RECT {
+        left: text_left - scroll_x,
+        top: text_top,
+        right: text_right - scroll_x,
+        bottom: text_bottom,
+    };
+    draw_text(
+        hdc,
+        text,
+        &mut text_rect,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+    unsafe {
+        let _ = RestoreDC(hdc, -1);
+    }
+
+    // Submit button (enter arrow) to the left of stop button
+    let submit_bs = 16;
+    let submit_bl = rect.right - STREAMING_TEXT_RIGHT_MARGIN + 6; // 6px gap after text area
+    let submit_bt = rect.top + (rect.bottom - rect.top - submit_bs) / 2;
+    let submit_rect = RECT {
+        left: submit_bl,
+        top: submit_bt,
+        right: submit_bl + submit_bs,
+        bottom: submit_bt + submit_bs,
+    };
+    let submit_pen = unsafe { CreatePen(PS_SOLID, 1, OVERLAY_BRAND_ORANGE) };
+    let submit_pen_old = unsafe { SelectObject(hdc, submit_pen) };
+    let submit_brush = unsafe { CreateSolidBrush(OVERLAY_BRAND_ORANGE) };
+    let submit_brush_old = unsafe { SelectObject(hdc, submit_brush) };
+    // Draw rounded submit button background
+    unsafe {
+        let _ = RoundRect(
+            hdc,
+            submit_rect.left,
+            submit_rect.top,
+            submit_rect.right,
+            submit_rect.bottom,
+            CORNER_RADIUS,
+            CORNER_RADIUS,
+        );
+    }
+    // Draw enter arrow (⏎) centered
+    let arrow = "\u{23CE}";
+    let mut arrow_rect = submit_rect;
+    unsafe {
+        let _ = SetTextColor(hdc, OVERLAY_BG_DARK);
+    }
+    draw_text(
+        hdc,
+        arrow,
+        &mut arrow_rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+    unsafe {
+        let _ = SelectObject(hdc, submit_pen_old);
+        let _ = SelectObject(hdc, submit_brush_old);
+        let _ = DeleteObject(submit_pen);
+        let _ = DeleteObject(submit_brush);
+    }
+
+    // Text hit region (for entering edit mode) excludes submit/stop buttons
+    let text_hit_rect = RECT {
+        left: text_left,
+        top: rect.top + CORNER_RADIUS,
+        right: text_right,
+        bottom: rect.bottom - CORNER_RADIUS,
+    };
+
+    // Right separator between waveform/text area and submit button
+    let sep_r_x = rect.right - 36;
+    let sep_h = 20;
+    let sep_hh = sep_h / 2;
+    let sep_pen = unsafe { CreatePen(PS_SOLID, 2, BORDER_GRAY) };
+    let sep_op = unsafe { SelectObject(hdc, sep_pen) };
+    unsafe {
+        let _ = MoveToEx(hdc, sep_r_x, cy - sep_hh, None);
+        let _ = LineTo(hdc, sep_r_x, cy + sep_hh);
+        let _ = SelectObject(hdc, sep_op);
+        let _ = DeleteObject(sep_pen);
+    }
+
+    (cancel_rect, submit_rect, text_hit_rect)
+}
+
+#[cfg(target_os = "windows")]
+fn draw_editing_overlay_chrome(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: &RECT,
+    _ui_language: config::UiLanguage,
+) -> (RECT, RECT) {
+    const BG_DARK: COLORREF = COLORREF(0x110F0D);
+    const BORDER_GRAY: COLORREF = COLORREF(0x060607);
+    const CORNER_RADIUS: i32 = 10;
+
+    // Background + border
+    let bg = unsafe { CreateSolidBrush(BG_DARK) };
+    unsafe {
+        let _ = FillRect(hdc, rect, bg);
+        let _ = DeleteObject(bg);
+    }
+    let border_pen = unsafe { CreatePen(PS_SOLID, 1, BORDER_GRAY) };
+    let old_pen = unsafe { SelectObject(hdc, border_pen) };
+    let null_brush = unsafe { GetStockObject(NULL_BRUSH) };
+    let old_brush = unsafe { SelectObject(hdc, null_brush) };
+    unsafe {
+        let _ = RoundRect(
+            hdc,
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            CORNER_RADIUS * 2,
+            CORNER_RADIUS * 2,
+        );
+        let _ = SelectObject(hdc, old_pen);
+        let _ = SelectObject(hdc, old_brush);
+        let _ = DeleteObject(border_pen);
+    }
+
+    // Cancel button: same stop square as recording overlay, orange outline
+    let bs = 16;
+    let bl = rect.right - 25;
+    let bt = rect.top + (rect.bottom - rect.top - bs) / 2;
+    let cancel_rect = RECT {
+        left: bl,
+        top: bt,
+        right: bl + bs + 1,
+        bottom: bt + bs + 1,
+    };
+    let bp = unsafe { CreatePen(PS_SOLID, 1, OVERLAY_BRAND_ORANGE) };
+    let bop = unsafe { SelectObject(hdc, bp) };
+    let bnb = unsafe { GetStockObject(NULL_BRUSH) };
+    let bob = unsafe { SelectObject(hdc, bnb) };
+    unsafe {
+        let _ = Rectangle(
+            hdc,
+            cancel_rect.left,
+            cancel_rect.top,
+            cancel_rect.right,
+            cancel_rect.bottom,
+        );
+        let _ = SelectObject(hdc, bop);
+        let _ = SelectObject(hdc, bob);
+        let _ = DeleteObject(bp);
+    }
+    let isz = 8;
+    let il = cancel_rect.left + (bs - isz) / 2;
+    let it = cancel_rect.top + (bs - isz) / 2;
+    let ir = RECT {
+        left: il,
+        top: it,
+        right: il + isz + 1,
+        bottom: it + isz + 1,
+    };
+    let ib = unsafe { CreateSolidBrush(OVERLAY_BRAND_ORANGE) };
+    let ip = unsafe { CreatePen(PS_NULL, 0, OVERLAY_BRAND_ORANGE) };
+    let ibo = unsafe { SelectObject(hdc, ib) };
+    let ipo = unsafe { SelectObject(hdc, ip) };
+    unsafe {
+        let _ = Rectangle(hdc, ir.left, ir.top, ir.right, ir.bottom);
+        let _ = SelectObject(hdc, ibo);
+        let _ = SelectObject(hdc, ipo);
+        let _ = DeleteObject(ib);
+        let _ = DeleteObject(ip);
+    }
+
+    // Submit button to the left of cancel button
+    let submit_bs = 16;
+    let submit_gap = 6;
+    let submit_bl = cancel_rect.left - submit_gap - submit_bs;
+    let submit_bt = rect.top + (rect.bottom - rect.top - submit_bs) / 2;
+    let submit_rect = RECT {
+        left: submit_bl,
+        top: submit_bt,
+        right: submit_bl + submit_bs,
+        bottom: submit_bt + submit_bs,
+    };
+    let submit_pen = unsafe { CreatePen(PS_SOLID, 1, OVERLAY_BRAND_ORANGE) };
+    let submit_pen_old = unsafe { SelectObject(hdc, submit_pen) };
+    let submit_brush = unsafe { CreateSolidBrush(OVERLAY_BRAND_ORANGE) };
+    let submit_brush_old = unsafe { SelectObject(hdc, submit_brush) };
+    unsafe {
+        let _ = RoundRect(
+            hdc,
+            submit_rect.left,
+            submit_rect.top,
+            submit_rect.right,
+            submit_rect.bottom,
+            CORNER_RADIUS,
+            CORNER_RADIUS,
+        );
+    }
+    let arrow = "\u{23CE}";
+    let mut arrow_rect = submit_rect;
+    unsafe {
+        let _ = SetTextColor(hdc, BG_DARK);
+    }
+    draw_text(
+        hdc,
+        arrow,
+        &mut arrow_rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+    unsafe {
+        let _ = SelectObject(hdc, submit_pen_old);
+        let _ = SelectObject(hdc, submit_brush_old);
+        let _ = DeleteObject(submit_pen);
+        let _ = DeleteObject(submit_brush);
+    }
+
+    (cancel_rect, submit_rect)
+}
+
 #[cfg(target_os = "windows")]
 fn draw_processing_overlay(
     hdc: windows::Win32::Graphics::Gdi::HDC,
@@ -1744,21 +2376,113 @@ fn draw_error_overlay(
     );
 }
 #[cfg(target_os = "windows")]
-fn overlay_geometry(status: &OverlayStatus) -> ([i32; 2], [i32; 2]) {
+fn monitor_work_rect(hwnd: HWND) -> RECT {
+    unsafe {
+        let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !hmon.is_invalid() && GetMonitorInfoW(hmon, &mut mi).as_bool() {
+            mi.rcWork
+        } else {
+            RECT {
+                left: 0,
+                top: 0,
+                right: GetSystemMetrics(SM_CXSCREEN),
+                bottom: GetSystemMetrics(SM_CYSCREEN),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn overlay_geometry(status: &OverlayStatus, hwnd: HWND) -> ([i32; 2], [i32; 2]) {
+    let work = monitor_work_rect(hwnd);
+    let work_w = work.right - work.left;
+    let work_h = work.bottom - work.top;
+
     let size = match status {
-        OverlayStatus::Recording | OverlayStatus::RecordingWithText { .. } => {
+        OverlayStatus::Recording
+        | OverlayStatus::RecordingWithText { .. }
+        | OverlayStatus::FallingToProcessing { .. }
+        | OverlayStatus::StreamingEditing { .. } => {
+            // ASR-038-C: editing mode initial size; will be expanded by adjust_overlay_size_for_text
             RECORDING_OVERLAY_SIZE
         }
-        OverlayStatus::FallingToProcessing { .. } => RECORDING_OVERLAY_SIZE,
-        OverlayStatus::Processing(_) => STATUS_OVERLAY_SIZE,
+        OverlayStatus::Processing(_) | OverlayStatus::Error(_) => STATUS_OVERLAY_SIZE,
         OverlayStatus::FocusLost { .. } => PREVIEW_OVERLAY_SIZE,
-        OverlayStatus::Error(_) => STATUS_OVERLAY_SIZE,
     };
-    let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-    let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    let x = (screen_w - size[0]) / 2;
-    let y = (screen_h - size[1] - 64).max(0);
+    let x = work.left + (work_w - size[0]) / 2;
+    let y = work.top + (work_h - size[1] - 64).max(0);
     ([x, y], size)
+}
+
+#[cfg(target_os = "windows")]
+fn overlay_max_width(hwnd: HWND) -> i32 {
+    let work = monitor_work_rect(hwnd);
+    let work_w = work.right - work.left;
+    (work_w as f32 * STREAMING_OVERLAY_MAX_SCREEN_RATIO).round() as i32
+}
+
+#[cfg(target_os = "windows")]
+fn adjust_overlay_pos_size_for_text(
+    hwnd: HWND,
+    status: &OverlayStatus,
+    current_pos: &[i32; 2],
+    current_size: &[i32; 2],
+) -> ([i32; 2], [i32; 2]) {
+    let text = match status {
+        OverlayStatus::RecordingWithText { text } => text.as_str(),
+        OverlayStatus::StreamingEditing { text } => text.as_str(),
+        _ => return (*current_pos, *current_size),
+    };
+
+    let work = monitor_work_rect(hwnd);
+    let work_w = work.right - work.left;
+    let work_h = work.bottom - work.top;
+    let max_w = overlay_max_width(hwnd);
+
+    unsafe {
+        let hdc = GetDC(hwnd);
+        let font = create_clear_type_font(-12);
+        let old_font = SelectObject(hdc, font);
+        let text_w = measure_text_width(hdc, text);
+        let _ = SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
+        let _ = ReleaseDC(hwnd, hdc);
+
+        let extra = if matches!(status, OverlayStatus::StreamingEditing { .. }) {
+            24 // caret/padding room in edit mode
+        } else {
+            0
+        };
+        let desired_w = STREAMING_TEXT_LEFT_MARGIN + text_w + STREAMING_TEXT_RIGHT_MARGIN + extra;
+        let w = desired_w.clamp(
+            RECORDING_OVERLAY_SIZE[0],
+            max_w.max(RECORDING_OVERLAY_SIZE[0]),
+        );
+        let h = RECORDING_OVERLAY_SIZE[1];
+        let x = work.left + (work_w - w) / 2;
+        let y = work.top + (work_h - h - 64).max(0);
+        ([x, y], [w, h])
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn measure_text_width(hdc: HDC, text: &str) -> i32 {
+    if text.is_empty() {
+        return 0;
+    }
+    let wide = encode_wide(text);
+    let mut size = windows::Win32::Foundation::SIZE::default();
+    unsafe {
+        let len = wide.len().saturating_sub(1);
+        if len > 0 {
+            let _ = GetTextExtentPoint32W(hdc, &wide[..len], &mut size);
+        }
+    }
+    size.cx
 }
 #[cfg(target_os = "windows")]
 fn convert_to_friendly_error(message: &str, ui_language: config::UiLanguage) -> String {
@@ -1785,7 +2509,7 @@ fn show_overlay(
     ui_language: config::UiLanguage,
     status: OverlayStatus,
 ) {
-    let (pos, size) = overlay_geometry(&status);
+    let (pos, size) = overlay_geometry(&status, HWND(overlay_handle.overlay_hwnd.0));
     overlay_handle.send(OverlayCommand::Show(OverlayRequest {
         status,
         pos,
@@ -1793,6 +2517,7 @@ fn show_overlay(
         opacity: overlay_opacity.clamp(0.1, 1.0),
         ui_language,
         auto_close_ms: 0,
+        target_hwnd: 0,
     }));
 }
 fn maybe_refresh_settings_child(
@@ -1918,7 +2643,10 @@ fn process_controller_events(
                     if crate::audio::is_mic_muted() {
                         let config = clone_runtime_config(runtime_config);
                         let msg = i18n::get(config.ui_language).error_mic_muted.to_string();
-                        let (pos, size) = overlay_geometry(&OverlayStatus::Error(msg.clone()));
+                        let (pos, size) = overlay_geometry(
+                            &OverlayStatus::Error(msg.clone()),
+                            overlay_handle.overlay_hwnd,
+                        );
                         overlay_handle.send(OverlayCommand::Show(OverlayRequest {
                             status: OverlayStatus::Error(msg),
                             pos,
@@ -1926,18 +2654,23 @@ fn process_controller_events(
                             opacity: 0.95,
                             ui_language: config.ui_language,
                             auto_close_ms: 2000,
+                            target_hwnd: 0,
                         }));
                         continue;
                     }
 
                     // HOTKEY-LATENCY-FIX-001: 立即显示录音 overlay，不等 RecordingStarted 事件
                     let config = clone_runtime_config(runtime_config);
-                    show_overlay(
-                        overlay_handle,
-                        config.audio.overlay_opacity,
-                        config.ui_language,
-                        OverlayStatus::Recording,
-                    );
+                    let target_hwnd = hwnd.0 as usize;
+                    overlay_handle.send(OverlayCommand::Show(OverlayRequest {
+                        status: OverlayStatus::Recording,
+                        pos: [0, 0],
+                        size: RECORDING_OVERLAY_SIZE,
+                        opacity: config.audio.overlay_opacity.clamp(0.1, 1.0),
+                        ui_language: config.ui_language,
+                        auto_close_ms: 0,
+                        target_hwnd,
+                    }));
                     log::info!(
                         "[Latency] overlay shown at +{:.1}ms",
                         t_hotkey.elapsed().as_secs_f64() * 1000.0
@@ -1945,7 +2678,7 @@ fn process_controller_events(
                     set_tray_state(tray, TrayState::Recording, config.ui_language);
 
                     let _ = worker_tx.send(WorkerCommand::Start(StartCmd {
-                        target_hwnd: hwnd.0 as usize,
+                        target_hwnd,
                         translate,
                     }));
                     log::info!(
@@ -2046,7 +2779,10 @@ fn process_controller_events(
                 set_tray_state(tray, TrayState::Error, ui_language);
                 // Shimmer animation frame update (phase increments every cycle)
                 let friendly_message = convert_to_friendly_error(&message, ui_language);
-                let (pos, size) = overlay_geometry(&OverlayStatus::Error(friendly_message.clone()));
+                let (pos, size) = overlay_geometry(
+                    &OverlayStatus::Error(friendly_message.clone()),
+                    overlay_handle.overlay_hwnd,
+                );
                 overlay_handle.send(OverlayCommand::Show(OverlayRequest {
                     status: OverlayStatus::Error(friendly_message),
                     pos,
@@ -2054,6 +2790,7 @@ fn process_controller_events(
                     opacity: 0.95,
                     ui_language: config.ui_language,
                     auto_close_ms: 2000,
+                    target_hwnd: 0,
                 }));
             }
             // FORMAT-LLM-001-CORE (DEC-031-③): LLM 格式化失败提示。
@@ -2063,7 +2800,10 @@ fn process_controller_events(
                 platform::notify_translate_poll_stop();
                 set_tray_state(tray, TrayState::Idle, ui_language);
                 let hint = i18n::get(ui_language).format_failed_hint;
-                let (pos, size) = overlay_geometry(&OverlayStatus::Error(hint.to_string()));
+                let (pos, size) = overlay_geometry(
+                    &OverlayStatus::Error(hint.to_string()),
+                    overlay_handle.overlay_hwnd,
+                );
                 overlay_handle.send(OverlayCommand::Show(OverlayRequest {
                     status: OverlayStatus::Error(hint.to_string()),
                     pos,
@@ -2071,6 +2811,7 @@ fn process_controller_events(
                     opacity: 0.9,
                     ui_language,
                     auto_close_ms: 2500,
+                    target_hwnd: 0,
                 }));
             }
         }
@@ -2088,11 +2829,58 @@ fn process_controller_events(
                 overlay_handle.send(OverlayCommand::Hide);
             }
             OverlayUiEvent::EditRequested => {
-                // ASR-038-B: 用户点击 overlay 文本区进入编辑态
+                // ASR-038-C: 用户点击 overlay 文本区进入编辑态
                 // 停录音 + 取消 pipeline（关 WebSocket 由 ASR 线程检测 cancel_signal 处理）
                 cancel_signal.store(true, Ordering::Relaxed);
                 stop_recording_signal.store(true, Ordering::Relaxed);
-                // overlay 进入编辑态由 C-overlay 批实现渲染，本批只做信号传递
+                platform::notify_translate_poll_stop();
+                // 通知 overlay 线程切换到 StreamingEditing 态并创建 EDIT 控件
+                overlay_handle.send(OverlayCommand::EnterEditMode);
+            }
+            OverlayUiEvent::SubmitRequested(text, target_hwnd) => {
+                // ASR-038-C: 编辑提交。先尝试把焦点还给目标窗口，再注入文本。
+                // 无法取回焦点则降级为复制到剪贴板 + FocusLost 预览。
+                if target_hwnd != 0 {
+                    let target = HWND(target_hwnd as *mut std::ffi::c_void);
+                    let restored = unsafe { SetForegroundWindow(target).as_bool() };
+                    if restored {
+                        let current_id = platform::foreground_window_id();
+                        let focus_lost = current_id != target_hwnd;
+                        if !focus_lost {
+                            let config = clone_runtime_config(runtime_config);
+                            let text_snapshot = platform::capture_focused_text_snapshot();
+                            if let Err(e) = platform::inject_text(
+                                &text,
+                                config.injection.use_clipboard,
+                                config.injection.clipboard_delay_ms,
+                            ) {
+                                log::error!("ASR-038-C: inject text failed: {}", e);
+                                let _ = platform::copy_text_to_clipboard(&text);
+                                show_overlay(
+                                    overlay_handle,
+                                    0.95,
+                                    ui_language,
+                                    OverlayStatus::FocusLost { text, copied: true },
+                                );
+                                set_tray_state(tray, TrayState::Idle, ui_language);
+                                continue;
+                            }
+                            maybe_learn_user_edit(&text, text_snapshot, runtime_config);
+                            overlay_handle.send(OverlayCommand::Hide);
+                            set_tray_state(tray, TrayState::Idle, ui_language);
+                            continue;
+                        }
+                    }
+                }
+                // UIPI / focus lost fallback
+                let _ = platform::copy_text_to_clipboard(&text);
+                show_overlay(
+                    overlay_handle,
+                    0.95,
+                    ui_language,
+                    OverlayStatus::FocusLost { text, copied: true },
+                );
+                set_tray_state(tray, TrayState::Idle, ui_language);
             }
         }
     }
