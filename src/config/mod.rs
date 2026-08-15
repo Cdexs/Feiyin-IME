@@ -155,26 +155,19 @@ pub struct AudioConfig {
     /// ASR-041: "qwen3_online" 已被 "qwen_audio_online" 替代，存量配置自动迁移（见 load/load_from）
     #[serde(default = "default_asr_model")]
     pub asr_model: String,
-    /// 在线 ASR API Key（DEC-028，qwen3_online / qwen_audio_online 模式共用）
-    #[serde(default)]
-    pub qwen3_api_key: String,
-    /// Qwen3 在线 ASR 服务 URL（DEC-028，仅配置文件持有，不在 UI 显示）
-    /// 默认北京 region：wss://dashscope.aliyuncs.com/api-ws/v1/realtime
-    #[serde(default = "default_qwen3_asr_url")]
-    pub qwen3_asr_url: String,
-    /// Qwen3 在线 ASR 模型 ID（DEC-028，2026-07-07 从硬编码改为配置读取）
-    /// 默认：qwen3-asr-flash-realtime
-    #[serde(default = "default_qwen3_asr_model")]
-    pub qwen3_asr_model: String,
-    /// Qwen-Audio-3.0 在线流式 ASR 服务 URL（RESEARCH-ASR-038，仅配置文件，不在 UI 显示）
+    /// 在线 ASR API Key（DEC-028，ASR-041-B 改名为通用名，与具体模型代号解耦）
+    /// #[serde(alias)] 保证存量 config.toml 里的 `qwen3_api_key` 仍能正确读入
+    #[serde(default, alias = "qwen3_api_key")]
+    pub asr_online_api_key: String,
+    /// 在线 ASR 服务 URL（ASR-041-B 改名为通用名，与具体模型代号解耦）
     /// 默认北京 region：wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference
-    /// WorkspaceId 取值与 qwen3_asr_url 一致（同一百炼账号同一 workspace）
-    #[serde(default = "default_qwen_asr_url")]
-    pub qwen_asr_url: String,
-    /// Qwen-Audio-3.0 在线流式 ASR 模型 ID（RESEARCH-ASR-038）
+    /// #[serde(alias)] 免疫含 038-A 字段名的存量配置
+    #[serde(default = "default_asr_online_url", alias = "qwen_asr_url")]
+    pub asr_online_url: String,
+    /// 在线 ASR 模型 ID（ASR-041-B 改名为通用名）
     /// 默认：qwen-audio-3.0-asr-flash-streaming
-    #[serde(default = "default_qwen_asr_model")]
-    pub qwen_asr_model: String,
+    #[serde(default = "default_asr_online_model", alias = "qwen_asr_model")]
+    pub asr_online_model: String,
 }
 
 fn default_overlay_opacity() -> f32 {
@@ -185,22 +178,14 @@ fn default_asr_model() -> String {
     "performance".to_string()
 }
 
-fn default_qwen3_asr_url() -> String {
-    "wss://dashscope.aliyuncs.com/api-ws/v1/realtime".to_string()
-}
-
-fn default_qwen3_asr_model() -> String {
-    "qwen3-asr-flash-realtime".to_string()
-}
-
-fn default_qwen_asr_url() -> String {
+fn default_asr_online_url() -> String {
     // ASR-038-B: Inference API 端点主机名须为 {WorkspaceId}.{region}.maas.aliyuncs.com
     // （035 研究文档 A6）。现有项目 WorkspaceId = llm-kudx4dj2bfqn4gr2（北京 region），
     // 与旧 Realtime API 同一 workspace 同一 key，仅路径 /realtime → /inference。
     "wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference".to_string()
 }
 
-fn default_qwen_asr_model() -> String {
+fn default_asr_online_model() -> String {
     "qwen-audio-3.0-asr-flash-streaming".to_string()
 }
 
@@ -214,11 +199,9 @@ impl Default for AudioConfig {
             input_device: String::new(),
             enable_streaming: false, // 默认使用 offline 模式
             asr_model: default_asr_model(),
-            qwen3_api_key: String::new(),
-            qwen3_asr_url: default_qwen3_asr_url(),
-            qwen3_asr_model: default_qwen3_asr_model(),
-            qwen_asr_url: default_qwen_asr_url(),
-            qwen_asr_model: default_qwen_asr_model(),
+            asr_online_api_key: String::new(),
+            asr_online_url: default_asr_online_url(),
+            asr_online_model: default_asr_online_model(),
         }
     }
 }
@@ -1130,34 +1113,26 @@ clipboard_delay_ms = 150
         let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
 
         assert_eq!(
-            loaded.audio.qwen3_api_key, "",
-            "qwen3_api_key default should be empty"
-        );
-        assert_eq!(
-            loaded.audio.qwen3_asr_url, "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
-            "qwen3_asr_url default should match config/mod.rs"
-        );
-        assert_eq!(
-            loaded.audio.qwen3_asr_model, "qwen3-asr-flash-realtime",
-            "qwen3_asr_model default should match config/mod.rs"
+            loaded.audio.asr_online_api_key, "",
+            "asr_online_api_key default should be empty"
         );
     }
 
-    /// QWEN3-CONFIG-002: qwen3_api_key 非空值往返正确
+    /// QWEN3-CONFIG-002: asr_online_api_key 非空值往返正确
     #[test]
-    fn qwen3_api_key_custom_value_roundtrip() {
+    fn asr_online_api_key_custom_value_roundtrip() {
         let _guard = TEST_MUTEX.lock().unwrap();
         let env = TestEnv::new();
 
         let mut cfg = AppConfig::default();
-        cfg.audio.qwen3_api_key = "sk-test-key-123456".to_string();
+        cfg.audio.asr_online_api_key = "sk-test-key-123456".to_string();
 
         cfg.save_to(&env.config_path())
             .expect("save should succeed");
         let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
         assert_eq!(
-            loaded.audio.qwen3_api_key, "sk-test-key-123456",
-            "qwen3_api_key custom value should survive roundtrip"
+            loaded.audio.asr_online_api_key, "sk-test-key-123456",
+            "asr_online_api_key custom value should survive roundtrip"
         );
     }
 
@@ -1203,133 +1178,145 @@ clipboard_delay_ms = 150
         std::fs::write(&env.config_path(), old_toml).unwrap();
         let loaded = AppConfig::load_from(&env.config_path()).expect("should load old config");
         assert_eq!(
-            loaded.audio.qwen3_api_key, "",
-            "missing qwen3_api_key should default to empty"
-        );
-        assert_eq!(
-            loaded.audio.qwen3_asr_url, "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
-            "missing qwen3_asr_url should default to config/mod.rs"
-        );
-        assert_eq!(
-            loaded.audio.qwen3_asr_model, "qwen3-asr-flash-realtime",
-            "missing qwen3_asr_model should default to config/mod.rs"
+            loaded.audio.asr_online_api_key, "",
+            "missing asr_online_api_key should default to empty"
         );
     }
 
-    /// QWEN3-CONFIG-004: qwen3_asr_url 自定义值往返正确
+    /// ASR-041-B: serde alias 实测 —— 含旧字段名 `qwen3_api_key` 的 toml 能正确读入
+    /// 这是本单的生死线：没有 alias，Gavin 的 API key 会被静默丢弃
     #[test]
-    fn qwen3_asr_url_custom_value_roundtrip() {
+    fn asr_online_api_key_serde_alias_reads_legacy_qwen3_api_key() {
         let _guard = TEST_MUTEX.lock().unwrap();
         let env = TestEnv::new();
-
+        // 先用 default 保存完整配置（确保所有必填段都在）
         let mut cfg = AppConfig::default();
-        cfg.audio.qwen3_asr_url = "wss://custom.example.com/realtime".to_string();
-
+        cfg.audio.asr_online_api_key = "sk-legacy-key".to_string();
         cfg.save_to(&env.config_path())
             .expect("save should succeed");
+        // 然后把保存的 toml 里的 asr_online_api_key 改回旧字段名 qwen3_api_key
+        let toml_content = std::fs::read_to_string(&env.config_path()).expect("read toml");
+        let patched = toml_content.replace("asr_online_api_key", "qwen3_api_key");
+        std::fs::write(&env.config_path(), patched).expect("write patched toml");
+        // 加载 —— alias 应该把旧字段名 qwen3_api_key 读入 asr_online_api_key
         let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
         assert_eq!(
-            loaded.audio.qwen3_asr_url, "wss://custom.example.com/realtime",
-            "qwen3_asr_url custom value should survive roundtrip"
+            loaded.audio.asr_online_api_key, "sk-legacy-key",
+            "serde alias must read legacy 'qwen3_api_key' field into 'asr_online_api_key'"
         );
     }
 
-    /// QWEN3-CONFIG-005: qwen3_asr_model 自定义值往返正确
+    /// ASR-041-B: 含旧字段 qwen3_asr_url / qwen3_asr_model 的 toml 仍能正常解析
+    /// 任务书验收项6：这条必须实测，不能推断。
+    /// 这两个字段已从结构体删除，serde 默认忽略未知字段（未设 deny_unknown_fields）。
+    /// Gavin 的 config.toml 实打实有这两行，必须确认不会解析失败。
     #[test]
-    fn qwen3_asr_model_custom_value_roundtrip() {
+    fn legacy_qwen3_asr_fields_ignored_without_error() {
         let _guard = TEST_MUTEX.lock().unwrap();
         let env = TestEnv::new();
-
-        let mut cfg = AppConfig::default();
-        cfg.audio.qwen3_asr_model = "qwen3-asr-flash-demo".to_string();
-
+        // 用 default 保存完整配置
+        let cfg = AppConfig::default();
         cfg.save_to(&env.config_path())
             .expect("save should succeed");
-        let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
+        // 在 toml 里追加旧字段（模拟 Gavin 的存量 config）
+        let toml_content = std::fs::read_to_string(&env.config_path()).expect("read toml");
+        let patched = format!(
+            "{}qwen3_asr_url = \"wss://dashscope.aliyuncs.com/api-ws/v1/realtime\"\nqwen3_asr_model = \"qwen3-asr-flash-realtime\"\n",
+            toml_content
+        );
+        std::fs::write(&env.config_path(), patched).expect("write patched toml");
+        // 加载 —— 旧字段应被忽略，不报错，其余字段正确读入
+        let loaded =
+            AppConfig::load_from(&env.config_path()).expect("load with legacy fields must succeed");
+        // 确认关键字段未受影响
         assert_eq!(
-            loaded.audio.qwen3_asr_model, "qwen3-asr-flash-demo",
-            "qwen3_asr_model custom value should survive roundtrip"
+            loaded.audio.asr_model, cfg.audio.asr_model,
+            "asr_model must not be affected by legacy qwen3_asr_* fields"
+        );
+        assert_eq!(
+            loaded.audio.asr_online_api_key, cfg.audio.asr_online_api_key,
+            "asr_online_api_key must not be affected by legacy qwen3_asr_* fields"
         );
     }
 
     // ============================================================
     // ASR-038-B: QwenAudioOnline Inference API 配置（独立于 Qwen3Online Realtime）
     // 三条端点缺陷的回归防护：
-    //   ① default_qwen_asr_url 必须含 WorkspaceId（非 dashscope.aliyuncs.com）
-    //   ② default_qwen_asr_url 路径必须为 /api-ws/v1/inference（非 /realtime）
-    //   ③ qwen_asr_model 默认值为 qwen-audio-3.0-asr-flash-streaming
+    //   ① default_asr_online_url 必须含 WorkspaceId（非 dashscope.aliyuncs.com）
+    //   ② default_asr_online_url 路径必须为 /api-ws/v1/inference（非 /realtime）
+    //   ③ asr_online_model 默认值为 qwen-audio-3.0-asr-flash-streaming
     // ============================================================
 
-    /// ASR-038-B-001: default_qwen_asr_url 必须是 Inference API 端点（含 WorkspaceId + /inference 路径）
+    /// ASR-038-B-001: default_asr_online_url 必须是 Inference API 端点（含 WorkspaceId + /inference 路径）
     #[test]
-    fn qwen_asr_url_default_is_inference_endpoint_with_workspace_id() {
+    fn asr_online_url_default_is_inference_endpoint_with_workspace_id() {
         let cfg = AppConfig::default();
-        let url = &cfg.audio.qwen_asr_url;
+        let url = &cfg.audio.asr_online_url;
         // 缺陷③回归防护：主机名不得为 dashscope.aliyuncs.com（那是 Realtime API 的主机）
         assert!(
             !url.contains("dashscope.aliyuncs.com"),
-            "qwen_asr_url default must not use dashscope.aliyuncs.com (Realtime API host), got: {}",
+            "asr_online_url default must not use dashscope.aliyuncs.com (Realtime API host), got: {}",
             url
         );
         // 必须含 WorkspaceId 子域（035 研究文档 A6：{WorkspaceId}.cn-beijing.maas.aliyuncs.com）
         assert!(
             url.contains("llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com"),
-            "qwen_asr_url default must contain WorkspaceId subdomain, got: {}",
+            "asr_online_url default must contain WorkspaceId subdomain, got: {}",
             url
         );
         // 路径必须是 /api-ws/v1/inference（不是 /realtime）
         assert!(
             url.ends_with("/api-ws/v1/inference"),
-            "qwen_asr_url default must end with /api-ws/v1/inference, got: {}",
+            "asr_online_url default must end with /api-ws/v1/inference, got: {}",
             url
         );
     }
 
-    /// ASR-038-B-002: default_qwen_asr_model 必须是 qwen-audio-3.0-asr-flash-streaming
+    /// ASR-038-B-002: default_asr_online_model 必须是 qwen-audio-3.0-asr-flash-streaming
     #[test]
-    fn qwen_asr_model_default_is_streaming_model() {
+    fn asr_online_model_default_is_streaming_model() {
         let cfg = AppConfig::default();
         assert_eq!(
-            cfg.audio.qwen_asr_model, "qwen-audio-3.0-asr-flash-streaming",
-            "qwen_asr_model default must be qwen-audio-3.0-asr-flash-streaming"
+            cfg.audio.asr_online_model, "qwen-audio-3.0-asr-flash-streaming",
+            "asr_online_model default must be qwen-audio-3.0-asr-flash-streaming"
         );
     }
 
-    /// ASR-038-B-003: qwen_asr_url 自定义值往返正确（独立于 qwen3_asr_url）
+    /// ASR-038-B-003: asr_online_url 自定义值往返正确
     #[test]
-    fn qwen_asr_url_custom_value_roundtrip() {
+    fn asr_online_url_custom_value_roundtrip() {
         let _guard = TEST_MUTEX.lock().unwrap();
         let env = TestEnv::new();
 
         let mut cfg = AppConfig::default();
-        cfg.audio.qwen_asr_url =
+        cfg.audio.asr_online_url =
             "wss://my-workspace.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference".to_string();
 
         cfg.save_to(&env.config_path())
             .expect("save should succeed");
         let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
         assert_eq!(
-            loaded.audio.qwen_asr_url,
+            loaded.audio.asr_online_url,
             "wss://my-workspace.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference",
-            "qwen_asr_url custom value should survive roundtrip"
+            "asr_online_url custom value should survive roundtrip"
         );
     }
 
-    /// ASR-038-B-004: qwen_asr_model 自定义值往返正确
+    /// ASR-038-B-004: asr_online_model 自定义值往返正确
     #[test]
-    fn qwen_asr_model_custom_value_roundtrip() {
+    fn asr_online_model_custom_value_roundtrip() {
         let _guard = TEST_MUTEX.lock().unwrap();
         let env = TestEnv::new();
 
         let mut cfg = AppConfig::default();
-        cfg.audio.qwen_asr_model = "qwen-audio-3.0-asr-demo".to_string();
+        cfg.audio.asr_online_model = "qwen-audio-3.0-asr-demo".to_string();
 
         cfg.save_to(&env.config_path())
             .expect("save should succeed");
         let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
         assert_eq!(
-            loaded.audio.qwen_asr_model, "qwen-audio-3.0-asr-demo",
-            "qwen_asr_model custom value should survive roundtrip"
+            loaded.audio.asr_online_model, "qwen-audio-3.0-asr-demo",
+            "asr_online_model custom value should survive roundtrip"
         );
     }
 
@@ -1365,32 +1352,6 @@ clipboard_delay_ms = 150
         assert_eq!(
             cfg.translation.target_language,
             TranslationLanguage::Chinese
-        );
-    }
-
-    /// ASR-038-B-007: 两个 ASR 端点默认值必须不同 —— Inference(qwen_asr_url)
-    /// 与 Realtime(qwen3_asr_url) 不混用（缺陷①的配置层回归护栏）
-    #[test]
-    fn qwen_asr_url_differs_from_qwen3_asr_url_default() {
-        let cfg = AppConfig::default();
-        assert_ne!(
-            cfg.audio.qwen_asr_url, cfg.audio.qwen3_asr_url,
-            "qwen_asr_url (Inference) and qwen3_asr_url (Realtime) must be distinct endpoints"
-        );
-        assert!(
-            cfg.audio.qwen3_asr_url.contains("dashscope.aliyuncs.com"),
-            "qwen3_asr_url is the Realtime host (dashscope), got: {}",
-            cfg.audio.qwen3_asr_url
-        );
-        assert!(
-            cfg.audio.qwen3_asr_url.ends_with("/api-ws/v1/realtime"),
-            "qwen3_asr_url is the /realtime path, got: {}",
-            cfg.audio.qwen3_asr_url
-        );
-        assert!(
-            cfg.audio.qwen_asr_url.ends_with("/api-ws/v1/inference"),
-            "qwen_asr_url is the /inference path, got: {}",
-            cfg.audio.qwen_asr_url
         );
     }
 

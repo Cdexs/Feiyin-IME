@@ -3092,11 +3092,9 @@ fn spawn_worker_thread(
             "auto".to_string(),
             transcription::AsrModel::from_config(&config.audio.asr_model),
             initial_hotwords.as_deref(),
-            &config.audio.qwen3_asr_url,
-            &config.audio.qwen3_api_key,
-            &config.audio.qwen3_asr_model,
-            &config.audio.qwen_asr_url,
-            &config.audio.qwen_asr_model,
+            &config.audio.asr_online_api_key,
+            &config.audio.asr_online_url,
+            &config.audio.asr_online_model,
         ) {
             Ok(t) => Some(t),
             Err(err) => {
@@ -3119,13 +3117,10 @@ fn spawn_worker_thread(
             .as_ref()
             .map(|t| t.hotwords_version())
             .unwrap_or(0);
-        // R2-4: qwen3 配置跟踪，用于热重载对比
-        let mut active_qwen3_url: String = config.audio.qwen3_asr_url.clone();
-        let mut active_qwen3_api_key: String = config.audio.qwen3_api_key.clone();
-        let mut active_qwen3_asr_model: String = config.audio.qwen3_asr_model.clone();
-        // ASR-038-B: qwen_asr 配置跟踪（QwenAudioOnline 用 Inference API，独立于 qwen3）
-        let mut active_qwen_asr_url: String = config.audio.qwen_asr_url.clone();
-        let mut active_qwen_asr_model: String = config.audio.qwen_asr_model.clone();
+        // ASR-041-B: 在线 ASR 配置跟踪，用于热重载对比
+        let mut active_asr_online_api_key: String = config.audio.asr_online_api_key.clone();
+        let mut active_asr_online_url: String = config.audio.asr_online_url.clone();
+        let mut active_asr_online_model: String = config.audio.asr_online_model.clone();
 
         // PERF-INIT-001: Pre-initialize LlmClient once; update_config() before each use.
         let mut llm_client = llm::LlmClient::new(config.llm.clone());
@@ -3164,14 +3159,11 @@ fn spawn_worker_thread(
                     log::info!("ASR transcriber hot-reload completed, swapping instance");
                     active_asr_model = new_transcriber.asr_model();
                     active_hotwords_version = new_transcriber.hotwords_version();
-                    // R2-4: 同步 qwen3 跟踪值（仅 Qwen3Online 模式有实际值）
+                    // ASR-041-B: 同步在线 ASR 配置跟踪值
                     let fresh = clone_runtime_config(&runtime_config);
-                    active_qwen3_url = fresh.audio.qwen3_asr_url;
-                    active_qwen3_api_key = fresh.audio.qwen3_api_key;
-                    active_qwen3_asr_model = fresh.audio.qwen3_asr_model;
-                    // ASR-038-B: 同步 qwen_asr 跟踪值（QwenAudioOnline 用）
-                    active_qwen_asr_url = fresh.audio.qwen_asr_url;
-                    active_qwen_asr_model = fresh.audio.qwen_asr_model;
+                    active_asr_online_api_key = fresh.audio.asr_online_api_key;
+                    active_asr_online_url = fresh.audio.asr_online_url;
+                    active_asr_online_model = fresh.audio.asr_online_model;
                     transcriber = Some(new_transcriber);
                     asr_reload_in_flight = false;
                 }
@@ -3217,32 +3209,26 @@ fn spawn_worker_thread(
                     };
                     // R2-4: transcriber.is_none() 时无条件尝试重建（启动失败自愈）
                     let needs_rebuild = transcriber.is_none() && !asr_reload_in_flight;
-                    // R2-4: qwen3 配置变更（key 改错后修正、url/model 变更）
-                    let qwen3_changed = desired_asr_model == transcription::AsrModel::Qwen3Online
-                        && (active_qwen3_url != config.audio.qwen3_asr_url
-                            || active_qwen3_api_key != config.audio.qwen3_api_key
-                            || active_qwen3_asr_model != config.audio.qwen3_asr_model);
-                    // ASR-038-B: qwen_asr 配置变更（QwenAudioOnline 的 Inference API 端点/模型）
-                    let qwen_asr_changed = desired_asr_model
+                    // ASR-041-B: 在线 ASR 配置变更检测（key/url/model 变更）
+                    let online_asr_changed = desired_asr_model
                         == transcription::AsrModel::QwenAudioOnline
-                        && (active_qwen_asr_url != config.audio.qwen_asr_url
-                            || active_qwen_asr_model != config.audio.qwen_asr_model);
+                        && (active_asr_online_api_key != config.audio.asr_online_api_key
+                            || active_asr_online_url != config.audio.asr_online_url
+                            || active_asr_online_model != config.audio.asr_online_model);
                     // LANG-AUTO-001: language 恒为 "auto"，移除语言变更监听
                     let needs_reload = active_asr_model != desired_asr_model
                         || (desired_asr_model == transcription::AsrModel::Accuracy
                             && active_hotwords_version != desired_hotwords_version)
-                        || qwen3_changed
-                        || qwen_asr_changed
+                        || online_asr_changed
                         || needs_rebuild;
                     if needs_reload && !asr_reload_in_flight {
                         log::info!(
-                            "Triggering ASR transcriber hot-reload: model {:?}->{:?}, hotwords_version {}->{}, qwen3_changed={}, qwen_asr_changed={}, needs_rebuild={}",
+                            "Triggering ASR transcriber hot-reload: model {:?}->{:?}, hotwords_version {}->{}, online_asr_changed={}, needs_rebuild={}",
                             active_asr_model,
                             desired_asr_model,
                             active_hotwords_version,
                             desired_hotwords_version,
-                            qwen3_changed,
-                            qwen_asr_changed,
+                            online_asr_changed,
                             needs_rebuild,
                         );
                         asr_reload_in_flight = true;
@@ -3250,11 +3236,9 @@ fn spawn_worker_thread(
                         let reload_streaming = config.audio.enable_streaming;
                         let reload_language = "auto".to_string();
                         let reload_hotwords = desired_hotwords.clone();
-                        let reload_qwen3_url = config.audio.qwen3_asr_url.clone();
-                        let reload_qwen3_key = config.audio.qwen3_api_key.clone();
-                        let reload_qwen3_model = config.audio.qwen3_asr_model.clone();
-                        let reload_qwen_asr_url = config.audio.qwen_asr_url.clone();
-                        let reload_qwen_asr_model = config.audio.qwen_asr_model.clone();
+                        let reload_asr_online_key = config.audio.asr_online_api_key.clone();
+                        let reload_asr_online_url = config.audio.asr_online_url.clone();
+                        let reload_asr_online_model = config.audio.asr_online_model.clone();
                         let reload_tx = asr_reload_tx.clone();
                         std::thread::spawn(move || {
                             let t_build = std::time::Instant::now();
@@ -3264,11 +3248,9 @@ fn spawn_worker_thread(
                                 reload_language,
                                 desired_asr_model,
                                 reload_hotwords.as_deref(),
-                                &reload_qwen3_url,
-                                &reload_qwen3_key,
-                                &reload_qwen3_model,
-                                &reload_qwen_asr_url,
-                                &reload_qwen_asr_model,
+                                &reload_asr_online_key,
+                                &reload_asr_online_url,
+                                &reload_asr_online_model,
                             ) {
                                 Ok(new_t) => {
                                     log::info!(
@@ -3299,9 +3281,9 @@ fn spawn_worker_thread(
 
                     if is_streaming_asr {
                         let transcriber_ref = transcriber.as_ref().expect("checked above");
-                        let qwen_asr_url = transcriber_ref.qwen_asr_url().to_string();
-                        let qwen_asr_model = transcriber_ref.qwen_asr_model().to_string();
-                        let qwen_api_key = config.audio.qwen3_api_key.clone();
+                        let asr_online_url = transcriber_ref.asr_online_url().to_string();
+                        let asr_online_model = transcriber_ref.asr_online_model().to_string();
+                        let qwen_api_key = config.audio.asr_online_api_key.clone();
                         let model_dir_clone = model_dir.clone();
                         let cancel_clone = Arc::clone(&cancel_signal);
                         let event_tx_clone = event_tx.clone();
@@ -3314,9 +3296,9 @@ fn spawn_worker_thread(
                             std::thread::spawn(move || {
                                 let vocabulary = crate::transcription::load_wordbook_vocabulary();
                                 crate::transcription::qwen_inference::transcribe_streaming_realtime(
-                                    &qwen_asr_url,
+                                    &asr_online_url,
                                     &qwen_api_key,
-                                    &qwen_asr_model,
+                                    &asr_online_model,
                                     chunk_rx,
                                     &vocabulary,
                                     &model_dir_clone,
@@ -4278,8 +4260,8 @@ fn select_preprocessing_params(asr_model: transcription::AsrModel) -> (usize, us
         transcription::AsrModel::Performance => {
             (PERF_SILENCE_HEAD_SAMPLES, PERF_ONSET_BACKTRACK_SAMPLES)
         }
-        transcription::AsrModel::Qwen3Online | transcription::AsrModel::QwenAudioOnline => {
-            // DEC-028 / RESEARCH-ASR-038 / ASR-038-B: 在线 ASR 模型承袭 Qwen3Online 既有先例
+        transcription::AsrModel::QwenAudioOnline => {
+            // DEC-028 / RESEARCH-ASR-038 / ASR-038-B / ASR-041-B: 在线 ASR 模型
             // （在线模型对前导静音不敏感，保持与 CTC 一致的前处理行为）
             //
             // ASR-038-B 真流式拍板后更新：
@@ -5929,20 +5911,21 @@ mod overlay_shimmer_tests {
     }
 
     #[test]
-    fn preprocessing_params_qwen3_online_follows_performance() {
-        // DEC-028: qwen3_online 沿用 performance 前处理参数（0ms head / 200ms backtrack）
-        let (q3_head, q3_bt) = select_preprocessing_params(transcription::AsrModel::Qwen3Online);
+    fn preprocessing_params_online_asr_follows_performance() {
+        // ASR-041-B: 在线 ASR 沿用 performance 前处理参数（0ms head / 200ms backtrack）
+        let (online_head, online_bt) =
+            select_preprocessing_params(transcription::AsrModel::QwenAudioOnline);
         let (perf_head, perf_bt) =
             select_preprocessing_params(transcription::AsrModel::Performance);
         assert_eq!(
-            q3_head, perf_head,
-            "qwen3_online silence head ({}) must equal performance head ({})",
-            q3_head, perf_head
+            online_head, perf_head,
+            "online ASR silence head ({}) must equal performance head ({})",
+            online_head, perf_head
         );
         assert_eq!(
-            q3_bt, perf_bt,
-            "qwen3_online backtrack ({}) must equal performance backtrack ({})",
-            q3_bt, perf_bt
+            online_bt, perf_bt,
+            "online ASR backtrack ({}) must equal performance backtrack ({})",
+            online_bt, perf_bt
         );
     }
 }

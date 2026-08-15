@@ -34,7 +34,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
       asr_model: 'performance',
       qwen3_asr_url: 'wss://dashscope.aliyuncs.com/api-qwen3-asr/v1/realtime',
       qwen3_asr_model: 'qwen3-asr-flash-realtime',
-      qwen3_api_key: '',
+      asr_online_api_key: '',
     },
     llm: { enabled: false, api_url: '', api_key: '', model: '' },
     wordbook: [] as string[],
@@ -211,7 +211,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
       const qwenConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online'}};
       render(<VoicePage config={qwenConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
-        expect(screen.getByText(zhHans.voice_qwen3_api_key as string)).toBeInTheDocument();
+        expect(screen.getByText(zhHans.voice_asr_online_api_key as string)).toBeInTheDocument();
       });
     });
 
@@ -224,7 +224,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
     });
 
     it('ASR-UI-010: Qwen3 test connection button disabled when no key', async () => {
-      const emptyKeyConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', qwen3_api_key: ''}};
+      const emptyKeyConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', asr_online_api_key: ''}};
       render(<VoicePage config={emptyKeyConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
         const btn = screen.getByText(zhHans.voice_qwen3_test_connection as string).closest('button');
@@ -233,7 +233,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
     });
 
     it('ASR-UI-011: Qwen3 test connection button enabled with key', async () => {
-      const hasKeyConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', qwen3_api_key: 'sk-test-key'}};
+      const hasKeyConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', asr_online_api_key: 'sk-test-key'}};
       render(<VoicePage config={hasKeyConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
         const btn = screen.getByText(zhHans.voice_qwen3_test_connection as string).closest('button');
@@ -249,7 +249,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
         if (cmd === 'check_accuracy_model_ready') return true;
         return null;
       });
-      const goodKeyConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', qwen3_api_key: 'sk-test-key-123456'}};
+      const goodKeyConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', asr_online_api_key: 'sk-test-key-123456'}};
       render(<VoicePage config={goodKeyConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
         const btn = screen.getByText(zhHans.voice_qwen3_test_connection as string).closest('button');
@@ -261,7 +261,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
     });
 
     it('ASR-UI-013: successful connection shows success message', async () => {
-      const goodKeyConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', qwen3_api_key: 'sk-test-key-123456'}};
+      const goodKeyConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', asr_online_api_key: 'sk-test-key-123456'}};
       render(<VoicePage config={goodKeyConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
         const btn = screen.getByText(zhHans.voice_qwen3_test_connection as string).closest('button');
@@ -273,7 +273,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
     });
 
     it('ASR-UI-014: failed connection shows failure message', async () => {
-      const badKeyConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', qwen3_api_key: 'bad-key'}};
+      const badKeyConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', asr_online_api_key: 'bad-key'}};
       render(<VoicePage config={badKeyConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
         const btn = screen.getByText(zhHans.voice_qwen3_test_connection as string).closest('button');
@@ -289,16 +289,16 @@ describe('VoicePage - PUNCT-UI-001', () => {
       const qwenConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online'}};
       rerender(<VoicePage config={qwenConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
-        expect(screen.getByText(zhHans.voice_qwen3_api_key as string)).toBeInTheDocument();
+        expect(screen.getByText(zhHans.voice_asr_online_api_key as string)).toBeInTheDocument();
       });
       rerender(<VoicePage config={baseConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
-        expect(screen.queryByText(zhHans.voice_qwen3_api_key as string)).not.toBeInTheDocument();
+        expect(screen.queryByText(zhHans.voice_asr_online_api_key as string)).not.toBeInTheDocument();
       });
     });
 
     it('ASR-UI-016: empty key hint shown when switching to Qwen3 without key', async () => {
-      const qwenConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', qwen3_api_key: ''}};
+      const qwenConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', asr_online_api_key: ''}};
       render(<VoicePage config={qwenConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
         expect(screen.getByText(zhHans.voice_qwen3_empty_key_hint as string)).toBeInTheDocument();
@@ -335,7 +335,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
       const select = screen.getAllByRole('combobox')[1];
       fireEvent.change(select, { target: { value: 'qwen_audio_online' } });
       // Re-render with key set
-      const qwenKeyConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', qwen3_api_key: 'sk-test-key'}};
+      const qwenKeyConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', asr_online_api_key: 'sk-test-key'}};
       rerender(<VoicePage config={qwenKeyConfig} updateConfig={updateFn} />);
       await new Promise(r => setTimeout(r, 50));
       unmount();
@@ -350,7 +350,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
 
     it('FALLBACK-003: mount with qwen3+key does not fallback on unmount', async () => {
       const updateConfig = vi.fn();
-      const qwenHasKeyConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', qwen3_api_key: 'sk-test-key-123456'}};
+      const qwenHasKeyConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', asr_online_api_key: 'sk-test-key-123456'}};
       const { unmount } = render(<VoicePage config={qwenHasKeyConfig} updateConfig={updateConfig} />);
       await new Promise(r => setTimeout(r, 50));
       unmount();

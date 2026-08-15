@@ -39,7 +39,7 @@ export const en = {
   voice_asr_model_manual_download: 'You can also download the model manually and place it in this directory.',
   voice_copy: 'Copy',
   voice_copied: 'Copied',
-  voice_qwen3_api_key: 'Qwen3 API Key',
+  voice_asr_online_api_key: 'ASR API Key',
   voice_qwen3_test_connection: 'Test Connection',
   voice_qwen3_testing: 'Testing...',
   voice_qwen3_test_success: '✓ Connection Successful',

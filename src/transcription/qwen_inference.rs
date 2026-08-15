@@ -26,7 +26,20 @@ use tungstenite::http::Uri;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{ClientRequestBuilder, Error as WsError, HandshakeError, Message, WebSocket};
 
-use crate::transcription::qwen3_online::f32_to_pcm16_le;
+/// ASR-041-B: 从 qwen3_online.rs 迁移而来（旧文件已删除）。
+/// f32 样本 → 16-bit PCM little-endian bytes。
+///
+/// - 1.0 → 32767 (clamp)
+/// - -1.0 → -32768
+/// - 0.0 → 0
+pub fn f32_to_pcm16_le(samples: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for &s in samples {
+        let pcm = (s * 32768.0).clamp(-32768.0, 32767.0) as i16;
+        bytes.extend_from_slice(&pcm.to_le_bytes());
+    }
+    bytes
+}
 
 /// 连接超时（沿用 DEC-028：5s）
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1136,6 +1149,27 @@ mod tests {
         let run = build_run_task_message(task_id, "model", &serde_json::json!({}));
         let finish = build_finish_task_message(task_id);
         assert_eq!(run["header"]["task_id"], finish["header"]["task_id"]);
+    }
+
+    // --- f32_to_pcm16_le（从 qwen3_online.rs 迁移） ---
+
+    #[test]
+    fn f32_to_pcm16_le_converts_correctly() {
+        let samples = vec![0.0f32, 1.0, -1.0, 0.5];
+        let bytes = f32_to_pcm16_le(&samples);
+        assert_eq!(bytes.len(), 8);
+        assert_eq!(i16::from_le_bytes([bytes[0], bytes[1]]), 0);
+        assert_eq!(i16::from_le_bytes([bytes[2], bytes[3]]), 32767);
+        assert_eq!(i16::from_le_bytes([bytes[4], bytes[5]]), -32768);
+        assert_eq!(i16::from_le_bytes([bytes[6], bytes[7]]), 16384);
+    }
+
+    #[test]
+    fn f32_to_pcm16_clamps_overshoot() {
+        let samples = vec![2.0f32, -2.0];
+        let bytes = f32_to_pcm16_le(&samples);
+        assert_eq!(i16::from_le_bytes([bytes[0], bytes[1]]), 32767);
+        assert_eq!(i16::from_le_bytes([bytes[2], bytes[3]]), -32768);
     }
 
     // --- 音频分片 ---

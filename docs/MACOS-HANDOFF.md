@@ -1099,3 +1099,41 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 **`config/mod.rs` 是平台中立模块**，macOS 编译同一份代码。静默迁移逻辑对 macOS 同样生效——macOS 用户的 `qwen3_online` 配置也会自动迁移为 `qwen_audio_online`。这是预期行为（新旧引擎替代是全平台的，不是 Windows 专属）。
 
 `ui/` 前端改动平台无关。macOS 侧 Tauri UI 编译同一份前端代码。
+
+---
+
+## §ASR-041-B · 清除旧在线 ASR 代码路径 + 字段改名通用名（2026-08-15）
+
+### 改动范围
+
+| 文件 | 动作 | 平台中立？ |
+|---|---|---|
+| `src/transcription/mod.rs` | 删 Qwen3Online 枚举 + from_config 分支 + transcribe 分支 + qwen3 字段/参数 + match 臂 + 测试 | ✅ 是 |
+| `src/transcription/qwen3_online.rs` | **整个文件删除**（686 行） | ✅ 是（纯 Rust + tungstenite） |
+| `src/transcription/qwen_inference.rs` | f32_to_pcm16_le 搬家来此 + 2 单测 | ✅ 是 |
+| `src/config/mod.rs` | 删 qwen3_asr_url/model 配置项 + 改名 qwen3_api_key→asr_online_api_key + qwen_asr_url→asr_online_url + qwen_asr_model→asr_online_model（三字段带 serde alias）+ 删旧测试 + 加 alias 单测 | ✅ 是 |
+| `src/main.rs` | Transcriber::new 调用更新 + 热重载删 qwen3_changed + match 臂删 Qwen3Online + 测试更新 | ⚠️ spawn_worker_thread 已中立，macOS 可达 |
+| `ui/src/**` | qwen3_api_key→asr_online_api_key + i18n key 改名 + 文案去 Qwen3 | N/A（前端） |
+| `src-tauri/src/config.rs` | 补 asr_online_url/model 字段 + alias + asr_online_api_key alias + 删 qwen3_asr_* | ✅ 是（Tauri config 镜像） |
+| `src-tauri/src/main.rs` | test_qwen3_asr_connection 调用改用空串占位（旧字段已删） | ✅ 是 |
+
+### 行为变更
+
+| 项 | 修前 | 修后 |
+|---|---|---|
+| AsrModel 变体 | 4 个（Performance/Accuracy/Qwen3Online/QwenAudioOnline） | 3 个（Performance/Accuracy/QwenAudioOnline） |
+| 旧 qwen3_online.rs | 存在（Realtime API） | **删除** |
+| config 字段名 | qwen3_api_key / qwen3_asr_url / qwen3_asr_model / qwen_asr_url / qwen_asr_model | asr_online_api_key / asr_online_url / asr_online_model（三字段统一通用名 + serde alias 免疫存量） |
+| 存量配置迁移 | qwen3_online→qwen_audio_online（保留） | 同（不受影响） |
+| src-tauri config | 缺 qwen_asr_url/model 字段 → Gavin 保存设置静默丢弃 | 已补 asr_online_url/model（修复 038-A 遗留隐患） |
+
+### 对 macOS 的影响
+
+1. **`transcription/mod.rs`**：平台中立，macOS 编译同一份代码。`AsrModel` 枚举变体减少一个，macOS 侧若有 match `AsrModel` 的代码需编译器要求覆盖——`build_recognizer` 已更新（只匹配 QwenAudioOnline），macOS 可达的 `spawn_worker_thread` 已更新调用。
+2. **`qwen3_online.rs` 删除**：macOS 侧若引用 `qwen3_online::transcribe_online` 或 `f32_to_pcm16_le` 会编译失败。`f32_to_pcm16_le` 已搬到 `qwen_inference.rs`，macOS 侧引用路径需从 `qwen3_online::f32_to_pcm16_le` 改为 `qwen_inference::f32_to_pcm16_le`——但唯一引用方就是 `qwen_inference.rs` 本身（已改），macOS 侧无其他引用。
+3. **`config/mod.rs`**：字段改名 + alias，平台中立。macOS 用户的存量 `qwen3_api_key` 配置通过 alias 正确读入 `asr_online_api_key`。
+4. **`src-tauri/src/config.rs`**：Tauri config 镜像，macOS 侧 Tauri 编译同一份代码。补字段 + alias 对 macOS Tauri UI 同样生效。
+
+### 结论
+
+**macOS 侧编译应无影响**——所有改动在平台中立模块内，`AsrModel` match 已更新，`f32_to_pcm16_le` 搬家后唯一引用方已适配。macOS 侧若有遗留的 `Qwen3Online` match 分支，编译器会报 non-exhaustive match 强制修复（这是好事，编译时发现而非运行时）。

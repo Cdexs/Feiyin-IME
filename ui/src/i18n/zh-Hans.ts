@@ -39,7 +39,7 @@ export const zhHans = {
   voice_asr_model_manual_download: '也可自行下载后放置到该目录。',
   voice_copy: '复制',
   voice_copied: '已复制',
-  voice_qwen3_api_key: 'Qwen3 API Key',
+  voice_asr_online_api_key: 'ASR API Key',
   voice_qwen3_test_connection: '测试连接',
   voice_qwen3_testing: '测试中…',
   voice_qwen3_test_success: '✓ 连接成功',

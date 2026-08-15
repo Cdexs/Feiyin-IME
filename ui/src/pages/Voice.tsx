@@ -41,7 +41,7 @@ const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
   useEffect(() => {
     return () => {
       const { asrModel: lastModel, config: lastConfig } = latestRef.current;
-      if (lastModel === 'qwen_audio_online' && !lastConfig.audio?.qwen3_api_key) {
+      if (lastModel === 'qwen_audio_online' && !lastConfig.audio?.asr_online_api_key) {
         updateConfig({
           ...lastConfig,
           audio: { ...lastConfig.audio, asr_model: prevModelRef.current }
@@ -80,7 +80,7 @@ const loadDevices = async () => {
     if (value === 'qwen_audio_online' && asrModel !== 'qwen_audio_online') {
       prevModelRef.current = asrModel;
     }
-    if (value === 'qwen_audio_online' && !config.audio?.qwen3_api_key) {
+    if (value === 'qwen_audio_online' && !config.audio?.asr_online_api_key) {
       setQwen3TestStatus('idle');
     }
     handleAudioChange('asr_model', value);
@@ -90,7 +90,7 @@ const loadDevices = async () => {
     setQwen3TestStatus('testing');
     setQwen3TestMessage('');
     try {
-      const result = await invoke<string>("test_qwen3_asr_connection", { apiKey: config.audio?.qwen3_api_key || '' });
+      const result = await invoke<string>("test_qwen3_asr_connection", { apiKey: config.audio?.asr_online_api_key || '' });
       setQwen3TestStatus('success');
       setQwen3TestMessage(result);
     } catch (e: any) {
@@ -242,17 +242,17 @@ const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.rea
 
           {asrModel === 'qwen_audio_online' && (
             <div className="qwen3-section" style={{ marginTop: '16px' }}>
-              {!config.audio?.qwen3_api_key && (
+              {!config.audio?.asr_online_api_key && (
                 <p className="form-hint" style={{ color: 'var(--brand-primary)', marginBottom: '8px' }}>
                   {t.voice_qwen3_empty_key_hint}
                 </p>
               )}
               <div className="form-group">
-                <span className="form-label">{t.voice_qwen3_api_key}</span>
+                <span className="form-label">{t.voice_asr_online_api_key}</span>
                 <input
                   type="password"
-                  value={config.audio?.qwen3_api_key || ''}
-                  onChange={(e) => handleAudioChange('qwen3_api_key', e.target.value)}
+                  value={config.audio?.asr_online_api_key || ''}
+                  onChange={(e) => handleAudioChange('asr_online_api_key', e.target.value)}
                   className="input"
                   placeholder="sk-..."
                 />
@@ -262,7 +262,7 @@ const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.rea
                   type="button"
                   onClick={handleTestQwen3Connection}
                   className="btn btn-primary btn-sm"
-                  disabled={qwen3TestStatus === 'testing' || !config.audio?.qwen3_api_key}
+                  disabled={qwen3TestStatus === 'testing' || !config.audio?.asr_online_api_key}
                 >
                   {qwen3TestStatus === 'testing' ? t.voice_qwen3_testing : t.voice_qwen3_test_connection}
                 </button>

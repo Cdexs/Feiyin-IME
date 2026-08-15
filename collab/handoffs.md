@@ -2,6 +2,18 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-08-15 — coder-1 — ASR-041-B ✅ 清除旧在线 ASR 代码路径 + 字段改名通用名
+
+- **来源**：Gavin 指令「连代码一起清掉」+「qwen3_api_key 改成通用名」+ 主控追加「qwen_asr_url/model 也改通用名」+「镜像侧补字段」。基线 HEAD `26e8565`
+- **删除**：AsrModel::Qwen3Online 枚举 + qwen3_online.rs(686行) + mod 声明 + transcribe_online 调用分支 + qwen3_asr_url/model 配置项 + Transcriber qwen3 字段/参数 + qwen3_changed 热重载 + 所有 match 臂 + 相关测试
+- **保留（不能删）**：①asr_online_api_key 字段+serde alias ②f32_to_pcm16_le 搬家到 qwen_inference.rs ③qwen3_online→qwen_audio_online 存量迁移 ④Accuracy
+- **字段改名（三字段统一 asr_online_ 前缀）**：qwen3_api_key→asr_online_api_key(alias="qwen3_api_key") + qwen_asr_url→asr_online_url(alias="qwen_asr_url") + qwen_asr_model→asr_online_model(alias="qwen_asr_model")。src/24+处 + ui/src/24处 + src-tauri/src/3+处全同步
+- **src-tauri/config.rs 补字段**：主 config 有 asr_online_url/model 但镜像侧没有 → Gavin 每次保存设置就静默丢弃。本单补上（同名同默认值+alias）
+- **src-tauri/src/main.rs:91 越界说明**：test_qwen3_asr_connection 引用已删的 qwen3_asr_url/model 字段，不改编译必挂。改为用空串占位（test 函数仍测旧 Realtime API，更新它测 Inference API 是单独任务）
+- **验收**：cargo fmt clean / cargo check --all-targets 0 error / src-tauri check 0 error / cargo test transcription 136/0/7ign / cargo test config 41/0/2ign(含alias单测) / npm run build 通过 / grep Qwen3Online src/ 零代码命中(仅注释)
+- **版本号未动**（已是 0.8.0）
+- **详情**：outbox/coder-1/result.md + logs/20260815.md + CHANGELOG.md
+
 ## 2026-08-15 — coder-1 — ASR-041 ✅ 在线 ASR 模型换代 UI 选项 + 存量配置静默迁移
 
 - **来源**：Gavin 指令「用新模型替代旧模型，改选项文本」。基线 HEAD `c76a4c3`

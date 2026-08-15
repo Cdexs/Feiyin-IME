@@ -230,6 +230,15 @@ DNS 解析 (to_socket_addrs，阻塞系统调用，无缓存)
 - **验收**：cargo fmt clean / cargo check --all-targets 0 error / npm run build 通过 / config 43/0 / grep qwen3_online ui/src 零命中
 - **旧代码路径保留**（Qwen3Online 枚举/qwen3_online.rs/qwen3_asr_* 不删，回退能力）
 
+### ✅ ASR-041-B 清除旧在线 ASR 代码路径 + 字段改名通用名（coder-1，2026-08-15）
+
+- **来源**：Gavin 指令「连代码一起清掉，不用保留旧的在线 asr 模型作为回退兜底」+「qwen3_api_key 改成通用名」
+- **删除**：Qwen3Online 枚举 + qwen3_online.rs(686行) + qwen3_asr_url/model 配置 + Transcriber qwen3 字段/参数 + 热重载 qwen3_changed + 所有 match 臂 + 测试
+- **保留**：①asr_online_api_key+serde alias ②f32_to_pcm16_le 搬家到 qwen_inference.rs ③qwen3_online→qwen_audio_online 存量迁移 ④Accuracy
+- **字段改名**：qwen3_api_key→asr_online_api_key + qwen_asr_url→asr_online_url + qwen_asr_model→asr_online_model（三字段统一 asr_online_ 前缀 + serde alias）
+- **镜像补字段**：src-tauri/config.rs 补 asr_online_url/model（038-A 遗留隐患）
+- **验收**：cargo fmt/check 0 error / src-tauri check 0 error / cargo test transcription 136/0/7ign / config 41/0/2ign / npm run build 通过 / grep Qwen3Online src/ 零代码命中
+
 > 🔴 **2026-08-15 主控更正状态**：coder-2 曾把本节标为「✅ 已结案」，但**当时主控已打回**，
 > Toggle 回归尚未修复。**状态不实，已改回「验收中」。**
 > 教训与 `[DOC-STATE-DRIFT-001]` 同族但方向相反：不是漏写，是**提前宣告完成**。

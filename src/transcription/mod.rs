@@ -9,7 +9,6 @@ use crate::{config::ChineseScript, punctuation, text_normalizer};
 // Re-export SenseVoice config for convenience
 use sherpa_onnx::{OfflineFunASRNanoModelConfig, OfflineSenseVoiceModelConfig};
 
-pub mod qwen3_online;
 pub mod qwen_inference;
 mod vad;
 pub use vad::{
@@ -33,9 +32,7 @@ pub enum AsrModel {
     Performance,
     /// 准确率更高：972MB FunASR Nano native（OfflineFunASRNanoModelConfig，config 层 hotwords）
     Accuracy,
-    /// Qwen3 在线 ASR（DEC-028）：零本地 ASR 内存，WebSocket Realtime 协议
-    Qwen3Online,
-    /// Qwen-Audio-3.0 在线流式 ASR（RESEARCH-ASR-038）：DashScope Inference 协议，支持即时热词
+    /// 在线流式 ASR（RESEARCH-ASR-038 / ASR-041-B）：DashScope Inference 协议，支持即时热词
     QwenAudioOnline,
 }
 
@@ -43,8 +40,6 @@ impl AsrModel {
     pub fn from_config(s: &str) -> Self {
         if s.eq_ignore_ascii_case("accuracy") {
             AsrModel::Accuracy
-        } else if s.eq_ignore_ascii_case("qwen3_online") {
-            AsrModel::Qwen3Online
         } else if s.eq_ignore_ascii_case("qwen_audio_online") {
             AsrModel::QwenAudioOnline
         } else {
@@ -58,7 +53,7 @@ impl AsrModel {
 /// ASR-SINGLE-MODEL-001（DEC-027）+ DEC-028：多模式 ASR 架构
 /// - Performance: 179MB CTC，OfflineSenseVoiceModelConfig，无 hotwords
 /// - Accuracy: 972MB native，OfflineFunASRNanoModelConfig，config 层 hotwords
-/// - Qwen3Online: 零本地 ASR 内存，WebSocket 实时协议（DEC-028）
+/// - QwenAudioOnline: 零本地 ASR 内存，DashScope Inference 协议（ASR-041-B）
 /// - 本地模式一次只加载一个模型；accuracy 不再预创建 CTC fallback
 /// - H1 temperature 0.1 为 accuracy 唯一幻觉缓解（2026-07-08 Gavin 拍板下调 0.3→0.1，RESEARCH-ASR-ACCURACY-002 证实越低越好）；异常检测链已删除
 ///
@@ -72,22 +67,17 @@ pub struct Transcriber {
     mode: AsrMode,
     asr_language: String,
     asr_model: AsrModel,
-    /// 本地 ASR recognizer（Performance/Accuracy 模式用；Qwen3Online 为 None）
+    /// 本地 ASR recognizer（Performance/Accuracy 模式用；QwenAudioOnline 为 None）
     offline_recognizer: Option<sherpa_onnx::OfflineRecognizer>,
     /// 当前注入的 hotwords 版本号（len + 内容哈希），用于感知词库变更
     hotwords_version: u64,
     /// VAD 分段器（仅 accuracy 长音频用，懒加载）
     /// 用 Mutex<Option> 因为 VAD 在首次长音频时才初始化
     vad_segmenter: Option<Mutex<vad::VadSegmenter>>,
-    /// Qwen3 在线 ASR 配置（仅 Qwen3Online 模式用）
-    qwen3_url: String,
-    qwen3_api_key: String,
-    /// Qwen3 在线 ASR 模型 ID（DEC-028，从配置文件读取，2026-07-07 移出硬编码）
-    qwen3_asr_model: String,
-    /// Qwen-Audio-3.0 在线流式 ASR 配置（仅 QwenAudioOnline 模式用，ASR-038-B）
-    /// 独立于 qwen3_*：两协议端点不同（Realtime vs Inference）、模型名不同、帧格式不同
-    qwen_asr_url: String,
-    qwen_asr_model: String,
+    /// 在线 ASR 配置（仅 QwenAudioOnline 模式用，ASR-041-B 改名通用）
+    asr_online_api_key: String,
+    asr_online_url: String,
+    asr_online_model: String,
 }
 
 // SAFETY: Transcriber 持有的 OfflineRecognizer 内部为 *const C++ 指针。
@@ -98,24 +88,21 @@ unsafe impl Send for Transcriber {}
 impl Transcriber {
     /// Create new Transcriber with explicit ASR model selection
     ///
-    /// ASR-SINGLE-MODEL-001（DEC-027）+ DEC-028：多模式 ASR
+    /// ASR-SINGLE-MODEL-001（DEC-027）+ DEC-028 + ASR-041-B：多模式 ASR
     /// - Performance/Accuracy：加载本地模型（单模型，不预创建 fallback）
-    /// - Qwen3Online：不加载任何本地模型（零本地 ASR 内存），存 url+key
+    /// - QwenAudioOnline：不加载任何本地模型（零本地 ASR 内存），存 url+key
     ///
     /// R2 修订（验收第 2 轮）：asr_model 存的是 effective_model（生效模型）。
     /// accuracy 降级 CTC 时 effective=Performance，语义自动归位。
-    /// DEC-028：qwen3_online 模式 key 空 → bail 明确错误（UI 侧保证 key 非空才允许选中，后端防御）
     pub fn new(
         model_dir: &Path,
         enable_streaming: bool,
         asr_language: String,
         asr_model: AsrModel,
         hotwords: Option<&str>,
-        qwen3_url: &str,
-        qwen3_api_key: &str,
-        qwen3_asr_model: &str,
-        qwen_asr_url: &str,
-        qwen_asr_model: &str,
+        asr_online_api_key: &str,
+        asr_online_url: &str,
+        asr_online_model: &str,
     ) -> Result<Self> {
         let mode = if enable_streaming {
             AsrMode::Streaming
@@ -123,20 +110,15 @@ impl Transcriber {
             AsrMode::Offline
         };
 
-        // DEC-028 / ASR-038-B: 在线 ASR 模式不加载本地模型
-        // Qwen3Online 用 Realtime API（qwen3_* 配置），QwenAudioOnline 用 Inference API（qwen_asr_* 配置）
-        if asr_model == AsrModel::Qwen3Online || asr_model == AsrModel::QwenAudioOnline {
-            if qwen3_api_key.trim().is_empty() {
+        // DEC-028 / ASR-038-B / ASR-041-B: 在线 ASR 模式不加载本地模型
+        if asr_model == AsrModel::QwenAudioOnline {
+            if asr_online_api_key.trim().is_empty() {
                 anyhow::bail!("在线 ASR 配置失败：API Key 为空（请在设置中配置 API Key）");
             }
             log::info!(
                 "Online ASR mode: no local model loaded, model={:?}, url={}",
                 asr_model,
-                if asr_model == AsrModel::QwenAudioOnline {
-                    qwen_asr_url
-                } else {
-                    qwen3_url
-                }
+                asr_online_url
             );
             return Ok(Self {
                 mode,
@@ -145,11 +127,9 @@ impl Transcriber {
                 offline_recognizer: None,
                 hotwords_version: 0,
                 vad_segmenter: None,
-                qwen3_url: qwen3_url.to_string(),
-                qwen3_api_key: qwen3_api_key.to_string(),
-                qwen3_asr_model: qwen3_asr_model.to_string(),
-                qwen_asr_url: qwen_asr_url.to_string(),
-                qwen_asr_model: qwen_asr_model.to_string(),
+                asr_online_api_key: asr_online_api_key.to_string(),
+                asr_online_url: asr_online_url.to_string(),
+                asr_online_model: asr_online_model.to_string(),
             });
         }
 
@@ -172,11 +152,9 @@ impl Transcriber {
             offline_recognizer: Some(offline_recognizer),
             hotwords_version,
             vad_segmenter,
-            qwen3_url: String::new(),
-            qwen3_api_key: String::new(),
-            qwen3_asr_model: String::new(),
-            qwen_asr_url: String::new(),
-            qwen_asr_model: String::new(),
+            asr_online_api_key: String::new(),
+            asr_online_url: String::new(),
+            asr_online_model: String::new(),
         })
     }
 
@@ -184,14 +162,14 @@ impl Transcriber {
         self.asr_model
     }
 
-    /// ASR-038-B: QwenAudioOnline 的 Inference API 端点（独立于 Qwen3Online 的 Realtime 端点）
-    pub fn qwen_asr_url(&self) -> &str {
-        &self.qwen_asr_url
+    /// ASR-038-B: 在线 ASR 的 Inference API 端点
+    pub fn asr_online_url(&self) -> &str {
+        &self.asr_online_url
     }
 
     /// ASR-038-B: QwenAudioOnline 的模型 ID
-    pub fn qwen_asr_model(&self) -> &str {
-        &self.qwen_asr_model
+    pub fn asr_online_model(&self) -> &str {
+        &self.asr_online_model
     }
 
     /// 当前 hotwords 版本号（外部对比用）
@@ -284,50 +262,15 @@ impl Transcriber {
         samples: &[f32],
         script: ChineseScript,
     ) -> Result<(String, bool)> {
-        // DEC-028: qwen3_online 模式走在线转录路径
-        if self.asr_model == AsrModel::Qwen3Online {
-            let lang = if self.asr_language == "auto" {
-                None
-            } else {
-                Some(self.asr_language.as_str())
-            };
-            let text = qwen3_online::transcribe_online(
-                &self.qwen3_url,
-                &self.qwen3_api_key,
-                &self.qwen3_asr_model,
-                samples,
-                lang,
-            )?;
-            // ASR-NOSPEECH-FILTER-001: 剥离特殊 token（如 <|nospeech|>）
-            let cleaned = Self::strip_asr_special_tokens(&text);
-            let trimmed = cleaned.trim();
-            if trimmed.is_empty() {
-                log::warn!(
-                    "ASR qwen3_online output only contained special tokens, transcription failed"
-                );
-                anyhow::bail!(
-                    "ASR transcription failed: qwen3_online output only contained special tokens"
-                );
-            }
-            // PUNCT-GOVERNANCE-030-A-2（主控 c 方案）：Qwen3 是否带标点是模型行为，
-            // 官方 API 无标点参数（主控 2026-08-08 核实），不能假定必然带标点 ——
-            // 短句/单词场景常无尾标点。实测输出决定标记：真有**有效标点**才跳过
-            // 标点引擎，否则照常走引擎补标点。判据统一走 `has_effective_punctuation`
-            // （词内嵌豁免：3.14 小数点 / don't 撇号 / 3:30 冒号 / example.com 域名点
-            // 因被 ASCII 字母数字夹持不计为标点，避免误判 native=true 跳过引擎）。
-            let normalized = text_normalizer::normalize_text_for_language(trimmed, script);
-            let native_punctuated = punctuation::has_effective_punctuation(&normalized);
-            return Ok((normalized, native_punctuated));
-        }
         // ASR-038-B: QwenAudioOnline 流式路径（非流式回退：录完整段再发）
         // 流式管线在 main.rs 的 run_streaming_pipeline 中直接调用 qwen_inference::transcribe_streaming，
         // 此分支仅用于非流式回退（如模型切换过渡期）
         if self.asr_model == AsrModel::QwenAudioOnline {
             let vocabulary = crate::transcription::load_wordbook_vocabulary();
             let text = qwen_inference::transcribe_streaming(
-                &self.qwen_asr_url,
-                &self.qwen3_api_key,
-                &self.qwen_asr_model,
+                &self.asr_online_url,
+                &self.asr_online_api_key,
+                &self.asr_online_model,
                 samples,
                 &vocabulary,
                 None,
@@ -685,8 +628,8 @@ fn build_recognizer(
                 }
             }
         }
-        AsrModel::Qwen3Online | AsrModel::QwenAudioOnline => {
-            // DEC-028 / RESEARCH-ASR-038: 在线 ASR 模式不加载本地模型，
+        AsrModel::QwenAudioOnline => {
+            // ASR-041-B: 在线 ASR 模式不加载本地模型，
             // Transcriber::new() 已提前返回，此分支不应被触达
             unreachable!(
                 "online ASR models should be handled in Transcriber::new() before build_recognizer"
@@ -912,8 +855,8 @@ mod tests {
         assert_eq!(AsrModel::from_config("ACCURACY"), AsrModel::Accuracy);
         assert_eq!(AsrModel::from_config(""), AsrModel::Performance);
         assert_eq!(AsrModel::from_config("garbage"), AsrModel::Performance);
-        assert_eq!(AsrModel::from_config("qwen3_online"), AsrModel::Qwen3Online);
-        assert_eq!(AsrModel::from_config("QWEN3_ONLINE"), AsrModel::Qwen3Online);
+        // ASR-041-B: Qwen3Online 已删除，qwen3_online 字符串由迁移逻辑改写为 qwen_audio_online
+        // from_config 不再认 qwen3_online（迁移在 load 阶段已改写）
         // ASR-038-B: QwenAudioOnline 解析
         assert_eq!(
             AsrModel::from_config("qwen_audio_online"),
@@ -927,10 +870,10 @@ mod tests {
 
     // ============================================================
     // ASR-038-B: Transcriber QwenAudioOnline 独立配置字段验证
-    // 回归防护：A 批错误复用 qwen3_url 调 Inference 协议，B 批修正为独立 qwen_asr_url
+    // 回归防护：A 批错误复用 qwen3_url 调 Inference 协议，B 批修正为独立 asr_online_url
     // ============================================================
 
-    /// ASR-038-B-005: QwenAudioOnline 模式 Transcriber::new 存独立 qwen_asr_url/model
+    /// ASR-038-B-005: QwenAudioOnline 模式 Transcriber::new 存在线 ASR 配置
     /// （不加载本地模型，new 不依赖 model_dir 存在性，可直接测）
     #[test]
     fn transcriber_qwen_audio_online_stores_independent_config() {
@@ -941,20 +884,17 @@ mod tests {
             "auto".to_string(),
             AsrModel::QwenAudioOnline,
             None,
-            "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
             "sk-test-key",
-            "qwen3-asr-flash-realtime",
             "wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference",
             "qwen-audio-3.0-asr-flash-streaming",
         )
         .expect("QwenAudioOnline Transcriber::new should succeed without local models");
         assert_eq!(t.asr_model(), AsrModel::QwenAudioOnline);
-        // 独立字段必须存入正确的 Inference API 配置（不是 qwen3 的 Realtime 配置）
         assert_eq!(
-            t.qwen_asr_url(),
+            t.asr_online_url(),
             "wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference"
         );
-        assert_eq!(t.qwen_asr_model(), "qwen-audio-3.0-asr-flash-streaming");
+        assert_eq!(t.asr_online_model(), "qwen-audio-3.0-asr-flash-streaming");
     }
 
     /// ASR-038-B-006: QwenAudioOnline 模式 API Key 空 → bail
@@ -967,9 +907,7 @@ mod tests {
             "auto".to_string(),
             AsrModel::QwenAudioOnline,
             None,
-            "wss://realtime.example.com",
             "",
-            "qwen3-asr-flash-realtime",
             "wss://inference.example.com",
             "qwen-audio-3.0-asr-flash-streaming",
         );

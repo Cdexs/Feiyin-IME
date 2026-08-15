@@ -29,7 +29,7 @@ vi.mock("@tauri-apps/api/core", () => ({
         asr_model: "performance",
         qwen3_asr_url: "wss://dashscope.aliyuncs.com/api-qwen3-asr/v1/realtime",
         qwen3_asr_model: "qwen3-asr-flash-realtime",
-        qwen3_api_key: "",
+        asr_online_api_key: "",
       },
       llm: { enabled: false, api_url: "", api_key: "", model: "sensevoice" },
       wordbook: [],

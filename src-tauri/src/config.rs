@@ -103,19 +103,22 @@ pub struct AudioConfig {
     /// Enable streaming ASR mode (2-pass: streaming + offline correction)
     #[serde(default)]
     pub enable_streaming: bool,
-    /// ASR 模型选择（DEC-025 / DEC-028）："performance"(默认) | "accuracy" | "qwen3_online"
+    /// ASR 模型选择（DEC-025 / DEC-028 / ASR-041）："performance"(默认) | "accuracy" | "qwen_audio_online"
     /// 必须与主程序 src/config/mod.rs AudioConfig.asr_model 同步，
     /// 否则配置界面保存时会静默丢弃主程序写入的 asr_model（round-trip 数据丢失）
     #[serde(default = "default_asr_model")]
     pub asr_model: String,
-    /// Qwen3 online ASR API key (DEC-028)
-    #[serde(default)]
-    pub qwen3_api_key: String,
-    /// Qwen3 online ASR service URL. Stored in config only; not exposed in UI.
-    #[serde(default = "default_qwen3_asr_url")]
-    pub qwen3_asr_url: String,
-    #[serde(default = "default_qwen3_asr_model")]
-    pub qwen3_asr_model: String,
+    /// 在线 ASR API Key（ASR-041-B 改名为通用名，与具体模型代号解耦）
+    /// #[serde(alias)] 保证存量 config.toml 里的 `qwen3_api_key` 仍能正确读入
+    #[serde(default, alias = "qwen3_api_key")]
+    pub asr_online_api_key: String,
+    /// 在线 ASR 服务 URL（ASR-041-B 改名为通用名）
+    /// 必须与主程序 src/config/mod.rs 同步（round-trip 数据丢失防护）
+    #[serde(default = "default_asr_online_url", alias = "qwen_asr_url")]
+    pub asr_online_url: String,
+    /// 在线 ASR 模型 ID（ASR-041-B 改名为通用名）
+    #[serde(default = "default_asr_online_model", alias = "qwen_asr_model")]
+    pub asr_online_model: String,
 }
 
 fn default_overlay_opacity() -> f32 {
@@ -126,12 +129,12 @@ fn default_asr_model() -> String {
     "performance".to_string()
 }
 
-fn default_qwen3_asr_url() -> String {
-    "wss://dashscope.aliyuncs.com/api-ws/v1/realtime".to_string()
+fn default_asr_online_url() -> String {
+    "wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference".to_string()
 }
 
-fn default_qwen3_asr_model() -> String {
-    "qwen3-asr-flash-realtime".to_string()
+fn default_asr_online_model() -> String {
+    "qwen-audio-3.0-asr-flash-streaming".to_string()
 }
 
 impl Default for AudioConfig {
@@ -144,9 +147,9 @@ impl Default for AudioConfig {
             input_device: String::new(),
             enable_streaming: false, // 默认使用 offline 模式
             asr_model: default_asr_model(),
-            qwen3_api_key: String::new(),
-            qwen3_asr_url: default_qwen3_asr_url(),
-            qwen3_asr_model: default_qwen3_asr_model(),
+            asr_online_api_key: String::new(),
+            asr_online_url: default_asr_online_url(),
+            asr_online_model: default_asr_online_model(),
         }
     }
 }
@@ -395,9 +398,9 @@ mod tests {
                 input_device: String::new(),
                 enable_streaming: false,
                 asr_model: asr_model.to_string(),
-                qwen3_api_key: String::new(),
-                qwen3_asr_url: default_qwen3_asr_url(),
-                qwen3_asr_model: default_qwen3_asr_model(),
+                asr_online_api_key: String::new(),
+                asr_online_url: default_asr_online_url(),
+                asr_online_model: default_asr_online_model(),
             },
             llm: LlmConfig::default(),
             hotkey: HotkeyConfig::default(),
