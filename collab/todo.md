@@ -2,11 +2,83 @@
 
 > ✅ **产物已更新**（2026-08-03 **17:42**，BUILD-012）：`Publish/feiyin-ime.exe` `DB07CEFD8D51` / `feiyin-ime-ui.exe` `46D0F31E149D` / `crash-reporter.exe` `699ED9656958`，包含 017/018/020/021/**023**（四语标记清单恢复扩充）。三 exe 两副本 sha256 一致，两 toml 三副本一致（`scene-rules.toml` `7C1F0620` / `itn-rules.toml` `ED77A912`），ProductVersion 0.7.3.0/0.7.3。**⏭ 待 Gavin 端测。**
 > 🔴 **2026-08-04 主控核查：上方产物不含 ITN-FIX-CHAIN-TEAR-026** —— 产物 mtime `17:42:42` 早于 `src/itn.rs` `23:47:25` 整 6 小时。026 需 BUILD-013 才进 exe，详见下方 P0 节。
-> ⏳ **本地 ahead 2 未 push**（最新 `480a23c`，Gavin 只授权提交，不授权 push）。
+> ⏳ **本地 ahead 2 未 push**（最新 `2447dbb`，Gavin 只授权提交，不授权 push）。
+> 🔴 **2026-08-15 主控核查：上方 BUILD-012/015 产物段落均已过期** —— 当前处于 **v0.8.0 在线 ASR 引擎更替**批次，
+> HEAD `2447dbb` 为 038-B 的 **WIP 快照，`cargo check` 实跑 1 个 error 不可编译**，详见下方「当前批次」节。
 > ✅ **2026-08-08 已合并 origin/main 的 6 个 macOS Phase 4 提交**（merge `7e76465`，+6694/−281，零冲突，`cargo check` 0 error）。mac 端顺带跑了全库 `cargo fmt`，后续改动须保持 rustfmt 风格。
 > 端测方式（2026-07-25 Gavin 指示）：Gavin 已在**实际日常使用中自行测试**，端测项不再列入本文档；发现 bug 或优化点由 Gavin 邀请重新开单。
 
 > ✅ **TEST-EXEC-024 + BUILD-012-VERIFY 已闭环并提交 `7a1329e`**（崩溃中断续做，tester-1 2026-08-03 18:3x，主控 18:4x 独立验收）。详见 CHANGELOG / `logs/20260803.md`（规则 3：测试同步与出包不在本文档详列）。
+
+---
+
+## 🔄 当前批次 · v0.8.0 在线 ASR 引擎更替 + 流式上屏（2026-08-14 起）
+
+> 🔴 **2026-08-15 主控补记**：本批次自 08-14 开工，`handoffs.md` 与 `logs/20260814.md` 有完整记录，
+> 但 **todo.md / progress.md 长期零条目**（`grep "ASR-038"` 命中 0 次）——
+> `[DOC-STATE-DRIFT-001]` 又一次复现，且这次漂的是**主控自己职责内的两份文档**。已补齐。
+
+### 🔴 断点：当前代码库不可编译（主控 08-15 `cargo check --all-targets` 实跑取证）
+
+```
+src\transcription\mod.rs:301:52: error[E0425]:
+  cannot find function `load_wordbook_vocabulary` in module `crate::transcription`
+error: could not compile `voice-ime` (bin "feiyin-ime") due to 1 previous error; 10 warnings
+error: could not compile `voice-ime` (bin "feiyin-ime" test) due to 1 previous error; 14 warnings
+```
+
+**唯一 1 个 error**。14 个 warning 全为既有 unused variable（`itn.rs:2013` / `punctuation/mod.rs:284` /
+`main.rs:4305,4559`），非本批引入、非阻塞。
+
+**根因**：`mod tests` 在 `src/transcription/mod.rs:838` 开、`:1570` 闭（一直到文件末尾），
+`pub fn load_wordbook_vocabulary()`（`:1314–1354` 含文档注释）**被插在 `mod tests` 内部**。
+虽写在第 0 列看着像顶层，词法上仍属测试模块 → 正式构建不可见。
+**修法：移到 `:837` 的 `#[cfg(test)]` 之前。一处改动。**
+
+> ⚠️ 上次会话主控靠**缩进目测**判断该函数在顶层 → 判断错误。
+> **模块归属以编译器 `help` 输出为准，不要靠缩进目测。**
+
+### 任务分解与状态
+
+| 编号 | 内容 | 文件域 | 负责人 | 状态 |
+| --- | --- | --- | --- | --- |
+| RESEARCH-ASR-035 | qwen-audio-3.0 接入研究 | 无（纯研究） | coder-1 | ✅ 闭环（§4 前提已被 038 取代） |
+| RESEARCH-TSF-036 | Windows TSF 组合文本可行性 | 无（纯研究） | coder-1 | ✅ 闭环 → **DEC-050 判死** |
+| DESIGN-OVERLAY-037 | overlay 流式预览交互设计 | 无（纯设计） | coder-2 | ✅ 闭环 |
+| RESEARCH-ASR-038 | 流式管线 + VAD 门控 + 热词链路 | 无（纯设计） | coder-1 | ✅ 闭环 |
+| **ASR-038-A** | `qwen_inference.rs` 新建（1076 行 + 45 单测） | `src/transcription/` 新文件 | coder-1 | ✅ **主控独立复现验收通过** |
+| **ASR-038-B** | VAD 入口门控 + 管线改造（边录边发 + 增量接收） | `src/audio/`、`src/main.rs`、`src/transcription/`、`qwen_inference.rs`、`src/ui/overlay.rs`（🔴 仅数据字段） | coder-1 | 🔴 **进行中 · 待派发收尾** |
+| ASR-038-C | overlay 流式显示 + 编辑态 + EDIT 控件 | `src/main.rs`、`src/ui/overlay.rs`（绘制与交互） | coder-2 | 🔜 **等 B**（同动 `main.rs`，零并行空间） |
+| TEST-SYNC-038 | 阶段三测试同步 | 各 `mod tests` | tester-1 | 🔜 等 B 验收 |
+| TEST-EXEC-038 | 阶段四全量回归 | — | tester-1 | 🔜 |
+| BUILD-016 | 阶段五 v0.8.0 首包 | — | tester-1 | 🔜 |
+
+### 038-B 任务书要点（正文备份，防 inbox 跨 session 丢失）
+
+**禁止**：`src-tauri/`、`ui/`；**禁止**实现 overlay 渲染 / EDIT 控件 / 提交按钮 / 编辑态交互（属 038-C，coder-2 做）。
+
+**两条硬性自证**：
+
+| # | 项 | 状态 |
+| --- | --- | --- |
+| ① | 词库调用链只连 `wordbook` 表 | ✅ **主控已代验通过**（`list_all()` → `load_word_entries()` → `SELECT … FROM wordbook`，不碰 `wordbook_candidates`） |
+| ② | VAD 门控最坏情况**不吞字** | ⏸ **待 Worker 自证**：pre-roll 从热键按下**之前**就在缓冲，须证「按下瞬间即开口」不丢音频；**VAD 模型缺失时降级为总是建连**（宁可多花钱不可吞字） |
+
+**其余要点**：`record_streaming()` 与现有 `record()` 并存、不改其行为 ｜ `speech_detected`（RMS）管停录、
+Silero VAD 管建连，**并存不替换、行为零变更** ｜ 增量文本**推送不设限**，节流靠消费端 16ms timer +
+100ms 尺寸节流两道 ｜ 推送 `StreamingAsrState::display_text()` **全量文本**，消费端整体替换 ｜
+收 `EditRequested` → 关 WS / 丢弃 state / 置 `pipeline_cancelled` ｜ 松键后整段交现有 LLM 管线
+（**F3 跨句能力必须保留**）｜ 复核 `select_preprocessing_params` 在流式下是否适用（A 批遗留：
+`silence_head`/`onset_backtrack` 是批处理概念，流式下是否适用存疑）。
+
+**验收**：`cargo fmt` clean ｜ `cargo check --all-targets` 0 error ｜ `cargo test` **全量回归**
+（动了既有文件，不能只跑局部）｜ 文件域未越界。
+
+### 待端测顺手确认的低成本项（无需单独开单）
+
+**计费口径**：`usage.duration` 是「上传音频时长」还是「墙钟会话时长」，官方文档未覆盖，
+038 已按保守假设（墙钟）设计。`-debug` 跑一次录音对比实际录音时长即可。
+若为「上传音频时长」，VAD 第②层会话内静音门控可再省一截。
 
 ---
 

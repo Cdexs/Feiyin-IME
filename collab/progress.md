@@ -404,6 +404,101 @@
 
 ---
 
+## 🔄 v0.8.0 · 在线 ASR 引擎更替 + 流式上屏（2026-08-14 起，**进行中，当前不可编译**）
+
+> **版本号 0.7.3 → 0.8.0**（Gavin 2026-08-14 明确指示「升级版本号」+「版本号就按照你的建议来」）。
+> 定为 minor bump 的理由：替换核心在线 ASR 引擎（协议族更换）+ 流式管线 + VAD 计费门控
+> + 词库热词注入 + overlay 流式预览与编辑态 —— 引擎级更替，非 patch 级修复。
+> 三处已改：`Cargo.toml:3` / `src-tauri/Cargo.toml:3` / `src-tauri/tauri.conf.json:9`；
+> `ui/package.json`（0.1.0）与产品版本号独立，未动。
+
+### 一、设计阶段 ✅ 已闭环（四份文档，全部主控验收通过且互相对齐）
+
+| 任务 | 文档 | 核心结论 |
+| --- | --- | --- |
+| RESEARCH-ASR-035 | `research/asr-qwen-audio-3.0-integration-001.md`（720 行） | 协议/能力/商务三层 14 问全答；**§4 整合方案的「录完再发」前提已被 Gavin 推翻**，由 038 取代，事实部分仍有效 |
+| RESEARCH-TSF-036 | `research/tsf-composition-feasibility-001.md`（25039 B） | TSF 组合文本**判死** → **DEC-050** |
+| DESIGN-OVERLAY-037 | `research/overlay-streaming-preview-design-001.md`（28446 B） | 复用 Win32 GDI overlay（DEC-003）；双阶段窗口样式；Win32 `EDIT` 子类化去边框（中文 IME 支持为决定性因素），规格 `(42,10)-(191,26)` |
+| RESEARCH-ASR-038 | `research/asr-streaming-pipeline-design-001.md`（533 行 / 30388 B） | 真流式管线 + VAD 三层门控（只做①入口）+ 热词注入链路 |
+
+**主控 037/038 交叉复核**：三个高风险接口点（推送频率／窗口抖动防护／中间结果覆盖／取消信号）**双向对齐**。
+唯一轻微措辞不一致已记录：节流由消费端 16ms timer + 100ms 尺寸节流两道保证，**推送端不设限**。
+
+**关键拍板**（详见 `logs/20260814.md` 第四节汇总表）：上屏走 overlay 否决 TIP（DEC-050）｜
+PTT 录音中点击即进编辑态（不等松键）｜流式文本白色不加下划线｜`language_hints` 固定 `[zh,en,ja,ko]`｜
+热词 user=5／system=4 且 **`wordbook_candidates` 禁止注入**｜ITN 保护词表不注入 ASR｜
+`speech_detected` RMS 与 Silero VAD 并存不替换｜本地降噪暂不做｜`context` v1 不上。
+
+### 二、实施阶段 🔄 进行中
+
+| 批次 | 内容 | 文件域 | 负责人 | 状态 |
+| --- | --- | --- | --- | --- |
+| **ASR-038-A** | `qwen_inference.rs` 新建（流式协议 + 二进制帧 + 热词 + 四语） | `src/transcription/` 新文件 | coder-1 | ✅ **主控独立复现验收通过** |
+| **ASR-038-B** | VAD 入口门控 + 管线改造（边录边发 + 增量接收） | `src/audio/`、`src/main.rs`、`src/transcription/`、`src/ui/overlay.rs`（仅数据字段） | coder-1 | 🔴 **进行中，断点：1 个编译 error** |
+| ASR-038-C | overlay 流式显示 + 编辑态 + EDIT 控件 | `src/main.rs`、`src/ui/overlay.rs`（绘制与交互） | coder-2 | 🔜 等 B（**同动 `src/main.rs`，零并行空间**） |
+| TEST-SYNC-038 | 测试同步（阶段三） | 各 `mod tests` | tester-1 | 🔜 等 B 验收 |
+| TEST-EXEC-038 | 全量回归（阶段四） | — | tester-1 | 🔜 |
+| BUILD-016 | v0.8.0 首包（阶段五） | — | tester-1 | 🔜 |
+
+**038-A 验收取证**（主控独立复现，未采信报告）：`cargo fmt --check` clean ｜ `cargo check --all-targets` 0 error（当时）
+｜源码 `#[test]` 计数 **45** 与报告一致 ｜文件域零越界。四处硬红线全部落实：`"model"` 在 payload 内 ｜
+`AUDIO_CHUNK_BYTES = 3200` ｜ `ASR_LANGUAGE_HINTS = &["zh","en","ja","ko"]` ｜ `vocab_weight` user=>5／system=>4
+**且自加 `_ => 3` 保守兜底**（主控未要求，加得对）。
+
+### 三、🔴 当前断点（2026-08-15 主控 `cargo check` 实跑取证）
+
+```
+src\transcription\mod.rs:301:52: error[E0425]:
+  cannot find function `load_wordbook_vocabulary` in module `crate::transcription`
+error: could not compile `voice-ime` (bin "feiyin-ime") due to 1 previous error; 10 warnings
+error: could not compile `voice-ime` (bin "feiyin-ime" test) due to 1 previous error; 14 warnings
+```
+
+**唯一 1 个 error**，14 个 warning 全为既有 unused variable（`itn.rs:2013`／`punctuation/mod.rs:284`／
+`main.rs:4305,4559` 等），非本批引入、非阻塞。
+
+**根因**：`mod tests` 在 `src/transcription/mod.rs:838` 开、`:1570` 闭（直到文件末尾），
+`pub fn load_wordbook_vocabulary()`（`:1314–1354` 含文档注释）**被插在 `mod tests` 内部** ——
+虽写在第 0 列看着像顶层，词法上仍属测试模块，正式构建不可见。
+**修法**：移到 `:837` 的 `#[cfg(test)]` 之前。一处改动。
+
+> ⚠️ **教训（已记）**：上次会话主控靠**缩进目测**判断该函数在顶层 → 判断错误。
+> **模块归属以编译器 `help` 输出为准，不要靠缩进目测。**
+
+### 四、038-B 一条硬性验收项主控已提前代验通过
+
+要求「贴出调用链证明词库数据源为 `wordbook` 表」，主控已自行追到 SQL 层：
+
+```
+load_wordbook_vocabulary()
+  → Wordbook::list_all()      (src/wordbook/mod.rs:41)
+  → db::load_word_entries()   (src/wordbook/db.rs:63)
+  → SELECT id, word, source, created_at FROM wordbook ORDER BY id DESC
+```
+
+**只查 `wordbook` 表，完全不碰 `wordbook_candidates`（163 条未确认候选）。** ✅ 红线守住。
+
+**剩余待 Worker 自证**：VAD 门控最坏情况不吞字 —— pre-roll 须自证「热键按下瞬间即开口」不丢音频；
+**VAD 模型缺失时降级为总是建连**（宁可多花钱不可吞字）。
+
+### 五、提交与遗留
+
+| commit | 内容 |
+| --- | --- |
+| `4ba4933` | DEC-050 流式上屏走 overlay，否决 TSF 组合文本 TIP 路线 |
+| `01e9c2f` | 版本号 0.7.3 → 0.8.0 + 新 ASR 架构三份设计收敛 |
+| `003ba65` | wip(asr)：ASR-038-A 验收通过 + 038-B 进行中快照（🔴 **当前不可编译**） |
+| `2447dbb` | 补提交 `Cargo.lock`（版本号联动）+ CHANGELOG 增补 ← **当前 HEAD** |
+
+**本地 ahead 2 未 push**（push 需 Gavin 明确指示）。工作区干净。
+
+**待端测顺手确认的低成本项**：计费口径（`usage.duration` 是「上传音频时长」还是「墙钟会话时长」）
+文档未覆盖，038 已按保守假设（墙钟）设计。`-debug` 跑一次录音对比即可，无需单独开单。
+
+**跨端**：`docs/MACOS-HANDOFF.md` §ASR-038-A 已追加，平台中立模块 macOS 无需同步改动。
+
+---
+
 ## macOS 双平台 · A 阶段（2026-07-29~30）· ✅ 编译打通
 
 > 治理约束：**DEC-034**（跨平台兼容为首要约束 + 单仓库两端并行）｜ 版本号未动，仍 v0.7.2
