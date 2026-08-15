@@ -149,12 +149,13 @@ pub struct AudioConfig {
     /// Enable streaming ASR mode (2-pass: streaming + offline correction)
     #[serde(default)]
     pub enable_streaming: bool,
-    /// ASR 模型选择（DEC-025 + DEC-028）：
-    /// "performance"(默认,179MB CTC) | "accuracy"(972MB native+hotwords) | "qwen3_online"(在线 ASR)
+    /// ASR 模型选择（DEC-025 + DEC-028 + ASR-041）：
+    /// "performance"(默认,179MB CTC) | "accuracy"(972MB native+hotwords) | "qwen_audio_online"(在线流式 ASR)
     /// 旧配置无此字段时 serde default 等效于 "performance"，行为与直换前完全一致
+    /// ASR-041: "qwen3_online" 已被 "qwen_audio_online" 替代，存量配置自动迁移（见 load/load_from）
     #[serde(default = "default_asr_model")]
     pub asr_model: String,
-    /// Qwen3 在线 ASR API Key（DEC-028，仅 qwen3_online 模式用）
+    /// 在线 ASR API Key（DEC-028，qwen3_online / qwen_audio_online 模式共用）
     #[serde(default)]
     pub qwen3_api_key: String,
     /// Qwen3 在线 ASR 服务 URL（DEC-028，仅配置文件持有，不在 UI 显示）
@@ -407,6 +408,18 @@ impl AppConfig {
             }
         }
 
+        // ASR-041: 存量 qwen3_online 配置静默迁移为 qwen_audio_online。
+        // 背景：UI 下拉选项已从 qwen3_online 切换为 qwen_audio_online（新引擎替代旧引擎），
+        // 存量用户配置若仍是 qwen3_online 会致下拉不匹配任何 option → 静默落到 performance。
+        // 迁移：load 时检测到 asr_model=="qwen3_online" 静默改写为 "qwen_audio_online" 并落盘保存。
+        if cfg.audio.asr_model == "qwen3_online" {
+            log::info!("ASR-041: migrating legacy asr_model='qwen3_online' -> 'qwen_audio_online'");
+            cfg.audio.asr_model = "qwen_audio_online".to_string();
+            if let Err(e) = cfg.save() {
+                log::warn!("ASR-041: failed to persist migrated config: {}", e);
+            }
+        }
+
         Ok(cfg)
     }
 
@@ -484,6 +497,18 @@ impl AppConfig {
                     "ASR-HIDE-ACCURACY-001: failed to persist migrated config: {}",
                     e
                 );
+            }
+        }
+
+        // ASR-041: 存量 qwen3_online 配置静默迁移为 qwen_audio_online（load_from 同 load）。
+        let migrated_from_qwen3 = cfg.audio.asr_model == "qwen3_online";
+        if migrated_from_qwen3 {
+            log::info!(
+                "ASR-041: migrating legacy asr_model='qwen3_online' -> 'qwen_audio_online' (load_from)"
+            );
+            cfg.audio.asr_model = "qwen_audio_online".to_string();
+            if let Err(e) = cfg.save_to(path) {
+                log::warn!("ASR-041: failed to persist migrated config: {}", e);
             }
         }
 
@@ -1038,13 +1063,17 @@ clipboard_delay_ms = 150
         let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
         assert_eq!(
             loaded.audio.asr_model, "performance",
-            "performance must be unchanged by accuracy migration logic"
+            "performance must not be affected by migrations"
         );
     }
 
-    /// ASR-HIDE-ACCURACY-001-CORE: qwen3_online 值零回归（不受迁移影响）
+    // =====================================================================
+    // ASR-041: 存量 qwen3_online 配置静默迁移为 qwen_audio_online
+    // =====================================================================
+
+    /// ASR-041: 存量 qwen3_online 配置加载时静默迁移为 qwen_audio_online
     #[test]
-    fn asr_model_qwen3_online_unchanged_by_migration() {
+    fn asr_model_qwen3_online_migrates_to_qwen_audio_online() {
         let _guard = TEST_MUTEX.lock().unwrap();
         let env = TestEnv::new();
 
@@ -1054,9 +1083,34 @@ clipboard_delay_ms = 150
         cfg.save_to(&env.config_path())
             .expect("save should succeed");
         let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
+        // 迁移后应是 qwen_audio_online（不是 qwen3_online）
         assert_eq!(
-            loaded.audio.asr_model, "qwen3_online",
-            "qwen3_online must be unchanged by accuracy migration logic"
+            loaded.audio.asr_model, "qwen_audio_online",
+            "ASR-041: legacy 'qwen3_online' must migrate to 'qwen_audio_online' on load"
+        );
+        // 落盘后再次加载应保持 qwen_audio_online（不重复迁移）
+        let reloaded = AppConfig::load_from(&env.config_path()).expect("reload should succeed");
+        assert_eq!(
+            reloaded.audio.asr_model, "qwen_audio_online",
+            "migrated config should persist 'qwen_audio_online' on disk"
+        );
+    }
+
+    /// ASR-041: qwen_audio_online 值零回归（不受迁移影响）
+    #[test]
+    fn asr_model_qwen_audio_online_unchanged_by_migration() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        let mut cfg = AppConfig::default();
+        cfg.audio.asr_model = "qwen_audio_online".to_string();
+
+        cfg.save_to(&env.config_path())
+            .expect("save should succeed");
+        let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
+        assert_eq!(
+            loaded.audio.asr_model, "qwen_audio_online",
+            "qwen_audio_online must not be affected by qwen3_online migration"
         );
     }
 

@@ -41,7 +41,7 @@ const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
   useEffect(() => {
     return () => {
       const { asrModel: lastModel, config: lastConfig } = latestRef.current;
-      if (lastModel === 'qwen3_online' && !lastConfig.audio?.qwen3_api_key) {
+      if (lastModel === 'qwen_audio_online' && !lastConfig.audio?.qwen3_api_key) {
         updateConfig({
           ...lastConfig,
           audio: { ...lastConfig.audio, asr_model: prevModelRef.current }
@@ -77,10 +77,10 @@ const loadDevices = async () => {
   };
 
   const handleAsrModelChange = (value: string) => {
-    if (value === 'qwen3_online' && asrModel !== 'qwen3_online') {
+    if (value === 'qwen_audio_online' && asrModel !== 'qwen_audio_online') {
       prevModelRef.current = asrModel;
     }
-    if (value === 'qwen3_online' && !config.audio?.qwen3_api_key) {
+    if (value === 'qwen_audio_online' && !config.audio?.qwen3_api_key) {
       setQwen3TestStatus('idle');
     }
     handleAudioChange('asr_model', value);
@@ -153,7 +153,7 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
     switch (asrModel) {
       case 'performance': return t.voice_asr_model_performance_desc;
       case 'accuracy': return t.voice_asr_model_accuracy_desc;
-      case 'qwen3_online': return t.voice_asr_model_qwen3_desc;
+      case 'qwen_audio_online': return t.voice_asr_model_qwen3_desc;
       default: return '';
     }
   };
@@ -188,7 +188,7 @@ const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.rea
             className="select-input"
           >
             <option value="performance">{t.voice_asr_model_performance}</option>
-            <option value="qwen3_online">{t.voice_asr_model_qwen3}</option>
+            <option value="qwen_audio_online">{t.voice_asr_model_qwen3}</option>
           </select>
 
           <p className="asr-model-desc" style={{ marginTop: '8px' }}>
@@ -240,7 +240,7 @@ const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.rea
             </div>
           )}
 
-          {asrModel === 'qwen3_online' && (
+          {asrModel === 'qwen_audio_online' && (
             <div className="qwen3-section" style={{ marginTop: '16px' }}>
               {!config.audio?.qwen3_api_key && (
                 <p className="form-hint" style={{ color: 'var(--brand-primary)', marginBottom: '8px' }}>

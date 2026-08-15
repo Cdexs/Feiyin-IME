@@ -1070,3 +1070,32 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 ### 对 macOS 的影响
 
 **已评估，对 macOS 无影响**。`hotkey.rs` 全部位于 `#[cfg(target_os = "windows")]` 门控内，macOS 侧不编译此文件。`HotkeyMode` 枚举本身是平台中立的（config 层定义），但两个新纯函数只在 Windows 的 hotkey 模块内使用，macOS 侧无对应调用点。`TRANSLATE_WINDOW_MS` 原本也只在 Windows 侧使用，删除不影响 macOS。
+
+---
+
+## §ASR-041 · 在线 ASR 模型换代 UI 选项 + 存量配置静默迁移（2026-08-15）
+
+### 改动范围
+
+| 文件 | 动作 | 平台中立？ |
+|---|---|---|
+| `ui/src/pages/Voice.tsx` | 下拉 value + desc case + 4 处逻辑判断 `qwen3_online` → `qwen_audio_online` | N/A（前端，平台无关） |
+| `ui/src/i18n/en.ts` / `zh-Hans.ts` / `zh-Hant.ts` | 去 Qwen3 字样 | N/A |
+| `ui/src/pages/Voice.test.tsx` | 17 处 `qwen3_online` → `qwen_audio_online` | N/A |
+| `src/config/mod.rs` | load+load_from 存量 `qwen3_online` 静默迁移为 `qwen_audio_online` + 文档注释 | ✅ 是（config 平台中立模块） |
+
+### 行为变更：存量配置静默迁移
+
+**变更**：用户 `config.toml` 中 `asr_model = "qwen3_online"` 在 load 时自动迁移为 `qwen_audio_online` 并落盘保存。
+
+| 项 | 修前 | 修后 |
+|---|---|---|
+| UI 下拉 | `qwen3_online` 选项 | `qwen_audio_online` 选项（新引擎） |
+| 存量 config | `qwen3_online` 可匹配下拉 | `qwen3_online` 不匹配任何 option → 静默迁移为 `qwen_audio_online` |
+| 后端 | 已认 `qwen_audio_online`（038-A/B 已完成） | 无变化 |
+
+### 对 macOS 的影响
+
+**`config/mod.rs` 是平台中立模块**，macOS 编译同一份代码。静默迁移逻辑对 macOS 同样生效——macOS 用户的 `qwen3_online` 配置也会自动迁移为 `qwen_audio_online`。这是预期行为（新旧引擎替代是全平台的，不是 Windows 专属）。
+
+`ui/` 前端改动平台无关。macOS 侧 Tauri UI 编译同一份前端代码。

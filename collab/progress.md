@@ -441,6 +441,7 @@ PTT 录音中点击即进编辑态（不等松键）｜流式文本白色不加�
 | TEST-SYNC-038 | 测试同步（阶段三） | 各 `mod tests` | tester-1 | 🔜 等 B 验收 |
 | TEST-EXEC-038 | 全量回归（阶段四） | — | tester-1 | 🔜 |
 | BUILD-016 | v0.8.0 首包（阶段五） | — | tester-1 | 🔜 |
+| **ASR-041** | 在线 ASR 模型换代 UI 选项 + 存量配置静默迁移 | `ui/src/pages/Voice.tsx`、`ui/src/i18n/*.ts`、`ui/src/pages/Voice.test.tsx`、`src/config/mod.rs` | coder-1 | ✅ 已验证（UI 下拉指向 qwen_audio_online + 三份 i18n 去 Qwen3 字样 + 存量 qwen3_online 静默迁移 + 17 处测试同步） |
 
 **038-A 验收取证**（主控独立复现，未采信报告）：`cargo fmt --check` clean ｜ `cargo check --all-targets` 0 error（当时）
 ｜源码 `#[test]` 计数 **45** 与报告一致 ｜文件域零越界。四处硬红线全部落实：`"model"` 在 payload 内 ｜

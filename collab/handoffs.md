@@ -2,6 +2,22 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-08-15 — coder-1 — ASR-041 ✅ 在线 ASR 模型换代 UI 选项 + 存量配置静默迁移
+
+- **来源**：Gavin 指令「用新模型替代旧模型，改选项文本」。基线 HEAD `c76a4c3`
+- **文件域**：6 文件（Voice.tsx / Voice.test.tsx / en.ts / zh-Hans.ts / zh-Hant.ts / config/mod.rs）
+- **五处改动**：
+  - ① 下拉 option value `qwen3_online` → `qwen_audio_online`
+  - ② desc case 同步
+  - ③ 三份 i18n 去 Qwen3 字样（`在线语音识别模型`/`線上語音辨識模型`/`Online Speech Recognition`，_desc 去 Qwen3）
+  - ④ config/mod.rs load+load_from 存量 `qwen3_online` 静默迁移为 `qwen_audio_online`（照抄 accuracy→performance 先例，含 log+落盘）+ 文档注释更新
+  - ⑤ Voice.test.tsx 17 处同步；Voice.tsx 另有 4 处逻辑判断也同步（切换检查 key/显示 key 输入框/卸载回退）
+- **i18n key 名保留** `voice_asr_model_qwen3`（改 key 名牵连 8 处收益为零）
+- **旧代码路径保留**：AsrModel::Qwen3Online / qwen3_online.rs / qwen3_asr_url / qwen3_asr_model 不删（回退能力）
+- **验收**：cargo fmt clean / cargo check --all-targets 0 error / npm run build 通过 / config 43 passed 0 failed（+2 迁移测试）/ grep qwen3_online ui/src 零命中
+- **版本号未动**（已是 0.8.0）
+- **详情**：outbox/coder-1/result.md + logs/20260815.md + CHANGELOG.md
+
 ## 2026-08-15 — coder-1 — TRANS-HOTKEY-039-D ✅ 抽判据纯函数 + 清理死常量
 
 - **来源**：主控验收 TEST-SYNC-038 时发现假护栏（tester-1 闭包自述同义反复，与生产零耦合）。基线 HEAD `4f3b41b` + 在途改动

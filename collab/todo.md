@@ -218,6 +218,18 @@ DNS 解析 (to_socket_addrs，阻塞系统调用，无缓存)
 - **验收**：cargo fmt clean / cargo check --all-targets 0 error / cargo test hotkey 23/0
 - **行为零变更**：PTT 抬起仍停、Toggle 抬起仍不停
 
+### ✅ ASR-041 在线 ASR 模型换代 UI 选项 + 存量配置静默迁移（coder-1，2026-08-15）
+
+- **来源**：Gavin 指令「用新模型替代旧模型，改选项文本」
+- **改动**：6 文件（Voice.tsx / Voice.test.tsx / en.ts / zh-Hans.ts / zh-Hant.ts / config/mod.rs）
+  - 下拉 value + desc case `qwen3_online` → `qwen_audio_online`
+  - 三份 i18n 去 Qwen3 字样（`在线语音识别模型`/`線上語音辨識模型`/`Online Speech Recognition`）
+  - Voice.tsx 4 处逻辑判断同步（切换检查 key/显示 key 输入框/卸载回退）
+  - config/mod.rs load+load_from 存量 `qwen3_online` 静默迁移为 `qwen_audio_online`（含 log+落盘）
+  - Voice.test.tsx 17 处同步；+2 迁移单测
+- **验收**：cargo fmt clean / cargo check --all-targets 0 error / npm run build 通过 / config 43/0 / grep qwen3_online ui/src 零命中
+- **旧代码路径保留**（Qwen3Online 枚举/qwen3_online.rs/qwen3_asr_* 不删，回退能力）
+
 > 🔴 **2026-08-15 主控更正状态**：coder-2 曾把本节标为「✅ 已结案」，但**当时主控已打回**，
 > Toggle 回归尚未修复。**状态不实，已改回「验收中」。**
 > 教训与 `[DOC-STATE-DRIFT-001]` 同族但方向相反：不是漏写，是**提前宣告完成**。
