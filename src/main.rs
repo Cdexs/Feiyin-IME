@@ -168,6 +168,12 @@ struct OverlayRequest {
     /// ASR-038-C: 本次录音开始时捕获的目标窗口，用于编辑提交后归还焦点 / 注入文本
     target_hwnd: platform::WindowId,
 }
+// ASR-038-C-REWORK-001: controller-side flag that suppresses Cancelled/Done → Hide while the user is editing.
+// Needed because EditRequested sets cancel_signal; worker then emits PipelineEvent::Cancelled, which would
+// otherwise immediately destroy the EDIT control we just created. Guard is paired with the overlay-side
+// StreamingEditing guard in the Hide handler.
+#[cfg(target_os = "windows")]
+static OVERLAY_EDITING: AtomicBool = AtomicBool::new(false);
 #[derive(Debug, Clone, Copy)]
 #[cfg(target_os = "windows")]
 struct SendHwnd(isize);
@@ -744,6 +750,8 @@ struct OverlayWindowState {
     edit_old_wndproc: Option<windows::Win32::UI::WindowsAndMessaging::WNDPROC>,
     /// ASR-038-C: 用于 WM_CTLCOLOREDIT 返回的背景画刷（BG_DARK）
     edit_bg_brush: Option<windows::Win32::Graphics::Gdi::HBRUSH>,
+    /// ASR-038-C-REWORK-001: 流式文本窗口宽度 100ms 尺寸节流时间戳
+    last_resize_time: Option<std::time::Instant>,
 }
 #[cfg(target_os = "windows")]
 struct OverlayWindowData {
@@ -837,6 +845,7 @@ fn run_overlay_thread(
         edit_hwnd: None,
         edit_old_wndproc: None,
         edit_bg_brush: None,
+        last_resize_time: None,
     }));
     let window_data = Box::new(OverlayWindowData {
         state: Arc::clone(&shared_state),
@@ -893,6 +902,27 @@ fn run_overlay_thread(
         while let Ok(command) = command_rx.try_recv() {
             match command {
                 OverlayCommand::Show(mut request) => {
+                    // ASR-038-C-REWORK-001: 100ms size throttle for streaming text resize.
+                    // The 16ms timer already throttles repaint; this guard throttles the expensive
+                    // SetWindowPos/EDIT-resize so rapid StreamingText events do not jiggle the width.
+                    let should_resize =
+                        if matches!(request.status, OverlayStatus::RecordingWithText { .. }) {
+                            if let Ok(mut state) = shared_state.lock() {
+                                let now = std::time::Instant::now();
+                                let do_it = state
+                                    .last_resize_time
+                                    .map(|t| t.elapsed().as_millis() >= 100)
+                                    .unwrap_or(true);
+                                if do_it {
+                                    state.last_resize_time = Some(now);
+                                }
+                                do_it
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        };
                     if let Ok(mut state) = shared_state.lock() {
                         // ASR-038-C: clean up any lingering EDIT control when a fresh overlay appears
                         destroy_edit_control(&mut state);
@@ -907,12 +937,16 @@ fn run_overlay_thread(
                             ui::overlay::warmup_levels(&state.audio_buf);
                         }
                         // ASR-038-C: dynamic width for streaming text / editing
-                        let (new_pos, new_size) = adjust_overlay_pos_size_for_text(
-                            hwnd,
-                            &request.status,
-                            &request.pos,
-                            &request.size,
-                        );
+                        let (new_pos, new_size) = if should_resize {
+                            adjust_overlay_pos_size_for_text(
+                                hwnd,
+                                &request.status,
+                                &request.pos,
+                                &request.size,
+                            )
+                        } else {
+                            (request.pos, request.size)
+                        };
                         request.pos = new_pos;
                         request.size = new_size;
                     }
@@ -992,6 +1026,19 @@ fn run_overlay_thread(
                 }
                 OverlayCommand::Hide => {
                     if let Ok(mut state) = shared_state.lock() {
+                        // ASR-038-C-REWORK-001: single-point safeguard — do not tear down the EDIT control
+                        // while the user is actively editing. The controller will also suppress Hide while
+                        // OVERLAY_EDITING is true; this guard protects against any other path that reaches here.
+                        if matches!(
+                            state.request,
+                            Some(OverlayRequest {
+                                status: OverlayStatus::StreamingEditing { .. },
+                                ..
+                            })
+                        ) {
+                            log::info!("ASR-038-C: Hide suppressed while overlay is in StreamingEditing state");
+                            continue;
+                        }
                         destroy_edit_control(&mut state);
                         state.request = None;
                         state.cancel_btn_rect = None;
@@ -2728,6 +2775,8 @@ fn process_controller_events(
         let opacity = config.audio.overlay_opacity;
         match event {
             PipelineEvent::RecordingStarted => {
+                // New recording session resets any stale editing state from a previous session.
+                OVERLAY_EDITING.store(false, Ordering::Release);
                 set_tray_state(tray, TrayState::Recording, ui_language);
                 show_overlay(
                     overlay_handle,
@@ -2756,11 +2805,18 @@ fn process_controller_events(
                 );
             }
             PipelineEvent::Done | PipelineEvent::Cancelled => {
-                set_tray_state(tray, TrayState::Idle, ui_language);
-                overlay_handle.send(OverlayCommand::Hide);
+                // ASR-038-C-REWORK-001: if the user has taken over editing, do not revert tray to Idle
+                // and do not hide the overlay; editing controls the end-of-session lifecycle.
+                if OVERLAY_EDITING.load(Ordering::Acquire) {
+                    log::info!("ASR-038-C: suppressing Done/Cancelled → Idle/Hide while editing");
+                } else {
+                    set_tray_state(tray, TrayState::Idle, ui_language);
+                    overlay_handle.send(OverlayCommand::Hide);
+                }
                 platform::notify_translate_poll_stop();
             }
             PipelineEvent::FocusLost(text) => {
+                OVERLAY_EDITING.store(false, Ordering::Release);
                 set_tray_state(tray, TrayState::Idle, ui_language);
                 platform::notify_translate_poll_stop();
                 show_overlay(
@@ -2774,6 +2830,7 @@ fn process_controller_events(
                 );
             }
             PipelineEvent::Error(message) => {
+                OVERLAY_EDITING.store(false, Ordering::Release);
                 log::error!("Pipeline error: {}", message);
                 platform::notify_translate_poll_stop();
                 set_tray_state(tray, TrayState::Error, ui_language);
@@ -2796,6 +2853,7 @@ fn process_controller_events(
             // FORMAT-LLM-001-CORE (DEC-031-③): LLM 格式化失败提示。
             // 历史教训：必须显式复位 tray 状态到 Idle，否则会卡在"处理中"。
             PipelineEvent::FormatFailed => {
+                OVERLAY_EDITING.store(false, Ordering::Release);
                 log::warn!("LLM formatting failed; raw text injected as fallback");
                 platform::notify_translate_poll_stop();
                 set_tray_state(tray, TrayState::Idle, ui_language);
@@ -2822,13 +2880,17 @@ fn process_controller_events(
             OverlayUiEvent::CancelRequested => {
                 cancel_signal.store(true, Ordering::Relaxed);
                 stop_recording_signal.store(true, Ordering::Relaxed);
-                overlay_handle.send(OverlayCommand::Hide); // 闂呮劘妫?overlay 缁愭褰?
+                OVERLAY_EDITING.store(false, Ordering::Release);
+                overlay_handle.send(OverlayCommand::Hide);
                 set_tray_state(tray, TrayState::Idle, ui_language);
             }
             OverlayUiEvent::PreviewCopied => {
                 overlay_handle.send(OverlayCommand::Hide);
             }
             OverlayUiEvent::EditRequested => {
+                // ASR-038-C-REWORK-001: set controller-side editing flag BEFORE cancel_signal, so the
+                // inevitable PipelineEvent::Cancelled from the worker does not hide the overlay.
+                OVERLAY_EDITING.store(true, Ordering::Release);
                 // ASR-038-C: 用户点击 overlay 文本区进入编辑态
                 // 停录音 + 取消 pipeline（关 WebSocket 由 ASR 线程检测 cancel_signal 处理）
                 cancel_signal.store(true, Ordering::Relaxed);
@@ -2866,6 +2928,7 @@ fn process_controller_events(
                                 continue;
                             }
                             maybe_learn_user_edit(&text, text_snapshot, runtime_config);
+                            OVERLAY_EDITING.store(false, Ordering::Release);
                             overlay_handle.send(OverlayCommand::Hide);
                             set_tray_state(tray, TrayState::Idle, ui_language);
                             continue;
@@ -2873,6 +2936,7 @@ fn process_controller_events(
                     }
                 }
                 // UIPI / focus lost fallback
+                OVERLAY_EDITING.store(false, Ordering::Release);
                 let _ = platform::copy_text_to_clipboard(&text);
                 show_overlay(
                     overlay_handle,

@@ -357,10 +357,22 @@ Windows 侧新增两个 `OverlayStatus` 变体：
   - 编辑提交后调用 `platform::inject_text` 或 `copy_text_to_clipboard` + `FocusLost` 预览降级。
 - 与 Windows 侧保持一致的状态流转：录音中点击即进入编辑，不等松开热键。
 
-#### 2.10.4 对 Windows 侧的反向约束
+#### 2.10.4 2026-08-15 返工修复补充
+
+主控验收 ASR-038-C 时发现 3 项问题，已在 Windows 侧修复并同步影响 macOS 交互契约：
+
+| # | 问题 | Windows 侧修法 | macOS 侧需对齐 |
+| --- | --- | --- | --- |
+| 1 | 编辑态一进即被销毁 | 新增 `OVERLAY_EDITING` 主控侧标志 + overlay 侧 `StreamingEditing` 守卫，使 `EditRequested` 触发的 `PipelineEvent::Cancelled` 不再 `Hide` | macOS `handle_pipeline_event` 在编辑态接管时也需忽略 `Done/Cancelled` 的 Hide 请求，直到用户提交/取消 |
+| 2 | 托盘编辑态被复位 Idle | `Done\|Cancelled` 分支编辑态时保持 `Recording` | 编辑态期间托盘保持 `Recording` |
+| 3 | 100ms 尺寸节流缺失 | `OverlayWindowState` 新增 `last_resize_time`，`RecordingWithText` 每次刷新至少间隔 100ms 才重算宽度 | 流式文本刷新加 100ms 尺寸防抖，避免窗口宽度抖动 |
+
+> 注：037 设计中的 `pipeline_cancelled` 拦截全库仅存在于注释，未实际实现；返工后以 `OVERLAY_EDITING` 标志 + overlay 侧守卫双保险替代。
+
+#### 2.10.5 对 Windows 侧的反向约束
 
 - `OverlayStatus` 枚举是共享类型，macOS 侧编译同一份定义，**禁止从 Windows 侧删除或重命名新变体**。
-- 新增 `OverlayCommand::UpdateStreamingText`、`EnterEditMode` 是 Windows-only 内部命令，不影响 macOS 平台契约。
+- 新增 `OverlayCommand::EnterEditMode` 是 Windows-only 内部命令，不影响 macOS 平台契约。
 - 新增 `OverlayUiEvent::SubmitRequested(String, platform::WindowId)` 仅 Windows 侧使用；macOS 侧若采用不同事件模型，不强制对齐签名，但**语义**（提交文本 + 目标窗口）必须一致。
 | 027-F | 027-E 引入的静默归零：隐式尾数吸收未做纯数字校验，带单位串进 `format_currency_chain` 的 `.parse()` 静默归零（`五块三亿`→`5元`） | **金额静默改错** |
 | 027-G-1 | DEC-042 补充二：万亿层升级链（`一万亿`→`1万亿`，亿层 ≥1e12 且 ≤1位小数升万亿） | **行为变更** |

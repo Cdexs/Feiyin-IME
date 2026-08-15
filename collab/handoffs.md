@@ -27,6 +27,18 @@
 - **版本号未动**（已是 0.8.0）
 - **详情**：`outbox/tester-1/result.md` + `logs/20260815.md` + CHANGELOG.md
 
+## 2026-08-15 — coder-2 — ASR-038-C-REWORK ✅ 编辑态销毁 + 托盘复位 + 100ms 尺寸节流返工修复
+
+- **来源**：主控验收 ASR-038-C 不通过，指出 3 项问题（task.md 末尾追加返工要求）。基线 HEAD `4f3b41b` + 在途改动
+- **P0 编辑态一进就被销毁**：`EditRequested` 置 `cancel_signal=true` → worker 发 `PipelineEvent::Cancelled` → `Done|Cancelled` 分支无条件 `Hide` → `Hide` 调 `destroy_edit_control()`。双保险修复：① 主控侧新增 `OVERLAY_EDITING` 原子标志，编辑态时 `Done|Cancelled` 不发 `Hide`、不重置托盘；② overlay 侧 `Hide` 处理加 `StreamingEditing` 守卫，遇到该态直接忽略
+- **托盘编辑态须保持 Recording**：`Done|Cancelled` 分支编辑态时跳过 `set_tray_state(Idle)`，与 P0 同根因一并修复
+- **100ms 尺寸节流缺失**：`OverlayWindowState` 新增 `last_resize_time: Option<Instant>`；`RecordingWithText` 每次 `Show` 至少间隔 100ms 才调用 `adjust_overlay_pos_size_for_text`，防止窗口宽度每帧抖动
+- **标志复位点**：`RecordingStarted`、`FocusLost`、`Error`、`FormatFailed`、`CancelRequested`、`SubmitRequested` 成功 / UIPI 降级路径均 `store(false)`，确保状态不泄漏到下一次录音
+- **改动文件**：仅 `src/main.rs`（+73/-9）
+- **验证**：`cargo fmt` clean / `cargo check --all-targets` 0 error / `cargo test` PASS / `cargo check --manifest-path src-tauri/Cargo.toml --all-targets` PASS
+- **版本号未动**（已是 0.8.0）
+- **详情**：`outbox/coder-2/result.md` + `logs/20260815.md` + CHANGELOG.md
+
 ## 2026-08-15 — coder-2 — TRANS-HOTKEY-039 ✅ 翻译热键全链失效修复（P0）
 
 - **来源**：Gavin 端测报翻译热键 100% 不生效，主控全链取证后派发。基线 HEAD `4b3c63f` + coder-1 ASR-038-B 在途改动
