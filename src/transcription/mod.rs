@@ -84,6 +84,10 @@ pub struct Transcriber {
     qwen3_api_key: String,
     /// Qwen3 在线 ASR 模型 ID（DEC-028，从配置文件读取，2026-07-07 移出硬编码）
     qwen3_asr_model: String,
+    /// Qwen-Audio-3.0 在线流式 ASR 配置（仅 QwenAudioOnline 模式用，ASR-038-B）
+    /// 独立于 qwen3_*：两协议端点不同（Realtime vs Inference）、模型名不同、帧格式不同
+    qwen_asr_url: String,
+    qwen_asr_model: String,
 }
 
 // SAFETY: Transcriber 持有的 OfflineRecognizer 内部为 *const C++ 指针。
@@ -110,6 +114,8 @@ impl Transcriber {
         qwen3_url: &str,
         qwen3_api_key: &str,
         qwen3_asr_model: &str,
+        qwen_asr_url: &str,
+        qwen_asr_model: &str,
     ) -> Result<Self> {
         let mode = if enable_streaming {
             AsrMode::Streaming
@@ -117,7 +123,8 @@ impl Transcriber {
             AsrMode::Offline
         };
 
-        // DEC-028: qwen3_online 模式不加载本地模型
+        // DEC-028 / ASR-038-B: 在线 ASR 模式不加载本地模型
+        // Qwen3Online 用 Realtime API（qwen3_* 配置），QwenAudioOnline 用 Inference API（qwen_asr_* 配置）
         if asr_model == AsrModel::Qwen3Online || asr_model == AsrModel::QwenAudioOnline {
             if qwen3_api_key.trim().is_empty() {
                 anyhow::bail!("在线 ASR 配置失败：API Key 为空（请在设置中配置 API Key）");
@@ -125,7 +132,11 @@ impl Transcriber {
             log::info!(
                 "Online ASR mode: no local model loaded, model={:?}, url={}",
                 asr_model,
-                qwen3_url
+                if asr_model == AsrModel::QwenAudioOnline {
+                    qwen_asr_url
+                } else {
+                    qwen3_url
+                }
             );
             return Ok(Self {
                 mode,
@@ -137,6 +148,8 @@ impl Transcriber {
                 qwen3_url: qwen3_url.to_string(),
                 qwen3_api_key: qwen3_api_key.to_string(),
                 qwen3_asr_model: qwen3_asr_model.to_string(),
+                qwen_asr_url: qwen_asr_url.to_string(),
+                qwen_asr_model: qwen_asr_model.to_string(),
             });
         }
 
@@ -162,11 +175,23 @@ impl Transcriber {
             qwen3_url: String::new(),
             qwen3_api_key: String::new(),
             qwen3_asr_model: String::new(),
+            qwen_asr_url: String::new(),
+            qwen_asr_model: String::new(),
         })
     }
 
     pub fn asr_model(&self) -> AsrModel {
         self.asr_model
+    }
+
+    /// ASR-038-B: QwenAudioOnline 的 Inference API 端点（独立于 Qwen3Online 的 Realtime 端点）
+    pub fn qwen_asr_url(&self) -> &str {
+        &self.qwen_asr_url
+    }
+
+    /// ASR-038-B: QwenAudioOnline 的模型 ID
+    pub fn qwen_asr_model(&self) -> &str {
+        &self.qwen_asr_model
     }
 
     /// 当前 hotwords 版本号（外部对比用）
@@ -300,19 +325,18 @@ impl Transcriber {
         if self.asr_model == AsrModel::QwenAudioOnline {
             let vocabulary = crate::transcription::load_wordbook_vocabulary();
             let text = qwen_inference::transcribe_streaming(
-                &self.qwen3_url, // 复用 qwen3_url 字段（URL 在 config 层区分）
+                &self.qwen_asr_url,
                 &self.qwen3_api_key,
-                &self.qwen3_asr_model, // 复用 qwen3_asr_model 字段
+                &self.qwen_asr_model,
                 samples,
                 &vocabulary,
-                |_| {}, // 非流式回退不推增量
+                None,
+                |_| {},
             )?;
             let cleaned = Self::strip_asr_special_tokens(&text);
             let trimmed = cleaned.trim();
             if trimmed.is_empty() {
-                anyhow::bail!(
-                    "ASR transcription failed: qwen_audio_online output is empty"
-                );
+                anyhow::bail!("ASR transcription failed: qwen_audio_online output is empty");
             }
             let normalized = text_normalizer::normalize_text_for_language(trimmed, script);
             let native_punctuated = punctuation::has_effective_punctuation(&normalized);
@@ -834,6 +858,48 @@ pub fn check_accuracy_model_ready(model_dir: &Path) -> (bool, PathBuf) {
     (ready, dir)
 }
 
+/// ASR-038-B: 从 wordbook 表加载热词 vocabulary（调用链证明）
+///
+/// **调用链**：
+/// `wordbook::Wordbook::list_all()` → `db::load_word_entries()`（只查 `wordbook` 表）
+/// → 转换为 `qwen_inference::VocabEntry` → `qwen_inference::build_vocabulary()`
+///
+/// 🔴 **数据源保证**：`Wordbook::list_all()` 只查 `wordbook` 表（`db::load_word_entries()`），
+/// **不查 `wordbook_candidates` 表**（163 条未确认候选，禁止注入）。
+/// `wordbook_candidates` 由 `db::upsert_candidate` / `db::load_candidates` 管理，
+/// 本函数不调用这些接口。
+///
+/// 权重：user=5（专名领域词）、system=4（历史 bug 沉淀保护词）、未知=3
+/// 超限词条由 `build_vocabulary` 内部过滤（跳过 ASR 但保留给 LLM）
+pub fn load_wordbook_vocabulary() -> serde_json::Value {
+    match crate::wordbook::Wordbook::open() {
+        Ok(wb) => match wb.list_all() {
+            Ok(entries) => {
+                let vocab_entries: Vec<qwen_inference::VocabEntry> = entries
+                    .into_iter()
+                    .map(|e| qwen_inference::VocabEntry {
+                        word: e.word,
+                        source: e.source,
+                    })
+                    .collect();
+                log::info!(
+                    "ASR vocabulary loaded from wordbook table: {} entries",
+                    vocab_entries.len()
+                );
+                qwen_inference::build_vocabulary(&vocab_entries)
+            }
+            Err(e) => {
+                log::warn!("Failed to load wordbook for ASR vocabulary: {}", e);
+                serde_json::json!({})
+            }
+        },
+        Err(e) => {
+            log::warn!("Failed to open wordbook for ASR vocabulary: {}", e);
+            serde_json::json!({})
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,6 +914,72 @@ mod tests {
         assert_eq!(AsrModel::from_config("garbage"), AsrModel::Performance);
         assert_eq!(AsrModel::from_config("qwen3_online"), AsrModel::Qwen3Online);
         assert_eq!(AsrModel::from_config("QWEN3_ONLINE"), AsrModel::Qwen3Online);
+        // ASR-038-B: QwenAudioOnline 解析
+        assert_eq!(
+            AsrModel::from_config("qwen_audio_online"),
+            AsrModel::QwenAudioOnline
+        );
+        assert_eq!(
+            AsrModel::from_config("QWEN_AUDIO_ONLINE"),
+            AsrModel::QwenAudioOnline
+        );
+    }
+
+    // ============================================================
+    // ASR-038-B: Transcriber QwenAudioOnline 独立配置字段验证
+    // 回归防护：A 批错误复用 qwen3_url 调 Inference 协议，B 批修正为独立 qwen_asr_url
+    // ============================================================
+
+    /// ASR-038-B-005: QwenAudioOnline 模式 Transcriber::new 存独立 qwen_asr_url/model
+    /// （不加载本地模型，new 不依赖 model_dir 存在性，可直接测）
+    #[test]
+    fn transcriber_qwen_audio_online_stores_independent_config() {
+        let model_dir = std::path::Path::new("nonexistent-model-dir-for-test");
+        let t = Transcriber::new(
+            model_dir,
+            false,
+            "auto".to_string(),
+            AsrModel::QwenAudioOnline,
+            None,
+            "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+            "sk-test-key",
+            "qwen3-asr-flash-realtime",
+            "wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference",
+            "qwen-audio-3.0-asr-flash-streaming",
+        )
+        .expect("QwenAudioOnline Transcriber::new should succeed without local models");
+        assert_eq!(t.asr_model(), AsrModel::QwenAudioOnline);
+        // 独立字段必须存入正确的 Inference API 配置（不是 qwen3 的 Realtime 配置）
+        assert_eq!(
+            t.qwen_asr_url(),
+            "wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference"
+        );
+        assert_eq!(t.qwen_asr_model(), "qwen-audio-3.0-asr-flash-streaming");
+    }
+
+    /// ASR-038-B-006: QwenAudioOnline 模式 API Key 空 → bail
+    #[test]
+    fn transcriber_qwen_audio_online_empty_key_bails() {
+        let model_dir = std::path::Path::new("nonexistent-model-dir-for-test");
+        let result = Transcriber::new(
+            model_dir,
+            false,
+            "auto".to_string(),
+            AsrModel::QwenAudioOnline,
+            None,
+            "wss://realtime.example.com",
+            "",
+            "qwen3-asr-flash-realtime",
+            "wss://inference.example.com",
+            "qwen-audio-3.0-asr-flash-streaming",
+        );
+        assert!(result.is_err());
+        let err_msg = result.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("API Key 为空"),
+            "empty API key should bail with clear message, got: {}",
+            err_msg
+        );
     }
 
     #[test]
@@ -1307,51 +1439,9 @@ mod tests {
             Err(e) => {
                 // 两个模型都缺失才 Err，本机至少有一个则不会到这
                 eprintln!("build_recognizer err (models may be missing): {}", e);
+            }
         }
     }
-}
-
-/// ASR-038-B: 从 wordbook 表加载热词 vocabulary（调用链证明）
-///
-/// **调用链**：
-/// `wordbook::Wordbook::list_all()` → `db::load_word_entries()`（只查 `wordbook` 表）
-/// → 转换为 `qwen_inference::VocabEntry` → `qwen_inference::build_vocabulary()`
-///
-/// 🔴 **数据源保证**：`Wordbook::list_all()` 只查 `wordbook` 表（`db::load_word_entries()`），
-/// **不查 `wordbook_candidates` 表**（163 条未确认候选，禁止注入）。
-/// `wordbook_candidates` 由 `db::upsert_candidate` / `db::load_candidates` 管理，
-/// 本函数不调用这些接口。
-///
-/// 权重：user=5（专名领域词）、system=4（历史 bug 沉淀保护词）、未知=3
-/// 超限词条由 `build_vocabulary` 内部过滤（跳过 ASR 但保留给 LLM）
-pub fn load_wordbook_vocabulary() -> serde_json::Value {
-    match crate::wordbook::Wordbook::open() {
-        Ok(wb) => match wb.list_all() {
-            Ok(entries) => {
-                let vocab_entries: Vec<qwen_inference::VocabEntry> = entries
-                    .into_iter()
-                    .map(|e| qwen_inference::VocabEntry {
-                        word: e.word,
-                        source: e.source,
-                    })
-                    .collect();
-                log::info!(
-                    "ASR vocabulary loaded from wordbook table: {} entries",
-                    vocab_entries.len()
-                );
-                qwen_inference::build_vocabulary(&vocab_entries)
-            }
-            Err(e) => {
-                log::warn!("Failed to load wordbook for ASR vocabulary: {}", e);
-                serde_json::json!({})
-            }
-        },
-        Err(e) => {
-            log::warn!("Failed to open wordbook for ASR vocabulary: {}", e);
-            serde_json::json!({})
-        }
-    }
-}
 
     /// R2 纯逻辑验证：build_recognizer 返回元组 arity 正确（3 个元素），
     /// effective_model 是 AsrModel 类型。此测试文档化签名契约，

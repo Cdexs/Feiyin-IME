@@ -25,7 +25,17 @@ pub const SEGMENT_PADDING_SAMPLES: usize = 3200;
 
 /// silero VAD 窗口大小（512 samples = 32ms @ 16kHz，silero_vad.onnx 要求）
 const VAD_WINDOW_SIZE: i32 = 512;
+
+/// ASR-038-B: 导出 VAD 窗口大小供流式入口门控使用
+pub fn vad_window_size() -> usize {
+    VAD_WINDOW_SIZE as usize
+}
+
 const VAD_THRESHOLD: f32 = 0.5;
+/// ASR-038-B: 入口门控 VAD 阈值（低于分段用 0.5）
+/// 设计文档 §2.2：0.3 对应「只要有微弱语音特征就建连」，牺牲纯静音不建连效果换取首字安全
+/// Gavin 硬指令：必须用真 VAD 防「键盘声/风扇声/音乐」无效上传，RMS 被否决
+const VAD_STREAMING_THRESHOLD: f32 = 0.3;
 const VAD_MIN_SILENCE_DURATION: f32 = 0.3;
 const VAD_MIN_SPEECH_DURATION: f32 = 0.1;
 const VAD_MAX_SPEECH_DURATION: f32 = SEGMENT_MAX_SECS as f32;
@@ -102,6 +112,67 @@ impl VadSegmenter {
 
         // 合并 + padding + 从原音频提取（纵深防御：内部对越界段做过滤/clamp）
         build_padded_segments(&raw, samples.len(), samples)
+    }
+
+    // ===========================================================================
+    // ASR-038-B: 流式入口门控滚动 VAD（Gavin 硬指令：真 VAD 防「键盘声/风扇声/音乐」无效上传）
+    // ===========================================================================
+
+    /// 流式入口门控专用工厂：阈值 0.3（低于分段用 0.5），其他配置同 try_new。
+    /// 模型缺失/失败返回 None → 调用方降级为「总是建连」（宁可多花钱不可吞字）。
+    pub fn try_new_for_streaming(model_dir: &Path) -> Option<Self> {
+        let vad_model = find_silero_vad_model(model_dir)?;
+        let config = VadModelConfig {
+            silero_vad: sherpa_onnx::SileroVadModelConfig {
+                model: vad_model.to_str().map(|s| s.to_string()),
+                threshold: VAD_STREAMING_THRESHOLD,
+                min_silence_duration: VAD_MIN_SILENCE_DURATION,
+                min_speech_duration: VAD_MIN_SPEECH_DURATION,
+                window_size: VAD_WINDOW_SIZE,
+                max_speech_duration: VAD_MAX_SPEECH_DURATION,
+            },
+            ten_vad: sherpa_onnx::TenVadModelConfig::default(),
+            sample_rate: 16000,
+            num_threads: 1,
+            provider: Some("cpu".to_string()),
+            debug: false,
+        };
+        let detector = VoiceActivityDetector::create(&config, 300.0)?;
+        log::info!(
+            "VAD streaming gate initialized (silero, threshold={}, model={})",
+            VAD_STREAMING_THRESHOLD,
+            vad_model.display()
+        );
+        Some(Self { detector })
+    }
+
+    /// 滚动 VAD 判定：喂一个窗口的样本（512 samples = 32ms），返回是否检测到语音。
+    ///
+    /// **与 segment() 的关键差异**（主控取证纠正）：
+    /// - 不调 `flush()` —— flush 是批处理收尾，强制输出未完成的段；滚动判定不需要
+    /// - 用 `detected()` 查询当前是否有语音（sherpa-onnx C API `SherpaOnnxVoiceActivityDetectorDetected`）
+    /// - 不收段（不调 front/pop），不做分段，只回答「有没有语音」这一个布尔
+    ///
+    /// **调用方式**：ASR 线程每从音频 channel 收到一个 chunk，喂给本方法。
+    /// 返回 true → 立即建连 WebSocket。
+    /// 2s 内未命中 → 无条件建连（保底，防 VAD 漏检吞字）。
+    ///
+    /// **不调 reset/clear**：滚动判定依赖 detector 内部状态连续性，
+    /// reset 会清空内部缓冲破坏滚动语义。整个录音会话用同一个 VadSegmenter 实例。
+    /// 会话结束后由实例 drop 自动清理。
+    ///
+    /// **并发安全**：本方法用 `&self`，sherpa-onnx C++ 层 VAD 推理本身不可重入，
+    /// 调用方须保证同一实例同一时刻只有一个线程访问（ASR 线程独占）。
+    pub fn accept_and_check(&self, samples: &[f32]) -> bool {
+        self.detector.accept_waveform(samples);
+        self.detector.detected()
+    }
+
+    /// 重置 VAD 状态（会话结束时调，归零内部游标与段队列）。
+    /// 滚动判定期间不调；只在会话结束、实例将复用时调。
+    pub fn reset_for_new_session(&self) {
+        self.detector.clear();
+        self.detector.reset();
     }
 }
 
@@ -662,5 +733,136 @@ mod tests {
             samples.push(v);
         }
         samples
+    }
+
+    // =========================================================================
+    // ASR-038-B: 流式入口门控滚动 VAD 测试
+    // =========================================================================
+
+    /// try_new_for_streaming：模型缺失返回 None（降级为总是建连）
+    #[test]
+    fn vad_streaming_try_new_missing_model_returns_none() {
+        let model_dir = std::path::Path::new("nonexistent-vad-model-dir");
+        assert!(
+            VadSegmenter::try_new_for_streaming(model_dir).is_none(),
+            "missing VAD model should return None for streaming gate"
+        );
+    }
+
+    /// try_new_for_streaming：模型存在时返回 Some（与 try_new 一致行为）
+    /// 需要 silero_vad.onnx + 工作的 ORT runtime（vendor ORT 1.17.1 可能不支持 API v24）
+    #[test]
+    #[ignore = "requires working ORT runtime (vendor ORT 1.17.1 may not support API v24)"]
+    fn vad_streaming_try_new_with_real_model() {
+        let project_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let model_dir = project_root.join("models");
+        let segmenter = match VadSegmenter::try_new_for_streaming(&model_dir) {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "skip: silero_vad.onnx not found at {}, VAD model required",
+                    model_dir.display()
+                );
+                return;
+            }
+        };
+        // 能创建即通过（配置内部用 0.3 阈值，外部不可见）
+        let _ = segmenter;
+    }
+
+    /// accept_and_check：静音样本不检测到语音
+    /// 喂 512 样本全零（静音），detected() 应为 false
+    #[test]
+    #[ignore = "requires working ORT runtime + silero_vad.onnx"]
+    fn vad_streaming_accept_and_check_silence_no_speech() {
+        let project_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let model_dir = project_root.join("models");
+        let segmenter = match VadSegmenter::try_new_for_streaming(&model_dir) {
+            Some(s) => s,
+            None => {
+                eprintln!("skip: silero_vad.onnx not found");
+                return;
+            }
+        };
+        // 喂多个静音窗口（VAD 需要积累一定上下文才稳定）
+        let silence = vec![0.0f32; VAD_WINDOW_SIZE as usize];
+        let mut detected = false;
+        for _ in 0..10 {
+            if segmenter.accept_and_check(&silence) {
+                detected = true;
+            }
+        }
+        assert!(
+            !detected,
+            "pure silence should not trigger speech detection"
+        );
+    }
+
+    /// accept_and_check：语音样本（sine 模拟）应检测到语音
+    #[test]
+    #[ignore = "requires working ORT runtime + silero_vad.onnx"]
+    fn vad_streaming_accept_and_check_speech_detected() {
+        let project_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let model_dir = project_root.join("models");
+        let segmenter = match VadSegmenter::try_new_for_streaming(&model_dir) {
+            Some(s) => s,
+            None => {
+                eprintln!("skip: silero_vad.onnx not found");
+                return;
+            }
+        };
+        // 440Hz sine 模拟语音能量，持续 1s（~31 个窗口）
+        let win = VAD_WINDOW_SIZE as usize;
+        let mut detected = false;
+        for i in 0..31 {
+            let start = i * win;
+            let chunk: Vec<f32> = (0..win)
+                .map(|j| {
+                    let t = (start + j) as f32 / 16000.0;
+                    (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.3
+                })
+                .collect();
+            if segmenter.accept_and_check(&chunk) {
+                detected = true;
+            }
+        }
+        assert!(
+            detected,
+            "sustained sine energy should trigger speech detection"
+        );
+    }
+
+    /// reset_for_new_session：调后不 panic，可继续用
+    #[test]
+    #[ignore = "requires working ORT runtime + silero_vad.onnx"]
+    fn vad_streaming_reset_for_new_session_no_panic() {
+        let project_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let model_dir = project_root.join("models");
+        let segmenter = match VadSegmenter::try_new_for_streaming(&model_dir) {
+            Some(s) => s,
+            None => {
+                eprintln!("skip: silero_vad.onnx not found");
+                return;
+            }
+        };
+        // 喂一些样本后 reset
+        let silence = vec![0.0f32; VAD_WINDOW_SIZE as usize];
+        let _ = segmenter.accept_and_check(&silence);
+        segmenter.reset_for_new_session();
+        // reset 后再喂不应 panic
+        let _ = segmenter.accept_and_check(&silence);
+    }
+
+    /// 入口门控阈值 0.3 低于分段阈值 0.5（验证常量隔离）
+    #[test]
+    fn vad_streaming_threshold_lower_than_segment() {
+        assert!(
+            VAD_STREAMING_THRESHOLD < VAD_THRESHOLD,
+            "streaming gate threshold ({}) must be lower than segment threshold ({}) for first-syllable safety",
+            VAD_STREAMING_THRESHOLD,
+            VAD_THRESHOLD
+        );
+        assert_eq!(VAD_STREAMING_THRESHOLD, 0.3);
+        assert_eq!(VAD_THRESHOLD, 0.5);
     }
 }

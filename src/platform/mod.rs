@@ -71,8 +71,9 @@ mod windows;
 pub use windows::{
     capture_focused_text_snapshot, capture_scene_signals, capture_scene_signals_by_id,
     copy_text_to_clipboard, create_controller_window, destroy_controller_window, disable, enable,
-    foreground_window_id, inject_text, is_enabled, notify_config_changed, read_text_from_hwnd,
-    run_message_loop, FocusedTextSnapshot, HotkeyEvent, HotkeyListener,
+    foreground_window_id, inject_text, is_enabled, notify_config_changed,
+    notify_translate_poll_stop, read_text_from_hwnd, run_message_loop, FocusedTextSnapshot,
+    HotkeyEvent, HotkeyListener,
 };
 
 #[cfg(target_os = "macos")]

@@ -2,6 +2,79 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-08-15 — coder-2 — TRANS-HOTKEY-039 ✅ 翻译热键全链失效修复（P0）
+
+- **来源**：Gavin 端测报翻译热键 100% 不生效，主控全链取证后派发。基线 HEAD `4b3c63f` + coder-1 ASR-038-B 在途改动
+- **根因 A**：`ui/src/pages/HotkeySettings.tsx:43` 的 `VK_TO_LABEL` 把 `0xA0` 标成 Right Shift、`0xA1` 标成 Left Shift，与 Windows 事实（VK_LSHIFT=0xA0 / VK_RSHIFT=0xA1）相反。UI 把 Gavin 的物理左 Shift 配置显示为 "Right Shift"，导致他按物理右 Shift 永远不触发
+- **根因 A-补充**：`CODE_TO_VK` 捕获表本身正确（`ShiftRight:0xA1 / ShiftLeft:0xA0`），Gavin 配置中存的 160 来自他当时按了物理左 Shift，被错标签误导记忆
+- **根因 B**：`src/platform/windows/hotkey.rs` 原翻译键轮询只有 500ms 窗口，Gavin 「录音中途才按」必然错过。改为跟随录音生命周期，新增 `TRANSLATE_POLL_STOP` 静态 AtomicBool，在 PTT 松开 / Toggle 二次按下 / hook 卸载 / poll_ptt_release_thread 结束等路径置位；再加 `MAX_RECORD_SECONDS + 5` 秒硬上限兜底防泄漏
+- **观测性**：`translate_flag.store(true)` 处补 `log::info!`，输出按下时距录音开始的毫秒数
+- **跨文件接线**：`src/main.rs` 6 处终止路径调用 `platform::notify_translate_poll_stop()`（:1978 CancelStop / :1987 ESC / :2028 Done|Cancelled / :2032 FocusLost / :2045 Error / :2063 FormatFailed）。这 6 处与 coder-1 ASR-038-B 改动区（:2231-2413）文本零重叠
+- **根因 C（macOS）**：`docs/MACOS-HANDOFF.md` 新增 §TRANS-HOTKEY-039，说明 macOS 侧硬编码 false、从未实现，给出若要对齐需做的 5 项工作；本单不改 macOS 代码
+- **改动文件**：`ui/src/pages/HotkeySettings.tsx`、`src/platform/windows/hotkey.rs`、`src/platform/windows/mod.rs`、`src/platform/mod.rs`、`src/main.rs`（6 处单函数调用）、`docs/MACOS-HANDOFF.md`
+- **验证**：`cargo fmt` clean / `cargo check --all-targets` 0 error / `cargo check --manifest-path src-tauri/Cargo.toml --all-targets` 0 error / `npm run build` OK
+- **版本号未动**（已是 0.8.0）
+- **详情**：`outbox/coder-2/result.md` + `logs/20260815.md` + CHANGELOG.md
+
+# handoffs · voice-ime
+
+> 只保留当天条目；历史条目见 `handoffs-archive.md`。
+
+## 2026-08-15 — coder-1 — ASR-038-B-streaming ✅ 真流式核心实施（C-1~C-4 + 040-A）
+
+- **来源**：Gavin 拍板真流式 + 两条硬指令（边说边上屏是验收判据；必须用真 VAD 防「键盘声/风扇声/音乐」无效上传，RMS 被否决）。基线 HEAD `4b3c63f`
+- **主控取证纠正**：我说「sherpa VoiceActivityDetector 是批处理式」——不对，批处理是当前 wrapper 写法造成的，`accept_waveform`/`detected()`/`front()`/`pop()` 都是独立方法，滚动判定只需逐块 `accept_waveform` 不调 `flush` 查 `detected()`
+- **C-1 VadSegmenter 滚动方法**（`src/transcription/vad.rs` +202 行）：
+  - `try_new_for_streaming(model_dir)` 工厂，阈值 0.3（低于分段 0.5）
+  - `accept_and_check(&[f32]) -> bool`：喂 `accept_waveform` → 查 `detected()`，不调 flush
+  - `reset_for_new_session()` + `vad_window_size()` 导出
+  - **不改 `segment()`**（FIX-VAD-STATE-RESET-001 在里面）
+  - +6 测试（2 非ORT：阈值常量+模型缺失None；4 ORT-dependent 标 `#[ignore]`）
+- **C-2 record_streaming**（`src/audio/mod.rs` +155 行）：
+  - 热键按下即采集（WASAPI prewarm stream 已在跑，从 channel 读 chunk 推回调）
+  - pre-roll 从 VecDeque drain 后作为首批 chunk 推给回调（建连后补发）
+  - RMS 静音检测管停录（speech_detected 行为不变，与 Silero VAD 并存）
+  - **不改 record()**：平行方法，record 的 collect_recording 零动
+- **C-3 transcribe_streaming_realtime**（`src/transcription/qwen_inference.rs` +447 行）：
+  - VAD 入口门控：逐 chunk 喂 Silero，命中即建连。VAD 缺失→立即建连。2s 保底无条件建连
+  - pre-roll 补发：VAD 命中前+握手期间缓冲的 chunk 建连后一次性发
+  - 边发边收：录音期间 1ms read_timeout 模拟非阻塞读 ws_socket，chunk_rx try_recv 读音频，交替发送+收 result-generated→on_result 回调推 StreamingText
+  - finish-task：chunk_rx 断开→恢复 10s timeout→发 finish-task→阻塞收最终结果
+  - cancel_signal 各循环检查点检测
+  - 040-A 分段 [Latency] 埋点（DNS/TCP/TLS/WS 四段）
+- **C-4 worker 接线**（`src/main.rs` +311 行）：
+  - QwenAudioOnline 分支：chunk channel → spawn ASR 线程 → record_streaming 推 chunk → drop tx → join ASR → run_pipeline_core(initial_text=Some)
+  - 非流式分支：record()+run_pipeline_core(None) 零行为变更
+  - run_pipeline_core 新增 `initial_text: Option<String>` 参数
+- **FIRSTCHAR 专项自证**：非流式前处理链逐字节等价
+  - SPEECH_ENERGY_THRESHOLD=0.008 / select_preprocessing_params / find_speech_onset_with_backtrack / padded 构造全不变
+  - is_accuracy 内联为 if 表达式（log 输出值相同）
+  - Err 路径：原版 match 内 send_event → 搬迁后 .map_err + 外层 match send_event（行为等价）
+  - 6 条 FIRSTCHAR 单测全绿
+- **040-A 埋点**：`transcribe_streaming` + `transcribe_streaming_realtime` 都加 DNS/TCP/TLS/WS 分段 [Latency]
+- **验收**：cargo fmt clean / cargo check --all-targets 0 error / cargo test 949+32 全绿 0 failed（10 ignored）/ 文件域 6 文件零越界
+- **版本号未动**（已是 0.8.0）
+- **详情**：outbox/coder-1/result.md + logs/20260815.md + CHANGELOG.md
+
+## 2026-08-15 — coder-1 — ASR-038-B-partial ✅ 038-B 收尾（部分实施，架构项挂起）
+
+- **来源**：ASR-038-B 任务书（主控派发）。基线 HEAD `4b3c63f`（含 WIP `003ba65`：A 批 + B 半成品）
+- **主控方案裁决**：coder-1 提伪流式方案，主控反驳（037 编辑态交互在伪流式下物理不成立——录音期间无文本可点），裁决为「立即开工端点缺陷+cancel_signal+preprocessing 结论；伪流式vs真流式挂起等 Gavin 拍板」
+- **Step 1：修 E0425**：`load_wordbook_vocabulary` 从 `mod tests` 内移到模块顶层（`src/transcription/mod.rs`），`cargo check --all-targets` 0 error
+- **B-1：修三条端点缺陷**（主控独立验证 + 追加两条同族）：
+  - ① `mod.rs:302` 用 `self.qwen3_url`（Realtime 端点）调 `transcribe_streaming`（Inference 协议）→ 连错端点必失败
+  - ② `qwen_asr_url`/`qwen_asr_model` config 字段全库零消费（grep 证实）
+  - ③ `default_qwen_asr_url` 主机名 `dashscope.aliyuncs.com` 是 Realtime API 的，035 文档 A6 明确须为 `{WorkspaceId}.cn-beijing.maas.aliyuncs.com`
+  - **修法**：Transcriber 新增 `qwen_asr_url`/`qwen_asr_model` 独立字段 + `new` 签名加两参数 + 所有调用点更新 + `default_qwen_asr_url` 改为 `wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference`
+  - **配套**：热重载触发条件加 `qwen_asr_changed` + `active_qwen_asr_*` 跟踪 + reload 块加 `reload_qwen_asr_*`
+- **B-2：transcribe_streaming 加 cancel_signal**：签名加 `cancel_signal: Option<&AtomicBool>`，上传/接收循环检测取消 → `close(None)` + `bail!("转录已取消")`。EditRequested/ESC 中断支持
+- **B-3：select_preprocessing_params 结论化**：`silence_head`/`onset_backtrack` 伪流式下完全适用，真流式下不适用。注释扩充写明，无逻辑变更
+- **新增 +10 测试**：4 config 端点回归防护 + 6 transcription（QwenAudioOnline 配置验证 + asr_model 解析扩展）
+- **验收**：cargo fmt clean / cargo check --all-targets 0 error / cargo test 主 crate 947+6ign / config 32 / **0 failed** / src-tauri check 0 error / 文件域 4 文件零越界
+- **挂起（等 Gavin 拍板）**：伪流式 vs 真流式 + VAD 入口门控 + record_streaming + 流式管线接线
+- **版本号未动**（已是 0.8.0）
+- **详情**：outbox/coder-1/result.md + logs/20260815.md + CHANGELOG.md
+
 ## 2026-08-14 — coder-1 — ASR-038-A ✅ qwen_inference.rs 流式 ASR 模块实施（第一次动生产代码）
 
 - **来源**：RESEARCH-ASR-038 设计定稿 + 交叉复核通过。基线 HEAD `35a2a74`

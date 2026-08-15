@@ -193,7 +193,10 @@ fn default_qwen3_asr_model() -> String {
 }
 
 fn default_qwen_asr_url() -> String {
-    "wss://dashscope.aliyuncs.com/api-ws/v1/inference".to_string()
+    // ASR-038-B: Inference API 端点主机名须为 {WorkspaceId}.{region}.maas.aliyuncs.com
+    // （035 研究文档 A6）。现有项目 WorkspaceId = llm-kudx4dj2bfqn4gr2（北京 region），
+    // 与旧 Realtime API 同一 workspace 同一 key，仅路径 /realtime → /inference。
+    "wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference".to_string()
 }
 
 fn default_qwen_asr_model() -> String {
@@ -1192,6 +1195,87 @@ clipboard_delay_ms = 150
         assert_eq!(
             loaded.audio.qwen3_asr_model, "qwen3-asr-flash-demo",
             "qwen3_asr_model custom value should survive roundtrip"
+        );
+    }
+
+    // ============================================================
+    // ASR-038-B: QwenAudioOnline Inference API 配置（独立于 Qwen3Online Realtime）
+    // 三条端点缺陷的回归防护：
+    //   ① default_qwen_asr_url 必须含 WorkspaceId（非 dashscope.aliyuncs.com）
+    //   ② default_qwen_asr_url 路径必须为 /api-ws/v1/inference（非 /realtime）
+    //   ③ qwen_asr_model 默认值为 qwen-audio-3.0-asr-flash-streaming
+    // ============================================================
+
+    /// ASR-038-B-001: default_qwen_asr_url 必须是 Inference API 端点（含 WorkspaceId + /inference 路径）
+    #[test]
+    fn qwen_asr_url_default_is_inference_endpoint_with_workspace_id() {
+        let cfg = AppConfig::default();
+        let url = &cfg.audio.qwen_asr_url;
+        // 缺陷③回归防护：主机名不得为 dashscope.aliyuncs.com（那是 Realtime API 的主机）
+        assert!(
+            !url.contains("dashscope.aliyuncs.com"),
+            "qwen_asr_url default must not use dashscope.aliyuncs.com (Realtime API host), got: {}",
+            url
+        );
+        // 必须含 WorkspaceId 子域（035 研究文档 A6：{WorkspaceId}.cn-beijing.maas.aliyuncs.com）
+        assert!(
+            url.contains("llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com"),
+            "qwen_asr_url default must contain WorkspaceId subdomain, got: {}",
+            url
+        );
+        // 路径必须是 /api-ws/v1/inference（不是 /realtime）
+        assert!(
+            url.ends_with("/api-ws/v1/inference"),
+            "qwen_asr_url default must end with /api-ws/v1/inference, got: {}",
+            url
+        );
+    }
+
+    /// ASR-038-B-002: default_qwen_asr_model 必须是 qwen-audio-3.0-asr-flash-streaming
+    #[test]
+    fn qwen_asr_model_default_is_streaming_model() {
+        let cfg = AppConfig::default();
+        assert_eq!(
+            cfg.audio.qwen_asr_model, "qwen-audio-3.0-asr-flash-streaming",
+            "qwen_asr_model default must be qwen-audio-3.0-asr-flash-streaming"
+        );
+    }
+
+    /// ASR-038-B-003: qwen_asr_url 自定义值往返正确（独立于 qwen3_asr_url）
+    #[test]
+    fn qwen_asr_url_custom_value_roundtrip() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        let mut cfg = AppConfig::default();
+        cfg.audio.qwen_asr_url =
+            "wss://my-workspace.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference".to_string();
+
+        cfg.save_to(&env.config_path())
+            .expect("save should succeed");
+        let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
+        assert_eq!(
+            loaded.audio.qwen_asr_url,
+            "wss://my-workspace.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference",
+            "qwen_asr_url custom value should survive roundtrip"
+        );
+    }
+
+    /// ASR-038-B-004: qwen_asr_model 自定义值往返正确
+    #[test]
+    fn qwen_asr_model_custom_value_roundtrip() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        let mut cfg = AppConfig::default();
+        cfg.audio.qwen_asr_model = "qwen-audio-3.0-asr-demo".to_string();
+
+        cfg.save_to(&env.config_path())
+            .expect("save should succeed");
+        let loaded = AppConfig::load_from(&env.config_path()).expect("load should succeed");
+        assert_eq!(
+            loaded.audio.qwen_asr_model, "qwen-audio-3.0-asr-demo",
+            "qwen_asr_model custom value should survive roundtrip"
         );
     }
 

@@ -414,6 +414,7 @@ pub fn transcribe_streaming(
     model: &str,
     samples_16k: &[f32],
     vocabulary: &serde_json::Value,
+    cancel_signal: Option<&std::sync::atomic::AtomicBool>,
     mut on_result: impl FnMut(&str),
 ) -> Result<String> {
     if api_key.trim().is_empty() {
@@ -423,10 +424,12 @@ pub fn transcribe_streaming(
         bail!("转录失败：音频样本为空");
     }
 
-    let model = if model.trim().is_empty() {
-        DEFAULT_MODEL
-    } else {
-        model
+    // ASR-038-B: cancel_signal 检查 helper
+    // EditRequested / ESC 取消时置 true，本函数在发送/读取循环里检测后中止
+    let is_cancelled = || {
+        cancel_signal
+            .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false)
     };
     let task_id = generate_task_id();
     let hard_cap = compute_hard_cap(samples_16k.len());
@@ -441,7 +444,11 @@ pub fn transcribe_streaming(
         hard_cap.as_secs_f64(),
     );
 
-    // DNS 解析 + TCP 连接
+    // ASR-PERF-040-A: 分段 [Latency] 埋点
+    let t_connect_start = std::time::Instant::now();
+
+    // DNS 解析
+    let t_dns_start = std::time::Instant::now();
     let uri: Uri = url.parse().context("无效的 ASR URL")?;
     let host = uri.host().context("URL 缺少 host")?;
     let port = uri.port_u16().unwrap_or(443);
@@ -450,13 +457,25 @@ pub fn transcribe_streaming(
         .context("DNS 解析失败")?;
     let socket_addrs: Vec<_> = addrs.collect();
     let addr = socket_addrs.first().context("DNS 未返回地址")?;
+    log::info!(
+        "[Latency] ASR (batch) DNS resolved in {:.0}ms",
+        t_dns_start.elapsed().as_millis()
+    );
+
+    // TCP 连接
+    let t_tcp_start = std::time::Instant::now();
     let tcp = TcpStream::connect_timeout(addr, CONNECT_TIMEOUT).context("网络失败：连接超时")?;
     tcp.set_read_timeout(Some(CONNECT_TIMEOUT))
         .context("网络失败：设置读取超时失败")?;
     tcp.set_write_timeout(Some(CONNECT_TIMEOUT))
         .context("网络失败：设置写入超时失败")?;
+    log::info!(
+        "[Latency] ASR (batch) TCP connected in {:.0}ms",
+        t_tcp_start.elapsed().as_millis()
+    );
 
     // TLS/WS 握手（Inference API 不需要 OpenAI-Beta header）
+    let t_tls_start = std::time::Instant::now();
     let request =
         ClientRequestBuilder::new(uri).with_header("Authorization", format!("Bearer {}", api_key));
     let (mut ws_socket, response) =
@@ -464,6 +483,14 @@ pub fn transcribe_streaming(
             HandshakeError::Failure(e) => map_connect_error(&e),
             HandshakeError::Interrupted(_) => anyhow!("网络失败：TLS 握手意外中断"),
         })?;
+    log::info!(
+        "[Latency] ASR (batch) TLS+WS handshake in {:.0}ms",
+        t_tls_start.elapsed().as_millis()
+    );
+    log::info!(
+        "[Latency] ASR (batch) total connect in {:.0}ms",
+        t_connect_start.elapsed().as_millis()
+    );
 
     // WS 握手成功状态码 101
     debug_assert_eq!(
@@ -527,6 +554,11 @@ pub fn transcribe_streaming(
         AUDIO_CHUNK_BYTES as u64 * 1000 / (16000 * 2)
     );
     for chunk in &chunks {
+        if is_cancelled() {
+            log::info!("QwenAudio ASR cancelled by signal during upload, closing");
+            let _ = ws_socket.close(None);
+            bail!("转录已取消");
+        }
         ws_socket
             .send(Message::Binary(chunk.clone().into()))
             .map_err(|e| anyhow!("网络失败：发送音频帧失败 - {}", e))?;
@@ -542,6 +574,11 @@ pub fn transcribe_streaming(
     // 5. 收 result-generated，收集最终文本
     let mut state = StreamingAsrState::new();
     loop {
+        if is_cancelled() {
+            log::info!("QwenAudio ASR cancelled by signal during receive, closing");
+            let _ = ws_socket.close(None);
+            bail!("转录已取消");
+        }
         let now = std::time::Instant::now();
         if now > hard_cap_deadline {
             bail!(
@@ -606,9 +643,407 @@ pub fn transcribe_streaming(
     }
 }
 
-// ===========================================================================
-// 测试
-// ===========================================================================
+/// ASR-038-B: 真流式 ASR 转录 —— 边收音频边发帧边收结果。
+///
+/// **与 `transcribe_streaming`（伪流式）的差异**：
+/// - 输入是 `chunk_rx: Receiver<Vec<f32>>`（实时音频流），非完整 `&[f32]`
+/// - VAD 入口门控：建连前逐 chunk 喂 Silero VAD，命中才建连（Gavin 硬指令：防无效上传）
+/// - 建连后先发 pre-roll 缓冲（VAD 命中前的 chunk），再发实时 chunk
+/// - 边发边收：发送循环和接收循环交替进行（非先发完再收）
+/// - VAD 缺失 → 立即建连（降级保底，宁可多花钱不可吞字）
+/// - 2s 保底：VAD 2s 未命中无条件建连
+///
+/// **不吞字保证（硬性自证②）**：
+/// - 音频采集在热键按下即开始（record_streaming 的 on_chunk 回调）
+/// - VAD 命中前的 chunk 全部缓冲，建连后补发
+/// - 建连握手期间（~200-500ms）的 chunk 也缓冲，握手完成后一次性补发
+pub fn transcribe_streaming_realtime(
+    url: &str,
+    api_key: &str,
+    model: &str,
+    chunk_rx: crossbeam_channel::Receiver<Vec<f32>>,
+    vocabulary: &serde_json::Value,
+    model_dir: &std::path::Path,
+    cancel_signal: Option<&std::sync::atomic::AtomicBool>,
+    mut on_result: impl FnMut(&str),
+) -> Result<String> {
+    if api_key.trim().is_empty() {
+        bail!("鉴权失败：API Key 为空");
+    }
+
+    let model = if model.trim().is_empty() {
+        DEFAULT_MODEL
+    } else {
+        model
+    };
+    let task_id = generate_task_id();
+    let t_start = std::time::Instant::now();
+
+    log::info!(
+        "QwenAudio realtime streaming ASR: url={}, model={}, task_id={}",
+        url,
+        model,
+        task_id,
+    );
+
+    let is_cancelled = || {
+        cancel_signal
+            .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false)
+    };
+
+    // =========================================================================
+    // 阶段 1：VAD 入口门控 —— 逐 chunk 喂 Silero，命中即建连
+    // =========================================================================
+
+    // VAD 模型缺失 → 降级为「立即建连」（保底，宁可多花钱不可吞字）
+    let mut vad = crate::transcription::vad::VadSegmenter::try_new_for_streaming(model_dir);
+    let mut pre_roll_buffer: Vec<Vec<f32>> = Vec::new(); // VAD 命中前的 chunk 缓冲
+    let mut connected = false;
+
+    if vad.is_none() {
+        log::warn!("VAD model missing, falling back to immediate connect (no gate, cost more)");
+    }
+
+    let vad_window = crate::transcription::vad::vad_window_size();
+    let vad_2s_deadline = t_start + Duration::from_secs(2);
+
+    // VAD 门控循环：读 chunk → 喂 VAD → 命中或 2s 保底即跳出
+    while !connected {
+        if is_cancelled() {
+            log::info!("QwenAudio realtime ASR cancelled during VAD gate");
+            bail!("转录已取消");
+        }
+
+        // 2s 保底：VAD 2s 未命中无条件建连
+        if std::time::Instant::now() >= vad_2s_deadline {
+            log::info!(
+                "VAD gate 2s deadline reached without detection, forcing connect (safety net)"
+            );
+            connected = true;
+            break;
+        }
+
+        match chunk_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(chunk) if !chunk.is_empty() => {
+                pre_roll_buffer.push(chunk.clone());
+
+                if let Some(ref vad_seg) = vad {
+                    // 逐窗口喂 VAD（chunk 可能 > 512 samples，需切片）
+                    let mut offset = 0;
+                    while offset < chunk.len() {
+                        let end = (offset + vad_window).min(chunk.len());
+                        if vad_seg.accept_and_check(&chunk[offset..end]) {
+                            log::info!(
+                                "VAD gate: speech detected at +{:.0}ms, connecting (pre-roll buffer: {} chunks)",
+                                t_start.elapsed().as_millis(),
+                                pre_roll_buffer.len()
+                            );
+                            connected = true;
+                            break;
+                        }
+                        offset = end;
+                    }
+                }
+                // VAD 缺失时 connected 在循环顶部的 2s 检查或这里设
+                if vad.is_none() {
+                    connected = true;
+                    break;
+                }
+            }
+            Ok(_) => { /* empty chunk, skip */ }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                // 音频 channel 断开（录音结束）但还没建连 —— 用户按了热键没说话
+                if pre_roll_buffer.is_empty() {
+                    log::info!("Audio channel closed before VAD detected speech and before connect — likely user pressed hotkey without speaking");
+                    bail!("转录已取消：未检测到语音输入");
+                }
+                // 有 pre-roll 但没命中 VAD —— 用 2s 保底逻辑建连发完
+                log::info!(
+                    "Audio channel closed during VAD gate with {} chunks buffered, forcing connect to flush",
+                    pre_roll_buffer.len()
+                );
+                connected = true;
+                break;
+            }
+        }
+    }
+
+    // =========================================================================
+    // 阶段 2：建连 WebSocket（DNS → TCP → TLS → WS 握手 → run-task → task-started）
+    // =========================================================================
+
+    // ASR-PERF-040-A: 分段 [Latency] 埋点
+    let t_connect_start = std::time::Instant::now();
+    let uri: Uri = url.parse().context("无效的 ASR URL")?;
+    let host = uri.host().context("URL 缺少 host")?;
+    let port = uri.port_u16().unwrap_or(443);
+
+    // DNS 解析
+    let t_dns_start = std::time::Instant::now();
+    let addrs = format!("{}:{}", host, port)
+        .to_socket_addrs()
+        .context("DNS 解析失败")?;
+    let socket_addrs: Vec<_> = addrs.collect();
+    let addr = socket_addrs.first().context("DNS 未返回地址")?;
+    log::info!(
+        "[Latency] ASR DNS resolved in {:.0}ms",
+        t_dns_start.elapsed().as_millis()
+    );
+
+    // TCP 连接
+    let t_tcp_start = std::time::Instant::now();
+    let tcp = TcpStream::connect_timeout(addr, CONNECT_TIMEOUT).context("网络失败：连接超时")?;
+    tcp.set_read_timeout(Some(CONNECT_TIMEOUT))
+        .context("网络失败：设置读取超时失败")?;
+    tcp.set_write_timeout(Some(CONNECT_TIMEOUT))
+        .context("网络失败：设置写入超时失败")?;
+    log::info!(
+        "[Latency] ASR TCP connected in {:.0}ms",
+        t_tcp_start.elapsed().as_millis()
+    );
+
+    // TLS/WS 握手
+    let t_tls_start = std::time::Instant::now();
+    let request =
+        ClientRequestBuilder::new(uri).with_header("Authorization", format!("Bearer {}", api_key));
+    let (mut ws_socket, response) =
+        client_tls_with_config(request, tcp, None, None).map_err(|e| match e {
+            HandshakeError::Failure(e) => map_connect_error(&e),
+            HandshakeError::Interrupted(_) => anyhow!("网络失败：TLS 握手意外中断"),
+        })?;
+    log::info!(
+        "[Latency] ASR TLS+WS handshake in {:.0}ms",
+        t_tls_start.elapsed().as_millis()
+    );
+
+    debug_assert_eq!(
+        response.status().as_u16(),
+        101,
+        "post-handshake status must be 101"
+    );
+    let _ = &response;
+
+    set_socket_timeouts(
+        &mut ws_socket,
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+    )
+    .context("网络失败：设置 socket 超时失败")?;
+
+    log::info!(
+        "[Latency] ASR total connect in {:.0}ms",
+        t_connect_start.elapsed().as_millis()
+    );
+
+    // send run-task
+    let run_task = build_run_task_message(&task_id, model, vocabulary);
+    send_json(&mut ws_socket, &run_task)?;
+
+    // 等 task-started
+    let t_task_started = std::time::Instant::now();
+    loop {
+        if is_cancelled() {
+            let _ = ws_socket.close(None);
+            bail!("转录已取消");
+        }
+        match ws_socket.read() {
+            Ok(Message::Text(text)) => {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&text).context("服务端返回非 JSON 文本")?;
+                if let Some(err) = extract_task_error(&parsed) {
+                    bail!("服务端错误：{}", err);
+                }
+                if extract_event_type(&parsed) == Some("task-started") {
+                    log::info!(
+                        "QwenAudio ASR task started: {} (+{:.0}ms from connect)",
+                        task_id,
+                        t_task_started.elapsed().as_millis()
+                    );
+                    break;
+                }
+            }
+            Ok(Message::Binary(_)) => {}
+            Ok(Message::Ping(_) | Message::Pong(_)) => {}
+            Ok(Message::Close(_)) => {
+                bail!("网络失败：服务端关闭连接（未收到 task-started）");
+            }
+            Ok(Message::Frame(_)) => {}
+            Err(e) if is_read_timeout(&e) => {
+                bail!("超时：等待 task-started 超时");
+            }
+            Err(e) => bail!("网络失败：读取消息失败 - {}", e),
+        }
+    }
+
+    // =========================================================================
+    // 阶段 3：先发 pre-roll 缓冲，再边收实时 chunk 边发边收结果
+    // =========================================================================
+
+    let mut state = StreamingAsrState::new();
+
+    // 发 pre-roll 缓冲（VAD 命中前 + 握手期间积攒的 chunk）
+    let pre_roll_chunk_count = pre_roll_buffer.len();
+    let mut pre_roll_samples: usize = 0;
+    for chunk in &pre_roll_buffer {
+        if is_cancelled() {
+            let _ = ws_socket.close(None);
+            bail!("转录已取消");
+        }
+        let pcm = f32_to_pcm16_le(chunk);
+        for binary_chunk in chunk_pcm_to_binary(&pcm) {
+            ws_socket
+                .send(Message::Binary(binary_chunk.into()))
+                .map_err(|e| anyhow!("网络失败：发送 pre-roll 音频帧失败 - {}", e))?;
+        }
+        pre_roll_samples += chunk.len();
+    }
+    log::info!(
+        "QwenAudio ASR pre-roll flushed: {} chunks, {} samples ({:.1}s)",
+        pre_roll_chunk_count,
+        pre_roll_samples,
+        pre_roll_samples as f64 / 16000.0,
+    );
+    pre_roll_buffer.clear();
+
+    // 主循环：边发实时 chunk 边收结果
+    // std 无 select，用独立线程读 ws_socket 结果推到 result_rx
+    let (result_tx, result_rx) = crossbeam_channel::unbounded::<(i64, String, bool)>();
+    let (finished_tx, finished_rx) = crossbeam_channel::bounded::<bool>(1);
+
+    // WS 读取线程：持续读 ws_socket，解析 result-generated/task-finished/error
+    // 通过 result_tx 推句子，finished_tx 通知 task-finished
+    // 用 Arc<Mutex<WebSocket>> 共享 ws_socket 给发送线程 —— 但 tungstenite WebSocket 不是 Send
+    // 改为：读取线程独占 ws_socket 的读端，发送在主线程做
+    // tungstenite WebSocket 是单一对象，不能拆分读写端
+    // 最终方案：读取线程持有 ws_socket，主线程通过 channel 把要发的数据推给读取线程
+    // 不行 —— 读取线程在 ws_socket.read() 阻塞，不能同时 send
+    //
+    // 正确方案：主线程做发送+读 chunk_rx，spawn 线程做 ws_socket.read()
+    // 但 ws_socket 不是 Send（tungstenite WebSocket 可能含非 Send 的内部状态）
+    // 检查：tungstenite WebSocket 是否 Send
+
+    // 妥协方案：录音期间用 read_timeout(1ms) 模拟非阻塞读 ws_socket
+    // chunk 间隔 ~20ms（50fps），1ms 读 ws_socket 开销可接受
+    let mut all_samples: Vec<f32> = Vec::new();
+    let mut finish_task_sent = false;
+    let t_streaming = std::time::Instant::now();
+    let hard_cap = compute_hard_cap(16000 * 60); // 预估 60s，录音结束后重算
+    let _ = hard_cap;
+    let mut last_ws_activity = std::time::Instant::now();
+
+    // 临时设短 read_timeout 模拟非阻塞读（录音期间）
+    // 保存原 timeout，录音结束后恢复
+    set_socket_timeouts(
+        &mut ws_socket,
+        Duration::from_millis(1),
+        Duration::from_secs(10),
+    )
+    .context("网络失败：设置非阻塞读 timeout 失败")?;
+
+    loop {
+        if is_cancelled() {
+            let _ = ws_socket.close(None);
+            bail!("转录已取消");
+        }
+
+        // 读 chunk（非阻塞）
+        match chunk_rx.try_recv() {
+            Ok(chunk) if !chunk.is_empty() => {
+                all_samples.extend_from_slice(&chunk);
+                let pcm = f32_to_pcm16_le(&chunk);
+                for binary_chunk in chunk_pcm_to_binary(&pcm) {
+                    ws_socket
+                        .send(Message::Binary(binary_chunk.into()))
+                        .map_err(|e| anyhow!("网络失败：发送音频帧失败 - {}", e))?;
+                }
+            }
+            Ok(_) => {}
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                if !finish_task_sent {
+                    let finish_task = build_finish_task_message(&task_id);
+                    send_json(&mut ws_socket, &finish_task)?;
+                    finish_task_sent = true;
+                    // 录音结束，恢复长 timeout 阻塞读最终结果
+                    set_socket_timeouts(
+                        &mut ws_socket,
+                        Duration::from_secs(10),
+                        Duration::from_secs(10),
+                    )
+                    .context("网络失败：恢复读 timeout 失败")?;
+                    log::info!(
+                        "QwenAudio ASR finish-task sent after {:.1}s streaming, {} samples ({:.1}s)",
+                        t_streaming.elapsed().as_secs_f64(),
+                        all_samples.len(),
+                        all_samples.len() as f64 / 16000.0,
+                    );
+                }
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+        }
+
+        // 读 ws_socket（非阻塞 1ms timeout）
+        match ws_socket.read() {
+            Ok(Message::Text(text)) => {
+                last_ws_activity = std::time::Instant::now();
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&text).context("服务端返回非 JSON 文本")?;
+                if let Some(err) = extract_task_error(&parsed) {
+                    bail!("服务端错误：{}", err);
+                }
+                if let Some((id, text, end)) = extract_sentence(&parsed) {
+                    state.on_result(id, &text, end);
+                    let display = state.display_text();
+                    log::debug!(
+                        "QwenAudio ASR result: id={}, end={}, display='{}'",
+                        id,
+                        end,
+                        display
+                    );
+                    on_result(&display);
+                }
+                if extract_event_type(&parsed) == Some("task-finished") {
+                    log::info!(
+                        "QwenAudio ASR task finished: {} confirmed sentences",
+                        state.confirmed_count()
+                    );
+                    let final_text = state.final_text();
+                    if final_text.is_empty() {
+                        let display = state.display_text();
+                        if display.is_empty() {
+                            bail!("转录失败：task-finished 但无识别结果");
+                        }
+                        return Ok(display);
+                    }
+                    return Ok(final_text);
+                }
+            }
+            Ok(Message::Binary(_)) => {}
+            Ok(Message::Ping(_) | Message::Pong(_)) => {}
+            Ok(Message::Close(_)) => {
+                bail!("网络失败：服务端关闭连接");
+            }
+            Ok(Message::Frame(_)) => {}
+            Err(e) if is_read_timeout(&e) => {
+                // 1ms timeout 是预期的（非阻塞模拟），继续循环
+                // 只有在 finish_task_sent 后的 10s timeout 才是真超时
+                if finish_task_sent && last_ws_activity.elapsed() >= SILENCE_TIMEOUT {
+                    bail!("超时：服务端 10s 无响应");
+                }
+            }
+            Err(e) => bail!("网络失败：读取消息失败 - {}", e),
+        }
+
+        // 录音结束后且 finish_task_sent，进入纯收结果模式（上面 ws_socket.read 已用 10s timeout）
+        // 但循环还在跑 try_recv chunk_rx（已 Disconnected，会一直走 finish_task_sent 分支）
+        // 这没问题，只是空转。加个 yield 避免忙等
+        if finish_task_sent {
+            // chunk_rx 已断，try_recv 立即返回 Disconnected，ws_socket.read 用 10s timeout 阻塞
+            // 不会忙等
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1054,6 +1489,7 @@ mod tests {
             "model",
             &[0.0; 16000],
             &serde_json::json!({}),
+            None,
             |_| {},
         );
         assert!(result.is_err());
@@ -1068,6 +1504,7 @@ mod tests {
             "model",
             &[],
             &serde_json::json!({}),
+            None,
             |_| {},
         );
         assert!(result.is_err());
@@ -1097,10 +1534,22 @@ mod tests {
     fn build_vocabulary_from_wordbook_entries() {
         // 模拟从 wordbook 表 list_all() 返回的条目
         let entries = vec![
-            VocabEntry { word: "采编".into(), source: "user".into() },
-            VocabEntry { word: "风无心".into(), source: "user".into() },
-            VocabEntry { word: "三五成群".into(), source: "system".into() },
-            VocabEntry { word: "维生素B12".into(), source: "system".into() },
+            VocabEntry {
+                word: "采编".into(),
+                source: "user".into(),
+            },
+            VocabEntry {
+                word: "风无心".into(),
+                source: "user".into(),
+            },
+            VocabEntry {
+                word: "三五成群".into(),
+                source: "system".into(),
+            },
+            VocabEntry {
+                word: "维生素B12".into(),
+                source: "system".into(),
+            },
         ];
         let vocab = build_vocabulary(&entries);
         assert_eq!(vocab["采编"], 5);

@@ -4,11 +4,225 @@
 > 🔴 **2026-08-04 主控核查：上方产物不含 ITN-FIX-CHAIN-TEAR-026** —— 产物 mtime `17:42:42` 早于 `src/itn.rs` `23:47:25` 整 6 小时。026 需 BUILD-013 才进 exe，详见下方 P0 节。
 > ⏳ **本地 ahead 2 未 push**（最新 `2447dbb`，Gavin 只授权提交，不授权 push）。
 > 🔴 **2026-08-15 主控核查：上方 BUILD-012/015 产物段落均已过期** —— 当前处于 **v0.8.0 在线 ASR 引擎更替**批次，
-> HEAD `2447dbb` 为 038-B 的 **WIP 快照，`cargo check` 实跑 1 个 error 不可编译**，详见下方「当前批次」节。
+> HEAD `4b3c63f`（含 WIP `003ba65`）。coder-1 已完成 038-B 真流式核心实施（C-1~C-4+040-A），**当前可编译，949+32 测试全绿**，
+> 待主控终验（重点验 FIRSTCHAR 等价 + record 零改动 + 040-A 四段覆盖），详见下方「当前批次」节。
 > ✅ **2026-08-08 已合并 origin/main 的 6 个 macOS Phase 4 提交**（merge `7e76465`，+6694/−281，零冲突，`cargo check` 0 error）。mac 端顺带跑了全库 `cargo fmt`，后续改动须保持 rustfmt 风格。
 > 端测方式（2026-07-25 Gavin 指示）：Gavin 已在**实际日常使用中自行测试**，端测项不再列入本文档；发现 bug 或优化点由 Gavin 邀请重新开单。
 
 > ✅ **TEST-EXEC-024 + BUILD-012-VERIFY 已闭环并提交 `7a1329e`**（崩溃中断续做，tester-1 2026-08-03 18:3x，主控 18:4x 独立验收）。详见 CHANGELOG / `logs/20260803.md`（规则 3：测试同步与出包不在本文档详列）。
+
+---
+
+## 🔴 P0 门禁 · ASR-PERF-040 新 ASR 连接性能与可靠性（2026-08-15 Gavin 指令）
+
+> **Gavin 原话**：「这次继承新 asr 模型一定要汲取之前的教训，要优化好连接池、
+> 要优化好连接的速度和性能。」
+>
+> **定位：这是 ASR-038 全批的验收门禁，不是可选优化项。** 038-B/C 完成后若本节未落实，不予出包。
+
+### 🔴 第一件事：028 的教训不能照搬，因为 ASR 根本没有连接池
+
+| 项 | LLM（028 现场） | ASR（本批） |
+| --- | --- | --- |
+| 传输 | `reqwest` HTTP，**有连接池** | `tungstenite` WebSocket，**无池，每次全新建连** |
+| 028 根因 | 池中空闲连接被服务端 keep-alive(~60s) 杀掉，取出即 0ms 失败 | **不适用** —— 没有池就没有僵尸连接 |
+| 修复 | `POOL_IDLE_TIMEOUT=30s` + `is_request()` 重试 + `fmt_error_chain` | **照搬无效** |
+
+**🔴 但真正的陷阱在这里**：为了提速而引入「**预热 / 复用长连接**」，
+会**精确复现 028 的 bug 类** —— 预热好的 WS 空闲期间被服务端 idle timeout 静默杀掉，
+下次录音取用即失败，且表现为「0ms 失败」，与 028 一模一样。
+
+**因此复用设计必须自带三件套，缺一不可**：
+① 本端 idle 上限**必须短于**服务端 idle timeout（服务端值未知 → 须实测，不可假设）；
+② 取用前**健康检查**（WS Ping/Pong 或轻量探针）；
+③ 检查失败**立即回退新建连**，绝不把失败抛给用户。
+
+> **这正是 028 的真正教训**：不是「把超时调小」，而是
+> **「任何跨请求复用的连接，都必须假设它在空闲期间已经死了」。**
+
+### 取证：当前连接路径的实际开销（`qwen_inference.rs:445-465`）
+
+每次录音**从零走完整条链**，零预热、零复用、零重试：
+
+```
+DNS 解析 (to_socket_addrs，阻塞系统调用，无缓存)
+  → TCP connect (CONNECT_TIMEOUT = 5s)
+  → TLS 握手 (client_tls_with_config)
+  → WS 升级 (HTTP 101)
+  → 才开始发第一个音频字节
+```
+
+`grep -i "prewarm|reuse|retry|keepalive|pool" src/transcription/qwen_inference.rs` → **零命中**。
+
+### 已定位的四个问题
+
+| # | 问题 | 位置 | 性质 |
+| --- | --- | --- | --- |
+| **40-1** | **`socket_addrs.first()` 只试第一个地址** —— DNS 返回 IPv6 在前但本机无 IPv6 连通性时，**直接失败**，不会回退第二个地址 | `qwen_inference.rs:461` | 🔴 **健壮性缺陷**。标准做法是遍历所有 addr（`TcpStream::connect` 本身就是这么做的） |
+| **40-2** | **零重试** —— 建连瞬时抖动直接变「转录失败」 | 同上 | 🔴 与 028 修复精神相悖（028 明确补了重试判据） |
+| **40-3** | **零 `[Latency]` 埋点** —— DNS/TCP/TLS/WS 各段耗时**完全不可观测** | `qwen_inference.rs` 全文 | 🔴 **Gavin 要求「优化速度」，但现在连测都测不了**。全库已有 12 处 `[Latency]` 约定可循 |
+| **40-4** | `CONNECT_TIMEOUT=5s` 被同时用作 **connect / read / write** 三处超时 | `:32`、`:456-459` | 🟡 语义混用。建连 5s 合理，但流式收包期间的 read timeout 应独立定义 |
+
+### 🔴 真流式在这里是**性能杠杆**，不只是交互需求
+
+| 方案 | 建连成本落在哪 | 用户感知 |
+| --- | --- | --- |
+| **真流式**（边录边发） | 建连与**说话并行** → DNS+TCP+TLS 被说话时间吸收 | **零感知** |
+| **伪流式**（录完再发） | 建连在**录音结束之后** → 全部落在关键路径 | **干等一个完整 RTT 链** |
+
+**这条独立于 037 交互论证，直接服务于 Gavin 的性能指令。**
+伪流式方案下，「优化连接速度」这个目标先天就少了最大的一块杠杆。
+
+### 建议实施顺序（待派发）
+
+| 编号 | 内容 | 前置 |
+| --- | --- | --- |
+| 040-A | **先补 `[Latency]` 埋点**（DNS/TCP/TLS/WS 升级/首帧/首结果分段计时） | 无 —— **必须最先做，否则后续优化全是盲调** |
+| 040-B | 修 40-1 地址遍历 + 40-2 建连重试（判据参照 028 的 `is_request()` 精神）+ 40-4 超时语义拆分 | 040-A |
+| 040-C | 实测服务端 idle timeout（**不可假设**），据此决定是否上预热/复用及其 idle 上限 | 040-A/B + 端测数据 |
+
+**🔴 040-C 是 028 同款雷区，未拿到服务端 idle timeout 实测值之前，禁止上长连接复用。**
+
+### 文件域
+
+`src/transcription/qwen_inference.rs`（与 ASR-038-B 同域，**必须串行，归同一个 Worker**）。
+
+---
+
+## 🔄 验收中（已打回一轮） · TRANS-HOTKEY-039 翻译热键全链失效（2026-08-15）
+
+> 🔴 **2026-08-15 主控更正状态**：coder-2 曾把本节标为「✅ 已结案」，但**当时主控已打回**，
+> Toggle 回归尚未修复。**状态不实，已改回「验收中」。**
+> 教训与 `[DOC-STATE-DRIFT-001]` 同族但方向相反：不是漏写，是**提前宣告完成**。
+> **结案状态只能由主控在验收通过后标注，Worker 不得自行标 ✅ 已结案。**
+
+> 已移入 CHANGELOG / `logs/20260815.md` / `handoffs.md`。本节仅留梗概。
+
+> **Gavin 原话**：「无论是否开启格式化输出（注意是走的不同的翻译路径），在录音的时候同时按下翻译热键，
+> 输出的结果并没有进行翻译，比如从中文翻译到英文。」
+>
+> **性质**：功能 100% 不可用，且**两个独立根因各自都足以致死** —— 不是一个 bug，是两个叠在一起。
+> 「无论是否开启格式化输出都不翻译」正是这个特征：两条翻译路径共用同一个上游 flag，flag 恒 false，
+> 下游走哪条路径都一样。
+
+### 取证一：`translate` flag 恒为 false（日志 109 条命中，无一例外）
+
+`target/release/debug.log`（2026-08-15 12:15:55，362KB）中**每一条**
+`Controller received hotkey start (translate=false)`，含今日 04:11–04:15 全部会话。
+
+**但这不是 bug 本身** —— `HotkeyEvent::Start` 携带的是 `Arc<AtomicBool>`，
+`spawn_translate_poll_thread`（`hotkey.rs:99`）本就设计成「录音开始后继续轮询、中途按下也能翻转」，
+真正消费点在 `main.rs:3430` 的 `translate.load(Ordering::Acquire)`（管线阶段读，时机正确）。
+日志打的只是 Start 那一刻的值，**不足以定罪**。
+
+### 🔴 根因 A：UI 标签表 Shift 左右互换（一行，最致命）
+
+`ui/src/pages/HotkeySettings.tsx:43`：
+
+```ts
+0xA0: 'Right Shift', 0xA2: 'Left Ctrl', 0xA4: 'Left Alt', 0xA1: 'Left Shift',
+```
+
+**Windows 事实**：`VK_LSHIFT = 0xA0`、`VK_RSHIFT = 0xA1`。**这两个标签是反的。**
+
+对照同表其余四条**全部正确**：`0xA3: 'Right Ctrl'`（VK_RCONTROL=0xA3 ✅）/
+`0xA5: 'Right Alt'`（VK_RMENU=0xA5 ✅）/ `0xA2: 'Left Ctrl'` ✅ / `0xA4: 'Left Alt'` ✅。
+**只有 Shift 这一对是错的**，所以长期没被发现。
+
+**完整失效链**（与 Gavin 的 config 实测吻合）：
+
+```
+target/release/config.toml:67-70
+  [translation] enabled = true / vk_code = 160 / display_name = "Right Shift"
+       ↓ display_name 由 getHotkeyDisplayName(160) 经上述错表算出
+  UI 告诉 Gavin：「你的翻译热键是 Right Shift」
+       ↓ 运行时 translation_pressed() → GetAsyncKeyState(160) = 物理 Left Shift
+  Gavin 按物理 Right Shift（0xA1）→ 永远 false
+```
+
+**结论：只要 Gavin 按的是右 Shift，翻译功能 100% 死，与录音时机、格式化开关全都无关。**
+
+> ✅ **2026-08-15 Gavin 已确认**：「我按下的是右 shift，我在配置里配置的就是右 shift」。
+> **根因 A 由「疑似」升格为「已确认的元凶」** —— 他在 UI 里选的是标着 "Right Shift" 的项，
+> 存进去的是 `160`（物理左 Shift），运行时等的也是物理左 Shift，而他按的是物理右 Shift（`161`）。
+> **三方一致地错开，功能自配置之日起就从未生效过。**
+> 根因 B（500ms 窗口）是**修好 A 之后立刻会咬人的第二颗雷**，两条必须一起修。
+
+> 📌 附带疑点（需一并查清）：`HotkeySettings.tsx:69` 的
+> `TRANSLATION_SINGLE_KEYS = [0xA3, 0xA2, 0xA5, 0xA4]` **不含任何 Shift**，
+> 而 `config/mod.rs:128` 的 `translation.vk_code` 默认是 `0`。
+> 那么 **160 是怎么进到 config 里的？** 说明除下拉外还有一条按键捕获路径，
+> 且该路径可能把物理右 Shift 捕获成 `0xA0`。**根因 A 若只改标签表而不查捕获路径，可能只治了一半。**
+
+### 🔴 根因 B：`TRANSLATE_WINDOW_MS = 500`，轮询窗口只有 0.5 秒
+
+`src/platform/windows/hotkey.rs:29-30`：
+
+```rust
+const TRANSLATE_POLL_MS: u64 = 10;
+const TRANSLATE_WINDOW_MS: u64 = 500;
+```
+
+`spawn_translate_poll_thread` 只在**录音开始后 500ms 内**盯着翻译键，到点线程退出。
+`translate_flag.store(true, …)` 全代码库**只有 `hotkey.rs:108` 一处**（另一处是创建时的
+`AtomicBool::new(translation_pressed())`）→ **超过 500ms 后 flag 再无任何途径变 true。**
+
+**这正是 Gavin 描述的场景**：「在录音的时候同时按下」= 录音已经跑了若干秒才按 → 必然错过窗口。
+
+**根因 A 与 B 相互独立**：修好 A 之后，B 依然会让「录音中途按下」失效。**两个都必须修。**
+
+### 🟡 根因 C（跨平台缺口）：macOS 侧翻译热键从未接线
+
+`src/platform/macos/hotkey.rs:137` 与 `:153` 两处**硬编码** `translate: Arc::new(AtomicBool::new(false))`，
+无 `translation_pressed()`、无 poll 线程。**macOS 端翻译热键完全不存在，不是失效是没做。**
+依「跨平台强制规则」必须给出明确结论，不得沉默跳过。
+
+### ✅ 结案摘要
+
+- **039-A**：`VK_TO_LABEL` 中 Shift 左右标签已修正（`0xA0`→Left Shift、`0xA1`→Right Shift）。`CODE_TO_VK` 捕获表经复核本身正确，Gavin 配置中的 160 来自他当时按了物理左 Shift，被错标签误导为 "Right Shift"。
+- **039-B**：轮询从固定 500ms 改为跟随录音生命周期（`TRANSLATE_POLL_STOP` 信号 + PTT 松开/Toggle 二次按下/hook 卸载/poll_ptt_release_thread 结束均置位），并加 `MAX_RECORD_SECONDS + 5` 秒硬上限兜底；flag 翻转日志已补。
+- **039-C**：macOS 侧未实施，结论写入 `docs/MACOS-HANDOFF.md` §TRANS-HOTKEY-039。
+- **跨文件接线**：`src/main.rs` 6 处终止路径调用 `platform::notify_translate_poll_stop()`（:1978 / :1987 / :2028 / :2032 / :2045 / :2063），与 coder-1 ASR-038-B 改动区文本零重叠。
+
+### 🔴 主控验收（逐行 Read + 独立复算，未采信汇总表格）
+
+**通过项**：`VK_TO_LABEL` 修正正确且 `CODE_TO_VK` 未被误动 ✅ ｜硬上限兜底真落地
+（`MAX_RECORD_SECONDS + 5`，带 warn 日志）✅ ｜flag 翻转日志已补（含按下时距录音开始毫秒数）✅ ｜
+`cargo check --all-targets` **0 error**（主控独立跑）✅
+
+**`TRANSLATE_POLL_STOP` 复位配对已核**：全局 static 若不复位，首次 ESC 后将永久为 true、
+翻译热键再次全死。实测复位与 spawn **三处严格配对**（`171→176` / `524→526` / `537→539`），
+**该风险不成立**。
+
+#### 🔴 打回项：Toggle 模式下把根因 B 原样复活
+
+`hotkey.rs:197` `WM_KEYUP` 分支把 `TRANSLATE_POLL_STOP.store(true)` 放在**无条件**位置，
+而紧随其后的 `send Stop` 却有 `if mode == 1` 门控。**`mode == 0` 是 Toggle。**
+
+> Toggle 语义是「按一下开始 → **松手** → 说话 → 再按一下结束」，**松手 ≠ 录音结束**。
+> 故 Toggle 下用户一松开主热键 poll 线程即死，之后按翻译键永不生效。
+> **且比改之前更糟**：旧代码固定轮询 500ms、不看 keyup；改后变成松手即死，通常远不到 500ms。
+> 触犯最高原则「修改不可引入新问题」。**修法**：`store(true)` 移进 `if mode == 1` 块内。
+> Gavin 本人当前为 `PushToTalk`（debug.log `sync_binding` 实证），不受影响；Toggle 用户会中招。
+
+#### 📌 只报不改（既有死逻辑，非 039 引入，本单明令不修）
+
+`hotkey.rs:185` 的 `else if mode == 0`（Toggle 第二次按下结束录音）分支在 **hook 路径下不可达**
+—— `:205` 的 `PTT_ACTIVE.store(false)` **无条件执行**，第二次按下时 `!PTT_ACTIVE` 成立，
+会重新走 start 分支而非进入该 else。
+
+> hook 路径只用于 `RegisterHotKey` 不支持的键（`requires_polling`：`0xA0..=0xA5` 裸修饰键）。
+> Gavin 的 vk=165（VK_RMENU）正走此路径，但他是 PTT 模式故不触发。
+> **待开单**：Toggle + 裸修饰键组合下的行为需实测确认。
+
+#### 硬上限兜底的实证价值（保留供后续参考）
+
+主控要求的硬上限在验收中被证明**不是冗余**：Toggle 经 `RegisterHotKey` 路径（`:523`）时，
+**第二次按下会重置 `STOP=false` 并 spawn 一个新 poll 线程**，而那次按下本意是结束录音 ——
+该线程无任何正常终止路径，**全靠硬上限兜住**。
+
+> **补调用点是穷举，穷举必漏（coder-2 第一版就漏了 ESC）；硬上限是兜底，漏了也不出事。**
+> 两者是纵深防御，不是二选一。
 
 ---
 
@@ -47,7 +261,7 @@ error: could not compile `voice-ime` (bin "feiyin-ime" test) due to 1 previous e
 | DESIGN-OVERLAY-037 | overlay 流式预览交互设计 | 无（纯设计） | coder-2 | ✅ 闭环 |
 | RESEARCH-ASR-038 | 流式管线 + VAD 门控 + 热词链路 | 无（纯设计） | coder-1 | ✅ 闭环 |
 | **ASR-038-A** | `qwen_inference.rs` 新建（1076 行 + 45 单测） | `src/transcription/` 新文件 | coder-1 | ✅ **主控独立复现验收通过** |
-| **ASR-038-B** | VAD 入口门控 + 管线改造（边录边发 + 增量接收） | `src/audio/`、`src/main.rs`、`src/transcription/`、`qwen_inference.rs`、`src/ui/overlay.rs`（🔴 仅数据字段） | coder-1 | 🔴 **进行中 · 待派发收尾** |
+| **ASR-038-B** | VAD 入口门控 + 管线改造（边录边发 + 增量接收） | `src/audio/`、`src/main.rs`、`src/transcription/`、`qwen_inference.rs`、`src/ui/overlay.rs`（🔴 仅数据字段） | coder-1 | 🟡 **真流式核心已实施**（C-1~C-4+040-A，编译通/测试全绿），待主控终验 |
 | ASR-038-C | overlay 流式显示 + 编辑态 + EDIT 控件 | `src/main.rs`、`src/ui/overlay.rs`（绘制与交互） | coder-2 | 🔜 **等 B**（同动 `main.rs`，零并行空间） |
 | TEST-SYNC-038 | 阶段三测试同步 | 各 `mod tests` | tester-1 | 🔜 等 B 验收 |
 | TEST-EXEC-038 | 阶段四全量回归 | — | tester-1 | 🔜 |

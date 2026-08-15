@@ -172,6 +172,161 @@ impl AudioCapture {
         )
     }
 
+    /// ASR-038-B: 流式录音 —— 热键按下即采集，每个 chunk 通过回调推送。
+    ///
+    /// **与 record() 的关键差异**：
+    /// - 不调 `collect_recording`（那是阻塞攒完整 samples 的批处理逻辑）
+    /// - 每个 chunk 实时推给 `on_chunk` 回调（ASR 线程做 VAD 门控+建连+发帧）
+    /// - RMS 静音检测仍在（管停录），`speech_detected` 行为不变（与 Silero VAD 并存）
+    /// - pre_roll 不攒在 VecDeque，而是作为首批 chunk 推给回调（建连后补发）
+    ///
+    /// **热键按下即采集**（硬性自证②要求）：
+    /// WASAPI stream 在 prewarm 时已运行，回调持续推 chunk 到 channel。
+    /// 本方法从 channel 读 chunk 推给回调，**不等待 VAD 判定** —— VAD 在 ASR 线程做，
+    /// 只决定「何时建连」，不影响「何时开始采集」。采集从热键按下瞬间就开始。
+    ///
+    /// **不改 record() 行为**：平行方法，record() 零改动。
+    pub fn record_streaming(
+        &mut self,
+        stop_signal: Arc<AtomicBool>,
+        silence_threshold: f32,
+        silence_duration_ms: u64,
+        max_seconds: u64,
+        level_buf: Option<AudioLevelBuf>,
+        device_name: Option<&str>,
+        mut on_chunk: impl FnMut(&[f32]),
+    ) -> Result<()> {
+        let t_record = std::time::Instant::now();
+        let warm = self.ensure_stream(device_name)?;
+        log::info!(
+            "[Latency] record_streaming ensure_stream completed at +{:.1}ms",
+            t_record.elapsed().as_secs_f64() * 1000.0
+        );
+
+        // pre-roll：从 VecDeque drain 出热键前的音频，作为首批 chunk 推给回调
+        // 这是「建连后补发」的 pre-roll 来源 —— 热键前的音频不丢
+        let pre_roll_chunks = warm.drain_pre_roll(PRE_ROLL_MS);
+        log::info!(
+            "[Latency] record_streaming drain_pre_roll: {} chunks at +{:.1}ms",
+            pre_roll_chunks.len(),
+            t_record.elapsed().as_secs_f64() * 1000.0
+        );
+
+        // 精确 idle drain（同 record() 的 FIRSTCHAR-FIX-004）：清热键前 stale chunk
+        let mut idle_cleared: usize = 0;
+        let mut post_hotkey_chunks: Vec<Vec<f32>> = Vec::new();
+        loop {
+            match warm.rx.try_recv() {
+                Ok((ts, chunk)) => {
+                    if ts < t_record {
+                        idle_cleared += 1;
+                    } else {
+                        post_hotkey_chunks.push(chunk);
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
+        }
+        log::info!(
+            "[Latency] record_streaming idle drain: cleared {} stale, preserved {} post-hotkey at +{:.1}ms",
+            idle_cleared,
+            post_hotkey_chunks.len(),
+            t_record.elapsed().as_secs_f64() * 1000.0
+        );
+        warm.stream_failed.store(false, Ordering::Release);
+
+        log::info!(
+            "Streaming recording started ({}Hz, {} ch, device='{}', pre_roll={} chunks, post_hotkey={} chunks)",
+            warm.sample_rate,
+            warm.channels,
+            warm.actual_device_name,
+            pre_roll_chunks.len(),
+            post_hotkey_chunks.len()
+        );
+
+        // 推 pre-roll chunks 给回调（ASR 线程的 VAD 门控+建连会收到这些）
+        for chunk in &pre_roll_chunks {
+            on_chunk(chunk);
+        }
+        // 推 post-hotkey chunks
+        for chunk in &post_hotkey_chunks {
+            on_chunk(chunk);
+        }
+
+        // RMS 静音检测状态（与 record() 的 RecordingState 逻辑一致，但只管停录+level_buf）
+        let sample_rate = warm.sample_rate;
+        let silence_frames = (silence_duration_ms as f32 / 1000.0 * sample_rate as f32) as usize;
+        let mut silent_count: usize = 0;
+        let mut speech_detected = false;
+        let max_frames = max_seconds as usize * sample_rate as usize;
+        let mut total_samples: usize = pre_roll_chunks.iter().map(|c| c.len()).sum::<usize>()
+            + post_hotkey_chunks.iter().map(|c| c.len()).sum::<usize>();
+
+        // 主循环：从 channel 读 chunk → 推回调 → RMS 检测
+        let recv_timeout = Duration::from_millis(50);
+        loop {
+            if stop_signal.load(Ordering::Relaxed) {
+                log::info!("Streaming recording: stop signal received");
+                break;
+            }
+            if warm.stream_failed.load(Ordering::Acquire) {
+                anyhow::bail!("Audio input stream failed during streaming recording");
+            }
+            if total_samples >= max_frames {
+                log::info!("Streaming recording: max length reached");
+                break;
+            }
+
+            match warm.rx.recv_timeout(recv_timeout) {
+                Ok((_ts, chunk)) if !chunk.is_empty() => {
+                    let rms =
+                        (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32).sqrt();
+
+                    if let Some(ref buf) = level_buf {
+                        crate::ui::overlay::push_level(buf, rms);
+                    }
+
+                    if rms > silence_threshold {
+                        silent_count = 0;
+                        speech_detected = true;
+                    } else if speech_detected {
+                        silent_count += chunk.len();
+                        if silent_count >= silence_frames {
+                            log::info!(
+                                "Streaming recording: silence detected ({} samples), ending",
+                                silent_count
+                            );
+                            break;
+                        }
+                    }
+
+                    on_chunk(&chunk);
+                    total_samples += chunk.len();
+                }
+                Ok(_) => {
+                    log::warn!(
+                        "Streaming recording: received empty chunk (possible stream failure)"
+                    );
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("Audio input stream disconnected during streaming recording");
+                }
+            }
+        }
+
+        log::info!(
+            "Streaming recording complete: ~{} samples ({:.1}s @ {}Hz), speech_detected={}",
+            total_samples,
+            total_samples as f32 / sample_rate as f32,
+            sample_rate,
+            speech_detected
+        );
+
+        Ok(())
+    }
+
     fn ensure_stream(&mut self, device_name: Option<&str>) -> Result<&mut WarmInputStream> {
         let requested_device_name = normalize_device_name(device_name);
         let host = cpal::default_host();

@@ -871,3 +871,128 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 ### 结论
 
 **macOS 侧无需同步改动即可编译通过**（`AsrModel` 枚举的 match 已覆盖、config 字段带 serde default）。`src-tauri/src/config.rs` 的字段镜像属批次 C 任务，与本批解耦。
+
+---
+
+## §ASR-038-B-partial · 038-B 收尾（端点缺陷修复 + cancel_signal + preprocessing 结论，2026-08-15）
+
+### 改动范围
+
+| 文件 | 动作 | 平台中立？ |
+|---|---|---|
+| `src/config/mod.rs` | `default_qwen_asr_url` 改为含 WorkspaceId 的 Inference 端点 + 4 测试 | ✅ 是 |
+| `src/transcription/mod.rs` | Transcriber 新增 `qwen_asr_url`/`qwen_asr_model` 字段 + `new` 签名加两参数 + getter + 非流式回退分支用独立字段 + 6 测试 | ✅ 是 |
+| `src/transcription/qwen_inference.rs` | `transcribe_streaming` 加 `cancel_signal` 参数 + 上传/接收循环 cancel 检查 + 测试调用更新 | ✅ 是 |
+| `src/main.rs` | `spawn_worker_thread` 两处 `Transcriber::new` 调用更新 + 热重载加 `qwen_asr_changed` + `active_qwen_asr_*` 跟踪 + `select_preprocessing_params` 注释扩充 | ⚠️ 在 `#[cfg(target_os="windows")]` 内的调用点，但 `Transcriber::new` 签名变更是平台中立的 |
+
+### 三条端点缺陷（主控独立验证 + 追加两条同族）
+
+| # | 缺陷 | 修法 |
+|---|---|---|
+| ① | `mod.rs:302` 用 `self.qwen3_url`（Realtime 端点）调 `transcribe_streaming`（Inference 协议） | Transcriber 新增 `qwen_asr_url`/`qwen_asr_model` 独立字段 |
+| ② | `qwen_asr_url`/`qwen_asr_model` config 字段全库零消费 | `Transcriber::new` 签名加两参数 + 所有调用点更新 |
+| ③ | `default_qwen_asr_url` 主机名 `dashscope.aliyuncs.com` 是 Realtime API 的 | 改为 `wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference` |
+
+### 行为前后对比
+
+- **修前**：QwenAudioOnline 模式复用 Qwen3Online 的 Realtime API 端点 + model，Inference 协议去连 Realtime 端点 → **必然连不上**
+- **修后**：QwenAudioOnline 用独立的 Inference API 端点（含 WorkspaceId）+ 独立 model 名 → 协议与端点匹配
+- **cancel_signal**：`transcribe_streaming` 新增可选取消信号，EditRequested/ESC 可中断进行中的 WebSocket 转录（修前无法中断）
+
+### 对 macOS 的影响
+
+1. **`Transcriber::new` 签名变更**：加了两参数 `qwen_asr_url`/`qwen_asr_model`。macOS 侧若有 `Transcriber::new` 调用点需同步更新——`spawn_worker_thread` 已去 `cfg(windows)`（NEUTRAL-002），macOS 侧调用同一函数，本批已更新两处调用点，macOS 编译同一份代码无需额外改动。
+2. **`AsrModel` 枚举**：A 批已加 `QwenAudioOnline`，本批未改枚举本身。
+3. **`config/mod.rs`**：`default_qwen_asr_url` 默认值变更 + 新增测试，平台中立，macOS 编译同一份代码。
+4. **`qwen_inference.rs`**：`transcribe_streaming` 签名加 `cancel_signal`，平台中立。
+5. **`select_preprocessing_params`**：在 `#[cfg(target_os="windows")]` 内，macOS 侧不编译，无影响。
+
+### 结论
+
+**已评估，对 macOS 侧编译无影响**——`Transcriber::new` 签名变更已被 macOS 可达的 `spawn_worker_thread` 两处调用点同步更新，其余改动平台中立或 macOS 不可达。`src-tauri/src/config.rs` 的 `qwen_asr_url`/`qwen_asr_model` 字段镜像属批次 C，与本批解耦。
+
+### 挂起项（等 Gavin 拍板，macOS 侧暂无需动作）
+
+伪流式 vs 真流式 + VAD 入口门控 + `record_streaming()` + 流式管线接线 —— 这些属架构层，待 Gavin 拍板后可能影响 `src/audio/mod.rs`（`record_streaming()` 可能需平台分支：WASAPI vs cpal），届时 macOS 侧需同步评估。
+
+---
+
+## §TRANS-HOTKEY-039 · 翻译热键全链失效修复（Windows 侧，2026-08-15）
+
+### 改动范围
+
+| 文件 | 动作 | 平台中立？ |
+|---|---|---|
+| `ui/src/pages/HotkeySettings.tsx` | 修正 `VK_TO_LABEL` 中 Shift 左右标签（0xA0/0xA1 对调） | ✅ 纯前端 |
+| `src/platform/windows/hotkey.rs` | 翻译键轮询跟随录音生命周期 + 硬上限兜底 + flag 翻转日志 | ❌ Windows 专用 |
+| `src/platform/windows/mod.rs` | re-export `notify_translate_poll_stop` | ❌ Windows 专用 |
+| `src/platform/mod.rs` | Windows 侧导出 `notify_translate_poll_stop` | ❌ Windows 专用 |
+| `src/main.rs` | 6 处录音终止路径调用 `platform::notify_translate_poll_stop()` | ❌ 在 `#[cfg(target_os="windows")]` 内 |
+
+### macOS 侧现状
+
+- `src/platform/macos/hotkey.rs:137` 与 `:153` 两处硬编码 `translate: Arc::new(AtomicBool::new(false))`，无 `translation_pressed()`、无 poll 线程。
+- **结论：macOS 翻译热键从未实现，不是失效，是功能不存在。**
+
+### 若 macOS 侧要对齐 Windows，需做的工作
+
+1. **配置消费**：在 `macos/hotkey.rs` 读取 `config.translation.enabled` 与 `config.translation.vk_code`（当前被忽略）。
+2. **按键检测**：为翻译键增加按键检测（CGEventTap 层或轮询 `GetAsyncKeyState` 的 macOS 等价物）。
+3. **poll 线程**：按录音生命周期启动/停止翻译键轮询，并将结果写入 `HotkeyEvent::Start { translate }` 的 `Arc<AtomicBool>`。
+4. **终止路径**：与 `main.rs` 中的 ESC / 录音结束 / overlay 取消等路径对齐；macOS 侧 `process_controller_events` 镜像当前只在 `:2843` 之后存在 stub，需先完整实现 Windows 行为镜像。
+5. **跨平台导出**：在 `src/platform/macos/mod.rs` 提供 `pub fn notify_translate_poll_stop()` stub（当前不存在），使平台层符号对称。
+
+### 本单决策
+
+- **不实施 macOS 侧代码改动**（任务书明确要求只给结论）。
+- Windows 侧修复对 macOS 编译无影响：所有新增符号均位于 `#[cfg(target_os = "windows")]` 路径，`process_controller_events` 本身在 macOS 侧不编译。
+
+---
+
+## §ASR-038-B-streaming · 真流式核心实施（C-1~C-4 + 040-A，2026-08-15）
+
+### 改动范围
+
+| 文件 | 动作 | 平台中立？ |
+|---|---|---|
+| `src/transcription/vad.rs` | +202 行：VadSegmenter 新增 `try_new_for_streaming`/`accept_and_check`/`reset_for_new_session`/`vad_window_size` + 6 测试 | ✅ 是（sherpa-onnx 跨平台） |
+| `src/audio/mod.rs` | +155 行：`record_streaming` 平行方法 | ⚠️ WASAPI/cpal 采集，macOS 需评估 cpal 分支 |
+| `src/transcription/qwen_inference.rs` | +447 行：`transcribe_streaming_realtime` 真流式 + 040-A 埋点 + 旧 `transcribe_streaming` 也加 040-A 埋点 | ✅ 是（tungstenite 跨平台） |
+| `src/main.rs` | +311 行：worker QwenAudioOnline 分支 + `run_pipeline_core` `initial_text` 参数 | ⚠️ `spawn_worker_thread` 已中立（NEUTRAL-002），macOS 可达 |
+| `src/config/mod.rs` | 无新改动（B-1 已在 partial 批完成） | ✅ |
+| `src/transcription/mod.rs` | 无新改动（B-1/B-2 已在 partial 批完成） | ✅ |
+
+### 行为前后对比
+
+- **修前**：QwenAudioOnline 走 `record()` 录完整段→`transcribe_streaming` 一次性发→回调推增量（伪流式，录音期间无文本上屏）
+- **修后**：QwenAudioOnline 走 `record_streaming` 边录边推 chunk→ASR 线程 VAD 门控建连→边发边收→`on_result` 回调推 `StreamingText` 到 overlay（真流式，录音期间实时上屏）
+- **非流式路径零改动**：record() + run_pipeline_core(None) 行为不变（FIRSTCHAR 前处理链逐字节等价已自证）
+
+### 对 macOS 的影响
+
+1. **`vad.rs`**：平台中立，macOS 编译同一份代码。`try_new_for_streaming`/`accept_and_check` 可直接复用
+2. **`audio/mod.rs` `record_streaming`**：WASAPI/cpal 采集层。macOS 用 cpal（非 WASAPI），`ensure_stream` 已是 cpal 跨平台代码。`record_streaming` 复用 `ensure_stream` + `warm.rx`，macOS 应可直接调用。但需端测验证 cpal 在 macOS 上的 chunk 时序行为
+3. **`qwen_inference.rs`**：平台中立（tungstenite WS）
+4. **`main.rs` worker 分支**：`spawn_worker_thread` 已中立（NEUTRAL-002），macOS 可达。QwenAudioOnline 分支判断 + 流式管线在 macOS 编译同一份代码。但 `record_streaming` 的设备名传递 + overlay `StreamingText` 事件在 macOS 侧的渲染（038-C）需评估
+5. **`run_pipeline_core` `initial_text` 参数**：签名变更影响所有调用点。worker 线程非流式调用传 `None`（macOS 可达，已更新）
+
+### 结论
+
+**macOS 侧编译应无影响**（vad/qwen_inference 平台中立，main.rs worker 分支已中立）。`record_streaming` 的 cpal 分支需 macOS 端测验证。`StreamingText` 事件的 macOS overlay 渲染属 038-C 任务。
+
+### 🔴 行为变更：真流式绕过前导静音裁剪（trade-off 记录）
+
+**变更性质**：QwenAudioOnline 模式从非流式回退路径切到真流式主路径后，`select_preprocessing_params` 返回的 `(0, 3200)`（0ms silence_head + 200ms onset_backtrack）**不再被应用**。
+
+| 项 | 非流式回退路径（旧） | 真流式主路径（新） |
+|---|---|---|
+| 前导静音裁剪 | `find_speech_onset_with_backtrack` 裁掉语音起始前的静音 | 不裁剪（边录边发，无完整 samples 可 trim） |
+| 上传音频量 | 裁剪后仅语音段 | 含前导静音（VAD 命中前缓冲的 pre-roll） |
+| 费用影响 | 少 | 多（上传音频变多） |
+| 送气声母风险 | 裁剪可能截断 /pʰ/ /tʰ/ 等送气清声母（FIRSTCHAR-FIX 001~006 的起因） | 不裁剪，无截断风险 |
+
+**与 Gavin 省钱指令的关系**：Gavin 今日硬指令「防止无效语音输入上传浪费 token」由 VAD 入口门控解决（纯静音不建连）。前导静音裁剪省的是「有语音但前面有静音」的那段，VAD 门控挡不住这类。真流式多上传的音频量 = pre-roll 缓冲（~600ms）+ VAD 判定窗口（~32ms）+ 握手期间音频（~200-500ms）≈ 0.8-1.1s，相对于一次录音的总时长占比小。
+
+**不裁剪反而更安全的理由**：FIRSTCHAR-FIX 001~006 六轮才把首字率从 ~20% 压到 ~54%，根因就是裁剪截断了送气声母。真流式不裁剪，从机制上消除了这个风险。VAD 入口门控 + pre-roll 补发保证首字不丢。
+
+**端测观察点**：真流式模式下，若发现费用异常增加（相对非流式回退），可考虑在 transcribe_streaming_realtime 的 pre-roll 补发阶段加能量门控（低于阈值的 pre-roll chunk 不发），但这会重新引入送气声母风险，需端测权衡。

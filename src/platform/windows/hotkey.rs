@@ -45,6 +45,8 @@ static TARGET_VK: AtomicU32 = AtomicU32::new(0);
 static TARGET_MODS: AtomicU32 = AtomicU32::new(0);
 static TARGET_MODE: AtomicU32 = AtomicU32::new(0);
 static TRANSLATION_VK: AtomicU32 = AtomicU32::new(0);
+/// STOP flag for translate poll thread; set true when recording ends.
+static TRANSLATE_POLL_STOP: AtomicBool = AtomicBool::new(false);
 static HOOK_SENDER: AtomicPtr<crossbeam_channel::Sender<HotkeyEvent>> =
     AtomicPtr::new(std::ptr::null_mut());
 static HOOK_WAKE_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -98,19 +100,43 @@ fn translation_pressed() -> bool {
 
 fn spawn_translate_poll_thread(translate_flag: Arc<AtomicBool>) {
     thread::spawn(move || {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(TRANSLATE_WINDOW_MS);
-        while std::time::Instant::now() < deadline {
+        let start = std::time::Instant::now();
+        // Hard ceiling: poll thread must never outlive the maximum recording length.
+        // This is a safety net independent of the TRANSLATE_POLL_STOP signal.
+        let hard_deadline =
+            start + std::time::Duration::from_secs(crate::config::MAX_RECORD_SECONDS + 5);
+        loop {
+            if TRANSLATE_POLL_STOP.load(Ordering::Relaxed) {
+                break;
+            }
             if translate_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            if start.elapsed() >= hard_deadline.duration_since(start) {
+                log::warn!(
+                    "Translate poll thread hit hard deadline ({}s), forcing stop",
+                    crate::config::MAX_RECORD_SECONDS + 5
+                );
                 break;
             }
             if translation_pressed() {
                 translate_flag.store(true, Ordering::Release);
+                log::info!(
+                    "Translation hotkey pressed after {:.0}ms of recording, translate enabled",
+                    start.elapsed().as_millis()
+                );
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(TRANSLATE_POLL_MS));
         }
     });
+}
+
+/// Notify the translate poll thread to stop (e.g. ESC cancel or abnormal end of recording).
+/// This is a cross-module signal because the ESC cancel path lives in the controller loop.
+pub fn notify_translate_poll_stop() {
+    TRANSLATE_POLL_STOP.store(true, Ordering::Relaxed);
+    log::info!("Translate poll stop notified");
 }
 
 /// Check if modifiers are pressed (used in hook callback)
@@ -142,6 +168,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                 if modifiers_pressed_from_hook() {
                     if !PTT_ACTIVE.load(Ordering::Relaxed) {
                         PTT_ACTIVE.store(true, Ordering::Relaxed);
+                        TRANSLATE_POLL_STOP.store(false, Ordering::Relaxed);
                         let sender_ptr = HOOK_SENDER.load(Ordering::Relaxed);
                         if !sender_ptr.is_null() {
                             let sender = &*sender_ptr;
@@ -155,10 +182,20 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                                 hook_wake_target(),
                             );
                         }
+                    } else if mode == 0 {
+                        // Toggle mode: second press ends recording
+                        TRANSLATE_POLL_STOP.store(true, Ordering::Relaxed);
+                        let sender_ptr = HOOK_SENDER.load(Ordering::Relaxed);
+                        if !sender_ptr.is_null() {
+                            let sender = &*sender_ptr;
+                            send_hotkey_event(sender, HotkeyEvent::Stop, hook_wake_target());
+                        }
+                        PTT_ACTIVE.store(false, Ordering::Relaxed);
                     }
                 }
             } else if msg_type == WM_KEYUP || msg_type == WM_SYSKEYUP {
                 if mode == 1 {
+                    TRANSLATE_POLL_STOP.store(true, Ordering::Relaxed);
                     let sender_ptr = HOOK_SENDER.load(Ordering::Relaxed);
                     if !sender_ptr.is_null() {
                         let sender = &*sender_ptr;
@@ -229,6 +266,7 @@ fn uninstall_keyboard_hook() {
     HOOK_WAKE_HWND.store(0, Ordering::Relaxed);
     HOOK_WAKE_MSG.store(0, Ordering::Relaxed);
     PTT_ACTIVE.store(false, Ordering::Relaxed);
+    TRANSLATE_POLL_STOP.store(true, Ordering::Relaxed);
 }
 
 /// Hotkey event types
@@ -483,6 +521,7 @@ fn handle_hotkey_trigger(
 
     match binding.mode {
         HotkeyMode::Toggle => {
+            TRANSLATE_POLL_STOP.store(false, Ordering::Relaxed);
             let translate_flag = Arc::new(AtomicBool::new(translation_pressed()));
             spawn_translate_poll_thread(Arc::clone(&translate_flag));
             send_hotkey_event(
@@ -495,6 +534,7 @@ fn handle_hotkey_trigger(
         }
         HotkeyMode::PushToTalk => {
             if !PTT_ACTIVE.swap(true, Ordering::AcqRel) {
+                TRANSLATE_POLL_STOP.store(false, Ordering::Relaxed);
                 let translate_flag = Arc::new(AtomicBool::new(translation_pressed()));
                 spawn_translate_poll_thread(Arc::clone(&translate_flag));
                 send_hotkey_event(
@@ -639,12 +679,16 @@ fn poll_ptt_release_thread(
                 log::info!("PTT release detected, sending Stop");
                 send_hotkey_event(&sender, HotkeyEvent::Stop, wake_target);
             }
+            TRANSLATE_POLL_STOP.store(true, Ordering::Relaxed);
             PTT_ACTIVE.store(false, Ordering::Release);
             break;
         }
 
         std::thread::sleep(std::time::Duration::from_millis(PTT_POLL_MS));
     }
+
+    // Ensure stop flag is set if thread exits for any other reason
+    TRANSLATE_POLL_STOP.store(true, Ordering::Relaxed);
 }
 
 fn binding_pressed(binding: HotkeyBinding) -> bool {

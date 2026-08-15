@@ -20,7 +20,7 @@ const CODE_TO_VK: { [key: string]: number } = {
   'F6': 0x75, 'F7': 0x76, 'F8': 0x77, 'F9': 0x78, 'F10': 0x79,
   'F11': 0x7A, 'F12': 0x7B,
   'ControlRight': 0xA3, 'AltRight': 0xA5,
-  'ShiftRight': 0xA0, 'ControlLeft': 0xA2, 'AltLeft': 0xA4, 'ShiftLeft': 0xA1,
+  'ShiftRight': 0xA1, 'ControlLeft': 0xA2, 'AltLeft': 0xA4, 'ShiftLeft': 0xA0,
   'Space': 0x20, 'Enter': 0x0D, 'Backspace': 0x08, 'Tab': 0x09,
   'Escape': 0x1B, 'Insert': 0x2D, 'Delete': 0x2E, 'Home': 0x24, 'End': 0x23,
   'PageUp': 0x21, 'PageDown': 0x22,
@@ -40,7 +40,7 @@ const VK_TO_LABEL: { [key: number]: string } = {
   0x30: '0', 0x31: '1', 0x32: '2', 0x33: '3', 0x34: '4',
   0x35: '5', 0x36: '6', 0x37: '7', 0x38: '8', 0x39: '9',
   0xA3: 'Right Ctrl', 0xA5: 'Right Alt',
-  0xA0: 'Right Shift', 0xA2: 'Left Ctrl', 0xA4: 'Left Alt', 0xA1: 'Left Shift',
+  0xA1: 'Right Shift', 0xA2: 'Left Ctrl', 0xA4: 'Left Alt', 0xA0: 'Left Shift',
 };
 
 const MOD_LABELS: { [key: number]: string } = {

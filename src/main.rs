@@ -1975,6 +1975,7 @@ fn process_controller_events(
                 log::info!("Controller received hotkey cancel-stop (PTT held < 300ms)");
                 cancel_signal.store(true, Ordering::Release);
                 stop_recording_signal.store(true, Ordering::Release);
+                platform::notify_translate_poll_stop();
             }
         }
     }
@@ -1983,6 +1984,7 @@ fn process_controller_events(
         if (esc as u16) & 0x8000u16 != 0 {
             cancel_signal.store(true, Ordering::Release);
             stop_recording_signal.store(true, Ordering::Release);
+            platform::notify_translate_poll_stop();
             let ui_language = clone_runtime_config(runtime_config).ui_language;
             set_tray_state(tray, TrayState::Idle, ui_language);
         }
@@ -2023,9 +2025,11 @@ fn process_controller_events(
             PipelineEvent::Done | PipelineEvent::Cancelled => {
                 set_tray_state(tray, TrayState::Idle, ui_language);
                 overlay_handle.send(OverlayCommand::Hide);
+                platform::notify_translate_poll_stop();
             }
             PipelineEvent::FocusLost(text) => {
                 set_tray_state(tray, TrayState::Idle, ui_language);
+                platform::notify_translate_poll_stop();
                 show_overlay(
                     overlay_handle,
                     opacity,
@@ -2038,6 +2042,7 @@ fn process_controller_events(
             }
             PipelineEvent::Error(message) => {
                 log::error!("Pipeline error: {}", message);
+                platform::notify_translate_poll_stop();
                 set_tray_state(tray, TrayState::Error, ui_language);
                 // Shimmer animation frame update (phase increments every cycle)
                 let friendly_message = convert_to_friendly_error(&message, ui_language);
@@ -2055,6 +2060,7 @@ fn process_controller_events(
             // 历史教训：必须显式复位 tray 状态到 Idle，否则会卡在"处理中"。
             PipelineEvent::FormatFailed => {
                 log::warn!("LLM formatting failed; raw text injected as fallback");
+                platform::notify_translate_poll_stop();
                 set_tray_state(tray, TrayState::Idle, ui_language);
                 let hint = i18n::get(ui_language).format_failed_hint;
                 let (pos, size) = overlay_geometry(&OverlayStatus::Error(hint.to_string()));
@@ -2237,6 +2243,8 @@ fn spawn_worker_thread(
             &config.audio.qwen3_asr_url,
             &config.audio.qwen3_api_key,
             &config.audio.qwen3_asr_model,
+            &config.audio.qwen_asr_url,
+            &config.audio.qwen_asr_model,
         ) {
             Ok(t) => Some(t),
             Err(err) => {
@@ -2263,6 +2271,9 @@ fn spawn_worker_thread(
         let mut active_qwen3_url: String = config.audio.qwen3_asr_url.clone();
         let mut active_qwen3_api_key: String = config.audio.qwen3_api_key.clone();
         let mut active_qwen3_asr_model: String = config.audio.qwen3_asr_model.clone();
+        // ASR-038-B: qwen_asr 配置跟踪（QwenAudioOnline 用 Inference API，独立于 qwen3）
+        let mut active_qwen_asr_url: String = config.audio.qwen_asr_url.clone();
+        let mut active_qwen_asr_model: String = config.audio.qwen_asr_model.clone();
 
         // PERF-INIT-001: Pre-initialize LlmClient once; update_config() before each use.
         let mut llm_client = llm::LlmClient::new(config.llm.clone());
@@ -2306,6 +2317,9 @@ fn spawn_worker_thread(
                     active_qwen3_url = fresh.audio.qwen3_asr_url;
                     active_qwen3_api_key = fresh.audio.qwen3_api_key;
                     active_qwen3_asr_model = fresh.audio.qwen3_asr_model;
+                    // ASR-038-B: 同步 qwen_asr 跟踪值（QwenAudioOnline 用）
+                    active_qwen_asr_url = fresh.audio.qwen_asr_url;
+                    active_qwen_asr_model = fresh.audio.qwen_asr_model;
                     transcriber = Some(new_transcriber);
                     asr_reload_in_flight = false;
                 }
@@ -2356,20 +2370,27 @@ fn spawn_worker_thread(
                         && (active_qwen3_url != config.audio.qwen3_asr_url
                             || active_qwen3_api_key != config.audio.qwen3_api_key
                             || active_qwen3_asr_model != config.audio.qwen3_asr_model);
+                    // ASR-038-B: qwen_asr 配置变更（QwenAudioOnline 的 Inference API 端点/模型）
+                    let qwen_asr_changed = desired_asr_model
+                        == transcription::AsrModel::QwenAudioOnline
+                        && (active_qwen_asr_url != config.audio.qwen_asr_url
+                            || active_qwen_asr_model != config.audio.qwen_asr_model);
                     // LANG-AUTO-001: language 恒为 "auto"，移除语言变更监听
                     let needs_reload = active_asr_model != desired_asr_model
                         || (desired_asr_model == transcription::AsrModel::Accuracy
                             && active_hotwords_version != desired_hotwords_version)
                         || qwen3_changed
+                        || qwen_asr_changed
                         || needs_rebuild;
                     if needs_reload && !asr_reload_in_flight {
                         log::info!(
-                            "Triggering ASR transcriber hot-reload: model {:?}->{:?}, hotwords_version {}->{}, qwen3_changed={}, needs_rebuild={}",
+                            "Triggering ASR transcriber hot-reload: model {:?}->{:?}, hotwords_version {}->{}, qwen3_changed={}, qwen_asr_changed={}, needs_rebuild={}",
                             active_asr_model,
                             desired_asr_model,
                             active_hotwords_version,
                             desired_hotwords_version,
                             qwen3_changed,
+                            qwen_asr_changed,
                             needs_rebuild,
                         );
                         asr_reload_in_flight = true;
@@ -2380,6 +2401,8 @@ fn spawn_worker_thread(
                         let reload_qwen3_url = config.audio.qwen3_asr_url.clone();
                         let reload_qwen3_key = config.audio.qwen3_api_key.clone();
                         let reload_qwen3_model = config.audio.qwen3_asr_model.clone();
+                        let reload_qwen_asr_url = config.audio.qwen_asr_url.clone();
+                        let reload_qwen_asr_model = config.audio.qwen_asr_model.clone();
                         let reload_tx = asr_reload_tx.clone();
                         std::thread::spawn(move || {
                             let t_build = std::time::Instant::now();
@@ -2392,6 +2415,8 @@ fn spawn_worker_thread(
                                 &reload_qwen3_url,
                                 &reload_qwen3_key,
                                 &reload_qwen3_model,
+                                &reload_qwen_asr_url,
+                                &reload_qwen_asr_model,
                             ) {
                                 Ok(new_t) => {
                                     log::info!(
@@ -2409,6 +2434,163 @@ fn spawn_worker_thread(
                     }
 
                     log::info!("[Latency] worker received Start command");
+
+                    // ASR-038-B: QwenAudioOnline 走真流式管线（边录边发边收边上屏）
+                    // 其他模式走现有 record() + run_pipeline_core（零行为变更）
+                    let desired_asr_model_check =
+                        transcription::AsrModel::from_config(&config.audio.asr_model);
+                    let is_streaming_asr = desired_asr_model_check
+                        == transcription::AsrModel::QwenAudioOnline
+                        && transcriber.as_ref().is_some_and(|t| {
+                            t.asr_model() == transcription::AsrModel::QwenAudioOnline
+                        });
+
+                    if is_streaming_asr {
+                        let transcriber_ref = transcriber.as_ref().expect("checked above");
+                        let qwen_asr_url = transcriber_ref.qwen_asr_url().to_string();
+                        let qwen_asr_model = transcriber_ref.qwen_asr_model().to_string();
+                        let qwen_api_key = config.audio.qwen3_api_key.clone();
+                        let model_dir_clone = model_dir.clone();
+                        let cancel_clone = Arc::clone(&cancel_signal);
+                        let event_tx_clone = event_tx.clone();
+
+                        // chunk channel：record_streaming 推 chunk，ASR 线程读
+                        let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<Vec<f32>>(256);
+
+                        // spawn ASR 线程跑 transcribe_streaming_realtime
+                        let asr_handle: std::thread::JoinHandle<Result<String>> =
+                            std::thread::spawn(move || {
+                                let vocabulary = crate::transcription::load_wordbook_vocabulary();
+                                crate::transcription::qwen_inference::transcribe_streaming_realtime(
+                                    &qwen_asr_url,
+                                    &qwen_api_key,
+                                    &qwen_asr_model,
+                                    chunk_rx,
+                                    &vocabulary,
+                                    &model_dir_clone,
+                                    Some(&cancel_clone),
+                                    |display_text| {
+                                        let _ = event_tx_clone.send(PipelineEvent::StreamingText(
+                                            display_text.to_string(),
+                                        ));
+                                    },
+                                )
+                            });
+
+                        // worker 线程跑 record_streaming，推 chunk 给 ASR 线程
+                        let record_result = audio_capture.record_streaming(
+                            Arc::clone(&stop_recording_signal),
+                            config.audio.silence_threshold,
+                            config::SILENCE_DURATION_MS,
+                            config::MAX_RECORD_SECONDS,
+                            Some(Arc::clone(&audio_buf)),
+                            device_name,
+                            |chunk| {
+                                let _ = chunk_tx.send(chunk.to_vec());
+                            },
+                        );
+                        // drop chunk_tx 让 ASR 线程的 channel 断开（触发 finish-task）
+                        drop(chunk_tx);
+
+                        log::info!(
+                            "[Latency] record_streaming() completed after +{:.1}ms",
+                            t_worker.elapsed().as_secs_f64() * 1000.0
+                        );
+                        is_recording.store(false, Ordering::Release);
+
+                        if cancel_signal.load(Ordering::Acquire) {
+                            log::warn!(
+                                "Streaming recording ended with cancel_signal=true, skipping ASR join"
+                            );
+                            send_event(&event_tx, PipelineEvent::Cancelled);
+                            continue;
+                        }
+
+                        if let Err(e) = record_result {
+                            log::error!("Streaming recording error: {}", e);
+                            send_event(&event_tx, PipelineEvent::Error(e.to_string()));
+                            // ASR 线程会因 channel 断开自行退出
+                            continue;
+                        }
+
+                        // join ASR 线程拿最终文本
+                        let asr_result = match asr_handle.join() {
+                            Ok(r) => r,
+                            Err(_) => {
+                                log::error!("ASR thread panicked");
+                                send_event(
+                                    &event_tx,
+                                    PipelineEvent::Error("ASR thread panicked".into()),
+                                );
+                                continue;
+                            }
+                        };
+                        let streaming_text = match asr_result {
+                            Ok(text) => text,
+                            Err(e) => {
+                                log::error!("Streaming ASR error: {}", e);
+                                send_event(&event_tx, PipelineEvent::Error(e.to_string()));
+                                continue;
+                            }
+                        };
+
+                        // 流式文本走 LLM 后半段（跳过转录）
+                        let transcriber = match &transcriber {
+                            Some(t) => t,
+                            None => {
+                                log::error!("Transcriber not initialized");
+                                send_event(
+                                    &event_tx,
+                                    PipelineEvent::Error("Transcriber unavailable".into()),
+                                );
+                                continue;
+                            }
+                        };
+                        llm_client.update_config(config.llm.clone());
+
+                        let needs_reload = match &cached_translation {
+                            Some((lang, _)) => {
+                                !config.translation.enabled
+                                    || *lang != config.translation.target_language
+                            }
+                            None => config.translation.enabled,
+                        };
+                        if needs_reload {
+                            cached_translation = if config.translation.enabled {
+                                translation::TranslationEngine::load_for_direction(
+                                    &model_dir,
+                                    config.translation.target_language,
+                                )
+                                .map(|engine| (config.translation.target_language, engine))
+                            } else {
+                                None
+                            };
+                        }
+                        if config.punctuation.enabled && cached_punctuation.is_none() {
+                            cached_punctuation = punctuation::PunctuationEngine::new(&model_dir);
+                        } else if !config.punctuation.enabled {
+                            cached_punctuation = None;
+                        }
+
+                        run_pipeline_core(
+                            Ok(Vec::new()), // 流式模式不用 samples
+                            transcriber,
+                            &rt,
+                            &llm_client,
+                            &cancel_signal,
+                            &config,
+                            &runtime_config,
+                            &mut cached_translation,
+                            &model_dir,
+                            cached_punctuation.as_mut(),
+                            start.target_hwnd,
+                            &event_tx,
+                            start.translate,
+                            Some(streaming_text), // 流式文本，跳过转录
+                        );
+                        continue;
+                    }
+
                     let samples_result = audio_capture.record(
                         Arc::clone(&stop_recording_signal),
                         config.audio.silence_threshold,
@@ -2486,6 +2668,7 @@ fn spawn_worker_thread(
                         start.target_hwnd,
                         &event_tx,
                         start.translate,
+                        None,
                     );
                 }
             }
@@ -3244,8 +3427,17 @@ fn select_preprocessing_params(asr_model: transcription::AsrModel) -> (usize, us
             (PERF_SILENCE_HEAD_SAMPLES, PERF_ONSET_BACKTRACK_SAMPLES)
         }
         transcription::AsrModel::Qwen3Online | transcription::AsrModel::QwenAudioOnline => {
-            // DEC-028 / RESEARCH-ASR-038: 在线 ASR 模型承袭 Qwen3Online 既有先例
+            // DEC-028 / RESEARCH-ASR-038 / ASR-038-B: 在线 ASR 模型承袭 Qwen3Online 既有先例
             // （在线模型对前导静音不敏感，保持与 CTC 一致的前处理行为）
+            //
+            // ASR-038-B 真流式拍板后更新：
+            // silence_head / onset_backtrack 是批处理前处理概念，在 run_pipeline_core
+            // 用于 trim/pad 完整 samples 数组后送转录。真流式路径（QwenAudioOnline
+            // 走 record_streaming + transcribe_streaming_realtime）【绕过】本前处理，
+            // 原因是边录边发无完整 samples 可 trim。真流式的前导静音由 VAD 入口门控
+            // 处理（VAD 命中前的 chunk 缓冲后补发，不裁剪），详见 transcribe_streaming_realtime。
+            // 本 match 分支仅对非流式回退路径（transcribe_with_punct_info 内的
+            // QwenAudioOnline 分支）生效，真流式主路径不走这里。
             (PERF_SILENCE_HEAD_SAMPLES, PERF_ONSET_BACKTRACK_SAMPLES)
         }
     }
@@ -3269,6 +3461,9 @@ fn run_pipeline_core(
     target_hwnd: platform::WindowId,
     event_tx: &crossbeam_channel::Sender<PipelineEvent>,
     translate: Arc<AtomicBool>,
+    // ASR-038-B: 流式模式传入已转录文本，跳过转录步骤直接走 LLM 后半段。
+    // None = 正常模式（run_pipeline_core 内部转录）；Some(text) = 流式模式（跳过转录）
+    initial_text: Option<String>,
 ) {
     match samples_result {
         Err(e) => {
@@ -3285,62 +3480,68 @@ fn run_pipeline_core(
                 send_event(event_tx, PipelineEvent::Cancelled);
                 return;
             }
-            // FIRSTCHAR-FIX-006 (R3): Regulate leading silence before transcription.
-            // Old: prepend fixed 3200-sample (200ms) silence head. With ~600ms
-            // pre_roll silence already in samples, total leading silence could
-            // reach ~800ms, drowning weak aspirated consonants like /pʰ/.
-            //
-            // New approach:
-            // 1. Find speech onset in the 16kHz samples (energy gate)
-            // 2. Backtrack from onset as the keep-start — guarantees
-            //    aspirated consonant (~60–100ms) is fully preserved
-            // 3. Trim silence before keep-start
-            // 4. Prepend silence head (see select_preprocessing_params: performance
-            //    0ms per ASR-CTC-OPT-001 P1, accuracy 0ms per ASR-ACC-OPT-001)
-            //
-            // Result: total leading silence minimized, no frame alignment padding
-            // needed (offline models don't require it).
-            //
-            // ASR-ACC-OPT-001 方案 B + ASR-CTC-OPT-001 P1: 前处理参数按模型分支。
-            // 研究依据（RESEARCH-ASR-ACCURACY-001 R1 + RESEARCH-ASR-CTC-OPT-001 C1）：
-            // native decoder 对前导静音极度敏感（50ms 掉 10pp），CTC 也敏感但弱
-            // （50ms 掉 2.5pp）。两模型均用 0ms head（offline 不需 frame alignment
-            // padding，原 50ms 是旧 SenseVoice 遗产）。accuracy 模式：silence head
-            // 0ms + onset backtrack 200→100ms（native 对送气声母不如 CTC 敏感，
-            // 少留前导静音更安全）。
-            // performance 模式：保持 50ms/200ms 不变（为 CTC 调优，零改动红线）。
-            const SPEECH_ENERGY_THRESHOLD: f32 = 0.008; // lower than VAD threshold to catch weak consonants
+            // ASR-038-B: 流式模式跳过转录步骤，直接用 transcribe_streaming_realtime
+            // 返回的文本走 LLM 后半段（ITN→LLM→注入）。转录已在 ASR 线程完成。
+            // initial_text = Some → 流式；None → 正常转录
+            let transcription_result: Result<(String, bool), String> = if let Some(text) =
+                initial_text
+            {
+                if text.trim().is_empty() {
+                    Err("streaming transcription empty".to_string())
+                } else {
+                    let native_punctuated = punctuation::has_effective_punctuation(&text);
+                    Ok((text, native_punctuated))
+                }
+            } else {
+                // 正常转录路径（FIRSTCHAR-FIX-006 前处理 + transcribe_with_punct_info）
+                const SPEECH_ENERGY_THRESHOLD: f32 = 0.008;
+                let (silence_head_samples, onset_backtrack_samples) =
+                    select_preprocessing_params(transcriber.asr_model());
+                let keep_start = find_speech_onset_with_backtrack(
+                    &samples,
+                    SPEECH_ENERGY_THRESHOLD,
+                    onset_backtrack_samples,
+                );
+                let trimmed = &samples[keep_start..];
+                let mut padded = Vec::with_capacity(silence_head_samples + trimmed.len());
+                padded.resize(silence_head_samples, 0.0f32);
+                padded.extend_from_slice(trimmed);
+                log::info!(
+                    "Transcribing {} samples (silence_head={}ms, trimmed leading silence by {} samples / {:.0}ms, asr_model={})",
+                    padded.len(),
+                    silence_head_samples as f64 / 16.0,
+                    keep_start,
+                    keep_start as f64 / 16.0,
+                    if transcriber.asr_model() == transcription::AsrModel::Accuracy { "accuracy" } else { "performance" },
+                );
+                let transcribing_msg = i18n::get(config.ui_language).overlay_transcribing;
+                send_event(
+                    event_tx,
+                    PipelineEvent::Processing(transcribing_msg.to_string()),
+                );
+                transcriber
+                    .transcribe_with_punct_info(&padded, config.audio.chinese_script)
+                    .map_err(|e| e.to_string())
+            };
 
-            let is_accuracy = transcriber.asr_model() == transcription::AsrModel::Accuracy;
-            let (silence_head_samples, onset_backtrack_samples) =
-                select_preprocessing_params(transcriber.asr_model());
-
-            let keep_start = find_speech_onset_with_backtrack(
-                &samples,
-                SPEECH_ENERGY_THRESHOLD,
-                onset_backtrack_samples,
-            );
-            let trimmed = &samples[keep_start..];
-            let mut padded = Vec::with_capacity(silence_head_samples + trimmed.len());
-            padded.resize(silence_head_samples, 0.0f32);
-            padded.extend_from_slice(trimmed);
-            log::info!(
-                "Transcribing {} samples (silence_head={}ms, trimmed leading silence by {} samples / {:.0}ms, asr_model={})",
-                padded.len(),
-                silence_head_samples as f64 / 16.0,
-                keep_start,
-                keep_start as f64 / 16.0,
-                if is_accuracy { "accuracy" } else { "performance" },
-            );
-            let transcribing_msg = i18n::get(config.ui_language).overlay_transcribing;
-            send_event(
-                event_tx,
-                PipelineEvent::Processing(transcribing_msg.to_string()),
-            );
-            match transcriber.transcribe_with_punct_info(&padded, config.audio.chinese_script) {
+            match transcription_result {
                 Err(e) => {
-                    log::error!("Transcription error: {}", e);
-                    send_event(event_tx, PipelineEvent::Error(e.to_string()));
+                    if e == "streaming transcription empty" {
+                        log::warn!(
+                            "Streaming transcription result is empty, skipping LLM and injection"
+                        );
+                        send_event(
+                            event_tx,
+                            PipelineEvent::Error(
+                                i18n::get(config.ui_language)
+                                    .error_transcription_empty
+                                    .to_string(),
+                            ),
+                        );
+                    } else {
+                        log::error!("Transcription error: {}", e);
+                        send_event(event_tx, PipelineEvent::Error(e));
+                    }
                 }
                 Ok((raw_text, native_punctuated)) => {
                     if cancel_signal.load(Ordering::Relaxed) {

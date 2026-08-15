@@ -404,7 +404,7 @@
 
 ---
 
-## 🔄 v0.8.0 · 在线 ASR 引擎更替 + 流式上屏（2026-08-14 起，**进行中，当前不可编译**）
+## 🔄 v0.8.0 · 在线 ASR 引擎更替 + 流式上屏（2026-08-14 起，**进行中**）
 
 > **版本号 0.7.3 → 0.8.0**（Gavin 2026-08-14 明确指示「升级版本号」+「版本号就按照你的建议来」）。
 > 定为 minor bump 的理由：替换核心在线 ASR 引擎（协议族更换）+ 流式管线 + VAD 计费门控
@@ -433,8 +433,9 @@ PTT 录音中点击即进编辑态（不等松键）｜流式文本白色不加�
 
 | 批次 | 内容 | 文件域 | 负责人 | 状态 |
 | --- | --- | --- | --- | --- |
+| **TRANS-HOTKEY-039** | 翻译热键全链失效修复（VK_TO_LABEL Shift 标签修正 + 轮询跟随录音生命周期 + 硬上限兜底 + flag 日志 + 6 处终止路径通知） | `ui/src/pages/HotkeySettings.tsx`、`src/platform/windows/hotkey.rs`、跨 `src/main.rs` 6 处调用 | coder-2 | ✅ 已验证 |
 | **ASR-038-A** | `qwen_inference.rs` 新建（流式协议 + 二进制帧 + 热词 + 四语） | `src/transcription/` 新文件 | coder-1 | ✅ **主控独立复现验收通过** |
-| **ASR-038-B** | VAD 入口门控 + 管线改造（边录边发 + 增量接收） | `src/audio/`、`src/main.rs`、`src/transcription/`、`src/ui/overlay.rs`（仅数据字段） | coder-1 | 🔴 **进行中，断点：1 个编译 error** |
+| **ASR-038-B** | VAD 入口门控 + 管线改造（边录边发 + 增量接收） | `src/audio/`、`src/main.rs`、`src/transcription/`、`src/ui/overlay.rs`（仅数据字段） | coder-1 | 🟡 **真流式核心已实施**（C-1 VadSegmenter滚动方法 + C-2 record_streaming + C-3 transcribe_streaming_realtime + C-4 worker接线 + 040-A埋点）。编译已通 / 949+32测试全绿。待主控终验（重点验FIRSTCHAR等价+record零改动+040-A四段覆盖） |
 | ASR-038-C | overlay 流式显示 + 编辑态 + EDIT 控件 | `src/main.rs`、`src/ui/overlay.rs`（绘制与交互） | coder-2 | 🔜 等 B（**同动 `src/main.rs`，零并行空间**） |
 | TEST-SYNC-038 | 测试同步（阶段三） | 各 `mod tests` | tester-1 | 🔜 等 B 验收 |
 | TEST-EXEC-038 | 全量回归（阶段四） | — | tester-1 | 🔜 |
