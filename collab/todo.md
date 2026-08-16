@@ -10,10 +10,25 @@
 | **ASR-042** | 在线流式 ASR 采样率修复（48000→16000 带状态流式重采样器） | `src/audio/mod.rs` | coder-1 | ✅ **已验收已提交 `34906a1`**（StreamingResampler + record_streaming 接线 + 6 测试 + 改坏会红自证） |
 | TEST-SYNC-042 | 阶段三测试同步（补 4 条流式重采样缺口用例） | `src/audio/mod.rs` `mod tests` | tester-1 | ✅ **已提交 `427cd50`** |
 | **ASR-045** | 流式识别结果被管线丢弃（文字从未上屏，P0） | `src/main.rs` | coder-1 | ✅ **已验收已提交 `54cde62`**（`should_cancel_on_empty` 纯函数 + 判空臂改调 + 3 条护栏测试） |
-| TEST-SYNC-045 | 阶段三测试同步（ASR-045 除 coder-1 自带 3 条护栏外的缺口） | `src/main.rs` `mod tests` | tester-1 | 🔜 **待派发**（阶段三） |
-| TEST-EXEC-042/045 | 阶段四全量回归（本批从未跑过全量） | — | tester-1 | 🔜 待 TEST-SYNC-045 完成后串行 |
+| TEST-SYNC-045 | 阶段三测试同步（ASR-045 缺口 3 条，`src/main.rs` +46 仅测试模块） | `src/main.rs` `mod streaming_empty_samples_tests` | tester-1 | ✅ **已验收**（主控逐行 Read diff + 独立复算 `cargo fmt --check` clean / `cargo check --all-targets` 0 error）。真值表第 4 格（如实标弱护栏）+ 空串/纯空白两层分层契约 ×2（核心）+ 调用侧不可测诚实判定 |
+| TEST-EXEC-042/045 | 阶段四全量回归（本批从未跑过全量）+ 消融自证补做（阶段三禁 test 未能做） | — | tester-1 | 🟡 **待派发**（阶段四） |
 | BUILD-017 | 阶段五出包（ASR-042/045 进 exe，Gavin 端测目视确认） | — | tester-1 | 🔜 **须 Gavin 明确下达「现在可以出包」** |
 | **OVERLAY-043** | 录音窗口四项显示错乱 | `src/main.rs` | coder-2 | 🔜 **等 BUILD-017 + Gavin 目视确认识别输出正常后再派发**（Note：coder-1 已在 `:4282-4320`、`:5982` 改过 main.rs，其改动区 `:908-940`、`:1780` 起无重叠） |
+
+### 🟡 待排期 · TEST-045-REFACTOR 抽 `decide_pipeline_entry` 纯函数（tester-1 建议，主控采纳但延后）
+
+**问题**：ASR-045 全批 6 条测试（coder-1 3 + tester-1 3）**全是纯函数级，保护不了调用侧**。
+若有人把 `main.rs:4318` 的 guard 改回 `Ok(s) if s.is_empty()`，P0（流式文字从未上屏）立刻复发，
+**6 条测试依然全绿**。这是本批已知且已如实记录的护栏缺口，不是遗漏。
+
+**建议方案**（tester-1 提出，主控核后认可）：把 `run_pipeline_core` 入口三臂判据抽成
+`decide_pipeline_entry(&samples_result, &initial_text) -> EntryDecision`
+（`CancelNoInput` / `Err` 透传 / `Proceed`），让「空+文本 / 空+无文本 / 非空+无文本 / Err」四种入口组合可测。
+
+**主控裁决：采纳，但排到 OVERLAY-043 之后。** 理由：① 这是可测性改进不是 bug，不该插队 P0；
+② OVERLAY-043 马上要动 `main.rs`，两个改动叠一起会让回归归因变难。
+🔴 **实施时的红线**：不得合并 `:4334` 第二层的 `text.trim().is_empty()` 分支 ——
+分层是刻意设计，合并即复现「空文本静默消失」的 P0 类回归。
 
 ### ASR-045 根因（一句话）
 

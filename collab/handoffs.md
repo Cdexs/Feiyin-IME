@@ -2,6 +2,19 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-08-16 — tester-1 — TEST-SYNC-045 ✅ 阶段三测试同步：ASR-045 流式判空取消（src/main.rs +46，待主控验收）
+
+- **来源**：主控派单（基线 `05eb5f0`，代码基线 `54cde62` ASR-045 已提交）。前置：ASR-045 P0 修复（流式文字从未上屏）
+- **改动**：仅 `src/main.rs` `mod streaming_empty_samples_tests`（+46 行，生产零改动）
+  - ① `nonempty_samples_with_text_truth_table_cell`：真值表第 4 格（非空+Some），如实标注弱护栏
+  - ② ③ `empty_string_text_not_cancelled_at_first_layer` / `whitespace_only_text_not_cancelled_at_first_layer`：🔴 本单核心，钉死两层职责划分（`:4288` 只管「有没有东西」「:4334` `trim().is_empty()` 管「文本是否有效」→ 空/纯空白用户可见 Error 提示 2000ms，非静默消失）
+- **调用侧不可测**：`:4318` 判空臂需 6 种资源无法单测；全部 6 条纯函数测试保护不了调用侧，guard 改回 `s.is_empty()` P0 即复发；禁闭包伪造护栏；抽 `decide_pipeline_entry`/`EntryDecision` 纯函数建议交主控排期（未动生产代码）
+- **验收**：`cargo fmt -- --check` clean / `cargo check --all-targets` 0 error（97 既有 warning）/ `git diff --stat` 仅 src/main.rs +46 / 阶段三白名单只跑 fmt+check / 消融自证顺延阶段四
+- **边界**：未碰 `src/audio/mod.rs`；未 commit（主控统一提交）；版本号未动（0.8.0）
+- **详情**：outbox/tester-1/result.md + logs/20260816.md + CHANGELOG.md
+
+---
+
 ## 2026-08-16 — coder-1 — ASR-045 ✅ 流式识别结果被管线丢弃修复（P0，src/main.rs +44，待主控验收）
 
 - **来源**：主控定位（P0，功能 100% 不可用）：在线流式 ASR 悬浮层实时出字 → 松开热键 → 文字从未上屏。基线 HEAD `427cd50`

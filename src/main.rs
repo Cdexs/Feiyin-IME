@@ -6012,6 +6012,52 @@ mod streaming_empty_samples_tests {
             "有音频样本的正常转录不得触发空输入取消"
         );
     }
+
+    /// ASR-045 真值表第 4 格：非空 samples + Some 文本 → 不取消。
+    ///
+    /// ⚠️ 诚实标注：本格判别力弱于前三条——多数错误变体（如把条件还原成只看
+    /// `samples.is_empty()`）会先被前三条用例抓住。它的价值只在两点：
+    /// ① 真值表完备性（2×2 全格）；② 防止未来被改成含 `initial_text.is_some()`
+    /// 这类错误形态（对条件做镜像翻转/取反时误把「文本存在」写成「文本缺失」）。
+    /// 不是强护栏，不要据此宣称调用侧已被保护。
+    #[test]
+    fn nonempty_samples_with_text_truth_table_cell() {
+        assert!(
+            !should_cancel_on_empty(&[0.01f32, -0.01], &Some("文本".to_string())),
+            "非空样本 + 有流式文本不得触发空输入取消"
+        );
+    }
+
+    /// ASR-045 两层职责划分护栏：空/纯空白流式文本**不在第一层**取消。
+    ///
+    /// 职责划分（修复后行为契约，:4288 与 :4334 两层各司其职）：
+    /// - 第一层 `should_cancel_on_empty`（:4288）：只管「有没有东西可处理」——
+    ///   空 samples 且无文本才取消；只要有流式文本（**哪怕内容是空串或纯空白**），
+    ///   一律落 `Ok(samples)` 走后半段，不在此层取消。
+    /// - 第二层 `run_pipeline_core`（:4334 `text.trim().is_empty()`）：管「文本内容
+    ///   是否有效」——空/纯空白文本在此产出 `Err("streaming transcription empty")`
+    ///   → `PipelineEvent::Error(error_transcription_empty)` → overlay 弹
+    ///   「识别结果为空。」提示 2000ms（**用户可见的失败反馈**，不是静默消失）。
+    ///
+    /// 🔴 为什么必须钉死这条：若未来有人在 `should_cancel_on_empty` 里加
+    /// `trim().is_empty()` 判断（看似「合并同类项」的优化），会把「空文本时的错误提示」
+    /// 又变回「静默取消」，P0 类回归复发，且前三条用例**全部不会红**。
+    /// 本条用例 + 这段注释是钉死该分层的唯一手段。
+    #[test]
+    fn empty_string_text_not_cancelled_at_first_layer() {
+        assert!(
+            !should_cancel_on_empty(&[], &Some(String::new())),
+            "空字符串流式文本属第二层 Error 分支，不得在第一层静默取消"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_text_not_cancelled_at_first_layer() {
+        assert!(
+            !should_cancel_on_empty(&[], &Some("   \t\n".to_string())),
+            "纯空白流式文本属第二层 Error 分支，不得在第一层静默取消"
+        );
+    }
 }
 
 /// OVERLAY-WIRE-002：PipelineEvent → overlay 指令七分支真值表（macOS）。
