@@ -12,7 +12,7 @@
 | **ASR-045** | 流式识别结果被管线丢弃（文字从未上屏，P0） | `src/main.rs` | coder-1 | ✅ **已验收已提交 `54cde62`**（`should_cancel_on_empty` 纯函数 + 判空臂改调 + 3 条护栏测试） |
 | TEST-SYNC-045 | 阶段三测试同步（ASR-045 缺口 3 条，`src/main.rs` +46 仅测试模块） | `src/main.rs` `mod streaming_empty_samples_tests` | tester-1 | ✅ **已验收**（主控逐行 Read diff + 独立复算 `cargo fmt --check` clean / `cargo check --all-targets` 0 error）。真值表第 4 格（如实标弱护栏）+ 空串/纯空白两层分层契约 ×2（核心）+ 调用侧不可测诚实判定 |
 | TEST-EXEC-042/045 | 阶段四全量回归 + 消融 A/B 自证 | — | tester-1 | ✅ **已验收已提交 `2a173f0`**。1030/0/11（941→957 恰 +16，零残差）+ Vitest 54 + src-tauri 55；pytest 按书 SKIP（Publish/ 为 BUILD-016 旧包）；③ 类真回归 = 0 |
-| BUILD-017 | 阶段五出包（ASR-042/045 进 exe，Gavin 端测目视确认） | — | tester-1 | 🔴 **闸门已全开，只等 Gavin 下令「现在可以出包」** |
+| BUILD-017 | 阶段五出包（ASR-042/045 进 exe） | — | tester-1 | ✅ **已验收**（主控独立复算全部七项）。产物 08-16 23:25，`feiyin-ime.exe` 12,112,384B（+5,632）/ ui 10,026,496B 不变 / crash 24,859,648B 不变；两副本 sha256 全等；toml 三副本全等；ProductVersion 0.8.0.0/0.8.0/0.8.0.0。⏭ **待 Gavin 端测** |
 | **OVERLAY-043** | 录音窗口四项显示错乱 | `src/main.rs` | coder-2 | 🔜 **等 BUILD-017 + Gavin 目视确认识别输出正常后再派发**（Note：coder-1 已在 `:4282-4320`、`:5982` 改过 main.rs，其改动区 `:908-940`、`:1780` 起无重叠） |
 
 ### 🟡 待排期 · TEST-045-REFACTOR 抽 `decide_pipeline_entry` 纯函数（tester-1 建议，主控采纳但延后）

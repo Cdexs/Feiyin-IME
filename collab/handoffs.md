@@ -71,3 +71,13 @@
 - **验收**：无需 fmt/check（本单纯回归执行 + 临时消融已还原）；版本号 0.8.0 未动；未 commit（主控统一提交）；未出包（BUILD-017 须 Gavin 明确下令）
 - **结论**：v0.8.0 全量回归闸门通过，无阻塞项，可进入阶段五 BUILD-017
 - **详情**：outbox/tester-1/result.md + logs/20260816.md + CHANGELOG.md
+
+## 2026-08-16 — tester-1 — BUILD-017 ✅ v0.8.0 第二包出包（ASR-042 + ASR-045 进 exe，生产零改动）
+
+- **来源**：Gavin 已下令出包（并确立新规则：测试验收通过后主控直接派发出包，不再逐次请示）。基线 HEAD `3c075e8`
+- **构建**：四步全执行。Step1 杀进程（无 `feiyin-ime` 主进程运行）→ Step2 npm build（`index-DkzLqu_f.js` 与 BUILD-016 同名=零前端改动）+ Tauri UI release 1m45s（cp 至 target/release/）→ Step3 主程序 2m04s → Step4 同步 Publish/（三 exe + scene/itn 两 toml；Gavin 运行时数据 config.toml 等四文件未覆盖，mtime 全为历史时间）
+- **七项核验全 PASS**（详见 outbox/tester-1/result.md）：① 六 exe 时间戳 23:23-23:25；② 三 exe 两副本 sha256 相等（feiyin `7562b943…` / ui `62ae24df…` / crash `84fdfddd…`）；③ toml 三副本 hash 全等；④ ProductVersion 0.8.0；⑤ 正向探针 `Streaming resampler active`=1 → **ASR-042 进包**；**ASR-045 如实报「探不到」**（无新字符串+可能内联），用间接证据（mtime>54cde62 + 源码 ×12 引用）证明，未编探针；⑥ 大小对照：feiyin +5,632 B（略增吻合代码量）、ui/crash 完全不变；⑦ 冒烟 PID 23956 Responding=True 无 panic 已清理
+- **⚠️ 杀进程实测**：Step1 时无 `feiyin-ime` 主进程运行（无 PID 被杀）；但发现并清杀**名单外遗留 `feiyin-ime-nor` PID 23232**（8-9 旧构建，持单实例 mutex，冒烟首次启动被挡）。若 Gavin 在用输入法需重新启动
+- **验收**：生产代码零改动（`git diff src/ src-tauri/ ui/`=0）；版本号 0.8.0 未动；未 commit（主控统一提交）
+- **Gavin 端测四项**（须 `-debug`，ASR-PERF-040-B/C 唯一数据源）：新端点连通性 / `usage.duration` 计费口径 / 040-A 四段连接耗时 / VAD 门控实际行为
+- **详情**：outbox/tester-1/result.md + logs/20260816.md + CHANGELOG.md
