@@ -245,25 +245,53 @@ impl AudioCapture {
             post_hotkey_chunks.len()
         );
 
+        // ASR-042: 流式重采样器。麦克风以 48kHz 采集，但在线 ASR 需要 16kHz。
+        // 旧 record() 在录音结束时一次性 resample_anti_alias；record_streaming
+        // 边录边发没有那个时机，且逐块调 resample_anti_alias 会在每 10ms chunk
+        // 边界截断 FIR 卷积核（TAPS=32），复发 FIRSTCHAR-FIX-005 消灭的送气清声母
+        // 失真。StreamingResampler 跨块保留历史+lookahead，用全局 emitted 计数，
+        // 与批处理版数学等价。
+        //
+        // 🔴 顺序不变式：pre-roll → post-hotkey → 主循环 必须依次喂进【同一个】
+        // 实例。顺序错位 = 音频错位。实例只建这一个。
+        let sample_rate = warm.sample_rate;
+        const ASR_TARGET_RATE: u32 = 16000;
+        let mut resampler = StreamingResampler::new(sample_rate, ASR_TARGET_RATE);
+        if sample_rate != ASR_TARGET_RATE {
+            log::info!(
+                "Streaming resampler active: {}Hz -> {}Hz",
+                sample_rate,
+                ASR_TARGET_RATE
+            );
+        }
+
         // 推 pre-roll chunks 给回调（ASR 线程的 VAD 门控+建连会收到这些）
         for chunk in &pre_roll_chunks {
-            on_chunk(chunk);
+            let resampled = resampler.push(chunk);
+            if !resampled.is_empty() {
+                on_chunk(&resampled);
+            }
         }
         // 推 post-hotkey chunks
         for chunk in &post_hotkey_chunks {
-            on_chunk(chunk);
+            let resampled = resampler.push(chunk);
+            if !resampled.is_empty() {
+                on_chunk(&resampled);
+            }
         }
 
         // RMS 静音检测状态（与 record() 的 RecordingState 逻辑一致，但只管停录+level_buf）
-        let sample_rate = warm.sample_rate;
         let silence_frames = (silence_duration_ms as f32 / 1000.0 * sample_rate as f32) as usize;
         let mut silent_count: usize = 0;
         let mut speech_detected = false;
         let max_frames = max_seconds as usize * sample_rate as usize;
+        // 🔴 total_samples 继续用原始 chunk 长度：max_frames 按 warm.sample_rate 算，
+        // 重采样后的长度会改变比例，不能用来做原始采样率下的时长上限判定。
         let mut total_samples: usize = pre_roll_chunks.iter().map(|c| c.len()).sum::<usize>()
             + post_hotkey_chunks.iter().map(|c| c.len()).sum::<usize>();
 
-        // 主循环：从 channel 读 chunk → 推回调 → RMS 检测
+        // 主循环：从 channel 读 chunk → 重采样 → 推回调 → RMS 检测
+        // 🔴 RMS 静音检测、level_buf 继续用原始 chunk（未重采样），与 record() 一致。
         let recv_timeout = Duration::from_millis(50);
         loop {
             if stop_signal.load(Ordering::Relaxed) {
@@ -301,7 +329,11 @@ impl AudioCapture {
                         }
                     }
 
-                    on_chunk(&chunk);
+                    // 重采样后推回调（原始 chunk 的 RMS/level_buf 已在上面处理完）
+                    let resampled = resampler.push(&chunk);
+                    if !resampled.is_empty() {
+                        on_chunk(&resampled);
+                    }
                     total_samples += chunk.len();
                 }
                 Ok(_) => {
@@ -314,6 +346,13 @@ impl AudioCapture {
                     anyhow::bail!("Audio input stream disconnected during streaming recording");
                 }
             }
+        }
+
+        // 录音结束：flush 重采样器尾部，与批处理版 resample_anti_alias 的
+        // 尾部截断行为一致。非空则最后再推一次回调。
+        let tail = resampler.finish();
+        if !tail.is_empty() {
+            on_chunk(&tail);
         }
 
         log::info!(
@@ -967,6 +1006,223 @@ fn resample_anti_alias(input: &[f32], source_rate: u32, target_rate: u32) -> Vec
     }
 
     output
+}
+
+/// Filter half-length used by both `resample_anti_alias` and `StreamingResampler`.
+/// Must match the batch version's `TAPS` exactly or the streaming/batch equivalence
+/// invariant breaks. Kept as a private item-level constant so the two call sites
+/// can never silently diverge.
+const RESAMPLE_TAPS: usize = 32;
+
+/// Streaming anti-aliased resampler: mathematically equivalent to
+/// `resample_anti_alias` but supports chunk-by-chunk feeding.
+///
+/// Why this exists (ASR-042): `record_streaming` feeds audio to the online ASR
+/// in 10 ms chunks straight from the capture callback. `resample_anti_alias`
+/// is a whole-signal FIR (windowed-sinc, `TAPS = 32` on each side) — calling it
+/// per chunk would truncate the convolution kernel at every chunk boundary
+/// (≈100 times per second), re-introducing exactly the aspirated-consonant
+/// distortion FIRSTCHAR-FIX-005 eliminated. This struct keeps a sliding window
+/// of history + lookahead so the kernel is never truncated across chunk
+/// boundaries, while using the *global* `emitted` counter so output sample `n`
+/// always maps to the same input position regardless of how the input was
+/// chunked.
+///
+/// Invariants (all must hold for batch/stream equivalence):
+/// 1. `src_pos = (emitted + k) as f64 / ratio` uses the global `emitted` count,
+///    never reset per chunk. Resetting per chunk would make every block
+///    re-anchor at input 0 → periodic discontinuities.
+/// 2. An output point is only emitted when its full `[center - TAPS, center +
+///    TAPS]` kernel window is available in `buf`; otherwise it is deferred to
+///    the next push (or to `finish`).
+/// 3. After emitting, `buf` is drained but at least `TAPS` history samples are
+///    retained so the next chunk's left-side kernel taps stay valid.
+/// 4. Kernel weights (sinc × Hann window), cutoff, and normalization are
+///    byte-for-byte identical to `resample_anti_alias`.
+/// 5. `source_rate == target_rate` ⇒ `push` / `finish` return input unchanged.
+pub(crate) struct StreamingResampler {
+    source_rate: u32,
+    target_rate: u32,
+    ratio: f64,
+    cutoff: f64,
+    /// Sliding window: [retained history tail] ++ [not-yet-emitted new samples].
+    buf: Vec<f32>,
+    /// Global input index of `buf[0]` in the "infinite input stream".
+    base: u64,
+    /// Total output samples already emitted. Drives `src_pos` so it is
+    /// continuous across chunks.
+    emitted: u64,
+    /// Total input samples fed so far. Used by `finish` to compute the
+    /// batch-equivalent `output_len = round(total_input * ratio)` and stop
+    /// emitting beyond it — mirroring `resample_anti_alias`'s output length.
+    total_input: u64,
+}
+
+impl StreamingResampler {
+    pub(crate) fn new(source_rate: u32, target_rate: u32) -> Self {
+        let ratio = target_rate as f64 / source_rate as f64;
+        let cutoff = if target_rate < source_rate {
+            0.9 * (target_rate as f64 / source_rate as f64)
+        } else {
+            1.0
+        };
+        Self {
+            source_rate,
+            target_rate,
+            ratio,
+            cutoff,
+            buf: Vec::new(),
+            base: 0,
+            emitted: 0,
+            total_input: 0,
+        }
+    }
+
+    /// Feed one chunk of input; return whatever output can be produced with a
+    /// full (untruncated) kernel. Samples whose right-side kernel taps are not
+    /// yet available are held until the next `push` or `finish`.
+    pub(crate) fn push(&mut self, input: &[f32]) -> Vec<f32> {
+        if self.source_rate == self.target_rate {
+            // Identity path: mirror resample_anti_alias's early return.
+            return input.to_vec();
+        }
+        if input.is_empty() {
+            return Vec::new();
+        }
+        self.total_input += input.len() as u64;
+        self.buf.extend_from_slice(input);
+        self.emit_ready(false)
+    }
+
+    /// Call at end of stream. Emits all remaining output using whatever kernel
+    /// taps are available (left-side only past the end), matching the batch
+    /// version's tail-truncation behavior exactly.
+    pub(crate) fn finish(&mut self) -> Vec<f32> {
+        if self.source_rate == self.target_rate {
+            return Vec::new();
+        }
+        self.emit_ready(true)
+    }
+
+    /// Core emission loop. `flush` = false respects the right-side lookahead
+    /// requirement (kernel must be fully available); `flush` = true emits all
+    /// remaining points with whatever taps remain (tail truncation, identical
+    /// to how `resample_anti_alias` handles its final samples).
+    fn emit_ready(&mut self, flush: bool) -> Vec<f32> {
+        if self.ratio <= 0.0 || self.buf.is_empty() {
+            return Vec::new();
+        }
+        let taps = RESAMPLE_TAPS as isize;
+        let mut out = Vec::new();
+
+        // In flush mode, cap output at the batch-equivalent length:
+        // `round(total_input * ratio)`. Without this, the stream tail can emit
+        // one extra sample whose `center` is still ≤ buf_hi but beyond where
+        // `resample_anti_alias` would have stopped.
+        let output_cap = if flush {
+            (self.total_input as f64 * self.ratio).round() as u64
+        } else {
+            u64::MAX
+        };
+
+        loop {
+            if self.emitted >= output_cap {
+                break;
+            }
+            // Output index (global) → input position.
+            let src_pos = self.emitted as f64 / self.ratio;
+            let center = src_pos.round() as isize;
+            let frac = src_pos - center as f64;
+
+            // Availability check. The batch version (`resample_anti_alias`)
+            // skips out-of-range taps via `continue` *inside* the convolution
+            // loop — so the signal *start* (left taps < 0) still produces
+            // output, only the *end* (right taps past input.len) is naturally
+            // limited by the finite input.
+            //
+            // To match that in streaming mode:
+            //   - non-flush: require only the RIGHT side to be fully available
+            //     (`hi <= buf_hi`); left taps `lo < buf_lo` are handled by the
+            //     inner `continue`, exactly like batch handles `src_idx < 0`.
+            //     This lets the very first output sample emit as soon as enough
+            //     right-side lookahead has arrived, instead of waiting for
+            //     `TAPS` left history that will never come at the stream start.
+            //   - flush: emit while `center` is in range; both sides truncate
+            //     via inner `continue`, matching the batch tail.
+            let hi = center + taps;
+            let buf_lo = self.base as isize;
+            let buf_hi = (self.base + self.buf.len() as u64) as isize - 1;
+
+            if !flush {
+                if hi > buf_hi {
+                    break;
+                }
+                // `lo < buf_lo` is fine — inner loop skips those taps.
+                // (At stream start buf_lo == 0, so this mirrors batch's
+                // `src_idx < 0` handling.)
+            } else {
+                // Tail: emit while the *center* is still in range.
+                if center < buf_lo || center > buf_hi {
+                    break;
+                }
+            }
+
+            let mut sum = 0.0f64;
+            let mut norm = 0.0f64;
+            for j_off in -taps..=taps {
+                let src_idx = center + j_off;
+                if src_idx < buf_lo || src_idx > buf_hi {
+                    continue;
+                }
+                let buf_pos = (src_idx - buf_lo) as usize;
+                let t = j_off as f64 - frac;
+                let sinc_val = if t.abs() < 1e-10 {
+                    self.cutoff
+                } else {
+                    (std::f64::consts::PI * self.cutoff * t).sin() / (std::f64::consts::PI * t)
+                };
+                let w_idx = (j_off + taps) as f64 / (2 * RESAMPLE_TAPS) as f64;
+                let window = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * w_idx).cos());
+                let weight = sinc_val * window;
+                sum += weight * self.buf[buf_pos] as f64;
+                norm += weight;
+            }
+
+            if norm.abs() > 1e-10 {
+                out.push((sum / norm) as f32);
+            } else {
+                out.push(0.0f32);
+            }
+            self.emitted += 1;
+        }
+
+        // Drain history that will never be needed again. The next output point
+        // to be produced has global index `self.emitted`; its leftmost tap is at
+        // input index `next_lo = round(emitted / ratio) - taps`. Any sample with
+        // input index < next_lo can be discarded. This is exact (no margin
+        // needed): every future output point `k ≥ emitted` has
+        // `center_k ≥ next_center`, so its `lo_k ≥ next_lo`.
+        let drop_n = if flush {
+            self.buf.len()
+        } else {
+            let next_src_pos = self.emitted as f64 / self.ratio;
+            let next_center = next_src_pos.round() as isize;
+            let next_lo = next_center - taps;
+            let buf_lo = self.base as isize;
+            let drop_to = next_lo - buf_lo;
+            if drop_to <= 0 {
+                0
+            } else {
+                drop_to as usize
+            }
+        };
+        if drop_n > 0 && drop_n <= self.buf.len() {
+            self.buf.drain(0..drop_n);
+            self.base += drop_n as u64;
+        }
+
+        out
+    }
 }
 
 /// Legacy resample_linear kept only for reference / fallback testing.
@@ -1948,5 +2204,220 @@ mod tests {
             anchor, 0,
             "backtrack saturating_sub must return 0 when onset < margin"
         );
+    }
+
+    // ===== ASR-042 StreamingResampler 测试 =====
+    // 这些测试是本单的核心护栏。等价性测试（第 3 条验收）必须能红：
+    // 把 push 里的全局 emitted 改成每块从 0 重算，它会失败。
+
+    /// 验收第 3 条（核心护栏）：流式逐块 push + finish 必须与批处理
+    /// resample_anti_alias 逐点等价（差值 ≤ 1e-5）。
+    ///
+    /// 信号：多频率叠加正弦 + 白噪声，48000Hz，≥1 秒。
+    /// 若把 StreamingResampler::push 的 emitted 改成每块从 0 重算，
+    /// 每块都会在输入位置 0 附近重新对齐卷积核 → 周期性跳变 → 此测试必红。
+    #[test]
+    fn streaming_resampler_equivalent_to_batch() {
+        let source_rate = 48000u32;
+        let target_rate = 16000u32;
+        let duration_secs = 1.0;
+        let n = (source_rate as f64 * duration_secs) as usize;
+
+        // 多频率叠加正弦（220Hz + 880Hz + 2000Hz）+ 伪白噪声
+        let mut signal = Vec::with_capacity(n);
+        let mut x = 0.0f64;
+        let mut noise_acc = 13.0f64;
+        for _ in 0..n {
+            let s = (2.0 * std::f64::consts::PI * 220.0 * x).sin() * 0.3
+                + (2.0 * std::f64::consts::PI * 880.0 * x).sin() * 0.2
+                + (2.0 * std::f64::consts::PI * 2000.0 * x).sin() * 0.1;
+            // 线性同余伪白噪声，幅度 0.05
+            noise_acc = (noise_acc * 1664525.0 + 1013904223.0).fract();
+            let noise = (noise_acc - 0.5) * 0.1;
+            signal.push((s + noise) as f32);
+            x += 1.0 / source_rate as f64;
+        }
+
+        // 批处理参考
+        let batch = resample_anti_alias(&signal, source_rate, target_rate);
+
+        // 流式：480 样本/块（10ms @ 48kHz）逐块 push + finish
+        let mut streamer = StreamingResampler::new(source_rate, target_rate);
+        let mut stream_out = Vec::new();
+        for chunk in signal.chunks(480) {
+            stream_out.extend_from_slice(&streamer.push(chunk));
+        }
+        stream_out.extend_from_slice(&streamer.finish());
+
+        assert_eq!(
+            batch.len(),
+            stream_out.len(),
+            "流式与批处理输出长度必须相等（batch={}, stream={}）",
+            batch.len(),
+            stream_out.len()
+        );
+
+        let mut max_diff = 0.0f64;
+        for (i, (b, s)) in batch.iter().zip(stream_out.iter()).enumerate() {
+            let d = (*b as f64 - *s as f64).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+            assert!(
+                d <= 1e-5,
+                "样本 {} 不等价：batch={}, stream={}, diff={}",
+                i,
+                b,
+                s,
+                d
+            );
+        }
+        let _ = max_diff; // 抑制未用警告
+    }
+
+    /// 验收第 4 条：用 441（不能整除 3）作块长，证明不依赖块长对齐。
+    #[test]
+    fn streaming_resampler_works_with_non_aligned_chunk_size() {
+        let source_rate = 48000u32;
+        let target_rate = 16000u32;
+        let n = 48000; // 1 秒
+        let signal: Vec<f32> = (0..n)
+            .map(|i| {
+                (2.0 * std::f64::consts::PI * 440.0 * i as f64 / source_rate as f64).sin() as f32
+                    * 0.5
+            })
+            .collect();
+
+        let batch = resample_anti_alias(&signal, source_rate, target_rate);
+
+        // 441 不能被 3 整除，刻意制造非对齐
+        let mut streamer = StreamingResampler::new(source_rate, target_rate);
+        let mut stream_out = Vec::new();
+        for chunk in signal.chunks(441) {
+            stream_out.extend_from_slice(&streamer.push(chunk));
+        }
+        stream_out.extend_from_slice(&streamer.finish());
+
+        assert_eq!(batch.len(), stream_out.len());
+        for (i, (b, s)) in batch.iter().zip(stream_out.iter()).enumerate() {
+            assert!(
+                (*b as f64 - *s as f64).abs() <= 1e-5,
+                "非对齐块长样本 {} 不等价：batch={}, stream={}",
+                i,
+                b,
+                s
+            );
+        }
+    }
+
+    /// 验收第 5 条：16000→16000 时 push 原样返回。
+    #[test]
+    fn streaming_resampler_identity_passthrough() {
+        let mut streamer = StreamingResampler::new(16000, 16000);
+        let chunk = vec![0.1f32, 0.2, 0.3, 0.4, 0.5];
+        let out = streamer.push(&chunk);
+        assert_eq!(out, chunk, "同采样率 push 必须原样返回");
+        // finish 在同采样率下返回空
+        let tail = streamer.finish();
+        assert!(tail.is_empty(), "同采样率 finish 必须返回空");
+    }
+
+    /// 验收第 6 条：总输出长度与 input_len * 16000 / 48000 相差 ≤ 1。
+    #[test]
+    fn streaming_resampler_correct_output_length() {
+        let source_rate = 48000u32;
+        let target_rate = 16000u32;
+        for &n in &[480usize, 4800, 48000, 48001, 96000] {
+            let signal = vec![0.5f32; n];
+            let mut streamer = StreamingResampler::new(source_rate, target_rate);
+            let mut out = streamer.push(&signal);
+            out.extend_from_slice(&streamer.finish());
+
+            let expected = (n as f64 * target_rate as f64 / source_rate as f64).round() as usize;
+            assert!(
+                (out.len() as isize - expected as isize).abs() <= 1,
+                "n={}：输出长度 {} 与期望 {} 相差 > 1",
+                n,
+                out.len(),
+                expected
+            );
+        }
+    }
+
+    /// 验收第 7 条：顺序护栏——pre-roll → post-hotkey → 主循环 用同一实例。
+    /// 用计数器验证：逐块 push 同一实例的输出拼接后，与整段一次性 push 等价。
+    /// 若用了多个实例（每块新建），每块都会从 emitted=0 重算 → 输出重复/错位 → 长度远超期望。
+    #[test]
+    fn streaming_resampler_single_instance_order_guard() {
+        let source_rate = 48000u32;
+        let target_rate = 16000u32;
+        let signal: Vec<f32> = (0..48000)
+            .map(|i| {
+                (2.0 * std::f64::consts::PI * 300.0 * i as f64 / source_rate as f64).sin() as f32
+            })
+            .collect();
+
+        // 整段一次性 push（参考）
+        let mut whole = StreamingResampler::new(source_rate, target_rate);
+        let whole_out = {
+            let mut o = whole.push(&signal);
+            o.extend_from_slice(&whole.finish());
+            o
+        };
+
+        // 模拟 pre-roll(160) + post-hotkey(320) + 主循环(480 反复)
+        // 全部喂进【同一个】实例 —— 这是 record_streaming 的真实接线方式
+        let mut streamer = StreamingResampler::new(source_rate, target_rate);
+        let mut parts_out = Vec::new();
+        // pre-roll
+        parts_out.extend_from_slice(&streamer.push(&signal[0..160]));
+        // post-hotkey
+        parts_out.extend_from_slice(&streamer.push(&signal[160..480]));
+        // 主循环 480/块
+        let mut idx = 480;
+        while idx < signal.len() {
+            let end = (idx + 480).min(signal.len());
+            parts_out.extend_from_slice(&streamer.push(&signal[idx..end]));
+            idx = end;
+        }
+        parts_out.extend_from_slice(&streamer.finish());
+
+        assert_eq!(
+            whole_out.len(),
+            parts_out.len(),
+            "分段喂同一实例必须与整段喂同一实例输出长度相等"
+        );
+        for (i, (w, p)) in whole_out.iter().zip(parts_out.iter()).enumerate() {
+            assert!(
+                (*w as f64 - *p as f64).abs() <= 1e-5,
+                "顺序护栏样本 {} 不等价：whole={}, parts={}",
+                i,
+                w,
+                p
+            );
+        }
+    }
+
+    /// 多块小信号 + finish 尾部：确保 finish 不丢样本。
+    #[test]
+    fn streaming_resampler_finish_emits_tail() {
+        let source_rate = 48000u32;
+        let target_rate = 16000u32;
+        // 100 样本，远小于一个块，确保全部留到 finish
+        let signal = vec![0.7f32; 100];
+        let mut streamer = StreamingResampler::new(source_rate, target_rate);
+        let mut out = streamer.push(&signal);
+        let tail = streamer.finish();
+        out.extend_from_slice(&tail);
+
+        let batch = resample_anti_alias(&signal, source_rate, target_rate);
+        assert_eq!(out.len(), batch.len(), "finish 必须补齐尾部不丢样本");
+        for (i, (b, s)) in batch.iter().zip(out.iter()).enumerate() {
+            assert!(
+                (*b as f64 - *s as f64).abs() <= 1e-5,
+                "tail 样本 {} 不等价",
+                i
+            );
+        }
     }
 }

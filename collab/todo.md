@@ -7,7 +7,7 @@
 
 | 编号 | 内容 | 文件域 | 负责人 | 状态 |
 | --- | --- | --- | --- | --- |
-| **ASR-042** | 在线流式 ASR 采样率修复（48000→16000 带状态流式重采样器） | `src/audio/mod.rs`（+必要时 `qwen_inference.rs`） | coder-1 | 🟡 **已派发已 ACK，同意方案 A，执行中** |
+| **ASR-042** | 在线流式 ASR 采样率修复（48000→16000 带状态流式重采样器） | `src/audio/mod.rs`（+必要时 `qwen_inference.rs`） | coder-1 | 🟢 **代码完成待主控验收**（StreamingResampler + record_streaming 接线 + 6 测试 + 改坏会红自证；cargo fmt/check/test audio 全绿） |
 | **OVERLAY-043** | 录音窗口四项显示错乱 | `src/main.rs` | coder-2 | 🔜 **等 ASR-042 验收 + Gavin 目视确认识别正常** |
 | TEST-SYNC-042 | 阶段三测试同步 | 各 `mod tests` | tester-1 | 🔜 等 ASR-042 验收（禁止与代码任务并行） |
 

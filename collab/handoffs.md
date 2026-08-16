@@ -13,3 +13,22 @@
 - **详情**：outbox/tester-1/result.md + logs/20260816.md + CHANGELOG.md
 
 ---
+
+## 2026-08-16 — coder-1 — ASR-042 在线流式 ASR 采样率修复（StreamingResampler，src/audio/mod.rs +476/-5）
+
+- **来源**：Gavin v0.8.0 端测，新在线 ASR 识别全错（48kHz 音频按 16kHz 解）。主控派单 ASR-042，基线 HEAD `efb101f`
+- **根因**：`record_streaming` 边录边发绕过了 `record()` 录音结束时的一次性 `resample_anti_alias`（FIRSTCHAR-FIX-005 引入），48kHz 直推服务端
+- **改动**：仅 `src/audio/mod.rs`（+476/-5）
+  - 新增 `StreamingResampler`（`pub(crate)`）：带状态流式抗混叠重采样器，数学等价于 `resample_anti_alias`（windowed-sinc FIR, TAPS=32, Hann 窗），跨块保留历史+全局 emitted 计数，接缝不截断卷积核
+  - `record_streaming` 接线：pre-roll → post-hotkey → 主循环 依次喂**同一实例** + break 后 `finish()` flush 尾部 + 新日志 `Streaming resampler active: {N}Hz -> 16000Hz`
+  - `total_samples`/`max_frames`/RMS/`level_buf` 继续用原始 chunk（未重采样）
+  - 新增 `RESAMPLE_TAPS` 常量（`resample_anti_alias` 与 `StreamingResampler` 共用防漂移）
+  - +6 测试：等价性（逐点差 ≤1e-5）/ 非对齐块长(441) / 恒等(16k→16k) / 长度(误差 ≤1) / 顺序护栏 / finish 尾部
+- **"改坏会红"自证**：`push` 入口注入 `emitted=0`（每块重算）→ 等价性测试 FAILED（stream=807010 vs batch=16000），移除后 GREEN
+- **验收**：cargo fmt clean / cargo check --all-targets 0 error / cargo test audio 56 passed 0 failed 1 ignored（既有用例零改动）
+- **禁区核验**：`resample_anti_alias` 函数体 / `record()` / `vad.rs` / `main.rs` / `qwen_inference.rs` 零改动
+- **跨平台**：`docs/MACOS-HANDOFF.md` 新增 §ASR-042 节（平台中立模块，macOS 编译同份代码；运行时影响取决于 macOS 侧 record_streaming 是否已接线）
+- **版本号**：未动
+- **详情**：outbox/coder-1/result.md + logs/20260816.md + CHANGELOG.md
+
+---

@@ -1137,3 +1137,37 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 ### 结论
 
 **macOS 侧编译应无影响**——所有改动在平台中立模块内，`AsrModel` match 已更新，`f32_to_pcm16_le` 搬家后唯一引用方已适配。macOS 侧若有遗留的 `Qwen3Online` match 分支，编译器会报 non-exhaustive match 强制修复（这是好事，编译时发现而非运行时）。
+
+---
+
+## §ASR-042 · 在线流式 ASR 采样率修复（StreamingResampler）（2026-08-16）
+
+### 改了什么
+
+`src/audio/mod.rs`（平台中立模块，macOS 编译同一份代码）：
+
+1. **新增 `StreamingResampler` 结构体**：带状态的流式抗混叠重采样器，数学等价于既有 `resample_anti_alias`（windowed-sinc FIR, TAPS=32），但支持逐块喂入。跨块保留历史样本 + 全局 `emitted` 计数，接缝处不截断卷积核。
+2. **`record_streaming` 接线**：pre-roll → post-hotkey → 主循环 依次喂进同一实例，主循环 break 后调 `finish()` flush 尾部。新增日志 `Streaming resampler active: {N}Hz -> 16000Hz`。
+3. **新增 6 条测试**：批处理/流式等价性、非对齐块长（441）、恒等（16k→16k）、长度、顺序护栏、finish 尾部。
+4. **`record()` 路径零改动**，`resample_anti_alias` 函数体零改动。
+
+### 行为前后对比
+
+| 项 | 修前 | 修后 |
+|---|---|---|
+| `record_streaming` 输出采样率 | 原始麦克风采样率（通常 48000Hz）直推 `on_chunk` | 重采样到 16000Hz 后推 `on_chunk` |
+| 在线 ASR 识别结果 | 全错（服务器按 16kHz 解 48kHz 音频） | 正确（采样率匹配） |
+| VAD 门控 | 漏检（48kHz 喂 16kHz VAD → safety net 强制建连） | 预期自动恢复（VAD 收到 16kHz），需日志实测确认 |
+| 本地模型路径（`record()`） | 不受影响 | 不受影响（零改动） |
+| FIR 卷积核边界 | N/A（无重采样） | 不截断（跨块保留历史 + lookahead） |
+
+### 对 macOS 的具体影响
+
+1. **`src/audio/mod.rs` 是平台中立模块**，macOS 编译同一份代码。`StreamingResampler` 纯 Rust 数学，无平台依赖。
+2. **macOS 麦克风默认采样率**：macOS 的 cpal/AudioUnit 默认输入采样率通常为 **44100Hz 或 48000Hz**（取决于设备）。本修复对 macOS 同样生效——`record_streaming` 会将 44100/48000 重采样到 16000Hz 喂给在线 ASR。
+3. **macOS 侧 `record_streaming` 是否已接线**：需 macOS 团队确认。若 macOS 侧尚未实现流式录音（仍在用 `record()` 批处理路径），则本改动对 macOS 无运行时影响，但编译通过（`StreamingResampler` 是 `pub(crate)`，即使未使用也不会告警）。
+4. **VAD（`src/transcription/vad.rs`）**：macOS 侧若已接线 VAD，同样受益于采样率修复。VAD 代码零改动。
+
+### 结论
+
+**macOS 侧编译无影响**（平台中立模块，纯 Rust 数学）。**运行时影响取决于 macOS 侧 `record_streaming` 是否已接线**：若已接线则同步受益（采样率匹配 + VAD 恢复），若未接线则无影响。macOS 团队无需同步改动，但实现流式录音时应直接复用 `StreamingResampler`。
