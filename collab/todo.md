@@ -8,8 +8,19 @@
 | 编号 | 内容 | 文件域 | 负责人 | 状态 |
 | --- | --- | --- | --- | --- |
 | **ASR-042** | 在线流式 ASR 采样率修复（48000→16000 带状态流式重采样器） | `src/audio/mod.rs`（+必要时 `qwen_inference.rs`） | coder-1 | 🟢 **代码完成待主控验收**（StreamingResampler + record_streaming 接线 + 6 测试 + 改坏会红自证；cargo fmt/check/test audio 全绿） |
-| **OVERLAY-043** | 录音窗口四项显示错乱 | `src/main.rs` | coder-2 | 🔜 **等 ASR-042 验收 + Gavin 目视确认识别正常** |
+| **ASR-045** | 流式识别结果被管线丢弃（文字从未上屏，P0） | `src/main.rs` | coder-1 | 🟢 **代码完成待主控验收**（新增 `should_cancel_on_empty` 纯函数 + 判空臂改调；流式 empty+Some 落 `Ok(samples)` 走 LLM 后半段；3 条护栏测试；cargo fmt/check --all-targets 0 error） |
+| **OVERLAY-043** | 录音窗口四项显示错乱 | `src/main.rs` | coder-2 | 🔜 **等 ASR-042 / ASR-045 验收 + Gavin 目视确认**（Note：coder-1 已在 `:4282-4320`、`:5982` 改过 main.rs，其改动区 `:908-940`、`:1780` 起无重叠，但提交时注意冲突） |
 | TEST-SYNC-042 | 阶段三测试同步 | 各 `mod tests` | tester-1 | 🔜 等 ASR-042 验收（禁止与代码任务并行） |
+
+### ASR-045 根因（一句话）
+
+调用侧 `run_pipeline_core(Ok(Vec::new()), …, Some(streaming_text))`（`main.rs:3409`）传**空 samples +
+流式文本**；接收侧判空臂 `Ok(s) if s.is_empty()`（原 `:4307`）**无条件取消**，`initial_text` 从未被读取
+→ 流式文本在函数入口即被丢弃，ITN→LLM→注入后半段从未执行（日志 `:193` 已产出 5 confirmed sentences，
+`:194` 即被 WARN 吞掉）。
+
+**取证与修法** → outbox/coder-1/result.md（含三问全链 27 步、Q1 samples 消费点排查、Q2 cancel_signal
+时序、护栏测试）。
 
 ### ASR-042 根因（一句话）
 

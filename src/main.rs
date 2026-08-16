@@ -4279,6 +4279,15 @@ fn select_preprocessing_params(asr_model: transcription::AsrModel) -> (usize, us
 
 // MACOS-P4-NEUTRAL-001/002: run_pipeline 薄封装已删除（零调用者，自证见 result.md）。
 // macOS 侧的调用者由 run_controller_macos 经 spawn_worker_thread 间接调用本函数（NEUTRAL-002 接线）。
+// ASR-045: 流式模式（initial_text = Some）下 samples 为空是正常情况——音频已逐块直传
+// ASR 线程（record_streaming → chunk channel → transcribe_streaming_realtime），finish-task
+// 后以文本落回 initial_text，管线无需也不再消费 samples（见 :3409 调用侧「流式模式不用 samples」）。
+// 只有「既无音频样本、也无流式文本」才真正没录到东西，需要取消管线。
+// 判定为纯函数：护栏测试直接断言，回滚修复（判空条件还原）时测试即红。
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn should_cancel_on_empty(samples: &[f32], initial_text: &Option<String>) -> bool {
+    samples.is_empty() && initial_text.is_none()
+}
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 fn run_pipeline_core(
@@ -4304,7 +4313,9 @@ fn run_pipeline_core(
             log::error!("Recording error: {}", e);
             send_event(event_tx, PipelineEvent::Error(e.to_string()));
         }
-        Ok(s) if s.is_empty() => {
+        // ASR-045: 判空取消仅在「无样本 且 无流式文本」时成立。
+        // 流式模式（samples 空 + initial_text Some）属正常情况，落入 Ok(samples) 分支走 LLM 后半段。
+        Ok(s) if should_cancel_on_empty(&s, &initial_text) => {
             log::warn!("No audio samples recorded");
             send_event(event_tx, PipelineEvent::Cancelled);
         }
@@ -5965,6 +5976,41 @@ mod focus_lost_logic_tests {
     fn focus_lost_different_nonzero() {
         // target=123, current=456 → true（焦点确实丢失）
         assert!(focus_lost(123, 456));
+    }
+}
+
+/// ASR-045: 流式模式「samples 空」判空取消决策护栏。
+/// 判定源：run_pipeline_core 判空分支调用 should_cancel_on_empty（纯函数）。
+#[cfg(test)]
+mod streaming_empty_samples_tests {
+    use super::should_cancel_on_empty;
+
+    /// ASR-045 验收#4: 流式模式（samples 空 + initial_text 有值）必须进入正常管线而非 Cancelled。
+    /// 回滚修复（把判空条件还原成只看 s.is_empty()）本测试即红。
+    #[test]
+    fn streaming_empty_samples_with_text_must_proceed() {
+        assert!(
+            !should_cancel_on_empty(&[], &Some("你好今天过得怎么样".to_string())),
+            "流式模式下 samples 为空是正常情况，不得触发 Cancelled"
+        );
+    }
+
+    /// ASR-045 验收#5: samples 空 且 initial_text 为 None（正常模式真空录）仍走 Cancelled（原行为保留）。
+    #[test]
+    fn normal_empty_samples_without_text_still_cancels() {
+        assert!(
+            should_cancel_on_empty(&[], &None),
+            "真空录（无样本且无流式文本）必须保持原 Cancelled 行为"
+        );
+    }
+
+    /// 正常模式非空样本 + None → 不取消（绝大多数正常转录路径，防止误伤）。
+    #[test]
+    fn normal_nonempty_samples_without_text_proceeds() {
+        assert!(
+            !should_cancel_on_empty(&[0.0f32, 0.01, -0.01], &None),
+            "有音频样本的正常转录不得触发空输入取消"
+        );
     }
 }
 

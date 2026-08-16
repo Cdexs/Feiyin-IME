@@ -1171,3 +1171,24 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 ### 结论
 
 **macOS 侧编译无影响**（平台中立模块，纯 Rust 数学）。**运行时影响取决于 macOS 侧 `record_streaming` 是否已接线**：若已接线则同步受益（采样率匹配 + VAD 恢复），若未接线则无影响。macOS 团队无需同步改动，但实现流式录音时应直接复用 `StreamingResampler`。
+
+## §ASR-045 · 流式判空取消修复（`should_cancel_on_empty`）（2026-08-16）
+
+### 改了什么
+
+`src/main.rs`（平台中立 `run_pipeline_core` 内，macOS 编译同一份代码）：
+
+1. **新增纯函数 `should_cancel_on_empty(samples, initial_text)`**（`:4288`）：`samples.is_empty() && initial_text.is_none()`。
+2. **判空臂改调该函数**（`:4316-4320`）：原来 `Ok(s) if s.is_empty()` 无条件取消；现在只有「无样本 **且** 无流式文本（initial_text=None）」才取消。流式模式（`Ok(Vec::new())` + `Some(text)`）落入 `Ok(samples)` 分支走既有 `initial_text` 路径（ITN→LLM→注入）。
+3. **新增 3 条护栏测试**（`mod streaming_empty_samples_tests`，`:5982`）。
+
+### 对 macOS 的具体影响
+
+1. **`run_pipeline_core` 是平台中立共享代码**（NEUTRAL-001/002），macOS 侧同一份编译。**若 macOS 将来接入流式录音并复用 `run_pipeline_core(Ok(Vec::new()), …, Some(text))` 调用形态，本次修复将其一并带上**——原本会被 `s.is_empty()` 无条件取消吞掉，现在能正常走完 LLM 后半段。
+2. **macOS 非流式路径零行为变更**：`samples 空 + initial_text=None` 仍走 `Cancelled`（原行为由 `normal_empty_samples_without_text_still_cancels` 用例钉住）。
+3. **`samples` 消费点核证对 macOS 同样成立**：`Ok(samples)` 分支内 `samples` 仅在 else 正常转录分支（`:4341-4370`）被引用，流式路径零引用，空数组无 panic 风险。
+4. **签名未变**：本次不修改 `run_pipeline_core` 签名（`:4293` 起），macOS 既有调用点零改动。
+
+### 结论
+
+**macOS 侧无需任何同步改动**；若 macOS 侧已接线 `run_pipeline_core` 流式调用，则本次修复自动生效。属「改动落在平台中立模块 → 必须记」情形（§2.7）。

@@ -2275,7 +2275,7 @@ mod tests {
         let _ = max_diff; // 抑制未用警告
     }
 
-    /// 验收第 4 条：用 441（不能整除 3）作块长，证明不依赖块长对齐。
+    /// 验收第 4 条：用 437（4+3+7=14，不能被 3 整除）作块长，证明不依赖块长对齐。
     #[test]
     fn streaming_resampler_works_with_non_aligned_chunk_size() {
         let source_rate = 48000u32;
@@ -2290,10 +2290,10 @@ mod tests {
 
         let batch = resample_anti_alias(&signal, source_rate, target_rate);
 
-        // 441 不能被 3 整除，刻意制造非对齐
+        // 437 = 19×23，不能被 3 整除，刻意制造非对齐块长
         let mut streamer = StreamingResampler::new(source_rate, target_rate);
         let mut stream_out = Vec::new();
-        for chunk in signal.chunks(441) {
+        for chunk in signal.chunks(437) {
             stream_out.extend_from_slice(&streamer.push(chunk));
         }
         stream_out.extend_from_slice(&streamer.finish());
@@ -2417,6 +2417,180 @@ mod tests {
                 (*b as f64 - *s as f64).abs() <= 1e-5,
                 "tail 样本 {} 不等价",
                 i
+            );
+        }
+    }
+
+    // ===== TEST-SYNC-042 补充用例（tester-1 补覆盖缺口）=====
+
+    /// 非 48k 输入：44100Hz → 16000Hz（比例 2.75625，非整数倍）。
+    /// 验证实现不依赖 3:1 整除关系，逐点与批处理等价。
+    #[test]
+    fn streaming_resampler_44100_to_16000_equivalent_to_batch() {
+        let source_rate = 44100u32;
+        let target_rate = 16000u32;
+        let n = 44100; // 1 秒
+        let signal: Vec<f32> = (0..n)
+            .map(|i| {
+                (2.0 * std::f64::consts::PI * 440.0 * i as f64 / source_rate as f64).sin() as f32
+                    * 0.5
+            })
+            .collect();
+
+        let batch = resample_anti_alias(&signal, source_rate, target_rate);
+
+        // 443 = 非 3 的倍数块长，且 44100/443 非整除，最后一块是残缺块
+        let mut streamer = StreamingResampler::new(source_rate, target_rate);
+        let mut stream_out = Vec::new();
+        for chunk in signal.chunks(443) {
+            stream_out.extend_from_slice(&streamer.push(chunk));
+        }
+        stream_out.extend_from_slice(&streamer.finish());
+
+        assert_eq!(
+            batch.len(),
+            stream_out.len(),
+            "44100→16000 输出长度与批处理不一致（batch={}, stream={}）",
+            batch.len(),
+            stream_out.len()
+        );
+        for (i, (b, s)) in batch.iter().zip(stream_out.iter()).enumerate() {
+            assert!(
+                (*b as f64 - *s as f64).abs() <= 1e-5,
+                "44100→16000 非整数比例样本 {} 不等价：batch={}, stream={}",
+                i,
+                b,
+                s
+            );
+        }
+    }
+
+    /// 单样本一个 chunk —— 最大粒度切分。验证状态机在 1 样本/块的
+    /// 极端输入下仍与批处理逐点等价（依赖全局 emitted，而非块内偏移）。
+    #[test]
+    fn streaming_resampler_single_sample_chunks() {
+        let source_rate = 48000u32;
+        let target_rate = 16000u32;
+        let n = 4800; // 0.1s 足够覆盖
+        let signal: Vec<f32> = (0..n)
+            .map(|i| {
+                (2.0 * std::f64::consts::PI * 440.0 * i as f64 / source_rate as f64).sin() as f32
+                    * 0.5
+            })
+            .collect();
+
+        let batch = resample_anti_alias(&signal, source_rate, target_rate);
+
+        let mut streamer = StreamingResampler::new(source_rate, target_rate);
+        let mut stream_out = Vec::new();
+        for s in signal.iter() {
+            stream_out.extend_from_slice(&streamer.push(&[*s]));
+        }
+        stream_out.extend_from_slice(&streamer.finish());
+
+        assert_eq!(
+            batch.len(),
+            stream_out.len(),
+            "单样本块输出长度与批处理不一致（batch={}, stream={}）",
+            batch.len(),
+            stream_out.len()
+        );
+        for (i, (b, s)) in batch.iter().zip(stream_out.iter()).enumerate() {
+            assert!(
+                (*b as f64 - *s as f64).abs() <= 1e-5,
+                "单样本块样本 {} 不等价：batch={}, stream={}",
+                i,
+                b,
+                s
+            );
+        }
+    }
+
+    /// 空 chunk 无副作用 + finish 幂等：
+    /// - push(&[]) 必须返回空、不贡献样本；
+    /// - 空 chunk 混入正常流后，逐点仍与批处理等价；
+    /// - 重复调用 finish()：第二次及以后必须返回空（尾部只补一次）。
+    #[test]
+    fn streaming_resampler_empty_chunk_and_finish_idempotent() {
+        let source_rate = 48000u32;
+        let target_rate = 16000u32;
+
+        // 从未喂数的新实例：push 空 + finish 都必须为空
+        let mut fresh = StreamingResampler::new(source_rate, target_rate);
+        assert!(fresh.push(&[]).is_empty(), "push 空 chunk 必须返回空");
+        assert!(fresh.finish().is_empty(), "空流 finish 必须返回空");
+
+        let signal: Vec<f32> = (0..4800)
+            .map(|i| {
+                (2.0 * std::f64::consts::PI * 440.0 * i as f64 / source_rate as f64).sin() as f32
+                    * 0.5
+            })
+            .collect();
+        let batch = resample_anti_alias(&signal, source_rate, target_rate);
+
+        let mut streamer = StreamingResampler::new(source_rate, target_rate);
+        let mut stream_out = Vec::new();
+        for (i, chunk) in signal.chunks(240).enumerate() {
+            if i % 3 == 0 {
+                assert!(streamer.push(&[]).is_empty(), "空 chunk 必须返回空");
+            }
+            stream_out.extend_from_slice(&streamer.push(chunk));
+        }
+        let tail1 = streamer.finish();
+        stream_out.extend_from_slice(&tail1);
+        assert!(streamer.finish().is_empty(), "第二次 finish 必须返回空");
+        assert!(streamer.finish().is_empty(), "第三次 finish 必须返回空");
+
+        assert_eq!(
+            batch.len(),
+            stream_out.len(),
+            "空 chunk 混入后输出长度与批处理不一致"
+        );
+        for (i, (b, s)) in batch.iter().zip(stream_out.iter()).enumerate() {
+            assert!(
+                (*b as f64 - *s as f64).abs() <= 1e-5,
+                "空 chunk 混入后样本 {} 不等价：batch={}, stream={}",
+                i,
+                b,
+                s
+            );
+        }
+    }
+
+    /// 单次 push 巨块（整段 3s，长度远超内部缓冲）：补齐「长 chunk」值等价
+    /// 覆盖。coder 的 correct_output_length 只验长度，本用例补逐点值与批处理等价。
+    #[test]
+    fn streaming_resampler_large_single_chunk_value_equivalence() {
+        let source_rate = 48000u32;
+        let target_rate = 16000u32;
+        let n = 144000; // 3s @48k
+        let signal: Vec<f32> = (0..n)
+            .map(|i| {
+                (2.0 * std::f64::consts::PI * 440.0 * i as f64 / source_rate as f64).sin() as f32
+                    * 0.3
+            })
+            .collect();
+
+        let batch = resample_anti_alias(&signal, source_rate, target_rate);
+
+        let mut streamer = StreamingResampler::new(source_rate, target_rate);
+        let mut stream_out = streamer.push(&signal);
+        stream_out.extend_from_slice(&streamer.finish());
+
+        assert_eq!(
+            batch.len(),
+            stream_out.len(),
+            "巨块输出长度与批处理不一致（batch={}, stream={}）",
+            batch.len(),
+            stream_out.len()
+        );
+        for (i, (b, s)) in batch.iter().zip(stream_out.iter()).enumerate() {
+            assert!(
+                (*b as f64 - *s as f64).abs() <= 1e-5,
+                "巨块样本 {} 不等价：batch={}, stream={}",
+                i,
+                b,
+                s
             );
         }
     }

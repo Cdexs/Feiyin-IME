@@ -2,6 +2,21 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-08-16 — coder-1 — ASR-045 ✅ 流式识别结果被管线丢弃修复（P0，src/main.rs +44，待主控验收）
+
+- **来源**：主控定位（P0，功能 100% 不可用）：在线流式 ASR 悬浮层实时出字 → 松开热键 → 文字从未上屏。基线 HEAD `427cd50`
+- **根因**：调用侧 `run_pipeline_core(Ok(Vec::new()), …, Some(streaming_text))`（`main.rs:3409`）传空 samples + 流式文本；接收侧判空臂 `Ok(s) if s.is_empty()`（原 `:4307`）**无条件**取消，`initial_text` 从未被读取 → 流式文本在函数入口即被丢弃，ITN→LLM→注入后半段从未执行
+- **改动**（仅 `src/main.rs`）
+  - 新增纯函数 `should_cancel_on_empty(samples, initial_text)`（`:4288`）= `samples.is_empty() && initial_text.is_none()`
+  - 判空臂改调该函数（`:4316-4320`）：只有「无样本 且 无流式文本」才真取消；流式（empty+Some）落入 `Ok(samples)` 走既有 `initial_text` 路径
+  - 护栏测试 `mod streaming_empty_samples_tests`（`:5982`，3 条）：流式空+文本 proceed / 真空录仍 cancel / 非空+None proceed
+- **三问核证**：Q1 `samples` 仅在正常转录 else 分支消费（`:4347-4357`），流式路径零引用，无 panic/除零；Q2 `cancel_signal` 每次 Start 重置 false（`:3189`），`:4323` 只拦 join 期真实取消，无误伤；Q3 全链 27 步核完（热键→录音→流式识别→松开→ITN→LLM→注入）唯一断点即原判空臂
+- **验收**：cargo fmt --check clean（仅本人区域）/ cargo check --all-targets 0 error；白名单遵守未跑 test/build；未 commit（主控统一提交）；版本号未动
+- **边界**：与 coder-2 OVERLAY-043（`:908-940`、`:1780` 起）无文本重叠；`src/audio/mod.rs`（tester-1 在途）零触碰
+- **详情**：outbox/coder-1/result.md + logs/20260816.md + CHANGELOG.md
+
+---
+
 ## 2026-08-16 — tester-1 — BUILD-016 ✅ v0.8.0 首包出包（全构建 + 七项核验 + 双探针，生产零改动）
 
 - **来源**：Gavin 已明确下达出包指令，主控派单 BUILD-016（阶段五）。基线 HEAD `be76fc1`

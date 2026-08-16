@@ -3069,3 +3069,60 @@ QwenAudio ASR pre-roll flushed: 261 chunks, 125280 samples (7.8s)
 
 `debug.log:194` / `:429`：每次在线流式录完都报 `WARN No audio samples recorded`。
 需查清是无害日志噪音，还是有副作用（如词库自动学习拿不到音频）。
+
+---
+
+## [REPLACE-WORKER-TASKFILE-WIPED-001] 🔴 重启 Worker 会清空 inbox/task.md，Worker 转而读到另一套目录下的陈旧任务【重启前必读】
+
+**发生**：2026-08-16。Gavin 指令给 coder-1/coder-2 换模型（原 ollama-cloud 额度用尽 →
+`opencode/deepseek-v4-flash-free`）并重启。重启后两个 Worker 都拿不到当天派的任务，
+coder-1 读到的是 **8月14日的 ASR-038-B**（早已完成并提交）。
+
+### 一、两个缺陷叠加才出事
+
+**缺陷 A：`replace-worker.sh` 第③步「清理状态文件」把 `inbox/<id>/task.md` 清成 0 字节。**
+
+主控在重启**之前**已把 ASR-045 / OVERLAY-043 任务书写进 inbox，重启一跑全没了。
+脚本没有任何提示说它会清任务文件。
+
+**缺陷 B：清空之后，Worker 去另一套 collab 目录找，找到了陈旧任务。**
+
+本项目长期存在两套 collab（`[COLLAB-PATH-SPLIT-001]`）：
+
+| 路径 | 用途 | 本次状态 |
+| --- | --- | --- |
+| `/d/Workspace/CodeLab/collab/inbox/` | **dispatch.sh 实际使用** | 被重启清空 → 0 字节 |
+| `/d/Workspace/CodeLab/voice-ime/collab/inbox/` | 历史遗留 | 残留 08-14 的 ASR-038-B，7509 B |
+
+Worker 看到工作区级是空的，就顺着项目级找，读到了陈旧文件。
+
+### 二、差一点造成的后果
+
+ASR-038-B 是**已完成并提交**的批次。若 coder-1 闷头执行，
+会在已验收代码上重做一遍，轻则冲突，重则覆盖。
+
+**没出事的唯一原因**：coder-1 主动核证并上报
+（`💬 [coder-1] inbox/task.md 仍是 08-14 的 ASR-038-B 旧内容…请把完整任务书写入`），
+而不是默默执行。**这正是「主动沟通比默默出错代价更低」那条规则的价值兑现。**
+
+### 三、规则
+
+1. 🔴 **派发任务与重启 Worker 的顺序不可颠倒：先重启，后写 task.md，再 dispatch。**
+   重启会清空 inbox，重启前写的任务书一定丢。
+2. 🔴 **重启后 dispatch 前，必须 `wc -c inbox/<id>/task.md` 确认非 0**，
+   不要因为「我刚写过」就跳过。
+3. 🔴 **Worker 侧**：只认 `/d/Workspace/CodeLab/collab/inbox/<id>/task.md`。
+   若该文件为空 → **立即报告主控，绝不去别处找任务**。
+   任何写着旧任务编号的文件都要当成陷阱。
+4. **主控侧已做的封堵（2026-08-16）**：项目级 `voice-ime/collab/inbox/*/task.md`
+   全部改名为 `task-STALE-<日期>.md`（**改名不删除，可回滚**），
+   原位置留一个指路文件，写明「本目录已废弃，唯一有效任务在工作区级路径」。
+
+### 四、与既有条目的关系
+
+- `[COLLAB-PATH-SPLIT-001]`：本条是它的一次实际爆发，根因同源（两套目录）
+- `[REPLACE-WORKER-INJECT-LOST-001]`：同一次重启中也复现了「注入失败」，
+  但**这次脚本如实报错了**（2026-08-14 的修复生效），主控 capture-pane 后发现
+  文本其实已在输入框、只是没提交，补一个 Enter 即恢复。**修复有效，保留。**
+- 顺带发现：注入模板里「项目：，工作目录：。」两个字段**是空的**，脚本未填充。
+  主控当场手工补发。**待修：`replace-worker.sh` 的注入模板变量缺失。**
