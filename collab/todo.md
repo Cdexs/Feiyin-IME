@@ -191,7 +191,7 @@ main.rs:993   Hide 处理 → destroy_edit_control() + state.request = None（�
 ③ tester-1：TEST-SYNC-038-B（main.rs 用例，规格表已在 outbox/tester-1/result.md）
       ↓ 串行
 ④ tester-1：TEST-EXEC-038 全量回归（阶段四，本批从未跑过全量）
-⑤ BUILD-016 出包（阶段五，主控须请示 Gavin 后执行）
+⑤ BUILD-016 出包（阶段五）🔴 **2026-08-16 DEC-053 已改规则：阶段四通过后主控直接派发，不再请示 Gavin**
 ```
 
 > ⚠️ **出包后建议 Gavin 首次用 `-debug` 跑**：新端点连通性 / 计费口径（`usage.duration` 是
