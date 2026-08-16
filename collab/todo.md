@@ -7,10 +7,13 @@
 
 | 编号 | 内容 | 文件域 | 负责人 | 状态 |
 | --- | --- | --- | --- | --- |
-| **ASR-042** | 在线流式 ASR 采样率修复（48000→16000 带状态流式重采样器） | `src/audio/mod.rs`（+必要时 `qwen_inference.rs`） | coder-1 | 🟢 **代码完成待主控验收**（StreamingResampler + record_streaming 接线 + 6 测试 + 改坏会红自证；cargo fmt/check/test audio 全绿） |
-| **ASR-045** | 流式识别结果被管线丢弃（文字从未上屏，P0） | `src/main.rs` | coder-1 | 🟢 **代码完成待主控验收**（新增 `should_cancel_on_empty` 纯函数 + 判空臂改调；流式 empty+Some 落 `Ok(samples)` 走 LLM 后半段；3 条护栏测试；cargo fmt/check --all-targets 0 error） |
-| **OVERLAY-043** | 录音窗口四项显示错乱 | `src/main.rs` | coder-2 | 🔜 **等 ASR-042 / ASR-045 验收 + Gavin 目视确认**（Note：coder-1 已在 `:4282-4320`、`:5982` 改过 main.rs，其改动区 `:908-940`、`:1780` 起无重叠，但提交时注意冲突） |
-| TEST-SYNC-042 | 阶段三测试同步 | 各 `mod tests` | tester-1 | 🔜 等 ASR-042 验收（禁止与代码任务并行） |
+| **ASR-042** | 在线流式 ASR 采样率修复（48000→16000 带状态流式重采样器） | `src/audio/mod.rs` | coder-1 | ✅ **已验收已提交 `34906a1`**（StreamingResampler + record_streaming 接线 + 6 测试 + 改坏会红自证） |
+| TEST-SYNC-042 | 阶段三测试同步（补 4 条流式重采样缺口用例） | `src/audio/mod.rs` `mod tests` | tester-1 | ✅ **已提交 `427cd50`** |
+| **ASR-045** | 流式识别结果被管线丢弃（文字从未上屏，P0） | `src/main.rs` | coder-1 | ✅ **已验收已提交 `54cde62`**（`should_cancel_on_empty` 纯函数 + 判空臂改调 + 3 条护栏测试） |
+| TEST-SYNC-045 | 阶段三测试同步（ASR-045 除 coder-1 自带 3 条护栏外的缺口） | `src/main.rs` `mod tests` | tester-1 | 🔜 **待派发**（阶段三） |
+| TEST-EXEC-042/045 | 阶段四全量回归（本批从未跑过全量） | — | tester-1 | 🔜 待 TEST-SYNC-045 完成后串行 |
+| BUILD-017 | 阶段五出包（ASR-042/045 进 exe，Gavin 端测目视确认） | — | tester-1 | 🔜 **须 Gavin 明确下达「现在可以出包」** |
+| **OVERLAY-043** | 录音窗口四项显示错乱 | `src/main.rs` | coder-2 | 🔜 **等 BUILD-017 + Gavin 目视确认识别输出正常后再派发**（Note：coder-1 已在 `:4282-4320`、`:5982` 改过 main.rs，其改动区 `:908-940`、`:1780` 起无重叠） |
 
 ### ASR-045 根因（一句话）
 
@@ -52,10 +55,13 @@
 现成为文字截断的直接原因。**不能简单删除**（删了会抖，属「修一个带出一个」）。
 修法：改为**延迟合并** —— 100ms 内多次变化攒起来，到点按最新文字算一次宽度。
 
-### 待查（未定性，别遗漏）
+### ~~待查~~ ✅ 已定性并修复（2026-08-16）
 
-`debug.log:194`/`:429` 每次在线流式录完都报 `WARN No audio samples recorded`。
-查清是无害日志噪音，还是有副作用（如词库自动学习拿不到音频）。
+~~`debug.log:194`/`:429` 每次在线流式录完都报 `WARN No audio samples recorded`。~~
+
+**结论：不是日志噪音，就是 ASR-045 本身。** 该 WARN 正是判空臂 `Ok(s) if s.is_empty()`
+无条件取消时打的那一行 —— 流式文本在此被丢弃，整条 ITN→LLM→注入后半段从未执行。
+ASR-045（`54cde62`）修复后该 WARN 在流式路径不再触发。**本条核销，无残留副作用待查。**
 
 ---
 
