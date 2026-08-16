@@ -1,5 +1,46 @@
 # 任务列表 · voice-ime
 
+## 🛑 2026-08-16 收工交接 —— 明天从这里开始
+
+> Gavin 收工（当晚）。**下一个动作是等他端测结果，不是派新任务。**
+
+| 项 | 状态 |
+| --- | --- |
+| HEAD | `e182311`，工作区 **clean**，零悬空改动 |
+| 本批四个 P0/测试任务 | ASR-042 `34906a1` / TEST-SYNC-042 `427cd50` / ASR-045 `54cde62` / TEST-SYNC-045 `fd994a5` **全部已验收提交** |
+| 阶段四全量回归 | ✅ `2a173f0` —— 1030/0/11，③ 类真回归 = 0 |
+| 阶段五出包 | ✅ BUILD-017 `2074859` —— 产物 08-16 23:25 在 `Publish/`，七项核验主控独立复算通过 |
+| 三个 Worker | coder-1 / coder-2 / tester-1 **全部空闲待命，手上零任务** |
+| 未 push | 本地 ahead 若干，**Gavin 未授权 push，不得自动执行** |
+
+### 明天第一件事：问 Gavin 端测结果（两个 P0 一眼可判）
+
+1. **识别内容对不对** —— 修复前输出「你好，花呗还不上」这类完全不相干的客服话术（48kHz 按 16kHz 解）
+2. **文字上不上屏** —— 修复前悬浮层实时出字，松开热键后文字凭空消失
+
+### 端测环境（已核，勿重复排查）
+
+- Gavin 跑的是 **`target/release/feiyin-ime.exe`（PID 4696，他自己启的）**，sha256 与 `Publish/` 版**完全相同**，等价于测包
+- 其 `debug.log` 落在 **`target/release/debug.log`**，不在 `Publish/`
+- `target/release/config.toml` 三项 ASR 配置已核对全对：`qwen_audio_online` / `/api-ws/v1/inference` / `qwen-audio-3.0-asr-flash-streaming`，api_key 非空
+- 🔴 **`enable_streaming = false` 是虚惊，不影响真流式** —— `main.rs:3276` 的 `is_streaming_asr` 只看 `asr_model`，与该开关无关。**别再为这行重新排查一遍**
+
+### 端测通过后的下一棒
+
+1. **OVERLAY-043**（coder-2 待命中）—— 录音窗口四项显示错乱，四条现象主控已逐条核过代码，见下方专节
+2. **TEST-045-REFACTOR**（排在 OVERLAY-043 之后）—— 抽 `decide_pipeline_entry` 纯函数补调用侧护栏缺口
+
+### 端测若失败
+
+`debug.log` 优先看这两条：
+- ASR-042 是否生效：搜 `Streaming resampler active` —— 有这行说明重采样器接上了
+- ASR-045 是否生效：搜 `No audio samples recorded` —— 流式录音后**不应**再出现这行
+
+### 🔴 两个不许动的东西（Gavin 2026-08-16 明确指示）
+
+- `target/release/feiyin-ime-nor.exe`（08-09，11.9MB，非当前构建目标）—— **是 Gavin 的备份 exe，不得删除**
+- **PID 4696** —— Gavin 端测进程，不得 kill
+
 ## 🔴 P0 进行中 · v0.8.0 端测两大问题（Gavin 2026-08-16 提交）
 
 > 出包后 Gavin 端测发现两个问题，主控已独立取证定位根因。**执行顺序已与 Gavin 商定：先修识别，再修窗口。**
