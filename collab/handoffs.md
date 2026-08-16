@@ -60,3 +60,14 @@
 - **详情**：outbox/coder-1/result.md + logs/20260816.md + CHANGELOG.md
 
 ---
+
+## 2026-08-16 — tester-1 — TEST-EXEC-042/045 ✅ 阶段四全量回归 + 消融自证（v0.8.0 出包前最后一道闸，生产零改动）
+
+- **来源**：主控派单 TEST-EXEC-042/045（阶段四，基线 HEAD `fd994a5`）；前置四提交 ASR-042/TEST-SYNC-042/ASR-045/TEST-SYNC-045 已全验收
+- **四步回归全过**：Step1 `cargo test` = **1030 passed / 0 failed / 11 ignored**（主 crate 957 + crash-reporter 37 + integration 36；预期 ≈1030 精确命中零残差）→ Step2 Vitest **54 passed / 5 files** → Step3 src-tauri **55 passed / 0 failed** → Step4 pytest **SKIP**（`Publish/` 是 BUILD-016 旧包早于本批，E2E 正确时机 BUILD-017 出包后）
+- **消融 A（调用侧缺口实证）**：guard `:4318` 改回 `s.is_empty()` → 6 条 streaming_empty 测试**全绿**（P0 静默复发但零报警）→ 还原。结论：6 条纯函数测试保护不了调用侧，`TEST-045-REFACTOR` 排期维持
+- **消融 B（分层契约护栏实证）**：`should_cancel_on_empty` 合并 `trim().is_empty()` → **4 passed / 2 failed**，变红恰为空串/纯空白两条（coder-1 3 条 + 真值表第 4 格仍绿）→ 还原。与主控推演真值表完全一致，护栏有效
+- **收尾自证**：两消融全还原 → `git diff src/main.rs` 空 + `git diff -w` 0 行（77 文件仅 CRLF 噪声 [CRLF-CROSSPLAT-001]）→ 还原后复跑 **1030 全绿**逐数一致；红条 ③=0/①=0/②=0
+- **验收**：无需 fmt/check（本单纯回归执行 + 临时消融已还原）；版本号 0.8.0 未动；未 commit（主控统一提交）；未出包（BUILD-017 须 Gavin 明确下令）
+- **结论**：v0.8.0 全量回归闸门通过，无阻塞项，可进入阶段五 BUILD-017
+- **详情**：outbox/tester-1/result.md + logs/20260816.md + CHANGELOG.md
