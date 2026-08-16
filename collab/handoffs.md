@@ -81,3 +81,11 @@
 - **验收**：生产代码零改动（`git diff src/ src-tauri/ ui/`=0）；版本号 0.8.0 未动；未 commit（主控统一提交）
 - **Gavin 端测四项**（须 `-debug`，ASR-PERF-040-B/C 唯一数据源）：新端点连通性 / `usage.duration` 计费口径 / 040-A 四段连接耗时 / VAD 门控实际行为
 - **详情**：outbox/tester-1/result.md + logs/20260816.md + CHANGELOG.md
+
+## 2026-08-16 — tester-1 — 文档维护：build-test-guide.md Step 1 杀进程名单补 `feiyin-ime-nor`（主控验收后建议，非派单）
+
+- **背景**：BUILD-017 验收通过（提交 `2074859`）。主控建议把名单外遗留进程 `feiyin-ime-nor` 补进 Step 1 杀进程名单，否则下次出包重蹈 mutex 坑。该文档归 tester-1 维护，无需等派单
+- **改动**：两处命令 `Get-Process feiyin-ime,voice-ime-ui` → `feiyin-ime,feiyin-ime-nor,voice-ime-ui,feiyin-ime-ui,crash-reporter`（原名单还缺 `feiyin-ime-ui`/`crash-reporter`，一并补齐）+ 注释说明 BUILD-017 实测背景
+- **纯文档维护**：无代码改动、无出包、无 commit（主控统一提交）
+- **留意项（不动作）**：`target/release/feiyin-ime.exe` PID 4696（00:08:39 启动，非冒烟进程）锁着 exe，下次构建可能报 os error 5；主控已报 Gavin 判断归属，回话前任何人不得杀。保持待命等 Gavin 端测
+- **详情**：logs/20260816.md

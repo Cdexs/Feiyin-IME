@@ -22,8 +22,11 @@
 #### Step 1 — 退出运行中进程
 
 ```bash
-powershell -Command "Get-Process feiyin-ime,voice-ime-ui -ErrorAction SilentlyContinue | Stop-Process -Force"
+powershell -Command "Get-Process feiyin-ime,feiyin-ime-nor,voice-ime-ui,feiyin-ime-ui,crash-reporter -ErrorAction SilentlyContinue | Stop-Process -Force"
 ```
+
+> 名单含 `feiyin-ime-nor`：BUILD-017 实测发现该 8-9 遗留构建会持单实例 mutex，导致新包启动报
+> `Application already running, exiting`（名单外进程，原命令漏杀）。若有其它命名变体同样持有 mutex，一并补入。
 
 #### Step 2 — 前端 + Tauri UI
 
@@ -280,7 +283,7 @@ ls -la target/release/feiyin-ime-ui.exe
 
 ```bash
 # 0. 【必须先构建】确保 feiyin-ime-ui.exe 包含最新前端修改
-powershell -Command "Get-Process feiyin-ime,voice-ime-ui -ErrorAction SilentlyContinue | Stop-Process -Force"
+powershell -Command "Get-Process feiyin-ime,feiyin-ime-nor,voice-ime-ui,feiyin-ime-ui,crash-reporter -ErrorAction SilentlyContinue | Stop-Process -Force"
 cd /d/Workspace/CodeLab/voice-ime/ui && npm run build
 cargo build --release --manifest-path src-tauri/Cargo.toml --features custom-protocol
 cp src-tauri/target/release/feiyin-ime-ui.exe target/release/  # 同步产物
