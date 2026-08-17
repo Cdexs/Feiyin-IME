@@ -88,26 +88,6 @@
 
 ---
 
-## 🟡 待 Gavin 拍板 · HOTKEY-047 设置 UI 热键录制把「右 Alt + 字母」记成 Ctrl+Alt+字母
-
-> **Gavin 原话**：「点击设置热键，按下 alt 设为热键没反应，但按下 M 或 F10，却被设置为 ctrl+alt+M/F10，这个问题之前没出现过」
-
-**主控定位（`ui/src/pages/HotkeySettings.tsx`，代码逻辑自 08-15 `4f3b41b` 未变，那次只改了 `:43` 标签表）**：
-
-| 现象 | 机制 |
-| --- | --- |
-| 按 Alt 没反应 | `:131` 把 `AltLeft`/`ControlLeft`/`ShiftLeft`/`ShiftRight`/`Meta*` 列入**忽略名单**直接 return。只有右 Ctrl（`:122`）和右 Alt（`:126`）能单独成键。**按左 Alt 无反应是既有设计，不是新坏的** |
-| 按 M 变成 Ctrl+Alt+M | **AltGr**。Gavin 的语音热键就是右 Alt（`config.toml` `vk_code=165`），而右 Alt 在多数键盘布局上就是 AltGr，Windows 会**同时合成一个 LeftCtrl**。于是按住它再按 M 时 `e.ctrlKey && e.altKey` 双真，`:142-144` 忠实地记录成 `Ctrl+Alt+M`。**代码没错，是没处理 AltGr 语义** |
-
-🔴 **诚实标注**：「之前没出现过」这半句主控**无法从证据证实** —— 该文件逻辑未变，
-config 里 `hotkey` 两端都是 165。最可能是以往录制时先松开了右 Alt 再按字母。**待 Gavin 确认。**
-
-**待拍板两问**（答完才派发，避免按错的期望改）：
-1. 左 Alt / 左 Ctrl / 左 Shift 要不要允许单独设为热键？（当前设计只允许右侧三键）
-2. 右 Alt 按住再按字母时，期望是 ①只取字母（丢弃 AltGr 合成的 Ctrl+Alt）②取 Alt+字母 ③保持现状 Ctrl+Alt+字母？
-
----
-
 ## ℹ️ 非代码问题（已核实，无需开单）
 
 | 现象 | 结论 |
@@ -936,3 +916,29 @@ coder-1 在 DATA-SCENE-GENERIC-008 中评估后建议的候选：**`思维导图
 
 来源：DESIGN-FORMAT-SCENE-001 技术方案（collab/research/typeless-format-design-001.md）+ DEC-031。
 
+
+---
+
+## 📋 待排期 · I18N-HANT-GAP-001 繁体中文缺 `voice_asr_model_accuracy` 一个 key（2026-08-17 主控验收 HOTKEY-047 时机器发现）
+
+**发现方式**：验收 HOTKEY-047 时主控用 `comm` 比对三份 locale 的 key 集合（不是采信 Worker 自证）。
+
+| 文件 | key 数（`^  [a-z_0-9]*:` 计） |
+| --- | --- |
+| `ui/src/i18n/en.ts` | 111 |
+| `ui/src/i18n/zh-Hans.ts` | 111 |
+| `ui/src/i18n/zh-Hant.ts` | **110** ← 缺 `voice_asr_model_accuracy` |
+
+**已确认是历史遗留**：`git show HEAD:ui/src/i18n/zh-Hant.ts` 计得 110，`en.ts` 计得 111
+→ **不是 HOTKEY-047 引入**，coder-1 无责。
+
+**影响**：繁体中文用户在语音设置页看到 ASR 模型「准确度」相关文案时会拿到 `undefined`
+或回退（取决于 `getTranslations` 的兜底策略，**未核，实施前需先确认**）。
+
+**修法**：给 `zh-Hant.ts` 补该 key 的繁体译文。改动极小，但**必须顺带核一件事** ——
+`ui/src/i18n/index.ts` 的 `getTranslations` 对缺失 key 是否有兜底；
+若无兜底则属于「繁中用户看到 undefined」的用户可见缺陷，优先级要上调。
+
+**顺带的方法教训**（已记 `[WORKER-WRITE-SILENT-FAIL-001]` 同族）：
+coder-1 自证里报「三份 locale = 111:111:111 一致」，等式不成立 ——
+**报数字前要真的量一次**。主控验收一律独立复算，不采信自证里的数字。

@@ -2,6 +2,57 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-08-17 — coder-1 — HOTKEY-047-R2 ✅ 回归修复（右 Alt 单键 modifiers 被合成 Ctrl 污染，1 段改，待主控验收）
+
+- **来源**：主控 R1 验收通过主体，查出一处相对原代码的回归 —— 右 Alt 单键 `modifiers` 被合成 Ctrl 污染。基线同 R1
+- **根因**：原代码 `:126-129` `if (code === 'AltRight') applyVoiceHotkey(0xA5, 0)` modifiers 硬编码 0 永远干净；R1 改成推算后 ku AltRight 时 `e.ctrlKey`（合成 LeftCtrl 仍按下）&& `!isAltGrUp`（AltGraph 在 AltRight 抬起时已为 false）→ 条件成立 → `modifiers |= 0x0002` → display_name 变 `Ctrl+Right Alt`。Gavin 热键正是右 Alt，属「界面撒谎」（TRANS-HOTKEY-039 修过的同类）
+- **改动**（仅 `ui/src/pages/HotkeySettings.tsx` keyup 单键定案段，+2/-1）：
+  ```tsx
+  const altGrSynthWasActive = altGrSynthCtrlActiveRef.current;   // 在清零之前捕获
+  if (code === 'AltRight') { altGrSynthCtrlActiveRef.current = false; }
+  ...
+  if (e.ctrlKey && !isAltGrUp && !altGrSynthWasActive) modifiers |= 0x0002;
+  ```
+  只动 keyup 单键定案这一段；keydown 主键路径（`!isAltGr` 实时判定）已经是对的，未碰
+- **自证 1（右 Alt 单键逐事件，含 modifiers 逐位）**：kd ControlLeft(合成)→kd AltRight(delete ControlLeft+altGrSynth=true)→ku AltRight(altGrSynthWasActive=true 清前捕获→altGrSynth=false→hadNonModifierKey=F→delete→size=0→singleVk=0xA5→e.altKey=F 0x0001 不置；e.ctrlKey=T 但 !altGrSynthWasActive=false → 0x0002 不置；e.shiftKey=F → 0x0004 不置 → **modifiers=0**)→ku ControlLeft(finalized return) = **vk_code=165(0xA5), modifiers=0, display_name='Right Alt'**（不是 `Ctrl+Right Alt`）✅
+- **自证 2（按住右 Alt 再按 M，验证未修坏 B）**：kd ControlLeft(合成)→kd AltRight→kd KeyM(非修饰→isAltGr=getModifierState('AltGraph')=true→`e.ctrlKey && !isAltGr` ctrl 不计入→modifiers=0x0001→checkAndApply(0x4D,0x0001)) = **vk=0x4D mod=0x0001 display_name='Alt+M'** ✅（keydown 主键路径用 `!isAltGr` 实时判定，R2 未碰）
+- **主控已核清不受影响的三条**（不用重复验）：左 Alt 单键 / 右 Ctrl 单键 / 左 Shift 单键 ku 时 altKey/ctrlKey/shiftKey 均 false → modifiers=0。只有 AltGr 这一条受影响，已修
+- **关于 locale key 数量**：R1 自证报 111:111:111 有误，主控实测 111/111/110（zh-Hant 缺 voice_asr_model_accuracy，HEAD 版本就缺，非本任务引入，主控另开待办）。方法提醒：报数字前要真量一次
+- **验证**：`npx tsc --noEmit` 0 error / `npm run build` 通过 / `git diff -w --stat -- ui/` 仍 4 文件（HotkeySettings.tsx +147/-17 + 三份 i18n 各 +1/-1）
+- **红线合规**：未碰 `src/` `src-tauri/`（红线 1）/ 未改 CODE_TO_VK/VK_TO_LABEL/MOD_LABELS 数值（红线 2）/ 组合键 display_name 无 Left/Right（红线 3）/ 未用启发式（红线 4，`getModifierState('AltGraph')` 仍用于算 modifiers + `altGrSynthWasActive` 是平台固有事实捕获）/ 翻译侧只修焦点竞态（红线 6）/ 版本号 0.8.0 未动（红线 5）/ 未 commit
+- **result.md 落盘**：write 工具历史 silent fail，本轮直接贴 tmux 通知
+- **详情**：logs/20260817.md + CHANGELOG.md（HOTKEY-047-R2 条目）
+
+## 2026-08-17 — coder-1 — HOTKEY-047-R1 ✅ 打回修复（缺陷 1/2/3 + finalized 防重入，4 文件，待主控验收）
+
+- **来源**：主控验收 R0 打回三项：①【P0】右 Alt 单键被定案成 Left Ctrl（合成 ControlLeft 在 AltGraph 时序未成立时进入 pressedMods，keyup 顺序 AltRight→ControlLeft 时第 4 步 ControlLeft 误单键定案）；②追加需求 1 三语文案 `hotkey_click_to_change` 一个字没改；③组合键定案后残留 keyup 覆盖成单键。基线同 R0（HEAD `664b7bd`）
+- **改动**（4 文件：`ui/src/pages/HotkeySettings.tsx` +146/-17 + 三份 `ui/src/i18n/*.ts` 各 +1/-1）：
+  1. **缺陷 1**：改以「看见 AltRight 即剔除 ControlLeft」为锚点（不依赖 AltGraph 时序）—— keydown `code===AltRight` 时 `pressedModsRef.delete('ControlLeft')` + `altGrSynthCtrlActiveRef=true`；keyup 最前 `code===ControlLeft && altGrSynth` → 删除并 return（合成键永不定案）；keyup `AltRight` 时清 altGrSynth。删除原依赖 AltGraph 时序的合成键入口。`getModifierState('AltGraph')` 仍用于算 modifiers 过滤合成 Ctrl（红线 4 不破）。副作用：真想设「左 Ctrl+右 Alt+某键」的用户拿不到左 Ctrl，Windows 平台固有限制
+  2. **缺陷 2**：三份 locale `hotkey_click_to_change` 改为 `建议设置左右 Ctrl 或 Alt 键为热键` / `建議設定左右 Ctrl 或 Alt 鍵為熱鍵` / `Recommended: left or right Ctrl / Alt as the hotkey`。用 Edit 工具改（非 PowerShell），编码安全；`hotkey_set_translation` 未动
+  3. **缺陷 3**：选 ① `if (!isRecordingVoice) return` + 新增 `finalizedRef` 防重入。`applyVoiceHotkey`/`checkAndApplyVoiceHotkey`/keydown/keyup 入口 guard；`resetRecordingState` 清 false；`checkAndApplyVoiceHotkey` apply 分支前临时 `finalizedRef=false` 让 apply guard 通过。理由：`isRecordingVoice` 异步刷新，async `await invoke` 期间 keyup 仍看到旧值 true，ref 同步置 true 填补窗口期
+- **自证**：① 右 Alt 单键逐事件 kd ControlLeft(合成)→kd AltRight(剔除ControlLeft+altGrSynth=true)→ku AltRight(altGrSynth=false→delete→size=0→singleVk=0xA5→finalized=T)→ku ControlLeft(finalized=T return) = **vk=0xA5 Right Alt**（非 0xA2）✅；② Ctrl+Shift+M 释放 kd ControlLeft→kd ShiftLeft→kd KeyM(finalized=T)→ku KeyM/ShiftLeft/ControlLeft 全 return = **Ctrl+Shift+M 不被覆盖** ✅；③ 三份 locale `grep -c ":"` = 111:111:111，三行新值正确 ✅
+- **验证**：`npx tsc --noEmit` 0 error / `npm run build` 通过 / `git diff -w --stat -- ui/` 仅 4 文件
+- **红线合规**：未碰 `src/` `src-tauri/`（红线 1）/ 未改 CODE_TO_VK/VK_TO_LABEL/MOD_LABELS 数值（红线 2）/ 组合键 display_name 无 Left/Right（红线 3）/ 未用启发式代替 `getModifierState('AltGraph')`（红线 4，仍用于算 modifiers）/ 翻译侧只修焦点竞态（红线 6）/ 版本号 0.8.0 未动（红线 5）/ 未 commit
+- **result.md 落盘**：write 工具两次 silent fail（`wc -c`=0，mtime 未动），已按主控指示把自证+收尾表贴进 tmux 通知
+- **详情**：logs/20260817.md + CHANGELOG.md（HOTKEY-047-R1 条目）
+
+## 2026-08-17 — coder-1 — HOTKEY-047 ✅ 设置 UI 热键录制重做（P0，ui/src/pages/HotkeySettings.tsx +117/-13，待主控验收）
+
+- **来源**：Gavin 端测两轮反馈 + 主控独立取证三根因派单。基线 HEAD `664b7bd`（BUILD-018）
+- **三根因**：A 焦点竞态 `setTimeout(50)`+`ref?.focus()` 静默失败（首次进入页面 React 未提交 DOM → ref.current===null，整轮拿不到焦点 → 按 alt 无反应；第二次组件已渲染、主线程空闲 → 成功）；B 左侧修饰键 `:131` 硬编码 `return` 吞掉；C 右 Alt=AltGr，Windows 合成左 Ctrl，按住右 Alt+M 被误记成 Ctrl+Alt+M
+- **改动**（仅 `ui/src/pages/HotkeySettings.tsx`，+117/-13）：
+  1. 焦点竞态：`setTimeout` 全删 → `useLayoutEffect` 在 DOM 提交后同步 focus（ref 必非 null）+ `autoFocus` 第二道兜底 + `onBlur` 退出录制态防僵死；语音侧 + 翻译侧同款
+  2. 修饰键单设 + 任意组合：keydown 定组合 / keyup 定单键；维护 `pressedModsRef: Set<string>` + `hadNonModifierKeyRef`；keydown 修饰键入集 + 实时回显 `voiceRecordingPreview`，非修饰键立即定案；keyup 若本轮无非修饰键且最后一个修饰键松开 → 定案为该单键（vk 区分左右）；`onKeyUp` handler 新增
+  3. AltGr：`getModifierState('AltGraph')` 精确判定（非启发式）；合成 ControlLeft 用 `altGrSynthCtrlActiveRef` 过滤、不进 `pressedModsRef`；算 modifiers 时 `if (e.ctrlKey && !isAltGr)` 过滤
+  4. 统一冲突检查：删原 `:122-129` 右 Ctrl/右 Alt 绕过 `check_hotkey_available` 的快捷路径，所有定案走 `checkAndApplyVoiceHotkey`
+- **自证（三必答）**：① 四种操作逐条走通（单左 Alt→`Left Alt` vk=0xA4 mod=0 / 左 Alt+M→`Alt+M` vk=0x4D mod=0x0001 / 右 Alt(AltGr)+M→`Alt+M`（合成 Ctrl 被过滤）/ Ctrl+Shift+M→`Ctrl+Shift+M` mod=0x0006）；② `useLayoutEffect` 在 React DOM mutation 后同步执行（早于 paint），ref 必非 null，与 `setTimeout` 跨越渲染提交时序的本质区别消除静默失败，`autoFocus`+`onBlur` 兜底；③ 组合键 display_name 经 `getHotkeyDisplayName`，修饰键部分只用 `MOD_LABELS`（`Alt`/`Ctrl`/`Shift`/`Win` 不分左右），**无 `Left`/`Right` 字样**（自证通过）；单键 display_name 用 `VK_TO_LABEL` 的 `Left Alt`/`Right Alt`（单键真区分左右，非撒谎）
+- **验收**：`npx tsc --noEmit` 0 error / `npm run build` 通过（tsc && vite build，dist 正常）/ `git diff -w --stat` 仅 `ui/src/pages/HotkeySettings.tsx` +117/-13（CRLF 噪声属既有 `[CRLF-CROSSPLAT-001]`）
+- **红线合规**：未碰 `src/` `src-tauri/`（红线 1）/ 未改 `CODE_TO_VK` `VK_TO_LABEL` `MOD_LABELS` 数值（红线 2）/ 未用启发式代替 `getModifierState('AltGraph')`（红线 4）/ 翻译侧只修焦点竞态、录制规则未改（红线 6）/ 版本号 0.8.0 未动（红线 5）/ 未 commit（主控统一提交）
+- **测试**：无 `*.test.tsx`（阶段三 TEST-SYNC-047 由 tester-1 串行派发，禁止并行）
+- **边界**：与 coder-2 在 `src/main.rs` 零重叠；`ui/src/pages/Voice.tsx` 等其他文件未碰
+- **跨平台**：`docs/MACOS-HANDOFF.md` 追加 §HOTKEY-047
+- **详情**：outbox/coder-1/result.md + logs/20260817.md + CHANGELOG.md
+
 ## 2026-08-17 — tester-1 — BUILD-018 ✅ 阶段五出包：OVERLAY-043 全批进 exe（零生产改动，待主控验收）
 
 - **来源**：主控派单（DEC-053 直接出包，基线 HEAD `b499cc3`）。前置四提交 OVERLAY-043 `a588509` / OVERLAY-043-B `5940e73` / TEST-SYNC-043 `497131f` / TEST-EXEC-043 `b499cc3` 已全验收

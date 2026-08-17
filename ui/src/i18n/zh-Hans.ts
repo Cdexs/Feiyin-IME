@@ -93,7 +93,7 @@ export const zhHans = {
   hotkey_voice_tab: '语音热键',
   hotkey_translation_tab: '翻译热键',
   hotkey_press_new: '请按下新热键...',
-  hotkey_click_to_change: '点击按键可修改热键（推荐：右 Ctrl / 右 Alt）',
+  hotkey_click_to_change: '建议设置左右 Ctrl 或 Alt 键为热键',
   hotkey_trigger_mode: '触发方式',
   hotkey_toggle: '切换模式',
   hotkey_toggle_desc: '按一次开始，再按一次结束',

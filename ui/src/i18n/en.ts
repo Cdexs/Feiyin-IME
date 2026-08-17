@@ -93,7 +93,7 @@ export const en = {
   hotkey_voice_tab: 'Voice Hotkey',
   hotkey_translation_tab: 'Translation Hotkey',
   hotkey_press_new: 'Press new hotkey...',
-  hotkey_click_to_change: 'Click to change hotkey (recommended: Right Ctrl / Right Alt)',
+  hotkey_click_to_change: 'Recommended: left or right Ctrl / Alt as the hotkey',
   hotkey_trigger_mode: 'Trigger mode',
   hotkey_toggle: 'Toggle',
   hotkey_toggle_desc: 'Press to start, press again to stop',

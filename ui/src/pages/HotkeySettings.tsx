@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useLayoutEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getTranslations } from '../i18n';
 
@@ -68,6 +68,31 @@ function getHotkeyDisplayName(vkCode: number, modifiers: number): string {
 
 const TRANSLATION_SINGLE_KEYS = [0xA3, 0xA2, 0xA5, 0xA4];
 
+const MODIFIER_CODES = new Set([
+  'ControlLeft', 'ControlRight',
+  'AltLeft', 'AltRight',
+  'ShiftLeft', 'ShiftRight',
+  'MetaLeft', 'MetaRight',
+]);
+
+const MODIFIER_DISPLAY_ORDER = [
+  'ControlLeft', 'ControlRight',
+  'AltLeft', 'AltRight',
+  'ShiftLeft', 'ShiftRight',
+  'MetaLeft', 'MetaRight',
+];
+
+function pressedModifierLabels(pressed: Set<string>): string {
+  const labels: string[] = [];
+  for (const c of MODIFIER_DISPLAY_ORDER) {
+    if (pressed.has(c)) {
+      const vk = CODE_TO_VK[c];
+      if (vk !== undefined && VK_TO_LABEL[vk]) labels.push(VK_TO_LABEL[vk]);
+    }
+  }
+  return labels.join('+');
+}
+
 const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
   const t = getTranslations(config.ui_language);
   const [activeSubTab, setActiveSubTab] = useState<'voice' | 'translation'>('voice');
@@ -75,13 +100,28 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
   const [isRecordingVoice, setIsRecordingVoice] = useState(false);
   const [pendingHotkey, setPendingHotkey] = useState<{vk: number, mod: number} | null>(null);
   const voiceInputRef = useRef<HTMLDivElement>(null);
+  const pressedModsRef = useRef<Set<string>>(new Set());
+  const hadNonModifierKeyRef = useRef(false);
+  const altGrSynthCtrlActiveRef = useRef(false);
+  const finalizedRef = useRef(false);
+  const [voiceRecordingPreview, setVoiceRecordingPreview] = useState<string>('');
 
   const [isRecordingTranslation, setIsRecordingTranslation] = useState(false);
   const translationInputRef = useRef<HTMLDivElement>(null);
 
   const translation = config.translation ?? { enabled: false, vk_code: 0, display_name: '', target_language: 'Chinese' };
 
+  const resetRecordingState = () => {
+    pressedModsRef.current.clear();
+    hadNonModifierKeyRef.current = false;
+    altGrSynthCtrlActiveRef.current = false;
+    finalizedRef.current = false;
+    setVoiceRecordingPreview('');
+  };
+
   const applyVoiceHotkey = (vkCode: number, modifiers: number) => {
+    if (finalizedRef.current) return;
+    finalizedRef.current = true;
     const newHotkey = {
       ...config.hotkey,
       vk_code: vkCode,
@@ -90,21 +130,27 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
     };
     updateConfig({ ...config, hotkey: newHotkey });
     setIsRecordingVoice(false);
+    resetRecordingState();
   };
 
   const checkAndApplyVoiceHotkey = async (vkCode: number, modifiers: number) => {
+    if (finalizedRef.current) return;
+    finalizedRef.current = true;
     try {
       const available = await invoke<boolean>('check_hotkey_available', {
         vk_code: vkCode,
         modifiers: modifiers,
       });
       if (available) {
+        finalizedRef.current = false;
         applyVoiceHotkey(vkCode, modifiers);
       } else {
         setIsRecordingVoice(false);
         setPendingHotkey({ vk: vkCode, mod: modifiers });
+        resetRecordingState();
       }
     } catch {
+      finalizedRef.current = false;
       applyVoiceHotkey(vkCode, modifiers);
     }
   };
@@ -112,23 +158,24 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
   const handleVoiceHotkeyKeyDown = (e: React.KeyboardEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    if (finalizedRef.current) return;
     const code = e.code;
 
     if (code === 'Escape') {
       setIsRecordingVoice(false);
+      resetRecordingState();
       return;
     }
 
-    if (code === 'ControlRight') {
-      applyVoiceHotkey(0xA3, 0);
-      return;
-    }
-    if (code === 'AltRight') {
-      applyVoiceHotkey(0xA5, 0);
-      return;
-    }
-
-    if (['ControlLeft', 'AltLeft', 'ShiftLeft', 'ShiftRight', 'MetaLeft', 'MetaRight'].includes(code)) {
+    if (MODIFIER_CODES.has(code)) {
+      if (code === 'AltRight') {
+        pressedModsRef.current.delete('ControlLeft');
+        altGrSynthCtrlActiveRef.current = true;
+      }
+      if (!pressedModsRef.current.has(code)) {
+        pressedModsRef.current.add(code);
+        setVoiceRecordingPreview(pressedModifierLabels(pressedModsRef.current));
+      }
       return;
     }
 
@@ -138,17 +185,69 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
       return;
     }
 
+    const isAltGr = e.getModifierState('AltGraph');
     let modifiers = 0;
     if (e.altKey) modifiers |= 0x0001;
-    if (e.ctrlKey) modifiers |= 0x0002;
+    if (e.ctrlKey && !isAltGr) modifiers |= 0x0002;
     if (e.shiftKey) modifiers |= 0x0004;
+    if (e.getModifierState('Meta')) modifiers |= 0x0008;
 
+    hadNonModifierKeyRef.current = true;
     checkAndApplyVoiceHotkey(vkCode, modifiers);
   };
 
+  const handleVoiceHotkeyKeyUp = (e: React.KeyboardEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (finalizedRef.current) return;
+    if (!isRecordingVoice) return;
+    const code = e.code;
+
+    if (code === 'ControlLeft' && altGrSynthCtrlActiveRef.current) {
+      pressedModsRef.current.delete(code);
+      return;
+    }
+
+    if (!MODIFIER_CODES.has(code)) return;
+
+    const altGrSynthWasActive = altGrSynthCtrlActiveRef.current;
+    if (code === 'AltRight') {
+      altGrSynthCtrlActiveRef.current = false;
+    }
+
+    if (hadNonModifierKeyRef.current) {
+      pressedModsRef.current.delete(code);
+      return;
+    }
+
+    pressedModsRef.current.delete(code);
+    if (pressedModsRef.current.size > 0) {
+      setVoiceRecordingPreview(pressedModifierLabels(pressedModsRef.current));
+      return;
+    }
+
+    const singleVk = CODE_TO_VK[code];
+    if (singleVk === undefined) return;
+
+    const isAltGrUp = e.getModifierState('AltGraph');
+    let modifiers = 0;
+    if (e.altKey) modifiers |= 0x0001;
+    if (e.ctrlKey && !isAltGrUp && !altGrSynthWasActive) modifiers |= 0x0002;
+    if (e.shiftKey) modifiers |= 0x0004;
+    if (e.getModifierState('Meta')) modifiers |= 0x0008;
+
+    checkAndApplyVoiceHotkey(singleVk, modifiers);
+  };
+
+  useLayoutEffect(() => {
+    if (isRecordingVoice) {
+      resetRecordingState();
+      voiceInputRef.current?.focus();
+    }
+  }, [isRecordingVoice]);
+
   const startRecordingVoice = () => {
     setIsRecordingVoice(true);
-    setTimeout(() => voiceInputRef.current?.focus(), 50);
   };
 
   const handleVoiceModeChange = (mode: string) => {
@@ -193,8 +292,13 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
 
   const startRecordingTranslation = () => {
     setIsRecordingTranslation(true);
-    setTimeout(() => translationInputRef.current?.focus(), 50);
   };
+
+  useLayoutEffect(() => {
+    if (isRecordingTranslation) {
+      translationInputRef.current?.focus();
+    }
+  }, [isRecordingTranslation]);
 
   const handleTranslationEnabledChange = (enabled: boolean) => {
     updateConfig({
@@ -232,7 +336,15 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
               {!isRecordingVoice ? (
                 <button className="hotkey-key-btn" onClick={startRecordingVoice}>{currentVoiceDisplayName}</button>
               ) : (
-                <div className="hotkey-key-btn hotkey-key-listening" tabIndex={0} ref={voiceInputRef} onKeyDown={handleVoiceHotkeyKeyDown}>{t.hotkey_press_new}</div>
+                <div
+                  className="hotkey-key-btn hotkey-key-listening"
+                  tabIndex={0}
+                  ref={voiceInputRef}
+                  autoFocus
+                  onKeyDown={handleVoiceHotkeyKeyDown}
+                  onKeyUp={handleVoiceHotkeyKeyUp}
+                  onBlur={() => { setIsRecordingVoice(false); resetRecordingState(); }}
+                >{voiceRecordingPreview || t.hotkey_press_new}</div>
               )}
               <span className="hotkey-key-hint">{t.hotkey_click_to_change}</span>
             </div>
@@ -277,7 +389,14 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
               {!isRecordingTranslation ? (
                 <button className="hotkey-key-btn" onClick={startRecordingTranslation}>{currentTranslationDisplayName}</button>
               ) : (
-                <div className="hotkey-key-btn hotkey-key-listening" tabIndex={0} ref={translationInputRef} onKeyDown={handleTranslationHotkeyKeyDown}>{t.hotkey_press_translation}</div>
+                <div
+                  className="hotkey-key-btn hotkey-key-listening"
+                  tabIndex={0}
+                  ref={translationInputRef}
+                  autoFocus
+                  onKeyDown={handleTranslationHotkeyKeyDown}
+                  onBlur={() => setIsRecordingTranslation(false)}
+                >{t.hotkey_press_translation}</div>
               )}
               <span className="hotkey-key-hint">{t.hotkey_set_translation}</span>
             </div>

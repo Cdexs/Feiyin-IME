@@ -93,7 +93,7 @@ export const zhHant = {
   hotkey_voice_tab: '語音熱鍵',
   hotkey_translation_tab: '翻譯熱鍵',
   hotkey_press_new: '請按下新熱鍵...',
-  hotkey_click_to_change: '點擊按鍵可修改熱鍵（推薦：右 Ctrl / 右 Alt）',
+  hotkey_click_to_change: '建議設定左右 Ctrl 或 Alt 鍵為熱鍵',
   hotkey_trigger_mode: '觸發方式',
   hotkey_toggle: '切換模式',
   hotkey_toggle_desc: '按一次開始，再按一次結束',

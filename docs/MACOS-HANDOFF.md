@@ -1262,3 +1262,12 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 - 阶段五出包：OVERLAY-043 全批（`a588509`/`5940e73`/`497131f`/`b499cc3`）进 exe，改动全在 `src/main.rs`。
 - 四步构建全执行 + 七项核验全 PASS；三 exe 两副本 sha256 逐一相等、toml 三副本一致、ProductVersion 0.8.0 未动、冒烟 Responding=True 无 panic。
 - `interpolate_step` / `should_ignore_streaming_text` 均为 Windows overlay 纯函数，本包为 Windows 产物构建，macOS 侧无任何动作。
+
+### HOTKEY-047 补充（2026-08-17）
+
+- 仅改前端 `ui/src/pages/HotkeySettings.tsx`（+117/-13），两端共用此文件，macOS 端同步生效。
+- 修三个根因：① 焦点竞态 `setTimeout(50)` → `useLayoutEffect` + `autoFocus` + `onBlur` 兜底；② 左/右修饰键可单设（keydown 定组合 / keyup 定单键）；③ AltGr 合成的左 Ctrl 用 `getModifierState('AltGraph')` 精确过滤。
+- 录制期间实时回显已按下的修饰键（`voiceRecordingPreview`），消灭「按了没反应」。
+- 翻译热键侧只同步焦点竞态修复（`useLayoutEffect` + `autoFocus` + `onBlur`），录制规则未改。
+- 后端能力边界（macOS 侧 `src/platform/macos/hotkey.rs` 未读，本轮未碰）：UI 层改动平台中立，若 macOS 后端不支持修饰键单键 polling，UI 仍会发出对应 vk/modifiers，届时由 macOS 后端决定是否生效；本任务红线明确不动后端。
+- 无 `*.test.tsx`（阶段三 TEST-SYNC-047 由 tester-1 串行派发）。

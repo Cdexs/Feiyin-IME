@@ -455,6 +455,7 @@ PTT 录音中点击即进编辑态（不等松键）｜流式文本白色不加�
 | **TEST-EXEC-043** | 阶段四全量回归 + 消融实测（OVERLAY-043 批） | — | tester-1 | ✅ 已验收已提交 `b499cc3` |
 | **BUILD-018** | 阶段五出包：OVERLAY-043 全批进 exe | — | tester-1 | ✅ 已验收（产物 08-17 13:57-14:00，七项核验主控独立复算通过） |
 | **OVERLAY-046** | 修复录音 overlay 窗口从未被定位/定尺寸（P0 阻塞日常使用，OVERLAY-043 真回归） | `src/main.rs` | coder-2 | 🟡 **阶段一修复完成**，待主控验收 |
+| **HOTKEY-047** | 设置 UI 热键录制重做（P0）：焦点竞态 + 左修饰键可单设 + 任意组合键 + AltGr 合成 Ctrl 过滤（R1：修右 Alt 误定案 Left Ctrl + 三语文案 + finalized 防重入；R2：修右 Alt 单键 modifiers 被合成 Ctrl 污染） | `ui/src/pages/HotkeySettings.tsx` + 三份 `ui/src/i18n/*.ts` | coder-1 | 🟡 **R2 完成待验收** |
 
 **038-A 验收取证**（主控独立复现，未采信报告）：`cargo fmt --check` clean ｜ `cargo check --all-targets` 0 error（当时）
 ｜源码 `#[test]` 计数 **45** 与报告一致 ｜文件域零越界。四处硬红线全部落实：`"model"` 在 payload 内 ｜
