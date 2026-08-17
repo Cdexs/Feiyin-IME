@@ -18,6 +18,7 @@ vi.mock('@tauri-apps/api/app', () => ({
 }));
 
 import HotkeySettingsPage from './HotkeySettings.tsx';
+import { voiceKeySet, translationKeySet, keysOverlap } from './HotkeySettings.tsx';
 import { zhHans } from '../i18n/zh-Hans';
 import { zhHant } from '../i18n/zh-Hant';
 import { en } from '../i18n/en';
@@ -211,5 +212,90 @@ describe('HotkeySettingsPage - HOTKEY-047', () => {
     expect(zhHans.hotkey_click_to_change).toBeTruthy();
     expect(zhHant.hotkey_click_to_change).toBeTruthy();
     expect(en.hotkey_click_to_change).toBeTruthy();
+  });
+});
+
+describe('HotkeySettingsPage - HOTKEY-049 纯函数护栏', () => {
+  const toSortedArray = (s: Set<number>) => [...s].sort((a, b) => a - b);
+
+  // Gavin 拍板的七条实例对照表（逐条一个用例）
+  it('HOTKEY-049-T1: 语音=右 Alt(165,0)，翻译=右 Alt(0xA5) → 拦（交集 {0xA5}）', () => {
+    const vSet = voiceKeySet(165, 0);
+    expect(toSortedArray(vSet)).toEqual([0xA5]);
+    const tSet = translationKeySet(0xA5);
+    expect(keysOverlap(vSet, tSet)).toBe(true);
+  });
+
+  it('HOTKEY-049-T2: 语音=右 Alt(165,0)，翻译=左 Alt(0xA4) → 放行（空交集）', () => {
+    const vSet = voiceKeySet(165, 0);
+    const tSet = translationKeySet(0xA4);
+    expect(keysOverlap(vSet, tSet)).toBe(false);
+  });
+
+  it('HOTKEY-049-T3: 语音=Alt+M(0x4D,0x1)，翻译=右 Alt(0xA5) → 拦', () => {
+    const vSet = voiceKeySet(0x4D, 0x1);
+    expect(toSortedArray(vSet)).toEqual([0x4D, 0xA4, 0xA5]);
+    const tSet = translationKeySet(0xA5);
+    expect(keysOverlap(vSet, tSet)).toBe(true);
+  });
+
+  it('HOTKEY-049-T4: 语音=Alt+M(0x4D,0x1)，翻译=左 Alt(0xA4) → 拦（左右都算）', () => {
+    const vSet = voiceKeySet(0x4D, 0x1);
+    const tSet = translationKeySet(0xA4);
+    expect(keysOverlap(vSet, tSet)).toBe(true);
+  });
+
+  it('HOTKEY-049-T5: 语音=Alt+M(0x4D,0x1)，翻译=右 Ctrl(0xA3) → 放行', () => {
+    const vSet = voiceKeySet(0x4D, 0x1);
+    const tSet = translationKeySet(0xA3);
+    expect(keysOverlap(vSet, tSet)).toBe(false);
+  });
+
+  it('HOTKEY-049-T6: 语音=Ctrl+Shift+M(0x4D,0x6)，翻译=左 Ctrl(0xA2) → 拦', () => {
+    const vSet = voiceKeySet(0x4D, 0x6);
+    expect(toSortedArray(vSet)).toEqual([0x4D, 0xA0, 0xA1, 0xA2, 0xA3]);
+    const tSet = translationKeySet(0xA2);
+    expect(keysOverlap(vSet, tSet)).toBe(true);
+  });
+
+  it('HOTKEY-049-T7: 语音=Ctrl+Shift+M(0x4D,0x6)，翻译=右 Alt(0xA5) → 放行', () => {
+    const vSet = voiceKeySet(0x4D, 0x6);
+    const tSet = translationKeySet(0xA5);
+    expect(keysOverlap(vSet, tSet)).toBe(false);
+  });
+
+  // 追加边界用例
+  it('HOTKEY-049-T8: translationKeySet(0)（翻译未设置）→ 空集，keysOverlap 恒 false（不得拦）', () => {
+    const tSet = translationKeySet(0);
+    expect(tSet.size).toBe(0);
+    const vSet = voiceKeySet(0xA5, 0);
+    expect(keysOverlap(vSet, tSet)).toBe(false);
+    expect(keysOverlap(tSet, vSet)).toBe(false);
+  });
+
+  it('HOTKEY-049-T9: 修饰键展开穷举 —— MOD_ALT→{0xA4,0xA5} / MOD_CONTROL→{0xA2,0xA3} / MOD_SHIFT→{0xA0,0xA1} / MOD_WIN→{0x5B,0x5C}', () => {
+    const cases: Array<[number, number[]]> = [
+      [0x0001, [0xA4, 0xA5]],
+      [0x0002, [0xA2, 0xA3]],
+      [0x0004, [0xA0, 0xA1]],
+      [0x0008, [0x5B, 0x5C]],
+    ];
+    for (const [mod, expectedMods] of cases) {
+      const set = voiceKeySet(0x41, mod);
+      for (const m of expectedMods) expect(set.has(m)).toBe(true);
+    }
+  });
+
+  it('HOTKEY-049-T10: keysOverlap 空集短路 —— 任一侧为空 → false', () => {
+    expect(keysOverlap(new Set(), new Set([0xA5]))).toBe(false);
+    expect(keysOverlap(new Set([0xA5]), new Set())).toBe(false);
+    expect(keysOverlap(new Set(), new Set())).toBe(false);
+  });
+
+  it('HOTKEY-049-T11: 组合修饰键 mod=0x7（Ctrl+Alt+Shift）→ 六个修饰键 vk 全在集合内', () => {
+    const set = voiceKeySet(0x4D, 0x7);
+    const allModKeys = [0xA2, 0xA3, 0xA4, 0xA5, 0xA0, 0xA1];
+    for (const vk of allModKeys) expect(set.has(vk)).toBe(true);
+    expect(set.has(0x4D)).toBe(true);
   });
 });

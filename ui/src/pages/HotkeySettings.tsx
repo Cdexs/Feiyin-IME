@@ -68,7 +68,7 @@ function getHotkeyDisplayName(vkCode: number, modifiers: number): string {
 
 const TRANSLATION_SINGLE_KEYS = [0xA3, 0xA2, 0xA5, 0xA4];
 
-function voiceKeySet(vkCode: number, modifiers: number): Set<number> {
+export function voiceKeySet(vkCode: number, modifiers: number): Set<number> {
   const set = new Set<number>();
   set.add(vkCode);
   if (modifiers & 0x0001) { set.add(0xA4); set.add(0xA5); }
@@ -78,13 +78,13 @@ function voiceKeySet(vkCode: number, modifiers: number): Set<number> {
   return set;
 }
 
-function translationKeySet(vkCode: number): Set<number> {
+export function translationKeySet(vkCode: number): Set<number> {
   const set = new Set<number>();
   if (vkCode !== 0) set.add(vkCode);
   return set;
 }
 
-function keysOverlap(a: Set<number>, b: Set<number>): boolean {
+export function keysOverlap(a: Set<number>, b: Set<number>): boolean {
   if (a.size === 0 || b.size === 0) return false;
   for (const v of a) if (b.has(v)) return true;
   return false;

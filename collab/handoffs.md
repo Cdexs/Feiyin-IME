@@ -311,3 +311,16 @@
 - **纯出包**：无代码改动、版本号未动、未 commit（主控统一提交）、未 push
 - **建议主控下一步**：① 修 harness 三处缺陷（配置写 exe_dir / state_detector 尺寸 240x36 / 补 pip toml）后重跑 E2E 冲绿；② 端测项转达：HOTKEY-047 右 Alt 单键 PTT + 任意组合键 + AltGr 过滤
 - **详情**：logs/20260817.md + CHANGELOG.md + progress.md 产物表
+
+---
+
+## 2026-08-17 — tester-1 — TEST-SYNC-049/051/053 ✅ 阶段三测试同步：HOTKEY-049 护栏 + WORDBOOK-053 方向复核（前置 export 授权协商闭环，待主控验收）
+
+- **来源**：主控派单（基线 HEAD `15ea6b5`，本批三提交 HOTKEY-049+OVERLAY-051 `9c1806d` / OVERLAY-051-A/H `f03a4ea` / WORDBOOK-053 A+B `15ea6b5` 已验收）
+- **前置协商**：任务书称三纯函数「已导出可直接测」不实（模块私有，`git log -S` 从未 export）→ 按 [ASSERT-ADJUST-REPORT-001 附则] 先报主控 → 主控认错 + **授权仅加 `export`**（严格边界），diff `--numstat` 3/3 自证，`:500` export default 原样
+- **任务一**：`HotkeySettings.test.tsx` 追加 +86（不新建）：T1-T7 七条实例逐条一用例（精确集合断言 + keysOverlap 拦/放行）+ T8-T11 边界（`translationKeySet(0)` 空集不得拦 / 修饰键展开穷举 / 空集短路 / mod=0x7 六修饰键）；消融推演删 `set.add(0xA4)` → T4 必红（Gavin 拍板「左右都算」）
+- **任务二**：`src/wordbook/mod.rs` 测试区补 +15，复核 coder-2 四条均为精确值断言真护栏；补 `test_extract_correction_word_never_returns_original_side_text`（阿里云/阿里運，断言不含原侧 `云` + eq `運`）；附注 `_does_not_learn_original_side` 注释陈旧（写 None 实为 Some("云")，判据正确未动）
+- **任务三**：五项不可测项如实清单（EDIT 子类化/横向滚动/C-E-F/线程归属/Ctrl+Alt+M vs AltGr），不写假护栏
+- **验证**：`npx tsc --noEmit` 0 error / `cargo check --all-targets` 0 error（白名单内）；未跑测试执行类命令（消融实测留阶段四 TEST-EXEC-049/051/053）
+- **红线合规**：版本号 0.8.0 未动 / 未 commit / 未改 coder-2 判据 / `src/**` 生产零改动（仅测试模块）
+- **详情**：outbox/tester-1/result.md + logs/20260817.md + CHANGELOG.md

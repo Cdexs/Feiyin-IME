@@ -232,4 +232,19 @@ mod tests {
             Some("好".to_string())
         );
     }
+
+    #[test]
+    fn test_extract_correction_word_never_returns_original_side_text() {
+        // Orchestrator-specified direction guard: for original "阿里云" edited to "阿里運"-type
+        // input, the learned word must NEVER contain original-side text. The common prefix "阿里"
+        // is preserved context (present in both sides), so the guard checks the *distinctive*
+        // original-side char "云" that a wrong-side implementation would return instead of "運".
+        let learned = extract_correction_word("阿里云", "阿里運").expect("should learn a word");
+        assert!(
+            !learned.contains('云'),
+            "learned word {:?} must not contain original-side char 云",
+            learned
+        );
+        assert_eq!(learned, "運");
+    }
 }
