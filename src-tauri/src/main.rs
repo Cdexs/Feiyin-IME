@@ -82,17 +82,23 @@ fn check_hotkey_available(_vk_code: u32, _modifiers: u32) -> bool {
     true
 }
 
-/// ASR-QWEN3-UI-001 / ASR-041-B: verify that the provided online ASR API key
+/// ASR-QWEN3-UI-001 / ASR-041-B / ASR-055: verify that the provided online ASR API key
 /// can authenticate to the ASR WebSocket endpoint. Returns a short success
 /// string or an error message suitable for display in the settings UI.
-/// Note: test_qwen3_asr_connection still tests the old Realtime API endpoint;
-/// updating it to test the Inference API is a separate task.
+///
+/// ASR-055: previously passed empty strings for url/model (leftover from ASR-041-B
+/// rename), causing 100% failure with "invalid WebSocket URL". Now reads real config
+/// and uses the Inference API protocol (model in payload, not URL query) matching
+/// production (`src/transcription/qwen_inference.rs`).
 #[tauri::command]
 async fn test_qwen3_asr_connection(api_key: String) -> Result<String, String> {
-    let cfg = AppConfig::load().map_err(|e| format!("failed to load config: {e}"))?;
-    // ASR-041-B: 字段已改名为 asr_online_url/asr_online_model，但 test 函数
-    // 仍测旧 Realtime API（qwen3_asr_url 的默认值已被删，这里用空串占位避免编译挂）
-    qwen3::test_qwen3_asr_connection(api_key, "", "").await
+    let cfg = AppConfig::load().map_err(|e| format!("加载配置失败：{e}"))?;
+    qwen3::test_qwen3_asr_connection(
+        api_key,
+        &cfg.audio.asr_online_url,
+        &cfg.audio.asr_online_model,
+    )
+    .await
 }
 
 /// ASR-DUAL-B-003: 检测 accuracy 模型是否已就位（供前端下载引导用）

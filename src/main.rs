@@ -150,6 +150,9 @@ enum OverlayCommand {
     /// ASR-038-C: 从 Recording/RecordingWithText 进入 StreamingEditing 态
     EnterEditMode,
     Hide,
+    /// OVERLAY-054-A: 提交编辑时先恢复 NOACTIVATE、销毁 EDIT 控件并隐藏窗口，
+    /// 避免 overlay 继续持有焦点/前台，影响原窗口文本注入。
+    RestoreAndHide,
     Shutdown,
 }
 #[derive(Debug, Clone)]
@@ -1196,18 +1199,23 @@ fn run_overlay_thread(
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                 }
-                OverlayCommand::Hide => {
+                OverlayCommand::Hide | OverlayCommand::RestoreAndHide => {
+                    let restore = matches!(command, OverlayCommand::RestoreAndHide);
                     if let Ok(mut state) = shared_state.lock() {
                         // ASR-038-C-REWORK-001: single-point safeguard — do not tear down the EDIT control
                         // while the user is actively editing. The controller will also suppress Hide while
                         // OVERLAY_EDITING is true; this guard protects against any other path that reaches here.
-                        if matches!(
-                            state.request,
-                            Some(OverlayRequest {
-                                status: OverlayStatus::StreamingEditing { .. },
-                                ..
-                            })
-                        ) {
+                        // OVERLAY-054-A: RestoreAndHide is explicitly allowed to tear down editing because the
+                        // controller has already cleared OVERLAY_EDITING and needs the window to release focus.
+                        if !restore
+                            && matches!(
+                                state.request,
+                                Some(OverlayRequest {
+                                    status: OverlayStatus::StreamingEditing { .. },
+                                    ..
+                                })
+                            )
+                        {
                             log::info!("ASR-038-C: Hide suppressed while overlay is in StreamingEditing state");
                             continue;
                         }
@@ -3273,10 +3281,16 @@ fn process_controller_events(
                             target_hwnd,
                         );
                     } else {
+                        // OVERLAY-054-B: use overlay_geometry for the initial Recording position so the
+                        // first Show matches the later RecordingStarted Show; avoids a flash at (0,0).
+                        let (pos, size) = overlay_geometry(
+                            &OverlayStatus::Recording,
+                            overlay_handle.overlay_hwnd,
+                        );
                         overlay_handle.send(OverlayCommand::Show(OverlayRequest {
                             status: OverlayStatus::Recording,
-                            pos: [0, 0],
-                            size: RECORDING_OVERLAY_SIZE,
+                            pos,
+                            size,
                             opacity: config.audio.overlay_opacity.clamp(0.1, 1.0),
                             ui_language: config.ui_language,
                             auto_close_ms: 0,
@@ -3517,50 +3531,74 @@ fn process_controller_events(
                         }
                     });
                 }
-                // ASR-038-C: 编辑提交。先尝试把焦点还给目标窗口，再注入文本。
-                // 无法取回焦点则降级为复制到剪贴板 + FocusLost 预览。
-                if target_hwnd != 0 {
-                    let target = HWND(target_hwnd as *mut std::ffi::c_void);
-                    let restored = unsafe { SetForegroundWindow(target).as_bool() };
-                    if restored {
-                        let current_id = platform::foreground_window_id();
-                        let focus_lost = current_id != target_hwnd;
-                        if !focus_lost {
-                            let config = clone_runtime_config(runtime_config);
-                            let text_snapshot = platform::capture_focused_text_snapshot();
-                            if let Err(e) = platform::inject_text(
-                                &text,
-                                config.injection.use_clipboard,
-                                config.injection.clipboard_delay_ms,
-                            ) {
-                                log::error!("ASR-038-C: inject text failed: {}", e);
-                                let _ = platform::copy_text_to_clipboard(&text);
-                                show_overlay(
-                                    overlay_handle,
-                                    0.95,
-                                    ui_language,
-                                    OverlayStatus::FocusLost { text, copied: true },
-                                );
-                                set_tray_state(tray, TrayState::Idle, ui_language);
-                                continue;
+                // OVERLAY-054-A: 编辑提交时，先把 overlay 的 NOACTIVATE 恢复、销毁 EDIT 控件并隐藏
+                // 窗口，再把焦点还给原目标窗口，确认焦点真正到达后再注入文本。
+                overlay_handle.send(OverlayCommand::RestoreAndHide);
+                let text_to_inject = text.clone();
+                let overlay_tx_for_focus = overlay_handle.tx.clone();
+                let runtime_config_for_focus = Arc::clone(runtime_config);
+                let ui_language_for_focus = ui_language;
+                let _ = std::thread::spawn(move || {
+                    // Give the overlay thread one frame to destroy the EDIT control and hide the window.
+                    std::thread::sleep(Duration::from_millis(16));
+                    let mut fallback = false;
+                    if target_hwnd != 0 {
+                        let target = HWND(target_hwnd as *mut std::ffi::c_void);
+                        let restored = unsafe { SetForegroundWindow(target).as_bool() };
+                        if restored {
+                            // Wait up to 200ms for the foreground window to actually switch.
+                            let deadline = std::time::Instant::now() + Duration::from_millis(200);
+                            let mut focus_ok = false;
+                            while std::time::Instant::now() < deadline {
+                                let hwnd = unsafe { GetForegroundWindow() };
+                                if hwnd.0 as usize == target_hwnd {
+                                    focus_ok = true;
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(8));
                             }
-                            maybe_learn_user_edit(&text, text_snapshot, runtime_config);
-                            OVERLAY_EDITING.store(false, Ordering::Release);
-                            overlay_handle.send(OverlayCommand::Hide);
-                            set_tray_state(tray, TrayState::Idle, ui_language);
-                            continue;
+                            if focus_ok {
+                                let config = clone_runtime_config(&runtime_config_for_focus);
+                                if let Err(e) = platform::inject_text(
+                                    &text_to_inject,
+                                    config.injection.use_clipboard,
+                                    config.injection.clipboard_delay_ms,
+                                ) {
+                                    log::error!(
+                                        "OVERLAY-054-A: inject text failed after focus restore: {}",
+                                        e
+                                    );
+                                    fallback = true;
+                                }
+                            } else {
+                                log::warn!(
+                                    "OVERLAY-054-A: foreground did not switch to target_hwnd {} within timeout",
+                                    target_hwnd
+                                );
+                                fallback = true;
+                            }
+                        } else {
+                            fallback = true;
                         }
+                    } else {
+                        fallback = true;
                     }
-                }
-                // UIPI / focus lost fallback
-                OVERLAY_EDITING.store(false, Ordering::Release);
-                let _ = platform::copy_text_to_clipboard(&text);
-                show_overlay(
-                    overlay_handle,
-                    0.95,
-                    ui_language,
-                    OverlayStatus::FocusLost { text, copied: true },
-                );
+                    if fallback {
+                        let _ = platform::copy_text_to_clipboard(&text_to_inject);
+                        let _ = overlay_tx_for_focus.send(OverlayCommand::Show(OverlayRequest {
+                            status: OverlayStatus::FocusLost {
+                                text: text_to_inject,
+                                copied: true,
+                            },
+                            pos: [0, 0],
+                            size: PREVIEW_OVERLAY_SIZE,
+                            opacity: 0.95,
+                            ui_language: ui_language_for_focus,
+                            auto_close_ms: 0,
+                            target_hwnd: 0,
+                        }));
+                    }
+                });
                 set_tray_state(tray, TrayState::Idle, ui_language);
             }
         }

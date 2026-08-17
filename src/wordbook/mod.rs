@@ -7,6 +7,79 @@ use std::cell::RefCell;
 #[allow(unused_imports)]
 pub use cache::{WordbookCache, WordbookEntry, WordbookStats};
 
+/// WORDBOOK-053-C: Maximum character count for a valid wordbook candidate.
+/// Rationale: Chinese idioms/proper nouns are typically <=10 chars; English phrases
+/// like "Claude Code" are <=12 chars. 30 chars leaves ample headroom for legitimate
+/// short phrases while rejecting full sentences (which are usually 40+ chars).
+/// "维生素B12" (6 chars), "飞音输入法" (5 chars), "Claude Code" (11 chars) all pass.
+const MAX_CANDIDATE_CHARS: usize = 30;
+
+/// WORDBOOK-053-C: Maximum number of whitespace-separated segments.
+/// Rationale: English phrases like "Claude Code" (2 segments) or "voice ime" (2)
+/// are legitimate. 4 segments allows rare longer English terms while rejecting
+/// sentence-level text (which typically has many whitespace-separated words).
+const MAX_WHITESPACE_SEGMENTS: usize = 4;
+
+/// WORDBOOK-053-C: Validate a wordbook candidate before learning.
+///
+/// Rejects sentence-level text and numbered-list fragments that should never be
+/// learned as hotwords. Returns `Ok(())` if valid, `Err(reason)` if rejected.
+/// The rejection reason is a static string suitable for `log::debug!` (no allocation).
+pub fn is_valid_candidate(word: &str) -> Result<(), &'static str> {
+    let trimmed = word.trim();
+    if trimmed.is_empty() {
+        return Err("empty");
+    }
+    if trimmed.chars().count() > MAX_CANDIDATE_CHARS {
+        return Err("exceeds max char limit");
+    }
+    if trimmed.contains('。')
+        || trimmed.contains('！')
+        || trimmed.contains('？')
+        || trimmed.contains('；')
+    {
+        return Err("contains sentence-ending punctuation");
+    }
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        return Err("contains newline");
+    }
+    let first_char = trimmed.chars().next().unwrap();
+    if first_char.is_ascii_digit() {
+        let chars: Vec<char> = trimmed.chars().collect();
+        if chars.len() >= 2 {
+            let second = chars[1];
+            if second == '.' || second == '、' || second == ' ' || second == '\t' {
+                return Err("starts with numbered prefix");
+            }
+        }
+    }
+    if first_char == '①'
+        || first_char == '②'
+        || first_char == '③'
+        || first_char == '④'
+        || first_char == '⑤'
+        || first_char == '⑥'
+        || first_char == '⑦'
+        || first_char == '⑧'
+        || first_char == '⑨'
+        || first_char == '⑩'
+    {
+        return Err("starts with circled number prefix");
+    }
+    if trimmed.starts_with("- ") {
+        return Err("starts with dash-list prefix");
+    }
+    let comma_count = trimmed.chars().filter(|&c| c == '，' || c == ',').count();
+    if comma_count >= 2 {
+        return Err("multiple commas (sentence-level)");
+    }
+    let segments = trimmed.split_whitespace().count();
+    if segments > MAX_WHITESPACE_SEGMENTS {
+        return Err("too many whitespace segments");
+    }
+    Ok(())
+}
+
 /// Compatibility wrapper for the existing main pipeline.
 ///
 /// New code should use `WordbookCache` directly so reads can stay in memory.
@@ -65,6 +138,15 @@ impl Wordbook {
     pub fn learn_suggestion(&self, word: &str, threshold: u32) -> Result<()> {
         let word = word.trim();
         if word.is_empty() {
+            return Ok(());
+        }
+
+        // WORDBOOK-053-C: reject sentence-level / numbered-list candidates before
+        // they enter the candidate table or get promoted to the wordbook.
+        // Uses log::debug! (filtered out in release builds where LevelFilter=Warn,
+        // zero disk IO per Gavin's "reduce real-time log IO" requirement).
+        if let Err(reason) = is_valid_candidate(word) {
+            log::debug!("Auto-learn candidate rejected ({}): {:?}", reason, word);
             return Ok(());
         }
 
@@ -246,5 +328,86 @@ mod tests {
             learned
         );
         assert_eq!(learned, "運");
+    }
+
+    // WORDBOOK-053-C: is_valid_candidate guard tests
+
+    use super::is_valid_candidate;
+
+    #[test]
+    fn test_is_valid_candidate_rejects_real_dirty_sentence() {
+        // The exact sentence from debug.log (08-17 08:43:46) that prompted this task
+        let dirty = "1. 设置UI，点击设置热键，按下Alt键，没有任何反应。";
+        assert!(is_valid_candidate(dirty).is_err());
+    }
+
+    #[test]
+    fn test_is_valid_candidate_rejects_numbered_list_with_newlines() {
+        let dirty = "1. 3块2毛2的大葱
+2. 5块6毛钱的土豆";
+        assert!(is_valid_candidate(dirty).is_err());
+    }
+
+    #[test]
+    fn test_is_valid_candidate_rejects_dash_list_with_newlines() {
+        let dirty = "- 不能迟到早退。
+- 遵守课堂纪律，要尊重老师。";
+        assert!(is_valid_candidate(dirty).is_err());
+    }
+
+    #[test]
+    fn test_is_valid_candidate_rejects_circled_number_prefix() {
+        let dirty = "① 第一条注意事项";
+        assert!(is_valid_candidate(dirty).is_err());
+    }
+
+    #[test]
+    fn test_is_valid_candidate_rejects_multiple_commas() {
+        let dirty = "遵守纪律，不迟到，不早退";
+        assert!(is_valid_candidate(dirty).is_err());
+    }
+
+    #[test]
+    fn test_is_valid_candidate_rejects_too_long() {
+        // Exceeds MAX_CANDIDATE_CHARS=30 (31 chars)
+        let long = "一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十一";
+        assert!(is_valid_candidate(long).is_err());
+    }
+
+    #[test]
+    fn test_is_valid_candidate_rejects_too_many_segments() {
+        // 5 whitespace-separated segments (exceeds MAX_WHITESPACE_SEGMENTS=4)
+        let segments = "a b c d e";
+        assert!(is_valid_candidate(segments).is_err());
+    }
+
+    #[test]
+    fn test_is_valid_candidate_passes_normal_chinese_words() {
+        assert!(is_valid_candidate("阿里云").is_ok());
+        assert!(is_valid_candidate("飞音输入法").is_ok());
+        assert!(is_valid_candidate("五代十国").is_ok());
+        assert!(is_valid_candidate("维生素B12").is_ok());
+        assert!(is_valid_candidate("三五成群").is_ok());
+    }
+
+    #[test]
+    fn test_is_valid_candidate_passes_normal_english_words() {
+        assert!(is_valid_candidate("Claude Code").is_ok());
+        assert!(is_valid_candidate("voice ime").is_ok());
+        assert!(is_valid_candidate("LLM").is_ok());
+        assert!(is_valid_candidate("Cloud").is_ok());
+        assert!(is_valid_candidate("M2").is_ok());
+    }
+
+    #[test]
+    fn test_is_valid_candidate_passes_single_comma_phrase() {
+        // One comma is a two-word phrase, not a sentence
+        assert!(is_valid_candidate("三五成群，打架斗殴").is_ok());
+    }
+
+    #[test]
+    fn test_is_valid_candidate_rejects_empty() {
+        assert!(is_valid_candidate("").is_err());
+        assert!(is_valid_candidate("   ").is_err());
     }
 }

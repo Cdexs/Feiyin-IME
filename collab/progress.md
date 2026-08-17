@@ -462,6 +462,9 @@ PTT 录音中点击即进编辑态（不等松键）｜流式文本白色不加�
 | **BUILD-020** | 阶段五出包：v0.8.0 第五包（HOTKEY-049 + OVERLAY-051 七项 + OVERLAY-051-A/H + WORDBOOK-053 A+B + 测试文档 6 提交进 exe） | — | tester-1 | ✅ 已出已验收自有核验（产物 08-17 19:34-19:37，七项核验全 PASS：sha `5e2bc716…`/`225aaeb8…`/`1af60bf0…` 全异于 BUILD-019、新 JS `index-B5q249eW.js`、ProductVersion 0.8.0 未变、冒烟零 panic；E2E 9FAIL/54PASS/32SKIP BLOCKED 无新增失败类型；端测清单 14 项列于 result.md；push 待主控） |
 | **HOTKEY-049** | 翻译热键与录音热键重复检测 + 拦截（按键集合交集判据，语音侧+翻译侧双向拦截，新弹窗无放行出口） | `ui/src/pages/HotkeySettings.tsx` + 三份 `ui/src/i18n/*.ts` | coder-1 | 🟡 **阶段一完成待验收** |
 | **OVERLAY-051-A/H** | EDIT 子类化转发修复（CallWindowProcW 替代 DefWindowProcW）+ 编辑态横向滚动（去 ES_MULTILINE 改单行） | `src/main.rs` | coder-1 | 🟡 **阶段一完成待验收** |
+| **ASR-055** | 配置 UI 测试按钮 100% 失败修复（Inference 协议重写，model 在 payload，三类错误信息） | `src-tauri/src/qwen3.rs` `src-tauri/src/main.rs` | coder-1 | 🟡 **阶段一完成待验收** |
+| **WORDBOOK-053-C** | 词库候选词有效性校验（is_valid_candidate 7 条规则，log::debug! 拒绝） | `src/wordbook/mod.rs` | coder-1 | 🟡 **阶段一完成待验收** |
+| **WORDBOOK-053-D** | 脏数据排查（只读报告，12 条脏候选已报告，未删除） | — | coder-1 | ✅ **报告完成** |
 
 **038-A 验收取证**（主控独立复现，未采信报告）：`cargo fmt --check` clean ｜ `cargo check --all-targets` 0 error（当时）
 ｜源码 `#[test]` 计数 **45** 与报告一致 ｜文件域零越界。四处硬红线全部落实：`"model"` 在 payload 内 ｜

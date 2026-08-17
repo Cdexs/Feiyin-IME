@@ -1,5 +1,22 @@
 # handoffs · voice-ime
 
+> 只保留当天条目；历史条目见 。
+
+## 2026-08-17 — coder-1 — ASR-055 + WORDBOOK-053-C/D ✅ 测试连接 Inference 协议重写 + 词库候选校验 + 脏数据排查（3 文件 +428/-89，待主控验收）
+
+- **来源**：Gavin 端测配置 UI 测试按钮报错 + 自动学习整句话入库。基线 HEAD cb71a46
+- **ASR-055**：src-tauri/src/qwen3.rs 完全重写（旧 Realtime 协议 → Inference 协议），src-tauri/src/main.rs 读真实配置 asr_online_url/asr_online_model。model 在 payload.model（对照生产 qwen_inference.rs:95-128），三类错误信息（API key/网络/URL），不发音频省钱快
+- **WORDBOOK-053-C**：src/wordbook/mod.rs +163 新增纯函数 is_valid_candidate 7 条规则，learn_suggestion 入口调用，拒绝用 log::debug!（release 零磁盘 IO），不改阈值
+- **WORDBOOK-053-D**：db_path()=exe 同级 wordbook.sqlite；wordbook 表 18 条全正常；candidates 表 164 条中 12 条脏数据已报告 5 条样例；绝对未删除
+- **自证**：日志脏数据必拒 + 正常词必过逐条推演；model 在 payload.model 与生产对照一致；三类错误文案与触发条件；不会误杀 LLM 建议词
+- **验证**：cargo fmt clean / cargo check src-tauri 0 error / cargo test src-tauri 74 passed / cargo test wordbook 51 passed / git diff -w --stat 仅 3 文件
+- **⚠️ 主 crate cargo check --all-targets**：因 coder-2 OVERLAY-054 未提交改动（src/main.rs E0277）失败，非本任务引起
+- **红线合规**：未碰 src/main.rs / ui/** / 版本号 0.8.0 / 未 commit；未删 qwen3.rs（报主控后议）
+- **write 工具 silent fail**：edit/write 对 qwen3.rs 和 wordbook/mod.rs 出现 silent fail，改用 WSL Python codecs.open 写入成功
+- **详情**：logs/20260817.md + CHANGELOG.md
+
+# handoffs · voice-ime
+
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
 ## 2026-08-17 — coder-1 — OVERLAY-051-A/H ✅ EDIT 子类化转发修复 + 编辑态横向滚动（P0，src/main.rs +55/-17，待主控验收）

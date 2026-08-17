@@ -1278,3 +1278,9 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 - **051-A**：`edit_subclass_wnd_proc` 原转发 `DefWindowProcW`（默认窗口过程）→ EDIT 文本存储/绘制/按键/滚动/选区全被绕过（Gavin 端测：文字消失/没法编辑/光标到不了）。改为 `CallWindowProcW(old_proc)` 转发原 EDIT 过程；old_proc 用 `SetPropW`/`GetPropW`/`RemovePropW` 存取于 EDIT 窗口的命名属性 `fyn_edit_oldpro`（`GWLP_USERDATA` 已被 051-D 占用存父窗口 HWND）。`destroy_edit_control` 加 `RemovePropW` 清理。
 - **051-H**：去掉 `ES_MULTILINE` 改真正单行 EDIT（保留 `ES_AUTOHSCROLL`），单行模式 Enter 上报 `VK_RETURN`（051-D 回车提交更可靠），`ES_AUTOHSCROLL` 跟随式自动滚动光标可达全部文字，无 `WS_HSCROLL` 滚动条。
 - macOS 侧无对应 EDIT 子类化实现（macOS overlay 用 NSView/NSPanel，不是 Win32 EDIT），本改动平台隔离，macOS 侧无需任何动作。
+
+### ASR-055 + WORDBOOK-053-C/D 补充（2026-08-17）
+
+- **ASR-055**：`src-tauri/src/qwen3.rs` 完全重写（旧 Realtime 协议 → Inference 协议），`src-tauri/src/main.rs` 读真实配置。改动在 `src-tauri/`（Tauri 设置 UI 后端），macOS 侧无 Tauri（macOS 用独立 UI），零编译影响。Inference 协议平台中立，macOS 侧若实现测试连接可用同协议。
+- **WORDBOOK-053-C**：`src/wordbook/mod.rs` 新增 `is_valid_candidate` 纯函数 + 7 条校验规则。`src/wordbook` 是平台中立模块（SQLite + 纯 Rust 逻辑），macOS 编译同份代码，校验规则自动生效。`log::debug!` 跨平台一致（release 零磁盘 IO）。
+- **WORDBOOK-053-D**：脏数据排查只读报告，无代码改动。`db_path()` 在 macOS 侧由 `src/wordbook/db.rs` 的 `cfg` 决议（DEC-011/DEC-032），与本任务无关。
