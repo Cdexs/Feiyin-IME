@@ -450,7 +450,11 @@ PTT 录音中点击即进编辑态（不等松键）｜流式文本白色不加�
 | **TEST-EXEC-042/045** | 阶段四全量回归 + 消融自证 | — | tester-1 | ✅ 已验收已提交 `2a173f0` |
 | **BUILD-017** | v0.8.0 第二包出包（ASR-042 + ASR-045 进 exe） | — | tester-1 | ✅ 已验收（产物 08-16 23:25，七项核验主控独立复算通过） |
 | **OVERLAY-043** | 录音悬浮层五项显示与流畅度修复 | `src/main.rs` | coder-2 | ✅ 已验收已提交 `a588509` |
-| **OVERLAY-043-B** | 抽 `interpolate_step` + `should_ignore_streaming_text` 纯函数补护栏 | `src/main.rs` | coder-2 | 🟡 **阶段一补强完成**，待主控验收 |
+| **OVERLAY-043-B** | 抽 `interpolate_step` + `should_ignore_streaming_text` 纯函数补护栏 | `src/main.rs` | coder-2 | ✅ 已验收已提交 `5940e73` |
+| **TEST-SYNC-043** | 阶段三测试同步：两纯函数护栏 + 不可测项如实说明 | `src/main.rs` mod tests | tester-1 | ✅ 已验收已提交 `497131f` |
+| **TEST-EXEC-043** | 阶段四全量回归 + 消融实测（OVERLAY-043 批） | — | tester-1 | ✅ 已验收已提交 `b499cc3` |
+| **BUILD-018** | 阶段五出包：OVERLAY-043 全批进 exe | — | tester-1 | ✅ 已验收（产物 08-17 13:57-14:00，七项核验主控独立复算通过） |
+| **OVERLAY-046** | 修复录音 overlay 窗口从未被定位/定尺寸（P0 阻塞日常使用，OVERLAY-043 真回归） | `src/main.rs` | coder-2 | 🟡 **阶段一修复完成**，待主控验收 |
 
 **038-A 验收取证**（主控独立复现，未采信报告）：`cargo fmt --check` clean ｜ `cargo check --all-targets` 0 error（当时）
 ｜源码 `#[test]` 计数 **45** 与报告一致 ｜文件域零越界。四处硬红线全部落实：`"model"` 在 payload 内 ｜

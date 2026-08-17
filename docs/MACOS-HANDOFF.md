@@ -1250,6 +1250,13 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 - 两次消融均完整还原，还原后全量复跑 1040/0/11 逐数一致。
 - 纯 Windows 平台测试执行，macOS 侧无任何动作。
 
+### OVERLAY-046 补充（2026-08-17）
+
+- **根因**：`src/main.rs:997` Show 分支在 OVERLAY-043 重构中丢失了无条件 `SetWindowPos` / `InvalidateRect`，非流式态（`Recording`/`FallingToProcessing`/`Processing`/`Error`）于 `:991-993` 被赋 `current_size == target_size`，导致 `:1198` 插值门控永不置位，`SetWindowPos` 一次都不执行 → 录音窗口不定位/不定尺寸，完全不可见。
+- **修复**：在 Show 分支内 `ShowWindow` 之前恢复无条件 `SetWindowPos(hwnd, request.pos, computed_size, SWP_NOACTIVATE | SWP_NOZORDER)`，并在 `ShowWindow` 之后补 `InvalidateRect(hwnd, None, false)`。`bErase` 保持 `false`（红线 1）。
+- **不影响插值**：流式 `RecordingWithText` 的 `computed_size` 与 `:1221` 插值路径同源（均来自 `:930-959` 的 `pending_size`/`target_size`）；Show 时一次性定位到最新目标尺寸，后续 16ms timer 仍按 `interpolate_step` 推进 `current_size → target_size`，动画连续。
+- **全部改动仍位于 Windows-only `#[cfg(target_os = "windows")]` 区域内**，macOS 编译零接触、零行为契约变化、`platform/` 导出符号无增减、`AppConfig` 字段无变化。**macOS 侧无需任何动作**。
+
 ### BUILD-018 补充（2026-08-17）
 
 - 阶段五出包：OVERLAY-043 全批（`a588509`/`5940e73`/`497131f`/`b499cc3`）进 exe，改动全在 `src/main.rs`。

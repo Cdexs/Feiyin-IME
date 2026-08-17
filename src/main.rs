@@ -997,7 +997,21 @@ fn run_overlay_thread(
                     unsafe {
                         let alpha = (request.opacity.clamp(0.1, 1.0) * 255.0).round() as u8;
                         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
+                        // OVERLAY-046: non-streaming statuses have current_size == target_size
+                        // at Show time, so the interpolation path below never reaches SetWindowPos.
+                        // Restore an unconditional positioning here so the overlay appears at the
+                        // correct location and size on every Show.
+                        let _ = SetWindowPos(
+                            hwnd,
+                            None,
+                            request.pos[0],
+                            request.pos[1],
+                            computed_size[0],
+                            computed_size[1],
+                            SWP_NOACTIVATE | SWP_NOZORDER,
+                        );
                         let _ = ShowWindow(hwnd, SW_SHOWNA);
+                        let _ = InvalidateRect(hwnd, None, false);
                         // Set auto-close timer if needed
                         if request.auto_close_ms > 0 {
                             let _ = SetTimer(hwnd, 1, request.auto_close_ms, None);

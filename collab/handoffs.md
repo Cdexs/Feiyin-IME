@@ -120,6 +120,22 @@
 - **Gavin 端测四项**（须 `-debug`，ASR-PERF-040-B/C 唯一数据源）：新端点连通性 / `usage.duration` 计费口径 / 040-A 四段连接耗时 / VAD 门控实际行为
 - **详情**：outbox/tester-1/result.md + logs/20260816.md + CHANGELOG.md
 
+## 2026-08-17 — coder-2 — OVERLAY-046：录音 overlay 窗口未被定位/定尺寸修复（P0 阻塞日常使用）
+
+- **来源**：Gavin 2026-08-17 端测 BUILD-018 报「按下热键录音窗口完全不出现」；主控 `git show` 对照取证
+- **根因**：OVERLAY-043 重构中 Show 分支丢失了无条件 `SetWindowPos` / `InvalidateRect`；非流式 `OverlayStatus` 在 `:991-993` 被赋 `current_size == target_size`，导致 `:1198` 插值条件永不成立、`size_interpolation_done` 永不置位，`:1221` 的 `SetWindowPos` 永不执行
+- **影响**：`Recording`/`FallingToProcessing`/`Processing`/`Error`/`FocusLost` 全部非流式态均受影响；在线模型与本地模型录音窗口一律无法定位/定尺寸
+- **改动**（仅 `src/main.rs` `:997-1005`）：
+  - 在 Show 分支 `ShowWindow` 之前恢复无条件 `SetWindowPos(hwnd, request.pos, computed_size, SWP_NOACTIVATE | SWP_NOZORDER)`
+  - `ShowWindow` 之后补 `InvalidateRect(hwnd, None, false)`，保持 `bErase=false`（红线 1）
+- **不破坏 043 插值**：流式 `RecordingWithText` 的 `computed_size` 与 `:1221` 插值路径同源（`:930-959` 的 `pending_size`/`target_size`）；Show 时一次性定位到最新目标尺寸，后续 16ms timer 仍按 `interpolate_step` 推进动画
+- **覆盖的恒等赋值变体**：`Recording`、`FallingToProcessing { .. }`、`Processing(_)`、`Error(_)`、`FocusLost { .. }` 全部在本次修复后被覆盖
+- **验收**：`cargo fmt --all -- --check` clean / `cargo check --all-targets` 0 error（109 warnings 均为既有）/ `cargo check --manifest-path src-tauri/Cargo.toml --all-targets` 0 error / `git diff -w -- src/main.rs` 仅 `:997-1005` 新增 14 行
+- **边界**：未碰 `src/audio/mod.rs`、`src/vad.rs`、`src/transcription/**`、`ui/`、`src-tauri/`；版本号 0.8.0 未动
+- **跨平台**：`docs/MACOS-HANDOFF.md` §OVERLAY-043 已追加 OVERLAY-046 条目；改动全在 Windows-only `#[cfg]` 内，macOS 零编译影响
+- **阶段三**：不跑 `cargo test` / `cargo build`，测试由 tester-1 负责
+- **详情**：outbox/coder-2/result.md + logs/20260817.md + CHANGELOG.md
+
 ## 2026-08-17 — coder-2 — OVERLAY-043 录音悬浮层五项显示与流畅度修复（src/main.rs +349/-150，阶段一完成）
 
 - **来源**：Gavin 2026-08-17 端测截图 + 主控逐条 Read 代码取证；基线 HEAD `56bfa37`
@@ -127,7 +143,7 @@
 - **改动**（仅 `src/main.rs`）：
   1. 拆 `draw_recording_overlay` 为 chrome/indicator+waveform/stop-button 三段；`RecordingWithText` 路径不再画波形，文字区不被挤压
   2. 右侧单按钮复用：录音态=停止方块，编辑态=同位置橙色 ⏎ 提交；删除独立 submit 绘制
-  3. 100ms 尺寸节流改为**延迟合并** + 25% lerp 插值，避免回退 240px 突闪
+  3. 100ms 尺寸节流改为**延迟合并** + 25% lerp 插值，避免回退 240 px 突闪
   4. `InvalidateRect` 改 `bErase=false`；加 `needs_repaint` 脏标记；WM_PAINT 已双缓冲，内存 DC 先 FillRect 背景防垃圾像素
   5. 新增 `STREAMING_STOPPED` 门闩：Stop/ESC/取消/提交/编辑置位，`RecordingStarted` 复位；晚到 `StreamingText` 不再把 `FallingToProcessing` 顶回录音态；编辑态仍同步文字
 - **流畅度额外手段**：尺寸插值过渡、状态变化才重置命中区、目标尺寸与当前尺寸差异阈值驱动 `SetWindowPos`
