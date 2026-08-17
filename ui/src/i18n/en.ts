@@ -101,7 +101,7 @@ export const en = {
   hotkey_ptt_desc: 'Hold to record, release to stop',
   hotkey_enable_translation: 'Enable translation',
   hotkey_press_translation: 'Press translation key...',
-  hotkey_set_translation: 'Click to set translation key (recommended: Left Ctrl / Right Ctrl)',
+  hotkey_set_translation: 'Recommended: left or right Ctrl / Alt; must not duplicate the recording hotkey',
   hotkey_set_first: '⚠ Please set translation hotkey first',
   hotkey_translation_usage: 'Hold translation key + voice key together to translate the result to target language.',
   hotkey_conflict: 'Hotkey Conflict',

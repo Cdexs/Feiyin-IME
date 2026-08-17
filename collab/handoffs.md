@@ -2,6 +2,20 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-08-17 — coder-1 — HOTKEY-048 ✅ 翻译热键页说明文字改文案（三份 locale，纯文案，待主控验收）
+
+- **来源**：Gavin 追加要求。HOTKEY-047 已结案提交（`4d5c56b`），本单纯文案无冲突。BUILD-019 卡在此单等前端重跑构建
+- **改动**（仅三份 locale 的 `hotkey_set_translation` key，各 +1/-1）：
+  - `ui/src/i18n/zh-Hans.ts:104` → `'推荐：左右 Ctrl / Alt，不可和录音热键重复'`
+  - `ui/src/i18n/zh-Hant.ts:104` → `'推薦：左右 Ctrl / Alt，不可和錄音熱鍵重複'`
+  - `ui/src/i18n/en.ts:104` → `'Recommended: left or right Ctrl / Alt; must not duplicate the recording hotkey'`
+  - 用 Edit 工具改（非 PowerShell），编码安全。渲染位置 `HotkeySettings.tsx:401`，tsx 一行未动
+- **明确不在本单范围**：文案「不可和录音热键重复」目前无代码强制（`check_hotkey_available` 对 0xA0..0xA5 无条件 return true、`handleTranslationHotkeyKeyDown` 无重复校验）。本单只改文案**不实现校验**，是否加强制校验及重复时 UI 行为是产品决策，主控正在问 Gavin，另开 HOTKEY-049。**未自行发挥**
+- **自证**：① `grep -n hotkey_set_translation ui/src/i18n/*.ts` 三行新值正确，中文未乱码；② `grep -n hotkey_click_to_change ui/src/i18n/zh-Hans.ts` → `'建议设置左右 Ctrl 或 Alt 键为热键'` —— 上一单（HOTKEY-047 R1）的值**未被误改** ✅
+- **验证**：`npx tsc --noEmit` 0 error / `git diff -w --stat -- ui/` 恰 3 文件各 +1/-1 / 未跑 `npm run build`（构建由 tester-1 做）/ 未跑 `npm run test`（纯文案单）
+- **红线合规**：未碰 `HotkeySettings.tsx`、`src/`、`src-tauri/`（红线 1/2）/ 未实现重复校验（红线 3）/ 版本号 0.8.0 未动（红线 4）/ 未 commit（红线 5）/ 未跑 npm run test（红线 6）
+- **详情**：logs/20260817.md + CHANGELOG.md（HOTKEY-048 条目）
+
 ## 2026-08-17 — coder-1 — HOTKEY-047-R2 ✅ 回归修复（右 Alt 单键 modifiers 被合成 Ctrl 污染，1 段改，待主控验收）
 
 - **来源**：主控 R1 验收通过主体，查出一处相对原代码的回归 —— 右 Alt 单键 `modifiers` 被合成 Ctrl 污染。基线同 R1
@@ -225,3 +239,41 @@
 - **纯文档维护**：无代码改动、无出包、无 commit（主控统一提交）
 - **留意项（不动作）**：`target/release/feiyin-ime.exe` PID 4696（00:08:39 启动，非冒烟进程）锁着 exe，下次构建可能报 os error 5；主控已报 Gavin 判断归属，回话前任何人不得杀。保持待命等 Gavin 端测
 - **详情**：logs/20260816.md
+
+---
+
+## 2026-08-17 — tester-1 — TEST-SYNC-046/047 ✅ 阶段三测试同步：OVERLAY-046 + HOTKEY-047 补护栏（ui/ +215 新测试文件，待主控验收）
+
+- **来源**：主控派单（基线 HEAD `4d5c56b`，OVERLAY-046 `46be389` + HOTKEY-047 `4d5c56b` 已提交）
+- **改动**：仅新建 `ui/src/pages/HotkeySettings.test.tsx`（+215 行，13 条用例 = 12 必测场景 S1-S12 + 1 locale 护栏），生产零改动
+- **S1-S8** 逐条断言 vk_code/modifiers/display_name（右 Alt 单键 0xA5/0/'Right Alt'、AltGr+M 0x4D/0x0001/'Alt+M'、左修饰键单键、Ctrl+Shift+M 0x4D/0x0006、finalizedRef 防重入恰 1 次落库）；**S9** 同步断言 activeElement（useLayoutEffect vs setTimeout 差异）；**S10** 预览即时回显；**S11** Escape 零调用；**S12** 冲突弹窗非落库
+- **排雷**：happy-dom `getModifierState('AltGraph')` 返回 altKey，`{altKey:true,ctrlKey:true}` 即 AltGraph=true 无需 override；react-dom 合成事件直接委托 nativeEvent 无 TypeError 路径（node 库级探针 + react-dom 源码静态实证替代禁跑的 Vitest）
+- **OVERLAY-046 判定**：同意主控预判不可纯单测（raw FFI + 真实 HWND + 副作用-only），给出两个真实可测切面——①抽 `should_position_at_show` 纯函数抓门控回归一半根因（参照 interpolate_step 先例）；②E2E 层现成护栏已存在（state_detector 按可见性+尺寸判 RECORDING，test_hotkey.py:228 等），缺口是 BUILD-018 未实际跑 E2E 的流程缺口，建议纳入 release smoke 门
+- **消融推演**：A/B/D 同意任务书（S1/S1/S9），C 持异议（hadNonModifierKeyRef+isRecordingVoice+checkAndApply 首行三重兜底，S8 预计不红，建议阶段四在 S12 加「冲突后残留 keyup」变体实测），诚实标注推演可能偏轻
+- **验收**：npx tsc --noEmit 0 error / git diff -w 源码域零 diff 仅新增测试文件 / 未碰 src/ src-tauri/、版本号 0.8.0、未 commit（主控统一提交）
+- **详情**：outbox/tester-1/result.md + logs/20260817.md + CHANGELOG.md（TEST-SYNC-046/047 条目）
+
+---
+
+## 2026-08-17 — tester-1 — TEST-EXEC-046/047 ✅ 阶段四全量回归 + 消融实测（HOTKEY-047 批，生产零改动，待主控验收）
+
+- **来源**：主控派单（基线 HEAD `b5a96a9`，HOTKEY-047 `4d5c56b` + TEST-SYNC `4d5c56b` 后一提交已验收）
+- **四步回归全过**：Step1 `cargo test` = **1040 passed / 0 failed / 11 ignored**（与基线逐数一致）→ Step2 Vitest **67 passed**（54+13 差账吻合）→ Step3 src-tauri **55 passed** → Step4 pytest **SKIP**（`Publish/` 为 BUILD-018 旧包 14:00 早于本批 HEAD 15:07，E2E 待 BUILD-019）
+- **消融实测**：**A**（keyup 去 `!altGrSynthWasActive`）→ S1 红（modifiers 0→2、'Ctrl+Right Alt'）1/12 吻合；**B**（keydown AltRight 去 delete ControlLeft）→ **S1+S12 红**（S1 vk 165→162 'Left Ctrl'；S12 弹窗 'Right Alt' 失配）2/11 **超任务书预测**，护栏更严非失效；**D**（focus 改 setTimeout 50）→ S9 红 1/12 吻合；**C 按主控裁决取消**（finalizedRef 四处检查点纵深防御，主护栏为 :217 hadNonModifierKeyRef，不可独立消融，不另造人工消融）
+- **还原自证**：三次消融编辑器还原（禁 git reset/checkout/stash/clean），每次 `git diff -w -- ui/` 0 字节 + HotkeySettings.tsx byte-identical to HEAD，还原后 vitest 复跑 67/67 逐数一致
+- **红条三分类**：③真回归 0 / ①测试错 0 / ②预期内 0（消融期 4 条红均有意消融已还原，终态全绿），无阻塞项
+- **补记不可测缺口**：真按 左Ctrl+左Alt+M 与 AltGr 在 happy-dom 单测不可区分（AltGraph 映射 altKey，0x0001 'Alt+M' vs 真实 0x0003 'Ctrl+Alt+M'，S7 规避正确），troubleshooting.md [HAPPYDOM-ALTGR-INDISTINGUISHABLE-001]
+- **边界**：未出包（BUILD-019 待主控放行）、版本号 0.8.0 未动、未 commit（主控统一提交）
+- **详情**：outbox/tester-1/result.md + logs/20260817.md + CHANGELOG.md（TEST-EXEC-046/047 条目）
+
+---
+
+## 2026-08-17 — tester-1 — BUILD-019 v0.8.0 第四包出包 + 首次真跑 E2E 门禁
+
+- **出包**：OVERLAY-046 + HOTKEY-047 + HOTKEY-048 进 exe，基线 `b5a96a9` + 048 未提交文案
+- **两轮构建**：首轮（048 前）全量；二轮（048 后）仅 Step2/4，**Step3 跳过**（`git diff -w` Rust 零改动，主程序沿用 15:48 构建）
+- **七项核验全 PASS**：sha 两副本逐一相等（`e0785397…`/`1a2b40c8…`/`7b499bbf…`）+ toml 三副本未变 + ProductVersion 0.8.0 + index 探针 `index-CZoCPT7t.js` + 冒烟 PID 10392
+- **E2E 首跑**：50 PASS / 32 SKIP / 10 FAIL / 4 error，**全部 harness/环境缺陷零真回归**（决定性实验证 F9 链路产品正常）；详见 troubleshooting [E2E-CONFIG-PATH-STALE-001]
+- **纯出包**：无代码改动、版本号未动、未 commit（主控统一提交）、未 push
+- **建议主控下一步**：① 修 harness 三处缺陷（配置写 exe_dir / state_detector 尺寸 240x36 / 补 pip toml）后重跑 E2E 冲绿；② 端测项转达：HOTKEY-047 右 Alt 单键 PTT + 任意组合键 + AltGr 过滤
+- **详情**：logs/20260817.md + CHANGELOG.md + progress.md 产物表

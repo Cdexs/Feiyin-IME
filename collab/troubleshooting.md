@@ -3450,3 +3450,59 @@ switch (String(key).toLowerCase()) {
 同族于 `[VERIFY-001]`（Playwright/Vitest 无法验证原生行为）—— 都是
 **「测试环境的能力边界被误当成被测系统的行为边界」**。区别是那条讲原生窗口，本条讲键盘修饰键语义。
 
+
+---
+
+## [E2E-CONFIG-PATH-STALE-001] — 全量 pytest 的 overlay 判定全部假红：harness 写 APPDATA 配置而程序只读 exe_dir（2026-08-17 BUILD-019 首次真跑 E2E 曝光）
+
+### 现象
+
+BUILD-019 首次按书真跑 `pytest tests/test_cases/`，`test_hotkey.py` **6/6 全 FAIL**（Toggle/PTT/Cancel/Presets × F9、Ctrl+Space、Alt+`），统一报
+「Expected recording overlay after F9, got hidden」。其余 FAIL 分属独立 harness 缺陷（见「同族」）。此前 BUILD-016/017/018
+的 pytest 一律按书 SKIP（理由：Publish/ 是旧包），故该缺陷长期未被曝光——**本次是 E2E 门禁第一次被真实运行**。
+
+### 决定性实验（排除产品回归，锁定 harness）
+
+主控授权后做实验：把 `target/release/config.toml` 改为 Toggle 模式 + F9 热键（= **程序真正读取的路径**），
+用同一 exe `-debug` 启动后按 F9：日志立即出现 `Registering hotkey vk_code=120` + overlay shown +0.2ms + 流式录音开始。
+→ **产品在 F9/热键/overlay 链路完全正常**。反之 harness 运行时从未见过 overlay，证明问题在 harness 侧。
+
+### 根因①：配置写入路径错位
+
+`tests/test_cases/test_hotkey.py:34` 定义 `CONFIG_DIR = Path(os.getenv("APPDATA")) / "voice-ime"`（Windows），
+把测试配置写进 `%APPDATA%\voice-ime\config.toml`；而程序 `src/config/mod.rs:340-346` 的 `config_path()`
+按 `current_exe()` 解析为 **`<exe_dir>/config.toml`**。全 `src/` 无任何 APPDATA 引用。
+→ harness 改的热键配置程序**从未读取**，程序按 exe 旁默认配置（右 Alt PTT）运行，F9 自然无效。
+
+### 根因②：overlay 尺寸表陈旧
+
+`tests/utils/state_detector.py:39-43` `STATE_SIZES = {recording:(480,52), processing:(480,52), focuslost:(320,110)}`；
+生产 `src/main.rs:782-786` 实际尺寸 = Recording/Processing **240x36**、FocusLost **320x140**。
+实测录制中 overlay rect = 240x36 → 状态机永远判 `UNKNOWN` ≠ `RECORDING`。尺寸来自旧架构（48x? 时代）从未随 OVERLAY 系列更新。
+
+### 历史性
+
+`git log -S "480, 52"` 与 `-S "240, 36"` 均只命中**初始提交**（f808427/680d78f），
+即 state_detector 尺寸与生产从未对齐过；BUILD-016/017/018 的 pytest 全 SKIP → E2E **从未绿过**。
+
+### 修复建议（均属测试基建，另开单，不阻塞本出包）
+
+1. harness 配置写入改指 `<exe_dir>/config.toml`（与 `VOICE_IME_EXE` 同目录），或给 AppConfig 增加
+   `VOICE_IME_CONFIG` 环境变量覆盖（改生产，需主控批）
+2. `state_detector.py` 尺寸表对齐生产：`recording/processing → (240,36)`、`focuslost → (320,140)`
+3. 顺带修同批曝光的预存 harness 缺陷（与产品无关）：
+   - `test_injection.py` `TestFocusLostPreview` 调用 `self._no_hardware()` 但类未定义该方法（`AttributeError`）
+   - `test_platform.py:73/127` 用 `sys.executable -m cargo`（`cargo` 非 Python 模块）→ 应直接调 `cargo` 二进制
+   - `test_tauri_v2_commands.py:208` `expected_commands` 缺 `open_url_in_browser`（命令实现在 `src-tauri/src/version_check.rs:103`，是测试列表陈旧非产品缺命令）
+
+### 防御规则
+
+1. **E2E 门禁只对最新出包产物跑**，且跑之前先核对 state_detector 尺寸表与 `src/main.rs` 常量一致（写进 build-test-guide）
+2. E2E 报 overlay 假红时，**先做决定性实验**（改 exe 旁配置 + `-debug` 启动验证）再判定产品 vs harness，
+   不要直接采信「overlay 不出」为产品回归
+3. harness 配置必须写程序**真实读取**的路径（`current_exe()` 同目录），禁止想当然 APPDATA
+
+### 与既有条目的关系
+
+同族于 `[HAPPYDOM-ALTGR-INDISTINGUISHABLE-001]` / `[VERIFY-001]` —— **「测试环境的实现细节（路径/尺寸/包依赖）
+被误当成被测系统的行为边界」**。此类 harness 缺陷的共性：从未被真实运行过，一旦首次运行即批量曝光。

@@ -101,7 +101,7 @@ export const zhHans = {
   hotkey_ptt_desc: '按住录音，松开结束',
   hotkey_enable_translation: '开启翻译功能',
   hotkey_press_translation: '请按下翻译热键...',
-  hotkey_set_translation: '点击设置翻译热键（推荐：左Ctrl / 右Ctrl）',
+  hotkey_set_translation: '推荐：左右 Ctrl / Alt，不可和录音热键重复',
   hotkey_set_first: '⚠ 请先设置翻译热键',
   hotkey_translation_usage: '同时按住翻译热键 + 录音热键，识别结果将自动翻译为目标语言。',
   hotkey_conflict: '热键冲突',
