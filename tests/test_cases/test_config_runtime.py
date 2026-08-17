@@ -9,7 +9,6 @@
 4. 静音阈值修改生效
 """
 
-import os
 import sys
 import time
 import subprocess
@@ -21,15 +20,13 @@ import pytest
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "tests"))
 
-from conftest import wait_for_condition
+from conftest import wait_for_condition, voice_ime_config_file
 
 
-# 配置文件路径
-if os.name == "nt":
-    CONFIG_DIR = Path.home() / "AppData" / "Roaming" / "voice-ime"
-else:
-    CONFIG_DIR = Path.home() / ".config" / "voice-ime"
-CONFIG_FILE = CONFIG_DIR / "config.toml"
+# 配置文件路径：主程序读取 <exe_dir>/config.toml（同源 src/config/mod.rs:340-346），
+# harness 必须与之一致（[E2E-CONFIG-PATH-STALE-001] 错位一修复）。
+CONFIG_FILE = voice_ime_config_file()
+CONFIG_DIR = CONFIG_FILE.parent
 
 
 def read_config() -> dict:

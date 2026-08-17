@@ -38,6 +38,18 @@ EXE_PATH = Path(os.getenv("VOICE_IME_EXE", str(DEFAULT_EXE_PATH)))
 DEFAULT_TIMEOUT = int(os.getenv("TEST_TIMEOUT", "30"))
 SKIP_AUDIO_TESTS = os.getenv("SKIP_AUDIO_TESTS", "0") == "1"
 
+
+def voice_ime_config_file(exe_path: Path | None = None) -> Path:
+    """
+    返回主程序实际读取的配置文件路径：<exe_dir>/config.toml。
+
+    与生产代码 src/config/mod.rs:340-346 的 AppConfig::config_path() 同源：
+        current_exe().parent().join("config.toml")
+    E2E harness 必须写这个位置，测试写进 %APPDATA% 程序永远读不到
+    （[E2E-CONFIG-PATH-STALE-001] 错位一修复）。
+    """
+    return (exe_path or EXE_PATH).parent / "config.toml"
+
 # ===== 全局 pyautogui 设置 =====
 try:
     import pyautogui

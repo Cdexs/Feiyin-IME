@@ -6,6 +6,7 @@
 - TEST-SYNC-MAC-004：文字注入平台抽象
 """
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +17,17 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 pytestmark = [pytest.mark.timeout(30)]
+
+
+def _cargo_bin() -> str:
+    """定位 cargo 可执行文件（[E2E-CARGO-INVOCATION] 修复：python -m cargo 必然失败）。"""
+    cargo = shutil.which("cargo")
+    if cargo:
+        return cargo
+    home_cargo = Path.home() / ".cargo" / "bin" / ("cargo.exe" if sys.platform == "win32" else "cargo")
+    if home_cargo.exists():
+        return str(home_cargo)
+    raise RuntimeError("cargo not found in PATH or ~/.cargo/bin")
 
 
 class TestHotkeyPlatformAbstraction:
@@ -67,11 +79,11 @@ class TestHotkeyPlatformAbstraction:
         if not manifest.exists():
             pytest.skip("Cargo.toml not found")
 
-        # 运行 platform 模块的单元测试
+        # 运行 platform 模块的单元测试（voice-ime 是 bin crate，无 lib target；须用 --bin feiyin-ime）
         result = subprocess.run(
             [
-                sys.executable, "-m", "cargo", "test",
-                "--lib",
+                _cargo_bin(), "test",
+                "--bin", "feiyin-ime",
                 "--",
                 "platform",
                 "--nocapture",
@@ -79,6 +91,8 @@ class TestHotkeyPlatformAbstraction:
             cwd=str(project_root),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=60,
         )
 
@@ -121,11 +135,11 @@ class TestTextInjectionPlatformAbstraction:
         if not manifest.exists():
             pytest.skip("Cargo.toml not found")
 
-        # 运行 injection 模块的单元测试
+        # 运行 injection 模块的单元测试（voice-ime 是 bin crate，无 lib target；须用 --bin feiyin-ime）
         result = subprocess.run(
             [
-                sys.executable, "-m", "cargo", "test",
-                "--lib",
+                _cargo_bin(), "test",
+                "--bin", "feiyin-ime",
                 "--",
                 "inject",
                 "--nocapture",
@@ -133,6 +147,8 @@ class TestTextInjectionPlatformAbstraction:
             cwd=str(project_root),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=60,
         )
 

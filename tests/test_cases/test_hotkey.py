@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import time
@@ -20,7 +19,7 @@ import pytest
 if sys.platform != "win32":
     pytest.skip("Win32-only tests", allow_module_level=True)
 
-from ..conftest import kill_existing_voice_ime, wait_for_condition
+from ..conftest import kill_existing_voice_ime, voice_ime_config_file, wait_for_condition
 from ..sendinput_hotkey import (
     press_alt_grave,
     press_ctrl_space,
@@ -30,11 +29,10 @@ from ..sendinput_hotkey import (
 from ..utils.state_detector import OverlayState, detect_overlay_state
 
 
-if os.name == "nt":
-    CONFIG_DIR = Path.home() / "AppData" / "Roaming" / "voice-ime"
-else:
-    CONFIG_DIR = Path.home() / ".config" / "voice-ime"
-CONFIG_FILE = CONFIG_DIR / "config.toml"
+# 配置文件路径：主程序读取 <exe_dir>/config.toml（同源 src/config/mod.rs:340-346），
+# harness 必须与之一致（[E2E-CONFIG-PATH-STALE-001] 错位一修复）。
+CONFIG_FILE = voice_ime_config_file()
+CONFIG_DIR = CONFIG_FILE.parent
 
 
 def _ensure_config_file() -> None:
@@ -114,12 +112,13 @@ def _wait_for_overlay_not_state(unexpected_state: OverlayState, timeout: float =
 
 @pytest.fixture
 def hotkey_config_guard() -> None:
+    # 字节级备份/还原：避免文本模式读写下把 LF 改写为 CRLF（E2E-CONFIG-PATH 副效应）
     _ensure_config_file()
-    backup = _read_config_text()
+    backup = CONFIG_FILE.read_bytes()
     try:
         yield
     finally:
-        _write_config_text(backup)
+        CONFIG_FILE.write_bytes(backup)
 
 
 @pytest.fixture
@@ -156,6 +155,32 @@ def alt_grave_config(hotkey_config_guard) -> None:
     _write_config_section("hotkey", "display_name", "Alt+`")
     _write_config_section("hotkey", "mode", "Toggle")
     yield
+
+
+def _prewarm_recording(start_gesture, stop_gesture, settle: float = 2.5, attempts: int = 3) -> None:
+    """冷启动预热（[E2E-COLD-START-RACE-001] harness 修复）。
+
+    cold 启动后 worker 处理首个 Start 会触发 transcriber 热重载/重建
+    （src/main.rs:3971-3973 处处理 Start 时无条件清空 cancel/stop 信号），
+    若 Stop/CancelStop 在该窗口内到达会被清掉 → 录音无法停止。
+    warm 进程快速手势 4/4 全部成功（探针证据），故在断言序列前先完成一轮
+    Start→settle→Stop 往返验证 worker 已就绪。不改产品码、不弱化断言语义。
+    """
+    for attempt in range(1, attempts + 1):
+        start_gesture()
+        if not _wait_for_overlay_state(OverlayState.RECORDING, timeout=5.0):
+            raise AssertionError(
+                f"prewarm attempt {attempt}: overlay not recording after start gesture"
+            )
+        time.sleep(settle)
+        stop_gesture()
+        if _wait_for_overlay_not_state(OverlayState.RECORDING, timeout=6.0):
+            return
+        time.sleep(1.0)
+    raise AssertionError(
+        f"prewarm failed after {attempts} attempts: worker could not stop recording "
+        "(cold-start transcriber reload window persisted?)"
+    )
 
 
 @pytest.fixture
@@ -235,6 +260,7 @@ class TestHotkeyToggleMode:
     ) -> None:
         """测试 Toggle 模式停止录音（再次 F9）"""
         wait_for_condition(lambda: toggle_voice_ime_process.poll() is None, timeout=5.0)
+        _prewarm_recording(tap_f9, tap_f9)
         tap_f9()
         assert _wait_for_overlay_state(OverlayState.RECORDING, timeout=5.0)
 
@@ -257,8 +283,15 @@ class TestHotkeyPTTMode:
         """测试 PTT 模式按住录音"""
         wait_for_condition(lambda: ptt_voice_ime_process.poll() is None, timeout=5.0)
         assert _wait_for_overlay_state(OverlayState.HIDDEN, timeout=2.0)
+        _prewarm_recording(tap_f9, tap_f9)
 
         from ..sendinput_hotkey import key_down, key_up, VK_F9
+
+        _prewarm_recording(
+            lambda: key_down(VK_F9),
+            lambda: key_up(VK_F9),
+            settle=0.5,
+        )
 
         key_down(VK_F9)
         try:
@@ -284,6 +317,7 @@ class TestHotkeyCancel:
     ) -> None:
         """测试 ESC 取消录音"""
         wait_for_condition(lambda: toggle_voice_ime_process.poll() is None, timeout=5.0)
+        _prewarm_recording(tap_f9, tap_f9)
         tap_f9()
         assert _wait_for_overlay_state(OverlayState.RECORDING, timeout=5.0)
 

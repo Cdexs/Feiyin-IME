@@ -465,6 +465,7 @@ PTT 录音中点击即进编辑态（不等松键）｜流式文本白色不加�
 | **ASR-055** | 配置 UI 测试按钮 100% 失败修复（Inference 协议重写，model 在 payload，三类错误信息） | `src-tauri/src/qwen3.rs` `src-tauri/src/main.rs` | coder-1 | 🟡 **阶段一完成待验收** |
 | **WORDBOOK-053-C** | 词库候选词有效性校验（is_valid_candidate 7 条规则，log::debug! 拒绝） | `src/wordbook/mod.rs` | coder-1 | 🟡 **阶段一完成待验收** |
 | **WORDBOOK-053-D** | 脏数据排查（只读报告，12 条脏候选已报告，未删除） | — | coder-1 | ✅ **报告完成** |
+| **OVERLAY-051-G** | 抖动缓冲（打字机效果）：服务端到达节奏与屏幕显示节奏解耦，16ms 循环推进游标，速率自适应（积压摊 1000ms 每字 180-350ms），四个时机排空，三个边界处理（撤回/新句/积压） | `src/main.rs` | coder-1 | 🟡 **阶段一完成待验收** |
 
 **038-A 验收取证**（主控独立复现，未采信报告）：`cargo fmt --check` clean ｜ `cargo check --all-targets` 0 error（当时）
 ｜源码 `#[test]` 计数 **45** 与报告一致 ｜文件域零越界。四处硬红线全部落实：`"model"` 在 payload 内 ｜

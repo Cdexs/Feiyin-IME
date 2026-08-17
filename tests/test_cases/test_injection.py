@@ -185,7 +185,7 @@ class TestFocusLostPreview:
             time.sleep(2)
 
             # 验证 overlay 窗口切换到 FocusLost 状态
-            # 实际验证需要检测窗口尺寸变化（320x110）
+            # 实际验证需要检测窗口尺寸变化（320x140，与 PREVIEW_OVERLAY_SIZE 同源）
 
         finally:
             process.terminate()

@@ -1,6 +1,32 @@
 # handoffs · voice-ime
 
-> 只保留当天条目；历史条目见 。
+> 只保留当天条目；历史条目见 `handoffs-archive.md`。
+
+## 2026-08-18 — tester-1 — E2E-HARNESS-050 ✅ 修复 E2E 两道陈年错位 + 全套 harness 修复（9 FAIL→2 FAIL，待主控验收）
+
+- **来源**：Gavin 批评「代码几轮修改仍未拿到主程序流程完全走通的版本」，主控复盘根因是 E2E 门禁**自初始提交起从未绿**。基线 HEAD `0049c33`（⚠️ 工作区实际含 coder-2 **未提交** OVERLAY-051-G WIP：`src/main.rs` +270 / `qwen_inference.rs` +45，全程不触碰）
+- **错位一（配置路径）**：harness 写 `%APPDATA%\voice-ime\config.toml`，程序 `src/config/mod.rs:340-346` 只读 `<exe_dir>/config.toml`。三处实例统一改为 `tests/conftest.py` 新增 `voice_ime_config_file()` 单一来源；未加 `VOICE_IME_CONFIG` 环境变量（遵 DEC-031）
+- **错位二（overlay 判据）**：`state_detector.py` 导入时正则解析 `src/main.rs:880-884` 三常量动态建表（零硬编码）+ `TOLERANCE_PX=15` 容差带（依据 <3px 抖动 << 80px 状态间隔）；`recording==processing` 240x36 纯尺寸不可分局限已在 docstring 如实声明
+- **附带修复**：`test_platform.py` `--lib`→`--bin feiyin-ime`（bin-only crate）+ `_cargo_bin()` 定位 + UTF-8 capture（原 GBK 崩线程）；`test_tauri_v2_commands.py` 白名单补 3 命令（前端 6 个 invoke 已核实全覆盖）
+- **hotkey cold 竞态**（[E2E-COLD-START-RACE-001]）：worker `src/main.rs:3969-3974` Start 清空 stop 信号，cold 窗口内二击丢失 / PTT<300ms 防误触 `cancel-stop`；warm 4/4 探针证据 → harness 加 `_prewarm_recording()` 预热往返，不改产品不弱化断言
+- **实跑**：Publish/ 真包 `pytest tests/test_cases/ -m "not hardware"` → **2 FAIL / 61 PASS / 32 SKIP / 7 deselected（142.96s）**，基线 9 FAIL 中 **7 条 harness 全过**；残留 2 条 `test_cargo_test_*` = **② coder-2 阻塞**（未提交 WIP `qwen_inference.rs:712` 签名改 vs `:1645` 测试闭包 1 参 → E0593，非 harness）
+- **红线合规**：`git diff --stat` 仅 `tests/**` 8 文件（+138/-47，CRLF 归一）；生产零改动；未放宽断言；config.toml 字节级还原（最终 sha=`3186ec8c05cd…`=备份）；guard 改字节级还原防 LF→CRLF；版本号/commit/出包均未动
+- **详情**：result.md + logs/20260818.md + CHANGELOG.md + troubleshooting [E2E-COLD-START-RACE-001] 新增
+
+## 2026-08-17 — coder-1 — OVERLAY-051-G ✅ 抖动缓冲（打字机效果，src/main.rs +199/-28，待主控验收）
+
+- **来源**：Gavin 端测日志：服务端每约 1000ms 吐一批 3-4 字，用户看到「一顿一顿地蹦字」。首字延迟 42ms 不在关键路径。方案：服务端到达节奏与屏幕显示节奏解耦
+- **改动**（仅 `src/main.rs` +199/-28）：
+  1. 新增纯函数 `compute_tween_advance(displayed, target, elapsed_ms, tween_start_target) -> (usize, u64)`：速率自适应（backlog 摊 1000ms，interval clamp 180-350ms），边界 1（target<displayed snap），边界 3（backlog>20 jump）
+  2. `OverlayWindowState` 新增 `tween_start: Option<Instant>`
+  3. `RecordingWithText` 分支重写 tween 推进，用 `compute_tween_advance` 替代旧 budget 逻辑
+  4. `Show` 处理：离开 `RecordingWithText` 时（如 `HotkeyEvent::Stop`→`FallingToProcessing`）游标排空到 target
+  5. `EnterEditMode`/`Hide` 补 `tween_start = None`
+  6. 9 条纯函数测试（含 Gavin 真实数据推演）
+- **自证**：① Gavin 真实数据逐时刻推演（"最近"2字 interval=350ms，"最近有什么"5字 backlog=3 interval=333ms）；② 三个边界（撤回 snap/新句归零/积压>20 jump）；③ 提交路径拿完整文本（EnterEditMode 排空到 text.chars().count() + SubmitRequested 用 EDIT 完整文本 + last_streaming_text 存完整）；④ 本地模型零影响（覆盖调用门控：is_streaming_asr→StreamingText→RecordingWithText→tween 仅在此分支）；⑤ 纯函数签名 `compute_tween_advance(displayed, target, elapsed_ms, tween_start_target) -> (new_displayed, next_offset_ms)`
+- **验证**：`cargo fmt` clean / `cargo check --all-targets` 0 error / `cargo check src-tauri` 0 error / `cargo test overlay_051g` 9 passed / `git diff -w --stat` 仅 `src/main.rs`
+- **红线合规**：未碰 `src/transcription/**` / `interpolate_step`/`should_ignore_streaming_text` 契约 / `InvalidateRect bErase` / `ui` / 版本号 0.8.0 / 未 commit
+- **详情**：logs/20260817.md + CHANGELOG.md
 
 ## 2026-08-17 — coder-1 — ASR-055 + WORDBOOK-053-C/D ✅ 测试连接 Inference 协议重写 + 词库候选校验 + 脏数据排查（3 文件 +428/-89，待主控验收）
 

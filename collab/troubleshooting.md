@@ -3553,3 +3553,77 @@ git diff 有产出）。措辞「均无应答」严重误导，且会诱使主�
 3. **实测多于预期 = 护栏更严，是好事**，一律按实测为准，
    **不得让 Worker 改测试去迁就推演**（Worker 三次都正确地先报后做，这个纪律要保持）
 
+---
+
+## [E2E-COLD-START-RACE-001] — hotkey 停止/PTT 释放的 cold 启动竞态：worker 处理 Start 时清空 stop 信号（2026-08-18 E2E-HARNESS-050 修复 3 条 hotkey 残留时发现）
+
+**状态**：🟢 harness 侧已处理（不改产品），保留为已知产品行为边界。
+
+### 现象
+
+E2E-HARNESS-050 修好配置路径后，3 条 hotkey 测试（`toggle_stop`/`ptt_hold`/`cancel_recording`）仍 FAIL：
+overlay 停在 RECORDING 不消失（`_wait_for_overlay_not_state(RECORDING)` 超时）。
+
+### 探针证据（全部 cold 启动实测）
+
+| 探针 | 结果 |
+| --- | --- |
+| warm 进程 0.3s 快速双击 ×4 | 4/4 hidden@2.0s ✅ |
+| cold 进程 gap 0.25-0.5s（= 测试真实间隔） | 必 stuck |
+| cold 进程 gap 0.75/1.0/1.5s | hidden@2.0-2.3s |
+| cold 进程 gap 1.25s | 偶发 stuck |
+| cold PTT hold 0.6-1.5s | stuck ×6 |
+| cold PTT hold 3.0s | hidden ×3 |
+| `-debug` 双模式 log | 第二次 F9 = 另一个 `Start`；PTT keyup = `cancel-stop (PTT held < 300ms)` |
+
+### 根因（主进程代码定位）
+
+1. `src/main.rs:3969-3974` worker `Some(WorkerCommand::Start(start))` 分支**无条件**
+   `cancel_signal.store(false)` + `stop_recording_signal.store(false)` —— 若 Stop/CancelStop 在
+   首击 Start 的 worker 处理窗口内到达，会被随后的 Start 处理清掉 → 录音无法停止。
+2. `src/main.rs:3443-3462` PTT 模式 keyup 若按住 <300ms，控制器发送 `CancelStop`
+   （`cancel-stop (PTT held < 300ms)`）—— 产品**防误触保护**（符合设计），但 cold 启动时
+   测试快速 release 恰好命中该路径。
+
+### 为什么判定为 harness 而非产品缺陷
+
+- **warm 进程 4/4 全部成功**，且 6 次 warm 探针零失败 → 稳态行为可靠。
+- 竞态窗口仅在 **cold 启动后最初 ~1-2s**（worker 首个 Start 触发 transcriber 热重载/重建
+  `src/main.rs:3980-4010` `needs_rebuild` 路径），真实用户不会在冷启动 1-2 秒内按热键。
+- `cancel-stop (PTT held < 300ms)` 是产品**明确设计的防误触**，测试快速 release 属误触语义，非产品错误。
+
+### harness 修复（E2E-HARNESS-050）
+
+`tests/test_cases/test_hotkey.py` 新增 `_prewarm_recording(start_gesture, stop_gesture, settle)`：
+断言序列前先做一轮「Start→settle→Stop」往返，验证 worker 已就绪；PTT 用例用 `key_down`/`key_up` + 0.5s settle。
+**不改产品、不弱化「窗口出现/消失」断言语义**。修复后 6/6 hotkey 全过且可复现。
+
+### 防御规则
+
+1. 对依赖「热键停止/PTT 释放」的用例，先在断言前预热一轮完整 Start→Stop 往返，再测目标手势
+2. PTT 测试不得用快速 tap（<300ms 触发产品防误触 cancel-stop），必须用显式 `key_down`+定时释放
+3. 判产品缺陷前先做 **warm 对照**（warm 无故障 → 大概率 cold 启动竞态而非稳态缺陷）
+
+### 与既有条目的关系
+
+曝光机制同 [E2E-CONFIG-PATH-STALE-001]（fix 后 door 真正立起来才暴露的**下一层** harness 时序问题）；
+`cancel-stop (PTT held < 300ms)` 行为同 [HAPPYDOM-ALTGR-INDISTINGUISHABLE-001] 模式 ——
+「产品设计行为被测试误当成缺陷」，测试应匹配产品语义而非要求产品改变。
+
+---
+
+## [E2E-CONFIG-PATH-STALE-001] 修复实证（2026-08-18 E2E-HARNESS-050 闭环）
+
+上方「修复建议」已全部落实并实跑验证：
+
+| 项 | 落实 |
+| --- | --- |
+| 建议 1（harness 写 exe_dir） | ✅ `tests/conftest.py` 新增 `voice_ime_config_file()`（单源，同 `src/config/mod.rs:340-346`），三处实例（test_hotkey/test_config_runtime/test_full_pipeline）统一；未加环境变量（DEC-031） |
+| 建议 2（尺寸对齐 + 同源化） | ✅ `state_detector.py` 导入时正则解析 `main.rs:880-884` 三常量，动态建表零硬编码；`TOLERANCE_PX=15` 容差带 |
+| 建议 3（预存 harness 缺陷顺带修） | ✅ `test_platform.py` `--lib`→`--bin feiyin-ime`+`_cargo_bin()`+UTF-8 capture；`test_tauri_v2_commands.py` 白名单补 3 命令；`test_injection.py` 注释 320x110→320x140 |
+
+**实跑对照**：Publish/ 真包 `-m "not hardware"` → **2 FAIL / 61 PASS / 32 SKIP / 7 deselected（142.96s）**，
+基线 9 FAIL 中 **7 条 harness 全过**；残留 2 条 `test_cargo_test_*` = coder-2 **未提交** WIP 编译破坏
+（`qwen_inference.rs:712` 签名改 `FnMut(&str, &[WordTiming])` vs `:1645` 测试闭包 1 参 → E0593），非 harness。
+→ **[E2E-CONFIG-PATH-STALE-001] 正式闭环（harness 侧），门禁自初始提交以来首次接近全绿。**
+

@@ -17,7 +17,6 @@
 - 使用记事本作为文字注入验证目标
 """
 
-import os
 import subprocess
 import time
 from pathlib import Path
@@ -27,7 +26,7 @@ import pytest
 win32clipboard = pytest.importorskip("win32clipboard")
 import pyautogui
 
-from ..conftest import kill_existing_voice_ime, wait_for_condition
+from ..conftest import kill_existing_voice_ime, voice_ime_config_file, wait_for_condition
 from ..sendinput_hotkey import key_down, key_up, press_escape, tap_key, press_hotkey
 from ..utils.state_detector import OverlayState, detect_overlay_state
 
@@ -35,12 +34,10 @@ from ..utils.state_detector import OverlayState, detect_overlay_state
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.1
 
-# 配置目录
-if os.name == "nt":
-    CONFIG_DIR = Path.home() / "AppData" / "Roaming" / "voice-ime"
-else:
-    CONFIG_DIR = Path.home() / ".config" / "voice-ime"
-CONFIG_FILE = CONFIG_DIR / "config.toml"
+# 配置路径：主程序读取 <exe_dir>/config.toml（同源 src/config/mod.rs:340-346），
+# harness 必须与之一致（[E2E-CONFIG-PATH-STALE-001] 错位一修复）。
+CONFIG_FILE = voice_ime_config_file()
+CONFIG_DIR = CONFIG_FILE.parent
 
 
 # ==================== 热键配置读取 ====================
@@ -580,7 +577,7 @@ class TestFullPipelineFocusLost:
         1. 启动录音
         2. 切换到其他窗口（模拟焦点丢失）
         3. 停止录音
-        4. 验证 overlay 显示 FocusLost 预览窗口（320x110）
+        4. 验证 overlay 显示 FocusLost 预览窗口（320x140，与 PREVIEW_OVERLAY_SIZE 同源）
         """
         hotkey = e2e_toggle_config
         print(f"\n🔑 使用热键配置: {hotkey}")

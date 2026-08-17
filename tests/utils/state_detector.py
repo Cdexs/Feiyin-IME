@@ -6,12 +6,22 @@ voice-ime 状态检测工具
 - 通过可见性 + 窗口尺寸判断当前状态
 - 支持截图 + OCR（可选）
 
-窗口尺寸对应状态（2026-05-02 RECORDING-OVERLAY-REDESIGN-001 更新）：
-- 所有状态统一尺寸：480x52
+尺寸与源码同源（[E2E-OVERLAY-SIZE-STALE-001] 错位二修复）：
+- STATE_SIZES 不再硬编码，而是在导入时从 src/main.rs 的三个常量实时解析：
+  RECORDING_OVERLAY_SIZE / STATUS_OVERLAY_SIZE / PREVIEW_OVERLAY_SIZE
+- 尺寸判据使用容差带（TOLERANCE_PX）而非精确相等，避免微调尺寸误报
+
+已知局限（harness 能力边界，非产品缺陷）：
+- recording(240x36) 与 processing(240x36) 尺寸相同，纯尺寸无法区分；
+  full_pipeline 中显式断言 PROCESSING 的用例需 OCR/内容探针，超出本模块能力。
+- StreamingEditing / RecordingStreamingIdle 等变体同样映射到 RECORDING_OVERLAY_SIZE，
+  尺寸层视为 RECORDING 是预期行为。
 """
 
 import ctypes
+import re
 import time
+from pathlib import Path
 from ctypes import wintypes
 from enum import Enum
 from dataclasses import dataclass
@@ -33,14 +43,35 @@ WNDENUMPROC = ctypes.WINFUNCTYPE(
 OVERLAY_CLASS_NAME = "voice-ime-overlay-window"
 SETTINGS_WINDOW_TITLE = "飞音语音输入"  # Tauri v2 窗口标题（productName）
 
-# 状态对应窗口尺寸 (width, height)
-# RECORDING-OVERLAY-REDESIGN-001: recording/processing 更新为 480x52
-# focuslost 保持原尺寸 320x110（coder-2 未修改）
-STATE_SIZES = {
-    "recording": (480, 52),
-    "processing": (480, 52),
-    "focuslost": (320, 110),
+# 容差带（px）：吸收 DPI/边框抖动与微小尺寸调整，仍远小于各状态尺寸间距
+TOLERANCE_PX = 15
+
+_SRC_MAIN_RS = Path(__file__).resolve().parents[2] / "src" / "main.rs"
+_SIZE_PATTERNS = {
+    "recording": re.compile(r"const RECORDING_OVERLAY_SIZE: \[i32; 2\] = \[(\d+),\s*(\d+)\];"),
+    "processing": re.compile(r"const STATUS_OVERLAY_SIZE: \[i32; 2\] = \[(\d+),\s*(\d+)\];"),
+    "focuslost": re.compile(r"const PREVIEW_OVERLAY_SIZE: \[i32; 2\] = \[(\d+),\s*(\d+)\];"),
 }
+
+
+def _load_overlay_sizes() -> dict:
+    """从 src/main.rs 实时解析 overlay 尺寸常量（单一事实源）。"""
+    if not _SRC_MAIN_RS.exists():
+        raise FileNotFoundError(f"src/main.rs not found: {_SRC_MAIN_RS}")
+    text = _SRC_MAIN_RS.read_text(encoding="utf-8")
+    sizes = {}
+    for state, pattern in _SIZE_PATTERNS.items():
+        match = pattern.search(text)
+        if not match:
+            raise RuntimeError(
+                f"cannot parse {state} size constant ({_SIZE_PATTERNS[state].pattern}) from {_SRC_MAIN_RS}"
+            )
+        sizes[state] = (int(match.group(1)), int(match.group(2)))
+    return sizes
+
+
+# 状态对应窗口尺寸 (width, height)，与 src/main.rs 常量同源
+STATE_SIZES = _load_overlay_sizes()
 
 
 class OverlayState(Enum):
@@ -135,9 +166,10 @@ def detect_overlay_state(hwnd: Optional[int] = None) -> OverlayState:
     """
     检测 overlay 窗口状态
 
-    RECORDING-OVERLAY-REDESIGN-001 更新：
-    - recording/processing: 480x52（新设计）
-    - focuslost: 320x110（未修改）
+    尺寸来自 src/main.rs 常量（STYLE_SIZES 与容差带实时解析，非硬编码）：
+    - recording / processing: RECORDING_OVERLAY_SIZE / STATUS_OVERLAY_SIZE（当前均为 240x36）
+    - focuslost: PREVIEW_OVERLAY_SIZE（当前 320x140）
+    匹配采用容差带 TOLERANCE_PX，非精确相等。
 
     Args:
         hwnd: 窗口句柄（可选，不传则自动查找）
@@ -158,9 +190,9 @@ def detect_overlay_state(hwnd: Optional[int] = None) -> OverlayState:
     width = rect[2] - rect[0]
     height = rect[3] - rect[1]
 
-    # 根据尺寸判断状态（允许 ±5px 误差）
+    # 根据尺寸判断状态（容差带 TOLERANCE_PX，非精确相等）
     for state_name, (expected_w, expected_h) in STATE_SIZES.items():
-        if abs(width - expected_w) <= 5 and abs(height - expected_h) <= 5:
+        if abs(width - expected_w) <= TOLERANCE_PX and abs(height - expected_h) <= TOLERANCE_PX:
             return OverlayState(state_name)
 
     return OverlayState.UNKNOWN

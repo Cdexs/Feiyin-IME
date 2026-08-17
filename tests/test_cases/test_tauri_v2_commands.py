@@ -208,6 +208,9 @@ class TestTauriV2CommandsFrontend:
         expected_commands = {
             "get_config",
             "save_config",
+            "open_url_in_browser",
+            "add_wordbook_entry",
+            "delete_wordbook_entry_by_id",
             "test_llm_connection",
             "get_audio_devices",
             "check_hotkey_available",
