@@ -1249,3 +1249,9 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 - 消融 A（`delta.abs()` 改回 `delta`）实测 4 条变红（含任务书预期外的 `step_never_exceeds_quarter_of_delta`，主控确认以实测为准）；消融 B（门闩改 `false`）实测仅真值表 1 条变红。
 - 两次消融均完整还原，还原后全量复跑 1040/0/11 逐数一致。
 - 纯 Windows 平台测试执行，macOS 侧无任何动作。
+
+### BUILD-018 补充（2026-08-17）
+
+- 阶段五出包：OVERLAY-043 全批（`a588509`/`5940e73`/`497131f`/`b499cc3`）进 exe，改动全在 `src/main.rs`。
+- 四步构建全执行 + 七项核验全 PASS；三 exe 两副本 sha256 逐一相等、toml 三副本一致、ProductVersion 0.8.0 未动、冒烟 Responding=True 无 panic。
+- `interpolate_step` / `should_ignore_streaming_text` 均为 Windows overlay 纯函数，本包为 Windows 产物构建，macOS 侧无任何动作。

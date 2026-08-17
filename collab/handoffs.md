@@ -2,6 +2,18 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-08-17 — tester-1 — BUILD-018 ✅ 阶段五出包：OVERLAY-043 全批进 exe（零生产改动，待主控验收）
+
+- **来源**：主控派单（DEC-053 直接出包，基线 HEAD `b499cc3`）。前置四提交 OVERLAY-043 `a588509` / OVERLAY-043-B `5940e73` / TEST-SYNC-043 `497131f` / TEST-EXEC-043 `b499cc3` 已全验收
+- **四步构建全执行**：Step1 击杀 Gavin 端测实例 `feiyin-ime` PID 21948（-debug / 12:27 / BUILD-017 旧包 08-16 23:25）——**先报主控获 Gavin 授权**属预期击杀，`feiyin-ime-nor.exe` 备份未删 → Step2 npm build 1.60s + Tauri UI 1m56s → Step3 主程序 2m21s → Step4 同步 Publish/+toml 三副本，`Publish/config.toml` 运行时数据未覆盖
+- **七项核验全 PASS**：① 六 exe 时间戳 13:57-14:00 本次构建；② sha256 两副本逐一相等（`24cad6be…`/`1857c0de…`/`17fe10af…`）；③ toml 三副本 hash 全等（与 BUILD-017 相同未变）；④ ProductVersion 0.8.0/0.8.0.0 未动；⑤ 正向探针 `Streaming resampler active`=1；OVERLAY-043 本批如实报探不到（GDI 逻辑无新文案），间接证据三件套（mtime>最新提交+源码引用×24/×9+反向 `delta.abs()` 无残留）；⑥ 大小 feiyin-ime +3,072 B 略增（吻合 +337/-128）/ ui 0 / crash 0；⑦ 冒烟 PID 28300 Responding=True 无 panic 测后清理
+- **红线合规**：生产零改动（`git diff -w` src/src-tauri/ui 全空，工作区 M 纯 CRLF 噪声）｜版本号未动｜运行时数据未覆盖｜未 reset/checkout/commit｜**未 push**｜Gavin 端测进程先报后杀（PID 4696 先例同族）
+- **Gavin 端测重点四项**（result.md 末尾原样列出）：流畅度目视 / 本地模型录一次（波形动画）/ 波形隐藏+单按钮 / 松开热键立即切处理中
+- **验收**：版本号 0.8.0 未动；未 commit（主控统一提交）；产物 `Publish/` 三 exe 12,115,456 / 10,026,496 / 24,859,648 B
+- **详情**：outbox/tester-1/result.md + logs/20260817.md + CHANGELOG.md
+
+---
+
 ## 2026-08-17 — tester-1 — TEST-EXEC-043 ✅ 阶段四全量回归 + 消融实测（OVERLAY-043 批，生产零改动，待主控验收）
 
 - **来源**：主控派单（基线 HEAD `497131f`）。前置三提交 OVERLAY-043 `a588509` / OVERLAY-043-B `5940e73` / TEST-SYNC-043 `497131f` 已全验收

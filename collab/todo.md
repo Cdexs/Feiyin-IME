@@ -2434,3 +2434,15 @@ coder-1 在 DATA-SCENE-GENERIC-008 中评估后建议的候选：**`思维导图
 - [x] 还原自证：git diff -w 空 + 还原后复跑 1040/0/11
 - [x] 文档同步（logs/CHANGELOG/handoffs/MACOS-HANDOFF/本文件）
 - [ ] 主控验收
+
+## BUILD-018（2026-08-17，tester-1）— 阶段五出包 OVERLAY-043 全批进 exe
+- [x] Step1 杀进程（含 Gavin 端测实例 PID 21948，先报主控获授权）
+- [x] Step2 npm build + Tauri UI（custom-protocol + cp）
+- [x] Step3 主程序 release
+- [x] Step4 同步 Publish/ + toml 三副本（config.toml 未覆盖）
+- [x] ① 六 exe 时间戳 ② sha256 两副本 ③ toml 三副本 ④ ProductVersion 0.8.0
+- [x] ⑤ 探针（正向 1 命中 + 间接证据三件套）
+- [x] ⑥ 大小对照（feiyin-ime +3,072 / ui 0 / crash 0）
+- [x] ⑦ 冒烟 PID 28300 Responding=True 无 panic 测后清理
+- [x] result.md + 五文档同步
+- [ ] 主控验收 + Gavin 端测（流畅度/本地模型/波形/切态 四项）
