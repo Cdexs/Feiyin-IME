@@ -2,6 +2,23 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-08-17 — coder-1 — OVERLAY-051-A/H ✅ EDIT 子类化转发修复 + 编辑态横向滚动（P0，src/main.rs +55/-17，待主控验收）
+
+- **来源**：OVERLAY-051 coder-2 完成七项后上下文耗尽，剩下 051-A/H（最根本的一条）改派 coder-1。基线 HEAD `9c1806d`。Gavin 端测三现象：① 进编辑态窗口文字消失；② 没法编辑；③ 文字超窗口宽光标到不了无法标记
+- **根因**：`edit_subclass_wnd_proc` 除拦 `WM_NCPAINT`/`VK_RETURN` 外一律 `DefWindowProcW`（默认窗口过程，**不是 EDIT 类过程**），`grep CallWindowProcW src/main.rs`=0 印证原过程保存了但从未调用 → EDIT 文本存储/绘制/按键/插入符滚动/选区全被绕过
+- **改动**（仅 `src/main.rs` +55/-17）：
+  1. import 加 `CallWindowProcW`/`SetPropW`/`GetPropW`/`RemovePropW`/`HANDLE`，移除未用 `ES_MULTILINE`
+  2. const `EDIT_OLD_PROC_PROP` 宽字符串 prop 名
+  3. `create_edit_control` 用 `SetPropW` 把 old_proc 存到 EDIT 命名属性（`GWLP_USERDATA` 已被 051-D 占用存父窗口 HWND）
+  4. `edit_subclass_wnd_proc` 其余消息改 `CallWindowProcW(old_proc)` 转发（`GetPropW` 取回 transmute `WNDPROC`）；`WM_NCPAINT`/`VK_RETURN` 拦截不变
+  5. `destroy_edit_control` 加 `RemovePropW` 清理
+  6. 051-H：去 `ES_MULTILINE` 改真正单行 EDIT（保留 `ES_AUTOHSCROLL` 跟随式自动滚动，无 `WS_HSCROLL` 滚动条）
+- **方案选择**：选项 1（`CallWindowProcW` + `SetPropW`），不选选项 2（`SetWindowSubclass` + Comctl32 依赖）。理由：改动小、不引入 Cargo.toml feature 变更（红线 1）、所需 API 全在已启用 feature 下、`GWLP_USERDATA` 已被占用故用 `SetPropW`
+- **自证**：① `old_proc` 存 `SetPropW` 命名属性（非 `GWLP_USERDATA`）；② `WM_NCPAINT` 拦截在 `CallWindowProcW` 转发前返回 0，去边框效果不丢；③ `destroy_edit_control` 先恢复原 WNDPROC → `RemovePropW` → `DestroyWindow`，无悬空指针无泄漏；④ 去 `ES_MULTILINE` 后单行 + `ES_AUTOHSCROLL` 标准语义光标可达全部文字，**无 `WS_HSCROLL` 滚动条**；⑤ 051-D 回车提交在单行模式下**更可靠**（多行 Enter 插换行不上报 `VK_RETURN`）；⑥ 不可单测（EDIT 子类化依赖真实 HWND），未写假护栏，靠 Gavin 端测 BUILD-020
+- **验证**：`cargo fmt --all -- --check` clean / `cargo check --all-targets` 0 error（109 既有 warnings 无新增）/ `cargo check --manifest-path src-tauri/Cargo.toml --all-targets` 0 error / `git diff -w --stat -- src/ src-tauri/` 仅 `src/main.rs`
+- **红线合规**：未碰 `src/transcription/**`（红线 2）/ `interpolate_step` `should_ignore_streaming_text` 签名契约（红线 3）/ `InvalidateRect` `bErase`（红线 4）/ coder-2 已提交七项（红线 5，在其基础上补）/ `ui/**`（红线 7）/ 版本号 0.8.0 未动（红线 6）/ 未 commit
+- **详情**：logs/20260817.md + CHANGELOG.md（OVERLAY-051-A/H 条目）
+
 ## 2026-08-17 — coder-1 — HOTKEY-049 ✅ 翻译热键与录音热键重复检测 + 拦截（4 文件 +78，待主控验收）
 
 - **来源**：Gavin 拍板「要拦截，如果是组合键，其中一个键重复也要拦」。方案完全固化在 todo.md `## 🔴 已拍板待派发 · HOTKEY-049` 专节（含 7 条实例对照表）。HOTKEY-048 文案已写「不可和录音热键重复」但三层强制机制全为空，本单补 UI 层强制

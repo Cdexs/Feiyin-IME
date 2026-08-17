@@ -43,7 +43,9 @@ use std::os::windows::ffi::OsStrExt;
 #[cfg(target_os = "windows")]
 use windows::core::PCWSTR;
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+};
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
@@ -75,25 +77,28 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 
 #[cfg(target_os = "windows")]
-use windows::Win32::UI::WindowsAndMessaging::{
-    ES_AUTOHSCROLL, ES_MULTILINE, GWLP_WNDPROC, WINDOW_STYLE,
-};
+use windows::Win32::UI::WindowsAndMessaging::{ES_AUTOHSCROLL, GWLP_WNDPROC, WINDOW_STYLE};
 #[cfg(target_os = "windows")]
 const EM_SETSEL_MSG: u32 = 0x00B1; // EM_SETSEL
 #[cfg(target_os = "windows")]
+const EDIT_OLD_PROC_PROP: [u16; 16] = [
+    'f' as u16, 'y' as u16, 'n' as u16, '_' as u16, 'e' as u16, 'd' as u16, 'i' as u16, 't' as u16,
+    '_' as u16, 'o' as u16, 'l' as u16, 'd' as u16, 'p' as u16, 'r' as u16, 'o' as u16, 0,
+];
+#[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetClientRect, GetForegroundWindow, GetMessageW, GetSystemMetrics,
-    GetWindowLongPtrW, KillTimer, LoadCursorW, MsgWaitForMultipleObjects, PeekMessageW,
-    PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetLayeredWindowAttributes,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage,
-    CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA, GWL_EXSTYLE, HMENU, IDC_ARROW, LWA_ALPHA,
-    MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN, SM_CYSCREEN,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
-    SW_SHOWNA, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CTLCOLOREDIT, WM_DESTROY,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_NCCREATE, WM_PAINT, WM_TIMER, WNDCLASSW,
-    WNDCLASS_STYLES, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
+    AppendMenuW, CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+    DestroyWindow, DispatchMessageW, GetClientRect, GetForegroundWindow, GetMessageW, GetPropW,
+    GetSystemMetrics, GetWindowLongPtrW, KillTimer, LoadCursorW, MsgWaitForMultipleObjects,
+    PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, RemovePropW, SetForegroundWindow,
+    SetLayeredWindowAttributes, SetPropW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TrackPopupMenu, TranslateMessage, CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA, GWL_EXSTYLE,
+    HMENU, IDC_ARROW, LWA_ALPHA, MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN,
+    SM_CYSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
+    SW_SHOW, SW_SHOWNA, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CTLCOLOREDIT,
+    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_NCCREATE, WM_NCPAINT, WM_PAINT,
+    WM_TIMER, WNDCLASSW, WNDCLASS_STYLES, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
 };
 #[derive(Debug, Clone)]
 enum PipelineEvent {
@@ -538,7 +543,7 @@ fn create_edit_control(hwnd: HWND, state: &mut OverlayWindowState, rect: &RECT, 
             WS_EX_NOACTIVATE, // child, keep NOACTIVATE so it doesn't steal from parent
             PCWSTR(class_name.as_ptr()),
             PCWSTR(title.as_ptr()),
-            WS_CHILD | WS_VISIBLE | WINDOW_STYLE((ES_AUTOHSCROLL | ES_MULTILINE) as u32),
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
             edit_left,
             edit_top,
             edit_w,
@@ -567,6 +572,17 @@ fn create_edit_control(hwnd: HWND, state: &mut OverlayWindowState, rect: &RECT, 
                     old_proc,
                 )
             });
+            // OVERLAY-051-A: store old_proc on the EDIT window via SetPropW so the
+            // static subclass proc can CallWindowProcW it. GWLP_USERDATA is already
+            // used to store the parent overlay HWND (see :559), so we use a named prop.
+            unsafe {
+                let prop_name = PCWSTR(EDIT_OLD_PROC_PROP.as_ptr());
+                let _ = SetPropW(
+                    edit_hwnd,
+                    prop_name,
+                    HANDLE(old_proc as *mut std::ffi::c_void),
+                );
+            }
             log::info!("ASR-038-C: created EDIT control for streaming editing");
         }
         Err(e) => {
@@ -619,7 +635,23 @@ unsafe extern "system" fn edit_subclass_wnd_proc(
             return LRESULT(0);
         }
     }
-    DefWindowProcW(hwnd, msg, wparam, lparam)
+    // OVERLAY-051-A: forward to the original EDIT window procedure via CallWindowProcW.
+    // DefWindowProcW is the default window proc, NOT the EDIT class proc — using it
+    // bypasses all of EDIT's text storage, drawing, caret/scroll, selection logic,
+    // which was the root cause of "text disappears / can't edit / cursor can't reach".
+    let prop_name = PCWSTR(EDIT_OLD_PROC_PROP.as_ptr());
+    let old_proc = unsafe { GetPropW(hwnd, prop_name) };
+    if !old_proc.0.is_null() {
+        let old_proc_fn = unsafe {
+            std::mem::transmute::<
+                *mut std::ffi::c_void,
+                windows::Win32::UI::WindowsAndMessaging::WNDPROC,
+            >(old_proc.0)
+        };
+        unsafe { CallWindowProcW(old_proc_fn, hwnd, msg, wparam, lparam) }
+    } else {
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -634,6 +666,12 @@ fn destroy_edit_control(state: &mut OverlayWindowState) {
                     )
                 });
             }
+        }
+        // OVERLAY-051-A: remove the prop we stored on the EDIT window (old proc handle)
+        // before destroying it, to avoid a dangling atom/property entry.
+        unsafe {
+            let prop_name = PCWSTR(EDIT_OLD_PROC_PROP.as_ptr());
+            let _ = RemovePropW(edit_hwnd, prop_name);
         }
         unsafe {
             let _ = DestroyWindow(edit_hwnd);

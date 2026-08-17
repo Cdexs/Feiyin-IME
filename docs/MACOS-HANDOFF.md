@@ -1271,3 +1271,10 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 - 翻译热键侧只同步焦点竞态修复（`useLayoutEffect` + `autoFocus` + `onBlur`），录制规则未改。
 - 后端能力边界（macOS 侧 `src/platform/macos/hotkey.rs` 未读，本轮未碰）：UI 层改动平台中立，若 macOS 后端不支持修饰键单键 polling，UI 仍会发出对应 vk/modifiers，届时由 macOS 后端决定是否生效；本任务红线明确不动后端。
 - 无 `*.test.tsx`（阶段三 TEST-SYNC-047 由 tester-1 串行派发）。
+
+### OVERLAY-051-A/H 补充（2026-08-17）
+
+- 仅改 `src/main.rs`（+55/-17），改动全部位于 Windows-only `#[cfg(target_os = "windows")]` 区域内，macOS 编译零接触、零行为契约变化。
+- **051-A**：`edit_subclass_wnd_proc` 原转发 `DefWindowProcW`（默认窗口过程）→ EDIT 文本存储/绘制/按键/滚动/选区全被绕过（Gavin 端测：文字消失/没法编辑/光标到不了）。改为 `CallWindowProcW(old_proc)` 转发原 EDIT 过程；old_proc 用 `SetPropW`/`GetPropW`/`RemovePropW` 存取于 EDIT 窗口的命名属性 `fyn_edit_oldpro`（`GWLP_USERDATA` 已被 051-D 占用存父窗口 HWND）。`destroy_edit_control` 加 `RemovePropW` 清理。
+- **051-H**：去掉 `ES_MULTILINE` 改真正单行 EDIT（保留 `ES_AUTOHSCROLL`），单行模式 Enter 上报 `VK_RETURN`（051-D 回车提交更可靠），`ES_AUTOHSCROLL` 跟随式自动滚动光标可达全部文字，无 `WS_HSCROLL` 滚动条。
+- macOS 侧无对应 EDIT 子类化实现（macOS overlay 用 NSView/NSPanel，不是 Win32 EDIT），本改动平台隔离，macOS 侧无需任何动作。
