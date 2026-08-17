@@ -74,23 +74,44 @@ HOTKEY-048 把翻译热键页文案改成「推荐：左右 Ctrl / Alt，**不�
 翻译走 `spawn_translate_poll_thread` 轮询 `GetAsyncKeyState(vk)`。
 设成同一个键时**两条路径会同时触发**，产生不可预测的错乱状态。
 
-### 判据设计（**两条，第 2 条请 Gavin 过目**）
+### 🔴 判据（2026-08-17 Gavin 已拍板，**比主控原提案更宽**）
 
-**数据形态差异先说清**：
-- 语音热键 = `{ vk_code, modifiers }`（可带修饰键组合）
-- 翻译热键 = `{ vk_code }` **只有单键**，无 modifiers 字段（候选 `TRANSLATION_SINGLE_KEYS = [0xA3, 0xA2, 0xA5, 0xA4]`）
+> **Gavin 原话**：「要拦截，如果是组合键，其中一个键重复也要拦」
 
-| # | 判据 | 举例 | 拦截？ |
+**统一规则：两个热键涉及的「按键集合」不得有交集，有交集即拦。**
+（此规则同时涵盖主控原提案的判据 1 与判据 2，不再分两条。）
+
+**语音热键的按键集合推导**（`{vk_code, modifiers}` → 键集合）：
+
+| 来源 | 展开为 |
+| --- | --- |
+| `vk_code` 本身 | `{vk_code}`（若它本就是修饰键 0xA0–0xA5，它就是那个键） |
+| `modifiers` 含 `0x0001` (MOD_ALT) | `{0xA4, 0xA5}` 左右 Alt **两个都算** |
+| `modifiers` 含 `0x0002` (MOD_CONTROL) | `{0xA2, 0xA3}` 左右 Ctrl |
+| `modifiers` 含 `0x0004` (MOD_SHIFT) | `{0xA0, 0xA1}` 左右 Shift |
+| `modifiers` 含 `0x0008` (MOD_WIN) | `{0x5B, 0x5C}`（翻译候选集不含 Win，实际不会命中） |
+
+🔴 **为什么修饰键必须展开成左右两个**：语音热键的 `modifiers` 是 Win32 的
+`MOD_ALT`/`MOD_CONTROL`/`MOD_SHIFT`，**不区分左右**（`RegisterHotKey` 与
+`modifiers_pressed_from_hook` 用的 `VK_MENU`/`VK_CONTROL`/`VK_SHIFT` 均不分左右）。
+所以语音热键写 `Alt+M` 时，**左 Alt 和右 Alt 都会触发它** →
+翻译键设成左 Alt 或右 Alt 任一个都构成真冲突，必须都拦。
+
+**翻译热键的按键集合** = `{translation.vk_code}`（单键，无 modifiers 字段）。
+
+**判定**：两集合交集非空 → **拦截**。
+
+### 实例对照表（实施时按此逐条自证）
+
+| 语音热键 | 语音键集合 | 翻译键 | 结果 |
 | --- | --- | --- | --- |
-| **1** | **完全相同**：`translation.vk_code === hotkey.vk_code` 且 `hotkey.modifiers === 0` | 录音=右Alt(165)，翻译=右Alt(165) | 🔴 **拦**（Gavin 明确要求） |
-| **2** | **翻译键是语音组合键的修饰键**：语音 `modifiers` 含某修饰位，翻译键正是该位对应的左/右变体 | 录音=`Alt+M`，翻译=右Alt | 🟡 **建议拦**，待 Gavin 确认 |
-
-**第 2 条的理由**：录音是 `Alt+M` 时，用户**必须按住 Alt** 才能触发录音，
-而按住 Alt 的同一动作就会翻转翻译开关 → 每次录音都被迫开翻译，等价于坏掉。
-**第 2 条要展开成左右两个 vk**：语音 `modifiers` 不区分左右，故 `MOD_ALT` 同时与 `0xA4`/`0xA5` 冲突
-（Ctrl→`0xA2`/`0xA3`，Shift→`0xA0`/`0xA1`）。
-
-**明确不拦**：语音=`Alt+M`、翻译=右**Ctrl** → 无交集，正常放行。
+| 右 Alt (165, mod=0) | `{0xA5}` | 右 Alt (0xA5) | 🔴 **拦**（完全相同） |
+| 右 Alt (165, mod=0) | `{0xA5}` | 左 Alt (0xA4) | ✅ 放行（vk 不同，运行时钩子能区分左右） |
+| `Alt+M` (0x4D, mod=0x1) | `{0x4D, 0xA4, 0xA5}` | 右 Alt (0xA5) | 🔴 **拦**（Gavin 第 2 条） |
+| `Alt+M` (0x4D, mod=0x1) | `{0x4D, 0xA4, 0xA5}` | 左 Alt (0xA4) | 🔴 **拦**（左右都算） |
+| `Alt+M` (0x4D, mod=0x1) | `{0x4D, 0xA4, 0xA5}` | 右 Ctrl (0xA3) | ✅ 放行（无交集） |
+| `Ctrl+Shift+M` (0x4D, mod=0x6) | `{0x4D, 0xA2, 0xA3, 0xA0, 0xA1}` | 左 Ctrl (0xA2) | 🔴 **拦** |
+| `Ctrl+Shift+M` (0x4D, mod=0x6) | 同上 | 右 Alt (0xA5) | ✅ 放行 |
 
 ### 🔴 UI 行为：不得复用现有「仍然使用」弹窗
 
@@ -1028,3 +1049,37 @@ coder-1 在 DATA-SCENE-GENERIC-008 中评估后建议的候选：**`思维导图
 **顺带的方法教训**（已记 `[WORKER-WRITE-SILENT-FAIL-001]` 同族）：
 coder-1 自证里报「三份 locale = 111:111:111 一致」，等式不成立 ——
 **报数字前要真的量一次**。主控验收一律独立复算，不采信自证里的数字。
+
+---
+
+## 🛑 2026-08-17 停派指令（Gavin）—— 恢复时从这里开始
+
+> **Gavin 原话**：「你的额度快尽了，先别派发任务，等我指令再派」
+
+| 项 | 状态 |
+| --- | --- |
+| HEAD | `2e70875`，**已 push**（`56bfa37..2e70875`，10 个提交），token 无残留 |
+| 工作区 | clean（仅 `collab/todo.md.bak-20260817` 未跟踪备份，可留） |
+| BUILD-019 产物 | `Publish/` 08-17 16:18，三 exe sha 相对 BUILD-018 全变，⏭ **待 Gavin 端测** |
+| coder-1 / coder-2 / tester-1 | **全部空闲待命，手上零任务** |
+| 🔴 恢复后第一个动作 | 派 **HOTKEY-049**（Gavin 已定顺序「先 049」），方案与判据已固化在上方专节，**可直接派，无需再问** |
+| 其后 | 阶段三 TEST-SYNC-049 → 阶段四 → BUILD-020 → push（push 授权已给，出包后执行） |
+| 再其后 | `E2E-HARNESS-050`（修两道 harness 错位，裁决已定：改 harness 不改生产、尺寸与 `main.rs` 常量同源） |
+
+### 恢复时不必重新调研的（已定论，直接用）
+
+- HOTKEY-049 判据、键集合推导、7 条实例对照表 → 见上方 049 专节
+- 049 的 UI 红线：**不得复用带「仍然使用」的现有冲突弹窗**，须另做只有「重新设置」出口的提示
+- 049 双向生效：设翻译键查语音键、设语音键查翻译键，两侧都要做
+- 049 范围外：后端不做强制（手改 config.toml 不受保护），已如实记录
+- E2E 门禁结论：产品正常，两道 harness 错位自初始提交即存在 → `[E2E-CONFIG-PATH-STALE-001]`
+
+### Gavin 端测五项（BUILD-019）
+
+1. 按热键录音窗口出不出来（本包核心）
+2. 点一次「设置热键」就能录上（不用点两次）
+3. 左 Alt / 左 Ctrl / 左 Shift 可单独设，且按下即回显键名
+4. 按住右 Alt 再按 M → 应得 `Alt+M` 而非 `Ctrl+Alt+M`
+5. 🔴 **只有端测能验**：真按左 Ctrl+左 Alt+字母 → 应得 `Ctrl+Alt+字母`，不得被吞成 `Alt+字母`
+   （happy-dom 把 `AltGraph` 与 `alt` 同映射，单测证明不了，见
+   `[HAPPYDOM-ALTGR-INDISTINGUISHABLE-001]`）
