@@ -6296,6 +6296,144 @@ mod streaming_empty_samples_tests {
     }
 }
 
+/// OVERLAY-043-B：overlay 尺寸插值步长 `interpolate_step` 与流式晚到包门闩
+/// `should_ignore_streaming_text` 护栏。
+///
+/// 缺陷 A 背景（OVERLAY-043 验收打回）：缩小方向步长恒 1px/帧（800px→240px 需 559 帧
+/// ≈ 8.9 秒爬行）。根因是把 `delta.abs()` 误写成 `delta`，负 delta 的 `*0.25` 被
+/// `.max(1.0)` 抬高后恒为 1。修复后该算式已抽为纯函数 `interpolate_step`（OVERLAY-043-B）。
+/// 下方数值断言将「改回 `delta` 即变红」钉死，防缺陷 A 复发。
+#[cfg(target_os = "windows")]
+#[cfg(test)]
+mod overlay_043_interpolate_tests {
+    use super::interpolate_step;
+    use super::should_ignore_streaming_text;
+
+    /// 契约一：delta == 0 → 0（无可插值）。
+    #[test]
+    fn zero_delta_returns_zero() {
+        assert_eq!(interpolate_step(0), 0);
+    }
+
+    /// 🔴 缺陷 A 回归护栏（核心）：缩小方向必须与放大方向对称。
+    /// 若有人把 `delta.abs()` 改回 `delta`，`interpolate_step(-400)` 会变成 -1 而非 -100，
+    /// `interpolate_step(-100)` 会变成 -1 而非 -25，本条立即变红。
+    #[test]
+    fn shrink_direction_matches_contract_exact_values() {
+        assert_eq!(
+            interpolate_step(-400),
+            -100,
+            "缩小 400 每帧应走 25% 即 100px"
+        );
+        assert_eq!(interpolate_step(-100), -25, "缩小 100 每帧应走 25% 即 25px");
+        assert_eq!(interpolate_step(-8), -2);
+        assert_eq!(interpolate_step(-3), -1);
+    }
+
+    /// 放大方向同样满足 25% 量级（对称性正向侧证）。
+    #[test]
+    fn expand_direction_matches_contract_exact_values() {
+        assert_eq!(interpolate_step(400), 100);
+        assert_eq!(interpolate_step(100), 25);
+    }
+
+    /// 契约：非零 delta 步长绝对值 ≥ 1（至少 1px，保证最终收敛）。
+    #[test]
+    fn nonzero_delta_step_at_least_one_px() {
+        for n in -50_000i32..=50_000 {
+            if n == 0 {
+                continue;
+            }
+            let s = interpolate_step(n);
+            assert!(s.abs() >= 1, "delta={n} 步长应为 ≥1，实际 {s}");
+        }
+    }
+
+    /// 契约：步长不超过 delta 的 25%（按 ceil 量级）——防止单帧变化过大产生突兀跳动。
+    #[test]
+    fn step_never_exceeds_quarter_of_delta() {
+        for n in -50_000i32..=50_000 {
+            if n == 0 {
+                continue;
+            }
+            let s = interpolate_step(n);
+            let cap = (n.abs() as f32 * 0.25).ceil() as i32;
+            assert!(s.abs() <= cap, "delta={n} 步长 {s} 超过 25% 上限 {cap}");
+        }
+    }
+
+    /// 契约：步长绝对值 ≤ |delta|（绝不越过目标产生振荡）。
+    #[test]
+    fn step_never_overshoots_target() {
+        for n in -50_000i32..=50_000 {
+            if n == 0 {
+                continue;
+            }
+            let s = interpolate_step(n);
+            assert!(s.abs() <= n.abs(), "delta={n} 步长 {s} 越界");
+        }
+    }
+
+    /// 契约：正负对称 `interpolate_step(-n) == -interpolate_step(n)`。
+    #[test]
+    fn sign_symmetry_over_range() {
+        for n in 1..=50_000i32 {
+            assert_eq!(
+                interpolate_step(-n),
+                -interpolate_step(n),
+                "delta={n} 正负步长必须对称"
+            );
+        }
+    }
+
+    /// 收敛性：从 800 迭代到 240，帧数必须在合理上界内（≤40）。
+    /// 缺陷 A 下需 559 帧；正确实现 23 帧。该用例同时防「步长过小」与「振荡不收敛」两类退化。
+    #[test]
+    fn converges_800_to_240_within_frame_budget() {
+        let target = 240i32;
+        let mut width = 800i32;
+        let mut frames = 0u32;
+        while width != target && frames < 10_000 {
+            let delta = target - width;
+            width += interpolate_step(delta);
+            frames += 1;
+        }
+        assert_eq!(width, target, "窗口宽度必须收敛到 240");
+        assert!(
+            frames <= 40,
+            "800→240 应在 40 帧内收敛，实际 {frames} 帧（缺陷 A 为 559 帧）"
+        );
+    }
+
+    /// 放大方向对称收敛（240→800）同样在预算内。
+    #[test]
+    fn converges_240_to_800_within_frame_budget() {
+        let target = 800i32;
+        let mut width = 240i32;
+        let mut frames = 0u32;
+        while width != target && frames < 10_000 {
+            let delta = target - width;
+            width += interpolate_step(delta);
+            frames += 1;
+        }
+        assert_eq!(width, target, "窗口宽度必须收敛到 800");
+        assert!(frames <= 40, "240→800 应在 40 帧内收敛，实际 {frames} 帧");
+    }
+
+    /// 门闩 `should_ignore_streaming_text` 四格真值表穷举（Gavin 第 5 条修复）。
+    #[test]
+    fn ignore_streaming_text_truth_table() {
+        // (false, false)：正常录音出字 → 不忽略
+        assert!(!should_ignore_streaming_text(false, false));
+        // (false, true)：编辑中，文字继续同步进 EDIT → 不忽略
+        assert!(!should_ignore_streaming_text(false, true));
+        // (true, false)：已松手且未编辑 → 晚到包不得把窗口推回录音态 → 忽略
+        assert!(should_ignore_streaming_text(true, false));
+        // (true, true)：已松手但在编辑 → 仍同步 EDIT，但不切窗口状态 → 不忽略
+        assert!(!should_ignore_streaming_text(true, true));
+    }
+}
+
 /// OVERLAY-WIRE-002：PipelineEvent → overlay 指令七分支真值表（macOS）。
 /// 调用真实 overlay_request_for_event 与真实 PipelineEvent 各变体，逐分支断言。
 /// OVERLAY-002/003 契约（已对照生产 overlay_request_for_event 核验）：

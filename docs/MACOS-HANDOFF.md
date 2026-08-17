@@ -1236,3 +1236,9 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 - 仅将 `interpolate_step` 与 `should_ignore_streaming_text` 两个内联布尔/算术表达式抽为纯函数，调用点替换。
 - 新增函数仍位于 Windows-only `#[cfg(target_os = "windows")]` 区域内，macOS 编译零接触。
 - 行为零变更，macOS 侧无需任何动作。
+
+### TEST-SYNC-043 补充（2026-08-17）
+
+- 阶段三测试同步：仅新增 `mod overlay_043_interpolate_tests`（`src/main.rs` 测试区，+138 行，生产零改动）。
+- 模块带 `#[cfg(target_os = "windows")]` 门控（与 `interpolate_step` / `should_ignore_streaming_text` 同平台约束），macOS 编译完全不包含该模块。
+- 纯 Windows 平台测试，macOS 侧无任何动作。

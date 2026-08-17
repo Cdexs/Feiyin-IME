@@ -56,7 +56,7 @@
 | BUILD-017 | 阶段五出包（ASR-042/045 进 exe） | — | tester-1 | ✅ **已验收**（主控独立复算全部七项）。产物 08-16 23:25，`feiyin-ime.exe` 12,112,384B（+5,632）/ ui 10,026,496B 不变 / crash 24,859,648B 不变；两副本 sha256 全等；toml 三副本全等；ProductVersion 0.8.0.0/0.8.0/0.8.0.0。⏭ **待 Gavin 端测** |
 | **OVERLAY-043** | 录音窗口**五项**显示错乱 + 流畅度 | `src/main.rs` | coder-2 | ✅ **已验收已提交 `a588509`**（打回一轮，见下方打回记录）。⏭ 流畅度**待 Gavin 端测目视拍板** |
 | **OVERLAY-043-B** | 抽 `interpolate_step` / `should_ignore_streaming_text` 补护栏 | `src/main.rs` | coder-2 | ✅ **已验收已提交 `5940e73`**（纯重构零行为变更，无 `#[test]`） |
-| **TEST-SYNC-043** | 阶段三测试同步（两纯函数护栏 + 不可测项如实说明） | `src/main.rs` `mod tests` | tester-1 | 🚧 **2026-08-17 已派发** |
+| **TEST-SYNC-043** | 阶段三测试同步（两纯函数护栏 + 不可测项如实说明） | `src/main.rs` `mod tests` | tester-1 | ✅ **2026-08-17 已完成待验收**（`mod overlay_043_interpolate_tests` +138 行仅测试区：10 条用例——五契约 ±50000 穷举 + 缺陷 A 数值回归护栏 + 双向收敛预算 + 门闩四格真值表；cargo fmt clean / cargo check --all-targets 0 error；Python 复算契约成立、消融推演护栏有效。消融实测顺延阶段四 TEST-EXEC-043） |
 
 ### 🔴 OVERLAY-043 验收打回记录（主控独立复算查出，非采信报告）
 

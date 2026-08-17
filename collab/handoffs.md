@@ -2,6 +2,19 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-08-17 — tester-1 — TEST-SYNC-043 ✅ 阶段三测试同步：OVERLAY-043 + 043-B 补真护栏（src/main.rs +138，待主控验收）
+
+- **来源**：主控派单（基线 HEAD `5940e73`，OVERLAY-043 `a588509` + OVERLAY-043-B `5940e73` 已提交）。前置：缺陷 A 验收打回后已抽 `interpolate_step` 纯函数
+- **改动**：仅 `src/main.rs` 测试区新增 `mod overlay_043_interpolate_tests`（+138 行，Windows-only `#[cfg]` 门控，生产零改动）
+- **10 条用例**：`interpolate_step` 五契约（零值/≥1px/≤ceil(25%)/不越界/正负对称，±50000 穷举）+ 🔴 缺陷 A 回归护栏（`(-400)==-100`、`(-100)==-25` 改回 delta 即红）+ 双向收敛预算（800→240 与 240→800 均 ≤40 帧，缺陷 A 为 559 帧，正确 23 帧）+ `should_ignore_streaming_text` 四格真值表穷举
+- **护栏预验证**：Python 数值复算五契约全范围 0 失败；消融推演（`delta.abs()`→`delta`）确认 `(-400)` 变 `-1`、收敛 560 帧 → 用例必然变红
+- **不可测项如实列出**（GDI 绘制/按钮消息循环/脏标记/门闩调用侧接线），无假护栏、无闭包自证
+- **验收**：cargo fmt -- --check clean / cargo check --all-targets 0 error（99 warnings 均既有，无一条指向新模块，97→99 的 +2 来自 OVERLAY-043 生产代码）/ git diff --stat 仅 src/main.rs +138 / 阶段三白名单只跑 fmt+check / 消融自证顺延阶段四（TEST-EXEC-043）
+- **边界**：未碰 coder-2 生产代码；未 commit（主控统一提交）；版本号 0.8.0 未动
+- **详情**：outbox/tester-1/result.md + logs/20260817.md + CHANGELOG.md
+
+---
+
 ## 2026-08-16 — tester-1 — TEST-SYNC-045 ✅ 阶段三测试同步：ASR-045 流式判空取消（src/main.rs +46，待主控验收）
 
 - **来源**：主控派单（基线 `05eb5f0`，代码基线 `54cde62` ASR-045 已提交）。前置：ASR-045 P0 修复（流式文字从未上屏）
