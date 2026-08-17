@@ -68,6 +68,28 @@ function getHotkeyDisplayName(vkCode: number, modifiers: number): string {
 
 const TRANSLATION_SINGLE_KEYS = [0xA3, 0xA2, 0xA5, 0xA4];
 
+function voiceKeySet(vkCode: number, modifiers: number): Set<number> {
+  const set = new Set<number>();
+  set.add(vkCode);
+  if (modifiers & 0x0001) { set.add(0xA4); set.add(0xA5); }
+  if (modifiers & 0x0002) { set.add(0xA2); set.add(0xA3); }
+  if (modifiers & 0x0004) { set.add(0xA0); set.add(0xA1); }
+  if (modifiers & 0x0008) { set.add(0x5B); set.add(0x5C); }
+  return set;
+}
+
+function translationKeySet(vkCode: number): Set<number> {
+  const set = new Set<number>();
+  if (vkCode !== 0) set.add(vkCode);
+  return set;
+}
+
+function keysOverlap(a: Set<number>, b: Set<number>): boolean {
+  if (a.size === 0 || b.size === 0) return false;
+  for (const v of a) if (b.has(v)) return true;
+  return false;
+}
+
 const MODIFIER_CODES = new Set([
   'ControlLeft', 'ControlRight',
   'AltLeft', 'AltRight',
@@ -99,6 +121,7 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
 
   const [isRecordingVoice, setIsRecordingVoice] = useState(false);
   const [pendingHotkey, setPendingHotkey] = useState<{vk: number, mod: number} | null>(null);
+  const [dupConflict, setDupConflict] = useState<{ voice: string, translation: string } | null>(null);
   const voiceInputRef = useRef<HTMLDivElement>(null);
   const pressedModsRef = useRef<Set<string>>(new Set());
   const hadNonModifierKeyRef = useRef(false);
@@ -142,6 +165,17 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
         modifiers: modifiers,
       });
       if (available) {
+        const vSet = voiceKeySet(vkCode, modifiers);
+        const tSet = translationKeySet(translation.vk_code);
+        if (keysOverlap(vSet, tSet)) {
+          setIsRecordingVoice(false);
+          setDupConflict({
+            voice: getHotkeyDisplayName(vkCode, modifiers),
+            translation: translation.display_name || VK_TO_LABEL[translation.vk_code] || '',
+          });
+          resetRecordingState();
+          return;
+        }
         finalizedRef.current = false;
         applyVoiceHotkey(vkCode, modifiers);
       } else {
@@ -258,6 +292,16 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
   };
 
   const applyTranslationHotkey = (vkCode: number) => {
+    const vSet = voiceKeySet(config.hotkey.vk_code, config.hotkey.modifiers);
+    const tSet = translationKeySet(vkCode);
+    if (keysOverlap(vSet, tSet)) {
+      setIsRecordingTranslation(false);
+      setDupConflict({
+        voice: getHotkeyDisplayName(config.hotkey.vk_code, config.hotkey.modifiers),
+        translation: VK_TO_LABEL[vkCode] || vkCode.toString(),
+      });
+      return;
+    }
     const displayName = VK_TO_LABEL[vkCode] || vkCode.toString();
     updateConfig({
       ...config,
@@ -426,6 +470,25 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
             <div className="modal-footer">
               <button className="btn btn-secondary" onClick={() => setPendingHotkey(null)}>{t.hotkey_cancel}</button>
               <button className="btn btn-primary" onClick={() => { applyVoiceHotkey(pendingHotkey.vk, pendingHotkey.mod); setPendingHotkey(null); }}>{t.hotkey_use_anyway}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {dupConflict && (
+        <div className="modal-overlay" onClick={() => setDupConflict(null)}>
+          <div className="modal-dialog" role="dialog" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <span className="modal-title">{t.hotkey_dup_title}</span>
+              <button className="modal-close" onClick={() => setDupConflict(null)}>×</button>
+            </div>
+            <div className="modal-body">
+              <p style={{ margin: 0, lineHeight: '1.6' }}>
+                {t.hotkey_dup_prefix}{dupConflict.voice}{t.hotkey_dup_infix}{dupConflict.translation}{t.hotkey_dup_suffix}
+              </p>
+            </div>
+            <div className="modal-footer">
+              <button className="btn btn-primary" onClick={() => setDupConflict(null)}>{t.hotkey_dup_ack}</button>
             </div>
           </div>
         </div>

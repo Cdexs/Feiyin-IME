@@ -2,6 +2,23 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-08-17 — coder-1 — HOTKEY-049 ✅ 翻译热键与录音热键重复检测 + 拦截（4 文件 +78，待主控验收）
+
+- **来源**：Gavin 拍板「要拦截，如果是组合键，其中一个键重复也要拦」。方案完全固化在 todo.md `## 🔴 已拍板待派发 · HOTKEY-049` 专节（含 7 条实例对照表）。HOTKEY-048 文案已写「不可和录音热键重复」但三层强制机制全为空，本单补 UI 层强制
+- **判据**：两个热键的按键集合交集非空即拦。语音键集合 = `{vk_code}` ∪ (modifiers 展开左右修饰键 vk：MOD_ALT→{0xA4,0xA5}/MOD_CONTROL→{0xA2,0xA3}/MOD_SHIFT→{0xA0,0xA1}/MOD_WIN→{0x5B,0x5C})；翻译键集合 = `{translation.vk_code}`（vk=0 时空集不拦）。修饰键必须展开左右两个，因为语音 modifiers 是 Win32 `MOD_*` 不分左右
+- **改动**（4 文件 +78）：
+  1. 三个纯函数 `voiceKeySet`/`translationKeySet`/`keysOverlap`
+  2. 新增 `dupConflict` state
+  3. 语音侧 `checkAndApplyVoiceHotkey` 在 `check_hotkey_available` 通过后、`applyVoiceHotkey` 前加 `keysOverlap` 检测，命中不落库弹新提示
+  4. 翻译侧 `applyTranslationHotkey` 入口加 `keysOverlap` 检测
+  5. 新弹窗只有「知道了」一个出口**无「仍然使用」放行按钮**（红线 1）
+  6. 三份 locale 各 +5 i18n key（`hotkey_dup_title`/`prefix`/`infix`/`suffix`/`ack`，沿用既有 `hotkey_conflict_prefix/suffix` 拼接风格）
+- **自证**：① 7 条实例对照表逐条走通（与 todo.md 完全一致）；② 新弹窗 JSX footer 仅 `t.hotkey_dup_ack` 一个按钮，无 `hotkey_use_anyway`；③ 双向校验调用点（语音侧 `checkAndApplyVoiceHotkey` + 翻译侧 `applyTranslationHotkey`）；④ `grep -c ":"` 三份 locale = 116:116:116（新增 5 个 dup key 一致）+ `grep -P '[\x{4e00}-\x{9fff}]' HotkeySettings.tsx` = 0 命中（tsx 无裸中文）
+- **范围外**：后端不做强制（手改 config.toml 不受保护，Gavin 说「设置时拦截」属 UI 层）/ 不动 `check_hotkey_available`（签名拿不到配置）/ 不动 `TRANSLATION_SINGLE_KEYS` / `zh-Hant.ts` 历史缺 key 问题未在本次处理
+- **验证**：`npx tsc --noEmit` 0 error / `npm run build` 通过 / `git diff -w --stat -- ui/` 恰 4 文件 / 未跑 `npm run test`（阶段三 tester-1 负责）
+- **红线合规**：未碰 `src/` `src-tauri/`（coder-2 独占 `src/main.rs`）/ 新弹窗无放行按钮（红线 1）/ 双向生效（红线 2）/ 新增 i18n 三语齐全（红线 3）/ 版本号 0.8.0 未动 / 未 commit
+- **详情**：logs/20260817.md + CHANGELOG.md（HOTKEY-049 条目）
+
 ## 2026-08-17 — coder-1 — HOTKEY-048 ✅ 翻译热键页说明文字改文案（三份 locale，纯文案，待主控验收）
 
 - **来源**：Gavin 追加要求。HOTKEY-047 已结案提交（`4d5c56b`），本单纯文案无冲突。BUILD-019 卡在此单等前端重跑构建

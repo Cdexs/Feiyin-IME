@@ -110,4 +110,9 @@ export const en = {
   hotkey_cancel: 'Cancel',
   hotkey_use_anyway: 'Use Anyway',
   hotkey_not_set: 'Not set',
+  hotkey_dup_title: 'Hotkey Conflict',
+  hotkey_dup_prefix: 'The translation hotkey must not share keys with the recording hotkey (recording "',
+  hotkey_dup_infix: '" already covers the key(s) used by translation "',
+  hotkey_dup_suffix: '"). Please set a different key.',
+  hotkey_dup_ack: 'OK',
 } as const;

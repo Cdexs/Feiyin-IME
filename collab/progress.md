@@ -457,7 +457,9 @@ PTT 录音中点击即进编辑态（不等松键）｜流式文本白色不加�
 | **OVERLAY-046** | 修复录音 overlay 窗口从未被定位/定尺寸（P0 阻塞日常使用，OVERLAY-043 真回归） | `src/main.rs` | coder-2 | ✅ 已验收已提交（BUILD-019 内） |
 | **HOTKEY-047** | 设置 UI 热键录制重做（P0）：焦点竞态 + 左修饰键可单设 + 任意组合键 + AltGr 合成 Ctrl 过滤 | `ui/src/pages/HotkeySettings.tsx` + 三份 `ui/src/i18n/*.ts` | coder-1 | ✅ 已验收已提交（BUILD-019 内，TEST-EXEC-046/047 全绿） |
 | **BUILD-019** | 阶段五出包：OVERLAY-046 + HOTKEY-047 + HOTKEY-048 进 exe + 首次真跑 E2E 门禁 | — | tester-1 | ✅ 已验收（产物 08-17 15:45-16:18，七项核验全 PASS；E2E 首跑 10 FAIL+4 error 全 harness/环境缺陷无真回归，见 troubleshooting [E2E-CONFIG-PATH-STALE-001]） |
-| **HOTKEY-047** | 设置 UI 热键录制重做（P0）：焦点竞态 + 左修饰键可单设 + 任意组合键 + AltGr 合成 Ctrl 过滤（R1：修右 Alt 误定案 Left Ctrl + 三语文案 + finalized 防重入；R2：修右 Alt 单键 modifiers 被合成 Ctrl 污染） | `ui/src/pages/HotkeySettings.tsx` + 三份 `ui/src/i18n/*.ts` | coder-1 | 🟡 **R2 完成待验收** |
+| **HOTKEY-047** | 设置 UI 热键录制重做（P0）：焦点竞态 + 左修饰键可单设 + 任意组合键 + AltGr 合成 Ctrl 过滤 | `ui/src/pages/HotkeySettings.tsx` + 三份 `ui/src/i18n/*.ts` | coder-1 | ✅ 已验收已提交（BUILD-019 内，TEST-EXEC-046/047 全绿） |
+| **BUILD-019** | 阶段五出包：OVERLAY-046 + HOTKEY-047 + HOTKEY-048 进 exe + 首次真跑 E2E 门禁 | — | tester-1 | ✅ 已验收（产物 08-17 15:45-16:18，七项核验全 PASS；E2E 首跑 10 FAIL+4 error 全 harness/环境缺陷无真回归，见 troubleshooting [E2E-CONFIG-PATH-STALE-001]） |
+| **HOTKEY-049** | 翻译热键与录音热键重复检测 + 拦截（按键集合交集判据，语音侧+翻译侧双向拦截，新弹窗无放行出口） | `ui/src/pages/HotkeySettings.tsx` + 三份 `ui/src/i18n/*.ts` | coder-1 | 🟡 **阶段一完成待验收** |
 
 **038-A 验收取证**（主控独立复现，未采信报告）：`cargo fmt --check` clean ｜ `cargo check --all-targets` 0 error（当时）
 ｜源码 `#[test]` 计数 **45** 与报告一致 ｜文件域零越界。四处硬红线全部落实：`"model"` 在 payload 内 ｜

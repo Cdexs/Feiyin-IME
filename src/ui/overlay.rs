@@ -69,6 +69,9 @@ pub fn push_level(buf: &AudioLevelBuf, rms: f32) {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OverlayStatus {
     Recording,
+    /// OVERLAY-051-E: 在线流式 ASR 已启动但尚未收到首个识别文本。
+    /// 显示占位提示，不画波形；本地模型不走此状态。
+    RecordingStreamingIdle,
     /// ASR-038-B/C: 录音中带流式预览文本（数据字段，渲染由 C-overlay 批实现）
     /// production 端写入 streaming_text，消费端读取并绘制
     RecordingWithText {

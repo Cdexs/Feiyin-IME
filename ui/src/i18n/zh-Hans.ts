@@ -110,4 +110,9 @@ export const zhHans = {
   hotkey_cancel: '取消',
   hotkey_use_anyway: '确定使用',
   hotkey_not_set: '未设置',
+  hotkey_dup_title: '热键重复',
+  hotkey_dup_prefix: '翻译热键与录音热键的按键不能重复（录音热键「',
+  hotkey_dup_infix: '」已包含翻译热键「',
+  hotkey_dup_suffix: '」涉及的按键）。请重新设置。',
+  hotkey_dup_ack: '知道了',
 } as const;

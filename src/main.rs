@@ -98,6 +98,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 #[derive(Debug, Clone)]
 enum PipelineEvent {
     RecordingStarted,
+    /// OVERLAY-051-E: 流式 ASR 已启动但尚未收到第一个文本，overlay 显示占位提示。
+    StreamingIdle,
     /// ASR-038-B: 流式 ASR 增量文本（display_text 全量，供 overlay 整段覆盖）
     StreamingText(String),
     Processing(String),
@@ -552,7 +554,11 @@ fn create_edit_control(hwnd: HWND, state: &mut OverlayWindowState, rect: &RECT, 
             state.edit_hwnd = Some(edit_hwnd);
             // Background brush for WM_CTLCOLOREDIT
             state.edit_bg_brush = Some(unsafe { CreateSolidBrush(OVERLAY_BG_DARK) });
-            // Subclass EDIT to suppress default border via WM_NCPAINT
+            // OVERLAY-051-D: store parent overlay HWND so the EDIT subclass can forward Enter.
+            unsafe {
+                let _ = SetWindowLongPtrW(edit_hwnd, GWLP_USERDATA, hwnd.0 as isize);
+            }
+            // Subclass EDIT to suppress default border via WM_NCPAINT and handle Enter.
             let old_proc = unsafe {
                 SetWindowLongPtrW(edit_hwnd, GWLP_WNDPROC, edit_subclass_wnd_proc as isize)
             };
@@ -578,6 +584,40 @@ unsafe extern "system" fn edit_subclass_wnd_proc(
 ) -> LRESULT {
     if msg == windows::Win32::UI::WindowsAndMessaging::WM_NCPAINT {
         return LRESULT(0);
+    }
+    if msg == windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN {
+        if wparam.0 == VK_RETURN.0 as usize {
+            // OVERLAY-051-D: Enter in the EDIT control submits the edited text, same as clicking
+            // the submit button. We retrieve the parent overlay window from the EDIT's GWLP_USERDATA
+            // (set on creation) and forward the event through its event channel.
+            let parent_hwnd = {
+                let parent = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+                HWND(parent as _)
+            };
+            if !parent_hwnd.0.is_null() {
+                let data_ptr =
+                    GetWindowLongPtrW(parent_hwnd, GWLP_USERDATA) as *mut OverlayWindowData;
+                if !data_ptr.is_null() {
+                    let data = &mut *data_ptr;
+                    if let Ok(state) = data.state.lock() {
+                        if let Some(ref request) = state.request {
+                            if matches!(request.status, OverlayStatus::StreamingEditing { .. }) {
+                                if let Some(edit_hwnd) = state.edit_hwnd {
+                                    if let Ok(text) = get_window_text(edit_hwnd) {
+                                        let _ =
+                                            state.event_tx.send(OverlayUiEvent::SubmitRequested(
+                                                text,
+                                                request.target_hwnd,
+                                            ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return LRESULT(0);
+        }
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
@@ -766,6 +806,14 @@ struct OverlayWindowState {
     target_size: [i32; 2],
     /// OVERLAY-043: last displayed streaming text to avoid repaint on unchanged content
     last_streaming_text: Option<String>,
+    /// OVERLAY-051-F/G: cached ClearType font so we don't create/destroy HFONT every frame.
+    cached_font: Option<HFONT>,
+    /// OVERLAY-051-G: number of characters currently visible during typewriter tween.
+    displayed_chars: usize,
+    /// OVERLAY-051-G: deadline for next character reveal during typewriter tween.
+    tween_deadline: Option<std::time::Instant>,
+    /// OVERLAY-051-G: total target character count for the current tween.
+    tween_target_chars: usize,
 }
 #[cfg(target_os = "windows")]
 struct OverlayWindowData {
@@ -865,6 +913,10 @@ fn run_overlay_thread(
         current_size: RECORDING_OVERLAY_SIZE,
         target_size: RECORDING_OVERLAY_SIZE,
         last_streaming_text: None,
+        cached_font: None,
+        displayed_chars: 0,
+        tween_deadline: None,
+        tween_target_chars: 0,
     }));
     let window_data = Box::new(OverlayWindowData {
         state: Arc::clone(&shared_state),
@@ -921,35 +973,43 @@ fn run_overlay_thread(
         while let Ok(command) = command_rx.try_recv() {
             match command {
                 OverlayCommand::Show(mut request) => {
-                    // OVERLAY-043: coalescing + smooth interpolation for streaming text resize.
-                    // 100ms throttle only defers the SetWindowPos decision; width correctness is
-                    // preserved by pending_size. Between throttle edges the window interpolates
-                    // from current_size toward target_size so no instant jump occurs.
-                    let is_streaming_text =
-                        matches!(request.status, OverlayStatus::RecordingWithText { .. });
+                    // OVERLAY-043 / 051-F: coalescing + smooth interpolation for streaming text resize.
+                    // Growing width bypasses throttle so text is never clipped by old window width.
+                    // Shrinking/same keeps the 100ms throttle to avoid oscillation.
+                    let is_streaming_text = matches!(
+                        request.status,
+                        OverlayStatus::RecordingWithText { .. }
+                            | OverlayStatus::StreamingEditing { .. }
+                    );
                     let (_computed_pos, computed_size) = if is_streaming_text {
                         let now = std::time::Instant::now();
                         let mut state_guard = shared_state.lock().ok();
                         if let Some(ref mut state) = state_guard {
-                            let do_it = state
-                                .last_resize_time
-                                .map(|t| t.elapsed().as_millis() >= 100)
-                                .unwrap_or(true);
+                            let (pos, desired_size) = adjust_overlay_pos_size_for_text(
+                                hwnd,
+                                &request.status,
+                                &request.pos,
+                                &state.target_size,
+                            );
+                            let is_growing = desired_size[0] > state.target_size[0];
+                            let do_it = if is_growing {
+                                // OVERLAY-051-F: growing width must follow text immediately
+                                true
+                            } else {
+                                // shrinking / same size: keep 100ms throttle to avoid oscillation
+                                state
+                                    .last_resize_time
+                                    .map(|t| t.elapsed().as_millis() >= 100)
+                                    .unwrap_or(true)
+                            };
                             if do_it {
                                 state.last_resize_time = Some(now);
-                                // compute latest desired size and store as target
-                                let (pos, size) = adjust_overlay_pos_size_for_text(
-                                    hwnd,
-                                    &request.status,
-                                    &request.pos,
-                                    &state.target_size,
-                                );
-                                state.target_size = size;
-                                state.pending_size = Some(size);
+                                state.target_size = desired_size;
+                                state.pending_size = Some(desired_size);
                                 // center horizontally based on the target width
                                 let work = monitor_work_rect(hwnd);
                                 let work_w = work.right - work.left;
-                                let x = work.left + (work_w - size[0]) / 2;
+                                let x = work.left + (work_w - desired_size[0]) / 2;
                                 let y = pos[1];
                                 request.pos = [x, y];
                             } else if let Some(size) = state.pending_size {
@@ -981,7 +1041,23 @@ fn run_overlay_thread(
                             state.title_close_btn_rect = None;
                             state.submit_btn_rect = None;
                             state.text_hit_rect = None;
-                            state.last_streaming_text = None;
+                            // OVERLAY-051-A: preserve last_streaming_text across status changes.
+                            // Only clear it on a fresh Recording session.
+                            if matches!(request.status, OverlayStatus::Recording) {
+                                state.last_streaming_text = None;
+                                // OVERLAY-051-G: reset typewriter cursor on a fresh recording.
+                                state.displayed_chars = 0;
+                                state.tween_target_chars = 0;
+                                state.tween_deadline = None;
+                            }
+                        }
+                        // OVERLAY-051-C: preserve target_hwnd across Show updates that carry 0.
+                        // The original foreground window is captured only on hotkey Start; subsequent
+                        // Show commands from streaming text updates do not have it.
+                        if let Some(ref mut req) = state.request {
+                            if request.target_hwnd == 0 && req.target_hwnd != 0 {
+                                request.target_hwnd = req.target_hwnd;
+                            }
                         }
                         state.request = Some(request.clone());
                         if request.status == OverlayStatus::Recording {
@@ -1020,14 +1096,22 @@ fn run_overlay_thread(
                 }
                 OverlayCommand::EnterEditMode => {
                     if let Ok(mut state) = shared_state.lock() {
+                        // OVERLAY-051-A: editing text fallback chain:
+                        // RecordingWithText -> StreamingEditing -> last_streaming_text -> empty.
                         let text = state
                             .request
                             .as_ref()
                             .and_then(|r| match &r.status {
                                 OverlayStatus::RecordingWithText { text } => Some(text.clone()),
+                                OverlayStatus::StreamingEditing { text } => Some(text.clone()),
                                 _ => None,
                             })
+                            .or_else(|| state.last_streaming_text.clone())
                             .unwrap_or_default();
+                        // OVERLAY-051-G: when entering edit mode, stop tweening and use full text.
+                        state.displayed_chars = text.chars().count();
+                        state.tween_target_chars = state.displayed_chars;
+                        state.tween_deadline = None;
                         state.request = state.request.as_mut().map(|r| {
                             r.status = OverlayStatus::StreamingEditing { text: text.clone() };
                             r.clone()
@@ -1101,6 +1185,14 @@ fn run_overlay_thread(
                         state.last_resize_time = None;
                         state.current_size = RECORDING_OVERLAY_SIZE;
                         state.target_size = RECORDING_OVERLAY_SIZE;
+                        state.displayed_chars = 0;
+                        state.tween_target_chars = 0;
+                        state.tween_deadline = None;
+                        if let Some(font) = state.cached_font.take() {
+                            unsafe {
+                                let _ = DeleteObject(font);
+                            }
+                        }
                     }
                     restore_noactivate(hwnd);
                     unsafe {
@@ -1133,8 +1225,70 @@ fn run_overlay_thread(
                             }
                         }
                     }
-                    OverlayStatus::RecordingWithText { .. }
-                    | OverlayStatus::StreamingEditing { .. } => {
+                    OverlayStatus::RecordingStreamingIdle => {
+                        // OVERLAY-051-E: static placeholder state; repaint only on explicit dirty flag.
+                        if state.needs_repaint && !MENU_VISIBLE.load(Ordering::Acquire) {
+                            unsafe {
+                                let _ = InvalidateRect(hwnd, None, false);
+                            }
+                        }
+                        state.needs_repaint = false;
+                    }
+                    OverlayStatus::RecordingWithText { ref text } => {
+                        // OVERLAY-051-G: drive typewriter tween per frame.
+                        let target = text.chars().count();
+                        if state.tween_target_chars != target {
+                            state.tween_target_chars = target;
+                            let new_chars = target.saturating_sub(state.displayed_chars);
+                            let budget_ms = (new_chars * 30).clamp(150, 800) as u64;
+                            state.tween_deadline = Some(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_millis(budget_ms),
+                            );
+                            state.needs_repaint = true;
+                        }
+                        if state.displayed_chars < state.tween_target_chars {
+                            let now = std::time::Instant::now();
+                            if state.tween_deadline.map_or(true, |d| now >= d) {
+                                let remaining = state.tween_target_chars - state.displayed_chars;
+                                let since_start = state
+                                    .tween_deadline
+                                    .map_or(Duration::ZERO, |d| d.saturating_duration_since(now));
+                                let budget = (state.tween_target_chars * 30).clamp(150, 800) as u64;
+                                let budget = std::time::Duration::from_millis(budget);
+                                let progress = if budget.is_zero() {
+                                    1.0
+                                } else {
+                                    1.0 - (since_start.as_millis() as f32
+                                        / budget.as_millis() as f32)
+                                };
+                                let advance =
+                                    (remaining as f32 * progress.max(0.05)).ceil() as usize;
+                                state.displayed_chars = (state.displayed_chars + advance.max(1))
+                                    .min(state.tween_target_chars);
+                                if state.displayed_chars < state.tween_target_chars {
+                                    let remaining2 =
+                                        state.tween_target_chars - state.displayed_chars;
+                                    let next_budget_ms = (remaining2 * 30).clamp(80, 400) as u64;
+                                    state.tween_deadline = Some(
+                                        now + std::time::Duration::from_millis(next_budget_ms),
+                                    );
+                                } else {
+                                    state.tween_deadline = None;
+                                }
+                                state.needs_repaint = true;
+                            }
+                        }
+                        // OVERLAY-043: only repaint when text/status/size actually changed
+                        let dirty = state.needs_repaint;
+                        if dirty && !MENU_VISIBLE.load(Ordering::Acquire) {
+                            unsafe {
+                                let _ = InvalidateRect(hwnd, None, false);
+                            }
+                        }
+                        state.needs_repaint = false;
+                    }
+                    OverlayStatus::StreamingEditing { .. } => {
                         // OVERLAY-043: only repaint when text/status/size actually changed
                         let dirty = state.needs_repaint;
                         if dirty && !MENU_VISIBLE.load(Ordering::Acquire) {
@@ -1208,14 +1362,21 @@ fn run_overlay_thread(
                 }
             }
 
-            // OVERLAY-043: smooth interpolation of window size toward target_size
+            // OVERLAY-043 / 051-F: smooth interpolation of window size toward target_size.
+            // Growing width follows text immediately (no interpolation) so the latest text is never
+            // clipped by an in-flight resize. Shrinking / height changes still use interpolation to
+            // avoid oscillation. interpolate_step itself is untouched (TEST-SYNC-043护栏).
             if state.current_size != state.target_size {
                 let dx = state.target_size[0] - state.current_size[0];
                 let dy = state.target_size[1] - state.current_size[1];
-                let step_x = interpolate_step(dx);
-                let step_y = interpolate_step(dy);
-                state.current_size[0] += step_x;
-                state.current_size[1] += step_y;
+                if dx > 0 {
+                    state.current_size[0] = state.target_size[0];
+                } else if dx < 0 {
+                    state.current_size[0] += interpolate_step(dx);
+                }
+                if dy != 0 {
+                    state.current_size[1] += interpolate_step(dy);
+                }
                 // snap when very close to avoid micro-jitter
                 if (state.target_size[0] - state.current_size[0]).abs() <= 1 {
                     state.current_size[0] = state.target_size[0];
@@ -1253,6 +1414,7 @@ fn run_overlay_thread(
                 matches!(
                     r.status,
                     OverlayStatus::Recording
+                        | OverlayStatus::RecordingStreamingIdle
                         | OverlayStatus::RecordingWithText { .. }
                         | OverlayStatus::StreamingEditing { .. }
                         | OverlayStatus::FallingToProcessing { .. }
@@ -1513,9 +1675,12 @@ fn draw_overlay_to_dc(
 ) {
     // Double-buffer: hdc is memory DC, rect is already computed
 
-    // Create ClearType font (Segoe UI, ~9pt)
-    let font = create_clear_type_font(-12);
+    // OVERLAY-051-F: reuse a cached ClearType font instead of creating/destroying one per frame.
+    let font = state
+        .cached_font
+        .unwrap_or_else(|| create_clear_type_font(-12));
     let old_font = unsafe { SelectObject(hdc, font) };
+    state.cached_font = Some(font);
 
     unsafe {
         let _ = SetBkMode(hdc, TRANSPARENT);
@@ -1535,13 +1700,31 @@ fn draw_overlay_to_dc(
                     hdc,
                     rect,
                     state,
+                    false,
+                    request.ui_language,
+                ));
+            }
+            OverlayStatus::RecordingStreamingIdle => {
+                apply_overlay_window_region(hwnd, rect, None, true);
+                cancel_btn_rect = Some(draw_recording_overlay(
+                    hdc,
+                    rect,
+                    state,
+                    true,
                     request.ui_language,
                 ));
             }
             OverlayStatus::RecordingWithText { text } => {
                 apply_overlay_window_region(hwnd, rect, None, true);
-                let (cr, sr, thr) =
-                    draw_recording_overlay_with_text(hdc, rect, state, request.ui_language, text);
+                // OVERLAY-051-G: render only the tween-visible prefix.
+                let visible_text: String = text.chars().take(state.displayed_chars).collect();
+                let (cr, sr, thr) = draw_recording_overlay_with_text(
+                    hdc,
+                    rect,
+                    state,
+                    request.ui_language,
+                    &visible_text,
+                );
                 cancel_btn_rect = Some(cr);
                 submit_btn_rect = Some(sr);
                 text_hit_rect = Some(thr);
@@ -1570,12 +1753,10 @@ fn draw_overlay_to_dc(
             }
             OverlayStatus::StreamingEditing { .. } => {
                 apply_overlay_window_region(hwnd, rect, None, true);
-                // OVERLAY-043: editing mode reuses the same chrome + single right button as
-                // RecordingWithText; the button acts as submit. EDIT control draws text itself.
-                let (cr, sr, _thr) =
-                    draw_recording_overlay_with_text(hdc, rect, state, request.ui_language, "");
-                cancel_btn_rect = Some(cr);
-                submit_btn_rect = Some(sr);
+                // OVERLAY-051-B: editing mode draws a clear submit button (orange ⏎) on the right.
+                // The EDIT control renders the text itself; we only paint chrome + submit button.
+                draw_overlay_chrome(hdc, rect);
+                submit_btn_rect = Some(draw_submit_button(hdc, rect));
             }
             OverlayStatus::FocusLost { text, .. } => {
                 apply_overlay_window_region(hwnd, rect, Some(10), false);
@@ -1596,7 +1777,7 @@ fn draw_overlay_to_dc(
 
     unsafe {
         let _ = SelectObject(hdc, old_font);
-        let _ = DeleteObject(font);
+        // OVERLAY-051-F: do NOT delete the cached font here; it lives in OverlayWindowState.
     }
 
     (
@@ -1912,10 +2093,18 @@ fn draw_recording_overlay(
     hdc: windows::Win32::Graphics::Gdi::HDC,
     rect: &RECT,
     state: &OverlayWindowState,
-    _ui_language: config::UiLanguage,
+    show_placeholder: bool,
+    ui_language: config::UiLanguage,
 ) -> RECT {
     draw_overlay_chrome(hdc, rect);
-    draw_recording_indicator_and_waveform(hdc, rect, state);
+    // OVERLAY-051-E: online streaming ASR waiting for first text shows placeholder,
+    // not waveform. Local model continues to show waveform unchanged.
+    if show_placeholder {
+        draw_recording_indicator(hdc, rect, state);
+        draw_listening_placeholder(hdc, rect, ui_language);
+    } else {
+        draw_recording_indicator_and_waveform(hdc, rect, state);
+    }
     draw_stop_button(hdc, rect)
 }
 
@@ -2001,6 +2190,55 @@ fn draw_recording_overlay_with_text(
 
     // OVERLAY-043: the single right button serves as stop in RecordingWithText and submit in StreamingEditing
     (cancel_rect, cancel_rect, text_hit_rect)
+}
+
+#[cfg(target_os = "windows")]
+fn draw_submit_button(hdc: windows::Win32::Graphics::Gdi::HDC, rect: &RECT) -> RECT {
+    const BG_DARK: COLORREF = COLORREF(0x110F0D);
+    const CORNER_RADIUS: i32 = 10;
+    // OVERLAY-051-B: orange rounded button with a white ⏎ return arrow.
+    let bs = 16;
+    let bl = rect.right - 25;
+    let bt = rect.top + (rect.bottom - rect.top - bs) / 2;
+    let submit_rect = RECT {
+        left: bl,
+        top: bt,
+        right: bl + bs,
+        bottom: bt + bs,
+    };
+    let submit_pen = unsafe { CreatePen(PS_SOLID, 1, OVERLAY_BRAND_ORANGE) };
+    let submit_pen_old = unsafe { SelectObject(hdc, submit_pen) };
+    let submit_brush = unsafe { CreateSolidBrush(OVERLAY_BRAND_ORANGE) };
+    let submit_brush_old = unsafe { SelectObject(hdc, submit_brush) };
+    unsafe {
+        let _ = RoundRect(
+            hdc,
+            submit_rect.left,
+            submit_rect.top,
+            submit_rect.right,
+            submit_rect.bottom,
+            CORNER_RADIUS,
+            CORNER_RADIUS,
+        );
+    }
+    let arrow = "\u{23CE}";
+    let mut arrow_rect = submit_rect;
+    unsafe {
+        let _ = SetTextColor(hdc, BG_DARK);
+    }
+    draw_text(
+        hdc,
+        arrow,
+        &mut arrow_rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+    unsafe {
+        let _ = SelectObject(hdc, submit_pen_old);
+        let _ = SelectObject(hdc, submit_brush_old);
+        let _ = DeleteObject(submit_pen);
+        let _ = DeleteObject(submit_brush);
+    }
+    submit_rect
 }
 
 #[cfg(target_os = "windows")]
@@ -2091,6 +2329,30 @@ fn draw_recording_indicator(
         let _ = SelectObject(hdc, sep_op);
         let _ = DeleteObject(sep_pen);
     }
+}
+
+#[cfg(target_os = "windows")]
+fn draw_listening_placeholder(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: &RECT,
+    ui_language: config::UiLanguage,
+) {
+    // OVERLAY-051-E: centered placeholder text shown while online ASR is waiting for the first
+    // streaming result. Uses the same text color as streaming text for visual continuity.
+    let hint = i18n::get(ui_language).overlay_listening_hint;
+    unsafe {
+        let _ = SetTextColor(hdc, OVERLAY_TEXT_WHITE);
+    }
+    let mut text_rect = *rect;
+    // Leave margins so the text does not overlap the mic icon area or the stop button.
+    text_rect.left += STREAMING_TEXT_LEFT_MARGIN;
+    text_rect.right -= STREAMING_TEXT_RIGHT_MARGIN;
+    draw_text(
+        hdc,
+        hint,
+        &mut text_rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
 }
 
 #[cfg(target_os = "windows")]
@@ -2676,6 +2938,7 @@ fn overlay_geometry(status: &OverlayStatus, hwnd: HWND) -> ([i32; 2], [i32; 2]) 
 
     let size = match status {
         OverlayStatus::Recording
+        | OverlayStatus::RecordingStreamingIdle
         | OverlayStatus::RecordingWithText { .. }
         | OverlayStatus::FallingToProcessing { .. }
         | OverlayStatus::StreamingEditing { .. } => {
@@ -2709,6 +2972,7 @@ fn adjust_overlay_pos_size_for_text(
         OverlayStatus::StreamingEditing { text } => text.as_str(),
         _ => return (*current_pos, *current_size),
     };
+    let text = text;
 
     let work = monitor_work_rect(hwnd);
     let work_w = work.right - work.left;
@@ -2792,6 +3056,27 @@ fn show_overlay(
         target_hwnd: 0,
     }));
 }
+
+#[cfg(target_os = "windows")]
+fn show_overlay_streaming_idle(
+    overlay_handle: &OverlayThreadHandle,
+    overlay_opacity: f32,
+    ui_language: config::UiLanguage,
+    target_hwnd: platform::WindowId,
+) {
+    // OVERLAY-051-E: the first Show for an online streaming ASR session uses a dedicated
+    // placeholder status. The target_hwnd is preserved so later submit can return focus.
+    overlay_handle.send(OverlayCommand::Show(OverlayRequest {
+        status: OverlayStatus::RecordingStreamingIdle,
+        pos: [0, 0],
+        size: RECORDING_OVERLAY_SIZE,
+        opacity: overlay_opacity.clamp(0.1, 1.0),
+        ui_language,
+        auto_close_ms: 0,
+        target_hwnd,
+    }));
+}
+
 fn maybe_refresh_settings_child(
     settings_child: &mut Option<Child>,
     runtime_config: &Arc<RwLock<AppConfig>>,
@@ -2934,15 +3219,31 @@ fn process_controller_events(
                     // HOTKEY-LATENCY-FIX-001: 立即显示录音 overlay，不等 RecordingStarted 事件
                     let config = clone_runtime_config(runtime_config);
                     let target_hwnd = hwnd.0 as usize;
-                    overlay_handle.send(OverlayCommand::Show(OverlayRequest {
-                        status: OverlayStatus::Recording,
-                        pos: [0, 0],
-                        size: RECORDING_OVERLAY_SIZE,
-                        opacity: config.audio.overlay_opacity.clamp(0.1, 1.0),
-                        ui_language: config.ui_language,
-                        auto_close_ms: 0,
-                        target_hwnd,
-                    }));
+                    // OVERLAY-051-E: decide whether this is online streaming ASR. We cannot read
+                    // the worker's is_streaming_asr flag yet, so infer from configured model.
+                    let is_streaming_asr = {
+                        let cfg = clone_runtime_config(runtime_config);
+                        transcription::AsrModel::from_config(&cfg.audio.asr_model)
+                            == transcription::AsrModel::QwenAudioOnline
+                    };
+                    if is_streaming_asr {
+                        show_overlay_streaming_idle(
+                            overlay_handle,
+                            config.audio.overlay_opacity.clamp(0.1, 1.0),
+                            config.ui_language,
+                            target_hwnd,
+                        );
+                    } else {
+                        overlay_handle.send(OverlayCommand::Show(OverlayRequest {
+                            status: OverlayStatus::Recording,
+                            pos: [0, 0],
+                            size: RECORDING_OVERLAY_SIZE,
+                            opacity: config.audio.overlay_opacity.clamp(0.1, 1.0),
+                            ui_language: config.ui_language,
+                            auto_close_ms: 0,
+                            target_hwnd,
+                        }));
+                    }
                     log::info!(
                         "[Latency] overlay shown at +{:.1}ms",
                         t_hotkey.elapsed().as_secs_f64() * 1000.0
@@ -3013,6 +3314,12 @@ fn process_controller_events(
                     ui_language,
                     OverlayStatus::Recording,
                 );
+            }
+            PipelineEvent::StreamingIdle => {
+                // OVERLAY-051-E: worker confirmed online streaming ASR is waiting for first text;
+                // show the placeholder overlay (keeps tray in Recording).
+                set_tray_state(tray, TrayState::Recording, ui_language);
+                show_overlay_streaming_idle(overlay_handle, opacity, ui_language, 0);
             }
             PipelineEvent::StreamingText(text) => {
                 // ASR-038-B: 流式 ASR 增量文本推送到 overlay
@@ -3530,6 +3837,9 @@ fn spawn_worker_thread(
                         });
 
                     if is_streaming_asr {
+                        // OVERLAY-051-E: notify controller that online streaming ASR is waiting for first text
+                        send_event(&event_tx, PipelineEvent::StreamingIdle);
+
                         let transcriber_ref = transcriber.as_ref().expect("checked above");
                         let asr_online_url = transcriber_ref.asr_online_url().to_string();
                         let asr_online_model = transcriber_ref.asr_online_model().to_string();

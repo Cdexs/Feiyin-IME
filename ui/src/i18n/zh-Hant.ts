@@ -110,4 +110,9 @@ export const zhHant = {
   hotkey_cancel: '取消',
   hotkey_use_anyway: '確定使用',
   hotkey_not_set: '未設定',
+  hotkey_dup_title: '熱鍵重複',
+  hotkey_dup_prefix: '翻譯熱鍵與錄音熱鍵的按鍵不能重複（錄音熱鍵「',
+  hotkey_dup_infix: '」已包含翻譯熱鍵「',
+  hotkey_dup_suffix: '」涉及的按鍵）。請重新設定。',
+  hotkey_dup_ack: '知道了',
 } as const;
