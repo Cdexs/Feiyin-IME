@@ -3390,3 +3390,63 @@ HOTKEY-047 交付时 coder-1 通知「三自证已写入 result.md」，主控 `
 3. 主控验收**一律以 `handoffs.md` + `CHANGELOG.md` 为留档主体**，result.md 缺失不阻塞交付上线
    （两者内容本就重叠，为过程文件卡住 P0 是本末倒置）
 
+
+---
+
+## [HAPPYDOM-ALTGR-INDISTINGUISHABLE-001] ⚠️ happy-dom 把 `getModifierState('AltGraph')` 直接映射到 `altKey`，导致「真按 Ctrl+Alt」与「AltGr」在单测里不可区分【写热键/修饰键测试前必读】
+
+**日期**：2026-08-17 ｜ **发现者**：tester-1（TEST-SYNC-047 排雷）｜ **主控独立复核成立**
+
+### 事实（库源码实证，非推测）
+
+`ui/vite.config.ts:19` → `environment: "happy-dom"`。
+`node_modules/happy-dom/lib/event/events/KeyboardEvent.js:53` 的 `getModifierState`：
+
+```js
+switch (String(key).toLowerCase()) {
+  case 'alt':
+  case 'altgraph':      // ← 两者同一分支
+    return this.altKey;
+  case 'control': return this.ctrlKey;
+  case 'meta':    return this.metaKey;
+  case 'shift':   return this.shiftKey;
+  default:        return false;
+}
+```
+
+**`'altgraph'` 与 `'alt'` 共用 `this.altKey`。**
+
+### 两面后果（必须同时知道）
+
+**好的一面**（tester-1 据此排雷成功）：写 AltGr 用例**不需要 override `getModifierState`**，
+`fireEvent.keyDown(el, { altKey: true, ctrlKey: true })` 就能让 `getModifierState('AltGraph')` 为 true。
+省掉了一整类 mock 麻烦。
+
+🔴 **坏的一面（本条目的重点）**：**「用户真按 左Ctrl+左Alt+M」在 happy-dom 下无法与 AltGr 区分。**
+
+`HotkeySettings.tsx` 的判据是 `if (e.ctrlKey && !isAltGr) modifiers |= 0x0002`：
+
+| 环境 | 真按 Ctrl+Alt+M 时 `getModifierState('AltGraph')` | 得到的 modifiers |
+| --- | --- | --- |
+| 真实 Chromium / WebView2 | **false**（只有真 AltGr 才 true） | `0x0003` = `Ctrl+Alt+M` ✅ 正确 |
+| happy-dom 单测 | **true**（因为 altKey 为 true） | `0x0001` = `Alt+M` ❌ 与真实行为不符 |
+
+→ **「真按 Ctrl+Alt+M 应得 Ctrl+Alt+M」这条用例在 happy-dom 下写不了**，写了必然假红。
+而这恰恰是 HOTKEY-047 红线第 4 条（「不得用启发式代替 `getModifierState('AltGraph')`，
+否则真想设 Ctrl+Alt+M 的用户永远设不上」）所保护的行为 ——
+**红线保护的正确性，单测环境无法证明。**
+
+### 防御规则
+
+1. 写含 `AltGraph` 判据的用例时，**只断言 AltGr 路径**（Alt 为真那一侧），
+   **不要**断言「真按 Ctrl+Alt」路径 —— 后者属 happy-dom 不可测项，须如实列入不可测清单
+2. 该行为的验证只能靠**真实浏览器 E2E 或人工端测**。本项目对应 Gavin 端测，
+   派发时应在端测清单里显式列一条「真按左 Ctrl+左 Alt+字母，确认得到 Ctrl+Alt+字母」
+3. 反向注意：**不要**因为 happy-dom 下 AltGr 好模拟就误以为覆盖充分。
+   `S2` 通过 ≠ AltGr 语义被验证，只说明「altKey 为真时 Ctrl 被丢弃」
+
+### 与既有条目的关系
+
+同族于 `[VERIFY-001]`（Playwright/Vitest 无法验证原生行为）—— 都是
+**「测试环境的能力边界被误当成被测系统的行为边界」**。区别是那条讲原生窗口，本条讲键盘修饰键语义。
+
