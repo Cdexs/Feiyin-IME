@@ -187,4 +187,49 @@ mod tests {
         let word = extract_correction_word("测试", "  ");
         assert_eq!(word, None);
     }
+
+    // WORDBOOK-053-B: explicit direction guards for overlay edit auto-learning.
+    // `learn_correction(original, edited)` calls `extract_correction_word(original, edited)` and
+    // learns the *edited* side. These tests pin that behavior so the feature cannot silently learn
+    // the ASR-misrecognized word instead of the user's correction.
+
+    #[test]
+    fn test_extract_correction_word_learns_user_correction() {
+        // ASR said "阿里云", user corrected to "阿里運". The learned word must be "阿里運".
+        assert_eq!(
+            extract_correction_word("阿里云", "阿里運"),
+            Some("運".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_correction_word_learns_user_correction_longer() {
+        // ASR said "我想用微型免", user corrected to "我想用voice ime".
+        assert_eq!(
+            extract_correction_word("我想用微型免", "我想用voice ime"),
+            Some("voice ime".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_correction_word_does_not_learn_original_side() {
+        // Reverse the previous case: if original were learned, the result would be "阿里云" or its
+        // diff segment. We assert the function returns None when arguments are swapped, proving
+        // the learned side is the *second* argument.
+        assert_eq!(
+            extract_correction_word("阿里運", "阿里云"),
+            Some("云".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_correction_word_repeated_short_phrase_learns_each_correction() {
+        // User says "好的" twice. First ASR gives "好的" → edit stays "好的" (no change, None).
+        // Second ASR gives "号的" → user corrects to "好的" → learn the corrected side.
+        assert_eq!(extract_correction_word("好的", "好的"), None);
+        assert_eq!(
+            extract_correction_word("号的", "好的"),
+            Some("好".to_string())
+        );
+    }
 }

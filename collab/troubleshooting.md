@@ -3506,3 +3506,32 @@ BUILD-019 首次按书真跑 `pytest tests/test_cases/`，`test_hotkey.py` **6/6
 
 同族于 `[HAPPYDOM-ALTGR-INDISTINGUISHABLE-001]` / `[VERIFY-001]` —— **「测试环境的实现细节（路径/尺寸/包依赖）
 被误当成被测系统的行为边界」**。此类 harness 缺陷的共性：从未被真实运行过，一旦首次运行即批量曝光。
+
+### 🔴 [COLLAB-ACK-001] 补充（2026-08-17）：根因定位为**两条 ACK 通道错位**，非 Worker 失联
+
+**现象**：单次 session 内 `⚠️ [ACK_FAIL] <worker> 经 3 次发送均无应答` 出现 **5 次**，
+每一次 `capture-pane` 核实都显示 Worker **正在正常工作**（有 `esc interrupt`、上下文在增长、
+git diff 有产出）。措辞「均无应答」严重误导，且会诱使主控重发（重发反而伤 Worker）。
+
+**根因（主控读 `collab/dispatch.sh` 取证）**：
+
+| 通道 | 谁在用 |
+| --- | --- |
+| `acks/<id>/task_ack.md` 非空（`dispatch.sh:139` 先清空、`:152`/`:167` 轮询 `-s`） | **脚本在等这个** |
+| tmux 消息 `✅ ACK [<id>] 已收到` | **Worker 实际都走这条**，主控每次都收到了 |
+
+派发消息里那句 `【收到后立即执行：echo ACK > $COLLAB/acks/<id>/task_ack.md】`
+埋在一长段提示词的**最末尾**，Worker（LLM Agent）读完任务就开工，
+普遍把「已用 tmux 回 ACK」当作已应答，**不会再去写文件**。
+`acks/` 三个子目录**均存在**，不是路径问题；脚本逻辑也没错 —— 是**协议设计上的双通道不一致**。
+
+**处置（2026-08-17）**：
+- 只改告警措辞为 `[ACK_FILE_MISS] … Worker 可能正常工作中 … 请 capture-pane 核实后再判定，勿直接重发`，
+  **判定逻辑一行未改** —— 因为 `dispatch.sh` 是工作区级共享工具，多项目在用，
+  不在单项目批次里改其行为
+- 主控纪律：**见到该告警一律先 `capture-pane` 核实**，
+  屏幕显示在工作即忽略，**不重发、不重启**（`[REPLACE-WORKER-INJECT-LOST-001]` 已证重启代价高）
+
+**待办（未做，需 Gavin 拍板，因涉共享工具行为变更）**：
+让 `dispatch.sh` 用「pane 是否忙」作为佐证，或干脆取消文件 ack 只保留 tmux ack ——
+现状是两条通道各记一半，等于没有可信的机器判据。

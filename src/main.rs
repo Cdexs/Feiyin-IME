@@ -3160,6 +3160,7 @@ fn process_controller_events(
     stop_recording_signal: &Arc<AtomicBool>,
     cancel_signal: &Arc<AtomicBool>,
     is_recording: &Arc<AtomicBool>,
+    last_streaming_text: &Arc<Mutex<Option<String>>>,
 ) -> Result<bool> {
     maybe_refresh_settings_child(settings_child, runtime_config);
     while let Ok(command) = app_cmd_rx.try_recv() {
@@ -3360,6 +3361,10 @@ fn process_controller_events(
                 show_overlay_streaming_idle(overlay_handle, opacity, ui_language, 0);
             }
             PipelineEvent::StreamingText(text) => {
+                // WORDBOOK-053-B: mirror the latest streaming text for the edit-learn path.
+                if let Ok(mut mirror) = last_streaming_text.lock() {
+                    *mirror = Some(text.clone());
+                }
                 // ASR-038-B: 流式 ASR 增量文本推送到 overlay
                 // OVERLAY-043-B: late streaming packets after stop are ignored unless editing.
                 let stopped = STREAMING_STOPPED.load(Ordering::Acquire);
@@ -3495,6 +3500,23 @@ fn process_controller_events(
             OverlayUiEvent::SubmitRequested(text, target_hwnd) => {
                 OVERLAY_EDITING.store(false, Ordering::Release);
                 STREAMING_STOPPED.store(true, Ordering::Release);
+                // WORDBOOK-053-B: learn the explicit user correction (original ASR text vs submitted
+                // edited text) in a detached thread. This is an online-streaming-ASR-only signal:
+                // only the streaming path produces StreamingText events, which populate
+                // last_streaming_text. Local-model pipeline never reaches here.
+                let original_text = last_streaming_text.lock().ok().and_then(|m| m.clone());
+                if let Some(original) = original_text {
+                    let runtime_config = Arc::clone(runtime_config);
+                    let edited = text.clone();
+                    thread::spawn(move || {
+                        let auto_learn_threshold = read_auto_learn_threshold(&runtime_config);
+                        if let Err(e) = wordbook::Wordbook::open().and_then(|wb| {
+                            wb.learn_correction(&original, &edited, auto_learn_threshold)
+                        }) {
+                            log::debug!("Overlay auto-learning skipped: {}", e);
+                        }
+                    });
+                }
                 // ASR-038-C: 编辑提交。先尝试把焦点还给目标窗口，再注入文本。
                 // 无法取回焦点则降级为复制到剪贴板 + FocusLost 预览。
                 if target_hwnd != 0 {
@@ -4178,6 +4200,10 @@ fn run_controller(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
     let mut tray: Option<TrayIcon> = None;
     let mut settings_child: Option<Child> = None;
     let mut msg = MSG::default();
+    // WORDBOOK-053-B: controller-side mirror of the last streaming ASR text. It is updated on
+    // the controller thread by every PipelineEvent::StreamingText, so it always matches the text
+    // the user saw before entering overlay edit mode.
+    let last_streaming_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     loop {
         let ret = unsafe { GetMessageW(&mut msg, HWND::default(), 0, 0) };
         if ret.0 <= 0 {
@@ -4209,6 +4235,7 @@ fn run_controller(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
                     &stop_recording_signal,
                     &cancel_signal,
                     &is_recording,
+                    &last_streaming_text,
                 )?;
                 if should_exit {
                     log::info!("Controller events returned true, initiating shutdown");
@@ -4234,6 +4261,7 @@ fn run_controller(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
                     &stop_recording_signal,
                     &cancel_signal,
                     &is_recording,
+                    &last_streaming_text,
                 )?;
                 if should_exit {
                     log::info!("Controller hotkey wake returned true, initiating shutdown");
@@ -4260,6 +4288,7 @@ fn run_controller(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
                     &stop_recording_signal,
                     &cancel_signal,
                     &is_recording,
+                    &last_streaming_text,
                 )?;
                 if should_exit {
                     log::info!("Controller pipeline wake returned true, initiating shutdown");
@@ -5472,6 +5501,9 @@ mod pipeline_logic_tests {
         ));
     }
 }
+/// WORDBOOK-053-A: synchronous part of auto-learning. Must stay on the caller thread because
+/// `capture_focused_text_snapshot()` captures the *current* foreground window; moving it to a
+/// background thread would read the wrong window after the 300ms observation delay.
 fn maybe_learn_user_edit(
     expected_text: &str,
     snapshot: Option<platform::FocusedTextSnapshot>,
@@ -5481,25 +5513,37 @@ fn maybe_learn_user_edit(
     let Some(snapshot) = snapshot else {
         return;
     };
-    thread::sleep(Duration::from_millis(AUTO_LEARN_OBSERVE_MS));
-    let Some(after_text) = platform::read_text_from_hwnd(snapshot.hwnd) else {
-        // MAC-004
-        return;
-    };
-    let Some(observed_text) = extract_changed_text(&snapshot.text, &after_text) else {
-        return;
-    };
-    let expected_text = expected_text.trim();
-    let observed_text = observed_text.trim();
-    if expected_text.is_empty() || observed_text.is_empty() || expected_text == observed_text {
+    let expected_text = expected_text.trim().to_string();
+    if expected_text.is_empty() {
         return;
     }
-    let auto_learn_threshold = read_auto_learn_threshold(runtime_config);
-    if let Err(e) = wordbook::Wordbook::open()
-        .and_then(|wb| wb.learn_correction(expected_text, observed_text, auto_learn_threshold))
-    {
-        log::debug!("Auto-learning skipped: {}", e);
-    }
+    let runtime_config = Arc::clone(runtime_config);
+    // Detach the heavy observation + diff + SQLite write so the caller thread (controller main
+    // message loop or worker thread) returns immediately. The HWND snapshot text is captured here
+    // and moved in; only the original foreground window's text is observed.
+    let hwnd_usize = snapshot.hwnd.0 as usize;
+    let before_text = snapshot.text;
+    thread::spawn(move || {
+        let hwnd = HWND(hwnd_usize as *mut std::ffi::c_void);
+        thread::sleep(Duration::from_millis(AUTO_LEARN_OBSERVE_MS));
+        let Some(after_text) = platform::read_text_from_hwnd(hwnd) else {
+            // MAC-004
+            return;
+        };
+        let Some(observed_text) = extract_changed_text(&before_text, &after_text) else {
+            return;
+        };
+        let observed_text = observed_text.trim();
+        if observed_text.is_empty() || expected_text == observed_text {
+            return;
+        }
+        let auto_learn_threshold = read_auto_learn_threshold(&runtime_config);
+        if let Err(e) = wordbook::Wordbook::open()
+            .and_then(|wb| wb.learn_correction(&expected_text, observed_text, auto_learn_threshold))
+        {
+            log::debug!("Auto-learning skipped: {}", e);
+        }
+    });
 }
 fn learn_llm_suggestions(
     suggestions: &[llm::SuggestionEntry],
