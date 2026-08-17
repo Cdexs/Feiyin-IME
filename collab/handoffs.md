@@ -314,6 +314,18 @@
 
 ---
 
+## 2026-08-17 — tester-1 — BUILD-020 ✅ v0.8.0 第五包出包（本批 6 提交进 exe，阶段五）
+
+- **来源**：主控直接派发（DEC-053 + Gavin 授权「测试完直接出包然后 push」；push 由主控执行，我不碰）
+- **四步构建**：Step1 清进程（预查**无 Gavin 自启实例**，0 残留）→ Step2 npm build（`index-B5q249eW.js`）+ Tauri UI 1m39s + cp 时间戳一致 → Step3 主程序 2m08s（Rust 侧实质改动必跑）→ Step4 同步 Publish/ 三 exe + 两 toml（config.toml 未覆盖）
+- **七项核验全 PASS**：① 时间戳本次 ② 三 exe 两副本 sha 逐一相等 ③ 两 toml 三副本 hash 全等 ④ ProductVersion 0.8.0 三处未变 ⑤ 探针：三条 sha 全异于 BUILD-019 + 新 JS 名内嵌 + i18n `hotkey_dup` 5 key 命中（exe grep 0 为 Tauri 压缩，按 BUILD-016 既定结论改用 JS 名字符探针）+ 后端 resampler=1 ⑥ 大小：feiyin +23KB（Rust 增量）/ ui 同大小但 sha 变（BUILD-019 教训：大小不作唯一判据）⑦ 冒烟 PID 28448 零 panic 清理
+- **Step5 E2E**：9 FAIL / 54 PASS / 32 SKIP 记 **BLOCKED**，失败项与 TEST-EXEC-049/051/053 **逐一相同无新增类型**（[E2E-CONFIG-PATH-STALE-001] harness 缺陷）
+- **Gavin 端测清单 14 项**已原样列于 result.md（含 right-Alt+M 得 Alt+M、Ctrl+Alt+M 不被吞、热键重复拦截弹窗、编辑态横向滚动、debug 分离测流畅度等）
+- **红线合规**：版本号 0.8.0 三处未动 / 未 push / 未 commit / Publish 运行时数据未覆盖 / feiyin-ime-nor.exe 保留 / 无 Gavin 自启实例
+- **详情**：outbox/tester-1/result.md + logs/20260817.md + CHANGELOG.md + progress.md 产物表新增行
+
+---
+
 ## 2026-08-17 — tester-1 — TEST-EXEC-049/051/053 ✅ 阶段四全量回归 + 消融实测（HOTKEY-049 + WORDBOOK-053 批，无阻塞项）
 
 - **来源**：主控派单（基线 HEAD `5a5a7e7`，本批三提交 + TEST-SYNC 已验收，仅我一人执行）
