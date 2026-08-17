@@ -54,7 +54,36 @@
 | TEST-SYNC-045 | 阶段三测试同步（ASR-045 缺口 3 条，`src/main.rs` +46 仅测试模块） | `src/main.rs` `mod streaming_empty_samples_tests` | tester-1 | ✅ **已验收**（主控逐行 Read diff + 独立复算 `cargo fmt --check` clean / `cargo check --all-targets` 0 error）。真值表第 4 格（如实标弱护栏）+ 空串/纯空白两层分层契约 ×2（核心）+ 调用侧不可测诚实判定 |
 | TEST-EXEC-042/045 | 阶段四全量回归 + 消融 A/B 自证 | — | tester-1 | ✅ **已验收已提交 `2a173f0`**。1030/0/11（941→957 恰 +16，零残差）+ Vitest 54 + src-tauri 55；pytest 按书 SKIP（Publish/ 为 BUILD-016 旧包）；③ 类真回归 = 0 |
 | BUILD-017 | 阶段五出包（ASR-042/045 进 exe） | — | tester-1 | ✅ **已验收**（主控独立复算全部七项）。产物 08-16 23:25，`feiyin-ime.exe` 12,112,384B（+5,632）/ ui 10,026,496B 不变 / crash 24,859,648B 不变；两副本 sha256 全等；toml 三副本全等；ProductVersion 0.8.0.0/0.8.0/0.8.0.0。⏭ **待 Gavin 端测** |
-| **OVERLAY-043** | 录音窗口**五项**显示错乱 + 流畅度 | `src/main.rs` | coder-2 | 🟡 **阶段一完成**，待主控验收后进入阶段三 TEST-SYNC |
+| **OVERLAY-043** | 录音窗口**五项**显示错乱 + 流畅度 | `src/main.rs` | coder-2 | ✅ **已验收已提交 `a588509`**（打回一轮，见下方打回记录）。⏭ 流畅度**待 Gavin 端测目视拍板** |
+| **OVERLAY-043-B** | 抽 `interpolate_step` / `should_ignore_streaming_text` 补护栏 | `src/main.rs` | coder-2 | ✅ **已验收已提交 `5940e73`**（纯重构零行为变更，无 `#[test]`） |
+| **TEST-SYNC-043** | 阶段三测试同步（两纯函数护栏 + 不可测项如实说明） | `src/main.rs` `mod tests` | tester-1 | 🚧 **2026-08-17 已派发** |
+
+### 🔴 OVERLAY-043 验收打回记录（主控独立复算查出，非采信报告）
+
+| 缺陷 | 位置 | 问题 | 数值证据 |
+| --- | --- | --- | --- |
+| **A** | `main.rs:1195` 插值步长 | `(dx as f32 * 0.25).max(1.0)` 在 `dx` 为负时**负数被 `max(1.0)` 吃掉比例**，恒为 `-1px` | 800px→240px 需 **559 帧 ≈ 8.9 秒**爬行；修正后放大/缩小对称均 **22 帧 ≈ 0.35 秒** |
+| **B** | `main.rs:1114` 脏标记 | 纯 `Recording` 态被纳入脏标记，但**全文件无一处在音频电平变化时置位** → 波形动画冻结 | 违反红线「`Recording` 观感零变化」；对照 `:1159` `FallingToProcessing` 有 `!all_settled` 兜底，`Recording` 分支缺同类兜底 |
+
+**教训**：缺陷 A 只能靠手工数值复算发现 —— 算式内联在消息循环内，测试够不着。
+故**当场派 OVERLAY-043-B 抽纯函数补护栏**，不排期延后
+（与 `TEST-045-REFACTOR` 同类，但那是没塌过的预防，本处是刚塌过一次）。
+
+### ✅ 本地模型回归核查（Gavin 2026-08-17 提出，主控独立取证，四条全过）
+
+> **Gavin 原话**：「本地模型的录音还是会使用原先的录音窗口，所以这次新集成 asr 实时上屏
+> 不能影响本地模型录音的 overlay 窗口效果」
+
+| # | 核查项 | 结论与证据 |
+| --- | --- | --- |
+| 1 | 绘制是否等价 | ✅ **机器比对**：拆分前单体与拆分后 `chrome + indicator_and_waveform + stop_button` 串接，**18 个 GDI 原语序列完全一致**（`diff` 为空） |
+| 2 | 是否被尺寸插值波及 | ✅ 不会。`is_streaming_text` 仅 `matches!(RecordingWithText)`；非流式态 `:991-994` 令 `target_size == current_size` → `:1191` 插值条件不成立 |
+| 3 | 波形是否会冻 | ✅ 不会。返工后 `Recording` 独立为**每帧重绘**分支，脏标记只用于 `RecordingWithText`/`StreamingEditing` |
+| 4 | 门闩是否误伤 | ✅ 不会。`StreamingText` 仅在 `is_streaming_asr`（`AsrModel::QwenAudioOnline`）下产生（`:3512-3543`）；本地模型走 `record()` + `run_pipeline_core` 老路**永不进入该分支**，注释 `:3509` 亦自陈「零行为变更」 |
+
+**结论**：本地模型 overlay 只经历 `Recording → FallingToProcessing → Processing`，
+全是本批未改语义的状态。**OVERLAY-043 对本地模型录音窗口零影响。**
+🔴 **但这是静态代码论证，Gavin 端测时请顺手用本地模型录一次确认。**
 
 ### 🟡 待排期 · TEST-045-REFACTOR 抽 `decide_pipeline_entry` 纯函数（tester-1 建议，主控采纳但延后）
 
