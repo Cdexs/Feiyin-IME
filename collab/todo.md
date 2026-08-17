@@ -2422,3 +2422,15 @@ coder-1 在 DATA-SCENE-GENERIC-008 中评估后建议的候选：**`思维导图
 场景感知后续演进方向：UIA 控件信号、浏览器细分词表迭代、内容压缩独立开关、语气适配 LLM 兜底开关（未命中时参考应用名，默认关）、个性化风格学习。
 
 来源：DESIGN-FORMAT-SCENE-001 技术方案（collab/research/typeless-format-design-001.md）+ DEC-031。
+
+## TEST-EXEC-043（2026-08-17，tester-1）— 阶段四回归 + 消融实测
+- [x] Step1 cargo test 全量 1040/0/11（主967+crash37+集成36，精确命中）
+- [x] Step2 Vitest 54 passed
+- [x] Step3 src-tauri 55 passed
+- [x] Step4 pytest SKIP（Publish/ 为 BUILD-017 旧包早于本批）
+- [x] 消融前基线 overlay_043 专项 10/10
+- [x] 消融 A（delta.abs()→delta）：4 条变红（含预期外 step_never_exceeds_quarter_of_delta，主控裁决实测为准）
+- [x] 消融 B（门闩→false）：仅真值表 1 条变红
+- [x] 还原自证：git diff -w 空 + 还原后复跑 1040/0/11
+- [x] 文档同步（logs/CHANGELOG/handoffs/MACOS-HANDOFF/本文件）
+- [ ] 主控验收

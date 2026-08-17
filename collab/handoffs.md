@@ -2,6 +2,19 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-08-17 — tester-1 — TEST-EXEC-043 ✅ 阶段四全量回归 + 消融实测（OVERLAY-043 批，生产零改动，待主控验收）
+
+- **来源**：主控派单（基线 HEAD `497131f`）。前置三提交 OVERLAY-043 `a588509` / OVERLAY-043-B `5940e73` / TEST-SYNC-043 `497131f` 已全验收
+- **四步回归全过**：Step1 `cargo test` = **1040 passed / 0 failed / 11 ignored**（主 crate 967 含 +10 overlay_043 + crash-reporter 37/2ign + 集成 36；上批 1030 +10 精确命中零残差）→ Step2 Vitest **54 passed** → Step3 src-tauri **55 passed** → Step4 pytest **SKIP**（`Publish/` 为 BUILD-017 旧包 08-16 23:25 早于本批 HEAD 08-17 13:40）
+- **消融 A（delta.abs()→delta）**：实测变红 **4 条**（任务书预期 3 条）——预期 3 条全中（shrink_exact_values / sign_symmetry / converges_800_240），**多出 step_never_exceeds_quarter_of_delta**。主控裁决：`interpolate_step` 的 `abs` 变量两处使用（`abs*0.25` + `.min(abs)`），其推演只改比例基数一处、min 仍用绝对值故模型偏轻少算一条；**实测 4 条为准**，该用例捕获同根因更强表现（负 delta 步长 +|delta| 方向暴跳），属护栏更严非失效
+- **消融 B（门闩→false）**：实测仅 `ignore_streaming_text_truth_table` 1 条变红（第 3 格失守），与预期完全吻合
+- **还原自证**：两次消融编辑器还原 → `git diff -w src/main.rs` 输出空（0 行）→ 还原后复跑 **1040/0/11** 与消融前逐数一致；红条 ③=0/①=0/②=0
+- **纪律遵守**：消融 A 实测与任务书预期冲突时先上报主控再继续（主控确认"先报不改"正确），未自行改测试迁就
+- **验收**：版本号 0.8.0 未动；未 commit（主控统一提交）；未出包（BUILD-018 须主控明确下令）
+- **详情**：outbox/tester-1/result.md + logs/20260817.md + CHANGELOG.md
+
+---
+
 ## 2026-08-17 — tester-1 — TEST-SYNC-043 ✅ 阶段三测试同步：OVERLAY-043 + 043-B 补真护栏（src/main.rs +138，待主控验收）
 
 - **来源**：主控派单（基线 HEAD `5940e73`，OVERLAY-043 `a588509` + OVERLAY-043-B `5940e73` 已提交）。前置：缺陷 A 验收打回后已抽 `interpolate_step` 纯函数

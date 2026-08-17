@@ -1242,3 +1242,10 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 - 阶段三测试同步：仅新增 `mod overlay_043_interpolate_tests`（`src/main.rs` 测试区，+138 行，生产零改动）。
 - 模块带 `#[cfg(target_os = "windows")]` 门控（与 `interpolate_step` / `should_ignore_streaming_text` 同平台约束），macOS 编译完全不包含该模块。
 - 纯 Windows 平台测试，macOS 侧无任何动作。
+
+### TEST-EXEC-043 补充（2026-08-17）
+
+- 阶段四全量回归 + 消融实测：cargo test 1040/0/11、Vitest 54、src-tauri 55 全绿；pytest 按书 SKIP（Publish/ 为 BUILD-017 旧包）。
+- 消融 A（`delta.abs()` 改回 `delta`）实测 4 条变红（含任务书预期外的 `step_never_exceeds_quarter_of_delta`，主控确认以实测为准）；消融 B（门闩改 `false`）实测仅真值表 1 条变红。
+- 两次消融均完整还原，还原后全量复跑 1040/0/11 逐数一致。
+- 纯 Windows 平台测试执行，macOS 侧无任何动作。
