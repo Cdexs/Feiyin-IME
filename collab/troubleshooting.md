@@ -3125,4 +3125,90 @@ ASR-038-B 是**已完成并提交**的批次。若 coder-1 闷头执行，
   但**这次脚本如实报错了**（2026-08-14 的修复生效），主控 capture-pane 后发现
   文本其实已在输入框、只是没提交，补一个 Enter 即恢复。**修复有效，保留。**
 - 顺带发现：注入模板里「项目：，工作目录：。」两个字段**是空的**，脚本未填充。
-  主控当场手工补发。**待修：`replace-worker.sh` 的注入模板变量缺失。**
+  主控当场手工补发。~~**待修：`replace-worker.sh` 的注入模板变量缺失。**~~
+  ✅ **2026-08-17 已修复并验证**，见下方第五节。
+
+### 五、2026-08-17 第二次爆发 + 两项根治
+
+#### ① 新形态：陷阱不在「另一套目录」，而在**同一个目录的兄弟文件**
+
+2026-08-17 12:30 三 Worker 重启，主控启动巡检 `capture-pane` 抓到
+**coder-2 正在 Read `collab/inbox/coder-2/task_wordbook_ui_fix.md`** —— mtime **2026-04-23**，
+4 个月前的任务，不在当前 todo 任何条目内。
+
+第四节的封堵（把**项目级** `voice-ime/collab/inbox/*/task.md` 改名为 `task-STALE-*.md`）
+**挡不住这一次**，因为这次的陷阱文件就躺在**工作区级 inbox 自己家里**：
+
+```
+/d/Workspace/CodeLab/collab/inbox/coder-2/
+├── task.md                      ← 0 字节（重启清空）
+├── task_analysis.md             ← 4-5 月陈旧任务
+├── task_wordbook_ui_fix.md      ← coder-2 抓到的就是这个
+└── …（三 Worker 合计 23 个 task_*.md）
+```
+
+**规律**：`task.md` 被清空后，Worker 会在**当前目录**扫描「名字最像任务的文件」。
+只要目录里还有任何 `task_*.md`，封堵别处路径都是徒劳。
+
+**根治（已执行）**：三 Worker inbox 下 23 个陈旧 `task_*.md` 全部移入
+`collab/inbox/_stale-archive-20260817/`（**移动非删除，可回滚**）。
+inbox 目录今后只允许存在 `task.md` / `notify.md` / `result.md`。
+
+**拦截结果**：coder-2 停在 `~ Reading file...` 尚未落笔，`git status` + `git diff --stat`
+实测**工作区零污染**。当时工作区 clean 且正等 Gavin 端测 v0.8.0，若晚一步产生悬空改动，
+与端测产物混在一起，归因成本极高。
+
+#### ② 注入模板变量为空的根因（第四节「待修」项销账）
+
+`replace-worker.sh` 第 226-227 行：
+
+```bash
+grep -o '"project":"[^"]*"'      # ← 写死冒号后无空格
+grep -o '"worker_dir":"[^"]*"'
+```
+
+而 `state.json` 实际格式是 `"project": "voice-ime"`（**冒号后有一个空格**），
+两条 grep **永远匹配不到** → 变量恒为空 → 注入模板长期输出
+「项目：，工作目录：。」和「阅读 **/collab/** 下的 todo.md」（少了工作目录前缀）。
+
+**修复**：改用 `grep -oE '"project"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1`，
+容忍任意空白。已实测解析出 `voice-ime` / `/d/Workspace/CodeLab/voice-ime`。
+
+#### ③ `[REPLACE-WORKER-INJECT-LOST-001]` 的稳定残留：脚本 6 个 Enter 全废，人工 1 个就成
+
+2026-08-17 连做**三次**重启（coder-1 一次、coder-2 两次），**三次全部**报
+「三次注入均失败」，而每次 `capture-pane` 都显示**文本已完整躺在输入框里，只差提交**，
+主控手工补**一个** Enter 立即生效。
+
+即：脚本每轮发 2 个 Enter、3 轮共 6 个全部无效，人工补 1 个必成。
+说明**不是 Enter 丢了，是脚本 `sleep 2` 的校验窗口对超长注入文本太短**
+（注入文本约 1.2KB，TUI 渲染 + 状态机切换未完成即被判定失败）。
+
+**当前处置**：脚本如实报错的行为**是对的，保留**；主控收到该报错后
+**不要重跑脚本**，直接 `capture-pane` 确认文本在框内，补一个 Enter 即可。
+**待优化**：把提交校验的 `sleep 2` 改为轮询等待（如 0.5s × 10 次），而非一次性睡死。
+
+#### ④ 新坑：ollama-cloud 模型分「套餐内」与「extra usage」两类，切模型前必须知道
+
+2026-08-17 Gavin 指令 coder-2 用 `ollama-cloud/kimi-k3`，重启后**模型起不来**：
+
+```
+this model uses extra usage only (not included plan usage) and your extra usage
+balance is empty, add extra usage or turn on auto reload at https://ollama.com/settings
+```
+
+**同一 provider 下并非所有模型同权**：
+
+| 模型 | 结果 |
+| --- | --- |
+| `ollama-cloud/glm-5.2` | ✅ 套餐内，coder-1 实测正常 |
+| `ollama-cloud/kimi-k3` | ❌ **extra usage only**，余额空，两次重试同错（ref `63e9b0db` / `364f23db`） |
+| `ollama-cloud/kimi-k2.7-code` | ✅ 可用，coder-2 实测正常（最终采用） |
+
+**判据**：`extra usage balance is empty` 这条错误**与「额度用尽」不是一回事** ——
+它表示该模型**从来就不在套餐内**，不是用超了。换套餐内的同族模型即可，充值不是唯一解。
+
+**另**：Gavin 当时在 TUI 里手切模型试图绕过，底栏渲染立刻错乱成 `kkimi-k2.7-cod`
+（多字符 + 截断），印证 `team-voiceime.yaml:36-37` 与 `[WORKER-HANG-001]` 补充三的
+「**不要在 OpenCode TUI 里手动切换模型**」。正解是改 yaml 的 `model:` 字段
++ `replace-worker <id> OpenCode <provider/model>` 启动时定死。

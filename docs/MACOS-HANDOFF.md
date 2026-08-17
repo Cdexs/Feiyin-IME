@@ -1192,3 +1192,41 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 ### 结论
 
 **macOS 侧无需任何同步改动**；若 macOS 侧已接线 `run_pipeline_core` 流式调用，则本次修复自动生效。属「改动落在平台中立模块 → 必须记」情形（§2.7）。
+
+## §OVERLAY-043 · 录音悬浮层显示与流畅度修复（2026-08-17）
+
+### 改了什么
+
+`src/main.rs`（**Windows 专用** `#[cfg(target_os = "windows")]` 代码，`run_overlay_thread` / `draw_overlay_to_dc` / `process_controller_events` 区域）：
+
+1. **拆分录音态绘制函数**：`draw_recording_overlay` → `draw_overlay_chrome`（背景+边框）+ `draw_recording_indicator_and_waveform`（指示灯+波形）+ `draw_stop_button`（停止按钮）。`draw_recording_overlay_with_text` 只调 chrome + 指示灯 + 停止按钮，**不再画波形**，避免文字区被挤压。
+2. **右侧按钮复用**：`RecordingWithText` 与 `StreamingEditing` 共用同一个右按钮矩形；录音态显示停止方块，编辑态同一位置改为橙色圆角 ⏎ 提交按钮。删除独立的 submit 绘制段。
+3. **延迟合并 + 平滑插值**：100ms 内连续 `StreamingText` 不再把窗口宽度跳回默认 240px，而是把最新目标宽度存入 `target_size`；每帧按剩余距离 25%（至少 1px）插值移动 `current_size`，避免 `SetWindowPos` 瞬跳。
+4. **减少无效重绘**：`InvalidateRect` 改 `bErase=false`；WM_PAINT 已双缓冲（CreateCompatibleDC/Bitmap/BitBlt）。加 `needs_repaint` 脏标记，仅在文字变化、状态切换、尺寸目标变化时触发重绘。
+5. **停止后门闩**：新增 `STREAMING_STOPPED` AtomicBool，`HotkeyEvent::Stop` / `CancelStop` / ESC / `CancelRequested` / `EditRequested` / `SubmitRequested` 时置位；`RecordingStarted` 复位。`StreamingText` 分支若检测到已停止且未编辑，则忽略晚到的流式尾包，避免把刚切过去的 `FallingToProcessing` 又顶回录音态。
+6. **内存 DC 预填充背景**：双缓冲内存位图在绘制前先 `FillRect` 全区域为 `OVERLAY_BG_DARK`，避免未初始化像素暴露垃圾。
+7. **编辑态文字同步**：`OVERLAY_EDITING=true` 时，晚到的 `StreamingText` 仍以 `StreamingEditing` 状态更新请求（EDIT 控件内容同步），但不切换窗口状态。
+
+### 行为前后对比
+
+| 项 | 修前 | 修后 |
+|---|---|---|
+| 文字态波形 | 完整波形占据中央，文字被挤成窄条 | 仅保留左侧指示灯，右侧留给文字 |
+| 右按钮 | 停止 + 提交 两个按钮并排 | 同一位置按状态切换语义 |
+| 宽度变化 | 100ms 内回退 240px，与算出宽度来回跳 = 突闪 | 保持目标宽度、插值过渡 |
+| 重绘 | `bErase=true` 每帧擦背景；16ms timer 无脑 Invalidate | `bErase=false` + 脏标记 |
+| 停止后状态 | 晚到流式尾包把 `FallingToProcessing` 顶回 `RecordingWithText` | 门闩拦截尾包 |
+
+### 对 macOS 的具体影响
+
+1. **全部改动在 Windows-only `#[cfg]` 区域内**，macOS 编译不接触这些函数，**零编译影响**。
+2. **行为契约需同步**：macOS 侧若将来实现同等的「边说边上屏」overlay，应参考本节的交互语义：
+   - 录音带文字态不显示波形，避免文字挤压；
+   - 停止/提交共用同一按钮位置，按状态切换语义；
+   - 窗口宽度变化做平滑过渡而非瞬跳；
+   - 录音停止后忽略晚到的流式识别尾包，防止状态回退。
+3. **无平台层契约变化**：未新增/修改 `platform/` 导出符号，未改动 `AppConfig` 字段。
+
+### 结论
+
+**macOS 侧无需任何同步改动**。本改动属「纯 Windows 平台代码且无契约变化」情形，已在 §2.7 要求下明确评估并记录为「无影响」。

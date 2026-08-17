@@ -445,7 +445,11 @@ PTT 录音中点击即进编辑态（不等松键）｜流式文本白色不加�
 | **ASR-041** | 在线 ASR 模型换代 UI 选项 + 存量配置静默迁移 | `ui/src/pages/Voice.tsx`、`ui/src/i18n/*.ts`、`ui/src/pages/Voice.test.tsx`、`src/config/mod.rs` | coder-1 | ✅ 已验证（UI 下拉指向 qwen_audio_online + 三份 i18n 去 Qwen3 字样 + 存量 qwen3_online 静默迁移 + 17 处测试同步） |
 | **ASR-041-B** | 清除旧在线 ASR 代码路径 + 字段改名通用名 | `src/transcription/**`、`src/config/mod.rs`、`src/main.rs`、`ui/src/**`、`src-tauri/src/config.rs`、`src-tauri/src/main.rs` | coder-1 | ✅ 已验证（删 Qwen3Online 枚举+qwen3_online.rs(686行)+qwen3_asr 配置+热重载+match 臂+测试；f32_to_pcm16_le 搬家；三字段改通用名+alias；镜像补字段；存量迁移保留） |
 | **ASR-042** | 在线流式 ASR 采样率修复（StreamingResampler） | `src/audio/mod.rs` | coder-1 | ✅ 已验证（48kHz→16kHz 流式重采样；数学等价于 resample_anti_alias；pre-roll→post-hotkey→主循环喂同一实例+finish()；+6 测试含改坏会红自证；record()/resample_anti_alias/vad.rs 零改动） |
-| **ASR-045** | 流式识别结果被管线丢弃修复（P0） | `src/main.rs` | coder-1 | 🟢 **代码完成待主控验收**（新增 `should_cancel_on_empty` 纯函数 + 判空臂改调；流式 empty+Some 落 `Ok(samples)` 走 LLM 后半段；3 条护栏测试；`cargo fmt --check`/`cargo check --all-targets` 0 error） |
+| **ASR-045** | 流式识别结果被管线丢弃修复（P0） | `src/main.rs` | coder-1 | ✅ 已验收已提交 `54cde62` |
+| **TEST-SYNC-045** | 阶段三测试同步：ASR-045 护栏缺口 | `src/main.rs` mod tests | tester-1 | ✅ 已验收已提交 `fd994a5` |
+| **TEST-EXEC-042/045** | 阶段四全量回归 + 消融自证 | — | tester-1 | ✅ 已验收已提交 `2a173f0` |
+| **BUILD-017** | v0.8.0 第二包出包（ASR-042 + ASR-045 进 exe） | — | tester-1 | ✅ 已验收（产物 08-16 23:25，七项核验主控独立复算通过） |
+| **OVERLAY-043** | 录音悬浮层五项显示与流畅度修复 | `src/main.rs` | coder-2 | 🟡 **阶段一完成**，待主控验收后进入阶段三 TEST-SYNC |
 
 **038-A 验收取证**（主控独立复现，未采信报告）：`cargo fmt --check` clean ｜ `cargo check --all-targets` 0 error（当时）
 ｜源码 `#[test]` 计数 **45** 与报告一致 ｜文件域零越界。四处硬红线全部落实：`"model"` 在 payload 内 ｜

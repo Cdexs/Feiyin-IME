@@ -82,6 +82,25 @@
 - **Gavin 端测四项**（须 `-debug`，ASR-PERF-040-B/C 唯一数据源）：新端点连通性 / `usage.duration` 计费口径 / 040-A 四段连接耗时 / VAD 门控实际行为
 - **详情**：outbox/tester-1/result.md + logs/20260816.md + CHANGELOG.md
 
+## 2026-08-17 — coder-2 — OVERLAY-043 录音悬浮层五项显示与流畅度修复（src/main.rs +349/-150，阶段一完成）
+
+- **来源**：Gavin 2026-08-17 端测截图 + 主控逐条 Read 代码取证；基线 HEAD `56bfa37`
+- **根因**：此前任务从未派发，代码未动。端测已确认 ASR-042 生效、流式文字能上 overlay，问题 purely 在 overlay 显示与流畅度
+- **改动**（仅 `src/main.rs`）：
+  1. 拆 `draw_recording_overlay` 为 chrome/indicator+waveform/stop-button 三段；`RecordingWithText` 路径不再画波形，文字区不被挤压
+  2. 右侧单按钮复用：录音态=停止方块，编辑态=同位置橙色 ⏎ 提交；删除独立 submit 绘制
+  3. 100ms 尺寸节流改为**延迟合并** + 25% lerp 插值，避免回退 240px 突闪
+  4. `InvalidateRect` 改 `bErase=false`；加 `needs_repaint` 脏标记；WM_PAINT 已双缓冲，内存 DC 先 FillRect 背景防垃圾像素
+  5. 新增 `STREAMING_STOPPED` 门闩：Stop/ESC/取消/提交/编辑置位，`RecordingStarted` 复位；晚到 `StreamingText` 不再把 `FallingToProcessing` 顶回录音态；编辑态仍同步文字
+- **流畅度额外手段**：尺寸插值过渡、状态变化才重置命中区、目标尺寸与当前尺寸差异阈值驱动 `SetWindowPos`
+- **验收**：`cargo fmt --all -- --check` clean / `cargo check --all-targets` 0 error（99 warnings 均为既有/未使用变量）/ `cargo check --manifest-path src-tauri/Cargo.toml --all-targets` 0 error / `git diff --stat` 仅 `src/main.rs`
+- **边界**：未碰 `src/audio/mod.rs`、`src/vad.rs`、`src/transcription/**`、版本号（0.8.0）
+- **跨平台**：`docs/MACOS-HANDOFF.md` 新增 §OVERLAY-043；改动全在 Windows-only `#[cfg]` 内，macOS 零编译影响，行为契约已记录
+- **后续**：阶段三 TEST-SYNC 待 coder-2 验收后派发；最终目视顺滑度由 Gavin 端测拍板
+- **详情**：outbox/coder-2/result.md + logs/20260817.md + CHANGELOG.md
+
+---
+
 ## 2026-08-16 — tester-1 — 文档维护：build-test-guide.md Step 1 杀进程名单补 `feiyin-ime-nor`（主控验收后建议，非派单）
 
 - **背景**：BUILD-017 验收通过（提交 `2074859`）。主控建议把名单外遗留进程 `feiyin-ime-nor` 补进 Step 1 杀进程名单，否则下次出包重蹈 mutex 坑。该文档归 tester-1 维护，无需等派单
