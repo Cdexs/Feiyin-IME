@@ -99,6 +99,18 @@
 - **后续**：阶段三 TEST-SYNC 待 coder-2 验收后派发；最终目视顺滑度由 Gavin 端测拍板
 - **详情**：outbox/coder-2/result.md + logs/20260817.md + CHANGELOG.md
 
+## 2026-08-17 — coder-2 — OVERLAY-043-B 抽两个纯函数补真护栏（src/main.rs +39/-12，阶段一补强）
+
+- **来源**：OVERLAY-043 验收时主控手工数值复算发现 `interpolate_step` 内联逻辑缺陷；基线 HEAD `a588509`
+- **改动**（仅 `src/main.rs`）：
+  1. 新增 `interpolate_step(delta: i32) -> i32` 纯函数（doc 注释含四条契约），替换 `run_overlay_thread` 中内联步长计算；与原内联表达式逐位等价
+  2. 新增 `should_ignore_streaming_text(stopped: bool, editing: bool) -> bool` 纯函数，替换 `PipelineEvent::StreamingText` 分支的内联门闩判断；与原布尔表达式 `stopped && !editing` 逐位等价
+- **性质**：纯可测性重构，**行为零变更**；测试用例由阶段三 tester-1 负责，本任务不写 `#[test]`
+- **验收**：`cargo fmt --all -- --check` clean / `cargo check --all-targets` 0 error / `cargo check --manifest-path src-tauri/Cargo.toml --all-targets` 0 error / `git diff --stat` 仅 `src/main.rs`，无新增 `#[test]`
+- **边界**：未碰 `src/audio/mod.rs`、`src/vad.rs`、`src/transcription/**`、版本号（0.8.0）
+- **跨平台**：`docs/MACOS-HANDOFF.md` §OVERLAY-043 已声明纯 Windows-only `#[cfg]` 代码，macOS 零编译影响；本次抽函数仍在同一 `#[cfg]` 块内
+- **详情**：outbox/coder-2/result.md + logs/20260817.md + CHANGELOG.md
+
 ---
 
 ## 2026-08-16 — tester-1 — 文档维护：build-test-guide.md Step 1 杀进程名单补 `feiyin-ime-nor`（主控验收后建议，非派单）

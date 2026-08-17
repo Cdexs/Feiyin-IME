@@ -1198,12 +1198,8 @@ fn run_overlay_thread(
             if state.current_size != state.target_size {
                 let dx = state.target_size[0] - state.current_size[0];
                 let dy = state.target_size[1] - state.current_size[1];
-                // move at least 1 pixel per frame, up to 1/4 of the remaining distance.
-                // Use abs() first so negative deltas still take a proportional step.
-                let step_x =
-                    (dx.abs() as f32 * 0.25).max(1.0).min(dx.abs() as f32) as i32 * dx.signum();
-                let step_y =
-                    (dy.abs() as f32 * 0.25).max(1.0).min(dy.abs() as f32) as i32 * dy.signum();
+                let step_x = interpolate_step(dx);
+                let step_y = interpolate_step(dy);
                 state.current_size[0] += step_x;
                 state.current_size[1] += step_y;
                 // snap when very close to avoid micro-jitter
@@ -2605,6 +2601,38 @@ fn draw_error_overlay(
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
     );
 }
+/// OVERLAY-043-B: per-frame size interpolation step.
+///
+/// Contract:
+/// - `delta == 0` -> `0`
+/// - at least 1 px per frame (so the animation actually reaches the target)
+/// - at most 25% of the remaining distance per frame
+/// - never overshoots the target (no oscillation)
+/// - sign-symmetric: `interpolate_step(-n) == -interpolate_step(n)`
+#[cfg(target_os = "windows")]
+fn interpolate_step(delta: i32) -> i32 {
+    if delta == 0 {
+        return 0;
+    }
+    let abs = delta.abs() as f32;
+    let magnitude = (abs * 0.25).max(1.0).min(abs) as i32;
+    magnitude * delta.signum()
+}
+
+/// OVERLAY-043-B: whether a late StreamingText packet should be ignored.
+/// Truth table (rows are the four input combinations that must be nailed down):
+///
+/// | stopped | editing | result | meaning |
+/// |---------|---------|--------|---------|
+/// | false   | false   | false  | normal recording, show text |
+/// | false   | true    | false  | editing, keep syncing EDIT text |
+/// | true    | false   | true   | stopped & not editing -> do not revert to RecordingWithText |
+/// | true    | true    | false  | stopped but editing -> still sync EDIT text (window stays) |
+#[cfg(target_os = "windows")]
+fn should_ignore_streaming_text(stopped: bool, editing: bool) -> bool {
+    stopped && !editing
+}
+
 #[cfg(target_os = "windows")]
 fn monitor_work_rect(hwnd: HWND) -> RECT {
     unsafe {
@@ -2974,13 +3002,12 @@ fn process_controller_events(
             }
             PipelineEvent::StreamingText(text) => {
                 // ASR-038-B: 流式 ASR 增量文本推送到 overlay
-                // OVERLAY-043: once the user has released the hotkey, ignore late streaming packets
-                // unless the user is actively editing (in which case the text still updates inside EDIT).
-                if STREAMING_STOPPED.load(Ordering::Acquire)
-                    && !OVERLAY_EDITING.load(Ordering::Acquire)
-                {
+                // OVERLAY-043-B: late streaming packets after stop are ignored unless editing.
+                let stopped = STREAMING_STOPPED.load(Ordering::Acquire);
+                let editing = OVERLAY_EDITING.load(Ordering::Acquire);
+                if should_ignore_streaming_text(stopped, editing) {
                     log::debug!("OVERLAY-043: ignoring late StreamingText after stop");
-                } else if OVERLAY_EDITING.load(Ordering::Acquire) {
+                } else if editing {
                     // Editing mode: keep the EDIT control text in sync without switching window status.
                     overlay_handle.send(OverlayCommand::Show(OverlayRequest {
                         status: OverlayStatus::StreamingEditing { text: text.clone() },

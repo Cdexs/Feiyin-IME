@@ -1230,3 +1230,9 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 ### 结论
 
 **macOS 侧无需任何同步改动**。本改动属「纯 Windows 平台代码且无契约变化」情形，已在 §2.7 要求下明确评估并记录为「无影响」。
+
+### OVERLAY-043-B 补充（2026-08-17）
+
+- 仅将 `interpolate_step` 与 `should_ignore_streaming_text` 两个内联布尔/算术表达式抽为纯函数，调用点替换。
+- 新增函数仍位于 Windows-only `#[cfg(target_os = "windows")]` 区域内，macOS 编译零接触。
+- 行为零变更，macOS 侧无需任何动作。
