@@ -314,6 +314,18 @@
 
 ---
 
+## 2026-08-17 — tester-1 — TEST-EXEC-049/051/053 ✅ 阶段四全量回归 + 消融实测（HOTKEY-049 + WORDBOOK-053 批，无阻塞项）
+
+- **来源**：主控派单（基线 HEAD `5a5a7e7`，本批三提交 + TEST-SYNC 已验收，仅我一人执行）
+- **四步回归**：cargo test **1045/0/11**（与预期精确吻合）→ Vitest **78/78**（与预期精确吻合）→ src-tauri **60/0**（任务书预期 55，**对账非回归**：`src-tauri/src/wordbook.rs:2` `#[path="../../src/wordbook/mod.rs"]` 把主 crate wordbook 整体编入，TEST-SYNC +5 条 `extract_correction_word` 使 src-tauri 侧 wordbook 31→36→60；`git diff b5a96a9..HEAD -- src-tauri/` 空证自身零改动）→ pytest **9 FAIL/54 PASS/32 SKIP 记 BLOCKED**（全已知 harness 缺陷 [E2E-CONFIG-PATH-STALE-001]，`tests/` 零 diff 非本批引入，未调 harness 待 E2E-HARNESS-050）
+- **消融 A**：删 MOD_ALT 分支 `set.add(0xA4)` → 实测变红 **4 条超任务书预测 1 条**：T4 命中；T3/T9/T11 因精确数组/穷举/组合断言同样 assert 0xA4 缺失而同红，**全同源、护栏更严非失效**（[ABLATION-MODEL-TOO-LIGHT-001] 同向）；**零 false alarm**（T5/T7 独立性保持绿）
+- **还原自证**：编辑器还原（禁 git reset/checkout/stash/clean）→ `git diff -w` 0 字节 → 复跑 Vitest 78/78 逐数一致
+- **红条三分类**：① 0 / ② 9（pytest harness）/ ③ 真回归 **0**，无阻塞项
+- **红线合规**：版本号 0.8.0 未动 / 未 commit / 未改 coder-2 判据 / `src/**`+`src-tauri/**` 生产零改动 / progress.md N/A（规则 7）
+- **详情**：outbox/tester-1/result.md + logs/20260817.md + CHANGELOG.md
+
+---
+
 ## 2026-08-17 — tester-1 — TEST-SYNC-049/051/053 ✅ 阶段三测试同步：HOTKEY-049 护栏 + WORDBOOK-053 方向复核（前置 export 授权协商闭环，待主控验收）
 
 - **来源**：主控派单（基线 HEAD `15ea6b5`，本批三提交 HOTKEY-049+OVERLAY-051 `9c1806d` / OVERLAY-051-A/H `f03a4ea` / WORDBOOK-053 A+B `15ea6b5` 已验收）
