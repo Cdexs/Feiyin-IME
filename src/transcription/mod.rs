@@ -25,15 +25,20 @@ pub enum AsrMode {
     Streaming,
 }
 
-/// ASR 模型选择（DEC-025 + DEC-028）
+/// ASR 模型选择（DEC-025 + DEC-028 + ASR-056）
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AsrModel {
     /// 性能最优：179MB FunASR Nano CTC 兼容版（OfflineSenseVoiceModelConfig，无 hotwords）
     Performance,
     /// 准确率更高：972MB FunASR Nano native（OfflineFunASRNanoModelConfig，config 层 hotwords）
     Accuracy,
-    /// 在线流式 ASR（RESEARCH-ASR-038 / ASR-041-B）：DashScope Inference 协议，支持即时热词
+    /// 在线流式 ASR —— Qwen Audio 3.0（RESEARCH-ASR-038 / ASR-041-B）：
+    /// DashScope Inference 协议，模型 ID qwen-audio-3.0-asr-flash-streaming
     QwenAudioOnline,
+    /// 在线流式 ASR —— FunASR Realtime（ASR-056）：
+    /// 与 QwenAudioOnline 共用同一 WS 端点 + 同一 Inference 协议 + 同一返回结构，
+    /// 仅 model 名与部分参数取值不同。Gavin 研究发现比 qwen-audio-3.0-asr-flash-streaming 快。
+    FunAsrRealtime,
 }
 
 impl AsrModel {
@@ -42,9 +47,19 @@ impl AsrModel {
             AsrModel::Accuracy
         } else if s.eq_ignore_ascii_case("qwen_audio_online") {
             AsrModel::QwenAudioOnline
+        } else if s.eq_ignore_ascii_case("fun_asr_realtime") {
+            AsrModel::FunAsrRealtime
         } else {
             AsrModel::Performance
         }
+    }
+
+    /// ASR-056: 收敛判据——是否走在线流式管线（真流式 record_streaming + transcribe_streaming_realtime）。
+    ///
+    /// 新增在线模型时只改这一处，不必逐个更新 main.rs 的 12 处引用点。
+    /// QwenAudioOnline 和 FunAsrRealtime 都走真流式管线（共用 qwen_inference.rs 实现）。
+    pub fn is_online_streaming(&self) -> bool {
+        matches!(self, AsrModel::QwenAudioOnline | AsrModel::FunAsrRealtime)
     }
 }
 
@@ -78,6 +93,8 @@ pub struct Transcriber {
     asr_online_api_key: String,
     asr_online_url: String,
     asr_online_model: String,
+    /// ASR-056: VAD 断句静音阈值（ms），config.toml 隐藏字段覆盖，默认 800
+    asr_online_max_sentence_silence: i64,
 }
 
 // SAFETY: Transcriber 持有的 OfflineRecognizer 内部为 *const C++ 指针。
@@ -103,6 +120,7 @@ impl Transcriber {
         asr_online_api_key: &str,
         asr_online_url: &str,
         asr_online_model: &str,
+        asr_online_max_sentence_silence: i64,
     ) -> Result<Self> {
         let mode = if enable_streaming {
             AsrMode::Streaming
@@ -110,8 +128,9 @@ impl Transcriber {
             AsrMode::Offline
         };
 
-        // DEC-028 / ASR-038-B / ASR-041-B: 在线 ASR 模式不加载本地模型
-        if asr_model == AsrModel::QwenAudioOnline {
+        // DEC-028 / ASR-038-B / ASR-041-B / ASR-056: 在线 ASR 模式不加载本地模型
+        // ASR-056: QwenAudioOnline 与 FunAsrRealtime 都走此路径（is_online_streaming 收敛判据）
+        if asr_model.is_online_streaming() {
             if asr_online_api_key.trim().is_empty() {
                 anyhow::bail!("在线 ASR 配置失败：API Key 为空（请在设置中配置 API Key）");
             }
@@ -130,6 +149,7 @@ impl Transcriber {
                 asr_online_api_key: asr_online_api_key.to_string(),
                 asr_online_url: asr_online_url.to_string(),
                 asr_online_model: asr_online_model.to_string(),
+                asr_online_max_sentence_silence,
             });
         }
 
@@ -155,6 +175,7 @@ impl Transcriber {
             asr_online_api_key: String::new(),
             asr_online_url: String::new(),
             asr_online_model: String::new(),
+            asr_online_max_sentence_silence,
         })
     }
 
@@ -170,6 +191,11 @@ impl Transcriber {
     /// ASR-038-B: QwenAudioOnline 的模型 ID
     pub fn asr_online_model(&self) -> &str {
         &self.asr_online_model
+    }
+
+    /// ASR-056: VAD 断句静音阈值（ms）
+    pub fn asr_online_max_sentence_silence(&self) -> i64 {
+        self.asr_online_max_sentence_silence
     }
 
     /// 当前 hotwords 版本号（外部对比用）
@@ -262,10 +288,11 @@ impl Transcriber {
         samples: &[f32],
         script: ChineseScript,
     ) -> Result<(String, bool)> {
-        // ASR-038-B: QwenAudioOnline 流式路径（非流式回退：录完整段再发）
+        // ASR-038-B / ASR-056: 在线流式 ASR 路径（非流式回退：录完整段再发）
+        // QwenAudioOnline 与 FunAsrRealtime 都走此路径（is_online_streaming 收敛判据）。
         // 流式管线在 main.rs 的 run_streaming_pipeline 中直接调用 qwen_inference::transcribe_streaming，
         // 此分支仅用于非流式回退（如模型切换过渡期）
-        if self.asr_model == AsrModel::QwenAudioOnline {
+        if self.asr_model.is_online_streaming() {
             let vocabulary = crate::transcription::load_wordbook_vocabulary();
             let text = qwen_inference::transcribe_streaming(
                 &self.asr_online_url,
@@ -273,13 +300,14 @@ impl Transcriber {
                 &self.asr_online_model,
                 samples,
                 &vocabulary,
+                self.asr_online_max_sentence_silence,
                 None,
                 |_| {},
             )?;
             let cleaned = Self::strip_asr_special_tokens(&text);
             let trimmed = cleaned.trim();
             if trimmed.is_empty() {
-                anyhow::bail!("ASR transcription failed: qwen_audio_online output is empty");
+                anyhow::bail!("ASR transcription failed: online ASR output is empty");
             }
             let normalized = text_normalizer::normalize_text_for_language(trimmed, script);
             let native_punctuated = punctuation::has_effective_punctuation(&normalized);
@@ -628,8 +656,8 @@ fn build_recognizer(
                 }
             }
         }
-        AsrModel::QwenAudioOnline => {
-            // ASR-041-B: 在线 ASR 模式不加载本地模型，
+        AsrModel::QwenAudioOnline | AsrModel::FunAsrRealtime => {
+            // ASR-041-B / ASR-056: 在线 ASR 模式不加载本地模型，
             // Transcriber::new() 已提前返回，此分支不应被触达
             unreachable!(
                 "online ASR models should be handled in Transcriber::new() before build_recognizer"
@@ -887,6 +915,7 @@ mod tests {
             "sk-test-key",
             "wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference",
             "qwen-audio-3.0-asr-flash-streaming",
+            800,
         )
         .expect("QwenAudioOnline Transcriber::new should succeed without local models");
         assert_eq!(t.asr_model(), AsrModel::QwenAudioOnline);
@@ -895,6 +924,8 @@ mod tests {
             "wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference"
         );
         assert_eq!(t.asr_online_model(), "qwen-audio-3.0-asr-flash-streaming");
+        // ASR-056: max_sentence_silence 存储
+        assert_eq!(t.asr_online_max_sentence_silence(), 800);
     }
 
     /// ASR-038-B-006: QwenAudioOnline 模式 API Key 空 → bail
@@ -910,6 +941,7 @@ mod tests {
             "",
             "wss://inference.example.com",
             "qwen-audio-3.0-asr-flash-streaming",
+            800,
         );
         assert!(result.is_err());
         let err_msg = result.err().unwrap().to_string();
@@ -1596,18 +1628,23 @@ mod tests {
         assert_eq!(Transcriber::strip_asr_special_tokens(""), "");
     }
 
-    /// ASR-041-B-补: AsrModel 恰好三变体（Performance/Accuracy/QwenAudioOnline）。
+    /// ASR-041-B-补 / ASR-056: AsrModel 恰好四变体
+    /// （Performance/Accuracy/QwenAudioOnline/FunAsrRealtime）。
     /// Gavin 明确保留 Accuracy，防将来误删该变体。
-    /// 用穷举 match 而非断言计数：删任一变体 → 本 match 编译失败（比 `== 3` 强）。
+    /// ASR-056 新增 FunAsrRealtime（与 QwenAudioOnline 共用 Inference 协议）。
+    /// 用穷举 match 而非断言计数：删任一变体 → 本 match 编译失败（比 `== 4` 强）。
     /// 每个变体都走一遍 from_config 正反向，钉住字符串 ↔ 变体映射不被破坏。
     #[test]
-    fn asr_model_exactly_three_variants_with_stable_mapping() {
-        // 穷举三变体：新增/删除变体都会在此编译失败（编译期护栏）
+    fn asr_model_exactly_four_variants_with_stable_mapping() {
+        // 穷举四变体：新增/删除变体都会在此编译失败（编译期护栏）
         let _exhaustive: fn(AsrModel) = |m| match m {
-            AsrModel::Performance | AsrModel::Accuracy | AsrModel::QwenAudioOnline => (),
+            AsrModel::Performance
+            | AsrModel::Accuracy
+            | AsrModel::QwenAudioOnline
+            | AsrModel::FunAsrRealtime => (),
         };
 
-        // from_config 正反向映射（大小写不敏感，041-B 改名后仍是 qwen_audio_online）
+        // from_config 正反向映射（大小写不敏感）
         assert_eq!(AsrModel::from_config("performance"), AsrModel::Performance);
         assert_eq!(AsrModel::from_config("accuracy"), AsrModel::Accuracy);
         assert_eq!(
@@ -1618,8 +1655,38 @@ mod tests {
             AsrModel::from_config("QwEn_AuDiO_oNlInE"),
             AsrModel::QwenAudioOnline
         );
+        // ASR-056: fun_asr_realtime 映射
+        assert_eq!(
+            AsrModel::from_config("fun_asr_realtime"),
+            AsrModel::FunAsrRealtime
+        );
+        assert_eq!(
+            AsrModel::from_config("FuN_AsR_ReAlTiMe"),
+            AsrModel::FunAsrRealtime
+        );
         // 未知字符串回落 Performance（不 panic）
         assert_eq!(AsrModel::from_config("qwen3_online"), AsrModel::Performance);
         assert_eq!(AsrModel::from_config(""), AsrModel::Performance);
+    }
+
+    /// ASR-056: is_online_streaming() 收敛判据——QwenAudioOnline 和 FunAsrRealtime 都返回 true
+    #[test]
+    fn asr_056_is_online_streaming_correct_for_all_variants() {
+        assert!(
+            !AsrModel::Performance.is_online_streaming(),
+            "Performance must not be online streaming"
+        );
+        assert!(
+            !AsrModel::Accuracy.is_online_streaming(),
+            "Accuracy must not be online streaming"
+        );
+        assert!(
+            AsrModel::QwenAudioOnline.is_online_streaming(),
+            "QwenAudioOnline must be online streaming"
+        );
+        assert!(
+            AsrModel::FunAsrRealtime.is_online_streaming(),
+            "FunAsrRealtime must be online streaming"
+        );
     }
 }

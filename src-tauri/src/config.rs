@@ -103,22 +103,33 @@ pub struct AudioConfig {
     /// Enable streaming ASR mode (2-pass: streaming + offline correction)
     #[serde(default)]
     pub enable_streaming: bool,
-    /// ASR 模型选择（DEC-025 / DEC-028 / ASR-041）："performance"(默认) | "accuracy" | "qwen_audio_online"
+    /// ASR 模型选择（DEC-025 / DEC-028 / ASR-041 / ASR-056）：
+    /// "performance"(默认) | "accuracy" | "qwen_audio_online" | "fun_asr_realtime"
     /// 必须与主程序 src/config/mod.rs AudioConfig.asr_model 同步，
     /// 否则配置界面保存时会静默丢弃主程序写入的 asr_model（round-trip 数据丢失）
     #[serde(default = "default_asr_model")]
     pub asr_model: String,
     /// 在线 ASR API Key（ASR-041-B 改名为通用名，与具体模型代号解耦）
     /// #[serde(alias)] 保证存量 config.toml 里的 `qwen3_api_key` 仍能正确读入
+    /// ASR-056: qwen_audio_online 与 fun_asr_realtime 两族共用同一 API Key
     #[serde(default, alias = "qwen3_api_key")]
     pub asr_online_api_key: String,
     /// 在线 ASR 服务 URL（ASR-041-B 改名为通用名）
     /// 必须与主程序 src/config/mod.rs 同步（round-trip 数据丢失防护）
+    /// ASR-056: 两族共用同一端点
     #[serde(default = "default_asr_online_url", alias = "qwen_asr_url")]
     pub asr_online_url: String,
     /// 在线 ASR 模型 ID（ASR-041-B 改名为通用名）
+    /// ASR-056: 此字段存「当前生效的在线模型串」，由 asr_model 顶层选择器决定族。
+    /// 前缀守卫在主程序 src/config/mod.rs::resolve_online_model_id 实现，
+    /// 镜像侧不重复守卫逻辑（主程序 load 时已落盘回写，镜像 load 时读到的是已守卫的值）。
     #[serde(default = "default_asr_online_model", alias = "qwen_asr_model")]
     pub asr_online_model: String,
+    /// ASR-056: VAD 断句静音阈值（ms），config.toml 隐藏字段（不进 UI，DEC-031）。
+    /// 默认 800ms 保持基线，500 vs 800 可作为独立一轴单独 A/B。
+    /// 必须与主程序 src/config/mod.rs 同步（round-trip 数据丢失防护）。
+    #[serde(default = "default_asr_online_max_sentence_silence")]
+    pub asr_online_max_sentence_silence: i64,
 }
 
 fn default_overlay_opacity() -> f32 {
@@ -134,7 +145,15 @@ fn default_asr_online_url() -> String {
 }
 
 fn default_asr_online_model() -> String {
+    // ASR-056: 此默认值是 qwen_audio_online 族的默认模型串。
+    // fun_asr_realtime 族的默认模型串见主程序 src/config/mod.rs::default_online_model_for_family。
+    // 镜像侧不重复族判定逻辑（主程序 load 时已落盘回写已守卫的值）。
     "qwen-audio-3.0-asr-flash-streaming".to_string()
+}
+
+/// ASR-056: VAD 断句静音阈值默认值（ms），与主程序 default_asr_online_max_sentence_silence 同步
+fn default_asr_online_max_sentence_silence() -> i64 {
+    800
 }
 
 impl Default for AudioConfig {
@@ -150,6 +169,7 @@ impl Default for AudioConfig {
             asr_online_api_key: String::new(),
             asr_online_url: default_asr_online_url(),
             asr_online_model: default_asr_online_model(),
+            asr_online_max_sentence_silence: default_asr_online_max_sentence_silence(),
         }
     }
 }
@@ -401,6 +421,7 @@ mod tests {
                 asr_online_api_key: String::new(),
                 asr_online_url: default_asr_online_url(),
                 asr_online_model: default_asr_online_model(),
+                asr_online_max_sentence_silence: default_asr_online_max_sentence_silence(),
             },
             llm: LlmConfig::default(),
             hotkey: HotkeyConfig::default(),
@@ -488,6 +509,29 @@ mod tests {
         );
         // alias 字段名同步（镜像缺 alias 也会静默丢数据，041-B 已补）
         assert_eq!(cfg.audio.asr_online_api_key, "");
+    }
+
+    /// ASR-056: 镜像必须能正确往返 fun_asr_realtime 新增的 asr_model 值，
+    /// 否则 UI 保存后重读会静默丢失（038-A 同款事故防护）。
+    #[test]
+    fn asr_056_mirror_fun_asr_realtime_roundtrip() {
+        let path = temp_config_path("fun_asr_realtime");
+        cleanup(&path);
+        let mut cfg = make_minimal_cfg_with_asr_model("fun_asr_realtime");
+        cfg.audio.asr_online_model = "fun-asr-realtime".to_string();
+        cfg.llm.system_prompt = default_system_prompt();
+        cfg.save_to(&path).unwrap();
+
+        let loaded = AppConfig::load_from(&path).unwrap();
+        cleanup(&path);
+        assert_eq!(
+            loaded.audio.asr_model, "fun_asr_realtime",
+            "ASR-056: fun_asr_realtime must survive mirror roundtrip (038-A guard)"
+        );
+        assert_eq!(
+            loaded.audio.asr_online_model, "fun-asr-realtime",
+            "ASR-056: fun-asr-realtime model id must survive mirror roundtrip"
+        );
     }
 
     /// TEST-SYNC-038-B: 镜像 alias 实测 —— 含旧字段名 qwen_asr_url / qwen_asr_model 的

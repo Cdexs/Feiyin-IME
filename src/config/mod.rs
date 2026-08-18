@@ -149,25 +149,42 @@ pub struct AudioConfig {
     /// Enable streaming ASR mode (2-pass: streaming + offline correction)
     #[serde(default)]
     pub enable_streaming: bool,
-    /// ASR 模型选择（DEC-025 + DEC-028 + ASR-041）：
-    /// "performance"(默认,179MB CTC) | "accuracy"(972MB native+hotwords) | "qwen_audio_online"(在线流式 ASR)
+    /// ASR 模型选择（DEC-025 + DEC-028 + ASR-041 + ASR-056）：
+    /// "performance"(默认,179MB CTC) | "accuracy"(972MB native+hotwords)
+    /// | "qwen_audio_online"(在线流式 ASR, qwen-audio-3.0-asr-flash-streaming)
+    /// | "fun_asr_realtime"(在线流式 ASR, fun-asr-realtime)
     /// 旧配置无此字段时 serde default 等效于 "performance"，行为与直换前完全一致
     /// ASR-041: "qwen3_online" 已被 "qwen_audio_online" 替代，存量配置自动迁移（见 load/load_from）
+    /// ASR-056: "fun_asr_realtime" 新增，与 qwen_audio_online 共用同一 WS 端点与 Inference 协议
     #[serde(default = "default_asr_model")]
     pub asr_model: String,
     /// 在线 ASR API Key（DEC-028，ASR-041-B 改名为通用名，与具体模型代号解耦）
     /// #[serde(alias)] 保证存量 config.toml 里的 `qwen3_api_key` 仍能正确读入
+    /// ASR-056: qwen_audio_online 与 fun_asr_realtime 两族共用同一 API Key（同 workspace）
     #[serde(default, alias = "qwen3_api_key")]
     pub asr_online_api_key: String,
     /// 在线 ASR 服务 URL（ASR-041-B 改名为通用名，与具体模型代号解耦）
     /// 默认北京 region：wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference
     /// #[serde(alias)] 免疫含 038-A 字段名的存量配置
+    /// ASR-056: qwen_audio_online 与 fun_asr_realtime 两族共用同一端点（官方文档并列两模型）
     #[serde(default = "default_asr_online_url", alias = "qwen_asr_url")]
     pub asr_online_url: String,
     /// 在线 ASR 模型 ID（ASR-041-B 改名为通用名）
-    /// 默认：qwen-audio-3.0-asr-flash-streaming
+    /// ASR-056: 此字段为「当前生效的在线模型串」，由 asr_model 顶层选择器决定族，
+    /// 加载时经 resolve_online_model_id 守卫：配置串前缀必须与所选族匹配，否则回落到族默认。
+    /// - asr_model="qwen_audio_online" → 默认 "qwen-audio-3.0-asr-flash-streaming"
+    /// - asr_model="fun_asr_realtime"  → 默认 "fun-asr-realtime"
+    /// 前缀守卫防「UI 选 fun-asr 但配置串还是 qwen 的」静默串味（主控 2026-08-18 裁决）
     #[serde(default = "default_asr_online_model", alias = "qwen_asr_model")]
     pub asr_online_model: String,
+    /// ASR-056: VAD 断句静音阈值（ms），config.toml 隐藏字段（不进 UI，DEC-031）。
+    ///
+    /// 主控 2026-08-18 验收裁决：默认 800ms 保持基线（与 qwen 既有行为一致），
+    /// 让 Gavin 的 A/B 对比能分清「fun-asr 更快」是模型带来的还是 silence 带来的。
+    /// 500 vs 800 可以作为独立一轴单独 A/B——改 config.toml 即可，不用重新出包。
+    /// 官方文档默认 1300ms，范围 200-6000ms。
+    #[serde(default = "default_asr_online_max_sentence_silence")]
+    pub asr_online_max_sentence_silence: i64,
 }
 
 fn default_overlay_opacity() -> f32 {
@@ -186,7 +203,116 @@ fn default_asr_online_url() -> String {
 }
 
 fn default_asr_online_model() -> String {
+    // ASR-056: 此默认值是 qwen_audio_online 族的默认模型串。
+    // fun_asr_realtime 族的默认模型串见 default_online_model_for_family。
     "qwen-audio-3.0-asr-flash-streaming".to_string()
+}
+
+/// ASR-056: VAD 断句静音阈值默认值（ms）
+///
+/// 主控 2026-08-18 验收裁决：保持 800ms 基线（与 qwen 既有行为一致），
+/// 让 Gavin 的 A/B 对比能分清「fun-asr 更快」是模型带来的还是 silence 带来的。
+/// 500 vs 800 可作为独立一轴单独 A/B（改 config.toml 即可，不用重新出包）。
+fn default_asr_online_max_sentence_silence() -> i64 {
+    800
+}
+
+/// ASR-056: 每个在线 ASR 族的默认模型串（前缀守卫回落用）
+///
+/// 族由 `asr_model` 顶层选择器决定（"qwen_audio_online" / "fun_asr_realtime"）。
+/// 前缀守卫规则（主控 2026-08-18 裁决）：
+/// - 配置里的 `asr_online_model` 串前缀必须与所选族的默认串前缀相符
+///   （前缀 = 第一个 `-` 之前的部分，如 "qwen-audio..." → "qwen-audio"，
+///   "fun-asr..." → "fun-asr"）。这样 `fun-asr-realtime-2025-11-07` 快照版
+///   仍能覆盖默认 `fun-asr-realtime`。
+/// - 冲突（UI 选 fun-asr 但配置串还是 qwen 的）→ 打警告 + 回落到族默认串
+/// - 两族都不匹配（自建/代理/未知前缀）→ 照用并记一条日志
+pub fn default_online_model_for_family(asr_model: &str) -> &'static str {
+    match asr_model {
+        "fun_asr_realtime" => "fun-asr-realtime",
+        // qwen_audio_online 或其他任何值（含 performance/accuracy 等非在线模式）都回落到 qwen 族默认
+        // —— 非在线模式不会走在线路径，此返回值不会被使用，但保持一致性
+        _ => "qwen-audio-3.0-asr-flash-streaming",
+    }
+}
+
+/// ASR-056: 提取模型串的族前缀（前两段，用 `-` 分割取 2 段再 join，小写化）
+///
+/// 主控 2026-08-18 验收裁决：取第一个 `-` 之前的部分会得到 "qwen"/"fun"，
+/// 而 known_prefixes 是 ["qwen-audio","fun-asr"]，永远匹配不上 → 守卫失效。
+/// 修法：取前**两段**，与注释、known_prefixes、测试期望一致。
+///
+/// 例："qwen-audio-3.0-asr-flash-streaming" → "qwen-audio"
+///     "fun-asr-realtime" → "fun-asr"
+///     "fun-asr-realtime-2025-11-07" → "fun-asr"
+///     "my-custom-model" → "my-custom"
+///     "nodash" → "nodash"
+///     "single-dash" → "single-dash"
+fn model_family_prefix(model_id: &str) -> String {
+    // 🔴 必须是「前两段」而不是 splitn(2)：splitn 会把余下全部留在第二段
+    // （"qwen-audio-3.0-asr" → ["qwen", "audio-3.0-asr"]），拼回去等于原串，
+    // 于是与 known_prefixes 永远比不上、守卫静默失效。用 split + take(2)。
+    let mut it = model_id.split('-');
+    match (it.next(), it.next()) {
+        (Some(first), Some(second)) => {
+            format!("{}-{}", first.to_lowercase(), second.to_lowercase())
+        }
+        (Some(first), None) => first.to_lowercase(),
+        _ => String::new(),
+    }
+}
+
+/// ASR-056: 在线模型串前缀守卫（纯函数，可单测）
+///
+/// 根据顶层 `asr_model` 选择器（族权威）与配置里的 `asr_online_model` 串（可能过期），
+/// 返回实际生效的模型串。
+///
+/// 规则：
+/// - 族前缀匹配 → 照用配置串（允许快照版/自定义版覆盖族默认）
+/// - 族前缀不匹配且配置串不属于任何已知族 → 照用并记日志（自建/代理场景）
+/// - 族前缀不匹配且配置串属于另一个已知族 → 回落到族默认串 + warn
+/// - 配置串为空 → 回落到族默认串（serde default 路径）
+pub fn resolve_online_model_id(asr_model: &str, configured_model_id: &str) -> String {
+    let family_default = default_online_model_for_family(asr_model);
+    let family_prefix = model_family_prefix(family_default);
+
+    let configured_trimmed = configured_model_id.trim();
+    if configured_trimmed.is_empty() {
+        return family_default.to_string();
+    }
+
+    let configured_prefix = model_family_prefix(configured_trimmed);
+    if configured_prefix == family_prefix {
+        // 族匹配，照用配置串（可能是快照版/自定义版）
+        return configured_trimmed.to_string();
+    }
+
+    // 检查配置串是否属于另一个已知族
+    let known_prefixes = ["qwen-audio", "fun-asr"];
+    if known_prefixes.contains(&configured_prefix.as_str()) {
+        // 属于另一个已知族 → 静默串味风险，回落 + warn
+        log::warn!(
+            "ASR-056: online model id '{}' prefix '{}' does not match family '{}' (asr_model='{}'); \
+             falling back to family default '{}'",
+            configured_trimmed,
+            configured_prefix,
+            family_prefix,
+            asr_model,
+            family_default
+        );
+        return family_default.to_string();
+    }
+
+    // 不属于任何已知族（自建/代理）→ 照用并记日志
+    log::info!(
+        "ASR-056: online model id '{}' has unknown prefix '{}' (not in {:?}); \
+         using as-is for family '{}'",
+        configured_trimmed,
+        configured_prefix,
+        known_prefixes,
+        asr_model
+    );
+    configured_trimmed.to_string()
 }
 
 impl Default for AudioConfig {
@@ -202,6 +328,7 @@ impl Default for AudioConfig {
             asr_online_api_key: String::new(),
             asr_online_url: default_asr_online_url(),
             asr_online_model: default_asr_online_model(),
+            asr_online_max_sentence_silence: default_asr_online_max_sentence_silence(),
         }
     }
 }
@@ -403,6 +530,25 @@ impl AppConfig {
             }
         }
 
+        // ASR-056: 在线模型串前缀守卫——防止 UI 选 fun-asr 但配置串还是 qwen 的静默串味。
+        // 只对在线流式族（qwen_audio_online / fun_asr_realtime）生效，非在线模式不动。
+        if cfg.audio.asr_model == "qwen_audio_online" || cfg.audio.asr_model == "fun_asr_realtime" {
+            let resolved =
+                resolve_online_model_id(&cfg.audio.asr_model, &cfg.audio.asr_online_model);
+            if resolved != cfg.audio.asr_online_model {
+                log::warn!(
+                    "ASR-056: online model id resolved '{}' -> '{}' (asr_model='{}'), persisting",
+                    cfg.audio.asr_online_model,
+                    resolved,
+                    cfg.audio.asr_model
+                );
+                cfg.audio.asr_online_model = resolved;
+                if let Err(e) = cfg.save() {
+                    log::warn!("ASR-056: failed to persist resolved online model id: {}", e);
+                }
+            }
+        }
+
         Ok(cfg)
     }
 
@@ -492,6 +638,24 @@ impl AppConfig {
             cfg.audio.asr_model = "qwen_audio_online".to_string();
             if let Err(e) = cfg.save_to(path) {
                 log::warn!("ASR-041: failed to persist migrated config: {}", e);
+            }
+        }
+
+        // ASR-056: 在线模型串前缀守卫（load_from 同 load）。
+        if cfg.audio.asr_model == "qwen_audio_online" || cfg.audio.asr_model == "fun_asr_realtime" {
+            let resolved =
+                resolve_online_model_id(&cfg.audio.asr_model, &cfg.audio.asr_online_model);
+            if resolved != cfg.audio.asr_online_model {
+                log::warn!(
+                    "ASR-056: online model id resolved '{}' -> '{}' (asr_model='{}'), persisting (load_from)",
+                    cfg.audio.asr_online_model,
+                    resolved,
+                    cfg.audio.asr_model
+                );
+                cfg.audio.asr_online_model = resolved;
+                if let Err(e) = cfg.save_to(path) {
+                    log::warn!("ASR-056: failed to persist resolved online model id: {}", e);
+                }
             }
         }
 
@@ -1444,5 +1608,163 @@ clipboard_delay_ms = 150
             MAX_RECORD_SECONDS, 300,
             "MAX_RECORD_SECONDS must stay 300s (translate poll hard cap derives from it)"
         );
+    }
+
+    // ============================================================
+    // ASR-056: 在线模型串前缀守卫纯函数测试
+    // 防止 UI 选 fun-asr 但配置串还是 qwen 的静默串味（主控 2026-08-18 裁决）
+    // ============================================================
+
+    #[test]
+    fn asr_056_family_default_qwen() {
+        assert_eq!(
+            default_online_model_for_family("qwen_audio_online"),
+            "qwen-audio-3.0-asr-flash-streaming"
+        );
+    }
+
+    #[test]
+    fn asr_056_family_default_fun_asr() {
+        assert_eq!(
+            default_online_model_for_family("fun_asr_realtime"),
+            "fun-asr-realtime"
+        );
+    }
+
+    #[test]
+    fn asr_056_family_default_non_online_falls_back_to_qwen() {
+        // 非在线模式不会走在线路径，但保持一致性
+        assert_eq!(
+            default_online_model_for_family("performance"),
+            "qwen-audio-3.0-asr-flash-streaming"
+        );
+        assert_eq!(
+            default_online_model_for_family("accuracy"),
+            "qwen-audio-3.0-asr-flash-streaming"
+        );
+        assert_eq!(
+            default_online_model_for_family("unknown"),
+            "qwen-audio-3.0-asr-flash-streaming"
+        );
+    }
+
+    #[test]
+    fn asr_056_resolve_prefix_match_uses_configured() {
+        // 族匹配 → 照用配置串
+        assert_eq!(
+            resolve_online_model_id("qwen_audio_online", "qwen-audio-3.0-asr-flash-streaming"),
+            "qwen-audio-3.0-asr-flash-streaming"
+        );
+        assert_eq!(
+            resolve_online_model_id("fun_asr_realtime", "fun-asr-realtime"),
+            "fun-asr-realtime"
+        );
+    }
+
+    #[test]
+    fn asr_056_resolve_prefix_match_allows_snapshot_version() {
+        // 快照版/自定义版覆盖族默认（前缀匹配即可）
+        assert_eq!(
+            resolve_online_model_id("fun_asr_realtime", "fun-asr-realtime-2025-11-07"),
+            "fun-asr-realtime-2025-11-07"
+        );
+        assert_eq!(
+            resolve_online_model_id("qwen_audio_online", "qwen-audio-3.0-asr-flash-streaming-v2"),
+            "qwen-audio-3.0-asr-flash-streaming-v2"
+        );
+    }
+
+    #[test]
+    fn asr_056_resolve_prefix_mismatch_known_family_falls_back() {
+        // UI 选 fun-asr 但配置串还是 qwen 的 → 回落到 fun-asr 默认
+        assert_eq!(
+            resolve_online_model_id("fun_asr_realtime", "qwen-audio-3.0-asr-flash-streaming"),
+            "fun-asr-realtime"
+        );
+        // 反向：UI 选 qwen 但配置串是 fun-asr → 回落到 qwen 默认
+        assert_eq!(
+            resolve_online_model_id("qwen_audio_online", "fun-asr-realtime"),
+            "qwen-audio-3.0-asr-flash-streaming"
+        );
+    }
+
+    #[test]
+    fn asr_056_resolve_empty_configured_falls_back_to_family_default() {
+        assert_eq!(
+            resolve_online_model_id("qwen_audio_online", ""),
+            "qwen-audio-3.0-asr-flash-streaming"
+        );
+        assert_eq!(
+            resolve_online_model_id("fun_asr_realtime", "   "),
+            "fun-asr-realtime"
+        );
+    }
+
+    #[test]
+    fn asr_056_resolve_unknown_prefix_uses_as_is() {
+        // 自建/代理场景：照用并记日志（这里只验证返回值，日志在运行时观察）
+        assert_eq!(
+            resolve_online_model_id("qwen_audio_online", "my-custom-model"),
+            "my-custom-model"
+        );
+        assert_eq!(
+            resolve_online_model_id("fun_asr_realtime", "proxy-asr-v1"),
+            "proxy-asr-v1"
+        );
+    }
+
+    #[test]
+    fn asr_056_resolve_case_insensitive_prefix() {
+        // 前缀比较小写化
+        assert_eq!(
+            resolve_online_model_id("fun_asr_realtime", "Fun-ASR-Realtime"),
+            "Fun-ASR-Realtime"
+        );
+    }
+
+    #[test]
+    fn asr_056_model_family_prefix_extracts_correctly() {
+        assert_eq!(
+            model_family_prefix("qwen-audio-3.0-asr-flash-streaming"),
+            "qwen-audio"
+        );
+        assert_eq!(model_family_prefix("fun-asr-realtime"), "fun-asr");
+        assert_eq!(
+            model_family_prefix("fun-asr-realtime-2025-11-07"),
+            "fun-asr"
+        );
+        assert_eq!(model_family_prefix("my-custom-model"), "my-custom");
+        assert_eq!(model_family_prefix("nodash"), "nodash");
+    }
+
+    /// ASR-056: load() 路径前缀守卫集成——选 fun_asr_realtime 但配置串是 qwen 的应回落
+    #[test]
+    fn asr_056_load_resolves_mismatched_online_model_id() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let path = crate::config::AppConfig::config_path();
+        let existed = path.exists();
+        let mut cfg = AppConfig::default();
+        cfg.audio.asr_model = "fun_asr_realtime".to_string();
+        // 故意写一个 qwen 的串——模拟用户从 0.8.0 升上来、UI 选了 fun-asr 但配置串没改
+        cfg.audio.asr_online_model = "qwen-audio-3.0-asr-flash-streaming".to_string();
+        cfg.save_to(&path).expect("save should succeed");
+        let loaded = AppConfig::load().expect("load should succeed");
+        // 守卫应回落到 fun-asr-realtime
+        assert_eq!(
+            loaded.audio.asr_online_model, "fun-asr-realtime",
+            "ASR-056: load() must resolve mismatched online model id to family default"
+        );
+        // 落盘后再次 load 应保持 fun-asr-realtime（幂等）
+        let reloaded = AppConfig::load().expect("reload should succeed");
+        assert_eq!(
+            reloaded.audio.asr_online_model, "fun-asr-realtime",
+            "ASR-056: resolved model id must persist on disk"
+        );
+        // 清理
+        if existed {
+            let _ = AppConfig::default().save_to(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }

@@ -32,6 +32,8 @@ export const zhHans = {
   voice_asr_model_accuracy_desc: '本地运行，准确率高、适合长音频。',
   voice_asr_model_qwen3: '在线语音识别模型',
   voice_asr_model_qwen3_desc: '云端运行，通过阿里云 API 进行语音识别。',
+  voice_asr_model_fun_asr: '在线语音识别 - FunASR',
+  voice_asr_model_fun_asr_desc: '云端运行，FunASR Realtime 模型，低延迟，适合实时语音输入。',
   voice_asr_model_download_required: '该模型需要下载后才能使用',
   voice_asr_model_download_url: '下载模型',
   voice_asr_model_open_download: '打开下载页',

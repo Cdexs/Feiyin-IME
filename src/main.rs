@@ -3534,10 +3534,11 @@ fn process_controller_events(
                     let target_hwnd = hwnd.0 as usize;
                     // OVERLAY-051-E: decide whether this is online streaming ASR. We cannot read
                     // the worker's is_streaming_asr flag yet, so infer from configured model.
+                    // ASR-056: 用 is_online_streaming() 收敛判据（QwenAudioOnline | FunAsrRealtime）
                     let is_streaming_asr = {
                         let cfg = clone_runtime_config(runtime_config);
                         transcription::AsrModel::from_config(&cfg.audio.asr_model)
-                            == transcription::AsrModel::QwenAudioOnline
+                            .is_online_streaming()
                     };
                     if is_streaming_asr {
                         show_overlay_streaming_idle(
@@ -4018,6 +4019,7 @@ fn spawn_worker_thread(
             &config.audio.asr_online_api_key,
             &config.audio.asr_online_url,
             &config.audio.asr_online_model,
+            config.audio.asr_online_max_sentence_silence,
         ) {
             Ok(t) => Some(t),
             Err(err) => {
@@ -4132,9 +4134,9 @@ fn spawn_worker_thread(
                     };
                     // R2-4: transcriber.is_none() 时无条件尝试重建（启动失败自愈）
                     let needs_rebuild = transcriber.is_none() && !asr_reload_in_flight;
-                    // ASR-041-B: 在线 ASR 配置变更检测（key/url/model 变更）
-                    let online_asr_changed = desired_asr_model
-                        == transcription::AsrModel::QwenAudioOnline
+                    // ASR-041-B / ASR-056: 在线 ASR 配置变更检测（key/url/model 变更）
+                    // 用 is_online_streaming() 收敛判据（QwenAudioOnline | FunAsrRealtime）
+                    let online_asr_changed = desired_asr_model.is_online_streaming()
                         && (active_asr_online_api_key != config.audio.asr_online_api_key
                             || active_asr_online_url != config.audio.asr_online_url
                             || active_asr_online_model != config.audio.asr_online_model);
@@ -4162,6 +4164,8 @@ fn spawn_worker_thread(
                         let reload_asr_online_key = config.audio.asr_online_api_key.clone();
                         let reload_asr_online_url = config.audio.asr_online_url.clone();
                         let reload_asr_online_model = config.audio.asr_online_model.clone();
+                        let reload_asr_online_max_sentence_silence =
+                            config.audio.asr_online_max_sentence_silence;
                         let reload_tx = asr_reload_tx.clone();
                         std::thread::spawn(move || {
                             let t_build = std::time::Instant::now();
@@ -4174,6 +4178,7 @@ fn spawn_worker_thread(
                                 &reload_asr_online_key,
                                 &reload_asr_online_url,
                                 &reload_asr_online_model,
+                                reload_asr_online_max_sentence_silence,
                             ) {
                                 Ok(new_t) => {
                                     log::info!(
@@ -4192,15 +4197,15 @@ fn spawn_worker_thread(
 
                     log::info!("[Latency] worker received Start command");
 
-                    // ASR-038-B: QwenAudioOnline 走真流式管线（边录边发边收边上屏）
+                    // ASR-038-B / ASR-056: 在线流式 ASR 走真流式管线（边录边发边收边上屏）
                     // 其他模式走现有 record() + run_pipeline_core（零行为变更）
+                    // ASR-056: 用 is_online_streaming() 收敛判据（QwenAudioOnline | FunAsrRealtime）
                     let desired_asr_model_check =
                         transcription::AsrModel::from_config(&config.audio.asr_model);
-                    let is_streaming_asr = desired_asr_model_check
-                        == transcription::AsrModel::QwenAudioOnline
-                        && transcriber.as_ref().is_some_and(|t| {
-                            t.asr_model() == transcription::AsrModel::QwenAudioOnline
-                        });
+                    let is_streaming_asr = desired_asr_model_check.is_online_streaming()
+                        && transcriber
+                            .as_ref()
+                            .is_some_and(|t| t.asr_model().is_online_streaming());
 
                     if is_streaming_asr {
                         // OVERLAY-051-E: notify controller that online streaming ASR is waiting for first text
@@ -4209,6 +4214,8 @@ fn spawn_worker_thread(
                         let transcriber_ref = transcriber.as_ref().expect("checked above");
                         let asr_online_url = transcriber_ref.asr_online_url().to_string();
                         let asr_online_model = transcriber_ref.asr_online_model().to_string();
+                        let asr_online_max_sentence_silence =
+                            transcriber_ref.asr_online_max_sentence_silence();
                         let qwen_api_key = config.audio.asr_online_api_key.clone();
                         let model_dir_clone = model_dir.clone();
                         let cancel_clone = Arc::clone(&cancel_signal);
@@ -4227,6 +4234,7 @@ fn spawn_worker_thread(
                                     &asr_online_model,
                                     chunk_rx,
                                     &vocabulary,
+                                    asr_online_max_sentence_silence,
                                     &model_dir_clone,
                                     Some(&cancel_clone),
                                     |display_text, words| {
@@ -5194,18 +5202,18 @@ fn select_preprocessing_params(asr_model: transcription::AsrModel) -> (usize, us
         transcription::AsrModel::Performance => {
             (PERF_SILENCE_HEAD_SAMPLES, PERF_ONSET_BACKTRACK_SAMPLES)
         }
-        transcription::AsrModel::QwenAudioOnline => {
-            // DEC-028 / RESEARCH-ASR-038 / ASR-038-B / ASR-041-B: 在线 ASR 模型
+        transcription::AsrModel::QwenAudioOnline | transcription::AsrModel::FunAsrRealtime => {
+            // DEC-028 / RESEARCH-ASR-038 / ASR-038-B / ASR-041-B / ASR-056: 在线 ASR 模型
             // （在线模型对前导静音不敏感，保持与 CTC 一致的前处理行为）
             //
             // ASR-038-B 真流式拍板后更新：
             // silence_head / onset_backtrack 是批处理前处理概念，在 run_pipeline_core
-            // 用于 trim/pad 完整 samples 数组后送转录。真流式路径（QwenAudioOnline
-            // 走 record_streaming + transcribe_streaming_realtime）【绕过】本前处理，
+            // 用于 trim/pad 完整 samples 数组后送转录。真流式路径（QwenAudioOnline /
+            // FunAsrRealtime 走 record_streaming + transcribe_streaming_realtime）【绕过】本前处理，
             // 原因是边录边发无完整 samples 可 trim。真流式的前导静音由 VAD 入口门控
             // 处理（VAD 命中前的 chunk 缓冲后补发，不裁剪），详见 transcribe_streaming_realtime。
             // 本 match 分支仅对非流式回退路径（transcribe_with_punct_info 内的
-            // QwenAudioOnline 分支）生效，真流式主路径不走这里。
+            // QwenAudioOnline/FunAsrRealtime 分支）生效，真流式主路径不走这里。
             (PERF_SILENCE_HEAD_SAMPLES, PERF_ONSET_BACKTRACK_SAMPLES)
         }
     }
@@ -7071,9 +7079,11 @@ mod overlay_shimmer_tests {
 
     #[test]
     fn preprocessing_params_online_asr_follows_performance() {
-        // ASR-041-B: 在线 ASR 沿用 performance 前处理参数（0ms head / 200ms backtrack）
+        // ASR-041-B / ASR-056: 在线 ASR（两族）沿用 performance 前处理参数（0ms head / 200ms backtrack）
         let (online_head, online_bt) =
             select_preprocessing_params(transcription::AsrModel::QwenAudioOnline);
+        let (fun_asr_head, fun_asr_bt) =
+            select_preprocessing_params(transcription::AsrModel::FunAsrRealtime);
         let (perf_head, perf_bt) =
             select_preprocessing_params(transcription::AsrModel::Performance);
         assert_eq!(
@@ -7085,6 +7095,15 @@ mod overlay_shimmer_tests {
             online_bt, perf_bt,
             "online ASR backtrack ({}) must equal performance backtrack ({})",
             online_bt, perf_bt
+        );
+        // ASR-056: FunAsrRealtime 与 QwenAudioOnline 前处理参数一致
+        assert_eq!(
+            fun_asr_head, online_head,
+            "FunAsrRealtime head must equal QwenAudioOnline head"
+        );
+        assert_eq!(
+            fun_asr_bt, online_bt,
+            "FunAsrRealtime backtrack must equal QwenAudioOnline backtrack"
         );
     }
 }

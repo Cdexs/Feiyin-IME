@@ -41,7 +41,9 @@ const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
   useEffect(() => {
     return () => {
       const { asrModel: lastModel, config: lastConfig } = latestRef.current;
-      if (lastModel === 'qwen_audio_online' && !lastConfig.audio?.asr_online_api_key) {
+      // ASR-056: 两族在线 ASR 无 key 退出时都回落到 prevModel
+      if ((lastModel === 'qwen_audio_online' || lastModel === 'fun_asr_realtime')
+          && !lastConfig.audio?.asr_online_api_key) {
         updateConfig({
           ...lastConfig,
           audio: { ...lastConfig.audio, asr_model: prevModelRef.current }
@@ -77,13 +79,26 @@ const loadDevices = async () => {
   };
 
   const handleAsrModelChange = (value: string) => {
-    if (value === 'qwen_audio_online' && asrModel !== 'qwen_audio_online') {
+    // ASR-056: 两族在线 ASR 切换时都记录 prevModel（cleanup 回落用）
+    if ((value === 'qwen_audio_online' || value === 'fun_asr_realtime')
+        && asrModel !== value) {
       prevModelRef.current = asrModel;
     }
-    if (value === 'qwen_audio_online' && !config.audio?.asr_online_api_key) {
+    if ((value === 'qwen_audio_online' || value === 'fun_asr_realtime')
+        && !config.audio?.asr_online_api_key) {
       setQwen3TestStatus('idle');
     }
-    handleAudioChange('asr_model', value);
+    // ASR-056: 切换在线族时同步 asr_online_model 为该族默认串。
+    // 前缀守卫在主程序 load 时已兜底，这里主动同步避免守卫 warn 噪音。
+    if (value === 'qwen_audio_online') {
+      handleAudioChange('asr_online_model', 'qwen-audio-3.0-asr-flash-streaming');
+      handleAudioChange('asr_model', value);
+    } else if (value === 'fun_asr_realtime') {
+      handleAudioChange('asr_online_model', 'fun-asr-realtime');
+      handleAudioChange('asr_model', value);
+    } else {
+      handleAudioChange('asr_model', value);
+    }
   };
 
   const handleTestQwen3Connection = async () => {
@@ -154,6 +169,7 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
       case 'performance': return t.voice_asr_model_performance_desc;
       case 'accuracy': return t.voice_asr_model_accuracy_desc;
       case 'qwen_audio_online': return t.voice_asr_model_qwen3_desc;
+      case 'fun_asr_realtime': return t.voice_asr_model_fun_asr_desc;
       default: return '';
     }
   };
@@ -189,6 +205,7 @@ const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.rea
           >
             <option value="performance">{t.voice_asr_model_performance}</option>
             <option value="qwen_audio_online">{t.voice_asr_model_qwen3}</option>
+            <option value="fun_asr_realtime">{t.voice_asr_model_fun_asr}</option>
           </select>
 
           <p className="asr-model-desc" style={{ marginTop: '8px' }}>
@@ -240,7 +257,7 @@ const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.rea
             </div>
           )}
 
-          {asrModel === 'qwen_audio_online' && (
+          {(asrModel === 'qwen_audio_online' || asrModel === 'fun_asr_realtime') && (
             <div className="qwen3-section" style={{ marginTop: '16px' }}>
               {!config.audio?.asr_online_api_key && (
                 <p className="form-hint" style={{ color: 'var(--brand-primary)', marginBottom: '8px' }}>

@@ -32,6 +32,8 @@ export const en = {
   voice_asr_model_accuracy_desc: 'Runs locally, high accuracy, suitable for long audio.',
   voice_asr_model_qwen3: 'Online Speech Recognition',
   voice_asr_model_qwen3_desc: 'Runs via cloud, uses Alibaba Cloud API for speech recognition.',
+  voice_asr_model_fun_asr: 'Online Speech Recognition - FunASR',
+  voice_asr_model_fun_asr_desc: 'Runs via cloud, FunASR Realtime model, low latency, suitable for real-time voice input.',
   voice_asr_model_download_required: 'This model requires downloading before use',
   voice_asr_model_download_url: 'Download Model',
   voice_asr_model_open_download: 'Open Download Page',

@@ -54,13 +54,75 @@ const SILENCE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 固定四语 language_hints（Gavin 拍板 + 主控定稿）
 /// 产品默认支持中英韩日，让 ASR 后端在四语范围内自动检测
 /// 正好卡 Qwen-Audio-3.0 的 4 个上限，不会截断
+///
+/// ASR-056 参数调优结论（主控 2026-08-18 裁决偏向低延迟）：
+/// - language_hints 是「提示」非「约束」，列四种不会拖慢识别（服务端用其调路由，不增加搜索空间）
+/// - 限缩到 ["zh","en"] 会损失日韩用户识别能力，且中文场景下日韩提示不增加干扰
+/// - 依据：DashScope 官方文档 language_hints 字段说明「自动检测语言，提示值不限制识别范围」
+/// - 保持四语，利准确率（覆盖用户可能说的语言），不拖慢速度
 const ASR_LANGUAGE_HINTS: &[&str] = &["zh", "en", "ja", "ko"];
 
-/// 默认模型名
+/// 默认模型名（qwen_audio_online 族）
 const DEFAULT_MODEL: &str = "qwen-audio-3.0-asr-flash-streaming";
 
-/// VAD 断句静音阈值（ms），低于默认 1300 以获得更好的「边说边出字」手感
+/// ASR-056: fun_asr_realtime 族默认模型名
+const DEFAULT_FUN_ASR_MODEL: &str = "fun-asr-realtime";
+
+/// VAD 断句静音阈值（ms）
+///
+/// ASR-056 参数调优结论（主控 2026-08-18 验收裁决）：
+/// - 官方文档默认 1300ms，范围 200-6000ms
+/// - 默认保持 800ms 基线（与 qwen 既有行为一致），不改变两族行为
+/// - 此常量是**编译期默认**，运行时由 config.toml 的
+///   `asr_online_max_sentence_silence` 隐藏字段覆盖（DEC-031，不进 UI）
+/// - 让 Gavin 的 A/B 对比能分清「fun-asr 更快」是模型带来的还是 silence 带来的：
+///   500 vs 800 可作为独立一轴单独 A/B，改 config.toml 即可，不用重新出包
 const DEFAULT_MAX_SENTENCE_SILENCE: i64 = 800;
+
+/// ASR-056: speech_noise_threshold 服务端噪声门限
+///
+/// 调优结论：**不设置**（保持默认）
+/// - 我们已有本地 VAD 前置（transcribe_streaming_realtime 阶段 1），
+///   VAD 命中前的 chunk 缓冲后补发，已过滤纯静音段
+/// - 服务端 speech_noise_threshold 是额外的一道门，设了可能在低信噪比环境下吞字
+/// - 依据：官方文档 speech_noise_threshold 默认值未知，且功能描述为「过滤背景噪声」，
+///   与本地 VAD 功能重叠。拿不准保持默认（不显式设置 = 用服务端默认），不瞎调
+/// - 不设置此字段（省略），利准确率（防吞字）
+
+/// ASR-056: heartbeat 心跳
+///
+/// 调优结论：**不设置**（保持默认）
+/// - 我们录音最长 300s（MAX_RECORD_SECONDS），finish-task 后 10s 静音超时已覆盖
+/// - 录音期间持续发送音频帧（每 100ms 一片），本身就是「心跳」，服务端不会因静音断开
+/// - 长静音场景：用户按住热键不说话，本地 VAD 2s 保底建连后会发 pre-roll + 环境噪声帧
+/// - 依据：官方文档 heartbeat 字段功能描述为「维持连接」，我们音频流本身就是持续信号
+/// - 不设置此字段，不引入额外心跳负担
+
+/// ASR-056: special_word_filter 敏感词过滤
+///
+/// 调优结论：**不设置**（保持默认 = 不开启）
+/// - 主控明确「默认不开，除非查到有理由开」
+/// - 输入法场景用户说什么都是用户自由，敏感词过滤会改写用户原话，违反输入法中立原则
+/// - 依据：主控裁定 + 输入法产品定位
+/// - 不设置此字段
+
+/// ASR-056: multi_threshold_mode_enabled 多门限模式
+///
+/// 调优结论：**不设置**（保持默认）
+/// - todo 里 ASR-PERF-052 挂了很久，官方文档对此参数描述不明确
+/// - 「多门限模式」推测是 VAD/断句的多门限判定（多个能量门限分级），可能影响断句灵敏度
+/// - 拿不准保持默认，不瞎调。依据：查不到可靠依据，保持默认
+/// - 不设置此字段
+
+/// ASR-056: 语义标点开关
+///
+/// 调优结论：保持 `false`（原值）
+/// - 我们已有本地标点引擎（CT-Transformer），且 PUNCT-GOVERNANCE-030 已治理标点全源
+/// - semantic_punctuation_enabled=true 会让服务端加标点，与本地标点引擎重复
+/// - true 更准但延迟高（服务端标点需额外推理），false 低延迟（PUNCT-GOVERNANCE-030 已让本地兜底）
+/// - 依据：PUNCT-GOVERNANCE-030 治理结论 + 低延迟优先裁决
+/// - 取值 false，利速度
+const SEMANTIC_PUNCTUATION_ENABLED: bool = false;
 
 // ===========================================================================
 // 纯函数：消息构造（可单测）
@@ -92,19 +154,31 @@ fn generate_task_id() -> String {
 /// - input: context（本批不传上下文，v1 不上）
 ///
 /// `vocabulary` 为空时省略该字段。
+///
+/// ASR-056: 参数取值按「偏向低延迟」裁决（Gavin 研究发现 fun-asr-realtime 更快）。
+/// 两族共用同一 schema，差异只在 model 名。
+/// - max_sentence_silence 由调用方传入（config.toml 隐藏字段 asr_online_max_sentence_silence，
+///   默认 800ms 保持基线，500 vs 800 可独立 A/B）
+/// - semantic_punctuation_enabled=false（本地标点引擎兜底，利速度）
+/// - language_hints=["zh","en","ja","ko"]（保持四语，利准确率，不拖慢）
+/// - speech_noise_threshold/multi_threshold_mode_enabled/heartbeat/special_word_filter
+///   均不设置（保持服务端默认，查不到可靠依据不瞎调）
 pub fn build_run_task_message(
     task_id: &str,
     model: &str,
     vocabulary: &serde_json::Value,
+    max_sentence_silence: i64,
 ) -> serde_json::Value {
+    let _ = model; // ASR-056: 参数取值对两族一致，model 名差异已在调用侧处理
     let mut parameters = serde_json::json!({
         "format": "pcm",
         "sample_rate": 16000,
         "language_hints": ASR_LANGUAGE_HINTS,
-        "semantic_punctuation_enabled": false,
-        "max_sentence_silence": DEFAULT_MAX_SENTENCE_SILENCE,
+        "semantic_punctuation_enabled": SEMANTIC_PUNCTUATION_ENABLED,
+        "max_sentence_silence": max_sentence_silence,
     });
     // 仅当 vocabulary 非空对象时注入
+    // ASR-056: vocabulary 两族都支持即时热词（同 Inference 协议），权重口径一致
     if let Some(obj) = vocabulary.as_object() {
         if !obj.is_empty() {
             parameters["vocabulary"] = vocabulary.clone();
@@ -522,6 +596,7 @@ pub fn transcribe_streaming(
     model: &str,
     samples_16k: &[f32],
     vocabulary: &serde_json::Value,
+    max_sentence_silence: i64,
     cancel_signal: Option<&std::sync::atomic::AtomicBool>,
     mut on_result: impl FnMut(&str),
 ) -> Result<String> {
@@ -543,7 +618,7 @@ pub fn transcribe_streaming(
     let hard_cap = compute_hard_cap(samples_16k.len());
 
     log::info!(
-        "QwenAudio streaming ASR: url={}, model={}, task_id={}, {} samples ({:.1}s), hard_cap={:.0}s",
+        "Online streaming ASR: url={}, model={}, task_id={}, {} samples ({:.1}s), hard_cap={:.0}s",
         url,
         model,
         task_id,
@@ -617,7 +692,7 @@ pub fn transcribe_streaming(
     .context("网络失败：设置 socket 超时失败")?;
 
     // 1. send run-task
-    let run_task = build_run_task_message(&task_id, model, vocabulary);
+    let run_task = build_run_task_message(&task_id, model, vocabulary, max_sentence_silence);
     send_json(&mut ws_socket, &run_task)?;
 
     // 2. 等 task-started
@@ -632,7 +707,7 @@ pub fn transcribe_streaming(
                 }
                 if extract_event_type(&parsed) == Some("task-started") {
                     started = true;
-                    log::info!("QwenAudio ASR task started: {}", task_id);
+                    log::info!("Online ASR task started: {}", task_id);
                     break;
                 }
                 // 其他事件忽略
@@ -657,13 +732,13 @@ pub fn transcribe_streaming(
     let pcm = f32_to_pcm16_le(samples_16k);
     let chunks = chunk_pcm_to_binary(&pcm);
     log::info!(
-        "QwenAudio ASR uploading {} binary chunks ({}ms each)",
+        "Online ASR uploading {} binary chunks ({}ms each)",
         chunks.len(),
         AUDIO_CHUNK_BYTES as u64 * 1000 / (16000 * 2)
     );
     for chunk in &chunks {
         if is_cancelled() {
-            log::info!("QwenAudio ASR cancelled by signal during upload, closing");
+            log::info!("Online ASR cancelled by signal during upload, closing");
             let _ = ws_socket.close(None);
             bail!("转录已取消");
         }
@@ -683,7 +758,7 @@ pub fn transcribe_streaming(
     let mut state = StreamingAsrState::new();
     loop {
         if is_cancelled() {
-            log::info!("QwenAudio ASR cancelled by signal during receive, closing");
+            log::info!("Online ASR cancelled by signal during receive, closing");
             let _ = ws_socket.close(None);
             bail!("转录已取消");
         }
@@ -718,7 +793,7 @@ pub fn transcribe_streaming(
                     state.on_result(id, &text, end, &[]);
                     let display = state.display_text();
                     log::debug!(
-                        "QwenAudio ASR result: id={}, end={}, text='{}', display='{}'",
+                        "Online ASR result: id={}, end={}, text='{}', display='{}'",
                         id,
                         end,
                         text,
@@ -728,7 +803,7 @@ pub fn transcribe_streaming(
                 }
                 if extract_event_type(&parsed) == Some("task-finished") {
                     log::info!(
-                        "QwenAudio ASR task finished: {} confirmed sentences",
+                        "Online ASR task finished: {} confirmed sentences",
                         state.confirmed_count()
                     );
                     let final_text = state.final_text();
@@ -773,6 +848,7 @@ pub fn transcribe_streaming_realtime(
     model: &str,
     chunk_rx: crossbeam_channel::Receiver<Vec<f32>>,
     vocabulary: &serde_json::Value,
+    max_sentence_silence: i64,
     model_dir: &std::path::Path,
     cancel_signal: Option<&std::sync::atomic::AtomicBool>,
     mut on_result: impl FnMut(&str, &[WordTiming]),
@@ -790,7 +866,7 @@ pub fn transcribe_streaming_realtime(
     let t_start = std::time::Instant::now();
 
     log::info!(
-        "QwenAudio realtime streaming ASR: url={}, model={}, task_id={}",
+        "Online realtime streaming ASR: url={}, model={}, task_id={}",
         url,
         model,
         task_id,
@@ -821,7 +897,7 @@ pub fn transcribe_streaming_realtime(
     // VAD 门控循环：读 chunk → 喂 VAD → 命中或 2s 保底即跳出
     while !connected {
         if is_cancelled() {
-            log::info!("QwenAudio realtime ASR cancelled during VAD gate");
+            log::info!("Online realtime ASR cancelled during VAD gate");
             bail!("转录已取消");
         }
 
@@ -948,7 +1024,7 @@ pub fn transcribe_streaming_realtime(
     );
 
     // send run-task
-    let run_task = build_run_task_message(&task_id, model, vocabulary);
+    let run_task = build_run_task_message(&task_id, model, vocabulary, max_sentence_silence);
     send_json(&mut ws_socket, &run_task)?;
 
     // 等 task-started
@@ -967,7 +1043,7 @@ pub fn transcribe_streaming_realtime(
                 }
                 if extract_event_type(&parsed) == Some("task-started") {
                     log::info!(
-                        "QwenAudio ASR task started: {} (+{:.0}ms from connect)",
+                        "Online ASR task started: {} (+{:.0}ms from connect)",
                         task_id,
                         t_task_started.elapsed().as_millis()
                     );
@@ -1010,7 +1086,7 @@ pub fn transcribe_streaming_realtime(
         pre_roll_samples += chunk.len();
     }
     log::info!(
-        "QwenAudio ASR pre-roll flushed: {} chunks, {} samples ({:.1}s)",
+        "Online ASR pre-roll flushed: {} chunks, {} samples ({:.1}s)",
         pre_roll_chunk_count,
         pre_roll_samples,
         pre_roll_samples as f64 / 16000.0,
@@ -1083,7 +1159,7 @@ pub fn transcribe_streaming_realtime(
                     )
                     .context("网络失败：恢复读 timeout 失败")?;
                     log::info!(
-                        "QwenAudio ASR finish-task sent after {:.1}s streaming, {} samples ({:.1}s)",
+                        "Online ASR finish-task sent after {:.1}s streaming, {} samples ({:.1}s)",
                         t_streaming.elapsed().as_secs_f64(),
                         all_samples.len(),
                         all_samples.len() as f64 / 16000.0,
@@ -1111,7 +1187,7 @@ pub fn transcribe_streaming_realtime(
                     let display = state.display_text();
                     let display_words = state.display_words();
                     log::debug!(
-                        "QwenAudio ASR result: id={}, end={}, display='{}', words={}",
+                        "Online ASR result: id={}, end={}, display='{}', words={}",
                         id,
                         end,
                         display,
@@ -1123,7 +1199,7 @@ pub fn transcribe_streaming_realtime(
                 }
                 if extract_event_type(&parsed) == Some("task-finished") {
                     log::info!(
-                        "QwenAudio ASR task finished: {} confirmed sentences",
+                        "Online ASR task finished: {} confirmed sentences",
                         state.confirmed_count()
                     );
                     let final_text = state.final_text();
@@ -1172,7 +1248,12 @@ mod tests {
     #[test]
     fn build_run_task_has_correct_schema() {
         let vocab = serde_json::json!({"测试词": 5});
-        let msg = build_run_task_message("test-task-id", "test-model", &vocab);
+        let msg = build_run_task_message(
+            "test-task-id",
+            "test-model",
+            &vocab,
+            DEFAULT_MAX_SENTENCE_SILENCE,
+        );
         assert_eq!(msg["header"]["action"], "run-task");
         assert_eq!(msg["header"]["task_id"], "test-task-id");
         assert_eq!(msg["header"]["streaming"], "duplex");
@@ -1187,7 +1268,12 @@ mod tests {
     #[test]
     fn build_run_task_model_in_payload_not_url() {
         // model 必须在 payload 里，不在 URL query（与旧协议的关键差异）
-        let msg = build_run_task_message("tid", "my-model", &serde_json::json!({}));
+        let msg = build_run_task_message(
+            "tid",
+            "my-model",
+            &serde_json::json!({}),
+            DEFAULT_MAX_SENTENCE_SILENCE,
+        );
         assert_eq!(msg["payload"]["model"], "my-model");
         // header 不应有 model
         assert!(msg["header"].get("model").is_none());
@@ -1195,7 +1281,12 @@ mod tests {
 
     #[test]
     fn build_run_task_language_hints_fixed_four() {
-        let msg = build_run_task_message("tid", "model", &serde_json::json!({}));
+        let msg = build_run_task_message(
+            "tid",
+            "model",
+            &serde_json::json!({}),
+            DEFAULT_MAX_SENTENCE_SILENCE,
+        );
         let hints = msg["payload"]["parameters"]["language_hints"]
             .as_array()
             .unwrap();
@@ -1209,7 +1300,7 @@ mod tests {
     #[test]
     fn build_run_task_vocabulary_injected_when_non_empty() {
         let vocab = serde_json::json!({"张三": 5, "李四": 4});
-        let msg = build_run_task_message("tid", "model", &vocab);
+        let msg = build_run_task_message("tid", "model", &vocab, DEFAULT_MAX_SENTENCE_SILENCE);
         assert_eq!(msg["payload"]["parameters"]["vocabulary"]["张三"], 5);
         assert_eq!(msg["payload"]["parameters"]["vocabulary"]["李四"], 4);
     }
@@ -1217,7 +1308,7 @@ mod tests {
     #[test]
     fn build_run_task_vocabulary_omitted_when_empty() {
         let vocab = serde_json::json!({});
-        let msg = build_run_task_message("tid", "model", &vocab);
+        let msg = build_run_task_message("tid", "model", &vocab, DEFAULT_MAX_SENTENCE_SILENCE);
         assert!(
             msg["payload"]["parameters"].get("vocabulary").is_none(),
             "empty vocabulary must be omitted"
@@ -1226,13 +1317,40 @@ mod tests {
 
     #[test]
     fn build_run_task_has_max_sentence_silence_800() {
-        let msg = build_run_task_message("tid", "model", &serde_json::json!({}));
+        // ASR-056: 默认 800ms 保持基线（主控 2026-08-18 验收裁决）
+        // 500 vs 800 可通过 config.toml asr_online_max_sentence_silence 隐藏字段独立 A/B
+        let msg = build_run_task_message(
+            "tid",
+            "model",
+            &serde_json::json!({}),
+            DEFAULT_MAX_SENTENCE_SILENCE,
+        );
         assert_eq!(msg["payload"]["parameters"]["max_sentence_silence"], 800);
     }
 
     #[test]
+    fn asr_056_build_run_task_max_sentence_silence_configurable() {
+        // ASR-056: max_sentence_silence 由调用方传入，可被 config.toml 覆盖
+        let msg_500 = build_run_task_message("tid", "model", &serde_json::json!({}), 500);
+        assert_eq!(
+            msg_500["payload"]["parameters"]["max_sentence_silence"],
+            500
+        );
+        let msg_800 = build_run_task_message("tid", "model", &serde_json::json!({}), 800);
+        assert_eq!(
+            msg_800["payload"]["parameters"]["max_sentence_silence"],
+            800
+        );
+    }
+
+    #[test]
     fn build_run_task_semantic_punctuation_disabled() {
-        let msg = build_run_task_message("tid", "model", &serde_json::json!({}));
+        let msg = build_run_task_message(
+            "tid",
+            "model",
+            &serde_json::json!({}),
+            DEFAULT_MAX_SENTENCE_SILENCE,
+        );
         assert_eq!(
             msg["payload"]["parameters"]["semantic_punctuation_enabled"],
             false
@@ -1251,7 +1369,12 @@ mod tests {
     #[test]
     fn finish_task_uses_same_task_id_as_run_task() {
         let task_id = "shared-id-123";
-        let run = build_run_task_message(task_id, "model", &serde_json::json!({}));
+        let run = build_run_task_message(
+            task_id,
+            "model",
+            &serde_json::json!({}),
+            DEFAULT_MAX_SENTENCE_SILENCE,
+        );
         let finish = build_finish_task_message(task_id);
         assert_eq!(run["header"]["task_id"], finish["header"]["task_id"]);
     }
@@ -1628,6 +1751,7 @@ mod tests {
             "model",
             &[0.0; 16000],
             &serde_json::json!({}),
+            800,
             None,
             |_| {},
         );
@@ -1643,6 +1767,7 @@ mod tests {
             "model",
             &[],
             &serde_json::json!({}),
+            800,
             None,
             |_| {},
         );
@@ -1716,6 +1841,7 @@ mod tests {
             "model",
             rx,
             &serde_json::json!({}),
+            800,
             std::path::Path::new("nonexistent-model-dir"),
             None,
             |_, _| {},
