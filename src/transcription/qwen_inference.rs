@@ -1833,7 +1833,7 @@ mod tests {
     fn new_sentence_id_replaces_current_words() {
         let mut state = StreamingAsrState::new();
         state.on_result(1, "第一句", true, &[wt(100, "第一"), wt(180, "句")]);
-        state.on_result(2, "第二", false, &[wtp(300, "第二", "。")]);
+        state.on_result(2, "第二。", false, &[wtp(300, "第二", "。")]);
         assert_eq!(state.display_text(), "第一句第二。");
         assert_eq!(
             state.display_words(),

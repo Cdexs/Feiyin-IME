@@ -3675,3 +3675,55 @@ overlay 停在 RECORDING 不消失（`_wait_for_overlay_not_state(RECORDING)` �
 **同样会出现在左上角**，Gavin 还没撞上。同批一并修。
 `:3490` StreamingEditing 虽也写 `[0,0]`，但流式文本态会进 `adjust_overlay_pos_size_for_text`
 重算 x/y（`:3145-3146`），当前无害 —— **但仍需清掉**，否则它是下一个陷阱。
+
+---
+
+## [EDIT-CONTROL-NO-FONT-001] 编辑态文字粗糙有锯齿：Win32 控件没设字体就退回点阵字体
+
+**日期**：2026-08-18 ｜ **发现**：Gavin 端测 ｜ **定位**：主控 Read 取证
+**Gavin 原话**：「没有进入编辑态的时候，字体显示得很圆润，没有锯齿。
+但是一旦点击进入了编辑状态，字体就显得很粗糙，有锯齿。」
+
+### 真因
+
+**全库 `grep -rn "WM_SETFONT" src/` = 0 次。**
+`create_edit_control`（`main.rs:543`）建出 EDIT 控件后设了背景刷、`GWLP_USERDATA`、
+子类化 WNDPROC、`SetPropW`，**唯独没有 `WM_SETFONT`**。
+
+Win32 控件未收到 `WM_SETFONT` 时退回 stock **`SYSTEM_FONT`** ——
+那是**位图点阵字体**，**不存在抗锯齿**，字形也不是 Segoe UI。
+
+对照：非编辑态文字由我们自己在 `WM_PAINT` 用 `create_clear_type_font`（`:322`，
+Segoe UI + `CLEARTYPE_QUALITY`）绘制 → 圆润。
+**同一个窗口，两套字体，于是一进编辑态就"变糙"。**
+
+### 🔴 教训一：现象的差异位置就是根因的位置
+
+主控此前把锯齿归因于 `apply_overlay_window_region` 的 `CreateRoundRectRgn` 硬裁剪
+（窗口圆角，1 位掩码确实无抗锯齿）—— **这个判断对本现象是错的**。
+
+**证伪只需一句**：圆角裁剪**不区分编辑态与否**，而 Gavin 明确说"非编辑态圆润、
+编辑态粗糙"。**能解释差异的原因才是根因；对两种状态一视同仁的机制，不可能造成两态差异。**
+主控当时拿着「`WM_SETFONT` 全库 0 次」这条线索却没往下追，反而去查了圆角 ——
+线索就在手上，是推理方向错了。
+
+### 🔴 教训二：「用户描述的部位」优先于「我们猜的机制」
+
+Gavin 从一开始说的就是**字体**（「字体显示得很圆润」「字体就显得很粗糙」），
+主控却把它转译成了「窗口边缘锯齿」。**转译发生的那一刻，取证方向就偏了。**
+
+### 修法（OVERLAY-054-D）
+
+`CreateWindowExW` 建出 EDIT 后立即
+`SendMessageW(edit_hwnd, WM_SETFONT, WPARAM(hfont), LPARAM(1))`，
+字体与非编辑态**同源同字号**（`create_clear_type_font(-13)`），目标是**进编辑态观感零变化**。
+
+🔴 **生命周期陷阱**：不要复用 `state.cached_font` —— 它在 `:1316` 会被 `take()` 并
+`DeleteObject`，与 EDIT 生命周期不一致，复用 = EDIT 持有已删除的 HFONT。
+须新增独立字段，并在 `destroy_edit_control` 中 **`DestroyWindow` 之后**再 `DeleteObject`。
+
+### 未处理（另行排期，本批不动）
+
+`apply_overlay_window_region` 的圆角硬裁剪确实无抗锯齿（`decisions.md:54` 佐证为老问题，
+当年胶囊改方形是绕开不是解决）。但它风险高（涉及 DWM 圆角 / Win10 回退 / layered 窗口
+四角像素），**不与视觉打磨批次混做**，否则回归归因困难。
