@@ -52,6 +52,19 @@ _SIZE_PATTERNS = {
     "processing": re.compile(r"const STATUS_OVERLAY_SIZE: \[i32; 2\] = \[(\d+),\s*(\d+)\];"),
     "focuslost": re.compile(r"const PREVIEW_OVERLAY_SIZE: \[i32; 2\] = \[(\d+),\s*(\d+)\];"),
 }
+# OVERLAY-051-G / 054-B E2E 位置断言用：从 src/main.rs 实时解析 overlay 几何契约
+# （overlay_geometry，src/main.rs:3114-3134），判据与生产同源，禁止硬编码。
+_GEOMETRY_PATTERNS = {
+    # x = work.left + (work_w - size[0]) / 2  → 水平居中
+    "center_x": re.compile(
+        r"let x = work\.left \+ \(work_w - size\[0\]\) / 2;"
+    ),
+    # y = work.top + (work_h - size[1] - OFFSET).max(0)  → 底部贴边 + OFFSET。
+    # 提取 OFFSET 值本身，方便断言直接复用（默认 64，见 overlay_geometry）。
+    "bottom_offset": re.compile(
+        r"let y = work\.top \+ \(work_h - size\[1\] - (\d+)\)\.max\(0\);"
+    ),
+}
 
 
 def _load_overlay_sizes() -> dict:
@@ -72,6 +85,63 @@ def _load_overlay_sizes() -> dict:
 
 # 状态对应窗口尺寸 (width, height)，与 src/main.rs 常量同源
 STATE_SIZES = _load_overlay_sizes()
+
+
+# OVERLAY-051-G / 054-B：几何契约同源解析（单一事实源 src/main.rs overlay_geometry）
+# 底部上移量："let y = work.top + (work_h - size[1] - <OFFSET>).max(0);"（src/main.rs:3132）
+_GEOMETRY_SRC = _SRC_MAIN_RS.read_text(encoding="utf-8")
+_offset_match = _GEOMETRY_PATTERNS["bottom_offset"].search(_GEOMETRY_SRC)
+if not _offset_match:
+    raise RuntimeError(
+        f"cannot parse overlay_geometry bottom offset from {_SRC_MAIN_RS}"
+    )
+OVERLAY_BOTTOM_OFFSET_PX = int(_offset_match.group(1))
+del _offset_match
+
+# 窗口的 MONITOR_DEFAULTTONEAREST 工作区（模拟生产 monitor_work_rect，src/main.rs:3093）
+MONITOR_DEFAULTTONEAREST = 2
+SM_CXSCREEN = 0
+SM_CYSCREEN = 1
+
+
+def get_overlay_work_area(hwnd: int) -> Optional[Tuple[int, int, int, int]]:
+    """
+    获取 overlay 所在显示器的"工作区"矩形（与生产 monitor_work_rect 同语义）。
+
+    生产代码（src/main.rs:3093-3111）：MonitorFromWindow(hwnd, DEFAULTTONEAREST)
+    + GetMonitorInfoW(rcWork)，失败时退化为全屏（GetSystemMetrics）。
+    这里用完全相同的 Win32 调用，保证 E2E 断言与产品实际几何计算同源。
+
+    Args:
+        hwnd: overlay 窗口句柄
+
+    Returns:
+        (left, top, right, bottom) 工作区坐标；失败返回 None
+    """
+    hmon = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+    if not hmon:
+        return None
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("rcMonitor", wintypes.RECT),
+            ("rcWork", wintypes.RECT),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    info = MONITORINFO()
+    info.cbSize = ctypes.sizeof(MONITORINFO)
+    if not user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+        # 退化为全屏屏幕尺寸（同生产逻辑）
+        return (
+            0,
+            0,
+            user32.GetSystemMetrics(SM_CXSCREEN),
+            user32.GetSystemMetrics(SM_CYSCREEN),
+        )
+    w = info.rcWork
+    return (w.left, w.top, w.right, w.bottom)
 
 
 class OverlayState(Enum):
