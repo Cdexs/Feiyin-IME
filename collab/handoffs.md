@@ -463,3 +463,13 @@
   **原因是它把「消融还原禁令」理解成只约束消融那一步** —— 重启后的任务书要写死：
   **整个任务期间对本仓库禁用这四条命令，不分场景**。
 - **重启后从零重跑 TEST-EXEC-056**（四步回归 + 消融 A/B/C/D），不继承任何中间结论。
+
+## 2026-08-18 — tester-1 — TEST-EXEC-056 ✅ 阶段四全量回归 + 消融实测（重启后从零重跑，③ 真回归 0，过闸）
+- **来源**：主控派单（基线 HEAD `1668abe`，工作区 clean）。上一实例额度耗尽中断，本单从零重跑，不继承任何中间结论
+- **四步回归全过**：Step1 `cargo test` = **1113/0/11**（基线 1083，+30 全量归因：feiyin +16 = config/mod.rs +14 + transcription/mod.rs +1 + qwen_inference.rs +1；crash-reporter +14 = config 测试模块经 #[path] 编入重复计数；integration 36 不变）→ Step2 Vitest **84/84**（+6 = Voice.test.tsx 26→32）→ Step3 src-tauri **76/0**（+2 = src-tauri/config.rs 5→7）→ Step4 pytest **SKIP**（Publish/ 17:22 早于 HEAD 21:03，BUILD-021 旧包，E2E 留阶段五 Step 5）
+- **消融实测**：**A**（model_family_prefix 改回 splitn(2,'-')）→ **4 红**（实例表 + v2 回归护栏 + 2 resolve 链路，本批最重要护栏实证真能抓住）；**B**（is_online_streaming 去 FunAsrRealtime）→ **1 红**（四变体穷举）精确吻合；**C**（隐藏字段 default 改 500）→ **1 红**（默认值护栏）精确吻合；**D**（handleAsrModelChange 改回两次连调）→ **3 红**（FUN-UI-004 + FALLBACK-002 + FUNFALLBACK-002 同因扩散，证明 UI 用例断言真行为非假护栏）
+- **还原自证**：四次消融均编辑器还原（禁 git reset/checkout/stash/clean），每次 `git diff -w` 0 字节；终态工作区完全 clean（status/diff -w/diff --ignore-cr-at-eol 全空）；复跑 cargo test 1113/0/11 + Vitest 84/84 + src-tauri 76/0 逐数一致
+- **红条三分类**：③ 真回归 **0** / ① 0 / ② 0，过闸无阻塞项
+- **红线合规**：版本号 0.8.1 未动 / 未 commit / 未出包（BUILD-022 待主控下令）/ 未 push
+- **详情**：outbox/tester-1/result.md + logs/20260818.md + CHANGELOG.md
+→27 高度 28→16 断崖；新语义 `height = desired.min(available).max(1)`（尽量给、最多给到 available）。调用侧 `log::error!` 不变。真实运行域 tm≈17~19 新旧逐位一致。
