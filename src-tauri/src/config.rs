@@ -507,6 +507,11 @@ mod tests {
             "qwen-audio-3.0-asr-flash-streaming",
             "mirror asr_online_model default must match main config"
         );
+        assert_eq!(
+            cfg.audio.asr_online_max_sentence_silence,
+            800,
+            "mirror asr_online_max_sentence_silence default must match main config (800ms)"
+        );
         // alias 字段名同步（镜像缺 alias 也会静默丢数据，041-B 已补）
         assert_eq!(cfg.audio.asr_online_api_key, "");
     }
@@ -531,6 +536,25 @@ mod tests {
         assert_eq!(
             loaded.audio.asr_online_model, "fun-asr-realtime",
             "ASR-056: fun-asr-realtime model id must survive mirror roundtrip"
+        );
+    }
+
+    /// TEST-SYNC-056 ④: 隐藏字段 asr_online_max_sentence_silence 镜像往返不丢
+    /// （038-A 同款：镜像缺字段会让 UI 保存时静默丢弃主程序写入的值）。
+    #[test]
+    fn mirror_asr_online_max_sentence_silence_roundtrip() {
+        let path = temp_config_path("silence_roundtrip");
+        cleanup(&path);
+        let mut cfg = make_minimal_cfg_with_asr_model("performance");
+        cfg.audio.asr_online_max_sentence_silence = 500;
+        cfg.llm.system_prompt = default_system_prompt();
+        cfg.save_to(&path).unwrap();
+
+        let loaded = AppConfig::load_from(&path).unwrap();
+        cleanup(&path);
+        assert_eq!(
+            loaded.audio.asr_online_max_sentence_silence, 500,
+            "mirror must roundtrip hidden max_sentence_silence field (silent-drop guard)"
         );
     }
 

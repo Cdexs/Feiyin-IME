@@ -1735,6 +1735,35 @@ clipboard_delay_ms = 150
         );
         assert_eq!(model_family_prefix("my-custom-model"), "my-custom");
         assert_eq!(model_family_prefix("nodash"), "nodash");
+        // TEST-SYNC-056: 实例表 ≥6（补两段/单段/大小写边界）
+        assert_eq!(model_family_prefix("single-dash"), "single-dash");
+        assert_eq!(model_family_prefix("Fun-ASR-Realtime"), "fun-asr");
+        assert_eq!(model_family_prefix("Qwen-Audio-3.0-asr"), "qwen-audio");
+    }
+
+    /// TEST-SYNC-056 ①: v2 回归护栏——断言 prefix 严格短于入参（不等于入参本身）。
+    ///
+    /// 🔴 splitn 是最多分 N 段不是取前 N 段，2026-08-18 在此翻车一次：
+    /// `splitn(2, "-")` 会把余下全部留在第二段，拼回等于原串，
+    /// 于是与 known_prefixes 永远比不上、守卫静默失效。
+    /// 谁再写成 splitn 拼回原串，这个 `assert_ne!` 立刻红。
+    #[test]
+    fn asr_056_model_family_prefix_v2_splitn_regression_guard() {
+        for input in [
+            "qwen-audio-3.0-asr-flash-streaming",
+            "fun-asr-realtime-2025-11-07",
+            "my-custom-model-extra",
+        ] {
+            let prefix = model_family_prefix(input);
+            assert_ne!(
+                prefix, input,
+                "prefix 必须不等于入参：splitn(2) 拼回等于原串是守卫静默失效的元凶"
+            );
+            assert!(
+                prefix.len() < input.len(),
+                "prefix 必须严格短于入参：splitn(2) 会把余下全部留在第二段"
+            );
+        }
     }
 
     /// ASR-056: load() 路径前缀守卫集成——选 fun_asr_realtime 但配置串是 qwen 的应回落
@@ -1766,5 +1795,32 @@ clipboard_delay_ms = 150
         } else {
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    /// TEST-SYNC-056 ④: 隐藏字段 asr_online_max_sentence_silence 默认 800ms
+    /// （DEC-031 不进 UI，主控 2026-08-18 裁决保持基线，500 vs 800 留作独立 A/B 轴）。
+    #[test]
+    fn asr_056_config_hidden_field_default_silence_800() {
+        let cfg = AppConfig::default();
+        assert_eq!(
+            cfg.audio.asr_online_max_sentence_silence, 800,
+            "hidden field default must be 800ms (main config side)"
+        );
+    }
+
+    /// TEST-SYNC-056 ④: 隐藏字段 save→load 往返不丢（038-A 同款防镜像丢字段）。
+    /// 用 TestEnv 临时目录，不碰真实 config.toml。
+    #[test]
+    fn asr_056_config_hidden_field_roundtrip_persists() {
+        let env = TestEnv::new();
+        let path = env.config_path();
+        let mut cfg = AppConfig::default();
+        cfg.audio.asr_online_max_sentence_silence = 500;
+        cfg.save_to(&path).unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert_eq!(
+            loaded.audio.asr_online_max_sentence_silence, 500,
+            "hidden field must survive save→load roundtrip"
+        );
     }
 }

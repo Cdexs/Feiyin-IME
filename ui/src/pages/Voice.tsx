@@ -90,15 +90,25 @@ const loadDevices = async () => {
     }
     // ASR-056: 切换在线族时同步 asr_online_model 为该族默认串。
     // 前缀守卫在主程序 load 时已兜底，这里主动同步避免守卫 warn 噪音。
-    if (value === 'qwen_audio_online') {
-      handleAudioChange('asr_online_model', 'qwen-audio-3.0-asr-flash-streaming');
-      handleAudioChange('asr_model', value);
-    } else if (value === 'fun_asr_realtime') {
-      handleAudioChange('asr_online_model', 'fun-asr-realtime');
-      handleAudioChange('asr_model', value);
-    } else {
-      handleAudioChange('asr_model', value);
-    }
+    //
+    // 🔴 必须一次 updateConfig 写两个字段（FUN-UI-004，tester-1 阶段三查出）：
+    // handleAudioChange 每次都从**本次渲染捕获的** config 展开，连续调用两次时
+    // 第二次会用同一份陈旧 config 覆盖第一次的结果 —— asr_online_model 的同步
+    // 直接丢失。改为单次 patch 提交。
+    const familyModelId =
+      value === 'qwen_audio_online'
+        ? 'qwen-audio-3.0-asr-flash-streaming'
+        : value === 'fun_asr_realtime'
+          ? 'fun-asr-realtime'
+          : null;
+    updateConfig({
+      ...config,
+      audio: {
+        ...config.audio,
+        asr_model: value,
+        ...(familyModelId ? { asr_online_model: familyModelId } : {})
+      }
+    });
   };
 
   const handleTestQwen3Connection = async () => {
