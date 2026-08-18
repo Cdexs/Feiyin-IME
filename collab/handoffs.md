@@ -391,3 +391,36 @@
 - **验证**：`npx tsc --noEmit` 0 error / `cargo check --all-targets` 0 error（白名单内）；未跑测试执行类命令（消融实测留阶段四 TEST-EXEC-049/051/053）
 - **红线合规**：版本号 0.8.0 未动 / 未 commit / 未改 coder-2 判据 / `src/**` 生产零改动（仅测试模块）
 - **详情**：outbox/tester-1/result.md + logs/20260817.md + CHANGELOG.md
+
+## 2026-08-18 — coder-1 — OVERLAY-051-G-FIN ✅ 051-G 收尾：时间戳驱动回放（纠正方向，src/main.rs + qwen_inference.rs +264/-58，待主控验收）
+
+- **来源**：昨天被打断的 051-G 半成品是「固定速率打字机」（每字 clamp 180-350ms、backlog 摊 1000ms、超 20 字 jump），违反 Gavin 三条指示（时间戳驱动/不压缩停顿/words 空退回立即显示）。基线 HEAD 12f0915
+- **改动**（仅 src/main.rs + src/transcription/qwen_inference.rs +264/-58）：
+  1. 修编译错误（qwen_inference.rs:1653 测试闭包 |_, _|{} 适配 :712 新签名 FnMut(&str, &[WordTiming])）
+  2. WordTiming 补 end_time/punctuation 两字段（缺字段降级不整条丢弃，官方 schema 取证 asr-qwen-audio-3.0-integration-001.md:105-107）
+  3. **words 累积放 StreamingAsrState**（关键设计，避免原 WIP 的 extend 合并 bug）：增 confirmed_words/current_words 字段 + on_result 扩 words 参数（与文本同构）+ display_words()；回调每次下发与 display_text 完全对齐的全量词表 → overlay 侧 UpdateWordTimings 整体替换
+  4. 删 compute_tween_advance + 5 速率常量 + 9 测试，新增 reveal_chars_by_timeline 纯函数（契约：words 空→立即全显/以 words[0].begin_time 取差值不依赖绝对起点/不压缩停顿/单调不回退/.min(total_chars) 宁可多显绝不少显）
+  5. RecordingWithText 分支改时间戳驱动（origin 墙钟 + reveal_chars_by_timeline + .max(displayed) 单调 + 降级 words 空立即全显）+ 四个清理点补 word_timings.clear/tween_audio_origin=None 防跨会话复用
+- **自证**：① words 累积放 StreamingAsrState 与文本同构（end=true push confirmed 并清空 current；同 id 整体替换 current；新 id 换 id 替换 current）→ display_words 与 display_text 字符级对齐 → UpdateWordTimings 整体替换无合并 bug；② reveal_chars_by_timeline 五契约逐条推演（words 空→total_chars；words[0].begin_time 取差值 1.5s pre-roll 消掉；不压缩停顿无上限下限；.max(displayed) 单调；.min(total_chars) 宁可多显）；③ 降级路径 src/main.rs:1365 word_timings.is_empty()→立即全显；④ 四个清理点补防跨会话复用；⑤ 未动三条历史红线（InvalidateRect bErase=false/interpolate_step/STREAMING_STOPPED）
+- **验证**：cargo fmt clean / cargo check --all-targets 0 error（99 既有 warnings 无新增）/ cargo check src-tauri --all-targets 0 error / git diff --stat 仅两文件 +264/-58 / 残留自查全空（grep 不到 compute_tween_advance 及 5 常量）/ 版本号 0.8.0 三处未动
+- **红线合规**：未碰 src/audio/**/src/vad.rs/ui/**/src-tauri/**/tests/**（文件域独占）/ 未跑 cargo test/build（阶段一）/ 未 push / 未 commit（主控统一提交）/ 版本号 0.8.0 未动
+- **Gavin -debug 实证前暂定参数**：无新常量引入（删掉了 5 个）。时间戳驱动完全依赖服务端 words[].begin_time，无任何人为参数。下一棒 tester-1 出诊断包 → Gavin 跑 -debug 看 words=N 实际值校准：① 词表是否覆盖完整文本；② begin_time 差值是否与墙钟对齐
+- **详情**：outbox/coder-1/result.md + logs/20260818.md + CHANGELOG.md（OVERLAY-051-G-FIN 条目）+ docs/MACOS-HANDOFF.md §OVERLAY-051-G-FIN
+
+## 2026-08-18 — coder-1 — OVERLAY-054-B-FIX ✅ 录音窗口闪左上角修复（类型层面根治，src/main.rs，待主控验收）
+
+- **来源**：Gavin 2026-08-18 端测第二次报同一现象（上一轮只修本地模型路径，在线路径没修）。录音开始窗口先闪屏幕左上角再跳回正确位置
+- **根因**（主控已 Read 取证三步闭环）：show_overlay_streaming_idle 绕过 overlay_geometry 硬写 pos:[0,0]（在线流式第一次 Show）；OVERLAY-046 恢复无条件 SetWindowPos 后 [0,0] 真的生效 → 窗口摆到左上角；随后第一条 StreamingText 走 show_overlay 算出正确位置 → 窗口跳一下。三处 pos:[0,0] 的实际危害：streaming_idle 真错位（Gavin 看到的）/ FocusLost 真错位（注入失败提示框会出现在左上角）/ StreamingEditing 当前无害（adjust_overlay_pos_size_for_text 重算 x/y 忽略传入 pos）但同样要清
+- **改动**（仅 src/main.rs，与 051-G-FIN 同文件串行无冲突）：
+  1. OverlayRequest.pos 从 [i32;2] 改为 Option<[i32;2]>（None=调用方无位置可给，overlay 线程 Show 时解析）
+  2. Show 端入口 unwrap_or_else(|| overlay_geometry(&request.status, hwnd).0) 解析，写回 Some(resolved_pos) —— 在 overlay 线程内算比调用侧算更对（monitor_work_rect 解析的是 overlay 窗口所在显示器，多屏时调用侧 hwnd 可能不同块）
+  3. streaming 分支用 final_pos 局部变量跟踪，最终 request.pos = Some(final_pos)
+  4. SetWindowPos 读 resolved_pos（已解析）而非 request.pos[0]
+  5. 插值路径 req.pos.unwrap_or([0,0]) 兜底（state.request 存的已是 Some）
+  6. 9 个构造点：3 处 [0,0] 改 None（streaming_idle/FocusLost/StreamingEditing）；4 处已算好位置改 Some(pos)；1 处 overlay 线程内 .. 模式匹配不改；1 处 show_overlay 改 Some(pos)
+- **同批 051-G-FIN 尾部托底修复**：reveal_chars_by_timeline 循环记录 broke_early，若无 break（全部词到期）→ return total_chars（词表覆盖不到的尾部一并放出，契约 5「宁可多显绝不少显」的托底，修前尾部差额卡到松键 flush 才补上，端测表现是最后一两字迟迟不上屏）
+- **自证**：① grep "pos:[0,0]" 零命中；② OverlayRequest.pos 已是 Option<[i32;2]>（:182）；③ Show 端 unwrap_or_else 兜底（:1044）；④ 9 构造点逐点对照表（见 result.md）；⑤ 三条红线未动（OVERLAY-046 无条件 SetWindowPos 仅改读 resolved_pos 不改调用 / InvalidateRect bErase=false / 051-G 揭示+interpolate_step+STREAMING_STOPPED）
+- **验证**：cargo fmt clean / cargo check --all-targets 0 error / cargo check src-tauri --all-targets 0 error / git diff --stat 仅 src/main.rs + qwen_inference.rs / 版本号 0.8.0 三处未动
+- **红线合规**：未跑 cargo test/build（阶段一）/ 未 push / 未 commit（主控统一提交）/ 未碰 src/audio/**/src/vad.rs/ui/**/src-tauri/**/tests/**
+- **详情**：outbox/coder-1/result.md + logs/20260818.md + CHANGELOG.md + docs/MACOS-HANDOFF.md §OVERLAY-054-B-FIX
+

@@ -979,6 +979,39 @@ coder-1 自证里报「三份 locale = 111:111:111 一致」，等式不成立 �
 
 ---
 
+## 🟡 2026-08-18 上午 · OVERLAY-051-G-FIN 已交付待验收 —— coder-1 完成
+
+| 项 | 值 |
+| --- | --- |
+| HEAD | `12f0915`；工作区**非 clean**（051-G 在途，`main.rs` +270 / `qwen_inference.rs` +45） |
+| Worker | coder-1 **已交付**（051-G 收尾完成，待主控验收）／ coder-2 **待命**（054-B/C/D/E 全在 `main.rs`，文件冲突，本轮不派）／ tester-1 **待命**（等阶段三 TEST-SYNC） |
+| 主控实测 | `cargo check --all-targets` ✅ 0 error（coder-1 修完编译 + 方向纠正完成） |
+| 方向纠偏 | ✅ 已纠正：删 `compute_tween_advance` + 5 常量 + 9 测试，新增 `reveal_chars_by_timeline`（时间戳驱动，不压缩停顿，words 空退回立即显示） |
+| 决策补记 | `decisions.md` **DEC-054**（时间戳驱动回放 + 三个坑处理口径） |
+| 未 push | 本地 ahead **3**（`0049c33` / `8fd9767` / `12f0915`），Gavin 未授权，不得自动 push |
+
+**下一棒**：coder-1 交付 → 主控验收（Read + `cargo check`）→ 阶段三 TEST-SYNC → 阶段四回归 →
+E2E 门禁 → 出诊断包 → **Gavin 跑一次 `-debug` 看 `words=N`**（回放参数校准的唯一数据源）。
+
+---
+
+### 进展更新（当日滚动）
+
+| 时间 | 事件 |
+| --- | --- |
+| 11:14 | `OVERLAY-051-G-FIN` 派发 coder-1（含方向纠偏：删固定速率打字机，改时间戳驱动） |
+| ~12:0x | **Gavin 端测再报**：录音窗口先闪屏幕左上角再跳回底部。主控 Read 取证 → `OVERLAY-054-B-FIX`，根因见 troubleshooting `[OVERLAY-POS-HARDCODED-ZERO-001]`，**追加进 coder-1 同批**（同文件串行，零冲突） |
+| ~12:1x | coder-1 交付 051-G：删 `compute_tween_advance`+5 常量+9 测试，新增 `reveal_chars_by_timeline`，words 累积下沉 `StreamingAsrState`，+264/-58 两文件 |
+| 同上 | 主控 Read 验收查出**尾部字符不显示**缺口（词表覆盖不到 `total_chars` 时无路径推进，端测表现＝最后一两个字迟迟不上屏），已反馈并入本批：循环无 break ⇒ `return total_chars` |
+
+**OVERLAY-054-B 根因一句话**：`show_overlay_streaming_idle`（`main.rs:3215`）绕过 `overlay_geometry`
+硬写 `pos:[0,0]`，而 OVERLAY-046 恢复了无条件 `SetWindowPos` → 硬编码从"无害"变"真生效"。
+治本修法：`OverlayRequest.pos` 改 `Option<[i32;2]>`，Show 端 `None` 兜底算几何，
+验收判据加**全文件 `grep "pos: [0, 0]"` 零命中**（上一轮漏修一半就是因为没这条判据）。
+附带查出 `:3693` FocusLost 提示框同样错位（Gavin 还没撞上），同批修。
+
+---
+
 ## 🛑 2026-08-18 01:4x 收工交接 —— 明天从这里开始
 
 ### 状态快照

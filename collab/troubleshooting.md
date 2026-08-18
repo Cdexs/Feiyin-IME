@@ -3627,3 +3627,51 @@ overlay 停在 RECORDING 不消失（`_wait_for_overlay_not_state(RECORDING)` �
 （`qwen_inference.rs:712` 签名改 `FnMut(&str, &[WordTiming])` vs `:1645` 测试闭包 1 参 → E0593），非 harness。
 → **[E2E-CONFIG-PATH-STALE-001] 正式闭环（harness 侧），门禁自初始提交以来首次接近全绿。**
 
+
+---
+
+## [OVERLAY-POS-HARDCODED-ZERO-001] 窗口位置硬编码 `[0,0]`：一个被「上游没生效」掩盖了很久的缺陷
+
+**日期**：2026-08-18 ｜ **发现**：Gavin 端测（**第二次**报同一现象）｜ **定位**：主控 Read 取证
+
+### 现象
+
+在线流式录音，overlay **先出现在屏幕左上角，再跳到底部正确位置**。Gavin 原话：「很低级的bug」。
+
+### 根因链（三步）
+
+1. `main.rs:3186` `show_overlay()` 走 `overlay_geometry()` 算底部居中位置 —— 正常。
+2. `main.rs:3204` `show_overlay_streaming_idle()` **绕过 `overlay_geometry`，硬写 `pos: [0, 0]`**，
+   而它恰是**在线流式会话的第一次 Show**。
+3. OVERLAY-046（2026-08-17）恢复了 Show 分支的**无条件 `SetWindowPos(request.pos, …)`**
+   → `[0,0]` 从此真的生效。
+
+### 🔴 教训：修复「参数没生效」时，必须回查所有传参点
+
+`[0,0]` 这个硬编码**在 046 之前一直存在且无害** —— 因为那时 `request.pos` 根本没人读。
+046 把「窗口不定位」修好的同时，让所有传错的位置**一次性全部变成可见错位**。
+
+**通用规则**：当一个字段/参数从「被忽略」变成「真正生效」时，
+**它的每一个传入点都从"无所谓"变成了"必须正确"**，必须逐点回查，
+不能只验证自己新加的那条路径。046 当时只验了「窗口出不出现」，没查「谁在传什么位置」。
+
+### 为什么上一轮只修了一半
+
+2026-08-17 派 054-B 时，coder-2 只改了本地模型 `Recording` 路径，
+`pos: [0,0]` 还剩 3 处，其中 `:3117`（现 `:3215`）正是 Gavin 实际走的在线流式首次 Show。
+**主控当时未要求「全文件 grep 零命中」作为验收判据**，是漏网的直接原因 —— 已补进本次任务书。
+
+### 治本修法（OVERLAY-054-B-FIX）
+
+把 `OverlayRequest.pos` 改成 `Option<[i32;2]>`：`None` = 未指定 → Show 端
+`unwrap_or_else(|| overlay_geometry(&status, hwnd).0)` 兜底。
+**在 overlay 线程内算比调用侧算更对**：`monitor_work_rect(hwnd)` 解析的是 overlay 自己
+所在那块显示器，多屏下调用侧 hwnd 可能不是同一块。
+改完「忘了传位置」在类型层面即不可能，杜绝第三次复发。
+
+### 附带查出的第二处真错位
+
+`main.rs:3693` FocusLost 兜底提示（注入失败 → 复制到剪贴板的提示框）同样 `pos: [0,0]`，
+**同样会出现在左上角**，Gavin 还没撞上。同批一并修。
+`:3490` StreamingEditing 虽也写 `[0,0]`，但流式文本态会进 `adjust_overlay_pos_size_for_text`
+重算 x/y（`:3145-3146`），当前无害 —— **但仍需清掉**，否则它是下一个陷阱。

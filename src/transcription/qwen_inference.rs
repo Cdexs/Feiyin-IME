@@ -179,6 +179,67 @@ pub fn extract_sentence(msg: &serde_json::Value) -> Option<(i64, String, bool)> 
     Some((id, text, end))
 }
 
+/// OVERLAY-051-G: 一个词的时间戳信息（纯数据结构）
+#[derive(Debug, Clone, PartialEq)]
+pub struct WordTiming {
+    /// 相对音频起点的开始时间（毫秒）
+    pub begin_time: i64,
+    /// 相对音频起点的结束时间（毫秒）；缺字段时退化为 begin_time
+    pub end_time: i64,
+    /// 该词的文本
+    pub text: String,
+    /// 该词后接的标点；缺字段时退化为空串（拼接时接在 text 之后）
+    pub punctuation: String,
+}
+
+/// OVERLAY-051-G: 从 result-generated 事件提取 words 数组（纯函数，可单测）
+///
+/// 阿里云 Inference API 的 sentence 对象含 `words[]`，每个 word 有
+/// `begin_time`/`end_time`/`text`/`punctuation`。本函数提取渲染所需的四字段。
+///
+/// 降级规则（**只允许缺字段降级，不允许整条丢弃**）：
+/// - `begin_time` 缺失/非整数 → 整条跳过（没有起点无法驱动回放）
+/// - `end_time` 缺失/非整数 → 退化为 `begin_time`
+/// - `text` 缺失/非字符串 → 退化为空串
+/// - `punctuation` 缺失/非字符串 → 退化为空串
+///
+/// 返回 `Some(vec)` 当 words 字段存在且为数组（可能为空数组）；
+/// 返回 `None` 当字段缺失或非数组（降级路径判定依据）。
+pub fn extract_words(msg: &serde_json::Value) -> Option<Vec<WordTiming>> {
+    if extract_event_type(msg)? != "result-generated" {
+        return None;
+    }
+    let sentence = msg.get("payload")?.get("output")?.get("sentence")?;
+    let words = sentence.get("words")?.as_array()?;
+    let result: Vec<WordTiming> = words
+        .iter()
+        .filter_map(|w| {
+            let begin_time = w.get("begin_time")?.as_i64()?;
+            let end_time = w
+                .get("end_time")
+                .and_then(|t| t.as_i64())
+                .unwrap_or(begin_time);
+            let text = w
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            let punctuation = w
+                .get("punctuation")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(WordTiming {
+                begin_time,
+                end_time,
+                text,
+                punctuation,
+            })
+        })
+        .collect();
+    Some(result)
+}
+
 /// 从 task-failed 事件提取错误信息（纯函数，可单测）
 pub fn extract_task_error(msg: &serde_json::Value) -> Option<String> {
     if extract_event_type(msg)? != "task-failed" {
@@ -214,6 +275,9 @@ pub fn extract_usage_duration(msg: &serde_json::Value) -> Option<i64> {
 ///
 /// 维护已确认句（sentence_end=true）和当前正在变化的句。
 /// 设计依据 asr-streaming-pipeline-design-001.md §三
+///
+/// OVERLAY-051-G: 同时维护与文本同构的 words 累积（confirmed_words / current_words），
+/// 保证 `display_words()` 与 `display_text()` 字符级对齐，供时间戳驱动回放使用。
 #[derive(Debug, Clone, Default)]
 pub struct StreamingAsrState {
     /// 已确认句（sentence_end=true 的句子文本，按顺序）
@@ -222,6 +286,10 @@ pub struct StreamingAsrState {
     current_sentence: String,
     /// 当前句 ID
     current_sentence_id: i64,
+    /// OVERLAY-051-G: 已确认句对应的 word timings（与 confirmed_sentences 一一对应）
+    confirmed_words: Vec<Vec<WordTiming>>,
+    /// OVERLAY-051-G: 当前正在变化句的 word timings（与 current_sentence 同步替换）
+    current_words: Vec<WordTiming>,
 }
 
 impl StreamingAsrState {
@@ -234,15 +302,29 @@ impl StreamingAsrState {
     /// - sentence_end=true：句子确认，加入 confirmed，清空 current
     /// - sentence_end=false 且 sentence_id 相同：同一句的中间修正，替换 current
     /// - sentence_end=false 且 sentence_id 不同：新句开始，更新 current_sentence_id
-    pub fn on_result(&mut self, sentence_id: i64, text: &str, sentence_end: bool) {
+    ///
+    /// OVERLAY-051-G: `words` 参数与 `text` 完全同构处理（end=true push 进 confirmed
+    /// 并清空 current；同 id 整体替换 current；新 id 换 id 并替换 current）。
+    /// 这保证 `display_words()` 与 `display_text()` 始终字符级对齐。
+    pub fn on_result(
+        &mut self,
+        sentence_id: i64,
+        text: &str,
+        sentence_end: bool,
+        words: &[WordTiming],
+    ) {
         if sentence_end {
             self.confirmed_sentences.push(text.to_string());
+            self.confirmed_words.push(words.to_vec());
             self.current_sentence.clear();
+            self.current_words.clear();
         } else if sentence_id == self.current_sentence_id {
             self.current_sentence = text.to_string();
+            self.current_words = words.to_vec();
         } else {
             self.current_sentence_id = sentence_id;
             self.current_sentence = text.to_string();
+            self.current_words = words.to_vec();
         }
     }
 
@@ -253,6 +335,19 @@ impl StreamingAsrState {
         let mut text = self.confirmed_sentences.join("");
         text.push_str(&self.current_sentence);
         text
+    }
+
+    /// OVERLAY-051-G: 合并出完整 word timings（与 display_text 字符级对齐）
+    ///
+    /// 每次 on_result 后调用，返回与 `display_text()` 完全对齐的全量词表。
+    /// overlay 侧 `UpdateWordTimings` 直接整体替换，无需合并逻辑。
+    pub fn display_words(&self) -> Vec<WordTiming> {
+        let mut words: Vec<WordTiming> = Vec::new();
+        for sentence_words in &self.confirmed_words {
+            words.extend_from_slice(sentence_words);
+        }
+        words.extend_from_slice(&self.current_words);
+        words
     }
 
     /// 取最终文本（松键后交给 LLM）
@@ -618,7 +713,9 @@ pub fn transcribe_streaming(
                     bail!("服务端错误：{}", err);
                 }
                 if let Some((id, text, end)) = extract_sentence(&parsed) {
-                    state.on_result(id, &text, end);
+                    // OVERLAY-051-G: 非 realtime 路径不走流式 overlay，传空 words
+                    // （StreamingAsrState::on_result 签名统一，老路径无 word timings）
+                    state.on_result(id, &text, end, &[]);
                     let display = state.display_text();
                     log::debug!(
                         "QwenAudio ASR result: id={}, end={}, text='{}', display='{}'",
@@ -678,7 +775,7 @@ pub fn transcribe_streaming_realtime(
     vocabulary: &serde_json::Value,
     model_dir: &std::path::Path,
     cancel_signal: Option<&std::sync::atomic::AtomicBool>,
-    mut on_result: impl FnMut(&str),
+    mut on_result: impl FnMut(&str, &[WordTiming]),
 ) -> Result<String> {
     if api_key.trim().is_empty() {
         bail!("鉴权失败：API Key 为空");
@@ -1006,15 +1103,23 @@ pub fn transcribe_streaming_realtime(
                     bail!("服务端错误：{}", err);
                 }
                 if let Some((id, text, end)) = extract_sentence(&parsed) {
-                    state.on_result(id, &text, end);
+                    // OVERLAY-051-G: extract word timings for timestamp-driven reveal.
+                    // words 与 text 同源同构累积于 StreamingAsrState，保证 display_words()
+                    // 与 display_text() 字符级对齐。
+                    let words = extract_words(&parsed).unwrap_or_default();
+                    state.on_result(id, &text, end, &words);
                     let display = state.display_text();
+                    let display_words = state.display_words();
                     log::debug!(
-                        "QwenAudio ASR result: id={}, end={}, display='{}'",
+                        "QwenAudio ASR result: id={}, end={}, display='{}', words={}",
                         id,
                         end,
-                        display
+                        display,
+                        display_words.len()
                     );
-                    on_result(&display);
+                    // OVERLAY-051-G: 每次都下发与 display_text 完全对齐的全量词表。
+                    // overlay 侧 UpdateWordTimings 整体替换，合并逻辑归零。
+                    on_result(&display, &display_words);
                 }
                 if extract_event_type(&parsed) == Some("task-finished") {
                     log::info!(
@@ -1336,9 +1441,9 @@ mod tests {
     #[test]
     fn streaming_state_intermediate_replaces_current() {
         let mut state = StreamingAsrState::new();
-        state.on_result(1, "你好", false);
+        state.on_result(1, "你好", false, &[]);
         assert_eq!(state.display_text(), "你好");
-        state.on_result(1, "你好世界", false);
+        state.on_result(1, "你好世界", false, &[]);
         assert_eq!(state.display_text(), "你好世界");
         assert_eq!(state.confirmed_count(), 0);
     }
@@ -1346,8 +1451,8 @@ mod tests {
     #[test]
     fn streaming_state_sentence_end_confirms() {
         let mut state = StreamingAsrState::new();
-        state.on_result(1, "你好", false);
-        state.on_result(1, "你好世界", true);
+        state.on_result(1, "你好", false, &[]);
+        state.on_result(1, "你好世界", true, &[]);
         assert_eq!(state.confirmed_count(), 1);
         assert_eq!(state.final_text(), "你好世界");
         assert_eq!(state.display_text(), "你好世界");
@@ -1356,11 +1461,11 @@ mod tests {
     #[test]
     fn streaming_state_new_sentence_starts_after_confirm() {
         let mut state = StreamingAsrState::new();
-        state.on_result(1, "第一句", true);
-        state.on_result(2, "第二", false);
+        state.on_result(1, "第一句", true, &[]);
+        state.on_result(2, "第二", false, &[]);
         assert_eq!(state.display_text(), "第一句第二");
         assert_eq!(state.final_text(), "第一句");
-        state.on_result(2, "第二句", true);
+        state.on_result(2, "第二句", true, &[]);
         assert_eq!(state.display_text(), "第一句第二句");
         assert_eq!(state.final_text(), "第一句第二句");
     }
@@ -1368,9 +1473,9 @@ mod tests {
     #[test]
     fn streaming_state_multiple_sentences() {
         let mut state = StreamingAsrState::new();
-        state.on_result(1, "A", true);
-        state.on_result(2, "B", true);
-        state.on_result(3, "C", true);
+        state.on_result(1, "A", true, &[]);
+        state.on_result(2, "B", true, &[]);
+        state.on_result(3, "C", true, &[]);
         assert_eq!(state.final_text(), "ABC");
         assert_eq!(state.confirmed_count(), 3);
     }
@@ -1613,7 +1718,7 @@ mod tests {
             &serde_json::json!({}),
             std::path::Path::new("nonexistent-model-dir"),
             None,
-            |_| {},
+            |_, _| {},
         );
         assert!(result.is_err());
         assert!(

@@ -1284,3 +1284,27 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 - **ASR-055**：`src-tauri/src/qwen3.rs` 完全重写（旧 Realtime 协议 → Inference 协议），`src-tauri/src/main.rs` 读真实配置。改动在 `src-tauri/`（Tauri 设置 UI 后端），macOS 侧无 Tauri（macOS 用独立 UI），零编译影响。Inference 协议平台中立，macOS 侧若实现测试连接可用同协议。
 - **WORDBOOK-053-C**：`src/wordbook/mod.rs` 新增 `is_valid_candidate` 纯函数 + 7 条校验规则。`src/wordbook` 是平台中立模块（SQLite + 纯 Rust 逻辑），macOS 编译同份代码，校验规则自动生效。`log::debug!` 跨平台一致（release 零磁盘 IO）。
 - **WORDBOOK-053-D**：脏数据排查只读报告，无代码改动。`db_path()` 在 macOS 侧由 `src/wordbook/db.rs` 的 `cfg` 决议（DEC-011/DEC-032），与本任务无关。
+
+### OVERLAY-051-G-FIN 补充（2026-08-18）
+
+- **改动范围**：`src/main.rs` + `src/transcription/qwen_inference.rs` 两个文件。
+- **平台隔离**：所有 overlay 改动（`OverlayCommand::UpdateWordTimings`、`OverlayWindowState.word_timings/tween_audio_origin`、`RecordingWithText` 分支、`reveal_chars_by_timeline`、四个清理点）全部位于 `#[cfg(target_os = "windows")]` 区域内，macOS 编译零接触、零行为契约变化。
+- **平台中立部分**（macOS 编译同份代码，行为自动生效）：
+  - `src/transcription/qwen_inference.rs` 的 `WordTiming` 结构（4 字段：begin_time/end_time/text/punctuation）、`extract_words()` 纯函数、`StreamingAsrState` 增 `confirmed_words`/`current_words` 字段 + `on_result` 扩 `words` 参数 + `display_words()` 方法。这些是 ASR 状态机的数据层改动，平台中立。
+  - `transcribe_streaming_realtime` 回调签名 `FnMut(&str, &[WordTiming])`（macOS 若实现流式 ASR 接线需同步签名）。`transcribe_streaming`（非 realtime 老路径）传空 `&[]` 保持原语义。
+- **macOS 侧契约**（若将来实现流式 overlay 需遵守）：
+  1. **时间戳驱动，不压缩停顿**（Gavin 三条指示）：词间间隔多长就等多长，无 interval 上限/下限，无 backlog 加速
+  2. **words 为空 → 立即全显**（降级路径）
+  3. **words 与 display_text 同源累积**：在 `StreamingAsrState` 里与文本一一对应累积（end=true push 进 confirmed 并清空 current；同 id 整体替换 current；新 id 换 id 并替换 current），`display_words()` 与 `display_text()` 字符级对齐。overlay 侧 `UpdateWordTimings` 整体替换，不做合并。
+  4. **单调不回退**：`displayed` 只增不减（用 `.max(prev)`）；服务端回撤（target < displayed）→ snap 到 target
+  5. **离开 RecordingWithText（松键）→ flush 游标到全长**
+- **不可单测项**：`reveal_chars_by_timeline` 是纯函数可单测（阶段三 tester-1 负责）；overlay 调用侧依赖真实 HWND + GDI 消息循环，不可单测。
+- **Gavin -debug 实证前暂定参数**：无新常量引入（删掉了 5 个固定速率常量）。时间戳驱动完全依赖服务端 `words[].begin_time`，无任何人为参数。降级路径在 `words` 缺失时立即全显，无延迟参数。下一棒 tester-1 出诊断包 → Gavin 跑一次 `-debug` 看 `words=N` 实际值，用真实数据校准「词表是否覆盖完整文本」「begin_time 差值是否与墙钟对齐」。
+
+### OVERLAY-054-B-FIX 补充（2026-08-18）
+
+- **改动范围**：仅 `src/main.rs`（与 051-G-FIN 同文件，串行无冲突）。
+- **平台隔离**：`OverlayRequest` struct 及所有 Show 处理逻辑都在 `#[cfg(target_os = "windows")]` 区域内，macOS 编译零接触。
+- **改动内容**：`OverlayRequest.pos` 从 `[i32; 2]` 改为 `Option<[i32; 2]>`。语义：`None` = 调用方没有位置可给，overlay 线程在 Show 时通过 `overlay_geometry(&status, hwnd)` 解析默认位置。Show 端入口 `unwrap_or_else` 兜底，解析后写回 `Some(resolved)`，后续读取点保证 `Some`。
+- **macOS 侧契约**：`platform::OverlayRequest`（平台抽象层，`src/platform/mod.rs`）不受影响——它用的是 `OverlayCommand` enum 的跨平台抽象，不直接暴露 `pos` 字段。macOS 若实现 overlay 需自行决定位置解析策略，本改动的 `Option` 语义是 Windows 实现细节。
+- **红线遵守**：未动 OVERLAY-046 的无条件 `SetWindowPos`（`:1175` 区域，只是改读 `resolved_pos` 而非 `request.pos[0]`，调用本身保留）；未动 `InvalidateRect bErase=false`；未动 051-G 揭示逻辑 / `interpolate_step` / `STREAMING_STOPPED` 门闩。

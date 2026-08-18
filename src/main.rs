@@ -106,7 +106,11 @@ enum PipelineEvent {
     /// OVERLAY-051-E: 流式 ASR 已启动但尚未收到第一个文本，overlay 显示占位提示。
     StreamingIdle,
     /// ASR-038-B: 流式 ASR 增量文本（display_text 全量，供 overlay 整段覆盖）
-    StreamingText(String),
+    /// OVERLAY-051-G: 附带 word timings 供时间戳驱动揭示
+    StreamingText(
+        String,
+        Vec<crate::transcription::qwen_inference::WordTiming>,
+    ),
     Processing(String),
     Done,
     Cancelled,
@@ -153,6 +157,8 @@ enum OverlayCommand {
     /// OVERLAY-054-A: 提交编辑时先恢复 NOACTIVATE、销毁 EDIT 控件并隐藏窗口，
     /// 避免 overlay 继续持有焦点/前台，影响原窗口文本注入。
     RestoreAndHide,
+    /// OVERLAY-051-G: 更新 word timings 供时间戳驱动揭示
+    UpdateWordTimings(Vec<crate::transcription::qwen_inference::WordTiming>),
     Shutdown,
 }
 #[derive(Debug, Clone)]
@@ -169,7 +175,11 @@ enum OverlayUiEvent {
 #[cfg(target_os = "windows")]
 struct OverlayRequest {
     status: OverlayStatus,
-    pos: [i32; 2],
+    /// OVERLAY-054-B-FIX: `None` = caller has no position to give, overlay thread
+    /// resolves it via `overlay_geometry(&status, hwnd)` at Show time. This is the
+    /// type-level cure for the `[0, 0]` hardcode that made the window flash at the
+    /// top-left corner before jumping to the correct position.
+    pos: Option<[i32; 2]>,
     size: [i32; 2],
     opacity: f32,
     ui_language: config::UiLanguage,
@@ -855,6 +865,12 @@ struct OverlayWindowState {
     tween_deadline: Option<std::time::Instant>,
     /// OVERLAY-051-G: total target character count for the current tween.
     tween_target_chars: usize,
+    /// OVERLAY-051-G: start time of the current tween, for elapsed computation.
+    tween_start: Option<std::time::Instant>,
+    /// OVERLAY-051-G: word timings from ASR for timestamp-driven reveal.
+    word_timings: Vec<crate::transcription::qwen_inference::WordTiming>,
+    /// OVERLAY-051-G: wall-clock time when the first word's audio began, for offset mapping.
+    tween_audio_origin: Option<std::time::Instant>,
 }
 #[cfg(target_os = "windows")]
 struct OverlayWindowData {
@@ -958,6 +974,9 @@ fn run_overlay_thread(
         displayed_chars: 0,
         tween_deadline: None,
         tween_target_chars: 0,
+        tween_start: None,
+        word_timings: Vec::new(),
+        tween_audio_origin: None,
     }));
     let window_data = Box::new(OverlayWindowData {
         state: Arc::clone(&shared_state),
@@ -1014,6 +1033,16 @@ fn run_overlay_thread(
         while let Ok(command) = command_rx.try_recv() {
             match command {
                 OverlayCommand::Show(mut request) => {
+                    // OVERLAY-054-B-FIX: resolve `pos: None` to a real geometry here,
+                    // inside the overlay thread. This is the correct place because
+                    // `monitor_work_rect(hwnd)` resolves the monitor that the overlay
+                    // window lives on, which may differ from the caller's monitor in
+                    // multi-display setups. After this point `request.pos` is always
+                    // `Some`, so downstream readers can unwrap safely.
+                    let resolved_pos = request
+                        .pos
+                        .unwrap_or_else(|| overlay_geometry(&request.status, hwnd).0);
+                    request.pos = Some(resolved_pos);
                     // OVERLAY-043 / 051-F: coalescing + smooth interpolation for streaming text resize.
                     // Growing width bypasses throttle so text is never clipped by old window width.
                     // Shrinking/same keeps the 100ms throttle to avoid oscillation.
@@ -1022,14 +1051,16 @@ fn run_overlay_thread(
                         OverlayStatus::RecordingWithText { .. }
                             | OverlayStatus::StreamingEditing { .. }
                     );
-                    let (_computed_pos, computed_size) = if is_streaming_text {
+                    let (computed_pos, computed_size) = if is_streaming_text {
                         let now = std::time::Instant::now();
                         let mut state_guard = shared_state.lock().ok();
+                        // OVERLAY-054-B-FIX: track pos via a local since request.pos is now Option
+                        let mut final_pos = resolved_pos;
                         if let Some(ref mut state) = state_guard {
                             let (pos, desired_size) = adjust_overlay_pos_size_for_text(
                                 hwnd,
                                 &request.status,
-                                &request.pos,
+                                &resolved_pos,
                                 &state.target_size,
                             );
                             let is_growing = desired_size[0] > state.target_size[0];
@@ -1052,19 +1083,20 @@ fn run_overlay_thread(
                                 let work_w = work.right - work.left;
                                 let x = work.left + (work_w - desired_size[0]) / 2;
                                 let y = pos[1];
-                                request.pos = [x, y];
+                                final_pos = [x, y];
                             } else if let Some(size) = state.pending_size {
                                 request.size = size;
                             }
                         }
-                        (request.pos, request.size)
+                        request.pos = Some(final_pos);
+                        (final_pos, request.size)
                     } else {
                         // non-streaming: reset throttle state and use the natural geometry
                         if let Ok(mut state) = shared_state.lock() {
                             state.last_resize_time = None;
                             state.pending_size = None;
                         }
-                        (request.pos, request.size)
+                        (resolved_pos, request.size)
                     };
 
                     if let Ok(mut state) = shared_state.lock() {
@@ -1086,10 +1118,32 @@ fn run_overlay_thread(
                             // Only clear it on a fresh Recording session.
                             if matches!(request.status, OverlayStatus::Recording) {
                                 state.last_streaming_text = None;
-                                // OVERLAY-051-G: reset typewriter cursor on a fresh recording.
+                                // OVERLAY-051-G-FIN: reset typewriter cursor + timestamp-driven
+                                // state on a fresh recording session.
                                 state.displayed_chars = 0;
                                 state.tween_target_chars = 0;
                                 state.tween_deadline = None;
+                                state.tween_start = None;
+                                state.word_timings.clear();
+                                state.tween_audio_origin = None;
+                            }
+                            // OVERLAY-051-G-FIN: flush cursor when leaving RecordingWithText
+                            // (e.g. HotkeyEvent::Stop -> FallingToProcessing). This ensures
+                            // the cursor is at full length if any late packet somehow reaches
+                            // the tween path, and keeps last_streaming_text consistent.
+                            if !matches!(
+                                request.status,
+                                OverlayStatus::RecordingWithText { .. }
+                                    | OverlayStatus::Recording
+                                    | OverlayStatus::RecordingStreamingIdle
+                            ) {
+                                if state.tween_target_chars > state.displayed_chars {
+                                    state.displayed_chars = state.tween_target_chars;
+                                }
+                                state.tween_deadline = None;
+                                state.tween_start = None;
+                                state.word_timings.clear();
+                                state.tween_audio_origin = None;
                             }
                         }
                         // OVERLAY-051-C: preserve target_hwnd across Show updates that carry 0.
@@ -1118,11 +1172,15 @@ fn run_overlay_thread(
                         // at Show time, so the interpolation path below never reaches SetWindowPos.
                         // Restore an unconditional positioning here so the overlay appears at the
                         // correct location and size on every Show.
+                        // OVERLAY-054-B-FIX F1: use computed_pos (streaming 分支含水平居中后的
+                        // final_pos；non-streaming 分支是 resolved_pos)，不是入口的 resolved_pos
+                        // —— 流式文字宽度增长时水平居中 x 会变，必须用居中后的值，否则每来一批
+                        // 文字水平抖一下（旧 request.pos 走的就是居中后的值）。
                         let _ = SetWindowPos(
                             hwnd,
                             None,
-                            request.pos[0],
-                            request.pos[1],
+                            computed_pos[0],
+                            computed_pos[1],
                             computed_size[0],
                             computed_size[1],
                             SWP_NOACTIVATE | SWP_NOZORDER,
@@ -1133,6 +1191,21 @@ fn run_overlay_thread(
                         if request.auto_close_ms > 0 {
                             let _ = SetTimer(hwnd, 1, request.auto_close_ms, None);
                         }
+                    }
+                }
+                OverlayCommand::UpdateWordTimings(words) => {
+                    if let Ok(mut state) = shared_state.lock() {
+                        // OVERLAY-051-G-FIN: 整体替换（与 display_text 同源累积已在
+                        // StreamingAsrState 完成，回调每次下发全量词表）。
+                        // words 为空 → 降级路径（RecordingWithText 分支判定后立即全显）
+                        let was_nonempty = !words.is_empty();
+                        state.word_timings = words;
+                        // 首次收到非空 words 时建立 audio origin（墙钟），
+                        // 用于把 word.begin_time 差值映射到播放进度。
+                        if was_nonempty && state.tween_audio_origin.is_none() {
+                            state.tween_audio_origin = Some(std::time::Instant::now());
+                        }
+                        state.needs_repaint = true;
                     }
                 }
                 OverlayCommand::EnterEditMode => {
@@ -1149,10 +1222,13 @@ fn run_overlay_thread(
                             })
                             .or_else(|| state.last_streaming_text.clone())
                             .unwrap_or_default();
-                        // OVERLAY-051-G: when entering edit mode, stop tweening and use full text.
+                        // OVERLAY-051-G-FIN: when entering edit mode, stop tweening and use full text.
                         state.displayed_chars = text.chars().count();
                         state.tween_target_chars = state.displayed_chars;
                         state.tween_deadline = None;
+                        state.tween_start = None;
+                        state.word_timings.clear();
+                        state.tween_audio_origin = None;
                         state.request = state.request.as_mut().map(|r| {
                             r.status = OverlayStatus::StreamingEditing { text: text.clone() };
                             r.clone()
@@ -1234,6 +1310,9 @@ fn run_overlay_thread(
                         state.displayed_chars = 0;
                         state.tween_target_chars = 0;
                         state.tween_deadline = None;
+                        state.tween_start = None;
+                        state.word_timings.clear();
+                        state.tween_audio_origin = None;
                         if let Some(font) = state.cached_font.take() {
                             unsafe {
                                 let _ = DeleteObject(font);
@@ -1281,48 +1360,47 @@ fn run_overlay_thread(
                         state.needs_repaint = false;
                     }
                     OverlayStatus::RecordingWithText { ref text } => {
-                        // OVERLAY-051-G: drive typewriter tween per frame.
+                        // OVERLAY-051-G-FIN: 时间戳驱动回放（Gavin 三条指示）。
+                        // 1. words 为空 → 立即全显（降级路径）
+                        // 2. words 非空 → 按 word.begin_time 差值驱动，不压缩停顿
+                        // 3. 单调不回退：displayed 只增不减（.max(prev)）
+                        // 4. 服务端回撤（target < displayed）→ snap 到 target
+                        // 5. 离开 RecordingWithText（松键）→ flush 到全长
                         let target = text.chars().count();
-                        if state.tween_target_chars != target {
+
+                        // 服务端回撤：target 缩了 → snap（绝不能往回动画）
+                        if target < state.displayed_chars {
+                            state.displayed_chars = target;
                             state.tween_target_chars = target;
-                            let new_chars = target.saturating_sub(state.displayed_chars);
-                            let budget_ms = (new_chars * 30).clamp(150, 800) as u64;
-                            state.tween_deadline = Some(
-                                std::time::Instant::now()
-                                    + std::time::Duration::from_millis(budget_ms),
-                            );
                             state.needs_repaint = true;
                         }
+
+                        // 记录目标字符数（供离开 RecordingWithText 时 flush 判定）
+                        if state.tween_target_chars != target {
+                            state.tween_target_chars = target;
+                            state.needs_repaint = true;
+                        }
+
+                        // 时间戳驱动推进
                         if state.displayed_chars < state.tween_target_chars {
-                            let now = std::time::Instant::now();
-                            if state.tween_deadline.map_or(true, |d| now >= d) {
-                                let remaining = state.tween_target_chars - state.displayed_chars;
-                                let since_start = state
-                                    .tween_deadline
-                                    .map_or(Duration::ZERO, |d| d.saturating_duration_since(now));
-                                let budget = (state.tween_target_chars * 30).clamp(150, 800) as u64;
-                                let budget = std::time::Duration::from_millis(budget);
-                                let progress = if budget.is_zero() {
-                                    1.0
-                                } else {
-                                    1.0 - (since_start.as_millis() as f32
-                                        / budget.as_millis() as f32)
-                                };
-                                let advance =
-                                    (remaining as f32 * progress.max(0.05)).ceil() as usize;
-                                state.displayed_chars = (state.displayed_chars + advance.max(1))
-                                    .min(state.tween_target_chars);
-                                if state.displayed_chars < state.tween_target_chars {
-                                    let remaining2 =
-                                        state.tween_target_chars - state.displayed_chars;
-                                    let next_budget_ms = (remaining2 * 30).clamp(80, 400) as u64;
-                                    state.tween_deadline = Some(
-                                        now + std::time::Duration::from_millis(next_budget_ms),
-                                    );
-                                } else {
-                                    state.tween_deadline = None;
-                                }
+                            if state.word_timings.is_empty() {
+                                // 降级路径：words 不可用 → 立即全显
+                                state.displayed_chars = state.tween_target_chars;
                                 state.needs_repaint = true;
+                            } else if let Some(origin) = state.tween_audio_origin {
+                                // 正常路径：按墙钟 elapsed 对齐 word.begin_time 差值
+                                let elapsed_ms = origin.elapsed().as_millis() as i64;
+                                let revealed = reveal_chars_by_timeline(
+                                    &state.word_timings,
+                                    elapsed_ms,
+                                    state.tween_target_chars,
+                                );
+                                // 单调不回退：取 max（reveal 可能因词表覆盖不到尾部而
+                                // 小于 displayed，此时保持已显示的字符不回退）
+                                if revealed > state.displayed_chars {
+                                    state.displayed_chars = revealed;
+                                    state.needs_repaint = true;
+                                }
                             }
                         }
                         // OVERLAY-043: only repaint when text/status/size actually changed
@@ -1438,12 +1516,18 @@ fn run_overlay_thread(
         if size_interpolation_done {
             if let Ok(state) = shared_state.lock() {
                 if let Some(ref req) = state.request {
+                    // OVERLAY-054-B-FIX F2: 与 :1044 Show 端同源的兜底，不硬编码 [0,0]。
+                    // 当前 Show 端保证 Some，但一旦将来有路径让它是 None，硬编码会让窗口
+                    // 瞬间回到左上角——这正是本轮要根治的模式，必须从类型层面堵死。
+                    let pos = req
+                        .pos
+                        .unwrap_or_else(|| overlay_geometry(&req.status, hwnd).0);
                     unsafe {
                         let _ = SetWindowPos(
                             hwnd,
                             None,
-                            req.pos[0],
-                            req.pos[1],
+                            pos[0],
+                            pos[1],
                             state.current_size[0],
                             state.current_size[1],
                             SWP_NOACTIVATE | SWP_NOZORDER,
@@ -2955,6 +3039,56 @@ fn should_ignore_streaming_text(stopped: bool, editing: bool) -> bool {
     stopped && !editing
 }
 
+/// OVERLAY-051-G-FIN: 时间戳驱动回放 —— 返回此刻应显示的字符数。
+///
+/// Gavin 三条指示（不得动摇）：
+/// 1. 时间戳驱动，不用固定速率抖动缓冲
+/// 2. 停顿与用户讲话节奏一致，**不压缩停顿**（无 interval 上限/下限，无 backlog 加速）
+/// 3. `words` 不可用时退回立即显示（几百毫秒固定延迟可接受）
+///
+/// 契约：
+/// 1. `words` 为空 → 返回 `total_chars`（立即全显，降级路径）
+/// 2. 以 `words[0].begin_time` 为基准取**差值**，不依赖音频绝对起点
+///    （1.5s pre-roll 偏移在减法里消掉，不要算绝对锚点）
+/// 3. 不压缩停顿：词间间隔多长就等多长，无上限无下限
+/// 4. 单调不回退：调用侧保证 `displayed` 只增不减（用 `.max(displayed)`）
+/// 5. **词表覆盖不到的尾部一并放出**：若所有词都已到期（循环走完无 break），
+///    说明词表短于文本（标点归属差异 / words 落后于 text 等），此时直接返回
+///    `total_chars` —— **宁可多显绝不少显**，绝不让尾部差额卡到松键 flush 才补上。
+///    `.min(total_chars)` 仍作为上界保护，防止词表字符总数超过文本长度。
+///
+/// 实现：`origin_begin = words[0].begin_time`；累加所有满足
+/// `w.begin_time - origin_begin <= elapsed_ms` 的
+/// `w.text.chars().count() + w.punctuation.chars().count()`。
+#[cfg(target_os = "windows")]
+fn reveal_chars_by_timeline(
+    words: &[crate::transcription::qwen_inference::WordTiming],
+    elapsed_ms: i64,
+    total_chars: usize,
+) -> usize {
+    // 契约 1：words 为空 → 立即全显（降级路径）
+    if words.is_empty() {
+        return total_chars;
+    }
+    let origin_begin = words[0].begin_time;
+    let mut revealed: usize = 0;
+    let mut broke_early = false;
+    for w in words {
+        if w.begin_time - origin_begin <= elapsed_ms {
+            revealed += w.text.chars().count() + w.punctuation.chars().count();
+        } else {
+            // words 按 begin_time 升序排列；遇到第一个未到的词就可以停止
+            broke_early = true;
+            break;
+        }
+    }
+    // 契约 5：所有词都已到期（循环走完无 break）→ 词表覆盖不到的尾部一并放出
+    if !broke_early {
+        return total_chars;
+    }
+    revealed.min(total_chars)
+}
+
 #[cfg(target_os = "windows")]
 fn monitor_work_rect(hwnd: HWND) -> RECT {
     unsafe {
@@ -3094,7 +3228,7 @@ fn show_overlay(
     let (pos, size) = overlay_geometry(&status, HWND(overlay_handle.overlay_hwnd.0));
     overlay_handle.send(OverlayCommand::Show(OverlayRequest {
         status,
-        pos,
+        pos: Some(pos),
         size,
         opacity: overlay_opacity.clamp(0.1, 1.0),
         ui_language,
@@ -3114,7 +3248,7 @@ fn show_overlay_streaming_idle(
     // placeholder status. The target_hwnd is preserved so later submit can return focus.
     overlay_handle.send(OverlayCommand::Show(OverlayRequest {
         status: OverlayStatus::RecordingStreamingIdle,
-        pos: [0, 0],
+        pos: None,
         size: RECORDING_OVERLAY_SIZE,
         opacity: overlay_opacity.clamp(0.1, 1.0),
         ui_language,
@@ -3253,7 +3387,7 @@ fn process_controller_events(
                         );
                         overlay_handle.send(OverlayCommand::Show(OverlayRequest {
                             status: OverlayStatus::Error(msg),
-                            pos,
+                            pos: Some(pos),
                             size,
                             opacity: 0.95,
                             ui_language: config.ui_language,
@@ -3289,7 +3423,7 @@ fn process_controller_events(
                         );
                         overlay_handle.send(OverlayCommand::Show(OverlayRequest {
                             status: OverlayStatus::Recording,
-                            pos,
+                            pos: Some(pos),
                             size,
                             opacity: config.audio.overlay_opacity.clamp(0.1, 1.0),
                             ui_language: config.ui_language,
@@ -3374,7 +3508,7 @@ fn process_controller_events(
                 set_tray_state(tray, TrayState::Recording, ui_language);
                 show_overlay_streaming_idle(overlay_handle, opacity, ui_language, 0);
             }
-            PipelineEvent::StreamingText(text) => {
+            PipelineEvent::StreamingText(text, words) => {
                 // WORDBOOK-053-B: mirror the latest streaming text for the edit-learn path.
                 if let Ok(mut mirror) = last_streaming_text.lock() {
                     *mirror = Some(text.clone());
@@ -3389,7 +3523,7 @@ fn process_controller_events(
                     // Editing mode: keep the EDIT control text in sync without switching window status.
                     overlay_handle.send(OverlayCommand::Show(OverlayRequest {
                         status: OverlayStatus::StreamingEditing { text: text.clone() },
-                        pos: [0, 0],
+                        pos: None,
                         size: RECORDING_OVERLAY_SIZE,
                         opacity,
                         ui_language,
@@ -3397,6 +3531,8 @@ fn process_controller_events(
                         target_hwnd: 0,
                     }));
                 } else {
+                    // OVERLAY-051-G: store word timings for timestamp-driven reveal
+                    overlay_handle.send(OverlayCommand::UpdateWordTimings(words));
                     show_overlay(
                         overlay_handle,
                         opacity,
@@ -3452,7 +3588,7 @@ fn process_controller_events(
                 );
                 overlay_handle.send(OverlayCommand::Show(OverlayRequest {
                     status: OverlayStatus::Error(friendly_message),
-                    pos,
+                    pos: Some(pos),
                     size,
                     opacity: 0.95,
                     ui_language: config.ui_language,
@@ -3474,7 +3610,7 @@ fn process_controller_events(
                 );
                 overlay_handle.send(OverlayCommand::Show(OverlayRequest {
                     status: OverlayStatus::Error(hint.to_string()),
-                    pos,
+                    pos: Some(pos),
                     size,
                     opacity: 0.9,
                     ui_language,
@@ -3590,7 +3726,7 @@ fn process_controller_events(
                                 text: text_to_inject,
                                 copied: true,
                             },
-                            pos: [0, 0],
+                            pos: None,
                             size: PREVIEW_OVERLAY_SIZE,
                             opacity: 0.95,
                             ui_language: ui_language_for_focus,
@@ -3961,9 +4097,10 @@ fn spawn_worker_thread(
                                     &vocabulary,
                                     &model_dir_clone,
                                     Some(&cancel_clone),
-                                    |display_text| {
+                                    |display_text, words| {
                                         let _ = event_tx_clone.send(PipelineEvent::StreamingText(
                                             display_text.to_string(),
+                                            words.to_vec(),
                                         ));
                                     },
                                 )
