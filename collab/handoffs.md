@@ -424,3 +424,10 @@
 - **红线合规**：未跑 cargo test/build（阶段一）/ 未 push / 未 commit（主控统一提交）/ 未碰 src/audio/**/src/vad.rs/ui/**/src-tauri/**/tests/**
 - **详情**：outbox/coder-1/result.md + logs/20260818.md + CHANGELOG.md + docs/MACOS-HANDOFF.md §OVERLAY-054-B-FIX
 
+
+## TEST-SYNC-051G/054B · 阶段三 · coder-2 → tester-1 → 全体
+
+- **交接物**：`src/main.rs` 新增 `mod overlay_051g_reveal_tests`（T1-T8，+122）；`src/transcription/qwen_inference.rs` `mod tests` 追加（T9-T16，+210）。工作区已含两文件新增，**未 commit**。
+- **运行要求**：tester-1 阶段四 `cargo test` 请以 `export PATH="/c/Users/Aaron-GMK/.cargo/bin:$PATH"` 开头；仅白名单 `cargo fmt` / `cargo check`（DEC-048）。`cargo test` 已在消融推演列表就绪（A 删 `- origin_begin`→T2 红；B 引入 clamp→T3 红；C append 回归→T10/T12 红）。
+- **已评估未实施**：OVERLAY-054-B-FIX 的 E2E 定位断言（`state_detector.py` rect + `MonitorFromWindow` 判下半部）需构建产物，留作未来增强单独派发。
+- **提出者追加**：OVERLAY-051-G 回放 reveal 的 EST-09 命题源自既有 EST-04/05/06/07（tester-1 已置 Reflect）；OVERLAY-054-B-FIX 命题 EST-11 置为 verify-pass，spec 不新增测试要求。

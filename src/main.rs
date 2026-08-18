@@ -7015,6 +7015,128 @@ mod overlay_043_interpolate_tests {
     }
 }
 
+/// OVERLAY-051-G-FIN：时间戳驱动回放 `reveal_chars_by_timeline` 契约护栏。
+/// 每条契约一用例，防的是 Gavin 三条指示的方向性回归：
+///   1. 时间戳驱动（不用固定速率抖动缓冲）
+///   2. 停顿与讲话节奏一致、不压缩停顿（无 interval 上限/下限）
+///   3. words 不可用时退回立即显示（降级路径）
+#[cfg(all(test, target_os = "windows"))]
+mod overlay_051g_reveal_tests {
+    use super::reveal_chars_by_timeline;
+    use crate::transcription::qwen_inference::WordTiming;
+
+    fn wt(begin_ms: i64, text: &str) -> WordTiming {
+        WordTiming {
+            begin_time: begin_ms,
+            end_time: begin_ms,
+            text: text.to_string(),
+            punctuation: String::new(),
+        }
+    }
+
+    fn wtp(begin_ms: i64, text: &str, punct: &str) -> WordTiming {
+        WordTiming {
+            begin_time: begin_ms,
+            end_time: begin_ms,
+            text: text.to_string(),
+            punctuation: punct.to_string(),
+        }
+    }
+
+    /// 契约 1：`words` 为空 → 返回 `total_chars`（立即全显，降级路径），不是 0。
+    #[test]
+    fn empty_words_returns_total_chars() {
+        assert_eq!(reveal_chars_by_timeline(&[], 0, 6), 6);
+        assert_eq!(reveal_chars_by_timeline(&[], 999_999, 3), 3);
+    }
+
+    /// 契约 2：以 `words[0].begin_time` 为基准取差值。
+    /// 首词 begin_time = 1500（非 0）时，`elapsed_ms = 0` 首词应**已显示**（1 字）。
+    /// 若有人误用绝对时间戳（删掉 `- origin_begin`），本用例立即变红。
+    #[test]
+    fn relative_to_first_word_begin_time() {
+        let words = vec![wt(1500, "你"), wt(2500, "好")];
+        assert_eq!(reveal_chars_by_timeline(&words, 0, 2), 1);
+        assert_eq!(
+            reveal_chars_by_timeline(&words, 1000, 2),
+            2,
+            "两词间隔 1000ms，elapsed=1000 时两词都应显示"
+        );
+    }
+
+    /// 契约 3（Gavin 核心指示）：**不压缩停顿**。
+    /// 两词间隔 3000ms：elapsed=2999 只显 1 字，elapsed=3000 全显。
+    /// 若有人重新引入 interval 上限（如 `.min(350)`），本用例立即变红。
+    #[test]
+    fn no_pause_compression_large_gap() {
+        let words = vec![wt(1000, "你"), wt(4000, "好")];
+        assert_eq!(
+            reveal_chars_by_timeline(&words, 2999, 2),
+            1,
+            "间隔 3000ms，elapsed=2999 必须仍只显第一词"
+        );
+        assert_eq!(
+            reveal_chars_by_timeline(&words, 3000, 2),
+            2,
+            "间隔 3000ms，elapsed=3000 才应两词全显"
+        );
+    }
+
+    /// 契约 5（主控验收缺口，防复发）：词表覆盖不到的尾部一并放出。
+    /// 词表共 4 字但 total_chars=6，elapsed 足够大 → 返回 6 而非 4。
+    #[test]
+    fn tail_beyond_word_count_flushed_to_total_chars() {
+        let words = vec![
+            wt(1000, "你"),
+            wt(2000, "好"),
+            wt(3000, "世"),
+            wt(4000, "界"),
+        ];
+        assert_eq!(
+            reveal_chars_by_timeline(&words, 100_000, 6),
+            6,
+            "词表短于文本时尾部差额必须一次性放出"
+        );
+    }
+
+    /// 上界封顶：词表字符总数 > total_chars → 返回 total_chars。
+    #[test]
+    fn upper_bound_capped_at_total_chars() {
+        let words = vec![wt(1000, "你好"), wt(2000, "世界")];
+        assert_eq!(reveal_chars_by_timeline(&words, 100_000, 3), 3);
+    }
+
+    /// 标点计入字符数：text + punctuation 各计一次。
+    /// 第一词 text="你好"(2) + punctuation="。"(1) = 3；若标点被忽略结果会变 3 而非 4。
+    #[test]
+    fn punctuation_counts_into_chars() {
+        let words = vec![wtp(1000, "你好", "。"), wt(3000, "好"), wt(5000, "吧")];
+        assert_eq!(
+            reveal_chars_by_timeline(&words, 2000, 5),
+            4,
+            "你好。=3 字 + 好=1 字，elapsed=2000 时应显 4 字"
+        );
+    }
+
+    /// 多字节：用 `chars().count()` 而非字节长度。4 个汉字若按字节算为 12，结果会错。
+    #[test]
+    fn multibyte_counted_by_chars_not_bytes() {
+        let words = vec![wt(1000, "你好世界"), wt(5000, "哈")];
+        assert_eq!(
+            reveal_chars_by_timeline(&words, 3000, 5),
+            4,
+            "你好世界=4 字符（非 12 字节），elapsed=3000 时应显 4 字"
+        );
+    }
+
+    /// 边界：elapsed_ms 为负（时钟回拨）不 panic、不越界，返回 0。
+    #[test]
+    fn negative_elapsed_no_panic() {
+        let words = vec![wt(1000, "你"), wt(2000, "好")];
+        assert_eq!(reveal_chars_by_timeline(&words, -5000, 4), 0);
+    }
+}
+
 /// OVERLAY-WIRE-002：PipelineEvent → overlay 指令七分支真值表（macOS）。
 /// 调用真实 overlay_request_for_event 与真实 PipelineEvent 各变体，逐分支断言。
 /// OVERLAY-002/003 契约（已对照生产 overlay_request_for_event 核验）：

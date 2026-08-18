@@ -1749,4 +1749,214 @@ mod tests {
             "CONNECT_TIMEOUT must stay 5s, 040-A 分段埋点依赖此上限"
         );
     }
+
+    // ============================================================
+    // TEST-SYNC-051G/054B：词表累积同构护栏（StreamingAsrState）
+    // words 累积必须与 text 三分支完全同构，否则 display_words() 与
+    // display_text() 字符级对不上，时间戳回放按词表放字会与实际文本错位。
+    // ============================================================
+
+    fn wt(begin_ms: i64, text: &str) -> WordTiming {
+        WordTiming {
+            begin_time: begin_ms,
+            end_time: begin_ms,
+            text: text.to_string(),
+            punctuation: String::new(),
+        }
+    }
+
+    fn wtp(begin_ms: i64, text: &str, punct: &str) -> WordTiming {
+        WordTiming {
+            begin_time: begin_ms,
+            end_time: begin_ms,
+            text: text.to_string(),
+            punctuation: punct.to_string(),
+        }
+    }
+
+    /// T9: `sentence_end = true` → 词表进 `confirmed_words`，`current_words` 清空。
+    #[test]
+    fn sentence_end_moves_words_to_confirmed_and_clears_current() {
+        let mut state = StreamingAsrState::new();
+        let words = vec![wt(100, "你"), wtp(250, "好", "。")];
+        state.on_result(1, "你好。", false, &words);
+        state.on_result(1, "你好。", true, &words);
+        assert_eq!(state.confirmed_count(), 1);
+        assert_eq!(
+            state.display_words(),
+            words,
+            "确认后词表应完整进入 confirmed_words"
+        );
+        // 新句开始后 current_words 从新句的词表重新累积，不残留旧句
+        state.on_result(2, "今天", false, &[wt(300, "今"), wt(400, "天")]);
+        assert_eq!(state.display_text(), "你好。今天");
+        assert_eq!(
+            state.display_words(),
+            vec![
+                wt(100, "你"),
+                wtp(250, "好", "。"),
+                wt(300, "今"),
+                wt(400, "天")
+            ],
+            "confirmed_words + 新 current_words 的拼接顺序必须与文本一致"
+        );
+    }
+
+    /// T10（防重复堆叠核心护栏）：同 `sentence_id` 的中间修正 → 整体替换而非追加。
+    /// 连发 3 次同句，词表长度 = 最后一次的长度（3），不是 3 倍（9 或 6）。
+    #[test]
+    fn same_sentence_id_middle_corrections_replace_not_append() {
+        let mut state = StreamingAsrState::new();
+        state.on_result(7, "你", false, &[wt(100, "你")]);
+        state.on_result(7, "你好", false, &[wt(100, "你"), wt(150, "好")]);
+        state.on_result(
+            7,
+            "你好啊",
+            false,
+            &[wt(100, "你"), wt(150, "好"), wt(200, "啊")],
+        );
+        assert_eq!(
+            state.display_words().len(),
+            3,
+            "同句 3 次修正词表长度应为 3，若 append 会堆成 6 或 9"
+        );
+        assert_eq!(
+            state.display_words(),
+            vec![wt(100, "你"), wt(150, "好"), wt(200, "啊")],
+            "词表应为最后一次修正的内容"
+        );
+        assert_eq!(state.display_text(), "你好啊");
+    }
+
+    /// T11: 新 `sentence_id` → 换句，`current_words` 被新句替换。
+    #[test]
+    fn new_sentence_id_replaces_current_words() {
+        let mut state = StreamingAsrState::new();
+        state.on_result(1, "第一句", true, &[wt(100, "第一"), wt(180, "句")]);
+        state.on_result(2, "第二", false, &[wtp(300, "第二", "。")]);
+        assert_eq!(state.display_text(), "第一句第二。");
+        assert_eq!(
+            state.display_words(),
+            vec![wt(100, "第一"), wt(180, "句"), wtp(300, "第二", "。")]
+        );
+    }
+
+    /// T12（同源总校验，最有价值的一条）：`display_words()` 与 `display_text()`
+    /// 字符数对齐 —— 跨「两句已确认 + 一句进行中」的组合。
+    #[test]
+    fn display_words_chars_match_display_text() {
+        let mut state = StreamingAsrState::new();
+        // 已确认句 1
+        state.on_result(1, "今天天气", true, &[wt(100, "今天"), wt(250, "天气")]);
+        // 已确认句 2（含标点）
+        state.on_result(
+            2,
+            "很不错。",
+            true,
+            &[wt(400, "很"), wtp(500, "不错", "。")],
+        );
+        // 进行中句 3
+        state.on_result(3, "明天", false, &[wt(700, "明天")]);
+
+        let text_chars = state.display_text().chars().count();
+        let word_chars: usize = state
+            .display_words()
+            .iter()
+            .map(|w| w.text.chars().count() + w.punctuation.chars().count())
+            .sum();
+        assert_eq!(
+            word_chars,
+            text_chars,
+            "词表字符总数必须等于文本字符数：text={} chars={} words_chars={}",
+            state.display_text(),
+            text_chars,
+            word_chars
+        );
+        assert_eq!(state.display_text(), "今天天气很不错。明天");
+    }
+
+    // ============================================================
+    // TEST-SYNC-051G/054B：extract_words 降级护栏
+    // 语义区分：Some(vec![])（words 存在但为空）= 无时间戳但事件有效；
+    // None = 字段缺失/非数组/非 result-generated → 触发降级路径（立即全显）。
+    // ============================================================
+
+    fn result_generated_message(words: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "header": {"task_id": "tid", "event": "result-generated", "attributes": {}},
+            "payload": {
+                "output": {
+                    "sentence": {
+                        "begin_time": 0, "end_time": null,
+                        "text": "x", "sentence_end": false,
+                        "sentence_id": 1, "words": words
+                    }
+                },
+                "usage": null
+            }
+        })
+    }
+
+    /// T13: 非 `result-generated` 事件 → `None`。
+    #[test]
+    fn extract_words_non_result_event_returns_none() {
+        let msg = serde_json::json!({
+            "header": {"task_id": "tid", "event": "task-started", "attributes": {}},
+            "payload": {}
+        });
+        assert_eq!(extract_words(&msg), None);
+    }
+
+    /// T14: `words` 字段缺失 / 非数组 → `None`（降级判定依据）。
+    #[test]
+    fn extract_words_missing_or_non_array_returns_none() {
+        let missing = serde_json::json!({
+            "header": {"task_id": "tid", "event": "result-generated", "attributes": {}},
+            "payload": {"output": {"sentence": {"text": "x", "sentence_end": false, "sentence_id": 1}}}
+        });
+        assert_eq!(extract_words(&missing), None, "words 字段缺失 → None");
+
+        let non_array = serde_json::json!({
+            "header": {"task_id": "tid", "event": "result-generated", "attributes": {}},
+            "payload": {"output": {"sentence": {"words": {"a": 1}}}}
+        });
+        assert_eq!(extract_words(&non_array), None, "words 非数组 → None");
+    }
+
+    /// T15: `words` 为空数组 → `Some(vec![])`（与 `None` 语义不同，不得相混）。
+    #[test]
+    fn extract_words_empty_array_returns_some_empty() {
+        let msg = result_generated_message(serde_json::json!([]));
+        assert_eq!(extract_words(&msg), Some(vec![]));
+    }
+
+    /// T16: 缺 `end_time` → 退化为 `begin_time`；缺 `punctuation` → 空串；
+    /// 整条不得丢弃。
+    #[test]
+    fn extract_words_missing_end_time_and_punctuation_degrade_not_drop() {
+        let msg = result_generated_message(serde_json::json!([
+            {"begin_time": 123, "text": "你好"},
+            {"begin_time": 456, "end_time": 789, "text": "世界", "punctuation": "。"}
+        ]));
+        let words = extract_words(&msg).expect("words 存在且为数组 → Some");
+        assert_eq!(words.len(), 2, "缺 end_time/punctuation 的词条不得整条丢弃");
+        assert_eq!(
+            words[0],
+            WordTiming {
+                begin_time: 123,
+                end_time: 123, // 退化为 begin_time
+                text: "你好".to_string(),
+                punctuation: String::new(), // 缺字段 → 空串
+            }
+        );
+        assert_eq!(
+            words[1],
+            WordTiming {
+                begin_time: 456,
+                end_time: 789,
+                text: "世界".to_string(),
+                punctuation: "。".to_string(),
+            }
+        );
+    }
 }
