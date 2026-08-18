@@ -1017,9 +1017,14 @@ const STREAMING_TEXT_LEFT_MARGIN: i32 = 42; // left fixed: mic icon area + separ
 #[cfg(target_os = "windows")]
 const STREAMING_TEXT_RIGHT_MARGIN: i32 = 49; // right fixed: submit + stop buttons
 #[cfg(target_os = "windows")]
-const STREAMING_TEXT_TOP_MARGIN: i32 = 10; // keep inside 10px rounded-corner region
+const STREAMING_TEXT_TOP_MARGIN: i32 = 10; // keep inside 10px rounded-corner region; EDIT fallback still uses this
 #[cfg(target_os = "windows")]
-const STREAMING_TEXT_BOTTOM_MARGIN: i32 = 10;
+const STREAMING_TEXT_BOTTOM_MARGIN: i32 = 10; // EDIT fallback still uses this
+                                              // OVERLAY-054-H: vertical inset for self-drawn streaming text only. The rect center is
+                                              // identical to the old 10/10 margin (both are symmetric), so the text does not move;
+                                              // only the available height grows from 16px to 28px, which is enough for -14 ClearType.
+#[cfg(target_os = "windows")]
+const OVERLAY_TEXT_DRAW_VERTICAL_INSET: i32 = 4;
 #[cfg(target_os = "windows")]
 const STREAMING_OVERLAY_MAX_SCREEN_RATIO: f32 = 0.65;
 #[cfg(target_os = "windows")]
@@ -2377,11 +2382,14 @@ fn draw_recording_overlay_with_text(
 
     let cy = rect.top + (rect.bottom - rect.top) / 2;
 
-    // Text region dimensions
+    // OVERLAY-054-H: self-drawn streaming text uses a 4px vertical inset so the
+    // -14 ClearType font fits. The center is identical to the old 10/10 margin
+    // because both are symmetric around the window center, so the text has zero
+    // visual displacement; only the available height changes (16px -> 28px).
     let text_left = rect.left + STREAMING_TEXT_LEFT_MARGIN;
     let text_right = rect.right - STREAMING_TEXT_RIGHT_MARGIN;
-    let text_top = rect.top + STREAMING_TEXT_TOP_MARGIN;
-    let text_bottom = rect.bottom - STREAMING_TEXT_BOTTOM_MARGIN;
+    let text_top = rect.top + OVERLAY_TEXT_DRAW_VERTICAL_INSET;
+    let text_bottom = rect.bottom - OVERLAY_TEXT_DRAW_VERTICAL_INSET;
     let visible_w = (text_right - text_left).max(1);
 
     // Measure full text width
@@ -2390,7 +2398,8 @@ fn draw_recording_overlay_with_text(
     // Scroll offset so newest text stays at the right edge once text overflows
     let scroll_x = (text_width - visible_w).max(0);
 
-    // Setup clip region for text area using SaveDC/RestoreDC
+    // OVERLAY-054-H: keep the horizontal clip region unchanged. We only relaxed the
+    // vertical text rectangle; the horizontal scroll/clipping behavior is untouched.
     unsafe {
         let _ = SaveDC(hdc);
     }
@@ -2419,12 +2428,13 @@ fn draw_recording_overlay_with_text(
         let _ = RestoreDC(hdc, -1);
     }
 
-    // Text hit region (for entering edit mode) excludes the stop button
+    // Text hit region (for entering edit mode) excludes the stop button.
+    // Keep the hit region at the old 10px margin so the editable area is not shrunk.
     let text_hit_rect = RECT {
         left: text_left,
-        top: rect.top + 10,
+        top: rect.top + STREAMING_TEXT_TOP_MARGIN,
         right: text_right,
-        bottom: rect.bottom - 10,
+        bottom: rect.bottom - STREAMING_TEXT_BOTTOM_MARGIN,
     };
 
     // Right separator between text area and stop button
