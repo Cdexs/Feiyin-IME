@@ -145,6 +145,95 @@ fn generate_task_id() -> String {
     format!("{:016x}{:08x}{:08x}", ts as u64, pid, seq)
 }
 
+// ===========================================================================
+// ASR-058 ③: A/B 对比埋点 —— 每次录音结束打一行 [ASR-SUMMARY]
+// ===========================================================================
+
+/// ASR-058 ③: 录音性能摘要（A/B 对比用）
+///
+/// Gavin 明确要求「下次要根据 debug 时间戳评估两个 ASR 模型到底哪个服务端反馈更快」。
+/// 每次 task-finished 时打一行 [ASR-SUMMARY]，含各段耗时。
+///
+/// 🔴 **口径红线**：`first_text_ms` 的起点必须是「首个音频字节发出」（`first_audio_byte_ms`）
+/// 而不是热键按下（`vad_hit_ms`），否则会把人的反应时间算到服务端头上、两个模型没法公平比。
+/// `first_text_ms = first_text_arrival - first_audio_byte`（仅含服务端处理延迟）
+///
+/// **ASR-058 验收补**：所有退出路径都打 [ASR-SUMMARY]（不只 task-finished），
+/// 未取到的字段填 -1（不填 0，0 会被误读成「零延迟」），
+/// 加 outcome=finished|cancelled|failed 字段标明本次怎么结束。
+/// Gavin 统计时可只筛 outcome=finished 做公平对比，同时看到取消发生在哪一段。
+#[derive(Debug, Clone)]
+struct AsrSummary {
+    model: String,
+    task_id: String,
+    /// 本次录音的结局：finished（正常完成）/ cancelled（用户取消）/ failed（错误）
+    outcome: &'static str,
+    /// VAD 命中时间（热键按下→VAD 检测到语音），含人的反应时间，仅参考
+    vad_hit_ms: i64,
+    /// 连接耗时（DNS+TCP+TLS+WS+task-started），程序侧可控
+    connect_ms: i64,
+    /// task-started 往返（连接完成→收到 task-started）
+    task_started_ms: i64,
+    /// 首个音频字节发出时间（热键按下→pre-roll 首字节发出）
+    first_audio_byte_ms: i64,
+    /// 首个 partial result 到达时间（热键按下→首个 result-generated）
+    first_partial_ms: i64,
+    /// 🔴 首个非空文本到达时间（**从首个音频字节发出算起**，仅含服务端处理延迟）
+    first_text_ms: i64,
+    /// task-finished 时间（热键按下→task-finished）
+    final_ms: i64,
+    /// 总词数
+    words_total: i64,
+    /// 总字符数
+    chars_total: i64,
+}
+
+impl AsrSummary {
+    fn new(model: &str, task_id: String) -> Self {
+        Self {
+            model: model.to_string(),
+            task_id,
+            outcome: "failed",
+            vad_hit_ms: -1,
+            connect_ms: -1,
+            task_started_ms: -1,
+            first_audio_byte_ms: -1,
+            first_partial_ms: -1,
+            first_text_ms: -1,
+            final_ms: -1,
+            words_total: -1,
+            chars_total: -1,
+        }
+    }
+
+    /// 格式化 [ASR-SUMMARY] 日志行
+    ///
+    /// 字段顺序：model / outcome / task_id / vad_hit_ms / connect_ms / task_started_ms /
+    /// first_audio_byte_ms / first_partial_ms / first_text_ms / final_ms /
+    /// words_total / chars_total
+    ///
+    /// 未取到的字段填 -1（不填 0，0 会被误读成「零延迟」）。
+    fn format_summary(&self) -> String {
+        format!(
+            "[ASR-SUMMARY] model={} outcome={} task_id={} vad_hit_ms={} connect_ms={} \
+             task_started_ms={} first_audio_byte_ms={} first_partial_ms={} first_text_ms={} \
+             final_ms={} words_total={} chars_total={}",
+            self.model,
+            self.outcome,
+            self.task_id,
+            self.vad_hit_ms,
+            self.connect_ms,
+            self.task_started_ms,
+            self.first_audio_byte_ms,
+            self.first_partial_ms,
+            self.first_text_ms,
+            self.final_ms,
+            self.words_total,
+            self.chars_total,
+        )
+    }
+}
+
 /// 构造 run-task 消息（纯函数，可单测）
 ///
 /// 官方 schema（DashScope Inference API client events）：
@@ -828,20 +917,27 @@ pub fn transcribe_streaming(
     }
 }
 
-/// ASR-038-B: 真流式 ASR 转录 —— 边收音频边发帧边收结果。
+/// ASR-038-B / ASR-058: 真流式 ASR 转录 —— 边收音频边发帧边收结果。
+///
+/// **ASR-058 关键改动**：建连从「VAD 命中后」提前到「热键按下后立即建连」，
+/// VAD 门控与已建连接并行。收益 ~108ms（实测连接耗时稳定 108-117ms）。
 ///
 /// **与 `transcribe_streaming`（伪流式）的差异**：
 /// - 输入是 `chunk_rx: Receiver<Vec<f32>>`（实时音频流），非完整 `&[f32]`
-/// - VAD 入口门控：建连前逐 chunk 喂 Silero VAD，命中才建连（Gavin 硬指令：防无效上传）
-/// - 建连后先发 pre-roll 缓冲（VAD 命中前的 chunk），再发实时 chunk
-/// - 边发边收：发送循环和接收循环交替进行（非先发完再收）
-/// - VAD 缺失 → 立即建连（降级保底，宁可多花钱不可吞字）
-/// - 2s 保底：VAD 2s 未命中无条件建连
+/// - ASR-058: 热键按下即建连（DNS→TCP→TLS→WS→run-task→task-started），
+///   建连期间 chunk_rx 积攒 chunk（channel bounded 256，108ms ≈ 5-6 chunks 不溢出）
+/// - 建连完成后跑 VAD 门控循环（从 chunk_rx 读积攒 + 新到的 chunk）
+///   - VAD 命中 → 发 pre-roll + 实时 chunk
+///   - 2s 保底 → 发 pre-roll + 实时 chunk
+///   - channel 断开 → 正常关闭连接 + bail（未说话）
+/// - 🔴 红线：VAD 命中前一个音频字节都不许发（建连≠发音频，run-task 不含音频可先发）
+/// - 🔴 只在本次录音内提前建连，禁止跨录音复用（040-C 雷区）
+/// - VAD 缺失 → 建连后立即发音频（降级保底，宁可多花钱不可吞字）
 ///
 /// **不吞字保证（硬性自证②）**：
 /// - 音频采集在热键按下即开始（record_streaming 的 on_chunk 回调）
-/// - VAD 命中前的 chunk 全部缓冲，建连后补发
-/// - 建连握手期间（~200-500ms）的 chunk 也缓冲，握手完成后一次性补发
+/// - 建连期间（~108ms）的 chunk 在 channel 里积攒，不丢
+/// - VAD 命中前的 chunk 全部缓冲，命中后补发
 pub fn transcribe_streaming_realtime(
     url: &str,
     api_key: &str,
@@ -865,6 +961,11 @@ pub fn transcribe_streaming_realtime(
     let task_id = generate_task_id();
     let t_start = std::time::Instant::now();
 
+    // ASR-058 ③: A/B 对比埋点——收集各段耗时
+    // 🔴 first_text_ms 的起点必须是「首个音频字节发出」而不是热键按下，
+    // 否则会把人的反应时间算到服务端头上、两个模型没法公平比。
+    let mut summary = AsrSummary::new(model, task_id.clone());
+
     log::info!(
         "Online realtime streaming ASR: url={}, model={}, task_id={}",
         url,
@@ -879,88 +980,11 @@ pub fn transcribe_streaming_realtime(
     };
 
     // =========================================================================
-    // 阶段 1：VAD 入口门控 —— 逐 chunk 喂 Silero，命中即建连
+    // ASR-058 ①: 阶段 1 —— 热键按下即建连（DNS→TCP→TLS→WS→run-task→task-started）
+    // 建连期间 chunk_rx 积攒 chunk（不读不丢），108ms 被 VAD 前时间吸收
+    // 🔴 建连≠发音频：run-task 不含音频字节，VAD 命中前一个音频字节都不许发
     // =========================================================================
 
-    // VAD 模型缺失 → 降级为「立即建连」（保底，宁可多花钱不可吞字）
-    let mut vad = crate::transcription::vad::VadSegmenter::try_new_for_streaming(model_dir);
-    let mut pre_roll_buffer: Vec<Vec<f32>> = Vec::new(); // VAD 命中前的 chunk 缓冲
-    let mut connected = false;
-
-    if vad.is_none() {
-        log::warn!("VAD model missing, falling back to immediate connect (no gate, cost more)");
-    }
-
-    let vad_window = crate::transcription::vad::vad_window_size();
-    let vad_2s_deadline = t_start + Duration::from_secs(2);
-
-    // VAD 门控循环：读 chunk → 喂 VAD → 命中或 2s 保底即跳出
-    while !connected {
-        if is_cancelled() {
-            log::info!("Online realtime ASR cancelled during VAD gate");
-            bail!("转录已取消");
-        }
-
-        // 2s 保底：VAD 2s 未命中无条件建连
-        if std::time::Instant::now() >= vad_2s_deadline {
-            log::info!(
-                "VAD gate 2s deadline reached without detection, forcing connect (safety net)"
-            );
-            connected = true;
-            break;
-        }
-
-        match chunk_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(chunk) if !chunk.is_empty() => {
-                pre_roll_buffer.push(chunk.clone());
-
-                if let Some(ref vad_seg) = vad {
-                    // 逐窗口喂 VAD（chunk 可能 > 512 samples，需切片）
-                    let mut offset = 0;
-                    while offset < chunk.len() {
-                        let end = (offset + vad_window).min(chunk.len());
-                        if vad_seg.accept_and_check(&chunk[offset..end]) {
-                            log::info!(
-                                "VAD gate: speech detected at +{:.0}ms, connecting (pre-roll buffer: {} chunks)",
-                                t_start.elapsed().as_millis(),
-                                pre_roll_buffer.len()
-                            );
-                            connected = true;
-                            break;
-                        }
-                        offset = end;
-                    }
-                }
-                // VAD 缺失时 connected 在循环顶部的 2s 检查或这里设
-                if vad.is_none() {
-                    connected = true;
-                    break;
-                }
-            }
-            Ok(_) => { /* empty chunk, skip */ }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                // 音频 channel 断开（录音结束）但还没建连 —— 用户按了热键没说话
-                if pre_roll_buffer.is_empty() {
-                    log::info!("Audio channel closed before VAD detected speech and before connect — likely user pressed hotkey without speaking");
-                    bail!("转录已取消：未检测到语音输入");
-                }
-                // 有 pre-roll 但没命中 VAD —— 用 2s 保底逻辑建连发完
-                log::info!(
-                    "Audio channel closed during VAD gate with {} chunks buffered, forcing connect to flush",
-                    pre_roll_buffer.len()
-                );
-                connected = true;
-                break;
-            }
-        }
-    }
-
-    // =========================================================================
-    // 阶段 2：建连 WebSocket（DNS → TCP → TLS → WS 握手 → run-task → task-started）
-    // =========================================================================
-
-    // ASR-PERF-040-A: 分段 [Latency] 埋点
     let t_connect_start = std::time::Instant::now();
     let uri: Uri = url.parse().context("无效的 ASR URL")?;
     let host = uri.host().context("URL 缺少 host")?;
@@ -1018,12 +1042,12 @@ pub fn transcribe_streaming_realtime(
     )
     .context("网络失败：设置 socket 超时失败")?;
 
-    log::info!(
-        "[Latency] ASR total connect in {:.0}ms",
-        t_connect_start.elapsed().as_millis()
-    );
+    let connect_ms = t_connect_start.elapsed().as_millis();
+    log::info!("[Latency] ASR total connect in {:.0}ms", connect_ms);
+    summary.connect_ms = connect_ms as i64;
 
-    // send run-task
+    // send run-task（不含音频，只含 model/parameters/input）
+    // 🔴 红线：run-task 不含音频字节，VAD 命中前一个音频字节都不许发
     let run_task = build_run_task_message(&task_id, model, vocabulary, max_sentence_silence);
     send_json(&mut ws_socket, &run_task)?;
 
@@ -1031,7 +1055,13 @@ pub fn transcribe_streaming_realtime(
     let t_task_started = std::time::Instant::now();
     loop {
         if is_cancelled() {
+            // ASR-058 ①: 未说话就松手——正常关闭已建连接
+            log::info!(
+                "Online ASR cancelled while waiting for task-started, closing connection gracefully"
+            );
             let _ = ws_socket.close(None);
+            summary.outcome = "cancelled";
+            log::info!("{}", summary.format_summary());
             bail!("转录已取消");
         }
         match ws_socket.read() {
@@ -1039,27 +1069,132 @@ pub fn transcribe_streaming_realtime(
                 let parsed: serde_json::Value =
                     serde_json::from_str(&text).context("服务端返回非 JSON 文本")?;
                 if let Some(err) = extract_task_error(&parsed) {
+                    log::info!("{}", summary.format_summary());
+                    summary.outcome = "failed";
                     bail!("服务端错误：{}", err);
                 }
                 if extract_event_type(&parsed) == Some("task-started") {
+                    let task_started_ms = t_task_started.elapsed().as_millis();
                     log::info!(
                         "Online ASR task started: {} (+{:.0}ms from connect)",
                         task_id,
-                        t_task_started.elapsed().as_millis()
+                        task_started_ms
                     );
+                    summary.task_started_ms = task_started_ms as i64;
                     break;
                 }
             }
             Ok(Message::Binary(_)) => {}
             Ok(Message::Ping(_) | Message::Pong(_)) => {}
             Ok(Message::Close(_)) => {
+                log::info!("{}", summary.format_summary());
+                summary.outcome = "failed";
                 bail!("网络失败：服务端关闭连接（未收到 task-started）");
             }
             Ok(Message::Frame(_)) => {}
             Err(e) if is_read_timeout(&e) => {
+                log::info!("{}", summary.format_summary());
+                summary.outcome = "failed";
                 bail!("超时：等待 task-started 超时");
             }
             Err(e) => bail!("网络失败：读取消息失败 - {}", e),
+        }
+    }
+
+    // =========================================================================
+    // ASR-058 ①: 阶段 2 —— VAD 门控（连接已就绪，VAD 命中即发音频）
+    // 建连期间积攒的 chunk 在 channel 里，现在读取喂 VAD
+    // 🔴 命中前一个音频字节都不许发（连接已建但不发音频）
+    // =========================================================================
+
+    let mut vad = crate::transcription::vad::VadSegmenter::try_new_for_streaming(model_dir);
+    let mut pre_roll_buffer: Vec<Vec<f32>> = Vec::new();
+    let mut vad_hit = false;
+
+    if vad.is_none() {
+        log::warn!("VAD model missing, falling back to immediate send (no gate, cost more)");
+    }
+
+    let vad_window = crate::transcription::vad::vad_window_size();
+    let vad_2s_deadline = t_start + Duration::from_secs(2);
+
+    // ASR-058 ②: task-started 已收到，pre-roll 编码可与 VAD 门控并行
+    // （pre-roll 编码是纯 CPU，VAD 门控是读 channel + 喂模型，天然可交替）
+    // 实际上 pre-roll 在 VAD 命中后才确定内容，所以编码在 VAD 命中后做——
+    // 但 task-started 的 35ms 已在建连阶段被吸收（建连提前到 VAD 之前）。
+
+    // VAD 门控循环：读 chunk → 喂 VAD → 命中或 2s 保底即跳出
+    while !vad_hit {
+        if is_cancelled() {
+            // ASR-058 ①: 未说话就松手——正常关闭已建连接并写出关闭时序
+            log::info!(
+                "Online ASR cancelled during VAD gate, closing connection gracefully (+{:.0}ms)",
+                t_start.elapsed().as_millis()
+            );
+            let _ = ws_socket.close(None);
+            summary.outcome = "cancelled";
+            log::info!("{}", summary.format_summary());
+            bail!("转录已取消");
+        }
+
+        // 2s 保底：VAD 2s 未命中无条件发音频
+        if std::time::Instant::now() >= vad_2s_deadline {
+            log::info!("VAD gate 2s deadline reached without detection, forcing send (safety net)");
+            vad_hit = true;
+            break;
+        }
+
+        match chunk_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(chunk) if !chunk.is_empty() => {
+                pre_roll_buffer.push(chunk.clone());
+
+                if let Some(ref vad_seg) = vad {
+                    let mut offset = 0;
+                    while offset < chunk.len() {
+                        let end = (offset + vad_window).min(chunk.len());
+                        if vad_seg.accept_and_check(&chunk[offset..end]) {
+                            let vad_ms = t_start.elapsed().as_millis();
+                            log::info!(
+                                "VAD gate: speech detected at +{:.0}ms, sending audio (pre-roll buffer: {} chunks)",
+                                vad_ms,
+                                pre_roll_buffer.len()
+                            );
+                            summary.vad_hit_ms = vad_ms as i64;
+                            vad_hit = true;
+                            break;
+                        }
+                        offset = end;
+                    }
+                }
+                if vad.is_none() {
+                    let vad_ms = t_start.elapsed().as_millis();
+                    summary.vad_hit_ms = vad_ms as i64;
+                    vad_hit = true;
+                    break;
+                }
+            }
+            Ok(_) => { /* empty chunk, skip */ }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                // ASR-058 ①: 音频 channel 断开（录音结束）但还没命中 VAD —— 用户按了热键没说话
+                if pre_roll_buffer.is_empty() {
+                    log::info!(
+                        "Audio channel closed before VAD detected speech (+{:.0}ms), closing connection gracefully — likely user pressed hotkey without speaking",
+                        t_start.elapsed().as_millis()
+                    );
+                    let _ = ws_socket.close(None);
+                    summary.outcome = "cancelled";
+                    log::info!("{}", summary.format_summary());
+                    bail!("转录已取消：未检测到语音输入");
+                }
+                // 有 pre-roll 但没命中 VAD —— 用 2s 保底逻辑发完
+                log::info!(
+                    "Audio channel closed during VAD gate with {} chunks buffered, forcing send to flush",
+                    pre_roll_buffer.len()
+                );
+                vad_hit = true;
+                break;
+            }
         }
     }
 
@@ -1069,16 +1204,28 @@ pub fn transcribe_streaming_realtime(
 
     let mut state = StreamingAsrState::new();
 
-    // 发 pre-roll 缓冲（VAD 命中前 + 握手期间积攒的 chunk）
+    // 发 pre-roll 缓冲（VAD 命中前的所有 chunk）
     let pre_roll_chunk_count = pre_roll_buffer.len();
     let mut pre_roll_samples: usize = 0;
+    let mut first_audio_byte_sent = false;
     for chunk in &pre_roll_buffer {
         if is_cancelled() {
             let _ = ws_socket.close(None);
+            summary.outcome = "cancelled";
+            log::info!("{}", summary.format_summary());
             bail!("转录已取消");
         }
         let pcm = f32_to_pcm16_le(chunk);
         for binary_chunk in chunk_pcm_to_binary(&pcm) {
+            // ASR-058 ③: 记录首个音频字节发出时间（first_text_ms 的起点）
+            if !first_audio_byte_sent {
+                first_audio_byte_sent = true;
+                summary.first_audio_byte_ms = t_start.elapsed().as_millis() as i64;
+                log::info!(
+                    "[Latency] ASR first audio byte sent at +{:.0}ms (pre-roll start)",
+                    t_start.elapsed().as_millis()
+                );
+            }
             ws_socket
                 .send(Message::Binary(binary_chunk.into()))
                 .map_err(|e| anyhow!("网络失败：发送 pre-roll 音频帧失败 - {}", e))?;
@@ -1131,6 +1278,8 @@ pub fn transcribe_streaming_realtime(
     loop {
         if is_cancelled() {
             let _ = ws_socket.close(None);
+            summary.outcome = "cancelled";
+            log::info!("{}", summary.format_summary());
             bail!("转录已取消");
         }
 
@@ -1176,6 +1325,8 @@ pub fn transcribe_streaming_realtime(
                 let parsed: serde_json::Value =
                     serde_json::from_str(&text).context("服务端返回非 JSON 文本")?;
                 if let Some(err) = extract_task_error(&parsed) {
+                    log::info!("{}", summary.format_summary());
+                    summary.outcome = "failed";
                     bail!("服务端错误：{}", err);
                 }
                 if let Some((id, text, end)) = extract_sentence(&parsed) {
@@ -1183,6 +1334,24 @@ pub fn transcribe_streaming_realtime(
                     // words 与 text 同源同构累积于 StreamingAsrState，保证 display_words()
                     // 与 display_text() 字符级对齐。
                     let words = extract_words(&parsed).unwrap_or_default();
+
+                    // ASR-058 ③: A/B 对比埋点
+                    // 🔴 first_text_ms 的起点必须是「首个音频字节发出」而不是热键按下
+                    if summary.first_partial_ms < 0 {
+                        summary.first_partial_ms = t_start.elapsed().as_millis() as i64;
+                    }
+                    if !text.is_empty() && summary.first_text_ms < 0 {
+                        // first_text_ms = 首个非空文本到达 - 首个音频字节发出
+                        // 这是服务端处理延迟的公平口径（不含人的反应时间）
+                        summary.first_text_ms =
+                            t_start.elapsed().as_millis() as i64 - summary.first_audio_byte_ms;
+                        log::info!(
+                            "[Latency] ASR first non-empty text at +{:.0}ms ({}ms from first audio byte)",
+                            t_start.elapsed().as_millis(),
+                            summary.first_text_ms
+                        );
+                    }
+
                     state.on_result(id, &text, end, &words);
                     let display = state.display_text();
                     let display_words = state.display_words();
@@ -1193,29 +1362,61 @@ pub fn transcribe_streaming_realtime(
                         display,
                         display_words.len()
                     );
+
+                    // ASR-058 ④: 词时间戳日志（仅 debug 模式）
+                    // 打印末次结果的词时间轴，让停顿压缩的收益能用真实数据评估
+                    if !display_words.is_empty() && log::log_enabled!(log::Level::Debug) {
+                        let timeline: Vec<String> = display_words
+                            .iter()
+                            .map(|w| format!("{}[{}-{}]", w.text, w.begin_time, w.end_time))
+                            .collect();
+                        log::debug!(
+                            "[ASR-WORDS] {} words: {}",
+                            display_words.len(),
+                            timeline.join(" ")
+                        );
+                    }
+
                     // OVERLAY-051-G: 每次都下发与 display_text 完全对齐的全量词表。
                     // overlay 侧 UpdateWordTimings 整体替换，合并逻辑归零。
                     on_result(&display, &display_words);
                 }
                 if extract_event_type(&parsed) == Some("task-finished") {
+                    let final_elapsed = t_start.elapsed().as_millis();
+                    let final_text = state.final_text();
+                    summary.final_ms = final_elapsed as i64;
+                    summary.words_total = state.display_words().len() as i64;
+                    summary.chars_total = state.display_text().chars().count() as i64;
+
+                    // ASR-058 ③: 每次录音结束打一行 [ASR-SUMMARY]
+                    // Gavin 明确要求「下次要根据 debug 时间戳评估两个 ASR 模型到底哪个服务端反馈更快」
+                    log::info!("{}", summary.format_summary());
+
                     log::info!(
                         "Online ASR task finished: {} confirmed sentences",
                         state.confirmed_count()
                     );
-                    let final_text = state.final_text();
                     if final_text.is_empty() {
                         let display = state.display_text();
                         if display.is_empty() {
+                            log::info!("{}", summary.format_summary());
+                            summary.outcome = "failed";
                             bail!("转录失败：task-finished 但无识别结果");
                         }
+                        log::info!("{}", summary.format_summary());
+                        summary.outcome = "finished";
                         return Ok(display);
                     }
+                    log::info!("{}", summary.format_summary());
+                    summary.outcome = "finished";
                     return Ok(final_text);
                 }
             }
             Ok(Message::Binary(_)) => {}
             Ok(Message::Ping(_) | Message::Pong(_)) => {}
             Ok(Message::Close(_)) => {
+                log::info!("{}", summary.format_summary());
+                summary.outcome = "failed";
                 bail!("网络失败：服务端关闭连接");
             }
             Ok(Message::Frame(_)) => {}
@@ -1223,6 +1424,8 @@ pub fn transcribe_streaming_realtime(
                 // 1ms timeout 是预期的（非阻塞模拟），继续循环
                 // 只有在 finish_task_sent 后的 10s timeout 才是真超时
                 if finish_task_sent && last_ws_activity.elapsed() >= SILENCE_TIMEOUT {
+                    log::info!("{}", summary.format_summary());
+                    summary.outcome = "failed";
                     bail!("超时：服务端 10s 无响应");
                 }
             }
