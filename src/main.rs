@@ -81,6 +81,8 @@ use windows::Win32::UI::WindowsAndMessaging::{ES_AUTOHSCROLL, GWLP_WNDPROC, WIND
 #[cfg(target_os = "windows")]
 const EM_SETSEL_MSG: u32 = 0x00B1; // EM_SETSEL
 #[cfg(target_os = "windows")]
+const WM_SETFONT: u32 = 0x0030;
+#[cfg(target_os = "windows")]
 const EDIT_OLD_PROC_PROP: [u16; 16] = [
     'f' as u16, 'y' as u16, 'n' as u16, '_' as u16, 'e' as u16, 'd' as u16, 'i' as u16, 't' as u16,
     '_' as u16, 'o' as u16, 'l' as u16, 'd' as u16, 'p' as u16, 'r' as u16, 'o' as u16, 0,
@@ -596,6 +598,20 @@ fn create_edit_control(hwnd: HWND, state: &mut OverlayWindowState, rect: &RECT, 
                     HANDLE(old_proc as *mut std::ffi::c_void),
                 );
             }
+            // OVERLAY-054-D: give EDIT control its own ClearType font. Without this the
+            // EDIT falls back to a non-scalable system font and shows jagged glyphs.
+            // We use an independent HFONT (not cached_font) because cached_font is
+            // take()+DeleteObject() when the overlay hides/destroys.
+            let edit_font = create_clear_type_font(OVERLAY_FONT_SIZE);
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                    edit_hwnd,
+                    WM_SETFONT,
+                    WPARAM(edit_font.0 as usize),
+                    LPARAM(1), // TRUE: redraw immediately
+                );
+            }
+            state.edit_font = Some(edit_font);
             log::info!("ASR-038-C: created EDIT control for streaming editing");
         }
         Err(e) => {
@@ -693,6 +709,14 @@ fn destroy_edit_control(state: &mut OverlayWindowState) {
     if let Some(brush) = state.edit_bg_brush.take() {
         unsafe {
             let _ = DeleteObject(brush);
+        }
+    }
+    // OVERLAY-054-D: destroy the EDIT-specific font only after the EDIT window is gone.
+    // The WM_SETFONT message copies the HFONT handle into the control; the application
+    // remains responsible for deleting it when no longer needed (MSDN).
+    if let Some(font) = state.edit_font.take() {
+        unsafe {
+            let _ = DeleteObject(font);
         }
     }
 }
@@ -845,6 +869,10 @@ struct OverlayWindowState {
     edit_old_wndproc: Option<windows::Win32::UI::WindowsAndMessaging::WNDPROC>,
     /// ASR-038-C: 用于 WM_CTLCOLOREDIT 返回的背景画刷（BG_DARK）
     edit_bg_brush: Option<windows::Win32::Graphics::Gdi::HBRUSH>,
+    /// OVERLAY-054-D: EDIT 控件专用 HFONT。必须独立于 cached_font，因为 cached_font 在
+    /// 隐藏/退出时会被 take+DeleteObject（:1316）；EDIT 控件生命周期与窗口状态绑定，
+    /// 若复用 cached_font 会导致字体被提前删除或双删。
+    edit_font: Option<HFONT>,
     /// ASR-038-C-REWORK-001: 流式文本窗口宽度 100ms 尺寸节流时间戳
     last_resize_time: Option<std::time::Instant>,
     /// OVERLAY-043: coalesced pending size for streaming text resize throttle
@@ -883,6 +911,18 @@ const OVERLAY_BRAND_ORANGE: COLORREF = COLORREF(0x006BFF); // #FF6B00
 const OVERLAY_BG_DARK: COLORREF = COLORREF(0x110F0D);
 #[cfg(target_os = "windows")]
 const OVERLAY_TEXT_WHITE: COLORREF = COLORREF(0xFFFFFF);
+// OVERLAY-054-C: unified window border color. Changing this one constant updates
+// every overlay variant; previously 10+ scattered local consts made it easy to miss.
+#[cfg(target_os = "windows")]
+const OVERLAY_BORDER_GRAY: COLORREF = COLORREF(0x3A3A3C);
+// OVERLAY-054-E: unified overlay font size. The cached font in overlay_paint and
+// the measure-text font in adjust_overlay_pos_size_for_text must match exactly.
+#[cfg(target_os = "windows")]
+const OVERLAY_FONT_SIZE: i32 = -13;
+// OVERLAY-054-C: file-level button border color. Kept at 0x707070 (value unchanged).
+// Tests can now reference this constant instead of mirroring the literal.
+#[cfg(target_os = "windows")]
+const OVERLAY_BTN_BORDER: COLORREF = COLORREF(0x707070);
 #[cfg(target_os = "windows")]
 const RECORDING_OVERLAY_SIZE: [i32; 2] = [240, 36]; // Recording window
 #[cfg(target_os = "windows")]
@@ -964,6 +1004,7 @@ fn run_overlay_thread(
         edit_hwnd: None,
         edit_old_wndproc: None,
         edit_bg_brush: None,
+        edit_font: None,
         last_resize_time: None,
         pending_size: None,
         needs_repaint: true,
@@ -1806,9 +1847,10 @@ fn draw_overlay_to_dc(
     // Double-buffer: hdc is memory DC, rect is already computed
 
     // OVERLAY-051-F: reuse a cached ClearType font instead of creating/destroying one per frame.
+    // OVERLAY-054-E: use file-level OVERLAY_FONT_SIZE so cached font matches measuring font.
     let font = state
         .cached_font
-        .unwrap_or_else(|| create_clear_type_font(-12));
+        .unwrap_or_else(|| create_clear_type_font(OVERLAY_FONT_SIZE));
     let old_font = unsafe { SelectObject(hdc, font) };
     state.cached_font = Some(font);
 
@@ -1922,7 +1964,6 @@ fn draw_overlay_to_dc(
 #[cfg(target_os = "windows")]
 fn draw_overlay_chrome(hdc: windows::Win32::Graphics::Gdi::HDC, rect: &RECT) {
     const BG_DARK: COLORREF = COLORREF(0x110F0D);
-    const BORDER_GRAY: COLORREF = COLORREF(0x060607); // FIX-006-1: darkened border
     const CORNER_RADIUS: i32 = 10;
     // Dark background
     let bg = unsafe { CreateSolidBrush(BG_DARK) };
@@ -1931,7 +1972,7 @@ fn draw_overlay_chrome(hdc: windows::Win32::Graphics::Gdi::HDC, rect: &RECT) {
         let _ = DeleteObject(bg);
     }
     // Window border
-    let border_pen = unsafe { CreatePen(PS_SOLID, 1, BORDER_GRAY) };
+    let border_pen = unsafe { CreatePen(PS_SOLID, 1, OVERLAY_BORDER_GRAY) };
     let old_pen = unsafe { SelectObject(hdc, border_pen) };
     let null_brush = unsafe { GetStockObject(NULL_BRUSH) };
     let old_brush = unsafe { SelectObject(hdc, null_brush) };
@@ -1961,11 +2002,10 @@ fn draw_recording_indicator_and_waveform(
     const RED_STREAM_FAILED: COLORREF = COLORREF(0x0000FF); // #FF0000 — device error
     const GRAY_SILENT: COLORREF = COLORREF(0x808080); // #808080
     const BG_DARK: COLORREF = COLORREF(0x110F0D);
-    const BORDER_GRAY: COLORREF = COLORREF(0x060607); // FIX-006-1: darkened border
-    const CIRC_BORDER: COLORREF = COLORREF(0x060607); // match border
-                                                      // === Problem 1: 14px smooth circle using HALFTONE supersampling ===
-                                                      // PERF-BATCH-001 TASK-5: 三态指示灯
-                                                      // RED=stream_failed(设备故障) > ORANGE=有音频录入(level>0.01) > GRAY=设备正常但无音频
+    // OVERLAY-054-C: use file-level OVERLAY_BORDER_GRAY instead of local constant.
+    // === Problem 1: 14px smooth circle using HALFTONE supersampling ===
+    // PERF-BATCH-001 TASK-5: 三态指示灯
+    // RED=stream_failed(设备故障) > ORANGE=有音频录入(level>0.01) > GRAY=设备正常但无音频
     let circ_size = 18; // MIC-ICON-ENLARGE-001: from 14 to 18
     let circ_l = rect.left + 6; // MIC-ICON-ENLARGE-001: left-shift to keep margin to separator
     let circ_t = rect.top + (rect.bottom - rect.top - circ_size) / 2;
@@ -2044,7 +2084,7 @@ fn draw_recording_indicator_and_waveform(
     let sep_h = 20;
     let sep_hh = sep_h / 2;
     let cy = rect.top + (rect.bottom - rect.top) / 2;
-    let sep_pen = unsafe { CreatePen(PS_SOLID, 2, BORDER_GRAY) };
+    let sep_pen = unsafe { CreatePen(PS_SOLID, 2, OVERLAY_BORDER_GRAY) };
     let sep_op = unsafe { SelectObject(hdc, sep_pen) };
     unsafe {
         let _ = MoveToEx(hdc, sep_l_x, cy - sep_hh, None);
@@ -2160,7 +2200,7 @@ fn draw_recording_indicator_and_waveform(
         }
     }
     // Draw right separator
-    let sep_pen2 = unsafe { CreatePen(PS_SOLID, 2, BORDER_GRAY) };
+    let sep_pen2 = unsafe { CreatePen(PS_SOLID, 2, OVERLAY_BORDER_GRAY) };
     let sep_op2 = unsafe { SelectObject(hdc, sep_pen2) };
     unsafe {
         let _ = MoveToEx(hdc, sep_r_x, cy - sep_hh, None);
@@ -2252,7 +2292,6 @@ fn draw_recording_overlay_with_text(
     draw_recording_indicator(hdc, rect, state);
     let cancel_rect = draw_stop_button(hdc, rect);
 
-    const BORDER_GRAY: COLORREF = COLORREF(0x060607);
     let cy = rect.top + (rect.bottom - rect.top) / 2;
 
     // Text region dimensions
@@ -2309,7 +2348,7 @@ fn draw_recording_overlay_with_text(
     let sep_r_x = rect.right - 36;
     let sep_h = 20;
     let sep_hh = sep_h / 2;
-    let sep_pen = unsafe { CreatePen(PS_SOLID, 2, BORDER_GRAY) };
+    let sep_pen = unsafe { CreatePen(PS_SOLID, 2, OVERLAY_BORDER_GRAY) };
     let sep_op = unsafe { SelectObject(hdc, sep_pen) };
     unsafe {
         let _ = MoveToEx(hdc, sep_r_x, cy - sep_hh, None);
@@ -2381,7 +2420,7 @@ fn draw_recording_indicator(
     const RED_STREAM_FAILED: COLORREF = COLORREF(0x0000FF); // #FF0000 — device error
     const GRAY_SILENT: COLORREF = COLORREF(0x808080); // #808080
     const BG_DARK: COLORREF = COLORREF(0x110F0D);
-    const CIRC_BORDER: COLORREF = COLORREF(0x060607); // match border
+    // OVERLAY-054-C: separator color matches the unified window border.
     let circ_size = 18; // MIC-ICON-ENLARGE-001: from 14 to 18
     let circ_l = rect.left + 6; // MIC-ICON-ENLARGE-001: left-shift to keep margin to separator
     let circ_t = rect.top + (rect.bottom - rect.top - circ_size) / 2;
@@ -2451,7 +2490,7 @@ fn draw_recording_indicator(
     let sep_h = 20;
     let sep_hh = sep_h / 2;
     let cy = rect.top + (rect.bottom - rect.top) / 2;
-    let sep_pen = unsafe { CreatePen(PS_SOLID, 2, CIRC_BORDER) };
+    let sep_pen = unsafe { CreatePen(PS_SOLID, 2, OVERLAY_BORDER_GRAY) };
     let sep_op = unsafe { SelectObject(hdc, sep_pen) };
     unsafe {
         let _ = MoveToEx(hdc, sep_l_x, cy - sep_hh, None);
@@ -2492,7 +2531,6 @@ fn draw_editing_overlay_chrome(
     _ui_language: config::UiLanguage,
 ) -> (RECT, RECT) {
     const BG_DARK: COLORREF = COLORREF(0x110F0D);
-    const BORDER_GRAY: COLORREF = COLORREF(0x060607);
     const CORNER_RADIUS: i32 = 10;
 
     // Background + border
@@ -2501,7 +2539,7 @@ fn draw_editing_overlay_chrome(
         let _ = FillRect(hdc, rect, bg);
         let _ = DeleteObject(bg);
     }
-    let border_pen = unsafe { CreatePen(PS_SOLID, 1, BORDER_GRAY) };
+    let border_pen = unsafe { CreatePen(PS_SOLID, 1, OVERLAY_BORDER_GRAY) };
     let old_pen = unsafe { SelectObject(hdc, border_pen) };
     let null_brush = unsafe { GetStockObject(NULL_BRUSH) };
     let old_brush = unsafe { SelectObject(hdc, null_brush) };
@@ -2626,10 +2664,10 @@ fn draw_processing_overlay(
     const BRAND_ORANGE: COLORREF = COLORREF(0x006BFF); // #FF6B00
     const BRIGHT_ORANGE: COLORREF = COLORREF(0x008CFF); // #FF8C00 - brighter shimmer
     const BG_DARK: COLORREF = COLORREF(0x181A18); // #181A18
-    const BORDER_GRAY: COLORREF = COLORREF(0x060607); // FIX-006-1: unify with recording overlay
+                                                  // OVERLAY-054-C: use file-level OVERLAY_BORDER_GRAY instead of local constant.
     const CORNER_RADIUS: i32 = 16;
     // WAVEFORM-HEIGHT-FIX-001: restore fixed gray border (remove breathing)
-    let border_color = BORDER_GRAY;
+    let border_color = OVERLAY_BORDER_GRAY;
     // Dark background
     let bg = unsafe { CreateSolidBrush(BG_DARK) };
     unsafe {
@@ -2751,7 +2789,7 @@ fn draw_preview_overlay(
     // UI-OPT-003: preview window with title bar, centered buttons, i18n labels
     const BRAND_ORANGE: COLORREF = COLORREF(0x006BFF); // #FF6B00
     const BG_DARK: COLORREF = COLORREF(0x211D1A);
-    const BORDER_GRAY: COLORREF = COLORREF(0x060607); // FIX-006-1: unify with recording overlay
+    // OVERLAY-054-C: use file-level OVERLAY_BORDER_GRAY instead of local constant.
     const CORNER_RADIUS: i32 = 10;
     let strings = i18n::get(ui_language);
     let bg = unsafe { CreateSolidBrush(BG_DARK) };
@@ -2760,7 +2798,7 @@ fn draw_preview_overlay(
         let _ = DeleteObject(bg);
     }
     // Border (unified style)
-    let border_pen = unsafe { CreatePen(PS_SOLID, 1, BORDER_GRAY) };
+    let border_pen = unsafe { CreatePen(PS_SOLID, 1, OVERLAY_BORDER_GRAY) };
     let border_old_pen = unsafe { SelectObject(hdc, border_pen) };
     let null_brush = unsafe { GetStockObject(NULL_BRUSH) };
     let border_old_brush = unsafe { SelectObject(hdc, null_brush) };
@@ -2804,9 +2842,9 @@ fn draw_preview_overlay(
         right: rect.right - 8,
         bottom: rect.top + 23,
     };
-    // FIX-006 v2: button border brighter than window border for visual distinction
-    const BTN_BORDER: COLORREF = COLORREF(0x707070); // mid gray, distinguishable from BORDER_GRAY 0x060607
-    let tc_pen = unsafe { CreatePen(PS_SOLID, 1, BTN_BORDER) };
+    // FIX-006 v2: button border brighter than window border for visual distinction.
+    // OVERLAY-054-C: use file-level OVERLAY_BTN_BORDER (value unchanged, 0x707070).
+    let tc_pen = unsafe { CreatePen(PS_SOLID, 1, OVERLAY_BTN_BORDER) };
     let tc_old_pen = unsafe { SelectObject(hdc, tc_pen) };
     let tc_hollow = unsafe { GetStockObject(NULL_BRUSH) };
     let tc_old_brush = unsafe { SelectObject(hdc, tc_hollow) };
@@ -2836,7 +2874,7 @@ fn draw_preview_overlay(
         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
     );
     // Title bar separator line
-    let sep_pen = unsafe { CreatePen(PS_SOLID, 1, BORDER_GRAY) };
+    let sep_pen = unsafe { CreatePen(PS_SOLID, 1, OVERLAY_BORDER_GRAY) };
     let sep_old = unsafe { SelectObject(hdc, sep_pen) };
     unsafe {
         let _ = MoveToEx(hdc, rect.left + 8, rect.top + title_bar_h, None);
@@ -2879,8 +2917,9 @@ fn draw_preview_overlay(
         right: btn_left + btn_w * 2 + gap,
         bottom: btn_top + btn_h,
     };
-    // FIX-006 v2: bottom buttons use brighter border to distinguish from window edge
-    let btn_pen = unsafe { CreatePen(PS_SOLID, 1, BTN_BORDER) };
+    // FIX-006 v2: bottom buttons use brighter border to distinguish from window edge.
+    // OVERLAY-054-C: use file-level OVERLAY_BTN_BORDER.
+    let btn_pen = unsafe { CreatePen(PS_SOLID, 1, OVERLAY_BTN_BORDER) };
     let old_pen = unsafe { SelectObject(hdc, btn_pen) };
     let hollow = unsafe { GetStockObject(NULL_BRUSH) };
     let old_brush = unsafe { SelectObject(hdc, hollow) };
@@ -2942,7 +2981,7 @@ fn draw_error_overlay(
     // UI-OVERLAY-OPT-001: unified visual style
     const BRAND_ORANGE: COLORREF = COLORREF(0x006BFF); // #FF6B00
     const BG_DARK: COLORREF = COLORREF(0x211D1A); // #1A1D21
-    const BORDER_GRAY: COLORREF = COLORREF(0x060607); // FIX-006-1: unify with recording overlay
+                                                  // OVERLAY-054-C: use file-level OVERLAY_BORDER_GRAY instead of local constant.
     const CORNER_RADIUS: i32 = 10;
     // Dark gray background (unified)
     let bg = unsafe { CreateSolidBrush(BG_DARK) };
@@ -2951,7 +2990,7 @@ fn draw_error_overlay(
         let _ = DeleteObject(bg);
     }
     // Border: 1px rounded corners (unified)
-    let border_pen = unsafe { CreatePen(PS_SOLID, 1, BORDER_GRAY) };
+    let border_pen = unsafe { CreatePen(PS_SOLID, 1, OVERLAY_BORDER_GRAY) };
     let border_old_pen = unsafe { SelectObject(hdc, border_pen) };
     let null_brush = unsafe { GetStockObject(NULL_BRUSH) };
     let border_old_brush = unsafe { SelectObject(hdc, null_brush) };
@@ -3161,7 +3200,8 @@ fn adjust_overlay_pos_size_for_text(
 
     unsafe {
         let hdc = GetDC(hwnd);
-        let font = create_clear_type_font(-12);
+        // OVERLAY-054-E: use file-level OVERLAY_FONT_SIZE so measuring font matches cached font.
+        let font = create_clear_type_font(OVERLAY_FONT_SIZE);
         let old_font = SelectObject(hdc, font);
         let text_w = measure_text_width(hdc, text);
         let _ = SelectObject(hdc, old_font);
@@ -6387,31 +6427,33 @@ mod overlay_shimmer_tests {
     // === OVERLAY-FIX-006: Border darken + Shimmer rewrite + Preview adjustments ===
 
     #[test]
-    fn border_gray_deeply_darkened() {
-        // FIX-007: BORDER_GRAY darkened from 0x171513 to 0x060607 (≈30% brightness)
-        const BORDER_GRAY: u32 = 0x060607; // COLORREF format: 0x00BBGGRR
+    fn overlay_border_gray_is_mid_gray() {
+        // OVERLAY-054-C: BORDER_GRAY brightened from 0x060607 to 0x3A3A3C (≈58% brightness).
+        // This mid gray makes the overlay outline clearly visible against dark backgrounds.
+        const BORDER_GRAY: u32 = 0x3A3A3C; // COLORREF format: 0x00BBGGRR
         let r = BORDER_GRAY & 0xFF;
         let g = (BORDER_GRAY >> 8) & 0xFF;
         let b = (BORDER_GRAY >> 16) & 0xFF;
-        assert_eq!(r, 0x07, "BORDER_GRAY red must be 0x07");
-        assert_eq!(g, 0x06, "BORDER_GRAY green must be 0x06");
-        assert_eq!(b, 0x06, "BORDER_GRAY blue must be 0x06");
-        // Verify darker than old value (0x171513)
+        assert_eq!(r, 0x3A, "OVERLAY_BORDER_GRAY red must be 0x3A");
+        assert_eq!(g, 0x3A, "OVERLAY_BORDER_GRAY green must be 0x3A");
+        assert_eq!(b, 0x3C, "OVERLAY_BORDER_GRAY blue must be 0x3C");
+        // Verify brighter than old value (0x171513). Note: as a packed u32 the ordering is
+        // 0x00BBGGRR, so "larger" means more blue/green/red; 0x3A3A3C > 0x131517.
         let old_gray: u32 = 0x131517;
         assert!(
-            BORDER_GRAY < old_gray,
-            "New BORDER_GRAY must be darker than old 0x171513"
+            BORDER_GRAY > old_gray,
+            "New OVERLAY_BORDER_GRAY must be brighter than old 0x171513"
         );
     }
 
     #[test]
-    fn circ_border_matches_border_gray() {
-        // FIX-007: CIRC_BORDER must match BORDER_GRAY (0x060607)
-        const BORDER_GRAY: u32 = 0x060607;
-        const CIRC_BORDER: u32 = 0x060607;
+    fn circ_border_matches_overlay_border_gray() {
+        // OVERLAY-054-C: CIRC_BORDER must match OVERLAY_BORDER_GRAY.
+        const BORDER_GRAY: u32 = 0x3A3A3C;
+        const CIRC_BORDER: u32 = 0x3A3A3C;
         assert_eq!(
             BORDER_GRAY, CIRC_BORDER,
-            "CIRC_BORDER must match BORDER_GRAY"
+            "CIRC_BORDER must match OVERLAY_BORDER_GRAY"
         );
     }
 
@@ -6657,26 +6699,55 @@ mod overlay_shimmer_tests {
 
     #[test]
     fn btn_border_brighter_than_window_border() {
-        // FIX-007: BTN_BORDER must be visually brighter than BORDER_GRAY (0x060607)
-        // so X close, copy, close buttons are distinguishable from window edge
-        const BORDER_GRAY: u32 = 0x060607;
+        // OVERLAY-054-C: BTN_BORDER must be visually brighter than OVERLAY_BORDER_GRAY (0x3A3A3C)
+        // so X close, copy, close buttons are distinguishable from window edge.
+        // The old "btn_sum > gray_sum * 4" check was an accident of the near-black border
+        // era (0x060607 sum=19, so any gray passed). After brightening the window border
+        // to 0x3A3A3C, the 4x multiplier no longer expresses the design intent and is
+        // replaced by per-channel and aggregate checks that assert "visibly brighter".
+        const BORDER_GRAY: u32 = 0x3A3A3C;
         const BTN_BORDER: u32 = 0x707070;
-        // Sum channels as proxy for brightness (since both are gray-ish)
-        let gray_sum =
-            (BORDER_GRAY & 0xFF) + ((BORDER_GRAY >> 8) & 0xFF) + ((BORDER_GRAY >> 16) & 0xFF);
-        let btn_sum =
-            (BTN_BORDER & 0xFF) + ((BTN_BORDER >> 8) & 0xFF) + ((BTN_BORDER >> 16) & 0xFF);
+
+        let gray_r = (BORDER_GRAY & 0xFF) as i32;
+        let gray_g = ((BORDER_GRAY >> 8) & 0xFF) as i32;
+        let gray_b = ((BORDER_GRAY >> 16) & 0xFF) as i32;
+        let btn_r = (BTN_BORDER & 0xFF) as i32;
+        let btn_g = ((BTN_BORDER >> 8) & 0xFF) as i32;
+        let btn_b = ((BTN_BORDER >> 16) & 0xFF) as i32;
+
+        // A) Per-channel: button must be brighter by at least 0x20 (~12.5% gray step),
+        //    a commonly noticeable gray difference on dark backgrounds.
+        //    Measured deltas: R=0x36, G=0x36, B=0x34.
         assert!(
-            btn_sum > gray_sum * 4,
-            "BTN_BORDER must be at least 4x brighter than BORDER_GRAY"
+            btn_r - gray_r >= 0x20,
+            "BTN_BORDER R must be at least 0x20 brighter than BORDER_GRAY R (R diff = 0x{:02X})",
+            btn_r - gray_r
         );
+        assert!(
+            btn_g - gray_g >= 0x20,
+            "BTN_BORDER G must be at least 0x20 brighter than BORDER_GRAY G (G diff = 0x{:02X})",
+            btn_g - gray_g
+        );
+        assert!(
+            btn_b - gray_b >= 0x20,
+            "BTN_BORDER B must be at least 0x20 brighter than BORDER_GRAY B (B diff = 0x{:02X})",
+            btn_b - gray_b
+        );
+
+        // B) Aggregate: total luminance must be strictly larger in the brighter direction.
+        let gray_sum = gray_r + gray_g + gray_b;
+        let btn_sum = btn_r + btn_g + btn_b;
+        assert!(
+            btn_sum > gray_sum,
+            "BTN_BORDER total brightness ({}) must exceed BORDER_GRAY total brightness ({})",
+            btn_sum,
+            gray_sum
+        );
+
         // Verify BTN_BORDER is neutral gray
-        let r = BTN_BORDER & 0xFF;
-        let g = (BTN_BORDER >> 8) & 0xFF;
-        let b = (BTN_BORDER >> 16) & 0xFF;
-        assert_eq!(r, 0x70, "BTN_BORDER R = 0x70");
-        assert_eq!(r, g, "BTN_BORDER must be neutral gray (R=G)");
-        assert_eq!(g, b, "BTN_BORDER must be neutral gray (G=B)");
+        assert_eq!(btn_r, 0x70, "BTN_BORDER R = 0x70");
+        assert_eq!(btn_r, btn_g, "BTN_BORDER must be neutral gray (R=G)");
+        assert_eq!(btn_g, btn_b, "BTN_BORDER must be neutral gray (G=B)");
     }
 
     // ============================================================

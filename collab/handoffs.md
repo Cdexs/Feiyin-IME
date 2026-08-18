@@ -2,6 +2,19 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-08-18 — coder-2 — OVERLAY-054-C/D/E ✅ 视觉三项（src/main.rs 唯一改动，阶段一完成，待主控验收）
+
+- **来源**：Gavin 令「三个问题一起做了再出包」。任务书由主控在会话重启后重写，Worker 独占 `src/main.rs`
+- **054-C 边框提亮收敛**：新增文件级 `OVERLAY_BORDER_GRAY = COLORREF(0x3A3A3C)`；原 10 处散落局部 `0x060607`（含 `CIRC_BORDER`）全部改引用该常量。覆盖窗口边框、分隔线、编辑态、处理中/预览/错误态。Gavin 拍板「轮廓清楚」
+- **054-D 编辑态锯齿根因修复**：新增 `OverlayWindowState.edit_font: Option<HFONT>`；`create_edit_control` 创建 EDIT 后 `SendMessageW(WM_SETFONT)` 发独立 `create_clear_type_font(OVERLAY_FONT_SIZE)` 字体并 `lParam=1` 立即重绘；`destroy_edit_control` 在 `DestroyWindow(edit_hwnd)` 之后 `DeleteObject(font)`。未复用 `cached_font`（其生命周期被 `take()+DeleteObject` 绑定在隐藏/退出）。圆角硬裁剪本批未动
+- **054-E 字号统一**：新增文件级 `OVERLAY_FONT_SIZE: i32 = -13`；`overlay_paint` 缓存字体与 `adjust_overlay_pos_size_for_text` 量宽字体同步替换，防止窗口宽度算错
+- **测试区同步**：`:6439/:6454/:6455/:6706` 四处测试字面量从 `0x060607` 改为 `0x3A3A3C`
+- **主控追加授权**：`BTN_BORDER` 提到文件级 `OVERLAY_BTN_BORDER = COLORREF(0x707070)`，值不动；`:6708` 亮度判据从失效的 `4x` 改为「逐通道 ≥0x20 + 总亮度方向更亮」，注释说明旧 4x 是近黑时代偶然产物
+- **验证**：`cargo fmt --all -- --check` clean / `cargo check --all-targets` 0 error（109 既有 warnings，无新增指向本批改动）/ `cargo check --manifest-path src-tauri/Cargo.toml --all-targets` 0 error
+- **红线合规**：只改 `src/main.rs`；未动版本号 0.8.0 / `bErase=false` / `pos:[0,0]`；未 commit；未跑 `cargo test` / 未出包（阶段一）
+- **遗留**：Gavin 端测目视拍板按钮边框与窗口边框是否仍可区分；TEST-SYNC-054CDE 阶段三将把测试区改为引用生产常量
+- **详情**：logs/20260818.md + CHANGELOG.md + result.md
+
 ## 2026-08-18 — tester-1 — E2E-HARNESS-050 ✅ 修复 E2E 两道陈年错位 + 全套 harness 修复（9 FAIL→2 FAIL，待主控验收）
 
 - **来源**：Gavin 批评「代码几轮修改仍未拿到主程序流程完全走通的版本」，主控复盘根因是 E2E 门禁**自初始提交起从未绿**。基线 HEAD `0049c33`（⚠️ 工作区实际含 coder-2 **未提交** OVERLAY-051-G WIP：`src/main.rs` +270 / `qwen_inference.rs` +45，全程不触碰）
