@@ -3805,3 +3805,53 @@ Worker 报「五文档已更新」，实际是**整份重写**而非追加：
 **写五文档一律用「追加」语义**（`>>` 或读全文后拼接再整写），
 **禁止**先构造新内容再整体覆盖。写完自查 `git diff --stat`：
 **只允许出现纯增量，出现删除行即为写坏，立刻报主控不要继续。**
+
+## [WORKER-DOC-ENCODING-002] 🔴 Worker 以 GBK 写入 UTF-8 文档 → 追加也会毁文件，且内容不可逆丢失【写文档前必读】
+
+**日期**：2026-08-18 ｜ **发现**：主控提交前 diff 复核 ｜ **责任**：tester-1（BUILD-022）
+
+### 与 [WORKER-DOC-OVERWRITE-001] 的关系
+
+上一条是「整份覆盖」，本条是**同一天同一 Worker 的第二次毁文档，但机制不同**：
+tester-1 这次**确实用了追加**（它的自查也确实发现了负增量并主动停手上报，做得对），
+但写出去的字节是 **GBK 编码**，混进 UTF-8 文档后：
+
+- 追加点前后的字节流被撕裂 → 表头与既有条目在解析上「消失」
+- 该行内容**已不可逆丢失**：主控实测该行既不能按 UTF-8 也不能按 GBK 还原
+  （文件里落的已经是 U+FFFD 替换符本身，原文没了）
+
+### 🔴 关键澄清（Worker 的归因是错的）
+
+tester-1 报「疑似主控 ce033c1 的还原未真正恢复文件」。**实测证否**：
+`git show ce033c1:CHANGELOG.md | head` 显示表头三行与 TEST-EXEC-056 条目**完好在库**。
+**损坏发生在它本轮写入时，不是继承来的。** 归因错会导致下一次继续用同一个坏写法。
+
+### 根因
+
+Windows PowerShell 5.1 的 `Set-Content` / `Add-Content` / `>` / `>>`
+**默认按系统 ANSI 代码页（简体中文=GBK）写文件**，不是 UTF-8。
+项目里 `CHANGELOG.md` / `handoffs.md` / `logs/*.md` 全是 UTF-8。
+
+**佐证**：同一批次里 `handoffs.md` 与 `logs/20260818.md` 的追加内容**完好**
+（走的是另一条写入路径），**只有 `CHANGELOG.md` 那一行是 GBK** —— 混用写法所致。
+
+### 正确写法（三选一）
+
+```bash
+# ① bash heredoc（推荐，引号版防变量展开）
+（三种正确写法）
+
+- **bash heredoc**（推荐）：用引号版分隔符，内容整段追加，天然 UTF-8
+- **python 显式编码**：`io.open(path,'a',encoding='utf-8',newline='
+')`
+- **万不得已用 PowerShell**：必须显式 `Add-Content -Encoding utf8`
+
+**禁止**：无 `-Encoding` 的 `Set-Content` / `Add-Content` / `Out-File`，
+以及 PowerShell 里的裸 `>` / `>>`。
+
+### 自查（写完必做两条）
+
+1. `git diff --stat` —— 只允许纯增量，出现删除行即为写坏
+2. 用 grep 查替换符 U+FFFD 命中数，必须为 0；非 0 说明已有内容被污染
+
+🔴 **主控侧规程**：提交任何 Worker 的文档改动前，先看 `git diff --stat` 有无删除行。

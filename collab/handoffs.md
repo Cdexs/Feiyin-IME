@@ -473,3 +473,13 @@
 - **红线合规**：版本号 0.8.1 未动 / 未 commit / 未出包（BUILD-022 待主控下令）/ 未 push
 - **详情**：outbox/tester-1/result.md + logs/20260818.md + CHANGELOG.md
 →27 高度 28→16 断崖；新语义 `height = desired.min(available).max(1)`（尽量给、最多给到 available）。调用侧 `log::error!` 不变。真实运行域 tm≈17~19 新旧逐位一致。
+
+## 2026-08-18 — tester-1 — BUILD-022 ✅ v0.8.1 阶段五出包（fun-asr-realtime 进 exe，零生产改动）
+- **来源**：主控派单（基线 HEAD `1668abe`，主控裁定跳过回归快门）。Gavin 急着端测 fun-asr 新模型
+- **四步构建**：Step1 无残留进程（feiyin-ime-nor.exe 备份保留）→ Step2 npm build 682ms（index-3w1Jngeu.js 新）+ Tauri UI 1m49s（custom-protocol）+ cp 时间戳一致 → Step3 主程序 2m02s（110 warnings 全既有）→ Step4 同步 Publish/ 三 exe + scene/itn 两 toml 三副本（config.toml 运行时数据未覆盖）
+- **七项核验全 PASS**：① 六 exe 时间戳本次构建 ② 三 exe 两副本 sha 逐一相等（feiyin `2eac2008…`/ui `d9f13438…`/crash `fb51e32c…`）③ 两 toml 三副本 hash 全等（scene `0a3a0b9a…`/itn `b208271b…`）④ **ProductVersion 0.8.1.0/0.8.1/0.8.1.0 关键核验点通过** ⑤ **正向探针 fun-asr-realtime count=1 新模型真进包**（反向 qwen-audio count=1 两模型并存）⑥ 大小 feiyin 12,180,480B（+13.5KB 合理）/ui 不变/crash 不变 ⑦ 冒烟 PID 15184 Responding=True 无 panic
+- **Step5 E2E 门禁 0 FAIL**：65 PASS / 33 SKIP / 7 deselected（174.49s），与 BUILD-021 基线精确一致零真回归；测后清理残留 notepad
+- **红线合规**：版本号 0.8.1 未动 / 未 commit / 未 push / Publish 运行时数据未覆盖 / feiyin-ime-nor.exe 保留
+- **Gavin 端测**：设置→语音输入→ASR 模型下拉选 fun-asr-realtime（qwen 保留可切回，不需重启）；debug.log 看模型分辨行 + `[Latency]` 分段 + `words=N` 字级；`asr_online_max_sentence_silence` 隐藏字段默认 800 可独立 A/B
+- **详情**：outbox/tester-1/result.md + logs/20260818.md + CHANGELOG.md
+_geometry` 契约 4**：只改函数体，`mod tests` 不动。旧语义 desired > available 时回退 fixed_height=16，导致 tm=26→27 高度 28→16 断崖；新语义 `height = desired.min(available).max(1)`（尽量给、最多给到 available）。调用侧 `log::error!` 不变。真实运行域 tm≈17~19 新旧逐位一致。
