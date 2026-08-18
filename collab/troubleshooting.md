@@ -3727,3 +3727,37 @@ Gavin 从一开始说的就是**字体**（「字体显示得很圆润」「字�
 `apply_overlay_window_region` 的圆角硬裁剪确实无抗锯齿（`decisions.md:54` 佐证为老问题，
 当年胶囊改方形是绕开不是解决）。但它风险高（涉及 DWM 圆角 / Win10 回退 / layered 窗口
 四角像素），**不与视觉打磨批次混做**，否则回归归因困难。
+
+## [WORKER-RESTART-MODEL-RESET-001] ⚠️ 重启 Worker 后模型回落到额度耗尽的免费档，注入的上下文直接烧在失败请求里【重启前必读】
+
+**日期**：2026-08-18 ｜ **场景**：tester-1 额度耗尽，连续重启两次
+
+### 现象
+
+`replace-worker.sh tester-1 OpenCode` 重启后：
+
+1. 状态栏模型变成 **`DeepSeek V4 Flash Free · OpenCode Zen`** —— 不是重启前用的
+   `deepseek-v4-flash Ollama Cloud`。**重启会把模型重置为默认档**。
+2. 该免费档正处于 `Free usage exceeded, subscribe to Go [retrying in 11h]` 状态。
+3. 脚本注入的角色上下文被提交给这个模型 → 挂在重试队列里，
+   **Worker 看起来"活着"但永远不会响应**。
+4. 脚本自身报「上下文注入三次均失败」，但实际上**文本已经在输入框里**，
+   只是它检测不到提交成功 —— 这是误报，别据此重复注入（会叠加成一条超长消息）。
+
+### 正确顺序（否则白折腾）
+
+```
+① replace-worker.sh 重启
+② 按 Esc 若干次打断残留请求 + Ctrl+U 清空输入框
+③ /models → Enter 打开选择器 → 选中目标模型（Recent 首项通常就是）→ Enter
+④ 确认状态栏已变成目标模型
+⑤ 才手工注入角色上下文，send-keys 文本 → sleep → Enter
+```
+
+🔴 **③ 必须在 ⑤ 之前**。顺序反了，注入的长上下文会烧在一个注定失败的请求上，
+还得再打断一次。
+
+### 附带教训
+
+`/models` 必须在**输入框为空**时发。上一次没清空，`/models` 被追加到残留的
+角色上下文末尾，整段作为普通消息提交了出去。
