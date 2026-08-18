@@ -8,12 +8,15 @@
 - **054-C 边框提亮收敛**：新增文件级 `OVERLAY_BORDER_GRAY = COLORREF(0x3A3A3C)`；原 10 处散落局部 `0x060607`（含 `CIRC_BORDER`）全部改引用该常量。覆盖窗口边框、分隔线、编辑态、处理中/预览/错误态。Gavin 拍板「轮廓清楚」
 - **054-D 编辑态锯齿根因修复**：新增 `OverlayWindowState.edit_font: Option<HFONT>`；`create_edit_control` 创建 EDIT 后 `SendMessageW(WM_SETFONT)` 发独立 ClearType 字体并 `lParam=1` 立即重绘；`destroy_edit_control` 在 `DestroyWindow(edit_hwnd)` 之后 `DeleteObject(font)`。未复用 `cached_font`（其生命周期被 `take()+DeleteObject` 绑定在隐藏/退出）。圆角硬裁剪本批未动
 - **054-E 字号统一**：新增文件级 `OVERLAY_FONT_SIZE: i32 = -13`；`overlay_paint` 缓存字体与 `adjust_overlay_pos_size_for_text` 量宽字体同步替换，防止窗口宽度算错
-- **054-F 编辑态字体再大一档**：新增 `OVERLAY_EDIT_FONT_SIZE: i32 = -14` 仅供 EDIT 控件；`create_edit_control` 用 `GetTextMetricsW` 取真实 `tmHeight`，计算 `edit_h = (tmHeight + 2).max(原始固定高度)`，并让 EDIT 在 36px 窗口内垂直居中（`edit_top` 取 `top+margin`/`居中`/`top+4` 最大；`edit_bottom` 不超 `bottom-4`）。若 `tmHeight + 2 > rect_h - 8` 说明 36px 装不下，**不自行加高窗口**，回退固定高度并报 error 日志等主控决策。`adjust_overlay_pos_size_for_text` 量宽字号按 status 分支：`StreamingEditing` 用 -14，`RecordingWithText` 用 -13，避免窗口按小一号算宽导致提前滚动/截断
+- **054-F-B EDIT 框几何抽纯函数**：新增 `compute_edit_box_geometry(rect_h, tm_height, fixed_margin, corner_floor) -> (top_offset, height)`，零行为变更；desired <= available 时 height 恰好等于 desired，top_offset 仅由居中值与 `corner_floor` 决定，`fixed_margin` 不再参与 `.max()` 链；`create_edit_control` 内联算式改为调用该纯函数。
+- **054-G 字号统一为 -14**：删除 `OVERLAY_EDIT_FONT_SIZE`；`OVERLAY_FONT_SIZE` 从 -13 改为 -14（Gavin 拍板「上屏文字提上来对齐编辑态」）；`create_edit_control` 两处字体与 `adjust_overlay_pos_size_for_text` 量宽字体统一引用 `OVERLAY_FONT_SIZE`，删除 054-F 的 status 分支。
+- **字体同源复核**：全文件仅 `create_clear_type_font:325` 一处 `CreateFontW`；上屏缓存字体与 EDIT 控件字体均经此创建，face="Segoe UI" / weight=FW_NORMAL / quality=CLEARTYPE_QUALITY 完全相同。
+- **上屏裁剪复核结论**：`draw_recording_overlay_with_text` 文字区高 16px（36-10-10），DrawTextW flags `DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS`；`-14` 字体 tmHeight 估算 18~19px > 16px，**会切 g/y/p 下缘**，已报主控，未自行加高窗口。
 - **测试区同步**：`:6439/:6454/:6455/:6706` 四处测试字面量从 `0x060607` 改为 `0x3A3A3C`
 - **主控追加授权**：`BTN_BORDER` 提到文件级 `OVERLAY_BTN_BORDER = COLORREF(0x707070)`，值不动；`:6708` 亮度判据从失效的 `4x` 改为「逐通道 ≥0x20 + 总亮度方向更亮」，注释说明旧 4x 是近黑时代偶然产物
 - **验证**：`cargo fmt --all -- --check` clean / `cargo check --all-targets` 0 error（108 既有 warnings，无新增指向本批改动）/ `cargo check --manifest-path src-tauri/Cargo.toml --all-targets` 0 error
 - **红线合规**：只改 `src/main.rs`；未动版本号 0.8.0 / `bErase=false` / `pos:[0,0]`；未自行加高窗口；未 commit；未跑 `cargo test` / 未出包（阶段一）
-- **遗留**：Gavin 端测目视拍板按钮边框与窗口边框是否仍可区分；实测 `tmHeight` 数值需阶段四端测从运行日志回填；TEST-SYNC-054CDE 阶段三将把测试区改为引用生产常量
+- **遗留**：Gavin 端测目视拍板按钮边框与窗口边框是否仍可区分；上屏文字裁剪需主控/Gavin 决策是否整体加高窗口；TEST-SYNC-054CDE 阶段三将把测试区改为引用生产常量
 - **详情**：logs/20260818.md + CHANGELOG.md + result.md
 
 ## 2026-08-18 — tester-1 — E2E-HARNESS-050 ✅ 修复 E2E 两道陈年错位 + 全套 harness 修复（9 FAIL→2 FAIL，待主控验收）
