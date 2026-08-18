@@ -6691,13 +6691,16 @@ mod overlay_shimmer_tests {
         // OVERLAY-054-C: BORDER_GRAY brightened from 0x060607 to 0x3A3A3C (≈58% brightness).
         // This mid gray makes the overlay outline clearly visible against dark backgrounds.
         // TEST-SYNC-054: bind the production constant directly; no copied literal.
+        // TEST-EXEC-054: corrected channel assertions — COLORREF 0x3A3A3C = 0x00BBGGRR gives
+        // R=0x3C/G=0x3A/B=0x3A; the 054-C-era R=0x3A/B=0x3C transposition was a latent test bug
+        // (surfaced by the first full cargo test run since 054-C; production value is Gavin's ruling).
         let border_gray = super::OVERLAY_BORDER_GRAY.0;
         let r = border_gray & 0xFF;
         let g = (border_gray >> 8) & 0xFF;
         let b = (border_gray >> 16) & 0xFF;
-        assert_eq!(r, 0x3A, "OVERLAY_BORDER_GRAY red must be 0x3A");
+        assert_eq!(r, 0x3C, "OVERLAY_BORDER_GRAY red must be 0x3C");
         assert_eq!(g, 0x3A, "OVERLAY_BORDER_GRAY green must be 0x3A");
-        assert_eq!(b, 0x3C, "OVERLAY_BORDER_GRAY blue must be 0x3C");
+        assert_eq!(b, 0x3A, "OVERLAY_BORDER_GRAY blue must be 0x3A");
         // Verify brighter than old value (0x171513). Note: as a packed u32 the ordering is
         // 0x00BBGGRR, so "larger" means more blue/green/red; 0x3A3A3C > 0x131517.
         let old_gray: u32 = 0x131517;
