@@ -1,5 +1,35 @@
 # 任务列表 · voice-ime
 
+## 🔄 2026-08-18 晚 · 会话重启后现场核对（主控，控制台崩溃后重建上下文）
+
+| 项 | 实况（以 `git status` / `git log` 为准，非文档记忆） |
+| --- | --- |
+| HEAD | `7b8423c`，本地 **ahead 7**（未 push，Gavin 未授权） |
+| `src/` 工作区 | **clean** —— 昨日 handoffs 里「051-G WIP +270 未提交」**已过期**，该批已随 `663f1d5` 提交 |
+| 未提交残留 | 仅 `tests/utils/state_detector.py` (+70) 与未跟踪 `tests/test_cases/test_overlay_position.py` —— tester-1 域的 E2E 位置断言，**待确认归属后一并提交** |
+| 三 Worker | coder-1 / coder-2 / tester-1 **全部 ACK 就绪**（框架重启已清空 inbox/outbox，旧任务书被抹，[REPLACE-WORKER-TASKFILE-WIPED-001] 再现） |
+| 流水线阶段 | 051-G-FIN + 054-B-FIX 的**阶段三已完成并提交** `ce690cf`；**阶段四（TEST-EXEC）尚未跑** |
+
+### 本轮派发
+
+| 时间 | 动作 |
+| --- | --- |
+| 08-18 晚 | **OVERLAY-054-C/D/E → coder-2**（任务书 9.2KB 重写，原 6.0KB 版被框架重启抹掉）。独占 `src/main.rs` |
+
+### 排期决策：054-C/D/E 先做，阶段四合并一次跑
+
+Gavin 已明令「三个问题一起做了再出包，避免无效重复出包」。
+故**不为 051-G/054-B 单独跑一轮阶段四**，等 054-C/D/E 完成后
+走一次 TEST-SYNC-054CDE（阶段三）+ 一次全量回归（阶段四），
+最后 **BUILD-021 单包**带上：054-A 焦点恢复 / ASR-055 测试按钮 / WORDBOOK-053-C/D /
+054-B-FIX 窗口位置 / 051-G-FIN 上屏节奏 / E2E-HARNESS-050 门禁 / 054-C/D/E 视觉三项。
+
+### 🔴 出包门禁（主控自加，持续有效）
+
+出包前 **E2E 门禁必须真跑通过**，不以「读代码觉得没问题」代替运行验证。
+
+---
+
 ## 🛑 2026-08-17 当前状态 —— 下一步等 Gavin 端测 BUILD-018
 
 > 三个 Worker 全部空闲待命。**下一个动作是等 Gavin 端测结果，不是派新任务。**
