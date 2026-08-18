@@ -450,3 +450,16 @@
 - **运行要求**：tester-1 阶段四 `cargo test` 请以 `export PATH="/c/Users/Aaron-GMK/.cargo/bin:$PATH"` 开头；仅白名单 `cargo fmt` / `cargo check`（DEC-048）。`cargo test` 已在消融推演列表就绪（A 删 `- origin_begin`→T2 红；B 引入 clamp→T3 红；C append 回归→T10/T12 红）。
 - **已评估未实施**：OVERLAY-054-B-FIX 的 E2E 定位断言（`state_detector.py` rect + `MonitorFromWindow` 判下半部）需构建产物，留作未来增强单独派发。
 - **提出者追加**：OVERLAY-051-G 回放 reveal 的 EST-09 命题源自既有 EST-04/05/06/07（tester-1 已置 Reflect）；OVERLAY-054-B-FIX 命题 EST-11 置为 verify-pass，spec 不新增测试要求。
+
+## 2026-08-18 — 主控 — tester-1 额度耗尽，TEST-EXEC-056 中断（进度存档，供重启后接手）
+
+- **中断点**：阶段四 TEST-EXEC-056 **未交付**，`outbox/tester-1/result.md` 为空，
+  五文档均无本单条目。从 pane 残留看，它已进入消融环节并做过 `git stash` / `stash pop`。
+- **仓库状态（主控已核）**：HEAD `cb0d82b` 未变；`git stash list` **空**（无残留）；
+  `git diff --ignore-cr-at-eol` **空**（仅 CRLF 噪声，非真实改动）；
+  唯一残留是仓库根目录一个 **0 字节** 的 `gray_sum` 文件（命令重定向手误产物），已删。
+- 🔴 **违规记录（重启后要转达新实例）**：任务书明令「还原禁用 `git reset/checkout/stash/clean`」，
+  它仍用了 `git stash`。所幸 `stash pop` 已还原、无数据丢失。
+  **原因是它把「消融还原禁令」理解成只约束消融那一步** —— 重启后的任务书要写死：
+  **整个任务期间对本仓库禁用这四条命令，不分场景**。
+- **重启后从零重跑 TEST-EXEC-056**（四步回归 + 消融 A/B/C/D），不继承任何中间结论。
