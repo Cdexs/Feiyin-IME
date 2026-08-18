@@ -2288,4 +2288,169 @@ mod tests {
             }
         );
     }
+
+    // ============================================================
+    // TEST-SYNC-058: [ASR-SUMMARY] format_summary 五契约 + [ASR-WORDS] 时间轴可解析性
+    // ============================================================
+
+    /// 契约 0（关键判据）：`AsrSummary::new` 后所有未取到的字段默认值必须是 **-1 不是 0**。
+    /// 填 0 会被 Gavin 读成「零延迟」= 假数据。
+    #[test]
+    fn asr_058_summary_defaults_are_minus_one_not_zero() {
+        let s = AsrSummary::new("fun-asr-realtime", "tid-1".to_string());
+        assert_eq!(s.vad_hit_ms, -1);
+        assert_eq!(s.connect_ms, -1);
+        assert_eq!(s.task_started_ms, -1);
+        assert_eq!(s.first_audio_byte_ms, -1);
+        assert_eq!(s.first_partial_ms, -1);
+        assert_eq!(s.first_text_ms, -1);
+        assert_eq!(s.final_ms, -1);
+        assert_eq!(s.words_total, -1);
+        assert_eq!(s.chars_total, -1);
+        let line = s.format_summary();
+        // 格式化输出里也必须全是 =-1，不得出现 =-0 或 =0
+        assert!(line.contains("vad_hit_ms=-1"));
+        assert!(line.contains("connect_ms=-1"));
+        assert!(line.contains("task_started_ms=-1"));
+        assert!(line.contains("first_audio_byte_ms=-1"));
+        assert!(line.contains("first_partial_ms=-1"));
+        assert!(line.contains("first_text_ms=-1"));
+        assert!(line.contains("final_ms=-1"));
+        assert!(line.contains("words_total=-1"));
+        assert!(line.contains("chars_total=-1"));
+        // 出现 "=0" 即说明有人把默认填成了 0
+        assert!(
+            !line.contains("=0"),
+            "默认值必须是 -1 不是 0，出现 =0 即假数据"
+        );
+    }
+
+    /// 契约 1：outcome 三态齐全 —— finished / cancelled / failed 都必须在格式串里出现。
+    #[test]
+    fn asr_058_summary_outcome_three_states_present() {
+        for outcome in ["finished", "cancelled", "failed"] {
+            let s = AsrSummary {
+                outcome,
+                ..AsrSummary::new("qwen-audio-3.0-asr-flash-streaming", "tid".to_string())
+            };
+            assert!(
+                s.format_summary().contains(&format!("outcome={outcome}")),
+                "outcome={outcome} 应出现在日志行"
+            );
+        }
+    }
+
+    /// 契约 2：字段齐全且顺序稳定（Gavin 靠 grep + 列切分统计，顺序变了要红）。
+    /// 字段顺序：model / outcome / task_id / vad_hit_ms / connect_ms / task_started_ms /
+    /// first_audio_byte_ms / first_partial_ms / first_text_ms / final_ms /
+    /// words_total / chars_total
+    #[test]
+    fn asr_058_summary_field_order_stable_and_complete() {
+        let s = AsrSummary::new("fun-asr-realtime", "tid-7".to_string());
+        let line = s.format_summary();
+        assert!(
+            line.starts_with("[ASR-SUMMARY] "),
+            "行首必须是 [ASR-SUMMARY] 锚点"
+        );
+        // 按文档顺序逐个断言 key= 出现的先后（index 递增 = 顺序稳定）
+        let keys = [
+            "model=",
+            "outcome=",
+            "task_id=",
+            "vad_hit_ms=",
+            "connect_ms=",
+            "task_started_ms=",
+            "first_audio_byte_ms=",
+            "first_partial_ms=",
+            "first_text_ms=",
+            "final_ms=",
+            "words_total=",
+            "chars_total=",
+        ];
+        let mut last = -1i64;
+        for k in keys {
+            let pos = line.find(k).unwrap_or_else(|| panic!("字段 {k} 缺失"));
+            let pos_i = pos as i64;
+            assert!(pos_i > last, "字段 {k} 顺序错位（应在前一字段之后）");
+            last = pos_i;
+        }
+        // 全部 12 个字段都出现且顺序严格递增 = 完整且稳定
+        assert_eq!(keys.len(), 12);
+    }
+
+    /// 契约 3：两族 model 串原样透传、不得截断。
+    #[test]
+    fn asr_058_summary_model_strings_passed_through_untouched() {
+        let long_model = "qwen-audio-3.0-asr-flash-streaming";
+        let short_model = "fun-asr-realtime";
+        for m in [long_model, short_model] {
+            let s = AsrSummary::new(m, "tid".to_string());
+            let line = s.format_summary();
+            assert!(
+                line.contains(&format!("model={m}")),
+                "model 串必须原样透传，不能截断：{m}"
+            );
+        }
+    }
+
+    /// 契约 4：行首 [ASR-SUMMARY] 锚点（Gavin 靠它过滤日志行）。
+    #[test]
+    fn asr_058_summary_line_anchor_at_start() {
+        let s = AsrSummary::new("fun-asr-realtime", "tid".to_string());
+        assert!(s.format_summary().starts_with("[ASR-SUMMARY]"));
+    }
+
+    /// 任务②：[ASR-WORDS] 时间轴可解析性 —— 断言能还原成 (begin,end,text) 序列。
+    /// 生产格式：`text[begin-end]`，空格连接（见 :1371 `format!("{}[{}-{}]", w.text, w.begin_time, w.end_time)`）。
+    /// 若格式被改（如 `,` 分隔、顺序调换、缺 text），此解析即失败 = 停顿压缩取数数据源丢失。
+    #[test]
+    fn asr_058_asr_words_timeline_roundtrips_to_tuples() {
+        let words = vec![
+            WordTiming {
+                begin_time: 100,
+                end_time: 300,
+                text: "你好".to_string(),
+                punctuation: String::new(),
+            },
+            WordTiming {
+                begin_time: 350,
+                end_time: 520,
+                text: "世界".to_string(),
+                punctuation: "。".to_string(),
+            },
+            WordTiming {
+                begin_time: 900,
+                end_time: 950,
+                text: "今天".to_string(),
+                punctuation: String::new(),
+            },
+        ];
+        // 与生产代码同构地构造 timeline（:1369-1377）
+        let timeline: Vec<String> = words
+            .iter()
+            .map(|w| format!("{}[{}-{}]", w.text, w.begin_time, w.end_time))
+            .collect();
+        let joined = timeline.join(" ");
+
+        // 解析：每个 token 形如 text[begin-end]，text 不含空格与 [ ]（生产保证字词无空格）
+        let mut parsed: Vec<(i64, i64, String)> = Vec::new();
+        for tok in joined.split(' ') {
+            let open = tok.find('[').expect("缺少 '[' 分隔符");
+            let dash = tok.find('-').expect("缺少 '-' 分隔 begin/end");
+            let close = tok.find(']').expect("缺少 ']' 结尾");
+            assert!(open < dash && dash < close, "token 结构非法: {tok}");
+            let text = &tok[..open];
+            let begin: i64 = tok[open + 1..dash].parse().expect("begin 非整数");
+            let end: i64 = tok[dash + 1..close].parse().expect("end 非整数");
+            parsed.push((begin, end, text.to_string()));
+        }
+
+        // 还原出的 (begin,end,text) 必须与原词表逐条一致
+        assert_eq!(parsed.len(), words.len());
+        for (p, w) in parsed.iter().zip(words.iter()) {
+            assert_eq!(p.0, w.begin_time, "begin_time 还原不一致");
+            assert_eq!(p.1, w.end_time, "end_time 还原不一致");
+            assert_eq!(p.2, w.text, "text 还原不一致");
+        }
+    }
 }

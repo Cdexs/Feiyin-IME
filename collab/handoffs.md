@@ -483,3 +483,17 @@
 - **Gavin 端测**：设置→语音输入→ASR 模型下拉选 fun-asr-realtime（qwen 保留可切回，不需重启）；debug.log 看模型分辨行 + `[Latency]` 分段 + `words=N` 字级；`asr_online_max_sentence_silence` 隐藏字段默认 800 可独立 A/B
 - **详情**：outbox/tester-1/result.md + logs/20260818.md + CHANGELOG.md
 _geometry` 契约 4**：只改函数体，`mod tests` 不动。旧语义 desired > available 时回退 fixed_height=16，导致 tm=26→27 高度 28→16 断崖；新语义 `height = desired.min(available).max(1)`（尽量给、最多给到 available）。调用侧 `log::error!` 不变。真实运行域 tm≈17~19 新旧逐位一致。
+
+## 2026-08-19 — tester-1 — TEST-SYNC-058 ✅ 阶段三测试同步（ASR-058 埋点 + [ASR-WORDS] 时间轴，qwen_inference.rs +165 纯新增）
+
+- **来源**：主控派单（基线 HEAD `710cec9`，工作区 clean）。本批改动：建连从「VAD 命中后」提前到「录音开始即建连」（首字提速 143ms）+ AsrSummary/[ASR-SUMMARY]（15 退出点，outcome 三态，未取到填 -1）+ [ASR-WORDS] 词时间轴（仅 debug）
+- **改动**：仅 `src/transcription/qwen_inference.rs` 测试模块 +165 纯新增，6 条用例
+- **契约 0（关键判据）**：`asr_058_summary_defaults_are_minus_one_not_zero` —— AsrSummary 默认值必须 -1 不是 0（`assert!(!line.contains("=0"))` 钉死假数据）
+- **契约 1** outcome 三态齐全 / **契约 2** 行首 [ASR-SUMMARY] + 12 字段顺序严格递增（Gavin 靠 grep+列切分，顺序变了要红）/ **契约 3** 两族 model 串原样透传不截断 / **契约 4** 行首锚点
+- **任务②** `asr_058_asr_words_timeline_roundtrips_to_tuples`：[ASR-WORDS] `text[begin-end]` 空格连接格式能还原成 (begin,end,text) 序列（与生产 :1371 同构，格式被改即数据源丢失）
+- **不可测项如实**：🔴 本批最有价值改动（建连提前）无纯函数可测，正确性只能靠端测日志（connect_ms/first_text_ms），未写假护栏
+- **消融推演**：A 默认值改 0→用例1 红；B 字段顺序调换→用例3 红；C 去行首锚点→用例5+3 红
+- **验证**：cargo fmt clean / cargo check --all-targets 0 error / src-tauri check 0 error / git diff --numstat 165/0 纯增量零删除
+- **红线合规**：版本号 0.8.1 未动 / 未 commit / 未跑 test/build / 禁 git reset/checkout/stash/clean 全程未用
+- **详情**：outbox/tester-1/result.md + logs/20260818.md + CHANGELOG.md
+Binary file (standard input) matches
