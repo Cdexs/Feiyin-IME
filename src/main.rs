@@ -554,7 +554,9 @@ fn state_guard_edit_hwnd(state: &Arc<Mutex<OverlayWindowState>>) -> Option<HWND>
 // 1. desired height = (tm_height + 2).max(rect_h - 2 * fixed_margin).max(1)
 // 2. available height = (rect_h - 2 * corner_floor).max(0)
 // 3. If desired <= available, returned height must equal desired exactly.
-// 4. If desired >  available, fall back to the fixed height (rect_h - 2*fixed_margin).max(1).
+// 4. If desired >  available, clamp to available: give as much as fits, never less.
+//    (The old "fall back to fixed_height" rule was wrong: 16px is worse than 28px.)
+//    Final height = desired.min(available).max(1); .max(1) guards against tiny rect_h.
 // 5. Top offset is centered first, then clamped to corner_floor; fixed_margin must NOT
 //    participate in the top offset (it would pin the box and defeat centering).
 fn compute_edit_box_geometry(
@@ -566,11 +568,7 @@ fn compute_edit_box_geometry(
     let fixed_height = (rect_h - 2 * fixed_margin).max(1);
     let desired = (tm_height + 2).max(fixed_height);
     let available = (rect_h - 2 * corner_floor).max(0);
-    let height = if desired > available {
-        fixed_height
-    } else {
-        desired
-    };
+    let height = desired.min(available).max(1);
     let top_offset = ((rect_h - height) / 2).max(corner_floor);
     (top_offset, height)
 }
@@ -6343,17 +6341,18 @@ mod overlay_shimmer_tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn preview_brand_orange_color_value() {
-        // OVERLAY-FIX-005: BRAND_ORANGE = #FF6B00 used for title, X button, and buttons
-        const BRAND_ORANGE: u32 = 0x006BFF; // COLORREF format: 0x00BBGGRR
-                                            // Verify it is orange (high R, medium G, low B)
-        let r = BRAND_ORANGE & 0xFF;
-        let g = (BRAND_ORANGE >> 8) & 0xFF;
-        let b = (BRAND_ORANGE >> 16) & 0xFF;
-        assert_eq!(r, 0xFF, "BRAND_ORANGE must have full red channel");
-        assert_eq!(g, 0x6B, "BRAND_ORANGE must have 0x6B green channel");
-        assert_eq!(b, 0x00, "BRAND_ORANGE must have zero blue channel");
+        // OVERLAY-FIX-005: BRAND_ORANGE = #FF6B00 used for title, X button, and buttons.
+        // TEST-SYNC-054: bind the production constant directly; no copied literal.
+        let brand_orange = super::OVERLAY_BRAND_ORANGE.0;
+        let r = brand_orange & 0xFF;
+        let g = (brand_orange >> 8) & 0xFF;
+        let b = (brand_orange >> 16) & 0xFF;
+        assert_eq!(r, 0xFF, "OVERLAY_BRAND_ORANGE must have full red channel");
+        assert_eq!(g, 0x6B, "OVERLAY_BRAND_ORANGE must have 0x6B green channel");
+        assert_eq!(b, 0x00, "OVERLAY_BRAND_ORANGE must have zero blue channel");
     }
 
     // === WAVEFORM-FIX-001: Gravity decay + center spectral weighting ===
@@ -6518,16 +6517,184 @@ mod overlay_shimmer_tests {
         }
     }
 
+    // === OVERLAY-054-F-B: compute_edit_box_geometry contracts ===
+    // Pure-function tests bind the 5 documented contracts (main.rs:553-559) with the
+    // exact call-site parameters (fixed_margin = STREAMING_TEXT_TOP_MARGIN = 10,
+    // corner_floor = 4). These are behavior contracts, not implementation strings.
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn edit_box_geometry_contract1_desired_tracks_tm_height() {
+        let (top, h) = super::compute_edit_box_geometry(36, 17, 10, 4);
+        assert_eq!(h, 19, "desired = (tm_height + 2).max(fixed_height) = 19");
+        assert_eq!(top, 8);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn edit_box_geometry_contract1_fixed_height_is_floor() {
+        let (_, h) = super::compute_edit_box_geometry(36, 4, 10, 4);
+        assert_eq!(h, 16, "tiny font must still get the fixed_height floor");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn edit_box_geometry_contract1_metrics_failure_falls_back_to_fixed() {
+        // contract 1 failure state: GetTextMetricsW 失败时调用侧传入 tm_height=0
+        //（main.rs:608 got.as_bool() 分支），这是真实运行时路径，必须回退固定布局。
+        let (top, h) = super::compute_edit_box_geometry(36, 0, 10, 4);
+        assert_eq!(top, 10);
+        assert_eq!(
+            h, 16,
+            "metrics-failure tm_height=0 must fall back to fixed_height layout"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn edit_box_geometry_contract1_negative_tm_falls_back_to_fixed() {
+        // contract 1 failure state: 负数 tm_height（异常字体度量）同样回退固定布局。
+        let (top, h) = super::compute_edit_box_geometry(36, -5, 10, 4);
+        assert_eq!(top, 10);
+        assert_eq!(
+            h, 16,
+            "negative tm_height must fall back to fixed_height layout"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn edit_box_geometry_contract2_available_floor_zero() {
+        let (top, h) = super::compute_edit_box_geometry(6, 5, 10, 4);
+        assert_eq!(h, 1, "fallback fixed_height = (6 - 20).max(1) = 1");
+        assert_eq!(top, 4, "top clamps to corner_floor");
+        assert!(top + h <= 6, "box must stay inside the rect");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn edit_box_geometry_contract3_exact_desired_when_it_fits() {
+        let (_, h) = super::compute_edit_box_geometry(36, 17, 10, 4);
+        let fixed_height = (36 - 2 * 10).max(1);
+        let desired = (17 + 2).max(fixed_height);
+        assert!(
+            desired <= (36 - 2 * 4).max(0),
+            "precondition: desired must fit inside available"
+        );
+        assert_eq!(
+            h, desired,
+            "contract 3: when desired <= available, height must equal desired EXACTLY"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn edit_box_geometry_contract4_clamps_to_available_when_too_tall() {
+        // OVERLAY-054-J: desired > available 时不再"回退"到 fixed_height(16)——塌回 16 等于
+        // 主动扔掉可用像素、让裁字更严重，且制造 tm=26→27 的高度断崖（旧期望 16 正是断崖
+        // 的下半截）。新语义 height = desired.min(available).max(1)：尽量给、最多给到
+        // available(28)，error 日志另在调用侧照打。
+        let (top, h) = super::compute_edit_box_geometry(36, 40, 10, 4);
+        assert_eq!(
+            h, 28,
+            "contract 4: desired 42 > available 28, must clamp to available 28, not collapse to 16"
+        );
+        assert_eq!(top, 4, "(36 28) / 2 centered then corner_floor clamp");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn edit_box_geometry_contract4_cliff_point_removed_tm26_equals_tm27() {
+        // OVERLAY-054-J 契约钉死断崖点本身：旧实现 tm=26 高度 28 而 tm=27 塌回 16；
+        // 新语义下两者必须同为 available(28)，不允许出现任何落差。
+        let (_, h26) = super::compute_edit_box_geometry(36, 26, 10, 4);
+        let (_, h27) = super::compute_edit_box_geometry(36, 27, 10, 4);
+        assert_eq!(h26, 28, "tm=26 must already reach the available cap");
+        assert_eq!(h27, 28, "tm=27 must NOT collapse (old cliff: 28 -> 16)");
+        assert_eq!(h26, h27, "the tm=26->27 cliff point must stay flat");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn edit_box_geometry_contract5_centered_inside_corner_floor() {
+        let (top, h) = super::compute_edit_box_geometry(36, 14, 10, 4);
+        assert_eq!(h, 16);
+        assert_eq!(top, (36 - h) / 2, "top must be centered first");
+        assert_eq!(
+            top, 10,
+            "centered offset must survive the corner_floor clamp"
+        );
+        assert_eq!(top + h + top, 36, "exact symmetric centering");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn edit_box_geometry_contract7_height_monotonic_non_decreasing() {
+        // contract 7: 返回 height 必须关于 tm_height 单调不减。逐值扫描 [-5,40]：
+        // 本函数两次出错均为某个值域下的行为翻转（.max 链恒占优 / 溢出回落），
+        // 单点断言抓不住值域翻转，整段扫描才能。
+        // 阶段三首跑即在 tm=26→27 抓到真实断崖（h=28→16），OVERLAY-054-J 修复后全区间
+        // 转绿。区间不得收窄——收窄即失去发现同类值域翻转的能力。
+        let mut prev_h = i32::MIN;
+        for tm_height in -5..=40 {
+            let (_, h) = super::compute_edit_box_geometry(36, tm_height, 10, 4);
+            assert!(
+                h >= prev_h,
+                "contract 7: height must be non-decreasing in tm_height (tm={}: h={} < previous h={})",
+                tm_height,
+                h,
+                prev_h
+            );
+            prev_h = h;
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn edit_box_geometry_defect_a_top_offset_not_pinned_by_fixed_margin() {
+        // OVERLAY-043/054-F-B defect A regression: fixed_margin must never re-enter the
+        // top-offset .max() chain, otherwise centering is pinned to the legacy margin.
+        // rect_h=36 / tm_height=17 must yield top_offset=8 (not the legacy 10).
+        let (top, h) = super::compute_edit_box_geometry(36, 17, 10, 4);
+        assert_eq!(
+            top, 8,
+            "top_offset must be (36-19)/2 = 8, NOT the legacy fixed_margin 10"
+        );
+        assert_ne!(top, 10, "fixed_margin must not pin the top offset");
+        assert_eq!(h, 19);
+    }
+
+    // === OVERLAY-054-H: text-area capacity guard ===
+    // The 36px recording overlay must leave enough drawing height for the -14 ClearType
+    // font plus a 6px cushion. If this trips, 054-G/H class clipping has regressed.
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn overlay_text_area_capacity_guard() {
+        let font_h = super::OVERLAY_FONT_SIZE.unsigned_abs() as i32;
+        let drawing_area =
+            super::RECORDING_OVERLAY_SIZE[1] - 2 * super::OVERLAY_TEXT_DRAW_VERTICAL_INSET;
+        assert!(
+            drawing_area >= font_h + 6,
+            "OVERLAY-054-H: {}px drawing area must fit {}px font + 6px cushion ({}px needed)",
+            drawing_area,
+            font_h,
+            font_h + 6
+        );
+    }
+
     // === OVERLAY-FIX-006: Border darken + Shimmer rewrite + Preview adjustments ===
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn overlay_border_gray_is_mid_gray() {
         // OVERLAY-054-C: BORDER_GRAY brightened from 0x060607 to 0x3A3A3C (≈58% brightness).
         // This mid gray makes the overlay outline clearly visible against dark backgrounds.
-        const BORDER_GRAY: u32 = 0x3A3A3C; // COLORREF format: 0x00BBGGRR
-        let r = BORDER_GRAY & 0xFF;
-        let g = (BORDER_GRAY >> 8) & 0xFF;
-        let b = (BORDER_GRAY >> 16) & 0xFF;
+        // TEST-SYNC-054: bind the production constant directly; no copied literal.
+        let border_gray = super::OVERLAY_BORDER_GRAY.0;
+        let r = border_gray & 0xFF;
+        let g = (border_gray >> 8) & 0xFF;
+        let b = (border_gray >> 16) & 0xFF;
         assert_eq!(r, 0x3A, "OVERLAY_BORDER_GRAY red must be 0x3A");
         assert_eq!(g, 0x3A, "OVERLAY_BORDER_GRAY green must be 0x3A");
         assert_eq!(b, 0x3C, "OVERLAY_BORDER_GRAY blue must be 0x3C");
@@ -6535,21 +6702,15 @@ mod overlay_shimmer_tests {
         // 0x00BBGGRR, so "larger" means more blue/green/red; 0x3A3A3C > 0x131517.
         let old_gray: u32 = 0x131517;
         assert!(
-            BORDER_GRAY > old_gray,
+            border_gray > old_gray,
             "New OVERLAY_BORDER_GRAY must be brighter than old 0x171513"
         );
     }
 
-    #[test]
-    fn circ_border_matches_overlay_border_gray() {
-        // OVERLAY-054-C: CIRC_BORDER must match OVERLAY_BORDER_GRAY.
-        const BORDER_GRAY: u32 = 0x3A3A3C;
-        const CIRC_BORDER: u32 = 0x3A3A3C;
-        assert_eq!(
-            BORDER_GRAY, CIRC_BORDER,
-            "CIRC_BORDER must match OVERLAY_BORDER_GRAY"
-        );
-    }
+    // TEST-SYNC-054: circ_border_matches_overlay_border_gray deleted. The test asserted
+    // two locally copied literals (0x3A3A3C == 0x3A3A3C) against a CIRC_BORDER symbol that
+    // OVERLAY-054-C physically eliminated from production. It was a vacuous tautology; the
+    // rounded-rect outline now draws OVERLAY_BORDER_GRAY directly (guarded above).
 
     #[test]
     fn waveform_index_center_is_newest() {
@@ -6791,6 +6952,7 @@ mod overlay_shimmer_tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn btn_border_brighter_than_window_border() {
         // OVERLAY-054-C: BTN_BORDER must be visually brighter than OVERLAY_BORDER_GRAY (0x3A3A3C)
@@ -6799,15 +6961,16 @@ mod overlay_shimmer_tests {
         // era (0x060607 sum=19, so any gray passed). After brightening the window border
         // to 0x3A3A3C, the 4x multiplier no longer expresses the design intent and is
         // replaced by per-channel and aggregate checks that assert "visibly brighter".
-        const BORDER_GRAY: u32 = 0x3A3A3C;
-        const BTN_BORDER: u32 = 0x707070;
+        // TEST-SYNC-054: bind the production constants directly; no copied literals.
+        let border_gray = super::OVERLAY_BORDER_GRAY.0;
+        let btn_border = super::OVERLAY_BTN_BORDER.0;
 
-        let gray_r = (BORDER_GRAY & 0xFF) as i32;
-        let gray_g = ((BORDER_GRAY >> 8) & 0xFF) as i32;
-        let gray_b = ((BORDER_GRAY >> 16) & 0xFF) as i32;
-        let btn_r = (BTN_BORDER & 0xFF) as i32;
-        let btn_g = ((BTN_BORDER >> 8) & 0xFF) as i32;
-        let btn_b = ((BTN_BORDER >> 16) & 0xFF) as i32;
+        let gray_r = (border_gray & 0xFF) as i32;
+        let gray_g = ((border_gray >> 8) & 0xFF) as i32;
+        let gray_b = ((border_gray >> 16) & 0xFF) as i32;
+        let btn_r = (btn_border & 0xFF) as i32;
+        let btn_g = ((btn_border >> 8) & 0xFF) as i32;
+        let btn_b = ((btn_border >> 16) & 0xFF) as i32;
 
         // A) Per-channel: button must be brighter by at least 0x20 (~12.5% gray step),
         //    a commonly noticeable gray difference on dark backgrounds.

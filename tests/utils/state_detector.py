@@ -55,12 +55,9 @@ _SIZE_PATTERNS = {
 # OVERLAY-051-G / 054-B E2E 位置断言用：从 src/main.rs 实时解析 overlay 几何契约
 # （overlay_geometry，src/main.rs:3114-3134），判据与生产同源，禁止硬编码。
 _GEOMETRY_PATTERNS = {
-    # x = work.left + (work_w - size[0]) / 2  → 水平居中
-    "center_x": re.compile(
-        r"let x = work\.left \+ \(work_w - size\[0\]\) / 2;"
-    ),
     # y = work.top + (work_h - size[1] - OFFSET).max(0)  → 底部贴边 + OFFSET。
     # 提取 OFFSET 值本身，方便断言直接复用（默认 64，见 overlay_geometry）。
+    # TEST-SYNC-054：center_x 正则从未被使用（水平居中由 E2E 像素断言覆盖），已删除。
     "bottom_offset": re.compile(
         r"let y = work\.top \+ \(work_h - size\[1\] - (\d+)\)\.max\(0\);"
     ),

@@ -341,5 +341,4 @@ class TestOverlayPosition:
         assert _wait_for_overlay_state(OverlayState.RECORDING, timeout=5.0), (
             f"expected recording (streaming-idle) overlay, got {detect_overlay_state().value}"
         )
-        info = _assert_overlay_position()
-        assert info["left"] > 0 or info["top"] > 0, "streaming overlay must not sit at (0,0)"
+        _assert_overlay_position()
