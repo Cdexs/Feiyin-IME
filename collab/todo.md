@@ -1137,7 +1137,7 @@ coder-1 已把 `words={}` 加进日志。**新包出来后 Gavin 跑一次 `-deb
 | 1 | **051-G 收尾**（时间戳回放 + 三个坑） | coder-1 | 额度 |
 | 2 | 出诊断包 → Gavin `-debug` 一次 → 定回放参数 | tester-1 + Gavin | 1 |
 | 3 | **054-B 打回**：`:3117` `RecordingStreamingIdle` 仍传 `pos:[0,0]`，**在线路径仍闪左上角**（coder-2 上轮只改了本地模型路径） | coder-2 | 额度 |
-| 4 | 054-C 边框（🔴 `BORDER_GRAY` 实测 **7 处**全为近黑 `0x060607`，非主控此前所说 2 处）／ 054-D 抗锯齿（`WM_SETFONT` 全库 0 次 + GDI `RoundRect` 无抗锯齿）／ 054-E 字体大一号 | coder-2 | 额度 |
+| ~~4~~ | ~~054-C/D/E~~ ✅ 已完成并提交（`9c0b1b1`） | coder-2 | — |
 | 5 | ASR-055 端测（需有效 api_key，Worker 无法真连） | Gavin | 出包 |
 | 6 | `ASR-PERF-052` `multi_threshold_mode_enabled` 实验 | 待定 | 低优先 |
 

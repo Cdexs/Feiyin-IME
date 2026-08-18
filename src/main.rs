@@ -56,13 +56,14 @@ use windows::Win32::Graphics::Gdi::{
     AlphaBlend, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
     CreatePen, CreateRectRgn, CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject,
     DrawTextW, Ellipse, EndPaint, FillRect, GetDC, GetMonitorInfoW, GetStockObject,
-    GetTextExtentPoint32W, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, Rectangle,
-    ReleaseDC, RestoreDC, RoundRect, SaveDC, SelectClipRgn, SelectObject, SetBkColor, SetBkMode,
-    SetBrushOrgEx, SetStretchBltMode, SetTextColor, SetWindowRgn, StretchBlt, UpdateWindow,
-    AC_SRC_OVER, BLENDFUNCTION, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH,
+    GetTextExtentPoint32W, GetTextMetricsW, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx,
+    Rectangle, ReleaseDC, RestoreDC, RoundRect, SaveDC, SelectClipRgn, SelectObject, SetBkColor,
+    SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor, SetWindowRgn, StretchBlt,
+    UpdateWindow, AC_SRC_OVER, BLENDFUNCTION, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH,
     DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
     FF_DONTCARE, FW_NORMAL, HALFTONE, HDC, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_NULL, PS_SOLID, SRCCOPY, TRANSPARENT,
+    NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_NULL, PS_SOLID, SRCCOPY, TEXTMETRICW,
+    TRANSPARENT,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -548,10 +549,57 @@ fn create_edit_control(hwnd: HWND, state: &mut OverlayWindowState, rect: &RECT, 
     let class_name = encode_wide("EDIT");
     let title = encode_wide(text);
     let edit_left = rect.left + STREAMING_TEXT_LEFT_MARGIN;
-    let edit_top = rect.top + STREAMING_TEXT_TOP_MARGIN;
     let edit_right = rect.right - STREAMING_TEXT_RIGHT_MARGIN;
-    let edit_bottom = rect.bottom - STREAMING_TEXT_BOTTOM_MARGIN;
     let edit_w = (edit_right - edit_left).max(1);
+
+    // OVERLAY-054-F: size the EDIT control using the real ClearType font metrics so
+    // descenders (g/y/p) are not clipped. The overlay window is only 36px tall, and the
+    // previous fixed 10px top/bottom margins gave a 16px client area which is too small
+    // for Segoe UI at -14. We measure tmHeight on a temporary DC and let the control
+    // height be (tmHeight + 2).max(original_fixed_height). The +2 reserves a one-pixel
+    // cushion above and below the glyph bounding box.
+    let mut tm = TEXTMETRICW::default();
+    let desired_edit_h = unsafe {
+        let hdc = GetDC(hwnd);
+        let font = create_clear_type_font(OVERLAY_EDIT_FONT_SIZE);
+        let old_font = SelectObject(hdc, font);
+        let got = GetTextMetricsW(hdc, &mut tm);
+        let _ = SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
+        let _ = ReleaseDC(hwnd, hdc);
+        if !got.as_bool() {
+            log::warn!("OVERLAY-054-F: GetTextMetricsW failed; falling back to fixed edit height");
+        }
+        let tm_height = if got.as_bool() { tm.tmHeight } else { 0 };
+        let original_h =
+            (rect.bottom - rect.top - STREAMING_TEXT_TOP_MARGIN - STREAMING_TEXT_BOTTOM_MARGIN)
+                .max(1);
+        // Guard: if the 36px overlay cannot accommodate the larger font, stop and ask
+        // the orchestrator before raising the window height (which would cascade into
+        // overlay_geometry, state_detector regex, and E2E size assertions).
+        let available_for_content = (rect.bottom - rect.top - 8).max(0);
+        let requested_h = (tm_height + 2).max(original_h);
+        if requested_h > available_for_content {
+            log::error!(
+                "OVERLAY-054-F: font {} requires edit height {} but window {} only leaves {} content pixels; stopping before raising window height",
+                OVERLAY_EDIT_FONT_SIZE,
+                requested_h,
+                rect.bottom - rect.top,
+                available_for_content
+            );
+            original_h
+        } else {
+            requested_h
+        }
+    };
+    // Center the EDIT vertically inside the overlay; never let it touch the rounded border.
+    // NOTE: the old fixed STREAMING_TEXT_TOP_MARGIN must NOT participate here. Taking
+    // max() with it would pin the box at top+10 and defeat the centering, and in the
+    // tight case it also silently loses the bottom pixels the guard above just proved
+    // were available (top+10 + desired_edit_h can exceed bottom-4 even when
+    // desired_edit_h <= rect_h - 8). Only the 4px rounded-corner floor applies.
+    let edit_top = (rect.top + ((rect.bottom - rect.top - desired_edit_h) / 2)).max(rect.top + 4);
+    let edit_bottom = (edit_top + desired_edit_h).min(rect.bottom - 4);
     let edit_h = (edit_bottom - edit_top).max(1);
     let edit_hwnd = unsafe {
         CreateWindowExW(
@@ -598,11 +646,11 @@ fn create_edit_control(hwnd: HWND, state: &mut OverlayWindowState, rect: &RECT, 
                     HANDLE(old_proc as *mut std::ffi::c_void),
                 );
             }
-            // OVERLAY-054-D: give EDIT control its own ClearType font. Without this the
-            // EDIT falls back to a non-scalable system font and shows jagged glyphs.
-            // We use an independent HFONT (not cached_font) because cached_font is
+            // OVERLAY-054-D/F: give EDIT control its own ClearType font, sized one point
+            // larger than the non-edit overlay font so the user can edit comfortably. We use
+            // an independent HFONT (not cached_font) because cached_font is
             // take()+DeleteObject() when the overlay hides/destroys.
-            let edit_font = create_clear_type_font(OVERLAY_FONT_SIZE);
+            let edit_font = create_clear_type_font(OVERLAY_EDIT_FONT_SIZE);
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
                     edit_hwnd,
@@ -612,7 +660,11 @@ fn create_edit_control(hwnd: HWND, state: &mut OverlayWindowState, rect: &RECT, 
                 );
             }
             state.edit_font = Some(edit_font);
-            log::info!("ASR-038-C: created EDIT control for streaming editing");
+            log::info!(
+                "ASR-038-C: created EDIT control for streaming editing (edit_h={}, tmHeight={})",
+                edit_h,
+                tm.tmHeight
+            );
         }
         Err(e) => {
             log::error!("ASR-038-C: failed to create EDIT control: {}", e);
@@ -923,6 +975,11 @@ const OVERLAY_FONT_SIZE: i32 = -13;
 // Tests can now reference this constant instead of mirroring the literal.
 #[cfg(target_os = "windows")]
 const OVERLAY_BTN_BORDER: COLORREF = COLORREF(0x707070);
+// OVERLAY-054-F: edit-mode font is one point larger than the non-edit overlay font.
+// The EDIT control is the only consumer; measuring font for StreamingEditing must use
+// this same size so the computed window width matches the actual text.
+#[cfg(target_os = "windows")]
+const OVERLAY_EDIT_FONT_SIZE: i32 = -14;
 #[cfg(target_os = "windows")]
 const RECORDING_OVERLAY_SIZE: [i32; 2] = [240, 36]; // Recording window
 #[cfg(target_os = "windows")]
@@ -3200,8 +3257,16 @@ fn adjust_overlay_pos_size_for_text(
 
     unsafe {
         let hdc = GetDC(hwnd);
-        // OVERLAY-054-E: use file-level OVERLAY_FONT_SIZE so measuring font matches cached font.
-        let font = create_clear_type_font(OVERLAY_FONT_SIZE);
+        // OVERLAY-054-E/F: measuring font must match the font actually used to draw the text.
+        // RecordingWithText uses the cached overlay font; StreamingEditing uses the larger
+        // edit font so the window width is computed from the same metrics the EDIT control
+        // will render with, preventing premature horizontal scrolling / apparent truncation.
+        let font_size = if matches!(status, OverlayStatus::StreamingEditing { .. }) {
+            OVERLAY_EDIT_FONT_SIZE
+        } else {
+            OVERLAY_FONT_SIZE
+        };
+        let font = create_clear_type_font(font_size);
         let old_font = SelectObject(hdc, font);
         let text_w = measure_text_width(hdc, text);
         let _ = SelectObject(hdc, old_font);
