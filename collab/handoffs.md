@@ -220,3 +220,20 @@ Binary file (standard input) matches
 - **改动**：itn-rules.toml +3/-2、src/itn.rs +40。三副本 sha256 311cbb96 一致
 - **验证**：fmt clean / check 0 error / src-tauri check 0 error / UTF-8 OK
 - **红线合规**：一点半未加保护表 / check_protection 语义未改 / 未写入 main.rs/ui / 未跑 test/build / 未 commit/push / 禁 git 破坏性命令 / 版本号 0.9.0 未动 / config.toml 等未碰
+
+## 2026-08-30 夜 — tester-1 — REPRO-073 ✅ 四项端测现象实机取证完成（零生产/零用例/零出包，待主控验收）
+
+- **基线**：HEAD `9c9ff73`，取证 exe=target/release/feiyin-ime.exe（08-18 23:48，Gavin 端测同款）以 -debug 运行
+- **REP-061 闪左上角**：未复现。1044 帧全程 2ms rect 采样，overlay 从可枚举起就是终态 (1160,1292,240,36)，无中间帧。建议 Gavin 多屏/DPI 变更下复测（coder-2 054-B-FIX 或已根治此现象）
+- **REP-068 长文本跳动**：复现。宽度阶梯式 12 档增长 240→1664、x 以水平中心锚反向同步；2 次「长文本→Recording 240宽」回缩；y=1292 全程恒定（无上下跳）。**「交替闪烁」主体按数据是「长文本动态宽 vs Recording 240」拉锯（stop 后 late-StreamingText 4-5s 内 6+ 次），不是 Processing 200×36** —— coder-2 查的方向请按此修正
+- **REP-067 停顿失聪 (P0)**：复现（4 轮 3 中）。服务端在 >1.4s 静默后的句子丢尾（词流冻结在 14 words）或整句丢（新 id 全 words=0）。**vad_hit_ms 全 8 run = -1**，客户端无 end-of-speech 信号源。另外静默后新 sentence 的 display 继承前句全文再追加——服务端 sentence 上下文管理问题，不是客户端上行断
+- **REP-070 尾部丢字 (P0)**：复现（7 组 5 丢）。**服务端 word 流就停在结尾词之前（「门口集合」等从未到达客户端），LLM/注入层零丢失**。直接回答任务书：是服务端没返回，不是返回没注入。规律：≥4s 音频或含降调收尾时丢，3.3s 短句不丢
+- **REP-067/070 疑似同根**：客户端 StopSignal→finish-task 与服务端收尾间无 end-of-speech 握手，final_ms 全部远小于音频时长
+- **新疑点 3 项（建议立项）**：①ASR-SUMMARY outcome=failed 但 words_total>0（判定脱节，Gavin A/B 会被误导）②vad_hit_ms=-1 从未命中（服务端 VAD 回执没走通）③stop 后迟发 6+次/4-5s
+- **对 coder-1**：ASR-070-FIX 建议复核——本次数据显示丢失在「服务端 word 流未发送」层，final_text 改 display_text() 只能救「已到达但未断句」的场景，救不了「从未到达」的（067 同源问题）
+- **产物**：outbox/tester-1/result.md（四节+逐帧数据+7组对照表）；取证数据 240 张截图+3 份 rect CSV+debug.log 副本（3442 行）在 /c/msys64/tmp/opencode/repro073/
+- **红线合规**：tests/src/src-tauri/ui 零触碰；Publish md5 前后一致；target/release/config.toml md5 前后一致、API key 未泄漏；feiyin-ime-nor.exe 未动；系统音量 28%/C920 mic 93% 已还原；未出包未 commit；UTF-8
+
+### （补 2026-08-30 深夜）REPRO-073 验收反馈回填 —— 数据局限性声明
+
+主控验收通过并采纳 070 对照结论（已向 Gavin 更正「服务端未返回」定性）。回填一条局限性：主控复核 28 条 [ASR-SUMMARY] 出更早 2 run vad_hit_ms=637/644 正常 → 「vad_hit_ms=-1 从未命中=回执没走通」降级为待验证假设，真因更可能是 TTS 合成音频不触发 VAD；14/26 run 零识别 → 067/070 的比例型统计掺环境因素，**15:09 干净对照与窗口几何数据不受影响**。详见 result.md 附录A 局限性声明。

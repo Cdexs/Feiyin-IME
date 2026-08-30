@@ -94,6 +94,77 @@ for w in words {
   - `[ASR-SUMMARY]` 12 字段 —— 看 `first_text_ms` / `final_ms` / `words_total` / `chars_total`
 - **出包因此进入 ASR-067 的关键路径**：不出包就拿不到日志，拿不到日志就定不了根因
 
+## 🔴 ASR-074 · 在线 ASR 会话中途停止产出 + finalize 拖尾（**ASR-067 与 ASR-070 合并为同一根因**）
+
+**建单人**：主控，2026-08-30，依据 tester-1 REPRO-073 实测 + 主控独立复核。
+
+### 为什么合并
+
+ASR-067（录音中途上屏显示中断）与 ASR-070（松键后尾部文字丢失）
+三份独立证据指向**同一处机制**：
+
+| # | 证据 | 来源 |
+| --- | --- | --- |
+| 1 | 末次长录音 `final_ms=55474`，词时间轴跨度远小于录音时长；多条 run 出现 `words_total=0 / chars_total=0` 而 `final_ms` 正常 → **录音在跑、服务端不产出** | 主控分析 `target/release/debug.log` 28 条 `[ASR-SUMMARY]` |
+| 2 | 7 组尾部对照中 5 组丢失，**全部为服务端未返回**（非客户端丢弃） | tester-1 REPRO-070 |
+| 3 | `OVERLAY-043: ignoring late StreamingText after stop` 单 run 6+ 次、**持续 4-5 秒** → 松手后服务端仍在缓慢回吐 | tester-1 REPRO-073 新疑点 3 |
+
+**统一解释**：在线 ASR 会话运行中途停止产出识别结果，且 stop 后 finalize 拖尾 4-5 秒。
+中途表现为「上屏显示中断」（=ASR-067），末尾表现为「尾部文字丢失」（=ASR-070）。
+
+### 🔴 主控自陈：已提交的 ASR-070 修复**不解决本症状**
+
+提交 `958cadb` 把 `final_text()` 从「只返回 confirmed」改为「confirmed + current」。
+
+**那是一个真实的潜在缺陷，修法也正确，予以保留**
+（若服务端确实返回了尾部但未标 `sentence_end`，旧实现会丢；新实现不会）。
+
+**但它不是 Gavin 所报现象的原因。** 决定性反证（主控独立复核 `debug.log` 15:09:33）：
+
+| 环节 | 内容 |
+| --- | --- |
+| 口播 | 今天天气很好我们下午**三点在公司门口集合** |
+| `Transcribed:`（服务端返回） | 今天天气很好，我们下午。 |
+| `Injecting text:`（实际注入） | 今天天气很好，我们下午。**与上一行逐字相同** |
+
+注入层零丢失，尾部字**从未从服务端到达**。
+
+🔴 **主控 2026-08-30 曾向 Gavin 报「尾部丢字已修复」，该结论下得过早，此处更正。**
+教训：**修了一个能解释症状的缺陷 ≠ 修了造成症状的缺陷。**
+定案必须有「修复前后同场景实测对照」，静态因果链再顺也只是假设。
+与本批 `[STATIC-PROOF-MISSED-CALLGATE-001]`、ITN-071-B 的「防御性修复」属同类。
+
+### 排查方向（下一棒，**现行 exe 即可查，不必等出包**）
+
+ASR-058 埋点已在 `target/release/feiyin-ime.exe`（08-18 23:48 构建）内。
+
+1. **会话为何中途停止产出**：`qwen_inference.rs` 主循环在长录音下是否仍持续收发；
+   服务端是否发过 `task-failed` / 错误帧而被静默吞掉；
+   是否存在未处理的 WebSocket 关闭/超时
+2. **finalize 为何拖尾 4-5 秒**：stop 后到 `task-finished` 之间发生了什么
+3. **`vad_hit_ms` 异常**（🟡 tester-1 已自行降级为待验证假设，不作判据）：
+   28 条 `[ASR-SUMMARY]` 中，早期 2 条（04:19/04:21）为 637/644 正常值，
+   tester-1 的 26 条（15:xx）**全为 -1**。可能是环境差异（TTS 放音链路）而非缺陷，
+   但值得顺带确认 VAD 命中回执路径
+
+### 🟡 数据可信度限制（tester-1 已在 result.md 附录 A 如实声明）
+
+tester-1 用 TTS 放音经扬声器再由麦克风拾音，信号质量偏低：
+**26 次 run 中 14 次 `words_total=0 / chars_total=0`（完全无识别）**。
+故其统计口径（如「067 四轮三中」）可能掺入环境因素。
+**不受影响的是**：061/068 的几何数据（不依赖识别质量）、
+以及 070 的 15:09 那组干净对照（服务端返回与注入逐字比对）。
+
+### 关联的其他 REPRO-073 结论
+
+- **OVERLAY-061 未复现**：1044 帧零命中。tester-1 如实报告未复现并建议
+  **多屏 / 不同 DPI 环境复测**，主控采纳。已向 Gavin 确认其显示器配置。
+- **OVERLAY-068 覆盖面存疑**：实测交替闪烁主体为「长文本 vs Recording 240 宽」拉锯，
+  而 coder-2 的 068-B 修的是「流式 → Processing 200」路径。已要求 coder-2
+  核对覆盖面并给行号证据（不返工整体方案）。
+
+---
+
 #### 🔬 ASR-067 实测日志分析（主控 2026-08-30 23:0x，数据源 `target/release/debug.log`）
 
 **数据源合法性**：`debug.log` mtime 2026-08-30 22:24，size 159,779 —— 今晚 tester-1
@@ -1342,3 +1413,9 @@ coder-1 已把 `words={}` 加进日志。**新包出来后 Gavin 跑一次 `-deb
 - **api_key 明文存 `config.toml`**（`Publish/` 与 `target/release/` 均有），Gavin 未决定是否处理
 - `main.rs:4723`、`hotkey.rs:300` 等处中文注释**乱码**（`[ENCODING-UTF8-001]` 历史遗留，范围不止一个文件）
 - `src/main - 副本.rs` 99KB 未入 git 的旧副本残留，**删除需 Gavin 单独确认**
+
+### 🔍 REPRO-073 取证新疑点（tester-1 2026-08-30 夜，待主控定性/派发）
+
+1. **ASR-SUMMARY outcome 判定脱节**：所有成功识别 run 均标 `outcome=failed`（words_total>0 的 run 也是）——Gavin 端测 A/B 若引用该字段会被误导。查 `AsrSummary::format_summary()`（qwen_inference.rs:209-218）outcome 赋值链
+2. **vad_hit_ms=-1 从未命中**（8 run）：服务端 VAD 回执疑似从未到达客户端，客户端无 end-of-speech 信号源——与 067/070 同根
+3. **stop 后迟发窗口**：`OVERLAY-043: ignoring late StreamingText after stop` 单 run 6+ 次、持续 4-5s——REPRO-068 交替闪烁与 070 尾部丢失疑似同源 finalize 拖尾
