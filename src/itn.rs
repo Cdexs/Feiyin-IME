@@ -2973,6 +2973,46 @@ words = ["度", "摄氏度"]
         );
     }
 
+    // ITN-071-B: Gavin 端测实测用例 —— 一点半点 不被转成 1点半点。
+    // 根因：一点半点 原在 [protect.unit_collisions]（check_protection 第5步），
+    // 挪到 [protect.idioms]（第1步，最高优先级）确保保护。
+    // 消融：若从 idioms 删掉一点半点（且 unit_collisions 也没有），
+    // check_protection 返回 None → try_parse_remainder_suffix 把一点半当时间
+    // 转 1点半 → 尾部点原样 → 输出 "1点半点"，此用例变红。
+    #[test]
+    fn itn_071b_yidianbandian_protected() {
+        assert_eq!(normalize_test("差的不是一点半点"), "差的不是一点半点");
+    }
+
+    // ITN-071-B: Gavin 端测实测用例 —— 一点点 不被转成 1点点。
+    // 根因：一点点 不在任何保护集 → check_protection 返回 None →
+    // parse_cn_number 只消费"一"→ decide_conversion 因 is_date_suffix("点")=true
+    // 判转 → "1" + "点点" → "1点点"。
+    // 修法：补进 [protect.function_words]（虚词一的搭配，同一样/一起/一下）。
+    // 消融：若从 function_words 删掉一点点，
+    // check_protection 返回 None → 上述路径产出 "1点点"，此用例变红。
+    #[test]
+    fn itn_071b_yidiandian_protected() {
+        assert_eq!(normalize_test("我只是有一点点不信"), "我只是有一点点不信");
+    }
+
+    // ITN-071-B 回归护栏：合法时间转换不受影响。
+    // 一点半 不在保护表（红线：绝不许加），check_protection 对"一点半"返回 None
+    // → try_parse_remainder_suffix 正常解析为 1点半。
+    // 消融：若误把一点半加进保护表，check_protection 返回 Some(3)
+    // → 一点半被跳过 → 输出"一点半"而非"1点半"，此用例变红。
+    #[test]
+    fn itn_071b_legal_time_yidianban_still_converts() {
+        assert_eq!(normalize_test("下午一点半"), "下午1点半");
+    }
+
+    // ITN-071-B 回归护栏：一点十五分 仍正常转换。
+    // 一点十五分 不在保护表 → parse_cn_number + date_suffix 正常 → 1点15分。
+    #[test]
+    fn itn_071b_legal_time_yidianshiwufen_still_converts() {
+        assert_eq!(normalize_test("一点十五分"), "1点15分");
+    }
+
     // ============================================================
     // 保护：专有名词白名单
     // ============================================================

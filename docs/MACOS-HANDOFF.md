@@ -1336,3 +1336,9 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 - **平台中立**：`src/itn.rs` / `src/llm/mod.rs` / `src/transcription/qwen_inference.rs` 均为平台中立模块（无 cfg 门控），macOS 侧编译同份代码自动生效。`itn-rules.toml` 是平台中立规则数据，三副本同步即可（词表类改动不需构建）。
 - **ITN-071**：三五成群补词已修复（idioms 段 + 护栏）。一点半点挂起——代码层面 unit_collision_map 应保护（:2442-2453），等 Gavin 实际输入输出定方向。
 - **FMT-072**：取证存档挂起。时间线排查三结论（fe69f23 恢复完整有序清单 / 4c8f830 DECISION RULE 未变 / 94bfb0b 只碰 F3c 不碰 F3a），静态分析未找到碰坏有序路径的改动，需 API 验证。
+
+### ITN-071-B 补充（2026-08-30）
+
+- **改动范围**：`itn-rules.toml`（+3/-2，词表挪动+新增）、`src/itn.rs`（+40，护栏测试）。
+- **平台中立**：`src/itn.rs` 纯 Rust ITN 逻辑，`itn-rules.toml` 平台中立规则数据。macOS 侧编译同份代码 + 三副本同步即可生效。
+- **修复内容**：`一点半点` 从 [protect.unit_collisions] 挪到 [protect.idioms]（第1步最高优先级）；`一点点` 新增到 [protect.function_words]。根因：`decide_conversion` :2275 `is_date_suffix("点")` 把 `点` 当时间后缀误判，导致不在保护集的 `一` 开头词被转。修法在词表层面，未改 check_protection 代码逻辑。

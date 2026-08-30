@@ -208,3 +208,15 @@ Binary file (standard input) matches
 - **验证**：cargo fmt clean / cargo check --all-targets 0 error / cargo check src-tauri 0 error
 - **红线合规**：未写入 main.rs/ui / 未跑 test/build / FMT-072 未自行烧 API / 未 commit/push / 禁 git 破坏性命令 / 版本号 0.9.0 未动 / 未碰 config.toml 等运行时数据 / UTF-8
 - **详情**：outbox/coder-1/result.md + logs/20260830.md + CHANGELOG.md + collab/progress.md + docs/MACOS-HANDOFF.md
+
+## 2026-08-30 — coder-1 — ITN-071-B ✅ 时间语境路径绕过成语保护修复（待主控验收）
+
+- **来源**：Gavin 实测用例 `一点半点→1点半点`、`一点点→1点点`
+- **产出源全表**：主循环10条路径均受 :1870 check_protection 前置门控，问题在 check_protection 返回 None 而非路径绕过
+- **根因**：一点点不在任何保护集→decide_conversion :2275 is_date_suffix("点")=true 误转；一点半点在 unit_collisions(第5步)应保护但防御性挪到 idioms(第1步)
+- **修复**：一点半点 unit_collisions→idioms；一点点 新增到 function_words。一点半绝不加保护表
+- **回归**：下午一点半/一点十五分/两点半/三点一刻 全部仍正确转换
+- **护栏**：4条（Gavin原句2+回归2）各附消融推演
+- **改动**：itn-rules.toml +3/-2、src/itn.rs +40。三副本 sha256 311cbb96 一致
+- **验证**：fmt clean / check 0 error / src-tauri check 0 error / UTF-8 OK
+- **红线合规**：一点半未加保护表 / check_protection 语义未改 / 未写入 main.rs/ui / 未跑 test/build / 未 commit/push / 禁 git 破坏性命令 / 版本号 0.9.0 未动 / config.toml 等未碰

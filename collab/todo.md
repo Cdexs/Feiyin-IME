@@ -27,7 +27,7 @@
 | **OVERLAY-068** | 长文本时窗口位置跳动；切到「识别处理中」时长短两个窗口交替闪烁 | BUG | 🟠 P1 | `src/main.rs` | coder-2 | ✅ 已验收已提交 920e1d2 |
 | **OVERLAY-062** | 点击进入编辑态，文字字体显示很粗糙，提交按钮的边沿也很粗糙 | 优化 | 🟠 P1 | `src/main.rs` | coder-2 | ⬜ 待 D2D 批（DEC-055） |
 | **HOTKEY-060** | 录音、翻译热键设置时，重复拦截提示 | BUG | 🟠 P1 | `ui/src/pages/HotkeySettings.tsx` | coder-2 | 🔵 实施中 |
-| **ITN-071** | ITN 错误：`三五成群` / `一点半点` | BUG | 🟠 P1 | `src/itn.rs` | coder-1 | 🟢 三五成群已结 9506eac；一点半点 已派 ITN-071-B（coder-1 额度超限待恢复） |
+| **ITN-071** | ITN 错误：`三五成群` / `一点半点` | BUG | 🟠 P1 | `src/itn.rs` | coder-1 | 🟣 ITN-071-B 已交付待验收（一点半点挪idioms+一点点补function_words+护栏4条） |
 | **FMT-072** | 明显有序列举内容，格式化输出失败 | BUG | 🟠 P1 | `src/llm/mod.rs` | — | ⏸ Gavin 拍板挂起，下次开单（需端侧判定是否 LLM 造成） |
 | **OVERLAY-063** | 笔记框内字体再大一号 | 优化 | 🟡 P2 | `src/main.rs` | 待派 | ⬜ 待派发 |
 | **OVERLAY-066** | Overlay 窗口的高度再增加 3 个像素 | 优化 | 🟡 P2 | `src/main.rs` | 待派 | ⬜ 待派发 |

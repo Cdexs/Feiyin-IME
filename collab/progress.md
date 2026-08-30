@@ -559,6 +559,7 @@ load_wordbook_vocabulary()
 | OVERLAY-064 边框消失根因 | coder-2 阶段一：根因报告，三假设核验。本轮不改绘制（DEC-055 D2D 迁移负责）。｜ 2026-08-30 |
 | ASR-070-FIX 松键尾部文字丢失修复 | P0 数据丢失。根因 `final_text()`（qwen_inference.rs:520）只返回 confirmed_sentences 丢弃 current_sentence，依赖未验证假设「finish-task 后服务端发最后 sentence_end=true 清空 current」——Gavin 端测实证不成立。修法 A：final_text 改返回 display_text()（confirmed+current）。改动仅 qwen_inference.rs +27/-4：实现+注释改写、1 条断言更新（逐条推演 5 条仅 :1793 需改）、新增护栏用例（消融改回旧实现必红）。重复计数核查：on_result end=true 时 push confirmed 同时 clear current（原子），无重复风险。fallback 保留。验证 fmt clean/check 0 error ｜ 2026-08-30 |
 | ITN-071 三五成群补词+死代码化简 | 三五成群不在任何保护集，补进 itn-rules.toml [protect.idioms]，三副本同步+护栏2条（消融删词变红）。一点半点挂起（代码层面应保护，等 Gavin 实际输入输出定方向）。qwen_inference.rs:1404-1413 死代码化简（ASR-070 后不可达 fallback 删掉保留 bail）。FMT-072 取证挂起（时间线排查三结论存档，等 Gavin 用例+API 验证）。改动：itn-rules.toml +1、src/itn.rs +17、qwen_inference.rs +4/-6 ｜ 2026-08-30 |
+| ITN-071-B 时间语境绕过成语保护修复 | Gavin 实测：一点半点→1点半点、一点点→1点点。产出源全表：主循环10条路径均受 check_protection 前置门控。根因：一点点不在保护集→is_date_suffix("点")误转；一点半点防御性挪到 idioms 最高优先级。修法：一点半点 unit_collisions→idioms、一点点新增到 function_words。一点半绝不加保护表。回归4条全过。护栏4条。改动 itn-rules.toml+3/-2、src/itn.rs+40 ｜ 2026-08-30 |
 
 ---
 

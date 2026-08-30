@@ -195,8 +195,6 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
   };
 
   const checkAndApplyVoiceHotkey = async (vkCode: number, modifiers: number) => {
-    if (voiceFinalizedRef.current) return;
-    voiceFinalizedRef.current = true;
     try {
       const available = await invoke<boolean>('check_hotkey_available', {
         vk_code: vkCode,
@@ -218,7 +216,6 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
         resetVoiceRecordingState();
       }
     } catch {
-      voiceFinalizedRef.current = false;
       applyHotkeyIfNoDupConflict(
         voiceFinalizedRef,
         'voice',
