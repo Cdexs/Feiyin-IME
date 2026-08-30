@@ -147,3 +147,52 @@ Binary file (standard input) matches
 - **红线合规**：只改版本号未碰功能代码 / 未跑 test/build（阶段一）/ 未 commit/push / 禁用 git 破坏性命令全程未用 / 未动 ui/package.json / UTF-8 编写（bash heredoc + Edit 工具）
 - **跨平台**：版本号平台中立，macOS 侧无需同步改动，详见 docs/MACOS-HANDOFF.md §VERSION-059
 - **详情**：outbox/coder-1/result.md + logs/20260830.md + CHANGELOG.md + collab/progress.md（新建 v0.9.0 段落）
+
+## 2026-08-30 — coder-1 — ASR-067/070 取证 ✅ v0.9.0 两条 P0 根因取证（零生产改动，待主控验收）
+
+- **来源**：主控派单（基线 HEAD `9c9ff73`，v0.9.0）。两条 P0：ASR-067 停顿 1 秒后麦克风不接受输入 / ASR-070 松键后尾部文字丢失
+- **ASR-067 结论**：主控 800ms 假设大概率不成立。官方文档确认 sentence_silence 断句不断连（新句 sentence_begin 自动开始），客户端 on_result 状态机（qwen_inference.rs:472-492）正确处理新句，主循环 sentence_end=true 后无 break/return。真根因需 Gavin -debug 实测，三方向：A 服务端静默期 / B channel 积压 / C heartbeat 未过滤。🔴 需确认 Gavin 端测用哪个模型（Publish/config.toml 是 performance 本地模型，若本地则 800ms 假设完全不适用）
+- **ASR-070 结论**：根因锁定 `final_text()`（qwen_inference.rs:520-522）只返回 confirmed_sentences 不含 current_sentence。松键时若最后一段未收到 sentence_end=true 则尾部丢。候选 c（揭示进度截断）排除——最终提交取 final_text 不取 displayed_chars（reveal 只管动画）。修复点落 qwen_inference.rs，归 coder-1 与 coder-2 零冲突。建议修法：final_text 改返回 display_text
+- **文件域**：只读 qwen_inference.rs / main.rs / audio/mod.rs + 官方文档 + research；**未写入 main.rs**（coder-2 独占）
+- **红线合规**：零生产改动 / 未写入 main.rs / 未跑 test/build / 未 commit/push / 禁用 git 破坏性命令 / Publish 运行时数据只读 / 版本号 0.9.0 未动 / UTF-8
+- **需主控确认**：① Gavin 端测用哪个 ASR 模型 ② ASR-070 修法 A 是否可立项 ③ ASR-067 是否等 -debug 日志再定方案
+- **详情**：outbox/coder-1/result.md + logs/20260830.md + CHANGELOG.md
+
+---
+
+## 2026-08-19 — coder-1 — ASR-058 ✅ 首字提速 143ms + A/B 对比埋点（`qwen_inference.rs`，提交 `710cec9`）
+
+> 🔴 **本条为 2026-08-30 主控补录**：任务完成时 handoffs 未建条目，属 `[DOC-STATE-DRIFT-001]`。
+> 内容以提交正文为准，非记忆。
+
+- **来源**：RESEARCH-ASR-057（coder-1 与主控**双路独立研究**，结论收敛后实施）
+- **① 热键按下即建连**（收益 108ms，6 次实测 108-117ms 稳定）：原为串行「等 VAD 命中 → 才 DNS/TCP/TLS/WS」，改为录音一开始就建连，建连期间 `chunk_rx` 积攒音频不丢
+- **四条硬约束全遵守**：命中前零音频发送（run-task 不含音频可先发）／未说话就松手时连接优雅关闭／2s 安全网保留／🔴 **只在本次录音内提前建连，不跨录音复用**（040-C 雷区：空闲连接被服务端静默杀掉）
+- **② task-started 往返 35ms 移出关键路径**：建连提前后在 VAD 命中前即完成，35ms 自然被吸收。coder-1 **如实说明这是「被吸收」而非「并行编码」，未夸大实现**
+- **③ `[ASR-SUMMARY]` A/B 对比埋点**（Gavin 要求）：每次录音一行 12 字段汇总
+- 🔴 **口径红线写死在注释**：`first_text_ms` 起点是「首个音频字节发出」而非热键按下 —— 否则用户的反应时间会被算到服务端头上，两个模型无法公平比较
+
+## 2026-08-19 — tester-1 — TEST-EXEC-058 ✅ 阶段四过闸（1119/0/11，消融三条全实证，提交 `6009aa3`）
+
+> 🔴 **本条为 2026-08-30 主控补录**，同上。
+
+- **四步回归**：cargo test **1119/0/11**（基线 1113，+6 精确命中 TEST-SYNC-058 新增契约，零残差）／Vitest **84/84** 持平／src-tauri **76/0** 持平／pytest 按书 **SKIP**（`Publish/` 当时为 BUILD-022，早于本批）
+- **消融三条全有判别力**：A（`AsrSummary` 默认值 -1 改回 0）→ **1 红**（最关键护栏：填 0 会把「没测到」读成「零延迟」）；B（调换字段顺序）→ **1 红**；C（去行首 `[ASR-SUMMARY]` 锚点）→ **2 红**
+- **还原自证**：三次消融均编辑器还原（禁 git reset/checkout/stash/clean），`git diff -w` 0 字节，复跑逐数一致
+- **红条三分类**：③ 真回归 **0**，过闸无阻塞项
+- 🔴 **如实交代的覆盖缺口（未粉饰，主控认可）**：建连提前、15 个退出点汇总行接线 —— **无纯函数可测，阶段四也测不到**，只能靠 Gavin 端测 `[ASR-SUMMARY]` 日志验证
+
+
+## 2026-08-30 — coder-1 — ASR-070-FIX ✅ 修复松键后尾部文字丢失（qwen_inference.rs，待主控验收）
+
+- **来源**：主控派单（基线 HEAD `9c9ff73`）。ASR-070 取证已验收，根因 `final_text()` 丢弃 current_sentence 确认
+- **改动**：仅 `src/transcription/qwen_inference.rs` +27/-4
+  - `final_text()`（:520-528）：`confirmed_sentences.join("")` → `display_text()`（confirmed+current），注释改写说明根因
+  - 断言 :1793（:1795-1797）：`"第一句"` → `"第一句第二"`，加注释说明契约变更
+  - 新增护栏（:1816-1830）：`asr_070_final_text_includes_current_sentence`，消融改回旧实现必红
+- **重复计数核查**：on_result（:472-491）end=true 时 push confirmed 同时 clear current（:480/:482 原子），其余分支覆盖非追加 → 无重复风险
+- **5 条断言推演**：逐条手工推演，仅 :1793 需改（confirmed+current 场景），其余 4 条 current 为空旧新一致
+- **fallback 保留**：:1404-1413 未动，:1411-1413 改后成死代码但 bail 路径 :1409 仍必要
+- **验证**：cargo fmt clean / cargo check --all-targets 0 error / cargo check src-tauri 0 error / git diff -w 仅 qwen_inference.rs +27/-4
+- **红线合规**：只改 qwen_inference.rs 未写入 main.rs / 未跑 test/build / 未 commit/push / 禁 git 破坏性命令 / 版本号 0.9.0 未动 / 未碰 target/release/config.toml / UTF-8
+- **详情**：outbox/coder-1/result.md + logs/20260830.md + CHANGELOG.md + collab/progress.md + docs/MACOS-HANDOFF.md §ASR-070-FIX

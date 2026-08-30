@@ -19,20 +19,20 @@
 
 | ID | Gavin 原话 | 类型 | 优先级 | 文件域 | 负责人 | 状态 |
 | --- | --- | --- | --- | --- | --- | --- |
-| **VERSION-059** | 升级版本到 v0.9.0 | 版本 | 前置 | `Cargo.toml` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` | coder-1 | ✅ 已交付待验收 |
-| **ASR-067** | 输入中间有停顿（约 1 秒），接着输入就无法继续，麦克风不接受输入 | BUG | 🔴 **P0** | `src/transcription/qwen_inference.rs` (+config) | 待派 | ⬜ 待取证 |
-| **ASR-070** | 说完松开热键后，识别的文本不完整，被丢掉尾部文字 | BUG | 🔴 **P0** | `qwen_inference.rs` (+ 可能 `src/main.rs`) | 待派 | ⬜ 待取证 |
-| **OVERLAY-064** | 原来 overlay 窗口的灰色线条边框消失了，必须显示回来，否则窗口缺少质感 | BUG | 🟠 P1 | `src/main.rs` | 待派 | ⬜ 待取证 |
-| **OVERLAY-061** | 按下热键，录音窗口会先显示在屏幕左上角边沿，然后跳到屏幕下方正确位置 | BUG | 🟠 P1 | `src/main.rs` | 待派 | ⬜ 待取证 |
-| **OVERLAY-068** | 长文本时窗口位置跳动；切到「识别处理中」时长短两个窗口交替闪烁 | BUG | 🟠 P1 | `src/main.rs` | 待派 | ⬜ 待取证 |
-| **OVERLAY-062** | 点击进入编辑态，文字字体显示很粗糙，提交按钮的边沿也很粗糙 | 优化 | 🟠 P1 | `src/main.rs` | 待派 | ⬜ 待取证 |
+| **VERSION-059** | 升级版本到 v0.9.0 | 版本 | 前置 | `Cargo.toml` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` | coder-1 | ✅ 已验收已提交 9c9ff73 |
+| **ASR-067** | 输入中间有停顿（约 1 秒），接着输入就无法继续，麦克风不接受输入 | BUG | 🔴 **P0** | `src/transcription/qwen_inference.rs` (+config) | coder-1 | 🟣 取证完成：800ms 假设驳回（断句不断连），需 -debug 实测定根因 |
+| **ASR-070** | 说完松开热键后，识别的文本不完整，被丢掉尾部文字 | BUG | 🔴 **P0** | `qwen_inference.rs`（final_text() :520） | coder-1 | 🟣 已交付待验收（ASR-070-FIX） |
+| **OVERLAY-064** | 原来 overlay 窗口的灰色线条边框消失了，必须显示回来，否则窗口缺少质感 | BUG | 🟠 P1 | `src/main.rs` | coder-2 | 🟣 取证报告待验收 |
+| **OVERLAY-061** | 按下热键，录音窗口会先显示在屏幕左上角边沿，然后跳到屏幕下方正确位置 | BUG | 🟠 P1 | `src/main.rs` | coder-2 | 🟣 排查表交付，等 REPRO 实测 |
+| **OVERLAY-068** | 长文本时窗口位置跳动；切到「识别处理中」时长短两个窗口交替闪烁 | BUG | 🟠 P1 | `src/main.rs` | coder-2 | 🟣 代码改动待验收 |
+| **OVERLAY-062** | 点击进入编辑态，文字字体显示很粗糙，提交按钮的边沿也很粗糙 | 优化 | 🟠 P1 | `src/main.rs` | coder-2 | ⬜ 待 D2D 批（DEC-055） |
 | **HOTKEY-060** | 录音、翻译热键设置时，重复拦截提示 | BUG | 🟠 P1 | `ui/src/pages/HotkeySettings.tsx` | 待派 | ⬜ 待取证 |
 | **ITN-071** | ITN 错误：`三五成群` / `一点半点` | BUG | 🟠 P1 | `src/itn.rs` | 待派 | ⬜ 待取证 |
 | **FMT-072** | 明显有序列举内容，格式化输出失败 | BUG | 🟠 P1 | `src/llm/mod.rs` | 待派 | ⬜ 待取证 |
 | **OVERLAY-063** | 笔记框内字体再大一号 | 优化 | 🟡 P2 | `src/main.rs` | 待派 | ⬜ 待派发 |
 | **OVERLAY-066** | Overlay 窗口的高度再增加 3 个像素 | 优化 | 🟡 P2 | `src/main.rs` | 待派 | ⬜ 待派发 |
-| **OVERLAY-069** | 松开热键 / 编辑态提交或回车后，窗口关闭要流畅丝滑，缩短最后消失的过程，不要生硬突然关闭 | 优化 | 🟡 P2 | `src/main.rs` | 待派 | ⬜ 待派发 |
-| **OVERLAY-065** | 替换左侧麦克风图标为动态图标 | 优化 | 🟡 P2 | `src/main.rs` | 待派 | ⬜ 待派发 |
+| **OVERLAY-069** | 松开热键 / 编辑态提交或回车后，窗口关闭要流畅丝滑，缩短最后消失的过程，不要生硬突然关闭 | 优化 | 🟡 P2 | `src/main.rs` | coder-2 | ⬜ 待 D2D 批（DEC-055） |
+| **OVERLAY-065** | 替换左侧麦克风图标为动态图标 | 优化 | 🟡 P2 | `src/main.rs` | coder-2 | ⬜ 待 D2D 批（DEC-055） |
 
 **状态图例**：⬜ 待派发 / 🔵 已派发执行中 / 🟣 已交付待验收 / ✅ 已验收已提交 / 🟢 Gavin 端测通过 / ❌ 打回
 

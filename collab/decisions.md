@@ -1512,3 +1512,90 @@ Gavin 直接改规则。
 ### 关联
 
 `DEC-050`（overlay 浮层预览）｜ `DEC-051`（真流式）｜ `OVERLAY-051-G` 任务链
+
+## DEC-055 · overlay 绘制层从 GDI 迁移到 Direct2D + DirectWrite（否决「GDI+ 局部打补丁」）
+
+**拍板人**：Gavin，2026-08-30。主控给出 A/B 两案，Gavin 选 **B**。
+
+### 背景
+
+Gavin 2026-08-30 端测提交 13 项问题，其中三项**同源**，全部卡在 GDI 渲染管线的能力上限：
+
+| ID | Gavin 原话 | 卡在哪 |
+| --- | --- | --- |
+| OVERLAY-062 | 点击进入编辑态，文字字体显示很粗糙，提交按钮的边沿也很粗糙 | 文字抗锯齿 + 图形抗锯齿 |
+| OVERLAY-065 | 替换左侧麦克风图标为动态图标 | 逐帧动画的重绘成本 |
+| OVERLAY-069 | 窗口关闭要流畅丝滑，缩短最后消失的过程，不要生硬突然关闭 | 淡出动画需要高频低成本重绘 |
+
+### 取证（主控 2026-08-30 独立查证，非推测）
+
+1. **分层窗口禁用 ClearType**：overlay 窗口以
+   `WS_EX_LAYERED`（`src/main.rs:1114`）创建，并在 `:1297` 调用
+   `SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA)`。
+   Windows 在带 alpha 的分层窗口上**关闭次像素（ClearType）渲染**，文字最多拿到灰度抗锯齿。
+   这就是 Gavin 说的「字体显示很粗糙」。
+
+2. **GDI 图形不做抗锯齿**：`src/main.rs` 中 18 处 `RoundRect` 调用
+   （`:2066` / `:2143` / `:2248` / `:2474` / `:2638` / `:2715` / `:2774` / `:2897` / `:2943` / `:3018` / `:3027` 等）
+   全部走 GDI 的整像素栅格化，**没有任何抗锯齿开关**。圆角与按钮边沿必然是硬像素阶梯。
+   这就是 Gavin 说的「提交按钮的边沿也很粗糙」。
+
+3. 🔴 **OVERLAY-054-D 修的不是这个问题**：054-D 给 EDIT 控件补了 `WM_SETFONT`
+   （`src/main.rs:681-690`，`state.edit_font` 独立 HFONT）。那**是一个真 bug**
+   （控件此前根本没设字体，退回点阵字体），修得对、代码现在也确实在跑。
+   但它只解决「压根没设字体」，**解决不了管线层的糙**。
+   2026-08-30 Gavin 复报 062 时明确说「我重复提交的问题就是之前没有修复好」，
+   根因至此才定位到管线层。**教训：视觉类问题不能只查资源句柄，要一路查到栅格化管线。**
+
+### 被否决的方案 A：GDI+ 局部打补丁
+
+用 GDI+ 的 `Graphics::SetSmoothingMode(SmoothingModeAntiAlias)` 替换若干 `RoundRect` 调用点。
+
+**否决理由**：
+- 只能救图形边沿，救不了分层窗口下的文字渲染（文字仍走 GDI/ClearType 禁用路径）
+- 救不了 065 / 069 的动画需求（GDI+ 仍是 CPU 栅格化 + 位图搬运，逐帧成本高）
+- 等于在 GDI 上打第三次补丁（前两次是 FIX-006-1 边框调暗、054-C 边框提亮），
+  最后仍要重来 —— **Gavin 明确不接受这种反复**
+
+### 决策：方案 B —— Direct2D + DirectWrite 重写 overlay 绘制层
+
+| 维度 | 结论 |
+| --- | --- |
+| 图形 | Direct2D，`D2D1_ANTIALIAS_MODE_PER_PRIMITIVE`，圆角/圆形/按钮边沿全部平滑 |
+| 文字 | DirectWrite，`IDWriteTextFormat` + `D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE`，不受分层窗口 ClearType 禁用影响 |
+| 合成 | 与现有 `WS_EX_LAYERED` + `LWA_ALPHA` 兼容路径待实施时定；若需 per-pixel alpha 则走 `UpdateLayeredWindow` + D2D DXGI 表面 |
+| 动画 | D2D 硬件加速重绘，为 065（动态图标）与 069（淡出）提供逐帧低成本重绘基础 |
+| 平台 | Direct2D 是 Win7+ API，满足 DEC-000（Win10/11），无兼容性风险 |
+
+### 影响范围（🔴 派发前必须逐项评估，不得遗漏）
+
+| 受影响面 | 说明 |
+| --- | --- |
+| `src/main.rs` 全部 `draw_*` 函数 | 录音态 / 流式文字态 / 编辑态 / 处理中 / 错误态 / 焦点丢失态，**六种状态全部要迁** |
+| overlay 消息循环 | `WM_PAINT` 路径、`needs_repaint` 脏标记（OVERLAY-043）、`interpolate_step` 尺寸插值（043-B）都要重新接线 |
+| 字体缓存 | `create_clear_type_font` / `cached_font` / `state.edit_font` 三套 HFONT 生命周期管理要重构为 DirectWrite 对象 |
+| EDIT 子控件 | 编辑态用的是**真 Win32 EDIT 子窗口**，不是自绘。D2D 迁移**不能顺手把它也重写**，否则 051-A/051-D 的子类化、Enter 转发、横向滚动全部要重做 —— 本批**明确不动 EDIT 控件本身** |
+| 现有单测 | 颜色常量断言（`OVERLAY_BORDER_GRAY` / `OVERLAY_BTN_BORDER` 的测试区镜像值）、`compute_edit_box_geometry` 契约、`interpolate_step` 护栏 |
+| E2E | `tests/utils/state_detector.py` 按 `src/main.rs` 正则解析尺寸常量；窗口尺寸若变，E2E 判据同步失效 |
+| 跨平台 | Direct2D 是 Windows 独有。macOS 侧 overlay 走独立实现（DEC-045 独立窗口），**必须在 `docs/MACOS-HANDOFF.md` 记明本决策不适用于 macOS，且 Windows 侧绘制契约已换代** |
+
+### 红线
+
+1. 🔴 **不得顺手改窗口尺寸**。066（高度 +3px）是独立任务，有它自己的连锁评估（`overlay_geometry` / `state_detector` 正则 / E2E 断言），**不许混进 D2D 迁移批**。
+2. 🔴 **不得重写 EDIT 子控件**。见上表。
+3. 🔴 **不得动 `InvalidateRect` 的 `bErase=false`**（OVERLAY-043 红线）、
+   **不得动 `STREAMING_STOPPED` 门闩语义**（043 红线）、
+   **不得合并 `run_pipeline_core` 第二层 `text.trim().is_empty()` 分支**（ASR-045 红线）。
+4. 🔴 **迁移必须可分状态灰度**：先迁一个状态跑通并由 Gavin 目视确认，再迁其余，
+   **禁止六状态一次性全改**（一次全改则回归归因不可能）。
+5. 🔴 视觉结果**必须 Gavin 目视确认**，不接受静态代码论证结案
+   （`feedback_ui_visual_verification` + 本次 054-D 的教训）。
+
+### 与既有决策的关系
+
+- **DEC-003**（录音悬浮层原生 Win32 overlay / GDI 绘制）：**窗口宿主不变**，仍是原生 Win32 overlay；
+  **仅绘制后端从 GDI 换成 Direct2D**。DEC-003 的「原生 Win32」部分继续有效，「GDI」部分由本决策取代。
+- **DEC-045**（macOS 侧浮层独立窗口）：不受影响，macOS 侧不走 Direct2D。
+- **DEC-050**（流式上屏走 overlay 浮层预览，否决 TSF）：不受影响，预览载体不变。
+
+---

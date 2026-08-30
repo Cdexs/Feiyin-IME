@@ -8,6 +8,13 @@
 
 ## 0 · 先读这份，再读那两份
 
+### 0.1 · OVERLAY-061/068/064 跨平台评估（2026-08-30）
+
+- **OVERLAY-068 位置/尺寸同步逻辑**：全部位于 `src/main.rs` 的 `#[cfg(target_os = "windows")]` 消息循环内，macOS 侧目前没有等价 overlay 宿主窗口，因此本次修改对 macOS 侧**零编译影响、零行为影响**。
+- **OVERLAY-061 左上角闪屏**：根因为 Windows Win32 `CreateWindowExW` + `CW_USEDEFAULT` + `WS_POPUP` 的组合行为；macOS 侧使用 `NSPanel` 创建窗口，不存在同一机制，**不适用**。
+- **OVERLAY-064 灰色边框消失**：根因为 Windows GDI `RoundRect` 右下开区间 + DWM 圆角遮罩的组合；macOS 侧 overlay 绘制将走 AppKit/CoreGraphics，**不适用**。本次不改 GDI 绘制，统一交给下一轮 Direct2D + DirectWrite 迁移（DEC-055）。
+
+
 本文档是**入职材料**，不是工作总结。读完它你应该知道：
 1. 平台层契约长什么样、为什么这样设计（§1）
 2. 跨平台协作的硬约定与当前防线缺口（§2）—— **这节最重要，不看会破坏对方平台**
@@ -1315,3 +1322,10 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 - **平台中立**：版本号是平台中立改动，macOS 侧编译同一份 `Cargo.toml`，无需同步改动。
 - **`scripts/Info.plist` 核查**：`scripts/Info.plist:20` 的 `CFBundleShortVersionString` / `CFBundleVersion` 当前为 `0.7.3` 占位值，但 `scripts/build-macos.sh:92-147` 打包时从 `Cargo.toml` 动态读取版本号（`grep '^version' Cargo.toml`）并用 `PlistBuddy -c "Set :CFBundleShortVersionString $VERSION"` 覆盖 → `.app` 打包时 `CFBundleShortVersionString` 会自动跟随 Cargo.toml 变为 0.9.0，**不构成需手改的产品版本号**。
 - **macOS 侧无独立版本号声明**：核查 `scripts/`（build-macos.sh / env-macos.sh / setup-macos.sh / Info.plist）后确认，除 `Info.plist` 的占位值（由打包脚本动态覆盖）外，macOS 侧无其他独立产品版本号声明。
+
+### ASR-070-FIX 补充（2026-08-30）
+
+- **改动范围**：仅 `src/transcription/qwen_inference.rs`（+27/-4）。`StreamingAsrState::final_text()` 从 `confirmed_sentences.join("")` 改为 `display_text()`（confirmed + current）。
+- **平台中立**：`qwen_inference.rs` 是平台中立模块（无 cfg 门控，无平台特定 API），`StreamingAsrState`/`final_text()`/`on_result()` 纯 Rust 逻辑。macOS 侧编译同份代码，ASR-070 修复自动生效。
+- **根因**：旧 `final_text()` 丢弃 `current_sentence`，依赖未验证假设「finish-task 后服务端发最后 sentence_end=true 清空 current」。Gavin 端测实证不成立 → 松键时尾部文字丢失。修法 A 让 final_text 返回 confirmed+current。
+- **重复计数核查**：`on_result`（:472-491）end=true 时 push confirmed 同时 clear current（原子），无重复风险。macOS 侧若实现流式 ASR 接线同样受益。

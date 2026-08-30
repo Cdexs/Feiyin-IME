@@ -526,6 +526,23 @@ load_wordbook_vocabulary()
 
 ---
 
+## v0.8.1 · 在线 ASR 双模型并存与首字提速（2026-08-18 ~ 08-19，补录）
+
+> 🔴 **本段为 2026-08-30 主控补录**。原因：v0.8.1 的两项功能级改动完成时
+> 只更新了 CHANGELOG 与 logs，progress.md 从未建段，属 `[DOC-STATE-DRIFT-001]` 复现。
+> 补录内容全部以 git 提交正文为准，非记忆。
+
+| 功能 | 说明 | 日期 |
+| --- | --- | --- |
+| ASR-056 在线 ASR 双模型并存 | 集成 `fun-asr-realtime`，与既有 `qwen-audio` 族**并存可切换**（设置→语音输入→ASR 模型下拉，不需重启）。新增隐藏字段 `asr_online_max_sentence_silence`（默认 800ms）供独立 A/B。提交 `bde893e` | 2026-08-18 |
+| ASR-058 首字提速 143ms | ① **建连从「VAD 命中后」提前到「录音开始即建连」**（实测收益 108ms，6 次 108-117ms 稳定）：建连期间 `chunk_rx` 积攒音频不丢，VAD 命中时连接通常已就绪；四条硬约束全遵守——命中前零音频发送／未说话松手时连接优雅关闭／2s 安全网保留／🔴 只在本次录音内提前建连不跨录音复用（040-C 雷区：空闲连接被服务端静默杀掉）。② **task-started 往返 35ms 移出关键路径**（建连提前后自然被吸收，如实说明是「被吸收」非「并行编码」）。③ 新增 `[ASR-SUMMARY]` A/B 对比埋点：每次录音一行 12 字段汇总（model/outcome/vad_hit_ms/connect_ms/task_started_ms/first_audio_byte_ms/first_partial_ms/first_text_ms/final_ms/words_total/chars_total），🔴 口径红线写死在注释——`first_text_ms` 起点是「首个音频字节发出」而非热键按下，否则用户反应时间会被算到服务端头上，两个模型无法公平比较。方案来自 RESEARCH-ASR-057（coder-1 与主控双路独立研究，结论收敛后实施）。提交 `710cec9` | 2026-08-19 |
+
+**v0.8.1 遗留**：ASR-058 最有价值的两项改动（建连提前、15 个退出点汇总行接线）
+**无纯函数可测，阶段四也测不到**，只能靠端测 `[ASR-SUMMARY]` 日志验证。
+截至 2026-08-30 Gavin 尚未就该埋点回报数据。
+
+---
+
 ## v0.9.0 · 版本号先行升级（2026-08-30，里程碑起点，功能待入）
 
 > **版本号 0.8.1 → 0.9.0**（Gavin 2026-08-30 明确指示「升级版本到 v0.9.0」）。
@@ -537,6 +554,10 @@ load_wordbook_vocabulary()
 | 功能 | 说明 |
 | --- | --- |
 | VERSION-059 版本号升级 | 仅改版本号零功能改动。3 手改 + 2 lock 自动写回。全仓 grep 确认无第 4 处产品版本号漏列；macOS `Info.plist` 占位由 `build-macos.sh` PlistBuddy 动态覆盖非手改项。验收 6 条全过：fmt clean / 主 crate check 0 error / src-tauri check 0 error / diff 仅 5 文件 / 旧版本号 0.8.1 清零 / 新版本号 0.9.0 恰好 5 处 ｜ 2026-08-30 |
+| OVERLAY-068 位置跳动+闪烁修复 | coder-2 阶段一：流式文字 x 坐标跟随当前渲染宽度而非目标宽度；streaming Show 更新时同步 current_size=target_size，保证每帧只有一处 SetWindowPos。未碰绘制、尺寸、EDIT 控件。验证：fmt clean / check 0 error / tauri check 0 error。待 tester-1 运行时验证。｜ 2026-08-30 |
+| OVERLAY-061 左上角闪屏排查 | coder-2 阶段一：交付可见路径×是否已定位对照表；创建时坐标兜底到 (-32000,-32000)。根因待 REPRO-061 逐帧截图实证后再定。｜ 2026-08-30 |
+| OVERLAY-064 边框消失根因 | coder-2 阶段一：根因报告，三假设核验。本轮不改绘制（DEC-055 D2D 迁移负责）。｜ 2026-08-30 |
+| ASR-070-FIX 松键尾部文字丢失修复 | P0 数据丢失。根因 `final_text()`（qwen_inference.rs:520）只返回 confirmed_sentences 丢弃 current_sentence，依赖未验证假设「finish-task 后服务端发最后 sentence_end=true 清空 current」——Gavin 端测实证不成立。修法 A：final_text 改返回 display_text()（confirmed+current）。改动仅 qwen_inference.rs +27/-4：实现+注释改写、1 条断言更新（逐条推演 5 条仅 :1793 需改）、新增护栏用例（消融改回旧实现必红）。重复计数核查：on_result end=true 时 push confirmed 同时 clear current（原子），无重复风险。fallback 保留。验证 fmt clean/check 0 error ｜ 2026-08-30 |
 
 ---
 

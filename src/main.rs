@@ -1115,8 +1115,12 @@ fn run_overlay_thread(
             PCWSTR(class_name.as_ptr()),
             PCWSTR(window_title.as_ptr()),
             WS_POPUP,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            // OVERLAY-061: create off-screen so the initial 1x1 window never flashes at (0,0)
+            // if a frame is composited before ShowWindow(SW_HIDE) lands. WS_POPUP with
+            // CW_USEDEFAULT has undefined position and commonly resolves to the top-left
+            // corner of the primary monitor.
+            -32000,
+            -32000,
             1,
             1,
             None,
@@ -1144,6 +1148,9 @@ fn run_overlay_thread(
         );
         if result.is_ok() {
             log::info!("DWM rounded corners enabled (Windows 11+)");
+            // OVERLAY-064: H1 under investigation — DWM rounded-corner compositing may clip the
+            // outermost 1px border drawn by GDI. This is documented for the root-cause report only;
+            // any real fix will be handled in the Direct2D migration per DEC-055.
         } else {
             log::info!("DWM rounded corners not available, using SetWindowRgn fallback");
         }
@@ -1205,10 +1212,22 @@ fn run_overlay_thread(
                                 state.last_resize_time = Some(now);
                                 state.target_size = desired_size;
                                 state.pending_size = Some(desired_size);
-                                // center horizontally based on the target width
+                                // OVERLAY-068-A: position must follow the *current* rendered width,
+                                // not the target width. If x is centered on desired_size while the
+                                // window is still interpolating toward it, the window visibly jumps
+                                // because the left edge snaps to a new center before the right edge
+                                // has caught up. Use the width that will actually be applied this frame.
+                                let applied_size = if desired_size[0] > state.current_size[0] {
+                                    desired_size
+                                } else {
+                                    // For shrinking we are still interpolating; keep x centered on
+                                    // the in-flight current width so the window does not hop.
+                                    state.current_size
+                                };
+                                // center horizontally based on the width applied this frame
                                 let work = monitor_work_rect(hwnd);
                                 let work_w = work.right - work.left;
-                                let x = work.left + (work_w - desired_size[0]) / 2;
+                                let x = work.left + (work_w - applied_size[0]) / 2;
                                 let y = pos[1];
                                 final_pos = [x, y];
                             } else if let Some(size) = state.pending_size {
@@ -1289,6 +1308,15 @@ fn run_overlay_thread(
                         if !is_streaming_text {
                             state.target_size = computed_size;
                             state.current_size = computed_size;
+                        } else {
+                            // OVERLAY-068-B: streaming-to-streaming Show updates must also
+                            // snap current_size to the target so the interpolation loop has
+                            // nothing to do this frame. The unconditional SetWindowPos below
+                            // (OVERLAY-046) is the single point that applies position/size;
+                            // the interpolation path only runs when current_size != target_size.
+                            // Leave target_size as-is because adjust_overlay_pos_size_for_text
+                            // already wrote the new desired target above.
+                            state.current_size = state.target_size;
                         }
                         state.needs_repaint = true;
                     }
@@ -1641,22 +1669,32 @@ fn run_overlay_thread(
         }
 
         if size_interpolation_done {
-            if let Ok(state) = shared_state.lock() {
-                if let Some(ref req) = state.request {
+            if let Ok(mut state) = shared_state.lock() {
+                // OVERLAY-068-A R1: during shrinking interpolation the window width changes
+                // every frame but the x stored in req.pos stays stale. Recompute x from the
+                // *just-updated* current_size so the window remains horizontally centered
+                // for every interpolated frame. y never changes during a resize.
+                let current_width = state.current_size[0];
+                let current_height = state.current_size[1];
+                if let Some(ref mut req) = state.request {
                     // OVERLAY-054-B-FIX F2: 与 :1044 Show 端同源的兜底，不硬编码 [0,0]。
                     // 当前 Show 端保证 Some，但一旦将来有路径让它是 None，硬编码会让窗口
                     // 瞬间回到左上角——这正是本轮要根治的模式，必须从类型层面堵死。
-                    let pos = req
+                    let mut pos = req
                         .pos
                         .unwrap_or_else(|| overlay_geometry(&req.status, hwnd).0);
+                    let work = monitor_work_rect(hwnd);
+                    let work_w = work.right - work.left;
+                    pos[0] = work.left + (work_w - current_width) / 2;
+                    req.pos = Some(pos);
                     unsafe {
                         let _ = SetWindowPos(
                             hwnd,
                             None,
                             pos[0],
                             pos[1],
-                            state.current_size[0],
-                            state.current_size[1],
+                            current_width,
+                            current_height,
                             SWP_NOACTIVATE | SWP_NOZORDER,
                         );
                     }
