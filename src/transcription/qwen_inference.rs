@@ -515,10 +515,15 @@ impl StreamingAsrState {
 
     /// 取最终文本（松键后交给 LLM）
     ///
-    /// 只含 confirmed 句，不含未确认的 current_sentence
-    /// （finish-task 后服务端会发最后一个 sentence_end=true，届时 current 清空）
+    /// ASR-070: 返回 confirmed + current（与 `display_text()` 同语义）。
+    /// 旧实现只返回 `confirmed_sentences.join("")`，依赖一个未经验证的假设
+    /// 「finish-task 后服务端会发最后一个 sentence_end=true，届时 current 清空」。
+    /// Gavin 2026-08-30 端测实证该假设不成立：松键时最后一段话常未收到
+    /// sentence_end=true，current_sentence 的内容被静默丢弃 → 尾部文字丢失。
+    /// 修法：final_text 返回 confirmed + current，宁可多给绝不少给
+    /// （与 OVERLAY-051-G 契约 5 同向），LLM 后半段会做纠错。
     pub fn final_text(&self) -> String {
-        self.confirmed_sentences.join("")
+        self.display_text()
     }
 
     /// 已确认句数
@@ -1790,7 +1795,9 @@ mod tests {
         state.on_result(1, "第一句", true, &[]);
         state.on_result(2, "第二", false, &[]);
         assert_eq!(state.display_text(), "第一句第二");
-        assert_eq!(state.final_text(), "第一句");
+        // ASR-070: 旧断言 == "第一句" 编码的是「丢弃 current」的缺陷契约，
+        // Gavin 2026-08-30 端测实证丢字，契约已改为 confirmed+current。
+        assert_eq!(state.final_text(), "第一句第二");
         state.on_result(2, "第二句", true, &[]);
         assert_eq!(state.display_text(), "第一句第二句");
         assert_eq!(state.final_text(), "第一句第二句");
@@ -1804,6 +1811,22 @@ mod tests {
         state.on_result(3, "C", true, &[]);
         assert_eq!(state.final_text(), "ABC");
         assert_eq!(state.confirmed_count(), 3);
+    }
+
+    // ASR-070: 钉死新契约的核心场景 —— confirmed 非空且 current 非空时，
+    // final_text() 必须返回两者拼接（旧实现只返回 confirmed，丢 current）。
+    // 消融自证：若把 final_text 改回 confirmed_sentences.join("")，
+    // 这条用例的 assert_eq 会因 "第一句" != "第一句第二" 而变红。
+    #[test]
+    fn asr_070_final_text_includes_current_sentence() {
+        let mut state = StreamingAsrState::new();
+        state.on_result(1, "第一句", true, &[]);
+        state.on_result(2, "第二", false, &[]);
+        // confirmed=["第一句"], current="第二" → final_text 必须含两者
+        assert_eq!(state.final_text(), "第一句第二");
+        assert_eq!(state.display_text(), "第一句第二");
+        // final_text 与 display_text 同语义（ASR-070 修法 A）
+        assert_eq!(state.final_text(), state.display_text());
     }
 
     // --- vocabulary 构造 ---
