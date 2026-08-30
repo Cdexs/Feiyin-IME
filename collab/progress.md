@@ -526,6 +526,20 @@ load_wordbook_vocabulary()
 
 ---
 
+## v0.9.0 · 版本号先行升级（2026-08-30，里程碑起点，功能待入）
+
+> **版本号 0.8.1 → 0.9.0**（Gavin 2026-08-30 明确指示「升级版本到 v0.9.0」）。
+> 定为 minor bump 的理由：Gavin 已提交 13 项端测问题（overlay 视觉 6 项 + ASR 2 项 P0 + 热键 1 项 + ITN/格式化 2 项 + 交互优化 2 项）构成独立里程碑批次，版本号先行升级，后续本批所有改动归入 v0.9.0。
+> 三处已改：`Cargo.toml:3` / `src-tauri/Cargo.toml:3` / `src-tauri/tauri.conf.json:9`；
+> `Cargo.lock:5893` / `src-tauri/Cargo.lock:934` 由 cargo 自动同步；
+> `ui/package.json`（0.1.0）与产品版本号独立，未动。
+
+| 功能 | 说明 |
+| --- | --- |
+| VERSION-059 版本号升级 | 仅改版本号零功能改动。3 手改 + 2 lock 自动写回。全仓 grep 确认无第 4 处产品版本号漏列；macOS `Info.plist` 占位由 `build-macos.sh` PlistBuddy 动态覆盖非手改项。验收 6 条全过：fmt clean / 主 crate check 0 error / src-tauri check 0 error / diff 仅 5 文件 / 旧版本号 0.8.1 清零 / 新版本号 0.9.0 恰好 5 处 ｜ 2026-08-30 |
+
+---
+
 ## macOS 双平台 · A 阶段（2026-07-29~30）· ✅ 编译打通
 
 > 治理约束：**DEC-034**（跨平台兼容为首要约束 + 单仓库两端并行）｜ 版本号未动，仍 v0.7.2

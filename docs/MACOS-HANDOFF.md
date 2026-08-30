@@ -1308,3 +1308,10 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 - **改动内容**：`OverlayRequest.pos` 从 `[i32; 2]` 改为 `Option<[i32; 2]>`。语义：`None` = 调用方没有位置可给，overlay 线程在 Show 时通过 `overlay_geometry(&status, hwnd)` 解析默认位置。Show 端入口 `unwrap_or_else` 兜底，解析后写回 `Some(resolved)`，后续读取点保证 `Some`。
 - **macOS 侧契约**：`platform::OverlayRequest`（平台抽象层，`src/platform/mod.rs`）不受影响——它用的是 `OverlayCommand` enum 的跨平台抽象，不直接暴露 `pos` 字段。macOS 若实现 overlay 需自行决定位置解析策略，本改动的 `Option` 语义是 Windows 实现细节。
 - **红线遵守**：未动 OVERLAY-046 的无条件 `SetWindowPos`（`:1175` 区域，只是改读 `resolved_pos` 而非 `request.pos[0]`，调用本身保留）；未动 `InvalidateRect bErase=false`；未动 051-G 揭示逻辑 / `interpolate_step` / `STREAMING_STOPPED` 门闩。
+
+### VERSION-059 补充（2026-08-30）
+
+- **改动范围**：版本号升级 v0.8.1 → v0.9.0。仅 3 处手改：`Cargo.toml:3` / `src-tauri/Cargo.toml:3` / `src-tauri/tauri.conf.json:9`；`Cargo.lock` / `src-tauri/Cargo.lock` 由 cargo 自动同步。
+- **平台中立**：版本号是平台中立改动，macOS 侧编译同一份 `Cargo.toml`，无需同步改动。
+- **`scripts/Info.plist` 核查**：`scripts/Info.plist:20` 的 `CFBundleShortVersionString` / `CFBundleVersion` 当前为 `0.7.3` 占位值，但 `scripts/build-macos.sh:92-147` 打包时从 `Cargo.toml` 动态读取版本号（`grep '^version' Cargo.toml`）并用 `PlistBuddy -c "Set :CFBundleShortVersionString $VERSION"` 覆盖 → `.app` 打包时 `CFBundleShortVersionString` 会自动跟随 Cargo.toml 变为 0.9.0，**不构成需手改的产品版本号**。
+- **macOS 侧无独立版本号声明**：核查 `scripts/`（build-macos.sh / env-macos.sh / setup-macos.sh / Info.plist）后确认，除 `Info.plist` 的占位值（由打包脚本动态覆盖）外，macOS 侧无其他独立产品版本号声明。
