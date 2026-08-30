@@ -1613,8 +1613,7 @@ Gavin 2026-08-30 端测提交 13 项问题，其中三项**同源**，全部卡�
 🔴 **这是依赖变更，不是纯代码改动**：
 - 按 worker-guide 第十节，`Cargo.toml` 依赖变更**必须派发 BUILD 给 tester-1**，coder 不得自行构建
 - 首次编译会显著变慢（新增 Windows API 绑定），要给 tester-1 预期
-- macOS 侧 `Cargo.toml` 共用，这些 feature 在 `[target.'cfg(target_os = "windows")']` 之外还是之内，
-  必须核清楚，否则 macOS 构建会炸。**这一条派发时要明确写进任务书**
+- ~~macOS 侧 Cargo.toml 共用，需核清 feature 在 Windows target 段之内还是之外~~ —— **2026-08-30 主控已核实排除**：`Cargo.toml:90` 即 `[target.'cfg(target_os = "windows")'.dependencies]`，`windows` crate（`:91`）本就在该段内，加 Direct2D feature **天然不影响 macOS 构建**，无需额外评估
 
 #### 前提二：绘制有唯一入口，灰度迁移可行（好消息）
 
