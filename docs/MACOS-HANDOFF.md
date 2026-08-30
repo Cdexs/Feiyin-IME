@@ -1329,3 +1329,10 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 - **平台中立**：`qwen_inference.rs` 是平台中立模块（无 cfg 门控，无平台特定 API），`StreamingAsrState`/`final_text()`/`on_result()` 纯 Rust 逻辑。macOS 侧编译同份代码，ASR-070 修复自动生效。
 - **根因**：旧 `final_text()` 丢弃 `current_sentence`，依赖未验证假设「finish-task 后服务端发最后 sentence_end=true 清空 current」。Gavin 端测实证不成立 → 松键时尾部文字丢失。修法 A 让 final_text 返回 confirmed+current。
 - **重复计数核查**：`on_result`（:472-491）end=true 时 push confirmed 同时 clear current（原子），无重复风险。macOS 侧若实现流式 ASR 接线同样受益。
+
+### ITN-071/FMT-072 补充（2026-08-30）
+
+- **改动范围**：`itn-rules.toml`（+1，三五成群补进 [protect.idioms]）、`src/itn.rs`（+17，护栏测试）、`src/transcription/qwen_inference.rs`（+4/-6，死代码化简）。`src/llm/mod.rs` 零改动（FMT-072 只取证）。
+- **平台中立**：`src/itn.rs` / `src/llm/mod.rs` / `src/transcription/qwen_inference.rs` 均为平台中立模块（无 cfg 门控），macOS 侧编译同份代码自动生效。`itn-rules.toml` 是平台中立规则数据，三副本同步即可（词表类改动不需构建）。
+- **ITN-071**：三五成群补词已修复（idioms 段 + 护栏）。一点半点挂起——代码层面 unit_collision_map 应保护（:2442-2453），等 Gavin 实际输入输出定方向。
+- **FMT-072**：取证存档挂起。时间线排查三结论（fe69f23 恢复完整有序清单 / 4c8f830 DECISION RULE 未变 / 94bfb0b 只碰 F3c 不碰 F3a），静态分析未找到碰坏有序路径的改动，需 API 验证。

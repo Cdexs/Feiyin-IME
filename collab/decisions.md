@@ -1599,3 +1599,65 @@ Gavin 2026-08-30 端测提交 13 项问题，其中三项**同源**，全部卡�
 - **DEC-050**（流式上屏走 overlay 浮层预览，否决 TSF）：不受影响，预览载体不变。
 
 ---
+
+### DEC-055 实施附录（主控 2026-08-30 补，派发 D2D 批前的地基勘测）
+
+#### 前提一：`windows` crate 当前**没有** Direct2D/DirectWrite feature
+
+`Cargo.toml:91-107` 现有 15 个 feature，与绘制相关的只有
+`Win32_Graphics_Gdi` 与 `Win32_Graphics_Dwm`。**Direct2D / DirectWrite / DXGI 一个都没有。**
+
+迁移前必须补：`Win32_Graphics_Direct2D`、`Win32_Graphics_DirectWrite`，
+若走 `UpdateLayeredWindow` + DXGI 表面路线还需 `Win32_Graphics_Dxgi`、`Win32_Graphics_Direct3D11`。
+
+🔴 **这是依赖变更，不是纯代码改动**：
+- 按 worker-guide 第十节，`Cargo.toml` 依赖变更**必须派发 BUILD 给 tester-1**，coder 不得自行构建
+- 首次编译会显著变慢（新增 Windows API 绑定），要给 tester-1 预期
+- macOS 侧 `Cargo.toml` 共用，这些 feature 在 `[target.'cfg(target_os = "windows")']` 之外还是之内，
+  必须核清楚，否则 macOS 构建会炸。**这一条派发时要明确写进任务书**
+
+#### 前提二：绘制有唯一入口，灰度迁移可行（好消息）
+
+全部 13 个绘制函数都收敛在单一入口 **`draw_overlay_to_dc`（`src/main.rs:1959`）**，
+且**全部以裸 `HDC` 为参数**：
+
+| 分类 | 函数 |
+| --- | --- |
+| 入口 | `draw_overlay_to_dc:1959` |
+| 通用件 | `draw_text:366`、`draw_overlay_chrome:2089` |
+| 录音态 | `draw_recording_overlay:2386`、`draw_recording_indicator_and_waveform:2120`、`draw_recording_indicator:2543`、`draw_stop_button:2338` |
+| 流式文字态 | `draw_recording_overlay_with_text:2406`、`draw_listening_placeholder:2633`、`draw_submit_button:2494` |
+| 编辑态 | `draw_editing_overlay_chrome:2657` |
+| 处理中 | `draw_processing_overlay:2785` |
+| 预览 | `draw_preview_overlay:2912` |
+| 错误态 | `draw_error_overlay:3104` |
+
+**意义**：DEC-055 红线 4 要求「分状态灰度迁移，禁止六状态一次性全改」——
+单一入口让这件事真正可行：在 `draw_overlay_to_dc` 里按状态分流，
+已迁移的状态走 D2D、未迁移的继续走 GDI，两套并存直到全部迁完。
+**派发时必须要求 Worker 采用这个结构，而不是原地替换。**
+
+#### 建议的迁移顺序（等 Gavin 逐个目视确认）
+
+| 序 | 状态 | 理由 |
+| --- | --- | --- |
+| 1 | **处理中 `draw_processing_overlay`** | 最简单（无波形、无文字滚动、无子控件、无插值），是验证 D2D 管线是否接通的最小闭环；出问题影响面最小 |
+| 2 | **错误态 `draw_error_overlay`** | 同上，结构近似，可复用第 1 步搭好的资源管理 |
+| 3 | **录音态 `draw_recording_overlay` + 波形** | Gavin 的 OVERLAY-065（动态麦克风图标）落在这里；波形是逐帧动画，正是 D2D 的主场 |
+| 4 | **流式文字态 `draw_recording_overlay_with_text`** | 最复杂：涉及横向滚动、字宽度量、051-G 时间戳回放。放最后 |
+| 5 | **编辑态 `draw_editing_overlay_chrome`** | 🔴 只迁**自绘边框部分**；EDIT 子控件是真 Win32 控件，DEC-055 红线 2 明令不动 |
+
+**OVERLAY-062（字体/边沿粗糙）在第 1 步就能得到部分验证** ——
+处理中浮层也有圆角与文字，Gavin 看第一版就能判断 D2D 的观感是否达标，
+不必等全部迁完才知道方向对不对。
+
+#### 与另外两项优化的关系
+
+- **OVERLAY-063（字号再大一号）**：D2D 用 DirectWrite 的字号语义与 GDI 的负数字号
+  （当前 `OVERLAY_FONT_SIZE = -14`）**不是一回事**。迁移后再定字号，
+  否则先在 GDI 上调了、迁完还得重调。**排在迁移之后。**
+- **OVERLAY-066（窗口高度 +3px）**：与绘制后端无关，但会连锁
+  `overlay_geometry` / `tests/utils/state_detector.py` 正则 / E2E 尺寸断言。
+  **可以独立于 D2D 先做，也可以迁完再做**，但**绝不能混在 D2D 批里**（DEC-055 红线 1）。
+
+---

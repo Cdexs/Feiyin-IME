@@ -1401,16 +1401,14 @@ pub fn transcribe_streaming_realtime(
                         "Online ASR task finished: {} confirmed sentences",
                         state.confirmed_count()
                     );
+                    // ASR-070: final_text() 现等价于 display_text()（confirmed + current）。
+                    // 全空 → bail；非空 → 直接返回。
+                    // （旧实现 final_text 只含 confirmed，此处曾 fallback 到 display_text
+                    //   补取 current，ASR-070 修法 A 后两者同语义，fallback 分支已不可达，化简。）
                     if final_text.is_empty() {
-                        let display = state.display_text();
-                        if display.is_empty() {
-                            log::info!("{}", summary.format_summary());
-                            summary.outcome = "failed";
-                            bail!("转录失败：task-finished 但无识别结果");
-                        }
                         log::info!("{}", summary.format_summary());
-                        summary.outcome = "finished";
-                        return Ok(display);
+                        summary.outcome = "failed";
+                        bail!("转录失败：task-finished 但无识别结果");
                     }
                     log::info!("{}", summary.format_summary());
                     summary.outcome = "finished";

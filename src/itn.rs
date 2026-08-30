@@ -2956,6 +2956,23 @@ words = ["度", "摄氏度"]
         assert_eq!(normalize_test("他做事三心二意的"), "他做事三心二意的");
     }
 
+    // ITN-071: 三五成群 是含数字成语，必须被保护不转成 35成群。
+    // 消融：若从 itn-rules.toml [protect.idioms] 删掉 "三五成群"，
+    // idiom_set 不含该词 → check_protection 返回 None → parse_cn_number
+    // 把"三"转"3"、"五"转"5" → 输出 "35成群"，此用例变红。
+    #[test]
+    fn protect_idiom_sanwuchengqun() {
+        assert_eq!(normalize_test("三五成群"), "三五成群");
+    }
+
+    #[test]
+    fn protect_idiom_sanwuchengqun_in_sentence() {
+        assert_eq!(
+            normalize_test("同学们三五成群地走着"),
+            "同学们三五成群地走着"
+        );
+    }
+
     // ============================================================
     // 保护：专有名词白名单
     // ============================================================

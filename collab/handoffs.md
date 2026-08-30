@@ -196,3 +196,15 @@ Binary file (standard input) matches
 - **验证**：cargo fmt clean / cargo check --all-targets 0 error / cargo check src-tauri 0 error / git diff -w 仅 qwen_inference.rs +27/-4
 - **红线合规**：只改 qwen_inference.rs 未写入 main.rs / 未跑 test/build / 未 commit/push / 禁 git 破坏性命令 / 版本号 0.9.0 未动 / 未碰 target/release/config.toml / UTF-8
 - **详情**：outbox/coder-1/result.md + logs/20260830.md + CHANGELOG.md + collab/progress.md + docs/MACOS-HANDOFF.md §ASR-070-FIX
+
+## 2026-08-30 — coder-1 — ITN-071/FMT-072 ✅ 三五成群补词+护栏 / 一点半点挂起 / FMT-072取证挂起 / 死代码化简（待主控验收）
+
+- **来源**：主控派单（基线 HEAD `958cadb`）。ITN-071 两条 ITN 错误 + FMT-072 有序列举失败 + 顺带清理 qwen_inference 死代码
+- **① 三五成群（已修复）**：不在任何保护集，补进 `itn-rules.toml [protect.idioms]`（:163），三副本同步 `be2ef5c7...`。护栏 2 条，消融删词变红
+- **② 一点半点（挂起）**：代码层面 unit_collision_map 一桶 + check_protection 第五步应匹配保护，主控独立复核属实。卡点不在代码而在不知道 Gavin 实际方向，等 Gavin 用例
+- **③ FMT-072（取证挂起）**：时间线排查三结论存档，静态分析未找到碰坏有序路径的改动，需 API 验证，主控已向 Gavin 索要用例
+- **④ 死代码化简**：qwen_inference.rs:1404-1413 不可达 fallback 化简，保留 bail，+4/-6 行为不变
+- **改动**：itn-rules.toml +1、src/itn.rs +17、qwen_inference.rs +4/-6。src/llm/mod.rs 零改动
+- **验证**：cargo fmt clean / cargo check --all-targets 0 error / cargo check src-tauri 0 error
+- **红线合规**：未写入 main.rs/ui / 未跑 test/build / FMT-072 未自行烧 API / 未 commit/push / 禁 git 破坏性命令 / 版本号 0.9.0 未动 / 未碰 config.toml 等运行时数据 / UTF-8
+- **详情**：outbox/coder-1/result.md + logs/20260830.md + CHANGELOG.md + collab/progress.md + docs/MACOS-HANDOFF.md

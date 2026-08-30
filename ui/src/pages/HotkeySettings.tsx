@@ -66,7 +66,7 @@ function getHotkeyDisplayName(vkCode: number, modifiers: number): string {
   return parts.join('+');
 }
 
-const TRANSLATION_SINGLE_KEYS = [0xA3, 0xA2, 0xA5, 0xA4];
+
 
 export function voiceKeySet(vkCode: number, modifiers: number): Set<number> {
   const set = new Set<number>();
@@ -126,78 +126,120 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
   const pressedModsRef = useRef<Set<string>>(new Set());
   const hadNonModifierKeyRef = useRef(false);
   const altGrSynthCtrlActiveRef = useRef(false);
-  const finalizedRef = useRef(false);
+  const voiceFinalizedRef = useRef(false);
   const [voiceRecordingPreview, setVoiceRecordingPreview] = useState<string>('');
 
   const [isRecordingTranslation, setIsRecordingTranslation] = useState(false);
   const translationInputRef = useRef<HTMLDivElement>(null);
+  const translationFinalizedRef = useRef(false);
 
   const translation = config.translation ?? { enabled: false, vk_code: 0, display_name: '', target_language: 'Chinese' };
 
-  const resetRecordingState = () => {
+  const resetVoiceRecordingState = () => {
     pressedModsRef.current.clear();
     hadNonModifierKeyRef.current = false;
     altGrSynthCtrlActiveRef.current = false;
-    finalizedRef.current = false;
+    voiceFinalizedRef.current = false;
     setVoiceRecordingPreview('');
   };
 
-  const applyVoiceHotkey = (vkCode: number, modifiers: number) => {
+  const resetTranslationRecordingState = () => {
+    translationFinalizedRef.current = false;
+  };
+
+  // HOTKEY-060: shared conflict-detection + finalize + reset flow.
+  // The caller supplies its own per-session finalized ref and reset callback so
+  // voice and translation recordings never cross-interfere.
+  type HotkeySide = 'voice' | 'translation';
+  const applyHotkeyIfNoDupConflict = (
+    finalizedRef: React.MutableRefObject<boolean>,
+    side: HotkeySide,
+    setRecording: (v: boolean) => void,
+    resetRecording: () => void,
+    voiceVkCode: number,
+    voiceModifiers: number,
+    translationVkCode: number,
+  ) => {
     if (finalizedRef.current) return;
     finalizedRef.current = true;
-    const newHotkey = {
-      ...config.hotkey,
-      vk_code: vkCode,
-      modifiers: modifiers,
-      display_name: getHotkeyDisplayName(vkCode, modifiers),
-    };
-    updateConfig({ ...config, hotkey: newHotkey });
-    setIsRecordingVoice(false);
-    resetRecordingState();
+
+    const vSet = voiceKeySet(voiceVkCode, voiceModifiers);
+    const tSet = translationKeySet(translationVkCode);
+    if (keysOverlap(vSet, tSet)) {
+      setRecording(false);
+      setDupConflict({
+        voice: getHotkeyDisplayName(voiceVkCode, voiceModifiers),
+        translation: translation.display_name || VK_TO_LABEL[translationVkCode] || translationVkCode.toString(),
+      });
+      resetRecording();
+      return;
+    }
+
+    if (side === 'voice') {
+      const newHotkey = {
+        ...config.hotkey,
+        vk_code: voiceVkCode,
+        modifiers: voiceModifiers,
+        display_name: getHotkeyDisplayName(voiceVkCode, voiceModifiers),
+      };
+      updateConfig({ ...config, hotkey: newHotkey });
+    } else {
+      const displayName = VK_TO_LABEL[translationVkCode] || translationVkCode.toString();
+      updateConfig({
+        ...config,
+        translation: { ...translation, vk_code: translationVkCode, display_name: displayName }
+      });
+    }
+    setRecording(false);
+    resetRecording();
   };
 
   const checkAndApplyVoiceHotkey = async (vkCode: number, modifiers: number) => {
-    if (finalizedRef.current) return;
-    finalizedRef.current = true;
+    if (voiceFinalizedRef.current) return;
+    voiceFinalizedRef.current = true;
     try {
       const available = await invoke<boolean>('check_hotkey_available', {
         vk_code: vkCode,
         modifiers: modifiers,
       });
       if (available) {
-        const vSet = voiceKeySet(vkCode, modifiers);
-        const tSet = translationKeySet(translation.vk_code);
-        if (keysOverlap(vSet, tSet)) {
-          setIsRecordingVoice(false);
-          setDupConflict({
-            voice: getHotkeyDisplayName(vkCode, modifiers),
-            translation: translation.display_name || VK_TO_LABEL[translation.vk_code] || '',
-          });
-          resetRecordingState();
-          return;
-        }
-        finalizedRef.current = false;
-        applyVoiceHotkey(vkCode, modifiers);
+        applyHotkeyIfNoDupConflict(
+          voiceFinalizedRef,
+          'voice',
+          setIsRecordingVoice,
+          resetVoiceRecordingState,
+          vkCode,
+          modifiers,
+          translation.vk_code,
+        );
       } else {
         setIsRecordingVoice(false);
         setPendingHotkey({ vk: vkCode, mod: modifiers });
-        resetRecordingState();
+        resetVoiceRecordingState();
       }
     } catch {
-      finalizedRef.current = false;
-      applyVoiceHotkey(vkCode, modifiers);
+      voiceFinalizedRef.current = false;
+      applyHotkeyIfNoDupConflict(
+        voiceFinalizedRef,
+        'voice',
+        setIsRecordingVoice,
+        resetVoiceRecordingState,
+        vkCode,
+        modifiers,
+        translation.vk_code,
+      );
     }
   };
 
   const handleVoiceHotkeyKeyDown = (e: React.KeyboardEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    if (finalizedRef.current) return;
+    if (voiceFinalizedRef.current) return;
     const code = e.code;
 
     if (code === 'Escape') {
       setIsRecordingVoice(false);
-      resetRecordingState();
+      resetVoiceRecordingState();
       return;
     }
 
@@ -233,7 +275,7 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
   const handleVoiceHotkeyKeyUp = (e: React.KeyboardEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    if (finalizedRef.current) return;
+    if (voiceFinalizedRef.current) return;
     if (!isRecordingVoice) return;
     const code = e.code;
 
@@ -275,7 +317,7 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
 
   useLayoutEffect(() => {
     if (isRecordingVoice) {
-      resetRecordingState();
+      resetVoiceRecordingState();
       voiceInputRef.current?.focus();
     }
   }, [isRecordingVoice]);
@@ -291,25 +333,6 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
     });
   };
 
-  const applyTranslationHotkey = (vkCode: number) => {
-    const vSet = voiceKeySet(config.hotkey.vk_code, config.hotkey.modifiers);
-    const tSet = translationKeySet(vkCode);
-    if (keysOverlap(vSet, tSet)) {
-      setIsRecordingTranslation(false);
-      setDupConflict({
-        voice: getHotkeyDisplayName(config.hotkey.vk_code, config.hotkey.modifiers),
-        translation: VK_TO_LABEL[vkCode] || vkCode.toString(),
-      });
-      return;
-    }
-    const displayName = VK_TO_LABEL[vkCode] || vkCode.toString();
-    updateConfig({
-      ...config,
-      translation: { ...translation, vk_code: vkCode, display_name: displayName }
-    });
-    setIsRecordingTranslation(false);
-  };
-
   const handleTranslationHotkeyKeyDown = (e: React.KeyboardEvent) => {
     e.preventDefault();
     e.stopPropagation();
@@ -317,6 +340,7 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
 
     if (code === 'Escape') {
       setIsRecordingTranslation(false);
+      resetTranslationRecordingState();
       return;
     }
 
@@ -326,12 +350,15 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
       return;
     }
 
-    if (!TRANSLATION_SINGLE_KEYS.includes(vkCode)) {
-      applyTranslationHotkey(vkCode);
-      return;
-    }
-
-    applyTranslationHotkey(vkCode);
+    applyHotkeyIfNoDupConflict(
+      translationFinalizedRef,
+      'translation',
+      setIsRecordingTranslation,
+      resetTranslationRecordingState,
+      config.hotkey.vk_code,
+      config.hotkey.modifiers,
+      vkCode,
+    );
   };
 
   const startRecordingTranslation = () => {
@@ -340,6 +367,7 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
 
   useLayoutEffect(() => {
     if (isRecordingTranslation) {
+      resetTranslationRecordingState();
       translationInputRef.current?.focus();
     }
   }, [isRecordingTranslation]);
@@ -387,7 +415,7 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
                   autoFocus
                   onKeyDown={handleVoiceHotkeyKeyDown}
                   onKeyUp={handleVoiceHotkeyKeyUp}
-                  onBlur={() => { setIsRecordingVoice(false); resetRecordingState(); }}
+                  onBlur={() => { setIsRecordingVoice(false); resetVoiceRecordingState(); }}
                 >{voiceRecordingPreview || t.hotkey_press_new}</div>
               )}
               <span className="hotkey-key-hint">{t.hotkey_click_to_change}</span>
@@ -439,7 +467,7 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
                   ref={translationInputRef}
                   autoFocus
                   onKeyDown={handleTranslationHotkeyKeyDown}
-                  onBlur={() => setIsRecordingTranslation(false)}
+                  onBlur={() => { setIsRecordingTranslation(false); resetTranslationRecordingState(); }}
                 >{t.hotkey_press_translation}</div>
               )}
               <span className="hotkey-key-hint">{t.hotkey_set_translation}</span>
@@ -469,7 +497,7 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
             </div>
             <div className="modal-footer">
               <button className="btn btn-secondary" onClick={() => setPendingHotkey(null)}>{t.hotkey_cancel}</button>
-              <button className="btn btn-primary" onClick={() => { applyVoiceHotkey(pendingHotkey.vk, pendingHotkey.mod); setPendingHotkey(null); }}>{t.hotkey_use_anyway}</button>
+              <button className="btn btn-primary" onClick={() => { applyHotkeyIfNoDupConflict(voiceFinalizedRef, 'voice', setIsRecordingVoice, resetVoiceRecordingState, pendingHotkey.vk, pendingHotkey.mod, translation.vk_code); setPendingHotkey(null); }}>{t.hotkey_use_anyway}</button>
             </div>
           </div>
         </div>
