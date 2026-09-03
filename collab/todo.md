@@ -1,5 +1,57 @@
 # 任务列表 · voice-ime
 
+## 🔴 2026-09-03 夜 —— 当前状态（session 重启后接棒，最新在最上）
+
+### 已完成并提交
+
+| 提交 | 内容 |
+| --- | --- |
+| `eb9056d` | **SECRET-077** DeepSeek key 明文处置 + `pre-commit` 密钥闸门（Gavin 授权，零生产代码） |
+
+### 待 Gavin 亲自处理（主控无权限）
+
+1. 🔴 **去 DeepSeek 后台吊销泄露的 key** —— 主控已把仓库内明文换成占位符，
+   但 key 已在 `f58af96` 历史里且 push 到公网，**删文件不等于止血，吊销才是**。
+2. **是否授权重写 git 历史 + force push** 清除历史痕迹 —— 破坏性操作，未获授权不执行；
+   在第 1 项完成后它只是卫生问题，不是安全问题。
+3. **LLM 401 是否已解决** —— 新 key 生成后需确认 LLM 可用，否则 FMT-072 出包也验不了。
+4. **每个新 clone 需执行一次**：`git config core.hooksPath scripts/git-hooks`（钩子本体已入库不会丢）。
+
+### TEST-EXEC-076 五条 FAIL —— 主控已逐行 Read 生产代码裁定完毕
+
+| # | 用例 | 裁定 | 归属 |
+| --- | --- | --- | --- |
+| ① | `itn_071b_legal_time_yidianban_still_converts` | 改测试：期望应为「下午1:30」（DEC-037 时间族固定 `H:MM`） | 待派 tester-1 |
+| ② | `itn_071b_legal_time_yidianshiwufen_still_converts` | 改测试：期望应为「1:15」 | 待派 tester-1 |
+| ③ | `asr_074_stop_drain_gives_up_at_deadline_with_abandoned_count` | 改测试（设计缺陷）：自建循环 `Empty=>continue` 偏离生产 `Empty=>break`，abandoned 结构性不可达 | 待派 tester-1 |
+| ④ | `stale_generation_must_not_touch_mirror_and_stopped_gate_is_orthogonal` | 改测试：末条断言与自己的闭包自相矛盾；生产「代际闸门→写镜像→043 闸门」的顺序是刻意的 | 待派 tester-1 |
+| ⑤ | `HOTKEY-047-S12` | 🔴 **真生产缺陷，改生产**（AltGr 尾随 keyup + async 重入窗口） | **HOTKEY-078 已派 coder-2** |
+
+**①② 的关键事实**：生产零 bug，ITN-071-B 的两条保护用例（一点半点／一点点）是 PASS 的。
+红的只是 coder-1 顺手写的两条回归护栏，期望值凭直觉写成「1点半」，
+与既有十余条 `X点半→X:30` 护栏（itn.rs:3456／3720-3726／3757／3934）冲突。
+
+**④ 的语义裁定（重要，别再翻）**：代际闸门 = 数据+渲染双拦；043 闸门 = **仅渲染**。
+同 session 松手后的迟来包是同一句话的更完整版本，**必须**进 `last_streaming_text` 镜像，
+否则 WORDBOOK-053-B 会拿截断的 raw 文本去 diff 用户编辑，学出用户从未做过的伪修正。
+**渲染抑制 ≠ 数据抑制。**
+
+### 下一棒顺序（五阶段串行，禁止并行）
+
+阶段一 **HOTKEY-078**（coder-2，在途）→ 阶段三 **TEST-FIX-079**（tester-1，改 ①②③④ 四条测试）
+→ 阶段四 全量回归 → 阶段五 **BUILD v0.9.0** → Gavin 端测。
+
+🔴 出包后必须 Gavin 目视确认：处理中态 overlay 的**文字与圆角边沿是否变细腻**（DEC-055 红线 5）。
+
+### 已结案（不要重查）
+
+- **行尾幻影**：coder-2 上报的「69 文件 18K 行 CRLF 漂移」= racy-git 的 index stat 缓存过期，
+  一次 `git status` 刷新即自愈。已复核：`git diff --stat` 与 `git diff -w --stat` 逐字相同。
+  裁定 `core.autocrlf=true` **不动**（改它会真的重写全仓行尾）。
+
+---
+
+
 ## ✅ 2026-09-03 收工状态 —— 下一棒从这里开始
 
 ### 已完成并提交（工作区干净，**本地领先 origin/main 16 个提交，未 push**）
