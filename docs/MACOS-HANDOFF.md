@@ -8,6 +8,19 @@
 
 ## 0 · 先读这份，再读那两份
 
+### 0.2 · ASR-074 音频上行背压修复（2026-09-03）
+
+- **文件域**：`src/audio/mod.rs` + `src/transcription/qwen_inference.rs`
+- **macOS 影响**：`src/audio/mod.rs` 是平台中立模块（cpal 回调），macOS 侧编译同一份代码。
+  本次改动加 `AtomicU64` 丢帧计数器 + `log::warn!` 可见化，**平台无关**，macOS 上同样生效。
+  `qwen_inference.rs` 是在线 ASR 客户端，平台无关（WebSocket + tungstenite）。
+- **Step 1 埋点**：`[ASR-LOOP]` / `[ASR-BACKLOG]` / `[ASR-DROP]` 日志行，macOS 上同样输出（`log::debug!` / `log::warn!`）。
+- **Step 2 修复（待坐实后实施）**：
+  - A（排空 chunk_rx）：平台无关，消费速率提升对 macOS 同样有效。
+  - B（drain warm.rx）：平台无关，`warm.rx` 是 crossbeam channel。
+  - C（永久 warn 丢帧）：已在 Step 1 落地。
+- **结论**：**零编译影响、零行为回归风险**，macOS 侧无需额外改动。
+
 ### 0.1 · OVERLAY-061/068/064 跨平台评估（2026-08-30）
 
 - **OVERLAY-068 位置/尺寸同步逻辑**：全部位于 `src/main.rs` 的 `#[cfg(target_os = "windows")]` 消息循环内，macOS 侧目前没有等价 overlay 宿主窗口，因此本次修改对 macOS 侧**零编译影响、零行为影响**。
@@ -1342,3 +1355,17 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
 - **改动范围**：`itn-rules.toml`（+3/-2，词表挪动+新增）、`src/itn.rs`（+40，护栏测试）。
 - **平台中立**：`src/itn.rs` 纯 Rust ITN 逻辑，`itn-rules.toml` 平台中立规则数据。macOS 侧编译同份代码 + 三副本同步即可生效。
 - **修复内容**：`一点半点` 从 [protect.unit_collisions] 挪到 [protect.idioms]（第1步最高优先级）；`一点点` 新增到 [protect.function_words]。根因：`decide_conversion` :2275 `is_date_suffix("点")` 把 `点` 当时间后缀误判，导致不在保护集的 `一` 开头词被转。修法在词表层面，未改 check_protection 代码逻辑。
+
+## §OVERLAY-075 · 跨 session 流式文本渗漏隔离（2026-09-03，Windows 侧会话代际）
+
+**本决策不适用 macOS 侧渲染路径（macOS 流式文本本就不渲染），但 `PipelineEvent` 枚举
+签名变更是平台中立的，macOS 编译单元必须同步——本批已同步修复。**
+
+- `PipelineEvent::StreamingText` 增加 `u64` 代际首字段（OVERLAY-075，跨 session 隔离，
+  Windows 专属机制 `STREAMING_GENERATION` 在 `src/main.rs` cfg(windows) 区）。
+- 🔴 **存量破损顺带修复**：macOS 三处（`overlay_request_for_event` 映射 /
+  `handle_pipeline_event` 消费 / `overlay_wire_tests` 单测构造）自 OVERLAY-051-G
+  给枚举加 word timings 字段起就是 1 字段签名对 2 字段枚举，**macOS 侧此前编译必失败**。
+  本批同步为 3 字段新签名，macOS 编译恢复一致（未在 macOS 机器实际验证，需 macOS 端测确认）。
+- Windows 侧绘制契约（GDI → Direct2D，DEC-055 / D2D-073）与本条无交互；代际闸门在
+  controller 事件分发层（`process_controller_events`），绘制层不感知代际。

@@ -1,0 +1,197 @@
+[2026-09-03T09:27:40.138Z INFO  feiyin_ime] Debug mode enabled, logging to "D:\\Workspace\\CodeLab\\voice-ime\\target\\release\\debug.log"
+[2026-09-03T09:27:40.138Z INFO  feiyin_ime] 飞音语音输入 starting...
+[2026-09-03T09:27:40.151Z INFO  feiyin_ime::audio] Prewarming input device: Microphone (HD Pro Webcam C920)
+[2026-09-03T09:27:40.245Z INFO  feiyin_ime::audio] Input stream prewarmed (48000Hz, 2 ch, F32)
+[2026-09-03T09:27:40.245Z INFO  feiyin_ime::transcription] Online ASR mode: no local model loaded, model=QwenAudioOnline, url=wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference
+[2026-09-03T09:27:40.248Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: no current binding, new vk=165, mod=0, mode=PushToTalk
+[2026-09-03T09:27:40.248Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: binding changed, updating...
+[2026-09-03T09:27:40.249Z INFO  feiyin_ime::platform::windows::hotkey] Low-level keyboard hook installed for vk_code=165
+[2026-09-03T09:27:40.249Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey thread started (id=23872)
+[2026-09-03T09:27:40.249Z INFO  feiyin_ime] Config watcher started for D:\Workspace\CodeLab\voice-ime\target\release\config.toml
+[2026-09-03T09:27:40.249Z INFO  feiyin_ime] DWM rounded corners enabled (Windows 11+)
+[2026-09-03T09:27:40.249Z INFO  feiyin_ime] Controller initialized, entering message loop
+[2026-09-03T09:27:40.249Z INFO  feiyin_ime] WM_APP_INIT_TRAY received, building tray...
+[2026-09-03T09:27:40.255Z INFO  feiyin_ime] Tray icon built
+[2026-09-03T09:27:41.266Z INFO  feiyin_ime::translation] zh-en CT2 model initialized at D:\Workspace\CodeLab\voice-ime\target\release\models\opus-mt-zh-en
+[2026-09-03T09:27:41.266Z INFO  feiyin_ime::translation] Offline translation engine loaded (English)
+[2026-09-03T09:27:41.826Z INFO  feiyin_ime::punctuation] Punctuation model loaded from "D:\\Workspace\\CodeLab\\voice-ime\\target\\release\\models\\punct-ct-transformer-zh"
+[2026-09-03T09:27:45.251Z DEBUG reqwest::connect] starting new connection: https://api.github.com/
+[2026-09-03T09:27:46.398Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey config change notification set
+[2026-09-03T09:27:46.398Z INFO  feiyin_ime] Runtime config reloaded after config file change
+[2026-09-03T09:27:46.413Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey thread: instant config sync triggered by AtomicBool
+[2026-09-03T09:27:46.413Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: current vk=165, mod=0, mode=PushToTalk; new vk=165, mod=0, mode=PushToTalk
+[2026-09-03T09:27:46.413Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: binding unchanged, skipping
+[2026-09-03T09:27:55.875Z INFO  feiyin_ime] Controller received hotkey start (translate=false)
+[2026-09-03T09:27:55.876Z INFO  feiyin_ime] [Latency] overlay shown at +0.3ms
+[2026-09-03T09:27:55.879Z INFO  feiyin_ime] [Latency] worker command sent at +3.6ms
+[2026-09-03T09:27:55.879Z INFO  feiyin_ime] [Latency] worker received Start command
+[2026-09-03T09:27:55.880Z INFO  feiyin_ime::audio] [Latency] record_streaming ensure_stream completed at +1.1ms
+[2026-09-03T09:27:55.880Z INFO  feiyin_ime::audio] Audio pre-roll drain: drained=60 chunks/28800 samples, retained=60 chunks/28800 samples (600ms)
+[2026-09-03T09:27:55.880Z INFO  feiyin_ime::audio] [Latency] record_streaming drain_pre_roll: 60 chunks at +1.1ms
+[2026-09-03T09:27:55.880Z INFO  feiyin_ime::audio] [Latency] record_streaming idle drain: cleared 256 stale, preserved 0 post-hotkey at +1.1ms
+[2026-09-03T09:27:55.880Z INFO  feiyin_ime::audio] Streaming recording started (48000Hz, 2 ch, device='Microphone (HD Pro Webcam C920)', pre_roll=60 chunks, post_hotkey=0 chunks)
+[2026-09-03T09:27:55.880Z INFO  feiyin_ime::audio] Streaming resampler active: 48000Hz -> 16000Hz
+[2026-09-03T09:27:55.898Z INFO  feiyin_ime::transcription] ASR vocabulary loaded from wordbook table: 18 entries
+[2026-09-03T09:27:55.898Z INFO  feiyin_ime::transcription::qwen_inference] Online realtime streaming ASR: url=wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference, model=qwen-audio-3.0-asr-flash-streaming, task_id=18d1c57ee86de6f800005ec800000000
+[2026-09-03T09:27:55.917Z INFO  feiyin_ime::transcription::qwen_inference] [Latency] ASR DNS resolved in 18ms
+[2026-09-03T09:27:55.918Z INFO  feiyin_ime::transcription::qwen_inference] [Latency] ASR TCP connected in 1ms
+[2026-09-03T09:27:58.080Z DEBUG tungstenite::handshake::client] Client handshake done.
+[2026-09-03T09:27:58.080Z INFO  feiyin_ime::transcription::qwen_inference] [Latency] ASR TLS+WS handshake in 2161ms
+[2026-09-03T09:27:58.080Z INFO  feiyin_ime::transcription::qwen_inference] [Latency] ASR total connect in 2181ms
+[2026-09-03T09:27:58.587Z INFO  feiyin_ime::transcription::qwen_inference] Online ASR task started: 18d1c57ee86de6f800005ec800000000 (+506ms from connect)
+[2026-09-03T09:27:58.623Z INFO  feiyin_ime::transcription::vad] VAD streaming gate initialized (silero, threshold=0.3, model=D:\Workspace\CodeLab\voice-ime\target\release\models\silero-vad\silero_vad.onnx)
+[2026-09-03T09:27:58.623Z INFO  feiyin_ime::transcription::qwen_inference] VAD gate 2s deadline reached without detection, forcing send (safety net)
+[2026-09-03T09:27:58.623Z INFO  feiyin_ime::transcription::qwen_inference] Online ASR pre-roll flushed: 0 chunks, 0 samples (0.0s)
+[2026-09-03T09:27:59.461Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:27:59.470Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:27:59.529Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:27:59.631Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:27:59.665Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:27:59.727Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:27:59.791Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:27:59.854Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:27:59.925Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:27:59.980Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:00.275Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:00.275Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:00.275Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:00.275Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:00.275Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:00.296Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:00.327Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:00.373Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:00.662Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:00.724Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:00.781Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:00.783Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:00.821Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:00.867Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:00.914Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:00.976Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:01.036Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:01.096Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:01.156Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='', words=0
+[2026-09-03T09:28:01.225Z INFO  feiyin_ime::transcription::qwen_inference] [Latency] ASR first non-empty text at +5326ms (5327ms from first audio byte)
+[2026-09-03T09:28:01.225Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='八月', words=2
+[2026-09-03T09:28:01.225Z DEBUG feiyin_ime::transcription::qwen_inference] [ASR-WORDS] 2 words: 八[1160-1320] 月[1320-1440]
+[2026-09-03T09:28:02.341Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='8月19号', words=5
+[2026-09-03T09:28:02.341Z DEBUG feiyin_ime::transcription::qwen_inference] [ASR-WORDS] 5 words: 8[1160-1400] 月[1400-1800] 1[1800-1920] 9[1920-2040] 号[2040-2160]
+[2026-09-03T09:28:03.972Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='8月19号号，苏局', words=8
+[2026-09-03T09:28:03.972Z DEBUG feiyin_ime::transcription::qwen_inference] [ASR-WORDS] 8 words: 8[1160-1400] 月[1400-1840] 1[1840-1900] 9[1900-1960] 号[1960-2120] 号[2120-2400] 苏[2560-2760] 局[2760-2880]
+[2026-09-03T09:28:04.497Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='8月19号号，苏局 3号', words=11
+[2026-09-03T09:28:04.497Z DEBUG feiyin_ime::transcription::qwen_inference] [ASR-WORDS] 11 words: 8[1160-1400] 月[1400-1840] 1[1840-1900] 9[1900-1960] 号[1960-2120] 号[2120-2400] 苏[2640-2840] 局[2840-3160]  [3160-3400] 3[3400-3500] 号[3500-3600]
+[2026-09-03T09:28:05.931Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='8月19号，朱雀三号遥二运', words=10
+[2026-09-03T09:28:05.931Z DEBUG feiyin_ime::transcription::qwen_inference] [ASR-WORDS] 10 words: 8[1160-1400] 月[1400-1840] 1[1840-1980] 9[1980-2120] 号[2120-2400] 朱雀[2640-3160] 三号[3160-3840] 遥[3840-4000] 二[4000-4160] 运[4160-4320]
+[2026-09-03T09:28:06.766Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='8月19号，朱雀三号遥二运载火箭', words=13
+[2026-09-03T09:28:06.766Z DEBUG feiyin_ime::transcription::qwen_inference] [ASR-WORDS] 13 words: 8[1160-1400] 月[1400-1840] 1[1840-1980] 9[2000-2120] 号[2120-2400] 朱雀[2640-3160] 三号[3160-3840] 遥[3840-4040] 二[4040-4200] 运[4200-4360] 载[4360-4640] 火[4640-4720] 箭[4720-5040]
+[2026-09-03T09:28:08.141Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='8月19号，朱雀三号遥二运载火箭在', words=14
+[2026-09-03T09:28:08.141Z DEBUG feiyin_ime::transcription::qwen_inference] [ASR-WORDS] 14 words: 8[1160-1400] 月[1400-1840] 1[1840-1980] 9[2000-2120] 号[2120-2400] 朱雀[2640-3160] 三号[3160-3840] 遥[3840-4040] 二[4040-4200] 运[4200-4360] 载[4360-4640] 火[4640-4760] 箭[4760-5360] 在[5560-5760]
+[2026-09-03T09:28:08.416Z INFO  feiyin_ime] Controller received hotkey stop
+[2026-09-03T09:28:08.417Z INFO  feiyin_ime::audio] Streaming recording: stop signal received
+[2026-09-03T09:28:08.433Z INFO  feiyin_ime::audio] Streaming recording complete: ~433440 samples (9.0s @ 48000Hz), speech_detected=true
+[2026-09-03T09:28:08.433Z INFO  feiyin_ime] [Latency] record_streaming() completed after +12554.6ms
+[2026-09-03T09:28:09.325Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='8月19号，朱雀三号遥二运载火箭在东风射', words=14
+[2026-09-03T09:28:09.325Z DEBUG feiyin_ime::transcription::qwen_inference] [ASR-WORDS] 14 words: 8[1160-1400] 月[1400-1840] 1[1840-1980] 9[2000-2120] 号[2120-2400] 朱雀[2640-3160] 三号[3160-3840] 遥[3840-4040] 二[4040-4200] 运载[4200-4640] 火箭[4640-5360] 在[5640-5960] 东风[5960-6360] 射[6360-6480]
+[2026-09-03T09:28:09.331Z DEBUG feiyin_ime] OVERLAY-043: ignoring late StreamingText after stop
+[2026-09-03T09:28:10.268Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='8月19号，朱雀三号遥二运载火箭在东风射商业航天', words=18
+[2026-09-03T09:28:10.268Z DEBUG feiyin_ime::transcription::qwen_inference] [ASR-WORDS] 18 words: 8[1160-1400] 月[1400-1840] 1[1840-1980] 9[2000-2120] 号[2120-2400] 朱雀[2640-3160] 三号[3160-3840] 遥[3840-4040] 二[4040-4200] 运载[4200-4640] 火箭[4640-5360] 在[5640-5960] 东风[5960-6360] 射[6360-6520] 商[6520-6600] 业[6600-6920] 航[6920-7080] 天[7080-7200]
+[2026-09-03T09:28:10.269Z DEBUG feiyin_ime] OVERLAY-043: ignoring late StreamingText after stop
+[2026-09-03T09:28:11.396Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='8月19号，朱雀三号遥二运载火箭在东风射商业航天创新时', words=21
+[2026-09-03T09:28:11.396Z DEBUG feiyin_ime::transcription::qwen_inference] [ASR-WORDS] 21 words: 8[1160-1400] 月[1400-1840] 1[1840-1980] 9[2000-2120] 号[2120-2400] 朱雀[2640-3160] 三号[3160-3840] 遥[3840-4000] 二[4000-4200] 运载[4200-4640] 火箭[4640-5360] 在[5640-5960] 东风[5960-6280] 射[6280-6520] 商[6520-6600] 业[6600-6960] 航[6960-7120] 天[7120-7520] 创[7520-7640] 新[7640-7840] 时[7840-7920]
+[2026-09-03T09:28:11.399Z DEBUG feiyin_ime] OVERLAY-043: ignoring late StreamingText after stop
+[2026-09-03T09:28:12.483Z INFO  feiyin_ime::transcription::qwen_inference] Online ASR finish-task sent after 13.9s streaming, 144480 samples (9.0s)
+[2026-09-03T09:28:12.693Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=false, display='8月19号，朱雀三号遥二运载火箭在东风商业航天创新试验区', words=21
+[2026-09-03T09:28:12.693Z DEBUG feiyin_ime::transcription::qwen_inference] [ASR-WORDS] 21 words: 8[1160-1400] 月[1400-1840] 1[1840-1980] 9[2000-2120] 号[2120-2400] 朱雀[2640-3160] 三号[3160-3800] 遥[3800-4000] 二[4000-4200] 运载[4200-4640] 火箭[4640-5360] 在[5640-5960] 东风[5960-6520] 商业[6520-6960] 航[6960-7520] 天[7520-7760] 创[7760-8000] 新[8000-8160] 试[8160-8320] 验[8320-8480] 区[8480-8640]
+[2026-09-03T09:28:12.696Z DEBUG feiyin_ime] OVERLAY-043: ignoring late StreamingText after stop
+[2026-09-03T09:28:13.219Z DEBUG feiyin_ime::transcription::qwen_inference] Online ASR result: id=1, end=true, display='8月19号，朱雀三号遥二运载火箭在东风商业航天创新试验区发射。', words=22
+[2026-09-03T09:28:13.219Z DEBUG feiyin_ime::transcription::qwen_inference] [ASR-WORDS] 22 words: 8[1160-1400] 月[1400-1840] 1[1840-1980] 9[2000-2120] 号[2120-2400] 朱雀[2640-3160] 三号[3160-3800] 遥[3800-4000] 二[4000-4200] 运载[4200-4640] 火箭[4640-5360] 在[5640-5960] 东风[5960-6520] 商业[6520-6960] 航[6960-7520] 天[7520-7760] 创[7760-8000] 新[8000-8170] 试[8170-8340] 验[8340-8510] 区[8510-8680] 发射[8680-9000]
+[2026-09-03T09:28:13.219Z INFO  feiyin_ime::transcription::qwen_inference] [ASR-SUMMARY] model=qwen-audio-3.0-asr-flash-streaming outcome=failed task_id=18d1c57ee86de6f800005ec800000000 vad_hit_ms=-1 connect_ms=2181 task_started_ms=506 first_audio_byte_ms=-1 first_partial_ms=3562 first_text_ms=5327 final_ms=17320 words_total=22 chars_total=31
+[2026-09-03T09:28:13.219Z INFO  feiyin_ime::transcription::qwen_inference] Online ASR task finished: 1 confirmed sentences
+[2026-09-03T09:28:13.219Z INFO  feiyin_ime::transcription::qwen_inference] [ASR-SUMMARY] model=qwen-audio-3.0-asr-flash-streaming outcome=failed task_id=18d1c57ee86de6f800005ec800000000 vad_hit_ms=-1 connect_ms=2181 task_started_ms=506 first_audio_byte_ms=-1 first_partial_ms=3562 first_text_ms=5327 final_ms=17320 words_total=22 chars_total=31
+[2026-09-03T09:28:13.229Z DEBUG feiyin_ime] OVERLAY-043: ignoring late StreamingText after stop
+[2026-09-03T09:28:13.231Z INFO  feiyin_ime] Transcribed: 8月19号，朱雀三号遥二运载火箭在东风商业航天创新试验区发射。 (native_punctuated=true)
+[2026-09-03T09:28:13.239Z INFO  feiyin_ime::itn] ITN rules loaded from "D:\\Workspace\\CodeLab\\voice-ime\\target\\release\\itn-rules.toml"
+[2026-09-03T09:28:13.247Z INFO  feiyin_ime::scene] Scene rules loaded from "D:\\Workspace\\CodeLab\\voice-ime\\target\\release\\scene-rules.toml"
+[2026-09-03T09:28:13.247Z INFO  feiyin_ime] Scene context: app_exe="Notepad.exe", kind=document, multiline_safe=true, f4_injected=true, window_title="*8月19号，朱雀3号遥二运载火箭在东风商业航天创新创新试验区发射升空。 - Notepad"
+[2026-09-03T09:28:13.247Z INFO  feiyin_ime::llm] Scene F4 block injected: "Scene Context (F4): The user is typing into a document application. Adapt tone accordingly.\nFormal written style. When the speech contains enumeration markers (ILLUSTRATIVE, NOT EXHAUSTIVE — ordered examples: 第一/第二/首先/其次/最后/几点/几个方面 / firstly/secondly / まず/次に/最後に / 첫째/둘째/마지막으로 etc.; unordered examples: 比如/比如说/例如/譬如/还有/另外/此外 / for example/for instance/also/another/additionally / たとえば/また/さらに / 예를 들어/또/게다가 etc.), split into list lines — use \"1. \" for ordered enumeration, use \"- \" for unordered enumeration. Apply your own language understanding beyond these lists: the decisive test is whether TWO OR MORE spans stand in a PARALLEL relation (same syntactic slot, same semantic function, jointly forming a set); if yes, format as a list even if the markers differ or are absent from the lists above. A single span introduced by an example marker remains a mere example — keep it as a continuous paragraph. Structured output (paragraphs, lists) is required where enumeration is present."
+[2026-09-03T09:28:13.248Z INFO  feiyin_ime::llm] Injecting 18 wordbook entries into LLM prompt
+[2026-09-03T09:28:13.248Z INFO  feiyin_ime::llm] === LLM Request Debug ===
+[2026-09-03T09:28:13.248Z INFO  feiyin_ime::llm] system_prompt (len=22122): "Rule Precedence: The rules below are grouped into layers L0-L3. When two rules conflict, the rule in the LOWER-numbered layer WINS. This precedence is ABSOLUTE and OVERRIDES position — never resolve a"
+[2026-09-03T09:28:13.248Z INFO  feiyin_ime::llm] input text (len=85): "8月19号，朱雀3号遥二运载火箭在东风商业航天创新试验区发射。"
+[2026-09-03T09:28:13.248Z INFO  feiyin_ime::llm] extra_instruction: Some("Normalize the Chinese parts of the output to Simplified Chinese (Mainland China standard glyphs). Do NOT translate any non-Chinese content — English, Japanese and Korean text MUST be preserved exactly as spoken.")
+[2026-09-03T09:28:13.248Z INFO  feiyin_ime::llm] LLM attempt 1/2 with timeout 8000ms
+[2026-09-03T09:28:13.248Z INFO  feiyin_ime::llm] Sending LLM request to: https://api.deepseek.com/chat/completions
+[2026-09-03T09:28:13.248Z INFO  feiyin_ime::llm] Request body: model=deepseek-v4-pro, messages_count=2
+[2026-09-03T09:28:13.248Z INFO  feiyin_ime::llm]   msg[0]: role=system, content_len=22122
+[2026-09-03T09:28:13.248Z INFO  feiyin_ime::llm]   msg[1]: role=user, content_len=102
+[2026-09-03T09:28:13.248Z DEBUG reqwest::connect] starting new connection: https://api.deepseek.com/
+[2026-09-03T09:28:14.962Z ERROR feiyin_ime::llm] LLM non-retryable error: HTTP status client error (401 Unauthorized) for url (https://api.deepseek.com/chat/completions)
+[2026-09-03T09:28:14.962Z WARN  feiyin_ime] LLM optimization error: HTTP status client error (401 Unauthorized) for url (https://api.deepseek.com/chat/completions)
+[2026-09-03T09:28:14.965Z INFO  feiyin_ime] Injecting text: '8月19号，朱雀3号遥二运载火箭在东风商业航天创新试验区发射。', focus_lost=false, target_hwnd=133658, current_id=133658
+[2026-09-03T09:28:14.965Z INFO  feiyin_ime] Injecting text...
+[2026-09-03T09:28:15.170Z INFO  feiyin_ime] Injection completed successfully
+[2026-09-03T09:28:15.173Z INFO  feiyin_ime::platform::windows::hotkey] Translate poll stop notified
+[2026-09-03T09:28:15.173Z WARN  feiyin_ime] LLM formatting failed; raw text injected as fallback
+[2026-09-03T09:28:15.173Z INFO  feiyin_ime::platform::windows::hotkey] Translate poll stop notified
+[2026-09-03T09:29:06.893Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey config change notification set
+[2026-09-03T09:29:06.893Z INFO  feiyin_ime] Runtime config reloaded after config file change
+[2026-09-03T09:29:06.907Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey thread: instant config sync triggered by AtomicBool
+[2026-09-03T09:29:06.907Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: current vk=165, mod=0, mode=PushToTalk; new vk=165, mod=0, mode=PushToTalk
+[2026-09-03T09:29:06.907Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: binding unchanged, skipping
+[2026-09-03T09:29:07.112Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey config change notification set
+[2026-09-03T09:29:07.112Z INFO  feiyin_ime] Runtime config reloaded after config file change
+[2026-09-03T09:29:07.127Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey thread: instant config sync triggered by AtomicBool
+[2026-09-03T09:29:07.127Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: current vk=165, mod=0, mode=PushToTalk; new vk=165, mod=0, mode=PushToTalk
+[2026-09-03T09:29:07.128Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: binding unchanged, skipping
+[2026-09-03T09:29:16.021Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey config change notification set
+[2026-09-03T09:29:16.021Z INFO  feiyin_ime] Runtime config reloaded after config file change
+[2026-09-03T09:29:16.036Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey thread: instant config sync triggered by AtomicBool
+[2026-09-03T09:29:16.036Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: current vk=165, mod=0, mode=PushToTalk; new vk=165, mod=0, mode=PushToTalk
+[2026-09-03T09:29:16.036Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: binding unchanged, skipping
+[2026-09-03T09:29:16.209Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey config change notification set
+[2026-09-03T09:29:16.209Z INFO  feiyin_ime] Runtime config reloaded after config file change
+[2026-09-03T09:29:16.225Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey thread: instant config sync triggered by AtomicBool
+[2026-09-03T09:29:16.225Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: current vk=165, mod=0, mode=PushToTalk; new vk=165, mod=0, mode=PushToTalk
+[2026-09-03T09:29:16.225Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: binding unchanged, skipping
+[2026-09-03T09:30:06.631Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey config change notification set
+[2026-09-03T09:30:06.632Z INFO  feiyin_ime] Runtime config reloaded after config file change
+[2026-09-03T09:30:06.644Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey thread: instant config sync triggered by AtomicBool
+[2026-09-03T09:30:06.644Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: current vk=165, mod=0, mode=PushToTalk; new vk=165, mod=0, mode=PushToTalk
+[2026-09-03T09:30:06.644Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: binding unchanged, skipping
+[2026-09-03T09:30:06.811Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey config change notification set
+[2026-09-03T09:30:06.811Z INFO  feiyin_ime] Runtime config reloaded after config file change
+[2026-09-03T09:30:06.817Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey thread: instant config sync triggered by AtomicBool
+[2026-09-03T09:30:06.817Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: current vk=165, mod=0, mode=PushToTalk; new vk=165, mod=0, mode=PushToTalk
+[2026-09-03T09:30:06.817Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: binding unchanged, skipping
+[2026-09-03T09:36:51.755Z INFO  feiyin_ime] App command received: ShowTrayMenu { x: 2299, y: 1270 }
+[2026-09-03T09:36:52.458Z INFO  feiyin_ime] Spawning Tauri Settings UI from: D:\Workspace\CodeLab\voice-ime\target\release\feiyin-ime-ui.exe
+[2026-09-03T09:36:55.196Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey config change notification set
+[2026-09-03T09:36:55.196Z INFO  feiyin_ime] Runtime config reloaded after config file change
+[2026-09-03T09:36:55.208Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey thread: instant config sync triggered by AtomicBool
+[2026-09-03T09:36:55.208Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: current vk=165, mod=0, mode=PushToTalk; new vk=165, mod=0, mode=PushToTalk
+[2026-09-03T09:36:55.208Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: binding unchanged, skipping
+[2026-09-03T09:37:50.346Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey config change notification set
+[2026-09-03T09:37:50.346Z INFO  feiyin_ime] Runtime config reloaded after config file change
+[2026-09-03T09:37:50.361Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey thread: instant config sync triggered by AtomicBool
+[2026-09-03T09:37:50.361Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: current vk=165, mod=0, mode=PushToTalk; new vk=165, mod=0, mode=PushToTalk
+[2026-09-03T09:37:50.361Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: binding unchanged, skipping
+[2026-09-03T09:39:20.409Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey config change notification set
+[2026-09-03T09:39:20.409Z INFO  feiyin_ime] Runtime config reloaded after config file change
+[2026-09-03T09:39:20.409Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey thread: instant config sync triggered by AtomicBool
+[2026-09-03T09:39:20.409Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: current vk=165, mod=0, mode=PushToTalk; new vk=165, mod=0, mode=PushToTalk
+[2026-09-03T09:39:20.409Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: binding unchanged, skipping
+[2026-09-03T09:46:01.002Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey config change notification set
+[2026-09-03T09:46:01.002Z INFO  feiyin_ime] Runtime config reloaded after config file change
+[2026-09-03T09:46:01.017Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey thread: instant config sync triggered by AtomicBool
+[2026-09-03T09:46:01.017Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: current vk=165, mod=0, mode=PushToTalk; new vk=165, mod=0, mode=PushToTalk
+[2026-09-03T09:46:01.017Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: binding unchanged, skipping
+[2026-09-03T09:46:04.064Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey config change notification set
+[2026-09-03T09:46:04.064Z INFO  feiyin_ime] Runtime config reloaded after config file change
+[2026-09-03T09:46:04.079Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey thread: instant config sync triggered by AtomicBool
+[2026-09-03T09:46:04.079Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: current vk=165, mod=0, mode=PushToTalk; new vk=165, mod=0, mode=PushToTalk
+[2026-09-03T09:46:04.079Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: binding unchanged, skipping
+[2026-09-03T09:50:43.551Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey config change notification set
+[2026-09-03T09:50:43.551Z INFO  feiyin_ime] Runtime config reloaded after config file change
+[2026-09-03T09:50:43.566Z INFO  feiyin_ime::platform::windows::hotkey] Hotkey thread: instant config sync triggered by AtomicBool
+[2026-09-03T09:50:43.566Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: current vk=165, mod=0, mode=PushToTalk; new vk=165, mod=0, mode=PushToTalk
+[2026-09-03T09:50:43.566Z INFO  feiyin_ime::platform::windows::hotkey] sync_binding: binding unchanged, skipping

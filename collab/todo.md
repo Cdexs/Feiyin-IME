@@ -1,10 +1,37 @@
 # 任务列表 · voice-ime
 
+## 🔴 2026-09-03 待办：一笔 git commit 被刻意推迟（不要忘）
+
+**状态**：coder-2 的 **Part A（HOTKEY-060 补账）+ Part B（OVERLAY-075 代际隔离）已验收通过**，
+但**尚未提交**。
+
+**为什么不提交**：主控准备提交时检查 `git diff src/main.rs`，发现 coder-2 **已开工 Part C（D2D-073 P0）**，
+main.rs 里已有 65 行 D2D 内容、`Cargo.toml` 已 +4 行（两个 feature）。
+此时提交会把**已验收的 A+B 与在途未验收的 D2D 混进同一个提交** ——
+**这正是 2026-08-30 `git add -A` 事故的复现条件**（当时 HOTKEY-060 被误扫进 ITN 的两个提交，
+提交信息只字未提，且从未走完验收）。
+
+**处理方式**：等 Part C 交付并验收后，**分开提交**：
+1. 一个提交 = Part A + Part B（HOTKEY-060 补账 + OVERLAY-075 + 主控代修的 macOS arity）
+2. 一个提交 = Part C（D2D-073 P0）
+
+🔴 **提交前必做**：`git status` 看清改动归属，`git diff --stat` 确认无负增量
+（防 `[WORKER-DOC-OVERWRITE-001]`）。**coder-1 的 `audio/mod.rs` / `qwen_inference.rs` 属另一批，
+不得混入。**
+
+---
+
+
 
 ## 🛑 2026-08-30 深夜收工存盘 —— 三 Worker 额度全部超限，下次从这里开始
 
 > **恢复条件**：Gavin 的 Ollama 账号额度重置（coder-1 / coder-2 / tester-1 撞的是**同一个账号墙**，非各自故障）。
-> **恢复动作**：三个 Worker 的 `inbox/*/task.md` **任务书都已写好并派发过**，重启后直接 `dispatch <id>`（不带任务内容，仅通知重读）即可，**不要重写任务书**。
+> **恢复动作**：~~三个 Worker 的 `inbox/*/task.md` 任务书都已写好并派发过，重启后直接 `dispatch <id>`（不带任务内容，仅通知重读）即可，不要重写任务书。~~
+>
+> 🔴 **2026-09-03 实测更正：上面这条作废。** 三个 `inbox/*/task.md` 在本次重启时**全部被清空为 0 字节**
+> （mtime 2026-09-03 17:14），属 troubleshooting.md `[REPLACE-WORKER-TASKFILE-WIPED-001]` 的已知行为。
+> **三份任务书必须重写**（ASR-074 / HOTKEY-060 收尾+D2D-073 / OVERLAY-061 冷启动复测），
+> 直接 dispatch 只会让 Worker 读到空文件或凭记忆臆造任务。
 
 ### 现场（以 git 为准，非记忆）
 
@@ -54,7 +81,7 @@
 | Worker | 任务 | 状态 |
 | --- | --- | --- |
 | **coder-1** | **ASR-074**（ASR-067 + ASR-070 合并单）：在线 ASR 会话中途停止产出 + finalize 拖尾 4-5s | 已 ACK 同意方案，额度中断，**零交付** |
-| **coder-2** | **HOTKEY-060 收尾**（补 result.md + 五文档）→ **D2D-073** 九阶段（P0 依赖+骨架 → P1 处理中态 → P2 错误态 → P3 录音态+波形+065 动态图标 → P4 流式文字态 → P5 编辑态边框 → P6 069 淡出 → P7 063 字号 → P8 066 高度+3px） | 已 ACK，额度中断，**D2D 零交付** |
+| **coder-2** | ~~HOTKEY-060 收尾~~（✅ 2026-09-03 补账完成）→ ~~OVERLAY-075~~（✅ 2026-09-03 代码交付待验收）→ **D2D-073** 九阶段（P0 依赖+骨架 → P1 处理中态 → P2 错误态 → P3 录音态+波形+065 动态图标 → P4 流式文字态 → P5 编辑态边框 → P6 069 淡出 → P7 063 字号 → P8 066 高度+3px） | Part A+B 已交付，等主控 ACK 后开 D2D P0 |
 | **tester-1** | **OVERLAY-061 冷启动定向复测**（无预热 × 5 次冷启动，抓前 300ms，判据=是否出现在 (0,0) 附近；用 `target/release` 旧包，它不含屏幕外兜底） | 已 ACK，额度中断，**零交付** |
 
 **另需 coder-2 顺带确认**（已发消息，未答）：tester-1 实测显示交替闪烁主体是
@@ -161,9 +188,11 @@ coder-1 断电前交出了 15:09:33 那次 run 的完整时间线（实测，价
 | **ASR-070** | 说完松开热键后，识别的文本不完整，被丢掉尾部文字 | BUG | 🔴 **P0** | `qwen_inference.rs`（final_text() :520） | coder-1 | ✅ 已验收已提交 958cadb |
 | **OVERLAY-064** | 原来 overlay 窗口的灰色线条边框消失了，必须显示回来，否则窗口缺少质感 | BUG | 🟠 P1 | `src/main.rs` | coder-2 | ✅ 根因定案，归 D2D 批 920e1d2 |
 | **OVERLAY-061** | 按下热键，录音窗口会先显示在屏幕左上角边沿，然后跳到屏幕下方正确位置 | BUG | 🟠 P1 | `src/main.rs` | coder-2 | 🟣 排查表交付，等 REPRO 实测 |
-| **OVERLAY-068** | 长文本时窗口位置跳动；切到「识别处理中」时长短两个窗口交替闪烁 | BUG | 🟠 P1 | `src/main.rs` | coder-2 | ✅ 已验收已提交 920e1d2 |
+| **OVERLAY-068** | 长文本时窗口位置跳动；切到「识别处理中」时长短两个窗口交替闪烁 | BUG | 🟠 P1 | `src/main.rs` | coder-2 | ✅ 已验收已提交 920e1d2（拉锯残余根因转 OVERLAY-075） |
+| **OVERLAY-075** | 跨 session 流式文本渗漏：A 拖尾期间开 B → A 迟到包与 B 交替闪烁 + A 旧文字渲染进 B 窗口 | BUG | 🟠 P1 | `src/main.rs` | coder-2 | ✅ 已验收 2026-09-03（+44/-5 会话代际；macOS 三处字段数由主控代修） |
+| **ASR-074-GUARD** | chunk_tx 阻塞 send 防松手卡死（ASR-074 验收时发现的跨文件域残留风险） | BUG | 🟠 P1 | `src/main.rs` | coder-2 | 🟣 交付 2026-09-03，待主控验收（send_timeout 200ms + warn 计数） |
 | **OVERLAY-062** | 点击进入编辑态，文字字体显示很粗糙，提交按钮的边沿也很粗糙 | 优化 | 🟠 P1 | `src/main.rs` | coder-2 | ⬜ 待 D2D 批（DEC-055） |
-| **HOTKEY-060** | 录音、翻译热键设置时，重复拦截提示 | BUG | 🟠 P1 | `ui/src/pages/HotkeySettings.tsx` | coder-2 | 🔵 实施中 |
+| **HOTKEY-060** | 录音、翻译热键设置时，重复拦截提示 | BUG | 🟠 P1 | `ui/src/pages/HotkeySettings.tsx` | coder-2 | ✅ 代码已在 9506eac+e7a6a29（主控误扫入），2026-09-03 补账待验收 |
 | **ITN-071** | ITN 错误：`三五成群` / `一点半点` | BUG | 🟠 P1 | `src/itn.rs` | coder-1 | 🟣 ITN-071-B 已交付待验收（一点半点挪idioms+一点点补function_words+护栏4条） |
 | **FMT-072** | 明显有序列举内容，格式化输出失败 | BUG | 🟠 P1 | `src/llm/mod.rs` | — | ⏸ Gavin 拍板挂起，下次开单（需端侧判定是否 LLM 造成） |
 | **OVERLAY-063** | 笔记框内字体再大一号 | 优化 | 🟡 P2 | `src/main.rs` | 待派 | ⬜ 待派发 |

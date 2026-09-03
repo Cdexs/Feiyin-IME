@@ -29,7 +29,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex, RwLock,
 };
 use std::thread::{self, JoinHandle};
@@ -110,7 +110,10 @@ enum PipelineEvent {
     StreamingIdle,
     /// ASR-038-B: 流式 ASR 增量文本（display_text 全量，供 overlay 整段覆盖）
     /// OVERLAY-051-G: 附带 word timings 供时间戳驱动揭示
+    /// OVERLAY-075: 附带产生该事件的录音会话代际。跨 session 迟到包（上一 session 的
+    /// finalize 拖尾期间用户新开会话）按代际不匹配丢弃，见消费侧 :3682 起。
     StreamingText(
+        u64,
         String,
         Vec<crate::transcription::qwen_inference::WordTiming>,
     ),
@@ -201,6 +204,15 @@ static OVERLAY_EDITING: AtomicBool = AtomicBool::new(false);
 // after the user has released the hotkey. Reset on each RecordingStarted.
 #[cfg(target_os = "windows")]
 static STREAMING_STOPPED: AtomicBool = AtomicBool::new(false);
+// OVERLAY-075: session generation counter for streaming text isolation. Bumped on every
+// new recording session (worker Start, :4155 area); each session's ASR callback closure
+// captures its own generation and stamps every StreamingText it emits. The consumer drops
+// events whose generation no longer matches — replacing the timing-based latch with an
+// identity check so a stale ASR thread from session A can never leak text into session B.
+// STREAMING_STOPPED stays: it governs "late packets within the SAME session after stop",
+// which is orthogonal to generation (cross-session identity). The two gates AND together.
+#[cfg(target_os = "windows")]
+static STREAMING_GENERATION: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone, Copy)]
 #[cfg(target_os = "windows")]
 struct SendHwnd(isize);
@@ -237,6 +249,10 @@ const MENU_CMD_SETTINGS: u32 = 1001;
 const MENU_CMD_EXIT: u32 = 1002;
 #[cfg(target_os = "windows")]
 static MENU_VISIBLE: AtomicBool = AtomicBool::new(false);
+// ASR-074-GUARD: process-wide count of audio chunks dropped because the ASR consumer
+// stopped draining chunk_tx (send_timeout hit 200ms). Warn-visible per drop, counted
+// here so the magnitude survives in logs even when the warn lines rotate out.
+static ASR_CHUNK_DROPS: AtomicU64 = AtomicU64::new(0);
 // TRAY-001: 设置 UI 二进制名（平台差异：Windows 带 .exe，macOS 裸二进制）。
 #[cfg(target_os = "windows")]
 const SETTINGS_UI_EXE_NAME: &str = "feiyin-ime-ui.exe";
@@ -2039,13 +2055,23 @@ fn draw_overlay_to_dc(
             }
             OverlayStatus::Processing(message) => {
                 apply_overlay_window_region(hwnd, rect, None, true);
-                draw_processing_overlay(
+                // D2D-073 P0: this status is redrawn with Direct2D + DirectWrite
+                // (DEC-055 gray migration step 1). On any D2D failure the GDI path below
+                // still renders this frame, so the overlay never goes blank.
+                if !d2d::draw_processing_overlay(
                     hdc,
                     rect,
-                    message,
                     request.ui_language,
                     state.shimmer_phase,
-                );
+                ) {
+                    draw_processing_overlay(
+                        hdc,
+                        rect,
+                        message,
+                        request.ui_language,
+                        state.shimmer_phase,
+                    );
+                }
             }
             OverlayStatus::StreamingEditing { .. } => {
                 apply_overlay_window_region(hwnd, rect, None, true);
@@ -2779,6 +2805,289 @@ fn draw_editing_overlay_chrome(
     }
 
     (cancel_rect, submit_rect)
+}
+
+// D2D-073 P0: module for the Direct2D + DirectWrite redraw of the processing overlay.
+// DEC-055 gray migration: only draw_processing_overlay is routed here; every other
+// status keeps its GDI path. The DC render target keeps the existing double-buffered
+// WM_PAINT pipeline (mem_dc → BitBlt) untouched — D2D draws into the same memory DC.
+#[cfg(target_os = "windows")]
+mod d2d {
+    use super::{OVERLAY_BORDER_GRAY, OVERLAY_FONT_SIZE};
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Direct2D::Common::{
+        D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
+    };
+    use windows::Win32::Graphics::Direct2D::{
+        D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, ID2D1SolidColorBrush,
+        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+        D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    };
+    use windows::Win32::Graphics::DirectWrite::{
+        DWriteCreateFactory, IDWriteFactory, DWRITE_FACTORY_TYPE_SHARED,
+        DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+        DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+        DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_WORD_WRAPPING_NO_WRAP,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+    use windows::Win32::Graphics::Gdi::HDC;
+
+    /// Per-thread D2D/DWrite resources. Created once per overlay thread; the DC render
+    /// target is rebound to the current memory DC every WM_PAINT (BindDC is cheap).
+    /// factory/dwrite are held so the render target, text format and brushes keep their
+    /// parent objects alive for the thread's lifetime (COM reference semantics).
+    pub(crate) struct D2dResources {
+        #[allow(dead_code)] // kept alive for COM parent lifetime, see struct doc
+        pub factory: ID2D1Factory,
+        #[allow(dead_code)] // kept alive for text_format lifetime, see struct doc
+        pub dwrite: IDWriteFactory,
+        pub rt: ID2D1DCRenderTarget,
+        pub text_format: windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
+        pub brush: ID2D1SolidColorBrush,
+    }
+    fn create_resources() -> windows::core::Result<D2dResources> {
+        unsafe {
+            let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            let rt_props = D2D1_RENDER_TARGET_PROPERTIES {
+                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                },
+                dpiX: 0.0,
+                dpiY: 0.0,
+                usage: D2D1_RENDER_TARGET_USAGE_NONE,
+                minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+            };
+            // DC render target: GDI-compatible surface, so the existing double-buffered
+            // WM_PAINT (mem_dc → BitBlt) keeps working with zero structural change.
+            let rt: ID2D1DCRenderTarget = factory.CreateDCRenderTarget(&rt_props)?;
+            // Font family must match the GDI path's ClearType font face for visual parity.
+            let family: Vec<u16> = "Microsoft YaHei UI".encode_utf16().collect();
+            let locale: Vec<u16> = "zh-CN".encode_utf16().collect();
+            let text_format = dwrite.CreateTextFormat(
+                PCWSTR(family.as_ptr()),
+                None,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                -OVERLAY_FONT_SIZE as f32, // GDI negative height (em) → D2D positive size
+                PCWSTR(locale.as_ptr()),
+            )?;
+            text_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            text_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            let _ = rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            let brush = rt.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 0.42,
+                    b: 0.0,
+                    a: 1.0,
+                },
+                None,
+            )?;
+            Ok(D2dResources {
+                factory,
+                dwrite,
+                rt,
+                text_format,
+                brush,
+            })
+        }
+    }
+
+    thread_local! {
+        static D2D: std::cell::RefCell<Option<D2dResources>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Try to draw the processing overlay with D2D. Returns false if D2D failed to
+    /// initialize or draw (caller falls back to the GDI path for this frame; init is
+    /// retried on the next attempt so a transient failure never permanently disables D2D).
+    pub(crate) fn draw_processing_overlay(
+        hdc: HDC,
+        rect: &RECT,
+        ui_language: crate::config::UiLanguage,
+        shimmer_phase: f32,
+    ) -> bool {
+        D2D.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                match create_resources() {
+                    Ok(r) => *slot = Some(r),
+                    Err(e) => {
+                        log::warn!("D2D-073: Direct2D init failed, staying on GDI this frame: {e}");
+                        return false;
+                    }
+                }
+            }
+            draw_with(
+                slot.as_ref().expect("just initialized"),
+                hdc,
+                rect,
+                ui_language,
+                shimmer_phase,
+            )
+        })
+    }
+
+    fn draw_with(
+        res: &D2dResources,
+        hdc: HDC,
+        rect: &RECT,
+        ui_language: crate::config::UiLanguage,
+        shimmer_phase: f32,
+    ) -> bool {
+        unsafe {
+            // Bind this frame's memory DC. The subrect is the full client rect so D2D
+            // pixel coordinates map 1:1 onto the GDI surface.
+            if res.rt.BindDC(hdc, rect).is_err() {
+                return false;
+            }
+            let w = (rect.right - rect.left).max(1) as f32;
+            let h = (rect.bottom - rect.top).max(1) as f32;
+            res.rt.BeginDraw();
+            res.rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+            // 1) Dark background — same #181A18 as the GDI path.
+            res.brush.SetColor(&D2D1_COLOR_F {
+                r: 0x18 as f32 / 255.0,
+                g: 0x1A as f32 / 255.0,
+                b: 0x18 as f32 / 255.0,
+                a: 1.0,
+            });
+            res.rt.FillRectangle(
+                &D2D_RECT_F {
+                    left: 0.0,
+                    top: 0.0,
+                    right: w,
+                    bottom: h,
+                },
+                &res.brush,
+            );
+
+            // 2) 1px rounded border — same geometry as GDI RoundRect(…, 16*2, 16*2):
+            //    corner radius 16, stroke centered on the GDI border line.
+            res.brush.SetColor(&D2D1_COLOR_F {
+                r: (OVERLAY_BORDER_GRAY.0 & 0xFF) as f32 / 255.0,
+                g: ((OVERLAY_BORDER_GRAY.0 >> 8) & 0xFF) as f32 / 255.0,
+                b: ((OVERLAY_BORDER_GRAY.0 >> 16) & 0xFF) as f32 / 255.0,
+                a: 1.0,
+            });
+            let radius = 16.0;
+            res.rt.DrawRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: 0.5,
+                        top: 0.5,
+                        right: w - 0.5,
+                        bottom: h - 0.5,
+                    },
+                    radiusX: radius,
+                    radiusY: radius,
+                },
+                &res.brush,
+                1.0,
+                None,
+            );
+
+            // 3) Shimmer glow — D2D native gradient replaces the 30-slice Gaussian AlphaBlend.
+            //    Same travel window and Gaussian profile (alpha peak 150/255 at beam center).
+            let glow_half = 45.0_f32;
+            let travel = w + glow_half * 2.0;
+            let beam_cx = -glow_half + travel * shimmer_phase;
+            let stops = [
+                windows::Win32::Graphics::Direct2D::Common::D2D1_GRADIENT_STOP {
+                    position: 0.0,
+                    color: D2D1_COLOR_F {
+                        r: 0.85,
+                        g: 0.85,
+                        b: 0.85,
+                        a: 0.0,
+                    },
+                },
+                windows::Win32::Graphics::Direct2D::Common::D2D1_GRADIENT_STOP {
+                    position: 0.5,
+                    color: D2D1_COLOR_F {
+                        r: 0.85,
+                        g: 0.85,
+                        b: 0.85,
+                        a: 150.0 / 255.0,
+                    },
+                },
+                windows::Win32::Graphics::Direct2D::Common::D2D1_GRADIENT_STOP {
+                    position: 1.0,
+                    color: D2D1_COLOR_F {
+                        r: 0.85,
+                        g: 0.85,
+                        b: 0.85,
+                        a: 0.0,
+                    },
+                },
+            ];
+            // Gradient brush takes a pre-created stop collection (3-arg form in windows 0.58).
+            let stop_collection = res.rt.CreateGradientStopCollection(
+                &stops,
+                windows::Win32::Graphics::Direct2D::D2D1_GAMMA_2_2,
+                windows::Win32::Graphics::Direct2D::D2D1_EXTEND_MODE_CLAMP,
+            );
+            if let Ok(stop_collection) = stop_collection {
+                if let Ok(gradient_brush) = res.rt.CreateLinearGradientBrush(
+                    &windows::Win32::Graphics::Direct2D::D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                        startPoint: D2D_POINT_2F {
+                            x: beam_cx - glow_half,
+                            y: 0.0,
+                        },
+                        endPoint: D2D_POINT_2F {
+                            x: beam_cx + glow_half,
+                            y: 0.0,
+                        },
+                    },
+                    None,
+                    &stop_collection,
+                ) {
+                    // Vertical span matches the GDI glow: 1px inside border to 1px inside bottom.
+                    res.rt.FillRectangle(
+                        &D2D_RECT_F {
+                            left: (beam_cx - glow_half).max(1.0),
+                            top: 1.0,
+                            right: (beam_cx + glow_half).min(w - 1.0),
+                            bottom: h - 1.0,
+                        },
+                        &gradient_brush,
+                    );
+                }
+            }
+
+            // 4) Processing text — centered, brand orange, DirectWrite grayscale AA.
+            res.brush.SetColor(&D2D1_COLOR_F {
+                r: 1.0,
+                g: 0x6B as f32 / 255.0,
+                b: 0.0,
+                a: 1.0,
+            });
+            let strings = super::i18n::get(ui_language);
+            let text: Vec<u16> = strings.overlay_processing.encode_utf16().collect();
+            res.rt.DrawText(
+                &text,
+                &res.text_format,
+                &D2D_RECT_F {
+                    left: 20.0,
+                    top: 4.0,
+                    right: w - 20.0,
+                    bottom: h - 4.0,
+                },
+                &res.brush,
+                windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+
+            res.rt.EndDraw(None, None).is_ok()
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -3679,7 +3988,20 @@ fn process_controller_events(
                 set_tray_state(tray, TrayState::Recording, ui_language);
                 show_overlay_streaming_idle(overlay_handle, opacity, ui_language, 0);
             }
-            PipelineEvent::StreamingText(text, words) => {
+            PipelineEvent::StreamingText(gen, text, words) => {
+                // OVERLAY-075: cross-session identity gate — MUST run before anything consumes
+                // the packet (overlay AND the edit-learn mirror below), so a stale session's
+                // finalize-tail text can neither render into this session's window nor pollute
+                // the WORDBOOK-053-B mirror used to learn user corrections.
+                let current_gen = STREAMING_GENERATION.load(Ordering::Acquire);
+                if gen != current_gen {
+                    log::debug!(
+                        "OVERLAY-075: dropping StreamingText from stale session (gen {} != current {})",
+                        gen,
+                        current_gen
+                    );
+                    continue;
+                }
                 // WORDBOOK-053-B: mirror the latest streaming text for the edit-learn path.
                 if let Ok(mut mirror) = last_streaming_text.lock() {
                     *mirror = Some(text.clone());
@@ -4152,6 +4474,13 @@ fn spawn_worker_thread(
                     cancel_signal.store(false, Ordering::Release);
                     stop_recording_signal.store(false, Ordering::Release);
                     is_recording.store(true, Ordering::Release);
+                    // OVERLAY-075: a new recording session claims the next generation.
+                    // Everything this session's ASR thread emits is stamped with this value;
+                    // the consumer (:3682 area) drops stamps that no longer match, so a
+                    // finalize-tail from a previous session can never reach a newer session's
+                    // overlay. Bump BEFORE the ASR closure below captures `session_generation`.
+                    let session_generation =
+                        STREAMING_GENERATION.fetch_add(1, Ordering::Release) + 1;
                     send_event(&event_tx, PipelineEvent::RecordingStarted);
                     let config = clone_runtime_config(&runtime_config);
                     let device_name = if config.audio.input_device.trim().is_empty() {
@@ -4276,7 +4605,10 @@ fn spawn_worker_thread(
                                     &model_dir_clone,
                                     Some(&cancel_clone),
                                     |display_text, words| {
+                                        // OVERLAY-075: stamp every packet with this session's
+                                        // generation; the consumer drops stale-session packets.
                                         let _ = event_tx_clone.send(PipelineEvent::StreamingText(
+                                            session_generation,
                                             display_text.to_string(),
                                             words.to_vec(),
                                         ));
@@ -4293,7 +4625,34 @@ fn spawn_worker_thread(
                             Some(Arc::clone(&audio_buf)),
                             device_name,
                             |chunk| {
-                                let _ = chunk_tx.send(chunk.to_vec());
+                                // ASR-074-GUARD: bounded channel send was an unbounded
+                                // blocking send — if the ASR thread stopped consuming
+                                // (WS stuck / server silent / half-open connection),
+                                // chunk_tx fills and the recording thread never returns:
+                                // release-hotkey presents as a frozen app. 200ms cap:
+                                // a healthy consumer drains 256 chunks in milliseconds,
+                                // so 200ms is 20x headroom above normal send latency;
+                                // at worst the recording thread stalls 200ms per chunk
+                                // instead of forever. Timeout = drop the chunk with a
+                                // counted warn (same drop-visibility principle as
+                                // ASR-074 Step 2-C's [ASR-DROP] tag) — never silently.
+                                match chunk_tx.send_timeout(
+                                    chunk.to_vec(),
+                                    Duration::from_millis(200),
+                                ) {
+                                    Ok(()) => {}
+                                    Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
+                                        ASR_CHUNK_DROPS.fetch_add(1, Ordering::Relaxed);
+                                        log::warn!(
+                                            "[ASR-DROP] chunk send timed out after 200ms (ASR consumer stuck?); total dropped: {}",
+                                            ASR_CHUNK_DROPS.load(Ordering::Relaxed)
+                                        );
+                                    }
+                                    Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                                        // ASR thread gone: drop silently, the recording
+                                        // session is being torn down anyway.
+                                    }
+                                }
                             },
                         );
                         // drop chunk_tx 让 ASR 线程的 channel 断开（触发 finish-task）
@@ -4973,7 +5332,7 @@ fn overlay_request_for_event(event: &PipelineEvent) -> platform::OverlayRequest 
             auto_close_ms: 2500,
         },
         PipelineEvent::FocusLost(text) => platform::OverlayRequest::ShowPreview(text.clone()),
-        PipelineEvent::StreamingText(_) => platform::OverlayRequest::Show, // macOS 侧流式文本暂不渲染
+        PipelineEvent::StreamingText(_, _, _) => platform::OverlayRequest::Show, // macOS 侧流式文本暂不渲染
         PipelineEvent::Done | PipelineEvent::Cancelled => platform::OverlayRequest::Hide,
     }
 }
@@ -5035,7 +5394,7 @@ fn handle_pipeline_event(event: &PipelineEvent, ui_language: config::UiLanguage)
             log::warn!("macOS pipeline: FormatFailed (LLM 格式化失败，原文已注入兜底)");
             platform::request_tray_state(TrayState::Idle, ui_language);
         }
-        PipelineEvent::StreamingText(text) => {
+        PipelineEvent::StreamingText(_, text, _) => {
             // ASR-038-B: macOS 侧流式文本暂不渲染（C-overlay 批后续实现）
             log::debug!("macOS pipeline: StreamingText ({} chars)", text.len());
         }
@@ -7594,7 +7953,11 @@ mod overlay_wire_tests {
 
         // ASR-038-B: StreamingText → Show（macOS 侧流式文本暂不渲染，只维持 overlay 可见）
         assert_eq!(
-            overlay_request_for_event(&PipelineEvent::StreamingText("测试文本".to_string())),
+            overlay_request_for_event(&PipelineEvent::StreamingText(
+                0,
+                "测试文本".to_string(),
+                Vec::new()
+            )),
             OverlayRequest::Show,
             "StreamingText 必须映射为 Show（macOS 侧暂不渲染流式文本）"
         );
