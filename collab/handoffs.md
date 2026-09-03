@@ -174,3 +174,27 @@
 - **必查A**：guard 门控模块 --list 实证 6 条非 0 ｜ **必查B**：228+15（git 物理实提交 15 个 #[test]，文档「14」是语义组口径，差额=1 已说明）｜ **必查C**：挂钟用例连跑 5 次全红 0.90-0.91s
 - **红线合规**：零生产/零用例改动、零出包、零 commit、版本号未动、纯 bash 追加文档
 - **详情**：outbox/tester-1/result.md（含裁定请求表：③建议改测试循环对齐生产；④⑤①②需主控裁定改哪侧）
+
+## 2026-09-03 — coder-2 — HOTKEY-078 ✅ AltGr 尾随 keyup 串键修复（HotkeySettings.tsx -3+5，待主控验收）
+
+- **根因（独立复核与主控推演一致）**：`handleVoiceHotkeyKeyUp` :287-289 在 AltRight keyUp
+  提前清 `altGrSynthCtrlActiveRef`，尾随合成 ControlLeft keyUp 逃过 :279（现 :284）抑制 →
+  第二次 `checkAndApplyVoiceHotkey(0xA2,0)`；async 闸门（await invoke 后才置 finalizedRef）
+  挡不住同步连续 keyUp；available=false else 分支 :213-216 不置 finalized 反而 reset →
+  `setPendingHotkey({vk:0xA2})` 覆盖 → S12 冲突弹窗错显 Left Ctrl
+- **修法**：删 3 行提前清旗，旗唯一清零点回归 `resetVoiceRecordingState()`（:141，会话级生命周期）；
+  +5 行注释。非回归五场景独立复核全过（wasActive 捕获序不变/AltRight 先抬修好/ControlLeft 先抬
+  行为不变/非 AltGr 无变化/同会话双保险）
+- **验证**：npx tsc --noEmit 0 error；git diff -w 精确 -3+5 注释仅此一文件；S12 测试零触碰；
+  未跑 cargo build/npm run test（tester-1 职责）；未 commit；v0.9.0 未动
+- **Part B 取证（等主控裁定）**：①翻译侧推演成立——handleTranslationHotkeyKeyDown(:335-361)
+  无修饰键过滤/无 AltGr 旗/无 keyUp 处理器（:466-467），AltGr 首事件 keyDown ControlLeft
+  :344 查表 0xA2 → :350 全同步直调 finalize → 翻译热键被录成 Left Ctrl，连 async 重入窗口
+  都不存在，无用例覆盖故未红；②修法=镜像语音侧键序生命周期（结构性改动需配套用例），
+  建议另开单，不碰 HOTKEY-060 helper 契约；③同步闸门同意不做，补充反论：入口置 finalized
+  会破坏 catch 回退路径（:218-228 invoke 异常时热键永远写不进去）
+- **附加发现备案**：Alt 先抬 Ctrl 后抬后单按 Left Ctrl 被 :284 误抑制至 Escape 重进；
+  修前错录 Left Ctrl、修后静默忽略，属模糊歧义键序更安全取舍
+- **红线合规**：仅 HotkeySettings.tsx / 测试零触碰 / 未 commit / 版本号未动 / UTF-8（Edit 工具）/
+  零临时文件 / MACOS-HANDOFF §HOTKEY-078 已记
+- **详情**：outbox/coder-2/result.md + logs/20260903.md + CHANGELOG.md

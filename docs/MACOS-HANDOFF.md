@@ -1369,3 +1369,18 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
   本批同步为 3 字段新签名，macOS 编译恢复一致（未在 macOS 机器实际验证，需 macOS 端测确认）。
 - Windows 侧绘制契约（GDI → Direct2D，DEC-055 / D2D-073）与本条无交互；代际闸门在
   controller 事件分发层（`process_controller_events`），绘制层不感知代际。
+
+## §HOTKEY-078 · AltGr 尾随 keyup 串键修复（2026-09-03，Windows 侧 UI 修复）
+
+**改动文件**：`ui/src/pages/HotkeySettings.tsx`（Tauri 设置页 React，Windows/macOS 共用同一份前端）。
+
+- **性质**：删除 `handleVoiceHotkeyKeyUp` 中 AltRight keyUp 处的 3 行提前清旗代码
+  （`altGrSynthCtrlActiveRef.current = false`），让合成 Ctrl 抑制旗的唯一清零点回归
+  `resetVoiceRecordingState()`（录制会话级生命周期）。+5 行注释说明缺陷机理。
+- **平台影响**：**零编译影响、零行为差异**——纯前端 TSX 逻辑，无平台分支、无 Rust 改动、
+  无 `PipelineEvent` 签名变更，macOS 编译单元零接触。
+- **修复场景**：Windows 下 AltGr 物理键合成 ControlLeft+AltRight 双事件，旧代码在
+  AltRight keyUp 时提前落旗，导致尾随的 ControlLeft keyUp 逃过抑制被录成第二个热键
+  （冲突弹窗键名显示 Left Ctrl 而非 Right Alt）。macOS 无 AltGr 合成键序，此缺陷
+  在 macOS 上本就不触发，但修复对 macOS 无副作用（旗只在 AltRight 按下时置位）。
+- **验证**：`npx tsc --noEmit` 0 error；测试执行与出包归 tester-1（阶段四/五）。

@@ -276,6 +276,11 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
     if (!isRecordingVoice) return;
     const code = e.code;
 
+    // HOTKEY-078: altGrSynthCtrlActiveRef must stay true until the trailing
+    // synthetic ControlLeft keyUp arrives (it is always dispatched AFTER
+    // AltRight keyUp). Clearing it on AltRight keyUp re-opens the :279
+    // suppression too early and lets the synthetic Ctrl be recorded as a
+    // second hotkey. Sole clear point: resetVoiceRecordingState().
     if (code === 'ControlLeft' && altGrSynthCtrlActiveRef.current) {
       pressedModsRef.current.delete(code);
       return;
@@ -284,9 +289,6 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
     if (!MODIFIER_CODES.has(code)) return;
 
     const altGrSynthWasActive = altGrSynthCtrlActiveRef.current;
-    if (code === 'AltRight') {
-      altGrSynthCtrlActiveRef.current = false;
-    }
 
     if (hadNonModifierKeyRef.current) {
       pressedModsRef.current.delete(code);
