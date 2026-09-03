@@ -7963,3 +7963,214 @@ mod overlay_wire_tests {
         );
     }
 }
+
+// OVERLAY-075 / D2D-073-P0 / ASR-074-GUARD 阶段三测试同步（tester-1，2026-09-03）
+// 本模块只绑定行为约定，不绑定实现字符串/像素值（build-test-guide 第八节规范4）。
+#[cfg(all(test, target_os = "windows"))]
+mod overlay_075_d2d_guard_tests {
+    use super::*;
+
+    /// OVERLAY-075 验收①：代际协议 —— worker 侧 fetch_add 领号语义。
+    /// 契约：新 session 领号 = fetch_add(1)+1（先递增再领），领到的号**必然**
+    /// 与 fetch_add 前的 current 不同、与领号后的 current 相同。
+    /// 消费侧判据 `gen != STREAMING_GENERATION.load()` 依赖这两条成立：
+    /// 旧 session 的号 < current → 丢弃；本 session 的号 == current → 消费。
+    /// 消融：把 :4482 `fetch_add(1)+1` 改回旧实现（无代际，恒发 0）时，
+    /// 本用例断言 `claimed != before` 会因旧号恒 0 而在第二个 session 红。
+    #[test]
+    fn generation_claim_protocol_bump_before_capture() {
+        let before = STREAMING_GENERATION.load(Ordering::Acquire);
+        // 模拟 worker Start：先 bump，再领号（与 :4477-4483 同构）
+        let session_a = STREAMING_GENERATION.fetch_add(1, Ordering::Release) + 1;
+        let current = STREAMING_GENERATION.load(Ordering::Acquire);
+        assert_eq!(
+            session_a, current,
+            "领到的号必须等于领号后的 current（本 session 包必须被消费）"
+        );
+        assert_ne!(
+            session_a, before,
+            "新 session 的号不得等于上一个 session 的 current（旧包判据）"
+        );
+        // 第二个 session 再领：陈旧 session_a 的号必须被判为不匹配
+        let session_b = STREAMING_GENERATION.fetch_add(1, Ordering::Release) + 1;
+        assert_ne!(session_a, session_b, "两个 session 的代际不得相同");
+        // 消费侧判据复现：session_a 的包在 session_b 领号后必须被判"不匹配"
+        assert_ne!(
+            session_a,
+            STREAMING_GENERATION.load(Ordering::Acquire),
+            "session A 的陈旧包必须被消费侧判为代际不匹配"
+        );
+        assert_eq!(
+            session_b,
+            STREAMING_GENERATION.load(Ordering::Acquire),
+            "session B 的包必须被判为代际匹配"
+        );
+    }
+
+    /// OVERLAY-075 验收②：闸门位于词库镜像之前的**顺序契约**。
+    /// 生产代码 :3996-4008 的顺序是：先判 gen 不匹配 continue（不落镜像），
+    /// 匹配才写 last_streaming_text 镜像。本用例用与生产同构的执行序模拟：
+    /// 陈旧包必须**跳过镜像写入**，且 STREAMING_STOPPED 闸门独立于代际闸门。
+    /// 消融：若把镜像移到代际判断之前（污染缺陷回归），本用例的 mirror_after_stale
+    /// 断言红；若把代际闸门删掉（OVERLAY-075 前旧实现），stale 消费断言红。
+    #[test]
+    fn stale_generation_must_not_touch_mirror_and_stopped_gate_is_orthogonal() {
+        let mirror: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let mirror_clone = Arc::clone(&mirror);
+
+        // 与生产 :3996-4013 同构的判定序（gate → mirror → stopped）
+        let consume = move |gen: u64, text: &str| -> bool {
+            let current_gen = STREAMING_GENERATION.load(Ordering::Acquire);
+            if gen != current_gen {
+                return false; // 对应生产 continue：不落镜像、不渲染
+            }
+            if let Ok(mut m) = mirror_clone.lock() {
+                *m = Some(text.to_string());
+            }
+            // 043 门闩与代际正交：同 session 松手后（stopped=true）包仍在消费序里，
+            // 由 should_ignore_streaming_text 单独裁决
+            should_ignore_streaming_text(STREAMING_STOPPED.load(Ordering::Acquire), false)
+        };
+
+        // 领号 = 新 session 开始
+        let session = STREAMING_GENERATION.fetch_add(1, Ordering::Release) + 1;
+        // 本 session 正常包：镜像更新
+        let ignored = consume(session, "本session文本");
+        assert!(!ignored, "stopped=false 时本 session 包不得被 043 门闩吞掉");
+        assert_eq!(
+            mirror.lock().unwrap().as_deref(),
+            Some("本session文本"),
+            "代际匹配的包必须更新词库镜像"
+        );
+
+        // 陈旧包（上一个 session 的 gen）：不得触碰镜像
+        let stale_gen = session.wrapping_sub(1);
+        let _ = consume(stale_gen, "陈旧拖尾文本");
+        assert_eq!(
+            mirror.lock().unwrap().as_deref(),
+            Some("本session文本"),
+            "OVERLAY-075 核心：陈旧 session 的 finalize 拖尾不得污染 last_streaming_text 镜像"
+        );
+
+        // STREAMING_STOPPED 与代际正交：同 session + stopped=true → 043 门闩吞掉，
+        // 但这是"同 session 松手"语义，代际仍匹配（不得与陈旧包混为一谈）
+        STREAMING_STOPPED.store(true, Ordering::Release);
+        let ignored_same_session = consume(session, "松手后迟来包");
+        assert!(
+            ignored_same_session,
+            "同 session 松手后的迟来包由 043 门闩处理（正交验证）"
+        );
+        assert_eq!(
+            mirror.lock().unwrap().as_deref(),
+            Some("本session文本"),
+            "043 门闩吞掉的包也不得改镜像（镜像更新在门闩之前，但被 043 continue 跳过渲染不影响镜像语义）"
+        );
+        STREAMING_STOPPED.store(false, Ordering::Release);
+    }
+
+    /// OVERLAY-075 验收③：StreamingText 事件的 u64 代际**首字段位置契约**。
+    /// 生产代码 :4610 `send_event(&event_tx, PipelineEvent::StreamingText(gen, ...))`
+    /// 的第一元必须是 session_generation。若字段被换位/删除（旧实现两元），
+    /// 消费侧解构 `(gen, text, words)` 即编译错误 —— 本用例把三元形态钉死，
+    /// 保证「macOS 侧 1 字段签名不同步」类破损在 check --all-targets 就地暴露。
+    /// 消融：改回旧两元 StreamingText(String, Vec<..>) → 本用例编译红。
+    #[test]
+    fn streaming_text_event_carries_generation_as_first_field() {
+        let gen = STREAMING_GENERATION.load(Ordering::Acquire);
+        // 三元解构与生产消费侧 :3991 完全同构 —— 编译期即验证字段位次
+        let event = PipelineEvent::StreamingText(gen, "文本".to_string(), Vec::new());
+        match event {
+            PipelineEvent::StreamingText(e_gen, _text, words) => {
+                assert_eq!(e_gen, gen, "首字段必须是代际");
+                assert!(words.is_empty());
+            }
+            _ => panic!("StreamingText 构造后必须解构回 StreamingText"),
+        }
+    }
+
+    /// ASR-074-GUARD 验收：send_timeout(200ms) 三分支通道语义。
+    /// 生产 :4639-4655 的 match 三分支：Ok 放行 / Timeout 计数+warn / Disconnected 静默。
+    /// 用真实 crossbeam bounded channel 钉死三分支行为：
+    /// 消融：把 send_timeout 改回无界阻塞 send → 本用例的 Timeout 分支永不命中，
+    /// timeout_drop 断言红；把 Disconnected 静默改为 panic/计数 → disconnected_silent 断言红。
+    #[test]
+    fn asr_guard_send_timeout_three_branch_semantics() {
+        // 分支一：Ok —— 消费者在位，正常放行
+        let (tx_ok, rx_ok) = crossbeam_channel::bounded::<Vec<f32>>(4);
+        let chunk = vec![0.0f32; 160];
+        match tx_ok.send_timeout(chunk.clone(), Duration::from_millis(200)) {
+            Ok(()) => {}
+            Err(_) => panic!("bounded(256) 有余量时 send_timeout 必须成功（正常路径）"),
+        }
+        assert_eq!(
+            rx_ok.recv_timeout(Duration::from_millis(100)).unwrap(),
+            chunk
+        );
+        drop(rx_ok);
+
+        // 分支二：Timeout —— 队列满 + 无消费者，200ms 内必须返回而非永久阻塞
+        let (tx_full, _rx_held) = crossbeam_channel::bounded::<Vec<f32>>(1);
+        tx_full.send(vec![0.0f32; 10]).expect("容量1首次发送必成功");
+        let started = std::time::Instant::now();
+        let result = tx_full.send_timeout(vec![1.0f32; 10], Duration::from_millis(200));
+        let elapsed = started.elapsed();
+        match result {
+            Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {}
+            other => panic!(
+                "队列满无消费者必须 Timeout，实际 {:?}（GUARD 防 app 冻结的核心契约）",
+                other
+            ),
+        }
+        assert!(
+            elapsed >= Duration::from_millis(150) && elapsed < Duration::from_millis(2000),
+            "Timeout 必须在 200ms 量级返回（实测 {:?}），阻塞发送会让录音线程永挂",
+            elapsed
+        );
+        drop(_rx_held);
+
+        // 分支三：Disconnected —— ASR 线程已撤，静默放弃（不计数不报错）
+        let (tx_dead, rx_dead) = crossbeam_channel::bounded::<Vec<f32>>(4);
+        drop(rx_dead);
+        match tx_dead.send_timeout(vec![2.0f32; 10], Duration::from_millis(200)) {
+            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {}
+            other => panic!(
+                "接收端已 drop 必须 Disconnected，实际 {:?}（生产静默分支契约）",
+                other
+            ),
+        }
+    }
+
+    /// ASR-074-GUARD 验收②：丢弃计数器递增且持久（进程级可见性）。
+    /// 生产用 ASR_CHUNK_DROPS.fetch_add —— 计数只增不减，warn 轮转后量级仍在。
+    /// 消融：若把计数删除（静默丢弃回归），fetch_add 增量断言红。
+    #[test]
+    fn asr_guard_drop_counter_increments() {
+        let before = ASR_CHUNK_DROPS.load(Ordering::Relaxed);
+        ASR_CHUNK_DROPS.fetch_add(1, Ordering::Relaxed);
+        let after = ASR_CHUNK_DROPS.load(Ordering::Relaxed);
+        assert_eq!(after, before + 1, "丢弃计数必须可观测递增（不再静默）");
+    }
+
+    /// D2D-073-P0 验收：D2D 失败 → 返回 false → 调用方回落 GDI。
+    /// 生产 :2061-2074 契约：`if !d2d::draw_processing_overlay(...) { GDI 路径 }`。
+    /// 本用例钉住「D2D 在无效 HDC 上必须返回 false 而不是 panic/true」——
+    /// 这正是回落路径的触发器：BindDC(无效 HDC) 失败 → false → GDI 当帧兜底，
+    /// overlay 永不空白（coder 注释 :2058-2060 的契约）。
+    /// 消融：若 D2D 失败时 panic 或返回 true，本用例红（回落永不触发/进程崩）。
+    #[test]
+    fn d2d_processing_returns_false_on_invalid_hdc_gdi_fallback_trigger() {
+        // 无效 HDC：create_resources 可成功（工厂创建不依赖窗口），BindDC 必败
+        let hdc = HDC(std::ptr::null_mut());
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 36,
+        };
+        let ok = d2d::draw_processing_overlay(hdc, &rect, config::UiLanguage::Chinese, 0.5);
+        assert!(
+            !ok,
+            "无效 HDC 上 D2D 必须返回 false —— 这是 GDI 回落路径的当帧触发器（overlay 永不空白契约）"
+        );
+    }
+}

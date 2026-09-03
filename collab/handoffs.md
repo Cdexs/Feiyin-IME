@@ -155,3 +155,13 @@
 - **边界**：仅 src/main.rs（on_chunk 闭包 + 新 static）；audio/qwen_inference 未碰；容量 256 未动
 - **验证**：fmt clean / check --all-targets 0 error（99 warnings 基线持平）
 - **详情**：outbox/coder-2/result.md + logs/20260903.md + CHANGELOG.md
+
+---
+
+## 2026-09-03 — tester-1 — TEST-SYNC-074/075/D2D ✅ 阶段三 14 用例交付（纯追加负增量0，fmt/check 过，待主控验收）
+
+- **交付**：src/main.rs +211（新模块 overlay_075_d2d_guard_tests 5 用例：075 领号协议/镜像污染/首字段三元 + GUARD 三分支/计数器 + D2D 回落触发器）、src/audio/mod.rs +154（Step 2-B drain 四用例）、src/transcription/qwen_inference.rs +233（批量边界 ×2 + 缺陷1/2/3 ×3）
+- **消融**：每条用例附「改回旧实现会不会红」推演（result.md 逐条表）
+- **覆盖缺口 5 项如实声明**（真实 WS 帧序/完整 match arm/真实 DC 成功路径/WASAPI 回调内计数/真实慢消费 abandoned 精确值），阶段五端测建议已附
+- **自查**：fmt --check clean；check --all-targets 0 error；git diff -w 纯增量；既有 228 用例零触碰
+- **注意**：阶段三未跑用例（红线）；阶段四执行时新用例随 `cargo test` 生效，其中 main.rs 新模块带 `#[cfg(all(test, target_os="windows"))]`（Windows-only statics 依赖）

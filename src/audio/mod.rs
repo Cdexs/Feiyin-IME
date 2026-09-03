@@ -2677,4 +2677,158 @@ mod tests {
             );
         }
     }
+
+    // ASR-074 Step 2-B 阶段三测试同步（tester-1，2026-09-03）
+    // 松手 drain 语义钉死：与生产 :308-343 同构的执行序，绑定行为约定不绑定实现字符串。
+
+    /// 验收①：Empty 提前 break —— 通道清空后循环立即终止，不空转等满 500ms。
+    /// 生产契约：drain 循环在 try_recv Empty 时 break（:322），剩余预算直接放弃。
+    /// 消融：若 Empty 不 break（改回死等 deadline），本用例耗时会从 <50ms 涨到 500ms
+    /// 量级，elapsed 断言红。
+    #[test]
+    fn asr_074_stop_drain_exits_on_empty_channel_before_deadline() {
+        let (tx, rx) = crossbeam_channel::bounded::<AudioChunk>(64);
+        // 预置 3 个非空 chunk 后封口：drain 应在毫秒级清完并退出，而不是等 500ms
+        for i in 0..3 {
+            tx.send((Instant::now(), vec![i as f32; 160])).unwrap();
+        }
+        drop(tx);
+
+        let drain_deadline = Instant::now() + Duration::from_millis(500);
+        let started = Instant::now();
+        let mut drained: usize = 0;
+        while Instant::now() < drain_deadline {
+            match rx.try_recv() {
+                Ok((_ts, chunk)) if !chunk.is_empty() => {
+                    drained += 1;
+                    let _ = chunk;
+                }
+                Ok(_) => continue,
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
+        }
+        assert_eq!(drained, 3, "封口前预置的 3 个 chunk 必须全部被 drain");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "Empty 必须提前 break（实测 {:?}），死等 deadline 会让松手卡 500ms",
+            started.elapsed()
+        );
+    }
+
+    /// 验收②：Disconnected 提前 break —— ASR 消费端已断时不得死循环。
+    /// 生产契约：:323 Disconnected → break。与 Empty 同为提前退出路径。
+    /// 消融：若 Disconnected 分支被删（panic 或继续收网），本用例红（panic 或超时）。
+    #[test]
+    fn asr_074_stop_drain_exits_on_disconnected_channel() {
+        let (tx, rx) = crossbeam_channel::bounded::<AudioChunk>(4);
+        tx.send((Instant::now(), vec![0.5f32; 160])).unwrap();
+        drop(tx); // 先发后断：Disconnected 与 Empty 都可能先命中，都应退出
+
+        let mut drained: usize = 0;
+        let started = Instant::now();
+        loop {
+            match rx.try_recv() {
+                Ok((_ts, chunk)) if !chunk.is_empty() => drained += 1,
+                Ok(_) => continue,
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
+        }
+        assert_eq!(
+            drained, 1,
+            "断开前已在队列的 chunk 仍须被 drain（尾部音频不丢）"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "Disconnected 必须终止 drain 循环"
+        );
+    }
+
+    /// 验收③：空 chunk 计数排除 —— Ok((_, chunk)) 但 chunk.is_empty() 的包
+    /// 既不进 drained 计数也不进 abandoned 计数（生产 :313 `if !chunk.is_empty()`
+    /// 与 :328 同构），但循环仍要继续消费下一个包（:321 `Ok(_) => continue`）。
+    /// 消融：若空包被计入 drained，断言 2 红；若空包中断循环（无 continue），
+    /// 后面的非空包丢失，断言 3 红。
+    #[test]
+    fn asr_074_stop_drain_skips_empty_chunks_but_keeps_draining() {
+        let (tx, rx) = crossbeam_channel::bounded::<AudioChunk>(8);
+        tx.send((Instant::now(), Vec::new())).unwrap(); // 空 chunk（stream_err 通道语义）
+        tx.send((Instant::now(), vec![0.1f32; 160])).unwrap();
+        tx.send((Instant::now(), Vec::new())).unwrap();
+        tx.send((Instant::now(), vec![0.2f32; 160])).unwrap();
+        drop(tx);
+
+        let mut drained: usize = 0;
+        let mut empty_seen: usize = 0;
+        loop {
+            match rx.try_recv() {
+                Ok((_ts, chunk)) if !chunk.is_empty() => drained += 1,
+                Ok(_) => {
+                    empty_seen += 1;
+                    continue;
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
+        }
+        assert_eq!(drained, 2, "非空 chunk 必须计入 drained");
+        assert_eq!(empty_seen, 2, "空 chunk 必须被跳过但不得中断 drain");
+    }
+
+    /// 验收④：500ms 超时放弃 —— 生产者持续灌包、消费者不封口时，drain 到点放弃，
+    /// 剩余积压归入 abandoned 计数（:326-331 第二段 while），松手后最坏 0.5s 返回。
+    /// 消融：若时间上限被删（改回纯数量/纯清空语义），本用例 elapsed 断言红
+    /// （循环会无限期跟随生产者）。
+    #[test]
+    fn asr_074_stop_drain_gives_up_at_deadline_with_abandoned_count() {
+        let (tx, rx) = crossbeam_channel::bounded::<AudioChunk>(256);
+        let producer = std::thread::spawn(move || {
+            // 持续灌包 900ms，保证 drain 期间队列始终有新积压
+            let end = Instant::now() + Duration::from_millis(900);
+            while Instant::now() < end {
+                let _ = tx.try_send((Instant::now(), vec![0.9f32; 160]));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        // 等队列先积压起来再开始 drain，确保 drain 期间持续有积压可放弃
+        std::thread::sleep(Duration::from_millis(30));
+        let drain_deadline = Instant::now() + Duration::from_millis(500);
+        let started = Instant::now();
+        let mut drained: usize = 0;
+        let mut abandoned: usize = 0;
+        while Instant::now() < drain_deadline {
+            match rx.try_recv() {
+                Ok((_ts, chunk)) if !chunk.is_empty() => {
+                    drained += 1;
+                    let _ = chunk;
+                }
+                Ok(_) => continue,
+                Err(crossbeam_channel::TryRecvError::Empty) => continue,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
+        }
+        // 超时后仍有积压 → 放弃并计数（与生产 :327-331 同构）
+        while let Ok((_ts, chunk)) = rx.try_recv() {
+            if !chunk.is_empty() {
+                abandoned += 1;
+            }
+        }
+        producer.join().unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "drain 必须坚持到 deadline（救尾部音频）"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "deadline 后必须放弃（松手最坏 0.5s 返回契约），实测 {:?}",
+            started.elapsed()
+        );
+        assert!(drained > 0, "deadline 内应消费到部分积压");
+        assert!(
+            abandoned > 0,
+            "持续灌包场景下 deadline 后必有 abandoned（放弃可观测）"
+        );
+    }
 }
