@@ -1,23 +1,48 @@
 # 任务列表 · voice-ime
 
-## 🔴 2026-09-03 待办：一笔 git commit 被刻意推迟（不要忘）
+## ✅ 2026-09-03 收工状态 —— 下一棒从这里开始
 
-**状态**：coder-2 的 **Part A（HOTKEY-060 补账）+ Part B（OVERLAY-075 代际隔离）已验收通过**，
-但**尚未提交**。
+### 已完成并提交（工作区干净，**本地领先 origin/main 16 个提交，未 push**）
 
-**为什么不提交**：主控准备提交时检查 `git diff src/main.rs`，发现 coder-2 **已开工 Part C（D2D-073 P0）**，
-main.rs 里已有 65 行 D2D 内容、`Cargo.toml` 已 +4 行（两个 feature）。
-此时提交会把**已验收的 A+B 与在途未验收的 D2D 混进同一个提交** ——
-**这正是 2026-08-30 `git add -A` 事故的复现条件**（当时 HOTKEY-060 被误扫进 ITN 的两个提交，
-提交信息只字未提，且从未走完验收）。
+| 提交 | 内容 | 验收 |
+| --- | --- | --- |
+| `8fbb913` | **ASR-074** 音频上行背压丢帧根治（coder-1）：2-A 排空 chunk_rx / 2-B 松手 drain 带 500ms 上限 / 2-C 丢帧计数 + 三个埋点缺陷 | 主控逐项 Read + 独立 cargo check |
+| `8023cc6` | **OVERLAY-075** 跨 session 代际隔离 + **D2D-073-P0** 处理中态迁移 + **ASR-074-GUARD** send_timeout + **HOTKEY-060** 补账 + 主控代修 macOS 元数（coder-2） | 四条红线 diff 逐个 grep 核对 |
 
-**处理方式**：等 Part C 交付并验收后，**分开提交**：
-1. 一个提交 = Part A + Part B（HOTKEY-060 补账 + OVERLAY-075 + 主控代修的 macOS arity）
-2. 一个提交 = Part C（D2D-073 P0）
+### 在途
 
-🔴 **提交前必做**：`git status` 看清改动归属，`git diff --stat` 确认无负增量
-（防 `[WORKER-DOC-OVERWRITE-001]`）。**coder-1 的 `audio/mod.rs` / `qwen_inference.rs` 属另一批，
-不得混入。**
+| Worker | 任务 | 状态 |
+| --- | --- | --- |
+| tester-1 | **TEST-SYNC-074/075/D2D**（阶段三，只写用例不跑） | 执行中 |
+| coder-1 | — | 待命 |
+| coder-2 | — | 待命（main.rs 已交给 tester-1，未经协调不得动） |
+
+### 下一棒顺序
+
+阶段三交付 → **阶段四全量回归** → **阶段五 BUILD v0.9.0** → Gavin 端测。
+
+🔴 **出包后必须 Gavin 目视确认的**：处理中态 overlay 的**文字与圆角边沿是否变细腻**（DEC-055 红线 5，
+不接受静态论证结案）。他说达标才继续迁剩余五个状态；不达标则 D2D 方向需重议。
+
+### 🔴 两条待 Gavin 处理（主控无权限 / 需授权）
+
+1. **DeepSeek API key 泄露**（详见 troubleshooting `[SECRET-IN-REPO-001]`）：
+   `collab/research/ab033-components.json:17` 明文 key，`f58af96`（08-14）已 push 到 GitHub，
+   暴露 20 天，Gavin 已确认遭第三方盗刷、有金钱损失。
+   **主控已完成全仓扫描（仅此一处）并落盘经验，但吊销 key 只能 Gavin 在服务商后台做。**
+   待 Gavin 决定的两项：① 是否把仓库内该 key 替换为占位符并提交；
+   ② 是否重写 git 历史 + force push（**破坏性操作，未获授权前主控不执行**）。
+2. **LLM 401 导致格式化全线未生效**：Gavin 提到「暂时关闭格式化输出」，语义待确认。
+   **FMT-072「有序列举格式化失败」的真因已查明 = LLM 根本没调用成功**，
+   出包端测前需确认 LLM 可用，否则该项无法验证。
+
+### 今日已证伪 / 已结案（不要重查）
+
+| 项 | 结论 |
+| --- | --- |
+| **OVERLAY-061 冷启动假设** | ❌ **证伪**。COLD 3199 帧 + WARM 9831 帧 = **13030 帧，可见态位置异常零命中**；单 HWND 无重建、GetWindowRect 零失败。两处 `ShowWindow` 均在 `SetWindowPos` 之后（主控 Read 核对 + 7 帧实测佐证）。**061 不是 overlay 窗口的问题**，下一步是 REPRO-061-ALLWIN 全窗口清扫（任务书未写） |
+| **068 宽度阶梯归属** | 主控裁定：`y≈1292 ∧ h=36` 的宽度阶梯族**属 068 不属 061**，两 bug 不得互相污染 |
+| **068-B 覆盖面** | coder-2 核查后主控采纳：**不返工**。拉锯真源是跨 session 渗漏，已由 OVERLAY-075 结构性根治 |
 
 ---
 

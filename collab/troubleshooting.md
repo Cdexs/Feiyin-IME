@@ -3987,3 +3987,58 @@ Gavin 2026-09-03 09:27 做了一次受控复现，产出 `target/release/debug.l
 2026-08-30 那次「三条证据里两条不成立」是证据**可信度**问题，
 本条是证据**存续性**问题 —— 前者已记，后者此前没人写过。
 
+## [SECRET-IN-REPO-001] 🔴 DeepSeek API key 明文入库并推送至 GitHub，20 天后被第三方盗刷【改 .gitignore 收录范围前必读】
+
+**日期**：2026-09-03 ｜ **报告人**：Gavin（发现非本人的 API 调用、已产生金钱损失）｜ **责任**：主控侧流程缺口
+
+### 事实
+
+| 项 | 值 |
+| --- | --- |
+| 文件 | `collab/research/ab033-components.json` 第 17 行 `"API_KEY": "sk-89edf7…"` |
+| 引入提交 | `f58af96`（TEST-PROMPT-AB-033 实测收口），**2026-08-14 15:19** |
+| 状态 | 🔴 **已 push 到 `origin/main`**（`github.com/Cdexs/Feiyin-IME`） |
+| 暴露时长 | 约 20 天 |
+| 全仓扫描结果 | 仅此一处。`sk-` 长串、`api_key/secret/password/token/bearer` + 20 位以上值，**无第二处** |
+
+**关联症状**：同日 Gavin 受控复现日志出现
+`LLM non-retryable error: HTTP status client error (401 Unauthorized)`，
+近期所有 LLM 格式化/优化/翻译全部走 raw text fallback 未生效
+—— **FMT-072「有序列举格式化失败」的真实原因是 LLM 根本没调用成功，不是判断错误。**
+
+### 根因：两个正确的决定叠加出一个漏洞
+
+1. **2026-07-30 Gavin 决定把 `collab/` 移出 `.gitignore` 入库**，理由正当
+   （Windows / macOS 两侧团队信息对称）。`.gitignore` 里保留排除的是
+   `inbox/outbox/acks/drafts` 与 `research/audio-*`、`research/data/`。
+2. **2026-08-14 A/B 实验把带 key 的配置快照写进 `collab/research/*.json`。**
+
+`research/*.json` **不在任何排除项里** → 随 collab/ 一起入库 → 随提交推上 GitHub。
+两步单看都没错，叠起来就是明文凭证进公网仓库。
+
+**放大器**：GitHub 公开仓库有凭证爬虫持续扫描，分钟级即被收割。
+
+### 规则
+
+1. 🔴 **任何写入仓库的实验/研究产物，落盘前必须过一遍凭证检查**，
+   尤其是「把运行时配置整份 dump 成 JSON」这类快照 —— 它会把 key 一起带出来。
+2. 🔴 **扩大 `.gitignore` 收录范围（把原本忽略的目录改为入库）时，必须先扫该目录既有内容**
+   是否含凭证。`.gitignore` **只影响未跟踪文件，不会让已跟踪文件消失**，
+   同理，把目录纳入跟踪时旧文件会一并入库。
+3. 🔴 **凭证只能放用户目录级的 `git-credentials.json`**（本项目既有约定），
+   **不得出现在任何仓库内文件中**，包括研究稿、测试夹具、日志副本。
+4. 主控侧：**把日志/数据副本存进仓库前必须扫凭证**
+   （本次 `collab/evidence/debug-*.log` 存入前已扫，0 命中，是对的做法）。
+
+### 处置顺序（**吊销优先于清历史**）
+
+1. **立刻在服务商后台吊销泄露的 key** —— key 一废，泄露出去的字符串即成废纸，止血完成
+2. 生成新 key，不入库
+3. （可选）重写 git 历史 + force push 清除痕迹 —— **破坏性操作，必须 Gavin 明确授权**，
+   且在 1 完成后已非安全问题，只是卫生问题
+
+### 与既有条目的关系
+
+`[ENCODING-UTF8-001]`、`[WORKER-DOC-OVERWRITE-001]` 管的是**仓库内容正确性**；
+本条管的是**仓库内容的对外暴露**。此前没有任何条目覆盖后者。
+
