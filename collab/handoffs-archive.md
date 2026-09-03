@@ -5217,3 +5217,88 @@ Binary file (standard input) matches
 - **还原自证**：三次消融均编辑器还原（禁 git reset/checkout/stash/clean），`git diff -w` 0 字节，复跑逐数一致
 - **红条三分类**：③ 真回归 **0**，过闸无阻塞项
 - 🔴 **如实交代的覆盖缺口（未粉饰，主控认可）**：建连提前、15 个退出点汇总行接线 —— **无纯函数可测，阶段四也测不到**，只能靠 Gavin 端测 `[ASR-SUMMARY]` 日志验证
+
+---
+
+# 归档批次：2026-08-30（v0.9.0 阶段一，2026-09-03 归档）
+
+## 2026-08-30 — coder-1 — VERSION-059 ✅ 版本号升级 v0.8.1 → v0.9.0（零功能改动，待主控验收）
+
+- **来源**：Gavin 2026-08-30 明确指示「升级版本到 v0.9.0」，属「版本号禁止擅改」规则例外放行
+- **改动**：3 处手改 + 2 处 cargo 自动写回
+  - `Cargo.toml:3` `version = "0.8.1"` → `"0.9.0"`
+  - `src-tauri/Cargo.toml:3` `version = "0.8.1"` → `"0.9.0"`
+  - `src-tauri/tauri.conf.json:9` `"version": "0.8.1",` → `"0.9.0",`
+  - `Cargo.lock:5893` + `src-tauri/Cargo.lock:934` 由 `cargo check` 自动同步
+- **方案评估**：同意主控方案。全仓 grep `0.8.1`（排除 target/node_modules/Publish/Backup/.venv）仅命中主控列的 3 处，无第 4 处产品版本号漏列。macOS `scripts/Info.plist:20` 的 `0.7.3` 由 `build-macos.sh:92-147` PlistBuddy 动态覆盖，非手改项（已记 docs/MACOS-HANDOFF.md §VERSION-059）。`ui/package.json:4` 的 `0.1.0` 按红线不动。
+- **验证**：cargo fmt clean / cargo check --all-targets 0 error（99 既有 warnings）/ cargo check src-tauri --all-targets 0 error（13/11 既有 warnings）/ git diff -w 五文件仅版本号行变更 / 旧版本号 0.8.1 grep 0 命中 / 新版本号 0.9.0 恰好 5 处
+- **红线合规**：只改版本号未碰功能代码 / 未跑 test/build（阶段一）/ 未 commit/push / 禁用 git 破坏性命令全程未用 / 未动 ui/package.json / UTF-8 编写（bash heredoc + Edit 工具）
+- **跨平台**：版本号平台中立，macOS 侧无需同步改动，详见 docs/MACOS-HANDOFF.md §VERSION-059
+- **详情**：outbox/coder-1/result.md + logs/20260830.md + CHANGELOG.md + collab/progress.md（新建 v0.9.0 段落）
+
+## 2026-08-30 — coder-1 — ASR-067/070 取证 ✅ v0.9.0 两条 P0 根因取证（零生产改动，待主控验收）
+
+- **来源**：主控派单（基线 HEAD `9c9ff73`，v0.9.0）。两条 P0：ASR-067 停顿 1 秒后麦克风不接受输入 / ASR-070 松键后尾部文字丢失
+- **ASR-067 结论**：主控 800ms 假设大概率不成立。官方文档确认 sentence_silence 断句不断连（新句 sentence_begin 自动开始），客户端 on_result 状态机（qwen_inference.rs:472-492）正确处理新句，主循环 sentence_end=true 后无 break/return。真根因需 Gavin -debug 实测，三方向：A 服务端静默期 / B channel 积压 / C heartbeat 未过滤。🔴 需确认 Gavin 端测用哪个模型（Publish/config.toml 是 performance 本地模型，若本地则 800ms 假设完全不适用）
+- **ASR-070 结论**：根因锁定 `final_text()`（qwen_inference.rs:520-522）只返回 confirmed_sentences 不含 current_sentence。松键时若最后一段未收到 sentence_end=true 则尾部丢。候选 c（揭示进度截断）排除——最终提交取 final_text 不取 displayed_chars（reveal 只管动画）。修复点落 qwen_inference.rs，归 coder-1 与 coder-2 零冲突。建议修法：final_text 改返回 display_text
+- **文件域**：只读 qwen_inference.rs / main.rs / audio/mod.rs + 官方文档 + research；**未写入 main.rs**（coder-2 独占）
+- **红线合规**：零生产改动 / 未写入 main.rs / 未跑 test/build / 未 commit/push / 禁用 git 破坏性命令 / Publish 运行时数据只读 / 版本号 0.9.0 未动 / UTF-8
+- **需主控确认**：① Gavin 端测用哪个 ASR 模型 ② ASR-070 修法 A 是否可立项 ③ ASR-067 是否等 -debug 日志再定方案
+- **详情**：outbox/coder-1/result.md + logs/20260830.md + CHANGELOG.md
+
+---
+
+## 2026-08-30 — coder-1 — ASR-070-FIX ✅ 修复松键后尾部文字丢失（qwen_inference.rs，待主控验收）
+
+- **来源**：主控派单（基线 HEAD `9c9ff73`）。ASR-070 取证已验收，根因 `final_text()` 丢弃 current_sentence 确认
+- **改动**：仅 `src/transcription/qwen_inference.rs` +27/-4
+  - `final_text()`（:520-528）：`confirmed_sentences.join("")` → `display_text()`（confirmed+current），注释改写说明根因
+  - 断言 :1793（:1795-1797）：`"第一句"` → `"第一句第二"`，加注释说明契约变更
+  - 新增护栏（:1816-1830）：`asr_070_final_text_includes_current_sentence`，消融改回旧实现必红
+- **重复计数核查**：on_result（:472-491）end=true 时 push confirmed 同时 clear current（:480/:482 原子），其余分支覆盖非追加 → 无重复风险
+- **5 条断言推演**：逐条手工推演，仅 :1793 需改（confirmed+current 场景），其余 4 条 current 为空旧新一致
+- **fallback 保留**：:1404-1413 未动，:1411-1413 改后成死代码但 bail 路径 :1409 仍必要
+- **验证**：cargo fmt clean / cargo check --all-targets 0 error / cargo check src-tauri 0 error / git diff -w 仅 qwen_inference.rs +27/-4
+- **红线合规**：只改 qwen_inference.rs 未写入 main.rs / 未跑 test/build / 未 commit/push / 禁 git 破坏性命令 / 版本号 0.9.0 未动 / 未碰 target/release/config.toml / UTF-8
+- **详情**：outbox/coder-1/result.md + logs/20260830.md + CHANGELOG.md + collab/progress.md + docs/MACOS-HANDOFF.md §ASR-070-FIX
+
+## 2026-08-30 — coder-1 — ITN-071/FMT-072 ✅ 三五成群补词+护栏 / 一点半点挂起 / FMT-072取证挂起 / 死代码化简（待主控验收）
+
+- **来源**：主控派单（基线 HEAD `958cadb`）。ITN-071 两条 ITN 错误 + FMT-072 有序列举失败 + 顺带清理 qwen_inference 死代码
+- **① 三五成群（已修复）**：不在任何保护集，补进 `itn-rules.toml [protect.idioms]`（:163），三副本同步 `be2ef5c7...`。护栏 2 条，消融删词变红
+- **② 一点半点（挂起）**：代码层面 unit_collision_map 一桶 + check_protection 第五步应匹配保护，主控独立复核属实。卡点不在代码而在不知道 Gavin 实际方向，等 Gavin 用例
+- **③ FMT-072（取证挂起）**：时间线排查三结论存档，静态分析未找到碰坏有序路径的改动，需 API 验证，主控已向 Gavin 索要用例
+- **④ 死代码化简**：qwen_inference.rs:1404-1413 不可达 fallback 化简，保留 bail，+4/-6 行为不变
+- **改动**：itn-rules.toml +1、src/itn.rs +17、qwen_inference.rs +4/-6。src/llm/mod.rs 零改动
+- **验证**：cargo fmt clean / cargo check --all-targets 0 error / cargo check src-tauri 0 error
+- **红线合规**：未写入 main.rs/ui / 未跑 test/build / FMT-072 未自行烧 API / 未 commit/push / 禁 git 破坏性命令 / 版本号 0.9.0 未动 / 未碰 config.toml 等运行时数据 / UTF-8
+- **详情**：outbox/coder-1/result.md + logs/20260830.md + CHANGELOG.md + collab/progress.md + docs/MACOS-HANDOFF.md
+
+## 2026-08-30 — coder-1 — ITN-071-B ✅ 时间语境路径绕过成语保护修复（待主控验收）
+
+- **来源**：Gavin 实测用例 `一点半点→1点半点`、`一点点→1点点`
+- **产出源全表**：主循环10条路径均受 :1870 check_protection 前置门控，问题在 check_protection 返回 None 而非路径绕过
+- **根因**：一点点不在任何保护集→decide_conversion :2275 is_date_suffix("点")=true 误转；一点半点在 unit_collisions(第5步)应保护但防御性挪到 idioms(第1步)
+- **修复**：一点半点 unit_collisions→idioms；一点点 新增到 function_words。一点半绝不加保护表
+- **回归**：下午一点半/一点十五分/两点半/三点一刻 全部仍正确转换
+- **护栏**：4条（Gavin原句2+回归2）各附消融推演
+- **改动**：itn-rules.toml +3/-2、src/itn.rs +40。三副本 sha256 311cbb96 一致
+- **验证**：fmt clean / check 0 error / src-tauri check 0 error / UTF-8 OK
+- **红线合规**：一点半未加保护表 / check_protection 语义未改 / 未写入 main.rs/ui / 未跑 test/build / 未 commit/push / 禁 git 破坏性命令 / 版本号 0.9.0 未动 / config.toml 等未碰
+
+## 2026-08-30 夜 — tester-1 — REPRO-073 ✅ 四项端测现象实机取证完成（零生产/零用例/零出包，待主控验收）
+
+- **基线**：HEAD `9c9ff73`，取证 exe=target/release/feiyin-ime.exe（08-18 23:48，Gavin 端测同款）以 -debug 运行
+- **REP-061 闪左上角**：未复现。1044 帧全程 2ms rect 采样，overlay 从可枚举起就是终态 (1160,1292,240,36)，无中间帧。建议 Gavin 多屏/DPI 变更下复测（coder-2 054-B-FIX 或已根治此现象）
+- **REP-068 长文本跳动**：复现。宽度阶梯式 12 档增长 240→1664、x 以水平中心锚反向同步；2 次「长文本→Recording 240宽」回缩；y=1292 全程恒定（无上下跳）。**「交替闪烁」主体按数据是「长文本动态宽 vs Recording 240」拉锯（stop 后 late-StreamingText 4-5s 内 6+ 次），不是 Processing 200×36** —— coder-2 查的方向请按此修正
+- **REP-067 停顿失聪 (P0)**：复现（4 轮 3 中）。服务端在 >1.4s 静默后的句子丢尾（词流冻结在 14 words）或整句丢（新 id 全 words=0）。**vad_hit_ms 全 8 run = -1**，客户端无 end-of-speech 信号源。另外静默后新 sentence 的 display 继承前句全文再追加——服务端 sentence 上下文管理问题，不是客户端上行断
+- **REP-070 尾部丢字 (P0)**：复现（7 组 5 丢）。**服务端 word 流就停在结尾词之前（「门口集合」等从未到达客户端），LLM/注入层零丢失**。直接回答任务书：是服务端没返回，不是返回没注入。规律：≥4s 音频或含降调收尾时丢，3.3s 短句不丢
+- **REP-067/070 疑似同根**：客户端 StopSignal→finish-task 与服务端收尾间无 end-of-speech 握手，final_ms 全部远小于音频时长
+- **新疑点 3 项（建议立项）**：①ASR-SUMMARY outcome=failed 但 words_total>0（判定脱节，Gavin A/B 会被误导）②vad_hit_ms=-1 从未命中（服务端 VAD 回执没走通）③stop 后迟发 6+次/4-5s
+- **对 coder-1**：ASR-070-FIX 建议复核——本次数据显示丢失在「服务端 word 流未发送」层，final_text 改 display_text() 只能救「已到达但未断句」的场景，救不了「从未到达」的（067 同源问题）
+- **产物**：outbox/tester-1/result.md（四节+逐帧数据+7组对照表）；取证数据 240 张截图+3 份 rect CSV+debug.log 副本（3442 行）在 /c/msys64/tmp/opencode/repro073/
+- **红线合规**：tests/src/src-tauri/ui 零触碰；Publish md5 前后一致；target/release/config.toml md5 前后一致、API key 未泄漏；feiyin-ime-nor.exe 未动；系统音量 28%/C920 mic 93% 已还原；未出包未 commit；UTF-8
+
+### （补 2026-08-30 深夜）REPRO-073 验收反馈回填 —— 数据局限性声明
+
+主控验收通过并采纳 070 对照结论（已向 Gavin 更正「服务端未返回」定性）。回填一条局限性：主控复核 28 条 [ASR-SUMMARY] 出更早 2 run vad_hit_ms=637/644 正常 → 「vad_hit_ms=-1 从未命中=回执没走通」降级为待验证假设，真因更可能是 TTS 合成音频不触发 VAD；14/26 run 零识别 → 067/070 的比例型统计掺环境因素，**15:09 干净对照与窗口几何数据不受影响**。详见 result.md 附录A 局限性声明。
