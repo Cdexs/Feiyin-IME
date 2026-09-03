@@ -665,6 +665,18 @@ pub fn compute_hard_cap(audio_samples: usize) -> Duration {
     Duration::from_secs_f64(cap_secs)
 }
 
+/// ASR-074 永久埋点: 计算 p95 百分位（用于 read/send 耗时分布）
+/// 空样本返回 0，否则排序后取第 p 百分位的值
+fn percentile(samples: &[u64], p: u64) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let mut sorted: Vec<u64> = samples.to_vec();
+    sorted.sort_unstable();
+    let idx = (sorted.len() * p as usize) / 100;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
 /// 流式 ASR 转录主入口
 ///
 /// 协议流程（RESEARCH-ASR-038）：
@@ -1074,8 +1086,8 @@ pub fn transcribe_streaming_realtime(
                 let parsed: serde_json::Value =
                     serde_json::from_str(&text).context("服务端返回非 JSON 文本")?;
                 if let Some(err) = extract_task_error(&parsed) {
-                    log::info!("{}", summary.format_summary());
                     summary.outcome = "failed";
+                    log::info!("{}", summary.format_summary());
                     bail!("服务端错误：{}", err);
                 }
                 if extract_event_type(&parsed) == Some("task-started") {
@@ -1092,14 +1104,14 @@ pub fn transcribe_streaming_realtime(
             Ok(Message::Binary(_)) => {}
             Ok(Message::Ping(_) | Message::Pong(_)) => {}
             Ok(Message::Close(_)) => {
-                log::info!("{}", summary.format_summary());
                 summary.outcome = "failed";
+                log::info!("{}", summary.format_summary());
                 bail!("网络失败：服务端关闭连接（未收到 task-started）");
             }
             Ok(Message::Frame(_)) => {}
             Err(e) if is_read_timeout(&e) => {
-                log::info!("{}", summary.format_summary());
                 summary.outcome = "failed";
+                log::info!("{}", summary.format_summary());
                 bail!("超时：等待 task-started 超时");
             }
             Err(e) => bail!("网络失败：读取消息失败 - {}", e),
@@ -1271,6 +1283,25 @@ pub fn transcribe_streaming_realtime(
     let _ = hard_cap;
     let mut last_ws_activity = std::time::Instant::now();
 
+    // ASR-074 永久诊断埋点（debug 级别，仅 -debug 下输出）
+    // 目的：定位循环瓶颈在 read 还是 send，以及 chunk_rx 积压曲线
+    // 🔴 永久保留（主控条件三）：此缺陷藏了很久因丢帧零日志，修完仍需可见性
+    let mut loop_iter_count: u64 = 0;
+    // read 统计
+    let mut read_min_us: u64 = u64::MAX;
+    let mut read_max_us: u64 = 0;
+    let mut read_sum_us: u64 = 0;
+    let mut read_count: u64 = 0;
+    let mut read_samples: Vec<u64> = Vec::with_capacity(1024);
+    // send 统计
+    let mut send_min_us: u64 = u64::MAX;
+    let mut send_max_us: u64 = 0;
+    let mut send_sum_us: u64 = 0;
+    let mut send_count: u64 = 0;
+    let mut send_samples: Vec<u64> = Vec::with_capacity(1024);
+    let mut last_backlog_log = std::time::Instant::now();
+    let t_loop_start = std::time::Instant::now();
+
     // 临时设短 read_timeout 模拟非阻塞读（录音期间）
     // 保存原 timeout，录音结束后恢复
     set_socket_timeouts(
@@ -1281,6 +1312,72 @@ pub fn transcribe_streaming_realtime(
     .context("网络失败：设置非阻塞读 timeout 失败")?;
 
     loop {
+        // ASR-074 永久埋点: 循环转速 + read/send 各自耗时分布
+        loop_iter_count += 1;
+        if loop_iter_count % 1000 == 0 {
+            let elapsed_ms = t_loop_start.elapsed().as_millis();
+            let hz = (loop_iter_count as f64 / elapsed_ms as f64 * 1000.0) as u64;
+            let avg_read = if read_count > 0 {
+                read_sum_us / read_count
+            } else {
+                0
+            };
+            let avg_send = if send_count > 0 {
+                send_sum_us / send_count
+            } else {
+                0
+            };
+            let p95_read = percentile(&read_samples, 95);
+            let p95_send = percentile(&send_samples, 95);
+            log::debug!(
+                "[ASR-LOOP] {} iters in {}ms → {} Hz | \
+                 read: min={}μs avg={}μs p95={}μs max={}μs (n={}) | \
+                 send: min={}μs avg={}μs p95={}μs max={}μs (n={}) | \
+                 chunk_rx={}",
+                loop_iter_count,
+                elapsed_ms,
+                hz,
+                if read_min_us == u64::MAX {
+                    0
+                } else {
+                    read_min_us
+                },
+                avg_read,
+                p95_read,
+                read_max_us,
+                read_count,
+                if send_min_us == u64::MAX {
+                    0
+                } else {
+                    send_min_us
+                },
+                avg_send,
+                p95_send,
+                send_max_us,
+                send_count,
+                chunk_rx.len(),
+            );
+            // 重置统计窗口（下一 1000 轮重新累计）
+            read_min_us = u64::MAX;
+            read_max_us = 0;
+            read_sum_us = 0;
+            read_count = 0;
+            read_samples.clear();
+            send_min_us = u64::MAX;
+            send_max_us = 0;
+            send_sum_us = 0;
+            send_count = 0;
+            send_samples.clear();
+        }
+        if last_backlog_log.elapsed() >= Duration::from_millis(500) {
+            log::debug!(
+                "[ASR-BACKLOG] chunk_rx={} (t={:.1}s)",
+                chunk_rx.len(),
+                t_streaming.elapsed().as_secs_f64()
+            );
+            last_backlog_log = std::time::Instant::now();
+        }
+
         if is_cancelled() {
             let _ = ws_socket.close(None);
             summary.outcome = "cancelled";
@@ -1288,43 +1385,132 @@ pub fn transcribe_streaming_realtime(
             bail!("转录已取消");
         }
 
-        // 读 chunk（非阻塞）
-        match chunk_rx.try_recv() {
-            Ok(chunk) if !chunk.is_empty() => {
-                all_samples.extend_from_slice(&chunk);
-                let pcm = f32_to_pcm16_le(&chunk);
-                for binary_chunk in chunk_pcm_to_binary(&pcm) {
-                    ws_socket
-                        .send(Message::Binary(binary_chunk.into()))
-                        .map_err(|e| anyhow!("网络失败：发送音频帧失败 - {}", e))?;
+        // 读 chunk（非阻塞）—— ASR-074 Step 2-A: 每轮排空 chunk_rx，最多 N=16 帧
+        // 🔴 上限理由：旧代码每轮只发 1 帧 = 65 Hz；N=16 时合并 send，
+        // 若 send 1ms/帧 → 16ms send + 1ms read ≈ 60 Hz（优于旧 65）；
+        // 若 send 5ms/帧 → 80ms send = 12 Hz（恶化，但此时瓶颈在 send，
+        // 排空无效——需在 result.md 写明下一步：拆 send 到独立线程）
+        // 合并多个 chunk 成一次 WS 帧，减少 send 系统调用次数
+        const MAX_CHUNKS_PER_ITER: usize = 16;
+        let mut batch_samples: Vec<f32> = Vec::new();
+        let mut chunks_drained: usize = 0;
+        loop {
+            match chunk_rx.try_recv() {
+                Ok(chunk) if !chunk.is_empty() => {
+                    all_samples.extend_from_slice(&chunk);
+                    batch_samples.extend_from_slice(&chunk);
+                    chunks_drained += 1;
+                    if chunks_drained >= MAX_CHUNKS_PER_ITER {
+                        break;
+                    }
                 }
+                Ok(_) => {}
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    if !finish_task_sent {
+                        let finish_task = build_finish_task_message(&task_id);
+                        // 先发完 batch 里已有的 chunk，再发 finish-task
+                        if !batch_samples.is_empty() {
+                            let pcm = f32_to_pcm16_le(&batch_samples);
+                            for binary_chunk in chunk_pcm_to_binary(&pcm) {
+                                if !first_audio_byte_sent {
+                                    first_audio_byte_sent = true;
+                                    summary.first_audio_byte_ms =
+                                        t_start.elapsed().as_millis() as i64;
+                                    log::info!(
+                                        "[Latency] ASR first audio byte sent at +{:.0}ms (main loop, pre-roll was empty)",
+                                        t_start.elapsed().as_millis()
+                                    );
+                                }
+                                let _send_start = std::time::Instant::now();
+                                ws_socket
+                                    .send(Message::Binary(binary_chunk.into()))
+                                    .map_err(|e| anyhow!("网络失败：发送音频帧失败 - {}", e))?;
+                                let _send_elapsed_us = _send_start.elapsed().as_micros() as u64;
+                                send_count += 1;
+                                send_sum_us += _send_elapsed_us;
+                                if _send_elapsed_us < send_min_us {
+                                    send_min_us = _send_elapsed_us;
+                                }
+                                if _send_elapsed_us > send_max_us {
+                                    send_max_us = _send_elapsed_us;
+                                }
+                                if send_samples.len() < 4096 {
+                                    send_samples.push(_send_elapsed_us);
+                                }
+                            }
+                        }
+                        send_json(&mut ws_socket, &finish_task)?;
+                        finish_task_sent = true;
+                        // 录音结束，恢复长 timeout 阻塞读最终结果
+                        set_socket_timeouts(
+                            &mut ws_socket,
+                            Duration::from_secs(10),
+                            Duration::from_secs(10),
+                        )
+                        .context("网络失败：恢复读 timeout 失败")?;
+                        log::info!(
+                            "Online ASR finish-task sent after {:.1}s streaming, {} samples ({:.1}s)",
+                            t_streaming.elapsed().as_secs_f64(),
+                            all_samples.len(),
+                            all_samples.len() as f64 / 16000.0,
+                        );
+                    }
+                    break; // 跳出 batch drain loop，进入下方 ws_socket.read
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
             }
-            Ok(_) => {}
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                if !finish_task_sent {
-                    let finish_task = build_finish_task_message(&task_id);
-                    send_json(&mut ws_socket, &finish_task)?;
-                    finish_task_sent = true;
-                    // 录音结束，恢复长 timeout 阻塞读最终结果
-                    set_socket_timeouts(
-                        &mut ws_socket,
-                        Duration::from_secs(10),
-                        Duration::from_secs(10),
-                    )
-                    .context("网络失败：恢复读 timeout 失败")?;
+        }
+        if !batch_samples.is_empty() {
+            let pcm = f32_to_pcm16_le(&batch_samples);
+            for binary_chunk in chunk_pcm_to_binary(&pcm) {
+                // ASR-074 缺陷1修复: pre-roll 为空时 first_audio_byte_ms 恒 -1，
+                // 在主循环首帧 send 处补赋值（pre-roll 非空时 first_audio_byte_sent
+                // 已为 true，此分支不执行）
+                if !first_audio_byte_sent {
+                    first_audio_byte_sent = true;
+                    summary.first_audio_byte_ms = t_start.elapsed().as_millis() as i64;
                     log::info!(
-                        "Online ASR finish-task sent after {:.1}s streaming, {} samples ({:.1}s)",
-                        t_streaming.elapsed().as_secs_f64(),
-                        all_samples.len(),
-                        all_samples.len() as f64 / 16000.0,
+                        "[Latency] ASR first audio byte sent at +{:.0}ms (main loop, pre-roll was empty)",
+                        t_start.elapsed().as_millis()
                     );
                 }
+                // ASR-074 永久埋点: send 耗时统计
+                let _send_start = std::time::Instant::now();
+                ws_socket
+                    .send(Message::Binary(binary_chunk.into()))
+                    .map_err(|e| anyhow!("网络失败：发送音频帧失败 - {}", e))?;
+                let _send_elapsed_us = _send_start.elapsed().as_micros() as u64;
+                send_count += 1;
+                send_sum_us += _send_elapsed_us;
+                if _send_elapsed_us < send_min_us {
+                    send_min_us = _send_elapsed_us;
+                }
+                if _send_elapsed_us > send_max_us {
+                    send_max_us = _send_elapsed_us;
+                }
+                if send_samples.len() < 4096 {
+                    send_samples.push(_send_elapsed_us);
+                }
             }
-            Err(crossbeam_channel::TryRecvError::Empty) => {}
         }
 
         // 读 ws_socket（非阻塞 1ms timeout）
-        match ws_socket.read() {
+        // ASR-074 永久埋点: 记录 read() 单次耗时分布
+        let _read_start = std::time::Instant::now();
+        let ws_read_result = ws_socket.read();
+        let _read_elapsed_us = _read_start.elapsed().as_micros() as u64;
+        read_count += 1;
+        read_sum_us += _read_elapsed_us;
+        if _read_elapsed_us < read_min_us {
+            read_min_us = _read_elapsed_us;
+        }
+        if _read_elapsed_us > read_max_us {
+            read_max_us = _read_elapsed_us;
+        }
+        if read_samples.len() < 4096 {
+            read_samples.push(_read_elapsed_us);
+        }
+        match ws_read_result {
             Ok(Message::Text(text)) => {
                 last_ws_activity = std::time::Instant::now();
                 let parsed: serde_json::Value =
@@ -1393,10 +1579,6 @@ pub fn transcribe_streaming_realtime(
                     summary.words_total = state.display_words().len() as i64;
                     summary.chars_total = state.display_text().chars().count() as i64;
 
-                    // ASR-058 ③: 每次录音结束打一行 [ASR-SUMMARY]
-                    // Gavin 明确要求「下次要根据 debug 时间戳评估两个 ASR 模型到底哪个服务端反馈更快」
-                    log::info!("{}", summary.format_summary());
-
                     log::info!(
                         "Online ASR task finished: {} confirmed sentences",
                         state.confirmed_count()
@@ -1405,21 +1587,23 @@ pub fn transcribe_streaming_realtime(
                     // 全空 → bail；非空 → 直接返回。
                     // （旧实现 final_text 只含 confirmed，此处曾 fallback 到 display_text
                     //   补取 current，ASR-070 修法 A 后两者同语义，fallback 分支已不可达，化简。）
+                    // ASR-074 缺陷2/3修复: outcome 赋值必须在 format_summary 打印之前，
+                    // 且只打一次（旧代码连打 2-3 次 + finished 永远打不出）
                     if final_text.is_empty() {
-                        log::info!("{}", summary.format_summary());
                         summary.outcome = "failed";
+                        log::info!("{}", summary.format_summary());
                         bail!("转录失败：task-finished 但无识别结果");
                     }
-                    log::info!("{}", summary.format_summary());
                     summary.outcome = "finished";
+                    log::info!("{}", summary.format_summary());
                     return Ok(final_text);
                 }
             }
             Ok(Message::Binary(_)) => {}
             Ok(Message::Ping(_) | Message::Pong(_)) => {}
             Ok(Message::Close(_)) => {
-                log::info!("{}", summary.format_summary());
                 summary.outcome = "failed";
+                log::info!("{}", summary.format_summary());
                 bail!("网络失败：服务端关闭连接");
             }
             Ok(Message::Frame(_)) => {}
@@ -1427,8 +1611,8 @@ pub fn transcribe_streaming_realtime(
                 // 1ms timeout 是预期的（非阻塞模拟），继续循环
                 // 只有在 finish_task_sent 后的 10s timeout 才是真超时
                 if finish_task_sent && last_ws_activity.elapsed() >= SILENCE_TIMEOUT {
-                    log::info!("{}", summary.format_summary());
                     summary.outcome = "failed";
+                    log::info!("{}", summary.format_summary());
                     bail!("超时：服务端 10s 无响应");
                 }
             }

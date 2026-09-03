@@ -4,7 +4,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::time::{Duration, Instant};
@@ -41,6 +41,8 @@ struct WarmInputStream {
     pre_roll: Arc<Mutex<VecDeque<Vec<f32>>>>,
     rx: crossbeam_channel::Receiver<AudioChunk>,
     stream_failed: Arc<AtomicBool>,
+    /// ASR-074 Step 1: 队列满时静默丢帧计数（永久埋点）
+    dropped_chunks: Arc<AtomicU64>,
     _stream: Stream,
 }
 
@@ -296,6 +298,49 @@ impl AudioCapture {
         loop {
             if stop_signal.load(Ordering::Relaxed) {
                 log::info!("Streaming recording: stop signal received");
+                // ASR-074 Step 2-B: 松手前 drain warm.rx 积压，防尾部音频丢失
+                // 🔴 时间上限 500ms（非数量上限）：on_chunk 落到 chunk_tx.send() 是
+                // crossbeam bounded channel 的**阻塞 send**，若 ASR 线程停止消费
+                // （WS 卡住/服务端不回/连接半开），chunk_tx 满则 send 永远等。
+                // 没有时间上限 = 把 ASR 的故障传导到录音线程 = 用户松手后程序卡死。
+                // 500ms 理由：正常 drain 256 chunks 的 on_chunk 应在毫秒级完成；
+                // 500ms 足够救回绝大多数尾部音频，同时保证松手后最坏 0.5s 内返回。
+                let drain_deadline = std::time::Instant::now() + Duration::from_millis(500);
+                let mut drained: usize = 0;
+                let mut abandoned: usize = 0;
+                while std::time::Instant::now() < drain_deadline {
+                    match warm.rx.try_recv() {
+                        Ok((_ts, chunk)) if !chunk.is_empty() => {
+                            let resampled = resampler.push(&chunk);
+                            if !resampled.is_empty() {
+                                on_chunk(&resampled);
+                            }
+                            total_samples += chunk.len();
+                            drained += 1;
+                        }
+                        Ok(_) => continue,
+                        Err(crossbeam_channel::TryRecvError::Empty) => break,
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                    }
+                }
+                // 超时后仍有积压 → 放弃，记录数量
+                while let Ok((_ts, chunk)) = warm.rx.try_recv() {
+                    if !chunk.is_empty() {
+                        abandoned += 1;
+                    }
+                }
+                if drained > 0 {
+                    log::info!(
+                        "Streaming recording: drained {} backlog chunks on stop (resampled→on_chunk)",
+                        drained
+                    );
+                }
+                if abandoned > 0 {
+                    log::warn!(
+                        "[ASR-DROP] abandoned {} backlog chunks on stop (drain deadline 500ms exceeded, ASR consumer may be stuck)",
+                        abandoned
+                    );
+                }
                 break;
             }
             if warm.stream_failed.load(Ordering::Acquire) {
@@ -355,12 +400,23 @@ impl AudioCapture {
             on_chunk(&tail);
         }
 
+        // ASR-074 Step 1: 打出累计丢帧数（每个 chunk ≈10ms @48k，精确秒数不可知因 chunk 已丢）
+        let dropped = warm.dropped_chunks.load(Ordering::Relaxed);
+        if dropped > 0 {
+            log::warn!(
+                "[ASR-DROP] {} chunks dropped during recording (~{:.1}s audio lost, est. 10ms/chunk)",
+                dropped,
+                dropped as f32 * 0.01
+            );
+        }
+
         log::info!(
-            "Streaming recording complete: ~{} samples ({:.1}s @ {}Hz), speech_detected={}",
+            "Streaming recording complete: ~{} samples ({:.1}s @ {}Hz), speech_detected={}, dropped_chunks={}",
             total_samples,
             total_samples as f32 / sample_rate as f32,
             sample_rate,
-            speech_detected
+            speech_detected,
+            dropped
         );
 
         Ok(())
@@ -407,6 +463,8 @@ impl AudioCapture {
         let stream_failed = Arc::new(AtomicBool::new(false));
         let pre_roll = Arc::new(Mutex::new(VecDeque::<Vec<f32>>::new()));
         let max_pre_roll_samples = pre_roll_samples(sample_rate, PRE_ROLL_MS);
+        // ASR-074 Step 1: 丢帧计数器，回调闭包递增，record_streaming 结束时读取
+        let dropped_chunks = Arc::new(AtomicU64::new(0));
 
         let stream = match sample_format {
             SampleFormat::F32 => {
@@ -414,6 +472,7 @@ impl AudioCapture {
                 let tx_stream_err = tx_err.clone();
                 let stream_failed = Arc::clone(&stream_failed);
                 let pre_roll_cb = Arc::clone(&pre_roll);
+                let dropped_chunks_cb = Arc::clone(&dropped_chunks);
                 let max_pr = max_pre_roll_samples;
                 device.build_input_stream(
                     &config,
@@ -429,7 +488,14 @@ impl AudioCapture {
                                 }
                             }
                         }
-                        let _ = tx_audio.try_send((Instant::now(), chunk));
+                        // ASR-074 Step 1: 队列满不再静默丢弃，计数并降级日志
+                        if tx_audio.try_send((Instant::now(), chunk)).is_err() {
+                            dropped_chunks_cb.fetch_add(1, Ordering::Relaxed);
+                            log::warn!(
+                                "[ASR-DROP] audio chunk dropped (queue full), total dropped so far: {}",
+                                dropped_chunks_cb.load(Ordering::Relaxed)
+                            );
+                        }
                     },
                     move |err| {
                         log::error!("Audio stream error: {}", err);
@@ -444,6 +510,7 @@ impl AudioCapture {
                 let tx_stream_err = tx_err.clone();
                 let stream_failed = Arc::clone(&stream_failed);
                 let pre_roll_cb = Arc::clone(&pre_roll);
+                let dropped_chunks_cb = Arc::clone(&dropped_chunks);
                 let max_pr = max_pre_roll_samples;
                 device.build_input_stream(
                     &config,
@@ -461,7 +528,14 @@ impl AudioCapture {
                                 }
                             }
                         }
-                        let _ = tx_audio.try_send((Instant::now(), chunk));
+                        // ASR-074 Step 1: 队列满不再静默丢弃，计数并降级日志
+                        if tx_audio.try_send((Instant::now(), chunk)).is_err() {
+                            dropped_chunks_cb.fetch_add(1, Ordering::Relaxed);
+                            log::warn!(
+                                "[ASR-DROP] audio chunk dropped (queue full), total dropped so far: {}",
+                                dropped_chunks_cb.load(Ordering::Relaxed)
+                            );
+                        }
                     },
                     move |err| {
                         log::error!("Audio stream error: {}", err);
@@ -476,6 +550,7 @@ impl AudioCapture {
                 let tx_stream_err = tx_err.clone();
                 let stream_failed = Arc::clone(&stream_failed);
                 let pre_roll_cb = Arc::clone(&pre_roll);
+                let dropped_chunks_cb = Arc::clone(&dropped_chunks);
                 let max_pr = max_pre_roll_samples;
                 device.build_input_stream(
                     &config,
@@ -493,7 +568,14 @@ impl AudioCapture {
                                 }
                             }
                         }
-                        let _ = tx_audio.try_send((Instant::now(), chunk));
+                        // ASR-074 Step 1: 队列满不再静默丢弃，计数并降级日志
+                        if tx_audio.try_send((Instant::now(), chunk)).is_err() {
+                            dropped_chunks_cb.fetch_add(1, Ordering::Relaxed);
+                            log::warn!(
+                                "[ASR-DROP] audio chunk dropped (queue full), total dropped so far: {}",
+                                dropped_chunks_cb.load(Ordering::Relaxed)
+                            );
+                        }
                     },
                     move |err| {
                         log::error!("Audio stream error: {}", err);
@@ -528,6 +610,7 @@ impl AudioCapture {
             pre_roll,
             rx,
             stream_failed,
+            dropped_chunks,
             _stream: stream,
         });
 
