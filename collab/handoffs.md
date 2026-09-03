@@ -165,3 +165,12 @@
 - **覆盖缺口 5 项如实声明**（真实 WS 帧序/完整 match arm/真实 DC 成功路径/WASAPI 回调内计数/真实慢消费 abandoned 精确值），阶段五端测建议已附
 - **自查**：fmt --check clean；check --all-targets 0 error；git diff -w 纯增量；既有 228 用例零触碰
 - **注意**：阶段三未跑用例（红线）；阶段四执行时新用例随 `cargo test` 生效，其中 main.rs 新模块带 `#[cfg(all(test, target_os="windows"))]`（Windows-only statics 依赖）
+
+## 2026-09-03 夜 — tester-1 — TEST-EXEC-076 阶段四全量回归 ✅（源码层纯执行，5 FAIL 原样上报，待主控验收+裁定）
+
+- **范围**：Step 1 两 crate cargo test + Step 2 vitest + 必查A/B/C；pytest 系列按任务书 SKIP（08-18 旧包）
+- **净结果**：root 1050P/4F/9I ｜ src-tauri 76P 全绿 ｜ vitest 83P/1F（HotkeySettings 23/24）
+- **5 FAIL 全部完整取证**：①②itn_071b×2（一点半→「下午1:30」非「1点半」，疑生产 071-B 不彻底）③asr_074 abandoned 5/5 稳定红（测试自建循环语义≠生产 Empty=>break，疑似测试设计缺陷）④stale_generation（断言 vs 生产 :4006 镜像先写冲突，053-B/075 语义裁定）⑤S12（AltGr 弹窗键名 Left Ctrl≠Right Alt，拦截行为正确）
+- **必查A**：guard 门控模块 --list 实证 6 条非 0 ｜ **必查B**：228+15（git 物理实提交 15 个 #[test]，文档「14」是语义组口径，差额=1 已说明）｜ **必查C**：挂钟用例连跑 5 次全红 0.90-0.91s
+- **红线合规**：零生产/零用例改动、零出包、零 commit、版本号未动、纯 bash 追加文档
+- **详情**：outbox/tester-1/result.md（含裁定请求表：③建议改测试循环对齐生产；④⑤①②需主控裁定改哪侧）

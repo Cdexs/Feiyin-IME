@@ -206,24 +206,37 @@ coder-1 断电前交出了 15:09:33 那次 run 的完整时间线（实测，价
 
 ### 总表
 
-| ID | Gavin 原话 | 类型 | 优先级 | 文件域 | 负责人 | 状态 |
+> 🔄 **2026-09-03 21:30 主控按 git 逐项核对更新**（上一版停留在 08-30 深夜，已过期）。
+> **全局前提：`Publish/` 仍是 2026-08-18 23:48 的旧包，自那以来 14 个提交一次都没出包
+> → 下表任何 ✅ 都只代表「代码已进本地仓库」，Gavin 端没有一项验证过，无一项能标 🟢。**
+
+| ID | Gavin 原话 | 类型 | 优先级 | 文件域 | 负责人 | 状态（2026-09-03 核对） |
 | --- | --- | --- | --- | --- | --- | --- |
-| **VERSION-059** | 升级版本到 v0.9.0 | 版本 | 前置 | `Cargo.toml` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` | coder-1 | ✅ 已验收已提交 9c9ff73 |
-| **ASR-067** | 输入中间有停顿（约 1 秒），接着输入就无法继续，麦克风不接受输入 | BUG | 🔴 **P0** | `src/transcription/qwen_inference.rs` (+config) | coder-2 | ⏸ 症状澄清改向 overlay，等出包后 debug.log |
-| **ASR-070** | 说完松开热键后，识别的文本不完整，被丢掉尾部文字 | BUG | 🔴 **P0** | `qwen_inference.rs`（final_text() :520） | coder-1 | ✅ 已验收已提交 958cadb |
-| **OVERLAY-064** | 原来 overlay 窗口的灰色线条边框消失了，必须显示回来，否则窗口缺少质感 | BUG | 🟠 P1 | `src/main.rs` | coder-2 | ✅ 根因定案，归 D2D 批 920e1d2 |
-| **OVERLAY-061** | 按下热键，录音窗口会先显示在屏幕左上角边沿，然后跳到屏幕下方正确位置 | BUG | 🟠 P1 | `src/main.rs` | coder-2 | 🟣 排查表交付，等 REPRO 实测 |
-| **OVERLAY-068** | 长文本时窗口位置跳动；切到「识别处理中」时长短两个窗口交替闪烁 | BUG | 🟠 P1 | `src/main.rs` | coder-2 | ✅ 已验收已提交 920e1d2（拉锯残余根因转 OVERLAY-075） |
-| **OVERLAY-075** | 跨 session 流式文本渗漏：A 拖尾期间开 B → A 迟到包与 B 交替闪烁 + A 旧文字渲染进 B 窗口 | BUG | 🟠 P1 | `src/main.rs` | coder-2 | ✅ 已验收 2026-09-03（+44/-5 会话代际；macOS 三处字段数由主控代修） |
-| **ASR-074-GUARD** | chunk_tx 阻塞 send 防松手卡死（ASR-074 验收时发现的跨文件域残留风险） | BUG | 🟠 P1 | `src/main.rs` | coder-2 | 🟣 交付 2026-09-03，待主控验收（send_timeout 200ms + warn 计数） |
-| **OVERLAY-062** | 点击进入编辑态，文字字体显示很粗糙，提交按钮的边沿也很粗糙 | 优化 | 🟠 P1 | `src/main.rs` | coder-2 | ⬜ 待 D2D 批（DEC-055） |
-| **HOTKEY-060** | 录音、翻译热键设置时，重复拦截提示 | BUG | 🟠 P1 | `ui/src/pages/HotkeySettings.tsx` | coder-2 | ✅ 代码已在 9506eac+e7a6a29（主控误扫入），2026-09-03 补账待验收 |
-| **ITN-071** | ITN 错误：`三五成群` / `一点半点` | BUG | 🟠 P1 | `src/itn.rs` | coder-1 | 🟣 ITN-071-B 已交付待验收（一点半点挪idioms+一点点补function_words+护栏4条） |
-| **FMT-072** | 明显有序列举内容，格式化输出失败 | BUG | 🟠 P1 | `src/llm/mod.rs` | — | ⏸ Gavin 拍板挂起，下次开单（需端侧判定是否 LLM 造成） |
-| **OVERLAY-063** | 笔记框内字体再大一号 | 优化 | 🟡 P2 | `src/main.rs` | 待派 | ⬜ 待派发 |
-| **OVERLAY-066** | Overlay 窗口的高度再增加 3 个像素 | 优化 | 🟡 P2 | `src/main.rs` | 待派 | ⬜ 待派发 |
-| **OVERLAY-069** | 松开热键 / 编辑态提交或回车后，窗口关闭要流畅丝滑，缩短最后消失的过程，不要生硬突然关闭 | 优化 | 🟡 P2 | `src/main.rs` | coder-2 | ⬜ 待 D2D 批（DEC-055） |
-| **OVERLAY-065** | 替换左侧麦克风图标为动态图标 | 优化 | 🟡 P2 | `src/main.rs` | coder-2 | ⬜ 待 D2D 批（DEC-055） |
+| **VERSION-059** | 升级版本到 v0.9.0 | 版本 | 前置 | `Cargo.toml` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` | coder-1 | ✅ 已提交 `9c9ff73` |
+| **ASR-067** | 输入中间有停顿（约 1 秒），接着输入就无法继续，麦克风不接受输入 | BUG | 🔴 **P0** | `src/audio/mod.rs` + `qwen_inference.rs` | coder-1 | 🟡 **改判两次后已动手**：原「800ms 断句」假设证伪 → REPRO-073 实测定位到**音频上行背压丢帧**，并入 **ASR-074** 已提交 `8fbb913`。**是否真解决必须靠出包端测**，不接受静态结案 |
+| **ASR-070** | 说完松开热键后，识别的文本不完整，被丢掉尾部文字 | BUG | 🔴 **P0** | `qwen_inference.rs` `final_text()` | coder-1 | 🟡 **修了一层，不确定够不够**：`958cadb` 修「已到达未断句」的尾部丢弃；但 REPRO-073 实测显示还有一层「服务端 word 流根本没送达」，那一层归 ASR-074 `8fbb913`。同样必须端测判定 |
+| **ASR-074** | （067+070 合并单，主控立项）音频上行背压丢帧 + finalize 拖尾 | BUG | 🔴 **P0** | `src/audio/mod.rs` / `qwen_inference.rs` | coder-1 | ✅ 已提交 `8fbb913`（2-A 排空 / 2-B 松手 drain 带 500ms 上限 / 2-C 丢帧计数 + 三个埋点缺陷 + 永久 debug 埋点） |
+| **ASR-074-GUARD** | （主控验收 ASR-074 时发现的残留风险）chunk_tx 阻塞 send 会导致松手卡死 | BUG | 🟠 P1 | `src/main.rs` | coder-2 | ✅ 已提交 `8023cc6`（send_timeout 200ms + warn 计数） |
+| **OVERLAY-064** | 原来 overlay 窗口的灰色线条边框消失了，必须显示回来，否则窗口缺少质感 | BUG | 🟠 P1 | `src/main.rs` | coder-2 | 🟠 **只出了根因报告，代码没改**（`920e1d2` 内只有分析）。修复动作归 D2D 迁移批，**未做** |
+| **OVERLAY-061** | 按下热键，录音窗口会先显示在屏幕左上角边沿，然后跳到屏幕下方正确位置 | BUG | 🟠 P1 | 待定（已不在 overlay 窗口） | 待派 | ❌ **假设证伪，未定位未修**。COLD+WARM 共 13030 帧采样，可见态位置异常**零命中**；`920e1d2` 只加了屏幕外坐标安全网（治标）。下一步 REPRO-061-ALLWIN 全窗口清扫，**任务书未写** |
+| **OVERLAY-068** | 长文本时窗口位置跳动；切到「识别处理中」时长短两个窗口交替闪烁 | BUG | 🟠 P1 | `src/main.rs` | coder-2 | ✅ 已提交 `920e1d2`；「交替闪烁」的真源（跨 session 渗漏）由 OVERLAY-075 结构性根治 |
+| **OVERLAY-075** | （主控立项）跨 session 流式文本渗漏：A 拖尾期间开 B → 宽窄拉锯 + A 旧文字渲染进 B 窗口 | BUG | 🟠 P1 | `src/main.rs` | coder-2 | ✅ 已提交 `8023cc6`（会话代际 AtomicU64 闸门，+44/-5） |
+| **HOTKEY-060** | 录音、翻译热键设置时，重复拦截提示 | BUG | 🟠 P1 | `ui/src/pages/HotkeySettings.tsx` | coder-2 | ✅ 代码已在 `9506eac`+`e7a6a29`，补账已完成。🔴 **这份改动至今一次 Vitest 都没跑过**，正由 TEST-EXEC-076 补跑 |
+| **ITN-071** | ITN 错误：`三五成群` / `一点半点` | BUG | 🟠 P1 | `src/itn.rs` + `itn-rules.toml` | coder-1 | ✅ 已提交 `9506eac`（三五成群）+ `e7a6a29`（一点半点挪 idioms、一点点补 function_words，护栏 4 条）。🔴 结构性问题未解：保护词表是白名单模型，漏一词出一 bug，Gavin 已撞四个 |
+| **D2D-073-P0** | （DEC-055 落地）overlay 绘制层迁 Direct2D + DirectWrite，处理中态先行 | 优化 | 🟠 P1 | `src/main.rs` | coder-2 | ✅ 已提交 `8023cc6`（骨架 + 处理中态 + GDI 回落）。🔴 **出包后必须 Gavin 目视确认文字与圆角边沿是否变细腻**，他说达标才继续迁剩余五态 |
+| **OVERLAY-062** | 点击进入编辑态，文字字体显示很粗糙，提交按钮的边沿也很粗糙 | 优化 | 🟠 P1 | `src/main.rs` | coder-2 | ⬜ **未做**，排在 D2D P5（编辑态边框） |
+| **FMT-072** | 明显有序列举内容，格式化输出失败 | BUG | 🟠 P1 | `src/llm/mod.rs` | — | ⏸ **未做**，Gavin 拍板挂起。🔴 真因已查明 = LLM 401 根本没调用成功，**LLM 不修好这项没法验证** |
+| **OVERLAY-065** | 替换左侧麦克风图标为动态图标 | 优化 | 🟡 P2 | `src/main.rs` | coder-2 | ⬜ **未做**，排在 D2D P3 |
+| **OVERLAY-069** | 松开热键 / 编辑态提交或回车后，窗口关闭要流畅丝滑，不要生硬突然关闭 | 优化 | 🟡 P2 | `src/main.rs` | coder-2 | ⬜ **未做**，排在 D2D P6 |
+| **OVERLAY-063** | 笔记框内字体再大一号 | 优化 | 🟡 P2 | `src/main.rs` | coder-2 | ⬜ **未做**，排在 D2D P7 |
+| **OVERLAY-066** | Overlay 窗口的高度再增加 3 个像素 | 优化 | 🟡 P2 | `src/main.rs` | coder-2 | ⬜ **未做**，排在 D2D P8 |
+
+### 一句话总账（2026-09-03）
+
+- **代码已落地（本地已提交，未出包未端测）：9 项** —— VERSION-059 / ASR-070 / ASR-074 / ASR-074-GUARD / OVERLAY-068 / OVERLAY-075 / HOTKEY-060 / ITN-071 / D2D-073-P0
+- **动了但没做完：2 项** —— ASR-067（并入 ASR-074，等端测判定）、OVERLAY-064（只有根因报告，无代码）
+- **完全没做：6 项** —— OVERLAY-061（假设证伪，重新定位中）/ OVERLAY-062 / 063 / 065 / 066 / 069（全排在 D2D 后续阶段）/ FMT-072（挂起，卡在 LLM 401）
+- **Gavin 端测通过（🟢）：0 项** —— 因为一次包都还没出
 
 **状态图例**：⬜ 待派发 / 🔵 已派发执行中 / 🟣 已交付待验收 / ✅ 已验收已提交 / 🟢 Gavin 端测通过 / ❌ 打回
 

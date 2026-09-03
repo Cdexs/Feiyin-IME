@@ -4042,3 +4042,60 @@ Gavin 2026-09-03 09:27 做了一次受控复现，产出 `target/release/debug.l
 `[ENCODING-UTF8-001]`、`[WORKER-DOC-OVERWRITE-001]` 管的是**仓库内容正确性**；
 本条管的是**仓库内容的对外暴露**。此前没有任何条目覆盖后者。
 
+
+### 追加 2026-09-03 夜 —— Gavin 授权后的实际处置 + 机制化防复发
+
+**Gavin 原话**：「立刻把 key 删除，需要思考如何拒绝下次再犯这样的问题？」
+
+#### 已执行（主控，非破坏性）
+
+| 动作 | 结果 |
+| --- | --- |
+| `collab/research/ab033-components.json:17` 明文 key → 占位符 | `"API_KEY": "<REDACTED-SEE-ENV-DEEPSEEK_API_KEY>"` |
+| UTF-8 与 JSON 完整性验证 | WSL `python3 json.load(encoding='utf-8')` 通过，36 键全在，中文未损 |
+| 全仓复扫 `sk-[A-Za-z0-9]{20,}` | **0 命中** |
+| 全仓复扫通用凭证形态（api_key/token/secret/password + ≥16 位值） | 仅变量名与第三方源码词元，**无真值** |
+| 改动落点 | `git diff --cached --stat` = 1 insertion / 1 deletion，文件仍为跟踪态（未误删） |
+
+🔴 **这一步不等于止血**：key 已在 `f58af96` 的历史里并 push 到公网，删工作区文件对已泄露的字符串毫无作用。
+**唯一真正的止血仍是 Gavin 去 DeepSeek 后台吊销** —— 处置顺序第 1 条未被本次动作替代。
+重写历史 + force push（第 3 条）仍**未授权、未执行**。
+
+#### 「如何拒绝下次再犯」的答案：本条规则此前已存在，但它拦不住
+
+事故当天这份条目的「规则」第 1、3 条就已写着「实验产物落盘前必须过凭证检查」
+「凭证不得出现在任何仓库内文件中」。**规则是存在的，还是漏了。**
+原因和 `[DOC-STATE-DRIFT-001]` 完全同构：**它写在「通用规则」里，不在任何一步的机器判据里** ——
+读过就忘，靠人记的规则在第 N 次必然失效。所以本次不再加第 4 条文字规则，改为三层机器/判据拦截：
+
+| 层 | 措施 | 拦截时机 | 为什么必须是它 |
+| --- | --- | --- | --- |
+| **1 机器闸门** | `scripts/git-hooks/pre-commit` 密钥扫描，命中即 `exit 1` | **commit 时**，无人参与 | 唯一一层不依赖任何人记得规则；泄露只能经 commit 发生，卡这里就卡住了全部入口 |
+| **2 收尾判据** | `collab/docs/worker-guide.md` 收尾自证表新增「密钥/凭证」一行 | Worker 交付前 | 把规则变成必须逐行打钩的判据（DOC-STATE-DRIFT-001 验证过这招有效） |
+| **3 文字规则** | 本条目既有 4 条 | 事后回查 | 单独用它已被本次事故证伪，只作为 1、2 的解释来源保留 |
+
+**钩子覆盖形态**：`sk-`(OpenAI/DeepSeek/DashScope)、`sk-ant-`、`ghp_/gho_/ghu_/ghs_/ghr_/github_pat_`、
+`AKIA`(AWS)、`AIza`(Google)、`xox[baprs]-`(Slack)、`glpat-`(GitLab)，
+外加通用形态 `(api_key|apikey|access_token|auth_token|secret_key|client_secret|password) [:=] ≥20 位串`，
+并排除占位符（`REDACTED/PLACEHOLDER/YOUR_/<...>/${...}/env./getenv/process.env/std::env`）。
+
+**只扫 staged 新增行**（`git diff --cached -U0 | grep '^+'`）——不对历史存量反复报警，
+否则噪音会逼人养成绕过习惯，那等于没有钩子。
+
+**安装**（每个 clone 一次，钩子本体入库所以不会丢）：
+```bash
+git config core.hooksPath scripts/git-hooks
+```
+
+**绕过**：`SECRET_SCAN_SKIP=1 git commit`，会打印警告留痕。**只允许误报时用**。
+
+#### 钩子实测（一次性临时仓库，测完即删，未污染本仓）
+
+| 用例 | 期望 | 实测 |
+| --- | --- | --- |
+| 明文 `sk-89edf7…`（本次事故原串） | 拦 | ✅ 拦住，两条规则同时命中，提交未产生 |
+| 占位符 `<REDACTED-SEE-ENV-DEEPSEEK_API_KEY>` | 放行 | ✅ 提交成功 |
+| GitHub PAT `ghp_…` | 拦 | ✅ 拦住，提交未产生 |
+| 含「API_KEY」字样但无真值的中文 UTF-8 文档 | 放行 | ✅ 提交成功（中文不误伤） |
+
+`git log` 实证：只有两个「应放行」用例进了历史，两个「应拦截」用例零提交。

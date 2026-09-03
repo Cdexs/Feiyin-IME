@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# voice-ime 密钥泄露拦截钩子（SECRET-IN-REPO-001 事故后建立）
+#
+# 背景：2026-08-14 f58af96 把 DeepSeek API key 明文提交并 push 到 GitHub，
+# 暴露 20 天后遭第三方盗刷，产生真实金钱损失。当时「不得提交凭证」这条规则
+# 已经写在文档里 —— 规则存在但拦不住，因为它靠人记。本钩子把它变成机器判据：
+# 只要 staged 内容里出现密钥形态，commit 直接失败。
+#
+# 安装（每个 clone 一次）：
+#   git config core.hooksPath scripts/git-hooks
+#
+# 紧急绕过（必须留下痕迹，且只允许误报时使用）：
+#   SECRET_SCAN_SKIP=1 git commit ...
+
+set -u
+
+if [ "${SECRET_SCAN_SKIP:-0}" = "1" ]; then
+  echo "⚠️  [pre-commit] SECRET_SCAN_SKIP=1 —— 密钥扫描已被显式跳过，请确认这是误报。"
+  exit 0
+fi
+
+# 只扫本次 staged 的新增行（-U0 去掉上下文，^+ 取新增），避免历史存量反复报警
+DIFF=$(git diff --cached -U0 --diff-filter=ACM 2>/dev/null | grep -E '^\+' | grep -v '^+++')
+[ -z "$DIFF" ] && exit 0
+
+# 已知密钥形态（前缀型，几乎不可能误报）
+PREFIX_PATTERNS='sk-[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|xox[baprs]-[A-Za-z0-9-]{10,}|glpat-[A-Za-z0-9_-]{20,}'
+
+# 通用赋值形态（key/token/secret/password = 长随机串），排除占位符
+GENERIC_PATTERN='(api[_-]?key|apikey|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|password)["'"'"' ]*[:=]["'"'"' ]*[A-Za-z0-9_/+=-]{20,}'
+PLACEHOLDER='REDACTED|PLACEHOLDER|YOUR[_-]?|xxxx|EXAMPLE|CHANGE[_-]?ME|<[^>]*>|\*\*\*|\$\{|%[A-Z_]+%|env\.|getenv|process\.env|std::env'
+
+HITS=""
+
+P_HIT=$(printf '%s\n' "$DIFF" | grep -nE "$PREFIX_PATTERNS" || true)
+[ -n "$P_HIT" ] && HITS="${HITS}
+[已知密钥前缀]
+${P_HIT}"
+
+G_HIT=$(printf '%s\n' "$DIFF" | grep -inE "$GENERIC_PATTERN" | grep -viE "$PLACEHOLDER" || true)
+[ -n "$G_HIT" ] && HITS="${HITS}
+[疑似凭证赋值]
+${G_HIT}"
+
+if [ -n "$HITS" ]; then
+  cat >&2 <<MSG
+❌ [pre-commit] 拦截：staged 内容里发现疑似密钥/凭证，commit 已中止。
+${HITS}
+
+处理方式（按优先级）：
+  1. 把明文换成占位符，真值移到环境变量或 git 之外的凭证文件；
+  2. 如确认是误报（变量名、示例、测试桩），改写成含 REDACTED/YOUR_KEY/<...> 的形式，
+     或用 SECRET_SCAN_SKIP=1 git commit 显式放行（会打印警告，留痕）。
+
+🔴 已经 push 出去的密钥，删文件不等于安全 —— 必须去服务商后台吊销。
+   参见 collab/troubleshooting.md [SECRET-IN-REPO-001]。
+MSG
+  exit 1
+fi
+
+exit 0
