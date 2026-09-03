@@ -132,6 +132,15 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
   const [isRecordingTranslation, setIsRecordingTranslation] = useState(false);
   const translationInputRef = useRef<HTMLDivElement>(null);
   const translationFinalizedRef = useRef(false);
+  // HOTKEY-079: translation-side exclusive. AltGr always synthesizes
+  // ControlLeft BEFORE AltRight, and at the ControlLeft keyDown itself
+  // getModifierState('AltGraph') is still false — there is not enough
+  // information to tell it apart from a real Left Ctrl press at that instant.
+  // So the verdict is deferred: pending=true means "ControlLeft seen, waiting
+  // for either an AltRight takeover (record Right Alt) or its own keyUp
+  // (record Left Ctrl)". Translation-side exclusive per HOTKEY-060 (sides
+  // never share state); sole clear point: resetTranslationRecordingState().
+  const translationPendingCtrlRef = useRef(false);
 
   const translation = config.translation ?? { enabled: false, vk_code: 0, display_name: '', target_language: 'Chinese' };
 
@@ -145,6 +154,10 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
 
   const resetTranslationRecordingState = () => {
     translationFinalizedRef.current = false;
+    // HOTKEY-079: pending must die with the session (Escape / blur / finalize
+    // all route through here). Leaking it would misroute the next session's
+    // first ControlLeft — same lifecycle trap HOTKEY-078 fixed on voice side.
+    translationPendingCtrlRef.current = false;
   };
 
   // HOTKEY-060: shared conflict-detection + finalize + reset flow.
@@ -349,6 +362,28 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
       return;
     }
 
+    // HOTKEY-079: AltGr synthesizes ControlLeft then AltRight; at the
+    // ControlLeft keyDown itself AltGraph is still false, so the verdict is
+    // deferred here and resolved by AltRight (record Right Alt) or the
+    // ControlLeft keyUp (record Left Ctrl).
+    if (code === 'ControlLeft') {
+      translationPendingCtrlRef.current = true;
+      return;
+    }
+    if (code === 'AltRight' && translationPendingCtrlRef.current) {
+      translationPendingCtrlRef.current = false;
+      applyHotkeyIfNoDupConflict(
+        translationFinalizedRef,
+        'translation',
+        setIsRecordingTranslation,
+        resetTranslationRecordingState,
+        config.hotkey.vk_code,
+        config.hotkey.modifiers,
+        0xA5,
+      );
+      return;
+    }
+
     applyHotkeyIfNoDupConflict(
       translationFinalizedRef,
       'translation',
@@ -358,6 +393,30 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
       config.hotkey.modifiers,
       vkCode,
     );
+  };
+
+  const handleTranslationHotkeyKeyUp = (e: React.KeyboardEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (translationFinalizedRef.current) return;
+    if (!isRecordingTranslation) return;
+    const code = e.code;
+
+    // HOTKEY-079: pending still true at ControlLeft keyUp = no AltRight ever
+    // arrived = a real standalone Left Ctrl press. Record it now. Any other
+    // keyUp is ignored (translation is single-key semantics).
+    if (code === 'ControlLeft' && translationPendingCtrlRef.current) {
+      translationPendingCtrlRef.current = false;
+      applyHotkeyIfNoDupConflict(
+        translationFinalizedRef,
+        'translation',
+        setIsRecordingTranslation,
+        resetTranslationRecordingState,
+        config.hotkey.vk_code,
+        config.hotkey.modifiers,
+        0xA2,
+      );
+    }
   };
 
   const startRecordingTranslation = () => {
@@ -466,6 +525,7 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
                   ref={translationInputRef}
                   autoFocus
                   onKeyDown={handleTranslationHotkeyKeyDown}
+                  onKeyUp={handleTranslationHotkeyKeyUp}
                   onBlur={() => { setIsRecordingTranslation(false); resetTranslationRecordingState(); }}
                 >{t.hotkey_press_translation}</div>
               )}

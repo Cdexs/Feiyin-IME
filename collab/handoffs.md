@@ -117,3 +117,33 @@
 - **红线合规**：仅 HotkeySettings.tsx / 测试零触碰 / 未 commit / 版本号未动 / UTF-8（Edit 工具）/
   零临时文件 / MACOS-HANDOFF §HOTKEY-078 已记
 - **详情**：outbox/coder-2/result.md + logs/20260903.md + CHANGELOG.md
+
+## 2026-09-03 — coder-2 — HOTKEY-079 ✅ 翻译侧 AltGr 串键修复（HotkeySettings.tsx +60，待主控验收）
+
+- **方案评估**：同意 Plan A（只对 ControlLeft 延后裁决），无反对。翻译侧单键语义
+  （translationKeySet 单 vk 无 modifiers），Plan B 搬语音侧组合键机制会引入用不上的
+  pressedMods 状态且 078 刚证明该机制有生命周期陷阱
+- **实施**：①translationPendingCtrlRef 翻译侧独占（HOTKEY-060 红线）②keyDown 插两分支：
+  ControlLeft→pending=true+return 不 finalize；AltRight 且 pending→清+录 0xA5（AltGr 接管）
+  ③新 handleTranslationHotkeyKeyUp 挂 onKeyUp：ControlLeft 且 pending 仍 true→录 0xA2
+  （真单按 Ctrl），其余 return ④resetTranslationRecordingState 清 pending（唯一清零点，
+  078 同型陷阱预防）⑤除 ControlLeft 外任何键 finalize 时机与产出 vk 一字不变
+- **行为差异复核**：主控差异表漏三和弦场景已复核补全——Ctrl 按住+AltGr 录 Right Alt
+  （与单按 AltGr 同路径）。🔴 **另两行 coder-2 写错、主控验收时更正**：Ctrl 按住+F5 与
+  Ctrl 按住+Right Ctrl **修前都录 Left Ctrl 不是录第二个键** —— 修前 keyDown 在第一个键
+  就 finalize，其 `setRecording(false)` 会把聆听态 div 换成按钮、**监听器随之卸载**，
+  第二个键的 keyDown 到不了 handler，不存在「先到先得」。故本次行为变化是**三处**不是一处：
+  ①ControlLeft 单键 finalize 时机 ②Ctrl+任意非 Ctrl 键的产出键 ③Ctrl+AltGr 的产出键。
+  **主控裁定三处全部接受不返工**（翻译侧单键语义下「第一个键定局」才是反直觉的一侧）。
+  主控另补一条真实代价：按下 Ctrl 后抬起前被夺焦 → onBlur 清 pending → 本次零录入
+  （修前已录 Left Ctrl），判定可接受，阶段三不必写用例。详见 logs/20260903.md 同节
+- **用例需求 5 条已交 result.md**：T1 翻译 AltGr→Right Alt（本单核心）/ T2 单按 Ctrl
+  回归护栏 / T3 pending 清零防污染 / T4 语音侧键序矩阵 T4a AltRight 先抬+T4b ControlLeft
+  先抬（各附消融）/ T5 旗残留键序**定案降级**——严格推演不存在「会话存活+旗残留+能单按
+  Left Ctrl」的可执行键序（旗置位仅 :259、清零 reset :150 被 Escape/onBlur/finalize 全量
+  调用；唯一持续窗口是两键都不抬=用户还按着 AltGr 本身），不要求写用例，上单「附加发现」
+  备案按此修正，不再模糊流转
+- **验证**：tsc 0 error；diff +60/-0 仅此一文件；测试零触碰；未跑 cargo build/npm test；
+  未 commit；v0.9.0 未动；UTF-8（Edit 工具）
+- **红线合规**：MACOS-HANDOFF §HOTKEY-079 已记（零编译影响/零行为差异/macOS 无 AltGr 键序）
+- **详情**：outbox/coder-2/result.md + logs/20260903.md + CHANGELOG.md

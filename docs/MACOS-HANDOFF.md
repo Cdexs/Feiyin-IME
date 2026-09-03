@@ -1384,3 +1384,18 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
   （冲突弹窗键名显示 Left Ctrl 而非 Right Alt）。macOS 无 AltGr 合成键序，此缺陷
   在 macOS 上本就不触发，但修复对 macOS 无副作用（旗只在 AltRight 按下时置位）。
 - **验证**：`npx tsc --noEmit` 0 error；测试执行与出包归 tester-1（阶段四/五）。
+
+## §HOTKEY-079 · 翻译侧 AltGr 串键修复（2026-09-03，Windows 侧 UI 修复）
+
+**改动文件**：`ui/src/pages/HotkeySettings.tsx`（Tauri 设置页 React，Windows/macOS 共用同一份前端）。
+
+- **性质**：翻译侧热键录制新增 AltGr 合成键裁决——`translationPendingCtrlRef`（翻译侧独占 ref，
+  不与语音侧共享状态，HOTKEY-060 红线）+ `handleTranslationHotkeyKeyUp`（新 handler 挂 onKeyUp）。
+  `ControlLeft` keyDown 延后裁决（pending=true），`AltRight` 接管则录 Right Alt(0xA5)，
+  其自身 keyUp 到来仍 pending 则录 Left Ctrl(0xA2)。
+- **生命周期**：pending 唯一清零点 `resetTranslationRecordingState()`（Escape / 失焦 / finalize
+  全路由经过），与 HOTKEY-078 语音侧同型陷阱的预防性处理。
+- **平台影响**：**零编译影响、零行为差异**——纯前端 TSX 逻辑，无 Rust 改动。macOS 无 AltGr
+  合成键序（ControlLeft+AltRight 成对事件），此缺陷在 macOS 上本就不触发；macOS 用户单按
+  Left Ctrl 仍走 keyUp finalize 路径，行为一致。
+- **验证**：`npx tsc --noEmit` 0 error；测试执行与出包归 tester-1（阶段三写用例/阶段四跑）。
