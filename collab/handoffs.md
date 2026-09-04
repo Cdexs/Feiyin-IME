@@ -228,3 +228,14 @@
 - **运行时数据**：config.toml/wordbook.sqlite/debug.log 零覆盖；version_check.json mtime 变化已定性=程序冒烟自写缓存（src/version_check/mod.rs save_cache），非出包覆盖
 - 产物：`Publish/` 三 exe 就绪，待 Gavin 端测（DEC-055 红线 5 目视 / AltGr 双侧 / LLM 401 定性提示见 result.md）
 - **详情**：outbox/tester-1/result.md + logs/20260904.md
+
+## 2026-09-04 — coder-2 — OVERLAY-086 ✅ 三 overlay 缺陷修复（main.rs +213/-52 + qwen_inference.rs +10/-2，代码验收通过，含打回整改）
+
+- **Bug1 圆角灰线**：D2D 背景与辉光 `FillRoundedRectangle`（corner_radius 单绑定共享，0.5px 笔偏移保留）+ GDI 兜底 `FillRgn(CreateRoundRectRgn 16*2)` + Processing region `Some(16)`。DEC-056 下取「楔形被裁」优于「楔形外露」，端测不偏好可一行回退 None
+- **Bug2 空窗口真根因**：realtime on_result 无空过滤 → VAD 预热 21 空包/170ms → Show(RecordingWithText{text:""}) 空窗口 + WORDBOOK-053-B 镜像被空串抹掉。①源头 `!display.is_empty()` 闸门（qwen_inference.rs:1579）②渲染层空文本回落 placeholder（不变量）③`tween_timeline_origin` 与墙钟零点同锚，`reveal_chars_by_timeline` 加 Option<i64> 第4参（None=旧行为，11 处护栏零语义改动）——词表重写（is→试 重排、origin 1120→1160）冻结/爆发成因消除
+- **Bug3 宽度瞬移**：变宽改插值（删 grow-snap）+ 删 068-B snap + Show 流式 SetWindowPos 用 in-flight current_size——两处 SetWindowPos 尺寸同源（current），068-B 防争抢结构性保留，046 非流式零变，068-A R1 居中保留=两边扩展
+- **打回整改（主控验收两处，均已处理）**：① `:1249` 068-A applied_size 的 if/else 删除，统一 `state.current_size`（A 方案）——变宽帧原按 desired 算居中、窗口按 current 画，左缘偏 `(desired-current)/2` 一帧；现在 :1249/:1366/R1 三处同源。② 插值循环注释「reveal now follows the interpolated width」是代码不存在的承诺，已改事实表述（scroll_x 在已画宽度内滚动 + target 只走节流 Show 路径 + reveal 纯时间轴驱动，无窗口宽度耦合）
+- **验证（主控独立复跑）**：fmt --check exit 0 / check --all-targets 0 error / diff -w 仅 2 生产文件 + 3 文档 / 测试文件零触碰 / v0.9.0 未动
+- **非回归结论**：043/046/051-G/068-A/068-B/075/D2D-073/053-B/DEC-056 逐项点名全过（result.md 各节），interpolate_step 零改动、bErase=false 未动
+- **红线合规**：未跑 test/build / 未 commit / UTF-8（bash heredoc + Edit + py -3.11 codecs）/ 零凭证 / 建议护栏 4 组交阶段三
+- **详情**：outbox/coder-2/result.md（含打回整改记录节）+ logs/20260904.md + CHANGELOG.md + MACOS-HANDOFF §OVERLAY-086

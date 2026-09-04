@@ -1568,9 +1568,17 @@ pub fn transcribe_streaming_realtime(
                         );
                     }
 
-                    // OVERLAY-051-G: 每次都下发与 display_text 完全对齐的全量词表。
+                    // OVERLAY-051-G: 每次都下发与 display_text 完全同源的全量词表。
                     // overlay 侧 UpdateWordTimings 整体替换，合并逻辑归零。
-                    on_result(&display, &display_words);
+                    // OVERLAY-086 Bug 2 ①：display 为空的 result-generated 包（服务端
+                    // VAD 命中后的预热期必然成批出现，Gavin 实测 21 包/170ms）不得转发：
+                    // 转发会被 controller 包成 Show(RecordingWithText{text:""})，把
+                    // RecordingStreamingIdle 的聆听占位窗口替换成只有边框+麦标的空窗口
+                    //（Gavin 报的「文字全部消失只剩空窗口」），且空串会先写入
+                    // WORDBOOK-053-B 镜像把已学镜像抹掉。堵在源头：空包不回调即两条全断。
+                    if !display.is_empty() {
+                        on_result(&display, &display_words);
+                    }
                 }
                 if extract_event_type(&parsed) == Some("task-finished") {
                     let final_elapsed = t_start.elapsed().as_millis();

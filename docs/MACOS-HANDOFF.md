@@ -1399,3 +1399,19 @@ Gavin 决定暂不启用 GitHub CI/CD（DEC-033 附则二）。Windows 侧沿用
   合成键序（ControlLeft+AltRight 成对事件），此缺陷在 macOS 上本就不触发；macOS 用户单按
   Left Ctrl 仍走 keyUp finalize 路径，行为一致。
 - **验证**：`npx tsc --noEmit` 0 error；测试执行与出包归 tester-1（阶段三写用例/阶段四跑）。
+
+## OVERLAY-086（2026-09-04，coder-2）
+
+**范围**：Bug1 D2D/GDI 圆角填充 + region、Bug2 空包闸门/渲染护栏/时间轴双端锚定、Bug3 宽度插值。
+
+**零编译影响**：全部改动位于 `#[cfg(target_os = "windows")]` 区——`d2d` mod、`draw_overlay_to_dc`、
+`draw_processing_overlay`（GDI 兜底）、`apply_overlay_window_region`、`OverlayWindowState`（含新增
+`tween_timeline_origin` 字段）、`reveal_chars_by_timeline` 及其全部调用点、`run_overlay_thread` 的
+Show/UpdateWordTimings/插值循环。macOS overlay 走 `src/platform/macos/overlay.rs` 独立路径，
+`PipelineEvent::StreamingText` 在 macOS 侧不渲染（:5397 区）。
+
+**零行为差异**：`reveal_chars_by_timeline` 虽加参数但函数本体带 `#[cfg(windows)]`；
+qwen_inference.rs 的空 display 闸门在 `transcribe_streaming_realtime`（平台中立），macOS 若
+未来接 realtime 流式路径将同样受益（空包不转发是纯数据层改进，无平台耦合）。
+
+**macOS 无 AltGr 键序**结论沿用 HOTKEY-078/079 条目；本单不触及输入/热键域。

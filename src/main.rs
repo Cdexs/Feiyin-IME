@@ -55,7 +55,7 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::{
     AlphaBlend, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
     CreatePen, CreateRectRgn, CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject,
-    DrawTextW, Ellipse, EndPaint, FillRect, GetDC, GetMonitorInfoW, GetStockObject,
+    DrawTextW, Ellipse, EndPaint, FillRect, FillRgn, GetDC, GetMonitorInfoW, GetStockObject,
     GetTextExtentPoint32W, GetTextMetricsW, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx,
     Rectangle, ReleaseDC, RestoreDC, RoundRect, SaveDC, SelectClipRgn, SelectObject, SetBkColor,
     SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor, SetWindowRgn, StretchBlt,
@@ -995,6 +995,12 @@ struct OverlayWindowState {
     word_timings: Vec<crate::transcription::qwen_inference::WordTiming>,
     /// OVERLAY-051-G: wall-clock time when the first word's audio began, for offset mapping.
     tween_audio_origin: Option<std::time::Instant>,
+    /// OVERLAY-086 Bug 2 ③: timeline zero anchored at the same instant as
+    /// `tween_audio_origin` — the first non-empty word table's `words[0].begin_time`.
+    /// Both ends of the wall-clock↔timeline mapping are fixed once; server-side word
+    /// rewrites (which shift `words[0].begin_time`) must not re-float the timeline zero,
+    /// otherwise the reveal boundary regresses wholesale (freeze then burst).
+    tween_timeline_origin: Option<i64>,
 }
 #[cfg(target_os = "windows")]
 struct OverlayWindowData {
@@ -1120,6 +1126,7 @@ fn run_overlay_thread(
         tween_start: None,
         word_timings: Vec::new(),
         tween_audio_origin: None,
+        tween_timeline_origin: None,
     }));
     let window_data = Box::new(OverlayWindowData {
         state: Arc::clone(&shared_state),
@@ -1233,13 +1240,13 @@ fn run_overlay_thread(
                                 // window is still interpolating toward it, the window visibly jumps
                                 // because the left edge snaps to a new center before the right edge
                                 // has caught up. Use the width that will actually be applied this frame.
-                                let applied_size = if desired_size[0] > state.current_size[0] {
-                                    desired_size
-                                } else {
-                                    // For shrinking we are still interpolating; keep x centered on
-                                    // the in-flight current width so the window does not hop.
-                                    state.current_size
-                                };
+                                // OVERLAY-086 Bug 3: growing width now interpolates too, so the
+                                // width actually applied this frame is ALWAYS the in-flight
+                                // current_size (both directions) — the old grow-snap made the
+                                // growing case equal desired_size, which is why this used to be
+                                // an if/else. One width, one source of truth, same as the
+                                // SetWindowPos below and the interpolation loop's R1 recenter.
+                                let applied_size = state.current_size;
                                 // center horizontally based on the width applied this frame
                                 let work = monitor_work_rect(hwnd);
                                 let work_w = work.right - work.left;
@@ -1288,6 +1295,7 @@ fn run_overlay_thread(
                                 state.tween_start = None;
                                 state.word_timings.clear();
                                 state.tween_audio_origin = None;
+                                state.tween_timeline_origin = None;
                             }
                             // OVERLAY-051-G-FIN: flush cursor when leaving RecordingWithText
                             // (e.g. HotkeyEvent::Stop -> FallingToProcessing). This ensures
@@ -1306,6 +1314,7 @@ fn run_overlay_thread(
                                 state.tween_start = None;
                                 state.word_timings.clear();
                                 state.tween_audio_origin = None;
+                                state.tween_timeline_origin = None;
                             }
                         }
                         // OVERLAY-051-C: preserve target_hwnd across Show updates that carry 0.
@@ -1324,16 +1333,17 @@ fn run_overlay_thread(
                         if !is_streaming_text {
                             state.target_size = computed_size;
                             state.current_size = computed_size;
-                        } else {
-                            // OVERLAY-068-B: streaming-to-streaming Show updates must also
-                            // snap current_size to the target so the interpolation loop has
-                            // nothing to do this frame. The unconditional SetWindowPos below
-                            // (OVERLAY-046) is the single point that applies position/size;
-                            // the interpolation path only runs when current_size != target_size.
-                            // Leave target_size as-is because adjust_overlay_pos_size_for_text
-                            // already wrote the new desired target above.
-                            state.current_size = state.target_size;
                         }
+                        // OVERLAY-086 Bug 3: the OVERLAY-068-B streaming snap
+                        // (`current_size = target_size`) is REMOVED. With width growth now
+                        // interpolated (see the interpolation loop), snapping here would make
+                        // the Show branch's SetWindowPos (which uses target-full-size) fight
+                        // the interpolation loop's SetWindowPos (which uses current) within
+                        // the same frame — exactly the oscillation 068-B was built to prevent.
+                        // The single geometry authority per frame is now:
+                        //   - Show: positions the window at the in-flight current size
+                        //   - interpolation loop: advances current → target, recentering x
+                        // target_size stays as written by adjust_overlay_pos_size_for_text.
                         state.needs_repaint = true;
                     }
                     unsafe {
@@ -1347,13 +1357,28 @@ fn run_overlay_thread(
                         // final_pos；non-streaming 分支是 resolved_pos)，不是入口的 resolved_pos
                         // —— 流式文字宽度增长时水平居中 x 会变，必须用居中后的值，否则每来一批
                         // 文字水平抖一下（旧 request.pos 走的就是居中后的值）。
+                        // OVERLAY-086 Bug 3: streaming Show applies the IN-FLIGHT current size
+                        // (not the target) so this call and the interpolation loop never fight
+                        // over geometry — 068-B's original "two SetWindowPos per frame with
+                        // inconsistent sizes" is structurally prevented: during streaming the
+                        // interpolation loop is the only width authority; this call just keeps
+                        // the window pinned to the width the renderer is already drawing.
+                        let applied_size = if is_streaming_text {
+                            if let Ok(state) = shared_state.lock() {
+                                state.current_size
+                            } else {
+                                computed_size
+                            }
+                        } else {
+                            computed_size
+                        };
                         let _ = SetWindowPos(
                             hwnd,
                             None,
                             computed_pos[0],
                             computed_pos[1],
-                            computed_size[0],
-                            computed_size[1],
+                            applied_size[0],
+                            applied_size[1],
                             SWP_NOACTIVATE | SWP_NOZORDER,
                         );
                         let _ = ShowWindow(hwnd, SW_SHOWNA);
@@ -1370,11 +1395,25 @@ fn run_overlay_thread(
                         // StreamingAsrState 完成，回调每次下发全量词表）。
                         // words 为空 → 降级路径（RecordingWithText 分支判定后立即全显）
                         let was_nonempty = !words.is_empty();
-                        state.word_timings = words;
                         // 首次收到非空 words 时建立 audio origin（墙钟），
                         // 用于把 word.begin_time 差值映射到播放进度。
-                        if was_nonempty && state.tween_audio_origin.is_none() {
+                        // OVERLAY-086 Bug 2 ③: 同一时刻把时间轴零点也锚定一次
+                        // （首个非空词表的 words[0].begin_time）。此后词表被服务端
+                        // 整段重写时，重写只改「有哪些词」，时间零点不再随
+                        // words[0].begin_time 漂移 —— 消除揭示边界整体后退
+                        // （冻 1.9s + 爆发追涨）的成因。
+                        // （先取首词值再 move words，避免 borrow-after-move。）
+                        let first_begin_time = if was_nonempty && state.tween_audio_origin.is_none()
+                        {
+                            Some(words[0].begin_time)
+                        } else {
+                            None
+                        };
+                        state.word_timings = words;
+                        if let (true, Some(begin)) = (first_begin_time.is_some(), first_begin_time)
+                        {
                             state.tween_audio_origin = Some(std::time::Instant::now());
+                            state.tween_timeline_origin = Some(begin);
                         }
                         state.needs_repaint = true;
                     }
@@ -1400,6 +1439,7 @@ fn run_overlay_thread(
                         state.tween_start = None;
                         state.word_timings.clear();
                         state.tween_audio_origin = None;
+                        state.tween_timeline_origin = None;
                         state.request = state.request.as_mut().map(|r| {
                             r.status = OverlayStatus::StreamingEditing { text: text.clone() };
                             r.clone()
@@ -1484,6 +1524,7 @@ fn run_overlay_thread(
                         state.tween_start = None;
                         state.word_timings.clear();
                         state.tween_audio_origin = None;
+                        state.tween_timeline_origin = None;
                         if let Some(font) = state.cached_font.take() {
                             unsafe {
                                 let _ = DeleteObject(font);
@@ -1561,10 +1602,13 @@ fn run_overlay_thread(
                             } else if let Some(origin) = state.tween_audio_origin {
                                 // 正常路径：按墙钟 elapsed 对齐 word.begin_time 差值
                                 let elapsed_ms = origin.elapsed().as_millis() as i64;
+                                // OVERLAY-086 Bug 2 ③: 时间轴零点用锚定值（与墙钟零点
+                                // 同一时刻写入），词表重写不再让零点漂移。
                                 let revealed = reveal_chars_by_timeline(
                                     &state.word_timings,
                                     elapsed_ms,
                                     state.tween_target_chars,
+                                    state.tween_timeline_origin,
                                 );
                                 // 单调不回退：取 max（reveal 可能因词表覆盖不到尾部而
                                 // 小于 displayed，此时保持已显示的字符不回退）
@@ -1658,15 +1702,21 @@ fn run_overlay_thread(
             }
 
             // OVERLAY-043 / 051-F: smooth interpolation of window size toward target_size.
-            // Growing width follows text immediately (no interpolation) so the latest text is never
-            // clipped by an in-flight resize. Shrinking / height changes still use interpolation to
-            // avoid oscillation. interpolate_step itself is untouched (TEST-SYNC-043护栏).
+            // OVERLAY-086 Bug 3: growing width now interpolates like shrinking. The old
+            // grow-snap (`dx > 0 → current = target`) made every streaming packet jump the
+            // width instantly, and the centering x (OVERLAY-068-A R1 below) jumped with it —
+            // the "position slides left / flickers" Gavin reported. The clipping concern that
+            // snap originally served ("latest text must not be clipped by an in-flight resize")
+            // stays covered: target_size only advances through the 100ms-throttled Show path,
+            // the text renderer scrolls within the *drawn* width (scroll_x in
+            // draw_recording_overlay_with_text), and the text reveal is timestamp-driven
+            // (OVERLAY-086 Bug 2 ③ anchors both zeros so server word-table rewrites no longer
+            // stall it) — none of these depend on the window reaching target width instantly.
+            // interpolate_step itself is untouched (TEST-SYNC-043护栏).
             if state.current_size != state.target_size {
                 let dx = state.target_size[0] - state.current_size[0];
                 let dy = state.target_size[1] - state.current_size[1];
-                if dx > 0 {
-                    state.current_size[0] = state.target_size[0];
-                } else if dx < 0 {
+                if dx != 0 {
                     state.current_size[0] += interpolate_step(dx);
                 }
                 if dy != 0 {
@@ -2028,23 +2078,39 @@ fn draw_overlay_to_dc(
             }
             OverlayStatus::RecordingWithText { text } => {
                 apply_overlay_window_region(hwnd, rect, None, true);
-                // OVERLAY-051-G: render only the tween-visible prefix.
-                let visible_text: String = text.chars().take(state.displayed_chars).collect();
-                let (cr, sr, thr) = draw_recording_overlay_with_text(
-                    hdc,
-                    rect,
-                    state,
-                    request.ui_language,
-                    &visible_text,
-                );
-                cancel_btn_rect = Some(cr);
-                submit_btn_rect = Some(sr);
-                text_hit_rect = Some(thr);
-                // OVERLAY-043: set dirty when the streaming text actually changes
-                let text_changed = state.last_streaming_text.as_ref() != Some(text);
-                if text_changed {
-                    state.last_streaming_text = Some(text.clone());
-                    state.needs_repaint = true;
+                // OVERLAY-086 Bug 2 ② (render-side guard): an empty streaming text must
+                // never produce an empty window. The upstream gate (OVERLAY-086 Bug 2 ①,
+                // qwen_inference on_result) should stop empty packets from reaching this
+                // status at all, but "empty streaming text never yields an empty window"
+                // is an invariant the render layer must uphold on its own — fall back to
+                // the full listening placeholder exactly like RecordingStreamingIdle.
+                if text.is_empty() {
+                    cancel_btn_rect = Some(draw_recording_overlay(
+                        hdc,
+                        rect,
+                        state,
+                        true,
+                        request.ui_language,
+                    ));
+                } else {
+                    // OVERLAY-051-G: render only the tween-visible prefix.
+                    let visible_text: String = text.chars().take(state.displayed_chars).collect();
+                    let (cr, sr, thr) = draw_recording_overlay_with_text(
+                        hdc,
+                        rect,
+                        state,
+                        request.ui_language,
+                        &visible_text,
+                    );
+                    cancel_btn_rect = Some(cr);
+                    submit_btn_rect = Some(sr);
+                    text_hit_rect = Some(thr);
+                    // OVERLAY-043: set dirty when the streaming text actually changes
+                    let text_changed = state.last_streaming_text.as_ref() != Some(text);
+                    if text_changed {
+                        state.last_streaming_text = Some(text.clone());
+                        state.needs_repaint = true;
+                    }
                 }
             }
             OverlayStatus::FallingToProcessing { .. } => {
@@ -2054,7 +2120,13 @@ fn draw_overlay_to_dc(
                 cancel_btn_rect = Some(draw_stop_button(hdc, rect));
             }
             OverlayStatus::Processing(message) => {
-                apply_overlay_window_region(hwnd, rect, None, true);
+                // OVERLAY-086 Bug 1: rounded window region matching the D2D/GDI border
+                // geometry (radius 16) so no rectangular-region wedge is left outside the
+                // rounded stroke in the corners. Trade-off: SetWindowRgn is a binary mask
+                // (no anti-aliasing), so the outermost 1px of the D2D anti-aliased corner
+                // edge gets clipped hard — accepted under DEC-056 as the better of the two
+                // imperfect options; if end-testing prefers the soft edge, revert to None.
+                apply_overlay_window_region(hwnd, rect, Some(16), true);
                 // D2D-073 P0: this status is redrawn with Direct2D + DirectWrite
                 // (DEC-055 gray migration step 1). On any D2D failure the GDI path below
                 // still renders this frame, so the overlay never goes blank.
@@ -2959,25 +3031,35 @@ mod d2d {
                 b: 0x18 as f32 / 255.0,
                 a: 1.0,
             });
-            res.rt.FillRectangle(
-                &D2D_RECT_F {
-                    left: 0.0,
-                    top: 0.0,
-                    right: w,
-                    bottom: h,
+            // OVERLAY-086 Bug 1: the background must be a rounded rectangle matching the
+            // border geometry exactly. A rectangular fill leaves a wedge of background
+            // color outside the rounded 1px stroke in each corner (visible as stray gray
+            // fringes on the rounded edge). Fill and stroke must share ONE radius binding.
+            let corner_radius = 16.0;
+            res.rt.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: 0.0,
+                        top: 0.0,
+                        right: w,
+                        bottom: h,
+                    },
+                    radiusX: corner_radius,
+                    radiusY: corner_radius,
                 },
                 &res.brush,
             );
 
             // 2) 1px rounded border — same geometry as GDI RoundRect(…, 16*2, 16*2):
             //    corner radius 16, stroke centered on the GDI border line.
+            //    Fill (0.0..w) and stroke (0.5..w-0.5) intentionally differ by the 0.5px
+            //    pen-centering inset; the radius binding above is shared by both.
             res.brush.SetColor(&D2D1_COLOR_F {
                 r: (OVERLAY_BORDER_GRAY.0 & 0xFF) as f32 / 255.0,
                 g: ((OVERLAY_BORDER_GRAY.0 >> 8) & 0xFF) as f32 / 255.0,
                 b: ((OVERLAY_BORDER_GRAY.0 >> 16) & 0xFF) as f32 / 255.0,
                 a: 1.0,
             });
-            let radius = 16.0;
             res.rt.DrawRoundedRectangle(
                 &D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
@@ -2986,8 +3068,8 @@ mod d2d {
                         right: w - 0.5,
                         bottom: h - 0.5,
                     },
-                    radiusX: radius,
-                    radiusY: radius,
+                    radiusX: corner_radius,
+                    radiusY: corner_radius,
                 },
                 &res.brush,
                 1.0,
@@ -3050,12 +3132,18 @@ mod d2d {
                     &stop_collection,
                 ) {
                     // Vertical span matches the GDI glow: 1px inside border to 1px inside bottom.
-                    res.rt.FillRectangle(
-                        &D2D_RECT_F {
-                            left: (beam_cx - glow_half).max(1.0),
-                            top: 1.0,
-                            right: (beam_cx + glow_half).min(w - 1.0),
-                            bottom: h - 1.0,
+                    // OVERLAY-086 Bug 1: the glow must not bleed into the rounded corners
+                    // either — clip it to the same rounded geometry as the background.
+                    res.rt.FillRoundedRectangle(
+                        &D2D1_ROUNDED_RECT {
+                            rect: D2D_RECT_F {
+                                left: (beam_cx - glow_half).max(1.0),
+                                top: 1.0,
+                                right: (beam_cx + glow_half).min(w - 1.0),
+                                bottom: h - 1.0,
+                            },
+                            radiusX: corner_radius,
+                            radiusY: corner_radius,
                         },
                         &gradient_brush,
                     );
@@ -3108,8 +3196,22 @@ fn draw_processing_overlay(
     let border_color = OVERLAY_BORDER_GRAY;
     // Dark background
     let bg = unsafe { CreateSolidBrush(BG_DARK) };
+    // OVERLAY-086 Bug 1 (GDI fallback path): fill through a rounded region so the
+    // background matches the RoundRect border geometry — a rectangular FillRect leaves
+    // the same corner wedges the D2D path had. radius 16 = CORNER_RADIUS below.
+    let fill_region = unsafe {
+        CreateRoundRectRgn(
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            CORNER_RADIUS * 2,
+            CORNER_RADIUS * 2,
+        )
+    };
     unsafe {
-        let _ = FillRect(hdc, rect, bg);
+        let _ = FillRgn(hdc, fill_region, bg);
+        let _ = DeleteObject(fill_region);
         let _ = DeleteObject(bg);
     }
     // Border: 1px rounded corners (breathing orange)
@@ -3534,20 +3636,29 @@ fn should_ignore_streaming_text(stopped: bool, editing: bool) -> bool {
 ///    `total_chars` —— **宁可多显绝不少显**，绝不让尾部差额卡到松键 flush 才补上。
 ///    `.min(total_chars)` 仍作为上界保护，防止词表字符总数超过文本长度。
 ///
-/// 实现：`origin_begin = words[0].begin_time`；累加所有满足
-/// `w.begin_time - origin_begin <= elapsed_ms` 的
-/// `w.text.chars().count() + w.punctuation.chars().count()`。
+/// 实现：时间轴零点 `origin_begin` 优先取 `timeline_origin`（OVERLAY-086 Bug 2 ③：
+/// 首个非空词表的 `words[0].begin_time`，由调用方锚定一次后固定传入）；`timeline_origin`
+/// 为 `None` 时退回旧实现，从**当前词表**现算 `words[0].begin_time`（既有护栏的旧行为）。
+/// 固定零点的必要性：服务端会整段重写词表（Gavin 实测 id=2 20词→19词、文本不变），
+/// 重写后 `words[0].begin_time` 漂移（1120→1160），若每次现算，所有
+/// `w.begin_time - origin_begin` 一起变大 → 揭示边界整体后退 → 显示冻结，
+/// 直到墙钟追上再一次性释放（冻 1.9s + 爆发追涨，Gavin 报的「中断显示」）。
+/// 墙钟零点（tween_audio_origin，:1376）与时间轴零点必须**同一时刻锚定、此后双端固定**，
+/// 词表重写只改「有哪些词」，不改「时间零点在哪」。
 #[cfg(target_os = "windows")]
 fn reveal_chars_by_timeline(
     words: &[crate::transcription::qwen_inference::WordTiming],
     elapsed_ms: i64,
     total_chars: usize,
+    timeline_origin: Option<i64>,
 ) -> usize {
     // 契约 1：words 为空 → 立即全显（降级路径）
     if words.is_empty() {
         return total_chars;
     }
-    let origin_begin = words[0].begin_time;
+    // OVERLAY-086 Bug 2 ③：时间轴零点固定锚定；None = 旧行为（从当前词表现算），
+    // 供 OVERLAY-051-G-FIN 既有护栏（:7801 模块五处直调）保持原语义零改动。
+    let origin_begin = timeline_origin.unwrap_or(words[0].begin_time);
     let mut revealed: usize = 0;
     let mut broke_early = false;
     for w in words {
@@ -7793,8 +7904,8 @@ mod overlay_051g_reveal_tests {
     /// 契约 1：`words` 为空 → 返回 `total_chars`（立即全显，降级路径），不是 0。
     #[test]
     fn empty_words_returns_total_chars() {
-        assert_eq!(reveal_chars_by_timeline(&[], 0, 6), 6);
-        assert_eq!(reveal_chars_by_timeline(&[], 999_999, 3), 3);
+        assert_eq!(reveal_chars_by_timeline(&[], 0, 6, None), 6);
+        assert_eq!(reveal_chars_by_timeline(&[], 999_999, 3, None), 3);
     }
 
     /// 契约 2：以 `words[0].begin_time` 为基准取差值。
@@ -7803,9 +7914,9 @@ mod overlay_051g_reveal_tests {
     #[test]
     fn relative_to_first_word_begin_time() {
         let words = vec![wt(1500, "你"), wt(2500, "好")];
-        assert_eq!(reveal_chars_by_timeline(&words, 0, 2), 1);
+        assert_eq!(reveal_chars_by_timeline(&words, 0, 2, None), 1);
         assert_eq!(
-            reveal_chars_by_timeline(&words, 1000, 2),
+            reveal_chars_by_timeline(&words, 1000, 2, None),
             2,
             "两词间隔 1000ms，elapsed=1000 时两词都应显示"
         );
@@ -7818,12 +7929,12 @@ mod overlay_051g_reveal_tests {
     fn no_pause_compression_large_gap() {
         let words = vec![wt(1000, "你"), wt(4000, "好")];
         assert_eq!(
-            reveal_chars_by_timeline(&words, 2999, 2),
+            reveal_chars_by_timeline(&words, 2999, 2, None),
             1,
             "间隔 3000ms，elapsed=2999 必须仍只显第一词"
         );
         assert_eq!(
-            reveal_chars_by_timeline(&words, 3000, 2),
+            reveal_chars_by_timeline(&words, 3000, 2, None),
             2,
             "间隔 3000ms，elapsed=3000 才应两词全显"
         );
@@ -7840,7 +7951,7 @@ mod overlay_051g_reveal_tests {
             wt(4000, "界"),
         ];
         assert_eq!(
-            reveal_chars_by_timeline(&words, 100_000, 6),
+            reveal_chars_by_timeline(&words, 100_000, 6, None),
             6,
             "词表短于文本时尾部差额必须一次性放出"
         );
@@ -7850,7 +7961,7 @@ mod overlay_051g_reveal_tests {
     #[test]
     fn upper_bound_capped_at_total_chars() {
         let words = vec![wt(1000, "你好"), wt(2000, "世界")];
-        assert_eq!(reveal_chars_by_timeline(&words, 100_000, 3), 3);
+        assert_eq!(reveal_chars_by_timeline(&words, 100_000, 3, None), 3);
     }
 
     /// 标点计入字符数：text + punctuation 各计一次。
@@ -7859,7 +7970,7 @@ mod overlay_051g_reveal_tests {
     fn punctuation_counts_into_chars() {
         let words = vec![wtp(1000, "你好", "。"), wt(3000, "好"), wt(5000, "吧")];
         assert_eq!(
-            reveal_chars_by_timeline(&words, 2000, 5),
+            reveal_chars_by_timeline(&words, 2000, 5, None),
             4,
             "你好。=3 字 + 好=1 字，elapsed=2000 时应显 4 字"
         );
@@ -7870,7 +7981,7 @@ mod overlay_051g_reveal_tests {
     fn multibyte_counted_by_chars_not_bytes() {
         let words = vec![wt(1000, "你好世界"), wt(5000, "哈")];
         assert_eq!(
-            reveal_chars_by_timeline(&words, 3000, 5),
+            reveal_chars_by_timeline(&words, 3000, 5, None),
             4,
             "你好世界=4 字符（非 12 字节），elapsed=3000 时应显 4 字"
         );
@@ -7880,7 +7991,7 @@ mod overlay_051g_reveal_tests {
     #[test]
     fn negative_elapsed_no_panic() {
         let words = vec![wt(1000, "你"), wt(2000, "好")];
-        assert_eq!(reveal_chars_by_timeline(&words, -5000, 4), 0);
+        assert_eq!(reveal_chars_by_timeline(&words, -5000, 4, None), 0);
     }
 }
 
