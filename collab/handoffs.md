@@ -280,3 +280,11 @@
 - **过程**：三轮协商（护栏2可测性→主控裁B；E0425 并行中间态误报按红线只报不动；**护栏7/8 假护栏交付前自审**——判别力区分=消融对象是否生产真函数，主控裁定 7走A/8·6走B，已按裁定落地）
 - **红线合规**：既有用例/11 处 None 直调/interpolate_step 零触碰；生产代码我侧零改动；fmt --check exit 0 / check --all-targets 0 error；cargo test/build 未跑；v0.9.0 未动；零临时文件
 - **详情**：outbox/tester-1/result.md（含判别力缺口独立节 + 消融推演与顺序自证表）+ logs/20260904.md
+
+## 2026-09-05 — tester-1 — TEST-FIX-091 + TEST-EXEC-092 ✅（4处测试修正 + 2条ignore跳过挂死项，回归全绿，待主控验收提交）
+
+- **修正**：分隔线同坐标系比对 / reveal 反例同字数 begin变小三角窗口（old=anchored=2,drifted=1）/ advance_width 收窄 660 / 删重复 #[test]；两处二次修正（reveal 词表口径、advance_width 收敛预算算术）实测定位后改对
+- **#[ignore] ×2（D2D-HANG-001，Gavin 授权）**：075 模块 P0 + 086 模块流式两态入口，均保留 #[test] 只加 ignore + 完整注释（主控定位卡在 CreateDCRenderTarget 之后，P0 待办非已解决）
+- **回归**：root **1061P/0F/11I**（1054+9=1063，2 ignore→1061+11 对账）、src-tauri 76P、vitest 89P；两 REFACTOR 等价性判据全绿；消融 A/B 按 Gavin 拍板跳过
+- **红线**：生产零改动（diff 仅测试模块）、v0.9.0 未动、未 commit、无残留进程、临时文件已删
+- **详情**：outbox/tester-1/result.md + logs/20260904.md

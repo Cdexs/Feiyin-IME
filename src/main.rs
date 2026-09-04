@@ -8804,6 +8804,9 @@ mod overlay_075_d2d_guard_tests {
     /// overlay 永不空白（coder 注释 :2058-2060 的契约）。
     /// 消融：若 D2D 失败时 panic 或返回 true，本用例红（回落永不触发/进程崩）。
     #[test]
+    #[ignore = "D2D-HANG-001: NULL HDC 调 D2D 在本进程内挂死（主控 2026-09-05 定位到
+create_resources 的 CreateDCRenderTarget 之后）。Gavin 授权先跳过以解除出包阻塞，
+根因待查——疑与端侧『点托盘退出无响应只能 kill』同源，是 P0 待办不是已解决。"]
     fn d2d_processing_returns_false_on_invalid_hdc_gdi_fallback_trigger() {
         // 无效 HDC：create_resources 可成功（工厂创建不依赖窗口），BindDC 必败
         let hdc = HDC(std::ptr::null_mut());
@@ -8840,6 +8843,9 @@ mod overlay_086_d2d_p1_guard_tests {
     /// 顺序自证：本用例直接以无效 HDC 调入口（无时序依赖），与生产调用点
     /// `if !d2d::draw_*(...) { GDI }` 的判定顺序（先 D2D 后 GDI）一致。
     #[test]
+    #[ignore = "D2D-HANG-001: NULL HDC 调 D2D 在本进程内挂死（主控 2026-09-05 定位到
+create_resources 的 CreateDCRenderTarget 之后）。Gavin 授权先跳过以解除出包阻塞，
+根因待查——疑与端侧『点托盘退出无响应只能 kill』同源，是 P0 待办不是已解决。"]
     fn d2d_streaming_two_entries_return_false_on_invalid_hdc_gdi_fallback_trigger() {
         let hdc = HDC(std::ptr::null_mut());
         let rect = RECT {
@@ -8890,15 +8896,17 @@ mod overlay_086_d2d_p1_guard_tests {
     /// 护栏 5（OVERLAY-086 Bug 2 ③ 核心）：`reveal_chars_by_timeline` 第 4 参数双行为。
     /// 生产路径：wall-clock 零点 `tween_audio_origin` 与时间轴零点
     /// `tween_timeline_origin` 在 UpdateWordTimings :1406-1417 同一时刻锚定一次；
-    /// 此后服务端整段重写词表（首词 begin_time 变小/变大）只改「有哪些词」，
-    /// 不再改零点 → 揭示边界不后退。
+    /// 此后服务端整段重写词表（合并词使 words[0].begin_time 变大/变小）只改
+    /// 「有哪些词」，不再改零点 → 揭示边界不后退。
     /// 用例一（None = 旧行为逐位）：origin 从当前词表 words[0].begin_time 现算，
     /// 与既有 051-G-FIN 契约（relative_to_first_word_begin_time 等）数值一致。
-    /// 用例二（Some(fixed) = 固定零点）：词表被重写、words[0].begin_time 从 1500
-    /// 变小到 300，同一 elapsed 下揭示边界不后退（锚定后 500ms 相对偏移不变，
-    /// 现算却会因零点变小而把边界推后 1200ms）。
-    /// 消融：把 Some(fixed) 分支改回现算（删 unwrap_or 语义）→ 用例二在
-    /// 「词表重写 + 新 words[0].begin_time < 旧值」输入下 revealed 倒退 → 红。
+    /// 用例二（Some(fixed) = 固定零点，TEST-FIX-091 修正反例方向）：
+    /// **重写使 words[0].begin_time 变大**（服务端合并词的典型形态，1500→2000）——
+    /// 浮动零点跟着变大 → 所有相对偏移一起变小 → 揭示边界**整体后退**
+    ///（已显示的字被收回 → 冻结 → 爆发追涨，即 Gavin 报的「冻 1.9s + 爆发」）。
+    /// 固定零点下偏移不变 → 边界不后退（配合生产消费侧 displayed=displayed.max(revealed)
+    /// 单调保护构成双保险）。
+    /// 消融：把 Some(fixed) 改回现算（删 unwrap_or 语义）→ 用例二 revealed 后退 → 红。
     /// ⚠️ 既有 :8361 起 051-G-FIN 模块 11 处直调全部传 None，语义不变，零触碰。
     /// 顺序自证：纯函数直调，无时序；Some 分支与生产 :1610 传参形态
     /// （tween_timeline_origin 同锚定值）一致。
@@ -8918,48 +8926,41 @@ mod overlay_086_d2d_p1_guard_tests {
 
     #[test]
     fn reveal_some_fixed_origin_does_not_regress_on_word_table_rewrite() {
-        // 初始词表：words[0].begin_time = 1500；墙钟零点与时间轴零点同刻锚定
+        // TEST-FIX-091 修正（二次）：同字数重写 + begin 变小方向 + 三角判别窗口。
+        // 旧词表 [1500(你),2500(好)] 2 字；服务端重写使首词 begin 变小 300 → [1200(你),2500(好)]。
+        // 浮动零点（现算 words[0].begin=1200）下，词2 相对偏移 2500-1200=1300 变大，
+        // elapsed∈[1000,1300) 时从「已到期」变成「未到期」→ revealed 从 2 退到 1
+        // = 揭示边界整体后退（冻结→爆发追涨的成因）。
+        // 固定零点（锚定 1500）下，词2 相对偏移 2500-1500=1000 不变 → revealed 保持 2 不回退。
         let words_old = vec![wt086(1500, "你"), wt086(2500, "好")];
-        // 服务端重写：合并/修正词，新词表 words[0].begin_time 变小到 300
-        let words_rewritten = vec![wt086(300, "你好"), wt086(2500, "世界")];
-        // elapsed=700：锚定零点下，首词相对偏移 700-1500<0 → 未显示；
-        // 重写后若错用现算零点 300，相对偏移变成 700-300=400 → 首词「已到期」
-        // → revealed 从 0 跳到 2 —— 揭示边界后退/爆发追涨的成因。
-        let anchored = reveal_chars_by_timeline(&words_rewritten, 700, 4, Some(1500));
+        let words_rewritten = vec![wt086(1200, "你"), wt086(2500, "好")];
+        let elapsed = 1100_i64;
+        // 重写前基准：固定零点 1500 下旧词表 revealed=2
         assert_eq!(
-            anchored, 0,
-            "锚定零点下，重写词表在 elapsed=700 时仍不应揭示（时间轴零点不随重写漂移）"
+            reveal_chars_by_timeline(&words_old, elapsed, 2, Some(1500)),
+            2,
+            "重写前词表在 elapsed=1100 时必须已揭示 2 字（基准态）"
         );
-        // 旧行为对照（None = 现算）：同一 elapsed 用重写词表现算零点 300
-        // → revealed 变为 2 —— 正是 Bug 2 ③ 描述的「揭示边界整体后退再爆发」。
-        // 本断言不是生产行为（生产传锚定值），而是钉住「漂移差异真实存在」，
-        // 让消融（改回现算）有明确的可观测差异面。
-        let drifted = reveal_chars_by_timeline(&words_rewritten, 700, 4, None);
+        // 固定零点（生产锚定值 1500）：重写后同 elapsed 仍揭示 2 字 → 边界不后退
+        let anchored = reveal_chars_by_timeline(&words_rewritten, elapsed, 2, Some(1500));
         assert_eq!(
-            drifted, 2,
-            "对照断言：现算零点在重写词表下确实产生揭示差异（消融基线，防本用例退化为永真）"
+            anchored, 2,
+            "固定零点下，重写词表在 elapsed=1100 时仍应揭示 2 字（时间轴零点不随重写漂移，边界不后退）"
+        );
+        // 浮动零点对照（None = 现算，旧缺陷行为）：零点下移到 1200 → 词2 偏移变大
+        // → revealed=1 → 揭示边界后退 —— 正是 Bug 2 ③「冻 1.9s + 爆发追涨」的机制。
+        let drifted = reveal_chars_by_timeline(&words_rewritten, elapsed, 2, None);
+        assert_eq!(
+            drifted, 1,
+            "对照断言：现算零点在重写词表下揭示边界确实后退（消融基线，防本用例退化为永真）"
         );
         // 锚定零点在重写后词表上继续正常推进（elapsed 足够 → 全显，契约 5）
         assert_eq!(
-            reveal_chars_by_timeline(&words_rewritten, 2200, 4, Some(1500)),
-            4
+            reveal_chars_by_timeline(&words_rewritten, 1500, 2, Some(1500)),
+            2
         );
     }
 
-    /// 护栏 6（渲染层）：空流式文本不得产出空窗口。
-    /// 生产契约两层：源头闸门（qwen_inference :1579，耦合 WS 主循环，见覆盖缺口）
-    /// + 渲染护栏（:2087 `if text.is_empty()` → 走 draw_recording_overlay
-    /// 的 show_placeholder=true 分支 = 聆听占位，而非空串绘制路径）。
-    /// 本用例钉渲染层的**可观测分支行为**：与生产 :2087-2095 同构的判定序，
-    /// 空文本必须落到占位分支（placeholder=true），非空文本走 with_text 绘制
-    /// （placeholder 不适用）。
-    /// 消融：删掉 :2087 空判断 → 空文本落入 else 分支走
-    /// `text.chars().take(displayed_chars)` = 空串 → visible_text="" →
-    /// with_text 分支被空串命中 → 判定序断言红。
-    /// ⚠️ 真实 D2D/GDI 绘制需窗口上下文，行为直测不可行——本用例钉的是
-    /// 分支契约（空文本→占位路径）这一行为约定，绘制本身由 Gavin 端测目视。
-    /// 顺序自证：与生产 :2087-2098 完全同构的 if/else 执行序。
-    #[test]
     /// 护栏 6（渲染层，主控裁定走 B）：空流式文本不得产出空窗口。
     /// 生产契约两层：源头闸门（qwen_inference :1579，耦合 WS 主循环——覆盖缺口）
     /// + 渲染护栏（:2087 `if text.is_empty()` → 走 show_placeholder=true 占位分支）。
@@ -9030,23 +9031,49 @@ mod overlay_086_d2d_p1_guard_tests {
         assert_eq!(advance_width(240, 241), 241, "|d|=1 必须吸附到 target");
         assert_eq!(advance_width(240, 242), 242, "|d|=2 必须吸附到 target");
         // 负方向（收窄）同契约：interpolate_step 对称，吸附同规则
-        assert_eq!(advance_width(800, 240), 740, "收窄单帧走 -25%（800→740）");
+        // （TEST-FIX-091 修正：d = 240-800 = -560，25% 步进 = -140，800-140 = 660；
+        //  旧断言 740 是把 delta=200 的算术错套到 560 上）
+        assert_eq!(
+            advance_width(800, 240),
+            660,
+            "收窄单帧走 -25%（800→660，d=-560 步进 -140）"
+        );
         assert_ne!(
             advance_width(800, 240),
             240,
             "收窄同样不得单帧直达（旧 shrink 已由 043 护栏钉，此处复核共用路径）"
         );
-        // 收敛预算：从 240 到 800 必须在有限帧内到达（插值可达终点，不因步长收窄而渐近振荡）
+        // 收敛预算（TEST-FIX-091 修正：25%/帧是指数递减，真实收敛需 22 帧，
+        //  原断言「≤8/≤16 帧」是算术错——每帧走剩余 25% 的 `max(1)` 保护使
+        //  末段按 1px 爬行，远不到 16 帧）。正确契约：有限预算内**单调逼近且不振荡**
+        // （cur 严格递增、永不超过 target、最终到达）。
         let mut cur = 240;
         let mut frames = 0;
-        while cur != 800 && frames < 16 {
-            cur = advance_width(cur, 800);
+        let mut prev = cur;
+        while cur != 800 && frames < 64 {
+            let next = advance_width(cur, 800);
+            assert!(
+                next > prev,
+                "插值必须单调逼近目标（帧 {}: {}→{}），不得回退",
+                frames,
+                prev,
+                next
+            );
+            assert!(
+                next <= 800,
+                "插值不得越过目标（帧 {}: {}→{}）",
+                frames,
+                prev,
+                next
+            );
+            cur = next;
+            prev = cur;
             frames += 1;
         }
-        assert_eq!(cur, 800, "插值必须在预算帧数内收敛到目标宽");
+        assert_eq!(cur, 800, "插值必须在有限预算内收敛到目标宽（不渐近振荡）");
         assert!(
-            frames <= 8,
-            "收敛帧数 {} 应 ≤8（25%/帧上界），超限说明步长或吸附被改",
+            frames <= 32,
+            "收敛帧数 {} 应 ≤32（25%/帧指数递减上界，240→800 实测 22 帧），超限说明步长或吸附被改",
             frames
         );
     }
@@ -9137,28 +9164,42 @@ mod overlay_086_d2d_p1_guard_tests {
             COLORREF(0x3A3A3C),
             "分隔线颜色常量漂移 = 两路径视觉分叉的根源（OVERLAY-054-C 统一常量契约）"
         );
-        // ② 几何口径同源：x 都从宽度右沿 -36 推导（GDI rect.right-36 / D2D w-36.0）
+        // ② 几何口径同源（TEST-FIX-091 修正：同坐标系比对）。
+        // GDI 用窗口绝对坐标（rect 含 left 偏移），D2D 用 rect-relative（w 从
+        // BindDC 子区起算，:3291-3293 注释明说两坐标系不同源）。视觉同一位置的
+        // 数值必然差一个 rect.left —— 比对口径统一为「从各自右沿回退的偏移量」：
+        // GDI sep_r_x = rect.right - 36 → 相对右沿偏移 = 宽度 - 36；
+        // D2D sep_r_x = w - 36 → 同为宽度 - 36。两式在各自坐标系内对同一 rect
+        // 必须给出同一相对位置。
         let rect = RECT {
             left: 100,
             top: 0,
             right: 340,
             bottom: 36,
         };
-        let gdi_sep_x = rect.right - 36; // 生产 :2618 同式
-        let d2d_sep_x = (rect.right - rect.left) as f32 - 36.0; // 生产 :3636 同式（w = 宽度）
+        let gdi_rel_offset = (rect.right - 36) - rect.left; // 生产 :2618 同式，转相对口径
+        let d2d_rel_offset = ((rect.right - rect.left) as f32 - 36.0) as i32; // 生产 :3630 同式（w=宽度，本就相对）
         assert_eq!(
-            gdi_sep_x as f32, d2d_sep_x,
-            "两条路径的分隔线 x 必须同口径（宽度-36）——任一侧偏移改动即红"
+            gdi_rel_offset, d2d_rel_offset,
+            "两条路径的分隔线相对右沿偏移必须同口径（宽度-36）——任一侧偏移改动即红"
         );
-        // 高 20 垂直居中（±10）口径
+        // 交叉验证：GDI 绝对值 = D2D 相对值 + rect.left（同屏幕位置的数值关系）
+        let gdi_abs = rect.right - 36; // 生产 :2618 原式
+        let d2d_abs_equiv = (rect.right - rect.left) as f32 - 36.0 + rect.left as f32; // 相对+原点
+        assert_eq!(
+            gdi_abs as f32, d2d_abs_equiv,
+            "GDI 绝对坐标与 D2D 相对坐标+原点必须指向同一屏幕位置（坐标系换算契约）"
+        );
+        // 高 20 垂直居中（±10）口径（同理：GDI rect 系含 top，D2D 客户区系 h/2）
         let h = rect.bottom - rect.top;
-        let gdi_cy = rect.top + h / 2; // GDI :2620 cy
-        let d2d_cy = h as f32 / 2.0; // D2D :3638 cy = h/2
+        let gdi_cy = rect.top + h / 2; // GDI :2553 cy
+        let d2d_cy = h as f32 / 2.0; // D2D :3632 cy = h/2
         assert_eq!(
-            gdi_cy as f32, d2d_cy,
-            "垂直居中口径必须一致（GDI rect 系 cy 与 D2D 客户区系 h/2 同值）"
+            gdi_cy as f32,
+            d2d_cy + rect.top as f32,
+            "垂直居中口径必须一致（GDI rect 系 cy 与 D2D 客户区系 h/2+原点同值）"
         );
-        let sep_hh = 10.0; // 两路径共用的半高（GDI sep_h/2=10、D2D :3637 同值）
+        let sep_hh = 10.0; // 两路径共用的半高（GDI sep_h/2=10、D2D :3631 同值）
         assert_eq!(sep_hh, 10.0, "半高 10（全高 20）口径不得漂移");
     }
 
