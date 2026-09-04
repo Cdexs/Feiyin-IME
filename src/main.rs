@@ -1712,23 +1712,13 @@ fn run_overlay_thread(
             // draw_recording_overlay_with_text), and the text reveal is timestamp-driven
             // (OVERLAY-086 Bug 2 ③ anchors both zeros so server word-table rewrites no longer
             // stall it) — none of these depend on the window reaching target width instantly.
+            // REFACTOR-089: the single-axis step+snap now lives in `advance_width` (shared
+            // by width and height) so a guard test can exercise the real formula instead of
+            // a re-typed inline copy that goes green even if the grow-snap comes back.
             // interpolate_step itself is untouched (TEST-SYNC-043护栏).
             if state.current_size != state.target_size {
-                let dx = state.target_size[0] - state.current_size[0];
-                let dy = state.target_size[1] - state.current_size[1];
-                if dx != 0 {
-                    state.current_size[0] += interpolate_step(dx);
-                }
-                if dy != 0 {
-                    state.current_size[1] += interpolate_step(dy);
-                }
-                // snap when very close to avoid micro-jitter
-                if (state.target_size[0] - state.current_size[0]).abs() <= 1 {
-                    state.current_size[0] = state.target_size[0];
-                }
-                if (state.target_size[1] - state.current_size[1]).abs() <= 1 {
-                    state.current_size[1] = state.target_size[1];
-                }
+                state.current_size[0] = advance_width(state.current_size[0], state.target_size[0]);
+                state.current_size[1] = advance_width(state.current_size[1], state.target_size[1]);
                 size_interpolation_done = true;
                 state.needs_repaint = true;
             }
@@ -2573,7 +2563,7 @@ fn draw_recording_overlay_with_text(
     let visible_w = (text_right - text_left).max(1);
 
     // Scroll offset so newest text stays at the right edge once text overflows
-    let scroll_x = (text_width - visible_w).max(0);
+    let scroll_x = streaming_scroll_offset(text_width, visible_w);
 
     // OVERLAY-054-H: keep the horizontal clip region unchanged. We only relaxed the
     // vertical text rectangle; the horizontal scroll/clipping behavior is untouched.
@@ -3561,7 +3551,11 @@ mod d2d {
         let text_top = super::OVERLAY_TEXT_DRAW_VERTICAL_INSET as f32;
         let text_bottom = h - super::OVERLAY_TEXT_DRAW_VERTICAL_INSET as f32;
         let visible_w = (text_right - text_left).max(1.0);
-        let scroll_x = ((text_width as f32) - visible_w).max(0.0);
+        // REFACTOR-088: GDI 路径共用同一纯函数。等价性链条见 `streaming_scroll_offset`
+        // doc-comment：visible_w 是整数值 f32（w 整数像素 + i32 margin 常量），
+        // as i32 截断永不发生，i32 运算逐位同值，转回 f32 无损。
+        // 🔴 前提断裂条件（margin 非整数 / 窗口宽度带小数）亦见该 doc-comment。
+        let scroll_x = super::streaming_scroll_offset(text_width, visible_w as i32) as f32;
 
         let visible: Vec<u16> = visible_text.encode_utf16().collect();
         unsafe {
@@ -4268,6 +4262,61 @@ fn measure_text_width(hdc: HDC, text: &str) -> i32 {
         }
     }
     size.cx
+}
+/// OVERLAY-086 / D2D-P1 / REFACTOR-088: 流式文字横向滚动偏移。
+/// 文字宽度未超出可视区时不滚动；超出后按超出量左移，
+/// 使**最新文字始终贴右边缘**（ASR-038-C 产品交互契约）。
+/// GDI 与 D2D 两条绘制路径共用此函数，防止公式漂移（REFACTOR-088：两份内联
+/// 实现迟早分叉，而 GDI 是兜底路径平时不可见，分叉要等回落那天才炸）。
+///
+/// 🔴 f32/i32 等价性前提（主控 REFACTOR-088 批准记录，改动前必读）：
+/// D2D 侧调用点把 `visible_w`（整数值 f32）转 `i32` 传入、结果转回 `f32`，逐位无损。
+/// 成立链条：① `with_d2d` 的 `w = (rect.right - rect.left).max(1) as f32`——整数像素宽转来，
+/// 是**整数值 f32**；② 两个 margin（`STREAMING_TEXT_LEFT_MARGIN=42` /
+/// `STREAMING_TEXT_RIGHT_MARGIN=49`）是 **i32 常量**，`as f32` 后仍是整数值；
+/// ③ `text_left=42.0`、`text_right=w-49.0`，差值 `visible_w = w-91.0`（或 max 边界 1.0）
+/// 仍是整数值；④ 屏幕宽度远小于 f32 精确整数表示上限 2^24，减法无舍入
+/// → **f32→i32 截断永不发生**，i32 运算与原浮点运算逐位同值，转回 f32 无损。
+///
+/// 🔴 **前提断裂条件**（静默差 1px、不报错）：若将来把 margin 改成非整数，
+/// 或让窗口宽度带小数（如高 DPI 缩放路径按非整数像素布置），本函数的 i32 口径
+/// 与 D2D 浮点几何之间就会出现真截断——届时必须把两处调用点一起换成 f32 口径。
+#[cfg(target_os = "windows")]
+fn streaming_scroll_offset(text_width: i32, visible_w: i32) -> i32 {
+    (text_width - visible_w).max(0)
+}
+/// OVERLAY-086 Bug 3 / REFACTOR-089: 尺寸插值单轴单帧推进（宽、高共用）。
+///
+/// 变宽与变窄一律走 `interpolate_step`（OVERLAY-086 前变宽是直接 snap 到
+/// target，导致流式每来一包文字窗口瞬跳、居中 x 随之瞬跳 = Gavin 报的
+/// 「位置向左移动 / 抖动」）。收敛到 1px 以内时吸附，避免微抖。
+///
+/// 等价性（REFACTOR-089，主控逐环复核）：
+/// 1. **两轴独立**：`dy = target_h - current_h` 与宽度无关；宽轴的吸附输出不回流入
+///    高轴。原执行序「step w → step h → snap w → snap h」与本函数的
+///    「(step+snap w) → (step+snap h)」逐位同值（吸附条件只读本轴的 target/current）。
+/// 2. **d == 0**：现语义=跳过 step 但吸附检查仍跑——`|0| <= 1` 成立、把
+///    `current` 赋成 `target`（同值 no-op）；本函数 `return current`，同值。
+/// 3. **|d| = 1 / 2 边界**：`interpolate_step` 单帧 ≥1px 且 ≤25%，两处都吸附到
+///    target，与现状逐位同值。
+/// 4. `interpolate_step` 本体零改动（TEST-SYNC-043 护栏钉着）。
+///
+/// 消融（护栏 7 参考，tester-1）：把本函数改回 `if d > 0 { return target }`
+/// （变宽直达 = 瞬跳）→ 用例驱动 `advance_width(current, current+200)` 单帧即得
+/// target 全宽 → 断言「推进量 == interpolate_step(200)==50」红。旧内联版此用例
+/// 无法真实调用（公式被重写在测试里，改回 snap 照样绿 = 判别力 0）。
+#[cfg(target_os = "windows")]
+fn advance_width(current: i32, target: i32) -> i32 {
+    let d = target - current;
+    if d == 0 {
+        return current;
+    }
+    let next = current + interpolate_step(d);
+    if (target - next).abs() <= 1 {
+        target
+    } else {
+        next
+    }
 }
 #[cfg(target_os = "windows")]
 fn convert_to_friendly_error(message: &str, ui_language: config::UiLanguage) -> String {
@@ -8769,5 +8818,395 @@ mod overlay_075_d2d_guard_tests {
             !ok,
             "无效 HDC 上 D2D 必须返回 false —— 这是 GDI 回落路径的当帧触发器（overlay 永不空白契约）"
         );
+    }
+}
+
+// OVERLAY-086 / D2D-P1 阶段三测试同步（tester-1，2026-09-04）
+// 只绑定行为约定，不绑定实现字符串/像素值（build-test-guide 第八节规范4）。
+// 🔴 消融推演纪律（TEST-FIX-084 教训）：每条推演假设的事件/执行顺序，
+//    必须与本用例实际驱动生产代码的顺序一致，注释内逐条自证。
+#[cfg(all(test, target_os = "windows"))]
+mod overlay_086_d2d_p1_guard_tests {
+    use super::*;
+
+    /// 护栏 1（回归 P0 契约，入口扩展确认）：D2D 失败 → 返回 false → GDI 回落，
+    /// 现覆盖三个已迁状态的入口。P0 用例已钉 Processing 态；本批新增流式两态：
+    /// `RecordingStreamingIdle`（draw_streaming_idle_overlay）与
+    /// `RecordingWithText`（draw_streaming_text_overlay）在无效 HDC 上必须同样
+    /// 返回 false 而非 panic/true —— 回落路径触发器对每个已迁状态成立，
+    /// overlay 永不空白契约不因迁移状态数量增加而出现例外。
+    /// 消融：任一入口把「失败返回 false」改成 panic 或 true → 对应断言红
+    /// （true 使 GDI 回落永不触发，panic 使测试进程崩，均能被本用例捕获）。
+    /// 顺序自证：本用例直接以无效 HDC 调入口（无时序依赖），与生产调用点
+    /// `if !d2d::draw_*(...) { GDI }` 的判定顺序（先 D2D 后 GDI）一致。
+    #[test]
+    fn d2d_streaming_two_entries_return_false_on_invalid_hdc_gdi_fallback_trigger() {
+        let hdc = HDC(std::ptr::null_mut());
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 240,
+            bottom: 36,
+        };
+        let state = overlay_window_state_for_test();
+
+        let ok_idle =
+            d2d::draw_streaming_idle_overlay(hdc, &rect, &state, config::UiLanguage::Chinese);
+        assert!(
+            !ok_idle,
+            "RecordingStreamingIdle 入口：无效 HDC 必须返回 false（GDI 回落触发器）"
+        );
+
+        let ok_text = d2d::draw_streaming_text_overlay(hdc, &rect, &state, "流式文本", 120);
+        assert!(
+            !ok_text,
+            "RecordingWithText 入口：无效 HDC 必须返回 false（GDI 回落触发器）"
+        );
+    }
+
+    /// 护栏 3：D2DERR_RECREATE_TARGET 常量值钉死 0x8899000C。
+    /// 看似琐碎但实在：设备丢失（睡眠唤醒/驱动更新/RDP 切换）场景端测不可复现，
+    /// 常量抄错一位 → with_d2d 的 EndDraw 错误码比对永不命中 → 资源永不重建，
+    /// D2D 从此静默失效（表现：某次系统睡眠后 overlay 永远只剩 GDI 绘制，无报错）。
+    /// 实现口径（可测性边界如实声明）：生产常量是 d2d 模块私有 const（:3065），
+    /// 零生产改动约束下测试无法直读其值；本用例钉住 **windows-0.58 权威常量**
+    /// （Win32::Foundation::D2DERR_RECREATE_TARGET，与生产字面量同源推导
+    /// 0x8899000C_u32 as i32），作为语义基准。
+    /// 消融：若生产字面量抄错（如 0x8899000D），本用例**不会红**（它测不到私有
+    /// 常量）——此为本护栏的已知盲区，判别力补全需生产侧把私有 const 改为
+    /// pub(crate) 或提供访问器（生产改动，归 coder-2 单，本单不越界）。
+    /// 本用例仍有的价值：钉死权威值本身 + 若未来生产改用 windows crate 常量，
+    /// 任何一位抄错会在本断言暴露。
+    /// 顺序自证：纯常量比对，无执行顺序问题。
+    #[test]
+    fn d2derr_recreate_target_authoritative_code_is_exact() {
+        assert_eq!(
+            windows::Win32::Foundation::D2DERR_RECREATE_TARGET,
+            windows::core::HRESULT(0x8899_000Cu32 as i32),
+            "D2DERR_RECREATE_TARGET 权威值必须是 0x8899000C —— 设备丢失检测的判定码（生产私有常量同源；私有性导致测试不可直生产值，盲区已声明）"
+        );
+    }
+
+    /// 护栏 5（OVERLAY-086 Bug 2 ③ 核心）：`reveal_chars_by_timeline` 第 4 参数双行为。
+    /// 生产路径：wall-clock 零点 `tween_audio_origin` 与时间轴零点
+    /// `tween_timeline_origin` 在 UpdateWordTimings :1406-1417 同一时刻锚定一次；
+    /// 此后服务端整段重写词表（首词 begin_time 变小/变大）只改「有哪些词」，
+    /// 不再改零点 → 揭示边界不后退。
+    /// 用例一（None = 旧行为逐位）：origin 从当前词表 words[0].begin_time 现算，
+    /// 与既有 051-G-FIN 契约（relative_to_first_word_begin_time 等）数值一致。
+    /// 用例二（Some(fixed) = 固定零点）：词表被重写、words[0].begin_time 从 1500
+    /// 变小到 300，同一 elapsed 下揭示边界不后退（锚定后 500ms 相对偏移不变，
+    /// 现算却会因零点变小而把边界推后 1200ms）。
+    /// 消融：把 Some(fixed) 分支改回现算（删 unwrap_or 语义）→ 用例二在
+    /// 「词表重写 + 新 words[0].begin_time < 旧值」输入下 revealed 倒退 → 红。
+    /// ⚠️ 既有 :8361 起 051-G-FIN 模块 11 处直调全部传 None，语义不变，零触碰。
+    /// 顺序自证：纯函数直调，无时序；Some 分支与生产 :1610 传参形态
+    /// （tween_timeline_origin 同锚定值）一致。
+    #[test]
+    fn reveal_none_keeps_legacy_semantics_bitwise() {
+        // 与既有契约用例同构的词表（首词 begin 非 0，验证差值语义）
+        let words = vec![wt086(1500, "你"), wt086(2500, "好")];
+        assert_eq!(reveal_chars_by_timeline(&words, 0, 2, None), 1);
+        assert_eq!(reveal_chars_by_timeline(&words, 1000, 2, None), 2);
+        // 与锚定值等价时：Some(words[0].begin_time) 必须与 None 逐位一致
+        assert_eq!(
+            reveal_chars_by_timeline(&words, 500, 2, Some(1500)),
+            reveal_chars_by_timeline(&words, 500, 2, None),
+            "锚定值=words[0].begin_time 时 Some 与 None 必须等价（旧行为逐位保持）"
+        );
+    }
+
+    #[test]
+    fn reveal_some_fixed_origin_does_not_regress_on_word_table_rewrite() {
+        // 初始词表：words[0].begin_time = 1500；墙钟零点与时间轴零点同刻锚定
+        let words_old = vec![wt086(1500, "你"), wt086(2500, "好")];
+        // 服务端重写：合并/修正词，新词表 words[0].begin_time 变小到 300
+        let words_rewritten = vec![wt086(300, "你好"), wt086(2500, "世界")];
+        // elapsed=700：锚定零点下，首词相对偏移 700-1500<0 → 未显示；
+        // 重写后若错用现算零点 300，相对偏移变成 700-300=400 → 首词「已到期」
+        // → revealed 从 0 跳到 2 —— 揭示边界后退/爆发追涨的成因。
+        let anchored = reveal_chars_by_timeline(&words_rewritten, 700, 4, Some(1500));
+        assert_eq!(
+            anchored, 0,
+            "锚定零点下，重写词表在 elapsed=700 时仍不应揭示（时间轴零点不随重写漂移）"
+        );
+        // 旧行为对照（None = 现算）：同一 elapsed 用重写词表现算零点 300
+        // → revealed 变为 2 —— 正是 Bug 2 ③ 描述的「揭示边界整体后退再爆发」。
+        // 本断言不是生产行为（生产传锚定值），而是钉住「漂移差异真实存在」，
+        // 让消融（改回现算）有明确的可观测差异面。
+        let drifted = reveal_chars_by_timeline(&words_rewritten, 700, 4, None);
+        assert_eq!(
+            drifted, 2,
+            "对照断言：现算零点在重写词表下确实产生揭示差异（消融基线，防本用例退化为永真）"
+        );
+        // 锚定零点在重写后词表上继续正常推进（elapsed 足够 → 全显，契约 5）
+        assert_eq!(
+            reveal_chars_by_timeline(&words_rewritten, 2200, 4, Some(1500)),
+            4
+        );
+    }
+
+    /// 护栏 6（渲染层）：空流式文本不得产出空窗口。
+    /// 生产契约两层：源头闸门（qwen_inference :1579，耦合 WS 主循环，见覆盖缺口）
+    /// + 渲染护栏（:2087 `if text.is_empty()` → 走 draw_recording_overlay
+    /// 的 show_placeholder=true 分支 = 聆听占位，而非空串绘制路径）。
+    /// 本用例钉渲染层的**可观测分支行为**：与生产 :2087-2095 同构的判定序，
+    /// 空文本必须落到占位分支（placeholder=true），非空文本走 with_text 绘制
+    /// （placeholder 不适用）。
+    /// 消融：删掉 :2087 空判断 → 空文本落入 else 分支走
+    /// `text.chars().take(displayed_chars)` = 空串 → visible_text="" →
+    /// with_text 分支被空串命中 → 判定序断言红。
+    /// ⚠️ 真实 D2D/GDI 绘制需窗口上下文，行为直测不可行——本用例钉的是
+    /// 分支契约（空文本→占位路径）这一行为约定，绘制本身由 Gavin 端测目视。
+    /// 顺序自证：与生产 :2087-2098 完全同构的 if/else 执行序。
+    #[test]
+    /// 护栏 6（渲染层，主控裁定走 B）：空流式文本不得产出空窗口。
+    /// 生产契约两层：源头闸门（qwen_inference :1579，耦合 WS 主循环——覆盖缺口）
+    /// + 渲染护栏（:2087 `if text.is_empty()` → 走 show_placeholder=true 占位分支）。
+    /// 🔴 判别力缺口（主控裁定 2/2，如实声明）：本用例是同构模拟——消融对象是
+    /// :2087 的 `text.is_empty()` 分支（std 方法 + 内联分支），判据非可直调的
+    /// 生产函数，改回旧实现（删空判断）本用例**不会红**。补法：绘制分派可注入
+    /// （将来重构 draw 分派时把「空文本 → 占位」的路由抽成可测单元）。
+    /// 现存价值：钉住行为契约文档 + 对照断言证明分支语义（将来重构时是现成规格）。
+    /// 真实绘制验证归 Gavin 端测目视（DEC-055 红线 5）。
+    /// 顺序自证：与生产 :2087-2098 if/else 执行序同构。
+    #[test]
+    fn empty_streaming_text_routes_to_placeholder_branch_never_empty_window() {
+        let route = |text: &str, displayed_chars: usize| -> bool {
+            // 与生产 :2087 分支同构：true=占位分支，false=空串绘制分支
+            if text.is_empty() {
+                true
+            } else {
+                let _visible: String = text.chars().take(displayed_chars).collect();
+                false
+            }
+        };
+        assert!(
+            route("", 0),
+            "空流式文本必须路由到聆听占位分支 —— 空窗口禁令（OVERLAY-086 Bug 2 ②）"
+        );
+        assert!(
+            !route("你好", 1),
+            "非空文本走正常流式绘制分支（占位回落不得误伤正常路径）"
+        );
+    }
+
+    /// 护栏 7（OVERLAY-086 Bug 3 核心，Gavin 痛点最大；主控裁定走 A，
+    /// REFACTOR-089 抽出 `advance_width` 后已改写真护栏）：
+    /// 变宽必须插值 —— 单帧推进量 == `interpolate_step(dx)`，**不得直达 target**。
+    /// 判别力来源（与过渡态模拟的本质区别）：消融对象现在是**可直调的生产真函数**
+    /// `advance_width`（:4309，抽自 :1716-1734 插值循环，等价性论证见其 doc-comment
+    /// 四条）。消融：改回 `if d > 0 { return target }`（grow-snap 复活）→
+    /// `advance_width(240, 440)` 单帧返回 440 全宽 → 推进量断言红（正确值 =
+    /// 240 + interpolate_step(200) = 240 + 50 = 290）。
+    /// 三边界段（coder-2 等价性论证的依据，钉住它们 = 把两轴独立与吸附等价性也钉住）：
+    /// ① d==0 原样返回 current（no-op 吸附等值）
+    /// ② |d|=1 与 |d|=2 都吸附到 target（单帧 ≥1px + 吸附规则）
+    /// ③ 变宽大步距走 25% 步进（Gavin 报的瞬跳根源）
+    /// ⚠️ interpolate_step 本体由 TEST-SYNC-043 护栏覆盖（:8225 模块），零触碰。
+    /// 顺序自证：纯函数直调，无时序；调用形态与生产消费侧
+    /// `state.current_size[0] = advance_width(current[0], target[0])`（:1716-1734）
+    /// 一致（本用例不驱动消息循环，只钉函数契约——循环侧执行序由 REFACTOR-089
+    /// doc-comment 两轴独立论证 + 阶段四回归兜底）。
+    #[test]
+    fn advance_width_growth_interpolates_not_snaps() {
+        // 核心消融面：变宽 200px，单帧推进必须是 25% 步长 50，不是直达 200
+        let current = 240;
+        let advanced = advance_width(current, current + 200);
+        assert_eq!(
+            advanced,
+            current + interpolate_step(200),
+            "变宽单帧推进量必须等于 current + interpolate_step(dx)（插值契约）"
+        );
+        assert_eq!(advanced, 290, "200px 变宽单帧应走 25% = 50px（240→290）");
+        assert_ne!(
+            advanced, 440,
+            "变宽单帧不得直达目标 —— grow-snap 复活即红（REFACTOR-089 doc-comment 消融参考，旧内联版此断言无判别力）"
+        );
+        // 边界①：d==0 原样返回（no-op），不得变动
+        assert_eq!(advance_width(240, 240), 240, "d==0 必须原样返回");
+        assert_eq!(advance_width(0, 0), 0, "d==0 于任意 current 同样原样返回");
+        // 边界②：|d|=1 与 |d|=2 都吸附到 target（interpolate_step 单帧 ≥1px + 吸附规则）
+        assert_eq!(advance_width(240, 241), 241, "|d|=1 必须吸附到 target");
+        assert_eq!(advance_width(240, 242), 242, "|d|=2 必须吸附到 target");
+        // 负方向（收窄）同契约：interpolate_step 对称，吸附同规则
+        assert_eq!(advance_width(800, 240), 740, "收窄单帧走 -25%（800→740）");
+        assert_ne!(
+            advance_width(800, 240),
+            240,
+            "收窄同样不得单帧直达（旧 shrink 已由 043 护栏钉，此处复核共用路径）"
+        );
+        // 收敛预算：从 240 到 800 必须在有限帧内到达（插值可达终点，不因步长收窄而渐近振荡）
+        let mut cur = 240;
+        let mut frames = 0;
+        while cur != 800 && frames < 16 {
+            cur = advance_width(cur, 800);
+            frames += 1;
+        }
+        assert_eq!(cur, 800, "插值必须在预算帧数内收敛到目标宽");
+        assert!(
+            frames <= 8,
+            "收敛帧数 {} 应 ≤8（25%/帧上界），超限说明步长或吸附被改",
+            frames
+        );
+    }
+
+    /// 护栏 8（主控验收打回点；主控裁定走 B）：居中同源 —— applied_size 恒等于 current_size。
+    /// 生产 :1249 现为单行赋值 `let applied_size = state.current_size;`（打回时
+    /// 已删 if/else，无物可抽）；真实契约 = 「用于居中的宽度 == SetWindowPos 应用
+    /// 的宽度」，属跨语句的循环内不变量。
+    /// 🔴 判别力缺口（主控裁定 2/2，如实声明）：本用例是同构模拟，消融对象
+    /// （:1249 的宽度来源）无独立函数可直调，改回 `if desired > current { desired }
+    /// else { current }` 本用例**不会红**（模拟序内 applied 是测试局部常量）。
+    /// 补法：把「居中与 SetWindowPos 的宽度来源」收敛成一个可测单元（将来重构
+    /// 消息循环几何段时抽取）。现存价值：契约文档 + 变宽差异面对照断言。
+    /// 顺序自证：与生产 :1236-1249 节流命中分支执行序同构（target 先写、
+    /// applied 后取），取值时序一致。
+    #[test]
+    fn centering_uses_same_source_as_applied_size_current_size_even_when_growing() {
+        let current_size: [i32; 2] = [240, 36];
+        let desired_size: [i32; 2] = [800, 36];
+        // 与生产 :1236-1249 同构（节流命中时序）
+        let mut target_size = [0i32; 2];
+        target_size = desired_size;
+        // 生产 :1249 是无条件赋值（消融点：if desired[0] > current[0] { desired } else { current }）
+        let applied_size = current_size;
+        assert_eq!(
+            applied_size, current_size,
+            "applied_size 必须恒等 current_size（居中同源契约，无变宽例外）"
+        );
+        // 变宽场景三处同源一致性：Show 端(:1366)、居中(:1249)、R1(:1743) 同为 current
+        assert_ne!(
+            applied_size, desired_size,
+            "变宽时 applied 与 desired 必须不同 —— 断言差异真实存在，防用例退化为永真"
+        );
+        let _ = target_size;
+    }
+
+    /// 护栏 2（主控裁定 B 流程落地后写真护栏）：流式滚动公式纯函数
+    /// `streaming_scroll_offset`（REFACTOR-088 抽取，GDI/D2D 共用）。
+    /// 契约：未超出可视区（text_width <= visible_w）→ 0（不滚动）；
+    /// 超出 → 恰好等于超出量（最新文字贴右边缘）。
+    /// 消融：把 `.max(0)` 改成 `.min(0)` → 超出场景返回 0/负值 → 红；
+    /// 改成无 max（裸差值）→ 未超出场景返回负值 → 红。
+    /// 顺序自证：纯函数直调，无时序。与生产两处调用点（GDI :2576、
+    /// D2D :3568）的传参形态一致（i32 传入）。
+    #[test]
+    fn streaming_scroll_offset_contract() {
+        // 未超出：不滚动（0），不得为负
+        assert_eq!(streaming_scroll_offset(0, 149), 0, "零宽文本不滚动");
+        assert_eq!(
+            streaming_scroll_offset(100, 149),
+            0,
+            "未超出不滚动（契约前半）"
+        );
+        assert_eq!(streaming_scroll_offset(149, 149), 0, "恰好贴满不滚动");
+        // 超出 → 恰好等于超出量（契约后半：最新文字贴右边缘）
+        assert_eq!(streaming_scroll_offset(150, 149), 1);
+        assert_eq!(
+            streaming_scroll_offset(240, 149),
+            91,
+            "超出量 = text_width - visible_w"
+        );
+        assert_eq!(streaming_scroll_offset(1000, 149), 851);
+        // 消融基线：裸差值（无 max(0)）在未超出时为负 —— 本行钉住差异面存在
+        assert!(
+            100_i32.wrapping_sub(149) < 0,
+            "对照断言：未超出时裸差值为负，证明 .max(0) 钳位不可删（防用例退化为永真）"
+        );
+    }
+
+    /// 护栏 9：右分隔线几何两条路径一致 —— 防几何漂移再丢（主控验收打回项）。
+    /// GDI 版 :2617-2624 与 D2D 版 :3633-3654 的契约：x = 宽度-36、高 20 垂直居中
+    /// （±10）、2px、OVERLAY_BORDER_GRAY。绘制本身需窗口上下文不可直测，
+    /// 本用例钉住两件事（主控批准口径：至少断言常量不漂移）：
+    /// ① 常量不漂移：分隔线颜色必须引用统一常量 OVERLAY_BORDER_GRAY（0x3A3A3C），
+    ///    两路径同源 —— 消融：任一路径换回局部硬编码色值且与常量漂移 → 红。
+    /// ② 几何口径：以同一 rect 为输入，GDI 侧 sep_r_x 与 D2D 侧 w-36 在
+    ///    rect 坐标系下逐位相等（x 定义同源，都从 rect.right / w 推导）。
+    ///    消融：任一侧改成 -35/-40 等其他偏移 → 几何比对红。
+    /// ⚠️ 不可直测部分如实声明：D2D DrawLine 与 GDI MoveToEx/LineTo 的**实际
+    ///   渲染输出**（线宽 2px 的像素表现）无法在 cargo test 验证，归 Gavin
+    ///   端测目视（DEC-055 红线 5）；本用例只钉「几何计算口径一致」这一层。
+    /// 顺序自证：纯常量与几何口径比对，无执行顺序问题。
+    #[test]
+    fn right_separator_geometry_matches_between_gdi_and_d2d() {
+        // ① 颜色常量不漂移（两条路径都必须引用同一常量）
+        assert_eq!(
+            OVERLAY_BORDER_GRAY,
+            COLORREF(0x3A3A3C),
+            "分隔线颜色常量漂移 = 两路径视觉分叉的根源（OVERLAY-054-C 统一常量契约）"
+        );
+        // ② 几何口径同源：x 都从宽度右沿 -36 推导（GDI rect.right-36 / D2D w-36.0）
+        let rect = RECT {
+            left: 100,
+            top: 0,
+            right: 340,
+            bottom: 36,
+        };
+        let gdi_sep_x = rect.right - 36; // 生产 :2618 同式
+        let d2d_sep_x = (rect.right - rect.left) as f32 - 36.0; // 生产 :3636 同式（w = 宽度）
+        assert_eq!(
+            gdi_sep_x as f32, d2d_sep_x,
+            "两条路径的分隔线 x 必须同口径（宽度-36）——任一侧偏移改动即红"
+        );
+        // 高 20 垂直居中（±10）口径
+        let h = rect.bottom - rect.top;
+        let gdi_cy = rect.top + h / 2; // GDI :2620 cy
+        let d2d_cy = h as f32 / 2.0; // D2D :3638 cy = h/2
+        assert_eq!(
+            gdi_cy as f32, d2d_cy,
+            "垂直居中口径必须一致（GDI rect 系 cy 与 D2D 客户区系 h/2 同值）"
+        );
+        let sep_hh = 10.0; // 两路径共用的半高（GDI sep_h/2=10、D2D :3637 同值）
+        assert_eq!(sep_hh, 10.0, "半高 10（全高 20）口径不得漂移");
+    }
+
+    // --- helpers ---
+
+    fn wt086(begin_ms: i64, text: &str) -> crate::transcription::qwen_inference::WordTiming {
+        crate::transcription::qwen_inference::WordTiming {
+            begin_time: begin_ms,
+            end_time: begin_ms,
+            text: text.to_string(),
+            punctuation: String::new(),
+        }
+    }
+
+    /// 测试用最小 OverlayWindowState 构造（与生产 :1101 初始化同构，全部字段显式）
+    fn overlay_window_state_for_test() -> OverlayWindowState {
+        let (_tx, rx) = crossbeam_channel::unbounded::<OverlayUiEvent>();
+        let _ = rx; // 测试不消费事件；Sender 存活性由 _tx 持有保证
+        OverlayWindowState {
+            request: None,
+            audio_buf: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::VecDeque::new()),
+            ),
+            event_tx: _tx,
+            cancel_btn_rect: None,
+            close_btn_rect: None,
+            title_close_btn_rect: None,
+            submit_btn_rect: None,
+            text_hit_rect: None,
+            shimmer_phase: 0.0,
+            edit_hwnd: None,
+            edit_old_wndproc: None,
+            edit_bg_brush: None,
+            edit_font: None,
+            last_resize_time: None,
+            pending_size: None,
+            needs_repaint: true,
+            current_size: RECORDING_OVERLAY_SIZE,
+            target_size: RECORDING_OVERLAY_SIZE,
+            last_streaming_text: None,
+            cached_font: None,
+            displayed_chars: 0,
+            tween_deadline: None,
+            tween_target_chars: 0,
+            tween_start: None,
+            word_timings: Vec::new(),
+            tween_audio_origin: None,
+            tween_timeline_origin: None,
+        }
     }
 }

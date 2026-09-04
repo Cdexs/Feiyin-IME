@@ -1425,3 +1425,15 @@ cfg 区内，macOS 编译不触及。
 
 **零编译影响 / 零行为差异**：macOS overlay 走 `src/platform/macos/overlay.rs` 独立路径；
 流式文字的度量与滚动逻辑（GDI measure_text_width）同为 windows-only。macOS 无对应改动需求。
+
+## REFACTOR-088（2026-09-04，coder-2）
+
+纯函数 `streaming_scroll_offset` 及两处调用点（GDI/D2D 绘制路径）均在
+`#[cfg(target_os = "windows")]` 区内。Direct2D/GDI 均为 Windows 独有，macOS 零编译影响、
+零行为差异；macOS overlay 独立路径不消费该函数。
+
+## REFACTOR-089（2026-09-04，coder-2）
+
+`advance_width` 纯函数与插值区调用点均在 `#[cfg(target_os = "windows")]` 区内
+（`run_overlay_thread` 是 windows-only 线程主循环）。macOS 零编译影响、零行为差异；
+macOS overlay 独立路径不消费该函数。

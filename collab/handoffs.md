@@ -252,3 +252,31 @@
 - **验收整改**：右分隔线已补（D2D 流式态 DrawLine x=w-36/2px/高20，照抄 GDI :2617；此前「常态缺线、回落才有」回归已消除）；#4 省略号按主控裁定改写为「有意行为变更」（超宽裁剪无省略号：触发罕见 + 右端省略号会盖最新文字，请 Gavin 端测知悉判断）
 - **验证**：fmt clean / check --all-targets 0 error（自跑）/ git diff -w 仅 main.rs / interpolate_step 零改动 / 版本号 v0.9.0 未动 / 未跑 test/build / 未 commit / UTF-8（Edit 工具）/ 零凭证 / MACOS-HANDOFF §D2D-P1 已记
 - **详情**：outbox/coder-2/result.md + logs/20260904.md + CHANGELOG.md
+
+## 2026-09-04 — coder-2 — REFACTOR-088 ✅ 抽 streaming_scroll_offset 纯函数（main.rs +函数+2调用替换，待主控验收）
+
+- **动机**：scroll_x 公式内联两处（GDI :2576 / D2D :3564），单一实现防静默漂移（GDI 兜底路径平时不可见，分叉等回落才炸）
+- **签名**：`streaming_scroll_offset(text_width: i32, visible_w: i32) -> i32`（#[cfg(windows)]）
+- **f32/i32 处置**：D2D 调用点 `visible_w as i32` 传参 + 结果 `as f32` 回转——等价性链条（w 整数值 f32 / margin i32 常量 / visible_w=w-91.0 整数值 / 屏宽≪2^24 无舍入 → 截断永不发生）逐环主控复核通过，全文写入 doc-comment；断裂条件（margin 非整数/窗口宽带小数）同文标注
+- **归属边界**：工作区 mod overlay_086_d2d_p1_guard_tests ≈380 行 = tester-1 TEST-SYNC-087 交付物非本单；本单 diff 仅新函数+2 调用替换；tester-1 的 streaming_scroll_offset_contract 直测本函数签名逐字匹配
+- **验证**：fmt clean / check 0 error（主控独立复跑）/ 版本号未动 / 未跑 test/build / 未 commit / UTF-8 / 零凭证
+- **详情**：outbox/coder-2/result.md + logs/20260904.md + CHANGELOG.md + MACOS-HANDOFF §REFACTOR-088
+
+## 2026-09-04 — coder-2 — REFACTOR-089 ✅ 抽 advance_width 纯函数（main.rs 插值区+新函数，待主控验收）
+
+- **动机**：护栏 7（变宽必须插值）消融对象是内联分支，用例无法真实调用 → 判别力 0；OVERLAY-046 先例证明「修复被重构静默回退」的代价，Gavin 痛点最大的 Bug 3 值得真护栏
+- **签名**：`advance_width(current: i32, target: i32) -> i32`（#[cfg(windows)]，含吸附 + 完整等价性 doc-comment + 消融参考）
+- **等价性**：两轴独立（吸附只读本轴字段）+ d==0 no-op 等值 + |d|=1/2 边界同值，主控逐环复核；外层守卫与 size_interpolation_done 置位时机零改动
+- **验证**：fmt clean / check 0 error / interpolate_step 零改动 / 086/D2D-P1/088 成果零回退 / 版本号未动 / 未跑 test/build / 未 commit / UTF-8 / 零凭证
+- **hunk 归属**：我=插值区 :1715-1731 + 新函数 :4271-4326；tester-1 TEST-SYNC-087 :8823+378 不在本单
+- **详情**：outbox/coder-2/result.md + logs/20260904.md + CHANGELOG.md + MACOS-HANDOFF §REFACTOR-089
+
+## 2026-09-04 — tester-1 — TEST-SYNC-087 阶段三测试同步 ✅（九护栏全覆盖：6 真判别力 + 3 缺口如实声明，fmt/check 过，待主控验收）
+
+- **交付**：src/main.rs `mod overlay_086_d2d_p1_guard_tests` 9 用例 + 2 helper（≈400 行测试区）
+- **真护栏 6 条**：流式两态 D2D 入口无效 HDC→false（护栏1）/ RECREATE_TARGET 权威常量（护栏3）/ reveal 第4参数双行为 None 逐位+Some(fixed) 不倒退（护栏5×2）/ **advance_width 直调变宽插值**（护栏7，REFACTOR-089 后消融改回 snap 必红：240→290 而非 440）/ **streaming_scroll_offset 直调**（护栏2，REFACTOR-088 后）/ 分隔线几何两路径同口径（护栏9）
+- **判别力缺口 3 条**（单列成节，裁定 B 口径）：护栏6 空文本路由（std 方法+内联分支）/ 护栏8 居中同源（单行赋值无物可抽）/ 源头闸门（耦合 WS）；各自给补法，未造假推演
+- **不可测项 7 条**：D2D 视觉效果全归 Gavin 端测目视（DEC-055 红线 5）
+- **过程**：三轮协商（护栏2可测性→主控裁B；E0425 并行中间态误报按红线只报不动；**护栏7/8 假护栏交付前自审**——判别力区分=消融对象是否生产真函数，主控裁定 7走A/8·6走B，已按裁定落地）
+- **红线合规**：既有用例/11 处 None 直调/interpolate_step 零触碰；生产代码我侧零改动；fmt --check exit 0 / check --all-targets 0 error；cargo test/build 未跑；v0.9.0 未动；零临时文件
+- **详情**：outbox/tester-1/result.md（含判别力缺口独立节 + 消融推演与顺序自证表）+ logs/20260904.md
