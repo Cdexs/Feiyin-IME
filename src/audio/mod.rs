@@ -2776,59 +2776,68 @@ mod tests {
         assert_eq!(empty_seen, 2, "空 chunk 必须被跳过但不得中断 drain");
     }
 
-    /// 验收④：500ms 超时放弃 —— 生产者持续灌包、消费者不封口时，drain 到点放弃，
-    /// 剩余积压归入 abandoned 计数（:326-331 第二段 while），松手后最坏 0.5s 返回。
-    /// 消融：若时间上限被删（改回纯数量/纯清空语义），本用例 elapsed 断言红
-    /// （循环会无限期跟随生产者）。
+    /// 验收④：慢消费 × 500ms deadline —— ASR 卡住（on_chunk 阻塞）时松手，
+    /// drain 到点即止：deadline 内消费到一部分（drained），剩余积压归 abandoned
+    /// 计数（:326-331 第二段 while），录音线程最坏 0.5s 脱身。
+    /// 生产真实路径建模：chunk_tx 是 crossbeam bounded 的**阻塞 send**（:305-308
+    /// 注释），deadline 真正被触发靠的是 on_chunk 慢（ASR 线程不消费 → send 等），
+    /// 而不是「生产者一直灌包让队列不空」——队列一空 :322 Empty → break，微秒级返回。
+    /// 故本用例不建活的生产者：松手瞬间预灌 200 个 chunk 后停止生产（对齐生产：
+    /// stop 信号一到 capture 侧即停灌），消费端每包 sleep(10ms) 模拟 on_chunk 阻塞。
+    /// 200×10ms = 2s ≫ 500ms → deadline 必然先于队列见底触发 → abandoned 有判别力。
+    /// 消融：删掉生产 :309 的时间上限（改回纯清空语义）→ 循环会把 200 个全消费完
+    /// → abandoned == 0 且 elapsed ≈ 2s，两条断言同红。
+    /// 本用例守的契约是「ASR 卡住时录音线程能在 0.5s 内脱身」，不是「drain 磨够 500ms」。
     #[test]
-    fn asr_074_stop_drain_gives_up_at_deadline_with_abandoned_count() {
+    fn asr_074_stop_drain_slow_consumer_abandons_backlog_at_deadline() {
         let (tx, rx) = crossbeam_channel::bounded::<AudioChunk>(256);
-        let producer = std::thread::spawn(move || {
-            // 持续灌包 900ms，保证 drain 期间队列始终有新积压
-            let end = Instant::now() + Duration::from_millis(900);
-            while Instant::now() < end {
-                let _ = tx.try_send((Instant::now(), vec![0.9f32; 160]));
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        });
+        // 松手瞬间的积压：一次性预灌 200 个非空 chunk，此后不再生产
+        for _ in 0..200 {
+            tx.send((Instant::now(), vec![0.9f32; 160])).unwrap();
+        }
 
-        // 等队列先积压起来再开始 drain，确保 drain 期间持续有积压可放弃
-        std::thread::sleep(Duration::from_millis(30));
-        let drain_deadline = Instant::now() + Duration::from_millis(500);
         let started = Instant::now();
+        let drain_deadline = started + Duration::from_millis(500);
         let mut drained: usize = 0;
         let mut abandoned: usize = 0;
         while Instant::now() < drain_deadline {
             match rx.try_recv() {
                 Ok((_ts, chunk)) if !chunk.is_empty() => {
+                    // 模拟 on_chunk 阻塞的慢消费（:305-308 ASR 卡住场景）
+                    std::thread::sleep(Duration::from_millis(10));
                     drained += 1;
                     let _ = chunk;
                 }
                 Ok(_) => continue,
-                Err(crossbeam_channel::TryRecvError::Empty) => continue,
+                // 与生产 :322-323 同构：队列见底/断开即提前收网
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => break,
             }
         }
-        // 超时后仍有积压 → 放弃并计数（与生产 :327-331 同构）
+        // 到点即止：剩余积压全部放弃并计数（与生产 :327-331 同构）
         while let Ok((_ts, chunk)) = rx.try_recv() {
             if !chunk.is_empty() {
                 abandoned += 1;
             }
         }
-        producer.join().unwrap();
+        drop(tx);
+
+        assert!(
+            drained > 0,
+            "deadline 内应消费到部分积压（慢消费也得救回头部音频）"
+        );
+        assert!(
+            abandoned > 0,
+            "慢消费下 deadline 必先于队列见底触发，剩余必须归 abandoned（放弃可观测）"
+        );
         assert!(
             started.elapsed() >= Duration::from_millis(500),
-            "drain 必须坚持到 deadline（救尾部音频）"
+            "deadline 必须真的被触发过（慢消费 200×10ms 远超 500ms）"
         );
         assert!(
             started.elapsed() < Duration::from_millis(1500),
-            "deadline 后必须放弃（松手最坏 0.5s 返回契约），实测 {:?}",
+            "到点后必须立刻放弃（松手最坏 0.5s 返回契约；第二段排空不计 sleep），实测 {:?}",
             started.elapsed()
-        );
-        assert!(drained > 0, "deadline 内应消费到部分积压");
-        assert!(
-            abandoned > 0,
-            "持续灌包场景下 deadline 后必有 abandoned（放弃可观测）"
         );
     }
 }

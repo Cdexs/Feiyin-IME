@@ -2997,20 +2997,24 @@ words = ["度", "摄氏度"]
     }
 
     // ITN-071-B 回归护栏：合法时间转换不受影响。
-    // 一点半 不在保护表（红线：绝不许加），check_protection 对"一点半"返回 None
-    // → try_parse_remainder_suffix 正常解析为 1点半。
+    // 一点半 不在保护表（红线：绝不许加）→ check_protection 返回 None
+    // → 走甲型时间族（format_remainder_suffix is_time 分支）→ 渲染为 "1:30"（DEC-037）。
+    // 与 :3456 "一点半"→"1:30"、:2630 "八点半"→"8:30" 同属一族既有护栏。
     // 消融：若误把一点半加进保护表，check_protection 返回 Some(3)
-    // → 一点半被跳过 → 输出"一点半"而非"1点半"，此用例变红。
+    // → 一点半被跳过 → 输出"下午一点半"而非"下午1:30"，此用例变红。
     #[test]
     fn itn_071b_legal_time_yidianban_still_converts() {
-        assert_eq!(normalize_test("下午一点半"), "下午1点半");
+        assert_eq!(normalize_test("下午一点半"), "下午1:30");
     }
 
     // ITN-071-B 回归护栏：一点十五分 仍正常转换。
-    // 一点十五分 不在保护表 → parse_cn_number + date_suffix 正常 → 1点15分。
+    // 一点十五分 不在保护表 → 走 unit chain 时间族（format_time_chain：
+    // unit=="点"→hours=1，unit=="分"→minutes=15）→ 渲染为 "1:15"（DEC-037）。
+    // 消融：若误把一点/十五分加进保护表 → check_protection 命中 → 输出
+    // 原文"一点十五分"而非"1:15"，此用例变红。
     #[test]
     fn itn_071b_legal_time_yidianshiwufen_still_converts() {
-        assert_eq!(normalize_test("一点十五分"), "1点15分");
+        assert_eq!(normalize_test("一点十五分"), "1:15");
     }
 
     // ============================================================

@@ -2,6 +2,30 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-09-04 — tester-1 — TEST-FIX-080 阶段三 ✅ 主控验收通过（代码 PASS，文档同步由主控回填）
+
+- **交付**：`+190/-42` 四文件，全部落在测试模块内（主控逐 hunk 核对行号：audio `mod tests` :1365 起／
+  itn :2533 起／main `overlay_075_d2d_guard_tests` :7970 起／`.test.tsx` 纯追加）。**生产代码零改动属实**。
+- **四条修正主控逐条对生产取证，全部成立**：①② ITN 时间族 —— `format_remainder_suffix` :1711-1729
+  与 `format_time_chain` :1381-1398 实证 `H:MM`，同族既有护栏 :3460／:2630／:3549 三处佐证；
+  ③ audio drain 重写 —— 旧用例 `Err(Empty)=>continue` 与生产 :322 `break` 不同构，`abandoned`
+  结构性不可达；新用例慢消费建模对齐生产「deadline 靠 on_chunk 阻塞触发」；④ main.rs 消费序 ——
+  生产 :3996-4013 实证「代际闸门 → 写镜像 → 043 仅裁渲染」，旧断言与自身闭包矛盾。
+- **5 条 tsx 护栏**：所引生产行号 :160/:353/:369/:373/:387/:408 主控 `sed` 逐处核对全部对上。
+  T3 拆 T3a（泄漏探针，删清 pending 行会红）+ T3b（正向回归）的判断主控复核认可，断言粒度不降反升。
+- **主控独立验证**（验收上限内，未跑 test）：`cargo fmt --check` exit 0 ／
+  `cargo check --all-targets` **0 error** ／ `npx tsc --noEmit` **0 error**。
+- 🔴 **文档同步 3/5 缺，主控回填**：只写了 `logs/20260904.md`；CHANGELOG／handoffs／todo
+  `grep` 零命中（`progress.md` 按其规则 7「测试同步任务不记录」判 **N/A**，不算漏）。
+  `[DOC-STATE-DRIFT-001]` 第四次复发。叠加 Worker 重启把 `outbox/tester-1/result.md` 清成 0 字节
+  （`[REPLACE-WORKER-TASKFILE-WIPED-001]`），**收尾自证表无从核对** —— 已把「五文档逐条打钩」
+  写进阶段四任务书的完成判据，不再只靠通用规则。
+- **结论复述**：ITN-071-B 生产修复是好的，`一点半点`／`一点点` 两条保护用例都绿，
+  **不存在「071-B 没修彻底」**。红的只是两条护栏的期望值笔误。
+
+---
+
+
 ## 2026-09-03 — coder-2 — HOTKEY-060 收尾补账 ✅（代码已在 9506eac/e7a6a29，本次零代码，待主控验收）
 
 - **来源**：主控派单 Part A。08-30 主控 `git add -A` 误扫入 ITN 提交，未走验收流程，本次补齐账目

@@ -1,56 +1,71 @@
 # 任务列表 · voice-ime
 
-## 🔴 2026-09-03 夜 —— 当前状态（session 重启后接棒，最新在最上）
+## 🔴 2026-09-04 —— 当前状态（最新在最上）
 
-### 已完成并提交
+### 阶段三 TEST-FIX-080 ✅ 主控验收通过（tester-1）
 
-| 提交 | 内容 |
-| --- | --- |
-| `eb9056d` | **SECRET-077** DeepSeek key 明文处置 + `pre-commit` 密钥闸门（Gavin 授权，零生产代码） |
+- 四条错测试修正 + 5 条 AltGr 护栏，`+190/-42` 全在测试模块内，**生产代码零改动**（逐 hunk 行号核对）
+- 主控独立验证：`cargo fmt --check` exit 0 ／ `cargo check --all-targets` **0 error** ／ `npx tsc --noEmit` **0 error**
+- 详情见 CHANGELOG.md TEST-FIX-080 ／ handoffs.md 2026-09-04 ／ logs/20260904.md
+- 🔴 tester-1 漏更 CHANGELOG／handoffs／todo 三处（`[DOC-STATE-DRIFT-001]` 第四次复发），**已由主控回填**；
+  `progress.md` 按其规则 7「测试同步任务不记录」属 N/A，不算漏。
+  阶段四任务书已把「五文档逐条打钩」写进**完成判据**，不再只靠通用规则。
 
-### 待 Gavin 亲自处理（主控无权限）
+### ✅ Gavin 已处理：DeepSeek key 已吊销（2026-09-04）
 
-1. 🔴 **去 DeepSeek 后台吊销泄露的 key** —— 主控已把仓库内明文换成占位符，
-   但 key 已在 `f58af96` 历史里且 push 到公网，**删文件不等于止血，吊销才是**。
-2. **是否授权重写 git 历史 + force push** 清除历史痕迹 —— 破坏性操作，未获授权不执行；
-   在第 1 项完成后它只是卫生问题，不是安全问题。
-3. **LLM 401 是否已解决** —— 新 key 生成后需确认 LLM 可用，否则 FMT-072 出包也验不了。
-4. **每个新 clone 需执行一次**：`git config core.hooksPath scripts/git-hooks`（钩子本体已入库不会丢）。
+**SECRET-077 止血完成。** 泄露的 key 已在服务商后台吊销 —— 这是唯一的真止血，
+`f58af96` 历史里的明文从此是**失效字符串**，不再是安全问题。
 
-### TEST-EXEC-076 五条 FAIL —— 主控已逐行 Read 生产代码裁定完毕
+剩余两项**降级为卫生/可用性问题，不再阻塞**：
 
-| # | 用例 | 裁定 | 归属 |
+1. 是否重写 git 历史 + force push 清除痕迹 —— 破坏性操作，**未获授权不执行**，Gavin 说了算。
+2. **LLM 401 是否已解决** —— 新 key 配上后需确认 LLM 可用，否则 FMT-072「有序列举格式化失败」
+   出包端测时仍验不了（该项真因就是 LLM 根本没调用成功，不是格式化逻辑坏了）。
+3. 每个新 clone 需执行一次：`git config core.hooksPath scripts/git-hooks`（钩子本体已入库不会丢）。
+
+### 下一棒顺序（五阶段串行，禁止并行）
+
+```
+阶段三 TEST-FIX-080   ✅ 已验收
+阶段四 TEST-EXEC-081  ← 当前，全量回归（tester-1）
+阶段五 BUILD v0.9.0      测试无明显问题后主控下达「现在可以出包」
+       → Gavin 端测
+```
+
+**coder-1 / coder-2 阶段四期间保持待命**：工作区躺着未提交的测试改动，
+任何人动 `src/main.rs`／`src/audio/mod.rs`／`src/itn.rs` 都会污染回归结果。
+
+🔴 **出包后必须 Gavin 目视确认**：处理中态 overlay 的**文字与圆角边沿是否变细腻**
+（DEC-055 红线 5，不接受静态论证结案）。他说达标才继续迁剩余五个状态；不达标则 D2D 方向需重议。
+
+### TEST-EXEC-076 五条 FAIL —— 处置全部闭环
+
+| # | 用例 | 处置 | 状态 |
 | --- | --- | --- | --- |
-| ① | `itn_071b_legal_time_yidianban_still_converts` | 改测试：期望应为「下午1:30」（DEC-037 时间族固定 `H:MM`） | 待派 tester-1 |
-| ② | `itn_071b_legal_time_yidianshiwufen_still_converts` | 改测试：期望应为「1:15」 | 待派 tester-1 |
-| ③ | `asr_074_stop_drain_gives_up_at_deadline_with_abandoned_count` | 改测试（设计缺陷）：自建循环 `Empty=>continue` 偏离生产 `Empty=>break`，abandoned 结构性不可达 | 待派 tester-1 |
-| ④ | `stale_generation_must_not_touch_mirror_and_stopped_gate_is_orthogonal` | 改测试：末条断言与自己的闭包自相矛盾；生产「代际闸门→写镜像→043 闸门」的顺序是刻意的 | 待派 tester-1 |
-| ⑤ | `HOTKEY-047-S12` | 🔴 **真生产缺陷，改生产**（AltGr 尾随 keyup + async 重入窗口） | **HOTKEY-078 已派 coder-2** |
+| ① | `itn_071b_legal_time_yidianban_still_converts` | 改测试 → `下午1:30` | ✅ TEST-FIX-080 |
+| ② | `itn_071b_legal_time_yidianshiwufen_still_converts` | 改测试 → `1:15` | ✅ TEST-FIX-080 |
+| ③ | `asr_074_stop_drain_...abandoned_count` | 改测试（整条重写，慢消费建模） | ✅ TEST-FIX-080 |
+| ④ | `stale_generation_must_not_touch_mirror...` | 改测试（改名 + 末条期望修正） | ✅ TEST-FIX-080 |
+| ⑤ | `HOTKEY-047-S12` | **真生产缺陷，改生产** | ✅ HOTKEY-078（+ 079 翻译侧同型） |
 
-**①② 的关键事实**：生产零 bug，ITN-071-B 的两条保护用例（一点半点／一点点）是 PASS 的。
-红的只是 coder-1 顺手写的两条回归护栏，期望值凭直觉写成「1点半」，
-与既有十余条 `X点半→X:30` 护栏（itn.rs:3456／3720-3726／3757／3934）冲突。
+**①② 的关键事实（别再翻）**：生产零 bug，ITN-071-B 的两条保护用例（一点半点／一点点）都是 PASS 的。
+红的只是顺手写的两条回归护栏，期望值凭直觉写成「1点半」，与既有十余条 `X点半→X:30` 护栏冲突。
 
 **④ 的语义裁定（重要，别再翻）**：代际闸门 = 数据+渲染双拦；043 闸门 = **仅渲染**。
 同 session 松手后的迟来包是同一句话的更完整版本，**必须**进 `last_streaming_text` 镜像，
 否则 WORDBOOK-053-B 会拿截断的 raw 文本去 diff 用户编辑，学出用户从未做过的伪修正。
 **渲染抑制 ≠ 数据抑制。**
 
-### 下一棒顺序（五阶段串行，禁止并行）
-
-阶段一 **HOTKEY-078**（coder-2，在途）→ 阶段三 **TEST-FIX-079**（tester-1，改 ①②③④ 四条测试）
-→ 阶段四 全量回归 → 阶段五 **BUILD v0.9.0** → Gavin 端测。
-
-🔴 出包后必须 Gavin 目视确认：处理中态 overlay 的**文字与圆角边沿是否变细腻**（DEC-055 红线 5）。
-
 ### 已结案（不要重查）
 
 - **行尾幻影**：coder-2 上报的「69 文件 18K 行 CRLF 漂移」= racy-git 的 index stat 缓存过期，
-  一次 `git status` 刷新即自愈。已复核：`git diff --stat` 与 `git diff -w --stat` 逐字相同。
-  裁定 `core.autocrlf=true` **不动**（改它会真的重写全仓行尾）。
+  一次 `git status` 刷新即自愈。裁定 `core.autocrlf=true` **不动**。
+- **OVERLAY-061 冷启动假设**：❌ **证伪**（COLD 3199 帧 + WARM 9831 帧 = 13030 帧，可见态位置异常
+  零命中）。061 不是 overlay 窗口的问题，下一步是 REPRO-061-ALLWIN 全窗口清扫（任务书未写）。
+- **068 宽度阶梯归属**：`y≈1292 ∧ h=36` 的宽度阶梯族**属 068 不属 061**，两 bug 不得互相污染。
+- **068-B 覆盖面**：**不返工**。拉锯真源是跨 session 渗漏，已由 OVERLAY-075 结构性根治。
 
 ---
-
 
 ## ✅ 2026-09-03 收工状态 —— 下一棒从这里开始
 

@@ -8007,14 +8007,21 @@ mod overlay_075_d2d_guard_tests {
         );
     }
 
-    /// OVERLAY-075 验收②：闸门位于词库镜像之前的**顺序契约**。
-    /// 生产代码 :3996-4008 的顺序是：先判 gen 不匹配 continue（不落镜像），
-    /// 匹配才写 last_streaming_text 镜像。本用例用与生产同构的执行序模拟：
-    /// 陈旧包必须**跳过镜像写入**，且 STREAMING_STOPPED 闸门独立于代际闸门。
-    /// 消融：若把镜像移到代际判断之前（污染缺陷回归），本用例的 mirror_after_stale
-    /// 断言红；若把代际闸门删掉（OVERLAY-075 前旧实现），stale 消费断言红。
+    /// OVERLAY-075 验收②：闸门位于词库镜像之前的**顺序契约** + 043 门闩「仅渲染」边界。
+    /// 生产代码 :3996-4013 的顺序是：先判 gen 不匹配 continue（不落镜像），
+    /// 匹配才写 last_streaming_text 镜像，043 门闩（should_ignore_streaming_text）
+    /// 在镜像**之后**才裁决渲染。本用例用与生产同构的执行序模拟。
+    /// 代际闸门与 043 门闩的职责边界（TEST-FIX-080 主控裁定）：
+    /// **代际闸门 = 数据 + 渲染双拦**（跨 session，内容与本 session 无关，
+    /// 所以必须挡在词库镜像之前 —— OVERLAY-075 实施时把闸门从镜像后移到镜像前，正是为这个）；
+    /// **043 门闩 = 仅渲染**。同 session 松手后的迟来包是**同一句话的更完整版本**，
+    /// 必须进 `last_streaming_text` 镜像 —— 否则 WORDBOOK-053-B 会拿被截断的 raw 文本
+    /// 去 diff 用户的编辑，学出一堆用户从未做过的「伪修正」。**渲染抑制 ≠ 数据抑制。**
+    /// 消融：若把代际闸门移到写镜像之后（OVERLAY-075 前旧序），mirror_after_stale
+    /// 断言红（陈旧包污染镜像）；若把 043 门闩改成数据抑制（吞包不落镜像），
+    /// mirror_after_late 断言红（053-B 拿不到完整 raw 文本，学出伪修正）。
     #[test]
-    fn stale_generation_must_not_touch_mirror_and_stopped_gate_is_orthogonal() {
+    fn generation_gate_blocks_mirror_but_043_gate_is_render_only() {
         let mirror: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let mirror_clone = Arc::clone(&mirror);
 
@@ -8052,8 +8059,8 @@ mod overlay_075_d2d_guard_tests {
             "OVERLAY-075 核心：陈旧 session 的 finalize 拖尾不得污染 last_streaming_text 镜像"
         );
 
-        // STREAMING_STOPPED 与代际正交：同 session + stopped=true → 043 门闩吞掉，
-        // 但这是"同 session 松手"语义，代际仍匹配（不得与陈旧包混为一谈）
+        // 043 门闩正交段：同 session + stopped=true → 渲染被抑制，
+        // 但迟来包是同一句话的更完整版本，镜像**必须**更新（渲染抑制 ≠ 数据抑制）
         STREAMING_STOPPED.store(true, Ordering::Release);
         let ignored_same_session = consume(session, "松手后迟来包");
         assert!(
@@ -8062,8 +8069,8 @@ mod overlay_075_d2d_guard_tests {
         );
         assert_eq!(
             mirror.lock().unwrap().as_deref(),
-            Some("本session文本"),
-            "043 门闩吞掉的包也不得改镜像（镜像更新在门闩之前，但被 043 continue 跳过渲染不影响镜像语义）"
+            Some("松手后迟来包"),
+            "043 门闩只拦渲染：镜像更新在门闩之前且不受门闩影响 —— 迟来包是同句话的更完整版本，053-B 需要完整 raw 文本"
         );
         STREAMING_STOPPED.store(false, Ordering::Release);
     }
