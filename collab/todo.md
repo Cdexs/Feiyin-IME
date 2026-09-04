@@ -23,6 +23,34 @@
    出包端测时仍验不了（该项真因就是 LLM 根本没调用成功，不是格式化逻辑坏了）。
 3. 每个新 clone 需执行一次：`git config core.hooksPath scripts/git-hooks`（钩子本体已入库不会丢）。
 
+### 在途任务（2026-09-04）
+
+| Worker | 任务 | 阶段 | 状态 |
+| --- | --- | --- | --- |
+| tester-1 | **TEST-EXEC-081** 全量回归 | 阶段四 | 已 ACK，执行中 |
+| coder-1 | **SECRET-082** pre-push 密钥/隐私闸门 + 修 `.gitattributes` CRLF 隐患 | 独立基建 | 已派发 |
+| coder-2 | — | — | 待命（回归期间不得动 src/ 与 ui/） |
+
+**边界评估**：tester-1 占 `src/**`、`ui/**`；coder-1 只碰 `scripts/git-hooks/**` + `.gitattributes`
++ troubleshooting/worker-guide 文档。**文件级零重叠**，可并行。
+
+#### SECRET-082 的由来（Gavin 2026-09-04 问「push 会扫吗」）
+
+主控查证结论：**不会。闸门在 commit，不在 push。**
+`core.hooksPath=scripts/git-hooks` 已生效，但目录里只有 `pre-commit` 一个文件，
+`.git/hooks` 无自定义钩子 —— **push 这一步是裸奔的**。
+
+两个缺口：① 只认密钥形态（`sk-`/`ghp_`/`AKIA`/`AIza` 等），**邮箱/手机号/身份证一概不拦**；
+② 只在 voice-ime 仓库生效，CodeLab 下其他仓库没配。
+
+**附带发现的真隐患（一并修）**：`core.autocrlf=true` + 无 `.gitattributes`
+→ 新 clone 会把钩子脚本检出成 CRLF → `bad interpreter: ^M` → **钩子静默失效**。
+当前机器工作区副本恰好还是 LF 所以没暴露，但任何人新 clone 一次闸门就是坏的。
+
+**硬性前提（已取证）**：`origin/main..HEAD` 25 个待推提交，密钥/邮箱/手机号/身份证命中 **全 0**；
+`f58af96`（泄露那个提交）**已在 origin/main 内**，不落待推范围 —— 这是设计如此，
+否则它会让此后每一次 push 被永久拦死。装完钩子 `git push --dry-run` 必须放行。
+
 ### 下一棒顺序（五阶段串行，禁止并行）
 
 ```
