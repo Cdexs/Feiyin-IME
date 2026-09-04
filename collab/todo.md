@@ -64,6 +64,66 @@
 `f58af96`（泄露那个提交）**已在 origin/main 内**，不落待推范围 —— 这是设计如此，
 否则它会让此后每一次 push 被永久拦死。装完钩子 `git push --dry-run` 必须放行。
 
+### 🔴 D2D 迁移排期（Gavin 2026-09-04 指示：「尽快完成迁移到 D2D」）
+
+**前置已达成**：Gavin 端测处理中态后原话「**整体效果满意**」= DEC-055 红线 5
+（视觉必须目视确认）**已过**，D2D-073-P0 试点验收通过，方向确认可继续。
+遗留的圆角灰线瑕疵走 OVERLAY-086 Bug 1，**不阻塞后续迁移**。
+
+#### 剩余待迁状态（`draw_overlay_to_dc` 共 8 个分支，已迁 1）
+
+| # | 状态 | 现状 | 备注 |
+| --- | --- | --- | --- |
+| — | `Processing` | ✅ **已迁**（D2D-073-P0） | 保留 GDI 兜底，Gavin 已目视确认 |
+| 1 | `RecordingWithText` | GDI | 🔴 **优先级最高**：流式文字上屏，OVERLAY-062「字体粗糙」的正主；且 OVERLAY-086 Bug 2/3 都在这条路径上 |
+| 2 | `Recording` | GDI | 录音态 + 波形；OVERLAY-065 动态麦克风图标的地基 |
+| 3 | `RecordingStreamingIdle` | GDI | 与 1 同族，建议同批 |
+| 4 | `FallingToProcessing` | GDI | 过渡态，与 Processing 相邻，建议紧跟 Processing 之后 |
+| 5 | `StreamingEditing` | GDI | ⚠️ 只迁 chrome + 提交按钮；**EDIT 子控件本体不许动**（DEC-055 红线 2） |
+| 6 | `FocusLost` | GDI | 含复制/关闭按钮 |
+| 7 | `Error` | GDI | 最简单，可与其他批搭车 |
+
+#### 🔴 排期约束（DEC-055 红线 4：禁止一次全改）
+
+**必须分批灰度，每批出包后 Gavin 目视确认再开下一批**，理由：一次全改则回归归因不可能。
+
+建议分三批：
+
+| 批次 | 内容 | 理由 |
+| --- | --- | --- |
+| **P1** | `RecordingWithText` + `RecordingStreamingIdle` | 用得最多、Gavin 感知最强；与 OVERLAY-086 同路径，**必须等 086 落地后再动，否则文件冲突** |
+| **P2** | `Recording` + `FallingToProcessing` + `Error` | 录音态打通后 OVERLAY-065 动态图标才有地基 |
+| **P3** | `StreamingEditing` + `FocusLost` | 按钮/交互最多，放最后 |
+
+#### 🔴 派发前必须先做的两件事（否则 P1 开不了工）
+
+1. ~~`Cargo.toml` 补 feature~~ ✅ **已核查完毕（主控 2026-09-04 实读，非照抄附录）**
+   —— DEC-055 实施附录写的「Direct2D / DirectWrite 一个都没有」是 **08-30 快照，已过期**。
+   D2D-073-P0 那批已补齐四个：`Win32_Graphics_Direct2D` / `_Direct2D_Common` /
+   `_Dxgi_Common` / `_DirectWrite`，均在 `[target.'cfg(target_os = "windows")'.dependencies]`
+   段内（天然不影响 macOS 构建）。**P1/P2/P3 走 BindDC 路线无需再加 feature，不构成依赖变更。**
+   ⚠️ 唯一例外：若将来改走 `UpdateLayeredWindow` + DXGI 表面（per-pixel alpha），
+   需补 `Win32_Graphics_Dxgi` + `Win32_Graphics_Direct3D11` —— 那才是依赖变更，
+   按 worker-guide 第十节**必须派 BUILD 给 tester-1**，coder 不得自行构建。
+
+2. **抽出 P0 的可复用地基**
+   —— 当前 `d2d` 模块只有 `draw_processing_overlay` 一个函数 + 一套 `D2dResources`。
+   迁 7 个状态前应先评估：`create_resources` / `BindDC` / 画刷 / 文本格式
+   要不要抽成共用层。**这是架构决策，派发前主控给方案，不许 Worker 边写边攒。**
+
+#### 顺带一并解决的既有缺口
+
+| ID | Gavin 原话 | 依赖哪一批 |
+| --- | --- | --- |
+| OVERLAY-062 | 编辑态文字粗糙、提交按钮边沿粗糙 | P3（StreamingEditing） |
+| OVERLAY-065 | 替换左侧麦克风图标为动态图标 | P2（Recording）打通后另开单 |
+| OVERLAY-069 | 窗口关闭要流畅丝滑，不要生硬突然关闭 | P2/P3 之后另开单（淡出动画） |
+
+#### 当前阻塞
+
+**P1 必须等 OVERLAY-086 完成**：086 改的 `RecordingWithText` 绘制路径与宽度插值，
+与 P1 是同一批代码。两个任务同时开 = 文件级冲突，违反边界评估规则。
+
 ### 下一棒顺序（五阶段串行，禁止并行）
 
 ```
