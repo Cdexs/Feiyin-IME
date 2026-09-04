@@ -727,3 +727,4 @@ REFACTOR-089 | 抽出 advance_width 纯函数（尺寸插值单轴单帧推进�
 TEST-SYNC-087 | OVERLAY-086+D2D-P1 阶段三：9 用例覆盖任务书九护栏（6 条真判别力：D2D 入口回落×2态/reveal 第4参双行为/advance_width 变宽插值直调/scroll_offset 直调/分隔线几何；3 条判别力缺口如实声明给补法）+ 不可测项 7 条单列；REFACTOR-088/089 抽函数后护栏2/7升级真护栏；三轮方案协商；fmt/check 白名单内全过 | tester-1 | 2026-09-04
 TEST-FIX-091 | 修 TEST-SYNC-087 护栏 4 处（分隔线同坐标系比对 / reveal 反例同字数 begin变小三角窗口 / advance_width 收窄660 / 删重复#[test]），两处二次修正后全绿 | tester-1 | 2026-09-05
 TEST-EXEC-092 | 阶段四回归收口：root 1061P/0F/11I（2条D2D用例#[ignore]挂死项D2D-HANG-001 Gavin授权跳过）+ src-tauri 76P + vitest 89P 全绿；消融按Gavin拍板跳过 | tester-1 | 2026-09-05
+BUILD-093 | v0.9.0 出包：五批累积改动（OVERLAY-086/D2D-P1/REFACTOR-088/089/护栏）进 exe，七项核验全过（sha 全异于 085、ProductVersion 0.9.0.0、探针 D2D-P1×2+D2DERR_RECREATE_TARGET×1）；E2E 64P/1F（toggle_stop 间歇性 FAIL，主控裁定不阻塞出包列为端测重点）；冒烟无 panic；运行时数据零覆盖 | tester-1 | 2026-09-05

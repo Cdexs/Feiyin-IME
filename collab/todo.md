@@ -1,5 +1,13 @@
 # 任务列表 · voice-ime
 
+## 🔴 2026-09-05 —— 当前状态（最新在最上）
+
+### ✅ 阶段五 BUILD-093 已出包（tester-1，2026-09-05 00:37）—— 待 Gavin 端测
+
+- **BUILD-093**：BUILD-085 后五批（OVERLAY-086/D2D-P1/REFACTOR-088+089/测试护栏）进 exe，七项核验全 PASS（sha 全异于 085、ProductVersion 0.9.0.0、探针 D2D-P1×2+D2DERR_RECREATE_TARGET×1）；E2E 64P/**1F**（test_hotkey_toggle_stop 间歇性 FAIL，主控裁定不阻塞出包）；冒烟无 panic；产物在 `Publish/`
+- **Gavin 端测清单**（主控已列）：①宽度扩展丝滑度 ②流式空窗口（开嗓瞬间）③处理中圆角灰线 ④D2D 文字/边沿细腻度 ⑤语音热键录 AltGr ⑥文字超屏宽 65% 省略号行为变更 ⑦**toggle 连按两次能否正常停**（E2E 间歇 FAIL 的实机验证点）
+- **D2D-HANG-001**：NULL HDC 调 D2D 挂死（CreateDCRenderTarget 之后），Gavin 授权跳过出包阻塞；P0 待办，疑与端侧托盘退出无响应同源
+
 ## 🔴 2026-09-04 —— 当前状态（最新在最上）
 
 ### ✅ 阶段四 TEST-EXEC-081 收口（tester-1）—— 全量回归通过 + TEST-FIX-084 注释改正完成，等主控出包指令

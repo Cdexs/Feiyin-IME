@@ -288,3 +288,12 @@
 - **回归**：root **1061P/0F/11I**（1054+9=1063，2 ignore→1061+11 对账）、src-tauri 76P、vitest 89P；两 REFACTOR 等价性判据全绿；消融 A/B 按 Gavin 拍板跳过
 - **红线**：生产零改动（diff 仅测试模块）、v0.9.0 未动、未 commit、无残留进程、临时文件已删
 - **详情**：outbox/tester-1/result.md + logs/20260904.md
+
+## 2026-09-05 — tester-1 — BUILD-093 v0.9.0 出包 ✅（七项核验全过 + E2E 64P/1F 间歇 toggle_stop，主控裁定出包）
+
+- **构建**：Step 1-4 顺序完整（npm 654ms → Tauri UI 1m43s → 主程序 2m12s → cp+toml 三副本）
+- **核验**：①时间戳 09-05 ②sha256 三对相等且全异于 085（e6f55e0a/7651fd4e/0131ff55）③toml 三副本一致 ④ProductVersion 0.9.0.0 ⑤探针 D2D-P1×2+D2DERR_RECREATE_TARGET×1+index-CJ1JUYoT.js ⑥大小同量级 ⑦冒烟 PID 21680 Responding 无 panic
+- **冒烟退出响应性**：CloseMainWindow=False 是 tray 无主窗口正常现象，非挂死；D2D-HANG-001 未复现
+- **E2E**：64P/1F/33S。FAIL=test_hotkey_toggle_stop（**间歇性**：全量 FAIL、单跑 PASS/FAIL/PASS 交替）——第二次 F9 后 5s 内未离 recording。归因方向：OVERLAY-086 状态迁移 / D2D 绘制阻塞（D2D-HANG-001 关联）/ cold-start 时序残余。**主控裁定不阻塞出包，列为 Gavin 端测重点（toggle 连按两次）**
+- **红线**：生产/测试零改动、v0.9.0 未动、运行时数据零覆盖、config.toml sha 3186ec8c 字节级无污染、临时文件已删
+- **详情**：outbox/tester-1/result.md + logs/20260904.md
