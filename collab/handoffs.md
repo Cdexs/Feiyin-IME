@@ -202,3 +202,20 @@
 **实测**：A1-A4 拦 / B1-B3 放 / C1-C5 / D / E / F 本仓 dry-run 全绿（C3 根提交+密钥被拦，C4 根提交干净放行，C5 无效 sha fail-closed）
 **协作文档**：troubleshooting 新开 [HOOK-FAIL-OPEN-001] + logs + CHANGELOG + handoffs
 **临时仓库**：测完 rm -rf 已删
+
+## 2026-09-04 — tester-1 — TEST-EXEC-081 阶段四全量回归 ✅（1054/76/89 逐位吻合，消融A偏差裁定后收口）
+
+- **Step 1**：root 1054P/0F/9I（4 条修红转绿，与模型一致）；src-tauri 76P 持平
+- **必查 A**：四条逐条转绿，两个新名生效（旧名 gives_up…/stale_generation… 零命中）
+- **必查 B**：挂钟用例 5/5 绿（0.50/0.50/0.51/0.50/0.51s，deadline 闸门 ~500ms 生效）
+- **必查 C**：S12 红转绿 + T1/T2/T3a/T3b/T4b 五条新护栏全绿（vitest 89P/0F）
+- **消融 B**：079 撤销 → T1 变红（received 0xA2）预期命中；**消融 A**：078 撤销 → T4b 仍绿、S12 变红（弹窗显示 Left Ctrl = 原始症状精确复现）→ 停手报告 → **主控裁定归因成立**（清旗在 altGrSynthWasActive 捕获之后），判红基准改 S12，**本体验收通过**
+- pytest 系列按任务书 SKIP（Publish/ 为 08-18 旧包，E2E 门禁挪阶段五出包后）
+- 两处消融均还原，`git diff -w` 0 字节；详情 outbox/tester-1/result.md + logs/20260904.md
+
+## 2026-09-04 — tester-1 — TEST-FIX-084 T4b 消融注释改正 ✅（阶段四收口）
+
+- **改动**：`ui/src/pages/HotkeySettings.test.tsx` T4b 消融注释 +5/-3 仅注释（结构性不红事实 + 078 判别力由 S12 承担 + T4b 保留职责守 ControlLeft 先抬半边矩阵）；it() 断言/键序/用例名零触碰
+- **另 4 条复核**：T1/T2/T3a/T3b 消融推演事件顺序 vs 用例 fireEvent 顺序逐条核对全部成立（T3a 的 :160/:408/:529 行号核实、T3b 自陈「删 :160 仍绿」推演正确），零凑数改动
+- **验证**：tsc 0 error（白名单内）；未跑 npm/cargo test；未 commit；v0.9.0 未动
+- **详情**：outbox/tester-1/result.md + logs/20260904.md

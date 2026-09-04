@@ -716,3 +716,5 @@ echo "appended"
 | SECRET-082 | pre-push 密钥/隐私闸门 + 修 pre-commit CRLF 静默失效隐患（共享模式表抽离、隐私组+白名单、.gitattributes 强制 LF） | coder-1 | 2026-09-04 |
 
 | SECRET-082-FIX | pre-push 根提交无父静默放行（空树 base + rev-parse --verify）+ fail-open→fail-closed（pre-push/pre-commit） | coder-1 | 2026-09-04 |
+TEST-EXEC-081 | 阶段四全量回归：root 1054P/0F、src-tauri 76P、vitest 89P/0F 全部与预期逐位吻合；必查A四条转绿（新名生效）、必查B挂钟5连绿(0.50-0.51s)、必查C六条全绿(S12红转绿)；消融B(079/T1)变红预期命中，消融A停手报告→主控裁定归因成立、判红基准改S12（护栏判别力由S12证实）；pytest按任务书SKIP(旧包)；两处消融还原git diff -w=0字节 | tester-1 | 2026-09-04
+TEST-FIX-084 | T4b消融注释改正（+5/-3仅注释，it()零触碰）——结构性不红事实+078判别力由S12承担+T4b保留职责；另4条(T1/T2/T3a/T3b)消融推演逐条复核全部成立零改动；tsc 0 error；阶段四收口 | tester-1 | 2026-09-04

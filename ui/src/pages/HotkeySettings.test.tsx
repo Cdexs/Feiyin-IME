@@ -323,9 +323,13 @@ describe('HotkeySettingsPage - HOTKEY-078/079 AltGr 键序矩阵', () => {
   // ControlLeft keyUp :297-300 旗在 → 只清 pressedMods 即 return（不定案、不清旗）；
   // AltRight keyUp :304 读旗 → :323 altGrSynthWasActive=true 压制 0x0002 → modifiers=0
   // → checkAndApplyVoiceHotkey(0xA5, 0)。
-  // 消融（HOTKEY-078 撤销）：把删掉的提前清旗三行加回 → ControlLeft keyUp 时旗已 false
-  // → AltRight keyUp 时 altGrSynthWasActive=false → e.ctrlKey=true && !isAltGrUp
-  // → modifiers|=0x0002 → 录成 Ctrl+Right Alt → 断言 modifiers=0 红（且可能双定案）。
+  // 消融（撤销 HOTKEY-078，把删掉的提前清旗三行加回）：**本用例不会红，这是结构性的**——
+  // 三行的位置在 `const altGrSynthWasActive = ...` 捕获**之后**（见 git show 38cc809），
+  // 而本用例键序 ControlLeft 先抬、AltRight keyUp 是末事件：捕获时旗仍为 true，
+  // modifiers 照样是 0，其后再无 ControlLeft keyUp 让清旗产生可观测后果。
+  // 078 的判别力由 **HOTKEY-047-S12** 承担（AltRight 先抬 + 尾随合成 Ctrl keyUp）：
+  // 撤销三行后 S12 变红，弹窗显示 Left Ctrl，精确复现 078 原始症状 —— TEST-EXEC-081 实测。
+  // 本用例守的是另一半矩阵：ControlLeft 先抬这条路径产出 0xA5/modifiers=0 且只 finalize 一次。
   it('HOTKEY-078-T4b: 语音侧 AltGr（ControlLeft 先抬）→ Right Alt modifiers=0', async () => {
     const { container, updateConfig } = renderPage();
     const rec = startRecording(container);
