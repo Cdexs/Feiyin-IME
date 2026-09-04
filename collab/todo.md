@@ -162,6 +162,44 @@ OVERLAY-086（三缺陷）
 - `Hide` 分支现有的两条保护不许破坏：ASR-038-C（编辑态不许拆 EDIT 控件）、
   OVERLAY-054-A（`RestoreAndHide` 显式允许拆）
 
+### 🎨 per-pixel alpha 改造（DEC-056，Gavin 2026-09-04 拍板）
+
+Gavin：「效果一定好，视觉体验一定要棒，这关乎到用户体验，现在硬件性能很强大」。
+**视觉是产品目标，不是性能预算的余数。** DEC-055 补充二「帧率 < 30fps 才换路线」判据**已作废**。
+
+🔴 **主控原先把这条路线定性错了**：它不是性能优化，是**视觉能力的天花板**。
+`LWA_ALPHA` 整窗统一透明度下，圆角要么留背景楔形（= OVERLAY-086 Bug 1 本体），
+要么被 `SetWindowRgn` 二值掩码切成硬阶梯（= DEC-055 要消灭的「粗糙」）。
+**两条路都到不了「棒」，与帧率无关，再快的机器也解不开。**
+
+#### 顺序是硬的，不可调换
+
+```
+OVERLAY-086      → Bug 1 只能做到「消除楔形」，圆角仍非真抗锯齿（已通知 coder-2 下调目标）
+D2D P1/P2/P3     → 八状态全迁完，GDI 绘制清零
+per-pixel alpha  → UpdateLayeredWindow 改造        ← Bug 1 的彻底解
+OVERLAY-065/069  → 动态图标 / 收缩淡出
+```
+
+🔴 **为什么必须等 D2D 全迁完**：GDI 绘制函数（含 `DrawTextW`）不维护 alpha 通道，
+会把写过的像素 alpha 置 0，在 `UpdateLayeredWindow` 合成时**该区域整块透明消失**。
+残留一处 GDI 绘制，整个 per-pixel alpha 改造就是坏的。
+
+**这给「尽快完成 D2D 迁移」加了一条新理由**：它不再只是为了字更清楚，
+而是 per-pixel alpha 的**前置条件**。迁移不完成，视觉天花板打不破。
+
+#### 派发前待实证（勿凭推断直接派）
+
+主控倾向判断**可能不需要新增 Cargo feature**（32bpp DIB section +
+`ID2D1DCRenderTarget` 以 `ALPHA_MODE_PREMULTIPLIED` 绑其 DC + 全程 D2D 绘制 +
+`UpdateLayeredWindow`，现有 Direct2D/DirectWrite 已足够）。
+**但这是推断不是实证**，派发前必须实测；若确需新增 feature 属依赖变更，
+按 worker-guide 第十节必须派 BUILD 给 tester-1。
+
+#### 验收判据（DEC-055 红线 5 沿用，且更明确）
+
+**圆角边缘在浅色背景上不得看出阶梯或色块** —— 必须 Gavin 目视确认，不接受静态论证。
+
 ### 🔴 D2D 迁移排期（Gavin 2026-09-04 指示：「尽快完成迁移到 D2D」）
 
 **前置已达成**：Gavin 端测处理中态后原话「**整体效果满意**」= DEC-055 红线 5
