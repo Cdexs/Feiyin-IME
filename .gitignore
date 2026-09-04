@@ -45,6 +45,27 @@ __pycache__/
 #      在许可证结论落实前一律不入库；最终产物只以「净化后的词条」形式进 itn-rules.toml，
 #      并在文档致谢来源。此前该目录处于「未跟踪但未被忽略」状态，`git add -A` 会误提交（2026-07-30 主控发现）。
 /collab/research/data/
+# ===== SECRET-083（Gavin 2026-09-04 拍板）：实验产物与调试证据不入库 =====
+# 起因：Gavin 问「collab 目录全部都会 push 吗」。答案是会 —— 除瞬时 IPC 外全量入库。
+# 主控随即用 pre-commit/pre-push 的同一套判据全量扫了 93 个已跟踪 collab 文件：
+# 密钥/邮箱/手机号/身份证层面干净（仅 1 处文档示例地址，误报）。
+#
+# 🔴 但闸门认的是「形态」，认不了「内容」。以下两类正在公开出去，正则永远抓不到：
+#   ① collab/evidence/*.log —— 程序 debug 日志，含 `Online ASR result` / `[ASR-WORDS]`，
+#      载荷是 Gavin 本人的真实口述转写文本（+ 当时开着哪个程序 app_exe=...）。
+#   ② collab/research/*.{json,log,txt} —— LLM 实验的输入输出 dump
+#      （verbatim-inputs-*.json 名字就叫「逐字」；prompt-parts-*-full.json 21KB），
+#      很可能含真实口述语料。**[SECRET-IN-REPO-001] 那把 DeepSeek key 就出自这个目录**，
+#      失效机制一模一样：你想留的是 prompt 或参数，真值是顺带被抄走的。
+#
+# 🔴 2026-09-04 Gavin 当场扩大范围（原方案只排除数据类文件、保留 research/*.md）：
+#    「这两个目录不是项目必须的代码，整个目录都加进 gitignore」。
+#    照办 —— evidence/ 与 research/ 整目录出库，43 个 .md 一并移出索引（本地一个不删）。
+#    理由成立：分析过程文档不是构建产物也不是团队协作契约，
+#    留在本地随时可查；入公开库只是把「我们研究过什么、拿什么语料研究的」一起送出去。
+#    协作契约（todo/handoffs/decisions/troubleshooting/progress/build-test-guide）继续入库不变。
+/collab/evidence/
+/collab/research/
 /collab/inbox/
 /collab/outbox/
 /collab/acks/
