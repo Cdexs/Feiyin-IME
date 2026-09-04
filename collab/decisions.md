@@ -1564,7 +1564,7 @@ Gavin 2026-08-30 端测提交 13 项问题，其中三项**同源**，全部卡�
 | 图形 | Direct2D，`D2D1_ANTIALIAS_MODE_PER_PRIMITIVE`，圆角/圆形/按钮边沿全部平滑 |
 | 文字 | DirectWrite，`IDWriteTextFormat` + `D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE`，不受分层窗口 ClearType 禁用影响 |
 | 合成 | 与现有 `WS_EX_LAYERED` + `LWA_ALPHA` 兼容路径待实施时定；若需 per-pixel alpha 则走 `UpdateLayeredWindow` + D2D DXGI 表面 |
-| 动画 | D2D 硬件加速重绘，为 065（动态图标）与 069（淡出）提供逐帧低成本重绘基础 |
+| 动画 | ~~D2D 硬件加速重绘，为 065（动态图标）与 069（淡出）提供逐帧低成本重绘基础~~ 🔴 **此条与 P0 实际实现不符，见「DEC-055 补充二」**：P0 走的是 DC render target（每帧 BindDC 到 GDI 表面），拿不到硬件加速收益。当前不换路线，触发判据见补充二 |
 | 平台 | Direct2D 是 Win7+ API，满足 DEC-000（Win10/11），无兼容性风险 |
 
 ### 影响范围（🔴 派发前必须逐项评估，不得遗漏）
@@ -1660,3 +1660,72 @@ Gavin 2026-08-30 端测提交 13 项问题，其中三项**同源**，全部卡�
   **可以独立于 D2D 先做，也可以迁完再做**，但**绝不能混在 D2D 批里**（DEC-055 红线 1）。
 
 ---
+
+### DEC-055 补充二 · P0 走的是 DC render target，**没有拿到「硬件加速」那份收益**（2026-09-04 主控实读代码补记）
+
+**起因**：Gavin 2026-09-04 端测确认处理中态效果满意后问：「D2D 在效果和性能上是比之前用的 GDI 更强吗」。
+主控读代码后发现，**效果与性能是两个不同的结论**，而本决策正文第 4 行写的
+「D2D 硬件加速重绘，为 065（动态图标）与 069（淡出）提供逐帧低成本重绘基础」
+**与 P0 的实际实现对不上**。故补记，避免后人照着立项理由去找硬件加速却找不到。
+
+#### 效果：确实更强，且这是迁移的真实收益
+
+| 维度 | GDI | D2D/DirectWrite | 差距 |
+| --- | --- | --- | --- |
+| 图形抗锯齿 | **完全没有**（18 处 `RoundRect` 整像素栅格化，无开关） | `D2D1_ANTIALIAS_MODE_PER_PRIMITIVE` | **巨大**，Gavin 说的「细腻」主要来自这里 |
+| 文字抗锯齿 | 灰度 | 灰度 | **无差别** —— 见下方澄清 |
+| 字形定位 | 整像素对齐 | **亚像素定位**（字形可落在小数 x） + 更好的 gamma 校正 | 中等，体现为字间距更均匀 |
+
+🔴 **一处必须澄清的常见误解**：D2D **没有把 ClearType 找回来**。
+overlay 是 `WS_EX_LAYERED` + 带 alpha，Windows 在这类窗口上禁用次像素渲染，
+**GDI 与 DirectWrite 都只能拿到灰度抗锯齿**（代码 `:2883` 显式设的就是
+`D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE`）。文字变好看是「更好的灰度栅格化 + 亚像素定位」，
+不是「ClearType 回来了」。**别拿这个去承诺文字锐度**。
+
+#### 性能：当前路线**不比 GDI 强，每帧还多一点开销**
+
+`src/main.rs:2867`：
+
+```rust
+let rt: ID2D1DCRenderTarget = factory.CreateDCRenderTarget(&rt_props)?;
+```
+
+**DC render target**，每帧 `BindDC` 绑到现有的 GDI 内存 DC 上绘制。
+代码注释把动机写得很清楚：
+
+> GDI-compatible surface, so the existing double-buffered WM_PAINT (mem_dc → BitBlt)
+> keeps working with **zero structural change**
+
+**这是刻意选的低风险试点路线，选择本身是对的** —— 只替换「怎么画」，不替换「画到哪」，
+不动 WM_PAINT / OVERLAY-043 脏标记 / 尺寸插值任何结构。P0 能一次跑通、Gavin 一次目视通过，
+很大程度上就是因为这个选择。
+
+**但代价要说清**：输出必须落进 GDI 表面，即便 D2D 内部动用了 GPU，
+结果也要传回系统内存再 `BitBlt`。**拿不到「GPU 直接合成到屏幕」那份收益**，
+反而多了每帧 `BindDC` / `BeginDraw` / `EndDraw` 的开销。
+`D2D1_RENDER_TARGET_TYPE_DEFAULT`（`:2855`）虽写着「有硬件就用硬件」，
+也改变不了目标表面是 GDI DC 这个事实。
+
+另注 `:2858` `alphaMode: D2D1_ALPHA_MODE_IGNORE` —— **无 per-pixel alpha**。
+（对 OVERLAY-069 不构成障碍：窗口用的是 `LWA_ALPHA` 整窗透明度，淡出直接调 alpha 即可。）
+
+#### 对 065 / 069 的实际影响（**这才是本补充存在的意义**）
+
+正文承诺的「逐帧低成本重绘基础」，**当前 DC 路线并不提供**。
+若 OVERLAY-065（动态麦克风图标）或 OVERLAY-069（收缩淡出）做出来发现帧率不够，
+需要再走一次迁移：`UpdateLayeredWindow` + DXGI 表面，或改用 HWND render target。
+那需要补 `Win32_Graphics_Dxgi` + `Win32_Graphics_Direct3D11` 两个 feature —— **属依赖变更**，
+按 worker-guide 第十节必须派 BUILD 给 tester-1，coder 不得自行构建。
+
+#### 🔴 主控的判断：现在**不换**，等实测数据
+
+overlay 最宽也就千把像素、高 36。这么小的表面，**软件渲染在绝对值上依然很便宜**，
+60fps 压不垮。所谓「性能不如预期」是相对的，实际大概率感知不到。
+
+**决定：先按现有 DC 路线把 P1/P2/P3 迁完、把 065/069 做出来。
+真出现帧率不够再换路线** —— 那时有实测数据支撑；现在换等于凭猜测提前上难度，
+且会把 P0 已验证的「零结构改动」优势一次性丢掉。
+
+**触发换路线的判据（写死，免得将来靠感觉拍）**：
+065 或 069 实现后，动画期间实测帧率 < 30fps，或 Gavin 端测明确反馈卡顿/掉帧。
+
