@@ -4118,3 +4118,157 @@ git config core.hooksPath scripts/git-hooks
 | 含「API_KEY」字样但无真值的中文 UTF-8 文档 | 放行 | ✅ 提交成功（中文不误伤） |
 
 `git log` 实证：只有两个「应放行」用例进了历史，两个「应拦截」用例零提交。
+
+#### 追加 2026-09-04 —— pre-push 闸门补齐 + CRLF 静默失效隐患修复（SECRET-082）
+
+**起因**：Gavin 问「push 时会扫吗」，查证答案是**不会** —— pre-commit 只管 commit 时点，
+push 这道出口一直空着。Gavin 拍板补上。
+
+**交付**（四个文件，零生产代码改动）：
+
+| 文件 | 动作 | 作用 |
+| --- | --- | --- |
+| `scripts/git-hooks/secret-patterns.sh` | 新增 | 共享模式表 + `scan_diff` 函数，被 pre-commit / pre-push 同时 `source`，杜绝两边正则漂移 |
+| `scripts/git-hooks/pre-push` | 新增 | push 时扫「即将出去的整段提交范围」，覆盖三种 ref 情况（删除分支/推新提交/推全新分支） |
+| `scripts/git-hooks/pre-commit` | 改 | 改为 `source` 共享文件，行为不变 |
+| `.gitattributes` | 新增 | `scripts/git-hooks/** text eol=lf` —— 修 CRLF 静默失效隐患（见下） |
+
+**pre-push 三种 ref 情况处理**（漏一种就是 bug）：
+
+| 情况 | 判据 | 处理 |
+| --- | --- | --- |
+| 删除分支 | `local_sha` 全 0 | 跳过 |
+| 推新提交 | `remote_sha` 非全 0 | `git diff remote_sha..local_sha` |
+| 推全新分支 | `remote_sha` 全 0 | 用 `git rev-list local_sha --not --remotes` 求本地独有提交，从最老提交的父 diff 到 local_sha（**不能扫 `..local_sha`，那是整个仓库历史**） |
+
+**新增隐私组**（Gavin 问的是「敏感隐私信息」，原有闸门只管密钥）：
+
+- 邮箱（配白名单：Gavin 本人地址、`noreply@`、`*.example.com`、`@users.noreply.github.com`）
+- 中国手机号 `1[3-9][0-9]{9}`（前后边界防长数字串误判）
+- 身份证 18 位（带日期段校验，误报率低）
+
+🔴 **邮箱白名单是隐私组能不能用的关键** —— 不加白名单，这一组会把每次 push 全拦死，
+逼所有人养成用 SKIP 绕过的习惯，闸门就废了。
+
+**🔴 CRLF 让钩子静默失效隐患**（本单查出的真问题，对未来非常有价值）：
+
+`core.autocrlf=true`（Windows 默认）在 checkout 时把文本文件 LF→CRLF，
+shell 钩子第一行变 `#!/usr/bin/env bash\r`，执行报 `bad interpreter: ... ^M`，
+**钩子直接跑不起来，且没有任何提示**。当前工作区副本恰好是 LF 所以没暴露，
+**但任何人新 clone 一次钩子就是坏的**。修法：`.gitattributes` 强制 `scripts/git-hooks/** eol=lf`。
+
+**实测**（一次性临时仓库 `/c/msys64/tmp/opencode/secret082/tmprepo/`，测完 `rm -rf` 已删）：
+
+| 用例 | 期望 | 实测 |
+| --- | --- | --- |
+| A1 `sk-`+20 位 | 拦 | ✅ rc=1 |
+| A2 `ghp_`+20 位 | 拦 | ✅ rc=1 |
+| A3 手机号 `138xxxx8000`（真值不落盘，见本条末尾说明） | 拦 | ✅ rc=1 |
+| A4 身份证 18 位 | 拦 | ✅ rc=1 |
+| B1 占位符 `<REDACTED-SEE-ENV-...>` | 放行 | ✅ rc=0 |
+| B2 白名单邮箱 `cdexs@hotmail.com` | 放行 | ✅ rc=0 |
+| B3 含「API_KEY」字样中文 UTF-8 文档（无真值） | 放行 | ✅ rc=0 |
+| C1 推全新分支（remote_sha 全 0）且干净 | 放行 | ✅ rc=0，未扫整仓历史 |
+| C2 删除分支（local_sha 全 0） | 跳过放行 | ✅ rc=0 |
+| D `.gitattributes` 生效 | 新 clone 后钩子仍 LF 可执行 | ✅ `file` 报 Bourne-Again shell script，`pre-push` 能正常执行 |
+| E `SECRET_SCAN_SKIP=1` | 放行+警告 | ✅ rc=0，打印 ⚠️ 警告 |
+| pre-push 拦截绕过 commit 闸门的密钥 | 拦 | ✅ rc=1，输出命中分类+行号 |
+| F 本仓 `git push --dry-run` | 放行 | ✅ rc=0，26 个待推提交 0 命中 |
+
+**逃生口**：`SECRET_SCAN_SKIP=1 git push`（与 pre-commit 同名同语义，别另起变量名）。
+
+**安装**（每个新 clone 一次）：
+```bash
+git config core.hooksPath scripts/git-hooks
+```
+
+## [HOOK-FAIL-OPEN-001] 🔴 安全闸门必须 fail-closed + git rev-parse --verify 静默失效坑（SECRET-082-FIX）
+
+**日期**：2026-09-04 ｜ **来源**：SECRET-082 验收返工 ｜ **性质**：闸门设计缺陷
+
+### 两个缺陷，同一条教训
+
+SECRET-082 的 pre-push 钩子有两个缺陷，主控验收时实测复现：
+
+1. **根提交无父时静默放行**：情况 3（推全新分支）用 `${FIRST}^` 当 diff base，
+   根提交无父 → `git diff` fatal → `2>/dev/null` 吞错 → DIFF 空 → `continue` 放行
+2. **fail-open 设计**：`git diff ... 2>/dev/null` + `[ -z "$DIFF" ] && continue`，
+   把「命令失败」和「diff 确实为空」当同一件事 —— 任何故障（sha 无效、ref 损坏、
+   磁盘错误、没想到的第四种 ref 情况）都静默放行
+
+**共同根因**：和 `[SECRET-IN-REPO-001]`「规则存在但拦不住」是同一个失效机制的两种形态 ——
+**规则存在 ≠ 拦得住，得看它失效时会发生什么**。一个悄悄放行的扫描器比没有扫描器更危险，
+因为它让你以为有防护。**安全闸门失败时必须 fail-closed。**
+
+### 修法
+
+**缺陷一**：无父时用 git 空树对象当 base：
+```bash
+EMPTY_TREE=$(git hash-object -t tree /dev/null)  # 恒为 4b825dc642cb6eb9a060e54bf8d69288fbee4904
+BASE=$(git rev-parse --verify -q "${FIRST}^" 2>/dev/null || echo "$EMPTY_TREE")
+```
+
+🔴 **必须用 `--verify -q`，不许裸 `git rev-parse`**。这个坑很隐蔽，值得单独记：
+
+裸 `git rev-parse "$X^" 2>/dev/null` 在解析失败时**照样把未解析的字面量 `<sha>^` 打到 stdout**
+（exit=128 但 stdout 非空），于是 `$(cmd || echo $EMPTY)` 会把**字面量和空树 hash 两个都吃进变量**，
+BASE 变成一坨垃圾，diff 继续失败，你以为修好了其实没有。`--verify -q` 才会安静地失败、不吐字面量。
+
+**缺陷二**：分开判断「命令失败」与「diff 为空」：
+```bash
+if ! DIFF_RAW=$(git diff "${BASE}..${LOCAL_SHA}" -U0 --diff-filter=ACM 2>&1); then
+  echo "❌ [pre-push] 无法取得待推 diff，拒绝放行（fail-closed）。" >&2
+  echo "   git 报错：${DIFF_RAW}" >&2
+  exit 1
+fi
+DIFF=$(printf '%s\n' "$DIFF_RAW" | grep -E '^\+' | grep -v '^+++')
+[ -z "$DIFF" ] && continue     # 这时的空才是「真的没有新增行」，合法放行
+```
+
+pre-commit 也一并收敛（staged diff 取不到基本只发生在空提交，风险比 pre-push 低，
+但失效形态同源，修成本极低，保持一致性）。
+
+### 规则
+
+1. 🔴 **安全闸门失败时必须 fail-closed**：拿不到 diff 就放行，等于闸门在最需要它的时候自动开门。
+   任何 `2>/dev/null` + `[ -z ] && pass` 形态都是 fail-open，必须改为 `if ! cmd; then exit 1; fi`。
+2. 🔴 **`git rev-parse` 不加 `--verify` 会吐未解析字面量**，让 `|| fallback` 静默失效。
+   凡是 `rev-parse` 取 sha 的地方，一律 `--verify -q`，不许裸用。
+3. **空树对象 `4b825dc642cb6eb9a060e54bf8d69288fbee4904`** 是 git 恒定值，
+   可安全用作「根提交无父」时的 diff base，语义 = 「把提交引入的所有内容当新增行扫一遍」。
+
+### 实测
+
+见 logs/20260904.md SECRET-082-FIX 章节：A1-A4/B1-B3/C1-C5/D/E/F 全绿，
+其中 C3（根提交+密钥）被拦、C4（根提交+干净）放行、C5（无效 sha）fail-closed 拦截。
+
+### 🔴 闸门当场自证：它拦下的第一个真实提交，是主控自己的（2026-09-04）
+
+SECRET-082 全部交付物落盘后，主控执行本批 commit，**被自己刚装的 pre-commit 拦住**：
+
+```
+❌ [pre-commit] 拦截：staged 内容里发现疑似密钥/凭证，commit 已中止。
+[隐私-手机号]
+89:+| A3 手机号 `138xxxx8000` | 拦 | ✅ rc=1 |
+```
+
+来源是本条目的测试结果表——**记录「我们测了手机号拦截」时，把测试用的手机号明文写了进去**。
+
+**更有意思的是它拦了两次**：主控第一次改掉真值后，为了写这一节
+**原样引用了拦截输出**，而那段输出里就带着手机号 —— 于是同一个号码
+以「证据引用」的身份又混了进去，第二次被拦。
+**「我在记录一次泄露拦截」这个动作本身，就是下一次泄露的载体。**
+
+这件事本身就是最好的验收证据，有三层意思：
+
+1. **闸门真的在跑**，不是装了个摆设（`core.hooksPath` 配置生效、脚本能执行、正则能命中）。
+2. **它拦的是真实场景，不是人造用例**。没人是故意要提交隐私数据的 ——
+   泄露几乎总是这样发生的：你在**记录一件安全的事**的时候，顺手把真值抄了进去。
+   `[SECRET-IN-REPO-001]` 那把 key 一模一样：想留的是 prompt 和参数，key 是顺带被抄走的。
+3. **处理方式定调**：改成 `138xxxx8000` 占位形态，**没有用 `SECRET_SCAN_SKIP=1` 绕过**。
+   被闸门拦住的正确反应是改内容，不是关闸门 —— 一旦养成 SKIP 的习惯，
+   这道网就退化成一句提示音。
+
+**给未来的自己**：写测试报告、贴复现步骤、dump 排查数据时，
+真值一律写成占位形态（`sk-<30字符>`、`138xxxx8000`、`<REDACTED>`）。
+描述形态和真值对读者的信息量完全一样，对泄露风险差一个量级。

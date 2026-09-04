@@ -1,0 +1,7 @@
+# voice-ime git 文件属性
+#
+# 背景：SECRET-082。Windows 上 core.autocrlf=true 会在 checkout 时把文本文件 LF→CRLF，
+# 导致 shell 钩子第一行变 `#!/usr/bin/env bash\r`，执行报 `bad interpreter: ... ^M`，
+# 钩子静默失效（没有任何提示）—— 新 clone 一次就坏。强制钩子脚本保持 LF。
+
+scripts/git-hooks/** text eol=lf

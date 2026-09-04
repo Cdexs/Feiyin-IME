@@ -171,3 +171,34 @@
   未 commit；v0.9.0 未动；UTF-8（Edit 工具）
 - **红线合规**：MACOS-HANDOFF §HOTKEY-079 已记（零编译影响/零行为差异/macOS 无 AltGr 键序）
 - **详情**：outbox/coder-2/result.md + logs/20260903.md + CHANGELOG.md
+
+## 2026-09-04 — coder-1 — SECRET-082 ✅ pre-push 闸门 + CRLF 隐患修复（4 文件，零生产代码，待主控验收）
+
+**基线**：`ace4a5c`，v0.9.0（未动）
+
+**交付物**：
+- `scripts/git-hooks/secret-patterns.sh`（新增，共享模式表 + scan_diff 函数）
+- `scripts/git-hooks/pre-push`（新增，覆盖三种 ref 情况）
+- `scripts/git-hooks/pre-commit`（改为 source 共享文件，行为不变）
+- `.gitattributes`（新增，`scripts/git-hooks/** text eol=lf`）
+
+**协作文档更新**：
+- `collab/troubleshooting.md [SECRET-IN-REPO-001]` 追加 pre-push 闸门 + CRLF 隐患记录
+- `collab/docs/worker-guide.md` 加「每个新 clone 执行 git config core.hooksPath」提示
+- `logs/20260904.md` + `CHANGELOG.md` 已追加
+
+**实测**：A1-A4 拦截 / B1-B3 放行 / C1-C2 / D / E / pre-push 拦截 / F 本仓 dry-run 放行，全绿
+**临时仓库**：`/c/msys64/tmp/opencode/secret082/tmprepo/` 测完 `rm -rf` 已删
+**红线**：零生产代码改动；未 commit、未 push；版本号未动
+
+## 2026-09-04 — coder-1 — SECRET-082-FIX ✅ pre-push 根提交+fail-open 修复（pre-push/pre-commit，待主控验收）
+
+**基线**：SECRET-082 工作区改动（未提交），v0.9.0
+
+**修复**：
+- 缺陷一：根提交无父时 `${FIRST}^` 解析失败 → 空树 base + `git rev-parse --verify -q` fallback
+- 缺陷二：fail-open → fail-closed，git diff 失败时拒绝放行并打印报错（pre-push + pre-commit 一并收敛）
+
+**实测**：A1-A4 拦 / B1-B3 放 / C1-C5 / D / E / F 本仓 dry-run 全绿（C3 根提交+密钥被拦，C4 根提交干净放行，C5 无效 sha fail-closed）
+**协作文档**：troubleshooting 新开 [HOOK-FAIL-OPEN-001] + logs + CHANGELOG + handoffs
+**临时仓库**：测完 rm -rf 已删

@@ -28,7 +28,7 @@
 | Worker | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
 | tester-1 | **TEST-EXEC-081** 全量回归 | 阶段四 | 已 ACK，执行中 |
-| coder-1 | **SECRET-082** pre-push 密钥/隐私闸门 + 修 `.gitattributes` CRLF 隐患 | 独立基建 | 已派发 |
+| coder-1 | **SECRET-082 + FIX** pre-push 密钥/隐私闸门 + `.gitattributes` CRLF 修复 | 独立基建 | ✅ 主控验收通过（13/13 用例独立复验） |
 | coder-2 | — | — | 待命（回归期间不得动 src/ 与 ui/） |
 
 **边界评估**：tester-1 占 `src/**`、`ui/**`；coder-1 只碰 `scripts/git-hooks/**` + `.gitattributes`

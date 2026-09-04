@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# voice-ime pre-push 密钥/隐私闸门（SECRET-082）
+#
+# 背景：2026-08-14 f58af96 把 DeepSeek API key 明文 push 到 GitHub，暴露 20 天被盗刷。
+# 事后建了 pre-commit 闸门，但 push 这道出口一直是空的 —— Gavin 2026-09-04 拍板补上。
+#
+# 与 pre-commit 的分工：
+#   pre-commit  扫 staged 新增行（commit 时点）
+#   pre-push    扫「即将出去的整段提交范围」（push 时点）
+# 两者共用 secret-patterns.sh 的模式表与扫描函数，保证不漂移。
+#
+# 安装（每个 clone 一次）：
+#   git config core.hooksPath scripts/git-hooks
+#
+# 紧急绕过（与 pre-commit 同名同语义，别另起变量名）：
+#   SECRET_SCAN_SKIP=1 git push ...
+
+set -u
+
+if [ "${SECRET_SCAN_SKIP:-0}" = "1" ]; then
+  echo "⚠️  [pre-push] SECRET_SCAN_SKIP=1 —— 密钥/隐私扫描已被显式跳过，请确认这是误报。" >&2
+  exit 0
+fi
+
+# 定位共享模式表（钩子可能被 git 从仓库根或子目录调用，用绝对路径兜底）
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=secret-patterns.sh
+. "$HOOK_DIR/secret-patterns.sh"
+
+# git 通过 stdin 逐行喂入待推 ref，每行四字段：
+#   <local_ref> <local_sha> <remote_ref> <remote_sha>
+# 三种情况必须都覆盖（漏一种就是 bug）：
+#   删除分支        : local_sha 全 0  → 跳过，没有内容要扫
+#   已有分支推新提交 : remote_sha 非全 0 → 扫 remote_sha..local_sha
+#   推全新分支      : remote_sha 全 0  → 用 rev-list --not --remotes 求本地独有提交
+#
+# 注意：remote_sha 全 0 时绝不能扫 ..local_sha（那是整个仓库历史，必炸）。
+#
+# 🔴 fail-closed 设计（HOOK-FAIL-OPEN-001）：任何 git 命令失败时拒绝放行，不许静默放过。
+#   「拿不到 diff」和「diff 确实是空的」必须分开判断 —— 前者是故障，后者是合法空推。
+#   一个悄悄放行的扫描器比没有扫描器更危险，因为它让你以为有防护。
+ALL_HITS=""
+ZERO_SHA="0000000000000000000000000000000000000000"
+# git 空树对象（恒定值），用于根提交无父时的 base
+EMPTY_TREE=$(git hash-object -t tree /dev/null 2>/dev/null || echo "4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+
+while read -r LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
+  [ -z "$LOCAL_SHA" ] && continue
+
+  # 情况 1：删除分支 —— local_sha 全 0，没有内容要扫
+  if [ "$LOCAL_SHA" = "$ZERO_SHA" ]; then
+    continue
+  fi
+
+  # 求出本次 push 真正要出去的新增行 diff（与 pre-commit 同 -U0 --diff-filter=ACM 参数）
+  if [ "$REMOTE_SHA" = "$ZERO_SHA" ]; then
+    # 情况 3：推全新分支 —— remote_sha 全 0，git diff 会 fatal。
+    # 用 rev-list --not --remotes 求本地独有提交，取最老的一个，从其父提交 diff 到 local_sha。
+    if ! COMMITS=$(git rev-list "$LOCAL_SHA" --not --remotes 2>&1); then
+      echo "❌ [pre-push] 无法取得 ${LOCAL_REF} 的本地独有提交列表，拒绝放行（fail-closed）。" >&2
+      echo "   git 报错：${COMMITS}" >&2
+      echo "   确认无误后可用 SECRET_SCAN_SKIP=1 git push 显式放行。" >&2
+      exit 1
+    fi
+    # 真的没有本地独有提交 = 合法空推
+    [ -z "$COMMITS" ] && continue
+    FIRST=$(printf '%s\n' "$COMMITS" | tail -1)
+    # 🔴 根提交无父：用 --verify -q 安静失败，不许裸 rev-parse（会吐未解析字面量污染 fallback）
+    # 裸 `git rev-parse "$X^" 2>/dev/null` 解析失败时仍把字面量 `<sha>^` 打到 stdout，
+    # `$(cmd || echo $EMPTY)` 会把字面量和空树 hash 都吃进变量 → BASE 变垃圾 → diff 继续失败 → 静默放行。
+    BASE=$(git rev-parse --verify -q "${FIRST}^" 2>/dev/null || echo "$EMPTY_TREE")
+    if ! DIFF_RAW=$(git diff "${BASE}..${LOCAL_SHA}" -U0 --diff-filter=ACM 2>&1); then
+      echo "❌ [pre-push] 无法取得 ${LOCAL_REF} 的待推 diff，拒绝放行（fail-closed）。" >&2
+      echo "   git 报错：${DIFF_RAW}" >&2
+      echo "   确认无误后可用 SECRET_SCAN_SKIP=1 git push 显式放行。" >&2
+      exit 1
+    fi
+    DIFF=$(printf '%s\n' "$DIFF_RAW" | grep -E '^\+' | grep -v '^+++')
+  else
+    # 情况 2：已有分支推新提交
+    if ! DIFF_RAW=$(git diff "${REMOTE_SHA}..${LOCAL_SHA}" -U0 --diff-filter=ACM 2>&1); then
+      echo "❌ [pre-push] 无法取得 ${LOCAL_REF} 的待推 diff，拒绝放行（fail-closed）。" >&2
+      echo "   git 报错：${DIFF_RAW}" >&2
+      echo "   确认无误后可用 SECRET_SCAN_SKIP=1 git push 显式放行。" >&2
+      exit 1
+    fi
+    DIFF=$(printf '%s\n' "$DIFF_RAW" | grep -E '^\+' | grep -v '^+++')
+  fi
+
+  # 这里的空才是「真的没有新增行」，合法放行（fail-closed 已在上面处理命令失败）
+  [ -z "$DIFF" ] && continue
+
+  HITS=$(scan_diff "$DIFF")
+  if [ -n "$HITS" ]; then
+    ALL_HITS="${ALL_HITS}
+── push 范围 ${LOCAL_REF} (${REMOTE_SHA:0:8}..${LOCAL_SHA:0:8}) 命中 ──
+${HITS}"
+  fi
+done
+
+if [ -n "$ALL_HITS" ]; then
+  cat >&2 <<MSG
+❌ [pre-push] 拦截：即将推送的提交范围内发现疑似密钥/隐私信息，push 已中止。
+${ALL_HITS}
+MSG
+  print_secret_guidance
+  exit 1
+fi
+
+exit 0
