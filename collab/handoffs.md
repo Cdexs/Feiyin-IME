@@ -219,3 +219,12 @@
 - **另 4 条复核**：T1/T2/T3a/T3b 消融推演事件顺序 vs 用例 fireEvent 顺序逐条核对全部成立（T3a 的 :160/:408/:529 行号核实、T3b 自陈「删 :160 仍绿」推演正确），零凑数改动
 - **验证**：tsc 0 error（白名单内）；未跑 npm/cargo test；未 commit；v0.9.0 未动
 - **详情**：outbox/tester-1/result.md + logs/20260904.md
+
+## 2026-09-04 — tester-1 — BUILD-085 v0.9.0 阶段五出包 ✅（七项核验全过 + E2E 65P/0F，待主控验收+Gavin 端测）
+
+- **构建**：Step 1-4 顺序完整执行（npm 1.46s → Tauri UI 2m03s 含 custom-protocol → 主程序 2m42s → cp+toml 三副本同步）
+- **核验**：①时间戳 09-04 ②sha256 三对相等 ③toml 三副本 hash 一致（scene `0a3a0b9a…`/itn `311cbb96…`）④**ProductVersion 0.9.0.0** ⑤探针 ASR-DROP×4/ASR-LOOP×1 + index-CJ1JUYoT.js ⑥大小同量级（main +29KB 预期内）⑦冒烟 PID 25288 Responding 无 panic
+- **E2E 门禁**：65P/0F/33S（175s）与 BUILD-022 逐位一致，两条已知坑未命中，config.toml 双侧 sha256 字节级相等无污染
+- **运行时数据**：config.toml/wordbook.sqlite/debug.log 零覆盖；version_check.json mtime 变化已定性=程序冒烟自写缓存（src/version_check/mod.rs save_cache），非出包覆盖
+- 产物：`Publish/` 三 exe 就绪，待 Gavin 端测（DEC-055 红线 5 目视 / AltGr 双侧 / LLM 401 定性提示见 result.md）
+- **详情**：outbox/tester-1/result.md + logs/20260904.md

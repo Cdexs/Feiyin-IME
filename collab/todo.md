@@ -7,7 +7,13 @@
 - **TEST-EXEC-081**（验收通过，主控裁定）：root 1054P/0F（4 条修红转绿）、src-tauri 76P、vitest 89P/0F（S12 红转绿）；必查 A/B/C 全过；消融 B 预期命中，消融 A 停手报告 → 主控裁定归因成立、判红基准改 S12（078 护栏判别力由 S12 实测证实）；pytest 按任务书 SKIP（Publish/ 旧包，E2E 门禁挪阶段五出包后）
 - **TEST-FIX-084**：T4b 消融注释改正（+5/-3 仅注释，it() 零触碰）；另 4 条（T1/T2/T3a/T3b）消融推演逐条复核全部成立零改动；tsc 0 error
 - 详情见 CHANGELOG.md TEST-EXEC-081 / TEST-FIX-084 ／ handoffs.md 2026-09-04 ／ logs/20260904.md
-- 下一棒：**阶段五 BUILD v0.9.0**（等主控下达「现在可以出包」）→ Gavin 端测（含 DEC-055 红线 5 目视确认）
+- ~~下一棒：**阶段五 BUILD v0.9.0**~~ → **BUILD-085 已完成**（2026-09-04 14:23，七项核验全过、ProductVersion 0.9.0.0、E2E 65P/0F 与 BUILD-022 逐位一致，产物在 `Publish/`）
+
+### 🔴 BUILD-085 已出包 —— 待 Gavin 端测三重点（主控 2026-09-04 列）
+
+1. 🔴 处理中态 overlay 文字与圆角边沿是否变细腻（DEC-055 红线 5，D2D-073-P0 验收判据，**不接受静态论证结案**）—— 达标才继续迁剩余五态
+2. AltGr 当热键：语音侧/翻译侧各录一次，应显示 `Right Alt` 而非 `Left Ctrl`
+3. LLM 401 若仍在 = DeepSeek key 吊销后新 key 未配置，**不是格式化逻辑坏了**，别误判 FMT-072
 
 ### 阶段三 TEST-FIX-080 ✅ 主控验收通过（tester-1）
 
