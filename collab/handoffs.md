@@ -239,3 +239,16 @@
 - **非回归结论**：043/046/051-G/068-A/068-B/075/D2D-073/053-B/DEC-056 逐项点名全过（result.md 各节），interpolate_step 零改动、bErase=false 未动
 - **红线合规**：未跑 test/build / 未 commit / UTF-8（bash heredoc + Edit + py -3.11 codecs）/ 零凭证 / 建议护栏 4 组交阶段三
 - **详情**：outbox/coder-2/result.md（含打回整改记录节）+ logs/20260904.md + CHANGELOG.md + MACOS-HANDOFF §OVERLAY-086
+
+## 2026-09-04 — coder-2 — D2D-P1 ✅ 流式文字两态迁 D2D（main.rs +490/-33，待主控验收）
+
+- **共用层三层化**：资源层（D2dResources + streaming_text_format Segoe UI/normal/14px/LEADING）→ 帧层 `with_d2d`（BindDC/Begin/End/RECREATE 集中）→ 原语层 chrome/mic_indicator/stop_button/placeholder_text/streaming_text + colorref_to_d2d。P2/P3 只写原语调用
+- **D2DERR_RECREATE_TARGET**（0x8899000C）：EndDraw 失败判 code → 丢 thread_local 资源 + false → GDI 当帧兜底 → 下帧重建（休眠唤醒/驱动更新/RDP）
+- **P0 机械包装**（裁定采纳）：draw_processing_overlay 走 with_d2d，原语改 draw_processing_primitives——与 HEAD 旧 draw_with 核心区 109 非注释行逐行 diff=0（机器比对），RECREATE 修复覆盖处理中态
+- **两态迁移**：RecordingStreamingIdle（D2D chrome+mic+placeholder+stop）/ RecordingWithText（D2D chrome+mic+PushAxisAlignedClip 滚动裁剪文字+stop），GDI 兜底保留；Recording 波形态未迁（红线 4）
+- **度量单一源**（裁定③）：窗口定宽与 scroll_x 全用 GDI measure_text_width，D2D 侧零 DirectWrite 度量，零双度量漂移
+- **逐原语对照表**：result.md §二（含两处有意差异：背景圆角=086 教训前置、占位 LEADING=与流式连续；两处遗漏如实声明：右分隔线缺、超宽无省略号）
+- **非回归**：043/046/051-A/051-G/068-A/075/086/D2D-073-P0/GDI 兜底契约逐项点名全过（result.md §三）；P0 原语零 diff；空文本护栏路径复验（空文本→D2D idle 画 placeholder）
+- **验收整改**：右分隔线已补（D2D 流式态 DrawLine x=w-36/2px/高20，照抄 GDI :2617；此前「常态缺线、回落才有」回归已消除）；#4 省略号按主控裁定改写为「有意行为变更」（超宽裁剪无省略号：触发罕见 + 右端省略号会盖最新文字，请 Gavin 端测知悉判断）
+- **验证**：fmt clean / check --all-targets 0 error（自跑）/ git diff -w 仅 main.rs / interpolate_step 零改动 / 版本号 v0.9.0 未动 / 未跑 test/build / 未 commit / UTF-8（Edit 工具）/ 零凭证 / MACOS-HANDOFF §D2D-P1 已记
+- **详情**：outbox/coder-2/result.md + logs/20260904.md + CHANGELOG.md

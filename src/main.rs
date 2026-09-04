@@ -2488,6 +2488,13 @@ fn draw_recording_overlay(
     show_placeholder: bool,
     ui_language: config::UiLanguage,
 ) -> RECT {
+    // D2D-P1: RecordingStreamingIdle is drawn with D2D (DEC-055 step 2). On any D2D
+    // failure the GDI path below still renders this frame, so the overlay never blanks.
+    // Only the placeholder variant migrates — the waveform variant (Recording) is a
+    // P2 state and keeps its GDI path untouched (DEC-055 红线 4).
+    if show_placeholder && d2d::draw_streaming_idle_overlay(hdc, rect, state, ui_language) {
+        return draw_stop_button_hit_rect_only(rect);
+    }
     draw_overlay_chrome(hdc, rect);
     // OVERLAY-051-E: online streaming ASR waiting for first text shows placeholder,
     // not waveform. Local model continues to show waveform unchanged.
@@ -2500,6 +2507,34 @@ fn draw_recording_overlay(
     draw_stop_button(hdc, rect)
 }
 
+/// D2D-P1 helper: when the D2D idle path succeeds it has already painted the stop
+/// button; the caller only needs its hit RECT. Same geometry as draw_stop_button.
+#[cfg(target_os = "windows")]
+fn draw_stop_button_hit_rect_only(rect: &RECT) -> RECT {
+    let bs = 16;
+    let bl = rect.right - 25;
+    let bt = rect.top + (rect.bottom - rect.top - bs) / 2;
+    RECT {
+        left: bl,
+        top: bt,
+        right: bl + bs + 1,
+        bottom: bt + bs + 1,
+    }
+}
+
+/// D2D-P1 helper: the text hit region (for entering edit mode), same geometry as
+/// the GDI path's `text_hit_rect` (:2567 区): 10px margins top/bottom, text band
+/// horizontally (mic margin → stop button margin).
+#[cfg(target_os = "windows")]
+fn text_hit_rect_for(rect: &RECT) -> RECT {
+    RECT {
+        left: rect.left + STREAMING_TEXT_LEFT_MARGIN,
+        top: rect.top + STREAMING_TEXT_TOP_MARGIN,
+        right: rect.right - STREAMING_TEXT_RIGHT_MARGIN,
+        bottom: rect.bottom - STREAMING_TEXT_BOTTOM_MARGIN,
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn draw_recording_overlay_with_text(
     hdc: windows::Win32::Graphics::Gdi::HDC,
@@ -2508,6 +2543,17 @@ fn draw_recording_overlay_with_text(
     _ui_language: config::UiLanguage,
     text: &str,
 ) -> (RECT, RECT, RECT) {
+    // D2D-P1: RecordingWithText is drawn with D2D (DEC-055 step 2). On any D2D failure
+    // the GDI path below still renders this frame, so the overlay never blanks.
+    // The metric (text_width) comes from measure_text_width on the GDI font — the
+    // single metric source agreed in D2D-P1 — so the D2D side never measures itself
+    // and cannot drift from the window-sizing path (adjust_overlay_pos_size_for_text).
+    let text_width = measure_text_width(hdc, text);
+    if d2d::draw_streaming_text_overlay(hdc, rect, state, text, text_width) {
+        let text_hit = text_hit_rect_for(rect);
+        let cancel = draw_stop_button_hit_rect_only(rect);
+        return (cancel, cancel, text_hit);
+    }
     // OVERLAY-043: text mode uses chrome + stop button only, no waveform so text is not squeezed
     draw_overlay_chrome(hdc, rect);
     // keep the mic indicator so the user still sees the recording state
@@ -2525,9 +2571,6 @@ fn draw_recording_overlay_with_text(
     let text_top = rect.top + OVERLAY_TEXT_DRAW_VERTICAL_INSET;
     let text_bottom = rect.bottom - OVERLAY_TEXT_DRAW_VERTICAL_INSET;
     let visible_w = (text_right - text_left).max(1);
-
-    // Measure full text width
-    let text_width = measure_text_width(hdc, text);
 
     // Scroll offset so newest text stays at the right edge once text overflows
     let scroll_x = (text_width - visible_w).max(0);
@@ -2880,12 +2923,18 @@ fn draw_editing_overlay_chrome(
 }
 
 // D2D-073 P0: module for the Direct2D + DirectWrite redraw of the processing overlay.
-// DEC-055 gray migration: only draw_processing_overlay is routed here; every other
-// status keeps its GDI path. The DC render target keeps the existing double-buffered
+// D2D-P1 (DEC-055 gray migration step 2): the shared frame layer (`with_d2d`) plus the
+// RecordingStreamingIdle / RecordingWithText primitives were added here; every migrated
+// status keeps a GDI fallback path so the overlay never blanks. The DC render target
+// keeps the existing double-buffered
 // WM_PAINT pipeline (mem_dc → BitBlt) untouched — D2D draws into the same memory DC.
 #[cfg(target_os = "windows")]
 mod d2d {
-    use super::{OVERLAY_BORDER_GRAY, OVERLAY_FONT_SIZE};
+    use super::{
+        OverlayWindowState, COLORREF, OVERLAY_BG_DARK, OVERLAY_BORDER_GRAY, OVERLAY_BRAND_ORANGE,
+        OVERLAY_FONT_SIZE, OVERLAY_TEXT_DRAW_VERTICAL_INSET, OVERLAY_TEXT_WHITE,
+        STREAMING_TEXT_LEFT_MARGIN, STREAMING_TEXT_RIGHT_MARGIN,
+    };
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct2D::Common::{
@@ -2899,9 +2948,10 @@ mod d2d {
     };
     use windows::Win32::Graphics::DirectWrite::{
         DWriteCreateFactory, IDWriteFactory, DWRITE_FACTORY_TYPE_SHARED,
-        DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-        DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-        DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_WORD_WRAPPING_NO_WRAP,
+        DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
+        DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL,
+        DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
+        DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP,
     };
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
     use windows::Win32::Graphics::Gdi::HDC;
@@ -2916,7 +2966,18 @@ mod d2d {
         #[allow(dead_code)] // kept alive for text_format lifetime, see struct doc
         pub dwrite: IDWriteFactory,
         pub rt: ID2D1DCRenderTarget,
+        /// Processing-state text format (D2D-073-P0): centered paragraph, NO_WRAP.
+        /// Face is "Microsoft YaHei UI" SemiBold — see the note on the field below.
         pub text_format: windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
+        /// D2D-P1: streaming-state text format — left-aligned (LEADING), vertical center,
+        /// NO_WRAP. Face "Segoe UI" Normal 14px, chosen to match the GDI path's
+        /// `create_clear_type_font` ("Segoe UI", FW_NORMAL, OVERLAY_FONT_SIZE = -14 → 14px)
+        /// so the single GDI metric source (measure_text_width) tracks the drawn width.
+        /// (P0's format comment claimed "must match the GDI face" but used YaHei UI
+        /// SemiBold; for the processing state that was an intentional standalone choice —
+        /// Chinese-only text falls back to the same glyph engine either way, and Gavin has
+        /// visually accepted it. The streaming states need the real GDI face.)
+        pub streaming_text_format: windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
         pub brush: ID2D1SolidColorBrush,
     }
     fn create_resources() -> windows::core::Result<D2dResources> {
@@ -2938,6 +2999,11 @@ mod d2d {
             // WM_PAINT (mem_dc → BitBlt) keeps working with zero structural change.
             let rt: ID2D1DCRenderTarget = factory.CreateDCRenderTarget(&rt_props)?;
             // Font family must match the GDI path's ClearType font face for visual parity.
+            // D2D-P1 correction of this comment: the GDI face is "Segoe UI" FW_NORMAL
+            // (create_clear_type_font), NOT YaHei UI SemiBold. The P0 processing format
+            // below is a deliberate standalone choice (Chinese-only string; Gavin accepted
+            // it visually). The D2D-P1 streaming format (streaming_text_format) is the one
+            // that actually matches the GDI face/weight.
             let family: Vec<u16> = "Microsoft YaHei UI".encode_utf16().collect();
             let locale: Vec<u16> = "zh-CN".encode_utf16().collect();
             let text_format = dwrite.CreateTextFormat(
@@ -2952,6 +3018,21 @@ mod d2d {
             text_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             text_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            // D2D-P1: streaming-state format — same face/weight as the GDI text path
+            // ("Segoe UI", FW_NORMAL, 14px), left-aligned, single line, no wrap.
+            let gdi_family: Vec<u16> = "Segoe UI".encode_utf16().collect();
+            let streaming_text_format = dwrite.CreateTextFormat(
+                PCWSTR(gdi_family.as_ptr()),
+                None,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                -OVERLAY_FONT_SIZE as f32, // GDI negative height (em) → D2D positive size
+                PCWSTR(locale.as_ptr()),
+            )?;
+            streaming_text_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+            streaming_text_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            streaming_text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             let _ = rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             let brush = rt.CreateSolidColorBrush(
                 &D2D1_COLOR_F {
@@ -2967,6 +3048,7 @@ mod d2d {
                 dwrite,
                 rt,
                 text_format,
+                streaming_text_format,
                 brush,
             })
         }
@@ -2976,14 +3058,22 @@ mod d2d {
         static D2D: std::cell::RefCell<Option<D2dResources>> = const { std::cell::RefCell::new(None) };
     }
 
-    /// Try to draw the processing overlay with D2D. Returns false if D2D failed to
-    /// initialize or draw (caller falls back to the GDI path for this frame; init is
-    /// retried on the next attempt so a transient failure never permanently disables D2D).
-    pub(crate) fn draw_processing_overlay(
+    /// D2DERR_RECREATE_TARGET (0x8899000C): device loss (sleep/wake, driver update,
+    /// RDP switch). All cached resources are invalid; the frame must fall back to GDI
+    /// and the next attempt must rebuild from scratch. D2D-P1: detected in `with_d2d`,
+    /// dropping the thread-local slot so `create_resources` runs again on the next call.
+    const D2DERR_RECREATE_TARGET: i32 = 0x8899_000Cu32 as i32;
+
+    /// D2D-P1 shared frame layer: bind, begin, run the caller's primitives, end, and
+    /// classify failure. Every migrated status routes through this single path so
+    /// BindDC/BeginDraw/EndDraw/D2DERR_RECREATE_TARGET handling exists in exactly one
+    /// place. Returns false on ANY failure (init, BindDC, EndDraw) — the caller must
+    /// render the same frame through its GDI fallback so the overlay never blanks.
+    /// A RECREATE_TARGET failure additionally drops the cached resources (device lost).
+    pub(crate) fn with_d2d(
         hdc: HDC,
         rect: &RECT,
-        ui_language: crate::config::UiLanguage,
-        shimmer_phase: f32,
+        draw: impl FnOnce(&D2dResources, f32, f32),
     ) -> bool {
         D2D.with(|cell| {
             let mut slot = cell.borrow_mut();
@@ -2996,34 +3086,62 @@ mod d2d {
                     }
                 }
             }
-            draw_with(
-                slot.as_ref().expect("just initialized"),
-                hdc,
-                rect,
-                ui_language,
-                shimmer_phase,
-            )
+            let res = slot.as_ref().expect("just initialized");
+            unsafe {
+                // Bind this frame's memory DC. The subrect is the full client rect so D2D
+                // pixel coordinates map 1:1 onto the GDI surface.
+                if res.rt.BindDC(hdc, rect).is_err() {
+                    return false;
+                }
+                let w = (rect.right - rect.left).max(1) as f32;
+                let h = (rect.bottom - rect.top).max(1) as f32;
+                res.rt.BeginDraw();
+                res.rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                draw(res, w, h);
+                if let Err(e) = res.rt.EndDraw(None, None) {
+                    let code = e.code().0;
+                    if code == D2DERR_RECREATE_TARGET {
+                        // Device lost: discard everything; the next frame rebuilds.
+                        log::warn!("D2D-P1: D2DERR_RECREATE_TARGET (device lost), dropping D2D resources; GDI renders this frame, D2D rebuilds next frame");
+                        *slot = None;
+                    } else {
+                        log::warn!("D2D-P1: EndDraw failed ({code:#x}), GDI renders this frame");
+                    }
+                    return false;
+                }
+            }
+            true
         })
     }
 
-    fn draw_with(
-        res: &D2dResources,
+    /// Try to draw the processing overlay with D2D. Returns false if D2D failed to
+    /// initialize or draw (caller falls back to the GDI path for this frame; init is
+    /// retried on the next attempt so a transient failure never permanently disables D2D).
+    /// D2D-P1: routed through the shared `with_d2d` frame layer so device-loss handling
+    /// (D2DERR_RECREATE_TARGET → drop resources → GDI this frame → rebuild next frame)
+    /// covers this state too. The primitives below are byte-identical to the P0 body.
+    pub(crate) fn draw_processing_overlay(
         hdc: HDC,
         rect: &RECT,
         ui_language: crate::config::UiLanguage,
         shimmer_phase: f32,
     ) -> bool {
-        unsafe {
-            // Bind this frame's memory DC. The subrect is the full client rect so D2D
-            // pixel coordinates map 1:1 onto the GDI surface.
-            if res.rt.BindDC(hdc, rect).is_err() {
-                return false;
-            }
-            let w = (rect.right - rect.left).max(1) as f32;
-            let h = (rect.bottom - rect.top).max(1) as f32;
-            res.rt.BeginDraw();
-            res.rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        with_d2d(hdc, rect, |res, w, h| {
+            draw_processing_primitives(res, w, h, ui_language, shimmer_phase);
+        })
+    }
 
+    /// P0 primitives, unchanged. Extracted as the `with_d2d` closure body; D2D-P1 only
+    /// wrapped the frame management around them (BindDC/Begin/End/RECREATE) — the
+    /// geometry, colors and text format are untouched, so the visual output is the same.
+    fn draw_processing_primitives(
+        res: &D2dResources,
+        w: f32,
+        h: f32,
+        ui_language: crate::config::UiLanguage,
+        shimmer_phase: f32,
+    ) {
+        unsafe {
             // 1) Dark background — same #181A18 as the GDI path.
             res.brush.SetColor(&D2D1_COLOR_F {
                 r: 0x18 as f32 / 255.0,
@@ -3172,9 +3290,370 @@ mod d2d {
                 windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
                 DWRITE_MEASURING_MODE_NATURAL,
             );
-
-            res.rt.EndDraw(None, None).is_ok()
         }
+    }
+
+    // ------------------------------------------------------------------
+    // D2D-P1 shared primitives (RecordingStreamingIdle / RecordingWithText)
+    //
+    // Each mirrors one GDI primitive one-to-one (geometry/colors/radius in the
+    // per-primitive doc comments); P2/P3 (Recording / FallingToProcessing / Error)
+    // reuse the same set. Coordinates are rect-RELATIVE (0..w × 0..h) because
+    // BindDC binds the full client rect — the GDI functions use absolute
+    // rect.left/top, D2D's origin is the BindDC subrect's top-left corner.
+    // ------------------------------------------------------------------
+
+    /// COLORREF (0x00BBGGRR) → D2D1_COLOR_F (premultiplied-free RGBA 0..1).
+    fn colorref_to_d2d(c: COLORREF) -> D2D1_COLOR_F {
+        D2D1_COLOR_F {
+            r: (c.0 & 0xFF) as f32 / 255.0,
+            g: ((c.0 >> 8) & 0xFF) as f32 / 255.0,
+            b: ((c.0 >> 16) & 0xFF) as f32 / 255.0,
+            a: 1.0,
+        }
+    }
+
+    /// GDI `draw_overlay_chrome` (:2187): dark #110F0D rounded-rect background +
+    /// 1px OVERLAY_BORDER_GRAY rounded border, radius 10 (GDI RoundRect 10*2 ellipse).
+    /// Same 0.5px pen-centering inset as the P0 border (fill 0..w, stroke 0.5..w-0.5).
+    /// OVERLAY-086 Bug 1's wedge lesson applied here from day one: fill and stroke
+    /// share one radius binding, so no corner wedge exists on this path either.
+    fn chrome(res: &D2dResources, w: f32, h: f32) {
+        unsafe {
+            const CORNER_RADIUS: f32 = 10.0; // GDI: CORNER_RADIUS=10, RoundRect(…,10*2,10*2)
+            res.brush.SetColor(&colorref_to_d2d(super::OVERLAY_BG_DARK));
+            res.rt.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: 0.0,
+                        top: 0.0,
+                        right: w,
+                        bottom: h,
+                    },
+                    radiusX: CORNER_RADIUS,
+                    radiusY: CORNER_RADIUS,
+                },
+                &res.brush,
+            );
+            res.brush
+                .SetColor(&colorref_to_d2d(super::OVERLAY_BORDER_GRAY));
+            res.rt.DrawRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: 0.5,
+                        top: 0.5,
+                        right: w - 0.5,
+                        bottom: h - 0.5,
+                    },
+                    radiusX: CORNER_RADIUS,
+                    radiusY: CORNER_RADIUS,
+                },
+                &res.brush,
+                1.0,
+                None,
+            );
+        }
+    }
+
+    /// Mic indicator geometry shared by the D2D path (matches GDI `draw_recording_indicator`
+    /// :2641): 18px icon at (6, vertically centered) with a wide pill body + stem + base,
+    /// plus the 2px left separator at x=30, 20px tall, centered vertically.
+    /// Colors come from the audio level snapshot (three-state) exactly like the GDI fn.
+    /// D2D-P1: drawn natively (no 4x HALFTONE supersampling) — D2D's per-primitive AA
+    /// replaces the GDI-era workaround. Geometry parameters in the对照表 in result.md.
+    fn mic_indicator(res: &D2dResources, h: f32, state: &OverlayWindowState) {
+        let circ_size = 18.0_f32; // MIC-ICON-ENLARGE-001: 18px (GDI supersamples 4x to 72)
+        let circ_l = 6.0_f32; // GDI: rect.left + 6
+        let circ_t = (h - circ_size) / 2.0; // GDI: (rect height - circ)/2
+
+        // Three-state audio indicator (same snapshot logic as GDI :2656-2669).
+        let (buf_empty, has_audio) = if let Ok(levels) = state.audio_buf.lock() {
+            let empty = levels.is_empty();
+            let audio = !empty && levels.iter().any(|v| v.current > 0.01);
+            (empty, audio)
+        } else {
+            (true, false) // Lock poisoned = stream failed
+        };
+        let circ_color = if buf_empty {
+            COLORREF(0x0000FF) // RED_STREAM_FAILED — device error
+        } else if has_audio {
+            super::OVERLAY_BRAND_ORANGE // has audio above threshold
+        } else {
+            COLORREF(0x808080) // GRAY_SILENT — device OK, no audio
+        };
+
+        unsafe {
+            // Pill body: GDI RoundRect(22,4,50,53, dia 28) on the 72px (4x) canvas
+            // ≡ (5.5, 1)-(12.5, 13.25) at 1x, i.e. a 7.0 × 12.25px pill with a fully
+            // rounded 3.5px radius (dia 7 = the GDI dia 28 / 4).
+            // Drawn rect-relative + icon origin (circ_l, circ_t).
+            let body_l = circ_l + 5.5;
+            let body_t = circ_t + 1.0;
+            let body_r = circ_l + 12.5;
+            let body_b = circ_t + 13.25;
+            let radius = 3.5; // GDI dia 28 / (2 × scale 4)
+            res.brush.SetColor(&colorref_to_d2d(circ_color));
+            res.rt.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: body_l,
+                        top: body_t,
+                        right: body_r,
+                        bottom: body_b,
+                    },
+                    radiusX: radius,
+                    radiusY: radius,
+                },
+                &res.brush,
+            );
+            // Stem: GDI 4px-wide line (36,53)→(36,63) @4x ≡ (9,13.25)→(9,15.75) @1x,
+            // drawn from the icon origin. D2D strokes center on the line like GDI pens.
+            let stem_x = circ_l + 9.0;
+            let stem_top = circ_t + 13.25;
+            let stem_bottom = circ_t + 15.75;
+            res.rt.DrawLine(
+                D2D_POINT_2F {
+                    x: stem_x,
+                    y: stem_top,
+                },
+                D2D_POINT_2F {
+                    x: stem_x,
+                    y: stem_bottom,
+                },
+                &res.brush,
+                1.0, // GDI: CreatePen(PS_SOLID, scale=4) @4x → 4/4 = 1px at 1x
+                None,
+            );
+            // Base: GDI (24,63)→(48,63) @4x ≡ (6,15.75)→(12,15.75) @1x from icon origin.
+            res.rt.DrawLine(
+                D2D_POINT_2F {
+                    x: circ_l + 6.0,
+                    y: stem_bottom,
+                },
+                D2D_POINT_2F {
+                    x: circ_l + 12.0,
+                    y: stem_bottom,
+                },
+                &res.brush,
+                1.0,
+                None,
+            );
+        }
+        // Left separator: GDI :2716-2727 — 2px gray line at rect.left+30, 20px tall.
+        unsafe {
+            let sep_l_x = 30.0; // GDI: rect.left + 30
+            let sep_hh = 10.0; // GDI: sep_h 20 / 2
+            let cy = h / 2.0; // GDI: rect.top + height/2 (rect-relative)
+            res.brush
+                .SetColor(&colorref_to_d2d(super::OVERLAY_BORDER_GRAY));
+            res.rt.DrawLine(
+                D2D_POINT_2F {
+                    x: sep_l_x,
+                    y: cy - sep_hh,
+                },
+                D2D_POINT_2F {
+                    x: sep_l_x,
+                    y: cy + sep_hh,
+                },
+                &res.brush,
+                2.0,
+                None,
+            );
+        }
+    }
+
+    /// GDI `draw_stop_button` (:2436): 16px orange square at right-25, vertically
+    /// centered; 1px outline + 8px solid inner block (4px inset). Returns the same
+    /// hit RECT as the GDI version (right/bottom +1: GDI Rectangle is exclusive).
+    fn stop_button(res: &D2dResources, w: f32, h: f32) -> RECT {
+        const BRAND_ORANGE: COLORREF = COLORREF(0x006BFF);
+        let bs = 16.0_f32;
+        let bl = w - 25.0; // GDI: rect.right - 25 (rect-relative width)
+        let bt = (h - bs) / 2.0; // GDI: (height - bs)/2
+        let cr = RECT {
+            left: bl as i32,
+            top: bt as i32,
+            right: (bl + bs + 1.0) as i32, // GDI Rectangle right/bottom exclusive → +1
+            bottom: (bt + bs + 1.0) as i32,
+        };
+        unsafe {
+            // Outline: GDI Rectangle(left,top,right,bottom) with a 1px pen covers
+            // left/top..right-1/bottom-1; D2D DrawRectangle stroke (1px, centered)
+            // on (l+0.5, t+0.5)-(r-0.5, b-0.5) lands on the same pixel rows.
+            let l = bl + 0.5;
+            let t = bt + 0.5;
+            let r = bl + bs + 1.0 - 0.5;
+            let b = bt + bs + 1.0 - 0.5;
+            res.brush.SetColor(&colorref_to_d2d(BRAND_ORANGE));
+            res.rt.DrawRectangle(
+                &D2D_RECT_F {
+                    left: l,
+                    top: t,
+                    right: r,
+                    bottom: b,
+                },
+                &res.brush,
+                1.0,
+                None,
+            );
+            // Inner solid: GDI Rectangle(il,it,il+isz+1,it+isz+1) filled — the +1 makes
+            // the fill 9px wide; D2D FillRectangle covers [l, r) the same way.
+            let isz = 8.0_f32;
+            let il = bl + (bs - isz) / 2.0;
+            let it = bt + (bs - isz) / 2.0;
+            res.rt.FillRectangle(
+                &D2D_RECT_F {
+                    left: il,
+                    top: it,
+                    right: il + isz + 1.0,
+                    bottom: it + isz + 1.0,
+                },
+                &res.brush,
+            );
+        }
+        cr
+    }
+
+    /// GDI `draw_listening_placeholder` (:2731): centered single-line hint
+    /// ("请说话..." / "Speak now...") between the mic area and the stop button.
+    fn placeholder_text(
+        res: &D2dResources,
+        w: f32,
+        h: f32,
+        ui_language: crate::config::UiLanguage,
+    ) {
+        let hint = super::i18n::get(ui_language).overlay_listening_hint;
+        let hint: Vec<u16> = hint.encode_utf16().collect();
+        unsafe {
+            res.brush
+                .SetColor(&colorref_to_d2d(super::OVERLAY_TEXT_WHITE));
+            // D2D-P1: same face/weight as the GDI text path (Segoe UI normal, streaming
+            // format) so the placeholder is visually continuous with the streaming text
+            // that replaces it — the P0 centered format is YaHei SemiBold and would
+            // visibly differ from the GDI baseline on Latin glyphs.
+            res.rt.DrawText(
+                &hint,
+                &res.streaming_text_format,
+                &D2D_RECT_F {
+                    left: super::STREAMING_TEXT_LEFT_MARGIN as f32,
+                    top: 0.0,
+                    right: w - super::STREAMING_TEXT_RIGHT_MARGIN as f32,
+                    bottom: h,
+                },
+                &res.brush,
+                windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+    }
+
+    /// GDI streaming text path (:2530-2563 of draw_recording_overlay_with_text):
+    /// clip to the text band, draw the tween-visible prefix at
+    /// `x = text_left - scroll_x`, newest text pinned to the right edge once overflow.
+    /// Metrics come from the caller (GDI measure_text_width — the single metric source
+    /// agreed in D2D-P1 方案裁定 1/2), passed as `text_width` so the D2D side never
+    /// measures on its own and cannot drift from the window sizing path.
+    /// `visible_text` is the tween-visible prefix (OVERLAY-051-G), precomputed by the
+    /// caller exactly like the GDI path.
+    fn streaming_text(res: &D2dResources, w: f32, h: f32, visible_text: &str, text_width: i32) {
+        let text_left = super::STREAMING_TEXT_LEFT_MARGIN as f32;
+        let text_right = w - super::STREAMING_TEXT_RIGHT_MARGIN as f32;
+        let text_top = super::OVERLAY_TEXT_DRAW_VERTICAL_INSET as f32;
+        let text_bottom = h - super::OVERLAY_TEXT_DRAW_VERTICAL_INSET as f32;
+        let visible_w = (text_right - text_left).max(1.0);
+        let scroll_x = ((text_width as f32) - visible_w).max(0.0);
+
+        let visible: Vec<u16> = visible_text.encode_utf16().collect();
+        unsafe {
+            // Clip: GDI SaveDC → SelectClipRgn(text area) → RestoreDC.
+            // D2D: PushAxisAlignedClip → DrawText → PopAxisAlignedClip.
+            res.rt.PushAxisAlignedClip(
+                &D2D_RECT_F {
+                    left: text_left,
+                    top: text_top,
+                    right: text_right,
+                    bottom: text_bottom,
+                },
+                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            );
+            res.brush
+                .SetColor(&colorref_to_d2d(super::OVERLAY_TEXT_WHITE));
+            // Layout rect shifted left by scroll_x; the layout is wider than the clip,
+            // so the right edge of the text (newest) stays pinned at text_right.
+            res.rt.DrawText(
+                &visible,
+                &res.streaming_text_format,
+                &D2D_RECT_F {
+                    left: text_left - scroll_x,
+                    top: text_top,
+                    right: text_right - scroll_x,
+                    bottom: text_bottom,
+                },
+                &res.brush,
+                windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+            res.rt.PopAxisAlignedClip();
+        }
+    }
+
+    /// D2D-P1: `RecordingStreamingIdle`（聆听占位态）= chrome + mic indicator +
+    /// centered placeholder hint + stop button. Returns false on any D2D failure —
+    /// the caller (draw_recording_overlay) renders the same frame via GDI.
+    pub(crate) fn draw_streaming_idle_overlay(
+        hdc: HDC,
+        rect: &RECT,
+        state: &OverlayWindowState,
+        ui_language: crate::config::UiLanguage,
+    ) -> bool {
+        with_d2d(hdc, rect, |res, w, h| {
+            chrome(res, w, h);
+            mic_indicator(res, h, state);
+            placeholder_text(res, w, h, ui_language);
+            let _ = stop_button(res, w, h);
+        })
+    }
+
+    /// D2D-P1: `RecordingWithText`（流式文字态）= chrome + mic indicator +
+    /// scroll-clipped streaming text + stop button. Returns false on any D2D
+    /// failure — the caller (draw_recording_overlay_with_text) renders the same
+    /// frame via GDI. `text_width` is measured by the caller with the GDI font
+    /// (single metric source); `visible_text` is the tween-visible prefix.
+    pub(crate) fn draw_streaming_text_overlay(
+        hdc: HDC,
+        rect: &RECT,
+        state: &OverlayWindowState,
+        visible_text: &str,
+        text_width: i32,
+    ) -> bool {
+        with_d2d(hdc, rect, |res, w, h| {
+            chrome(res, w, h);
+            mic_indicator(res, h, state);
+            streaming_text(res, w, h, visible_text, text_width);
+            // Right separator (主控 D2D-P1 验收要求补齐): GDI 版 :2617-2624 逐项照抄 —
+            // x = width-36, 高 20 垂直居中, 2px OVERLAY_BORDER_GRAY。文字区与停止键之间。
+            unsafe {
+                let sep_r_x = w - 36.0; // GDI: rect.right - 36 (rect-relative)
+                let sep_hh = 10.0; // GDI: sep_h 20 / 2
+                let cy = h / 2.0;
+                res.brush
+                    .SetColor(&colorref_to_d2d(super::OVERLAY_BORDER_GRAY));
+                res.rt.DrawLine(
+                    D2D_POINT_2F {
+                        x: sep_r_x,
+                        y: cy - sep_hh,
+                    },
+                    D2D_POINT_2F {
+                        x: sep_r_x,
+                        y: cy + sep_hh,
+                    },
+                    &res.brush,
+                    2.0,
+                    None,
+                );
+            }
+            let _ = stop_button(res, w, h);
+        })
     }
 }
 

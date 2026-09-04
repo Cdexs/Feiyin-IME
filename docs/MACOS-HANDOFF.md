@@ -1415,3 +1415,13 @@ qwen_inference.rs 的空 display 闸门在 `transcribe_streaming_realtime`（平
 未来接 realtime 流式路径将同样受益（空包不转发是纯数据层改进，无平台耦合）。
 
 **macOS 无 AltGr 键序**结论沿用 HOTKEY-078/079 条目；本单不触及输入/热键域。
+
+## D2D-P1（2026-09-04，coder-2）
+
+**Direct2D 为 Windows 独有**：本单全部改动位于 `#[cfg(target_os = "windows")]` 的 `mod d2d`
+与 windows-only 绘制函数（`draw_recording_overlay` / `draw_recording_overlay_with_text` /
+`draw_stop_button_hit_rect_only` / `text_hit_rect_for`）。`with_d2d`/原语层/两态入口全在该
+cfg 区内，macOS 编译不触及。
+
+**零编译影响 / 零行为差异**：macOS overlay 走 `src/platform/macos/overlay.rs` 独立路径；
+流式文字的度量与滚动逻辑（GDI measure_text_width）同为 windows-only。macOS 无对应改动需求。
