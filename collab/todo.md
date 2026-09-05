@@ -2,6 +2,71 @@
 
 ## 🔴 2026-09-05 —— 当前状态（最新在最上）
 
+### 🟢 BUILD-098 已出包（2026-09-05 13:36）—— 待 Gavin 端测，重点：托盘退出
+
+- **P0 达成**：托盘退出端到端 **5/5 干净退出**（修复前同手法 5 次 4 挂）。
+  每次先触发录音确保 D2D 槽非空 —— **空槽退出不构成证据**（REPRO-094 run4 教训）
+- **判别探针**：`grep -c 'D2D-HANG-095' Publish/feiyin-ime.exe` = **1**（BUILD-093 旧包实测 **0**），
+  新代码进包有硬证据；对照探针 `D2D-P1` 仍 = 2
+- **产物**：`Publish/` main `39cca97c…`（异于 093 `e6f55e0a…`）/ ui `5d292c16…` / crash `ea83504d…`
+- **Gavin 端测重点**：**先说几句话让浮层真画出来，再点托盘退出**；直接启动就退不算数
+
+### 🔴 E2E 门禁真相：5F 全部非本批引入，但暴露门禁一直是虚的（主控 2026-09-05 取证）
+
+BUILD-098 E2E = **61P / 5F / 33S / 6deselected**，看着比 BUILD-093 的 64P/1F 差。
+**主控查证结论：不是回归，是门禁第一次照出真相。**
+
+| FAIL | 归因 | 证据 |
+| --- | --- | --- |
+| `test_full_recording_pipeline_toggle` | **非本批**，此前根本没跑 | `logs/20260817.md:706` 明载「test_full_pipeline_e2e ModuleNotFoundError toml \| 4 \| 环境缺 toml pip 包」，自 8-17 起这 4 条一直是 ERROR 不是 PASS |
+| `test_full_recording_pipeline_ptt` | 同上 | 本批 `pytest_e2e.log` 第一次跑仍是 `ModuleNotFoundError: No module named 'toml'`，tester-1 补装模块后才首次真正执行 |
+| `test_recording_cancel_flow` | 同上 | 失败信息 `Notepad should still be running`（notepad 自己退了）= harness 问题 |
+| `test_focus_lost_preview_flow` | 同上 | `Expected processing state, got hidden` |
+| `test_focus_lost_preview`（test_injection） | **预存测试 bug，8-17 已在案** | `logs/20260817.md:705`「test_injection `_no_hardware` AttributeError \| 1 \| 预存 harness 缺陷」 |
+
+**⚠️ 两次数字不可直接比**：BUILD-093 跑的是 `-m "not hardware"`（7 deselected），
+本次 6 deselected，**选集不同**；且本次多装了 `toml` 模块，4 条从 ERROR 转为真执行。
+
+#### 🔴 真正值得警惕的是这个，不是那 5 个 F
+
+**E2E 出包门禁三周来一直是虚的。** BUILD-085 / BUILD-093 报的「64P/1F」「65P/0F」看着漂亮，
+但 **full_pipeline 这 4 条最有价值的端到端用例根本没在跑**（ERROR 不计入 FAIL），
+`test_injection` 那条也没跑。门禁的实际覆盖比数字显示的少 5 条，且**少的正是全链路那几条**。
+
+#### 4 条 full_pipeline 失败是不是真 bug —— **未知，需单独查**
+
+失败信息集中在 `Expected processing state after stop, got hidden`。
+两个方向，**主控倾向 harness/环境，但不作定论**：
+
+1. **强先例**：`logs/20260817.md:703` 记过 6 条 test_hotkey 同样报「overlay hidden」，
+   经决定性实验证明是 **harness 缺陷（`[E2E-CONFIG-PATH-STALE-001]`），产品正常**
+2. 自动化环境无真实麦克风输入 → 录到静音 → 无转写内容 → overlay 直接隐藏而不进 Processing。
+   佐证：同文件其他类有 `_no_hardware()` 跳过守卫，full_pipeline 这几个类没有
+3. 另一个待排除项：DeepSeek key 已吊销，若新 key 未配置则 LLM 401（todo 既有待办）
+
+#### 下一棒：E2E-GATE-099（待 Gavin 端测后派）
+
+- 判定 4 条 full_pipeline 失败是产品缺陷还是 harness/环境缺陷（**必须做决定性实验，不许推断结案**）
+- 修 `test_focus_lost_preview` 的 `_no_hardware` 预存 bug
+- 把 `toml` 依赖写进 E2E 环境要求，**并加一条「ERROR 数 > 0 即门禁不通过」的判据** ——
+  否则同类静默失效还会再来一次
+
+### ✅ DEC-056 补充一：处理中态灰线不回退软边，直接等 per-pixel alpha（Gavin 2026-09-05 拍板）
+
+Gavin 端测截图反馈「处理中窗口边沿灰线还是粗乱的」。**非回归、非漏做** ——
+OVERLAY-086 Bug 1 验收原文即「消除楔形**保灰线**」（CHANGELOG:722），当时已下调目标。
+
+机制（主控实读代码）：`src/main.rs:2139` 用 `SetWindowRgn` 半径 16 的**二值掩码**
+去卡 D2D 画的**抗锯齿**描边（`:3163` `corner_radius=16.0`），
+掩码无中间态而抗锯齿恰好活在被切掉那圈 → 断续粗灰点。
+窗口仅 36px 高、半径 16 → 上下弧几乎相接近胶囊形，**阶梯在近垂直弧段最扎眼**。
+
+回退 `None` → 软边回来但楔形也回来。`LWA_COLORKEY`、单态临时切 `UpdateLayeredWindow`
+两条绕法均已否决。**唯一真解 per-pixel alpha，必须等八态全迁完。**
+
+**Gavin 决定**：不为此单独出包二选一（原话「先不试了，按照你建议来」）。
+→ **下一批直接冲 P2+P3 五态合并迁 D2D，迁完立刻接 per-pixel alpha**，DEC-057 排期提到最优先。
+
 ### 🔴 D2D-HANG-095 · 根因修复（coder-2，2026-09-05 派发，进行中）
 
 **根因已由 REPRO-094 实证锁死，不是推测**：Rust `thread_local!` 析构器在 Windows 上

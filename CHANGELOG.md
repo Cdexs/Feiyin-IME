@@ -734,3 +734,4 @@ D2D-HANG-095-B | spawn_overlay_thread 闭包尾部直调改 Drop 守卫（D2dRel
 | REPRO-094-DOC | handoffs.md + troubleshooting.md 补账：D2D-HANG-001 根因条目落盘（+18/0 与 +39/0 纯追加） | tester-1 | 2026-09-05 |
 | TEST-SYNC-096 | 阶段三：解除两条 D2D #[ignore]（用例尾部显式 release_resources）+ 新增「线程退出不死锁」与「空槽幂等」两条护栏（src/main.rs +59/-6，全在 test 模块） | tester-1 | 2026-09-05 |
 | TEST-EXEC-097 | 阶段四 D2D-HANG 批全量回归：root 1065/0/9 + tauri 76 + vitest 89 全绿；消融（删线程内释放）进程挂死=判别力最强形态，已还原 | tester-1 | 2026-09-05 |
+| BUILD-098 | v0.9.0 出包（D2D-HANG-095+096 进包）：七项核验全过（sha 39cca97c 异于 093、D2D-HANG-095 探针=1）；托盘退出 5/5 干净（修复前 4/5 挂）；E2E 61P/5F（4 full_pipeline processing-state + 1 focus_lost 预存bug，待主控归因）；toggle_stop 仍间歇 | tester-1 | 2026-09-05 |

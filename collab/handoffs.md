@@ -205,3 +205,12 @@
 - **还原自证**：diff --numstat=59/6 复原；重跑护栏 1P/0F/0I 0.10s 绿；全量在其后跑 0.69s 无卡顿。
 - **红线**：未改任何用例（仅消融行注释并还原）；未 commit；v0.9.0 未动；Publish/config.toml sha=3186ec8c 保持。
 - **详情**：outbox/tester-1/result.md + 执行日志（cargo_test_root/tauri.log、ablation_run.log、restore_check.log）。
+
+## 2026-09-05 — tester-1 — BUILD-098 ✅ 阶段五出包（七项核验全过 + 托盘退出 5/5 干净退出，E2E 61P/5F 待主控归因，产物在 Publish/）
+
+- **构建**：四步完成；feiyin-ime 12,229,632B / ui 10,053,632B / crash 24,887,808B；toml 三副本 scene 0a3a0b9a / itn 311cbb96。
+- **七项核验**：sha target↔Publish 三对相等、main 39cca97c 异于 093(e6f55e0a)；ProductVersion 0.9.0.0；**D2D-HANG-095 探针=1**（新代码入包硬证据）+ D2D-P1=2；冒烟 Responding 无 panic。
+- **托盘退出 E2E（核心）**：复用探针 D（隔离 APPDATA + WM_QUIT 同链路 + 先触发录音画 D2D）→ 新包 **5/5 干净退出**（修复前 5次4挂）；debug.log 4 次 "D2D resources released in-thread before thread exit" 佐证。**D2D-HANG-095 端到端修复成立**。
+- **E2E 门禁**：补装缺失 `toml`（首轮 4 条 full_pipeline 收集期 ERROR）后全量 **61P/5F/33S/6deselected**。5F=4×full_pipeline（processing state got hidden/recording，可复现）+1×focus_lost_preview（`_no_hardware` AttributeError = 独立类未继承静态方法的**预存在测试代码 bug**，建议主控派 TEST-FIX）。toggle_stop：本批全量转绿一次、standalone 3x=PASS/FAIL/PASS，**仍间歇**，交主控归因（非本批修复可证事项，第8项已独立证明退出修复）。
+- **红线**：未改任何代码；未 commit；v0.9.0 未动；config.toml sha 3186ec8c 保持；debug.log 恢复原样；日志全部 mv 至 outbox/tester-1/build098/（无 cp 残留）；无残留进程。
+- **详情**：outbox/tester-1/result.md + build098/ 证据目录。
