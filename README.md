@@ -120,6 +120,15 @@ cargo check
 build.bat
 ```
 
+### Git 提交钩子（每个新 clone 必须执行一次）
+
+仓库自带密钥/隐私扫描闸门（pre-commit / pre-push），但 `core.hooksPath` 不会被
+clone 继承，新 clone 后必须手动配置一次才生效：
+
+```bash
+git config core.hooksPath scripts/git-hooks
+```
+
 ### 运行时依赖设置
 
 所有外部资源从 **exe 所在目录**加载：

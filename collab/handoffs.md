@@ -2,6 +2,17 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-09-05 — coder-1 — SECRET-104 ✅ 手机号闸门 Cargo.lock 校验和误报修复（secret-patterns.sh 边界收紧 + README 补 hooksPath 说明，待主控验收）
+
+- **改动**：`scripts/git-hooks/secret-patterns.sh` PHONE 边界 `[^0-9]` → `[^0-9A-Za-z]`（+3 行注释）；
+  README.md 新增「### Git 提交钩子」小节（worker-guide.md:156 已有，README 补齐）
+- **实测**：一次性临时仓库七用例全过 + push 侧两向验证（干净放行/手机号拦截），
+  明细见 `outbox/coder-1/result.md`；首轮 push 侧误判系测试脚本 non-fast-forward 未触发钩子，已复盘重建实证
+- **已知漏网形态（如实）**：紧贴字母/数字的手机号（`id13812345678`）不再命中
+- **附带发现（未动手，按 §12 上报）**：工作区另有 44 个文件纯 CRLF/LF 翻转，
+  `git diff -w` 后实质差异仅 secret-patterns.sh，非本 session 造成，请主控裁定处置方式
+
+
 ## 2026-09-04 — tester-1 — TEST-FIX-080 阶段三 ✅ 主控验收通过（代码 PASS，文档同步由主控回填）
 
 - **交付**：`+190/-42` 四文件，全部落在测试模块内（主控逐 hunk 核对行号：audio `mod tests` :1365 起／

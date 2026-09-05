@@ -4566,3 +4566,51 @@ coder-2 由此推出「服务端新句 partial 是累计式，携带上一句全
 `[ASR-SERVER-REWRITES-TIMELINE-001]` 第五节第 3 条已写过「观测可信 ≠ 推论可信」，
 且写的就是**同一个 Worker 查同一份日志**的教训。**本条是它的第二次复发**，
 故单列并把判据写成可执行的三条自查，而不是再提醒一次。
+
+## [SAFECRLF-WARNING-MISREAD-001] ⚠️ 把 git 的 `LF will be replaced by CRLF` **警告行**当成「N 个文件被改动」上报【两个 Worker 各踩一次】
+
+**日期**：2026-09-05 ｜ **来源**：coder-2 报「45 文件纯 CRLF 改动、基线即脏」，
+coder-1 报「44 文件纯 CRLF 翻转非我所致」—— **同一误读，两个 Worker，同一天**
+
+### 一、现象
+
+仓库 `core.autocrlf=true`，`git add` / `git diff` 会对每个被处理的文本文件打印：
+
+```
+warning: in the working copy of 'X', LF will be replaced by CRLF the next time Git touches it
+```
+
+这是 `core.safecrlf` 的**提示**，说的是「将来 git 再碰它时会转换」，
+**不是**「这个文件现在有改动」。Worker 数了警告行数，当成了改动文件数上报。
+
+### 二、判据（一条命令定案）
+
+```bash
+git -c core.safecrlf=false diff --numstat
+```
+
+`-c core.safecrlf=false` 关掉警告，输出只剩**真实的增删行数**。
+
+两次实测结果：
+
+| 上报 | 实际 `--numstat` |
+| --- | --- |
+| coder-2「45 文件纯 CRLF 改动」 | **7 个文件，全部为真实内容改动，零 CRLF-only 改动** |
+| coder-1「44 文件纯 CRLF 翻转」 | **5 个文件，全部为真实内容改动，零 CRLF-only 改动** |
+
+### 三、为什么值得单列
+
+这条误读的后果不是白虚惊一场 —— 它会让人**怀疑基线脏了**，
+进而产生「先清理一下工作区」的冲动，而清理动作（`git checkout --` / `git stash`）
+正是 `worker-guide` 第十二节**明令禁止**的破坏性命令（2026-07-24 已经炸过一次，
+多个已验收批次的改动被抹掉）。**误读 → 想清理 → 踩禁令**，这条链必须在第一环掐断。
+
+### 四、规矩
+
+1. **报告工作区状态一律以 `git -c core.safecrlf=false diff --numstat` 为准**，
+   不要数 warning 行，也不要凭 `git status` 的输出条数目测。
+2. 怀疑基线脏 → **报主控，不要自己清理**（worker-guide 第十二节）。
+3. 顺带记一个**真隐患**（与本条不同，是真的）：`.gitattributes` 目前只覆盖
+   `scripts/git-hooks/**`，其余跟踪文件工作区是 LF、新 clone 会被检出成 CRLF。
+   主控 2026-09-05 沙盒实测：**新 clone 的钩子脚本确实仍是 LF（该修复有效）**，
+   但其它文件未覆盖。是否补 `* text=auto eol=lf` 待 Gavin 定夺，已记 todo「卫生债」。
