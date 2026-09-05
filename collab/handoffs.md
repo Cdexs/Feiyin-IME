@@ -188,3 +188,20 @@
 - **验证**：fmt exit 0 / check --all-targets 0 error / diff 相对 095 基线仅 spawn_overlay_thread 一个 hunk（vs HEAD 两 hunk 因 095 未 commit，已说明）
 - **红线**：release_resources 本体未动 / 无 catch_unwind / with_d2d·原语·测试模块·troubleshooting.md 未碰 / 未 commit / v0.9.0 未动 / 零凭证
 - **详情**：outbox/coder-2/result.md + logs/20260905.md + CHANGELOG.md + MACOS-HANDOFF §D2D-HANG-095 追加句
+
+## 2026-09-05 — tester-1 — TEST-SYNC-096 ✅ 阶段三（解除两条 #[ignore] + D2D-HANG-095 护栏，待主控验收 + 阶段四 TEST-EXEC-097 首跑）
+
+- **交付**：`src/main.rs` +59/-6，五处 hunk 全部落在 `#[cfg(all(test, target_os = "windows"))]` 模块内（overlay_075 / overlay_086），生产零改动。
+- **1.1**：两条 `#[ignore]`（:8842 / :8881）整体删除，用例末尾加 `d2d::release_resources()` + 说明注释；测试内 3 个会填槽的 `d2d::draw_*` 调用点（:8855/:8896/:8902）全部覆盖。
+- **1.2**：新护栏 `d2d_thread_with_populated_slot_exits_after_in_thread_release` —— `is_finished()` 10s 轮询断言线程真实退出；消融=删线程体内释放必红。
+- **1.3**：新护栏 `d2d_release_resources_is_idempotent_on_empty_slot` —— 空槽重复调用不 panic。
+- **验证**：`cargo fmt --check` exit 0；`cargo check --all-targets` 0 error（102 条 warning 均既有）；未跑 `cargo test`（白名单设计如此，首跑归阶段四）。
+- **红线合规**：未 commit / v0.9.0 未动 / 零凭证 / 无临时文件。
+
+## 2026-09-05 — tester-1 — TEST-EXEC-097 ✅ 阶段四全量回归（三层全绿，消融证判别力，待主控验收 → 阶段五 BUILD-098）
+
+- **数字**：root 主 bin **1065P/0F/9I**（与 1061+2+2 / 11-2 对账逐位吻合）+ src-tauri 76P + vitest 89P；E2E/smoke 主控指定 SKIP（旧包不含本批）。
+- **消融**：注释 `src/main.rs:9269`（护栏线程体内 release）→ 单跑护栏用例 → **整个 test 进程挂死**（ablation_run.log：running 1 test 后无结果行，EXIT=124）= D2D-HANG-001 本体复现，判别力最强形态；timeout 清理，无残留进程。
+- **还原自证**：diff --numstat=59/6 复原；重跑护栏 1P/0F/0I 0.10s 绿；全量在其后跑 0.69s 无卡顿。
+- **红线**：未改任何用例（仅消融行注释并还原）；未 commit；v0.9.0 未动；Publish/config.toml sha=3186ec8c 保持。
+- **详情**：outbox/tester-1/result.md + 执行日志（cargo_test_root/tauri.log、ablation_run.log、restore_check.log）。

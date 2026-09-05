@@ -8840,9 +8840,6 @@ mod overlay_075_d2d_guard_tests {
     /// overlay 永不空白（coder 注释 :2058-2060 的契约）。
     /// 消融：若 D2D 失败时 panic 或返回 true，本用例红（回落永不触发/进程崩）。
     #[test]
-    #[ignore = "D2D-HANG-001: NULL HDC 调 D2D 在本进程内挂死（主控 2026-09-05 定位到
-create_resources 的 CreateDCRenderTarget 之后）。Gavin 授权先跳过以解除出包阻塞，
-根因待查——疑与端侧『点托盘退出无响应只能 kill』同源，是 P0 待办不是已解决。"]
     fn d2d_processing_returns_false_on_invalid_hdc_gdi_fallback_trigger() {
         // 无效 HDC：create_resources 可成功（工厂创建不依赖窗口），BindDC 必败
         let hdc = HDC(std::ptr::null_mut());
@@ -8857,6 +8854,11 @@ create_resources 的 CreateDCRenderTarget 之后）。Gavin 授权先跳过以�
             !ok,
             "无效 HDC 上 D2D 必须返回 false —— 这是 GDI 回落路径的当帧触发器（overlay 永不空白契约）"
         );
+        // D2D-HANG-095: 本用例以无效 HDC 调 D2D 入口，create_resources 会成功
+        //（工厂创建不依赖窗口），因此本测试线程的 thread_local 槽被填上了 D2D 资源。
+        // 必须在用例体内显式释放 —— 否则测试线程退出时由 FLS 回调在 loader lock 下
+        // 析构 COM，自锁死锁，整个 test 进程挂死且 kill 不掉（REPRO-094 探针 B/C 实证）。
+        d2d::release_resources();
     }
 }
 
@@ -8879,9 +8881,6 @@ mod overlay_086_d2d_p1_guard_tests {
     /// 顺序自证：本用例直接以无效 HDC 调入口（无时序依赖），与生产调用点
     /// `if !d2d::draw_*(...) { GDI }` 的判定顺序（先 D2D 后 GDI）一致。
     #[test]
-    #[ignore = "D2D-HANG-001: NULL HDC 调 D2D 在本进程内挂死（主控 2026-09-05 定位到
-create_resources 的 CreateDCRenderTarget 之后）。Gavin 授权先跳过以解除出包阻塞，
-根因待查——疑与端侧『点托盘退出无响应只能 kill』同源，是 P0 待办不是已解决。"]
     fn d2d_streaming_two_entries_return_false_on_invalid_hdc_gdi_fallback_trigger() {
         let hdc = HDC(std::ptr::null_mut());
         let rect = RECT {
@@ -8904,6 +8903,11 @@ create_resources 的 CreateDCRenderTarget 之后）。Gavin 授权先跳过以�
             !ok_text,
             "RecordingWithText 入口：无效 HDC 必须返回 false（GDI 回落触发器）"
         );
+        // D2D-HANG-095: 本用例以无效 HDC 调 D2D 入口，create_resources 会成功
+        //（工厂创建不依赖窗口），因此本测试线程的 thread_local 槽被填上了 D2D 资源。
+        // 必须在用例体内显式释放 —— 否则测试线程退出时由 FLS 回调在 loader lock 下
+        // 析构 COM，自锁死锁，整个 test 进程挂死且 kill 不掉（REPRO-094 探针 B/C 实证）。
+        d2d::release_resources();
     }
 
     /// 护栏 3：D2DERR_RECREATE_TARGET 常量值钉死 0x8899000C。
@@ -9237,6 +9241,55 @@ create_resources 的 CreateDCRenderTarget 之后）。Gavin 授权先跳过以�
         );
         let sep_hh = 10.0; // 两路径共用的半高（GDI sep_h/2=10、D2D :3631 同值）
         assert_eq!(sep_hh, 10.0, "半高 10（全高 20）口径不得漂移");
+    }
+
+    /// D2D-HANG-095 护栏：填满 D2D thread_local 槽的线程，在**线程体内**显式释放后
+    /// 必须能正常退出。这是 D2D-HANG-001 的直接护栏。
+    /// 消融：把线程体里的 `d2d::release_resources()` 删掉 → 线程退出时走 FLS 回调，
+    /// 在 loader lock 下析构 COM 自锁 → `is_finished()` 永远为 false → 本用例在
+    /// 超时断言处红（而不是整个 test 进程静默挂死）。
+    /// 🔴 已知性质：消融态下那个线程会永久卡住，可能连带拖住 test 进程退出。
+    ///    这是被测缺陷本身的性质，不是本用例的缺陷 —— 正常态不会发生。
+    /// 顺序自证：本用例线程体内先调 D2D 入口（填槽，BindDC 必败返回 false）再释放，
+    /// 与生产 `spawn_overlay_thread` 闭包尾部 `d2d::release_resources()` 的
+    /// 「先用后释放」顺序一致；断言对象是线程是否真正走完退出（`is_finished`）。
+    #[test]
+    fn d2d_thread_with_populated_slot_exits_after_in_thread_release() {
+        let handle = std::thread::spawn(|| {
+            let hdc = HDC(std::ptr::null_mut());
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: 200,
+                bottom: 36,
+            };
+            // 走一次 D2D 入口把 thread_local 槽填上（BindDC 必败，返回 false，但资源已建）
+            let _ = d2d::draw_processing_overlay(hdc, &rect, config::UiLanguage::Chinese, 0.5);
+            // 线程体内显式释放 —— 删掉这一句本用例必红
+            d2d::release_resources();
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            handle.is_finished(),
+            "填过 D2D 槽的线程 10s 内未退出 —— thread_local COM 析构在 loader lock 下自锁复发（D2D-HANG-001）"
+        );
+        let _ = handle.join();
+    }
+
+    /// D2D-HANG-095 护栏：`release_resources()` 幂等 —— 槽为空时重复调用不得 panic。
+    /// 生产路径：`spawn_overlay_thread` 闭包尾部的 `D2dReleaseGuard` 在
+    /// `run_overlay_thread` 根本没画过任何 D2D 状态（资源槽始终为空）时也会触发，
+    /// 若空槽调用 panic，正常退出也会崩 —— 本用例钉住「空槽重复调用安全」。
+    /// 消融：把 `release_resources()` 实现改成空槽时 panic/错误 → 本用例红。
+    /// 顺序自证：纯幂等调用，无时序依赖；与生产空槽守卫路径（D2D.with → take → None）一致。
+    #[test]
+    fn d2d_release_resources_is_idempotent_on_empty_slot() {
+        d2d::release_resources();
+        d2d::release_resources(); // 空槽重复调用不得 panic
     }
 
     // --- helpers ---

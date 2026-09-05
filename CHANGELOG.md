@@ -732,3 +732,5 @@ D2D-HANG-095 | overlay 线程退出 COM Release 加载器锁死锁根因修复�
 | REPRO-094 | D2D-HANG-001 根因定位：thread_local COM Release 在线程退出 loader lock 下自锁（H1成立，Q1=ID2D1SolidColorBrush::Release，探针D真实exe 4/5挂） | tester-1 | 2026-09-05 |
 D2D-HANG-095-B | spawn_overlay_thread 闭包尾部直调改 Drop 守卫（D2dReleaseGuard），堵住 panic 展开跳过释放的漏网路径（:1475 unwrap/:3115 expect/Mutex 中毒均会绕过尾部语句）；双重借用推理复核成立（with_d2d 帧 RefMut 同帧逆序析构先于守卫归还借用）故用 borrow_mut；release_resources 本体零改动；fmt/check 0 error | coder-2 | 2026-09-05
 | REPRO-094-DOC | handoffs.md + troubleshooting.md 补账：D2D-HANG-001 根因条目落盘（+18/0 与 +39/0 纯追加） | tester-1 | 2026-09-05 |
+| TEST-SYNC-096 | 阶段三：解除两条 D2D #[ignore]（用例尾部显式 release_resources）+ 新增「线程退出不死锁」与「空槽幂等」两条护栏（src/main.rs +59/-6，全在 test 模块） | tester-1 | 2026-09-05 |
+| TEST-EXEC-097 | 阶段四 D2D-HANG 批全量回归：root 1065/0/9 + tauri 76 + vitest 89 全绿；消融（删线程内释放）进程挂死=判别力最强形态，已还原 | tester-1 | 2026-09-05 |
