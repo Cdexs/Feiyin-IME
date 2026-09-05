@@ -214,3 +214,12 @@
 - **E2E 门禁**：补装缺失 `toml`（首轮 4 条 full_pipeline 收集期 ERROR）后全量 **61P/5F/33S/6deselected**。5F=4×full_pipeline（processing state got hidden/recording，可复现）+1×focus_lost_preview（`_no_hardware` AttributeError = 独立类未继承静态方法的**预存在测试代码 bug**，建议主控派 TEST-FIX）。toggle_stop：本批全量转绿一次、standalone 3x=PASS/FAIL/PASS，**仍间歇**，交主控归因（非本批修复可证事项，第8项已独立证明退出修复）。
 - **红线**：未改任何代码；未 commit；v0.9.0 未动；config.toml sha 3186ec8c 保持；debug.log 恢复原样；日志全部 mv 至 outbox/tester-1/build098/（无 cp 残留）；无残留进程。
 - **详情**：outbox/tester-1/result.md + build098/ 证据目录。
+
+## 2026-09-05 — coder-2 — OVERLAY-101+102 ✅（Bug B 修复 + 宽度上限 50%，待主控验收）
+
+- **Bug A 协商结果**：我的「display 双计」假说被主控驳回（我把 log display 输出字段二次误当 raw 输入反推；52 包 display 单调、最大 61、零回落）；Bug A 转待证据（09-05 端测无 -debug 日志），qwen_inference.rs 零改动
+- **Bug B 机制**（主控裁定「你对了」）：!do_it 节流帧不重算 x，沿用 overlay_geometry 默认位（240 居中）+ SetWindowPos 应用 current → 到上限后右窜 (current−240)/2 且插值循环休眠无帧纠正；触发=句界双 Show 同毫秒（日志 25.835 实证）
+- **改动**：centered_x 纯函数统一 5 处居中；Show 流式两分支 x 一律 current 现算（!do_it 帧=修复本体）；插值循环/overlay_geometry/adjust 只换调用不换宽度（主控边界遵守，同值证明表在 result.md）；OVERLAY-102 0.65→0.50 分步改
+- **验证**：fmt exit 0 / check 0 error / 163 warning 持平；7 hunk 全列行号，测试模块零触碰；消融推演逐项
+- **红线**：interpolate_step/grow-snap/streaming_scroll_offset/d2d 未动 / troubleshooting.md 未碰 / 未 commit / v0.9.0 未动 / 零凭证
+- **详情**：outbox/coder-2/result.md + logs/20260905.md + CHANGELOG.md + MACOS-HANDOFF §OVERLAY-101

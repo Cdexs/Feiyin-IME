@@ -1045,8 +1045,11 @@ const STREAMING_TEXT_BOTTOM_MARGIN: i32 = 10; // EDIT fallback still uses this
                                               // only the available height grows from 16px to 28px, which is enough for -14 ClearType.
 #[cfg(target_os = "windows")]
 const OVERLAY_TEXT_DRAW_VERTICAL_INSET: i32 = 4;
+// OVERLAY-102 (Gavin 端测 2026-09-05): 0.65 → 0.50。必须与 OVERLAY-101 的修复
+// 分两步落地：改比例会移动 Bug B 的触发点（上限更早到达），混在一起无法区分
+// 「修好了」还是「换了个位置没触发」。
 #[cfg(target_os = "windows")]
-const STREAMING_OVERLAY_MAX_SCREEN_RATIO: f32 = 0.65;
+const STREAMING_OVERLAY_MAX_SCREEN_RATIO: f32 = 0.50;
 #[cfg(target_os = "windows")]
 fn spawn_overlay_thread(
     audio_buf: AudioLevelBuf,
@@ -1235,7 +1238,7 @@ fn run_overlay_thread(
                         // OVERLAY-054-B-FIX: track pos via a local since request.pos is now Option
                         let mut final_pos = resolved_pos;
                         if let Some(ref mut state) = state_guard {
-                            let (pos, desired_size) = adjust_overlay_pos_size_for_text(
+                            let (adj_pos, desired_size) = adjust_overlay_pos_size_for_text(
                                 hwnd,
                                 &request.status,
                                 &resolved_pos,
@@ -1256,27 +1259,23 @@ fn run_overlay_thread(
                                 state.last_resize_time = Some(now);
                                 state.target_size = desired_size;
                                 state.pending_size = Some(desired_size);
-                                // OVERLAY-068-A: position must follow the *current* rendered width,
-                                // not the target width. If x is centered on desired_size while the
-                                // window is still interpolating toward it, the window visibly jumps
-                                // because the left edge snaps to a new center before the right edge
-                                // has caught up. Use the width that will actually be applied this frame.
-                                // OVERLAY-086 Bug 3: growing width now interpolates too, so the
-                                // width actually applied this frame is ALWAYS the in-flight
-                                // current_size (both directions) — the old grow-snap made the
-                                // growing case equal desired_size, which is why this used to be
-                                // an if/else. One width, one source of truth, same as the
-                                // SetWindowPos below and the interpolation loop's R1 recenter.
-                                let applied_size = state.current_size;
-                                // center horizontally based on the width applied this frame
-                                let work = monitor_work_rect(hwnd);
-                                let work_w = work.right - work.left;
-                                let x = work.left + (work_w - applied_size[0]) / 2;
-                                let y = pos[1];
-                                final_pos = [x, y];
                             } else if let Some(size) = state.pending_size {
                                 request.size = size;
                             }
+                            // OVERLAY-101 (Bug B): x 一律由实际应用宽度（in-flight
+                            // current_size）现算，**不分 do_it 与否**。旧代码只在 do_it
+                            // 分支重算 x（OVERLAY-068-A R1），!do_it 节流帧沿用
+                            // resolved_pos = show_overlay 传入的 overlay_geometry 默认位
+                            //（基准宽 240 居中），而本调用 SetWindowPos 应用的是 current
+                            //（到上限后 ≫240）→ 中心右偏 (current-240)/2 px；到上限后
+                            // current == target、插值循环休眠，无帧纠正，持续到下一包
+                            // do_it（~700ms）= Gavin 端测「宽度到上限后瞬跳向右窜」。
+                            // 句界双 Show 同毫秒命中节流（REPRO：09-04 日志 25.835
+                            // id=2 end + id=3 首包同 ms）。公式与插值循环同源 centered_x。
+                            let work = monitor_work_rect(hwnd);
+                            let work_w = work.right - work.left;
+                            let x = centered_x(work.left, work_w, state.current_size[0]);
+                            final_pos = [x, adj_pos[1]];
                         }
                         request.pos = Some(final_pos);
                         (final_pos, request.size)
@@ -1762,7 +1761,8 @@ fn run_overlay_thread(
                         .unwrap_or_else(|| overlay_geometry(&req.status, hwnd).0);
                     let work = monitor_work_rect(hwnd);
                     let work_w = work.right - work.left;
-                    pos[0] = work.left + (work_w - current_width) / 2;
+                    // OVERLAY-101: 与 Show 流式分支共用 centered_x（同源同公式）。
+                    pos[0] = centered_x(work.left, work_w, current_width);
                     req.pos = Some(pos);
                     unsafe {
                         let _ = SetWindowPos(
@@ -4225,7 +4225,7 @@ fn overlay_geometry(status: &OverlayStatus, hwnd: HWND) -> ([i32; 2], [i32; 2]) 
         OverlayStatus::Processing(_) | OverlayStatus::Error(_) => STATUS_OVERLAY_SIZE,
         OverlayStatus::FocusLost { .. } => PREVIEW_OVERLAY_SIZE,
     };
-    let x = work.left + (work_w - size[0]) / 2;
+    let x = centered_x(work.left, work_w, size[0]);
     let y = work.top + (work_h - size[1] - 64).max(0);
     ([x, y], size)
 }
@@ -4278,7 +4278,8 @@ fn adjust_overlay_pos_size_for_text(
             max_w.max(RECORDING_OVERLAY_SIZE[0]),
         );
         let h = RECORDING_OVERLAY_SIZE[1];
-        let x = work.left + (work_w - w) / 2;
+        // OVERLAY-101: 传 clamp 后的 w（target 口径）——只换调用不换宽度（主控边界）。
+        let x = centered_x(work.left, work_w, w);
         let y = work.top + (work_h - h - 64).max(0);
         ([x, y], [w, h])
     }
@@ -4320,6 +4321,25 @@ fn measure_text_width(hdc: HDC, text: &str) -> i32 {
 #[cfg(target_os = "windows")]
 fn streaming_scroll_offset(text_width: i32, visible_w: i32) -> i32 {
     (text_width - visible_w).max(0)
+}
+/// OVERLAY-101: 水平居中 x 必须由**实际应用的宽度**算出。
+/// 全仓所有 overlay 水平居中点（Show 流式分支 :1274 前身 / 插值循环 :1778 前身 /
+/// `overlay_geometry` :4228 / `adjust_overlay_pos_size_for_text` :4281）共用本函数，
+/// 杜绝「居中用 A 宽、SetWindowPos 应用 B 宽」的源头分叉。
+///
+/// 缺陷史（Bug B 本体）：Show 的 !do_it（100ms 节流命中）分支旧代码不重算 x，
+/// 沿用 `resolved_pos` = `show_overlay` 传入的 `overlay_geometry` 默认位（按基准宽
+/// 240 居中），而同一调用 SetWindowPos 应用的宽度是 in-flight `current_size`
+/// （到上限后 ≫240）→ 窗口中心右偏 (current-240)/2 px；且到上限后
+/// current == target、插值循环休眠，无任何帧纠正，直到下一包 do_it（~700ms）
+/// 才复位 = Gavin 端测「宽度扩展到上限后瞬跳、向右窜」。
+/// （do_it 分支 OVERLAY-068-A R1 已用 current 居中，无此问题。）
+///
+/// 消融（tester-1 参考）：任一调用点改回内联公式/换宽度来源（如用 target 宽或
+/// resolved_pos 的 x）→ 右窜/拉扯复发；本函数是唯一居中宽度源。
+#[cfg(target_os = "windows")]
+fn centered_x(work_left: i32, work_w: i32, applied_w: i32) -> i32 {
+    work_left + (work_w - applied_w) / 2
 }
 /// OVERLAY-086 Bug 3 / REFACTOR-089: 尺寸插值单轴单帧推进（宽、高共用）。
 ///

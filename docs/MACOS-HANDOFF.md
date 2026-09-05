@@ -1450,3 +1450,11 @@ windows 版）线程闭包尾部的调用。macOS 走 `spawn_overlay_thread` 的
 D2D-HANG-095-B（2026-09-05）收尾：闭包尾部直调改为 Drop 守卫（D2dReleaseGuard），
 仍在 windows 版 `spawn_overlay_thread` 的 `#[cfg(target_os = "windows")]` 区内；
 macOS 零编译影响、零行为差异，§D2D-HANG-095 结论不变。
+
+## OVERLAY-101/102（2026-09-05，coder-2）
+
+全部改动位于 windows-only 区：`centered_x`（`#[cfg(target_os = "windows")]`）、
+`run_overlay_thread` 的 Show/插值循环（windows 线程主循环）、
+`STREAMING_OVERLAY_MAX_SCREEN_RATIO`（cfg(windows) 常量，0.65→0.50）。
+macOS overlay 走 `src/platform/macos/overlay.rs` 独立几何路径，不消费这些符号。
+零编译影响、零行为差异。
