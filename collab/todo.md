@@ -2,6 +2,80 @@
 
 ## 🔴 2026-09-05 —— 当前状态（最新在最上）
 
+### ✅ BUILD-098 端测结果（Gavin 2026-09-05）—— 7 项过 6，结案 5 条历史待办
+
+| # | 项 | 结果 |
+| --- | --- | --- |
+| 1 | **托盘退出**（D2D-HANG-095，本批 P0） | ✅ **OK** —— 端到端确认，P0 结案 |
+| 2 | 宽度扩展丝滑（OVERLAY-086 Bug 3） | 🔴 **两个新 bug**，见下 OVERLAY-101 |
+| 3 | 开嗓瞬间空窗口（OVERLAY-086 Bug 2） | ✅ OK，结案 |
+| 4 | 流式文字细腻度（D2D-P1） | ✅ OK，D2D 方向再次确认，结案 |
+| 5 | 超长文字滚动行为 | ✅ 行为 OK；**但要把 65% 改 50%**，见 OVERLAY-102 |
+| 6 | 语音侧 AltGr（HOTKEY-078） | ✅ **OK，结案** —— 最后一个「未知」项清掉 |
+| 7 | toggle 连按两次能否停 | ✅ **实机 OK** —— 见下，这条是重要情报 |
+
+🔴 **第 7 项的意义**：`test_hotkey_toggle_stop` 在 E2E 里长期间歇 FAIL，主控此前列了三个
+归因方向。**Gavin 实机确认能正常停** ⇒ 产品侧正常，**天平明显偏向 harness/环境缺陷**，
+「D2D 绘制阻塞」这个方向本批修完 D2D-HANG 后仍未稳定转绿，**证据不足，不再当主要嫌疑**。
+并入 E2E-GATE-103。
+
+---
+
+### 🔴 下一轮任务全景（主控 2026-09-05 整理，Gavin 要求「新 bug + 之前未完成一起排」）
+
+#### 已派发（进行中，文件级零重叠）
+
+| Worker | 任务 | 内容 |
+| --- | --- | --- |
+| coder-2 | **OVERLAY-101 + OVERLAY-102** | 两个宽度/位置缺陷 + 最大宽度 65%→50%。占 `src/main.rs` |
+| tester-1 | **E2E-GATE-103** | 4 条 full_pipeline 归因 + 修 `_no_hardware` 预存 bug + **加「ERROR>0 即门禁不通过」机器闸门**。占 `tests/**` + `build-test-guide.md` |
+
+##### OVERLAY-101 —— Gavin 原话与主控静态取证
+
+> Bug A：宽度扩展过程**偶发抖动，突然变很长又很快缩回**
+> Bug B：**宽度到上限后**、文字左滑时，**窗口位置瞬跳、向右窜**
+
+🔴 **主控已定位一处确凿的源头不一致**（静态取证，非推测）：
+`src/main.rs:1396` 的 `SetWindowPos` —— **尺寸用在飞的 `current_size`，
+位置 `computed_pos` 却来自 `adjust_overlay_pos_size_for_text`（`:4241`）用 clamp 后的
+target 宽算的居中 x**。增长期 `w_target > w_current` ⇒ Show 把窗口摆偏左，
+插值循环（`:1765`，用 `current_width` 重算 x）又推回右边 ⇒ **两处每帧拉扯 = 水平窜动**。
+
+**这个契约测试里早标成缺口**：`src/main.rs:9123` 注释原文
+「真实契约 = **『用于居中的宽度 == SetWindowPos 应用的宽度』**」，TEST-SYNC-087 列为判别力缺口。
+
+**Bug B 第二条线索**（给方向不给结论）：插值循环整块被
+`if state.current_size != state.target_size`（`:1739`）门控 ——
+**到上限后 `current == target`，整块含 x 重算全部不执行**，此后只剩 Show 在设位置。
+时间点与 Gavin 描述吻合，但**主控无实测证据**，已要求 coder-2 自证不许顺手宣布。
+
+**Bug A 是宽度异常不是位置异常**，上面那条解释不了它。已要求逐环取证：
+`measure_text_width` 用的是**全量文本**而渲染画的是 timeline 揭示部分（是否同一段？）／
+`[ASR-SERVER-REWRITES-TIMELINE-001]` 服务端重写时间轴会不会让 target 瞬时算大。
+
+#### 排队中（按依赖顺序，不可调换）
+
+| 顺位 | 任务 | 说明 / 阻塞点 |
+| --- | --- | --- |
+| ① | **D2D P2+P3 五态合并迁移**（DEC-057 ②） | `Recording` / `FallingToProcessing` / `Error` / `StreamingEditing` / `FocusLost`。**必须等 OVERLAY-101 落地**（同一 `src/main.rs` 路径，文件冲突） |
+| ② | **per-pixel alpha**（DEC-056 ③） | **必须等八态全迁完** —— 残留 GDI 绘制会在预乘 alpha 位图上打透明洞。解 **处理中态圆角灰线**（DEC-056 补充一，Gavin 已拍板等它）+ OVERLAY-062 编辑态文字粗糙 |
+| ③ | **OVERLAY-069** 收缩淡出关闭 | 地基 = 086 定型后的插值机制 + P1 的 D2D 化。**OVERLAY-101 改完插值后方案才能定** |
+| ④ | **OVERLAY-065** 动态麦克风图标 | 等 P2（`Recording` 态）打通后另开单 |
+
+#### 阻塞中（等 Gavin，不占 Worker）
+
+| 项 | 阻塞点 |
+| --- | --- |
+| **FMT-072 / LLM 可用性** | DeepSeek key 已吊销，**新 key 未配则 LLM 401**，格式化全线验不了。配好后告知主控即可单独安排 |
+| **git 历史是否重写清除泄露 key 痕迹** | 破坏性操作，**未获授权不执行**。key 已吊销 ⇒ 已降级为卫生问题不是安全问题 |
+
+#### 卫生债（低优先，记录在案）
+
+- **`.gitattributes` 覆盖面不足**：`core.autocrlf=true` 但 `.gitattributes` 只管
+  `scripts/git-hooks/**`（SECRET-082 只堵了钩子那个洞）。其余 321 个跟踪文件工作区是 LF，
+  **新 clone 一次会被检出成 CRLF**，此后任意编辑都产生整文件级 diff。
+  建议补 `* text=auto eol=lf`，**待 Gavin 定夺**（改动面大，需单独一批）
+
 ### 🟢 BUILD-098 已出包（2026-09-05 13:36）—— 待 Gavin 端测，重点：托盘退出
 
 - **P0 达成**：托盘退出端到端 **5/5 干净退出**（修复前同手法 5 次 4 挂）。
