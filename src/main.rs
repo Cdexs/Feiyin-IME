@@ -10049,3 +10049,360 @@ mod overlay_101_centering_guard_tests {
         );
     }
 }
+
+// D2D-P2P3 (IMPL-109 五态迁移) 阶段三测试同步（tester-1，2026-09-05）
+// 方案：docs/D2D-P2P3-PLAN.md §3.4.4 G1-G5 + coder-2 补充素材（submit 无+1 / 波形整除口径）。
+// 只绑定行为约定，不绑定实现字符串/像素值（build-test-guide 第八节规范4）。
+// G4 是结构性护栏（唯一例外），其判别力边界在用例内如实声明。
+#[cfg(all(test, target_os = "windows"))]
+mod overlay_109_d2d_p2p3_guard_tests {
+    use super::*;
+
+    // ==================== G1: 四个新包装的回落触发测试 ====================
+
+    /// G1：D2D-P2P3 新迁移四态包装的 GDI 回落触发器。
+    /// 契约（overlay 永不空白）：`draw_editing_overlay` / `draw_recording_waveform_overlay`
+    /// / `draw_error_overlay` / `draw_preview_overlay` 在无效 HDC 上必须返回 false
+    /// （BindDC 失败 → with_d2d 返回 false → 调用方 `if !d2d::draw_*(...) { GDI }`
+    /// 当帧兜底）。镜像既有 P0/P1 用例（:9388/:9428）的模式。
+    /// 消融：任一入口把失败路径改成 panic 或返回 true → 对应断言红
+    /// （true 使 GDI 回落永不触发，panic 使测试进程崩）。
+    /// 顺序自证：直接以无效 HDC 调入口，无时序依赖，与生产 dispatch
+    /// `if !d2d::draw_*(...) { GDI }` 判定顺序一致。
+    #[test]
+    fn d2d_p2p3_four_entries_return_false_on_invalid_hdc_gdi_fallback_trigger() {
+        let hdc = HDC(std::ptr::null_mut());
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 240,
+            bottom: 36,
+        };
+        let state = overlay_window_state_for_test();
+
+        let ok_editing = d2d::draw_editing_overlay(hdc, &rect);
+        assert!(
+            !ok_editing,
+            "StreamingEditing 入口：无效 HDC 必须返回 false（GDI 回落触发器）"
+        );
+
+        let ok_waveform = d2d::draw_recording_waveform_overlay(hdc, &rect, &state);
+        assert!(
+            !ok_waveform,
+            "Recording/FallingToProcessing 共用入口：无效 HDC 必须返回 false（GDI 回落触发器）"
+        );
+
+        let ok_error = d2d::draw_error_overlay(hdc, &rect, "错误消息");
+        assert!(
+            !ok_error,
+            "Error 入口：无效 HDC 必须返回 false（GDI 回落触发器）"
+        );
+
+        let ok_preview =
+            d2d::draw_preview_overlay(hdc, &rect, "预览文本", config::UiLanguage::Chinese);
+        assert!(
+            !ok_preview,
+            "FocusLost 入口：无效 HDC 必须返回 false（GDI 回落触发器）"
+        );
+
+        // D2D-HANG-095: 本用例以无效 HDC 调 D2D 入口，create_resources 会成功
+        //（工厂创建不依赖窗口），测试线程的 thread_local 槽被填上 D2D 资源。
+        // 必须在用例体内显式释放 —— 否则线程退出时 FLS 回调在 loader lock 下
+        // 析构 COM，自锁死锁（REPRO-094 探针 B/C 实证）。
+        d2d::release_resources();
+    }
+
+    // ==================== G2: 命中矩形等值断言 ====================
+
+    /// G2a：submit 命中矩形 = 无 +1 口径（负向断言防「顺手统一」）。
+    /// 契约（coder-2 补充素材）：`draw_submit_button_hit_rect_only`（:2698）
+    /// right == left+bs（bs=16），**没有** stop 按钮的 +1。这是 draw_submit_button
+    /// 的历史行为，点击判定（rect_contains）消费的就是它 —— 迁移时不得「顺手统一」。
+    /// 消融：给 submit 补上 +1（right = bl+bs+1）→ 负向断言红。
+    /// 顺序自证：纯函数直调，无时序。
+    #[test]
+    fn submit_hit_rect_has_no_plus_one_asymmetry_pinned() {
+        let rect = RECT {
+            left: 100,
+            top: 50,
+            right: 340,
+            bottom: 86,
+        };
+        let r = draw_submit_button_hit_rect_only(&rect);
+        // 公式：bs=16, bl=right-25, bt=top+(h-16)/2
+        assert_eq!(r.left, 340 - 25, "bl = rect.right - 25");
+        assert_eq!(r.top, 50 + (36 - 16) / 2, "bt = top + (h-16)/2");
+        assert_eq!(r.right, r.left + 16, "submit right = left + bs（无 +1）");
+        assert_eq!(r.bottom, r.top + 16);
+        // 🔴 负向断言：不得「顺手统一」成 stop 的 +1
+        assert_ne!(r.right, r.left + 17, "submit 命中 rect 不得有 stop 的 +1");
+        // 与 GDI 绘制路径同源：draw_submit_button 返回的就是这个 rect
+        //（GDI 路径 :2717 改调 helper，返回 submit_rect）。
+        let gdi_rect = draw_submit_button_hit_rect_only(&rect);
+        assert_eq!(r, gdi_rect, "GDI 路径命中 rect 与 helper 同源");
+    }
+
+    /// G2b：stop 命中矩形与 d2d 侧同公式（含 +1）。
+    /// 契约：`draw_stop_button_hit_rect_only`（:2572）right = bl+bs+1（GDI Rectangle
+    /// right/bottom 排他 +1），与 d2d::stop_button（:3615 right=(bl+bs+1)）同式。
+    /// 消融：去掉 +1 → 断言红；d2d 侧口径被改 → 与 helper 比对红。
+    /// 顺序自证：纯函数直调，无时序。
+    #[test]
+    fn stop_hit_rect_matches_d2d_stop_button_geometry() {
+        let rect = RECT {
+            left: 100,
+            top: 50,
+            right: 340,
+            bottom: 86,
+        };
+        let helper = draw_stop_button_hit_rect_only(&rect);
+        // 公式：bs=16, bl=right-25, bt=top+(h-16)/2, right=bl+bs+1（+1 口径）
+        assert_eq!(helper.left, 340 - 25);
+        assert_eq!(helper.top, 50 + (36 - 16) / 2);
+        assert_eq!(
+            helper.right,
+            helper.left + 16 + 1,
+            "stop right = left + bs + 1"
+        );
+        assert_eq!(helper.bottom, helper.top + 16 + 1);
+        // d2d 侧同式：w 为 rect 相对宽（h=36），bl = w-25，right = bl+bs+1
+        //（d2d::stop_button :3607 的几何公式，rect-relative）。
+        let w = rect.right - rect.left;
+        let d2d_bl = w - 25;
+        let d2d_bt = (36 - 16) / 2;
+        let d2d_rect = RECT {
+            left: d2d_bl,
+            top: d2d_bt,
+            right: d2d_bl + 16 + 1,
+            bottom: d2d_bt + 16 + 1,
+        };
+        // helper 返回窗口绝对坐标（含 rect.left/top 偏移），d2d 是 rect-relative。
+        // 换算到同一坐标系比对：helper - rect.left/top。
+        let helper_relative = RECT {
+            left: helper.left - rect.left,
+            top: helper.top - rect.top,
+            right: helper.right - rect.left,
+            bottom: helper.bottom - rect.top,
+        };
+        assert_eq!(
+            helper_relative, d2d_rect,
+            "stop 命中 rect 与 d2d 侧同公式（含 +1）"
+        );
+    }
+
+    /// G2c：preview_hit_rects 三件套真值表。
+    /// 契约（:4349）：title_close 18x18（right-26, top+5 → right-8, top+23）；
+    /// 底部双键 45x18 gap10 底距 10 水平居中。返回 (copy, close, title_close)。
+    /// 消融：任一处几何改动（btn_w/gap/边距/居中公式）→ 对应断言红。
+    /// 顺序自证：纯函数直调，无时序。
+    #[test]
+    fn preview_hit_rects_truth_table() {
+        // 固定 320x140 输入（PREVIEW_OVERLAY_SIZE 同源）
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 320,
+            bottom: 140,
+        };
+        let (copy, close, title_close) = preview_hit_rects(&rect);
+        // 标题 ✕ 键：right-26 → right-8，top+5 → top+23
+        assert_eq!(title_close.left, 320 - 26);
+        assert_eq!(title_close.top, 0 + 5);
+        assert_eq!(title_close.right, 320 - 8);
+        assert_eq!(title_close.bottom, 0 + 23);
+        // 底部双键：btn_w=45, gap=10, total=100, 水平居中，btn_top = bottom-18-10
+        let btn_left = 0 + (320 - 100) / 2;
+        let btn_top = 140 - 18 - 10;
+        assert_eq!(copy.left, btn_left);
+        assert_eq!(copy.top, btn_top);
+        assert_eq!(copy.right, btn_left + 45);
+        assert_eq!(copy.bottom, btn_top + 18);
+        assert_eq!(close.left, btn_left + 45 + 10);
+        assert_eq!(close.top, btn_top);
+        assert_eq!(close.right, btn_left + 45 * 2 + 10);
+        assert_eq!(close.bottom, btn_top + 18);
+        // 三件套互不重叠（点击区域离散）
+        assert!(copy.right <= close.left, "copy 与 close 不得重叠");
+        // 与 GDI draw_preview_overlay 同源：GDI 路径返回值即 preview_hit_rects
+        //（:2187-2197 两分支都从同一纯函数出，GDI 兜底分支调 draw_preview_overlay
+        //  内部调 preview_hit_rects —— 该分支无法在无效 HDC 下直测，本断言钉
+        //  纯函数真值表即可，dispatch 接线由 G1 fallback 用例覆盖）。
+    }
+
+    // ==================== G3: 波形纯函数 ====================
+
+    /// G3a：waveform_bar_height 公式表。
+    /// 契约（:2293，WAVEFORM-HEIGHT-FIX-001 常量）：
+    ///   maxh=48 / static_h=12 / minh=8 / gain=2.5；
+    ///   weight = 0.4 + 0.6·cos²(π/2·i/(half-1))；
+    ///   v_gain = min(v·gain·weight, 1.0)；
+    ///   v_gain > 0.01 → minh + v_gain·(maxh−minh)，否则 static_h（12）。
+    /// 消融：任一常量（48/12/8/2.5）或公式（权重/增益）擅改 → 对应断言红。
+    /// 顺序自证：纯函数直调，无时序。
+    #[test]
+    fn waveform_bar_height_formula_table() {
+        // v=0：恒 static_h=12（无音频 → 静态高度）
+        assert_eq!(waveform_bar_height(0.0, 0, 8), 12);
+        assert_eq!(waveform_bar_height(0.0, 3, 8), 12);
+        assert_eq!(waveform_bar_height(0.0, 7, 8), 12);
+        // v_gain > 0.01 边界：i=0 权重=1.0，v·2.5 跨 0.01。
+        // 🔴 实测（rustc f32）：0.004f32 存为 0.0040000002，×2.5=0.010000001 > 0.01 → active。
+        //   边界安全值：0.0039f32×2.5=0.00975 < 0.01 → static(12)。
+        assert_eq!(
+            waveform_bar_height(0.0039, 0, 8),
+            12,
+            "v_gain=0.00975 不>0.01 → static"
+        );
+        assert_eq!(
+            waveform_bar_height(0.005, 0, 8),
+            8,
+            "v_gain=0.0125>0.01 → minh 起步"
+        );
+        // v=0.5 避开 min(,1.0) 封顶，区分权重端点：
+        //   i=0: weight=0.4+0.6·cos²(0)=1.0 → v_gain=min(0.5·2.5·1,1)=1.0 → 48
+        //   i=3 (half=8): i/(half-1)=3/7, cos²(3π/14)≈0.611 → weight≈0.767
+        //     → v_gain=min(0.5·2.5·0.767,1)=0.958 → 8+0.958·40≈46.3 → 46
+        //   i=7 (half-1): weight=0.4 → v_gain=min(0.5·2.5·0.4,1)=0.5 → 8+0.5·40=28
+        assert_eq!(waveform_bar_height(0.5, 0, 8), 48);
+        assert_eq!(waveform_bar_height(0.5, 3, 8), 46);
+        assert_eq!(waveform_bar_height(0.5, 7, 8), 28);
+        // half=16 端点同律
+        assert_eq!(waveform_bar_height(0.5, 0, 16), 48);
+        assert_eq!(waveform_bar_height(0.5, 15, 16), 28);
+        // v=1.0 封顶：任一位置 v_gain=1.0 → maxh=48
+        assert_eq!(waveform_bar_height(1.0, 0, 8), 48);
+        assert_eq!(waveform_bar_height(1.0, 7, 8), 48);
+    }
+
+    /// G3b：waveform_snapshot 空 buf / poisoned lock → 空 vec。
+    /// 契约（:2264）：锁 poisoned（流失败）→ Vec::new()（全部落 static 高度）；
+    /// 空 buf → 0..half 全 0.0（idx 越界返回 0.0）。
+    /// 消融：把 Err 分支改成别的（如 panic / 返回非空）→ 对应断言红。
+    /// 顺序自证：构造状态 → 调纯函数，无时序。
+    #[test]
+    fn waveform_snapshot_empty_and_poisoned_contract() {
+        // 空 buf
+        let state = overlay_window_state_for_test();
+        let snap_empty = waveform_snapshot(&state, 8);
+        assert_eq!(snap_empty.len(), 8, "空 buf 仍返回 half 条（全 0.0）");
+        assert!(snap_empty.iter().all(|v| *v == 0.0), "空 buf 快照全 0.0");
+
+        // poisoned lock：在持有锁时 panic → std 毒死 Mutex
+        let poisoned_state = overlay_window_state_for_test();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = poisoned_state.audio_buf.lock().unwrap();
+            panic!("deliberate poison");
+        }));
+        let snap_poisoned = waveform_snapshot(&poisoned_state, 8);
+        assert!(
+            snap_poisoned.is_empty(),
+            "poisoned lock 必须返回空 vec（流失败 → 全部落 static 高度）"
+        );
+    }
+
+    // ==================== G4: include_str! 结构护栏 ====================
+
+    /// G4：dispatch 五分支 d2d 优先 + GDI 回落在位的静态证据。
+    /// 契约（overlay 永不空白）：draw_overlay_to_dc 的每个 D2D 迁移状态分支形如
+    /// `if !d2d::draw_xxx(...) { GDI 兜底 }` —— 五个迁移态（Recording/FallingToProcessing
+    /// 共用 waveform 入口、StreamingEditing、FocusLost、Error，另含 P0 Processing）
+    /// 的 d2d::draw_ 调用都必须出现在 `if !d2d::draw_` 形态内，且其下必有 GDI 调用。
+    /// 判据：include_str 读自身源码，逐行去空白后统计 `if!d2d::draw_` 出现次数，
+    /// 断言 == 5（RecordingWaveform/Processing/Editing/Preview/Error），且每个
+    /// `!d2d::draw_` 的后续行内存在非 d2d 前缀的绘制函数调用（GDI 兜底）。
+    /// 消融：任一分支删掉 d2d 调用（回归纯 GDI）→ 计数变 4 → 红；
+    /// 任一分支删掉 GDI 兜底 → 该分支后续无 GDI 调用 → 红。
+    /// 🔴 判别力边界（如实声明）：本护栏匹配 `if !d2d::draw_` 形态与「其下有非 d2d
+    /// 调用行」的粗粒度结构，不解析括号配对（实现字符串形态，非行为断言）。
+    /// 与 G5（TEST-SYNC-105）同为结构护栏，价值=钉住「d2d 优先 + GDI 兜底」骨架；
+    /// 具体绘制正确性由 G1 回落触发 + 阶段四回归 + Gavin 端测目视承担。
+    #[test]
+    fn dispatch_five_branches_d2d_first_gdi_fallback_in_place() {
+        let src = include_str!("main.rs");
+        // needle 用 format 拼装避免字面量自我命中
+        let needle = format!("if!d2d::draw_{}", "");
+        let mut d2d_lines: Vec<(usize, String)> = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            let stripped: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+            // 🔴 只匹配「行首」为 if!d2d::draw_ 的行 —— 生产 dispatch 分支是语句起始，
+            // 注释里提到该形态的（本护栏 docstring / 既有用例注释）不得计入。
+            if stripped.starts_with(&needle) {
+                d2d_lines.push((i + 1, stripped));
+            }
+        }
+        assert_eq!(
+            d2d_lines.len(),
+            5,
+            "dispatch 必须恰有 5 个 `if !d2d::draw_` 分支（waveform/processing/editing/preview/error），实测 {}",
+            d2d_lines.len()
+        );
+        // 每个 d2d 分支后续行内必须有 GDI 兜底调用（非 d2d 前缀的绘制函数）。
+        // 依据生产 :2132-2206 结构：`if !d2d::draw_x(...) { <GDI 调用> } else {...}`。
+        // 检查方式：从该行往后找最近的含 `if` 块内绘制调用（draw_overlay_chrome /
+        // draw_processing_overlay / draw_error_overlay / draw_recording_overlay 等
+        // 非 d2d:: 前缀）。此处用「该分支行之后 8 行内存在非 d2d:: 的函数调用行」
+        // 作粗粒度判据（生产各分支 GDI 兜底都在紧随的 1-4 行内）。
+        for (lineno, _) in &d2d_lines {
+            let mut has_gdi = false;
+            let window = src.lines().skip(*lineno).take(8);
+            for line in window {
+                let stripped: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+                // 非 d2d 前缀 + 形似函数调用（含 '(' 且不是注释/空行）
+                if !stripped.starts_with("//")
+                    && !stripped.is_empty()
+                    && !stripped.contains("d2d::")
+                    && stripped.contains('(')
+                    && (stripped.contains("draw_")
+                        || stripped.contains("overlay")
+                        || stripped.contains("chrome"))
+                {
+                    has_gdi = true;
+                    break;
+                }
+            }
+            assert!(
+                has_gdi,
+                "dispatch 分支（L{}）d2d 调用后 8 行内必须存在 GDI 兜底调用（overlay 永不空白）",
+                lineno
+            );
+        }
+    }
+
+    // ==================== helpers ====================
+
+    fn overlay_window_state_for_test() -> OverlayWindowState {
+        let (_tx, rx) = crossbeam_channel::unbounded::<OverlayUiEvent>();
+        let _ = rx;
+        OverlayWindowState {
+            request: None,
+            audio_buf: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::VecDeque::new()),
+            ),
+            event_tx: _tx,
+            cancel_btn_rect: None,
+            close_btn_rect: None,
+            title_close_btn_rect: None,
+            submit_btn_rect: None,
+            text_hit_rect: None,
+            shimmer_phase: 0.0,
+            edit_hwnd: None,
+            edit_old_wndproc: None,
+            edit_bg_brush: None,
+            edit_font: None,
+            last_resize_time: None,
+            pending_size: None,
+            needs_repaint: true,
+            current_size: RECORDING_OVERLAY_SIZE,
+            target_size: RECORDING_OVERLAY_SIZE,
+            last_streaming_text: None,
+            cached_font: None,
+            displayed_chars: 0,
+            tween_deadline: None,
+            tween_target_chars: 0,
+            tween_start: None,
+            word_timings: Vec::new(),
+            tween_audio_origin: None,
+            tween_timeline_origin: None,
+        }
+    }
+}

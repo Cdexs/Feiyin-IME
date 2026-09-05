@@ -2,6 +2,17 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-09-05 — tester-1 — TEST-SYNC-110 ✅ 阶段三（D2D-P2P3-IMPL-109 五态迁移护栏，待主控验收 + 阶段四 TEST-EXEC-111 首跑）
+
+- **交付**：`src/main.rs` +357/-0，单 hunk `:10049` 后新增 `#[cfg(all(test, target_os="windows"))] mod overlay_109_d2d_p2p3_guard_tests`，生产零改动（numstat 357/0）。
+- **G1** 回落触发：editing / recording_waveform / error / preview 四入口无效 HDC→false + `d2d::release_resources()`。
+- **G2** 命中矩形：G2a submit 无 +1 负向断言；G2b stop 与 d2d 侧同公式（含 +1）；G2c preview 三件套真值表。
+- **G3** 波形纯函数：G3a `waveform_bar_height` 公式表（🔴 f32 边界实测修正：0.004→8 非 12，改 0.0039→12）；G3b `waveform_snapshot` 空 buf / poisoned lock。
+- **G4** include_str 结构护栏：dispatch 五分支行首计数==5 + GDI 兜底在 8 行内（🔴 contains→startswith 修自命中）。
+- **G5** 既有 D2D-HANG-095 护栏在位（:9802/:9835）确认。
+- **验证**：fmt --check exit 0 / check --all-targets 0 error（102 warnings 持平）/ 未跑 cargo test（白名单设计如此，首跑归阶段四）。
+- **红线合规**：未 commit / v0.9.0 未动 / 零凭证 / 无临时文件。
+
 ## 2026-09-05 — tester-1 — E2E-GATE-103 ✅ pytest 门禁归因 + ERROR>0 机器闸门（只动 tests/** + build-test-guide.md，src/main.rs 零触碰）
 
 - **4 条 full_pipeline 决定性实验判 B harness 缺陷**：① -debug 日志实证产品全链路正常（Recording→Processing→注入→Hidden，speech_detected=true / ASR-SUMMARY finished / Injection completed）；② PROCESSING 与 RECORDING 同尺寸 240x36，`detect_overlay_state()` 结构性不可观测 PROCESSING（dict 序 recording 先命中）；③ Win11 notepad shim PID 立即退出。
