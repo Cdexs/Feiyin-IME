@@ -2,6 +2,15 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-09-06 — tester-1 — REPRO-114 ✅ 🔴 P0 热键第二下按不停根因定位（只查不修，生产零改动）
+
+- **根因锁死**：`src/platform/windows/hotkey.rs:221` WM_KEYUP 分支 `PTT_ACTIVE.store(false)` **无条件执行**，Toggle 松键重置标志 → 第二下按下又发 `Start` 而非 `Stop`。RegisterHotKey 路径（F9）`:536-547` 恒发 Start 无 toggle 状态。
+- **H1 证伪**：probe1/2 实测回调 60-83us（默认 1000ms 超时 1/10000），loader-lock 压力下正常；probe3 逐句镜像生产 PTT_ACTIVE 逻辑决定性复现（两次 DOWN 都 START）。
+- **真实 app 实证**：双按（gap 1000ms/20ms）第二下恒 Start、overlay 卡 recording ~20s；单按 5/5 可靠。
+- **建议修法（交 coder）**：① `:221` 移入 `if should_stop_translate_poll_on_keyup(mode)` 块内；② `:536` Toggle 分支加 PTT_ACTIVE toggle 状态。
+- **红线**：生产零改动 / 未出包 / 未 commit / v0.9.0 未动 / config.toml sha 3186ec8c / 探针工程保留 repro114/ / 零凭证。
+- **详情**：outbox/tester-1/result.md + logs/20260906.md + CHANGELOG.md
+
 ## 2026-09-05 — tester-1 — TEST-EXEC-111 ✅ 阶段四（三层全绿 + A1-A5 消融 + 🔴 热键环境级失效证据，G4 重设计保留）
 
 - **Step1**：root **1077P/0F/9I**（1070+7）/ src-tauri 76P / vitest 89P，三层全绿。
