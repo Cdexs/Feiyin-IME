@@ -2126,9 +2126,16 @@ fn draw_overlay_to_dc(
             }
             OverlayStatus::FallingToProcessing { .. } => {
                 apply_overlay_window_region(hwnd, rect, None, true);
-                draw_overlay_chrome(hdc, rect);
-                draw_recording_indicator_and_waveform(hdc, rect, state);
-                cancel_btn_rect = Some(draw_stop_button(hdc, rect));
+                // D2D-P2 (PLAN-108 H7): 与 Recording 波形变体共用同一复合体
+                // （两者 GDI 输出逐位相同，见 draw_recording_waveform_overlay doc）。
+                // On any D2D failure the GDI path below still renders this frame.
+                if !d2d::draw_recording_waveform_overlay(hdc, rect, state) {
+                    draw_overlay_chrome(hdc, rect);
+                    draw_recording_indicator_and_waveform(hdc, rect, state);
+                    cancel_btn_rect = Some(draw_stop_button(hdc, rect));
+                } else {
+                    cancel_btn_rect = Some(draw_stop_button_hit_rect_only(rect));
+                }
             }
             OverlayStatus::Processing(message) => {
                 // OVERLAY-086 Bug 1: rounded window region matching the D2D/GDI border
@@ -2158,22 +2165,45 @@ fn draw_overlay_to_dc(
             }
             OverlayStatus::StreamingEditing { .. } => {
                 apply_overlay_window_region(hwnd, rect, None, true);
-                // OVERLAY-051-B: editing mode draws a clear submit button (orange ⏎) on the right.
-                // The EDIT control renders the text itself; we only paint chrome + submit button.
-                draw_overlay_chrome(hdc, rect);
-                submit_btn_rect = Some(draw_submit_button(hdc, rect));
+                // D2D-P2 (PLAN-108 H9): editing chrome + submit button redrawn with D2D.
+                // 正文由 EDIT 子控件自绘（本态父窗口不画文字）；on any D2D failure the
+                // GDI path below still renders this frame, so the overlay never blanks.
+                if !d2d::draw_editing_overlay(hdc, rect) {
+                    // OVERLAY-051-B: editing mode draws a clear submit button (orange ⏎) on the right.
+                    // The EDIT control renders the text itself; we only paint chrome + submit button.
+                    draw_overlay_chrome(hdc, rect);
+                    submit_btn_rect = Some(draw_submit_button(hdc, rect));
+                } else {
+                    submit_btn_rect = Some(draw_submit_button_hit_rect_only(rect));
+                }
             }
             OverlayStatus::FocusLost { text, .. } => {
                 apply_overlay_window_region(hwnd, rect, Some(10), false);
-                let (copy_rect, close_rect, tc_rect) =
-                    draw_preview_overlay(hdc, rect, text, request.ui_language);
-                cancel_btn_rect = Some(copy_rect);
-                close_btn_rect = Some(close_rect);
-                title_close_btn_rect = Some(tc_rect);
+                // D2D-P2 (PLAN-108 H11): preview overlay redrawn with D2D. On any D2D
+                // failure the GDI path below still renders this frame, so the overlay
+                // never goes blank. 命中 rect 两条路径都从 preview_hit_rects 出
+                // （H10 单一几何源，点击口径逐位同值）。
+                if !d2d::draw_preview_overlay(hdc, rect, text, request.ui_language) {
+                    let (copy_rect, close_rect, tc_rect) =
+                        draw_preview_overlay(hdc, rect, text, request.ui_language);
+                    cancel_btn_rect = Some(copy_rect);
+                    close_btn_rect = Some(close_rect);
+                    title_close_btn_rect = Some(tc_rect);
+                } else {
+                    let (copy_rect, close_rect, tc_rect) = preview_hit_rects(rect);
+                    cancel_btn_rect = Some(copy_rect);
+                    close_btn_rect = Some(close_rect);
+                    title_close_btn_rect = Some(tc_rect);
+                }
             }
             OverlayStatus::Error(message) => {
                 apply_overlay_window_region(hwnd, rect, Some(10), false);
-                draw_error_overlay(hdc, rect, message, request.ui_language);
+                // D2D-P2 (PLAN-108 H12): error 态 redrawn with D2D. On any D2D failure
+                // the GDI path below still renders this frame, so the overlay never
+                // goes blank. GDI fallback keeps DT_END_ELLIPSIS (U1 裁决).
+                if !d2d::draw_error_overlay(hdc, rect, message) {
+                    draw_error_overlay(hdc, rect, message, request.ui_language);
+                }
             }
         }
     } else {
@@ -2222,6 +2252,59 @@ fn draw_overlay_chrome(hdc: windows::Win32::Graphics::Gdi::HDC, rect: &RECT) {
         let _ = SelectObject(hdc, old_pen);
         let _ = SelectObject(hdc, old_brush);
         let _ = DeleteObject(border_pen);
+    }
+}
+
+/// D2D-P2 (PLAN-108 H3): 波形快照纯函数 —— 锁内完成 peak decay（OVERLAY-LOCK-SCOPE-001
+/// 语义固化点：decay 必须在锁内、绘制在锁外）并收集 16 个 display_value。
+/// GDI draw_recording_indicator_and_waveform 与 D2D d2d::waveform 共用，公式单源。
+/// DECAY_RATE 0.02（原 draw_recording_indicator_and_waveform 局部常量上移）；
+/// WAVEFORM-FIX-002 的取样方向（bar i=0 → 最新样本 len-1）原样保留。
+#[cfg(target_os = "windows")]
+fn waveform_snapshot(state: &OverlayWindowState, half: i32) -> Vec<f32> {
+    const DECAY_RATE: f32 = 0.02; // Peak decay per frame at 60fps
+    if let Ok(mut levels) = state.audio_buf.lock() {
+        for level in levels.iter_mut() {
+            level.update(level.current, DECAY_RATE);
+        }
+        let len = levels.len();
+        let half_u = half as usize;
+        (0..half_u)
+            .map(|i| {
+                let idx = len.saturating_sub(1 + i);
+                if idx < len {
+                    levels[idx].display_value()
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    } else {
+        // Lock poisoned = stream failed → 空快照，全部落 static 高度
+        Vec::new()
+    }
+}
+
+/// D2D-P2 (PLAN-108 H3): 单条波形 bar 高度纯函数。公式逐位照抄原 GDI 内联版
+/// （WAVEFORM-HEIGHT-FIX-001：maxh 48 / static 12 / minh 8，gain 2.5，
+/// 权重 0.4 + 0.6·cos²(π/2·i/(half-1))）。返回 i32（GDI RoundRect 整数像素口径），
+/// D2D 侧取用前转 f32 —— 整数对齐避免两路径 ±1px 视觉差。
+#[cfg(target_os = "windows")]
+fn waveform_bar_height(v: f32, i: i32, half: i32) -> i32 {
+    let maxh = 48;
+    let static_h = 12;
+    let minh = 8;
+    let gain = 2.5;
+    let weight: f32 = 0.4
+        + 0.6
+            * (std::f32::consts::FRAC_PI_2 * i as f32 / (half - 1).max(1) as f32)
+                .cos()
+                .powi(2);
+    let v_gain = (v * gain * weight).min(1.0);
+    if v_gain > 0.01 {
+        (minh as f32 + v_gain * (maxh - minh) as f32) as i32
+    } else {
+        static_h
     }
 }
 
@@ -2336,50 +2419,18 @@ fn draw_recording_indicator_and_waveform(
     let half = bc / 2; // 16
     let total_bar_width = bc * bw + (bc - 1) * bgap;
     let wl = sep_l_x + 12 + (ww - total_bar_width) / 2; // centered start
-                                                        // WAVEFORM-HEIGHT-FIX-001: increased heights + gain for visible waveform
-    let maxh = 48; // from 40 - taller max height
-    let static_h = 12; // from 6 - taller static bars
-    let minh = 8; // from 3 - taller minimum bars
-    let gain = 2.5; // RMS gain multiplier
     let by = cy;
-    const DECAY_RATE: f32 = 0.02; // Peak decay per frame at 60fps
-                                  // OVERLAY-LOCK-SCOPE-001: snapshot display values under lock (apply decay),
-                                  // then release lock for GDI drawing — prevents audio thread push_level() blocking
-    let snapshot: Vec<f32> = if let Ok(mut levels) = state.audio_buf.lock() {
-        for level in levels.iter_mut() {
-            level.update(level.current, DECAY_RATE);
-        }
-        let len = levels.len();
-        let half_u = half as usize;
-        (0..half_u)
-            .map(|i| {
-                let idx = len.saturating_sub(1 + i);
-                if idx < len {
-                    levels[idx].display_value()
-                } else {
-                    0.0
-                }
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // D2D-P2 (PLAN-108 H3): snapshot（锁内 decay，OVERLAY-LOCK-SCOPE-001）与 bar 高度
+    // 公式抽成共享纯函数 —— GDI/D2D 两路径同源，常量/公式不可能分叉。
+    // WAVEFORM-HEIGHT-FIX-001 的常量（maxh 48 / static 12 / minh 8 / gain 2.5）
+    // 随公式一起上移进 waveform_bar_height。
+    let snapshot = waveform_snapshot(state, half);
     // GDI drawing uses snapshot (lock released)
     // WAVEFORM-FIX-002: center bar(i=0) maps to newest sample(len-1), edge(i=half-1) to oldest
     // Left half: bars spread from center outward to the left
     for i in 0..half {
         let v = snapshot.get(i as usize).copied().unwrap_or(0.0);
-        let weight: f32 = 0.4
-            + 0.6
-                * (std::f32::consts::FRAC_PI_2 * i as f32 / (half - 1).max(1) as f32)
-                    .cos()
-                    .powi(2);
-        let v_gain = (v * gain * weight).min(1.0);
-        let bh = if v_gain > 0.01 {
-            (minh as f32 + v_gain * (maxh - minh) as f32) as i32
-        } else {
-            static_h
-        };
+        let bh = waveform_bar_height(v, i, half);
         let x = wl + (half - 1 - i) * (bw + bgap);
         let br = RECT {
             left: x,
@@ -2402,17 +2453,7 @@ fn draw_recording_indicator_and_waveform(
     // Right half: bars spread from center outward to the right (mirror)
     for i in 0..half {
         let v = snapshot.get(i as usize).copied().unwrap_or(0.0);
-        let weight: f32 = 0.4
-            + 0.6
-                * (std::f32::consts::FRAC_PI_2 * i as f32 / (half - 1).max(1) as f32)
-                    .cos()
-                    .powi(2);
-        let v_gain = (v * gain * weight).min(1.0);
-        let bh = if v_gain > 0.01 {
-            (minh as f32 + v_gain * (maxh - minh) as f32) as i32
-        } else {
-            static_h
-        };
+        let bh = waveform_bar_height(v, i, half);
         let x = wl + (half + i) * (bw + bgap);
         let br = RECT {
             left: x,
@@ -2513,6 +2554,13 @@ fn draw_recording_overlay(
         draw_recording_indicator(hdc, rect, state);
         draw_listening_placeholder(hdc, rect, ui_language);
     } else {
+        // D2D-P2 (PLAN-108 H6): 波形变体迁 D2D。On any D2D failure the GDI path
+        // below still renders this frame, so the overlay never blanks. 命中 rect
+        // 由 P1 既有 helper 出（与 d2d::stop_button 同公式，几何单一源）。
+        if d2d::draw_recording_waveform_overlay(hdc, rect, state) {
+            return draw_stop_button_hit_rect_only(rect);
+        }
+        draw_overlay_chrome(hdc, rect);
         draw_recording_indicator_and_waveform(hdc, rect, state);
     }
     draw_stop_button(hdc, rect)
@@ -2642,20 +2690,31 @@ fn draw_recording_overlay_with_text(
     (cancel_rect, cancel_rect, text_hit_rect)
 }
 
+/// D2D-P2 (PLAN-108 H8): submit 键命中 rect 的单一几何源。
+/// 🔴 与 draw_stop_button_hit_rect_only 的 +1 排他约定**不同**：GDI draw_submit_button
+/// 的返回 RECT 是 right = bl+bs（无 +1），点击判定 rect_contains 消费的就是这个值。
+/// GDI 绘制路径与 D2D 成功路径都从本 helper 取 rect，几何口径物理上不可分叉。
 #[cfg(target_os = "windows")]
-fn draw_submit_button(hdc: windows::Win32::Graphics::Gdi::HDC, rect: &RECT) -> RECT {
-    const BG_DARK: COLORREF = COLORREF(0x110F0D);
-    const CORNER_RADIUS: i32 = 10;
-    // OVERLAY-051-B: orange rounded button with a white ⏎ return arrow.
+fn draw_submit_button_hit_rect_only(rect: &RECT) -> RECT {
     let bs = 16;
     let bl = rect.right - 25;
     let bt = rect.top + (rect.bottom - rect.top - bs) / 2;
-    let submit_rect = RECT {
+    RECT {
         left: bl,
         top: bt,
         right: bl + bs,
         bottom: bt + bs,
-    };
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn draw_submit_button(hdc: windows::Win32::Graphics::Gdi::HDC, rect: &RECT) -> RECT {
+    const BG_DARK: COLORREF = COLORREF(0x110F0D);
+    const CORNER_RADIUS: i32 = 10;
+    // D2D-P2 (PLAN-108 H8): 命中 rect 抽成 helper，GDI/D2D 两条路径共用单一几何源。
+    // 🔴 注意与 draw_stop_button 的不对称：这里**没有 +1**（right = bl+bs），
+    // 是 draw_submit_button 的历史行为，点击判定消费的就是它——迁移时不得"顺手统一"。
+    let submit_rect = draw_submit_button_hit_rect_only(rect);
     let submit_pen = unsafe { CreatePen(PS_SOLID, 1, OVERLAY_BRAND_ORANGE) };
     let submit_pen_old = unsafe { SelectObject(hdc, submit_pen) };
     let submit_brush = unsafe { CreateSolidBrush(OVERLAY_BRAND_ORANGE) };
@@ -2953,7 +3012,7 @@ mod d2d {
     };
     use windows::Win32::Graphics::Direct2D::{
         D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, ID2D1SolidColorBrush,
-        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
         D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
         D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
     };
@@ -2961,8 +3020,9 @@ mod d2d {
         DWriteCreateFactory, IDWriteFactory, DWRITE_FACTORY_TYPE_SHARED,
         DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
         DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL,
-        DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
-        DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP,
+        DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+        DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP,
+        DWRITE_WORD_WRAPPING_WRAP,
     };
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
     use windows::Win32::Graphics::Gdi::HDC;
@@ -2989,6 +3049,16 @@ mod d2d {
         /// Chinese-only text falls back to the same glyph engine either way, and Gavin has
         /// visually accepted it. The streaming states need the real GDI face.)
         pub streaming_text_format: windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
+        /// D2D-P2 (PLAN-108 H2): 居中小文本 format（⏎/✕/标题/按钮标签）。
+        /// Segoe UI Normal 14，CENTER + 段落垂直居中 + NO_WRAP，
+        /// 对应 GDI draw_text(DT_CENTER|DT_VCENTER|SINGLELINE) 的缓存字体。
+        pub centered_text_format: windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
+        /// D2D-P2 (PLAN-108 H2): 预览正文换行 format。Segoe UI Normal 14，
+        /// LEADING + **顶对齐** + WORD_WRAPPING_WRAP —— GDI 正文是
+        /// DT_LEFT|DT_WORDBREAK（无 DT_VCENTER → 顶对起画，:3944-3949），
+        /// 段落对齐不能用 CENTER，否则整块文本垂直居中造成观感漂移。
+        /// 度量裁定③：只用于画，从不测量；断行差异是 U2 已裁决的端测观察项。
+        pub wrap_text_format: windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
         pub brush: ID2D1SolidColorBrush,
     }
     fn create_resources() -> windows::core::Result<D2dResources> {
@@ -3044,6 +3114,35 @@ mod d2d {
             streaming_text_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
             streaming_text_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             streaming_text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            // D2D-P2 (H2): 居中小文本 format —— 同 GDI face（Segoe UI Normal 14），
+            // 对应 draw_text 的 DT_CENTER|DT_VCENTER|SINGLELINE 三连。
+            let centered_text_format = dwrite.CreateTextFormat(
+                PCWSTR(gdi_family.as_ptr()),
+                None,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                -OVERLAY_FONT_SIZE as f32, // GDI negative height (em) → D2D positive size
+                PCWSTR(locale.as_ptr()),
+            )?;
+            centered_text_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            centered_text_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            centered_text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            // D2D-P2 (H2): 预览正文换行 format —— 顶对齐（GDI 无 DT_VCENTER），
+            // WORD_WRAPPING_WRAP 对应 DT_WORDBREAK。断行差异 = U2 裁决的端测观察项。
+            // 注：windows 0.58 无 _TOP 常量，顶对齐 = NEAR（0，SDK 原名 parity）。
+            let wrap_text_format = dwrite.CreateTextFormat(
+                PCWSTR(gdi_family.as_ptr()),
+                None,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                -OVERLAY_FONT_SIZE as f32,
+                PCWSTR(locale.as_ptr()),
+            )?;
+            wrap_text_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+            wrap_text_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
+            wrap_text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
             let _ = rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             let brush = rt.CreateSolidColorBrush(
                 &D2D1_COLOR_F {
@@ -3060,6 +3159,8 @@ mod d2d {
                 rt,
                 text_format,
                 streaming_text_format,
+                centered_text_format,
+                wrap_text_format,
                 brush,
             })
         }
@@ -3344,10 +3445,13 @@ mod d2d {
     /// Same 0.5px pen-centering inset as the P0 border (fill 0..w, stroke 0.5..w-0.5).
     /// OVERLAY-086 Bug 1's wedge lesson applied here from day one: fill and stroke
     /// share one radius binding, so no corner wedge exists on this path either.
-    fn chrome(res: &D2dResources, w: f32, h: f32) {
+    /// D2D-P2 (PLAN-108 H1): chrome 参数化底色与半径。FocusLost / Error 的 GDI 底色是
+    /// #211D1A（draw_preview_overlay / draw_error_overlay 内 local const BG_DARK），
+    /// 圆角同 r10；已迁路径经 chrome() 保持 #110F0D + r10 零变化。
+    /// fill/stroke 共用一个半径绑定（OVERLAY-086 Bug 1 教训，:3178-3200 同款）。
+    fn chrome_with(res: &D2dResources, w: f32, h: f32, bg: COLORREF, radius: f32) {
         unsafe {
-            const CORNER_RADIUS: f32 = 10.0; // GDI: CORNER_RADIUS=10, RoundRect(…,10*2,10*2)
-            res.brush.SetColor(&colorref_to_d2d(super::OVERLAY_BG_DARK));
+            res.brush.SetColor(&colorref_to_d2d(bg));
             res.rt.FillRoundedRectangle(
                 &D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
@@ -3356,8 +3460,8 @@ mod d2d {
                         right: w,
                         bottom: h,
                     },
-                    radiusX: CORNER_RADIUS,
-                    radiusY: CORNER_RADIUS,
+                    radiusX: radius,
+                    radiusY: radius,
                 },
                 &res.brush,
             );
@@ -3371,14 +3475,23 @@ mod d2d {
                         right: w - 0.5,
                         bottom: h - 0.5,
                     },
-                    radiusX: CORNER_RADIUS,
-                    radiusY: CORNER_RADIUS,
+                    radiusX: radius,
+                    radiusY: radius,
                 },
                 &res.brush,
                 1.0,
                 None,
             );
         }
+    }
+
+    /// GDI `draw_overlay_chrome` (:2187): dark #110F0D rounded-rect background +
+    /// 1px OVERLAY_BORDER_GRAY rounded border, radius 10 (GDI RoundRect 10*2 ellipse).
+    /// Same 0.5px pen-centering inset as the P0 border (fill 0..w, stroke 0.5..w-0.5).
+    /// OVERLAY-086 Bug 1's wedge lesson applied here from day one: fill and stroke
+    /// share one radius binding, so no corner wedge exists on this path either.
+    fn chrome(res: &D2dResources, w: f32, h: f32) {
+        chrome_with(res, w, h, super::OVERLAY_BG_DARK, 10.0);
     }
 
     /// Mic indicator geometry shared by the D2D path (matches GDI `draw_recording_indicator`
@@ -3540,6 +3653,197 @@ mod d2d {
         cr
     }
 
+    /// D2D-P2 (PLAN-108 H9): GDI `draw_submit_button` 直译 —— 16px 橙色圆角钮 +
+    /// 深色 ⏎（U+23CE）。几何照抄 GDI（rect 相对）：bs=16、bl=w-25、bt=(h-16)/2。
+    /// GDI RoundRect(…,10,10) 是椭圆**直径** 10 → D2D 半径 5（别与 chrome 的
+    /// RoundRect(…,10*2,10*2)→r10 抄混）。返回命中 RECT **无 +1**（GDI 历史口径，
+    /// 与 stop_button 的 +1 排他约定不同）。箭头用 centered_text_format
+    /// （对应 GDI draw_text 的 DT_CENTER|DT_VCENTER），文字色 BG_DARK #110F0D。
+    /// 无度量需求（自居中）——度量裁定③继续成立。
+    fn submit_button(res: &D2dResources, w: f32, h: f32) -> RECT {
+        let bs = 16.0_f32;
+        let bl = w - 25.0; // GDI: rect.right - 25（rect 相对宽）
+        let bt = (h - bs) / 2.0; // GDI: (height - bs)/2
+        let submit_rect = RECT {
+            left: bl as i32,
+            top: bt as i32,
+            right: (bl + bs) as i32, // 🔴 无 +1：draw_submit_button_hit_rect_only 同公式
+            bottom: (bt + bs) as i32,
+        };
+        unsafe {
+            res.brush
+                .SetColor(&colorref_to_d2d(super::OVERLAY_BRAND_ORANGE));
+            res.rt.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: bl,
+                        top: bt,
+                        right: bl + bs,
+                        bottom: bt + bs,
+                    },
+                    radiusX: 5.0,
+                    radiusY: 5.0,
+                },
+                &res.brush,
+            );
+            // 1px 描边内缩 0.5px（stop_button 的像素对齐论证同款）
+            res.rt.DrawRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: bl + 0.5,
+                        top: bt + 0.5,
+                        right: bl + bs - 0.5,
+                        bottom: bt + bs - 0.5,
+                    },
+                    radiusX: 5.0,
+                    radiusY: 5.0,
+                },
+                &res.brush,
+                1.0,
+                None,
+            );
+            let arrow: Vec<u16> = "\u{23CE}".encode_utf16().collect();
+            res.brush.SetColor(&colorref_to_d2d(super::OVERLAY_BG_DARK));
+            res.rt.DrawText(
+                &arrow,
+                &res.centered_text_format,
+                &D2D_RECT_F {
+                    left: bl,
+                    top: bt,
+                    right: bl + bs,
+                    bottom: bt + bs,
+                },
+                &res.brush,
+                windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+        submit_rect
+    }
+
+    /// D2D-P2 (PLAN-108 H9): `StreamingEditing`（编辑态）= chrome + submit 键。
+    /// 正文文字由 Win32 EDIT 子控件自绘（create_edit_control），父窗口不画文字，
+    /// D2D 帧与子控件零交集（共存论证：docs/D2D-P2P3-PLAN.md §3.3-A —— D2D 只画进
+    /// mem_dc、BitBlt 合成不变、子控件独立表面、颜色同值闭环）。
+    /// Returns false on any D2D failure — the caller renders the same frame via GDI.
+    pub(crate) fn draw_editing_overlay(hdc: HDC, rect: &RECT) -> bool {
+        with_d2d(hdc, rect, |res, w, h| {
+            chrome(res, w, h);
+            let _ = submit_button(res, w, h);
+        })
+    }
+
+    /// D2D-P2 (PLAN-108 H4): 右分隔线小原语 —— x = w-36、高 20 垂直居中、
+    /// 2px OVERLAY_BORDER_GRAY（文字区与停止键之间）。原
+    /// draw_streaming_text_overlay 内联版（:3663-3684 P1 补齐）上提共用，
+    /// 消除第二份内联（GDI 侧两处 :2329/:2629 同一几何）。
+    fn right_separator(res: &D2dResources, w: f32, h: f32) {
+        unsafe {
+            let sep_r_x = w - 36.0; // GDI: rect.right - 36 (rect-relative)
+            let sep_hh = 10.0; // GDI: sep_h 20 / 2
+            let cy = h / 2.0;
+            res.brush
+                .SetColor(&colorref_to_d2d(super::OVERLAY_BORDER_GRAY));
+            res.rt.DrawLine(
+                D2D_POINT_2F {
+                    x: sep_r_x,
+                    y: cy - sep_hh,
+                },
+                D2D_POINT_2F {
+                    x: sep_r_x,
+                    y: cy + sep_hh,
+                },
+                &res.brush,
+                2.0,
+                None,
+            );
+        }
+    }
+
+    /// D2D-P2 (PLAN-108 H3): 波形原语 —— 32 条 3px 圆角竖条（GDI RoundRect(…,6,6)
+    /// = r3 全圆角）单色 FillRoundedRectangle，逐条高度/横位与 GDI 循环逐位同值：
+    /// bc=32、bw=3、bgap=2、half=16；wl = 30+12+(ww-108)/2（rect 相对，ww = w-90，
+    /// GDI :2332-2338 同式）；by = h/2。高度来自共享纯函数 waveform_bar_height
+    /// （i32 口径转 f32，整数对齐防 ±1px 视觉差），快照来自 waveform_snapshot
+    /// （锁内 decay，OVERLAY-LOCK-SCOPE-001）。性能：GDI 每帧 ~224 次 GDI 对象
+    /// 创建/销毁 → D2D 1 次 SetColor + 32 次 FillRoundedRectangle，零 GDI 对象操作。
+    fn waveform(res: &D2dResources, w: f32, h: f32, state: &OverlayWindowState) {
+        let bc: i32 = 32;
+        let bw: i32 = 3;
+        let bgap: i32 = 2;
+        let half = bc / 2;
+        let ww = (w as i32 - 36) - 30 - 24; // GDI: sep_r_x - sep_l_x - 24（rect 相对）
+        let total_bar_width = bc * bw + (bc - 1) * bgap;
+        let wl = (30 + 12 + (ww - total_bar_width) / 2) as f32; // GDI: sep_l_x + 12 + …
+        let by = h / 2.0;
+        let snapshot = super::waveform_snapshot(state, half);
+        unsafe {
+            res.brush
+                .SetColor(&colorref_to_d2d(super::OVERLAY_BRAND_ORANGE));
+            // 🔴 奇偶对齐：GDI br = {top: by - bh/2, bottom: by + bh/2} 是 **i32 整除**，
+            // 奇数 bh 实画 2*(bh/2) px（丢 1px）。D2D 必须复刻同一整除口径，
+            // 否则奇数高度 bar 比 GDI 高 1px（视觉差）。
+            // Left half: bars spread from center outward to the left
+            for i in 0..half {
+                let v = snapshot.get(i as usize).copied().unwrap_or(0.0);
+                let hh = (super::waveform_bar_height(v, i, half) / 2) as f32;
+                let x = wl + ((half - 1 - i) * (bw + bgap)) as f32;
+                res.rt.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: x,
+                            top: by - hh,
+                            right: x + bw as f32,
+                            bottom: by + hh,
+                        },
+                        radiusX: bw as f32,
+                        radiusY: bw as f32,
+                    },
+                    &res.brush,
+                );
+            }
+            // Right half: bars spread from center outward to the right (mirror)
+            for i in 0..half {
+                let v = snapshot.get(i as usize).copied().unwrap_or(0.0);
+                let hh = (super::waveform_bar_height(v, i, half) / 2) as f32;
+                let x = wl + ((half + i) * (bw + bgap)) as f32;
+                res.rt.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: x,
+                            top: by - hh,
+                            right: x + bw as f32,
+                            bottom: by + hh,
+                        },
+                        radiusX: bw as f32,
+                        radiusY: bw as f32,
+                    },
+                    &res.brush,
+                );
+            }
+        }
+    }
+
+    /// D2D-P2 (PLAN-108 H5): `Recording` 波形变体与 `FallingToProcessing` 的共用
+    /// 复合体（两者 GDI 像素输出逐位相同 —— dispatch :2070-2079 经
+    /// draw_recording_overlay(show_placeholder=false) 与 :2127-2131 直调同一组
+    /// 绘制函数）= chrome + mic_indicator(三态图标+左分隔线) + waveform +
+    /// right_separator + stop_button。命中 rect 由调用侧 helper 出。
+    /// Returns false on any D2D failure — the caller renders the same frame via GDI.
+    pub(crate) fn draw_recording_waveform_overlay(
+        hdc: HDC,
+        rect: &RECT,
+        state: &OverlayWindowState,
+    ) -> bool {
+        with_d2d(hdc, rect, |res, w, h| {
+            chrome(res, w, h);
+            mic_indicator(res, h, state);
+            waveform(res, w, h, state);
+            right_separator(res, w, h);
+            let _ = stop_button(res, w, h);
+        })
+    }
+
     /// GDI `draw_listening_placeholder` (:2731): centered single-line hint
     /// ("请说话..." / "Speak now...") between the mic area and the stop button.
     fn placeholder_text(
@@ -3662,27 +3966,235 @@ mod d2d {
             streaming_text(res, w, h, visible_text, text_width);
             // Right separator (主控 D2D-P1 验收要求补齐): GDI 版 :2617-2624 逐项照抄 —
             // x = width-36, 高 20 垂直居中, 2px OVERLAY_BORDER_GRAY。文字区与停止键之间。
+            // D2D-P2 (PLAN-108 H4): 内联版上提为 right_separator 原语（同值替换），
+            // 与 Recording/FallingToProcessing 复合体共用，消除第二份内联。
+            right_separator(res, w, h);
+            let _ = stop_button(res, w, h);
+        })
+    }
+
+    /// D2D-P2 (PLAN-108 H12): `Error`（错误态）= chrome_with(#211D1A, r10) + 红点
+    /// FillEllipse + 左对齐单行错误文本。几何逐位照抄 GDI `draw_error_overlay`：
+    /// 底色 #211D1A / 边 r10（:4032-4034）、红点 d=8 圆心 (left+16, 垂直中)
+    /// （:4061-4075，Ellipse → FillEllipse r4 直译）、文本带相对 28 → w-14、
+    /// 上下 4px（:4082-4087，left = circ_x + circ_d/2 + 8 = 28）。
+    /// 文本复用 streaming_text_format（Segoe UI Normal 14, LEADING + 垂直居中 +
+    /// NO_WRAP，与 GDI DT_LEFT|DT_VCENTER|SINGLELINE 逐项对应）——U1 裁决：
+    /// DT_END_ELLIPSIS 不迁移，NO_WRAP 硬裁剪，GDI 兜底保留省略号。
+    /// 无命中矩形（GDI 版无返回值，五元组全 None）。
+    /// Returns false on any D2D failure — the caller renders the same frame via GDI.
+    pub(crate) fn draw_error_overlay(hdc: HDC, rect: &RECT, message: &str) -> bool {
+        with_d2d(hdc, rect, |res, w, h| {
+            chrome_with(res, w, h, COLORREF(0x211D1A), 10.0);
             unsafe {
-                let sep_r_x = w - 36.0; // GDI: rect.right - 36 (rect-relative)
-                let sep_hh = 10.0; // GDI: sep_h 20 / 2
-                let cy = h / 2.0;
+                let circ_d = 4.0_f32; // GDI circ_d=8 的半径
+                res.brush.SetColor(&colorref_to_d2d(COLORREF(0x0033CC)));
+                res.rt.FillEllipse(
+                    &D2D1_ELLIPSE {
+                        point: D2D_POINT_2F {
+                            x: 12.0 + circ_d,
+                            y: h / 2.0,
+                        },
+                        radiusX: circ_d,
+                        radiusY: circ_d,
+                    },
+                    &res.brush,
+                );
+                let msg: Vec<u16> = message.encode_utf16().collect();
+                res.brush
+                    .SetColor(&colorref_to_d2d(super::OVERLAY_BRAND_ORANGE));
+                res.rt.DrawText(
+                    &msg,
+                    &res.streaming_text_format,
+                    &D2D_RECT_F {
+                        left: 12.0 + circ_d + circ_d + 8.0, // GDI: circ_x + circ_d/2 + 8
+                        top: 4.0,
+                        right: w - 14.0,
+                        bottom: h - 4.0,
+                    },
+                    &res.brush,
+                    windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+        })
+    }
+
+    /// D2D-P2 (PLAN-108 H11): `FocusLost`（失焦预览态）。几何逐位照抄 GDI
+    /// `draw_preview_overlay`（rect 相对坐标）：
+    /// - 底 #211D1A + 1px 边 r10（:3840-3867）→ chrome_with(bg, 10)
+    /// - 标题栏文字：橙，带 (26, 4) → (w-26, 28)（:3869-3886），centered format
+    /// - 标题 ✕ 键 18x18：(w-26, 5) → (w-8, 23)，GDI RoundRect(…,6,6)→r3，
+    ///   OVERLAY_BTN_BORDER 1px 描边（无填充）+ ✕（U+2715）橙字，centered format
+    /// - 标题分隔线：y=28，x 8 → w-8，1px OVERLAY_BORDER_GRAY（:3925-3933）
+    /// - 正文：#F2F2F2，带 (14, 36) → (w-14, h-40)（:3934-3949），wrap_text_format
+    ///   （LEADING + 顶对齐 + WRAP = DT_LEFT|DT_WORDBREAK；U2 裁决：断行差异是
+    ///   端测观察项，不许为它开单元素退 GDI 先例）
+    /// - 底部双键：45x18 gap10 水平居中、底距 10（同 preview_hit_rects 公式，
+    ///   btn_left 用 i32 整除保持与 GDI 逐位同值），GDI RoundRect(…,8,8)→r4
+    ///   OVERLAY_BTN_BORDER 描边（无填充）；复制橙字 / 关闭 #808080 灰字，
+    ///   centered format（:3950-4020）
+    /// 命中 rect 由调用侧 preview_hit_rects(rect) 出（单一几何源，本原语不算几何）。
+    /// Returns false on any D2D failure — the caller renders the same frame via GDI.
+    pub(crate) fn draw_preview_overlay(
+        hdc: HDC,
+        rect: &RECT,
+        text: &str,
+        ui_language: crate::config::UiLanguage,
+    ) -> bool {
+        with_d2d(hdc, rect, |res, w, h| {
+            chrome_with(res, w, h, COLORREF(0x211D1A), 10.0);
+            unsafe {
+                // 标题栏文字（橙，DT_CENTER|DT_VCENTER → centered format）
+                res.brush
+                    .SetColor(&colorref_to_d2d(super::OVERLAY_BRAND_ORANGE));
+                let title: Vec<u16> = super::i18n::get(ui_language)
+                    .preview_title_bar
+                    .encode_utf16()
+                    .collect();
+                res.rt.DrawText(
+                    &title,
+                    &res.centered_text_format,
+                    &D2D_RECT_F {
+                        left: 26.0,
+                        top: 4.0,
+                        right: w - 26.0,
+                        bottom: 28.0,
+                    },
+                    &res.brush,
+                    windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+                // 标题 ✕ 键（18x18，r3，描边无填充）
+                let tc_l = w - 26.0;
+                let tc_t = 5.0;
+                let tc_r = w - 8.0;
+                let tc_b = 23.0;
+                res.brush
+                    .SetColor(&colorref_to_d2d(super::OVERLAY_BTN_BORDER));
+                res.rt.DrawRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: tc_l + 0.5,
+                            top: tc_t + 0.5,
+                            right: tc_r - 0.5,
+                            bottom: tc_b - 0.5,
+                        },
+                        radiusX: 3.0,
+                        radiusY: 3.0,
+                    },
+                    &res.brush,
+                    1.0,
+                    None,
+                );
+                res.brush
+                    .SetColor(&colorref_to_d2d(super::OVERLAY_BRAND_ORANGE));
+                let x_mark: Vec<u16> = "\u{2715}".encode_utf16().collect();
+                res.rt.DrawText(
+                    &x_mark,
+                    &res.centered_text_format,
+                    &D2D_RECT_F {
+                        left: tc_l,
+                        top: tc_t,
+                        right: tc_r,
+                        bottom: tc_b,
+                    },
+                    &res.brush,
+                    windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+                // 标题分隔线（y=28，x 8 → w-8，1px）
                 res.brush
                     .SetColor(&colorref_to_d2d(super::OVERLAY_BORDER_GRAY));
                 res.rt.DrawLine(
+                    D2D_POINT_2F { x: 8.0, y: 28.0 },
                     D2D_POINT_2F {
-                        x: sep_r_x,
-                        y: cy - sep_hh,
-                    },
-                    D2D_POINT_2F {
-                        x: sep_r_x,
-                        y: cy + sep_hh,
+                        x: w - 8.0,
+                        y: 28.0,
                     },
                     &res.brush,
-                    2.0,
+                    1.0,
                     None,
                 );
+                // 正文（#F2F2F2，顶对齐 + WRAP）
+                res.brush.SetColor(&colorref_to_d2d(COLORREF(0xF2F2F2)));
+                let body: Vec<u16> = text.encode_utf16().collect();
+                res.rt.DrawText(
+                    &body,
+                    &res.wrap_text_format,
+                    &D2D_RECT_F {
+                        left: 14.0,
+                        top: 36.0,
+                        right: w - 14.0,
+                        bottom: h - 40.0,
+                    },
+                    &res.brush,
+                    windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+                // 底部双键（45x18 gap10；btn_left i32 整除 = GDI (W-100)/2 逐位同值）
+                let btn_left = ((w as i32 - 100) / 2) as f32;
+                let btn_top = h - 28.0; // GDI: bottom - 18 - 10（rect 相对）
+                let copy_l = btn_left;
+                let close_l = btn_left + 55.0; // btn_w + gap
+                res.brush
+                    .SetColor(&colorref_to_d2d(super::OVERLAY_BTN_BORDER));
+                for l in [copy_l, close_l] {
+                    res.rt.DrawRoundedRectangle(
+                        &D2D1_ROUNDED_RECT {
+                            rect: D2D_RECT_F {
+                                left: l + 0.5,
+                                top: btn_top + 0.5,
+                                right: l + 45.0 - 0.5,
+                                bottom: btn_top + 18.0 - 0.5,
+                            },
+                            radiusX: 4.0,
+                            radiusY: 4.0,
+                        },
+                        &res.brush,
+                        1.0,
+                        None,
+                    );
+                }
+                // 标签：复制橙字 / 关闭灰字（DT_CENTER|DT_VCENTER → centered format）
+                let copy_label: Vec<u16> = super::i18n::get(ui_language)
+                    .preview_copy_btn
+                    .encode_utf16()
+                    .collect();
+                let close_label: Vec<u16> = super::i18n::get(ui_language)
+                    .preview_close
+                    .encode_utf16()
+                    .collect();
+                res.brush
+                    .SetColor(&colorref_to_d2d(super::OVERLAY_BRAND_ORANGE));
+                res.rt.DrawText(
+                    &copy_label,
+                    &res.centered_text_format,
+                    &D2D_RECT_F {
+                        left: copy_l,
+                        top: btn_top,
+                        right: copy_l + 45.0,
+                        bottom: btn_top + 18.0,
+                    },
+                    &res.brush,
+                    windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+                res.brush.SetColor(&colorref_to_d2d(COLORREF(0x808080)));
+                res.rt.DrawText(
+                    &close_label,
+                    &res.centered_text_format,
+                    &D2D_RECT_F {
+                        left: close_l,
+                        top: btn_top,
+                        right: close_l + 45.0,
+                        bottom: btn_top + 18.0,
+                    },
+                    &res.brush,
+                    windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
             }
-            let _ = stop_button(res, w, h);
         })
     }
 }
@@ -3828,6 +4340,40 @@ fn draw_processing_overlay(
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
     );
 }
+/// D2D-P2 (PLAN-108 H10): FocusLost 三个命中矩形的单一几何源（纯函数，只依赖 rect）。
+/// GDI 绘制路径与 D2D 成功路径都从这里取返回值——几何口径物理上不可分叉
+/// （centered_x 同款哲学：返回值不允许两份算术）。公式逐位照抄原
+/// draw_preview_overlay 内联版：标题 ✕ 键 18x18（right-26, top+5 → right-8, top+23）、
+/// 底部双键 45x18 gap10 底边距 10 水平居中。
+#[cfg(target_os = "windows")]
+fn preview_hit_rects(rect: &RECT) -> (RECT, RECT, RECT) {
+    let title_close_rect = RECT {
+        left: rect.right - 26,
+        top: rect.top + 5,
+        right: rect.right - 8,
+        bottom: rect.top + 23,
+    };
+    let btn_w = 45;
+    let btn_h = 18;
+    let gap = 10;
+    let total_w = btn_w * 2 + gap;
+    let btn_left = rect.left + (rect.right - rect.left - total_w) / 2;
+    let btn_top = rect.bottom - btn_h - 10;
+    let copy_rect = RECT {
+        left: btn_left,
+        top: btn_top,
+        right: btn_left + btn_w,
+        bottom: btn_top + btn_h,
+    };
+    let close_rect = RECT {
+        left: btn_left + btn_w + gap,
+        top: btn_top,
+        right: btn_left + btn_w * 2 + gap,
+        bottom: btn_top + btn_h,
+    };
+    (copy_rect, close_rect, title_close_rect)
+}
+
 #[cfg(target_os = "windows")]
 fn draw_preview_overlay(
     hdc: windows::Win32::Graphics::Gdi::HDC,
@@ -3841,6 +4387,9 @@ fn draw_preview_overlay(
     // OVERLAY-054-C: use file-level OVERLAY_BORDER_GRAY instead of local constant.
     const CORNER_RADIUS: i32 = 10;
     let strings = i18n::get(ui_language);
+    // D2D-P2 (PLAN-108 H10): 三个命中 rect 改由 preview_hit_rects 单一源出
+    // （绘制与返回值共用同一组 RECT，同值替换）。
+    let (copy_rect, close_rect, title_close_rect) = preview_hit_rects(rect);
     let bg = unsafe { CreateSolidBrush(BG_DARK) };
     unsafe {
         let _ = FillRect(hdc, rect, bg);
@@ -3884,13 +4433,7 @@ fn draw_preview_overlay(
         &mut title_rect,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
     );
-    // Title bar close button (18x18, right side)
-    let title_close_rect = RECT {
-        left: rect.right - 26,
-        top: rect.top + 5,
-        right: rect.right - 8,
-        bottom: rect.top + 23,
-    };
+    // Title bar close button (18x18, right side) — rect 来自 preview_hit_rects
     // FIX-006 v2: button border brighter than window border for visual distinction.
     // OVERLAY-054-C: use file-level OVERLAY_BTN_BORDER (value unchanged, 0x707070).
     let tc_pen = unsafe { CreatePen(PS_SOLID, 1, OVERLAY_BTN_BORDER) };
@@ -3947,25 +4490,7 @@ fn draw_preview_overlay(
         &mut text_rect,
         DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS,
     );
-    // Bottom buttons (centered)
-    let btn_w = 45; // FIX-006-6: shrink 25%
-    let btn_h = 18; // FIX-006-6: shrink 25%
-    let gap = 10;
-    let total_w = btn_w * 2 + gap;
-    let btn_left = rect.left + (rect.right - rect.left - total_w) / 2;
-    let btn_top = rect.bottom - btn_h - 10;
-    let copy_rect = RECT {
-        left: btn_left,
-        top: btn_top,
-        right: btn_left + btn_w,
-        bottom: btn_top + btn_h,
-    };
-    let close_rect = RECT {
-        left: btn_left + btn_w + gap,
-        top: btn_top,
-        right: btn_left + btn_w * 2 + gap,
-        bottom: btn_top + btn_h,
-    };
+    // Bottom buttons (centered) — rects 来自 preview_hit_rects（45x18, gap10, 底距10）
     // FIX-006 v2: bottom buttons use brighter border to distinguish from window edge.
     // OVERLAY-054-C: use file-level OVERLAY_BTN_BORDER.
     let btn_pen = unsafe { CreatePen(PS_SOLID, 1, OVERLAY_BTN_BORDER) };

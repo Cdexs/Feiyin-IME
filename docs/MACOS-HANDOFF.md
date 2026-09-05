@@ -1458,3 +1458,54 @@ macOS 零编译影响、零行为差异，§D2D-HANG-095 结论不变。
 `STREAMING_OVERLAY_MAX_SCREEN_RATIO`（cfg(windows) 常量，0.65→0.50）。
 macOS overlay 走 `src/platform/macos/overlay.rs` 独立几何路径，不消费这些符号。
 零编译影响、零行为差异。
+
+## D2D-P2P3-IMPL-109（2026-09-05，coder-2）
+
+剩余五态（`Recording` / `FallingToProcessing` / `StreamingEditing` / `FocusLost` /
+`Error`）从 GDI 迁到 Direct2D，方案见 `docs/D2D-P2P3-PLAN.md`（冻结版 + 主控裁决附录）。
+全部改动位于 `src/main.rs` 的 windows-only 区（`mod d2d` 全在 `#[cfg(target_os = "windows")]`
+内；dispatch `draw_overlay_to_dc` 亦然），macOS 零编译影响。
+
+**本批新增的 D2D 原语/复合体清单**（macOS 侧将来对齐时的能力盘点）：
+
+- 共用层：`chrome_with(bg, radius)`（底色/半径参数化的窗口骨架，默认 `chrome()`
+  = #110F0D + r10 不变）、`right_separator`（右分隔线小原语，三处共用）
+- 新原语：`waveform`（32 条圆角竖条，高度公式与音频快照抽成共享纯函数
+  `waveform_bar_height` / `waveform_snapshot`，锁内 decay、锁外绘制）、
+  `submit_button`（橙圆角 ⏎，命中 RECT 无 +1 的历史口径保留）
+- 状态复合体：`draw_recording_waveform_overlay`（**Recording 波形变体与
+  FallingToProcessing 共用同一复合体**——两者 GDI 输出本就逐位相同）、
+  `draw_editing_overlay`（chrome + submit，正文由 Win32 EDIT 子控件自绘）、
+  `draw_preview_overlay`（标题/✕/分隔线/换行正文/双键）、`draw_error_overlay`
+  （红点 + 左对齐文本）
+- 新文本 format ×2：`centered_text_format`（CENTER+垂直居中+NO_WRAP）、
+  `wrap_text_format`（LEADING+顶对齐+WRAP）；`D2dResources` 加两字段，
+  **零新 thread_local**（release_resources 整槽释放覆盖）
+
+**macOS 侧对齐口径（DEC-045：独立窗口，禁止托盘代替）**：
+
+1. macOS overlay 是 `src/platform/macos/overlay.rs` 独立实现，本批不改它的任何行为；
+   但五态的**视觉规格**现在以 D2D 路径为准（GDI 降为兜底）：底色/radius/元素几何/
+   命中 rect 口径的权威定义 = `docs/D2D-P2P3-PLAN.md` §3.1 + `mod d2d` 内各原语 doc 注释。
+   macOS 侧若做视觉对齐，应照这套规格，而不是照 GDI 兜底路径。
+2. 命中矩形单一源哲学可移植：Windows 侧三个 helper
+   （stop +1 / submit 无 +1 / `preview_hit_rects` 纯函数）的「返回值不允许两份算术」
+   原则，macOS 侧对应点击区域计算应同样单源化。
+3. 波形纯函数（`waveform_bar_height` / `waveform_snapshot`）在本文件（非 mod d2d、
+   但 cfg(windows)）——macOS 侧如需波形，公式可直接对表移植，音频数据源语义
+   （decay 0.02/帧、取样新→旧映射）一致。
+
+**Win32/D2D 专有、不可直接移植的部分**：
+
+- `with_d2d` 的 DC render target（BindDC 到 GDI 内存 DC）与 GDI 兜底回落机制
+  —— macOS 侧无 GDI 概念，需按 DEC-045 用 AppKit/CoreGraphics 自行决策；
+- StreamingEditing 的 Win32 EDIT 子控件自绘正文（OVERLAY-054-D WM_SETFONT、
+  WM_CTLCOLOREDIT 背景刷）—— macOS 对应物是 NSTextField/自绘，本批未触碰其生命周期；
+- `apply_overlay_window_region`（SetWindowRgn 硬裁剪）与 DWM 圆角路径。
+
+**per-pixel alpha 前置条件对 macOS 的含义**：本批落定后 Windows 侧八态全部 D2D 化
+（DEC-056 ③ 的前置达成）——接下来 per-pixel alpha 批次会把 `ALPHA_MODE_IGNORE` 换
+premultiplied 并重审角部像素。macOS 侧无对应前置依赖，但 DEC-056 补充一
+「处理中态灰线不回退软边，直接等 per-pixel alpha」的裁决只针对 Windows 合成链；
+macOS 侧若未来做半透明窗口（NSWindow.backgroundColor alpha），角部像素/软边问题
+需独立评估，不得沿用 Windows 的 SetWindowRgn/DWM 结论。

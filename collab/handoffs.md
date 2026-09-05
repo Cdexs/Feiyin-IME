@@ -134,3 +134,13 @@
 - **协商点**：FallingToProcessing 与 Recording 波形变体 GDI 输出逐位相同 → 共用同一 D2D 复合体（与任务书预设不同，属简化，请主控裁决）；D2dResources +2 字段零新 thread_local（D2D-HANG-095 关天然过）
 - **红线**：src/**、ui/**、src-tauri/**、tests/** 零写入；零构建；未 commit；v0.9.0 未动；troubleshooting.md 未碰；零凭证
 - **详情**：outbox/coder-2/result.md（含收尾自证表）+ logs/20260905.md + CHANGELOG.md
+
+## 2026-09-05 — coder-2 — D2D-P2P3-IMPL-109 ✅ 五态迁移实施完成（仅 src/main.rs，待主控逐 hunk 验收）
+
+- **范围**：src/main.rs +637/-115，22 hunks 全生产区（末 hunk :4549 ≪ 测试区）；基线 f774b26
+- **五步顺序未改**：Error（H1+H2+H12）→ StreamingEditing（H8+H9）→ FocusLost（H10+H11）→ Recording 波形（H3+H4+H5+H6）→ FallingToProcessing（H7）
+- **验证**：fmt --check 0 / check --all-targets 0 error / warning 163 = stash 基线持平；几何区六锚点零 diff（grep 证）；零新 thread_local；命中矩形三 helper 单一源（stop+1 / submit 无+1 / preview 三件套纯函数）
+- **实施修正 2 条**：① DWRITE_PARAGRAPH_ALIGNMENT_TOP 不存在于 windows 0.58 → NEAR（等价）；② 波形奇数高度 i32 整除口径在 D2D 复刻（方案笔误修正，防 ±1px）
+- **给 tester-1（TEST-SYNC-110）**：G1-G5 照方案 §3.4.4；新增素材见 result.md §五（submit 无+1 负向断言 / 波形整除口径 / dispatch 形态正则）
+- **红线**：未 commit / tests/** 与 troubleshooting.md 未碰 / draw_editing_overlay_chrome 不删不改不参考（U5）/ 零凭证
+- **详情**：outbox/coder-2/result.md（逐 hunk 行号表 + 15 项非回归保证手段 + 收尾自证表）
