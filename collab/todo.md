@@ -2,6 +2,62 @@
 
 ## 🔴 2026-09-05 —— 当前状态（最新在最上）
 
+### 🔴 D2D-HANG-095 · 根因修复（coder-2，2026-09-05 派发，进行中）
+
+**根因已由 REPRO-094 实证锁死，不是推测**：Rust `thread_local!` 析构器在 Windows 上
+运行于 `DLL_THREAD_DETACH`，**加载器锁已被本线程持有**；此时做 D2D/DWrite 最后一次
+COM Release → **自持加载器锁死锁**（BS4 抓到 `LoaderLock.OwningThread` = 挂死线程自身 tid）。
+
+- 探针 A 独立 exe 主线程 **正常**（11ms）／ B 子线程退出 **挂死**在 `[Drop 6/6] brush Release`
+  ／ b2·b5 线程体内释放 **正常** ／ b6 反向序 **照样挂**（与顺序无关）／ b3 `CoInitializeEx` **不救**
+- **端侧「托盘退出无响应」同源路径**：`shutdown_and_join()` `:937-947` 主线程 `join.join()`
+  死等 overlay 线程结束 → 它结束前必跑那批析构 → 主线程永不返回
+- **修法**：`mod d2d` 加 `release_resources()`（`take()` 就地 drop）+
+  `spawn_overlay_thread` 线程闭包尾部调用（闭包是唯一覆盖全部 `?` 早返回路径的位置）
+- **硬判据**：产出源盘点（还有哪些线程会写这个 thread_local），答不出不许交付
+- 任务书：`collab/inbox/coder-2/task.md`
+
+### 在途任务（2026-09-05）
+
+| Worker | 任务 | 阶段 | 状态 |
+| --- | --- | --- | --- |
+| tester-1 | **REPRO-094** D2D-HANG-001 根因定位 | 定位 | 🔄 探针 A/B/b2/b3/b5/b6/BS4 已出结论，探针 D 端侧复测进行中 |
+| coder-2 | **D2D-HANG-095** 根因修复 | 阶段一 | 🔄 方案已同意，执行中 |
+| coder-1 | — | — | 待命 |
+
+**边界评估**：coder-2 占 `src/main.rs` + `docs/MACOS-HANDOFF.md`；
+tester-1 占 `collab/outbox/tester-1/repro094/`（独立 cargo 工程，不入库）。**文件级零重叠。**
+`collab/troubleshooting.md` 本批归 **tester-1**（证据在它手里），coder-2 禁写，防 `[WORKER-DOC-OVERWRITE-001]`。
+
+**下一棒**：coder-2 验收通过 → 阶段三 `TEST-SYNC-096`（tester-1：去掉两条 `#[ignore]` +
+在测试里显式调 `release_resources()` + 加护栏）→ 阶段四全量回归 → 阶段五出包。
+
+### 🔴 REPRO-094 · D2D-HANG-001 根因定位（tester-1，2026-09-05 11:2x 派发，进行中）
+
+**Gavin 2026-09-05 指示「派吧」**。P0：NULL HDC 调 D2D 在 `cargo test` 内挂死，
+两条用例现靠 `#[ignore]` 绕过；疑与端侧「点托盘退出无响应只能 kill」同源。
+
+- **本单是定位不是修复**：产出证据 + 根因判定，`src/**` `ui/**` 零改动
+- **四探针**：A 主线程复刻 `create_resources` ／ B 子线程 + `join()`（验 thread_local COM Release 阻塞）
+  ／ C `cargo test` harness 内对照（验环境差异）／ D 端侧托盘退出 ×5 复测
+- **四假设**：H1 线程退出 COM Release 阻塞 ／ H2 `CreateTextFormat` 字体集合阻塞
+  ／ H3 test harness 并行 + DWrite SHARED 单例锁 ／ H4 全进程无 `CoInitialize`
+- **主控实读取证**：`create_resources` 在 `src/main.rs:2973-3045`，
+  「CreateDCRenderTarget 之后」= 阻塞落在 `CreateTextFormat` 或其后；
+  `thread_local` D2D（:3047）在线程尾部 drop，而 `shutdown_and_join()`（:937-947）
+  主线程 `join.join()` 阻塞等它 —— 这是「托盘退出无响应」的直连路径；
+  全仓 `src/` 下 `CoInitialize` 命中数 **0**
+- **下一棒**：定位结论出来后派 `D2D-HANG-001-FIX` 给 coder-2（届时 tester-1 转阶段三 TEST-SYNC）
+- 任务书：`collab/inbox/tester-1/task.md`
+
+### ⚠️ 2026-09-05 主控 session 启动发现
+
+- **tester-1 模型余额耗尽**：OpenCode Zen（DeepSeek V4 Flash）`Insufficient balance`，
+  启动上下文注入失败。主控已切至 **GLM-5.3-Flash (2x usage) / OpenCode Go**（与两个 coder 同源）后恢复。
+  → 复发即查此条，不要误判为 Worker 僵死（对照 `[WORKER-RESTART-MODEL-RESET-001]`）
+- **handoffs.md 已归档**：299 → 153 行，09-03 的 9 条移入 `handoffs-archive.md`
+- **本地领先 origin/main 7 个提交未 push**，等 Gavin 明确指示
+
 ### ✅ 阶段五 BUILD-093 已出包（tester-1，2026-09-05 00:37）—— 待 Gavin 端测
 
 - **BUILD-093**：BUILD-085 后五批（OVERLAY-086/D2D-P1/REFACTOR-088+089/测试护栏）进 exe，七项核验全 PASS（sha 全异于 085、ProductVersion 0.9.0.0、探针 D2D-P1×2+D2DERR_RECREATE_TARGET×1）；E2E 64P/**1F**（test_hotkey_toggle_stop 间歇性 FAIL，主控裁定不阻塞出包）；冒烟无 panic；产物在 `Publish/`

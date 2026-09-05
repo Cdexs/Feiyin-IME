@@ -1437,3 +1437,16 @@ cfg 区内，macOS 编译不触及。
 `advance_width` 纯函数与插值区调用点均在 `#[cfg(target_os = "windows")]` 区内
 （`run_overlay_thread` 是 windows-only 线程主循环）。macOS 零编译影响、零行为差异；
 macOS overlay 独立路径不消费该函数。
+
+## D2D-HANG-095（2026-09-05，coder-2）
+
+本单全部改动位于 `#[cfg(target_os = "windows")]` 区内：`mod d2d` 新增的
+`release_resources()`（在 mod d2d 的 cfg 门内）与 `spawn_overlay_thread`（:1050，
+windows 版）线程闭包尾部的调用。macOS 走 `spawn_overlay_thread` 的独立 macOS 实现
+（原 :6979，无 d2d 引用），不消费 thread_local `D2D`，也不调用 `release_resources`。
+
+**零编译影响 / 零行为差异**：macOS overlay 独立路径无 thread_local COM 资源，
+不存在 DLL_THREAD_DETACH 加载器锁死锁问题，无需对应改动。
+D2D-HANG-095-B（2026-09-05）收尾：闭包尾部直调改为 Drop 守卫（D2dReleaseGuard），
+仍在 windows 版 `spawn_overlay_thread` 的 `#[cfg(target_os = "windows")]` 区内；
+macOS 零编译影响、零行为差异，§D2D-HANG-095 结论不变。

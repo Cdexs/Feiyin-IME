@@ -5302,3 +5302,154 @@ Binary file (standard input) matches
 ### （补 2026-08-30 深夜）REPRO-073 验收反馈回填 —— 数据局限性声明
 
 主控验收通过并采纳 070 对照结论（已向 Gavin 更正「服务端未返回」定性）。回填一条局限性：主控复核 28 条 [ASR-SUMMARY] 出更早 2 run vad_hit_ms=637/644 正常 → 「vad_hit_ms=-1 从未命中=回执没走通」降级为待验证假设，真因更可能是 TTS 合成音频不触发 VAD；14/26 run 零识别 → 067/070 的比例型统计掺环境因素，**15:09 干净对照与窗口几何数据不受影响**。详见 result.md 附录A 局限性声明。
+
+---
+
+## 归档批次：2026-09-03 条目（2026-09-05 主控归档，handoffs.md 超 200 行）
+
+## 2026-09-03 — coder-2 — HOTKEY-060 收尾补账 ✅（代码已在 9506eac/e7a6a29，本次零代码，待主控验收）
+
+- **来源**：主控派单 Part A。08-30 主控 `git add -A` 误扫入 ITN 提交，未走验收流程，本次补齐账目
+- **代码盘点（git 取证）**：`ui/src/pages/HotkeySettings.tsx` 9506eac +93/-65（finalizedRef 两侧拆分
+  + reset 函数拆分 + 冲突检测收敛为共用 helper `applyHotkeyIfNoDupConflict` :154-195 +
+  删除死常量 TRANSLATION_SINGLE_KEYS）；e7a6a29 -3 行（checkAndApplyVoiceHotkey 手写 finalized
+  检查收敛进 helper）。调用点：语音 :204/:219/:497，翻译 :350
+- **主控补审结论（转录）**：两侧独立 ✅ / 死代码删除等价非回归 ✅ / tsc 0 error ✅
+- **红线合规**：纯文档零代码 / 未跑 test/build / 未 commit / 版本号 v0.9.0 未动 / UTF-8
+- **详情**：outbox/coder-2/result.md + logs/20260903.md + CHANGELOG.md + progress.md + todo.md
+
+## 2026-09-03 — coder-2 — OVERLAY-075 跨 session 渗漏隔离 ✅（src/main.rs +44/-5，待主控验收+阶段三）
+
+- **根因**：STREAMING_STOPPED 布尔门闩表达不了会话身份。A 拖尾期间开 B → :3679 重置门闩 →
+  A 迟到包畅通 → 宽窄拉锯 + A 旧文字渲染进 B 窗口（内容错误）
+- **修法**：会话代际身份判断。StreamingText(u64, String, Vec<WordTiming>) +
+  STREAMING_GENERATION AtomicU64：Start bump（:4180）→ 闭包捕获（:4286）→ 每包加戳（:4313）→
+  消费闸门（:3694-3709，先于词库镜像）。STREAMING_STOPPED 未动（两闸正交）
+- **产出源清单**：Windows 唯一产出 :4279（改前）；macOS 三处 1 字段签名（:4976/:5038/:7597 改前）
+  = 051-G 遗留存量破损（macOS 此前必编不过），本批同步 3 字段修复，见 MACOS-HANDOFF §OVERLAY-075
+- **实施自查纠错**：闸门第一版放在词库镜像后，会污染 WORDBOOK-053-B 学习数据，已移前
+- **消融**：删代际闸门 → A 包经四格真值表「不忽略」→ 拉锯+内容错+镜像污染全复发
+- **时序安全**：bump 先于本 session 任何事件发送；A 包先于 B bump 入队=合法尾包照常消费，两种交错均正确
+- **验证**：fmt clean / check --all-targets 0 error（99 warnings 基线一致）/ git diff -w 仅 main.rs
+- **红线合规**：043 语义未动 / bErase 未动 / 未改尺寸 / 未跑 test/build / 未 commit / 版本号未动 / UTF-8
+- **详情**：outbox/coder-2/result.md + logs/20260903.md + CHANGELOG.md + progress.md + todo.md
+
+---
+
+## 2026-09-03 — tester-1 — REPRO-061-COLD ✅ 冷启动定向复测完成：判定 B 态（不算复现，强线索），待主控验收
+
+- **判定**：主控收紧三态判据（测前锁定）下落 **B 态**——可见态 (0,0) 帧 5 次冷启动共 3199 帧 **0 命中**；隐藏态 (0,0) 帧 1870 帧（HWND 可枚举首帧即 (0,0) 1x1，隐藏期 ~600ms 全停 (0,0)）；1323 个可见帧 rect **全部**为终态 (1160,1292,240,36)
+- **关键帧证据**：7 帧「rect 已在终态、IsWindowVisible 仍 FALSE」（先挪后显的直接实证），用户可见的永远是 SetWindowPos 之后的帧
+- **窗口创建时机（主控要求单列）**：overlay HWND 进程启动后 **+190~+320ms** 已创建（6 次观测一致，含 sanity），热键时窗口已存在 ~570-620ms，**非懒创建**
+- **方法**：C# 采样器（EnumWindows 类名 `voice-ime-overlay-window` + PID，src/main.rs:219）+ timeBeginPeriod(1) 校准（间隔 med ~1.5ms，首版 15ms 未达标数据已废弃重跑）；SendInput RightAlt(165) PushToTalk hold 400ms；每冷启动完整 taskkill→重启
+- **数据**：outbox/tester-1/repro061-cold/run{1..5}.csv（逐帧 9 列）+ OverlaySampler.cs；md5 前后 19/19 一致；debug.log 仅被测程序自身追加，未用于判定
+- **给主控的定向事实**：「(0,0) 创建」成立、「显示前被绘制」不成立——Gavin 看到的机制在 Win32 API 层采样覆盖不到的层（本单不延伸假设）
+
+## 2026-09-03 — coder-1 — ASR-074-FIX ✅ 音频上行背压修复（audio/mod.rs + qwen_inference.rs + MACOS-HANDOFF.md，待主控验收）
+
+**基线**：HEAD `e389289`，v0.9.0。证据源：`collab/evidence/debug-gavin-controlled-repro-20260903-0927.log`（Gavin 09:27 受控复现只读副本）。
+
+**旧日志间接证据**：循环转速 65.2 Hz（903 chunks / 13.86s）< 100 Hz，丢失 351 chunks = 3.51s，finalize 拖尾 4.05s——三数字与主控独立推算逐位吻合。🔴 65.2 Hz 是倒推非证明，瓶颈在 read 还是 send 是最后一个未知数。
+
+**永久埋点**（主控条件三，转永久 debug 级）：
+- `[ASR-LOOP]` 每 1000 轮：循环转速 + read/send **分别** min/avg/p95/max（主控条件一）+ chunk_rx 积压
+- `[ASR-BACKLOG]` 每 500ms：chunk_rx 积压深度
+- `[ASR-DROP]` `log::warn!` 级别：队列满丢帧计数
+- `percentile()` 辅助函数 + read/send 各自 samples 数组（cap 4096）
+
+**Step 2-B**（`audio/mod.rs:299-340`）：stop_signal break 前 drain warm.rx，重采样后推 on_chunk。🔴 **时间上限 500ms（非数量上限）**：on_chunk 落到 chunk_tx.send() 是阻塞 send，ASR 线程卡住时 drain 无限等 = 把 ASR 故障传导到录音线程 = 松手后卡死（主控验收时发现的回归风险）。500ms deadline，超时放弃并 `[ASR-DROP]` warn 记录。
+
+**Step 2-C**（`audio/mod.rs`）：三处 `let _ = tx_audio.try_send` → 计数 + `log::warn!`。`WarmInputStream` 新增 `dropped_chunks: Arc<AtomicU64>` 永久字段。完成日志追加 `dropped_chunks=N`。
+
+**Step 2-A**（`qwen_inference.rs:1388-1480`）：每轮排空 chunk_rx 最多 N=16 chunks，合并成一次 send。N=16 理由见 result.md。🔴 若瓶颈在 send：排空治标不治本，下一步拆 send 到独立线程（tungstenite WebSocket 非 Send，需架构改动）。
+
+**三个小缺陷**：① first_audio_byte_ms 主循环首帧 send 处补赋值 ② outcome 赋值挪到 format_summary 之前（7 处退出路径） ③ format_summary 去重。
+
+**验证**：cargo fmt clean / cargo check --all-targets **0 error**（101 warnings，93 duplicates，既有 99 + coder-2 D2D 新增 2，均非本任务）。验证时间：coder-2 恢复 main.rs 编译后一次性跑完。
+
+**红线合规**：版本号 v0.9.0 未动 / 未写入 main.rs / 未 commit / 未碰运行时数据 / UTF-8（bash heredoc + Edit）/ 禁用 git 破坏性命令。macOS 影响：MACOS-HANDOFF §0.2，零编译影响零行为回归。
+
+## 2026-09-03 — coder-2 — ASR-074-GUARD ✅ chunk_tx 超时防卡死（单点，待主控验收）
+
+- **背景**：主控验收 ASR-074 发现跨文件域残留风险——drain 循环 500ms deadline 在循环头判断，
+  单次 on_chunk→chunk_tx.send()（bounded 无超时阻塞）卡住即回不去；ASR 停死→队满→录音线程
+  不返回→松手卡死
+- **改动**：send_timeout(200ms)；Timeout→[ASR-DROP] warn + ASR_CHUNK_DROPS 计数；
+  Disconnected 静默。200ms=健康消费 20 倍余量
+- **边界**：仅 src/main.rs（on_chunk 闭包 + 新 static）；audio/qwen_inference 未碰；容量 256 未动
+- **验证**：fmt clean / check --all-targets 0 error（99 warnings 基线持平）
+- **详情**：outbox/coder-2/result.md + logs/20260903.md + CHANGELOG.md
+
+---
+
+## 2026-09-03 — tester-1 — TEST-SYNC-074/075/D2D ✅ 阶段三 14 用例交付（纯追加负增量0，fmt/check 过，待主控验收）
+
+- **交付**：src/main.rs +211（新模块 overlay_075_d2d_guard_tests 5 用例：075 领号协议/镜像污染/首字段三元 + GUARD 三分支/计数器 + D2D 回落触发器）、src/audio/mod.rs +154（Step 2-B drain 四用例）、src/transcription/qwen_inference.rs +233（批量边界 ×2 + 缺陷1/2/3 ×3）
+- **消融**：每条用例附「改回旧实现会不会红」推演（result.md 逐条表）
+- **覆盖缺口 5 项如实声明**（真实 WS 帧序/完整 match arm/真实 DC 成功路径/WASAPI 回调内计数/真实慢消费 abandoned 精确值），阶段五端测建议已附
+- **自查**：fmt --check clean；check --all-targets 0 error；git diff -w 纯增量；既有 228 用例零触碰
+- **注意**：阶段三未跑用例（红线）；阶段四执行时新用例随 `cargo test` 生效，其中 main.rs 新模块带 `#[cfg(all(test, target_os="windows"))]`（Windows-only statics 依赖）
+
+## 2026-09-03 夜 — tester-1 — TEST-EXEC-076 阶段四全量回归 ✅（源码层纯执行，5 FAIL 原样上报，待主控验收+裁定）
+
+- **范围**：Step 1 两 crate cargo test + Step 2 vitest + 必查A/B/C；pytest 系列按任务书 SKIP（08-18 旧包）
+- **净结果**：root 1050P/4F/9I ｜ src-tauri 76P 全绿 ｜ vitest 83P/1F（HotkeySettings 23/24）
+- **5 FAIL 全部完整取证**：①②itn_071b×2（一点半→「下午1:30」非「1点半」，疑生产 071-B 不彻底）③asr_074 abandoned 5/5 稳定红（测试自建循环语义≠生产 Empty=>break，疑似测试设计缺陷）④stale_generation（断言 vs 生产 :4006 镜像先写冲突，053-B/075 语义裁定）⑤S12（AltGr 弹窗键名 Left Ctrl≠Right Alt，拦截行为正确）
+- **必查A**：guard 门控模块 --list 实证 6 条非 0 ｜ **必查B**：228+15（git 物理实提交 15 个 #[test]，文档「14」是语义组口径，差额=1 已说明）｜ **必查C**：挂钟用例连跑 5 次全红 0.90-0.91s
+- **红线合规**：零生产/零用例改动、零出包、零 commit、版本号未动、纯 bash 追加文档
+- **详情**：outbox/tester-1/result.md（含裁定请求表：③建议改测试循环对齐生产；④⑤①②需主控裁定改哪侧）
+
+## 2026-09-03 — coder-2 — HOTKEY-078 ✅ AltGr 尾随 keyup 串键修复（HotkeySettings.tsx -3+5，待主控验收）
+
+- **根因（独立复核与主控推演一致）**：`handleVoiceHotkeyKeyUp` :287-289 在 AltRight keyUp
+  提前清 `altGrSynthCtrlActiveRef`，尾随合成 ControlLeft keyUp 逃过 :279（现 :284）抑制 →
+  第二次 `checkAndApplyVoiceHotkey(0xA2,0)`；async 闸门（await invoke 后才置 finalizedRef）
+  挡不住同步连续 keyUp；available=false else 分支 :213-216 不置 finalized 反而 reset →
+  `setPendingHotkey({vk:0xA2})` 覆盖 → S12 冲突弹窗错显 Left Ctrl
+- **修法**：删 3 行提前清旗，旗唯一清零点回归 `resetVoiceRecordingState()`（:141，会话级生命周期）；
+  +5 行注释。非回归五场景独立复核全过（wasActive 捕获序不变/AltRight 先抬修好/ControlLeft 先抬
+  行为不变/非 AltGr 无变化/同会话双保险）
+- **验证**：npx tsc --noEmit 0 error；git diff -w 精确 -3+5 注释仅此一文件；S12 测试零触碰；
+  未跑 cargo build/npm run test（tester-1 职责）；未 commit；v0.9.0 未动
+- **Part B 取证（等主控裁定）**：①翻译侧推演成立——handleTranslationHotkeyKeyDown(:335-361)
+  无修饰键过滤/无 AltGr 旗/无 keyUp 处理器（:466-467），AltGr 首事件 keyDown ControlLeft
+  :344 查表 0xA2 → :350 全同步直调 finalize → 翻译热键被录成 Left Ctrl，连 async 重入窗口
+  都不存在，无用例覆盖故未红；②修法=镜像语音侧键序生命周期（结构性改动需配套用例），
+  建议另开单，不碰 HOTKEY-060 helper 契约；③同步闸门同意不做，补充反论：入口置 finalized
+  会破坏 catch 回退路径（:218-228 invoke 异常时热键永远写不进去）
+- **附加发现备案**：Alt 先抬 Ctrl 后抬后单按 Left Ctrl 被 :284 误抑制至 Escape 重进；
+  修前错录 Left Ctrl、修后静默忽略，属模糊歧义键序更安全取舍
+- **红线合规**：仅 HotkeySettings.tsx / 测试零触碰 / 未 commit / 版本号未动 / UTF-8（Edit 工具）/
+  零临时文件 / MACOS-HANDOFF §HOTKEY-078 已记
+- **详情**：outbox/coder-2/result.md + logs/20260903.md + CHANGELOG.md
+
+## 2026-09-03 — coder-2 — HOTKEY-079 ✅ 翻译侧 AltGr 串键修复（HotkeySettings.tsx +60，待主控验收）
+
+- **方案评估**：同意 Plan A（只对 ControlLeft 延后裁决），无反对。翻译侧单键语义
+  （translationKeySet 单 vk 无 modifiers），Plan B 搬语音侧组合键机制会引入用不上的
+  pressedMods 状态且 078 刚证明该机制有生命周期陷阱
+- **实施**：①translationPendingCtrlRef 翻译侧独占（HOTKEY-060 红线）②keyDown 插两分支：
+  ControlLeft→pending=true+return 不 finalize；AltRight 且 pending→清+录 0xA5（AltGr 接管）
+  ③新 handleTranslationHotkeyKeyUp 挂 onKeyUp：ControlLeft 且 pending 仍 true→录 0xA2
+  （真单按 Ctrl），其余 return ④resetTranslationRecordingState 清 pending（唯一清零点，
+  078 同型陷阱预防）⑤除 ControlLeft 外任何键 finalize 时机与产出 vk 一字不变
+- **行为差异复核**：主控差异表漏三和弦场景已复核补全——Ctrl 按住+AltGr 录 Right Alt
+  （与单按 AltGr 同路径）。🔴 **另两行 coder-2 写错、主控验收时更正**：Ctrl 按住+F5 与
+  Ctrl 按住+Right Ctrl **修前都录 Left Ctrl 不是录第二个键** —— 修前 keyDown 在第一个键
+  就 finalize，其 `setRecording(false)` 会把聆听态 div 换成按钮、**监听器随之卸载**，
+  第二个键的 keyDown 到不了 handler，不存在「先到先得」。故本次行为变化是**三处**不是一处：
+  ①ControlLeft 单键 finalize 时机 ②Ctrl+任意非 Ctrl 键的产出键 ③Ctrl+AltGr 的产出键。
+  **主控裁定三处全部接受不返工**（翻译侧单键语义下「第一个键定局」才是反直觉的一侧）。
+  主控另补一条真实代价：按下 Ctrl 后抬起前被夺焦 → onBlur 清 pending → 本次零录入
+  （修前已录 Left Ctrl），判定可接受，阶段三不必写用例。详见 logs/20260903.md 同节
+- **用例需求 5 条已交 result.md**：T1 翻译 AltGr→Right Alt（本单核心）/ T2 单按 Ctrl
+  回归护栏 / T3 pending 清零防污染 / T4 语音侧键序矩阵 T4a AltRight 先抬+T4b ControlLeft
+  先抬（各附消融）/ T5 旗残留键序**定案降级**——严格推演不存在「会话存活+旗残留+能单按
+  Left Ctrl」的可执行键序（旗置位仅 :259、清零 reset :150 被 Escape/onBlur/finalize 全量
+  调用；唯一持续窗口是两键都不抬=用户还按着 AltGr 本身），不要求写用例，上单「附加发现」
+  备案按此修正，不再模糊流转
+- **验证**：tsc 0 error；diff +60/-0 仅此一文件；测试零触碰；未跑 cargo build/npm test；
+  未 commit；v0.9.0 未动；UTF-8（Edit 工具）
+- **红线合规**：MACOS-HANDOFF §HOTKEY-079 已记（零编译影响/零行为差异/macOS 无 AltGr 键序）
+- **详情**：outbox/coder-2/result.md + logs/20260903.md + CHANGELOG.md
+

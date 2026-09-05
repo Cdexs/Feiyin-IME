@@ -1060,6 +1060,27 @@ fn spawn_overlay_thread(
     // OVERLAY-WAKE-001: channel to receive HWND back from overlay thread
     let (hwnd_tx, hwnd_rx) = crossbeam_channel::bounded::<SendHwnd>(1);
     let join = thread::spawn(move || {
+        // D2D-HANG-095-B: 用 Drop 守卫而非尾部直调。尾部语句在 panic 展开时会被跳过，
+        // Drop 守卫在展开路径上照样运行 —— 这是「无论怎么离开这个线程体，
+        // COM 都必须在线程体内释放」的唯一写法。
+        // 已知 panic 点：:1475 `state.request.as_ref().unwrap()`、
+        // :3115 `expect("just initialized")`，以及 Mutex 中毒。
+        // 任一 panic 走尾部直调都会漏掉释放 → thread_local 析构器在 loader lock 下
+        // 释放 COM → D2D-HANG-001 原样复发（REPRO-094 探针 B / 探针 D 4/5 实证）。
+        // 不会双重借用：with_d2d 内 `cell.borrow_mut()` 的 RefMut（slot）是该闭包帧的
+        // 局部变量，panic 展开时同帧局部按逆序先析构 → 借用在栈退到本闭包层、
+        // 守卫 drop 调 release_resources() 之前必然已归还；守卫在本帧声明最早、
+        // 析构最晚，不存在守卫先于内层借用释放运行的可能。故可用 borrow_mut。
+        // （D2D-HANG-095 初版注释保留：run_overlay_thread 多条 `?` 早返回路径
+        //（GetModuleHandleW(None)?、DestroyWindow(hwnd)? 等）由闭包级释放统一覆盖。）
+        struct D2dReleaseGuard;
+        impl Drop for D2dReleaseGuard {
+            fn drop(&mut self) {
+                d2d::release_resources();
+            }
+        }
+        let _d2d_guard = D2dReleaseGuard;
+
         if let Err(err) = run_overlay_thread(command_rx, event_tx, hwnd_tx, audio_buf) {
             log::error!("Overlay thread failed: {}", err);
         }
@@ -3046,6 +3067,21 @@ mod d2d {
 
     thread_local! {
         static D2D: std::cell::RefCell<Option<D2dResources>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// D2D-HANG-095: 必须在**线程体内**显式调用，绝不能依赖 thread_local 析构器。
+    /// 根因（REPRO-094 实证）：thread_local 析构器在 Windows 上运行于 DLL_THREAD_DETACH，
+    /// 加载器锁已被本线程持有；此时做 D2D/DWrite 的最后一次 COM Release 会自持锁死锁
+    /// （探针 B 卡在 [Drop 6/6] brush Release，BS4 抓到 LoaderLock.OwningThread = 自身 tid）。
+    /// 探针 b2/b5 已证：同样这些对象在**线程体内**释放完全正常。
+    ///
+    /// `take()` 取出的值就地在本闭包内 drop（仍在线程体栈上），不得返回出去或延后 drop。
+    pub(crate) fn release_resources() {
+        D2D.with(|cell| {
+            if cell.borrow_mut().take().is_some() {
+                log::debug!("D2D-HANG-095: D2D resources released in-thread before thread exit");
+            }
+        });
     }
 
     /// D2DERR_RECREATE_TARGET (0x8899000C): device loss (sleep/wake, driver update,

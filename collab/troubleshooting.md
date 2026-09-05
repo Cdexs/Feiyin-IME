@@ -4452,3 +4452,42 @@ SECRET-082 全部交付物落盘后，主控执行本批 commit，**被自己刚
 **给未来的自己**：写测试报告、贴复现步骤、dump 排查数据时，
 真值一律写成占位形态（`sk-<30字符>`、`138xxxx8000`、`<REDACTED>`）。
 描述形态和真值对读者的信息量完全一样，对泄露风险差一个量级。
+
+## [D2D-HANG-001] 🔴 COM 对象放进 thread_local，线程退出时在 loader lock 下释放 → 自锁死锁
+【往 thread_local / lazy_static 里塞任何 COM 或系统句柄前必读】
+
+**1. 症状两副面孔（同一个 bug）**
+- ① `cargo test` 里 D2D 用例挂死，`process::exit(9)` 都杀不掉（看门狗打印 TIMEOUT 后进程仍存留）；
+- ② 端侧「点托盘退出无响应只能 kill」。
+- 它俩同源：都是「线程退出时 thread_local 批量 COM Release 卡死」。测试是 harness 工作线程退出，端侧是 overlay 线程退出。
+
+**2. 机制**
+- Rust `thread_local!` 析构器在 Windows 由 ntdll FLS/TLS 线程退出回调驱动；回调运行时 **loader lock 已被该线程持有**。
+- 此时 COM `Release` 内部路径再触碰 loader lock（LoadLibrary/GetModule 类操作）→ 同线程对非递归锁二次获取 →
+  `NtWaitForAlertByThreadId` 无限等待 → 线程永不退出 → `join()` 永不返回。
+
+**3. 决定性取证手法（后人可复用）**
+- 挂死线程 `SuspendThread` + `GetThreadContext`，Rip 定位在 ntdll 等待原语区段；
+- 读 `PEB+0x110` 的 `LoaderLock`（RTL_CRITICAL_SECTION 指针），比对 `OwningThread` 与挂死线程 tid；
+- 本次实测：`LockCount=-2 RecursionCount=1 OwningThread=0x3764`，挂死线程 tid=14180，完全对上。
+- ⚠️ 抓栈用 `SymInitializeW(fInvadeProcess=TRUE)` 或 `GetModuleHandleW/GetProcAddress` 会因 loader lock 本身卡死；
+  全部 API 指针须在启动期预解析，挂死后只做 `ReadProcessMemory` 纯内存读取（探针 bs4 手法）。
+
+**4. 四条被证伪的岔路（别重走）**
+- 不是 `CreateTextFormat`/字体缓存（H2，全序列通过，无一行停在 CreateTextFormat）；
+- 不是 cargo test 并行 harness 竞争（H3，独立 exe 单子线程零并行照样挂；并行/单线程只是表象差异）；
+- 不是缺 `CoInitializeEx`（H4，加 STA 照样挂）；
+- **与释放顺序无关**（反向字段序 thread_local 批量析构照样挂）。
+
+**5. 为什么「线程体内释放」就没事**
+- 那时还没进线程退出回调，loader lock 没被持有；探针 b2/b5（线程体内任意顺序逐对象 Release）实测正常，
+  探针 A 主线程显式 drop 批量 Release 仅 11ms 完成。
+
+**6. 修法**
+- D2D-HANG-095：`mod d2d` 加 `release_resources()`，在 overlay 线程**线程体内**显式清空槽；
+- 095-B 进一步改成 **Drop 守卫**（线程闭包内声明空结构体 `D2dReleaseGuard`，其 `Drop` 调 `release_resources()`；**不是**给 `D2D` / `D2dResources` 加 Drop impl —— 那等于回到析构器里释放，什么也没解决），因为尾部直调在 panic 展开时会被跳过。
+- 测试侧：解除两条 `#[ignore]` 的用例须在用例尾部显式调 `release_resources()`，把「不显式释放就死锁」做成护栏。
+
+**7. 间歇性从哪来**
+- 只有本会话真的画过 D2D 迁移状态、槽里有东西时才挂（探针 D run4 未挂即此因）。
+- **别被「有时能退出」误导成「已修好」**——资源槽非空即可能挂，验证必须强制画一次 D2D 状态后再退出。

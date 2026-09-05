@@ -728,3 +728,7 @@ TEST-SYNC-087 | OVERLAY-086+D2D-P1 阶段三：9 用例覆盖任务书九护栏�
 TEST-FIX-091 | 修 TEST-SYNC-087 护栏 4 处（分隔线同坐标系比对 / reveal 反例同字数 begin变小三角窗口 / advance_width 收窄660 / 删重复#[test]），两处二次修正后全绿 | tester-1 | 2026-09-05
 TEST-EXEC-092 | 阶段四回归收口：root 1061P/0F/11I（2条D2D用例#[ignore]挂死项D2D-HANG-001 Gavin授权跳过）+ src-tauri 76P + vitest 89P 全绿；消融按Gavin拍板跳过 | tester-1 | 2026-09-05
 BUILD-093 | v0.9.0 出包：五批累积改动（OVERLAY-086/D2D-P1/REFACTOR-088/089/护栏）进 exe，七项核验全过（sha 全异于 085、ProductVersion 0.9.0.0、探针 D2D-P1×2+D2DERR_RECREATE_TARGET×1）；E2E 64P/1F（toggle_stop 间歇性 FAIL，主控裁定不阻塞出包列为端测重点）；冒烟无 panic；运行时数据零覆盖 | tester-1 | 2026-09-05
+D2D-HANG-095 | overlay 线程退出 COM Release 加载器锁死锁根因修复：mod d2d 新增 release_resources()（take() 就地 drop 保线程体内析构，避开 DLL_THREAD_DETACH 加载器锁）+ spawn_overlay_thread 闭包尾部调用（覆盖全部 ? 早返回路径）；REPRO-094 探针 B 卡点 [Drop 6/6] brush Release 对应的最后 COM Release 移出 TLS 析构器；产出源盘点=仅 overlay 线程+两条#[ignore]测试触达 thread_local，后者移交 tester-1 阶段三；fmt/check 0 error | coder-2 | 2026-09-05
+| REPRO-094 | D2D-HANG-001 根因定位：thread_local COM Release 在线程退出 loader lock 下自锁（H1成立，Q1=ID2D1SolidColorBrush::Release，探针D真实exe 4/5挂） | tester-1 | 2026-09-05 |
+D2D-HANG-095-B | spawn_overlay_thread 闭包尾部直调改 Drop 守卫（D2dReleaseGuard），堵住 panic 展开跳过释放的漏网路径（:1475 unwrap/:3115 expect/Mutex 中毒均会绕过尾部语句）；双重借用推理复核成立（with_d2d 帧 RefMut 同帧逆序析构先于守卫归还借用）故用 borrow_mut；release_resources 本体零改动；fmt/check 0 error | coder-2 | 2026-09-05
+| REPRO-094-DOC | handoffs.md + troubleshooting.md 补账：D2D-HANG-001 根因条目落盘（+18/0 与 +39/0 纯追加） | tester-1 | 2026-09-05 |
