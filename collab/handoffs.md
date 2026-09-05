@@ -2,6 +2,14 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-09-05 — tester-1 — TEST-SYNC-105 ✅ 阶段三（OVERLAY-101/102 五条护栏，待主控验收 + 阶段四 TEST-EXEC-106 首跑）
+
+- **交付**：`src/main.rs` +164/-0，单 hunk `:9360` 后新增 `#[cfg(all(test, target_os="windows"))] mod overlay_101_centering_guard_tests`，生产零改动（numstat 164/0）。
+- **G1** centered_x 公式精确值（work_left=0/负坐标屏/奇偶向零截断/超宽负 x 不 clamp）；**G2** Bug B 量化：同 work_w=1920 下 240 与 960 宽居中 x 差 == (960−240)/2 == 360；**G3** 中心不变量 x+w/2 恒定 + 宽+2→x−1 + 奇数宽 ≤1 容差；**G4** `STREAMING_OVERLAY_MAX_SCREEN_RATIO==0.50` + 1920 复算 960（可测性边界如实声明）；**G5** 单一居中源结构护栏：include_str 自读源码 + 去空白 needle「(work_w−」恰 1 行 + applied_w 断言 + `fn centered_x` 存在，全角减号规避自触发，实测命中恰 1 行（:4342）。
+- **G5 判别力边界如实声明**：只匹配 work_w 变量名形态，别的变量名内联会漏。
+- **验证**：fmt --check exit 0 / check --all-targets 0 error（102 warnings 持平）/ 未跑 cargo test（白名单设计如此，首跑归阶段四）。
+- **红线合规**：未 commit / v0.9.0 未动 / 零凭证 / 无临时文件。
+
 ## 2026-09-05 — coder-1 — SECRET-104 ✅ 手机号闸门 Cargo.lock 校验和误报修复（secret-patterns.sh 边界收紧 + README 补 hooksPath 说明，待主控验收）
 
 - **改动**：`scripts/git-hooks/secret-patterns.sh` PHONE 边界 `[^0-9]` → `[^0-9A-Za-z]`（+3 行注释）；

@@ -9360,3 +9360,167 @@ mod overlay_086_d2d_p1_guard_tests {
         }
     }
 }
+
+// OVERLAY-101 (Bug B 单一居中源) + OVERLAY-102 (最大宽度 0.50) 阶段三测试同步
+// （tester-1，2026-09-05）。只绑定行为约定，不绑定实现字符串/像素值
+// （build-test-guide 第八节规范4）。
+// G5 是结构性护栏（唯一例外），其可靠性与判别力边界在用例内如实声明。
+#[cfg(all(test, target_os = "windows"))]
+mod overlay_101_centering_guard_tests {
+    use super::*;
+
+    /// G1：centered_x 公式正确性。
+    /// 契约：水平居中 x = work_left + 半差，其中半差 = (work_w − applied_w) 的
+    /// 整数除法（向零截断）；applied_w > work_w 时允许负 x（不 panic、不 clamp
+    /// —— 超宽由调用侧 clamp 兜底）。
+    /// 消融：把 :4342 的公式改错（如漏掉 work_left、改为四舍五入、换系数）→ 对应断言红。
+    /// 顺序自证：纯函数直调，无时序。
+    #[test]
+    fn centered_x_formula_exact_values() {
+        // work_left = 0：单屏
+        assert_eq!(centered_x(0, 1920, 240), 840); // (1920-240)/2 = 840
+        assert_eq!(centered_x(0, 1920, 960), 480); // (1920-960)/2 = 480
+                                                   // work_left ≠ 0：多显示器负坐标，x 必须整体叠加 work_left 偏移
+        assert_eq!(centered_x(-1920, 1920, 240), -1080);
+        assert_eq!(centered_x(-1920, 1920, 960), -1440);
+        // 奇偶宽度取整：Rust 整数除法向零截断
+        assert_eq!(centered_x(0, 1921, 240), 840); // 1681/2 = 840.5 → 840
+        assert_eq!(centered_x(0, 1920, 241), 839); // 1679/2 = 839.5 → 839
+                                                   // applied_w > work_w：允许负 x，不 panic 不 clamp
+        assert_eq!(centered_x(0, 1920, 3000), -540); // (1920-3000)/2 = -540
+        assert!(centered_x(0, 1920, 3000) < 0, "超宽必须给负 x（不 clamp）");
+    }
+
+    /// G2：Bug B 量化护栏 —— 「沿用基准宽默认位」造成的中心偏移量 == (W_max−240)/2。
+    /// 缺陷机制（Gavin 端测复现过）：!do_it（100ms 节流命中）帧旧代码不重算 x，
+    /// 沿用 resolved_pos = overlay_geometry 默认位（按基准宽 240 居中），而同一调用
+    /// SetWindowPos 应用的是 in-flight current（到上限后 = W_max）→ 中心右偏
+    /// (W_max−240)/2 px，且到上限后 current==target、插值循环休眠、无帧纠正。
+    /// 本用例把该偏移量钉成数字：同 work_w 下 240 宽与 W_max 宽的 x 之差必须恰为
+    /// (W_max−240)/2。用真实数量级：work_w=1920、W_max=960（0.50 × 1920）。
+    /// 消融：centered_x 不再按 applied_w 居中（如改回按 target/基准宽）→
+    /// x_240 − x_max 变化 → 红。
+    /// 顺序自证：纯函数直调，无时序。
+    #[test]
+    fn centered_x_baseline_to_max_width_offset_is_half_the_delta() {
+        let work_w = 1920;
+        let w_max = 960; // STREAMING_OVERLAY_MAX_SCREEN_RATIO=0.50 × 1920
+                         // work_left = 0
+        let x_240 = centered_x(0, work_w, 240);
+        let x_max = centered_x(0, work_w, w_max);
+        assert_eq!(
+            x_240 - x_max,
+            (w_max - 240) / 2,
+            "Bug B 量化：基准宽 240 与上限宽 W_max 的居中 x 之差必须等于 (W_max−240)/2"
+        );
+        assert_eq!(x_240 - x_max, 360, "1920/960 量级：差必须为 360");
+        // work_left ≠ 0（负坐标屏）：偏移量不随 work_left 变（两者抵消）
+        let x_240_neg = centered_x(-1920, work_w, 240);
+        let x_max_neg = centered_x(-1920, work_w, w_max);
+        assert_eq!(x_240_neg - x_max_neg, 360, "负坐标屏下偏移量不变");
+    }
+
+    /// G3：两边等量扩展不变量 —— 宽度增大时窗口中心不变（x + w/2 恒定）。
+    /// OVERLAY-068-A R1「两边扩展」语义：同一 work 区、偶数宽下，任意宽度居中后
+    /// center = x + w/2 必须恒等于 work_left + work_w/2（与 w 无关）。
+    /// 消融：centered_x 改按 target 宽或基准宽居中 → 中心随宽度漂移 → 红。
+    /// 顺序自证：纯函数直调，无时序。
+    #[test]
+    fn centering_keeps_window_center_fixed_as_width_grows() {
+        let work_left = 0;
+        let work_w = 1920;
+        let base_center = work_left + work_w / 2; // 960
+                                                  // 偶数宽全序列：中心必须逐位恒定
+        for w in [240, 480, 720, 960, 1200, 1440, 1680, 1920] {
+            let x = centered_x(work_left, work_w, w);
+            assert_eq!(
+                x + w / 2,
+                base_center,
+                "宽度 {} 时中心必须保持 work_left + work_w/2（两边等量扩展）",
+                w
+            );
+        }
+        // 增量不变量：宽 +2 → x −1、中心不变（对称扩展语义的细粒度形态）
+        for w in (240..1920).step_by(2) {
+            let x = centered_x(work_left, work_w, w);
+            let x2 = centered_x(work_left, work_w, w + 2);
+            assert_eq!(x2, x - 1, "宽 +2 必须左移 1px（对称扩展）");
+            assert_eq!(x2 + (w + 2) / 2, x + w / 2, "宽 +2 中心不变");
+        }
+        // 奇数宽：整数除法截断使中心允许 ±1 偏差，不得漂移超过 1（偶数宽严格相等已在上断言）
+        for w in (241..1920).step_by(2) {
+            let x = centered_x(work_left, work_w, w);
+            let drift = (x + w / 2) - base_center;
+            assert!(
+                drift.abs() <= 1,
+                "奇数宽中心偏差必须在截断容差内（≤1），宽度 {} 实测 {}",
+                w,
+                drift
+            );
+        }
+    }
+
+    /// G4：OVERLAY-102 常量护栏 —— 最大流式宽度占屏比 0.65 → 0.50。
+    /// 契约：STREAMING_OVERLAY_MAX_SCREEN_RATIO == 0.50；1920 屏宽下
+    /// overlay_max_width（:4234）的算式 work_w × ratio 再 round 必须得 960。
+    /// 消融：改回 0.65 → ratio 断言红 + 1920 宽断言红（0.65×1920=1248 ≠ 960）。
+    /// 顺序自证：纯常量断言，无时序。
+    /// ⚠️ 可测性边界：overlay_max_width(:4234) 需要真实 HWND（monitor_work_rect），
+    /// 本用例钉住常量值 + 复算同一算式（不调真实 HWND 函数）。
+    #[test]
+    fn streaming_max_width_ratio_is_half_with_960_on_1920() {
+        assert_eq!(
+            STREAMING_OVERLAY_MAX_SCREEN_RATIO, 0.50_f32,
+            "OVERLAY-102：最大流式宽度占屏比必须为 0.50（Gavin 端测拍板）"
+        );
+        // 与生产 overlay_max_width(:4237) 同式复算
+        let max_w = (1920.0_f32 * STREAMING_OVERLAY_MAX_SCREEN_RATIO).round() as i32;
+        assert_eq!(max_w, 960, "1920 屏宽下 max_w 必须为 960");
+    }
+
+    /// G5：单一居中源结构护栏（TEST-SYNC-087 判别力缺口第一次有可测形态）。
+    /// 契约（真实契约 = 用于居中的宽度 == SetWindowPos 应用的宽度）：全仓 overlay
+    /// 水平居中只允许经 centered_x 一个源头；未来任何人把内联公式（work_w 与
+    /// 宽度之差的一半）抄回调用点 → 本护栏红。
+    /// 判据：include_str 读自身源码，逐行去空白后，含「左括号紧接 work_w 紧接
+    /// ASCII 减号」形态的行必须恰好 1 行，且该行必须含 applied_w（即 centered_x
+    /// 定义体）。去空白后匹配让减号前后有无空格等空白变体归一。
+    /// 消融：任一处调用点内联回 work.left + (work_w − 宽度) / 2 → 命中行数变 2 → 红；
+    /// centered_x 被改名/删除 → 0 行或非定义体行 → 红。
+    /// 🔴 判别力边界（如实声明）：本护栏只匹配 work_w 这个变量名形态 —— 若未来
+    /// 有人用别的变量名内联（如 `let ww = work.right - work.left; (ww - w) / 2`）
+    /// 则漏过（结构性短板，与「正则容易脆/误伤」的担忧一致）。本护栏的价值：
+    /// 钉住现形态的唯一源头，拦截最直接的回归（把旧代码复制粘贴回去）。
+    /// 顺序自证：纯文本静态比对，无时序。
+    #[test]
+    fn inline_centering_formula_appears_only_in_centered_x_body() {
+        let src = include_str!("main.rs");
+        // needle 用 format 拼装，避免本文件出现连写字面量自我命中
+        let needle = format!("(work_w{}", "-");
+        let mut hits: Vec<(usize, &str)> = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            let stripped: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+            if stripped.contains(&needle) {
+                hits.push((i + 1, line));
+            }
+        }
+        assert_eq!(
+            hits.len(),
+            1,
+            "内联居中公式形态 (work_w−宽度)/2 必须全文件仅出现在 centered_x 定义体，实测 {} 处",
+            hits.len()
+        );
+        let (lineno, line) = hits[0];
+        assert!(
+            line.contains("applied_w"),
+            "命中行（{}）必须是 centered_x 定义体（含 applied_w 参数）——实际为: {}",
+            lineno,
+            line
+        );
+        // 附带：centered_x 必须仍存在（防止整函数被删、调用点各自内联）
+        assert!(
+            src.lines().any(|l| l.contains("fn centered_x")),
+            "centered_x 函数必须存在（单一居中源）"
+        );
+    }
+}
