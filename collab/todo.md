@@ -53,9 +53,9 @@ TEST-SYNC-105（同文件测试模块）冲突，五阶段禁止并行。先把�
 
 | 顺位 | Worker | 任务 | 占用文件 |
 | --- | --- | --- | --- |
-| ① 进行中 | tester-1 | `TEST-EXEC-106` 阶段四全量回归 + A1~A4 消融（**做完不出包**） | `src/main.rs`（消融临时改+还原） |
-| ② 并行 | coder-2 | **`D2D-P2P3-IMPL-109`** 五态迁移实施（方案已冻结：`docs/D2D-P2P3-PLAN.md`） | `src/main.rs` 生产区 |
-| ② 并行 | tester-1 | `E2E-GATE-103`（4 条 full_pipeline 归因 + 修 `_no_hardware` + ERROR>0 门禁） | `tests/**` + `build-test-guide.md` |
+| ① ✅ 完成 | tester-1 | `TEST-EXEC-106` 阶段四全量回归 + A1~A4 消融 | 已验收提交 `f774b26`，1070P/0F/9I |
+| ② 🔵 进行中 | coder-2 | **`D2D-P2P3-IMPL-109`** 五态迁移实施（方案已冻结：`docs/D2D-P2P3-PLAN.md`，H1-H12 十二 hunk + 五步顺序） | `src/main.rs` 生产区 |
+| ② 🔵 进行中 | tester-1 | `E2E-GATE-103`（4 条 full_pipeline 决定性实验归因 + 修 `_no_hardware` + **ERROR>0 机器闸门**） | `tests/**` + `build-test-guide.md` |
 | ③ | tester-1 | `TEST-SYNC-110` 阶段三（P2+P3 护栏） | `src/main.rs` 测试模块 |
 | ④ | tester-1 | `TEST-EXEC-111` 阶段四全量 | — |
 | ⑤ | tester-1 | **`BUILD-112` 出包** | — |
@@ -65,7 +65,27 @@ TEST-SYNC-105（同文件测试模块）冲突，五阶段禁止并行。先把�
 **② 的并行是安全的**：`src/main.rs` 生产区（coder-2）与 `tests/**` python 层（tester-1）
 文件级零重叠。阶段三 `TEST-SYNC-110` 必须等 ② 的 coder-2 完成后才派（同文件）。
 
+#### 🔴 A4 消融关键发现（TEST-EXEC-106，2026-09-05）—— Bug B 无自动护栏
+
+tester-1 把「Bug B 本体复原」拆成两个形态实测：
+
+| 形态 | 结果 |
+| --- | --- |
+| **A4-1** 历史忠实形态（内联公式抄回 + `!do_it` 沿用 `resolved_pos`） | **G5 红** |
+| **A4-minimal** 语义本体形态（保留 `centered_x` 调用，但只收进 `do_it` 分支） | **五条全绿** |
+
+🔴 **结论**：Bug B 的语义本体「调用点是否重算 x」**没有任何自动护栏能测**，
+唯一真实验证仍是 Gavin 端测目视（DEC-055 红线 5）。
+G5 抓得住「内联公式抄回」，抓不住「调用被 gate 掉」，两者都是可能的回归路径。
+
+**主控裁定**：tester-1 建议的「把 x 来源决策抽成可测纯函数」**不并入 IMPL-109**
+（合并批里几何区必须干净，见 DEC-057 补充），另开 **`REFACTOR-113`** 排在
+`BUILD-112` 出包端测之后。
+
 #### 卫生债追加（2026-09-05）
+
+- **`REFACTOR-113`**：抽 Show 流式分支的 x 来源决策为纯函数 + 补护栏，
+  让 A4-minimal 形态可被机器捕获。排在 BUILD-112 端测之后
 
 - **`draw_editing_overlay_chrome`（`src/main.rs:2809`）是死代码**：编译器 `never used`
   警告实证，全文件仅定义体一处 grep 命中，无调用方。
