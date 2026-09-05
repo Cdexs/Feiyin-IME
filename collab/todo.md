@@ -2,6 +2,16 @@
 
 ## 🔴 2026-09-05 —— 当前状态（最新在最上）
 
+### 🟡 HOTKEY-115 已交付待验收（coder-1，2026-09-06）
+
+Toggle 停不住双缺陷修复（REPRO-114 根因落地）：钩子 KEYUP store 移位 + DOWN 按模式分支 +
+RegisterHotKey Toggle 加 `TOGGLE_ACTIVE` 翻转 + B3 单一收口（`notify_translate_poll_stop`
+内复位，覆盖全部录音非热键结束路径）+ 主控扩单 mic-muted 出口 main.rs:5101 一行 +
+B2/B4 绑定切换三处归零。fmt/check 过，warning 持平；macOS 缺陷②同源已写 MACOS-HANDOFF.md。
+详情：outbox/coder-1/result.md。
+
+---
+
 ### 🟡 SECRET-105 已交付待验收（coder-1，2026-09-05）
 
 密钥闸门 diff 行首标记误报+漏报双修，只动 `scripts/git-hooks/` 3 文件：

@@ -5093,6 +5093,12 @@ fn process_controller_events(
                             auto_close_ms: 2000,
                             target_hwnd: 0,
                         }));
+                        // HOTKEY-115 B3 残余收口：这是 Start 事件唯一不产出任何 pipeline
+                        // 事件的拒绝出口，toggle 态若不复位会滞留 true（录音从未开始），
+                        // 下一次按键被反转成 no-op Stop、两按才恢复。借用既有单一收口
+                        // notify_translate_poll_stop() 复位（对 PTT 无副作用，只清 TOGGLE_ACTIVE
+                        // 并停掉已 spawn 的 translate 轮询线程）。
+                        platform::notify_translate_poll_stop();
                         continue;
                     }
 

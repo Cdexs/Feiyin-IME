@@ -2,12 +2,13 @@
 
 use anyhow::{anyhow, Result};
 use std::sync::{
-    atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU32, AtomicU64, Ordering},
     Arc, RwLock,
 };
 use std::thread::{self, JoinHandle};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
@@ -52,6 +53,30 @@ static HOOK_WAKE_HWND: AtomicIsize = AtomicIsize::new(0);
 static HOOK_WAKE_MSG: AtomicU32 = AtomicU32::new(0);
 static CURRENT_HOOK: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 static PTT_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// HOTKEY-115: Toggle 模式的录音进行中状态（与 PTT_ACTIVE 分开，不复用）。
+/// PTT_ACTIVE 语义是「PTT 按住中」且被 poll_ptt_release_thread 的 while 自旋消费，
+/// 复用会让 Toggle 录音生命周期与 PTT 释放检测互相干扰；分开后 B1（PTT 零回归）
+/// 由构造保证，B2（两路径互不污染）由 uses_hook 互斥 + 绑定切换时的显式复位保证。
+/// 复位点：notify_translate_poll_stop（B3，外部结束路径）+ install/uninstall/sync_binding（B4）。
+static TOGGLE_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// HOTKEY-115-B: 目标键的物理按下状态（钩子路径的 auto-repeat 抑制判据）。
+/// DOWN 置 true、UP 清 false；DOWN 之间没有 UP 就是系统 repeat，直接忽略。
+/// 独立于 PTT_ACTIVE / TOGGLE_ACTIVE（它是「键」的状态，不是「模式语义」的状态），
+/// 复位点与另两态一致：install / uninstall / sync_binding（防长按中重绑定后残留）。
+static KEY_PHYSICALLY_DOWN: AtomicBool = AtomicBool::new(false);
+/// HOTKEY-115-C: 上次目标键 DOWN 的时刻（GetTickCount64 毫秒）。
+/// 给 KEY_PHYSICALLY_DOWN 提供陈旧自愈判据：标志停着但距上次 DOWN 超过阈值 ⇒
+/// 之前必有一次钩子没看到的 KEYUP（Win+L 锁屏把 KEYUP 送安全桌面 / 上游吞 KEYUP /
+/// 钩子摘除重装窗口），按首次按下处理，不再永久吃掉后续所有按下。
+static LAST_TARGET_DOWN_TICKS: AtomicU64 = AtomicU64::new(0);
+/// HOTKEY-115-C: 陈旧标志阈值。🔴 必须 > Windows 键盘「重复延迟」上限 1000ms
+///（控制面板四档 250/500/750/1000ms —— 若只按 repeat 间隔 ~33ms 取阈值，长延迟
+/// 设置下首个 repeat 会被误判陈旧、抑制失效退回翻转）。取 2 倍余量 2000ms；
+/// 仍远小于丢 KEYUP 后用户重按的典型间隔（秒级，如锁屏→解锁→重按）。
+/// 残余窗口如实声明：吞 UP + 2s 内重按仍会被当 repeat 吞掉一次 —— 有界自愈
+///（≤2s）远优于无判据时的永久失灵；两态（TOGGLE_ACTIVE 等）由 B3 收口与
+/// KEYUP 复位保障语义正确，故误吞一次后下一次按压行为自动恢复正常。
+const STALE_DOWN_THRESHOLD_MS: u64 = 2000;
 
 #[derive(Debug, Clone, Copy)]
 struct WakeTarget {
@@ -133,8 +158,13 @@ fn spawn_translate_poll_thread(translate_flag: Arc<AtomicBool>) {
 
 /// Notify the translate poll thread to stop (e.g. ESC cancel or abnormal end of recording).
 /// This is a cross-module signal because the ESC cancel path lives in the controller loop.
+/// HOTKEY-115 B3：控制器在所有「录音非热键结束」路径（PipelineEvent Done/Cancelled/
+/// FocusLost/Error/FormatFailed、EditRequested、CancelStop、ESC）都汇聚调用本函数，
+/// 因此这里同时复位 TOGGLE_ACTIVE —— 录音被 VAD 静音/最大时长/浮层按钮/取消等途径
+/// 结束后，Toggle 状态随之归零，下一次按键不会被反转成 Stop。零控制器侧改动收口 B3。
 pub fn notify_translate_poll_stop() {
     TRANSLATE_POLL_STOP.store(true, Ordering::Relaxed);
+    TOGGLE_ACTIVE.store(false, Ordering::Relaxed);
     log::info!("Translate poll stop notified");
 }
 
@@ -182,34 +212,91 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
 
             if msg_type == WM_KEYDOWN || msg_type == WM_SYSKEYDOWN {
                 if modifiers_pressed_from_hook() {
-                    if !PTT_ACTIVE.load(Ordering::Relaxed) {
-                        PTT_ACTIVE.store(true, Ordering::Relaxed);
-                        TRANSLATE_POLL_STOP.store(false, Ordering::Relaxed);
-                        let sender_ptr = HOOK_SENDER.load(Ordering::Relaxed);
-                        if !sender_ptr.is_null() {
-                            let sender = &*sender_ptr;
-                            let translate_flag = Arc::new(AtomicBool::new(translation_pressed()));
-                            spawn_translate_poll_thread(Arc::clone(&translate_flag));
-                            send_hotkey_event(
-                                sender,
-                                HotkeyEvent::Start {
-                                    translate: translate_flag,
-                                },
-                                hook_wake_target(),
-                            );
+                    // HOTKEY-115-B: 结构性 auto-repeat 抑制 —— 「DOWN 之间没有 UP 就是
+                    // repeat」。钩子能同时看到 DOWN 和 UP，物理按键状态是精确判据，
+                    // 不用计时窗。长按>0.5s 进入 ~30 次/秒 repeat，不加此闸 Toggle 会
+                    // Start/Stop 高速交替、终态随机（Gavin「有时出现有时不出现」的另一半）。
+                    // PTT 路径原有的 !PTT_ACTIVE 门控本已使 repeat 为 no-op，此闸对其
+                    // 行为零影响；Toggle 路径的翻转由此封死。
+                    //
+                    // HOTKEY-115-C: 陈旧自愈 —— KEY_PHYSICALLY_DOWN 是唯一 DOWN 闸门，
+                    // 一次未被看到的 KEYUP（锁屏安全桌面/上游吞 KEYUP/钩子重装）会让它
+                    // 永久停在 true、热键失灵到重绑定。故标志已置位时不直接当 repeat
+                    // 丢弃：距上次 DOWN 超过阈值（> 重复延迟上限 1000ms，见
+                    // STALE_DOWN_THRESHOLD_MS 注释）判为陈旧，按首次按下处理。
+                    // 真 repeat 的相邻 DOWN 间隔 ≤ 重复延迟上限 + ~33ms，恒 < 阈值，
+                    // 不会被误判（阈值时间戳随每次 DOWN 刷新，长按期间间隔始终是
+                    // repeat 间隔本身）。GetAsyncKeyState 不能做这个判别：DOWN 到达时
+                    // 两种场景下键都处于按下态，判别力为零（其 LSB 转变位文档明示
+                    // 多进程轮询下不可靠）。
+                    let was_down = KEY_PHYSICALLY_DOWN.swap(true, Ordering::AcqRel);
+                    let now = unsafe { GetTickCount64() } as u64;
+                    let last = LAST_TARGET_DOWN_TICKS.swap(now, Ordering::AcqRel);
+                    if !was_down || now.saturating_sub(last) > STALE_DOWN_THRESHOLD_MS {
+                        // HOTKEY-115: 两种模式各自独立的状态机，不再共用 PTT_ACTIVE 做 DOWN 门控。
+                        if mode == hotkey_mode_to_u32(HotkeyMode::PushToTalk) {
+                            if !PTT_ACTIVE.load(Ordering::Relaxed) {
+                                PTT_ACTIVE.store(true, Ordering::Relaxed);
+                                TRANSLATE_POLL_STOP.store(false, Ordering::Relaxed);
+                                let sender_ptr = HOOK_SENDER.load(Ordering::Relaxed);
+                                if !sender_ptr.is_null() {
+                                    let sender = &*sender_ptr;
+                                    let translate_flag =
+                                        Arc::new(AtomicBool::new(translation_pressed()));
+                                    spawn_translate_poll_thread(Arc::clone(&translate_flag));
+                                    send_hotkey_event(
+                                        sender,
+                                        HotkeyEvent::Start {
+                                            translate: translate_flag,
+                                        },
+                                        hook_wake_target(),
+                                    );
+                                }
+                            }
+                        } else {
+                            // HOTKEY-115 缺陷 1 修复：Toggle 状态由 TOGGLE_ACTIVE 承载，
+                            // 不再借用 PTT_ACTIVE —— 原实现在 KEYUP 无条件把 PTT_ACTIVE 清零，
+                            // 第二次 DOWN 永远走不到下面的 Stop 分支（该分支实际不可达）。
+                            if !TOGGLE_ACTIVE.swap(true, Ordering::AcqRel) {
+                                TRANSLATE_POLL_STOP.store(false, Ordering::Relaxed);
+                                let sender_ptr = HOOK_SENDER.load(Ordering::Relaxed);
+                                if !sender_ptr.is_null() {
+                                    let sender = &*sender_ptr;
+                                    let translate_flag =
+                                        Arc::new(AtomicBool::new(translation_pressed()));
+                                    spawn_translate_poll_thread(Arc::clone(&translate_flag));
+                                    send_hotkey_event(
+                                        sender,
+                                        HotkeyEvent::Start {
+                                            translate: translate_flag,
+                                        },
+                                        hook_wake_target(),
+                                    );
+                                }
+                            } else {
+                                // Toggle mode: second press ends recording
+                                TOGGLE_ACTIVE.store(false, Ordering::Relaxed);
+                                TRANSLATE_POLL_STOP.store(true, Ordering::Relaxed);
+                                let sender_ptr = HOOK_SENDER.load(Ordering::Relaxed);
+                                if !sender_ptr.is_null() {
+                                    let sender = &*sender_ptr;
+                                    send_hotkey_event(
+                                        sender,
+                                        HotkeyEvent::Stop,
+                                        hook_wake_target(),
+                                    );
+                                }
+                            }
                         }
-                    } else if mode == 0 {
-                        // Toggle mode: second press ends recording
-                        TRANSLATE_POLL_STOP.store(true, Ordering::Relaxed);
-                        let sender_ptr = HOOK_SENDER.load(Ordering::Relaxed);
-                        if !sender_ptr.is_null() {
-                            let sender = &*sender_ptr;
-                            send_hotkey_event(sender, HotkeyEvent::Stop, hook_wake_target());
-                        }
-                        PTT_ACTIVE.store(false, Ordering::Relaxed);
                     }
                 }
             } else if msg_type == WM_KEYUP || msg_type == WM_SYSKEYUP {
+                // HOTKEY-115-B: 物理松键，repeat 抑制复位 —— 必须在模式判定之前，
+                // 两模式的 KEYUP 都要清（KEYUP 分支本就无 modifiers 门控）。
+                KEY_PHYSICALLY_DOWN.store(false, Ordering::Relaxed);
+                // HOTKEY-115 缺陷 1 修复：PTT_ACTIVE.store(false) 从这里移进
+                // should_stop_translate_poll_on_keyup 块内 —— 原来它在该 if 之外，
+                // Toggle 模式 KEYUP 也会重置 PTT_ACTIVE，导致下一次 DOWN 被当首次按下。
                 if should_stop_translate_poll_on_keyup(mode) {
                     TRANSLATE_POLL_STOP.store(true, Ordering::Relaxed);
                     let sender_ptr = HOOK_SENDER.load(Ordering::Relaxed);
@@ -217,8 +304,8 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                         let sender = &*sender_ptr;
                         send_hotkey_event(sender, HotkeyEvent::Stop, hook_wake_target());
                     }
+                    PTT_ACTIVE.store(false, Ordering::Relaxed);
                 }
-                PTT_ACTIVE.store(false, Ordering::Relaxed);
             }
             return LRESULT(1); // Consume the event
         }
@@ -249,7 +336,10 @@ fn install_keyboard_hook(
         wake_target.map(|target| target.message).unwrap_or(0),
         Ordering::Relaxed,
     );
+    // HOTKEY-115 B4：重绑定/重装钩子时两态归零，防旧模式残留状态污染新绑定。
     PTT_ACTIVE.store(false, Ordering::Relaxed);
+    TOGGLE_ACTIVE.store(false, Ordering::Relaxed);
+    KEY_PHYSICALLY_DOWN.store(false, Ordering::Relaxed);
 
     unsafe {
         let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0)
@@ -278,7 +368,10 @@ fn uninstall_keyboard_hook() {
     HOOK_SENDER.store(std::ptr::null_mut(), Ordering::Relaxed);
     HOOK_WAKE_HWND.store(0, Ordering::Relaxed);
     HOOK_WAKE_MSG.store(0, Ordering::Relaxed);
+    // HOTKEY-115 B4：卸钩子复位三态。
     PTT_ACTIVE.store(false, Ordering::Relaxed);
+    TOGGLE_ACTIVE.store(false, Ordering::Relaxed);
+    KEY_PHYSICALLY_DOWN.store(false, Ordering::Relaxed);
     TRANSLATE_POLL_STOP.store(true, Ordering::Relaxed);
 }
 
@@ -488,6 +581,12 @@ fn sync_binding(
         }
         state.uses_hook = false;
     }
+    // HOTKEY-115 B2/B4：绑定切换（含 PTT↔Toggle、hook↔RegisterHotKey）时三态归零。
+    // uninstall_keyboard_hook 已复位，但 RegisterHotKey 侧的 unregister_binding
+    // 不复位静态量，这里统一兜底，保证任何路径切换后不残留旧状态。
+    PTT_ACTIVE.store(false, Ordering::Relaxed);
+    TOGGLE_ACTIVE.store(false, Ordering::Relaxed);
+    KEY_PHYSICALLY_DOWN.store(false, Ordering::Relaxed);
 
     if binding.vk_code != 0 {
         if needs_polling(binding.vk_code) {
@@ -534,16 +633,26 @@ fn handle_hotkey_trigger(
 
     match binding.mode {
         HotkeyMode::Toggle => {
-            TRANSLATE_POLL_STOP.store(false, Ordering::Relaxed);
-            let translate_flag = Arc::new(AtomicBool::new(translation_pressed()));
-            spawn_translate_poll_thread(Arc::clone(&translate_flag));
-            send_hotkey_event(
-                sender,
-                HotkeyEvent::Start {
-                    translate: translate_flag,
-                },
-                wake_target,
-            );
+            // HOTKEY-115 缺陷 2 修复：原实现恒发 Start（无任何 toggle 状态），
+            // 靠控制器「Start 时已在录音则转 Stop」的兜底路径生存；录音被外部途径
+            // 结束后该兜底失效（第二次按会重新开录）。改为 TOGGLE_ACTIVE 翻转，
+            // 与钩子路径同一状态量，语义一致。
+            if !TOGGLE_ACTIVE.swap(true, Ordering::AcqRel) {
+                TRANSLATE_POLL_STOP.store(false, Ordering::Relaxed);
+                let translate_flag = Arc::new(AtomicBool::new(translation_pressed()));
+                spawn_translate_poll_thread(Arc::clone(&translate_flag));
+                send_hotkey_event(
+                    sender,
+                    HotkeyEvent::Start {
+                        translate: translate_flag,
+                    },
+                    wake_target,
+                );
+            } else {
+                TOGGLE_ACTIVE.store(false, Ordering::Relaxed);
+                TRANSLATE_POLL_STOP.store(true, Ordering::Relaxed);
+                send_hotkey_event(sender, HotkeyEvent::Stop, wake_target);
+            }
         }
         HotkeyMode::PushToTalk => {
             if !PTT_ACTIVE.swap(true, Ordering::AcqRel) {

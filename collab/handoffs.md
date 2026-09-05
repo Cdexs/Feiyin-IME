@@ -2,6 +2,20 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-09-06 — coder-1 — HOTKEY-115 ✅ Toggle 停不住双缺陷修复（hotkey.rs 9 hunks + main.rs 1 行扩单收口，待主控验收）
+
+- **缺陷 1**：钩子 KEYUP 分支 `PTT_ACTIVE.store(false)` 在 `if should_stop…` 外，Toggle 松键被重置 → 第二次 DOWN 恒发 Start（Stop 分支不可达）。修：store 移进 if 内（PTT 行为逐位等价）+ DOWN 按模式分支。
+- **缺陷 2**：RegisterHotKey Toggle 分支恒发 Start（无状态，靠控制器兜底生存）。修：`TOGGLE_ACTIVE.swap` 翻转。
+- **选型**：另开 `TOGGLE_ACTIVE`（PTT_ACTIVE 被 poll_ptt_release_thread 自旋消费，复用两生命周期打架）；B1 由按模式分支构造性成立。
+- **互斥证据（主控要求实证）**：handle_hotkey_trigger:574 uses_hook 早退 / 钩子仅 CURRENT_HOOK 非空时被调 / sync_binding 清理→归零→安装顺序 / 中间态两路径都不产事件。
+- **B3 单一收口**：控制器 8 处结束路径汇聚 `notify_translate_poll_stop()` → 该函数内复位 TOGGLE_ACTIVE（零新增分发）；「有时」= 兜底依赖 is_recording 时序窗口 + 外部结束后的反转，真 Stop 无条件置信号后竞态消除。
+- **主控扩单③**：main.rs:5101 mic-muted 拒绝出口补 1 行 notify（Start 唯一无 pipeline 事件出口，否则态反转）。
+- **B4**：install/uninstall/sync_binding 三处两态归零。
+- **教训(六)**：给 tester-1 的护栏建议 = include_str 结构护栏守调用点（store 在 if 内 / 分支 atom 归属 / 收口含复位），不再造测纯函数的假护栏。
+- **报备**：钩子路径 auto-repeat 长按 Toggle 翻转新旧持平（无回归），去抖另立单；macOS 缺陷②同源已写 MACOS-HANDOFF.md。
+- **验证**：fmt --check 0 / check --all-targets 0 error / warning stash 对照与基线持平（111/102）/ 未 commit / v0.9.0 未动 / 零凭证。
+- **详情**：outbox/coder-1/result.md + logs/20260906.md + CHANGELOG.md
+
 ## 2026-09-06 — tester-1 — REPRO-114 ✅ 🔴 P0 热键第二下按不停根因定位（只查不修，生产零改动）
 
 - **根因锁死**：`src/platform/windows/hotkey.rs:221` WM_KEYUP 分支 `PTT_ACTIVE.store(false)` **无条件执行**，Toggle 松键重置标志 → 第二下按下又发 `Start` 而非 `Stop`。RegisterHotKey 路径（F9）`:536-547` 恒发 Start 无 toggle 状态。

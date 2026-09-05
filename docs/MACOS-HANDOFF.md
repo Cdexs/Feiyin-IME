@@ -1509,3 +1509,40 @@ premultiplied 并重审角部像素。macOS 侧无对应前置依赖，但 DEC-0
 「处理中态灰线不回退软边，直接等 per-pixel alpha」的裁决只针对 Windows 合成链；
 macOS 侧若未来做半透明窗口（NSWindow.backgroundColor alpha），角部像素/软边问题
 需独立评估，不得沿用 Windows 的 SetWindowRgn/DWM 结论。
+
+---
+
+## HOTKEY-115 · Windows Toggle 停不住双缺陷修复 —— macOS 侧同源性与注意事项（coder-1，2026-09-06）
+
+**Windows 侧修了什么**：Toggle 热键两缺陷——① 钩子路径 KEYUP 无条件 `PTT_ACTIVE.store(false)`
+导致第二次按下永远发 Start（Stop 分支不可达）；② RegisterHotKey 路径（如无修饰键 F9）的
+Toggle 分支无任何状态、恒发 Start。修法：另开 `TOGGLE_ACTIVE` 独立承载 Toggle 语义，
+两路径共用；复位单一收口在 `notify_translate_poll_stop()`（控制器所有录音非热键结束路径
+——Done/Cancelled/FocusLost/Error/FormatFailed/EditRequested/CancelStop/ESC——都汇聚调用它），
+外加 install/uninstall/sync_binding 三处绑定切换复位；mic-muted 拒绝路径（main.rs :5101 附近）
+补一行 notify 调用。
+
+**macOS 是否同源（已读 `src/platform/macos/hotkey.rs:132-157`）**：
+- **缺陷 ② 同源**：macOS Toggle 分支用 CGEventTap 边沿检测（`primary_now_pressed &&
+  !self.primary_pressed`，边沿处理正确、无 Windows 缺陷①同款问题），但**同样恒发 Start、
+  从不发 Stop**——Toggle 语义完全依赖控制器镜像（`macos event_loop.rs` 的
+  is_recording→stop 兜底）生存。外部途径结束后反转问题同样存在。
+- **缺陷 ① 不同源**：macOS 无「KEYUP 无条件清 PTT 状态」的问题（`primary_pressed` 的
+  清除只发生在 `!primary_now_pressed` 分支，即真正的松键）。
+- **B3 同样适用**：macOS 若采纳同方案，复位点应找 macOS 侧的等价汇聚函数
+  （若没有单一收口，需先补一个，不要散在 macOS 控制器各处）。
+- **注意**：macOS 的 `primary_pressed` 是结构体字段（事件驱动的边沿状态），不是原子量；
+  若引入 TOGGLE_ACTIVE 概念，建议同样保持「按模式分状态量」，不要与 PTT 的 held 状态合并。
+- **对端验证点**：Toggle 模式下（macOS 设置页同有该选项）连按两次能否停 + VAD 自动停
+  之后下一次按键是否能正常开始新录音。
+
+### HOTKEY-115-B 补充 · auto-repeat 语义两端对齐（2026-09-06）
+
+- **Windows 侧现状**：① 钩子路径新增 `KEY_PHYSICALLY_DOWN` 结构性抑制（DOWN 之间没有
+  UP 就是 repeat，物理按键状态判据，非计时窗）；② RegisterHotKey 路径实测（Win11，
+  F10 长按 2s，带/不带 `MOD_NOREPEAT` 双对照 + 单击对照）**WM_HOTKEY 均只触发 1 次**
+  ——该路径天然无 repeat，未加去抖代码；`MOD_NOREPEAT` 在 register_binding :651 已带上。
+- **macOS 侧**：`!is_repeat`（CGEvent AUTOREPEAT 字段）已有防护，与本批 Windows 侧
+  `KEY_PHYSICALLY_DOWN` 语义等价（都是「一次物理按压只算一次」，判据来源不同：
+  macOS 用系统字段、Windows 用钩子自跟踪的 DOWN/UP 状态）。**两端语义一致，macOS 无需改动**。
+- **对端验证点**不变：Toggle 连按两次停 + 长按不应产生 Start/Stop 交替。
