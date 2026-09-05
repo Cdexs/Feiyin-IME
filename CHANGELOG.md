@@ -740,3 +740,4 @@ D2D-HANG-095-B | spawn_overlay_thread 闭包尾部直调改 Drop 守卫（D2dRel
 | BUILD-098 | v0.9.0 出包（D2D-HANG-095+096 进包）：七项核验全过（sha 39cca97c 异于 093、D2D-HANG-095 探针=1）；托盘退出 5/5 干净（修复前 4/5 挂）；E2E 61P/5F（4 full_pipeline processing-state + 1 focus_lost 预存bug，待主控归因）；toggle_stop 仍间歇 | tester-1 | 2026-09-05 |
 OVERLAY-101 | Bug B 修复：Show 流式分支 !do_it 节流帧 x 沿用 overlay_geometry 默认位（基准宽 240 居中）而 SetWindowPos 应用 current（上限宽）→ 到上限后右窜 (current-240)/2 且无帧纠正；新增 centered_x 纯函数统一 5 处居中（Show 两分支一律 current 现算 + 插值循环 + overlay_geometry/adjust 纯重构只换调用不换宽度）；Bug A 假说被主控驳回（display 输出误当 raw 反推，二次同错），qwen_inference.rs 未动、转入待证据 | coder-2 | 2026-09-05
 OVERLAY-102 | 流式 overlay 最大宽度 65%→50%（STREAMING_OVERLAY_MAX_SCREEN_RATIO 0.50），Gavin 端测优化项；与 101 分步落地防触发点混淆 | coder-2 | 2026-09-05
+| D2D-P2P3-PLAN-108 | 剩余五态（Recording/FallingToProcessing/StreamingEditing/FocusLost/Error）D2D 迁移方案设计：collab/drafts/d2d-p2p3-plan.md（零代码，12 hunk + 五步顺序 + 五风险项含 EDIT 共存明确结论） | coder-2 | 2026-09-05 |

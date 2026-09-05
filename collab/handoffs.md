@@ -118,3 +118,11 @@
 - **验证**：fmt exit 0 / check 0 error / 163 warning 持平；7 hunk 全列行号，测试模块零触碰；消融推演逐项
 - **红线**：interpolate_step/grow-snap/streaming_scroll_offset/d2d 未动 / troubleshooting.md 未碰 / 未 commit / v0.9.0 未动 / 零凭证
 - **详情**：outbox/coder-2/result.md + logs/20260905.md + CHANGELOG.md + MACOS-HANDOFF §OVERLAY-101
+
+## 2026-09-05 — coder-2 — D2D-P2P3-PLAN-108 ✅ 五态迁移方案设计交付（零代码改动，待主控评审）
+
+- **交付物**：`collab/drafts/d2d-p2p3-plan.md`（基线 b072383 只读取证，行号实测，主控可 sed -n 抽查）
+- **三章全齐**：§3.1 五态逐节（调用链/元素清单/命中矩形口径/region）；§3.2 新原语（任务书 3 个实为 4 个，waveform 性能对比 GDI ~224 次/帧对象操作→0）；§3.3 五风险项各成节（EDIT 共存结论=无新增风险，5 步论证链）；§3.4 12 hunk + 五步顺序（Error→StreamingEditing→FocusLost→Recording→FallingToProcessing）+ 15 项非回归 + 5 条护栏；§3.5 六条不确定项（含 U5：draw_editing_overlay_chrome:2809 死代码，待拍板）
+- **协商点**：FallingToProcessing 与 Recording 波形变体 GDI 输出逐位相同 → 共用同一 D2D 复合体（与任务书预设不同，属简化，请主控裁决）；D2dResources +2 字段零新 thread_local（D2D-HANG-095 关天然过）
+- **红线**：src/**、ui/**、src-tauri/**、tests/** 零写入；零构建；未 commit；v0.9.0 未动；troubleshooting.md 未碰；零凭证
+- **详情**：outbox/coder-2/result.md（含收尾自证表）+ logs/20260905.md + CHANGELOG.md
