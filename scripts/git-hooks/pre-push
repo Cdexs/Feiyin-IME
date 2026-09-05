@@ -69,22 +69,24 @@ while read -r LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
     # 裸 `git rev-parse "$X^" 2>/dev/null` 解析失败时仍把字面量 `<sha>^` 打到 stdout，
     # `$(cmd || echo $EMPTY)` 会把字面量和空树 hash 都吃进变量 → BASE 变垃圾 → diff 继续失败 → 静默放行。
     BASE=$(git rev-parse --verify -q "${FIRST}^" 2>/dev/null || echo "$EMPTY_TREE")
-    if ! DIFF_RAW=$(git diff "${BASE}..${LOCAL_SHA}" -U0 --diff-filter=ACM 2>&1); then
+    if ! DIFF_RAW=$(hook_diff "${BASE}..${LOCAL_SHA}" -U0 --diff-filter=ACM 2>&1); then
       echo "❌ [pre-push] 无法取得 ${LOCAL_REF} 的待推 diff，拒绝放行（fail-closed）。" >&2
       echo "   git 报错：${DIFF_RAW}" >&2
       echo "   确认无误后可用 SECRET_SCAN_SKIP=1 git push 显式放行。" >&2
       exit 1
     fi
-    DIFF=$(printf '%s\n' "$DIFF_RAW" | grep -E '^\+' | grep -v '^+++')
+    # 文件头白名单式排除（理由同 pre-commit，见 secret-patterns.sh hook_diff 注释）
+    DIFF=$(printf '%s\n' "$DIFF_RAW" | grep -E '^\+' | grep -vE '^\+\+\+ (b/|/dev/null|")')
   else
     # 情况 2：已有分支推新提交
-    if ! DIFF_RAW=$(git diff "${REMOTE_SHA}..${LOCAL_SHA}" -U0 --diff-filter=ACM 2>&1); then
+    if ! DIFF_RAW=$(hook_diff "${REMOTE_SHA}..${LOCAL_SHA}" -U0 --diff-filter=ACM 2>&1); then
       echo "❌ [pre-push] 无法取得 ${LOCAL_REF} 的待推 diff，拒绝放行（fail-closed）。" >&2
       echo "   git 报错：${DIFF_RAW}" >&2
       echo "   确认无误后可用 SECRET_SCAN_SKIP=1 git push 显式放行。" >&2
       exit 1
     fi
-    DIFF=$(printf '%s\n' "$DIFF_RAW" | grep -E '^\+' | grep -v '^+++')
+    # 文件头白名单式排除（理由同 pre-commit，见 secret-patterns.sh hook_diff 注释）
+    DIFF=$(printf '%s\n' "$DIFF_RAW" | grep -E '^\+' | grep -vE '^\+\+\+ (b/|/dev/null|")')
   fi
 
   # 这里的空才是「真的没有新增行」，合法放行（fail-closed 已在上面处理命令失败）

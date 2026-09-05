@@ -40,6 +40,18 @@ SECRET_EMAIL_WHITELIST='cdexs@hotmail\.com|gavinshare6@outlook\.com|noreply@[A-Z
 
 # ---- 扫描函数 ---------------------------------------------------------
 
+# hook_diff —— 钩子专用的 git diff 包装。
+# SECRET-105：钩子对 diff 输出的解析（grep ^+ 取新增行 + 文件头白名单排除）
+# 依赖「文件头恒为 '+++ b/path' / '+++ /dev/null'（或带引号路径）」这一形态。
+# 但用户全局配置可以改变形态：diff.noprefix=true（无 b/ 前缀）、
+# diff.mnemonicPrefix=true（前缀变 c/、w/ 等）、diff.srcPrefix/dstPrefix 自定义。
+# 这里用 -c 全部钉死为标准形态，白名单的匹配就从「假设」变成「保证」；
+# 未知配置键在旧版 git 上被忽略、回落默认 a/ b/，同样安全。
+hook_diff() {
+  git -c diff.noprefix=false -c diff.mnemonicPrefix=false \
+      -c diff.srcPrefix=a/ -c diff.dstPrefix=b/ diff "$@"
+}
+
 # scan_diff <diff_text> —— 对一段 `git diff -U0 --diff-filter=ACM` 的输出扫全部模式，
 # 命中则把分类 + 行号写入 stdout，调用方用 $() 捕获后判非空即拦截。
 # 输入：stdin = diff 文本（已 grep ^+ 过滤、已 grep -v ^+++ 去掉文件头）
@@ -47,6 +59,14 @@ SECRET_EMAIL_WHITELIST='cdexs@hotmail\.com|gavinshare6@outlook\.com|noreply@[A-Z
 scan_diff() {
   local DIFF="$1"
   [ -z "$DIFF" ] && return 0
+
+  # SECRET-105：先剥离行首 diff 标记（+/- 各剥一个字符）再匹配。
+  # 邮箱 local-part 字符类含 +（RFC 合法），若不剥，`<+>@pytest.hookimpl` 的标记
+  # 会被当成 local-part，任何 `@foo.bar` 形态的新增行都误报（SECRET-082/104 同族：
+  # 模式认形态不认语境）。统一在入口剥而不是逐个模式改字符类：一处修，全类受益，
+  # 且只剥行首一个字符，内容里的 +（如 AKIA+xxx、a+b）不受影响。
+  # 剥离按行 1:1 替换，行数不变，下方 grep -n 的行号仍然正确。
+  DIFF=$(printf '%s\n' "$DIFF" | sed 's/^[+-]//')
 
   local HITS=""
 

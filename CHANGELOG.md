@@ -748,3 +748,4 @@ OVERLAY-101 | Bug B 修复：Show 流式分支 !do_it 节流帧 x 沿用 overlay
 OVERLAY-102 | 流式 overlay 最大宽度 65%→50%（STREAMING_OVERLAY_MAX_SCREEN_RATIO 0.50），Gavin 端测优化项；与 101 分步落地防触发点混淆 | coder-2 | 2026-09-05
 | D2D-P2P3-PLAN-108 | 剩余五态（Recording/FallingToProcessing/StreamingEditing/FocusLost/Error）D2D 迁移方案设计：collab/drafts/d2d-p2p3-plan.md（零代码，12 hunk + 五步顺序 + 五风险项含 EDIT 共存明确结论） | coder-2 | 2026-09-05 |
 | D2D-P2P3-IMPL-109 | D2D 剩余五态（Recording/FallingToProcessing/StreamingEditing/FocusLost/Error）迁移实施：src/main.rs +637/-115（22 hunks，五步顺序，全部 d2d 优先+GDI 兜底，命中矩形 helper 单一源，几何区零触碰，零新 thread_local） | coder-2 | 2026-09-05 |
+SECRET-105 | 密钥闸门 diff 标记误报+漏报双修：scan_diff 入口剥行首 +/- 标记（修 +@pytest 装饰器误报）+ 文件头排除改白名单 ^\+\+\+ (b/|/dev/null|")（修 ++ 开头内容行漏报）+ hook_diff -c 钉死 a/b 前缀防用户 diff 配置漂移；真阳性7+真阴性7 两钩子全矩阵实测过、f38bc06 事故场景无 SKIP 可 commit、行号不变 | coder-1 | 2026-09-05 23:20

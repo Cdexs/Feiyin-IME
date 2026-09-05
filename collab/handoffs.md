@@ -2,6 +2,18 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-09-05 — coder-1 — SECRET-105 ✅ 密钥闸门 diff 标记误报+漏报双修（只动 scripts/git-hooks/ 3 文件，待主控验收）
+
+- **根因**：`scan_diff` 输入为 git diff 原始行，行首 `+` 标记未剥离；邮箱 local-part 类含 `+`，标记被当 local-part → `<+>@pytest.hookimpl` 全中招（SECRET-082/104 同族）。
+- **修 1**：`scan_diff` 入口 `sed 's/^[+-]//'` 剥一个标记（一处修全类受益；行数 1:1 行号不变；真阳性实测全保留）。
+- **修 2（漏报洞）**：文件头排除裸 `^+++` → 白名单 `^\+\+\+ (b/|/dev/null|")`（pre-commit 1 + pre-push 2）——内容行 `++foo` 旧过滤器整行丢弃=真密钥漏报，修前漏报已复现、修后必拦。
+- **修 3**：新增 `hook_diff()`（-c 钉死 noprefix/mnemonicPrefix/srcPrefix/dstPrefix），用户 diff 配置无法再改变文件头形态，白名单匹配成保证；3 处 git diff 全走它。
+- **顺序结论**：文件头过滤必须在剥离标记之前对原始行做（先剥则 `+++ b/x`→`++ b/x` 无人能认出）。
+- **验证**：真阳性 7 + 真阴性 7 两钩子全矩阵实测（pre-push 用 --no-verify 独立造提交，case2/case3 全覆盖）；三种文件头形态排除无噪音；f38bc06 事故场景无 SKIP 可 commit；行号 `3:` 正确；bash -n 三文件过；LF/UTF-8 未破坏。
+- **残余窄口报备**：内容 `++ b/x` 与文件头逐字节同形属统一 diff 固有歧义（状态机式过滤可根治，本单未动）。
+- **另报备**：工作区 47 文件整文件 EOL 漂移（worktree CRLF vs index LF），非本单造成，建议另立单。
+- **红线**：未 commit / v0.9.0 未动 / 零凭证 / 临时仓库 4 个全 rm -rf。
+
 ## 2026-09-05 — tester-1 — TEST-SYNC-110 ✅ 阶段三（D2D-P2P3-IMPL-109 五态迁移护栏，待主控验收 + 阶段四 TEST-EXEC-111 首跑）
 
 - **交付**：`src/main.rs` +357/-0，单 hunk `:10049` 后新增 `#[cfg(all(test, target_os="windows"))] mod overlay_109_d2d_p2p3_guard_tests`，生产零改动（numstat 357/0）。

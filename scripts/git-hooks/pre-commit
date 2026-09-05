@@ -27,13 +27,17 @@ HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # 只扫本次 staged 的新增行（-U0 去掉上下文，^+ 取新增），避免历史存量反复报警
 # 🔴 fail-closed（HOOK-FAIL-OPEN-001）：git diff 失败时拒绝放行，不静默放过。
 #   staged diff 取不到基本只发生在空提交，风险比 pre-push 低，但失效形态同源，一并收敛。
-if ! DIFF_RAW=$(git diff --cached -U0 --diff-filter=ACM 2>&1); then
+if ! DIFF_RAW=$(hook_diff --cached -U0 --diff-filter=ACM 2>&1); then
   echo "❌ [pre-commit] 无法取得 staged diff，拒绝放行（fail-closed）。" >&2
   echo "   git 报错：${DIFF_RAW}" >&2
   echo "   确认无误后可用 SECRET_SCAN_SKIP=1 git commit 显式放行。" >&2
   exit 1
 fi
-DIFF=$(printf '%s\n' "$DIFF_RAW" | grep -E '^\+' | grep -v '^+++')
+# SECRET-105：文件头用白名单式排除（b/ 或 /dev/null 或带引号路径），
+# 不再用裸 '^+++' —— 内容行以 ++ 开头（diff 里呈现为 '+++foo' 无空格）会被裸
+# 前缀误排成漏报。hook_diff 已强制标准 a/ b/ 前缀形态，白名单恒可匹配文件头；
+# 白名单失配的失败方向是被扫到的噪音，而非漏报。
+DIFF=$(printf '%s\n' "$DIFF_RAW" | grep -E '^\+' | grep -vE '^\+\+\+ (b/|/dev/null|")')
 [ -z "$DIFF" ] && exit 0
 
 HITS=$(scan_diff "$DIFF")
