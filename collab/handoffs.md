@@ -2,6 +2,15 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-09-05 — tester-1 — TEST-EXEC-111 ✅ 阶段四（三层全绿 + A1-A5 消融 + 🔴 热键环境级失效证据，G4 重设计保留）
+
+- **Step1**：root **1077P/0F/9I**（1070+7）/ src-tauri 76P / vitest 89P，三层全绿。
+- **消融**：A1→G1 红；A2→G2a 红；A3→G3a 红；**A4 初版 G4 未红（8 行窗口误扫 else 分支 helper）→ 重设计只扫 if-body 后基线绿/消融红**；A5 注释线程体内释放→**整个 test 进程挂死 timeout exit 124（D2D-HANG-001 本体）**。
+- **Step3 🔴 决定性发现**：当前环境**热键模拟整体失效**（全 6 条 hotkey FAIL，非仅预暖竞态）。证据链：非代码回归（旧包同失败）/ SendInput 对 notepad 正常但到不了 app 的 WH_KEYBOARD_LL 钩子 / detached 同失败 / app 完全响应 / 时间线显示 ~23:00 过、~23:50 全失败=环境退化。**根因在 Windows 输入层，tests/** 无 API 可修**。已提选项 A（门禁显式豁免）/选项 B（出包接受门禁红、主控逐次显式裁定，**强烈建议 B**）。
+- **还原自证**：A1-A5 全还原（ABLATION-A=0）；root 重跑 1077P/0F/9I；G1-G4 单跑 7P；无残留进程；config.toml sha 3186ec8c；target/release config 恢复 vk=165。唯一 src/main.rs 残留 diff = G4 重设计（28/13 全测试模块，非消融残留）。
+- **红线**：git-hooks 未碰 / 未出包 / 未 commit / v0.9.0 未动 / 零凭证。
+- **详情**：outbox/tester-1/result.md + logs/20260905.md + CHANGELOG.md
+
 ## 2026-09-05 — coder-1 — SECRET-105 ✅ 密钥闸门 diff 标记误报+漏报双修（只动 scripts/git-hooks/ 3 文件，待主控验收）
 
 - **根因**：`scan_diff` 输入为 git diff 原始行，行首 `+` 标记未剥离；邮箱 local-part 类含 `+`，标记被当 local-part → `<+>@pytest.hookimpl` 全中招（SECRET-082/104 同族）。

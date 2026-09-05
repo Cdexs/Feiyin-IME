@@ -10336,25 +10336,40 @@ mod overlay_109_d2d_p2p3_guard_tests {
             "dispatch 必须恰有 5 个 `if !d2d::draw_` 分支（waveform/processing/editing/preview/error），实测 {}",
             d2d_lines.len()
         );
-        // 每个 d2d 分支后续行内必须有 GDI 兜底调用（非 d2d 前缀的绘制函数）。
-        // 依据生产 :2132-2206 结构：`if !d2d::draw_x(...) { <GDI 调用> } else {...}`。
-        // 检查方式：从该行往后找最近的含 `if` 块内绘制调用（draw_overlay_chrome /
-        // draw_processing_overlay / draw_error_overlay / draw_recording_overlay 等
-        // 非 d2d:: 前缀）。此处用「该分支行之后 8 行内存在非 d2d:: 的函数调用行」
-        // 作粗粒度判据（生产各分支 GDI 兜底都在紧随的 1-4 行内）。
+        // 每个 d2d 分支的 **if-body**（`if !d2d::draw_x(...) { ... }`，结束于 `} else {`
+        // 或独立 `}`）内必须有 GDI 兜底绘制调用（非 d2d 前缀）。
+        // 依据生产 :2132-2206 结构，GDI 兜底都在 if-body 内、else 分支之前。
+        // 🔴 只扫 if-body 不扫 else：else 分支的命中矩形 helper（如
+        //    draw_submit_button_hit_rect_only）也含 `draw_` 前缀，若扫到 else 会
+        //    误判为「GDI 兜底在位」—— A4 消融实测抓不住（TEST-EXEC-111 发现）。
+        // 消融：任一分支把 if-body 内 GDI 兜底删掉（只留 d2d 或空）→ 该分支红。
         for (lineno, _) in &d2d_lines {
             let mut has_gdi = false;
-            let window = src.lines().skip(*lineno).take(8);
-            for line in window {
-                let stripped: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-                // 非 d2d 前缀 + 形似函数调用（含 '(' 且不是注释/空行）
+            // 从 d2d 调用行之后扫描 if-body，直到 } else { 或独立 } 为止
+            let lines: Vec<&str> = src.lines().collect();
+            for j in (*lineno + 1)..(*lineno + 15).min(lines.len() + 1) {
+                if j - 1 >= lines.len() {
+                    break;
+                }
+                let stripped: String = lines[j - 1]
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                // if-body 结束（} else { 或独立 }）
+                if stripped.starts_with("}else")
+                    || stripped.starts_with("}elseif")
+                    || stripped == "}"
+                {
+                    break;
+                }
+                // 非 d2d 前缀 + 形似 GDI 绘制调用
                 if !stripped.starts_with("//")
                     && !stripped.is_empty()
                     && !stripped.contains("d2d::")
                     && stripped.contains('(')
                     && (stripped.contains("draw_")
-                        || stripped.contains("overlay")
-                        || stripped.contains("chrome"))
+                        || stripped.contains("chrome")
+                        || stripped.contains("indicator"))
                 {
                     has_gdi = true;
                     break;
@@ -10362,7 +10377,7 @@ mod overlay_109_d2d_p2p3_guard_tests {
             }
             assert!(
                 has_gdi,
-                "dispatch 分支（L{}）d2d 调用后 8 行内必须存在 GDI 兜底调用（overlay 永不空白）",
+                "dispatch 分支（L{}）if-body 内必须存在 GDI 兜底绘制调用（overlay 永不空白）",
                 lineno
             );
         }
