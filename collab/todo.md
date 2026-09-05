@@ -47,10 +47,30 @@ TEST-SYNC-105（同文件测试模块）冲突，五阶段禁止并行。先把�
 | --- | --- |
 | **E2E-GATE-103**（tester-1） | **零产出被打断**（`tests/` 无提交、工作区干净）。真因不是终端卡死，是 tester-1 模型档余额耗尽（`Insufficient balance` / OpenCode Zen）＝ `[WORKER-RESTART-MODEL-RESET-001]` 复发。已切档 GLM-5.3-Flash (2x usage) OpenCode Go 并重注入上下文。**排在 BUILD-107 出包之后**（它占 `tests/**`，与本轮 `src/main.rs` 无冲突，但 tester-1 一次只做一单） |
 
-#### 后续顺位（本轮）
+#### 🔴 后续顺位（2026-09-05 Gavin 拍板「一起改完一起出包」后重排，见 DEC-057 补充）
 
-`TEST-SYNC-105` → `TEST-EXEC-106`（阶段四全量回归）→ `BUILD-107`（阶段五出包，
-给 Gavin 验 Bug B + 抓 Bug A 的 `-debug` 日志）→ `E2E-GATE-103` → `D2D-P2P3-IMPL-109`
+**BUILD-107 取消**。OVERLAY-101/102 不单独出包，与 D2D P2+P3 合并成一个包、只端测一轮。
+
+| 顺位 | Worker | 任务 | 占用文件 |
+| --- | --- | --- | --- |
+| ① 进行中 | tester-1 | `TEST-EXEC-106` 阶段四全量回归 + A1~A4 消融（**做完不出包**） | `src/main.rs`（消融临时改+还原） |
+| ② 并行 | coder-2 | **`D2D-P2P3-IMPL-109`** 五态迁移实施（方案已冻结：`docs/D2D-P2P3-PLAN.md`） | `src/main.rs` 生产区 |
+| ② 并行 | tester-1 | `E2E-GATE-103`（4 条 full_pipeline 归因 + 修 `_no_hardware` + ERROR>0 门禁） | `tests/**` + `build-test-guide.md` |
+| ③ | tester-1 | `TEST-SYNC-110` 阶段三（P2+P3 护栏） | `src/main.rs` 测试模块 |
+| ④ | tester-1 | `TEST-EXEC-111` 阶段四全量 | — |
+| ⑤ | tester-1 | **`BUILD-112` 出包** | — |
+| ⑥ | Gavin | **一次端测**：Bug B 位置 + 五态视觉 + **带 `-debug` 抓 Bug A 日志** | — |
+| ⑦ | — | per-pixel alpha（DEC-056 ③，前置条件「八态全迁完」本批达成） | — |
+
+**② 的并行是安全的**：`src/main.rs` 生产区（coder-2）与 `tests/**` python 层（tester-1）
+文件级零重叠。阶段三 `TEST-SYNC-110` 必须等 ② 的 coder-2 完成后才派（同文件）。
+
+#### 卫生债追加（2026-09-05）
+
+- **`draw_editing_overlay_chrome`（`src/main.rs:2809`）是死代码**：编译器 `never used`
+  警告实证，全文件仅定义体一处 grep 命中，无调用方。
+  **D2D-P2P3-IMPL-109 明令不删不改不参考**（删死代码与迁移零关系，混批污染归因）。
+  单独一批处理，**待 Gavin 定夺**
 
 ##### OVERLAY-101 —— Gavin 原话与主控静态取证
 
