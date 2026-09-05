@@ -207,7 +207,7 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """测试收集后处理：默认跳过 slow 测试（优化3）"""
+    """测试收集后处理：默认跳过 slow 测试（优化3）+ E2E-GATE-103 选集记录"""
     # 如果未指定 --run-slow，跳过 slow 标记测试
     if not config.getoption("-m", default=""):
         skip_slow = pytest.mark.skip(reason="Slow test, use 'pytest -m slow' to run")
@@ -220,6 +220,13 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         for item in items:
             if "audio" in item.keywords:
                 item.add_marker(skip_audio)
+
+    # E2E-GATE-103: 记录选集表达式与 deselected 数（供 GATE 横幅打印）
+    # 注意：pytest 的 -m deselection 在此钩子之后由内部逻辑执行，这里拿到的 items
+    # 是过滤前的；deselected 数在 pytest_terminal_summary 用 tr.stats 不包含。
+    # 改用 collected 与「实际收集数」在横幅里分别展示（见 pytest_terminal_summary）。
+    _EGATE["expr"] = config.getoption("-m", default="") or "(none)"
+    _EGATE["collected"] = len(items)
 
 
 @pytest.fixture(scope="session")
@@ -373,6 +380,76 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> None:
         item.rep_setup = rep
     elif call.when == "teardown":
         item.rep_teardown = rep
+
+
+# ===== E2E-GATE-103: 「ERROR>0 即门禁不通过」机器闸门 =====
+# 背景（logs/20260905.md）：BUILD-085/093 报的「64P/1F」「65P/0F」漂亮数字背后，
+# full_pipeline 四条用例因环境缺 toml 包收集期 ERROR，三周无人发现——收集期 ERROR
+# 被当成「没跑」而非「门禁失效」。
+# 本闸门把 ERROR 从「被忽略」改成「显式红」：
+#   - pytest_terminal_summary 永远打印 GATE 横幅（选集 + 各计数），供人工/脚本 grep
+#   - pytest_sessionfinish 在 errors>0 时把退出码强制为非零（pytest 默认 errors>0
+#     已是 exitcode 2，这里显式兜底 + 打横幅，防任何包装脚本吞掉退出码）
+# 机器判据：errors>0 或 failed>0 都算「门禁不通过」；退出码非零即机器拦截。
+# 🔴 选集显式化：BUILD-093 用 -m "not hardware"（7 deselected）、BUILD-098 全量
+#   （6 deselected），两次数字不可比却无人察觉。本闸门把 -m 表达式与 deselected
+#   数一并打印，让选集变化显式可见。
+
+_EGATE = {"expr": "", "collected": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0, "deselected": 0}
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_terminal_summary(
+    terminalreporter: object,
+    exitstatus: int,
+    config: pytest.Config,
+) -> None:
+    """E2E-GATE-103: 门禁横幅 —— 选集 + 计数 + ERROR 显式红"""
+    _EGATE["passed"] = len(getattr(terminalreporter, "stats", {}).get("passed", []))
+    _EGATE["failed"] = len(getattr(terminalreporter, "stats", {}).get("failed", []))
+    _EGATE["errors"] = len(getattr(terminalreporter, "stats", {}).get("error", []))
+    _EGATE["skipped"] = len(getattr(terminalreporter, "stats", {}).get("skipped", []))
+
+    tr = terminalreporter
+    # deselected 数：pytest 在终端摘要用 _numcollected（过滤前）与实际执行数相减。
+    # 更可靠：从 footer 摘要统计取。pytest 的 terminalreporter._numcollected 是
+    # 收集总数（含随后被 -m deselected 的），实际执行数 = passed+failed+skipped+errors。
+    _EGATE["deselected"] = max(
+        0, _EGATE["collected"] - (_EGATE["passed"] + _EGATE["failed"] + _EGATE["errors"] + _EGATE["skipped"])
+    )
+    tr.write_sep("=", "E2E-GATE-103 门禁报告")
+    tr.write_line(f"  -m 表达式       : {_EGATE['expr']}")
+    tr.write_line(f"  collected       : {_EGATE['collected']}")
+    tr.write_line(f"  deselected      : {_EGATE['deselected']}")
+    tr.write_line(f"  passed          : {_EGATE['passed']}")
+    tr.write_line(f"  failed          : {_EGATE['failed']}")
+    tr.write_line(f"  errors          : {_EGATE['errors']}")
+    tr.write_line(f"  skipped         : {_EGATE['skipped']}")
+    if _EGATE["errors"] > 0 or _EGATE["failed"] > 0:
+        tr.write_line(
+            "  🔴 门禁判定：不通过（errors>0 或 failed>0 都算红，"
+            "收集期 ERROR 不再被静默计入 skip/deselect）"
+        )
+    else:
+        tr.write_line("  ✅ 门禁判定：通过")
+    tr.write_sep("=", "E2E-GATE-103 门禁报告 end")
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """E2E-GATE-103: errors>0 强制非零退出码（机器拦截的兜底闸）"""
+    # pytest 自身对 errors 已返回非零（收集期 error=exitcode 2、setup error=1），
+    # 此处仅兜底：若包装脚本吞掉退出码，横幅仍会打 ERROR 计数。
+    # 真正机器判据见 tests/e2e_gate.py（解析横幅 + 退出码双重判定）。
+    tr = session.config.pluginmanager.get_plugin("terminalreporter")
+    if tr is None:
+        return
+    error_count = len(getattr(tr, "stats", {}).get("error", []))
+    if error_count > 0 and exitstatus == 0:
+        session.config._exitstatus = 1
+        tr.write_line(
+            "🔴 [E2E-GATE-103] errors>0 且退出码为 0 —— 强制置为非零，门禁不通过"
+        )
 
 
 @pytest.fixture

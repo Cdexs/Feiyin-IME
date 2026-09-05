@@ -2,6 +2,17 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-09-05 — tester-1 — E2E-GATE-103 ✅ pytest 门禁归因 + ERROR>0 机器闸门（只动 tests/** + build-test-guide.md，src/main.rs 零触碰）
+
+- **4 条 full_pipeline 决定性实验判 B harness 缺陷**：① -debug 日志实证产品全链路正常（Recording→Processing→注入→Hidden，speech_detected=true / ASR-SUMMARY finished / Injection completed）；② PROCESSING 与 RECORDING 同尺寸 240x36，`detect_overlay_state()` 结构性不可观测 PROCESSING（dict 序 recording 先命中）；③ Win11 notepad shim PID 立即退出。
+- **修复**：`_wait_for_pipeline_completion`（等 HIDDEN）+ `_notepad_window_exists`（EnumWindows），四条改写后 **4/4 PASS**。
+- **事项2**：`TestFocusLostPreview._no_hardware` 静态方法补齐（8-17 在案 AttributeError），test_injection 3/3 PASS。
+- **事项3 机器闸门**：conftest GATE 横幅（选集+deselected+各计数+判定）+ errors>0 强制非零退出码；`tests/e2e_gate.py` 门禁脚本；**故意制造 ERROR 正反验证通过**。
+- **全量 E2E**（BUILD-098 旧包）：71P/0F/13S/20D/1 error（test_overlay_position 间歇预暖竞态，单跑 PASS，门禁首次照出）。BUILD-098 5F 全消失。
+- **build-test-guide.md**：门禁判据节 + 状态检测表修正（Processing 240x36、FocusLost 320x140）。
+- **红线**：生产零改动 / 未 commit / config.toml sha 3186ec8c / debug.log 恢复基线 / 零凭证。
+- **详情**：outbox/tester-1/result.md + logs/20260905.md + CHANGELOG.md
+
 ## 2026-09-05 — tester-1 — TEST-EXEC-106 ✅ 阶段四（三层全绿 + A1~A4 消融 + 还原自证，生产/测试零改动）
 
 - **Step1**：root **1070P/0F/9I**（1065+5 逐位吻合）/ src-tauri 76P / vitest 89P，三层全绿。

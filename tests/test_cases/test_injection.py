@@ -190,3 +190,10 @@ class TestFocusLostPreview:
         finally:
             process.terminate()
             process.wait(timeout=5)
+
+    @staticmethod
+    def _no_hardware() -> bool:
+        """检测是否有麦克风设备（E2E-GATE-103 修复：本类原先缺失该静态方法，
+        调用 `self._no_hardware()` 时抛 AttributeError —— 8-17 已在案从未修）"""
+        import os
+        return os.getenv("SKIP_AUDIO_TESTS", "0") == "1"

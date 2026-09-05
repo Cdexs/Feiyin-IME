@@ -236,6 +236,43 @@ playwright install chromium
 | Step 4b | `py -3.11 -m pytest tests/test_cases/ -m "not webview" -v`               | ~60s | pywinauto Win32 E2E           | 改了热键/托盘/Overlay/文字注入/进程管理                      |
 | Step 4c | `py -3.11 -m pytest tests/test_cases/ -v`                                | ~90s | pytest 全量（含 Playwright + E2E） | 大版本发布/回归测试/前后端都改了                              |
 
+### 🔴 E2E-GATE-103 门禁判据【强制，2026-09-05 加入】
+
+> **教训**（logs/20260905.md）：BUILD-085/093 报「64P/1F」「65P/0F」漂亮数字背后，
+> full_pipeline 四条用例因环境缺 toml **收集期 ERROR** 三周无人发现——收集期 ERROR
+> 被当成「没跑」而非「门禁失效」；且 BUILD-093（`-m "not hardware"` 7 deselected）
+> 与 BUILD-098（全量 6 deselected）选集不同、数字不可比却无人察觉。
+> **只加文字规则等于没解决，必须落成机器判据。**
+
+**判据（机器拦截，不只是文字）**：
+
+```
+ERROR>0 或 FAIL>0  ⇒ 门禁不通过（退出码非零）
+ERROR=0 且 FAIL=0  ⇒ 门禁通过
+```
+
+**执行方式（二选一，均会打 GATE 横幅 + 强制退出码）**：
+
+```bash
+# 方式 A：门禁包装脚本（推荐，自动打印选集 + 各计数 + 机器判据）
+py -3.11 tests/e2e_gate.py                       # 全量 E2E
+py -3.11 tests/e2e_gate.py -m "not hardware"     # 指定选集
+
+# 方式 B：直接 pytest（conftest 的 pytest_terminal_summary 横幅 + errors>0 兜底）
+PYTHONIOENCODING=utf-8 py -3.11 -m pytest tests/test_cases/ -v
+```
+
+**要点**：
+
+1. **ERROR 显式红**：收集期 `ModuleNotFoundError` 等被 GATE 横幅打印为 `errors: N`，
+   门禁判定「不通过」，退出码非零。**不允许**把 ERROR 静默计入 skip/deselect。
+2. **选集显式化**：GATE 横幅打印 `-m 表达式 + collected + deselected + 各计数`，
+   两次运行的数字不可比时当场可见（防 093 vs 098 事件复现）。
+3. **机器判据落地**：`tests/e2e_gate.py` 解析 pytest 摘要 + 退出码双重判定；
+   `tests/conftest.py` 的 `pytest_sessionfinish` 在 errors>0 时强制退出码非零兜底。
+4. 验证方法：故意制造一个收集期 ERROR（如临时放一个 import 不存在模块的测试文件），
+   跑门禁必须 exit 1；删掉后必须 exit 0。**每次改门禁后必须做一次这个正反验证。**
+
 ### ⚠️ 强制规则：任何代码修改后必须先构建对应产物
 
 > **原则**：任何代码修改（前端 CSS/React 或后端 Rust）后执行自动化测试前，**必须先构建对应产物**。否则测试连接的是旧产物，修改不会生效。
@@ -367,14 +404,24 @@ tests/
 
 ### 状态检测机制
 
-基于 Win32 API 检测 overlay 窗口尺寸：
+基于 Win32 API 检测 overlay 窗口尺寸（尺寸与 src/main.rs 常量同源解析，
+见 `tests/utils/state_detector.py` `STATE_SIZES`）：
 
 | 状态         | 窗口尺寸    |
 | ---------- | ------- |
 | Recording  | 240x36  |
-| Processing | 200x36  |
-| FocusLost  | 320x110 |
+| Processing | 240x36  |
+| FocusLost  | 320x140 |
 | Hidden     | 无窗口     |
+
+🔴 **E2E-GATE-103 已确认的能力边界（2026-09-05 决定性实验）**：
+**Recording 与 Processing 尺寸相同（均 240x36），纯尺寸检测**无法**区分二者**——
+`detect_overlay_state()` 按 STATE_SIZES dict 序先命中 recording，**PROCESSING 状态
+对检测器不可见**。因此：
+- 全流程测试（test_full_pipeline_e2e.py）**不得断言 PROCESSING**，改为断言可观测的
+  完成态（overlay 回到 HIDDEN = 识别+注入完成）。归因证据：-debug 日志实证产品
+  Recording→Processing→注入→Hidden 全链路正常，此前失败是 harness 缺陷非产品缺陷。
+- 需区分 Recording/Processing 的用例需 OCR/内容探针，超出纯尺寸检测能力。
 
 ### 注意事项
 

@@ -223,6 +223,25 @@ def _wait_for_overlay_not_state(unexpected_state: OverlayState, timeout: float =
     )
 
 
+def _wait_for_pipeline_completion(timeout: float = 20.0, interval: float = 0.2) -> bool:
+    """等待录音管线完成：overlay 回到 HIDDEN。
+
+    E2E-GATE-103 归因结论（决定性实验见 outbox/tester-1/result.md）：
+    `detect_overlay_state()` 纯靠窗口尺寸判状态，而 RECORDING(240x36) 与
+    PROCESSING(240x36) 尺寸相同（state_detector.py 导入时从 src/main.rs 三常量
+    同源解析，dict 序 recording 先命中）→ **PROCESSING 状态对检测器不可见**，
+    `_wait_for_overlay_state(PROCESSING)` 结构性不可满足，此前的失败是 harness
+    缺陷而非产品缺陷（-debug 日志实证产品 Recording→Processing→注入→Hidden
+    全链路正常）。故本测试断言可观测的**完成态**（HIDDEN = 注入已完成）。
+    """
+    return wait_for_condition(
+        lambda: detect_overlay_state() == OverlayState.HIDDEN,
+        timeout=timeout,
+        interval=interval,
+        description="overlay hidden (pipeline completion)",
+    )
+
+
 def _get_clipboard_text() -> str:
     """获取当前剪贴板文本内容"""
     try:
@@ -265,6 +284,49 @@ def _open_notepad_and_wait() -> subprocess.Popen:
     )
     time.sleep(2)  # 等待记事本窗口加载
     return process
+
+
+def _notepad_window_exists() -> bool:
+    """检测是否有记事本窗口存在（E2E-GATE-103 修复）。
+
+    Windows 11 的 notepad 是 Store/UWP 应用：`Popen(["notepad"])` 拿到的 shim
+    进程 PID 会**立即退出**（返回码 0），真正的记事本以另一进程运行 ——
+    `notepad_proc.poll() is None` 在 Win11 上结构性不可靠（BUILD-098 的
+    `Notepad should still be running` 失败即此 harness 缺陷）。
+    改为用 Win32 EnumWindows 检测「记事本窗口」是否实际存在（进程存活 ≠ 窗口存在，
+    但窗口存在 = 记事本真在运行，这正是测试要验证的语义）。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+
+    found = [False]
+
+    def enum_proc(hwnd, lparam):
+        if user32.IsWindowVisible(hwnd):
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = buf.value
+                if title.endswith("记事本") or title.endswith("Notepad"):
+                    found[0] = True
+                    return False
+        return True
+
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows(WNDENUMPROC(enum_proc), 0)
+    return found[0]
+
+
+def _assert_notepad_alive(notepad_proc: subprocess.Popen) -> bool:
+    """E2E-GATE-103: 断言记事本仍在运行（窗口存在 = 真在运行，见 _notepad_window_exists）。
+    返回 True 供调用侧 `assert _assert_notepad_alive(...)` 使用。"""
+    assert _notepad_window_exists(), (
+        "Notepad should still be running (no notepad window found)"
+    )
+    return True
 
 
 def _close_notepad(notepad_process: subprocess.Popen) -> None:
@@ -382,21 +444,18 @@ class TestFullPipelineToggle:
             # 再次按热键停止录音
             _trigger_hotkey_start(hotkey)
 
-            # 等待进入 Processing 状态
-            assert _wait_for_overlay_state(OverlayState.PROCESSING, timeout=5.0), (
-                f"Expected processing state after stop, got {detect_overlay_state().value}"
-            )
-
-            # 等待处理完成，overlay 隐藏
-            assert _wait_for_overlay_state(OverlayState.HIDDEN, timeout=15.0), (
-                "Overlay should hide after processing completes"
+            # E2E-GATE-103: 等管线完成（overlay 回到 HIDDEN = 识别+注入已完成）。
+            # 不再断言 PROCESSING —— 该状态与 RECORDING 尺寸相同，检测器不可区分
+            # （见 _wait_for_pipeline_completion docstring，决定性实验归因）。
+            assert _wait_for_pipeline_completion(timeout=20.0), (
+                "Overlay should hide after processing completes (pipeline did not complete)"
             )
 
             # 等待文字注入完成
             time.sleep(1)
 
             # 验证记事本仍在运行
-            assert notepad_proc.poll() is None, "Notepad should still be running"
+            assert _assert_notepad_alive(notepad_proc)
 
         finally:
             if notepad_proc:
@@ -467,21 +526,16 @@ class TestFullPipelinePTT:
                 # 松开热键停止录音
                 _trigger_hotkey_ptt_release(hotkey)
 
-            # 等待进入 Processing 状态
-            assert _wait_for_overlay_state(OverlayState.PROCESSING, timeout=5.0), (
-                f"Expected processing state after release, got {detect_overlay_state().value}"
-            )
-
-            # 等待处理完成，overlay 隐藏
-            assert _wait_for_overlay_state(OverlayState.HIDDEN, timeout=15.0), (
-                "Overlay should hide after processing completes"
+            # E2E-GATE-103: 等管线完成（见 _wait_for_pipeline_completion docstring）
+            assert _wait_for_pipeline_completion(timeout=20.0), (
+                "Overlay should hide after processing completes (pipeline did not complete)"
             )
 
             # 等待文字注入完成
             time.sleep(1)
 
             # 验证记事本仍在运行
-            assert notepad_proc.poll() is None, "Notepad should still be running"
+            assert _assert_notepad_alive(notepad_proc)
 
         finally:
             if notepad_proc:
@@ -549,7 +603,7 @@ class TestFullPipelineCancel:
             )
 
             # 验证记事本仍在运行
-            assert notepad_proc.poll() is None, "Notepad should still be running"
+            assert _assert_notepad_alive(notepad_proc)
 
         finally:
             if notepad_proc:
@@ -615,15 +669,17 @@ class TestFullPipelineFocusLost:
             # 再次按热键停止录音
             _trigger_hotkey_start(hotkey)
 
-            # 等待 Processing 状态
-            assert _wait_for_overlay_state(OverlayState.PROCESSING, timeout=5.0), (
-                f"Expected processing state, got {detect_overlay_state().value}"
-            )
-
-            # 验证焦点丢失预览窗口
+            # E2E-GATE-103: 焦点丢失场景 —— 停止后 overlay 可能进入 FOCUSLOST（320x140，
+            # 检测器可区分）或直接完成隐藏。PROCESSING 不可观测（与 RECORDING 同尺寸）。
             state = detect_overlay_state()
-            assert state in (OverlayState.FOCUSLOST, OverlayState.HIDDEN, OverlayState.PROCESSING), (
-                f"Expected focuslost/hidden/processing, got {state.value}"
+            assert state in (OverlayState.FOCUSLOST, OverlayState.HIDDEN, OverlayState.RECORDING), (
+                f"Expected focuslost/hidden/recording, got {state.value}"
+            )
+            # 最终必须走到完成态（FOCUSLOST 预览或 HIDDEN）
+            assert _wait_for_overlay_state(
+                OverlayState.HIDDEN, timeout=20.0
+            ) or _wait_for_overlay_state(OverlayState.FOCUSLOST, timeout=5.0), (
+                "Overlay should reach focuslost preview or hide after stop"
             )
 
         finally:
