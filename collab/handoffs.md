@@ -2,6 +2,14 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-09-05 — tester-1 — TEST-EXEC-106 ✅ 阶段四（三层全绿 + A1~A4 消融 + 还原自证，生产/测试零改动）
+
+- **Step1**：root **1070P/0F/9I**（1065+5 逐位吻合）/ src-tauri 76P / vitest 89P，三层全绿。
+- **消融**：A1 centered_x 忽略 applied_w → G1/G2/G3 红（G5 也红 collateral）；A2 ratio 0.65 → G4 红；A3 overlay_geometry 内联旧公式 → G5 红（命中 2）；A4 Bug B 复原 → **A4-1 历史内联式 G5 红 / A4-minimal 保留调用式 5 条全绿** —— 与主控「一条都不红」预判相反，Bug B 语义本体无护栏可测，唯一真实验证仍是 Gavin 端测目视；建议下一轮把 Show 分支 x 来源抽成可测纯函数。
+- **还原自证**：`git diff --numstat src/main.rs` 空；全量重跑 root/src-tauri/vitest 全绿；无残留进程；config.toml sha 3186ec8c 未变。
+- **红线**：生产/测试零改动（最终 diff 空）/ 未出包（BUILD-107 取消）/ 未 commit / v0.9.0 未动 / 零凭证。
+- **详情**：outbox/tester-1/result.md + logs/20260905.md + CHANGELOG.md
+
 ## 2026-09-05 — tester-1 — TEST-SYNC-105 ✅ 阶段三（OVERLAY-101/102 五条护栏，待主控验收 + 阶段四 TEST-EXEC-106 首跑）
 
 - **交付**：`src/main.rs` +164/-0，单 hunk `:9360` 后新增 `#[cfg(all(test, target_os="windows"))] mod overlay_101_centering_guard_tests`，生产零改动（numstat 164/0）。
