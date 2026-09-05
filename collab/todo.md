@@ -23,12 +23,34 @@
 
 ### 🔴 下一轮任务全景（主控 2026-09-05 整理，Gavin 要求「新 bug + 之前未完成一起排」）
 
-#### 已派发（进行中，文件级零重叠）
+#### 已派发（进行中，文件级零重叠）—— 2026-09-05 21:xx 会话重启后重排
 
 | Worker | 任务 | 内容 |
 | --- | --- | --- |
-| coder-2 | **OVERLAY-101 + OVERLAY-102** | 两个宽度/位置缺陷 + 最大宽度 65%→50%。占 `src/main.rs` |
-| tester-1 | **E2E-GATE-103** | 4 条 full_pipeline 归因 + 修 `_no_hardware` 预存 bug + **加「ERROR>0 即门禁不通过」机器闸门**。占 `tests/**` + `build-test-guide.md` |
+| tester-1 | **TEST-SYNC-105**（阶段三） | OVERLAY-101/102 护栏（`centered_x` 单一居中源 + 0.50 常量 + Bug B 量化偏移 + G5 源码级单一源结构护栏）。占 `src/main.rs` **测试模块** |
+| coder-2 | **D2D-P2P3-PLAN-108** | D2D 剩余五态迁移**方案设计文档**（DEC-057 备料，🔴 零代码改动）。占 `collab/drafts/d2d-p2p3-plan.md` |
+
+**为什么 coder-2 这一单只出文档**：P2+P3 实施要动 `src/main.rs` 生产区，与 tester-1 的
+TEST-SYNC-105（同文件测试模块）冲突，五阶段禁止并行。先把方案做扎实，
+等阶段三/四/五走完，实施单 D2D-P2P3-IMPL-109 立刻可开工。
+
+#### 已完成（上一会话，均已 commit）
+
+| 任务 | commit | 状态 |
+| --- | --- | --- |
+| OVERLAY-101 + OVERLAY-102 | `4805039` | ✅ 已验收提交。**Bug B 已修、Bug A 未修**（机制未确立，待 `-debug` 日志） |
+| SECRET-104 手机号闸门误报 | `b072383` | ✅ 已验收提交 |
+
+#### 🔴 被中断、需重排的任务
+
+| 任务 | 状态 |
+| --- | --- |
+| **E2E-GATE-103**（tester-1） | **零产出被打断**（`tests/` 无提交、工作区干净）。真因不是终端卡死，是 tester-1 模型档余额耗尽（`Insufficient balance` / OpenCode Zen）＝ `[WORKER-RESTART-MODEL-RESET-001]` 复发。已切档 GLM-5.3-Flash (2x usage) OpenCode Go 并重注入上下文。**排在 BUILD-107 出包之后**（它占 `tests/**`，与本轮 `src/main.rs` 无冲突，但 tester-1 一次只做一单） |
+
+#### 后续顺位（本轮）
+
+`TEST-SYNC-105` → `TEST-EXEC-106`（阶段四全量回归）→ `BUILD-107`（阶段五出包，
+给 Gavin 验 Bug B + 抓 Bug A 的 `-debug` 日志）→ `E2E-GATE-103` → `D2D-P2P3-IMPL-109`
 
 ##### OVERLAY-101 —— Gavin 原话与主控静态取证
 

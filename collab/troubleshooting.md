@@ -3762,6 +3762,25 @@ Gavin 从一开始说的就是**字体**（「字体显示得很圆润」「字�
 `/models` 必须在**输入框为空**时发。上一次没清空，`/models` 被追加到残留的
 角色上下文末尾，整段作为普通消息提交了出去。
 
+### 补充（2026-09-05 第二次复发，主控实操记录）
+
+**复发形态**：会话重启后 tester-1 停在 `Insufficient balance. Manage your billing here:
+opencode.ai/workspace/.../billing`，模型档 `DeepSeek V4 Flash · OpenCode Zen`。
+表现与 2026-08-18 一致：pane 看着活着，实则请求挂在失败重试里，永不响应。
+**Gavin 侧的观感是「终端卡死」——不是终端，是模型档。**
+主控判据：`capture-pane` 末几行有 billing/quota 字样即可定性，不用重启。
+
+**两个 `/models` 实操坑（上一版没记，这次踩到）**：
+
+1. 🔴 选择器打开后**不能一次性** `send-keys -l "GLM"` —— 整串会把选择器关掉、
+   文本落进普通输入框。**必须逐字符发送**（每字 sleep 0.4s）才进得了 Search 框。
+2. 判断高亮在哪一行**不能靠缩进猜**（pane 重叠渲染会让缩进错乱）。
+   用 `capture-pane -p -e` 看 ANSI 背景色，选中行是 `48;2;250;178;131`（橙底）。
+
+**选档**：切成与其它 Worker 同档的 `GLM-5.3-Flash (2x usage) · OpenCode Go`。
+注意同名条目有多个 provider（Zen / Go / Ollama Cloud），**Zen 就是余额耗尽的那个**，
+只看模型名会再切回死档。
+
 ## [WORKER-DOC-OVERWRITE-001] 🔴 Worker 写五文档时把整份文件覆盖掉（表头连同他人条目一起消失）【主控提交前必查 diff 有无删除行】
 
 **日期**：2026-08-18 ｜ **发现**：主控提交前 `git diff --stat` 看到**负增量** ｜ **责任**：tester-1（TEST-EXEC-056）
