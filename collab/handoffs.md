@@ -2,6 +2,15 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-09-06 — coder-1 — UIFIX-139 ✅ 补 `--system-text-disabled` 令牌（G2 抓到的缺陷闭环，待主控验收）
+
+- **改动**：`styles.css` +4 行（`--system-text-disabled: rgba(0,0,0,0.3614)` + 取值注释）+ `design-tokens.test.ts` G2 白名单删 1 条（`--value` 保留）。未 commit。
+- **缺陷**：styles.css:1356 词库「添加」按钮禁用态文字引用未定义令牌 → 计算值无效回落继承色（禁用态与正常态同色，浏览器不报错）——UITEST-137 G2 首跑抓到的两个真实隐患之一。
+- **取值**：WinUI Light TextFillColorDisabled 口径（主控已定）。复核：`.btn-primary:disabled` 现行 tertiary+opacity 不可直接搬（opacity 视觉叠加）、rgba 与 fill/border 族一致，无更优解。
+- **验证**：test 97P 不变（零新增用例）；反向自证：删定义 → G2 红在 :1356 → 还原复绿。
+- **🔴 build 门禁被外部阻塞**：tester-1 在途 `src/test/browser/visual-style.test.tsx`（UITEST-138）TS6133 使 `npm run build` 红；`npx tsc --noEmit` 证实唯一报错在该文件、本单零错误。红线禁碰其文件，已报备主控，待 tester-1 修复后自然恢复。
+- **详情**：outbox/coder-1/result.md + logs/20260906.md + CHANGELOG.md
+
 ## 2026-09-06 — coder-1 — UITEST-137 ✅ 第一阶段设计令牌合规护栏（G1/G2/G3 + 3 条行为示范，清理 3 处分叉，待主控验收）
 
 - **产出**：`ui/src/test/design-tokens.test.ts`（新增，8 用例）+ `About.tsx`/`Llm.tsx` 3 处字面量换令牌（精确等值，行号零漂移）。pages 业务逻辑零触碰，未 commit。

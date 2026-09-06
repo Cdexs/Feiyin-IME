@@ -121,14 +121,10 @@ function collectTokenDefinitions(): Set<string> {
 // G2 基线白名单：被引用但未定义、且**带 fallback**的令牌（运行时不会裸失效）。
 // 每条写明为什么暂不定义为令牌；清掉一条删一条。不带 fallback 的裸引用 = 直接红。
 const ALLOWED_UNDEFINED: Record<string, string> = {
-  // styles.css:933 range 滑杆进度值：var(--value, 50%)，值由使用方内联注入。
+  // styles.css:937 range 滑杆进度值：var(--value, 50%)，值由使用方内联注入。
   // 当前仓库里 input[type="range"] 无任何 tsx 使用方（选择器是死 CSS），
   // 所以没有注入点 —— 定义一个没人写的 --value 反而制造僵尸令牌。待滑杆真正接入时再定。
   '--value': '带 fallback(50%)，进度值由使用方注入，当前无使用方',
-  // styles.css:1352 wordbook-add-inline.disabled 的文字色。未定义 → color 在计算值阶段
-  // 无效、回落继承色。补一个定义会**改变现有渲染**（继承色 → 新令牌色），
-  // 在设计侧定值之前不补（「拿不准不动」同理）。
-  '--system-text-disabled': '待定义：需设计侧定值，当前回落继承色',
 };
 
 describe('G2 · 令牌完整性（UITEST-137）', () => {

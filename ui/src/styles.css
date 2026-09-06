@@ -14,6 +14,10 @@
   --system-text-primary: #1a1a1a;
   --system-text-secondary: #616161;
   --system-text-tertiary: #9d9d9d;
+  /* UIFIX-139：禁用态文字（WinUI Light TextFillColorDisabled 口径）。
+     此前 :1356 处引用未定义 → 计算值无效回落继承色（禁用态与正常态同色的视觉缺陷）。
+     用 rgba 与 fill/border 族约定一致；半透明在 Mica 背景上更自然。 */
+  --system-text-disabled: rgba(0, 0, 0, 0.3614);
   --system-border: rgba(0, 0, 0, 0.0578);
   --system-border-strong: rgba(0, 0, 0, 0.1176);
   --system-fill-rest: rgba(0, 0, 0, 0.0353);
