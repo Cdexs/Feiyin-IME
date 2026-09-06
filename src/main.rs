@@ -9186,6 +9186,11 @@ mod overlay_043_interpolate_tests {
     /// OVERLAY-043 时代的四格表（stopped × editing）在 R1 落地后收敛为两格：
     /// editing 豁免删除——豁免路径（Show → destroy_edit_control）从未实现同步意图，
     /// 是编辑态闪烁根因；生产不变量 editing ⇒ stopped（EditRequested 相邻置位）。
+    /// 🔴 本测试是 should_ignore_streaming_text **行为断言的唯一权威份**（主控 2026-09-06
+    /// 裁定，不设副本）。它与 flicker_130_guard_tests::f2_single_call_site_and_single_param_signature
+    /// （签名/调用点唯一性）**成对**：函数改回双参语义时签名一变 F2 红、行为一错本测试红；
+    /// 删任一条另一条即失效。
+    /// 🔴 阶段四消融验证：把函数改回双参 `(stopped: bool, editing: bool)` → F2 必须红。
     #[test]
     fn ignore_streaming_text_truth_table() {
         // (false)：正常录音出字 → 不忽略
@@ -10982,4 +10987,212 @@ mod nospeech_122_guard_tests {
             "H8: NoSpeech 分支必须把 tray 复位到 Idle（防卡「处理中」）"
         );
     }
+}
+
+// ==================== FLICKER-130 (R1) 护栏 ====================
+//
+// FLICKER-130 (commit 80ce51f): should_ignore_streaming_text 由
+// (stopped, editing) -> stopped && !editing 收敛为单参 (stopped) -> stopped：
+// 松手后到达的迟到流式包一律丢弃，编辑态不再豁免。
+//
+// 为什么这么改：OVERLAY-043 的 editing 豁免唯一路径 Show(StreamingEditing) 会无条件
+// destroy_edit_control(:1298)，而 create_edit_control 唯一调用点在 EnterEditMode(:1475)
+// —— Show 只销毁不重建，意图的「编辑态继续同步 EDIT 文字」从未实现，豁免的唯一可观测
+// 效果就是销毁编辑框 = Gavin 报的「窗口和文字闪烁」。
+//
+// 四条护栏守的是三个不变量：
+//   F1 门闩仅抑制渲染、不抑制数据（镜像写入必须先于门闩，且同处 process_controller_events）
+//   F2 调用点唯一性（防复活 editing 维度 / 加旁路调用）—— 与 F4 成对，缺一废一
+//   F3 editing ⇒ stopped 不变量（(false,true) 组合不可达的前提）
+//   F4 行为真值表（函数本体）—— 与 F2 成对，缺一废一
+#[cfg(all(test, target_os = "windows"))]
+mod flicker_130_guard_tests {
+    /// 读取 src/main.rs 生产区（首个 #[cfg(test)] 之前）。
+    fn main_prod_lines() -> Vec<String> {
+        let mut out = Vec::new();
+        for line in include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).lines() {
+            let t = line.trim();
+            if t.starts_with("#[cfg(test)]") {
+                break;
+            }
+            out.push(t.to_string());
+        }
+        out
+    }
+
+    fn find_line(lines: &[String], needle: &str) -> Option<usize> {
+        lines.iter().position(|l| l.starts_with(needle))
+    }
+
+    fn norm_line(line: &str) -> String {
+        line.trim().replace("platform::", "")
+    }
+
+    fn brace_delta(line: &str) -> i32 {
+        line.matches('{').count() as i32 - line.matches('}').count() as i32
+    }
+
+    /// 花括号定界：以 anchor 行（可为多行签名锚点，行无 `{` 时前扫首个开括号）为起点，
+    /// 返回 (open_idx, close_idx) —— 函数/块体的首行与闭合行（0-based 行号）。
+    /// 找不到闭合（未配对）返回 None。
+    fn block_bounds(lines: &[String], anchor: usize) -> Option<(usize, usize)> {
+        let mut depth = 0i32;
+        let mut opened = false;
+        let mut open_idx = usize::MAX;
+        for (i, line) in lines.iter().enumerate().skip(anchor) {
+            let norm = norm_line(line);
+            depth += brace_delta(&norm);
+            if depth > 0 && !opened {
+                opened = true;
+                open_idx = i;
+            }
+            if opened && depth == 0 {
+                return Some((open_idx, i));
+            }
+        }
+        None
+    }
+
+    /// 花括号定界块内是否存在一行 startswith(needle)。
+    fn block_contains(lines: &[String], anchor: usize, needle: &str) -> bool {
+        block_bounds(lines, anchor)
+            .map(|(lo, hi)| {
+                lines[lo..=hi]
+                    .iter()
+                    .any(|l| norm_line(l).starts_with(needle))
+            })
+            .unwrap_or(false)
+    }
+
+    /// 花括号定界块内，某 needle 首现的 0-based 行号；不在块内返回 None。
+    fn block_line_of(lines: &[String], anchor: usize, needle: &str) -> Option<usize> {
+        block_bounds(lines, anchor)
+            .and_then(|(lo, hi)| (lo..=hi).find(|&i| norm_line(&lines[i]).starts_with(needle)))
+    }
+
+    fn count_startswith(lines: &[String], needle: &str) -> usize {
+        lines.iter().filter(|l| l.starts_with(needle)).count()
+    }
+
+    /// F1 🔴最重要：门闩仅抑制渲染、不抑制数据。
+    ///
+    /// WORDBOOK-053-B 的镜像写入 `*mirror = Some(text.clone())` 必须在门闩
+    /// `if should_ignore_streaming_text(stopped)` 调用**之前**，且两者同处
+    /// `process_controller_events` 函数体内。若有人把门闩挪到镜像之前 =
+    /// 变成数据抑制 = 被截断的 raw 会学出伪修正。
+    ///
+    /// 消融：① 把镜像行与门闩行对调 → 红；② 把门闩整体挪出 process_controller_events
+    /// （行号先后可能仍满足，但函数归属被破坏）→ 红。
+    ///
+    /// 🔴 判别力边界：锚点钉死在 `*mirror = Some(text.clone())` 形态上，若有人把它
+    /// 重构成 `to_string()` 等其它赋值形态会**误红** —— 这是有意的：重构触红会逼人
+    /// 来看一眼并同步更新护栏，护栏因重构而红是好事。
+    #[test]
+    fn f1_mirror_before_gate_within_process_controller_events() {
+        let lines = main_prod_lines();
+        // process_controller_events 多行签名锚点（:5138）
+        let fn_anchor = find_line(&lines, concat!("fn process_controller_events", "("))
+            .expect("F1 anchor: process_controller_events 函数签名");
+        let (lo, hi) = block_bounds(&lines, fn_anchor)
+            .expect("F1: process_controller_events 函数体必须能定位（花括号配对）");
+        let mirror = block_line_of(
+            &lines,
+            fn_anchor,
+            concat!("*mirror = Some(text.", "clone())"),
+        );
+        let gate = block_line_of(
+            &lines,
+            fn_anchor,
+            concat!("if should_ignore_streaming_text(", "stopped)"),
+        );
+        assert!(
+            mirror.is_some() && gate.is_some(),
+            "F1: 镜像写入与门闩调用必须都在 process_controller_events 函数体内（{}-{}）",
+            lo + 1,
+            hi + 1
+        );
+        assert!(
+            mirror.unwrap() < gate.unwrap(),
+            "F1: 镜像写入行（L{}）必须早于门闩调用行（L{}）—— 门闩在前=数据抑制，WORDBOOK-053-B 会学到被截断的 raw",
+            mirror.unwrap() + 1,
+            gate.unwrap() + 1
+        );
+    }
+
+    /// F2 调用点唯一性：生产区 `if should_ignore_streaming_text(stopped)` 调用恰 1 处，
+    /// 单参签名定义恰 1 处，双参签名 0 处。
+    ///
+    /// 防：恢复双参签名（= 复活 editing 维度）或新增旁路调用。
+    /// 🔴 与 F4 成对：F2 守「没人绕过函数自己写判断」，F4 守「函数本体行为正确」。
+    /// 缺 F2：别人在调用点用 `stopped && !editing` 内联，F4 全绿但闪烁回归。
+    /// 缺 F4：函数体被改回双参语义但签名仍是单参（外部形态对、行为错），F2 全绿但闪烁回归。
+    ///
+    /// 消融：① 加第二调用点 → 红；② 改回双参签名 `(stopped: bool, editing: bool)` → 红。
+    #[test]
+    fn f2_single_call_site_and_single_param_signature() {
+        let lines = main_prod_lines();
+        let call_sites = count_startswith(
+            &lines,
+            concat!("if should_ignore_streaming_text(", "stopped)"),
+        );
+        let single_sig = count_startswith(
+            &lines,
+            concat!("fn should_ignore_streaming_text(", "stopped: bool) -> bool"),
+        );
+        let dual_sig = count_startswith(
+            &lines,
+            concat!(
+                "fn should_ignore_streaming_text(",
+                "stopped: bool, editing: bool)"
+            ),
+        );
+        assert_eq!(
+            call_sites, 1,
+            "F2: should_ignore_streaming_text 调用必须恰 1 处（实测 {}），新增旁路调用=复活闪烁路径",
+            call_sites
+        );
+        assert_eq!(
+            single_sig, 1,
+            "F2: 单参签名 fn should_ignore_streaming_text(stopped: bool) 定义必须恰 1 处"
+        );
+        assert_eq!(
+            dual_sig, 0,
+            "F2: 双参签名（stopped, editing）不得出现 —— editing 维度已收敛，出现=复活豁免"
+        );
+    }
+
+    /// F3 `editing ⇒ stopped` 不变量：EditRequested 臂内 OVERLAY_EDITING.store(true)
+    /// 与 STREAMING_STOPPED.store(true) 共现于同一 match 臂（花括号定界）。
+    ///
+    /// 这是 `(false,true)` 组合不可达的前提（主控独立验证：OVERLAY_EDITING.store(true)
+    /// 全库仅 :5531 一处，同臂 :5536 紧跟 STREAMING_STOPPED.store(true)，同线程）。
+    /// 破坏它 = 复活「编辑中流式继续推」路径 = 复活闪烁。
+    ///
+    /// 🔴 不写「else if editing 运行时行为」断言 —— 该分支已成不可达死分支，对不可达
+    /// 路径写断言 = 永远绿的假护栏。F3 守的是「让它保持不可达」的不变量，才有判别力。
+    ///
+    /// 消融：把 STREAMING_STOPPED.store(true) 那行移出 EditRequested 臂 → 红。
+    #[test]
+    fn f3_edit_requested_arm_sets_editing_and_stopped_together() {
+        let lines = main_prod_lines();
+        let anchor = find_line(&lines, concat!("OverlayUiEvent::EditRequested", " => {"))
+            .expect("F3 anchor: EditRequested match 臂");
+        let has_editing_store =
+            block_contains(&lines, anchor, concat!("OVERLAY_EDITING.store(", "true"));
+        let has_stopped_store =
+            block_contains(&lines, anchor, concat!("STREAMING_STOPPED.store(", "true"));
+        assert!(
+            has_editing_store && has_stopped_store,
+            "F3: EditRequested 臂必须同时置 OVERLAY_EDITING.store(true) 与 STREAMING_STOPPED.store(true)—— editing⇒stopped 不变量，破坏=复活 (false,true) 不可达组合=复活闪烁"
+        );
+    }
+
+    // F4 行为真值表**有意不在此重复**：should_ignore_streaming_text 的行为断言唯一
+    // 权威份在 overlay_043_interpolate_tests::ignore_streaming_text_truth_table
+    // (main.rs:9190)。本模块 F2 守签名/调用点唯一性，与 :9190 成对 —— 函数改回双参
+    // 语义时签名一变 F2 红、行为一错 :9190 红，删任一条另一条即失效。不要在这里
+    // 再加行为断言副本（主控 2026-09-06 裁定：逐字相同的断言让两条同时红，零增量信息）。
+    //
+    // 🔴 阶段四消融验证（主控指定）：把函数改回双参 `(stopped: bool, editing: bool)`
+    // → **F2 必须红**。若实测不红，说明主控以 F2 替代 F4 的推断错误，须回报重开 F4。
 }

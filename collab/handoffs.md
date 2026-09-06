@@ -178,3 +178,13 @@
 - **运行时数据零覆盖**：config.toml sha `3186ec8c` 未变；version_check.json 由冒烟启动程序自写（非 Step4 覆盖）。
 - **红线**：未 commit / v0.9.0 未动 / 未用 cargo tauri build / 未 cargo clean / 零凭证 /
   热键与浮层端测交回 Gavin（端测清单在 result.md）。
+
+## 2026-09-06 — tester-1 — TEST-SYNC-131 ✅ 阶段三（FLICKER-130 门闩收敛护栏 F1-F3 + F4 唯一权威份安排，待主控验收 + 阶段四）
+
+- **交付**：main.rs +213/-0（hunk1 :9186 +5 doc 注释交叉引用；hunk2 :10988 mod flicker_130_guard_tests +208），生产区零改动。
+- **F1** 镜像(L5381)早于门闩(L5389)且同处 process_controller_events 函数体（block_bounds 花括号定界）；clone 锚点重构误红=有意。
+- **F2** 调用点恰1 + 单参签名恰1 + 双参0。
+- **F3** EditRequested 臂双 store 共现（editing⇒stopped 不变量）；不写不可达分支断言。
+- **F4 主控裁定落实**：删 F4 副本、:9190 加唯一权威份交叉引用、flicker 模块留指向注释；阶段四消融验证「函数改回双参→F2 必须红」。
+- **验证**：fmt 0 / check --all-targets 0 error / warnings 111/102 持平 / 沙箱预演 F1-F3 PASS + 消融 A-D 全 RED-OK。
+- **红线**：未 commit / v0.9.0 未动 / 未出包 / 未跑 cargo test / 零凭证 / 无临时文件。
