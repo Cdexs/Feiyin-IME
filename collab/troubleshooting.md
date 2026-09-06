@@ -4668,3 +4668,56 @@ git -c core.safecrlf=false diff --numstat
    `scripts/git-hooks/**`，其余跟踪文件工作区是 LF、新 clone 会被检出成 CRLF。
    主控 2026-09-05 沙盒实测：**新 clone 的钩子脚本确实仍是 LF（该修复有效）**，
    但其它文件未覆盖。是否补 `* text=auto eol=lf` 待 Gavin 定夺，已记 todo「卫生债」。
+
+## [WORKER-GIT-AUTOCRLF-ENV-DIFF-001] ⚠️ 同一工作区，主控看 clean 而 Worker 看 44 个文件 M —— 是两侧 git 读到的 gitconfig 不同【Worker 首次接手必读】
+
+**发现**：2026-09-06，主控 session 重启后核对现场，`git status --short` 只有 4 行（都是主控刚写的文档）；
+同一时刻 coder-1 在同一个工作区报 **44 行 M**。
+
+**主控第一反应是错的**：判为 `[SAFECRLF-WARNING-MISREAD-001]` 复现（把 `LF will be replaced by CRLF`
+警告行当成改动文件计数），并据此给 coder-1 发了更正。**coder-1 反驳并给出实证，主控复核后收回归因。**
+
+### 真实机制
+
+| 侧 | `core.autocrlf` | 比对结果 |
+| --- | --- | --- |
+| 主控（原生 Windows git） | **true**，来自 `C:/Program Files/Git/etc/gitconfig` + `C:/msys64/home/Aaron-GMK/.gitconfig` | 读工作区时归一化 CRLF→LF 再与索引比 ⇒ **clean** |
+| coder-1（MSYS 环境，`HOME=/home/Aaron-GMK`） | 读不到上述两份配置，**未设** | 原始字节比对 ⇒ **44 文件全 M** |
+
+工作区文件**确实是 CRLF**、索引**确实是 LF**，这一点两侧一致，主控独立取证：
+
+```bash
+grep -c $'\r' src/main.rs   # 10972
+wc -l < src/main.rs         # 10972   ← 每一行都带 CR ⇒ 工作区为 CRLF
+```
+
+🔴 **注意 `git ls-files --eol` 会误导**：主控侧它报 `i/lf w/lf`（看起来工作区是 LF），
+但那是**应用 autocrlf 归一化之后**的视图。**判工作区真实换行必须数 CR 字节，不要信 `--eol` 的 w/ 列。**
+
+### 连带结论：`SECRET-105` 报的「47 文件 EOL 漂移」不是缺陷
+
+coder-1 在 SECRET-105、SECRET-104 两次报备的「工作区 47/44 文件整文件 CRLF/LF 翻转，
+非本单造成，建议另立单」，根因就是本条 —— **Windows 上 `autocrlf=true` 的正常工作方式，
+不是漂移、不需要修**。todo.md 中该待办已改判为非问题，不再立单。
+
+### 处置（Worker 首次接手本工作区时自查）
+
+```bash
+git config --show-origin --get-all core.autocrlf   # 期望能看到 true
+# 看不到就自己配（只改自己的全局配置，不动仓库配置）：
+git config --global core.autocrlf true
+```
+
+配完 `git status --short` 应为 0 行。**配置前不要把满屏 M 当成「有人改了代码」上报，
+更不要动手清理** —— worker-guide §十二 的 git 破坏性命令禁令在这种场景下就是最后一道保险。
+
+### 与 `[SAFECRLF-WARNING-MISREAD-001]` 的区别（别再混淆）
+
+| | 那一条 | 本条 |
+| --- | --- | --- |
+| 数的是什么 | `LF will be replaced by CRLF` **警告行** | `git status --short` **真实 M 行** |
+| 是否真有差异 | 没有，纯误读 | **有**，只是被主控侧的 autocrlf 归一化掩盖了 |
+| 怎么区分 | 看你数的是 stderr 警告还是 stdout 状态行 | 同左 |
+
+**给主控的教训**：看到「Worker 报的数字和我不一样」，不要先套已有条目归因 ——
+先要对方给出**它那一侧的原始命令与输出**。本次是 Worker 顶回来才没把错误归因写进文档。

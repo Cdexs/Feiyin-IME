@@ -26,7 +26,7 @@
 | 1 | **编辑态闪烁修法二选一**：R1（推荐，迟到包直接丢弃，`should_ignore_streaming_text` 改 `stopped`）／ R2（Show 对 StreamingEditing 走 WM_SETTEXT 同步 + 冻结宽度）。R2 与 OVERLAY-121 per-pixel alpha 有前置耦合（UpdateLayeredWindow 下子控件不可渲染） | INVESTIGATE-120 |
 | 2 | **学习信号缺口**：走 overlay 编辑（路径 A）之后、用户在目标应用里继续改这一段没人学 —— 已由 DEC-058 拍板「只覆盖应用内编辑」，**本项已闭环，无需再问** | BUILD-118 端测第 4 项 |
 | 3 | `draw_editing_overlay_chrome` 死代码（main.rs:2809，编译器实证 never used）是否删 | 历史待办 |
-| 4 | 工作区 EOL 漂移（47 文件 worktree CRLF vs index LF）是否立单 | SECRET-105 报备 |
+| ~~4~~ | ~~工作区 EOL 漂移是否立单~~ → 🟢 **2026-09-06 已闭环，改判非问题**：根因是 Worker 侧 MSYS git 读不到 `core.autocrlf=true`，主控侧归一化后 clean。工作区 CRLF/索引 LF 是 Windows `autocrlf=true` 的正常工作方式。备案 `[WORKER-GIT-AUTOCRLF-ENV-DIFF-001]` | SECRET-105 报备 |
 
 ### 本轮 Worker 占用（文件级零重叠）
 
@@ -110,7 +110,7 @@
 | `REFACTOR-113` | 抽 Show 分支 x 来源决策为可测纯函数 + 补护栏 | 🔴 **立项前提与 HOTKEY-115 教训(六) 冲突** —— 后者结论是「调用点状态机抽纯函数=假护栏」。方案要么改走结构护栏，要么取消，端测后拍板 |
 | per-pixel alpha | DEC-056 ③，前置「八态全迁完」已达成 | 等端测确认 D2D 方向 |
 | `draw_editing_overlay_chrome` 死代码 | `main.rs:2809`，编译器 `never used` 实证、无调用方 | 待 Gavin 定夺是否删 |
-| 工作区 EOL 漂移 | 47 文件 worktree CRLF vs index LF（coder-1 在 SECRET-105 报备，非其造成） | 待立单 |
+| ~~工作区 EOL 漂移~~ | 🟢 **已闭环，非问题**（2026-09-06）：Worker/主控 gitconfig 环境差，非真漂移，不立单。见 troubleshooting `[WORKER-GIT-AUTOCRLF-ENV-DIFF-001]` | ~~待立单~~ 已关闭 |
 | 钩子 auto-repeat 去抖 | 115-B 已用 `KEY_PHYSICALLY_DOWN` 结构性抑制，**原「另立单」诉求大概率已消解**，端测第 2 项确认后即可关闭 | 等端测 |
 
 ### 本轮 Worker 占用（文件级零重叠）
