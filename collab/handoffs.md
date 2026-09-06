@@ -207,3 +207,14 @@
 - **A1-A4 跳过**（阶段三沙箱已证 RED）。
 - **还原**：git diff 空 / config sha 3186ec8c / 无残留进程 / fmt 0。
 - **红线**：未 commit / v0.9.0 未动 / 未出包 / 零凭证 / 无临时文件。
+
+## 2026-09-06 — tester-1 — TEST-SYNC-134 ✅ 阶段三（OVERLAY-121 护栏：H7 换血 + G2-G7，待主控验收 + 阶段四）
+
+- **交付**：main.rs +284/-27（H7 换血 -37/+24 + 新模块 overlay_121_guard_tests +273），生产区零改动。
+- **H7 换血**：旧快照（Some16×1/Some10×3/None×6）判据基础没了，换 G1 结构护栏（掩码归零），留退役说明。
+- **G2-G7**：ULW 单点 / fixup 单点+同块（rposition 反向定位 if use_ulw）/ SLWA 条件化 /
+  切换隐藏区间（EnterEditMode+Show 双处，同块+行序）/ fixup 三分支 / DIB 32bpp+负高。
+- **预演发现并修正 3 处护栏 bug**：G4/G5 needle 缺 let _ = 前缀（会永久红）；G3 find_line 误锚
+  首个 if use_ulw（改 rposition）。已修并通过预演。
+- **验证**：fmt 0 / check 0 error / warnings 111/102 持平 / 沙箱 G1-G7 PASS + 消融 7/7 RED。
+- **红线**：未 commit / v0.9.0 未动 / 未出包 / 未跑 cargo test / 零凭证 / 无临时文件。

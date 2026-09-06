@@ -11127,37 +11127,24 @@ mod nospeech_122_guard_tests {
         );
     }
 
-    /// H7: 🔴 圆角回归护栏 —— apply_overlay_window_region 调用点的圆角参数快照：
-    /// Some(16) 恰 1 处、Some(10) 恰 3 处、None 恰 6 处。
-    /// OVERLAY-121 per-pixel alpha 会**有意**改这些值，届时护栏红是预期的、要主动更新；
-    /// 但在那之前任何改动都是回归。
-    /// 消融路径：任一值被改（如某 Some(10)→Some(12)）→ 计数变化 → 本测试红。
+    /// G1 (OVERLAY-121 H7 换血): 二值圆角掩码 `apply_overlay_window_region` 已退役。
+    ///
+    /// OVERLAY-121 (634f016) 八态改走 UpdateLayeredWindow 逐像素 alpha，圆角由 D2D
+    /// 几何抗锯齿绘制，`apply_overlay_window_region` 函数与全部 10 个调用点退役。
+    /// 本护栏由旧 H7 的快照式（Some(16)×1/Some(10)×3/None×6）改为**结构式**：
+    /// 生产区出现该函数或任何调用 = 二值掩码复活 = 圆角硬阶梯回归。
+    ///
+    /// 消融：生产区任意处写回一个 `apply_overlay_window_region(` 调用（或恢复函数定义）
+    /// → 本测试红。
+    /// 判别力边界：只扫生产区（首个 #[cfg(test)] 之前），测试区内若有人引用该名不计数。
     #[test]
     fn h7_overlay_corner_radius_snapshot() {
         let lines = main_prod_lines();
-        let n16 = count_startswith(
-            &lines,
-            concat!("apply_overlay_window_region(hwnd, rect, Some(1", "6),"),
-        );
-        let n10 = count_startswith(
-            &lines,
-            concat!("apply_overlay_window_region(hwnd, rect, Some(1", "0),"),
-        );
-        let nnone = count_startswith(
-            &lines,
-            concat!("apply_overlay_window_region(hwnd, rect, None", ","),
-        );
+        let n = count_startswith(&lines, concat!("apply_overlay_window_region(", ""));
         assert_eq!(
-            n16, 1,
-            "H7: apply_overlay_window_region Some(16) 圆角调用点必须恰 1 处"
-        );
-        assert_eq!(
-            n10, 3,
-            "H7: apply_overlay_window_region Some(10) 圆角调用点必须恰 3 处"
-        );
-        assert_eq!(
-            nnone, 6,
-            "H7: apply_overlay_window_region None 圆角调用点必须恰 6 处"
+            n, 0,
+            "G1: apply_overlay_window_region 必须 0 处（OVERLAY-121 掩码退役），实测 {} 处——二值掩码复活=圆角硬阶梯回归",
+            n
         );
     }
 
@@ -11391,4 +11378,274 @@ mod flicker_130_guard_tests {
     //
     // 🔴 阶段四消融验证（主控指定）：把函数改回双参 `(stopped: bool, editing: bool)`
     // → **F2 必须红**。若实测不红，说明主控以 F2 替代 F4 的推断错误，须回报重开 F4。
+}
+
+// ==================== OVERLAY-121 (per-pixel alpha) 护栏 ====================
+//
+// OVERLAY-121 (634f016): 八态改走 UpdateLayeredWindow 逐像素 alpha，
+// apply_overlay_window_region 二值掩码（函数 + 10 调用点）全部退役，
+// 圆角改由 D2D 几何抗锯齿绘制。G1 已在 nospeech_122_guard_tests::h7
+// 换血实现（掩码归零）。G2-G7 守新架构的不变量：
+//   G2 ULW 提交单点（防多提交点 / 改回 BitBlt 直出）
+//   G3 fixup 单点 + 紧邻 ULW（防 alpha 烘焙被绕过）
+//   G4 SLWA 条件化（防 ULW 窗口被切回均一 alpha = 必闪）
+//   G5 模式切换在隐藏区间（防 redirection 表面重建闪烁可见）
+//   G6 fixup 三分支完整（防 GDI fallback 帧整体消失）
+//   G7 DIB 32bpp + 负高（防 BindDC 1:1 映射破坏 = 上下翻转）
+#[cfg(all(test, target_os = "windows"))]
+mod overlay_121_guard_tests {
+    /// 读取 src/main.rs 生产区（首个 #[cfg(test)] 之前）。
+    fn main_prod_lines() -> Vec<String> {
+        let mut out = Vec::new();
+        for line in include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).lines() {
+            let t = line.trim();
+            if t.starts_with("#[cfg(test)]") {
+                break;
+            }
+            out.push(t.to_string());
+        }
+        out
+    }
+
+    fn find_line(lines: &[String], needle: &str) -> Option<usize> {
+        lines.iter().position(|l| l.starts_with(needle))
+    }
+
+    fn norm_line(line: &str) -> String {
+        line.trim().replace("platform::", "")
+    }
+
+    fn brace_delta(line: &str) -> i32 {
+        line.matches('{').count() as i32 - line.matches('}').count() as i32
+    }
+
+    /// 花括号定界：以 anchor 行（可为多行签名锚点）为起点，返回 (open_idx, close_idx)。
+    fn block_bounds(lines: &[String], anchor: usize) -> Option<(usize, usize)> {
+        let mut depth = 0i32;
+        let mut opened = false;
+        let mut open_idx = usize::MAX;
+        for (i, line) in lines.iter().enumerate().skip(anchor) {
+            let norm = norm_line(line);
+            depth += brace_delta(&norm);
+            if depth > 0 && !opened {
+                opened = true;
+                open_idx = i;
+            }
+            if opened && depth == 0 {
+                return Some((open_idx, i));
+            }
+        }
+        None
+    }
+
+    /// 花括号定界块内是否存在一行 startswith(needle)。
+    fn block_contains(lines: &[String], anchor: usize, needle: &str) -> bool {
+        block_bounds(lines, anchor)
+            .map(|(lo, hi)| {
+                lines[lo..=hi]
+                    .iter()
+                    .any(|l| norm_line(l).starts_with(needle))
+            })
+            .unwrap_or(false)
+    }
+
+    /// 花括号定界块内，某 needle 首现的 0-based 行号；不在块内返回 None。
+    fn block_line_of(lines: &[String], anchor: usize, needle: &str) -> Option<usize> {
+        block_bounds(lines, anchor)
+            .and_then(|(lo, hi)| (lo..=hi).find(|&i| norm_line(&lines[i]).starts_with(needle)))
+    }
+
+    fn count_startswith(lines: &[String], needle: &str) -> usize {
+        lines.iter().filter(|l| l.starts_with(needle)).count()
+    }
+
+    /// G2: ULW 提交单点。生产区真实调用 UpdateLayeredWindow( 恰 1 处。
+    ///
+    /// OVERLAY-121 的逐像素 alpha 通过 WM_PAINT 内 `let _ = UpdateLayeredWindow(...)`
+    /// 单点提交。import 行与注释里的该词不算 —— 只数真实调用形态。
+    /// 防：新增第二提交点（多提交点互相覆盖），或改回 BitBlt 直出（丢失 per-pixel alpha）。
+    ///
+    /// 消融：新增第二处提交调用 → 计数变 2 → 红；删掉该调用改回 BitBlt → 计数 0 → 红。
+    #[test]
+    fn g2_ulw_submit_single_site() {
+        let lines = main_prod_lines();
+        let n = count_startswith(&lines, concat!("let _ = UpdateLayeredWindow(", ""));
+        assert_eq!(
+            n, 1,
+            "G2: UpdateLayeredWindow 真实提交必须恰 1 处（WM_PAINT 单点），实测 {} 处",
+            n
+        );
+    }
+
+    /// G3: alpha fixup 单点 + 紧邻 ULW 提交（同块）。
+    ///
+    /// apply_alpha_fixup 负责把逐像素 alpha（含 GDI fallback 提亮）烘焙进 DIB，
+    /// 必须恰 1 处定义、恰 1 处调用，且调用与 ULW 提交同处 if use_ulw 块。
+    ///
+    /// 消融：删调用 → 计数 1→0 → 红；加第二调用点 → 计数变 2 → 红。
+    #[test]
+    fn g3_alpha_fixup_single_and_adjacent_to_ulw() {
+        let lines = main_prod_lines();
+        let defs = count_startswith(&lines, concat!("fn apply_alpha_fixup", "("));
+        assert_eq!(
+            defs, 1,
+            "G3: apply_alpha_fixup 定义必须恰 1 处（实测 {} 处）",
+            defs
+        );
+        let calls = count_startswith(&lines, concat!("apply_alpha_fixup(", ""));
+        assert_eq!(
+            calls, 1,
+            "G3: apply_alpha_fixup 调用必须恰 1 处（实测 {} 处）",
+            calls
+        );
+        // 🔴 定位 fixup/ULW 所在的那个 if use_ulw 块（生产区有 3 处 if use_ulw，
+        // 只有 :2136 那个含 ULW 提交；用 ULW 提交行反向找最近的 if use_ulw 块锚）。
+        let ulw_submit = find_line(&lines, concat!("let _ = UpdateLayeredWindow(", ""))
+            .expect("G3 anchor: ULW 提交行");
+        // 从 ULW 提交行向前找最近的 `if use_ulw {`（行号最大且小于 submit）
+        let ulw_anchor = lines[..ulw_submit]
+            .iter()
+            .rposition(|l| l.starts_with("if use_ulw"))
+            .expect("G3 anchor: fixup/ULW 所在的 if use_ulw 块");
+        let has_fixup = block_contains(&lines, ulw_anchor, concat!("apply_alpha_fixup(", ""));
+        let has_ulw = block_contains(
+            &lines,
+            ulw_anchor,
+            concat!("let _ = UpdateLayeredWindow(", ""),
+        );
+        assert!(
+            has_fixup && has_ulw,
+            "G3: apply_alpha_fixup 调用与 UpdateLayeredWindow 提交必须同处 if use_ulw 块（L{} 起的块）",
+            ulw_anchor + 1
+        );
+    }
+
+    /// G4: SLWA 条件化。Show 处理器内 SetLayeredWindowAttributes 必须处于
+    /// slwa_active 条件块内。
+    ///
+    /// 守的是「把 ULW 窗口切回均一 alpha，之后回 ULW 必须清/置 bit = 必闪」。
+    ///
+    /// 消融：把 SetLayeredWindowAttributes 改成无条件调用 → 本测试红。
+    /// 判别力边界：needle 绑 `let _ = SetLayeredWindowAttributes(` 当前调用形态；
+    /// 若有人改成裸调（无 let _）会漏，但该形态与项目风格不符，且 G2（ULW 单点）
+    /// 兜底。
+    #[test]
+    fn g4_slwa_conditional_inside_active_block() {
+        let lines = main_prod_lines();
+        let anchor = find_line(&lines, concat!("if slwa_active", " {"))
+            .expect("G4 anchor: if slwa_active 条件块");
+        assert!(
+            block_contains(
+                &lines,
+                anchor,
+                concat!("let _ = SetLayeredWindowAttributes", "("),
+            ),
+            "G4: SetLayeredWindowAttributes 必须处于 if slwa_active 条件块内"
+        );
+    }
+
+    /// G5: 模式切换发生在隐藏区间（EnterEditMode + Show 处理器两处）。
+    ///
+    /// 编辑态（SLWA）与其余七态（ULW）不能直切，须清/置 WS_EX_LAYERED 中转；
+    /// 该切换的 redirection 表面重建会闪，必须藏在窗口隐藏区间内：
+    /// 两处都要求 SW_HIDE 行号 < switch_overlay_layered_mode 行号且同块（花括号定界）。
+    ///
+    /// 消融：把 SW_HIDE 移到切换之后 / 移出该块 → 本测试红。
+    /// 判别力边界：needle 绑 `let _ = ShowWindow(hwnd, SW_HIDE)` 当前调用形态；
+    /// 若有人改成裸调会漏，但该形态与项目风格不符。
+    #[test]
+    fn g5_mode_switch_hidden_before_switch() {
+        let lines = main_prod_lines();
+        // ① EnterEditMode 臂
+        let edit_anchor = find_line(&lines, concat!("OverlayCommand::EnterEditMode", " => {"))
+            .expect("G5 anchor: EnterEditMode 臂");
+        let edit_hide = block_line_of(
+            &lines,
+            edit_anchor,
+            concat!("let _ = ShowWindow(hwnd, SW_HIDE)", ""),
+        );
+        let edit_switch = block_line_of(
+            &lines,
+            edit_anchor,
+            concat!("switch_overlay_layered_mode", "("),
+        );
+        assert!(
+            edit_hide.is_some() && edit_switch.is_some(),
+            "G5: EnterEditMode 臂必须同时有 SW_HIDE 与 switch_overlay_layered_mode，且同块"
+        );
+        assert!(
+            edit_hide.unwrap() < edit_switch.unwrap(),
+            "G5: EnterEditMode 内 SW_HIDE（L{}）必须早于 switch_overlay_layered_mode（L{}）",
+            edit_hide.unwrap() + 1,
+            edit_switch.unwrap() + 1
+        );
+        // ② Show 处理器切换块
+        let mode_if = find_line(
+            &lines,
+            concat!("if state.layered_mode != target_mode", " {"),
+        )
+        .or_else(|| {
+            lines
+                .iter()
+                .rposition(|l| l.starts_with("if state.layered_mode != target_mode"))
+        })
+        .expect("G5 anchor: layered_mode 切换条件块");
+        let show_hide = block_line_of(&lines, mode_if, concat!("ShowWindow(hwnd, SW_HIDE)", ""));
+        let show_switch =
+            block_line_of(&lines, mode_if, concat!("switch_overlay_layered_mode", "("));
+        assert!(
+            show_hide.is_some() && show_switch.is_some(),
+            "G5: Show 处理器切换块必须同时有 SW_HIDE 与 switch_overlay_layered_mode"
+        );
+        assert!(
+            show_hide.unwrap() < show_switch.unwrap(),
+            "G5: Show 处理器内 SW_HIDE（L{}）必须早于 switch_overlay_layered_mode（L{}）",
+            show_hide.unwrap() + 1,
+            show_switch.unwrap() + 1
+        );
+    }
+
+    /// G6: apply_alpha_fixup 三分支完整。
+    ///
+    /// 函数体内必须共现：
+    ///   1. GDI 提亮：`if a == 0 && (r | g | b) != 0` → 不透明化 + 预乘
+    ///   2. 预乘缩放：`else if a != 0` → 四通道按 opacity 缩放
+    ///   3. 全零跳过：a==0 && RGB==0 保持不动（if-else 的隐式 else）
+    /// 守的是「GDI fallback 帧整体消失」。
+    ///
+    /// 消融：删掉 GDI 提亮分支 → 本测试红。
+    #[test]
+    fn g6_fixup_three_branches_present() {
+        let lines = main_prod_lines();
+        let anchor = find_line(&lines, concat!("fn apply_alpha_fixup", "("))
+            .expect("G6 anchor: apply_alpha_fixup 函数");
+        let has_gdi_brighten =
+            block_contains(&lines, anchor, concat!("if a == 0 && (r | g | b) != 0", ""));
+        let has_premult_scale = block_contains(&lines, anchor, concat!("} else if a != 0", " {"));
+        assert!(
+            has_gdi_brighten && has_premult_scale,
+            "G6: apply_alpha_fixup 必须含 GDI 提亮分支与预乘缩放分支"
+        );
+    }
+
+    /// G7: DIB 32bpp + 负高。WM_PAINT 的 BITMAPINFOHEADER 必须 biBitCount: 32
+    /// 且 biHeight 为负（top-down）。
+    ///
+    /// 防：改回 bottom-up 正高 → BindDC 1:1 映射破坏 → 画面上下翻转。
+    ///
+    /// 消融：把 biHeight 改回正高 → 本测试红。
+    #[test]
+    fn g7_dib_32bpp_and_top_down() {
+        let lines = main_prod_lines();
+        let has_32bpp = lines
+            .iter()
+            .any(|l| l.starts_with(concat!("biBitCount: 32", ",")));
+        let has_neg_height = lines
+            .iter()
+            .any(|l| l.starts_with(concat!("biHeight: -", "height")));
+        assert!(
+            has_32bpp && has_neg_height,
+            "G7: WM_PAINT bmi 必须 biBitCount: 32 且 biHeight 为负（top-down）"
+        );
+    }
 }
