@@ -256,3 +256,20 @@
 - **运行时数据零触碰**：config.toml/wordbook.sqlite/debug.log/version_check.json mtime 保持旧值。
 - **冒烟**：启动 Responding=True 无 panic；进程清理；**热键端测交回 Gavin**（任务书明确不做）。
 - **红线**：未 commit / v0.9.0 未动 / 零凭证 / 无临时文件 / 未用 cargo tauri build。
+
+## 2026-09-06 — tester-1 — TEST-SYNC-122 ✅ 阶段三（BUG-119「没说话」类型化信号 8 条护栏，待主控验收 + 阶段四 TEST-EXEC-123）
+
+- **交付**：main.rs 末尾追加 `#[cfg(test)] mod nospeech_122_guard_tests`，+348/-0（单 hunk `@@ -10624,0 +10625,348`），生产零改动。
+- **H1**：NoSpeechError 存在 + impl `std::error::Error`（downcast/is:: 依赖）。
+- **H2**：产出源 bail 计数恰 5（qwen:921/1605 + mod:331/373/453），只数代码行（注释 startswith 排除）。
+- **H3** 🔴 反向护栏：convert_to_friendly_error 函数体禁「没说话」嗅探（block_contains_any 花括号定界 + 子串例外，守「又回去加 contains」回归路径）。
+- **H4**：TranscriptionFailure 枚举含 NoSpeech + run_pipeline_core map_err `is::<transcription::NoSpeechError>()` 下探（拦截在 to_string 前）。
+- **H5**：spawn_worker_thread 流式 join is:: 下探 + send PipelineEvent::NoSpeech。
+- **H6**：i18n no_speech_hint 三语言非空互异 + ZH 恰为「请说话哦..」（Gavin 原文两 dot）。
+- **H7** 🔴 圆角快照：apply_overlay_window_region Some(16)×1 / Some(10)×3 / None×6（OVERLAY-121 有意改动时护栏红属预期）。
+- **H8**：Windows 控制器 NoSpeech arm 用 OverlayStatus::Info + tray Idle。
+- **写法**：include_str! 按首个 #[cfg(test)] 切分只扫生产区 + 一律 startswith（禁 contains，H3 唯一子串例外）+ needle 全 concat! 拆串 + block_contains 花括号定界（未复活 window_has）。
+- **验证**：fmt --check exit 0 / check --all-targets 0 error（102 warnings 与基线持平）/ 未跑 cargo test（首跑归阶段四）。
+- **逻辑预演**：沙箱逐字复刻 —— 22 项主断言全 PASS + 消融模拟 RED-OK（H2/H3/H4/H6/H7/H8 各代表消融）。
+- **判别力边界**：H2 只扫现有三文件；H5 event 行绑定 event_tx 形参名；H6 按文件首处判 ZH。
+- **红线**：未 commit / v0.9.0 未动 / 零凭证 / 无临时文件（append 临时模块文件已 rm）。

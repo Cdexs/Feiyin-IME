@@ -40,6 +40,7 @@
 | ③ | `TEST-EXEC-117` 阶段四：三层全量回归 + 逐条消融自证 + 还原自证 | tester-1 | — | ✅ 已交付（1088P/76P/89P + 13 消融全红 + Step3 A+ 结构定界 + E2E 66P/0F/0E，待主控验收） |
 | ④ | `BUILD-118` 阶段五出包：**首个同时含 D2D 五态 + 热键修复的包** | tester-1 | — | ✅ 已交付（三 exe + toml 三副本 + 冒烟通过，待主控验收/派 Gavin 端测） |
 | ⑤ | **Gavin 端测**（见下方专项清单） | Gavin | — | ⏳ 等包 |
+| ⑥ | **`TEST-SYNC-122`** 阶段三：BUG-119「没说话」类型化信号 8 条护栏（H1 NoSpeechError 存在+impl Error / H2 产出源计数恰 5 / H3 🔴 convert_to_friendly_error 反向护栏禁嗅探 / H4 枚举 NoSpeech+map_err is:: 下探 / H5 流式 join 分流 / H6 i18n 三语言 + ZH 原文 / H7 🔴 圆角快照 Some16×1+Some10×3+None×6 / H8 overlay Info+tray Idle） | tester-1 | `main.rs` **测试模块** | ✅ 已交付（8 护栏，+348/-0 生产零改动，fmt/check 白名单内过，待主控验收 + 阶段四 TEST-EXEC-123） |
 
 ### ⑤ Gavin 端测专项清单（出包后交回）
 

@@ -10622,3 +10622,351 @@ mod overlay_109_d2d_p2p3_guard_tests {
         }
     }
 }
+// =====================================================================
+// TEST-SYNC-122 / BUG-119「用户没说话」类型化信号 8 条护栏（阶段三，只写用例）
+// ---------------------------------------------------------------------
+// 契约（写在 NoSpeechError 类型文档里）：新增第三个「没说话」产出源时只需
+// `bail!(NoSpeechError)`，显示侧分类器零改动。本组护栏守的回归路径 =
+// 「有人图省事又回去改字符串」。
+//
+// 结构护栏写法（前几轮教训）：
+//   1) include_str! 自读源码，按首个 `#[cfg(test)]` 切分只扫生产区 —— 测试
+//      代码（本 mod）永不进入扫描区；
+//   2) 匹配一律 startswith（禁 contains），needle 全部 concat! 拆串；
+//   3) H3 是唯一子串例外（要在函数体内找「禁止出现的嗅探串」），仍先花括号
+//      深度定界到 convert_to_friendly_error 函数体再查；
+//   4) 行窗一律 block_contains 花括号定界（不复活 window_has）。
+// =====================================================================
+#[cfg(test)]
+mod nospeech_122_guard_tests {
+    /// 读取源码并截断到首个 `#[cfg(test)]`，逐行 trim（只扫生产区）。
+    fn prod_lines(src: &'static str) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in src.lines() {
+            let t = line.trim();
+            if t.starts_with("#[cfg(test)]") {
+                break;
+            }
+            out.push(t.to_string());
+        }
+        out
+    }
+
+    fn main_prod_lines() -> Vec<String> {
+        prod_lines(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/main.rs"
+        )))
+    }
+
+    fn i18n_prod_lines() -> Vec<String> {
+        prod_lines(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/i18n.rs"
+        )))
+    }
+
+    /// src/transcription/ 全部 .rs 文件生产区行合并（现为 mod/qwen_inference/vad 三文件）。
+    /// 判别力边界：若未来新增「没说话」产出源放进**新文件**，本计数扫不到该文件；
+    /// 放进现有三文件必被计到，护栏红会要求主动更新。
+    fn transcription_prod_lines() -> Vec<String> {
+        let mut out = Vec::new();
+        for src in [
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/transcription/mod.rs"
+            )),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/transcription/qwen_inference.rs"
+            )),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/transcription/vad.rs"
+            )),
+        ] {
+            for line in src.lines() {
+                let t = line.trim();
+                if t.starts_with("#[cfg(test)]") {
+                    break;
+                }
+                out.push(t.to_string());
+            }
+        }
+        out
+    }
+
+    fn find_line(lines: &[String], needle: &str) -> Option<usize> {
+        lines.iter().position(|l| l.starts_with(needle))
+    }
+
+    fn norm_line(line: &str) -> String {
+        line.trim().replace("platform::", "")
+    }
+
+    fn brace_delta(line: &str) -> i32 {
+        line.matches('{').count() as i32 - line.matches('}').count() as i32
+    }
+
+    /// 花括号定界块内是否存在一行 startswith(needle)。
+    /// 支持多行签名锚点（锚点行无 `{` 时前扫首个开括号再开始匹配），块闭合即停。
+    fn block_contains(lines: &[String], anchor: usize, needle: &str) -> bool {
+        let mut depth = 0i32;
+        let mut opened = false;
+        for line in lines.iter().skip(anchor) {
+            let norm = norm_line(line);
+            depth += brace_delta(&norm);
+            if depth > 0 {
+                opened = true;
+                if norm.starts_with(needle) {
+                    return true;
+                }
+            } else if opened {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// H3 专用（子串例外）：花括号定界函数体内是否存在任一 needle 子串。
+    fn block_contains_any(lines: &[String], anchor: usize, needles: &[&str]) -> bool {
+        let mut depth = 0i32;
+        let mut opened = false;
+        for line in lines.iter().skip(anchor) {
+            let norm = norm_line(line);
+            depth += brace_delta(&norm);
+            if depth > 0 {
+                opened = true;
+                if needles.iter().any(|n| norm.contains(n)) {
+                    return true;
+                }
+            } else if opened {
+                return false;
+            }
+        }
+        false
+    }
+
+    fn count_startswith(lines: &[String], needle: &str) -> usize {
+        lines.iter().filter(|l| l.starts_with(needle)).count()
+    }
+
+    /// 提取 `key: "value",` 引号内字符串。
+    fn quoted_value(line: &str) -> Option<String> {
+        let s = line.find('"')? + 1;
+        let e = line[s..].find('"')? + s;
+        Some(line[s..e].to_string())
+    }
+
+    // ----- H1-H8 护栏 -----
+
+    /// H1: transcription::NoSpeechError 存在，且实现 std::error::Error
+    ///（可被 anyhow 的 downcast / is::<>() 下探）。
+    /// 消融路径：删掉 `impl std::error::Error for NoSpeechError` → 本测试红。
+    #[test]
+    fn h1_nospeech_error_exists_and_implements_error() {
+        let lines = transcription_prod_lines();
+        assert!(
+            find_line(&lines, concat!("pub struct NoSpeech", "Error")).is_some(),
+            "H1: transcription::NoSpeechError struct must exist"
+        );
+        assert!(
+            find_line(
+                &lines,
+                concat!("impl std::error::", "Error for NoSpeechError")
+            )
+            .is_some(),
+            "H1: NoSpeechError must implement std::error::Error (downcast / is::<>() 依赖)"
+        );
+    }
+
+    /// H2: 产出源计数 —— src/transcription/ 下 bail!(NoSpeechError) /
+    /// bail!(super::NoSpeechError) 恰为 5 处（qwen:921 / qwen:1605 / mod:373 / mod:331 / mod:453）。
+    /// 只数**代码行**（注释里的同名字面量以 `///`/`//` 开头被 startswith 排除）。
+    /// 数量变化必须让人主动来改这条护栏（新增源是有意识行为）。
+    /// 消融路径：删任一真实 bail 处 → 计数 4 → 本测试红。
+    #[test]
+    fn h2_nospeech_bail_sources_count_is_five() {
+        let lines = transcription_prod_lines();
+        let needles: [&str; 4] = [
+            concat!("anyhow::bail!(NoSpeech", "Error)"),
+            concat!("bail!(NoSpeech", "Error)"),
+            concat!("bail!(super::NoSpeech", "Error)"),
+            concat!("anyhow::bail!(super::NoSpeech", "Error)"),
+        ];
+        let count = needles
+            .iter()
+            .map(|n| count_startswith(&lines, n))
+            .sum::<usize>();
+        assert_eq!(
+            count,
+            5,
+            "H2: 产出源 bail!(NoSpeechError) 计数必须恰为 5（qwen:921/1605 + mod:331/373/453）；数量变化须主动改此护栏"
+        );
+    }
+
+    /// H3: 🔴 反向护栏（本单最重要）—— convert_to_friendly_error 函数体内
+    /// **不得出现**「没说话」语义的关键词嗅探（无识别 / no speech / nospeech /
+    /// empty text / 没说话 / no_speech）。守的就是「有人又回去加 contains」的回归路径。
+    /// 写法：花括号深度定界到函数体，再在体内查子串（H3 是唯一子串例外）。
+    /// 消融路径：往该函数加一行 `m.contains("无识别")` → 本测试红。
+    #[test]
+    fn h3_convert_to_friendly_error_no_nospeech_sniffing() {
+        let lines = main_prod_lines();
+        let anchor = find_line(&lines, concat!("fn convert_to_friendly_", "error("))
+            .expect("H3 anchor: convert_to_friendly_error");
+        let needles: [&str; 6] = [
+            concat!("无识", "别"),
+            concat!("no sp", "eech"),
+            concat!("nospe", "ech"),
+            concat!("empty te", "xt"),
+            concat!("没说", "话"),
+            concat!("no_spe", "ech"),
+        ];
+        assert!(
+            !block_contains_any(&lines, anchor, &needles),
+            "H3: convert_to_friendly_error 函数体内不得出现「没说话」关键词嗅探（无识别/no speech/nospeech/empty text/没说话/no_speech）—— 回归路径=有人又回去加 contains"
+        );
+    }
+
+    /// H4: TranscriptionFailure 枚举存在且有 NoSpeech 变体；run_pipeline_core 的
+    /// map_err 闭包含 `is::<transcription::NoSpeechError>()` 下探 ——
+    /// 守「拦截点必须在 to_string() 之前」（to_string 后无法再与普通错误区分）。
+    /// 消融路径：把 map_err 改回 `|e| e.to_string()` → is:: 行消失 → 本测试红。
+    #[test]
+    fn h4_transcription_failure_nospeech_and_downcast_before_tostring() {
+        let lines = main_prod_lines();
+        let enum_anchor = find_line(&lines, concat!("enum Transcription", "Failure"))
+            .expect("H4 anchor: enum TranscriptionFailure");
+        assert!(
+            block_contains(&lines, enum_anchor, concat!("NoSpeech", ",")),
+            "H4: TranscriptionFailure 枚举必须含 NoSpeech 变体"
+        );
+        let map_anchor = find_line(
+            &lines,
+            concat!(
+                "let transcription_result: Result<(String, bool), Transcription",
+                "Failure>"
+            ),
+        )
+        .expect("H4 anchor: transcription_result in run_pipeline_core");
+        assert!(
+            block_contains(
+                &lines,
+                map_anchor,
+                concat!("if e.is::<transcription::NoSpeech", "Error>()")
+            ),
+            "H4: run_pipeline_core map_err 必须含 is::<transcription::NoSpeechError>() 下探（拦截点必须在 to_string() 之前）"
+        );
+    }
+
+    /// H5: 流式 join 处（spawn_worker_thread 内）同样有
+    /// is::<transcription::NoSpeechError>() 分流到 PipelineEvent::NoSpeech。
+    /// 消融路径：删掉该分支 → is:: / NoSpeech 事件行消失 → 本测试红。
+    #[test]
+    fn h5_streaming_join_nospeech_is_detected() {
+        let lines = main_prod_lines();
+        let anchor = find_line(&lines, concat!("fn spawn_worker_", "thread("))
+            .expect("H5 anchor: spawn_worker_thread");
+        assert!(
+            block_contains(
+                &lines,
+                anchor,
+                concat!("if e.is::<transcription::NoSpeech", "Error>()")
+            ),
+            "H5: spawn_worker_thread 流式 join 处必须 is::<transcription::NoSpeechError>() 下探"
+        );
+        assert!(
+            block_contains(
+                &lines,
+                anchor,
+                concat!("send_event(&event_tx, PipelineEvent::NoSpeech")
+            ),
+            "H5: 流式 join 处必须 send_event PipelineEvent::NoSpeech（分流，不进 convert_to_friendly_error 错误链）"
+        );
+    }
+
+    /// H6: i18n no_speech_hint 三语言（ZH/ZH_TW/EN）全部非空且互不相同；
+    /// ZH（文件中第一处）必须恰为「请说话哦..」（Gavin 指定原文，含两个点）。
+    /// 消融路径：任一语言留空 / ZH 文案被改 → 本测试红。
+    #[test]
+    fn h6_nospeech_hint_i18n_three_languages() {
+        let lines = i18n_prod_lines();
+        let hints: Vec<String> = lines
+            .iter()
+            .filter(|l| l.starts_with("no_speech_hint:"))
+            .filter_map(|l| quoted_value(l))
+            .collect();
+        assert_eq!(hints.len(), 3, "H6: no_speech_hint 必须三语言各一");
+        assert!(
+            hints.iter().all(|h| !h.is_empty()),
+            "H6: 三语言 no_speech_hint 都不得为空"
+        );
+        let mut sorted = hints.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 3, "H6: 三语言 no_speech_hint 必须互不相同");
+        assert_eq!(
+            hints[0],
+            concat!("请说话", "哦.."),
+            "H6: ZH no_speech_hint 必须恰为 请说话哦..（Gavin 指定原文，含两个点）"
+        );
+    }
+
+    /// H7: 🔴 圆角回归护栏 —— apply_overlay_window_region 调用点的圆角参数快照：
+    /// Some(16) 恰 1 处、Some(10) 恰 3 处、None 恰 6 处。
+    /// OVERLAY-121 per-pixel alpha 会**有意**改这些值，届时护栏红是预期的、要主动更新；
+    /// 但在那之前任何改动都是回归。
+    /// 消融路径：任一值被改（如某 Some(10)→Some(12)）→ 计数变化 → 本测试红。
+    #[test]
+    fn h7_overlay_corner_radius_snapshot() {
+        let lines = main_prod_lines();
+        let n16 = count_startswith(
+            &lines,
+            concat!("apply_overlay_window_region(hwnd, rect, Some(1", "6),"),
+        );
+        let n10 = count_startswith(
+            &lines,
+            concat!("apply_overlay_window_region(hwnd, rect, Some(1", "0),"),
+        );
+        let nnone = count_startswith(
+            &lines,
+            concat!("apply_overlay_window_region(hwnd, rect, None", ","),
+        );
+        assert_eq!(
+            n16, 1,
+            "H7: apply_overlay_window_region Some(16) 圆角调用点必须恰 1 处"
+        );
+        assert_eq!(
+            n10, 3,
+            "H7: apply_overlay_window_region Some(10) 圆角调用点必须恰 3 处"
+        );
+        assert_eq!(
+            nnone, 6,
+            "H7: apply_overlay_window_region None 圆角调用点必须恰 6 处"
+        );
+    }
+
+    /// H8: PipelineEvent::NoSpeech 的 overlay 分支（Windows 控制器）用
+    /// OverlayStatus::Info（不是 Error），且 tray 复位到 Idle（照 FormatFailed 先例，
+    /// 防卡在「处理中」）。
+    /// 消融路径：改回 Error 或删 tray 复位 → 本测试红。
+    #[test]
+    fn h8_nospeech_overlay_uses_info_and_idle_tray() {
+        let lines = main_prod_lines();
+        let anchor = find_line(&lines, concat!("PipelineEvent::NoSpeech", " => {"))
+            .expect("H8 anchor: Windows 控制器 NoSpeech arm");
+        assert!(
+            block_contains(&lines, anchor, concat!("status: OverlayStatus::", "Info(")),
+            "H8: NoSpeech overlay 分支必须用 OverlayStatus::Info（不是 Error）"
+        );
+        assert!(
+            block_contains(
+                &lines,
+                anchor,
+                concat!("set_tray_state(tray, TrayState::", "Idle,")
+            ),
+            "H8: NoSpeech 分支必须把 tray 复位到 Idle（防卡「处理中」）"
+        );
+    }
+}
