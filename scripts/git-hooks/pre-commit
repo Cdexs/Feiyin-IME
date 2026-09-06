@@ -23,6 +23,29 @@ fi
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=secret-patterns.sh
 . "$HOOK_DIR/secret-patterns.sh"
+# shellcheck source=secret-paths.sh
+. "$HOOK_DIR/secret-paths.sh"
+
+# ---- SECRET-126 路径闸门（内容扫描之前先跑，命中即拒）----
+# 有些文件「按路径」就判危险（根 config.toml 含真实 api_key、.env 凭证载体、*.log 口述
+# 转写原文等隐私）—— 内容正则拦不住或拦不全（[GATE-MATCHES-SHAPE-NOT-CONTENT-001]）。
+# .gitignore 挡不住 git add -f、也挡不住有人删规则，这里是第二道机器闸门。
+# 🔴 fail-closed（HOOK-FAIL-OPEN-001 同源）：取不到 staged 列表就拒绝放行。
+if ! STAGED=$(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMR 2>&1); then
+  echo "❌ [pre-commit] 无法取得 staged 文件列表，拒绝放行（fail-closed）。" >&2
+  echo "   git 报错：${STAGED}" >&2
+  echo "   确认无误后可用 SECRET_SCAN_SKIP=1 git commit 显式放行。" >&2
+  exit 1
+fi
+PATH_HITS=$(printf '%s\n' "$STAGED" | scan_paths)
+if [ -n "$PATH_HITS" ]; then
+  cat >&2 <<MSG
+❌ [pre-commit] 拦截：staged 中存在按路径即判危险的文件，commit 已中止（SECRET-126）。
+${PATH_HITS}
+MSG
+  print_path_guidance
+  exit 1
+fi
 
 # 只扫本次 staged 的新增行（-U0 去掉上下文，^+ 取新增），避免历史存量反复报警
 # 🔴 fail-closed（HOOK-FAIL-OPEN-001）：git diff 失败时拒绝放行，不静默放过。

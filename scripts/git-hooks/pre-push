@@ -26,6 +26,8 @@ fi
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=secret-patterns.sh
 . "$HOOK_DIR/secret-patterns.sh"
+# shellcheck source=secret-paths.sh
+. "$HOOK_DIR/secret-paths.sh"
 
 # git 通过 stdin 逐行喂入待推 ref，每行四字段：
 #   <local_ref> <local_sha> <remote_ref> <remote_sha>
@@ -43,6 +45,27 @@ ALL_HITS=""
 ZERO_SHA="0000000000000000000000000000000000000000"
 # git 空树对象（恒定值），用于根提交无父时的 base
 EMPTY_TREE=$(git hash-object -t tree /dev/null 2>/dev/null || echo "4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+
+# ---- SECRET-126 路径闸门（push 侧同样拦，是最后一道网）----
+# pre-commit 的路径闸门有两个绕过口：① SECRET_SCAN_SKIP=1 的显式绕过口径（合法，留痕）；
+# ② 没配 core.hooksPath 的 clone 上钩子根本不跑。push 是公开仓库暴露前的最后一道网
+# （f58af96 有真实前科），所以同样的路径判定在这里再拦一遍，共用 secret-paths.sh 防漂移。
+# 🔴 fail-closed（HOOK-FAIL-OPEN-001）：取不到待推文件列表就拒绝放行，不许静默放过。
+push_path_gate() {
+  # $1=LOCAL_REF $2=BASE $3=LOCAL_SHA $4=REMOTE_SHA
+  local PUSH_PATHS PATH_HITS
+  if ! PUSH_PATHS=$(git -c core.quotePath=false diff --name-only --diff-filter=ACMR "$2..$3" 2>&1); then
+    echo "❌ [pre-push] 无法取得 ${1} 的待推文件列表，拒绝放行（fail-closed）。" >&2
+    echo "   git 报错：${PUSH_PATHS}" >&2
+    echo "   确认无误后可用 SECRET_SCAN_SKIP=1 git push 显式放行。" >&2
+    exit 1
+  fi
+  PATH_HITS=$(printf '%s\n' "$PUSH_PATHS" | scan_paths)
+  [ -n "$PATH_HITS" ] && ALL_HITS="${ALL_HITS}
+── push 范围 ${1} (${4:0:8}..${3:0:8}) 路径闸门命中 ──
+${PATH_HITS}"
+  return 0
+}
 
 while read -r LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
   [ -z "$LOCAL_SHA" ] && continue
@@ -69,6 +92,7 @@ while read -r LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
     # 裸 `git rev-parse "$X^" 2>/dev/null` 解析失败时仍把字面量 `<sha>^` 打到 stdout，
     # `$(cmd || echo $EMPTY)` 会把字面量和空树 hash 都吃进变量 → BASE 变垃圾 → diff 继续失败 → 静默放行。
     BASE=$(git rev-parse --verify -q "${FIRST}^" 2>/dev/null || echo "$EMPTY_TREE")
+    push_path_gate "$LOCAL_REF" "$BASE" "$LOCAL_SHA" "$REMOTE_SHA"
     if ! DIFF_RAW=$(hook_diff "${BASE}..${LOCAL_SHA}" -U0 --diff-filter=ACM 2>&1); then
       echo "❌ [pre-push] 无法取得 ${LOCAL_REF} 的待推 diff，拒绝放行（fail-closed）。" >&2
       echo "   git 报错：${DIFF_RAW}" >&2
@@ -79,6 +103,8 @@ while read -r LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
     DIFF=$(printf '%s\n' "$DIFF_RAW" | grep -E '^\+' | grep -vE '^\+\+\+ (b/|/dev/null|")')
   else
     # 情况 2：已有分支推新提交
+    BASE="$REMOTE_SHA"
+    push_path_gate "$LOCAL_REF" "$BASE" "$LOCAL_SHA" "$REMOTE_SHA"
     if ! DIFF_RAW=$(hook_diff "${REMOTE_SHA}..${LOCAL_SHA}" -U0 --diff-filter=ACM 2>&1); then
       echo "❌ [pre-push] 无法取得 ${LOCAL_REF} 的待推 diff，拒绝放行（fail-closed）。" >&2
       echo "   git 报错：${DIFF_RAW}" >&2

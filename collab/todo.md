@@ -2369,3 +2369,37 @@ coder-1 已把 `words={}` 加进日志。**新包出来后 Gavin 跑一次 `-deb
 1. **ASR-SUMMARY outcome 判定脱节**：所有成功识别 run 均标 `outcome=failed`（words_total>0 的 run 也是）——Gavin 端测 A/B 若引用该字段会被误导。查 `AsrSummary::format_summary()`（qwen_inference.rs:209-218）outcome 赋值链
 2. **vad_hit_ms=-1 从未命中**（8 run）：服务端 VAD 回执疑似从未到达客户端，客户端无 end-of-speech 信号源——与 067/070 同根
 3. **stop 后迟发窗口**：`OVERLAY-043: ignoring late StreamingText after stop` 单 run 6+ 次、持续 4-5s——REPRO-068 交替闪烁与 070 尾部丢失疑似同源 finalize 拖尾
+
+---
+
+## 🟢 2026-09-06 晚 · SECRET-126 已验收（Gavin 指令：确保配置与隐私永不入库）
+
+**Gavin 原话**：「确保本地配置文件和代码不会提交任何 key、和其他隐私敏感信息」。
+
+### 主控审计现状（先说结论：当前无正在泄露的东西）
+
+| 审计项 | 实测 |
+| --- | --- |
+| 磁盘上真正含非空 `api_key` 的文件 | 仅 `Publish/config.toml` 与 `target/release/config.toml`，**两者已 ignore** ✅ |
+| 未跟踪且未被忽略（`git add -A` 会抓的） | **0 个** ✅ |
+| 326 个已跟踪文件全量内容扫描 | 命中 8 处**全为良性**：上游 vendor 作者邮箱（cmake/esaxx-rs）、`@example.com` 占位、Gutenberg 语料公开地址、Tauri 图标清单里的 `128x128 @ 2x.png` 文件名（@ 前后加空格以免自触发闸门）被邮箱正则误命中。**零真实凭证** ✅ |
+| `assets/default-config.toml` | `api_key = ""` 空占位 ✅ |
+| 两道钩子 | 实机验过：pre-commit 真阳性 5 拦/真阴性 3 放；pre-push 能兜住被 `SECRET_SCAN_SKIP=1` 绕过的 commit ✅ |
+
+### 补的 latent 洞（SECRET-126，coder-1）
+
+`.gitignore` 四类路径规则 + **新增 `scripts/git-hooks/secret-paths.sh` 路径闸门**
+（pre-commit + pre-push 双侧 source 同一份，防 SECRET-082 式漂移）。
+拦截判据是**路径不是内容** —— `[GATE-MATCHES-SHAPE-NOT-CONTENT-001]` 的教训：
+口述转写日志、实验 dump 这类「文件类别本身危险」的东西是内容正则的永久盲区。
+
+**主控独立复跑（未采信报告）**：路径闸门 **17/17** 全对（含 `CONFIG.TOML` 大小写绕过、
+`collab/research/` 强加 `-f`、`logs/*.md` 与 `.cargo/config.toml` 未误伤）；
+内容闸门 **7/7** 零回归；`ls-files` 326 未变；三钩子 LF+UTF-8+可执行。
+
+### 遗留
+
+| 项 | 处置 |
+| --- | --- |
+| coder-1 的 result.md 缺「收尾自证表」 | 已退回补写（`[DOC-STATE-DRIFT-001]` 又复现，且这次漏的正是防它的那张表） |
+| MSYS git `add -f <ignored>` 偶发静默 no-op（coder-1 报） | 主控立 troubleshooting 条目 |

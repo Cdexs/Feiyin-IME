@@ -126,6 +126,21 @@ COMMIT-LIST.md
 *.db-wal
 config.json
 
+# ===== SECRET-126（Gavin 2026-09-06 指令：确保配置与隐私永不入库）=====
+# 以下四类靠「内容正则」拦不住或拦不全，必须靠路径拦；对应的第二道机器闸门
+# （git add -f / 删规则也拦得住）在 scripts/git-hooks/secret-paths.sh，两层判定保持同表：
+#  - /config.toml      运行时用户配置，含真实 api_key（root 锚定；.cargo/config.toml 是构建
+#                      配置不受影响，assets/default-config.toml 是脱敏模板，api_key 留空）
+#  - .env / .env.*     凭证专用载体，这类文件存在本身就是危险信号
+#  - *.log             debug.log 载荷是口述转写原文 + app_exe（用户当时在用什么程序），
+#                      属隐私非密钥，内容正则永久盲区（[GATE-MATCHES-SHAPE-NOT-CONTENT-001]）
+#  - /version_check.json 运行时产物，无入库价值
+/config.toml
+.env
+.env.*
+*.log
+/version_check.json
+
 # ===== GitHub Actions (macOS CI not yet ready) =====
 .github/
 

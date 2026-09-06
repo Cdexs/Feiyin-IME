@@ -2,6 +2,17 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-09-06 — coder-1 — SECRET-126 ✅ 配置/隐私「永不入库」机器闸门（.gitignore 四类路径规则 + pre-commit/pre-push 路径闸门，待主控验收）
+
+- **改动面**：`.gitignore`（+12 行，User app data 节内，含理由注释）+ `scripts/git-hooks/secret-paths.sh`（新建，scan_paths 共享判定）+ `pre-commit`（内容扫描前路径闸门，fail-closed）+ `pre-push`（push_path_gate 函数 + 两分支各 1 调用，情况 2 补 BASE 推导）。未 commit，待主控验收。
+- **secret-patterns.sh 现有模式表零触碰**；路径判定单独成文件、两钩子共用防漂移（SECRET-082 同理），两层职责分开。
+- **pre-push 侧已加（任务书留判）**：理由 = pre-commit 闸门有 `SECRET_SCAN_SKIP=1` 绕过口 + 未装钩子 clone 不跑；公开仓库 + f58af96 前科，push 是最后一道网。
+- **实机矩阵全绿**（一次性临时仓库 + 真 hooks，已 rm -rf）：pre-commit 真阳性 5 拦（根 config.toml 纯路径拦 / .env / debug.log / collab/research 强加 / wordbook.sqlite）、真阴性 4 放（.cargo/config.toml、assets 模板、logs/20260906.md、notes.md）、内容闸门 4 拦 2 放零回归；pre-push 情况 3 + 情况 2 均拦、纯删除放行（--diff-filter=ACMR 排 D）、skip 口径双钩子放行+警告。
+- **实现细化**：匹配小写归一（CONFIG.TOML 绕过堵死，Windows FS 实测 + Linux 单元级兜底）/ core.quotePath=false 钉路径形态 / 根 config.toml 仅根锚定。
+- **本仓库判据**：git ls-files = 326 不变；untracked 除本单三文件外保持 0。
+- **红线**：未 commit / 不动版本号 / 未碰 src/main.rs、hotkey.rs / secret-patterns.sh 模式表零改动 / 零真实密钥（用例全假值）/ 临时仓库已清理。
+- **详情**：outbox/coder-1/result.md + logs/20260906.md + CHANGELOG.md
+
 ## 2026-09-06 — coder-1 — BUG-119 ✅ 无语音改为信息提示「请说话哦..」（i18n 类型化信号 + Info 态浮层，待主控验收）
 
 - **根因双重**：主控取证的关键词嗅探分类器漏 + 实施侧实证的 `map_err(|e| e.to_string())` 先抹 anyhow 类型（拦截点前移到 map_err 下探）。
