@@ -11140,10 +11140,14 @@ mod nospeech_122_guard_tests {
     #[test]
     fn h7_overlay_corner_radius_snapshot() {
         let lines = main_prod_lines();
-        let n = count_startswith(&lines, concat!("apply_overlay_window_region(", ""));
+        let n_call = count_startswith(&lines, concat!("apply_overlay_window_region(", ""));
+        let n_def = count_startswith(&lines, concat!("fn apply_overlay_window_region", "("));
+        let n = n_call + n_def;
         assert_eq!(
             n, 0,
-            "G1: apply_overlay_window_region 必须 0 处（OVERLAY-121 掩码退役），实测 {} 处——二值掩码复活=圆角硬阶梯回归",
+            "G1: apply_overlay_window_region 必须 0 处（OVERLAY-121 掩码退役），实测调用 {} 处 + 定义 {} 处 = {} 处——二值掩码复活=圆角硬阶梯回归",
+            n_call,
+            n_def,
             n
         );
     }
@@ -11590,7 +11594,11 @@ mod overlay_121_guard_tests {
                 .rposition(|l| l.starts_with("if state.layered_mode != target_mode"))
         })
         .expect("G5 anchor: layered_mode 切换条件块");
-        let show_hide = block_line_of(&lines, mode_if, concat!("ShowWindow(hwnd, SW_HIDE)", ""));
+        let show_hide = block_line_of(
+            &lines,
+            mode_if,
+            concat!("let _ = ShowWindow(hwnd, SW_HIDE)", ""),
+        );
         let show_switch =
             block_line_of(&lines, mode_if, concat!("switch_overlay_layered_mode", "("));
         assert!(

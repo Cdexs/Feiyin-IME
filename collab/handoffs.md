@@ -218,3 +218,13 @@
   首个 if use_ulw（改 rposition）。已修并通过预演。
 - **验证**：fmt 0 / check 0 error / warnings 111/102 持平 / 沙箱 G1-G7 PASS + 消融 7/7 RED。
 - **红线**：未 commit / v0.9.0 未动 / 未出包 / 未跑 cargo test / 零凭证 / 无临时文件。
+
+## 2026-09-06 — tester-1 — TEST-EXEC+BUILD-135 ✅ 阶段四+五（回归 1105P + 消融 G1-G7 全 RED + 出包，待主控验收 + Gavin 端测）
+
+- **阶段四**：root 1105P/0F/9I（G1 是 H7 换血不增减，实际 +6，主控确认达标）+ src-tauri 76P + vitest 89P。
+- **消融 G1-G7 七条全 RED + 还原**；发现并修 2 处护栏 bug（G1 漏函数定义匹配 / G5 show_hide 缺 let _ 前缀）。
+- **出包**：feiyin-ime 12,263,424B@17:55（+1024B OVERLAY-121）sha ac70a990…；UI 沿用 11:39；
+  toml 三副本一致；ProductVersion 0.9.0.0；判别探针 UpdateLayeredWindow 新=1旧=0 硬证据；冒烟无 panic；
+  config.toml sha 未变。
+- **主控紧急加速**：出包后 E2E/src-tauri/vitest 挪下一批；Gavin 端测清单 6 项在 result.md。
+- **红线**：未 commit / v0.9.0 未动 / 未出包（已出 BUILD-135）/ 零凭证 / 无临时文件。
