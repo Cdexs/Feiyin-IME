@@ -225,3 +225,12 @@
 - **验证**：fmt --check exit 0 / check --all-targets 0 error（102 warnings 与基线持平）/ 未跑 cargo test（白名单设计如此，首跑归阶段四）。
 - **逻辑预演**：沙箱逐字复刻护栏匹配逻辑 —— 19 项主断言全 PASS；G1/G2/G3(flip+reset)/G4/G6c(const 删除)/G7 六组消融模拟全 RED-OK；G7 块内注释「notify_translate_poll_stop()」startswith 正确排除无误命中。
 - **红线**：未 commit / v0.9.0 未动 / 零凭证 / 无临时文件（预演跑沙箱 temp）。
+
+## 2026-09-06 — tester-1 — TEST-EXEC-117 ✅ 阶段四（三层回归 + 13 消融全红 + Step3 A+ 结构定界，待主控验收）
+
+- **Step1**：root **1088P/0F/9I**（1077+11 逐位对账）+ src-tauri 76P + vitest 89P。
+- **Step2 消融 13/13 全红（真代码）**：G1 移 store 出 if / G2+G3flip 改恒发 Start / G3reset 删 store / G4 删收口 store / G5a·b·c 各删三态之一 / G5b-附加 删 POLL_STOP=true / G6a 改名保编译 / G6b 去陈旧闸 / **G6c 2000→1000 边界（"got 1000" 证 `>` 非 `>=`）** / G7 删 mic-muted notify。逐次还原。
+- **Step3 行窗余量 → A+ 结构定界（主控批准 + 修正1/2/3 落实）**：G3/G5a/b/c 改 block_contains 花括号定界（零行窗）；修正1 增强支持多行签名锚点（install/sync_binding 锚点行无 `{`，前扫首开括号，干净 PASS 实证）；修正2 G3 锚 `HotkeyMode::Toggle => {` 排除 PTT arm；修正3 每转换护栏 ①干净 PASS + ②消融 RED 双证据；window_has 删死代码。测试模块 +29/-34 生产零触碰。
+- **Step4 E2E**：门禁 66P/0F/0E 通过；🔴 热键 6/6 PASS —— **E2E-GATE-103 环境失效已恢复**（任务书预期红未发生，如实报）；33 skip 既有类别无新失败；旧包口径，HOTKEY-115 真 E2E 归 BUILD-118。
+- **Step5 还原**：numstat 仅剩 Step3 测试模块 29/34 + main.rs 空；三层重跑与 Step1 一致；消融变量全归零；无进程残留；config sha 3186ec8c；fmt exit 0。
+- **红线**：未 commit（含 Step3 A+ 改动）/ v0.9.0 未动 / 零凭证 / 无临时文件 / 未出包。

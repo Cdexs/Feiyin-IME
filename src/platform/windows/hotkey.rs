@@ -1252,35 +1252,29 @@ mod tests {
         lines.iter().position(|l| l.starts_with(needle))
     }
 
-    /// 行窗匹配：在 [start, start+window) 窗口内是否存在一行 `startswith(needle)`。
-    fn window_has(lines: &[String], start: usize, window: usize, needle: &str) -> bool {
-        let end = (start + window).min(lines.len());
-        lines[start..end]
-            .iter()
-            .any(|l| norm_line(l).starts_with(needle))
-    }
-
     /// 一行净花括号增量（'(' 不计数，只计 '{' 与 '}'；字符串内花括号一并计入，
     /// 结构护栏接受该近似 —— 生产窗内无字符串花括号）。
     fn brace_delta(line: &str) -> i32 {
         line.matches('{').count() as i32 - line.matches('}').count() as i32
     }
 
-    /// 块内匹配：锚点行 `anchor` 打开的花括号块闭合之前，是否存在一行 `startswith(needle)`。
-    /// 用于「store 必须落在某 if 块内」这类归属断言。
+    /// 块内匹配：从锚点行起累计花括号深度，块打开后（depth > 0）是否存在一行
+    /// `startswith(needle)`，块闭合即停。
+    /// 支持多行函数签名（如 `fn install_keyboard_hook(` 锚点行本身无花括号）：深度为 0
+    /// 且尚未打开时继续前扫，遇到首个 `{` 才开始匹配 —— 结构定界 = 零行窗，余量无穷，
+    /// 构造上不可能越界到下一个函数（TEST-EXEC-117 Step3 A+ 修正1）。
     fn block_contains(lines: &[String], anchor: usize, needle: &str) -> bool {
         let mut depth = 0i32;
-        for (i, line) in lines.iter().enumerate().skip(anchor) {
+        let mut opened = false;
+        for line in lines.iter().skip(anchor) {
             let norm = norm_line(line);
-            if i == anchor {
-                depth += brace_delta(&norm);
-                continue;
-            }
-            if norm.starts_with(needle) && depth > 0 {
-                return true;
-            }
             depth += brace_delta(&norm);
-            if depth <= 0 {
+            if depth > 0 {
+                opened = true;
+                if norm.starts_with(needle) {
+                    return true;
+                }
+            } else if opened {
                 return false;
             }
         }
@@ -1367,23 +1361,20 @@ mod tests {
 
     /// G3: RegisterHotKey 路径（handle_hotkey_trigger）的 Toggle 分支同样是
     /// `TOGGLE_ACTIVE.swap` 翻转 + `:652` 复位（HOTKEY-115 缺陷 2 修复）。
-    /// 消融路径：该窗口内退回无条件 Start → flip 行消失 → 本测试红。
+    /// TEST-EXEC-117 Step3 A+：锚点直接取 `HotkeyMode::Toggle => {`（自带 `{`），
+    /// 花括号深度定界精确到 Toggle arm —— 不含相邻 PushToTalk arm，判别力比行窗更强。
+    /// 消融路径：该 arm 内退回无条件 Start → flip 消失 → 本测试红。
     #[test]
     fn g3_register_hotkey_toggle_branch_flips_and_resets() {
         let lines = hotkey_prod_lines();
-        let anchor = find_line(&lines, concat!("match binding.", "mode {"))
-            .expect("G3 anchor: match binding.mode");
-        let arm_off = lines[anchor + 1..]
-            .iter()
-            .position(|l| l.starts_with(concat!("HotkeyMode::", "Toggle => {")))
-            .expect("G3: Toggle arm must exist inside match binding.mode");
-        let arm = anchor + 1 + arm_off;
+        let arm = find_line(&lines, concat!("HotkeyMode::", "Toggle => {"))
+            .expect("G3 anchor: Toggle arm inside match binding.mode");
         assert!(
-            window_has(&lines, arm, 20, concat!("if !TOGGLE_ACTIVE.", "swap(true,")),
+            block_contains(&lines, arm, concat!("if !TOGGLE_ACTIVE.", "swap(true,")),
             "G3: RegisterHotKey Toggle branch must flip TOGGLE_ACTIVE, not emit constant Start"
         );
         assert!(
-            window_has(&lines, arm, 20, concat!("TOGGLE_ACTIVE.", "store(false,")),
+            block_contains(&lines, arm, concat!("TOGGLE_ACTIVE.", "store(false,")),
             "G3: RegisterHotKey Toggle branch must reset TOGGLE_ACTIVE on the stop path"
         );
     }
@@ -1404,6 +1395,8 @@ mod tests {
 
     /// G5a: install_keyboard_hook 清理块必须同时归零 PTT_ACTIVE + TOGGLE_ACTIVE +
     /// KEY_PHYSICALLY_DOWN（HOTKEY-115 B4，防重绑定后旧模式残留）。
+    /// TEST-EXEC-117 Step3 A+：block_contains 花括号定界到 install 函数体（多行签名，
+    /// 锚点行无 `{`，由增强版前扫首个开括号支持），零行窗。
     /// 消融路径：任一处缺任一行 → 本测试红。
     #[test]
     fn g5a_install_clears_all_hotkey_state() {
@@ -1419,7 +1412,7 @@ mod tests {
             ),
         ] {
             assert!(
-                window_has(&lines, anchor, 40, needle),
+                block_contains(&lines, anchor, needle),
                 "G5a: install_keyboard_hook must reset {} in its cleanup block",
                 label
             );
@@ -1427,6 +1420,7 @@ mod tests {
     }
 
     /// G5b: uninstall_keyboard_hook 清理块三态归零 + 额外含 TRANSLATE_POLL_STOP.store(true)。
+    /// TEST-EXEC-117 Step3 A+：block_contains 花括号定界到 uninstall 函数体，零行窗。
     /// 消融路径：缺任一行 → 本测试红。
     #[test]
     fn g5b_uninstall_clears_all_state_and_stops_poll() {
@@ -1439,15 +1433,14 @@ mod tests {
             concat!("KEY_PHYSICALLY_DOWN.", "store(false,"),
         ] {
             assert!(
-                window_has(&lines, anchor, 25, needle),
+                block_contains(&lines, anchor, needle),
                 "G5b: uninstall_keyboard_hook must reset all three flags"
             );
         }
         assert!(
-            window_has(
+            block_contains(
                 &lines,
                 anchor,
-                25,
                 concat!("TRANSLATE_POLL_STOP.", "store(true,")
             ),
             "G5b: uninstall_keyboard_hook must set TRANSLATE_POLL_STOP=true"
@@ -1456,6 +1449,8 @@ mod tests {
 
     /// G5c: sync_binding 绑定切换清理块同样三态归零（RegisterHotKey 侧 unregister_binding
     /// 不复位静态量，这里统一兜底）。
+    /// TEST-EXEC-117 Step3 A+：block_contains 花括号定界到 sync_binding 函数体（多行签名，
+    /// 锚点行无 `{`，由增强版前扫首个开括号支持），零行窗 —— 修复原 50 行窗余量仅 1 的问题。
     /// 消融路径：缺任一行 → 本测试红。
     #[test]
     fn g5c_sync_binding_clears_all_hotkey_state_on_switch() {
@@ -1468,7 +1463,7 @@ mod tests {
             concat!("KEY_PHYSICALLY_DOWN.", "store(false,"),
         ] {
             assert!(
-                window_has(&lines, anchor, 50, needle),
+                block_contains(&lines, anchor, needle),
                 "G5c: sync_binding must reset all three flags on binding switch"
             );
         }
