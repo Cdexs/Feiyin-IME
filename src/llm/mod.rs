@@ -269,13 +269,43 @@ resolve a conflict by preferring whichever rule appears later in this prompt.";
 
 // PROMPT-ARCH-018 步骤 2（任务书 §3.3）: L0 不变式四条，英文原文照用。
 // L0-1 同时吸收原 F3d 的「DO NOT delete any semantic content」条款（任务书 §3.3 配套第 1 条）。
-const L0_1_FIDELITY: &str = "L0-1 FIDELITY: Every semantic unit present in <speech> MUST appear in <corrected>: \
-every quantity, unit, measure word, modifier, and entity. You MUST NOT delete a unit or measure phrase (e.g. 一斤, \
-per pound, ずつ) to make a sentence read better. This rule OVERRIDES every formatting, style, and number-preservation \
-rule below.";
-const L0_2_FIDELITY_OVER_FLUENCY: &str = "L0-2 FIDELITY OVER FLUENCY: If preserving a semantic unit makes the \
-sentence awkward, KEEP THE UNIT and accept the awkwardness. An awkward but complete sentence is CORRECT; a fluent \
-but incomplete one is a FAILURE.";
+const L0_1_FIDELITY: &str = "L0-1 MEANING FIDELITY (DEC-060): Your output MUST preserve the MEANING of \
+<speech>. You may polish the wording; you may NOT change what was said. \
+\
+(A) NEVER LOSE OR ALTER — every number, quantity, unit, measure word (一斤, per pound, ずつ), amount, \
+price, date, time, proper name and entity; the main proposition of each clause (who did what, the \
+judgement, the conclusion); every negation and modality (不/别/没有/必须/可能, not/must/may); and every \
+qualifier that changes scope or degree (只/全部/大约, only/all/about). Losing, replacing or bending ANY \
+of these is a FAILURE even if the result reads better. Wordbook mappings and technical terms are content: \
+do not paraphrase them. \
+\
+(B) YOU MAY REMOVE OR CONDENSE — these are delivery artifacts, not content: filler and hesitation \
+particles (嗯/啊/那个/就是说, um/uh/you know); verbatim repetition and redundant restatement of the same \
+point; the ABANDONED half of a self-correction (\"三点…不对，是四点\" -> keep only 四点); and discourse or \
+enumeration markers (比如/比如说/例如/再比如/还有/另外, for example/also/plus, たとえば/また, 예를 들어/또) \
+when a formatting rule converts the enumeration into a list — the list structure itself carries the \
+relation the marker expressed. \
+\
+(B2) LIGHT REGISTER POLISH IS NOT A LOSS — replacing a colloquial word with a plainer written equivalent \
+(整挺好 -> 很好, 搞一下 -> 处理一下) does NOT violate this rule. It is LIGHT only: keep sentence structure \
+and length essentially unchanged, keep person and forms of address unchanged (你 stays 你), never escalate \
+into bureaucratic or officialese phrasing, never change the strength of a stance (\"我觉得\" must not become \
+an unhedged assertion). \
+🔴 WHETHER to polish at all is decided ONLY by the scene style rule in layer L3, never here: this clause \
+merely stops treating such polish as content loss. If the scene says to keep it casual, keep it casual. \
+\
+(C) NEVER ADD — do not invent facts, do not add explanations, opinions or conclusions that were not \
+spoken, do not resolve an ambiguity by guessing. \
+\
+TIE-BREAKER: if unsure whether something is content (A) or a delivery artifact (B), KEEP IT. A slightly \
+redundant but complete output is CORRECT; a fluent output that dropped or bent content is a FAILURE. \
+For (A) this rule OVERRIDES every formatting, style and number-preservation rule below.";
+const L0_2_FIDELITY_OVER_FLUENCY: &str = "L0-2 CONTENT OVER FLUENCY (DEC-060): This applies to the \
+CONTENT listed in L0-1(A) only. If preserving a number, unit, measure word, entity, negation, modality or \
+main proposition makes the sentence awkward, KEEP IT and accept the awkwardness — awkward but complete is \
+CORRECT, fluent but incomplete is a FAILURE. It does NOT protect the delivery artifacts in L0-1(B): \
+removing those, and the light register polish in L0-1(B2), are polishing rather than incompleteness and \
+are expressly permitted.";
 const L0_3_SUSPECT_INPUT: &str = "L0-3 SUSPECT INPUT: The input has been pre-processed by an automatic \
 number-normalizer that is NOT infallible. If a number appears inconsistent with its context (e.g. \"2.80元斤\", where \
 the price and the measure phrase do not agree), you MUST still output every element unchanged. Do NOT delete the \
@@ -1215,10 +1245,32 @@ fn f3_rules_text(multiline_safe: bool, punctuation_enabled: bool) -> String {
         English \"A few things help: for example reading more, also listening to podcasts, plus talking to people\" → 3 parallel items, markers DIFFER (for example/also/plus) → bullet list; vs \"The rain was heavy today, for example this morning it was especially intense\" → 1 example → paragraph. \
         Japanese \"いくつか方法があります。たとえば本をもっと読むこと、またポッドキャストを聞くこと、さらに人と話すことです\" → 3 parallel items, markers DIFFER (たとえば/また/さらに) → bullet list; vs \"今日は雨がひどくて、たとえば今朝は特に激しかった\" → 1 example → paragraph. \
         Korean \"몇 가지 방법이 있습니다. 예를 들어 책을 많이 읽고, 또 팟캐스트를 듣고, 게다가 사람들과 대화하는 것입니다\" → 3 parallel items, markers DIFFER (예를 들어/또/게다가) → bullet list; vs \"오늘 비가 많이 왔는데, 예를 들어 오늘 아침은 특히 심했어요\" → 1 example → paragraph. \
+        \nSCOPE (two dimensions, keep them apart): \
+        (i) ITEM TYPE IS IRRELEVANT — actions/suggestions, objects/things, scenes/phenomena and \
+        state descriptions all count equally as enumeration items. \
+        (ii) The enumeration MAY SPAN SENTENCE BOUNDARIES. A full stop between items does NOT end the \
+        enumeration; keep collecting parallel members across sentences until the parallel relation stops. \
+        A trailing wrap-up clause (这些都挺不错的 / 以上几点) is NOT an item — leave it outside the list. \
+        Only ITEM LENGTH decides list-vs-inline (see F3-item form below), never item type. \
+        \nCross-sentence + suggestion items: Chinese \"你可以多发展一些兴趣爱好，比如多去电影院看看电影，\
+        比如平时可以听听音乐。再比如，可以出去旅游，一个人出去散散心。这些都挺不错的\" → 3 parallel items \
+        spanning two sentences, repeated markers (比如/比如/再比如) → bullet list of the 3 items, \
+        the wrap-up 这些都挺不错的 stays as a trailing line, markers dropped.\
+        \nObject/scene items: Chinese \"这次去菜场买了不少东西，比如很新鲜的本地蔬菜，再比如刚宰的土猪肉，\
+        还有一些当季的水果\" → 3 parallel items (things, each with a modifier, NOT bare nouns) → bullet list.\
+        \nNOTE the contrast with bare short nouns: \"买了3斤土豆，一个西瓜，20斤大米\" stays INLINE — \
+        that is decided by item LENGTH/form, not by the items being objects.\
         Apply the same parallel-relation test to any language: 2+ coordinate members → list; a single example → paragraph.\
-        If unsure, DO NOT use a list — keep the text as a continuous paragraph. \
-        Over-formatting normal speech into lists is a regression. \
-        However, failing to list a genuine parallel enumeration (2+ distinct items) is ALSO a \
+        🔴 JUDGEMENT, NOT DEFAULT (2026-09-07): in a borderline case do NOT fall back on a fixed \
+        answer in either direction. Decide it as a careful writer of THAT language would decide it \
+        for THAT context: read the passage as your reader receives it — if it lands as a set of \
+        coordinate members being run through, make it a list; if it lands as one flowing statement, \
+        keep the paragraph. The marker inventories and worked examples in this block exist ONLY to \
+        calibrate your sense of what enumeration looks like. They are NOT a whitelist and NOT a \
+        gate: an input matching none of them can still be a genuine enumeration, and you are \
+        expected to recognise it yourself. Never reason from \"no example matches, therefore no \
+        list\". Over-formatting ordinary narration into lists is a regression, and \
+        failing to list a genuine parallel enumeration (2+ distinct items) is ALSO a \
         regression — both directions are equally wrong.\
         \nF3-item form: after the DECISION RULE confirms an enumeration (2+ items), split by item \
         form:\
@@ -2131,11 +2183,46 @@ mod tests {
         );
         assert!(UNIT_SYMBOL_PROTECTION_TRANSLATE.contains("In the <corrected> line"));
         //   W2 F3d 语义保全条款迁入 L0-1，F3 排版块不再含「DO NOT delete any semantic content」。
-        assert!(L0_1_FIDELITY
-            .contains("Every semantic unit present in <speech> MUST appear in <corrected>"));
-        assert!(L0_1_FIDELITY.contains(
-            "This rule OVERRIDES every formatting, style, and number-preservation rule below"
-        ));
+        //   🔴 DEC-060（2026-09-06 Gavin 拍板）：L0-1 的保护对象由「semantic unit」收窄为
+        //   「CONTENT unit」，并开出唯一例外 —— 话语/枚举标记（比如、再比如、for example…）
+        //   在格式化转列表时可移除，因为并列关系由列表形式本身承载。
+        //   背景：原措辞与 F3c 无序示例（示例删掉了「比如」）硬冲突，且 L0 自称压过所有格式规则，
+        //   模型选 L0 → 保留标记词 → 无序列表永远做不出来（2026-08-03 实验 6 变体全 0/9 的真因）。
+        //   🔴 DEC-060 二次放宽（2026-09-06 Gavin 拍板）：L0-1 重构为 (A)保护/(B)可删/
+        //   (B2)轻微润色/(C)禁新增 + 兜底判据。背景：F1 语气词去除、F2 改口修正、
+        //   F3 无序列表三者长期失效，根因同一 —— L0 原文「每个语义单元都必须出现」
+        //   且自称压过所有格式规则，模型不敢删任何字。
+        //   下列断言守的是「口子不许被扩大、防线不许被拆」：
+        assert!(L0_1_FIDELITY.contains("(A) NEVER LOSE OR ALTER"));
+        assert!(L0_1_FIDELITY.contains("(B) YOU MAY REMOVE OR CONDENSE"));
+        assert!(L0_1_FIDELITY.contains("(C) NEVER ADD"));
+        //   A1 量词单位保护 —— L0 立身之本，当初就是为修「模型删量词求通顺」而加
+        assert!(L0_1_FIDELITY.contains("measure word (一斤, per pound, ずつ)"));
+        //   A2 词库与术语属内容，不许被润色改写
+        assert!(L0_1_FIDELITY.contains("Wordbook mappings and technical terms are content"));
+        //   B2 轻微润色的三道边界：不许公文腔 / 不许改人称 / 不许改立场强度
+        assert!(L0_1_FIDELITY.contains("never escalate"));
+        assert!(L0_1_FIDELITY.contains("keep person and forms of address unchanged"));
+        assert!(L0_1_FIDELITY.contains("never change the strength of a stance"));
+        //   🔴 B3 裁决点唯一（DEC-040）：润不润由 L3 场景规则决定，L0 只负责「不算丢失」。
+        //   删掉这条会让 L0 反过来盖掉 scene-rules.toml 的 "Keep it casual" —— 聊天被公文化。
+        assert!(L0_1_FIDELITY.contains("decided ONLY by the scene style rule in layer L3"));
+        //   兜底判据：拿不准就保留
+        assert!(L0_1_FIDELITY.contains("if unsure whether something is content (A) or a delivery artifact (B), KEEP IT"));
+        //   L0-2 的保护范围必须钉死在 (A)，否则又会把填充词一起保住
+        assert!(L0_2_FIDELITY_OVER_FLUENCY.contains("CONTENT listed in L0-1(A) only"));
+        assert!(L0_2_FIDELITY_OVER_FLUENCY.contains("does NOT protect the delivery artifacts"));
+        //   🔴 F3c 作用域两维度（2026-09-06 Gavin 端测：兴趣爱好句跨句枚举未识别）：
+        //   (i) 项类型无关（动作/事物/景象/状态一律算）；(ii) 枚举可跨句子边界。
+        //   只有项的长度决定 list-vs-inline，类型不决定。删任一条会让跨句枚举重新漏判。
+        let f3 = f3_rules_text(true, true);
+        assert!(f3.contains("ITEM TYPE IS IRRELEVANT"));
+        assert!(f3.contains("MAY SPAN SENTENCE BOUNDARIES"));
+        assert!(f3.contains("Only ITEM LENGTH decides list-vs-inline"));
+        //   收尾语不算枚举项 —— 防止「这些都挺不错的」被并进列表
+        assert!(f3.contains("is NOT an item"));
+        //   短裸名词仍走内联（买菜流水账），这条是既有设计，不许被新示例带偏
+        assert!(f3.contains("stays INLINE"));
         assert!(!f3_rules_text(multiline_safe, punctuation_enabled)
             .contains("DO NOT delete any semantic content"));
         //   W3 两处 OVERRIDE 覆盖声明已删除。
@@ -2455,8 +2542,18 @@ mod tests {
         );
         // c. 保守默认双向（本测试防回归核心，两侧缺一即退化）
         assert!(
-            safe.contains("If unsure, DO NOT use a list"),
-            "保守默认单向必须保留（Gavin 2026-07-31 拍板）"
+            safe.contains("JUDGEMENT, NOT DEFAULT"),
+            "边界情形须要求模型自行判断（Gavin 2026-09-07 推翻 07-31 的保守默认单向）"
+        );
+        // 🔴 DEC-039 落到机器判据：样例只作校准、不作闸门。删掉这两条，
+        //    模型会退回「不匹配样例故不列表」的路径（2026-09-06 兴趣爱好句端测实证）。
+        assert!(
+            safe.contains("NOT a whitelist and NOT a gate"),
+            "必须明示样例不是白名单/闸门"
+        );
+        assert!(
+            safe.contains("no example matches, therefore no"),
+            "必须显式禁止「不匹配样例故不列表」这条推理路径"
         );
         assert!(
             safe.contains("both directions are equally wrong"),
@@ -2518,8 +2615,8 @@ mod tests {
         );
         // 保守默认双向仍在（Gavin 2026-07-31 拍板，1b2697b 对称化核心）
         assert!(
-            fmt.contains("If unsure, DO NOT use a list"),
-            "保守默认单向必须保留"
+            fmt.contains("JUDGEMENT, NOT DEFAULT"),
+            "边界情形须要求模型自行判断（2026-09-07）"
         );
         assert!(
             fmt.contains("both directions are equally wrong"),
