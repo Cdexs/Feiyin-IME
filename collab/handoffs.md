@@ -234,3 +234,13 @@
 - **Step4 E2E**：门禁 66P/0F/0E 通过；🔴 热键 6/6 PASS —— **E2E-GATE-103 环境失效已恢复**（任务书预期红未发生，如实报）；33 skip 既有类别无新失败；旧包口径，HOTKEY-115 真 E2E 归 BUILD-118。
 - **Step5 还原**：numstat 仅剩 Step3 测试模块 29/34 + main.rs 空；三层重跑与 Step1 一致；消融变量全归零；无进程残留；config sha 3186ec8c；fmt exit 0。
 - **红线**：未 commit（含 Step3 A+ 改动）/ v0.9.0 未动 / 零凭证 / 无临时文件 / 未出包。
+
+## 2026-09-06 — tester-1 — BUILD-118 ✅ 阶段五出包（首个含 D2D-109 + HOTKEY-115/B/C 的包，待主控验收 + Gavin 端测）
+
+- **Step1-4 完整执行**：清进程（无在跑）→ npm 1.50s + Tauri UI 1m44s → 主程序 2m12s（111 warnings 持平）→ 同步 Publish/。
+- **产物**：feiyin-ime 12,255,232 B@11:42 / feiyin-ime-ui 10,053,632 B@11:39 / crash-reporter 24,887,808 B@11:42；UI 自 src-tauri/target/release `cp -p` 三处一致。
+- **toml 三副本**：scene `0a3a0b9a…`×3 / itn `311cbb96…`×3（六行 sha256 原始输出在 result.md）。
+- **大小对照**：主程序 +25,600B=两批增量（同量级）；UI/crash 与基线相同（零改动）；~3m58s 同量级。
+- **运行时数据零触碰**：config.toml/wordbook.sqlite/debug.log/version_check.json mtime 保持旧值。
+- **冒烟**：启动 Responding=True 无 panic；进程清理；**热键端测交回 Gavin**（任务书明确不做）。
+- **红线**：未 commit / v0.9.0 未动 / 零凭证 / 无临时文件 / 未用 cargo tauri build。
