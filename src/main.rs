@@ -44,7 +44,7 @@ use std::os::windows::ffi::OsStrExt;
 use windows::core::PCWSTR;
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{
-    COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dwm::{
@@ -53,13 +53,14 @@ use windows::Win32::Graphics::Dwm::{
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
-    AlphaBlend, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
-    CreatePen, CreateRectRgn, CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject,
-    DrawTextW, Ellipse, EndPaint, FillRect, FillRgn, GetDC, GetMonitorInfoW, GetStockObject,
-    GetTextExtentPoint32W, GetTextMetricsW, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx,
-    Rectangle, ReleaseDC, RestoreDC, RoundRect, SaveDC, SelectClipRgn, SelectObject, SetBkColor,
-    SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor, SetWindowRgn, StretchBlt,
-    UpdateWindow, AC_SRC_OVER, BLENDFUNCTION, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH,
+    AlphaBlend, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection,
+    CreateFontW, CreatePen, CreateRectRgn, CreateRoundRectRgn, CreateSolidBrush, DeleteDC,
+    DeleteObject, DrawTextW, Ellipse, EndPaint, FillRect, FillRgn, GetDC, GetMonitorInfoW,
+    GetStockObject, GetTextExtentPoint32W, GetTextMetricsW, InvalidateRect, LineTo,
+    MonitorFromWindow, MoveToEx, Rectangle, ReleaseDC, RestoreDC, RoundRect, SaveDC, SelectClipRgn,
+    SelectObject, SetBkColor, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor,
+    StretchBlt, UpdateWindow, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    BLENDFUNCTION, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
     DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
     FF_DONTCARE, FW_NORMAL, HALFTONE, HDC, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_NULL, PS_SOLID, SRCCOPY, TEXTMETRICW,
@@ -95,13 +96,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, GetWindowLongPtrW, KillTimer, LoadCursorW, MsgWaitForMultipleObjects,
     PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, RemovePropW, SetForegroundWindow,
     SetLayeredWindowAttributes, SetPropW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TrackPopupMenu, TranslateMessage, CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA, GWL_EXSTYLE,
-    HMENU, IDC_ARROW, LWA_ALPHA, MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN,
-    SM_CYSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOW, SW_SHOWNA, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CTLCOLOREDIT,
-    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_NCCREATE, WM_NCPAINT, WM_PAINT,
-    WM_TIMER, WNDCLASSW, WNDCLASS_STYLES, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
+    TrackPopupMenu, TranslateMessage, UpdateLayeredWindow, CREATESTRUCTW, CW_USEDEFAULT,
+    GWLP_USERDATA, GWL_EXSTYLE, HMENU, IDC_ARROW, LWA_ALPHA, MF_SEPARATOR, MF_STRING, MSG,
+    PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN, SM_CYSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNA, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONUP, WM_NCCREATE, WM_NCPAINT, WM_PAINT, WM_TIMER, WNDCLASSW, WNDCLASS_STYLES,
+    WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED,
+    WS_POPUP, WS_VISIBLE,
 };
 #[derive(Debug, Clone)]
 enum PipelineEvent {
@@ -365,25 +367,6 @@ fn create_clear_type_font(size: i32) -> HFONT {
     }
 }
 #[cfg(target_os = "windows")]
-fn apply_overlay_window_region(
-    hwnd: HWND,
-    rect: &RECT,
-    corner_radius: Option<i32>,
-    _is_recording: bool,
-) {
-    let width = (rect.right - rect.left).max(1);
-    let height = (rect.bottom - rect.top).max(1);
-    unsafe {
-        let region = if let Some(radius) = corner_radius {
-            let dia = (radius.max(1) * 2) as i32;
-            CreateRoundRectRgn(0, 0, width, height, dia, dia)
-        } else {
-            CreateRectRgn(0, 0, width, height)
-        };
-        let _ = SetWindowRgn(hwnd, region, true);
-    }
-}
-#[cfg(target_os = "windows")]
 fn draw_text(
     hdc: windows::Win32::Graphics::Gdi::HDC,
     text: &str,
@@ -592,6 +575,49 @@ fn compute_edit_box_geometry(
     let height = desired.min(available).max(1);
     let top_offset = ((rect_h - height) / 2).max(corner_floor);
     (top_offset, height)
+}
+
+/// OVERLAY-121 (P2): ULW ↔ SLWA 模式切换，唯一收口。
+///
+/// 🔴 两种模式不能直切：MSDN SetLayeredWindowAttributes Remarks 逐字 ——
+/// "once SetLayeredWindowAttributes has been called, subsequent UpdateLayeredWindow
+/// calls will fail until the layering style bit is cleared and set again"。
+/// 因此**双向**切换统一走「清 WS_EX_LAYERED → 置回 → 调用目标模式 API」中转
+/// （draft §3.2 / §0 结论 2-3），不依赖任何未记录方向。
+///
+/// 🔴 调用方必须让窗口处于隐藏区间（hide → switch → show）——清 bit 会销毁
+/// layering/redirection 表面（MSDN Using Windows），可见状态下切换会闪一帧。
+///
+/// 目标 SLWA 时立即用当前请求不透明度调 SetLayeredWindowAttributes 完成模式建立；
+/// 目标 ULW 时由下一次 WM_PAINT 的 UpdateLayeredWindow 提交建立（InvalidateRect 触发）。
+#[cfg(target_os = "windows")]
+fn switch_overlay_layered_mode(
+    hwnd: HWND,
+    state: &mut OverlayWindowState,
+    target: OverlayLayeredMode,
+) {
+    if state.layered_mode == target {
+        return;
+    }
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style & !(WS_EX_LAYERED.0 as isize));
+        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | (WS_EX_LAYERED.0 as isize));
+    }
+    state.layered_mode = target;
+    if target == OverlayLayeredMode::Slwa {
+        let alpha = state
+            .request
+            .as_ref()
+            .map(|r| (r.opacity.clamp(0.1, 1.0) * 255.0).round() as u8)
+            .unwrap_or(255);
+        unsafe {
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
+        }
+    }
+    unsafe {
+        let _ = InvalidateRect(hwnd, None, false);
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -951,6 +977,19 @@ impl OverlayThreadHandle {
         }
     }
 }
+/// OVERLAY-121 (P2): overlay 窗口的分层合成模式。
+/// - `Ulw`: UpdateLayeredWindow 逐像素 alpha（per-pixel），八态默认走这条。
+/// - `Slwa`: SetLayeredWindowAttributes 均一 alpha —— 仅编辑态（EDIT 子控件
+///   在 ULW 合成里不可见，MSDN Window Features §Layered Windows）。
+/// 两种模式不能直切（MSDN SetLayeredWindowAttributes Remarks：SLWA 调过之后
+/// ULW 必败，须清/置 WS_EX_LAYERED 中转），切换统一走 `switch_overlay_layered_mode`。
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayLayeredMode {
+    Ulw,
+    Slwa,
+}
+
 #[cfg(target_os = "windows")]
 struct OverlayWindowState {
     request: Option<OverlayRequest>,
@@ -970,6 +1009,8 @@ struct OverlayWindowState {
     edit_old_wndproc: Option<windows::Win32::UI::WindowsAndMessaging::WNDPROC>,
     /// ASR-038-C: 用于 WM_CTLCOLOREDIT 返回的背景画刷（BG_DARK）
     edit_bg_brush: Option<windows::Win32::Graphics::Gdi::HBRUSH>,
+    /// OVERLAY-121 (P2): 当前分层合成模式（Ulw=逐像素 / Slwa=均一 alpha，仅编辑态）
+    layered_mode: OverlayLayeredMode,
     /// OVERLAY-054-D: EDIT 控件专用 HFONT。必须独立于 cached_font，因为 cached_font 在
     /// 隐藏/退出时会被 take+DeleteObject（:1316）；EDIT 控件生命周期与窗口状态绑定，
     /// 若复用 cached_font 会导致字体被提前删除或双删。
@@ -1141,6 +1182,7 @@ fn run_overlay_thread(
         edit_hwnd: None,
         edit_old_wndproc: None,
         edit_bg_brush: None,
+        layered_mode: OverlayLayeredMode::Ulw,
         edit_font: None,
         last_resize_time: None,
         pending_size: None,
@@ -1294,6 +1336,22 @@ fn run_overlay_thread(
                     };
 
                     if let Ok(mut state) = shared_state.lock() {
+                        // OVERLAY-121 (P2): 模式随目标状态对齐 —— StreamingEditing 走
+                        // SLWA（EDIT 子控件可见），其余七态走 ULW（逐像素 alpha）。
+                        // 切换发生在隐藏区间：编辑窗可见时先 SW_HIDE，把清/置
+                        // WS_EX_LAYERED 的 redirection 表面重建闪烁藏进不可见区间。
+                        let target_mode =
+                            if matches!(request.status, OverlayStatus::StreamingEditing { .. }) {
+                                OverlayLayeredMode::Slwa
+                            } else {
+                                OverlayLayeredMode::Ulw
+                            };
+                        if state.layered_mode != target_mode {
+                            unsafe {
+                                let _ = ShowWindow(hwnd, SW_HIDE);
+                            }
+                            switch_overlay_layered_mode(hwnd, &mut state, target_mode);
+                        }
                         // ASR-038-C: clean up any lingering EDIT control when a fresh overlay appears
                         destroy_edit_control(&mut state);
                         restore_noactivate(hwnd);
@@ -1373,7 +1431,17 @@ fn run_overlay_thread(
                     }
                     unsafe {
                         let alpha = (request.opacity.clamp(0.1, 1.0) * 255.0).round() as u8;
-                        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
+                        // OVERLAY-121 (P1): SLWA 均一 alpha 只在 SLWA 模式（编辑态）调用。
+                        // ULW 模式下调 SLWA 会把窗口切回均一 alpha 合成（且之后再想回
+                        // ULW 必须清/置 style bit），ULW 帧的不透明度由 apply_alpha_fixup
+                        // 逐像素烘焙。此处已离开 state 锁作用域，重新锁读模式。
+                        let slwa_active = shared_state
+                            .lock()
+                            .map(|s| s.layered_mode == OverlayLayeredMode::Slwa)
+                            .unwrap_or(false);
+                        if slwa_active {
+                            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
+                        }
                         // OVERLAY-046: non-streaming statuses have current_size == target_size
                         // at Show time, so the interpolation path below never reaches SetWindowPos.
                         // Restore an unconditional positioning here so the overlay appears at the
@@ -1444,6 +1512,12 @@ fn run_overlay_thread(
                     }
                 }
                 OverlayCommand::EnterEditMode => {
+                    // OVERLAY-121 (P2): 切模式必须发生在隐藏区间（draft §3.2）——
+                    // 编辑入口从可见的录音浮层进入，先藏窗，SLWA 切换藏在不可见区间，
+                    // 再走原有 EDIT 创建 + 显示流程。
+                    unsafe {
+                        let _ = ShowWindow(hwnd, SW_HIDE);
+                    }
                     if let Ok(mut state) = shared_state.lock() {
                         // OVERLAY-051-A: editing text fallback chain:
                         // RecordingWithText -> StreamingEditing -> last_streaming_text -> empty.
@@ -1469,6 +1543,10 @@ fn run_overlay_thread(
                             r.status = OverlayStatus::StreamingEditing { text: text.clone() };
                             r.clone()
                         });
+                        // OVERLAY-121 (P2): 窗口已在本 handler 入口隐藏，此刻切 SLWA ——
+                        // EDIT 子控件只在 SLWA 合成里可见（ULW 合成不含子窗口，
+                        // MSDN Window Features §Layered Windows / draft §3.1）。
+                        switch_overlay_layered_mode(hwnd, &mut state, OverlayLayeredMode::Slwa);
                         // Remove NOACTIVATE so overlay can receive focus/IME
                         remove_noactivate(hwnd);
                         let rect = get_window_client_rect(hwnd);
@@ -1949,7 +2027,8 @@ unsafe extern "system" fn overlay_wnd_proc(
             }
         }
         WM_PAINT => {
-            // Double-buffer: draw to memory DC first, then BitBlt to screen
+            // Double-buffer: draw to memory DC, then submit — via UpdateLayeredWindow
+            // (ULW, per-pixel alpha, OVERLAY-121 P1) or BitBlt (SLWA editing mode, P2).
             let mut ps = PAINTSTRUCT::default();
             let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
             if hdc.0.is_null() {
@@ -1963,29 +2042,75 @@ unsafe extern "system" fn overlay_wnd_proc(
             let width = rect.right - rect.left;
             let height = rect.bottom - rect.top;
 
-            // Create memory DC and bitmap
+            let layered_mode = data
+                .state
+                .lock()
+                .map(|s| s.layered_mode)
+                .unwrap_or(OverlayLayeredMode::Ulw);
+            let use_ulw = layered_mode == OverlayLayeredMode::Ulw;
+
+            // Create memory DC and bitmap.
+            // OVERLAY-121 (P1): ULW path uses a 32bpp top-down DIB section — the
+            // premultiplied BGRA surface UpdateLayeredWindow composes (BindDC binds the
+            // same mem_dc, DEC-055 single point untouched). SLWA path keeps the
+            // compatible bitmap for byte-exact old behavior.
             let mem_dc = unsafe { CreateCompatibleDC(hdc) };
-            let mem_bmp = unsafe { CreateCompatibleBitmap(hdc, width, height) };
+            let (mem_bmp, ppv_bits) = if use_ulw {
+                let mut bmi = BITMAPINFO::default();
+                bmi.bmiHeader = BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height, // negative = top-down, GDI/D2D top-left origin
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                };
+                let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+                // CreateDIBSection 失败（罕见）时返回默认无效 HBITMAP —— 后续
+                // SelectObject 失败当帧画不出，下一帧重试；GDI fallback 结构不受影响。
+                let bmp = unsafe {
+                    CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+                        .unwrap_or_default()
+                };
+                (bmp, bits)
+            } else {
+                (
+                    unsafe { CreateCompatibleBitmap(hdc, width, height) },
+                    std::ptr::null_mut(),
+                )
+            };
             let old_bmp = unsafe { SelectObject(mem_dc, mem_bmp) };
 
-            // OVERLAY-043: memory bitmap is uninitialized; fill the whole back-buffer with the
-            // overlay background so any region not covered by subsequent drawing stays predictable.
-            let bg_brush = unsafe { CreateSolidBrush(OVERLAY_BG_DARK) };
-            unsafe {
-                let _ = FillRect(
-                    mem_dc,
-                    &RECT {
-                        left: 0,
-                        top: 0,
-                        right: width,
-                        bottom: height,
-                    },
-                    bg_brush,
-                );
-                let _ = DeleteObject(bg_brush);
+            if use_ulw {
+                // OVERLAY-121 (P1/P3): ULW 帧从全透明起步（零初始化），不再整矩形预填
+                // —— D2D 各态自画圆角底板（圆角外像素 alpha=0 = 合成时透明），
+                // GDI fallback 各态自带背景填充（含 Processing 的圆角 region 填充）。
+                unsafe {
+                    std::ptr::write_bytes(ppv_bits as *mut u8, 0, (width * height * 4) as usize);
+                }
+            } else {
+                // OVERLAY-043: memory bitmap is uninitialized; fill the whole back-buffer
+                // with the overlay background so any region not covered by subsequent
+                // drawing stays predictable. SLWA (editing) keeps this byte-exact.
+                let bg_brush = unsafe { CreateSolidBrush(OVERLAY_BG_DARK) };
+                unsafe {
+                    let _ = FillRect(
+                        mem_dc,
+                        &RECT {
+                            left: 0,
+                            top: 0,
+                            right: width,
+                            bottom: height,
+                        },
+                        bg_brush,
+                    );
+                    let _ = DeleteObject(bg_brush);
+                }
             }
 
             // Draw to memory DC
+            let mut opacity = 1.0_f32;
             if let Ok(mut state) = data.state.lock() {
                 // SHIMMER-FIX-002: time-based phase — immune to WM_PAINT frequency variation
                 let _shimmer_ms = std::time::SystemTime::now()
@@ -1993,6 +2118,9 @@ unsafe extern "system" fn overlay_wnd_proc(
                     .unwrap_or_default()
                     .as_millis() as u64;
                 state.shimmer_phase = (_shimmer_ms % 800) as f32 / 800.0; // SHIMMER-SPEED-002: 1200→800ms
+                if let Some(req) = state.request.as_ref() {
+                    opacity = req.opacity.clamp(0.1, 1.0);
+                }
                 let (cancel_rect, close_rect, title_close_rect, submit_rect, text_hit_rect) =
                     draw_overlay_to_dc(hwnd, mem_dc, &rect, &mut state);
                 state.cancel_btn_rect = cancel_rect;
@@ -2004,11 +2132,37 @@ unsafe extern "system" fn overlay_wnd_proc(
                 state.needs_repaint = false;
             }
 
-            // Copy to screen DC (one-shot, no flicker)
             unsafe {
-                let _ = BitBlt(
-                    hdc, rect.left, rect.top, width, height, mem_dc, 0, 0, SRCCOPY,
-                );
+                if use_ulw {
+                    // OVERLAY-121 (P1): 单点提交。先做帧末 alpha 处理（D2D 预乘像素乘
+                    // 请求不透明度；GDI 像素提为不透明再预乘），再整窗交给合成器。
+                    apply_alpha_fixup(ppv_bits as *mut u8, (width * height) as usize, opacity);
+                    let blend = BLENDFUNCTION {
+                        BlendOp: AC_SRC_OVER as u8,
+                        BlendFlags: 0,
+                        SourceConstantAlpha: 255, // 不透明度已逐像素烘焙进 DIB
+                        AlphaFormat: AC_SRC_ALPHA as u8,
+                    };
+                    let _ = UpdateLayeredWindow(
+                        hwnd,
+                        None,
+                        None,
+                        Some(&SIZE {
+                            cx: width,
+                            cy: height,
+                        }),
+                        mem_dc,
+                        Some(&POINT { x: 0, y: 0 }),
+                        COLORREF(0),
+                        Some(&blend),
+                        ULW_ALPHA,
+                    );
+                } else {
+                    // SLWA (editing) path: one-shot BitBlt to screen DC, byte-exact old behavior.
+                    let _ = BitBlt(
+                        hdc, rect.left, rect.top, width, height, mem_dc, 0, 0, SRCCOPY,
+                    );
+                }
                 let _ = SelectObject(mem_dc, old_bmp);
                 let _ = DeleteObject(mem_bmp);
                 let _ = DeleteDC(mem_dc);
@@ -2040,9 +2194,43 @@ unsafe extern "system" fn overlay_wnd_proc(
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
+/// OVERLAY-121 (P1): 帧末单点 alpha 处理，唯一调用点紧贴 ULW 提交（WM_PAINT 内）。
+/// - D2D 预乘像素（a>0）：RGB/A 同乘 opacity —— 预乘不变式（rgb ≤ a）随等比缩放成立。
+/// - GDI 像素（a==0 且 RGB≠0）：GDI 不写 alpha 通道；语义「本应不透明」，提为
+///   a = opacity·255 并同乘 RGB 落入预乘域（预乘合法：rgb·op ≤ 255·op = a）。
+/// - 全零像素（a==0 且 RGB==0）：真透明（P3 圆角外），保持不动。
+/// opacity 取自 Show 请求的均一不透明度，替代原 SetLayeredWindowAttributes(LWA_ALPHA) 语义。
+#[cfg(target_os = "windows")]
+fn apply_alpha_fixup(bits: *mut u8, pixel_count: usize, opacity: f32) {
+    let op = opacity.clamp(0.1, 1.0);
+    let scale = |c: u8| ((c as f32 * op).round() as u8).min(255);
+    unsafe {
+        for i in 0..pixel_count {
+            let p = bits.add(i * 4);
+            let b = *p;
+            let g = *p.add(1);
+            let r = *p.add(2);
+            let a = *p.add(3);
+            if a == 0 && (r | g | b) != 0 {
+                // GDI-written pixel: promote to opaque-at-opacity, then premultiply.
+                *p = scale(b);
+                *p.add(1) = scale(g);
+                *p.add(2) = scale(r);
+                *p.add(3) = ((op * 255.0).round() as u8).min(255);
+            } else if a != 0 {
+                // D2D premultiplied pixel: scale all four channels.
+                *p = scale(b);
+                *p.add(1) = scale(g);
+                *p.add(2) = scale(r);
+                *p.add(3) = scale(a);
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn draw_overlay_to_dc(
-    hwnd: HWND,
+    _hwnd: HWND, // OVERLAY-121 (P3): 掩码退役后本函数不再触碰窗口几何，保留参数位
     hdc: HDC,
     rect: &RECT,
     state: &mut OverlayWindowState,
@@ -2076,7 +2264,6 @@ fn draw_overlay_to_dc(
     if let Some(request) = &state.request {
         match &request.status {
             OverlayStatus::Recording => {
-                apply_overlay_window_region(hwnd, rect, None, true);
                 cancel_btn_rect = Some(draw_recording_overlay(
                     hdc,
                     rect,
@@ -2086,7 +2273,6 @@ fn draw_overlay_to_dc(
                 ));
             }
             OverlayStatus::RecordingStreamingIdle => {
-                apply_overlay_window_region(hwnd, rect, None, true);
                 cancel_btn_rect = Some(draw_recording_overlay(
                     hdc,
                     rect,
@@ -2096,7 +2282,6 @@ fn draw_overlay_to_dc(
                 ));
             }
             OverlayStatus::RecordingWithText { text } => {
-                apply_overlay_window_region(hwnd, rect, None, true);
                 // OVERLAY-086 Bug 2 ② (render-side guard): an empty streaming text must
                 // never produce an empty window. The upstream gate (OVERLAY-086 Bug 2 ①,
                 // qwen_inference on_result) should stop empty packets from reaching this
@@ -2133,12 +2318,12 @@ fn draw_overlay_to_dc(
                 }
             }
             OverlayStatus::FallingToProcessing { .. } => {
-                apply_overlay_window_region(hwnd, rect, None, true);
                 // D2D-P2 (PLAN-108 H7): 与 Recording 波形变体共用同一复合体
                 // （两者 GDI 输出逐位相同，见 draw_recording_waveform_overlay doc）。
                 // On any D2D failure the GDI path below still renders this frame.
                 if !d2d::draw_recording_waveform_overlay(hdc, rect, state) {
-                    draw_overlay_chrome(hdc, rect);
+                    // OVERLAY-121 (P3): FallingToProcessing fallback r=16（Gavin 拍板）。
+                    draw_overlay_chrome(hdc, rect, 16);
                     draw_recording_indicator_and_waveform(hdc, rect, state);
                     cancel_btn_rect = Some(draw_stop_button(hdc, rect));
                 } else {
@@ -2152,7 +2337,6 @@ fn draw_overlay_to_dc(
                 // (no anti-aliasing), so the outermost 1px of the D2D anti-aliased corner
                 // edge gets clipped hard — accepted under DEC-056 as the better of the two
                 // imperfect options; if end-testing prefers the soft edge, revert to None.
-                apply_overlay_window_region(hwnd, rect, Some(16), true);
                 // D2D-073 P0: this status is redrawn with Direct2D + DirectWrite
                 // (DEC-055 gray migration step 1). On any D2D failure the GDI path below
                 // still renders this frame, so the overlay never goes blank.
@@ -2172,21 +2356,20 @@ fn draw_overlay_to_dc(
                 }
             }
             OverlayStatus::StreamingEditing { .. } => {
-                apply_overlay_window_region(hwnd, rect, None, true);
                 // D2D-P2 (PLAN-108 H9): editing chrome + submit button redrawn with D2D.
                 // 正文由 EDIT 子控件自绘（本态父窗口不画文字）；on any D2D failure the
                 // GDI path below still renders this frame, so the overlay never blanks.
                 if !d2d::draw_editing_overlay(hdc, rect) {
                     // OVERLAY-051-B: editing mode draws a clear submit button (orange ⏎) on the right.
                     // The EDIT control renders the text itself; we only paint chrome + submit button.
-                    draw_overlay_chrome(hdc, rect);
+                    // OVERLAY-121 (P3): 编辑态 fallback 维持 r=10（SLWA 旧路径口径不变）。
+                    draw_overlay_chrome(hdc, rect, 10);
                     submit_btn_rect = Some(draw_submit_button(hdc, rect));
                 } else {
                     submit_btn_rect = Some(draw_submit_button_hit_rect_only(rect));
                 }
             }
             OverlayStatus::FocusLost { text, .. } => {
-                apply_overlay_window_region(hwnd, rect, Some(10), false);
                 // D2D-P2 (PLAN-108 H11): preview overlay redrawn with D2D. On any D2D
                 // failure the GDI path below still renders this frame, so the overlay
                 // never goes blank. 命中 rect 两条路径都从 preview_hit_rects 出
@@ -2205,7 +2388,6 @@ fn draw_overlay_to_dc(
                 }
             }
             OverlayStatus::Error(message) => {
-                apply_overlay_window_region(hwnd, rect, Some(10), false);
                 // D2D-P2 (PLAN-108 H12): error 态 redrawn with D2D. On any D2D failure
                 // the GDI path below still renders this frame, so the overlay never
                 // goes blank. GDI fallback keeps DT_END_ELLIPSIS (U1 裁决).
@@ -2217,14 +2399,12 @@ fn draw_overlay_to_dc(
                 // BUG-119: 信息提示态。圆角掩码沿用 Error 现值 Some(10)
                 //（OVERLAY-121 per-pixel alpha 才动圆角，本单不碰）。
                 // D2D 优先，失败回落 GDI（与 Error 态同一兜底结构）。
-                apply_overlay_window_region(hwnd, rect, Some(10), false);
                 if !d2d::draw_info_overlay(hdc, rect, message) {
                     draw_info_overlay(hdc, rect, message, request.ui_language);
                 }
             }
         }
     } else {
-        apply_overlay_window_region(hwnd, rect, None, false);
     }
 
     unsafe {
@@ -2242,9 +2422,8 @@ fn draw_overlay_to_dc(
 }
 
 #[cfg(target_os = "windows")]
-fn draw_overlay_chrome(hdc: windows::Win32::Graphics::Gdi::HDC, rect: &RECT) {
+fn draw_overlay_chrome(hdc: windows::Win32::Graphics::Gdi::HDC, rect: &RECT, corner_radius: i32) {
     const BG_DARK: COLORREF = COLORREF(0x110F0D);
-    const CORNER_RADIUS: i32 = 10;
     // Dark background
     let bg = unsafe { CreateSolidBrush(BG_DARK) };
     unsafe {
@@ -2263,15 +2442,15 @@ fn draw_overlay_chrome(hdc: windows::Win32::Graphics::Gdi::HDC, rect: &RECT) {
             rect.top,
             rect.right,
             rect.bottom,
-            CORNER_RADIUS * 2,
-            CORNER_RADIUS * 2,
+            corner_radius * 2,
+            corner_radius * 2,
         );
+
         let _ = SelectObject(hdc, old_pen);
         let _ = SelectObject(hdc, old_brush);
         let _ = DeleteObject(border_pen);
     }
 }
-
 /// D2D-P2 (PLAN-108 H3): 波形快照纯函数 —— 锁内完成 peak decay（OVERLAY-LOCK-SCOPE-001
 /// 语义固化点：decay 必须在锁内、绘制在锁外）并收集 16 个 display_value。
 /// GDI draw_recording_indicator_and_waveform 与 D2D d2d::waveform 共用，公式单源。
@@ -2564,7 +2743,9 @@ fn draw_recording_overlay(
     if show_placeholder && d2d::draw_streaming_idle_overlay(hdc, rect, state, ui_language) {
         return draw_stop_button_hit_rect_only(rect);
     }
-    draw_overlay_chrome(hdc, rect);
+    // OVERLAY-121 (P3): Recording 系 GDI fallback r=16（Gavin 拍板；D2D 失败帧仍是
+    // 方角填充 —— GDI 无 AA，方角是 fallback 的既定降级，见 result.md）。
+    draw_overlay_chrome(hdc, rect, 16);
     // OVERLAY-051-E: online streaming ASR waiting for first text shows placeholder,
     // not waveform. Local model continues to show waveform unchanged.
     if show_placeholder {
@@ -2577,7 +2758,7 @@ fn draw_recording_overlay(
         if d2d::draw_recording_waveform_overlay(hdc, rect, state) {
             return draw_stop_button_hit_rect_only(rect);
         }
-        draw_overlay_chrome(hdc, rect);
+        draw_overlay_chrome(hdc, rect, 16);
         draw_recording_indicator_and_waveform(hdc, rect, state);
     }
     draw_stop_button(hdc, rect)
@@ -2631,7 +2812,8 @@ fn draw_recording_overlay_with_text(
         return (cancel, cancel, text_hit);
     }
     // OVERLAY-043: text mode uses chrome + stop button only, no waveform so text is not squeezed
-    draw_overlay_chrome(hdc, rect);
+    // OVERLAY-121 (P3): RecordingWithText fallback r=16（Gavin 拍板）。
+    draw_overlay_chrome(hdc, rect, 16);
     // keep the mic indicator so the user still sees the recording state
     draw_recording_indicator(hdc, rect, state);
     let cancel_rect = draw_stop_button(hdc, rect);
@@ -3025,7 +3207,7 @@ mod d2d {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct2D::Common::{
-        D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
+        D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
     };
     use windows::Win32::Graphics::Direct2D::{
         D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, ID2D1SolidColorBrush,
@@ -3086,7 +3268,12 @@ mod d2d {
                 r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
                 pixelFormat: D2D1_PIXEL_FORMAT {
                     format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                    // OVERLAY-121 (P1): IGNORE → PREMULTIPLIED。MSDN CreateDCRenderTarget
+                    // Remarks 明文 DC render target 支持两种 alpha mode；预乘 alpha 是
+                    // UpdateLayeredWindow(ULW_ALPHA, AC_SRC_ALPHA) 合成的输入格式 ——
+                    // 改字段不改收口结构（DEC-055：BindDC/Begin/End/RECREATE 单点不动）。
+                    // D2D 产出的预乘像素直接落进 WM_PAINT 的 32bpp DIB section。
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
                 },
                 dpiX: 0.0,
                 dpiY: 0.0,
@@ -3507,8 +3694,11 @@ mod d2d {
     /// Same 0.5px pen-centering inset as the P0 border (fill 0..w, stroke 0.5..w-0.5).
     /// OVERLAY-086 Bug 1's wedge lesson applied here from day one: fill and stroke
     /// share one radius binding, so no corner wedge exists on this path either.
-    fn chrome(res: &D2dResources, w: f32, h: f32) {
-        chrome_with(res, w, h, super::OVERLAY_BG_DARK, 10.0);
+    /// OVERLAY-121 (P3): 圆角半径参数化 —— Gavin 2026-09-06 拍板视觉口径：
+    /// Recording 三态 + FallingToProcessing 走 r=16（与 Processing 统一），
+    /// 编辑态维持 r=10（SLWA 旧路径，视觉零变化）。
+    fn chrome(res: &D2dResources, w: f32, h: f32, radius: f32) {
+        chrome_with(res, w, h, super::OVERLAY_BG_DARK, radius);
     }
 
     /// Mic indicator geometry shared by the D2D path (matches GDI `draw_recording_indicator`
@@ -3745,7 +3935,8 @@ mod d2d {
     /// Returns false on any D2D failure — the caller renders the same frame via GDI.
     pub(crate) fn draw_editing_overlay(hdc: HDC, rect: &RECT) -> bool {
         with_d2d(hdc, rect, |res, w, h| {
-            chrome(res, w, h);
+            // OVERLAY-121 (P3): 编辑态维持 r=10 —— SLWA 旧路径，视觉口径不变。
+            chrome(res, w, h, 10.0);
             let _ = submit_button(res, w, h);
         })
     }
@@ -3853,7 +4044,8 @@ mod d2d {
         state: &OverlayWindowState,
     ) -> bool {
         with_d2d(hdc, rect, |res, w, h| {
-            chrome(res, w, h);
+            // OVERLAY-121 (P3): Recording/FallingToProcessing 升 r=16（Gavin 拍板）。
+            chrome(res, w, h, 16.0);
             mic_indicator(res, h, state);
             waveform(res, w, h, state);
             right_separator(res, w, h);
@@ -3958,7 +4150,8 @@ mod d2d {
         ui_language: crate::config::UiLanguage,
     ) -> bool {
         with_d2d(hdc, rect, |res, w, h| {
-            chrome(res, w, h);
+            // OVERLAY-121 (P3): RecordingStreamingIdle 升 r=16（Gavin 拍板）。
+            chrome(res, w, h, 16.0);
             mic_indicator(res, h, state);
             placeholder_text(res, w, h, ui_language);
             let _ = stop_button(res, w, h);
@@ -3978,7 +4171,8 @@ mod d2d {
         text_width: i32,
     ) -> bool {
         with_d2d(hdc, rect, |res, w, h| {
-            chrome(res, w, h);
+            // OVERLAY-121 (P3): RecordingWithText 升 r=16（Gavin 拍板）。
+            chrome(res, w, h, 16.0);
             mic_indicator(res, h, state);
             streaming_text(res, w, h, visible_text, text_width);
             // Right separator (主控 D2D-P1 验收要求补齐): GDI 版 :2617-2624 逐项照抄 —
@@ -10085,6 +10279,7 @@ mod overlay_086_d2d_p1_guard_tests {
             edit_hwnd: None,
             edit_old_wndproc: None,
             edit_bg_brush: None,
+            layered_mode: OverlayLayeredMode::Ulw,
             edit_font: None,
             last_resize_time: None,
             pending_size: None,
@@ -10622,6 +10817,7 @@ mod overlay_109_d2d_p2p3_guard_tests {
             edit_hwnd: None,
             edit_old_wndproc: None,
             edit_bg_brush: None,
+            layered_mode: OverlayLayeredMode::Ulw,
             edit_font: None,
             last_resize_time: None,
             pending_size: None,

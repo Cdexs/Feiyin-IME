@@ -2,6 +2,15 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-09-06 — coder-2 — OVERLAY-121-IMPL-133 ✅ per-pixel alpha P1+P2+P3 一次做完（ULW+DIB+fixup / 双模式切换 / 掩码退役，1098P/1F 唯一红=预期 H7，待主控验收）
+
+- **diff**：仅 src/main.rs +282/-86。P1=渲染骨架（PREMULTIPLIED + 32bpp DIB + apply_alpha_fixup 帧末单点 + ULW 单点提交 + :1376 SLWA 条件化）；P2=switch_overlay_layered_mode 唯一收口（清/置 WS_EX_LAYERED 双向中转，MSDN 逐字）+ EnterEditMode/Show 两处挂钩（隐藏区间切换）；P3=apply_overlay_window_region 函数+10 调用点退役 + chrome 半径参数化（Recording 系/Falling r=16，Error/FocusLost/Info/编辑 r=10，Gavin 口径）。
+- **验证**：fmt 0 / check --all-targets 0 error / warnings **111/102 与基线逐位持平** / cargo test **1098P/1F/9I，唯一红=H7 圆角快照（预期，tester-1 阶段三更新）**；wordbook 等其余目标 51P/0F。
+- **三阶段 commit 边界 + H7 新快照建议 + 护栏建议**：outbox/coder-2/result.md。
+- **PoC 项（端测）**：P2 切换闪烁 / PREMULTIPLIED→DIB alpha 传递（worst case fixup 兜底为不透明，几何仍正确）/ 流式帧率。
+- **macOS**：不适用复核成立（全部改动 cfg(windows) 内；NSWindow 原生逐像素透明），已写 docs/MACOS-HANDOFF.md。
+- **红线**：未 commit / 未动版本 / 未出包 / 圆角快照护栏未改（H7 红留给 tester-1）/ hotkey.rs 未动 / 零 config 开关。
+
 ## 2026-09-06 — coder-2 — FLICKER-130 ✅ 编辑态闪烁根治 R1 落地（should_ignore_streaming_text 收敛单参，三问取证 + 1096P/0F，待主控验收）
 
 - **核心改动**：`should_ignore_streaming_text` 由 `stopped && !editing` 收敛为 `stopped`（单参化），编辑态迟到流式包一律丢弃。仅 src/main.rs +34/-22（含 doc/测试），fmt/check 过，warnings 111/102 与基线逐位持平，cargo test 1096P/0F/9I。

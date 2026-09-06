@@ -1587,3 +1587,20 @@ Show(StreamingEditing) → 无条件 destroy_edit_control 从未实现「同步 
 - **因此**：R1 改动零 macOS 对端工作；MACOS-HANDOFF §2.10 的 macOS 编辑态 TODO 表
   若将来实施，应直接按 R1 后的语义实现（晚到包丢弃，不做编辑态豁免），不要复刻
   OVERLAY-043 时代已被证伪的 editing 豁免。
+
+
+### OVERLAY-121-IMPL-133 · per-pixel alpha（ULW）落地（2026-09-06，coder-2）
+
+**Windows 侧改动**：overlay 渲染提交通道从「均一 alpha（SetLayeredWindowAttributes）+
+二值掩码（SetWindowRgn）」迁移为「UpdateLayeredWindow 逐像素 alpha + D2D 抗锯齿圆角」
+（draft `collab/drafts/overlay-121-plan.md` 方案 B：编辑态切回 SLWA，其余七态走 ULW）。
+三阶段一次做完（P1 渲染骨架 / P2 双模式切换 / P3 掩码退役）。
+
+**macOS 侧结论（不适用，无需对端改动；draft §10 复核成立）**：
+- 本次全部改动位于 `#[cfg(target_os = "windows")]` 区域（wndproc/WM_PAINT/d2d 模块/
+  OverlayLayeredMode/switch helper/GDI+D2D 绘制函数），macOS 编译零影响。
+- macOS NSWindow 原生支持逐像素透明（`setOpaque:NO` + 带 alpha backgroundColor）与
+  AA 圆角（layer cornerRadius），无 Windows 这边的 layered window 历史包袱，无对应缺口。
+- 若将来实施 macOS 编辑态（§2.10 TODO 表），视觉口径直接对齐新基线：圆角
+  Recording 系 r=16 / Error·FocusLost·Info r=10，逐像素 alpha 天然成立，无需移植
+  ULW/SLWA 双模式机制（那是 Win32 layered window 专属约束）。
