@@ -2,6 +2,15 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-09-06 — coder-2 — FLICKER-130 ✅ 编辑态闪烁根治 R1 落地（should_ignore_streaming_text 收敛单参，三问取证 + 1096P/0F，待主控验收）
+
+- **核心改动**：`should_ignore_streaming_text` 由 `stopped && !editing` 收敛为 `stopped`（单参化），编辑态迟到流式包一律丢弃。仅 src/main.rs +34/-22（含 doc/测试），fmt/check 过，warnings 111/102 与基线逐位持平，cargo test 1096P/0F/9I。
+- **三问取证**：① `editing` 豁免系 OVERLAY-043（a588509）有意加的「编辑中同步 EDIT 文字」，但其路径（Show→destroy_edit_control）从未实现该意图，唯一效果是闪烁本身——删除不属 PLAUSIBLE-FIX 形态；② 快照链/词库镜像在门闩前取数，零影响，代价 ≤ 个别字尾巴且现状是「销毁 EDIT」非「同步」——R1 严格改进；③ 非编辑态逐位等价（调用点全库 1 处 + 测试 2 处全盘清）。
+- **不变量**：EditRequested 相邻置位 editing⇒stopped（同线程），(false,true) 不可达；门闩仍为「仅渲染」，镜像先行未动（053-B 安全）。
+- **macOS**：不同源不适用复核成立（StreamingText 仅 log :6805，无编辑态），已写 MACOS-HANDOFF.md。
+- **红线**：未 commit / 未动版本 / 未出包 / 圆角未动 / hotkey.rs 未动 / 零凭证。
+- **护栏建议**：result.md 附录（门闩仅渲染顺序护栏 / 调用点唯一性 / editing⇒stopped 不变量护栏）。
+
 ## 2026-09-06 — coder-2 — OVERLAY-121-PLAN-127 ✅ per-pixel alpha 落地方案设计（零代码，主控验收通过 + 三处反馈已闭环，待 Gavin 拍板：方案 B 批准 + 三态是否顺带升 r=16 圆角）
 
 - **产出**：collab/drafts/overlay-121-plan.md（唯一可写文件，git status 干净，零 src/** 触碰）。

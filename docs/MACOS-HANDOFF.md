@@ -1568,3 +1568,22 @@ Toggle 分支无任何状态、恒发 Start。修法：另开 `TOGGLE_ACTIVE` �
   后续批次。
 - **对端验证点**：按住热键不说话 → 浮层弹本地化提示（非英文开发态原文）后自动关、
   托盘回 Idle。
+
+
+### FLICKER-130 · 编辑态闪烁根治 R1（2026-09-06，coder-2 复核）
+
+**Windows 侧改动**：`should_ignore_streaming_text` 由 `stopped && !editing` 收敛为
+`stopped`（FLICKER-130 R1，Gavin 拍板「丢弃编辑态迟到流式包」）——录音已停后到达的
+流式包一律丢弃，不再保留 OVERLAY-043 时代的 editing 豁免（该豁免路径
+Show(StreamingEditing) → 无条件 destroy_edit_control 从未实现「同步 EDIT 文字」意图，
+唯一效果是销毁编辑控件引发闪烁）。
+
+**macOS 侧结论（不同源，不适用，无需对端改动）——INVESTIGATE-120 结论复核后仍成立**：
+- **无门闩可改**：macOS 控制器是独立 `run_controller_macos`（cfg(macos)，main.rs:6473+），
+  其 `handle_pipeline_event`（:6748+）对 `StreamingText` 只 `log::debug!`（:6805-6807，
+  「macOS 侧流式文本暂不渲染」，:6734 注释同证），从不进 overlay 渲染路径。
+- **无编辑态**：macOS 侧无 `OVERLAY_EDITING` 等价物、无 EDIT 子控件、无 EnterEditMode——
+  闪烁根因（子控件销毁）在 macOS 侧结构上不存在。
+- **因此**：R1 改动零 macOS 对端工作；MACOS-HANDOFF §2.10 的 macOS 编辑态 TODO 表
+  若将来实施，应直接按 R1 后的语义实现（晚到包丢弃，不做编辑态豁免），不要复刻
+  OVERLAY-043 时代已被证伪的 editing 豁免。

@@ -4774,17 +4774,28 @@ fn interpolate_step(delta: i32) -> i32 {
 }
 
 /// OVERLAY-043-B: whether a late StreamingText packet should be ignored.
-/// Truth table (rows are the four input combinations that must be nailed down):
+/// Truth table (both input combinations must be nailed down):
 ///
-/// | stopped | editing | result | meaning |
-/// |---------|---------|--------|---------|
-/// | false   | false   | false  | normal recording, show text |
-/// | false   | true    | false  | editing, keep syncing EDIT text |
-/// | true    | false   | true   | stopped & not editing -> do not revert to RecordingWithText |
-/// | true    | true    | false  | stopped but editing -> still sync EDIT text (window stays) |
+/// | stopped | result | meaning |
+/// |---------|--------|---------|
+/// | false   | false  | recording, show text |
+/// | true    | true   | stopped, late packet is always dropped |
+///
+/// FLICKER-130 (R1, Gavin 2026-09-06 拍板): the OVERLAY-043-era `editing`
+/// exemption is removed. Its only code path (`else if editing` -> Show(StreamingEditing))
+/// unconditionally destroys the EDIT control in the Show handler (:1298) while
+/// `create_edit_control` is only reachable from EnterEditMode — so the designed
+/// "still sync EDIT text" never worked; the exemption's sole observable effect was
+/// destroying the editor = the flicker itself. Production invariant that makes the
+/// `editing` dimension moot: OVERLAY_EDITING.store(true) (:5518) and
+/// STREAMING_STOPPED.store(true) (:5521) are adjacent stores on the same controller
+/// thread inside EditRequested, so editing=true implies stopped=true; the (false,true)
+/// combination is unreachable. Render-only gate: the last_streaming_text mirror
+/// (:5372) is updated BEFORE this gate, so dropping the render does not starve
+/// WORDBOOK-053-B (渲染抑制 ≠ 数据抑制, see generation_gate_blocks_mirror_but_043_gate_is_render_only).
 #[cfg(target_os = "windows")]
-fn should_ignore_streaming_text(stopped: bool, editing: bool) -> bool {
-    stopped && !editing
+fn should_ignore_streaming_text(stopped: bool) -> bool {
+    stopped
 }
 
 /// OVERLAY-051-G-FIN: 时间戳驱动回放 —— 返回此刻应显示的字符数。
@@ -5370,10 +5381,12 @@ fn process_controller_events(
                     *mirror = Some(text.clone());
                 }
                 // ASR-038-B: 流式 ASR 增量文本推送到 overlay
-                // OVERLAY-043-B: late streaming packets after stop are ignored unless editing.
+                // OVERLAY-043-B / FLICKER-130 (R1): late streaming packets after stop are
+                // always ignored, editing or not — the old editing exemption destroyed the
+                // EDIT control instead of syncing it (see should_ignore_streaming_text doc).
                 let stopped = STREAMING_STOPPED.load(Ordering::Acquire);
                 let editing = OVERLAY_EDITING.load(Ordering::Acquire);
-                if should_ignore_streaming_text(stopped, editing) {
+                if should_ignore_streaming_text(stopped) {
                     log::debug!("OVERLAY-043: ignoring late StreamingText after stop");
                 } else if editing {
                     // Editing mode: keep the EDIT control text in sync without switching window status.
@@ -9169,17 +9182,16 @@ mod overlay_043_interpolate_tests {
         assert!(frames <= 40, "240→800 应在 40 帧内收敛，实际 {frames} 帧");
     }
 
-    /// 门闩 `should_ignore_streaming_text` 四格真值表穷举（Gavin 第 5 条修复）。
+    /// 门闩 `should_ignore_streaming_text` 真值表穷举（Gavin 第 5 条修复；FLICKER-130 R1 收敛）。
+    /// OVERLAY-043 时代的四格表（stopped × editing）在 R1 落地后收敛为两格：
+    /// editing 豁免删除——豁免路径（Show → destroy_edit_control）从未实现同步意图，
+    /// 是编辑态闪烁根因；生产不变量 editing ⇒ stopped（EditRequested 相邻置位）。
     #[test]
     fn ignore_streaming_text_truth_table() {
-        // (false, false)：正常录音出字 → 不忽略
-        assert!(!should_ignore_streaming_text(false, false));
-        // (false, true)：编辑中，文字继续同步进 EDIT → 不忽略
-        assert!(!should_ignore_streaming_text(false, true));
-        // (true, false)：已松手且未编辑 → 晚到包不得把窗口推回录音态 → 忽略
-        assert!(should_ignore_streaming_text(true, false));
-        // (true, true)：已松手但在编辑 → 仍同步 EDIT，但不切窗口状态 → 不忽略
-        assert!(!should_ignore_streaming_text(true, true));
+        // (false)：正常录音出字 → 不忽略
+        assert!(!should_ignore_streaming_text(false));
+        // (true)：已松手 → 晚到包一律丢弃，编辑态也不例外（FLICKER-130 R1）
+        assert!(should_ignore_streaming_text(true));
     }
 }
 
@@ -9456,8 +9468,8 @@ mod overlay_075_d2d_guard_tests {
                 *m = Some(text.to_string());
             }
             // 043 门闩与代际正交：同 session 松手后（stopped=true）包仍在消费序里，
-            // 由 should_ignore_streaming_text 单独裁决
-            should_ignore_streaming_text(STREAMING_STOPPED.load(Ordering::Acquire), false)
+            // 由 should_ignore_streaming_text 单独裁决（FLICKER-130 R1 后单参：仅 stopped）
+            should_ignore_streaming_text(STREAMING_STOPPED.load(Ordering::Acquire))
         };
 
         // 领号 = 新 session 开始
