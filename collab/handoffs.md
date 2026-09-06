@@ -148,3 +148,13 @@
 - **教训**：A8 还原 oldString 过长误伤 show_overlay（cannot find value hint），按 git show HEAD
   手工修复。消融还原必须用行号级短锚点。
 - **红线**：未 commit / v0.9.0 未动 / 未出包 / 零凭证 / 无临时文件。
+
+## 2026-09-06 — tester-1 — TEST-FIX-125 ✅ overlay_109 dispatch 快照 5→6（测试模块 +5/-4，生产区零触碰，待主控验收）
+
+- **背景**：TEST-EXEC-123 唯一 1F = dispatch 护栏断言「恰 5 个 if!d2d::draw_ 分支」，
+  BUG-119 新增 draw_info_overlay（main.rs:2221）第 6 分支。主控复核=合法新增快照过期。
+- **改动**：assert_eq! 5→6（保持精确相等，禁改 >=）+ 消息分支名清单补 info + docstring 同步。
+- **证据**：① 单跑 PASS；② 消融 6→5 红（left:6 right:5）还原绿；③ 定向消融删 :2221 GDI 兜底
+  → 护栏精确报 L2221 兜底缺失还原绿（info 兜底断言真实覆盖，现有实现自动纳入）；
+  ④ root 全量 **1096P/0F/9I**（1F 转绿，总数不变）。
+- **红线**：未 commit / v0.9.0 未动 / 未出包 / 零凭证 / 无临时文件。

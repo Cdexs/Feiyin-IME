@@ -10507,11 +10507,12 @@ mod overlay_109_d2d_p2p3_guard_tests {
     /// 契约（overlay 永不空白）：draw_overlay_to_dc 的每个 D2D 迁移状态分支形如
     /// `if !d2d::draw_xxx(...) { GDI 兜底 }` —— 五个迁移态（Recording/FallingToProcessing
     /// 共用 waveform 入口、StreamingEditing、FocusLost、Error，另含 P0 Processing）
+    /// + BUG-119 的 Info 信息提示态，共六个 D2D 分支。
     /// 的 d2d::draw_ 调用都必须出现在 `if !d2d::draw_` 形态内，且其下必有 GDI 调用。
     /// 判据：include_str 读自身源码，逐行去空白后统计 `if!d2d::draw_` 出现次数，
-    /// 断言 == 5（RecordingWaveform/Processing/Editing/Preview/Error），且每个
+    /// 断言 == 6（RecordingWaveform/Processing/Editing/Preview/Error/Info），且每个
     /// `!d2d::draw_` 的后续行内存在非 d2d 前缀的绘制函数调用（GDI 兜底）。
-    /// 消融：任一分支删掉 d2d 调用（回归纯 GDI）→ 计数变 4 → 红；
+    /// 消融：任一分支删掉 d2d 调用（回归纯 GDI）→ 计数变 5 → 红；
     /// 任一分支删掉 GDI 兜底 → 该分支后续无 GDI 调用 → 红。
     /// 🔴 判别力边界（如实声明）：本护栏匹配 `if !d2d::draw_` 形态与「其下有非 d2d
     /// 调用行」的粗粒度结构，不解析括号配对（实现字符串形态，非行为断言）。
@@ -10533,8 +10534,8 @@ mod overlay_109_d2d_p2p3_guard_tests {
         }
         assert_eq!(
             d2d_lines.len(),
-            5,
-            "dispatch 必须恰有 5 个 `if !d2d::draw_` 分支（waveform/processing/editing/preview/error），实测 {}",
+            6,
+            "dispatch 必须恰有 6 个 `if !d2d::draw_` 分支（waveform/processing/editing/preview/error/info），实测 {}",
             d2d_lines.len()
         );
         // 每个 d2d 分支的 **if-body**（`if !d2d::draw_x(...) { ... }`，结束于 `} else {`
