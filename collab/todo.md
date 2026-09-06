@@ -1,5 +1,48 @@
 # 任务列表 · voice-ime
 
+## 🟢 2026-09-06 晚 · 主控 session 重启后现场核对（以 git 为准，非记忆）
+
+**HEAD = `2f39eeb`，工作区 clean。** BUILD-118 端测四项中三项已落地并提交：
+
+| 任务 | Worker | 状态 | 提交 |
+| --- | --- | --- | --- |
+| `BUG-119` 无语音改信息提示「请说话哦..」 | coder-1 | ✅ 已验收 | `870e6a6` |
+| `TEST-SYNC-122` 阶段三 8 条护栏 | tester-1 | ✅ 已验收 | `5b6b297` |
+| `INVESTIGATE-120` 编辑态闪烁根因（只查不修） | coder-2 | ✅ 已验收 | `2f39eeb` |
+
+### 🔴 待办队列（本轮，串行）
+
+| # | 任务 | Worker | 占用文件 | 前置 | 状态 |
+| --- | --- | --- | --- | --- | --- |
+| ① | **`TEST-EXEC-123`** 阶段四：BUG-119 + 122 八护栏全量回归 + 逐条消融 + 还原自证 | tester-1 | 无（只跑） | 无 | ⏳ 待派发 |
+| ② | **`OVERLAY-121`** 圆角包裹线堆叠 → per-pixel alpha（DEC-056 ③，前置「八态全迁完」已达成） | coder-1 或 coder-2 | `src/main.rs` 生产区 | ① 完成（阶段禁并行） | ⏳ 待方案设计 |
+| ③ | **`FLICKER-124`**（暂名）编辑态闪烁修复 R1/R2 | coder-2 | `src/main.rs` 生产区 | 🔴 **等 Gavin 拍板 R1/R2** + 与 ② 同文件须串行 | ⏳ 待拍板 |
+| ④ | 阶段三 TEST-SYNC → 阶段四 TEST-EXEC → 阶段五 BUILD | tester-1 | — | ②③ 完成 | ⏳ |
+
+### 🔴 待 Gavin 拍板（主控无权决定）
+
+| 项 | 内容 | 出处 |
+| --- | --- | --- |
+| 1 | **编辑态闪烁修法二选一**：R1（推荐，迟到包直接丢弃，`should_ignore_streaming_text` 改 `stopped`）／ R2（Show 对 StreamingEditing 走 WM_SETTEXT 同步 + 冻结宽度）。R2 与 OVERLAY-121 per-pixel alpha 有前置耦合（UpdateLayeredWindow 下子控件不可渲染） | INVESTIGATE-120 |
+| 2 | **学习信号缺口**：走 overlay 编辑（路径 A）之后、用户在目标应用里继续改这一段没人学 —— 已由 DEC-058 拍板「只覆盖应用内编辑」，**本项已闭环，无需再问** | BUILD-118 端测第 4 项 |
+| 3 | `draw_editing_overlay_chrome` 死代码（main.rs:2809，编译器实证 never used）是否删 | 历史待办 |
+| 4 | 工作区 EOL 漂移（47 文件 worktree CRLF vs index LF）是否立单 | SECRET-105 报备 |
+
+### 本轮 Worker 占用（文件级零重叠）
+
+- coder-1：待命（已 ACK，不触碰 `src/main.rs` / `hotkey.rs`）
+- coder-2：待命（已 ACK，同上）
+- tester-1：待 ① `TEST-EXEC-123`
+
+### 主控本轮已做的运维改动（非代码）
+
+| 项 | 内容 |
+| --- | --- |
+| `handoffs.md` 归档 | 275 行 → 111 行；2026-09-05 全部 12 条移入 `handoffs-archive.md`（追加式，加分隔注释），只留当天 09-06 条目 |
+| `handoffs.md` 补记 | `INVESTIGATE-120` 条目缺失（`[DOC-STATE-DRIFT-001]` 复现：coder-2 只写了 logs/CHANGELOG），主控代记并标注来源 |
+
+---
+
 ## 🔴 2026-09-06 —— Gavin BUILD-118 端测反馈四项（主控已取证，最新在最上）
 
 > 端测第 1/2/3 项（Toggle 停、长按、锁屏自愈）Gavin 未报问题；本节是新增的 4 条。
