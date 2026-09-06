@@ -90,7 +90,7 @@ const LlmPage: React.FC<Props> = ({ config, updateConfig }) => {
           <span className="toggle-label" style={{ fontWeight: 600 }}>{t.llm_enable}</span>
         </label>
         {!canEnable && (
-          <p className="form-hint" style={{ color: '#FF6B35', marginTop: '4px', paddingLeft: '8px' }}>{gateHintText}</p>
+          <p className="form-hint" style={{ color: 'var(--brand-primary)', marginTop: '4px', paddingLeft: '8px' }}>{gateHintText}</p>
         )}
       </section>
 

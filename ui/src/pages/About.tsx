@@ -127,13 +127,13 @@ const AboutPage: React.FC<Props> = ({ config }) => {
       )}
 
       {status === 'failed' && (
-        <p style={{ marginTop: '16px', fontSize: '14px', color: '#dc2626' }}>
+        <p style={{ marginTop: '16px', fontSize: '14px', color: 'var(--status-error)' }}>
           {t.about_check_failed}
         </p>
       )}
 
       <div style={{ marginTop: '24px' }}>
-        <button className="btn btn-secondary" onClick={handleCheck} disabled={buttonDisabled} style={{ color: '#ff6b35', fontFamily: 'inherit' }}>
+        <button className="btn btn-secondary" onClick={handleCheck} disabled={buttonDisabled} style={{ color: 'var(--brand-primary)', fontFamily: 'inherit' }}>
           {buttonText}
         </button>
       </div>

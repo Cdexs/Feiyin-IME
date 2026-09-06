@@ -2,6 +2,25 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-09-06 — coder-1 — UITEST-137 ✅ 第一阶段设计令牌合规护栏（G1/G2/G3 + 3 条行为示范，清理 3 处分叉，待主控验收）
+
+- **产出**：`ui/src/test/design-tokens.test.ts`（新增，8 用例）+ `About.tsx`/`Llm.tsx` 3 处字面量换令牌（精确等值，行号零漂移）。pages 业务逻辑零触碰，未 commit。
+- **护栏设计**：Node 侧源码扫描（不依赖 DOM，happy-dom 无 CSS 引擎也工作）。G1 白名单基线制「存量不阻塞、增量被挡」+ 双向自防（白名单空挂即红）；G2 引用完整性 **首跑抓到 2 个真实隐患**（`--value` 死滑杆带 fallback / `--system-text-disabled` 未定义回落继承色，均白名单附理由，不擅自补定义防改变渲染）；G3 值唯一性 + 显式 ALIAS_GROUPS 登记（零重复）。
+- **实测量证**：G1 扫描域硬编码实测仅 7 处（任务书估 40 系把 styles.css 定义处 72 处计入，G1 明确排除定义处）。清理 3 / 剩 4（About 105/108 #6b7280 灰阶、114/124 成功态绿与 --status-success 非等值，设计侧未定层级不动）。
+- **行为示范**：user-event + aria 断言（checked 翻转 / Escape 状态转换 / role="dialog" 撞键弹窗），替代 class 名断言范式。
+- **🔴 环境发现（UITEST-138 前必读）**：happy-dom KeyboardEvent 不映射 F 键 code（`{F9}`→`Unknown`；字母/Enter/Backspace 正常）。依赖 `e.code` 的 user-event 按键流只能用字母键；fireEvent 显式传 code 不受影响（既有测试未踩到的原因）。
+- **验证**：`npm run test` 97 passed（89+8）/ `npm run build` 成功；反向自证 G1+G2 双红（临时 fixture 已删）复绿。
+- **styles.css 内部遗留**（G1 范围外，记后续）：1349 行 `#e55a2b` == `--brand-hover` 字面量分叉等。
+- **详情**：outbox/coder-1/result.md + logs/20260906.md + CHANGELOG.md
+
+## 2026-09-06 — coder-2 — HOOKTEST-136 ✅ 密钥/隐私闸门自动化测试固化（tests/test_secret_hooks.py 51 用例全绿 + 2 次反向自证，待主控验收）
+
+- **产出**：`tests/test_secret_hooks.py`（唯一新增）+ `tests/pytest.ini` 注册 hooks 标记；`scripts/git-hooks/` 零触碰（按新分工规则：闸门是 coder-1 写的，测试由 coder-2 写）。
+- **五类齐全**：内容拦 10 / 内容放 12（占位符·白名单邮箱·env 读法）/ 路径拦 10·放 9（全走 add -f 强塞 + CONFIG.TOML 大写）/ 真实事故回归 5（SECRET-104/105 漏报误报 + SECRET-IN-REPO-001 配置 dump + Tauri 图标已知误报如实断言）/ 元行为 5（SKIP 双侧留痕 + push 兜住 commit 绕过 = 纵深防御 + 干净放行 + pre-push fail-closed 构造成功）。
+- **验证**：`py -3.11 -m pytest tests/test_secret_hooks.py -v` 51 passed / 0 failed（timeout=30 默认档全过）。反向自证 A（假 key 换进放行用例→红）+ B（.md→.log→红）均证实判别力，已还原。
+- **实现红线**：一次性临时仓库 + bare 远端，用完即弃；每次 add 后 ls-files --error-unmatch 复核（MSYS-GIT-ADD-FORCE-NOOP-001 防线）；零真实凭证。pre-commit fail-closed 无法干净构造已在 result.md 如实说明。
+- **备注**：工作区 ui/src/* 在途改动非本单产物（其他 Worker），零触碰。
+
 ## 2026-09-06 — coder-2 — OVERLAY-121-IMPL-133 ✅ per-pixel alpha P1+P2+P3 一次做完（ULW+DIB+fixup / 双模式切换 / 掩码退役，1098P/1F 唯一红=预期 H7，待主控验收）
 
 - **diff**：仅 src/main.rs +282/-86。P1=渲染骨架（PREMULTIPLIED + 32bpp DIB + apply_alpha_fixup 帧末单点 + ULW 单点提交 + :1376 SLWA 条件化）；P2=switch_overlay_layered_mode 唯一收口（清/置 WS_EX_LAYERED 双向中转，MSDN 逐字）+ EnterEditMode/Show 两处挂钩（隐藏区间切换）；P3=apply_overlay_window_region 函数+10 调用点退役 + chrome 半径参数化（Recording 系/Falling r=16，Error/FocusLost/Info/编辑 r=10，Gavin 口径）。
