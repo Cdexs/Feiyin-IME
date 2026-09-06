@@ -95,6 +95,9 @@ pub enum OverlayStatus {
     },
     /// Error occurred; show error message briefly.
     Error(String),
+    /// BUG-119: informational hint (e.g. no speech detected). Same layout as
+    /// Error but visually distinct: blue dot + white text (see draw_info_overlay).
+    Info(String),
 }
 
 // =============================================================================

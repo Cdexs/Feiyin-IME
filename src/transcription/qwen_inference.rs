@@ -917,7 +917,8 @@ pub fn transcribe_streaming(
                         // fallback: 用 display_text（可能只有未确认的 current_sentence）
                         let display = state.display_text();
                         if display.is_empty() {
-                            bail!("转录失败：task-finished 但无识别结果");
+                            // BUG-119: 没识别到语音 = 类型化信息信号，不走错误串
+                            bail!(super::NoSpeechError);
                         }
                         return Ok(display);
                     }
@@ -1600,7 +1601,8 @@ pub fn transcribe_streaming_realtime(
                     if final_text.is_empty() {
                         summary.outcome = "failed";
                         log::info!("{}", summary.format_summary());
-                        bail!("转录失败：task-finished 但无识别结果");
+                        // BUG-119: 没识别到语音 = 类型化信息信号，不走错误串
+                        bail!(super::NoSpeechError);
                     }
                     summary.outcome = "finished";
                     log::info!("{}", summary.format_summary());

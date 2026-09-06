@@ -126,6 +126,8 @@ pub struct Strings {
     pub error_transcription_empty: &'static str,
     /// FORMAT-LLM-001-CORE (DEC-031-③): LLM 格式化失败后 overlay 提示文本。
     pub format_failed_hint: &'static str,
+    /// BUG-119: 「用户没说话」信息提示（信息级，非错误样式）。
+    pub no_speech_hint: &'static str,
 }
 
 static ZH: Strings = Strings {
@@ -254,6 +256,7 @@ Example: If wordbook contains "PPT -> 演示文稿" and input contains "PPT", ou
     error_mic_muted: "麦克风已静音，请取消静音后重试。",
     error_transcription_empty: "识别结果为空。",
     format_failed_hint: "优化失败，已输出原文。",
+    no_speech_hint: "请说话哦..",
 };
 
 static ZH_TW: Strings = Strings {
@@ -382,6 +385,7 @@ Example: If wordbook contains "PPT -> 演示文稿" and input contains "PPT", ou
     error_mic_muted: "麥克風已靜音，請取消靜音後重試。",
     error_transcription_empty: "識別結果為空。",
     format_failed_hint: "優化失敗，已輸出原文。",
+    no_speech_hint: "請說話喔..",
 };
 
 static EN: Strings = Strings {
@@ -509,6 +513,7 @@ Example: If wordbook contains "PPT -> 演示文稿" and input contains "PPT", ou
     error_mic_muted: "Microphone is muted. Please unmute and try again.",
     error_transcription_empty: "Transcription result is empty.",
     format_failed_hint: "Optimization failed, original text used.",
+    no_speech_hint: "Please say something..",
 };
 
 pub fn get(lang: UiLanguage) -> &'static Strings {

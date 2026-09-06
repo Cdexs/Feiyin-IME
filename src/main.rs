@@ -125,6 +125,11 @@ enum PipelineEvent {
     /// FORMAT-LLM-001-CORE (DEC-031-③): LLM 格式化失败，原文已注入兜底。
     /// overlay 显示 2500ms 提示后自动复位 tray 到 Idle（防卡在"处理中"）。
     FormatFailed,
+    /// BUG-119: 「用户没说话」信息提示（Gavin BUILD-118 端测第 1 项）。
+    /// 无 payload：文案由显示侧查 i18n（no_speech_hint），照 FormatFailed 先例。
+    /// 产出源：transcription::NoSpeechError 类型化错误在 worker 边界下探转成本事件，
+    /// 新增第三个产出源只需复用该类型，无需改任何分类器。
+    NoSpeech,
 }
 // LATENCY-001: send event and immediately wake controller via PostMessageW
 fn send_event(tx: &crossbeam_channel::Sender<PipelineEvent>, event: PipelineEvent) {
@@ -1718,6 +1723,9 @@ fn run_overlay_thread(
                     OverlayStatus::Error(_) => {
                         // Error state does not repaint
                     }
+                    OverlayStatus::Info(_) => {
+                        // BUG-119: Info 态静态提示，不重绘（同 Error）
+                    }
                 }
             }
 
@@ -2203,6 +2211,15 @@ fn draw_overlay_to_dc(
                 // goes blank. GDI fallback keeps DT_END_ELLIPSIS (U1 裁决).
                 if !d2d::draw_error_overlay(hdc, rect, message) {
                     draw_error_overlay(hdc, rect, message, request.ui_language);
+                }
+            }
+            OverlayStatus::Info(message) => {
+                // BUG-119: 信息提示态。圆角掩码沿用 Error 现值 Some(10)
+                //（OVERLAY-121 per-pixel alpha 才动圆角，本单不碰）。
+                // D2D 优先，失败回落 GDI（与 Error 态同一兜底结构）。
+                apply_overlay_window_region(hwnd, rect, Some(10), false);
+                if !d2d::draw_info_overlay(hdc, rect, message) {
+                    draw_info_overlay(hdc, rect, message, request.ui_language);
                 }
             }
         }
@@ -4020,6 +4037,48 @@ mod d2d {
         })
     }
 
+    /// BUG-119: Info 态。几何逐位照抄 D2D `draw_error_overlay`（即 GDI
+    /// `draw_info_overlay` 的 D2D 直译）：chrome bg #211D1A / 边 r10，
+    /// 蓝点（COLORREF 0xFF9933 = RGB #3399FF，错误态是红点 0x0033CC），
+    /// 文本白色（OVERLAY_TEXT_WHITE，错误态是 BRAND_ORANGE）。其余逐位同源。
+    /// Returns false on any D2D failure — the caller renders the same frame via GDI.
+    pub(crate) fn draw_info_overlay(hdc: HDC, rect: &RECT, message: &str) -> bool {
+        with_d2d(hdc, rect, |res, w, h| {
+            chrome_with(res, w, h, COLORREF(0x211D1A), 10.0);
+            unsafe {
+                let circ_d = 4.0_f32; // GDI circ_d=8 的半径
+                res.brush.SetColor(&colorref_to_d2d(COLORREF(0xFF9933)));
+                res.rt.FillEllipse(
+                    &D2D1_ELLIPSE {
+                        point: D2D_POINT_2F {
+                            x: 12.0 + circ_d,
+                            y: h / 2.0,
+                        },
+                        radiusX: circ_d,
+                        radiusY: circ_d,
+                    },
+                    &res.brush,
+                );
+                let msg: Vec<u16> = message.encode_utf16().collect();
+                res.brush
+                    .SetColor(&colorref_to_d2d(super::OVERLAY_TEXT_WHITE));
+                res.rt.DrawText(
+                    &msg,
+                    &res.streaming_text_format,
+                    &D2D_RECT_F {
+                        left: 12.0 + circ_d + circ_d + 8.0, // GDI: circ_x + circ_d/2 + 8
+                        top: 4.0,
+                        right: w - 14.0,
+                        bottom: h - 4.0,
+                    },
+                    &res.brush,
+                    windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+        })
+    }
+
     /// D2D-P2 (PLAN-108 H11): `FocusLost`（失焦预览态）。几何逐位照抄 GDI
     /// `draw_preview_overlay`（rect 相对坐标）：
     /// - 底 #211D1A + 1px 边 r10（:3840-3867）→ chrome_with(bg, 10)
@@ -4620,6 +4679,82 @@ fn draw_error_overlay(
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
     );
 }
+/// BUG-119: 信息提示态（如「请说话哦..」）。布局逐位照抄 draw_error_overlay，
+/// 仅点色（蓝）与文字色（白）与错误态区分 —— 信息级不再是红色告警。
+/// 圆角沿用 Error 的 10（OVERLAY-121 per-pixel alpha 才动圆角，本单不碰）。
+#[cfg(target_os = "windows")]
+fn draw_info_overlay(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: &RECT,
+    message: &str,
+    _ui_language: config::UiLanguage,
+) {
+    const INFO_BLUE: COLORREF = COLORREF(0xFF9933); // BGR: blue #3399FF
+    const BG_DARK: COLORREF = COLORREF(0x211D1A); // #1A1D21（同错误态统一底色）
+    const CORNER_RADIUS: i32 = 10;
+    // Dark gray background (unified)
+    let bg = unsafe { CreateSolidBrush(BG_DARK) };
+    unsafe {
+        let _ = FillRect(hdc, rect, bg);
+        let _ = DeleteObject(bg);
+    }
+    // Border: 1px rounded corners (unified)
+    let border_pen = unsafe { CreatePen(PS_SOLID, 1, OVERLAY_BORDER_GRAY) };
+    let border_old_pen = unsafe { SelectObject(hdc, border_pen) };
+    let null_brush = unsafe { GetStockObject(NULL_BRUSH) };
+    let border_old_brush = unsafe { SelectObject(hdc, null_brush) };
+    unsafe {
+        let _ = RoundRect(
+            hdc,
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            CORNER_RADIUS * 2,
+            CORNER_RADIUS * 2,
+        );
+        let _ = SelectObject(hdc, border_old_pen);
+        let _ = SelectObject(hdc, border_old_brush);
+        let _ = DeleteObject(border_pen);
+    }
+    // Small solid blue dot on left (error 态是红点，信息态用蓝点区分)
+    let circ_d = 8; // diameter 8px
+    let circ_x = rect.left + 12 + circ_d / 2; // center x
+    let cy = rect.top + (rect.bottom - rect.top) / 2;
+    let blue_brush = unsafe { CreateSolidBrush(INFO_BLUE) };
+    let null_pen = unsafe { CreatePen(PS_NULL, 0, COLORREF(0)) };
+    let old_brush = unsafe { SelectObject(hdc, blue_brush) };
+    let old_pen = unsafe { SelectObject(hdc, null_pen) };
+    unsafe {
+        let _ = Ellipse(
+            hdc,
+            circ_x - circ_d / 2,
+            cy - circ_d / 2,
+            circ_x + circ_d / 2,
+            cy + circ_d / 2,
+        );
+        let _ = SelectObject(hdc, old_brush);
+        let _ = SelectObject(hdc, old_pen);
+        let _ = DeleteObject(blue_brush);
+        let _ = DeleteObject(null_pen);
+    }
+    // Info text (white, left-aligned with margin for circle)
+    let mut text_rect = RECT {
+        left: circ_x + circ_d / 2 + 8,
+        top: rect.top + 4,
+        right: rect.right - 14,
+        bottom: rect.bottom - 4,
+    };
+    unsafe {
+        let _ = SetTextColor(hdc, OVERLAY_TEXT_WHITE);
+    }
+    draw_text(
+        hdc,
+        message,
+        &mut text_rect,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+}
 /// OVERLAY-043-B: per-frame size interpolation step.
 ///
 /// Contract:
@@ -4747,7 +4882,9 @@ fn overlay_geometry(status: &OverlayStatus, hwnd: HWND) -> ([i32; 2], [i32; 2]) 
             // ASR-038-C: editing mode initial size; will be expanded by adjust_overlay_size_for_text
             RECORDING_OVERLAY_SIZE
         }
-        OverlayStatus::Processing(_) | OverlayStatus::Error(_) => STATUS_OVERLAY_SIZE,
+        OverlayStatus::Processing(_) | OverlayStatus::Error(_) | OverlayStatus::Info(_) => {
+            STATUS_OVERLAY_SIZE
+        }
         OverlayStatus::FocusLost { .. } => PREVIEW_OVERLAY_SIZE,
     };
     let x = centered_x(work.left, work_w, size[0]);
@@ -5329,6 +5466,28 @@ fn process_controller_events(
                 );
                 overlay_handle.send(OverlayCommand::Show(OverlayRequest {
                     status: OverlayStatus::Error(hint.to_string()),
+                    pos: Some(pos),
+                    size,
+                    opacity: 0.9,
+                    ui_language,
+                    auto_close_ms: 2500,
+                    target_hwnd: 0,
+                }));
+            }
+            // BUG-119: 「用户没说话」→ 信息提示（Info 态，蓝点白字，非红色错误样式），
+            // 文案走 i18n no_speech_hint。同 FormatFailed：必须显式复位 tray 到 Idle。
+            PipelineEvent::NoSpeech => {
+                OVERLAY_EDITING.store(false, Ordering::Release);
+                log::info!("Pipeline: no speech detected; showing info hint");
+                platform::notify_translate_poll_stop();
+                set_tray_state(tray, TrayState::Idle, ui_language);
+                let hint = i18n::get(ui_language).no_speech_hint;
+                let (pos, size) = overlay_geometry(
+                    &OverlayStatus::Info(hint.to_string()),
+                    overlay_handle.overlay_hwnd,
+                );
+                overlay_handle.send(OverlayCommand::Show(OverlayRequest {
+                    status: OverlayStatus::Info(hint.to_string()),
                     pos: Some(pos),
                     size,
                     opacity: 0.9,
@@ -5920,8 +6079,15 @@ fn spawn_worker_thread(
                         let streaming_text = match asr_result {
                             Ok(text) => text,
                             Err(e) => {
-                                log::error!("Streaming ASR error: {}", e);
-                                send_event(&event_tx, PipelineEvent::Error(e.to_string()));
+                                // BUG-119: 流式 ASR「没识别到语音」= 类型化信号 → 信息提示，
+                                // 不进 convert_to_friendly_error 错误链
+                                if e.is::<transcription::NoSpeechError>() {
+                                    log::info!("Streaming ASR: no speech detected");
+                                    send_event(&event_tx, PipelineEvent::NoSpeech);
+                                } else {
+                                    log::error!("Streaming ASR error: {}", e);
+                                    send_event(&event_tx, PipelineEvent::Error(e.to_string()));
+                                }
                                 continue;
                             }
                         };
@@ -6557,6 +6723,13 @@ fn overlay_request_for_event(event: &PipelineEvent) -> platform::OverlayRequest 
             message: String::new(), // 文案由 handle_pipeline_event 按 ui_language 补齐
             auto_close_ms: 2500,
         },
+        // BUG-119: macOS 侧无 Info 视觉样式（三态浮层），暂与 FormatFailed 同路走
+        // ShowError 提示窗承载 i18n no_speech_hint —— 显示形态的升级留给 macOS
+        // overlay 批（见 docs/MACOS-HANDOFF.md），「没说话不弹错误」语义本单已达成。
+        PipelineEvent::NoSpeech => platform::OverlayRequest::ShowError {
+            message: String::new(), // 文案由 handle_pipeline_event 按 ui_language 补齐
+            auto_close_ms: 2500,
+        },
         PipelineEvent::FocusLost(text) => platform::OverlayRequest::ShowPreview(text.clone()),
         PipelineEvent::StreamingText(_, _, _) => platform::OverlayRequest::Show, // macOS 侧流式文本暂不渲染
         PipelineEvent::Done | PipelineEvent::Cancelled => platform::OverlayRequest::Hide,
@@ -6578,6 +6751,10 @@ fn handle_pipeline_event(event: &PipelineEvent, ui_language: config::UiLanguage)
     let req = match event {
         PipelineEvent::FormatFailed => platform::OverlayRequest::ShowError {
             message: i18n::get(ui_language).format_failed_hint.to_string(),
+            auto_close_ms: 2500,
+        },
+        PipelineEvent::NoSpeech => platform::OverlayRequest::ShowError {
+            message: i18n::get(ui_language).no_speech_hint.to_string(),
             auto_close_ms: 2500,
         },
         _ => overlay_request_for_event(event),
@@ -6618,6 +6795,11 @@ fn handle_pipeline_event(event: &PipelineEvent, ui_language: config::UiLanguage)
         }
         PipelineEvent::FormatFailed => {
             log::warn!("macOS pipeline: FormatFailed (LLM 格式化失败，原文已注入兜底)");
+            platform::request_tray_state(TrayState::Idle, ui_language);
+        }
+        // BUG-119: macOS 侧「没说话」→ 信息提示（当前复用 ShowError 承载，见上）
+        PipelineEvent::NoSpeech => {
+            log::info!("macOS pipeline: NoSpeech (信息提示：请说话哦..)");
             platform::request_tray_state(TrayState::Idle, ui_language);
         }
         PipelineEvent::StreamingText(_, text, _) => {
@@ -6853,6 +7035,17 @@ fn select_preprocessing_params(asr_model: transcription::AsrModel) -> (usize, us
 fn should_cancel_on_empty(samples: &[f32], initial_text: &Option<String>) -> bool {
     samples.is_empty() && initial_text.is_none()
 }
+/// BUG-119: 转录失败三分类。载体必须是本枚举而非 String —— 拦截点在 map_err，
+/// 此刻 anyhow::Error 还带类型，downcast NoSpeechError 是「没说话」与
+/// 「设备/模型异常」的唯一区分手段；转成 String 后一切只能靠关键词嗅探。
+#[derive(Debug)]
+enum TranscriptionFailure {
+    /// 「用户没说话」类型化信号 → 上层发 PipelineEvent::NoSpeech 信息提示。
+    /// 新增第三个产出源（transcription 内 bail!(NoSpeechError)）零改此处。
+    NoSpeech,
+    /// 其余错误转字符串，走既有 convert_to_friendly_error 显示链。
+    Other(String),
+}
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 fn run_pipeline_core(
@@ -6893,11 +7086,20 @@ fn run_pipeline_core(
             // ASR-038-B: 流式模式跳过转录步骤，直接用 transcribe_streaming_realtime
             // 返回的文本走 LLM 后半段（ITN→LLM→注入）。转录已在 ASR 线程完成。
             // initial_text = Some → 流式；None → 正常转录
-            let transcription_result: Result<(String, bool), String> = if let Some(text) =
+            //
+            // BUG-119: 错误载体从 String 升为 TranscriptionFailure —— 拦截点必须在
+            // map_err 处（anyhow::Error 还带类型的最后时机）下探 NoSpeechError；
+            // 一旦 to_string() 就永远无法与普通错误区分（本 bug 成因链一环）。
+            // 新增第三个「没说话」产出源只需 bail!(NoSpeechError)，此处零改动。
+            let transcription_result: Result<(String, bool), TranscriptionFailure> = if let Some(
+                text,
+            ) =
                 initial_text
             {
                 if text.trim().is_empty() {
-                    Err("streaming transcription empty".to_string())
+                    // BUG-119: 流式结果空文本 = 没说话，同样走信息提示
+                    // （护栏契约不变：仍是用户可见反馈，不是第一层静默取消）
+                    Err(TranscriptionFailure::NoSpeech)
                 } else {
                     let native_punctuated = punctuation::has_effective_punctuation(&text);
                     Ok((text, native_punctuated))
@@ -6931,27 +7133,24 @@ fn run_pipeline_core(
                 );
                 transcriber
                     .transcribe_with_punct_info(&padded, config.audio.chinese_script)
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| {
+                        if e.is::<transcription::NoSpeechError>() {
+                            TranscriptionFailure::NoSpeech
+                        } else {
+                            TranscriptionFailure::Other(e.to_string())
+                        }
+                    })
             };
 
             match transcription_result {
-                Err(e) => {
-                    if e == "streaming transcription empty" {
-                        log::warn!(
-                            "Streaming transcription result is empty, skipping LLM and injection"
-                        );
-                        send_event(
-                            event_tx,
-                            PipelineEvent::Error(
-                                i18n::get(config.ui_language)
-                                    .error_transcription_empty
-                                    .to_string(),
-                            ),
-                        );
-                    } else {
-                        log::error!("Transcription error: {}", e);
-                        send_event(event_tx, PipelineEvent::Error(e));
-                    }
+                Err(TranscriptionFailure::NoSpeech) => {
+                    // BUG-119: 没识别到语音 → 信息提示（i18n no_speech_hint），非错误样式
+                    log::info!("No speech detected, showing info hint");
+                    send_event(event_tx, PipelineEvent::NoSpeech);
+                }
+                Err(TranscriptionFailure::Other(e)) => {
+                    log::error!("Transcription error: {}", e);
+                    send_event(event_tx, PipelineEvent::Error(e));
                 }
                 Ok((raw_text, native_punctuated)) => {
                     if cancel_signal.load(Ordering::Relaxed) {
@@ -6964,16 +7163,11 @@ fn run_pipeline_core(
                         native_punctuated
                     );
                     // Skip downstream processing when transcription output is empty.
+                    // BUG-119: 空文本（含 <|nospeech|> token 剥离后仅剩空白）= 没识别到语音
+                    // → 信息提示。护栏契约不变：仍是用户可见反馈，不是静默取消。
                     if raw_text.trim().is_empty() {
-                        log::warn!("Transcription result is empty, skipping LLM and injection");
-                        send_event(
-                            event_tx,
-                            PipelineEvent::Error(
-                                i18n::get(config.ui_language)
-                                    .error_transcription_empty
-                                    .to_string(),
-                            ),
-                        );
+                        log::warn!("Transcription result is empty (no speech content)");
+                        send_event(event_tx, PipelineEvent::NoSpeech);
                         return;
                     }
                     // OPT-002: Skip if text is not effective (empty or filler-only).
@@ -8824,14 +9018,15 @@ mod streaming_empty_samples_tests {
     /// - 第一层 `should_cancel_on_empty`（:4288）：只管「有没有东西可处理」——
     ///   空 samples 且无文本才取消；只要有流式文本（**哪怕内容是空串或纯空白**），
     ///   一律落 `Ok(samples)` 走后半段，不在此层取消。
-    /// - 第二层 `run_pipeline_core`（:4334 `text.trim().is_empty()`）：管「文本内容
-    ///   是否有效」——空/纯空白文本在此产出 `Err("streaming transcription empty")`
-    ///   → `PipelineEvent::Error(error_transcription_empty)` → overlay 弹
-    ///   「识别结果为空。」提示 2000ms（**用户可见的失败反馈**，不是静默消失）。
+    /// - 第二层 `run_pipeline_core`（`text.trim().is_empty()`）：管「文本内容
+    ///   是否有效」——空/纯空白文本在此产出 `TranscriptionFailure::NoSpeech`
+    ///   → `PipelineEvent::NoSpeech` → overlay 弹 i18n no_speech_hint 信息提示
+    ///   2500ms（BUG-119 起，从错误样式改为信息提示；**仍是用户可见反馈**，
+    ///   不是静默消失）。
     ///
     /// 🔴 为什么必须钉死这条：若未来有人在 `should_cancel_on_empty` 里加
-    /// `trim().is_empty()` 判断（看似「合并同类项」的优化），会把「空文本时的错误提示」
-    /// 又变回「静默取消」，P0 类回归复发，且前三条用例**全部不会红**。
+    /// `trim().is_empty()` 判断（看似「合并同类项」的优化），会把「空文本时的
+    /// 可见提示」又变回「静默取消」，P0 类回归复发，且前三条用例**全部不会红**。
     /// 本条用例 + 这段注释是钉死该分层的唯一手段。
     #[test]
     fn empty_string_text_not_cancelled_at_first_layer() {

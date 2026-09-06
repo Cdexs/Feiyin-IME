@@ -16,6 +16,26 @@ pub use vad::{
     SEGMENT_MAX_SECS, SEGMENT_PADDING_SAMPLES, SEGMENT_TRIGGER_SECS,
 };
 
+/// BUG-119（BUILD-118 端测第 1 项）：「用户没说话」的类型化信号，不是设备/网络错误。
+///
+/// 缺陷史：所有「没识别到语音」路径原先都用 anyhow 字符串错误（一中一英），
+/// 显示层 `convert_to_friendly_error` 关键词嗅探分类不中 → 开发态原文直出。
+/// 升级为类型化信号后，显示侧在 map_err 边界 downcast 本类型 → 信息提示（i18n）。
+///
+/// 契约：**新增第三个「没说话」产出源时只需 `bail!(NoSpeechError)`，
+/// 显示侧分类器零改动** —— 这是本类型存在的唯一意义，禁止再往错误串里加关键词。
+/// 设备/模型异常（空音频样本、VAD 已确认有语音段但模型空输出）**不得**用本类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoSpeechError;
+
+impl std::fmt::Display for NoSpeechError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no speech detected")
+    }
+}
+
+impl std::error::Error for NoSpeechError {}
+
 /// ASR mode: offline or streaming (2-pass)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AsrMode {
@@ -307,7 +327,8 @@ impl Transcriber {
             let cleaned = Self::strip_asr_special_tokens(&text);
             let trimmed = cleaned.trim();
             if trimmed.is_empty() {
-                anyhow::bail!("ASR transcription failed: online ASR output is empty");
+                // BUG-119: 在线回退路径空输出 = 没识别到语音，类型化信息信号
+                anyhow::bail!(NoSpeechError);
             }
             let normalized = text_normalizer::normalize_text_for_language(trimmed, script);
             let native_punctuated = punctuation::has_effective_punctuation(&normalized);
@@ -348,9 +369,8 @@ impl Transcriber {
                         let segs = vad.segment(samples);
                         if segs.is_empty() {
                             log::warn!("VAD produced no speech segments, transcription failed");
-                            anyhow::bail!(
-                                "ASR transcription failed: VAD detected no speech segments"
-                            );
+                            // BUG-119: 没说话 = 类型化信息信号，不走错误串
+                            anyhow::bail!(NoSpeechError);
                         }
                         log::info!(
                             "VAD segmented {} samples ({:.1}s) into {} segments",
@@ -429,7 +449,8 @@ impl Transcriber {
             ));
         }
         log::warn!("All segments produced empty text, transcription failed");
-        anyhow::bail!("ASR transcription failed: all segments produced empty text");
+        // BUG-119: 全段空拼接 = 没识别到语音，类型化信息信号
+        anyhow::bail!(NoSpeechError);
     }
 
     /// 转录单段音频 — 旧签名兼容
@@ -1451,7 +1472,7 @@ mod tests {
         // 1. 输入 &[Vec<f32>]（段样本列表）
         // 2. 逐段调 transcribe_segment_detailed
         // 3. join_segment_texts 拼接
-        // 4. 全空 → bail "all segments produced empty text"
+        // 4. 全空 → bail!(NoSpeechError)（BUG-119 类型化信息信号）
         // 5. 任一段 np=false → all_native=false
         // 6. 返回 (normalized_text, all_native)
         //

@@ -1546,3 +1546,25 @@ Toggle 分支无任何状态、恒发 Start。修法：另开 `TOGGLE_ACTIVE` �
   `KEY_PHYSICALLY_DOWN` 语义等价（都是「一次物理按压只算一次」，判据来源不同：
   macOS 用系统字段、Windows 用钩子自跟踪的 DOWN/UP 状态）。**两端语义一致，macOS 无需改动**。
 - **对端验证点**不变：Toggle 连按两次停 + 长按不应产生 Start/Stop 交替。
+
+## BUG-119 · 无语音改为信息提示「请说话哦..」（coder-1，2026-09-06）
+
+**改动**：「用户没说话」从 anyhow 字符串错误升为类型化信号 `transcription::NoSpeechError`
+（src/transcription/mod.rs，Windows/macOS 共享代码），Windows 侧 worker 边界 downcast 转
+`PipelineEvent::NoSpeech` → overlay 显示 `OverlayStatus::Info`（蓝点白字）+ i18n
+`no_speech_hint`（ZH「请说话哦..」/ ZH_TW「請說話喔..」/ EN "Please say something.."）。
+
+**macOS 侧结论（同源，需对端接线）**：
+- **产出源同源**：5 个「没说话」产出源全部在共享的 transcription 模块
+  （qwen_inference.rs 两处 task-finished 空 bail + mod.rs 三处 VAD/全段空/在线回退空），
+  macOS 侧无需任何 transcription 改动即继承类型化信号。
+- **消费侧同源**：`main.rs` cfg(macos) 的 `overlay_request_for_event` /
+  `handle_pipeline_event` 已加 `NoSpeech` 分支：文案由 handle_pipeline_event 按
+  ui_language 填 `no_speech_hint`，走 `ShowError` 提示窗（2500ms 自动关）+ 托盘 Idle。
+- **形态差异（遗留项，非阻塞）**：macOS 浮层目前是三态（Show/ShowProcessing/ShowError），
+  无 Info 视觉样式 —— 本单在 macOS 侧「没说话」仍以 ShowError 承载（与 FormatFailed
+  同路，语义达成：不再甩开发态原文）。若要对齐 Windows 的蓝点白字信息样式，
+  需在 `platform/macos/overlay.rs` 加 ShowInfo 变体 + NSPanel 绘制，属 macOS overlay
+  后续批次。
+- **对端验证点**：按住热键不说话 → 浮层弹本地化提示（非英文开发态原文）后自动关、
+  托盘回 Idle。

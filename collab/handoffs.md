@@ -2,6 +2,18 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-09-06 — coder-1 — BUG-119 ✅ 无语音改为信息提示「请说话哦..」（i18n 类型化信号 + Info 态浮层，待主控验收）
+
+- **根因双重**：主控取证的关键词嗅探分类器漏 + 实施侧实证的 `map_err(|e| e.to_string())` 先抹 anyhow 类型（拦截点前移到 map_err 下探）。
+- **选型**：`transcription::NoSpeechError`（unit struct，anyhow downcast）。验收判据实证：任务书外的源 4/5（在线回退空 / 全段空拼接）加入时 main.rs 分类代码零改动。
+- **产出源 5+2 全表**（含保留 Error 的设备/模型异常 2 条判据）见 logs/20260906.md BUG-119 节。
+- **显示**：`PipelineEvent::NoSpeech`（照 FormatFailed 先例）→ `OverlayStatus::Info(String)`（GDI+D2D 双路径，蓝点 #3399FF + 白字，圆角 Some(10) 未动）+ i18n `no_speech_hint`（ZH「请说话哦..」逐字 / ZH_TW「請說話喔..」/ EN "Please say something.."）。tray 复位 Idle。
+- **扩单**：src/ui/overlay.rs 加 Info 变体（主控批准，无其它重构）。
+- **macOS**：产出源/消费侧同源（transcription 共享 + main.rs cfg(macos) 两分支已加）；ShowInfo 视觉形态留 macOS overlay 批，结论在 docs/MACOS-HANDOFF.md。
+- **验证**：fmt --check exit 0 / check --all-targets 0 error / warnings 111/102 与基线逐位持平。
+- **红线**：未 commit / v0.9.0 未动 / 圆角 Some(10)/Some(16) 未动 / hotkey.rs 未动 / 零凭证 / 无临时文件。
+- **详情**：outbox/coder-1/result.md + logs/20260906.md + CHANGELOG.md + docs/MACOS-HANDOFF.md
+
 ## 2026-09-06 — coder-1 — HOTKEY-115 ✅ Toggle 停不住双缺陷修复（hotkey.rs 9 hunks + main.rs 1 行扩单收口，待主控验收）
 
 - **缺陷 1**：钩子 KEYUP 分支 `PTT_ACTIVE.store(false)` 在 `if should_stop…` 外，Toggle 松键被重置 → 第二次 DOWN 恒发 Start（Stop 分支不可达）。修：store 移进 if 内（PTT 行为逐位等价）+ DOWN 按模式分支。
