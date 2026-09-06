@@ -217,6 +217,10 @@ def test_content_gate_allows(workdir, case_name, content):
 PATH_BLOCK_CASES = [
     ("root_config_toml", "config.toml", f'api_key = "{FAKE_GENERIC_KEY}"\n'),
     ("root_config_toml_uppercase", "CONFIG.TOML", "# Windows 同一文件，大小写不归一化=绕过\n"),
+    # 🔴 2026-09-06 补：真正装着 api_key 的是这两份运行时副本，此前只靠 .gitignore
+    # 挡着，git add -f 即可绕过（Gavin 追问「config 不能提交」时主控发现的缺口）。
+    ("runtime_config_target", "target/release/config.toml", f'api_key = "{FAKE_GENERIC_KEY}"\n'),
+    ("runtime_config_publish", "Publish/config.toml", f'api_key = "{FAKE_GENERIC_KEY}"\n'),
     ("dotenv", ".env", f"API_KEY={FAKE_GENERIC_KEY}\n"),
     ("dotenv_local", ".env.local", f"API_KEY={FAKE_GENERIC_KEY}\n"),
     ("debug_log", "debug.log", "2026-09-06 用户口述转写原文……\n"),

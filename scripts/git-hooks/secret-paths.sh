@@ -38,9 +38,12 @@ scan_paths() {
     lbase="$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')"
     ldir="$(printf '%s' "$dir" | tr '[:upper:]' '[:lower:]')"
     reason=""
-    if [ -z "$dir" ] && [ "$lbase" = "config.toml" ]; then
-      # 只拦根目录这份；.cargo/config.toml（构建配置）、assets/default-config.toml（脱敏模板）不受影响
-      reason="根目录运行时配置，含真实 api_key，只许本地留存"
+    # config.toml 在**任何目录**都拦（不止根目录）—— 真正装着 api_key 的是
+    # target/release/ 与 Publish/ 那两份运行时副本，它们此前只靠 .gitignore 挡，
+    # git add -f 即可绕过（2026-09-06 Gavin 追问配置入库问题时主控发现的缺口）。
+    # 唯一例外：*/.cargo/config.toml 是 Cargo 构建配置，不含凭证，且已入库。
+    if [ "$lbase" = "config.toml" ] && [ "${ldir##*/}" != ".cargo" ]; then
+      reason="运行时配置（根目录/target/Publish 副本），含真实 api_key，只许本地留存"
     elif case "$lbase" in .env|*.env|.env.*) true ;; *) false ;; esac; then
       reason="环境变量文件，凭证专用载体"
     elif case "$lbase" in *.log) true ;; *) false ;; esac; then
