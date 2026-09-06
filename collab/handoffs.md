@@ -130,3 +130,21 @@
   存在前置耦合（UpdateLayeredWindow 下子控件不可渲染）。
 - **红线**：生产零改动 / v0.9.0 未动 / 探针工程保留 collab/research/repro120/ / run 目录（含密钥 config 副本）已整目录删除 / 零凭证入档。
 - **详情**：collab/drafts/edit-flicker-analysis.md + outbox/coder-2/result.md + logs/20260906.md
+
+## 2026-09-06 — tester-1 — TEST-EXEC-123 ✅ 阶段四（三层回归 + 八护栏首跑消融 8/8 全红 + E2E 门禁，待主控验收）
+
+- **Step1 三层**：root **1095P/1F/9I**（总数 1096 对账一致）+ src-tauri 76P + vitest 89P。
+  🔴 **1F = 既有护栏快照过时**：`overlay_109 dispatch_five_branches`（断言恰 5 个 d2d::draw_ 分支）
+  vs BUG-119 新增 `draw_info_overlay`（main.rs:2221）第 6 分支。非本批八护栏问题、非回归。
+  **建议快照 5→6 或改 ≥6 语义，交主控裁定**；本单未修（阶段四零改动红线）。
+- **Step2 消融 8/8 全红（真代码，非推演）**：A1 删 impl Error / A2 bail 改字符串（4≠5）/
+  **A3 convert 加「没说话」嗅探=回归路径真红** / A4 map_err 改 to_string / A5 删流式 is:: /
+  A6 改 ZH 文案 / A7 Some(10)→None（3→2）/ A8 Info→Error。逐条还原后 8/8 绿。
+- **Step4 E2E 门禁**：首跑 63P/1F/2E → **逐条单测复跑全绿判定环境瞬态**（notepad 残留实例
+  阻塞 `subprocess.run(["notepad"])` fixture + [E2E-COLD-START-RACE-001] prewarm 竞态）；
+  二次全量 **66P/0F/0E/33S/6D 通过**，与 TEST-EXEC-117 一致。E2E 跑 BUILD-118 旧包，仅回归确认。
+- **Step5 还原**：git diff --numstat 与 HEAD 零差异（仅 CRLF 警告）/ 三层重跑逐位一致 /
+  无残留进程 / config sha 3186ec8c / fmt 0。
+- **教训**：A8 还原 oldString 过长误伤 show_overlay（cannot find value hint），按 git show HEAD
+  手工修复。消融还原必须用行号级短锚点。
+- **红线**：未 commit / v0.9.0 未动 / 未出包 / 零凭证 / 无临时文件。
