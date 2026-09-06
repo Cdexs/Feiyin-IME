@@ -2,6 +2,13 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-09-06 — coder-2 — HOOKTEST-136-B ✅ 测试文件密钥字面量改运行时拼接（闸门不再命中自己，51 全绿 + 闸门实扫 exit 0，待主控验收）
+
+- **改法**：主控裁定 C（运行时拼接，不开豁免不走 SKIP）—— 9 个假值常量 + git 身份邮箱（chr(64) + noreply 白名单段双保险）+ 路径载荷 f-string 化 + 三处注释自命中形态改述 + tauri 图标载荷拼接。**逐字节比对 PASS**（10 常量运行时打印逐一相等）。
+- **决定性证据**：临时仓库 hooksPath 指向真实钩子，对测试文件 add+commit → pre-commit 全量扫描 **exit 0**（改前 6 处命中）。
+- **验证**：pytest 51P/0F；反向自证 FAKE_PHONE 拼成 10 位 → phone 用例红（拼接结果=被测形态证实），已还原。
+- **红线**：scripts/git-hooks 零触碰 / 未用 SKIP / 未 commit / 未碰 ui/**。
+
 ## 2026-09-06 — coder-1 — UIFIX-139 ✅ 补 `--system-text-disabled` 令牌（G2 抓到的缺陷闭环，待主控验收）
 
 - **改动**：`styles.css` +4 行（`--system-text-disabled: rgba(0,0,0,0.3614)` + 取值注释）+ `design-tokens.test.ts` G2 白名单删 1 条（`--value` 保留）。未 commit。
