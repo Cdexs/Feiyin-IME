@@ -2,6 +2,16 @@
 
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
+## 2026-09-06 — coder-2 — OVERLAY-121-PLAN-127 ✅ per-pixel alpha 落地方案设计（零代码，主控验收通过 + 三处反馈已闭环，待 Gavin 拍板：方案 B 批准 + 三态是否顺带升 r=16 圆角）
+
+- **产出**：collab/drafts/overlay-121-plan.md（唯一可写文件，git status 干净，零 src/** 触碰）。
+- **推荐方案 B 运行时双模式**：其余七态 ULW + 逐像素 alpha；编辑态（StreamingEditing）切回 SLWA——编辑态现状本就是矩形 None 掩码（main.rs:2175），零视觉倒退；A ❌（EDIT 白送的全套重写不成比例）/ C ❌（双窗常驻状态机不值得）/ D ❌ 不可行（main.rs:1376 每次显示必调 SLWA，ULW 必败）/ 新提第五条 E（WM_PRINTCLIENT 桥接）作 B 闪烁 PoC 不过时的备选。
+- **关键查证（MSDN 逐字出处见文档 §12）**：SLWA 调过后 ULW 必败须清/置 style bit 中转；**现有 DCRenderTarget 原生支持 D2D1_ALPHA_MODE_PREMULTIPLIED** → main.rs:3089 一处字段改动 + BindDC 改绑 DIB section，DEC-055 单点收口零变化，不需换 WIC target。
+- **主控验收三处反馈已闭环**：① handoffs 补记（本条）；② result.md 补收尾自证表；③ config.toml 开关否决（DEC-031 默认零配置），回滚改为 P1/P2/P3 各自独立 commit、revert 即回滚，draft §8 表已改并附裁定注记。
+- **待拍板**：① 方案 B 批准与否；② Recording 系三态+FallingToProcessing 顺带升 r=16 圆角；③ PoC 并入实施单 P2 首项。
+- **macOS**：不适用无需迁移（NSWindow 原生支持逐像素透明 + AA 圆角），实施时 MACOS-HANDOFF.md 补一句即可。
+- **护栏预告**：TEST-SYNC-122 H7 圆角快照在 P3 后必然变红（预期），建议 tester-1 届时改写为正向护栏（ULW 调用点恰 1 / PREMULTIPLIED 恰 1 / switch_layered_mode 挂钩恰 2）。
+
 ## 2026-09-06 — coder-1 — SECRET-126 ✅ 配置/隐私「永不入库」机器闸门（.gitignore 四类路径规则 + pre-commit/pre-push 路径闸门，待主控验收）
 
 - **改动面**：`.gitignore`（+12 行，User app data 节内，含理由注释）+ `scripts/git-hooks/secret-paths.sh`（新建，scan_paths 共享判定）+ `pre-commit`（内容扫描前路径闸门，fail-closed）+ `pre-push`（push_path_gate 函数 + 两分支各 1 调用，情况 2 补 BASE 推导）。未 commit，待主控验收。
