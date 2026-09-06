@@ -148,3 +148,8 @@ config.json
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ===== UITEST-138 Browser Mode 产物（不入库）=====
+# vitest browser 运行时附件与失败截图，本地产物，无入库价值
+ui/.vitest-attachments/
+ui/src/test/browser/__screenshots__/

@@ -263,3 +263,14 @@
   config.toml sha 未变。
 - **主控紧急加速**：出包后 E2E/src-tauri/vitest 挪下一批；Gavin 端测清单 6 项在 result.md。
 - **红线**：未 commit / v0.9.0 未动 / 未出包（已出 BUILD-135）/ 零凭证 / 无临时文件。
+
+## 2026-09-06 — tester-1 — UITEST-138 ✅ Vitest Browser Mode 上真实浏览器（测试基建，待主控验收）
+
+- **交付**：双环境并存（npm run test happy-dom 语义不变 / npm run test:browser 独立配置 +
+  @vitest/browser-playwright + chromium headless）+ 5 条示范用例（src/test/browser/visual-style.test.tsx）
+  + vite.config.ts exclude 隔离。
+- **反向自证 2 条**：改 --brand-primary → 3 条颜色红；改指示条 3px→10px → 宽度红。验完还原 styles.css 零 diff。
+- **关键修复**：beforeEach 渲染（主控定位 cleanup 问题）；颜色 hex→rgb 归一化；TS6133 共享门禁已清。
+- **成本**：Chromium 下载约 700MB（超预期 150MB），首跑 5 条 ~1.2s，按需跑。
+- **验证**：npm run test 97P / test:browser 5P / npm run build 0 error。
+- **红线**：未碰 design-tokens.test.ts / styles.css / pages/*.tsx / 未 commit / v0.9.0 未动 / 零凭证。
