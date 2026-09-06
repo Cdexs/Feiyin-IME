@@ -3781,6 +3781,41 @@ opencode.ai/workspace/.../billing`，模型档 `DeepSeek V4 Flash · OpenCode Ze
 注意同名条目有多个 provider（Zen / Go / Ollama Cloud），**Zen 就是余额耗尽的那个**，
 只看模型名会再切回死档。
 
+### 🔴 复发记录三：2026-09-06 —— 不重启也会中招，失败点从「静默挂起」变成「派发无 ACK」
+
+**场景**：新会话启动，主控派发 `TEST-SYNC-116` 给 tester-1，`dispatch.sh` 三次重发全无应答，
+后台监控打出 `[ACK_FAIL]`。capture-pane 一看：`Insufficient balance.`（`DeepSeek V4 Flash · OpenCode Zen`），
+且屏幕上模型选择器已自行弹开。
+
+**与前两次的差异（本条的新增价值）**：
+
+| 维度 | 2026-08-18 / 09-05 | 2026-09-06 本次 |
+| --- | --- | --- |
+| 触发 | `replace-worker.sh` **重启**后模型被重置 | **没有重启**，会话跨天续用，档位自己耗尽 |
+| 表现 | Worker 看似活着、永不响应 | `dispatch.sh` 的 **ACK_FAIL 兜底直接报警** |
+| 发现方式 | 主控轮询才发现 | **ACK_FAIL 自动告警**（这条兜底有效，值得保留） |
+
+**结论**：本条目标题「重启后」**收窄了适用面**，实际是「**任何时刻档位都可能耗尽**」。
+派发前不必预检，但收到 `ACK_FAIL` **第一件事是 capture-pane 看有没有 `Insufficient balance`**，
+别先去猜僵死/卡顿。
+
+### 🔴 主控踩坑：弹层开着时 send-keys 文本会落进输入框，不是搜索框
+
+本次主控想切档，直接 `send-keys -l "GLM"` —— 那一刻选择器**已被 Worker 自己弹开**，
+但焦点不在搜索框：文本落进了 prompt 输入框，同时选择器把高亮项当成确认，
+档位被切成 `deepseek-v4-flash OpenCode Go`（非预期档），输入框还残留 `GLM`。
+
+**正确做法**（与上文「正确顺序」②③ 一致，主控这次没照做）：
+`Esc` 关掉任何弹层 → `C-u` 清空输入框 → `/models` + Enter 重新开选择器 → 再输入搜索词。
+
+**更省事的做法**：切档这类**带弹层的交互操作交给 Gavin 手工完成**。
+主控盲发 send-keys 在弹层状态下判断不了焦点归属，容易越弄越乱。
+本次即由 Gavin 接手，切到 `deepseek-v4-flash OpenCode Go` 后 `go on` 续跑。
+
+**任务续跑要点**：`inbox/<id>/task.md` 不会因 ACK_FAIL 丢失（本次 4055B 完好），
+Worker 恢复后 `go on` 即可继续；确需重新通知用 `dispatch <id>`（**不带 task 参数**），
+它保留既有 task.md，只重发通知。
+
 ## [WORKER-DOC-OVERWRITE-001] 🔴 Worker 写五文档时把整份文件覆盖掉（表头连同他人条目一起消失）【主控提交前必查 diff 有无删除行】
 
 **日期**：2026-08-18 ｜ **发现**：主控提交前 `git diff --stat` 看到**负增量** ｜ **责任**：tester-1（TEST-EXEC-056）

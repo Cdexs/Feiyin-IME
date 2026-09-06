@@ -1,5 +1,58 @@
 # 任务列表 · voice-ime
 
+## 🔴 2026-09-06 —— 本轮任务清单（最新在最上）
+
+### 本轮定位：把「已改完但没测、没出包」的两批代码一次性收口
+
+上一会话在 coder-1 提交 `030f831` 后中断，**测试与出包全部停摆**。
+证据：`target/release/feiyin-ime.exe` 时间戳 09-05 13:36，早于 D2D 五态迁移（`4c3b42d` 22:33）
+与热键修复（`030f831` 09-06 01:12）—— 现有 exe **两批改动一个都没有**。
+
+### 五阶段执行队列
+
+| # | 任务 | Worker | 占用文件 | 状态 |
+| --- | --- | --- | --- | --- |
+| ① | `HOTKEY-115` / `-B` / `-C` 开发（Toggle 停不住 + 长按翻转 + 陈旧标志自愈） | coder-1 | `hotkey.rs` + `main.rs:5101` | ✅ 已提交 `030f831` |
+| ② | **`TEST-SYNC-116`** 阶段三：热键 7 条结构护栏（G1 KEYUP 归属 / G2 DOWN 模式分支 / G3 RegisterHotKey 翻转 / G4 单一收口 / G5 三处复位点两态齐全 / G6 陈旧阈值 >1000 / G7 mic-muted 出口） | tester-1 | `hotkey.rs` **测试模块** | ✅ 已交付（11 用例，生产零改动，fmt/check 白名单内过，待主控验收 + ③） |
+| ③ | `TEST-EXEC-117` 阶段四：三层全量回归 + 逐条消融自证 + 还原自证 | tester-1 | — | ⏳ 待派（②验收后） |
+| ④ | `BUILD-118` 阶段五出包：**首个同时含 D2D 五态 + 热键修复的包** | tester-1 | — | ⏳ 待派（③通过后按 DEC-053 直接派） |
+| ⑤ | **Gavin 端测**（见下方专项清单） | Gavin | — | ⏳ 等包 |
+
+### ⑤ Gavin 端测专项清单（出包后交回）
+
+| 项 | 验什么 | 来源 |
+| --- | --- | --- |
+| 1 | Toggle 连按两次能停（第二下不再重开录音） | HOTKEY-115 主缺陷 |
+| 2 | 长按热键不再 Start/Stop 乱翻、终态可预期 | HOTKEY-115-B |
+| 3 | 锁屏（Win+L）/ 切走再回来后热键不失灵 | HOTKEY-115-C 陈旧自愈 |
+| 4 | D2D 五态视觉（editing / recording_waveform / error / preview / stop） | IMPL-109 |
+| 5 | OVERLAY-101 **Bug B** 位置不再右窜（唯一验证手段就是目视，无自动护栏） | DEC-055 红线 5 |
+| 6 | 🔴 **带 `-debug` 启动抓 Bug A 日志**（宽度偶发抖动，机制仍未确立） | OVERLAY-101 |
+
+### 本轮已完成的运维改动（非代码）
+
+| 项 | 内容 |
+| --- | --- |
+| tester-1 档位 | `opencode/deepseek-v4-flash`（Zen，余额耗尽）→ `opencode-go/deepseek-v4-flash`（Go）。`get_worker_model` 实测已生效；按 Gavin 指令不重启 |
+| troubleshooting | `[WORKER-RESTART-MODEL-RESET-001]` 加「复发记录三」：**不重启也会中招**，原标题收窄了适用面；附主控弹层 send-keys 踩坑 |
+
+### 端测之后的待办（本轮不动，排在 ⑤ 之后）
+
+| 任务 | 内容 | 卡点 |
+| --- | --- | --- |
+| `REFACTOR-113` | 抽 Show 分支 x 来源决策为可测纯函数 + 补护栏 | 🔴 **立项前提与 HOTKEY-115 教训(六) 冲突** —— 后者结论是「调用点状态机抽纯函数=假护栏」。方案要么改走结构护栏，要么取消，端测后拍板 |
+| per-pixel alpha | DEC-056 ③，前置「八态全迁完」已达成 | 等端测确认 D2D 方向 |
+| `draw_editing_overlay_chrome` 死代码 | `main.rs:2809`，编译器 `never used` 实证、无调用方 | 待 Gavin 定夺是否删 |
+| 工作区 EOL 漂移 | 47 文件 worktree CRLF vs index LF（coder-1 在 SECRET-105 报备，非其造成） | 待立单 |
+| 钩子 auto-repeat 去抖 | 115-B 已用 `KEY_PHYSICALLY_DOWN` 结构性抑制，**原「另立单」诉求大概率已消解**，端测第 2 项确认后即可关闭 | 等端测 |
+
+### 本轮 Worker 占用（文件级零重叠）
+
+- tester-1：`hotkey.rs` 测试模块（②）
+- coder-1 / coder-2：**待命**，已 ACK 不触碰 `main.rs` 与 `hotkey.rs`
+
+---
+
 ## 🔴 2026-09-05 —— 当前状态（最新在最上）
 
 ### 🟡 HOTKEY-115 已交付待验收（coder-1，2026-09-06）

@@ -210,3 +210,18 @@
 - **给 tester-1（TEST-SYNC-110）**：G1-G5 照方案 §3.4.4；新增素材见 result.md §五（submit 无+1 负向断言 / 波形整除口径 / dispatch 形态正则）
 - **红线**：未 commit / tests/** 与 troubleshooting.md 未碰 / draw_editing_overlay_chrome 不删不改不参考（U5）/ 零凭证
 - **详情**：outbox/coder-2/result.md（逐 hunk 行号表 + 15 项非回归保证手段 + 收尾自证表）
+
+## 2026-09-06 — tester-1 — TEST-SYNC-116 ✅ 阶段三（HOTKEY-115/B/C 七条结构护栏，待主控验收 + 阶段四 TEST-EXEC-117）
+
+- **交付**：`src/platform/windows/hotkey.rs` 测试模块 +373/-0（单 hunk `@@ -1192,0 +1193,373`），生产零改动（numstat 373/0）；`src/main.rs` 仅 include_str 只读、零触碰。
+- **G1**：`PTT_ACTIVE.store(false)` 落在 `should_stop_translate_poll_on_keyup(mode)` if 块内（block_contains 花括号深度）。
+- **G2**：钩子 DOWN 路径 Toggle 分支 `TOGGLE_ACTIVE.swap(true)` 翻转（else_branch_contains 定位 `} else {`）。
+- **G3**：RegisterHotKey Toggle 分支同翻转 + `:652` 复位（match binding.mode 锚点 + 20 行窗）。
+- **G4**：`notify_translate_poll_stop` 函数体内含 `TOGGLE_ACTIVE.store(false)`（B3 单一收口）。
+- **G5a/b/c**：install/uninstall/sync_binding 三处清理点各归零 PTT_ACTIVE+TOGGLE_ACTIVE+KEY_PHYSICALLY_DOWN；uninstall 额外 `TRANSLATE_POLL_STOP.store(true)`。
+- **G6a/b/c**：`LAST_TARGET_DOWN_TICKS` 存在 + 闸判据形态 + **阈值>1000 语义断言**（从闸行 RHS 解析 token：字面量直读 / const 回查，不断言 ==2000）。
+- **G7**：main.rs mic-muted 拒绝出口含 `notify_translate_poll_stop()` 调用（norm_line 剥 `platform::` 前缀）。
+- **自扫描规避**：按首个 `#[cfg(test)]` 切分只扫生产区 + 一律 startswith（禁 contains）+ needle 全 `concat!` 拆串（TEST-SYNC-110 教训）。
+- **验证**：fmt --check exit 0 / check --all-targets 0 error（102 warnings 与基线持平）/ 未跑 cargo test（白名单设计如此，首跑归阶段四）。
+- **逻辑预演**：沙箱逐字复刻护栏匹配逻辑 —— 19 项主断言全 PASS；G1/G2/G3(flip+reset)/G4/G6c(const 删除)/G7 六组消融模拟全 RED-OK；G7 块内注释「notify_translate_poll_stop()」startswith 正确排除无误命中。
+- **红线**：未 commit / v0.9.0 未动 / 零凭证 / 无临时文件（预演跑沙箱 temp）。

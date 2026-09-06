@@ -1190,4 +1190,377 @@ mod tests {
         assert_eq!(should_stop_translate_poll_on_keyup(ptt), true);
         assert_eq!(should_stop_translate_poll_on_keyup(toggle), false);
     }
+
+    // =====================================================================
+    // TEST-SYNC-116 / HOTKEY-115 / 115-B / 115-C 结构护栏（阶段三，只写用例）
+    // ---------------------------------------------------------------------
+    // 为什么是结构护栏而不是纯函数护栏（coder-1 handoffs 教训(六)）：
+    // 三个缺陷的本体全在钩子回调里的状态机调用点（keyboard_hook_proc /
+    // handle_hotkey_trigger / install·uninstall·sync_binding 清理块），抽纯函数
+    // 只会造出「测不到真实调用点」的假护栏 —— TEST-EXEC-106 的 A4 已栽过一次。
+    // 故本组用 include_str! 自读源码，以「行窗 + 去空白 + startswith」断言。
+    //
+    // 自扫描规避（TEST-SYNC-110 曾自命中注释的教训）：
+    //   1) 按文件内第一个 `#[cfg(test)]` 切分，只扫描生产区 —— 测试代码（本模块
+    //      自身）不可能被扫到；
+    //   2) 匹配一律 startswith（禁止 contains），生产区注释里的同名短语不会误命中；
+    //   3) 断言 needle 全部经 concat! 拆串 —— 即使未来改成整文件扫描也不会自命中。
+    // =====================================================================
+
+    /// hotkey.rs 生产区行数组：include_str! 自读本文件源码，逐行 trim，遇第一个
+    /// `#[cfg(test)]` 即停（本模块自身在其后，永不进入扫描区）。
+    fn hotkey_prod_lines() -> Vec<String> {
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/platform/windows/hotkey.rs"
+        ));
+        let mut out = Vec::new();
+        for line in src.lines() {
+            let t = line.trim();
+            if t.starts_with("#[cfg(test)]") {
+                break;
+            }
+            out.push(t.to_string());
+        }
+        out
+    }
+
+    /// src/main.rs 生产区行数组（G7 用；main.rs 的 #[cfg(test)] 在 7577 行之后，
+    /// mic-muted 锚点 5080 恒在生产区）。
+    fn main_prod_lines() -> Vec<String> {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let mut out = Vec::new();
+        for line in src.lines() {
+            let t = line.trim();
+            if t.starts_with("#[cfg(test)]") {
+                break;
+            }
+            out.push(t.to_string());
+        }
+        out
+    }
+
+    /// 规范化生产行：去空白 + 去掉可选的 `platform::` 模块前缀（G7 的 main.rs
+    /// 跨模块调用是 `platform::notify_translate_poll_stop();`，规范化后按裸函数名
+    /// startswith 匹配，不依赖具体模块限定）。
+    fn norm_line(line: &str) -> String {
+        line.trim().replace("platform::", "")
+    }
+
+    /// 返回生产区内与 `needle` 前缀匹配的第一行下标（锚点定位，唯一性由生产代码保证）。
+    fn find_line(lines: &[String], needle: &str) -> Option<usize> {
+        lines.iter().position(|l| l.starts_with(needle))
+    }
+
+    /// 行窗匹配：在 [start, start+window) 窗口内是否存在一行 `startswith(needle)`。
+    fn window_has(lines: &[String], start: usize, window: usize, needle: &str) -> bool {
+        let end = (start + window).min(lines.len());
+        lines[start..end]
+            .iter()
+            .any(|l| norm_line(l).starts_with(needle))
+    }
+
+    /// 一行净花括号增量（'(' 不计数，只计 '{' 与 '}'；字符串内花括号一并计入，
+    /// 结构护栏接受该近似 —— 生产窗内无字符串花括号）。
+    fn brace_delta(line: &str) -> i32 {
+        line.matches('{').count() as i32 - line.matches('}').count() as i32
+    }
+
+    /// 块内匹配：锚点行 `anchor` 打开的花括号块闭合之前，是否存在一行 `startswith(needle)`。
+    /// 用于「store 必须落在某 if 块内」这类归属断言。
+    fn block_contains(lines: &[String], anchor: usize, needle: &str) -> bool {
+        let mut depth = 0i32;
+        for (i, line) in lines.iter().enumerate().skip(anchor) {
+            let norm = norm_line(line);
+            if i == anchor {
+                depth += brace_delta(&norm);
+                continue;
+            }
+            if norm.starts_with(needle) && depth > 0 {
+                return true;
+            }
+            depth += brace_delta(&norm);
+            if depth <= 0 {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// else 分支匹配：先找到关闭 `anchor` 块的 `} else {`，再在 else 分支体内查找
+    /// `needle`。用于「DOWN 路径 Toggle 分支必须翻转 TOGGLE_ACTIVE」这类分支归属断言。
+    fn else_branch_contains(lines: &[String], anchor: usize, needle: &str) -> bool {
+        let mut depth = 0i32;
+        let mut else_idx = None;
+        for (i, line) in lines.iter().enumerate().skip(anchor) {
+            let norm = norm_line(line);
+            if i == anchor {
+                depth += brace_delta(&norm);
+                continue;
+            }
+            if norm.starts_with("} else {") && depth == 1 {
+                else_idx = Some(i);
+                break;
+            }
+            depth += brace_delta(&norm);
+            if depth <= 0 {
+                break;
+            }
+        }
+        let else_idx = match else_idx {
+            Some(i) => i,
+            None => return false,
+        };
+        let mut depth = 1i32;
+        for line in lines.iter().skip(else_idx + 1) {
+            let norm = norm_line(line);
+            if norm.starts_with(needle) && depth > 0 {
+                return true;
+            }
+            depth += brace_delta(&norm);
+            if depth <= 0 {
+                return false;
+            }
+        }
+        false
+    }
+
+    // ----- G1-G7 结构护栏 -----
+
+    /// G1: `PTT_ACTIVE.store(false, ...)` 必须落在 `should_stop_translate_poll_on_keyup(mode)`
+    /// 的 if 块**内**（HOTKEY-115 缺陷 1：原来在 if 外，Toggle 松键也清零 PTT_ACTIVE，
+    /// 下一次 DOWN 被当首次按下，Stop 分支不可达）。
+    /// 消融路径：把 store 移到 if 外 → 块在 store 之前闭合 → block_contains 返回 false → 本测试红。
+    #[test]
+    fn g1_ptt_active_store_false_is_inside_keyup_stop_branch() {
+        let lines = hotkey_prod_lines();
+        let anchor = find_line(
+            &lines,
+            concat!("if should_stop_", "translate_poll_on_keyup(mode) {"),
+        )
+        .expect("G1 anchor: should_stop_translate_poll_on_keyup(mode) if");
+        assert!(
+            block_contains(&lines, anchor, concat!("PTT_ACTIVE.", "store(false,")),
+            "G1: PTT_ACTIVE.store(false) must stay INSIDE the should_stop_translate_poll_on_keyup if block"
+        );
+    }
+
+    /// G2: 钩子 DOWN 路径存在 Toggle 分支，且用 `TOGGLE_ACTIVE.swap(true, ...)` 翻转，
+    /// 不是恒发 Start（HOTKEY-115 缺陷 1 的对侧修复）。
+    /// 消融路径：改回恒发 Start → PTT 分支的 else 体内 flip 行消失 → 本测试红。
+    #[test]
+    fn g2_hook_down_toggle_branch_flips_toggle_active() {
+        let lines = hotkey_prod_lines();
+        let anchor = find_line(
+            &lines,
+            concat!(
+                "if mode == hotkey_mode_",
+                "to_u32(HotkeyMode::PushToTalk) {"
+            ),
+        )
+        .expect("G2 anchor: hook DOWN PTT branch");
+        assert!(
+            else_branch_contains(&lines, anchor, concat!("if !TOGGLE_ACTIVE.", "swap(true,")),
+            "G2: hook DOWN Toggle branch must flip TOGGLE_ACTIVE via swap(true), not emit constant Start"
+        );
+    }
+
+    /// G3: RegisterHotKey 路径（handle_hotkey_trigger）的 Toggle 分支同样是
+    /// `TOGGLE_ACTIVE.swap` 翻转 + `:652` 复位（HOTKEY-115 缺陷 2 修复）。
+    /// 消融路径：该窗口内退回无条件 Start → flip 行消失 → 本测试红。
+    #[test]
+    fn g3_register_hotkey_toggle_branch_flips_and_resets() {
+        let lines = hotkey_prod_lines();
+        let anchor = find_line(&lines, concat!("match binding.", "mode {"))
+            .expect("G3 anchor: match binding.mode");
+        let arm_off = lines[anchor + 1..]
+            .iter()
+            .position(|l| l.starts_with(concat!("HotkeyMode::", "Toggle => {")))
+            .expect("G3: Toggle arm must exist inside match binding.mode");
+        let arm = anchor + 1 + arm_off;
+        assert!(
+            window_has(&lines, arm, 20, concat!("if !TOGGLE_ACTIVE.", "swap(true,")),
+            "G3: RegisterHotKey Toggle branch must flip TOGGLE_ACTIVE, not emit constant Start"
+        );
+        assert!(
+            window_has(&lines, arm, 20, concat!("TOGGLE_ACTIVE.", "store(false,")),
+            "G3: RegisterHotKey Toggle branch must reset TOGGLE_ACTIVE on the stop path"
+        );
+    }
+
+    /// G4: `fn notify_translate_poll_stop` **函数体内**必须含 `TOGGLE_ACTIVE.store(false, ...)`
+    /// （HOTKEY-115 B3 单一收口：控制器所有「录音非热键结束」路径汇聚于此）。
+    /// 消融路径：删掉该行 → 本测试红。
+    #[test]
+    fn g4_notify_translate_poll_stop_resets_toggle_active() {
+        let lines = hotkey_prod_lines();
+        let anchor = find_line(&lines, concat!("pub fn notify_translate_", "poll_stop() {"))
+            .expect("G4 anchor: notify_translate_poll_stop fn");
+        assert!(
+            block_contains(&lines, anchor, concat!("TOGGLE_ACTIVE.", "store(false,")),
+            "G4: notify_translate_poll_stop body must reset TOGGLE_ACTIVE (B3 single exit point)"
+        );
+    }
+
+    /// G5a: install_keyboard_hook 清理块必须同时归零 PTT_ACTIVE + TOGGLE_ACTIVE +
+    /// KEY_PHYSICALLY_DOWN（HOTKEY-115 B4，防重绑定后旧模式残留）。
+    /// 消融路径：任一处缺任一行 → 本测试红。
+    #[test]
+    fn g5a_install_clears_all_hotkey_state() {
+        let lines = hotkey_prod_lines();
+        let anchor = find_line(&lines, concat!("fn install_", "keyboard_hook("))
+            .expect("G5a anchor: install_keyboard_hook");
+        for (label, needle) in [
+            ("PTT_ACTIVE", concat!("PTT_ACTIVE.", "store(false,")),
+            ("TOGGLE_ACTIVE", concat!("TOGGLE_ACTIVE.", "store(false,")),
+            (
+                "KEY_PHYSICALLY_DOWN",
+                concat!("KEY_PHYSICALLY_DOWN.", "store(false,"),
+            ),
+        ] {
+            assert!(
+                window_has(&lines, anchor, 40, needle),
+                "G5a: install_keyboard_hook must reset {} in its cleanup block",
+                label
+            );
+        }
+    }
+
+    /// G5b: uninstall_keyboard_hook 清理块三态归零 + 额外含 TRANSLATE_POLL_STOP.store(true)。
+    /// 消融路径：缺任一行 → 本测试红。
+    #[test]
+    fn g5b_uninstall_clears_all_state_and_stops_poll() {
+        let lines = hotkey_prod_lines();
+        let anchor = find_line(&lines, concat!("fn uninstall_", "keyboard_hook()"))
+            .expect("G5b anchor: uninstall_keyboard_hook");
+        for needle in [
+            concat!("PTT_ACTIVE.", "store(false,"),
+            concat!("TOGGLE_ACTIVE.", "store(false,"),
+            concat!("KEY_PHYSICALLY_DOWN.", "store(false,"),
+        ] {
+            assert!(
+                window_has(&lines, anchor, 25, needle),
+                "G5b: uninstall_keyboard_hook must reset all three flags"
+            );
+        }
+        assert!(
+            window_has(
+                &lines,
+                anchor,
+                25,
+                concat!("TRANSLATE_POLL_STOP.", "store(true,")
+            ),
+            "G5b: uninstall_keyboard_hook must set TRANSLATE_POLL_STOP=true"
+        );
+    }
+
+    /// G5c: sync_binding 绑定切换清理块同样三态归零（RegisterHotKey 侧 unregister_binding
+    /// 不复位静态量，这里统一兜底）。
+    /// 消融路径：缺任一行 → 本测试红。
+    #[test]
+    fn g5c_sync_binding_clears_all_hotkey_state_on_switch() {
+        let lines = hotkey_prod_lines();
+        let anchor =
+            find_line(&lines, concat!("fn sync_", "binding(")).expect("G5c anchor: sync_binding");
+        for needle in [
+            concat!("PTT_ACTIVE.", "store(false,"),
+            concat!("TOGGLE_ACTIVE.", "store(false,"),
+            concat!("KEY_PHYSICALLY_DOWN.", "store(false,"),
+        ] {
+            assert!(
+                window_has(&lines, anchor, 50, needle),
+                "G5c: sync_binding must reset all three flags on binding switch"
+            );
+        }
+    }
+
+    /// G6a: LAST_TARGET_DOWN_TICKS 静态必须存在（HOTKEY-115-C 陈旧自愈的时间戳载体）。
+    /// 消融路径：删掉该 static → 本测试红。
+    #[test]
+    fn g6a_last_target_down_ticks_static_exists() {
+        let lines = hotkey_prod_lines();
+        assert!(
+            find_line(&lines, concat!("static LAST_TARGET_", "DOWN_TICKS")).is_some(),
+            "G6a: LAST_TARGET_DOWN_TICKS static must exist (HOTKEY-115-C stale self-heal)"
+        );
+    }
+
+    /// G6b: DOWN 闸判据必须形如 `!was_down || now.saturating_sub(last) > 阈值`。
+    /// 消融路径：删掉陈旧自愈闸（无条件当 repeat 丢弃）→ 本测试红。
+    #[test]
+    fn g6b_down_gate_has_stale_detection_shape() {
+        let lines = hotkey_prod_lines();
+        assert!(
+            find_line(
+                &lines,
+                concat!("if !was_down || now.", "saturating_sub(last) > ")
+            )
+            .is_some(),
+            "G6b: DOWN gate must have shape !was_down || now.saturating_sub(last) > threshold"
+        );
+    }
+
+    /// G6c: 陈旧阈值必须 > 1000ms —— Windows 键盘「重复延迟」上限硬理由
+    ///（控制面板四档 250/500/750/1000ms），若阈值 ≤1000，长延迟档位下首个 repeat
+    /// 会被误判陈旧、抑制失效退回翻转。**断言语义是「阈值 > 1000」，不是「== 2000」**：
+    /// 从闸行 `>` 右侧取阈值 —— 字面量直接解析；标识符则查 `const <ident>` 定义取值。
+    /// 消融路径：阈值降到 ≤1000 → 本测试红。
+    #[test]
+    fn g6c_stale_threshold_is_above_1000ms() {
+        let lines = hotkey_prod_lines();
+        let gate = find_line(
+            &lines,
+            concat!("if !was_down || now.", "saturating_sub(last) > "),
+        )
+        .expect("G6c anchor: DOWN gate line");
+        let rhs = lines[gate]
+            .split('>')
+            .nth(1)
+            .expect("G6c: threshold rhs after >");
+        let token = rhs
+            .trim_start()
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or("");
+        let threshold = match token.parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => {
+                // 闸行引用的是常量名：回到生产区解析 `const <IDENT>: ... = <n>;`。
+                let prefix = format!("const {}:", token);
+                let const_line = lines
+                    .iter()
+                    .find(|l| l.starts_with(&prefix))
+                    .unwrap_or_else(|| panic!("G6c: const {} not found in production", token));
+                const_line
+                    .split('=')
+                    .nth(1)
+                    .expect("G6c: const must carry a value")
+                    .trim_start()
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .unwrap_or("")
+                    .parse::<u64>()
+                    .expect("G6c: const value must be a u64")
+            }
+        };
+        assert!(
+            threshold > 1000,
+            "G6c: stale threshold must be > 1000ms (Windows repeat-delay cap), got {}",
+            threshold
+        );
+    }
+
+    /// G7: src/main.rs 的 mic-muted 拒绝出口（Start 事件唯一不产出 pipeline 事件的
+    /// 分支，toggle 态若不复位会滞留 true）必须调用 notify_translate_poll_stop()。
+    /// 消融路径：删掉该调用 → 本测试红。
+    #[test]
+    fn g7_mic_muted_reject_exit_resets_poll_stop() {
+        let lines = main_prod_lines();
+        let anchor = find_line(&lines, concat!("if crate::audio::is_mic_", "muted() {"))
+            .expect("G7 anchor: mic-muted rejection exit in main.rs");
+        assert!(
+            block_contains(&lines, anchor, "notify_translate_poll_stop()"),
+            "G7: mic-muted rejection exit must call notify_translate_poll_stop() before continue (B3 residual)"
+        );
+    }
 }
