@@ -158,3 +158,14 @@
   → 护栏精确报 L2221 兜底缺失还原绿（info 兜底断言真实覆盖，现有实现自动纳入）；
   ④ root 全量 **1096P/0F/9I**（1F 转绿，总数不变）。
 - **红线**：未 commit / v0.9.0 未动 / 未出包 / 零凭证 / 无临时文件。
+
+## 2026-09-06 — tester-1 — BUILD-129 ✅ 阶段五出包（首个含 BUG-119「请说话哦..」的包，待主控验收 + Gavin 端测）
+
+- **Step 2 跳过前提已复核**（ui/ + src-tauri/ 自 BUILD-118 零 diff），只跑 Step1→Step3（2m13s）→Step4。
+- **产物**：feiyin-ime 12,262,400 B@14:56（+7,168B=BUG-119）/ feiyin-ime-ui 10,053,632 B@11:39 沿用 /
+  crash-reporter 24,887,808 B@14:55 同批重建（sha 变化=正常，源码零改动+无时间戳嵌入+todo 先例）。
+- **七项核验全 PASS**：时间戳 / sha 两副本三对相等 + 主程序异于 BUILD-118（UI 相同）/ toml 三副本 /
+  ProductVersion 0.9.0.0 / **判别探针 6 条全命中 + BUILD-118 反向对照 0 命中** / 大小同量级 / 冒烟无 panic。
+- **运行时数据零覆盖**：config.toml sha `3186ec8c` 未变；version_check.json 由冒烟启动程序自写（非 Step4 覆盖）。
+- **红线**：未 commit / v0.9.0 未动 / 未用 cargo tauri build / 未 cargo clean / 零凭证 /
+  热键与浮层端测交回 Gavin（端测清单在 result.md）。
