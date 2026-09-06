@@ -4721,3 +4721,28 @@ git config --global core.autocrlf true
 
 **给主控的教训**：看到「Worker 报的数字和我不一样」，不要先套已有条目归因 ——
 先要对方给出**它那一侧的原始命令与输出**。本次是 Worker 顶回来才没把错误归因写进文档。
+
+## [MSYS-GIT-ADD-FORCE-NOOP-001] ⚠️ MSYS 下 `git add -f <被忽略的文件>` 偶发静默 no-op（exit 0 但没进索引）【做钩子/忽略规则实验前必读】
+
+**发现**：2026-09-06 SECRET-126，coder-1 在一次性临时仓库里验证路径闸门时报告：
+MSYS git 2.53.0 下 `git add -f` 对已被 `.gitignore` 忽略的文件**偶发静默失败** ——
+退出码 0、无任何报错，但 `git ls-files` 里查不到该文件。复现于 `.env.local`、`CONFIG.TOML`。
+
+**为什么这件事很危险**：做「闸门能不能拦住 X」这类实验时，你以为在测「闸门拦住了」，
+实际测的是「文件压根没进 staging，所以钩子没东西可扫」。**两种情况的可观测结果一模一样：
+commit 成功、无输出。** 于是你会得出「闸门放行了」的错误结论 —— 方向恰好反了，
+本该是真阳性的用例被记成真阴性。
+
+**正确做法（做任何 staging 相关实验时）**：
+
+```bash
+git add -f "$f"
+git ls-files --error-unmatch "$f" >/dev/null 2>&1 || { echo "🔴 add 静默失败，用例作废"; }
+```
+
+**先用 `git ls-files` 确认文件真的进了索引，再断言钩子行为。** coder-1 本次全程做了这一步复核，
+所以 SECRET-126 的 17/17 矩阵结论有效；主控独立复跑（原生 Windows git）同样 17/17，两侧吻合。
+
+**关联**：与 `[WORKER-GIT-AUTOCRLF-ENV-DIFF-001]` 同属「MSYS git 与原生 Windows git 行为不一致」
+这一族。**通用教训：Worker 侧 git 行为异常时，先问它是哪个 git、读的哪份配置，
+不要默认两侧等价。**
