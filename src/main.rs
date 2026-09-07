@@ -290,11 +290,17 @@ fn tray_menu_labels(ui_language: config::UiLanguage) -> (&'static str, &'static 
 #[cfg(target_os = "windows")]
 fn create_menu_item_bitmap(size: i32, rgba: &[u8]) -> Option<HBITMAP> {
     let n = size as usize;
-    if size <= 0 || n.checked_mul(4)? != rgba.len() {
+    // 🔴 DIAG-166 根因修复：长度契约是 size²*4（RGBA8 方形缓冲）。原 `n.checked_mul(4)`
+    // 只有 4*size，与 rgba.len()=4*size² 仅在 size=1 时相等 ⇒ 对任何实际尺寸必然判否
+    // ⇒ 本函数自 TRAY-ICON-158 起恒返 None ⇒ 图标从未挂载（端测「菜单没有图标」真因，
+    // 离线工装 + 读回验证实证）。修正为 size²*4 全溢出安全链。
+    let expected = size.checked_mul(size).and_then(|sq| sq.checked_mul(4));
+    if size <= 0 || expected.map_or(true, |total| total as usize != rgba.len()) {
         log::warn!(
-            "menu icon: create_menu_item_bitmap rejected input (size={}, rgba_len={})",
+            "menu icon: create_menu_item_bitmap rejected input (size={}, rgba_len={}, expected={:?})",
             size,
-            rgba.len()
+            rgba.len(),
+            expected
         );
         return None;
     }

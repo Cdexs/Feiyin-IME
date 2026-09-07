@@ -203,3 +203,12 @@
 - **验证**：fmt 0 / check --all-targets warnings 111/102 持平 / cargo test 1110P/0F 零预期红；FIX-162 两 hunk 零触碰。
 - **红线**：未 commit/未出包/版本未动/零凭证/临时文件无（无截图无脚本）；diff --numstat 328+/81- 全部归属本人改动+coder-2 既有回退。
 - **给主控**：出包前目视清单（托盘右键一次看 debug.log 的 menu icon 行=Q1 取证；说话中看弧=Q2）；Q2 若端测仍无弧，弧级插桩（E5）待批。
+
+## 2026-09-07 — coder-1 — DIAG-166 ✅ 托盘菜单图标查到底（工装实证定案 Q1 根因 + 守卫修复 +9/-3，待主控验收）
+
+- **根因（定案，非候选）**：`create_menu_item_bitmap` 长度守卫 `n.checked_mul(4) != rgba.len()`——rgba 是 size²*4 的方形缓冲，比较值只有 4*size ⇒ size≥16 时恒判否 ⇒ 函数恒返 None ⇒ 图标从未创建/挂载。与 HMENU 归属（DIAG-163 已证伪）、MENUINFO/MNS_CHECKORBMP（本轮工装对照排除）、CreateDIBSection 失败（DC 对照排除）、SetMenuItemInfoW 失效（读回逐位相等排除）全无关——第 0 层：位图没造出来。
+- **工装**：src/bin/diag166_menu_probe.rs 四组实验（现状复现/DC 对照/A 层读回/CHECKORBMP 对照），全 stdout 存档 docs/DIAG-166-TRAY-ICON.md，**工装文件已按红线删除**。
+- **修复**：守卫改 size²*4 溢出安全链（+9/-3）；机制实证钉死才动手（Step 4 达成）；FIX-164 Part C 日志零触碰。
+- **验证**：fmt 0 / warnings 111/102 持平 / cargo test 1110P/0F 连续 3 次全绿；中间一次 24F 不可复现（与工装删除+fmt 重叠窗口期可疑，无断言锚定被改行），已在主文档如实记录。
+- **出包观察点（交主控/Gavin）**：右键托盘应见双图标品牌橙；若上下颠倒（DIBSECTION 读回 biHeight=+16 痕迹）→ 去掉 biHeight 负号一行即修。
+- **红线**：未 commit/版本未动/未出包/零凭证；工装已清理。

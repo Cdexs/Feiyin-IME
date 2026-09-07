@@ -823,3 +823,5 @@ FIX-162 | P0 止血：回退 WS_EX_COMPOSITED（Gavin 端测第4条 EDIT 大黑�
 | DIAG-163 | BUILD-159 端测三问诊断（Q3 机制已定=DEC-025 异步重载缺口非回归；Q1 头号怀疑证伪机制未定待插桩；Q2 链路通+冻结帧假设；只查不修 src/ 零改动） | coder-1 | 2026-09-07 |
 
 | FIX-164 | 端测三条一次修完：Q3 预热+有界等待（D1 轮询+失败签名/D2 1500ms 可打断）、Q2 弧阈值 0.35→0.10+0.35 地板、Q1 菜单图标失败日志永久化；DEC-062；1110P/0F、warnings 111/102 持平 | coder-1 | 2026-09-07 |
+
+| DIAG-166 | 托盘菜单图标根因=长度守卫缺 size² 因子致 create_menu_item_bitmap 恒 None（工装实证 A 层存储正常+MNS_CHECKORBMP 无关+DC 对照排除 CreateDIBSection）；守卫修复+9/-3；1110P/0F×3、warnings 111/102 持平；工装已删证据存档 | coder-1 | 2026-09-07 |
