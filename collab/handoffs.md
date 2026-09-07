@@ -3,6 +3,15 @@
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
 
+## 2026-09-07 — coder-2 — TEST-SYNC-150 ✅ 阶段三：OVERLAY-149 双修复护栏 G10/G11（生产区零字节，待主控验收 → TEST-EXEC）
+
+- **G10（caret 清理顺序）**：`destroy_edit_control` 内 `let _ = SetFocus(` / `let _ = HideCaret(` / `let _ = DestroyCaret(` 三行必须全部早于 `let _ = DestroyWindow(`——顺序是护栏主体（销毁后清 caret=空操作）。needle 全代码行首形态注释免疫；锚 `fn destroy_edit_control(` raw 计数=1 唯一；块定界起点断言防漂移；PROBE 探针块删除不影响。
+- **G11（Stop 臂清 OVERLAY_EDITING）**：结构锚 `HotkeyEvent::Stop => {` raw 计数=1（macOS 臂 `platform::` 前缀不可命中，不绑日志文案——主控裁定采纳）；sanity=`if is_recording.load(` 结构特征，误锚红显式暴露。
+- **沙箱预演+消融 4 条全验红**（独立 rust 复刻 helper 语义，验后整目录删除）：A1 删 DestroyCaret 代码行**留注释**→G10 红（主控追加的注释喂绿验证）；A2 三步挪 DestroyWindow 后→顺序红；A3 删 store(false)→G11 红；A4 裸重复臂注入→sanity 红。baseline 双 PASS。验后还原：`git diff --numstat src/main.rs` = **+82/-0 单 hunk @ mod overlay_121_guard_tests（:12102，测试区）**。
+- **macOS 定稿**：OVERLAY_EDITING 唯一 store(true) 在 cfg(windows) 内 ⇒ macOS 恒 false ⇒ F2 缺陷 macOS 不可达，macOS Stop 臂无需同款守卫。
+- **验证**：fmt 0 / check --all-targets 0 error / warnings **111/102 基线逐位持平**。红线：未跑 cargo test/build / 未 commit / 未动版本 / 零凭证 / 沙箱已清理。
+
+
 ## 2026-09-07 — tester-1 — BUILD-151 ✅ 阶段五出包：首个含 OVERLAY-149 caret 修复 + 热键停止卡屏修复 + 圆角判别探针 E3/E4 的包（待主控验收/Gavin 端测）
 
 - **基线**：开工 HEAD `115eb5b` + 工作区仅 `docs/MACOS-HANDOFF.md`（coder-2 macOS 复核同步，主控确认漏 add）；构建期主控补提交 `69aded0`，`git diff 115eb5b 69aded0` 仅该文档 +6 行零代码差异 ⇒ **报告基线 69aded0，二进制零影响**。

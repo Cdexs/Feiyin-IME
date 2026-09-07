@@ -12102,4 +12102,86 @@ mod overlay_121_guard_tests {
             checked
         );
     }
+
+    /// G10: EDIT 销毁前 caret 清理三步齐全且顺序正确（OVERLAY-149 F1）。
+    ///
+    /// 守的是：`destroy_edit_control` 内「移焦 `SetFocus(` → `HideCaret(` →
+    /// `DestroyCaret()`」三步必须全部早于 `let _ = DestroyWindow(`。
+    /// 带焦销毁收到的是 WM_DESTROY 而非 WM_KILLFOCUS，EDIT 内部不会销毁
+    /// caret；caret 对象绑线程输入队列而非窗口，DestroyWindow **之后**再清
+    /// 是空操作（caret 残留跨态闪烁，OVERLAY-147-DIAG §B2 成因）——
+    /// 顺序错了修复即失效，故顺序断言是本护栏的主体。
+    ///
+    /// 锚点唯一性（134/143 教训）：needle 全部取代码行首形态
+    /// （`let _ = DestroyCaret()` 等），注释行以 `//` 开头天然不命中
+    /// starts_with，不存在「注释喂绿」；fn 定义行全库恰 1（find_line 首锚
+    /// 即唯一锚）。OVERLAY-149-PROBE 探针块（GetGUIThreadInfo）位于三步与
+    /// DestroyWindow 之间，判读后删除不影响本护栏（相对顺序不变）。
+    ///
+    /// 消融（沙箱预演，验后还原）：删 DestroyCaret 调用 → 红；
+    /// 三步整块挪到 DestroyWindow 之后 → 红（顺序断言）。
+    #[test]
+    fn g10_caret_cleanup_before_destroy_window() {
+        let lines = main_prod_lines();
+        let anchor = find_line(&lines, concat!("fn destroy_edit_control", "("))
+            .expect("G10 anchor: destroy_edit_control 定义");
+        let bounds = block_bounds(&lines, anchor).expect("G10: 函数块定界失败");
+        assert_eq!(
+            bounds.0,
+            anchor,
+            "G10: 块定界起点异常（open=L{}，anchor=L{}）——锚点漂移，护栏需跟进",
+            bounds.0 + 1,
+            anchor + 1
+        );
+        let line_of = |needle: &str| {
+            block_line_of(&lines, anchor, needle)
+                .unwrap_or_else(|| panic!("G10: 块内未找到代码行首形态 {needle}（三步被删/改名）"))
+        };
+        let setfocus = line_of(concat!("let _ = SetFocus", "("));
+        let hide = line_of(concat!("let _ = HideCaret", "("));
+        let destroy_caret = line_of(concat!("let _ = DestroyCaret", "("));
+        let destroy_window = line_of(concat!("let _ = DestroyWindow", "("));
+        assert!(
+            setfocus < destroy_window && hide < destroy_window && destroy_caret < destroy_window,
+            "G10: caret 清理三步（SetFocus L{} / HideCaret L{} / DestroyCaret L{}）必须全部早于 DestroyWindow（L{}）——销毁后清理是空操作，顺序错=修复失效",
+            setfocus + 1,
+            hide + 1,
+            destroy_caret + 1,
+            destroy_window + 1
+        );
+    }
+
+    /// G11: 热键 Stop 臂必须清 OVERLAY_EDITING（OVERLAY-149 F2）。
+    ///
+    /// 守的是：OVERLAY_EDITING 不清则后续 Done/Cancelled 被压制臂
+    /// （`if OVERLAY_EDITING.load(...)`）拦下，既不回 Idle 也不 Hide，
+    /// Processing 浮层永久卡屏直到下次录音（OVERLAY-147-DIAG §B1-⑥ 可达缺陷）。
+    ///
+    /// 锚点唯一性（134/143 教训，结构锚不绑文案）：`HotkeyEvent::Stop => {`
+    /// 生产区两处 —— Windows 控制器臂行首 `HotkeyEvent::Stop => {`（:5807 区）、
+    /// macOS 臂行首 `platform::HotkeyEvent::Stop => {`（:7214 区，前缀不同
+    /// startswith 天然不命中）⇒ find_line 首锚结构性唯一取 Windows 臂，改日志
+    /// 措辞不会误伤。sanity 断言用结构特征 `if is_recording.load(`（Windows 臂
+    /// 独有，macOS 臂三行无此结构）：若臂序重排导致锚到 macOS 臂，sanity 红 =
+    /// 误锚显式暴露，不产生假绿。
+    ///
+    /// macOS 侧无需同款守卫（主控 cfg 归属扫描定稿）：OVERLAY_EDITING 唯一
+    /// store(true) 在 cfg(windows) 块内，macOS 上恒 false ⇒ Done/Cancelled
+    /// 压制臂不可能生效 ⇒ F2 缺陷 macOS 不可达。
+    ///
+    /// 消融（沙箱预演，验后还原）：删 `OVERLAY_EDITING.store(false` 行 → 红。
+    #[test]
+    fn g11_hotkey_stop_clears_editing_flag() {
+        let lines = main_prod_lines();
+        let anchor = find_line(&lines, concat!("HotkeyEvent::Stop", " => {"))
+            .expect("G11 anchor: HotkeyEvent::Stop 臂");
+        assert!(
+            block_contains(&lines, anchor, concat!("if is_recording.load", "(")),
+            "G11: 锚定块不含 Windows 控制器臂结构特征 if is_recording.load（锚点漂移到 macOS 臂）——臂序变化需同步更新锚点"
+        );
+        assert!(
+            block_contains(&lines, anchor, concat!("OVERLAY_EDITING.store(false", "")),
+            "G11: HotkeyEvent::Stop 臂必须清 OVERLAY_EDITING（不清则 Done/Cancelled 被压制臂拦下 ⇒ Processing 浮层永久卡屏）"
+        );
+    }
 }
