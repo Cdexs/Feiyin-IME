@@ -1604,3 +1604,19 @@ Show(StreamingEditing) → 无条件 destroy_edit_control 从未实现「同步 
 - 若将来实施 macOS 编辑态（§2.10 TODO 表），视觉口径直接对齐新基线：圆角
   Recording 系 r=16 / Error·FocusLost·Info r=10，逐像素 alpha 天然成立，无需移植
   ULW/SLWA 双模式机制（那是 Win32 layered window 专属约束）。
+
+### OVERLAY-141-IMPL · 圆角灰边根治：帧末解析式 SDF 写 alpha（2026-09-07，coder-2）
+
+**Windows 侧改动**：`apply_alpha_fixup` 重写为按圆角矩形 SDF 每像素解析计算覆盖率直接写
+alpha（不再依赖 D2D 经 BindDC 保真 alpha——实测不保真，AA 边缘被旧提亮规则压成全不透明，
+即 Gavin 报的圆角灰边粗乱）；窗口外框半径收敛为单一来源 `OVERLAY_FRAME_RADIUS_LG/SM`
++ `overlay_frame_radius(status)` 映射，D2D chrome 与 GDI fallback 全部引用常量。
+
+**macOS 侧结论（不适用，无需对端改动）**：
+- 本次全部改动位于 `#[cfg(target_os = "windows")]` 区域（常量 / overlay_frame_radius /
+  apply_alpha_fixup / mod d2d / 各绘制函数 / WM_PAINT 调用点），`src/platform/macos/**`
+  零引用，macOS 编译零影响。
+- macOS NSWindow 的 AA 圆角由 layer cornerRadius 天然提供，不存在「D2D→DIB alpha
+  丢失」这一合成层缺陷，无需等价的帧末 SDF 修正。
+- 半径视觉口径与 OVERLAY-121 基线一致（Recording 系 r=16 / Error·FocusLost·Info·编辑
+  r=10），若将来实施 macOS 侧 overlay 直接对齐同一常量语义即可。
