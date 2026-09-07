@@ -3,6 +3,17 @@
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
 
+## 2026-09-07 — tester-1 — BUILD-156 ✅ 快速出包：OVERLAY-155 圆角三次修法（精简流程，Gavin 在等，待主控验收/端测）
+
+- **基线**：HEAD `aeaebe1` clean。
+- **精简流程**（免阶段四/消融）：Step1 清进程 → Step3 主程序（1m45s，111 warnings 持平）→ Step4 cp -p 同步 Publish/。
+- **Step2 Skip（git-log 法）**：`git log -1 -- ui/ src-tauri/` ⇒ `f85c550 @09-06 18:47` 早于 UI exe 01:15。
+- **四项核验全 PASS**：① 主程序 14:55:13 本次构建；② sha 两副本一致 `a0521728…` **异于** PRE155 `fb9fcf50…`；③ ProductVersion 0.9.0.0 未动；④ 冒烟 PID 8956 Responding=True 无 panic 已清理。
+- **跳过**：toml 三副本/判别探针/大小对照/cargo test/vitest/E2E/消融。config.toml sha `3186ec8c` 未变。
+- **红线**：未 commit / v0.9.0 未动 / 未用 cargo tauri build / 未 cargo clean / 零凭证。
+- **Gavin 端测清单 5 项**见 `outbox/tester-1/result.md`（🔴 录音+处理中窗圆角灰边恢复 1px / 信息·错误窗不回退 / 录音窗光标复验 / 编辑态停止热键复验 / 🔴 保留 debug.log 给 E3）。
+
+
 ## 2026-09-07 — tester-1 — BUILD-154 ✅ 快速出包：OVERLAY-153 圆角二次修法（精简流程，Gavin 在等，待主控验收/端测）
 
 - **基线**：HEAD `14bce8f` clean。

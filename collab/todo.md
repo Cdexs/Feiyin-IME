@@ -28,6 +28,8 @@
 | ⑤ | 探针删除（`OVERLAY-149-PROBE` 标注 10 处，清单见 coder-1 result.md §六） | 待定 | ⏳ 判读后 |
 | ⑥ | **`OVERLAY-153`** 圆角二次修法：覆盖率当乘数（免阶段三/四直出包，Gavin 指示） | coder-2 | ✅ 已交付验收（cargo test 三跑 1109P/0F，`14bce8f`） |
 | ⑦ | **`BUILD-154`** 快速出包：OVERLAY-153（精简流程四步 + 四项核验） | tester-1 | ✅ 已交付（sha `fb9fcf50…` 异于 PRE153 `b20fbe14…`，四项核验全 PASS，产物在 Publish/，待主控验收/Gavin 端测） |
+| ⑧ | **`OVERLAY-155`** 圆角三次修法：GDI chrome 收进 D2D 失败分支 + 半径对齐 Info | coder-2 | ✅ 已交付验收（`aeaebe1`，1109P/0F） |
+| ⑨ | **`BUILD-156`** 快速出包：OVERLAY-155（精简流程四步 + 四项核验） | tester-1 | ✅ 已交付（sha `a0521728…` 异于 PRE155 `fb9fcf50…`，四项核验全 PASS，产物在 Publish/，待主控验收/Gavin 端测） |
 
 ### 🔴 Gavin 端测清单（13:07 包）
 
