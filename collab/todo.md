@@ -15,9 +15,9 @@
 
 | 任务 | Worker | 内容 | 状态 |
 | --- | --- | --- | --- |
-| `BUILD-171` | tester-1 | 出包：FLICKER-170 编辑态移光标闪烁（✅ 七项核验全 PASS，sha `3a55ad20…` 异于 `20b371d4…`，判别探针三证 PASS，cargo test 全量 1110P/0F；B' WM_PAINT 单次合成 + A WS_CLIPCHILDREN） | ✅ **已交付，待主控验收/自测目视** |
-| `FLICKER-170` | coder-1 | 编辑态移光标闪烁修复（B' EDIT 子类 WM_PAINT 单次合成修现象本体 + A 父窗 WS_CLIPCHILDREN 修放大器；协商 2 轮；🔴 WM_PRINTCLIENT 下选区反白不渲染 Gavin 已接受） | ✅ **已验收提交** `8efbf89`，已进 BUILD-171 |
-| `BUILD-168` | tester-1 | 出包：DIAG-166 托盘图标根因修复（✅ 七项核验全 PASS，sha `20b371d4…`，判别探针字节级 PASS；托盘图标已修=四条全覆盖首包） | ✅ **已交付**，已被 BUILD-171 覆盖 |
+| `BUILD-173` | tester-1 | 出包：FIX-172 声波弧动效修复 + 最右侧闪烁本体（✅ 七项核验全 PASS，sha `f698a431…` 异于 `3a55ad20…`，判别探针三证 PASS，cargo test 全量 1110P/0F；A 地板抬高振幅 + B 滚动位块 WM_SETREDRAW 包裹） | ✅ **已交付，待主控验收/自测目视** |
+| `FIX-172` | coder-1 | 声波弧回归修复（A 地板截断改抬高振幅）+ 编辑态最右侧闪烁根治（B 滚动位块 WM_SETREDRAW 包裹，工装 E1 实证滚动绕过 WM_PAINT） | ✅ **已验收提交** `b0b5c66`，已进 BUILD-173 |
+| `BUILD-171` | tester-1 | 出包：FLICKER-170 编辑态移光标闪烁（✅ 七项核验全 PASS，sha `3a55ad20…`，判别探针三证 PASS；B' WM_PAINT 单次合成 + A WS_CLIPCHILDREN） | ✅ **已交付**，已被 BUILD-173 覆盖 |
 
 ### 🔴 主控失职复盘（根因，待固化进出包判据）
 

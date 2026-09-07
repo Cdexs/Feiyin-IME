@@ -4,6 +4,17 @@
 
 
 
+## 2026-09-07 — tester-1 — BUILD-173 ✅ 出包：FIX-172 声波弧动效修复 + 最右侧闪烁本体（精简流程，待主控验收）
+
+- **基线**：HEAD `b0b5c66` clean（FIX-172 修复已由主控提交）。
+- **精简流程**：Step1 清进程（无残留）→ Step2 git-log 法 UI 免重建（f85c550@09-06 18:47 早于 UI exe 01:15）→ Step3 主程序（2m07s，feiyin-ime 111 / crash-reporter 5）→ Step4 cp -p 同步 Publish/。
+- **七项核验全 PASS**：① 主程序 22:07 本次构建；② 两副本 sha `f698a431…` 一致异于 `3a55ad20…`；③ ProductVersion 0.9.0.0；④ 冒烟 PID 15508 Responding=True 无 panic 已清理；⑤ config.toml sha `3186ec8c` 不变；⑥ warnings 111/102；⑦ 🔴 判别探针三证 PASS（源码 grep+时间戳+sha；WM_SETREDRAW grep=4 含 2 注释代码级=2，amplitude grep=4 含 1 注释代码级=3）。
+- **回归（并行）**：cargo test 全量 **1110P/0F/9I** + hotkey 51P + ui_guard 2P；Vitest/E2E Skip。🔴 crash_reporter config 批量 FAIL **本轮未出现**（连续五轮未复现，维持归档偶发）。
+- **出包语义**：声波弧「一起亮一起灭」（A 地板截断改抬高振幅，FIX-164 回归修复）+ 编辑态最右侧文字闪烁（B 滚动位块 WM_SETREDRAW 包裹）；🔴 已知取舍如实写入（WM_PRINTCLIENT 下选区反白不渲染，Gavin 已接受）。不出端测清单给 Gavin，主控自出。
+- **红线**：未 commit / v0.9.0 未动 / 未 cargo clean / 未 cargo tauri build / 零凭证 / 无临时文件。
+
+
+
 ## 2026-09-07 — tester-1 — BUILD-171 ✅ 出包：FLICKER-170 编辑态移光标闪烁（精简流程，待主控验收）
 
 - **基线**：HEAD `8efbf89` clean（FLICKER-170 修复已由主控提交）。
@@ -251,3 +262,25 @@
 - **macOS**：mic_pulse_* 与 EDIT 子类均 cfg(windows) 专属，不涉及，MACOS-HANDOFF 无需同步。
 - **预期现象分离（供端测归因）**：A 修「声波弧依次亮/1 秒一轮」；B 修「左右移光标最右侧文字闪烁」。只好一半按此去留。
 - **红线**：未 commit/版本未动/未出包/零凭证/工装已删；FLICKER-170-A/B' 主体/选区/圆角/ULW/预热/托盘零触碰。
+
+## 2026-09-07 — coder-1 — ESC-174 ✅ 编辑态 ESC 取消编辑与录入（阶段一：30+/0-，1111P/0F，待主控验收）
+
+- **重点结论（压制链不卡窗，双顺序安全）**：CancelRequested 臂（:6537）自带完整收口——cancel/stop 双信号 + OVERLAY_EDITING=false + STREAMING_STOPPED=true + Hide + 托盘 Idle。worker 后续 Cancelled 到压制臂时 editing 已 false ⇒ else 幂等再 Hide。乱序场景（Cancelled 先到被压制吞掉）编辑窗保持、ESC 仍可收口。**「按 ESC 卡屏」不成立，无需拆单、无需先修压制**。
+- **语义双满足**：关窗（F1 caret 清理+EDIT 销毁）+ 作废录入（cancel_signal→ASR 关 WS 丢文本；注入唯一通道 SubmitRequested 不经过 cancel）。
+- **实施**：子类 WM_KEYDOWN 补 VK_ESCAPE 分支（同 Enter 分支父通道取 data，request.is_some() 守卫），位于 FIX-172-B 包裹块之前 return 0 无 SETREDRAW 停绘风险。
+- **四条边界**：非编辑态零改动（EDIT 仅编辑态存在，父窗 :2226/FocusLost :2097 未动）；父子天然互斥+取消臂幂等；ESC/RETURN 无交叉；包裹块不参与。
+- **验证**：fmt 0 / 0 error / cargo test 1111P/0F；warnings 118/109 中新增 7 条全在 menu_icons.rs = coder-2 EDITICON-175 在途改动（与本单无关），本单 main.rs 零新增。
+- **Hide 双重压制静态缺陷**：绕开即可（理由见上），不动压制臂。
+- **红线**：未 commit/版本未动/未出包/零凭证；macOS 不涉及。
+
+## 2026-09-07 — coder-2 — EDITICON-175 ✅ 编辑小图标（铅笔）图标本体交付（只写 src/ui/menu_icons.rs，待主控验收 → 下一单集成）
+
+- **交付**：`src/ui/menu_icons.rs` +99 行——`edit_icon_rgba(size)` 铅笔图标光栅化（SSAA 4x4、品牌橙、尖-杆缺口识别特征，18px/16px 均可辨）+ `dump_edit_icon_preview` 测试；预览 PNG 在 collab/outbox/coder-2/icons/（16/18/24 + x8，🔴 只证形态不证运行时）。
+- **下一单集成依据**：图标盒子 18px@(6,9)（main.rs:4427-4429）；分割线规格=沿用现有左分割线 x=30/2px/20px 高/OVERLAY_BORDER_GRAY 0x3A3A3C（:4514-4529），图标右缘 24→线 30 间距 6px，线右缘 31→文字左缘 42 间距 11px。
+- **注意**：main.rs 中 `edit_icon_rgba` 暂以 allow(dead_code) 压 warning（111/102 持平），集成后删 allow；cargo test 1111P/0F（+1 预览测试）；main.rs 零触碰（numstat +30 为 coder-1 ESC-174 在途）。
+
+## 2026-09-07 — coder-2 — EDITICON-176 ✅ 集成完成：编辑态铅笔图标+分割线（D2D+GDI 兜底全覆盖，待主控验收 → 出包端测）
+
+- **两条活产出路径都已覆盖**：D2D `draw_editing_overlay`（main.rs:4827 内 `edit_icon_and_left_separator`）+ GDI 兜底（:2903 调用 `draw_edit_icon_and_separator_gdi`）；`:3853 draw_editing_overlay_chrome` 是死代码未触碰。像素=175 验收的光栅化源（D2D 预乘 BGRA / GDI 直通 BGRA），无第二几何源。
+- **验证**：fmt 幂等/check 0 error/warnings 111-102 持平/test 1112P-0F（+1 转换单测）；ESC-174 `@@ -948` hunk 零触碰。
+- **待出包端测清单**：见 result.md 第七节（图标位置/大小/颜色、分割线、版式一致性、编辑态闪烁未回归、其余四态无变化）。

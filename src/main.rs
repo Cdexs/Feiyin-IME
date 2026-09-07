@@ -948,6 +948,36 @@ unsafe extern "system" fn edit_subclass_wnd_proc(
         return LRESULT(0);
     }
     if msg == windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN {
+        // ESC-174: 编辑态 ESC = 取消编辑 + 作废本次录入。发 CancelRequested 走既有
+        // 取消收口（controller 臂：cancel/stop 双信号 + OVERLAY_EDITING=false +
+        // STREAMING_STOPPED=true + Hide + 托盘回 Idle），复用现有通道零新增路径。
+        // 压制链分析（OVERLAY-147-DIAG B3 + OVERLAY-149 F2 的存量结论）：worker 随后
+        // 发出的 PipelineEvent::Cancelled 到达压制臂时 OVERLAY_EDITING 已被本事件臂
+        // 清为 false ⇒ 走 else 幂等再 Hide 一次，无卡窗。非编辑态不经过本子类
+        // （EDIT 仅编辑态存在），父窗 :2226 的 ESC 分支行为不变，两者按 EDIT 存在
+        // 与否天然互斥。return 0 不落 FIX-172-B 包裹块（ESC 分支在包裹块之前），
+        // 无 SETREDRAW 停绘风险；Hide 流程照常走 OVERLAY-149 F1 caret 清理。
+        // 回退 = 删除本分支。
+        if wparam.0 == VK_ESCAPE.0 as usize {
+            // 与 Enter 分支同一取父通道：EDIT 的 GWLP_USERDATA 存的是父 overlay HWND
+            let parent_hwnd = {
+                let parent = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+                HWND(parent as _)
+            };
+            if !parent_hwnd.0.is_null() {
+                let data_ptr =
+                    GetWindowLongPtrW(parent_hwnd, GWLP_USERDATA) as *mut OverlayWindowData;
+                if !data_ptr.is_null() {
+                    let data = &mut *data_ptr;
+                    if let Ok(state) = data.state.lock() {
+                        if state.request.is_some() {
+                            let _ = state.event_tx.send(OverlayUiEvent::CancelRequested);
+                        }
+                    }
+                }
+            }
+            return LRESULT(0);
+        }
         if wparam.0 == VK_RETURN.0 as usize {
             // OVERLAY-051-D: Enter in the EDIT control submits the edited text, same as clicking
             // the submit button. We retrieve the parent overlay window from the EDIT's GWLP_USERDATA
@@ -2871,6 +2901,8 @@ fn draw_overlay_to_dc(
                     // OVERLAY-121 (P3): 编辑态 fallback 维持 r=10（SLWA 旧路径口径不变）。
                     // OVERLAY-141: 半径单一来源。
                     draw_overlay_chrome(hdc, rect, OVERLAY_FRAME_RADIUS_SM as i32);
+                    // EDITICON-176: 兜底帧同画铅笔图标 + 左分割线（与 D2D 主路径同几何）
+                    draw_edit_icon_and_separator_gdi(hdc, rect);
                     submit_btn_rect = Some(draw_submit_button(hdc, rect));
                 } else {
                     submit_btn_rect = Some(draw_submit_button_hit_rect_only(rect));
@@ -3732,6 +3764,67 @@ fn draw_recording_indicator(
     }
 }
 
+/// EDITICON-176: 编辑态 GDI 兜底路径的铅笔图标 + 左分割线（D2D 失败帧）。
+/// 几何与 D2D 主路径（d2d::edit_icon_and_left_separator）逐项同值：
+/// 图标 18px @ (rect.left+6, 垂直居中)，分割线 x=rect.left+30 / 2px / 20px 居中 /
+/// OVERLAY_BORDER_GRAY（= draw_recording_indicator :3750-3762 左分割线同一实现）。
+/// 图标 = `edit_icon_bgra(18)` 直通 alpha BGRA → CreateDIBSection（32bpp 顶行在前，
+/// biHeight 负高）→ AlphaBlend(AC_SRC_OVER, AC_SRC_ALPHA) 1:1 贴出，与
+/// draw_recording_indicator 的 4x HALFTONE 是两条独立路数（GDI 兜底帧不追求
+/// 与主帧逐位同像素，契约是「不空白」，形态一致性由同一光栅化源保证）。
+#[cfg(target_os = "windows")]
+fn draw_edit_icon_and_separator_gdi(hdc: windows::Win32::Graphics::Gdi::HDC, rect: &RECT) {
+    const ICON_SIZE: i32 = 18;
+    let icon_l = rect.left + 6; // GDI: rect.left + 6（mic_indicator 同盒子）
+    let icon_t = rect.top + (rect.bottom - rect.top - ICON_SIZE) / 2;
+    let bgra = ui::menu_icons::edit_icon_bgra(ICON_SIZE as u32);
+    unsafe {
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: ICON_SIZE,
+            biHeight: -ICON_SIZE, // 负高 = 顶行在前（menu_icons 行序一致）
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let bmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0);
+        if let Ok(bmp) = bmp {
+            if !bits.is_null() {
+                std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits.cast(), bgra.len());
+            }
+            let mem_dc = CreateCompatibleDC(hdc);
+            let old_bmp = SelectObject(mem_dc, bmp);
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let _ = AlphaBlend(
+                hdc, icon_l, icon_t, ICON_SIZE, ICON_SIZE, mem_dc, 0, 0, ICON_SIZE, ICON_SIZE,
+                blend,
+            );
+            let _ = SelectObject(mem_dc, old_bmp);
+            let _ = DeleteObject(bmp);
+            let _ = DeleteDC(mem_dc);
+        }
+        // 左分割线：与 draw_recording_indicator :3750-3762 逐项同值
+        let sep_l_x = rect.left + 30;
+        let sep_h = 20;
+        let sep_hh = sep_h / 2;
+        let cy = rect.top + (rect.bottom - rect.top) / 2;
+        let sep_pen = CreatePen(PS_SOLID, 2, OVERLAY_BORDER_GRAY);
+        let sep_op = SelectObject(hdc, sep_pen);
+        let _ = MoveToEx(hdc, sep_l_x, cy - sep_hh, None);
+        let _ = LineTo(hdc, sep_l_x, cy + sep_hh);
+        let _ = SelectObject(hdc, sep_op);
+        let _ = DeleteObject(sep_pen);
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn draw_listening_placeholder(
     hdc: windows::Win32::Graphics::Gdi::HDC,
@@ -3904,10 +3997,12 @@ mod d2d {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct2D::Common::{
         D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
+        D2D_SIZE_U,
     };
     use windows::Win32::Graphics::Direct2D::{
         D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, ID2D1SolidColorBrush,
-        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+        D2D1_BITMAP_PROPERTIES, D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
         D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
         D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
     };
@@ -4724,11 +4819,82 @@ mod d2d {
     /// D2D 帧与子控件零交集（共存论证：docs/D2D-P2P3-PLAN.md §3.3-A —— D2D 只画进
     /// mem_dc、BitBlt 合成不变、子控件独立表面、颜色同值闭环）。
     /// Returns false on any D2D failure — the caller renders the same frame via GDI.
+    /// EDITICON-176：编辑态左侧 = 铅笔图标（18px @ (6, 垂直居中)）+ 左分割线
+    /// （x=30 / 2px / 20px 居中 / OVERLAY_BORDER_GRAY —— 与 mic_indicator 的左
+    /// 分割线 :4544-4564 逐项同值，GDI 侧 :3750-3762 同一几何）。
+    /// 图标像素 = `ui::menu_icons::edit_icon_rgba(18)`（EDITICON-175 主控目视
+    /// 验收通过的那批像素）预乘 BGRA 后经 `rt.CreateBitmap` + `DrawBitmap`
+    /// 1:1 贴出（NEAREST_NEIGHBOR，尺寸相同无重采样），不用 D2D 矢量重画
+    /// ——避免第二份几何源与已验收形态漂移。
+    /// 失败语义：位图创建/贴图失败 = 本帧 best-effort 跳过图标（分割线照画、
+    /// 返回值不受影响）——「overlay 永不空白」契约只看 BindDC/D2D 基础设施，
+    /// G1 护栏语义不变；图标缺失属可降级缺陷，GDI 兜底在下次 D2D 失败帧补画。
+    fn edit_icon_and_left_separator(res: &D2dResources, h: f32) {
+        const ICON_SIZE: f32 = 18.0;
+        let icon_l = 6.0; // GDI: rect.left + 6
+        let icon_t = (h - ICON_SIZE) / 2.0;
+        let bgra = crate::ui::menu_icons::edit_icon_premultiplied_bgra(18);
+        unsafe {
+            let props = D2D1_BITMAP_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+            };
+            let bitmap = res.rt.CreateBitmap(
+                D2D_SIZE_U {
+                    width: 18,
+                    height: 18,
+                },
+                Some(bgra.as_ptr().cast()),
+                18 * 4, // pitch：18px × 4B/px
+                &props,
+            );
+            if let Ok(bitmap) = bitmap {
+                res.rt.DrawBitmap(
+                    &bitmap,
+                    Some(&D2D_RECT_F {
+                        left: icon_l,
+                        top: icon_t,
+                        right: icon_l + ICON_SIZE,
+                        bottom: icon_t + ICON_SIZE,
+                    }),
+                    1.0,
+                    D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                    None,
+                );
+            }
+            // 左分割线：与 mic_indicator :4544-4564 逐项同值
+            let sep_l_x = 30.0; // GDI: rect.left + 30
+            let sep_hh = 10.0; // GDI: sep_h 20 / 2
+            let cy = h / 2.0; // GDI: rect.top + height/2 (rect-relative)
+            res.brush
+                .SetColor(&colorref_to_d2d(super::OVERLAY_BORDER_GRAY));
+            res.rt.DrawLine(
+                D2D_POINT_2F {
+                    x: sep_l_x,
+                    y: cy - sep_hh,
+                },
+                D2D_POINT_2F {
+                    x: sep_l_x,
+                    y: cy + sep_hh,
+                },
+                &res.brush,
+                2.0,
+                None,
+            );
+        }
+    }
+
     pub(crate) fn draw_editing_overlay(hdc: HDC, rect: &RECT) -> bool {
         with_d2d(hdc, rect, |res, w, h| {
             // OVERLAY-121 (P3): 编辑态维持 r=10 —— SLWA 旧路径，视觉口径不变。
             // OVERLAY-141: 半径单一来源（映射完备性：SLWA 不走 ULW fixup，仅绘制用）。
             chrome(res, w, h, super::OVERLAY_FRAME_RADIUS_SM);
+            // EDITICON-176: 左侧铅笔图标 + 分割线（Gavin：原麦克风位置放编辑小图标）
+            edit_icon_and_left_separator(res, h);
             let _ = submit_button(res, w, h);
         })
     }
