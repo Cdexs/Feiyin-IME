@@ -4,6 +4,17 @@
 
 
 
+## 2026-09-07 — tester-1 — BUILD-171 ✅ 出包：FLICKER-170 编辑态移光标闪烁（精简流程，待主控验收）
+
+- **基线**：HEAD `8efbf89` clean（FLICKER-170 修复已由主控提交）。
+- **精简流程**：Step1 清进程（无残留）→ Step2 git-log 法 UI 免重建（f85c550@09-06 18:47 早于 UI exe 01:15）→ Step3 主程序（2m06s，feiyin-ime 111 / crash-reporter 5）→ Step4 cp -p 同步 Publish/。
+- **七项核验全 PASS**：① 主程序 21:20 本次构建；② 两副本 sha `3a55ad20…` 一致异于 `20b371d4…`；③ ProductVersion 0.9.0.0；④ 冒烟 PID 25444 Responding=True 无 panic 已清理；⑤ config.toml sha `3186ec8c` 不变；⑥ warnings 111/102；⑦ 🔴 判别探针三证 PASS（源码 grep+时间戳+sha；WS_CLIPCHILDREN grep=4 含 2 注释代码级=2，WM_PRINTCLIENT grep=3 含 1 注释代码级=2）。
+- **回归（并行）**：cargo test 全量 **1110P/0F/9I** + hotkey 51P + ui_guard 2P；Vitest/E2E Skip。🔴 crash_reporter config 批量 FAIL **本轮未出现**（连续四轮未复现，维持归档偶发）。
+- **出包语义**：编辑态移光标闪烁（B' WM_PAINT 单次合成）+ 进出编辑态/文字更新整块被盖（A WS_CLIPCHILDREN）；🔴 已知取舍如实写入（WM_PRINTCLIENT 下选区反白不渲染，Gavin 已接受）。不出端测清单给 Gavin，主控自出。
+- **红线**：未 commit / v0.9.0 未动 / 未 cargo clean / 未 cargo tauri build / 零凭证 / 无临时文件。
+
+
+
 ## 2026-09-07 — tester-1 — BUILD-168 ✅ 出包：DIAG-166 托盘图标根因修复（精简流程，四条全覆盖首包，待主控验收）
 
 - **基线**：HEAD `2dc9474` clean（DIAG-166 修复已由主控提交）。
@@ -232,3 +243,11 @@
 - **工装实证**：擦背景 ✓ / 文字 ✓ / 🔴 选区反白 ✗ 不渲染（0px diff ×3 组，Gavin 已接受）；caret/ps.rcPaint/IME 结论见 result.md。
 - **预期现象分离（供 Gavin 端测判归因）**：A 修「进出编辑态/文字更新瞬间 EDIT 整块被盖掉后等 caret 周期回来」；B' 修「按住方向键移光标时最右侧文字闪烁」。只好一半时按此归因决定去留。
 - **红线**：未 commit/版本未动/未出包/零凭证/工装已删；不碰 COMPOSITED/ULW/apply_alpha_fixup/圆角/RecordingStarted/预热逻辑。
+
+## 2026-09-07 — coder-1 — FIX-172 ✅ 声波弧回归修复 + 编辑态最右侧闪烁根治（阶段一：46+/3-，1110P/0F、warnings 111/102 持平，待主控验收 → tester-1 出包）
+
+- **FIX-172-A（声波弧回归）**：.max() 截断 → 抬高振幅 `amplitude=FLOOR+(1-FLOOR)*gain`；三条契约保住（谷底回 0/相位次序/静音零绘制）；只改 mic_pulse_alphas 一处。回退=恢复 .max() 两行。
+- **FIX-172-B（最右侧闪烁）**：工装双实验定案——E1 证明滚动位块绕过 WM_PAINT 直打屏幕（变化 1894px/paints=0），E2 证明 SETREDRAW 包裹可把更新压成单次全客户区合成（变化=覆盖，TRUE 零额外重绘）。实施=子类消息尾包裹按键/字符/EM_SETSEL/点击消息（🔴 在 Enter 提交分支之后）。回退=删包裹块。
+- **macOS**：mic_pulse_* 与 EDIT 子类均 cfg(windows) 专属，不涉及，MACOS-HANDOFF 无需同步。
+- **预期现象分离（供端测归因）**：A 修「声波弧依次亮/1 秒一轮」；B 修「左右移光标最右侧文字闪烁」。只好一半按此去留。
+- **红线**：未 commit/版本未动/未出包/零凭证/工装已删；FLICKER-170-A/B' 主体/选区/圆角/ULW/预热/托盘零触碰。

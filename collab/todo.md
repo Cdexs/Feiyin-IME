@@ -15,9 +15,9 @@
 
 | 任务 | Worker | 内容 | 状态 |
 | --- | --- | --- | --- |
-| `BUILD-168` | tester-1 | 出包：DIAG-166 托盘图标根因修复（✅ 七项核验全 PASS，sha `20b371d4…` 异于 `85c1cf26…`，判别探针字节级 PASS，cargo test 全量 1110P/0F；托盘图标已修 = 四条全覆盖首包） | ✅ **已交付，待主控验收/自测目视** |
-| `DIAG-166` | coder-1 | 托盘图标根因定位 + 修复（工装四实验钉死：长度守卫缺 size² 因子 ⇒ 图标从未被创建；修=守卫 size.checked_mul(size) 溢出链+expected 字段） | ✅ **已验收提交** `2dc9474`，已进 BUILD-168 |
-| `BUILD-165` | tester-1 | 出包：FIX-162 + FIX-164（✅ 六项核验全 PASS，sha `85c1cf26…`；修端测第 4/3/2 条；🔴 第 1 条托盘图标未修仅加日志） | ✅ **已交付**，已被 BUILD-168 覆盖 |
+| `BUILD-171` | tester-1 | 出包：FLICKER-170 编辑态移光标闪烁（✅ 七项核验全 PASS，sha `3a55ad20…` 异于 `20b371d4…`，判别探针三证 PASS，cargo test 全量 1110P/0F；B' WM_PAINT 单次合成 + A WS_CLIPCHILDREN） | ✅ **已交付，待主控验收/自测目视** |
+| `FLICKER-170` | coder-1 | 编辑态移光标闪烁修复（B' EDIT 子类 WM_PAINT 单次合成修现象本体 + A 父窗 WS_CLIPCHILDREN 修放大器；协商 2 轮；🔴 WM_PRINTCLIENT 下选区反白不渲染 Gavin 已接受） | ✅ **已验收提交** `8efbf89`，已进 BUILD-171 |
+| `BUILD-168` | tester-1 | 出包：DIAG-166 托盘图标根因修复（✅ 七项核验全 PASS，sha `20b371d4…`，判别探针字节级 PASS；托盘图标已修=四条全覆盖首包） | ✅ **已交付**，已被 BUILD-171 覆盖 |
 
 ### 🔴 主控失职复盘（根因，待固化进出包判据）
 

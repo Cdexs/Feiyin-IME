@@ -985,6 +985,43 @@ unsafe extern "system" fn edit_subclass_wnd_proc(
     // DefWindowProcW is the default window proc, NOT the EDIT class proc — using it
     // bypasses all of EDIT's text storage, drawing, caret/scroll, selection logic,
     // which was the root cause of "text disappears / can't edit / cursor can't reach".
+    // FIX-172-B: 滚动位块包裹 —— FLICKER-170-B' 没修到本体的原因（工装 E1 实证）：
+    // EDIT 的 ES_AUTOHSCROLL 横向滚动走内部 ScrollWindowEx 类位块传送**直接打屏幕**，
+    // 全程零 WM_PAINT（变化 1894px、paints=0），位块与 DWM 合成不同步 ⇒ 最右侧闪烁。
+    // 修法 = 把「滚动 + 重绘」压成一次屏幕更新：对会移动光标/触发滚动的消息，
+    // 先 WM_SETREDRAW(FALSE) 关掉 EDIT 直打屏幕的一切绘制 → 默认过程只改内部状态
+    // → WM_SETREDRAW(TRUE)（工装 E2 实证不触发额外重绘）→ InvalidateRect(bErase=FALSE)
+    // 整客户区失效 → 由 FLICKER-170-B 的 WM_PAINT 单次合成一次上屏。
+    // 连击时失效区自动合并成一次合成。回退 = 删除本包裹块。
+    // 范围仅收口「内容/光标/选区变化」类消息（任务书列出：方向键/字符/EM_SETSEL/点击）；
+    // WM_MOUSEMOVE 不包（拖选高亮本就不渲染，避免高频无效整客户区失效）。
+    // 🔴 位置约束：必须在 Enter 分支之后（Enter 走提交通道 return，不参与包裹）。
+    const EM_SETSEL_MSG: u32 = 0x00B1; // windows-0.58 在 UI::Controls（feature 未启用），用裸值
+    let wraps = matches!(
+        msg,
+        windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN
+            | windows::Win32::UI::WindowsAndMessaging::WM_SYSKEYDOWN
+            | windows::Win32::UI::WindowsAndMessaging::WM_CHAR
+            | windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONDOWN
+            | windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONDBLCLK
+    ) || msg == EM_SETSEL_MSG;
+    if wraps {
+        let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+            hwnd,
+            windows::Win32::UI::WindowsAndMessaging::WM_SETREDRAW,
+            WPARAM(0),
+            LPARAM(0),
+        );
+        let result = forward_edit_old_proc(hwnd, msg, wparam, lparam);
+        let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+            hwnd,
+            windows::Win32::UI::WindowsAndMessaging::WM_SETREDRAW,
+            WPARAM(1),
+            LPARAM(0),
+        );
+        let _ = InvalidateRect(hwnd, None, false);
+        return result;
+    }
     forward_edit_old_proc(hwnd, msg, wparam, lparam)
 }
 
@@ -3026,11 +3063,17 @@ fn mic_pulse_alphas(now_ms: u64, gain: f32) -> (f32, f32) {
     if gain <= 0.0 {
         return (0.0, 0.0);
     }
+    // FIX-172-A: 地板从「截断」改回「抬高振幅」（乘，不是 max）。FIX-164 的 .max()
+    // 把 tri*gain 峰值（正常说话 gain 0.2~0.5 ⇒ 峰值 0.2~0.5）几乎全程压平在 0.35
+    // 地板上，连 tri 的 45% 零段也被抬成 0.35 ⇒ 波形变常数直线 = 「一起亮一起灭」
+    // （Gavin 端测回归，主控定性）。改法：amplitude = FLOOR + (1-FLOOR)*gain，
+    // 峰值 ∈ (FLOOR, 1]；谷底仍回 0（渐隐保留）、内先外后相位次序不变、
+    // gain→0⁺ 峰值仍有 FLOOR（橙麦必有可见弧）、静音 gain≤0 早退 (0,0) 契约原样。
+    let amplitude = MIC_PULSE_ALPHA_FLOOR + (1.0 - MIC_PULSE_ALPHA_FLOOR) * gain;
     let p = (now_ms % MIC_PULSE_PERIOD_MS) as f32 / MIC_PULSE_PERIOD_MS as f32;
     (
-        (mic_pulse_tri(p, 0.0) * gain).max(MIC_PULSE_ALPHA_FLOOR),
-        (mic_pulse_tri(p, MIC_PULSE_OUT_OFFSET) * gain * MIC_PULSE_OUT_DIM)
-            .max(MIC_PULSE_ALPHA_FLOOR * MIC_PULSE_OUT_DIM),
+        mic_pulse_tri(p, 0.0) * amplitude,
+        mic_pulse_tri(p, MIC_PULSE_OUT_OFFSET) * amplitude * MIC_PULSE_OUT_DIM,
     )
 }
 
