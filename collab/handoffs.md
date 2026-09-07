@@ -3,6 +3,14 @@
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
 
+## 2026-09-07 — coder-2 — OVERLAY-147-DIAG ✅ BUILD-145 端测两问诊断（🔴 只查不修，src 零改动，待主控验收）
+
+- **Part A**：SDF 数学实证正确（探针 vs 精确面积覆盖 mean|Δ|=0.0002/0.0001）⇒ 掩码候选整片砍掉；**H1a 如实推翻**（描边深度偏差 r 无关 ~0.2px，r16 [-0.008,+1.207] vs r10 [-0.012,+1.207]，描边从不探出轮廓；主控 r-0.5 同心化修法方向正确列 F2 顺手项）；**H2 被静态推翻**（RecordingStreamingIdle = r16+静态+坏，`:1678-1686`；待 Gavin 确认看的是占位变体）；窗口高度/内容同构混淆全部排除 ⇒ 剩余候选 {半径值未测路径, 底色}，**机制未定**，判别实验 E1/E2（半径翻转）+ E3（角区像素 dump，顺带验证「BindDC alpha 未存活」从未直接测过的立论前提）已写进 `docs/OVERLAY-147-DIAG.md §A5`。
+- **Part B**：EDIT 不可能存活到录音帧（Show 臂 `:1366` 无条件销毁）⇒ 截图光标 = **线程级 caret 泄漏**主假设（全库零 DestroyCaret、destroy 无 caret 处置、带焦 DestroyWindow 无 WM_KILLFOCUS、caret 直打屏幕不走 ULW 合成），探针=退出编辑后 `GetGUIThreadInfo().hCaret`；**新钉死可达缺陷**：`HotkeyEvent::Stop :5598` 缺 OVERLAY_EDITING 守卫 → 编辑中热键停止 → **Processing 浮层永久卡屏**（Done/Cancelled 全被 `:5718` 压制）；Hide 双重压制卡窗静态存在、可达触发器疑似为零（编辑态 ESC 不可达）；**FLICKER-130 耦合证伪**（被丢 Show 本是销毁 EDIT 的肇事路径，清理不依赖它，`:5679-5681` 注释自述）。
+- **产出**：`docs/OVERLAY-147-DIAG.md`（直接写 docs/）；修法建议 F1-F5 全部标注不实施。
+- **红线自证**：`git diff --numstat -- src/` 空；探针文件已删；未 commit/未动版本/未出包；零凭证；无临时文件。
+
+
 ## 2026-09-07 — tester-1 — BUILD-145 ✅ 阶段五出包：首个含 OVERLAY-141 圆角灰边根治的包（待主控验收/Gavin 端测）
 
 - **基线**：HEAD `bd5a160` clean，主控明确下达「现在可以出包」。
