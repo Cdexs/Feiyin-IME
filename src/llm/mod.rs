@@ -2208,7 +2208,9 @@ mod tests {
         //   删掉这条会让 L0 反过来盖掉 scene-rules.toml 的 "Keep it casual" —— 聊天被公文化。
         assert!(L0_1_FIDELITY.contains("decided ONLY by the scene style rule in layer L3"));
         //   兜底判据：拿不准就保留
-        assert!(L0_1_FIDELITY.contains("if unsure whether something is content (A) or a delivery artifact (B), KEEP IT"));
+        assert!(L0_1_FIDELITY.contains(
+            "if unsure whether something is content (A) or a delivery artifact (B), KEEP IT"
+        ));
         //   L0-2 的保护范围必须钉死在 (A)，否则又会把填充词一起保住
         assert!(L0_2_FIDELITY_OVER_FLUENCY.contains("CONTENT listed in L0-1(A) only"));
         assert!(L0_2_FIDELITY_OVER_FLUENCY.contains("does NOT protect the delivery artifacts"));
