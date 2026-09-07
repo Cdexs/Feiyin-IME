@@ -3,6 +3,16 @@
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
 
+
+## 2026-09-07 — tester-1 — BUILD-159 ✅ 出包：TRAY-ICON-158(+FIX) + MIC-PULSE-160 + EDIT-FLICKER-157（精简流程，Gavin 在等，待主控验收/端测）
+
+- **基线**：HEAD `85388ac` clean。
+- **🔴 对照基线抢存**：`Publish/feiyin-ime.exe` 旧二进制（sha `e6f1445e…`，mtime 15:18，五文档零记录构建）已备份 `collab/evidence/binaries/feiyin-ime-PRE159-UNRECORDED-1518.exe`。
+- **精简流程**：Step1 清进程 → Step2 git-log 判 UI 免重建（f85c550@09-06 18:47 早于 exe 01:15）→ Step3 主程序（2m14s，111 warnings 持平）→ Step4 cp -p 同步 Publish/。
+- **五项核验全 PASS**：① 主程序 18:14 本次构建；② 两副本 sha `b3043119…` **异于** e6f1445e…；③ ProductVersion 0.9.0.0 未动；④ 冒烟 PID 28976 Responding=True 无 panic 已清理；⑤ **Publish==target/release sha 完全一致**（历史不一致问题顺带修复）。
+- **跳过**：toml 三副本/判别探针/大小对照/cargo test/vitest/E2E/消融。config.toml sha `3186ec8c` 未变。
+- **红线**：未 commit / v0.9.0 未动 / 未用 cargo tauri build / 未 cargo clean / 零凭证 / 无临时文件。
+- **Gavin 端测清单 6 项**见 `outbox/tester-1/result.md`（🔴 托盘图标目视 / 🔴 流式麦克风声波弧动效 / 🔴 静音时无弧 / 🔴 流式上屏卡顿闪烁 / 编辑态文字闪烁消失 / 编辑态移光标无新增闪烁）。
 ## 2026-09-07 — coder-2 — EDIT-FLICKER-157 ✅ 编辑态右侧文字闪烁：EDIT 开双缓冲（待主控验收 → 直出包）
 
 - **机制复核成立**（三条定位逐条核对）→ 修法 = `CreateWindowExW` 扩展样式加 `WS_EX_COMPOSITED`（一行 + import，共 +8/-3 双 hunk :102/:678）。

@@ -16,6 +16,7 @@
 | `115eb5b` / `69aded0` | **OVERLAY-149** | F1 caret 泄漏修复 + F2 Stop 臂守卫 + E3/E4 圆角判别探针（coder-1） |
 | `d867c2d` | **BUILD-151** | 出包 `feiyin-ime` 12,277,248 B @13:07 sha `b20fbe14`，硬判别探针正反双向 PASS（tester-1） |
 | `7ddf943` | **TEST-SYNC-150** | G10 caret 清理顺序护栏（注释免疫）+ G11 Stop 臂清 flag（coder-2） |
+| `85388ac` | **BUILD-159** | 出包：TRAY-ICON-158(+FIX) + MIC-PULSE-160 + EDIT-FLICKER-157（tester-1，五项核验全 PASS，产物在 Publish/，待主控验收/Gavin 端测） |
 
 ### 🔴 在跑 / 待办
 
@@ -33,7 +34,7 @@
 | ⑩ | **`TRAY-ICON-158`** 托盘菜单项加图标（设置=齿轮 / 退出=电源符号，品牌橙 #FF6B35，SSAA 4×4 程序化生成，DPI 自适应）+ macOS 对称实现 | coder-1 | ✅ **已验收通过**（FIX 返工后主控目视放行；BUILD-159 暂缓中）|
 | ⑪b | **`TRAY-ICON-158-FIX`** 齿轮几何返工（齿区下方圆盘被挖空 + 齿为外宽内窄扇形，两处真 bug；电源图标已验收禁改）| coder-1 | ✅ **已验收通过**（实心盘+6 梯形齿，12 张 PNG 重 dump 目视放行）|
 | ⑫ | **`MIC-PULSE-160`** 流式窗麦克风动效（两段同心声波弧渐隐扩散，**周期 1000ms**，不透明度由实时电平驱动；静音 gain=0 逐位回归原貌；三个产出源 D2D+GDI×2 全改；StreamingEditing 不参与）| coder-1 | ✅ 已交付待验收（8 帧预览 PNG 在 collab/outbox/coder-1/mic-frames/ 待主控目视；fmt 0/check 0/111/102 持平/1110P/0F；临时 dump 测试已删；不出包）|
-| ⑪ | **`BUILD-159`** 出包：TRAY-ICON-158 + MIC-PULSE-160 + EDIT-FLICKER-157（🔴 顺带修掉 15:18 未记录构建导致的 Publish/target-release sha 不一致）| tester-1 | 🟢 **Gavin 2026-09-07 解除暂缓：「修改好尽快出包」** ⇒ MIC-PULSE-160 验收通过即 commit 并立即派发，不再请示 |
+| ⑪ | **`BUILD-159`** 出包：TRAY-ICON-158 + MIC-PULSE-160 + EDIT-FLICKER-157（🔴 顺带修掉 15:18 未记录构建导致的 Publish/target-release sha 不一致）| tester-1 | ✅ **已交付**（sha `b3043119…` 异于 `e6f1445e…`，五项核验全 PASS，含第⑤项 Publish==target/release 一致修复，产物在 Publish/，待主控验收/Gavin 端测） |
 
 ### 🔴 Gavin 端测清单（13:07 包）
 
