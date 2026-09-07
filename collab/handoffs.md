@@ -3,6 +3,13 @@
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
 
+## 2026-09-07 — coder-2 — EDIT-FLICKER-157 ✅ 编辑态右侧文字闪烁：EDIT 开双缓冲（待主控验收 → 直出包）
+
+- **机制复核成立**（三条定位逐条核对）→ 修法 = `CreateWindowExW` 扩展样式加 `WS_EX_COMPOSITED`（一行 + import，共 +8/-3 双 hunk :102/:678）。
+- **风险留痕**：`WS_EX_COMPOSITED` 在 SLWA 分层窗子控件上未运行时实测——Gavin 端测若见 EDIT 不显示/异常，回退 = 子类拦 `WM_ERASEBKGND` 自绘背景（父窗同色刷+内存 DC BitBlt）或创建后 `SetWindowLongPtrW`，已注释标注。
+- **验证**：fmt 0 / check --all-targets 0 error / warnings **111/102 持平** / cargo test **1109P/0F**。红线：只动 create_edit_control+import / 未 commit / 零凭证。
+
+
 ## 2026-09-07 — tester-1 — BUILD-156 ✅ 快速出包：OVERLAY-155 圆角三次修法（精简流程，Gavin 在等，待主控验收/端测）
 
 - **基线**：HEAD `aeaebe1` clean。

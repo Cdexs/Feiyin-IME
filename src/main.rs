@@ -102,8 +102,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CYSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
     SW_SHOW, SW_SHOWNA, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP,
     WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_NCCREATE, WM_NCPAINT,
-    WM_PAINT, WM_TIMER, WNDCLASSW, WNDCLASS_STYLES, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
+    WM_PAINT, WM_TIMER, WNDCLASSW, WNDCLASS_STYLES, WS_CHILD, WS_EX_COMPOSITED, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
 };
 #[derive(Debug, Clone)]
 enum PipelineEvent {
@@ -678,7 +678,12 @@ fn create_edit_control(hwnd: HWND, state: &mut OverlayWindowState, rect: &RECT, 
     };
     let edit_hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_NOACTIVATE, // child, keep NOACTIVATE so it doesn't steal from parent
+            // EDIT-FLICKER-157: 双缓冲（WS_EX_COMPOSITED）—— ES_AUTOHSCROLL 光标右移
+            // 触发横向滚动，右侧留待重绘条带，EDIT 擦背景+画字两步直接上屏 ⇒ 右侧
+            // 可见闪烁（左侧不滚不闪）。COMPOSITED 令子控件离屏合成、擦-画不上屏。
+            // 🔴 SLWA 分层窗子控件上的兼容性未实测：若 EDIT 不显示/显示异常，
+            // 回退方案 = 子类拦 WM_ERASEBKGND 自绘背景（父窗同色刷+内存 DC BitBlt）。
+            WS_EX_NOACTIVATE | WS_EX_COMPOSITED, // child, keep NOACTIVATE so it doesn't steal from parent
             PCWSTR(class_name.as_ptr()),
             PCWSTR(title.as_ptr()),
             WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
