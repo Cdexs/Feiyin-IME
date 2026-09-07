@@ -75,7 +75,7 @@ use windows::Win32::System::Registry::{
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, SetActiveWindow, SetFocus, VK_ESCAPE, VK_RETURN,
+    GetAsyncKeyState, GetFocus, SetActiveWindow, SetFocus, VK_ESCAPE, VK_RETURN,
 };
 
 #[cfg(target_os = "windows")]
@@ -91,19 +91,19 @@ const EDIT_OLD_PROC_PROP: [u16; 16] = [
 ];
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GetClientRect, GetForegroundWindow, GetMessageW, GetPropW,
-    GetSystemMetrics, GetWindowLongPtrW, KillTimer, LoadCursorW, MsgWaitForMultipleObjects,
-    PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, RemovePropW, SetForegroundWindow,
-    SetLayeredWindowAttributes, SetPropW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TrackPopupMenu, TranslateMessage, UpdateLayeredWindow, CREATESTRUCTW, CW_USEDEFAULT,
-    GWLP_USERDATA, GWL_EXSTYLE, HMENU, IDC_ARROW, LWA_ALPHA, MF_SEPARATOR, MF_STRING, MSG,
-    PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN, SM_CYSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNA, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONUP, WM_NCCREATE, WM_NCPAINT, WM_PAINT, WM_TIMER, WNDCLASSW, WNDCLASS_STYLES,
-    WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED,
-    WS_POPUP, WS_VISIBLE,
+    AppendMenuW, CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyCaret,
+    DestroyMenu, DestroyWindow, DispatchMessageW, GetClientRect, GetForegroundWindow,
+    GetGUIThreadInfo, GetMessageW, GetPropW, GetSystemMetrics, GetWindowLongPtrW, HideCaret,
+    KillTimer, LoadCursorW, MsgWaitForMultipleObjects, PeekMessageW, PostMessageW, PostQuitMessage,
+    RegisterClassW, RemovePropW, SetForegroundWindow, SetLayeredWindowAttributes, SetPropW,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage,
+    UpdateLayeredWindow, CREATESTRUCTW, CW_USEDEFAULT, GUITHREADINFO, GWLP_USERDATA, GWL_EXSTYLE,
+    HMENU, IDC_ARROW, LWA_ALPHA, MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN,
+    SM_CYSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
+    SW_SHOW, SW_SHOWNA, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP,
+    WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_NCCREATE, WM_NCPAINT,
+    WM_PAINT, WM_TIMER, WNDCLASSW, WNDCLASS_STYLES, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
 };
 #[derive(Debug, Clone)]
 enum PipelineEvent {
@@ -813,6 +813,50 @@ unsafe extern "system" fn edit_subclass_wnd_proc(
 #[cfg(target_os = "windows")]
 fn destroy_edit_control(state: &mut OverlayWindowState) {
     if let Some(edit_hwnd) = state.edit_hwnd.take() {
+        // OVERLAY-149 (F1): caret 泄漏修复（Gavin 端测第 2 项：录音窗显示文字光标）。
+        // EDIT 带焦销毁收到的是 WM_DESTROY 而非 WM_KILLFOCUS，EDIT 内部不会销毁
+        // caret；caret 生命周期绑线程输入队列而非窗口 ⇒ DestroyWindow 后 caret
+        // 对象跨态存活，而系统 caret 是屏幕级绘制（不走 ULW 合成）⇒ 录音帧
+        // （本无子控件）上可见为「文字光标」。
+        // 修法（DIAG §B2/B3-1，DestroyWindow 之前）：移焦点 → HideCaret → DestroyCaret；
+        // 原有 DestroyWindow 及后续清理不动。
+        // DestroyCaret 只销毁本线程拥有的 caret，无跨进程副作用；调用时本线程无
+        // caret 则返回 FALSE，属正常，不当错误处理。
+        unsafe {
+            let focus = GetFocus();
+            if focus == edit_hwnd {
+                // create_edit_control 把父 overlay HWND 存在 EDIT 的 GWLP_USERDATA，
+                // 焦点移回父窗（比 SetFocus(None) 保留 IME 上下文）；无父时退化为
+                // SetFocus(None)（释放焦点），同样达成「焦点离开 EDIT」。
+                let parent = GetWindowLongPtrW(edit_hwnd, GWLP_USERDATA);
+                let _ = SetFocus(if parent != 0 {
+                    HWND(parent as _)
+                } else {
+                    HWND::default()
+                });
+            }
+            let _ = HideCaret(edit_hwnd);
+            let _ = DestroyCaret();
+        }
+        // 🔴 OVERLAY-149-PROBE（F1 决定性实验的运行时证据，判读完删除；将来删除时
+        // 需删本 if 块整段）：销毁 + 显式清 caret 后查询本线程 caret 残留 ——
+        // hCaret=0 ⇒ 清理生效；≠0 ⇒ caret 被重建/他处持有，需回报主控。
+        unsafe {
+            let mut gti = GUITHREADINFO::default();
+            gti.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+            if GetGUIThreadInfo(
+                windows::Win32::System::Threading::GetCurrentThreadId(),
+                &mut gti,
+            )
+            .is_ok()
+            {
+                log::debug!(
+                    "OVERLAY-149-PROBE F1: post-destroy caret hwndCaret={:?} flags={:#x}",
+                    gti.hwndCaret,
+                    gti.flags.0
+                );
+            }
+        }
         // Restore original window procedure if we have it
         if let Some(old_proc) = state.edit_old_wndproc.take() {
             unsafe {
@@ -2150,7 +2194,31 @@ unsafe extern "system" fn overlay_wnd_proc(
                 if use_ulw {
                     // OVERLAY-121 (P1): 单点提交。先做帧末 alpha 处理（D2D 预乘像素乘
                     // 请求不透明度；GDI 像素提为不透明再预乘），再整窗交给合成器。
+                    // 🔴 OVERLAY-149-PROBE（E3/E4，临时探针）：fixup 前/后各采样一次，
+                    // 判读完删除（删除清单见 probe fn 头注释 + result.md）。
+                    overlay149_probe_dump(
+                        hwnd,
+                        hdc,
+                        "pre-fixup",
+                        ppv_bits as *mut u8,
+                        width,
+                        height,
+                        opacity,
+                        frame_radius,
+                        &data.state,
+                    );
                     apply_alpha_fixup(ppv_bits as *mut u8, width, height, opacity, frame_radius);
+                    overlay149_probe_dump(
+                        hwnd,
+                        hdc,
+                        "post-fixup",
+                        ppv_bits as *mut u8,
+                        width,
+                        height,
+                        opacity,
+                        frame_radius,
+                        &data.state,
+                    );
                     let blend = BLENDFUNCTION {
                         BlendOp: AC_SRC_OVER as u8,
                         BlendFlags: 0,
@@ -2286,6 +2354,130 @@ fn apply_alpha_fixup(bits: *mut u8, width: i32, height: i32, opacity: f32, radiu
             }
         }
     }
+}
+
+// 🔴 OVERLAY-149-PROBE（E3/E4 临时探针，OVERLAY-147-DIAG §A5；判读完整段删除）。
+// 将来删除清单（四处，缺一漏证据）：
+//   ① 本文件两处 probe fn（overlay149_probe_dump / overlay149_probe_region_hex）整段
+//   ② WM_PAINT ULW 分支内两处调用（"pre-fixup" / "post-fixup"）
+//   ③ d2d::with_d2d 内 E4 RT GetDpi once 块
+//   ④ destroy_edit_control 内 F1 的 GetGUIThreadInfo 证据块
+// E4 口径说明：任务书原文 GetDpiForWindow 需要 Cargo.toml 加 Win32_UI_HiDpi feature
+// （红线只许改 src/main.rs，未加）；改用 GetDeviceCaps(LOGPIXELSX/SY) 对**同一 hdc**
+// （即 DIB CreateCompatibleDC 的源 DC，正是 BindDC/合成坐标系的 GDI 侧）取 DPI，
+// 与 D2D RT GetDpi 对照，排除目的相同（DIAG §A5-E4：不一致会两组同坏，非分界解释）。
+#[cfg(target_os = "windows")]
+fn overlay149_probe_dump(
+    hwnd: HWND,
+    hdc: HDC,
+    phase: &str,
+    bits: *mut u8,
+    width: i32,
+    height: i32,
+    opacity: f32,
+    radius: f32,
+    state: &Mutex<OverlayWindowState>,
+) {
+    use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+    static LAST_STATUS: AtomicU8 = AtomicU8::new(255);
+    static FRAMES: AtomicU32 = AtomicU32::new(0);
+
+    let Ok(state_guard) = state.lock() else {
+        return;
+    };
+    let Some(req) = state_guard.request.as_ref() else {
+        return;
+    };
+    let (status_id, status_name): (u8, &str) = match &req.status {
+        OverlayStatus::Recording => (1, "Recording"),
+        OverlayStatus::RecordingStreamingIdle => (2, "RecordingStreamingIdle"),
+        OverlayStatus::RecordingWithText { .. } => (3, "RecordingWithText"),
+        OverlayStatus::StreamingEditing { .. } => (4, "StreamingEditing"),
+        OverlayStatus::FallingToProcessing { .. } => (5, "FallingToProcessing"),
+        OverlayStatus::Processing(_) => (6, "Processing"),
+        OverlayStatus::FocusLost { .. } => (7, "FocusLost"),
+        OverlayStatus::Error(_) => (8, "Error"),
+        OverlayStatus::Info(_) => (9, "Info"),
+    };
+    drop(state_guard);
+
+    // 节流：状态切换后仅前 N=3 帧采样（Recording 每帧重绘，防 debug.log 撑爆，
+    // [EVIDENCE-LOG-VOLATILE-001]）。对照态 RecordingStreamingIdle(r=16 坏) / Info(r=10 好)。
+    if LAST_STATUS.load(Ordering::Relaxed) != status_id {
+        LAST_STATUS.store(status_id, Ordering::Relaxed);
+        FRAMES.store(0, Ordering::Relaxed);
+    }
+    let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    if !matches!(status_id, 2 | 9) || frame > 3 {
+        return;
+    }
+    // E4：窗口/DC 侧 DPI（GetDeviceCaps LOGPIXELSX；RT 侧见 with_d2d once 块）
+    unsafe {
+        let dpi_x = windows::Win32::Graphics::Gdi::GetDeviceCaps(
+            hdc,
+            windows::Win32::Graphics::Gdi::LOGPIXELSX,
+        );
+        let dpi_y = windows::Win32::Graphics::Gdi::GetDeviceCaps(
+            hdc,
+            windows::Win32::Graphics::Gdi::LOGPIXELSY,
+        );
+        log::debug!(
+            "OVERLAY-149-PROBE E4 [{}] frame#{} status={} hwnd-hdc-dpi=({},{}) w={} h={} radius={} opacity={:.2}",
+            phase,
+            frame,
+            status_name,
+            dpi_x,
+            dpi_y,
+            width,
+            height,
+            radius,
+            opacity
+        );
+    }
+    // E3：四角 8×8 块 + 左缘一整列，BGRA 内存序原值（B,G,R,A）
+    for (tag, x0, y0, w, h) in [
+        ("TL", 0, 0, 8, 8),
+        ("TR", width - 8, 0, 8, 8),
+        ("BL", 0, height - 8, 8, 8),
+        ("BR", width - 8, height - 8, 8, 8),
+    ] {
+        log::debug!("OVERLAY-149-PROBE E3 [{}] {} {}", phase, tag, unsafe {
+            overlay149_probe_region_hex(bits, width, height, x0, y0, w, h)
+        });
+    }
+    log::debug!("OVERLAY-149-PROBE E3 [{}] LEFT-COL {}", phase, unsafe {
+        overlay149_probe_region_hex(bits, width, height, 0, 0, 1, height)
+    });
+    let _ = hwnd;
+}
+
+// 🔴 OVERLAY-149-PROBE：BGRA 区域 hex dump（内存序 B,G,R,A；删除见 probe fn 头清单①）
+#[cfg(target_os = "windows")]
+unsafe fn overlay149_probe_region_hex(
+    bits: *mut u8,
+    width: i32,
+    height: i32,
+    x0: i32,
+    y0: i32,
+    w: i32,
+    h: i32,
+) -> String {
+    let mut s = String::new();
+    let x_end = (x0 + w).min(width);
+    let y_end = (y0 + h).min(height);
+    for y in y0.max(0)..y_end {
+        for x in x0.max(0)..x_end {
+            let p = bits.add(((y as usize) * (width as usize) + x as usize) * 4);
+            s.push_str(&format!(
+                "{:02X}{:02X}{:02X}{:02X}",
+                *p,
+                *p.add(1),
+                *p.add(2),
+                *p.add(3)
+            ));
+        }
+    }
+    s
 }
 
 #[cfg(target_os = "windows")]
@@ -3491,6 +3683,24 @@ mod d2d {
                 // pixel coordinates map 1:1 onto the GDI surface.
                 if res.rt.BindDC(hdc, rect).is_err() {
                     return false;
+                }
+                // 🔴 OVERLAY-149-PROBE（E4，临时探针，判读完删除——见
+                // overlay149_probe_dump 头注释删除清单③）：D2D RT GetDpi 全程只打
+                // 一次（进程级 once），与 E3/E4 行的 hwnd-hdc-dpi 比对，排除
+                // 「RT 坐标系 DPI ≠ 窗口 DC DPI ⇒ D2D 坐标与位图像素错位」。
+                {
+                    static E4_RT_DPI_LOGGED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !E4_RT_DPI_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        let mut rt_dpi_x = 0.0_f32;
+                        let mut rt_dpi_y = 0.0_f32;
+                        res.rt.GetDpi(&mut rt_dpi_x, &mut rt_dpi_y);
+                        log::debug!(
+                            "OVERLAY-149-PROBE E4: D2D RT GetDpi = ({},{})",
+                            rt_dpi_x,
+                            rt_dpi_y
+                        );
+                    }
                 }
                 let w = (rect.right - rect.left).max(1) as f32;
                 let h = (rect.bottom - rect.top).max(1) as f32;
@@ -5598,6 +5808,12 @@ fn process_controller_events(
                 log::info!("Controller received hotkey stop");
                 stop_recording_signal.store(true, Ordering::Release);
                 STREAMING_STOPPED.store(true, Ordering::Release);
+                // OVERLAY-149 (F2): 编辑态按停止热键缺守卫 —— OVERLAY_EDITING 不清则
+                // 后续 Done/Cancelled 被压制臂（`if OVERLAY_EDITING.load(...)`）拦下，
+                // 既不回 Idle 也不 Hide，Processing 浮层永久卡屏直到下次录音。
+                // 修法按「退出编辑态」语义清 flag；非编辑态时该值本就 false，逐位不变
+                // （单写者 = controller 线程，无竞态；完整事件序列推演见 result.md）。
+                OVERLAY_EDITING.store(false, Ordering::Release);
                 if is_recording.load(Ordering::Acquire) {
                     let config = clone_runtime_config(runtime_config);
                     show_overlay(

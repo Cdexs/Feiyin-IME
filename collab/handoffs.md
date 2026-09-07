@@ -46,3 +46,15 @@
 - **验证**：cargo fmt 0（幂等）/ check --all-targets 0 error / warnings **111/102 基线逐位持平**；沙箱预演（独立 rustc harness 于 tmp/opencode/ts143，未触仓库 cargo test）对 fmt 后真实文件 **3 PASS**；消融 10 变异全验红（G6×5 含🔴塞回旧规则⇒红 / G8×3 / G9×2）+ 豁免假红核对 1 条 PASS（result.md 附录 A）——消融在临时副本执行，`git diff src/` 始终为空（规避 TEST-EXEC 还原误伤教训）。
 - **macOS**：模块 cfg(all(test, windows)) 整体不编译，不适用。
 - **红线**：未 commit / v0.9.0 未动 / 未出包 / 未跑 cargo test / 零凭证；临时目录已整删（check.rs/exe/mutant.rs/ablate*.py/out，result.md 附录 B）。
+
+## 2026-09-07 — coder-1 — OVERLAY-149 ✅ F1 caret 泄漏修复 + F2 热键停止臂守卫 + E3/E4 判别探针（cargo test 1107P/0F 零预期红，待主控验收 + tester-1 阶段四 + Gavin 端测）
+
+- **F1（🔴 待端测判定，未预先宣布已修）**：destroy_edit_control 在 DestroyWindow 前新增三步——GetFocus==edit ⇒ SetFocus(父窗) / HideCaret / DestroyCaret。语义依据 DIAG §B1/B2（带焦销毁收 WM_DESTROY 而非 WM_KILLFOCUS、caret 绑线程输入队列、系统 caret 屏幕级绘制不走 ULW 合成）。端测判定：光标消失=假设坐实；仍在=假设推翻须回报重开调查。运行时证据探针（OVERLAY-149-PROBE F1）destroy 后查 GetGUIThreadInfo.hwndCaret。
+- **F2**：HotkeyEvent::Stop 臂补 OVERLAY_EDITING.store(false)（无条件 store；非编辑态逐位不变，controller 线程单写者）。修复卡屏可达序列：编辑态（worker 未 finalize）按停止热键 → FallingToProcessing → Cancelled 被 :5720 压制 → 永久卡屏；修复后 Done/Cancelled 不再被压制 → Idle+Hide 收口。**方案选择**：无条件 store(false) 而非改发 RestoreAndHide——Case-B（worker 已 finalize，is_recording=false）Stop 臂 is_recording 门关着本就不 Show，此时 RestoreAndHide 反而会多余销毁 EDIT 藏窗；完整 Step1-4+Case-A/B/C 序列在 result.md §二。
+- **E3**：ULW 分支 apply_alpha_fixup 前/后采样四角 8×8+左缘整列 BGRA hex（首测 OVERLAY-141 立论前提「BindDC 后 alpha 未存活」）+元数据（w/h/radius/opacity/状态名）；节流=状态切换后仅前 3 帧、仅 RecordingStreamingIdle(r16 坏)/Info(r10 好) 对照态；判读期待预声明（pre-fixup 左缘列 alpha 存活 ⇒ 前提被推翻）。
+- **E4（口径替代已报备）**：GetDpiForWindow 需 Cargo.toml Win32_UI_HiDpi feature（红线只许改 src/main.rs）→ GetDeviceCaps(LOGPIXELSX/SY) 对同一 hdc（DIB 源 DC）+ d2d::with_d2d 内 RT GetDpi once；如主控裁定要原文 API 需加 feature（一行，主控/后续批次）。
+- **探针删除清单**（result.md §六 四处）：①两 helper fn ②WM_PAINT 两调用 ③with_d2d once 块 ④F1 证据块；caret 清理本体=F1 实修复永久保留。
+- **验证**：fmt 0（幂等）/check --all-targets 0 error/warnings 111/102 基线持平/cargo test（本单允许）1107P/0F+51P/0F——**零预期红**，G1-G9 全绿（F2 Stop 臂系独立 match 臂，F3 锚 EditRequested 臂不受影响）。
+- **明确不做**（主控裁定）：stroke 同心化/Hide 双压制/编辑态 ESC/E1·E2/ui/**。
+- **macOS**：四件事全 Windows 专属，MACOS-HANDOFF.md 已同步三段。
+- **红线**：只改 src/main.rs（+230/-14）；未 commit/版本未动/未出包/零凭证/无临时文件。
