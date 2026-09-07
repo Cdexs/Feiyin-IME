@@ -26,6 +26,8 @@
 | ④ | `TEST-EXEC-144` 阶段四：全量回归 + 新护栏消融 | tester-1 | 无（只跑） | ③ 完成 | ⏳ |
 | ⑤ | `BUILD-145` 阶段五：出包 → Gavin 端测 | tester-1 | — | ④ 通过 | ✅ 已交付（七项核验全 PASS，产物在 Publish/，待主控验收/Gavin 端测） |
 | ⑥ | **`OVERLAY-147-DIAG`** BUILD-145 端测两问：r=16 三态圆角仍坏 + 录音窗光标（🔴 只查不修） | coder-2 | `docs/OVERLAY-147-DIAG.md` | ⑤ Gavin 端测反馈 | 🟡 已交付待验收（SDF 实证正确/H1a 推翻/H2 静态推翻，机制未定需 E1-E3；光标=caret 泄漏主假设+Stop 臂缺守卫新缺陷） |
+| ⑦ | **`OVERLAY-149`** caret 泄漏修复 + 热键停止卡屏修复 + 圆角判别探针 E3/E4 | coder-1 | `src/main.rs` 生产区 | ⑥ 验收 | ✅ 已交付验收（`115eb5b`，1107P/0F 零预期红，macOS 复核同步 `69aded0`） |
+| ⑧ | **`BUILD-151`** 阶段五：OVERLAY-149 出包 → Gavin 端测 | tester-1 | — | ⑦ 验收 | ✅ 已交付（七项核验全 PASS + 硬判别探针正反双向 6/6，产物在 Publish/，待主控验收/Gavin 端测） |
 
 ### 🔴 本轮 Worker 占用（文件级零重叠，已核）
 

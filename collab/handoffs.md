@@ -3,6 +3,16 @@
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
 
+## 2026-09-07 — tester-1 — BUILD-151 ✅ 阶段五出包：首个含 OVERLAY-149 caret 修复 + 热键停止卡屏修复 + 圆角判别探针 E3/E4 的包（待主控验收/Gavin 端测）
+
+- **基线**：开工 HEAD `115eb5b` + 工作区仅 `docs/MACOS-HANDOFF.md`（coder-2 macOS 复核同步，主控确认漏 add）；构建期主控补提交 `69aded0`，`git diff 115eb5b 69aded0` 仅该文档 +6 行零代码差异 ⇒ **报告基线 69aded0，二进制零影响**。
+- **Step 2 跳过（判据升级）**：git-log 法 `git log -1 --format='%h %ad' -- ui/ src-tauri/` ⇒ `f85c550 @09-06 18:47` 早于 UI exe 01:15 ⇒ 已含全部 ui 改动（不依赖 diff 区间起点）；补充 `git diff bd5a160..HEAD -- ui/ src-tauri/` 为空。
+- **构建**：Step1 清进程 → Step3 主程序（1m58s，111 warnings 持平）→ Step4 **cp -p** 同步 Publish/（BUILD-145 订正项，UI mtime 保留 01:15）+ toml 三副本。
+- **七项核验全 PASS**：① 主程序 13:07:47 本次构建；② sha 两副本三对相等，主 `b20fbe14…` 异于 PRE149 `59d64c4d…`；③ toml 三副本一致；④ ProductVersion 0.9.0.0 未动；⑤ 🔴 **硬判别探针正反双向**（OVERLAY-149-PROBE E3×2/E4×2/F1×1/pre-fixup×1/post-fixup×1 新包全命中，PRE149 6 串全 0）；⑥ 大小 12,277,248 B（+9,216 B 含探针代码合理）；⑦ 冒烟 Responding=True 无 panic 已清理；⑧ config.toml sha 前后不变。
+- **红线**：未 commit / v0.9.0 未动 / 未用 cargo tauri build / 未 cargo clean / 零凭证 / 无临时文件。
+- **Gavin 端测清单 5 项**见 `outbox/tester-1/result.md`（caret 是否消失 / 编辑态停止热键收口 / 圆角三态预期无变化 / 🔴 保留 debug.log 给 E3/E4 / 编辑态闪烁仍在）。
+
+
 ## 2026-09-07 — coder-2 — OVERLAY-147-DIAG ✅ BUILD-145 端测两问诊断（🔴 只查不修，src 零改动，待主控验收）
 
 - **Part A**：SDF 数学实证正确（探针 vs 精确面积覆盖 mean|Δ|=0.0002/0.0001）⇒ 掩码候选整片砍掉；**H1a 如实推翻**（描边深度偏差 r 无关 ~0.2px，r16 [-0.008,+1.207] vs r10 [-0.012,+1.207]，描边从不探出轮廓；主控 r-0.5 同心化修法方向正确列 F2 顺手项）；**H2 被静态推翻**（RecordingStreamingIdle = r16+静态+坏，`:1678-1686`；待 Gavin 确认看的是占位变体）；窗口高度/内容同构混淆全部排除 ⇒ 剩余候选 {半径值未测路径, 底色}，**机制未定**，判别实验 E1/E2（半径翻转）+ E3（角区像素 dump，顺带验证「BindDC alpha 未存活」从未直接测过的立论前提）已写进 `docs/OVERLAY-147-DIAG.md §A5`。
