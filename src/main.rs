@@ -2335,22 +2335,29 @@ fn apply_alpha_fixup(bits: *mut u8, width: i32, height: i32, opacity: f32, radiu
                     continue;
                 }
                 let k = cov * op;
-                let b = *p;
-                let g = *p.add(1);
-                let r = *p.add(2);
                 let a = *p.add(3);
-                // 反预乘还原原色：a>0 的 D2D 像素 rgb·255/a；GDI 像素（a==0）本就是直通色。
-                let unpremult = |c: u8| {
-                    if a > 0 {
-                        (((c as u32) * 255) / (a as u32)).min(255) as u8
-                    } else {
-                        c
-                    }
-                };
-                *p = premul(unpremult(b), k);
-                *p.add(1) = premul(unpremult(g), k);
-                *p.add(2) = premul(unpremult(r), k);
-                *p.add(3) = premul(255, k);
+                // OVERLAY-153: 几何覆盖率当**乘数**、不当 alpha 的**替代品**。
+                // - a>0（D2D 预乘像素）：四通道等比缩放 ×(cov·op) —— 恢复 OVERLAY-121
+                //   语义，保留原 alpha（描边 AA 的半透明信息不被强制拉满；预乘不变式
+                //   rgb≤a 随等比缩放天然成立，反预乘一步整个去掉，无精度损失）。
+                //   141 的强制不透明把内部区（cov=1）描边 AA 压成 2-3px 实心灰带，
+                //   即 Gavin 端测「圆角包边灰线粗乱」的内部区伪影本体。
+                // - a==0（GDI 像素，GDI 不写 alpha）：语义「本应不透明」，维持提亮——
+                //   rgb×=k 落预乘域，a=255·k。alpha 未存活的世界里与 141 逐位相同。
+                if a > 0 {
+                    *p = premul(*p, k);
+                    *p.add(1) = premul(*p.add(1), k);
+                    *p.add(2) = premul(*p.add(2), k);
+                    *p.add(3) = premul(a, k);
+                } else {
+                    let b = *p;
+                    let g = *p.add(1);
+                    let r = *p.add(2);
+                    *p = premul(b, k);
+                    *p.add(1) = premul(g, k);
+                    *p.add(2) = premul(r, k);
+                    *p.add(3) = premul(255, k);
+                }
             }
         }
     }
@@ -11939,12 +11946,13 @@ mod overlay_121_guard_tests {
         );
     }
 
-    /// G6: apply_alpha_fixup SDF alpha 不变量（OVERLAY-141 换血 —— 旧「三分支完整」
-    /// 命题随按色三分支整体退役而失效，改守新实现的真实不变量，四条）：
+    /// G6: apply_alpha_fixup SDF alpha 不变量（OVERLAY-141 换血、OVERLAY-153 再演进
+    /// —— 旧「三分支完整」命题随按色三分支整体退役而失效，改守真实不变量，四条）：
     ///   ① alpha 由几何决定：函数体内含 SDF 覆盖率计算
     ///      `let cov = (0.5 - d).clamp(0.0, 1.0);`
     ///   ② 轮廓外真透明：`if cov <= 0.0 {` 块内四通道全零
-    ///   ③ 反预乘还原：`if a > 0 {`（D2D 预乘像素还原原色，不被二次预乘压暗）
+    ///   ③ D2D 像素分支存在：`if a > 0 {`（OVERLAY-153 起为**四通道等比缩放**，
+    ///      保留原 alpha 不强制不透明；141 时代语义是反预乘+强制 255·k，已退役）
     ///   ④ 🔴 反向断言：函数体内不得再出现旧「提亮」规则
     ///      `if a == 0 && (r | g | b) != 0` —— 它把 AA 半透明边缘像素压成全不透明，
     ///      正是 OVERLAY-141「圆角灰边」事故的元凶，机器钉死防复活。
@@ -11980,7 +11988,7 @@ mod overlay_121_guard_tests {
         }
         assert!(
             block_contains(&lines, anchor, concat!("if a > 0", " {")),
-            "G6③: apply_alpha_fixup 必须含反预乘分支 if a > 0（防二次预乘压暗）"
+            "G6③: apply_alpha_fixup 必须含 D2D 像素分支 if a > 0（153 起等比缩放保留原 alpha，防强制不透明复活）"
         );
         assert!(
             !block_contains_raw(&lines, anchor, concat!("a == 0 && (r | g | b)", "")),

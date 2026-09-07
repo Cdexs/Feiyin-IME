@@ -1626,3 +1626,10 @@ alpha（不再依赖 D2D 经 BindDC 保真 alpha——实测不保真，AA 边�
 - F1 caret 泄漏修复（Win32 EDIT 带焦销毁 → 线程级 caret 对象跨态存活）：**macOS 不适用** —— macOS 无 Win32 caret 等价物，NSText 插入点归焦点系统（first responder）管理，焦点释放即消失，不存在「DestroyWindow 后 caret 存留于线程输入队列」的泄漏形态。
 - F2 热键停止臂编辑守卫（OVERLAY_EDITING 清理）：macOS 侧无 OVERLAY_EDITING/EnterEditMode 对应物（编辑态为 Windows 专属 ASR-038-C 功能），不适用。
 - E3/E4 探针（SDF 前提测量 + DPI 一致性）：全部绑 Windows ULW/D2D 管线，macOS NSWindow 无 D2D→DIB 合成层，不适用。
+
+### OVERLAY-153 · apply_alpha_fixup 覆盖率乘数化（2026-09-07，coder-2）
+
+Windows 侧唯一改动：`apply_alpha_fixup` 的 a>0 分支从「反预乘+强制 255·cov·op」改为
+「四通道等比 ×(cov·op)」（保留 D2D 原 alpha，描边 AA 不再被强制拉满）。全部位于
+`#[cfg(target_os = "windows")]`，macOS 编译零影响，不适用（macOS 无 ULW/BindDC 通路，
+NSWindow 层 AA 由系统合成器天然保真，无等价缺陷形态）。

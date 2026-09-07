@@ -26,6 +26,7 @@
 | ③ | E3/E4 探针数据判读 → 定圆角机制 | 主控 | ⏳ 等 ② 的 `debug.log` |
 | ④ | 圆角修复（机制定了才动手） | 待定 | ⏳ 阻塞于 ③ |
 | ⑤ | 探针删除（`OVERLAY-149-PROBE` 标注 10 处，清单见 coder-1 result.md §六） | 待定 | ⏳ 判读后 |
+| ⑥ | **`OVERLAY-153`** 圆角二次修法：覆盖率当乘数（免阶段三/四直出包，Gavin 指示） | coder-2 | `src/main.rs` apply_alpha_fixup | 无（推论验证成立，两世界安全） | 🟡 已交付待验收（cargo test 三跑 1109P/0F，等主控验收 → tester-1 直出包） |
 
 ### 🔴 Gavin 端测清单（13:07 包）
 
