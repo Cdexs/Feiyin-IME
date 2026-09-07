@@ -1666,3 +1666,11 @@ Windows 侧为流式窗（RecordingWithText/RecordingStreamingIdle）的麦克�
 🔴 **待办（macOS 侧将来实现流式窗时）**：麦克风图标复刻 Windows 几何（pill 体中心为弧心，
 内弧 R=5.5/外弧 R=8.0，左右各 ±40°，线宽 1.2，1000ms 周期 tri 波，电平 gain 阈值 0.35），
 动效逻辑可参照 `src/main.rs` 的 `mic_pulse_tri`/`mic_pulse_alphas` 纯函数直接移植（平台无关）。
+
+## FIX-164（2026-09-07，coder-1）—— macOS 侧影响逐条结论
+
+| 项 | macOS 结论 |
+| --- | --- |
+| Part A D1 预热 / D2 有界等待 | ✅ **两端同效**：`spawn_worker_thread` 已平台中立（MACOS-P4-NEUTRAL-002 去 cfg），重载判定/spawn/结果应用收口函数均在平台中立层；macOS 控制器（run_controller_macos → logic 线程发 WorkerCommand::Start）走同一 worker loop，预热 tick 与 D2 等待自动生效。行为与 Windows 一致：切模型 ≤500ms 后台预热、Start 前最多等 1500ms、失败签名防风暴 |
+| Part B 声波弧（阈值/地板） | ⛔ **不涉及**：`mic_pulse_*` 全族 `#[cfg(target_os = "windows")]`；macOS overlay 绘制走 `src/platform/macos/overlay.rs`，本就没有声波弧。若未来 macOS 要对齐动效，参数常量在本文件同名位置可复用 |
+| Part C 菜单图标日志 | ⛔ **不涉及**：`attach_menu_icons`/`create_menu_item_bitmap` 均 `cfg(windows)`；macOS 菜单图标走 `NSMenuItem::setImage`（TRAY-ICON-158 已对称实现），该路径零改动、无需加日志 |

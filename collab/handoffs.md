@@ -4,6 +4,17 @@
 
 
 
+## 2026-09-07 — tester-1 — BUILD-165 ✅ 出包：FIX-162 + FIX-164（精简流程，Gavin 端测打回四条的修复包，待主控验收）
+
+- **基线**：HEAD `e012108` + 未 commit 的 FIX-162（WS_EX_COMPOSITED 回退）+ FIX-164（Part A 预热+1500ms 有界等待 / Part B 声波弧阈值 0.10+地板 0.35 / Part C GetLastError 日志），主控已验收。
+- **精简流程**：Step1 清进程（PID 23692）→ Step2 git-log 法 UI 免重建（f85c550@09-06 18:47 早于 UI exe 01:15）→ Step3 主程序（2m00s，feiyin-ime 111 / crash-reporter 5 warnings）→ Step4 cp -p 同步 Publish/。
+- **六项核验全 PASS**：① 主程序 19:40 本次构建；② 两副本 sha `85c1cf26…` 一致异于 `b3043119…`；③ ProductVersion 0.9.0.0 未动；④ 冒烟 PID 29352 Responding=True 无 panic 已清理；⑤ config.toml sha `3186ec8c` 不变；⑥ warnings 111/102。
+- **回归（并行）**：cargo test 全量 **1110P/0F/9I** + hotkey 51P + ui_guard 2P + 其余 0F；Vitest/E2E Skip。🔴 crash_reporter config 批量 FAIL **未复现**（归档偶发）。
+- **出包语义**：修 Gavin 端测第 4/3/2 条；🔴 第 1 条（托盘图标）未修，仅加 GetLastError 日志待 debug.log 定位。不出端测清单给 Gavin，主控先自测目视。
+- **红线**：未 commit / v0.9.0 未动 / 未 cargo clean / 未 cargo tauri build / 零凭证 / 无临时文件。
+
+
+
 ## 2026-09-07 — tester-1 — BUILD-159 ✅ 出包：TRAY-ICON-158(+FIX) + MIC-PULSE-160 + EDIT-FLICKER-157（精简流程，Gavin 在等，待主控验收/端测）
 
 - **基线**：HEAD `85388ac` clean。
@@ -167,3 +178,28 @@
 - **预览**：8 帧 PNG（gain=1.0, ×8）在 collab/outbox/coder-1/mic-frames/，自查节奏=内弧先亮→外弧跟进→渐隐；临时 dump 测试已删（保持 1110P）。
 - **macOS**：overlay.rs 无流式窗麦克风元素 → 不适用，MACOS-HANDOFF 记待办。
 - **验证**：fmt 0／check 0 error／warnings 111/102 持平／test 1110P/0F；TRAY-ICON-158 零触碰；Cargo.toml 零字节；未 commit/版本未动/未出包/零凭证。
+
+## 2026-09-07 — coder-2 — FIX-162 ✅ P0 止血：WS_EX_COMPOSITED 已回退（EDIT 大黑屏/文字全丢，待主控验收 → 直出包）
+
+- **改动**：`src/main.rs` 两 hunk = 62800bc 的逆操作：import 行删 `WS_EX_COMPOSITED`、`create_edit_control` ex-style 回退 `WS_EX_NOACTIVATE`；注释改为回退留痕，备选方案（WM_ERASEBKGND 子类自绘 / SetWindowLongPtrW）原样保留供后续参考。
+- **验证**：grep=0／fmt 幂等／check --all-targets 0 error／warnings 111/102 持平／cargo test 1110P/0F + 其余二进制全绿。首轮 crash_reporter 24F 为并行环境偶发（crash-reporter 不含 main.rs），复跑两轮全绿。
+- **状态**：编辑态右侧文字闪烁回到「未修」状态（已知问题回到原点）；未 commit/版本未动/未出包/零凭证。可立即出包给 Gavin。
+
+## 2026-09-07 — coder-1 — DIAG-163 ✅ BUILD-159 端测三问诊断（🔴 只查不修，src/ 零改动，待主控验收 + runtime 复核清单）
+
+- **Q3 切模型出错窗（机制已定，非回归）**：DEC-025 异步热重载缺口——切模型后**首次录音必用旧 transcriber**（worker 判据 config 且实例双条件，ASR-038-B `4f3b41b` 引入；重载机制 `81304f7` v0.6.1；无条件 `RecordingStarted` 初始提交即有，三者均先于 aeaebe1/62800bc/85388ac，三提交 hunk 范围取证未触碰状态选择）。窗口期 worker 走本地管线 → RecordingStarted 覆盖控制器按 config 先画的流式占位窗 → 频谱窗。**只错外观不错输出，第二次按热键自愈**。若二次仍坏则本机制证伪（debug.log 找 `hot-reload failed` 循环）。定案签名：日志时序 Triggering hot-reload → worker received Start → ensure_stream（非 record_streaming）→ hot-reload completed 在 Start 之后。
+- **Q1 托盘菜单图标（机制未定，头号怀疑证伪）**：`show_tray_popup_menu` 自建 CreatePopupMenu，attach/TrackPopup/Destroy 全程同一 HMENU；tray-icon 0.19 无 with_menu，crate 菜单不存在。wID=1001/1002、MIIM_BITMAP 单掩码合法（MSDN + SO 78577359 同型确认）、biHeight 负 top-down、预乘 BGRA、DeleteObject 在 DestroyMenu 后——**静态全链路零缺陷**。根因只能在静默降级黑箱（SetMenuItemInfoW / CreateDIBSection 运行时成败无日志）。建议：一次性插桩诊断包（log size/DIB 成败/SetMenuItemInfoW 返回/attached 数），右键一次定案——**未实施，等主控批**。
+- **Q2 声波弧（链路查通 + 核心矛盾）**：流式路径电平**有喂**（record_streaming 传同一 audio_buf Arc；audio/mod.rs:359/:923 逐 chunk 写；重绘门 `needs_repaint||mic_has_audio` 已开 ~25fps；三 D2D 变体 + 两 GDI 分支全含弧代码）。🔴 截图橙色麦克风 ⇔ 同帧 has_audio=true ⇔ gain>0 ⇔ 弧已画——「代码没执行」不成立。唯一静态自洽假设=**非对称阈值冻结帧**（色阈值 0.01 vs 弧满亮 0.35 差 35 倍；静默间隙末帧=橙麦+gain 3~11% 不可见弧，随后重绘停止画面冻结）。**证伪条件**：说话中仍无弧 → 需弧级插桩（E5 探针）。
+- **产出**：主文档 `docs/DIAG-163-BUILD159-ENDTEST.md`（含三问结论/证据链/修法建议 A/C/插桩方案，均标注不实施）；result.md 含收尾自证表。
+- **红线**：`git diff --numstat -- src/` 唯一条目 7+/8- src/main.rs 为 coder-2 FIX-162 并行改动（hunk 仅 import + create_edit_control）；只读 git；cargo 未跑（纯静态+git 取证，无符号确认需求）；未出包；零凭证；临时文件已清理（/tmp/main_155.rs）。
+- **交主控三个决策点**：① Q3 修法 A（Start 同步等重建）/C（文档声明现状）二选一，或先拿 debug.log 实锤；② Q1 是否批插桩诊断包；③ Q2 先用「说话中观察 3 秒」零成本复核，不行再插桩。
+
+## 2026-09-07 — coder-1 — FIX-164 ✅ 端测三条一次修完（阶段一：src/main.rs 独占，1110P/0F + warnings 111/102 持平，待主控验收 → coder-2 TEST-SYNC → tester-1 回归出包）
+
+- **Part A Q3（主修，方案 D 两段）**：D1 预热——worker 空闲 tick 轮询廉价层判定（模型身份+在线配置，不读词库，主控拍板），配置变更 ≤500ms 后台重载；失败签名防风暴（签名=模型+key/url/model；Start 主动路径不受限）。D2 兜底——Start 决策前廉价层命中且在途，最多等 1500ms，逐 ≤100ms 切片可被 stop/cancel 打断，超时/失败退回旧行为，硬红线不挂死。三处收口（asr_cheap_reload_needed / spawn_asr_reload / apply_reload_result）两路共用零漂移；RecordingStarted 时机零改动（HOTKEY-LATENCY-FIX-001 地盘）。
+- **Part B Q2**：FULL_LEVEL 0.35→0.10 + 可见地板 0.35（外弧×0.85）；只改 mic_pulse_alphas 一处；gain<=0 ⇒ (0,0) 静音契约逐位不变。
+- **Part C Q1**：菜单图标失败分支全量 log::warn!（带 GetLastError），成功一条 debug!；永久代码非探针；降级行为不变。
+- **DEC-062** 已落 collab/decisions.md（部分修订 DEC-025 + 定性修正「功能性错误」）；MACOS-HANDOFF.md 已同步（A 两端同效；B/C Windows 专属不涉及）。
+- **验证**：fmt 0 / check --all-targets warnings 111/102 持平 / cargo test 1110P/0F 零预期红；FIX-162 两 hunk 零触碰。
+- **红线**：未 commit/未出包/版本未动/零凭证/临时文件无（无截图无脚本）；diff --numstat 328+/81- 全部归属本人改动+coder-2 既有回退。
+- **给主控**：出包前目视清单（托盘右键一次看 debug.log 的 menu icon 行=Q1 取证；说话中看弧=Q2）；Q2 若端测仍无弧，弧级插桩（E5）待批。

@@ -103,8 +103,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CYSMICON, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
     SW_SHOW, SW_SHOWNA, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP,
     WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_NCCREATE, WM_NCPAINT,
-    WM_PAINT, WM_TIMER, WNDCLASSW, WNDCLASS_STYLES, WS_CHILD, WS_EX_COMPOSITED, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
+    WM_PAINT, WM_TIMER, WNDCLASSW, WNDCLASS_STYLES, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
 };
 #[derive(Debug, Clone)]
 enum PipelineEvent {
@@ -284,11 +284,18 @@ fn tray_menu_labels(ui_language: config::UiLanguage) -> (&'static str, &'static 
 }
 /// TRAY-ICON-158：把直通 RGBA8 图标转成 32bpp top-down 预乘 BGRA DIB，
 /// 供菜单项 `MIIM_BITMAP` 挂载。菜单渲染只有在 32bpp 预乘 DIB 上才正确
-/// 合成 per-pixel alpha。失败返回 None（调用方静默降级为无图标菜单）。
+/// 合成 per-pixel alpha。失败返回 None（调用方降级为无图标菜单——行为不变，
+/// FIX-164 Part C：不再沉默，每个失败分支 log::warn! 带 GetLastError，
+/// BUILD-159 端测「图标没挂上」的真因就藏在这段无观测的失败路径里）。
 #[cfg(target_os = "windows")]
 fn create_menu_item_bitmap(size: i32, rgba: &[u8]) -> Option<HBITMAP> {
     let n = size as usize;
     if size <= 0 || n.checked_mul(4)? != rgba.len() {
+        log::warn!(
+            "menu icon: create_menu_item_bitmap rejected input (size={}, rgba_len={})",
+            size,
+            rgba.len()
+        );
         return None;
     }
     let mut bmi = BITMAPINFO::default();
@@ -304,9 +311,26 @@ fn create_menu_item_bitmap(size: i32, rgba: &[u8]) -> Option<HBITMAP> {
     let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
     let hbmp = unsafe {
         // hdc 传 None：32bpp DIB 不需要绑定 DC，菜单 GDI 读取内存即可合成
-        CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?
+        CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+    };
+    let Ok(hbmp) = hbmp else {
+        // FIX-164 Part C: 不再静默——CreateDIBSection 失败是「图标没挂上」候选真因之一
+        let err = unsafe { windows::Win32::Foundation::GetLastError() };
+        log::warn!(
+            "menu icon: CreateDIBSection failed ({}x{}), GetLastError={:?}",
+            size,
+            size,
+            err
+        );
+        return None;
     };
     if bits.is_null() {
+        // FIX-164 Part C: 同上，ppvBits 为空同样降级但留痕
+        log::warn!(
+            "menu icon: CreateDIBSection returned null bits ({}x{})",
+            size,
+            size
+        );
         let _ = unsafe { DeleteObject(hbmp) };
         return None;
     }
@@ -338,7 +362,8 @@ fn attach_menu_icons(menu: HMENU) -> Vec<HBITMAP> {
         (MENU_CMD_EXIT, ui::menu_icons::exit_icon_rgba(size as u32)),
     ] {
         let Some(hbmp) = create_menu_item_bitmap(size, &rgba) else {
-            continue; // 静默降级：图标失败绝不影响菜单弹出
+            // FIX-164 Part C: 降级行为不变，但失败原因已在 create_menu_item_bitmap 内留痕
+            continue;
         };
         let mut mii = MENUITEMINFOW::default();
         mii.cbSize = std::mem::size_of::<MENUITEMINFOW>() as u32;
@@ -348,9 +373,25 @@ fn attach_menu_icons(menu: HMENU) -> Vec<HBITMAP> {
         if unsafe { SetMenuItemInfoW(menu, cmd_id, false, &mii) }.is_ok() {
             attached.push(hbmp);
         } else {
+            // FIX-164 Part C: SetMenuItemInfoW 失败是「图标没挂上」另一候选真因——
+            // 静默降级吞了 8 个月没人能说出为什么，现在带 GetLastError 留痕。
+            let err = unsafe { windows::Win32::Foundation::GetLastError() };
+            log::warn!(
+                "menu icon: SetMenuItemInfoW failed for cmd_id={}, GetLastError={:?}",
+                cmd_id,
+                err
+            );
             let _ = unsafe { DeleteObject(hbmp) };
         }
     }
+    // FIX-164 Part C: 成功路径只记一条 debug（不刷屏），含挂载数量与尺寸供 debug.log 核对
+    log::debug!(
+        "menu icon: attached {}/2 bitmaps at {}px (settings={}, exit={})",
+        attached.len(),
+        size,
+        MENU_CMD_SETTINGS,
+        MENU_CMD_EXIT
+    );
     attached
 }
 #[cfg(target_os = "windows")]
@@ -758,12 +799,11 @@ fn create_edit_control(hwnd: HWND, state: &mut OverlayWindowState, rect: &RECT, 
     };
     let edit_hwnd = unsafe {
         CreateWindowExW(
-            // EDIT-FLICKER-157: 双缓冲（WS_EX_COMPOSITED）—— ES_AUTOHSCROLL 光标右移
-            // 触发横向滚动，右侧留待重绘条带，EDIT 擦背景+画字两步直接上屏 ⇒ 右侧
-            // 可见闪烁（左侧不滚不闪）。COMPOSITED 令子控件离屏合成、擦-画不上屏。
-            // 🔴 SLWA 分层窗子控件上的兼容性未实测：若 EDIT 不显示/显示异常，
-            // 回退方案 = 子类拦 WM_ERASEBKGND 自绘背景（父窗同色刷+内存 DC BitBlt）。
-            WS_EX_NOACTIVATE | WS_EX_COMPOSITED, // child, keep NOACTIVATE so it doesn't steal from parent
+            // EDIT-FLICKER-157 双缓冲扩展样式（COMPOSITED）方案因 Gavin 端测出现 EDIT
+            // 大黑屏/文字全丢，已于 FIX-162 回退；闪烁问题重新排期，下次必须端测确认后才收。
+            // 备选方案（供后续参考，同样未实测）：子类拦 WM_ERASEBKGND 自绘背景
+            // （父窗同色刷+内存 DC BitBlt），或创建后 SetWindowLongPtrW 改样式。
+            WS_EX_NOACTIVATE, // child, keep NOACTIVATE so it doesn't steal from parent
             PCWSTR(class_name.as_ptr()),
             PCWSTR(title.as_ptr()),
             WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
@@ -2870,7 +2910,14 @@ fn waveform_bar_height(v: f32, i: i32, half: i32) -> i32 {
 const MIC_PULSE_PERIOD_MS: u64 = 1000;
 const MIC_PULSE_OUT_OFFSET: f32 = 0.30; // 外弧相位滞后 0.3 ⇒「由内向外扩散」
 const MIC_PULSE_PULSE_WIDTH: f32 = 0.55; // tri 波总宽（半宽 0.275）
-const MIC_PULSE_FULL_LEVEL: f32 = 0.35; // 电平 ≥0.35 即满亮
+                                         // FIX-164 Part B: 0.35 → 0.10。诊断（DIAG-163）：色阈值 0.01（mic_audio_snapshot 的
+                                         // has_audio 门槛）与本值相差 35 倍 ⇒ 正常说话电平区间里麦克风早已变橙、弧的 alpha
+                                         // 却只有百分之几，1.2px 线宽下肉眼不可见（「橙麦 + 隐形弧」自相矛盾态）。
+                                         // 0.10 = level≥0.10 即满亮；正常说话电平 0.02~0.3 区间 gain≈0.2~1.0，动效可读。
+const MIC_PULSE_FULL_LEVEL: f32 = 0.10;
+// FIX-164 Part B: 可见地板 —— has_audio 为真（level>0.01）时弧的 alpha 不低于此值，
+// 杜绝「橙麦 + 隐形弧」再出现。静音（gain==0 / 无音频）仍完全不画（160 既定契约）。
+const MIC_PULSE_ALPHA_FLOOR: f32 = 0.35;
 const MIC_PULSE_OUT_DIM: f32 = 0.85; // 外弧略淡，强化扩散读感
 const MIC_PULSE_ARC_HALF_ANGLE_DEG: f32 = 40.0;
 const MIC_PULSE_R_IN: f32 = 5.5;
@@ -2894,12 +2941,19 @@ fn mic_pulse_tri(p: f32, offset: f32) -> f32 {
 }
 
 /// 墙钟（ms）+ 电平增益 → (内弧 alpha, 外弧 alpha)。
+/// FIX-164 Part B: 三产出源（D2D mic_indicator / GDI 波形 / GDI 流式）共用本纯函数，
+/// 阈值与地板只在本处生效；gain<=0（静音/无音频）返回 (0,0)，调用方零绘制的
+/// 160 契约不变。has_audio 语义下 gain>0 ⇒ alpha 有 0.35 地板，杜绝隐形弧。
 #[cfg(target_os = "windows")]
 fn mic_pulse_alphas(now_ms: u64, gain: f32) -> (f32, f32) {
+    if gain <= 0.0 {
+        return (0.0, 0.0);
+    }
     let p = (now_ms % MIC_PULSE_PERIOD_MS) as f32 / MIC_PULSE_PERIOD_MS as f32;
     (
-        mic_pulse_tri(p, 0.0) * gain,
-        mic_pulse_tri(p, MIC_PULSE_OUT_OFFSET) * gain * MIC_PULSE_OUT_DIM,
+        (mic_pulse_tri(p, 0.0) * gain).max(MIC_PULSE_ALPHA_FLOOR),
+        (mic_pulse_tri(p, MIC_PULSE_OUT_OFFSET) * gain * MIC_PULSE_OUT_DIM)
+            .max(MIC_PULSE_ALPHA_FLOOR * MIC_PULSE_OUT_DIM),
     )
 }
 
@@ -6578,6 +6632,135 @@ fn compute_hotwords_version(hotwords: &str) -> u64 {
     hasher.finish()
 }
 
+// FIX-164 D2: Start 决策管线前等待重载完成的上限。超时/失败/停止信号 ⇒ 退回旧行为
+// （旧实例继续），🔴 硬红线：绝不挂死热键路径。1500ms 覆盖在线模型重建（秒级内）；
+// 本地 972MB 模型重建更久时会退回旧实例——但 D1 预热已把绝大多数场景提前完成。
+const ASR_RELOAD_START_WAIT_MS: u64 = 1500;
+
+/// FIX-164 D1: 失败签名 —— (期望模型, 在线 key, url, model)。空闲预热对同一签名不
+/// 自动重试（防重试风暴：失败后 active_* 保持旧值，若无签名记忆每 500ms tick 都会
+/// 重 spawn 一次重建）；配置再变签名即变，预热恢复；Start 主动路径不受限（用户显式
+/// 触发，重试合理）。词库版本不进签名：预热廉价层不读词库（主控拍板取舍）。
+type FailedReloadKey = (transcription::AsrModel, String, String, String);
+
+/// FIX-164 D1: 重载判定「廉价层」——模型身份 + 在线 ASR 配置对比，不读词库（词库
+/// 版本判定要开 SQLite，只留在 Start 完整判定里）。预热（空闲 tick）与 Start 完整
+/// 判定共用本函数，杜绝两份判定漂移（任务书红线：判定不许复制粘贴两份）。
+/// 返回 (是否需要重载, 期望模型, 在线配置是否变更)。
+fn asr_cheap_reload_needed(
+    config: &AppConfig,
+    active_asr_model: transcription::AsrModel,
+    active_asr_online_api_key: &str,
+    active_asr_online_url: &str,
+    active_asr_online_model: &str,
+) -> (bool, transcription::AsrModel, bool) {
+    let desired_asr_model = transcription::AsrModel::from_config(&config.audio.asr_model);
+    let identity_changed = active_asr_model != desired_asr_model;
+    // ASR-041-B / ASR-056: 在线 ASR 配置变更检测（key/url/model 变更），
+    // is_online_streaming() 收敛判据（QwenAudioOnline | FunAsrRealtime）
+    let online_asr_changed = desired_asr_model.is_online_streaming()
+        && (active_asr_online_api_key != config.audio.asr_online_api_key
+            || active_asr_online_url != config.audio.asr_online_url
+            || active_asr_online_model != config.audio.asr_online_model);
+    (
+        identity_changed || online_asr_changed,
+        desired_asr_model,
+        online_asr_changed,
+    )
+}
+
+/// FIX-164 D1/D2: 重载 spawn 收口 —— 预热与 Start 共用同一 spawn（判定+spawn 都不许
+/// 两份）。行为与原 Start 内联版逐位一致：后台线程构建，成功/失败都经 reload_tx 送回。
+fn spawn_asr_reload(
+    model_dir: &std::path::Path,
+    config: &AppConfig,
+    desired_asr_model: transcription::AsrModel,
+    desired_hotwords: Option<String>,
+    reload_tx: crossbeam_channel::Sender<Result<transcription::Transcriber, String>>,
+) {
+    let reload_model_dir = model_dir.to_path_buf();
+    let reload_streaming = config.audio.enable_streaming;
+    let reload_language = "auto".to_string();
+    let reload_asr_online_key = config.audio.asr_online_api_key.clone();
+    let reload_asr_online_url = config.audio.asr_online_url.clone();
+    let reload_asr_online_model = config.audio.asr_online_model.clone();
+    let reload_asr_online_max_sentence_silence = config.audio.asr_online_max_sentence_silence;
+    std::thread::spawn(move || {
+        let t_build = std::time::Instant::now();
+        match transcription::Transcriber::new(
+            &reload_model_dir,
+            reload_streaming,
+            reload_language,
+            desired_asr_model,
+            desired_hotwords.as_deref(),
+            &reload_asr_online_key,
+            &reload_asr_online_url,
+            &reload_asr_online_model,
+            reload_asr_online_max_sentence_silence,
+        ) {
+            Ok(new_t) => {
+                log::info!(
+                    "ASR transcriber rebuild completed in {:.1}s",
+                    t_build.elapsed().as_secs_f64()
+                );
+                let _ = reload_tx.send(Ok(new_t));
+            }
+            Err(e) => {
+                // 失败也必须回消息，worker 侧据此清除 in_flight 标志
+                let _ = reload_tx.send(Err(e.to_string()));
+            }
+        }
+    });
+}
+
+/// FIX-164: 重载结果应用收口 —— loop 顶与 D2 有界等待共用（交换实例/同步跟踪值/
+/// 清除 in_flight/记录或清除失败签名），杜绝两份应用逻辑漂移。
+#[allow(clippy::too_many_arguments)]
+fn apply_reload_result(
+    result: Result<transcription::Transcriber, String>,
+    runtime_config: &Arc<RwLock<AppConfig>>,
+    transcriber: &mut Option<transcription::Transcriber>,
+    active_asr_model: &mut transcription::AsrModel,
+    active_hotwords_version: &mut u64,
+    active_asr_online_api_key: &mut String,
+    active_asr_online_url: &mut String,
+    active_asr_online_model: &mut String,
+    asr_reload_in_flight: &mut bool,
+    failed_reload_key: &mut Option<FailedReloadKey>,
+) {
+    match result {
+        Ok(new_transcriber) => {
+            log::info!("ASR transcriber hot-reload completed, swapping instance");
+            *active_asr_model = new_transcriber.asr_model();
+            *active_hotwords_version = new_transcriber.hotwords_version();
+            // ASR-041-B: 同步在线 ASR 配置跟踪值
+            let fresh = clone_runtime_config(runtime_config);
+            *active_asr_online_api_key = fresh.audio.asr_online_api_key;
+            *active_asr_online_url = fresh.audio.asr_online_url;
+            *active_asr_online_model = fresh.audio.asr_online_model;
+            *transcriber = Some(new_transcriber);
+            *asr_reload_in_flight = false;
+            *failed_reload_key = None; // FIX-164: 成功即清失败签名，预热恢复待命
+        }
+        Err(e) => {
+            // active_* 保持旧值，下次 Start 对比仍不一致 → 自然重试
+            log::warn!(
+                "ASR transcriber hot-reload failed: {}, keeping old instance",
+                e
+            );
+            *asr_reload_in_flight = false;
+            // FIX-164 D1 防风暴：见 FailedReloadKey 文档
+            let cfg = clone_runtime_config(runtime_config);
+            *failed_reload_key = Some((
+                transcription::AsrModel::from_config(&cfg.audio.asr_model),
+                cfg.audio.asr_online_api_key,
+                cfg.audio.asr_online_url,
+                cfg.audio.asr_online_model,
+            ));
+        }
+    }
+}
+
 // MACOS-P4-NEUTRAL-002: 去 cfg——WorkerCommand/StartCmd 已中立，worker 线程 macOS 侧接线需此函数可见。
 // 对 Windows 构建该 cfg 恒为真，删除为 no-op。
 fn spawn_worker_thread(
@@ -6639,6 +6822,8 @@ fn spawn_worker_thread(
         // 重建进行中标志：spawn 时置 true，收到成功/失败消息时清除。
         // 防止 ~6s 构建窗口内每次 Start 都重复 spawn（并发加载多个 972MB 模型）。
         let mut asr_reload_in_flight = false;
+        // FIX-164 D1: 失败签名，见 FailedReloadKey 文档（防空闲预热重试风暴）
+        let mut failed_reload_key: Option<FailedReloadKey> = None;
         // 当前已生效的 asr_model + hotwords_version，用于对比是否需要重建
         let mut active_asr_model: transcription::AsrModel =
             transcription::AsrModel::from_config(&config.audio.asr_model);
@@ -6682,29 +6867,58 @@ fn spawn_worker_thread(
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             };
-            // ASR-DUAL-B-001: 非阻塞检查热重载结果（后台线程构建完成后送回）
-            match asr_reload_rx.try_recv() {
-                Ok(Ok(new_transcriber)) => {
-                    log::info!("ASR transcriber hot-reload completed, swapping instance");
-                    active_asr_model = new_transcriber.asr_model();
-                    active_hotwords_version = new_transcriber.hotwords_version();
-                    // ASR-041-B: 同步在线 ASR 配置跟踪值
-                    let fresh = clone_runtime_config(&runtime_config);
-                    active_asr_online_api_key = fresh.audio.asr_online_api_key;
-                    active_asr_online_url = fresh.audio.asr_online_url;
-                    active_asr_online_model = fresh.audio.asr_online_model;
-                    transcriber = Some(new_transcriber);
-                    asr_reload_in_flight = false;
-                }
-                Ok(Err(e)) => {
-                    // active_* 保持旧值，下次 Start 对比仍不一致 → 自然重试
-                    log::warn!(
-                        "ASR transcriber hot-reload failed: {}, keeping old instance",
-                        e
+            // ASR-DUAL-B-001: 非阻塞检查热重载结果（后台线程构建完成后送回）。
+            // FIX-164: 应用逻辑收口进 apply_reload_result（与 D2 有界等待共用）。
+            if let Ok(result) = asr_reload_rx.try_recv() {
+                apply_reload_result(
+                    result,
+                    &runtime_config,
+                    &mut transcriber,
+                    &mut active_asr_model,
+                    &mut active_hotwords_version,
+                    &mut active_asr_online_api_key,
+                    &mut active_asr_online_url,
+                    &mut active_asr_online_model,
+                    &mut asr_reload_in_flight,
+                    &mut failed_reload_key,
+                );
+            }
+            // FIX-164 D1: 空闲预热 —— 配置变更后 ≤500ms（tick 周期）即在后台启动重载，
+            // 消除「切完模型第一次录音用旧引擎」（DEC-025 遗留缺口，DIAG-163 Q3 实锤）。
+            // 只在 idle tick（cmd=None）判定：录音期间 loop 顶不执行，天然不会中途换引擎；
+            // Start 处理器占用 loop 时本 tick 也轮不到。判定用廉价层（不读词库，主控拍板）；
+            // in_flight 防重复 spawn + 失败签名防重试风暴，双保险。
+            if cmd.is_none() && !asr_reload_in_flight {
+                let config_now = clone_runtime_config(&runtime_config);
+                let (cheap_needed, desired_now, _) = asr_cheap_reload_needed(
+                    &config_now,
+                    active_asr_model,
+                    &active_asr_online_api_key,
+                    &active_asr_online_url,
+                    &active_asr_online_model,
+                );
+                let desired_key: FailedReloadKey = (
+                    desired_now,
+                    config_now.audio.asr_online_api_key.clone(),
+                    config_now.audio.asr_online_url.clone(),
+                    config_now.audio.asr_online_model.clone(),
+                );
+                if cheap_needed && failed_reload_key.as_ref() != Some(&desired_key) {
+                    log::info!(
+                        "FIX-164 D1 idle prewarm: config change detected (model {:?} -> {:?}), reloading transcriber in background",
+                        active_asr_model,
+                        desired_now
                     );
-                    asr_reload_in_flight = false;
+                    let desired_hotwords = load_hotwords_for_accuracy(&config_now);
+                    asr_reload_in_flight = true;
+                    spawn_asr_reload(
+                        &model_dir,
+                        &config_now,
+                        desired_now,
+                        desired_hotwords,
+                        asr_reload_tx.clone(),
+                    );
                 }
-                Err(_) => {}
             }
             match cmd {
                 None => {
@@ -6736,8 +6950,16 @@ fn spawn_worker_thread(
                     // ASR-DUAL-B-001: 检查是否需要热重载 transcriber
                     // 触发条件：asr_model 变更 / transcription_language 变更 /
                     // accuracy 模式下词库变更 / qwen3 配置变更 / transcriber 未初始化自愈
-                    let desired_asr_model =
-                        transcription::AsrModel::from_config(&config.audio.asr_model);
+                    // FIX-164: 廉价层判定抽为 asr_cheap_reload_needed（预热与 Start 共用，
+                    // 不许两份）；词库版本 + 自愈只属于 Start 完整层（词库判定要读库）。
+                    let (cheap_needed, desired_asr_model, online_asr_changed) =
+                        asr_cheap_reload_needed(
+                            &config,
+                            active_asr_model,
+                            &active_asr_online_api_key,
+                            &active_asr_online_url,
+                            &active_asr_online_model,
+                        );
                     let desired_hotwords = load_hotwords_for_accuracy(&config);
                     let desired_hotwords_version = match &desired_hotwords {
                         Some(h) => compute_hotwords_version(h),
@@ -6745,17 +6967,9 @@ fn spawn_worker_thread(
                     };
                     // R2-4: transcriber.is_none() 时无条件尝试重建（启动失败自愈）
                     let needs_rebuild = transcriber.is_none() && !asr_reload_in_flight;
-                    // ASR-041-B / ASR-056: 在线 ASR 配置变更检测（key/url/model 变更）
-                    // 用 is_online_streaming() 收敛判据（QwenAudioOnline | FunAsrRealtime）
-                    let online_asr_changed = desired_asr_model.is_online_streaming()
-                        && (active_asr_online_api_key != config.audio.asr_online_api_key
-                            || active_asr_online_url != config.audio.asr_online_url
-                            || active_asr_online_model != config.audio.asr_online_model);
-                    // LANG-AUTO-001: language 恒为 "auto"，移除语言变更监听
-                    let needs_reload = active_asr_model != desired_asr_model
+                    let needs_reload = cheap_needed
                         || (desired_asr_model == transcription::AsrModel::Accuracy
                             && active_hotwords_version != desired_hotwords_version)
-                        || online_asr_changed
                         || needs_rebuild;
                     if needs_reload && !asr_reload_in_flight {
                         log::info!(
@@ -6768,45 +6982,78 @@ fn spawn_worker_thread(
                             needs_rebuild,
                         );
                         asr_reload_in_flight = true;
-                        let reload_model_dir = model_dir.clone();
-                        let reload_streaming = config.audio.enable_streaming;
-                        let reload_language = "auto".to_string();
-                        let reload_hotwords = desired_hotwords.clone();
-                        let reload_asr_online_key = config.audio.asr_online_api_key.clone();
-                        let reload_asr_online_url = config.audio.asr_online_url.clone();
-                        let reload_asr_online_model = config.audio.asr_online_model.clone();
-                        let reload_asr_online_max_sentence_silence =
-                            config.audio.asr_online_max_sentence_silence;
-                        let reload_tx = asr_reload_tx.clone();
-                        std::thread::spawn(move || {
-                            let t_build = std::time::Instant::now();
-                            match transcription::Transcriber::new(
-                                &reload_model_dir,
-                                reload_streaming,
-                                reload_language,
-                                desired_asr_model,
-                                reload_hotwords.as_deref(),
-                                &reload_asr_online_key,
-                                &reload_asr_online_url,
-                                &reload_asr_online_model,
-                                reload_asr_online_max_sentence_silence,
-                            ) {
-                                Ok(new_t) => {
-                                    log::info!(
-                                        "ASR transcriber rebuild completed in {:.1}s",
-                                        t_build.elapsed().as_secs_f64()
-                                    );
-                                    let _ = reload_tx.send(Ok(new_t));
-                                }
-                                Err(e) => {
-                                    // 失败也必须回消息，worker 侧据此清除 in_flight 标志
-                                    let _ = reload_tx.send(Err(e.to_string()));
-                                }
-                            }
-                        });
+                        spawn_asr_reload(
+                            &model_dir,
+                            &config,
+                            desired_asr_model,
+                            desired_hotwords,
+                            asr_reload_tx.clone(),
+                        );
                     }
 
                     log::info!("[Latency] worker received Start command");
+
+                    // FIX-164 D2: 有界等待兜底 —— 模型身份/在线配置已变更且重载仍在途时，
+                    // 最多等 ASR_RELOAD_START_WAIT_MS 让新实例落地，堵住「切完立刻按热键
+                    // 仍用旧引擎」（DIAG-163 Q3：输出是旧模型质量，用户以为在用新引擎——
+                    // 静默的功能性错误）。超时/失败/停止信号 ⇒ 退回旧行为（旧实例继续），
+                    // 🔴 硬红线：绝不挂死热键路径。等待逐 ≤100ms 切片，随时可被
+                    // stop/cancel 信号打断（用户连按两下热键的后悔场景）。
+                    // hotwords 版本变更不等待（主控拍板：Q3 病根是引擎身份，词库走原路径）。
+                    let (cheap_needed_now, _, _) = asr_cheap_reload_needed(
+                        &config,
+                        active_asr_model,
+                        &active_asr_online_api_key,
+                        &active_asr_online_url,
+                        &active_asr_online_model,
+                    );
+                    if cheap_needed_now && asr_reload_in_flight {
+                        let wait_deadline = std::time::Instant::now()
+                            + Duration::from_millis(ASR_RELOAD_START_WAIT_MS);
+                        log::info!(
+                            "FIX-164 D2: reload in flight, waiting up to {}ms for new transcriber before deciding pipeline",
+                            ASR_RELOAD_START_WAIT_MS
+                        );
+                        while asr_reload_in_flight {
+                            if stop_recording_signal.load(Ordering::Acquire)
+                                || cancel_signal.load(Ordering::Acquire)
+                            {
+                                log::info!(
+                                    "FIX-164 D2: stop signal during reload wait, proceeding with current instance"
+                                );
+                                break;
+                            }
+                            let remaining =
+                                wait_deadline.saturating_duration_since(std::time::Instant::now());
+                            if remaining.is_zero() {
+                                log::warn!(
+                                    "FIX-164 D2: reload wait timed out after {}ms, proceeding with current (old) instance",
+                                    ASR_RELOAD_START_WAIT_MS
+                                );
+                                break;
+                            }
+                            match asr_reload_rx
+                                .recv_timeout(remaining.min(Duration::from_millis(100)))
+                            {
+                                Ok(result) => {
+                                    apply_reload_result(
+                                        result,
+                                        &runtime_config,
+                                        &mut transcriber,
+                                        &mut active_asr_model,
+                                        &mut active_hotwords_version,
+                                        &mut active_asr_online_api_key,
+                                        &mut active_asr_online_url,
+                                        &mut active_asr_online_model,
+                                        &mut asr_reload_in_flight,
+                                        &mut failed_reload_key,
+                                    );
+                                }
+                                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                    }
 
                     // ASR-038-B / ASR-056: 在线流式 ASR 走真流式管线（边录边发边收边上屏）
                     // 其他模式走现有 record() + run_pipeline_core（零行为变更）
