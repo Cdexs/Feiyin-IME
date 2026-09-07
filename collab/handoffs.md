@@ -4,6 +4,18 @@
 
 
 
+## 2026-09-07 — tester-1 — BUILD-168 ✅ 出包：DIAG-166 托盘图标根因修复（精简流程，四条全覆盖首包，待主控验收）
+
+- **基线**：HEAD `2dc9474` clean（DIAG-166 修复已由主控提交）。
+- **精简流程**：Step1 清进程（无残留）→ Step2 git-log 法 UI 免重建（f85c550@09-06 18:47 早于 UI exe 01:15）→ Step3 主程序（2m08s，feiyin-ime 111 / crash-reporter 5）→ Step4 cp -p 同步 Publish/。
+- **七项核验全 PASS**：① 主程序 20:33 本次构建；② 两副本 sha `20b371d4…` 一致异于 `85c1cf26…`；③ ProductVersion 0.9.0.0；④ 冒烟 PID 26760 Responding=True 无 panic 已清理；⑤ config.toml sha `3186ec8c` 不变；⑥ warnings 111/102；⑦ 🔴 判别探针字节级 PASS（新文案含 expected= 进包、旧文案 rgba_len=…) 形态 0 命中）。
+- **回归（并行）**：cargo test 全量 **1110P/0F/9I** + hotkey 51P + ui_guard 2P；Vitest/E2E Skip。🔴 crash_reporter config 批量 FAIL **本轮未出现**（连续三轮未复现，维持归档偶发）。
+- **出包语义**：托盘图标（第 1 条）✅ 已修 = 四条全覆盖首包。不出端测清单给 Gavin，主控自出。
+- **顺带修正**：logs/20260907.md BUILD-165 条目乱码 `0X0P+0PPDATA`→`%APPDATA%`。
+- **红线**：未 commit / v0.9.0 未动 / 未 cargo clean / 未 cargo tauri build / 零凭证 / 无临时文件。
+
+
+
 ## 2026-09-07 — tester-1 — BUILD-165 ✅ 出包：FIX-162 + FIX-164（精简流程，Gavin 端测打回四条的修复包，待主控验收）
 
 - **基线**：HEAD `e012108` + 未 commit 的 FIX-162（WS_EX_COMPOSITED 回退）+ FIX-164（Part A 预热+1500ms 有界等待 / Part B 声波弧阈值 0.10+地板 0.35 / Part C GetLastError 日志），主控已验收。
@@ -212,3 +224,11 @@
 - **验证**：fmt 0 / warnings 111/102 持平 / cargo test 1110P/0F 连续 3 次全绿；中间一次 24F 不可复现（与工装删除+fmt 重叠窗口期可疑，无断言锚定被改行），已在主文档如实记录。
 - **出包观察点（交主控/Gavin）**：右键托盘应见双图标品牌橙；若上下颠倒（DIBSECTION 读回 biHeight=+16 痕迹）→ 去掉 biHeight 负号一行即修。
 - **红线**：未 commit/版本未动/未出包/零凭证；工装已清理。
+
+## 2026-09-07 — coder-1 — FLICKER-170 ✅ 编辑态移光标闪烁 A+B' 双修（阶段一：80+/9-，1110P/0F、warnings 111/102 持平，待主控验收 → tester-1 出包）
+
+- **A（放大器）**：父窗 WS_POPUP → WS_POPUP|WS_CLIPCHILDREN。修 INVESTIGATE-142 放大器（父窗全窗 BitBlt 盖 EDIT）；非编辑态无子窗口恒惰性、ULW 无 EDIT 惰性、其余三态零变化。回退=删 WS_CLIPCHILDREN。
+- **B'（现象本体）**：EDIT 子类拦 WM_PAINT，WM_PRINTCLIENT(PRF_ERASEBKGND|PRF_CLIENT) 进内存 DC 一次画完擦除+文字，单次 BitBlt 提交 ps.rcPaint；caret 成对 Hide/Show；资源失败兜底回默认绘制。修 EDIT 内部两步直打表面的 DWM 合成间隙闪烁。回退=删 WM_PAINT 分支。
+- **工装实证**：擦背景 ✓ / 文字 ✓ / 🔴 选区反白 ✗ 不渲染（0px diff ×3 组，Gavin 已接受）；caret/ps.rcPaint/IME 结论见 result.md。
+- **预期现象分离（供 Gavin 端测判归因）**：A 修「进出编辑态/文字更新瞬间 EDIT 整块被盖掉后等 caret 周期回来」；B' 修「按住方向键移光标时最右侧文字闪烁」。只好一半时按此归因决定去留。
+- **红线**：未 commit/版本未动/未出包/零凭证/工装已删；不碰 COMPOSITED/ULW/apply_alpha_fixup/圆角/RecordingStarted/预热逻辑。

@@ -96,15 +96,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetGUIThreadInfo, GetMessageW, GetPropW, GetSystemMetrics, GetWindowLongPtrW, HideCaret,
     KillTimer, LoadCursorW, MsgWaitForMultipleObjects, PeekMessageW, PostMessageW, PostQuitMessage,
     RegisterClassW, RemovePropW, SetForegroundWindow, SetLayeredWindowAttributes, SetMenuItemInfoW,
-    SetPropW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu,
+    SetPropW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowCaret, ShowWindow, TrackPopupMenu,
     TranslateMessage, UpdateLayeredWindow, CREATESTRUCTW, CW_USEDEFAULT, GUITHREADINFO,
     GWLP_USERDATA, GWL_EXSTYLE, HMENU, IDC_ARROW, LWA_ALPHA, MENUITEMINFOW, MF_SEPARATOR,
-    MF_STRING, MIIM_BITMAP, MSG, PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN, SM_CXSMICON, SM_CYSCREEN,
-    SM_CYSMICON, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOW, SW_SHOWNA, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP,
-    WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_NCCREATE, WM_NCPAINT,
-    WM_PAINT, WM_TIMER, WNDCLASSW, WNDCLASS_STYLES, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
+    MF_STRING, MIIM_BITMAP, MSG, PM_REMOVE, PRF_CLIENT, PRF_ERASEBKGND, QS_ALLINPUT, SM_CXSCREEN,
+    SM_CXSMICON, SM_CYSCREEN, SM_CYSMICON, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNA, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONUP, WM_NCCREATE, WM_NCPAINT, WM_PAINT, WM_PRINTCLIENT, WM_TIMER, WNDCLASSW,
+    WNDCLASS_STYLES, WS_CHILD, WS_CLIPCHILDREN, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
 };
 #[derive(Debug, Clone)]
 enum PipelineEvent {
@@ -885,6 +886,64 @@ unsafe extern "system" fn edit_subclass_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // FLICKER-170-B: 单次合成绘制 —— 现象本体是 EDIT 内部「擦背景刷填充→画字」两步
+    // 直打 SLWA 重定向表面，DWM 可在两步之间合成 ⇒ 移光标/滚动时可见闪烁
+    // （Gavin 端测现象；A 的 WS_CLIPCHILDREN 修的是父窗放大器，修不到这条）。
+    // 修法 = create_edit_control 注释里预留的备选路径完整形态：拦 WM_PAINT，
+    // WM_PRINTCLIENT(PRF_ERASEBKGND|PRF_CLIENT) 让 EDIT 把擦除+文字一次画进内存 DC，
+    // 再单次 BitBlt 只提交 ps.rcPaint 更新区（坑③：不全矩形重画）。无 COMPOSITED、
+    // 无新窗口样式、无新合成模型 —— 与 157 的炸法不同类。工装实证（flck170 探针）：
+    // 擦背景 ✓（bg=CTLCOLOREDIT 刷色）、文字 ✓；🔴 选区反白 ✗ 不渲染（Gavin 已知悉
+    // 并接受，见 result.md 端测清单）。回退 = 删除本 WM_PAINT 分支。
+    if msg == WM_PAINT {
+        let mut ps = PAINTSTRUCT::default();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        if hdc.is_invalid() {
+            return forward_edit_old_proc(hwnd, msg, wparam, lparam);
+        }
+        let mut rc_client = RECT::default();
+        if GetClientRect(hwnd, &mut rc_client).is_err() {
+            let _ = EndPaint(hwnd, &ps);
+            return forward_edit_old_proc(hwnd, msg, wparam, lparam);
+        }
+        let cw = (rc_client.right - rc_client.left).max(1);
+        let ch = (rc_client.bottom - rc_client.top).max(1);
+        let mem_dc = CreateCompatibleDC(hdc);
+        let mem_bmp = CreateCompatibleBitmap(hdc, cw, ch);
+        if mem_dc.is_invalid() || mem_bmp.is_invalid() {
+            // 资源失败兜底：退回 EDIT 默认绘制（闪烁但功能完好，绝不黑块）
+            if !mem_dc.is_invalid() {
+                let _ = DeleteDC(mem_dc);
+            }
+            let _ = EndPaint(hwnd, &ps);
+            return forward_edit_old_proc(hwnd, msg, wparam, lparam);
+        }
+        let old_bmp = SelectObject(mem_dc, mem_bmp);
+        let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+            hwnd,
+            WM_PRINTCLIENT,
+            WPARAM(mem_dc.0 as usize),
+            LPARAM((PRF_ERASEBKGND | PRF_CLIENT) as isize),
+        );
+        // caret 由系统直接画在屏幕层，BitBlt 会盖掉它 ⇒ BitBlt 前后成对隐藏/恢复
+        // （坑①；与 OVERLAY-149 的销毁期 caret 清理零交互：那边是 DestroyWindow 前
+        // 一次性 HideCaret+DestroyCaret，这里是绘制期瞬态平衡对）。
+        let _ = HideCaret(hwnd);
+        let up = ps.rcPaint;
+        let uw = (up.right - up.left).max(0);
+        let uh = (up.bottom - up.top).max(0);
+        if uw > 0 && uh > 0 {
+            let _ = BitBlt(
+                hdc, up.left, up.top, uw, uh, mem_dc, up.left, up.top, SRCCOPY,
+            );
+        }
+        let _ = ShowCaret(hwnd);
+        let _ = SelectObject(mem_dc, old_bmp);
+        let _ = DeleteObject(mem_bmp);
+        let _ = DeleteDC(mem_dc);
+        let _ = EndPaint(hwnd, &ps);
+        return LRESULT(0);
+    }
     if msg == windows::Win32::UI::WindowsAndMessaging::WM_NCPAINT {
         return LRESULT(0);
     }
@@ -926,6 +985,11 @@ unsafe extern "system" fn edit_subclass_wnd_proc(
     // DefWindowProcW is the default window proc, NOT the EDIT class proc — using it
     // bypasses all of EDIT's text storage, drawing, caret/scroll, selection logic,
     // which was the root cause of "text disappears / can't edit / cursor can't reach".
+    forward_edit_old_proc(hwnd, msg, wparam, lparam)
+}
+
+/// FLICKER-170-B: 子类前向收口 —— WM_PAINT 合成兜底与消息尾共用同一前向逻辑。
+fn forward_edit_old_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let prop_name = PCWSTR(EDIT_OLD_PROC_PROP.as_ptr());
     let old_proc = unsafe { GetPropW(hwnd, prop_name) };
     if !old_proc.0.is_null() {
@@ -937,7 +1001,7 @@ unsafe extern "system" fn edit_subclass_wnd_proc(
         };
         unsafe { CallWindowProcW(old_proc_fn, hwnd, msg, wparam, lparam) }
     } else {
-        DefWindowProcW(hwnd, msg, wparam, lparam)
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     }
 }
 
@@ -1396,7 +1460,14 @@ fn run_overlay_thread(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE,
             PCWSTR(class_name.as_ptr()),
             PCWSTR(window_title.as_ptr()),
-            WS_POPUP,
+            // FLICKER-170-A: 加 WS_CLIPCHILDREN —— INVESTIGATE-142 指认的结构性放大器：
+            // SLWA 父窗 WM_PAINT 全窗 BitBlt 直打屏幕，会整块盖掉 EDIT 子控件的文字。
+            // 加后父窗绘制自动裁掉子窗口矩形，EDIT 不再被父窗重绘覆盖。非编辑态没有
+            // 子窗口 ⇒ 裁剪区为空集 ⇒ 其余三态逐位零变化；EDIT 仅在编辑态创建
+            // （switch_overlay_layered_mode 切 SLWA 在先），ULW 路径恒惰性。
+            // 与 157 的 WS_EX_COMPOSITED 完全不同类：不改合成模型、不加缓冲，
+            // 只影响父窗自身绘制的落笔范围。回退 = 删去本标识符。
+            WS_POPUP | WS_CLIPCHILDREN,
             // OVERLAY-061: create off-screen so the initial 1x1 window never flashes at (0,0)
             // if a frame is composited before ShowWindow(SW_HIDE) lands. WS_POPUP with
             // CW_USEDEFAULT has undefined position and commonly resolves to the top-left
