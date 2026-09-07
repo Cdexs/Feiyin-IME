@@ -1620,3 +1620,9 @@ alpha（不再依赖 D2D 经 BindDC 保真 alpha——实测不保真，AA 边�
   丢失」这一合成层缺陷，无需等价的帧末 SDF 修正。
 - 半径视觉口径与 OVERLAY-121 基线一致（Recording 系 r=16 / Error·FocusLost·Info·编辑
   r=10），若将来实施 macOS 侧 overlay 直接对齐同一常量语义即可。
+
+## OVERLAY-149（2026-09-07）
+
+- F1 caret 泄漏修复（Win32 EDIT 带焦销毁 → 线程级 caret 对象跨态存活）：**macOS 不适用** —— macOS 无 Win32 caret 等价物，NSText 插入点归焦点系统（first responder）管理，焦点释放即消失，不存在「DestroyWindow 后 caret 存留于线程输入队列」的泄漏形态。
+- F2 热键停止臂编辑守卫（OVERLAY_EDITING 清理）：macOS 侧无 OVERLAY_EDITING/EnterEditMode 对应物（编辑态为 Windows 专属 ASR-038-C 功能），不适用。
+- E3/E4 探针（SDF 前提测量 + DPI 一致性）：全部绑 Windows ULW/D2D 管线，macOS NSWindow 无 D2D→DIB 合成层，不适用。
