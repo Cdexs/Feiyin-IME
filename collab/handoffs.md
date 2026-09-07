@@ -3,6 +3,16 @@
 > 只保留当天条目；历史条目见 `handoffs-archive.md`。
 
 
+## 2026-09-07 — tester-1 — TEST-EXEC-152 ✅ 阶段四：OVERLAY-149 + TEST-SYNC-150 全量回归 + G10/G11 消融真跑（生产零改动，待主控验收）
+
+- **基线**：HEAD `7ddf943` clean。
+- **Step1a 三层**：root **1109P/0F/9I**（预期 1107+G10/G11 逐位命中）+ hotkey 51P + src-tauri **76P/0F**。
+- **Step1b Skip（git-log 法）**：`git log -1 -- ui/` ⇒ f85c550@09-06 18:47、`-- src-tauri/` ⇒ 9c9ff73@08-30 均早于上次跑测 ⇒ ui/ 零改动。
+- **Step2 消融 3/3 RED 真跑 + 逐条还原**：A1 删 DestroyCaret 行留注释 → G10 红（注释不喂绿）；A2 caret 三步挪 DestroyWindow 后 → G10 红（L869/875/876 早于 L862 顺序守卫命中）；A3 删 Stop 臂 store(false) → G11 红。每条 Edit 还原。
+- **还原自证**：git diff src/main.rs = 0 行；复跑 1109P/0F/9I 0 红；无残留进程；Publish/config.toml sha `3186ec8c` 未变。
+- **红线**：零生产改动 / 未 commit / v0.9.0 未动 / 未出包 / 零凭证。
+
+
 ## 2026-09-07 — coder-2 — TEST-SYNC-150 ✅ 阶段三：OVERLAY-149 双修复护栏 G10/G11（生产区零字节，待主控验收 → TEST-EXEC）
 
 - **G10（caret 清理顺序）**：`destroy_edit_control` 内 `let _ = SetFocus(` / `let _ = HideCaret(` / `let _ = DestroyCaret(` 三行必须全部早于 `let _ = DestroyWindow(`——顺序是护栏主体（销毁后清 caret=空操作）。needle 全代码行首形态注释免疫；锚 `fn destroy_edit_control(` raw 计数=1 唯一；块定界起点断言防漂移；PROBE 探针块删除不影响。
