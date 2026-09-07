@@ -24,10 +24,7 @@ pub fn exit_icon_rgba(size: u32) -> Vec<u8> {
     rasterize(size, power_covered)
 }
 
-/// 编辑图标（铅笔，EDITICON-175）。
-pub fn edit_icon_rgba(size: u32) -> Vec<u8> {
-    rasterize(size, pencil_covered)
-}
+// edit_icon_rgba 见本文件头部 EDITICON-182 实现（字体优先 + 几何兜底）。
 
 /// EDITICON-176：直通 alpha BGRA（GDI `AlphaBlend` `AC_SRC_ALPHA` 输入格式）。
 /// 仅做 RGBA→BGRA 字节序重排，alpha 通道原样（非预乘）。
@@ -139,20 +136,26 @@ fn power_covered(fx: f32, fy: f32) -> bool {
     ang_from_up.abs() >= POWER_GAP_HALF_RAD
 }
 
-// —— EDITICON-175：编辑图标（铅笔，尖朝左下、笔杆朝右上，45° 对角）——
-// 语义「这里可以编辑文字」。选铅笔而非其他符号：编辑态最强公认符号（Segoe MDL2
-// Edit / 各输入法编辑键同构），18px 下单一路径形状无小尺寸信息密度问题（对比
-// TRAY-ICON-158 教训：16px 8 齿齿轮欠采样发糊）。风格与齿轮/电源同语言：SSAA 4x4、
-// 品牌橙、直边平切端（不做圆角端帽，与两参照一致）。
-// 几何（18px 网格迭代调优后取值）：尖点 T(-0.40S, 0.40S)，笔杆平切端 E(0.40S, -0.40S)。
-// 笔杆 = 轴上 s∈[0.31,1] 宽 0.16S（≈2.9px @18px）的斜条；笔尖 = s∈[0,0.22]（≈4.2px
-// @18px）由尖点线性展开到同宽的三角；两者之间留 ≈0.086S（≈1.8px @18px）缺口
-// （Segoe MDL2 Edit 的「尖-杆分离」识别特征；16px 压力档下缺口仍可辨）。
-const PENCIL_TIP: (f32, f32) = (-0.40, 0.40);
-const PENCIL_END: (f32, f32) = (0.40, -0.40);
-const PENCIL_HALF_W: f32 = 0.08; // 笔杆半宽（全宽 0.16S ≈ 2.9px @18px）
-const PENCIL_S_TIP: f32 = 0.22; // 尖三角占轴长比例（≈4.2px @18px）
-const PENCIL_S_GAP_END: f32 = 0.31; // 笔杆起点（缺口 ≈0.086S ≈ 1.8px @18px）
+// —— EDITICON-185：编辑图标定稿 = 候选 B「铅笔 + 两条短文本线」（Gavin 拍板）——
+// 构图：两条短文本线（左，读作已有文字）+ 铅笔（右，175 三段式：尖楔+缺口+杆）
+// 斜压在末行延长线上 —— 表达「在文字上编辑」。**逐位复刻 EDITICON-184 预览的像素**
+// （Gavin 选的是他看到的那一版）：铅笔按单位轴参数化（s∈[0,1]），实际画到图标盒
+// 右上缘被盒裁切 —— 这是 184 预览的原样，不许「修正」为短铅笔。
+// 笔尖加固尝试（任务书第二节）：B1 杆加宽 0.085+缺口外移 0.33 / B2 只加宽 / B3 尖楔
+// 加长 0.26 —— 三组网格全部证伪（尖区像素对子采样位相敏感，无一优于原稿 16px 尖区
+// `##o`/`###`），**维持原稿 (0.08/0.22/0.31)**，如实报告不改。
+// A/C 候选与 v3 对照几何已从 cfg(test) 移除（Gavin 已定稿；历史几何可从 git/log 恢复）。
+const PENCIL_TIP: (f32, f32) = (-0.10, 0.14);
+const PENCIL_END: (f32, f32) = (0.40, -0.36);
+const PENCIL_HALF_W: f32 = 0.08; // 笔杆半宽（全宽 0.16S）
+const PENCIL_S_TIP: f32 = 0.22; // 尖楔占轴长比例
+const PENCIL_S_GAP_END: f32 = 0.31; // 笔杆起点（尖-杆缺口）
+const TEXT_LINE_1: (f32, f32, f32) = (-0.20, -0.44, 0.02); // (y, x0, x1) 长线
+const TEXT_LINE_2: (f32, f32, f32) = (0.028, -0.44, -0.20); // 短线（18px 单像素行对齐）
+
+pub fn edit_icon_rgba(size: u32) -> Vec<u8> {
+    rasterize(size, edit_icon_covered)
+}
 
 fn pencil_covered(fx: f32, fy: f32) -> bool {
     let (tx, ty) = PENCIL_TIP;
@@ -166,14 +169,13 @@ fn pencil_covered(fx: f32, fy: f32) -> bool {
     let ny = ax;
     let px = fx - tx;
     let py = fy - ty;
-    let s = px * ax + py * ay; // 沿轴位置 0..1
+    let s = px * ax + py * ay; // 沿轴位置（单位轴参数化，与 184 预览同数学）
     if !(0.0..=1.0).contains(&s) {
         return false;
     }
     let d = (px * nx + py * ny).abs(); // 到轴的垂距
     if s <= PENCIL_S_TIP {
-        // 尖三角：宽度从尖点线性展开
-        d <= PENCIL_HALF_W * (s / PENCIL_S_TIP)
+        d <= PENCIL_HALF_W * (s / PENCIL_S_TIP) // 尖楔：宽度从尖点线性展开
     } else if s >= PENCIL_S_GAP_END {
         d <= PENCIL_HALF_W // 笔杆
     } else {
@@ -181,23 +183,42 @@ fn pencil_covered(fx: f32, fy: f32) -> bool {
     }
 }
 
+fn text_line_covered(fx: f32, fy: f32) -> bool {
+    let half = 0.055 / 2.0; // 线厚 ≈1px @18px（渲染为 2px 实条，见 179 报告 alpha 公式注）
+    [TEXT_LINE_1, TEXT_LINE_2].iter().any(|line| {
+        let (y, x0, x1) = *line;
+        (y - half..=y + half).contains(&fy) && (x0..=x1).contains(&fx)
+    })
+}
+
+fn edit_icon_covered(fx: f32, fy: f32) -> bool {
+    pencil_covered(fx, fy) || text_line_covered(fx, fy)
+}
+
+// v3 手工几何（纸+笔）已迁至 cfg(test) 作对照组（dump_edit_icon_preview 的
+// edit-v3-* 预览）——184 起 font fallback 随字体路线一并移除，生产实现=候选 A。
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// EDITICON-175 视觉自证：18px（运行时实际尺寸）+ 16（压力档）+ 24 共 3 档，
-    /// 各一张 8x 最近邻放大版，写到 coder-2 的 collab outbox。
-    /// 🔴 预览只证明「形态好不好看」（DIAG-166 教训），不证明运行时行为——运行时
-    /// 是否画得出来由下一单集成 + Gavin 端测判定。
+    /// EDITICON-185 视觉自证：定稿（候选 B）出 edit-FINAL-{18,18-x8,16-x8}。
+    /// 🔴 预览只证明「形态好不好看」（DIAG-166 教训），不证明运行时行为。
     #[test]
     fn dump_edit_icon_preview() {
         let dir = std::path::Path::new("D:/Workspace/CodeLab/collab/outbox/coder-2/icons");
         std::fs::create_dir_all(dir).unwrap();
         let scale = 8u32;
-        for size in [16u32, 18, 24] {
+        for size in [18u32, 16] {
             let rgba = edit_icon_rgba(size);
-            let path = dir.join(format!("edit-{size}.png"));
-            image::save_buffer(&path, &rgba, size, size, image::ExtendedColorType::Rgba8).unwrap();
+            image::save_buffer(
+                dir.join(format!("edit-FINAL-{size}.png")),
+                &rgba,
+                size,
+                size,
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
             let mut big = Vec::with_capacity((size * scale * size * scale * 4) as usize);
             for by in 0..size * scale {
                 for bx in 0..size * scale {
@@ -205,9 +226,8 @@ mod tests {
                     big.extend_from_slice(&rgba[i..i + 4]);
                 }
             }
-            let bpath = dir.join(format!("edit-{size}-x8.png"));
             image::save_buffer(
-                &bpath,
+                dir.join(format!("edit-FINAL-{size}-x8.png")),
                 &big,
                 size * scale,
                 size * scale,
@@ -215,25 +235,41 @@ mod tests {
             )
             .unwrap();
         }
-        // 覆盖率抽检：四角全透明；笔杆中段（几何中心附近）不透明
+        // 抽检（定稿 B，与 184 预览逐位同源）：非全空 + 满覆盖墨迹 + 非实心方块
         let icon = edit_icon_rgba(18);
-        for corner in [0usize, 17] {
-            assert_eq!(
-                icon[(corner * 18 + corner) * 4 + 3],
-                0,
-                "corner must be empty"
-            );
-            assert_eq!(
-                icon[(corner * 18 + (17 - corner)) * 4 + 3],
-                0,
-                "corner must be empty"
-            );
-        }
-        let mid = ((9 * 18 + 9) * 4 + 3) as usize;
         assert!(
-            icon[mid] > 200,
-            "pencil shaft mid must be opaque, got {}",
-            icon[mid]
+            icon.chunks_exact(4).any(|p| p[3] >= 250),
+            "edit icon must have near-opaque ink"
+        );
+        assert!(
+            icon.chunks_exact(4).any(|p| p[3] == 0),
+            "edit icon must have empty regions (not a filled square)"
+        );
+        // 铅笔延伸到盒右上缘被裁（184 原样，不许「修正」）——右上角有墨
+        assert!(
+            icon[(0 * 18 + 17) * 4 + 3] > 0,
+            "pencil must reach top-right edge (as 184 preview)"
+        );
+        // 左上/左下/右下角透明（右上角=铅笔到达处，上面已断言有墨）
+        for (y, x) in [(0usize, 0usize), (17usize, 0usize), (17usize, 17usize)] {
+            assert_eq!(icon[(y * 18 + x) * 4 + 3], 0, "corner must be empty");
+        }
+        // 笔杆满覆盖像素 (12,6)
+        assert_eq!(
+            icon[(6 * 18 + 12) * 4 + 3],
+            252,
+            "pencil shaft must be full coverage"
+        );
+        // 两条文本线存在（行 5 / 行 9 满覆盖）
+        assert_eq!(
+            icon[(5 * 18 + 5) * 4 + 3],
+            252,
+            "text line 1 must be present"
+        );
+        assert_eq!(
+            icon[(9 * 18 + 3) * 4 + 3],
+            252,
+            "text line 2 must be present"
         );
     }
 
@@ -264,15 +300,19 @@ mod tests {
         assert_eq!(pm[0], 0);
         assert_eq!(pm[1], 0);
         assert_eq!(pm[2], 0);
-        // 笔杆中段满覆盖像素：alpha 直通预乘（rasterize 满覆盖 = 252 非 255，
-        // 见 rasterize 的 alpha 公式 —— 与齿轮/电源同一既定行为）
-        let mid = (9 * 18 + 9) * 4;
+        // 满覆盖像素：alpha 直通预乘（前提源无关：源中必须存在满覆盖像素，
+        // 且其 alpha 在两条转换输出中原样）
+        let full = src
+            .chunks_exact(4)
+            .position(|p| p[3] >= 250)
+            .expect("edit icon must have near-opaque ink")
+            * 4; // 像素索引 → 字节偏移
+        assert_eq!(bgra[full + 3], src[full + 3], "alpha passthrough (bgra)");
         assert_eq!(
-            src[mid + 3],
-            252,
-            "test premise: shaft mid full-coverage alpha"
+            pm[full + 3],
+            src[full + 3],
+            "alpha passthrough (premultiplied)"
         );
-        assert_eq!(pm[mid + 3], 252, "alpha must pass through premultiply");
     }
 
     /// TRAY-ICON-158 视觉自证：16/24/32 三档 x 2 图标 = 6 张 PNG + 各一张 8x

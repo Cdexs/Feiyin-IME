@@ -295,3 +295,49 @@
 - **两条活产出路径都已覆盖**：D2D `draw_editing_overlay`（main.rs:4827 内 `edit_icon_and_left_separator`）+ GDI 兜底（:2903 调用 `draw_edit_icon_and_separator_gdi`）；`:3853 draw_editing_overlay_chrome` 是死代码未触碰。像素=175 验收的光栅化源（D2D 预乘 BGRA / GDI 直通 BGRA），无第二几何源。
 - **验证**：fmt 幂等/check 0 error/warnings 111-102 持平/test 1112P-0F（+1 转换单测）；ESC-174 `@@ -948` hunk 零触碰。
 - **待出包端测清单**：见 result.md 第七节（图标位置/大小/颜色、分割线、版式一致性、编辑态闪烁未回归、其余四态无变化）。
+
+## 2026-09-07 — coder-2 — EDITICON-179 ✅ 换图标「笔在纸上书写」交付（只写 menu_icons.rs，待主控验收→Gavin 目视）
+
+- **交付**：v2 构图（纸=左上轮廓+2文本线；笔=右下实心斜杆尖压纸面），`edit_icon_*` 三函数签名不变，main.rs 零改动自动换像素，无需再集成单。预览 6 张已重 dump 到 coder-2/icons/。
+- **🔴 阻塞通报**：全量 cargo test 被 coder-1 在途未跟踪文件 `src/bin/esc178_focus_probe.rs` 编译错误阻塞（E0308/E0277，非我改动未触碰）；scoped 验证全绿（1112P+36P+51P）。probe 修复前主控出包前的全量回归会挂。
+- **验证**：fmt 幂等/feiyin-ime 111-102 warnings 持平/main.rs 零字节。
+
+## 2026-09-07 — coder-1 — ESC-178 ✅ 日志链 + 轮询旁路双保险（阶段一：main.rs 43+/1-，1112P/0F、warnings 111/102 基线恢复，待主控验收）
+
+- **假设判定**：H2/H3/H4/H5 证伪（Enter 提交生产可用 + 消费臂被「点停止取消」实证 + 无 IsDialogMessage）；**H1 系统路由层未定**（工装实证后台进程 SendInput 无法模拟生产前台路由，SetForegroundWindow 失败四键全被终端收走——工装已删，教训存档）。
+- **交付①日志链三处**（debug 级永久代码）：子类入口记 ESC/Enter wparam / ESC 分支记守卫与事件发出 / 消费臂记收到与收口执行。下一包按一次 ESC 三段定位。
+- **交付②轮询旁路**（主控批准）：StreamingEditing 重绘臂加 FocusLost 同款 GetAsyncKeyState(ESC) 0x0001 检查 → 发 CancelRequested 走既有收口（174 已证不卡窗）→ request=None 防 重发。**零重绘约束达成**：不触碰 dirty/InvalidateRect，命中后唯一重绘=Hide（预期内）。已知取舍：编辑态下他窗按 ESC 也取消（Gavin 已接受）。
+- **验证**：fmt 0 / 0 error / 1112P/0F / warnings 111/102 恢复；menu_icons.rs 在途改动为 coder-2 EDITICON-179。
+- **红线**：未 commit/版本未动/未出包/零凭证/工装已删（esc178_focus_probe.rs 曾短暂阻塞 coder-2 cargo test，已删）。
+
+## 2026-09-07 — coder-2 — EDITICON-180 ✅ v3 微调交付（笔尖楔形+单文本线，待主控目视→转 Gavin）
+
+- **改动**：只写 menu_icons.rs +55/-38。笔尖 S_TIP 0.32 连续楔形（无缺口）、杆 0.17S、文本线单条；三函数签名不变，main.rs 两条路径自动吃新像素。
+- **验证**：fmt 幂等/warnings 111-102 持平/全量 cargo test 1112P-0F（probe 已删恢复全量）。预览 6 张已重 dump coder-2/icons/（只证形态）。三条验收标准自评全过，详见 result.md。
+
+## 2026-09-07 — coder-1 — EDITFONT-183 ✅ 编辑框字号调大一号（阶段一：main.rs 增量 ~21+/4-，1112P/0F、warnings 111/102 持平，待主控验收）
+
+- **实施**：新增 OVERLAY_EDIT_FONT_SIZE=-16，作用三处：EDIT 字体创建、tmHeight 测量字体（测渲一致）、守卫日志。自绘文字各态 -14 逐位不变。
+- **测量一致性**：adjust_overlay_pos_size_for_text 按状态选测量字号（StreamingEditing=-16，RecordingWithText=-14）——否则编辑态自动宽度低估 14%，滚动更频繁。
+- **六问全答**：①36px 装得下（desired 23 ≤ available 28，不裁字、守卫不触发、无需改窗高）；②垂直居中经 compute_edit_box_geometry 按 tm_height 自动适配；③图标盒/分割线 x 坐标不受影响，垂直无打架；④测量两处已分派；⑤护栏测试全绿；⑥FIX-172-B 包裹未触碰。
+- **已知取舍（Gavin 知情）**：进出编辑态文字 14→16 跳变；若不要跳变两常量合一一行改回。
+- **验证**：fmt 0 / 0 error / 1112P/0F / warnings 111/102；menu_icons.rs 在途为 coder-2。
+- **红线**：未 commit/版本未动/未出包/零凭证；未碰 src/ui/。
+
+## 2026-09-07 — coder-2 — EDITICON-182 ✅ 编辑图标改字体渲染交付（Segoe MDL2 E70F + 几何兜底，待主控验收→端测）
+
+- **交付**：`render_icon_glyph`（GDI 灰度 AA → RGBA，cfg windows 隔离）+ `edit_icon_rgba` 字体优先/几何兜底（三函数签名不变，main.rs 零改动）；v3 几何保留为 fallback；预览 edit-{E70F,E104,E932,E8E5,E70B,E943,fallback}-{18,16}+x8 在 coder-2/icons/。
+- **结论**：E70F（Edit 铅笔轮廓式）推荐为默认，hinting 锐利显著优于手工几何；E8E5/E70B/E943 语义不符建议剔除；E104 与 E70F 渲染相同；E932（框+笔）备选。
+- **验证**：fmt0/warnings 111-102 持平/全量 cargo test 1112P-0F 连续两轮（另有 asr_074/asr_056 两异域偶发各一次复跑即过，已记录非本单缺陷）；main.rs 零字节；MACOS-HANDOFF 已同步。
+
+## 2026-09-07 — coder-2 — EDITICON-184 ✅ 字体路线已撤净 + 三候选交付（A=生产实现，待主控目视→Gavin 挑选）
+
+- **移除自证**：grep 零字体残留（CreateFontW/GetTextFace/GetGlyphIndices/TextOutW/render_icon_glyph 全 0）；Edit 逐处删，coder-1 在途 main.rs 零触碰。
+- **三候选**：A 铅笔+下划线（生产实现，距分割线 7px 无粘连）、B 铅笔+双短线、C 陡笔+光标、v3 对照；预览 16 张 edit-{A,B,C,v3}-{18,16}+x8（旧字体预览已清理）。
+- **验证**：fmt0/warnings 111-102 持平/全量 test 1112P-0F。推荐 A（四条自评全过，B/C 弱点如实报 result.md）。
+
+## 2026-09-07 — coder-2 — EDITICON-185 ✅ 定稿交付：生产=B 候选（铅笔+双短文本线，逐位=184 预览）
+
+- **生产实现**：`edit_icon_covered` = B 几何（铅笔 0.08/0.22/0.31 原稿 + 双文本线），main.rs 两条路径自动吃到新像素，免集成单。
+- **笔尖加固**：B1/B2/B3 三组网格证伪 → 维持 184 原稿（如实报告）。
+- **验证**：fmt0/warnings 111-102 持平/全量 test 1112P-0F；零字体依赖 grep=0；预览 edit-FINAL-{18,16}+x8 交付，旧候选已清理；main.rs 零字节。可与 ESC/编辑框字号一并出包端测。

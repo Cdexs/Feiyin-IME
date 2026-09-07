@@ -769,7 +769,9 @@ fn create_edit_control(hwnd: HWND, state: &mut OverlayWindowState, rect: &RECT, 
     let mut tm = TEXTMETRICW::default();
     let (edit_top, edit_h) = unsafe {
         let hdc = GetDC(hwnd);
-        let font = create_clear_type_font(OVERLAY_FONT_SIZE);
+        // EDITFONT-183: 测量字体必须与 EDIT 实际字体一致（:860 同步换 EDITFONT 常量），
+        // 否则 tmHeight 按 14px 量、控件按 16px 渲染 ⇒ 高度与垂直居中都错。
+        let font = create_clear_type_font(OVERLAY_EDIT_FONT_SIZE);
         let old_font = SelectObject(hdc, font);
         let got = GetTextMetricsW(hdc, &mut tm);
         let _ = SelectObject(hdc, old_font);
@@ -796,7 +798,7 @@ fn create_edit_control(hwnd: HWND, state: &mut OverlayWindowState, rect: &RECT, 
         if desired > available {
             log::error!(
                 "OVERLAY-054-G: font {} requires edit height {} but window {} only leaves {} content pixels; stopping before raising window height",
-                OVERLAY_FONT_SIZE,
+                OVERLAY_EDIT_FONT_SIZE,
                 desired,
                 rect_h,
                 available
@@ -857,7 +859,7 @@ fn create_edit_control(hwnd: HWND, state: &mut OverlayWindowState, rect: &RECT, 
             // unified overlay font size as the self-drawn text. We use an independent HFONT
             // (not cached_font) because cached_font is take()+DeleteObject() when the
             // overlay hides/destroys.
-            let edit_font = create_clear_type_font(OVERLAY_FONT_SIZE);
+            let edit_font = create_clear_type_font(OVERLAY_EDIT_FONT_SIZE);
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
                     edit_hwnd,
@@ -948,6 +950,14 @@ unsafe extern "system" fn edit_subclass_wnd_proc(
         return LRESULT(0);
     }
     if msg == windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN {
+        // ESC-178: 永久日志链 ①——子类入口。ESC/Enter 只在编辑态可能出现高频，
+        // 只记这两键，不刷屏。定位「键到底进没进子类」（H1 判别点）。
+        if wparam.0 == VK_ESCAPE.0 as usize || wparam.0 == VK_RETURN.0 as usize {
+            log::debug!(
+                "ESC-178: EDIT subclass received WM_KEYDOWN wparam={:#x}",
+                wparam.0
+            );
+        }
         // ESC-174: 编辑态 ESC = 取消编辑 + 作废本次录入。发 CancelRequested 走既有
         // 取消收口（controller 臂：cancel/stop 双信号 + OVERLAY_EDITING=false +
         // STREAMING_STOPPED=true + Hide + 托盘回 Idle），复用现有通道零新增路径。
@@ -960,20 +970,30 @@ unsafe extern "system" fn edit_subclass_wnd_proc(
         // 回退 = 删除本分支。
         if wparam.0 == VK_ESCAPE.0 as usize {
             // 与 Enter 分支同一取父通道：EDIT 的 GWLP_USERDATA 存的是父 overlay HWND
+            // ESC-178: 永久日志链 ②——分支执行 + 守卫取值 + 事件发出（H3/H4 判别点）。
             let parent_hwnd = {
                 let parent = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
                 HWND(parent as _)
             };
+            log::debug!(
+                "ESC-178: subclass ESC branch, parent_hwnd_null={}",
+                parent_hwnd.0.is_null()
+            );
             if !parent_hwnd.0.is_null() {
                 let data_ptr =
                     GetWindowLongPtrW(parent_hwnd, GWLP_USERDATA) as *mut OverlayWindowData;
                 if !data_ptr.is_null() {
                     let data = &mut *data_ptr;
                     if let Ok(state) = data.state.lock() {
-                        if state.request.is_some() {
+                        let has_request = state.request.is_some();
+                        log::debug!("ESC-178: subclass ESC branch, request.is_some={has_request}");
+                        if has_request {
                             let _ = state.event_tx.send(OverlayUiEvent::CancelRequested);
+                            log::debug!("ESC-178: CancelRequested sent from subclass");
                         }
                     }
+                } else {
+                    log::debug!("ESC-178: subclass ESC branch, parent data_ptr null");
                 }
             }
             return LRESULT(0);
@@ -1373,6 +1393,13 @@ const OVERLAY_BORDER_GRAY: COLORREF = COLORREF(0x3A3A3C);
 // control. Gavin decided the edit-mode and non-edit text must look the same size.
 #[cfg(target_os = "windows")]
 const OVERLAY_FONT_SIZE: i32 = -14;
+// EDITFONT-183: 编辑框字号调大一号（Gavin 原话），独立于自绘文字的 OVERLAY_FONT_SIZE。
+// 取值 -16（14→16px，主控裁定）：Segoe UI em 16 ⇒ tmHeight ≈ 21，compute_edit_box_geometry
+// 的 available = 36-2*4 = 28 ⇒ desired(≈23) ≤ available，36px 窗高装得下不裁字。
+// 已知取舍（Gavin 知情）：进出编辑态文字 14→16 视觉跳变；若 Gavin 不要跳变，两处
+// 常量合一即可（改回一行）。自绘文字各态保持 -14 逐位不变。
+#[cfg(target_os = "windows")]
+const OVERLAY_EDIT_FONT_SIZE: i32 = -16;
 // OVERLAY-054-C: file-level button border color. Kept at 0x707070 (value unchanged).
 // Tests can now reference this constant instead of mirroring the literal.
 #[cfg(target_os = "windows")]
@@ -2061,6 +2088,25 @@ fn run_overlay_thread(
                         state.needs_repaint = false;
                     }
                     OverlayStatus::StreamingEditing { .. } => {
+                        // ESC-178: ESC 轮询旁路 —— WM_KEYDOWN 路由层机制未定（工装实证
+                        // SetForegroundWindow 后台进程失败，无法模拟生产前台路由），改用
+                        // FocusLost 态同款 GetAsyncKeyState 轮询（:2126 范式，读物理键态、
+                        // 与坏掉的消息路由零交集）。命中即发 CancelRequested 走既有收口
+                        // 臂（ESC-174 已证双顺序安全）。🔴 零重绘约束：本检查放在 dirty
+                        // 判定之前、不触碰 needs_repaint/InvalidateRect；命中后的唯一
+                        // 重绘是 Hide 本身（预期内）。0x0001 转变位全仓唯一读者
+                        // （FocusLost 与编辑态互斥；控制器 :6518 用 0x8000 不消费位）。
+                        // 已知取舍：编辑态下其他窗口按 ESC 也会取消（浮层在交互焦点上，
+                        // Gavin 已知情接受）。回退 = 删除本检查块。
+                        let esc = unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) };
+                        if (esc as u16) & 0x0001 != 0 {
+                            log::debug!(
+                                "ESC-178: streaming-editing ESC poll fired, sending CancelRequested"
+                            );
+                            let _ = state.event_tx.send(OverlayUiEvent::CancelRequested);
+                            // 与 FocusLost 同款防重发：清请求，等 controller 的 Hide 接管
+                            state.request = None;
+                        }
                         // OVERLAY-043: only repaint when text/status/size actually changed
                         let dirty = state.needs_repaint;
                         if dirty && !MENU_VISIBLE.load(Ordering::Acquire) {
@@ -6097,6 +6143,14 @@ fn adjust_overlay_pos_size_for_text(
     current_pos: &[i32; 2],
     current_size: &[i32; 2],
 ) -> ([i32; 2], [i32; 2]) {
+    // EDITFONT-183: 测量字号按状态选择 —— StreamingEditing 的文字由 EDIT 控件以
+    // OVERLAY_EDIT_FONT_SIZE(16px) 渲染，测量必须跟随；RecordingWithText 由 GDI/D2D
+    // 自绘仍是 OVERLAY_FONT_SIZE(14px)。若编辑态仍按 14px 量宽，自动宽度低估 ~14%
+    // ⇒ 文字更早溢出 ⇒ ES_AUTOHSCROLL 滚动更频繁（FIX-172-B 依赖测渲一致）。
+    let font_size = match status {
+        OverlayStatus::StreamingEditing { .. } => OVERLAY_EDIT_FONT_SIZE,
+        _ => OVERLAY_FONT_SIZE,
+    };
     let text = match status {
         OverlayStatus::RecordingWithText { text } => text.as_str(),
         OverlayStatus::StreamingEditing { text } => text.as_str(),
@@ -6113,7 +6167,7 @@ fn adjust_overlay_pos_size_for_text(
         let hdc = GetDC(hwnd);
         // OVERLAY-054-G: one unified overlay font size for both self-drawn text and the
         // EDIT control, so measuring font always matches the drawing font.
-        let font = create_clear_type_font(OVERLAY_FONT_SIZE);
+        let font = create_clear_type_font(font_size);
         let old_font = SelectObject(hdc, font);
         let text_w = measure_text_width(hdc, text);
         let _ = SelectObject(hdc, old_font);
@@ -6701,6 +6755,11 @@ fn process_controller_events(
         let ui_language = clone_runtime_config(runtime_config).ui_language;
         match event {
             OverlayUiEvent::CancelRequested => {
+                // ESC-178: 永久日志链 ③——消费端收到 + 收口执行（H4 判别点）。
+                log::debug!(
+                    "ESC-178: controller consumed CancelRequested, editing was {}, hiding",
+                    OVERLAY_EDITING.load(Ordering::Acquire)
+                );
                 cancel_signal.store(true, Ordering::Relaxed);
                 stop_recording_signal.store(true, Ordering::Relaxed);
                 OVERLAY_EDITING.store(false, Ordering::Release);

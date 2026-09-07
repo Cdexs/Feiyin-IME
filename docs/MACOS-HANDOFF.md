@@ -1674,3 +1674,19 @@ Windows 侧为流式窗（RecordingWithText/RecordingStreamingIdle）的麦克�
 | Part A D1 预热 / D2 有界等待 | ✅ **两端同效**：`spawn_worker_thread` 已平台中立（MACOS-P4-NEUTRAL-002 去 cfg），重载判定/spawn/结果应用收口函数均在平台中立层；macOS 控制器（run_controller_macos → logic 线程发 WorkerCommand::Start）走同一 worker loop，预热 tick 与 D2 等待自动生效。行为与 Windows 一致：切模型 ≤500ms 后台预热、Start 前最多等 1500ms、失败签名防风暴 |
 | Part B 声波弧（阈值/地板） | ⛔ **不涉及**：`mic_pulse_*` 全族 `#[cfg(target_os = "windows")]`；macOS overlay 绘制走 `src/platform/macos/overlay.rs`，本就没有声波弧。若未来 macOS 要对齐动效，参数常量在本文件同名位置可复用 |
 | Part C 菜单图标日志 | ⛔ **不涉及**：`attach_menu_icons`/`create_menu_item_bitmap` 均 `cfg(windows)`；macOS 菜单图标走 `NSMenuItem::setImage`（TRAY-ICON-158 已对称实现），该路径零改动、无需加日志 |
+
+## EDITICON-182（2026-09-07，coder-2）—— macOS 侧影响逐条结论
+
+编辑图标改为系统图标字体渲染（Segoe MDL2 `E70F` Edit，GDI 灰度 AA → RGBA，
+覆盖率当 alpha + 品牌橙），**v3 手工几何保留为字体不可用时的兜底**（永不空图标）。
+
+| 项 | macOS 结论 |
+| --- | --- |
+| `edit_icon_rgba` / `edit_icon_bgra` / `edit_icon_premultiplied_bgra` | 函数签名不变；实现内 `font_edit_icon_rgba`/`render_icon_glyph` 全部 `#[cfg(target_os = "windows")]`，**macOS 编译零影响**（字体路径不参与编译） |
+| macOS 实际行为 | `edit_icon_rgba` 在 macOS 走几何兜底（`rasterize(size, edit_icon_covered)`，即 v3「纸+笔」构图）；**macOS 无编辑态 UI**（无流式编辑窗），该函数当前在 macOS 无调用点，行为无观感影响 |
+| `settings_icon_rgba` / `exit_icon_rgba` | 零触碰（仍是跨平台纯几何） |
+| 🔴 待办（macOS 侧将来若要同款编辑图标） | 两条路：① 复用几何兜底（现成，观感见 `collab/outbox/coder-2/icons/edit-fallback-18-x8.png`）；② 字形渲染需 macOS 侧等价实现（CoreText + `CTFontGetGlyphsIndicies`/`CGPath` 填充， Segoe 字体 macOS 无自带，需评估替代字体如 SF Symbols——语义对照 MDL2 E70F）。建议优先 ① |
+
+> 🔴 **上节（EDITICON-182 字体路线）已被 EDITICON-184 撤销**（Gavin 拍板：环境无关性优先，
+> 字体渲染不采用）——menu_icons.rs 字体代码已全部移除，macOS 侧无需参考该节方法论；
+> 编辑图标回到纯几何（三候选预览见 `collab/outbox/coder-2/icons/edit-{A,B,C,v3}-*.png`）。

@@ -723,3 +723,5 @@ load_wordbook_vocabulary()
 - 2026-09-07 FLICKER-170（coder-1，交付待验收）：A+B' 双修落地（父窗 WS_CLIPCHILDREN + EDIT WM_PAINT 单次合成）；选区不渲染风险 Gavin 拍板接受并实证（0px diff）；1110P/0F、warnings 111/102 持平。
 - 2026-09-07 FIX-172（coder-1，交付待验收）：声波弧 .max() 回归修复（抬高振幅方案）+ 编辑态最右侧闪烁根治（工装实证滚动绕过 WM_PAINT → SETREDRAW 包裹单次合成）；1110P/0F、warnings 111/102 持平。
 - 2026-09-07 ESC-174（coder-1，交付待验收）：编辑态 ESC=取消编辑+作废录入（复用 CancelRequested 收口臂，压制链双顺序安全）；30+/0-；1111P/0F。
+- 2026-09-07 ESC-178（coder-1，交付待验收）：ESC 不响应=机制未定（H1 路由层）+ 永久日志链三处 + FocusLost 同款轮询旁路（零重绘约束达成）；1112P/0F、warnings 111/102。
+- 2026-09-07 EDITFONT-183（coder-1，交付待验收）：编辑框字号 14→16px（独立常量+测渲一致+36px 装得下论证）；1112P/0F、warnings 111/102。
