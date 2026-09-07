@@ -107,3 +107,12 @@
 - **明确不做**（主控裁定）：stroke 同心化/Hide 双压制/编辑态 ESC/E1·E2/ui/**。
 - **macOS**：四件事全 Windows 专属，MACOS-HANDOFF.md 已同步三段。
 - **红线**：只改 src/main.rs（+230/-14）；未 commit/版本未动/未出包/零凭证/无临时文件。
+
+## 2026-09-07 — coder-1 — OVERLAY-155 ✅ 圆角三次修法（GDI chrome 收进 D2D 失败分支 + LG 半径 16→10，1109P/0F=基线，交付即出包，待 Gavin 端测）
+
+- **差异 A 结论（成立+精确收窄）**：全库逐位排查「GDI chrome 先于 D2D 无条件执行」——唯一肇事点 = `draw_recording_overlay` 波形分支（show_placeholder=false 每帧先画无 AA 的 GDI RoundRect，D2D waveform 在后）：1px 灰描边 + D2D AA 描边错位 ~0.5px 叠画 → 角区灰线粗乱；这些像素全在 SDF cov>0 区，fixup 清不掉 ⇒ 121/141/153 三轮改 fixup 改错地方。**其余七处（placeholder 分支/with_text/FallingToProcessing/Processing/Editing/FocusLost/Error/Info）本来就是 Info 同构，零改动。**
+- **改动 1**：chrome 移进 `show_placeholder` 分支（D2D idle 失败兜底）；波形分支 D2D 在先、成功即 return、失败才 chrome。D2D 失败兜底契约完整（失败路径与改前逐位相同；`if !d2d::draw_` 形态护栏绿）。
+- **如实声明（防 PLAUSIBLE-FIX）**：Idle（无叠画）与 Processing（无叠画）端测也报坏，差异 A 解释不了这两态——DIAG §A2 给 Gavin 的「Idle 是否单独看过」确认问题仍未答；**改动 2（LG 16→10）是覆盖全部 r=16 组的共同修复**，两改动互补。
+- **改动 2**：`OVERLAY_FRAME_RADIUS_LG: 16.0 → 10.0`（单一来源一行全生效；LG/SM 保留未合并，Gavin 想要回 16 改回字面量即可）。
+- **验证**：fmt 0（幂等）/check --all-targets 0 error/warnings 111/102 基线持平/**cargo test 1109P/0F（=主控基线）护栏零变红，未改任何 needle**。
+- **红线**：apply_alpha_fixup 零字节未动；E3/E4 探针照留；只改 src/main.rs（+16/-5 两 hunk）；未 commit/版本未动/未出包/零凭证/无临时文件；MACOS-HANDOFF 已同步。

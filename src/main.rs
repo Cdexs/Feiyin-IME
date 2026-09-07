@@ -1122,7 +1122,10 @@ const OVERLAY_BTN_BORDER: COLORREF = COLORREF(0x707070);
 // 掩码与绘制不一致切出新锯齿。内部元素（麦克风药丸 3.5、停止/提交键 5/4、
 // 底部按钮 4、标题 ✕ 键 3）半径不在此列，仍为各自字面量。
 #[cfg(target_os = "windows")]
-const OVERLAY_FRAME_RADIUS_LG: f32 = 16.0;
+// OVERLAY-155 (改动2): 16.0 → 10.0 —— 对齐 Info/Error/FocusLost 的半径几何（Gavin
+// 明确指向「照『请说话哦』那个提示窗口做」，r=10 组视觉已被接受）。单一来源，改一行
+// 全部生效；不删 LG/SM 常量 —— Gavin 若想要回 16，改回本字面量即可（可逆性）。
+const OVERLAY_FRAME_RADIUS_LG: f32 = 10.0;
 #[cfg(target_os = "windows")]
 const OVERLAY_FRAME_RADIUS_SM: f32 = 10.0;
 
@@ -3004,22 +3007,30 @@ fn draw_recording_overlay(
     if show_placeholder && d2d::draw_streaming_idle_overlay(hdc, rect, state, ui_language) {
         return draw_stop_button_hit_rect_only(rect);
     }
-    // OVERLAY-121 (P3): Recording 系 GDI fallback r=16（Gavin 拍板；D2D 失败帧仍是
+    // OVERLAY-149 (P3): Recording 系 GDI fallback r=16（Gavin 拍板；D2D 失败帧仍是
     // 方角填充 —— GDI 无 AA，方角是 fallback 的既定降级，见 result.md）。
     // OVERLAY-141: 半径单一来源。
-    draw_overlay_chrome(hdc, rect, OVERLAY_FRAME_RADIUS_LG as i32);
-    // OVERLAY-051-E: online streaming ASR waiting for first text shows placeholder,
-    // not waveform. Local model continues to show waveform unchanged.
+    // OVERLAY-155 (改动1): 🔴 GDI chrome 收进 D2D 失败分支（与 Info/Error 同构）。
+    // 旧行为：此行无条件先画，波形分支（show_placeholder=false）在 D2D 尝试之前
+    // 就落下 GDI RoundRect —— 无 AA 硬台阶 + 1px 灰描边与 D2D 的 AA 描边错位
+    // ~0.5px 叠画，角区灰线粗乱（Gavin 三轮端测的圆角病灶，DIAG 差异 A）。
+    // 收进失败分支后：D2D 成功即 return，GDI 只在 D2D 失败时兜底（DEC-055 契约），
+    // Info/Error 的干净结构与此同构。
     if show_placeholder {
+        draw_overlay_chrome(hdc, rect, OVERLAY_FRAME_RADIUS_LG as i32);
+        // OVERLAY-051-E: online streaming ASR waiting for first text shows placeholder,
+        // not waveform. Local model continues to show waveform unchanged.
         draw_recording_indicator(hdc, rect, state);
         draw_listening_placeholder(hdc, rect, ui_language);
     } else {
         // D2D-P2 (PLAN-108 H6): 波形变体迁 D2D。On any D2D failure the GDI path
         // below still renders this frame, so the overlay never blanks. 命中 rect
         // 由 P1 既有 helper 出（与 d2d::stop_button 同公式，几何单一源）。
+        // 🔴 OVERLAY-155: D2D 在先 —— 成功即 return（不再被先行的 GDI chrome 污染）。
         if d2d::draw_recording_waveform_overlay(hdc, rect, state) {
             return draw_stop_button_hit_rect_only(rect);
         }
+        // D2D 失败才走 GDI 兜底（chrome 在此，不在 D2D 之前）。
         // OVERLAY-141: 半径单一来源。
         draw_overlay_chrome(hdc, rect, OVERLAY_FRAME_RADIUS_LG as i32);
         draw_recording_indicator_and_waveform(hdc, rect, state);

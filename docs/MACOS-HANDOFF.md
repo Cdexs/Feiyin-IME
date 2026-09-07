@@ -1633,3 +1633,7 @@ Windows 侧唯一改动：`apply_alpha_fixup` 的 a>0 分支从「反预乘+强�
 「四通道等比 ×(cov·op)」（保留 D2D 原 alpha，描边 AA 不再被强制拉满）。全部位于
 `#[cfg(target_os = "windows")]`，macOS 编译零影响，不适用（macOS 无 ULW/BindDC 通路，
 NSWindow 层 AA 由系统合成器天然保真，无等价缺陷形态）。
+
+## OVERLAY-155（2026-09-07）
+
+- 圆角三次修法（GDI chrome 收进 D2D 失败分支 + LG 半径 16→10）：**macOS 不适用** —— GDI/D2D 叠画结构、RoundRect 硬台阶、OVERLAY_FRAME_RADIUS_LG/SM 常量全部是 Windows overlay 管线专属；macOS NSWindow 的 AA 圆角由 layer cornerRadius 天然提供（见 OVERLAY-141 节），无「GDI 先画+D2D 盖画」结构可对位。半径视觉口径若将来在 macOS 侧实现 overlay，直接对齐 LG=10 的新语义即可。

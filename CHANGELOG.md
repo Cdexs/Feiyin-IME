@@ -806,3 +806,5 @@ INVESTIGATE-142 | 编辑态移光标仍闪二次取证（只查不修）：编�
 TEST-SYNC-143 | 阶段三 OVERLAY-141 护栏：G6 换血为 SDF alpha 四断言（含🔴反向钉死旧提亮规则禁复活）+ G8/G9 半径单一来源护栏（映射赋值恰1/调用实参绑 frame_radius/三类绘制调用实参引用常量+总数13+折行收集），测试区 +146/-15 生产区 0 字节；fmt 0 + check --all-targets 0 error + warnings 111/102 基线持平；沙箱预演 3 PASS + 消融 10 变异全验红（含塞回旧规则⇒红）+豁免不误伤；cargo test 未跑（白名单） | coder-1 | 2026-09-07
 
 OVERLAY-149 | F1 caret 泄漏修复（destroy_edit_control 销毁前移焦点+HideCaret+DestroyCaret，待端测判定）+ F2 热键停止臂 OVERLAY_EDITING 守卫（Stop 臂无条件 store(false)，防 Processing 永久卡屏，事件序列含 Case-A/B/C）+ E3 角区像素 dump 探针（fixup 前/后四角 8×8+左缘列 BGRA，节流=每状态前 3 帧）+ E4 DPI 比对（GetDeviceCaps 替代 GetDpiForWindow 因 Cargo feature 红线，已报备）；src/main.rs +230/-14；fmt/check 0 + warnings 111/102 持平 + cargo test 1107P/0F 零预期红 | coder-1 | 2026-09-07
+
+OVERLAY-155 | 圆角三次修法（Gavin 指示照『请说话哦』窗）：改动1=GDI chrome 收进 D2D 失败分支（唯一肇事点=draw_recording_overlay 波形分支无条件先画，与 Info 同构化；全库七处排查其余本来就对）+ 改动2=OVERLAY_FRAME_RADIUS_LG 16→10（对齐 Info 几何，LG/SM 保留可逆）；差异 A 对 Idle/Processing 坏态解释不了的部分如实声明（无叠画路径，半径对齐为共同修复）；src/main.rs +16/-5；fmt/check 0 + warnings 111/102 持平 + cargo test 1109P/0F=基线；apply_alpha_fixup 零字节未动 | coder-1 | 2026-09-07
