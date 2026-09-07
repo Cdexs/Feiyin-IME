@@ -24,7 +24,7 @@
 | ② | **`INVESTIGATE-142`** 编辑态移光标仍闪 二次取证（**只查不修**，产出 draft 文档） | coder-1 | `collab/drafts/` 唯一可写 | 无（与 ① 写文件零重叠） | ✅ 已交付待验收（drafts/overlay-142-editing-flicker.md，src 零改动） |
 | ③ | `TEST-SYNC-143` 阶段三：141 护栏 G2/G3/G6 换血 + SDF 新护栏 | coder-1（非作者） | `src/main.rs` 测试区 | ① 验收通过 | ⏳ |
 | ④ | `TEST-EXEC-144` 阶段四：全量回归 + 新护栏消融 | tester-1 | 无（只跑） | ③ 完成 | ⏳ |
-| ⑤ | `BUILD-145` 阶段五：出包 → Gavin 端测 | tester-1 | — | ④ 通过 | ⏳ |
+| ⑤ | `BUILD-145` 阶段五：出包 → Gavin 端测 | tester-1 | — | ④ 通过 | ✅ 已交付（七项核验全 PASS，产物在 Publish/，待主控验收/Gavin 端测） |
 
 ### 🔴 本轮 Worker 占用（文件级零重叠，已核）
 

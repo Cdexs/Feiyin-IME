@@ -11493,8 +11493,10 @@ mod flicker_130_guard_tests {
 //   G3 fixup 单点 + 紧邻 ULW（防 alpha 烘焙被绕过）
 //   G4 SLWA 条件化（防 ULW 窗口被切回均一 alpha = 必闪）
 //   G5 模式切换在隐藏区间（防 redirection 表面重建闪烁可见）
-//   G6 fixup 三分支完整（防 GDI fallback 帧整体消失）
+//   G6 SDF alpha 不变量四条（几何 alpha / 轮廓外全零 / 反预乘 / 🔴旧提亮规则禁活）
 //   G7 DIB 32bpp + 负高（防 BindDC 1:1 映射破坏 = 上下翻转）
+//   G8 掩码半径单一来源（overlay_frame_radius 映射恰 1 + 调用实参绑 frame_radius）
+//   G9 外框绘制半径单一来源（三类绘制调用实参必须引用 OVERLAY_FRAME_RADIUS_）
 #[cfg(all(test, target_os = "windows"))]
 mod overlay_121_guard_tests {
     /// 读取 src/main.rs 生产区（首个 #[cfg(test)] 之前）。
@@ -11556,6 +11558,15 @@ mod overlay_121_guard_tests {
     fn block_line_of(lines: &[String], anchor: usize, needle: &str) -> Option<usize> {
         block_bounds(lines, anchor)
             .and_then(|(lo, hi)| (lo..=hi).find(|&i| norm_line(&lines[i]).starts_with(needle)))
+    }
+
+    /// 块内任意位置子串命中（不依赖行首形态）。G6④ 反向断言专用：
+    /// 旧提亮规则若被塞回，可能不以行首出现（如嵌进更长表达式），
+    /// starts_with 版本会漏，contains 版本才钉得死。
+    fn block_contains_raw(lines: &[String], anchor: usize, needle: &str) -> bool {
+        block_bounds(lines, anchor)
+            .map(|(lo, hi)| lines[lo..=hi].iter().any(|l| norm_line(l).contains(needle)))
+            .unwrap_or(false)
     }
 
     fn count_startswith(lines: &[String], needle: &str) -> usize {
@@ -11712,26 +11723,52 @@ mod overlay_121_guard_tests {
         );
     }
 
-    /// G6: apply_alpha_fixup 三分支完整。
+    /// G6: apply_alpha_fixup SDF alpha 不变量（OVERLAY-141 换血 —— 旧「三分支完整」
+    /// 命题随按色三分支整体退役而失效，改守新实现的真实不变量，四条）：
+    ///   ① alpha 由几何决定：函数体内含 SDF 覆盖率计算
+    ///      `let cov = (0.5 - d).clamp(0.0, 1.0);`
+    ///   ② 轮廓外真透明：`if cov <= 0.0 {` 块内四通道全零
+    ///   ③ 反预乘还原：`if a > 0 {`（D2D 预乘像素还原原色，不被二次预乘压暗）
+    ///   ④ 🔴 反向断言：函数体内不得再出现旧「提亮」规则
+    ///      `if a == 0 && (r | g | b) != 0` —— 它把 AA 半透明边缘像素压成全不透明，
+    ///      正是 OVERLAY-141「圆角灰边」事故的元凶，机器钉死防复活。
     ///
-    /// 函数体内必须共现：
-    ///   1. GDI 提亮：`if a == 0 && (r | g | b) != 0` → 不透明化 + 预乘
-    ///   2. 预乘缩放：`else if a != 0` → 四通道按 opacity 缩放
-    ///   3. 全零跳过：a==0 && RGB==0 保持不动（if-else 的隐式 else）
-    /// 守的是「GDI fallback 帧整体消失」。
-    ///
-    /// 消融：删掉 GDI 提亮分支 → 本测试红。
+    /// 消融（沙箱预演，result.md 附录 A）：①删 cov 行红 / ②改 cov<=0.0 条件红、
+    /// 删通道全零写红 / ③改 a>0 条件红 / ④塞回旧规则行红 —— 全部实测验红。
     #[test]
-    fn g6_fixup_three_branches_present() {
+    fn g6_fixup_sdf_alpha_invariants() {
         let lines = main_prod_lines();
         let anchor = find_line(&lines, concat!("fn apply_alpha_fixup", "("))
             .expect("G6 anchor: apply_alpha_fixup 函数");
-        let has_gdi_brighten =
-            block_contains(&lines, anchor, concat!("if a == 0 && (r | g | b) != 0", ""));
-        let has_premult_scale = block_contains(&lines, anchor, concat!("} else if a != 0", " {"));
         assert!(
-            has_gdi_brighten && has_premult_scale,
-            "G6: apply_alpha_fixup 必须含 GDI 提亮分支与预乘缩放分支"
+            block_contains(
+                &lines,
+                anchor,
+                concat!("let cov = (0.5 - d).clamp(0.0, 1.0)", ";")
+            ),
+            "G6①: apply_alpha_fixup 必须含 SDF 覆盖率计算（alpha 由几何决定）"
+        );
+        let cov_if = block_line_of(&lines, anchor, concat!("if cov <= 0.0", " {"))
+            .expect("G6 anchor: if cov <= 0.0 分支");
+        for chan in [
+            concat!("*p = 0", ""),
+            concat!("*p.add(1) = 0", ""),
+            concat!("*p.add(2) = 0", ""),
+            concat!("*p.add(3) = 0", ""),
+        ] {
+            assert!(
+                block_contains(&lines, cov_if, chan),
+                "G6②: if cov <= 0.0 块必须四通道全零，缺：{}",
+                chan
+            );
+        }
+        assert!(
+            block_contains(&lines, anchor, concat!("if a > 0", " {")),
+            "G6③: apply_alpha_fixup 必须含反预乘分支 if a > 0（防二次预乘压暗）"
+        );
+        assert!(
+            !block_contains_raw(&lines, anchor, concat!("a == 0 && (r | g | b)", "")),
+            "G6④: 旧提亮规则 if a == 0 && (r|g|b) != 0 已被 OVERLAY-141 根治，禁止复活（会把 AA 半透明边缘压成硬灰带 = 圆角灰边回归）"
         );
     }
 
@@ -11753,6 +11790,100 @@ mod overlay_121_guard_tests {
         assert!(
             has_32bpp && has_neg_height,
             "G7: WM_PAINT bmi 必须 biBitCount: 32 且 biHeight 为负（top-down）"
+        );
+    }
+
+    /// G8: 掩码半径单一来源（OVERLAY-141 前置要求：掩码与绘制半径必须同值）。
+    ///   ① 生产区 `frame_radius = overlay_frame_radius(` 赋值形态恰 1 处
+    ///      （needle 绑完整赋值形态：`let mut frame_radius = ...` 默认值兜底行以
+    ///      `let mut` 开头不命中，`apply_alpha_fixup(...)` 调用行也不命中 —— 不会误计）；
+    ///   ② apply_alpha_fixup 唯一调用行的半径实参必须是 frame_radius，不得就地写数。
+    ///
+    /// 消融（沙箱预演，result.md 附录 A）：①映射改裸数字 → 计数 0 红；
+    /// 新增第二份映射 → 计数 2 红；②调用实参改 16.0 → 红。全部实测验红。
+    #[test]
+    fn g8_frame_radius_single_source() {
+        let lines = main_prod_lines();
+        let mapped = count_startswith(&lines, concat!("frame_radius = overlay_frame_radius", "("));
+        assert_eq!(
+            mapped, 1,
+            "G8①: overlay_frame_radius 映射赋值必须恰 1 处，实测 {} 处",
+            mapped
+        );
+        let call_idx = lines
+            .iter()
+            .position(|l| l.starts_with(concat!("apply_alpha_fixup(ppv_bits", "")))
+            .expect("G8 anchor: apply_alpha_fixup 调用行");
+        assert!(
+            lines[call_idx].contains(concat!(", frame_radius", ")")),
+            "G8②: apply_alpha_fixup 半径实参必须是 frame_radius（单一来源），实测行：{}",
+            lines[call_idx]
+        );
+    }
+
+    /// G9: 外框绘制半径单一来源（绘制半径与掩码同源，散落字面量会切出新锯齿）。
+    /// 覆盖三类外框绘制调用：GDI `draw_overlay_chrome(`（5 处，单行）、
+    /// D2D `chrome(res`（4 处，单行）、D2D `chrome_with(`（4 处，rustfmt 折行 →
+    /// 逐调用收集实参到 `);` 收尾）。每个调用点的半径实参必须引用
+    /// `OVERLAY_FRAME_RADIUS_`；唯一豁免：fn chrome 内部委托 chrome_with 透传
+    /// 形参 `radius`（其上游全部 chrome( 调用点已被本护栏逐一覆盖，不构成旁路）。
+    ///
+    /// 🔴 只盯外框绘制调用，不扫全库 CORNER_RADIUS —— 内部元素半径
+    /// （draw_submit_button 内 `const CORNER_RADIUS`、药丸 3.5 / 停止键 5 /
+    /// 提交键 4 / 底部按钮 4 / 标题✕ 3）有意留存，扫全库必假红。
+    ///
+    /// 锚点唯一性：三个定义行均以 `fn ` 开头，不命中 starts_with needle，
+    /// 天然排除（不依赖 find_line 首锚，规避 TEST-SYNC-134 误锚形态）。
+    ///
+    /// 消融（沙箱预演）：GDI 调用改裸 16 → 红；折行 chrome_with 实参改 10.0 → 红。
+    #[test]
+    fn g9_frame_drawing_calls_single_source() {
+        let lines = main_prod_lines();
+        let prefixes = [
+            concat!("draw_overlay_chrome", "("),
+            concat!("chrome(res", ""),
+            concat!("chrome_with(", ""),
+        ];
+        let mut checked = 0usize;
+        let mut i = 0usize;
+        while i < lines.len() {
+            let l = norm_line(&lines[i]);
+            if !prefixes.iter().any(|p| l.starts_with(p)) {
+                i += 1;
+                continue;
+            }
+            // rustfmt 会把 chrome_with( 折成多行：逐调用收集实参直到收尾。
+            let mut args = String::new();
+            let mut j = i;
+            loop {
+                args.push_str(&lines[j]);
+                args.push(' ');
+                let tj = lines[j].trim();
+                if tj.ends_with(';') || tj == ");" {
+                    break;
+                }
+                j += 1;
+                assert!(
+                    j <= i + 8,
+                    "G9: L{} 起的外框调用 8 行内未见 `);` 收尾（rustfmt 折行超预期，护栏需跟进）",
+                    i + 1
+                );
+            }
+            assert!(
+                args.contains(concat!("OVERLAY_FRAME_RADIUS", "_"))
+                    || args.contains(concat!(", radius)", ""))
+                    || args.contains(concat!(", radius,", "")),
+                "G9: 外框绘制调用（L{}）半径实参必须引用 OVERLAY_FRAME_RADIUS_（或 chrome 内部透传 radius），不得裸数字：{}",
+                i + 1,
+                args
+            );
+            checked += 1;
+            i = j + 1;
+        }
+        assert_eq!(
+            checked, 13,
+            "G9: 外框绘制调用计数异常（预期 13 = draw_overlay_chrome 5 + chrome 4 + chrome_with 4），实测 {} —— 调用点集合变化时必须同步更新本护栏",
+            checked
         );
     }
 }
