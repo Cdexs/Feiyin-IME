@@ -1072,6 +1072,16 @@ const OVERLAY_FONT_SIZE: i32 = -14;
 #[cfg(target_os = "windows")]
 const OVERLAY_BTN_BORDER: COLORREF = COLORREF(0x707070);
 
+// OVERLAY-141: 窗口外框圆角半径单一来源。所有状态的外框半径（D2D chrome /
+// draw_processing_primitives 与各 GDI fallback 的 CORNER_RADIUS）一律引用这里，
+// 禁止再写字面量 —— 帧末 SDF alpha 掩码与绘制半径必须同值，散落字面量会导致
+// 掩码与绘制不一致切出新锯齿。内部元素（麦克风药丸 3.5、停止/提交键 5/4、
+// 底部按钮 4、标题 ✕ 键 3）半径不在此列，仍为各自字面量。
+#[cfg(target_os = "windows")]
+const OVERLAY_FRAME_RADIUS_LG: f32 = 16.0;
+#[cfg(target_os = "windows")]
+const OVERLAY_FRAME_RADIUS_SM: f32 = 10.0;
+
 #[cfg(target_os = "windows")]
 const RECORDING_OVERLAY_SIZE: [i32; 2] = [240, 36]; // Recording window
 #[cfg(target_os = "windows")]
@@ -2111,6 +2121,9 @@ unsafe extern "system" fn overlay_wnd_proc(
 
             // Draw to memory DC
             let mut opacity = 1.0_f32;
+            // OVERLAY-141: 外框半径与 opacity 同锁取出（单一来源 overlay_frame_radius），
+            // 帧末 SDF alpha 掩码必须与绘制半径同值。
+            let mut frame_radius = OVERLAY_FRAME_RADIUS_LG;
             if let Ok(mut state) = data.state.lock() {
                 // SHIMMER-FIX-002: time-based phase — immune to WM_PAINT frequency variation
                 let _shimmer_ms = std::time::SystemTime::now()
@@ -2120,6 +2133,7 @@ unsafe extern "system" fn overlay_wnd_proc(
                 state.shimmer_phase = (_shimmer_ms % 800) as f32 / 800.0; // SHIMMER-SPEED-002: 1200→800ms
                 if let Some(req) = state.request.as_ref() {
                     opacity = req.opacity.clamp(0.1, 1.0);
+                    frame_radius = overlay_frame_radius(&req.status);
                 }
                 let (cancel_rect, close_rect, title_close_rect, submit_rect, text_hit_rect) =
                     draw_overlay_to_dc(hwnd, mem_dc, &rect, &mut state);
@@ -2136,7 +2150,7 @@ unsafe extern "system" fn overlay_wnd_proc(
                 if use_ulw {
                     // OVERLAY-121 (P1): 单点提交。先做帧末 alpha 处理（D2D 预乘像素乘
                     // 请求不透明度；GDI 像素提为不透明再预乘），再整窗交给合成器。
-                    apply_alpha_fixup(ppv_bits as *mut u8, (width * height) as usize, opacity);
+                    apply_alpha_fixup(ppv_bits as *mut u8, width, height, opacity, frame_radius);
                     let blend = BLENDFUNCTION {
                         BlendOp: AC_SRC_OVER as u8,
                         BlendFlags: 0,
@@ -2194,35 +2208,81 @@ unsafe extern "system" fn overlay_wnd_proc(
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
-/// OVERLAY-121 (P1): 帧末单点 alpha 处理，唯一调用点紧贴 ULW 提交（WM_PAINT 内）。
-/// - D2D 预乘像素（a>0）：RGB/A 同乘 opacity —— 预乘不变式（rgb ≤ a）随等比缩放成立。
-/// - GDI 像素（a==0 且 RGB≠0）：GDI 不写 alpha 通道；语义「本应不透明」，提为
-///   a = opacity·255 并同乘 RGB 落入预乘域（预乘合法：rgb·op ≤ 255·op = a）。
-/// - 全零像素（a==0 且 RGB==0）：真透明（P3 圆角外），保持不动。
-/// opacity 取自 Show 请求的均一不透明度，替代原 SetLayeredWindowAttributes(LWA_ALPHA) 语义。
+/// OVERLAY-141: 状态 → 窗口外框圆角半径单一映射（Gavin 2026-09-06 拍板口径）：
+/// Recording 系（Recording/RecordingStreamingIdle/RecordingWithText）+ FallingToProcessing
+/// + Processing = r16；StreamingEditing（SLWA 旧路径）+ FocusLost/Error/Info = r10。
+/// 绘制（D2D chrome 与 GDI fallback）与帧末 SDF alpha 掩码共用本值。
 #[cfg(target_os = "windows")]
-fn apply_alpha_fixup(bits: *mut u8, pixel_count: usize, opacity: f32) {
+fn overlay_frame_radius(status: &OverlayStatus) -> f32 {
+    match status {
+        OverlayStatus::Recording
+        | OverlayStatus::RecordingStreamingIdle
+        | OverlayStatus::RecordingWithText { .. }
+        | OverlayStatus::FallingToProcessing { .. }
+        | OverlayStatus::Processing(_) => OVERLAY_FRAME_RADIUS_LG,
+        OverlayStatus::StreamingEditing { .. }
+        | OverlayStatus::FocusLost { .. }
+        | OverlayStatus::Error(_)
+        | OverlayStatus::Info(_) => OVERLAY_FRAME_RADIUS_SM,
+    }
+}
+
+/// OVERLAY-121 (P1): 帧末单点 alpha 处理，唯一调用点紧贴 ULW 提交（WM_PAINT 内）。
+/// OVERLAY-141 根治重写：不再依赖 D2D 经 BindDC 是否保真 alpha（实测不保真 ——
+/// 抗锯齿边缘半透明像素丢失 alpha 后被旧「提亮」规则压成全不透明，1px 柔和描边
+/// 变 2-3px 硬灰带）。改为按已知几何（圆角矩形 SDF，与填充轮廓 (0,0,w,h) r=radius
+/// 逐位同框）每像素解析计算覆盖率直接写 alpha：
+/// - cov == 0（轮廓外）：四通道全零，真透明 —— 同时消灭「轮廓外杂散 AA 像素
+///   被提亮成灰边」与「形状内纯黑像素变透明洞」两个旧规则缺陷（与颜色无关）。
+/// - cov > 0：先反预乘还原原色（a>0 时 rgb·255/a；GDI 像素 a==0 本就是直通色），
+///   再按 k = cov·opacity 写回预乘域：a = 255·k，rgb = 原色·k。
+/// 窗口内部的真·逐像素半透明（如 shimmer 渐变）退化为均一 alpha ——
+/// 那是 OVERLAY-121 之前的行为，非回归（DEC-056 的视觉提升体现在圆角平滑）。
+/// opacity 取自 Show 请求的均一不透明度；radius 取自 overlay_frame_radius（单一来源）。
+#[cfg(target_os = "windows")]
+fn apply_alpha_fixup(bits: *mut u8, width: i32, height: i32, opacity: f32, radius: f32) {
     let op = opacity.clamp(0.1, 1.0);
-    let scale = |c: u8| ((c as f32 * op).round() as u8).min(255);
+    let half_w = width as f32 * 0.5;
+    let half_h = height as f32 * 0.5;
+    let inset_w = half_w - radius;
+    let inset_h = half_h - radius;
+    let premul = |c: u8, k: f32| ((c as f32 * k).round() as u8).min(255);
     unsafe {
-        for i in 0..pixel_count {
-            let p = bits.add(i * 4);
-            let b = *p;
-            let g = *p.add(1);
-            let r = *p.add(2);
-            let a = *p.add(3);
-            if a == 0 && (r | g | b) != 0 {
-                // GDI-written pixel: promote to opaque-at-opacity, then premultiply.
-                *p = scale(b);
-                *p.add(1) = scale(g);
-                *p.add(2) = scale(r);
-                *p.add(3) = ((op * 255.0).round() as u8).min(255);
-            } else if a != 0 {
-                // D2D premultiplied pixel: scale all four channels.
-                *p = scale(b);
-                *p.add(1) = scale(g);
-                *p.add(2) = scale(r);
-                *p.add(3) = scale(a);
+        for y in 0..height {
+            let qy = ((y as f32 + 0.5 - half_h).abs() - inset_h).max(0.0);
+            let row = bits.add((y as usize) * (width as usize) * 4);
+            for x in 0..width {
+                let p = row.add((x as usize) * 4);
+                let qx = ((x as f32 + 0.5 - half_w).abs() - inset_w).max(0.0);
+                // 圆角矩形 SDF（q 已夹逼到 ≥0，min(max(qx,qy),0) 恒 0）：
+                // 内部 d ≤ -r → cov=1，与精确 SDF 覆盖率逐位同值。
+                let d = (qx * qx + qy * qy).sqrt() - radius;
+                let cov = (0.5 - d).clamp(0.0, 1.0);
+                if cov <= 0.0 {
+                    // 轮廓外：真透明（四通道全零）。
+                    *p = 0;
+                    *p.add(1) = 0;
+                    *p.add(2) = 0;
+                    *p.add(3) = 0;
+                    continue;
+                }
+                let k = cov * op;
+                let b = *p;
+                let g = *p.add(1);
+                let r = *p.add(2);
+                let a = *p.add(3);
+                // 反预乘还原原色：a>0 的 D2D 像素 rgb·255/a；GDI 像素（a==0）本就是直通色。
+                let unpremult = |c: u8| {
+                    if a > 0 {
+                        (((c as u32) * 255) / (a as u32)).min(255) as u8
+                    } else {
+                        c
+                    }
+                };
+                *p = premul(unpremult(b), k);
+                *p.add(1) = premul(unpremult(g), k);
+                *p.add(2) = premul(unpremult(r), k);
+                *p.add(3) = premul(255, k);
             }
         }
     }
@@ -2323,7 +2383,8 @@ fn draw_overlay_to_dc(
                 // On any D2D failure the GDI path below still renders this frame.
                 if !d2d::draw_recording_waveform_overlay(hdc, rect, state) {
                     // OVERLAY-121 (P3): FallingToProcessing fallback r=16（Gavin 拍板）。
-                    draw_overlay_chrome(hdc, rect, 16);
+                    // OVERLAY-141: 半径单一来源。
+                    draw_overlay_chrome(hdc, rect, OVERLAY_FRAME_RADIUS_LG as i32);
                     draw_recording_indicator_and_waveform(hdc, rect, state);
                     cancel_btn_rect = Some(draw_stop_button(hdc, rect));
                 } else {
@@ -2363,7 +2424,8 @@ fn draw_overlay_to_dc(
                     // OVERLAY-051-B: editing mode draws a clear submit button (orange ⏎) on the right.
                     // The EDIT control renders the text itself; we only paint chrome + submit button.
                     // OVERLAY-121 (P3): 编辑态 fallback 维持 r=10（SLWA 旧路径口径不变）。
-                    draw_overlay_chrome(hdc, rect, 10);
+                    // OVERLAY-141: 半径单一来源。
+                    draw_overlay_chrome(hdc, rect, OVERLAY_FRAME_RADIUS_SM as i32);
                     submit_btn_rect = Some(draw_submit_button(hdc, rect));
                 } else {
                     submit_btn_rect = Some(draw_submit_button_hit_rect_only(rect));
@@ -2745,7 +2807,8 @@ fn draw_recording_overlay(
     }
     // OVERLAY-121 (P3): Recording 系 GDI fallback r=16（Gavin 拍板；D2D 失败帧仍是
     // 方角填充 —— GDI 无 AA，方角是 fallback 的既定降级，见 result.md）。
-    draw_overlay_chrome(hdc, rect, 16);
+    // OVERLAY-141: 半径单一来源。
+    draw_overlay_chrome(hdc, rect, OVERLAY_FRAME_RADIUS_LG as i32);
     // OVERLAY-051-E: online streaming ASR waiting for first text shows placeholder,
     // not waveform. Local model continues to show waveform unchanged.
     if show_placeholder {
@@ -2758,7 +2821,8 @@ fn draw_recording_overlay(
         if d2d::draw_recording_waveform_overlay(hdc, rect, state) {
             return draw_stop_button_hit_rect_only(rect);
         }
-        draw_overlay_chrome(hdc, rect, 16);
+        // OVERLAY-141: 半径单一来源。
+        draw_overlay_chrome(hdc, rect, OVERLAY_FRAME_RADIUS_LG as i32);
         draw_recording_indicator_and_waveform(hdc, rect, state);
     }
     draw_stop_button(hdc, rect)
@@ -2813,7 +2877,8 @@ fn draw_recording_overlay_with_text(
     }
     // OVERLAY-043: text mode uses chrome + stop button only, no waveform so text is not squeezed
     // OVERLAY-121 (P3): RecordingWithText fallback r=16（Gavin 拍板）。
-    draw_overlay_chrome(hdc, rect, 16);
+    // OVERLAY-141: 半径单一来源。
+    draw_overlay_chrome(hdc, rect, OVERLAY_FRAME_RADIUS_LG as i32);
     // keep the mic indicator so the user still sees the recording state
     draw_recording_indicator(hdc, rect, state);
     let cancel_rect = draw_stop_button(hdc, rect);
@@ -3070,7 +3135,10 @@ fn draw_editing_overlay_chrome(
     _ui_language: config::UiLanguage,
 ) -> (RECT, RECT) {
     const BG_DARK: COLORREF = COLORREF(0x110F0D);
-    const CORNER_RADIUS: i32 = 10;
+    // OVERLAY-141: 半径单一来源。
+    // 🔴 本函数当前零调用（死代码，是否删除待 Gavin 拍板）；此 hunk 独立，若
+    // Gavin 拍板删函数则整函数连同本改动一并带走，零残留。
+    const CORNER_RADIUS: i32 = OVERLAY_FRAME_RADIUS_SM as i32;
 
     // Background + border
     let bg = unsafe { CreateSolidBrush(BG_DARK) };
@@ -3484,7 +3552,9 @@ mod d2d {
             // border geometry exactly. A rectangular fill leaves a wedge of background
             // color outside the rounded 1px stroke in each corner (visible as stray gray
             // fringes on the rounded edge). Fill and stroke must share ONE radius binding.
-            let corner_radius = 16.0;
+            // OVERLAY-141: 半径单一来源 —— 与帧末 SDF alpha 掩码同值（overlay_frame_radius
+            // 对 Processing 返回同常量），禁止回退为字面量。
+            let corner_radius = super::OVERLAY_FRAME_RADIUS_LG;
             res.rt.FillRoundedRectangle(
                 &D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
@@ -3936,7 +4006,8 @@ mod d2d {
     pub(crate) fn draw_editing_overlay(hdc: HDC, rect: &RECT) -> bool {
         with_d2d(hdc, rect, |res, w, h| {
             // OVERLAY-121 (P3): 编辑态维持 r=10 —— SLWA 旧路径，视觉口径不变。
-            chrome(res, w, h, 10.0);
+            // OVERLAY-141: 半径单一来源（映射完备性：SLWA 不走 ULW fixup，仅绘制用）。
+            chrome(res, w, h, super::OVERLAY_FRAME_RADIUS_SM);
             let _ = submit_button(res, w, h);
         })
     }
@@ -4045,7 +4116,8 @@ mod d2d {
     ) -> bool {
         with_d2d(hdc, rect, |res, w, h| {
             // OVERLAY-121 (P3): Recording/FallingToProcessing 升 r=16（Gavin 拍板）。
-            chrome(res, w, h, 16.0);
+            // OVERLAY-141: 半径单一来源（overlay_frame_radius 同值）。
+            chrome(res, w, h, super::OVERLAY_FRAME_RADIUS_LG);
             mic_indicator(res, h, state);
             waveform(res, w, h, state);
             right_separator(res, w, h);
@@ -4151,7 +4223,8 @@ mod d2d {
     ) -> bool {
         with_d2d(hdc, rect, |res, w, h| {
             // OVERLAY-121 (P3): RecordingStreamingIdle 升 r=16（Gavin 拍板）。
-            chrome(res, w, h, 16.0);
+            // OVERLAY-141: 半径单一来源。
+            chrome(res, w, h, super::OVERLAY_FRAME_RADIUS_LG);
             mic_indicator(res, h, state);
             placeholder_text(res, w, h, ui_language);
             let _ = stop_button(res, w, h);
@@ -4172,7 +4245,8 @@ mod d2d {
     ) -> bool {
         with_d2d(hdc, rect, |res, w, h| {
             // OVERLAY-121 (P3): RecordingWithText 升 r=16（Gavin 拍板）。
-            chrome(res, w, h, 16.0);
+            // OVERLAY-141: 半径单一来源。
+            chrome(res, w, h, super::OVERLAY_FRAME_RADIUS_LG);
             mic_indicator(res, h, state);
             streaming_text(res, w, h, visible_text, text_width);
             // Right separator (主控 D2D-P1 验收要求补齐): GDI 版 :2617-2624 逐项照抄 —
@@ -4196,7 +4270,14 @@ mod d2d {
     /// Returns false on any D2D failure — the caller renders the same frame via GDI.
     pub(crate) fn draw_error_overlay(hdc: HDC, rect: &RECT, message: &str) -> bool {
         with_d2d(hdc, rect, |res, w, h| {
-            chrome_with(res, w, h, COLORREF(0x211D1A), 10.0);
+            // OVERLAY-141: 半径单一来源。
+            chrome_with(
+                res,
+                w,
+                h,
+                COLORREF(0x211D1A),
+                super::OVERLAY_FRAME_RADIUS_SM,
+            );
             unsafe {
                 let circ_d = 4.0_f32; // GDI circ_d=8 的半径
                 res.brush.SetColor(&colorref_to_d2d(COLORREF(0x0033CC)));
@@ -4238,7 +4319,14 @@ mod d2d {
     /// Returns false on any D2D failure — the caller renders the same frame via GDI.
     pub(crate) fn draw_info_overlay(hdc: HDC, rect: &RECT, message: &str) -> bool {
         with_d2d(hdc, rect, |res, w, h| {
-            chrome_with(res, w, h, COLORREF(0x211D1A), 10.0);
+            // OVERLAY-141: 半径单一来源。
+            chrome_with(
+                res,
+                w,
+                h,
+                COLORREF(0x211D1A),
+                super::OVERLAY_FRAME_RADIUS_SM,
+            );
             unsafe {
                 let circ_d = 4.0_f32; // GDI circ_d=8 的半径
                 res.brush.SetColor(&colorref_to_d2d(COLORREF(0xFF9933)));
@@ -4296,7 +4384,14 @@ mod d2d {
         ui_language: crate::config::UiLanguage,
     ) -> bool {
         with_d2d(hdc, rect, |res, w, h| {
-            chrome_with(res, w, h, COLORREF(0x211D1A), 10.0);
+            // OVERLAY-141: 半径单一来源。
+            chrome_with(
+                res,
+                w,
+                h,
+                COLORREF(0x211D1A),
+                super::OVERLAY_FRAME_RADIUS_SM,
+            );
             unsafe {
                 // 标题栏文字（橙，DT_CENTER|DT_VCENTER → centered format）
                 res.brush
@@ -4465,7 +4560,8 @@ fn draw_processing_overlay(
     const BRIGHT_ORANGE: COLORREF = COLORREF(0x008CFF); // #FF8C00 - brighter shimmer
     const BG_DARK: COLORREF = COLORREF(0x181A18); // #181A18
                                                   // OVERLAY-054-C: use file-level OVERLAY_BORDER_GRAY instead of local constant.
-    const CORNER_RADIUS: i32 = 16;
+                                                  // OVERLAY-141: 半径单一来源（GDI fallback 与 D2D draw_processing_primitives 同值）。
+    const CORNER_RADIUS: i32 = OVERLAY_FRAME_RADIUS_LG as i32;
     // WAVEFORM-HEIGHT-FIX-001: restore fixed gray border (remove breathing)
     let border_color = OVERLAY_BORDER_GRAY;
     // Dark background
@@ -4638,7 +4734,8 @@ fn draw_preview_overlay(
     const BRAND_ORANGE: COLORREF = COLORREF(0x006BFF); // #FF6B00
     const BG_DARK: COLORREF = COLORREF(0x211D1A);
     // OVERLAY-054-C: use file-level OVERLAY_BORDER_GRAY instead of local constant.
-    const CORNER_RADIUS: i32 = 10;
+    // OVERLAY-141: 半径单一来源（GDI fallback 与 D2D chrome_with 同值）。
+    const CORNER_RADIUS: i32 = OVERLAY_FRAME_RADIUS_SM as i32;
     let strings = i18n::get(ui_language);
     // D2D-P2 (PLAN-108 H10): 三个命中 rect 改由 preview_hit_rects 单一源出
     // （绘制与返回值共用同一组 RECT，同值替换）。
@@ -4809,7 +4906,8 @@ fn draw_error_overlay(
     const BRAND_ORANGE: COLORREF = COLORREF(0x006BFF); // #FF6B00
     const BG_DARK: COLORREF = COLORREF(0x211D1A); // #1A1D21
                                                   // OVERLAY-054-C: use file-level OVERLAY_BORDER_GRAY instead of local constant.
-    const CORNER_RADIUS: i32 = 10;
+                                                  // OVERLAY-141: 半径单一来源（GDI fallback 与 D2D chrome_with 同值）。
+    const CORNER_RADIUS: i32 = OVERLAY_FRAME_RADIUS_SM as i32;
     // Dark gray background (unified)
     let bg = unsafe { CreateSolidBrush(BG_DARK) };
     unsafe {
@@ -4885,7 +4983,8 @@ fn draw_info_overlay(
 ) {
     const INFO_BLUE: COLORREF = COLORREF(0xFF9933); // BGR: blue #3399FF
     const BG_DARK: COLORREF = COLORREF(0x211D1A); // #1A1D21（同错误态统一底色）
-    const CORNER_RADIUS: i32 = 10;
+                                                  // OVERLAY-141: 半径单一来源（GDI fallback 与 D2D chrome_with 同值）。
+    const CORNER_RADIUS: i32 = OVERLAY_FRAME_RADIUS_SM as i32;
     // Dark gray background (unified)
     let bg = unsafe { CreateSolidBrush(BG_DARK) };
     unsafe {
