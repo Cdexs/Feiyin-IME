@@ -1637,3 +1637,32 @@ NSWindow 层 AA 由系统合成器天然保真，无等价缺陷形态）。
 ## OVERLAY-155（2026-09-07）
 
 - 圆角三次修法（GDI chrome 收进 D2D 失败分支 + LG 半径 16→10）：**macOS 不适用** —— GDI/D2D 叠画结构、RoundRect 硬台阶、OVERLAY_FRAME_RADIUS_LG/SM 常量全部是 Windows overlay 管线专属；macOS NSWindow 的 AA 圆角由 layer cornerRadius 天然提供（见 OVERLAY-141 节），无「GDI 先画+D2D 盖画」结构可对位。半径视觉口径若将来在 macOS 侧实现 overlay，直接对齐 LG=10 的新语义即可。
+
+## TRAY-ICON-158（2026-09-07）· 托盘菜单项图标
+
+**共用光栅（两端同一实现）**：新增 `src/ui/menu_icons.rs`（纯 Rust，零平台依赖、零新 crate）：
+`settings_icon_rgba(size)`（齿轮）+ `exit_icon_rgba(size)`（电源符号），输出直通 RGBA8。
+品牌橙 `#FF6B35` 与托盘图标同色；SSAA 4×4 抗锯齿（明确不用解析式 SDF，见 OVERLAY-121/141/153 教训）。
+
+**Windows 侧**：`show_tray_popup_menu()` 裸 Win32 手搓菜单，走
+`SetMenuItemInfoW` + `MIIM_BITMAP` + 32bpp top-down 预乘 BGRA DIB
+（`CreateDIBSection(None, …)`，负 `biHeight`）；尺寸取 `SM_CXSMICON/CYSMICON` min 后
+clamp(16, 64)（不用 `GetDpiForWindow`——需 `Win32_UI_HiDpi` feature，红线禁改 Cargo.toml）。
+句柄现建现删、`DeleteObject` 在 `DestroyMenu` 之后（模态期间菜单在读位图）。
+
+**macOS 侧已写代码（🔴 本机无 mac，只写不构建不端测）**：
+`src/platform/macos/tray.rs` `build_tray_menu()` 对两个 `NSMenuItem` 各调
+`setImage(nsimage_from_rgba(18, 18, menu_icons::*_rgba(18)))`，18pt 对齐菜单小图标规格；
+刻意不设 `setTemplate(true)`——保住品牌橙，与 Windows 侧观感一致。
+macOS 侧接手后请构建确认（`objc2-app-kit` `NSMenuItem::setImage` 签名以仓库锁定版本为准），
+并目视确认两张图标在浅色/深色菜单底下的观感；预期无需任何对端改动。
+
+## MIC-PULSE-160（2026-09-07）· 流式窗麦克风声波弧动效
+
+Windows 侧为流式窗（RecordingWithText/RecordingStreamingIdle）的麦克风图标加了左右各一组
+对称声波弧动效（纯 Win32/D2D，`src/main.rs` `mic_pulse_*` 共享层 + 三产出源）。**macOS 不适用**：
+`src/platform/macos/overlay.rs` 的 `draw_overlay` 是录音波形窗（三态指示灯+波形条），
+尚无流式文字窗与 pill/stem/base 麦克风元素，无处挂载该动效。
+🔴 **待办（macOS 侧将来实现流式窗时）**：麦克风图标复刻 Windows 几何（pill 体中心为弧心，
+内弧 R=5.5/外弧 R=8.0，左右各 ±40°，线宽 1.2，1000ms 周期 tri 波，电平 gain 阈值 0.35），
+动效逻辑可参照 `src/main.rs` 的 `mic_pulse_tri`/`mic_pulse_alphas` 纯函数直接移植（平台无关）。

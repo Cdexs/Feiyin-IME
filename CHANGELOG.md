@@ -810,3 +810,9 @@ TEST-SYNC-143 | 阶段三 OVERLAY-141 护栏：G6 换血为 SDF alpha 四断言�
 OVERLAY-149 | F1 caret 泄漏修复（destroy_edit_control 销毁前移焦点+HideCaret+DestroyCaret，待端测判定）+ F2 热键停止臂 OVERLAY_EDITING 守卫（Stop 臂无条件 store(false)，防 Processing 永久卡屏，事件序列含 Case-A/B/C）+ E3 角区像素 dump 探针（fixup 前/后四角 8×8+左缘列 BGRA，节流=每状态前 3 帧）+ E4 DPI 比对（GetDeviceCaps 替代 GetDpiForWindow 因 Cargo feature 红线，已报备）；src/main.rs +230/-14；fmt/check 0 + warnings 111/102 持平 + cargo test 1107P/0F 零预期红 | coder-1 | 2026-09-07
 
 OVERLAY-155 | 圆角三次修法（Gavin 指示照『请说话哦』窗）：改动1=GDI chrome 收进 D2D 失败分支（唯一肇事点=draw_recording_overlay 波形分支无条件先画，与 Info 同构化；全库七处排查其余本来就对）+ 改动2=OVERLAY_FRAME_RADIUS_LG 16→10（对齐 Info 几何，LG/SM 保留可逆）；差异 A 对 Idle/Processing 坏态解释不了的部分如实声明（无叠画路径，半径对齐为共同修复）；src/main.rs +16/-5；fmt/check 0 + warnings 111/102 持平 + cargo test 1109P/0F=基线；apply_alpha_fixup 零字节未动 | coder-1 | 2026-09-07
+
+TRAY-ICON-158 | 托盘菜单项加图标：新增 src/ui/menu_icons.rs（齿轮+电源，品牌橙#FF6B35，SSAA 4×4 程序化生成零新 crate）+ Windows 裸 Win32 菜单 SetMenuItemInfoW/MIIM_BITMAP + 32bpp 预乘 top-down DIB（SM_CXSMICON 尺寸，失败静默降级，DeleteObject 在 DestroyMenu 后现建现删）+ macOS NSMenuItem setImage(18pt) 对称实现（只写不构建，MACOS-HANDOFF 已留痕）；12 张预览 PNG 交付 collab/outbox/coder-1/icons/；fmt 0 + check 0 error + warnings 111/102 持平 + cargo test 1110P/0F；Cargo.toml 零字节 | coder-1 | 2026-09-07
+
+TRAY-ICON-158-FIX | 齿轮几何返工（电源验收通过零改动）：实心盘（孔0.13S..根圆0.32S）+ 6 条梯形齿（齿根30°/齿顶20°半角线性收窄）+ 外径0.44S，修掉「齿下盘挖空⇒放射刺」「恒定角宽扇形齿反向」「8齿16px过载」三缺陷；只动 gear_covered+常量；12 张 PNG 重 dump；fmt 0/check 0/warnings 111/102 持平/test 1110P/0F | coder-1 | 2026-09-07
+
+MIC-PULSE-160 | 流式窗麦克风声波弧动效：左右各一组对称弧（R5.5/8.0，右±40°/左140°..220°，同相位同亮度，墙钟1000ms周期，电平gain≥0.35满亮，静音零回归）；三产出源全改（D2D clip+DrawEllipse+SetOpacity、GDI×2 采样折线+BG插值）；RecordingWithText/StreamingIdle 重绘加 mic_has_audio or 条件（StreamingEditing 不加，MENU_VISIBLE 门控原位）；8 帧预览 PNG 交付 mic-frames/（临时测试已删）；fmt 0/check 0/warnings 111/102 持平/test 1110P/0F；macOS 不适用已记 MACOS-HANDOFF | coder-1 | 2026-09-07

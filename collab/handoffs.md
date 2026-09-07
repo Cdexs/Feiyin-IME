@@ -134,3 +134,26 @@
 - **改动 2**：`OVERLAY_FRAME_RADIUS_LG: 16.0 → 10.0`（单一来源一行全生效；LG/SM 保留未合并，Gavin 想要回 16 改回字面量即可）。
 - **验证**：fmt 0（幂等）/check --all-targets 0 error/warnings 111/102 基线持平/**cargo test 1109P/0F（=主控基线）护栏零变红，未改任何 needle**。
 - **红线**：apply_alpha_fixup 零字节未动；E3/E4 探针照留；只改 src/main.rs（+16/-5 两 hunk）；未 commit/版本未动/未出包/零凭证/无临时文件；MACOS-HANDOFF 已同步。
+
+## 2026-09-07 — coder-1 — TRAY-ICON-158 ✅ 托盘菜单项加图标（齿轮/电源，品牌橙 SSAA 程序化生成，待主控验收 → BUILD-159 出包）
+
+- **方案**：同意主控并执行。`src/ui/menu_icons.rs` 新建（纯 Rust、零新 crate）：齿轮（外径 0.42S/8 齿 20°/齿根 0.30S/孔 0.15S）+ 电源（环 0.30S/线宽 0.11S/顶 70° 缺口/竖线圆头），SSAA 4×4，品牌橙 #FF6B35。
+- **Windows**：`create_menu_item_bitmap`（32bpp top-down 预乘 BGRA DIB）+ `attach_menu_icons`（SM_CXSMICON/CYSMICON min clamp(16,64)，MIIM_BITMAP 按 wID 挂载，失败静默降级）；`DeleteObject` 在 `DestroyMenu` 后、现建现删不缓存。MENU_VISIBLE/SetForegroundWindow/TPM 标志/命令 ID 零触碰。
+- **macOS**：`build_tray_menu` 两项 `setImage(nsimage_from_rgba(18,…))` 不设 template；🔴 只写不构建不端测，`docs/MACOS-HANDOFF.md` 已留痕。
+- **视觉自证**：常驻 `dump_menu_icons_preview` 产出 12 张 PNG（16/24/32 × 2 × 原图+x8）在 `collab/outbox/coder-1/icons/`，待主控逐张目视。**如实声明**：16px 档 8 齿齿轮欠采样发糊（齿宽 ~1.2px 固有），变体 B（22.5° 齿宽）略好/C（6 齿）更差已删，维持规格等 Gavin 定夺（调整只需动 TOOTH_HALF_ANGLE_RAD）。
+- **验证**：fmt 幂等 0／check --all-targets 0 error／warnings 111/102 逐位持平／cargo test **1110P/0F**（1109 基线+1 dump，如实说明）；Cargo.toml 零字节；diff 5 生产/文档文件全在任务书清单内；未 commit/版本未动/未出包/零凭证/探索临时 PNG 已清理。
+
+## 2026-09-07 — coder-1 — TRAY-ICON-158-FIX ✅ 齿轮几何返工（电源已验收零改动，12 张 PNG 重 dump，待主控目视 → BUILD-159）
+
+- **打回根因三条全修**（照主控处方，只动 `gear_covered`+常量）：①实心盘 hole(0.13S)..root(0.32S) 整片实心（原齿下盘被挖空⇒放射刺/雪花）②齿改梯形（齿根半角 15°→齿顶半角 10° 随 r 线性收窄，原恒定角宽=外宽内窄反向）③8 齿→6 齿（16px 密度过载，对齐系统级 UI 齿轮）+外径 0.42→0.44S。
+- **自查**：16px 清晰可辨、32px 标准齿轮；12 张预览 PNG 已重新 dump 覆盖 `collab/outbox/coder-1/icons/`。
+- **红线**：`power_covered` 及电源 5 常量零字节未动；`rasterize`/Win32 挂载/macOS setImage 零新增改动；fmt 0/check 0 error/warnings 111/102 持平/test 1110P/0F；Cargo.toml 零字节/未 commit/版本未动/未出包/零凭证。
+
+## 2026-09-07 — coder-1 — MIC-PULSE-160 ✅ 流式窗麦克风声波弧动效（待主控目视 8 帧 → 不出包等 Gavin）
+
+- **视觉**：左右各一组对称声波弧（内 R5.5/外 R8.0，右 -40°..+40° / 左 140°..220°，同相位同亮度，线宽 1.2），墙钟 1000ms 周期 tri 波（内弧先行 0.0、外弧滞后 0.30、宽 0.55），电平驱动 gain（≥0.35 满亮），外弧 ×0.85 略淡。静音完全不画（逐位零回归）；红/灰态不画。两轮 Gavin 修订（1000ms、左右对称）已并入。
+- **三产出源**：①D2D mic_indicator（main.rs:4252，弧=mic_pulse_arcs:4367，clip+DrawEllipse×4+SetOpacity 恢复）②GDI 波形态（:3071-3081）③GDI 流式态（:3525-3534）——后两者 4x 画布采样折线 20 段/弧+BG 插值近似。共享纯函数 main.rs:2882/2898 三处同源。
+- **重绘**：RecordingWithText(:1871)/RecordingStreamingIdle(:1814) dirty 加 `|| mic_has_audio(&state)`；StreamingEditing 零改动；MENU_VISIBLE 门控原位。锁纪律：绘制侧 snapshot 一次锁取 (empty,audio,level)（:2908），判定侧每帧一次锁。
+- **预览**：8 帧 PNG（gain=1.0, ×8）在 collab/outbox/coder-1/mic-frames/，自查节奏=内弧先亮→外弧跟进→渐隐；临时 dump 测试已删（保持 1110P）。
+- **macOS**：overlay.rs 无流式窗麦克风元素 → 不适用，MACOS-HANDOFF 记待办。
+- **验证**：fmt 0／check 0 error／warnings 111/102 持平／test 1110P/0F；TRAY-ICON-158 零触碰；Cargo.toml 零字节；未 commit/版本未动/未出包/零凭证。

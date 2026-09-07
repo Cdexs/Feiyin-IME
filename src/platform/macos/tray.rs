@@ -219,6 +219,18 @@ fn build_tray_menu(
     }
     menu.addItem(&exit);
 
+    // TRAY-ICON-158: 品牌橙菜单图标（与 Windows 侧共用同一光栅
+    // `crate::ui::menu_icons`，18pt 与 macOS 菜单小图标规格一致）。
+    // 刻意不设 setTemplate(true)：保住品牌橙，与 Windows 侧观感一致。
+    for (item, rgba) in [
+        (&settings, crate::ui::menu_icons::settings_icon_rgba(18)),
+        (&exit, crate::ui::menu_icons::exit_icon_rgba(18)),
+    ] {
+        if let Some(img) = nsimage_from_rgba(18, 18, &rgba) {
+            unsafe { item.setImage(Some(&img)) };
+        }
+    }
+
     menu
 }
 

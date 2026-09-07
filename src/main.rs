@@ -62,7 +62,7 @@ use windows::Win32::Graphics::Gdi::{
     StretchBlt, UpdateWindow, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
     BLENDFUNCTION, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
     DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
-    FF_DONTCARE, FW_NORMAL, HALFTONE, HDC, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    FF_DONTCARE, FW_NORMAL, HALFTONE, HBITMAP, HDC, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_NULL, PS_SOLID, SRCCOPY, TEXTMETRICW,
     TRANSPARENT,
 };
@@ -95,11 +95,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DestroyMenu, DestroyWindow, DispatchMessageW, GetClientRect, GetForegroundWindow,
     GetGUIThreadInfo, GetMessageW, GetPropW, GetSystemMetrics, GetWindowLongPtrW, HideCaret,
     KillTimer, LoadCursorW, MsgWaitForMultipleObjects, PeekMessageW, PostMessageW, PostQuitMessage,
-    RegisterClassW, RemovePropW, SetForegroundWindow, SetLayeredWindowAttributes, SetPropW,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage,
-    UpdateLayeredWindow, CREATESTRUCTW, CW_USEDEFAULT, GUITHREADINFO, GWLP_USERDATA, GWL_EXSTYLE,
-    HMENU, IDC_ARROW, LWA_ALPHA, MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN,
-    SM_CYSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
+    RegisterClassW, RemovePropW, SetForegroundWindow, SetLayeredWindowAttributes, SetMenuItemInfoW,
+    SetPropW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu,
+    TranslateMessage, UpdateLayeredWindow, CREATESTRUCTW, CW_USEDEFAULT, GUITHREADINFO,
+    GWLP_USERDATA, GWL_EXSTYLE, HMENU, IDC_ARROW, LWA_ALPHA, MENUITEMINFOW, MF_SEPARATOR,
+    MF_STRING, MIIM_BITMAP, MSG, PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN, SM_CXSMICON, SM_CYSCREEN,
+    SM_CYSMICON, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
     SW_SHOW, SW_SHOWNA, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP,
     WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_NCCREATE, WM_NCPAINT,
     WM_PAINT, WM_TIMER, WNDCLASSW, WNDCLASS_STYLES, WS_CHILD, WS_EX_COMPOSITED, WS_EX_LAYERED,
@@ -281,6 +282,77 @@ fn tray_menu_labels(ui_language: config::UiLanguage) -> (&'static str, &'static 
     let strings = i18n::get(ui_language);
     (strings.tray_menu_settings, strings.tray_menu_exit)
 }
+/// TRAY-ICON-158：把直通 RGBA8 图标转成 32bpp top-down 预乘 BGRA DIB，
+/// 供菜单项 `MIIM_BITMAP` 挂载。菜单渲染只有在 32bpp 预乘 DIB 上才正确
+/// 合成 per-pixel alpha。失败返回 None（调用方静默降级为无图标菜单）。
+#[cfg(target_os = "windows")]
+fn create_menu_item_bitmap(size: i32, rgba: &[u8]) -> Option<HBITMAP> {
+    let n = size as usize;
+    if size <= 0 || n.checked_mul(4)? != rgba.len() {
+        return None;
+    }
+    let mut bmi = BITMAPINFO::default();
+    bmi.bmiHeader = BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: size,
+        biHeight: -size, // 负 = top-down，与 rgba 行序一致
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        ..Default::default()
+    };
+    let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+    let hbmp = unsafe {
+        // hdc 传 None：32bpp DIB 不需要绑定 DC，菜单 GDI 读取内存即可合成
+        CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?
+    };
+    if bits.is_null() {
+        let _ = unsafe { DeleteObject(hbmp) };
+        return None;
+    }
+    let dst = unsafe { std::slice::from_raw_parts_mut(bits as *mut u8, n * n * 4) };
+    for (src, dst) in rgba.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+        let a = src[3] as u32;
+        dst[0] = ((src[2] as u32 * a + 127) / 255) as u8; // B（预乘）
+        dst[1] = ((src[1] as u32 * a + 127) / 255) as u8; // G
+        dst[2] = ((src[0] as u32 * a + 127) / 255) as u8; // R
+        dst[3] = src[3]; // A
+    }
+    Some(hbmp)
+}
+#[cfg(target_os = "windows")]
+fn attach_menu_icons(menu: HMENU) -> Vec<HBITMAP> {
+    // 尺寸取系统小图标规格（SM_CXSMICON 走已启用的 WindowsAndMessaging，
+    // 不用 GetDpiForWindow —— 需 Win32_UI_HiDpi feature，红线禁改 Cargo.toml）。
+    let size = unsafe {
+        GetSystemMetrics(SM_CXSMICON)
+            .min(GetSystemMetrics(SM_CYSMICON))
+            .clamp(16, 64)
+    };
+    let mut attached = Vec::with_capacity(2);
+    for (cmd_id, rgba) in [
+        (
+            MENU_CMD_SETTINGS,
+            ui::menu_icons::settings_icon_rgba(size as u32),
+        ),
+        (MENU_CMD_EXIT, ui::menu_icons::exit_icon_rgba(size as u32)),
+    ] {
+        let Some(hbmp) = create_menu_item_bitmap(size, &rgba) else {
+            continue; // 静默降级：图标失败绝不影响菜单弹出
+        };
+        let mut mii = MENUITEMINFOW::default();
+        mii.cbSize = std::mem::size_of::<MENUITEMINFOW>() as u32;
+        mii.fMask = MIIM_BITMAP;
+        mii.hbmpItem = hbmp;
+        // fByPosition=FALSE：按 wID（命令 ID）定位
+        if unsafe { SetMenuItemInfoW(menu, cmd_id, false, &mii) }.is_ok() {
+            attached.push(hbmp);
+        } else {
+            let _ = unsafe { DeleteObject(hbmp) };
+        }
+    }
+    attached
+}
 #[cfg(target_os = "windows")]
 fn show_tray_popup_menu(
     controller_hwnd: HWND,
@@ -307,6 +379,11 @@ fn show_tray_popup_menu(
             MENU_CMD_EXIT as usize,
             PCWSTR(exit_w.as_ptr()),
         );
+        // TRAY-ICON-158：两项挂品牌橙图标。句柄现建现删，不缓存进
+        // thread_local/OnceLock（[D2D-HANG-001] 教训：跨线程/退出期释放句柄自找
+        // 麻烦）；DeleteObject 必须在 DestroyMenu 之后——TrackPopupMenu 模态期间
+        // 菜单还在读这些位图，提前删会让图标空白。
+        let menu_bitmaps = attach_menu_icons(menu);
         let _ = SetForegroundWindow(controller_hwnd);
         let cmd = TrackPopupMenu(
             menu,
@@ -319,6 +396,9 @@ fn show_tray_popup_menu(
         );
         let cmd_id = cmd.0 as u32;
         let _ = DestroyMenu(menu);
+        for hbmp in menu_bitmaps {
+            let _ = DeleteObject(hbmp);
+        }
         MENU_VISIBLE.store(false, Ordering::SeqCst);
         match cmd_id {
             MENU_CMD_SETTINGS => Some(AppCommand::OpenSettings),
@@ -1729,7 +1809,10 @@ fn run_overlay_thread(
                     }
                     OverlayStatus::RecordingStreamingIdle => {
                         // OVERLAY-051-E: static placeholder state; repaint only on explicit dirty flag.
-                        if state.needs_repaint && !MENU_VISIBLE.load(Ordering::Acquire) {
+                        // MIC-PULSE-160: 麦克风动效期间（has_audio）也保持重绘；
+                        // StreamingEditing 分支绝不加（EDIT-FLICKER-157 刚修完的地盘）。
+                        let dirty = state.needs_repaint || mic_has_audio(&state);
+                        if dirty && !MENU_VISIBLE.load(Ordering::Acquire) {
                             unsafe {
                                 let _ = InvalidateRect(hwnd, None, false);
                             }
@@ -1784,7 +1867,8 @@ fn run_overlay_thread(
                             }
                         }
                         // OVERLAY-043: only repaint when text/status/size actually changed
-                        let dirty = state.needs_repaint;
+                        // MIC-PULSE-160: 麦克风动效期间（has_audio）也保持重绘。
+                        let dirty = state.needs_repaint || mic_has_audio(&state);
                         if dirty && !MENU_VISIBLE.load(Ordering::Acquire) {
                             unsafe {
                                 let _ = InvalidateRect(hwnd, None, false);
@@ -2773,6 +2857,147 @@ fn waveform_bar_height(v: f32, i: i32, half: i32) -> i32 {
     }
 }
 
+// MIC-PULSE-160: 流式窗麦克风声波弧动效共享层（D2D 主路径 + 两处 GDI 兜底同源）。
+// 时基走 SHIMMER-FIX-002 范式：相位由墙钟在 WM_PAINT 内现算，不累加、不存帧计数
+// ⇒ 免疫 WM_PAINT 频率抖动。
+// 几何（Gavin 修订：pill 上下无空间 ⇒ 弧画左右两侧）：弧心 = pill 体中心
+// （cx=circ_l+9, cy=circ_t+7），内弧 R=5.5 / 外弧 R=8.0，**左右各一组、对称、
+// 同相位同亮度**：右组 -40°..+40°，左组 140°..220°（0°=正右，y 向下为正），
+// 线宽 1.2。空间已核验：外弧含半线宽左沿 6.4 / 右沿 23.6，图标框 [6,24] 两侧
+// 都放得下，不碰 x=30 左分隔线；pill 上下方一律不画。
+// 只在橘色（has_audio）态绘制；静音 gain=0 时整段不画（与改前逐位相同）；
+// 红（设备故障）态也不画。
+const MIC_PULSE_PERIOD_MS: u64 = 1000;
+const MIC_PULSE_OUT_OFFSET: f32 = 0.30; // 外弧相位滞后 0.3 ⇒「由内向外扩散」
+const MIC_PULSE_PULSE_WIDTH: f32 = 0.55; // tri 波总宽（半宽 0.275）
+const MIC_PULSE_FULL_LEVEL: f32 = 0.35; // 电平 ≥0.35 即满亮
+const MIC_PULSE_OUT_DIM: f32 = 0.85; // 外弧略淡，强化扩散读感
+const MIC_PULSE_ARC_HALF_ANGLE_DEG: f32 = 40.0;
+const MIC_PULSE_R_IN: f32 = 5.5;
+const MIC_PULSE_R_OUT: f32 = 8.0;
+const MIC_PULSE_ARC_STROKE: f32 = 1.2;
+
+/// tri(p, off)：以 off 为起点的 0→1→0 三角波，宽 0.55，超出返回 0。
+#[cfg(target_os = "windows")]
+fn mic_pulse_tri(p: f32, offset: f32) -> f32 {
+    let x = (p - offset + 1.0) % 1.0;
+    if x >= MIC_PULSE_PULSE_WIDTH {
+        0.0
+    } else {
+        let half = MIC_PULSE_PULSE_WIDTH / 2.0;
+        if x <= half {
+            x / half
+        } else {
+            (MIC_PULSE_PULSE_WIDTH - x) / half
+        }
+    }
+}
+
+/// 墙钟（ms）+ 电平增益 → (内弧 alpha, 外弧 alpha)。
+#[cfg(target_os = "windows")]
+fn mic_pulse_alphas(now_ms: u64, gain: f32) -> (f32, f32) {
+    let p = (now_ms % MIC_PULSE_PERIOD_MS) as f32 / MIC_PULSE_PERIOD_MS as f32;
+    (
+        mic_pulse_tri(p, 0.0) * gain,
+        mic_pulse_tri(p, MIC_PULSE_OUT_OFFSET) * gain * MIC_PULSE_OUT_DIM,
+    )
+}
+
+/// 三态快照 + 峰值电平，一次锁内取出（不为动画二次加锁，避免和音频线程抢锁）。
+#[cfg(target_os = "windows")]
+fn mic_audio_snapshot(state: &OverlayWindowState) -> (bool, bool, f32) {
+    if let Ok(levels) = state.audio_buf.lock() {
+        let empty = levels.is_empty();
+        let audio = !empty && levels.iter().any(|v| v.current > 0.01);
+        let level = levels
+            .iter()
+            .map(|v| v.current)
+            .fold(0.0_f32, f32::max)
+            .clamp(0.0, 1.0);
+        (empty, audio, level)
+    } else {
+        (true, false, 0.0)
+    }
+}
+
+/// overlay 线程重绘决策用（RecordingWithText / RecordingStreamingIdle 分支各调一次）。
+#[cfg(target_os = "windows")]
+fn mic_has_audio(state: &OverlayWindowState) -> bool {
+    mic_audio_snapshot(state).1
+}
+
+/// GDI 无 per-primitive alpha：逐通道向背景色插值近似透明度（仅兜底路径，如实近似）。
+#[cfg(target_os = "windows")]
+fn blend_colorref(fg: COLORREF, bg: COLORREF, a: f32) -> COLORREF {
+    let mix = |f: u32, b: u32| {
+        (b as f32 + (f as f32 - b as f32) * a)
+            .round()
+            .clamp(0.0, 255.0) as u32
+    };
+    COLORREF(
+        mix(fg.0 & 0xFF, bg.0 & 0xFF)
+            | (mix((fg.0 >> 8) & 0xFF, (bg.0 >> 8) & 0xFF) << 8)
+            | (mix((fg.0 >> 16) & 0xFF, (bg.0 >> 16) & 0xFF) << 16),
+    )
+}
+
+/// GDI 兜底共享：声波弧画在 4x 超采样画布（icon 原点系，72×72）。
+/// 左右各一组对称弧（右 -40°..+40°，左 140°..220°），同相位同亮度。
+/// 采样折线（20 段/弧）而非 GDI Arc() —— Arc 方向语义依赖坐标约定，折线零歧义。
+#[cfg(target_os = "windows")]
+fn draw_mic_pulse_gdi_4x(
+    mem_dc: windows::Win32::Graphics::Gdi::HDC,
+    a_in: f32,
+    a_out: f32,
+    bg: COLORREF,
+) {
+    const CX: f32 = 9.0 * 4.0; // icon 坐标 (circ_l+9, circ_t+7)×4 = pill 体中心
+    const CY: f32 = 7.0 * 4.0;
+    const STEPS: usize = 20;
+    let half_ang = MIC_PULSE_ARC_HALF_ANGLE_DEG.to_radians();
+    // (半径 1x, alpha, 角度区间) —— 左右两组同 alpha
+    let arcs = [
+        (MIC_PULSE_R_IN, a_in, -half_ang..half_ang),
+        (MIC_PULSE_R_OUT, a_out, -half_ang..half_ang),
+        (
+            MIC_PULSE_R_IN,
+            a_in,
+            (std::f32::consts::PI - half_ang)..(std::f32::consts::PI + half_ang),
+        ),
+        (
+            MIC_PULSE_R_OUT,
+            a_out,
+            (std::f32::consts::PI - half_ang)..(std::f32::consts::PI + half_ang),
+        ),
+    ];
+    for (r_1x, a, span) in arcs {
+        if a <= 0.0 {
+            continue; // 全透明弧完全不画
+        }
+        let r = r_1x * 4.0; // 1x 半径 → 4x 画布
+        let pen = unsafe {
+            CreatePen(
+                PS_SOLID,
+                (MIC_PULSE_ARC_STROKE * 4.0).round() as i32, // 1.2×4≈5
+                blend_colorref(OVERLAY_BRAND_ORANGE, bg, a),
+            )
+        };
+        let old_pen = unsafe { SelectObject(mem_dc, pen) };
+        let pt = |ang: f32| (CX + r * ang.cos(), CY + r * ang.sin());
+        let (px, py) = pt(span.start);
+        unsafe {
+            let _ = MoveToEx(mem_dc, px.round() as i32, py.round() as i32, None);
+            for i in 1..=STEPS {
+                let ang = span.start + (span.end - span.start) * i as f32 / STEPS as f32;
+                let (x, y) = pt(ang);
+                let _ = LineTo(mem_dc, x.round() as i32, y.round() as i32);
+            }
+            let _ = SelectObject(mem_dc, old_pen);
+            let _ = DeleteObject(pen);
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn draw_recording_indicator_and_waveform(
     hdc: windows::Win32::Graphics::Gdi::HDC,
@@ -2793,14 +3018,8 @@ fn draw_recording_indicator_and_waveform(
 
     // Three-state audio indicator
     // OVERLAY-LOCK-SCOPE-001: snapshot buffer state under lock, compute color outside lock
-    let (buf_empty, has_audio) = if let Ok(levels) = state.audio_buf.lock() {
-        let empty = levels.is_empty();
-        let audio = !empty && levels.iter().any(|v| v.current > 0.01);
-        (empty, audio)
-    } else {
-        // Lock poisoned = stream failed
-        (true, false)
-    };
+    // MIC-PULSE-160: 峰值电平同一次锁内取出（不为动画二次加锁）。
+    let (buf_empty, has_audio, mic_level) = mic_audio_snapshot(state);
     let circ_color = if buf_empty {
         // Buffer empty = device failure / stream error
         RED_STREAM_FAILED
@@ -2849,6 +3068,19 @@ fn draw_recording_indicator_and_waveform(
         let _ = LineTo(mem_dc, 48, 63);
         let _ = SelectObject(mem_dc, old_pen);
         DeleteObject(line_pen);
+        // MIC-PULSE-160: 声波弧画在 4x 画布上（随 StretchBlt 一起 HALFTONE 降采样）。
+        // SHIMMER-FIX-002 范式：相位由墙钟现算。静音 gain=0 整段不画（与改前逐位相同）。
+        if has_audio {
+            let gain = (mic_level / MIC_PULSE_FULL_LEVEL).clamp(0.0, 1.0);
+            if gain > 0.0 {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let (a_in, a_out) = mic_pulse_alphas(now_ms, gain);
+                draw_mic_pulse_gdi_4x(mem_dc, a_in, a_out, BG_DARK);
+            }
+        }
         // Set HALFTONE mode and downscale to target
         SetStretchBltMode(hdc, HALFTONE);
         SetBrushOrgEx(hdc, 0, 0, None);
@@ -3245,13 +3477,8 @@ fn draw_recording_indicator(
     let circ_t = rect.top + (rect.bottom - rect.top - circ_size) / 2;
 
     // Three-state audio indicator
-    let (buf_empty, has_audio) = if let Ok(levels) = state.audio_buf.lock() {
-        let empty = levels.is_empty();
-        let audio = !empty && levels.iter().any(|v| v.current > 0.01);
-        (empty, audio)
-    } else {
-        (true, false)
-    };
+    // MIC-PULSE-160: 峰值电平同一次锁内取出（不为动画二次加锁）。
+    let (buf_empty, has_audio, mic_level) = mic_audio_snapshot(state);
     let circ_color = if buf_empty {
         RED_STREAM_FAILED
     } else if has_audio {
@@ -3295,6 +3522,18 @@ fn draw_recording_indicator(
         let _ = LineTo(mem_dc, 48, 63);
         let _ = SelectObject(mem_dc, old_pen);
         let _ = DeleteObject(line_pen);
+        // MIC-PULSE-160: 声波弧画在 4x 画布上（随 StretchBlt 一起 HALFTONE 降采样）。
+        if has_audio {
+            let gain = (mic_level / MIC_PULSE_FULL_LEVEL).clamp(0.0, 1.0);
+            if gain > 0.0 {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let (a_in, a_out) = mic_pulse_alphas(now_ms, gain);
+                draw_mic_pulse_gdi_4x(mem_dc, a_in, a_out, BG_DARK);
+            }
+        }
         let _ = SetStretchBltMode(hdc, HALFTONE);
         let _ = SetBrushOrgEx(hdc, 0, 0, None);
         let _ = StretchBlt(
@@ -4016,13 +4255,8 @@ mod d2d {
         let circ_t = (h - circ_size) / 2.0; // GDI: (rect height - circ)/2
 
         // Three-state audio indicator (same snapshot logic as GDI :2656-2669).
-        let (buf_empty, has_audio) = if let Ok(levels) = state.audio_buf.lock() {
-            let empty = levels.is_empty();
-            let audio = !empty && levels.iter().any(|v| v.current > 0.01);
-            (empty, audio)
-        } else {
-            (true, false) // Lock poisoned = stream failed
-        };
+        // MIC-PULSE-160: 峰值电平同一次锁内取出（不为动画二次加锁）。
+        let (buf_empty, has_audio, mic_level) = super::mic_audio_snapshot(state);
         let circ_color = if buf_empty {
             COLORREF(0x0000FF) // RED_STREAM_FAILED — device error
         } else if has_audio {
@@ -4088,6 +4322,21 @@ mod d2d {
                 None,
             );
         }
+        // MIC-PULSE-160: 两段同心声波弧（左右各一组对称），仅橘色有声态。
+        // SHIMMER-FIX-002 范式：相位由墙钟现算。静音 gain=0 整段不画（与改前逐位相同）。
+        if has_audio {
+            let gain = (mic_level / super::MIC_PULSE_FULL_LEVEL).clamp(0.0, 1.0);
+            if gain > 0.0 {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let (a_in, a_out) = super::mic_pulse_alphas(now_ms, gain);
+                let cx = circ_l + 9.0;
+                let cy = circ_t + 7.0;
+                mic_pulse_arcs(res, cx, cy, a_in, a_out);
+            }
+        }
         // Left separator: GDI :2716-2727 — 2px gray line at rect.left+30, 20px tall.
         unsafe {
             let sep_l_x = 30.0; // GDI: rect.left + 30
@@ -4108,6 +4357,71 @@ mod d2d {
                 2.0,
                 None,
             );
+        }
+    }
+
+    /// MIC-PULSE-160: 两对同心声波弧（左右各一组对称：右 -40°..+40°，左 140°..220°）。
+    /// 实现取 clip + DrawEllipse：clip 暴露整椭圆的 |θ|≤40° 部分恰好就是 80° 弧段
+    /// （cosθ ≥ cos40° ⟺ |θ| ≤ 40°，左右对称），不用 path geometry，成本 = 4 次描边。
+    /// alpha 用 brush SetOpacity，返回前恢复 1.0（brush 全帧复用）。
+    fn mic_pulse_arcs(res: &D2dResources, cx: f32, cy: f32, a_in: f32, a_out: f32) {
+        let half = super::MIC_PULSE_ARC_HALF_ANGLE_DEG.to_radians();
+        let cos_half = half.cos();
+        for (r, a) in [
+            (super::MIC_PULSE_R_IN, a_in),
+            (super::MIC_PULSE_R_OUT, a_out),
+        ] {
+            if a <= 0.0 {
+                continue; // 全透明弧完全不画
+            }
+            unsafe {
+                res.brush
+                    .SetColor(&colorref_to_d2d(super::OVERLAY_BRAND_ORANGE));
+                res.brush.SetOpacity(a);
+                // 右组：clip x ≥ cx + R·cos40°
+                res.rt.PushAxisAlignedClip(
+                    &D2D_RECT_F {
+                        left: cx + r * cos_half,
+                        top: cy - r - 1.0,
+                        right: cx + r + 1.0,
+                        bottom: cy + r + 1.0,
+                    },
+                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                );
+                res.rt.DrawEllipse(
+                    &D2D1_ELLIPSE {
+                        point: D2D_POINT_2F { x: cx, y: cy },
+                        radiusX: r,
+                        radiusY: r,
+                    },
+                    &res.brush,
+                    super::MIC_PULSE_ARC_STROKE,
+                    None,
+                );
+                res.rt.PopAxisAlignedClip();
+                // 左组：clip x ≤ cx − R·cos40°（对称镜像，同相位同亮度）
+                res.rt.PushAxisAlignedClip(
+                    &D2D_RECT_F {
+                        left: cx - r - 1.0,
+                        top: cy - r - 1.0,
+                        right: cx - r * cos_half,
+                        bottom: cy + r + 1.0,
+                    },
+                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                );
+                res.rt.DrawEllipse(
+                    &D2D1_ELLIPSE {
+                        point: D2D_POINT_2F { x: cx, y: cy },
+                        radiusX: r,
+                        radiusY: r,
+                    },
+                    &res.brush,
+                    super::MIC_PULSE_ARC_STROKE,
+                    None,
+                );
+                res.rt.PopAxisAlignedClip();
+                res.brush.SetOpacity(1.0);
+            }
         }
     }
 
