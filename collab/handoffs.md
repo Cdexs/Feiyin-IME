@@ -4,6 +4,17 @@
 
 
 
+## 2026-09-07 — tester-1 — BUILD-177 ✅ 出包：ESC-174 + EDITICON-175/176（精简流程，待主控验收）
+
+- **基线**：HEAD `0839593` clean（ESC-174 + EDITICON-175/176 已由主控提交）。
+- **精简流程**：Step1 清进程（无残留）→ Step2 git-log 法 UI 免重建（f85c550@09-06 18:47 早于 UI exe 01:15）→ Step3 主程序（2m02s，feiyin-ime 111 / crash-reporter 5）→ Step4 cp -p 同步 Publish/。
+- **七项核验全 PASS**：① 主程序 23:06 本次构建；② 两副本 sha `9d60f458…` 一致异于 `f698a431…`；③ ProductVersion 0.9.0.0；④ 冒烟 PID 29192 Responding=True 无 panic 已清理；⑤ config.toml sha `3186ec8c` 不变；⑥ warnings 111/102 持平（跨两 Worker + menu_icons.rs 新增）；⑦ 🔴 判别探针三证 PASS（`edit_icon_rgba` 全仓 7 处但定义在 menu_icons.rs:28、main.rs 仅注释——实际绘制引用 bgra 变体 GDI :3780 + D2D :4836 三变体全存在；`VK_ESCAPE`=5 恰等；时间戳+sha）。
+- **回归（并行）**：cargo test 全量 **1112P/0F/9I**（=1110+2 新增）+ hotkey 51P + ui_guard 2P；Vitest/E2E Skip。🔴 crash_reporter config 批量 FAIL **本轮首跑出现 23F、复跑未复现**（单独跑 crash-reporter 51P/0F 确认；归因多二进制并行争用 %APPDATA%，前五轮未复现本轮首现 ⇒ 计数重新累计，建议主控关注后续）。
+- **出包语义**：ESC-174 编辑态 ESC 关窗+作废录入 + EDITICON-175/176 铅笔图标(18px@(6,9))+分割线(x=30/2px/20px/0x3A3A3C)；🔴 已知取舍如实写入（WM_PRINTCLIENT 下选区反白不渲染，Gavin 已接受）。不出端测清单给 Gavin，主控自出。
+- **红线**：未 commit / v0.9.0 未动 / 未 cargo clean / 未 cargo tauri build / 零凭证 / 无临时文件。
+
+
+
 ## 2026-09-07 — tester-1 — BUILD-173 ✅ 出包：FIX-172 声波弧动效修复 + 最右侧闪烁本体（精简流程，待主控验收）
 
 - **基线**：HEAD `b0b5c66` clean（FIX-172 修复已由主控提交）。
