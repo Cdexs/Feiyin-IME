@@ -48,3 +48,13 @@
 
 
 
+
+
+
+## 2026-09-08 — 主控 — BUILD-193 ✅ 出包 + Gavin 端测全过（tester-1 故障，核验由主控代做）
+
+- **产物**：`Publish/feiyin-ime.exe` @13:44:56 sha `d081c742…`，两副本一致，异于上包 `6624cdd1…`；v0.9.0.0 未动；config.toml sha `3186ec8c` 未变。HEAD `8280927` 代码区 clean。
+- **本批四改动**：EDITICON-190（图标 A2）+ STREAMFONT-189（上屏字号 16）+ ESC-188（ESC 陈旧位加固）+ FIX-192（右侧空白结构修复）。
+- **tester-1 故障**：出包后模型 API `Bad Request: deepseek-v4-flash`，未交验证报告。产物七项核验由主控独立完成；回归以 coder-1 交付 FIX-192 时的全量 1113P/0F 为准（跑的即最终源码状态，其后零改动）。
+- 🔴 **出包顺带发现 `[TOML-ALL-NUL-001]`**：随包两份规则词表整文件全 NUL，已修复，详见 troubleshooting。
+- **端测**：Gavin「端侧全部通过！」，一票否决项「无新增闪烁」通过。

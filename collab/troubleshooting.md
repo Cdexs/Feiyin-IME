@@ -4746,3 +4746,45 @@ git ls-files --error-unmatch "$f" >/dev/null 2>&1 || { echo "🔴 add 静默失�
 **关联**：与 `[WORKER-GIT-AUTOCRLF-ENV-DIFF-001]` 同属「MSYS git 与原生 Windows git 行为不一致」
 这一族。**通用教训：Worker 侧 git 行为异常时，先问它是哪个 git、读的哪份配置，
 不要默认两侧等价。**
+
+## [TOML-ALL-NUL-001] 🔴 Publish/ 与 target/release/ 下的规则词表整文件变全 NUL 字节，exe 照常启动、功能静默失效【出包前必查】
+
+**发现**：2026-09-08 BUILD-193 出包时 tester-1 发现，主控独立复核确认。
+
+**现象**：
+```
+Publish/scene-rules.toml        size=45591  非NUL字节=0
+Publish/itn-rules.toml          size=37875  非NUL字节=0
+target/release/scene-rules.toml size=45591  非NUL字节=0
+target/release/itn-rules.toml   size=37875  非NUL字节=0
+根目录 scene-rules.toml          size=45591  非NUL字节=45591   ← 完好
+根目录 itn-rules.toml            size=37875  非NUL字节=37875   ← 完好
+```
+
+**关键特征：大小与完好副本逐字节相等，内容全 `\x00`。**
+这不是截断也不是编码损坏 —— 是文件系统**元数据（长度）已落盘、数据块未落盘**，
+典型的非正常关机 / 崩溃 / 断电特征。`ls -l` 看大小正常，肉眼与脚本都容易漏过。
+
+**为什么危险**：
+1. **exe 照常启动，不 panic** —— 词表解析失败走的是降级分支，功能静默失效，
+   与 `[GATE-MATCHES-SHAPE-NOT-CONTENT-001]`、`DIAG-166` 同一失效族：
+   **能跑 ≠ 在工作**。
+2. **根目录副本完好且已 commit**，`git status` 干净 —— git 完全看不见这个问题
+   （`Publish/`、`target/` 均在 .gitignore 内）。
+3. **端测结论会被污染**：Gavin 端测用的是 `Publish/feiyin-ime.exe`。若此前若干包
+   也处于该损坏状态，则场景感知与 ITN 规则在他测试期间是失效的，
+   基于那些包得出的结论需要重新审视。
+
+**检出方法（应纳入出包核验）**：
+```bash
+for f in Publish/*.toml target/release/*.toml; do
+  echo "$f size=$(stat -c%s "$f") 非NUL=$(tr -d '\000' < "$f" | wc -c)"
+done
+```
+🔴 **只比大小检不出来** —— 损坏文件大小与好文件完全一致。必须验内容或比 hash。
+
+**处置**：从根目录 `cp -p` 同步覆盖，核 hash 一致。`config.toml` 属用户数据，不在同步范围。
+
+**待固化**：出包七项核验应增第八项 ——「随包数据文件内容级校验（与根目录 hash 比对）」，
+不能只核 exe。与 `[TOML-STALE-001]`（陈旧副本）是同一类问题的两种形态：
+那条管「版本不对」，这条管「内容全没了」。
