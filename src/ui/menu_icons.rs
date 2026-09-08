@@ -24,7 +24,7 @@ pub fn exit_icon_rgba(size: u32) -> Vec<u8> {
     rasterize(size, power_covered)
 }
 
-// edit_icon_rgba 见本文件头部 EDITICON-182 实现（字体优先 + 几何兜底）。
+// edit_icon_rgba 见本文件下方 EDITICON-190 实现（纯几何 SSAA：铅笔 + 单条下划线，定稿 A2）。
 
 /// EDITICON-176：直通 alpha BGRA（GDI `AlphaBlend` `AC_SRC_ALPHA` 输入格式）。
 /// 仅做 RGBA→BGRA 字节序重排，alpha 通道原样（非预乘）。
@@ -136,22 +136,21 @@ fn power_covered(fx: f32, fy: f32) -> bool {
     ang_from_up.abs() >= POWER_GAP_HALF_RAD
 }
 
-// —— EDITICON-185：编辑图标定稿 = 候选 B「铅笔 + 两条短文本线」（Gavin 拍板）——
-// 构图：两条短文本线（左，读作已有文字）+ 铅笔（右，175 三段式：尖楔+缺口+杆）
-// 斜压在末行延长线上 —— 表达「在文字上编辑」。**逐位复刻 EDITICON-184 预览的像素**
-// （Gavin 选的是他看到的那一版）：铅笔按单位轴参数化（s∈[0,1]），实际画到图标盒
-// 右上缘被盒裁切 —— 这是 184 预览的原样，不许「修正」为短铅笔。
-// 笔尖加固尝试（任务书第二节）：B1 杆加宽 0.085+缺口外移 0.33 / B2 只加宽 / B3 尖楔
-// 加长 0.26 —— 三组网格全部证伪（尖区像素对子采样位相敏感，无一优于原稿 16px 尖区
-// `##o`/`###`），**维持原稿 (0.08/0.22/0.31)**，如实报告不改。
-// A/C 候选与 v3 对照几何已从 cfg(test) 移除（Gavin 已定稿；历史几何可从 git/log 恢复）。
-const PENCIL_TIP: (f32, f32) = (-0.10, 0.14);
-const PENCIL_END: (f32, f32) = (0.40, -0.36);
+// —— EDITICON-190：编辑图标定稿 = 候选 A2「铅笔 + 单条下划线」（Gavin 2026-09-08 目视
+// edit-A vs edit-A2 预览后拍板「图标选a2」，按预览原样定稿，不再调笔矢量）——
+// 构图：铅笔（右上→左下斜压，笔尖指向下方基线）+ 单条下划线（书写基线语义）。
+// 常量来源（187-ALT 三分法）：下划线 y=0.361/x -0.42..0.40 = 184 档案原值；
+// tip y=0.26 推导自档案气隙 1.3px；tip x=-0.24/END=(0.26,-0.24) 推算（沿 175→187
+// 迁移线插值）。⚠️ 铅笔整体下移后右上端 s=1.0 于角内收尾（留 ~0.8px 空隙），
+// **不再被盒缘裁切**——Gavin 看过放大预览后按此样定稿，不许「修正」为触角。
+// 🔴 A1（187 版）几何常量保留在 cfg(test) 对照组（dump_edit_icon_a1_preview），
+// 勿删——187 单本身就是因为 185 清理候选致参数丢失。
+const PENCIL_TIP: (f32, f32) = (-0.24, 0.26);
+const PENCIL_END: (f32, f32) = (0.26, -0.24);
 const PENCIL_HALF_W: f32 = 0.08; // 笔杆半宽（全宽 0.16S）
 const PENCIL_S_TIP: f32 = 0.22; // 尖楔占轴长比例
 const PENCIL_S_GAP_END: f32 = 0.31; // 笔杆起点（尖-杆缺口）
-const TEXT_LINE_1: (f32, f32, f32) = (-0.20, -0.44, 0.02); // (y, x0, x1) 长线
-const TEXT_LINE_2: (f32, f32, f32) = (0.028, -0.44, -0.20); // 短线（18px 单像素行对齐）
+const UNDERLINE: (f32, f32, f32) = (0.361, -0.42, 0.40); // (y, x0, x1) 单条下划线（184 档案原值）
 
 pub fn edit_icon_rgba(size: u32) -> Vec<u8> {
     rasterize(size, edit_icon_covered)
@@ -183,27 +182,27 @@ fn pencil_covered(fx: f32, fy: f32) -> bool {
     }
 }
 
-fn text_line_covered(fx: f32, fy: f32) -> bool {
-    let half = 0.055 / 2.0; // 线厚 ≈1px @18px（渲染为 2px 实条，见 179 报告 alpha 公式注）
-    [TEXT_LINE_1, TEXT_LINE_2].iter().any(|line| {
-        let (y, x0, x1) = *line;
-        (y - half..=y + half).contains(&fy) && (x0..=x1).contains(&fx)
-    })
+fn underline_covered(fx: f32, fy: f32) -> bool {
+    let half = 0.055 / 2.0; // 线厚 ≈1px @18px（alpha 公式注：≥4 子样本命中即渲染为实条）
+    let (y, x0, x1) = UNDERLINE;
+    (y - half..=y + half).contains(&fy) && (x0..=x1).contains(&fx)
 }
 
 fn edit_icon_covered(fx: f32, fy: f32) -> bool {
-    pencil_covered(fx, fy) || text_line_covered(fx, fy)
+    pencil_covered(fx, fy) || underline_covered(fx, fy)
 }
 
-// v3 手工几何（纸+笔）已迁至 cfg(test) 作对照组（dump_edit_icon_preview 的
-// edit-v3-* 预览）——184 起 font fallback 随字体路线一并移除，生产实现=候选 A。
+// v3 手工几何（纸+笔）对照已随 185 移除（Gavin 定稿后无对照需求）；历史几何可从
+// git/log 恢复。生产实现现定稿候选 A2（EDITICON-190），A1 对照在 cfg(test)。
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// EDITICON-185 视觉自证：定稿（候选 B）出 edit-FINAL-{18,18-x8,16-x8}。
-    /// 🔴 预览只证明「形态好不好看」（DIAG-166 教训），不证明运行时行为。
+    /// EDITICON-190 视觉自证：生产定稿（A2）出 edit-A2-{18,16}+x8。
+    /// 🔴 预览只证明「形态好不好看」（DIAG-166 教训），不证明运行时行为；
+    /// 运行时链路已由 Gavin 实际使用 B 图标反证打通。
+    /// 🔴 预览 PNG **保留不清理**（185 清理候选致 A 参数丢失的前车之鉴）。
     #[test]
     fn dump_edit_icon_preview() {
         let dir = std::path::Path::new("D:/Workspace/CodeLab/collab/outbox/coder-2/icons");
@@ -212,7 +211,7 @@ mod tests {
         for size in [18u32, 16] {
             let rgba = edit_icon_rgba(size);
             image::save_buffer(
-                dir.join(format!("edit-FINAL-{size}.png")),
+                dir.join(format!("edit-A2-{size}.png")),
                 &rgba,
                 size,
                 size,
@@ -227,7 +226,7 @@ mod tests {
                 }
             }
             image::save_buffer(
-                dir.join(format!("edit-FINAL-{size}-x8.png")),
+                dir.join(format!("edit-A2-{size}-x8.png")),
                 &big,
                 size * scale,
                 size * scale,
@@ -235,7 +234,7 @@ mod tests {
             )
             .unwrap();
         }
-        // 抽检（定稿 B，与 184 预览逐位同源）：非全空 + 满覆盖墨迹 + 非实心方块
+        // 抽检（候选 A）：非全空 + 满覆盖墨迹 + 非实心方块
         let icon = edit_icon_rgba(18);
         assert!(
             icon.chunks_exact(4).any(|p| p[3] >= 250),
@@ -245,31 +244,147 @@ mod tests {
             icon.chunks_exact(4).any(|p| p[3] == 0),
             "edit icon must have empty regions (not a filled square)"
         );
-        // 铅笔延伸到盒右上缘被裁（184 原样，不许「修正」）——右上角有墨
+        // 铅笔仍伸向右上（A2 笔画到 s=1.0 于角内收尾，近角有墨但不再满贴盒缘——
+        // Gavin 按预览原样定稿，不许「修正」为触角）
         assert!(
             icon[(0 * 18 + 17) * 4 + 3] > 0,
-            "pencil must reach top-right edge (as 184 preview)"
+            "A2 pencil must still reach toward top-right (per approved preview)"
         );
-        // 左上/左下/右下角透明（右上角=铅笔到达处，上面已断言有墨）
+        // 左上/左下/右下角透明
         for (y, x) in [(0usize, 0usize), (17usize, 0usize), (17usize, 17usize)] {
             assert_eq!(icon[(y * 18 + x) * 4 + 3], 0, "corner must be empty");
         }
-        // 笔杆满覆盖像素 (12,6)
+        // 笔杆满覆盖像素 (6,12)
         assert_eq!(
             icon[(6 * 18 + 12) * 4 + 3],
             252,
             "pencil shaft must be full coverage"
         );
-        // 两条文本线存在（行 5 / 行 9 满覆盖）
+        // 单条下划线存在（行 15；y=0.361 档案原值带宽恰落行 15 子采样网格 → 干净单行）
         assert_eq!(
-            icon[(5 * 18 + 5) * 4 + 3],
+            icon[(15 * 18 + 5) * 4 + 3],
             252,
-            "text line 1 must be present"
+            "A2 underline must be a single clean row (archive y=0.361)"
+        );
+        // 下划线右端端像素 (15,16)：距分割线 7px 无粘连；分割线侧（col17）无墨
+        assert!(
+            icon[(15 * 18 + 16) * 4 + 3] >= 128,
+            "A2 underline right end pixel (7px clear of divider)"
+        );
+        assert_eq!(icon[(15 * 18 + 17) * 4 + 3], 0, "no ink beyond A2 x1=0.40");
+        // 笔尖-下划线气隙（≈1.3px 档案值）：行 14 必须透明
+        assert_eq!(
+            icon[(14 * 18 + 6) * 4 + 3],
+            0,
+            "A2 tip-line air gap (archive 1.3px)"
+        );
+        // 笔尖楔区有墨（行 12）
+        assert!(icon[(12 * 18 + 5) * 4 + 3] > 0, "A2 pencil tip wedge ink");
+    }
+
+    // —— EDITICON-190：A1 对照组（187 交付版几何，仅 cfg(test)；🔴 参数留底防再丢）——
+    // A1 = 187 的「铅笔(185 定稿位) + 补偿下划线」：铅笔逐位=185 定稿值，线 y=0.25。
+    // Gavin 2026-09-08 已定裁 A2 为生产（见生产块注释），A1 仅作对照预览，勿删。
+    const A1_TIP: (f32, f32) = (-0.10, 0.14);
+    const A1_END: (f32, f32) = (0.40, -0.36);
+    const A1_LINE: (f32, f32, f32) = (0.25, -0.42, 0.40);
+
+    /// 与生产 `pencil_covered` 同数学的参数化副本（生产函数零触碰）。
+    fn a1_pencil_covered(fx: f32, fy: f32) -> bool {
+        let (tx, ty) = A1_TIP;
+        let (ex, ey) = A1_END;
+        let dx = ex - tx;
+        let dy = ey - ty;
+        let len = (dx * dx + dy * dy).sqrt();
+        let ax = dx / len;
+        let ay = dy / len;
+        let nx = -ay;
+        let ny = ax;
+        let px = fx - tx;
+        let py = fy - ty;
+        let s = px * ax + py * ay;
+        if !(0.0..=1.0).contains(&s) {
+            return false;
+        }
+        let d = (px * nx + py * ny).abs();
+        if s <= PENCIL_S_TIP {
+            d <= PENCIL_HALF_W * (s / PENCIL_S_TIP)
+        } else if s >= PENCIL_S_GAP_END {
+            d <= PENCIL_HALF_W
+        } else {
+            false
+        }
+    }
+
+    fn a1_covered(fx: f32, fy: f32) -> bool {
+        a1_pencil_covered(fx, fy) || {
+            let half = 0.055 / 2.0;
+            let (y, x0, x1) = A1_LINE;
+            (y - half..=y + half).contains(&fy) && (x0..=x1).contains(&fx)
+        }
+    }
+
+    /// A1 对照预览：edit-A1-{18,16}+x8（187 交付原样，供与生产 A2 并排比对/回滚参考）。
+    #[test]
+    fn dump_edit_icon_a1_preview() {
+        let dir = std::path::Path::new("D:/Workspace/CodeLab/collab/outbox/coder-2/icons");
+        std::fs::create_dir_all(dir).unwrap();
+        let scale = 8u32;
+        for size in [18u32, 16] {
+            let rgba = rasterize(size, a1_covered);
+            image::save_buffer(
+                dir.join(format!("edit-A1-{size}.png")),
+                &rgba,
+                size,
+                size,
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+            let mut big = Vec::with_capacity((size * scale * size * scale * 4) as usize);
+            for by in 0..size * scale {
+                for bx in 0..size * scale {
+                    let i = (((by / scale) * size + bx / scale) * 4) as usize;
+                    big.extend_from_slice(&rgba[i..i + 4]);
+                }
+            }
+            image::save_buffer(
+                dir.join(format!("edit-A1-{size}-x8.png")),
+                &big,
+                size * scale,
+                size * scale,
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+        }
+        // 抽检（A1 @18px，与 187 交付断言同源）
+        let icon = rasterize(18, a1_covered);
+        assert!(
+            icon[(0 * 18 + 17) * 4 + 3] > 0,
+            "A1 pencil reaches top-right edge (185 clipping as-is)"
+        );
+        for (y, x) in [(0usize, 0usize), (17usize, 0usize), (17usize, 17usize)] {
+            assert_eq!(icon[(y * 18 + x) * 4 + 3], 0, "A1 corner must be empty");
+        }
+        assert_eq!(
+            icon[(6 * 18 + 12) * 4 + 3],
+            252,
+            "A1 pencil shaft must be full coverage"
         );
         assert_eq!(
-            icon[(9 * 18 + 3) * 4 + 3],
+            icon[(13 * 18 + 5) * 4 + 3],
             252,
-            "text line 2 must be present"
+            "A1 underline must be a single clean row (y=0.25)"
+        );
+        assert_eq!(
+            icon[(13 * 18 + 16) * 4 + 3],
+            255,
+            "A1 underline right end pixel (7px clear of divider)"
+        );
+        assert_eq!(icon[(13 * 18 + 17) * 4 + 3], 0, "no ink beyond A1 x1=0.40");
+        assert_eq!(
+            icon[(12 * 18 + 8) * 4 + 3],
+            0,
+            "A1 tip-line air gap (≈1.5px)"
         );
     }
 
