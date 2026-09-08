@@ -771,7 +771,7 @@ fn create_edit_control(hwnd: HWND, state: &mut OverlayWindowState, rect: &RECT, 
         let hdc = GetDC(hwnd);
         // EDITFONT-183: 测量字体必须与 EDIT 实际字体一致（:860 同步换 EDITFONT 常量），
         // 否则 tmHeight 按 14px 量、控件按 16px 渲染 ⇒ 高度与垂直居中都错。
-        let font = create_clear_type_font(OVERLAY_EDIT_FONT_SIZE);
+        let font = create_clear_type_font(OVERLAY_TEXT_FONT_SIZE);
         let old_font = SelectObject(hdc, font);
         let got = GetTextMetricsW(hdc, &mut tm);
         let _ = SelectObject(hdc, old_font);
@@ -798,7 +798,7 @@ fn create_edit_control(hwnd: HWND, state: &mut OverlayWindowState, rect: &RECT, 
         if desired > available {
             log::error!(
                 "OVERLAY-054-G: font {} requires edit height {} but window {} only leaves {} content pixels; stopping before raising window height",
-                OVERLAY_EDIT_FONT_SIZE,
+                OVERLAY_TEXT_FONT_SIZE,
                 desired,
                 rect_h,
                 available
@@ -859,7 +859,7 @@ fn create_edit_control(hwnd: HWND, state: &mut OverlayWindowState, rect: &RECT, 
             // unified overlay font size as the self-drawn text. We use an independent HFONT
             // (not cached_font) because cached_font is take()+DeleteObject() when the
             // overlay hides/destroys.
-            let edit_font = create_clear_type_font(OVERLAY_EDIT_FONT_SIZE);
+            let edit_font = create_clear_type_font(OVERLAY_TEXT_FONT_SIZE);
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
                     edit_hwnd,
@@ -1355,6 +1355,12 @@ struct OverlayWindowState {
     last_streaming_text: Option<String>,
     /// OVERLAY-051-F/G: cached ClearType font so we don't create/destroy HFONT every frame.
     cached_font: Option<HFONT>,
+    /// STREAMFONT-189: 流式两态（RecordingStreamingIdle 占位 / RecordingWithText）自绘
+    /// 文字专用 HFONT（OVERLAY_TEXT_FONT_SIZE = -16）。必须独立于 cached_font（-14）：
+    /// cached_font 在隐藏/退出清理臂会被 take+DeleteObject（与 edit_font 同一坑，
+    /// :860 注释同源），复用会导致字体被提前删除或双删。生命周期照 edit_font/cached_font
+    /// 范式：绘制选择点惰性创建、存回本字段，清理臂与 cached_font 同处 take+DeleteObject。
+    streaming_font: Option<HFONT>,
     /// OVERLAY-051-G: number of characters currently visible during typewriter tween.
     displayed_chars: usize,
     /// OVERLAY-051-G: deadline for next character reveal during typewriter tween.
@@ -1393,13 +1399,17 @@ const OVERLAY_BORDER_GRAY: COLORREF = COLORREF(0x3A3A3C);
 // control. Gavin decided the edit-mode and non-edit text must look the same size.
 #[cfg(target_os = "windows")]
 const OVERLAY_FONT_SIZE: i32 = -14;
-// EDITFONT-183: 编辑框字号调大一号（Gavin 原话），独立于自绘文字的 OVERLAY_FONT_SIZE。
-// 取值 -16（14→16px，主控裁定）：Segoe UI em 16 ⇒ tmHeight ≈ 21，compute_edit_box_geometry
-// 的 available = 36-2*4 = 28 ⇒ desired(≈23) ≤ available，36px 窗高装得下不裁字。
-// 已知取舍（Gavin 知情）：进出编辑态文字 14→16 视觉跳变；若 Gavin 不要跳变，两处
-// 常量合一即可（改回一行）。自绘文字各态保持 -14 逐位不变。
+// EDITFONT-183: 编辑框字号调大一号（Gavin 原话）。STREAMFONT-189（Gavin 2026-09-08
+// 拍板「实时上屏也调大，和编辑态同步」）：本常量从「编辑框专用」升为「转写文字统一
+// 字号」，同时服务 —— EDIT 控件（WM_SETFONT）、D2D streaming_text_format（实时上屏 +
+// 占位提示）、GDI streaming_font（D2D 失败兜底同两态）、两态测量
+// （adjust_overlay_pos_size_for_text）。取值 -16（14→16px）：Segoe UI em 16 ⇒
+// tmHeight ≈ 21，available = 36-2*OVERLAY_TEXT_DRAW_VERTICAL_INSET(4) = 28 ⇒
+// desired(≈23) ≤ available，36px 窗高装得下不裁字（overlay_text_area_capacity_guard
+// 同时守护 14/16 两个字号）。处理中/箭头/Error/Info 小字仍归 OVERLAY_FONT_SIZE(-14)，
+// 逐位不变。
 #[cfg(target_os = "windows")]
-const OVERLAY_EDIT_FONT_SIZE: i32 = -16;
+const OVERLAY_TEXT_FONT_SIZE: i32 = -16;
 // OVERLAY-054-C: file-level button border color. Kept at 0x707070 (value unchanged).
 // Tests can now reference this constant instead of mirroring the literal.
 #[cfg(target_os = "windows")]
@@ -1537,6 +1547,7 @@ fn run_overlay_thread(
         target_size: RECORDING_OVERLAY_SIZE,
         last_streaming_text: None,
         cached_font: None,
+        streaming_font: None,
         displayed_chars: 0,
         tween_deadline: None,
         tween_target_chars: 0,
@@ -1892,6 +1903,13 @@ fn run_overlay_thread(
                         state.word_timings.clear();
                         state.tween_audio_origin = None;
                         state.tween_timeline_origin = None;
+                        // ESC-188: 进入编辑态前空读一次，排掉在别处按 ESC 攒下的陈旧
+                        // 转变位（0x0001 = 「自上次读取以来被按过」，两态之外无人读它，
+                        // 不排掉的话本态首个 tick 会凭空命中 ⇒ CancelRequested ⇒ 转写
+                        // 文本丢失）。此处仅丢弃返回值，不做任何位判断。
+                        unsafe {
+                            let _ = GetAsyncKeyState(VK_ESCAPE.0 as i32);
+                        }
                         state.request = state.request.as_mut().map(|r| {
                             r.status = OverlayStatus::StreamingEditing { text: text.clone() };
                             r.clone()
@@ -1982,6 +2000,14 @@ fn run_overlay_thread(
                         state.tween_audio_origin = None;
                         state.tween_timeline_origin = None;
                         if let Some(font) = state.cached_font.take() {
+                            unsafe {
+                                let _ = DeleteObject(font);
+                            }
+                        }
+                        // STREAMFONT-189: streaming_font 与 cached_font 同生命周期 ——
+                        // 两字体互不复用（复用即双删，见 edit_font :860 注释同源坑），
+                        // 此处必须配对清 second font。
+                        if let Some(font) = state.streaming_font.take() {
                             unsafe {
                                 let _ = DeleteObject(font);
                             }
@@ -2826,11 +2852,33 @@ fn draw_overlay_to_dc(
 
     // OVERLAY-051-F: reuse a cached ClearType font instead of creating/destroying one per frame.
     // OVERLAY-054-E: use file-level OVERLAY_FONT_SIZE so cached font matches measuring font.
-    let font = state
-        .cached_font
-        .unwrap_or_else(|| create_clear_type_font(OVERLAY_FONT_SIZE));
+    // STREAMFONT-189: 流式两态（RecordingStreamingIdle 占位 / RecordingWithText）改选
+    // streaming_font（OVERLAY_TEXT_FONT_SIZE = -16），与 D2D streaming_text_format /
+    // EDIT 控件 / 两态测量同号；其余态（处理中/箭头/Error/Info 小字等）维持 cached_font
+    // (-14) 逐位不变。选择点收在本处是刻意的：全 GDI 帧共用一次 SelectObject，
+    // 流式兜底路径内的 measure_text_width（draw_recording_overlay_with_text :3579，
+    // D2D 成败都消费）与 draw_text 全部继承此处所选字体 ⇒ 测渲必然同号（EDITFONT-183
+    // 的宽度低估教训在此结构性排除）。生命周期照 edit_font/cached_font 范式：
+    // 惰性创建 + 存回字段，DeleteObject 配对在隐藏/退出清理臂（cached_font 同臂）。
+    let streaming_text = matches!(
+        state.request.as_ref().map(|r| &r.status),
+        Some(OverlayStatus::RecordingStreamingIdle) | Some(OverlayStatus::RecordingWithText { .. })
+    );
+    let font = if streaming_text {
+        state
+            .streaming_font
+            .unwrap_or_else(|| create_clear_type_font(OVERLAY_TEXT_FONT_SIZE))
+    } else {
+        state
+            .cached_font
+            .unwrap_or_else(|| create_clear_type_font(OVERLAY_FONT_SIZE))
+    };
     let old_font = unsafe { SelectObject(hdc, font) };
-    state.cached_font = Some(font);
+    if streaming_text {
+        state.streaming_font = Some(font);
+    } else {
+        state.cached_font = Some(font);
+    }
 
     unsafe {
         let _ = SetBkMode(hdc, TRANSPARENT);
@@ -4036,8 +4084,8 @@ fn draw_editing_overlay_chrome(
 mod d2d {
     use super::{
         OverlayWindowState, COLORREF, OVERLAY_BG_DARK, OVERLAY_BORDER_GRAY, OVERLAY_BRAND_ORANGE,
-        OVERLAY_FONT_SIZE, OVERLAY_TEXT_DRAW_VERTICAL_INSET, OVERLAY_TEXT_WHITE,
-        STREAMING_TEXT_LEFT_MARGIN, STREAMING_TEXT_RIGHT_MARGIN,
+        OVERLAY_FONT_SIZE, OVERLAY_TEXT_DRAW_VERTICAL_INSET, OVERLAY_TEXT_FONT_SIZE,
+        OVERLAY_TEXT_WHITE, STREAMING_TEXT_LEFT_MARGIN, STREAMING_TEXT_RIGHT_MARGIN,
     };
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::RECT;
@@ -4077,9 +4125,10 @@ mod d2d {
         /// Face is "Microsoft YaHei UI" SemiBold — see the note on the field below.
         pub text_format: windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
         /// D2D-P1: streaming-state text format — left-aligned (LEADING), vertical center,
-        /// NO_WRAP. Face "Segoe UI" Normal 14px, chosen to match the GDI path's
-        /// `create_clear_type_font` ("Segoe UI", FW_NORMAL, OVERLAY_FONT_SIZE = -14 → 14px)
-        /// so the single GDI metric source (measure_text_width) tracks the drawn width.
+        /// NO_WRAP. Face "Segoe UI" Normal, STREAMFONT-189 起字号 = OVERLAY_TEXT_FONT_SIZE
+        /// (-16 → 16px)，与 GDI 兜底的 streaming_font 同号（EDITFONT-183 曾是 14px，
+        /// Gavin 2026-09-08 拍板实时上屏与编辑态同号），单一 GDI 度量源
+        /// (measure_text_width) 仍以所选字体为源，测渲不漂移。
         /// (P0's format comment claimed "must match the GDI face" but used YaHei UI
         /// SemiBold; for the processing state that was an intentional standalone choice —
         /// Chinese-only text falls back to the same glyph engine either way, and Gavin has
@@ -4141,7 +4190,9 @@ mod d2d {
             text_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             // D2D-P1: streaming-state format — same face/weight as the GDI text path
-            // ("Segoe UI", FW_NORMAL, 14px), left-aligned, single line, no wrap.
+            // ("Segoe UI", FW_NORMAL), left-aligned, single line, no wrap.
+            // STREAMFONT-189: 字号归 OVERLAY_TEXT_FONT_SIZE(16px)，与 GDI 兜底
+            // streaming_font / EDIT 控件同号；其余三个 format 仍绑 OVERLAY_FONT_SIZE。
             let gdi_family: Vec<u16> = "Segoe UI".encode_utf16().collect();
             let streaming_text_format = dwrite.CreateTextFormat(
                 PCWSTR(gdi_family.as_ptr()),
@@ -4149,7 +4200,7 @@ mod d2d {
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
-                -OVERLAY_FONT_SIZE as f32, // GDI negative height (em) → D2D positive size
+                -OVERLAY_TEXT_FONT_SIZE as f32, // GDI negative height (em) → D2D positive size
                 PCWSTR(locale.as_ptr()),
             )?;
             streaming_text_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
@@ -6143,12 +6194,15 @@ fn adjust_overlay_pos_size_for_text(
     current_pos: &[i32; 2],
     current_size: &[i32; 2],
 ) -> ([i32; 2], [i32; 2]) {
-    // EDITFONT-183: 测量字号按状态选择 —— StreamingEditing 的文字由 EDIT 控件以
-    // OVERLAY_EDIT_FONT_SIZE(16px) 渲染，测量必须跟随；RecordingWithText 由 GDI/D2D
-    // 自绘仍是 OVERLAY_FONT_SIZE(14px)。若编辑态仍按 14px 量宽，自动宽度低估 ~14%
-    // ⇒ 文字更早溢出 ⇒ ES_AUTOHSCROLL 滚动更频繁（FIX-172-B 依赖测渲一致）。
+    // EDITFONT-183: 测量字号按状态选择。STREAMFONT-189：RecordingWithText 的自绘文字
+    // 也已归 OVERLAY_TEXT_FONT_SIZE(16px) 渲染（D2D streaming_text_format + GDI
+    // streaming_font 兜底），测量必须跟随；若仍按 14px 量宽，自动宽度低估 ~14%
+    // ⇒ 文字更早溢出 ⇒ ES_AUTOHSCROLL 横向滚动更频繁（FIX-172-B 依赖测渲一致，
+    // 这是正确性不是外观 —— EDITFONT-183 在编辑态踩过并修过同一坑）。
     let font_size = match status {
-        OverlayStatus::StreamingEditing { .. } => OVERLAY_EDIT_FONT_SIZE,
+        OverlayStatus::RecordingWithText { .. } | OverlayStatus::StreamingEditing { .. } => {
+            OVERLAY_TEXT_FONT_SIZE
+        }
         _ => OVERLAY_FONT_SIZE,
     };
     let text = match status {
@@ -9941,22 +9995,28 @@ mod overlay_shimmer_tests {
     }
 
     // === OVERLAY-054-H: text-area capacity guard ===
-    // The 36px recording overlay must leave enough drawing height for the -14 ClearType
-    // font plus a 6px cushion. If this trips, 054-G/H class clipping has regressed.
+    // The 36px recording overlay must leave enough drawing height for the ClearType
+    // font plus a 6px cushion. STREAMFONT-189: the streaming text now renders at
+    // OVERLAY_TEXT_FONT_SIZE (16px), so the guard covers both font sizes. If this
+    // trips, 054-G/H class clipping has regressed.
 
     #[cfg(target_os = "windows")]
     #[test]
     fn overlay_text_area_capacity_guard() {
-        let font_h = super::OVERLAY_FONT_SIZE.unsigned_abs() as i32;
         let drawing_area =
             super::RECORDING_OVERLAY_SIZE[1] - 2 * super::OVERLAY_TEXT_DRAW_VERTICAL_INSET;
-        assert!(
-            drawing_area >= font_h + 6,
-            "OVERLAY-054-H: {}px drawing area must fit {}px font + 6px cushion ({}px needed)",
-            drawing_area,
-            font_h,
-            font_h + 6
-        );
+        for font_h in [
+            super::OVERLAY_FONT_SIZE.unsigned_abs() as i32,
+            super::OVERLAY_TEXT_FONT_SIZE.unsigned_abs() as i32,
+        ] {
+            assert!(
+                drawing_area >= font_h + 6,
+                "OVERLAY-054-H: {}px drawing area must fit {}px font + 6px cushion ({}px needed)",
+                drawing_area,
+                font_h,
+                font_h + 6
+            );
+        }
     }
 
     // === OVERLAY-FIX-006: Border darken + Shimmer rewrite + Preview adjustments ===
@@ -11532,6 +11592,7 @@ mod overlay_086_d2d_p1_guard_tests {
             target_size: RECORDING_OVERLAY_SIZE,
             last_streaming_text: None,
             cached_font: None,
+            streaming_font: None,
             displayed_chars: 0,
             tween_deadline: None,
             tween_target_chars: 0,
@@ -12070,6 +12131,7 @@ mod overlay_109_d2d_p2p3_guard_tests {
             target_size: RECORDING_OVERLAY_SIZE,
             last_streaming_text: None,
             cached_font: None,
+            streaming_font: None,
             displayed_chars: 0,
             tween_deadline: None,
             tween_target_chars: 0,
