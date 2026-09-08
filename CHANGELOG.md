@@ -853,3 +853,4 @@ EDITICON-187-ALT | A2 变体预览（cfg(test)，生产零改动）：铅笔整�
 STREAMFONT-189 | 实时上屏文字 14→16 与编辑态同号：常量升格 OVERLAY_TEXT_FONT_SIZE + D2D streaming format + GDI streaming_font 双字体生命周期 + 测量归 16（仅 src/main.rs） | coder-1 | 2026-09-08
 EDITICON-190 | A2 几何迁入生产（Gavin 目视定裁「图标选a2」）：仅换常量 PENCIL_TIP(-0.24,0.26)/PENCIL_END(0.26,-0.24)/UNDERLINE(0.361,-0.42,0.40)，三个 covered 函数体逐字节未动，三 pub 签名不变免集成单；A1 全套几何常量+预览测试留 cfg(test) 对照（参数留底防再丢）；生产输出与定裁预览 md5 一致 187ab98e；1113P/0F（-1+1 用例数不变）、warnings 111-102 持平、fmt0、零字体 grep=0 | coder-2 | 2026-09-08
 DIAG-191 | 编辑态右侧大片空白诊断（只查不修）：主因 H5=EDIT 先于扩窗用旧 rect 创建且无跟随 resize，BUILD-186 缺口 174px；H1-H4 逐条判定；修法 1 推荐（src 零改动交付） | coder-1 | 2026-09-08
+FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗再建 EDIT（DIAG-191 H5 定案），纯移动 +10/-3 | coder-1 | 2026-09-08

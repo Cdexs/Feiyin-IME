@@ -1920,9 +1920,14 @@ fn run_overlay_thread(
                         switch_overlay_layered_mode(hwnd, &mut state, OverlayLayeredMode::Slwa);
                         // Remove NOACTIVATE so overlay can receive focus/IME
                         remove_noactivate(hwnd);
-                        let rect = get_window_client_rect(hwnd);
-                        create_edit_control(hwnd, &mut state, &rect, &text);
-                        // Expand window to fit current text before focusing
+                        // FIX-192 (DIAG-191 H5): 先按目标状态算出最终窗口尺寸并应用，
+                        // 再按【扩窗后】的 client rect 建 EDIT —— 原顺序相反（先按旧
+                        // rect 建 EDIT 再扩窗），edit_w 唯一计算点（:759-761）拿到的是
+                        // 14px 度量的旧流式窗宽 ⇒ EDIT 比 16px 渲染所需窄 174px（DIAG-191
+                        // 实测）⇒ 扩窗后右侧露出父窗背景 = Gavin 端测「右侧一大片空白、
+                        // 光标进不去」。整个重排块处于入口 SW_HIDE 与 :1948 SW_SHOW 的
+                        // 隐藏区间内，不产生可见重绘（G5 判据不受影响：SW_HIDE 与
+                        // switch_overlay_layered_mode 仍在本块内且先于重排）。
                         let (new_pos, new_size) = adjust_overlay_pos_size_for_text(
                             hwnd,
                             &state.request.as_ref().unwrap().status,
@@ -1943,6 +1948,8 @@ fn run_overlay_thread(
                                 SWP_NOZORDER,
                             );
                         }
+                        let rect = get_window_client_rect(hwnd);
+                        create_edit_control(hwnd, &mut state, &rect, &text);
                     }
                     unsafe {
                         let _ = ShowWindow(hwnd, SW_SHOW);
