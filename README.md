@@ -1,4 +1,4 @@
-# 飞音智能语音输入 · Flash Voice Input
+# 飞音智能语音输入 · FlashVoice Input
 
 **[English](README.en.md) | 中文**
 

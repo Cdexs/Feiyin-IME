@@ -1,4 +1,4 @@
-# Flash Voice Input
+# FlashVoice Input
 
 **English | [中文](README.md)**
 
@@ -17,7 +17,7 @@ talk and what belongs on the screen — you say "um" and "you know", you start a
 through, you say "half past three" instead of `3:30`. And more importantly:
 **what you want to send in a chat app and what you want to type into a terminal are not the same thing.**
 
-Flash Voice Input is about that second half: **going from *heard* to *usable*.**
+FlashVoice Input is about that second half: **going from *heard* to *usable*.**
 
 ---
 
@@ -34,8 +34,8 @@ in place, then let it go to the app.
 
 ### 🎯 It knows what app you're in
 
-The same sentence should look different depending on where it lands. Flash detects the active window
-and switches its output style automatically:
+The same sentence should look different depending on where it lands. FlashVoice detects the active
+window and switches its output style automatically:
 
 | Where you are | What it does |
 |---------------|--------------|
@@ -50,7 +50,7 @@ done — no recompiling.**
 
 ### 🔢 Numbers the way people actually say them
 
-Spoken numbers and written numbers are different things. Flash converts them for you:
+Spoken numbers and written numbers are different things. FlashVoice converts them for you:
 
 ```
 half past four, meeting          →  4:30 meeting
