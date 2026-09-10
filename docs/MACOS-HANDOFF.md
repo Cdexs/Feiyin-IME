@@ -1690,3 +1690,24 @@ Windows 侧为流式窗（RecordingWithText/RecordingStreamingIdle）的麦克�
 > 🔴 **上节（EDITICON-182 字体路线）已被 EDITICON-184 撤销**（Gavin 拍板：环境无关性优先，
 > 字体渲染不采用）——menu_icons.rs 字体代码已全部移除，macOS 侧无需参考该节方法论；
 > 编辑图标回到纯几何（三候选预览见 `collab/outbox/coder-2/icons/edit-{A,B,C,v3}-*.png`）。
+
+## VERBOSE-195（2026-09-10，主控）· 场景 style 冗余压缩 —— macOS 侧影响
+
+**改动性质**：纯 `scene-rules.toml` 数据改动，零 Rust 改动。
+
+🔴 **macOS 必须同步关注**：`scene-rules.toml` 是**平台中立**资源
+（`src/scene/mod.rs` 平台中立，两端编译同一份，且 `include_str!` 内置同一个文件）。
+本次改的 7 组 `style` 字段**两端同样生效**，macOS 端无需改代码即自动获得冗余压缩行为。
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| 7 组 style 追加 CONDENSE 条款 | ✅ **自动生效**，行为与 Windows 一致（style 是纯提示词文本，无平台分支） |
+| agent 组 +`ZCode.exe` | ⚠️ **Windows only** —— macOS 可执行名惯例不同（参考同组既有 `"Claude"` / `"ChatGPT"` 无 .exe 写法）。**macOS 端接手时需自行核实 ZCode 的 macOS 可执行名并补录**，否则该应用在 macOS 上落入 Unknown |
+| `bundle_id` 字段 | 未使用（Phase 4 预留，当前忽略），本次未动 |
+| 行为变更告知 | 🔴 **这是行为变更不是 bug 修复** —— macOS 端若已按「不压缩冗余」写过测试或文档，需同步更新 |
+
+**已知限制（两端同源，macOS 一并适用）**：
+1. 开翻译时本次改动全部失效（`optimize_and_translate` 不传 scene，`llm/mod.rs:997` 签名无 scene 位）——平台中立缺陷。
+2. 翻译路径绕过 `flatten_multiline`（`llm/mod.rs:898` 自陈）——平台中立缺陷。
+3. agent 组 `kind="chat"` 致 F4 首句写「typing into a chat application」与 style 自相矛盾，
+   本次以 style 内 `NOTE` 治标；根治需 `SceneKind` 加 `Agent` 变体 = **平台中立 Rust 改动，两端同受影响**。

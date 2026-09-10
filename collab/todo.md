@@ -1,5 +1,84 @@
 # 任务列表 · voice-ime
 
+## ✅ 2026-09-10 — VERBOSE-195 正式写作场景冗余压缩（Gavin 拍板并扩容，**已执行，待端测**）
+
+> 🔴 **2026-09-10 Gavin 拍板扩容，推翻本单原「doc 不动」取舍**：
+> 「除了 chat 类，其他都算正式写作场景，在去除结巴字词、重复字句、纠正字词后都要进行冗余内容的优化简化」。
+> ⇒ 范围从 agent+terminal **扩到 email / doc / browser 全部**，只留社交 chat 两组不动。
+>
+> **已执行**（纯词表，免构建，重启即生效）：7 组 style 追加 CONDENSE 条款 + agent 组 `+ZCode.exe`。
+> 三副本 md5 `fb5a54ca0a85186a14ae6f98ed59df65`，TOML 解析 PASS，社交组 CONDENSE 零命中。
+> 详见 `logs/20260910.md` 与 CHANGELOG `VERBOSE-195`。
+>
+> ### 🔴 本单遗留（全需 Rust 改动，等 Worker 额度恢复）
+>
+> | # | 项 | 说明 |
+> | --- | --- | --- |
+> | 1 | **pi desktop exe 名** | Gavin 指定补录但本机未装、全盘扫描零命中。**猜=静默失效**，待 Gavin 给准确 exe 名（纯词表，拿到即可加，仍免构建） |
+> | 2 | **翻译路径补 scene + 用户基座** | `optimize_and_translate`(`main.rs:8783`) 只传 4 参，`scene_context`/`multiline_safe` 就在 `:8717` 同作用域没传；`build_translate_system_content`(`llm/mod.rs:997`) 签名无 scene 位。⇒ **开翻译时 VERBOSE-195 全部失效** |
+> | 3 | 🔴 **翻译路径补 multiline_safe**（优先级最高，非提示词问题） | `llm/mod.rs:898` 自陈绕过 `try_once`⇒ 不走 `flatten_multiline`(`:903`)。终端/vim(`multiline_safe=false`)开翻译可能吃到换行被当命令执行。**推自代码未实测**，需一次端测坐实 |
+> | 4 | **agent 从 chat kind 拆出** | `scene/mod.rs:350-353` F4 首句拼 `typing into a {kind} application` ⇒ agent 场景实际写「typing into a **chat** application」，与 style 自相矛盾且反向拉口语。本次 style 内 `NOTE` 治标，根治需 `SceneKind::Agent` + 全量回归 |
+> | 5 | **翻译版 L0-1(A) 保真底线** | 既有裁定(`llm/mod.rs:53`)「L0 不注入翻译路径」本身对（L0-1 要求语义单元原样出现，与翻译相悖），但副作用=翻译路径**完全无保真底线**：`UNIT_SYMBOL_PROTECTION_TRANSLATE` 只护数字单位，否定/情态/限定词/主命题全裸奔。照该常量先例做翻译版 L0-1(A) |
+> | 6 | CONDENSE 条款重复 7 份 | 运行时只注入 1 份（一次只匹配一个场景）⇒ **token 成本不变**，代价是**维护性**：改一处要改 7 处（ide_terminal 两处同串已是既有坑）。根治=代码侧按 kind 统一注入或 toml 加共享段 |
+> | 7 | browser 组已知局限 | 场景按 exe 匹配，浏览器 exe 就是 chrome.exe，**无法区分网页内是微博/评论（社交）还是文档编辑**。本次按 Gavin「其他都算正式」一并加了压缩。此为既有架构局限非本次引入 |
+
+
+**Gavin 原话**：「除了聊天、社交类软件之外，比如 agent、terminal 等正式应用软件中，
+格式化输出没有优化掉输入文本中的冗余、重复的字句（词语），这需要通过系统提示词来优化」。
+
+### 取证结论：不是「规则缺失」，是许可被三重锁死
+
+`src/llm/mod.rs:283-286` 的 L0-1(B) **早就写了**允许删：
+`YOU MAY REMOVE OR CONDENSE … verbatim repetition and redundant restatement of the same point`。
+没生效的原因是三条叠加：
+
+| # | 位置 | 原文 | 锁死机制 |
+| --- | --- | --- | --- |
+| 1 | `scene-rules.toml:95`（agent） | `Keep the intent and wording intact.` | L3 明令保持措辞。与 L0-1(B) **形式上不冲突**（一个「可以删」一个「保持原样」）⇒ 层级优先级 `META_RULE_PRECEDENCE:266` 判不了，模型自然听具体指令 = 不删 |
+| 2 | `scene-rules.toml:200` **和 `:265`**（ide_terminal，两处同串） | `Technical style. … No pleasantries.` | 一个字没提冗余。「No pleasantries」= 不要客套，≠ 删重复。L0-1(B) 是 **MAY** 不是 MUST，无 L3 驱动 ⇒ 默认不行使 |
+| 3 | `src/llm/mod.rs:299-301` | `TIE-BREAKER: if unsure … KEEP IT` | 口语冗余天然是灰色地带（强调？澄清？啰嗦？），一犹豫就保留 |
+
+### 落点必须是 L3 不是 L0（硬理由）
+
+- **爆炸半径**：L0 全场景吃。把 MAY 升 MUST 会连微信/QQ 一起压缩，正是 Gavin 排除的场景。
+- **架构自证**：`src/llm/mod.rs:294-296` 红字明写
+  `🔴 WHETHER to polish at all is decided ONLY by the scene style rule in layer L3, never here`
+  ⇒ 本方案不是发明新机制，走的是它自己指定的那条路。
+- L0-1 的 (A) 与 TIE-BREAKER **一字不动**（DEC-060 保真底线）。
+
+### 改动清单（三处，全在 scene-rules.toml，零 Rust 改动）
+
+🔴 **ide_terminal 是两处同串（`:200` + `:265`）—— 只改一处 = 半失效**（`feedback_no_patch_design` 的坑）。
+
+每条新增措辞自带「刹车」子句 `brevity NEVER outranks completeness`，
+钉死不得越界到 L0-1(A)（数字/单位/否定/情态/限定词/路径/标识符）——
+这是「修 A 且不带出 B」，不是把风险二选一递给 Gavin。
+
+🔴 措辞**不写 `L0-1(B)` 跨层引用**，自带完整语义 —— 同 `src/llm/mod.rs:52-53`
+对 `UNIT_SYMBOL_PROTECTION_TRANSLATE` 的判例（悬空引用有 PROMPT-ARCH-020 同因风险，
+且 toml 是数据文件、可被用户副本覆盖，写死层号更脆）。
+
+### 交付形态：免构建、免出包 ✅（已核实，非记忆）
+
+`src/scene/mod.rs:284-305` = 运行时**优先读 exe 同级 `scene-rules.toml`**，
+失败才回落 `include_str!` 内置（`:14`）。⇒ 改三副本 + 重启即可端测。
+三副本现 md5 一致 `d3356ef8ba8f7683a5447012b4807cba`（根 / Publish/ / target/release/），
+无 `[TOML-ALL-NUL-001]` 污染。
+
+🔴 **三个 Worker 全额度耗尽期间，这是少数能推进的任务形态**（改数据文件，非 Rust 生产代码）。
+
+### 卡点：DEC-059 要求真实 API A/B 实证
+
+提示词改动完成判据 = 固定样本改前改后对照 + 贴原始输出，不接受静态论证。
+Worker 全挂 ⇒ 合成 A/B 做不了。**建议改由 Gavin 端测充当 A/B**：
+同一句话在改前包/改后各口述一遍，对照上屏结果 —— 比合成样本更有说服力。
+
+### 主控声明的取舍（Gavin 可一句话推翻）
+
+- `doc` 场景（`:323` 正式书面语，Word 等）**本单不动** —— Gavin 只点名 agent + terminal。
+  书面语场景压缩收益可能更大，但属未经要求的扩大，不默认执行。
+- `chat`（`:26`/`:79`）、`email`、`browser` 一律不动 —— Gavin 明确排除聊天社交类。
+
 ## 🔴 2026-09-10 会话状态：**三个 Worker 全部额度耗尽，本轮无法派发任何任务**
 
 coder-1 / coder-2（`GLM-5.3-Flash · OpenCode Go`）与 tester-1（`deepseek-v4-flash · OpenCode Go`）
