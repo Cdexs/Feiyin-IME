@@ -905,3 +905,11 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **顺带**：`worker-guide.md` 396→299 行；`voice-ime/CLAUDE.md` 订正 6 处过时内容（Paraformer / eframe / GDI / 缺 5 模块 / build-guide 指错 / exe 名）
 - **新增决策**：DEC-064
 - **负责人**：主控 ｜ **日期**：2026-09-10
+
+## README-212 · 2026-09-10 · ✅ 中英 README 按 v0.9.0 重写
+
+- **改法**：功能表格罗列 → 叙事式产品页（先立问题，再用带例子的段落讲体验）
+- **英文名**：`Feiyin Smart Voice Input` → `Flash Voice Input`（与 Gavin 网页改的中文标题对齐）
+- **订正**：SenseVoice→FunASR Nano CTC；模型体积按实测重填；补两个可编辑规则文件；exe 名；补 v0.8~0.9 新能力
+- 🔴 **查出并纠正文档冲突**：翻译方向以代码为准（`target_language` 配置决定，非内容自动双向，且无界面开关）
+- **负责人**：主控 ｜ **日期**：2026-09-10

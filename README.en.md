@@ -1,8 +1,8 @@
-# Feiyin Smart Voice Input
+# Flash Voice Input
 
 **English | [中文](README.md)**
 
-> A Windows system-tray voice input tool. Hotkey-triggered, local ASR + LLM optimization, ready to use out of the box.
+> Just talk. The words appear as fast as you speak them — and they know which app you're typing into.
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](https://github.com/Cdexs/Feiyin-IME)
 [![Version](https://img.shields.io/badge/version-v0.9.0-green)](https://github.com/Cdexs/Feiyin-IME/releases)
@@ -10,155 +10,216 @@
 
 ---
 
-## Features
+## Why another voice input tool
 
-| Feature | Description |
-|---------|-------------|
-| 🎙️ **Global Hotkey Recording** | Toggle / PTT modes, fully customizable key bindings |
-| 🧠 **Local Speech Recognition** | SenseVoice multi-language model (Chinese / English / Japanese / Korean / Cantonese), INT8 quantized |
-| ✨ **LLM Text Optimization** | OpenAI-compatible API for error correction, punctuation and formatting |
-| 🔤 **Offline Translation** | opus-mt CT2 model, bidirectional Chinese ↔ English, auto-segmented for long text |
-| 🔡 **Punctuation Restoration** | CT-Transformer ONNX model, automatically adds punctuation after transcription |
-| 📖 **User Wordbook** | Custom term mappings + automatic learning of high-frequency corrections, SQLite persistence |
-| 🔇 **Microphone Mute Detection** | Detects mute before hotkey press and during recording, immediate notification |
-| 🌐 **Multi-language UI** | Simplified Chinese / Traditional Chinese / English |
-| 💥 **Crash Reporting** | Standalone crash-reporter process, local storage + email notification |
+Most speech-to-text stops at turning sound into characters. But there's still a gap between how people
+talk and what belongs on the screen — you say "um" and "you know", you start a sentence over halfway
+through, you say "half past three" instead of `3:30`. And more importantly:
+**what you want to send in a chat app and what you want to type into a terminal are not the same thing.**
+
+Flash Voice Input is about that second half: **going from *heard* to *usable*.**
 
 ---
 
-## Quick Start
+## What it's like to use
 
-### Requirements
+### 🎤 Words appear while you're still talking
 
-- Windows 10 / Windows 11 (64-bit)
-- WebView2 Runtime (auto-installed on first launch if missing on Windows 10)
-- Microphone device
+Press the hotkey and text flows into a floating overlay at the pace you're speaking — not a whole
+paragraph dumped after you finish, and not a mechanical fixed-rate typewriter either.
+**Pause and it pauses; speed up and it keeps up.**
 
-### Installation
+Misspoke? No need to start over. **Click the text in the overlay while still recording** and edit it
+in place, then let it go to the app.
 
-1. Download and extract the release package to any directory
-2. Double-click `voice-ime.exe` — the Feiyin icon appears in the system tray
-3. Press the default hotkey **F9** to start recording, press again to stop and inject text
-4. Right-click the tray icon → **Settings** to configure hotkeys, LLM, translation, etc.
+### 🎯 It knows what app you're in
 
-### Release Package Structure
+The same sentence should look different depending on where it lands. Flash detects the active window
+and switches its output style automatically:
+
+| Where you are | What it does |
+|---------------|--------------|
+| Chat apps (WeChat, QQ, Slack…) | Keeps it conversational — **no compression, no restructuring** |
+| Terminals and IDEs | Technical tone, no pleasantries, and **never injects newlines** (so half a sentence can't get executed as a command) |
+| Email, Word, documents | Proper written style, paragraphs and lists allowed, spoken-language repetition condensed away |
+| AI assistants (Claude, ChatGPT…) | Treated as instructions to an agent — formal and structured |
+| Browsers | Concise, web-friendly formatting |
+
+These rules live in an external `scene-rules.toml`. **Add your own apps or change any style, restart,
+done — no recompiling.**
+
+### 🔢 Numbers the way people actually say them
+
+Spoken numbers and written numbers are different things. Flash converts them for you:
 
 ```
-Feiyin-IME/
-├── voice-ime.exe           # Main application
-├── voice-ime-ui.exe        # Settings UI (Tauri + React)
-├── crash-reporter.exe      # Crash report utility
-├── *.dll                   # Runtime dependencies
-├── config.toml             # User configuration (auto-created on first launch)
-├── wordbook.sqlite         # User wordbook database
-└── models/
-    ├── sherpa-onnx-sense-voice-*/   # ASR model (required, ~233MB)
-    ├── opus-mt-zh-en/               # Chinese→English translation (optional, ~164MB)
-    ├── opus-mt-en-zh/               # English→Chinese translation (optional, ~164MB)
-    └── punct-ct-transformer-zh/     # Punctuation model (optional, ~79MB)
+half past four, meeting          →  4:30 meeting
+an hour and a half               →  1.5 hours
+ten million four hundred sixty-eight thousand seven hundred forty-one  →  10468741
 ```
 
+Just as importantly, **it knows when *not* to convert**. In Chinese, idioms and proper nouns that
+happen to contain number characters stay as characters. Those rules are external too
+(`itn-rules.toml`), so if you hit an edge case you can fix it yourself.
+
+### 🏠 Local first, fully offline capable
+
+Speech recognition, punctuation restoration and Chinese ↔ English translation **all run on your
+machine**. No network required, and nothing you say has to leave your computer.
+Want stronger polishing? Plug in any OpenAI-compatible model — **that's an option, not a requirement.**
+An online recognition engine is also available if you want the fastest possible first character.
+
+### 📖 It learns your vocabulary
+
+Jargon, names and product terms getting mangled? Add them to your wordbook and they'll stick.
+With formatted output enabled, it also **learns from your corrections automatically**, so you don't
+have to add every one by hand.
+
+### 🌍 Multilingual
+
+Recognition covers Chinese, English, Japanese, Korean and Cantonese. Hold the translation hotkey while
+speaking to get Chinese ↔ English translation directly. The interface itself ships in
+Simplified Chinese, Traditional Chinese and English.
+
 ---
 
-## Hotkeys
+## Quick start
 
-| Hotkey | Action |
-|--------|--------|
-| `F9` (default) | Start / stop recording (Toggle mode) |
-| Hold `F9` | Push-to-talk: hold to record, release to stop |
-| `Right Ctrl + F9` | Record with translation (requires translation hotkey config) |
-| `Esc` | Cancel current recording |
+### You'll need
 
-Hotkeys can be customized in Settings → **General → Trigger Mode**.
+- Windows 10 / 11 (64-bit)
+- A microphone
+- WebView2 Runtime (installed automatically if missing)
+
+### Three steps
+
+1. Download the [latest release](https://github.com/Cdexs/Feiyin-IME/releases) and extract it anywhere
+2. Run `feiyin-ime.exe` — a tray icon appears → right-click → **Settings**
+3. Pick a recording hotkey (**Right Ctrl or Right Alt work well** — reachable one-handed, and they
+   don't collide with common shortcuts), then hold it and speak
+
+For better output quality, add a model API key on the **Formatted Output** page (see below).
+It works fine without one.
+
+### Hotkeys
+
+| Key | Action |
+|-----|--------|
+| `F9` (default, configurable) | Start / stop recording (Toggle mode) |
+| Hold the key | Push-to-talk — speak while held, release to finish |
+| Translation hotkey while recording | Translate as you speak |
+| `Esc` | Cancel the current recording |
+
+Configure under **General → Trigger** in Settings. **Left and right modifiers are separate keys**
+(Left Ctrl ≠ Right Ctrl), any key combination works, and the app checks that your recording and
+translation hotkeys don't conflict.
 
 ---
 
-## LLM Configuration
+## Connecting a model (optional)
 
-Supports any OpenAI-compatible API endpoint:
+Any OpenAI-compatible endpoint works. Set it in the UI, or edit `config.toml` directly:
 
 ```toml
 [llm]
-api_url = "https://api.openai.com/v1"
+api_url = "https://api.deepseek.com/v1"
 api_key = "sk-..."
-model   = "gpt-4o-mini"
+model   = "deepseek-chat"
 enabled = true
 ```
 
-> When LLM is not configured, the app gracefully falls back to local transcription-only mode — no internet required.
+> **It works without this.** With no API key the app falls back to pure local transcription —
+> punctuation, translation and number conversion all still work; you just don't get semantic
+> polishing and layout.
+
+With a model connected, formatted output will: strip filler words, straighten out sentences you
+restarted mid-way, fix obvious homophone typos, and decide whether the result should be paragraphs or
+a list based on the app you're in. **It won't change your meaning** — numbers, units, negations,
+proper nouns, file paths and code identifiers are all explicitly protected.
 
 ---
 
 ## Translation
 
-- **Trigger**: Hold the translation hotkey (default: Right Ctrl) while recording
-- **Priority**: Uses LLM translation when configured; otherwise automatically uses local opus-mt model
-- **Long text**: Automatically segments text >120 characters to prevent truncation
+Hold the translation hotkey while recording and the translated text comes out directly.
+
+- **The target language** is set by `translation.target_language` in `config.toml`
+  (`Chinese` / `English`). Speech that is already in the target language passes through untranslated —
+  so with `English`, Chinese speech becomes English and English speech stays as-is
+- **Uses your configured model when available**; otherwise the local opus-mt model, **fully offline**
+- Long passages are segmented automatically so nothing gets truncated
+
+```toml
+[translation]
+enabled = true
+target_language = "English"   # flip to "Chinese" for the other direction
+```
+
+> There's no UI control for this yet — config file only. Fully automatic two-way translation is on the
+> backlog.
 
 ---
 
-## Architecture
+## What's in the release package
 
 ```
-voice-ime.exe (Win32 Controller)
-├── Win32 message loop + RegisterHotKey global hotkeys
-├── System tray (tray-icon)
-├── Win32 GDI Recording Overlay
-│   ├── Recording: waveform + microphone icon
-│   ├── Processing: shimmer sweep animation
-│   └── Error: red indicator + message
-├── WASAPI audio capture (cpal)
-├── SenseVoice ASR (sherpa-onnx)
-├── LLM text optimization (reqwest / OpenAI API)
-├── CT-Transformer punctuation (sherpa-onnx ONNX)
-├── opus-mt translation engine (CTranslate2)
-└── SQLite wordbook (rusqlite)
-
-voice-ime-ui.exe (Tauri + React)
-└── Settings UI (launched as subprocess by main app)
-
-crash-reporter.exe
-└── Standalone crash report utility
+Feiyin-IME/
+├── feiyin-ime.exe          # Main program (lives in the tray)
+├── feiyin-ime-ui.exe       # Settings UI (Tauri + React)
+├── crash-reporter.exe      # Crash reporter
+├── *.dll                   # Runtime dependencies
+├── config.toml             # Your configuration (created on first launch)
+├── wordbook.sqlite         # Your wordbook
+├── scene-rules.toml        # Scene rules (yours to edit)
+├── itn-rules.toml          # Number / idiom rules (yours to edit)
+└── models/
+    ├── sherpa-onnx-sense-voice-funasr-nano-int8-*/  # Speech recognition (required, ~254MB)
+    ├── punct-ct-transformer-zh/                     # Punctuation (optional, ~79MB)
+    ├── opus-mt-zh-en/ and opus-mt-en-zh/            # Offline translation (optional, ~153MB each)
+    └── silero-vad/                                  # Voice activity detection (~1MB)
 ```
+
+**Everything loads relative to the executable's own directory**, so the folder is portable — move it,
+copy it to a USB drive, or keep several independent copies side by side.
 
 ---
 
-## Building from Source
+## Building from source
 
-### Prerequisites
+### Requirements
 
-- Rust stable (1.75+, `x86_64-pc-windows-msvc` toolchain)
-- Visual Studio 2022 Build Tools with "Desktop development with C++"
+- Rust stable (1.75+)
 - Node.js 18+
+- Windows SDK + VS Build Tools (Desktop development with C++)
 
-See [docs/BUILD-DEPS.md](docs/BUILD-DEPS.md) for the complete step-by-step setup guide.
+### Build
 
-### Quick Build
+```bash
+# Set up the dev environment (links models / DLLs)
+PowerShell -File scripts/init-publish.ps1
 
-```powershell
-# Initialize dev environment (first time only)
-npm install
-PowerShell -File scripts\init-publish.ps1
+# Type-check
+cargo check
 
-# Build
+# Release build
 build.bat
+```
+
+### 🔴 Run once per fresh clone
+
+The repo ships secret/privacy scanning hooks (pre-commit / pre-push), but `core.hooksPath`
+**is not inherited by a clone** — you must set it manually for the hooks to run:
+
+```bash
+git config core.hooksPath scripts/git-hooks
 ```
 
 ---
 
 ## Changelog
 
-| Version | Highlights |
-|---------|-----------|
-| v0.5.4 | exe rename (feiyin-ime) / new orange icon / GitHub version check / About UI redesign / ESC fix / overlay no focus-steal |
-| v0.5.3 | Long-text segmented translation / mic mute detection / exe-relative paths / punctuation / Traditional Chinese UI |
-| v0.5.2 | SQLite wordbook / LLM auto-learning / multi-language UI |
-| v0.5.1 | Tauri v2 upgrade |
-| v0.5.0 | macOS cross-platform architecture |
-| v0.4.0 | UI framework: eframe → Tauri + React |
-| v0.3.x | Win32 architecture / Paraformer ASR / crash reporting |
-
----
+Full history in [CHANGELOG](CHANGELOG.md); latest release notes at
+[v0.9.0](https://github.com/Cdexs/Feiyin-IME/releases/tag/v0.9.0).
 
 ## License
 
