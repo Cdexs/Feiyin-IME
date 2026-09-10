@@ -2,7 +2,7 @@
 
 **[English](README.en.md) | 中文**
 
-> 说话就是输入。文字跟着你的语速出现在屏幕上，而且它知道你正在用哪个软件。
+> 说话就是输入。文字跟着你的语速出现在屏幕上，它可根据你使用的软件智能优化输出结构，词库自学习越用越懂你。
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](https://github.com/Cdexs/Feiyin-IME)
 [![Version](https://img.shields.io/badge/version-v0.9.0-green)](https://github.com/Cdexs/Feiyin-IME/releases)

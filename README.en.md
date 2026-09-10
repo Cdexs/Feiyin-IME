@@ -2,7 +2,8 @@
 
 **English | [中文](README.md)**
 
-> Just talk. The words appear as fast as you speak them — and they know which app you're typing into.
+> Just talk. The words appear as fast as you speak them, their structure adapts to whichever app
+> you're in, and the wordbook keeps learning your vocabulary — it fits you better the more you use it.
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](https://github.com/Cdexs/Feiyin-IME)
 [![Version](https://img.shields.io/badge/version-v0.9.0-green)](https://github.com/Cdexs/Feiyin-IME/releases)
