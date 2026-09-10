@@ -457,8 +457,26 @@ fn build_prompt_layers(
         rules: l2,
     });
 
-    // L3 呈现：F4 场景块 + F3 列表规则（含 INLINE_SEPARATOR_RULES）。
+    // L3 呈现：F3 列表规则（含 INLINE_SEPARATOR_RULES）+ F4 场景块。
+    //
+    // PROMPT-OPT-202: 🔴 F3 在前、场景在后是**刻意的顺序**，为最大化 LLM 前缀缓存命中。
+    // 前缀缓存按逐字节相同的前缀长度计费/命中，故装配须按「稳定性递减」排：
+    // 变化面小的靠前，变化面大的靠后。
+    //   - `f3_lists`：只随 (multiline_safe, punctuation_enabled) 变 ⇒ **4 种取值**
+    //   - `scene_f4`：随目标应用变 ⇒ 当前词表 **9 种场景**（且会随词表增长）
+    // 调序前实测：同 multiline_safe 下切换场景，公共前缀 9,427 B（64%）；
+    // 调序后：13,521 B（92%）。零字符内容变更，仅换 push 顺序。
+    //
+    // 语义安全性：同属 L3、层内并列，且 `META_RULE_PRECEDENCE` 明写
+    // `This precedence is ABSOLUTE and OVERRIDES position — never resolve a conflict by
+    // preferring whichever rule appears later` ⇒ 优先级由层级决定，与物理位置无关。
+    // 翻译路径已在 TRANS-F3-201 采用同一顺序（用户基座 → F3 → 场景），本处与之对齐。
     let mut l3: Vec<PromptRule> = Vec::new();
+    l3.push(PromptRule {
+        id: "f3_lists",
+        topic: Topic::ListForm,
+        text: f3_rules_text(multiline_safe, punctuation_enabled),
+    });
     if let Some(scene_block) = scene_block {
         l3.push(PromptRule {
             id: "scene_f4",
@@ -466,11 +484,6 @@ fn build_prompt_layers(
             text: scene_block,
         });
     }
-    l3.push(PromptRule {
-        id: "f3_lists",
-        topic: Topic::ListForm,
-        text: f3_rules_text(multiline_safe, punctuation_enabled),
-    });
     layers.push(PromptLayer {
         level: 3,
         rules: l3,
@@ -5160,6 +5173,77 @@ mod tests {
         assert!(
             content.contains("MUST NOT override the mandatory output format"),
             "用户基座声明必须自带「不得压垮输出格式契约」的完整语义"
+        );
+    }
+
+    // ==================== PROMPT-OPT-202 L3 装配顺序（前缀缓存） ====================
+
+    /// PROMPT-OPT-202-G1：🔴 **量化护栏** —— 直接断言前缀缓存能命中的字节数，
+    /// 而不是断言「push 语句谁在前」这种结构特征。
+    ///
+    /// 为什么这样写：结构锚只能拦住「顺序被改回去」这一种形态；本护栏断言的是
+    /// **我们真正要的属性**（同 multiline_safe 下切换场景时的公共前缀长度），
+    /// 任何让缓存命中变差的改动（调序、往 L0/L1/L2 里塞随场景变化的内容、
+    /// 把稳定块拆到场景块之后）都会被它拦下。
+    ///
+    /// 实测基线：调序前 9,427 B（64%），调序后 13,521 B（92%）。阈值取 13,000 留余量。
+    /// 消融：把 L3 的两个 push 换回原顺序 → 降到 9,427 → 红。
+    #[test]
+    fn l3_order_maximizes_prefix_cache_across_scenes() {
+        let base = crate::config::default_system_prompt();
+        let render_for = |exe: &str| {
+            let sc = crate::scene::classify_scene(exe, "");
+            let sb = crate::scene::build_scene_prompt_block(&sc, false);
+            assert!(
+                !sc.multiline_safe,
+                "{exe} 预期 multiline_safe=false（本用例要求两场景同 ml，否则比的是另一件事）"
+            );
+            render(&build_prompt_layers(
+                &base,
+                None,
+                None,
+                sb,
+                sc.multiline_safe,
+                true,
+            ))
+        };
+        let agent = render_for("Claude.exe");
+        let terminal = render_for("WindowsTerminal.exe");
+        assert_ne!(agent, terminal, "两场景 prompt 应当不同（场景块不同）");
+
+        let common = agent
+            .bytes()
+            .zip(terminal.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        assert!(
+            common >= 13_000,
+            "同 multiline_safe 下切换场景的公共前缀应 ≥13,000 B（调序后实测 13,521），\
+             实测 {common} B —— 低于阈值说明有随场景变化的内容被放到了靠前位置，\
+             或 L3 的 f3_lists/scene_f4 顺序被改回，前缀缓存命中率会显著下降"
+        );
+    }
+
+    /// PROMPT-OPT-202-G2：F3 块必须排在场景块之前（结构侧佐证，与 G1 互补）。
+    ///
+    /// G1 断言属性、G2 断言机制 —— 两者都红时能立刻区分是「顺序被改」
+    /// 还是「别处塞了变化内容」。
+    #[test]
+    fn l3_places_f3_before_scene_block() {
+        let layers = build_prompt_layers(
+            "",
+            None,
+            None,
+            Some("Scene Context (F4): test scene block.".into()),
+            false,
+            true,
+        );
+        let l3 = layers.iter().find(|l| l.level == 3).expect("L3 层必须存在");
+        let ids: Vec<&str> = l3.rules.iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            vec!["f3_lists", "scene_f4"],
+            "L3 顺序必须是 f3_lists 在前、scene_f4 在后（稳定性递减，最大化前缀缓存）"
         );
     }
 

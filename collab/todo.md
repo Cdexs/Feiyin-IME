@@ -1,5 +1,65 @@
 # 任务列表 · voice-ime
 
+## 🔴 2026-09-10 — 提示词优化三单（Gavin 拍板「开单」，DEC-059 管辖）
+
+**Gavin 指令**：① 等提示词优化后再出包 ② 开单 ③ 等优化开发完成再 push。
+⇒ 已攒 commit（`141fd8c` F3 注入、`979ffd7` 多行授权）**暂不出包不 push**，与本三单一起走。
+
+### 实测基线（临时探针渲染真实 prompt，测完已删）
+
+| 场景 | 字符 | ≈token |
+| --- | --- | --- |
+| agent / 终端（`multiline_safe=false`） | 14,628 | ~3,600 |
+| 微信（最小） | 13,684 | ~3,367 |
+| **Word / notepad / doc（`ml=true`）** | **25,123** | **~6,140** |
+
+**来源占比**：`config.toml` 用户基座 1,184（8%）+ `scene-rules.toml` 场景 1,151（8%）
++ **Rust `const` 硬编码 12,293（84%）**。
+
+**前缀缓存实测**：同 `ml` 不同场景命中 9,427 B（64%）；跨 `ml` 仅 4,050 B（28%）。
+
+**分段体量（agent, ml=F）**：`f3_lists` 4,094（ml=T 时 **13,789**）/ `L0_1_FIDELITY` 2,421
+/ `suggestion` 1,511 / `user_base` 1,184 / `scene_f4` 1,151 / `number_symbol` 810 / 其余 < 600。
+
+---
+
+### PROMPT-OPT-202 · L3 内调序（f3_lists 提到 scene_f4 之前）
+
+| 项 | 内容 |
+| --- | --- |
+| 影响文件 | `src/llm/mod.rs` `build_prompt_layers` L3 装配段**唯一** |
+| 改动 | 两个 `l3.push` 交换顺序；**零字符内容变更** |
+| 收益 | 同 `ml` 不同场景的公共前缀 9,427 → **13,521 B（64%→92%）** |
+| 风险 | 极低 —— 同层内并列，且 `META_RULE_PRECEDENCE` 明写优先级 `ABSOLUTE and OVERRIDES position` |
+| 依据 | 按「稳定性递减」排：`f3_lists` 仅 4 种取值（ml × punct），`scene_f4` 有 9 种场景 |
+| 验收 | 🔴 **量化护栏**：断言两场景 prompt 公共前缀 ≥ 13,000 B（直接断言要的属性，不是结构锚）+ 全量绿 |
+| 备注 | 翻译路径已在 TRANS-F3-201 排好（F3 在 scene 前），本单是主路径补齐 |
+
+### PROMPT-OPT-203 · `suggestion` 词库学习指令条件注入
+
+| 项 | 内容 |
+| --- | --- |
+| 影响文件 | `src/llm/mod.rs` `build_prompt_layers` L2 装配段 + `build_translate_system_content` |
+| 现状 | `suggestion`（1,511 chars）**无条件 `l2.push`**；而旁边 `wordbook_block` 是条件的（无词库返回 `None`） ⇒ **没词库时「怎么学词库」的指令照发**，纯浪费 ~10% |
+| 改动 | 与 `wordbook_block` 同源判定：无词库/未开自动学习时不注入 |
+| 🔴 风险 | 条件判错会让**词库自动学习静默失效**（WORDBOOK-AUTOLEARN 系列历史坑）。必须先查清「自动学习开关」的真实判据，不得只看 wordbook 是否为空 |
+| 验收 | 有词库 → 指令在场；无词库 → 不在场且 `suggestions` 解析链路不报错；全量绿 + 词库学习端测 |
+
+### PROMPT-OPT-204 · `f3_lists` 精简（最大单块）
+
+| 项 | 内容 |
+| --- | --- |
+| 影响文件 | `src/llm/mod.rs` `f3_rules_text` / `INLINE_SEPARATOR_RULES(_NO_PUNCT)` |
+| 现状 | ml=T 时 **13,789 chars = doc 场景总量 55%**；ml=F 时 4,094 |
+| 🔴 风险 | **最高** —— F3 + DEC-060 核心规则，直接决定列表化行为。刚被 Gavin 端测打过（TRANS-F3-201/B），此刻动它风险叠加 |
+| 🔴 DEC-059 硬要求 | **真实 API A/B 实证**（固定样本、改前改后对照、贴原始输出），不接受静态论证 |
+| 建议 | **排最后做**，且 202/203 出包端测稳定后再启动。A/B 方式待 Gavin 定：主控用 config 里的 key 跑（花钱）/ 或 Gavin 端测充当 A/B |
+
+### 三单执行顺序（串行，同文件不并行）
+
+`202`（最安全，收益明确）→ `203`（中风险）→ `204`（最高风险，需 A/B 授权）。
+三单均改 `src/llm/mod.rs` **同一文件**，禁止并行。
+
 ## ✅ 2026-09-10 — VERBOSE-195 正式写作场景冗余压缩（Gavin 拍板并扩容，**已执行，待端测**）
 
 > 🔴 **2026-09-10 Gavin 拍板扩容，推翻本单原「doc 不动」取舍**：
