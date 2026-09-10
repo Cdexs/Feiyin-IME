@@ -121,19 +121,40 @@ translation hotkeys don't conflict.
 
 ---
 
-## Connecting a model (optional)
+## Smart output polishing
+
+**A raw transcript is what you *said*, not what you can *use*.** Real speech comes with filler words,
+false starts and repetition — paste it as-is and you still have to clean it up yourself.
+Turn on smart output polishing and that step goes away:
+
+| What it does | Example |
+|--------------|---------|
+| **Drops filler words** | "um… so… I think maybe" → gone |
+| **Fixes false starts** | "this option — no wait, that option works" → one clean sentence |
+| **Corrects homophones** | using surrounding context and your own wordbook |
+| **Formats for the app** | paragraphs, a list, or a single unbroken line (see the scene table above) |
+| **Condenses padding** | in formal writing it merges points you made twice; chat is left alone |
+
+**It won't change your meaning.** Numbers, units, negations, proper nouns, file paths and code
+identifiers are all explicitly protected — it changes how you said it, never what you said.
+
+### Turning it on
 
 Any OpenAI-compatible endpoint works. On the **Formatted Output** page in Settings you fill in three
 things — **endpoint URL, API key, model name** — then flip the switch. There is a **Test connection**
 button right there to verify it.
+
+### Recommended model: DeepSeek Flash
+
+FlashVoice's prompts are **tuned specifically for DeepSeek Flash (V4 / V4.1 Flash)** — model ID
+`deepseek-flash`. Using the [official DeepSeek API](https://deepseek.com) is what we'd suggest.
+
+Other OpenAI-compatible models work too, but the formatting judgement — when to use a list, when to
+keep everything on one line — hasn't been tuned to the same degree, so results will vary.
+
 > **It works without this.** With no API key the app falls back to pure local transcription —
 > punctuation, translation and number conversion all still work; you just don't get semantic
 > polishing and layout.
-
-With a model connected, formatted output will: strip filler words, straighten out sentences you
-restarted mid-way, fix obvious homophone typos, and decide whether the result should be paragraphs or
-a list based on the app you're in. **It won't change your meaning** — numbers, units, negations,
-proper nouns, file paths and code identifiers are all explicitly protected.
 
 ---
 
