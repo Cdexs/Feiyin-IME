@@ -602,3 +602,56 @@ ls -la target/release/feiyin-ime-ui.exe
 ✅ **完整要求**（Playwright CDP 层，涉及真实 UI 的场景）：
 - 打开 UI → 添加词条 → 刷新/重载 → 词条仍存在（验证持久化）
 - 打开 UI → 点击删除 → 确认 → 词条消失（验证 Tauri IPC 层）
+
+---
+
+## 十一、PROMPT-LAB · 系统提示词实验室（提示词调优专用）
+
+**文件**：`src/llm/prompt_lab.rs`（`#[cfg(test)]` 常驻模块，不进生产二进制）
+**适用**：任何涉及**系统提示词或提示词模块**的调优、A/B、回归取证。
+**由来**：Gavin 2026-09-10 提议 —— 当日排查列表问题时主控重复手写临时探针四遍，
+且**前两次结论都因单次采样被推翻**。
+
+### 🔴 第一原则：LLM 单次输出不能定论
+
+`temperature` 非 0 时同一配置会跑出相反结果（2026-09-10 实测同配置两次相反）。
+本模块**不提供单次接口**，所有在线用例内建 N 轮采样 + 「输出种数」稳定性指标。
+**命中率差距 < 2/N 时不得下结论**，加大轮数重跑。
+
+### 四个用例
+
+| 用例 | 花钱 | 用途 |
+| --- | --- | --- |
+| `lab_dump_prompt` | ❌ | 渲染真实 prompt：总体量 + **逐段体量** + token 估算。定位「哪段在膨胀」「某条规则进没进 prompt」 |
+| `lab_cache_prefix` | ❌ | 前缀缓存分析：多场景两两公共前缀。改装配顺序 / 往靠前层塞变化内容时看代价（PROMPT-OPT-202 依据） |
+| `lab_sample` | 🔴 是 | 跑完整样本集，出命中率与稳定性。**提示词改动前后各跑一次做基线对照** |
+| `lab_ab` | 🔴 是 | 两种基座提示词 A/B。**DEC-059 要求的实证形式** |
+
+```bash
+cargo test --bin feiyin-ime lab_dump_prompt  -- --ignored --nocapture
+cargo test --bin feiyin-ime lab_cache_prefix -- --ignored --nocapture
+LAB_ROUNDS=5 cargo test --bin feiyin-ime lab_sample -- --ignored --nocapture
+```
+
+### 参数（环境变量，不用改代码）
+
+`LAB_ROUNDS`(5) / `LAB_EXE`(notepad.exe) / `LAB_TEMP`(生产值) / `LAB_SAMPLE`(全部) /
+`LAB_TRANSLATE`(0) / `LAB_FULL`(打印 prompt 全文) / `LAB_BASE_B_FILE`(A/B 的 B 组基座文件)。
+
+### 内置样本集（每条对应一个真实踩过的坑）
+
+`enum_explicit`（显式标记→必须成列表，Gavin 报障原型）/ `narration`（流水叙述→必须保持段落，
+防过度列表化反向回归）/ `short_nouns`（短名词并列→走 INLINE）/ `redundancy`（重复→应压缩）/
+`brake`（🔴 压缩刹车：自我更正只留最终值，但「只/别动/30 秒」一个不许丢）。
+
+🔴 **调优时固定跑整套**，只看单条容易顾此失彼 —— 把列表修好却把叙述也列表化，同样是回归。
+
+### 🔴 安全红线
+
+从生产 `config.toml` 读 api_key，**不打印、不写入任何文件**
+（`[SECRET-IN-REPO-001]`：2026-08-14 曾因 dump 配置把 key 写进仓库并遭盗刷）。
+
+### 与常规回归的边界
+
+四个用例全部 `#[ignore]`，`cargo test` 不会跑到（实测常规回归 ignored 由 9 → 13，
+passed 数不变）。**在线用例花钱，未经明确授权不得跑。**

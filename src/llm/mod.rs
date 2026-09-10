@@ -2173,6 +2173,11 @@ fn count_cjk(s: &str) -> usize {
         .count()
 }
 
+/// PROMPT-LAB：系统提示词调优实验室（常驻调试模块，全部用例 #[ignore]）。
+/// 用法与安全红线见该文件头部文档。
+#[cfg(test)]
+mod prompt_lab;
+
 #[cfg(test)]
 mod tests {
     use super::{
