@@ -144,13 +144,14 @@ describe('VoicePage - PUNCT-UI-001', () => {
       });
     });
 
-    it('ASR-UI-002: select has three options (performance / qwen / fun-asr)', async () => {
+    // ASR-UI-208（Gavin 2026-09-10）：UI 移除「在线语音识别模型」(qwen_audio_online) 选项
+    it('ASR-UI-002: select has two options (performance / fun-asr)', async () => {
       render(<VoicePage config={baseConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
         const select = screen.getAllByRole('combobox')[1];
         expect(select).toBeInTheDocument();
         const options = select.querySelectorAll('option');
-        expect(options.length).toBe(3);
+        expect(options.length).toBe(2);
       });
     });
 
@@ -168,9 +169,10 @@ describe('VoicePage - PUNCT-UI-001', () => {
         expect(
           screen.getByText(zhHans.voice_asr_model_performance as string)
         ).toBeInTheDocument();
+        // ASR-UI-208：qwen 选项已移除，其文案不应再出现
         expect(
-          screen.getByText(zhHans.voice_asr_model_qwen3 as string)
-        ).toBeInTheDocument();
+          screen.queryByText(zhHans.voice_asr_model_qwen3 as string)
+        ).not.toBeInTheDocument();
         expect(
           screen.queryByText(zhHans.voice_asr_model_accuracy as string)
         ).not.toBeInTheDocument();
@@ -182,10 +184,11 @@ describe('VoicePage - PUNCT-UI-001', () => {
       render(<VoicePage config={baseConfig} updateConfig={updateConfig} />);
       await waitFor(() => {
         const select = screen.getAllByRole('combobox')[1];
-        fireEvent.change(select, { target: { value: 'qwen_audio_online' } });
+        // ASR-UI-208：qwen 已不可选，改用 fun_asr_realtime 验证 select→config 通路
+        fireEvent.change(select, { target: { value: 'fun_asr_realtime' } });
         expect(updateConfig).toHaveBeenCalledWith(
           expect.objectContaining({
-            audio: expect.objectContaining({ asr_model: 'qwen_audio_online' }),
+            audio: expect.objectContaining({ asr_model: 'fun_asr_realtime' }),
           })
         );
       });
@@ -207,7 +210,12 @@ describe('VoicePage - PUNCT-UI-001', () => {
       });
     });
 
-    it('ASR-UI-008: Qwen3 model shows API key input', async () => {
+    // 🔴 ASR-UI-208（Gavin 2026-09-10）：以下用例全部通过 <select> 切到
+    // qwen_audio_online 再断言其专属区块（API key 输入 / 测试连接 / 切走隐藏 / unmount 回落）。
+    // UI 已移除该选项，且显示层对存量该值回落到 performance ⇒ 这些路径**不可达**，
+    // 非行为回归。故 skip 而非删除：后端能力与配置字段均保留不动，
+    // 将来若恢复该入口，本组用例可原样启用。
+    it.skip('ASR-UI-008: Qwen3 model shows API key input', async () => {
       const qwenConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online'}};
       render(<VoicePage config={qwenConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
@@ -215,7 +223,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
       });
     });
 
-    it('ASR-UI-009: Qwen3 model shows test connection button', async () => {
+    it.skip('ASR-UI-009: Qwen3 model shows test connection button', async () => {
       const qwenConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online'}};
       render(<VoicePage config={qwenConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
@@ -223,7 +231,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
       });
     });
 
-    it('ASR-UI-010: Qwen3 test connection button disabled when no key', async () => {
+    it.skip('ASR-UI-010: Qwen3 test connection button disabled when no key', async () => {
       const emptyKeyConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', asr_online_api_key: ''}};
       render(<VoicePage config={emptyKeyConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
@@ -232,7 +240,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
       });
     });
 
-    it('ASR-UI-011: Qwen3 test connection button enabled with key', async () => {
+    it.skip('ASR-UI-011: Qwen3 test connection button enabled with key', async () => {
       const hasKeyConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', asr_online_api_key: 'sk-test-key'}};
       render(<VoicePage config={hasKeyConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
@@ -241,7 +249,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
       });
     });
 
-    it('ASR-UI-012: clicking test connection shows testing state', async () => {
+    it.skip('ASR-UI-012: clicking test connection shows testing state', async () => {
       // Override mock with delay for this test
       mockInvoke.mockImplementation(async (cmd: string) => {
         if (cmd === 'get_config') return baseConfig;
@@ -260,7 +268,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
       });
     });
 
-    it('ASR-UI-013: successful connection shows success message', async () => {
+    it.skip('ASR-UI-013: successful connection shows success message', async () => {
       const goodKeyConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', asr_online_api_key: 'sk-test-key-123456'}};
       render(<VoicePage config={goodKeyConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
@@ -272,7 +280,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
       });
     });
 
-    it('ASR-UI-014: failed connection shows failure message', async () => {
+    it.skip('ASR-UI-014: failed connection shows failure message', async () => {
       const badKeyConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', asr_online_api_key: 'bad-key'}};
       render(<VoicePage config={badKeyConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
@@ -284,7 +292,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
       });
     });
 
-    it('ASR-UI-015: switching models hides Qwen3 section', async () => {
+    it.skip('ASR-UI-015: switching models hides Qwen3 section', async () => {
       const { rerender } = render(<VoicePage config={baseConfig} updateConfig={vi.fn()} />);
       const qwenConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online'}};
       rerender(<VoicePage config={qwenConfig} updateConfig={vi.fn()} />);
@@ -297,7 +305,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
       });
     });
 
-    it('ASR-UI-016: empty key hint shown when switching to Qwen3 without key', async () => {
+    it.skip('ASR-UI-016: empty key hint shown when switching to Qwen3 without key', async () => {
       const qwenConfig = {...baseConfig, audio: {...baseConfig.audio, asr_model: 'qwen_audio_online', asr_online_api_key: ''}};
       render(<VoicePage config={qwenConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
@@ -305,7 +313,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
       });
     });
     // R2 fallback tests — use wrapper to simulate real parent state management
-    it('FALLBACK-001: switch to qwen3(no key) then unmount falls back to performance', async () => {
+    it.skip('FALLBACK-001: switch to qwen3(no key) then unmount falls back to performance', async () => {
       let currentConfig = JSON.parse(JSON.stringify(baseConfig));
       const updateFn = vi.fn((cfg: any) => { currentConfig = cfg; });
       const { rerender, unmount } = render(<VoicePage config={currentConfig} updateConfig={updateFn} />);
@@ -328,7 +336,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
       expect(fallbackCalls.length).toBeGreaterThanOrEqual(1);
     });
 
-    it('FALLBACK-002: switch to qwen3(with key) then unmount does NOT fallback', async () => {
+    it.skip('FALLBACK-002: switch to qwen3(with key) then unmount does NOT fallback', async () => {
       let currentConfig = JSON.parse(JSON.stringify(baseConfig));
       const updateFn = vi.fn((cfg: any) => { currentConfig = cfg; });
       const { rerender, unmount } = render(<VoicePage config={currentConfig} updateConfig={updateFn} />);
@@ -364,7 +372,8 @@ describe('VoicePage - PUNCT-UI-001', () => {
         const options = screen.getAllByRole('combobox')[1].querySelectorAll('option');
         const values = Array.from(options).map((o) => (o as HTMLOptionElement).value);
         expect(values).toContain('fun_asr_realtime');
-        expect(values).toContain('qwen_audio_online');
+        // ASR-UI-208：qwen 选项已移除
+        expect(values).not.toContain('qwen_audio_online');
       });
     });
 

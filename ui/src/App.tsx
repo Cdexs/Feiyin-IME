@@ -15,7 +15,6 @@ function App() {
   const [activeTab, setActiveTab] = useState("general");
   const [config, setConfig] = useState<any>(null);
   const [loading, setLoading] = useState(true);
-  const [showPromptModal, setShowPromptModal] = useState(false);
 
   useEffect(() => {
     const disableMaximize = async () => {
@@ -32,19 +31,6 @@ function App() {
     loadConfig();
   }, []);
 
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.key === "t") {
-        e.preventDefault();
-        setShowPromptModal(prev => !prev);
-      }
-      if (e.key === "Escape" && showPromptModal) {
-        setShowPromptModal(false);
-      }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [showPromptModal]);
 
   const loadConfig = async () => {
     try {
@@ -162,32 +148,6 @@ function App() {
         </div>
       </div>
 
-      {showPromptModal && (
-        <div className="modal-overlay" onClick={() => setShowPromptModal(false)}>
-          <div className="modal-dialog" role="dialog" onClick={e => e.stopPropagation()}>
-            <div className="modal-header">
-              <span className="modal-title">{t.prompt_modal_title}</span>
-              <button className="modal-close" onClick={() => setShowPromptModal(false)}>×</button>
-            </div>
-            <div className="modal-body">
-              <textarea
-                className="textarea"
-                value={config.llm?.system_prompt || ''}
-                onChange={(e) => updateConfig({
-                  ...config,
-                  llm: { ...config.llm, system_prompt: e.target.value }
-                })}
-                style={{ maxWidth: '100%', width: '100%', minHeight: '200px' }}
-              />
-            </div>
-            <div className="modal-footer">
-              <button className="btn btn-primary" onClick={() => setShowPromptModal(false)}>
-                {t.prompt_modal_save}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

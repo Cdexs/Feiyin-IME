@@ -7,8 +7,6 @@ export const zhHans = {
   nav_about: '关于',
   app_title: '飞音智能语音输入',
   settings_tooltip: '设置',
-  prompt_modal_title: '系统提示词',
-  prompt_modal_save: '完成',
   general_title: '通用设置',
   general_system_section: '系统',
   general_auto_start: '开机自动启动',

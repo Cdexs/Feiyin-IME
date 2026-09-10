@@ -4,18 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
 
-use crate::i18n;
 
 /// 最大录音时长（秒），硬编码，不可通过 config 修改
 pub const MAX_RECORD_SECONDS: u64 = 180;
 /// 最长静默间隔（毫秒），超过此时长无声音则自动停止录音
 pub const SILENCE_DURATION_MS: u64 = 8_000;
 
-/// Get the unified English default system prompt.
-pub fn default_system_prompt() -> String {
-    let strings = i18n::get(UiLanguage::English);
-    strings.default_system_prompt_en.to_string()
-}
 
 fn default_auto_learn_threshold() -> u32 {
     2
@@ -26,9 +20,6 @@ pub struct LlmConfig {
     pub api_url: String,
     pub api_key: String,
     pub model: String,
-    /// Current system prompt (unified English default).
-    #[serde(default = "default_system_prompt")]
-    pub system_prompt: String,
     pub enabled: bool,
     #[serde(default)]
     pub connectivity_verified: bool,
@@ -40,7 +31,6 @@ impl Default for LlmConfig {
             api_url: "https://api.openai.com/v1".to_string(),
             api_key: String::new(),
             model: "gpt-4o-mini".to_string(),
-            system_prompt: default_system_prompt(),
             enabled: true,
             connectivity_verified: false,
         }
@@ -347,9 +337,7 @@ impl AppConfig {
         let content = std::fs::read_to_string(&path)?;
         let mut cfg: AppConfig = toml::from_str(&content)?;
 
-        if cfg.llm.system_prompt.is_empty() {
-            cfg.llm.system_prompt = default_system_prompt();
-        }
+        // PROMPT-BASE-207: 基座提示词已改为主程序侧编译期常量，配置项移除。
         if cfg.auto_learn_threshold == 0 {
             cfg.auto_learn_threshold = default_auto_learn_threshold();
         }
@@ -389,9 +377,7 @@ impl AppConfig {
         let content = std::fs::read_to_string(path)?;
         let mut cfg: AppConfig = toml::from_str(&content)?;
 
-        if cfg.llm.system_prompt.is_empty() {
-            cfg.llm.system_prompt = default_system_prompt();
-        }
+        // PROMPT-BASE-207: 基座提示词已改为主程序侧编译期常量，配置项移除。
         if cfg.auto_learn_threshold == 0 {
             cfg.auto_learn_threshold = default_auto_learn_threshold();
         }
@@ -450,7 +436,6 @@ mod tests {
         let path = temp_config_path("accuracy");
         cleanup(&path);
         let mut cfg = make_minimal_cfg_with_asr_model("accuracy");
-        cfg.llm.system_prompt = default_system_prompt();
         cfg.save_to(&path).unwrap();
 
         let loaded = AppConfig::load_from(&path).unwrap();
@@ -463,7 +448,6 @@ mod tests {
         let path = temp_config_path("performance");
         cleanup(&path);
         let mut cfg = make_minimal_cfg_with_asr_model("performance");
-        cfg.llm.system_prompt = default_system_prompt();
         cfg.save_to(&path).unwrap();
 
         let loaded = AppConfig::load_from(&path).unwrap();
@@ -476,7 +460,6 @@ mod tests {
         let path = temp_config_path("qwen3_online");
         cleanup(&path);
         let mut cfg = make_minimal_cfg_with_asr_model("qwen3_online");
-        cfg.llm.system_prompt = default_system_prompt();
         cfg.save_to(&path).unwrap();
 
         let loaded = AppConfig::load_from(&path).unwrap();
@@ -524,7 +507,6 @@ mod tests {
         cleanup(&path);
         let mut cfg = make_minimal_cfg_with_asr_model("fun_asr_realtime");
         cfg.audio.asr_online_model = "fun-asr-realtime".to_string();
-        cfg.llm.system_prompt = default_system_prompt();
         cfg.save_to(&path).unwrap();
 
         let loaded = AppConfig::load_from(&path).unwrap();
@@ -547,7 +529,6 @@ mod tests {
         cleanup(&path);
         let mut cfg = make_minimal_cfg_with_asr_model("performance");
         cfg.audio.asr_online_max_sentence_silence = 500;
-        cfg.llm.system_prompt = default_system_prompt();
         cfg.save_to(&path).unwrap();
 
         let loaded = AppConfig::load_from(&path).unwrap();
@@ -565,7 +546,6 @@ mod tests {
         let path = temp_config_path("mirror_alias");
         cleanup(&path);
         let mut cfg = make_minimal_cfg_with_asr_model("qwen_audio_online");
-        cfg.llm.system_prompt = default_system_prompt();
         cfg.save_to(&path).unwrap();
 
         let toml_content = std::fs::read_to_string(&path).unwrap();

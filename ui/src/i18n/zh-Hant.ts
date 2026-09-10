@@ -7,8 +7,6 @@ export const zhHant = {
   nav_about: '關於',
   app_title: '飛音智能語音輸入',
   settings_tooltip: '設定',
-  prompt_modal_title: '系統提示詞',
-  prompt_modal_save: '完成',
   general_title: '一般設定',
   general_system_section: '系統',
   general_auto_start: '開機自動啟動',

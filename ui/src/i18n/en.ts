@@ -7,8 +7,6 @@ export const en = {
   nav_about: 'About',
   app_title: 'Feiyin Smart Voice',
   settings_tooltip: 'Settings',
-  prompt_modal_title: 'System Prompt',
-  prompt_modal_save: 'Done',
   general_title: 'General Settings',
   general_system_section: 'System',
   general_auto_start: 'Auto-start on boot',

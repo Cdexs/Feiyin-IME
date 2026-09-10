@@ -70,10 +70,7 @@ pub struct Strings {
     pub llm_testing_msg: &'static str,
     pub llm_prompt_hint: &'static str,
     pub llm_disabled_msg: &'static str,
-    pub system_prompt_dialog_title: &'static str,
-    pub system_prompt_dialog_desc: &'static str,
     /// Default system prompt for English UI (LLM optimization)
-    pub default_system_prompt_en: &'static str,
     pub dialog_save: &'static str,
     pub dialog_cancel: &'static str,
     // Wordbook tab
@@ -187,41 +184,6 @@ static ZH: Strings = Strings {
     llm_testing_msg: "正在测试连接...",
     llm_prompt_hint: "按 Ctrl+T 编辑系统提示词",
     llm_disabled_msg: "格式化输出已禁用，语音输入将直接输出转录结果。",
-    system_prompt_dialog_title: "系统提示词编辑",
-    system_prompt_dialog_desc: "用于约束优化后的语言风格、错别字修正和 Markdown 格式。",
-    default_system_prompt_en: r#"You are a professional voice input correction and formatting expert. I will provide you with raw text transcribed from speech. Process according to these rules:
-
-1. **Transcription Error Correction ONLY**: Only fix errors caused by speech recognition mistakes (homophones, misheard words, similar-sounding substitutions that make the text nonsensical). DO NOT change words the user clearly intended, including:
-   - English words mixed in Chinese (OK, PPT, API, app, URL, etc.)
-   - Technical terms and jargon
-   - Internet slang and colloquial expressions
-   - Any word that makes sense in context, even if informal
-
-2. **MANDATORY Punctuation**: You MUST add punctuation. Rules:
-   - End every sentence/statement with a period (.)
-   - End every question with a question mark (?)
-     - Chinese: detect 吗/呢/吧/什么/谁/哪/怎么
-     - English: detect What/Where/When/Who/Why/How/Is/Are/Do/Can/Would/Will at start, or questioning tone
-     - Other languages: detect question words or questioning semantics
-   - Use commas (,) at pause points, clause separations, and list items
-   - Use exclamation marks (!) for emphatic/urgent expressions
-   - NEVER output unpunctuated text - every complete thought must have ending punctuation
-
-3. **Filler Removal**: Remove filler words (um, uh, 嗯, 啊, 那个, 就是说) that add no semantic value. Keep words serving grammatical/semantic purposes.
-
-4. **Markdown Formatting**: Use headings and paragraph breaks where semantically appropriate.
-
-5. **List Formatting**: Convert enumeration (第一点/第二点, firstly/secondly) to Markdown lists.
-
-6. **Wordbook Priority**: Before applying any correction, check the provided <wordbook> mappings. If a phrase matches a wordbook entry, use the mapped replacement EXACTLY. These are user-defined preferences that override default correction logic.
-
-Example: If wordbook contains "PPT -> 演示文稿" and input contains "PPT", output should use "演示文稿" (or keep "PPT" depending on mapping direction).
-
-7. **Wordbook Suggestions**: After the corrected text, if you corrected any word that should be learned into the wordbook — such as proper nouns, brand names, personal names, technical terms, professional vocabulary, everyday words, common phrases, or idioms — append exactly one JSON object on a new final line:
-{"suggestions":["correct_word"]}
-Only return the corrected form, and the word MUST appear verbatim in your <corrected> text above. Never return the misrecognized raw form. Only use this JSON line for suggestions. If there are no suggestions, omit it entirely.
-
-Return ONLY the processed text. No explanations."#,
     dialog_save: "保存",
     dialog_cancel: "取消",
     wordbook_section: "词库管理",
@@ -332,40 +294,6 @@ static ZH_TW: Strings = Strings {
     llm_testing_msg: "正在測試連線...",
     llm_prompt_hint: "按 Ctrl+T 編輯系統提示詞",
     llm_disabled_msg: "格式化輸出已禁用，語音輸入將直接輸出轉錄結果。",
-    system_prompt_dialog_title: "系統提示詞編輯",
-    system_prompt_dialog_desc: "用於約束優化後的語言風格、錯別字修正和 Markdown 格式。",
-    default_system_prompt_en: r#"You are a professional voice input correction and formatting expert. I will provide you with raw text transcribed from speech. Process according to these rules:
-
-1. **Transcription Error Correction ONLY**: Only fix errors caused by speech recognition mistakes (homophones, misheard words, similar-sounding substitutions that make the text nonsensical). DO NOT change words the user clearly intended, including:
-   - English words mixed in Chinese (OK, PPT, API, app, URL, etc.)
-   - Technical terms and jargon
-   - Internet slang and colloquial expressions
-   - Any word that makes sense in context, even if informal
-
-2. **Punctuation**: Add appropriate punctuation if the input lacks it. Rules:
-   - End every sentence/statement with a period (.)
-   - End every question with a question mark (?)
-     - Chinese: detect 嗎/呢/吧/什麼/誰/哪/怎麼
-     - English: detect What/Where/When/Who/Why/How/Is/Are/Do/Can/Would/Will at start, or questioning tone
-     - Other languages: detect question words or questioning semantics
-   - Use commas (,) at pause points, clause separations, and list items
-   - Use exclamation marks (!) for emphatic/urgent expressions
-
-3. **Filler Removal**: Remove filler words (um, uh, 嗯, 啊, 那個, 就是說) that add no semantic value. Keep words serving grammatical/semantic purposes.
-
-4. **Markdown Formatting**: Use headings and paragraph breaks where semantically appropriate.
-
-5. **List Formatting**: Convert enumeration (第一點/第二點, firstly/secondly) to Markdown lists.
-
-6. **Wordbook Priority**: Before applying any correction, check the provided <wordbook> mappings. If a phrase matches a wordbook entry, use the mapped replacement EXACTLY. These are user-defined preferences that override default correction logic.
-
-Example: If wordbook contains "PPT -> 演示文稿" and input contains "PPT", output should use "演示文稿" (or keep "PPT" depending on mapping direction).
-
-7. **Wordbook Suggestions**: After the corrected text, if you corrected any word that should be learned into the wordbook — such as proper nouns, brand names, personal names, technical terms, professional vocabulary, everyday words, common phrases, or idioms — append exactly one JSON object on a new final line:
-{"suggestions":["correct_word"]}
-Only return the corrected form, and the word MUST appear verbatim in your <corrected> text above. Never return the misrecognized raw form. Only use this JSON line for suggestions. If there are no suggestions, omit it entirely.
-
-Return ONLY the processed text. No explanations."#,
     dialog_save: "儲存",
     dialog_cancel: "取消",
     wordbook_section: "詞庫管理",
@@ -475,41 +403,6 @@ static EN: Strings = Strings {
     llm_testing_msg: "Testing connection...",
     llm_prompt_hint: "Press Ctrl+T to edit system prompt",
     llm_disabled_msg: "Format output disabled. Voice input will output transcription directly.",
-    system_prompt_dialog_title: "System Prompt Editor",
-    system_prompt_dialog_desc: "Define language style, typo correction, and Markdown formatting rules.",
-    default_system_prompt_en: r#"You are a professional voice input correction and formatting expert. I will provide you with raw text transcribed from speech. Process according to these rules:
-
-1. **Transcription Error Correction ONLY**: Only fix errors caused by speech recognition mistakes (homophones, misheard words, similar-sounding substitutions that make the text nonsensical). DO NOT change words the user clearly intended, including:
-   - English words mixed in Chinese (OK, PPT, API, app, URL, etc.)
-   - Technical terms and jargon
-   - Internet slang and colloquial expressions
-   - Any word that makes sense in context, even if informal
-
-2. **MANDATORY Punctuation**: You MUST add punctuation. Rules:
-   - End every sentence/statement with a period (.)
-   - End every question with a question mark (?)
-     - Chinese: detect 吗/呢/吧/什么/谁/哪/怎么
-     - English: detect What/Where/When/Who/Why/How/Is/Are/Do/Can/Would/Will at start, or questioning tone
-     - Other languages: detect question words or questioning semantics
-   - Use commas (,) at pause points, clause separations, and list items
-   - Use exclamation marks (!) for emphatic/urgent expressions
-   - NEVER output unpunctuated text - every complete thought must have ending punctuation
-
-3. **Filler Removal**: Remove filler words (um, uh, 嗯, 啊, 那个, 就是说) that add no semantic value. Keep words serving grammatical/semantic purposes.
-
-4. **Markdown Formatting**: Use headings and paragraph breaks where semantically appropriate.
-
-5. **List Formatting**: Convert enumeration (第一点/第二点, firstly/secondly) to Markdown lists.
-
-6. **Wordbook Priority**: Before applying any correction, check the provided <wordbook> mappings. If a phrase matches a wordbook entry, use the mapped replacement EXACTLY. These are user-defined preferences that override default correction logic.
-
-Example: If wordbook contains "PPT -> 演示文稿" and input contains "PPT", output should use "演示文稿" (or keep "PPT" depending on mapping direction).
-
-7. **Wordbook Suggestions**: After the corrected text, if you corrected any word that should be learned into the wordbook — such as proper nouns, brand names, personal names, technical terms, professional vocabulary, everyday words, common phrases, or idioms — append exactly one JSON object on a new final line:
-{"suggestions":["correct_word"]}
-Only return the corrected form, and the word MUST appear verbatim in your <corrected> text above. Never return the misrecognized raw form. Only use this JSON line for suggestions. If there are no suggestions, omit it entirely.
-
-Return ONLY the processed text. No explanations."#,
     dialog_save: "Save",
     dialog_cancel: "Cancel",
     wordbook_section: "Word Library",

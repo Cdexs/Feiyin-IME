@@ -4,19 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
 
-use crate::i18n;
-
 /// 最大录音时长（秒），硬编码，不可通过 config 修改
 pub const MAX_RECORD_SECONDS: u64 = 300;
 /// 最长静默间隔（毫秒），超过此时长无声音则自动停止录音
 pub const SILENCE_DURATION_MS: u64 = 30_000;
-
-/// Get default system prompt (unified English version).
-/// OPT-001: System prompt unified to English, model can understand English instructions regardless of input language.
-pub fn default_system_prompt() -> String {
-    let strings = i18n::get(UiLanguage::English);
-    strings.default_system_prompt_en.to_string()
-}
 
 fn default_auto_learn_threshold() -> u32 {
     2
@@ -27,15 +18,6 @@ pub struct LlmConfig {
     pub api_url: String,
     pub api_key: String,
     pub model: String,
-    /// Unified system prompt (English). OPT-001: Single prompt for all languages.
-    #[serde(default = "default_system_prompt")]
-    pub system_prompt: String,
-    /// Legacy field for config migration (deprecated, not used at runtime)
-    #[serde(default, skip_serializing)]
-    pub system_prompt_zh: Option<String>,
-    /// Legacy field for config migration (deprecated, not used at runtime)
-    #[serde(default, skip_serializing)]
-    pub system_prompt_en: Option<String>,
     pub enabled: bool,
     #[serde(default)]
     pub connectivity_verified: bool,
@@ -47,9 +29,6 @@ impl Default for LlmConfig {
             api_url: "https://api.openai.com/v1".to_string(),
             api_key: String::new(),
             model: "gpt-4o-mini".to_string(),
-            system_prompt: default_system_prompt(),
-            system_prompt_zh: None,
-            system_prompt_en: None,
             enabled: true,
             connectivity_verified: false,
         }
@@ -482,21 +461,9 @@ impl AppConfig {
         let content = std::fs::read_to_string(&path)?;
         let mut cfg: AppConfig = toml::from_str(&content)?;
 
-        // OPT-001: Migration - if system_prompt is empty but legacy fields exist, migrate
-        if cfg.llm.system_prompt.is_empty() {
-            // Prefer English prompt from legacy field, fallback to default
-            cfg.llm.system_prompt = cfg
-                .llm
-                .system_prompt_en
-                .clone()
-                .filter(|s| !s.is_empty())
-                .or_else(|| cfg.llm.system_prompt_zh.clone().filter(|s| !s.is_empty()))
-                .unwrap_or_else(default_system_prompt);
-        }
-
-        // Clear legacy fields after migration (they won't be serialized due to skip_serializing)
-        cfg.llm.system_prompt_zh = None;
-        cfg.llm.system_prompt_en = None;
+        // PROMPT-BASE-207: 基座提示词已改为编译期常量（llm::SYSTEM_BASE_PROMPT），
+        // 原 system_prompt / system_prompt_zh / system_prompt_en 三字段连同其迁移逻辑一并移除。
+        // 旧 config.toml 里的同名字段被 serde 忽略（未设 deny_unknown_fields），无需清理动作。
         if cfg.auto_learn_threshold == 0 {
             cfg.auto_learn_threshold = default_auto_learn_threshold();
         }
@@ -595,20 +562,9 @@ impl AppConfig {
         let content = std::fs::read_to_string(path)?;
         let mut cfg: AppConfig = toml::from_str(&content)?;
 
-        // OPT-001: Migration - if system_prompt is empty but legacy fields exist, migrate
-        if cfg.llm.system_prompt.is_empty() {
-            cfg.llm.system_prompt = cfg
-                .llm
-                .system_prompt_en
-                .clone()
-                .filter(|s| !s.is_empty())
-                .or_else(|| cfg.llm.system_prompt_zh.clone().filter(|s| !s.is_empty()))
-                .unwrap_or_else(default_system_prompt);
-        }
-
-        // Clear legacy fields after migration
-        cfg.llm.system_prompt_zh = None;
-        cfg.llm.system_prompt_en = None;
+        // PROMPT-BASE-207: 基座提示词已改为编译期常量（llm::SYSTEM_BASE_PROMPT），
+        // 原 system_prompt / system_prompt_zh / system_prompt_en 三字段连同其迁移逻辑一并移除。
+        // 旧 config.toml 里的同名字段被 serde 忽略（未设 deny_unknown_fields），无需清理动作。
         if cfg.auto_learn_threshold == 0 {
             cfg.auto_learn_threshold = default_auto_learn_threshold();
         }

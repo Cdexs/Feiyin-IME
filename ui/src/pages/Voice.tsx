@@ -23,6 +23,14 @@ const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
   const [qwen3TestMessage, setQwen3TestMessage] = useState('');
   const prevModelRef = useRef<string>('performance');
   const latestRef = useRef({ asrModel: '', config: {} as any });
+  // ASR-UI-208（Gavin 2026-09-10）：UI 不再提供「在线语音识别模型」(qwen_audio_online) 选项，
+  // 只留「本地模型」与「在线语音识别模型-FunASR」。后端能力与配置字段保留不动。
+  // 🔴 存量用户处理走「grandfathered option」：仅当配置值本就是 qwen_audio_online 时
+  // 才渲染该 option（见下方 select）。理由：qwen 与 accuracy 不同 —— accuracy 是废弃
+  // 不可用的模型故可静默迁移，qwen 是**可用功能**，Gavin 只要求隐藏 UI 入口而非废弃。
+  // 静默迁移会改变用户实际使用的 ASR 引擎（在线→本地），属功能变更；显示层回落则会
+  // 造成「显示 performance 实际跑 qwen」的不一致。两者都不可取，故按存量保留、
+  // 新用户不可见处理：切走之后就再也切不回来。
   const asrModel = config.audio?.asr_model ?? "performance";
 
   useEffect(() => {
@@ -214,7 +222,9 @@ const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.rea
             className="select-input"
           >
             <option value="performance">{t.voice_asr_model_performance}</option>
-            <option value="qwen_audio_online">{t.voice_asr_model_qwen3}</option>
+            {asrModel === "qwen_audio_online" && (
+              <option value="qwen_audio_online">{t.voice_asr_model_qwen3}</option>
+            )}
             <option value="fun_asr_realtime">{t.voice_asr_model_fun_asr}</option>
           </select>
 
