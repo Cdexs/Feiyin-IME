@@ -41,8 +41,6 @@
 | Claude、ChatGPT 等 AI 助手 | 按「给 AI 的工作指令」处理，正式、结构化 |
 | 浏览器 | 简洁的网页友好排版 |
 
-这套规则放在外置的 `scene-rules.toml` 里，**你可以自己加软件、改风格，改完重启即可，不用重新编译**。
-
 ### 🔢 中文数字说人话
 
 口语里的数字和写下来的数字是两回事，飞音替你换算：
@@ -55,7 +53,7 @@
 ```
 
 同时它**知道什么时候不该换**：「五代十国」「三五成群」「一点点」这类成语、专名、固定表达
-一律保持汉字 —— 这部分规则同样外置在 `itn-rules.toml`，踩到坑可以自己补。
+一律保持汉字。
 
 ### 🏠 本地优先，可以完全离线
 
@@ -113,7 +111,7 @@
 
 ## 配置大模型（可选）
 
-支持任何 OpenAI 兼容接口，在设置界面填就行，也可以直接改 `config.toml`：
+支持任何 OpenAI 兼容接口，在设置界面的「格式化输出」页填写即可：
 
 ```toml
 [llm]
@@ -163,8 +161,8 @@ Feiyin-IME/
 ├── *.dll                   # 运行时依赖
 ├── config.toml             # 你的配置（首次启动自动生成）
 ├── wordbook.sqlite         # 你的词库
-├── scene-rules.toml        # 场景规则（可自己改）
-├── itn-rules.toml          # 数字/成语规则（可自己改）
+├── scene-rules.toml        # 场景规则
+├── itn-rules.toml          # 数字与成语规则
 └── models/
     ├── sherpa-onnx-sense-voice-funasr-nano-int8-*/  # 语音识别（必需，~254MB）
     ├── punct-ct-transformer-zh/                     # 标点补全（可选，~79MB）

@@ -45,9 +45,6 @@ window and switches its output style automatically:
 | AI assistants (Claude, ChatGPT…) | Treated as instructions to an agent — formal and structured |
 | Browsers | Concise, web-friendly formatting |
 
-These rules live in an external `scene-rules.toml`. **Add your own apps or change any style, restart,
-done — no recompiling.**
-
 ### 🔢 Numbers the way people actually say them
 
 Spoken numbers and written numbers are different things. FlashVoice converts them for you:
@@ -59,8 +56,7 @@ ten million four hundred sixty-eight thousand seven hundred forty-one  →  1046
 ```
 
 Just as importantly, **it knows when *not* to convert**. In Chinese, idioms and proper nouns that
-happen to contain number characters stay as characters. Those rules are external too
-(`itn-rules.toml`), so if you hit an edge case you can fix it yourself.
+happen to contain number characters stay as characters.
 
 ### 🏠 Local first, fully offline capable
 
@@ -126,7 +122,7 @@ translation hotkeys don't conflict.
 
 ## Connecting a model (optional)
 
-Any OpenAI-compatible endpoint works. Set it in the UI, or edit `config.toml` directly:
+Any OpenAI-compatible endpoint works. Fill it in on the **Formatted Output** page in Settings:
 
 ```toml
 [llm]
@@ -179,8 +175,8 @@ Feiyin-IME/
 ├── *.dll                   # Runtime dependencies
 ├── config.toml             # Your configuration (created on first launch)
 ├── wordbook.sqlite         # Your wordbook
-├── scene-rules.toml        # Scene rules (yours to edit)
-├── itn-rules.toml          # Number / idiom rules (yours to edit)
+├── scene-rules.toml        # Scene rules
+├── itn-rules.toml          # Number and idiom rules
 └── models/
     ├── sherpa-onnx-sense-voice-funasr-nano-int8-*/  # Speech recognition (required, ~254MB)
     ├── punct-ct-transformer-zh/                     # Punctuation (optional, ~79MB)
