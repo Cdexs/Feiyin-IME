@@ -8,7 +8,9 @@
 # Unknown = 不注入 F4 场景段，multiline_safe 按 false 保守处理（等同 Phase 1）。
 #
 # 字段说明：
-#   kind          = 场景类别（chat/email/ide_terminal/doc/browser）
+#   kind          = 场景类别（chat/agent/email/ide_terminal/doc/browser）
+#                   🔴 新增 kind 必须同步 src/scene/mod.rs 的 parse_kind，否则旧 exe 读到会落 Unknown
+#                   （不注入 F4，静默失效）⇒ 改 kind 的改动必须随包出，不得只热更 toml
 #   exe           = 进程 exe 名列表（不区分大小写精确匹配）
 #   title_keywords= 窗口标题关键词（兜底匹配，主要用于浏览器场景细分）
 #   style         = 风格指令（写入 LLM prompt F4 段，不含 exe 名/标题）
@@ -91,8 +93,8 @@ title_keywords = [
 # ============================================================
 
 [[scene]]
-kind = "chat"
-style = "The dictated text is a prompt or instruction addressed to an AI assistant or coding agent. NOTE: despite the 'chat' label above, this is a WORKING CHANNEL, not casual conversation — treat it as formal writing. Keep the INTENT intact. Preserve technical terms, code identifiers, file paths, and English words as-is. Clear and direct. After correcting the transcription, CONDENSE it: state each point ONCE — drop stutters and filler, delete repeated restatements of the same request, and keep only the final version of a self-correction. Tighten wordy spoken phrasing into its plain written equivalent, so the agent receives one clean statement of the ask. HARD LIMIT — brevity NEVER outranks completeness: never drop or weaken any requirement, constraint, number, unit, date, file path, identifier, negation, modality (可能/必须/别), or scope qualifier (只/全部/大约), and never harden a hedge into a flat assertion (我觉得 stays hedged). If unsure whether a phrase is redundancy or substance, KEEP it. Do NOT use lists, headings, or greetings; output as a single message."
+kind = "agent"
+style = "The dictated text is a prompt or instruction addressed to an AI assistant or coding agent. This is a WORKING CHANNEL, not casual conversation — treat it as formal writing. Keep the INTENT intact. Preserve technical terms, code identifiers, file paths, and English words as-is. Clear and direct. After correcting the transcription, CONDENSE it: state each point ONCE — drop stutters and filler, delete repeated restatements of the same request, and keep only the final version of a self-correction. Tighten wordy spoken phrasing into its plain written equivalent, so the agent receives one clean statement of the ask. HARD LIMIT — brevity NEVER outranks completeness: never drop or weaken any requirement, constraint, number, unit, date, file path, identifier, negation, modality (可能/必须/别), or scope qualifier (只/全部/大约), and never harden a hedge into a flat assertion (我觉得 stays hedged). If unsure whether a phrase is redundancy or substance, KEEP it. Do NOT use lists, headings, or greetings; output as a single message."
 multiline_safe = false
 exe = [
     # --- 国际 AI 助手桌面版 ---

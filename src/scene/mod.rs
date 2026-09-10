@@ -22,6 +22,11 @@ const BUILTIN_RULES: &str = include_str!("../../scene-rules.toml");
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SceneKind {
     Chat,
+    /// AGENT-KIND-198: AI 助手 / coding agent。此前挂在 `Chat` 下，导致
+    /// `build_scene_prompt_block` 的首句拼出「typing into a **chat** application」，
+    /// 与紧随其后的 style（「这是给 agent 的工作指令，按正式书写处理」）自相矛盾，
+    /// 且首句在主动把模型往口语方向拉。拆为独立 kind 后首句自洽。
+    Agent,
     Email,
     Doc,
     IdeTerminal,
@@ -34,6 +39,11 @@ impl SceneKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Chat => "chat",
+            // AGENT-KIND-198: 标签刻意选以辅音音开头的写法 —— 调用处
+            // `build_scene_prompt_block` 硬编码不定冠词 "a"，若用「AI agent」
+            // 会拼出语法错误的「a AI agent」。「coding/AI agent」读作 /k/ 开头，
+            // 「a coding/AI agent application」语法正确。
+            Self::Agent => "coding/AI agent",
             Self::Email => "email",
             Self::Doc => "document",
             Self::IdeTerminal => "IDE/terminal",
@@ -267,11 +277,26 @@ impl CompiledRules {
 fn parse_kind(s: &str) -> SceneKind {
     match s.trim().to_lowercase().as_str() {
         "chat" => SceneKind::Chat,
+        // AGENT-KIND-198: 多写法并存，照 ide_terminal 既有范式。
+        "agent" | "ai_agent" | "ai-agent" | "coding_agent" => SceneKind::Agent,
         "email" => SceneKind::Email,
         "doc" => SceneKind::Doc,
         "ide_terminal" | "ide-terminal" | "ide/terminal" => SceneKind::IdeTerminal,
         "browser" => SceneKind::Browser,
-        _ => SceneKind::Unknown,
+        other => {
+            // AGENT-KIND-198 配套：此前未知 kind **静默**落 Unknown，而 Unknown
+            // 直接不注入 F4（build_scene_prompt_block 首行即返回 None）⇒ 整个场景
+            // 失效且无任何痕迹。拼错一个字母就是这个后果，排查时无从下手。
+            // 🔴 这也是本次拆 kind 的真实风险面：旧 exe 读到新 toml 的 kind="agent"
+            // 会命中此分支 ⇒ agent 场景静默失效。故本改动**必须随包出**，
+            // 不得走「只同步三副本 toml + 重启」的免构建热更流程。
+            log::warn!(
+                "Scene rule has unknown kind {:?}, falling back to Unknown (F4 will NOT be injected). \
+                 If this is a newer rules file, the executable is out of date.",
+                other
+            );
+            SceneKind::Unknown
+        }
     }
 }
 
@@ -797,7 +822,7 @@ exe = ["browser.exe"]
     #[test]
     fn ai_agent_exe_claude_classify_chat() {
         let scene = classify_builtin("Claude.exe", "Claude AI");
-        assert_eq!(scene.scene, SceneKind::Chat);
+        assert_eq!(scene.scene, SceneKind::Agent);
         assert!(
             !scene.multiline_safe,
             "AI agent must be multiline_safe=false"
@@ -809,7 +834,7 @@ exe = ["browser.exe"]
     #[test]
     fn ai_agent_exe_chatgpt_classify_chat() {
         let scene = classify_builtin("ChatGPT.exe", "ChatGPT");
-        assert_eq!(scene.scene, SceneKind::Chat);
+        assert_eq!(scene.scene, SceneKind::Agent);
         assert!(!scene.multiline_safe);
         assert!(!scene.style_hint.is_empty());
     }
@@ -818,7 +843,7 @@ exe = ["browser.exe"]
     #[test]
     fn ai_agent_exe_codex_classify_chat() {
         let scene = classify_builtin("Codex.exe", "Codex");
-        assert_eq!(scene.scene, SceneKind::Chat);
+        assert_eq!(scene.scene, SceneKind::Agent);
         assert!(!scene.multiline_safe);
         assert!(!scene.style_hint.is_empty());
     }
@@ -827,7 +852,7 @@ exe = ["browser.exe"]
     #[test]
     fn ai_agent_exe_yuanbao_classify_chat() {
         let scene = classify_builtin("yuanbao.exe", "元宝");
-        assert_eq!(scene.scene, SceneKind::Chat);
+        assert_eq!(scene.scene, SceneKind::Agent);
         assert!(!scene.multiline_safe);
         assert!(!scene.style_hint.is_empty());
     }
@@ -836,7 +861,7 @@ exe = ["browser.exe"]
     #[test]
     fn ai_agent_title_chatgpt_fallback() {
         let scene = classify_builtin("UnknownApp.exe", "ChatGPT 对话");
-        assert_eq!(scene.scene, SceneKind::Chat);
+        assert_eq!(scene.scene, SceneKind::Agent);
         assert!(!scene.multiline_safe);
         assert!(!scene.style_hint.is_empty());
     }
@@ -845,14 +870,14 @@ exe = ["browser.exe"]
     #[test]
     fn ai_agent_title_claude_fallback() {
         let scene = classify_builtin("UnknownApp.exe", "Claude 3.5 Sonnet");
-        assert_eq!(scene.scene, SceneKind::Chat);
+        assert_eq!(scene.scene, SceneKind::Agent);
     }
 
     /// SCENE-AI-AGENT-007: title_keywords 兜底——浏览器细分 chrome + 标题含 元宝 → chat
     #[test]
     fn ai_agent_browser_subclass_yuanbao() {
         let scene = classify_builtin("chrome.exe", "元宝 - AI助手 - Google Chrome");
-        assert_eq!(scene.scene, SceneKind::Chat);
+        assert_eq!(scene.scene, SceneKind::Agent);
         assert!(!scene.multiline_safe);
     }
 
@@ -860,7 +885,7 @@ exe = ["browser.exe"]
     #[test]
     fn ai_agent_browser_subclass_deepseek() {
         let scene = classify_builtin("msedge.exe", "DeepSeek 对话 - Edge");
-        assert_eq!(scene.scene, SceneKind::Chat);
+        assert_eq!(scene.scene, SceneKind::Agent);
         assert!(!scene.multiline_safe);
     }
 
@@ -884,21 +909,21 @@ exe = ["browser.exe"]
     #[test]
     fn ai_agent_exe_case_insensitive() {
         let scene = classify_builtin("claude.exe", "");
-        assert_eq!(scene.scene, SceneKind::Chat);
+        assert_eq!(scene.scene, SceneKind::Agent);
     }
 
     /// SCENE-AI-AGENT-012: 大小写不敏感——标题小写 chatgpt 兜底命中（回归 SCENE-TITLE-CASE-001）
     #[test]
     fn ai_agent_title_case_insensitive() {
         let scene = classify_builtin("UnknownApp.exe", "chatgpt conversation");
-        assert_eq!(scene.scene, SceneKind::Chat);
+        assert_eq!(scene.scene, SceneKind::Agent);
     }
 
     /// SCENE-AI-AGENT-013: 大小写不敏感——浏览器细分小写 claude 标题命中（回归 SCENE-TITLE-CASE-001）
     #[test]
     fn ai_agent_browser_subclass_case_insensitive() {
         let scene = classify_builtin("chrome.exe", "claude - Google Chrome");
-        assert_eq!(scene.scene, SceneKind::Chat);
+        assert_eq!(scene.scene, SceneKind::Agent);
     }
 
     /// SCENE-AI-AGENT-014: 大小写不敏感——CONHOST.EXE 大写 → ide_terminal（回归 SCENE-TITLE-CASE-001）
@@ -1023,7 +1048,7 @@ title_keywords = ["doc_keyword"]
     #[test]
     fn chatglm_classify_chat() {
         let scene = classify_builtin("ChatGLM.exe", "");
-        assert_eq!(scene.scene, SceneKind::Chat);
+        assert_eq!(scene.scene, SceneKind::Agent);
         assert!(!scene.multiline_safe);
     }
 
@@ -1031,7 +1056,7 @@ title_keywords = ["doc_keyword"]
     #[test]
     fn glm_classify_chat() {
         let scene = classify_builtin("GLM.exe", "");
-        assert_eq!(scene.scene, SceneKind::Chat);
+        assert_eq!(scene.scene, SceneKind::Agent);
         assert!(!scene.multiline_safe);
     }
 
@@ -1478,7 +1503,7 @@ title_keywords = ["doc_keyword"]
     #[test]
     fn p4_scene_macos_claude_chat() {
         let s = classify_builtin("Claude", "");
-        assert_eq!(s.scene, SceneKind::Chat, "macOS Claude 应 chat");
+        assert_eq!(s.scene, SceneKind::Agent, "macOS Claude 应 chat");
         assert!(!s.multiline_safe, "macOS Claude chat 应 false");
     }
 
@@ -1535,5 +1560,92 @@ title_keywords = ["doc_keyword"]
         let s = classify_builtin("WINWORD.EXE", "");
         assert_eq!(s.scene, SceneKind::Doc, "WINWORD.EXE 应仍 doc（回归）");
         assert!(s.multiline_safe, "WINWORD.EXE doc 应 true");
+    }
+
+    // ==================== AGENT-KIND-198 agent 从 chat 拆出 ====================
+
+    /// AGENT-KIND-198-G1：🔴 本次拆分的**全部目的** —— agent 场景的 F4 首句
+    /// 不得再自称 chat application。
+    ///
+    /// 拆分前：`build_scene_prompt_block` 拼 `typing into a {kind} application`，
+    /// agent 组 kind=chat ⇒ 首句「typing into a **chat** application. Adapt tone accordingly.」，
+    /// 与紧随其后的 style（「这是工作频道，按正式书写处理」）自相矛盾，
+    /// 且首句在主动把模型往口语方向拉 —— 它是 VERBOSE-195 三把锁的帮凶。
+    ///
+    /// 消融：toml 里 agent 组 kind 改回 "chat"，或 `SceneKind::Agent` 的 as_str
+    /// 返回 "chat" → 红。
+    #[test]
+    fn agent_scene_f4_header_no_longer_claims_chat() {
+        let scene = classify_builtin("Claude.exe", "Claude");
+        assert_eq!(
+            scene.scene,
+            SceneKind::Agent,
+            "Claude.exe 必须归 Agent 而非 Chat"
+        );
+
+        let block = build_scene_prompt_block(&scene, false).expect("agent 组 style 非空");
+        assert!(
+            !block.contains("a chat application"),
+            "agent 场景 F4 首句不得再自称 chat application，实际: {block}"
+        );
+        assert!(
+            block.contains("coding/AI agent application"),
+            "agent 场景 F4 首句应写明 coding/AI agent，实际: {block}"
+        );
+        // 冠词语法：调用处硬编码 "a"，标签必须与之拼出合法英文
+        assert!(
+            block.contains("into a coding/AI agent application"),
+            "标签须与硬编码不定冠词 a 拼合语法正确（不得出现 a AI …），实际: {block}"
+        );
+    }
+
+    /// AGENT-KIND-198-G2：`parse_kind` 认多种写法，且**未知 kind 仍落 Unknown**。
+    ///
+    /// 后半条是既有行为，此处钉死是因为它正是本次改动的风险面：
+    /// 旧 exe 读到新 toml 的 kind="agent" 会走 Unknown 分支 ⇒ 不注入 F4 静默失效。
+    /// 该分支现已加 warn 日志（可观测），但兜底语义本身不能变。
+    #[test]
+    fn parse_kind_accepts_agent_aliases_and_falls_back_on_unknown() {
+        for alias in [
+            "agent",
+            "Agent",
+            " AGENT ",
+            "ai_agent",
+            "ai-agent",
+            "coding_agent",
+        ] {
+            assert_eq!(
+                parse_kind(alias),
+                SceneKind::Agent,
+                "{alias:?} 应解析为 Agent"
+            );
+        }
+        assert_eq!(parse_kind("chat"), SceneKind::Chat, "chat 不受影响");
+        assert_eq!(
+            parse_kind("totally_unknown_kind"),
+            SceneKind::Unknown,
+            "未知 kind 必须落 Unknown（旧 exe 读新 toml 的兜底语义）"
+        );
+    }
+
+    /// AGENT-KIND-198-G3：社交 chat 组**不得**被拆分误伤 —— 仍是 Chat 且首句仍是 chat。
+    ///
+    /// Gavin 明确排除社交类，本护栏防止有人「顺手」把微信一起改成 agent。
+    #[test]
+    fn social_chat_group_unaffected_by_agent_split() {
+        for exe in ["WeChat.exe", "QQ.exe", "DingTalk.exe"] {
+            let s = classify_builtin(exe, "");
+            assert_eq!(s.scene, SceneKind::Chat, "{exe} 必须仍是 Chat");
+            let block = build_scene_prompt_block(&s, false).expect("social chat style 非空");
+            assert!(
+                block.contains("a chat application"),
+                "{exe} 的 F4 首句应仍是 chat application"
+            );
+            // 社交组不得被 VERBOSE-195 的压缩条款波及
+            assert!(
+                !block.contains("CONDENSE"),
+                "{exe} 属社交类，Gavin 明确排除冗余压缩"
+            );
+        }
     }
 }
