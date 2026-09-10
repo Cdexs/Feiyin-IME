@@ -887,3 +887,12 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 大小与根目录完好副本逐字节相等（元数据落盘、数据块未落盘）。已从根目录同步修复。
 **此前若干包处于该损坏状态 ⇒ 场景感知与 ITN 规则在那些包上静默失效**，
 基于其得出的端测结论需重新审视。
+
+## RELEASE-210 · 2026-09-10 · ✅ v0.9.0 正式发布
+
+- **release note**：`docs/RELEASE-NOTES-v0.9.0.md`（精简版，覆盖 v0.6 ~ v0.9）
+- **tag**：`v0.9.0` annotated（`--cleanup=verbatim`，message = release note 全文）
+- **push**：main `9520a58` + tag v0.9.0
+- **Release**：https://github.com/Cdexs/Feiyin-IME/releases/tag/v0.9.0 （HTTP 201，非 draft / 非 prerelease，未挂二进制）
+- **顺带**：README / README.en 版本徽章 v0.6.2 → v0.9.0
+- **负责人**：主控 ｜ **日期**：2026-09-10

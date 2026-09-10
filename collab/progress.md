@@ -729,3 +729,16 @@ load_wordbook_vocabulary()
 - 2026-09-07 ESC-174（coder-1，交付待验收）：编辑态 ESC=取消编辑+作废录入（复用 CancelRequested 收口臂，压制链双顺序安全）；30+/0-；1111P/0F。
 - 2026-09-07 ESC-178（coder-1，交付待验收）：ESC 不响应=机制未定（H1 路由层）+ 永久日志链三处 + FocusLost 同款轮询旁路（零重绘约束达成）；1112P/0F、warnings 111/102。
 - 2026-09-07 EDITFONT-183（coder-1，交付待验收）：编辑框字号 14→16px（独立常量+测渲一致+36px 装得下论证）；1112P/0F、warnings 111/102。
+
+---
+
+## 🚀 v0.9.0 发布（2026-09-10）
+
+| 项 | 内容 |
+| --- | --- |
+| tag | `v0.9.0`（annotated，自 `v0.5.4` 以来第一个 tag，跨 341 次提交 / 2026-05-28~09-10 / 214 文件 +98983 −6357） |
+| release note | `docs/RELEASE-NOTES-v0.9.0.md`，覆盖 v0.6 ~ v0.9，按 Gavin 要求走精简版 |
+| GitHub Release | https://github.com/Cdexs/Feiyin-IME/releases/tag/v0.9.0 （未挂二进制产物） |
+| 里程碑口径 | v0.9.0 = 悬浮窗重制 + 实时上屏体验 + 丢字类问题集中收口 + 热键重做 + 格式化输出治理 |
+
+**遗留**：README 正文功能表仍停留在 v0.6 时代；Release 未挂安装包。

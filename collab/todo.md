@@ -1,5 +1,18 @@
 # 任务列表 · voice-ime
 
+## ✅ 2026-09-10 — v0.9.0 已发布（RELEASE-210）
+
+tag `v0.9.0` + GitHub Release 已上线：https://github.com/Cdexs/Feiyin-IME/releases/tag/v0.9.0
+main 已推至 `9520a58`，本地与远端同步。
+
+### 本次发布的遗留待办
+
+| # | 项 | 说明 |
+| --- | --- | --- |
+| 1 | **README 正文更新** | `README.md` / `README.en.md` 核心功能表仍是 v0.6 时代（写着 SenseVoice 本地识别，无流式实时上屏 / 场景感知 / 在线 FunASR / 录音中编辑）。本次只改了版本徽章。建议随下一批派 coder 重写功能表 + 截图 |
+| 2 | **Release 挂安装包** | 本次 Release 未挂二进制。`docs/../Publish/voice-ime.iss` 是 Inno Setup 脚本但未构建安装包。需要对外分发时：tester-1 出 release 包 → 构建 setup.exe → upload asset |
+| 3 | `Publish/models` 缺 performance 模型 | 主控 21:38 查得 `Publish/models/sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17` 不在（目录 mtime 09-10 21:27），而 `config.toml` 是 `asr_model="performance"` ⇒ 跑 Publish 版本本地识别会直接报错。根目录与 `target/release/` 下都还在。**等 Gavin 确认是否手动删除**，确认后从 `target/release/models/` 拷回 |
+
 ## 🔴 2026-09-10 — 提示词优化三单（Gavin 拍板「开单」，DEC-059 管辖）
 
 **Gavin 指令**：① 等提示词优化后再出包 ② 开单 ③ 等优化开发完成再 push。
