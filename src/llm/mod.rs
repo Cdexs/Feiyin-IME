@@ -1064,7 +1064,11 @@ fn build_translate_system_content(
 /// Idempotent: input without newlines is returned unchanged (after trim).
 /// ITN-V2-PROMPT-002: Guard against separator doubling — if the accumulated output
 /// already ends with a separator or terminal punctuation, do NOT append another "；".
-fn flatten_multiline(text: &str) -> String {
+/// TRANS-SAFE-196: 由私有提升为 `pub(crate)` —— 翻译路径的格式安全裁决在 `main.rs`
+/// 的翻译分支出口统一执行（三条子路径 LLM/NLLB/兜底 一处覆盖），需跨模块调用本函数。
+/// 语义未改一字：无换行→trim；有换行→逐行 trim + 跳空行 + `；` 连接，且幂等
+/// （见 `flatten_multiline_idempotent` 等 11 条既有护栏）。
+pub(crate) fn flatten_multiline(text: &str) -> String {
     if !text.contains('\n') {
         return text.trim().to_string();
     }

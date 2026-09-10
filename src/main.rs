@@ -8776,7 +8776,11 @@ fn run_pipeline_core(
                             &raw_text,
                             config.audio.chinese_script,
                         );
-                        if should_try_llm_translate(
+                        // TRANS-SAFE-196: 三条子路径（LLM 成功 / LLM 失败转 NLLB / LLM 不合格直接
+                        // 走 NLLB，后两者各自还带 normalize_text_for_language 兜底）先汇合到
+                        // translated_out，再由下方统一做格式安全裁决 —— 一处覆盖全部子路径，
+                        // 避免逐路径打补丁时漏掉其中一条。
+                        let translated_out = if should_try_llm_translate(
                             config.llm.enabled,
                             config.llm.connectivity_verified,
                         ) {
@@ -8817,6 +8821,22 @@ fn run_pipeline_core(
                                     )
                                 },
                             )
+                        };
+                        // TRANS-SAFE-196 格式安全裁决 —— 补齐翻译路径此前完全缺失的 multiline_safe 保护。
+                        // 主路径在 llm::try_once 内做同款裁决，翻译路径走 try_once_raw 直接返回，
+                        // 整个绕过（llm/mod.rs 内「注：translate 路径不通过 try_once……不受影响」即指此）。
+                        // 后果：multiline_safe=false 的终端 / vim 等，翻译产生的多行结果换行原样注入，
+                        // 在模态编辑器里会被当命令键执行（scene-rules.toml 对 vim/gvim 的注释已警示该风险）。
+                        //
+                        // 🔴 只照搬 flatten 分支，刻意不照搬主路径 multiline_safe=true 那侧的
+                        // strip_fabricated_email_lines：该守卫用 input_contains_line 拿「输出行」去
+                        // 「输入原文」做字面包含匹配，翻译场景输入输出跨语言 ⇒ 字面永不匹配 ⇒ 判定条件
+                        // 恒真 ⇒ 用户真说了的称呼反被当成 LLM 编造删掉。与 llm/mod.rs 既有判例
+                        // 「判据 B 不扩展到翻译路径（英译中可合法大幅压缩，15% 会误伤）」同源。
+                        if multiline_safe {
+                            translated_out.trim().to_string()
+                        } else {
+                            llm::flatten_multiline(&translated_out)
                         }
                     } else if config.llm.enabled && !raw_text.trim().is_empty() {
                         let processing_msg = i18n::get(config.ui_language).overlay_processing;
@@ -11771,6 +11791,90 @@ mod overlay_101_centering_guard_tests {
         assert!(
             src.lines().any(|l| l.contains("fn centered_x")),
             "centered_x 函数必须存在（单一居中源）"
+        );
+    }
+
+    // ==================== TRANS-SAFE-196 翻译路径格式安全裁决护栏 ====================
+
+    /// TRANS-SAFE-196-G1：翻译分支出口必须做 multiline_safe 格式安全裁决。
+    ///
+    /// 背景：主路径在 `llm::try_once` 内做裁决，翻译路径走 `try_once_raw` 直接返回，
+    /// 此前完全绕过 —— multiline_safe=false 的终端/vim 会把翻译产生的换行原样注入，
+    /// 在模态编辑器里被当命令键执行。修法是在翻译分支三条子路径的汇合点统一裁决。
+    ///
+    /// 消融：删掉裁决块 → `flatten_multiline` 在 main.rs 命中 0 → 红；
+    /// 把 `translated_out` 绑定内联回原样（三子路径各自直接求值）→ 该标识符 0 命中 → 红；
+    /// 裁决改成无条件 flatten（丢掉 multiline_safe 分支）→ 同块内 `multiline_safe` 不再出现 → 红。
+    /// 🔴 判别力边界（如实声明）：本护栏只钉「裁决代码在场」，**不验证运行时行为**
+    /// —— 翻译分支深埋在 Win32 消息循环内，单测无法驱动。行为正确性由
+    /// `flatten_multiline` 自身的 11 条既有护栏 + 端测共同保证。
+    /// 顺序自证：纯文本静态比对，无时序。
+    #[test]
+    fn translate_branch_applies_multiline_safe_verdict() {
+        let src = include_str!("main.rs");
+
+        // 汇合点绑定必须存在（防止被内联回三条子路径各自求值）
+        // needle 拼装，避免本用例的字面量自我命中（同 centered_x 护栏范式）
+        let bind_needle = format!("let translated_{}", "out");
+        let bind_hits = src.lines().filter(|l| l.contains(&bind_needle)).count();
+        assert_eq!(
+            bind_hits, 1,
+            "翻译三子路径必须汇合到唯一的 translated_out 绑定，实测 {bind_hits} 处"
+        );
+
+        // 裁决必须调用 flatten_multiline（needle 拼装，避免本用例自我命中）
+        let needle = format!("llm::flatten_{}", "multiline");
+        let verdict: Vec<&str> = src
+            .lines()
+            .filter(|l| l.contains(&needle) && l.contains("translated_out"))
+            .collect();
+        assert_eq!(
+            verdict.len(),
+            1,
+            "翻译分支出口必须有且仅有一处 flatten 裁决作用于 translated_out，实测 {} 处",
+            verdict.len()
+        );
+
+        // 裁决必须是「按 multiline_safe 分支」而非无条件 flatten：
+        // 取裁决行前 6 行窗口，必须出现 multiline_safe 条件判定。
+        let idx = src
+            .lines()
+            .position(|l| l.contains(&needle) && l.contains("translated_out"))
+            .expect("上一断言已保证存在");
+        let window_start = idx.saturating_sub(6);
+        let window: String = src.lines().collect::<Vec<_>>()[window_start..=idx].join("\n");
+        assert!(
+            window.contains("if multiline_safe"),
+            "flatten 裁决必须受 multiline_safe 条件保护（multiline_safe=true 只 trim），\
+             否则多行安全场景（邮件/文档）的换行会被错误压平"
+        );
+    }
+
+    /// TRANS-SAFE-196-G2：翻译路径**禁止**套用 `strip_fabricated_email_lines`。
+    ///
+    /// 该守卫用 `input_contains_line` 拿「输出行」去「输入原文」做字面包含匹配。
+    /// 翻译场景输入输出跨语言 ⇒ 字面永不匹配 ⇒ 判定条件恒真 ⇒ 用户真说了的称呼
+    /// 反被当成 LLM 编造删除。与 `llm/mod.rs` 既有判例「判据 B 不扩展到翻译路径」同源。
+    ///
+    /// 消融：有人「为了对齐主路径」把该守卫搬进 main.rs 翻译分支 → 命中 >0 → 红。
+    /// 顺序自证：纯文本静态比对，无时序。
+    #[test]
+    fn translate_branch_must_not_use_fabrication_guard() {
+        let src = include_str!("main.rs");
+        let needle = format!("strip_fabricated_email_{}", "lines");
+        let hits: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains(&needle))
+            .filter(|(_, l)| !l.trim_start().starts_with("//"))
+            .map(|(i, l)| (i + 1, l))
+            .collect();
+        // 🔴 断言消息刻意不写该守卫的完整函数名 —— 写了会成为本文件的字面量，被自己命中。
+        assert!(
+            hits.is_empty(),
+            "main.rs 不得调用 LLM 编造称呼守卫（跨语言字面比对会把用户真说的称呼误删），\
+             实测命中 {:?}",
+            hits
         );
     }
 }
