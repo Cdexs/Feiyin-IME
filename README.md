@@ -161,8 +161,8 @@ Feiyin-IME/
 ├── *.dll                   # 运行时依赖
 ├── config.toml             # 你的配置（首次启动自动生成）
 ├── wordbook.sqlite         # 你的词库
-├── scene-rules.toml        # 场景规则
-├── itn-rules.toml          # 数字与成语规则
+├── scene-rules.toml
+├── itn-rules.toml
 └── models/
     ├── sherpa-onnx-sense-voice-funasr-nano-int8-*/  # 语音识别（必需，~254MB）
     ├── punct-ct-transformer-zh/                     # 标点补全（可选，~79MB）

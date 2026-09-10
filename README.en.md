@@ -175,8 +175,8 @@ Feiyin-IME/
 ├── *.dll                   # Runtime dependencies
 ├── config.toml             # Your configuration (created on first launch)
 ├── wordbook.sqlite         # Your wordbook
-├── scene-rules.toml        # Scene rules
-├── itn-rules.toml          # Number and idiom rules
+├── scene-rules.toml
+├── itn-rules.toml
 └── models/
     ├── sherpa-onnx-sense-voice-funasr-nano-int8-*/  # Speech recognition (required, ~254MB)
     ├── punct-ct-transformer-zh/                     # Punctuation (optional, ~79MB)
