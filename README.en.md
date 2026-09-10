@@ -122,16 +122,9 @@ translation hotkeys don't conflict.
 
 ## Connecting a model (optional)
 
-Any OpenAI-compatible endpoint works. Fill it in on the **Formatted Output** page in Settings:
-
-```toml
-[llm]
-api_url = "https://api.deepseek.com/v1"
-api_key = "sk-..."
-model   = "deepseek-chat"
-enabled = true
-```
-
+Any OpenAI-compatible endpoint works. On the **Formatted Output** page in Settings you fill in three
+things — **endpoint URL, API key, model name** — then flip the switch. There is a **Test connection**
+button right there to verify it.
 > **It works without this.** With no API key the app falls back to pure local transcription —
 > punctuation, translation and number conversion all still work; you just don't get semantic
 > polishing and layout.
@@ -148,20 +141,12 @@ proper nouns, file paths and code identifiers are all explicitly protected.
 Hold the translation hotkey (Right Ctrl, as recommended above) while recording, and the translated
 text comes out directly.
 
-- **The target language** is set by `translation.target_language` in `config.toml`
-  (`Chinese` / `English`). Speech that is already in the target language passes through untranslated —
-  so with `English`, Chinese speech becomes English and English speech stays as-is
+- **Chinese is translated to English by default.** Speech already in the target language passes
+  through as-is, with no extra processing
 - **Uses your configured model when available**; otherwise the local opus-mt model, **fully offline**
 - Long passages are segmented automatically so nothing gets truncated
 
-```toml
-[translation]
-enabled = true
-target_language = "English"   # flip to "Chinese" for the other direction
-```
-
-> There's no UI control for this yet — config file only. Fully automatic two-way translation is on the
-> backlog.
+> A switch for the translation direction is being added to the settings UI.
 
 ---
 
@@ -175,8 +160,6 @@ Feiyin-IME/
 ├── *.dll                   # Runtime dependencies
 ├── config.toml             # Your configuration (created on first launch)
 ├── wordbook.sqlite         # Your wordbook
-├── scene-rules.toml
-├── itn-rules.toml
 └── models/
     ├── sherpa-onnx-sense-voice-funasr-nano-int8-*/  # Speech recognition (required, ~254MB)
     ├── punct-ct-transformer-zh/                     # Punctuation (optional, ~79MB)

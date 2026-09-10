@@ -111,15 +111,8 @@
 
 ## 配置大模型（可选）
 
-支持任何 OpenAI 兼容接口，在设置界面的「格式化输出」页填写即可：
-
-```toml
-[llm]
-api_url = "https://api.deepseek.com/v1"
-api_key = "sk-..."
-model   = "deepseek-chat"
-enabled = true
-```
+支持任何 OpenAI 兼容接口。在设置界面的「格式化输出」页填三样东西：**接口地址、API Key、模型名**，
+打开开关即可，页面上有「测试连接」可以当场验证。
 
 国内可用：[DeepSeek](https://deepseek.com)、[SiliconFlow](https://siliconflow.cn)、[通义千问](https://dashscope.aliyun.com)
 
@@ -136,18 +129,11 @@ enabled = true
 
 录音时同时按住翻译热键（推荐右 Ctrl），说完直接出译文。
 
-- **目标语言**由 `config.toml` 的 `translation.target_language` 决定（`Chinese` / `English`）。
-  说的话如果已经是目标语言，就原样输出不翻译 —— 所以设成 `English` 时，说中文出英文、说英文照旧
+- **默认把中文翻成英文**。说的话如果已经是目标语言，就原样输出、不做多余处理
 - **优先用你配的大模型**；没配就用本地 opus-mt 模型，**完全离线**
 - 长文本自动分段，不会说到一半被截断
 
-```toml
-[translation]
-enabled = true
-target_language = "English"   # 想反过来就改成 "Chinese"
-```
-
-> 目前这一项还没有界面开关，只能改配置文件；「说什么语言都自动互译」在待办里。
+> 翻译方向的切换选项正在补进设置界面。
 
 ---
 
@@ -161,8 +147,6 @@ Feiyin-IME/
 ├── *.dll                   # 运行时依赖
 ├── config.toml             # 你的配置（首次启动自动生成）
 ├── wordbook.sqlite         # 你的词库
-├── scene-rules.toml
-├── itn-rules.toml
 └── models/
     ├── sherpa-onnx-sense-voice-funasr-nano-int8-*/  # 语音识别（必需，~254MB）
     ├── punct-ct-transformer-zh/                     # 标点补全（可选，~79MB）
