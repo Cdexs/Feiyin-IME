@@ -8790,6 +8790,11 @@ fn run_pipeline_core(
                                 derived_target,
                                 script_instruction,
                                 config.punctuation.enabled,
+                                // TRANS-SCENE-197: 这两个参数此前没传 —— scene_context / send_window_title
+                                // 就在同作用域（:8717/:8718）且主路径 optimize 一直在用，翻译路径漏传，
+                                // 导致场景风格（含 VERBOSE-195 冗余压缩）与用户基座一开翻译就全部失效。
+                                Some(&scene_context),
+                                send_window_title,
                             )) {
                                 Ok(result) => {
                                     log::info!("LLM optimize+translate done: {}", result.text);

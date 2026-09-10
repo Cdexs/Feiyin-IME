@@ -1711,3 +1711,17 @@ Windows 侧为流式窗（RecordingWithText/RecordingStreamingIdle）的麦克�
 2. 翻译路径绕过 `flatten_multiline`（`llm/mod.rs:898` 自陈）——平台中立缺陷。
 3. agent 组 `kind="chat"` 致 F4 首句写「typing into a chat application」与 style 自相矛盾，
    本次以 style 内 `NOTE` 治标；根治需 `SceneKind` 加 `Agent` 变体 = **平台中立 Rust 改动，两端同受影响**。
+
+## TRANS-SAFE-196 + TRANS-SCENE-197（2026-09-10，主控代做）· 翻译路径两项修复 —— macOS 侧影响
+
+**改动性质**：`src/llm/mod.rs` + `src/main.rs`，**全部落在平台中立模块**，两端编译同一份代码。
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| TRANS-SAFE-196 翻译路径 `multiline_safe` 裁决 | ✅ **自动生效，两端同源**。但注入侧行为由各端决定：Windows 的风险是终端/vim 把换行当命令键执行；**macOS 端需自行确认注入实现（剪贴板 vs CGEvent）在多行文本下的等价风险**，并核对 `scene-rules.toml` 中 macOS 可执行名的 `multiline_safe` 取值是否合理 |
+| TRANS-SCENE-197 场景块 + 用户基座注入翻译路径 | ✅ **自动生效，两端同源**。macOS 侧场景命中依赖 `bundle_id` 字段（Phase 4 预留、当前忽略）与无 `.exe` 的可执行名，**若 macOS 场景识别未落地，则翻译路径同样拿不到场景块** —— 与 Windows 不对等，接手时需一并评估 |
+| `llm::flatten_multiline` 私有 → `pub(crate)` | 平台中立，语义零改动，无平台差异 |
+| 新增 6 条护栏（main.rs 2 + llm/mod.rs 4） | 平台中立纯文本/纯函数断言，macOS 端 `cargo test` 同样应绿。其中 main.rs 两条是 `include_str!("main.rs")` 结构锚，**若 macOS 侧对该文件做平台分支重构，需同步维护锚点** |
+
+**行为变更告知**：🔴 这是**行为变更**不是 bug 修复 —— 开启翻译时的输出形态会变
+（多行被压平 / 场景风格与用户基座开始生效）。macOS 端若已按旧行为写过测试或文档，需同步更新。
