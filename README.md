@@ -1,4 +1,4 @@
-# 飞音智能语音输入 · Feiyin Smart Voice Input
+# 飞音智能语音输入 · Flash Voice Input
 
 **[English](README.en.md) | 中文**
 
