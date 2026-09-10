@@ -60,7 +60,8 @@
 
 | # | 项 | 说明 |
 | --- | --- | --- |
-| 1 | **README 正文更新** | `README.md` / `README.en.md` 功能表仍是 v0.6 时代（写着 SenseVoice，无流式上屏 / 场景感知 / 在线 FunASR / 录音中编辑）。本次只改了版本徽章 |
+| 1 | ~~README 正文更新~~ | ✅ **已完成 README-212**（2026-09-10）：中英 README 重写为叙事式产品页，英文名定为 **FlashVoice Input** |
+| 1b | 🔴 **命名不一致待定** | 产品英文名已改 FlashVoice Input，但这些**还是旧名**：仓库名 `Feiyin-IME`、产物名 `feiyin-ime.exe` / `feiyin-ime-ui.exe`、GitHub Release 标题「飞音智能语音输入 v0.9.0」、安装包脚本 `voice-ime.iss`。**改产物名会动构建链和用户升级路径，等 Gavin 决定改到哪一层** |
 | 2 | Release 挂安装包 | 本次 Release 未挂二进制。`voice-ime.iss` 是 Inno Setup 脚本但未构建。需对外分发时：出 release 包 → 构建 setup.exe → upload asset |
 | 3 | `Publish/models` 缺 performance 模型 | `sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17` 不在 `Publish/models/`（目录 mtime 09-10 21:27），而 config 是 `asr_model="performance"` ⇒ 跑 Publish 版本本地识别会直接报错。根目录与 `target/release/` 下都还在。**等 Gavin 确认是否手动删除**，确认后从 `target/release/models/` 拷回 |
 
