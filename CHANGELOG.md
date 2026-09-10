@@ -896,3 +896,12 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **Release**：https://github.com/Cdexs/Feiyin-IME/releases/tag/v0.9.0 （HTTP 201，非 draft / 非 prerelease，未挂二进制）
 - **顺带**：README / README.en 版本徽章 v0.6.2 → v0.9.0
 - **负责人**：主控 ｜ **日期**：2026-09-10
+
+## DOC-SLIM-211 · 2026-09-10 · ✅ 启动必读文档瘦身（DEC-064）
+
+- **改造**：`todo.md` / `decisions.md` / `troubleshooting.md` 三份改「索引 + 全文归档」两层结构
+- **效果**：启动必读合计 **227,865 → 23,022 token（−90%）**，达成 CLAUDE.md 的 ~20K 约束
+- **零删改**：全文搬入 `todo-archive.md` / `decisions-archive.md` / `troubleshooting-archive.md`，机器双向校验 0 遗漏
+- **顺带**：`worker-guide.md` 396→299 行；`voice-ime/CLAUDE.md` 订正 6 处过时内容（Paraformer / eframe / GDI / 缺 5 模块 / build-guide 指错 / exe 名）
+- **新增决策**：DEC-064
+- **负责人**：主控 ｜ **日期**：2026-09-10
