@@ -3816,6 +3816,29 @@ opencode.ai/workspace/.../billing`，模型档 `DeepSeek V4 Flash · OpenCode Ze
 Worker 恢复后 `go on` 即可继续；确需重新通知用 `dispatch <id>`（**不带 task 参数**），
 它保留既有 task.md，只重发通知。
 
+### 🔴 复发记录四：2026-09-10 —— **三个 Worker 同时死**，且换模型无效（账户级月度限额）
+
+**场景**：新会话启动，主控开工检查三个 pane：
+
+| Worker | 模型档 | 末行 |
+| --- | --- | --- |
+| coder-1 / coder-2 | `GLM-5.3-Flash (2x usage) · OpenCode Go` | `monthly usage limit reached. It will reset in 24 days 10 hours` `[retrying in ~3 weeks attempt #1]` |
+| tester-1 | `deepseek-v4-flash · OpenCode Go` | 启动上下文停在输入框未提交；主控补发 Enter 后**立刻同样命中** |
+
+**本条的新增价值（与前三次的关键差异）**：前三次都是**单个 Worker 的单个模型档**耗尽，
+处方是「切档」。本次是 **provider 级（OpenCode Go）月度限额**耗尽 ——
+`GLM-5.3-Flash` 与 `deepseek-v4-flash` 是两个不同模型名，**同一条限额，同时死**。
+⇒ **看到 `monthly usage limit reached` 就不要再试切同 provider 的其它模型名了**，
+那是白费一轮弹层操作。判别方法：文案是 `monthly usage limit reached … reset in N days`
+（provider 级）而不是 `Insufficient balance` / `Free usage exceeded`（档位级）。
+
+**主控当时未做、事后确认正确的两件事**：
+① 未重启任何 Worker —— 重启只把模型重置为默认档，对额度耗尽零帮助（本条目开头即载）。
+② 未盲发 `/models` 切档 —— 见上文「主控踩坑」节。
+
+**处置**：Gavin 确认「额度已用完，需要等重置」⇒ 本轮无可用 Worker，
+主控不派发任务、不重启、不切档，等额度重置。
+
 ## [WORKER-DOC-OVERWRITE-001] 🔴 Worker 写五文档时把整份文件覆盖掉（表头连同他人条目一起消失）【主控提交前必查 diff 有无删除行】
 
 **日期**：2026-08-18 ｜ **发现**：主控提交前 `git diff --stat` 看到**负增量** ｜ **责任**：tester-1（TEST-EXEC-056）

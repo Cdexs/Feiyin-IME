@@ -1,5 +1,17 @@
 # 任务列表 · voice-ime
 
+## 🔴 2026-09-10 会话状态：**三个 Worker 全部额度耗尽，本轮无法派发任何任务**
+
+coder-1 / coder-2（`GLM-5.3-Flash · OpenCode Go`）与 tester-1（`deepseek-v4-flash · OpenCode Go`）
+末行均为 `monthly usage limit reached. It will reset in 24 days 10 hours`。
+**是 provider 级（OpenCode Go）月度限额，不是单档耗尽** —— 换模型名无效（tester-1 已实证）。
+Gavin 确认：「额度已用完，需要等重置」。
+
+⇒ 主控本轮**不重启、不切档、不派发**，下方所有待办**原样保留**，等额度重置后接着做。
+⇒ 完整判据与处置见 `troubleshooting.md [WORKER-RESTART-MODEL-RESET-001]` 复发记录四。
+⇒ 原「遗留待办 #4 tester-1 故障处置（`Bad Request: deepseek-v4-flash`）」**已定性**：
+   同一条账户额度问题，非模型 API 故障，无需单独排查。
+
 ## ✅ 2026-09-08 本批已收官 —— BUILD-193 Gavin 端测全过
 
 **产物** `Publish/feiyin-ime.exe` @13:44:56 sha `d081c742…`，HEAD `8280927`。
