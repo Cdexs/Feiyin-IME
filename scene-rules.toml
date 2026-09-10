@@ -101,6 +101,12 @@ exe = [
     "Codex.exe",               # OpenAI Codex 桌面版独立入口（同 OpenAI.Codex 包内 Codex.exe；本机核实）
     "OpenCode.exe",            # OpenCode 桌面版（anomalyco/opencode desktop，安装路径 Programs/@opencode-aidesktop/OpenCode.exe；本机核实）
     "ZCode.exe",               # ZCode 桌面版（Gavin 2026-09-10 指定补录；本机核实 D:\ZCode\ZCode.exe，Electron 多进程）
+    # --- pi desktop（Gavin 2026-09-10 指定补录）。本机未安装，以下四条据上游仓库配置推定，非本机核实。
+    #     两个上游项目都自称 "pi desktop"，未定 Gavin 用的是哪个 ⇒ 全录（exe 为精确匹配，多录无误命中风险，漏录=静默失效）
+    "Pi Desktop.exe",          # FaqFirebase/pi-desktop（Electron，package.json productName="Pi Desktop"，未设 executableName ⇒ exe 取 productName）
+    "pi-desktop.exe",          # 同上，package.json name 兜底（若上游改设 executableName）
+    "Pi Agent.exe",            # abcwyc/pi-agent-desktop（Tauri v2，tauri.conf.json productName="Pi Agent"，未设 mainBinaryName ⇒ exe 取 productName）
+    "pi-agent-desktop.exe",    # 同上，src-tauri/Cargo.toml [package] name 兜底
     "CherryStudio.exe",        # Cherry Studio（CherryHQ/cherry-studio，electron-builder.yml executableName=CherryStudio；核实）
     "Chatbox.exe",             # Chatbox（chatboxai/chatbox，electron-builder.yml productName=Chatbox；核实）
     "jan.exe",                 # Jan（janhq/jan，README 明确 Windows=jan.exe；核实）

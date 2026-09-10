@@ -14,7 +14,7 @@
 >
 > | # | 项 | 说明 |
 > | --- | --- | --- |
-> | 1 | **pi desktop exe 名** | Gavin 指定补录但本机未装、全盘扫描零命中。**猜=静默失效**，待 Gavin 给准确 exe 名（纯词表，拿到即可加，仍免构建） |
+> | 1 | ~~pi desktop exe 名~~ | ✅ **已解决**（VERBOSE-195-B，2026-09-10 联网取证）：两个上游项目都自称 pi desktop，四条全录 —— `Pi Desktop.exe`/`pi-desktop.exe`（FaqFirebase/pi-desktop，Electron productName）+ `Pi Agent.exe`/`pi-agent-desktop.exe`（abcwyc/pi-agent-desktop，Tauri productName）。🔴 非本机核实，待端测看 `Scene context: app_exe=` 日志坐实 |
 > | 2 | **翻译路径补 scene + 用户基座** | `optimize_and_translate`(`main.rs:8783`) 只传 4 参，`scene_context`/`multiline_safe` 就在 `:8717` 同作用域没传；`build_translate_system_content`(`llm/mod.rs:997`) 签名无 scene 位。⇒ **开翻译时 VERBOSE-195 全部失效** |
 > | 3 | 🔴 **翻译路径补 multiline_safe**（优先级最高，非提示词问题） | `llm/mod.rs:898` 自陈绕过 `try_once`⇒ 不走 `flatten_multiline`(`:903`)。终端/vim(`multiline_safe=false`)开翻译可能吃到换行被当命令执行。**推自代码未实测**，需一次端测坐实 |
 > | 4 | **agent 从 chat kind 拆出** | `scene/mod.rs:350-353` F4 首句拼 `typing into a {kind} application` ⇒ agent 场景实际写「typing into a **chat** application」，与 style 自相矛盾且反向拉口语。本次 style 内 `NOTE` 治标，根治需 `SceneKind::Agent` + 全量回归 |
