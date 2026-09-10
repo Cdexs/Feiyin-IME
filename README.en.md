@@ -95,20 +95,28 @@ Simplified Chinese, Traditional Chinese and English.
 
 1. Download the [latest release](https://github.com/Cdexs/Feiyin-IME/releases) and extract it anywhere
 2. Run `feiyin-ime.exe` — a tray icon appears → right-click → **Settings**
-3. Pick a recording hotkey (**Right Ctrl or Right Alt work well** — reachable one-handed, and they
-   don't collide with common shortcuts), then hold it and speak
+3. Set the recording hotkey to **Right Alt** and translation to **Right Ctrl** (rationale below), then
+   hold Right Alt and speak
 
 For better output quality, add a model API key on the **Formatted Output** page (see below).
 It works fine without one.
 
 ### Hotkeys
 
+This is the setup we recommend — worth configuring the moment you open Settings:
+
 | Key | Action |
 |-----|--------|
-| `F9` (default, configurable) | Start / stop recording (Toggle mode) |
-| Hold the key | Push-to-talk — speak while held, release to finish |
-| Translation hotkey while recording | Translate as you speak |
+| **Right Alt** | Record. Tap to start, tap again to stop (Toggle) — or **hold to talk, release to finish** (PTT) |
+| **Right Ctrl** | Translate. Hold it while recording and the translated text comes out directly |
 | `Esc` | Cancel the current recording |
+
+**Why these two keys**: both sit under your right hand and are reachable one-handed; almost nothing
+else claims them, so they won't collide with existing shortcuts; and since left and right modifiers are
+detected separately, your normal Left-Ctrl / Left-Alt shortcuts never trigger them by accident.
+
+> Out of the box the recording key is `F9` (Toggle) and translation is disabled — which is why this
+> ten-second change is worth making first.
 
 Configure under **General → Trigger** in Settings. **Left and right modifiers are separate keys**
 (Left Ctrl ≠ Right Ctrl), any key combination works, and the app checks that your recording and
@@ -141,7 +149,8 @@ proper nouns, file paths and code identifiers are all explicitly protected.
 
 ## Translation
 
-Hold the translation hotkey while recording and the translated text comes out directly.
+Hold the translation hotkey (Right Ctrl, as recommended above) while recording, and the translated
+text comes out directly.
 
 - **The target language** is set by `translation.target_language` in `config.toml`
   (`Chinese` / `English`). Speech that is already in the target language passes through untranslated —
