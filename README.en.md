@@ -6,7 +6,7 @@
 > you're in, and the wordbook keeps learning your vocabulary — it fits you better the more you use it.
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](https://github.com/Cdexs/Feiyin-IME)
-[![Version](https://img.shields.io/badge/version-v0.9.0-green)](https://github.com/Cdexs/Feiyin-IME/releases)
+[![Version](https://img.shields.io/github/v/release/Cdexs/Feiyin-IME?color=green&label=version)](https://github.com/Cdexs/Feiyin-IME/releases)
 [![License](https://img.shields.io/badge/license-MIT-orange)](LICENSE)
 
 ---
@@ -302,7 +302,7 @@ git config core.hooksPath scripts/git-hooks
 ## Changelog
 
 Full history in [CHANGELOG](CHANGELOG.md); latest release notes at
-[v0.9.0](https://github.com/Cdexs/Feiyin-IME/releases/tag/v0.9.0).
+[the latest release](https://github.com/Cdexs/Feiyin-IME/releases/latest).
 
 ## License
 

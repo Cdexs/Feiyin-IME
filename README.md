@@ -5,7 +5,7 @@
 > 说话就是输入。文字跟着你的语速出现在屏幕上，它可根据你使用的软件智能优化输出结构，词库自学习越用越懂你。
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](https://github.com/Cdexs/Feiyin-IME)
-[![Version](https://img.shields.io/badge/version-v0.9.0-green)](https://github.com/Cdexs/Feiyin-IME/releases)
+[![Version](https://img.shields.io/github/v/release/Cdexs/Feiyin-IME?color=green&label=version)](https://github.com/Cdexs/Feiyin-IME/releases)
 [![License](https://img.shields.io/badge/license-MIT-orange)](LICENSE)
 
 ---
@@ -281,7 +281,7 @@ git config core.hooksPath scripts/git-hooks
 
 ## 更新日志
 
-完整变更见 [CHANGELOG](CHANGELOG.md)，最新版本说明见 [v0.9.0 Release](https://github.com/Cdexs/Feiyin-IME/releases/tag/v0.9.0)。
+完整变更见 [CHANGELOG](CHANGELOG.md)，最新版本说明见 [最新 Release](https://github.com/Cdexs/Feiyin-IME/releases/latest)。
 
 ## License
 
