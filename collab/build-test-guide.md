@@ -104,6 +104,9 @@ Get-ChildItem -Path "Publish\*.exe" | Select-Object Name, LastWriteTime, Length
 
 确认三个文件时间戳均为本次构建时间，Publish/ 为发布暂存目录，必须与 target/release/ 保持同步。出包任务必须执行此步骤，不可跳过。
 
+> 🔴 **本步是动作，不是核验** —— 本步做完只证明「`cp` 发了」，不证明「内容对了」。
+> 结果级核验见 `一·五、出包核验清单`（第八项 `sha256sum` 三副本比对）。
+
 ### 预期构建时间 & 产物大小
 
 > 🔴 **2026-08-09 BUILD-015 实测修正**：下表原值（~22MB / ~31MB / 合计 ~47s）是 **DEC-021 体积优化
@@ -129,6 +132,153 @@ Get-ChildItem -Path "Publish\*.exe" | Select-Object Name, LastWriteTime, Length
 | `cargo tauri build` 报错        | Tauri v1 与 tauri-cli v2 不兼容，**禁止使用** |
 | `拒绝访问 (os error 5)`           | 进程占用文件锁，先执行 Step 1 再重试               |
 | Tauri UI 空白页 / localhost 拒绝连接 | 缺少 custom-protocol feature           |
+
+---
+
+## 一·五、出包核验清单【八项，出包任务必须逐项报 PASS/FAIL】
+
+> **由来**：本清单此前只活在历次 `handoffs.md` 的 `BUILD-xxx` 条目里，正文无成文判据 ——
+> 换人出包不知道要核哪几项，或核了但项目不一致，事后也无从对账。
+> 2026-09-17 `BUILD-VERIFY-219` 从 `handoffs-archive.md` 逐条取证还原 + 新增第八项后落成本节。
+> 取证过程与清单演变全记录见该单的 result.md（含「七项」名号与实际条数长期不符、
+> 第八项历史上曾被核过又在 BUILD-159 被丢弃的实证）。
+
+### 🔴 与「构建步骤」的区别（本节的立身之本）
+
+| | 构建步骤（§一 Release 构建流程） | 出包核验（本节） |
+| --- | --- | --- |
+| 回答的问题 | 我**做了**什么动作 | 我**验证了**结果对不对 |
+| 例 | Step 4 `cp` 同步 `Publish/` + 两 toml | `sha256sum` 三副本比对，确认内容真的落对了 |
+| 缺失后果 | 产物没更新 | 产物更新了但可能是坏的/旧的/不是本批的，**且无人知道** |
+
+🔴 **动作顶替不了核验**。Step 4 执行了 `cp`，只证明「我发了这条命令」；
+第八项执行 `sha256sum`，才证明「文件内容确实是本批应有的内容」。
+`[TOML-ALL-NUL-001]` 就是把「动作做了、结果错了」演成真实事故的例子。
+
+### 逐项判据
+
+**① 主程序时间戳 = 本次构建时间**
+
+| | |
+| --- | --- |
+| 判据 | `target/release/feiyin-ime.exe` 的 mtime 落在本次构建时间窗内，且不早于本批最后一次代码改动 |
+| 命令 | `ls -la target/release/feiyin-ime.exe`（必要时 `stat -c '%y'`） |
+| 期望 | mtime = 本次构建；本批含 UI 改动时 `feiyin-ime-ui.exe` 一并在窗内 |
+| 失败意味着 | 出的是旧 exe，测试/端测全部对着旧产物 —— `[BUILD-002]` `[BUILD-003]` |
+| 陷阱 | mtime 被 `cp` 刷新而内容未变 → `[BUILD-FIX-SYNC-001]`，须配合②的 sha 一起看 |
+
+**② 两副本 exe sha256 相等，且本批改动过的产物异于上一包**
+
+| | |
+| --- | --- |
+| 判据 | `target/release/` 与 `Publish/` 同名 exe 的 sha256 逐一相等；**本批有改动**的产物 sha ≠ 上一包同产物 |
+| 命令 | `sha256sum target/release/feiyin-ime.exe Publish/feiyin-ime.exe`（ui / crash-reporter 同理） |
+| 期望 | 两副本相等；有改动的必变。**本批未改动的产物允许 sha 与上包相同**，但必须在报告里注明「本批未改动，sha 与上包相同属预期」 |
+| 失败意味着 | 两副本不等 → Step 4 `cp` 漏执行/漏文件（`[BUILD-PUBLISH-001]`）；有改动却不异于上包 → 改动没进包，是**假出包** |
+| 判别力来源 | 「异于上一包」这一半才是关键 —— 只核两副本相等时，漏构建会让两副本一起是旧的且自洽 |
+
+**③ ProductVersion 正确**
+
+| | |
+| --- | --- |
+| 判据 | 产物版本资源 == `Cargo.toml` 的 `version`，三产物（主程序 / UI / crash-reporter）一致 |
+| 命令 | `powershell -Command "(Get-Item .\target\release\feiyin-ime.exe).VersionInfo.ProductVersion"` |
+| 期望 | 与本批 `Cargo.toml` 一致；版本号本批**未被改动**（改动须 Gavin 明确指示，出处写进 result.md） |
+| 失败意味着 | 版本漂移 —— `[VERSION-DRIFT-001]`（文字记录不可信，必须实际读文件） |
+| 注意 | 版本升号单（如 `VER-BUMP-217`）与出包同批时，本项是**必须变红再变绿**的唯一例外 |
+
+**④ 冒烟启动：Responding + 无 panic + 测后清理**
+
+| | |
+| --- | --- |
+| 判据 | 主程序能启动并存活；`Responding=True`；无新 `crash.json`；日志无 panic；测后进程已清理 |
+| 命令 | 启动 `./target/release/feiyin-ime.exe` → `powershell -Command "Get-Process feiyin-ime | Select-Object Id,Responding"` → 查 `%APPDATA%/voice-ime/` 有无新 crash.json → `Stop-Process` |
+| 期望 | `Responding=True`、无 crash.json、无 panic 行、测后零残留 |
+| 失败意味着 | 启动即崩 / UI 空白 —— `[SMOKE-VANISH-001]` `[TEST-001]`（**进程存活不等于稳定性证据**） |
+| 前置 | 🔴 冒烟前必须先按 Step 1 清进程，否则命中单实例 mutex 报 `Application already running, exiting`，会被误判成崩溃 |
+| 陷阱 | 残留进程会抢全局热键，导致后续所有热键测试假失败 —— `[SENDINPUT-001]` |
+
+**⑤ `config.toml` sha256 不变（用户运行时数据不得被覆盖）**
+
+| | |
+| --- | --- |
+| 判据 | 构建前、构建后、冒烟后，`Publish/config.toml` 的 sha256 三次一致 |
+| 命令 | `sha256sum Publish/config.toml`（三个时点各一次） |
+| 期望 | 三次一致。`Publish/` 同时是 Gavin 的运行目录，`config.toml` / `wordbook.sqlite` / `debug.log` 一律不得从 `target/release/` 覆盖过去 |
+| 失败意味着 | 用户配置被静默覆盖，不可逆丢失；与 `[TOML-STALE-001]` 同族 |
+| 注意 | 冒烟启动后 `version_check.json` 会被**程序自身**合法写入，不算覆盖，不要误报 |
+
+**⑥ warnings 数与基线持平**
+
+| | |
+| --- | --- |
+| 判据 | 本次 release 构建的 warning 数与上一包基线逐位持平（主程序与 crash-reporter 分开记） |
+| 命令 | 从构建输出统计，或 `cargo build --release 2>&1 \| grep -c "^warning"` |
+| 期望 | 与基线相同（当前基线示例：`feiyin-ime` 111 / `crash-reporter` 5；测试档 102） |
+| 失败意味着 | 有未审查的改动混入（含 `cargo fmt` 连带、依赖变更、他人未提交改动）—— `[FMT-COLLATERAL-001]` |
+| 注意 | warning 数只在**同一命令、同一 feature 组合**下可比，不要跨 `--all-targets` 与 bare 构建对比 |
+
+**⑦ 本批改动的二进制字面量判别探针（正反对照）**
+
+| | |
+| --- | --- |
+| 判据 | 对本批**新增/删除的字符串字面量**在 exe 二进制里做双向 grep：正向（新串）≥1 命中、反向（旧串）0 命中 |
+| 命令 | `grep -c "新串" target/release/feiyin-ime.exe` ／ `grep -c "旧串" target/release/feiyin-ime.exe` |
+| 期望 | 正向 ≥1；反向 = 0；报告里贴原始计数 |
+| 失败意味着 | 正向 0 → 改动根本没进包（结合②的 sha 一起判）；反向 >0 → 旧逻辑残留 |
+| 🔴 降级条款 | 本批为**纯几何/纯逻辑、零新增字符串**时（如 `OVERLAY-141` 纯半径几何），二进制探针**不可构造** → 改报「三证」：源码引用 grep 计数 + 构建时间戳 + sha 异于上一包，并**显式标注「探针不可构造」**。**不许静默省略本项**（先例：BUILD-145 如实报不可构造 / BUILD-017 如实报「本批探不到」） |
+| 注意 | Tauri 前端字符串被压缩，`grep` 常 0 命中 —— 此时改用 `ui/dist` 产出的 **JS 文件名字符**探针（如 `index-XXXX.js` 是否内嵌进 `feiyin-ime-ui.exe`），先例：BUILD-016/019/020 |
+
+**⑧ 随包数据文件内容级校验（`scene-rules.toml` / `itn-rules.toml` 三副本 sha256 全等）【2026-09-17 新增】**
+
+| | |
+| --- | --- |
+| 判据 | `scene-rules.toml`、`itn-rules.toml` 各自的**三副本**（仓库根 / `Publish/` / `target/release/`）sha256 两两全等 |
+| 命令 | `sha256sum ./scene-rules.toml Publish/scene-rules.toml target/release/scene-rules.toml` ／ `sha256sum ./itn-rules.toml Publish/itn-rules.toml target/release/itn-rules.toml` |
+| 期望 | 每条命令三行 hash 全等（仓库根是唯一权威源、受 git 管辖；另两处是运行时副本） |
+| 🔴 为什么必须 hash 而非大小 | `[TOML-ALL-NUL-001]`：2026-09-08 出包时两份规则词表**整文件变成全 NUL**，exe 照常启动、功能静默失效，而**坏文件与好文件大小完全相等** —— 只比大小 100% 检不出来 |
+| 🔴 与 Step 4 的关系 | §一 Step 4 里的「toml 三副本同步」**是动作**（`cp`）；本项**是核验**（hash 比对）。两者不可互相顶替，见本节开头对照表 |
+| 🔴 为什么现在必须成文 | `BUILD-159`（2026-09-07）起 toml 三副本被显式列入「跳过」清单，此后 `BUILD-165/173/177/186` 只见 `cp` 动作、不见 hash 核验 —— **动作还在、核验丢了**，正是本节要堵的洞 |
+| 失败意味着 | 用户实际跑的不是代码里的规则（`[TOML-STALE-001]`：陈旧外置 toml 静默覆盖内置默认，**无任何报错**）；或文件已损坏（`[TOML-ALL-NUL-001]`） |
+| 高危场景 | toml 由**另一端（macOS）改动后经 merge 进来**：本端源码没动、`cargo build` 一切正常，但运行时两副本还是合并前的旧版（2026-08-09 BUILD-015 实际发生过，差 3877B 实质内容） |
+
+### 报告格式【出包任务 result.md 末尾必须原样带出】
+
+```
+出包核验（八项，逐项 PASS/FAIL，无实测输出 = 未核验）
+
+| # | 项 | 结果 | 实测输出（命令 + 原始值） |
+| --- | --- | --- | --- |
+| ① | 主程序时间戳 | PASS/FAIL | |
+| ② | 两副本 sha256 + 异于上一包 | PASS/FAIL | |
+| ③ | ProductVersion | PASS/FAIL | |
+| ④ | 冒烟启动 + 清理 | PASS/FAIL | |
+| ⑤ | config.toml sha256 不变 | PASS/FAIL | |
+| ⑥ | warnings 与基线持平 | PASS/FAIL | |
+| ⑦ | 二进制判别探针（正反） | PASS/FAIL/N-A(不可构造) | |
+| ⑧ | 规则 toml 三副本 hash 全等 | PASS/FAIL | |
+```
+
+**判 PASS 的门槛**：该项有**实测命令与原始输出**。只写「PASS」不贴输出 = 未核验，
+按 `[TESTER-FABRICATED-REPORT-001]` 处理（验收方须逐项独立取证）。
+
+### 历史沿革（取证自 `handoffs-archive.md`，供对账用）
+
+| 时期 | 报告名号 | 实际条目 |
+| --- | --- | --- |
+| 2026-08-16~08-18（BUILD-016/017/019/020/022，v0.8.x） | 「七项核验」 | ①六 exe 时间戳 ②三 exe 两副本 sha ③**两 toml 三副本 hash** ④ProductVersion ⑤UI 前端嵌入探针（JS 文件名 / i18n 文案）⑥大小对照 ⑦冒烟 |
+| 2026-09-07（BUILD-145/151） | 「七项核验」 | 实际列到 **①~⑧ 八条**：③=**toml 三副本**、⑥=大小对照 —— **名号与实际条数不符** |
+| 2026-09-07（BUILD-154/156） | 「四项核验」 | ①时间戳 ②两副本 sha 异于上一包 ③ProductVersion ④冒烟；**显式「跳过：toml 三副本 / 判别探针 / 大小对照」** |
+| 2026-09-07（BUILD-159） | 「五项核验」 | 上四项 + ⑤`Publish==target/release` sha 完全一致（顺带修历史不一致） |
+| 2026-09-07（BUILD-165） | 「六项核验」 | ①~④ + ⑤`config.toml` 不变 + ⑥warnings |
+| 2026-09-07~09-08（BUILD-168/171/173/177/186） | 「七项核验」 | 现行七项：①时间戳 ②sha 异于上一包 ③ProductVersion ④冒烟 ⑤`config.toml` ⑥warnings ⑦判别探针 |
+| 2026-09-08（BUILD-193） | 「七项核验」 | 🔴 **tester-1 模型故障，由主控代做，未逐项枚举**（仅记录产物 / 两副本 / 版本 / `config.toml`）—— **唯一一次核验项不完整的出包** |
+
+**如实记录的三个偏差**：
+
+1. **「七项」名号长期与实际条数不符**（BUILD-145/151 实际 8 条；BUILD-098 报「七项」但正文只列 4 类内容）。本节起以**本节八项为准**，报告一律称「八项核验」。
+2. **toml 三副本 hash 在 v0.8.x 恒为第③项，2026-09-07 BUILD-159 起被丢弃**，直到 `[TOML-ALL-NUL-001]`（09-08）出事才发现没人核 —— 本次以**第八项**补回。
+3. **大小对照（v0.8.x 第⑥项）已从清单移除**：BUILD-020 已确认「大小不作唯一判据」（ui 同大小但 sha 变），判别职责现由②的 sha 异动承担。
 
 ---
 

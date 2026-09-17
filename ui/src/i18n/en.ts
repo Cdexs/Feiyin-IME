@@ -20,6 +20,8 @@ export const en = {
   voice_default_device: 'Default',
   voice_recognition_output: 'Recognition Output',
   voice_auto_punctuation: 'Auto-punctuation',
+  voice_strip_trailing_punct: 'Hide trailing punctuation',
+  voice_strip_trailing_punct_hint: 'Remove punctuation at the end of every recognized result (applies to translation mode too).',
   voice_chinese_output: 'Chinese Output',
   voice_simplified: 'Simplified',
   voice_traditional: 'Traditional',
@@ -39,7 +41,9 @@ export const en = {
   voice_asr_model_manual_download: 'You can also download the model manually and place it in this directory.',
   voice_copy: 'Copy',
   voice_copied: 'Copied',
-  voice_asr_online_api_key: 'ASR API Key',
+  voice_asr_online_api_key: 'API Key (Alibaba Cloud Bailian Key)',
+  // UI-ASRKEY-225: rendered via the native placeholder attribute, NEVER enters value/state
+  voice_asr_online_api_key_placeholder: 'Enter your API key from Alibaba Cloud Bailian...',
   voice_qwen3_test_connection: 'Test Connection',
   voice_qwen3_testing: 'Testing...',
   voice_qwen3_test_success: '✓ Connection Successful',
@@ -48,7 +52,9 @@ export const en = {
   llm_title: 'Format Output Settings',
   llm_enable: 'Enable Format Output',
   llm_enable_hint: 'Enable AI formatting to refine transcribed text',
-  llm_api_config: 'API Configuration',
+  // UI-LLMHINT-226: label now recommends the model + points at provider docs (no component change)
+  llm_api_config:
+    "API Configuration (we recommend the deepseek-flash model; see your provider's docs for the parameter format)",
   llm_api_url: 'API URL',
   llm_api_key: 'API Key',
   llm_model: 'Model',

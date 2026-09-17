@@ -20,6 +20,114 @@
 
 ## 🔴 待做
 
+### 🆕 v0.9.1 批次（Gavin 2026-09-17 下单，含版本升级授权）
+
+**VER-BUMP-217** · 版本号 0.9.0 → 0.9.1
+`Cargo.toml:3` + `src-tauri/Cargo.toml:3` + `src-tauri/tauri.conf.json:9` 三处。
+`ui/package.json` 是 0.1.0，历史就没跟版本，**不动**。Gavin 明确授权，见本条。
+
+**V091-PUNCT-TAIL-214** · 「句尾不显示标点符号」新开关（默认关）
+
+| 项 | 内容 |
+| --- | --- |
+| 影响文件 | `src/config/mod.rs`(PunctuationConfig) / `src/punctuation/mod.rs`(apply_l2_postprocess) / `src/main.rs` / `ui/src/pages/Voice.tsx` / `ui/src/i18n/{en,zh-Hans,zh-Hant}.ts` |
+| 复用 | 🔴 **不新建剥离逻辑** —— `L2Action::StripTrailing` 已存在（短文本已在剥尾标点），本需求 = 把「短文本才剥」扩成「开关开则恒剥」 |
+| 产出源 | 主 pipeline(`main.rs:9022`)／FocusLost 预览(`6734`)／macOS FocusLost(`8292`) 三源都继承 L2；🔴 **overlay 编辑态提交(`6870→6895/6920`)完全绕过 pipeline，须单独处理** |
+| 验收 | 四条产出源逐条实测 + 翻译模式 + 开关关闭时行为与现状逐字一致 |
+
+**V091-ITN-SKIP-ONLINE-215** · 线上 ASR 跳过 ITN
+
+| 项 | 内容 |
+| --- | --- |
+| 影响文件 | `src/main.rs`（🔴 **与 214 同文件，必须同一 Worker 或串行**）|
+| 两个调用点 | DEC-036 双通道：`main.rs:8704` `normalize_numbers`（主通道，回 LLM 前）／`main.rs:8934` `normalize_unit_symbols_only`（补丁通道，标点前）|
+| 主控建议 | **只跳主通道**。补丁通道服务的是 LLM 输出而非 ASR 输出，不属于「二次重复处理」，跳了会让 LLM 写回的中文单位失去转换 |
+| 门控 | `AsrModel::from_config(&cfg.audio.asr_model).is_online_streaming()`（`transcription/mod.rs:81`）|
+
+**V091-ITN-FIX-YIKE-216** · `那一刻` → `那1刻`
+
+| 项 | 内容 |
+| --- | --- |
+| 根因 | `itn-rules.toml:119` `[date_time.triggers] suffix` 含「刻」→「一刻」被当数字+时间单位 |
+| 🔴 红线 | DEC-038 禁止词表打补丁 —— **不许往 protected 表加「那一刻」**（表里已有「一刻不停/一刻千金/一刻钟」等，正是打补丁的历史遗留）。要做文法级前置护栏，先例见 `src/itn.rs:2310/2322` `is_unit_preceded` |
+| 🔴 取证先行 | 动代码前必须先测同族：`那一天/这一年/每一次/哪一天/这一刻` 是否同样中招，按 `[ITN-LOCAL-RULE-OVERREACH-001]` 配边界外护栏测试 |
+| 影响文件 | `src/itn.rs`（+ 可能 `itn-rules.toml`）—— 与 214/215 无文件重叠，可并行 |
+
+**V091-ITN-YIKE-HANT-220** · 216 闸门对繁体中文半失效（coder-1 阶段三独立发现）
+
+| 项 | 内容 |
+| --- | --- |
+| 现象 | `is_demonstrative_yi`（`itn.rs:2423-2424`）字符集合只写了简体字面量：`这`、`么`。繁体 `這`、`麼` 不命中 |
+| 🔴 可达性已证 | **不是不可达路径**：`main.rs:8666` 转录时即按 `config.audio.chinese_script` 产出繁体，ITN 在 `:8729` 拿到的就是繁体文本。设置界面「语音输入 → 中文输出 → 繁体」是用户可选项 |
+| 为什么必须本批修 | `那/每/哪/某` 繁简同形，所以繁中用户会拿到**一半修好一半没修**：`那一年` 修了、`這一年` 没修。**不一致的半修状态比统一不修更糟**，用户无法形成稳定预期 |
+| 改动 | `:2423` 加 `'這'`、`:2424` 的 `'么'` 扩为 `'么' \| '麼'` 且前两字集合加 `'這'`。约 3 处字面量 |
+| 边界 | 只补繁体同义字，**不扩语义范围**；不碰条件③的 `is_date_suffix` |
+| 护栏归属 | 🔴 交叉规则照旧：谁改生产代码谁不写断言 |
+
+### 🆕 UI-ASRKEY-225 · 在线 ASR 的 Key 输入框标签与占位提示（Gavin 2026-09-17）
+
+| 项 | 内容 |
+| --- | --- |
+| 需求 | 选「在线语音识别 - FunASR」时：① 标签 `ASR API Key` → `API Key（阿里云百炼Key）` ② 输入框内淡灰色**斜体**占位提示「输入你在阿里云百炼平台的API Key...」，输入时消失、清空后自动回来 |
+| 影响文件 | `ui/src/pages/Voice.tsx`（现有渲染条件 `:280`）+ `ui/src/i18n/{en,zh-Hans,zh-Hant}.ts` 三份；现标签 key 为 `voice_asr_online_api_key` |
+| 🔴 实现方式收窄 | Gavin 描述的是「监听 focus/blur 事件判断是否填入提示文字」。**不要这么做** —— HTML 原生 `placeholder` 属性的行为与需求逐条一致（空则显示、输入即消失、清空即回来），配 `::placeholder` 设斜体与灰度即可。手写 focus/blur 会把提示文字变成真实 value，用户不改就会被当成 Key 提交 |
+| 注意 | 🔴 三份 locale 必须同时补（`I18N-HANT-GAP-001`）；后端零改动 |
+| 排期 | **等 TEST-EXEC-224 复跑结束再派** —— 本单动 `ui/`，tester-1 正在跑 vitest/browser，中途改会让它测到移动靶 |
+
+### 🆕 UI-LLMHINT-226 · 格式化输出「API 配置」标签补建议文案（Gavin 2026-09-17）
+
+| 项 | 内容 |
+| --- | --- |
+| 需求 | 配置界面/格式化输出，`API 配置` → `API 配置（建议使用deepseek-flash模型，参数格式参考提供商文档）` |
+| 影响文件 | `ui/src/i18n/{en,zh-Hans,zh-Hant}.ts` 的 `llm_api_config` 三份（现值 `'API 配置'`）。`Llm.tsx` 已引用该 key，**组件零改动** |
+| 注意 | 🔴 三份 locale 同时改，英文版语义等价即可不必逐字直译 |
+| 归并 | 与 `UI-ASRKEY-225` 同属 `ui/i18n`，**合并给 coder-2 一次做完**，避免同文件并发 |
+
+### 🆕 ITN-FIX-LIANGDIAN-223 · `这两点一个都不能少` → `这2.1个都不能少`（Gavin 2026-09-17 端测报）
+
+| 项 | 内容 |
+| --- | --- |
+| 复现 | 「这**两点一**个都不能少」→「这**2.1**个都不能少」；「这两点**一点**都不能少」同病 |
+| 语义 | 「两点」= 两个要点（量词），「一个都不能少」是独立短语。ITN 把 `两点一` 当成了小数 2.1 |
+| 🔴 取证先行 | 主控初查**未定位**：乙型 `try_parse_implicit_decimal`（`itn.rs:1607`）第 1624 行已有护栏 —— `date_suffixes` 命中且非「度」即 `return None`，而「点」在 `date_time.triggers.suffix` 里，**理论上乙型不该接手**。所以真凶可能是甲型/丙型/`parse_cn_number` 的小数点处理，**必须实测定位，禁止照「乙型越界」这个假设动手** |
+| 同族 | `[ITN-LOCAL-RULE-OVERREACH-001]`（局部规则在更长上下文越界）。护栏必须配边界外用例 |
+| 🔴 边界外红线 | 真小数不得被误挡：`两点一五`→2.15、`三点五`、`两点一度`（度是温度单位兼 date_suffix）、`下午两点一刻` |
+| 影响文件 | `src/itn.rs`（与 221/222 同文件，**必须串行**） |
+
+### 🔴 ITN-HANT-SYSTEMIC-221 · ITN 对「繁体输出」用户大面积降级（待 Gavin 拍板，**不进 v0.9.1**）
+
+**由来**：coder-1 做 220 时上报「繁中『那一號』不受保护」，主控顺藤取证，发现问题比那大得多。
+
+| 判据 | 取证 |
+| --- | --- |
+| ITN 确实拿到繁体文本 | `transcription/mod.rs` 的 `transcribe_with_punct_info` 内部就调 `text_normalizer::normalize_text_for_language(trimmed, script)`，**ASR 出口即繁体**；ITN 主通道在 `main.rs:8729` 之后 |
+| 规则表全简体 | `itn-rules.toml` 繁体异形字出现次数 **全为 0**；对应简体字出现 200+ 次（`号`29 `点`38 `个`37 `万`19 `时`18 `岁`17 `钱`16 `块`12 `亿`3） |
+| ITN 不做繁简归一 | `src/itn.rs` 内无任何 `Traditional` / 归一化逻辑，自身源码繁体字亦为 0 |
+
+**后果**（繁体输出用户）：`年月日分秒刻` 繁简同形故仍可用；但
+日期 `五號`、金额 `五萬塊` / `三塊錢`、时间 `三點半`、年龄 `十歲`、量词 `三個` **全部不转**。
+**金额与时间恰是 ITN 的核心用例。**
+
+**三条候选路线（需 Gavin 定，勿自行开工）**：
+① 规则表补全繁体异形字（200+ 处，易漏，维护面翻倍）
+② ITN 前繁→简归一、处理完再转回（架构改动，但一处收口）
+③ 把简繁转换整体挪到 ITN 之后（改 pipeline 顺序，影响面最大）
+
+🔴 **不进 v0.9.1**：与本批四单无关，属独立系统性缺口，需单独评估 + 端测。
+220 修的 `這/麼` 仍然有效且必要 —— `年/刻` 繁简同形，`這一年`/`這一刻` 是真实可达的 bug。
+
+**WORDBOOK-AUTOLEARN-OBS-218** · 自动学习可观测性（Gavin 端测「没看到效果」的根因）
+
+| 项 | 内容 |
+| --- | --- |
+| 结论 | **链路没坏**（`main.rs:6854-6866` → `wordbook::learn_correction`），是四道闸门叠加导致看不见 |
+| 四道闸门 | ① 落库 source=`"system"`（`wordbook/mod.rs:176`），要在**系统词库**页看，不是用户词库 ② 阈值默认 2（`config/mod.rs:12`），同词改够 2 次才提升 ③ 🔴 **两条关键 info 日志在非 debug 模式被 `LevelFilter::Warn` 全过滤**（`main.rs:8357`）④ 只有在线流式路径有 `last_streaming_text`，本地模型不可达 |
+| Gavin 拍板 | 自动学的词**维持进 system 不改**（2026-09-17）|
+| 主控拍板 | 阈值**不往界面露**（DEC-031 零配置原则，`feedback_single_switch_principle`）|
+| 本单只做 | 闸门③：`wordbook/mod.rs:161` 与 `:170` 两条 `log::info!` 提到 `log::warn!` 并加 `[AUTOLEARN]` 前缀，让正常运行时可见可 grep。**禁止**把 release 全局日志级别提到 Info（Gavin 明确要求过压低实时日志 IO）|
+| 影响文件 | `src/wordbook/mod.rs` —— 与 214/215/216 零重叠 |
+| 验收 | release 模式跑一次编辑提交，日志能 grep 到 `[AUTOLEARN]`；候选未达阈值和达阈值两种情况各出一条 |
+
 ### PROMPT-OPT-204 · `f3_lists` 精简（DEC-059 管辖，最高风险）
 
 | 项 | 内容 |
@@ -49,10 +157,16 @@ README 里教用户改 `config.toml` 的段落已全部删除。但 `translation
 
 钉死「先扩窗再建 EDIT」的顺序，防以后被改回去。按分工派**非作者的空闲 coder**（不是 coder-1）。
 
-### 出包核验加第八项 · 随包数据文件内容级校验
+### BUILD-VERIFY-219 · 出包核验清单成文 + 加第八项（🔄 已派 tester-1，2026-09-17）
 
 现在只核 exe。`[TOML-ALL-NUL-001]` 证明数据文件会整文件变 NUL 且**只比大小检不出来**，
 必须与根目录副本做 hash 比对。落点：`build-test-guide.md` 出包核验清单。
+
+🔴 **派发时新发现**：`build-test-guide.md` 全文 657 行里**根本没有出包核验清单这一节** ——
+历次「七项核验全 PASS」只活在 `handoffs` 条目里，是口头实践，无成文判据。
+故本单范围扩为两步：**A. 从 `handoffs-archive.md` 取证还原七项并落成正式清单**（不许凭印象写）；
+**B. 新增第八项**。第八项 ≠ 重复 `build-test-guide.md:72` 的「toml 三副本同步」——
+那是**构建步骤**（我做了这个动作），第八项是**出包核验判据**（我验证了结果对），两者不能互顶。
 
 ### ESC-178 · H1 机制定案
 

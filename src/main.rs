@@ -6867,7 +6867,20 @@ fn process_controller_events(
                 // OVERLAY-054-A: 编辑提交时，先把 overlay 的 NOACTIVATE 恢复、销毁 EDIT 控件并隐藏
                 // 窗口，再把焦点还给原目标窗口，确认焦点真正到达后再注入文本。
                 overlay_handle.send(OverlayCommand::RestoreAndHide);
-                let text_to_inject = text.clone();
+                // V091-PUNCT-TAIL-214 产出源 #4/#5：编辑态提交拿的是 text（用户在悬浮窗里编辑后的
+                // 文本），完全绕过 run_pipeline_core 的 L2 标点后处理。#4 注入（下方 inject_text）
+                // 与 #5 剪贴板兜底（下方 copy_text_to_clipboard）都消费 text_to_inject，故在此处
+                // 按开关做一次末尾剥标点即一并覆盖（Gavin 2026-09-17 拍板）。
+                // 🔴 只读新开关 punctuation.strip_trailing；punctuation.enabled=false 的「全剥」
+                //    现状本就不覆盖 #4/#5，本次不改变该行为（新开关关闭时逐字一致）。
+                let text_to_inject = if clone_runtime_config(&runtime_config)
+                    .punctuation
+                    .strip_trailing
+                {
+                    punctuation::strip_trailing_punctuation(&text)
+                } else {
+                    text.clone()
+                };
                 let overlay_tx_for_focus = overlay_handle.tx.clone();
                 let runtime_config_for_focus = Arc::clone(runtime_config);
                 let ui_language_for_focus = ui_language;
@@ -8603,6 +8616,12 @@ fn run_pipeline_core(
             // map_err 处（anyhow::Error 还带类型的最后时机）下探 NoSpeechError；
             // 一旦 to_string() 就永远无法与普通错误区分（本 bug 成因链一环）。
             // 新增第三个「没说话」产出源只需 bail!(NoSpeechError)，此处零改动。
+            // V091-ITN-SKIP-ONLINE-215: 记录文本是否产自在线流式 ASR。
+            // 在线 ASR 服务端已完成数字/单位规整，主通道再跑一遍属二次处理。
+            // 🔴 用 initial_text.is_some() 而非 config.audio.asr_model 判据：后者与
+            // transcriber 热重载存在瞬态不同步（config 已切在线但引擎仍为本地），
+            // 按 config 判会把本地 ASR 输出也误跳过 ITN。
+            let from_online_streaming = initial_text.is_some();
             let transcription_result: Result<(String, bool), TranscriptionFailure> = if let Some(
                 text,
             ) =
@@ -8701,7 +8720,20 @@ fn run_pipeline_core(
                     // 补丁通道（normalize_unit_symbols_only）仍在 LLM 后兜底（见 :3124），
                     // 捞回 LLM 纠正 ASR 同音错字后的「40摄氏度」→「40℃」。
                     // 放在 is_effective_text 之后：ITN 不增删语义字符，filler 判定不变。
-                    let pre_llm_text = itn::normalize_numbers(&raw_text);
+                    //
+                    // V091-ITN-SKIP-ONLINE-215：在线流式 ASR 已由服务端做过数字/单位规整，
+                    // 主通道跳过，避免二次处理（Gavin 2026-09-17）。判据用 from_online_streaming
+                    // （数据路径事实），不用 config.audio.asr_model（与引擎热重载有竞态）。
+                    // 🔴 只跳主通道；补丁通道 normalize_unit_symbols_only 仍在 LLM 后保留
+                    //    （DEC-036 双通道：补丁通道处理的是 LLM 输出方向，不属二次处理）。
+                    let pre_llm_text = if from_online_streaming {
+                        log::info!(
+                            "V091-ITN-SKIP-ONLINE-215: online ASR output, skipping main-channel ITN"
+                        );
+                        raw_text.clone()
+                    } else {
+                        itn::normalize_numbers(&raw_text)
+                    };
                     // SCENE-SENSE-001-CORE (DEC-031-⑤): 录音完成阶段采集前台窗口场景信号，
                     // 供 LLM prompt F4 段注入 + multiline_safe 格式安全裁决。
                     // target_hwnd 即录音启动时捕获的前台窗口，此处复用同一 HWND 采集。
@@ -8976,8 +9008,11 @@ fn run_pipeline_core(
                     // PUNCT-GOVERNANCE-030-E：判定逻辑已抽为纯函数 apply_l2_postprocess
                     //   （src/punctuation/mod.rs，可单测）；本侧只保留日志（日志方案 C：
                     //   按 L2Action 分支打对应文案，且沿用「输出变化才打」的 != 判定）。
-                    let (l2_text, l2_action) =
-                        punctuation::apply_l2_postprocess(&final_text, config.punctuation.enabled);
+                    let (l2_text, l2_action) = punctuation::apply_l2_postprocess(
+                        &final_text,
+                        config.punctuation.enabled,
+                        config.punctuation.strip_trailing,
+                    );
                     match l2_action {
                         punctuation::L2Action::StripAll => {
                             if l2_text != final_text {

@@ -360,16 +360,27 @@ impl Default for UiLanguage {
 pub struct PunctuationConfig {
     #[serde(default = "default_punctuation_enabled")]
     pub enabled: bool,
+    /// V091-PUNCT-TAIL-214: 句尾不显示标点符号开关。
+    ///
+    /// true 时无视文本长度恒剥末尾标点（复用 `strip_trailing_punctuation`）；
+    /// false 时行为与改动前逐字一致（仅短文本剥尾）。默认关。
+    #[serde(default = "default_strip_trailing")]
+    pub strip_trailing: bool,
 }
 
 fn default_punctuation_enabled() -> bool {
     true
 }
 
+fn default_strip_trailing() -> bool {
+    false
+}
+
 impl Default for PunctuationConfig {
     fn default() -> Self {
         Self {
             enabled: default_punctuation_enabled(),
+            strip_trailing: default_strip_trailing(),
         }
     }
 }

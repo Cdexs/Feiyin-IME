@@ -793,3 +793,565 @@ mod tests {
         assert!(is_effective_text("你好"));
     }
 }
+
+/// V091-ITN-HANT-SYSTEMIC-221 · **根本护栏**：影子串前提 —— 繁→简逐字归一与原串一一对应。
+///
+/// 221 路线②′（`itn.rs::normalize_with_rules` 逐字构造影子串、判定查影子串）成立的全部前提是
+/// 「影子串与原串字符 1:1」。若该前提被打破（zhconv 升级 / 换变体 / 表变更），
+/// 影子串下标与原串下标将错位 → ITN 会静默切错字符甚至越界。
+///
+/// 本模块由 221A 取证单转为常驻护栏（主控 2026-09-17 裁定，**不得删除**）：
+/// - `shadow_len_zhhans` / `shadow_per_char_1to1_zhhans`：样本级长度与逐字对齐；
+/// - `shadow_global_single_char_1to1_scan`：**全域 28,096 字**单字必得单字（决定性证据）；
+/// - `shadow_phrase_corpus_len_preserved`：词组级长度守恒（zhconv ZhHans 含 OpenCC 词组规则的残余面）；
+/// - `shadow_contrast_region_variants`：反面对照，证「必须用 ZhHans 而非地区变体 ZhCN/ZhTW」。
+///
+/// 🔴 变体纪律：本护栏断言的是 `Variant::ZhHans`（脚本变体，无地区词汇替换）。
+/// 若有人把 221 实现改用 `ZhCN`/`ZhTW`，对照用例会立刻暴露地区词替换差异。
+#[cfg(test)]
+mod itn_hant_shadow_1to1_guard {
+    use zhconv::{zhconv, Variant};
+
+    /// 取样：前 10 条为 ITN 核心用例（金额/时间/单位），后 10 条为高危词
+    /// （多对一字 髮/麵/隻 等 + 台湾地区词 電腦/網路/軟體，专门逼出长度变化）。
+    const SAMPLES: &[&str] = &[
+        "那一刻",
+        "這一刻",
+        "這麼一點",
+        "三月五號",
+        "五萬塊",
+        "三塊錢",
+        "三點半",
+        "十歲",
+        "三個",
+        "兩萬五",
+        "頭髮",
+        "麵條",
+        "一隻貓",
+        "乾淨",
+        "後面",
+        "計算機",
+        "網路",
+        "軟體",
+        "硬碟",
+        "資訊",
+    ];
+
+    fn counts(s: &str, v: Variant) -> (String, usize, usize) {
+        let shadow = zhconv(s, v);
+        (shadow.clone(), s.chars().count(), shadow.chars().count())
+    }
+
+    /// Q2 主测：ZhHans（字形变体）逐条长度对照。不等长即失败并列出全部反例。
+    #[test]
+    fn shadow_len_zhhans() {
+        let mut table = String::new();
+        let mut bad: Vec<String> = Vec::new();
+        for s in SAMPLES {
+            let (shadow, a, b) = counts(s, Variant::ZhHans);
+            table.push_str(&format!("  {s} -> {shadow}   (原 {a} / 影 {b})\n"));
+            if a != b {
+                bad.push(format!("{s} -> {shadow} (原 {a} / 影 {b})"));
+            }
+        }
+        println!("[HANT-SHADOW] ZhHans 长度对照：\n{table}");
+        assert!(
+            bad.is_empty(),
+            "[HANT-SHADOW] ZhHans 出现长度不等（影子串前提被打破）：\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// Q2 强测：证明「逐字 1:1」—— 单字归一必得单字，且整串归一 == 逐字拼接。
+    /// 比长度相等更强：长度相等仍可能是 2→1 + 1→2 的对冲。
+    #[test]
+    fn shadow_per_char_1to1_zhhans() {
+        let mut bad: Vec<String> = Vec::new();
+        for s in SAMPLES {
+            let whole = zhconv(s, Variant::ZhHans);
+            let mut concat = String::new();
+            for c in s.chars() {
+                let one = zhconv(&c.to_string(), Variant::ZhHans);
+                if one.chars().count() != 1 {
+                    bad.push(format!("单字 {c} -> {one}（{} 字）", one.chars().count()));
+                }
+                concat.push_str(&one);
+            }
+            if whole != concat {
+                bad.push(format!("整串≠逐字拼接：{s} 整串 {whole} / 逐字 {concat}"));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "[HANT-SHADOW] 1:1 前提被打破：\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// Q2 全局强证：扫描 contains_han 覆盖的全部 CJK 区段（基本区 + 扩展 A + 兼容区），
+    /// 逐字验证 ZhHans 归一【恰好 1 字】（既不删也不增）。单字若已 1:1，则整串必然逐字对齐
+    /// （zhconv 的整串规则不会跨字改变对齐——由 per_char 测同证）。
+    #[test]
+    fn shadow_global_single_char_1to1_scan() {
+        let ranges: &[(u32, u32, &str)] = &[
+            (0x4E00, 0x9FFF, "CJK 基本区"),
+            (0x3400, 0x4DBF, "扩展 A"),
+            (0xF900, 0xFAFF, "兼容区"),
+        ];
+        let mut total = 0usize;
+        let mut non_1to1: Vec<(char, String)> = Vec::new();
+        for &(lo, hi, name) in ranges {
+            let mut n = 0usize;
+            for cp in lo..=hi {
+                let Some(c) = char::from_u32(cp) else {
+                    continue;
+                };
+                let one = zhconv(&c.to_string(), Variant::ZhHans);
+                n += 1;
+                total += 1;
+                if one.chars().count() != 1 {
+                    non_1to1.push((c, one));
+                }
+            }
+            println!("[HANT-SHADOW] {name} U+{lo:04X}..U+{hi:04X}: {n} 字");
+        }
+        println!(
+            "[HANT-SHADOW] 全扫描 {total} 字，非 1:1 的 {} 个",
+            non_1to1.len()
+        );
+        for (c, s) in non_1to1.iter().take(80) {
+            println!("   U+{:04X} {c} -> {s}", *c as u32);
+        }
+        assert!(
+            non_1to1.is_empty(),
+            "[HANT-SHADOW] 存在单字非 1:1 映射 {} 个（首 80 见 stdout）",
+            non_1to1.len()
+        );
+    }
+
+    /// Q2 词组级补充：zhconv 的 ZhHans 表**确实含词组规则**（crate 文档例 `鼠麴草→鼠曲草`）。
+    /// 词组规则理论上可能改变长度 → 对一组多字繁体词/成语实测长度守恒。
+    /// 若本条与全局单字扫描同时通过，则「逐字 1:1」前提在字符级与常见词组级均未被打破。
+    #[test]
+    fn shadow_phrase_corpus_len_preserved() {
+        const PHRASES: &[&str] = &[
+            "鼠麴草",
+            "頭髮",
+            "麵條",
+            "一隻貓",
+            "乾淨",
+            "後面",
+            "計算機",
+            "網路",
+            "軟體",
+            "硬碟",
+            "資訊",
+            "藝術",
+            "體育",
+            "環境",
+            "經驗",
+            "關係",
+            "發展",
+            "標準",
+            "實際",
+            "聲明",
+            "徹底",
+            "慶祝",
+            "擁護",
+            "選擇",
+            "戰爭",
+            "擁擠",
+            "雖然",
+            "藥物",
+            "類型",
+            "體會",
+            "確實",
+            "觀眾",
+            "解釋",
+            "應該",
+            "實驗",
+            "雙方",
+            "維護",
+            "建設",
+            "語言",
+            "討論",
+            "辯論",
+            "嚴肅",
+            "傳統",
+            "遺產",
+            "欣賞",
+            "創造",
+            "價值",
+            "願望",
+            "歡迎",
+            "隱藏",
+            "鐘錶",
+            "螞蟻",
+            "蝴蝶",
+            "鸚鵡",
+            "鴕鳥",
+            "鳳凰",
+            "龍蝦",
+            "鱷魚",
+            "憂鬱",
+            "朦朧",
+        ];
+        let mut bad: Vec<String> = Vec::new();
+        for s in PHRASES {
+            let shadow = zhconv(s, Variant::ZhHans);
+            let (a, b) = (s.chars().count(), shadow.chars().count());
+            if a != b {
+                bad.push(format!("{s} -> {shadow} (原 {a} / 影 {b})"));
+            }
+        }
+        println!(
+            "[HANT-SHADOW] 词组语料 {} 条，长度不等 {} 条",
+            PHRASES.len(),
+            bad.len()
+        );
+        assert!(
+            bad.is_empty(),
+            "[HANT-SHADOW] 词组级出现长度不等：\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// 对照：项目现状用的地区变体（ZhCN / ZhTW）做地区词汇替换 → 长度可变。
+    /// 只打印不断言（用于证 Q1「必须用 ZhHans 而非 ZhCN/ZhTW」）。
+    #[test]
+    fn shadow_contrast_region_variants() {
+        let mut table = String::new();
+        for s in SAMPLES {
+            let (tw, _, twb) = counts(s, Variant::ZhTW);
+            let (cn, _, cnb) = counts(s, Variant::ZhCN);
+            let (hans, _, hb) = counts(s, Variant::ZhHans);
+            table.push_str(&format!(
+                "  {s}  ZhTW->{tw}({twb})  ZhCN->{cn}({cnb})  ZhHans->{hans}({hb})\n"
+            ));
+        }
+        println!("[HANT-SHADOW] 地区变体对照：\n{table}");
+    }
+
+    // ============================================================================
+    // GUARD-221-IDENTITY · 影子串前提的**另一半**：identity（不只是 1:1）
+    // ----------------------------------------------------------------------------
+    // 上面 4 条只证了「长度 1:1」。221 的「简体路径逐字零回归」还依赖更强的一条：
+    //   简体输入时 `shadow == orig`，即 `zhconv(简体字, ZhHans) 恒等返回该字`。
+    // 若某个简体字经 ZhHans 变成**另一个字**，影子串虽仍 1:1（长度一样、逐字对齐），
+    // 却已与原串**不同字** ⇒ 判定层拿错误的字去查规则表 ⇒ 简体路径（绝大多数用户）
+    // **静默**走错分支。这个洞比 221 要修的繁体问题严重得多，故单列三层护栏。
+    //
+    // ① `shadow_identity_itn_rule_chars_zhhans`：ITN 规则表实际用到的字
+    //    （硬编码最小集 + 从 `itn-rules.toml` 抽取的全表汉字）
+    // ② `shadow_identity_global_simplified_scan`：全域扫描（与 221A 同三区段）
+    //    🔴 先判定「该字是简体」再要求 identity —— 不得对繁体字要求 identity
+    // ③ `shadow_identity_negative_control_traditional_diverges`：🔴 反面对照
+    //
+    // 🔴 实测结果（2026-09-17，zhconv 0.4.1 OpenCC 数据扫描）：全域 28,096 字中「简体形」
+    //    2,742 个，其中**非 identity 恰好 6 个**，全部是双向变体字（ST 与 TS 两张表对同一个字
+    //    给出不同目标）⇒ 见 `R1_AMBIGUOUS_VARIANTS` 的逐条表与豁免理由。
+    //    这 6 个都不用于标准简体书写，故 R1 的实际暴露面被收敛到「已知 6 个罕见字」，而不是
+    //    「任意字都可能」。
+    //
+    // ✅ **本组在什么情况下会变红**（即判别力所在）：
+    //    a) 出现第 7 个「简体形却被 ZhHans 改写」的字（OpenCC 升级 / 换表）→ ② novel 非空；
+    //    b) 豁免表与实测集合不再精确相等（6 个里任何一个不再违反）→ ② 集合比对失败；
+    //    c) 若 identity 判据被改成恒真（例如把 `!=` 写成 `==`、或 ZhHans 误换成对简体恒等的
+    //       变体）→ ③ 的 `assert_ne!` 首条即红（繁体 這 竟然恒等）；
+    //    d) ①-a 最小集里任何一个 ITN 用字变成了非 identity → ① 红（含 48 字计数下限防空跑）；
+    //    e) 扫描域被改窄（total < 25,000）或 is_simplified_only 失效致 required < 300 → ② 红。
+    // ============================================================================
+
+    /// 该字经 ZhHant 归一后**恒等**（本身是繁体形 / 无字形差异）。
+    /// FIX-222 B 新谓词用它判定「影子串偏离原串是否属正当理由（繁体输入本就是 221 的目标）」。
+    fn hant_identity(c: char) -> bool {
+        zhconv(&c.to_string(), Variant::ZhHant) == c.to_string()
+    }
+
+    /// identity 判据：字形经 ZhHans 归一后必须**原样返回该字**。
+    fn hans_identity(c: char) -> bool {
+        zhconv(&c.to_string(), Variant::ZhHans) == c.to_string()
+    }
+
+    /// ①-a 硬编码最小集（任务书给定）：ITN 规则表实际用到的简体字 ——
+    /// 数字 / 进位 / 时间后缀 / 货币·度量衡单位 / 指示代词 + 「么」。
+    /// 硬编码的理由：**不依赖文件内容**，toml 怎么增删这批字都必测。
+    const ITN_RULE_CHARS: &str =
+        "零一二三四五六七八九十百千万亿两半年月日号点分秒刻个块钱毛元角斤吨米克岁这那每哪某么";
+
+    /// 🔴 R1 实测豁免表（**数据级证据，不是「先放着」**）。
+    ///
+    /// **判据（FIX-222 B 定稿，谓词无关式）**：对全域每个字 c 只判一件事 ——
+    /// **若 `ZhHans(c) != c`（影子串会偏离原串），则必须 `ZhHant(c) == c`**
+    /// （即 c 本身是繁体形：繁体输入归一正是 221 的目标，偏离属正当理由）。
+    /// 两者**都变** = 双向变体字（影子偏离却又不属「繁体输入」这一正当理由）→
+    /// 必须与本豁免表**精确相等**。
+    /// 🔴 **不存在被跳过的字**：identity 成立的字也走 `ZhHans(c) == c` 这一支被显式判过。
+    /// 旧版用 `is_simplified_only` 当闸门，会把「运行时判为非简体形」的字整批跳过
+    /// （例：`万`，原因见下）—— 主控 2026-09-17 指出这是未验证假设，故弃用闸门。
+    ///
+    /// 实测豁免集合（**5 个**；tester-1 阶段四实跑输出
+    /// 「全扫描 28096 字，其中简体形 2670 个，非 identity 5 个（已知双向变体 5，新增 0）」）：
+    ///
+    /// | 字 | 简→繁（ZhHant 会变） | 繁→简（ZhHans 会变） |
+    /// | --- | --- | --- |
+    /// | 緼 | 縕 | 缊 |
+    /// | 苧 | 薴 | 苎 |
+    /// | 藴 | 蘊 | 蕴 |
+    /// | 輼 | 轀 | 辒 |
+    /// | 醖 | 醞 | 酝 |
+    ///
+    /// 🔴 **`麽` 不在此表** —— 首版我按「取 OpenCC 首值」的模拟误收，阶段四实测证伪：
+    /// `TSCharacters.txt` 的 `麽 -> 么 麽` 是**多值且含自身** → zhconv 构建期整条丢弃
+    /// （`build.rs:571-575`，源码注释原文 *be conservative when converting*）
+    /// ⇒ 运行时 `ZhHans(麽) == 麽`（恒等）⇒ 它根本不是双向变体。
+    /// **同一条规则**也让 `STCharacters.txt` 的 `万 -> 萬 万` 被丢弃 ⇒ 运行时 `ZhHant(万) == 万`
+    /// ⇒ `万` 不是「简体形」（这正是旧闸门会跳过它的原因）；但 `ZhHans(万) == 万` ⇒ identity 成立、
+    /// 影子不偏离 ⇒ 新谓词下它走「identity 成立」支被**显式判过**。
+    /// （首版模拟值「全域 2,742 简体形 / 非 identity 6」**全错**，实测 2,670 / 5。
+    ///  教训：不要用依赖包的原始数据文件模拟其运行时行为 —— 构建期还会改写数据。）
+    ///
+    /// **为什么可豁免而不是必须修**（两条依据缺一不可，主控 2026-09-17 拍板）：
+    ///
+    /// ① **不用于标准简体书写**：这 5 个都是异体/变体字（通用形 缊/苎/蕴/辒/酝），
+    ///    简体路径的实际暴露面止于这 5 个罕见字。
+    ///
+    /// ② 🔴 **决定性依据：ITN 规则表零命中** —— 由 ①-b 机器断言（抽取 `itn-rules.toml` 全部汉字，
+    ///    双向变体必须为 0；**具体计数以 println 输出为准，不写死模拟值**）；
+    ///    且这 5 个字的 ZhHans 影子字（缊/苎/蕴/辒/酝）在规则表里的命中数全是 0。
+    ///    ⇒ 这 5 个字即使出现在口述里，影子串也只影响「一次不会命中任何规则的匹配判定」，
+    ///    而 ITN 输出恒取**原串** ⇒ **用户看到的字分毫不变**。R1 到此实质解除。
+    ///
+    /// 🔴 **本表是漂移检测**：出现**第 6 个**双向变体（OpenCC 升级 / 换表）→ 断言立刻红；
+    /// 这 5 个里任一不再违反（表被修）→ 集合比对不相等 → 同样红。两头都不放过。
+    ///
+    /// **本组变红条件（a~e，缺一即视为有人动了前提，须回报主控）**：
+    /// - a) 出现第 6 个双向变体 → `shadow_identity_global_simplified_scan` 的 novel 非空；
+    /// - b) 豁免表与实测集合不再精确相等 → 同上的集合比对失败；
+    /// - c) 判据被改成恒真（`!=` 写成 `==`、或换变体使繁体恒等）
+    ///      → `shadow_identity_negative_control_traditional_diverges` 的 `assert_ne!` 首条即红；
+    /// - d) ①-a 最小集里任一 ITN 用字变成非 identity，或其计数 < 40（防空跑）→ `..._itn_rule_chars_zhhans` 红；
+    /// - e) 扫描域被改窄（`total < 25_000`）或扫描未真跑（`hans_changed` / `hant_changed` 计数过低）→ ② 红。
+    const R1_AMBIGUOUS_VARIANTS: &[char] = &['緼', '苧', '藴', '輼', '醖'];
+
+    /// ① ITN 规则表用字 identity 断言（最小集 + 全表抽取）。
+    #[test]
+    fn shadow_identity_itn_rule_chars_zhhans() {
+        // ①-a 硬编码最小集：全部为简体形，**无条件**要求 identity
+        let mut bad: Vec<String> = Vec::new();
+        for c in ITN_RULE_CHARS.chars() {
+            if !hans_identity(c) {
+                bad.push(format!(
+                    "U+{:04X} {c} -> {}",
+                    c as u32,
+                    zhconv(&c.to_string(), Variant::ZhHans)
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "[HANT-SHADOW-IDENTITY] ITN 规则表最小集出现非 identity（{} 个）：\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+        // 反空断言：最小集必须真被逐字测过
+        assert!(
+            ITN_RULE_CHARS.chars().count() >= 40,
+            "[HANT-SHADOW-IDENTITY] 最小集字符数 {} 异常偏少，断言可能已失效",
+            ITN_RULE_CHARS.chars().count()
+        );
+
+        // ①-b 从 itn-rules.toml 全表抽取汉字（条目 + 注释一并抽，宁多勿漏），去重后逐字判 **两个方向**。
+        //      🔴 FIX-222 B：**无闸门** —— 每个字都被判（identity 成立的字走 `ZhHans(c)==c` 支），
+        //      不允许再出现「运行时判为非简体形就跳过」的假设。
+        //      将来 toml 收进繁体字（如 221 把 號/點 写进表）也安全：它们 ZhHant 恒等 → 走「允许」支。
+        const ITN_RULES: &str = include_str!("../itn-rules.toml");
+        let mut chars: std::collections::BTreeSet<char> = std::collections::BTreeSet::new();
+        for c in ITN_RULES.chars() {
+            if super::contains_han(&c.to_string()) {
+                chars.insert(c);
+            }
+        }
+        let mut bad_rules: Vec<String> = Vec::new();
+        let mut hans_changed = 0usize;
+        let mut hant_changed = 0usize;
+        for &c in &chars {
+            if !hans_identity(c) {
+                hans_changed += 1;
+            }
+            if !hant_identity(c) {
+                hant_changed += 1;
+            }
+            // 双向变体（影子偏离且不属「繁体输入」）才算问题；豁免表外一个都不许有
+            if !hans_identity(c) && !hant_identity(c) && !R1_AMBIGUOUS_VARIANTS.contains(&c) {
+                bad_rules.push(format!(
+                    "U+{:04X} {c} -> ZhHans {} / ZhHant {}",
+                    c as u32,
+                    zhconv(&c.to_string(), Variant::ZhHans),
+                    zhconv(&c.to_string(), Variant::ZhHant)
+                ));
+            }
+        }
+        println!(
+            "[HANT-SHADOW-IDENTITY] itn-rules.toml 抽取汉字 {} 个（逐字判，无跳过）：\
+             ZhHans 会改写 {} 个 / ZhHant 会改写 {} 个 / 双向变体 {} 个",
+            chars.len(),
+            hans_changed,
+            hant_changed,
+            bad_rules.len()
+        );
+        assert!(
+            bad_rules.is_empty(),
+            "[HANT-SHADOW-IDENTITY] itn-rules.toml 用字里出现双向变体（{} 个，豁免表外）：\n{}",
+            bad_rules.len(),
+            bad_rules
+                .iter()
+                .take(40)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        // 反空断言：抽取必须真的干活（否则本条恒绿无判别力）
+        assert!(
+            chars.len() >= 300,
+            "[HANT-SHADOW-IDENTITY] itn-rules.toml 只抽到 {} 个汉字（预期数百），抽取逻辑可能失效",
+            chars.len()
+        );
+    }
+
+    /// ② 全域扫描（与 221A 的 `shadow_global_single_char_1to1_scan` 同三区段）——
+    /// **谓词无关式，逐字全判、无跳过**：名字沿用（阶段四日志/任务书均按此名索引），
+    /// 但语义已从「只看简体形」改为「ZhHans(c)≠c 必须由 ZhHant(c)==c 正当化」。
+    #[test]
+    fn shadow_identity_global_simplified_scan() {
+        let ranges: &[(u32, u32, &str)] = &[
+            (0x4E00, 0x9FFF, "CJK 基本区"),
+            (0x3400, 0x4DBF, "扩展 A"),
+            (0xF900, 0xFAFF, "兼容区"),
+        ];
+        let mut total = 0usize;
+        let mut hans_changed = 0usize;
+        let mut hant_changed = 0usize;
+        let mut variants: Vec<(char, String, String)> = Vec::new();
+        for &(lo, hi, name) in ranges {
+            let mut n = 0usize;
+            for cp in lo..=hi {
+                let Some(c) = char::from_u32(cp) else {
+                    continue;
+                };
+                total += 1;
+                let hans = zhconv(&c.to_string(), Variant::ZhHans);
+                let hant = zhconv(&c.to_string(), Variant::ZhHant);
+                if hans != c.to_string() {
+                    hans_changed += 1;
+                }
+                if hant != c.to_string() {
+                    hant_changed += 1;
+                }
+                // 🔴 判据：影子偏离（ZhHans 改写）必须由「该字本身是繁体形」（ZhHant 恒等）正当化；
+                //          两者都变 ⇒ 双向变体 ⇒ 记入 variants（豁免表外一个都不许有）。
+                if hans != c.to_string() && hant != c.to_string() {
+                    n += 1;
+                    variants.push((c, hans, hant));
+                }
+            }
+            println!("[HANT-SHADOW-IDENTITY] {name} U+{lo:04X}..U+{hi:04X}: 双向变体 {n} 个");
+        }
+        let mut known_chars: Vec<char> = Vec::new();
+        let mut novel: Vec<String> = Vec::new();
+        for (c, hans, hant) in &variants {
+            if R1_AMBIGUOUS_VARIANTS.contains(c) {
+                known_chars.push(*c);
+            } else {
+                novel.push(format!(
+                    "U+{:04X} {c} -> ZhHans {hans} / ZhHant {hant}",
+                    *c as u32
+                ));
+            }
+        }
+        println!(
+            "[HANT-SHADOW-IDENTITY] 全扫描 {total} 字（逐字判、无跳过）：ZhHans 会改写 {hans_changed} 个 / \
+             ZhHant 会改写 {hant_changed} 个 / 双向变体 {} 个（已知 {}，新增 {}）",
+            variants.len(),
+            known_chars.len(),
+            novel.len()
+        );
+        for (c, hans, hant) in variants.iter().take(80) {
+            println!(
+                "   双向变体：U+{:04X} {c} -> ZhHans {hans} / ZhHant {hant}",
+                *c as u32
+            );
+        }
+        // 豁免表本身必须与实测**精确相等**：多了（表变）或少了（新违反）都红
+        let mut known_sorted = known_chars.clone();
+        known_sorted.sort_unstable();
+        let mut expect_sorted = R1_AMBIGUOUS_VARIANTS.to_vec();
+        expect_sorted.sort_unstable();
+        assert_eq!(
+            known_sorted, expect_sorted,
+            "[HANT-SHADOW-IDENTITY] 双向变体的实测集合与豁免表不符 —— \
+             OpenCC 表已变，请重新核对 R1_AMBIGUOUS_VARIANTS（并回报主控）"
+        );
+        assert!(
+            novel.is_empty(),
+            "[HANT-SHADOW-IDENTITY] 出现**新增**双向变体 {} 个（豁免表外）：\n{}",
+            novel.len(),
+            novel
+                .iter()
+                .take(40)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        // 反空断言：扫描域必须真扫过，且两个方向都确实有大批字被改写（否则本条恒绿无判别力）
+        assert!(
+            total >= 25_000,
+            "[HANT-SHADOW-IDENTITY] 扫描域只覆盖 {} 字（预期 ≥28,096 量级），域定义可能被改窄",
+            total
+        );
+        assert!(
+            hans_changed >= 500 && hant_changed >= 500,
+            "[HANT-SHADOW-IDENTITY] 改写计数异常偏低（ZhHans {hans_changed} / ZhHant {hant_changed}，预期各上千）\
+             —— zhconv 行为或扫描域可能已变，本条已失去判别力"
+        );
+    }
+
+    /// ③ 🔴 反面对照：**证明前两层的判据不是恒真的空断言**。
+    ///
+    /// ①② 的判据是 `ZhHans(c) == c`（或它的正当化形式）；若对任何输入都为真，前两层毫无判别力。
+    /// 本条用**已知会变**的繁体字把「ZhHans 会改写」这一支证伪，并验证「正当化」支（ZhHant 恒等）
+    /// 确实存在且可判 —— 两支都被覆盖，判据才不是恒真式。
+    #[test]
+    fn shadow_identity_negative_control_traditional_diverges() {
+        // ③-a 判据可证伪：繁体字经 ZhHans 必定换字（这就是 identity 判据的「反例」）
+        for t in ["這", "麼", "點", "號", "萬"] {
+            assert_ne!(
+                zhconv(t, Variant::ZhHans),
+                t,
+                "[HANT-SHADOW-IDENTITY] 反例失效：繁体 {t} 经 ZhHans 竟然恒等 \
+                 ⇒ ①② 的判据恒真、无判别力"
+            );
+            // ③-b 正当化支必须成立：这些繁体字 ZhHant 恒等 ⇒ 它们走「允许」支，
+            //      而不是靠「被跳过」逃过检查（FIX-222 B 弃用闸门后不再有跳过）
+            assert!(
+                hant_identity(t.chars().next().unwrap()),
+                "[HANT-SHADOW-IDENTITY] 繁体 {t} 应满足 ZhHant 恒等（正当化支），否则会被误判为双向变体"
+            );
+        }
+        // ③-c 高置信度反例的字形结果（任务书示例）：這→这，证明变的是「字」不是「长度」
+        assert_eq!(zhconv("這", Variant::ZhHans), "这");
+        // ③-d 简体对照：这些字的 identity 必须成立
+        //      🔴 注意：**不再断言它们「被判为简体形」** —— zhconv 构建期会丢弃
+        //      「多值且含自身」的条目（`build.rs:571-575`）：`STCharacters.txt` 的
+        //      `万 -> 萬 万` 被丢 ⇒ 运行时 `ZhHant(万) == 万` ⇒ 万 不是「简体形」。
+        //      但 `ZhHans(万) == 万` ⇒ identity 成立 ⇒ 新谓词下走「identity 成立」支被显式判过。
+        //      （首版在此断言 `is_simplified_only(万)`，阶段四实跑红 —— 该断言本身是错的。）
+        for s in ["这", "么", "点", "号", "万"] {
+            let c = s.chars().next().unwrap();
+            assert!(
+                hans_identity(c),
+                "[HANT-SHADOW-IDENTITY] 简体 {s} 经 ZhHans 必须恒等"
+            );
+        }
+    }
+}

@@ -147,7 +147,7 @@ pub fn strip_trailing_punctuation(text: &str) -> String {
 pub enum L2Action {
     /// (a) 开关关闭 → 全文剥标点
     StripAll,
-    /// (b) 开关开启且字/词数 <= 5 → 剥末尾标点
+    /// (b) 开关开启且（恒剥尾开关开启 或 字/词数 <= 5）→ 剥末尾标点
     StripTrailing,
     /// (c) 其余 → 原样返回
     NoOp,
@@ -158,16 +158,24 @@ pub enum L2Action {
 /// 判定矩阵（tester-1 规格，行为较 main.rs 内联版零变更）：
 /// (a) `punctuation_enabled=false` → `transcription::strip_punctuation`（标点换空格、
 ///     连续空格合一、trim），action = `StripAll`
-/// (b) `true` 且 `count_units <= SHORT_TEXT_UNIT_THRESHOLD` → `strip_trailing_punctuation`
-///     （直接删除不留空格），action = `StripTrailing`
-/// (c) 其余 → 原样返回，action = `NoOp`（**最大回归风险点**：>5 单位的长句必须逐字符不动）
+/// (b) `true` 且（`strip_trailing_always` 或 `count_units <= SHORT_TEXT_UNIT_THRESHOLD`）
+///     → `strip_trailing_punctuation`（直接删除不留空格），action = `StripTrailing`
+/// (c) 其余 → 原样返回，action = `NoOp`（**最大回归风险点**：>5 单位且未开恒剥尾的长句
+///     必须逐字符不动）
 ///
 /// note：返回值与 action 是否「实际改动」无关——`StripAll`/`StripTrailing` 分支若文本
 /// 本就无标点会返回原串（日志侧按 `!=` 判定是否打，沿用现码行为）。
-pub fn apply_l2_postprocess(text: &str, punctuation_enabled: bool) -> (String, L2Action) {
+///
+/// V091-PUNCT-TAIL-214：`strip_trailing_always` 由配置项 `punctuation.strip_trailing` 驱动。
+/// 🔴 全剥（a）优先于恒剥尾（b）：关标点时本就不该留任何标点，新开关不应把它降级成只剥尾。
+pub fn apply_l2_postprocess(
+    text: &str,
+    punctuation_enabled: bool,
+    strip_trailing_always: bool,
+) -> (String, L2Action) {
     if !punctuation_enabled {
         (transcription::strip_punctuation(text), L2Action::StripAll)
-    } else if count_units(text) <= SHORT_TEXT_UNIT_THRESHOLD {
+    } else if strip_trailing_always || count_units(text) <= SHORT_TEXT_UNIT_THRESHOLD {
         (strip_trailing_punctuation(text), L2Action::StripTrailing)
     } else {
         (text.to_string(), L2Action::NoOp)
@@ -623,15 +631,15 @@ mod tests {
     #[test]
     fn test_apply_l2_postprocess_disabled_strips_all() {
         // 行 1：开关关闭 → 全文剥标点（换空格、连续空格合一、trim），action=StripAll
-        let (out, action) = apply_l2_postprocess("周末能去爬山", false);
+        let (out, action) = apply_l2_postprocess("周末能去爬山", false, false);
         assert_eq!(out, "周末能去爬山");
         assert_eq!(action, L2Action::StripAll);
         // 行 1 附加：标点换空格 + 连续空格合一 + trim
-        let (out, action) = apply_l2_postprocess("周末 ，能去爬山", false);
+        let (out, action) = apply_l2_postprocess("周末 ，能去爬山", false, false);
         assert_eq!(out, "周末 能去爬山");
         assert_eq!(action, L2Action::StripAll);
         // 行 2：开关关闭、句末标点 → 剥成「再见」
-        let (out, action) = apply_l2_postprocess("再见。", false);
+        let (out, action) = apply_l2_postprocess("再见。", false, false);
         assert_eq!(out, "再见");
         assert_eq!(action, L2Action::StripAll);
     }
@@ -639,11 +647,11 @@ mod tests {
     #[test]
     fn test_apply_l2_postprocess_short_strip_trailing() {
         // 行 3：开关开启、≤5 单位 + 句末标点 → 直接删末尾，不留空格
-        let (out, action) = apply_l2_postprocess("再见。", true);
+        let (out, action) = apply_l2_postprocess("再见。", true, false);
         assert_eq!(out, "再见");
         assert_eq!(action, L2Action::StripTrailing);
         // 行 4：开关开启、≤5 单位 + 感叹号
-        let (out, action) = apply_l2_postprocess("好的！", true);
+        let (out, action) = apply_l2_postprocess("好的！", true, false);
         assert_eq!(out, "好的");
         assert_eq!(action, L2Action::StripTrailing);
     }
@@ -652,12 +660,12 @@ mod tests {
     fn test_apply_l2_postprocess_long_noop() {
         // 行 5：开关开启、>5 单位 → 完全 no-op（最大回归风险点：长句逐字符不动）
         let input = "这个方案不错，我们下周再评审。";
-        let (out, action) = apply_l2_postprocess(input, true);
+        let (out, action) = apply_l2_postprocess(input, true, false);
         assert_eq!(out, input);
         assert_eq!(action, L2Action::NoOp);
         // 行 6：开关开启、>5 单位，即使带末尾标点与内部数字也不动
         let input = "圆周率是3.14";
-        let (out, action) = apply_l2_postprocess(input, true);
+        let (out, action) = apply_l2_postprocess(input, true, false);
         assert_eq!(out, input);
         assert_eq!(action, L2Action::NoOp);
     }
@@ -665,12 +673,12 @@ mod tests {
     #[test]
     fn test_apply_l2_postprocess_threshold_boundary() {
         // 行 7：恰 5 单位 + 句末标点 → 走 ≤5 分支剥末尾
-        let (out, action) = apply_l2_postprocess("一二三四五。", true);
+        let (out, action) = apply_l2_postprocess("一二三四五。", true, false);
         assert_eq!(out, "一二三四五");
         assert_eq!(action, L2Action::StripTrailing);
         // 行 8：恰 6 单位 + 句末标点 → 走 >5 no-op
         let input = "一二三四五六。";
-        let (out, action) = apply_l2_postprocess(input, true);
+        let (out, action) = apply_l2_postprocess(input, true, false);
         assert_eq!(out, input);
         assert_eq!(action, L2Action::NoOp);
     }
@@ -678,12 +686,426 @@ mod tests {
     #[test]
     fn test_apply_l2_postprocess_action_is_branch_not_change() {
         // 行 9：开关关闭、文本本无标点 → 输出=入参但 action 是 StripAll（不是 NoOp）
-        let (out, action) = apply_l2_postprocess("好的", false);
+        let (out, action) = apply_l2_postprocess("好的", false, false);
         assert_eq!(out, "好的");
         assert_eq!(action, L2Action::StripAll);
         // 行 10：开关开启、≤5 且本无末尾标点 → 输出=入参但 action 是 StripTrailing（不是 NoOp）
-        let (out, action) = apply_l2_postprocess("好的", true);
+        let (out, action) = apply_l2_postprocess("好的", true, false);
         assert_eq!(out, "好的");
         assert_eq!(action, L2Action::StripTrailing);
+    }
+
+    // ============================================================================
+    // V091-PUNCT-TAIL-214 / V091-ITN-SKIP-ONLINE-215 · 阶段三交叉护栏
+    // （TEST-SYNC-214/215，coder-2 独立推导；作者 coder-1 阶段一只做了既有调用点的
+    //   三参迁移，一条新护栏都没有 —— 本组全部为新增断言）
+    //
+    // 分工说明（为什么不重复既有面）：`count_units` 口径、`strip_trailing_punctuation`
+    // 字符集、`has_effective_punctuation`、`apply_l2_postprocess` 旧行为（第三参恒 false）
+    // 已被本文件既有 40+ 条用例覆盖；本组只钉**新开关引入的新边界** + **验收标准 a
+    // （开关关闭时 5 条产出源逐字一致）的回归面**。
+    //
+    // 结构护栏写法沿用项目既有 idiom（`main.rs` 的 `nospeech_122_guard_tests` /
+    // `overlay_121_guard_tests`）：`include_str!` + 截断到首个 `#[cfg(test)]` 只扫生产区；
+    // 行首 `startswith` 定位；花括号定界取块。
+    // ============================================================================
+    mod guard_214_215 {
+        use super::*;
+
+        /// 读取源码并截断到首个 `#[cfg(test)]`，逐行 trim（只扫生产区，测试代码不进入扫描区）。
+        fn prod_lines(src: &'static str) -> Vec<String> {
+            let mut out = Vec::new();
+            for line in src.lines() {
+                let t = line.trim();
+                if t.starts_with("#[cfg(test)]") {
+                    break;
+                }
+                out.push(t.to_string());
+            }
+            out
+        }
+
+        fn main_prod_lines() -> Vec<String> {
+            prod_lines(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/main.rs"
+            )))
+        }
+
+        fn find_line(lines: &[String], needle: &str) -> Option<usize> {
+            lines.iter().position(|l| l.starts_with(needle))
+        }
+
+        fn brace_delta(line: &str) -> i32 {
+            line.matches('{').count() as i32 - line.matches('}').count() as i32
+        }
+
+        /// 花括号定界：以 anchor 行为起点返回 (open_idx, close_idx)。
+        fn block_bounds(lines: &[String], anchor: usize) -> Option<(usize, usize)> {
+            let mut depth = 0i32;
+            let mut opened = false;
+            let mut open_idx = usize::MAX;
+            for (i, line) in lines.iter().enumerate().skip(anchor) {
+                depth += brace_delta(line);
+                if depth > 0 && !opened {
+                    opened = true;
+                    open_idx = i;
+                }
+                if opened && depth == 0 {
+                    return Some((open_idx, i));
+                }
+            }
+            None
+        }
+
+        /// `if` **真分支体**：anchor 行之后、到第一个以 `}` 开头的行之前（不含两端）。
+        ///
+        /// 🔴 FIX-222 A：**不能用花括号定界取真分支** —— `} else {` 一行 `{`/`}` 净差为 0，
+        /// 深度不归零，`block_bounds` 的窗口会一直延伸到整个 `if/else` 的 `};`，
+        /// 于是 else 分支体也被算进「真分支内」→ 反向断言必然误报（首跑 guard_215_g10 即此）。
+        /// 改为按「首个以 `}` 开头的行」截断，天然的 else / 嵌套 if 都能正确断开。
+        fn if_true_body<'a>(lines: &'a [String], anchor: usize) -> &'a [String] {
+            let tail = &lines[anchor + 1..];
+            let n = tail
+                .iter()
+                .position(|l| l.starts_with('}'))
+                .unwrap_or(tail.len());
+            &tail[..n]
+        }
+
+        /// 语句窗口：anchor 行到首个恰好等于 `end` 的行（含首尾）。
+        ///
+        /// 用途：`let x = if <多行条件> { … } else { … };` 形态的判定点 ——
+        /// 条件表达式写在 `{` **之前**，花括号定界拿不到条件行，故改用语句终止符定界。
+        fn stmt_window<'a>(lines: &'a [String], anchor: usize, end: &str) -> &'a [String] {
+            let tail = &lines[anchor..];
+            let n = tail
+                .iter()
+                .position(|l| l == end)
+                .map(|i| i + 1)
+                .unwrap_or(tail.len());
+            &tail[..n]
+        }
+
+        fn window_has(window: &[String], needle: &str) -> bool {
+            window.iter().any(|l| l.contains(needle))
+        }
+
+        // ---------------------------------------------------------------------
+        // 214 · 真值表与恒剥尾新行为（纯函数边界）
+        // ---------------------------------------------------------------------
+
+        /// G1 · 四格真值表 + 🔴 全剥优先（最易写错的一格）。
+        /// 同一长文本四格对照：任一格语义漂移必红。
+        #[test]
+        fn guard_214_g1_strip_all_wins_over_strip_trailing() {
+            // 13 单位 > 5；含内部逗号 + 尾句号，可区分 StripAll 与 StripTrailing
+            let long = "这个方案不错，我们下周再评审。";
+
+            // 格 1：关闭 + 关尾 → StripAll（内部逗号也换空格 = 全剥特征）
+            let (out, action) = apply_l2_postprocess(long, false, false);
+            assert_eq!(action, L2Action::StripAll);
+            assert_eq!(out, "这个方案不错 我们下周再评审");
+
+            // 格 2：🔴 关闭 + 开尾 → 仍是 StripAll（全剥优先，不得降级成只剥尾）
+            let (out2, action2) = apply_l2_postprocess(long, false, true);
+            assert_eq!(
+                action2,
+                L2Action::StripAll,
+                "关标点时恒剥尾开关不得把全剥降级"
+            );
+            assert_eq!(out2, out, "关标点时第三参不改变输出");
+
+            // 格 3：开启 + 关尾 + 长文本 → NoOp（最大回归风险点，逐字符不动）
+            let (out3, action3) = apply_l2_postprocess(long, true, false);
+            assert_eq!(action3, L2Action::NoOp);
+            assert_eq!(out3, long);
+
+            // 格 4：开启 + 开尾 + 长文本 → StripTrailing（只剥尾，内部逗号保留）
+            let (out4, action4) = apply_l2_postprocess(long, true, true);
+            assert_eq!(action4, L2Action::StripTrailing);
+            assert_eq!(out4, "这个方案不错，我们下周再评审");
+            assert_ne!(out4, out3, "恒剥尾开启必须与关闭在长文本上可区分");
+        }
+
+        /// G2 · 恒剥尾对英文（翻译路径）同样生效，且只剥「句末终结类」标点。
+        #[test]
+        fn guard_214_g2_strip_trailing_always_english() {
+            // 8 单位 > 5；内部半角逗号/句点保留，仅尾 `?` 被剥
+            let en = "Hello, this is a long sentence. now what?";
+            let (out, action) = apply_l2_postprocess(en, true, true);
+            assert_eq!(action, L2Action::StripTrailing);
+            assert_eq!(out, "Hello, this is a long sentence. now what");
+            // 对照：第三参 false 时英文长句是 NoOp（防「英文走另一条路」的假设）
+            let (out2, action2) = apply_l2_postprocess(en, true, false);
+            assert_eq!(action2, L2Action::NoOp);
+            assert_eq!(out2, en);
+            // 关闭开关 → 半角标点换空格（StripAll 的语言无关性）
+            let (out3, action3) = apply_l2_postprocess(en, false, false);
+            assert_eq!(action3, L2Action::StripAll);
+            assert_eq!(out3, "Hello this is a long sentence now what");
+        }
+
+        /// G3 · action 是「走了哪条分支」不是「有没有改动」：恒剥尾开启时，
+        /// 无标点长文本的输出与 NoOp 相同，但 action 必须是 StripTrailing ——
+        /// 字符串相等时唯一判别力来自 action（L2Action 存在的理由）。
+        #[test]
+        fn guard_214_g3_action_is_branch_with_always_flag() {
+            let plain = "这个方案不错我们下周再评审"; // 13 单位，无任何标点
+            let (out, action) = apply_l2_postprocess(plain, true, true);
+            assert_eq!(out, plain);
+            assert_eq!(
+                action,
+                L2Action::StripTrailing,
+                "判据是「开关/长度」，不是「有无标点」"
+            );
+            let (out2, action2) = apply_l2_postprocess(plain, true, false);
+            assert_eq!(out2, out, "两格输出相同");
+            assert_eq!(action2, L2Action::NoOp);
+            assert_ne!(action, action2, "字符串相等时只能靠 action 判别");
+        }
+
+        /// G4 · 退化输入的边界：纯标点 / 空串 / 仅尾标点 / 尾随空白。
+        #[test]
+        fn guard_214_g4_degenerate_inputs() {
+            // 纯尾标点：恒剥尾 → 空串；action 仍是 StripTrailing（不是 NoOp）
+            assert_eq!(
+                apply_l2_postprocess("。。。", true, true),
+                (String::new(), L2Action::StripTrailing)
+            );
+            // 同输入、关标点 → StripAll（全剥优先，见 G1）
+            assert_eq!(
+                apply_l2_postprocess("。。。", false, true),
+                (String::new(), L2Action::StripAll)
+            );
+            // 空串：count_units=0 ≤ 5 → 短文本分支
+            assert_eq!(
+                apply_l2_postprocess("", true, false),
+                (String::new(), L2Action::StripTrailing)
+            );
+            // 仅一个尾标点 + 尾随空白（尾空白不得残留）
+            assert_eq!(
+                apply_l2_postprocess("好。", true, true),
+                ("好".to_string(), L2Action::StripTrailing)
+            );
+            assert_eq!(
+                apply_l2_postprocess("好。  ", true, true),
+                ("好".to_string(), L2Action::StripTrailing)
+            );
+        }
+
+        // ---------------------------------------------------------------------
+        // 214 · 验收标准 a 的回归面（配置 / 结构护栏）
+        // ---------------------------------------------------------------------
+
+        /// G5 · 🔴 存量用户零回归的根：配置缺字段必须回落 false。
+        /// 旧 `config.toml` 没有 `strip_trailing`，serde 少了 default 会让
+        /// 「关标点 → 恒剥尾」等行为对存量用户静默改变。
+        #[test]
+        fn guard_214_g5_config_field_defaults_false_when_absent() {
+            use crate::config::PunctuationConfig;
+            // 结构体默认值
+            let d = PunctuationConfig::default();
+            assert!(d.enabled, "enabled 默认必须 true（存量行为）");
+            assert!(
+                !d.strip_trailing,
+                "strip_trailing 默认必须 false（存量行为）"
+            );
+            // 旧配置（无该字段）→ false
+            let old: PunctuationConfig =
+                toml::from_str("enabled = true\n").expect("旧配置必须能解析");
+            assert!(
+                !old.strip_trailing,
+                "缺字段必须回落 false，否则存量用户行为改变"
+            );
+            // 关闭标点的旧配置同样回落 false
+            let off: PunctuationConfig =
+                toml::from_str("enabled = false\n").expect("旧配置必须能解析");
+            assert!(!off.strip_trailing);
+            // 显式开启 → true（开关可达，不是死字段）
+            let on: PunctuationConfig =
+                toml::from_str("enabled = true\nstrip_trailing = true\n").expect("新配置可解析");
+            assert!(on.strip_trailing);
+        }
+
+        /// G6 · 🔴 产出源 #4/#5「刻意不覆盖」：overlay 编辑态提交只读 `strip_trailing`，
+        /// **不得**读 `enabled`，也不得改用全剥函数。
+        /// 这是验收标准 a 的直接护栏：若有人把它「补全」成
+        /// `enabled || strip_trailing`（或换成 strip_punctuation），本组必红。
+        #[test]
+        fn guard_214_g6_overlay_submit_reads_only_strip_trailing() {
+            let lines = main_prod_lines();
+            let anchor = find_line(&lines, "let text_to_inject = if clone_runtime_config")
+                .expect("main.rs 必须保留编辑态提交的 text_to_inject 判定点");
+            let w = stmt_window(&lines, anchor, "};");
+            assert!(
+                window_has(&w, ".strip_trailing"),
+                "判定必须读 punctuation.strip_trailing"
+            );
+            assert!(
+                window_has(&w, "punctuation::strip_trailing_punctuation(&text)"),
+                "打开时必须调用 strip_trailing_punctuation（只剥尾）"
+            );
+            assert!(
+                window_has(&w, "text.clone()"),
+                "关闭时必须原样使用 text（逐字一致）"
+            );
+            // 反向：不得读 enabled（关标点的全剥现状本就**不**覆盖 #4/#5，刻意维持）
+            assert!(
+                !window_has(&w, "enabled"),
+                "🔴 #4/#5 刻意不覆盖 enabled 全剥 —— 补上去会破坏验收标准 a"
+            );
+            // 反向：不得改用全剥函数（注意 strip_trailing_punctuation 不含子串 strip_punctuation）
+            assert!(
+                !window_has(&w, "strip_punctuation"),
+                "🔴 #4/#5 不得使用全剥（strip_punctuation）"
+            );
+        }
+
+        /// G7 · 产出源 #1 主 pipeline 调用点必须把开关传进去（防漏传/写死 false）。
+        #[test]
+        fn guard_214_g7_main_pipeline_passes_config_flag() {
+            let lines = main_prod_lines();
+            let anchor = find_line(
+                &lines,
+                "let (l2_text, l2_action) = punctuation::apply_l2_postprocess(",
+            )
+            .expect("主 pipeline 的 L2 调用点必须存在");
+            let w = stmt_window(&lines, anchor, ");");
+            assert!(
+                window_has(&w, "config.punctuation.enabled"),
+                "第 2 实参必须是 config.punctuation.enabled"
+            );
+            assert!(
+                window_has(&w, "config.punctuation.strip_trailing"),
+                "第 3 实参必须是 config.punctuation.strip_trailing（写死 false = 新开关对主 pipeline 失效）"
+            );
+        }
+
+        /// G8 · src-tauri 侧镜像字段必须存在且带 `serde(default)`。
+        /// 缺失会让 UI 存档路径静默丢字段（Tauri 反序列化该结构再序列化写回）；
+        /// 不带 default 则旧存档（无该字段）反序列化失败。
+        /// 跨 crate 无法编译期引用，只能对源文件做结构断言。
+        #[test]
+        fn guard_214_g8_tauri_mirror_field_kept() {
+            let src = include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src-tauri/src/config.rs"
+            ));
+            let needle = "pub strip_trailing: bool";
+            let idx = src
+                .find(needle)
+                .expect("src-tauri 侧必须有 strip_trailing 镜像字段（否则 UI 存 config 会丢字段）");
+            let before = &src[..idx];
+            let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let ctx_begin = line_start.saturating_sub(200);
+            assert!(
+                src[ctx_begin..line_start].contains("serde(default)"),
+                "strip_trailing 必须带 #[serde(default)]（旧存档缺字段不得反序列化失败）"
+            );
+        }
+
+        // ---------------------------------------------------------------------
+        // 215 · 在线 ASR 跳 ITN 的判据与通道边界
+        // ---------------------------------------------------------------------
+
+        /// G9 · 🔴 判据必须是数据路径事实（`initial_text`），不得回退成 config。
+        /// `config.audio.asr_model` 与 transcriber 热重载存在瞬态不同步，
+        /// 按 config 判会把**本地** ASR 输出也误跳 ITN（main.rs 注释已声明该理由）。
+        /// 时序（必须在 `initial_text` 被 move 之前取值）由借用检查器保证，无需额外断言。
+        #[test]
+        fn guard_215_g9_judge_is_data_path_not_config() {
+            let lines = main_prod_lines();
+            let anchor = find_line(
+                &lines,
+                "let from_online_streaming = initial_text.is_some();",
+            )
+            .expect("215 判据行必须存在（数据路径事实 initial_text）");
+            assert!(
+                !lines[anchor].contains("config"),
+                "判据不得来自 config（与引擎热重载有瞬态不同步）"
+            );
+            assert!(
+                !lines[anchor].contains("asr_model"),
+                "判据不得来自 asr_model"
+            );
+            // 全生产区非注释出现次数必须恰为 2：1 次定义 + 1 次使用（只跳主通道）。
+            // 出现第 3 处 = 有人给它加了第二个门控（例如把补丁通道也跳掉）= 回归。
+            let uses = lines
+                .iter()
+                .filter(|l| !l.starts_with("//") && l.contains("from_online_streaming"))
+                .count();
+            assert_eq!(
+                uses, 2,
+                "from_online_streaming 只允许「定义 1 处 + 主通道使用 1 处」；多出即新增门控"
+            );
+        }
+
+        /// G10 · 主通道两条分支都必须存在：online → 逐字 `raw_text`；offline → 主通道 ITN。
+        #[test]
+        fn guard_215_g10_main_channel_both_branches() {
+            let lines = main_prod_lines();
+            let anchor = find_line(&lines, "let pre_llm_text = if from_online_streaming {")
+                .expect("主通道 skip 判定必须存在");
+            // 🔴 FIX-222 A：只扫**真分支体**（`} else {` 之前），不把 else 分支算进来。
+            let online = if_true_body(&lines, anchor);
+            // 非恒真自证：若有人把 `itn::normalize_numbers(&raw_text)` **挪进 online 分支**
+            // （即挪到这行 `}` 之前），`online` 就会包含它 → 下面第二条断言立刻变红。
+            // 反之，原实现把 else 分支也纳入窗口，所以它对**正确的**代码也报红（首跑假阳性根因）。
+            assert!(
+                online.iter().any(|l| l.starts_with("raw_text.clone()")),
+                "online 分支必须原样使用 raw_text（真分支体为空或分支被删都会红）"
+            );
+            assert!(
+                !online
+                    .iter()
+                    .any(|l| l.starts_with("itn::normalize_numbers")),
+                "online 分支内不得再跑主通道 ITN（否则 gate 形同虚设）"
+            );
+            assert!(
+                find_line(&lines, "itn::normalize_numbers(&raw_text)").is_some(),
+                "offline 分支必须保留主通道 normalize_numbers"
+            );
+        }
+
+        /// G11 · 🔴 补丁通道刻意保留（DEC-036 双通道的另一半），且不被 skip 门控 ——
+        /// 「只跳主通道」是决定不是漏。若有人把补丁通道也塞进门控块，本组必红。
+        #[test]
+        fn guard_215_g11_patch_channel_survives_and_not_gated() {
+            let lines = main_prod_lines();
+            let patch = find_line(
+                &lines,
+                "let final_text = itn::normalize_unit_symbols_only(&final_text);",
+            )
+            .expect("补丁通道调用必须保留（只跳主通道，不是两条都跳）");
+            let gate = find_line(&lines, "let pre_llm_text = if from_online_streaming {")
+                .expect("主通道门控必须存在");
+            let (_, gate_end) = block_bounds(&lines, gate).expect("门控块必须闭合");
+            assert!(
+                patch > gate_end,
+                "补丁通道必须在门控块之外（块内 = 被 online 门控吞掉）"
+            );
+            assert!(
+                !lines[patch].contains("from_online_streaming"),
+                "补丁通道调用不得挂在 online 门控上"
+            );
+        }
+
+        /// G12 · 补丁通道的「价值」与「边界」（语义旁证，证明只跳主通道不是漏跳）：
+        /// 它能做主通道不做的事（单位符号），也不做越权的事（不转中文数字）。
+        #[test]
+        fn guard_215_g12_patch_channel_value_and_limits() {
+            // 主通道：中文数字 → 阿拉伯数字（跳过它确有实质效果，不是恒等操作）
+            assert_eq!(crate::itn::normalize_numbers("三百二十五"), "325");
+            // 补丁通道：阿拉伯数字 + 中文单位 → 单位符号（LLM 纠正 ASR 同音错字后仍能定型）
+            assert_eq!(crate::itn::normalize_unit_symbols_only("40摄氏度"), "40℃");
+            // 补丁通道不越权：中文数字原样（它不是主通道的复制品）
+            assert_eq!(
+                crate::itn::normalize_unit_symbols_only("三百二十五"),
+                "三百二十五"
+            );
+            // 幂等：已定型输出不二次改动
+            assert_eq!(crate::itn::normalize_unit_symbols_only("40℃"), "40℃");
+        }
     }
 }

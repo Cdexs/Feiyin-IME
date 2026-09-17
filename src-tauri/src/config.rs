@@ -253,11 +253,19 @@ impl Default for TranslationConfig {
 pub struct PunctuationConfig {
     /// Enable punctuation restoration after transcription.
     pub enabled: bool,
+    /// V091-PUNCT-TAIL-214: always strip trailing punctuation regardless of text
+    /// length. Mirrors `src/config/mod.rs`; must stay in sync or the UI save path
+    /// silently drops the field (Tauri deserializes into this struct and re-serializes).
+    #[serde(default)]
+    pub strip_trailing: bool,
 }
 
 impl Default for PunctuationConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            strip_trailing: false,
+        }
     }
 }
 

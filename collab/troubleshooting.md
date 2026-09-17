@@ -17,6 +17,8 @@
 | [HOOK-FAIL-OPEN-001] | pre-push 闸门在根提交无父 / diff 取失败时**静默放行** → 安全闸门必须 fail-closed，`rev-parse` 要加 `--verify` |
 | [GIT-RESET-INCIDENT-001] | 排查测试失败误执行批量 `git checkout --` / `stash` → **抹掉 11 个已验收批次**；破坏性 git 命令全面禁用 |
 | [TOML-ALL-NUL-001] | 出包后规则词表整文件变全 NUL、exe 照常启动但功能静默失效 → **大小与好文件完全相等，只比大小检不出来**，须做内容 hash |
+| [BINARY-PROBE-FALSE-HIT-001] | 二进制探针 grep 得 18912 这种超大命中 → BRE 把方括号当字符类了，必须 grep -F；🔴 命中数异常大是红旗不是好消息。同批：PowerShell 内联 foreach 跨层转义被吃 → 三行空值，宁可逐条调用。共同形态 = **工具语法问题伪装成数据结论** |
+| [VERIFY-CHECKLIST-UNWRITTEN-001] | 「N 项核验全 PASS」长期无成文清单，条数从七→五→六自由漂移，`BUILD-159` 把 toml hash 丢进「跳过」隔天就炸 `[TOML-ALL-NUL-001]` → **编号会自动补位所以逐条读报告看不出缺项**；收到「N 项全 PASS」先问 **N 等于文档里的几项**。清单落点 `build-test-guide.md` §一·五 |
 | [DISK-CLEANUP-001] | 清理 target 磁盘占用 → **禁用 `cargo clean`**（会删端测数据 + 可能穿透 models 符号链接），须逐目录 `rm` |
 | [ENCODING-UTF8-001] | PowerShell 改 UTF-8 源码变乱码报错；**Python 不声明编码同样会被 GBK 截断** → 任何语言写中文源文件必须显式 utf-8 |
 | [WORKER-DOC-ENCODING-002] | Worker 用「追加」语义写文档仍毁 UTF-8 且内容不可逆丢失 → 根因是 PowerShell 默认按 GBK 写，须显式 `-Encoding utf8` |
@@ -42,7 +44,7 @@
 | [SCENE-OBSERVABILITY-001] | grep 场景日志 0 命中，误判场景感知未生效 → 实为零 log 可观测性缺口，用长度反演证明功能正常 |
 | [BUGREPORT-SELFCORRUPT-001] | 口述 bug 报告可能被 bug 本身污染（出现语法突兀词）→ 用错误值反推真实输入，勿照抄报告文本复现 |
 | [SESSION-CRASH-RECOVERY-001] | session 崩溃后产物与文档脱节 → sha256 + mtime 链 + 正反向探针三件套，全过则只补文档不重建 |
-| [FMT-COLLATERAL-001] | 只改 2 文件却冒出 5-9 个 modified → `cargo fmt` 全量连带格式化，去空白 / 去逗号 md5 比对可证清白 |
+| [FMT-COLLATERAL-001] | 只改 2 文件却冒出 5-9 个 modified → `cargo fmt` 全量连带格式化，去空白 / 去逗号 md5 比对可证清白。🔴 2026-09-17 定规：**`src-tauri` crate 本身非 fmt-clean，Worker 一律不许对它跑 `cargo fmt`**；核验连带是否清干净用 `git diff --numstat` 与 `--numstat -w` 两份输出是否逐字相同 |
 
 ## 协作 / Worker
 

@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use serde::Deserialize;
+use zhconv::{zhconv, Variant};
 
 /// 内置默认规则文件
 const BUILTIN_RULES: &str = include_str!("../itn-rules.toml");
@@ -237,9 +238,119 @@ struct CompiledRules {
     serial_suffix_set: HashSet<String>,
 }
 
+/// V091-ITN-HANT-SYSTEMIC-221-FIX (DEADRULE)：规则表 key 的**加载期归一**。
+///
+/// 影子串契约要求「判定发生在归一后的空间」。输入经 `hant_to_hans_char` 归一后，
+/// 表 key 若保持原样，任何含非简体字的条目都会变成**不可达死规则** ——
+/// 实例：`三角捷鰕虎鱼` 的 `鰕`(U+9C15) 在输入侧被归一为 `𫚥`(U+2B6A5)，
+/// 与表内字面 `鰕` 不再相等 ⇒ `check_protection` 永不命中 ⇒ `三角` 被转成 `3角`。
+///
+/// 🔴 归一在**加载期**完成，`itn-rules.toml` 继续只维护简体、一个字不改（[D] 条）。
+/// 本函数对**单个 key** 做归一；批量与碰撞检测见 `KeyNormalizeReport`。
+fn normalize_rule_key(s: &str) -> String {
+    // 快路径：纯 ASCII 不可能含需要归一化的汉字（省一次分配；不改变语义）
+    if s.is_ascii() {
+        return s.to_string();
+    }
+    s.chars().map(hant_to_hans_char).collect()
+}
+
+/// 规则表 key 归一的收集器：负责批量归一 + 改写/碰撞取证 + 落日志。
+///
+/// 🔴 碰撞 = 两个**不同**原文归一后得到同一个 key。此时集合会静默去重（条目数下降），
+/// 必须 `log::warn!` 报出双方，避免「表里明明有两条、运行时只剩一条」的静默语义丢失。
+#[derive(Default)]
+struct KeyNormalizeReport {
+    /// 被实际改写的 key 出现次数记录：(原文, 归一后)
+    rewritten: Vec<(String, String)>,
+    /// 归一后碰撞：(归一后, 先到原文, 后到原文)
+    collisions: Vec<(String, String, String)>,
+}
+
+impl KeyNormalizeReport {
+    /// 归一单个 key，并记录「是否被改写」
+    fn norm(&mut self, s: &str) -> String {
+        let n = normalize_rule_key(s);
+        if n != s {
+            self.rewritten.push((s.to_string(), n.clone()));
+        }
+        n
+    }
+
+    /// 批量归一为 HashSet，内置碰撞检测
+    fn set<S: AsRef<str>>(&mut self, items: &[S]) -> HashSet<String> {
+        let mut seen: HashMap<String, String> = HashMap::new();
+        let mut out = HashSet::new();
+        for it in items {
+            let orig = it.as_ref();
+            let n = self.norm(orig);
+            match seen.get(&n) {
+                Some(prev) if prev.as_str() != orig => {
+                    self.collisions
+                        .push((n.clone(), prev.clone(), orig.to_string()));
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(n.clone(), orig.to_string());
+                }
+            }
+            out.insert(n);
+        }
+        out
+    }
+
+    /// 加载期落日志：逐条改写 + 碰撞告警 + 汇总
+    fn finish_and_log(&self) {
+        for (orig, norm) in &self.rewritten {
+            log::info!("ITN rule-key 归一改写：'{}' -> '{}'", orig, norm);
+        }
+        for (norm, a, b) in &self.collisions {
+            log::warn!(
+                "ITN rule-key 归一碰撞：'{}' 与 '{}' 归一后同为 '{}'（后者被集合去重）",
+                a,
+                b,
+                norm
+            );
+        }
+        log::info!(
+            "ITN rule-key 归一完成：改写 {} 次 / 碰撞 {} 条",
+            self.rewritten.len(),
+            self.collisions.len()
+        );
+    }
+}
+
+/// 把 unit_hierarchy 的一个 (unit, family, val) 归一后并入 map，并做碰撞检测。
+/// 抽成自由函数以避免在 `from_rules` 里同时可变借用 `rep` / `map` / `seen` 的借用冲突。
+fn push_hierarchy_key(
+    rep: &mut KeyNormalizeReport,
+    map: &mut HashMap<String, Vec<(&'static str, f64)>>,
+    seen: &mut HashMap<String, String>,
+    unit: &str,
+    family: &'static str,
+    val: f64,
+) {
+    let n = rep.norm(unit);
+    if let Some(prev) = seen.get(&n) {
+        if prev.as_str() != unit {
+            rep.collisions
+                .push((n.clone(), prev.clone(), unit.to_string()));
+        }
+    } else {
+        seen.insert(n.clone(), unit.to_string());
+    }
+    map.entry(n).or_default().push((family, val));
+}
+
 impl CompiledRules {
     fn from_rules(r: Rules) -> Self {
-        let mut all_units = HashSet::new();
+        // V091-ITN-HANT-SYSTEMIC-221-FIX (DEADRULE)：所有规则表 key 在**加载期**做一次
+        // 与影子串同空间的归一（非简体 key 否则成不可达死规则）。含改写/碰撞取证。
+        let mut rep = KeyNormalizeReport::default();
+
+        // —— 单位表：all_units ⊇ 全部 units.*（含 other）；decimalizable 排除 other ——
+        let mut all_unit_words: Vec<&str> = Vec::new();
+        let mut decimalizable_words: Vec<&str> = Vec::new();
         for unit_list in [
             &r.units.currency,
             &r.units.length,
@@ -252,100 +363,125 @@ impl CompiledRules {
             &r.units.acoustic,
             &r.units.data,
             &r.units.time,
-            &r.units.other,
         ] {
             for w in &unit_list.words {
-                all_units.insert(w.clone());
+                all_unit_words.push(w.as_str());
+                decimalizable_words.push(w.as_str());
             }
         }
+        for w in &r.units.other.words {
+            all_unit_words.push(w.as_str());
+        }
+        let all_units = rep.set(&all_unit_words);
+        let decimalizable_units = rep.set(&decimalizable_words);
 
-        let geo_prefixes: HashSet<String> = r.units.geo_prefix.words.iter().cloned().collect();
-        let date_suffixes: HashSet<String> = r.date_time.triggers.suffix.iter().cloned().collect();
-        let date_specials: HashSet<String> = r.date_time.triggers.special.iter().cloned().collect();
-        let date_prefixes: HashSet<String> = r.date_time.triggers.prefix.iter().cloned().collect();
+        let geo_prefixes = rep.set(&r.units.geo_prefix.words);
+        let date_suffixes = rep.set(&r.date_time.triggers.suffix);
+        let date_specials = rep.set(&r.date_time.triggers.special);
+        let date_prefixes = rep.set(&r.date_time.triggers.prefix);
 
-        Self {
+        let ordinal_prefix = rep.norm(&r.ordinal.prefix);
+        let percentage_prefix = rep.norm(&r.percentage.prefix);
+        let fraction_pattern = rep.norm(&r.fraction.pattern);
+
+        let idiom_set = rep.set(&r.protect.idioms.words);
+        let proper_noun_set = rep.set(&r.protect.proper_nouns.words);
+        let function_word_set = rep.set(&r.protect.function_words.words);
+        let classifier_set = rep.set(&r.protect.classifiers.words);
+        let historical_set = rep.set(&r.protect.historical.words);
+        let serial_suffix_set = rep.set(&r.protect.serial_suffixes.words);
+
+        // 单位前缀碰撞保护词：按**归一后**首字分桶（桶内按字符数降序 = 最长匹配优先）
+        let unit_collision_map = {
+            let mut map: HashMap<char, Vec<String>> = HashMap::new();
+            let mut seen: HashMap<String, String> = HashMap::new();
+            for w in &r.protect.unit_collisions.words {
+                let n = rep.norm(w);
+                if let Some(prev) = seen.get(&n) {
+                    if prev.as_str() != w.as_str() {
+                        rep.collisions.push((n.clone(), prev.clone(), w.clone()));
+                    }
+                } else {
+                    seen.insert(n.clone(), w.clone());
+                }
+                if let Some(first) = n.chars().next() {
+                    map.entry(first).or_default().push(n);
+                }
+            }
+            for bucket in map.values_mut() {
+                bucket.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
+            }
+            map
+        };
+
+        // 单位符号 trigger：归一 trigger（replacement 是输出符号，保持原样）
+        let unit_symbol_rules = {
+            let mut rules: Vec<(String, String)> = r
+                .unit_symbols
+                .rules
+                .iter()
+                .map(|rule| (rep.norm(&rule.trigger), rule.replacement.clone()))
+                .collect();
+            let mut seen: HashMap<String, String> = HashMap::new();
+            for rule in &r.unit_symbols.rules {
+                let n = normalize_rule_key(&rule.trigger);
+                if let Some(prev) = seen.get(&n) {
+                    if prev.as_str() != rule.trigger.as_str() {
+                        rep.collisions
+                            .push((n.clone(), prev.clone(), rule.trigger.clone()));
+                    }
+                } else {
+                    seen.insert(n, rule.trigger.clone());
+                }
+            }
+            // Longest trigger first for correct matching
+            rules.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()));
+            rules
+        };
+
+        let unit_hierarchy = {
+            let mut map: HashMap<String, Vec<(&'static str, f64)>> = HashMap::new();
+            let mut seen: HashMap<String, String> = HashMap::new();
+            for (unit, val) in &r.unit_hierarchy.currency {
+                push_hierarchy_key(&mut rep, &mut map, &mut seen, unit, "currency", *val);
+            }
+            for (unit, val) in &r.unit_hierarchy.length {
+                push_hierarchy_key(&mut rep, &mut map, &mut seen, unit, "length", *val);
+            }
+            for (unit, val) in &r.unit_hierarchy.weight {
+                push_hierarchy_key(&mut rep, &mut map, &mut seen, unit, "weight", *val);
+            }
+            for (unit, val) in &r.unit_hierarchy.time {
+                push_hierarchy_key(&mut rep, &mut map, &mut seen, unit, "time", *val);
+            }
+            map
+        };
+
+        let compiled = Self {
             all_units,
             geo_prefixes,
             date_suffixes,
             date_specials,
             date_prefixes,
-            ordinal_prefix: r.ordinal.prefix,
-            percentage_prefix: r.percentage.prefix,
-            fraction_pattern: r.fraction.pattern,
-            idiom_set: r.protect.idioms.words.iter().cloned().collect(),
-            proper_noun_set: r.protect.proper_nouns.words.iter().cloned().collect(),
-            function_word_set: r.protect.function_words.words.iter().cloned().collect(),
-            classifier_set: r.protect.classifiers.words.iter().cloned().collect(),
+            ordinal_prefix,
+            percentage_prefix,
+            fraction_pattern,
+            idiom_set,
+            proper_noun_set,
+            function_word_set,
+            classifier_set,
             convert_single_digit_with_classifier: r.switches.convert_single_digit_with_classifier,
             below_zero_style: r.switches.below_zero_style,
             large_amount_keep_wan_yi: r.switches.large_amount_keep_wan_yi,
-            historical_set: r.protect.historical.words.iter().cloned().collect(),
-            unit_collision_map: {
-                let mut map: HashMap<char, Vec<String>> = HashMap::new();
-                for w in &r.protect.unit_collisions.words {
-                    if let Some(first) = w.chars().next() {
-                        map.entry(first).or_default().push(w.clone());
-                    }
-                }
-                // 桶内按字符数降序排序，确保最长匹配优先
-                for bucket in map.values_mut() {
-                    bucket.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
-                }
-                map
-            },
-            unit_symbol_rules: {
-                let mut rules: Vec<(String, String)> = r
-                    .unit_symbols
-                    .rules
-                    .iter()
-                    .map(|rule| (rule.trigger.clone(), rule.replacement.clone()))
-                    .collect();
-                // Longest trigger first for correct matching
-                rules.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()));
-                rules
-            },
-            unit_hierarchy: {
-                let mut map: HashMap<String, Vec<(&'static str, f64)>> = HashMap::new();
-                for (unit, val) in &r.unit_hierarchy.currency {
-                    map.entry(unit.clone())
-                        .or_default()
-                        .push(("currency", *val));
-                }
-                for (unit, val) in &r.unit_hierarchy.length {
-                    map.entry(unit.clone()).or_default().push(("length", *val));
-                }
-                for (unit, val) in &r.unit_hierarchy.weight {
-                    map.entry(unit.clone()).or_default().push(("weight", *val));
-                }
-                for (unit, val) in &r.unit_hierarchy.time {
-                    map.entry(unit.clone()).or_default().push(("time", *val));
-                }
-                map
-            },
-            decimalizable_units: {
-                let mut set = HashSet::new();
-                for list in [
-                    &r.units.currency,
-                    &r.units.length,
-                    &r.units.weight,
-                    &r.units.volume,
-                    &r.units.temperature,
-                    &r.units.pressure,
-                    &r.units.electrical,
-                    &r.units.frequency,
-                    &r.units.acoustic,
-                    &r.units.data,
-                    &r.units.time,
-                ] {
-                    for w in &list.words {
-                        set.insert(w.clone());
-                    }
-                }
-                set
-            },
-            serial_suffix_set: r.protect.serial_suffixes.words.iter().cloned().collect(),
-        }
+            historical_set,
+            unit_collision_map,
+            unit_symbol_rules,
+            unit_hierarchy,
+            decimalizable_units,
+            serial_suffix_set,
+        };
+        rep.finish_and_log();
+        compiled
     }
 
     fn is_unit(&self, s: &str) -> bool {
@@ -410,6 +546,10 @@ impl CompiledRules {
 
     /// TEMP-CELSIUS-001: 查找最长匹配的单位词，返回 (字符长度, 单位词原文)。
     /// 供调用方判定是否含"摄氏"关键词触发 ℃ 符号替换。
+    ///
+    /// 🔴 V091-ITN-HANT-SYSTEMIC-221：需要「匹配取影子串、上屏取原串」的调用方
+    /// （甲乙丙三型）自行用 `shadow` 调用本函数取得长度，再从 `orig` 同下标切片取上屏词
+    /// —— 见 `try_parse_unit_chain` / `try_parse_implicit_decimal` / `try_parse_half_mode`。
     fn match_unit_word<'a>(&self, chars: &'a [char], pos: usize) -> Option<(usize, String)> {
         if pos >= chars.len() {
             return None;
@@ -1109,24 +1249,35 @@ pub fn normalize_unit_symbols_only(text: &str) -> String {
 /// 丙型识别器输出：结构化的多级「数字-单位」链。
 #[derive(Debug, Clone)]
 struct UnitChain {
+    /// (数字, **影子单位**) —— 仅用于查表 / 族消歧（`hierarchy_value`/`unit_families` 等）。
     parts: Vec<(String, String)>,
+    /// 🔴 V091-ITN-HANT-SYSTEMIC-221 · [B] 铁律：与 `parts` **一一对应的原串单位词**，仅用于上屏。
+    /// 繁中用户看到的是自己的字形（如 `萬`/`塊`），绝不因判定归一而被改写成简体。
+    out_units: Vec<String>,
     consumed: usize,
     family: &'static str,
     /// ITN-FIX-CURRENCY-017：货币链后的单价限定词（如「一斤」），原样汉字保留。
     /// 仅 currency 族链在终止点后紧跟 weight 族单位时设置（`三块四毛八一斤`→`3.48元一斤`）。
+    /// 221 起取自**原串**（上屏用），不做任何字形改写。
     per_unit: Option<String>,
 }
 
 /// 丙型识别器：扫描连续「中文数字+可小数化单位」多级链。
 /// 与③的关键差异：match 失败用 break（保留已识别段）而非 ?（整体返回None）；
 /// 单位必须 is_decimalizable（排除编号单位）；`分`消歧靠前驱。
-fn try_parse_unit_chain(chars: &[char], start: usize, r: &CompiledRules) -> Option<UnitChain> {
+fn try_parse_unit_chain(
+    shadow: &[char],
+    orig: &[char],
+    start: usize,
+    r: &CompiledRules,
+) -> Option<UnitChain> {
     let mut parts: Vec<(String, String)> = Vec::new();
+    let mut out_units: Vec<String> = Vec::new();
     let mut pos = start;
     let mut family: Option<&'static str> = None;
 
     loop {
-        let (num_str, num_consumed) = match parse_cn_number(&chars[pos..], 0, Some(r)) {
+        let (num_str, num_consumed) = match parse_cn_number(&shadow[pos..], 0, Some(r)) {
             Some(v) => v,
             None => break,
         };
@@ -1134,52 +1285,59 @@ fn try_parse_unit_chain(chars: &[char], start: usize, r: &CompiledRules) -> Opti
             break;
         }
         let after_num = pos + num_consumed;
-        let rest: String = chars[after_num..].iter().collect();
-        // 单位匹配：先试 all_units，再试 date_suffix（点/分/秒 时间族）
-        let (unit_len, unit_word) = if let Some(v) = r.match_unit_word(chars, after_num) {
-            v
-        } else if let Some(len) = r.match_date_suffix_len(&rest) {
-            let word: String = chars[after_num..after_num + len].iter().collect();
-            // 仅时间 date_suffix（点/分/秒），排除号/日/年/月等日期
-            if word == "点" || word == "分" || word == "秒" {
-                (len, word)
+        let rest: String = shadow[after_num..].iter().collect();
+        // 单位匹配：先试 all_units，再试 date_suffix（点/分/秒 时间族）。
+        // 🔴 221 [B] 铁律：判定用**影子串**（`shadow`）、上屏用**原串**（`orig`），两串同下标（1:1）。
+        //    故此处同时取到影子单位词（`sw`，查表用）与原串单位词（`ow`，输出用）。
+        let (unit_len, unit_word, out_word) =
+            if let Some((len, sw)) = r.match_unit_word(shadow, after_num) {
+                let ow: String = orig[after_num..after_num + len].iter().collect();
+                (len, sw, ow)
+            } else if let Some(len) = r.match_date_suffix_len(&rest) {
+                let sw: String = shadow[after_num..after_num + len].iter().collect();
+                let ow: String = orig[after_num..after_num + len].iter().collect();
+                // 仅时间 date_suffix（点/分/秒），排除号/日/年/月等日期
+                if sw == "点" || sw == "分" || sw == "秒" {
+                    (len, sw, ow)
+                } else {
+                    break;
+                }
             } else {
-                break;
-            }
-        } else {
-            // 无单位：检查隐含末级单位尾数
-            // ITN-FIX-CHAIN-TEAR-026：去掉 after_is_boundary 检查，数值合成与后继识别正交。
-            if !parts.is_empty() && after_num <= chars.len() {
-                // 隐式尾数单位取决于链内最后一个显式单位的层级：
-                //   块/元(≥1.0) → 隐式尾数=毛(0.1) → 五块一=5.1元
-                //   毛/角(=0.1) → 隐式尾数=分(0.01) → 三块四毛八=3.48元
-                //   分(=0.01)   → 已到最小单位，不再吸收隐式尾数
-                let (_, last_unit) = parts.last().unwrap();
-                if let Some(last_val) = r.hierarchy_value(last_unit, "currency") {
-                    let implicit_unit = if last_val >= 1.0 {
-                        "毛"
-                    } else if last_val == 0.1 {
-                        "分"
-                    } else {
-                        ""
-                    };
-                    // ITN-FIX-BIGNUM-027-F：纯数字校验 —— 027-E 后 parse_cn_number
-                    //   可能返回带单位串（如 "3亿"），num_consumed 恰好 ≤2 可穿过门控 →
-                    //   带单位串进 parts → format_currency_chain 的 .parse::<f64>()
-                    //   静默归零（第四种失败模式）。此处加纯数字校验对齐
-                    //   capture_price_per_unit:1241 先例：非纯 ASCII 数字则跳过吸收，
-                    //   由主循环独立解析（走 DEC-042 锚定路径）。
-                    if !implicit_unit.is_empty()
-                        && num_consumed <= 2
-                        && num_str.bytes().all(|b| b.is_ascii_digit())
-                    {
-                        parts.push((num_str, implicit_unit.to_string()));
-                        pos = after_num;
+                // 无单位：检查隐含末级单位尾数
+                // ITN-FIX-CHAIN-TEAR-026：去掉 after_is_boundary 检查，数值合成与后继识别正交。
+                if !parts.is_empty() && after_num <= shadow.len() {
+                    // 隐式尾数单位取决于链内最后一个显式单位的层级：
+                    //   块/元(≥1.0) → 隐式尾数=毛(0.1) → 五块一=5.1元
+                    //   毛/角(=0.1) → 隐式尾数=分(0.01) → 三块四毛八=3.48元
+                    //   分(=0.01)   → 已到最小单位，不再吸收隐式尾数
+                    let (_, last_unit) = parts.last().unwrap();
+                    if let Some(last_val) = r.hierarchy_value(last_unit, "currency") {
+                        let implicit_unit = if last_val >= 1.0 {
+                            "毛"
+                        } else if last_val == 0.1 {
+                            "分"
+                        } else {
+                            ""
+                        };
+                        // ITN-FIX-BIGNUM-027-F：纯数字校验 —— 027-E 后 parse_cn_number
+                        //   可能返回带单位串（如 "3亿"），num_consumed 恰好 ≤2 可穿过门控 →
+                        //   带单位串进 parts → format_currency_chain 的 .parse::<f64>()
+                        //   静默归零（第四种失败模式）。此处加纯数字校验对齐
+                        //   capture_price_per_unit:1241 先例：非纯 ASCII 数字则跳过吸收，
+                        //   由主循环独立解析（走 DEC-042 锚定路径）。
+                        if !implicit_unit.is_empty()
+                            && num_consumed <= 2
+                            && num_str.bytes().all(|b| b.is_ascii_digit())
+                        {
+                            // 派生单位（毛/分）简繁同形 → 原串侧同步补一条（保持 parts/out_units 对齐）
+                            parts.push((num_str, implicit_unit.to_string()));
+                            out_units.push(implicit_unit.to_string());
+                            pos = after_num;
+                        }
                     }
                 }
-            }
-            break;
-        };
+                break;
+            };
         // 单位可小数化检查（date_suffix 时间词已在上方过滤，此处查 decimalizable）
         if unit_len == 0 {
             break;
@@ -1202,13 +1360,14 @@ fn try_parse_unit_chain(chars: &[char], start: usize, r: &CompiledRules) -> Opti
                 // 捕获单价限定词（如「一斤」），原样汉字保留在 per_unit。
                 if cur == "currency" && unit_fam == "weight" {
                     if let Some(chain) = capture_price_per_unit(
-                        chars,
+                        orig,
                         start,
                         after_num,
                         unit_len,
                         &num_str,
                         num_consumed,
                         &mut parts,
+                        &mut out_units,
                         r,
                     ) {
                         return Some(chain);
@@ -1220,9 +1379,10 @@ fn try_parse_unit_chain(chars: &[char], start: usize, r: &CompiledRules) -> Opti
             family = Some(unit_fam);
         }
         parts.push((num_str, unit_word.clone()));
+        out_units.push(out_word);
         pos = after_num + unit_len;
-        if pos >= chars.len()
-            || !is_cn_num_char(chars[pos]) && chars[pos] != '零' && chars[pos] != '〇'
+        if pos >= shadow.len()
+            || !is_cn_num_char(shadow[pos]) && shadow[pos] != '零' && shadow[pos] != '〇'
         {
             break;
         }
@@ -1236,6 +1396,7 @@ fn try_parse_unit_chain(chars: &[char], start: usize, r: &CompiledRules) -> Opti
         Some(UnitChain {
             consumed: pos - start,
             parts,
+            out_units,
             family: family.unwrap_or("length"),
             per_unit: None,
         })
@@ -1274,13 +1435,14 @@ fn resolve_family_consistent(unit: &str, cur: &str, r: &CompiledRules) -> &'stat
 /// 拆分规则：紧邻 weight 单位的最后一个汉字数字归 per_unit 数量（原样汉字保留），
 /// 其前数字作为货币链隐式尾位（`一块两毛二一斤` → [1块,2毛] + 隐式 二=2分 + per_unit 一斤）。
 fn capture_price_per_unit(
-    chars: &[char],
+    orig: &[char],
     start: usize,
     after_num: usize,
     unit_len: usize,
     num_str: &str,
     num_consumed: usize,
     parts: &mut Vec<(String, String)>,
+    out_units: &mut Vec<String>,
     r: &CompiledRules,
 ) -> Option<UnitChain> {
     if num_consumed == 0 || parts.is_empty() || !num_str.bytes().all(|b| b.is_ascii_digit()) {
@@ -1302,13 +1464,16 @@ fn capture_price_per_unit(
     if num_consumed >= 2 {
         let tail_digits = &num_str[..num_str.len() - 1];
         parts.push((tail_digits.to_string(), tail_unit.to_string()));
+        // 派生单位（毛/分）简繁同形 → 原串侧同步补一条，保持 parts/out_units 对齐
+        out_units.push(tail_unit.to_string());
     }
-    // per_unit = 紧邻单位的最后一个源字符 + 单位词，原样汉字保留
-    let per_unit_str: String = chars[after_num - 1..after_num + unit_len].iter().collect();
+    // per_unit = 紧邻单位的最后一个源字符 + 单位词，原样汉字保留（🔴 取自**原串**，221 [B] 铁律）
+    let per_unit_str: String = orig[after_num - 1..after_num + unit_len].iter().collect();
     let consumed = after_num + unit_len - start;
     Some(UnitChain {
         consumed,
         parts: std::mem::take(parts),
+        out_units: std::mem::take(out_units),
         family: "currency",
         per_unit: Some(per_unit_str),
     })
@@ -1334,8 +1499,11 @@ fn format_currency_chain(chain: &UnitChain, r: &CompiledRules) -> String {
     // 货币单位（块/角/毛），系统不替他改写表达；多段才有合成数值的必要，此时归一到
     // 元是计算结果而非改写。
     if chain.parts.len() == 1 {
-        let (num_str, unit) = &chain.parts[0];
-        let body = format!("{}{}", num_str, unit);
+        let (num_str, _unit) = &chain.parts[0];
+        // 🔴 221 [B] 铁律：上屏用**原串**单位词（`parts[].1` 是影子单位，只供查表）。
+        //    繁中「五塊」→ `5塊`（保留原字形），绝不上屏成 `5块`。
+        let out_unit = &chain.out_units[0];
+        let body = format!("{}{}", num_str, out_unit);
         // 单段链同样可带 per_unit（如「五块一斤」→ 单价限定词仍原样保留）
         match &chain.per_unit {
             Some(per) => format!("{}{}", body, per),
@@ -1371,9 +1539,11 @@ fn format_currency_chain(chain: &UnitChain, r: &CompiledRules) -> String {
 /// 小数 formatter，必须先同步更新本函数，否则 一斤二两 会静默变 1.2斤（见 itn-rules.toml 注释）。
 fn format_weight_chain(chain: &UnitChain) -> String {
     let mut out = String::new();
-    for (num_str, unit) in &chain.parts {
+    for (idx, (num_str, _unit)) in chain.parts.iter().enumerate() {
         out.push_str(num_str);
-        out.push_str(unit);
+        // 🔴 221 [B] 铁律：上屏用原串单位词（`parts[].1` 仅查表）。
+        //    繁中「一斤二兩」→ `1斤2兩`（保留原字形）。
+        out.push_str(&chain.out_units[idx]);
     }
     out
 }
@@ -1399,7 +1569,9 @@ fn format_time_chain(chain: &UnitChain, r: &CompiledRules) -> String {
 }
 
 fn format_generic_chain(chain: &UnitChain, r: &CompiledRules) -> String {
+    // 查表用影子单位（`parts[].1`），上屏用原串单位（`out_units[0]`）—— 221 [B] 铁律
     let main_unit = &chain.parts[0].1;
+    let out_main_unit = &chain.out_units[0];
     let main_mult = r.hierarchy_value(main_unit, chain.family).unwrap_or(1.0);
     let mut total: f64 = 0.0;
     for (num_str, unit) in &chain.parts {
@@ -1408,11 +1580,11 @@ fn format_generic_chain(chain: &UnitChain, r: &CompiledRules) -> String {
         total += n * mult / main_mult;
     }
     if total.fract() == 0.0 {
-        format!("{}{}", total as u64, main_unit)
+        format!("{}{}", total as u64, out_main_unit)
     } else {
         let s = format!("{:.4}", total);
         let s = s.trim_end_matches('0').trim_end_matches('.');
-        format!("{}{}", s, main_unit)
+        format!("{}{}", s, out_main_unit)
     }
 }
 
@@ -1423,23 +1595,27 @@ fn format_generic_chain(chain: &UnitChain, r: &CompiledRules) -> String {
 #[derive(Debug, Clone)]
 struct ImplicitDecimal {
     main_num: String,
+    /// **影子单位**：查表用（`unit_families`/`hierarchy_value`）。
     unit_word: String,
+    /// 🔴 221 [B] 铁律：**原串单位词**，上屏用（繁中保留原字形）。
+    out_unit: String,
     tail: String,
     consumed: usize,
 }
 
 /// 乙型识别器：`N<可小数化单位>M`，M 纯数字尾数后紧邻边界。
 fn try_parse_implicit_decimal(
-    chars: &[char],
+    shadow: &[char],
+    orig: &[char],
     start: usize,
     r: &CompiledRules,
 ) -> Option<ImplicitDecimal> {
-    let (main_num, num_consumed) = parse_cn_number(chars, start, Some(r))?;
+    let (main_num, num_consumed) = parse_cn_number(shadow, start, Some(r))?;
     if num_consumed == 0 {
         return None;
     }
     let after_num = start + num_consumed;
-    let rest: String = chars[after_num..].iter().collect();
+    let rest: String = shadow[after_num..].iter().collect();
     if !r.is_decimalizable(&rest) {
         return None;
     }
@@ -1447,16 +1623,18 @@ fn try_parse_implicit_decimal(
     if r.date_suffixes.iter().any(|d| rest.starts_with(d.as_str())) && !rest.starts_with("度") {
         return None;
     }
-    let (unit_len, unit_word) = r.match_unit_word(chars, after_num)?;
+    // 🔴 221 [B]：长度/匹配取影子串，单位词上屏取原串
+    let (unit_len, unit_word) = r.match_unit_word(shadow, after_num)?;
+    let out_unit: String = orig[after_num..after_num + unit_len].iter().collect();
     let after_unit = after_num + unit_len;
     let mut tail_chars: Vec<char> = Vec::new();
     let mut pos = after_unit;
-    while pos < chars.len() {
-        if let Some(d) = chinese_digit_char(chars[pos]) {
+    while pos < shadow.len() {
+        if let Some(d) = chinese_digit_char(shadow[pos]) {
             // ITN-FIX-CURRENCY-017：尾数遇到单位词开头 → 终止。`一斤二两` 的「两」是重量
             // 单位而非小数位（两=2 兼数字，会被 chinese_digit_char 吞进尾数 → 1.22斤）。
             // `三块两毛` 的「两」同理：乙型让位，由丙型按显式链 [3块,2毛] 处理。
-            if r.match_unit_word(chars, pos).is_some() {
+            if r.match_unit_word(shadow, pos).is_some() {
                 break;
             }
             tail_chars.push(d);
@@ -1469,13 +1647,14 @@ fn try_parse_implicit_decimal(
         return None;
     }
     // 边界护栏：尾数后必须紧邻边界
-    if pos < chars.len() && !is_boundary_char(chars[pos]) {
+    if pos < shadow.len() && !is_boundary_char(shadow[pos]) {
         return None;
     }
     let tail: String = tail_chars.iter().collect();
     Some(ImplicitDecimal {
         main_num,
         unit_word,
+        out_unit,
         tail,
         consumed: pos - start,
     })
@@ -1525,7 +1704,8 @@ fn format_implicit_decimal(id: &ImplicitDecimal, r: &CompiledRules) -> String {
             format!("{}元", s)
         }
     } else {
-        format!("{}.{}{}", id.main_num, id.tail, id.unit_word)
+        // 🔴 221 [B] 铁律：上屏用原串单位词（`unit_word` 是影子单位，仅查表用）
+        format!("{}.{}{}", id.main_num, id.tail, id.out_unit)
     }
 }
 
@@ -1538,10 +1718,15 @@ fn format_implicit_decimal(id: &ImplicitDecimal, r: &CompiledRules) -> String {
 struct RemainderSuffix {
     /// 主数（阿拉伯数字串，如 "4"/"1"/"39"）
     main_num: String,
-    /// 单位词原文（如 "点"/"吨"/"寸"）；量词穿透时为通用量词（"个"），真实单位在 `real_unit`
+    /// **影子单位词**（如 "点"/"吨"/"寸"）；量词穿透时为通用量词（"个"），真实单位在 `real_unit`。
+    /// 仅用于判定（`format_remainder_suffix` 的 `unit_word == "点"` 时间族判据）。
     unit_word: String,
-    /// 量词穿透：若 `unit_word` 是通用量词且后跟真实单位，此处存真实单位；否则 None
+    /// **影子真实单位**（量词穿透时）；仅用于判定 `is_time`。
     real_unit: Option<String>,
+    /// 🔴 221 [B] 铁律：与 `unit_word` 对应的**原串单位词**，仅用于上屏（繁中保留原字形）。
+    out_unit: String,
+    /// 🔴 221 [B] 铁律：与 `real_unit` 对应的**原串真实单位**，仅用于上屏。
+    out_real_unit: Option<String>,
     /// 余数值（分钟数用于时间族，或 0.5 用于度量衡）
     remainder: RemainderKind,
     /// 识别器消耗的源字符数
@@ -1567,27 +1752,35 @@ enum RemainderKind {
 /// - `半小时`/`半个小时`：前置 `半` 无主数 → 不匹配
 /// - `三点五`：`五` 是数字非 `半/刻` → 不匹配
 fn try_parse_remainder_suffix(
-    chars: &[char],
+    shadow: &[char],
+    orig: &[char],
     start: usize,
     r: &CompiledRules,
 ) -> Option<RemainderSuffix> {
     // 解析主数
-    let (main_num, num_consumed) = parse_cn_number(chars, start, Some(r))?;
+    let (main_num, num_consumed) = parse_cn_number(shadow, start, Some(r))?;
     if num_consumed == 0 {
         return None;
     }
     let after_num = start + num_consumed;
-    let rest: String = chars[after_num..].iter().collect();
+    let rest: String = shadow[after_num..].iter().collect();
 
-    // 尝试半模式：N<单位>半
-    if let Some(rs) =
-        try_parse_half_mode(chars, start, &main_num, num_consumed, after_num, &rest, r)
-    {
+    // 尝试半模式：N<单位>半（需原串取上屏单位词）
+    if let Some(rs) = try_parse_half_mode(
+        shadow,
+        orig,
+        start,
+        &main_num,
+        num_consumed,
+        after_num,
+        &rest,
+        r,
+    ) {
         return Some(rs);
     }
-    // 尝试刻模式：N点M刻（仅时间）
+    // 尝试刻模式：N点M刻（仅时间；输出为 H:MM，无单位字形，不需要原串）
     if let Some(rs) =
-        try_parse_quarter_mode(chars, start, &main_num, num_consumed, after_num, &rest, r)
+        try_parse_quarter_mode(shadow, start, &main_num, num_consumed, after_num, &rest, r)
     {
         return Some(rs);
     }
@@ -1595,8 +1788,11 @@ fn try_parse_remainder_suffix(
 }
 
 /// 半模式：N<单位>半
+///
+/// 🔴 221 [B] 铁律：匹配/判据取 `shadow`，上屏单位词取 `orig`（同下标）。
 fn try_parse_half_mode(
-    _chars: &[char],
+    shadow: &[char],
+    orig: &[char],
     _start: usize,
     main_num: &str,
     num_consumed_inner: usize,
@@ -1607,12 +1803,15 @@ fn try_parse_half_mode(
     // 时间族：date_suffix（点/分/秒）+ 半
     if let Some(len) = r.match_date_suffix_len(rest) {
         let after_unit = after_num + len;
-        if _chars.get(after_unit) == Some(&'半') {
-            let word: String = _chars[after_num..after_num + len].iter().collect();
+        if shadow.get(after_unit) == Some(&'半') {
+            let sw: String = shadow[after_num..after_num + len].iter().collect();
+            let ow: String = orig[after_num..after_num + len].iter().collect();
             return Some(RemainderSuffix {
                 main_num: main_num.to_string(),
-                unit_word: word,
+                unit_word: sw,
                 real_unit: None,
+                out_unit: ow,
+                out_real_unit: None,
                 remainder: RemainderKind::Half,
                 consumed: num_consumed_inner + len + 1,
             });
@@ -1620,13 +1819,16 @@ fn try_parse_half_mode(
     }
     // 度量衡族：真单位（排除 classifiers）+ 半
     if r.is_real_unit(rest) {
-        let (len, word) = r.match_unit_word(_chars, after_num)?;
+        let (len, sw) = r.match_unit_word(shadow, after_num)?;
+        let ow: String = orig[after_num..after_num + len].iter().collect();
         let after_unit = after_num + len;
-        if _chars.get(after_unit) == Some(&'半') {
+        if shadow.get(after_unit) == Some(&'半') {
             return Some(RemainderSuffix {
                 main_num: main_num.to_string(),
-                unit_word: word,
+                unit_word: sw,
                 real_unit: None,
+                out_unit: ow,
+                out_real_unit: None,
                 remainder: RemainderKind::Half,
                 consumed: num_consumed_inner + len + 1,
             });
@@ -1641,24 +1843,28 @@ fn try_parse_half_mode(
     let cls_len = cls.chars().count();
     let after_cls = after_num + cls_len;
     // 量词后必须是「半」
-    if _chars.get(after_cls) != Some(&'半') {
+    if shadow.get(after_cls) != Some(&'半') {
         return None;
     }
     let after_half = after_cls + 1;
-    if after_half >= _chars.len() {
+    if after_half >= shadow.len() {
         return None;
     }
     // 半后必须是真单位
-    let rest2: String = _chars[after_half..].iter().collect();
+    let rest2: String = shadow[after_half..].iter().collect();
     if !r.is_real_unit(&rest2) {
         return None;
     }
-    let (real_len, real_word) = r.match_unit_word(_chars, after_half)?;
-    let cls_word: String = _chars[after_num..after_num + cls_len].iter().collect();
+    let (real_len, real_sw) = r.match_unit_word(shadow, after_half)?;
+    let real_ow: String = orig[after_half..after_half + real_len].iter().collect();
+    let cls_sw: String = shadow[after_num..after_num + cls_len].iter().collect();
+    let cls_ow: String = orig[after_num..after_num + cls_len].iter().collect();
     Some(RemainderSuffix {
         main_num: main_num.to_string(),
-        unit_word: cls_word,
-        real_unit: Some(real_word),
+        unit_word: cls_sw,
+        real_unit: Some(real_sw),
+        out_unit: cls_ow,
+        out_real_unit: Some(real_ow),
         remainder: RemainderKind::Half,
         consumed: num_consumed_inner + cls_len + 1 + real_len,
     })
@@ -1702,6 +1908,9 @@ fn try_parse_quarter_mode(
         main_num: main_num.to_string(),
         unit_word: "点".to_string(),
         real_unit: None,
+        // 时间族输出形如 H:MM（纯 ASCII，无单位字形）⇒ 原串字段与影子同值即可
+        out_unit: "点".to_string(),
+        out_real_unit: None,
         remainder: RemainderKind::Quarter(m),
         consumed: num_consumed_inner + 1 + m_consumed + 1,
     })
@@ -1709,7 +1918,8 @@ fn try_parse_quarter_mode(
 
 /// 甲型 formatter：按单位族分派渲染（DEC-037）。
 fn format_remainder_suffix(rs: &RemainderSuffix) -> String {
-    let unit = rs.real_unit.as_ref().unwrap_or(&rs.unit_word);
+    // 🔴 221 [B] 铁律：判定看影子字段，上屏取原串字段
+    let unit = rs.out_real_unit.as_ref().unwrap_or(&rs.out_unit);
     let is_time = rs.real_unit.is_none() && rs.unit_word == "点";
 
     if is_time {
@@ -1858,34 +2068,73 @@ fn check_chain_consistency(chars: &[char], start: usize, r: &CompiledRules) -> b
     !(any_convert && any_not_convert)
 }
 
+/// V091-ITN-HANT-SYSTEMIC-221：单字繁→简（**字形级**）。
+///
+/// 用 `Variant::ZhHans`（脚本变体，**无地区词汇替换**）——`ZhCN`/`ZhTW` 带地区词表，
+/// 会做「計算機→计算机」这类超原意替换（221A 反面对照 `zhconv("後面", ZhTW) == "後麵"`）。
+/// 逐字构造保证影子串与原串 **1:1**（221A 全域 28,096 字实证：单字必得单字），
+/// 因此影子串下标与原串下标可共用。
+///
+/// 防御：万一未来规则表变更导致某字多字/零字，取首字或原字兜底，保证「每字必得一字」不漂移
+/// （配套 `debug_assert` 报错）。
+fn hant_to_hans_char(c: char) -> char {
+    let converted = zhconv(&c.to_string(), Variant::ZhHans);
+    let mut it = converted.chars();
+    let first = it.next().unwrap_or(c);
+    debug_assert!(
+        it.next().is_none(),
+        "221 前提被打破：ZhHans 单字映射产出了多字"
+    );
+    first
+}
+
 fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
-    let chars: Vec<char> = text.chars().collect();
+    let orig: Vec<char> = text.chars().collect();
+    // V091-ITN-HANT-SYSTEMIC-221 · 步骤 1（主 pass）：逐字繁→简构造【影子串】。
+    // 🔴 [B] 铁律：影子串只用于**判定**（查表 / 字符分类 / 匹配），原串只用于**输出**。
+    //    两者 1:1（`hant_to_hans_char` + 下方 debug_assert），故下标可直接共用。
+    let shadow: Vec<char> = orig.iter().copied().map(hant_to_hans_char).collect();
+    debug_assert_eq!(
+        orig.len(),
+        shadow.len(),
+        "221 前提：影子串与原串必须 1:1（否则索引对齐失效）"
+    );
     let mut result = String::new();
     let mut i = 0;
 
-    while i < chars.len() {
+    while i < shadow.len() {
         // 检查保护白名单（最长匹配优先）——在甲型文法之前。
         // 理由：保护词表（如「五一」）应优先于甲型文法，避免「五一点半」被甲型
         // 误转为「51:30」。移除的甲型词条（八点半等）不再命中保护，自然落入甲型。
-        if let Some(skip) = check_protection(&chars, i, r) {
-            // 输出受保护的原文
-            for ch in &chars[i..i + skip] {
+        if let Some(skip) = check_protection(&shadow, i, r) {
+            // 输出受保护的原文（🔴 原串）
+            for ch in &orig[i..i + skip] {
                 result.push(*ch);
             }
             i += skip;
             continue;
         }
+        // ITN-FIX-YIKE-216 (V091)：指示代词 + 单字「一」的虚指「一」不进入任何数字文法。
+        // 🔴 位置必须在甲型之前：`那一年半` 会被甲型半模式（`try_parse_remainder_suffix`）
+        // 抢先吃成 `那1.5年`，只在 decide_conversion 里挡，管不到甲/乙/丙三条路径。
+        // 判据、边界与「刻意选择」说明见 is_demonstrative_yi 注释。
+        // 🔴 221：判据走影子串 ⇒ 条件② 的 `這`/`麼` 分支变为冗余双保险（刻意保留，见其 doc）。
+        if is_demonstrative_yi(&shadow, i, r) {
+            result.push(orig[i]);
+            i += 1;
+            continue;
+        }
         // ITN-V2-003 (P3 甲型文法)：余数后缀（半/刻）匹配。
-        if is_cn_num_char(chars[i]) || chars[i] == '零' || chars[i] == '〇' {
-            if let Some(rs) = try_parse_remainder_suffix(&chars, i, r) {
+        if is_cn_num_char(shadow[i]) || shadow[i] == '零' || shadow[i] == '〇' {
+            if let Some(rs) = try_parse_remainder_suffix(&shadow, &orig, i, r) {
                 result.push_str(&format_remainder_suffix(&rs));
                 i += rs.consumed;
                 continue;
             }
         }
         // ITN-V2-004 (P4 乙型)：隐式小数位 N<可小数化单位>M（M后紧邻边界）。
-        if is_cn_num_char(chars[i]) || chars[i] == '零' || chars[i] == '〇' {
-            if let Some(id) = try_parse_implicit_decimal(&chars, i, r) {
+        if is_cn_num_char(shadow[i]) || shadow[i] == '零' || shadow[i] == '〇' {
+            if let Some(id) = try_parse_implicit_decimal(&shadow, &orig, i, r) {
                 result.push_str(&format_implicit_decimal(&id, r));
                 i += id.consumed;
                 continue;
@@ -1893,8 +2142,8 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
         }
         // ITN-V2-004 (P4 丙型)：显式多级单位链（取代③，用break不return None）。
         // 货币归一(11.92元)/时间H:MM(3:20)/度量衡小数合并。
-        if is_cn_num_char(chars[i]) || chars[i] == '零' || chars[i] == '〇' {
-            if let Some(chain) = try_parse_unit_chain(&chars, i, r) {
+        if is_cn_num_char(shadow[i]) || shadow[i] == '零' || shadow[i] == '〇' {
+            if let Some(chain) = try_parse_unit_chain(&shadow, &orig, i, r) {
                 result.push_str(&format_unit_chain(&chain, r));
                 i += chain.consumed;
                 continue;
@@ -1904,9 +2153,9 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
         // 检查百分比 "百分之X"
         if !r.percentage_prefix.is_empty() {
             let prefix_chars: Vec<char> = r.percentage_prefix.chars().collect();
-            if chars_match(&chars, i, &prefix_chars) {
+            if chars_match(&shadow, i, &prefix_chars) {
                 let after = i + prefix_chars.len();
-                if let Some((num_str, consumed)) = parse_cn_number(&chars, after, Some(r)) {
+                if let Some((num_str, consumed)) = parse_cn_number(&shadow, after, Some(r)) {
                     if consumed > 0 {
                         result.push_str(&num_str);
                         result.push('%');
@@ -1919,7 +2168,7 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
 
         // 检查分数 "X分之Y"
         if !r.fraction_pattern.is_empty() {
-            if let Some(frac_info) = try_parse_fraction(&chars, i, r) {
+            if let Some(frac_info) = try_parse_fraction(&shadow, i, r) {
                 let (numerator, denominator, total_consumed) = frac_info;
                 result.push_str(&numerator);
                 result.push('/');
@@ -1930,10 +2179,10 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
         }
 
         // 检查序数 "第X..."
-        if !r.ordinal_prefix.is_empty() && chars[i] == r.ordinal_prefix.chars().next().unwrap() {
+        if !r.ordinal_prefix.is_empty() && shadow[i] == r.ordinal_prefix.chars().next().unwrap() {
             // "第" 后面跟数字
             let after = i + 1;
-            if let Some((num_str, consumed)) = parse_cn_number(&chars, after, Some(r)) {
+            if let Some((num_str, consumed)) = parse_cn_number(&shadow, after, Some(r)) {
                 if consumed > 0 {
                     result.push(r.ordinal_prefix.chars().next().unwrap());
                     result.push_str(&num_str);
@@ -1944,13 +2193,13 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
         }
 
         // 检查经纬度前缀 "东经X度"
-        if let Some(prefix_len) = match_geo_prefix(&chars, i, r) {
+        if let Some(prefix_len) = match_geo_prefix(&shadow, i, r) {
             // 前缀后跟数字+度
             let after = i + prefix_len;
-            if let Some((num_str, consumed)) = parse_cn_number(&chars, after, Some(r)) {
+            if let Some((num_str, consumed)) = parse_cn_number(&shadow, after, Some(r)) {
                 if consumed > 0 {
-                    // 输出前缀
-                    for ch in &chars[i..after] {
+                    // 输出前缀（🔴 原串）
+                    for ch in &orig[i..after] {
                         result.push(*ch);
                     }
                     result.push_str(&num_str);
@@ -1961,23 +2210,23 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
         }
 
         // 检查日期时间前缀 "上午X点" "下午X点"
-        if let Some(prefix_len) = match_date_prefix(&chars, i, r) {
+        if let Some(prefix_len) = match_date_prefix(&shadow, i, r) {
             let after = i + prefix_len;
             // ITN-V2-FIX-TIMEPREFIX-001：文法优先让位 —— 若数字位置能被甲/乙/丙型识别，
             // 只输出前缀并把游标交还主循环，让下一轮迭代正常走文法分支（如「下午四点三刻」→
             // 甲型刻模式产出 4:45）。否则时段词分支会抢先消费数字导致甲型被跳过。
             // 主控修正：必须用 get() 越界安全取字符。match_date_prefix 只做 starts_with，
             // 对前缀之后是否还有字符无任何要求 —— 文本恰好以时段词结尾（「改到明天下午」
-            // 「那就晚上」）时 after == chars.len()，直接索引 chars[after] 会 panic。
-            if chars
+            // 「那就晚上」）时 after == shadow.len()，直接索引 shadow[after] 会 panic。
+            if shadow
                 .get(after)
                 .is_some_and(|c| is_cn_num_char(*c) || *c == '零' || *c == '〇')
             {
-                if try_parse_remainder_suffix(&chars, after, r).is_some()
-                    || try_parse_implicit_decimal(&chars, after, r).is_some()
-                    || try_parse_unit_chain(&chars, after, r).is_some()
+                if try_parse_remainder_suffix(&shadow, &orig, after, r).is_some()
+                    || try_parse_implicit_decimal(&shadow, &orig, after, r).is_some()
+                    || try_parse_unit_chain(&shadow, &orig, after, r).is_some()
                 {
-                    for ch in &chars[i..after] {
+                    for ch in &orig[i..after] {
                         result.push(*ch);
                     }
                     i = after;
@@ -1985,14 +2234,14 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
                 }
             }
             // 前缀后跟数字+时间后缀
-            if let Some((num_str, consumed)) = parse_cn_number(&chars, after, Some(r)) {
+            if let Some((num_str, consumed)) = parse_cn_number(&shadow, after, Some(r)) {
                 if consumed > 0 {
                     // 检查后面是否有时间后缀
                     let after_num = after + consumed;
-                    if after_num < chars.len()
-                        && r.is_date_suffix(&chars[after_num..].iter().collect::<String>())
+                    if after_num < shadow.len()
+                        && r.is_date_suffix(&shadow[after_num..].iter().collect::<String>())
                     {
-                        for ch in &chars[i..after] {
+                        for ch in &orig[i..after] {
                             result.push(*ch);
                         }
                         result.push_str(&num_str);
@@ -2000,7 +2249,7 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
                         continue;
                     }
                     // 前缀后面不是时间后缀 → 不转换
-                    for ch in &chars[i..after] {
+                    for ch in &orig[i..after] {
                         result.push(*ch);
                     }
                     i = after;
@@ -2010,28 +2259,28 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
         }
 
         // 检查负数前缀 "零下X度"
-        if let Some((is_neg, prefix_consumed)) = parse_negative_prefix(&chars, i) {
+        if let Some((is_neg, prefix_consumed)) = parse_negative_prefix(&shadow, i) {
             let after = i + prefix_consumed;
-            if let Some((num_str, consumed)) = parse_cn_number(&chars, after, Some(r)) {
+            if let Some((num_str, consumed)) = parse_cn_number(&shadow, after, Some(r)) {
                 if consumed > 0 {
                     // 检查后面是否有单位
                     let after_num = after + consumed;
-                    let after_str: String = chars[after_num..].iter().collect();
+                    let after_str: String = shadow[after_num..].iter().collect();
                     if r.is_unit(&after_str) || r.is_date_suffix(&after_str) {
                         // 输出负号或文本风格
                         if r.below_zero_style == "minus" {
                             result.push('-');
                             result.push_str(&num_str);
                         } else {
-                            // "text" 风格：零下10度
-                            for ch in &chars[i..after] {
+                            // "text" 风格：零下10度（前缀取原串）
+                            for ch in &orig[i..after] {
                                 result.push(*ch);
                             }
                             result.push_str(&num_str);
                         }
                         // TEMP-CELSIUS-001: 摄氏关键词 → 输出 ℃ 符号
                         // 与 below_zero_style 联动（minus→"-10℃"，text→"零下10℃"）
-                        if let Some((unit_len, unit_word)) = r.match_unit_word(&chars, after_num) {
+                        if let Some((unit_len, unit_word)) = r.match_unit_word(&shadow, after_num) {
                             if unit_word.contains("摄氏") {
                                 result.push_str("℃");
                                 i = after_num + unit_len;
@@ -2042,7 +2291,7 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
                         continue;
                     }
                     // 无单位 → 不转换
-                    for ch in &chars[i..after] {
+                    for ch in &orig[i..after] {
                         result.push(*ch);
                     }
                     i = after;
@@ -2052,20 +2301,20 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
         }
 
         // 检查中文数字 + 单位语境
-        if is_cn_num_char(chars[i]) || (chars[i] == '零' || chars[i] == '〇') {
+        if is_cn_num_char(shadow[i]) || (shadow[i] == '零' || shadow[i] == '〇') {
             // 尝试解析数字
-            if let Some((num_str, consumed)) = parse_cn_number(&chars, i, Some(r)) {
+            if let Some((num_str, consumed)) = parse_cn_number(&shadow, i, Some(r)) {
                 if consumed > 0 {
                     let after_num = i + consumed;
-                    let after_str: String = if after_num < chars.len() {
-                        chars[after_num..].iter().collect()
+                    let after_str: String = if after_num < shadow.len() {
+                        shadow[after_num..].iter().collect()
                     } else {
                         String::new()
                     };
 
                     // 判定语境
                     let should_convert =
-                        decide_conversion(&num_str, consumed, &chars, i, after_num, &after_str, r);
+                        decide_conversion(&num_str, consumed, &shadow, i, after_num, &after_str, r);
 
                     if should_convert {
                         // ITN-V2-004 (P4 任务C) 全或无撕裂防护：
@@ -2074,10 +2323,10 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
                         // 这是逐字路径的守门员（甲/乙/丙型已在前面处理，此处只管逐字路径）。
                         // 链定义：连续「中文数字+单位/date_suffix/classifier」序列，
                         // 终止于非数字非单位非量词字符（如的/有/班非单位）。
-                        if !check_chain_consistency(&chars, i, r) {
-                            // 链中混合 → 整段原样输出，游标跳过整个链
-                            let chain_end = scan_chain_end(&chars, i, r);
-                            for ch in &chars[i..chain_end] {
+                        if !check_chain_consistency(&shadow, i, r) {
+                            // 链中混合 → 整段原样输出，游标跳过整个链（🔴 原串）
+                            let chain_end = scan_chain_end(&shadow, i, r);
+                            for ch in &orig[i..chain_end] {
                                 result.push(*ch);
                             }
                             i = chain_end;
@@ -2087,7 +2336,7 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
                         // TEMP-CELSIUS-001: 摄氏关键词 → 输出 ℃ 符号
                         // 仅当匹配单位词含"摄氏"时替换（"三十摄氏度"→"30℃"，
                         // "三十度"→"30度" 不变）。after_num 处即单位起点。
-                        if let Some((unit_len, unit_word)) = r.match_unit_word(&chars, after_num) {
+                        if let Some((unit_len, unit_word)) = r.match_unit_word(&shadow, after_num) {
                             if unit_word.contains("摄氏") {
                                 result.push_str("℃");
                                 i = after_num + unit_len;
@@ -2101,8 +2350,8 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
             }
         }
 
-        // 普通字符，原样输出
-        result.push(chars[i]);
+        // 普通字符，原样输出（🔴 原串）
+        result.push(orig[i]);
         i += 1;
     }
 
@@ -2125,19 +2374,28 @@ fn normalize_unit_symbols(text: &str, r: &CompiledRules) -> String {
     if r.unit_symbol_rules.is_empty() {
         return text.to_string();
     }
-    let chars: Vec<char> = text.chars().collect();
-    let mut result = String::with_capacity(chars.len());
+    let orig: Vec<char> = text.chars().collect();
+    // V091-ITN-HANT-SYSTEMIC-221 · 步骤 2：后处理 pass 同守 [B] 铁律 ——
+    //   判定（trigger 表是简体，如「摄氏度」）查**影子串**，输出取**原串**。
+    //   繁中「40攝氏度」⇒ 影子 `40摄氏度` 命中 ⇒ 输出 `40℃`（被消费的 `攝氏度` 原字形随替换消失）。
+    let shadow: Vec<char> = orig.iter().copied().map(hant_to_hans_char).collect();
+    debug_assert_eq!(
+        orig.len(),
+        shadow.len(),
+        "221 前提：影子串与原串必须 1:1（否则索引对齐失效）"
+    );
+    let mut result = String::with_capacity(shadow.len());
     let mut i = 0;
 
-    while i < chars.len() {
+    while i < shadow.len() {
         // ITN-CELSIUS-003: try to match Arabic digits (with optional 零下/- prefix)
         // followed by a unit symbol trigger (摄氏度/摄氏/°C → ℃)
-        if let Some((output, input_len)) = try_match_arabic_symbol(&chars, i, r) {
+        if let Some((output, input_len)) = try_match_arabic_symbol(&shadow, &orig, i, r) {
             result.push_str(&output);
             i += input_len;
             continue;
         }
-        result.push(chars[i]);
+        result.push(orig[i]);
         i += 1;
     }
 
@@ -2148,62 +2406,70 @@ fn normalize_unit_symbols(text: &str, r: &CompiledRules) -> String {
 /// a unit symbol trigger. Returns (output_string, input_chars_consumed) on match.
 /// Handles below_zero_style for 零下 prefix.
 fn try_match_arabic_symbol(
-    chars: &[char],
+    shadow: &[char],
+    orig: &[char],
     pos: usize,
     r: &CompiledRules,
 ) -> Option<(String, usize)> {
-    try_match_neg_prefix_arabic_symbol(chars, pos, r)
-        .or_else(|| try_match_plain_arabic_symbol(chars, pos, r))
+    try_match_neg_prefix_arabic_symbol(shadow, orig, pos, r)
+        .or_else(|| try_match_plain_arabic_symbol(shadow, pos, r))
 }
 
 /// Match 零下 + Arabic digits + symbol trigger
+///
+/// 🔴 221 [B]：前缀/数字/token 判定取 `shadow`；text 风格回写的「零下」前缀取 `orig`（原字形）。
 fn try_match_neg_prefix_arabic_symbol(
-    chars: &[char],
+    shadow: &[char],
+    orig: &[char],
     pos: usize,
     r: &CompiledRules,
 ) -> Option<(String, usize)> {
     let neg_prefix: Vec<char> = "零下".chars().collect();
-    if pos + neg_prefix.len() > chars.len() {
+    if pos + neg_prefix.len() > shadow.len() {
         return None;
     }
-    if &chars[pos..pos + neg_prefix.len()] != neg_prefix.as_slice() {
+    if &shadow[pos..pos + neg_prefix.len()] != neg_prefix.as_slice() {
         return None;
     }
     let after_prefix = pos + neg_prefix.len();
-    let (digits_str, digits_len) = scan_arabic_digits(&chars[after_prefix..])?;
+    let (digits_str, digits_len) = scan_arabic_digits(&shadow[after_prefix..])?;
     if digits_len == 0 {
         return None;
     }
     let after_digits = after_prefix + digits_len;
-    let (trigger_len, replacement) = match_symbol_trigger(&chars[after_digits..], r)?;
+    let (trigger_len, replacement) = match_symbol_trigger(&shadow[after_digits..], r)?;
     let output = if r.below_zero_style == "minus" {
         format!("-{}{}", digits_str, replacement)
     } else {
-        format!("零下{}{}", digits_str, replacement)
+        // 前缀取原串（1:1 同下标）；「零下」繁简同形，此写法为 [B] 的形式化落点
+        let prefix: String = orig[pos..pos + neg_prefix.len()].iter().collect();
+        format!("{}{}{}", prefix, digits_str, replacement)
     };
     let input_len = neg_prefix.len() + digits_len + trigger_len;
     Some((output, input_len))
 }
 
 /// Match plain Arabic digits (+ optional leading -) + symbol trigger
+///
+/// 输出仅含 ASCII 数字 + replacement（如 `℃`），无输入字形被回写，故只需影子串。
 fn try_match_plain_arabic_symbol(
-    chars: &[char],
+    shadow: &[char],
     pos: usize,
     r: &CompiledRules,
 ) -> Option<(String, usize)> {
     let mut start = pos;
     let mut has_minus = false;
     // Optional leading minus sign
-    if pos < chars.len() && chars[pos] == '-' {
+    if pos < shadow.len() && shadow[pos] == '-' {
         has_minus = true;
         start = pos + 1;
     }
-    let (digits_str, digits_len) = scan_arabic_digits(&chars[start..])?;
+    let (digits_str, digits_len) = scan_arabic_digits(&shadow[start..])?;
     if digits_len == 0 {
         return None;
     }
     let after_digits = start + digits_len;
-    let (trigger_len, replacement) = match_symbol_trigger(&chars[after_digits..], r)?;
+    let (trigger_len, replacement) = match_symbol_trigger(&shadow[after_digits..], r)?;
     let output = if has_minus {
         format!("-{}{}", digits_str, replacement)
     } else {
@@ -2357,6 +2623,87 @@ fn is_virtual_two_phrase(chars: &[char], start: usize) -> bool {
         }
     }
     false
+}
+
+/// ITN-FIX-YIKE-216 (V091)：判定位置 `i` 的「一」是否为「指示代词 + 一」里的虚指成分。
+/// 命中则主循环原样输出该「一」，不进入任何数字文法（甲/乙/丙型 + 逐字路径）。
+///
+/// ## 语言学判据（主控 2026-09-17 拍板）
+/// `那一刻 / 这一年 / 每一分钟 / 这一点我同意` 里的「一」是指示代词短语（这一 / 那一 / 每一）
+/// 的构词成分，语义 =「这个（时刻/年/点）」，**不计数**，故不得转阿拉伯数字。
+///
+/// ## 反面对照（🔴 看清，别把本护栏推广）
+/// - `那两年` 的「两」、`那三个` 的「三」是**真计数** → `那2年` / `那3个` 是正确输出；
+///   本护栏只认单字「一」，绝不碰它们（挡了反而是新 bug）。
+/// - `第一年` 走 ordinal 分支（`:1933` → `第1年`），本护栏不插手。
+/// - `那两天` 现状保持汉字，是因为 `天` 不在 units / date_suffix / classifier 任何一张表里
+///   （无转换触发），与本护栏无关。
+///
+/// ## 三道判据（缺一不可）
+/// ① `chars[i] == '一'` —— 只认单字，理由见 ③。
+/// ② 前一字是指示代词 {这, 這, 那, 每, 哪, 某}；或「那么 / 这么」形式
+///    （前一字 `么` 或 `麼`，且前两字 ∈ {这, 這, 那}）。**裸「么 / 麼」不算** ——
+///    `怎么一年` / `要么一年` 的「么」不是指示代词，不得借道通过。
+///    🔴 V091-ITN-YIKE-HANT-220：`這` / `麼` 是繁中异形字，必须一并覆盖。
+///    那 / 每 / 哪 / 某 繁简同形，无需重复；`這` / `麼` 是条件②里**唯一**需要补的异形字。
+/// ③ 🔴 后一字命中 `date_time.triggers.suffix`（{年,月,日,号,点,分,秒,刻}）。
+///
+/// ### 为什么必须有 ③（本单最容易写错的一格，[ITN-LOCAL-RULE-OVERREACH-001] 的形状）
+/// 闸门位于甲/乙/丙型与 `parse_cn_number` **之前**，此刻还不知道「一」会被解析成几个字。
+/// 若只判 ①+②（「前字是这/那 + 当前字是一 + 后字非数字」），`这一块八`（真数量，
+/// 现状 `这1.8元`）的「一」会被当成孤立字拦下 → 乙型隐式小数（`:1887`）与丙型链
+/// （`try_parse_unit_chain`，`:1123`）整条被跳过 → 输出退化成 `这一块8`。
+/// 同族回归面还有 `这一块两毛`（1.2元）、`这一块五`（1.5元）。
+/// 加 ③ 之后，白名单天然蕴含「一 后不接数字/进位字」：
+/// `一` 后只要接 百/千/万/十/两/零… 中任一，串首字就**不是**时间后缀字 →
+/// `is_date_suffix` 为假 → 闸门不放行 → 原路照转：
+///   `那一百年` → `那100年`　　`这一十年` → `这10年`
+///   `那一千米` → `那1000米`　　`这一万` → `这1万`
+/// ③ 走 `r.is_date_suffix` 表驱动而非硬编码 8 个字 —— toml 增删后缀时闸门自动跟随。
+///
+/// ## 管到哪 / 不管到哪
+/// - 管：{这,這,那,每,哪,某} + 单字「一」+ 时间后缀；「那么 / 這麼 / 這么」+ 单字「一」+ 时间后缀。
+/// - 不管：其它数字（那两年 / 那三个）、序数（第一年）、非时间单位（这一块八 / 这一块五）、
+///   裸「么 / 麼」（怎么一年 / 要么一年）。
+///
+/// ## 已知边界（🔴 刻意选择，不是「暂不支持」，不许后人当漏的来补）
+/// `这一点五`（1.5）、`这一点半`（1:30）会被本闸门判为时间指代而保持汉字。刻意接受，理由：
+/// 1. `这一点` 在中文里压倒性是「这个观点 / 这一方面」（`这一点我同意`），保持汉字才是对的 ——
+///    为「这一点五」放行会把这个高频正确用法一起打坏；
+/// 2. 「这一点五 / 这一点半」是罕见说法，真要讲 1:30 的人通常不带「这」；
+/// 3. `:2977-3013` 的历史注释证明「一点半 / 一点点」一带是雷区，
+///    为罕见输入再加「点后跟数字或半就放行」的分支，回归风险大于收益
+///    （feedback_no_overengineering：收益不明确就不加）。
+///
+/// ### 时间量词「刻」族（V091-ITN-YIKE-HANT-220 补记，🔴 同属刻意选择）
+/// `N点M刻` 走甲型刻模式（`try_parse_quarter_mode:1668`）。本闸门③只判「后首字命中时间后缀」，
+/// **无法区分**「一」是孤立数字还是 `N点M刻` 的 N —— 故 `这一点一刻` / `这一点三刻` 会保持「一」，
+/// 而后续数字仍由 `decide_conversion`（`:2284`）照转 → 输出 `这一点1刻` / `这一点3刻`
+/// （无闸门时原行为是 `这1:15` / `这1:45`，即「前半保持、后半照转」的半转换）。
+/// 🔴 **刻意接受，不是「暂不支持」也不是「待优化」**（主控 2026-09-17 裁定），三条理由：
+/// 1. 半转结果虽丑，但触发它需要说出「这一点一刻」这种句子，实际语流里基本不存在；
+/// 2. 它是「这一点」被正确保护的副产物，而「这一点」（=这个观点）高频且必须保护 ——
+///    为消除副产物去动闸门，等于拿高频正确去换低频丑陋；
+/// 3. `:2977-3013` 的历史注释证明「一点半 / 一点点」一带是雷区，
+///    加分支的回归风险大于收益。
+/// 现状断言（测试区）：`itn_v091_216_l_quarter_mode_undeclared_boundary`。
+fn is_demonstrative_yi(chars: &[char], i: usize, r: &CompiledRules) -> bool {
+    if chars.get(i) != Some(&'一') {
+        return false;
+    }
+    // ② 指示代词（含「那么 / 这么」形式；裸「么」不算）
+    // V091-ITN-YIKE-HANT-220：`這` / `麼` 为繁中异形字，一并覆盖。那/每/哪/某 繁简同形，不重复。
+    let prev_is_demonstrative =
+        i > 0 && matches!(chars[i - 1], '这' | '這' | '那' | '每' | '哪' | '某');
+    let prev_is_me_form = i > 1
+        && (chars[i - 1] == '么' || chars[i - 1] == '麼')
+        && matches!(chars[i - 2], '这' | '這' | '那');
+    if !prev_is_demonstrative && !prev_is_me_form {
+        return false;
+    }
+    // ③ 后一字是时间后缀（同时保证「一」是孤立单字，见函数注释）
+    let after: String = chars[i + 1..].iter().collect();
+    r.is_date_suffix(&after)
 }
 
 /// 检查保护白名单，返回匹配长度（0=未匹配）
@@ -4785,5 +5132,568 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     fn itn_v2_031_cross_module_wanyi_full_chain() {
         assert_eq!(normalize_test("万一"), "万一");
         assert_eq!(normalize_test("万一下雨呢"), "万一下雨呢");
+    }
+
+    // ============================================================
+    // V091-ITN-FIX-YIKE-216：指示代词 + 「一」虚指护栏
+    // ------------------------------------------------------------
+    // 根因：`decide_conversion` 的 `is_date_suffix(after_str)` 不区分「数量词一」与
+    //       「指示代词构词成分一」→ 那一刻 → 那1刻。
+    // 闸门：`normalize_with_rules` 主循环 `check_protection` 之后、甲型之前
+    //       （甲型抢跑是 `那一年半` 的关键路径，只在 decide_conversion 挡管不到）。
+    // 判据/边界/刻意选择说明见 `is_demonstrative_yi` 注释。
+    // ⚠️ 本批断言为**静态逐行 trace 推得**（阶段一禁 cargo test），阶段四须实跑复核。
+    // ============================================================
+
+    /// a 组：指示代词 + 一 + 刻（任务书原报）
+    #[test]
+    fn itn_v091_216_a_demonstrative_yi_ke_preserved() {
+        assert_eq!(normalize_test("那一刻"), "那一刻");
+        assert_eq!(normalize_test("这一刻"), "这一刻");
+        assert_eq!(normalize_test("每一刻"), "每一刻");
+        assert_eq!(normalize_test("哪一刻"), "哪一刻");
+        assert_eq!(normalize_test("某一刻"), "某一刻");
+    }
+
+    /// b 组：同族换单位 —— 「刻」只是撞上的那一个，年月日号点分秒同病
+    #[test]
+    fn itn_v091_216_b_same_family_temporal_suffixes() {
+        assert_eq!(normalize_test("那一年"), "那一年");
+        assert_eq!(normalize_test("每一年"), "每一年");
+        assert_eq!(normalize_test("那一个月"), "那一个月"); // 个 是量词，本就不转（非本闸门）
+        assert_eq!(normalize_test("那一日"), "那一日");
+        assert_eq!(normalize_test("那一号"), "那一号");
+        assert_eq!(normalize_test("这一点"), "这一点");
+        assert_eq!(normalize_test("这一秒"), "这一秒");
+        assert_eq!(normalize_test("那一分"), "那一分");
+        // 天 不在 units/date_suffix/classifier 任何一张表 → 现状已安全，非本闸门之功
+        assert_eq!(normalize_test("那一天"), "那一天");
+        // 🔴 甲型抢跑路径必须被同一闸门拦下（只改 decide_conversion 治不了）
+        assert_eq!(normalize_test("那一年半"), "那一年半");
+        assert_eq!(normalize_test("那一点半"), "那一点半");
+        // 拍板 1：「那么 / 这么」形式（裸「么」不算，见 f 组）
+        assert_eq!(normalize_test("那么一刻"), "那么一刻");
+        assert_eq!(normalize_test("这么一点"), "这么一点");
+        // 🔴 高频真实场景：`这一点` 压倒性是「这个观点」
+        assert_eq!(normalize_test("这一点我同意"), "这一点我同意");
+    }
+
+    /// c 组：真正需要转的正例，护栏不得误伤
+    #[test]
+    fn itn_v091_216_c_positive_cases_not_broken() {
+        assert_eq!(normalize_test("一刻钟"), "一刻钟"); // 碰撞保护表命中
+        assert_eq!(normalize_test("三点一刻"), "3:15"); // 甲型刻模式（前字=点，非指示代词）
+        assert_eq!(normalize_test("下午四点三刻见面"), "下午4:45见面");
+        assert_eq!(normalize_test("五点三刻"), "5:45");
+        assert_eq!(normalize_test("五分钟"), "5分钟");
+        assert_eq!(normalize_test("十点半"), "10:30");
+    }
+
+    /// d 组：🔴 越界红线（主控 2026-09-17）—— 这些「一」是真数字，
+    /// 闸门若只判「前字=这/那 + 当前字=一」就会误挡 → 本单引入新 bug。
+    /// 第三条件（后字必须是时间后缀）必须放行它们。
+    #[test]
+    fn itn_v091_216_d_overreach_guards_still_convert() {
+        assert_eq!(normalize_test("那一百年"), "那100年");
+        assert_eq!(normalize_test("那一千米"), "那1000米");
+        assert_eq!(normalize_test("这一十年"), "这10年");
+        assert_eq!(normalize_test("这一万"), "这1万");
+        // 这一万块：万后跟单位 → large_amount_keep_wan_yi 保守 break，现状即「整串保汉字」
+        // （同 `三万元`→`三万元`，:4344）。本闸门不触发 → 零变化（不是本单要求它转）。
+        assert_eq!(normalize_test("这一万块"), "这一万块");
+    }
+
+    /// e 组：🔴 本单发现「排除法判据」会开洞的直接证据（主控要求钉死）。
+    /// 闸门若只判「后字非数字」，下面三个的「一」会被拦成孤立字 →
+    /// 乙型隐式小数 / 丙型货币链被跳过 → 退化成 `这一块8` / `这一块2毛`，而不是 1.8元 / 1.2元。
+    #[test]
+    fn itn_v091_216_e_hole_evidence_currency_chains_intact() {
+        assert_eq!(normalize_test("这一块八"), "这1.8元");
+        assert_eq!(normalize_test("这一块两毛"), "这1.2元");
+        assert_eq!(normalize_test("这一块五"), "这1.5元");
+        // 对照：非指示代词语境的同形链不受影响
+        assert_eq!(normalize_test("一块八"), "1.8元");
+        assert_eq!(
+            normalize_test("这个西瓜是一块八一斤"),
+            "这个西瓜是1.8元一斤"
+        );
+    }
+
+    /// f 组：刻意选择边界 + 「不管」清单（理由见 is_demonstrative_yi 注释，🔴 不许后人当漏的补）
+    #[test]
+    fn itn_v091_216_f_declared_boundaries() {
+        // 刻意选择：指代读法优先（放行会打坏「这一点我同意」）
+        assert_eq!(normalize_test("这一点五"), "这一点五");
+        // 不管：真计数 —— 两 是真计数，转阿拉伯数字本就正确
+        assert_eq!(normalize_test("那两年"), "那2年");
+        // 不管：序数走 ordinal 分支，本就该转
+        assert_eq!(normalize_test("第一年"), "第1年");
+        // 不管：裸「么」不是指示代词，不得借道通过
+        assert_eq!(normalize_test("怎么一年"), "怎么1年");
+    }
+
+    // ============================================================
+    // TEST-SYNC-216（阶段三交叉护栏 · coder-1 独立推导，非 216 作者）
+    // 🔴 来源：只读生产代码独立推边界 → 写进 result.md ① → 再读 coder-2 的 a~f 组做差集。
+    // 本组只补 coder-2 **未覆盖**的边界；已覆盖的不重复。全部为静态 trace 推得，阶段四实跑复核。
+    // ============================================================
+
+    /// g 组：后缀「月」在指示代词语境（coder-2 b 组只测了「那一个月」=量词，没测「那一月」后缀路径）。
+    /// 同时补「这么/那么 + 一 + 时间后缀」（他只测了 这么一点 / 那么一刻，未测 +年）。
+    #[test]
+    fn itn_v091_216_g_month_suffix_and_me_form_with_year() {
+        assert_eq!(normalize_test("这一月"), "这一月");
+        assert_eq!(normalize_test("那一月"), "那一月");
+        assert_eq!(normalize_test("每一月"), "每一月");
+        assert_eq!(normalize_test("这么一年"), "这么一年");
+        assert_eq!(normalize_test("那么一年"), "那么一年");
+    }
+
+    /// h 组：裸「么」排除的完整族 + i==1 越界安全。
+    /// coder-2 只测「怎么一年」；这里补「要么/什么」两个前两字非 这/那 的形态，
+    /// 以及「么」落在首位（i==1，`i > 1` 守卫）——防裸么借道 + 防越界 panic。
+    #[test]
+    fn itn_v091_216_h_naked_me_variants_and_i1_boundary() {
+        assert_eq!(normalize_test("要么一年"), "要么1年");
+        assert_eq!(normalize_test("什么一年"), "什么1年");
+        // 前两字不是 这/那 的「么」，且 么 在首位 → 不得借道、不得 panic
+        assert_eq!(normalize_test("么一年"), "么1年");
+    }
+
+    /// i 组：i==0（无前字）与句尾越界安全 —— 闸门不得把无指示代词的真数字一并拦掉，
+    /// after 为空串时 `is_date_suffix("")` 必假、`chars[i+1..]` 不得 panic。
+    #[test]
+    fn itn_v091_216_i_no_prev_and_empty_after_safe() {
+        assert_eq!(normalize_test("一年"), "1年");
+        assert_eq!(normalize_test("一年半"), "1.5年");
+        // 句尾「一」：after 为空串
+        assert_eq!(normalize_test("那一"), "那一");
+        assert_eq!(normalize_test("某一"), "某一");
+    }
+
+    /// j 组：非「一」数字不得被闸门误伤（差集：coder-2 只有「那两年」，缺 十/三/量词形态）。
+    /// 「那三个」= 单字数字+通用量词 → `convert_single_digit_with_classifier=false` 明令不转，
+    /// 与闸门无关，一并锁住防后人把开关语义改坏后归因给 216。
+    #[test]
+    fn itn_v091_216_j_non_yi_digits_not_blocked() {
+        assert_eq!(normalize_test("那十年"), "那10年");
+        assert_eq!(normalize_test("那三年"), "那3年");
+        assert_eq!(normalize_test("那三个"), "那三个");
+    }
+
+    /// k 组：条件③放行的非日期单位（差集：coder-2 d/e 组只有进位字与货币链，
+    /// 缺「甲型半模式 + 度量衡/货币单位」形态）——这些「一」是真数量，必须照转。
+    #[test]
+    fn itn_v091_216_k_half_mode_non_date_units_convert() {
+        assert_eq!(normalize_test("这一吨半"), "这1.5吨");
+        assert_eq!(normalize_test("这一块半"), "这1.5块");
+    }
+
+    /// l 组：🔴 时间量词「刻」族边界（我独立推出、coder-2 doc 与 a~f 组**均未覆盖**）。
+    ///
+    /// `N点M刻` 走甲型刻模式（`try_parse_quarter_mode:1668`）。闸门③只判「后首字命中时间后缀」，
+    /// **无法区分**「一」是孤立数字还是 `N点M刻` 的 N —— 所以 `这一点一刻 / 这一点三刻`
+    /// 会被闸门拦下前半，后半仍由 decide_conversion 照转。
+    ///
+    /// 当前行为 = `这一点1刻` / `这一点3刻`（半转换撕裂）；无闸门时原行为是 `这1:15` / `这1:45`。
+    /// doc 的「已知边界」只声明了 五/半，**未声明刻族**。
+    /// 🔴 本断言钉「现状」以冻结变化点并在 result.md ② 上报主控裁定：
+    ///    - 若判定属同一刻意边界族 → 本断言即终态，建议 doc 补一句「刻族同族」；
+    ///    - 若判定为缺口需修 → 本断言须随修复改为 `这1:15` / `这1:45`。
+    #[test]
+    fn itn_v091_216_l_quarter_mode_undeclared_boundary() {
+        assert_eq!(normalize_test("这一点一刻"), "这一点1刻");
+        assert_eq!(normalize_test("这一点三刻"), "这一点3刻");
+    }
+
+    /// m 组：闸门位于 check_protection 之后的副作用锁（差集：coder-2 无此面）。
+    /// 保护词优先于闸门 —— 取保护表条目「十一」/「十一月」验证保护路径未被闸门改变；
+    /// 「十一块」验证①右邻否决（`:2474`）撤销保护 → 丙型货币链仍正常。
+    #[test]
+    fn itn_v091_216_m_protection_precedence_unchanged() {
+        assert_eq!(normalize_test("十一"), "十一");
+        assert_eq!(normalize_test("十一月"), "十一月");
+        assert_eq!(normalize_test("十一块"), "11块");
+    }
+
+    /// n 组：🔴 闸门顺序机器闸门（本单最易被后人改回的点）。
+    /// 行为面（`那一年半` 见 b 组、`这一刻` 见 a 组）之外，再加源码顺序锁：
+    /// check_protection 调用点 < 闸门调用点 < 甲型调用点。
+    /// include_str! 相对本文件解析 → src/itn.rs；find 取首次命中 = 生产区（测试区在其后）。
+    #[test]
+    fn itn_v091_216_n_gate_order_locked() {
+        let src = include_str!("itn.rs");
+        let pos_prot = src
+            .find("if let Some(skip) = check_protection(&chars, i, r)")
+            .expect("anchor: check_protection 调用点缺失");
+        let pos_gate = src
+            .find("if is_demonstrative_yi(&chars, i, r)")
+            .expect("anchor: is_demonstrative_yi 调用点缺失");
+        let pos_jia = src
+            .find("if let Some(rs) = try_parse_remainder_suffix(&chars, i, r)")
+            .expect("anchor: 甲型调用点缺失");
+        assert!(
+            pos_prot < pos_gate,
+            "闸门必须晚于 check_protection（保护词表优先，见 :1870）"
+        );
+        assert!(
+            pos_gate < pos_jia,
+            "闸门必须早于甲型 try_parse_remainder_suffix，否则 `那一年半` 被吃成 `那1.5年`（:1879）"
+        );
+    }
+
+    /// o 组：真实句组合 + 幂等（差集：coder-2 无组合句与幂等面）。
+    #[test]
+    fn itn_v091_216_o_combined_sentence_and_idempotent() {
+        let s = "这一点我同意，那一年";
+        assert_eq!(normalize_test(s), s);
+        let once = normalize_test("那一年");
+        assert_eq!(normalize_test(&once), once);
+        let money = normalize_test("这一块八");
+        assert_eq!(money, "这1.8元");
+        assert_eq!(normalize_test(&money), money);
+    }
+
+    // ============================================================================
+    // V091-ITN-YIKE-HANT-220 · 阶段三交叉护栏（TEST-SYNC-220，coder-2 独立推导）
+    // ----------------------------------------------------------------------------
+    // 被测对象：`is_demonstrative_yi` 条件② 的繁中异形字集合 —— `這` 入选
+    // prev_is_demonstrative，`麼` 入选 prev_is_me_form（条件①「一」与条件③ is_date_suffix 零改动）。
+    //
+    // 🔴 可达性（为什么这是真 bug 不是理论问题）：`chinese_script=Traditional` 时，
+    //    transcribe_with_punct_info 内部走 `normalize_text_for_language` ⇒ **ASR 出口就是繁体**，
+    //    ITN 主通道（main.rs:8729）拿到的即繁体文本；而「年/月/日/分/秒/刻」**繁简同形**
+    //    ⇒ 条件③ 照常命中 ⇒ 220 之前「這一年」确实被转成 `這1年`。
+    //
+    // 差集（读 coder-1 的 g~o 组与 coder-2 的 a~f 组之后）：**两组全是简体**（那/每/哪/某/这/么），
+    //    220 的繁体面 **0 覆盖** —— 本组是本单唯一覆盖 `這` / `麼` 的断言。
+    //    简体面不重复：a~f（coder-2）+ g~o（coder-1）已覆盖，唯一补的简体对照是 `这一年`（a~o 均无）。
+    //
+    // ⚠️ 全部为静态逐行 trace 推得（阶段三禁 cargo test），阶段四必须实跑复核。
+    // ============================================================================
+
+    /// a 组：繁体 `這` + 「一」+ **繁简同形**时间后缀 —— 220 的第一处真实牙齿。
+    /// 异形后缀 `號`/`點` 不在本组（它们连条件③ 都命不中，属 221，见 f 组）。
+    #[test]
+    fn itn_v091_220_a_traditional_demonstrative_temporal_suffixes() {
+        // 220 前：這1年 / 這1月 / 這1日 / 這1分 / 這1秒 / 這1刻
+        assert_eq!(normalize_test("這一年"), "這一年");
+        assert_eq!(normalize_test("這一月"), "這一月");
+        assert_eq!(normalize_test("這一日"), "這一日");
+        assert_eq!(normalize_test("這一分"), "這一分");
+        assert_eq!(normalize_test("這一秒"), "這一秒");
+        assert_eq!(normalize_test("這一刻"), "這一刻");
+        // 真实语流词：后首字 分/刻 命中条件③，220 前是 這1分鐘 / 這1刻鐘
+        assert_eq!(normalize_test("這一分鐘"), "這一分鐘");
+        assert_eq!(normalize_test("這一刻鐘"), "這一刻鐘");
+        // 简体对照基线（a~o 两组均未断言过「这一年」；确认集合扩张未把简体路径改坏）
+        assert_eq!(normalize_test("这一年"), "这一年");
+    }
+
+    /// b 组：繁體「這麼 / 那麼」形式 —— 220 第二处牙齿。
+    /// `prev_is_me_form` 两侧都扩了集合：(prev ∈ {么, 麼}) × (prev2 ∈ {这, 這, 那})。
+    #[test]
+    fn itn_v091_220_b_traditional_me_form() {
+        // 220 前：這麼1刻 / 這麼1秒 / 這麼1年 / 這麼1分鐘 / 那麼1刻
+        assert_eq!(normalize_test("這麼一刻"), "這麼一刻");
+        assert_eq!(normalize_test("這麼一秒"), "這麼一秒");
+        assert_eq!(normalize_test("這麼一年"), "這麼一年");
+        assert_eq!(normalize_test("這麼一分鐘"), "這麼一分鐘");
+        assert_eq!(normalize_test("那麼一刻"), "那麼一刻");
+        // 交叉组合（doc `:2408` 明列「那么 / 這麼 / 這么」三形式）：么(简) + 這(繁)
+        assert_eq!(normalize_test("這么一刻"), "這么一刻");
+    }
+
+    /// c 组：🔴 反向红线 —— 裸「麼」不算判据（对应简体侧裸「么」不算，与 h 组同族）。
+    /// `prev_is_me_form` 要求**前两字** ∈ {这, 這, 那}；若有人把集合放宽成「么/麼 单独即可」，
+    /// 本组三条全部变红。
+    #[test]
+    fn itn_v091_220_c_naked_me_not_a_judge() {
+        assert_eq!(normalize_test("什麼一年"), "什麼1年");
+        assert_eq!(normalize_test("要麼一年"), "要麼1年");
+        assert_eq!(normalize_test("怎麼一年"), "怎麼1年");
+    }
+
+    /// d 组：🔴 边界外必须仍然转（条件③ 不命中 ⇒ 闸门不触发；与 216 d 组同形的繁体版）。
+    #[test]
+    fn itn_v091_220_d_overreach_still_converts() {
+        // 那/千/米 繁简同形 → 与简体 d 组同值
+        assert_eq!(normalize_test("那一百年"), "那100年");
+        assert_eq!(normalize_test("這一千米"), "這1000米");
+        assert_eq!(normalize_test("這一十年"), "這10年");
+        // 字形说明：`萬` 由 parse_cn_number 的 `'萬'` 分支（:737）识别，但 DEC-042 的
+        // 锚点输出**固定简体 `万`** ⇒ 孤立「這一萬」结果是繁简混排 `這1万`。
+        assert_eq!(normalize_test("這一萬"), "這1万");
+        // 🔴 **221 后的预期变化，不是回归，勿回滚 221**（主控 FIX-222-R1 已撤销原判）：
+        //    `這一萬塊` 在 221 前是 `這1萬塊`；221 的影子串把 `萬/塊` 归一后，走同一条
+        //    「万/萬 后跟单位 ⇒ large_amount_keep_wan_yi 保守 break」路径，
+        //    与简体基线「这一万块 → 这一万块」（216_d 组）一致 ⇒ 整串保汉字。
+        //    阶段四首跑 left=`這一萬塊`（实测）/ right=`這1萬塊`（旧字面量）即此变化。
+        assert_eq!(normalize_test("這一萬塊"), "這一萬塊");
+    }
+
+    /// e 组：繁简混排句子（任务书点名场景）—— 两条字符集合在同一次 normalize 内互不干扰。
+    #[test]
+    fn itn_v091_220_e_mixed_script_sentence() {
+        let s = "這一年和这一年都要评审。";
+        assert_eq!(normalize_test(s), s);
+        let t = "這一刻和那一刻都要記下來。";
+        assert_eq!(normalize_test(t), t);
+    }
+
+    /// f 组：ITN-HANT-SYSTEMIC-221 落地后的期望值（原为「221 前现状锚」，FIX-222 C 更新）。
+    ///
+    /// 🔴 **本组是 221 兑现主用例的预期变化，不是回归，勿据此回滚 221。**
+    /// 取值方式：**实跑实测**（`cargo test --bin feiyin-ime itn_v091_220_ -- --nocapture`，
+    /// 主控 FIX-222-C 特批定向取证），不是推算 —— 220 首版写的是 221 前的现状，故首跑变红。
+    #[test]
+    fn itn_v091_220_f_hant_221_boundary_current_state() {
+        // ① 221 的主用例：异形后缀 `點` 经影子串归一命中时间族 → 甲型出一等价的 H:MM
+        assert_eq!(normalize_test("三點半"), "3:30");
+        // ② 异形后缀/单位字：数字被转，**异形单位字保留原繁体字形**（影子串只用于判定，输出取原串）
+        assert_eq!(normalize_test("五號"), "5號");
+        assert_eq!(normalize_test("十歲"), "10歲");
+        assert_eq!(normalize_test("三塊錢"), "3塊錢");
+        // ③ 万/萬 后跟单位 → 「保守不转」路径：221 后整串保汉字，与简体基线
+        //    「五万块 → 五万块」「这一万块 → 这一万块」（216_d 组）**行为一致**
+        //    （221 前是繁简混排的 `5万塊`，属旧的半转状态）
+        assert_eq!(normalize_test("五萬塊"), "五萬塊");
+        // ④ 双向安全不变量（221 前后同值）：`點`/`號` 无论是否进匹配面，「這一點 / 這一號」
+        //    都保持汉字（221 后条件③ 命中 ⇒ 由 216 的指示代词闸门接管）
+        assert_eq!(normalize_test("這一點"), "這一點");
+        assert_eq!(normalize_test("這一號"), "這一號");
+    }
+
+    // ============================================================================
+    // V091-ITN-HANT-SYSTEMIC-221-FIX · GUARD-222-DEADRULE · 加载期归一【不变量】
+    // ----------------------------------------------------------------------------
+    // 本组防的**不是那两条鱼**，而是「影子串契约单边落地」这一类缺口：
+    // 输入侧经 `hant_to_hans_char` 归一了，规则表 key 若保持原样，表里任何非简体条目
+    // 都会变成**不可达死规则**。功能用例抓不到它 —— 表里 99.8% 条目本就是简体，
+    // 测什么都是绿的；它只会在有人往 toml 写进一个非简体字时复发，而那一刻不会有任何
+    // 功能测试变红。**所以本组价值全在不变量。**
+    //
+    // 被测生产实现：`normalize_rule_key`（:250）在 `CompiledRules::from_rules` 加载期
+    // 对全部表 key 过一道归一；`itn-rules.toml` 一个字不改。
+    //
+    // 🔴 判据单调性说明：**本组与 `shadow_identity` 组（text_normalizer.rs）判据不同、不可互相替代** ——
+    //    本组判「表里写了非简体 key」（对 鰕/鯻 这类异体 key 会红），
+    //    那组判「输入影子串偏离」（对 鰕/鯻 走正当化支放行）。
+    // ============================================================================
+    mod guard_222_deadrule {
+        use super::*;
+
+        /// 收集 `CompiledRules` 里**全部规则表 key**。
+        /// 真源是**已编译对象**（不是 toml 文本）—— 这样断言的正是「加载期契约」本身。
+        fn all_rule_keys(r: &CompiledRules) -> Vec<String> {
+            let mut out: Vec<String> = Vec::new();
+            for set in [
+                &r.all_units,
+                &r.geo_prefixes,
+                &r.date_suffixes,
+                &r.date_specials,
+                &r.date_prefixes,
+                &r.idiom_set,
+                &r.proper_noun_set,
+                &r.function_word_set,
+                &r.classifier_set,
+                &r.historical_set,
+                &r.serial_suffix_set,
+                &r.decimalizable_units,
+            ] {
+                out.extend(set.iter().cloned());
+            }
+            for bucket in r.unit_collision_map.values() {
+                out.extend(bucket.iter().cloned());
+            }
+            for (trigger, _repl) in &r.unit_symbol_rules {
+                out.push(trigger.clone());
+            }
+            out.extend(r.unit_hierarchy.keys().cloned());
+            for s in [&r.ordinal_prefix, &r.percentage_prefix, &r.fraction_pattern] {
+                if !s.is_empty() {
+                    out.push(s.clone());
+                }
+            }
+            out
+        }
+
+        /// 🔴 **核心不变量**：规则表所有 key 经 ZhHans 归一后必须**恒等**。
+        ///
+        /// 判别力：今天恒绿（加载期已归一）；但只要未来有人往 `itn-rules.toml` 写进一个非简体字，
+        /// 本条立刻红，且红在**加载期契约**这一层 —— 不需要那个人恰好写了一条会被功能用例覆盖的规则。
+        ///
+        /// 用 `compile_rules_from_content(BUILTIN_RULES)` 而非 `rules()` 的理由：后者会优先读
+        /// exe 同级的 `itn-rules.toml`，本机若有残留副本会让判据不确定（属 `[TOML-STALE-001]` 的
+        /// 另一个面，由构建/出包核验管）；本组要判的是**仓库里那张表**的加载期契约，故固定用内置串。
+        #[test]
+        fn guard_222_deadrule_all_keys_zhhans_identity() {
+            let r = compile_rules_from_content(BUILTIN_RULES);
+            let keys = all_rule_keys(&r);
+            println!("[DEADRULE] 已编译规则表 key 总数 = {}", keys.len());
+            // 反空断言：扫描面必须真的够大（否则本条恒绿无判别力）
+            assert!(
+                keys.len() >= 1000,
+                "[DEADRULE] 规则表 key 只收到 {} 个（预期 1.7k 量级）—— all_rule_keys 覆盖失效",
+                keys.len()
+            );
+            let mut bad: Vec<String> = Vec::new();
+            for k in &keys {
+                let n = normalize_rule_key(k);
+                if n != *k {
+                    bad.push(format!("{k} -> {n}"));
+                }
+            }
+            assert!(
+                bad.is_empty(),
+                "[DEADRULE] 加载期归一契约被破坏：存在未归一的规则表 key {} 条（首 20）：\n{}",
+                bad.len(),
+                bad.iter().take(20).cloned().collect::<Vec<_>>().join("\n")
+            );
+        }
+
+        /// 从内置 toml 抽取**全部带引号字面量**（规则表 key 的**超集**，含注释里的引号串）。
+        /// 逐行配对（实测每行引号数均为偶，不会跨行错配）。
+        ///
+        /// 超集是**安全**的：碰撞必须至少有一侧被改写，而今日被改写的 key 只有那两条鱼名，
+        /// 故超集不会凭空造出碰撞（实测 0）；若将来真出现碰撞，超集只会**更早**报红。
+        fn toml_quoted_literals(src: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            for line in src.lines() {
+                let mut cur = String::new();
+                let mut in_str = false;
+                for c in line.chars() {
+                    match c {
+                        '"' => {
+                            if in_str {
+                                out.push(std::mem::take(&mut cur));
+                            }
+                            in_str = !in_str;
+                        }
+                        _ if in_str => cur.push(c),
+                        _ => {}
+                    }
+                }
+            }
+            out
+        }
+
+        /// ① + ②：归一后**碰撞必须为 0**；条目计数归一前后必须相等（① 的必然推论，交叉验证）。
+        ///
+        /// 🔴 为什么碰撞比「死规则」更严重：碰撞 = 两条**不同**规则被静默合并成一条 ⇒ 无声的规则丢失。
+        /// 这条今天是 0，但它是**表内容的函数** —— 将来加词条可能变成 1，那时必须红。
+        /// 复刻的语义与 `KeyNormalizeReport::set`（:281-300）一致：不同原文落到同一归一 key 即碰撞。
+        #[test]
+        fn guard_222_deadrule_no_normalize_collision() {
+            let mut uniq: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for s in toml_quoted_literals(BUILTIN_RULES) {
+                if !s.is_empty() {
+                    uniq.insert(s);
+                }
+            }
+            let mut seen: HashMap<String, String> = HashMap::new();
+            let mut collisions: Vec<(String, String, String)> = Vec::new();
+            let mut rewritten: Vec<(String, String)> = Vec::new();
+            for orig in &uniq {
+                let n = normalize_rule_key(orig);
+                if n != *orig {
+                    rewritten.push((orig.clone(), n.clone()));
+                }
+                match seen.get(&n) {
+                    Some(prev) if prev != orig => {
+                        collisions.push((n.clone(), prev.clone(), orig.clone()))
+                    }
+                    Some(_) => {}
+                    None => {
+                        seen.insert(n.clone(), orig.clone());
+                    }
+                }
+            }
+            println!(
+                "[DEADRULE] toml 引号字面量去重 {} 条 → 归一后 {} 条；被改写 {} 条；碰撞 {} 条",
+                uniq.len(),
+                seen.len(),
+                rewritten.len(),
+                collisions.len()
+            );
+            for (orig, n) in &rewritten {
+                println!("   改写：{orig} -> {n}");
+            }
+            assert!(
+                collisions.is_empty(),
+                "[DEADRULE] 归一后出现碰撞（不同规则被静默合并，= 无声规则丢失）{} 条：\n{}",
+                collisions.len(),
+                collisions
+                    .iter()
+                    .map(|(n, a, b)| format!("  {a} 与 {b} 归一后同为 {n}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            // ② 计数交叉验证：不同原文数 == 不同归一 key 数 ⟺ 碰撞 0
+            assert_eq!(
+                uniq.len(),
+                seen.len(),
+                "[DEADRULE] 归一前后条目计数不等（{} vs {}）—— 碰撞检测与计数两条路必须同真",
+                uniq.len(),
+                seen.len()
+            );
+            // 反空断言：今日确实有 key 被改写（证明归一真的在动，判据不是恒等函数）
+            assert!(
+                rewritten.len() >= 2,
+                "[DEADRULE] 只探到 {} 条被改写的 key（预期 ≥2：两条鱼名）—— \
+                 归一被摘掉或 zhconv 表变了，本组已失去判别力",
+                rewritten.len()
+            );
+        }
+
+        /// ③ 可达性回归锚（用例级**佐证**）：归一后，含异体字的保护条目必须能被 `check_protection` 命中。
+        ///
+        /// 🔴 **本条只是佐证**：删了它不变量仍成立；但删了不变量，本条就形同虚设
+        /// （它证明的是「这一条能命中」，而不能拦住「下一条又写成非简体」）。
+        /// 修前恒 None（死规则）→ 修后 Some(6) / Some(4)（coder-1 实测值）。
+        #[test]
+        fn guard_222_deadrule_fish_entries_reachable() {
+            let r = compile_rules_from_content(BUILTIN_RULES);
+            for (word, expect) in [("三角捷鰕虎鱼", 6usize), ("三角聚鯻", 4usize)] {
+                let shadow = normalize_rule_key(word);
+                let chars: Vec<char> = shadow.chars().collect();
+                assert_eq!(
+                    chars.len(),
+                    word.chars().count(),
+                    "[DEADRULE] 归一必须 1:1（影子串契约），{word} 归一为 {shadow}"
+                );
+                assert_eq!(
+                    check_protection(&chars, 0, &r),
+                    Some(expect),
+                    "[DEADRULE] 归一后 {word}（影子 {shadow}）仍不可达 ⇒ 加载期归一失效"
+                );
+            }
+        }
+
+        /// ④ 🔴 反向可证伪自证：**本组在什么情况下会红**。
+        ///
+        /// ①/②/③ 的判据是 `normalize_rule_key(k) == k`；若该判据对任何输入都为真，前面的断言
+        /// 全是恒真式。本条用真实存在的非简体字把这个判据**证伪**：
+        /// `normalize_rule_key("鰕") != "鰕"` ⇒ 判据确实会为假 ⇒ ① 不是空断言。
+        /// 同时反向钉住加载期契约：**若有人把 `from_rules` 的归一摘掉**，① 会在下一次
+        /// 往 toml 写非简体 key 时红；**若有人把 `normalize_rule_key` 改成恒等**，本条立刻红。
+        #[test]
+        fn guard_222_deadrule_normalize_predicate_is_falsifiable() {
+            // 判据可证伪：真实非简体字会被改写（这就是「会红」的那一侧）
+            assert_ne!(
+                normalize_rule_key("鰕"),
+                "鰕",
+                "[DEADRULE] 反例失效：鰕 归一竟然恒等 ⇒ ①② 恒真、无判别力"
+            );
+            assert_ne!(normalize_rule_key("三角捷鰕虎鱼"), "三角捷鰕虎鱼");
+            // 简体对照组：恒等（证明上面不是「对所有输入都改写」的误报）
+            assert_eq!(normalize_rule_key("三角"), "三角");
+            assert_eq!(normalize_rule_key("这一刻"), "这一刻");
+            // 归一必须保持长度 1:1（影子串同下标的前提）
+            assert_eq!(
+                normalize_rule_key("三角捷鰕虎鱼").chars().count(),
+                "三角捷鰕虎鱼".chars().count()
+            );
+        }
     }
 }

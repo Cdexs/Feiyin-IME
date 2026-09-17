@@ -157,9 +157,12 @@ impl Wordbook {
 
         let threshold = threshold.max(1);
         let count = db::upsert_candidate(word)?;
+        // WORDBOOK-AUTOLEARN-OBS-218: 用 warn 级承载（release 非 debug 模式
+        // main.rs 的 LevelFilter=Warn 会把 info! 整条滤掉，用户看不到自动学习效果）。
+        // 前缀 [AUTOLEARN] 供 grep；不改全局日志级别（Gavin 要求压低实时日志 IO）。
         if count < threshold {
-            log::info!(
-                "Auto-learn candidate observed: '{}' ({}/{})",
+            log::warn!(
+                "[AUTOLEARN] candidate observed: '{}' ({}/{})",
                 word,
                 count,
                 threshold
@@ -167,8 +170,8 @@ impl Wordbook {
             return Ok(());
         }
 
-        log::info!(
-            "Auto-learning promoted after threshold: '{}' ({}/{})",
+        log::warn!(
+            "[AUTOLEARN] promoted after threshold: '{}' ({}/{})",
             word,
             count,
             threshold

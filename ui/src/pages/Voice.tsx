@@ -286,12 +286,16 @@ const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.rea
               )}
               <div className="form-group">
                 <span className="form-label">{t.voice_asr_online_api_key}</span>
+                {/* UI-ASRKEY-225: 提示文字用**原生 placeholder**（不是 value、不是 focus/blur 事件填值）——
+                    浏览器只在 value === '' 时渲染它，输入即消失、清空即回来，
+                    🔴 且它永远不进 value/state/config.toml（Gavin 一票否决判据）。
+                    样式（斜体 + 淡灰）由 .asr-key-input::placeholder 限定在本输入框，不污染其它输入框。 */}
                 <input
                   type="password"
                   value={config.audio?.asr_online_api_key || ''}
                   onChange={(e) => handleAudioChange('asr_online_api_key', e.target.value)}
-                  className="input"
-                  placeholder="sk-..."
+                  className="input asr-key-input"
+                  placeholder={t.voice_asr_online_api_key_placeholder}
                 />
               </div>
               <div className="form-group" style={{ marginTop: '12px' }}>
@@ -327,7 +331,7 @@ const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.rea
       <section className="settings-section">
         <h3 className="section-title">{t.voice_recognition_output}</h3>
         <div className="card">
-          <label className="toggle-switch" style={{ border: 'none', boxShadow: 'none', padding: '8px 0', marginBottom: '12px' }}>
+          <label className="toggle-switch" style={{ border: 'none', boxShadow: 'none', padding: '8px 0', marginBottom: '4px' }}>
             <input
               type="checkbox"
               checked={config.punctuation?.enabled ?? true}
@@ -340,6 +344,21 @@ const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.rea
             <span className="toggle-track"></span>
             <span className="toggle-label">{t.voice_auto_punctuation}</span>
           </label>
+          {/* V091-PUNCT-TAIL-214: 句尾不显示标点符号（默认关，绑 punctuation.strip_trailing） */}
+          <label className="toggle-switch" style={{ border: 'none', boxShadow: 'none', padding: '8px 0', marginBottom: '4px' }}>
+            <input
+              type="checkbox"
+              checked={config.punctuation?.strip_trailing ?? false}
+              onChange={(e) => updateConfig({
+                ...config,
+                punctuation: { ...config.punctuation, strip_trailing: e.target.checked }
+              })}
+              className="toggle-input"
+            />
+            <span className="toggle-track"></span>
+            <span className="toggle-label">{t.voice_strip_trailing_punct}</span>
+          </label>
+          <p className="form-hint" style={{ marginBottom: '12px' }}>{t.voice_strip_trailing_punct_hint}</p>
           <div className="form-group" style={{ marginTop: '16px' }}>
             <span className="form-label">{t.voice_chinese_output}</span>
             <div className="radio-group" style={{ marginTop: '8px' }}>

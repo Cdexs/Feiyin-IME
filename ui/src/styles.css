@@ -1585,6 +1585,21 @@ input[type="range"]::-moz-range-thumb {
   color: var(--system-text-tertiary);
 }
 
+/* V091-UI-ASRKEY-225：ONLY the online-ASR API Key input（斜体 + 淡灰占位提示）。
+   🔴 类名限定 —— 不污染其它输入框（.llm-input::placeholder / 默认 placeholder 均不受影响）。 */
+.asr-key-input::placeholder {
+  font-style: italic;
+  color: var(--system-text-tertiary);
+}
+
+/* UI-ASRKEY-225 补充（Gavin）：**获得焦点即隐藏**提示文字。
+   🔴 原生 placeholder 默认要等真有输入才隐藏，仅 focus 时仍显示 —— 故补这一行纯 CSS。
+   color: transparent 只影响 ::placeholder 伪元素：placeholder 属性与 value 属性依旧互不相干，
+   「提示文字绝不进 value/state」的三条实证不受影响；清空后失焦即自动回来。同类名限定只作用本输入框。 */
+.asr-key-input:focus::placeholder {
+  color: transparent;
+}
+
 .llm-model-row {
   display: flex;
   align-items: center;
