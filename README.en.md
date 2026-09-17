@@ -33,6 +33,10 @@ paragraph dumped after you finish, and not a mechanical fixed-rate typewriter ei
 Misspoke? No need to start over. **Click the text in the overlay while still recording** and edit it
 in place, then let it go to the app.
 
+> Live word-by-word output and mid-recording editing **require the online recognition model**
+> (see [Setup guide step 2](#step-2--pick-a-speech-recognition-model)); the default local fast model
+> delivers the whole passage once you stop speaking.
+
 ### 🎯 It knows what app you're in
 
 The same sentence should look different depending on where it lands. FlashVoice detects the active
@@ -91,33 +95,102 @@ Simplified Chinese, Traditional Chinese and English.
 ### Three steps
 
 1. Download the [latest release](https://github.com/Cdexs/Feiyin-IME/releases) and extract it anywhere
-2. Run `feiyin-ime.exe` — a tray icon appears → right-click → **Settings**
-3. Set the recording hotkey to **Right Alt** and translation to **Right Ctrl** (rationale below), then
-   hold Right Alt and speak
+2. Run `feiyin-ime.exe` — a tray icon appears → **right-click → Settings**
+3. Walk through the four steps below — **only the first one is required**, and you're up and running
 
-For better output quality, add a model API key on the **Formatted Output** page (see below).
-It works fine without one.
+---
 
-### Hotkeys
+## Setup guide
 
-This is the setup we recommend — worth configuring the moment you open Settings:
+Settings has six pages down the left side; the four steps below cover four of them.
+**Only step 1 is required** — the rest make it better, but it runs without them.
 
-| Key | Action |
-|-----|--------|
-| **Right Alt** | Record. Tap to start, tap again to stop (Toggle) — or **hold to talk, release to finish** (PTT) |
-| **Right Ctrl** | Translate. Hold it while recording and the translated text comes out directly |
-| `Esc` | Cancel the current recording |
+### Step 1 · Set your hotkeys (required)
+
+**Where**: tray icon → right-click → **Settings** → **Hotkey** in the left sidebar
+
+The page has two tabs: **Voice Hotkey** and **Translation Hotkey**. Click the big hotkey button in
+the middle — it switches to "Press new hotkey..." — then just press the key you want.
+
+Here's what we recommend:
+
+| Key | Action | Where to set it |
+|-----|--------|-----------------|
+| **Right Alt** | Record. Tap to start, tap again to stop (**Toggle**) — or **hold to talk, release to finish** (**Push-to-talk**) | Voice Hotkey tab |
+| **Right Ctrl** | Translate. Hold it while recording and the translated text comes out directly | Translation Hotkey tab — tick **Enable translation** first |
+| `Esc` | Cancel the current recording | Fixed, nothing to set |
 
 **Why these two keys**: both sit under your right hand and are reachable one-handed; almost nothing
 else claims them, so they won't collide with existing shortcuts; and since left and right modifiers are
 detected separately, your normal Left-Ctrl / Left-Alt shortcuts never trigger them by accident.
 
+**The translation hotkey is optional** — skip it if you don't need live translation. If you do want it,
+tick **Enable translation** first or the button stays greyed out. The two hotkeys can't share a key;
+the app catches the collision on the spot and asks you to pick another.
+
 > Out of the box the recording key is `F9` (Toggle) and translation is disabled — which is why this
 > ten-second change is worth making first.
 
-Configure under **General → Trigger** in Settings. **Left and right modifiers are separate keys**
-(Left Ctrl ≠ Right Ctrl), any key combination works, and the app checks that your recording and
-translation hotkeys don't conflict.
+**Toggle vs. Push-to-talk** is chosen under **Trigger mode** on the same page. **Left and right
+modifiers are separate keys** (Left Ctrl ≠ Right Ctrl) and any combination works; if the key you pick
+is already claimed by another app, you'll get a prompt asking whether to use it anyway.
+
+### Step 2 · Pick a speech recognition model
+
+**Where**: **Voice** in the left sidebar → **ASR Model**
+
+Two options — pick based on what you care about:
+
+| Option | Speed | Accuracy | Network | Cost |
+|--------|-------|----------|---------|------|
+| **Local Model - Fast** (default) | Fast | Good enough | ❌ Fully offline | ❌ Free |
+| **Online Speech Recognition - FunASR** | Low latency, **words appear as you speak** | **Highest** | ✅ Required | ✅ Metered |
+
+**The local model ships with the release package** — it's already in `models/` after you extract,
+works out of the box, and burns no quota. For everyday input it's all you need.
+
+**To use the online model you need your own key**:
+
+1. Create an API key on [Alibaba Cloud Bailian](https://bailian.console.aliyun.com/)
+2. Paste it into **ASR API Key** on the **Voice** page
+3. 🔴 **Always hit "Test Connection" afterwards** — you want to see "✓ Connected" before relying on it
+
+> Don't switch over without a passing connection test. The first time you press the hotkey it will
+> simply error out — the app deliberately does **not** silently fall back to the local model, so you
+> never end up thinking you're on the high-accuracy engine when you aren't.
+
+### Step 3 · Turn on smart output polishing (optional, recommended)
+
+**Where**: **Format Output** in the left sidebar → switch on **Enable Format Output**
+
+Any OpenAI-compatible endpoint works. Three fields to fill in:
+
+| Field | What goes in it |
+|-------|-----------------|
+| **API URL** | The endpoint your model provider gave you |
+| **API Key** | Your API key |
+| **Model** | The model ID — **`deepseek-flash` recommended** (rationale below) |
+
+Same parameters you'd use to configure a model in any other agent tool. Then **hit "Test Connection"**
+and wait for "✓ Connected" before enabling it.
+
+**It works without this**, you just lose the post-recognition polish: filler words and stutters removed,
+false starts smoothed out, homophones corrected, layout adapted to whatever app you're typing into.
+See [Smart output polishing](#smart-output-polishing) below for what it does and why DeepSeek Flash.
+
+### Step 4 · Fill in your wordbook (optional)
+
+**Where**: **Wordbook** in the left sidebar → **User** tab → **Add Entry**
+
+Two kinds of words are worth adding:
+
+- **Domain terms**: jargon, product codenames, project names, people and brand names — the model has
+  never seen them and can't guess them from sound alone
+- **Everyday words you use constantly** but that keep coming out wrong
+
+Once added, these words are **injected into the model's context to bias recognition**, and they also
+feed the post-processing correction pass. The **System** tab above is built in and read-only;
+everything you add lives in **User**.
 
 ---
 
@@ -140,9 +213,8 @@ identifiers are all explicitly protected — it changes how you said it, never w
 
 ### Turning it on
 
-Any OpenAI-compatible endpoint works. On the **Formatted Output** page in Settings you fill in three
-things — **endpoint URL, API key, model name** — then flip the switch. There is a **Test connection**
-button right there to verify it.
+Any OpenAI-compatible endpoint works — fill in **API URL, API Key and Model**, then flip the switch.
+Step-by-step instructions are in [Setup guide step 3](#step-3--turn-on-smart-output-polishing-optional-recommended) above.
 
 ### Recommended model: DeepSeek Flash
 
@@ -161,7 +233,8 @@ keep everything on one line — hasn't been tuned to the same degree, so results
 ## Translation
 
 Hold the translation hotkey (Right Ctrl, as recommended above) while recording, and the translated
-text comes out directly.
+text comes out directly. **It's off by default** — tick **Enable translation** and bind a key under
+**Hotkey → Translation Hotkey** first, per [Setup guide step 1](#step-1--set-your-hotkeys-required).
 
 - **Chinese is translated to English by default.** Speech already in the target language passes
   through as-is, with no extra processing
