@@ -7,12 +7,12 @@
 
 ---
 
-## 当前状态（2026-09-10）
+## 当前状态（2026-09-17）
 
 | 项 | 状态 |
 | --- | --- |
-| 版本 | **v0.9.0 已发布** —— tag + GitHub Release 均已上线，main 推至 `712c292`，工作区 clean |
-| Worker | 09-10 早间三个 Worker 全部 OpenCode Go 月度额度耗尽，当日任务由主控代做。**额度是否恢复未实测**，派发前先探一次 |
+| 版本 | **v0.9.0 已发布** —— tag + GitHub Release 均已上线，main 已推至 `5714f63`（含三条 README 文档提交），工作区 clean |
+| Worker | ✅ **09-17 已恢复可用**：OpenCode Go 额度确认未恢复（提示约 10-04 重置），Gavin 指令三个 Worker 统一切 `commandgo/deepseek/deepseek-v4.1-flash`，已重启并逐个核验就绪 |
 | 文档 | 2026-09-10 已按 DEC-064 改「索引 + 归档」两层，启动必读 227,865 → 23,022 token。**新增条目必须 archive 与索引两边都写** |
 | 下一步 | 优先级最高的是 `PROMPT-OPT-204`（需 A/B 授权）与 `TEST-SYNC-194` |
 

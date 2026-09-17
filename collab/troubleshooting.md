@@ -48,7 +48,7 @@
 
 | ID | 现象 → 判据 |
 | --- | --- |
-| [REPLACE-WORKER-INJECT-LOST-001] | 重启脚本打印「注入完成」但 Worker 零字未收到 → 就绪判据命中太早且零校验，须认输入框占位符 + 打字回读验证 |
+| [REPLACE-WORKER-INJECT-LOST-001] | 重启脚本的注入结论**两个方向都会错**：早期报「完成」实为零字未收到；2026-09-17 报「三次均失败」实为三次全部提交成功 → **报错不携带真相**，必须 `capture-pane` 看状态行：有 `esc interrupt` = 已在跑别动；只有占位符 = 补一个 Enter |
 | [REPLACE-WORKER-TASKFILE-WIPED-001] | 重启会清空 `inbox/task.md`，Worker 转去读同目录陈旧 `task_*.md` 执行 → **先重启后写任务书**，inbox 只留三文件 |
 | [WORKER-RESTART-MODEL-RESET-001] | 重启后模型回落到额度耗尽的免费档，看着活着实则永不响应 → 先切模型再注入；ACK_FAIL 先看是否 `Insufficient balance` |
 | [COLLAB-ACK-001] | Worker 正常干活却漏写 ack 文件触发假警报（3 次记录）→ `capture-pane` 确认活着就别重发重启，重发反而拖慢 Worker |
