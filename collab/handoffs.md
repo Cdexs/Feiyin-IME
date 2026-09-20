@@ -150,3 +150,15 @@
 - **按令不做**：新增用例 / harness / 消融 / 脚本；browser/E2E 与出包 SKIP。
 - **证据**：`collab/outbox/tester-1/testexec245/`（cargo_test_root.log / cargo_test_tauri.log / npm_test.log / tauri_list.txt）。
 - **红线**：未改生产代码与测试期望值 / 未 commit / 未出包 / 版本未动 / 零凭证。
+
+## 2026-09-20 — coder-1 — LOCAL-RT-ENGINE-239-A（阶段二）✅ 交付（枚举变体 + 双模型构建，待验收）
+
+- **① 枚举**：`AsrModel::LocalRealtime` + `from_config("local_realtime")`。
+- **② 双模型**：新建 `build_local_realtime_recognizers`（online=streaming paraformer greedy / offline=accuracy `create_funasr_nano_recognizer` 带 hotwords，返回三元组）；`Transcriber::new` 加 LocalRealtime 专用分支并存常驻 + 按 accuracy 建 VAD；**任一缺失/失败即 Err 不降级**（DEC-067 附则一），错误信息区分 online/offline 供 239-B 浮层。`build_recognizer` 的 LocalRealtime arm 走防御性 `bail!`（3-tuple 契约塞不下 online，主控认可）。
+- **③ `main.rs:8545`** 前处理 arm 跟 **Accuracy**（ACC 常量）。
+- **④ `mod.rs:1824`** 测试穷举 match 补 arm。
+- **端点**：`enable_endpoint=true`；rule1=2.4 / rule2=**2.0**（对齐 ASR-SEG-229 在线档 2000ms，注释锁定勿改回 1.2）/ rule3=20.0；线程 4。
+- **签名**：`transcribe_streaming_local -> Result<(String, Vec<f32>)>`；字段/getter allow 已移除，仅函数保留一行（239-B 接线前无调用者，守 warnings 基线）。
+- **验证**：`cargo check --all-targets` 0 error（warnings 111/102 = 基线）；rustfmt mod.rs/local_stream.rs/main.rs clean；未写测试/harness（Gavin 指令）。现有三档零影响已自证（build_recognizer 三 arm 逐字未动 / new() 新分支对其余档恒假 / select_preprocessing_params 仅加 arm / is_online_streaming 未改）。
+- **待 239-B**：`transcribe_offline_detailed` 的 VAD 分支仅认 Accuracy，LocalRealtime 2pass 复用需纳入；main.rs 若干 `==Accuracy`/`is_online_streaming()` 判定点接线；移除函数 allow。
+- **红线**：未碰 src-tauri；未动版本；未 commit；零凭证。

@@ -1048,3 +1048,12 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **MACOS-HANDOFF-250**：`docs/MACOS-HANDOFF.md` 追加 6 项跨端结论，全部平台中立；🔴 词库 `MIN_CANDIDATE_CHARS=2` 标为**行为变更**。
 - **范围**：纯文档，未碰任何 `.rs`/`.ts`/`.tsx`；未动版本；未 commit/出包；零凭证。
 - **负责人**：coder-2 ｜ **日期**：2026-09-20
+
+## LOCAL-RT-ENGINE-239-A 阶段二 · 2026-09-20 · ✅ 枚举变体 + 双模型构建 + 缺失即报错（待验收）
+
+- **枚举**：`AsrModel::LocalRealtime` + `from_config("local_realtime")`。
+- **双模型**：`build_local_realtime_recognizers`（online streaming paraformer + offline accuracy 带 hotwords）+ `Transcriber::new` 并存常驻 + VAD；**任一缺失/失败即 Err 不降级**（DEC-067 附则一）；错误信息区分 online/offline。
+- **前处理**：`main.rs` LocalRealtime arm 跟 Accuracy；端点 rule2=2.0（对齐 ASR-SEG-229）。
+- **签名**：`transcribe_streaming_local -> Result<(String, Vec<f32>)>`。
+- **验证**：`cargo check --all-targets` 0 error（111/102 基线）；rustfmt 三文件 clean；未写测试。现有三档零影响已逐条自证。
+- **负责人**：coder-1 ｜ **日期**：2026-09-20
