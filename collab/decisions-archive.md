@@ -2462,3 +2462,63 @@ API 端的浮点非确定性与批处理调度决定了 0 不保证逐字复现�
 coder-2 已改 `main.rs` 两处取值点 + 写了 `MACOS-HANDOFF.md` 条目，经 Gavin 澄清后撤销回滚。
 ⇒ **判据：影响范围有歧义时，先确认再派单，不得先派后等纠正。**
 本条同时反证 DEC-066 的价值——编排若已独立，改新管线物理上碰不到旧管线，该失误不会发生。
+
+---
+
+## DEC-067 · 本地 realtime 管线选型定案：paraformer 流式预览 + accuracy 2pass 后端
+
+**日期**：2026-09-20 ｜ **拍板**：Gavin（「选型确认」）｜ **状态**：现行
+
+### 选型
+
+```
+流式预览  →  sherpa-onnx-streaming-paraformer-trilingual-zh-cantonese-en
+             下载 1.05GB / 部署 int8 228MB（encoder 159M + decoder 69M）
+             greedy_search，不开热词
+     ↓ 松键，交出攒下的全量 PCM
+最终文本  →  accuracy（FunASR Nano native 972MB）+ 词库热词
+             走生产 Transcriber，VAD 自动分段（SEGMENT_TRIGGER_SECS=24 / MAX=20）
+     ↓
+后处理    →  本管线独立编排（DEC-066），浮层只显示一次「识别处理中…」（DEC-066 附则一）
+```
+
+### 实测依据（`POC-LOCAL-STREAM-235` / `236`，本机 Ryzen 7 7840HS 纯 CPU）
+
+| 指标 | paraformer（选中） | zipformer（否决） |
+| --- | --- | --- |
+| 首字延迟 | 625–652ms | 718–1031ms（3/4 素材 ≥700ms） |
+| RTF 1/2/4 线程 | 0.065 / 0.053 / 0.042 | 全 ≤0.3，但 beam 使 1T +5~15% |
+| 文字跳动 | **0 改写 / 0 回退**（前缀单调） | **rewrites 2–8 / 回退 0–2** |
+| 中文质量 | 明显更好 | 重复结巴极重（今天天／停顿顿顿／好好好几段） |
+| 英文形态 | `api` / `python` 小写 | `GPT`/`A P I`/`TY` 全大写+逐token空格 |
+| 热词 | 不支持 | 2/5，需 map10~20+score≈3，玄戒始终不对，score≥5 插重复字 |
+
+### 为什么否决 zipformer 的热词（关键）
+
+热词强制 `modified_beam_search`，而 **beam 必然产生改写/回退**（实测 0/0 → rewrites 2–8），
+**与 DEC-054「流式上屏走时间戳驱动回放」的前缀单调前提直接冲突**。
+coder-1 量出成本归属：**热词本身计算成本 ≈ 0，成本全在被逼用 beam**。
+⇒ 流式侧热词是陷阱：付延迟 + 文字跳动 + 中文质量三重代价，只换 2/5 修正率。
+
+### 热词的唯一归宿
+
+| 通道 | 结论 |
+| --- | --- |
+| performance（sense-voice） | ❌ 上游源码 hotwords 0 命中，实测 EXIT 127 硬死 |
+| streaming paraformer | ❌ 同上 |
+| streaming zipformer | ⚠️ 能用但实测否决（见上） |
+| **accuracy（LLM user prompt 注入）** | ✅ **唯一可用**，`offline-recognizer-funasr-nano-impl.cc:147-159 BuildUserPrompt`，PoC-B 实证首字正确率 62.5%→80.0%（+17.5pp） |
+| hr 拼音替换自实现 | 🔶 可补充，推翻 DEC-029 第 2 条，**Gavin 未拍板，保持待定** |
+
+### 已知代价（Gavin 知情确认）
+
+| 项 | 数值 |
+| --- | --- |
+| 松键后等待 | 5.6s 音频→0.70s ／ 18.2s→2.60s ／ 36s→VAD 分段约 5.4s+ |
+| 双模型常驻 | paraformer 228MB + accuracy 稳态 1338MB ≈ **1.6GB**（须打破「本地一次只加载一个模型」，`transcription/mod.rs:92`） |
+| 首字延迟 | 625–652ms，**超 600ms 目标 25–52ms**，由模型前瞻窗口写死，调不动 |
+| 磁盘 | 极客档需下载 228MB + 972MB ≈ 1.2GB，均不进安装包 |
+
+### 配套决策
+
+DEC-065（极客档 / Ctrl+M 解锁 / 否决 Docker 形态）、DEC-066（编排独立）+ 附则一（浮层单状态）。

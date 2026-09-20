@@ -88,7 +88,8 @@
 | DEC-060 | L0 保真规则收窄为只保护「内容单元」，话语标记（比如 / 再比如等）允许在格式化时移除 | 现行 |
 | DEC-062 | 模型切换预热（D1）+ 1.5s 有界等待（D2），修「切模型后首次录音仍用旧引擎」 | 现行 |
 | DEC-063 | LLM `temperature` 维持 0.3 不动 —— 实测 30 次证明温度不是格式化稳定性的杠杆，根因在提示词基座 | 现行 |
-| DEC-065 | 本地实时流式 ASR 定位「极客档」：默认完全隐藏，设置界面 `Ctrl+M` 才解锁；**否决 FunASR Runtime 独立服务形态**（与 tray-first 免安装冲突），走 sherpa-onnx 进程内 | 现行（待 PoC 验证） |
+| DEC-065 | 本地实时流式 ASR 定位「极客档」：默认完全隐藏，设置界面 `Ctrl+M` 才解锁；**否决 FunASR Runtime 独立服务形态**（与 tray-first 免安装冲突），走 sherpa-onnx 进程内 | 现行 |
+| DEC-067 | 本地 realtime 选型：**streaming-paraformer-trilingual（228MB, greedy）做流式预览 + accuracy（972MB）做 2pass 最终文本与热词**。否决 zipformer——热词强制 beam，beam 必产生改写/回退，与 DEC-054 前缀单调前提冲突 | 现行 |
 
 ### 已推翻 / 历史（引用前先看这一列）
 
