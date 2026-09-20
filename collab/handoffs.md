@@ -201,3 +201,13 @@
 - **端测（交 Gavin）**：Ctrl+M 解锁「本地流式实时模型」；双模型已就位 `Publish/models/`（paraformer-trilingual 228MB + funasr-nano-int8 972MB）；清单 `collab/e2e-checklist-local-realtime.md` 十项，🔴 第 10 项现有三档零回归为红线。
 - **证据**：`collab/outbox/tester-1/build244/`（prebuild_baseline / build_* / verify_all / verify_smoke / smoke_debug 等）。
 - **红线**：版本号三处未动 / 未 commit / 零凭证。
+
+## 2026-09-20 — coder-1 — FIX-LOCALRT-ENGINE-EQ-252 ✅ 交付（== Accuracy 漏认 LocalRealtime，待验收）
+
+- **根因（Gavin 端测两 bug 同源）**：`asr_model=LocalRealtime` 未被三处 `== AsrModel::Accuracy` 认可（相等比较编译器不报错）。① `native_punctuated` 落 performance ⇒ 外部 CT-Transformer + accuracy 自带标点**双重打点**；② 长音频不分段 ⇒ 整段喂 native 撞 KV512 ⇒ **空输出**；③ VAD segmenter 不建。
+- **改法**：`impl AsrModel` 新增 `pub fn uses_accuracy_engine(self)`（`matches!(Accuracy | LocalRealtime)`），三处收敛（mod.rs :253 / :455 / :582），:145 注释同步。
+- **同族排查**：`main.rs:7071` load_hotwords（真 bug，改为 `!uses_accuracy_engine()`）、`:7469` 热重载条件（改）、`:9002` 日志文案（改）；`mod.rs:1627` 测试断言（不改）、`select_preprocessing_params`（239-A 已加 arm）；全仓无 `== AsrModel::Performance` 比较。
+- **设计**：达成「用模型内标点」；「CT-Transformer 可不加载」本单不做（全局预载、涉三档，另行评估）。
+- **验证**：cargo check --all-targets 0 error（warnings 110/101 = 基线）；rustfmt mod.rs / main.rs clean；未碰 src-tauri；未写测试（Gavin 指令，回归由 tester-1）。
+- **自证三档零影响**：`uses_accuracy_engine()` 对 Performance/QwenAudioOnline/FunAsrRealtime 恒 false、Accuracy 恒 true，六处取值与改前逐位一致（新增命中仅 LocalRealtime）。
+- **红线**：未动版本 / 未 commit / 未出包 / 零凭证。

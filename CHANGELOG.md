@@ -1092,3 +1092,11 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **八项核验逐项 PASS**：①时间戳 20:48–20:50 ②两副本 sha 相等且异于上包（main `e5807ccd…` / ui `99a15b02…` / crash `964a7163…`）③**ProductVersion 0.9.2 不变 = Gavin 指示，改按 sha 异于上包为判据** ④冒烟 Responding=True / 无 crash.json / panic·ERROR 0 / 残留 0 ⑤`config.toml`+`wordbook.sqlite` 零变化 ⑥warnings 110/101/17 = 新基线 ⑦探针 `local_realtime`/`LocalRealtime`/`streaming-paraformer-trilingual` 命中 ⑧两 toml 三副本全等。
 - **端测**：交 Gavin，`collab/e2e-checklist-local-realtime.md` 十项（第 10 项现有三档零回归为红线）；双模型已就位 `Publish/models/`。
 - **负责人**：tester-1 ｜ **日期**：2026-09-20
+
+## FIX-LOCALRT-ENGINE-EQ-252 · 2026-09-20 · ✅ 修 `== AsrModel::Accuracy` 漏认 LocalRealtime（标点重复 + 长段无输出）
+
+- **收敛方法**：`impl AsrModel::uses_accuracy_engine()`（`matches!(Accuracy | LocalRealtime)`）。
+- **三处根因**：`transcription/mod.rs` 的 `native_punctuated`（:582）/ 长音频 VAD 分段（:455）/ VAD segmenter 构建（:253）判据收敛。
+- **同族排查**：`main.rs:7071` load_hotwords、`:7469` 热重载、`:9002` 日志文案一并收敛；测试断言与 select_preprocessing_params 判定不改。
+- **验证**：cargo check 0 error（warnings 110/101 = 基线）；rustfmt mod.rs/main.rs clean；未碰 src-tauri；未写测试。
+- **负责人**：coder-1 ｜ **日期**：2026-09-20
