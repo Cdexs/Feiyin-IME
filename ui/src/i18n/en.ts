@@ -36,7 +36,7 @@ export const en = {
   voice_asr_model_fun_asr_desc: 'Runs via cloud, FunASR Realtime model, low latency, suitable for real-time voice input.',
   // LOCAL-RT-UI-240: hidden geek tier (DEC-065), unlocked via Ctrl+M in this page
   voice_asr_model_local_realtime: 'Local Streaming Realtime',
-  voice_asr_model_local_realtime_desc: 'Runs locally, shows text as you speak, requires two extra model downloads (~1.2 GB).',
+  voice_asr_model_local_realtime_desc: 'Runs locally, shows text as you speak, works offline.',
   voice_asr_model_local_realtime_download_required: 'This mode requires both models below to be downloaded before use',
   voice_asr_model_local_realtime_size: 'Size',
   voice_asr_model_download_required: 'This model requires downloading before use',

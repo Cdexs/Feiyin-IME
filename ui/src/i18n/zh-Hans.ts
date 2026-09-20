@@ -36,7 +36,7 @@ export const zhHans = {
   voice_asr_model_fun_asr_desc: '云端运行，FunASR Realtime 模型，低延迟，适合实时语音输入。',
   // LOCAL-RT-UI-240: 极客档（DEC-065），本页 Ctrl+M 解锁
   voice_asr_model_local_realtime: '本地流式实时模型',
-  voice_asr_model_local_realtime_desc: '本地运行，边说边出字，需额外下载两个模型（约 1.2GB）。',
+  voice_asr_model_local_realtime_desc: '本地运行，边说边出字、无需联网。',
   voice_asr_model_local_realtime_download_required: '该模式需要下载以下两个模型后才能使用',
   voice_asr_model_local_realtime_size: '大小',
   voice_asr_model_download_required: '该模型需要下载后才能使用',
