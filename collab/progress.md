@@ -750,3 +750,14 @@ load_wordbook_vocabulary()
 | 里程碑口径 | v0.9.0 = 悬浮窗重制 + 实时上屏体验 + 丢字类问题集中收口 + 热键重做 + 格式化输出治理 |
 
 **遗留**：README 正文功能表仍停留在 v0.6 时代；Release 未挂安装包。
+
+
+## v0.9.2 · 2026-09-20 · 在线 ASR 两轴参数化（治碎句与满屏句号）
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | ASR-SEG-229 在线 ASR 两轴：`asr_online_max_sentence_silence` 默认 800→2000、`semantic_punctuation_enabled` 编译期常量→隐藏 config 字段（默认 false）；VER-BUMP-230 版本 0.9.1→0.9.2 |
+| 测试基建 | FIX-TESTENV-231：`TestEnv` 每实例唯一目录，修 `config::tests` 并行竞态（旧实现单目录 `voice-ime-test-{pid}` + Drop `remove_dir_all`） |
+| 回归 | root 1266P/0F/15I + src-tauri 77P/0F；`config::tests` 并行连跑 5 次全绿 |
+| 出包 | `BUILD-232` 八项核验逐项 PASS，ProductVersion 0.9.2；产物 `feiyin-ime` 12.35MB / UI 10.05MB / crash-reporter 24.88MB |
+| 遗留 | 语义断句模式下服务端中间结果频率未知（可能致 overlay 预览变顿）；`[ASR-DROP]` 逐帧 WARN（`src/audio/mod.rs:492-495`）待下批修 |

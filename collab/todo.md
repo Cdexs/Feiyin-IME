@@ -11,11 +11,11 @@
 
 | 项 | 状态 |
 | --- | --- |
-| 版本 | **v0.9.1 已出包**（`BUILD-228`，八项核验逐项全 PASS），本地已 commit `5a18d70` + `63cc4ad`，工作区 clean。🔴 **未 push、未打 tag、未发 Release**，等 Gavin 明示 |
-| 端测待办 | v0.9.1 四项待 Gavin 目视：overlay 编辑态剥尾标点 ／ Key 输入框斜体淡灰 placeholder ＋ focus 消失 ／ 繁中 ITN（`三點半→3:30`、`五號→5號`、`十歲→10歲`）／「API 配置（建议…）」新文案布局 |
-| Worker | ✅ 09-20 三 Worker 全部就绪（`commandgo/deepseek-v4.1-flash`），tester-1 启动时注入文本滞留输入框，补 Enter 后已正常运行（`[REPLACE-WORKER-INJECT-LOST-001]`） |
+| 版本 | **v0.9.2 已出包**（`BUILD-232`，八项核验逐项全 PASS），本地已 commit 至 `e557892`。🔴 **未 push、未打 tag、未发 Release**，等 Gavin 明示 |
+| 端测待办 | ① **v0.9.2 两轴 2×2**（`asr_online_max_sentence_silence` 800/2000 × `asr_online_semantic_punctuation_enabled` false/true）🔴 须手改 `Publish/config.toml:29` 的 800 那一行 + **重启进程**（热重载不含二者）② v0.9.1 四项：overlay 编辑态剥尾标点 ／ Key 输入框 placeholder ／ 繁中 ITN（`三點半→3:30`）／「API 配置」新文案布局 |
+| Worker | ✅ 09-20 新 session 三 Worker 全部就绪（`commandgo/deepseek-v4.1-flash`），coder-1 / coder-2 / tester-1 均已 ACK |
 | 文档 | 09-20 已归档 handoffs 26 条（288 → 7 行）。DEC-064 两层结构；**新增条目必须 archive 与索引两边都写** |
-| 下一步 | `ITN-FIX-LIANGDIAN-223`（待取证定位）、`TEST-SYNC-194`、`TRANS-LANG-UI-213`；`PROMPT-OPT-204` 仍缺 A/B 授权 |
+| 下一步 | 候选（三 Worker 空闲，等 Gavin 点单）：`ITN-FIX-LIANGDIAN-223`（待取证定位）、`ASR-DROP-233`（待取证定性）、`TRANS-LANG-UI-213`（纯前端，与前两者零重叠）、`TEST-SYNC-194`；`PROMPT-OPT-204` 仍缺 A/B 授权 |
 
 ---
 
@@ -29,24 +29,25 @@
 逐条取证见 `CHANGELOG.md` 的 `BUILD-228` 条目与 `handoffs-archive.md` 的 09-17 段（26 条）。
 **未销项的只剩 `ITN-FIX-LIANGDIAN-223`**（见下），它当时未进批。
 
-### 🆕 ASR-SEG-229 · 在线 ASR 碎句 + 满屏句号（Gavin 2026-09-20 端测报）🔄 已派 coder-1
+### ✅ v0.9.2 批次已全部完成并出包（2026-09-20）
+
+`ASR-SEG-229` 在线 ASR 两轴参数化（`asr_online_max_sentence_silence` 800→2000 ＋ 隐藏字段
+`asr_online_semantic_punctuation_enabled`）／ `VER-BUMP-230` 版本 0.9.1→0.9.2 ／ `TEST-SYNC-229` 三条交叉护栏
+／ `FIX-TESTENV-231` TestEnv 每实例唯一目录（治 `config::tests` 并行竞态）／ `TEST-EXEC-231` 回归全绿
+／ `BUILD-232` 出包八项核验逐项 PASS。取证见 `CHANGELOG.md` 与 `handoffs.md` 09-20 段。
+
+🔴 **只剩 Plan B 悬而未决**：若 Gavin 2×2 端测证明 L1（提阈值 ＋ 语义断句）治不住碎句，才启用
+L2「剥服务端句尾标点、整段交本地 CT-Transformer 重打」（PUNCT-GOVERNANCE-030 定源头优先）。
+另一未知风险只能靠端测暴露：语义模式下服务端若憋着批量发中间结果 → overlay 预览变顿。
+
+### 🆕 ASR-DROP-233 · 冒烟日志逐帧 `[ASR-DROP]` WARN（`BUILD-232` 发现，主控定下批修）
 
 | 项 | 内容 |
 | --- | --- |
-| 现象 | 说话稍一停顿就被判句尾，输出切得很碎且每段都带标点 |
-| 🔴 根因已坐实 | ① 日志实证 `Transcribed: …火箭在东风。商业航天创新试验区… (native_punctuated=true)` ⇒ 标点来自**服务端**，本地 CT-Transformer 被 `main.rs:8976` 的 `&& !native_punctuated` 跳过 ② 官方文档：`semantic_punctuation_enabled=false` 的含义就是**「开启 VAD 断句」= 按停顿断**，不是能修它的开关 ③ fun-asr-realtime **无关闭标点预测的参数**（与 PUNCT-GOVERNANCE-030「在线 ASR 物理上不可控」结论一致）④ `max_sentence_silence` 我们设 800，**官方默认 1300**，比默认还激进 |
-| 方案（两轴，L1 源头） | 轴一：默认 800 → **2000**；轴二：`SEMANTIC_PUNCTUATION_ENABLED` 编译期常量 → 隐藏 config 字段。两轴都可配 ⇒ Gavin 一次出包端测 2×2 四组合 |
-| 为什么提阈值零代价 | overlay 预览走中间结果（`sentence_end=false`）不等确认句；`final_text()` 返回 confirmed+current（ASR-070）不丢尾字。文档说的「VAD 延迟低」指**确认句**延迟，我们不依赖它 |
-| 🔴 必须同改的镜像 | `src-tauri/src/config.rs` 是配置镜像，**漏加新字段 = 设置界面一保存就把 A/B 配置静默抹掉**；`:502-504` 有「镜像默认值必须等于主配置 800ms」断言，改默认必同步 |
-| 🔴 未知风险（只能端测） | 语义模式下服务端是否仍以同频率发中间结果；若憋着批量发 → overlay 预览变顿 |
-| Plan B（A/B 失败才上） | L2：剥服务端句尾标点、整段交本地 CT-Transformer 重打。PUNCT-GOVERNANCE-030 定「能在源头关的别产出后再剥」，故 L1 优先 |
-| 🔴 端测前必做 | Gavin 的 `Publish/config.toml` 里**已写死 `asr_online_max_sentence_silence = 800`**，serde default 只在字段缺失时生效 ⇒ **改默认值对他的端测零作用，必须手改那一行**。新字段则因缺失会走 default(false) |
-| 配置键定名 | `asr_online_semantic_punctuation_enabled`（采纳 coder-1 提议，优于主控原拟的短名：与兄弟字段统一遵循 `asr_online_` + 官方字段原名 的构词规则） |
-| 热重载边界 | coder-1 报备并经主控确认：两个参数都在 `Transcriber::new` 熔入，`asr_cheap_reload_needed` 触发键不含二者 ⇒ **A/B 必须重启进程**。与既有 silence 字段行为一致，本单不扩 scope |
-
-**VER-BUMP-230** · 版本号 0.9.1 → 0.9.2（Gavin 2026-09-20 明确授权，本批算进 v0.9.2）
-`Cargo.toml:3` + `src-tauri/Cargo.toml:3` + `src-tauri/tauri.conf.json:9` 三处；`ui/package.json` 不动。
-与 229 文件零重叠，已并进同一单派给 coder-1，省一个派发轮次。
+| 现象 | 冒烟 stdout 出现 `[ASR-DROP]` WARN 刷屏 |
+| 位置 | `src/audio/mod.rs:492-495` |
+| 定性 | 非本批引入、已按「非本批缺陷不拦出包」放行；**尚未定性是真丢帧还是日志级别用错**，取证先行不动代码 |
+| 影响文件 | `src/audio/mod.rs`（与 v0.9.2 批次零重叠，可独立派发） |
 
 ### 🔴 ITN-FIX-LIANGDIAN-223 · `这两点一个都不能少` → `这2.1个都不能少`（Gavin 2026-09-17 端测报）
 

@@ -969,3 +969,12 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **改动**：只改 `src/config/mod.rs` `TestEnv::new()`（pid + 进程内原子计数器构造唯一目录）；25 个用例零改动，**不补锁**（无锁 2 例走显式 `save_to(&path)` 路径、不碰全局态，补锁只掩盖真根因）
 - **验证**：`cargo check --all-targets` 0 error（warnings 111/102 持平基线）；rustfmt clean；未跑 `cargo test`（归阶段四复跑）
 - **负责人**：coder-1 ｜ **日期**：2026-09-20
+
+
+## TEST-EXEC-231 + BUILD-232 · 2026-09-20 · ✅ v0.9.2 回归全绿 + 出包八项核验逐项 PASS
+
+- **回归**：`config::tests` 并行连跑 5 次全绿（49P/0F/2I×5）；root 1266P/0F/15I（10 target）；src-tauri 77P/0F。npm/browser/E2E SKIP（`ui/` 零 diff + 按令）。
+- **出包**：Step1 清进程 → Step2 npm(1.51s)+Tauri UI(1m40s, 17 warn) → Step3 主程序(2m20s, 111/9 warn) → Step4 cp `target/release/` + `Publish/` + toml 三副本。
+- **八项核验**：全部 PASS，逐项贴实测（③ ProductVersion 0.9.2 为唯一变红再变绿；⑦正向 `asr_online_semantic_punctuation_enabled`=1/反向=0 + UI 文件名探针；⑧toml 三副本 hash 全等）。
+- **端测提示**：`Publish/config.toml:29` 写死 800，需手改 + 重启；2×2 组合见 result.md Part C。
+- **负责人**：tester-1 ｜ **日期**：2026-09-20

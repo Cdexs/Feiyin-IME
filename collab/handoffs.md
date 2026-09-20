@@ -50,3 +50,14 @@
 - **验证**：`cargo check --all-targets` 0 error、warnings **111/102**（=基线）；`rustfmt --edition 2021 --check src/config/mod.rs` clean（首版多行 `format!` 被判 DIFF，已改单行）。🔴 未跑 `cargo test`（并行竞态一次绿证明不了，归阶段四 tester-1 复跑；重点：默认并行下 `asr_229_...` / `asr_056_...` 两例需稳定绿）。
 - **证据链**：`TEST-EXEC-229` 报告「单独跑绿 / `--test-threads=1` 49P0F / 并行失败者随调度漂移」= 共享资源竞态铁证；troubleshooting 条目 `[TESTENV-SHARED-DIR-RACE-001]` 由主控落档。
 - **红线**：只改 `TestEnv::new()` / 25 用例零改动 / 未跑 cargo test / 未 commit / 未出包 / 版本未动 / 零凭证。
+
+
+## 2026-09-20 — tester-1 — TEST-EXEC-231 复跑 + BUILD-232 v0.9.2 出包 ✅（八项核验逐项 PASS）
+
+- **TEST-EXEC-231**：`config::tests` 默认并行**连跑 5 次全绿**（各 49P/0F/2I，证 `FIX-TESTENV-231` 有效）；root 全量 **1266P/0F/15I**（10 target，EXIT 0，与期望逐位吻合）；`src-tauri` **77P/0F**。npm/browser/E2E SKIP（`ui/` 零 diff + 按令）。消融按令不重复。
+- **BUILD-232**：Step 1→4 全走（npm 1.51s / Tauri UI 1m40s / 主程序 2m20s），cp UI 入 `target/release/`、三 exe + 两 toml 入 `Publish/`。
+- **八项核验**：①时间戳 14:17–14:18 ✅ ②两副本 sha 相等且三者异于上包 ✅ ③**ProductVersion 0.9.2（唯一变红再变绿）** ✅ ④冒烟 Responding=True + 启动链路完整 + 无 crash.json + panic/ERROR 0 + 残留 0 ✅ ⑤`config.toml`/`wordbook.sqlite` 零变化 ✅ ⑥warnings 111/9/17 = BUILD-228 基线 ✅ ⑦正向 `asr_online_semantic_punctuation_enabled`=1 / 反向 `SEMANTIC_PUNCTUATION_ENABLED`=0 + UI 文件名探针 ✅ ⑧toml 三副本 hash 全等 ✅。
+- **端测项（交 Gavin）**：`Publish/config.toml:29` 写死 `asr_online_max_sentence_silence = 800`，新默认对其零作用 ⇒ A/B 须手改该行 + **重启**；2×2 四组合与目视重点见 result.md Part C。
+- **已知非本批**：冒烟 stdout 的 `[ASR-DROP]` WARN（`src/audio/mod.rs:492-495`），主控确认下批修，不拦出包。
+- **证据**：`collab/outbox/tester-1/build232/` 与 `testexec229/`。
+- **红线**：未改生产代码 / 未 commit / 零凭证。
