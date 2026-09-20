@@ -1833,3 +1833,11 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | `main.rs`（277）/`local_stream.rs`（276/278/284）诊断由 `warn!`→`debug!`，并对重计算加 `log_enabled!` 守卫 | ✅ **平台中立**；仅日志级别与守卫，无功能/行为变更。macOS 带 `-debug` 同样可取全部数据 |
 | `audio/mod.rs`（278）`pre_roll_diag` 首行加 `log_enabled!(Debug)` 早返回守卫（coder-1） | ✅ **平台中立**；仅日志级别与守卫，无功能/行为变更。macOS 带 `-debug` 同样可取全部数据 |
 | `audio/mod.rs`（283）trim 日志 `warn!`→`debug!`（coder-1） | ✅ **平台中立**；`trim_pre_roll_last_speech_segment()` 生产逻辑**未动**，仅日志级别 |
+
+## FIX-SHADOW-DISPLAY-289（2026-09-21，coder-2）· endpoint 确认改用当前句最完整结果 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| `local_stream.rs` endpoint confirm 改用「main vs shadow 更完整者」 | ✅ **平台中立**，两端编译同一份；macOS 若启用本地 realtime 预览自动获得同一行为 |
+| `shadow_current` 空结果置 None（防陈旧） | ✅ 平台中立，无平台分支 |
+| 新增 `[LocalRT-DBG-289]` 诊断（debug! + `log_enabled!` 守卫） | ✅ 平台中立；无行为变更 |

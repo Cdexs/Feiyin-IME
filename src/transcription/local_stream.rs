@@ -369,10 +369,33 @@ pub fn transcribe_streaming_local(
                         r.text.chars().count()
                     );
                 }
+                // FIX-SHADOW-DISPLAY-289：endpoint 确认的应是**当前句最完整的结果**，不固定用 main。
+                // 影子若更完整（字符更多）就用影子 —— 它算出的才是这一句真正的完整文本；
+                // 否则（影子为空/更短/非 endpoint）用 main。这样 endpoint 不会把影子的完整显示回退掉。
+                let use_shadow = endpoint
+                    && shadow_current
+                        .as_ref()
+                        .is_some_and(|sh| sh.chars().count() > r.text.chars().count());
+                let confirm_text: &str = if use_shadow {
+                    shadow_current.as_deref().unwrap_or(&r.text)
+                } else {
+                    &r.text
+                };
+                if endpoint && log::log_enabled!(log::Level::Debug) {
+                    log::debug!(
+                        "[LocalRT-DBG-289] endpoint confirm: main_len={} shadow_len={} used={}",
+                        r.text.chars().count(),
+                        shadow_current
+                            .as_ref()
+                            .map(|s| s.chars().count())
+                            .unwrap_or(0),
+                        if use_shadow { "shadow" } else { "main" }
+                    );
+                }
                 // 🔴 始终把**原始无标点**文本喂状态机：confirmed/current 均保持裸文本，
                 // 杜绝「对已打点文本二次打点 / 标点重复」（FIX-252 场景）。
                 // endpoint=true → 该句确认进 confirmed；false → 替换当前句中间结果。
-                state.on_result(sentence_id, &r.text, endpoint, &[]);
+                state.on_result(sentence_id, confirm_text, endpoint, &[]);
             } else if endpoint {
                 log::debug!(
                     "[LocalRT-DBG-276] endpoint=true but result EMPTY (prev='{}')",
@@ -424,11 +447,11 @@ pub fn transcribe_streaming_local(
                 while recognizer.is_ready(&shadow) {
                     recognizer.decode(&shadow);
                 }
-                if let Some(r) = recognizer.get_result(&shadow) {
-                    if !r.text.is_empty() {
-                        shadow_current = Some(r.text);
-                    }
-                }
+                // FIX-289：影子结果为空 ⇒ 置 None（不保留上一轮陈旧值，避免被误当「更完整」）。
+                shadow_current = recognizer
+                    .get_result(&shadow)
+                    .map(|r| r.text)
+                    .filter(|t| !t.is_empty());
                 shadow_count += 1;
                 if let Some(t0) = t_shadow {
                     log::debug!(

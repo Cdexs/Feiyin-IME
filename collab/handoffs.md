@@ -4,6 +4,14 @@
 
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行，超 200 行上限）。
 
+## 2026-09-21 — coder-2 — FIX-SHADOW-DISPLAY-289 ✅ 交付（endpoint 确认改用当前句最完整结果）
+
+- **根因**：影子解码正常（finalize 有结果），但 endpoint 固定用 main 的 `r.text` confirm ⇒ main 缺尾字 ⇒ 影子完整显示被回退（尾字不显示 / 等下一句才出）。
+- **修法**：endpoint 确认「当前句最完整结果」——`use_shadow = endpoint && shadow.chars().count() > main.chars().count()`；影子空/更短/非 endpoint 用 main。`shadow_current` 空结果置 None 防陈旧。显示仍取更长者（不闪回）。
+- **诊断**：`[LocalRT-DBG-289] endpoint confirm: main_len/shadow_len/used`（debug! + `log_enabled!` 守卫，沿用 284）。
+- **验证**：cargo check --all-targets 0 error、warnings **110/101** = 基线；rustfmt clean；`--numstat`==`-w`（29/6）。🔴 实机时序取证（shadow→endpoint→confirm 顺序与文本）交 tester-1/Gavin（我不能跑）。
+- **红线**：只改本地流式 / 在线档一行未动 / RULE1/2/3 未动 / 未动版本 / 未 commit / 未出包 / 零凭证。
+
 ## 2026-09-20 — coder-2 — URGENT-286 ✅ 交付（诊断埋点降级 debug + 重计算加守卫）
 
 - **改动**：`[LocalRT-DBG-276]`/`[277]`/`[278]`/`[284]` 全部 `warn!`→`debug!`（默认 Warn 连级别检查都短路）。

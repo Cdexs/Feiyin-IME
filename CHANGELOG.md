@@ -1394,3 +1394,11 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **探针（字面量口径）**：`[LocalRT-DBG-276/277/278/283/284]`=1/1/2/1/3；284 功能性字面量 `LOCAL_RT_SHADOW_MS`=1。
 - **日志开关两头验**：无 -debug → 0 条 DBG；有 -debug → `[LocalRT-DBG-284]` 实写；单元用例 `urgent286_pre_roll_diag_quiet_at_warn_full_at_debug` ok。
 - **负责人**：tester-1 ｜ **日期**：2026-09-21
+
+## FIX-SHADOW-DISPLAY-289 · 2026-09-21 · ✅ endpoint 确认改用「当前句最完整结果」
+
+- **根因**：endpoint 固定用 main 的 `r.text` confirm，main 缺尾字 ⇒ 影子完整显示被回退（尾字不显示 / 等下一句）。
+- **修法**：endpoint 确认 `max_chars(main, shadow)`（影子更长则用影子）；影子空/更短/非 endpoint 用 main；`shadow_current` 空结果置 None 防陈旧。显示仍取更长者（不闪回）。
+- **诊断**：`[LocalRT-DBG-289] endpoint confirm: main_len/shadow_len/used`（debug! + `log_enabled!` 守卫）。
+- **验证**：cargo check 0 error、warnings 110/101 = 基线；rustfmt clean；RULE1/2/3 未动；在线档未动。
+- **负责人**：coder-2 ｜ **日期**：2026-09-21
