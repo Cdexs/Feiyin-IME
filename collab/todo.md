@@ -33,11 +33,11 @@
 | `PIPELINE-ORCH-238-B` | N6 LLM 格式化/翻译提取（159 行） | ✅ 已验收 | `cdb4255`，回归 1267P/0F |
 | `LOCAL-RT-ENGINE-239-A` 阶段一 | `local_stream.rs` + `online_recognizer` 槽位 + VAD 注释 | ✅ 已验收 | `f198f61`，主控 Read 代码核实现有路径零触碰 |
 | `LOCAL-RT-ENGINE-239-A` 阶段二 | 枚举变体 + 双模型构建 + `main.rs:8536` arm + 测试穷举 + 缺失即报错 | 🔄 **进行中** | 前处理跟 **Accuracy**；endpoint rule2 **1.2→2.0**（防复发 ASR-SEG-229）|
-| `LOCAL-RT-ENGINE-239-B` | 新管线独立编排 + Info 加载提示 | ⏸ 未派 | DEC-066 编排独立 + 附则一浮层单状态 |
-| `WORDBOOK-EDIT-LEARN-243` | 新管线编辑态提交后走词库自学习 | 🔀 **并入 239-B** | 主控核实：新管线同样发 `StreamingText` ⇒ `last_streaming_text` 自动填充，编辑态学习**零改动生效**。只需接线时确认事件链通 + 修正 `main.rs:6850` 那条「Local-model pipeline never reaches here」过时注释 |
+| `LOCAL-RT-ENGINE-239-B` | 新管线独立编排 + Info 加载提示 | ✅ 已交付 09-20 | DEC-066 编排独立 + 附则一浮层单状态 |
+| `WORDBOOK-EDIT-LEARN-243` | 新管线编辑态提交后走词库自学习 | ✅ 随 239-B 交付 09-20 | 主控核实：新管线同样发 `StreamingText` ⇒ `last_streaming_text` 自动填充，编辑态学习**零改动生效**。只需接线时确认事件链通 + 修正 `main.rs:6850` 那条「Local-model pipeline never reaches here」过时注释 |
 | `LOCAL-RT-READY-246` | 🆕 **双模型就位检测**：现有 `check_accuracy_model_ready` 只查 accuracy 一个，新管线要**两个**（paraformer 流式 + accuracy）。未就位时 UI 卡片与运行时都要能正确判断 | ⏸ 未派 | 240 复用了 accuracy 的命令，是临时凑合 |
-| `LOCAL-RT-FALLBACK-247` | **模型缺失直接报错，不降级**（Gavin 2026-09-20 拍板，DEC-067 附则一）：浮层提示「所选模型不可用」，与 accuracy 的静默降级策略**有意不同**；错误文案补三份 locale | ⏸ 待实施 | 编排待决第④项**已定策** |
-| `LOCAL-RT-RELOAD-248` | 🆕 **切档热重载**：从别的档切到 local_realtime 要触发双模型加载。`asr_cheap_reload_needed` 的触发键是否含新字段？切档 ~6s 的 Info 提示挂在这条链上 | ⏸ 未派 | 与 239-B 的 Info 提示同源，可合并 |
+| `LOCAL-RT-FALLBACK-247` | **模型缺失直接报错，不降级**（Gavin 2026-09-20 拍板，DEC-067 附则一）：浮层提示「所选模型不可用」，与 accuracy 的静默降级策略**有意不同**；错误文案补三份 locale | ✅ 随 239-B 交付 09-20 | 编排待决第④项**已定策** |
+| `LOCAL-RT-RELOAD-248` | 🆕 **切档热重载**：从别的档切到 local_realtime 要触发双模型加载。`asr_cheap_reload_needed` 的触发键是否含新字段？切档 ~6s 的 Info 提示挂在这条链上 | ✅ 随 239-B 交付 09-20 | 与 239-B 的 Info 提示同源，可合并 |
 | `LOCAL-RT-E2E-CHECKLIST-249` | 端测清单 10 项成文 | ✅ 已交付 | `cdf256b` `collab/e2e-checklist-local-realtime.md` |
 | `MACOS-HANDOFF-250` | 跨端交接 6 项结论 | ✅ 已交付 | `cdf256b` `docs/MACOS-HANDOFF.md` +18 行 |
 | `BUILD-244` | v0.9.3 出包 | ⏸ 未派 | 全部验收 + 回归绿后 |

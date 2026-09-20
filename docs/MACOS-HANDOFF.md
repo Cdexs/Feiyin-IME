@@ -1743,3 +1743,21 @@ Windows 侧为流式窗（RecordingWithText/RecordingStreamingIdle）的麦克�
 **行为变更告知**：🔴 `wordbook` 单字候选**不再入库**属**行为变更**；`local_realtime` 档位为两端中性新增，
 **默认隐藏**，不改变 macOS 既有默认 ASR 行为。macOS 端接手本地 realtime 时需自行核实 sherpa-onnx
 streaming paraformer 模型的 macOS 分发路径与可执行名（延续本文件既有惯例：无 `.exe`）。
+
+## LOCAL-RT-ENGINE-239-B（2026-09-20，coder-2）· 本地 realtime 新管线接线 —— macOS 侧影响
+
+**改动性质**：`src/main.rs` + `src/i18n.rs` + `src/transcription/local_stream.rs`，**全部平台中立**
+（两端编译同一份代码）。
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| 新 `LocalRealtime` 分支（`spawn_worker_thread`，`std::thread::scope`） | ✅ 平台中立；macOS 经同一 `spawn_worker_thread` 执行。🔴 macOS 若启用该档位，需自行确认 scope 借用与 sherpa-onnx `OnlineRecognizer` 在 macOS 的线程安全一致（与 `SendOnlineRecognizerRef` 的 SAFETY 论证同源） |
+| `PipelineEvent::Info(String)` / `ModelUnavailable(String)` 新变体 | ✅ 平台中立；macOS 侧 `overlay_request_for_event` 与 `handle_pipeline_event` **已补 arm**（Info 复用 ShowError 承载，同 NoSpeech 先例；ModelUnavailable 用 payload 文案） |
+| `run_pipeline_core` 新增 `transcribing_status_text` 参数 | ✅ 平台中立；macOS 调用路径共用 `spawn_worker_thread`，已同步补参 |
+| `6617` FallingToProcessing 文案按 `AsrModel` 枚举切换 | ✅ 平台中立纯文案逻辑，无平台分支 |
+| i18n 新增 `local_realtime_loading_hint` / `local_realtime_unavailable` | ✅ 平台中立，三 locale 齐全 |
+| `SendOnlineRecognizerRef`（`local_stream.rs`） | ✅ 平台中立；`unsafe impl Send` 的安全前提（单线程访问 + scope join）两端相同 |
+
+**行为变更告知**：🟡 仅**新增** `local_realtime` 档位行为（默认隐藏，DEC-065），**不改动 macOS 既有
+performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 macOS 侧存在穷举 `match` 需补 arm
+（本仓已补；`overlay_request_for_event` 的「禁通配符」约定已遵守）。
