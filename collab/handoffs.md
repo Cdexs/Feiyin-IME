@@ -227,3 +227,12 @@
 - **探针发现**：任务书要求 `uses_accuracy_engine` 命中，实测 release exe **=0** —— Rust 方法名被内联/剥离，二进制探针不可构造；`git show 7e433ee` 无新增字符串字面量 ⇒ 应按 ⑦ 降级条款报三证。下包建议改测 255/256 的行为字符串。
 - **证据**：`collab/outbox/tester-1/testexec253/`（cargo test 两日志）+ `build254/`（构建/核验日志）。
 - **红线**：版本 0.9.2 三处未动 / 未 commit / 未新增测试 / 零凭证。
+
+## 2026-09-20 — tester-1 — TEST-EXEC-257 回归 ✅ + BUILD-258 出包 ✅（四项修复合并包，八项 PASS）
+
+- **回归全绿**：root **1267P/0F/15I** + `src-tauri` **78P/0F**；npm/browser/E2E SKIP（ui 零 diff）；两条护栏专项绿：`streaming_scroll_offset_contract`、护栏 9 `right_separator_geometry_matches_between_gdi_and_d2d`；warnings 110/101/17 = 基线。
+- **出包**：Step1–4 全走（npm 654ms / Tauri UI 97s / 主程序 126s）；八项核验逐项 PASS：①时间戳 main 21:51:15 / ui 21:48:58 / crash 21:50:08 ②两副本 sha 相等且三者异于 BUILD-254 作废包（main `b8a3fa98…` / ui `8ab68022…` / crash `240fb14a…`）③ProductVersion 0.9.2 与上包相同系 Gavin 指示，按替代判据「sha 异于上包」④冒烟 Responding=True ×2 + 无 crash.json + panic/ERROR 0 + 残留 0 ⑤`config.toml` `18fe8608…` / `wordbook.sqlite` `b6ab43ac…` 零变化 ⑥warnings 110/101/17 ⑦探针（字符串字面量）`sherpa-onnx-streaming-paraformer-trilingual-zh-cantonese-en`=1 / `local_realtime`=1 / `asr_local_realtime_unlocked`=1 ⑧scene `8ea93bb1…` / itn `311cbb96…` 三副本全等。
+- **探针口径**：改字符串字面量；`uses_accuracy_engine` 命中 0 属方法名内联（已立档 `[BINARY-PROBE-SYMBOL-INLINED-001]`）。`Publish/models/` 未触碰。
+- **端测（交 Gavin）四复验**：①标点不重复 ②长音频出字 ③流式右侧无留白（⚠️ 在线 FunASR 档同生效，修复非回归）④本地流式预览有标点；完整十项见 `collab/e2e-checklist-local-realtime.md`。
+- **证据**：`collab/outbox/tester-1/testexec257/` + `build258/`。
+- **红线**：版本 0.9.2 三处未动 / 未 commit / 未新增测试 / 零凭证。

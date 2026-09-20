@@ -772,3 +772,14 @@ load_wordbook_vocabulary()
 | 出包 | `BUILD-244` 八项核验逐项 PASS（③按「sha 异于上包」替代判据）；产物 `feiyin-ime` 12.43MB `e5807ccd…` / `feiyin-ime-ui` 10.05MB `99a15b02…` / `crash-reporter` 24.88MB `964a7163…`，时间戳 20:48–20:50 |
 | 端测 | 待 Gavin：`collab/e2e-checklist-local-realtime.md` 十项；双模型已就位 `Publish/models/`；🔴 第 10 项「现有三档零回归」为红线 |
 | 遗留 | `[ASR-DROP]` 逐帧 WARN 未修（非本批）；语义断句中间结果频率待端测 |
+
+
+## v0.9.2（三包 · BUILD-258）· 2026-09-20 · 四项端测修复合并（版本号不升）
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | FIX-252 标点重复 + FIX-252 长音频无输出 + FIX-255 流式右侧留白 + 256 本地流式预览补标点；**版本号维持 0.9.2**（Gavin 指示） |
+| 回归 | TEST-EXEC-257 root 1267P/0F/15I + src-tauri 78P/0F；两条 D2D 护栏专项绿（`streaming_scroll_offset_contract` / 护栏 9） |
+| 出包 | `BUILD-258` 八项核验逐项 PASS（③按「sha 异于上包」替代判据）；产物 `feiyin-ime` 12.43MB `b8a3fa98…` / `feiyin-ime-ui` 10.05MB `8ab68022…` / `crash-reporter` 24.88MB `240fb14a…`，时间戳 21:48–21:51 |
+| 端测 | 待 Gavin 复验四条（标点不重复 / 长音频出字 / 流式无留白(在线档同生效) / 本地流式预览有标点）；`Publish/models/` 未动 |
+| 遗留 | `[ASR-DROP]` 逐帧 WARN 未修（非本批） |

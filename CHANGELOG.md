@@ -1115,3 +1115,10 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **BUILD-254 中止**：主控停令 —— FIX-252 与 FIX-OVERLAY-SCROLL-255 / LOCALRT-PREVIEW-PUNCT-256 合并为一包重出；停令时 Step1–4 已完成，按令作废不推进。存档 sha main `ee6a1f10…` / ui `3b2e5dcd…` / crash `8a23b4e6…`（🔴 `Publish/` 暂存该作废包）。
 - **探针**：`uses_accuracy_engine` release 命中 **0**（方法名被剥离，探针不可构造）；FIX-252 零新增字符串 ⇒ 第⑦项按降级条款处理；下包改用 255/256 行为字符串。
 - **负责人**：tester-1 ｜ **日期**：2026-09-20
+
+## TEST-EXEC-257 + BUILD-258 · 2026-09-20 · ✅ 四项修复合并回归全绿 + 一次出包（v0.9.2 三包，八项 PASS）
+
+- **回归**：root **1267P/0F/15I** + `src-tauri` **78P/0F**；`ui/` 零 diff ⇒ npm/browser/E2E SKIP；两条护栏专项绿（`streaming_scroll_offset_contract`、护栏 9 `right_separator_geometry_matches_between_gdi_and_d2d`）；warnings 110/101/17 = 基线。
+- **出包**：npm 654ms + Tauri UI 97s + 主程序 126s；八项核验逐项 PASS —— 两副本 sha 相等且三者异于上包（main `b8a3fa98…` / ui `8ab68022…` / crash `240fb14a…`）；ProductVersion 0.9.2 不变（Gavin 指示，③按 sha 替代判据）；探针三串命中；toml 三副本全等；`Publish/models/` 未触碰。
+- **四项修复进包**：FIX-252 标点重复 / FIX-252 长音频无输出 / FIX-255 流式右侧留白 / 256 本地流式预览标点。
+- **负责人**：tester-1 ｜ **日期**：2026-09-20
