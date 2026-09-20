@@ -135,3 +135,12 @@
 - **按令不做**：新增用例 / harness / 消融 / 脚本；browser/E2E 与出包 SKIP（无视觉布局改动 / 未收出包令）。
 - **证据**：`collab/outbox/tester-1/testexec241/`（cargo_test_root.log / cargo_test_tauri.log / npm_test.log）。
 - **红线**：未改生产代码与测试期望值 / 未 commit / 未出包 / 版本未动 / 零凭证。
+
+## 2026-09-20 — tester-1 — TEST-EXEC-245 238-B+239-A 阶段一 回归 ✅（只跑现有用例，FAIL 0）
+
+- **结果**：root **1267P/0F/15I**（EXIT 0，与期望逐位吻合）；`src-tauri` **78P/0F/0I**；`npm run test` **7 files / 100P/0F/11S**（EXIT 0）。
+- **src-tauri 78≠77 归因（非回归）**：唯一新增 `minlen242_single_char_candidate_rejected`（`src/wordbook/mod.rs:356`）经 `src-tauri/src/wordbook.rs:1` 的 `#[path="../../src/wordbook/mod.rs"]` 同时编进两 crate ⇒ root 1178→1179 与 tauri 77→78 同源，各计一次。
+- **本批 ui/ 零 diff**（任务书所称 i18n 一行属上一批 c6828e9）；npm 仍跑作兜底，与上轮一致。
+- **按令不做**：新增用例 / harness / 消融 / 脚本；browser/E2E 与出包 SKIP。
+- **证据**：`collab/outbox/tester-1/testexec245/`（cargo_test_root.log / cargo_test_tauri.log / npm_test.log / tauri_list.txt）。
+- **红线**：未改生产代码与测试期望值 / 未 commit / 未出包 / 版本未动 / 零凭证。

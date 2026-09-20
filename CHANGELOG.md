@@ -1020,6 +1020,13 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **已知**：`--numstat`(90/57) 与 `--numstat -w`(88/55) 差 2/2，根因为新增调用点 `final_text,`/`);` 行在 -w 下巧合匹配被删 log 行，属 extract method 固有，非 fmt 连带。
 - **负责人**：coder-2 ｜ **日期**：2026-09-20
 
+## TEST-EXEC-245 · 2026-09-20 · ✅ 238-B + 239-A 阶段一 回归（只跑现有用例，FAIL 0）
+
+- **范围**：`cdb4255` N6 提取 + `f198f61` 239-A 引擎层 + `baa5534` 242；本批 `ui/` 零 diff。
+- **结果**：`cargo test` root **1267P/0F/15I**（EXIT 0，= 期望）；`src-tauri` **78P/0F/0I**；`npm run test` **100P/0F/11S**（EXIT 0）。
+- **src-tauri +1 归因**：新用例 `minlen242_single_char_candidate_rejected` 经 `src-tauri/src/wordbook.rs` 的 `#[path="../../src/wordbook/mod.rs"]` 同时编进两 crate，root/tauri 各计一次，非回归。
+- **负责人**：tester-1 ｜ **日期**：2026-09-20
+
 ## TEST-EXEC-241 · 2026-09-20 · ✅ 238 + 240 合并回归（只跑现有用例，FAIL 0）
 
 - **范围**：PIPELINE-ORCH-238（`src/main.rs` N5/N9 提取）+ LOCAL-RT-UI-240（config 双写 + `ui/`）+ i18n 文案；工作区 clean。
