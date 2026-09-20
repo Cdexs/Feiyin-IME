@@ -3674,7 +3674,11 @@ fn draw_recording_overlay_with_text(
     let mut text_rect = RECT {
         left: text_left - scroll_x,
         top: text_top,
-        right: text_right - scroll_x,
+        // FIX-OVERLAY-SCROLL-255: 右边界**不随 scroll_x 左移**，保持在可视区右沿。
+        // 旧写法 `text_right - scroll_x` 让排版矩形整体左移 ⇒ 文字溢出后右侧留白。
+        // 现布局宽度 = visible_w + scroll_x = max(text_width, visible_w) ≥ 文本宽度，
+        // 最新文字仍贴 text_right；裁剪区 text_left..text_right 不动，保证不溢出窗口。
+        right: text_right,
         bottom: text_bottom,
     };
     draw_text(
@@ -5189,15 +5193,17 @@ mod d2d {
             );
             res.brush
                 .SetColor(&colorref_to_d2d(super::OVERLAY_TEXT_WHITE));
-            // Layout rect shifted left by scroll_x; the layout is wider than the clip,
-            // so the right edge of the text (newest) stays pinned at text_right.
+            // FIX-OVERLAY-SCROLL-255: 排版矩形只移起点，右边界**不随 scroll_x 左移**，
+            // 保持在可视区右沿（旧写法 `text_right - scroll_x` 使矩形整体左移 ⇒ 右侧留白）。
+            // 布局宽度 = max(text_width, visible_w) ≥ 文本宽度，最新文字贴 text_right；
+            // 裁剪区 text_left..text_right 不动，保证不溢出窗口。
             res.rt.DrawText(
                 &visible,
                 &res.streaming_text_format,
                 &D2D_RECT_F {
                     left: text_left - scroll_x,
                     top: text_top,
-                    right: text_right - scroll_x,
+                    right: text_right,
                     bottom: text_bottom,
                 },
                 &res.brush,
@@ -7825,6 +7831,16 @@ fn spawn_worker_thread(
                         // OVERLAY-051-E：流式 ASR 已启动、等待首个文本
                         send_event(&event_tx, PipelineEvent::StreamingIdle);
 
+                        // LOCALRT-PREVIEW-PUNCT-256：预览打点复用已常驻的 CT-Transformer。
+                        // 录音前按 config 就绪（引擎由调用方传入，**不在 local_stream 内新建**，
+                        // 否则重复加载模型；与 run_pipeline_core 的传法一致）。
+                        if config.punctuation.enabled && cached_punctuation.is_none() {
+                            cached_punctuation = punctuation::PunctuationEngine::new(&model_dir);
+                        } else if !config.punctuation.enabled {
+                            cached_punctuation = None;
+                        }
+                        let punctuation = cached_punctuation.as_mut();
+
                         let recognizer = transcriber
                             .as_ref()
                             .and_then(|t| t.online_recognizer())
@@ -7849,6 +7865,7 @@ fn spawn_worker_thread(
                                     chunk_rx,
                                     recognizer,
                                     Some(&cancel_clone),
+                                    punctuation,
                                     |display_text, words| {
                                         // OVERLAY-075：与在线流式同构，代际盖章。
                                         let _ = event_tx_clone.send(PipelineEvent::StreamingText(

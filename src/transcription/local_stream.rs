@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use sherpa_onnx::{OnlineParaformerModelConfig, OnlineRecognizer, OnlineRecognizerConfig};
 
 use super::qwen_inference::{StreamingAsrState, WordTiming};
+use crate::punctuation::PunctuationEngine;
 
 /// 本地流式 recognizer 采样率（streaming paraformer trilingual 固定 16kHz 单声道）。
 const SAMPLE_RATE: i32 = 16000;
@@ -99,6 +100,9 @@ pub fn create_local_stream_recognizer(model_dir: &Path) -> Result<OnlineRecogniz
 /// - `chunk_rx`：实时音频块（16kHz f32 单声道）；channel 关闭 = 录音结束
 /// - `recognizer`：常驻的流式 paraformer recognizer（由 `Transcriber` 预加载，跨调用复用）
 /// - `cancel_signal`：置位则提前停止
+/// - `punctuation_engine`：LOCALRT-PREVIEW-PUNCT-256，调用方传入的已常驻 CT-Transformer
+///   （`None` = 用户关标点）。**仅对已确认句（endpoint=true）打点**；中间句逐帧在变，
+///   打点会拖垮 RTF，故不打。引擎不在此新建（否则重复加载 972MB 级模型）。
 /// - `on_result`：文本变化回调，传 `(display_text, display_words)`，与 qwen 路径同构
 ///
 /// # 返回
@@ -111,6 +115,7 @@ pub fn transcribe_streaming_local(
     chunk_rx: crossbeam_channel::Receiver<Vec<f32>>,
     recognizer: &OnlineRecognizer,
     cancel_signal: Option<&AtomicBool>,
+    mut punctuation_engine: Option<&mut PunctuationEngine>,
     mut on_result: impl FnMut(&str, &[WordTiming]),
 ) -> Result<(String, Vec<f32>)> {
     let is_cancelled = || {
@@ -149,8 +154,22 @@ pub fn transcribe_streaming_local(
         let endpoint = recognizer.is_endpoint(&stream);
         if let Some(r) = recognizer.get_result(&stream) {
             if !r.text.is_empty() {
+                // LOCALRT-PREVIEW-PUNCT-256：仅对**已确认句**（endpoint=true）打标点；
+                // 中间句（current）逐帧在变，打点会拖垮 RTF，保持裸文本。
+                // 引擎 None（用户关标点）⇒ 跳过，行为同现状。标点只进 overlay 预览，
+                // 不影响最终文本（最终由 accuracy 2pass 产出）。
+                let display_sentence = if endpoint {
+                    match punctuation_engine.as_deref_mut() {
+                        Some(engine) => engine
+                            .add_punctuation(&r.text)
+                            .unwrap_or_else(|| r.text.clone()),
+                        None => r.text.clone(),
+                    }
+                } else {
+                    r.text.clone()
+                };
                 // endpoint=true → 该句确认进 confirmed；false → 替换当前句中间结果。
-                state.on_result(sentence_id, &r.text, endpoint, &[]);
+                state.on_result(sentence_id, &display_sentence, endpoint, &[]);
                 let display = state.display_text();
                 if !display.is_empty() && display != last_display {
                     on_result(&display, &state.display_words());
