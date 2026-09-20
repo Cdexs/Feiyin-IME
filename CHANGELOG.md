@@ -1100,3 +1100,18 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **同族排查**：`main.rs:7071` load_hotwords、`:7469` 热重载、`:9002` 日志文案一并收敛；测试断言与 select_preprocessing_params 判定不改。
 - **验证**：cargo check 0 error（warnings 110/101 = 基线）；rustfmt mod.rs/main.rs clean；未碰 src-tauri；未写测试。
 - **负责人**：coder-1 ｜ **日期**：2026-09-20
+
+## FIX-OVERLAY-SCROLL-255 + LOCALRT-PREVIEW-PUNCT-256 · 2026-09-20 · ✅ 流式上屏右侧空白 + 本地流式预览补标点
+
+- **255**：GDI/D2D 两处排版矩形 `right` 不再随 `scroll_x` 左移（`text_right - scroll_x` → `text_right`），文字填满可视区、无右侧留白；最新文字仍贴右沿，裁剪区不动。🔴 共用绘制 ⇒ 在线档同样修复（非回归）。
+- **256**：`transcribe_streaming_local` 加 `punctuation_engine` 参数，**仅对 `endpoint=true` 已确认句**用常驻 CT-Transformer 打点，中间句不打；引擎 None 跳过。零新增模型/内存；只影响 overlay 预览，最终文本仍由 accuracy 2pass 产出。
+- **文件**：`src/main.rs` +21/-4、`src/transcription/local_stream.rs` +20/-1。
+- **验证**：cargo check --all-targets 0 error、warnings 110/101 = 基线；rustfmt clean；numstat==-w；未跑 cargo test（归 tester-1）。
+- **负责人**：coder-2 ｜ **日期**：2026-09-20
+
+## TEST-EXEC-253 · 2026-09-20 · ✅ FIX-252 回归全绿（BUILD-254 出包中止，产物作废）
+
+- **回归**：root **1267P/0F/15I**（=期望）+ `src-tauri` **78P/0F**；`ui/` 零 diff ⇒ npm/browser/E2E SKIP；warnings 110/101/17 = 基线。
+- **BUILD-254 中止**：主控停令 —— FIX-252 与 FIX-OVERLAY-SCROLL-255 / LOCALRT-PREVIEW-PUNCT-256 合并为一包重出；停令时 Step1–4 已完成，按令作废不推进。存档 sha main `ee6a1f10…` / ui `3b2e5dcd…` / crash `8a23b4e6…`（🔴 `Publish/` 暂存该作废包）。
+- **探针**：`uses_accuracy_engine` release 命中 **0**（方法名被剥离，探针不可构造）；FIX-252 零新增字符串 ⇒ 第⑦项按降级条款处理；下包改用 255/256 行为字符串。
+- **负责人**：tester-1 ｜ **日期**：2026-09-20

@@ -4,6 +4,14 @@
 
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行，超 200 行上限）。
 
+## 2026-09-20 — coder-2 — FIX-OVERLAY-SCROLL-255 + LOCALRT-PREVIEW-PUNCT-256 ✅ 交付（待主控验收 → tester-1 回归）
+
+- **255**：`main.rs` GDI `:3677` / D2D `:5200` 排版矩形 `right: text_right - scroll_x` → `right: text_right`。修「流式上屏溢出后右侧留白」；布局宽度 = `max(text_width, visible_w)`，最新文字贴右沿；裁剪区不动。`streaming_scroll_offset` 与两条护栏（`:11903` 契约 / `:11927` 几何）**未动**。🔴 该绘制函数所有流式档共用 ⇒ **在线 FunASR 右侧空白同样消失（修复，非回归）**。
+- **256**：`local_stream.rs::transcribe_streaming_local` 加 `punctuation_engine: Option<&mut PunctuationEngine>`；**仅 `endpoint=true` 已确认句**打点，中间句保持裸文本；`None` 跳过。引擎由新分支调用方传入（录音前就绪 `cached_punctuation.as_mut()`），**不在 local_stream 内新建**；只影响 overlay 预览，不影响最终文本（accuracy 2pass 自带标点）。
+- **文件**：`src/main.rs` +21/-4、`src/transcription/local_stream.rs` +20/-1。
+- **验证**：cargo check --all-targets 0 error、warnings **110/101** = 基线；rustfmt 两文件 clean；`--numstat`==`-w`（21/4、20/1）。🔴 未跑 cargo test（护栏归 tester-1）；按 Gavin 指令不写新测试。
+- **红线**：未碰 src-tauri / ui / transcription/mod.rs / 未动版本 / 未 commit / 未出包 / 零凭证。
+
 ## 2026-09-20 — coder-2 — LOCAL-RT-ENGINE-239-B ✅ 交付（新管线主控接线，含 243/247/248；待主控验收 → tester-1 全量回归）
 
 - **新分支**：在线流式分支之后新增 `LocalRealtime` 编排——`send StreamingIdle` → `std::thread::scope`（ASR 线程跑 `transcribe_streaming_local` 发 `StreamingText` + worker 跑 `record_streaming`）→ join 拿 `(preview_text, pcm)` → **丢弃预览文本**、`run_pipeline_core(Ok(pcm), initial_text=None)` 走 accuracy 2pass（主通道 ITN 启用）。
@@ -211,3 +219,11 @@
 - **验证**：cargo check --all-targets 0 error（warnings 110/101 = 基线）；rustfmt mod.rs / main.rs clean；未碰 src-tauri；未写测试（Gavin 指令，回归由 tester-1）。
 - **自证三档零影响**：`uses_accuracy_engine()` 对 Performance/QwenAudioOnline/FunAsrRealtime 恒 false、Accuracy 恒 true，六处取值与改前逐位一致（新增命中仅 LocalRealtime）。
 - **红线**：未动版本 / 未 commit / 未出包 / 零凭证。
+
+## 2026-09-20 — tester-1 — TEST-EXEC-253 回归 ✅ + BUILD-254 🛑 中止（产物作废）
+
+- **回归全绿**：root **1267P/0F/15I**（=期望）+ `src-tauri` **78P/0F**；npm/browser/E2E SKIP（`ui/` 零 diff）；warnings 110/101/17 = 基线。
+- **出包中止**：主控停令（FIX-252 + FIX-OVERLAY-SCROLL-255 + LOCALRT-PREVIEW-PUNCT-256 合并成一包）；停令时 Step1–4 已跑完，按令**作废、不再推进**。存档 sha main `ee6a1f10…` / ui `3b2e5dcd…` / crash `8a23b4e6…`（两副本相等，三者异于 BUILD-244 `e5807ccd…`/`99a15b02…`/`964a7163…`）。🔴 `Publish/` 当前暂存该作废包，合并包重出时覆盖。
+- **探针发现**：任务书要求 `uses_accuracy_engine` 命中，实测 release exe **=0** —— Rust 方法名被内联/剥离，二进制探针不可构造；`git show 7e433ee` 无新增字符串字面量 ⇒ 应按 ⑦ 降级条款报三证。下包建议改测 255/256 的行为字符串。
+- **证据**：`collab/outbox/tester-1/testexec253/`（cargo test 两日志）+ `build254/`（构建/核验日志）。
+- **红线**：版本 0.9.2 三处未动 / 未 commit / 未新增测试 / 零凭证。
