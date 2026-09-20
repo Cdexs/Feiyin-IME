@@ -1004,6 +1004,14 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **验证**：`npm run build` 通过；`cargo check --all-targets` 0 error（111/102 基线）、src-tauri 0 error（17 基线）；三 locale grep 齐全。
 - **负责人**：coder-1 ｜ **日期**：2026-09-20
 
+## LOCAL-RT-ENGINE-239-A（阶段一）· 2026-09-20 · ✅ 本地流式 ASR 引擎层（不含枚举变体，待验收）
+
+- **分期**：新增 `AsrModel::LocalRealtime` 会命中 `src/main.rs:8536` 穷举 match（禁碰），主控裁定阶段一不加变体。
+- **改动**：新建 `src/transcription/local_stream.rs`（`transcribe_streaming_local`，复用 `StreamingAsrState`，`is_endpoint()`→`sentence_end`，可选 `pcm_out` 供 2pass）+ `src/transcription/mod.rs`（`online_recognizer` 字段/getter/构造置 None、SAFETY 扩展、VAD 懒加载注释修正）。
+- **验证**：`cargo check --all-targets` 0 error（111/102 基线）；rustfmt 两文件 clean；未写测试。
+- **阶段二**：枚举变体 + 双模型构建 + main.rs arm（前处理跟 Accuracy）+ 测试穷举。
+- **负责人**：coder-1 ｜ **日期**：2026-09-20
+
 ## PIPELINE-ORCH-238（第一步：N9+N5）· 2026-09-20 · ✅ 后处理链节点提取（纯结构，零行为变更）
 
 - **范围**：DEC-066 第一步。仅提取 N9 标点决策 + N5 场景采集两段；N6 LLM 格式化/翻译按主控指令拆到 238-B，本单不做。
@@ -1018,3 +1026,11 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **结果**：`cargo test` root **1266P/0F/15I**（EXIT 0）；`src-tauri` **77P/0F/0I**；`npm run test` **100P/0F/11S**（7 files，EXIT 0）。三项与基线逐位吻合 ⇒ 238「行为逐位不变」经现有 1343 用例坐实，240 无回归。
 - **备注**：target 数 11（基线写 10）因 `89fe69a` 新增 `poc_local_stream` bin（0 用例），不影响判据；`TEST-FIX-002/003` 已知遗留本批未复现。
 - **负责人**：tester-1 ｜ **日期**：2026-09-20
+
+## PIPELINE-ORCH-238-B · 2026-09-20 · ✅ N6 LLM 格式化/翻译提取（纯结构，零行为变更）
+
+- **范围**：DEC-066 提取阶段收尾。`run_pipeline_core` 内联 N6（HEAD `:8752-8910`）→ `fn run_llm_stage(...) -> LlmStageOutput`（`src/main.rs:8928-9081`）。
+- **原位保留**：两处 `Processing` 事件与两处 `learn_llm_suggestions` 均在各自 LLM 调用前，时序零变；`translate_requested`/`derived_target` 与方向日志留调用点。
+- **验证**：`cargo check --all-targets` 0 error、warnings 111/102=基线；`rustfmt --check src/main.rs` clean；token 多重集证明无 token 遗漏；未跑 cargo test（归 tester-1）。
+- **已知**：`--numstat`(180/145) 与 `-w`(174/139) 差 6/6，新调用点参数行巧合归一匹配被删行，属 extract method 固有。
+- **负责人**：coder-2 ｜ **日期**：2026-09-20

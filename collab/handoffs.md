@@ -4,6 +4,16 @@
 
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行，超 200 行上限）。
 
+## 2026-09-20 — coder-2 — PIPELINE-ORCH-238-B ✅ 交付（N6 LLM 格式化/翻译提取，纯结构零行为变更；待主控验收 → tester-1 全量回归）
+
+- **范围**：DEC-066 提取阶段最后一块。`run_pipeline_core` 内联 N6（HEAD `src/main.rs:8752-8910`）→ `fn run_llm_stage(...) -> LlmStageOutput`。
+- **新符号**：`struct LlmStageOutput { text, llm_handled, format_failed }` + `fn run_llm_stage`（14 参显式传入，零外部可变捕获）；调用点 `let llm_out = run_llm_stage(...)` 后解构三绑定。
+- **原位保留（风险点）**：`Processing` 事件 #1 翻译 `:8959`、#2 optimize `:9036`，均在各 LLM 调用前；`learn_llm_suggestions` `:8988` / `:9046`，均在 `Ok(result)` 内。时序零变。
+- **方向判据**：`translate_requested` / `derived_target` / `Translation direction derived` 日志保留调用点（实现中修正过一次自造重复日志）。
+- **验证**：`cargo check --all-targets` 0 error、warnings **111/102**=基线；`rustfmt --check src/main.rs` clean；token 多重集对照无 old>new；`git diff` 仅 3 hunk 在目标区。🔴 未跑 cargo test（归 tester-1）；按 Gavin 指令不写新测试/护栏/消融。
+- **已知差值**：`--numstat` 180/145 vs `-w` 174/139（差 6/6）= 新调用点参数行在 -w 下巧合匹配被删原块行，extract method 固有，非 fmt 连带。
+- **红线**：只改 `src/main.rs` / 未 commit / 未出包 / 版本未动 / 零凭证。
+
 ## 2026-09-20 — coder-2 — PIPELINE-ORCH-238（N9+N5）✅ 交付（后处理链节点提取，纯结构零行为变更；待主控验收 → tester-1 全量回归）
 
 - **范围**：DEC-066 第一步，按主控调整只做 N9 + N5，N6（LLM 格式化/翻译）拆到 238-B 本单不做。调用点原地替换 = 标准 extract method。
@@ -105,6 +115,17 @@
 - **文案**：zh-Hans「本地流式实时模型」/ zh-Hant「本地串流即時模型」/ en「Local Streaming Realtime」。zh-Hant:29 既有漂移未动。
 - **验证**：`npm run build` 通过；`cargo check --all-targets` 0 error（111/102 基线）；src-tauri 0 error（17 基线）；main config rustfmt clean（src-tauri config 既有漂移 :4/:11/:512 非本单）；三 locale grep 齐全。
 - **红线**：未碰 src/main.rs / ASR 引擎 / transcription；未动版本；未 commit；零凭证。
+
+## 2026-09-20 — coder-1 — LOCAL-RT-ENGINE-239-A（阶段一）✅ 交付（本地流式引擎层，待验收）
+
+- **阻塞裁定**：`AsrModel::LocalRealtime` 命中 `src/main.rs:8536` 穷举 match（禁碰 + coder-2 独占）⇒ 主控裁定阶段一不加变体，只做不依赖枚举的三块。
+- **① 新建 `src/transcription/local_stream.rs`**（120 行）：`transcribe_streaming_local(chunk_rx, recognizer, cancel_signal, on_result, pcm_out) -> Result<String>`，与 qwen 真流式平行；`accept_waveform(16000)`→`while is_ready decode`→`get_result`→`on_result`；`is_endpoint()`→`sentence_end=true`+`reset()`；**复用 `StreamingAsrState` 无新状态机**；`pcm_out` 累积 PCM 供 2pass。
+- **② `online_recognizer: Option<OnlineRecognizer>` 字段**（mod.rs）+ getter + 两处构造置 None；!Send 沿用既有 `unsafe impl Send` SAFETY 论证（两 recognizer 共用），未发明新模式。阶段一 `#[allow(dead_code)]` 桥接，二阶段移除。
+- **③ 注释修正**：VAD「懒加载」过时描述改为「`Transcriber::new` 立即构建」；补 DEC-067 双模型并存文档。
+- **🔶 签名偏差待确认**：任务书写 `-> Result<String>`，2pass 需 PCM ⇒ 加可选出参 `pcm_out`；若 239-B 要 `Result<(String, Vec<f32>)>` 一行可改。
+- **验证**：`cargo check --all-targets` 0 error（warnings 111/102 基线）；rustfmt 两文件 clean；未写任何新测试/harness（Gavin 指令）。
+- **阶段二（待放行）**：枚举变体 + `build_recognizer` 双模型构建 + `main.rs:8536` arm（前处理跟 **Accuracy**）+ `mod.rs:1707` 测试穷举。
+- **红线**：未碰 src/main.rs / src-tauri；未动版本；未 commit；零凭证。
 
 ## 2026-09-20 — tester-1 — TEST-EXEC-241 238+240 合并回归 ✅（只跑现有用例，FAIL 0）
 
