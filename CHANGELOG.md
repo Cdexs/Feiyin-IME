@@ -943,6 +943,14 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **验证**：`cargo check` ×3 = 0 error（warnings 111 / 102 / 17 持平基线）；rustfmt 4 根文件 clean；定向测试全绿；未跑全量 `cargo test`、未出包、未 commit
 - **负责人**：coder-1 ｜ **日期**：2026-09-20
 
+## POC-LOCAL-STREAM-236 · 2026-09-20 · ✅ zipformer transducer 热词验证（独立 bin 增量，生产零改动）
+
+- **实验设计**：A greedy 无热词 / B beam(4) 无热词 / C beam+热词，三组分离变量。
+- **热词**：生效但弱——默认 map=4 下 5/5 零修正；map=10~20+score≈3 才 2/5 修正（飞音输入法、紫菜包饭）；过冲致重复字。两通道（config file / create_stream_with_hotwords）等价。
+- **首字延迟**：3/4 素材 ≥700ms（最高 1031ms），仅 zh_30s ~420ms，比 paraformer 差。RTF 全 ≤0.3。英文全大写确认（GPT / A P I / TY）。中文质量远逊 paraformer。
+- **纠 235**：accuracy >28s 空输出系 PoC 绕过生产封装；生产有 VAD 分段保障（`vad.rs:17` 24s 触发 / 20s 分段）。生产 API 复验未跑（根 Cargo.toml 无 lib target，撞红线）。
+- **负责人**：coder-1 ｜ **日期**：2026-09-20
+
 ## TEST-SYNC-229 · 2026-09-20 · ✅ 在线 ASR 两轴参数化阶段三交叉护栏（待验收）
 
 - **G1**：`build_run_task_message` 补轴二 `true` 分支 + `false` 对照（原只有单向 false 断言，挡不住「丢参数重硬编码」）

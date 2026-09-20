@@ -72,3 +72,16 @@
 - **验证**：`cargo check --bin poc_local_stream` 0 error；`rustfmt --check` clean；🔴 未跑 cargo test / release。
 - **证据**：`collab/outbox/coder-1/poc235/`（runA/B/C + 7 probe + 15 snapshot）。
 - **红线**：未碰生产代码 / 未 commit / 未出包 / 版本未动 / 零凭证。
+
+## 2026-09-20 — coder-1 — POC-LOCAL-STREAM-236 ✅ 交付（zipformer 热词验证，待验收）
+
+- **改动**：`src/bin/poc_local_stream.rs` 增量扩 `--model zipformer`（transducer 三件套 + cjkchar+bpe + bpe.vocab）、`--hotwords-stream`、`--max-active-paths`；生产零改动。模型 `sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20`（int8 189 MiB）。
+- **三组分离变量**：A greedy 无热词 / B beam(4) 无热词 / C beam+热词。
+- **热词（唯一必答项）**：**生效但弱**。默认 map=4 下 5/5 零修正；map=10~20 + score≈3.0 才 2/5 修正（飞音输入法、紫菜包饭）；玄戒芯片始终不行，通义千问仅部分，过冲(map50/score5)致重复字。两通道（config file / `create_stream_with_hotwords`）等价；beam 引入改写（rewrites 2–8，破坏 235 的 0/0）。
+- **首字延迟**：3/4 素材 ≥700ms（hw5 最高 1031ms），仅 zh_30s ~420ms；**比 paraformer 差**。RTF 全 ≤0.3，beam 1T 约 +5~15%。
+- **英文**：全大写确认（`GPT`/`A P I`/`TY`）。中文质量远逊 paraformer（重复结巴极重）。
+- **纠 235 错误档案**：accuracy >28s 空输出系 PoC 绕过生产封装；生产 `transcription/mod.rs:374-423` 有 VAD(20s)/naive_chunk 分段三重保障（`vad.rs:17` 触发 24s）。生产 API 运行时复验**未跑**（根 Cargo.toml 无 `[lib]`，bin 无法 use 私有模块，撞红线）。
+- **复现坑**：`--hotwords-stream "a/b/c"` 在 MSYS 被路径转换并触发 C++ abort，须 `MSYS_NO_PATHCONV=1`。
+- **验证**：`cargo check --bin poc_local_stream` 0 error；rustfmt clean；🔴 未跑 cargo test / release。
+- **证据**：`collab/outbox/coder-1/poc236/`。235 报告已留档 `result-235.md`（原被 harness 清 0，按上下文重建，主控核验 20837B）。
+- **红线**：未碰生产代码 / 未改 Cargo.toml / 未 commit / 未出包 / 版本未动 / 零凭证。
