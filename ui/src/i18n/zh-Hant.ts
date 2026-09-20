@@ -39,6 +39,11 @@ export const zhHant = {
   voice_asr_model_local_realtime_desc: '本地執行，邊說邊出字、無需連網。',
   voice_asr_model_local_realtime_download_required: '該模式需要下載以下兩個模型後才能使用',
   voice_asr_model_local_realtime_size: '大小',
+  // LOCAL-RT-READY-246: 雙模型分別就位狀態
+  voice_local_realtime_model_ready: '已就位',
+  voice_local_realtime_model_missing: '缺失',
+  voice_local_realtime_online_label: '串流預覽模型',
+  voice_local_realtime_offline_label: '最終轉錄模型',
   voice_asr_model_download_required: '選擇「準確率更高」模型後，需先下載模型才能啟用該模式。',
   voice_asr_model_download_url: '下載模型',
   voice_asr_model_open_download: '開啟下載頁',

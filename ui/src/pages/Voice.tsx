@@ -13,9 +13,22 @@ interface AccuracyModelInfo {
   download_url: string;
 }
 
+// LOCAL-RT-READY-246: 本地 realtime 双模型就位状态（后端 check_local_realtime_models_ready）
+interface LocalRealtimeModelsInfo {
+  online_ready: boolean;
+  offline_ready: boolean;
+  models_root: string;
+  online_dir: string;
+  offline_dir: string;
+  online_download_url: string;
+  offline_download_url: string;
+}
+
 const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
   const [devices, setDevices] = useState<string[]>([]);
   const [modelInfo, setModelInfo] = useState<AccuracyModelInfo | null>(null);
+  // LOCAL-RT-READY-246: 本地 realtime 双模型状态（与 accuracy 的 modelInfo 独立）
+  const [lrModelInfo, setLrModelInfo] = useState<LocalRealtimeModelsInfo | null>(null);
   const [copiedField, setCopiedField] = useState<string | null>(null);
   const t = getTranslations(config.ui_language);
 
@@ -63,6 +76,7 @@ const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
 
   useEffect(() => {
     checkAccuracyModelReady();
+    checkLocalRealtimeModelsReady();
   }, [asrModel]);
 
   // Keep latest values in ref for cleanup closure
@@ -100,6 +114,17 @@ const loadDevices = async () => {
     } catch (e) {
       console.warn("Failed to check accuracy model readiness:", e);
       setModelInfo(null);
+    }
+  };
+
+  // LOCAL-RT-READY-246: 本地 realtime 需两个模型，分别上报就位情况
+  const checkLocalRealtimeModelsReady = async () => {
+    try {
+      const info = await invoke<LocalRealtimeModelsInfo>("check_local_realtime_models_ready");
+      setLrModelInfo(info);
+    } catch (e) {
+      console.warn("Failed to check local realtime models readiness:", e);
+      setLrModelInfo(null);
     }
   };
 
@@ -225,27 +250,36 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
     }
   };
 
-  // LOCAL-RT-UI-240: local_realtime 需要的两个模型（DEC-067 选型）。
-  // 目标目录根复用后端 check_accuracy_model_ready 返回的 model_dir（exe 同级 models 目录，
-  // DEC-011）去掉末段推导，避免前端硬编码绝对路径。
-  const lrModelsRoot = modelInfo?.model_dir
-    ? modelInfo.model_dir.replace(/[\\/][^\\/]+$/, '')
-    : 'models';
-  const lrModels = [
-    {
-      name: 'sherpa-onnx-streaming-paraformer-trilingual-zh-cantonese-en',
-      size: '228 MB',
-      url: 'https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models',
-    },
-    {
-      name: 'sherpa-onnx-funasr-nano-int8-2025-12-30',
-      size: '972 MB',
-      url: 'https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models',
-    },
-  ].map((m) => ({ ...m, dir: `${lrModelsRoot}\\${m.name}` }));
+  // LOCAL-RT-READY-246: local_realtime 双模型状态。
+  // 目录/URL 全部来自后端 check_local_realtime_models_ready（不再复用 accuracy 的 model_dir 推导）。
+  const lrModels = lrModelInfo
+    ? [
+        {
+          key: 'online',
+          label: t.voice_local_realtime_online_label,
+          name: 'sherpa-onnx-streaming-paraformer-trilingual-zh-cantonese-en',
+          size: '228 MB',
+          ready: lrModelInfo.online_ready,
+          dir: lrModelInfo.online_dir,
+          url: lrModelInfo.online_download_url,
+        },
+        {
+          key: 'offline',
+          label: t.voice_local_realtime_offline_label,
+          name: 'sherpa-onnx-funasr-nano-int8-2025-12-30',
+          size: '972 MB',
+          ready: lrModelInfo.offline_ready,
+          dir: lrModelInfo.offline_dir,
+          url: lrModelInfo.offline_download_url,
+        },
+      ]
+    : [];
 
   const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.ready;
-  const showLocalRealtimeAlert = asrModel === 'local_realtime';
+  const showLocalRealtimeAlert =
+    asrModel === 'local_realtime' &&
+    lrModelInfo !== null &&
+    !(lrModelInfo.online_ready && lrModelInfo.offline_ready);
 
   return (
     <div className="settings-page">
@@ -337,10 +371,13 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
             <div className="asr-model-alert">
               <p className="asr-model-alert-title">{t.voice_asr_model_local_realtime_download_required}</p>
               {lrModels.map((m, i) => (
-                <div key={m.name} style={{ marginBottom: '12px' }}>
+                <div key={m.key} style={{ marginBottom: '12px' }}>
                   <div className="asr-model-field">
                     <span className="asr-model-label">
-                      {m.name} · {t.voice_asr_model_local_realtime_size}: {m.size}
+                      <span style={{ color: m.ready ? 'var(--status-success)' : 'var(--status-error)', fontWeight: 600 }}>
+                        {m.ready ? t.voice_local_realtime_model_ready : t.voice_local_realtime_model_missing}
+                      </span>
+                      {' · '}{m.label} · {m.name} · {t.voice_asr_model_local_realtime_size}: {m.size}
                     </span>
                     <button
                       type="button"

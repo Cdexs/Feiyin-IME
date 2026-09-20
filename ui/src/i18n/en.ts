@@ -39,6 +39,11 @@ export const en = {
   voice_asr_model_local_realtime_desc: 'Runs locally, shows text as you speak, works offline.',
   voice_asr_model_local_realtime_download_required: 'This mode requires both models below to be downloaded before use',
   voice_asr_model_local_realtime_size: 'Size',
+  // LOCAL-RT-READY-246: per-model readiness
+  voice_local_realtime_model_ready: 'Ready',
+  voice_local_realtime_model_missing: 'Missing',
+  voice_local_realtime_online_label: 'Streaming preview model',
+  voice_local_realtime_offline_label: 'Final transcription model',
   voice_asr_model_download_required: 'This model requires downloading before use',
   voice_asr_model_download_url: 'Download Model',
   voice_asr_model_open_download: 'Open Download Page',
