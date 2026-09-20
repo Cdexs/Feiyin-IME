@@ -11,11 +11,11 @@
 
 | 项 | 状态 |
 | --- | --- |
-| 版本 | **v0.9.2 已出包**（`BUILD-232`，八项核验逐项全 PASS），本地已 commit 至 `e557892`。🔴 **未 push、未打 tag、未发 Release**，等 Gavin 明示 |
+| 版本 | **v0.9.2 已出包**（`BUILD-232`）。🔄 **v0.9.3 开发中**（本地流式实时模型，DEC-065/066/067），已 commit 至 `cdf256b`。🔴 未 push、未打 tag，等 Gavin 明示 |
 | 端测待办 | ① **v0.9.2 两轴 2×2**（`asr_online_max_sentence_silence` 800/2000 × `asr_online_semantic_punctuation_enabled` false/true）🔴 须手改 `Publish/config.toml:29` 的 800 那一行 + **重启进程**（热重载不含二者）② v0.9.1 四项：overlay 编辑态剥尾标点 ／ Key 输入框 placeholder ／ 繁中 ITN（`三點半→3:30`）／「API 配置」新文案布局 |
 | Worker | ✅ 09-20 新 session 三 Worker 全部就绪（`commandgo/deepseek-v4.1-flash`），coder-1 / coder-2 / tester-1 均已 ACK |
 | 文档 | 09-20 已归档 handoffs 26 条（288 → 7 行）。DEC-064 两层结构；**新增条目必须 archive 与索引两边都写** |
-| 下一步 | 候选（三 Worker 空闲，等 Gavin 点单）：`ITN-FIX-LIANGDIAN-223`（待取证定位）、`ASR-DROP-234`（待取证定性）、`TRANS-LANG-UI-213`（纯前端，与前两者零重叠）、`TEST-SYNC-194`；`PROMPT-OPT-204` 仍缺 A/B 授权 |
+| 下一步 | v0.9.3 主线：`239-A 阶段二`（coder-1 跑着）→ `239-B` 新管线编排 → `246` 双模型就位检测 → 回归 → `BUILD-244` 出包。**其余待办全部让位主线**，不并行 |
 
 ---
 
@@ -30,32 +30,20 @@
 | `LOCAL-RT-UI-240` | Ctrl+M 解锁 + 配置双写 + 下载卡片 | ✅ 已验收 | `26f87d4` + 文案修正 `c6828e9` |
 | `TEST-EXEC-241` | 238+240 合并回归 | ✅ 全绿 | `3db8285`，三项与基线逐位吻合 |
 | `WORDBOOK-MINLEN-242` | 候选词补最小字数下限（Gavin 端测报 bug） | ✅ 已修 | `baa5534`，48P/0F |
-| `PIPELINE-ORCH-238-B` | N6 LLM 格式化/翻译提取（159 行） | 🔄 待验收 | 两处 Processing + 两处 learn 已核在函数体内 |
-| `LOCAL-RT-ENGINE-239-A` 阶段一 | `local_stream.rs` + `online_recognizer` 槽位 + VAD 注释 | 🔄 待验收 | 不依赖枚举的三块 |
-| `LOCAL-RT-ENGINE-239-A` 阶段二 | 枚举变体 + 构建分支 + `main.rs:8536` arm + 测试穷举 | ⏸ 待放行 | 等 238-B 释放 main.rs；前处理参数跟 **Accuracy** |
+| `PIPELINE-ORCH-238-B` | N6 LLM 格式化/翻译提取（159 行） | ✅ 已验收 | `cdb4255`，回归 1267P/0F |
+| `LOCAL-RT-ENGINE-239-A` 阶段一 | `local_stream.rs` + `online_recognizer` 槽位 + VAD 注释 | ✅ 已验收 | `f198f61`，主控 Read 代码核实现有路径零触碰 |
+| `LOCAL-RT-ENGINE-239-A` 阶段二 | 枚举变体 + 双模型构建 + `main.rs:8536` arm + 测试穷举 + 缺失即报错 | 🔄 **进行中** | 前处理跟 **Accuracy**；endpoint rule2 **1.2→2.0**（防复发 ASR-SEG-229）|
 | `LOCAL-RT-ENGINE-239-B` | 新管线独立编排 + Info 加载提示 | ⏸ 未派 | DEC-066 编排独立 + 附则一浮层单状态 |
-| `WORDBOOK-EDIT-LEARN-243` | 🆕 新管线编辑态提交后也要走词库自学习 | ⏸ 未派 | Gavin 2026-09-20；现有 `main.rs:6847` 仅在线流式路径有 `last_streaming_text` |
+| `WORDBOOK-EDIT-LEARN-243` | 新管线编辑态提交后走词库自学习 | 🔀 **并入 239-B** | 主控核实：新管线同样发 `StreamingText` ⇒ `last_streaming_text` 自动填充，编辑态学习**零改动生效**。只需接线时确认事件链通 + 修正 `main.rs:6850` 那条「Local-model pipeline never reaches here」过时注释 |
 | `LOCAL-RT-READY-246` | 🆕 **双模型就位检测**：现有 `check_accuracy_model_ready` 只查 accuracy 一个，新管线要**两个**（paraformer 流式 + accuracy）。未就位时 UI 卡片与运行时都要能正确判断 | ⏸ 未派 | 240 复用了 accuracy 的命令，是临时凑合 |
 | `LOCAL-RT-FALLBACK-247` | **模型缺失直接报错，不降级**（Gavin 2026-09-20 拍板，DEC-067 附则一）：浮层提示「所选模型不可用」，与 accuracy 的静默降级策略**有意不同**；错误文案补三份 locale | ⏸ 待实施 | 编排待决第④项**已定策** |
 | `LOCAL-RT-RELOAD-248` | 🆕 **切档热重载**：从别的档切到 local_realtime 要触发双模型加载。`asr_cheap_reload_needed` 的触发键是否含新字段？切档 ~6s 的 Info 提示挂在这条链上 | ⏸ 未派 | 与 239-B 的 Info 提示同源，可合并 |
-| `LOCAL-RT-E2E-CHECKLIST-249` | 🆕 **端测清单成文**：overlay 是 Win32+D2D 原生绘制，`cargo test`/Vitest/Browser **一条都覆盖不到**（worker-guide §五）。必须列出要 Gavin 目视确认的项：流式预览逐字上屏／编辑态进入与提交／松键后「识别处理中」单状态／切档 Info 提示／双模型内存占用 | ✅ 已交付 09-20（`collab/e2e-checklist-local-realtime.md`） | worker-guide 强制要求，漏了等于没验收 |
-| `MACOS-HANDOFF-250` | 🆕 **跨端交接文档**：`local_stream.rs` 用 sherpa-onnx 属**平台中立模块**，两端编译同一份代码 ⇒ CLAUDE.md 强制规则要求写入 `docs/MACOS-HANDOFF.md` | ✅ 已交付 09-20（`docs/MACOS-HANDOFF.md` 追加 6 项） | 「任一端开发+构建后必须评估对另一端影响」，不得沉默 |
+| `LOCAL-RT-E2E-CHECKLIST-249` | 端测清单 10 项成文 | ✅ 已交付 | `cdf256b` `collab/e2e-checklist-local-realtime.md` |
+| `MACOS-HANDOFF-250` | 跨端交接 6 项结论 | ✅ 已交付 | `cdf256b` `docs/MACOS-HANDOFF.md` +18 行 |
 | `BUILD-244` | v0.9.3 出包 | ⏸ 未派 | 全部验收 + 回归绿后 |
 
 🔴 **贯穿约束（Gavin 2026-09-20 强调）**：**千万不能改坏现有管线**。
 238/238-B 是零行为变更提取，唯一硬证据是全量回归与基线逐位吻合，每轮必跑。
-
-### 🔄 POC-LOCAL-STREAM-235 · 本地流式 ASR 可行性（已派 coder-1，2026-09-20）
-
-| 项 | 内容 |
-| --- | --- |
-| 选型 | 流式 `streaming-paraformer-trilingual-zh-cantonese-en`（下载 1.05GB／**部署仅 int8 228MB**）；2pass 后端 **accuracy**（Gavin 定，因其支持热词，+17.5pp） |
-| 出局 | zipformer-XL：tokens.txt **零英文 token**（2002 个全中文+字节兜底），预览会与最终文本打架 |
-| 要量七项 | 首字延迟／RTF（1·2·4线程）／文字跳动／2pass 后端等待（performance vs accuracy）／**在线侧 hotwords 是否生效**／🔴 **`OfflineRecognizerConfig.hotwords_file` 对 performance 是否生效**／`hr`+`lm_config` 可行性探查 |
-| 达标线 | RTF ≤ 0.3 且首字延迟 ≤ 600ms |
-| 🔴 待 PoC 后才编排 | Gavin 2026-09-20：本地 ASR Realtime 是**第四条管线**，需单独流程编排，**等 PoC 数据再写设计** |
-| 编排待决四项 | ① accuracy 内置 ITN(`itn:1`) 与主通道 `itn::normalize_numbers` **双重处理**如何解 ② 松键后 accuracy 要等 1–5s，须显式走 `FallingToProcessing`+`Processing` 两态（在线管线现不走）③ 双模型常驻 ≈1.6GB，须打破「本地一次只加载一个模型」约束（`transcription/mod.rs:92`）④ 流式/accuracy 任一加载失败的降级路径 |
-| 背景取证 | `collab/research/local-streaming-asr-233-model-survey.md`（十二节）+ DEC-065 |
 
 
 ### ✅ v0.9.1 / v0.9.2 两批已出包并销项 → 全文见 `todo-archive.md` 末尾
