@@ -236,3 +236,146 @@
 - **端测（交 Gavin）四复验**：①标点不重复 ②长音频出字 ③流式右侧无留白（⚠️ 在线 FunASR 档同生效，修复非回归）④本地流式预览有标点；完整十项见 `collab/e2e-checklist-local-realtime.md`。
 - **证据**：`collab/outbox/tester-1/testexec257/` + `build258/`。
 - **红线**：版本 0.9.2 三处未动 / 未 commit / 未新增测试 / 零凭证。
+
+## 2026-09-20 — coder-1 — RESEARCH-ACC-KV-BUDGET-259 ✅ 交付（KV 512 取证，只取证）
+
+- **任务一 KV 边界**：DLL 1.12.38/SHA aacfe96f。热词 20/30/40/60/100/200 × 短 9.45s + 长 52s（20s 硬切三段）。**短音频 N≤40 OK；20s 段 N=30 溢出**（`Context_len (536)>512. Truncating audio placeholders`→空）；**N≥60 短音频崩；N≥100 → `Falling back to keep last 512 tokens`（跳过音频，最坏静默失效）**。短 audio_token_len≈158 / 20s 段≈333 ⇒ 分段后预算更小，「分段提上限」不成立。
+- **任务二 max_new_tokens**：源码默认 512 / Validate 要求>0；实测 1→「飞」2→「飞音」**0→完整（=不限）**128/256 同 0。建议显式 **256**。
+- **任务三 筛词**：scene 有分类无映射；wordbook **无频次列**（candidates 有 count/last_seen）；优先级 频次>场景>上一句。
+- **任务四 system_prompt A/B**：短音频三组逐字相同，长段无一致增益 ⇒ **不改**（DEC-059 需更大样本）。
+- **任务五 KV 提升**：ModelScope `zengshuishui/FunASR-nano-onnx` 有 `llm_int8_max_token_768/1024`（各 1 个 ~600MB llm.int8.onnx）**零开发可换**；KV 每 512=112MiB(28层×2×8×128×4B)，1024→+112MiB（1.6GB 约+7%）。**未下载验证**（红线）。
+- **建议汇总**：HOTWORDS_MAX_ENTRIES 保持 **20**；max_new_tokens 显式 **256**；system_prompt 暂不改；KV 提升候选换 1024 变体。
+- **改动**：仅 PoC `src/bin/poc_funasr_nano.rs` 加 `--system-prompt`；生产零改动。验证 `cargo check` 0 error（110/101 基线）。
+- **红线**：未改生产常量/生产代码 / 未动版本 / 未 commit / 零凭证。
+
+## 2026-09-20 — coder-1 — RESEARCH-ACC-KV-BUDGET-259-B ✅ 交付（补单两缺口，只取证）
+
+- **缺口①（成立）**：N=20 全 10 字热词（219 字符）→ 20.4s 段 `context_len=553`、`Truncating` → 空；对照 20 短词（101 字符）不溢出。⇒「N=20 安全」**只在短热词下成立**，真实约束是**热词总字符(token)数**。
+- **缺口②（成立）**：源码 `valid_len=context_len`（impl:614）、每生成 token `valid_len+=1`（:766）、`>=max_seq_len` break（:628）⇒ **生成与输入共享 512**。实测同段 k=8/10/11/12/13/14 输出 80/74/58/46/32/18 字符、k=20 溢出空；斜率≈−10 字符/条（≈1:1），表现为**长句截断（无句末标点）非空输出**。
+- **修正建议**：热词按**总字符**限（保守 ≤100）而非仅条数；热词与生成零和；`max_new_tokens` 显式 256；KV 提升候选换 `llm_int8_max_token_1024`。
+- **路径分叉**：报告已**双写** `/d/Workspace/CodeLab/collab/outbox/coder-1/result.md` 与 `/d/Workspace/CodeLab/voice-ime/collab/outbox/coder-1/result.md`（[COLLAB-PATH-SPLIT-001]）。
+- **验证**：`cargo check` 0 error（110/101 基线）。生产零改动。
+- **红线**：未动版本 / 未 commit / 未出包 / 零凭证。
+
+## 2026-09-20 — coder-1 — ACC-KV-1024-260 ✅ 交付（1024 验证等四件）
+
+- **①1024**：临时目录验证（生产 models/ 零改动）。ONNX metadata 实读 `max_total_len=1024`、KV `[batch,1024,8,128]`。场景 A（20.4s+20×10字热词）512 ctx553 Truncating→空 vs **1024 有输出**；场景 B k=14/20 512 截断/空 vs **1024 完整**。短音频精度 **逐字相同**；加载 5.61→5.52s；RSS 无可测差异（理论 +112MiB fp32 / +29MiB int8 被噪声掩盖）。⚠️ 1024 尾部现热词泄漏/幻觉（热词过激）。**建议可换**。
+- **② max_new_tokens**：生产 `src/transcription/mod.rs:913` 0 → **256**（唯一生产改动）。
+- **③ 词长分布**：Publish wordbook 0 条 / candidates 3；APPDATA 旧 schema 11 条 mojibake ⇒ 真实数据不足。敏感度：短词20(82字符) cap80裁1；10字20(200字符) cap80裁12 / 100裁10 / 120裁8。
+- **④ itn**：`impl.cc:771-773` 后处理 + prompt「不进行文本规整」；实测 itn=1 带标点、0 无标点 ⇒ **生效**。另：hotwords 非空会覆盖我方 user_prompt。
+- **验证**：cargo check 0 error（110/101 基线）；rustfmt PoC clean；报告双写。
+- **红线**：未改其它生产代码 / 未动版本 / 未 commit / 零凭证。
+
+## 2026-09-20 — coder-1 — RESEARCH-ACC-SYSPROMPT-261 ✅ 交付（system_prompt 重测，只取证）
+
+- **素材**：TTS 24.55s 口语（语气词/重复/自我纠正齐全），原文贴报告；前置校验通过（baseline 完整保留这些现象）。
+- **四组 + 证伪组**（temp0.1/seed42，各 2 runs，无 hotwords）：A 空 / B 现状英文 / C 259 中文 / D 强指令(44tok) / E「只输出英文」/ F「忽略音频只输出 HELLO WORLD」/ D2 短强指令。
+- **结果**：A=B=C=D2 输出**本质逐字相同**；D **被截断**（44 token 占共享 KV）；E/F **仍是中文转写** ⇒ **system_prompt 完全失效**（证伪级）。
+- **结论/建议**：system_prompt 零指令效果，长 prompt 只占 token ⇒ **生产置空**（撤回 259 的撤回）。是否置空主控拍板。
+- **验证**：cargo check 0 error（110/101 基线）；生产零改动；报告双写。
+- **红线**：未动版本 / 未 commit / 未出包 / 零凭证。
+
+## 2026-09-20 — coder-1 — WORDBOOK-HITCOUNT-263 ✅ 交付（热词按频率筛选）
+
+- **备份**：`C:\msys64\tmp\opencode\kv263_backup-20260920-224306\{publish,appdata}-wordbook.sqlite`（迁移不可逆，保留至验收）。
+- **改动 5 文件**：`migrations/004_wordbook_hitcount.sql`（新建）/ `src/wordbook/db.rs` / `src/main.rs` / `src-tauri/src/wordbook.rs`。
+- **schema**：004 加 `hit_count INTEGER NOT NULL DEFAULT 0` + `last_used_at TEXT`；`WORD_SCHEMA` 同步；`ensure_hitcount_columns()` 查 pragma 后 ALTER（非幂等守卫），A/B/C 三路径调用。
+- **排序**：`load_word_entries` `ORDER BY hit_count DESC, id DESC`（全 0 ≡ id DESC，零回归；tiebreak 防 hotwords_version 抖动）。
+- **计数**：`db.rs::record_hits(final_text)` 单事务批量；`main.rs` 注入成功后调用，gate `uses_accuracy_engine()`；用 final_text。
+- **UI**：Tauri `get_wordbook_entries` 按 id DESC 重排，显示顺序不变。
+- **影响四条**：① Performance/在线三档零影响（不用 hotwords）② 全 0 版本哈希逐位不变、无抖动 ③ UI 顺序无变化 ④ 旧库 001→003→finalize→004 链路 SQL 实测可执行，列与全新库一致。
+- **验证**：列 parity IDENTICAL、0/5/2→5,2,0、全 0 == 旧顺序、record_hits 语义；cargo check root 110/101 / src-tauri 17。
+- **红线**：未动版本 / 未 commit / 未出包 / 零凭证。
+
+## 2026-09-20 — coder-1 — 263 增补 + ACC-KV-1024-SWAP-262 ✅ 交付
+
+- **263 增补**：`main.rs` record_hits → `std::thread::spawn` fire-and-forget（消除 BUSY 3s 挡 worker）。实测读库（同 SQL）冷 1.48/1.67/1.62ms、热 0.05/0.18/0.41ms（0/100/500 条）；写事务 5 条 ~8ms。读路径在录音前、不在识别链路。缓存层评估：收益 <2ms 暂不做（若做用 mtime 失效）。
+- **262 换 1024**：全工作区 **2 副本**（`models/`、`Publish/models/` 的 `sherpa-onnx-funasr-nano-int8-2025-12-30/llm.int8.onnx`）；原文件改名 `.512.bak`（600,339,316 B）保留；替换为 600,025,528 B（metadata max_total_len=1024）。**一处一验**：加载 6.40/5.77s 无 panic + 短音频出字且两副本**逐字相同**。`.gitignore` `/models`+`/Publish/*` 覆盖。场景 A 不再溢出 / B k=14 完整。
+- **system_prompt 置空**：`transcription/mod.rs` `Some("You are a helpful assistant.")` → `Some(String::new())`（261 证伪组依据，零行为变更）。
+- **验证**：cargo check 0 error（110/101 基线）；rustfmt clean。
+- **待主控**：`.512.bak` 是否删；端到端 app 启动/热键链路归 tester-1。
+- **红线**：未动版本 / 未 commit / 未出包 / 零凭证。
+
+## 2026-09-20 — coder-1 — 259~263 判据固化草稿 ✅ 交付（纯文档）
+
+- **产出**：`collab/decisions-draft-localrt-259.md`，5 条判据（建议 DEC-068~072）+ 建议索引行，全文待主控定号后并入 `decisions-archive.md` 与 `decisions.md`。
+- **内容**：①KV512 四者共享零和 ②撞顶静默 Truncating/Falling back ③system_prompt 完全不被遵循（261 E/F）④热词约束=总字符非条数 ⑤换1024 后 20s 段预算 149→661。
+- **红线**：纯文档，未碰生产代码/版本；零凭证。
+
+## 2026-09-20 — coder-1 — DEC-068~072 并入 ✅ 交付（纯文档）
+
+- **两层并入**：全文入 `collab/decisions-archive.md`（5 条），索引入 `collab/decisions.md` 现行表。
+- **主控指定改动**：DEC-072 标注「30 为估算，含模板+user_prompt，system_prompt 已置空」；DEC-069 索引行点明「判越界看日志关键字 Truncating/Falling back，不是有无输出」。
+- **草稿删除**：`decisions-draft-localrt-259.md` 已删（避免两处真相漂移）。
+- **红线**：纯文档；未碰生产代码/版本（遵「TEST-264 前不改生产代码」）；零凭证。
+
+## 2026-09-20 — tester-1 — TEST-SYNC-264 ✅ 交付（263 阶段三护栏 7 条，只写用例未执行，待主控验收 → 阶段四）
+
+- **改动**：`src/wordbook/db.rs` `#[cfg(test)] mod tests` 纯追加 **+7 用例**，生产代码零触碰；`git diff --numstat` == `--numstat -w`（359/3）。
+- **四组**：① 🔴 `hitcount263_all_zero_ordering_is_id_desc`（全 hit_count=0 → id DESC，= 263 改动前逐位相同；丢 tiebreak 即红，附 id ASC 反向断言）② `hitcount263_ordering_hits_desc_then_id_desc`（甲0/乙5/丙2/丁2 → [乙,丁,丙,甲]，含 tiebreak）③ `hitcount263_ensure_hitcount_columns_idempotent`（连跑两次 + 补列后数据可写）④ `hitcount263_fresh_vs_migrated_table_info_identical`（PRAGMA 逐字段 name/type/notnull/dflt_value/pk + 顺序，含新列两侧存在性）；record_hits 三条：`..._increments_only_matched_words` / `..._empty_text_and_empty_db_ok` / `..._same_word_twice_counts_once`。
+- **🔴 实现要点（须主控知悉）**：`load_word_entries`/`record_hits` **无 `_in_conn` 缝**，复制 SQL 的断言看着像护栏实则不跟生产走；故按 `db_path()` 同源取测试 exe 同级文件库、真实调用 public 函数，`static FILE_DB_LOCK` 串行化。副作用：`target/debug/deps/wordbook.sqlite`（构建产物目录）。**建议 coder 补 `*_in_conn(&Connection)` 变体**（照 `upsert_candidate_in_conn` 先例），后续护栏可纯 in-memory、零文件副作用。
+- **record_hits 实际语义**（按令「断言实际行为」）：同词条在同段文本多次出现 = **+1**（每去重词条一条 UPDATE，与 `contains` 次数无关）；子串匹配非分词；空词条过滤。
+- **验证（白名单内）**：`rustfmt --check` clean；`cargo check --all-targets` 0 error、warnings **110/101** = 基线；`cargo check --manifest-path src-tauri/Cargo.toml --all-targets` 0 error（bin 17 / test 19）。🔴 未跑 `cargo test`（阶段三禁）。
+- **阶段四预期**：root **1274P/0F/15I**（+7）、src-tauri **85P/0F**（+7）；🔴 额外**独立复验**换 1024 后 accuracy 档现有管线行为不变（不复用 coder-1 结论）。
+- **红线**：未改生产代码 / 未执行测试 / 未 commit / 版本未动 / 零凭证。证据 `collab/outbox/tester-1/testsync264/`。
+
+## 2026-09-20 — tester-1 — TEST-EXEC-264 ✅ 阶段四回归全绿 + 1024 独立复验通过
+
+- **回归逐 target**：root **1274P/0F/15I**（EXIT 0，=预期；main 1186 / crash-reporter 52 / int 36）；`src-tauri` **85P/0F**（=预期）；UI Vitest **100P/0F/11S**；browser/E2E SKIP。warnings root bin 110 / test 101、src-tauri `cargo check` 17 = 基线。
+- **+7 落点吻合**：main 1179→1186、src-tauri 78→85（阶段三 7 条 db 护栏经 `#[path]` 双编入两 crate）。
+- **🔴 额外必验 (1) 1024 短音频**：自选 `dia_hunan.wav`(7.01s)→「他总的来讲，孙膑对兵法的理解、文样比庞涓略胜一筹。」、`rag_physics.wav`(12.12s)→「根据碰撞理论，月面样本缺少挥发性物质。」—— 出字 + 标点齐全，RTF 0.16/0.08，加载 5.803s。
+- **🔴 额外必验 (2) 长音频 37.25s**：自建 `lyrics_en_3+far_2+rag_math` 拼接；输出覆盖全三段、末句以「。」收尾（= rag_math 原句）**不截断**，RTF 0.2141。口径：poc 无 VAD（生产 ≤20s 分段）⇒ 本测**更严**。
+- **262 模型核对**：两副本 `llm.int8.onnx` sha `c326cdeb…` 相等（600,025,528B）；两处 `.512.bak` **保留未删**（600,339,316B）；`max_total_len` 元数据命中。
+- **独立边界**：未复用 coder-1 素材/结论；未重跑 512↔1024 逐字差分（需 ~1GB 临时副本）。
+- **证据**：`collab/outbox/tester-1/testexec264/`（cargo_test_root / cargo_test_tauri / npm_test / asr_1024_run / model_and_check）。
+- **红线**：未改生产代码 / 未删 `.512.bak` 与 wordbook 备份 / 未 commit / 版本未动 / 零凭证。
+
+## 2026-09-20 — coder-1 — HOTWORDS-BUDGET-265 ✅ 交付（热词上限 120 + 字符预算 500）
+
+- **改动 1 文件** `src/transcription/mod.rs`：`HOTWORDS_MAX_ENTRIES` 20→120；新增 `HOTWORDS_MAX_TOTAL_CHARS=500`（算式注释：1024−333−24=667，留200给生成≈560字符取500）；`curate_hotwords_entries` 累加含逗号字符、超预算 **break**。
+- **单测 18/18 PASS**（120 短词全进 359；120 长词截 45/494；边界 500 保留・501 丢弃）。
+- **实测**：20s 音频上 120 短词与预算后长词均**无 Truncating/Falling back** 且输出完整；未预算 120 长词（1319）Truncating 空（对照）。
+- **⚠️ 待裁定**：500 下 2–3 字可容 120 条，4 字×120=599 → 截到 100。若要 4 字全进需预算 ≥600。
+- **验证**：cargo check 0 error（110/101 基线）；rustfmt clean；未跑全量（归 tester-1）。
+- **红线**：未动版本；备份未动；零凭证。
+
+## 2026-09-20 — coder-1 — WORDBOOK-UI-SORT-266 ✅ 交付（并入 265 同批）
+
+- **改动 1 文件** `src-tauri/src/wordbook.rs`：删 `entries.sort_by(|a,b| b.id.cmp(&a.id))`（263 的 UI 稳定排序），改注释为依据 Gavin 2026-09-20 指示按频率排序、底层 SQL 已 `hit_count DESC, id DESC` 直接透传；`mut entries`→`entries`。
+- **检查**：src-tauri 无 id DESC 断言；db.rs 排序断言属 DB 层未动；前端 filter 保序 ⇒ 两 tab 自动正确。
+- **验证**：src-tauri cargo check 0 error（17 基线）；rustfmt clean；`npm run test -- Wordbook` 13/13 PASS。
+- **红线**：未动版本；备份未动；零凭证。
+
+## 2026-09-20 — coder-1 — 265 600 裁定 ✅ 交付
+
+- **变更**：`HOTWORDS_MAX_TOTAL_CHARS` 500→**600**（主控裁定；算式 1024−340−24−500=160 给生成；让 4 字词装满 120 条）。
+- **单测**：新增 4字×120 全进(599)；10字×120 截 54(593)；边界正好600保留/601丢弃；`-- curate` 全 PASS。
+- **实测**：常用字 4×120(599) 无 Truncating/Falling back；**生僻字** 4×120(599) → context 1289 Truncating 空 ⇒ **char≠token 边界**（生僻 CJK byte 回退 ≈3tok/字），字符预算为近似闸门非硬上界。
+- **验证**：cargo check 0 error（110/101）；rustfmt clean；未跑全量（归测试阶段）。
+- **红线**：未动版本；备份未动；零凭证。
+
+## 2026-09-20 — coder-1 — HOTWORDS-TOKEN-268 评估 ✅ 交付（方案建议，未改代码）
+
+- **结论：选 B**（`tokenizers` 真实编码）。`tokenizers = "0.22.1"` 已在 Cargo.toml:27 ⇒ **无新依赖**（主控头号顾虑不成立）。
+- **A 否决**：vocab.json 是 **byte-level BPE**（'北' in vocab=False）→ CJK 全部查表失败按字节 → common4×120 估 1559 vs 真值 360（4.3×）→ 只 38 条。
+- **中间档否决**：字节词表贪心对 CJK 失效 → rare4×120 估 599 vs 真值 783 低估 → 实际 623>500 溢出（违保守判据）。
+- **B 数据**：common4×120=360 全进 / rare4×120=783 截 79 / mixed1/3=476 全进；加载 375.8ms（OnceLock 懒加载）。
+- **校准**：C++ 与 Rust tokenizer 可能差 ~1.22× → B 计数加安全边际，实现阶段用实测系数定。
+- **待出包后实现**（BUILD-267 期间不改生产代码）；本单零生产改动。
+
+## 2026-09-20 — tester-1 — BUILD-267 出包 ✅（263/262/260/265/266，八项 + 三条额外全 PASS）
+
+- **构建**：Step1–4 全走（npm 749ms / Tauri UI 109s / 主程序 143s）；三 exe + 两 toml 入 `Publish/`；本批 `ui/` 零 diff（266 为后端 `src-tauri/src/wordbook.rs` 去 UI 重排、透传 `hit_count DESC`）。
+- **八项**：①时间戳 main 23:17:59 / ui 23:15:26 / crash 23:16:43 ②两副本 sha 相等且三者异于 BUILD-258（main `db7c7878…` / ui `01090dc2…` / crash `85e7c5cf…`）③ProductVersion 0.9.2 与上包相同系 Gavin 未升版，按替代判据「sha 异于上包」④冒烟 Responding=True ×3 + 无 crash.json + panic/ERROR 0 + 残留 0 ⑤`config.toml` `da2be5da…` / `wordbook.sqlite` `b6ab43ac…` 零变化 ⑥warnings 110/101/17 ⑦探针（`grep -a -F`）`hit_count = hit_count + 1`=1 / `ORDER BY hit_count DESC, id DESC`=1 / `local_realtime`=1 / `asr_local_realtime_unlocked`=1 ⑧scene `8ea93bb1…` / itn `311cbb96…` 三副本全等。
+- **额外①**：`Publish/models/.../llm.int8.onnx` = 600,025,528 B（1024，sha `c326cdeb…` = 源副本），**非** `.512.bak` 600,339,316。
+- **额外②**：两处 `.512.bak` **保留未删**；`Publish/` 无 zip/setup 产物，`voice-ime.iss` [Files] 不含 funasr-nano 目录 ⇒ 现成安装包不带它；⚠️ **整目录打包 `Publish/` 会带上 600MB 备份**，出 zip/安装包时须排除（未擅自移动/删除）。
+- **额外③**：真实 exe 冒烟驱动 DB 迁移三态全通 —— 新库列 = `id,word,source,created_at,hit_count,last_used_at`；旧库 raw→word + `auto→system` 归一 + 候选 `count=3` 保留 + 新列补齐；状态 C 补列正常；全程无 `no such column`/`duplicate column`/panic。测试前备份并**原样恢复** `target/release/{config.toml,wordbook.sqlite}`。
+- **证据**：`collab/outbox/tester-1/build267/`（prebuild_baseline / verify_all / extra12 / extra3_fresh|legacy|restore / verify_smoke）。
+- **红线**：版本 0.9.2 三处未动 / 未 commit / 未改生产代码 / `.512.bak` 与 wordbook 备份未删 / 零凭证。
+
+## 2026-09-20 — coder-1 — 268 追踪：951 构成判别 ✅（情况①）
+
+- **判别**：104s 音频强制溢出取 C++ `before`，4 组差值 168/168/**293**/173 ⇒ 不恒定 ⇒ **情况① tokenizer 不一致**（C++ 手搓 byte-level BPE vs tokenizer.json 管线），热词 token 比 1.15–1.66×，Rust `tokenizers` 低估。
+- **连带发现**：4 字常用×120 before=653 → 20s 段 context 991≤1024 无 Truncating 但只剩 33 token 生成 ⇒ **生成饿死无日志**，验证判据须加「生成未饿死」；且 120×4 字与 1024 预算冲突。
+- **建议**：首选 Rust 复刻 C++ 分词；否则按 C++ 真计数重定预算/降目标。**待主控裁定**，出包后实施。
+- **红线**：零生产改动；未动版本；零凭证。

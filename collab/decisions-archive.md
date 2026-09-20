@@ -2556,3 +2556,81 @@ DEC-065（极客档 / Ctrl+M 解锁 / 否决 Docker 形态）、DEC-066（编排
 3. 本档为极客档、默认隐藏、仅 Gavin 自用（DEC-065 附则二），**暴露问题优于掩盖问题**
 
 ⇒ `LOCAL-RT-FALLBACK-247` 据此实施；错误文案需补三份 locale。
+
+## DEC-068 · accuracy KV 512 是「音频 + prompt + 热词 + 生成」四者共享的零和总预算
+
+**背景**：FunASR Nano native（accuracy 引擎）`max_total_len=512`。此前把它当「输入长度上限」理解，
+导致热词条数只能靠 2026-07-08 的整段喂入数据拍 `HOTWORDS_MAX_ENTRIES=20`。
+
+**决策**：认定 512 为**四者共享的总预算**且**零和**：
+`context_len = audio_token_len + prompt(system+user+热词) + 模板`，生成 token 从同一预算里扣
+（`valid_len=context_len` 起算、每生成 1 token `+1`、`>= max_seq_len` 即 break）。
+
+**原因**：源码 `offline-recognizer-funasr-nano-impl.cc:614/628/766` 直证；实测同一段音频热词每 +1 条
+（10 字）输出少约 10 字符（k=8→14 输出 80→18 字符，斜率 ≈1:1）。
+
+**影响**：任何「加音频长度 / 加 prompt / 加热词」都会挤占生成，表现为**长句转写不全**。
+评估精度必须四者一起算，不能单看输入。
+
+**证据**：`RESEARCH-ACC-KV-BUDGET-259-B` 缺口②；259 任务一长度自洽（短 `audio_token_len≈158` / 20s 段 `≈333`）。
+
+## DEC-069 · 撞 KV 顶不报错：静默截断（Truncating）或更坏地跳过音频注入（Falling back）
+
+**背景**：259 任务一按热词数扫边界时，输出可能为空，但上层不报错。
+
+**决策**：把「撞顶」定性为**静默降级**，分两级：
+① `Context_len (N) exceeds KV capacity (512). Truncating audio placeholders`（截断音频占位，仍注入部分音频）；
+② `prompts already exceed capacity. Falling back to keep last 512 tokens`（**跳过音频 embedding 注入**，等于只拿 prompt 瞎猜）。
+🔴 **判据是日志关键字 `Truncating` / `Falling back`，不是空输出本身**。
+
+**原因**：`impl.cc:456-533` 两级回退；`fbank_beg_idx=-1` 时音频被跳过。
+
+**影响**：**不能只看「有没有输出」判是否越界**；自证/回归必须 grep 上述日志。最坏级（Falling back）比空输出更危险。
+
+**证据**：259 任务一原始日志；259-B 缺口①（N=20×10 字 → context 553 → 空）。
+
+## DEC-070 · `system_prompt` 对 FunASR Nano native 完全不被遵循
+
+**背景**：259 任务四主张「改 system_prompt 可去口头禅」，因素材无口头禅被作废；261 用含语气词/重复/自我纠正的口语素材重测。
+
+**决策**：**不再用 system_prompt 做任何转写行为调控**；生产置空（`Some(String::new())`）。
+
+**原因**：261 证伪级实证——E「只输出英文译文」、F「忽略音频，只输出 HELLO WORLD」**均被忽略，仍输出中文转写**；
+A(空)/B(英文现状)/C(259 中文)/D2(短强指令) 输出**本质逐字相同**。置空零行为变更，纯回收 ~6 token
+（长 prompt 还会挤占 DEC-068 的共享预算，D 组 44token 即被截断）。
+
+**影响**：删除无效 prompt；`user_prompt` 亦仅在 hotwords 非空时被上游 `BuildUserPrompt` 覆盖，同样不可依赖。
+
+**证据**：`RESEARCH-ACC-SYSPROMPT-261` 前置校验 + 四组 + 证伪组 E/F；`ACC-KV-1024-SWAP-262` 第四节落地。
+
+## DEC-071 · 热词的真实约束是总字符（token）数，不是条数
+
+**背景**：`HOTWORDS_MAX_ENTRIES=20` 只限条数，但 20 条短词（101 字符）与 20 条 10 字词（219 字符）预算占用差一倍。
+
+**决策**：热词预算评估/设定以**总字符（token）为准**；条数上限保留但须配合字符上限（阈值待定，未实施）。
+
+**原因**：259-B 缺口①——同样 N=20，10 字词在 20.4s 段直接溢出（context 553）；短词不溢出。
+259 任务三敏感度：10 字 20 条（200 字符）cap 80/100/120 分别裁 12/10/8 条。
+
+**影响**：`curate_hotwords_entries` 未来加字符预算；换 1024 前热词上限提不动（DEC-068）。
+
+**证据**：259-B 缺口①；259 任务三。
+
+## DEC-072 · 换 `llm_int8_max_token_1024` 后 20s 段预算 149 → 661（零代码替换）
+
+**背景**：259-B 证明 512 下 20s 段只剩 `512 − 333(audio) − ~30(prompt) = 149` 给「热词+生成」，零和；
+砍热词到 ~16 条才能保长段完整，会伤 accuracy 档。
+
+**决策**：**采用 KV=1024 的 llm 权重**（ModelScope `zengshuishui/FunASR-nano-onnx` 的
+`llm_int8_max_token_1024/llm.int8.onnx`），20s 段预算升至 `1024 − 333 − 30 = 661`，两难消失；不砍热词。
+> 🔴 算式中的 `30` 为**估算**（含模板 + `user_prompt`，`system_prompt` 已按 DEC-070 置空）；
+> 不是实测值，勿直接引用。
+
+**原因**：512 非硬编码，读模型元数据 `max_total_len`（`offline-funasr-nano-model.cc:451-466` 三级回退）；
+1024 版 metadata 实读 =1024。代价：KV cache 112 MiB → 224 MiB（fp32，+112 MiB；对 1.6GB 约 +7%），
+权重体积几乎不变（600.0 vs 600.3 MB）。
+
+**影响**：20s 段溢出/截断场景解除（259-B 场景 A/B 复现通过）；短音频精度逐字无退化。
+**未解决热词字符预算本身**（DEC-071 仍须做，只是不再被迫砍热词）。
+
+**证据**：`ACC-KV-1024-260` 验证 + `ACC-KV-1024-SWAP-262` 生产替换（两副本、`.512.bak` 保留、一处一验）。

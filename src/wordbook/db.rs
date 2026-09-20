@@ -8,6 +8,8 @@ use super::cache::WordbookEntry;
 const MIGRATION_001: &str = include_str!("../../migrations/001_wordbook.sql");
 const MIGRATION_002: &str = include_str!("../../migrations/002_wordbook_candidates.sql");
 const MIGRATION_003: &str = include_str!("../../migrations/003_wordbook_singleword.sql");
+// WORDBOOK-HITCOUNT-263: 频率列迁移（ALTER 非幂等，由 ensure_hitcount_columns 守卫）
+const MIGRATION_004: &str = include_str!("../../migrations/004_wordbook_hitcount.sql");
 
 /// WORDBOOK-SCHEMA-FIX-001: 全新库直接建 word 模式 schema（不执行 001/002 的旧表 DDL、
 /// 不执行 legacy import）。复用 003 的 word 列定义但用最终表名，避免两处 schema 定义漂移。
@@ -16,7 +18,9 @@ CREATE TABLE IF NOT EXISTS wordbook (\
 \n    id INTEGER PRIMARY KEY AUTOINCREMENT,\
 \n    word TEXT NOT NULL,\
 \n    source TEXT NOT NULL,\
-\n    created_at TEXT NOT NULL\
+\n    created_at TEXT NOT NULL,\
+\n    hit_count INTEGER NOT NULL DEFAULT 0,\
+\n    last_used_at TEXT\
 \n);\
 \n\
 \nCREATE UNIQUE INDEX IF NOT EXISTS idx_wordbook_new_unique ON wordbook(word);\
@@ -59,8 +63,12 @@ pub fn load_entries() -> Result<Vec<WordbookEntry>> {
 
 pub fn load_word_entries() -> Result<Vec<StoredWordbookEntry>> {
     let conn = open_connection()?;
-    let mut stmt =
-        conn.prepare("SELECT id, word, source, created_at FROM wordbook ORDER BY id DESC")?;
+    // WORDBOOK-HITCOUNT-263: 按使用频率取词（常用浮前）。tiebreak `id DESC` 是必须的——
+    // 现有库 hit_count 全为 0，此时排序完全退化成 id DESC，与改动前逐位相同；
+    // 若写成单列 `hit_count DESC`，全 0 时顺序不确定会让 hotwords_version 抖动、触发无谓重载。
+    let mut stmt = conn.prepare(
+        "SELECT id, word, source, created_at FROM wordbook ORDER BY hit_count DESC, id DESC",
+    )?;
     let entries = stmt
         .query_map([], |row| {
             Ok(StoredWordbookEntry {
@@ -180,6 +188,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
     if table_exists == 0 {
         // 状态 A：全新库 → 直接建 word 模式 schema，不执行 001/002/legacy import
         conn.execute_batch(WORD_SCHEMA)?;
+        // 263: WORD_SCHEMA 已含 hit_count/last_used_at；此处为幂等兜底
+        ensure_hitcount_columns(conn)?;
         return Ok(());
     }
 
@@ -200,6 +210,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(MIGRATION_003)?;
         finalize_singleword_migration(conn)?;
         normalize_source(conn)?;
+        // 263: 003 finalize 后的表来自 003 定义（无频率列）→ 补 004
+        ensure_hitcount_columns(conn)?;
         return Ok(());
     }
 
@@ -226,8 +238,65 @@ fn init_schema(conn: &Connection) -> Result<()> {
     }
     // 3. source 归一化：先 SELECT 判断有无非法值，有才 UPDATE（避免写放大）
     normalize_source(conn)?;
+    // 4. WORDBOOK-HITCOUNT-263: 确保频率列存在（存量库补 004）
+    ensure_hitcount_columns(conn)?;
 
     Ok(())
+}
+
+/// WORDBOOK-HITCOUNT-263: 确保 `wordbook` 有 `hit_count` / `last_used_at` 两列。
+///
+/// 🔴 ALTER TABLE ADD COLUMN **非幂等**（列已存在会报错），故必须先查 `pragma_table_info`
+/// 再决定是否执行 004。迁移库走 004、全新库由 WORD_SCHEMA 直建、已迁移库在此补齐。
+fn ensure_hitcount_columns(conn: &Connection) -> Result<()> {
+    let has: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('wordbook') WHERE name = 'hit_count'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has == 0 {
+        conn.execute_batch(MIGRATION_004)?;
+    }
+    Ok(())
+}
+
+/// WORDBOOK-HITCOUNT-263: 用**最终上屏文本**记录词条命中（频率）。
+///
+/// - 用 final_text 而非 raw_text：raw 里热词没起作用/认错的词永远拿不到分（马太效应），
+///   而「常说但常认错」的词恰恰最该占热词额度。
+/// - 匹配 `final_text.contains(word)`；词条量级几十~几百，成本可忽略。
+/// - 批量一次事务写库（不逐条 execute）；调用方须放在**上屏之后**，不挡输入法延迟。
+/// 返回命中并自增的词条数。
+// `#[allow(dead_code)]`：src-tauri crate 以 `#[path]` 镜像编译本模块，但不调用本函数
+// （仅主程序 main.rs 调用）⇒ 在 tauri 侧会判 never used。root 侧真实使用。
+#[allow(dead_code)]
+pub fn record_hits(final_text: &str) -> Result<usize> {
+    if final_text.trim().is_empty() {
+        return Ok(0);
+    }
+    let mut conn = open_connection()?;
+    let words: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT word FROM wordbook")?;
+        let iter = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        iter.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let matched: Vec<String> = words
+        .into_iter()
+        .filter(|w| !w.is_empty() && final_text.contains(w.as_str()))
+        .collect();
+    if matched.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.transaction()?;
+    for w in &matched {
+        tx.execute(
+            "UPDATE wordbook SET hit_count = hit_count + 1, last_used_at = datetime('now') \
+             WHERE word = ?1",
+            params![w],
+        )?;
+    }
+    tx.commit()?;
+    Ok(matched.len())
 }
 
 /// WORDBOOK-SCHEMA-FIX-001（主控修法一）：残留临时表救援。
@@ -1377,6 +1446,293 @@ mod tests {
         assert_eq!(
             idx_a, idx_b,
             "wordbook index names must be identical between state A and state B"
+        );
+    }
+
+    // ============================================================
+    // WORDBOOK-HITCOUNT-263: 热词频率（hit_count / last_used_at）护栏
+    //
+    // 为什么用**真实文件库**：`load_word_entries()` / `record_hits()` 内部各自调
+    // `open_connection()` → `db_path()`（测试 exe 同级），没有可注入 Connection 的缝。
+    // 复制一份 SQL 字符串到断言里不是护栏——生产查询被改坏时复制体不会红。
+    // 故按 `db_path()` 同源决议拿到文件路径、真实调用 public 函数。
+    // （建议 coder：给这两个函数补 `*_in_conn(&Connection)` 变体，参照既有
+    //   `upsert_candidate_in_conn` 先例；本条为阶段三不改生产代码的权宜。）
+    // ============================================================
+
+    /// 频率用例共用一个文件库，串行化避免互相踩数据（先例 [TESTENV-SHARED-DIR-RACE-001]）。
+    static FILE_DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 与 `db_path()` 同源决议：测试 exe 所在目录的 `wordbook.sqlite`。
+    fn file_db_path() -> std::path::PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("wordbook.sqlite")
+    }
+
+    /// 重置并预置文件库：先建/补齐 schema，再清空 `wordbook`，再按 `(word, hit_count)`
+    /// 插入；返回各词按插入顺序得到的自增 id（供 id DESC 断言用）。
+    fn seed_file_db(words: &[(&str, i64)]) -> Vec<i64> {
+        let conn = Connection::open(file_db_path()).expect("open file db");
+        conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))
+            .expect("busy timeout");
+        init_schema(&conn).expect("init file db schema");
+        conn.execute("DELETE FROM wordbook", [])
+            .expect("clear wordbook");
+        let mut ids = Vec::new();
+        for (word, hits) in words {
+            conn.execute(
+                "INSERT INTO wordbook (word, source, created_at, hit_count) \
+                 VALUES (?1, 'user', '2024-01-01T00:00:00Z', ?2)",
+                rusqlite::params![word, hits],
+            )
+            .expect("seed insert");
+            ids.push(conn.last_insert_rowid());
+        }
+        ids
+    }
+
+    /// 读回文件库每个词的 hit_count。
+    fn file_db_hit_counts() -> std::collections::HashMap<String, i64> {
+        let conn = Connection::open(file_db_path()).expect("open file db for read");
+        let mut stmt = conn
+            .prepare("SELECT word, hit_count FROM wordbook")
+            .expect("prepare read");
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .expect("query read")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect read");
+        rows.into_iter().collect()
+    }
+
+    /// 🔴 回归护栏（263 零回归的立身之本）：全库 hit_count = 0（现有用户库的真实状态）时，
+    /// `load_word_entries()` 的顺序必须与 263 改动前**逐位相同** = `id DESC`。
+    ///
+    /// 为什么必须红：顺序一变 → hotwords_version 哈希抖动 → 触发无谓引擎重载（accuracy ~6s）。
+    /// 若有人把查询写成单列 `ORDER BY hit_count DESC`（丢掉 id tiebreak），全 0 时顺序不再
+    /// 确定为 id DESC，本用例必须变红。
+    #[test]
+    fn hitcount263_all_zero_ordering_is_id_desc() {
+        let _guard = FILE_DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ids = seed_file_db(&[("回归甲", 0), ("回归乙", 0), ("回归丙", 0)]);
+        assert_eq!(ids.len(), 3, "seed must insert 3 rows");
+        assert!(ids[0] < ids[1] && ids[1] < ids[2], "id 必须随插入递增");
+
+        let got: Vec<String> = load_word_entries()
+            .expect("load_word_entries")
+            .into_iter()
+            .map(|e| e.word)
+            .collect();
+        // id DESC ⇒ 后插入的在前（= 263 改动前 `ORDER BY id DESC` 的行为）
+        assert_eq!(
+            got,
+            vec!["回归丙", "回归乙", "回归甲"],
+            "全 hit_count=0 时必须退化为 id DESC（与改动前逐位相同）"
+        );
+        // 反向绑定：若退化成 id ASC，说明 tiebreak 丢了
+        assert_ne!(
+            got,
+            vec!["回归甲", "回归乙", "回归丙"],
+            "tiebreak id DESC 丢失（退化成 id ASC）"
+        );
+    }
+
+    /// 排序生效：`hit_count DESC`，命中数相同时按 `id DESC` tiebreak。
+    /// 插入顺序 甲(0) 乙(5) 丙(2) 丁(2) ⇒ id 递增 ⇒ 期望 [乙, 丁, 丙, 甲]。
+    #[test]
+    fn hitcount263_ordering_hits_desc_then_id_desc() {
+        let _guard = FILE_DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        seed_file_db(&[("排序甲", 0), ("排序乙", 5), ("排序丙", 2), ("排序丁", 2)]);
+
+        let got: Vec<String> = load_word_entries()
+            .expect("load_word_entries")
+            .into_iter()
+            .map(|e| e.word)
+            .collect();
+        assert_eq!(
+            got,
+            vec!["排序乙", "排序丁", "排序丙", "排序甲"],
+            "应 hit_count DESC、同命中按 id DESC（丁 id > 丙 id，故丁在前）"
+        );
+    }
+
+    /// 迁移幂等：`ensure_hitcount_columns` 缺列时补列，连续第二次不得因
+    /// 「duplicate column name」报错（ALTER ADD COLUMN 非幂等，是本批最易踩的坑）。
+    #[test]
+    fn hitcount263_ensure_hitcount_columns_idempotent() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        // 构造 003 finalize 后的表（无频率列）
+        conn.execute_batch(MIGRATION_001).expect("migration 001");
+        conn.execute_batch(MIGRATION_002).expect("migration 002");
+        conn.execute_batch(MIGRATION_003).expect("migration 003");
+        finalize_singleword_migration(&conn).expect("finalize");
+
+        let col_count = |c: &Connection, name: &str| -> i64 {
+            c.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('wordbook') WHERE name = ?1",
+                rusqlite::params![name],
+                |r| r.get(0),
+            )
+            .expect("pragma count")
+        };
+        assert_eq!(
+            col_count(&conn, "hit_count"),
+            0,
+            "前置：迁移表应缺 hit_count"
+        );
+        assert_eq!(
+            col_count(&conn, "last_used_at"),
+            0,
+            "前置：迁移表应缺 last_used_at"
+        );
+
+        ensure_hitcount_columns(&conn).expect("first ensure must add columns");
+        assert_eq!(col_count(&conn, "hit_count"), 1, "首次应补上 hit_count");
+        assert_eq!(
+            col_count(&conn, "last_used_at"),
+            1,
+            "首次应补上 last_used_at"
+        );
+
+        // 🔴 第二次：若守卫坏了会 duplicate column name 报错
+        ensure_hitcount_columns(&conn).expect("second ensure must be idempotent");
+
+        // 补列后数据仍可写、列数不翻倍
+        conn.execute(
+            "INSERT INTO wordbook (word, source, created_at) \
+             VALUES ('幂等词', 'user', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert after migration");
+        assert_eq!(col_count(&conn, "hit_count"), 1);
+        assert_eq!(col_count(&conn, "last_used_at"), 1);
+    }
+
+    /// 漂移高发区（coder-1 点名）：全新库（`WORD_SCHEMA` 直建）与迁移库
+    /// （001→003→finalize→ensure_004）的 `PRAGMA table_info(wordbook)` 必须**逐字段一致**
+    /// （name / type / notnull / dflt_value / pk，含顺序）。任一列定义、默认值、NOT NULL
+    /// 或列顺序漂移 → 立刻红。
+    #[test]
+    fn hitcount263_fresh_vs_migrated_table_info_identical() {
+        let table_info = |c: &Connection| -> Vec<(String, String, i64, Option<String>, i64)> {
+            c.prepare(
+                "SELECT name, type, \"notnull\", dflt_value, pk \
+                 FROM pragma_table_info('wordbook') ORDER BY cid",
+            )
+            .expect("prepare table_info")
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })
+            .expect("query table_info")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect table_info")
+        };
+
+        // 全新库（状态 A）
+        let fresh = Connection::open_in_memory().expect("in-memory fresh");
+        init_schema(&fresh).expect("init fresh db");
+        let fresh_info = table_info(&fresh);
+
+        // 迁移库（状态 B）
+        let migrated = Connection::open_in_memory().expect("in-memory migrated");
+        migrated.execute_batch(MIGRATION_001).expect("001");
+        migrated.execute_batch(MIGRATION_002).expect("002");
+        migrated.execute_batch(MIGRATION_003).expect("003");
+        finalize_singleword_migration(&migrated).expect("finalize");
+        ensure_hitcount_columns(&migrated).expect("ensure 004");
+        let migrated_info = table_info(&migrated);
+
+        assert_eq!(
+            fresh_info, migrated_info,
+            "全新库与迁移库的 wordbook 列定义必须逐字段一致（含顺序/类型/默认值/NOT NULL/pk）"
+        );
+
+        // 明确绑定 263 新列确实在两侧都存在（防「两侧一起漏列」的自洽假绿）
+        let names: Vec<String> = fresh_info.iter().map(|c| c.0.clone()).collect();
+        assert!(
+            names.contains(&"hit_count".to_string()),
+            "hit_count 必须存在于 wordbook"
+        );
+        assert!(
+            names.contains(&"last_used_at".to_string()),
+            "last_used_at 必须存在于 wordbook"
+        );
+    }
+
+    /// record_hits：命中词条 +1 并写 last_used_at，未命中词条不变，返回命中的条目数。
+    #[test]
+    fn hitcount263_record_hits_increments_only_matched_words() {
+        let _guard = FILE_DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        seed_file_db(&[("命中词", 0), ("旁词", 0)]);
+
+        let n = record_hits("这是一句包含命中词的最终文本").expect("record_hits");
+        assert_eq!(n, 1, "只应命中 1 个词条");
+
+        let hits = file_db_hit_counts();
+        assert_eq!(hits.get("命中词").copied().unwrap_or(-1), 1, "命中词应 +1");
+        assert_eq!(
+            hits.get("旁词").copied().unwrap_or(-1),
+            0,
+            "未命中词不得变化"
+        );
+
+        // last_used_at 被写入（非 NULL）
+        let conn = Connection::open(file_db_path()).expect("open for last_used_at");
+        let last: Option<String> = conn
+            .query_row(
+                "SELECT last_used_at FROM wordbook WHERE word = '命中词'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("read last_used_at");
+        assert!(last.is_some(), "命中后 last_used_at 必须写入");
+    }
+
+    /// record_hits：空 / 纯空白文本直接 Ok(0) 且不写库；空库同样 Ok(0) 不报错。
+    #[test]
+    fn hitcount263_record_hits_empty_text_and_empty_db_ok() {
+        let _guard = FILE_DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        seed_file_db(&[("空文本词", 0)]);
+
+        assert_eq!(record_hits("").expect("empty text must be Ok"), 0);
+        assert_eq!(record_hits("   ").expect("blank text must be Ok"), 0);
+        assert_eq!(
+            file_db_hit_counts().get("空文本词").copied().unwrap_or(-1),
+            0,
+            "空文本不得改任何计数"
+        );
+
+        // 空库（无任何词条）
+        seed_file_db(&[]);
+        assert_eq!(
+            record_hits("任意文本都不该报错").expect("empty db must be Ok"),
+            0
+        );
+    }
+
+    /// record_hits 语义锚定（**把实际行为断言下来，不按想象改代码**）：
+    /// 同一词条在同段文本中出现多次仍只 +1 —— 实现是「每个去重词条一条 UPDATE」，
+    /// 与出现次数无关（`wordbook.word` 唯一，SELECT 出的词天然去重）。
+    #[test]
+    fn hitcount263_record_hits_same_word_twice_counts_once() {
+        let _guard = FILE_DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        seed_file_db(&[("重复词", 0)]);
+
+        let n = record_hits("重复词 中间 重复词").expect("record_hits");
+        assert_eq!(n, 1, "同一词条无论出现几次，命中条目数都是 1");
+        assert_eq!(
+            file_db_hit_counts().get("重复词").copied().unwrap_or(-1),
+            1,
+            "同一词条多次出现只 +1（实际行为，非 +N）"
         );
     }
 }

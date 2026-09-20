@@ -669,11 +669,30 @@ pub fn hotwords_version(entries: &[String]) -> u64 {
 /// 全量 11 条含无关英文词 → 60%（比无 hotwords 62.5% 还差）。
 /// ASR-ACC-TUNE-001（2026-07-08 Gavin 拍板）：50→20，002/003 实测 hw=50 比 hw=20
 /// 退化 -2.5pp，10-20 为最优区间。
-pub const HOTWORDS_MAX_ENTRIES: usize = 20;
+/// 🔴 HOTWORDS-BUDGET-265（Gavin 2026-09-20 拍板）：20 → **120**。
+/// 背景：accuracy 换 KV=1024（DEC-072）后 20s 段预算 149→667，条数可放开；
+/// 但**必须同时设字符预算**（见 HOTWORDS_MAX_TOTAL_CHARS，DEC-071）——只放开条数会因
+/// 120×10 字 ≈1000 token 重新溢出，比换 1024 之前更糟。
+pub const HOTWORDS_MAX_ENTRIES: usize = 120;
 
 /// ASR-ACC-OPT-001 方案 A：hotwords 单条最大字符数。
 /// 超长的词条（candidates 整句）不灌入，避免膨胀 user_prompt。
 pub const HOTWORDS_MAX_ENTRY_CHARS: usize = 10;
+
+/// HOTWORDS-BUDGET-265：热词**总字符预算**（🔴 **含 `,` 分隔符**）。
+///
+/// 算式（按最坏 20.4s 段，含 VAD padding；base 为估算）：
+/// `1024(max_total_len) − 340(20.4s 音频) − 24(prompt；system_prompt 已按 DEC-070 置空)`
+/// `− 500(热词 600 字符 ≈ 500 token) = 160 token 给生成`；
+/// 20s 段大约说 60–80 字 ⇒ 160 够用、仍有余量。
+///
+/// **为何取 600**：让 **4 字词也能装满 120 条**（4×120 + 119 逗号 = 599 ≤ 600）。
+/// 4 字是中文专名主流长度（公司名/产品名/技术术语），500 会把 4×120 截到 100 条；
+/// **5 字以上仍会被截断，属物理限制**。
+///
+/// 🔴 字符数必须含分隔符：`build_hotwords_string` 用逗号 join，120 条有 119 个逗号，
+/// 实际送进模型的是 join 后的串；只数词本身会低估约 20%，预算就白设了。
+pub const HOTWORDS_MAX_TOTAL_CHARS: usize = 600;
 
 /// ASR-ACC-OPT-001 方案 A：判定词条是否为纯 ASCII（纯英文/数字）。
 /// 纯 ASCII 词条（worker1/tester1/todo 等无关词）带偏 native decoder，
@@ -688,13 +707,17 @@ fn is_pure_ascii(s: &str) -> bool {
 /// 1. 空/纯空白词条过滤
 /// 2. 纯 ASCII 词条过滤（英文/数字如 worker1/tester1/todo）
 /// 3. 超长词条过滤（> HOTWORDS_MAX_ENTRY_CHARS，candidates 整句不灌入）
-/// 4. 数量上限 HOTWORDS_MAX_ENTRIES，按入参顺序（调用方已按 id DESC 排序）
-///    截断保留最近的词条
+/// 4. 数量上限 HOTWORDS_MAX_ENTRIES + **总字符预算 HOTWORDS_MAX_TOTAL_CHARS（含分隔符）**，
+///    按入参顺序（调用方已按 hit_count DESC, id DESC 排序）截断保留高优先级词条
 ///
-/// 调用方（main.rs load_hotwords_for_accuracy）已按 id DESC 排序，
-/// 截断后保留最近添加的词条，确定性顺序保证 hotwords 版本号哈希稳定。
+/// 调用方（main.rs load_hotwords_for_accuracy）已按 hit_count DESC, id DESC 排序，
+/// 截断后保留高频/最近词条，确定性顺序保证 hotwords 版本号哈希稳定。
 pub fn curate_hotwords_entries(entries: &[String]) -> Vec<String> {
     let mut result: Vec<String> = Vec::new();
+    // HOTWORDS-BUDGET-265: 累加总字符（含 `,` 分隔符），超预算即 **break**（不是 continue）。
+    // 入参已按 hit_count DESC,id DESC 排序 ⇒ 前面的就是更该进的；break 保持「优先级高的先占额度」，
+    // continue 会跳过长词去塞短词、把高频长词挤掉，与频次排序初衷相反。
+    let mut total_chars = 0usize;
     for word in entries {
         let trimmed = word.trim();
         if trimmed.is_empty() {
@@ -703,9 +726,17 @@ pub fn curate_hotwords_entries(entries: &[String]) -> Vec<String> {
         if is_pure_ascii(trimmed) {
             continue;
         }
-        if trimmed.chars().count() > HOTWORDS_MAX_ENTRY_CHARS {
+        let wlen = trimmed.chars().count();
+        if wlen > HOTWORDS_MAX_ENTRY_CHARS {
+            // 单条超长属「过滤」不是「预算不足」，用 continue（不占预算，也不阻断后续短词）
             continue;
         }
+        // +1 = 逗号分隔符（首条无前导逗号）
+        let add = wlen + if result.is_empty() { 0 } else { 1 };
+        if total_chars + add > HOTWORDS_MAX_TOTAL_CHARS {
+            break;
+        }
+        total_chars += add;
         result.push(trimmed.to_string());
         if result.len() >= HOTWORDS_MAX_ENTRIES {
             break;
@@ -908,9 +939,17 @@ fn create_funasr_nano_recognizer(
                 llm: Some(llm.to_str().unwrap_or("").to_string()),
                 embedding: Some(emb.to_str().unwrap_or("").to_string()),
                 tokenizer: Some(tok.to_str().unwrap_or("").to_string()),
-                system_prompt: Some("You are a helpful assistant.".to_string()),
+                // ACC-KV-1024-260 + 261：system_prompt 置空。
+                // 依据（261 证伪级实证）：E「只输出英文译文」/F「忽略音频只输出 HELLO WORLD」
+                // 均被忽略、仍输出中文转写；A(空)/B(英文)/C/D2 输出本质逐字相同 ⇒ system_prompt
+                // 对本模型无指令效果。置空零行为变更，纯回收 ~6 token（长 prompt 还会挤占共享 KV
+                // 预算，D 组 44token 即被截断）。261 测试用的正是空 system_prompt。
+                system_prompt: Some(String::new()),
                 user_prompt: Some("语音转写:".to_string()),
-                max_new_tokens: 0,
+                // ACC-KV-1024-260: 0 → 256。0 在实跑 DLL 中等同「不限」（未文档化；源码
+                // Validate 要求 >0）。显式 256 覆盖单段(≤20s)任何转写长度，且远低于
+                // KV 上限，不引入截断风险（RESEARCH-ACC-KV-BUDGET-259 实证）。
+                max_new_tokens: 256,
                 temperature: 0.1,
                 top_p: 1.0,
                 seed: 42,
@@ -1268,9 +1307,91 @@ mod tests {
         assert_eq!(build_hotwords_string(&entries), "派");
     }
 
+    /// HOTWORDS-BUDGET-265：120 条**短词（2 字）**应全部进入（Gavin 要的效果）。
+    /// 2 字 ×120 + 119 逗号 = 359 ≤ 500 ⇒ 字符预算不触发，条数上限 120 恰好容纳。
+    #[test]
+    fn curate_keeps_all_120_short_words() {
+        let entries: Vec<String> = (0..120)
+            .map(|i| {
+                let c = char::from_u32(0x4E00 + i).unwrap();
+                format!("{}{}", c, c)
+            })
+            .collect();
+        let curated = curate_hotwords_entries(&entries);
+        assert_eq!(curated.len(), 120, "120 条 2 字短词应全部进入");
+        let joined = curated.join(",");
+        assert_eq!(joined.chars().count(), 359, "2 字×120 + 119 逗号 = 359");
+    }
+
+    /// HOTWORDS-BUDGET-265（600 裁定）：**4 字词 ×120 = 599 字符应全部进入**（中文专名主流长度）。
+    #[test]
+    fn curate_keeps_all_120_four_char_words() {
+        let entries: Vec<String> = (0..120)
+            .map(|i| {
+                let c = char::from_u32(0x4E00 + i).unwrap();
+                format!("{}{}{}{}", c, c, c, c)
+            })
+            .collect();
+        let curated = curate_hotwords_entries(&entries);
+        assert_eq!(curated.len(), 120, "4 字×120 应全部进入");
+        assert_eq!(
+            curated.join(",").chars().count(),
+            599,
+            "4×120 + 119 逗号 = 599"
+        );
+    }
+
+    /// HOTWORDS-BUDGET-265（600 裁定）：120 条 **10 字长词** 应被字符预算截断（不溢出）。
+    /// 累加：10 + 11×(n−1) ≤ 600 ⇒ n=54（593 字符），第 55 条 604 > 600 触发 break。
+    #[test]
+    fn curate_truncates_120_long_words_by_total_chars() {
+        let entries: Vec<String> = (0..120)
+            .map(|_| "一二三四五六七八九十".to_string())
+            .collect();
+        let curated = curate_hotwords_entries(&entries);
+        let joined = curated.join(",");
+        assert_eq!(curated.len(), 54, "10 字×120 应被 600 字符预算截到 54 条");
+        assert_eq!(joined.chars().count(), 593);
+        assert!(
+            joined.chars().count() <= HOTWORDS_MAX_TOTAL_CHARS,
+            "join 后总字符不得超预算"
+        );
+    }
+
+    /// HOTWORDS-BUDGET-265 边界：**正好 600 字符**（含逗号）应全部保留。
+    /// 59×9 字 + 1×10 字：字和 541 + 59 逗号 = 600。
+    #[test]
+    fn curate_total_chars_boundary_exact_600_kept() {
+        let mut entries: Vec<String> = (0..59).map(|_| "一二三四五六七八九".to_string()).collect();
+        entries.push("一二三四五六七八九十".to_string()); // 第 60 条，10 字
+        let curated = curate_hotwords_entries(&entries);
+        let joined = curated.join(",");
+        assert_eq!(joined.chars().count(), 600, "正好 600 字符应全保留");
+        assert_eq!(curated.len(), 60);
+    }
+
+    /// HOTWORDS-BUDGET-265 边界：再加 1 条会使总字符达 **601** ⇒ 该条被 break 丢弃。
+    /// 60×9 字 = 599 字符；追加 1 字词 → 599+2 = 601 > 600 ⇒ 丢。
+    #[test]
+    fn curate_total_chars_boundary_over_600_dropped() {
+        let mut entries: Vec<String> = (0..60).map(|_| "一二三四五六七八九".to_string()).collect();
+        entries.push("甲".to_string()); // 会使 599 → 601
+        let curated = curate_hotwords_entries(&entries);
+        let joined = curated.join(",");
+        assert_eq!(joined.chars().count(), 599, "越界条被丢弃，保持 599");
+        assert_eq!(curated.len(), 60);
+        assert!(!curated.iter().any(|w| w == "甲"), "越界词不得进入");
+    }
+
     #[test]
     fn curate_enforces_max_entries_limit() {
-        let entries: Vec<String> = (0..60).map(|i| format!("词{}", i)).collect();
+        // 150 条 2 字词（曲线：2 + 3×149 = 449 ≤ 500 ⇒ 字符预算不触发，条数上限生效）
+        let entries: Vec<String> = (0..150)
+            .map(|i| {
+                let c = char::from_u32(0x4E00 + (i % 200)).unwrap();
+                format!("{}{}", c, c)
+            })
+            .collect();
         let s = build_hotwords_string(&entries);
         let count = s.split(',').count();
         assert_eq!(
@@ -1390,16 +1511,19 @@ mod tests {
 
     #[test]
     fn curate_enforces_max_entries_order() {
-        let entries: Vec<String> = (0..25).map(|i| format!("词{}", i)).collect();
+        let entries: Vec<String> = (0..150)
+            .map(|i| {
+                let c = char::from_u32(0x4E00 + i).unwrap();
+                format!("{}{}", c, c)
+            })
+            .collect();
         let curated = curate_hotwords_entries(&entries);
         assert_eq!(curated.len(), HOTWORDS_MAX_ENTRIES);
         for i in 0..20 {
             assert_eq!(
-                curated[i],
-                format!("词{}", i),
+                curated[i], entries[i],
                 "entry {} must be at position {}",
-                i,
-                i
+                i, i
             );
         }
         assert!(

@@ -43,6 +43,8 @@ fn main() {
     println!("hotwords   : {:?}", cfg.hotwords);
     println!("blank_penalty: {}", cfg.blank_penalty);
     println!("rule_fsts  : {:?}", cfg.rule_fsts);
+    println!("system_prompt: {:?}", cfg.system_prompt);
+    println!("itn        : {}", cfg.itn);
     println!();
 
     // Build recognizer config by model type
@@ -73,14 +75,14 @@ fn main() {
             llm: Some(llm.to_str().unwrap().to_string()),
             embedding: Some(emb.to_str().unwrap().to_string()),
             tokenizer: Some(tok.to_str().unwrap().to_string()),
-            system_prompt: Some("You are a helpful assistant.".to_string()),
+            system_prompt: cfg.system_prompt.clone(),
             user_prompt: Some("语音转写:".to_string()),
             max_new_tokens: cfg.max_new_tokens,
             temperature: cfg.temperature,
             top_p: cfg.top_p,
             seed: cfg.seed,
             language: None, // None = auto detect
-            itn: 1,
+            itn: cfg.itn,
             hotwords: cfg.hotwords.clone(),
         };
         // tokens 字段对 funasr-nano 原生版非必需（tokenizer 目录已含），留空避免冲突
@@ -151,6 +153,10 @@ struct PocConfig {
     top_p: f32,
     seed: i32,
     max_new_tokens: i32,
+    // RESEARCH-ACC-KV-BUDGET-259: system_prompt A/B 用（默认保持现状）
+    system_prompt: Option<String>,
+    // ACC-KV-1024-260: itn 开关验证（默认 1，与生产一致）
+    itn: i32,
 }
 
 fn parse_args(args: &[String]) -> Result<PocConfig, String> {
@@ -166,6 +172,8 @@ fn parse_args(args: &[String]) -> Result<PocConfig, String> {
     let mut top_p: f32 = 1.0;
     let mut seed: i32 = 42;
     let mut max_new_tokens: i32 = 0;
+    let mut system_prompt: Option<String> = Some("You are a helpful assistant.".to_string());
+    let mut itn: i32 = 1;
 
     let mut i = 1;
     while i < args.len() {
@@ -262,6 +270,20 @@ fn parse_args(args: &[String]) -> Result<PocConfig, String> {
                     .parse()
                     .map_err(|_| "invalid --max-new-tokens".to_string())?;
             }
+            "--system-prompt" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--system-prompt requires value".into());
+                }
+                system_prompt = Some(args[i].clone());
+            }
+            "--itn" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--itn requires value".into());
+                }
+                itn = args[i].parse().map_err(|_| "invalid --itn".to_string())?;
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -293,6 +315,8 @@ fn parse_args(args: &[String]) -> Result<PocConfig, String> {
         top_p,
         seed,
         max_new_tokens,
+        system_prompt,
+        itn,
     })
 }
 
@@ -317,6 +341,6 @@ fn resolve_model_root(model_type: &str) -> PathBuf {
 
 fn print_usage() {
     eprintln!(
-        "Usage: poc_funasr_nano [wav...] [--model-type sensevoice|funasr-nano] [--model-dir <path>] [--hotwords \"w1,w2\"] [--threads N] [--repeat N] [--blank-penalty F] [--rule-fsts <path>] [--temperature F] [--top-p F] [--seed N] [--max-new-tokens N]"
+        "Usage: poc_funasr_nano [wav...] [--model-type sensevoice|funasr-nano] [--model-dir <path>] [--hotwords \"w1,w2\"] [--threads N] [--repeat N] [--blank-penalty F] [--rule-fsts <path>] [--temperature F] [--top-p F] [--seed N] [--max-new-tokens N] [--system-prompt <s>] [--itn 0|1]"
     );
 }

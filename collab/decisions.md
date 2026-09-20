@@ -90,6 +90,11 @@
 | DEC-063 | LLM `temperature` 维持 0.3 不动 —— 实测 30 次证明温度不是格式化稳定性的杠杆，根因在提示词基座 | 现行 |
 | DEC-065 | 本地实时流式 ASR 定位「极客档」：默认完全隐藏，设置界面 `Ctrl+M` 才解锁；**否决 FunASR Runtime 独立服务形态**（与 tray-first 免安装冲突），走 sherpa-onnx 进程内 | 现行 |
 | DEC-067 | 本地 realtime 选型：**streaming-paraformer-trilingual（228MB, greedy）做流式预览 + accuracy（972MB）做 2pass 最终文本与热词**。否决 zipformer——热词强制 beam，beam 必产生改写/回退，与 DEC-054 前缀单调前提冲突 | 现行 |
+| DEC-068 | accuracy KV 512 是「音频+prompt+热词+生成」**四者共享的零和总预算**，生成 token 计入其中；评估精度必须四者一起算 | 现行 |
+| DEC-069 | 🔴 撞 KV 顶**不报错**：静默 `Truncating`（截音频）或 `Falling back`（跳过音频注入，最坏）。**判越界看日志关键字 `Truncating`/`Falling back`，不是看有没有输出** | 现行 |
+| DEC-070 | `system_prompt` 对 FunASR Nano native **完全不被遵循**（261 证伪组 E/F：连「只输出 HELLO WORLD」都被忽略）⇒ 生产置空，禁止用它调控转写行为 | 现行 |
+| DEC-071 | 热词真实约束是**总字符（token）数**不是条数；条数上限须配字符预算 | 现行 |
+| DEC-072 | 换 `llm_int8_max_token_1024`（零代码、KV +112MiB）使 20s 段预算 149→661，不砍热词；算式 base 30 为估算（system_prompt 已置空） | 现行 |
 
 ### 已推翻 / 历史（引用前先看这一列）
 

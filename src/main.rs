@@ -9253,6 +9253,31 @@ fn run_pipeline_core(
                             log::error!("Injection failed: {}", e);
                         } else {
                             log::info!("Injection completed successfully");
+                            // WORDBOOK-HITCOUNT-263: 上屏后用**最终文本**记词频（仅使用 hotwords
+                            // 的 accuracy 引擎档位：Accuracy / LocalRealtime）。放在注入成功之后，
+                            // 不挡输入法延迟；用 final_text 而非 raw_text（常说但常认错的词最该占额度）。
+                            if transcription::AsrModel::from_config(&config.audio.asr_model)
+                                .uses_accuracy_engine()
+                            {
+                                // WORDBOOK-HITCOUNT-263（主控增补）：写库丢**后台线程**，
+                                // 绝不挡住 worker 回到待命。db.rs BUSY_TIMEOUT_MS=3000，若与设置
+                                // 界面读并发撞 SQLITE_BUSY 最坏同步卡 3s（用户感受：连续说话时第二次
+                                // 按热键没反应）。统计丢一次无所谓，故 fire-and-forget、失败仅记日志。
+                                let hit_text = final_text.clone();
+                                std::thread::spawn(move || {
+                                    match wordbook::db::record_hits(&hit_text) {
+                                        Ok(n) if n > 0 => log::info!(
+                                            "WORDBOOK-HITCOUNT-263: recorded {} word hits",
+                                            n
+                                        ),
+                                        Ok(_) => {}
+                                        Err(e) => log::warn!(
+                                            "WORDBOOK-HITCOUNT-263: record_hits failed: {}",
+                                            e
+                                        ),
+                                    }
+                                });
+                            }
                         }
                         maybe_learn_user_edit(&final_text, text_snapshot, runtime_config);
                         send_event(event_tx, PipelineEvent::Done);

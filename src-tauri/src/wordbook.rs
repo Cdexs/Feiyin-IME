@@ -27,6 +27,11 @@ pub fn get_wordbook_entries() -> Result<Vec<WordbookEntry>, String> {
         .list_all()
         .map_err(|err| format!("读取词库条目失败：{}", err))?;
 
+    // WORDBOOK-UI-SORT-266（Gavin 2026-09-20 指示）：设置界面词库列表**按使用频率排序，
+    // 高频在前**。list_all 底层的 load_word_entries 已是 `ORDER BY hit_count DESC, id DESC`
+    // （hit_count 相同时按最近添加）⇒ 直接透传，**不再在 UI 侧重排**。
+    // （263 曾在此按 id DESC 重排以保持显示顺序不变；266 依 Gavin 指示删除，行为以本注释为准。）
+
     Ok(entries
         .into_iter()
         .map(|entry| WordbookEntry {
