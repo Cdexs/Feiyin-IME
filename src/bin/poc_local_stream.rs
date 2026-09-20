@@ -13,17 +13,19 @@
 use sherpa_onnx::{
     OfflineFunASRNanoModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
     OfflineSenseVoiceModelConfig, OnlineParaformerModelConfig, OnlineRecognizer,
-    OnlineRecognizerConfig, Wave,
+    OnlineRecognizerConfig, OnlineTransducerModelConfig, Wave,
 };
 use std::env;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const USAGE: &str =
-    "Usage: poc_local_stream <wav...> [--stream-dir D] [--perf-dir D] [--acc-dir D] \
-[--threads 1,2,4] [--chunk-ms 100] [--enable-endpoint] [--skip-offline] \
-[--hotwords-file F] [--hotwords-score S] [--decoding-method greedy_search|modified_beam_search] \
-[--hr-lexicon F] [--hr-rule-fsts F] [--probe offline-hw-perf|online-hw|hr]";
+    "Usage: poc_local_stream <wav...> [--model paraformer|zipformer] [--stream-dir D] \
+[--zipformer-dir D] [--modeling-unit cjkchar|bpe|cjkchar+bpe] [--bpe-vocab F] \
+[--perf-dir D] [--acc-dir D] [--threads 1,2,4] [--chunk-ms 100] [--enable-endpoint] \
+[--skip-offline] [--hotwords-file F] [--hotwords-score S] [--hotwords-stream \"p1/p2\"] \
+[--decoding-method greedy_search|modified_beam_search] [--hr-lexicon F] [--hr-rule-fsts F] \
+[--probe offline-hw-perf|online-hw|hr]";
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -76,7 +78,8 @@ fn main() {
     // ---------------- Part 1/2/3: streaming ----------------
     for &threads in &cfg.threads {
         println!("\n########## STREAMING num_threads={} ##########", threads);
-        let rec = match build_online(&cfg, threads, None, "greedy_search") {
+        let hw_owned = cfg.hotwords();
+        let rec = match build_online(&cfg, threads, hw_owned.as_ref(), &cfg.decoding_method) {
             Some(r) => r,
             None => {
                 eprintln!(
@@ -105,6 +108,7 @@ fn main() {
                 0,
                 false,
                 None,
+                None,
             );
             println!(
                 "[RTF] threads={} audio={:.3}s decode_sum={:.3}s wall={:.3}s RTF={:.4}",
@@ -131,6 +135,7 @@ fn main() {
                 cfg.chunk_ms as u64,
                 true,
                 Some(snap_file.clone()),
+                None,
             );
             match lat.first_char_ms {
                 Some(ms) => println!(
@@ -224,27 +229,44 @@ fn run_probe(cfg: &PocConfig, probe: &str, wavs: &[(String, Wave)]) {
             }
         }
         "online-hw" => {
-            println!("\n##### PROBE online-hw: streaming paraformer + hotwords #####");
             println!(
-                "hotwords_file={:?} score={} decoding={}",
-                cfg.hotwords_file, cfg.hotwords_score, cfg.decoding_method
+                "\n##### PROBE online-hw: {:?} + hotwords (score={}, decoding={}) #####",
+                cfg.model, cfg.hotwords_score, cfg.decoding_method
             );
-            let base = build_online(cfg, 4, None, "greedy_search");
+            println!(
+                "hotwords_file={:?} hotwords_stream={:?}",
+                cfg.hotwords_file, cfg.hotwords_stream
+            );
+            let base = build_online(cfg, 4, None, &cfg.decoding_method);
             let hw = cfg.hotwords();
-            let variant = match &hw {
+            let variant_cfg = match &hw {
                 Some(h) => build_online(cfg, 4, Some(h), &cfg.decoding_method),
                 None => None,
             };
+            // per-stream channel: recognizer built WITHOUT config hotwords, hotwords
+            // passed to create_stream_with_hotwords().
+            let variant_stream_rec = if cfg.hotwords_stream.is_some() {
+                build_online(cfg, 4, None, &cfg.decoding_method)
+            } else {
+                None
+            };
             println!(
-                "[probe] baseline_create={} variant_create={}",
+                "[probe] baseline_create={} config_hw_create={} stream_rec_create={}",
                 base.is_some(),
-                variant.is_some()
+                variant_cfg.is_some(),
+                variant_stream_rec.is_some()
             );
             let chunk = 1600usize; // 100ms @ 16k
             for (name, wave) in wavs {
-                let b = base.as_ref().map(|r| online_text(r, wave, chunk));
-                let v = variant.as_ref().map(|r| online_text(r, wave, chunk));
-                report_ab("online-hw", name, b, v);
+                let b = base.as_ref().map(|r| online_text(r, wave, chunk, None));
+                if let Some(v) = variant_cfg.as_ref() {
+                    let vt = online_text(v, wave, chunk, None);
+                    report_ab("online-hw[config]", name, b.clone(), Some(vt));
+                }
+                if let Some(v) = variant_stream_rec.as_ref() {
+                    let vt = online_text(v, wave, chunk, cfg.hotwords_stream.as_deref());
+                    report_ab("online-hw[stream]", name, b.clone(), Some(vt));
+                }
             }
         }
         "hr" => {
@@ -278,7 +300,12 @@ fn offline_text(rec: &OfflineRecognizer, wave: &Wave) -> Option<String> {
     stream.get_result().map(|r| r.text)
 }
 
-fn online_text(rec: &OnlineRecognizer, wave: &Wave, chunk: usize) -> String {
+fn online_text(
+    rec: &OnlineRecognizer,
+    wave: &Wave,
+    chunk: usize,
+    stream_hotwords: Option<&str>,
+) -> String {
     run_stream(
         rec,
         wave.samples(),
@@ -287,6 +314,7 @@ fn online_text(rec: &OnlineRecognizer, wave: &Wave, chunk: usize) -> String {
         0,
         false,
         None,
+        stream_hotwords,
     )
     .final_text
 }
@@ -334,8 +362,12 @@ fn run_stream(
     pace_ms: u64,
     collect: bool,
     snap_file: Option<PathBuf>,
+    stream_hotwords: Option<&str>,
 ) -> StreamRun {
-    let stream = rec.create_stream();
+    let stream = match stream_hotwords {
+        Some(hw) => rec.create_stream_with_hotwords(hw),
+        None => rec.create_stream(),
+    };
     let start = Instant::now();
     let mut decode_secs = 0.0f64;
     let mut first_char_ms: Option<f64> = None;
@@ -441,27 +473,58 @@ fn build_online(
     hw: Option<&Hotwords>,
     decoding: &str,
 ) -> Option<OnlineRecognizer> {
-    let enc = cfg.stream_dir.join("encoder.int8.onnx");
-    let dec = cfg.stream_dir.join("decoder.int8.onnx");
-    let tok = cfg.stream_dir.join("tokens.txt");
-    for p in [&enc, &dec, &tok] {
-        if !p.exists() {
-            eprintln!("[online] missing model file: {}", p.display());
-            return None;
-        }
-    }
     let mut c = OnlineRecognizerConfig::default();
-    c.model_config.paraformer = OnlineParaformerModelConfig {
-        encoder: Some(enc.to_string_lossy().to_string()),
-        decoder: Some(dec.to_string_lossy().to_string()),
-    };
-    c.model_config.tokens = Some(tok.to_string_lossy().to_string());
+    if cfg.model == "zipformer" {
+        let enc = cfg.zipformer_dir.join("encoder-epoch-99-avg-1.int8.onnx");
+        let dec = cfg.zipformer_dir.join("decoder-epoch-99-avg-1.int8.onnx");
+        let joi = cfg.zipformer_dir.join("joiner-epoch-99-avg-1.int8.onnx");
+        let tok = cfg.zipformer_dir.join("tokens.txt");
+        for p in [&enc, &dec, &joi, &tok] {
+            if !p.exists() {
+                eprintln!("[online] missing model file: {}", p.display());
+                return None;
+            }
+        }
+        c.model_config.transducer = OnlineTransducerModelConfig {
+            encoder: Some(enc.to_string_lossy().to_string()),
+            decoder: Some(dec.to_string_lossy().to_string()),
+            joiner: Some(joi.to_string_lossy().to_string()),
+        };
+        c.model_config.tokens = Some(tok.to_string_lossy().to_string());
+        c.model_config.modeling_unit = Some(cfg.modeling_unit.clone());
+        if cfg.modeling_unit.contains("bpe") {
+            let bpe = cfg
+                .bpe_vocab
+                .clone()
+                .unwrap_or_else(|| cfg.zipformer_dir.join("bpe.vocab"));
+            if !bpe.exists() {
+                eprintln!("[online] missing bpe.vocab: {}", bpe.display());
+                return None;
+            }
+            c.model_config.bpe_vocab = Some(bpe.to_string_lossy().to_string());
+        }
+    } else {
+        let enc = cfg.stream_dir.join("encoder.int8.onnx");
+        let dec = cfg.stream_dir.join("decoder.int8.onnx");
+        let tok = cfg.stream_dir.join("tokens.txt");
+        for p in [&enc, &dec, &tok] {
+            if !p.exists() {
+                eprintln!("[online] missing model file: {}", p.display());
+                return None;
+            }
+        }
+        c.model_config.paraformer = OnlineParaformerModelConfig {
+            encoder: Some(enc.to_string_lossy().to_string()),
+            decoder: Some(dec.to_string_lossy().to_string()),
+        };
+        c.model_config.tokens = Some(tok.to_string_lossy().to_string());
+    }
     c.model_config.num_threads = threads;
     c.model_config.provider = Some("cpu".to_string());
     c.model_config.debug = false;
     c.decoding_method = Some(decoding.to_string());
     if decoding == "modified_beam_search" {
-        c.max_active_paths = 4;
+        c.max_active_paths = cfg.max_active_paths;
     }
     if let Some(hw) = hw {
         c.hotwords_file = Some(hw.file.to_string_lossy().to_string());
@@ -562,7 +625,11 @@ struct Hr {
 }
 
 struct PocConfig {
+    model: String,
     stream_dir: PathBuf,
+    zipformer_dir: PathBuf,
+    modeling_unit: String,
+    bpe_vocab: Option<PathBuf>,
     perf_dir: PathBuf,
     acc_dir: PathBuf,
     wavs: Vec<String>,
@@ -573,6 +640,8 @@ struct PocConfig {
     snapshot_dir: PathBuf,
     hotwords_file: Option<PathBuf>,
     hotwords_score: f32,
+    hotwords_stream: Option<String>,
+    max_active_paths: i32,
     decoding_method: String,
     hr_lexicon: Option<PathBuf>,
     hr_rule_fsts: Option<PathBuf>,
@@ -597,7 +666,11 @@ impl PocConfig {
 fn parse_args(args: &[String]) -> Result<PocConfig, String> {
     let models = resolve_models_dir();
     let mut cfg = PocConfig {
+        model: "paraformer".to_string(),
         stream_dir: models.join("sherpa-onnx-streaming-paraformer-trilingual-zh-cantonese-en"),
+        zipformer_dir: models.join("sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"),
+        modeling_unit: "cjkchar+bpe".to_string(),
+        bpe_vocab: None,
         perf_dir: models.join("sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17"),
         acc_dir: models.join("sherpa-onnx-funasr-nano-int8-2025-12-30"),
         wavs: Vec::new(),
@@ -608,6 +681,8 @@ fn parse_args(args: &[String]) -> Result<PocConfig, String> {
         snapshot_dir: PathBuf::from("."),
         hotwords_file: None,
         hotwords_score: 2.0,
+        hotwords_stream: None,
+        max_active_paths: 4,
         decoding_method: "greedy_search".to_string(),
         hr_lexicon: None,
         hr_rule_fsts: None,
@@ -647,6 +722,36 @@ fn parse_args(args: &[String]) -> Result<PocConfig, String> {
                 cfg.chunk_ms = need(args, i, "--chunk-ms")?
                     .parse()
                     .map_err(|_| "bad --chunk-ms".to_string())?;
+            }
+            "--model" => {
+                i += 1;
+                let v = need(args, i, "--model")?;
+                if v != "paraformer" && v != "zipformer" {
+                    return Err("--model must be paraformer or zipformer".into());
+                }
+                cfg.model = v.to_string();
+            }
+            "--zipformer-dir" => {
+                i += 1;
+                cfg.zipformer_dir = PathBuf::from(need(args, i, "--zipformer-dir")?);
+            }
+            "--modeling-unit" => {
+                i += 1;
+                cfg.modeling_unit = need(args, i, "--modeling-unit")?.to_string();
+            }
+            "--bpe-vocab" => {
+                i += 1;
+                cfg.bpe_vocab = Some(PathBuf::from(need(args, i, "--bpe-vocab")?));
+            }
+            "--hotwords-stream" => {
+                i += 1;
+                cfg.hotwords_stream = Some(need(args, i, "--hotwords-stream")?.to_string());
+            }
+            "--max-active-paths" => {
+                i += 1;
+                cfg.max_active_paths = need(args, i, "--max-active-paths")?
+                    .parse()
+                    .map_err(|_| "bad --max-active-paths".to_string())?;
             }
             "--enable-endpoint" => cfg.enable_endpoint = true,
             "--skip-offline" => cfg.skip_offline = true,

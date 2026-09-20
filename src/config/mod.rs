@@ -173,6 +173,14 @@ pub struct AudioConfig {
     /// 与 `asr_online_max_sentence_silence` 同属在线 ASR 隐藏调参。
     #[serde(default)]
     pub asr_online_semantic_punctuation_enabled: bool,
+    /// LOCAL-RT-UI-240: 本地 realtime 档位解锁开关（DEC-065 极客档，默认隐藏）。
+    ///
+    /// false（默认）= 设置界面不渲染 `local_realtime` 选项；
+    /// true = 渲染。由设置窗口内按 Ctrl+M 解锁并**落盘持久化**
+    /// （仅窗口焦点内 keydown，非全局热键，不碰 DEC-004）。
+    /// 必须先解锁才能选到该档位，故默认隐藏不影响任何现有用户。
+    #[serde(default)]
+    pub asr_local_realtime_unlocked: bool,
 }
 
 fn default_overlay_opacity() -> f32 {
@@ -320,6 +328,8 @@ impl Default for AudioConfig {
             asr_online_max_sentence_silence: default_asr_online_max_sentence_silence(),
             // ASR-SEG-229: 默认 false = VAD 断句（保持既有行为），A/B 走 config.toml
             asr_online_semantic_punctuation_enabled: false,
+            // LOCAL-RT-UI-240: 极客档默认隐藏，Ctrl+M 解锁后置 true 并落盘
+            asr_local_realtime_unlocked: false,
         }
     }
 }

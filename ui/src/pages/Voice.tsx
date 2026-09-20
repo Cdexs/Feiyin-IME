@@ -16,7 +16,7 @@ interface AccuracyModelInfo {
 const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
   const [devices, setDevices] = useState<string[]>([]);
   const [modelInfo, setModelInfo] = useState<AccuracyModelInfo | null>(null);
-  const [copiedField, setCopiedField] = useState<'url' | 'dir' | null>(null);
+  const [copiedField, setCopiedField] = useState<string | null>(null);
   const t = getTranslations(config.ui_language);
 
   const [qwen3TestStatus, setQwen3TestStatus] = useState<'idle' | 'testing' | 'success' | 'failed'>('idle');
@@ -32,9 +32,33 @@ const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
   // 造成「显示 performance 实际跑 qwen」的不一致。两者都不可取，故按存量保留、
   // 新用户不可见处理：切走之后就再也切不回来。
   const asrModel = config.audio?.asr_model ?? "performance";
+  // LOCAL-RT-UI-240: 本地 realtime 极客档（DEC-065），默认隐藏，本页按 Ctrl+M 解锁
+  const localRealtimeUnlocked = config.audio?.asr_local_realtime_unlocked === true;
 
   useEffect(() => {
     loadDevices();
+  }, []);
+
+  // LOCAL-RT-UI-240: 本页内 Ctrl+M 解锁本地 realtime 档位。
+  // - 只开不关（A：避免「下拉显示 performance 实际跑 local_realtime」的显示/行为不一致，
+  //   同 ASR-UI-208 注释判定）
+  // - window keydown 天然只在设置窗口有焦点、且本页挂载时生效，不注册全局热键（不碰 DEC-004）
+  // - 仅在确认 Ctrl+M 时处理，其余按键不拦截（不 preventDefault 无关事件）
+  // - 复用 updateConfig → save_config 落盘持久化（重启不丢）
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === 'm' || e.key === 'M')) {
+        e.preventDefault();
+        const cur = latestRef.current.config;
+        if (cur?.audio?.asr_local_realtime_unlocked === true) return;
+        updateConfig({
+          ...cur,
+          audio: { ...cur.audio, asr_local_realtime_unlocked: true }
+        });
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
   }, []);
 
   useEffect(() => {
@@ -188,11 +212,40 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
       case 'accuracy': return t.voice_asr_model_accuracy_desc;
       case 'qwen_audio_online': return t.voice_asr_model_qwen3_desc;
       case 'fun_asr_realtime': return t.voice_asr_model_fun_asr_desc;
+      case 'local_realtime': return t.voice_asr_model_local_realtime_desc;
       default: return '';
     }
   };
 
-const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.ready;
+  const handleCopyText = async (text: string, key: string) => {
+    const ok = await copyToClipboard(text);
+    if (ok) {
+      setCopiedField(key);
+      setTimeout(() => setCopiedField(null), 2000);
+    }
+  };
+
+  // LOCAL-RT-UI-240: local_realtime 需要的两个模型（DEC-067 选型）。
+  // 目标目录根复用后端 check_accuracy_model_ready 返回的 model_dir（exe 同级 models 目录，
+  // DEC-011）去掉末段推导，避免前端硬编码绝对路径。
+  const lrModelsRoot = modelInfo?.model_dir
+    ? modelInfo.model_dir.replace(/[\\/][^\\/]+$/, '')
+    : 'models';
+  const lrModels = [
+    {
+      name: 'sherpa-onnx-streaming-paraformer-trilingual-zh-cantonese-en',
+      size: '228 MB',
+      url: 'https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models',
+    },
+    {
+      name: 'sherpa-onnx-funasr-nano-int8-2025-12-30',
+      size: '972 MB',
+      url: 'https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models',
+    },
+  ].map((m) => ({ ...m, dir: `${lrModelsRoot}\\${m.name}` }));
+
+  const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.ready;
+  const showLocalRealtimeAlert = asrModel === 'local_realtime';
 
   return (
     <div className="settings-page">
@@ -226,6 +279,9 @@ const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.rea
               <option value="qwen_audio_online">{t.voice_asr_model_qwen3}</option>
             )}
             <option value="fun_asr_realtime">{t.voice_asr_model_fun_asr}</option>
+            {localRealtimeUnlocked && (
+              <option value="local_realtime">{t.voice_asr_model_local_realtime}</option>
+            )}
           </select>
 
           <p className="asr-model-desc" style={{ marginTop: '8px' }}>
@@ -271,6 +327,44 @@ const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.rea
                   </button>
                 </div>
               </div>
+              <p className="form-hint" style={{ marginTop: '8px' }}>
+                {t.voice_asr_model_manual_download}
+              </p>
+            </div>
+          )}
+
+          {showLocalRealtimeAlert && (
+            <div className="asr-model-alert">
+              <p className="asr-model-alert-title">{t.voice_asr_model_local_realtime_download_required}</p>
+              {lrModels.map((m, i) => (
+                <div key={m.name} style={{ marginBottom: '12px' }}>
+                  <div className="asr-model-field">
+                    <span className="asr-model-label">
+                      {m.name} · {t.voice_asr_model_local_realtime_size}: {m.size}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => invoke('open_url_in_browser', { url: m.url }).catch(() => {})}
+                      className="btn btn-primary btn-sm"
+                    >
+                      {t.voice_asr_model_open_download}
+                    </button>
+                  </div>
+                  <div className="asr-model-field">
+                    <span className="asr-model-label">{t.voice_asr_model_target_dir}</span>
+                    <div className="asr-model-path-row">
+                      <code className="asr-model-path">{m.dir}</code>
+                      <button
+                        type="button"
+                        onClick={() => handleCopyText(m.dir, `lr_dir_${i}`)}
+                        className="btn btn-secondary btn-sm"
+                      >
+                        {copiedField === `lr_dir_${i}` ? t.voice_copied : t.voice_copy}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))}
               <p className="form-hint" style={{ marginTop: '8px' }}>
                 {t.voice_asr_model_manual_download}
               </p>

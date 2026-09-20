@@ -995,3 +995,19 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **HomophoneReplacer**：对 performance 生效（3/3 修对）；`replace.fst` 生成受 pynini 无 Windows 包阻塞。
 - **验证**：`cargo check --bin poc_local_stream` 0 error；`rustfmt --check` clean。未跑 cargo test/release。
 - **负责人**：coder-1 ｜ **日期**：2026-09-20
+
+## LOCAL-RT-UI-240 · 2026-09-20 · ✅ 本地 realtime 档位 UI 解锁 + 配置字段（待验收）
+
+- **配置**：主 + Tauri 镜像新增 `asr_local_realtime_unlocked: bool`（`#[serde(default)]` 默认 false；镜像含穷举字面量同步，防 [CONFIG-MIRROR-DRIFT-001]）。
+- **UI**：Voice.tsx 加 Ctrl+M 解锁（只开不关、仅本页+焦点、落盘持久化）+ 条件渲染 `local_realtime` option + 两模型下载提示卡片（paraformer 228MB / funasr-nano 972MB）。
+- **文案**：zh-Hans「本地流式实时模型」/ zh-Hant「本地串流即時模型」/ en「Local Streaming Realtime」，三份齐全。
+- **验证**：`npm run build` 通过；`cargo check --all-targets` 0 error（111/102 基线）、src-tauri 0 error（17 基线）；三 locale grep 齐全。
+- **负责人**：coder-1 ｜ **日期**：2026-09-20
+
+## PIPELINE-ORCH-238（第一步：N9+N5）· 2026-09-20 · ✅ 后处理链节点提取（纯结构，零行为变更）
+
+- **范围**：DEC-066 第一步。仅提取 N9 标点决策 + N5 场景采集两段；N6 LLM 格式化/翻译按主控指令拆到 238-B，本单不做。
+- **改动**：`src/main.rs` 新增 `apply_local_punctuation(...) -> String` 与 `capture_pipeline_scene(config, target_hwnd) -> scene::SceneContext`；调用点原地替换。判据/顺序/文案/日志逐位不变。
+- **验证**：`cargo check --all-targets` 0 error、warnings 111/102=基线；`rustfmt --check src/main.rs` clean；未跑 cargo test（归 tester-1 全量回归）。
+- **已知**：`--numstat`(90/57) 与 `--numstat -w`(88/55) 差 2/2，根因为新增调用点 `final_text,`/`);` 行在 -w 下巧合匹配被删 log 行，属 extract method 固有，非 fmt 连带。
+- **负责人**：coder-2 ｜ **日期**：2026-09-20

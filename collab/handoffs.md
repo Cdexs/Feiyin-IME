@@ -4,6 +4,16 @@
 
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行，超 200 行上限）。
 
+## 2026-09-20 — coder-2 — PIPELINE-ORCH-238（N9+N5）✅ 交付（后处理链节点提取，纯结构零行为变更；待主控验收 → tester-1 全量回归）
+
+- **范围**：DEC-066 第一步，按主控调整只做 N9 + N5，N6（LLM 格式化/翻译）拆到 238-B 本单不做。调用点原地替换 = 标准 extract method。
+- **N9**：HEAD `src/main.rs:8974-9008` 内联标点决策 → 新 `fn apply_local_punctuation(final_text: String, enabled, llm_handled, translate_requested, native_punctuated, engine: Option<&mut punctuation::PunctuationEngine>) -> String`；调用点传 `punctuation_engine.as_deref_mut()`，内部 `if let Some(ref mut engine)` 等价改 `if let Some(engine)`。
+- **N5**：HEAD `:8748-8777` 内联场景采集 + SCENE-OBS-001 观测日志 → 新 `fn capture_pipeline_scene(config: &AppConfig, target_hwnd: platform::WindowId) -> scene::SceneContext`；日志随迁，`f4_injected` 函数内派生。
+- **零改**：`from_online_streaming`/`native_punctuated` 取值方式、节点顺序、log 文案与顺序、i18n 字符串；未碰 src-tauri。
+- **验证**：`cargo check --all-targets` 0 error、warnings **111/102** = 基线；`rustfmt --edition 2021 --check src/main.rs` clean。🔴 未跑 cargo test（按 DEC-048/分工归 tester-1）；按 Gavin 指令不写新测试/护栏/消融。
+- **已知差值**：`--numstat` 90/57 vs `--numstat -w` 88/55（差 2/2）= 新调用点 `final_text,`/`);` 在 -w 下巧合匹配被删 log 行，extract method 固有，非 fmt 连带；已上报主控。
+- **红线**：只改 `src/main.rs` 一文件 / 未 commit / 未出包 / 版本未动 / 零凭证。
+
 ## 2026-09-20 — coder-2 — TEST-SYNC-229 ✅ 交付（在线 ASR 两轴阶段三交叉护栏，待主控验收 → 阶段四实跑）
 
 - **改动**：三文件 `mod tests` 纯追加 **+79 / −0**，生产零触碰。G1 `qwen_inference.rs:1778-1806`；G2 `src/config/mod.rs:1806-1823`；G3 `src/transcription/mod.rs:964-995`。
@@ -85,3 +95,13 @@
 - **验证**：`cargo check --bin poc_local_stream` 0 error；rustfmt clean；🔴 未跑 cargo test / release。
 - **证据**：`collab/outbox/coder-1/poc236/`。235 报告已留档 `result-235.md`（原被 harness 清 0，按上下文重建，主控核验 20837B）。
 - **红线**：未碰生产代码 / 未改 Cargo.toml / 未 commit / 未出包 / 版本未动 / 零凭证。
+
+## 2026-09-20 — coder-1 — LOCAL-RT-UI-240 ✅ 交付（本地 realtime 档位 UI 解锁 + 配置字段，待验收）
+
+- **改动 6 文件**：`src/config/mod.rs`(+10) / `src-tauri/src/config.rs`(+9)（新增 `asr_local_realtime_unlocked: bool`，`#[serde(default)]` false，主+镜像含穷举字面量同步）/ `ui/src/pages/Voice.tsx`(+98/-2) / 3×i18n(+5)。
+- **Ctrl+M**：window keydown，仅 Voice 页挂载 + 窗口焦点；**只开不关**（不 toggle）；复用 updateConfig→save_config 落盘。不注册全局热键（未碰 DEC-004）。
+- **选项**：`localRealtimeUnlocked` 为 true 才渲染 `<option value="local_realtime">`；`getAsrDesc` 补 case。
+- **卡片**：复用 accuracy 结构，列 paraformer-trilingual(228MB)+funasr-nano(972MB)；目标目录根由 `check_accuracy_model_ready.model_dir` 去末段推导（DEC-011），无新增 Tauri 命令。
+- **文案**：zh-Hans「本地流式实时模型」/ zh-Hant「本地串流即時模型」/ en「Local Streaming Realtime」。zh-Hant:29 既有漂移未动。
+- **验证**：`npm run build` 通过；`cargo check --all-targets` 0 error（111/102 基线）；src-tauri 0 error（17 基线）；main config rustfmt clean（src-tauri config 既有漂移 :4/:11/:512 非本单）；三 locale grep 齐全。
+- **红线**：未碰 src/main.rs / ASR 引擎 / transcription；未动版本；未 commit；零凭证。

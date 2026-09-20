@@ -34,6 +34,11 @@ export const zhHant = {
   voice_asr_model_qwen3_desc: '雲端執行，通過阿里雲 API 進行語音辨識。',
   voice_asr_model_fun_asr: '線上語音辨識 - FunASR',
   voice_asr_model_fun_asr_desc: '雲端執行，FunASR Realtime 模型，低延遲，適合即時語音輸入。',
+  // LOCAL-RT-UI-240: 極客檔（DEC-065），本頁 Ctrl+M 解鎖
+  voice_asr_model_local_realtime: '本地串流即時模型',
+  voice_asr_model_local_realtime_desc: '本地執行，邊說邊出字，需額外下載兩個模型（約 1.2GB）。',
+  voice_asr_model_local_realtime_download_required: '該模式需要下載以下兩個模型後才能使用',
+  voice_asr_model_local_realtime_size: '大小',
   voice_asr_model_download_required: '選擇「準確率更高」模型後，需先下載模型才能啟用該模式。',
   voice_asr_model_download_url: '下載模型',
   voice_asr_model_open_download: '開啟下載頁',

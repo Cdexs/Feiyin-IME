@@ -125,6 +125,12 @@ pub struct AudioConfig {
     /// 必须与主程序 src/config/mod.rs 同步（round-trip 数据丢失防护）。
     #[serde(default)]
     pub asr_online_semantic_punctuation_enabled: bool,
+    /// LOCAL-RT-UI-240: 本地 realtime 档位解锁开关（DEC-065 极客档，默认隐藏）。
+    /// 必须与主程序 src/config/mod.rs AudioConfig.asr_local_realtime_unlocked 同步，
+    /// 否则设置界面一保存（Ctrl+M 解锁后）该字段会被镜像结构体静默蒸发
+    /// （[CONFIG-MIRROR-DRIFT-001]：serde default 只兜读不兜写）。
+    #[serde(default)]
+    pub asr_local_realtime_unlocked: bool,
 }
 
 fn default_overlay_opacity() -> f32 {
@@ -168,6 +174,8 @@ impl Default for AudioConfig {
             asr_online_max_sentence_silence: default_asr_online_max_sentence_silence(),
             // ASR-SEG-229: 默认 false = VAD 断句（保持既有行为）
             asr_online_semantic_punctuation_enabled: false,
+            // LOCAL-RT-UI-240: 极客档默认隐藏，Ctrl+M 解锁后置 true 并落盘
+            asr_local_realtime_unlocked: false,
         }
     }
 }
@@ -425,6 +433,7 @@ mod tests {
                 asr_online_model: default_asr_online_model(),
                 asr_online_max_sentence_silence: default_asr_online_max_sentence_silence(),
                 asr_online_semantic_punctuation_enabled: false,
+                asr_local_realtime_unlocked: false,
             },
             llm: LlmConfig::default(),
             hotkey: HotkeyConfig::default(),
