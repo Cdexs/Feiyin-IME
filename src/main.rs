@@ -134,6 +134,11 @@ enum PipelineEvent {
     /// 产出源：transcription::NoSpeechError 类型化错误在 worker 边界下探转成本事件，
     /// 新增第三个产出源只需复用该类型，无需改任何分类器。
     NoSpeech,
+    /// LOCAL-RT-ENGINE-239-B: 本地流式档位双模型加载提示（Info 态，文案携带在 payload）。
+    Info(String),
+    /// LOCAL-RT-ENGINE-239-B: 本地流式档位模型缺失/加载失败 → 直接报错不降级（DEC-067 附则一）。
+    /// 与 Error 的区别：**不过 convert_to_friendly_error**，保留「具体缺哪个模型」的原始上下文。
+    ModelUnavailable(String),
 }
 // LATENCY-001: send event and immediately wake controller via PostMessageW
 fn send_event(tx: &crossbeam_channel::Sender<PipelineEvent>, event: PipelineEvent) {
@@ -6613,9 +6618,20 @@ fn process_controller_events(
                         config.audio.overlay_opacity,
                         config.ui_language,
                         OverlayStatus::FallingToProcessing {
-                            message: i18n::get(config.ui_language)
-                                .overlay_transcribing
-                                .to_string(),
+                            // LOCAL-RT-ENGINE-239-B（DEC-066 附则一）：本地 realtime 新管线松键后
+                            // 只显示「识别处理中」单状态；其余三档保持「转录中」两段式不变。
+                            // 🔴 用枚举解析再比较（禁裸字符串），变体改名时编译器可捕获。
+                            message: {
+                                let label = if transcription::AsrModel::from_config(
+                                    &config.audio.asr_model,
+                                ) == transcription::AsrModel::LocalRealtime
+                                {
+                                    i18n::get(config.ui_language).overlay_processing
+                                } else {
+                                    i18n::get(config.ui_language).overlay_transcribing
+                                };
+                                label.to_string()
+                            },
                         },
                     );
                 }
@@ -6810,6 +6826,45 @@ fn process_controller_events(
                     target_hwnd: 0,
                 }));
             }
+            // LOCAL-RT-ENGINE-239-B: 模型加载中的信息提示（Info 态，蓝点白字，短暂后自动关闭）。
+            PipelineEvent::Info(message) => {
+                platform::notify_translate_poll_stop();
+                set_tray_state(tray, TrayState::Idle, ui_language);
+                let (pos, size) = overlay_geometry(
+                    &OverlayStatus::Info(message.clone()),
+                    overlay_handle.overlay_hwnd,
+                );
+                overlay_handle.send(OverlayCommand::Show(OverlayRequest {
+                    status: OverlayStatus::Info(message),
+                    pos: Some(pos),
+                    size,
+                    opacity: 0.9,
+                    ui_language,
+                    auto_close_ms: 2500,
+                    target_hwnd: 0,
+                }));
+            }
+            // LOCAL-RT-ENGINE-239-B: 模型缺失 → 错误态；🔴 不走 convert_to_friendly_error，
+            // 保留「缺哪个模型」的具体上下文（DEC-067 附则一：不降级、明确报错）。
+            PipelineEvent::ModelUnavailable(message) => {
+                OVERLAY_EDITING.store(false, Ordering::Release);
+                log::error!("Pipeline: model unavailable: {}", message);
+                platform::notify_translate_poll_stop();
+                set_tray_state(tray, TrayState::Error, ui_language);
+                let (pos, size) = overlay_geometry(
+                    &OverlayStatus::Error(message.clone()),
+                    overlay_handle.overlay_hwnd,
+                );
+                overlay_handle.send(OverlayCommand::Show(OverlayRequest {
+                    status: OverlayStatus::Error(message),
+                    pos: Some(pos),
+                    size,
+                    opacity: 0.95,
+                    ui_language,
+                    auto_close_ms: 4000,
+                    target_hwnd: 0,
+                }));
+            }
         }
     }
     while let Ok(event) = overlay_event_rx.try_recv() {
@@ -6848,9 +6903,10 @@ fn process_controller_events(
                 OVERLAY_EDITING.store(false, Ordering::Release);
                 STREAMING_STOPPED.store(true, Ordering::Release);
                 // WORDBOOK-053-B: learn the explicit user correction (original ASR text vs submitted
-                // edited text) in a detached thread. This is an online-streaming-ASR-only signal:
-                // only the streaming path produces StreamingText events, which populate
-                // last_streaming_text. Local-model pipeline never reaches here.
+                // edited text) in a detached thread. `last_streaming_text` is populated by
+                // `StreamingText` events — produced by the online streaming path AND by
+                // LOCAL-RT-ENGINE-239-B 本地 realtime 新管线（本地流式预览同发 StreamingText）。
+                // 本地 performance/accuracy 批处理路径不发 StreamingText，故其编辑提交不触发本学习。
                 let original_text = last_streaming_text.lock().ok().and_then(|m| m.clone());
                 if let Some(original) = original_text {
                     let runtime_config = Arc::clone(runtime_config);
@@ -7258,6 +7314,8 @@ fn spawn_worker_thread(
         let mut active_asr_online_api_key: String = config.audio.asr_online_api_key.clone();
         let mut active_asr_online_url: String = config.audio.asr_online_url.clone();
         let mut active_asr_online_model: String = config.audio.asr_online_model.clone();
+        // LOCAL-RT-ENGINE-239-B：最近一次 ASR 热重载失败原因（供模型缺失报错附「具体缺哪个」）。
+        let mut last_reload_error: Option<String> = None;
 
         // PERF-INIT-001: Pre-initialize LlmClient once; update_config() before each use.
         let mut llm_client = llm::LlmClient::new(config.llm.clone());
@@ -7293,6 +7351,10 @@ fn spawn_worker_thread(
             // ASR-DUAL-B-001: 非阻塞检查热重载结果（后台线程构建完成后送回）。
             // FIX-164: 应用逻辑收口进 apply_reload_result（与 D2 有界等待共用）。
             if let Ok(result) = asr_reload_rx.try_recv() {
+                match &result {
+                    Ok(_) => last_reload_error = None,
+                    Err(e) => last_reload_error = Some(e.clone()),
+                }
                 apply_reload_result(
                     result,
                     &runtime_config,
@@ -7333,6 +7395,17 @@ fn spawn_worker_thread(
                         desired_now
                     );
                     let desired_hotwords = load_hotwords_for_accuracy(&config_now);
+                    // LOCAL-RT-ENGINE-239-B：切到本地流式档位时用 Info 态提示双模型加载中（短暂自动关）。
+                    if desired_now == transcription::AsrModel::LocalRealtime {
+                        send_event(
+                            &event_tx,
+                            PipelineEvent::Info(
+                                i18n::get(config_now.ui_language)
+                                    .local_realtime_loading_hint
+                                    .to_string(),
+                            ),
+                        );
+                    }
                     asr_reload_in_flight = true;
                     spawn_asr_reload(
                         &model_dir,
@@ -7405,6 +7478,17 @@ fn spawn_worker_thread(
                             needs_rebuild,
                         );
                         asr_reload_in_flight = true;
+                        // LOCAL-RT-ENGINE-239-B：切到本地流式档位时用 Info 态提示双模型加载中（短暂自动关）。
+                        if desired_asr_model == transcription::AsrModel::LocalRealtime {
+                            send_event(
+                                &event_tx,
+                                PipelineEvent::Info(
+                                    i18n::get(config.ui_language)
+                                        .local_realtime_loading_hint
+                                        .to_string(),
+                                ),
+                            );
+                        }
                         spawn_asr_reload(
                             &model_dir,
                             &config,
@@ -7459,6 +7543,10 @@ fn spawn_worker_thread(
                                 .recv_timeout(remaining.min(Duration::from_millis(100)))
                             {
                                 Ok(result) => {
+                                    match &result {
+                                        Ok(_) => last_reload_error = None,
+                                        Err(e) => last_reload_error = Some(e.clone()),
+                                    }
                                     apply_reload_result(
                                         result,
                                         &runtime_config,
@@ -7677,6 +7765,221 @@ fn spawn_worker_thread(
                             &event_tx,
                             start.translate,
                             Some(streaming_text), // 流式文本，跳过转录
+                            i18n::get(config.ui_language).overlay_transcribing,
+                        );
+                        continue;
+                    }
+
+                    // LOCAL-RT-ENGINE-239-B（DEC-066/067）：本地 realtime 独立编排。
+                    // 与在线流式并列：录音期发流式预览（streaming paraformer，识别即上屏）；
+                    // 松键后**丢弃预览文本**，把完整 PCM 交给 run_pipeline_core 走 accuracy 2pass
+                    // （initial_text=None ⇒ from_online_streaming=false，主通道 ITN 启用、标点由
+                    //  accuracy 实际产出决定）。这是本管线与在线档的关键差异。
+                    let is_local_realtime_desired =
+                        desired_asr_model_check == transcription::AsrModel::LocalRealtime;
+                    let active_is_local_realtime = transcriber
+                        .as_ref()
+                        .is_some_and(|t| t.asr_model() == transcription::AsrModel::LocalRealtime);
+
+                    if is_local_realtime_desired && !active_is_local_realtime {
+                        if asr_reload_in_flight {
+                            // 双模型仍在加载（~6s，D2 有界等待仅 1.5s，可能尚未落地）：
+                            // 提示加载中，本次不录音、**不降级**，等加载完成后再按热键即可。
+                            log::info!(
+                                "LocalRealtime still loading; skipping this recording without degrading"
+                            );
+                            is_recording.store(false, Ordering::Release);
+                            send_event(
+                                &event_tx,
+                                PipelineEvent::Info(
+                                    i18n::get(config.ui_language)
+                                        .local_realtime_loading_hint
+                                        .to_string(),
+                                ),
+                            );
+                            continue;
+                        }
+                        // DEC-067 附则一：模型缺失/加载失败 → 明确报错，**绝不静默降级**到其他档位。
+                        let base = i18n::get(config.ui_language).local_realtime_unavailable;
+                        let detail = last_reload_error
+                            .as_deref()
+                            .and_then(|s| s.lines().next())
+                            .unwrap_or("");
+                        let message = if detail.is_empty() {
+                            base.to_string()
+                        } else {
+                            format!("{}：{}", base, detail)
+                        };
+                        log::error!(
+                            "LocalRealtime unavailable, refusing to degrade to another tier: {}",
+                            message
+                        );
+                        is_recording.store(false, Ordering::Release);
+                        send_event(&event_tx, PipelineEvent::ModelUnavailable(message));
+                        continue;
+                    }
+
+                    if is_local_realtime_desired {
+                        // OVERLAY-051-E：流式 ASR 已启动、等待首个文本
+                        send_event(&event_tx, PipelineEvent::StreamingIdle);
+
+                        let recognizer = transcriber
+                            .as_ref()
+                            .and_then(|t| t.online_recognizer())
+                            .expect("LocalRealtime transcriber must hold an online recognizer");
+                        let send_recognizer =
+                            transcription::local_stream::SendOnlineRecognizerRef(recognizer);
+                        let cancel_clone = Arc::clone(&cancel_signal);
+                        let event_tx_clone = event_tx.clone();
+                        // chunk channel：record_streaming 推 chunk，ASR 线程读
+                        let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<Vec<f32>>(256);
+
+                        // scoped：ASR 线程借常驻 recognizer，worker 线程跑 record_streaming。
+                        // 二者在 scope 内并发、join 后才继续 ⇒ 无并发访问 recognizer
+                        // （见 SendOnlineRecognizerRef 的 SAFETY 论证）。
+                        let (asr_result, record_result) = std::thread::scope(|scope| {
+                            let asr_handle = scope.spawn(move || {
+                                // into_inner 按值消费包装，强制闭包捕获整个 Send 包装
+                                // （Rust 2021 disjoint capture 若只取 .0 字段会退化为
+                                // 捕获裸引用，绕过 unsafe impl Send）。
+                                let recognizer = send_recognizer.into_inner();
+                                transcription::local_stream::transcribe_streaming_local(
+                                    chunk_rx,
+                                    recognizer,
+                                    Some(&cancel_clone),
+                                    |display_text, words| {
+                                        // OVERLAY-075：与在线流式同构，代际盖章。
+                                        let _ = event_tx_clone.send(PipelineEvent::StreamingText(
+                                            session_generation,
+                                            display_text.to_string(),
+                                            words.to_vec(),
+                                        ));
+                                    },
+                                )
+                            });
+
+                            let record_result = audio_capture.record_streaming(
+                                Arc::clone(&stop_recording_signal),
+                                config.audio.silence_threshold,
+                                config::SILENCE_DURATION_MS,
+                                config::MAX_RECORD_SECONDS,
+                                Some(Arc::clone(&audio_buf)),
+                                device_name,
+                                |chunk| match chunk_tx.send_timeout(
+                                    chunk.to_vec(),
+                                    Duration::from_millis(200),
+                                ) {
+                                    Ok(()) => {}
+                                    Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
+                                        ASR_CHUNK_DROPS.fetch_add(1, Ordering::Relaxed);
+                                        log::warn!(
+                                            "[ASR-DROP] chunk send timed out after 200ms (local streaming consumer stuck?); total dropped: {}",
+                                            ASR_CHUNK_DROPS.load(Ordering::Relaxed)
+                                        );
+                                    }
+                                    Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {}
+                                },
+                            );
+                            // drop chunk_tx 让 ASR 线程的 channel 断开（触发 flush 收尾）
+                            drop(chunk_tx);
+                            let asr_result = asr_handle.join();
+                            (asr_result, record_result)
+                        });
+
+                        log::info!(
+                            "[Latency] local realtime record_streaming() completed after +{:.1}ms",
+                            t_worker.elapsed().as_secs_f64() * 1000.0
+                        );
+                        is_recording.store(false, Ordering::Release);
+
+                        if cancel_signal.load(Ordering::Acquire) {
+                            log::warn!(
+                                "LocalRealtime recording ended with cancel_signal=true, skipping ASR join"
+                            );
+                            send_event(&event_tx, PipelineEvent::Cancelled);
+                            continue;
+                        }
+                        if let Err(e) = record_result {
+                            log::error!("LocalRealtime recording error: {}", e);
+                            send_event(&event_tx, PipelineEvent::Error(e.to_string()));
+                            continue;
+                        }
+
+                        let local_pcm = match asr_result {
+                            // 预览文本丢弃（DEC-067：仅供上屏，最终文本由 accuracy 重打）。
+                            Ok(Ok((_preview_text, pcm))) => pcm,
+                            Ok(Err(e)) => {
+                                if e.is::<transcription::NoSpeechError>() {
+                                    log::info!("LocalRealtime ASR: no speech detected");
+                                    send_event(&event_tx, PipelineEvent::NoSpeech);
+                                } else {
+                                    log::error!("LocalRealtime ASR error: {}", e);
+                                    send_event(&event_tx, PipelineEvent::Error(e.to_string()));
+                                }
+                                continue;
+                            }
+                            Err(_) => {
+                                log::error!("LocalRealtime ASR thread panicked");
+                                send_event(
+                                    &event_tx,
+                                    PipelineEvent::Error("ASR thread panicked".into()),
+                                );
+                                continue;
+                            }
+                        };
+
+                        // 下游与批处理路径同构：PCM 作 samples，initial_text=None。
+                        let transcriber = match &transcriber {
+                            Some(t) => t,
+                            None => {
+                                log::error!("Transcriber not initialized");
+                                send_event(
+                                    &event_tx,
+                                    PipelineEvent::Error("Transcriber unavailable".into()),
+                                );
+                                continue;
+                            }
+                        };
+                        llm_client.update_config(config.llm.clone());
+                        let needs_reload = match &cached_translation {
+                            Some((lang, _)) => {
+                                !config.translation.enabled
+                                    || *lang != config.translation.target_language
+                            }
+                            None => config.translation.enabled,
+                        };
+                        if needs_reload {
+                            cached_translation = if config.translation.enabled {
+                                translation::TranslationEngine::load_for_direction(
+                                    &model_dir,
+                                    config.translation.target_language,
+                                )
+                                .map(|engine| (config.translation.target_language, engine))
+                            } else {
+                                None
+                            };
+                        }
+                        if config.punctuation.enabled && cached_punctuation.is_none() {
+                            cached_punctuation = punctuation::PunctuationEngine::new(&model_dir);
+                        } else if !config.punctuation.enabled {
+                            cached_punctuation = None;
+                        }
+                        run_pipeline_core(
+                            Ok(local_pcm),
+                            transcriber,
+                            &rt,
+                            &llm_client,
+                            &cancel_signal,
+                            &config,
+                            &runtime_config,
+                            &mut cached_translation,
+                            &model_dir,
+                            cached_punctuation.as_mut(),
+                            start.target_hwnd,
+                            &event_tx,
+                            start.translate,
+                            None, // 非流式：accuracy 2pass 出最终文本（主通道 ITN 启用）
+                            i18n::get(config.ui_language).overlay_processing,
                         );
                         continue;
                     }
@@ -7759,6 +8062,7 @@ fn spawn_worker_thread(
                         &event_tx,
                         start.translate,
                         None,
+                        i18n::get(config.ui_language).overlay_transcribing,
                     );
                 }
             }
@@ -8262,6 +8566,16 @@ fn overlay_request_for_event(event: &PipelineEvent) -> platform::OverlayRequest 
             message: String::new(), // 文案由 handle_pipeline_event 按 ui_language 补齐
             auto_close_ms: 2500,
         },
+        // LOCAL-RT-ENGINE-239-B: macOS 侧无独立 Info 视觉样式，复用 ShowError 承载（同 NoSpeech 先例）。
+        PipelineEvent::Info(message) => platform::OverlayRequest::ShowError {
+            message: message.clone(),
+            auto_close_ms: 2500,
+        },
+        // LOCAL-RT-ENGINE-239-B: 模型缺失 → 错误提示（文案携带在 payload）。
+        PipelineEvent::ModelUnavailable(message) => platform::OverlayRequest::ShowError {
+            message: message.clone(),
+            auto_close_ms: 4000,
+        },
         PipelineEvent::FocusLost(text) => platform::OverlayRequest::ShowPreview(text.clone()),
         PipelineEvent::StreamingText(_, _, _) => platform::OverlayRequest::Show, // macOS 侧流式文本暂不渲染
         PipelineEvent::Done | PipelineEvent::Cancelled => platform::OverlayRequest::Hide,
@@ -8333,6 +8647,15 @@ fn handle_pipeline_event(event: &PipelineEvent, ui_language: config::UiLanguage)
         PipelineEvent::NoSpeech => {
             log::info!("macOS pipeline: NoSpeech (信息提示：请说话哦..)");
             platform::request_tray_state(TrayState::Idle, ui_language);
+        }
+        // LOCAL-RT-ENGINE-239-B: 本地流式档位加载提示 / 模型缺失
+        PipelineEvent::Info(msg) => {
+            log::info!("macOS pipeline: Info({})", msg);
+            platform::request_tray_state(TrayState::Idle, ui_language);
+        }
+        PipelineEvent::ModelUnavailable(msg) => {
+            log::error!("macOS pipeline: ModelUnavailable({})", msg);
+            platform::request_tray_state(TrayState::Error, ui_language);
         }
         PipelineEvent::StreamingText(_, text, _) => {
             // ASR-038-B: macOS 侧流式文本暂不渲染（C-overlay 批后续实现）
@@ -8603,6 +8926,10 @@ fn run_pipeline_core(
     // ASR-038-B: 流式模式传入已转录文本，跳过转录步骤直接走 LLM 后半段。
     // None = 正常模式（run_pipeline_core 内部转录）；Some(text) = 流式模式（跳过转录）
     initial_text: Option<String>,
+    // PIPELINE-ORCH-239-B（DEC-066 附则一）：本地转录步骤的状态文案。
+    // 现有三档传 `overlay_transcribing`（行为逐位零变）；本地 realtime 新管线传
+    // `overlay_processing`，满足「松键后只显示『识别处理中』单状态」要求。
+    transcribing_status_text: &'static str,
 ) {
     match samples_result {
         Err(e) => {
@@ -8670,7 +8997,7 @@ fn run_pipeline_core(
                     keep_start as f64 / 16.0,
                     if transcriber.asr_model() == transcription::AsrModel::Accuracy { "accuracy" } else { "performance" },
                 );
-                let transcribing_msg = i18n::get(config.ui_language).overlay_transcribing;
+                let transcribing_msg = transcribing_status_text;
                 send_event(
                     event_tx,
                     PipelineEvent::Processing(transcribing_msg.to_string()),

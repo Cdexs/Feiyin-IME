@@ -125,6 +125,10 @@ pub struct Strings {
     pub format_failed_hint: &'static str,
     /// BUG-119: 「用户没说话」信息提示（信息级，非错误样式）。
     pub no_speech_hint: &'static str,
+    /// LOCAL-RT-ENGINE-239-B: 切换到本地流式档位时的双模型加载提示（Info 态，短暂自动关闭）。
+    pub local_realtime_loading_hint: &'static str,
+    /// LOCAL-RT-ENGINE-239-B: 本地流式档位模型缺失，直接报错不降级（DEC-067 附则一）。
+    pub local_realtime_unavailable: &'static str,
 }
 
 static ZH: Strings = Strings {
@@ -239,6 +243,8 @@ static ZH: Strings = Strings {
     error_transcription_empty: "识别结果为空。",
     format_failed_hint: "优化失败，已输出原文。",
     no_speech_hint: "请说话哦..",
+    local_realtime_loading_hint: "本地流式模型加载中，约需 6 秒…",
+    local_realtime_unavailable: "所选模型不可用",
 };
 
 static ZH_TW: Strings = Strings {
@@ -353,6 +359,8 @@ static ZH_TW: Strings = Strings {
     error_transcription_empty: "識別結果為空。",
     format_failed_hint: "優化失敗，已輸出原文。",
     no_speech_hint: "請說話喔..",
+    local_realtime_loading_hint: "本地串流模型載入中，約需 6 秒…",
+    local_realtime_unavailable: "所選模型不可用",
 };
 
 static EN: Strings = Strings {
@@ -466,6 +474,8 @@ static EN: Strings = Strings {
     error_transcription_empty: "Transcription result is empty.",
     format_failed_hint: "Optimization failed, original text used.",
     no_speech_hint: "Please say something..",
+    local_realtime_loading_hint: "Loading local streaming models, ~6s…",
+    local_realtime_unavailable: "Selected model unavailable",
 };
 
 pub fn get(lang: UiLanguage) -> &'static Strings {

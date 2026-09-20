@@ -25,6 +25,25 @@ use super::qwen_inference::{StreamingAsrState, WordTiming};
 /// 本地流式 recognizer 采样率（streaming paraformer trilingual 固定 16kHz 单声道）。
 const SAMPLE_RATE: i32 = 16000;
 
+/// LOCAL-RT-ENGINE-239-B：把 `&OnlineRecognizer` 送进 ASR 工作线程的 Send 包装。
+///
+/// SAFETY：与 `Transcriber` 的 `unsafe impl Send` 同源论证——sherpa-onnx C++ OnlineRecognizer
+/// 的 create/decode/destroy 可在不同线程调用，只需保证**同一实例不被并发访问**。
+/// 本包装仅在 `std::thread::scope` 内把引用 move 给 ASR 线程；该线程运行期间，持有者
+/// （worker 线程）阻塞在 `record_streaming`，不触碰 recognizer；ASR 线程 join 之后才继续
+/// 使用（run_pipeline_core 走 offline_recognizer，对象不同且串行）。故无并发访问。
+pub struct SendOnlineRecognizerRef<'a>(pub &'a OnlineRecognizer);
+unsafe impl<'a> Send for SendOnlineRecognizerRef<'a> {}
+
+impl<'a> SendOnlineRecognizerRef<'a> {
+    /// 取出内部引用。**按值消费包装**，使跨线程闭包必须捕获整个 Send 包装
+    /// （Rust 2021 disjoint capture 下若直接取 `.0` 字段会退化为捕获裸引用，
+    /// 绕过 `unsafe impl Send`，故以方法消费强制整体捕获）。
+    pub fn into_inner(self) -> &'a OnlineRecognizer {
+        self.0
+    }
+}
+
 /// 流式解码线程数。对齐 POC-LOCAL-STREAM-235 的实测最优（4 线程 RTF 最好）。
 const LOCAL_STREAM_NUM_THREADS: i32 = 4;
 
@@ -88,8 +107,6 @@ pub fn create_local_stream_recognizer(model_dir: &Path) -> Result<OnlineRecogniz
 /// - `pcm` = 本次收到的全部音频（16kHz f32），供 2pass 离线纠错复用（≈64KB/s）
 ///
 /// 采用**返回值**而非出参传 PCM：2pass 的 PCM 是必需环节，出参漏传编译器抓不到。
-// 239-B 接线前本函数无调用者；保留此 allow 以守 warnings 基线（接线时移除）。
-#[allow(dead_code)]
 pub fn transcribe_streaming_local(
     chunk_rx: crossbeam_channel::Receiver<Vec<f32>>,
     recognizer: &OnlineRecognizer,
