@@ -8539,6 +8539,12 @@ fn select_preprocessing_params(asr_model: transcription::AsrModel) -> (usize, us
         transcription::AsrModel::Performance => {
             (PERF_SILENCE_HEAD_SAMPLES, PERF_ONSET_BACKTRACK_SAMPLES)
         }
+        // LOCAL-RT-ENGINE-239-A（DEC-067）：前处理跟 **Accuracy** 走。
+        // 本管线 2pass 的最终转录引擎就是 accuracy，前处理必须与实际引擎匹配，
+        // 配错直接吃首字（FIRSTCHAR-FIX-006）。非 online 档，走完整 samples 前处理。
+        transcription::AsrModel::LocalRealtime => {
+            (ACC_SILENCE_HEAD_SAMPLES, ACC_ONSET_BACKTRACK_SAMPLES)
+        }
         transcription::AsrModel::QwenAudioOnline | transcription::AsrModel::FunAsrRealtime => {
             // DEC-028 / RESEARCH-ASR-038 / ASR-038-B / ASR-041-B / ASR-056: 在线 ASR 模型
             // （在线模型对前导静音不敏感，保持与 CTC 一致的前处理行为）

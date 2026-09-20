@@ -8,24 +8,71 @@
 //!   把 sherpa 的 `is_endpoint()` 映射为 `sentence_end = true`，**不另写状态机**。
 //! - 回调签名与 qwen 路径同构：`on_result(&display_text, &display_words)`。
 //! - 每次 `get_result()` 文本变化才回调（与 qwen 路径「空包不转发」同向），避免无谓刷新。
-//! - 同时把收到的 PCM 累积进可选 `pcm_out`（给 2pass 离线纠错用；16kHz f32 ≈ 64KB/s）。
+//! - 返回 `(final_text, pcm)`：`pcm` 为本次全部音频（16kHz f32），供 2pass 离线纠错复用。
 //! - `cancel_signal` 置位即提前收尾（`Relaxed` 读，与 qwen 路径同款）。
 //!
 //! 端点语义：paraformer streaming 在一次 endpoint 后需 `reset()` 才能开始下一句；
 //! reset 后 `get_result()` 从空串重新累积，与 `StreamingAsrState` 的句切换天然对齐。
-//!
-//! ⚠️ 阶段一（本单）：函数尚未接线（枚举变体与 `Transcriber` 构建分支在 239-A 第二阶段），
-//! 故暂标 `#[allow(dead_code)]`；二阶段接线时移除。
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use sherpa_onnx::OnlineRecognizer;
+use sherpa_onnx::{OnlineParaformerModelConfig, OnlineRecognizer, OnlineRecognizerConfig};
 
 use super::qwen_inference::{StreamingAsrState, WordTiming};
 
 /// 本地流式 recognizer 采样率（streaming paraformer trilingual 固定 16kHz 单声道）。
 const SAMPLE_RATE: i32 = 16000;
+
+/// 流式解码线程数。对齐 POC-LOCAL-STREAM-235 的实测最优（4 线程 RTF 最好）。
+const LOCAL_STREAM_NUM_THREADS: i32 = 4;
+
+/// LOCAL-RT-ENGINE-239-A（DEC-067）：端点检测参数。
+///
+/// `rule1=2.4` / `rule3=20.0` 取 sherpa 默认；🔴 `rule2=2.0` 对齐 ASR-SEG-229
+/// 定的在线档 `asr_online_max_sentence_silence=2000ms` —— 官方默认 1.2 太激进，
+/// 会重现「说话稍一停顿就被判句尾、输出切碎」的端测缺陷，**勿改回 1.2**。
+const LOCAL_STREAM_RULE1_MIN_TRAILING_SILENCE: f32 = 2.4;
+const LOCAL_STREAM_RULE2_MIN_TRAILING_SILENCE: f32 = 2.0;
+const LOCAL_STREAM_RULE3_MIN_UTTERANCE_LENGTH: f32 = 20.0;
+
+/// LOCAL-RT-ENGINE-239-A：构建本地流式 paraformer recognizer（greedy_search）。
+///
+/// 模型目录（DEC-011，exe 同级 models）：`sherpa-onnx-streaming-paraformer-trilingual-zh-cantonese-en/`，
+/// 用 `encoder.int8.onnx` + `decoder.int8.onnx` + `tokens.txt`。
+///
+/// 🔴 任一模型文件缺失 ⇒ `Err`（DEC-067 附则一：不降级，整档不可用）。
+pub fn create_local_stream_recognizer(model_dir: &Path) -> Result<OnlineRecognizer> {
+    let dir = model_dir.join("sherpa-onnx-streaming-paraformer-trilingual-zh-cantonese-en");
+    let enc = dir.join("encoder.int8.onnx");
+    let dec = dir.join("decoder.int8.onnx");
+    let tok = dir.join("tokens.txt");
+    for p in [&enc, &dec, &tok] {
+        if !p.exists() {
+            anyhow::bail!("本地流式模型文件缺失: {}", p.display());
+        }
+    }
+
+    let mut c = OnlineRecognizerConfig::default();
+    c.model_config.paraformer = OnlineParaformerModelConfig {
+        encoder: Some(enc.to_string_lossy().to_string()),
+        decoder: Some(dec.to_string_lossy().to_string()),
+    };
+    c.model_config.tokens = Some(tok.to_string_lossy().to_string());
+    c.model_config.num_threads = LOCAL_STREAM_NUM_THREADS;
+    c.model_config.provider = Some("cpu".to_string());
+    c.model_config.debug = false;
+    // DEC-067：本地预览用 greedy_search（streaming paraformer 仅支持 greedy）
+    c.decoding_method = Some("greedy_search".to_string());
+    // 端点：不开则 is_endpoint() 永不触发，sentence_end 分支成死代码
+    c.enable_endpoint = true;
+    c.rule1_min_trailing_silence = LOCAL_STREAM_RULE1_MIN_TRAILING_SILENCE;
+    c.rule2_min_trailing_silence = LOCAL_STREAM_RULE2_MIN_TRAILING_SILENCE;
+    c.rule3_min_utterance_length = LOCAL_STREAM_RULE3_MIN_UTTERANCE_LENGTH;
+
+    OnlineRecognizer::create(&c).context("创建本地流式 (paraformer) recognizer 失败")
+}
 
 /// 本地真流式转录（边收音频边解码），与 `transcribe_streaming_realtime` 平行。
 ///
@@ -34,18 +81,21 @@ const SAMPLE_RATE: i32 = 16000;
 /// - `recognizer`：常驻的流式 paraformer recognizer（由 `Transcriber` 预加载，跨调用复用）
 /// - `cancel_signal`：置位则提前停止
 /// - `on_result`：文本变化回调，传 `(display_text, display_words)`，与 qwen 路径同构
-/// - `pcm_out`：可选输出缓冲，累积本次全部 PCM（16k f32），供 2pass 离线纠错复用
 ///
 /// # 返回
-/// `StreamingAsrState::final_text()` = confirmed + current（ASR-070：不丢尾字）。
+/// `(final_text, pcm)`：
+/// - `final_text` = `StreamingAsrState::final_text()` = confirmed + current（ASR-070 不丢尾字）
+/// - `pcm` = 本次收到的全部音频（16kHz f32），供 2pass 离线纠错复用（≈64KB/s）
+///
+/// 采用**返回值**而非出参传 PCM：2pass 的 PCM 是必需环节，出参漏传编译器抓不到。
+// 239-B 接线前本函数无调用者；保留此 allow 以守 warnings 基线（接线时移除）。
 #[allow(dead_code)]
 pub fn transcribe_streaming_local(
     chunk_rx: crossbeam_channel::Receiver<Vec<f32>>,
     recognizer: &OnlineRecognizer,
     cancel_signal: Option<&AtomicBool>,
     mut on_result: impl FnMut(&str, &[WordTiming]),
-    mut pcm_out: Option<&mut Vec<f32>>,
-) -> Result<String> {
+) -> Result<(String, Vec<f32>)> {
     let is_cancelled = || {
         cancel_signal
             .map(|s| s.load(Ordering::Relaxed))
@@ -56,6 +106,7 @@ pub fn transcribe_streaming_local(
     let mut state = StreamingAsrState::new();
     let mut sentence_id: i64 = 0;
     let mut last_display = String::new();
+    let mut pcm: Vec<f32> = Vec::new();
 
     loop {
         if is_cancelled() {
@@ -72,10 +123,7 @@ pub fn transcribe_streaming_local(
             continue;
         }
 
-        if let Some(buf) = pcm_out.as_deref_mut() {
-            buf.extend_from_slice(&chunk);
-        }
-
+        pcm.extend_from_slice(&chunk);
         stream.accept_waveform(SAMPLE_RATE, &chunk);
         while recognizer.is_ready(&stream) {
             recognizer.decode(&stream);
@@ -116,5 +164,5 @@ pub fn transcribe_streaming_local(
         }
     }
 
-    Ok(state.final_text())
+    Ok((state.final_text(), pcm))
 }

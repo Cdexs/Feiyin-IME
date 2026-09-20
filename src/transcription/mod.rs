@@ -60,6 +60,14 @@ pub enum AsrModel {
     /// 与 QwenAudioOnline 共用同一 WS 端点 + 同一 Inference 协议 + 同一返回结构，
     /// 仅 model 名与部分参数取值不同。Gavin 研究发现比 qwen-audio-3.0-asr-flash-streaming 快。
     FunAsrRealtime,
+    /// LOCAL-RT-ENGINE-239-A（DEC-067）：本地流式实时档（极客档，DEC-065 默认隐藏）。
+    ///
+    /// **双模型并存常驻**（有意打破「本地一次只加载一个模型」）：
+    /// - online = streaming paraformer trilingual（本地预览，greedy_search）
+    /// - offline = accuracy FunASR Nano native（2pass 最终文本 + hotwords）
+    ///
+    /// DEC-067 附则一：任一模型缺失/加载失败 ⇒ 整档 `Err`，**禁止静默降级**。
+    LocalRealtime,
 }
 
 impl AsrModel {
@@ -70,6 +78,8 @@ impl AsrModel {
             AsrModel::QwenAudioOnline
         } else if s.eq_ignore_ascii_case("fun_asr_realtime") {
             AsrModel::FunAsrRealtime
+        } else if s.eq_ignore_ascii_case("local_realtime") {
+            AsrModel::LocalRealtime
         } else {
             AsrModel::Performance
         }
@@ -114,7 +124,6 @@ pub struct Transcriber {
     /// **并存常驻**，有意打破旧约束「本地模式一次只加载一个模型」（见结构体文档）。
     ///
     /// ⚠️ 阶段一：本单只落字段声明与 !Send 包装；构建接线与枚举变体见 239-A 第二阶段。
-    #[allow(dead_code)]
     online_recognizer: Option<sherpa_onnx::OnlineRecognizer>,
     /// 当前注入的 hotwords 版本号（len + 内容哈希），用于感知词库变更
     hotwords_version: u64,
@@ -196,6 +205,33 @@ impl Transcriber {
             });
         }
 
+        // LOCAL-RT-ENGINE-239-A（DEC-067）：LocalRealtime 双模型并存常驻。
+        // 与 accuracy 不同：**不做静默降级**，任一模型缺失/加载失败即 Err（附则一），
+        // 因为降级就是「用户以为用 A 实际跑 B」的不一致（ASR-UI-208 判定）。
+        if asr_model == AsrModel::LocalRealtime {
+            let (online_recognizer, offline_recognizer, hotwords_version) =
+                build_local_realtime_recognizers(model_dir, &asr_language, hotwords)?;
+            // VAD 分段器：与 accuracy 同条件（2pass 最终引擎是 accuracy，长音频要分段）
+            let vad_segmenter = vad::VadSegmenter::try_new(model_dir).map(Mutex::new);
+            log::info!(
+                "LocalRealtime: dual recognizers loaded (online streaming paraformer + offline accuracy)"
+            );
+            return Ok(Self {
+                mode,
+                asr_language,
+                asr_model: AsrModel::LocalRealtime,
+                offline_recognizer: Some(offline_recognizer),
+                online_recognizer: Some(online_recognizer),
+                hotwords_version,
+                vad_segmenter,
+                asr_online_api_key: String::new(),
+                asr_online_url: String::new(),
+                asr_online_model: String::new(),
+                asr_online_max_sentence_silence,
+                asr_online_semantic_punctuation_enabled,
+            });
+        }
+
         let (offline_recognizer, effective_model, hotwords_version) =
             build_recognizer(model_dir, &asr_language, asr_model, hotwords)?;
 
@@ -213,7 +249,8 @@ impl Transcriber {
             asr_language,
             asr_model: effective_model,
             offline_recognizer: Some(offline_recognizer),
-            // LOCAL-RT-ENGINE-239-A 阶段一：流式 recognizer 尚未构建（枚举变体在二阶段落地）
+            // LOCAL-RT-ENGINE-239-A（DEC-067）：仅 LocalRealtime 档并存流式 recognizer；
+            // Performance/Accuracy 无流式侧，在线档已在上面提前返回。
             online_recognizer: None,
             hotwords_version,
             vad_segmenter,
@@ -229,10 +266,9 @@ impl Transcriber {
         self.asr_model
     }
 
-    /// LOCAL-RT-ENGINE-239-A（DEC-067）：取常驻的本地流式 recognizer（`LocalRealtime` 档位）。
+    /// LOCAL-RT-ENGINE-239-A（DEC-067）：取常驻的本地流式 recognizer（仅 `LocalRealtime` 档位为 `Some`）。
     ///
-    /// 阶段一仅落 getter（供 239-B 接线与二阶段构建分支使用）；当前所有档位均为 `None`。
-    #[allow(dead_code)]
+    /// 供 239-B 接线 `local_stream::transcribe_streaming_local` 使用。
     pub fn online_recognizer(&self) -> Option<&sherpa_onnx::OnlineRecognizer> {
         self.online_recognizer.as_ref()
     }
@@ -717,6 +753,15 @@ fn build_recognizer(
                 }
             }
         }
+        AsrModel::LocalRealtime => {
+            // LOCAL-RT-ENGINE-239-A（DEC-067）：LocalRealtime 需要 online + offline 双模型并存，
+            // 由 Transcriber::new 的专用分支经 build_local_realtime_recognizers() 构建；
+            // 本函数「返回单一 offline recognizer」的契约不适用该档，正常路径不会触达。
+            // 防御性 bail（非 panic），避免误用时静默返回半个模型。
+            anyhow::bail!(
+                "LocalRealtime requires dual-model construction; handled in Transcriber::new()"
+            )
+        }
         AsrModel::QwenAudioOnline | AsrModel::FunAsrRealtime => {
             // ASR-041-B / ASR-056: 在线 ASR 模式不加载本地模型，
             // Transcriber::new() 已提前返回，此分支不应被触达
@@ -725,6 +770,45 @@ fn build_recognizer(
             )
         }
     }
+}
+
+/// LOCAL-RT-ENGINE-239-A（DEC-067）：LocalRealtime 双模型构建。
+///
+/// - online  = streaming paraformer trilingual（本地预览，greedy_search）
+/// - offline = accuracy FunASR Nano native（2pass 最终文本 + hotwords）
+///
+/// 🔴 **DEC-067 附则一：任一缺失/加载失败即 `Err`，禁止静默降级**。
+/// 不沿用 accuracy 的 `effective_model` 归位逻辑 —— 静默降级正是 ASR-UI-208 判定
+/// 「用户以为用 A 实际跑 B」的不一致。错误信息区分 online / offline 侧，供 239-B 浮层文案分类。
+///
+/// 返回 `(online, offline, hotwords_version)`。hotwords_version 算法与 `build_recognizer`
+/// 内联实现一致（此处**不抽公共 fn**，以免触碰现有 accuracy / performance 分支）。
+fn build_local_realtime_recognizers(
+    model_dir: &Path,
+    _language: &str,
+    hotwords: Option<&str>,
+) -> Result<(
+    sherpa_onnx::OnlineRecognizer,
+    sherpa_onnx::OfflineRecognizer,
+    u64,
+)> {
+    let hotwords_version = match hotwords {
+        Some(h) => {
+            let count = h.split(',').filter(|s| !s.trim().is_empty()).count();
+            let mut hasher = DefaultHasher::new();
+            count.hash(&mut hasher);
+            h.hash(&mut hasher);
+            hasher.finish()
+        }
+        None => 0,
+    };
+
+    let online = local_stream::create_local_stream_recognizer(model_dir)
+        .context("LocalRealtime: 本地流式 (online) 模型缺失或加载失败")?;
+    let offline = create_funasr_nano_recognizer(model_dir, hotwords)
+        .context("LocalRealtime: 本地 accuracy (offline) 模型缺失或加载失败")?;
+
+    Ok((online, offline, hotwords_version))
 }
 
 /// ASR-CTC-OPT-001 P2（已撤销）: 推导 ITN rule_fsts 路径（exe 同级 models/itn/itn_zh_number.fst）。
@@ -1736,7 +1820,8 @@ mod tests {
             AsrModel::Performance
             | AsrModel::Accuracy
             | AsrModel::QwenAudioOnline
-            | AsrModel::FunAsrRealtime => (),
+            | AsrModel::FunAsrRealtime
+            | AsrModel::LocalRealtime => (),
         };
 
         // from_config 正反向映射（大小写不敏感）
