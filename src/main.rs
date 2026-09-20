@@ -7061,14 +7061,14 @@ fn set_auto_start(enabled: bool) -> Result<()> {
     }
     Ok(())
 }
-/// ASR-DUAL-B-001: 加载 hotwords 字符串（仅 accuracy 模式需要）
+/// ASR-DUAL-B-001: 加载 hotwords 字符串（使用 accuracy 引擎的档位需要）
 /// 从 wordbook 读取所有单词，按 id 排序保证哈希稳定，构建逗号分隔字符串
 /// performance 模式返回 None（不支持 hotwords）
+// FIX-LOCALRT-ENGINE-EQ-252: 判据收敛到 uses_accuracy_engine()——LocalRealtime 的最终转录
+// 引擎也是 accuracy（带 hotwords），否则本地 realtime 档拿不到词库热词。
 // MACOS-P4-NEUTRAL-002: 原 #[cfg(target_os = "windows")] 去除——平台中立纯 Rust（AsrModel 判定 + wordbook 读取 + build_hotwords_string），spawn_worker_thread（已去 cfg）调用，对 Windows 为 no-op。
 fn load_hotwords_for_accuracy(config: &AppConfig) -> Option<String> {
-    if transcription::AsrModel::from_config(&config.audio.asr_model)
-        != transcription::AsrModel::Accuracy
-    {
+    if !transcription::AsrModel::from_config(&config.audio.asr_model).uses_accuracy_engine() {
         return None;
     }
     match wordbook::Wordbook::open() {
@@ -7463,8 +7463,10 @@ fn spawn_worker_thread(
                     };
                     // R2-4: transcriber.is_none() 时无条件尝试重建（启动失败自愈）
                     let needs_rebuild = transcriber.is_none() && !asr_reload_in_flight;
+                    // FIX-LOCALRT-ENGINE-EQ-252: 判据收敛到 uses_accuracy_engine()——
+                    // LocalRealtime 也用 accuracy 引擎的热词，词库变更时需同样触发重载。
                     let needs_reload = cheap_needed
-                        || (desired_asr_model == transcription::AsrModel::Accuracy
+                        || (desired_asr_model.uses_accuracy_engine()
                             && active_hotwords_version != desired_hotwords_version)
                         || needs_rebuild;
                     if needs_reload && !asr_reload_in_flight {
@@ -8995,7 +8997,9 @@ fn run_pipeline_core(
                     silence_head_samples as f64 / 16.0,
                     keep_start,
                     keep_start as f64 / 16.0,
-                    if transcriber.asr_model() == transcription::AsrModel::Accuracy { "accuracy" } else { "performance" },
+                    // FIX-LOCALRT-ENGINE-EQ-252: 收敛到 uses_accuracy_engine()——LocalRealtime 的
+                    // 前处理/引擎按 accuracy 走，日志如实反映（否则被误标 performance）。
+                    if transcriber.asr_model().uses_accuracy_engine() { "accuracy" } else { "performance" },
                 );
                 let transcribing_msg = transcribing_status_text;
                 send_event(

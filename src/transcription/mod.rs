@@ -92,6 +92,18 @@ impl AsrModel {
     pub fn is_online_streaming(&self) -> bool {
         matches!(self, AsrModel::QwenAudioOnline | AsrModel::FunAsrRealtime)
     }
+
+    /// FIX-LOCALRT-ENGINE-EQ-252: 是否使用 **accuracy 引擎**（FunASR Nano native）。
+    ///
+    /// `Accuracy` 与 `LocalRealtime` 的离线/最终转录引擎都是 accuracy native
+    /// （LocalRealtime 的 2pass 最终文本由 accuracy 产出），故所有「accuracy 引擎专属」
+    /// 判据（VAD 分段、`native_punctuated`、hotwords 重载）都应命中两者。
+    ///
+    /// 🔴 收敛点：`== AsrModel::Accuracy` 这类相等比较**编译器不会报错**，新增变体极易漏改
+    /// （本单两个端测 bug 即由此而来）。新增使用 accuracy 引擎的档位时，只改这一处。
+    pub fn uses_accuracy_engine(self) -> bool {
+        matches!(self, AsrModel::Accuracy | AsrModel::LocalRealtime)
+    }
 }
 
 /// ASR transcriber using sherpa-onnx
@@ -130,7 +142,7 @@ pub struct Transcriber {
     /// VAD 分段器（仅 accuracy 长音频用）。
     ///
     /// 🔴 修正（LOCAL-RT-ENGINE-239-A，原文误写「懒加载」）：该字段在 `Transcriber::new`
-    /// （见下方 `let vad_segmenter = if effective_model == AsrModel::Accuracy { ... }` 分支）
+    /// （见下方 `let vad_segmenter = if effective_model.uses_accuracy_engine() { ... }` 分支）
     /// **随构造立即尝试初始化**，并非「首次长音频时才初始化」。
     /// 用 `Mutex` 包住的原因：`VadSegmenter::segment` 需要 `&mut self`，而 `Transcriber`
     /// 以共享引用被调用，故用内部可变性串行化。
@@ -235,10 +247,11 @@ impl Transcriber {
         let (offline_recognizer, effective_model, hotwords_version) =
             build_recognizer(model_dir, &asr_language, asr_model, hotwords)?;
 
-        // VAD 分段器仅 accuracy 模式懒加载初始化；performance 模式设 None
+        // VAD 分段器仅使用 accuracy 引擎的档位初始化；performance 模式设 None
         // R2: 用 effective_model 判断（降级 CTC 时不初始化 VAD）
-        let vad_segmenter = if effective_model == AsrModel::Accuracy {
-            // accuracy 模式下立即尝试初始化（模型文件在则建，失败后续降级）
+        // FIX-LOCALRT-ENGINE-EQ-252: 判据收敛到 uses_accuracy_engine()（含 LocalRealtime）
+        let vad_segmenter = if effective_model.uses_accuracy_engine() {
+            // accuracy 引擎档位立即尝试初始化（模型文件在则建，失败后续降级）
             vad::VadSegmenter::try_new(model_dir).map(Mutex::new)
         } else {
             None
@@ -437,7 +450,9 @@ impl Transcriber {
         script: ChineseScript,
     ) -> Result<(String, bool)> {
         // ASR-LONG-AUDIO-001: accuracy 分支长音频 VAD 分段路径
-        if self.asr_model == AsrModel::Accuracy && vad::should_segment(samples) {
+        // FIX-LOCALRT-ENGINE-EQ-252: 收敛到 uses_accuracy_engine()（LocalRealtime 长音频同样要分段，
+        // 否则整段喂 native 撞 max_total_len=512 ⇒ 空输出）
+        if self.asr_model.uses_accuracy_engine() && vad::should_segment(samples) {
             // 尝试 VAD 分段；lock poisoned / None → 降级 naive_chunk
             let vad_segments: Option<Vec<Vec<f32>>> = match &self.vad_segmenter {
                 Some(vad_lock) => match vad_lock.lock() {
@@ -562,7 +577,9 @@ impl Transcriber {
         let text = Self::strip_asr_special_tokens(&text);
 
         // ASR-SINGLE-MODEL-001: accuracy 空输出 → bail（不再兜底 CTC）
-        if self.asr_model == AsrModel::Accuracy {
+        // FIX-LOCALRT-ENGINE-EQ-252: 收敛到 uses_accuracy_engine()（LocalRealtime 也用 accuracy 引擎，
+        // native_punctuated=true ⇒ 跳过外部 CT-Transformer，避免双重打点）
+        if self.asr_model.uses_accuracy_engine() {
             if text.is_empty() {
                 log::warn!("ASR accuracy model produced empty output, transcription failed");
                 anyhow::bail!("ASR transcription failed: accuracy model produced empty output");
