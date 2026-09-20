@@ -192,3 +192,12 @@
 - **按令不做**：新增用例 / harness / 消融 / 脚本；未出包。
 - **证据**：`collab/outbox/tester-1/testexec251/`（cargo_test_root / cargo_test_tauri / cargo_check_tauri / npm_test / npm_test_browser 五日志）。
 - **红线**：未改生产代码与测试期望值 / 未 commit / 未出包 / 版本未动 / 零凭证。
+
+## 2026-09-20 — tester-1 — BUILD-244 v0.9.2 二包（本地流式实时模型批次）✅ 八项核验逐项 PASS
+
+- **放行**：TEST-EXEC-251 五项全绿 + 主控「现在可以出包」；HEAD `8354497`。**版本号维持 0.9.2（Gavin 明确「不升，0.9.2 一起出包」）**。
+- **构建**：Step1 清进程（PID 25612）→ npm 665ms（新资产 `index-CipQtFxc.js`/`index-y2eVZ7cR.css`）→ Tauri UI 96s（17 warnings）→ 主程序 152s（bin 110 / crash-reporter 9）→ cp UI 入 `target/release/` → Step4 三 exe + 两 toml 入 `Publish/`。
+- **八项**：①时间戳 main 20:50:36 / ui 20:48:05 / crash 20:49:21 ✅ ②两副本 sha 相等且全异于 BUILD-232 上包（main `e5807ccd…` / ui `99a15b02…` / crash `964a7163…`）✅ ③**ProductVersion 0.9.2 与上包相同系 Gavin 指示**，按替代判据「sha 异于上包」✅ ④冒烟 Responding=True ×2 + 无 crash.json + panic/ERROR 0（仅已知 `[ASR-DROP]` WARN）+ 残留 0 ✅ ⑤`config.toml` `18fe8608…` / `wordbook.sqlite` `b6ab43ac…` 零变化 ✅ ⑥warnings bin 110 / test 101 / src-tauri 17 = 新基线 ✅ ⑦探针（`grep -a -F`，无异常大命中）主 exe `local_realtime`=1 / `LocalRealtime`=5 / `streaming-paraformer-trilingual`=1，UI `local_realtime`=2 / `LocalRealtime`=1 ✅ ⑧scene `8ea93bb1…` / itn `311cbb96…` 三副本全等 ✅。
+- **端测（交 Gavin）**：Ctrl+M 解锁「本地流式实时模型」；双模型已就位 `Publish/models/`（paraformer-trilingual 228MB + funasr-nano-int8 972MB）；清单 `collab/e2e-checklist-local-realtime.md` 十项，🔴 第 10 项现有三档零回归为红线。
+- **证据**：`collab/outbox/tester-1/build244/`（prebuild_baseline / build_* / verify_all / verify_smoke / smoke_debug 等）。
+- **红线**：版本号三处未动 / 未 commit / 零凭证。

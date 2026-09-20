@@ -1084,3 +1084,11 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **warnings**：bin **110** / test **101** / src-tauri check **17** = 新基线逐位吻合。
 - **结论**：1345 用例全绿，FAIL 0，出包闸门通过。
 - **负责人**：tester-1 ｜ **日期**：2026-09-20
+
+## BUILD-244 · 2026-09-20 · ✅ 本地流式实时模型批次出包（v0.9.2 不升版）
+
+- **放行**：TEST-EXEC-251 五项全绿 + 主控「现在可以出包」（DEC-053）；HEAD `8354497`。
+- **构建**：Step1–4 全走（npm 665ms + Tauri UI 96s `custom-protocol` + 主程序 152s），三 exe + 两 toml 入 `Publish/`。
+- **八项核验逐项 PASS**：①时间戳 20:48–20:50 ②两副本 sha 相等且异于上包（main `e5807ccd…` / ui `99a15b02…` / crash `964a7163…`）③**ProductVersion 0.9.2 不变 = Gavin 指示，改按 sha 异于上包为判据** ④冒烟 Responding=True / 无 crash.json / panic·ERROR 0 / 残留 0 ⑤`config.toml`+`wordbook.sqlite` 零变化 ⑥warnings 110/101/17 = 新基线 ⑦探针 `local_realtime`/`LocalRealtime`/`streaming-paraformer-trilingual` 命中 ⑧两 toml 三副本全等。
+- **端测**：交 Gavin，`collab/e2e-checklist-local-realtime.md` 十项（第 10 项现有三档零回归为红线）；双模型已就位 `Publish/models/`。
+- **负责人**：tester-1 ｜ **日期**：2026-09-20

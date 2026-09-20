@@ -761,3 +761,14 @@ load_wordbook_vocabulary()
 | 回归 | root 1266P/0F/15I + src-tauri 77P/0F；`config::tests` 并行连跑 5 次全绿 |
 | 出包 | `BUILD-232` 八项核验逐项 PASS，ProductVersion 0.9.2；产物 `feiyin-ime` 12.35MB / UI 10.05MB / crash-reporter 24.88MB |
 | 遗留 | 语义断句模式下服务端中间结果频率未知（可能致 overlay 预览变顿）；`[ASR-DROP]` 逐帧 WARN（`src/audio/mod.rs:492-495`）待下批修 |
+
+
+## v0.9.2（二包 · BUILD-244）· 2026-09-20 · 本地流式实时模型批次（版本号不升）
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | LOCAL-RT-UI-240 / ENGINE-239-A/B 本地流式实时管线（第四条 ASR 档位）+ LOCAL-RT-READY-246 双模型就位检测 + WORDBOOK-MINLEN-242 候选词下限；**版本号维持 0.9.2**（Gavin 明确指示不升） |
+| 回归 | TEST-EXEC-251 五项全绿：root 1267P/0F/15I + src-tauri 78P/0F + Vitest 100P/0F/11S + browser(Chromium) 5P/0F |
+| 出包 | `BUILD-244` 八项核验逐项 PASS（③按「sha 异于上包」替代判据）；产物 `feiyin-ime` 12.43MB `e5807ccd…` / `feiyin-ime-ui` 10.05MB `99a15b02…` / `crash-reporter` 24.88MB `964a7163…`，时间戳 20:48–20:50 |
+| 端测 | 待 Gavin：`collab/e2e-checklist-local-realtime.md` 十项；双模型已就位 `Publish/models/`；🔴 第 10 项「现有三档零回归」为红线 |
+| 遗留 | `[ASR-DROP]` 逐帧 WARN 未修（非本批）；语义断句中间结果频率待端测 |
