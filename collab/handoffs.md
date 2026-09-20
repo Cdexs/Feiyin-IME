@@ -183,3 +183,12 @@
 - **中途修正**：卡片首版裸 `#d9534f` 被 design-tokens 测试（UITEST-137）判红 → 改令牌 `var(--status-success/error)`。
 - **验证**：`npm run build` 通过；`npm run test` 100P/11S；root cargo check 0 error（warnings **110/101** = 新基线）；src-tauri 0 error（17 基线）；transcription/mod.rs rustfmt clean；未新增测试。未碰 coder-2 的 src/main.rs / src/i18n.rs / local_stream.rs。
 - **红线**：未动版本；未 commit；未出包；零凭证。
+
+## 2026-09-20 — tester-1 — TEST-EXEC-251 v0.9.3 最终全量回归 ✅（出包前闸门，五项全绿，FAIL 0）
+
+- **结果（五项）**：root **1267P/0F/15I**（EXIT 0，=期望）；`src-tauri` **78P/0F/0I**（=期望）；Vitest happy-dom **7 files/100P/0F/11S**；🆕 **Vitest browser（Chromium）1 file/5P/0F**（本批 ui 有 diff，按 worker-guide §五必跑兜底；UITEST-137 未复现）；E2E SKIP（无 release 产物）。
+- **warnings 新基线核对**：bin "feiyin-ime" **110** / test 档 **101** / src-tauri `cargo check` **17** —— 三项逐位吻合；src-tauri test 档 19 与 check 17 非同一命令，不作判据。
+- **结论**：三处提取（N5/N6/N9）+ 第四条 ASR 管线 + 词库闸门 + 246 前端，共 **1345** 用例全绿 ⇒ 无本批回归，出包闸门通过。
+- **按令不做**：新增用例 / harness / 消融 / 脚本；未出包。
+- **证据**：`collab/outbox/tester-1/testexec251/`（cargo_test_root / cargo_test_tauri / cargo_check_tauri / npm_test / npm_test_browser 五日志）。
+- **红线**：未改生产代码与测试期望值 / 未 commit / 未出包 / 版本未动 / 零凭证。

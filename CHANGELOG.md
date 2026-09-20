@@ -1076,3 +1076,11 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **文件**：`src/main.rs` +334/-7、`src/i18n.rs` +10、`src/transcription/local_stream.rs` +19/-2。
 - **验证**：cargo check --all-targets 0 error、warnings 110/101 = 现行基线；rustfmt 三文件 clean；numstat/-w 同；未跑 cargo test（归 tester-1）。
 - **负责人**：coder-2 ｜ **日期**：2026-09-20
+
+## TEST-EXEC-251 · 2026-09-20 · ✅ v0.9.3 最终全量回归（出包前闸门，五项全绿）
+
+- **范围**：`00dfe54` 239-A 阶段二 + `dfe1b48` 239-B 接线 + `d0956a1` 246 双模型就位；工作区 clean。
+- **结果**：root **1267P/0F/15I**（=期望）；`src-tauri` **78P/0F/0I**（=期望）；Vitest happy-dom **100P/0F/11S**；Vitest browser Chromium **5P/0F**（本批 ui 必跑兜底，UITEST-137 未复现）；E2E SKIP。
+- **warnings**：bin **110** / test **101** / src-tauri check **17** = 新基线逐位吻合。
+- **结论**：1345 用例全绿，FAIL 0，出包闸门通过。
+- **负责人**：tester-1 ｜ **日期**：2026-09-20
