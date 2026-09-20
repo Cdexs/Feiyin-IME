@@ -933,3 +933,12 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **订正**：SenseVoice→FunASR Nano CTC；模型体积按实测重填；补两个可编辑规则文件；exe 名；补 v0.8~0.9 新能力
 - 🔴 **查出并纠正文档冲突**：翻译方向以代码为准（`target_language` 配置决定，非内容自动双向，且无界面开关）
 - **负责人**：主控 ｜ **日期**：2026-09-10
+
+## ASR-SEG-229 + VER-BUMP-230 · 2026-09-20 · ✅ 在线 ASR 两轴参数化 + 版本 0.9.1 → 0.9.2（待验收）
+
+- **229 轴一**：`asr_online_max_sentence_silence` 默认 **800 → 2000**（官方默认 1300；800 过激进致碎句 + 满屏句号）；主配置 + Tauri 镜像 + 测试默认用例同步
+- **229 轴二**：`semantic_punctuation_enabled` **编译期常量 → 隐藏 config 字段** `asr_online_semantic_punctuation_enabled`（默认 false），经 `Transcriber` / 两 streaming 函数逐层透传到 run-task
+- **红线遵守**：Tauri 配置镜像同改（防静默抹字段）；未对 src-tauri 跑 `cargo fmt`；新增测试仅镜像往返 1 条
+- **230**：`Cargo.toml` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` 三处版本 `0.9.1 → 0.9.2`（Gavin 2026-09-20 授权）
+- **验证**：`cargo check` ×3 = 0 error（warnings 111 / 102 / 17 持平基线）；rustfmt 4 根文件 clean；定向测试全绿；未跑全量 `cargo test`、未出包、未 commit
+- **负责人**：coder-1 ｜ **日期**：2026-09-20

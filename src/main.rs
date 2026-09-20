@@ -7104,6 +7104,8 @@ fn spawn_asr_reload(
     let reload_asr_online_url = config.audio.asr_online_url.clone();
     let reload_asr_online_model = config.audio.asr_online_model.clone();
     let reload_asr_online_max_sentence_silence = config.audio.asr_online_max_sentence_silence;
+    let reload_asr_online_semantic_punctuation_enabled =
+        config.audio.asr_online_semantic_punctuation_enabled;
     std::thread::spawn(move || {
         let t_build = std::time::Instant::now();
         match transcription::Transcriber::new(
@@ -7116,6 +7118,7 @@ fn spawn_asr_reload(
             &reload_asr_online_url,
             &reload_asr_online_model,
             reload_asr_online_max_sentence_silence,
+            reload_asr_online_semantic_punctuation_enabled,
         ) {
             Ok(new_t) => {
                 log::info!(
@@ -7226,6 +7229,7 @@ fn spawn_worker_thread(
             &config.audio.asr_online_url,
             &config.audio.asr_online_model,
             config.audio.asr_online_max_sentence_silence,
+            config.audio.asr_online_semantic_punctuation_enabled,
         ) {
             Ok(t) => Some(t),
             Err(err) => {
@@ -7493,6 +7497,8 @@ fn spawn_worker_thread(
                         let asr_online_model = transcriber_ref.asr_online_model().to_string();
                         let asr_online_max_sentence_silence =
                             transcriber_ref.asr_online_max_sentence_silence();
+                        let asr_online_semantic_punctuation_enabled =
+                            transcriber_ref.asr_online_semantic_punctuation_enabled();
                         let qwen_api_key = config.audio.asr_online_api_key.clone();
                         let model_dir_clone = model_dir.clone();
                         let cancel_clone = Arc::clone(&cancel_signal);
@@ -7512,6 +7518,7 @@ fn spawn_worker_thread(
                                     chunk_rx,
                                     &vocabulary,
                                     asr_online_max_sentence_silence,
+                                    asr_online_semantic_punctuation_enabled,
                                     &model_dir_clone,
                                     Some(&cancel_clone),
                                     |display_text, words| {

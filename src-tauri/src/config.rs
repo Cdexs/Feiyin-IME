@@ -116,10 +116,15 @@ pub struct AudioConfig {
     #[serde(default = "default_asr_online_model", alias = "qwen_asr_model")]
     pub asr_online_model: String,
     /// ASR-056: VAD 断句静音阈值（ms），config.toml 隐藏字段（不进 UI，DEC-031）。
-    /// 默认 800ms 保持基线，500 vs 800 可作为独立一轴单独 A/B。
+    /// ASR-SEG-229（2026-09-20）：默认 800 → 2000（从源头减少服务端 VAD 碎句）。
     /// 必须与主程序 src/config/mod.rs 同步（round-trip 数据丢失防护）。
     #[serde(default = "default_asr_online_max_sentence_silence")]
     pub asr_online_max_sentence_silence: i64,
+    /// ASR-SEG-229: 在线 ASR 语义断句/标点开关（隐藏字段，不进 UI，DEC-031）。
+    /// 官方 `semantic_punctuation_enabled`，默认 false = VAD 断句（保持既有行为）。
+    /// 必须与主程序 src/config/mod.rs 同步（round-trip 数据丢失防护）。
+    #[serde(default)]
+    pub asr_online_semantic_punctuation_enabled: bool,
 }
 
 fn default_overlay_opacity() -> f32 {
@@ -142,8 +147,9 @@ fn default_asr_online_model() -> String {
 }
 
 /// ASR-056: VAD 断句静音阈值默认值（ms），与主程序 default_asr_online_max_sentence_silence 同步
+/// ASR-SEG-229（2026-09-20）：主程序默认 800 → 2000，镜像必须逐值同步。
 fn default_asr_online_max_sentence_silence() -> i64 {
-    800
+    2000
 }
 
 impl Default for AudioConfig {
@@ -160,6 +166,8 @@ impl Default for AudioConfig {
             asr_online_url: default_asr_online_url(),
             asr_online_model: default_asr_online_model(),
             asr_online_max_sentence_silence: default_asr_online_max_sentence_silence(),
+            // ASR-SEG-229: 默认 false = VAD 断句（保持既有行为）
+            asr_online_semantic_punctuation_enabled: false,
         }
     }
 }
@@ -416,6 +424,7 @@ mod tests {
                 asr_online_url: default_asr_online_url(),
                 asr_online_model: default_asr_online_model(),
                 asr_online_max_sentence_silence: default_asr_online_max_sentence_silence(),
+                asr_online_semantic_punctuation_enabled: false,
             },
             llm: LlmConfig::default(),
             hotkey: HotkeyConfig::default(),
@@ -500,8 +509,13 @@ mod tests {
         );
         assert_eq!(
             cfg.audio.asr_online_max_sentence_silence,
-            800,
-            "mirror asr_online_max_sentence_silence default must match main config (800ms)"
+            2000,
+            "mirror asr_online_max_sentence_silence default must match main config (2000ms, ASR-SEG-229)"
+        );
+        // ASR-SEG-229: 语义断句开关镜像默认值必须 false（与主程序一致）
+        assert_eq!(
+            cfg.audio.asr_online_semantic_punctuation_enabled, false,
+            "mirror asr_online_semantic_punctuation_enabled default must match main config (false)"
         );
         // alias 字段名同步（镜像缺 alias 也会静默丢数据，041-B 已补）
         assert_eq!(cfg.audio.asr_online_api_key, "");
@@ -544,6 +558,24 @@ mod tests {
         assert_eq!(
             loaded.audio.asr_online_max_sentence_silence, 500,
             "mirror must roundtrip hidden max_sentence_silence field (silent-drop guard)"
+        );
+    }
+
+    /// ASR-SEG-229: 隐藏字段 asr_online_semantic_punctuation_enabled 镜像往返不丢
+    /// （038-A 同款：镜像缺字段会让 UI 保存时静默丢弃主程序写入的值）。
+    #[test]
+    fn mirror_asr_online_semantic_punctuation_roundtrip() {
+        let path = temp_config_path("semantic_punctuation_roundtrip");
+        cleanup(&path);
+        let mut cfg = make_minimal_cfg_with_asr_model("performance");
+        cfg.audio.asr_online_semantic_punctuation_enabled = true;
+        cfg.save_to(&path).unwrap();
+
+        let loaded = AppConfig::load_from(&path).unwrap();
+        cleanup(&path);
+        assert_eq!(
+            loaded.audio.asr_online_semantic_punctuation_enabled, true,
+            "mirror must roundtrip hidden semantic_punctuation_enabled field (silent-drop guard)"
         );
     }
 

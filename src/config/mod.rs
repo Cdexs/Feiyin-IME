@@ -158,12 +158,21 @@ pub struct AudioConfig {
     pub asr_online_model: String,
     /// ASR-056: VAD 断句静音阈值（ms），config.toml 隐藏字段（不进 UI，DEC-031）。
     ///
-    /// 主控 2026-08-18 验收裁决：默认 800ms 保持基线（与 qwen 既有行为一致），
-    /// 让 Gavin 的 A/B 对比能分清「fun-asr 更快」是模型带来的还是 silence 带来的。
-    /// 500 vs 800 可以作为独立一轴单独 A/B——改 config.toml 即可，不用重新出包。
+    /// ASR-SEG-229（2026-09-20）：默认 800 → 2000。
+    /// 800 比官方默认 1300 还激进，Gavin 端测「稍一停顿就被判句尾，输出切碎且每段带标点」。
+    /// 提阈值让中句停顿不再触发服务端 VAD 断句，从源头减少碎句与句末标点。
+    /// 端点预览走中间结果、「final_text = confirmed + current」不丢尾字，故提阈值零成本。
     /// 官方文档默认 1300ms，范围 200-6000ms。
     #[serde(default = "default_asr_online_max_sentence_silence")]
     pub asr_online_max_sentence_silence: i64,
+    /// ASR-SEG-229: 在线 ASR 语义断句/标点开关，config.toml 隐藏字段（不进 UI，DEC-031）。
+    ///
+    /// 官方 `semantic_punctuation_enabled`：true=服务端按语义断句（更准但延迟高）、
+    /// false=按 `asr_online_max_sentence_silence` 静音阈值做 VAD 断句。
+    /// ASR-SEG-229 两轴的第二轴：默认 false 保持既有行为，A/B 时改 config.toml 独立验证。
+    /// 与 `asr_online_max_sentence_silence` 同属在线 ASR 隐藏调参。
+    #[serde(default)]
+    pub asr_online_semantic_punctuation_enabled: bool,
 }
 
 fn default_overlay_opacity() -> f32 {
@@ -189,11 +198,12 @@ fn default_asr_online_model() -> String {
 
 /// ASR-056: VAD 断句静音阈值默认值（ms）
 ///
-/// 主控 2026-08-18 验收裁决：保持 800ms 基线（与 qwen 既有行为一致），
-/// 让 Gavin 的 A/B 对比能分清「fun-asr 更快」是模型带来的还是 silence 带来的。
-/// 500 vs 800 可作为独立一轴单独 A/B（改 config.toml 即可，不用重新出包）。
+/// ASR-SEG-229（2026-09-20）：默认 800 → 2000。
+/// 800 比官方默认 1300 还激进，Gavin 端测出现碎句 + 满屏句号；提阈值从源头减少
+/// 服务端 VAD 断句次数（端点预览走中间结果，不依赖确认句，故零代价）。
+/// 官方文档默认 1300ms，范围 200-6000ms；A/B 时可改 config.toml 独立验证。
 fn default_asr_online_max_sentence_silence() -> i64 {
-    800
+    2000
 }
 
 /// ASR-056: 每个在线 ASR 族的默认模型串（前缀守卫回落用）
@@ -308,6 +318,8 @@ impl Default for AudioConfig {
             asr_online_url: default_asr_online_url(),
             asr_online_model: default_asr_online_model(),
             asr_online_max_sentence_silence: default_asr_online_max_sentence_silence(),
+            // ASR-SEG-229: 默认 false = VAD 断句（保持既有行为），A/B 走 config.toml
+            asr_online_semantic_punctuation_enabled: false,
         }
     }
 }
@@ -1764,14 +1776,15 @@ clipboard_delay_ms = 150
         }
     }
 
-    /// TEST-SYNC-056 ④: 隐藏字段 asr_online_max_sentence_silence 默认 800ms
-    /// （DEC-031 不进 UI，主控 2026-08-18 裁决保持基线，500 vs 800 留作独立 A/B 轴）。
+    /// TEST-SYNC-056 ④ / ASR-SEG-229: 隐藏字段 asr_online_max_sentence_silence 默认 2000ms
+    /// （DEC-031 不进 UI；ASR-SEG-229 由 800 提到 2000，从源头减少服务端 VAD 碎句，
+    ///  A/B 时改 config.toml 即可独立验证）。
     #[test]
-    fn asr_056_config_hidden_field_default_silence_800() {
+    fn asr_056_config_hidden_field_default_silence_2000() {
         let cfg = AppConfig::default();
         assert_eq!(
-            cfg.audio.asr_online_max_sentence_silence, 800,
-            "hidden field default must be 800ms (main config side)"
+            cfg.audio.asr_online_max_sentence_silence, 2000,
+            "hidden field default must be 2000ms (main config side, ASR-SEG-229)"
         );
     }
 

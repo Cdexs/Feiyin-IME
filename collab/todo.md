@@ -29,6 +29,25 @@
 逐条取证见 `CHANGELOG.md` 的 `BUILD-228` 条目与 `handoffs-archive.md` 的 09-17 段（26 条）。
 **未销项的只剩 `ITN-FIX-LIANGDIAN-223`**（见下），它当时未进批。
 
+### 🆕 ASR-SEG-229 · 在线 ASR 碎句 + 满屏句号（Gavin 2026-09-20 端测报）🔄 已派 coder-1
+
+| 项 | 内容 |
+| --- | --- |
+| 现象 | 说话稍一停顿就被判句尾，输出切得很碎且每段都带标点 |
+| 🔴 根因已坐实 | ① 日志实证 `Transcribed: …火箭在东风。商业航天创新试验区… (native_punctuated=true)` ⇒ 标点来自**服务端**，本地 CT-Transformer 被 `main.rs:8976` 的 `&& !native_punctuated` 跳过 ② 官方文档：`semantic_punctuation_enabled=false` 的含义就是**「开启 VAD 断句」= 按停顿断**，不是能修它的开关 ③ fun-asr-realtime **无关闭标点预测的参数**（与 PUNCT-GOVERNANCE-030「在线 ASR 物理上不可控」结论一致）④ `max_sentence_silence` 我们设 800，**官方默认 1300**，比默认还激进 |
+| 方案（两轴，L1 源头） | 轴一：默认 800 → **2000**；轴二：`SEMANTIC_PUNCTUATION_ENABLED` 编译期常量 → 隐藏 config 字段。两轴都可配 ⇒ Gavin 一次出包端测 2×2 四组合 |
+| 为什么提阈值零代价 | overlay 预览走中间结果（`sentence_end=false`）不等确认句；`final_text()` 返回 confirmed+current（ASR-070）不丢尾字。文档说的「VAD 延迟低」指**确认句**延迟，我们不依赖它 |
+| 🔴 必须同改的镜像 | `src-tauri/src/config.rs` 是配置镜像，**漏加新字段 = 设置界面一保存就把 A/B 配置静默抹掉**；`:502-504` 有「镜像默认值必须等于主配置 800ms」断言，改默认必同步 |
+| 🔴 未知风险（只能端测） | 语义模式下服务端是否仍以同频率发中间结果；若憋着批量发 → overlay 预览变顿 |
+| Plan B（A/B 失败才上） | L2：剥服务端句尾标点、整段交本地 CT-Transformer 重打。PUNCT-GOVERNANCE-030 定「能在源头关的别产出后再剥」，故 L1 优先 |
+| 🔴 端测前必做 | Gavin 的 `Publish/config.toml` 里**已写死 `asr_online_max_sentence_silence = 800`**，serde default 只在字段缺失时生效 ⇒ **改默认值对他的端测零作用，必须手改那一行**。新字段则因缺失会走 default(false) |
+| 配置键定名 | `asr_online_semantic_punctuation_enabled`（采纳 coder-1 提议，优于主控原拟的短名：与兄弟字段统一遵循 `asr_online_` + 官方字段原名 的构词规则） |
+| 热重载边界 | coder-1 报备并经主控确认：两个参数都在 `Transcriber::new` 熔入，`asr_cheap_reload_needed` 触发键不含二者 ⇒ **A/B 必须重启进程**。与既有 silence 字段行为一致，本单不扩 scope |
+
+**VER-BUMP-230** · 版本号 0.9.1 → 0.9.2（Gavin 2026-09-20 明确授权，本批算进 v0.9.2）
+`Cargo.toml:3` + `src-tauri/Cargo.toml:3` + `src-tauri/tauri.conf.json:9` 三处；`ui/package.json` 不动。
+与 229 文件零重叠，已并进同一单派给 coder-1，省一个派发轮次。
+
 ### 🔴 ITN-FIX-LIANGDIAN-223 · `这两点一个都不能少` → `这2.1个都不能少`（Gavin 2026-09-17 端测报）
 
 | 项 | 内容 |

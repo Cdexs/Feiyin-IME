@@ -113,8 +113,10 @@ pub struct Transcriber {
     asr_online_api_key: String,
     asr_online_url: String,
     asr_online_model: String,
-    /// ASR-056: VAD 断句静音阈值（ms），config.toml 隐藏字段覆盖，默认 800
+    /// ASR-056: VAD 断句静音阈值（ms），config.toml 隐藏字段覆盖，ASR-SEG-229 默认 2000
     asr_online_max_sentence_silence: i64,
+    /// ASR-SEG-229: 在线 ASR 语义断句/标点开关，config.toml 隐藏字段覆盖，默认 false
+    asr_online_semantic_punctuation_enabled: bool,
 }
 
 // SAFETY: Transcriber 持有的 OfflineRecognizer 内部为 *const C++ 指针。
@@ -141,6 +143,7 @@ impl Transcriber {
         asr_online_url: &str,
         asr_online_model: &str,
         asr_online_max_sentence_silence: i64,
+        asr_online_semantic_punctuation_enabled: bool,
     ) -> Result<Self> {
         let mode = if enable_streaming {
             AsrMode::Streaming
@@ -170,6 +173,7 @@ impl Transcriber {
                 asr_online_url: asr_online_url.to_string(),
                 asr_online_model: asr_online_model.to_string(),
                 asr_online_max_sentence_silence,
+                asr_online_semantic_punctuation_enabled,
             });
         }
 
@@ -196,6 +200,7 @@ impl Transcriber {
             asr_online_url: String::new(),
             asr_online_model: String::new(),
             asr_online_max_sentence_silence,
+            asr_online_semantic_punctuation_enabled,
         })
     }
 
@@ -216,6 +221,11 @@ impl Transcriber {
     /// ASR-056: VAD 断句静音阈值（ms）
     pub fn asr_online_max_sentence_silence(&self) -> i64 {
         self.asr_online_max_sentence_silence
+    }
+
+    /// ASR-SEG-229: 在线 ASR 语义断句/标点开关（默认 false = VAD 断句）
+    pub fn asr_online_semantic_punctuation_enabled(&self) -> bool {
+        self.asr_online_semantic_punctuation_enabled
     }
 
     /// 当前 hotwords 版本号（外部对比用）
@@ -321,6 +331,7 @@ impl Transcriber {
                 samples,
                 &vocabulary,
                 self.asr_online_max_sentence_silence,
+                self.asr_online_semantic_punctuation_enabled,
                 None,
                 |_| {},
             )?;
@@ -937,6 +948,7 @@ mod tests {
             "wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference",
             "qwen-audio-3.0-asr-flash-streaming",
             800,
+            false,
         )
         .expect("QwenAudioOnline Transcriber::new should succeed without local models");
         assert_eq!(t.asr_model(), AsrModel::QwenAudioOnline);
@@ -963,6 +975,7 @@ mod tests {
             "wss://inference.example.com",
             "qwen-audio-3.0-asr-flash-streaming",
             800,
+            false,
         );
         assert!(result.is_err());
         let err_msg = result.err().unwrap().to_string();

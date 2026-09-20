@@ -70,14 +70,14 @@ const DEFAULT_FUN_ASR_MODEL: &str = "fun-asr-realtime";
 
 /// VAD 断句静音阈值（ms）
 ///
-/// ASR-056 参数调优结论（主控 2026-08-18 验收裁决）：
-/// - 官方文档默认 1300ms，范围 200-6000ms
-/// - 默认保持 800ms 基线（与 qwen 既有行为一致），不改变两族行为
-/// - 此常量是**编译期默认**，运行时由 config.toml 的
+/// ASR-056 参数调优结论（主控 2026-08-18 验收裁决）+
+/// ASR-SEG-229（2026-09-20 端测）：默认 800 → 2000。
+/// - 官方文档默认 1300ms，范围 200-6000ms；800 比官方默认还激进，
+///   导致中句停顿即被服务端 VAD 断句、输出碎且每段带标点
+/// - 此常量是**编译期默认**（仅测试夹具用），运行时由 config.toml 的
 ///   `asr_online_max_sentence_silence` 隐藏字段覆盖（DEC-031，不进 UI）
-/// - 让 Gavin 的 A/B 对比能分清「fun-asr 更快」是模型带来的还是 silence 带来的：
-///   500 vs 800 可作为独立一轴单独 A/B，改 config.toml 即可，不用重新出包
-const DEFAULT_MAX_SENTENCE_SILENCE: i64 = 800;
+/// - A/B 时可改 config.toml 独立验证，不用重新出包
+const DEFAULT_MAX_SENTENCE_SILENCE: i64 = 2000;
 
 /// ASR-056: speech_noise_threshold 服务端噪声门限
 ///
@@ -114,15 +114,10 @@ const DEFAULT_MAX_SENTENCE_SILENCE: i64 = 800;
 /// - 拿不准保持默认，不瞎调。依据：查不到可靠依据，保持默认
 /// - 不设置此字段
 
-/// ASR-056: 语义标点开关
-///
-/// 调优结论：保持 `false`（原值）
-/// - 我们已有本地标点引擎（CT-Transformer），且 PUNCT-GOVERNANCE-030 已治理标点全源
-/// - semantic_punctuation_enabled=true 会让服务端加标点，与本地标点引擎重复
-/// - true 更准但延迟高（服务端标点需额外推理），false 低延迟（PUNCT-GOVERNANCE-030 已让本地兜底）
-/// - 依据：PUNCT-GOVERNANCE-030 治理结论 + 低延迟优先裁决
-/// - 取值 false，利速度
-const SEMANTIC_PUNCTUATION_ENABLED: bool = false;
+// ASR-SEG-229: 原编译期常量 `SEMANTIC_PUNCTUATION_ENABLED` 已改为隐藏 config 字段
+// `asr_online_semantic_punctuation_enabled`（默认 false），由调用方逐层传入
+// `build_run_task_message`，供 Gavin 端测 A/B（语义断句 vs VAD 断句）。
+// 理由：语义断句开关是 Gavin 端测要独立验证的一轴，编译期常量无法 A/B。
 
 // ===========================================================================
 // 纯函数：消息构造（可单测）
@@ -247,8 +242,9 @@ impl AsrSummary {
 /// ASR-056: 参数取值按「偏向低延迟」裁决（Gavin 研究发现 fun-asr-realtime 更快）。
 /// 两族共用同一 schema，差异只在 model 名。
 /// - max_sentence_silence 由调用方传入（config.toml 隐藏字段 asr_online_max_sentence_silence，
-///   默认 800ms 保持基线，500 vs 800 可独立 A/B）
-/// - semantic_punctuation_enabled=false（本地标点引擎兜底，利速度）
+///   ASR-SEG-229 默认 2000ms，A/B 可改 config.toml）
+/// - semantic_punctuation_enabled 由调用方传入（config.toml 隐藏字段
+///   asr_online_semantic_punctuation_enabled，默认 false = VAD 断句，ASR-SEG-229 第二轴）
 /// - language_hints=["zh","en","ja","ko"]（保持四语，利准确率，不拖慢）
 /// - speech_noise_threshold/multi_threshold_mode_enabled/heartbeat/special_word_filter
 ///   均不设置（保持服务端默认，查不到可靠依据不瞎调）
@@ -257,13 +253,14 @@ pub fn build_run_task_message(
     model: &str,
     vocabulary: &serde_json::Value,
     max_sentence_silence: i64,
+    semantic_punctuation_enabled: bool,
 ) -> serde_json::Value {
     let _ = model; // ASR-056: 参数取值对两族一致，model 名差异已在调用侧处理
     let mut parameters = serde_json::json!({
         "format": "pcm",
         "sample_rate": 16000,
         "language_hints": ASR_LANGUAGE_HINTS,
-        "semantic_punctuation_enabled": SEMANTIC_PUNCTUATION_ENABLED,
+        "semantic_punctuation_enabled": semantic_punctuation_enabled,
         "max_sentence_silence": max_sentence_silence,
     });
     // 仅当 vocabulary 非空对象时注入
@@ -703,6 +700,7 @@ pub fn transcribe_streaming(
     samples_16k: &[f32],
     vocabulary: &serde_json::Value,
     max_sentence_silence: i64,
+    semantic_punctuation_enabled: bool,
     cancel_signal: Option<&std::sync::atomic::AtomicBool>,
     mut on_result: impl FnMut(&str),
 ) -> Result<String> {
@@ -798,7 +796,13 @@ pub fn transcribe_streaming(
     .context("网络失败：设置 socket 超时失败")?;
 
     // 1. send run-task
-    let run_task = build_run_task_message(&task_id, model, vocabulary, max_sentence_silence);
+    let run_task = build_run_task_message(
+        &task_id,
+        model,
+        vocabulary,
+        max_sentence_silence,
+        semantic_punctuation_enabled,
+    );
     send_json(&mut ws_socket, &run_task)?;
 
     // 2. 等 task-started
@@ -963,6 +967,7 @@ pub fn transcribe_streaming_realtime(
     chunk_rx: crossbeam_channel::Receiver<Vec<f32>>,
     vocabulary: &serde_json::Value,
     max_sentence_silence: i64,
+    semantic_punctuation_enabled: bool,
     model_dir: &std::path::Path,
     cancel_signal: Option<&std::sync::atomic::AtomicBool>,
     mut on_result: impl FnMut(&str, &[WordTiming]),
@@ -1066,7 +1071,13 @@ pub fn transcribe_streaming_realtime(
 
     // send run-task（不含音频，只含 model/parameters/input）
     // 🔴 红线：run-task 不含音频字节，VAD 命中前一个音频字节都不许发
-    let run_task = build_run_task_message(&task_id, model, vocabulary, max_sentence_silence);
+    let run_task = build_run_task_message(
+        &task_id,
+        model,
+        vocabulary,
+        max_sentence_silence,
+        semantic_punctuation_enabled,
+    );
     send_json(&mut ws_socket, &run_task)?;
 
     // 等 task-started
@@ -1653,6 +1664,7 @@ mod tests {
             "test-model",
             &vocab,
             DEFAULT_MAX_SENTENCE_SILENCE,
+            false,
         );
         assert_eq!(msg["header"]["action"], "run-task");
         assert_eq!(msg["header"]["task_id"], "test-task-id");
@@ -1673,6 +1685,7 @@ mod tests {
             "my-model",
             &serde_json::json!({}),
             DEFAULT_MAX_SENTENCE_SILENCE,
+            false,
         );
         assert_eq!(msg["payload"]["model"], "my-model");
         // header 不应有 model
@@ -1686,6 +1699,7 @@ mod tests {
             "model",
             &serde_json::json!({}),
             DEFAULT_MAX_SENTENCE_SILENCE,
+            false,
         );
         let hints = msg["payload"]["parameters"]["language_hints"]
             .as_array()
@@ -1700,7 +1714,8 @@ mod tests {
     #[test]
     fn build_run_task_vocabulary_injected_when_non_empty() {
         let vocab = serde_json::json!({"张三": 5, "李四": 4});
-        let msg = build_run_task_message("tid", "model", &vocab, DEFAULT_MAX_SENTENCE_SILENCE);
+        let msg =
+            build_run_task_message("tid", "model", &vocab, DEFAULT_MAX_SENTENCE_SILENCE, false);
         assert_eq!(msg["payload"]["parameters"]["vocabulary"]["张三"], 5);
         assert_eq!(msg["payload"]["parameters"]["vocabulary"]["李四"], 4);
     }
@@ -1708,7 +1723,8 @@ mod tests {
     #[test]
     fn build_run_task_vocabulary_omitted_when_empty() {
         let vocab = serde_json::json!({});
-        let msg = build_run_task_message("tid", "model", &vocab, DEFAULT_MAX_SENTENCE_SILENCE);
+        let msg =
+            build_run_task_message("tid", "model", &vocab, DEFAULT_MAX_SENTENCE_SILENCE, false);
         assert!(
             msg["payload"]["parameters"].get("vocabulary").is_none(),
             "empty vocabulary must be omitted"
@@ -1716,27 +1732,28 @@ mod tests {
     }
 
     #[test]
-    fn build_run_task_has_max_sentence_silence_800() {
-        // ASR-056: 默认 800ms 保持基线（主控 2026-08-18 验收裁决）
-        // 500 vs 800 可通过 config.toml asr_online_max_sentence_silence 隐藏字段独立 A/B
+    fn build_run_task_has_max_sentence_silence_2000() {
+        // ASR-SEG-229（2026-09-20）：默认 800 → 2000（官方默认 1300，800 过激进导致碎句）
+        // 可改 config.toml asr_online_max_sentence_silence 隐藏字段独立 A/B
         let msg = build_run_task_message(
             "tid",
             "model",
             &serde_json::json!({}),
             DEFAULT_MAX_SENTENCE_SILENCE,
+            false,
         );
-        assert_eq!(msg["payload"]["parameters"]["max_sentence_silence"], 800);
+        assert_eq!(msg["payload"]["parameters"]["max_sentence_silence"], 2000);
     }
 
     #[test]
     fn asr_056_build_run_task_max_sentence_silence_configurable() {
         // ASR-056: max_sentence_silence 由调用方传入，可被 config.toml 覆盖
-        let msg_500 = build_run_task_message("tid", "model", &serde_json::json!({}), 500);
+        let msg_500 = build_run_task_message("tid", "model", &serde_json::json!({}), 500, false);
         assert_eq!(
             msg_500["payload"]["parameters"]["max_sentence_silence"],
             500
         );
-        let msg_800 = build_run_task_message("tid", "model", &serde_json::json!({}), 800);
+        let msg_800 = build_run_task_message("tid", "model", &serde_json::json!({}), 800, false);
         assert_eq!(
             msg_800["payload"]["parameters"]["max_sentence_silence"],
             800
@@ -1750,6 +1767,7 @@ mod tests {
             "model",
             &serde_json::json!({}),
             DEFAULT_MAX_SENTENCE_SILENCE,
+            false,
         );
         assert_eq!(
             msg["payload"]["parameters"]["semantic_punctuation_enabled"],
@@ -1774,6 +1792,7 @@ mod tests {
             "model",
             &serde_json::json!({}),
             DEFAULT_MAX_SENTENCE_SILENCE,
+            false,
         );
         let finish = build_finish_task_message(task_id);
         assert_eq!(run["header"]["task_id"], finish["header"]["task_id"]);
@@ -2170,6 +2189,7 @@ mod tests {
             &[0.0; 16000],
             &serde_json::json!({}),
             800,
+            false,
             None,
             |_| {},
         );
@@ -2186,6 +2206,7 @@ mod tests {
             &[],
             &serde_json::json!({}),
             800,
+            false,
             None,
             |_| {},
         );
@@ -2260,6 +2281,7 @@ mod tests {
             rx,
             &serde_json::json!({}),
             800,
+            false,
             std::path::Path::new("nonexistent-model-dir"),
             None,
             |_, _| {},
