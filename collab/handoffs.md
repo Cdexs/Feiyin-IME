@@ -4,6 +4,18 @@
 
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行，超 200 行上限）。
 
+## 2026-09-20 — coder-2 — LOCAL-RT-ENGINE-239-B ✅ 交付（新管线主控接线，含 243/247/248；待主控验收 → tester-1 全量回归）
+
+- **新分支**：在线流式分支之后新增 `LocalRealtime` 编排——`send StreamingIdle` → `std::thread::scope`（ASR 线程跑 `transcribe_streaming_local` 发 `StreamingText` + worker 跑 `record_streaming`）→ join 拿 `(preview_text, pcm)` → **丢弃预览文本**、`run_pipeline_core(Ok(pcm), initial_text=None)` 走 accuracy 2pass（主通道 ITN 启用）。
+- **单状态（DEC-066 附则一，主控裁 A）**：`6617` 按 `AsrModel::from_config` **枚举**切文案（local_realtime→`overlay_processing`，其余→`overlay_transcribing` 零变）；`run_pipeline_core` 加 `transcribing_status_text: &'static str` 参数，现有两调用点传原值。
+- **切档 Info（248）**：LocalRealtime 重载触发时发 `PipelineEvent::Info(loading_hint)`；控制器 Info 臂 auto_close 2500ms。
+- **缺失报错（247）**：`asr_reload_in_flight`→提示加载中并跳过（不降级）；否则 `ModelUnavailable(「所选模型不可用：<缺哪个>」)`（**不走 convert_to_friendly_error**）；`last_reload_error` 记录失败原因。
+- **243**：新管线发 StreamingText ⇒ `last_streaming_text` 自动填充，编辑态学习零改动；修正 `main.rs:6850` 过时注释。
+- **Send 包装**：`local_stream.rs` 新增 `SendOnlineRecognizerRef` + `into_inner(self)`（破 Rust2021 disjoint capture）；移除 `transcribe_streaming_local` 的 dead_code allow。
+- **新增 locale key**：`local_realtime_loading_hint` / `local_realtime_unavailable`（三份）。
+- **验证**：`cargo check --all-targets` 0 error、warnings **110/101** = 现行基线（任务书 111/102 为 coder-1 mod.rs 改动前旧值；差异 = 接线使 `online_recognizer()` getter 由 dead 变 used，−1 warning）；rustfmt 三文件 clean；`--numstat`==`-w`（334/7）。🔴 未跑 cargo test（归 tester-1）。
+- **红线**：未碰 src-tauri / ui / transcription/mod.rs / 未动版本 / 未 commit / 未出包 / 零凭证。
+
 ## 2026-09-20 — coder-2 — DOC-LOCAL-RT-249-250 ✅ 交付（端测清单 + macOS 跨端交接，纯文档零代码）
 
 - **249**：新建 `collab/e2e-checklist-local-realtime.md` —— 本地 realtime 10 项端测（Ctrl+M 只开不关 / 切档 Info ~6s 自动关 / 预览不回退 / 松键单状态 + 三档对照 / accuracy 最终文本 / 热词 / 编辑态 / 词库 MINLEN-242 / 1.6GB 内存释放 / 🔴 现有三档零回归），逐项步骤 + 预期 + FAIL 判据，附前置状态表与通过判据。
@@ -162,3 +174,12 @@
 - **验证**：`cargo check --all-targets` 0 error（warnings 111/102 = 基线）；rustfmt mod.rs/local_stream.rs/main.rs clean；未写测试/harness（Gavin 指令）。现有三档零影响已自证（build_recognizer 三 arm 逐字未动 / new() 新分支对其余档恒假 / select_preprocessing_params 仅加 arm / is_online_streaming 未改）。
 - **待 239-B**：`transcribe_offline_detailed` 的 VAD 分支仅认 Accuracy，LocalRealtime 2pass 复用需纳入；main.rs 若干 `==Accuracy`/`is_online_streaming()` 判定点接线；移除函数 allow。
 - **红线**：未碰 src-tauri；未动版本；未 commit；零凭证。
+
+## 2026-09-20 — coder-1 — LOCAL-RT-READY-246 ✅ 交付（双模型就位检测，待验收）
+
+- **改动 5 文件**：`src/transcription/mod.rs`（新增 `check_local_realtime_models_ready`，现有 accuracy 检测零改动）/ `src-tauri/src/main.rs`（新 Tauri 命令+结构体+注册）/ `ui/src/pages/Voice.tsx`（卡片改用新命令，分别显示缺失）/ 3×i18n（4 key）。
+- **判据一致**：online 文件名（目录 + encoder.int8.onnx + decoder.int8.onnx + tokens.txt）与 `local_stream.rs:47-50` 加载清单**三处逐字一致**；offline 与 accuracy 判据一致。
+- **判据来源（主控打回后定稿）**：offline **直接调用** `check_accuracy_model_ready`（判据单一来源，防副本漂移致静默失效）；该处由主控 Edit 落地。warnings 基线自本单起 111/102 → **110/101**（主控批准，属改善）。
+- **中途修正**：卡片首版裸 `#d9534f` 被 design-tokens 测试（UITEST-137）判红 → 改令牌 `var(--status-success/error)`。
+- **验证**：`npm run build` 通过；`npm run test` 100P/11S；root cargo check 0 error（warnings **110/101** = 新基线）；src-tauri 0 error（17 基线）；transcription/mod.rs rustfmt clean；未新增测试。未碰 coder-2 的 src/main.rs / src/i18n.rs / local_stream.rs。
+- **红线**：未动版本；未 commit；未出包；零凭证。

@@ -1057,3 +1057,22 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **签名**：`transcribe_streaming_local -> Result<(String, Vec<f32>)>`。
 - **验证**：`cargo check --all-targets` 0 error（111/102 基线）；rustfmt 三文件 clean；未写测试。现有三档零影响已逐条自证。
 - **负责人**：coder-1 ｜ **日期**：2026-09-20
+
+## LOCAL-RT-READY-246 · 2026-09-20 · ✅ 双模型就位检测（待验收）
+
+- **主程序**：`src/transcription/mod.rs` 新增 `check_local_realtime_models_ready -> (online_ready, offline_ready, models_root)`；现有 accuracy 检测零改动。
+- **Tauri**：`src-tauri/src/main.rs` 新命令 `check_local_realtime_models_ready`（online/offline 就位 + 两模型目录/URL）+ 注册。
+- **UI**：`Voice.tsx` local_realtime 卡片改用新命令，分别显示「流式预览模型 / 最终转录模型」的 已就位/缺失；三份 locale 补 4 key。
+- **判据一致**：online 文件名清单与 `local_stream.rs:47-50` 加载清单逐字一致。
+- **判据来源**：offline 直接调用 `check_accuracy_model_ready`（防副本漂移）；warnings 基线自本单起 111/102 → **110/101**（主控批准，属改善）。
+- **验证**：npm build 通过 + npm test 100P/11S；root cargo check 0 error（110/101 = 新基线）；src-tauri 0 error（17 基线）；rustfmt mod.rs clean。
+- **负责人**：coder-1 ｜ **日期**：2026-09-20
+
+## LOCAL-RT-ENGINE-239-B · 2026-09-20 · ✅ 新管线主控接线（含 243/247/248）
+
+- **新管线**：`spawn_worker_thread` 新增 `LocalRealtime` 分支——流式预览（streaming paraformer）+ 松键丢弃预览文本、PCM 走 accuracy 2pass（`initial_text=None`，主通道 ITN 启用）；DEC-066 编排独立，仅新增分支。
+- **单状态 / Info / 报错**：`6617` 与 `run_pipeline_core` 新参数 `transcribing_status_text` 实现本地 realtime「识别处理中」单状态（现有三档零变）；切档 `PipelineEvent::Info` 加载提示；模型缺失 `PipelineEvent::ModelUnavailable` 直接报错不降级（DEC-067 附则一）。
+- **243**：新管线发 StreamingText ⇒ 编辑态词库学习零改动生效；修正 `main.rs:6850` 过时注释。
+- **文件**：`src/main.rs` +334/-7、`src/i18n.rs` +10、`src/transcription/local_stream.rs` +19/-2。
+- **验证**：cargo check --all-targets 0 error、warnings 110/101 = 现行基线；rustfmt 三文件 clean；numstat/-w 同；未跑 cargo test（归 tester-1）。
+- **负责人**：coder-2 ｜ **日期**：2026-09-20
