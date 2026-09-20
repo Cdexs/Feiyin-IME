@@ -2508,7 +2508,7 @@ coder-1 量出成本归属：**热词本身计算成本 ≈ 0，成本全在被�
 | streaming paraformer | ❌ 同上 |
 | streaming zipformer | ⚠️ 能用但实测否决（见上） |
 | **accuracy（LLM user prompt 注入）** | ✅ **唯一可用**，`offline-recognizer-funasr-nano-impl.cc:147-159 BuildUserPrompt`，PoC-B 实证首字正确率 62.5%→80.0%（+17.5pp） |
-| hr 拼音替换自实现 | 🔶 可补充，推翻 DEC-029 第 2 条，**Gavin 未拍板，保持待定** |
+| hr 拼音替换自实现 | ❌ **Gavin 2026-09-20 明确不做**（原话「不需要 hr 自实现」）。DEC-029 第 2 条「不开 LLM 时词库不参与 performance/qwen3 纠偏」**维持原状，不推翻**。⇒ 词库在本地档只经 accuracy 热词生效 |
 
 ### 已知代价（Gavin 知情确认）
 
