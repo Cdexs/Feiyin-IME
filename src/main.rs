@@ -8745,36 +8745,10 @@ fn run_pipeline_core(
                     // 供 LLM prompt F4 段注入 + multiline_safe 格式安全裁决。
                     // target_hwnd 即录音启动时捕获的前台窗口，此处复用同一 HWND 采集。
                     // 失败一律降级为 Unknown（不注入 F4，multiline_safe=false 保守）。
-                    let scene_context = if config.scene.enabled {
-                        match platform::capture_scene_signals_by_id(target_hwnd) {
-                            Some((exe, title)) => scene::classify_scene(&exe, &title),
-                            None => scene::SceneContext::unknown(),
-                        }
-                    } else {
-                        scene::SceneContext::unknown()
-                    };
+                    // PIPELINE-ORCH-238: 采集 + 观测日志已抽为 capture_pipeline_scene（行为逐位不变）。
+                    let scene_context = capture_pipeline_scene(config, target_hwnd);
                     let multiline_safe = scene_context.multiline_safe;
                     let send_window_title = config.scene.send_window_title;
-                    // SCENE-OBS-001: 场景感知可观测性日志。
-                    // 决策变更记录（2026-08-01）：原隐私红线「禁止打印 window_title」
-                    // 出自 SCENE-OBS-001，Gavin 2026-08-01 裁定解除——debug.log 为纯本地
-                    // 文件、不外发，故本地日志可记录 window_title 以支撑数据驱动的场景词表
-                    // 优化（OBS-SCENE-TITLE-005）。
-                    // ⚠️ 边界没有全解：本次只解除「本地日志」侧。send_window_title
-                    //（控制标题上送 LLM）的隐私边界完全不变，仍默认 false——外发与本地
-                    // 记录是两件事，后续不得据此放行标题给 LLM。
-                    // f4_injected 判据与 build_scene_prompt_block 的 None 条件一致：
-                    // 非 Unknown 且 style_hint 非空（不重复调用 build_scene_prompt_block 产生副作用）。
-                    let f4_injected =
-                        !scene_context.is_unknown() && !scene_context.style_hint.trim().is_empty();
-                    log::info!(
-                        "Scene context: app_exe={:?}, kind={}, multiline_safe={}, f4_injected={}, window_title={:?}",
-                        scene_context.app_exe,
-                        scene_context.scene.as_str(),
-                        multiline_safe,
-                        f4_injected,
-                        scene_context.window_title,
-                    );
                     // TRANS-008 B方案: translate=true 时走 LLM optimize+translate；translate=false 走 LLM optimize
                     // translate=false 閺冭绱濋崢鐔告箒 LLM optimize 鐠侯垰绶炴稉宥呭綁
                     let mut llm_handled = false;
@@ -8977,35 +8951,15 @@ fn run_pipeline_core(
                     // - native_punctuated=false（performance/兜底/混合）→ 照常走标点引擎
                     // - 本分支只负责「加标点」；「剥离」职责已移交下方 L2 后处理补位块
                     //   （PUNCT-GOVERNANCE-030-A），对全部产出源一视同仁，无来源判据。
-                    let final_text = if config.punctuation.enabled
-                        && !llm_handled
-                        && !translate_requested
-                        && !native_punctuated
-                    {
-                        if let Some(ref mut engine) = punctuation_engine {
-                            match engine.add_punctuation(&final_text) {
-                                Some(punctuated) => {
-                                    log::info!(
-                                        "Local punctuation applied: '{}' -> '{}'",
-                                        final_text,
-                                        punctuated
-                                    );
-                                    punctuated
-                                }
-                                None => {
-                                    log::warn!(
-                                        "Local punctuation returned None, keeping original text"
-                                    );
-                                    final_text
-                                }
-                            }
-                        } else {
-                            log::debug!("Punctuation engine not available, skipping");
-                            final_text
-                        }
-                    } else {
-                        final_text
-                    };
+                    // PIPELINE-ORCH-238: 判定体已抽为 apply_local_punctuation（行为逐位不变）。
+                    let final_text = apply_local_punctuation(
+                        final_text,
+                        config.punctuation.enabled,
+                        llm_handled,
+                        translate_requested,
+                        native_punctuated,
+                        punctuation_engine.as_deref_mut(),
+                    );
                     // PUNCT-GOVERNANCE-030-A L2 后处理补位（架构定位：L1 源头控制为主，L2 补位）
                     // 只负责两件 L1 物理上够不着的事：
                     //   (a) 开关关闭 → 全文剥标点（Qwen3 在线 ASR / 本地 native / NLLB 翻译不可控源兜底）
@@ -9081,6 +9035,85 @@ fn run_pipeline_core(
                 }
             }
         }
+    }
+}
+/// SCENE-SENSE-001-CORE (DEC-031-⑤): 录音完成阶段采集前台窗口场景信号，
+/// 供 LLM prompt F4 段注入 + multiline_safe 格式安全裁决。
+/// `target_hwnd` 即录音启动时捕获的前台窗口，此处复用同一 HWND 采集。
+/// 失败一律降级为 Unknown（不注入 F4，multiline_safe=false 保守）。
+/// PIPELINE-ORCH-238: 从 run_pipeline_core 内联块原样提取，行为逐位不变；
+/// 观测日志（SCENE-OBS-001）随节点一并迁入。
+fn capture_pipeline_scene(
+    config: &AppConfig,
+    target_hwnd: platform::WindowId,
+) -> scene::SceneContext {
+    let scene_context = if config.scene.enabled {
+        match platform::capture_scene_signals_by_id(target_hwnd) {
+            Some((exe, title)) => scene::classify_scene(&exe, &title),
+            None => scene::SceneContext::unknown(),
+        }
+    } else {
+        scene::SceneContext::unknown()
+    };
+    // SCENE-OBS-001: 场景感知可观测性日志。
+    // 决策变更记录（2026-08-01）：原隐私红线「禁止打印 window_title」
+    // 出自 SCENE-OBS-001，Gavin 2026-08-01 裁定解除——debug.log 为纯本地
+    // 文件、不外发，故本地日志可记录 window_title 以支撑数据驱动的场景词表
+    // 优化（OBS-SCENE-TITLE-005）。
+    // ⚠️ 边界没有全解：本次只解除「本地日志」侧。send_window_title
+    //（控制标题上送 LLM）的隐私边界完全不变，仍默认 false——外发与本地
+    // 记录是两件事，后续不得据此放行标题给 LLM。
+    // f4_injected 判据与 build_scene_prompt_block 的 None 条件一致：
+    // 非 Unknown 且 style_hint 非空（不重复调用 build_scene_prompt_block 产生副作用）。
+    let multiline_safe = scene_context.multiline_safe;
+    let f4_injected = !scene_context.is_unknown() && !scene_context.style_hint.trim().is_empty();
+    log::info!(
+        "Scene context: app_exe={:?}, kind={}, multiline_safe={}, f4_injected={}, window_title={:?}",
+        scene_context.app_exe,
+        scene_context.scene.as_str(),
+        multiline_safe,
+        f4_injected,
+        scene_context.window_title,
+    );
+    scene_context
+}
+/// PUNCT-INTEGRATION-001 + ASR-PUNCT-OPT-001: 本地标点决策（加标点）。
+/// 条件：auto_punct=true && LLM 未处理 && 非翻译 && 非 native 自带标点。
+/// - native_punctuated=true（accuracy native 成功）→ 跳过标点引擎（省一次推理）
+/// - native_punctuated=false（performance/兜底/混合）→ 照常走标点引擎
+/// - 本函数只负责「加标点」；「剥离」职责在下游 L2 后处理补位块
+///   （PUNCT-GOVERNANCE-030-A），对全部产出源一视同仁，无来源判据。
+/// PIPELINE-ORCH-238: 从 run_pipeline_core 内联块原样提取，行为逐位不变。
+fn apply_local_punctuation(
+    final_text: String,
+    enabled: bool,
+    llm_handled: bool,
+    translate_requested: bool,
+    native_punctuated: bool,
+    engine: Option<&mut punctuation::PunctuationEngine>,
+) -> String {
+    if enabled && !llm_handled && !translate_requested && !native_punctuated {
+        if let Some(engine) = engine {
+            match engine.add_punctuation(&final_text) {
+                Some(punctuated) => {
+                    log::info!(
+                        "Local punctuation applied: '{}' -> '{}'",
+                        final_text,
+                        punctuated
+                    );
+                    punctuated
+                }
+                None => {
+                    log::warn!("Local punctuation returned None, keeping original text");
+                    final_text
+                }
+            }
+        } else {
+            log::debug!("Punctuation engine not available, skipping");
+            final_text
+        }
+    } else {
+        final_text
     }
 }
 // MACOS-P4-NEUTRAL-001: 原 #[cfg(target_os = "windows")] 去除——平台中立纯 Rust，run_pipeline_core 调用，对 Windows 为 no-op。
