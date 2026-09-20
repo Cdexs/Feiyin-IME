@@ -783,3 +783,25 @@ load_wordbook_vocabulary()
 | 出包 | `BUILD-258` 八项核验逐项 PASS（③按「sha 异于上包」替代判据）；产物 `feiyin-ime` 12.43MB `b8a3fa98…` / `feiyin-ime-ui` 10.05MB `8ab68022…` / `crash-reporter` 24.88MB `240fb14a…`，时间戳 21:48–21:51 |
 | 端测 | 待 Gavin 复验四条（标点不重复 / 长音频出字 / 流式无留白(在线档同生效) / 本地流式预览有标点）；`Publish/models/` 未动 |
 | 遗留 | `[ASR-DROP]` 逐帧 WARN 未修（非本批） |
+
+
+## v0.9.2（四包 · BUILD-267）· 2026-09-20 · 热词频率 + KV1024 进包（版本号不升）
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 262 模型 512→1024 两副本 + `system_prompt` 置空；260 `max_new_tokens` 0→256；263 `hit_count`/`last_used_at` + 频率排序 + `record_hits` 后台线程；265 热词 20→120 条 + 600 字符预算；266 设置界面词库按频率排序（后端透传） |
+| 出包 | `BUILD-267` 八项核验逐项 PASS + 三条额外全 PASS；产物 `feiyin-ime` 12.44MB `db7c7878…` / `feiyin-ime-ui` 10.06MB `01090dc2…` / `crash-reporter` 24.88MB `85e7c5cf…`，时间戳 23:15–23:17 |
+| 模型 | `Publish/models/.../llm.int8.onnx` = 600,025,528（1024，`c326cdeb…`）；两处 `.512.bak` 保留未删 |
+| 迁移 | 新库 / 旧库 / 状态 C 迁移冒烟全通，无 SQL 报错 |
+| 遗留 | `[ASR-DROP]` 逐帧 WARN 未修（非本批） |
+
+
+## v0.9.2（五包 · BUILD-274）· 2026-09-21 · accuracy 多线程 + 流式预览标点定时 + 首字埋点（版本号不升）
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 268 热词 token 预算(356)；**271 accuracy `num_threads` 0→min(逻辑核,8) + provider cpu**；269/269-B 流式预览标点（静默 800ms 或满 4s 触发、全量重打）；272 首字延迟埋点；273 预算基准校正（仅验证） |
+| 回归 | TEST-EXEC-274 root 1279P/0F/15I + src-tauri 85P/0F + Vitest 100P/0F/11S；271 对照**内容逐字不变**、耗时 1.83–2.06× |
+| 出包 | `BUILD-274` 八项核验逐项 PASS；产物 `feiyin-ime` 14.35MB `40ccd5ea…` / `feiyin-ime-ui` 10.06MB `c788acf0…` / `crash-reporter` 24.88MB `21cb7d8a…`，时间戳 00:04–00:07；主程序 +1.9MB = `tokenizers` crate |
+| 端测 | 待 Gavin：② 句中停 1s 不切句 / ③ 预览标点不叠加（需真人发声）；**272 首字延迟实测待 Gavin 配合录音** |
+| 遗留 | `[ASR-DROP]` 逐帧 WARN 未修（非本批） |

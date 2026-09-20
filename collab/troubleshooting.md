@@ -46,6 +46,7 @@
 | [BUGREPORT-SELFCORRUPT-001] | 口述 bug 报告可能被 bug 本身污染（出现语法突兀词）→ 用错误值反推真实输入，勿照抄报告文本复现 |
 | [SESSION-CRASH-RECOVERY-001] | session 崩溃后产物与文档脱节 → sha256 + mtime 链 + 正反向探针三件套，全过则只补文档不重建 |
 | [FMT-COLLATERAL-001] | 只改 2 文件却冒出 5-9 个 modified → `cargo fmt` 全量连带格式化，去空白 / 去逗号 md5 比对可证清白。🔴 2026-09-17 定规：**`src-tauri` crate 本身非 fmt-clean，Worker 一律不许对它跑 `cargo fmt`**；核验连带是否清干净用 `git diff --numstat` 与 `--numstat -w` 两份输出是否逐字相同 |
+| [PROVIDER-SILENT-FALLBACK-001] | `provider` 设了不支持的值（如未编译 DirectML 时设 `"directml"`）**不报错不警告静默回退 CPU** → 以为开了 GPU 实际全程 CPU，据此做的判断全错。**判据不能是「设了参数」必须「验证实际生效」**（看 ORT 日志启用的 EP / 耗时差异反证）。🔴 同族：**DEC-069**（撞顶静默截断）、**DEC-073**（生成饿死无日志）—— 第三次踩「没报错≠成功」 |
 
 ## 协作 / Worker
 

@@ -2677,3 +2677,25 @@ A(空)/B(英文现状)/C(259 中文)/D2(短强指令) 输出**本质逐字相同
 若改用其他分词实现，须先与 C++ 实测比对。
 
 **证据**：`HOTWORDS-TOKEN-268` 评估 + 追踪（8 组比值；`before=` 构成判别）。
+
+## DEC-075 · GPU 加速路线暂缓（重启条件写死）
+
+**背景**：Gavin 机器只有 **AMD Radeon 780M 集显、无独显** ⇒ CUDA 出局，唯一可选 DirectML。
+`RESEARCH-ACC-GPU-275` 取证两道关卡：关卡一（现成 DirectML DLL）**不通过**、关卡二（现成 fp16 模型）通过。
+
+**决策**：**暂不走 GPU**（本轮不编译、不做四组对照）。
+
+**原因（三条，缺一不可）**：
+1. sherpa-onnx 官方**无 DirectML 预编译包**（releases assets 中 directml/dml = 0；win-x64 仅 CPU/CUDA）；
+   且 DirectML 是**编译期开关**（`session.cc:27` `SHERPA_ONNX_ENABLE_DIRECTML`）⇒ 走这条路必须
+   **自编译 sherpa-onnx + DirectML ORT**，维护成本长期存在（需跟上游版本）。无底洞先例：FunASR Runtime 编译陷 OpenSSL 1.1.1w。
+2. 780M 与 CPU **共享系统内存**（~90GB/s DDR5），而 LLM 逐 token 生成是**内存带宽敏感型**
+   （每 token 读一遍约 950MB 权重）—— 独显靠独立显存（~300GB/s）取胜的前提在集显上不成立。
+3. fp16 模型 **1.19GB**（int8 的 2 倍），整包体积代价大；而 **271 的 `num_threads` 修复已拿到 ~1.83×，零成本**。
+
+**重启条件（满足任一再议）**：① sherpa-onnx 官方发布 DirectML 预编译包；② 换到有独立显卡的机器。
+
+**补充事实（供将来复用，不必重查）**：ModelScope 有现成 fp16（`llm_fp16/llm.fp16.onnx` **1.19GB**）
+与 fp32（约 2.38GB），**关卡二本身是通过的**。
+
+**证据**：`RESEARCH-ACC-GPU-275`（releases assets 全量 grep + `session.cc:27/303` + ModelScope 文件列表）。

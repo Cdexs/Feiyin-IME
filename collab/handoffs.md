@@ -447,3 +447,30 @@
 - **未动**：1024 / max_new_tokens / VAD 并行。
 - **验证**：cargo check 0 error（110/101）；rustfmt clean。
 - **红线**：未动版本；备份未动；零凭证。
+
+## 2026-09-20 — coder-1 — RESEARCH-ACC-GPU-275 ✅ 交付（关卡一未过，按令停工）
+
+- **关卡一 不通过**：sherpa-onnx 官方 releases 无 directml/dml 资产（win-x64 仅 CPU/CUDA）；源码 `session.cc:27/303` 证 DirectML 是编译期开关（`SHERPA_ONNX_ENABLE_DIRECTML`），未编译则 `provider=directml` 静默回退 CPU。⇒ 要 GPU 必须自编 sherpa-onnx+DirectML ORT（Windows 源码编译无底洞先例）→ **停工报告，不编译**。
+- **关卡二 通过**：`llm_fp16/llm.fp16.onnx` = **1.19GB**（int8 600MB 的 2×）；`llm_fp32`≈2.38GB。
+- **结论**：GPU 不值得走（硬阻塞=无预编译 DirectML；780M 共享内存无带宽优势；fp16 整包 ~2.74GB）；271 num_threads 已给 ~1.83× 零成本替代。重提前置：官方出 DirectML 包 或 独显机。
+- **红线**：未碰生产 sherpa-onnx-lib/models；未动版本；未 commit 二进制；零凭证；无大文件下载。
+
+## 2026-09-21 — tester-1 — TEST-EXEC-274 + BUILD-274 ✅ 回归全绿 + 出包（八项 PASS，⏸ 272 延迟待录音）
+
+- **回归**：root **1279P/0F/15I** + `src-tauri` **85P/0F** + Vitest **100P/0F/11S**；warnings root 110/101、src-tauri check 17 = 基线。
+- **重点验 ①**（271 未改坏 accuracy，独立对照）：`poc_funasr_nano --threads 0`(旧=单线程) vs `--threads 8`(新) 同音频 —— `far_3` 文本**逐字相同** 7.308→4.004s；`rag_physics` **逐字相同** 2.134→1.038s。
+- **重点验 ②**（269-B 未动切句）：`LOCAL_STREAM_RULE1/2/3 = 2.4/2.0/20.0` 跨 `277b2fc`→`ace0786` **逐字相同**；269-B 对 `reset()`/`sentence_id`/`endpoint` 零新增（仅注释+显示层独立静默计数）。🔴 行为级「句中停 1s 不切句」需真人发声——`transcribe_streaming_local` 无测试缝、`poc_local_stream` 用自己的 rule2=1.2 不代表生产 ⇒ 交 Gavin 端测（未造假）。
+- **重点验 ③**（标点不重复）：结构上 `on_result` 恒喂 `r.text` 裸文本、`display_text()` 恒裸、标点仅 `preview_display` 作用于显示不回灌；间接实测流式 paraformer 原始输出无标点。🔴 视觉级留端测。
+- **重点验 ④**（生成未饿死）：`far_3` 21.8s +71 条 / +20 条、自建 27.3s +71 条 / 无热词 —— 全部**完整、末句「。」、无 `Truncating/Falling/Reduce`**。
+- **BUILD-274**：Step1–4 全走（npm 797ms / Tauri UI 112s / 主程序 165s）；三 exe + 两 toml 同步 `Publish/` 与 `target/release/`。八项逐项 PASS：①时间戳 main 00:07:31 / ui 00:04:40 / crash 00:05:52 ②两副本 sha 相等且三者异于 BUILD-267（main `40ccd5ea…` / ui `c788acf0…` / crash `21cb7d8a…`）③ProductVersion 0.9.2 不变（Gavin 未升版，按 sha 替代判据）④冒烟 Responding=True + 无 crash.json + panic/ERROR 0 + 残留 0 ⑤`config.toml` `da2be5da…` / `wordbook.sqlite` `b6ab43ac…` 零变化 ⑥warnings 110/101/17 ⑦探针 4 串命中 ⑧scene `8ea93bb1…` / itn `311cbb96…` 全等。
+- **额外**：`Publish/models/.../llm.int8.onnx` = 600,025,528（1024，`c326cdeb…`）；`.512.bak` 保留未删、无 zip/setup 产物。⚠️ 主程序 +1.9MB（268 引入 `tokenizers` crate，预期）。
+- **⏸ 未执行**：**272 首字延迟实测**（需真人发声，无法执行；前置已备：两处新产物 + `target/release/debug.log`，等 Gavin 配合录音）。
+- **证据**：`collab/outbox/tester-1/testexec274/` + `build274/`。
+- **红线**：版本 0.9.2 未动 / 未 commit / 未改生产代码 / 备份未删 / 零凭证。
+
+## 2026-09-20 — coder-1 — DEC-075 + PROVIDER-SILENT-FALLBACK-001 并入 ✅（纯文档）
+
+- **DEC-075**：GPU 暂缓（①官方无 DirectML 预编译须自编 ②780M 共享内存无带宽优势 ③fp16 1.19GB 体积大，而 271 num_threads ~1.83% 零成本）；重启=官方出 DirectML 包/换独显机；fp16/fp32 现成（关卡二通过）。
+- **[PROVIDER-SILENT-FALLBACK-001]**：provider 无效值**静默回退 CPU**（session.cc:303 编译期开关）；判据须「验证实际生效」；同族 DEC-069/073。
+- **残留清单（先报再删）**：`<repo>/1024`(0B)、`models/kv259/`(8.5MB)、`tmp/opencode/lat_*.txt`、`tok_funasr-nano-tokenizer.h`、`kv263_backup_path.txt` 建议删；`kv263_backup-*` + 两处 `.512.bak` 建议保留待端测。
+- **红线**：本次未删文件；未碰生产/版本；零凭证。

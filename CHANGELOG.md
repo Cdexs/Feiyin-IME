@@ -1296,3 +1296,25 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **273**：生产上界 24s；268 满预算热词 23.9s **安全**（generated 57 token，完整有标点）；确认 BUILD-267 的 265 字符预算在 24s 溢出（Context 1056>1024→空），268 token 预算修复有效。
 - **271 实施**：`create_funasr_nano_recognizer` 显式 `num_threads=min(逻辑核,8)`（兜底4）+ `provider="cpu"`；预期 long ~1.83×。
 - **负责人**：coder-1 ｜ **日期**：2026-09-20
+
+## RESEARCH-ACC-GPU-275 · 2026-09-20 · ✅ GPU(DirectML) 可行性取证（关卡一未过，停工）
+
+- **关卡一不通过**：官方无 DirectML 预编译（只有 CPU/CUDA）；DirectML 受编译期开关 `SHERPA_ONNX_ENABLE_DIRECTML` 控制，未编译则静默回退 CPU ⇒ 需自编 sherpa-onnx，按令停工不编译。
+- **关卡二通过**：ModelScope `llm_fp16` 1.19GB 现成。
+- **结论**：GPU 暂不值得（无预编译 DirectML + 780M 共享内存 + fp16 ~1.7GB 体积）；271 num_threads 已给 ~1.83× 零成本替代。
+- **负责人**：coder-1 ｜ **日期**：2026-09-20
+
+## TEST-EXEC-274 + BUILD-274 · 2026-09-21 · ✅ 268/269/269-B/271/272/273 回归全绿 + 出包（v0.9.2 五包，八项 PASS）
+
+- **回归**：root **1279P/0F/15I** + `src-tauri` **85P/0F** + Vitest **100P/0F/11S**；warnings 110/101/17 = 基线。
+- **重点验**：① 271 threads 0→8 **内容逐字不变**、耗时 1.83–2.06× 变快；④ 21.8s/27.3s 满预算热词输出完整带标点、无告警；②③ 静态证据成立（RULE 常量跨提交逐字相同 / 状态机恒喂裸文本），行为级留 Gavin 端测。
+- **出包**：npm 797ms + Tauri UI 112s + 主程序 165s；八项核验逐项 PASS —— 两副本 sha 相等且三者异于 BUILD-267（main `40ccd5ea…` / ui `c788acf0…` / crash `21cb7d8a…`）；ProductVersion 0.9.2 不变；探针命中；toml 三副本全等；Publish 模型 1024。
+- **未执行**：272 首字延迟实测（需真人发声，如实上报未造假）。
+- **负责人**：tester-1 ｜ **日期**：2026-09-21
+
+## DEC-075 + [PROVIDER-SILENT-FALLBACK-001] 并入 · 2026-09-20 · ✅ 文档
+
+- DEC-075：GPU 路线暂缓（无 DirectML 预编译/集显共享内存/fp16 体积大），重启条件写死。
+- [PROVIDER-SILENT-FALLBACK-001]：provider 设无效值静默回退 CPU；判据改「验证实际生效」。同族 DEC-069/073。
+- 残留清单已报（先报再删）；全文 archive + 索引两层。
+- **负责人**：coder-1 ｜ **日期**：2026-09-20

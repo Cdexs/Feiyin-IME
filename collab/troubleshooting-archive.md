@@ -5158,3 +5158,22 @@ pub fn uses_accuracy_engine(self) -> bool {
 
 **同族**：`[CONFIG-MIRROR-DRIFT-001]`（加字段必改两处，编译器不管）——
 共同形态 = **「语言层面不报错、但语义上必须同步」的多点一致性**，只能靠 grep 清单兜。
+
+## [PROVIDER-SILENT-FALLBACK-001] · provider 设了不支持的值 → 静默回退 CPU（不报错不警告）
+
+**现象**：`provider` 设成不支持的值（如未编译 DirectML 时设 `"directml"`），sherpa 不报错、不警告，
+**静默回退 CPU**。程序照常跑，我们会以为「GPU 已开」，实际一直在 CPU 上，再拿这个「GPU 数据」
+做后续判断 ⇒ **全盘皆错**。
+
+**判据**：**不能是「设了参数」，必须是「验证实际生效」**——
+看 ORT 日志里实际启用的 EP，或用**耗时差异反证**（GPU 与 CPU 耗时一样 = 没生效）。
+
+**根因**：`session.cc:303 case Provider::kDirectML:` 的实际启用调用被
+`#if defined(_WIN32) && SHERPA_ONNX_ENABLE_DIRECTML == 1` 包住；未编译该开关时只走
+`SHERPA_ONNX_LOGE("DirectML is for Windows only. Fallback to cpu!")`（仅日志，无错误）。
+
+**同族**：**DEC-069**（撞 KV 顶静默截断）、**DEC-073**（生成饿死完全无日志）。
+共同形态 = **「配置写了 ≠ 生效了，没报错 ≠ 成功了」** —— 本项目已第三次踩到，凡是「可切换的开关/参数」
+落地后都必须**验证实际生效**，而不是只看「设了」。
+
+**来源**：`RESEARCH-ACC-GPU-275`（关卡一取证时发现）。

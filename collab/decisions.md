@@ -97,6 +97,7 @@
 | DEC-072 | 换 `llm_int8_max_token_1024`（零代码、KV +112MiB）使 20s 段预算 149→661，不砍热词；算式 base 30 为估算（system_prompt 已置空） | 现行 |
 | DEC-073 | 静默失效**两级**：一级输入溢出**有日志**（`Truncating`/`Falling back`），二级输入没溢出但**生成空间被挤干、完全无日志**。判据须**同时**看截断日志 **与** 生成剩余空间 `max_total_len−context_len`（**修订 DEC-069**） | 现行 |
 | DEC-074 | C++ `FunASRNanoTokenizer`（手搓 byte-level BPE + 模拟正则）与 `tokenizer.json` 在 CJK 上不一致，比值 1.15–1.66 随内容变 ⇒ Rust 计数**必须乘保守系数**（现 1.85=最大1.66×1.1），不可当**真值**；上游 tokenizer 变更须重标定 | 现行 |
+| DEC-075 | **GPU 加速路线暂缓**：① 官方无 DirectML 预编译包（须自编 sherpa-onnx+DirectML ORT）② 780M 与 CPU 共享内存、无独显带宽优势 ③ fp16 1.19GB 体积大，而 271 num_threads 已给 ~1.83× 零成本。**重启条件**：官方出 DirectML 包 / 换独显机（fp16/fp32 模型现成，关卡二已过） | 现行 |
 
 ### 已推翻 / 历史（引用前先看这一列）
 
