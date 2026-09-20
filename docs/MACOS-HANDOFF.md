@@ -1725,3 +1725,21 @@ Windows 侧为流式窗（RecordingWithText/RecordingStreamingIdle）的麦克�
 
 **行为变更告知**：🔴 这是**行为变更**不是 bug 修复 —— 开启翻译时的输出形态会变
 （多行被压平 / 场景风格与用户基座开始生效）。macOS 端若已按旧行为写过测试或文档，需同步更新。
+
+## LOCAL-RT-249 / MACOS-HANDOFF-250（2026-09-20，coder-2）· 本地流式实时档位 + 后处理提取 + 词库候选下限 —— macOS 侧影响
+
+**改动性质**：新增本地流式引擎层 + 后处理 extract method + 词库候选下限，**全部落在平台中立模块**
+（两端编译同一份代码）；UI 侧改动为平台中立 React。**已逐项评估，无遗漏。**
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| `src/transcription/local_stream.rs`（新文件，sherpa-onnx `OnlineRecognizer`，streaming paraformer trilingual） | ✅ **平台中立模块**，两端编译同一份代码（sherpa-onnx 在 macOS 有产物）。🔴 但 **macOS 侧是否启用本地 realtime 档位需另行决策**（DEC-065 极客档定位 + 模型分发），当前不改变 macOS 默认行为 |
+| `Transcriber` 新增 `online_recognizer` 槽位、打破「本地一次只加载一个模型」 | ✅ 平台中立。`!Send` 沿用既有 `unsafe impl Send` SAFETY 论证（两个 recognizer 共用同一规则），无平台分支 |
+| `src/wordbook/mod.rs` `MIN_CANDIDATE_CHARS = 2` | 🔴 **平台中立 + 行为变更**（非 bug 修复）：单字改动不再入词库。**macOS 端若已按「单字可入库」写过测试或文档，必须同步更新** |
+| `src/main.rs` N5/N6/N9 extract method（`238` / `238-B`） | ✅ 平台中立，纯结构、**零行为变更**；macOS 经 `run_pipeline_core` 同源执行。若 macOS 侧对该文件做平台分支重构，需维护新增的函数边界（`capture_pipeline_scene` / `apply_local_punctuation` / `run_llm_stage`） |
+| `AsrModel::LocalRealtime` 枚举变体（`239-A` 阶段二将加） | ✅ 平台中立，但 macOS 侧若有 `AsrModel` 穷举 `match` **需同步补 arm**（编译期即红，不会静默漏过） |
+| UI 侧 `Ctrl+M` 解锁 + 三份 locale + 下载卡片 | ✅ 平台中立（React 同一份）；`Ctrl+M` 仅 Voice 页 `window` keydown，**未注册全局热键（不碰 DEC-004）**，macOS 无热键冲突 |
+
+**行为变更告知**：🔴 `wordbook` 单字候选**不再入库**属**行为变更**；`local_realtime` 档位为两端中性新增，
+**默认隐藏**，不改变 macOS 既有默认 ASR 行为。macOS 端接手本地 realtime 时需自行核实 sherpa-onnx
+streaming paraformer 模型的 macOS 分发路径与可执行名（延续本文件既有惯例：无 `.exe`）。

@@ -1041,3 +1041,10 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **验证**：`cargo check --all-targets` 0 error、warnings 111/102=基线；`rustfmt --check src/main.rs` clean；token 多重集证明无 token 遗漏；未跑 cargo test（归 tester-1）。
 - **已知**：`--numstat`(180/145) 与 `-w`(174/139) 差 6/6，新调用点参数行巧合归一匹配被删行，属 extract method 固有。
 - **负责人**：coder-2 ｜ **日期**：2026-09-20
+
+## DOC-LOCAL-RT-249-250 · 2026-09-20 · ✅ 端测清单 + macOS 跨端交接（纯文档，零代码）
+
+- **LOCAL-RT-E2E-CHECKLIST-249**：新建 `collab/e2e-checklist-local-realtime.md`，本地 realtime 端测 10 项（含🔴「现有三档零回归」红线），逐项步骤/预期/FAIL 判据 + 前置状态表。
+- **MACOS-HANDOFF-250**：`docs/MACOS-HANDOFF.md` 追加 6 项跨端结论，全部平台中立；🔴 词库 `MIN_CANDIDATE_CHARS=2` 标为**行为变更**。
+- **范围**：纯文档，未碰任何 `.rs`/`.ts`/`.tsx`；未动版本；未 commit/出包；零凭证。
+- **负责人**：coder-2 ｜ **日期**：2026-09-20

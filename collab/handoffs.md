@@ -4,6 +4,12 @@
 
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行，超 200 行上限）。
 
+## 2026-09-20 — coder-2 — DOC-LOCAL-RT-249-250 ✅ 交付（端测清单 + macOS 跨端交接，纯文档零代码）
+
+- **249**：新建 `collab/e2e-checklist-local-realtime.md` —— 本地 realtime 10 项端测（Ctrl+M 只开不关 / 切档 Info ~6s 自动关 / 预览不回退 / 松键单状态 + 三档对照 / accuracy 最终文本 / 热词 / 编辑态 / 词库 MINLEN-242 / 1.6GB 内存释放 / 🔴 现有三档零回归），逐项步骤 + 预期 + FAIL 判据，附前置状态表与通过判据。
+- **250**：`docs/MACOS-HANDOFF.md` 追加「LOCAL-RT-249 / MACOS-HANDOFF-250」段 —— 6 项跨端结论（`local_stream.rs` / `online_recognizer` 槽位 / `MIN_CANDIDATE_CHARS=2` 标**行为变更** / N5·N6·N9 extract / `LocalRealtime` 变体需补 match arm / UI Ctrl+M + locale），全部平台中立。
+- **红线**：纯文档，未碰任何 `.rs`/`.ts`/`.tsx` / 未动版本 / 未 commit / 未出包 / 零凭证。
+
 ## 2026-09-20 — coder-2 — PIPELINE-ORCH-238-B ✅ 交付（N6 LLM 格式化/翻译提取，纯结构零行为变更；待主控验收 → tester-1 全量回归）
 
 - **范围**：DEC-066 提取阶段最后一块。`run_pipeline_core` 内联 N6（HEAD `src/main.rs:8752-8910`）→ `fn run_llm_stage(...) -> LlmStageOutput`。
