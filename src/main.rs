@@ -7866,6 +7866,7 @@ fn spawn_worker_thread(
                                     recognizer,
                                     Some(&cancel_clone),
                                     punctuation,
+                                    config.audio.silence_threshold,
                                     |display_text, words| {
                                         // OVERLAY-075：与在线流式同构，代际盖章。
                                         let _ = event_tx_clone.send(PipelineEvent::StreamingText(

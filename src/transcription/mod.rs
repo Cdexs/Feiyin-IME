@@ -1007,6 +1007,20 @@ fn create_funasr_nano_recognizer(
 
     let offline_config = sherpa_onnx::OfflineRecognizerConfig {
         model_config: sherpa_onnx::OfflineModelConfig {
+            // RESEARCH-ACC-LATENCY-271：显式配 num_threads（原走 Default=0）。
+            // 实测（Ryzen 7 7840HS，8 物理核/16 逻辑核；短 9.45s / 长 52s，3 次中位数）：
+            //   thr  0      1      2      4      8
+            //   短  2.625  2.704  1.914  1.610  1.682   (s)
+            //   长  30.885 31.118 20.903 22.350 17.017  (s)
+            // 🔴 根因：session.cc:134-147 把 num_threads 原样透传 ORT，且 C API 未调 Validate，
+            //   `0` 在本机被 ORT 当**单线程**（0 与 1 线程耗时逐位吻合）⇒ accuracy 一直单线程跑。
+            // 取舍：long 用 8 比 4 快 **24%**，short 用 8 比 4 慢 4.5% ⇒ 综合取 8。
+            // 不写死 8：min(逻辑核数, 8)，避免换到少核机器后超核抢核变慢；取不到兜底 4。
+            num_threads: std::thread::available_parallelism()
+                .map(|n| n.get().min(8) as i32)
+                .unwrap_or(4),
+            // 显式 "cpu"（与 local_stream.rs 对齐，消除另一个隐式默认）
+            provider: Some("cpu".to_string()),
             funasr_nano: OfflineFunASRNanoModelConfig {
                 encoder_adaptor: Some(enc.to_str().unwrap_or("").to_string()),
                 llm: Some(llm.to_str().unwrap_or("").to_string()),

@@ -1251,3 +1251,48 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - DEC-074：C++ 与 Rust tokenizer 在 CJK 不一致（比值 1.15–1.66），Rust 计数须乘保守系数 1.85。
 - 全文 `decisions-archive.md` + 索引 `decisions.md`。
 - **负责人**：coder-1 ｜ **日期**：2026-09-20
+
+## LOCALRT-PUNCT-TIMER-269 · 2026-09-20 · ✅ 本地流式预览标点改 ~4s 全量重打
+
+- **问题**：预览标点仅 `endpoint=true` 出现，连续说话要等满 20s（rule3）。
+- **实测**：临时 bench 后删除——`add_punctuation` 中位 20/50/100/200/400 字 = 3.6/8.2/15.6/30.0/58.4ms（≈0.15ms/字）⇒ 选 4s 间隔，RTF 影响 <1.5%。
+- **改法**：`local_stream.rs` 新增 `preview_display` + `PunctPreviewCache`；状态机喂**裸文本**、标点只作用于显示（杜绝重复打点/FIX-252 复发）；两次之间「上次标点+新增后缀」；关标点零开销；引擎仍由调用方传入。不影响最终文本。
+- **验证**：cargo check --all-targets 0 error、warnings 110/101 = 基线；rustfmt clean；numstat==-w（96/17）；未跑 cargo test。
+- **负责人**：coder-2 ｜ **日期**：2026-09-20
+
+## LOCALRT-PUNCT-TIMER-269-B · 2026-09-20 · ✅ 预览打点补「静默 800ms」触发
+
+- **两条件「或」**：距上次 ≥4s（269 保持）+ 静默 ≥800ms（本单）⇒ 全量重打。
+- **🔴 独立计数**：静默由 `local_stream.rs` 内 RMS 自数（口径同 `config.audio.silence_threshold`），**与 sherpa endpoint 完全独立**；静默触发只刷显示、不 reset/不切句；`RULE1/2/3` 三常量一字未动。
+- **有新内容才打**：`preview_display` 加 `has_new` 门控，持续静默不重打（停 5s 只 1 次）。
+- **签名**：加 `silence_threshold: f32`，`main.rs` 新分支传 `config.audio.silence_threshold`。
+- **验证**：cargo check 0 error、warnings 110/101 = 基线；rustfmt clean；numstat==-w；未跑 cargo test。
+- **负责人**：coder-2 ｜ **日期**：2026-09-20
+
+## LOCALRT-FIRSTCHAR-272 · 2026-09-20 · ✅ 首字延迟埋点（永久观测，不改解码参数）
+
+- **埋点**：`local_stream.rs` 加 first_chunk / first_accept_waveform / first_is_ready / first_nonempty_result / first_on_result + `FIRST-CHAR breakdown` 汇总行；仅首次触发、纯 bool 门。
+- **先量后调**：不改任何解码参数；冷/热实测按 Worker 边界交 tester-1/Gavin 运行后出拆解表。
+- **可调项候选（只读代码层）**：`PRE_ROLL_MS=600` / `num_threads=4`（RTF 最优非首字最优）/ encoder chunk 不可调 / overlay 节流对增长绕过。
+- **验证**：cargo check 0 error、warnings 110/101 = 基线；rustfmt clean；`RULE1/2/3` 一字未动。
+- **负责人**：coder-2 ｜ **日期**：2026-09-20
+
+## TEST-EXEC-270 · 2026-09-20 · ✅ 268+269 全量回归全绿（⚠️ 仅回归，主控令未出包）
+
+- **全量回归**：root **1279P/0F/15I**（= 基线 1274 + 268 的 5 条 token 预算用例）+ `src-tauri` **85P/0F** + Vitest **100P/0F/11S**；warnings 110/101/17 = 基线。
+- **268 额外验**：accuracy 短音频 + 生产预算热词出字标点正常；DEC-073 边界实证 —— ≤20s(21.8s) + 满预算热词完整带标点，**37.25s 单发 + 满预算 → 空输出 + `Reduce hotwords` 警告**（生产有 VAD ≤20s 保护）。
+- **未出包**：269-B 由 coder-2 改 `local_stream.rs` 中，按主控令不出半成品包；269 预览标点待 269-B 后复验。
+- **负责人**：tester-1 ｜ **日期**：2026-09-20
+
+## RESEARCH-ACC-LATENCY-271 · 2026-09-20 · ✅ accuracy 耗时取证（只取证）
+
+- 根因：accuracy `num_threads` 默认 0 ⇒ **实测≈单线程**；改 8（物理核）可 **long ~1.83×**（31s→17s）。
+- 排除两项：换 1024 **不**变慢（short 512/1024 一致；512-long「快」实为 Truncating 0 token 空）；`max_new_tokens=256` 未跑满（EOS 提前停，26/134 token）。
+- VAD 分段串行；并行需多实例 ~1.6GB 且抢核，不建议首轮做。
+- **负责人**：coder-1 ｜ **日期**：2026-09-20
+
+## ACC-LATENCY-273 + 271 实施 · 2026-09-20 · ✅
+
+- **273**：生产上界 24s；268 满预算热词 23.9s **安全**（generated 57 token，完整有标点）；确认 BUILD-267 的 265 字符预算在 24s 溢出（Context 1056>1024→空），268 token 预算修复有效。
+- **271 实施**：`create_funasr_nano_recognizer` 显式 `num_threads=min(逻辑核,8)`（兜底4）+ `provider="cpu"`；预期 long ~1.83×。
+- **负责人**：coder-1 ｜ **日期**：2026-09-20

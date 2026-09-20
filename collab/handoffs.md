@@ -4,6 +4,31 @@
 
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行，超 200 行上限）。
 
+## 2026-09-20 — coder-2 — LOCALRT-FIRSTCHAR-272 ✅ 交付（首字延迟埋点，不改解码参数；待主控定向 tester-1 冷/热实测）
+
+- **埋点**（`local_stream.rs`，永久观测、仅首次触发）：`first_chunk` / `first_accept_waveform` / `first_is_ready` / `first_nonempty_result` / `first_on_result`（=用户看到首字）+ `FIRST-CHAR breakdown` 汇总行（chunk/accept/ready/result/callback + wait_audio / wait_infer / wait_callback）。t0 = 函数入口（ASR 线程起跑）。
+- **不改任何解码参数**（先量后调）。**按 Worker 边界，release 构建 + 麦克风运行时验证由 tester-1/Gavin 执行**，我据 `debug.log` 出拆解表。
+- **可调项候选（只读证据）**：① 等音频 → `PRE_ROLL_MS=600`（`audio/mod.rs:23`）、idle drain `cleared` = 热键前 stale（丢弃正确）、chunk ~10ms；② 等推理 → `num_threads=4`（RTF 最优非首字最优，可试 1/2/8）、provider=cpu、encoder chunk 烘进模型不可调；③ 等回调 → 事件 unbounded + `PostMessageW`、overlay 100ms 节流对增长宽度绕过（`main.rs:1644`）。
+- **验证**：cargo check --all-targets 0 error、warnings **110/101** = 基线；rustfmt clean；`RULE1/2/3` 一字未动。
+- **红线**：只改 `local_stream.rs` / 未碰 src-tauri / ui / 未动版本 / 未 commit / 未出包 / 零凭证。
+
+## 2026-09-20 — coder-2 — LOCALRT-PUNCT-TIMER-269-B ✅ 交付（预览打点补静默 800ms 触发；待主控验收 → tester-1 回归）
+
+- **两条件「或」**：① 距上次 ≥4s（269 保持）② 静默 ≥800ms（本单）⇒ 全量重打。
+- **🔴 独立静默计数**：`local_stream.rs` 内每 chunk `RMS ≤ silence_threshold` 累计、有声清零；**与 sherpa endpoint 完全独立**，静默触发只刷新显示，**不 reset / 不切句 / 不动 sentence_id**（`rule2=2.0` 切句路径零改，说话中间换气不被切）。`RULE1/2/3` 三常量一字未动。
+- **有新内容才打**：`preview_display` 加 `has_new` 门控；持续静默（停 5s）只打一次。
+- **签名**：`transcribe_streaming_local` 加 `silence_threshold: f32`；`main.rs` 新分支传 `config.audio.silence_threshold`。
+- **验证**：cargo check --all-targets 0 error、warnings **110/101** = 基线；rustfmt 两文件 clean；`--numstat`==`-w`。🔴 未跑 cargo test（回归归 tester-1）。
+- **红线**：只改 `local_stream.rs` + `main.rs` 新分支一行调用 / 未碰 src-tauri / ui / 未动版本 / 未 commit / 未出包 / 零凭证。
+
+## 2026-09-20 — coder-2 — LOCALRT-PUNCT-TIMER-269 ✅ 交付（预览标点 ~4s 全量重打；待主控验收 → tester-1 回归）
+
+- **问题**：预览标点只在 `endpoint=true`（静音≥2s / 满 20s）出现，连续说话等不到。
+- **实测**（临时 bench 后删，未入库）：`add_punctuation`（CT-Transformer 单线程 CPU）中位 20/50/100/200/400 字 = **3.6/8.2/15.6/30.0/58.4ms**（≈0.15ms/字）⇒ `PUNCT_REFRESH_INTERVAL=4000ms`，400 字仅 ~58ms/4s，RTF 影响 <1.5%。
+- **改法**：`preview_display(raw_full, engine, cache, interval, force)`——到点对**原始全文整体重打**；两次之间「上次标点 + raw 新增后缀」。🔴 状态机始终喂**裸文本**、标点只作用于显示 ⇒ 不重复打点（FIX-252 不复发）。引擎 None 直接返回 raw（零开销）；引擎仍由调用方传入；收尾强制打点一次。不影响最终文本。
+- **验证**：cargo check --all-targets 0 error、warnings **110/101** = 基线；rustfmt clean；`--numstat`==`-w`（96/17）。🔴 未跑 cargo test；不写新测试；临时 bench 已删。
+- **红线**：只改 `src/transcription/local_stream.rs` / 未碰 src-tauri / ui / main.rs / 未动版本 / 未 commit / 未出包 / 零凭证。
+
 ## 2026-09-20 — coder-2 — FIX-OVERLAY-SCROLL-255 + LOCALRT-PREVIEW-PUNCT-256 ✅ 交付（待主控验收 → tester-1 回归）
 
 - **255**：`main.rs` GDI `:3677` / D2D `:5200` 排版矩形 `right: text_right - scroll_x` → `right: text_right`。修「流式上屏溢出后右侧留白」；布局宽度 = `max(text_width, visible_w)`，最新文字贴右沿；裁剪区不动。`streaming_scroll_offset` 与两条护栏（`:11903` 契约 / `:11927` 几何）**未动**。🔴 该绘制函数所有流式档共用 ⇒ **在线 FunASR 右侧空白同样消失（修复，非回归）**。
@@ -394,3 +419,31 @@
 - **DEC-074**：C++ 手搓 byte-level BPE + 模拟 pre_tokenizer 正则 ≠ tokenizer.json（CJK），比值 1.15–1.66 随内容变 ⇒ Rust 计数乘保守系数 1.85，上游变更重标定。
 - **落档**：全文 archive + 索引 decisions.md；logs/CHANGELOG 同步。
 - **红线**：纯文档；未碰生产代码；未动版本；零凭证。
+
+## 2026-09-20 — tester-1 — TEST-EXEC-270 ✅ 268+269 全量回归全绿（⚠️ 仅回归，主控令未出包）
+
+- **主控调整令**：269-B 正由 coder-2 改 `local_stream.rs`（Gavin 明确标点触发：静默 800ms / 说满 4s），本轮 269 相关作废，**不出包**；268 部分有效。
+- **全量回归**：root **1279P/0F/15I**（EXIT 0；main 1186→1191 = +5，全为 268 的 `curate_*` token 预算用例）；`src-tauri` **85P/0F/0I**；Vitest **100P/0F/11S**；warnings root 110/101、src-tauri check 17 = 基线。
+- **268 额外验 ①**（accuracy 未被改坏，独立素材）：短音频 + 生产预算热词（71 条常用 4 字 / est 354 token）→ `dia_hunan`「他总的来讲，孙膑对兵法的理解、文样比庞涓略胜一筹。」、`far_2` 正常出字带标点。
+- **268 额外验 ③**（生成未饿死 / DEC-073）：37.25s 无热词 → 完整带「。」；+20 条(~99字) → 完整带「。」；**+71 条(生产预算) → 空输出 + sherpa `Reduce hotwords` 警告**；**21.8s `far_3` +71 条 → 完整带标点**。⇒ 生产 VAD（≤20s）+ naive_chunk 落在安全区；**超 VAD 长度的单发**满预算会饿死生成。⚠️ 已报主控。
+- **269（作废待复验）**：`preview_display` 私有无单测；`poc_local_stream` 自实现流式、不加载 `local_stream.rs` ⇒ LocalRealtime 预览标点无自动化入口（已报备，269-B 后可补缝或端测）。加验素材已备（800ms 触发 / 句中停 1s 不被切开）。
+- **未执行**：出包 SKIP（按令）；消融未派。
+- **证据**：`collab/outbox/tester-1/testexec270/`（cargo_test_root / cargo_test_tauri / npm_test / check_tauri / curate_268_tests / asr_268_* ）。
+- **红线**：未改生产代码 / 未 commit / 未出包 / 版本未动 / 零凭证 / 备份未删 / 未干扰 coder-1 的 models/kv259 实验。
+
+## 2026-09-20 — coder-1 — RESEARCH-ACC-LATENCY-271 ✅ 交付（只取证）
+
+- **根因（实测）**：`create_funasr_nano_recognizer` 的 `num_threads` 默认 0；`session.cc:134-147` 原样透传 ORT，**0 实测≈单线程**（vs 1 线程几乎同耗时）。⇒ accuracy 一直单线程。
+- **线程表（中位数）**：short 0/1/2/4/8=2.625/2.704/1.914/**1.610**/1.682；long=30.885/31.118/20.903/22.350/**17.017**（CPU 8核16线程）⇒ 4–8 最优。
+- **③ 512 vs 1024**：short 一致（1.618/1.637）；long 512=0.772s **溢出→0 token 空** vs 1024=15.598s（134 token）⇒ **1024 不慢**，排除。
+- **④** max_new_tokens=256 未跑满（26/134 token，EOS 停）。**⑤** VAD 分段串行；并行需多实例 ~1.6GB，不建议。
+- **建议**：设 `num_threads=8`（1 行、零内存、long ~1.8×）；可选透传 provider "cpu"；不动 1024/max_new_tokens。
+- **红线**：只取证；临时 512 对照目录已删；未动生产模型/版本；零凭证。
+
+## 2026-09-20 — coder-1 — 273 正确性 + 271 num_threads 实施 ✅
+
+- **273**：`should_segment > 24.0` ⇒ 生产上界 24s≈400token。268 满预算热词（est354）跑 21.8/23.0/23.9/24.1s 全无 Truncating/Falling/Reduce；23.9s generated 57 token、输出完整有标点 ⇒ **无需降 356→296**。23.0s 无标点=音频自身词中被切。**273-B**：265 字符预算 600（653 C++token）24s → Context 1056>1024 Truncating→空 ⇒ **BUILD-267 已知雷成立**，268 修复有效须进下包。
+- **271**：`create_funasr_nano_recognizer` 加 `num_threads=min(available_parallelism,8)` 兜底 4 + `provider="cpu"`；注释含实测表/机型/根因/取舍。预期 long 30.9→17.0s (~1.83×)。
+- **未动**：1024 / max_new_tokens / VAD 并行。
+- **验证**：cargo check 0 error（110/101）；rustfmt clean。
+- **红线**：未动版本；备份未动；零凭证。
