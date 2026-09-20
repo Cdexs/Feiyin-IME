@@ -660,8 +660,24 @@ mod tests {
 
     impl TestEnv {
         fn new() -> Self {
+            // FIX-TESTENV-231: 每实例唯一目录。旧实现所有用例共用
+            // `voice-ime-test-{pid}`，而 `Drop` 对整个目录 `remove_dir_all` ⇒
+            // 并发用例的目录会被另一用例的 Drop 删掉。23/25 用例靠 TEST_MUTEX
+            // 串行掩盖多年，无锁用例增至 2 个即必现（TEST-EXEC-229）。
+            // 进程内以原子计数器保证唯一（跨进程由 pid 保证）；
+            // Drop 只删自己这一份，不再存在共享目录被误删。
+            //
+            // 🔴 为什么不给那 2 个无锁用例补 TEST_MUTEX：该锁的职责是保护
+            // `AppConfig::config_path` 的**全局状态**，而它们走 `save_to(&path)` /
+            // `load_from(&path)` 显式路径、不碰全局状态，本就不该被迫取锁。
+            // 补锁是抄惯例不是修根因，且会把同一个坑留给下一个照抄的人
+            // ——本次已是第二次踩（asr_229 照抄 asr_056 写法，连 bug 一起抄）。
+            // 全文判据见 troubleshooting `[TESTENV-SHARED-DIR-RACE-001]`。
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
             let temp_dir =
-                std::env::temp_dir().join(format!("voice-ime-test-{}", std::process::id()));
+                std::env::temp_dir().join(format!("voice-ime-test-{}-{}", std::process::id(), seq));
             std::fs::create_dir_all(&temp_dir).unwrap();
             Self { temp_dir }
         }

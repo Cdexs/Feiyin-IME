@@ -80,6 +80,7 @@
 | [SENDINPUT-001] | 热键测试全失败、overlay 一直 hidden → 是旧常驻进程抢占按键，测试前须先 kill 旧实例 |
 | [D2D-HANG-001] | `cargo test` 里 D2D 用例挂死、kill 都杀不掉 → COM 对象放 thread_local 在线程退出 loader lock 下 Release 自锁 |
 | [E2E-CONFIG-PATH-STALE-001] | pytest 热键测试全 FAIL 像产品回归（含修复实证）→ 实为 harness 写 APPDATA 而程序只读 exe_dir |
+| [TESTENV-SHARED-DIR-RACE-001] | config 测试并行随机 1 例红、`os error 3`，**且每次红的用例不同** → 判据「谁抢输谁红」= 共享资源竞态，不是新增用例写错。根因是 `TestEnv` 全用例共享 `voice-ime-test-{pid}` 且 Drop 删共享目录；23/25 靠 `TEST_MUTEX` 串行掩盖，无锁用例增至 2 个即必现。**别靠补锁了事**（那 2 例走显式路径本不该取锁），要改 TestEnv 每实例唯一目录 |
 | [E2E-COLD-START-RACE-001] | cold 启动后热键停止 / PTT 释放卡在 RECORDING → 首个 Start 清空 stop 信号的竞态，warm 态无故障，harness 预热即可 |
 | [PYTEST-MACOS-COLLECT-001] | 仓库根裸跑 pytest 直接 INTERNALERROR → 递归进 CT 源码树 + Windows-only 导入，须限定 `tests/` 路径 |
 | [PLAYWRIGHT-FIX-001] | 9 个 UI 测试全 ScopeMismatch → session 作用域 fixture 依赖了 module fixture，改同级 scope |

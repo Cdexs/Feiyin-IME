@@ -953,3 +953,19 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **约束**：生产零改动（纯追加 79 行，全在 `mod tests`，0 删除）；未触碰 src-tauri（天然规避 FMT-COLLATERAL-001）
 - **验证**：`rustfmt --check` 三文件 clean；`cargo check --all-targets` 0 error（warnings 111/102 持平基线）；🔴 未跑 `cargo test`（DEC-048，归阶段四）
 - **负责人**：coder-2 ｜ **日期**：2026-09-20
+
+
+## TEST-EXEC-229 · 2026-09-20 · ✅ 阶段四全量回归（root 10 target 1264P/2F/15I + src-tauri 77P/0F；🔴 1 类 FAIL 为测试侧 harness 缺陷、生产缺陷 0）（只跑不改）
+
+- **FAIL**：`config::tests::asr_229_config_hidden_field_semantic_punctuation_roundtrip_persists`（新增护栏 G2）在 `feiyin-ime`+`crash-reporter` 各 1F（`os error 3`）。定性：`TestEnv` 单目录并行竞态，生产缺陷 0；证据：单独跑绿、`--test-threads=1` 49P/0F、并行失败者随调度漂移。按令未改测试，主控另开 `FIX-TESTENV-231`。
+- **新增护栏**：G1 PASS、G3 PASS；3 处 800→2000 机械同步全 PASS（无漏改）。
+- **消融 3 条**：G1/G2/G3 各自消融均 RED，还原后 sha256 回基线、git diff 零源码改动、复跑全绿。
+- **SKIP**：npm / test:browser（本批 `ui/` 零 diff）；E2E（按令）。
+- **负责人**：tester-1 ｜ **日期**：2026-09-20
+
+## FIX-TESTENV-231 · 2026-09-20 · ✅ TestEnv 每实例唯一目录（修 config 测试并行竞态，待验收）
+
+- **根因**：`TestEnv` 全用例共享 `voice-ime-test-{pid}` 且 `Drop` 删共享目录；23/25 靠 `TEST_MUTEX` 掩盖，无锁用例 1→2 即必现（`TEST-EXEC-229` 的 `os error 3`）
+- **改动**：只改 `src/config/mod.rs` `TestEnv::new()`（pid + 进程内原子计数器构造唯一目录）；25 个用例零改动，**不补锁**（无锁 2 例走显式 `save_to(&path)` 路径、不碰全局态，补锁只掩盖真根因）
+- **验证**：`cargo check --all-targets` 0 error（warnings 111/102 持平基线）；rustfmt clean；未跑 `cargo test`（归阶段四复跑）
+- **负责人**：coder-1 ｜ **日期**：2026-09-20

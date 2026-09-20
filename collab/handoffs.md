@@ -27,3 +27,26 @@
 - **验证**：`cargo check --all-targets` 0 error / test warnings **102**（基线）；`cargo check` 0 error / **111**；`cargo check --manifest-path src-tauri/Cargo.toml --all-targets` 0 error / **17**；`rustfmt --check` 四根文件 clean；定向测试 `build_run_task` 7P、`config::tests::asr_056` 14P、`transcriber_qwen_audio_online` 2P、`..._silence_2000` 1P、镜像 4P（含新断言）——**全 0F**。🔴 未跑全量 `cargo test`（阶段四 tester-1）、未 `cargo build --release`。
 - **边界**：`native_punctuated` / 本地 CT-Transformer 跳过逻辑 / 标点后处理**零改动**；`src-tauri/src/qwen3.rs`（连接自检）仍硬编码 false，属独立路径不含 silence，本单不动。
 - **红线**：未 commit / 未出包 / 零凭证；临时文件（HEAD 版本 rustfmt 对照）已清理。
+
+
+## 2026-09-20 — tester-1 — TEST-EXEC-229 阶段四全量回归 ✅ 执行完毕（🔴 1 类 FAIL：测试侧 harness 隔离缺陷、生产缺陷 0，只跑不改）
+
+- **结果**：`cargo test`（root 10 target）**1264P / 2F / 15I**；`src-tauri` **77P / 0F / 0I**。**2 F 同一条** `config::tests::asr_229_config_hidden_field_semantic_punctuation_roundtrip_persists`（新增护栏 G2），在 `feiyin-ime` + `crash-reporter` 两 target 各 1F，panic `os error 3`（`src/config/mod.rs:1817`）。
+- **定性（证据链）**：① 单独跑 G2 → 1P/0F；② `config::tests::` 加 `--test-threads=1` → 49P/0F；③ 默认并行 → 1F 且失败者换成**既有** `asr_056_config_hidden_field_roundtrip_persists`（谁抢输谁红）。根因 `TestEnv`（`src/config/mod.rs:657-678`）单目录 `voice-ime-test-{pid}` + Drop `remove_dir_all`，G2 与 056 均无锁并行 → 一个删目录另一个正 save。**生产缺陷 0**。
+- **处置**：按令**未自行改测试/期望值**；主控另开 `FIX-TESTENV-231`（TestEnv 每实例唯一目录）派 coder-1，排本单之后（同文件串行）。
+- **新增护栏**：G1 PASS、G3 PASS；G2 见上。**3 处 800→2000 机械同步全 PASS**（`asr_056_..._silence_2000` / `mirror_asr_fields_match_main_config_literals` / `build_run_task_has_max_sentence_silence_2000`）⇒ 无同步漏改。
+- **消融（3 条，过滤跑）**：G1 `qwen_inference.rs:263` 硬编码 false → RED；G2 `config/mod.rs:174` `#[serde(skip)]` → RED；G3 `transcription/mod.rs:228` getter 返回 false → RED。还原后三文件 sha256 回基线、`git status` 无源码 diff、复跑各 1P/0F。
+- **SKIP**：npm / test:browser（本批 `ui/` 零 diff，`git show --numstat -- ui/` 空）；E2E（按令，无 release 产物）。
+- **warnings**：test profile **102**、bin **111** = 基线；src-tauri test **19**（与 coder-1 的 `check --all-targets` 17 非同一命令，不作持平判据）。
+- **证据**：`collab/outbox/tester-1/testexec229/`（cargo_test_root_nff.log / cargo_test_tauri.log / ablate_g1|g2|g3.log）。
+- **红线**：未改生产代码与测试期望值 / 未出包 / 版本未动 / 未 commit / 零凭证。
+
+## 2026-09-20 — coder-1 — FIX-TESTENV-231 ✅ 交付（TestEnv 每实例唯一目录，待验收 → 阶段四复跑）
+
+- **根因**：`src/config/mod.rs:661` `TestEnv::new()` 对所有用例返回同一 `voice-ime-test-{pid}`，`Drop` 对整个目录 `remove_dir_all` ⇒ 并发用例的目录被另一用例的 Drop 删掉。23/25 用例靠 `TEST_MUTEX` 串行掩盖；无锁用例从 **1 个**（`asr_056_config_hidden_field_roundtrip_persists`，TEST-SYNC-056 `cb0d82b` 引入，**潜伏一个多月**）增至 **2 个**（本批 `asr_229_...`，`c5cff01`）即必现。
+- **改动（只一个函数）**：`TestEnv::new()` 目录名加进程内原子计数器 → `voice-ime-test-{pid}-{seq}`，每实例唯一；`Drop` 只删自己这份。**25 个用例一行未动**。
+- **🔴 不补锁（主控判断，我独立复核同意）**：`TEST_MUTEX` 保护的是 `AppConfig::config_path` 全局态；那 2 例走显式 `save_to(&path)`、不碰全局态，不取锁是对的。补锁只掩盖、且把「共享目录」真根因留在原地（再加第三个无锁用例照样炸）。
+- **边界核验**：实测 25 个 TestEnv 用例中无任何一例创建 >1 个 `TestEnv` ⇒ 无用例依赖共享路径；src-tauri 无同款 harness。
+- **验证**：`cargo check --all-targets` 0 error、warnings **111/102**（=基线）；`rustfmt --edition 2021 --check src/config/mod.rs` clean（首版多行 `format!` 被判 DIFF，已改单行）。🔴 未跑 `cargo test`（并行竞态一次绿证明不了，归阶段四 tester-1 复跑；重点：默认并行下 `asr_229_...` / `asr_056_...` 两例需稳定绿）。
+- **证据链**：`TEST-EXEC-229` 报告「单独跑绿 / `--test-threads=1` 49P0F / 并行失败者随调度漂移」= 共享资源竞态铁证；troubleshooting 条目 `[TESTENV-SHARED-DIR-RACE-001]` 由主控落档。
+- **红线**：只改 `TestEnv::new()` / 25 用例零改动 / 未跑 cargo test / 未 commit / 未出包 / 版本未动 / 零凭证。
