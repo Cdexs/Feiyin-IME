@@ -61,3 +61,14 @@
 - **已知非本批**：冒烟 stdout 的 `[ASR-DROP]` WARN（`src/audio/mod.rs:492-495`），主控确认下批修，不拦出包。
 - **证据**：`collab/outbox/tester-1/build232/` 与 `testexec229/`。
 - **红线**：未改生产代码 / 未 commit / 零凭证。
+
+## 2026-09-20 — coder-1 — POC-LOCAL-STREAM-235 ✅ 交付（本地流式 ASR 可行性，待主控验收）
+
+- **改动**：唯一新增 `src/bin/poc_local_stream.rs`（独立 bin，生产代码零触碰）；模型解压至 `models/`（gitignored）。
+- **四数**：① 首字延迟即时起音 **~625–652ms**（略超 600ms；20ms 分帧复测不变 ⇒ 模型前瞻决定）② RTF 1/2/4 线程 **0.065/0.053/0.042**（全 ≤0.3）③ 文字跳动 **0 rewrite / 0 shrink**（前缀单调）④ 2pass performance **0.11–0.75s**、accuracy **0.70–2.60s 且 >~28s 单段空输出**（KV 512）。
+- **热词实测（超撤销项）**：SenseVoice + hotwords + greedy → create 失败（"Please use modified_beam_search"）；+ beam → **EXIT 127**（"Only greedy_search is supported"）。online paraformer 同构。悖论互斥 ⇒ 物理封闭。
+- **追加5-新 HomophoneReplacer**：**跑通**。SenseVoice baseline「玄界芯片福南人工投安装」→ hr「玄戒芯片湖南人弓头安装」3/3 修对；安全边界用例 0/5 越界；同音碰撞用例 2/2 改写（属既定行为）。lexicon-only = no-op（证明 rule_fsts 必需）。
+- **SQLite→replace.fst**：`lexicon.txt` 可由 jieba+pypinyin（纯 Python/Windows）生成；`replace.fst` 需 pynini `cdrewrite`，**pynini 无 Windows 包**（实测 `No matching distribution`）；kaldifst 有 Windows wheel 但无 cdrewrite/cross。路径 A(WSL/Colab 离线生成)/B(kaldifst 原语手搓)/C(Rust 自实现拼音替换)。
+- **验证**：`cargo check --bin poc_local_stream` 0 error；`rustfmt --check` clean；🔴 未跑 cargo test / release。
+- **证据**：`collab/outbox/coder-1/poc235/`（runA/B/C + 7 probe + 15 snapshot）。
+- **红线**：未碰生产代码 / 未 commit / 未出包 / 版本未动 / 零凭证。

@@ -978,3 +978,12 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **八项核验**：全部 PASS，逐项贴实测（③ ProductVersion 0.9.2 为唯一变红再变绿；⑦正向 `asr_online_semantic_punctuation_enabled`=1/反向=0 + UI 文件名探针；⑧toml 三副本 hash 全等）。
 - **端测提示**：`Publish/config.toml:29` 写死 800，需手改 + 重启；2×2 组合见 result.md Part C。
 - **负责人**：tester-1 ｜ **日期**：2026-09-20
+
+## POC-LOCAL-STREAM-235 · 2026-09-20 · ✅ 本地流式 ASR 可行性 PoC（独立 bin，生产零改动）
+
+- **产出**：新增 `src/bin/poc_local_stream.rs`；模型 `sherpa-onnx-streaming-paraformer-trilingual`（下载 1.05GB / 部署 int8 227.4 MiB）。
+- **四数**：首字延迟 ~625–652ms（略超 600ms）；RTF 1/2/4 线程 0.065/0.053/0.042（全 ≤0.3）；文字跳动 0 改写 0 回退；2pass performance 0.11–0.75s，accuracy 0.70–2.60s 且 >~28s 空输出。
+- **热词**：SenseVoice CTC 与 streaming paraformer 均不支持（greedy create 失败 / beam 硬 EXIT=127），实测封闭。
+- **HomophoneReplacer**：对 performance 生效（3/3 修对）；`replace.fst` 生成受 pynini 无 Windows 包阻塞。
+- **验证**：`cargo check --bin poc_local_stream` 0 error；`rustfmt --check` clean。未跑 cargo test/release。
+- **负责人**：coder-1 ｜ **日期**：2026-09-20
