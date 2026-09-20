@@ -213,3 +213,18 @@ Phase 4 完整规划见 `collab/research/macos-phase4-plan-001.md`，逐任务�
 5. **不列端测跟踪项**（Gavin 自行使用中测试，有问题会重新开单）
 6. 🔴 **单条待办不超过 8 行**：背景、取证、方案推演一律写进 `todo-archive.md`，这里只留「是什么 + 前置/风险 + 指针」
 7. 🔴 **本文件行数上限 250 行** —— 它每次 session 启动都会被完整读进上下文，超了立刻归档
+
+### 🆕 LOCAL-RT-ENGINE-239 追加要求 · 切档模型加载提示（Gavin 2026-09-20）
+
+| 项 | 内容 |
+| --- | --- |
+| 需求 | 切到本地 realtime 档位时要预加载两个模型（约 6s），期间用**现有 overlay 信息提示窗口**显示提示，**短暂显示后自动关闭，不要久留** |
+| 现成机制 | `OverlayStatus::Info(String)`（蓝点白字，BUG-119 引入）。照抄 `main.rs:6791-6800` 的 `PipelineEvent::NoSpeech` 发送写法即可 |
+| 发送方 | 🔴 **后端**（热重载在 `main.rs:7111` `Transcriber::new`），不是 UI 侧 |
+| 文案 | 需补 i18n 新 key，三份 locale |
+
+### 🆕 I18N-DRIFT-HANT-001 · 繁中档位文案与简中语义不一致（低优先）
+
+`ui/src/i18n/zh-Hant.ts:29` `voice_asr_model_performance` = 「效能最優」，
+而简中是「本地模型 - 快速」、英文是 `Local Model - Fast`。**繁中丢了「本地模型」语义**。
+既有漂移，非本批引入；`LOCAL-RT-UI-240` 明令不许顺手改，单独排期。
