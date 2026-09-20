@@ -1761,3 +1761,11 @@ streaming paraformer 模型的 macOS 分发路径与可执行名（延续本文�
 **行为变更告知**：🟡 仅**新增** `local_realtime` 档位行为（默认隐藏，DEC-065），**不改动 macOS 既有
 performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 macOS 侧存在穷举 `match` 需补 arm
 （本仓已补；`overlay_request_for_event` 的「禁通配符」约定已遵守）。
+
+## FIX-OVERLAY-SCROLL-255 + LOCALRT-PREVIEW-PUNCT-256（2026-09-20，coder-2）· 流式上屏右边界 + 本地流式预览标点 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| 255 流式上屏排版矩形右边界（GDI/D2D 两路径） | 🔴 **Windows-only**（`main.rs` 的 Win32/D2D 绘制）。macOS 浮层为独立实现（`src/platform/macos/overlay.rs`），**本修不影响 macOS**；若 macOS 浮层有同类滚动/右留白逻辑，需自行核对（属另一实现，不在本修范围） |
+| 256 `transcribe_streaming_local` 加 `punctuation_engine` 参数 | ✅ **平台中立**（`src/transcription/local_stream.rs`），两端编译同一份。macOS 若启用本地 realtime 预览，经同一调用点传入 `PunctuationEngine` 即可；`PunctuationEngine` 包装的 `sherpa_onnx::OfflinePunctuation` 已由上游 crate `unsafe impl Send` |
+| 标点仅作用于 overlay 预览 | ✅ 平台中立语义：最终文本仍由 accuracy 2pass 产出，两端一致 |
