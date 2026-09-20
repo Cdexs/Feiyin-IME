@@ -14,6 +14,11 @@ pub use cache::{WordbookCache, WordbookEntry, WordbookStats};
 /// "维生素B12" (6 chars), "飞音输入法" (5 chars), "Claude Code" (11 chars) all pass.
 const MAX_CANDIDATE_CHARS: usize = 30;
 
+/// WORDBOOK-MINLEN-242: 候选词最小字符数。单字候选对热词偏置无实效但持续制造噪声，
+/// 一律拒绝。2 是下限而非经验值——中文专名最短即 2 字（飞音/玄戒），
+/// 常用英文缩写最短亦为 2（AI/UI）。
+const MIN_CANDIDATE_CHARS: usize = 2;
+
 /// WORDBOOK-053-C: Maximum number of whitespace-separated segments.
 /// Rationale: English phrases like "Claude Code" (2 segments) or "voice ime" (2)
 /// are legitimate. 4 segments allows rare longer English terms while rejecting
@@ -29,6 +34,13 @@ pub fn is_valid_candidate(word: &str) -> Result<(), &'static str> {
     let trimmed = word.trim();
     if trimmed.is_empty() {
         return Err("empty");
+    }
+    // WORDBOOK-MINLEN-242（Gavin 2026-09-20 端测报）：此前只有上限没有下限，
+    // 编辑态改一个字（最常见的是错字/标点修正）就会把单字灌进候选表。
+    // 单字对 ASR 热词偏置几乎无作用（一个字的上下文偏置不足以改变解码路径），
+    // 却会持续制造噪声候选。故设下限 2 字符。
+    if trimmed.chars().count() < MIN_CANDIDATE_CHARS {
+        return Err("below min char limit");
     }
     if trimmed.chars().count() > MAX_CANDIDATE_CHARS {
         return Err("exceeds max char limit");
@@ -336,6 +348,24 @@ mod tests {
     // WORDBOOK-053-C: is_valid_candidate guard tests
 
     use super::is_valid_candidate;
+
+    /// WORDBOOK-MINLEN-242（Gavin 2026-09-20 端测报）：编辑态改一个字就把单字灌进候选表。
+    /// 此前 `is_valid_candidate` 只有上限（30）没有下限，单字一路放行。
+    /// 本用例钉死下限，防复发；边界外（2 字）必须仍然放行。
+    #[test]
+    fn minlen242_single_char_candidate_rejected() {
+        // 单字一律拒绝——中英文、数字皆然
+        assert!(is_valid_candidate("好").is_err(), "单个汉字不得入库");
+        assert!(is_valid_candidate("運").is_err(), "单个繁体字不得入库");
+        assert!(is_valid_candidate("a").is_err(), "单个字母不得入库");
+        assert!(
+            is_valid_candidate(" 好 ").is_err(),
+            "trim 后仍是单字，不得入库"
+        );
+        // 🔴 边界外：2 字是合法下限，不得被误挡
+        assert!(is_valid_candidate("飞音").is_ok(), "2 字中文专名必须放行");
+        assert!(is_valid_candidate("AI").is_ok(), "2 字母英文缩写必须放行");
+    }
 
     #[test]
     fn test_is_valid_candidate_rejects_real_dirty_sentence() {
