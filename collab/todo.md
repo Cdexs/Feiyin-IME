@@ -20,6 +20,26 @@
 ---
 
 ## 🔴 待做
+### 🔄 v0.9.3 批次 · 本地流式实时模型（DEC-065/066/067）逐单跟踪
+
+| 单号 | 内容 | 状态 | 证据 |
+| --- | --- | --- | --- |
+| `POC-LOCAL-STREAM-235` | paraformer 流式四数实测 | ✅ 已验收 | RTF 0.042–0.076／首字 625–652ms／跳动 0-0 |
+| `POC-LOCAL-STREAM-236` | zipformer 热词三组 A/B/C | ✅ 已验收 | 热词 2/5、首字 718–1031ms、beam 破坏前缀单调 ⇒ **否决** |
+| `PIPELINE-ORCH-238` | N5 场景采集 + N9 标点决策提取 | ✅ 已验收 | `842e30c`，回归 1266P/0F |
+| `LOCAL-RT-UI-240` | Ctrl+M 解锁 + 配置双写 + 下载卡片 | ✅ 已验收 | `26f87d4` + 文案修正 `c6828e9` |
+| `TEST-EXEC-241` | 238+240 合并回归 | ✅ 全绿 | `3db8285`，三项与基线逐位吻合 |
+| `WORDBOOK-MINLEN-242` | 候选词补最小字数下限（Gavin 端测报 bug） | ✅ 已修 | `baa5534`，48P/0F |
+| `PIPELINE-ORCH-238-B` | N6 LLM 格式化/翻译提取（159 行） | 🔄 待验收 | 两处 Processing + 两处 learn 已核在函数体内 |
+| `LOCAL-RT-ENGINE-239-A` 阶段一 | `local_stream.rs` + `online_recognizer` 槽位 + VAD 注释 | 🔄 待验收 | 不依赖枚举的三块 |
+| `LOCAL-RT-ENGINE-239-A` 阶段二 | 枚举变体 + 构建分支 + `main.rs:8536` arm + 测试穷举 | ⏸ 待放行 | 等 238-B 释放 main.rs；前处理参数跟 **Accuracy** |
+| `LOCAL-RT-ENGINE-239-B` | 新管线独立编排 + Info 加载提示 | ⏸ 未派 | DEC-066 编排独立 + 附则一浮层单状态 |
+| `WORDBOOK-EDIT-LEARN-243` | 🆕 新管线编辑态提交后也要走词库自学习 | ⏸ 未派 | Gavin 2026-09-20；现有 `main.rs:6847` 仅在线流式路径有 `last_streaming_text` |
+| `BUILD-244` | v0.9.3 出包 | ⏸ 未派 | 全部验收 + 回归绿后 |
+
+🔴 **贯穿约束（Gavin 2026-09-20 强调）**：**千万不能改坏现有管线**。
+238/238-B 是零行为变更提取，唯一硬证据是全量回归与基线逐位吻合，每轮必跑。
+
 ### 🔄 POC-LOCAL-STREAM-235 · 本地流式 ASR 可行性（已派 coder-1，2026-09-20）
 
 | 项 | 内容 |
