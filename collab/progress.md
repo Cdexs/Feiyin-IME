@@ -805,3 +805,15 @@ load_wordbook_vocabulary()
 | 出包 | `BUILD-274` 八项核验逐项 PASS；产物 `feiyin-ime` 14.35MB `40ccd5ea…` / `feiyin-ime-ui` 10.06MB `c788acf0…` / `crash-reporter` 24.88MB `21cb7d8a…`，时间戳 00:04–00:07；主程序 +1.9MB = `tokenizers` crate |
 | 端测 | 待 Gavin：② 句中停 1s 不切句 / ③ 预览标点不叠加（需真人发声）；**272 首字延迟实测待 Gavin 配合录音** |
 | 遗留 | `[ASR-DROP]` 逐帧 WARN 未修（非本批） |
+
+
+## v0.9.2（六包 · BUILD-287）· 2026-09-21 · 右留白根治 + 收尾预览 + 预卷裁剪 + 影子解码（版本号不升）
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 281 overlay 滚动改 DirectWrite 实渲宽（治右留白）；282 `PipelineEvent::StreamingFinalPreview` 收尾预览；283 `trim_pre_roll_residual`（本地档 true）；284 影子解码静默 400ms；286 埋点降 `debug!` + `log_enabled!` 守卫 |
+| 回归 | TEST-EXEC-287 root 1283P/0F/15I + src-tauri 85P/0F + Vitest 100P/0F/11S；warnings 110/101/17 |
+| 出包 | `BUILD-287` 八项核验逐项 PASS；产物 `feiyin-ime` 14.38MB `e16e3738…` / `feiyin-ime-ui` 10.06MB `ee6d6e73…` / `crash-reporter` 24.88MB `a4b238aa…`，时间戳 01:14–01:17 |
+| 探针 | `[LocalRT-DBG-276/277/278/283/284]`=1/1/2/1/3；284 `LOCAL_RT_SHADOW_MS`=1 |
+| 自验 | 日志开关两头：无 -debug 0 条 / 有 -debug 有输出 |
+| 端测 | 待 Gavin 录音验四条修复效果 |

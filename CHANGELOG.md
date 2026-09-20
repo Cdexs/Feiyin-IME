@@ -1318,3 +1318,79 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - [PROVIDER-SILENT-FALLBACK-001]：provider 设无效值静默回退 CPU；判据改「验证实际生效」。同族 DEC-069/073。
 - 残留清单已报（先报再删）；全文 archive + 索引两层。
 - **负责人**：coder-1 ｜ **日期**：2026-09-20
+
+## LOCALRT-FIRSTCHAR-276 + FIX-OVERLAY-SCROLL-277 · 2026-09-20 · ✅ 取证埋点（未改行为）
+
+- **276**：主控更正方向（endpoint `reset()` 丢未解码帧，非 flush 时序）。`local_stream.rs` 加 `[LocalRT-DBG-276]`（每次 get_result 变化 + endpoint 空/None 分支）；待 Gavin 跑一次取证。原「flush 结构性必丢」结论采纳为 `[OVERLAY-FLUSH-TEXT-DROP-001]`（**有意不修**）。
+- **277**：`main.rs` D2D 绘制加 `[LocalRT-DBG-277]` 节流几何日志（**GDI 量宽 vs DirectWrite 实渲宽** + visible_w/scroll_x/text_right）；待 Gavin 跑长语音捞数据再定修法。
+- **API 调研**：sherpa `OnlineStream` 无句中 endpoint flush API（仅 `input_finished()`，会终止流）；候选 = reset 前喂静音 padding（待数据+批准）。
+- **验证**：cargo check 0 error、warnings 110/101 = 基线；rustfmt clean；numstat==-w；RULE1/2/3 一字未动；未改解码参数。
+- **负责人**：coder-2 ｜ **日期**：2026-09-20
+
+## ACC-LATENCY-279 + ACC-FIRSTCHAR-278 · 2026-09-20 · ✅
+
+- **279**：num_threads 12/16 实测更慢（short +18%/+164%，long +11%/+92%）⇒ 维持 8，数据补进注释（逻辑未动）。
+- **278**：确认流式 pre_roll 600ms 无裁剪、后端有 onset 裁剪；离线 PoC 复现首字延迟 +600ms 但**未复现「不准」**⇒ 需应用内两场景 A/B。方案评估：A/B 对残留无效、C 有丢字代价、**D（VAD 取最后语音段）**为建议方向；先加埋点。**未改生产代码**。
+- **负责人**：coder-1 ｜ **日期**：2026-09-20
+
+## BUILD-280 · 2026-09-21 · ✅ 诊断包（只读埋点 276/277，无新修复）
+
+- **用途**：Gavin 真机收 LocalRealtime 诊断数据；HEAD `5ad0670`；版本维持 0.9.2。
+- **产物**：main `33b65b3f…` / ui `486dc68c…` / crash `807bfb17…`，两副本相等、均异于 BUILD-274，时间戳 00:37–00:39；warnings 110/9/17 = 基线。
+- **埋点探针**：`[LocalRT-DBG-276]`=1、`[LocalRT-DBG-277]`=1（进包硬证据）。
+- **冒烟**：Responding=True + debug.log 1562 行 + panic/ERROR 0 + 残留 0。**278 未落地（按令不等）**。
+- **负责人**：tester-1 ｜ **日期**：2026-09-21
+
+## ACC-FIRSTCHAR-278 埋点 · 2026-09-20 · ✅（赶 BUILD-280 诊断包）
+
+- `src/audio/mod.rs` 加 `[LocalRT-DBG-278]` pre_roll 诊断（能量/含语音/gap_since_last_record，warn 级）；`src/transcription/local_stream.rs` 加首字 warn。纯只读非行为性。
+- cargo check 0 error（110/101）；rustfmt clean。
+- **负责人**：coder-1 ｜ **日期**：2026-09-20
+
+## LOCALRT-FIRSTCHAR-281 + 282 · 2026-09-20 · ✅ 修复（右侧空白量宽来源 + 预览尾段专用通道）
+
+- **281**：D2D scroll 改用 **DirectWrite 实渲宽**（新增 `dwrite_measure_width`），不再混用 GDI `GetTextExtent`（实测差 143-155px ⇒ 多滚 ⇒ 右留白，FIX-255 未根治的真因）；GDI 兜底路径未改（各自自洽）。
+- **282**：新增本地档专用 `PipelineEvent::StreamingFinalPreview`（**只有本地档发/收**）承载 flush 尾帧；**不改共享 latch** ⇒ 在线档结构上零变；Stop 本地档不切 FallingToProcessing（留 RecordingWithText，无闪烁、不延迟最终文本）。
+- **验证**：cargo check 0 error、warnings 110/101 = 基线；rustfmt clean；RULE1/2/3 一字未动；未改解码参数。
+- **负责人**：coder-2 ｜ **日期**：2026-09-20
+
+## FIX-LOCALRT-FIRSTCHAR-283 · 2026-09-20 · ✅ pre_roll 残尾裁剪（方案 D）
+
+- `record_streaming` 加 `trim_pre_roll_residual` 参 + `trim_pre_roll_last_speech_segment()`（样本级能量 VAD，多语音段只留最后一段）；在线流式 false / 本地流式 true。
+- 单测 3/3；离线算法 6/6；离线 PoC 未复现首字污染 ⇒ 端测两场景待 tester/Gavin。
+- MACOS-HANDOFF 已更新（平台中立，macOS 调用点须同步补参）。
+- **负责人**：coder-1 ｜ **日期**：2026-09-20
+
+## LOCALRT-ENDPOINT-284 · 2026-09-20 · ✅ 停顿 300-500ms 影子收尾（方案 B）+ A 实验开关
+
+- **B（主路）**：静默 ≥400ms（env `LOCAL_RT_SHADOW_MS` 可调）触发影子 `OnlineStream` 收尾当前句（`input_finished` 强制吐尾），**只动显示**；显示取「confirmed+影子」与「confirmed+main」更长者；主 stream / 切句 / rule2 不受影响；>12s 当前句跳过防 O(n²)。
+- **A（实验）**：`LOCAL_RT_RULE2` env 覆盖 rule2（默认 2.0 零变）；`[LocalRT-DBG-284] endpoint fired` 记录切句。
+- **埋点**：shadow 触发频率 + 单次 decode 耗时 + 跳过均 warn 级。
+- **验证**：cargo check 0 error、warnings 110/101 = 基线；rustfmt clean；RULE1/RULE3 未动；在线档未动。
+- **负责人**：coder-2 ｜ **日期**：2026-09-20
+
+## URGENT-286 · 2026-09-20 · ✅ 诊断埋点降级（性能）
+
+- `[LocalRT-DBG-276]`/`[277]`/`[278]`/`[284]` 由 `warn!`→`debug!`（默认 Warn 下级别检查即短路，零格式化开销）。
+- 重计算加守卫：276 的文本比较+clone 套 `log_enabled!(Debug)`；277 的 DWrite 文本布局测量在 `log_enabled!(Debug)` 通过后才做。
+- 278 的重灾（pre_roll 能量）在 `audio/mod.rs`，属 coder-1，未碰。
+- 284 的 `decode ms` 计时改为仅 Debug 级取样；`LOCAL_RT_RULE2`/`LOCAL_RT_SHADOW_MS` env 读取未动（功能非日志）。
+- **验证**：cargo check 0 error、warnings 110/101 = 基线；rustfmt clean。
+- **负责人**：coder-2 ｜ **日期**：2026-09-20
+
+### URGENT-286（coder-1 归属）· ✅ [278]/[283] 降级 + 守卫
+
+- `[LocalRT-DBG-278]`（audio pre_roll 能量统计、local_stream 流式首字）、`[LocalRT-DBG-283]`（pre_roll trim）`warn!`→`debug!`。
+- `pre_roll_diag()` 首行加 `log_enabled!(Debug)` 早返回守卫 ⇒ 默认 Warn 下**连 600ms 样本遍历都不发生**（真正零开销）。
+- 283 生产逻辑 `trim_pre_roll_last_speech_segment()` **未动**（不误包守卫）；其日志参数为廉价取长。
+- **验证**：cargo check 0 error、warnings 110/101；rustfmt clean；`cargo test` 13/13（含新增 `urgent286_*` 两头验证单测）；真实二进制不带 `-debug` 无任何 Debug 级、带 `-debug` 完整。
+- **未完成（留端测）**：[278]/[283] 真实录音热键路径的「有 -debug 完整数据」需 tester-1/Gavin 交互端测。
+- **负责人**：coder-1 ｜ **日期**：2026-09-20
+
+## BUILD-287 · 2026-09-21 · ✅ 281/282/283/284/286 合并出包（v0.9.2 六包，八项 PASS + 日志开关两头验）
+
+- **构建**：Step1–4；源码 mtime 开工前后一致（无中途改动）；产物 main `e16e3738…`(14.38MB) / ui `ee6d6e73…` / crash `a4b238aa…`，两副本相等、均异于 BUILD-280；版本维持 0.9.2；warnings 110/9/17 = 基线。
+- **回归**：root 1283P/0F/15I + src-tauri 85P/0F + Vitest 100P/0F/11S。
+- **探针（字面量口径）**：`[LocalRT-DBG-276/277/278/283/284]`=1/1/2/1/3；284 功能性字面量 `LOCAL_RT_SHADOW_MS`=1。
+- **日志开关两头验**：无 -debug → 0 条 DBG；有 -debug → `[LocalRT-DBG-284]` 实写；单元用例 `urgent286_pre_roll_diag_quiet_at_warn_full_at_debug` ok。
+- **负责人**：tester-1 ｜ **日期**：2026-09-21

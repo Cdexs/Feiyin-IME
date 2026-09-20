@@ -5177,3 +5177,37 @@ pub fn uses_accuracy_engine(self) -> bool {
 落地后都必须**验证实际生效**，而不是只看「设了」。
 
 **来源**：`RESEARCH-ACC-GPU-275`（关卡一取证时发现）。
+
+---
+
+## [OVERLAY-FLUSH-TEXT-DROP-001] flush 帧 StreamingText 结构性必丢（已知、有意不修）
+
+**现象**：松手停止录音后，overlay 预览最后一个字/尾段不上屏（最终注入文本完整）。
+
+**判据（静态证据链）**：
+- 控制器 `HotkeyEvent::Stop` 在**松手即** `STREAMING_STOPPED.store(true)`（`src/main.rs:6613`）。
+- `StreamingText` 消费侧 `should_ignore_streaming_text(stopped) = stopped`（`src/main.rs:6092`），late packet 直接丢。
+- ASR 线程 flush（`input_finished` → decode → 最后 `on_result` → 发 `StreamingText`）必然发生在松手**之后**。
+⇒ flush 那帧 StreamingText **结构性必丢**（非偶发时序），Gavin「总是少」与之一致。
+
+**为何不修（2026-09-20 主控裁定 (a)）**：预览文本最终**整个丢弃**（`main.rs` 新分支 `Ok(Ok((_preview_text, pcm))) => pcm`，pcm 交 accuracy 2pass 重转），唯一价值是「说话时看着舒服」。修复只能：① 动共享 latch（`should_ignore_streaming_text`）→ 影响在线档（违反「三档行为不许变」）+ 可能复活 OVERLAY-043 / FLICKER-130 修掉的迟到包闪烁；② 延缓 Processing 切换等 flush → 违反「不为即将丢弃的预览字增加等待」。**代价 > 收益**。
+
+**区分**：本条目 = **松手后** flush 尾帧被丢（显示层）。Gavin 报的「说完一句、等几秒、窗口没切换、最后一个字仍缺失」是**录音期间 endpoint `reset()` 丢掉未解码帧**（解码层），属另一问题 —— 见 `LOCALRT-FIRSTCHAR-272 / 276` 的诊断埋点（待 Gavin 跑一次取证）。
+
+**来源**：`LOCALRT-FIRSTCHAR-272 / 276` 取证（2026-09-20，coder-2）＋主控裁定。
+
+### [OVERLAY-FLUSH-TEXT-DROP-001] 修复记录（LOCALRT-FIRSTCHAR-282，2026-09-20）
+
+**裁定变更**：原文「已知、有意不修」→ Gavin 明确要求修（预览丢尾段视觉上像「说完话字停在半路」，长句丢一整段）。主控定方案：**不碰共享 latch，给本地档单开通道**。
+
+**修法**：新增 `PipelineEvent::StreamingFinalPreview(String)`（专用事件）：
+
+- **只有本地档发**：`local_stream::transcribe_streaming_local` 的 flush 段把最终（含标点）预览全文经返回值带出；`main.rs` 本地分支在 join 后、`run_pipeline_core`（Processing）之前 `send_event(StreamingFinalPreview(...))`。
+- **只有本地档收**：控制器新增 arm，在 `RecordingWithText` 态展示收尾预览（不 auto-close、不切状态机）。
+- **Stop 处理器档位隔离**：本地档 Stop **不切** `FallingToProcessing`（留在 `RecordingWithText` 等收尾预览 + Processing），非本地档走原路（`overlay_transcribing`）逐位不变。
+- **`STREAMING_STOPPED` / `should_ignore_streaming_text` 一字未改** ⇒ 在线档 StreamingText 该丢照样丢，代码路径结构上不变（在线永不发也永不收新事件）。
+
+**不延迟最终文本**：新事件在 `run_pipeline_core` 之前发，worker 不等待；最终注入时序不变。
+**无闪烁**：overlay 从 `RecordingWithText` 单调过渡到 `FallingToProcessing`→`Processing`，无回退。
+
+**来源**：`LOCALRT-FIRSTCHAR-276 / 282`（2026-09-20，coder-2）＋主控方案裁定。

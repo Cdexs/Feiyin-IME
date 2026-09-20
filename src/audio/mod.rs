@@ -26,6 +26,128 @@ const PRIME_TICK_MS: u64 = 20; // HOTKEY-LATENCY-FIX-001: recv_timeout tick, all
 
 type AudioChunk = (Instant, Vec<f32>);
 
+// RESEARCH-ACC-FIRSTCHAR-278: **仅埋点，非行为性**（不改任何逻辑）。
+// 记录「上次录音结束」时刻（进程启动起算 ms），用于计算按键时距上次录音结束的间隔 ——
+// 这是判断 pre_roll 600ms 是否为「上一句残留」的关键变量。
+static LAST_RECORD_END_MS: AtomicU64 = AtomicU64::new(0);
+static PROC_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn proc_now_ms() -> u64 {
+    PROC_START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// [LocalRT-DBG-278] 记录 pre_roll 那 600ms 的能量/内容特征（只读）。
+///
+/// URGENT-286：本函数全部计算（能量/峰值/语音帧统计，O(600ms 样本)）都是
+/// **为日志而算**，故先过 `log_enabled!` 守卫——默认 `max_level=Warn` 下直接返回，
+/// 连遍历都不发生（零开销）；仅带 `-debug`（`filter_level(Debug)`）端测时统计。
+fn pre_roll_diag(chunks: &[Vec<f32>], rate: u32) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    let total: usize = chunks.iter().map(|c| c.len()).sum();
+    if total == 0 {
+        log::debug!("[LocalRT-DBG-278] pre_roll chunks=0 (empty)");
+        return;
+    }
+    let mut peak = 0f32;
+    let mut sum_abs = 0f64;
+    let frame = ((rate / 50).max(1)) as usize; // 20ms 帧
+    let mut frames = 0usize;
+    let mut speech_frames = 0usize;
+    let mut f_sum_sq = 0f64;
+    let mut f_n = 0usize;
+    for c in chunks {
+        for &s in c {
+            let a = s.abs();
+            if a > peak {
+                peak = a;
+            }
+            sum_abs += a as f64;
+            f_sum_sq += (s * s) as f64;
+            f_n += 1;
+            if f_n >= frame {
+                let rms = (f_sum_sq / f_n as f64).sqrt();
+                frames += 1;
+                if rms > 0.01 {
+                    speech_frames += 1;
+                }
+                f_sum_sq = 0.0;
+                f_n = 0;
+            }
+        }
+    }
+    let dur_ms = total as f64 / rate as f64 * 1000.0;
+    let last = LAST_RECORD_END_MS.load(Ordering::Relaxed);
+    let gap = if last == 0 {
+        "-".to_string()
+    } else {
+        proc_now_ms().saturating_sub(last).to_string()
+    };
+    let ratio = if frames > 0 {
+        speech_frames as f64 / frames as f64
+    } else {
+        0.0
+    };
+    log::debug!(
+        "[LocalRT-DBG-278] pre_roll chunks={} dur={:.0}ms mean_abs={:.4} peak={:.4} speech_frames={}/{} ratio={:.2} gap_since_last_record={}ms",
+        chunks.len(),
+        dur_ms,
+        sum_abs / total as f64,
+        peak,
+        speech_frames,
+        frames,
+        ratio,
+        gap
+    );
+}
+
+/// FIX-LOCALRT-FIRSTCHAR-283（方案 D）：从前置音频里取**最后一个语音段**。
+///
+/// - 用轻量**能量 VAD**（20ms 帧 RMS）把音频切成语音段；段间需有 ≥200ms 静音才算分隔。
+///   （音频层保持平台中立、不引入 ASR 模型依赖，故用能量法而非 silero VAD；对
+///   「上一句尾音 vs 本次说话」的分隔判定足够。）
+/// - 若存在 **≥2 个**语音段 ⇒ 只保留**最后一段**（+100ms 前置 padding），丢掉更早的语音
+///   （即上一句尾音残留）。
+/// - 若 **0 或 1 段**（整段连续无停顿）⇒ **原样返回**——这正是「说得比按键快」的场景，
+///   保证首字不丢（FIRSTCHAR 系列老 bug 不许复活）。
+/// - 不改 `PRE_ROLL_MS`（600ms 取值不动），只改「怎么用这 600ms」。
+fn trim_pre_roll_last_speech_segment(samples: &[f32], rate: u32) -> Vec<f32> {
+    // 🔴 用**样本级**静音游程（非帧级）：帧级在边界量化上会把「正好 200ms 静音」算成 9 帧
+    // 而漏切（离线复现过），样本级无此问题。
+    const SIL_THRESHOLD: f32 = 0.005;
+    let min_silence = (rate as usize * 200) / 1000; // 200ms
+    let pad = (rate as usize * 100) / 1000; // 100ms 前置 padding
+    let mut segs: Vec<(usize, usize)> = Vec::new(); // (start_sample, end_sample)
+    let mut cur: Option<usize> = None;
+    let mut run = 0usize;
+    for (idx, &x) in samples.iter().enumerate() {
+        if x.abs() <= SIL_THRESHOLD {
+            run += 1;
+            if cur.is_some() && run >= min_silence {
+                let start = cur.unwrap();
+                segs.push((start, idx - run));
+                cur = None;
+                run = 0;
+            }
+        } else {
+            if cur.is_none() {
+                cur = Some(idx);
+            }
+            run = 0;
+        }
+    }
+    if let Some(start) = cur {
+        segs.push((start, samples.len() - 1));
+    }
+    if segs.len() <= 1 {
+        return samples.to_vec(); // 0/1 段 → 原样（「说得比按键快」不丢字）
+    }
+    let last = segs.last().unwrap().0;
+    let st = last.saturating_sub(pad);
+    samples[st..].to_vec()
+}
+
 pub struct AudioCapture {
     #[allow(dead_code)]
     pub sample_rate: u32,
@@ -196,6 +318,11 @@ impl AudioCapture {
         max_seconds: u64,
         level_buf: Option<AudioLevelBuf>,
         device_name: Option<&str>,
+        // FIX-LOCALRT-FIRSTCHAR-283（方案 D）：仅**本地流式**路径传 true——
+        // pre_roll 里若有被静音分隔的多个语音段，只保留最后一段（丢掉上一句尾音）；
+        // 整段连续无停顿 → 原样保留（保护「说得比按键快」不丢字）。
+        // 在线流式三档传 false ⇒ 行为完全不变。
+        trim_pre_roll_residual: bool,
         mut on_chunk: impl FnMut(&[f32]),
     ) -> Result<()> {
         let t_record = std::time::Instant::now();
@@ -213,6 +340,35 @@ impl AudioCapture {
             pre_roll_chunks.len(),
             t_record.elapsed().as_secs_f64() * 1000.0
         );
+        // RESEARCH-ACC-FIRSTCHAR-278 埋点（只读）：pre_roll 能量特征 + 距上次录音结束间隔
+        pre_roll_diag(&pre_roll_chunks, warm.sample_rate);
+
+        // FIX-LOCALRT-FIRSTCHAR-283（方案 D，仅本地流式 trim_pre_roll_residual=true）：
+        // 拼成单块 → 取最后一个语音段 → 丢掉更早的语音段（上一句残尾），避免污染本次首字。
+        let pre_roll_chunks = if trim_pre_roll_residual {
+            let mut all: Vec<f32> =
+                Vec::with_capacity(pre_roll_chunks.iter().map(|c| c.len()).sum());
+            for c in &pre_roll_chunks {
+                all.extend_from_slice(c);
+            }
+            // URGENT-286：trim 本身是生产逻辑（不可守卫）；只有这条日志降为 debug。
+            // all.len()/kept.len() 是廉价取长，无需再包 log_enabled!。
+            let kept = trim_pre_roll_last_speech_segment(&all, warm.sample_rate);
+            log::debug!(
+                "[LocalRT-DBG-283] pre_roll residual trim: {} -> {} samples ({:.0}ms -> {:.0}ms)",
+                all.len(),
+                kept.len(),
+                all.len() as f64 / warm.sample_rate as f64 * 1000.0,
+                kept.len() as f64 / warm.sample_rate as f64 * 1000.0
+            );
+            if kept.is_empty() {
+                Vec::new()
+            } else {
+                vec![kept]
+            }
+        } else {
+            pre_roll_chunks
+        };
 
         // 精确 idle drain（同 record() 的 FIRSTCHAR-FIX-004）：清热键前 stale chunk
         let mut idle_cleared: usize = 0;
@@ -419,6 +575,8 @@ impl AudioCapture {
             dropped
         );
 
+        // RESEARCH-ACC-FIRSTCHAR-278 埋点（只读）：标记本次录音结束时刻，供下次按键算间隔
+        LAST_RECORD_END_MS.store(proc_now_ms(), Ordering::Relaxed);
         Ok(())
     }
 
@@ -1364,6 +1522,104 @@ pub fn is_mic_muted() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // FIX-LOCALRT-FIRSTCHAR-283（方案 D）纯函数用例
+    fn speech(ms: usize) -> Vec<f32> {
+        vec![0.2f32; 16000 * ms / 1000]
+    }
+    fn silence(ms: usize) -> Vec<f32> {
+        vec![0.0f32; 16000 * ms / 1000]
+    }
+
+    #[test]
+    fn trim_pre_roll_keeps_last_segment_when_separated_by_silence() {
+        // [上句尾 250][静音 200][本句 500] → 只留最后一段（丢掉前段）
+        let mut s = speech(250);
+        s.extend(silence(200));
+        s.extend(speech(500));
+        let out = trim_pre_roll_last_speech_segment(&s, 16000);
+        assert!(out.len() < s.len(), "多语音段应被裁剪");
+        assert!(out.len() >= 16000 * 500 / 1000, "至少保留最后一段");
+    }
+
+    #[test]
+    fn trim_pre_roll_unchanged_for_continuous_speech() {
+        // 连续无停顿（「说得比按键快」）→ 原样，防丢字
+        let s = speech(600);
+        let out = trim_pre_roll_last_speech_segment(&s, 16000);
+        assert_eq!(out.len(), s.len(), "单段连续必须原样返回（不丢字）");
+    }
+
+    #[test]
+    fn trim_pre_roll_unchanged_for_pure_silence() {
+        let s = silence(600);
+        let out = trim_pre_roll_last_speech_segment(&s, 16000);
+        assert_eq!(out.len(), s.len(), "纯静音原样返回");
+    }
+
+    // ============================================================
+    // URGENT-286：诊断埋点「两头验证」回归
+    //   - 默认 Warn（端测不带 -debug）：守卫为 false ⇒ 重计算被跳过；
+    //     [LocalRT-DBG-278] 必须零输出。
+    //   - Debug（端测带 -debug）：[LocalRT-DBG-278] 必须完整输出。
+    // ============================================================
+    static DIAG_CAPTURED: std::sync::OnceLock<Mutex<Vec<String>>> = std::sync::OnceLock::new();
+
+    struct CapLogger;
+    impl log::Log for CapLogger {
+        fn enabled(&self, _m: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            if let Some(m) = DIAG_CAPTURED.get() {
+                if let Ok(mut v) = m.lock() {
+                    v.push(format!("{}", record.args()));
+                }
+            }
+        }
+        fn flush(&self) {}
+    }
+
+    fn diag_captured() -> Vec<String> {
+        DIAG_CAPTURED
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn urgent286_pre_roll_diag_quiet_at_warn_full_at_debug() {
+        let _ = log::set_boxed_logger(Box::new(CapLogger));
+        let chunks = vec![vec![0.2f32; 16000]]; // 1s 语音，足以触发能量统计
+
+        // 不带 -debug（release 默认）
+        log::set_max_level(log::LevelFilter::Warn);
+        assert!(
+            !log::log_enabled!(log::Level::Debug),
+            "默认 Warn 下 Debug 守卫必须为 false ⇒ 重计算被跳过"
+        );
+        let before = diag_captured().len();
+        pre_roll_diag(&chunks, 16000);
+        let warn_hits = diag_captured()[before..]
+            .iter()
+            .filter(|s| s.contains("[LocalRT-DBG-278]"))
+            .count();
+        assert_eq!(warn_hits, 0, "默认 Warn 下 [278] 必须零输出");
+
+        // 带 -debug
+        log::set_max_level(log::LevelFilter::Debug);
+        assert!(log::log_enabled!(log::Level::Debug));
+        let before = diag_captured().len();
+        pre_roll_diag(&chunks, 16000);
+        let dbg_hits = diag_captured()[before..]
+            .iter()
+            .filter(|s| s.contains("[LocalRT-DBG-278]"))
+            .count();
+        assert_eq!(dbg_hits, 1, "-debug 下 [278] 必须完整输出 1 条");
+
+        log::set_max_level(log::LevelFilter::Warn); // 复原
+    }
 
     #[test]
     fn normalizes_blank_device_name_to_default() {

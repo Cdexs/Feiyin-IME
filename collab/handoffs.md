@@ -4,6 +4,38 @@
 
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行，超 200 行上限）。
 
+## 2026-09-20 — coder-2 — URGENT-286 ✅ 交付（诊断埋点降级 debug + 重计算加守卫）
+
+- **改动**：`[LocalRT-DBG-276]`/`[277]`/`[278]`/`[284]` 全部 `warn!`→`debug!`（默认 Warn 连级别检查都短路）。
+- **重计算守卫**：276 的 `r.text != last_result_text` + clone 整块套 `log_enabled!(Debug)`；277 的 `log_draw_geo_277` 首行 `if !log_enabled!(Debug){return;}` ⇒ 不做 **DirectWrite 文本布局**（最贵那步）。
+- **边界**：278 的重灾（pre_roll 能量统计）在 `audio/mod.rs`，属 coder-1，**未碰**；local_stream 内的 278 日志行顺手降级（同文件）。
+- **284 合并**：284 五处埋点同步降级；`decode ms` 计时改为仅 Debug 级取样；`LOCAL_RT_RULE2`/`LOCAL_RT_SHADOW_MS` **env 读取未动**（功能非日志）。
+- **验证**：cargo check --all-targets 0 error、warnings **110/101** = 基线；rustfmt clean。🔴 实机两头验证（无 -debug 不出现 / 有 -debug 完整）交 tester-1/Gavin（我不能跑）。
+- **红线**：未动版本 / 未 commit / 未出包 / 零凭证。
+
+## 2026-09-20 — coder-2 — LOCALRT-ENDPOINT-284 ✅ 交付（停顿 300-500ms 影子收尾方案 B + A 实验开关；待 Gavin 多阈值实测）
+
+- **B 已实现**：静默 ≥ 阈值（默认 400ms，env `LOCAL_RT_SHADOW_MS`）→ 影子 `OnlineStream` 喂当前句音频 + `input_finished()` → 完整结果**只用于显示**（不 reset / 不切句 / 不动 sentence_id）；显示取「confirmed+影子」与「confirmed+main」更长者（避免闪烁）；endpoint 作废影子并推进 `sentence_pcm_start`；当前句 >12s 跳过（防 O(n²)）。
+- **A 开关**：`LOCAL_RT_RULE2` env 覆盖 rule2（默认 2.0 零变）；`[LocalRT-DBG-284] endpoint fired` warn 计切句数。
+- **埋点**：`shadow finalize #N silence/sentence_audio/decode ms/text_len`、`shadow skipped`、`rule1/2/3`、`shadow_trigger_ms`（warn 级）→ 交 Gavin 实测 300/400/500ms 的触发频率/单次耗时/CPU，及 A 的切句后果。
+- **验证**：cargo check --all-targets 0 error、warnings **110/101** = 基线；rustfmt 三文件 clean。RULE1/RULE3 未动；在线档一行未动。
+- **红线**：未动版本 / 未 commit / 未出包 / 零凭证。
+
+## 2026-09-20 — coder-2 — LOCALRT-FIRSTCHAR-281 + 282 ✅ 交付（右侧空白量宽修复 + 预览尾段专用通道）
+
+- **281**：D2D `streaming_text` 新增 `dwrite_measure_width`，scroll 用 **DirectWrite 实渲宽**（与 `DrawText` 同引擎），不再用 GDI `GetTextExtent`（实测差 143-155px ⇒ 多滚 ⇒ 右留白）。GDI 兜底路径未改（自洽）。`[LocalRT-DBG-277]` 改报 `right_gap`；改前 gdi=2635/dwrite=2480/gap 143-155，**改后公式推导 ≈0**（待 Gavin 跑一次确认）。
+- **282**：新增 `PipelineEvent::StreamingFinalPreview`（**只有本地档发/收**）承载 flush 最终预览；Stop 本地档不切 `FallingToProcessing`（留 `RecordingWithText` 等收尾 + `Processing`）。`STREAMING_STOPPED`/`should_ignore_streaming_text` **一字未改** ⇒ 在线档结构上不变；不延迟最终文本、无闪烁。
+- **验证**：cargo check --all-targets 0 error、warnings **110/101** = 基线；rustfmt 两文件 clean。RULE1/2/3 一字未动；未改解码参数。
+- **红线**：未碰 src-tauri / ui / 未动版本 / 未 commit / 未出包 / 零凭证。
+
+## 2026-09-20 — coder-2 — LOCALRT-FIRSTCHAR-276 + FIX-OVERLAY-SCROLL-277 ✅ 交付（取证埋点，未改行为；待 Gavin 跑数据）
+
+- **276**：主控更正方向 = 录音期间 endpoint `reset()` 丢未解码帧（非 flush/overlay 时序）。加 `[LocalRT-DBG-276]`（每次 get_result 文本变化 + endpoint 空/None 分支）。**待 Gavin 跑一次**：尾字是否在任何一帧出现过。原「flush 结构性必丢」结论由主控采纳 `[OVERLAY-FLUSH-TEXT-DROP-001]`（裁定 (a) 不修）。
+- **277**：FIX-255 两路径已改、measure/draw 同串、字体两端同源 ⇒ 排除漏改。加 `[LocalRT-DBG-277]` 节流日志：**GDI 量宽 vs DirectWrite 实渲宽** + 几何。**待 Gavin 跑长语音**捞数据。
+- **API 调研**：sherpa `OnlineStream` 无句中 endpoint flush API（仅 `input_finished()`，会终止流）；候选 = reset 前喂静音 padding（待数据+批准，本单未改）。
+- **验证**：cargo check --all-targets 0 error、warnings **110/101** = 基线；rustfmt 两文件 clean；numstat==-w。RULE1/2/3 一字未动；未改解码参数。
+- **红线**：只改 `local_stream.rs` + `main.rs` overlay 绘制 / 未碰 src-tauri / ui / 未动版本 / 未 commit / 未出包 / 零凭证。
+
 ## 2026-09-20 — coder-2 — LOCALRT-FIRSTCHAR-272 ✅ 交付（首字延迟埋点，不改解码参数；待主控定向 tester-1 冷/热实测）
 
 - **埋点**（`local_stream.rs`，永久观测、仅首次触发）：`first_chunk` / `first_accept_waveform` / `first_is_ready` / `first_nonempty_result` / `first_on_result`（=用户看到首字）+ `FIRST-CHAR breakdown` 汇总行（chunk/accept/ready/result/callback + wait_audio / wait_infer / wait_callback）。t0 = 函数入口（ASR 线程起跑）。
@@ -474,3 +506,68 @@
 - **[PROVIDER-SILENT-FALLBACK-001]**：provider 无效值**静默回退 CPU**（session.cc:303 编译期开关）；判据须「验证实际生效」；同族 DEC-069/073。
 - **残留清单（先报再删）**：`<repo>/1024`(0B)、`models/kv259/`(8.5MB)、`tmp/opencode/lat_*.txt`、`tok_funasr-nano-tokenizer.h`、`kv263_backup_path.txt` 建议删；`kv263_backup-*` + 两处 `.512.bak` 建议保留待端测。
 - **红线**：本次未删文件；未碰生产/版本；零凭证。
+
+## 2026-09-20 — coder-1 — 279 补测 + 278 取证 ✅
+
+- **279**：num_threads 12/16 更慢（short 8/12/16=1.618/1.916/4.263；long=17.873/19.808/34.247）⇒ 维持 8；12/16 数据补进注释（逻辑未动）。
+- **278**：`PRE_ROLL_MS=600` + `record_streaming` 首批 chunk 直喂流式无裁剪；后端 `find_speech_onset_with_backtrack` 裁前导静音。离线 PoC：残留使首字延迟 **+600ms**，但文本两组逐字相同、**未能复现「不准」**⇒ 精度效应内容相关，需应用内两场景 A/B。
+- **方案**：A 能量门控/B 复用 onset 裁剪对「上一句尾」残留**无效**（残留是语音）；C 缩短 pre_roll 有丢字代价；**D VAD 取 pre_roll 最后语音段**唯一能区分、无停顿场景不丢字。**建议先加非行为性埋点**再定。两场景回归：按键后才说/按键前就说。
+- **验证**：cargo check 0 error（110/101）；rustfmt clean。**278 未改生产代码**。
+- **红线**：未动版本；生产模型未碰；零凭证；临时已清。
+
+## 2026-09-21 — tester-1 — BUILD-280 ✅ 诊断包（只读埋点 276/277，无新修复）
+
+- **用途**：给 Gavin 真机跑一次收 LocalRealtime 诊断数据（coder-1/coder-2 均无法发声）；HEAD `5ad0670`，版本维持 0.9.2。
+- **构建**：Step1–4 全走；`target/release` 与 `Publish/` 三 exe + 两 toml 均更新；warnings bin 110 / crash 9 / tauri 17 = 基线。
+- **产物**：main `33b65b3f626da7b71563c180b6e01f96774f9c7ed77de999d26ee1b6352016aa`（14,360,576B / 00:39:54）/ ui `486dc68ccfa4a1ae5848ec3c3fcf08e7e172c424d154f06ff54e32d6c8f34932` / crash `807bfb17568d01cc615d75f2791f6a6565f932db4c2628b4a3e3518051cd5a2c`；两副本逐一相等，三者均异于 BUILD-274。
+- **🔴 埋点探针**（`grep -a -F` 于 `target/release/feiyin-ime.exe`）：`[LocalRT-DBG-276]`=**1**、`[LocalRT-DBG-277]`=**1** ⇒ 埋点确已进包。
+- **冒烟**：PID 4188 `Responding=True`；`target/release/debug.log` 生成（189,574B / 1562 行）；panic/ERROR=0；无 `crash.json`；残留 0。（本次无麦克风输入，`LocalRT-DBG` 行 0，需 Gavin 录音触发。）
+- **278（coder-1 流式首字/pre_roll）未落地**，按令不等，本包只含 276/277。
+- **证据**：`collab/outbox/tester-1/build280/`（build280 / build_* / verify_smoke）。
+- **红线**：版本 0.9.2 未动 / 未 commit / 未改生产代码 / 模型与备份未碰 / 零凭证。
+
+## 2026-09-20 — coder-1 — 278 埋点 ✅（赶 BUILD-280）
+
+- **改动 2 文件、纯 log::warn! 只读**：`src/audio/mod.rs` pre_roll 诊断（chunks/dur/mean_abs/peak/speech_frames/ratio/gap_since_last_record，含 `LAST_RECORD_END_MS`+`proc_now_ms()`，record_streaming 返回前写结束时刻）；`src/transcription/local_stream.rs` 首字文本 warn。标签统一 `[LocalRT-DBG-278]`。
+- **用途**：Gavin 两场景对照（安静 vs 刚说完再按）→ 残留是否坐实；坐实再上方案 D（VAD 取最后语音段）。本单不实施 D。
+- **验证**：cargo check 0 error（110/101）；rustfmt clean。
+- **红线**：非行为性；未动版本；生产模型未碰；零凭证。
+
+## 2026-09-20 — coder-1 — FIX-LOCALRT-FIRSTCHAR-283 ✅ 交付（方案 D，待端测两场景）
+
+- **改动**：`audio/mod.rs`（`record_streaming` 第8参 `trim_pre_roll_residual` + `trim_pre_roll_last_speech_segment` 样本级能量VAD；`[LocalRT-DBG-283]` 日志）；`main.rs` 在线流式 `false`/本地流式 `true`。
+- **关键修正**：帧级 RMS 边界量化漏切「正好200ms静音」→ 改样本级，6/6 用例通过。
+- **验证**：Rust 单测 3/3；离线算法 6/6；流式 PoC 与 accuracy 首字均正确但**未复现 Gavin 的「首字污染」**⇒ 真实端测两场景（按键后才说/按键前就说）须 tester/Gavin 用麦克风验证。
+- **跨端**：`docs/MACOS-HANDOFF.md` 已写（平台中立，macOS 调用点须同步补第8参）。
+- **并发**：main.rs E0004（coder-2 在途）曾致编译红，已报主控。
+- **验证**：cargo check 0 error（110/101）；rustfmt clean。**红线**：PRE_ROLL_MS 未动；在线三档行为不变；未动版本；零凭证。
+
+## 2026-09-21 — tester-1 — BUILD-285 🛑 中止（主控停令），产物作废；回归有效
+
+- **停令**：诊断埋点在 release 下仍求值+格式化（DBG-278 遍历 pre_roll）→ URGENT-286 降 `debug!`+`log_enabled!`；**已开始则中止重来**。停令时 Step1–4 已跑完（01:04–01:08），按令中止、**不交付**。
+- **作废**：main `ca2365f6…` / ui `59198f5c…` / crash `e0713a12…`；源码 mtime 01:08:12–26 落构建中途 ⇒ 混合快照。🔴 `Publish/` 与 `target/release/` 暂存该作废包，**Gavin 勿用**（重出会覆盖）。
+- **回归（复用）**：root **1282P/0F/15I**（1279+3 条 283 `trim_pre_roll_*`）/ `src-tauri` **85P/0F/0I** / Vitest **100P/0F/11S**；release warnings bin 110 / crash 9 / tauri 17 = 基线。
+- **探针教训**：`StreamingFinalPreview` / `trim_pre_roll`（符号名）release `grep -F`=0，不可作探针；用 `.rdata` 日志字面量 `[LocalRT-DBG-276/277/278/283]`（实测 1/1/2/1）。下包改用此口径。
+- **四条重点验需真人录音**（②需长文撑窗触发 `[LocalRT-DBG-277]`；④需两语音时序），我无发声能力，未产数据，留 Gavin。
+- **证据**：`collab/outbox/tester-1/testexec285/` + `build285/`。
+- **红线**：版本 0.9.2 未动 / 未 commit / 未改生产代码 / 备份未删 / 零凭证。
+
+## 2026-09-20 — coder-1 — URGENT-286（[278]/[283] 归属）诊断埋点降级
+
+- **改动**：仅两文件——`src/audio/mod.rs`（`pre_roll_diag` 首行 `log_enabled!(Debug)` 守卫 + 两条 `warn!`→`debug!`）、`src/transcription/local_stream.rs`（流式首字 `warn!`→`debug!`）。未碰 coder-2 的 276/277。
+- **未动的生产逻辑**：283 `trim_pre_roll_last_speech_segment()`（真在用的 VAD 分段）保持原样，仅降其日志。
+- **验证**：cargo check 0 error / warnings 110/101 基线 / rustfmt clean；`cargo test` **13/13 PASS**（新增 `urgent286_pre_roll_diag_quiet_at_warn_full_at_debug`：Warn→零输出、Debug→完整）；真实二进制不带 `-debug` **零 Debug 级**、带 `-debug` 完整（debug.log 生成）。
+- 🔴 **待端测**：[278]/[283] 在真实录音热键路径的完整数据采集须 tester-1/Gavin 在**交互式桌面**验证（本机 agent shell 注入 F9 在 local_realtime 冷启动下不稳定，未产证据）——与 276/277 四组一并在统一构建上验。
+- **红线**：PRE_ROLL_MS 未动 / 在线三档不变 / 未动版本 / 零凭证；测试产物已清。
+
+## 2026-09-21 — tester-1 — TEST-EXEC + BUILD-287 ✅ 回归全绿 + 出包（八项 PASS + 日志开关两头验）
+
+- **构建纪律**：开工前后源码 mtime 逐位一致（`01:08:12–01:11:06`）⇒ **无中途改动**，吸取 285 作废教训。
+- **回归（286 后重跑）**：root **1283P/0F/15I**（+1 条 286 `urgent286_pre_roll_diag_quiet_at_warn_full_at_debug`）/ `src-tauri` **85P/0F/0I** / Vitest **100P/0F/11S**；warnings **110/101/17** = 基线。
+- **产物**：main `e16e3738b2f7f979a49a7209438f5c44f77ebfc3a1db26b5bf32573b4aeb5955`（14,379,008B / 01:17:00）/ ui `ee6d6e73486e2e611da5a8e52805cdce935bf52545cf484438f8319b1776025d` / crash `a4b238aa11c9b89e5ba3957cd8674204ad5765fdb3cf5c40e1c22a88d5007aed`；两副本相等，均异于 BUILD-280。
+- **八项逐项 PASS**：①时间戳 01:14–01:17 ②两副本 sha 相等且异于上包 ③ProductVersion 0.9.2 ④冒烟 Responding=True + 无 crash.json + 残留 0 ⑤config/wordbook 零变化 ⑥warnings 110/101/17 ⑦探针 ⑧toml 三副本全等。
+- **探针（字面量）**：`[LocalRT-DBG-276/277/278/283/284]` = 1/1/2/1/3；284 功能性字面量 `LOCAL_RT_SHADOW_MS` = 1（非诊断标签，证 284 进包）。
+- **🔴 日志开关两头自验**：不带 `-debug` → 无 debug.log、DBG 0 条；带 `-debug` → debug.log 1848 行且 `[LocalRT-DBG-284]` 实写；静态守卫 `pre_roll_diag` 首行 `log_enabled!` 早退。诚实边界：LL 钩子（vk=165）不接受注入合成 Right-Alt，运行时未触发录音路径。
+- **四条修复效果**（281 右留白 / 282 收尾预览 / 283 两场景 / 284 影子解码）仍需 Gavin 真人录音。
+- **证据**：`collab/outbox/tester-1/testexec287/` + `build287/`。
+- **红线**：版本 0.9.2 未动 / 未 commit / 未改生产代码 / 备份未删 / 零凭证。

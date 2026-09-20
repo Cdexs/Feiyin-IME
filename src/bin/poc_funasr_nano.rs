@@ -51,7 +51,7 @@ fn main() {
     let mut recognizer_config = OfflineRecognizerConfig::default();
     recognizer_config.model_config.num_threads = cfg.threads;
     recognizer_config.model_config.provider = Some("cpu".to_string());
-    recognizer_config.model_config.debug = false;
+    recognizer_config.model_config.debug = cfg.debug;
     recognizer_config.rule_fsts = cfg.rule_fsts.clone();
 
     if cfg.model_type == "sensevoice" {
@@ -157,6 +157,8 @@ struct PocConfig {
     system_prompt: Option<String>,
     // ACC-KV-1024-260: itn 开关验证（默认 1，与生产一致）
     itn: i32,
+    // RESEARCH-ACC-LATENCY-271: debug 放开 C++ 的 generated N tokens 日志
+    debug: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<PocConfig, String> {
@@ -174,6 +176,7 @@ fn parse_args(args: &[String]) -> Result<PocConfig, String> {
     let mut max_new_tokens: i32 = 0;
     let mut system_prompt: Option<String> = Some("You are a helpful assistant.".to_string());
     let mut itn: i32 = 1;
+    let mut debug = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -284,6 +287,7 @@ fn parse_args(args: &[String]) -> Result<PocConfig, String> {
                 }
                 itn = args[i].parse().map_err(|_| "invalid --itn".to_string())?;
             }
+            "--debug" => debug = true,
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -317,6 +321,7 @@ fn parse_args(args: &[String]) -> Result<PocConfig, String> {
         max_new_tokens,
         system_prompt,
         itn,
+        debug,
     })
 }
 

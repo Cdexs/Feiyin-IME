@@ -139,6 +139,12 @@ enum PipelineEvent {
     /// LOCAL-RT-ENGINE-239-B: 本地流式档位模型缺失/加载失败 → 直接报错不降级（DEC-067 附则一）。
     /// 与 Error 的区别：**不过 convert_to_friendly_error**，保留「具体缺哪个模型」的原始上下文。
     ModelUnavailable(String),
+    /// LOCALRT-FIRSTCHAR-282: 本地流式**松手 flush 的最终预览全文**。
+    /// 🔴 专用通道：`STREAMING_STOPPED` + `should_ignore_streaming_text` 是本地/在线共用 latch，
+    /// 动它会影响在线档 + 可能复活 OVERLAY-043 闪烁 ⇒ **新开本事件，只有本地档发/只有本地档消费**，
+    /// 在线档代码路径结构上不变（它永不发也永不收本事件）。
+    /// 消费：在 `RecordingWithText` 态下展示收尾预览（不 auto-close、不改状态机）。
+    StreamingFinalPreview(String),
 }
 // LATENCY-001: send event and immediately wake controller via PostMessageW
 fn send_event(tx: &crossbeam_channel::Sender<PipelineEvent>, event: PipelineEvent) {
@@ -5158,6 +5164,62 @@ mod d2d {
         }
     }
 
+    /// LOCALRT-FIRSTCHAR-281: 用**实际渲染引擎**（DirectWrite）量文本宽度（像素）。
+    /// 与 GDI `GetTextExtentPoint32W` 对同一串可差 143-155px（实测，随长度增长）——
+    /// D2D 绘制若用 GDI 量宽算 `scroll_x` 会多滚一截 ⇒ 右侧留白。故 D2D 侧一律用本函数。
+    /// `fallback` 在 layout 创建/取 metrics 失败时返回（退化为原 GDI 量宽，避免 0 宽不滚动）。
+    fn dwrite_measure_width(res: &D2dResources, visible: &[u16], fallback: f32) -> f32 {
+        unsafe {
+            match res
+                .dwrite
+                .CreateTextLayout(visible, &res.streaming_text_format, 1.0e6, 1.0e3)
+            {
+                Ok(layout) => {
+                    let mut m =
+                        windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS::default();
+                    if layout.GetMetrics(&mut m).is_ok() && m.width > 0.0 {
+                        m.width
+                    } else {
+                        fallback
+                    }
+                }
+                Err(_) => fallback,
+            }
+        }
+    }
+
+    /// LOCALRT-SCROLL-277 诊断：量化右侧空白。只读日志、节流 500ms、仅在滚动时打。
+    /// `gdi_width` 仅作对照（281 起**不再驱动 scroll**）；`scroll_width` = 实际驱动 scroll 的宽度
+    /// （281 修复后 = DirectWrite 实渲宽）；`right_gap = 布局宽度(visible_w+scroll_x) - scroll_width`，
+    /// 修复后应 ≈ 0。保留至 Gavin 完成「改后」实测。
+    fn log_draw_geo_277(gdi_width: i32, scroll_width: f32, visible_w: f32, scroll_x: f32) {
+        // URGENT-286：默认 Warn 下直接返回 —— 连节流计时/文本布局（最贵的那步）都不做，真正零开销。
+        if !log::log_enabled!(log::Level::Debug) {
+            return;
+        }
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST_MS: AtomicU64 = AtomicU64::new(0);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if now_ms.saturating_sub(LAST_MS.load(Ordering::Relaxed)) < 500 {
+            return;
+        }
+        LAST_MS.store(now_ms, Ordering::Relaxed);
+        let layout_w = visible_w + scroll_x;
+        log::debug!(
+            "[LocalRT-DBG-277] gdi_width={} scroll_width={:.1} diff(gdi-scroll)={:.1} visible_w={:.1} scroll_x={:.1} layout_w={:.1} => right_gap={:.1}px",
+            gdi_width,
+            scroll_width,
+            gdi_width as f32 - scroll_width,
+            visible_w,
+            scroll_x,
+            layout_w,
+            layout_w - scroll_width
+        );
+    }
+
     /// GDI streaming text path (:2530-2563 of draw_recording_overlay_with_text):
     /// clip to the text band, draw the tween-visible prefix at
     /// `x = text_left - scroll_x`, newest text pinned to the right edge once overflow.
@@ -5172,13 +5234,19 @@ mod d2d {
         let text_top = super::OVERLAY_TEXT_DRAW_VERTICAL_INSET as f32;
         let text_bottom = h - super::OVERLAY_TEXT_DRAW_VERTICAL_INSET as f32;
         let visible_w = (text_right - text_left).max(1.0);
-        // REFACTOR-088: GDI 路径共用同一纯函数。等价性链条见 `streaming_scroll_offset`
-        // doc-comment：visible_w 是整数值 f32（w 整数像素 + i32 margin 常量），
-        // as i32 截断永不发生，i32 运算逐位同值，转回 f32 无损。
-        // 🔴 前提断裂条件（margin 非整数 / 窗口宽度带小数）亦见该 doc-comment。
-        let scroll_x = super::streaming_scroll_offset(text_width, visible_w as i32) as f32;
 
         let visible: Vec<u16> = visible_text.encode_utf16().collect();
+        // LOCALRT-FIRSTCHAR-281：scroll 用 **DirectWrite 实渲宽**（与下面 DrawText 同引擎），
+        // 不再用 GDI `GetTextExtentPoint32W` 量宽 —— 两者对同一串差 143-155px（实测，随长度增长），
+        // 用 GDI 宽算 scroll_x 会多滚一截 ⇒ 右侧留白（FIX-255 未根治的真因）。
+        // `text_width`（GDI）仅留作诊断对照；GDI 兜底路径自己量自己画，不经此处（各自自洽）。
+        let scroll_width = dwrite_measure_width(res, &visible, text_width as f32);
+        let scroll_x =
+            super::streaming_scroll_offset(scroll_width.round() as i32, visible_w as i32) as f32;
+        // LOCALRT-SCROLL-277 诊断（节流 500ms，仅滚动时）：量化右侧留白。
+        if scroll_x > 0.0 {
+            log_draw_geo_277(text_width, scroll_width, visible_w, scroll_x);
+        }
         unsafe {
             // Clip: GDI SaveDC → SelectClipRgn(text area) → RestoreDC.
             // D2D: PushAxisAlignedClip → DrawText → PopAxisAlignedClip.
@@ -6619,27 +6687,25 @@ fn process_controller_events(
                 OVERLAY_EDITING.store(false, Ordering::Release);
                 if is_recording.load(Ordering::Acquire) {
                     let config = clone_runtime_config(runtime_config);
-                    show_overlay(
-                        overlay_handle,
-                        config.audio.overlay_opacity,
-                        config.ui_language,
-                        OverlayStatus::FallingToProcessing {
-                            // LOCAL-RT-ENGINE-239-B（DEC-066 附则一）：本地 realtime 新管线松键后
-                            // 只显示「识别处理中」单状态；其余三档保持「转录中」两段式不变。
-                            // 🔴 用枚举解析再比较（禁裸字符串），变体改名时编译器可捕获。
-                            message: {
-                                let label = if transcription::AsrModel::from_config(
-                                    &config.audio.asr_model,
-                                ) == transcription::AsrModel::LocalRealtime
-                                {
-                                    i18n::get(config.ui_language).overlay_processing
-                                } else {
-                                    i18n::get(config.ui_language).overlay_transcribing
-                                };
-                                label.to_string()
+                    // LOCALRT-FIRSTCHAR-282：本地流式档**不在此处切 FallingToProcessing**——
+                    // 留在 RecordingWithText，等 flush 的 `StreamingFinalPreview` 收尾（完整预览）
+                    // 与 worker 的 Processing 再切换，避免预览尾段被 `STREAMING_STOPPED` latch 丢掉。
+                    // 在线档 / performance / accuracy 走原路，行为逐位不变。
+                    let is_local_realtime =
+                        transcription::AsrModel::from_config(&config.audio.asr_model)
+                            == transcription::AsrModel::LocalRealtime;
+                    if !is_local_realtime {
+                        show_overlay(
+                            overlay_handle,
+                            config.audio.overlay_opacity,
+                            config.ui_language,
+                            OverlayStatus::FallingToProcessing {
+                                message: i18n::get(config.ui_language)
+                                    .overlay_transcribing
+                                    .to_string(),
                             },
-                        },
-                    );
+                        );
+                    }
                 }
             }
             HotkeyEvent::CancelStop => {
@@ -6725,6 +6791,23 @@ fn process_controller_events(
                 } else {
                     // OVERLAY-051-G: store word timings for timestamp-driven reveal
                     overlay_handle.send(OverlayCommand::UpdateWordTimings(words));
+                    show_overlay(
+                        overlay_handle,
+                        opacity,
+                        ui_language,
+                        OverlayStatus::RecordingWithText { text },
+                    );
+                }
+            }
+            // LOCALRT-FIRSTCHAR-282：本地流式松手 flush 的最终预览全文。
+            // 🔴 只有本地档会发本事件 ⇒ 在线档结构上永不进入（`STREAMING_STOPPED` latch 未动、
+            // 在线行为逐位不变）。在 `RecordingWithText` 态下展示收尾预览：更新文本、不 auto-close、
+            // 不切状态机；随后 worker 的 `Processing` 事件把 overlay 切到「识别处理中」
+            // （无闪烁、不延迟最终文本）。
+            PipelineEvent::StreamingFinalPreview(text) => {
+                if OVERLAY_EDITING.load(Ordering::Acquire) {
+                    log::debug!("LOCALRT-282: final preview skipped while editing");
+                } else {
                     show_overlay(
                         overlay_handle,
                         opacity,
@@ -7637,6 +7720,7 @@ fn spawn_worker_thread(
                             config::MAX_RECORD_SECONDS,
                             Some(Arc::clone(&audio_buf)),
                             device_name,
+                            false, // FIX-283: 在线流式路径不做 pre_roll 残尾裁剪（三档行为不变）
                             |chunk| {
                                 // ASR-074-GUARD: bounded channel send was an unbounded
                                 // blocking send — if the ASR thread stopped consuming
@@ -7885,6 +7969,7 @@ fn spawn_worker_thread(
                                 config::MAX_RECORD_SECONDS,
                                 Some(Arc::clone(&audio_buf)),
                                 device_name,
+                                true, // FIX-283（方案 D）：仅本地流式裁剪 pre_roll 上一句残尾
                                 |chunk| match chunk_tx.send_timeout(
                                     chunk.to_vec(),
                                     Duration::from_millis(200),
@@ -7925,9 +8010,9 @@ fn spawn_worker_thread(
                             continue;
                         }
 
-                        let local_pcm = match asr_result {
-                            // 预览文本丢弃（DEC-067：仅供上屏，最终文本由 accuracy 重打）。
-                            Ok(Ok((_preview_text, pcm))) => pcm,
+                        let (final_preview, local_pcm) = match asr_result {
+                            // 预览文本本用于收尾显示（282）；最终文本仍由 accuracy 2pass 重打（DEC-067）。
+                            Ok(Ok((preview_text, pcm))) => (preview_text, pcm),
                             Ok(Err(e)) => {
                                 if e.is::<transcription::NoSpeechError>() {
                                     log::info!("LocalRealtime ASR: no speech detected");
@@ -7947,6 +8032,16 @@ fn spawn_worker_thread(
                                 continue;
                             }
                         };
+
+                        // LOCALRT-FIRSTCHAR-282：把 flush 的最终预览全文经**专用事件**送达 overlay
+                        // （`StreamingText` 会被 `STREAMING_STOPPED` latch 丢掉；本事件只有本地档发/收）。
+                        // 必须早于 run_pipeline_core 的 `Processing` 事件 ⇒ 收尾预览先显示、再切处理态。
+                        if !final_preview.is_empty() {
+                            send_event(
+                                &event_tx,
+                                PipelineEvent::StreamingFinalPreview(final_preview),
+                            );
+                        }
 
                         // 下游与批处理路径同构：PCM 作 samples，initial_text=None。
                         let transcriber = match &transcriber {
@@ -8598,6 +8693,8 @@ fn overlay_request_for_event(event: &PipelineEvent) -> platform::OverlayRequest 
         },
         PipelineEvent::FocusLost(text) => platform::OverlayRequest::ShowPreview(text.clone()),
         PipelineEvent::StreamingText(_, _, _) => platform::OverlayRequest::Show, // macOS 侧流式文本暂不渲染
+        // LOCALRT-FIRSTCHAR-282: 本地流式收尾预览（macOS 侧流式文本暂不渲染，同 StreamingText）
+        PipelineEvent::StreamingFinalPreview(_) => platform::OverlayRequest::Show,
         PipelineEvent::Done | PipelineEvent::Cancelled => platform::OverlayRequest::Hide,
     }
 }
@@ -8680,6 +8777,13 @@ fn handle_pipeline_event(event: &PipelineEvent, ui_language: config::UiLanguage)
         PipelineEvent::StreamingText(_, text, _) => {
             // ASR-038-B: macOS 侧流式文本暂不渲染（C-overlay 批后续实现）
             log::debug!("macOS pipeline: StreamingText ({} chars)", text.len());
+        }
+        // LOCALRT-FIRSTCHAR-282: 本地流式收尾预览（macOS 侧流式文本暂不渲染）
+        PipelineEvent::StreamingFinalPreview(text) => {
+            log::debug!(
+                "macOS pipeline: StreamingFinalPreview ({} chars)",
+                text.len()
+            );
         }
     }
 }

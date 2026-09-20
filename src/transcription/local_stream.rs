@@ -73,6 +73,19 @@ const PUNCT_REFRESH_INTERVAL: Duration = Duration::from_millis(4000);
 /// sherpa endpoint 决定（说话中间换气不会被切句）。两者是不同层的东西，不要混用。
 const PUNCT_SILENCE_TRIGGER_MS: f32 = 800.0;
 
+/// LOCALRT-ENDPOINT-284（方案 B）：静默多久触发「影子收尾」——
+/// 另起一个 `OnlineStream` 把**当前句**音频喂进去 + `input_finished()`，拿完整结果，
+/// **只用于显示**（不 reset / 不切句 / 不动 `sentence_id`）；主 stream 完全不受影响。
+///
+/// 目的：Gavin 说完停顿 ~300-500ms 最后一个字就出现（不必等 rule2=2.0 的切句）。
+/// 默认 400ms，可经 env `LOCAL_RT_SHADOW_MS` 覆盖以实测选值。
+const SHADOW_FINALIZE_MS_DEFAULT: f32 = 400.0;
+
+/// LOCALRT-ENDPOINT-284（方案 B）安全上限：影子只收尾「当前句」，若当前句音频超过本值
+/// （说明长时间连续说话、rule2=2.0 一直没切句）则跳过本次影子，避免每停顿一次就重解一段
+/// 越来越长的音频（O(n²) 开销）。被跳过时打 warn 便于实测评估。
+const SHADOW_MAX_AUDIO_SECS: f32 = 12.0;
+
 /// LOCALRT-PUNCT-TIMER-269：预览标点的节流缓存。
 ///
 /// 只缓存**标点后的全量文本**与其对应的**原始字节长度**，不缓存原始文本本身
@@ -165,9 +178,22 @@ pub fn create_local_stream_recognizer(model_dir: &Path) -> Result<OnlineRecogniz
     c.decoding_method = Some("greedy_search".to_string());
     // 端点：不开则 is_endpoint() 永不触发，sentence_end 分支成死代码
     c.enable_endpoint = true;
+    // LOCALRT-ENDPOINT-284 实验（方案 A 取证）：rule2 可经 env `LOCAL_RT_RULE2` 临时覆盖，
+    // 默认仍 2.0（无 env 时行为零变）。用于实测 2.0/1.5/1.0/0.5 的切句后果；定案后移除。
+    let rule2 = std::env::var("LOCAL_RT_RULE2")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(LOCAL_STREAM_RULE2_MIN_TRAILING_SILENCE);
     c.rule1_min_trailing_silence = LOCAL_STREAM_RULE1_MIN_TRAILING_SILENCE;
-    c.rule2_min_trailing_silence = LOCAL_STREAM_RULE2_MIN_TRAILING_SILENCE;
+    c.rule2_min_trailing_silence = rule2;
     c.rule3_min_utterance_length = LOCAL_STREAM_RULE3_MIN_UTTERANCE_LENGTH;
+    log::debug!(
+        "[LocalRT-DBG-284] rule1={} rule2={} rule3={} (rule2 env LOCAL_RT_RULE2 override)",
+        LOCAL_STREAM_RULE1_MIN_TRAILING_SILENCE,
+        rule2,
+        LOCAL_STREAM_RULE3_MIN_UTTERANCE_LENGTH
+    );
 
     OnlineRecognizer::create(&c).context("创建本地流式 (paraformer) recognizer 失败")
 }
@@ -187,8 +213,9 @@ pub fn create_local_stream_recognizer(model_dir: &Path) -> Result<OnlineRecogniz
 /// - `on_result`：文本变化回调，传 `(display_text, display_words)`，与 qwen 路径同构
 ///
 /// # 返回
-/// `(final_text, pcm)`：
-/// - `final_text` = `StreamingAsrState::final_text()` = confirmed + current（ASR-070 不丢尾字）
+/// `(final_preview, pcm)`：
+/// - `final_preview` = 收尾时最终（含标点）预览全文（282：供调用方以 `StreamingFinalPreview`
+///   收尾显示；239-B 丢弃预览文本、以 `pcm` 走 accuracy 2pass，本值不参与最终文本）
 /// - `pcm` = 本次收到的全部音频（16kHz f32），供 2pass 离线纠错复用（≈64KB/s）
 ///
 /// 采用**返回值**而非出参传 PCM：2pass 的 PCM 是必需环节，出参漏传编译器抓不到。
@@ -210,6 +237,8 @@ pub fn transcribe_streaming_local(
     let mut state = StreamingAsrState::new();
     let mut sentence_id: i64 = 0;
     let mut last_display = String::new();
+    // LOCALRT-LASTCHAR-276 诊断用：上一次 get_result 的文本（只在变化时打日志，避免每帧刷屏）。
+    let mut last_result_text = String::new();
     let mut pcm: Vec<f32> = Vec::new();
     // LOCALRT-PUNCT-TIMER-269：预览标点节流缓存（只对裸文本打点，杜绝重复）。
     let mut punct_cache = PunctPreviewCache {
@@ -219,6 +248,25 @@ pub fn transcribe_streaming_local(
     };
     // LOCALRT-PUNCT-TIMER-269-B：连续静默累计（ms）。独立于 sherpa endpoint，只驱动显示层打点。
     let mut silent_ms: f32 = 0.0;
+
+    // LOCALRT-ENDPOINT-284（方案 B）：影子收尾（只动显示层）。
+    let shadow_trigger_ms: f32 = std::env::var("LOCAL_RT_SHADOW_MS")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(SHADOW_FINALIZE_MS_DEFAULT);
+    log::debug!(
+        "[LocalRT-DBG-284] shadow_trigger_ms={} (env LOCAL_RT_SHADOW_MS override)",
+        shadow_trigger_ms
+    );
+    // 当前句音频在 `pcm` 中的起点（上次 endpoint reset 之后）。
+    let mut sentence_pcm_start: usize = 0;
+    // 影子收尾产出的当前句文本（仅显示；新语音进来即作废）。
+    let mut shadow_current: Option<String> = None;
+    // 本轮静默是否已跑过影子（同一停顿不重复解码）。
+    let mut shadow_done_for_pause = false;
+    // 影子触发计数（284 实测触发频率用）。
+    let mut shadow_count: u32 = 0;
 
     // LOCALRT-FIRSTCHAR-272：首字延迟埋点（**永久观测**，对齐现有 `[Latency] … at +N.Nms` 风格）。
     // t0 = 本函数进入时刻（ASR 线程起跑），把首字延迟拆成三段：
@@ -268,6 +316,9 @@ pub fn transcribe_streaming_local(
             silent_ms += chunk_ms;
         } else {
             silent_ms = 0.0;
+            // LOCALRT-ENDPOINT-284：有新语音进来 → 允许本轮停顿结束后再触发影子。
+            // 不立即清 shadow_current：显示侧用「取更长者」避免瞬时缩短/闪烁（见下 base 选择）。
+            shadow_done_for_pause = false;
         }
 
         pcm.extend_from_slice(&chunk);
@@ -295,6 +346,19 @@ pub fn transcribe_streaming_local(
         let endpoint = recognizer.is_endpoint(&stream);
         if let Some(r) = recognizer.get_result(&stream) {
             if !r.text.is_empty() {
+                // LOCALRT-LASTCHAR-276：诊断——每次识别文本变化时打印（含 endpoint 与即将 reset），
+                // 用于判断「最后一个字是否在任何一帧 get_result 里出现过」。只在变化时打，有界。
+                // URGENT-286：整块（比较 + clone + 格式化）仅在 Debug 级启用时执行 ⇒ 默认 Warn 下零开销。
+                if log::log_enabled!(log::Level::Debug) && r.text != last_result_text {
+                    log::debug!(
+                        "[LocalRT-DBG-276] result='{}' (chars={}) endpoint={} will_reset={}",
+                        r.text,
+                        r.text.chars().count(),
+                        endpoint,
+                        endpoint
+                    );
+                    last_result_text = r.text.clone();
+                }
                 // LOCALRT-FIRSTCHAR-272：首次拿到非空识别文本（首次推理产出）。
                 if !first_result_seen {
                     first_result_seen = true;
@@ -309,20 +373,96 @@ pub fn transcribe_streaming_local(
                 // 杜绝「对已打点文本二次打点 / 标点重复」（FIX-252 场景）。
                 // endpoint=true → 该句确认进 confirmed；false → 替换当前句中间结果。
                 state.on_result(sentence_id, &r.text, endpoint, &[]);
+            } else if endpoint {
+                log::debug!(
+                    "[LocalRT-DBG-276] endpoint=true but result EMPTY (prev='{}')",
+                    last_result_text
+                );
             }
+        } else if endpoint {
+            log::debug!(
+                "[LocalRT-DBG-276] endpoint=true but get_result=None (prev='{}')",
+                last_result_text
+            );
         }
 
         if endpoint {
+            // LOCALRT-ENDPOINT-284 诊断（方案 A 取证）：每次切句打一行，行数=切句次数。
+            log::debug!(
+                "[LocalRT-DBG-284] endpoint fired: sentence_id {} -> {} (rule2 cut)",
+                sentence_id,
+                sentence_id + 1
+            );
             // 一句结束：reset 让下一句从空开始（sherpa 要求），句号与状态机同步递增。
             recognizer.reset(&stream);
             sentence_id += 1;
+            // 新句从当前总音频长度起算；作废影子。
+            sentence_pcm_start = pcm.len();
+            shadow_current = None;
+            shadow_done_for_pause = false;
+        }
+
+        // LOCALRT-ENDPOINT-284（方案 B）：静默 ≥ 阈值 → 影子 stream 收尾当前句（**只动显示**）。
+        // 影子 = 另起 OnlineStream 喂当前句音频 + input_finished()，拿完整结果；主 stream 不受影响。
+        let mut shadow_fired = false;
+        if silent_ms >= shadow_trigger_ms && !shadow_done_for_pause {
+            shadow_done_for_pause = true;
+            let shadow_audio = &pcm[sentence_pcm_start..];
+            let shadow_secs = shadow_audio.len() as f32 / SAMPLE_RATE as f32;
+            if !shadow_audio.is_empty() && shadow_secs > SHADOW_MAX_AUDIO_SECS {
+                log::debug!(
+                    "[LocalRT-DBG-284] shadow skipped: current sentence {:.1}s > cap {:.1}s (no endpoint yet)",
+                    shadow_secs,
+                    SHADOW_MAX_AUDIO_SECS
+                );
+            } else if !shadow_audio.is_empty() {
+                // URGENT-286：decode 计时只为日志用 ⇒ 仅 Debug 级才取样（默认 Warn 下零开销）。
+                let t_shadow = log::log_enabled!(log::Level::Debug).then(Instant::now);
+                let shadow = recognizer.create_stream();
+                shadow.accept_waveform(SAMPLE_RATE, shadow_audio);
+                shadow.input_finished();
+                while recognizer.is_ready(&shadow) {
+                    recognizer.decode(&shadow);
+                }
+                if let Some(r) = recognizer.get_result(&shadow) {
+                    if !r.text.is_empty() {
+                        shadow_current = Some(r.text);
+                    }
+                }
+                shadow_count += 1;
+                if let Some(t0) = t_shadow {
+                    log::debug!(
+                        "[LocalRT-DBG-284] shadow finalize #{}: silence={:.0}ms sentence_audio={:.2}s decode={:.1}ms text_len={}",
+                        shadow_count,
+                        silent_ms,
+                        shadow_audio.len() as f32 / SAMPLE_RATE as f32,
+                        t0.elapsed().as_secs_f64() * 1000.0,
+                        shadow_current
+                            .as_ref()
+                            .map(|s| s.chars().count())
+                            .unwrap_or(0)
+                    );
+                }
+                shadow_fired = true;
+            }
         }
 
         // LOCALRT-PUNCT-TIMER-269-B：显示刷新，两条件「或」——
         //   ① 距上次打点 ≥4s（preview_display 内判 due）
         //   ② 连续静默 ≥800ms（本处独立计数）且自上次打点后有新内容
         // 两条件都**只刷新显示**，不动状态机（不 reset / 不切句 / 不改 sentence_id）。
-        let raw_full = state.display_text();
+        // 显示基文本：影子收尾（confirmed + 影子当前句）与主 stream（confirmed + current）**取更长者**，
+        // 避免新语音进来后主文本还没追上时显示瞬时缩短/闪烁。
+        let main_view = state.display_text();
+        let shadow_view = shadow_current.as_ref().map(|sh| {
+            let mut s = state.confirmed_text();
+            s.push_str(sh);
+            s
+        });
+        let raw_full = match shadow_view {
+            Some(sv) if sv.len() > main_view.len() => sv,
+            _ => main_view,
+        };
         if !raw_full.is_empty() {
             let has_new =
                 punct_cache.last_punct_at.is_none() || raw_full.len() > punct_cache.raw_len;
@@ -332,7 +472,7 @@ pub fn transcribe_streaming_local(
                 punctuation_engine.as_deref_mut(),
                 &mut punct_cache,
                 PUNCT_REFRESH_INTERVAL,
-                silence_due,
+                shadow_fired || silence_due,
             );
             if silence_due {
                 // 打完重置静默计数；4s 计时由 preview_display 内的 last_punct_at 一并重置。
@@ -354,6 +494,15 @@ pub fn transcribe_streaming_local(
                         t_result_ms - t_ready_ms,
                         t_callback_ms - t_result_ms
                     );
+                    // RESEARCH-ACC-FIRSTCHAR-278 埋点（只读）：流式首字文本 + 到达时刻。
+                    // URGENT-286：降为 debug 级——默认 max_level=Warn 下连参数求值都跳过。
+                    // 参数 t_callback_ms/display 均为已有廉价值（且 t_callback_ms 被上方
+                    // [Latency] info! 复用），故无需再包 log_enabled! 守卫。
+                    log::debug!(
+                        "[LocalRT-DBG-278] local streaming first text @+{:.0}ms: {}",
+                        t_callback_ms,
+                        display
+                    );
                 }
                 on_result(&display, &state.display_words());
                 last_display = display;
@@ -366,6 +515,9 @@ pub fn transcribe_streaming_local(
     while recognizer.is_ready(&stream) {
         recognizer.decode(&stream);
     }
+    // LOCALRT-FIRSTCHAR-282：最终（含标点）预览全文；供调用方以 `StreamingFinalPreview` 收尾显示。
+    // （239-B 丢弃本预览文本、以 pcm 走 accuracy 2pass；此返回值只服务于收尾显示。）
+    let mut final_preview = last_display.clone();
     if let Some(r) = recognizer.get_result(&stream) {
         if !r.text.is_empty() {
             state.on_result(sentence_id, &r.text, false, &[]);
@@ -378,11 +530,14 @@ pub fn transcribe_streaming_local(
                 PUNCT_REFRESH_INTERVAL,
                 true,
             );
-            if !display.is_empty() && display != last_display {
-                on_result(&display, &state.display_words());
+            if !display.is_empty() {
+                if display != last_display {
+                    on_result(&display, &state.display_words());
+                }
+                final_preview = display;
             }
         }
     }
 
-    Ok((state.final_text(), pcm))
+    Ok((final_preview, pcm))
 }

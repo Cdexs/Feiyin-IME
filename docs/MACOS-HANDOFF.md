@@ -1769,3 +1769,67 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 255 流式上屏排版矩形右边界（GDI/D2D 两路径） | 🔴 **Windows-only**（`main.rs` 的 Win32/D2D 绘制）。macOS 浮层为独立实现（`src/platform/macos/overlay.rs`），**本修不影响 macOS**；若 macOS 浮层有同类滚动/右留白逻辑，需自行核对（属另一实现，不在本修范围） |
 | 256 `transcribe_streaming_local` 加 `punctuation_engine` 参数 | ✅ **平台中立**（`src/transcription/local_stream.rs`），两端编译同一份。macOS 若启用本地 realtime 预览，经同一调用点传入 `PunctuationEngine` 即可；`PunctuationEngine` 包装的 `sherpa_onnx::OfflinePunctuation` 已由上游 crate `unsafe impl Send` |
 | 标点仅作用于 overlay 预览 | ✅ 平台中立语义：最终文本仍由 accuracy 2pass 产出，两端一致 |
+
+## LOCALRT-PUNCT-TIMER-269（2026-09-20，coder-2）· 本地流式预览标点节流 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| `local_stream.rs` 预览标点改 ~4s 全量重打（新增 `preview_display` + `PunctPreviewCache`） | ✅ **平台中立**，两端编译同一份。macOS 若启用本地 realtime 预览，自动获得同一节流行为；`std::time::{Duration, Instant}` 两端可用，无平台分支 |
+| 状态机喂裸文本、标点只作用于显示 | ✅ 平台中立语义；杜绝重复打点的设计两端一致 |
+| 引擎 None（关标点）零开销、引擎由调用方传入 | ✅ 平台中立，与 Windows 一致 |
+
+## LOCALRT-PUNCT-TIMER-269-B（2026-09-20，coder-2）· 预览打点补静默 800ms 触发 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| `local_stream.rs` 新增独立静默计数（`RMS ≤ silence_threshold` 累计 800ms 触发显示层打点） | ✅ **平台中立**，两端编译同一份；无平台分支 |
+| `transcribe_streaming_local` 加 `silence_threshold` 参数 | ✅ 平台中立；macOS 调用路径（共用 `spawn_worker_thread`）同步补参 |
+| 静默触发只刷显示、不 reset/不切句 | ✅ 平台中立语义；切句仍由 sherpa endpoint（rule2）决定，两端一致 |
+
+## LOCALRT-FIRSTCHAR-272（2026-09-20，coder-2）· 首字延迟埋点 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| `local_stream.rs` 首字延迟埋点（`[Latency] local_stream …`，永久观测） | ✅ **平台中立**，两端编译同一份；macOS 若启用本地 realtime 预览自动获得同一观测能力 |
+| 不改解码参数 | ✅ 无行为变更，仅新增日志（首次触发一次/会话） |
+
+## LOCALRT-FIRSTCHAR-276 + FIX-OVERLAY-SCROLL-277（2026-09-20，coder-2）· 取证埋点 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| 276 `local_stream.rs` `[LocalRT-DBG-276]` 诊断日志（endpoint 尾字取证） | ✅ **平台中立**，两端编译同一份；仅日志，无行为变更 |
+| 277 `main.rs` D2D `[LocalRT-DBG-277]` 几何日志（右侧留白取证） | 🔴 **Windows-only**（Win32/D2D 绘制）；macOS 浮层为独立实现，无关 |
+
+## LOCALRT-FIRSTCHAR-281 + 282（2026-09-20，coder-2）· 右侧空白量宽修复 + 预览尾段专用通道 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| 281 D2D scroll 改用 DirectWrite 量宽（`dwrite_measure_width`） | 🔴 **Windows-only**（Win32/D2D 绘制）；macOS 浮层为独立实现，本修不影响 |
+| 282 `PipelineEvent::StreamingFinalPreview` 新变体（本地档专用） | ✅ **平台中立**语义；macOS `overlay_request_for_event` / `handle_pipeline_event` **已补 arm**（Show / debug 日志）。macOS 本地 realtime 若启用，行为与 Windows 一致 |
+| Stop 处理器本地档不切 `FallingToProcessing` | ✅ 平台中立（同一控制器代码）；macOS 走同一分支 |
+| `STREAMING_STOPPED` / `should_ignore_streaming_text` | ✅ **未改**（本单红线）；两端一致 |
+
+## FIX-LOCALRT-FIRSTCHAR-283（2026-09-20，coder-1）· pre_roll 残尾裁剪（方案 D）—— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| `audio/mod.rs` `record_streaming` 新增第 8 参 `trim_pre_roll_residual` + `trim_pre_roll_last_speech_segment()`（样本级能量 VAD：多语音段只留最后一段；单段/纯静音原样） | ✅ **平台中立**，两端编译同一份。`PRE_ROLL_MS=600` **未改**，只改「怎么用这 600ms」。**macOS 需同样在本地流式调用点传 `true`、在线流式传 `false`**（macOS 侧调用点在 `macos/` 模块，两端接线需同步） |
+| `main.rs` 两调用点：在线流式 `false`（行为不变）/ 本地流式 `true` | 🔴 **Windows 侧接线**；macOS 侧对应调用点须自行补同样布尔参数（否则编译不过——新增参数，编译器会报缺参） |
+| `[LocalRT-DBG-283]` 日志（裁剪前后样本数） | ✅ 平台中立 |
+
+## LOCALRT-ENDPOINT-284（2026-09-20，coder-2）· 停顿 300-500ms 影子收尾（方案 B）—— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| `local_stream.rs` 影子收尾（另起 `OnlineStream` + `input_finished()`，只用于显示） | ✅ **平台中立**，两端编译同一份；macOS 若启用本地 realtime 预览自动获得同一行为 |
+| `qwen_inference::StreamingAsrState::confirmed_text()` 新增只读方法 | ✅ 平台中立 additive；**在线档不使用**，无行为变更 |
+| `LOCAL_RT_SHADOW_MS` / `LOCAL_RT_RULE2` 环境变量（实验） | ✅ 平台中立；默认值（400ms / 2.0）下行为零变 |
+| 埋点 `[LocalRT-DBG-284]`（warn） | ✅ 平台中立 |
+
+## URGENT-286（2026-09-20，coder-2）· 诊断埋点降级 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| `main.rs`（277）/`local_stream.rs`（276/278/284）诊断由 `warn!`→`debug!`，并对重计算加 `log_enabled!` 守卫 | ✅ **平台中立**；仅日志级别与守卫，无功能/行为变更。macOS 带 `-debug` 同样可取全部数据 |
+| `audio/mod.rs`（278）`pre_roll_diag` 首行加 `log_enabled!(Debug)` 早返回守卫（coder-1） | ✅ **平台中立**；仅日志级别与守卫，无功能/行为变更。macOS 带 `-debug` 同样可取全部数据 |
+| `audio/mod.rs`（283）trim 日志 `warn!`→`debug!`（coder-1） | ✅ **平台中立**；`trim_pre_roll_last_speech_segment()` 生产逻辑**未动**，仅日志级别 |
