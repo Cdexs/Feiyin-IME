@@ -961,6 +961,38 @@ mod tests {
         assert_eq!(t.asr_online_max_sentence_silence(), 800);
     }
 
+    /// TEST-SYNC-229 G3: 两轴参数透传链不断 —— `Transcriber::new` 传入什么，
+    /// getter 就返回什么（防中途丢参 / 重新硬编码）。
+    /// 用非默认值（轴一 1234 ≠ 2000、轴二 true ≠ false）才能与「写死默认值」区分开；
+    /// 传默认值就算字段被丢弃、getter 直接返回默认常量也会假绿。
+    #[test]
+    fn transcriber_seg229_two_axis_passthrough_stores_exact_values() {
+        let model_dir = std::path::Path::new("nonexistent-model-dir-for-test");
+        let t = Transcriber::new(
+            model_dir,
+            false,
+            "auto".to_string(),
+            AsrModel::QwenAudioOnline,
+            None,
+            "sk-test-key",
+            "wss://inference.example.com",
+            "qwen-audio-3.0-asr-flash-streaming",
+            1234,
+            true,
+        )
+        .expect("QwenAudioOnline Transcriber::new should succeed without local models");
+        assert_eq!(
+            t.asr_online_max_sentence_silence(),
+            1234,
+            "轴一：传入 1234 必须原样返回（非默认 2000，可区分写死默认）"
+        );
+        assert_eq!(
+            t.asr_online_semantic_punctuation_enabled(),
+            true,
+            "轴二：传入 true 必须原样返回（默认 false，可区分写死默认）"
+        );
+    }
+
     /// ASR-038-B-006: QwenAudioOnline 模式 API Key 空 → bail
     #[test]
     fn transcriber_qwen_audio_online_empty_key_bails() {

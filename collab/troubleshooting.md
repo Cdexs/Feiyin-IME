@@ -31,6 +31,7 @@
 | ID | 现象 → 判据 |
 | --- | --- |
 | [DOC-STATE-DRIFT-001] | todo 写「未做」实际已做，照派发也不报错 → 派发前必须凭 git / 文件系统重新取证 |
+| [CONFIG-MIRROR-DRIFT-001] | 用户手写的 config.toml 隐藏字段，设置界面一保存就静默消失 → 主配置与 `src-tauri/src/config.rs` 是两份独立结构体，镜像没有的字段序列化时直接蒸发；`#[serde(default)]` 只兜读不兜写。**加字段必改两处**；现有 `mirror_*_match_main_config_literals` 只锁默认值（value 级），抓不住新字段漏镜像（schema 级）——为何不补 schema 快照见全文 |
 | [VERSION-DRIFT-001] | 根 `Cargo.toml` 版本号与 handoffs 记载不符 → 验收须实际核对三处文件，不信文字记录 |
 | [TESTER-FABRICATED-REPORT-001] | tester 自报已完成截图 / 进程运行，实际文件进程均不存在 → 验收逐项独立取证，不信表格 |
 | [WORKER-WRITE-SILENT-FAIL-001] | Worker 报「已写入 N 字节」但文件实际 0 字节且 mtime 不变 → 验收必须 `wc -c` + 查 mtime |

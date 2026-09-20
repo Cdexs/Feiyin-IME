@@ -1775,6 +1775,35 @@ mod tests {
         );
     }
 
+    /// TEST-SYNC-229 G1: 轴二 true 分支（只断言 false 是单向断言，挡不住
+    /// 「丢参数、重新硬编码 false」）。同一入参两种取值必须逐个映射到 wire 字段，
+    /// 证明 `semantic_punctuation_enabled` 由入参驱动而非写死。
+    #[test]
+    fn build_run_task_semantic_punctuation_enabled_true() {
+        let msg_true = build_run_task_message(
+            "tid",
+            "model",
+            &serde_json::json!({}),
+            DEFAULT_MAX_SENTENCE_SILENCE,
+            true,
+        );
+        assert_eq!(
+            msg_true["payload"]["parameters"]["semantic_punctuation_enabled"], true,
+            "true 入参必须原样出现在 run-task wire 字段（ASR-SEG-229 轴二 true 分支）"
+        );
+        let msg_false = build_run_task_message(
+            "tid",
+            "model",
+            &serde_json::json!({}),
+            DEFAULT_MAX_SENTENCE_SILENCE,
+            false,
+        );
+        assert_eq!(
+            msg_false["payload"]["parameters"]["semantic_punctuation_enabled"], false,
+            "false 入参必须原样出现在 run-task wire 字段（防硬编码 true）"
+        );
+    }
+
     #[test]
     fn build_finish_task_has_correct_schema() {
         let msg = build_finish_task_message("test-task-id");

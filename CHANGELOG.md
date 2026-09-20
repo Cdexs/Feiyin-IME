@@ -942,3 +942,14 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **230**：`Cargo.toml` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` 三处版本 `0.9.1 → 0.9.2`（Gavin 2026-09-20 授权）
 - **验证**：`cargo check` ×3 = 0 error（warnings 111 / 102 / 17 持平基线）；rustfmt 4 根文件 clean；定向测试全绿；未跑全量 `cargo test`、未出包、未 commit
 - **负责人**：coder-1 ｜ **日期**：2026-09-20
+
+## TEST-SYNC-229 · 2026-09-20 · ✅ 在线 ASR 两轴参数化阶段三交叉护栏（待验收）
+
+- **G1**：`build_run_task_message` 补轴二 `true` 分支 + `false` 对照（原只有单向 false 断言，挡不住「丢参数重硬编码」）
+- **G2**：轴二隐藏字段**主配置侧** `save→load` 往返（`TestEnv` 置 true）；镜像侧 coder-1 已写，主配置侧补缺口
+- **G3**：`Transcriber::new` 两轴入参 → getter 透传断言，用非默认值（1234/true）区分「写死默认」
+- **G4**：默认值 2000/false 五处核对全在场，未发现漏改；按指令未重复写默认值测试
+- **G5 撤单**：镜像字段集快照 = 跨独立编译单元的自快照，是「提醒」非真闸门（假闸门比没闸门更糟）；残余风险转 `[CONFIG-MIRROR-DRIFT-001]`（主控）
+- **约束**：生产零改动（纯追加 79 行，全在 `mod tests`，0 删除）；未触碰 src-tauri（天然规避 FMT-COLLATERAL-001）
+- **验证**：`rustfmt --check` 三文件 clean；`cargo check --all-targets` 0 error（warnings 111/102 持平基线）；🔴 未跑 `cargo test`（DEC-048，归阶段四）
+- **负责人**：coder-2 ｜ **日期**：2026-09-20

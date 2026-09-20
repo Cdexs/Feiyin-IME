@@ -1803,4 +1803,22 @@ clipboard_delay_ms = 150
             "hidden field must survive save→load roundtrip"
         );
     }
+
+    /// TEST-SYNC-229 G2: 轴二隐藏字段 asr_online_semantic_punctuation_enabled
+    /// 主配置侧 save→load 往返不丢。镜像侧 coder-1 已写同款 roundtrip，主配置侧此前是缺口
+    /// （038-A 同款：字段漏改/漏序列化会静默丢用户写入的 A/B 值）。
+    /// 用 true（默认 false 之外的值）才能与「写死默认」区分开。
+    #[test]
+    fn asr_229_config_hidden_field_semantic_punctuation_roundtrip_persists() {
+        let env = TestEnv::new();
+        let path = env.config_path();
+        let mut cfg = AppConfig::default();
+        cfg.audio.asr_online_semantic_punctuation_enabled = true;
+        cfg.save_to(&path).unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert_eq!(
+            loaded.audio.asr_online_semantic_punctuation_enabled, true,
+            "hidden field must survive save→load roundtrip (main config side, ASR-SEG-229 axis 2)"
+        );
+    }
 }
