@@ -5120,3 +5120,41 @@ if asr_model == Accuracy && vad::should_segment(samples) {
 翻 `DEC-030` 背景发现原文写着「两个本地模型的模型级 ITN 开关（`use_itn`/`itn:1`）
 **实际无效**，中文数字原样输出」——**该问题根本不存在**。
 ⇒ 涉及既有模块行为的判断，先按 ID 去 `decisions-archive.md` 搜全文，别凭代码里一个字段值推断行为。
+
+---
+
+## [ENUM-EQ-CHECK-MISSES-NEW-VARIANT-001] · 新增枚举变体后，`==` 相等比较全部漏改而编译器不报错
+
+**日期**：2026-09-20 ｜ **发现者**：Gavin 端测 ｜ **修复单**：`FIX-LOCALRT-ENGINE-EQ-252`
+
+**现象（两个表面看无关的 bug，同一根因）**：
+1. 输出文本标点重复：「呢？？」「之后，，会进入」
+2. 🔴 长段语音**直接无输出**，浮层报「请说话哦」
+
+**根因**：新增 `AsrModel::LocalRealtime` 档位，它**复用 accuracy 引擎**做最终转录，
+但 `src/transcription/mod.rs` 里三处 `== AsrModel::Accuracy` 的**相等比较**不认新变体：
+
+| 判据 | 漏改后果 |
+| --- | --- |
+| `native_punctuated` 仅 Accuracy 返 true | LocalRealtime 落 performance 分支返 false ⇒ 外部 CT-Transformer 与模型内标点**双重打点** ⇒ bug 1 |
+| 长音频 VAD 分段仅 Accuracy 触发 | LocalRealtime 不分段 ⇒ 整段喂 native 撞 `max_total_len=512` ⇒ 空输出 ⇒ bug 2（[ASR-LONG-AUDIO-001] 复发） |
+| VAD segmenter 仅 Accuracy 构建 | 即使分段判据修好，segmenter 仍是 None |
+
+外加 `main.rs:7071` `load_hotwords` 同族漏改 —— LocalRealtime 拿不到热词，
+使 2pass 后端的热词能力整体失效（PoC-B 实证 +17.5pp 全丢）。**该处任务书未列，由 coder-1 自行排查出**。
+
+**判据**：
+🔴 **新增枚举变体时，穷举 `match` 有编译器保护，`==` / `!=` 相等比较没有。**
+派单时只让 Worker 补 `match` arm 是不够的，**必须同时全仓 grep `== Enum::Variant` / `!= Enum::Variant`
+逐个判断新变体是否也该命中**。主控 2026-09-20 派 `239-A 阶段二` 时正是只列了穷举 match，漏了这类。
+
+**修法（不要散落写 `== A || == B`）**：在枚举上加语义化判定方法作**收敛点**：
+```rust
+pub fn uses_accuracy_engine(self) -> bool {
+    matches!(self, AsrModel::Accuracy | AsrModel::LocalRealtime)
+}
+```
+用 `matches!` 穷举形式，将来再加变体时容易审；所有判据点改为调用它。
+
+**同族**：`[CONFIG-MIRROR-DRIFT-001]`（加字段必改两处，编译器不管）——
+共同形态 = **「语言层面不报错、但语义上必须同步」的多点一致性**，只能靠 grep 清单兜。

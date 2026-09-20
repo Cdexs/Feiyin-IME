@@ -132,3 +132,4 @@
 | [ENCODING-FIX-001] | 配置里中文标题变乱码致断言失败 → 以 UTF-8 重存并重新构建覆盖旧 exe |
 | [MAC-011] / [MAC-012] / [ENV] / [ENV-002] | 本机装 Darwin target / cc 失败、cmake 找不到、Tauri 构建缺环境 → 环境记录，报告中须明确写「未验证 Darwin」不谎称已验证 |
 | [POC-BYPASSES-PROD-WRAPPER-001] | PoC 报出「产品级严重缺陷」（如 accuracy >28s 空输出）→ **先核对它调的是不是生产同一条代码路径**，不是核对数据。数据全真但路径不同 ⇒ 结论完全无效。同批教训：判断既有模块行为前先按 ID 搜 `decisions-archive.md` 全文（`use_itn`/`itn:1` 实际无效已载于 DEC-030 背景，主控却凭字段值推断出不存在的「双重 ITN」） |
+| [ENUM-EQ-CHECK-MISSES-NEW-VARIANT-001] | 新增枚举变体后出现两个看似无关的 bug（标点重复 + 长句无输出）→ 根因是 `== Enum::Variant` **相等比较**漏改，**编译器不报错**（只有穷举 `match` 有保护）。派单只补 match arm 不够，**必须全仓 grep `==`/`!=` 逐个判断**。修法：在枚举上加语义化判定方法作收敛点（`matches!` 穷举形式），禁散落写 `== A \|\| == B`。同族 [CONFIG-MIRROR-DRIFT-001] |
