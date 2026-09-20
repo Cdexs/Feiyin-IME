@@ -4707,3 +4707,22 @@ coder-1 已把 `words={}` 加进日志。**新包出来后 Gavin 跑一次 `-deb
 | --- | --- |
 | coder-1 的 result.md 缺「收尾自证表」 | 已退回补写（`[DOC-STATE-DRIFT-001]` 又复现，且这次漏的正是防它的那张表） |
 | MSYS git `add -f <ignored>` 偶发静默 no-op（coder-1 报） | 主控立 troubleshooting 条目 |
+### ✅ v0.9.1 批次已全部完成并出包（2026-09-17，销项于 09-20）
+
+`214` 句尾标点开关 ／ `215` 在线 ASR 跳主通道 ITN ／ `216`「那一刻」文法闸门 ／ `218` `[AUTOLEARN]` 日志
+／ `220` 闸门补繁中异形字 ／ `221` ITN 繁体影子串（**路线②已实施，非「待拍板」**）／ `222` 规则表 key 加载期归一
+／ `225` Key 标签+placeholder ／ `226`「API 配置」文案 ／ `217` 版本号三处 ／ `219` 出包核验八项清单成文。
+逐条取证见 `CHANGELOG.md` 的 `BUILD-228` 条目与 `handoffs-archive.md` 的 09-17 段（26 条）。
+**未销项的只剩 `ITN-FIX-LIANGDIAN-223`**（见下），它当时未进批。
+
+### ✅ v0.9.2 批次已全部完成并出包（2026-09-20）
+
+`ASR-SEG-229` 在线 ASR 两轴参数化（`asr_online_max_sentence_silence` 800→2000 ＋ 隐藏字段
+`asr_online_semantic_punctuation_enabled`）／ `VER-BUMP-230` 版本 0.9.1→0.9.2 ／ `TEST-SYNC-229` 三条交叉护栏
+／ `FIX-TESTENV-231` TestEnv 每实例唯一目录（治 `config::tests` 并行竞态）／ `TEST-EXEC-231` 回归全绿
+／ `BUILD-232` 出包八项核验逐项 PASS。取证见 `CHANGELOG.md` 与 `handoffs.md` 09-20 段。
+
+🔴 **只剩 Plan B 悬而未决**：若 Gavin 2×2 端测证明 L1（提阈值 ＋ 语义断句）治不住碎句，才启用
+L2「剥服务端句尾标点、整段交本地 CT-Transformer 重打」（PUNCT-GOVERNANCE-030 定源头优先）。
+另一未知风险只能靠端测暴露：语义模式下服务端若憋着批量发中间结果 → overlay 预览变顿。
+

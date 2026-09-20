@@ -35,6 +35,11 @@
 | `LOCAL-RT-ENGINE-239-A` 阶段二 | 枚举变体 + 构建分支 + `main.rs:8536` arm + 测试穷举 | ⏸ 待放行 | 等 238-B 释放 main.rs；前处理参数跟 **Accuracy** |
 | `LOCAL-RT-ENGINE-239-B` | 新管线独立编排 + Info 加载提示 | ⏸ 未派 | DEC-066 编排独立 + 附则一浮层单状态 |
 | `WORDBOOK-EDIT-LEARN-243` | 🆕 新管线编辑态提交后也要走词库自学习 | ⏸ 未派 | Gavin 2026-09-20；现有 `main.rs:6847` 仅在线流式路径有 `last_streaming_text` |
+| `LOCAL-RT-READY-246` | 🆕 **双模型就位检测**：现有 `check_accuracy_model_ready` 只查 accuracy 一个，新管线要**两个**（paraformer 流式 + accuracy）。未就位时 UI 卡片与运行时都要能正确判断 | ⏸ 未派 | 240 复用了 accuracy 的命令，是临时凑合 |
+| `LOCAL-RT-FALLBACK-247` | 🆕 **加载失败降级路径**：流式模型缺失/加载失败怎么办？accuracy 缺失怎么办？两个都失败怎么办？现有 accuracy 有「降级 performance」先例（`transcription/mod.rs:676-687`），新管线要定等价策略 | ⏸ 未派 | 编排待决第④项，一直挂着没解 |
+| `LOCAL-RT-RELOAD-248` | 🆕 **切档热重载**：从别的档切到 local_realtime 要触发双模型加载。`asr_cheap_reload_needed` 的触发键是否含新字段？切档 ~6s 的 Info 提示挂在这条链上 | ⏸ 未派 | 与 239-B 的 Info 提示同源，可合并 |
+| `LOCAL-RT-E2E-CHECKLIST-249` | 🆕 **端测清单成文**：overlay 是 Win32+D2D 原生绘制，`cargo test`/Vitest/Browser **一条都覆盖不到**（worker-guide §五）。必须列出要 Gavin 目视确认的项：流式预览逐字上屏／编辑态进入与提交／松键后「识别处理中」单状态／切档 Info 提示／双模型内存占用 | ⏸ 未派 | worker-guide 强制要求，漏了等于没验收 |
+| `MACOS-HANDOFF-250` | 🆕 **跨端交接文档**：`local_stream.rs` 用 sherpa-onnx 属**平台中立模块**，两端编译同一份代码 ⇒ CLAUDE.md 强制规则要求写入 `docs/MACOS-HANDOFF.md` | ⏸ 未派 | 「任一端开发+构建后必须评估对另一端影响」，不得沉默 |
 | `BUILD-244` | v0.9.3 出包 | ⏸ 未派 | 全部验收 + 回归绿后 |
 
 🔴 **贯穿约束（Gavin 2026-09-20 强调）**：**千万不能改坏现有管线**。
@@ -53,24 +58,7 @@
 | 背景取证 | `collab/research/local-streaming-asr-233-model-survey.md`（十二节）+ DEC-065 |
 
 
-### ✅ v0.9.1 批次已全部完成并出包（2026-09-17，销项于 09-20）
-
-`214` 句尾标点开关 ／ `215` 在线 ASR 跳主通道 ITN ／ `216`「那一刻」文法闸门 ／ `218` `[AUTOLEARN]` 日志
-／ `220` 闸门补繁中异形字 ／ `221` ITN 繁体影子串（**路线②已实施，非「待拍板」**）／ `222` 规则表 key 加载期归一
-／ `225` Key 标签+placeholder ／ `226`「API 配置」文案 ／ `217` 版本号三处 ／ `219` 出包核验八项清单成文。
-逐条取证见 `CHANGELOG.md` 的 `BUILD-228` 条目与 `handoffs-archive.md` 的 09-17 段（26 条）。
-**未销项的只剩 `ITN-FIX-LIANGDIAN-223`**（见下），它当时未进批。
-
-### ✅ v0.9.2 批次已全部完成并出包（2026-09-20）
-
-`ASR-SEG-229` 在线 ASR 两轴参数化（`asr_online_max_sentence_silence` 800→2000 ＋ 隐藏字段
-`asr_online_semantic_punctuation_enabled`）／ `VER-BUMP-230` 版本 0.9.1→0.9.2 ／ `TEST-SYNC-229` 三条交叉护栏
-／ `FIX-TESTENV-231` TestEnv 每实例唯一目录（治 `config::tests` 并行竞态）／ `TEST-EXEC-231` 回归全绿
-／ `BUILD-232` 出包八项核验逐项 PASS。取证见 `CHANGELOG.md` 与 `handoffs.md` 09-20 段。
-
-🔴 **只剩 Plan B 悬而未决**：若 Gavin 2×2 端测证明 L1（提阈值 ＋ 语义断句）治不住碎句，才启用
-L2「剥服务端句尾标点、整段交本地 CT-Transformer 重打」（PUNCT-GOVERNANCE-030 定源头优先）。
-另一未知风险只能靠端测暴露：语义模式下服务端若憋着批量发中间结果 → overlay 预览变顿。
+### ✅ v0.9.1 / v0.9.2 两批已出包并销项 → 全文见 `todo-archive.md` 末尾
 
 ### 🆕 ASR-DROP-234 · 冒烟日志逐帧 `[ASR-DROP]` WARN（`BUILD-232` 发现，主控定下批修）
 
