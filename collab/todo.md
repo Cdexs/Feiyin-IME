@@ -15,7 +15,7 @@
 | 端测待办 | ① **v0.9.2 两轴 2×2**（`asr_online_max_sentence_silence` 800/2000 × `asr_online_semantic_punctuation_enabled` false/true）🔴 须手改 `Publish/config.toml:29` 的 800 那一行 + **重启进程**（热重载不含二者）② v0.9.1 四项：overlay 编辑态剥尾标点 ／ Key 输入框 placeholder ／ 繁中 ITN（`三點半→3:30`）／「API 配置」新文案布局 |
 | Worker | ✅ 09-20 新 session 三 Worker 全部就绪（`commandgo/deepseek-v4.1-flash`），coder-1 / coder-2 / tester-1 均已 ACK |
 | 文档 | 09-20 已归档 handoffs 26 条（288 → 7 行）。DEC-064 两层结构；**新增条目必须 archive 与索引两边都写** |
-| 下一步 | 候选（三 Worker 空闲，等 Gavin 点单）：`ITN-FIX-LIANGDIAN-223`（待取证定位）、`ASR-DROP-233`（待取证定性）、`TRANS-LANG-UI-213`（纯前端，与前两者零重叠）、`TEST-SYNC-194`；`PROMPT-OPT-204` 仍缺 A/B 授权 |
+| 下一步 | 候选（三 Worker 空闲，等 Gavin 点单）：`ITN-FIX-LIANGDIAN-223`（待取证定位）、`ASR-DROP-234`（待取证定性）、`TRANS-LANG-UI-213`（纯前端，与前两者零重叠）、`TEST-SYNC-194`；`PROMPT-OPT-204` 仍缺 A/B 授权 |
 
 ---
 
@@ -40,7 +40,7 @@
 L2「剥服务端句尾标点、整段交本地 CT-Transformer 重打」（PUNCT-GOVERNANCE-030 定源头优先）。
 另一未知风险只能靠端测暴露：语义模式下服务端若憋着批量发中间结果 → overlay 预览变顿。
 
-### 🆕 ASR-DROP-233 · 冒烟日志逐帧 `[ASR-DROP]` WARN（`BUILD-232` 发现，主控定下批修）
+### 🆕 ASR-DROP-234 · 冒烟日志逐帧 `[ASR-DROP]` WARN（`BUILD-232` 发现，主控定下批修）
 
 | 项 | 内容 |
 | --- | --- |
