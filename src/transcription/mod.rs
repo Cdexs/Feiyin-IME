@@ -9,6 +9,7 @@ use crate::{config::ChineseScript, punctuation, text_normalizer};
 // Re-export SenseVoice config for convenience
 use sherpa_onnx::{OfflineFunASRNanoModelConfig, OfflineSenseVoiceModelConfig};
 
+pub mod local_stream;
 pub mod qwen_inference;
 mod vad;
 pub use vad::{
@@ -89,25 +90,41 @@ impl AsrModel {
 /// - Performance: 179MB CTC，OfflineSenseVoiceModelConfig，无 hotwords
 /// - Accuracy: 972MB native，OfflineFunASRNanoModelConfig，config 层 hotwords
 /// - QwenAudioOnline: 零本地 ASR 内存，DashScope Inference 协议（ASR-041-B）
-/// - 本地模式一次只加载一个模型；accuracy 不再预创建 CTC fallback
+/// - Performance/Accuracy: 本地一次只加载一个模型；accuracy 不再预创建 CTC fallback
+/// - 🔴 LOCAL-RT-ENGINE-239-A（DEC-067）例外：`LocalRealtime` 档位**同时常驻两个本地模型**
+///   （online streaming paraformer 做预览 + offline accuracy 做 2pass 最终文本/热词），
+///   有意打破「本地一次只加载一个模型」。该档位为极客档、默认隐藏（DEC-065）。
 /// - H1 temperature 0.1 为 accuracy 唯一幻觉缓解（2026-07-08 Gavin 拍板下调 0.3→0.1，RESEARCH-ASR-ACCURACY-002 证实越低越好）；异常检测链已删除
 ///
-/// SAFETY: sherpa_onnx::OfflineRecognizer 内含 *const C++ 指针（!Send），
-/// 但其 C++ 实现本身是线程安全的（create/decode/destroy 均可跨线程，
-/// 只需保证同一 recognizer 实例不被并发访问）。
+/// SAFETY: sherpa_onnx::OfflineRecognizer 与 sherpa_onnx::OnlineRecognizer 均内含
+/// *const C++ 指针（!Send），但其 C++ 实现本身是线程安全的（create/decode/destroy
+/// 均可跨线程，只需保证同一 recognizer 实例不被并发访问）。
 /// 此处 Transcriber 通过 channel 在后台构建线程与 worker 线程间转移，
 /// 转移期间无并发访问（构建完成后才发送，发送后构建线程不再触碰），
-/// 因此手动实现 Send 是安全的。
+/// 因此手动实现 Send 是安全的。两个 recognizer 用同一套规则包装，不引入新模式。
 pub struct Transcriber {
     mode: AsrMode,
     asr_language: String,
     asr_model: AsrModel,
     /// 本地 ASR recognizer（Performance/Accuracy 模式用；QwenAudioOnline 为 None）
     offline_recognizer: Option<sherpa_onnx::OfflineRecognizer>,
+    /// LOCAL-RT-ENGINE-239-A（DEC-067）：本地**流式** recognizer（streaming paraformer trilingual）。
+    ///
+    /// 仅 `LocalRealtime` 档位用；与 `offline_recognizer`（accuracy，2pass 最终文本 + 热词）
+    /// **并存常驻**，有意打破旧约束「本地模式一次只加载一个模型」（见结构体文档）。
+    ///
+    /// ⚠️ 阶段一：本单只落字段声明与 !Send 包装；构建接线与枚举变体见 239-A 第二阶段。
+    #[allow(dead_code)]
+    online_recognizer: Option<sherpa_onnx::OnlineRecognizer>,
     /// 当前注入的 hotwords 版本号（len + 内容哈希），用于感知词库变更
     hotwords_version: u64,
-    /// VAD 分段器（仅 accuracy 长音频用，懒加载）
-    /// 用 Mutex<Option> 因为 VAD 在首次长音频时才初始化
+    /// VAD 分段器（仅 accuracy 长音频用）。
+    ///
+    /// 🔴 修正（LOCAL-RT-ENGINE-239-A，原文误写「懒加载」）：该字段在 `Transcriber::new`
+    /// （见下方 `let vad_segmenter = if effective_model == AsrModel::Accuracy { ... }` 分支）
+    /// **随构造立即尝试初始化**，并非「首次长音频时才初始化」。
+    /// 用 `Mutex` 包住的原因：`VadSegmenter::segment` 需要 `&mut self`，而 `Transcriber`
+    /// 以共享引用被调用，故用内部可变性串行化。
     vad_segmenter: Option<Mutex<vad::VadSegmenter>>,
     /// 在线 ASR 配置（仅 QwenAudioOnline 模式用，ASR-041-B 改名通用）
     asr_online_api_key: String,
@@ -119,9 +136,10 @@ pub struct Transcriber {
     asr_online_semantic_punctuation_enabled: bool,
 }
 
-// SAFETY: Transcriber 持有的 OfflineRecognizer 内部为 *const C++ 指针。
+// SAFETY: Transcriber 持有的 OfflineRecognizer / OnlineRecognizer 内部均为 *const C++ 指针。
 // 跨线程转移时，发送方在 send 后不再访问该实例，接收方独占所有权，
 // 满足"单一时刻单线程访问"约束。sherpa-onnx C++ 层本身支持跨线程调用。
+// LOCAL-RT-ENGINE-239-A: online_recognizer 与 offline_recognizer 共用本条 SAFETY 论证。
 unsafe impl Send for Transcriber {}
 
 impl Transcriber {
@@ -167,6 +185,7 @@ impl Transcriber {
                 asr_language,
                 asr_model,
                 offline_recognizer: None,
+                online_recognizer: None,
                 hotwords_version: 0,
                 vad_segmenter: None,
                 asr_online_api_key: asr_online_api_key.to_string(),
@@ -194,6 +213,8 @@ impl Transcriber {
             asr_language,
             asr_model: effective_model,
             offline_recognizer: Some(offline_recognizer),
+            // LOCAL-RT-ENGINE-239-A 阶段一：流式 recognizer 尚未构建（枚举变体在二阶段落地）
+            online_recognizer: None,
             hotwords_version,
             vad_segmenter,
             asr_online_api_key: String::new(),
@@ -206,6 +227,14 @@ impl Transcriber {
 
     pub fn asr_model(&self) -> AsrModel {
         self.asr_model
+    }
+
+    /// LOCAL-RT-ENGINE-239-A（DEC-067）：取常驻的本地流式 recognizer（`LocalRealtime` 档位）。
+    ///
+    /// 阶段一仅落 getter（供 239-B 接线与二阶段构建分支使用）；当前所有档位均为 `None`。
+    #[allow(dead_code)]
+    pub fn online_recognizer(&self) -> Option<&sherpa_onnx::OnlineRecognizer> {
+        self.online_recognizer.as_ref()
     }
 
     /// ASR-038-B: 在线 ASR 的 Inference API 端点
