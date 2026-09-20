@@ -20,6 +20,18 @@
 ---
 
 ## 🔴 待做
+### 🔄 POC-LOCAL-STREAM-235 · 本地流式 ASR 可行性（已派 coder-1，2026-09-20）
+
+| 项 | 内容 |
+| --- | --- |
+| 选型 | 流式 `streaming-paraformer-trilingual-zh-cantonese-en`（下载 1.05GB／**部署仅 int8 228MB**）；2pass 后端 **accuracy**（Gavin 定，因其支持热词，+17.5pp） |
+| 出局 | zipformer-XL：tokens.txt **零英文 token**（2002 个全中文+字节兜底），预览会与最终文本打架 |
+| 要量七项 | 首字延迟／RTF（1·2·4线程）／文字跳动／2pass 后端等待（performance vs accuracy）／**在线侧 hotwords 是否生效**／🔴 **`OfflineRecognizerConfig.hotwords_file` 对 performance 是否生效**／`hr`+`lm_config` 可行性探查 |
+| 达标线 | RTF ≤ 0.3 且首字延迟 ≤ 600ms |
+| 🔴 待 PoC 后才编排 | Gavin 2026-09-20：本地 ASR Realtime 是**第四条管线**，需单独流程编排，**等 PoC 数据再写设计** |
+| 编排待决四项 | ① accuracy 内置 ITN(`itn:1`) 与主通道 `itn::normalize_numbers` **双重处理**如何解 ② 松键后 accuracy 要等 1–5s，须显式走 `FallingToProcessing`+`Processing` 两态（在线管线现不走）③ 双模型常驻 ≈1.6GB，须打破「本地一次只加载一个模型」约束（`transcription/mod.rs:92`）④ 流式/accuracy 任一加载失败的降级路径 |
+| 背景取证 | `collab/research/local-streaming-asr-233-model-survey.md`（十二节）+ DEC-065 |
+
 
 ### ✅ v0.9.1 批次已全部完成并出包（2026-09-17，销项于 09-20）
 
