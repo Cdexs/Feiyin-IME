@@ -1237,3 +1237,17 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - 源码：C++ 手搓 byte-level BPE（vocab.json+merges.txt+模拟正则）≠ tokenizer.json 管线。
 - 连带：生成饿死（context≤1024）**无 Truncating 日志**，「无 Truncating」判据不足。
 - **负责人**：coder-1 ｜ **日期**：2026-09-20
+
+## HOTWORDS-TOKEN-268 · 2026-09-20 · ✅ 热词预算改真实 token（保守系数 1.85）
+
+- `HOTWORDS_MAX_TOTAL_TOKENS=356`（1024−340−168−160）；`HOTWORDS_CPP_SAFETY_FACTOR=1.85`（实测最大比 1.66×1.1）；字符预算删除。
+- 计数用既有 `tokenizers` 依赖，惰性加载（Rust 429ms）+ 启动预热；加载失败退化字节上界。
+- 实装条数：2字75/3字54/4字常用71/4字生僻33/5字51；真实 20s 音频 5 组无溢出且输出完整。
+- **负责人**：coder-1 ｜ **日期**：2026-09-20
+
+## DEC-073 / DEC-074 并入 · 2026-09-20 · ✅ 文档
+
+- DEC-073：静默失效两级（一级有日志/二级全无日志）+ 修订 DEC-069；判据加「生成剩余空间」。
+- DEC-074：C++ 与 Rust tokenizer 在 CJK 不一致（比值 1.15–1.66），Rust 计数须乘保守系数 1.85。
+- 全文 `decisions-archive.md` + 索引 `decisions.md`。
+- **负责人**：coder-1 ｜ **日期**：2026-09-20

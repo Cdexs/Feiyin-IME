@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use crate::{config::ChineseScript, punctuation, text_normalizer};
 
@@ -184,6 +184,10 @@ impl Transcriber {
         asr_online_max_sentence_silence: i64,
         asr_online_semantic_punctuation_enabled: bool,
     ) -> Result<Self> {
+        // HOTWORDS-TOKEN-268: 启动时后台预热热词 tokenizer（~数百 ms），避免首次计 token
+        // 落在「按热键→开始录音」路径上被用户感知。
+        warm_hotwords_tokenizer();
+
         let mode = if enable_streaming {
             AsrMode::Streaming
         } else {
@@ -679,20 +683,82 @@ pub const HOTWORDS_MAX_ENTRIES: usize = 120;
 /// 超长的词条（candidates 整句）不灌入，避免膨胀 user_prompt。
 pub const HOTWORDS_MAX_ENTRY_CHARS: usize = 10;
 
-/// HOTWORDS-BUDGET-265：热词**总字符预算**（🔴 **含 `,` 分隔符**）。
+/// HOTWORDS-TOKEN-268：热词**总 token 预算**（**C++ 口径**，含 `,` 分隔符）。
 ///
-/// 算式（按最坏 20.4s 段，含 VAD padding；base 为估算）：
-/// `1024(max_total_len) − 340(20.4s 音频) − 24(prompt；system_prompt 已按 DEC-070 置空)`
-/// `− 500(热词 600 字符 ≈ 500 token) = 160 token 给生成`；
-/// 20s 段大约说 60–80 字 ⇒ 160 够用、仍有余量。
+/// 算式（全按 C++ `FunASRNanoTokenizer` 口径；最坏 20.4s 段含 VAD padding）：
+/// ```
+/// 1024(max_total_len)
+/// − 340(20.4s 段音频)
+/// − 168(模板 + user_prompt + 特殊 token；实测最小差值)
+/// − 160(生成预留)   ← 🔴 以前漏了这项，就是「生成饿死」的成因（DEC-069 第二级静默失效）
+/// = 356
+/// ```
+/// 160 生成预留依据：20s 段约说 60–80 字，留 160 有一倍余量。
+/// ⚠️ 生成预留缺失时**不报 Truncating**（输入没溢出，只是没空间生成）⇒ 只盯 Truncating 判不出。
 ///
-/// **为何取 600**：让 **4 字词也能装满 120 条**（4×120 + 119 逗号 = 599 ≤ 600）。
-/// 4 字是中文专名主流长度（公司名/产品名/技术术语），500 会把 4×120 截到 100 条；
-/// **5 字以上仍会被截断，属物理限制**。
+/// 物理上限：1024 已是 ModelScope 最大版本；`HOTWORDS_MAX_ENTRIES=120` 仅作**条数上限**，
+/// **token 预算硬约束先生效** ⇒ 长词按 token 成本自动截断（如 4 字词约装 66 条）。
+pub const HOTWORDS_MAX_TOTAL_TOKENS: usize = 356;
+
+/// HOTWORDS-TOKEN-268：Rust `tokenizers` 计数相对 C++ `FunASRNanoTokenizer` 的**保守系数**。
 ///
-/// 🔴 字符数必须含分隔符：`build_hotwords_string` 用逗号 join，120 条有 119 个逗号，
-/// 实际送进模型的是 join 后的串；只数词本身会低估约 20%，预算就白设了。
-pub const HOTWORDS_MAX_TOTAL_CHARS: usize = 600;
+/// C++ 自己读 `vocab.json`+`merges.txt` **手搓 byte-level BPE** + 模拟 pre_tokenizer 正则
+/// （`funasr-nano-tokenizer.cc`），与 `tokenizer.json` 完整管线在 CJK 上结果不同：
+/// 实测 C++/Rust 比值 = 2字 1.25 / 生僻4字 1.15 / **常用4字 1.66** / 3字 1.53 / 5字 1.40 /
+/// 6字 1.51 / 10字 1.17 / 中英混 1.48 ⇒ 取最大 1.66 × 1.1 ≈ 1.83 → 上取 **1.85**。
+/// 🔴 上游 tokenizer 实现变更须**重新标定**；这是保守上界（宁可少装词，不可低估溢出）。
+const HOTWORDS_CPP_SAFETY_FACTOR: f64 = 1.85;
+
+/// 惰性加载的 Qwen3 BPE tokenizer（仅计 token 用，加载一次）。
+static HOTWORDS_TOKENIZER: OnceLock<Option<tokenizers::Tokenizer>> = OnceLock::new();
+
+/// 取（必要时加载）tokenizer。路径按 DEC-011 exe 同级 models 推导。
+fn hotwords_tokenizer() -> &'static Option<tokenizers::Tokenizer> {
+    HOTWORDS_TOKENIZER.get_or_init(|| {
+        let p = model_dir()
+            .join("sherpa-onnx-funasr-nano-int8-2025-12-30")
+            .join("Qwen3-0.6B")
+            .join("tokenizer.json");
+        let t = std::time::Instant::now();
+        match tokenizers::Tokenizer::from_file(&p) {
+            Ok(tk) => {
+                log::info!(
+                    "HOTWORDS-TOKEN-268: tokenizer loaded in {:?} ({})",
+                    t.elapsed(),
+                    p.display()
+                );
+                Some(tk)
+            }
+            Err(e) => {
+                log::warn!(
+                    "HOTWORDS-TOKEN-268: tokenizer load failed ({}): {}；将退化为字节上界",
+                    p.display(),
+                    e
+                );
+                None
+            }
+        }
+    })
+}
+
+/// HOTWORDS-TOKEN-268：启动时预热 tokenizer，避免 ~数百 ms 加载落在「按热键→开始录音」路径上。
+pub fn warm_hotwords_tokenizer() {
+    std::thread::spawn(|| {
+        let _ = hotwords_tokenizer();
+    });
+}
+
+/// 单条词在 **C++ 口径**下的保守 token 估算（Rust 计数 × 系数；tokenizer 不可用则用 UTF-8 字节数上界）。
+fn estimate_word_tokens(tk: Option<&tokenizers::Tokenizer>, word: &str) -> usize {
+    match tk {
+        Some(t) => match t.encode(word, false) {
+            Ok(enc) => ((enc.get_ids().len() as f64) * HOTWORDS_CPP_SAFETY_FACTOR).ceil() as usize,
+            // byte-level BPE 下 token ≤ byte，字节数是安全的粗上界
+            Err(_) => word.len(),
+        },
+        None => word.len(),
+    }
+}
 
 /// ASR-ACC-OPT-001 方案 A：判定词条是否为纯 ASCII（纯英文/数字）。
 /// 纯 ASCII 词条（worker1/tester1/todo 等无关词）带偏 native decoder，
@@ -707,17 +773,25 @@ fn is_pure_ascii(s: &str) -> bool {
 /// 1. 空/纯空白词条过滤
 /// 2. 纯 ASCII 词条过滤（英文/数字如 worker1/tester1/todo）
 /// 3. 超长词条过滤（> HOTWORDS_MAX_ENTRY_CHARS，candidates 整句不灌入）
-/// 4. 数量上限 HOTWORDS_MAX_ENTRIES + **总字符预算 HOTWORDS_MAX_TOTAL_CHARS（含分隔符）**，
+/// 4. 数量上限 HOTWORDS_MAX_ENTRIES + **总 token 预算 HOTWORDS_MAX_TOTAL_TOKENS（C++ 口径，含分隔符）**，
 ///    按入参顺序（调用方已按 hit_count DESC, id DESC 排序）截断保留高优先级词条
 ///
 /// 调用方（main.rs load_hotwords_for_accuracy）已按 hit_count DESC, id DESC 排序，
 /// 截断后保留高频/最近词条，确定性顺序保证 hotwords 版本号哈希稳定。
 pub fn curate_hotwords_entries(entries: &[String]) -> Vec<String> {
+    curate_hotwords_entries_with(entries, hotwords_tokenizer().as_ref())
+}
+
+/// 可注入 tokenizer 的内核（单测用真实 tokenizer 时传 Some，验证回退时传 None）。
+fn curate_hotwords_entries_with(
+    entries: &[String],
+    tk: Option<&tokenizers::Tokenizer>,
+) -> Vec<String> {
     let mut result: Vec<String> = Vec::new();
-    // HOTWORDS-BUDGET-265: 累加总字符（含 `,` 分隔符），超预算即 **break**（不是 continue）。
+    // HOTWORDS-TOKEN-268: 累加 C++ 口径 token 估算（含 `,`），超预算即 **break**（不是 continue）。
     // 入参已按 hit_count DESC,id DESC 排序 ⇒ 前面的就是更该进的；break 保持「优先级高的先占额度」，
     // continue 会跳过长词去塞短词、把高频长词挤掉，与频次排序初衷相反。
-    let mut total_chars = 0usize;
+    let mut est_tokens = 0usize;
     for word in entries {
         let trimmed = word.trim();
         if trimmed.is_empty() {
@@ -726,17 +800,16 @@ pub fn curate_hotwords_entries(entries: &[String]) -> Vec<String> {
         if is_pure_ascii(trimmed) {
             continue;
         }
-        let wlen = trimmed.chars().count();
-        if wlen > HOTWORDS_MAX_ENTRY_CHARS {
+        if trimmed.chars().count() > HOTWORDS_MAX_ENTRY_CHARS {
             // 单条超长属「过滤」不是「预算不足」，用 continue（不占预算，也不阻断后续短词）
             continue;
         }
         // +1 = 逗号分隔符（首条无前导逗号）
-        let add = wlen + if result.is_empty() { 0 } else { 1 };
-        if total_chars + add > HOTWORDS_MAX_TOTAL_CHARS {
+        let add = estimate_word_tokens(tk, trimmed) + if result.is_empty() { 0 } else { 1 };
+        if est_tokens + add > HOTWORDS_MAX_TOTAL_TOKENS {
             break;
         }
-        total_chars += add;
+        est_tokens += add;
         result.push(trimmed.to_string());
         if result.len() >= HOTWORDS_MAX_ENTRIES {
             break;
@@ -1307,97 +1380,150 @@ mod tests {
         assert_eq!(build_hotwords_string(&entries), "派");
     }
 
-    /// HOTWORDS-BUDGET-265：120 条**短词（2 字）**应全部进入（Gavin 要的效果）。
-    /// 2 字 ×120 + 119 逗号 = 359 ≤ 500 ⇒ 字符预算不触发，条数上限 120 恰好容纳。
-    #[test]
-    fn curate_keeps_all_120_short_words() {
-        let entries: Vec<String> = (0..120)
-            .map(|i| {
-                let c = char::from_u32(0x4E00 + i).unwrap();
-                format!("{}{}", c, c)
-            })
-            .collect();
-        let curated = curate_hotwords_entries(&entries);
-        assert_eq!(curated.len(), 120, "120 条 2 字短词应全部进入");
-        let joined = curated.join(",");
-        assert_eq!(joined.chars().count(), 359, "2 字×120 + 119 逗号 = 359");
+    // ---- HOTWORDS-TOKEN-268: token 预算测试（用真实 tokenizer；不可用则跳过）----
+
+    fn test_tokenizer() -> Option<tokenizers::Tokenizer> {
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("models")
+            .join("sherpa-onnx-funasr-nano-int8-2025-12-30")
+            .join("Qwen3-0.6B")
+            .join("tokenizer.json");
+        let t = std::time::Instant::now();
+        let tk = tokenizers::Tokenizer::from_file(&p).ok();
+        if tk.is_some() {
+            eprintln!("268: Rust tokenizers load = {:?}", t.elapsed());
+        }
+        tk
     }
 
-    /// HOTWORDS-BUDGET-265（600 裁定）：**4 字词 ×120 = 599 字符应全部进入**（中文专名主流长度）。
+    fn est_of(tk: Option<&tokenizers::Tokenizer>, ws: &[String]) -> usize {
+        let mut t = 0usize;
+        for (i, w) in ws.iter().enumerate() {
+            t += estimate_word_tokens(tk, w.trim()) + if i > 0 { 1 } else { 0 };
+        }
+        t
+    }
+
+    fn two_char_common(n: usize) -> Vec<String> {
+        let pool: Vec<char> =
+            "的一是不了人我在有他这中大来上国个到说们为子和你地出道也时年得就那要下以生会自着去"
+                .chars()
+                .collect();
+        (0..n)
+            .map(|i| format!("{}{}", pool[i % pool.len()], pool[(i * 3 + 1) % pool.len()]))
+            .collect()
+    }
+
+    /// 268：预算不变式——截断结果必须 ≤ 356，且**再加一条必然超**（即极大致）。
+    fn assert_budget_maximal(tk: Option<&tokenizers::Tokenizer>, entries: &[String]) {
+        let kept = curate_hotwords_entries_with(entries, tk);
+        assert!(kept.len() <= entries.len());
+        assert!(
+            est_of(tk, &kept) <= HOTWORDS_MAX_TOTAL_TOKENS,
+            "kept 必须 ≤ 356，实得 {}",
+            est_of(tk, &kept)
+        );
+        if kept.len() < entries.len() {
+            let mut more = kept.clone();
+            more.push(entries[kept.len()].clone());
+            assert!(
+                est_of(tk, &more) > HOTWORDS_MAX_TOTAL_TOKENS,
+                "未达极大：再加 1 条仍 ≤ 356"
+            );
+        }
+    }
+
     #[test]
-    fn curate_keeps_all_120_four_char_words() {
+    fn curate_two_char_120_report_and_budget() {
+        let Some(tk) = test_tokenizer() else {
+            return;
+        };
+        let entries = two_char_common(120);
+        let kept = curate_hotwords_entries_with(&entries, Some(&tk));
+        eprintln!(
+            "268: 2 字×120 实装 {} 条（est={}）",
+            kept.len(),
+            est_of(Some(&tk), &kept)
+        );
+        assert_budget_maximal(Some(&tk), &entries);
+    }
+
+    #[test]
+    fn curate_common_4char_truncated_by_token_budget() {
+        let Some(tk) = test_tokenizer() else {
+            return;
+        };
+        let pool: Vec<char> = "北京上海深圳杭州成都武汉西安南京广州苏州天津重庆长沙青岛厦门中科华夏东方南方长城智能网络数据电子信息集团研究院机器人医疗健康".chars().collect();
+        let entries: Vec<String> = (0..120)
+            .map(|i| {
+                format!(
+                    "{}{}{}{}",
+                    pool[(4 * i) % pool.len()],
+                    pool[(4 * i + 1) % pool.len()],
+                    pool[(4 * i + 2) % pool.len()],
+                    pool[(4 * i + 3) % pool.len()]
+                )
+            })
+            .collect();
+        let kept = curate_hotwords_entries_with(&entries, Some(&tk));
+        eprintln!(
+            "268: 常用 4 字×120 实装 {} 条（est={}）",
+            kept.len(),
+            est_of(Some(&tk), &kept)
+        );
+        assert!(kept.len() < 120, "4 字词应被 token 预算截断（<120）");
+        assert_budget_maximal(Some(&tk), &entries);
+    }
+
+    #[test]
+    fn curate_rare_4char_truncated_by_token_budget() {
+        let Some(tk) = test_tokenizer() else {
+            return;
+        };
         let entries: Vec<String> = (0..120)
             .map(|i| {
                 let c = char::from_u32(0x4E00 + i).unwrap();
                 format!("{}{}{}{}", c, c, c, c)
             })
             .collect();
-        let curated = curate_hotwords_entries(&entries);
-        assert_eq!(curated.len(), 120, "4 字×120 应全部进入");
-        assert_eq!(
-            curated.join(",").chars().count(),
-            599,
-            "4×120 + 119 逗号 = 599"
-        );
+        assert_budget_maximal(Some(&tk), &entries);
     }
 
-    /// HOTWORDS-BUDGET-265（600 裁定）：120 条 **10 字长词** 应被字符预算截断（不溢出）。
-    /// 累加：10 + 11×(n−1) ≤ 600 ⇒ n=54（593 字符），第 55 条 604 > 600 触发 break。
     #[test]
-    fn curate_truncates_120_long_words_by_total_chars() {
-        let entries: Vec<String> = (0..120)
-            .map(|_| "一二三四五六七八九十".to_string())
-            .collect();
-        let curated = curate_hotwords_entries(&entries);
-        let joined = curated.join(",");
-        assert_eq!(curated.len(), 54, "10 字×120 应被 600 字符预算截到 54 条");
-        assert_eq!(joined.chars().count(), 593);
-        assert!(
-            joined.chars().count() <= HOTWORDS_MAX_TOTAL_CHARS,
-            "join 后总字符不得超预算"
-        );
+    fn curate_token_budget_boundary() {
+        let Some(tk) = test_tokenizer() else {
+            return;
+        };
+        // 用单字常用词，逐条推近 356，验证正好保留 / 再加一条丢弃
+        let entries: Vec<String> = (0..200).map(|_| "的".to_string()).collect();
+        let kept = curate_hotwords_entries_with(&entries, Some(&tk));
+        let est = est_of(Some(&tk), &kept);
+        assert!(est <= HOTWORDS_MAX_TOTAL_TOKENS, "est={}", est);
+        let mut more = kept.clone();
+        more.push("的".to_string());
+        assert!(est_of(Some(&tk), &more) > HOTWORDS_MAX_TOTAL_TOKENS);
     }
 
-    /// HOTWORDS-BUDGET-265 边界：**正好 600 字符**（含逗号）应全部保留。
-    /// 59×9 字 + 1×10 字：字和 541 + 59 逗号 = 600。
     #[test]
-    fn curate_total_chars_boundary_exact_600_kept() {
-        let mut entries: Vec<String> = (0..59).map(|_| "一二三四五六七八九".to_string()).collect();
-        entries.push("一二三四五六七八九十".to_string()); // 第 60 条，10 字
-        let curated = curate_hotwords_entries(&entries);
-        let joined = curated.join(",");
-        assert_eq!(joined.chars().count(), 600, "正好 600 字符应全保留");
-        assert_eq!(curated.len(), 60);
-    }
-
-    /// HOTWORDS-BUDGET-265 边界：再加 1 条会使总字符达 **601** ⇒ 该条被 break 丢弃。
-    /// 60×9 字 = 599 字符；追加 1 字词 → 599+2 = 601 > 600 ⇒ 丢。
-    #[test]
-    fn curate_total_chars_boundary_over_600_dropped() {
-        let mut entries: Vec<String> = (0..60).map(|_| "一二三四五六七八九".to_string()).collect();
-        entries.push("甲".to_string()); // 会使 599 → 601
-        let curated = curate_hotwords_entries(&entries);
-        let joined = curated.join(",");
-        assert_eq!(joined.chars().count(), 599, "越界条被丢弃，保持 599");
-        assert_eq!(curated.len(), 60);
-        assert!(!curated.iter().any(|w| w == "甲"), "越界词不得进入");
+    fn curate_fallback_without_tokenizer_uses_byte_bound() {
+        // tokenizer 不可用 → 用 UTF-8 字节数（安全粗上界）：字节和 ≤ 356
+        let entries: Vec<String> = std::iter::repeat("北京".to_string()).take(200).collect();
+        let kept = curate_hotwords_entries_with(&entries, None);
+        let mut bytes = 0usize;
+        for (i, w) in kept.iter().enumerate() {
+            bytes += w.len() + if i > 0 { 1 } else { 0 };
+        }
+        assert!(bytes <= HOTWORDS_MAX_TOTAL_TOKENS, "bytes={}", bytes);
+        assert!(!kept.is_empty());
     }
 
     #[test]
     fn curate_enforces_max_entries_limit() {
-        // 150 条 2 字词（曲线：2 + 3×149 = 449 ≤ 500 ⇒ 字符预算不触发，条数上限生效）
-        let entries: Vec<String> = (0..150)
-            .map(|i| {
-                let c = char::from_u32(0x4E00 + (i % 200)).unwrap();
-                format!("{}{}", c, c)
-            })
-            .collect();
-        let s = build_hotwords_string(&entries);
-        let count = s.split(',').count();
-        assert_eq!(
-            count, HOTWORDS_MAX_ENTRIES,
-            "must cap at HOTWORDS_MAX_ENTRIES"
-        );
+        // 150 条 1 字词：token 预算先生效（条目上限 120 仅作上限）
+        let entries: Vec<String> = (0..150).map(|_| "的".to_string()).collect();
+        let kept = curate_hotwords_entries(&entries);
+        assert!(kept.len() <= HOTWORDS_MAX_ENTRIES);
+        assert!(!kept.is_empty());
     }
 
     #[test]
@@ -1511,25 +1637,14 @@ mod tests {
 
     #[test]
     fn curate_enforces_max_entries_order() {
-        let entries: Vec<String> = (0..150)
-            .map(|i| {
-                let c = char::from_u32(0x4E00 + i).unwrap();
-                format!("{}{}", c, c)
-            })
-            .collect();
+        // 268：token 预算先生效，条数上限 120 仅作上限；截断必须保持入参顺序（前缀）
+        let entries = two_char_common(200);
         let curated = curate_hotwords_entries(&entries);
-        assert_eq!(curated.len(), HOTWORDS_MAX_ENTRIES);
-        for i in 0..20 {
-            assert_eq!(
-                curated[i], entries[i],
-                "entry {} must be at position {}",
-                i, i
-            );
+        assert!(curated.len() <= HOTWORDS_MAX_ENTRIES);
+        assert!(!curated.is_empty());
+        for (i, w) in curated.iter().enumerate() {
+            assert_eq!(w, &entries[i], "entry {} 顺序必须与入参一致（前缀）", i);
         }
-        assert!(
-            !curated.contains(&"词20".to_string()),
-            "21st entry must be truncated"
-        );
     }
 
     // ============================================================

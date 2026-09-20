@@ -379,3 +379,18 @@
 - **连带发现**：4 字常用×120 before=653 → 20s 段 context 991≤1024 无 Truncating 但只剩 33 token 生成 ⇒ **生成饿死无日志**，验证判据须加「生成未饿死」；且 120×4 字与 1024 预算冲突。
 - **建议**：首选 Rust 复刻 C++ 分词；否则按 C++ 真计数重定预算/降目标。**待主控裁定**，出包后实施。
 - **红线**：零生产改动；未动版本；零凭证。
+
+## 2026-09-20 — coder-1 — HOTWORDS-TOKEN-268 ✅ 交付（token 预算 + 保守系数）
+
+- **改动 1 文件** `src/transcription/mod.rs`：`HOTWORDS_MAX_TOTAL_TOKENS=356`；`HOTWORDS_CPP_SAFETY_FACTOR=1.85`（实测 C++/Rust 比 1.15–1.66，最大×1.1）；`HOTWORDS_MAX_TOTAL_CHARS` 删除；`curate_hotwords_entries_with` 用 tokenizers 真实编码×系数、超 356 break；tokenizer 惰性加载 + 启动预热（Rust 加载 429.1ms）；加载失败退化 UTF-8 字节上界。
+- **实装条数**：2字 75 / 3字 54 / 4字常用 71 / 4字生僻 33 / 5字 51（系数保守，2字也未达 120）。
+- **验证**：单测（预算不变式/极大/边界/回退/顺序）全 PASS；真实 20s 音频 5 组生产参数下无 Truncating/Falling back、输出完整末句有标点；cargo check 0 error（110/101 基线）；rustfmt clean。
+- **待裁定**：若需更多词可改按词长分档系数。
+- **红线**：未动版本；备份未动；零凭证。
+
+## 2026-09-20 — coder-1 — DEC-073 / DEC-074 并入 ✅（纯文档）
+
+- **DEC-073**：静默失效两级（一级输入溢出有日志 `Truncating`/`Falling back`；二级输入没溢出但生成空间被挤干、**完全无日志**）⇒ 判据须同时看截断日志与生成剩余空间；**修订 DEC-069**（archive 069 节末加指向行）。证据：4字常用×120 context=991≤1024 无日志但生成仅 33 token。
+- **DEC-074**：C++ 手搓 byte-level BPE + 模拟 pre_tokenizer 正则 ≠ tokenizer.json（CJK），比值 1.15–1.66 随内容变 ⇒ Rust 计数乘保守系数 1.85，上游变更重标定。
+- **落档**：全文 archive + 索引 decisions.md；logs/CHANGELOG 同步。
+- **红线**：纯文档；未碰生产代码；未动版本；零凭证。

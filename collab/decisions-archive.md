@@ -2589,6 +2589,9 @@ DEC-065（极客档 / Ctrl+M 解锁 / 否决 Docker 形态）、DEC-066（编排
 
 **证据**：259 任务一原始日志；259-B 缺口①（N=20×10 字 → context 553 → 空）。
 
+> 🔴 **修订（HOTWORDS-TOKEN-268，见 DEC-073）**：本条只覆盖**一级**静默失效（输入溢出，有日志）。
+> 还有**二级**——输入未溢出、但生成空间被挤干，**完全无日志**。判据须同时看「截断日志」与「生成剩余空间」。
+
 ## DEC-070 · `system_prompt` 对 FunASR Nano native 完全不被遵循
 
 **背景**：259 任务四主张「改 system_prompt 可去口头禅」，因素材无口头禅被作废；261 用含语气词/重复/自我纠正的口语素材重测。
@@ -2634,3 +2637,43 @@ A(空)/B(英文现状)/C(259 中文)/D2(短强指令) 输出**本质逐字相同
 **未解决热词字符预算本身**（DEC-071 仍须做，只是不再被迫砍热词）。
 
 **证据**：`ACC-KV-1024-260` 验证 + `ACC-KV-1024-SWAP-262` 生产替换（两副本、`.512.bak` 保留、一处一验）。
+
+## DEC-073 · 静默失效有两级：一级有日志，二级完全无日志（修订 DEC-069）
+
+**背景**：DEC-069 把「撞 KV 顶」定性为静默降级，但只覆盖了**输入溢出**这一级（日志里有
+`Truncating` / `Falling back`）。`HOTWORDS-TOKEN-268` 追踪时发现更隐蔽的第二级。
+
+**决策**：静默失效分两级，判据必须**同时**看两件事：
+- **一级（输入溢出）**：`context_len > max_total_len` → 上游打印 `Truncating audio placeholders`
+  或 `prompts already exceed capacity. Falling back to keep last 512 tokens` → **有日志**。
+- **二级（生成被挤干）**：`context_len ≤ max_total_len`，**无任何日志**，但
+  `1024 − context_len` 的生成空间不足 ⇒ 长句被截断或（极端）空输出。
+- ⇒ **判据 = 看日志有无截断 + 算生成剩余空间 `max_total_len − context_len` 是否够用**。只看前者漏一半。
+
+**原因**：生成 token 与输入共享同一 KV 预算（DEC-068）；`valid_len=context_len` 起算、每生成 1 token `+1`，
+`>= max_seq_len` 即 break。输入没超 ≠ 有空间生成。
+
+**影响**：所有热词/长音频预算校验、回归自证、端测判据都须加「生成未饿死」一维
+（例：真实 20s 音频确认输出完整、末句有标点）。
+
+**证据**：`HOTWORDS-TOKEN-268` 追踪——4 字常用×120：`context=991 ≤ 1024` **不触发任何日志**，
+但生成只剩 `1024 − 991 = 33 token`。（同批 `curate` 预算改为显式扣 160 生成预留。）
+
+## DEC-074 · C++ `FunASRNanoTokenizer` 与 `tokenizer.json` 在 CJK 上不一致 ⇒ Rust 计数必须乘保守系数
+
+**背景**：`HOTWORDS-TOKEN-268` 评估：拟用 Rust `tokenizers`（`tokenizer.json`）计热词 token 做预算。
+但实测两边对同一 CJK 串给出的 token 数不同。
+
+**决策**：**不可把 Rust `tokenizers` 的计数当真值**；用它时必须乘**保守系数**
+（现 `HOTWORDS_CPP_SAFETY_FACTOR = 1.85` = 实测最大比值 1.66 × 1.1）；
+🔴 **上游 tokenizer 实现变更时须重新标定**。
+
+**原因**：C++ `funasr-nano-tokenizer.cc` 自己读 `vocab.json` + `merges.txt`，**手搓 byte-level BPE**
+并「模拟 `tokenizer.json` 的 pre_tokenizer 正则（刻意不用 std::regex）」；与 `tokenizer.json` 完整管线
+在 CJK 上结果不同。实测 C++/Rust 比值随内容变化：2字 1.25 / 生僻4字 1.15 / **常用4字 1.66** /
+3字 1.53 / 5字 1.40 / 6字 1.51 / 10字 1.17 / 中英混 1.48。
+
+**影响**：热词 token 预算须按「Rust 计数 × 保守系数」比较；系数取**最大比值**（宁少装不高估，判据①）。
+若改用其他分词实现，须先与 C++ 实测比对。
+
+**证据**：`HOTWORDS-TOKEN-268` 评估 + 追踪（8 组比值；`before=` 构成判别）。
