@@ -105,3 +105,12 @@
 - **文案**：zh-Hans「本地流式实时模型」/ zh-Hant「本地串流即時模型」/ en「Local Streaming Realtime」。zh-Hant:29 既有漂移未动。
 - **验证**：`npm run build` 通过；`cargo check --all-targets` 0 error（111/102 基线）；src-tauri 0 error（17 基线）；main config rustfmt clean（src-tauri config 既有漂移 :4/:11/:512 非本单）；三 locale grep 齐全。
 - **红线**：未碰 src/main.rs / ASR 引擎 / transcription；未动版本；未 commit；零凭证。
+
+## 2026-09-20 — tester-1 — TEST-EXEC-241 238+240 合并回归 ✅（只跑现有用例，FAIL 0）
+
+- **结果**：`cargo test` root **1266P/0F/15I**（11 target，EXIT 0）；`src-tauri` **77P/0F/0I**；`npm run test` **7 files / 100P/0F/11S**（111，EXIT 0）。三项与基线**逐位吻合** ⇒ 238「行为逐位不变」经现有用例坐实、240（config 双写 + ui）无回归。
+- **target 计数**：11 vs 任务书基线「10」= `89fe69a`（18:12）新增 `poc_local_stream` bin（0 用例），P/F/I 不受影响。
+- **已知遗留未复现**：`TEST-FIX-002/003`（App mock / Wordbook dialog）本批 0 failed——照实报，未改测试期望值。
+- **按令不做**：新增用例 / harness / 消融 / 脚本；browser/E2E 与出包 SKIP（无视觉布局改动 / 未收出包令）。
+- **证据**：`collab/outbox/tester-1/testexec241/`（cargo_test_root.log / cargo_test_tauri.log / npm_test.log）。
+- **红线**：未改生产代码与测试期望值 / 未 commit / 未出包 / 版本未动 / 零凭证。

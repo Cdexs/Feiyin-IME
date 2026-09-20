@@ -1011,3 +1011,10 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **验证**：`cargo check --all-targets` 0 error、warnings 111/102=基线；`rustfmt --check src/main.rs` clean；未跑 cargo test（归 tester-1 全量回归）。
 - **已知**：`--numstat`(90/57) 与 `--numstat -w`(88/55) 差 2/2，根因为新增调用点 `final_text,`/`);` 行在 -w 下巧合匹配被删 log 行，属 extract method 固有，非 fmt 连带。
 - **负责人**：coder-2 ｜ **日期**：2026-09-20
+
+## TEST-EXEC-241 · 2026-09-20 · ✅ 238 + 240 合并回归（只跑现有用例，FAIL 0）
+
+- **范围**：PIPELINE-ORCH-238（`src/main.rs` N5/N9 提取）+ LOCAL-RT-UI-240（config 双写 + `ui/`）+ i18n 文案；工作区 clean。
+- **结果**：`cargo test` root **1266P/0F/15I**（EXIT 0）；`src-tauri` **77P/0F/0I**；`npm run test` **100P/0F/11S**（7 files，EXIT 0）。三项与基线逐位吻合 ⇒ 238「行为逐位不变」经现有 1343 用例坐实，240 无回归。
+- **备注**：target 数 11（基线写 10）因 `89fe69a` 新增 `poc_local_stream` bin（0 用例），不影响判据；`TEST-FIX-002/003` 已知遗留本批未复现。
+- **负责人**：tester-1 ｜ **日期**：2026-09-20
