@@ -8751,12 +8751,6 @@ fn run_pipeline_core(
                     let send_window_title = config.scene.send_window_title;
                     // TRANS-008 B方案: translate=true 时走 LLM optimize+translate；translate=false 走 LLM optimize
                     // translate=false 閺冭绱濋崢鐔告箒 LLM optimize 鐠侯垰绶炴稉宥呭綁
-                    let mut llm_handled = false;
-                    // FORMAT-LLM-001-CORE (DEC-031): set when LLM formatting call
-                    // failed. Raw text still gets injected (fallback), but we
-                    // surface a brief "formatting failed" overlay hint after
-                    // injection so the user knows to check LLM config.
-                    let mut format_failed = false;
                     let translate_requested = translate.load(Ordering::Acquire);
                     // TRANS-BIDIR-001: 翻译方向由内容自动判定，不再由 config.translation.target_language 门控。
                     // target_language 字段保留仅为「上次使用方向缓存」（启动时据此预载引擎）。
@@ -8769,145 +8763,27 @@ fn run_pipeline_core(
                             config.translation.target_language
                         );
                     }
-                    let final_text = if translate_requested
-                        && config.translation.enabled
-                        && !raw_text.trim().is_empty()
-                    {
-                        let processing_msg = i18n::get(config.ui_language).overlay_processing;
-                        send_event(
-                            event_tx,
-                            PipelineEvent::Processing(processing_msg.to_string()),
-                        );
-                        // REFACTOR-SHARE-TRANSDIR-001: function moved to translation/mod.rs (platform-neutral)
-                        let effective_engine: Option<&translation::TranslationEngine> =
-                            translation::ensure_translation_direction(
-                                cached_translation,
-                                &model_dir,
-                                derived_target,
-                            );
-                        let script_instruction = text_normalizer::script_instruction_for_translate(
-                            &raw_text,
-                            config.audio.chinese_script,
-                        );
-                        // TRANS-SAFE-196: 三条子路径（LLM 成功 / LLM 失败转 NLLB / LLM 不合格直接
-                        // 走 NLLB，后两者各自还带 normalize_text_for_language 兜底）先汇合到
-                        // translated_out，再由下方统一做格式安全裁决 —— 一处覆盖全部子路径，
-                        // 避免逐路径打补丁时漏掉其中一条。
-                        let translated_out = if should_try_llm_translate(
-                            config.llm.enabled,
-                            config.llm.connectivity_verified,
-                        ) {
-                            // B: LLM optimization failed (non-critical), continue with raw result
-                            match rt.block_on(llm_client.optimize_and_translate(
-                                &pre_llm_text,
-                                derived_target,
-                                script_instruction,
-                                config.punctuation.enabled,
-                                // TRANS-SCENE-197: 这两个参数此前没传 —— scene_context / send_window_title
-                                // 就在同作用域（:8717/:8718）且主路径 optimize 一直在用，翻译路径漏传，
-                                // 导致场景风格（含 VERBOSE-195 冗余压缩）与用户基座一开翻译就全部失效。
-                                Some(&scene_context),
-                                send_window_title,
-                                multiline_safe,
-                            )) {
-                                Ok(result) => {
-                                    log::info!("LLM optimize+translate done: {}", result.text);
-                                    learn_llm_suggestions(&result.suggestions, runtime_config);
-                                    llm_handled = true;
-                                    result.text
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "LLM optimize+translate failed, trying offline: {}",
-                                        e
-                                    );
-                                    try_nllb_translate(&pre_llm_text, effective_engine)
-                                        .unwrap_or_else(|| {
-                                            text_normalizer::normalize_text_for_language(
-                                                &pre_llm_text,
-                                                config.audio.chinese_script,
-                                            )
-                                        })
-                                }
-                            }
-                        } else {
-                            // LLM not eligible, use offline engine directly
-                            try_nllb_translate(&pre_llm_text, effective_engine).unwrap_or_else(
-                                || {
-                                    text_normalizer::normalize_text_for_language(
-                                        &pre_llm_text,
-                                        config.audio.chinese_script,
-                                    )
-                                },
-                            )
-                        };
-                        // TRANS-SAFE-196 格式安全裁决 —— 补齐翻译路径此前完全缺失的 multiline_safe 保护。
-                        // 主路径在 llm::try_once 内做同款裁决，翻译路径走 try_once_raw 直接返回，
-                        // 整个绕过（llm/mod.rs 内「注：translate 路径不通过 try_once……不受影响」即指此）。
-                        // 后果：multiline_safe=false 的终端 / vim 等，翻译产生的多行结果换行原样注入，
-                        // 在模态编辑器里会被当命令键执行（scene-rules.toml 对 vim/gvim 的注释已警示该风险）。
-                        //
-                        // 🔴 只照搬 flatten 分支，刻意不照搬主路径 multiline_safe=true 那侧的
-                        // strip_fabricated_email_lines：该守卫用 input_contains_line 拿「输出行」去
-                        // 「输入原文」做字面包含匹配，翻译场景输入输出跨语言 ⇒ 字面永不匹配 ⇒ 判定条件
-                        // 恒真 ⇒ 用户真说了的称呼反被当成 LLM 编造删掉。与 llm/mod.rs 既有判例
-                        // 「判据 B 不扩展到翻译路径（英译中可合法大幅压缩，15% 会误伤）」同源。
-                        if multiline_safe {
-                            translated_out.trim().to_string()
-                        } else {
-                            llm::flatten_multiline(&translated_out)
-                        }
-                    } else if config.llm.enabled && !raw_text.trim().is_empty() {
-                        let processing_msg = i18n::get(config.ui_language).overlay_processing;
-                        send_event(
-                            event_tx,
-                            PipelineEvent::Processing(processing_msg.to_string()),
-                        );
-                        let script_instruction = text_normalizer::script_instruction(
-                            &raw_text,
-                            config.audio.chinese_script,
-                        );
-                        let llm_result = rt.block_on(llm_client.optimize(
-                            &pre_llm_text,
-                            script_instruction,
-                            config.punctuation.enabled,
-                            Some(&scene_context),
-                            multiline_safe,
-                            send_window_title,
-                        ));
-                        match llm_result {
-                            Ok(result) => {
-                                log::info!("LLM optimized: {}", result.text);
-                                learn_llm_suggestions(&result.suggestions, runtime_config);
-                                llm_handled = true;
-                                // FMT-LLM-005: LLM 成功路径用 normalize_script_only（仅简繁，不动大小写）。
-                                // LLM 输出大小写是正确意图（如"Dear Mr. Wang,"），fix_asr_english_case 会打回小写破坏。
-                                text_normalizer::normalize_script_only(
-                                    &result.text,
-                                    config.audio.chinese_script,
-                                )
-                            }
-                            Err(e) => {
-                                log::warn!("LLM optimization error: {}", e);
-                                format_failed = true;
-                                // ITN-V2-001 (R1)：兜底用主通道产物（已含数字转换），
-                                // 与 DEC-035 之前行为一致（属改进）。
-                                text_normalizer::normalize_text_for_language(
-                                    &pre_llm_text,
-                                    config.audio.chinese_script,
-                                )
-                            }
-                        }
-                    } else {
-                        // LLM optimization skipped
-                        log::info!(
-                            "LLM disabled or text empty, using transcription result directly"
-                        );
-                        text_normalizer::normalize_text_for_language(
-                            &pre_llm_text,
-                            config.audio.chinese_script,
-                        )
-                    };
+                    // PIPELINE-ORCH-238-B: N6 全量块（初始化 + 两条 Processing 事件 +
+                    // learn_llm_suggestions）已抽为 run_llm_stage（行为逐位不变，时序保持）。
+                    let llm_out = run_llm_stage(
+                        rt,
+                        llm_client,
+                        config,
+                        runtime_config,
+                        event_tx,
+                        &raw_text,
+                        &pre_llm_text,
+                        &scene_context,
+                        multiline_safe,
+                        send_window_title,
+                        translate_requested,
+                        derived_target,
+                        cached_translation,
+                        &model_dir,
+                    );
+                    let final_text = llm_out.text;
+                    let llm_handled = llm_out.llm_handled;
+                    let format_failed = llm_out.format_failed;
                     // REFACTOR-SHARE-TRANSDIR-001: persist via AppConfig method (platform-neutral)
                     // + runtime lock/save (Windows runtime concern, inline here in cfg(windows) run_pipeline)
                     if translate_requested
@@ -9035,6 +8911,165 @@ fn run_pipeline_core(
                 }
             }
         }
+    }
+}
+
+/// PIPELINE-ORCH-238-B: N6 LLM 格式化 / 翻译整段（原 run_pipeline_core 内联块）。
+/// 含 llm_handled / format_failed 初始化 + 翻译分支 + LLM optimize 分支 + LLM 跳过分支；
+/// 两处 send_event(Processing) 与 learn_llm_suggestions 原样保留在函数内，事件时序不变。
+struct LlmStageOutput {
+    text: String,
+    llm_handled: bool,
+    format_failed: bool,
+}
+
+/// 执行 LLM 格式化 / 翻译阶段，返回文本与两条状态位。
+#[allow(clippy::too_many_arguments)]
+fn run_llm_stage(
+    rt: &tokio::runtime::Runtime,
+    llm_client: &llm::LlmClient,
+    config: &AppConfig,
+    runtime_config: &Arc<RwLock<AppConfig>>,
+    event_tx: &crossbeam_channel::Sender<PipelineEvent>,
+    raw_text: &str,
+    pre_llm_text: &str,
+    scene_context: &scene::SceneContext,
+    multiline_safe: bool,
+    send_window_title: bool,
+    translate_requested: bool,
+    derived_target: config::TranslationLanguage,
+    cached_translation: &mut Option<(config::TranslationLanguage, translation::TranslationEngine)>,
+    model_dir: &Path,
+) -> LlmStageOutput {
+    let mut llm_handled = false;
+    // FORMAT-LLM-001-CORE (DEC-031): set when LLM formatting call
+    // failed. Raw text still gets injected (fallback), but we
+    // surface a brief "formatting failed" overlay hint after
+    // injection so the user knows to check LLM config.
+    let mut format_failed = false;
+    let text = if translate_requested && config.translation.enabled && !raw_text.trim().is_empty() {
+        let processing_msg = i18n::get(config.ui_language).overlay_processing;
+        send_event(
+            event_tx,
+            PipelineEvent::Processing(processing_msg.to_string()),
+        );
+        // REFACTOR-SHARE-TRANSDIR-001: function moved to translation/mod.rs (platform-neutral)
+        let effective_engine: Option<&translation::TranslationEngine> =
+            translation::ensure_translation_direction(
+                cached_translation,
+                &model_dir,
+                derived_target,
+            );
+        let script_instruction = text_normalizer::script_instruction_for_translate(
+            &raw_text,
+            config.audio.chinese_script,
+        );
+        // TRANS-SAFE-196: 三条子路径（LLM 成功 / LLM 失败转 NLLB / LLM 不合格直接
+        // 走 NLLB，后两者各自还带 normalize_text_for_language 兜底）先汇合到
+        // translated_out，再由下方统一做格式安全裁决 —— 一处覆盖全部子路径，
+        // 避免逐路径打补丁时漏掉其中一条。
+        let translated_out =
+            if should_try_llm_translate(config.llm.enabled, config.llm.connectivity_verified) {
+                // B: LLM optimization failed (non-critical), continue with raw result
+                match rt.block_on(llm_client.optimize_and_translate(
+                    &pre_llm_text,
+                    derived_target,
+                    script_instruction,
+                    config.punctuation.enabled,
+                    // TRANS-SCENE-197: 这两个参数此前没传 —— scene_context / send_window_title
+                    // 就在同作用域（:8717/:8718）且主路径 optimize 一直在用，翻译路径漏传，
+                    // 导致场景风格（含 VERBOSE-195 冗余压缩）与用户基座一开翻译就全部失效。
+                    Some(&scene_context),
+                    send_window_title,
+                    multiline_safe,
+                )) {
+                    Ok(result) => {
+                        log::info!("LLM optimize+translate done: {}", result.text);
+                        learn_llm_suggestions(&result.suggestions, runtime_config);
+                        llm_handled = true;
+                        result.text
+                    }
+                    Err(e) => {
+                        log::warn!("LLM optimize+translate failed, trying offline: {}", e);
+                        try_nllb_translate(&pre_llm_text, effective_engine).unwrap_or_else(|| {
+                            text_normalizer::normalize_text_for_language(
+                                &pre_llm_text,
+                                config.audio.chinese_script,
+                            )
+                        })
+                    }
+                }
+            } else {
+                // LLM not eligible, use offline engine directly
+                try_nllb_translate(&pre_llm_text, effective_engine).unwrap_or_else(|| {
+                    text_normalizer::normalize_text_for_language(
+                        &pre_llm_text,
+                        config.audio.chinese_script,
+                    )
+                })
+            };
+        // TRANS-SAFE-196 格式安全裁决 —— 补齐翻译路径此前完全缺失的 multiline_safe 保护。
+        // 主路径在 llm::try_once 内做同款裁决，翻译路径走 try_once_raw 直接返回，
+        // 整个绕过（llm/mod.rs 内「注：translate 路径不通过 try_once……不受影响」即指此）。
+        // 后果：multiline_safe=false 的终端 / vim 等，翻译产生的多行结果换行原样注入，
+        // 在模态编辑器里会被当命令键执行（scene-rules.toml 对 vim/gvim 的注释已警示该风险）。
+        //
+        // 🔴 只照搬 flatten 分支，刻意不照搬主路径 multiline_safe=true 那侧的
+        // strip_fabricated_email_lines：该守卫用 input_contains_line 拿「输出行」去
+        // 「输入原文」做字面包含匹配，翻译场景输入输出跨语言 ⇒ 字面永不匹配 ⇒ 判定条件
+        // 恒真 ⇒ 用户真说了的称呼反被当成 LLM 编造删掉。与 llm/mod.rs 既有判例
+        // 「判据 B 不扩展到翻译路径（英译中可合法大幅压缩，15% 会误伤）」同源。
+        if multiline_safe {
+            translated_out.trim().to_string()
+        } else {
+            llm::flatten_multiline(&translated_out)
+        }
+    } else if config.llm.enabled && !raw_text.trim().is_empty() {
+        let processing_msg = i18n::get(config.ui_language).overlay_processing;
+        send_event(
+            event_tx,
+            PipelineEvent::Processing(processing_msg.to_string()),
+        );
+        let script_instruction =
+            text_normalizer::script_instruction(&raw_text, config.audio.chinese_script);
+        let llm_result = rt.block_on(llm_client.optimize(
+            &pre_llm_text,
+            script_instruction,
+            config.punctuation.enabled,
+            Some(&scene_context),
+            multiline_safe,
+            send_window_title,
+        ));
+        match llm_result {
+            Ok(result) => {
+                log::info!("LLM optimized: {}", result.text);
+                learn_llm_suggestions(&result.suggestions, runtime_config);
+                llm_handled = true;
+                // FMT-LLM-005: LLM 成功路径用 normalize_script_only（仅简繁，不动大小写）。
+                // LLM 输出大小写是正确意图（如"Dear Mr. Wang,"），fix_asr_english_case 会打回小写破坏。
+                text_normalizer::normalize_script_only(&result.text, config.audio.chinese_script)
+            }
+            Err(e) => {
+                log::warn!("LLM optimization error: {}", e);
+                format_failed = true;
+                // ITN-V2-001 (R1)：兜底用主通道产物（已含数字转换），
+                // 与 DEC-035 之前行为一致（属改进）。
+                text_normalizer::normalize_text_for_language(
+                    &pre_llm_text,
+                    config.audio.chinese_script,
+                )
+            }
+        }
+    } else {
+        // LLM optimization skipped
+        log::info!("LLM disabled or text empty, using transcription result directly");
+        text_normalizer::normalize_text_for_language(&pre_llm_text, config.audio.chinese_script)
+    };
+
+    LlmStageOutput {
+        text,
+        llm_handled,
+        format_failed,
     }
 }
 /// SCENE-SENSE-001-CORE (DEC-031-⑤): 录音完成阶段采集前台窗口场景信号，
