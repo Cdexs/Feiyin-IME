@@ -131,3 +131,4 @@
 | [UI-001] | `Llm.tsx` 里被加了 `system_prompt` 输入框 → 该入口已随 PROMPT-BASE-207 整体移除，提示词现为内置常量 |
 | [ENCODING-FIX-001] | 配置里中文标题变乱码致断言失败 → 以 UTF-8 重存并重新构建覆盖旧 exe |
 | [MAC-011] / [MAC-012] / [ENV] / [ENV-002] | 本机装 Darwin target / cc 失败、cmake 找不到、Tauri 构建缺环境 → 环境记录，报告中须明确写「未验证 Darwin」不谎称已验证 |
+| [POC-BYPASSES-PROD-WRAPPER-001] | PoC 报出「产品级严重缺陷」（如 accuracy >28s 空输出）→ **先核对它调的是不是生产同一条代码路径**，不是核对数据。数据全真但路径不同 ⇒ 结论完全无效。同批教训：判断既有模块行为前先按 ID 搜 `decisions-archive.md` 全文（`use_itn`/`itn:1` 实际无效已载于 DEC-030 背景，主控却凭字段值推断出不存在的「双重 ITN」） |

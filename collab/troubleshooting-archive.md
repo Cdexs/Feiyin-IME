@@ -5082,3 +5082,41 @@ panic `os error 3 系统找不到指定的路径`（`save_to` 的 unwrap）。
 **同族**：`[E2E-CONFIG-PATH-STALE-001]`（harness 写错路径伪装成产品回归）——
 共同形态是 **测试基础设施缺陷伪装成产品缺陷 / 伪装成新增用例写错**。
 收到「新加的用例红了」先问：**单独跑绿不绿？换 --test-threads=1 绿不绿？红的用例每次一样吗？**
+
+---
+
+## [POC-BYPASSES-PROD-WRAPPER-001] · PoC 绕过生产封装，得出错误的「产品缺陷」结论
+
+**日期**：2026-09-20 ｜ **发现者**：Gavin 质疑「这么严重的问题也不可能出现」
+
+**现象**：`POC-LOCAL-STREAM-235` 实测报告显示 accuracy 模型对 36.08s 音频**空输出**，
+原始报错 `Context_len (624) exceeds KV capacity (512)`。主控据此宣布
+「accuracy 做 2pass 后端这条路实测否决」，并把它写进给 Gavin 的结论。
+
+**真相**：这是 PoC 的产物，不是产品缺陷。PoC 直接调 `sherpa_onnx::OfflineRecognizer`，
+**绕过了我们自己的 `Transcriber` 封装**。生产路径 `src/transcription/mod.rs:374-423` 有三重保障：
+
+```
+if asr_model == Accuracy && vad::should_segment(samples) {
+    ① silero VAD 分段（SEGMENT_MAX_SECS = 20）
+    ② VAD 锁 poisoned  → 降级 naive_chunk 20s 等分
+    ③ VAD 模型缺失     → 同样降级 naive_chunk
+}
+```
+注释原文即「**保证 accuracy 长音频在 VAD 模型缺失时仍可用（禁止 >28s 整段喂 native）**」。
+这是 `[ASR-LONG-AUDIO-001]` 早已修复、DEC-026 定案的问题，**生产永远走不到 28s 那条路**。
+
+**判据**：
+🔴 **PoC 报出「产品级严重缺陷」时，第一件事是核对它调的是不是生产同一条代码路径**，
+而不是核对数据对不对。数据可以完全真实，路径不同结论就完全无效。
+主控当时只做了数据核对（数字与日志一致 ✓），没做**路径核对**，
+`worker-guide` §八 验收第 1 条「Read 涉及文件，确认改动与报告一致」被理解成只查数据，
+实际必须同时确认「测的路径 == 生产路径」。
+
+**同族**：`[PLAUSIBLE-FIX-NOT-ACTUAL-CAUSE-001]`（因果链看着顺就下结论，缺同场景对照）。
+本条是它的镜像：**看着顺的「否决」证据同样需要同场景对照**才能成立。
+
+**附带教训（同日同批）**：主控还曾判定「accuracy 内置 ITN 会与主通道 ITN 双重处理」，
+翻 `DEC-030` 背景发现原文写着「两个本地模型的模型级 ITN 开关（`use_itn`/`itn:1`）
+**实际无效**，中文数字原样输出」——**该问题根本不存在**。
+⇒ 涉及既有模块行为的判断，先按 ID 去 `decisions-archive.md` 搜全文，别凭代码里一个字段值推断行为。
