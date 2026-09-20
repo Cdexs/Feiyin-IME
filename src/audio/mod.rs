@@ -285,6 +285,7 @@ impl AudioCapture {
         collect_recording(
             &warm.rx,
             &warm.stream_failed,
+            &warm.dropped_chunks,
             stop_signal,
             silence_threshold,
             silence_duration_ms,
@@ -451,6 +452,10 @@ impl AudioCapture {
         // 主循环：从 channel 读 chunk → 重采样 → 推回调 → RMS 检测
         // 🔴 RMS 静音检测、level_buf 继续用原始 chunk（未重采样），与 record() 一致。
         let recv_timeout = Duration::from_millis(50);
+        // FIX-ASR-DROP-288：消费端只在录音期存在 ⇒ 本节流上报即「录音期丢包」专用。
+        // 全局累计计数在此取基线快照，差值才是本次录音真实丢包。
+        let drop_baseline = warm.dropped_chunks.load(Ordering::Relaxed);
+        let mut last_drop_report_ms = proc_now_ms();
         loop {
             if stop_signal.load(Ordering::Relaxed) {
                 log::info!("Streaming recording: stop signal received");
@@ -507,6 +512,14 @@ impl AudioCapture {
                 break;
             }
 
+            // 非实时线程的节流上报（≤1 条/秒）；空闲期无消费端，永远不会走到这里。
+            report_recording_drops_throttled(
+                warm.dropped_chunks.load(Ordering::Relaxed),
+                drop_baseline,
+                &mut last_drop_report_ms,
+                proc_now_ms(),
+            );
+
             match warm.rx.recv_timeout(recv_timeout) {
                 Ok((_ts, chunk)) if !chunk.is_empty() => {
                     let rms =
@@ -556,23 +569,28 @@ impl AudioCapture {
             on_chunk(&tail);
         }
 
-        // ASR-074 Step 1: 打出累计丢帧数（每个 chunk ≈10ms @48k，精确秒数不可知因 chunk 已丢）
-        let dropped = warm.dropped_chunks.load(Ordering::Relaxed);
-        if dropped > 0 {
+        // FIX-ASR-DROP-288：只报**本次录音**真实丢包（全局累计 - 录音前基线），
+        // 修掉旧代码把全局累计当本次（3.7s 录音报出 23s 音频）的误导。
+        // 每个 chunk ≈10ms @48k，精确秒数不可知因 chunk 已丢。
+        let dropped_total = warm.dropped_chunks.load(Ordering::Relaxed);
+        let dropped_this_recording = dropped_total.saturating_sub(drop_baseline);
+        if dropped_this_recording > 0 {
             log::warn!(
-                "[ASR-DROP] {} chunks dropped during recording (~{:.1}s audio lost, est. 10ms/chunk)",
-                dropped,
-                dropped as f32 * 0.01
+                "[ASR-DROP] {} chunks dropped during THIS recording (~{:.1}s audio lost, est. 10ms/chunk); process-lifetime cumulative={}",
+                dropped_this_recording,
+                dropped_this_recording as f32 * 0.01,
+                dropped_total
             );
         }
 
         log::info!(
-            "Streaming recording complete: ~{} samples ({:.1}s @ {}Hz), speech_detected={}, dropped_chunks={}",
+            "Streaming recording complete: ~{} samples ({:.1}s @ {}Hz), speech_detected={}, dropped_this_recording={}, dropped_cumulative={}",
             total_samples,
             total_samples as f32 / sample_rate as f32,
             sample_rate,
             speech_detected,
-            dropped
+            dropped_this_recording,
+            dropped_total
         );
 
         // RESEARCH-ACC-FIRSTCHAR-278 埋点（只读）：标记本次录音结束时刻，供下次按键算间隔
@@ -646,13 +664,12 @@ impl AudioCapture {
                                 }
                             }
                         }
-                        // ASR-074 Step 1: 队列满不再静默丢弃，计数并降级日志
+                        // FIX-ASR-DROP-288：实时回调线程只做一次原子自增——**不打日志**
+                        // （不格式化/不分配/不加锁）。空闲期队列满丢弃是**正常行为**
+                        // （无人消费），由消费端决定是否告警；消费端只在录音期存在，
+                        // 故能结构性地区分「空闲正常丢弃」与「录音期异常丢弃」。
                         if tx_audio.try_send((Instant::now(), chunk)).is_err() {
                             dropped_chunks_cb.fetch_add(1, Ordering::Relaxed);
-                            log::warn!(
-                                "[ASR-DROP] audio chunk dropped (queue full), total dropped so far: {}",
-                                dropped_chunks_cb.load(Ordering::Relaxed)
-                            );
                         }
                     },
                     move |err| {
@@ -686,13 +703,9 @@ impl AudioCapture {
                                 }
                             }
                         }
-                        // ASR-074 Step 1: 队列满不再静默丢弃，计数并降级日志
+                        // FIX-ASR-DROP-288：实时回调线程只做一次原子自增——**不打日志**。
                         if tx_audio.try_send((Instant::now(), chunk)).is_err() {
                             dropped_chunks_cb.fetch_add(1, Ordering::Relaxed);
-                            log::warn!(
-                                "[ASR-DROP] audio chunk dropped (queue full), total dropped so far: {}",
-                                dropped_chunks_cb.load(Ordering::Relaxed)
-                            );
                         }
                     },
                     move |err| {
@@ -726,13 +739,9 @@ impl AudioCapture {
                                 }
                             }
                         }
-                        // ASR-074 Step 1: 队列满不再静默丢弃，计数并降级日志
+                        // FIX-ASR-DROP-288：实时回调线程只做一次原子自增——**不打日志**。
                         if tx_audio.try_send((Instant::now(), chunk)).is_err() {
                             dropped_chunks_cb.fetch_add(1, Ordering::Relaxed);
-                            log::warn!(
-                                "[ASR-DROP] audio chunk dropped (queue full), total dropped so far: {}",
-                                dropped_chunks_cb.load(Ordering::Relaxed)
-                            );
                         }
                     },
                     move |err| {
@@ -842,9 +851,41 @@ fn normalize_device_name(device_name: Option<&str>) -> Option<String> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// FIX-ASR-DROP-288：消费端节流上报（**非实时线程**）。
+///
+/// 只在消费端（`record()` 的 `collect_recording` / `record_streaming` 主循环）调用，
+/// 而消费端**只在录音期存在** ⇒ 能执行到此必为录音期，无需任何 `AtomicBool` 去判断
+/// 「当前是否在录音」——由结构本身回答。空闲期的队列满丢弃是正常行为（无人消费），
+/// 那时根本没有消费端，故永远不会走到这里、也就永远不打日志。
+///
+/// `dropped_total` 为全局累计计数，`baseline` 为本次录音开始时的快照；
+/// 二者差值即**本次录音真实丢包**（旧代码把全局累计当本次，是误导源头）。
+/// 节流：同一录音内至多每 1000ms 报一条。返回本次是否真的打了一条（便于单测）。
+fn report_recording_drops_throttled(
+    dropped_total: u64,
+    baseline: u64,
+    last_report_ms: &mut u64,
+    now_ms: u64,
+) -> bool {
+    let delta = dropped_total.saturating_sub(baseline);
+    if delta == 0 {
+        return false;
+    }
+    if now_ms.saturating_sub(*last_report_ms) >= 1000 {
+        *last_report_ms = now_ms;
+        log::warn!(
+            "[ASR-DROP] {} chunks dropped during THIS recording so far (queue full; consumer may be stalled)",
+            delta
+        );
+        return true;
+    }
+    false
+}
+
 fn collect_recording(
     rx: &crossbeam_channel::Receiver<AudioChunk>,
     stream_failed: &AtomicBool,
+    dropped_chunks: &AtomicU64,
     stop_signal: Arc<AtomicBool>,
     silence_threshold: f32,
     silence_duration_ms: u64,
@@ -969,6 +1010,11 @@ fn collect_recording(
         }
     }
 
+    // FIX-ASR-DROP-288：消费端只在录音期存在，故此处基线/节流上报即「录音期丢包」专用。
+    // 全局计数是累计值，只有差值才是本次录音真实丢包。
+    let drop_baseline = dropped_chunks.load(Ordering::Relaxed);
+    let mut last_drop_report_ms = proc_now_ms();
+
     let mut mute_check_counter: u32 = 0;
     while !stop_after_pre_roll {
         if stop_signal.load(Ordering::Relaxed) {
@@ -982,6 +1028,14 @@ fn collect_recording(
         if stream_failed.load(Ordering::Acquire) {
             return Err(anyhow::anyhow!("Audio input stream failed"));
         }
+
+        // 非实时线程的节流上报（≤1 条/秒）；空闲期无消费端，永远不会走到这里。
+        report_recording_drops_throttled(
+            dropped_chunks.load(Ordering::Relaxed),
+            drop_baseline,
+            &mut last_drop_report_ms,
+            proc_now_ms(),
+        );
 
         if let Ok((_ts, chunk)) = rx.recv_timeout(Duration::from_millis(50)) {
             if state.push_chunk(&chunk, silence_threshold)? {
@@ -1028,6 +1082,18 @@ fn collect_recording(
         peak_before_gain,
         peak_after_gain
     );
+
+    // FIX-ASR-DROP-288：只报**本次录音**真实丢包（全局累计 - 录音前基线），修正旧口径。
+    let dropped_total = dropped_chunks.load(Ordering::Relaxed);
+    let dropped_this_recording = dropped_total.saturating_sub(drop_baseline);
+    if dropped_this_recording > 0 {
+        log::warn!(
+            "[ASR-DROP] {} chunks dropped during THIS recording (~{:.1}s audio lost, est. 10ms/chunk); process-lifetime cumulative={}",
+            dropped_this_recording,
+            dropped_this_recording as f32 * 0.01,
+            dropped_total
+        );
+    }
 
     // FIRSTCHAR-FIX-005: Anti-aliased resampling — done once on the complete
     // signal.  This replaces the old per-chunk linear interpolation which had
@@ -1621,6 +1687,35 @@ mod tests {
         log::set_max_level(log::LevelFilter::Warn); // 复原
     }
 
+    // FIX-ASR-DROP-288：消费端节流上报的差值语义 + 1s 节流
+    #[test]
+    fn asr_drop_288_throttle_and_delta_semantics() {
+        let mut last = 10_000u64;
+        // delta == 0（本次录音尚无新丢包）→ 不报
+        assert!(!report_recording_drops_throttled(
+            100, 100, &mut last, 20_000
+        ));
+        // 有丢包但距上次 <1s → 节流，不报，且不得推进 last
+        assert!(!report_recording_drops_throttled(
+            105, 100, &mut last, 10_500
+        ));
+        assert_eq!(last, 10_000, "节流期间不得推进 last");
+        // 距上次 >=1s → 报一条并推进 last
+        assert!(report_recording_drops_throttled(
+            142, 100, &mut last, 11_000
+        ));
+        assert_eq!(last, 11_000);
+        // 紧接着又丢（<1s）→ 仍不报
+        assert!(!report_recording_drops_throttled(
+            200, 100, &mut last, 11_500
+        ));
+        // 又过 1s → 报
+        assert!(report_recording_drops_throttled(
+            230, 100, &mut last, 12_100
+        ));
+        assert_eq!(last, 12_100);
+    }
+
     #[test]
     fn normalizes_blank_device_name_to_default() {
         assert_eq!(normalize_device_name(None), None);
@@ -1749,6 +1844,7 @@ mod tests {
         let result = collect_recording(
             &rx,
             &failed,
+            &AtomicU64::new(0),
             Arc::clone(&stop),
             0.01,
             100,
@@ -1773,6 +1869,7 @@ mod tests {
         let result2 = collect_recording(
             &rx,
             &failed,
+            &AtomicU64::new(0),
             Arc::clone(&stop),
             0.01,
             100,
@@ -2464,6 +2561,7 @@ mod tests {
         let result = collect_recording(
             &rx,
             &failed,
+            &AtomicU64::new(0),
             Arc::clone(&stop),
             0.01,
             0,
@@ -2515,6 +2613,7 @@ mod tests {
         let result = collect_recording(
             &rx,
             &failed,
+            &AtomicU64::new(0),
             Arc::clone(&stop),
             0.01,
             0,
