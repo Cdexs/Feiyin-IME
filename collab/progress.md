@@ -882,3 +882,14 @@ load_wordbook_vocabulary()
 | 出包 | `BUILD-328` 八项核验逐项 PASS；产物 `feiyin-ime` 14.66MB `e39ac3a0…`（较 321 +50,176B）/ `feiyin-ime-ui` 10.06MB `8294a624…` / `crash-reporter` 24.88MB `4fcc90ee…`，时间戳 18:22–18:24；**四张规则表三副本全等**（含新拷的 homophone/wordbook） |
 | 探针 | `[LocalRT-DBG-325]`=1 / `[AUTOLEARN]`=1 / `degree_adverbs`=2 / `nz_ratio`=2 |
 | 端测 | 待 Gavin 六条（十分/十分钟；尾字回灌；🔴 预览窗编辑；自学习；先说半句 pre-roll；redecode 频次 <43%） |
+
+
+## v0.9.3（批次五 · BUILD-333）· 2026-09-21 · 回灌持续生效 + 编辑快照基准 + 摘路径B死代码（版本号不升）
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 329 回灌被下一个流式包冲掉（流式回调约 6 倍频繁）⇒ 权威前缀**持续生效** + 自学习基准对齐；330 删本地流式档指向已废弃 nano 的「缺失 972MB」UI 假提示块；331 编辑学习基准改取「用户开始编辑时所见」快照 + 词条上限 30→12；332 摘除「注入后观察目标窗口」路径B + 三处死代码（对齐 DEC-058） |
+| 回归 | TEST-EXEC + BUILD-333 root **1398P/0F/17I**（全量，NEW 13）+ src-tauri **92P/0F/0I**（NEW 1）+ Vitest **100P/11S/0F**（ui 有改动，实跑）；warnings **99/90/17 = 新基线** |
+| 出包 | `BUILD-333` 八项核验逐项 PASS；产物 `feiyin-ime` 14.66MB `703788ed…`（+1,536B）/ `feiyin-ime-ui` 10.05MB `80d79937…`（**−10,240B** = 删提示块）/ `crash-reporter` 24.88MB `c71d46c6…`，时间戳 19:19–19:21；四张规则表三副本全等 |
+| 探针 | 正向 `[LocalRT-DBG-325] streaming render`=1 / `[AUTOLEARN]`=1 / `degree_adverbs`=2 / `nz_ratio`=2；🔴 **反向 5 符号全 0**（332 摘除彻底） |
+| 端测 | 待 Gavin 七条（尾字 325 不归零／🔴 预览编辑不被冲／🔴 自学习=编辑改对后提交、同词连续两次 + 反向不编辑无 `[AUTOLEARN]`／十分·十分钟／pre-roll onset／redecode<43%／🔴 配置界面无模型提示块） |

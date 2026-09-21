@@ -310,6 +310,19 @@
 - **⚠️ 协作事件**：主控文档 commit `99799c5`（10:26:26）在本题进行中执行，**把我未完成的 `local_stream.rs` 与 coder-1 的 `src/audio/mod.rs` 一并扫入**（commit message 未反映代码改动）。本单改动已随之落盘、worktree 无额外 diff；`git status` 另见 `.gitignore` + `src/audio/mod.rs`（非本单）。请主控知悉该 commit 语义与文件归属。
 - **红线**：只改 `local_stream.rs` / 未动版本 / 未自行 commit / 未出包 / 未跑 `cargo build --release` / 零凭证。
 
+## 2026-09-21 — tester-1 — TEST-EXEC + BUILD-333 ✅ 第二批全量回归 + 出包（八项 PASS + 反向探针全 0）
+
+- **基线/归属**：HEAD 实测 **`eba918a`**（任务书写 `b0eca48`；其上是**纯文档提交** `docs: [FILTERED-TEST-BLINDSPOT-001]`，仅改 troubleshooting.md +26，无代码影响），clean，版本 0.9.2。含 329/330/331/332。
+- **回归（全量，未用过滤代替，遵守 `[FILTERED-TEST-BLINDSPOT-001]`）**：root `cargo test --no-fail-fast` **1398P/0F/17I**（= 1310+52+36 / 15+2 ignored 逐位吻合）；`src-tauri` **92P/0F/0I**；Vitest **7 files / 100P/11S / 0F**（本批 `b20f733` 有 UI 改动 ⇒ 实跑非 SKIP）。
+- **增量（对比 328）**：root NEW 13/GONE 0 = `reflow_persist_329_tests` 6 + `edit_snapshot_331_tests` 5 + `flicker_130_guard_tests::pathb_332_learn_correction_single_call_site_and_no_pathb_symbols` 1 + `wordbook::tests::test_is_valid_candidate_longest_real_world_positives_still_pass` 1；src-tauri NEW 1 = 同一条 wordbook 测试的 `wordbook_core` 第二实例。
+- **BUILD-333**：Step1–4 全走；源码 mtime 前后 md5 一致（`c183079f…`）。产物 main `703788ed…`（14,664,192B/19:21）/ ui `80d79937…`（10,050,048B，**−10,240B** = 330 删提示块）/ crash `c71d46c6…`（24,879,104B/19:19）；两副本相等；main 异于 BUILD-328（`e39ac3a0…`）。
+- **八项逐项 PASS**：①时间戳 19:17–19:21 ②sha ③0.9.2（Cargo.toml + tauri.conf.json 未动）④冒烟 PID 2284 Responding=True/无新 crash.json/残 0 ⑤config/wordbook 三时点零变化（两处，根目录无）⑥**warnings 99/90/17 = 新基线**（release 99 / test 90 / tauri 17）⑦四张规则表三副本全等（itn `ab950ba4…`/scene `8ea93bb1…`/homophone `a5fd4a61…`/wordbook `ac9a72ee…`，每张 distinct-sha=1，构建未清空 target/release）⑧探针。
+- **探针正向**：`[LocalRT-DBG-325] streaming render`=**1**（本包核心）/ `[AUTOLEARN]`=1 / `degree_adverbs`=2 / `nz_ratio`=2 / `[LocalRT-DBG-320]`=1 / `[LocalRT-DBG-293]`=1。
+- **🔴 探针反向（332 应摘除）**：`maybe_learn_user_edit` / `AUTO_LEARN_OBSERVE_MS` / `extract_changed_text` / `capture_focused_text_snapshot` / `read_text_from_hwnd` **全部 0 命中** ⇒ 摘除彻底。
+- **Gavin 端测七条**：① 尾字 `[LocalRT-DBG-325] streaming render` 的 `committed_len` 连续说话不归零 ② 🔴 预览编辑不被回灌冲掉 + 闩锁 ③ 🔴 **自学习唯一路径 = 预览窗编辑改对后提交、同一词连续改对两次**（第 1 次 `[AUTOLEARN] candidate observed <词> (1/2)`、第 2 次 `promoted after threshold (2/2)`）+ 词库可见；**反向：不点编辑直接上屏不应出现任何 `[AUTOLEARN]` 行**（329/331 验收）④ 十分·十分钟 ⑤ pre-roll `mode=onset` ⑥ `redecode`<43% ⑦ 🔴 配置界面本地流式档下方无模型提示块。
+- **证据**：`collab/outbox/tester-1/testexec333/`。
+- **红线**：版本 0.9.2 未动 / 未改生产代码 / 未 push / 零凭证。
+
 ## 2026-09-21 — tester-1 — TEST-EXEC + BUILD-328 ✅ 四单全量回归 + 出包（八项 PASS，含 4 张规则表三副本复核）
 
 - **基线**：HEAD `08fe5c6`，clean、`ui/` 零 diff、版本 0.9.2。含 323/324/322+325/327 + 77313e5 nano 解依赖。
