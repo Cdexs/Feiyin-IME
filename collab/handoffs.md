@@ -5,6 +5,16 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-2 — ACC-REFLOW-PERSIST-329 ✅ 交付（回灌持久化 + 镜像基准）
+
+- **缺陷A**：回灌被流式包冲掉 ⇒ 新增 per-gen `ACC_REFLOW_STATE` + `compose_with_acc_for_gen`；`StreamingText` 渲染分支走 `compose(raw)`（权威前缀 + 流式尾巴），不再被冲掉。
+- **缺陷B**：镜像改为早写 `compose(raw)`（**不再写 raw**）并保持 043 门闩前（053-B 契约不变，契约测试仍绿）；`PreviewReflow`/`StreamingFinalPreview` 渲染同步写镜像 = 所显 ⇒ 未编辑提交 `original==edited`。
+- **选 (a)**：保留早写、只换内容；未改/删任何护栏。
+- **残留 gap**（停止后迟到包镜像领先所见，窄窗口+零修改+2 次才可能出候选）本单不处理，断言钉住，另立 331 编辑入口快照收口。
+- **边界**：编辑态不冲输入 / 收尾用合成 / per-gen 清空 / 闩锁后保留前缀 / 非本地 raw passthrough。
+- **验证**：fmt clean（skip_children）/ check 0 error / warnings 110/101 / numstat==-w（169/4）/ 329 6P + 325 6P + 053-B 1P。
+- 🔴 实机交 tester-1/Gavin，未声称已验证。未动版本 / 未 commit / 未出包 / 未碰 audio 与 transcription / 零凭证。
+
 ## 2026-09-21 — coder-2 — AUTOLEARN-CANDIDATE-327 ✅ 交付（候选抽取二次收窄）
 
 - **根因**：字符 diff 后公共后缀为空 ⇒ 候选吞到句尾（`指导灵的信息吗？`）⇒ 被句末标点校验拒、阈值够不着。
@@ -271,6 +281,17 @@
 - **验证**：`cargo check --all-targets` 0 error、warnings **110/101** = 基线；`rustfmt --check` clean；新增单测 `local_stream::tests` **2P/0F**（连跑 3 次）。🔴 实机（`gained` 实测）交 tester-1/Gavin。
 - **⚠️ 协作事件**：主控文档 commit `99799c5`（10:26:26）在本题进行中执行，**把我未完成的 `local_stream.rs` 与 coder-1 的 `src/audio/mod.rs` 一并扫入**（commit message 未反映代码改动）。本单改动已随之落盘、worktree 无额外 diff；`git status` 另见 `.gitignore` + `src/audio/mod.rs`（非本单）。请主控知悉该 commit 语义与文件归属。
 - **红线**：只改 `local_stream.rs` / 未动版本 / 未自行 commit / 未出包 / 未跑 `cargo build --release` / 零凭证。
+
+## 2026-09-21 — tester-1 — TEST-EXEC + BUILD-328 ✅ 四单全量回归 + 出包（八项 PASS，含 4 张规则表三副本复核）
+
+- **基线**：HEAD `08fe5c6`，clean、`ui/` 零 diff、版本 0.9.2。含 323/324/322+325/327 + 77313e5 nano 解依赖。
+- **回归**：root **1385P/0F/17I**（NEW 19/GONE 0：`itn_shifen_323_*` 3 + `preview_reflow_325_tests` 6 + `wordbook::tests::autolearn327_*` 6 + `audio::tests::pr322_*` 4；`pr322_idle_probe_manual` `#[ignore]` 手工硬件探针 ⇒ **+18 运行/+1 ignored**）；`src-tauri` **91P/0F/0I**（85→91，**NEW 6 = `wordbook::wordbook_core::tests::autolearn327_*` 镜像**，任务书未预告已如实列出）；Vitest **SKIP**（`ui/` 零 diff）。
+- **BUILD-328**：Step1–4 全走；源码 mtime 前后 md5 一致（`bff96396…`）。产物 main `e39ac3a0…`（14,662,656B/18:24，较 321 **+50,176B**）/ ui `8294a624…`（10,060,288B）/ crash `4fcc90ee…`（24,879,104B/18:22）；两副本相等；main 异于 BUILD-321（`ea426a0c…`）。
+- **八项逐项 PASS**：①时间戳 18:19–18:24 ②sha ③0.9.2（Cargo.toml + tauri.conf.json 未动）④冒烟 PID 18008 Responding=True/无新 crash.json/残 0 ⑤**config/wordbook 零变化**（Publish/config `da2be5da…`、target/release/config `2e0e60a5…`、两 wordbook 不变；⚠️ 根目录无 config/wordbook，任务书「三处」实测两处）⑥warnings 110/9/17 ⑦**四张规则表三副本全等**（itn `ab950ba4…`/scene `8ea93bb1…`/homophone `a5fd4a61…`/wordbook `ac9a72ee…`）⑧探针。
+- **探针**：`[LocalRT-DBG-325]`=1 / `[AUTOLEARN]`=1 / `degree_adverbs`=2 / `nz_ratio`=2 / `[LocalRT-DBG-320]`=1 / `[MIGRATE-QWEN3-320]`=1 / `307`=2 / `293`=1 / `298`=4 / 同音 `满头大汉`=1。
+- **Gavin 端测六条**：① 十分的重要保汉字 + 十分钟→`10分钟` ② 尾字回灌 `[LocalRT-DBG-325] action=applied` ③ 🔴 **预览窗编辑不被回灌冲掉**（本批最高风险）④ 自学习 `[AUTOLEARN] promoted after threshold` ⑤ 先说半句 pre-roll `[293] mode=onset` + `[278] nz_ratio/dBFS` ⑥ `[320] action=redecode` 频次应远低于 43%。
+- **证据**：`collab/outbox/tester-1/testexec328/`。
+- **红线**：版本 0.9.2 未动 / 未改生产代码 / 未 push / 零凭证。
 
 ## 2026-09-21 — tester-1 — TEST-EXEC + BUILD-321 ✅ 全量回归 + 出包（八项 PASS，Qwen3 迁移批次）
 

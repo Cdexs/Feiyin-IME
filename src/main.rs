@@ -263,6 +263,13 @@ static STREAMING_GENERATION: AtomicU64 = AtomicU64::new(0);
 static ACC_REFLOW_LAST_SEG: AtomicI64 = AtomicI64::new(-1);
 #[cfg(target_os = "windows")]
 static ACC_REFLOW_EDIT_LATCH: AtomicBool = AtomicBool::new(false);
+// ACC-REFLOW-PERSIST-329：本代已确定的**权威前缀**状态 `(generation, acc_text, committed_len)`。
+// - 只在 `PreviewReflow`(Applied) 时写（唯一发送点 = 本地实时档）⇒ 在线/批处理恒 None；
+// - `RecordingStarted` 清空；流式渲染时按 gen 匹配取用；
+// - **闩锁之后保留**（只停止更新，不丢弃）⇒ 画面不倒退。
+// - controller 单线程读写；`Mutex` 仅因是 `static`（同 `last_streaming_text` 先例）。
+#[cfg(target_os = "windows")]
+static ACC_REFLOW_STATE: Mutex<Option<(u64, String, usize)>> = Mutex::new(None);
 #[derive(Debug, Clone, Copy)]
 #[cfg(target_os = "windows")]
 struct SendHwnd(isize);
@@ -6770,6 +6777,10 @@ fn process_controller_events(
                 // 325：回灌状态按代重置（新代重新开始回灌、编辑闩锁解除）。
                 ACC_REFLOW_LAST_SEG.store(-1, Ordering::Release);
                 ACC_REFLOW_EDIT_LATCH.store(false, Ordering::Release);
+                // 329（边界 3）：权威前缀状态 per-gen，随录音开始清空，旧代残留不得污染新录音。
+                if let Ok(mut st) = ACC_REFLOW_STATE.lock() {
+                    *st = None;
+                }
                 set_tray_state(tray, TrayState::Recording, ui_language);
                 show_overlay(
                     overlay_handle,
@@ -6798,9 +6809,14 @@ fn process_controller_events(
                     );
                     continue;
                 }
-                // WORDBOOK-053-B: mirror the latest streaming text for the edit-learn path.
+                // ACC-REFLOW-PERSIST-329：渲染/镜像前先合成权威前缀（本地档），在线/批处理恒 raw。
+                // 🔴 早写在 043 门闩**之前**、内容改为 `compose(raw)`（不是 raw）——
+                //    053-B「渲染抑制 ≠ 数据抑制」契约不变（迟来包仍进镜像、不饿死学习），
+                //    只是写进去的已是带权威前缀的版本（见 053-B 测试 + ACC-REFLOW-PERSIST-329）。
+                let acc_state = ACC_REFLOW_STATE.lock().ok().and_then(|g| g.clone());
+                let composed = compose_with_acc_for_gen(acc_state.as_ref(), gen, &text);
                 if let Ok(mut mirror) = last_streaming_text.lock() {
-                    *mirror = Some(text.clone());
+                    *mirror = Some(composed.clone());
                 }
                 // ASR-038-B: 流式 ASR 增量文本推送到 overlay
                 // OVERLAY-043-B / FLICKER-130 (R1): late streaming packets after stop are
@@ -6824,11 +6840,26 @@ fn process_controller_events(
                 } else {
                     // OVERLAY-051-G: store word timings for timestamp-driven reveal
                     overlay_handle.send(OverlayCommand::UpdateWordTimings(words));
+                    if log::log_enabled!(log::Level::Debug) {
+                        let committed = acc_state
+                            .as_ref()
+                            .filter(|(g, _, _)| *g == gen)
+                            .map(|(_, _, c)| *c)
+                            .unwrap_or(0);
+                        log::debug!(
+                            "[LocalRT-DBG-325] streaming render: gen={} raw_len={} committed_len={} display_len={} has_acc_prefix={}",
+                            gen,
+                            text.chars().count(),
+                            committed,
+                            composed.chars().count(),
+                            composed != text
+                        );
+                    }
                     show_overlay(
                         overlay_handle,
                         opacity,
                         ui_language,
-                        OverlayStatus::RecordingWithText { text },
+                        OverlayStatus::RecordingWithText { text: composed },
                     );
                 }
             }
@@ -6841,11 +6872,20 @@ fn process_controller_events(
                 if OVERLAY_EDITING.load(Ordering::Acquire) {
                     log::debug!("LOCALRT-282: final preview skipped while editing");
                 } else {
+                    // 329（边界 2）：收尾也用**权威合成**（acc 前缀 + 流式收尾全文尾巴）⇒
+                    // 尾字修复在收尾这一刻同样生效。本事件只有本地档发 ⇒ 在线无影响。
+                    let gen = STREAMING_GENERATION.load(Ordering::Acquire);
+                    let acc_state = ACC_REFLOW_STATE.lock().ok().and_then(|g| g.clone());
+                    let display = compose_with_acc_for_gen(acc_state.as_ref(), gen, &text);
+                    // 镜像恒 = 所显（缺陷 B）。
+                    if let Ok(mut mirror) = last_streaming_text.lock() {
+                        *mirror = Some(display.clone());
+                    }
                     show_overlay(
                         overlay_handle,
                         opacity,
                         ui_language,
-                        OverlayStatus::RecordingWithText { text },
+                        OverlayStatus::RecordingWithText { text: display },
                     );
                 }
             }
@@ -6889,6 +6929,15 @@ fn process_controller_events(
                     let preview = reflow_preview(&acc_text, &streaming, committed_len);
                     preview_len = preview.chars().count();
                     ACC_REFLOW_LAST_SEG.store(seg_index as i64, Ordering::Release);
+                    // 329：把权威前缀存为**本代持续状态**，供后续每次流式渲染复用（缺陷 A：
+                    // 修正不再被下一个流式包冲掉）。闩锁后不再更新，但**保留**（画面不倒退）。
+                    if let Ok(mut st) = ACC_REFLOW_STATE.lock() {
+                        *st = Some((generation, acc_text.clone(), committed_len));
+                    }
+                    // 329：镜像恒 = 所显（缺陷 B：未编辑提交 ⇒ original == edited ⇒ 不学习）。
+                    if let Ok(mut mirror) = last_streaming_text.lock() {
+                        *mirror = Some(preview.clone());
+                    }
                     show_overlay(
                         overlay_handle,
                         opacity,
@@ -9332,6 +9381,33 @@ fn reflow_preview(acc_text: &str, streaming: &str, committed_len: usize) -> Stri
     out
 }
 
+/// ACC-REFLOW-PERSIST-329：流式渲染/镜像前的权威前缀合成。
+///
+/// `state` = 本代已确定的 `(generation, acc_text, committed_len)`（见 [`ACC_REFLOW_STATE`]）。
+/// - gen 匹配 **且** `acc_text` 非空 ⇒ `reflow_preview(acc, raw, committed)`（权威前缀 + 流式尾巴）；
+/// - 其余（state 为 None / gen 不匹配 / acc 空）⇒ **原样返回 `raw`**
+///   ⇒ 在线 / 批处理结构上恒走此分支，行为逐位不变。
+///
+/// 🔴 **滚动分界线口径（Gavin 2026-09-21 明确，勿改）**：
+/// `preview = accuracy 权威前缀（已完成分片） + 流式尾巴（正在说的那段）`。
+/// 正在说的那段 accuracy 还没拿到（要攒够 `min_seg_ms` 且静默 800ms 才派片），
+/// 所以**流式尾巴在每一刻都存在**，不是「第一句才用流式」的特例；分界线随分片完成不断右移。
+/// BUILD-321 实测：第一片在 ~5.65s 派发、解码 1.2~1.9s ⇒ **前 6~8 秒全是流式文字**，
+/// 之后才有回灌。⇒ **`acc_text` 为空时必须原样返回流式全文**（否则开口后前 6~8 秒会是空白，
+/// 属致命回归；见 `compose_empty_acc_passthrough` 单测锁定）。
+fn compose_with_acc_for_gen(
+    state: Option<&(u64, String, usize)>,
+    raw_gen: u64,
+    raw: &str,
+) -> String {
+    match state {
+        Some((g, acc, committed)) if *g == raw_gen && !acc.is_empty() => {
+            reflow_preview(acc, raw, *committed)
+        }
+        _ => raw.to_string(),
+    }
+}
+
 /// ACC-PREVIEW-REFLOW-325：回灌决策（纯函数，消费端 controller 线程调用）。
 ///
 /// 优先级（高 → 低）：
@@ -9460,6 +9536,95 @@ mod preview_reflow_325_tests {
         assert_eq!(
             reflow_action(false, false, 6, 5, false, true),
             ReflowAction::SkippedEmpty
+        );
+    }
+}
+
+#[cfg(test)]
+mod reflow_persist_329_tests {
+    use super::{compose_with_acc_for_gen, reflow_preview};
+
+    /// 判据 1（不变式）：一次回灌后，后续任意次流式更新渲染出的文本**都带同一权威前缀**。
+    /// 证明缺陷 A 已修（修正不会被下一个流式包冲掉）。
+    #[test]
+    fn compose_prefix_persists_across_streaming_updates() {
+        // state = (gen=1, acc="指导灵", committed=3)
+        let state = (1u64, "指导灵".to_string(), 3usize);
+        let raws = [
+            "指导领",
+            "指导领的信息",
+            "指导领的信息吗",
+            "指导领的信息吗？",
+        ];
+        for raw in raws {
+            let display = compose_with_acc_for_gen(Some(&state), 1, raw);
+            assert!(
+                display.starts_with("指导灵"),
+                "每次流式渲染都必须带权威前缀，实测 {display:?}"
+            );
+            // 尾巴 = raw 从 committed 起的部分
+            assert_eq!(display, reflow_preview("指导灵", raw, 3));
+        }
+    }
+
+    /// 🔴 Gavin 口径 + 致命回归锁：acc 为空（第一片尚未回来）⇒ **原样返回流式全文**。
+    /// 前 6~8 秒全靠流式文字；若改成「acc 空就不显示」会开口即空白。
+    #[test]
+    fn compose_empty_acc_passthrough() {
+        let empty_acc = (1u64, String::new(), 0usize);
+        assert_eq!(
+            compose_with_acc_for_gen(Some(&empty_acc), 1, "第一句话的流式文字"),
+            "第一句话的流式文字"
+        );
+    }
+
+    /// 边界 3/4：gen 不匹配（旧代残留）⇒ 原样 raw；闩锁后 state 保留 ⇒ 仍带前缀。
+    #[test]
+    fn compose_gen_mismatch_passthrough_but_same_gen_keeps_prefix() {
+        let state = (2u64, "权威前缀".to_string(), 2usize);
+        assert_eq!(
+            compose_with_acc_for_gen(Some(&state), 3, "新录音raw"),
+            "新录音raw"
+        );
+        // 同 gen（闩锁后 state 未被清）⇒ 继续带前缀，画面不倒退
+        assert_eq!(
+            compose_with_acc_for_gen(Some(&state), 2, "后续raw尾"),
+            reflow_preview("权威前缀", "后续raw尾", 2)
+        );
+    }
+
+    /// 边界 1：编辑态（stopped）⇒ 包在第一道闸被丢，不进渲染（不会冲 EDIT 用户输入）。
+    /// editing⇒stopped 由既有 F3 护栏锁定；此处锁「闸门第一道即 stopped」。
+    #[test]
+    fn editing_implies_render_dropped() {
+        assert!(
+            super::should_ignore_streaming_text(true),
+            "stopped(含编辑态) 必须丢渲染"
+        );
+        assert!(!super::should_ignore_streaming_text(false));
+    }
+
+    /// 边界 5：非本地档 state 恒 None ⇒ 逐位 raw passthrough（在线/批处理结构上不进合成）。
+    #[test]
+    fn non_local_tiers_passthrough() {
+        assert_eq!(
+            compose_with_acc_for_gen(None, 42, "在线流式原文"),
+            "在线流式原文"
+        );
+    }
+
+    /// 残留 gap（053-B 既定契约「渲染抑制 ≠ 数据抑制」，本单不处理，仅钉住现状）：
+    /// 停止后迟到包仍写镜像（更完整），但 043 门闩抑制渲染 ⇒ 镜像可**领先于**最后所见。
+    /// 触发条件：Stop→StreamingFinalPreview 的亚秒窗口内用户进编辑且**零修改提交**；
+    /// 且需累计 2 次才入库。见 result.md 结论。此处断言防未来无声恶化。
+    #[test]
+    fn stopped_late_packet_advances_mirror_beyond_display() {
+        let state = (1u64, "权威".to_string(), 2usize);
+        let last_displayed = compose_with_acc_for_gen(Some(&state), 1, "早年");
+        let mirror_after_late = compose_with_acc_for_gen(Some(&state), 1, "晚年更长尾");
+        assert_ne!(
+            last_displayed, mirror_after_late,
+            "迟到包推进镜像、渲染被抑制 ⇒ 镜像领先所见（既定 gap，勿无声扩大）"
         );
     }
 }

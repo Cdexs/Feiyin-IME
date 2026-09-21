@@ -1933,3 +1933,11 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 新增根 `wordbook-rules.toml`（`include_str!` 内置默认 + exe 同级覆盖 + 降级，照 itn/homophone 先例） | ✅ 外置规则；macOS 打包同步该 toml 即可，不打包亦用内置默认（DEC-011） |
 | 门槛 `threshold` 与 `is_valid_candidate` 校验 | ✅ **一字未动**；只让送进校验的候选更干净 |
 | macOS 侧需要做什么 | ✅ **无需代码改动**；未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未触 `src/platform/**` |
+
+## ACC-REFLOW-PERSIST-329（2026-09-21，coder-2）· 回灌持久化 + 镜像基准修正 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| 新增 per-gen 权威前缀状态 `ACC_REFLOW_STATE` + 纯函数 `compose_with_acc_for_gen`；流式渲染/镜像前先合成（`StreamingText` 早写与渲染分支、`StreamingFinalPreview`） | ⚠️ **行为变更，平台中立逻辑**：`compose` 与状态定义在无 `#[cfg]` 区；但 `ACC_REFLOW_STATE` 只在 `PreviewReflow` 写，而 `PreviewReflow` 只有本地实时档发 ⇒ macOS 侧恒 None ⇒ `compose` 返回 raw（macOS 流式文本本就不渲染，行为不变） |
+| 镜像 `last_streaming_text` 早写内容由 raw 改 compose(raw)；`StreamingFinalPreview` 写镜像 | ✅ 平台中立；macOS 消费臂已具备该事件 arm（暂不渲染） |
+| macOS 侧需要做什么 | ✅ **无需改动**；未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未触 `src/platform/**` |

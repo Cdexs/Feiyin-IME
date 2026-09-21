@@ -11,12 +11,12 @@
 
 | 项 | 状态 |
 | --- | --- |
-| 版本 | 仍 **0.9.2**。v0.9.3 批次三已出包：最新包 **BUILD-321**（HEAD `51df565`，含 **Qwen3-ASR 迁移(314/315/320)** / 318 同音纠错 / 320 上下文注入+词条200 / 317·320 线程按核数 / 307 尾字 / 308 pre-roll 残留 / 303+305 口水词；**全部 env 已删除**）。🔴 未 push、未打 tag，等 Gavin 明示 |
-| 本轮出包史 | BUILD-258 → 267 → 274 → 280（诊断包）→ 285（🛑 作废）→ 287 → 290 → 296 → 302 → 306 → **321（当前）** |
-| 端测待办 | ① 🆕 **BUILD-321 四组**（须 Gavin 真人录音，🔴 **无 env 可调**）：**A 浮层预览** = 307 中间句尾字看 `[LocalRT-DBG-307] gained`（多数应为 1，恒 0 立即报主控）／308 `[LocalRT-DBG-293] mode=residual`；**B 最终文字** = Qwen3 准确率／**韩文应正确**／关 LLM 说「呃，然后然后我们开始吧」→「我们开始吧」；**C 等待时长+日志** = 长语音 `[LocalRT-DBG-298] tail_wait`／`[LocalRT-DBG-320] action=redecode` 频次；**D 交叉** = 本地流式+翻译 ② v0.9.1 四项遗留：overlay 编辑态剥尾标点／Key 输入框 placeholder／繁中 ITN（`三點半→3:30`）／「API 配置」新文案布局 |
+| 版本 | 仍 **0.9.2**。v0.9.3 批次四已出包：最新包 **BUILD-328**（HEAD `08fe5c6`，含 Qwen3 迁移 / 318 同音 / 320 上下文 / 323「十分」误转 / 324 护栏收窄 / 322+325 回灌预览 / 327 自学习收窄 / **nano 依赖全解**）。🔴 未 push、未打 tag，等 Gavin 明示 |
+| 本轮出包史 | BUILD-258 → 267 → 274 → 280（诊断包）→ 285（🛑 作废）→ 287 → 290 → 296 → 302 → 306 → 321 → **328（当前）** |
+| 端测待办 | ① 🆕 **BUILD-328 六条**（须 Gavin 真人录音）：**1** 「十分的重要」应保持汉字 +「十分钟」转 `10分钟`；**2** 尾字回灌看 `[LocalRT-DBG-325] action=applied` 频次；**3** 🔴 **录音中点进预览窗编辑打字，验回灌不冲掉你打的字**（本批最高风险）；**4** 自学习重复四五次看 `[AUTOLEARN] promoted after threshold` + 词库；**5** 先说半句再按热键看 `[LocalRT-DBG-293] mode=onset` + `[278] nz_ratio/dBFS`；**6** `[LocalRT-DBG-320] action=redecode` 频次应远低于改前 43%（6/14） ② v0.9.1 四项遗留：overlay 编辑态剥尾标点／Key 输入框 placeholder／繁中 ITN（`三點半→3:30`）／「API 配置」新文案布局 |
 | Worker | ✅ 09-21 新 session 三 Worker 就绪（OpenCode `commandgo/deepseek-v4.1-flash`），coder-1 / coder-2 已 ACK |
 | 文档 | 09-21 归档 handoffs 57 条（610 → 89 行）、todo 批次明细入 archive。DEC-064 两层结构：**新增条目必须 archive 与索引两边都写** |
-| 下一步 | **等 Gavin 端测 BUILD-321 反馈**。无新 bug 则清存量待办（223 ITN ／ 213 翻译语言 UI ／ 194 护栏 ／ 204 提示词）。⚠️ 待主控裁定：`mod.rs:1019` hotwords tokenizer 仍引用 nano 目录（只计 token 非 ASR），建议改指 Qwen3 自带 tokenizer |
+| 下一步 | **等 Gavin 端测 BUILD-328 反馈**。无新 bug 则清存量待办（223 ITN ／ 213 翻译语言 UI ／ 194 护栏 ／ 204 提示词）。✅ 前挂的 `hotwords_tokenizer` 引用 nano 目录问题已由 `77313e5` 解除（tokenizer 改指 Qwen3） |
 
 ---
 

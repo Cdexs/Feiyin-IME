@@ -4,7 +4,7 @@
 - 六条端测问题全部定性：2 条已修（⑤护栏、⑥无需动作）、1 条待重建即消（②tokenizer）、2 条已派单（①ITN → coder-2、pre-roll → coder-1）、2 条排队待派（③尾字、④自学习，均撞 `main.rs`）。
 - 调优复盘：后端并行派发是本版最大收益（后台解码 20.0s，用户实际等待中位 0.32s）；endpoint 门限有效；pre-roll 证实全程空转已派单处置；shadow 依 Gavin 端测观察保留不动。
 - 尾字问题的两条既有修法（291/307）**双双证伪**，方向改为用 accuracy 分片结果回灌预览。
-��证结果）
+��证结果）
 6. **新任务完成时立即更新**，不批量补
 7. **测试用例同步、构建和出包任务不记录到 progress**，这些属于 CHANGELOG/logs 范畴
 
@@ -871,3 +871,14 @@ load_wordbook_vocabulary()
 | 探针 | `[LocalRT-DBG-320]`=1 / `[MIGRATE-QWEN3-320]`=1 / `307`=2 / `293`=1 / `298`=4；同音 `满头大汉`=1 |
 | 遗留上报 | ⚠️ `mod.rs:1019` hotwords tokenizer 仍引用 nano 目录（只计 token 非 ASR）；建议改指 Qwen3 自带 tokenizer |
 | 端测 | 待 Gavin 四组（浮层预览 / 最终文字含韩文 / tail_wait+redecode / 本地流式+翻译）；🔴 本包无任何 env 可调 |
+
+
+## v0.9.3（批次四 · BUILD-328）· 2026-09-21 · 端测反馈修复四单 + nano 解依赖（版本号不升）
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 323「十分」作程度副词误转成「10分」修复（`[protect.degree_adverbs]`+右邻消歧）；324 回显护栏比对面收窄（修 43% 误触）+ 输出清理指令恒发；322+325 pre-roll 根因定案（非 bug）+ accuracy 分片结果**回灌预览**（尾字）；327 自学习候选抽取二次收窄（治「指导灵」不入库）；77313e5 **nano 最后一处依赖解除**（词条 tokenizer 改指 Qwen3）；322 诊断精度 dBFS + nz_ratio |
+| 回归 | TEST-EXEC + BUILD-328 root **1385P/0F/17I**（+18 运行/+1 ignored）+ src-tauri **91P/0F/0I**（+6 镜像）；Vitest SKIP（`ui/` 零 diff）；warnings 110/9/17 = 基线 |
+| 出包 | `BUILD-328` 八项核验逐项 PASS；产物 `feiyin-ime` 14.66MB `e39ac3a0…`（较 321 +50,176B）/ `feiyin-ime-ui` 10.06MB `8294a624…` / `crash-reporter` 24.88MB `4fcc90ee…`，时间戳 18:22–18:24；**四张规则表三副本全等**（含新拷的 homophone/wordbook） |
+| 探针 | `[LocalRT-DBG-325]`=1 / `[AUTOLEARN]`=1 / `degree_adverbs`=2 / `nz_ratio`=2 |
+| 端测 | 待 Gavin 六条（十分/十分钟；尾字回灌；🔴 预览窗编辑；自学习；先说半句 pre-roll；redecode 频次 <43%） |
