@@ -928,3 +928,15 @@ load_wordbook_vocabulary()
 | 🔴 待裁发现 | `target/release/crash.json`（**00:00:34，早于本 build**）byte-index 非字符边界 panic（`inside '斯'`）；`fbec727` 未显式修；候选 `local_stream.rs:315 raw_full[cache.raw_len..]`；已备份、未改代码 |
 | 量化 | 冒烟 idle CPU 0.04%、WS 1791MB；历史改前 47 次派发**最小 silence=800ms**（无一 <800）；`join/total_decode/tail_wait` 本机无数据 |
 | 端测 | 待 Gavin 五条（🔴 D：连说 15s+ 出 silence<800ms 派发／🔴 尾字 reflow applied 非 skipped-cancel／句尾幻字／接缝重复／其余照旧） |
+
+
+## v0.9.3（批次九 · BUILD-345）· 2026-09-22 · P0 崩溃修复 + DEC-077 回滚 + 失败片不留洞（版本号不升）
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 344（`8282203`）：**P0** 中文按字节切片崩溃（`byte index ... inside '斯'`）修复；**DEC-077 回滚**移除 340 shadow 补静音(500ms) + 340 收尾补静音(2000ms) + 307 每次断句整句重解码（三者实测零收益）；**G** 失败片改用该片**流式文本填补**（不再留永久洞致整场回灌全废）+ `d87b8b4` 注释同步。**替换作废的 8758ca66** |
+| 回归 | TEST-EXEC + BUILD-345 root **1419P/0F/22I**（全量，NEW 6/GONE 3）+ src-tauri **92P/0F/0I** + Vitest **100P/11S/0F**；`cargo fmt --check`（不带 `skip_children`）EXIT 0；warnings **99/90/17（未下降，如实报）** |
+| 出包 | `BUILD-345` 八项核验逐项 PASS；产物 `feiyin-ime` 14.68MB `ce10c4b7…`（−7,680B vs 作废 342）/ `feiyin-ime-ui` 10.05MB `1e3df6d4…` / `crash-reporter` 24.88MB `01378435…`，时间戳 00:58–00:59；四张规则表三副本全等 |
+| P0 验证 | 单测 `charboundary344_mid_char_raw_len_does_not_panic` 通过 + 删旧 crash.json 后冒烟**未新增**；原现场（长口述）交 Gavin |
+| 探针 | 自检 `feiyin`=19；正向 `337`=4/`336`=1/`325`=1/`AUTOLEARN`=4/`degree_adverbs`=2/`nz_ratio`=2；🆕 **反向 345 `feed_tail_silence`/`SHADOW_TAIL_PAD_MS`/`FLUSH_TAIL_PAD_MS` 全 0** ⇒ 三机制彻底移除 |
+| 端测 | 待 Gavin 五条（🔴 长句说到底 `skipped-hole` 基本消失／不得新增 crash.json／停手尾字 1~3s 补上／D 复核／其余照旧） |

@@ -11,12 +11,12 @@
 
 | 项 | 状态 |
 | --- | --- |
-| 版本 | 仍 **0.9.2**。v0.9.3 批次八已出包：最新包 **BUILD-342**（HEAD `fbec727`，含 **派发条件改回 OR 根因(D)** / 松手非取消(A) / 假 endpoint 护栏(F1+F3) / 接缝 padding / + 341/340 tailpad）。🔴 未 push、未打 tag，等 Gavin 明示 |
-| 本轮出包史 | BUILD-258 → 267 → 274 → 280（诊断包）→ 285（🛑 作废）→ 287 → 290 → 296 → 302 → 306 → 321 → 328 → 333 → 338 → 341 → **342（当前）** |
-| 端测待办 | ① 🆕 **BUILD-342 五条**（须 Gavin 真人录音，带 `-debug`）：**1** 🔴 **D（最重要）** 一口气连说 15s+（不要停顿），`[LocalRT-DBG-298] seg dispatch` 应出现 **silence<800ms** 的派发（改前 47 次最小=800ms，一次都没有 <800），请贴回原行；**2** 🔴 尾字：说完**停住不松手**，`[LocalRT-DBG-325/337] reflow applied` 且 action **非 `skipped-cancel`**；**3** 句尾幻字（停顿后不冒没说过的字）；**4** 接缝重复（不再出现「也可以。」孤立片段）；**5** 其余照旧（重复标点／预览编辑／自学习两次+反向／配置界面／首字「你→按」）。🔴 并报 D 后分片变密的**派发次数 / `join: total_decode` / `tail_wait` / CPU**。⚠️ 挂起待裁：`target/release/crash.json` char-boundary panic（§见 result.md §零）② v0.9.1 四项遗留：overlay 编辑态剥尾标点／Key 输入框 placeholder／繁中 ITN（`三點半→3:30`）／「API 配置」新文案布局 |
+| 版本 | 仍 **0.9.2**。v0.9.3 批次九已出包：最新包 **BUILD-345**（HEAD `d87b8b4`，含 **P0 中文切片崩溃修复** / **DEC-077 回滚 340+307 三机制** / 失败片流式填补 G / 342 D/OR 等）。**已替换作废的 8758ca66**。🔴 未 push、未打 tag，等 Gavin 明示 |
+| 本轮出包史 | BUILD-258 → 267 → 274 → 280（诊断包）→ 285（🛑 作废）→ 287 → 290 → 296 → 302 → 306 → 321 → 328 → 333 → 338 → 341 → 342（带 P0 已作废）→ **345（当前）** |
+| 端测待办 | ① 🆕 **BUILD-345 五条**（须 Gavin 真人录音，带 `-debug`）：**1** 🔴 **长句一口气说到底**（中间尽量不停顿）：预览**后半部分**应与最终输出一致；`[LocalRT-DBG-325] action=skipped-hole` **应基本消失**（上一版一次录音 7 片里 6 片是它），请贴 action 分布；**2** 🔴 **不得崩溃**：`target/release/crash.json` 不应新增（P0 修复重点）；**3** 停手不松手 ⇒ 尾字应在 1~3s 内被 accuracy 补上；**4** D 复核：连续说话应有 `silence<800ms` 的派发（改前 47 次最小 800ms）；**5** 其余（重复标点／编辑不被冲／自学习两次+反向／配置界面／首字「你→按」）有观察记一句 ② v0.9.1 四项遗留：overlay 编辑态剥尾标点／Key 输入框 placeholder／繁中 ITN（`三點半→3:30`）／「API 配置」新文案布局 |
 | Worker | ✅ 09-21 新 session 三 Worker 就绪（OpenCode `commandgo/deepseek-v4.1-flash`），coder-1 / coder-2 已 ACK |
 | 文档 | 09-21 归档 handoffs 57 条（610 → 89 行）、todo 批次明细入 archive。DEC-064 两层结构：**新增条目必须 archive 与索引两边都写** |
-| 下一步 | **等 Gavin 端测 BUILD-342 反馈**（重点：D 的 silence<800ms 派发 + 尾字 reflow applied）。🔴 **待主控裁定**：`target/release/crash.json` byte-index 非字符边界 panic（00:00:34，早于本 build；候选 `local_stream.rs:315`）是否热修。⏸ 335 电平闸挂起 |
+| 下一步 | **等 Gavin 端测 BUILD-345 反馈**（重点：长句 `skipped-hole` 是否基本消失 + 不得新增 `crash.json`）。✅ P0 char-boundary 崩溃已由 `8282203` 修复（单测 + 冒烟双证），原现场待 Gavin 长口述复核。⏸ 335 电平闸挂起 |
 
 ---
 
