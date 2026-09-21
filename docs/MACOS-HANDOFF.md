@@ -1996,3 +1996,11 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | `run_pipeline_core` 构造 `pretranscribed` 时，第二元由 `acc_all_native`（各片是否都解码成功）改为 `pretranscribed_native_punctuated(&normalized)` = `punctuation::has_effective_punctuation`（DEC-047 实测口径） | ⚠️ **行为变更，平台中立**：`compose`/detector 均无 `#[cfg]`；macOS 编译同一代码 ⇒ 同继承「不再二次打点」 |
 | `acc_all_native` 挪到 join 的 debug 日志继续观测（语义不再被误用） | ✅ 平台中立 |
 | macOS 侧需要做什么 | ✅ **无需代码改动**；未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未触 `src/platform/**` |
+
+## LOCALRT-TIMESTAMP-336（2026-09-21，coder-2）· 流式模型 token 时间戳可行性（**只诊断，零行为变更**）
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| `local_stream.rs` 加一条 `log_enabled!(Debug)` 守卫的只读探针 `[LocalRT-DBG-336]`（读 `r.timestamps/tokens/is_final/segment/start_time`，**不改 `.map(|r| r.text)`**）+ 新增 `#[ignore]` 离线手工测试 `localrt_timestamp_336_probe_offline` | ✅ 平台中立、**零行为变更**（探针只在 Debug 级打日志；测试默认不跑）；macOS 编译同一代码 |
+| **验证结论**：4 个现成 wav × 78 条探针**全部 `ts=len=0`**（`timestamps` 非 NULL 但为空）⇒ **该流式 paraformer 不提供 token 时间戳**；`start_time` 恒 0.0、`segment` 恒 0、`is_final` 恒 false | ⚠️ 结论对 macOS 同样适用（同一模型/绑定）⇒ 预览切分**不可依赖时间戳**，两端都须另找依据 |
+| macOS 侧需要做什么 | ✅ **无需代码改动**；未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未触 `src/platform/**` |

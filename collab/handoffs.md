@@ -5,6 +5,15 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-2 — LOCALRT-TIMESTAMP-336 ✅ 交付（流式 token 时间戳：模型不提供）
+
+- **结论**：该 streaming paraformer **不提供 token 时间戳**。78 条探针（4 个现成 wav：kv_long/kv_long_204/kv_short/colloq）**全部 `ts=len=0`**（非 NULL 但空 vec）；量具自检成立（text_chars/tokens 递增 1:1）。`start_time` 恒 0.0、`segment` 恒 0、`is_final` 恒 false ⇒ 亦不可对齐。
+- **改动**（零行为变更）：`local_stream.rs` 加 Debug 守卫探针 `[LocalRT-DBG-336]`（不改 `.map(|r| r.text)`）+ `#[ignore]` 离线手工测试 `localrt_timestamp_336_probe_offline`。
+- **跑法**：`cargo test --bin feiyin-ime localrt_timestamp_336 -- --ignored --nocapture`（零人工、可复跑）。
+- **⇒ 预览切分必须另找依据**（句边界 / `pcm_pos`），时间戳路线不可用。
+- **验证**：fmt clean / check 0 error / warnings 99/90 基线 / numstat==-w（90/0）/ 全量 cargo test EXIT 0 / 0 failed（19 ignored）；MACOS-HANDOFF 补小节。
+- 未动版本 / 未 commit / 未出包 / 未碰 `src/audio/mod.rs` / 零凭证。
+
 ## 2026-09-21 — coder-2 — PUNCT-DOUBLE-334 ✅ 交付（最终输出重复标点 `。。`/`，。`）
 
 - **根因**：`main.rs:8317` 把「各片是否解码成功」`acc_all_native` 当 `native_punctuated` ⇒ 任一片失败即误判无标点 ⇒ 对已带标点全文二次打点。

@@ -650,6 +650,23 @@ pub fn transcribe_streaming_local(
                         r.text,
                         r.text.chars().count()
                     );
+                    // LOCALRT-TIMESTAMP-336：**只读探针** —— 流式模型到底给不给 token 时间戳。
+                    // 🔴 只观测：**不改 `.map(|r| r.text)` 取用行为**，本阶段不碰预览合成/切分。
+                    // 量具自检：`text_chars` 恒 >0（本块已在 `!is_empty()` 内）⇒ 行确实执行到，
+                    // 「ts=none」才是模型不给（而非日志没跑）。
+                    let ts_desc = match &r.timestamps {
+                        Some(v) => format!("len={} first_ts={:?}", v.len(), &v[..v.len().min(3)]),
+                        None => "none".to_string(),
+                    };
+                    log::debug!(
+                        "[LocalRT-DBG-336] result probe: text_chars={} tokens={} ts={} is_final={} segment={:?} start_time={:?}",
+                        r.text.chars().count(),
+                        r.tokens.len(),
+                        ts_desc,
+                        r.is_final,
+                        r.segment,
+                        r.start_time
+                    );
                     last_result_text = r.text.clone();
                 }
                 // LOCALRT-FIRSTCHAR-272：首次拿到非空识别文本（首次推理产出）。
@@ -1272,5 +1289,78 @@ mod tests {
             n, expected,
             "口径须与 accuracy 侧 default_acc_num_threads 完全一致"
         );
+    }
+
+    /// LOCALRT-TIMESTAMP-336：**离线**验证流式 paraformer 是否给 token 时间戳。
+    ///
+    /// 手工跑（不会进常规回归）：
+    /// `cargo test --bin feiyin-ime localrt_timestamp_336 -- --ignored --nocapture`
+    ///
+    /// 做法：复用生产建流参数 [`super::create_local_stream_recognizer`] 构造 recognizer，
+    /// 把仓库现成 wav（中文长句）按 ~100ms chunk 喂进 OnlineStream，与生产主循环同序
+    /// （`accept_waveform → while is_ready decode → get_result`），每次文本变化打印一行探针。
+    /// 🔴 **只读观测**：不改 `.map(|r| r.text)` 取用行为，不碰预览合成。
+    /// 🔴 量具自检：同一行打印 `text_chars`（此处恒 >0）⇒「ts=none」可区分「模型不给」与「行未执行」。
+    #[test]
+    #[ignore = "手工：需模型 + wav；离线验证 336（不接受麦克风）"]
+    fn localrt_timestamp_336_probe_offline() {
+        use sherpa_onnx::Wave;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let recognizer = super::create_local_stream_recognizer(&root.join("models"))
+            .expect("create_local_stream_recognizer（模型须在位）");
+        for rel in [
+            "models/kv259/kv_long.wav",
+            "models/kv259/kv_long_204.wav",
+            "models/kv259/kv_short.wav",
+            "models/kv259/colloq.wav",
+        ] {
+            let path = root.join(rel);
+            let path_str = path.to_string_lossy();
+            let Some(wave) = Wave::read(&path_str) else {
+                println!("[336] skip missing {rel}");
+                continue;
+            };
+            let rate = wave.sample_rate();
+            let samples = wave.samples();
+            let stream = recognizer.create_stream();
+            // chunk ≈ 100ms（与生产音频回调量级一致；建流参数由 create_local_stream_recognizer 提供）
+            let chunk = (rate as usize / 10).max(1);
+            let mut last = String::new();
+            let mut printed = 0usize;
+            let mut pos = 0usize;
+            while pos < samples.len() {
+                let end = (pos + chunk).min(samples.len());
+                stream.accept_waveform(rate, &samples[pos..end]);
+                while recognizer.is_ready(&stream) {
+                    recognizer.decode(&stream);
+                }
+                pos = end;
+                if let Some(r) = recognizer.get_result(&stream) {
+                    if !r.text.is_empty() && r.text != last {
+                        let ts_desc = match &r.timestamps {
+                            Some(v) => {
+                                format!("len={} first_ts={:?}", v.len(), &v[..v.len().min(3)])
+                            }
+                            None => "none".to_string(),
+                        };
+                        println!(
+                            "[LocalRT-DBG-336] result probe: text_chars={} tokens={} ts={} is_final={} segment={:?} start_time={:?}",
+                            r.text.chars().count(),
+                            r.tokens.len(),
+                            ts_desc,
+                            r.is_final,
+                            r.segment,
+                            r.start_time
+                        );
+                        last = r.text.clone();
+                        printed += 1;
+                        if printed > 20 {
+                            break; // 有界，避免刷屏
+                        }
+                    }
+                }
+            }
+            println!("[336] {rel}: probes_printed={printed}");
+        }
     }
 }
