@@ -46,34 +46,31 @@ impl<'a> SendOnlineRecognizerRef<'a> {
     }
 }
 
-/// 流式解码线程数。**默认 8**（Gavin 2026-09-21 拍板，由 4 上调）。
+/// 流式解码线程数：**按运行机器的 CPU 核数取，不写死**（Gavin 2026-09-21 定）。
 ///
-/// 沿革：POC-LOCAL-STREAM-235 实测 4 线程 RTF 最好（**单独运行**前提）；
-/// TUNE-STREAM-317 加 env `LOCAL_STREAM_NUM_THREADS`；本次直接把默认值提到 8。
+/// 写死具体数字的问题：8 在 4 核机器上就是超订两倍；不同用户机器核数不同，
+/// 开发机上的最优值搬到用户机器上可能恰是最差值。
 ///
-/// Gavin 的判断：现代 CPU 处理能力足够，且 298 并行后整体耗时已大幅缩短，
-/// 内核多任务切换本就是常态，不必为此纠结。
+/// 口径与 accuracy 侧 `default_acc_num_threads()` **完全一致**：
+/// `available_parallelism().min(8)`，取不到时回落 4。
+/// 🔴 上限 8 的依据：271 本机实测 accuracy 线程曲线，长音频 0/1/2/4/**8**/12/**16** 线程 =
+/// 30.9/31.1/20.9/22.4/**17.0**/19.8/**34.2** 秒 —— 8 最优，**16 比 8 慢一倍**、甚至慢于单线程。
+/// 故机器核再多也不超过 8。
 ///
-/// 🔴 **反向数据（保留备查，不是反对意见）**：271 在本机（8 物理核 / 16 逻辑核）测过
-/// accuracy 的线程曲线，长音频耗时 0/1/2/4/**8**/12/**16** 线程 =
-/// 30.9/31.1/20.9/22.4/**17.0**/19.8/**34.2** 秒 —— **16 线程比 8 线程慢一倍**，
-/// 甚至慢于单线程。298 之后流式(8) + accuracy(8) = 16 个计算线程，正落在那一列。
-/// 但该曲线是 accuracy **独占运行**时测的，而流式模型轻得多（RTF 0.042–0.076），
-/// 不一定同样陡。**若端测发现预览卡顿或首字变慢，先把本值调回 4 验证**（env 可调，无需出包）。
+/// 沿革：POC-LOCAL-STREAM-235 定 4（独占运行前提）→ TUNE-STREAM-317 加 env →
+/// Gavin 提到 8 → 本次改为按核数动态取，并删除 env（开发端与用户端行为必须一致）。
+fn local_stream_num_threads() -> i32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(8) as i32)
+        .unwrap_or(4)
+}
+
 // 🔴 TUNE-STREAM-317 / TEST-SWEEP-319：`blank_penalty` 对本模型**完全无效**，已撤。
 // 实测（tester-1，证据 collab/evidence/20260921-sweep319-blankpenalty/）：
 // 0 / -0.5 / -1.0 / -1.5 / +0.5 五档输出**逐字节相同**，追加极端值 ±100 仍逐字节相同；
 // 且已用临时 println 自证 env 确实被应用 ⇒ 不是没传进去，是流式 paraformer 路径不消费该字段。
 // 属 [PROVIDER-SILENT-FALLBACK-001] 同族：参数收下、静默不生效。
 // **不要再加回来**；要改流式的吐字倾向，得换别的机制。
-const LOCAL_STREAM_NUM_THREADS: i32 = 8;
-
-/// TUNE-STREAM-317：解析 `LOCAL_STREAM_NUM_THREADS`（非法/缺失 ⇒ 默认 4；要求 ≥1）。
-fn parse_stream_num_threads(v: Option<&str>) -> i32 {
-    v.and_then(|s| s.trim().parse::<i32>().ok())
-        .filter(|n| *n >= 1)
-        .unwrap_or(LOCAL_STREAM_NUM_THREADS)
-}
 
 /// LOCAL-RT-ENGINE-239-A（DEC-067）：端点检测参数。
 ///
@@ -118,16 +115,17 @@ const SHADOW_MAX_AUDIO_SECS: f32 = 12.0;
 /// 并行转写」，**绝不触发** `reset()` / 切句 / `sentence_id += 1`（那是显示层的事）。
 const ACC_DISPATCH_SILENCE_MS_DEFAULT: f32 = 800.0;
 
-/// LOCALRT-PARALLEL-ACC-298：最小派发片长默认值（**5s**，Gavin 2026-09-21 拍板由 3s 上调）。
+/// LOCALRT-PARALLEL-ACC-298：最小派发片长默认值（**5s**，Gavin 2026-09-21 最终定值）。
+///
+/// 沿革：初版 3s（主控拍的，未经实测）→ **5s（Gavin 最终定值：切碎了偏差大）**；期间一度议到 4s，最终仍取 5s。
 ///
 /// 800ms 停顿在口语里很密，不设下限会切出 0.5s 碎片（每片固定解码开销 + 上下文过短伤精度）。
+/// 片越短，模型可用的声学/语言上下文越少、偏差越大；5s 是「够长不碎、又不至于让短句拿不到并行」
+/// 的折中。配套的静默判据 `ACC_DISPATCH_SILENCE_MS_DEFAULT` = 800ms 不变。
 ///
-/// 🔴 **为什么是 5s 而不是 3s**：段与段之间**没有任何上下文传递**
-/// （`user_prompt` 是构造期字段，per-stream 通道未接通 —— 见 upstream issue
-/// k2-fsa/sherpa-onnx#3970），片越短模型可用的声学/语言上下文越少、偏差越大。
-/// Gavin 原话：「长一点可识别误差小一点，否则切的碎了偏差大」。
-/// 代价是短句更不容易触发并行（<5s 的未派发区间不切），但短句本来就只等 ~1.6s，
-/// 并行收益小、风险却相同 ⇒ 这个取舍偏向质量是对的。
+/// 🔴 注意：LOCALRT-CTX-INJECT-320 之后，片与片之间**已经有上下文传递**
+/// （Qwen3 per-stream 注入前序分片文本），故「片短 ⇒ 无上下文」这条旧理由已不完全成立；
+/// 但声学上下文仍随片长增加，故仍设下限。
 ///
 /// 仍做成 env 可调（`LOCAL_RT_ACC_MIN_SEG_MS`），端测可比对不同取值。
 const ACC_MIN_SEGMENT_MS_DEFAULT: u64 = 5000;
@@ -147,23 +145,15 @@ pub struct AccDispatchConfig {
 }
 
 impl AccDispatchConfig {
-    /// 从 env 读取（沿用 `LOCAL_RT_RULE2` / `LOCAL_RT_SHADOW_MS` 写法），并 `debug!` 打一行实际取值。
-    pub fn from_env() -> Self {
-        let enabled = std::env::var("LOCAL_RT_ACC_PARALLEL")
-            .map(|v| v != "0")
-            .unwrap_or(true);
-        let silence_ms = std::env::var("LOCAL_RT_ACC_SILENCE_MS")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .filter(|v| *v > 0.0)
-            .unwrap_or(ACC_DISPATCH_SILENCE_MS_DEFAULT);
-        let min_seg_ms = std::env::var("LOCAL_RT_ACC_MIN_SEG_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(ACC_MIN_SEGMENT_MS_DEFAULT);
+    /// 🔴 常量构造，**无 env 覆盖**（Gavin 2026-09-21 定：不允许开发端与用户端行为不一致）。
+    /// 用户机器上不存在任何环境变量；env 覆盖等于给开发机开一条用户永远走不到的路径，
+    /// 且测试时 env 残留会让结论失真。要改参数就改常量重新构建 —— 构建出来的就是用户跑的那一份。
+    pub fn new() -> Self {
+        let enabled = true;
+        let silence_ms = ACC_DISPATCH_SILENCE_MS_DEFAULT;
+        let min_seg_ms = ACC_MIN_SEGMENT_MS_DEFAULT;
         log::debug!(
-            "[LocalRT-DBG-298] acc parallel cfg: enabled={} silence_ms={} min_seg_ms={} (env LOCAL_RT_ACC_PARALLEL/LOCAL_RT_ACC_SILENCE_MS/LOCAL_RT_ACC_MIN_SEG_MS)",
+            "[LocalRT-DBG-298] acc parallel cfg: enabled={} silence_ms={} min_seg_ms={}",
             enabled,
             silence_ms,
             min_seg_ms
@@ -301,9 +291,8 @@ pub fn create_local_stream_recognizer(model_dir: &Path) -> Result<OnlineRecogniz
         decoder: Some(dec.to_string_lossy().to_string()),
     };
     c.model_config.tokens = Some(tok.to_string_lossy().to_string());
-    // TUNE-STREAM-317：线程数 env 覆盖（默认 8，见常量处沿革与 271 反向数据）。
-    let num_threads =
-        parse_stream_num_threads(std::env::var("LOCAL_STREAM_NUM_THREADS").ok().as_deref());
+    // TUNE-STREAM-317：线程数常量（8，沿革与 271 反向数据见常量处）。无 env 覆盖。
+    let num_threads = local_stream_num_threads();
     c.model_config.num_threads = num_threads;
     c.model_config.provider = Some("cpu".to_string());
     c.model_config.debug = false;
@@ -311,18 +300,14 @@ pub fn create_local_stream_recognizer(model_dir: &Path) -> Result<OnlineRecogniz
     c.decoding_method = Some("greedy_search".to_string());
     // 端点：不开则 is_endpoint() 永不触发，sentence_end 分支成死代码
     c.enable_endpoint = true;
-    // LOCALRT-ENDPOINT-284 实验（方案 A 取证）：rule2 可经 env `LOCAL_RT_RULE2` 临时覆盖，
-    // 默认仍 2.0（无 env 时行为零变）。用于实测 2.0/1.5/1.0/0.5 的切句后果；定案后移除。
-    let rule2 = std::env::var("LOCAL_RT_RULE2")
-        .ok()
-        .and_then(|s| s.parse::<f32>().ok())
-        .filter(|v| *v > 0.0)
-        .unwrap_or(LOCAL_STREAM_RULE2_MIN_TRAILING_SILENCE);
+    // LOCALRT-ENDPOINT-284：rule2 已定案为 2.0（ASR-SEG-229 防复发值）。
+    // 原实验用的 env `LOCAL_RT_RULE2` 按「定案后移除」的约定已删除。
+    let rule2 = LOCAL_STREAM_RULE2_MIN_TRAILING_SILENCE;
     c.rule1_min_trailing_silence = LOCAL_STREAM_RULE1_MIN_TRAILING_SILENCE;
     c.rule2_min_trailing_silence = rule2;
     c.rule3_min_utterance_length = LOCAL_STREAM_RULE3_MIN_UTTERANCE_LENGTH;
     log::debug!(
-        "[LocalRT-DBG-284] rule1={} rule2={} rule3={} (rule2 env LOCAL_RT_RULE2 override)",
+        "[LocalRT-DBG-284] rule1={} rule2={} rule3={}",
         LOCAL_STREAM_RULE1_MIN_TRAILING_SILENCE,
         rule2,
         LOCAL_STREAM_RULE3_MIN_UTTERANCE_LENGTH
@@ -330,7 +315,7 @@ pub fn create_local_stream_recognizer(model_dir: &Path) -> Result<OnlineRecogniz
     // TUNE-STREAM-317：启动打三个调优点的**实际取值**，供端测对账。
     // 第三项 HomophoneReplacer 本单定性为「不做」（rule_fsts 需预编译 FST，见 result），固定 off。
     log::debug!(
-        "[LocalRT-DBG-317] stream tuning: num_threads={} homophone_replacer=off provider=cpu decoding=greedy_search endpoint=true (env LOCAL_STREAM_NUM_THREADS)",
+        "[LocalRT-DBG-317] stream tuning: num_threads={} homophone_replacer=off provider=cpu decoding=greedy_search endpoint=true",
         num_threads,
     );
 
@@ -420,15 +405,8 @@ pub fn transcribe_streaming_local(
     let mut silent_ms: f32 = 0.0;
 
     // LOCALRT-ENDPOINT-284（方案 B）：影子收尾（只动显示层）。
-    let shadow_trigger_ms: f32 = std::env::var("LOCAL_RT_SHADOW_MS")
-        .ok()
-        .and_then(|s| s.parse::<f32>().ok())
-        .filter(|v| *v > 0.0)
-        .unwrap_or(SHADOW_FINALIZE_MS_DEFAULT);
-    log::debug!(
-        "[LocalRT-DBG-284] shadow_trigger_ms={} (env LOCAL_RT_SHADOW_MS override)",
-        shadow_trigger_ms
-    );
+    let shadow_trigger_ms: f32 = SHADOW_FINALIZE_MS_DEFAULT;
+    log::debug!("[LocalRT-DBG-284] shadow_trigger_ms={}", shadow_trigger_ms);
     // 当前句音频在 `pcm` 中的起点（上次 endpoint reset 之后）。
     let mut sentence_pcm_start: usize = 0;
     // 影子收尾产出的当前句文本（仅显示；新语音进来即作废）。
@@ -924,8 +902,8 @@ pub fn transcribe_streaming_local(
 #[cfg(test)]
 mod tests {
     use super::{
-        endpoint_confirm_text, parse_stream_num_threads, should_dispatch_acc, should_dispatch_tail,
-        LOCAL_STREAM_NUM_THREADS, SAMPLE_RATE,
+        endpoint_confirm_text, local_stream_num_threads, should_dispatch_acc, should_dispatch_tail,
+        SAMPLE_RATE,
     };
 
     /// FIX-LOCALRT-TAILCHAR-291/307：三方取最长（main / full / shadow），结果恒 ≥ main。
@@ -1267,23 +1245,24 @@ mod tests {
     }
 
     // ============================================================
-    // TUNE-STREAM-317：流式侧两个 env 的解析（非法值回落默认；默认 = 现行为）
+    // TUNE-STREAM-317 / Gavin 2026-09-21：env 覆盖已全部删除，线程数按机器核数取。
     // ============================================================
 
+    /// 线程数须**随机器核数变化**且封顶 8，不得写死。
     #[test]
-    fn tune317_parse_num_threads_invalid_falls_back_to_default_8() {
-        // 🔴 默认值由 4 提到 8（Gavin 2026-09-21 拍板），断言随之更新。
-        assert_eq!(
-            parse_stream_num_threads(None),
-            LOCAL_STREAM_NUM_THREADS,
-            "缺失 ⇒ 默认（绑常量，避免默认值再改时测试与实现脱节）"
+    fn stream_num_threads_follows_machine_cores_and_caps_at_8() {
+        let n = local_stream_num_threads();
+        assert!(n >= 1, "至少 1；取不到核数时回落 4");
+        assert!(
+            n <= 8,
+            "封顶 8（271 实测：16 线程比 8 慢一倍，甚至慢于单线程）"
         );
-        assert_eq!(LOCAL_STREAM_NUM_THREADS, 8, "默认值应为 8");
-        assert_eq!(parse_stream_num_threads(Some("4")), 4, "显式 4 仍可回退");
-        assert_eq!(parse_stream_num_threads(Some(" 2 ")), 2, "容忍空白");
-        assert_eq!(parse_stream_num_threads(Some("0")), 8, "<1 非法 ⇒ 默认");
-        assert_eq!(parse_stream_num_threads(Some("-3")), 8, "负数非法 ⇒ 默认");
-        assert_eq!(parse_stream_num_threads(Some("abc")), 8, "非数字 ⇒ 默认");
-        assert_eq!(parse_stream_num_threads(Some("2.5")), 8, "非整数 ⇒ 默认");
+        let expected = std::thread::available_parallelism()
+            .map(|c| c.get().min(8) as i32)
+            .unwrap_or(4);
+        assert_eq!(
+            n, expected,
+            "口径须与 accuracy 侧 default_acc_num_threads 完全一致"
+        );
     }
 }

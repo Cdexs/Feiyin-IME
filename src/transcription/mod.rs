@@ -7,9 +7,7 @@ use std::sync::{Mutex, OnceLock};
 use crate::{config::ChineseScript, punctuation, text_normalizer};
 
 // Re-export SenseVoice config for convenience
-use sherpa_onnx::{
-    OfflineFunASRNanoModelConfig, OfflineQwen3ASRModelConfig, OfflineSenseVoiceModelConfig,
-};
+use sherpa_onnx::{OfflineQwen3ASRModelConfig, OfflineSenseVoiceModelConfig};
 
 pub mod local_stream;
 pub mod qwen_inference;
@@ -108,56 +106,21 @@ impl AsrModel {
     }
 }
 
-/// MIGRATE-QWEN3-314（DEC-076）：`AsrModel::Accuracy` 背后的识别器引擎。
+/// MIGRATE-QWEN3-320（Gavin 2026-09-21 拍板）：**accuracy 档就是 Qwen3-ASR，不再保留双引擎/回滚开关**。
 ///
-/// 🔴 **不新增 `AsrModel` 变体** —— 新增变体要全仓 grep `==`/`!=` 逐个判断，编译器不报错
-/// （`[ENUM-EQ-CHECK-MISSES-NEW-VARIANT-001]`）。只切换 Accuracy 背后加载的模型，
-/// `uses_accuracy_engine()` / VAD 分段 / `native_punctuated` 等判据全部沿用不变。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum AccuracyEngine {
-    /// 默认：Qwen3-ASR 0.6B（MIGRATE-QWEN3-314 / DEC-076）。
-    Qwen3,
-    /// 回滚路径：FunASR Nano native（原现役引擎，模型与代码保留不删）。
-    FunAsr,
-}
-
-/// 纯函数：解析引擎选择（便于单测，不碰全局 env）。
-fn accuracy_engine_from(v: Option<&str>) -> AccuracyEngine {
-    match v {
-        Some(s) if s.eq_ignore_ascii_case("funasr") => AccuracyEngine::FunAsr,
-        // 默认 qwen3；未知值也回落 qwen3（只有明确写 funasr 才回滚）
-        _ => AccuracyEngine::Qwen3,
-    }
-}
-
-/// 读取 env 回滚开关 `VOICE_IME_ACCURACY_ENGINE=funasr|qwen3`（默认 qwen3）。
+/// 原 `AccuracyEngine` 枚举 + `VOICE_IME_ACCURACY_ENGINE` env 已删除。理由：实际发布只下载 Qwen3，
+/// 用户机器无 FunASR 模型文件，开关在用户侧永远无效（只在开发机双模型时有意义），属过度设计；
+/// 且两套构造/就位/预算路径各自为政、易漏同步（`[CONFIG-MIRROR-DRIFT-001]` 同族）。
 ///
-/// 🔴 回滚用途（参照 298 的 `LOCAL_RT_ACC_PARALLEL` 先例）：端测出问题时**不用重新出包**，
-/// 设 `VOICE_IME_ACCURACY_ENGINE=funasr` 即逐位退回今天的行为。
-fn accuracy_engine() -> AccuracyEngine {
-    accuracy_engine_from(std::env::var("VOICE_IME_ACCURACY_ENGINE").ok().as_deref())
-}
+/// 🔴 不新增 `AsrModel` 变体（`[ENUM-EQ-CHECK-MISSES-NEW-VARIANT-001]`）；`uses_accuracy_engine()` /
+/// VAD 分段 / `native_punctuated` 判据沿用不变。**performance 档 SenseVoice 与流式 paraformer 不受影响**。
 
-/// MIGRATE-QWEN3-315：accuracy 侧解码线程数**默认值** = 现状
-/// `min(逻辑核数, 8)`（RESEARCH-ACC-LATENCY-271 实测最优；取不到兜底 4）。**不改默认**。
+/// accuracy 侧解码线程数（**唯一来源，无 env**）：`min(逻辑核数, 8)`
+/// （RESEARCH-ACC-LATENCY-271 实测最优；取不到兜底 4）。
 fn default_acc_num_threads() -> i32 {
     std::thread::available_parallelism()
         .map(|n| n.get().min(8) as i32)
         .unwrap_or(4)
-}
-
-/// MIGRATE-QWEN3-315：解析 `ACC_NUM_THREADS`（非法/缺失/<1 ⇒ 回落现状默认）。
-///
-/// 用途：与 317 的 `LOCAL_STREAM_NUM_THREADS` 配套，让 tester-1 扫「流式 N + accuracy M」组合
-/// —— 298 之后两者并发，4+8=12 > 8 物理核，这笔账从未合并评估过。
-fn acc_num_threads_from(v: Option<&str>) -> i32 {
-    v.and_then(|s| s.trim().parse::<i32>().ok())
-        .filter(|n| *n >= 1)
-        .unwrap_or_else(default_acc_num_threads)
-}
-
-fn acc_num_threads() -> i32 {
-    acc_num_threads_from(std::env::var("ACC_NUM_THREADS").ok().as_deref())
 }
 
 /// ASR transcriber using sherpa-onnx
@@ -253,12 +216,150 @@ impl<'a> SendOfflineRecognizerRef<'a> {
 /// → 空则 Err(NativeEmpty) → normalize_text_for_language + native_punctuated=true`。
 /// 独立成自由函数，是为了让 accuracy worker 在 scope 线程内**只借 recognizer、不入 `&self`**
 /// （`Transcriber` 非 `Sync`，不能跨线程共享 `&self`）。
-pub(crate) fn transcribe_accuracy_segment(
+/// LOCALRT-CTX-INJECT-320：上下文注入参数（accuracy worker 每片 **per-stream** 注入）。
+///
+/// - `CTX_DEFAULT_CHARS`：**时间线合并后**的统一上限，**常量 500 字**（320 修正：三段合一取尾，
+///   超长只从**最旧**一端截 ⇒ 本次录音刚完成的片永远保留；KV 4096 余量充足）。
+/// - 上下文注入**恒开**（原 `LOCAL_RT_CTX_ENABLED` 已删；Gavin 2026-09-21：不允许存在开发端/用户端
+///   不一致，用户机器无 env ⇒ env 覆盖是假路径。止血手段不再保留）。
+/// - 🔴 per-stream 通道仅 Qwen3 可用（accuracy 引擎已固定 Qwen3）。
+const CTX_DEFAULT_CHARS: usize = 500;
+/// 回显判定：LCS ≥ 此绝对长度（正常组 LCS=3、故障组 LCS=79；20 在两者之间、靠近正常侧）。
+const CTX_ECHO_LCS_ABS: usize = 20;
+/// 回显判定：LCS ≥ 输出的此比例（短输出也可能整段回显）。
+const CTX_ECHO_LCS_RATIO: f64 = 0.5;
+const CTX_INSTR_EN: &str = "The following is the preceding context of this recording. Use it to keep terminology and wording consistent.";
+
+/// 取字符串**最后** n 个字符（最近的最相关）；不足 n 全取。
+fn last_n_chars(s: &str, n: usize) -> String {
+    let v: Vec<char> = s.chars().collect();
+    if v.len() <= n {
+        s.to_string()
+    } else {
+        v[v.len() - n..].iter().collect()
+    }
+}
+
+/// 拼 system 段：英文说明句 + `Context:`（时间线）+ `Terms:`（词库），各占一行加标签。
+/// 两者皆空 ⇒ None（不注入）。
+fn build_ctx_system(context: Option<&str>, terms: Option<&str>) -> Option<String> {
+    let c = context.unwrap_or("").trim();
+    let t = terms.unwrap_or("").trim();
+    if c.is_empty() && t.is_empty() {
+        return None;
+    }
+    let mut s = String::from(CTX_INSTR_EN);
+    if !c.is_empty() {
+        s.push_str(&format!("\nContext: {c}"));
+    }
+    if !t.is_empty() {
+        s.push_str(&format!("\nTerms: {t}"));
+    }
+    Some(s)
+}
+
+/// LOCALRT-CTX-INJECT-320：注入素材——三段按**严格时间顺序**（上上次 → 上一次 → 本次已完成片）+ 词库。
+///
+/// 🔴 三段**合成一条时间线**，超长时**只从最旧端截**（先砍上上次、再砍上一次，本次刚完成的片永不先掉）。
+/// 不设分段配额（Gavin 2026-09-21 修正，推翻主控的「分开留额度」草案）。
+pub struct CtxInject<'a> {
+    pub prev_older: Option<&'a str>,
+    pub prev_latest: Option<&'a str>,
+    pub current: Option<&'a str>,
+    pub terms: Option<&'a str>,
+}
+
+/// 按时间顺序合并三段为一条时间线（跳过空段）；返回 `(合并串, [上上次,上一次,本次] 各段字数)`。
+fn merge_ctx_timeline(
+    prev_older: Option<&str>,
+    prev_latest: Option<&str>,
+    current: Option<&str>,
+) -> (String, [usize; 3]) {
+    let mut merged: Vec<&str> = Vec::new();
+    let mut lens = [0usize; 3];
+    for (i, p) in [prev_older, prev_latest, current].into_iter().enumerate() {
+        let t = p.unwrap_or("").trim();
+        lens[i] = t.chars().count();
+        if !t.is_empty() {
+            merged.push(t);
+        }
+    }
+    (merged.join("\n"), lens)
+}
+
+/// 回显探针归一化：去空白与常见中英标点（回显是逐字文本，标点差异不应漏检）。
+fn normalize_ctx_probe(s: &str) -> String {
+    const PUNCT: &[char] = &[
+        '。', '，', '、', '！', '？', '；', '：', '「', '」', '『', '』', '“', '”', '‘', '’', '…',
+        '—', '（', '）', '【', '】', '.', ',', '!', '?', ';', ':', '"', '\'', '(', ')', '[', ']',
+    ];
+    s.chars()
+        .filter(|c| !c.is_whitespace() && !PUNCT.contains(c))
+        .collect()
+}
+
+/// 最长公共**子串**长度（字符），用于检测「整片逐字回显上一片」。
+fn lcs_len(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
+    let mut prev = vec![0usize; b.len() + 1];
+    let mut best = 0usize;
+    for i in 1..=a.len() {
+        let mut cur = vec![0usize; b.len() + 1];
+        for j in 1..=b.len() {
+            if a[i - 1] == b[j - 1] {
+                cur[j] = prev[j - 1] + 1;
+                if cur[j] > best {
+                    best = cur[j];
+                }
+            }
+        }
+        prev = cur;
+    }
+    best
+}
+
+/// 回显处置：命中 ⇒ Redecode（**不丢片**，同音频无上下文重解一次）。
+#[derive(PartialEq, Eq, Debug)]
+enum CtxEchoAction {
+    Keep,
+    Redecode,
+}
+
+fn ctx_echo_action(out_norm: &str, ctx_norm: &str) -> (usize, CtxEchoAction) {
+    let l = lcs_len(out_norm, ctx_norm);
+    let out_len = out_norm.chars().count();
+    let hit =
+        l >= CTX_ECHO_LCS_ABS || (out_len > 0 && (l as f64) >= CTX_ECHO_LCS_RATIO * out_len as f64);
+    (
+        l,
+        if hit {
+            CtxEchoAction::Redecode
+        } else {
+            CtxEchoAction::Keep
+        },
+    )
+}
+
+/// 是否注入：有可注入文本即注入（**恒开、无 env**；引擎固定 Qwen3）。
+fn should_inject_ctx(system: Option<&str>) -> bool {
+    system.is_some()
+}
+
+/// 一次 accuracy 解码（可选 per-stream system 段）。返回规范化后的文本。
+fn decode_accuracy_once(
     recognizer: &sherpa_onnx::OfflineRecognizer,
     samples: &[f32],
+    system: Option<&str>,
     script: ChineseScript,
-) -> Result<(String, bool)> {
+) -> Result<String> {
     let stream = recognizer.create_stream();
+    if let Some(s) = system {
+        stream.set_option("hotwords", s);
+    }
     stream.accept_waveform(16000, samples);
     recognizer.decode(&stream);
     let result = stream.get_result().context("No transcription result")?;
@@ -267,10 +368,85 @@ pub(crate) fn transcribe_accuracy_segment(
         // 与 transcribe_segment_detailed 一致：accuracy 空输出 ⇒ 该段失败（上层 all_native=false）
         anyhow::bail!("ASR accuracy model produced empty output");
     }
-    Ok((
-        text_normalizer::normalize_text_for_language(&text, script),
-        true,
-    ))
+    Ok(text_normalizer::normalize_text_for_language(&text, script))
+}
+
+/// 无注入的简版单段入口（保留兼容；生产路径已切 `transcribe_accuracy_segment_ctx`）。
+#[allow(dead_code)]
+pub(crate) fn transcribe_accuracy_segment(
+    recognizer: &sherpa_onnx::OfflineRecognizer,
+    samples: &[f32],
+    script: ChineseScript,
+) -> Result<(String, bool)> {
+    decode_accuracy_once(recognizer, samples, None, script).map(|t| (t, true))
+}
+
+/// LOCALRT-CTX-INJECT-320：带「上下文 + 词库」per-stream 注入 + 长跨回显护栏的 accuracy 单段解码。
+///
+/// - `context`：前序分片累计文本（调用方已截到最后 300 字；第 1 片传 None）。
+/// - `terms`：用户词库词条（原样；调用方给）。
+/// - 命中回显 ⇒ 同音频**无上下文重解一次**，用重解码结果（不丢片）。
+pub(crate) fn transcribe_acc_ctx(
+    recognizer: &sherpa_onnx::OfflineRecognizer,
+    samples: &[f32],
+    script: ChineseScript,
+    seg_idx: usize,
+    inject: CtxInject<'_>,
+) -> Result<(String, bool)> {
+    // B/C：三段按时间顺序合并成一条时间线（上上次 → 上一次 → 本次已完成片）。
+    // 🔴🔴 截断方向：**从头部（时间最远）截，保留尾部（时间最近）**——即 `last_n_chars(_, CAP)`
+    //   保留最后 CAP 个字符。举例：CAP=500，三段 200+180+150=530 ⇒ 砍掉「上上次」开头 80 字，
+    //   结果 = 上上次后 120 + 上一次全部 180 + 本次全部 150。本次刚完成的片**永远最后才被考虑**。
+    //   ⚠️ 方向极易被后人改反；改反 = 丢掉最相关的刚说内容、留一堆最旧的，比不加还糟。
+    let (ctx_raw, lens) = merge_ctx_timeline(inject.prev_older, inject.prev_latest, inject.current);
+    let ctx_raw_len = ctx_raw.chars().count();
+    let ctx = last_n_chars(&ctx_raw, CTX_DEFAULT_CHARS);
+    let ctx_len = ctx.chars().count();
+    let cut = ctx_raw_len.saturating_sub(ctx_len);
+    let terms_len = inject.terms.map(|s| s.chars().count()).unwrap_or(0);
+    let ctx_opt = (!ctx.is_empty()).then_some(ctx.as_str());
+    let system = build_ctx_system(ctx_opt, inject.terms);
+    let inject_on = should_inject_ctx(system.as_deref());
+    let mut text = decode_accuracy_once(
+        recognizer,
+        samples,
+        system.as_deref().filter(|_| inject_on),
+        script,
+    )?;
+    // D：ctx 定稿后才做长跨回显护栏（命中 ⇒ 无上下文重解，不丢片）。
+    let mut lcs = 0usize;
+    let mut action = CtxEchoAction::Keep;
+    if inject_on {
+        if let Some(sys) = system.as_deref() {
+            let (l, a) = ctx_echo_action(&normalize_ctx_probe(&text), &normalize_ctx_probe(sys));
+            lcs = l;
+            if a == CtxEchoAction::Redecode {
+                action = CtxEchoAction::Redecode;
+                text = decode_accuracy_once(recognizer, samples, None, script)?;
+            }
+        }
+    }
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "[LocalRT-DBG-320] ctx inject: seg={} prev2_len={} prev1_len={} acc_len={} ctx_raw_len={} ctx_len={} cut={} terms_len={} out_chars={} lcs={} action={}",
+            seg_idx,
+            lens[0],
+            lens[1],
+            lens[2],
+            ctx_raw_len,
+            ctx_len,
+            cut,
+            terms_len,
+            text.chars().count(),
+            lcs,
+            if action == CtxEchoAction::Redecode {
+                "redecode"
+            } else {
+                "keep"
+            }
+        );
+    }
+    Ok((text, true))
 }
 
 impl Transcriber {
@@ -790,41 +966,48 @@ pub fn hotwords_version(entries: &[String]) -> u64 {
 /// 全量 11 条含无关英文词 → 60%（比无 hotwords 62.5% 还差）。
 /// ASR-ACC-TUNE-001（2026-07-08 Gavin 拍板）：50→20，002/003 实测 hw=50 比 hw=20
 /// 退化 -2.5pp，10-20 为最优区间。
-/// 🔴 HOTWORDS-BUDGET-265（Gavin 2026-09-20 拍板）：20 → **120**。
-/// 背景：accuracy 换 KV=1024（DEC-072）后 20s 段预算 149→667，条数可放开；
-/// 但**必须同时设字符预算**（见 HOTWORDS_MAX_TOTAL_CHARS，DEC-071）——只放开条数会因
-/// 120×10 字 ≈1000 token 重新溢出，比换 1024 之前更糟。
-pub const HOTWORDS_MAX_ENTRIES: usize = 120;
+/// 🔴 MIGRATE-QWEN3-320（Gavin 2026-09-21）：20 → 120 → **200**。
+/// ⚠️ 真正卡条数的是 token 预算（见 `HOTWORDS_MAX_TOTAL_TOKENS`）；条数仅作上限。
+pub const HOTWORDS_MAX_ENTRIES: usize = 200;
 
 /// ASR-ACC-OPT-001 方案 A：hotwords 单条最大字符数。
 /// 超长的词条（candidates 整句）不灌入，避免膨胀 user_prompt。
 pub const HOTWORDS_MAX_ENTRY_CHARS: usize = 10;
 
-/// HOTWORDS-TOKEN-268：热词**总 token 预算**（**C++ 口径**，含 `,` 分隔符）。
+/// 热词**总 token 预算**（**Qwen3 @ `max_total_len=4096`**）。
 ///
-/// 算式（全按 C++ `FunASRNanoTokenizer` 口径；最坏 20.4s 段含 VAD padding）：
+/// 算式：
 /// ```
-/// 1024(max_total_len)
-/// − 340(20.4s 段音频)
-/// − 168(模板 + user_prompt + 特殊 token；实测最小差值)
-/// − 160(生成预留)   ← 🔴 以前漏了这项，就是「生成饿死」的成因（DEC-069 第二级静默失效）
-/// = 356
+/// 4096
+/// − 260(20s 音频 token；Qwen3 实测 13.0 tok/s × 20)
+/// − 231(上下文 300 字；Qwen3 ~0.77 tok/字)
+/// −  40(说明句 + Context / Terms 标签)
+/// − 256(生成预留 = max_new_tokens)
+/// = 3309  ⇒ 取保守值 3000（Gavin 明确「余量很大，不要再抠」）
 /// ```
-/// 160 生成预留依据：20s 段约说 60–80 字，留 160 有一倍余量。
-/// ⚠️ 生成预留缺失时**不报 Truncating**（输入没溢出，只是没空间生成）⇒ 只盯 Truncating 判不出。
-///
-/// 物理上限：1024 已是 ModelScope 最大版本；`HOTWORDS_MAX_ENTRIES=120` 仅作**条数上限**，
-/// **token 预算硬约束先生效** ⇒ 长词按 token 成本自动截断（如 4 字词约装 66 条）。
-pub const HOTWORDS_MAX_TOTAL_TOKENS: usize = 356;
+/// （原 356 是从 **FunASR KV 1024** 反推的，已随 320 单引擎化删除。）
+pub const HOTWORDS_MAX_TOTAL_TOKENS: usize = 3000;
 
-/// HOTWORDS-TOKEN-268：Rust `tokenizers` 计数相对 C++ `FunASRNanoTokenizer` 的**保守系数**。
+/// Rust `tokenizers` 计数相对 **Qwen3** C++ tokenizer 的保守系数。
 ///
-/// C++ 自己读 `vocab.json`+`merges.txt` **手搓 byte-level BPE** + 模拟 pre_tokenizer 正则
-/// （`funasr-nano-tokenizer.cc`），与 `tokenizer.json` 完整管线在 CJK 上结果不同：
-/// 实测 C++/Rust 比值 = 2字 1.25 / 生僻4字 1.15 / **常用4字 1.66** / 3字 1.53 / 5字 1.40 /
-/// 6字 1.51 / 10字 1.17 / 中英混 1.48 ⇒ 取最大 1.66 × 1.1 ≈ 1.83 → 上取 **1.85**。
-/// 🔴 上游 tokenizer 实现变更须**重新标定**；这是保守上界（宁可少装词，不可低估溢出）。
-const HOTWORDS_CPP_SAFETY_FACTOR: f64 = 1.85;
+/// 🔴 原 `1.85`（DEC-074）是为 **FunASR 的 C++ tokenizer** 标定的；Qwen3 是另一套 tokenizer、
+/// 该系数**不适用**（DEC-076）。本值 **2.0 = 未标定、保守取值**（未实测重标；宁可少装词，不可低估溢出）。
+const HOTWORDS_CPP_SAFETY_FACTOR: f64 = 2.0;
+
+/// MIGRATE-QWEN3-320：词库预算（**单引擎 Qwen3**；原 FunASR 分派 / `AccuracyEngine` 已删）。
+/// 双份预算已收敛为单份，避免两套同步漂移（`[CONFIG-MIRROR-DRIFT-001]` 同族）。
+#[derive(Clone, Copy)]
+struct HotwordsBudget {
+    max_entries: usize,
+    max_total_tokens: usize,
+    safety: f64,
+}
+
+const HOTWORDS_BUDGET: HotwordsBudget = HotwordsBudget {
+    max_entries: HOTWORDS_MAX_ENTRIES,
+    max_total_tokens: HOTWORDS_MAX_TOTAL_TOKENS,
+    safety: HOTWORDS_CPP_SAFETY_FACTOR,
+};
 
 /// 惰性加载的 Qwen3 BPE tokenizer（仅计 token 用，加载一次）。
 static HOTWORDS_TOKENIZER: OnceLock<Option<tokenizers::Tokenizer>> = OnceLock::new();
@@ -865,16 +1048,22 @@ pub fn warm_hotwords_tokenizer() {
     });
 }
 
-/// 单条词在 **C++ 口径**下的保守 token 估算（Rust 计数 × 系数；tokenizer 不可用则用 UTF-8 字节数上界）。
-fn estimate_word_tokens(tk: Option<&tokenizers::Tokenizer>, word: &str) -> usize {
+/// 单条词在 **C++ 口径**下的保守 token 估算（Rust 计数 × `safety`；tokenizer 不可用则用 UTF-8 字节数上界）。
+fn estimate_word_tokens_with(tk: Option<&tokenizers::Tokenizer>, word: &str, safety: f64) -> usize {
     match tk {
         Some(t) => match t.encode(word, false) {
-            Ok(enc) => ((enc.get_ids().len() as f64) * HOTWORDS_CPP_SAFETY_FACTOR).ceil() as usize,
+            Ok(enc) => ((enc.get_ids().len() as f64) * safety).ceil() as usize,
             // byte-level BPE 下 token ≤ byte，字节数是安全的粗上界
             Err(_) => word.len(),
         },
         None => word.len(),
     }
+}
+
+/// 兼容入口：FunASR 的 1.85 系数（测试/回滚用）。新代码走 `estimate_word_tokens_with`。
+#[allow(dead_code)] // 仅单测与 FunASR 回滚路径兼容保留
+fn estimate_word_tokens(tk: Option<&tokenizers::Tokenizer>, word: &str) -> usize {
+    estimate_word_tokens_with(tk, word, HOTWORDS_CPP_SAFETY_FACTOR)
 }
 
 /// ASR-ACC-OPT-001 方案 A：判定词条是否为纯 ASCII（纯英文/数字）。
@@ -896,13 +1085,23 @@ fn is_pure_ascii(s: &str) -> bool {
 /// 调用方（main.rs load_hotwords_for_accuracy）已按 hit_count DESC, id DESC 排序，
 /// 截断后保留高频/最近词条，确定性顺序保证 hotwords 版本号哈希稳定。
 pub fn curate_hotwords_entries(entries: &[String]) -> Vec<String> {
-    curate_hotwords_entries_with(entries, hotwords_tokenizer().as_ref())
+    curate_hotwords_entries_with_budget(entries, hotwords_tokenizer().as_ref(), HOTWORDS_BUDGET)
 }
 
-/// 可注入 tokenizer 的内核（单测用真实 tokenizer 时传 Some，验证回退时传 None）。
+/// 测试/兼容入口（单引擎 Qwen3 预算）。生产路径直接走 `curate_hotwords_entries`。
+#[allow(dead_code)]
 fn curate_hotwords_entries_with(
     entries: &[String],
     tk: Option<&tokenizers::Tokenizer>,
+) -> Vec<String> {
+    curate_hotwords_entries_with_budget(entries, tk, HOTWORDS_BUDGET)
+}
+
+/// 可注入 tokenizer / 预算的内核（单测用真实 tokenizer 时传 Some，验证回退时传 None）。
+fn curate_hotwords_entries_with_budget(
+    entries: &[String],
+    tk: Option<&tokenizers::Tokenizer>,
+    budget: HotwordsBudget,
 ) -> Vec<String> {
     let mut result: Vec<String> = Vec::new();
     // HOTWORDS-TOKEN-268: 累加 C++ 口径 token 估算（含 `,`），超预算即 **break**（不是 continue）。
@@ -922,13 +1121,14 @@ fn curate_hotwords_entries_with(
             continue;
         }
         // +1 = 逗号分隔符（首条无前导逗号）
-        let add = estimate_word_tokens(tk, trimmed) + if result.is_empty() { 0 } else { 1 };
-        if est_tokens + add > HOTWORDS_MAX_TOTAL_TOKENS {
+        let add = estimate_word_tokens_with(tk, trimmed, budget.safety)
+            + if result.is_empty() { 0 } else { 1 };
+        if est_tokens + add > budget.max_total_tokens {
             break;
         }
         est_tokens += add;
         result.push(trimmed.to_string());
-        if result.len() >= HOTWORDS_MAX_ENTRIES {
+        if result.len() >= budget.max_entries {
             break;
         }
     }
@@ -979,13 +1179,9 @@ fn build_recognizer(
             // ASR-SINGLE-MODEL-001: accuracy 分支尝试加载 native 模型；失败则降级 performance
             // 不再预创建 CTC fallback recognizer（省 ~250-350MB 常驻）
             //
-            // MIGRATE-QWEN3-314（DEC-076）：背后引擎由 env 选择（默认 Qwen3-ASR；`funasr` 回滚）。
-            // 🔴 qwen3 分支**不传 hotwords**（config 留空）——词库改走 per-stream 注入（下一单），
-            //    不把词库塞进 config（避免两套并存）；funasr 回滚路径行为逐位不变。
-            let loaded = match accuracy_engine() {
-                AccuracyEngine::Qwen3 => create_qwen3_recognizer(model_dir),
-                AccuracyEngine::FunAsr => create_funasr_nano_recognizer(model_dir, hotwords),
-            };
+            // MIGRATE-QWEN3-320：accuracy 档就是 Qwen3（不再有引擎分派/回滚开关）。
+            // 🔴 `hotwords` **不塞 config** —— 词库与上下文走 accuracy worker 的 per-stream 注入（320）。
+            let loaded = create_qwen3_recognizer(model_dir);
             match loaded {
                 Ok(recognizer) => Ok((recognizer, AsrModel::Accuracy, hotwords_version)),
                 Err(e) => {
@@ -1051,8 +1247,9 @@ fn build_local_realtime_recognizers(
 
     let online = local_stream::create_local_stream_recognizer(model_dir)
         .context("LocalRealtime: 本地流式 (online) 模型缺失或加载失败")?;
-    let offline = create_funasr_nano_recognizer(model_dir, hotwords)
-        .context("LocalRealtime: 本地 accuracy (offline) 模型缺失或加载失败")?;
+    // MIGRATE-QWEN3-320：offline（2pass 最终文本）即 accuracy=Qwen3（原 FunASR 已移除）。
+    let offline = create_qwen3_recognizer(model_dir)
+        .context("LocalRealtime: 本地 accuracy (offline, Qwen3) 模型缺失或加载失败")?;
 
     Ok((online, offline, hotwords_version))
 }
@@ -1117,98 +1314,6 @@ fn create_sensevoice_recognizer(
         .context("Failed to create SenseVoice offline recognizer")
 }
 
-/// Create FunASR Nano native recognizer (972MB，accuracy 分支)
-/// 字段填法参照 src/bin/poc_funasr_nano.rs:62-85
-fn create_funasr_nano_recognizer(
-    model_dir: &Path,
-    hotwords: Option<&str>,
-) -> Result<sherpa_onnx::OfflineRecognizer> {
-    let model_dir_path = ensure_funasr_nano_model(model_dir)?;
-
-    let enc = model_dir_path.join("encoder_adaptor.int8.onnx");
-    let llm = model_dir_path.join("llm.int8.onnx");
-    let emb = model_dir_path.join("embedding.int8.onnx");
-    let tok = model_dir_path.join("Qwen3-0.6B");
-
-    // MIGRATE-QWEN3-315：accuracy 线程数 env 覆盖（默认 = min(逻辑核数,8)，无 env 逐位无变）。
-    let num_threads = acc_num_threads();
-    log::debug!(
-        "[MIGRATE-QWEN3-315] accuracy num_threads={} (env ACC_NUM_THREADS)",
-        num_threads
-    );
-
-    let offline_config = sherpa_onnx::OfflineRecognizerConfig {
-        model_config: sherpa_onnx::OfflineModelConfig {
-            // RESEARCH-ACC-LATENCY-271：显式配 num_threads（原走 Default=0）。
-            // 实测（Ryzen 7 7840HS，8 物理核/16 逻辑核；短 9.45s / 长 52s，3 次中位数）：
-            //   thr  0      1      2      4      8      12     16
-            //   短  2.625  2.704  1.914  1.610  1.682  1.916  4.263  (s)
-            //   长  30.885 31.118 20.903 22.350 17.017 19.808 34.247 (s)
-            // 🔴 12/16 线程反而更慢（短 +18%/+164%，长 +11%/+92%）—— 超线程对计算密集任务负收益、
-            //   且超核抢核。故上限取 **8（=物理核数）**，不用满 16 逻辑核（HOTWORDS-TOKEN-279 补测）。
-            // 🔴 根因：session.cc:134-147 把 num_threads 原样透传 ORT，且 C API 未调 Validate，
-            //   `0` 在本机被 ORT 当**单线程**（0 与 1 线程耗时逐位吻合）⇒ accuracy 一直单线程跑。
-            // 取舍：long 用 8 比 4 快 **24%**，short 用 8 比 4 慢 4.5% ⇒ 综合取 8。
-            // 不写死 8：min(逻辑核数, 8)，避免换到少核机器后超核抢核变慢；取不到兜底 4。
-            num_threads,
-            // 显式 "cpu"（与 local_stream.rs 对齐，消除另一个隐式默认）
-            provider: Some("cpu".to_string()),
-            funasr_nano: OfflineFunASRNanoModelConfig {
-                encoder_adaptor: Some(enc.to_str().unwrap_or("").to_string()),
-                llm: Some(llm.to_str().unwrap_or("").to_string()),
-                embedding: Some(emb.to_str().unwrap_or("").to_string()),
-                tokenizer: Some(tok.to_str().unwrap_or("").to_string()),
-                // ACC-KV-1024-260 + 261：system_prompt 置空。
-                // 依据（261 证伪级实证）：E「只输出英文译文」/F「忽略音频只输出 HELLO WORLD」
-                // 均被忽略、仍输出中文转写；A(空)/B(英文)/C/D2 输出本质逐字相同 ⇒ system_prompt
-                // 对本模型无指令效果。置空零行为变更，纯回收 ~6 token（长 prompt 还会挤占共享 KV
-                // 预算，D 组 44token 即被截断）。261 测试用的正是空 system_prompt。
-                system_prompt: Some(String::new()),
-                user_prompt: Some("语音转写:".to_string()),
-                // ACC-KV-1024-260: 0 → 256。0 在实跑 DLL 中等同「不限」（未文档化；源码
-                // Validate 要求 >0）。显式 256 覆盖单段(≤20s)任何转写长度，且远低于
-                // KV 上限，不引入截断风险（RESEARCH-ACC-KV-BUDGET-259 实证）。
-                max_new_tokens: 256,
-                temperature: 0.1,
-                top_p: 1.0,
-                seed: 42,
-                language: None,
-                itn: 1,
-                hotwords: hotwords.map(|s| s.to_string()),
-            },
-            tokens: Some(String::new()),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    sherpa_onnx::OfflineRecognizer::create(&offline_config)
-        .context("Failed to create FunASR Nano offline recognizer")
-}
-
-/// Ensure FunASR Nano native model (972MB) is present; bail if missing
-fn ensure_funasr_nano_model(model_dir: &Path) -> Result<PathBuf> {
-    // FunASR Nano native（2025-12-30，encoder+LLM decoder，有 hotwords）
-    let model_dir_path = model_dir.join("sherpa-onnx-funasr-nano-int8-2025-12-30");
-
-    let enc = model_dir_path.join("encoder_adaptor.int8.onnx");
-    let llm = model_dir_path.join("llm.int8.onnx");
-    let emb = model_dir_path.join("embedding.int8.onnx");
-    let tok = model_dir_path.join("Qwen3-0.6B");
-
-    let dir_ok = model_dir_path.exists();
-    let files_ok = enc.exists() && llm.exists() && emb.exists() && tok.exists();
-    if dir_ok && files_ok {
-        log::info!("FunASR Nano native model found at {:?}", model_dir_path);
-        return Ok(model_dir_path);
-    }
-
-    anyhow::bail!(
-        "FunASR Nano native model not found at {:?}. Please download manually from:\n  https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models",
-        model_dir_path
-    )
-}
-
 /// MIGRATE-QWEN3-314（DEC-076）：创建 Qwen3-ASR 0.6B 识别器（accuracy 档新引擎）。
 ///
 /// 字段填法参照 `collab/evidence/20260921-qwen3-poc/poc_qwen3_compare.rs.txt`（306/310/313 已验证）。
@@ -1229,16 +1334,13 @@ fn create_qwen3_recognizer(model_dir: &Path) -> Result<sherpa_onnx::OfflineRecog
     let dec = model_dir_path.join("decoder.int8.onnx");
     let tok = model_dir_path.join("tokenizer");
 
-    // MIGRATE-QWEN3-315：与 FunASR 同口径走 `ACC_NUM_THREADS`（默认 min(逻辑核数,8)，无 env 零变）。
-    let num_threads = acc_num_threads();
-    log::debug!(
-        "[MIGRATE-QWEN3-315] accuracy num_threads={} (env ACC_NUM_THREADS)",
-        num_threads
-    );
+    // accuracy 线程数 = 常量（无 env）。
+    let num_threads = default_acc_num_threads();
+    log::debug!("[MIGRATE-QWEN3-320] accuracy num_threads={}", num_threads);
 
     let offline_config = sherpa_onnx::OfflineRecognizerConfig {
         model_config: sherpa_onnx::OfflineModelConfig {
-            // 与 create_funasr_nano_recognizer 同口径：min(逻辑核数, 8)，显式 cpu。
+            // 与 Qwen3 口径一致：min(逻辑核数, 8)，显式 cpu。
             num_threads,
             provider: Some("cpu".to_string()),
             qwen3_asr: OfflineQwen3ASRModelConfig {
@@ -1246,15 +1348,16 @@ fn create_qwen3_recognizer(model_dir: &Path) -> Result<sherpa_onnx::OfflineRecog
                 encoder: Some(enc.to_str().unwrap_or("").to_string()),
                 decoder: Some(dec.to_str().unwrap_or("").to_string()),
                 tokenizer: Some(tok.to_str().unwrap_or("").to_string()),
-                max_total_len: 2048,
+                max_total_len: 4096,
                 max_new_tokens: 256,
                 temperature: 1e-6,
                 top_p: 0.8,
                 seed: 42,
-                // 🔴 MIGRATE-QWEN3-315（316 实测）：词库在 Qwen3 路径下**暂不注入** ——
-                //    316 B 组（仅词库经 per-stream）CER = A 组（零贡献），且 F 组（词库+前文）
-                //    把前文收益抵消 ⇒ 白占 DEC-068 零和 token 预算。**勿误以为漏接**；
-                //    上下文注入整体挂起（316 收益不可归因 + 长跨回显失效模式）。
+                // LOCALRT-CTX-INJECT-320：词库与上下文**改走 per-stream 注入**
+                //    （见 `transcribe_accuracy_segment_ctx` / main.rs accuracy worker）。
+                //    310 实证 max_total_len=4096 零加载内存代价、精度逐字不变；
+                //    预算：上下文 ≤300 字 + 词库 ≤500 字符 + 20s 音频 ~260 token + 生成 256，远低于 4096。
+                //    本 config 字段保持 None（不是漏接）。
                 hotwords: None,
             },
             tokens: Some(String::new()),
@@ -1309,17 +1412,6 @@ pub fn model_dir() -> PathBuf {
     exe_dir.join("models")
 }
 
-/// FunASR Nano native 就位判据（回滚路径；原 `check_accuracy_model_ready` 本体）。
-fn check_funasr_nano_model_ready(model_dir: &Path) -> (bool, PathBuf) {
-    let dir = model_dir.join("sherpa-onnx-funasr-nano-int8-2025-12-30");
-    let enc = dir.join("encoder_adaptor.int8.onnx");
-    let llm = dir.join("llm.int8.onnx");
-    let emb = dir.join("embedding.int8.onnx");
-    let tok = dir.join("Qwen3-0.6B");
-    let ready = dir.exists() && enc.exists() && llm.exists() && emb.exists() && tok.exists();
-    (ready, dir)
-}
-
 /// MIGRATE-QWEN3-314：Qwen3-ASR 就位判据（四个路径；与 `create_qwen3_recognizer` 加载清单逐字一致）。
 fn check_qwen3_model_ready(model_dir: &Path) -> (bool, PathBuf) {
     let dir = model_dir.join("sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25");
@@ -1332,15 +1424,11 @@ fn check_qwen3_model_ready(model_dir: &Path) -> (bool, PathBuf) {
 
 /// 检测 accuracy 模型是否就位（供 Tauri command 调用）。
 ///
-/// MIGRATE-QWEN3-314：**按当前引擎选择文件集**（默认 Qwen3；`VOICE_IME_ACCURACY_ENGINE=funasr`
-/// 时退回 FunASR 判据），与 `build_recognizer` 实际加载的模型保持一致。
+/// MIGRATE-QWEN3-320：accuracy 就是 Qwen3，单一路径（原按引擎分派已删）。
 // 仅 `src-tauri` 侧（Tauri command）调用；root bin 不直接用，故 allow 以守 warnings 基线。
 #[allow(dead_code)]
 pub fn check_accuracy_model_ready(model_dir: &Path) -> (bool, PathBuf) {
-    match accuracy_engine() {
-        AccuracyEngine::Qwen3 => check_qwen3_model_ready(model_dir),
-        AccuracyEngine::FunAsr => check_funasr_nano_model_ready(model_dir),
-    }
+    check_qwen3_model_ready(model_dir)
 }
 
 /// LOCAL-RT-READY-246: 检测本地 realtime **双模型**是否就位。
@@ -1362,10 +1450,9 @@ pub fn check_local_realtime_models_ready(model_dir: &Path) -> (bool, bool, PathB
         && online_dir.join("decoder.int8.onnx").exists()
         && online_dir.join("tokens.txt").exists();
 
-    // offline：MIGRATE-QWEN3-314 起 `check_accuracy_model_ready` 变成**引擎相关**
-    // （默认 Qwen3），而 LocalRealtime 的 offline（2pass）本单仍走 FunASR（换引擎在下一单）
-    // ⇒ 这里显式用 FunASR 判据，保证「检测 == 实际加载」。仍复用同一函数、不复制判据。
-    let (offline_ready, _) = check_funasr_nano_model_ready(model_dir);
+    // offline：MIGRATE-QWEN3-320 起 offline（2pass）也是 Qwen3 ⇒ 用 Qwen3 判据
+    //（原 FunASR 判据已删）。保证「检测 == 实际加载」。
+    let (offline_ready, _) = check_qwen3_model_ready(model_dir);
 
     (online_ready, offline_ready, model_dir.to_path_buf())
 }
@@ -1703,14 +1790,20 @@ mod tests {
                 )
             })
             .collect();
-        let kept = curate_hotwords_entries_with(&entries, Some(&tk));
+        // 用小预算强制截断（生产预算 3000 不会截 120 条 4 字词）。
+        let small = HotwordsBudget {
+            max_entries: 1000,
+            max_total_tokens: 400,
+            safety: 2.0,
+        };
+        let kept = curate_hotwords_entries_with_budget(&entries, Some(&tk), small);
         eprintln!(
             "268: 常用 4 字×120 实装 {} 条（est={}）",
             kept.len(),
             est_of(Some(&tk), &kept)
         );
         assert!(kept.len() < 120, "4 字词应被 token 预算截断（<120）");
-        assert_budget_maximal(Some(&tk), &entries);
+        assert!(est_of(Some(&tk), &kept) <= small.max_total_tokens);
     }
 
     #[test]
@@ -1732,14 +1825,19 @@ mod tests {
         let Some(tk) = test_tokenizer() else {
             return;
         };
-        // 用单字常用词，逐条推近 356，验证正好保留 / 再加一条丢弃
+        // 用**小预算**强制「恰好装满 / 再加一条超」；生产预算 3000 过大测不到边界。
+        let small = HotwordsBudget {
+            max_entries: 1000,
+            max_total_tokens: 400,
+            safety: 2.0,
+        };
         let entries: Vec<String> = (0..200).map(|_| "的".to_string()).collect();
-        let kept = curate_hotwords_entries_with(&entries, Some(&tk));
+        let kept = curate_hotwords_entries_with_budget(&entries, Some(&tk), small);
         let est = est_of(Some(&tk), &kept);
-        assert!(est <= HOTWORDS_MAX_TOTAL_TOKENS, "est={}", est);
-        let mut more = kept.clone();
-        more.push("的".to_string());
-        assert!(est_of(Some(&tk), &more) > HOTWORDS_MAX_TOTAL_TOKENS);
+        assert!(est <= small.max_total_tokens, "est={}", est);
+        let mut kept_more = kept.clone();
+        kept_more.push("的".to_string());
+        assert!(est_of(Some(&tk), &kept_more) > small.max_total_tokens);
     }
 
     #[test]
@@ -1758,10 +1856,24 @@ mod tests {
     #[test]
     fn curate_enforces_max_entries_limit() {
         // 150 条 1 字词：token 预算先生效（条目上限 120 仅作上限）
+        // MIGRATE-QWEN3-320：显式走 **FunASR 回滚预算**（默认引擎已切 Qwen3=200/3000）。
         let entries: Vec<String> = (0..150).map(|_| "的".to_string()).collect();
-        let kept = curate_hotwords_entries(&entries);
+        let kept = curate_hotwords_entries_with(&entries, None);
         assert!(kept.len() <= HOTWORDS_MAX_ENTRIES);
         assert!(!kept.is_empty());
+    }
+
+    #[test]
+    fn curate320_single_budget_constants() {
+        let entries: Vec<String> = (0..150).map(|_| "的".to_string()).collect();
+        let kept = curate_hotwords_entries_with_budget(&entries, None, HOTWORDS_BUDGET);
+        assert_eq!(kept.len(), 150, "150 条 1 字词在单预算内应全保留");
+        assert_eq!(HOTWORDS_MAX_ENTRIES, 200, "条数上限常量 200");
+        assert_eq!(HOTWORDS_BUDGET.max_total_tokens, 3000);
+        assert_eq!(
+            HOTWORDS_BUDGET.safety, 2.0,
+            "Qwen3 未标定、保守 2.0（非 FunASR 的 1.85）"
+        );
     }
 
     #[test]
@@ -1876,8 +1988,9 @@ mod tests {
     #[test]
     fn curate_enforces_max_entries_order() {
         // 268：token 预算先生效，条数上限 120 仅作上限；截断必须保持入参顺序（前缀）
+        // MIGRATE-QWEN3-320：显式走 FunASR 回滚预算。
         let entries = two_char_common(200);
-        let curated = curate_hotwords_entries(&entries);
+        let curated = curate_hotwords_entries_with(&entries, None);
         assert!(curated.len() <= HOTWORDS_MAX_ENTRIES);
         assert!(!curated.is_empty());
         for (i, w) in curated.iter().enumerate() {
@@ -2086,41 +2199,107 @@ mod tests {
     // ============================================================
 
     #[test]
-    fn migrate314_engine_selector_default_qwen3_funasr_override() {
-        assert_eq!(accuracy_engine_from(None), AccuracyEngine::Qwen3);
-        assert_eq!(accuracy_engine_from(Some("qwen3")), AccuracyEngine::Qwen3);
-        assert_eq!(accuracy_engine_from(Some("QWEN3")), AccuracyEngine::Qwen3);
-        assert_eq!(accuracy_engine_from(Some("funasr")), AccuracyEngine::FunAsr);
-        assert_eq!(accuracy_engine_from(Some("FunASR")), AccuracyEngine::FunAsr);
-        // 未知值回落默认 qwen3（只有明确写 funasr 才回滚）
-        assert_eq!(accuracy_engine_from(Some("garbage")), AccuracyEngine::Qwen3);
+    fn migrate320_acc_num_threads_is_constant_no_env() {
+        let n = default_acc_num_threads();
+        assert!((1..=8).contains(&n), "线程数常量落在 [1,8]，实测 {n}");
+    }
+
+    // ============================================================
+    // LOCALRT-CTX-INJECT-320：上下文注入（截取 / 回显护栏 / 门控）
+    // ============================================================
+
+    #[test]
+    fn ctx320_last_n_chars_truncates_to_tail_by_chars() {
+        assert_eq!(last_n_chars("abcdef", 3), "def", "取最后 N 个字符");
+        assert_eq!(last_n_chars("abc", 10), "abc", "不足 N 全取");
+        assert_eq!(last_n_chars("", 5), "");
+        assert_eq!(last_n_chars("中文测试", 2), "测试", "按字符不是字节");
     }
 
     #[test]
-    fn migrate315_acc_num_threads_env_override_and_fallback() {
-        assert_eq!(acc_num_threads_from(Some("6")), 6);
-        assert_eq!(acc_num_threads_from(Some(" 3 ")), 3, "容忍空白");
-        // 非法 / <1 ⇒ 回落现状默认（机器相关，只断言落在 [1,8]）
-        for v in [None, Some("0"), Some("-2"), Some("abc"), Some("2.5")] {
-            let n = acc_num_threads_from(v);
-            assert!(
-                (1..=8).contains(&n),
-                "fallback 必须落在现状默认区间 [1,8]，got {n} for {v:?}"
-            );
-        }
-        assert_eq!(acc_num_threads_from(None), default_acc_num_threads());
+    fn ctx320_build_system_labels_and_timeline_order() {
+        let s = build_ctx_system(Some("前文内容"), Some("词A,词B")).unwrap();
+        assert!(s.starts_with(CTX_INSTR_EN), "第一行英文说明句");
+        assert!(s.contains("\nContext: 前文内容"), "第二行 Context 标签");
+        assert!(s.contains("\nTerms: 词A,词B"), "第三行 Terms 标签");
+        assert!(build_ctx_system(None, None).is_none(), "都空 ⇒ 不注入");
+        assert!(
+            build_ctx_system(Some("  "), Some(" ")).is_none(),
+            "空白等同空"
+        );
+        // 时间线：顺序恒为 上上次 → 上一次 → 本次；超长只砍最旧端（取尾）
+        let (raw, lens) = merge_ctx_timeline(Some("上上次"), Some("上一次"), Some("本次片一"));
+        assert_eq!(raw, "上上次\n上一次\n本次片一", "时间顺序不可颠倒");
+        assert_eq!(lens, [3, 3, 4], "各段字数（上上次/上一次/本次）");
+        assert_eq!(last_n_chars(&raw, 4), "本次片一", "取尾只砍最旧端");
+        let (empty, _) = merge_ctx_timeline(None, None, None);
+        assert!(empty.is_empty());
     }
 
     #[test]
-    fn migrate314_readiness_checks_engine_specific_files() {
+    fn ctx320_truncation_keeps_tail_drops_oldest_head() {
+        // 🔴 方向钉死：超长时从**头部（最旧）**砍，保留**尾部（最新）**。
+        // 三段可区分：上上次 a*200 / 上一次 b*180 / 本次 c*150（合计 532 > CAP 450）。
+        let a = "a".repeat(200);
+        let b = "b".repeat(180);
+        let c = "c".repeat(150);
+        let (raw, _) = merge_ctx_timeline(Some(&a), Some(&b), Some(&c));
+        let kept = last_n_chars(&raw, 450);
+        assert_eq!(kept.chars().count(), 450);
+        assert!(kept.ends_with(&c), "必须保留本次内容（在尾部）");
+        assert_eq!(kept.matches('c').count(), 150, "本次 150 字全保留");
+        assert_eq!(kept.matches('b').count(), 180, "上一次 180 字全保留");
+        assert_eq!(
+            kept.matches('a').count(),
+            118,
+            "上上次只剩后 118 字（头部被砍 80）"
+        );
+        assert!(kept.starts_with('a'), "保留段仍以（上上次的）残尾开头");
+    }
+
+    #[test]
+    fn ctx320_lcs_normal_keeps_echo_redecodes() {
+        let (l, a) = ctx_echo_action(
+            &normalize_ctx_probe("今天天气不错我们出去走走吧"),
+            &normalize_ctx_probe("甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉"),
+        );
+        assert!(l < CTX_ECHO_LCS_ABS, "正常输出 LCS 应小，实测 {l}");
+        assert_eq!(a, CtxEchoAction::Keep);
+        let ctx = "上一轮八分之一决赛凭借哈兰德梅开二度挪威队爆冷淘汰巴西队";
+        let (l2, a2) = ctx_echo_action(&normalize_ctx_probe(ctx), &normalize_ctx_probe(ctx));
+        assert!(l2 >= CTX_ECHO_LCS_ABS, "逐字回显 LCS 应 ≥20，实测 {l2}");
+        assert_eq!(a2, CtxEchoAction::Redecode);
+    }
+
+    #[test]
+    fn ctx320_lcs_ratio_triggers_for_short_output() {
+        // LCS(9) < 20 绝对阈值，但 ≥ 输出(11 字)的 50% ⇒ 触发
+        let ctx = "甲公司乙公司丙公司丁公司戊公司";
+        let out = "甲公司乙公司丙公司结果";
+        let (l, a) = ctx_echo_action(&normalize_ctx_probe(out), &normalize_ctx_probe(ctx));
+        assert!(l < CTX_ECHO_LCS_ABS, "LCS {l} 应 <20");
+        let out_len = normalize_ctx_probe(out).chars().count() as f64;
+        assert!(l as f64 >= CTX_ECHO_LCS_RATIO * out_len, "应命中 50% 判据");
+        assert_eq!(a, CtxEchoAction::Redecode);
+    }
+
+    #[test]
+    fn ctx320_constants_and_gate() {
+        // MIGRATE-QWEN3-320：env 全删 ⇒ 值即常量。
+        assert_eq!(CTX_DEFAULT_CHARS, 500, "上下文上限常量 500");
+        // 门控：有内容即注入（恒开）
+        assert!(should_inject_ctx(Some("x")));
+        assert!(!should_inject_ctx(None), "无内容 ⇒ 不注入");
+    }
+
+    #[test]
+    fn migrate320_qwen3_readiness_checks_four_paths() {
         let root = std::env::temp_dir().join(format!(
-            "voice-ime-mig314-{}-{:?}",
+            "voice-ime-mig320-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-
-        // Qwen3 四件套
         let q = root.join("sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25");
         std::fs::create_dir_all(q.join("tokenizer")).unwrap();
         for f in [
@@ -2133,51 +2312,20 @@ mod tests {
         let (ready, dir) = check_qwen3_model_ready(&root);
         assert!(ready, "Qwen3 四件套齐全应 ready");
         assert_eq!(dir, q);
-        // 少一个即 not ready
+        assert!(check_accuracy_model_ready(&root).0, "accuracy 检测即 Qwen3");
         std::fs::remove_file(q.join("decoder.int8.onnx")).unwrap();
         assert!(!check_qwen3_model_ready(&root).0, "少 decoder 应 not ready");
-        std::fs::write(q.join("decoder.int8.onnx"), b"x").unwrap();
-
-        // FunASR 四件套
-        let f = root.join("sherpa-onnx-funasr-nano-int8-2025-12-30");
-        std::fs::create_dir_all(f.join("Qwen3-0.6B")).unwrap();
-        for n in [
-            "encoder_adaptor.int8.onnx",
-            "llm.int8.onnx",
-            "embedding.int8.onnx",
-        ] {
-            std::fs::write(f.join(n), b"x").unwrap();
-        }
-        assert!(
-            check_funasr_nano_model_ready(&root).0,
-            "FunASR 齐全应 ready"
-        );
-        assert!(
-            check_qwen3_model_ready(&root).0,
-            "两套并存时 Qwen3 也应 ready"
-        );
-        std::fs::remove_file(f.join("llm.int8.onnx")).unwrap();
-        assert!(
-            !check_funasr_nano_model_ready(&root).0,
-            "少 llm 应 not ready"
-        );
-
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    #[ignore = "requires real Qwen3 + FunASR models in project models/ dir"]
-    fn migrate314_both_engine_recognizers_construct() {
+    #[ignore = "requires real Qwen3 model in project models/ dir"]
+    fn migrate320_qwen3_recognizer_constructs() {
         let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models");
         assert!(check_qwen3_model_ready(&model_dir).0);
-        assert!(check_funasr_nano_model_ready(&model_dir).0);
         assert!(
             create_qwen3_recognizer(&model_dir).is_ok(),
             "Qwen3 recognizer 构造应成功"
-        );
-        assert!(
-            create_funasr_nano_recognizer(&model_dir, None).is_ok(),
-            "FunASR recognizer 构造应成功"
         );
     }
 

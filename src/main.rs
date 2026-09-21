@@ -7432,6 +7432,11 @@ fn spawn_worker_thread(
                 None
             };
 
+        // LOCALRT-CTX-INJECT-320-A：跨录音轮换的上上次/上一次转写（内存态，进程重启即空，不落盘）。
+        // 每次录音**成功产出最终文本**时轮换：prev2 = prev1; prev1 = final；取消/无语音/出错一律不动。
+        let mut ctx_prev2: Option<String> = None;
+        let mut ctx_prev1: Option<String> = None;
+
         loop {
             let cmd = match worker_rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(cmd) => Some(cmd),
@@ -7940,7 +7945,7 @@ fn spawn_worker_thread(
 
                         // PARALLEL-ACC-298：accuracy 并行派发。总开关关 / offline recognizer 缺失
                         // ⇒ acc_enabled=false ⇒ 不建 worker、不派发，**逐位退回今天的串行行为**。
-                        let acc_cfg = transcription::local_stream::AccDispatchConfig::from_env();
+                        let acc_cfg = transcription::local_stream::AccDispatchConfig::new();
                         let acc_offline = transcriber.as_ref().and_then(|t| t.offline_recognizer());
                         let acc_enabled = acc_cfg.enabled && acc_offline.is_some();
                         let acc_cfg = transcription::local_stream::AccDispatchConfig {
@@ -7963,11 +7968,19 @@ fn spawn_worker_thread(
                                     send_offline.expect("acc_enabled 蕴含 offline recognizer 存在");
                                 let cancel_acc = Arc::clone(&cancel_signal);
                                 let acc_rx = acc_rx;
+                                // LOCALRT-CTX-INJECT-320：词库词条随 per-stream 注入
+                                // （读 DB + 按引擎预算裁剪，每段录音一次，毫秒级）。
+                                let acc_terms = load_hotwords_for_accuracy(&config);
+                                // LOCALRT-CTX-INJECT-320-A：捕获跨录音轮换值（克隆进 worker）。
+                                let ctx_prev2_snapshot = ctx_prev2.clone();
+                                let ctx_prev1_snapshot = ctx_prev1.clone();
                                 Some(scope.spawn(move || {
                                         let recognizer = send_offline.into_inner();
                                         let mut ordered: Vec<(usize, Vec<String>)> = Vec::new();
                                         let mut all_native = true;
                                         let mut total_decode_ms = 0.0f64;
+                                        // 320：前序分片累计文本（本 worker 按序解码 ⇒ 天然因果可用、无并行损失）。
+                                        let mut acc_text = String::new();
                                         for (idx, sub_segs) in acc_rx {
                                             if cancel_acc.load(Ordering::Acquire) {
                                                 // 判据 #3：取消时不把已取消的结果带进下游。
@@ -7977,15 +7990,28 @@ fn spawn_worker_thread(
                                             for s in &sub_segs {
                                                 let t = log::log_enabled!(log::Level::Debug)
                                                     .then(std::time::Instant::now);
-                                                let res = transcription::transcribe_accuracy_segment(
-                                                    recognizer, s, acc_script,
+                                                let res = transcription::transcribe_acc_ctx(
+                                                    recognizer,
+                                                    s,
+                                                    acc_script,
+                                                    idx,
+                                                    transcription::CtxInject {
+                                                        prev_older: ctx_prev2_snapshot.as_deref(),
+                                                        prev_latest: ctx_prev1_snapshot.as_deref(),
+                                                        current: (!acc_text.is_empty())
+                                                            .then_some(acc_text.as_str()),
+                                                        terms: acc_terms.as_deref(),
+                                                    },
                                                 );
                                                 if let Some(t0) = t {
                                                     total_decode_ms +=
                                                         t0.elapsed().as_secs_f64() * 1000.0;
                                                 }
                                                 match res {
-                                                    Ok((txt, _np)) => texts.push(txt),
+                                                    Ok((txt, _np)) => {
+                                                        acc_text.push_str(&txt);
+                                                        texts.push(txt);
+                                                    }
                                                     Err(e) => {
                                                         log::warn!(
                                                             "PARALLEL-ACC-298 seg #{} sub-seg failed: {}",
@@ -8210,6 +8236,11 @@ fn spawn_worker_thread(
                             pretranscribed, // PARALLEL-ACC-298: 并行 accuracy 结果（关时 None ⇒ 原有 accuracy 2pass）
                             i18n::get(config.ui_language).overlay_processing,
                         );
+                        // 320-A：本次录音成功产出转写文本 ⇒ 轮换跨录音缓存（取消/无语音/出错不动）。
+                        if !acc_joined.trim().is_empty() && !cancel_signal.load(Ordering::Acquire) {
+                            ctx_prev2 = ctx_prev1.take();
+                            ctx_prev1 = Some(acc_joined.clone());
+                        }
                         continue;
                     }
 

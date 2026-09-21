@@ -5,6 +5,22 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-1 — LOCALRT-CTX-INJECT-320 追加 ✅ 交付（删回滚开关 + 全 env 删除 + 词库单引擎化）
+
+- **原则（Gavin）**：不允许开发端/用户端行为不一致——用户机无 env，env 覆盖是假路径，且残留 env 会污染端测结论。
+- **改动**（`src/transcription/mod.rs` + `src/main.rs` + `src-tauri/src/main.rs`）：删 `AccuracyEngine`/`accuracy_engine(_from)`/`VOICE_IME_ACCURACY_ENGINE`；`build_recognizer` Accuracy 直接 `create_qwen3_recognizer`；删 `create_funasr_nano_recognizer`/`ensure_funasr_nano_model`/`check_funasr_nano_model_ready`；src-tauri 就位检测单路径 Qwen3；LocalRealtime offline（2pass）切 Qwen3。词库预算单引擎：删 FunASR 支（356/1.85）与双份预算；`HOTWORDS_MAX_ENTRIES=200`/`MAX_TOTAL_TOKENS=3000`/`SAFETY_FACTOR=2.0（未标定保守）`。删三个 env（`ACC_NUM_THREADS`/`LOCAL_RT_CTX_ENABLED`/`LOCAL_RT_CTX_CHARS`）及解析函数/相关单测 → 常量：线程 `min(cores,8)` 兜底 4、注入**恒开**、上限 **500**。
+- **验证**：fmt clean；`cargo check --all-targets` 0 error、warnings **110/101** = 基线；root `cargo test` **1367P/0F/16I**；src-tauri **85P/0F**；numstat `main.rs` 35/4 与 `src-tauri` 6/19 == `-w`（`mod.rs` 435/287 vs 432/284 = 3/3 空白，大块删除括号重排，主控认可）。🔴 实机效果交 tester-1/Gavin。
+- **红线**：未动版本 / 未 commit / 未出包 / 未删磁盘模型文件 / 未碰流式与 performance 构造 / 零凭证。
+
+## 2026-09-21 — coder-1 — LOCALRT-CTX-INJECT-320 ✅ 交付（上下文注入 + 长跨回显护栏）
+
+- **实现**：accuracy worker 每片经 Qwen3 per-stream 注入 system 段（英文说明句 + `Context:` 时间线 + `Terms:` 词库，各占一行加标签）。**跨录音轮换 A**（`prev2=prev1; prev1=final`，仅成功时）+ **录音内增量 B**（`acc_text` 每片追加）+ **截断 C**（从头部砍保留尾部，CAP=500）+ **护栏 D**（ctx 定稿后 LCS，命中无上下文重解）+ 门控（`LOCAL_RT_CTX_ENABLED=0` 退回；🔴 FunASR 绝不注入防 EXIT(-1)）。
+- **推翻 315**：词库改回**注入**（Gavin 判 316 B 组构造性假阴性）；**KV 2048→4096**；词条 **120→200** + 引擎分派预算（FunASR 356/1.85 回滚不变；Qwen3 **3000/2.0 未标定保守值**，不沿用 1.85）。
+- **🔴 关键发现**：298 accuracy worker 是**单线程按序处理批次**（非段间并行）⇒ 因果上下文**零并行代价**。
+- **验证**：fmt clean、check 0 error、numstat==-w（mod.rs 454/21、main.rs 34/3）；6 ctx320 + 18 curate 单测全绿。🔴 实机交 tester-1/Gavin。
+- **上报**：① warnings 111/102（+1 非本单）；② 既有红测试 `tune317_...default_4` 系并发提交 `184633a`（默认 4→8 未同步测试；`local_stream.rs` 非本单未擅改；`:310` 另有可疑残留 `let blank_penalty = c.model_config.debug = false;`）。
+- **红线**：未动版本 / 未 commit / 未出包 / 未删 FunASR / 零凭证。
+
 ## 2026-09-21 — coder-2 — HOMOPHONE-NODE-318 ✅ 交付（同音纠错可挂载节点）
 
 - **交付**：`src/homophone/mod.rs`（新，规则外置 + 纯函数 `apply_homophone_fix`）+ 根 `homophone-rules.toml`（**129 条**）+ `main.rs` 挂载（`:9384`）+ MACOS-HANDOFF + `evidence/20260921-homophone-318/`。
@@ -208,6 +224,19 @@
 - **验证**：`cargo check --all-targets` 0 error、warnings **110/101** = 基线；`rustfmt --check` clean；新增单测 `local_stream::tests` **2P/0F**（连跑 3 次）。🔴 实机（`gained` 实测）交 tester-1/Gavin。
 - **⚠️ 协作事件**：主控文档 commit `99799c5`（10:26:26）在本题进行中执行，**把我未完成的 `local_stream.rs` 与 coder-1 的 `src/audio/mod.rs` 一并扫入**（commit message 未反映代码改动）。本单改动已随之落盘、worktree 无额外 diff；`git status` 另见 `.gitignore` + `src/audio/mod.rs`（非本单）。请主控知悉该 commit 语义与文件归属。
 - **红线**：只改 `local_stream.rs` / 未动版本 / 未自行 commit / 未出包 / 未跑 `cargo build --release` / 零凭证。
+
+## 2026-09-21 — tester-1 — TEST-SWEEP-319 🔴 blank_penalty 曲线：对流式 paraformer 完全无效（只测量）
+
+- **归属**：HEAD `2d814a7`；工作区非 clean（`M src/transcription/mod.rs`，coder-1 315 在途）；只测量、不出包。
+- **前置核查（已上报，主控裁定 A）**：`poc_local_stream.rs` **原本无 blank_penalty 入口**（从不给 `c.blank_penalty` 赋值）；`poc_funasr_nano` 的是离线 accuracy 不适用；素材实际在 `collab/research/audio-real-gavin/processed/`（非任务书写的 `collab/evidence/`）。
+- **方法**：临时给 PoC bin 加只读 env `POC_BLANK_PENALTY`（默认 0.0）→ **已备份 cp 原样还原，`git diff src/bin/poc_local_stream.rs` 空**；未碰 `src/transcription/**` / Publish / 未跑 `cargo build --release`。
+- **赋值自证**：临时 `eprintln!("[SWEEP319] applied blank_penalty={}")` 实测 `-100 ⇒ applied -100`、`100 ⇒ applied 100` ⇒ env 确已写入 config。
+- **曲线**（full.wav 56s，threads 4，chunk 100ms；打分复用现成 `score_cer.py` 的 normalize/edit/cer）：bp = 0.0 / −0.5 / −1.0 / −1.5 / +0.5 → **五档全 CER 0.1448、ins 1 / del 7 / sub 24、hyp_len 215、尾字后缀 7，`[RTF-final]` 逐字节相同**；极端值 **±100（para1.wav）仍逐字节相同** ⇒ `blank_penalty` 在流式 paraformer **解码路径未被消费**。
+- **结论**：按约定「正负两向无变化 ⇒ 无效，一句话收工」⇒ 第一轮结束，不再深入；未改任何默认值。
+- **🔴 附带发现（上报主控）**：317 的生产 env `LOCAL_STREAM_BLANK_PENALTY` 是 **no-op**（设置的正是不被消费的同一 config 字段），与 `[PROVIDER-SILENT-FALLBACK-001]` 同族；建议注释标注无效或下批撤掉，等主控定。
+- **第二轮（线程组合）** 待 315 `ACC_NUM_THREADS` 落地后做（4+8=12 线程 vs 8 物理核的超订问题仍待答）。
+- **原始数据**：`collab/evidence/20260921-sweep319-blankpenalty/`（5 份 log + score.py + score_result.txt，UTF-8）。
+- **红线**：未出包 / 版本未动 / 未改生产代码（PoC 已还原）/ 零凭证。
 
 ## 2026-09-21 — tester-1 — TEST-EXEC-309 ✅ 307/308 回归全绿（🛑 出包按 Gavin 令暂停，与 Qwen3-ASR 选型整合后一起出）
 
