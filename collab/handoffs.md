@@ -5,6 +5,14 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-2 — POC-QWEN3-CTX-VALUE-316 ✅ 交付（上下文价值 PoC，只变一变量）
+
+- **方法**：Qwen3-ASR 固定，full.wav 298 切 3 片，只变 system 段：A 空/B 词库/C ctx150/D ctx300/E 不截断/F 词库+ctx/G 无关菜谱；补扫 cap 0/40/80/120/全文。`t10_ctx_value` 164.6s EXIT0。
+- **结论**：① 收益微弱且不稳定——CER A 0.0444→C/D/E 0.0356、G 0.0489 更差；专名「约根·斯特兰德」仅 context 组转正，但**前文不含该词 ⇒ 非术语搬运**；F 回到 A。② 拐点未探到（素材前文 ≤~170 字，C/D/E 等价；cap≥40 即饱和，不外推）。③ 词库与前文不可互替（B=A；F 未增强）。④ G 证明 system 段被使用。
+- 🔴 **失败**：cap=80 回显片0 的 79 字，CER 0.3467；`has_repeat_loop` 检不出长跨回显 ⇒ 315 须补护栏。
+- **建议 315**：勿把 7.9% 代价当已证收益；若做则 cap ≤120 + 长跨护栏 + 可关闭；先更长素材复测。
+- **证据**：`collab/evidence/20260921-qwen3-poc/ctx-value-316-raw.log` + harness 快照。红线：未碰 `src/**`、harness 已移出 `tests/`、未动版本/未 commit/未出包/零凭证。
+
 ## 2026-09-21 — coder-1 — MIGRATE-QWEN3-314 ✅ 交付（accuracy 档换 Qwen3，识别器层）
 
 - **设计（DEC-076）**：**不新增 `AsrModel` 变体**，只切换 `Accuracy` 背后模型（避开 `[ENUM-EQ-CHECK-MISSES-NEW-VARIANT-001]`）；`uses_accuracy_engine()`/VAD/`native_punctuated` 判据全沿用。**枚举零改动**有 grep 正面证据（空输出）。
