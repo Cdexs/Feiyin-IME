@@ -576,3 +576,14 @@
 - **验证**：fmt clean / check 0 error / warnings **101** = 基线 / `ctx320` **6/6**。
 - **红线**：未动版本号 / 未出包 / 未碰 coder-1（`src/audio/mod.rs`）与 coder-2（`src/itn.rs`、`itn-rules.toml`）在飞文件 / 零凭证。
 - **待端测判据**：`action=redecode` 频次应显著低于改前的 43%（6/14）。
+
+---
+
+## LOCALRT-ENDPOINT-EMPTY-342（coder-2，2026-09-21）
+
+- **背景**：Gavin 报「一口气说完最后一句后握键等数秒，尾字不显示」；主控 342 阶段一离线复现证伪「JSON 解析失败」假设，定案①假 endpoint ②`full` 切片全静音 ③流式模型本就不出尾字。
+- **改动**：`src/transcription/local_stream.rs` + `src/main.rs`。①**F1+F3**：新增 `speech_since_last_reset`（复用能量判据）与 `endpoint_action` 纯函数；假 endpoint 不确认/不推进游标、静音流文本与 shadow 不入预览。②**A**：`ReflowStopState` 三态 + `reflow_stop_state`，`reflow_action` 判据由 `STREAMING_STOPPED` 改 `cancel_signal`（松手完成仍回灌，取消/编辑仍跳）。③**D**：`should_dispatch_acc` 改 OR（静默 ≥800ms 或累计 ≥5s）+ `has_speech` 护栏；C 并入。
+- **B 结论**：`[DBG-325]` 打点在消费端；15:33 seg#3 的 7.13s 是**真解码**（worker 空闲 3.97s 无排队），因 `action=redecode`（`out_chars=222`/`lcs=197`）触发第二次无上下文重解；主线程重解码仅 304.6ms 非主因；F1 对该片仅省 104.5ms。
+- **padding 结论**：实时单段路径前向 padding 被 clamp=0、后向填充为 0.0 静音 ⇒ 无音频重叠、无「接缝转写两遍」；建议后续移除后向零填充，**本单未改**。
+- **验证**：fmt clean / check 0 error / warnings **99/90** 基线 / numstat==-w / 全量 `cargo test` 0 failed。
+- **红线**：未动版本号 / 未出包 / 未 commit / 零凭证。

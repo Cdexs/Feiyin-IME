@@ -6947,12 +6947,16 @@ fn process_controller_events(
                     continue;
                 }
                 // 🔴 controller 线程单写者：这三个状态只在消费循环内读写，无竞态。
+                // 342-A：停止语义三态 —— 取消（cancel_signal）/ 编辑（OVERLAY_EDITING）/
+                // 松手完成；**不再用 STREAMING_STOPPED 一刀切**（松手完成也要回灌）。
                 let edit_latched = ACC_REFLOW_EDIT_LATCH.load(Ordering::Acquire);
-                let stopped = STREAMING_STOPPED.load(Ordering::Acquire);
+                let editing = OVERLAY_EDITING.load(Ordering::Acquire);
+                let cancelled = cancel_signal.load(Ordering::Acquire);
+                let stop_state = reflow_stop_state(cancelled, editing);
                 let last_seg = ACC_REFLOW_LAST_SEG.load(Ordering::Acquire);
                 let action = reflow_action(
                     edit_latched,
-                    stopped,
+                    stop_state,
                     seg_index,
                     last_seg,
                     has_hole,
@@ -9608,12 +9612,42 @@ fn try_resolve_reflow(
     }
 }
 
+/// LOCALRT-RELEASE-REFLOW-342-A：停止语义**三态**（消费端 controller 线程判定）。
+///
+/// 329 曾把 `STREAMING_STOPPED` 一刀切当「取消」⇒ 把**松手完成**与**取消**混为一谈。
+/// 该 latch 实际被三种情形置位，语义完全不同：
+/// - **取消**（ESC / PTT < 300ms，`cancel_signal`）⇒ 内容丢弃，**不回灌**；
+/// - **编辑**（`OVERLAY_EDITING`，进编辑时也置 `STREAMING_STOPPED`）⇒ 跳过，保护用户文本；
+/// - **松手完成**（正常 PTT 松手 / 仍在录音）⇒ 内容要用（最终文本本就走 accuracy），
+///   **允许回灌刷新预览**。
+///
+/// 🔴 判据用 `cancel_signal`（取消专用信号），**不再用 `STREAMING_STOPPED` 一刀切**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReflowStopState {
+    /// ESC / 短按取消：丢弃，不回灌。
+    Cancelled,
+    /// 编辑中（本代编辑闩锁另由 `edit_latched` 持久）。
+    Editing,
+    /// 松手完成 / 仍在录音：都允许回灌。
+    Released,
+}
+
+fn reflow_stop_state(cancelled: bool, editing: bool) -> ReflowStopState {
+    if cancelled {
+        ReflowStopState::Cancelled
+    } else if editing {
+        ReflowStopState::Editing
+    } else {
+        ReflowStopState::Released
+    }
+}
+
 /// ACC-PREVIEW-REFLOW-325：回灌决策（纯函数，消费端 controller 线程调用）。
 ///
 /// 优先级（高 → 低）：
-/// 1. **编辑闩锁**（本次录音进过一次编辑态即永久停，per-gen）——
+/// 1. **编辑**（本代编辑闩锁 `edit_latched`，或当前正在编辑 `stop_state=Editing`）——
 ///    防「编辑退出后迟到的回灌把用户刚打的字冲掉」；
-/// 2. **取消/停止**（`STREAMING_STOPPED`；编辑也置它）；
+/// 2. **取消**（`stop_state=Cancelled`，仅 ESC / 短按）—— 松手完成**不**在此列（342-A）；
 /// 3. **陈旧 seg**（`seg_index <= 已应用`）—— 单调键是 seg_index，不是 committed_len；
 /// 4. **覆盖区有洞**（该片覆盖范围内含 accuracy 失败片）—— 带洞文本比空串更糟；
 /// 5. **acc 空**（不能把已显示前缀抹白）。
@@ -9629,16 +9663,16 @@ enum ReflowAction {
 
 fn reflow_action(
     edit_latched: bool,
-    stopped: bool,
+    stop_state: ReflowStopState,
     seg_index: usize,
     last_applied_seg: i64,
     has_hole: bool,
     acc_empty: bool,
 ) -> ReflowAction {
-    if edit_latched {
+    if edit_latched || stop_state == ReflowStopState::Editing {
         return ReflowAction::SkippedEditing;
     }
-    if stopped {
+    if stop_state == ReflowStopState::Cancelled {
         return ReflowAction::SkippedCancel;
     }
     if (seg_index as i64) <= last_applied_seg {
@@ -9655,7 +9689,7 @@ fn reflow_action(
 
 #[cfg(test)]
 mod preview_reflow_325_tests {
-    use super::{reflow_action, reflow_preview, ReflowAction};
+    use super::{reflow_action, reflow_preview, reflow_stop_state, ReflowAction, ReflowStopState};
 
     /// 硬点 1 边界：committed_len 之前用 acc、之后保留流式尾巴。
     #[test]
@@ -9672,27 +9706,48 @@ mod preview_reflow_325_tests {
         assert_eq!(reflow_preview("", "ABCD", 2), "CD");
     }
 
-    /// 硬点 2：编辑闩锁 —— 一旦上闩，即便 `stopped` 已复位也一律 SkippedEditing。
+    /// 硬点 2：编辑闩锁 —— 一旦上闩，即便 `STREAMING_STOPPED` 已复位也一律 SkippedEditing。
     /// 这覆盖「进编辑 → 退出编辑 → 再来回灌」的序列（闩锁在 controller 线程置位，不随退出清）。
     #[test]
     fn reflow_action_edit_latch_persists() {
-        // 编辑中：编辑态 + 停止态
+        // 编辑中：编辑态（编辑也置 STREAMING_STOPPED，但 342 后由 Editing 三态表达）
         assert_eq!(
-            reflow_action(true, true, 3, 1, false, false),
+            reflow_action(false, ReflowStopState::Editing, 3, 1, false, false),
             ReflowAction::SkippedEditing
         );
-        // 退出编辑后（OVERLAY_EDITING 复位、甚至 STREAMING_STOPPED 也复位）——闩锁仍在 ⇒ 仍跳
+        // 退出编辑后（OVERLAY_EDITING 复位、STREAMING_STOPPED 也复位）——闩锁仍在 ⇒ 仍跳
         assert_eq!(
-            reflow_action(true, false, 4, 1, false, false),
+            reflow_action(true, ReflowStopState::Released, 4, 1, false, false),
             ReflowAction::SkippedEditing
         );
     }
 
-    /// 取消/停止 ⇒ SkippedCancel。
+    /// 342-A：停止语义三态纯函数 —— 取消 / 编辑 / 松手完成（含仍在录音）。
+    #[test]
+    fn reflow_stop_state_342_tri_state() {
+        // 取消优先于编辑（ESC 时若仍在编辑态，按取消处理）。
+        assert_eq!(reflow_stop_state(true, true), ReflowStopState::Cancelled);
+        assert_eq!(reflow_stop_state(true, false), ReflowStopState::Cancelled);
+        assert_eq!(reflow_stop_state(false, true), ReflowStopState::Editing);
+        // 松手完成 / 仍在录音 ⇒ Released（都允许回灌）。
+        assert_eq!(reflow_stop_state(false, false), ReflowStopState::Released);
+    }
+
+    /// 🔴 342-A 核心回归：**松手完成必须回灌**（不再是 329 的 skipped-cancel）。
+    #[test]
+    fn reflow_action_342_release_still_reflows() {
+        assert_eq!(
+            reflow_action(false, ReflowStopState::Released, 3, 1, false, false),
+            ReflowAction::Applied,
+            "松手完成（非取消/非编辑）必须 Applied —— 尾字回灌不能因松手被丢"
+        );
+    }
+
+    /// 342-A：取消 ⇒ SkippedCancel（内容丢弃，不回灌）。
     #[test]
     fn reflow_action_cancel() {
         assert_eq!(
-            reflow_action(false, true, 3, 1, false, false),
+            reflow_action(false, ReflowStopState::Cancelled, 3, 1, false, false),
             ReflowAction::SkippedCancel
         );
     }
@@ -9702,16 +9757,16 @@ mod preview_reflow_325_tests {
     #[test]
     fn reflow_action_stale_by_seg_not_len() {
         assert_eq!(
-            reflow_action(false, false, 2, 2, false, false),
+            reflow_action(false, ReflowStopState::Released, 2, 2, false, false),
             ReflowAction::SkippedStale
         );
         assert_eq!(
-            reflow_action(false, false, 1, 5, false, false),
+            reflow_action(false, ReflowStopState::Released, 1, 5, false, false),
             ReflowAction::SkippedStale
         );
         // seg 前进 ⇒ 通过（即便 has_hole 之后再判）
         assert_eq!(
-            reflow_action(false, false, 6, 5, false, false),
+            reflow_action(false, ReflowStopState::Released, 6, 5, false, false),
             ReflowAction::Applied
         );
     }
@@ -9720,12 +9775,12 @@ mod preview_reflow_325_tests {
     #[test]
     fn reflow_action_hole() {
         assert_eq!(
-            reflow_action(false, false, 6, 5, true, false),
+            reflow_action(false, ReflowStopState::Released, 6, 5, true, false),
             ReflowAction::SkippedHole
         );
         // 洞优先于空（都成立时报洞，语义更准）
         assert_eq!(
-            reflow_action(false, false, 6, 5, true, true),
+            reflow_action(false, ReflowStopState::Released, 6, 5, true, true),
             ReflowAction::SkippedHole
         );
     }
@@ -9734,7 +9789,7 @@ mod preview_reflow_325_tests {
     #[test]
     fn reflow_action_empty() {
         assert_eq!(
-            reflow_action(false, false, 6, 5, false, true),
+            reflow_action(false, ReflowStopState::Released, 6, 5, false, true),
             ReflowAction::SkippedEmpty
         );
     }
@@ -14540,6 +14595,34 @@ mod flicker_130_guard_tests {
         assert!(
             has_editing_store && has_stopped_store,
             "F3: EditRequested 臂必须同时置 OVERLAY_EDITING.store(true) 与 STREAMING_STOPPED.store(true)—— editing⇒stopped 不变量，破坏=复活 (false,true) 不可达组合=复活闪烁"
+        );
+    }
+
+    /// LOCALRT-RELEASE-REFLOW-342-A：PreviewReflow 臂的停止语义必须来自 `cancel_signal`
+    /// 三态判定，**不得再用 `STREAMING_STOPPED` 一刀切**（否则松手完成被误判为取消 ⇒
+    /// 尾字回灌被丢 = Gavin 报的「等 7 秒预览不刷新」）。
+    ///
+    /// 消融：把 `let cancelled = cancel_signal.load(` 改回 `STREAMING_STOPPED.load(` ⇒ 红。
+    #[test]
+    fn a342_reflow_uses_cancel_signal_tri_state() {
+        let lines = main_prod_lines();
+        let anchor = find_line(&lines, "PipelineEvent::PreviewReflow {")
+            .expect("342-A: PreviewReflow 匹配臂锚点不存在");
+        assert!(
+            block_contains(&lines, anchor, "let cancelled = cancel_signal.load("),
+            "342-A: PreviewReflow 臂必须读 cancel_signal 判定「取消」"
+        );
+        assert!(
+            block_contains(
+                &lines,
+                anchor,
+                "let stop_state = reflow_stop_state(cancelled, editing);"
+            ),
+            "342-A: 必须经 reflow_stop_state(cancelled, editing) 三态判定"
+        );
+        assert!(
+            !block_contains(&lines, anchor, "let stopped = STREAMING_STOPPED.load("),
+            "342-A: PreviewReflow 臂不得再用 STREAMING_STOPPED 一刀切当取消"
         );
     }
 

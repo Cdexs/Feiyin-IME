@@ -215,23 +215,35 @@ impl Default for AccDispatchConfig {
     }
 }
 
-/// PARALLEL-ACC-298：是否把「当前未派发区间」派发给 accuracy 并行 worker。
+/// PARALLEL-ACC-298 / LOCALRT-DISPATCH-OR-342-D：是否把「当前未派发区间」派发给 accuracy 并行 worker。
 ///
-/// 三个条件同时成立：总开关开 且 本轮停顿未派过（latch，防同一停顿重复派）且
-/// 连续静默 ≥ `silence_ms`(800) 且 未派发区间样本数 ≥ `min_seg_ms`(3s)。
+/// 🔴 设计口径（Gavin 原始意图，342-D 定案）：**静默 ≥ `silence_ms`(800) 或 未派发累计 ≥ `min_seg_ms`(5000)**
+/// **任一成立即派**。原实现误写成「静默 且 累计」两条件同时成立（`:221` 注释白纸黑字），
+/// 导致连续说话 >5s 不停顿时**永不派**、短句停顿**也不派** ⇒ accuracy 拿不到音频。
+///
+/// 两条支路：
+/// - **静默支**：`silent_ms >= silence_ms` —— 一句话说完的停顿。受 `done_for_pause` 约束
+///   （同一停顿只派一次）。
+/// - **长度支**：`pending >= min_seg_ms` —— 一口气说不停顿。**不受** `done_for_pause` 约束；
+///   派发后调用方把 `acc_dispatched_end = pcm.len()`，pending 归零 ⇒ 需再攒满 `min_seg_ms`
+///   才会再次成立，**天然节流**，不会每 chunk 都派。
+///
+/// 🔴 `has_speech` 护栏（保留）：**纯静音区间不派** —— 送 accuracy 会返回空 ⇒ 上层
+/// `all_native` 翻 false ⇒ 本地档多跑一遍标点引擎（路由漂移）。
 fn should_dispatch_acc(
     enabled: bool,
     silent_ms: f32,
     pending_samples: usize,
     done_for_pause: bool,
+    has_speech: bool,
     silence_ms: f32,
     min_seg_ms: u64,
 ) -> bool {
-    if !enabled || done_for_pause {
+    if !enabled || !has_speech || pending_samples == 0 {
         return false;
     }
-    if silent_ms < silence_ms {
-        return false;
+    if silent_ms >= silence_ms {
+        return !done_for_pause;
     }
     let min_samples = min_seg_ms as usize * SAMPLE_RATE as usize / 1000;
     pending_samples >= min_samples
@@ -385,6 +397,32 @@ fn endpoint_confirm_text<'a>(main: &'a str, full: &'a str, shadow: Option<&'a st
     best
 }
 
+/// LOCALRT-ENDPOINT-EMPTY-342：endpoint 分支的确认决策（纯函数，便于钉死 §判据）。
+///
+/// 触发场景：主 stream 换流后只喂了静音，2s 后 rule2 又给出一个 endpoint —— 这是
+/// **静音流上的假 endpoint**，不是真正的句子边界。判据「本句自上次 endpoint 是否有声」
+/// 复用现有能量口径（`chunk_rms > silence_threshold`），此处只做纯逻辑映射。
+#[derive(Debug, PartialEq, Eq)]
+enum EndpointAction {
+    /// 真 endpoint + 有确认文本：正常确认本句。
+    Confirm,
+    /// 真 endpoint 但三方全空：只记日志，不确认（原行为）。
+    Empty,
+    /// 假 endpoint（静音段）：不确认、不推进 `sentence_id` / `sentence_pcm_start`、
+    /// 静音流文本一律丢弃（幻字抑制，F3）。
+    SuppressSilence,
+}
+
+fn endpoint_action(segment_has_speech: bool, confirm_text_empty: bool) -> EndpointAction {
+    if !segment_has_speech {
+        EndpointAction::SuppressSilence
+    } else if confirm_text_empty {
+        EndpointAction::Empty
+    } else {
+        EndpointAction::Confirm
+    }
+}
+
 /// 本地真流式转录（边收音频边解码），与 `transcribe_streaming_realtime` 平行。
 ///
 /// # 参数
@@ -457,6 +495,11 @@ pub fn transcribe_streaming_local(
     log::debug!("[LocalRT-DBG-284] shadow_trigger_ms={}", shadow_trigger_ms);
     // 当前句音频在 `pcm` 中的起点（上次 endpoint reset 之后）。
     let mut sentence_pcm_start: usize = 0;
+    // LOCALRT-ENDPOINT-EMPTY-342：自上次 endpoint 以来是否出现过**有声** chunk
+    // （复用现有能量判据 `chunk_rms > silence_threshold`，不另抄阈值）。
+    // 用于区分「真 endpoint（本句有语音）」与「静音流上的假 endpoint」：后者不确认、
+    // 不推进游标、不并入预览（F3 幻字抑制）。
+    let mut speech_since_last_reset: bool = false;
     // 影子收尾产出的当前句文本（仅显示；新语音进来即作废）。
     let mut shadow_current: Option<String> = None;
     // 本轮静默是否已跑过影子（同一停顿不重复解码）。
@@ -532,6 +575,8 @@ pub fn transcribe_streaming_local(
             silent_ms += chunk_ms;
         } else {
             silent_ms = 0.0;
+            // LOCALRT-ENDPOINT-EMPTY-342：本句出现过有声 chunk ⇒ 后续 endpoint 是真切句。
+            speech_since_last_reset = true;
             // LOCALRT-ENDPOINT-284：有新语音进来 → 允许本轮停顿结束后再触发影子。
             // 不立即清 shadow_current：显示侧用「取更长者」避免瞬时缩短/闪烁（见下 base 选择）。
             shadow_done_for_pause = false;
@@ -683,7 +728,22 @@ pub fn transcribe_streaming_local(
             // 307 后预期 full 多数时候最长 ⇒ 尾字不再等下一句。影子保留（服务「停顿中提前显示」）。
             let confirm_text: &str =
                 endpoint_confirm_text(flush_text, &full_text, shadow_current.as_deref());
-            if !confirm_text.is_empty() {
+            // LOCALRT-ENDPOINT-EMPTY-342（F1+F3）：自上次 endpoint 无有声 chunk ⇒ 静音流上的
+            // **假 endpoint**。不确认、不推进游标、不并入预览（静音流吐出的字一律丢弃，幻字抑制）。
+            let segment_has_speech = speech_since_last_reset;
+            let action = endpoint_action(segment_has_speech, confirm_text.is_empty());
+            if action == EndpointAction::SuppressSilence {
+                log::debug!(
+                    "[LocalRT-DBG-342] endpoint on silence-only segment: suppressed (main_len={} full_len={} shadow_len={} suppress_len={})",
+                    flush_text.chars().count(),
+                    full_text.chars().count(),
+                    shadow_current
+                        .as_ref()
+                        .map(|s| s.chars().count())
+                        .unwrap_or(0),
+                    confirm_text.chars().count()
+                );
+            } else if action == EndpointAction::Confirm {
                 // LOCALRT-FIRSTCHAR-272：首次拿到非空识别文本（首次推理产出）。
                 if !first_result_seen {
                     first_result_seen = true;
@@ -751,21 +811,31 @@ pub fn transcribe_streaming_local(
                 bound_seg = None;
             }
             // LOCALRT-ENDPOINT-284 诊断（方案 A 取证）：每次切句打一行，行数=切句次数。
+            // 342：`has_speech=false` 的假 endpoint 不推进 sentence_id（游标不动）。
             log::debug!(
-                "[LocalRT-DBG-284] endpoint fired: sentence_id {} -> {} (rule2 cut)",
+                "[LocalRT-DBG-284] endpoint fired: sentence_id {} -> {} (rule2 cut, has_speech={})",
                 sentence_id,
-                sentence_id + 1
+                sentence_id + segment_has_speech as i64,
+                segment_has_speech
             );
             // 🔴 input_finished() 之后的 stream 不可复用，下一句换新流（create_stream 廉价：
             // 影子逻辑每 400ms 就建一次，decode 0.5~0.7ms 起步，无性能顾虑）。
+            // 342：假 endpoint 也换新流（清 endpoint 闩锁），但**不推进** sentence_id / sentence_pcm_start。
             stream = recognizer.create_stream();
-            sentence_id += 1;
-            // 新句从当前总音频长度起算；作废影子。
-            sentence_pcm_start = pcm.len();
+            // 342：假 endpoint（本句无声）**不推进** sentence_id / sentence_pcm_start。
+            sentence_id += segment_has_speech as i64;
+            let next_sentence_start = if segment_has_speech {
+                pcm.len()
+            } else {
+                sentence_pcm_start
+            };
+            // 新句从当前总音频长度起算（342：假 endpoint 保持不动）；作废影子。
+            sentence_pcm_start = next_sentence_start;
             shadow_current = None;
             shadow_done_for_pause = false;
+            speech_since_last_reset = false;
         } else if let Some(r) = recognizer.get_result(&stream) {
-            if !r.text.is_empty() {
+            if !r.text.is_empty() && speech_since_last_reset {
                 // LOCALRT-LASTCHAR-276：诊断——每次识别文本变化时打印，用于判断「最后一个字
                 // 是否在任何一帧 get_result 里出现过」。只在变化时打，有界。
                 // URGENT-286：整块（比较 + clone + 格式化）仅在 Debug 级启用时执行 ⇒ 默认 Warn 下零开销。
@@ -808,6 +878,14 @@ pub fn transcribe_streaming_local(
                 // 杜绝「对已打点文本二次打点 / 标点重复」（FIX-252 场景）。
                 // 非 endpoint → 仅替换当前句中间结果（本函数内唯一另一处 on_result）。
                 state.on_result(sentence_id, &r.text, false, &[]);
+            } else if !r.text.is_empty() && log::log_enabled!(log::Level::Debug) {
+                // LOCALRT-ENDPOINT-EMPTY-342（F3）：静音段（自上次 endpoint 无有声 chunk）
+                // 的流式文本一律丢弃，不并入预览（幻字抑制）。
+                log::debug!(
+                    "[LocalRT-DBG-342] non-endpoint text on silence-only segment: suppressed '{}' (chars={})",
+                    r.text,
+                    r.text.chars().count()
+                );
             }
         }
 
@@ -824,7 +902,7 @@ pub fn transcribe_streaming_local(
                     shadow_secs,
                     SHADOW_MAX_AUDIO_SECS
                 );
-            } else if !shadow_audio.is_empty() {
+            } else if !shadow_audio.is_empty() && speech_since_last_reset {
                 // URGENT-286：decode 计时只为日志用 ⇒ 仅 Debug 级才取样（默认 Warn 下零开销）。
                 let t_shadow = log::log_enabled!(log::Level::Debug).then(Instant::now);
                 let shadow = recognizer.create_stream();
@@ -857,18 +935,25 @@ pub fn transcribe_streaming_local(
                     );
                 }
                 shadow_fired = true;
+            } else if !shadow_audio.is_empty() {
+                // LOCALRT-ENDPOINT-EMPTY-342（F3）：静音段不跑影子（避免静音流幻字进入预览）。
+                log::debug!(
+                    "[LocalRT-DBG-342] shadow skipped: silence-only segment (no speech since last endpoint)"
+                );
             }
         }
 
-        // PARALLEL-ACC-298：静默 ≥800ms 且当前未派发区间 ≥3s ⇒ 把这一段派给 accuracy 并行 worker。
+        // PARALLEL-ACC-298 / 342-D：**静默 ≥800ms 或 未派发 ≥5s** 任一成立即把这一段派给 accuracy。
         // 🔴 只推进 `acc_dispatched_end`，**不 reset / 不切句 / 不动 sentence_id**（与 endpoint 解耦）。
         // 复用 `build_padded_segments`：自动加 200ms 边界 padding，且 >20s 的片会硬切成多个子段
         // （native `max_total_len=512` 的硬限制，禁止整段 >20s 喂 accuracy）。
+        let acc_pending = pcm.len().saturating_sub(acc_dispatched_end);
         if should_dispatch_acc(
             acc_cfg.enabled,
             silent_ms,
-            pcm.len().saturating_sub(acc_dispatched_end),
+            acc_pending,
             acc_done_for_pause,
+            acc_pending_has_speech,
             acc_cfg.silence_ms,
             acc_cfg.min_seg_ms,
         ) {
@@ -1084,8 +1169,8 @@ pub fn transcribe_streaming_local(
 #[cfg(test)]
 mod tests {
     use super::{
-        endpoint_confirm_text, local_stream_num_threads, should_dispatch_acc, should_dispatch_tail,
-        SAMPLE_RATE,
+        endpoint_action, endpoint_confirm_text, local_stream_num_threads, should_dispatch_acc,
+        should_dispatch_tail, EndpointAction, SAMPLE_RATE,
     };
 
     /// FIX-LOCALRT-TAILCHAR-291/307：三方取最长（main / full / shadow），结果恒 ≥ main。
@@ -1135,6 +1220,116 @@ mod tests {
                 "main={main:?} full={full:?} shadow={shadow:?} chosen={chosen:?}"
             );
         }
+    }
+
+    // ========================================================================
+    // LOCALRT-ENDPOINT-EMPTY-342 · F1+F3 决策纯函数
+    //   「假 endpoint 不确认/不推进游标 + 静音流幻字不入预览」的行为由 `endpoint_action`
+    //   纯函数钉死；端到端时序由源码护栏（下方 guard342_*）钉死。
+    // ========================================================================
+
+    /// 判据 #1：假 endpoint（本句无声）即使三方有非空文本也一律抑制（幻字抑制）。
+    #[test]
+    fn endpoint_action_342_fake_endpoint_suppressed_even_with_text() {
+        // 无声 + 有文本 ⇒ 抑制（静音流幻字绝不并入预览）。
+        assert_eq!(
+            endpoint_action(false, false),
+            EndpointAction::SuppressSilence
+        );
+        // 无声 + 空 ⇒ 同样抑制（不确认、不推进游标）。
+        assert_eq!(
+            endpoint_action(false, true),
+            EndpointAction::SuppressSilence
+        );
+    }
+
+    /// 判据 #2：真 endpoint（本句有语音）行为逐位不变 —— 有文本确认、空则只记 EMPTY。
+    #[test]
+    fn endpoint_action_342_real_endpoint_unchanged() {
+        assert_eq!(endpoint_action(true, false), EndpointAction::Confirm);
+        assert_eq!(endpoint_action(true, true), EndpointAction::Empty);
+    }
+
+    // ========================================================================
+    // LOCALRT-ENDPOINT-EMPTY-342 · 源码级结构护栏
+    // ========================================================================
+
+    /// 判据 #3：endpoint 分支「推进游标」必须被 `segment_has_speech` 门控；
+    /// 非 endpoint 分支的 `on_result` 必须被 `speech_since_last_reset` 门控；
+    /// 有声判据在函数体内**恰好一处置位**（复用现有能量分支，不另抄阈值）。
+    #[test]
+    fn guard342_silence_segment_does_not_advance_or_render() {
+        let (lines, (lo, hi), (fn_lo, fn_hi)) = endpoint_guard_regions();
+
+        // endpoint 分支：游标推进必须是条件式（假 endpoint 不推进）。
+        assert_eq!(
+            count_starts(&lines, lo, hi, "sentence_id += segment_has_speech as i64;"),
+            1,
+            "342: sentence_id 必须按 segment_has_speech 条件推进"
+        );
+        assert_eq!(
+            count_starts(
+                &lines,
+                lo,
+                hi,
+                "let next_sentence_start = if segment_has_speech {"
+            ),
+            1,
+            "342: sentence_pcm_start 必须按 segment_has_speech 条件取值"
+        );
+        assert_eq!(
+            count_starts(&lines, lo, hi, "sentence_pcm_start = next_sentence_start;"),
+            1,
+            "342: sentence_pcm_start 必须赋条件值"
+        );
+        assert_eq!(
+            count_starts(&lines, lo, hi, "sentence_id += 1;"),
+            0,
+            "342: 不得无条件推进 sentence_id"
+        );
+        assert_eq!(
+            count_starts(&lines, lo, hi, "sentence_pcm_start = pcm.len();"),
+            0,
+            "342: 不得无条件推进 sentence_pcm_start"
+        );
+
+        // 非 endpoint 分支：文本入预览必须与有声音号同条件。
+        let sup = (fn_lo..=fn_hi)
+            .find(|&i| lines[i].starts_with("if !r.text.is_empty() && speech_since_last_reset {"))
+            .expect(
+                "342: 非 endpoint 文本必须按 `!r.text.is_empty() && speech_since_last_reset` 门控",
+            );
+        let onres = (fn_lo..=fn_hi)
+            .find(|&i| lines[i].starts_with("state.on_result(sentence_id, &r.text, false"))
+            .expect("342: 非 endpoint 中间结果 on_result 行必须存在");
+        assert!(
+            sup < onres,
+            "342: 非 endpoint 的 on_result 必须被 speech_since_last_reset 门控，实测 sup={sup} onres={onres}"
+        );
+
+        let n_set = count_starts(&lines, fn_lo, fn_hi, "speech_since_last_reset = true;");
+        assert_eq!(
+            n_set, 1,
+            "342: 有声判据应恰 1 处置位（复用现有能量分支 chunk_rms>silence_threshold），实测 {n_set}"
+        );
+    }
+
+    /// 判据 #4：endpoint 分支必须走 `endpoint_action(...)` 决策，且抑制分支存在一次。
+    #[test]
+    fn guard342_uses_endpoint_action() {
+        let (lines, (lo, hi), _) = endpoint_guard_regions();
+        let n_call = count_contains(
+            &lines,
+            lo,
+            hi,
+            "endpoint_action(segment_has_speech, confirm_text.is_empty())",
+        );
+        assert_eq!(
+            n_call, 1,
+            "342: endpoint 分支应调用 endpoint_action 恰 1 次，实测 {n_call}"
+        );
+        let n_sup = count_contains(&lines, lo, hi, "EndpointAction::SuppressSilence");
+        assert_eq!(n_sup, 1, "342: 抑制分支应恰 1 处，实测 {n_sup}");
     }
 
     // ========================================================================
@@ -1343,45 +1538,68 @@ mod tests {
     //   真实 recognizer 起不来 ⇒ 把触发判据抽纯函数钉死（判据 #3）。
     // ========================================================================
 
-    /// 判据 #3-a：800ms + ≥3s + 本轮未派 三条件缺一不可。
+    /// 判据 #3-a（342-D 修订）：**静默 ≥800ms 或 未派发 ≥5s** 任一成立即派（OR，不是 AND）。
     #[test]
-    fn acc_should_dispatch_requires_all_three_conditions() {
+    fn acc_should_dispatch_or_semantics() {
         let min3s = 3000u64;
         let three_s = 3 * SAMPLE_RATE as usize;
-        // 全满足 ⇒ true
+        // 静默支：silent>=800 + 有语音 + 未派 ⇒ true（pending 可以远小于 min_seg）
         assert!(should_dispatch_acc(
-            true, 800.0, three_s, false, 800.0, min3s
+            true, 800.0, 1, false, true, 800.0, min3s
         ));
-        // 静默差 1ms ⇒ false
-        assert!(!should_dispatch_acc(
-            true, 799.0, three_s, false, 800.0, min3s
+        // 长度支：pending>=min_seg + 有语音 ⇒ true（**即使 silent=0，连续说话**）
+        assert!(should_dispatch_acc(
+            true, 0.0, three_s, false, true, 800.0, min3s
         ));
-        // 区间差 1 样本 ⇒ false
-        assert!(!should_dispatch_acc(
+        // 🔴 旧实现（AND）在此为 false 的核心场景：连续说话满 5s 不停顿
+        assert!(should_dispatch_acc(
+            true,
+            0.0,
+            three_s * 2,
+            false,
             true,
             800.0,
+            min3s
+        ));
+        // 两条件都不满足 ⇒ false（静默差 1ms 且区间差 1 样本）
+        assert!(!should_dispatch_acc(
+            true,
+            799.0,
             three_s - 1,
             false,
+            true,
             800.0,
             min3s
         ));
-        // 本轮已派（latch）⇒ false
+        // 🔴 纯静音不派（has_speech=false），两条支都不放过。
         assert!(!should_dispatch_acc(
             true,
             5000.0,
             three_s * 10,
-            true,
+            false,
+            false,
             800.0,
             min3s
         ));
-        // 总开关关 ⇒ false
+        // 静默支受 done_for_pause 约束（同一停顿只派一次）；长度支不受。
+        assert!(!should_dispatch_acc(
+            true, 5000.0, 100, true, true, 800.0, min3s
+        ));
+        assert!(should_dispatch_acc(
+            true, 0.0, three_s, true, true, 800.0, min3s
+        ));
+        // 总开关关 / 空区间 ⇒ false。
         assert!(!should_dispatch_acc(
             false,
             5000.0,
             three_s * 10,
             false,
+            true,
             800.0,
             min3s
+        ));
+        assert!(!should_dispatch_acc(
+            true, 5000.0, 0, false, true, 800.0, min3s
         ));
     }
 
@@ -1390,27 +1608,24 @@ mod tests {
     fn acc_should_dispatch_honors_env_thresholds() {
         // silence 调到 400：400ms 即派
         assert!(should_dispatch_acc(
-            true,
-            400.0,
-            3 * SAMPLE_RATE as usize,
-            false,
-            400.0,
-            3000
+            true, 400.0, 1, false, true, 400.0, 3000
         ));
-        // min_seg 调到 6000：3s 不够，6s 才够
+        // min_seg 调到 6000：无静默时 3s 不够，6s 才够
         assert!(!should_dispatch_acc(
             true,
-            800.0,
+            0.0,
             3 * SAMPLE_RATE as usize,
             false,
+            true,
             800.0,
             6000
         ));
         assert!(should_dispatch_acc(
             true,
-            800.0,
+            0.0,
             6 * SAMPLE_RATE as usize,
             false,
+            true,
             800.0,
             6000
         ));

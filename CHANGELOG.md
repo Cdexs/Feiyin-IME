@@ -1488,3 +1488,4 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
   非 coder-2 自行 commit；同批被误扫入的还有 coder-1 在途的 `src/audio/mod.rs`。
   原因是主控用了 `git add -A`，详见 `.claude/tasks/lessons.md` 2026-09-21 条。
 - ORCH-CTX-GUARD-FIX-324：回显护栏比对面收窄至仅前文（排除词库与英文指令，改前误触 43%）；`[LocalRT-DBG-320]` 埋点改记判决当时输出长度并新增 `final_chars`；新增恒发的输出清理指令（结巴/重复/口水词），`build_ctx_system` 契约改为恒返回 `Some`。
+- LOCALRT-ENDPOINT-EMPTY-342：①F1+F3 假 endpoint 护栏（静音段自上次 endpoint 无有声 chunk ⇒ 不确认/不推进 `sentence_id`·`sentence_pcm_start`，仍换流清闩锁；静音流文本与 shadow 一律不入预览）；②A 回灌停止语义三态（取消 `cancel_signal` / 编辑 `OVERLAY_EDITING` / 松手完成），`reflow_action` 判据由 `STREAMING_STOPPED` 一刀切改为三态 ⇒ **松手完成仍回灌**；③D `should_dispatch_acc` 由「静默 且 ≥5s」改回设计口径 **OR**（静默 ≥800ms **或** 累计 ≥5s），并补 `has_speech` 护栏（纯静音不派）；C 并入 D。文件 `src/transcription/local_stream.rs`、`src/main.rs`；`cargo fmt --check` clean / `check --all-targets` 0 error、warnings 99/90 基线 / numstat==-w / 全量 `cargo test` 0 failed。未改版本、未出包、未 commit。padding 仅出结论（实时单段后向填充为 0.0 静音、前向被 clamp，无音频重叠），**未改代码**。
