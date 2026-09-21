@@ -151,6 +151,17 @@
 - **⚠️ 协作事件**：主控文档 commit `99799c5`（10:26:26）在本题进行中执行，**把我未完成的 `local_stream.rs` 与 coder-1 的 `src/audio/mod.rs` 一并扫入**（commit message 未反映代码改动）。本单改动已随之落盘、worktree 无额外 diff；`git status` 另见 `.gitignore` + `src/audio/mod.rs`（非本单）。请主控知悉该 commit 语义与文件归属。
 - **红线**：只改 `local_stream.rs` / 未动版本 / 未自行 commit / 未出包 / 未跑 `cargo build --release` / 零凭证。
 
+## 2026-09-21 — tester-1 — TEST-EXEC-309 ✅ 307/308 回归全绿（🛑 出包按 Gavin 令暂停，与 Qwen3-ASR 选型整合后一起出）
+
+- **基线**：HEAD `5ca48b2`（308），clean、`ui/` 零 diff。**未开始 Step1-4、Publish/ 未动**（仍 BUILD-306）。
+- **回归**：root **1349P/0F/15I**（EXIT 0；上轮 1342P → **+7**）；`src-tauri` **85P/0F/0I**；Vitest **SKIP**（`ui/` 零 diff）。
+- **+7 对账**（NEW 9 / GONE 2）：308 新增 7 条 `audio::tests::pre_roll_residual_308_*`；307 新增 2 条 `endpoint_confirm_text_takes_longest_of_three` / `endpoint_confirm_text_len_not_below_main`；旧 291 两参用例 `endpoint_confirm_text_{never_regresses,len_not_below_before}` **−2**（扩为「三选一取最长」的有意替换）。
+- **🔴 护栏逐条点名**：`guard291_g1..g4` 全 ok（**G3 计数已由 307 同步 1→2** = 全量重解码 + 换流）、`audio::tests::guard_293_i5` ok、`nospeech_122` 8/8、`guard_214_215` 12/12、`overlay_121` 10/10、`flicker_130` 3/3（main.rs 四组 **33/33**）⇒ 307/308 **未致扫描区塌缩/锚点位移**。
+- **Gavin 端测（带 `-debug`）**：**A 尾字** = `[LocalRT-DBG-307] endpoint/final full-decode: … gained=<n>`（🔴 多数应为 1；**恒 0 则立即报主控**）；**B 残留** = `[LocalRT-DBG-293] … mode=residual trailing_silence_ms=<n>`。其余照旧（首字三场景分开测 / `tail_wait` / 本地流式+翻译 / 切片 A/B/C / 口水词过滤）。
+- **🔴 已知未修**：模型对纯静音也可能凭空吐字（BUILD-306 实证 pre-roll `peak=0`，+444ms 就出「我是」）——**308 修不到**，属模型幻觉，需另立单；用 `[LocalRT-DBG-292]` 的 `first_speech_at` 区分。
+- **证据**：`collab/outbox/tester-1/testexec309/{root_test.log,tauri_test.log}`。
+- **红线**：未出包 / Publish 未动 / 版本 0.9.2 未动 / 未改生产代码 / 零凭证。
+
 ## 2026-09-21 — tester-1 — TEST-EXEC + BUILD-306 ✅ 全量回归 + 出包（八项 PASS，303+305 口水词过滤接线）
 
 - **基线**：HEAD `60c0457`（305 接线），clean、`ui/` 零 diff。（本单首次「放行」口头消息因含 shell 元字符被误当命令执行、未送达，主控改走任务书重发。）
