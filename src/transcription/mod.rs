@@ -138,6 +138,28 @@ fn accuracy_engine() -> AccuracyEngine {
     accuracy_engine_from(std::env::var("VOICE_IME_ACCURACY_ENGINE").ok().as_deref())
 }
 
+/// MIGRATE-QWEN3-315：accuracy 侧解码线程数**默认值** = 现状
+/// `min(逻辑核数, 8)`（RESEARCH-ACC-LATENCY-271 实测最优；取不到兜底 4）。**不改默认**。
+fn default_acc_num_threads() -> i32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(8) as i32)
+        .unwrap_or(4)
+}
+
+/// MIGRATE-QWEN3-315：解析 `ACC_NUM_THREADS`（非法/缺失/<1 ⇒ 回落现状默认）。
+///
+/// 用途：与 317 的 `LOCAL_STREAM_NUM_THREADS` 配套，让 tester-1 扫「流式 N + accuracy M」组合
+/// —— 298 之后两者并发，4+8=12 > 8 物理核，这笔账从未合并评估过。
+fn acc_num_threads_from(v: Option<&str>) -> i32 {
+    v.and_then(|s| s.trim().parse::<i32>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or_else(default_acc_num_threads)
+}
+
+fn acc_num_threads() -> i32 {
+    acc_num_threads_from(std::env::var("ACC_NUM_THREADS").ok().as_deref())
+}
+
 /// ASR transcriber using sherpa-onnx
 ///
 /// ASR-SINGLE-MODEL-001（DEC-027）+ DEC-028：多模式 ASR 架构
@@ -1108,6 +1130,13 @@ fn create_funasr_nano_recognizer(
     let emb = model_dir_path.join("embedding.int8.onnx");
     let tok = model_dir_path.join("Qwen3-0.6B");
 
+    // MIGRATE-QWEN3-315：accuracy 线程数 env 覆盖（默认 = min(逻辑核数,8)，无 env 逐位无变）。
+    let num_threads = acc_num_threads();
+    log::debug!(
+        "[MIGRATE-QWEN3-315] accuracy num_threads={} (env ACC_NUM_THREADS)",
+        num_threads
+    );
+
     let offline_config = sherpa_onnx::OfflineRecognizerConfig {
         model_config: sherpa_onnx::OfflineModelConfig {
             // RESEARCH-ACC-LATENCY-271：显式配 num_threads（原走 Default=0）。
@@ -1121,9 +1150,7 @@ fn create_funasr_nano_recognizer(
             //   `0` 在本机被 ORT 当**单线程**（0 与 1 线程耗时逐位吻合）⇒ accuracy 一直单线程跑。
             // 取舍：long 用 8 比 4 快 **24%**，short 用 8 比 4 慢 4.5% ⇒ 综合取 8。
             // 不写死 8：min(逻辑核数, 8)，避免换到少核机器后超核抢核变慢；取不到兜底 4。
-            num_threads: std::thread::available_parallelism()
-                .map(|n| n.get().min(8) as i32)
-                .unwrap_or(4),
+            num_threads,
             // 显式 "cpu"（与 local_stream.rs 对齐，消除另一个隐式默认）
             provider: Some("cpu".to_string()),
             funasr_nano: OfflineFunASRNanoModelConfig {
@@ -1202,12 +1229,17 @@ fn create_qwen3_recognizer(model_dir: &Path) -> Result<sherpa_onnx::OfflineRecog
     let dec = model_dir_path.join("decoder.int8.onnx");
     let tok = model_dir_path.join("tokenizer");
 
+    // MIGRATE-QWEN3-315：与 FunASR 同口径走 `ACC_NUM_THREADS`（默认 min(逻辑核数,8)，无 env 零变）。
+    let num_threads = acc_num_threads();
+    log::debug!(
+        "[MIGRATE-QWEN3-315] accuracy num_threads={} (env ACC_NUM_THREADS)",
+        num_threads
+    );
+
     let offline_config = sherpa_onnx::OfflineRecognizerConfig {
         model_config: sherpa_onnx::OfflineModelConfig {
             // 与 create_funasr_nano_recognizer 同口径：min(逻辑核数, 8)，显式 cpu。
-            num_threads: std::thread::available_parallelism()
-                .map(|n| n.get().min(8) as i32)
-                .unwrap_or(4),
+            num_threads,
             provider: Some("cpu".to_string()),
             qwen3_asr: OfflineQwen3ASRModelConfig {
                 conv_frontend: Some(conv.to_str().unwrap_or("").to_string()),
@@ -1219,7 +1251,10 @@ fn create_qwen3_recognizer(model_dir: &Path) -> Result<sherpa_onnx::OfflineRecog
                 temperature: 1e-6,
                 top_p: 0.8,
                 seed: 42,
-                // 🔴 本单留空；词库改走 per-stream（下一单）。
+                // 🔴 MIGRATE-QWEN3-315（316 实测）：词库在 Qwen3 路径下**暂不注入** ——
+                //    316 B 组（仅词库经 per-stream）CER = A 组（零贡献），且 F 组（词库+前文）
+                //    把前文收益抵消 ⇒ 白占 DEC-068 零和 token 预算。**勿误以为漏接**；
+                //    上下文注入整体挂起（316 收益不可归因 + 长跨回显失效模式）。
                 hotwords: None,
             },
             tokens: Some(String::new()),
@@ -2059,6 +2094,21 @@ mod tests {
         assert_eq!(accuracy_engine_from(Some("FunASR")), AccuracyEngine::FunAsr);
         // 未知值回落默认 qwen3（只有明确写 funasr 才回滚）
         assert_eq!(accuracy_engine_from(Some("garbage")), AccuracyEngine::Qwen3);
+    }
+
+    #[test]
+    fn migrate315_acc_num_threads_env_override_and_fallback() {
+        assert_eq!(acc_num_threads_from(Some("6")), 6);
+        assert_eq!(acc_num_threads_from(Some(" 3 ")), 3, "容忍空白");
+        // 非法 / <1 ⇒ 回落现状默认（机器相关，只断言落在 [1,8]）
+        for v in [None, Some("0"), Some("-2"), Some("abc"), Some("2.5")] {
+            let n = acc_num_threads_from(v);
+            assert!(
+                (1..=8).contains(&n),
+                "fallback 必须落在现状默认区间 [1,8]，got {n} for {v:?}"
+            );
+        }
+        assert_eq!(acc_num_threads_from(None), default_acc_num_threads());
     }
 
     #[test]

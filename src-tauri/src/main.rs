@@ -111,12 +111,27 @@ fn check_accuracy_model_ready() -> AccuracyModelStatus {
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("models");
-    let dir = model_dir.join("sherpa-onnx-funasr-nano-int8-2025-12-30");
-    let enc = dir.join("encoder_adaptor.int8.onnx");
-    let llm = dir.join("llm.int8.onnx");
-    let emb = dir.join("embedding.int8.onnx");
-    let tok = dir.join("Qwen3-0.6B");
-    let ready = dir.exists() && enc.exists() && llm.exists() && emb.exists() && tok.exists();
+    // MIGRATE-QWEN3-315：按引擎选择文件集（默认 Qwen3；`VOICE_IME_ACCURACY_ENGINE=funasr` 回滚）。
+    // 🔴 src-tauri 是独立 crate，无法复用 `transcription::check_accuracy_model_ready`，
+    // 故此处镜像同一组文件名——两处判据必须逐字一致，否则 UI 显示「已就位」而主程序加载失败。
+    let engine_funasr = std::env::var("VOICE_IME_ACCURACY_ENGINE")
+        .map(|v| v.eq_ignore_ascii_case("funasr"))
+        .unwrap_or(false);
+    let (dir, ready) = if engine_funasr {
+        let d = model_dir.join("sherpa-onnx-funasr-nano-int8-2025-12-30");
+        let ready = d.join("encoder_adaptor.int8.onnx").exists()
+            && d.join("llm.int8.onnx").exists()
+            && d.join("embedding.int8.onnx").exists()
+            && d.join("Qwen3-0.6B").exists();
+        (d, ready)
+    } else {
+        let d = model_dir.join("sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25");
+        let ready = d.join("conv_frontend.onnx").exists()
+            && d.join("encoder.int8.onnx").exists()
+            && d.join("decoder.int8.onnx").exists()
+            && d.join("tokenizer").exists();
+        (d, ready)
+    };
     AccuracyModelStatus {
         ready,
         model_dir: dir.display().to_string(),

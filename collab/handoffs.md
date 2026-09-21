@@ -5,6 +5,14 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-1 — MIGRATE-QWEN3-315 ✅ 交付（迁移收尾：线程 env + 词库不注入 + 硬编码排查）
+
+- **2.1 `ACC_NUM_THREADS`**：`default_acc_num_threads()`(=min(逻辑核数,8) 兜底 4)+`acc_num_threads_from()`（非法/缺失/<1 回落）+`acc_num_threads()`；FunASR/Qwen3 两处接线 + `[MIGRATE-QWEN3-315]` 日志。**默认=现状，无 env 逐位无变**（配 317 扫流式N+accuracyM 组合）。
+- **2.2 词库不注入**：`create_qwen3_recognizer` hotwords=None 注释改为决策记录（316 B 组零贡献、F 组抵消前文 ⇒ 白占 DEC-068 预算；勿误以为漏接）；未接 per-stream。
+- **2.3 用户可见硬编码**：src-tauri `check_accuracy_model_ready` 写死 FunASR（独立 crate，314 未覆盖）⇒ 已按 `VOICE_IME_ACCURACY_ENGINE` 分派；UI accuracy 卡仅动态显示 `modelInfo.model_dir`、**无 name/size 硬编码**（无 locale 变更）；local_realtime offline 卡与在线 FunASR 文案有意保留（LocalRealtime offline 仍 FunASR）。
+- **2.4 自检**：两引擎构造均 Ok（`migrate314_both_engine_recognizers_construct --ignored`）、就位判据两套 true；`native_punctuated` 与引擎无关；🔴 未跑实机录音。
+- **验证**：root fmt clean / check 0 error / warnings 110/101；src-tauri check 0 error / warnings 17/19；numstat==-w（mod.rs 57/7、src-tauri main.rs 21/6）；1 新单测通过。未碰根 `src/main.rs`；未动版本 / 未 commit / 未出包 / 零凭证。
+
 ## 2026-09-21 — coder-1 — TUNE-STREAM-317 ✅ 交付（流式三调优点）
 
 - **①② env（默认不变）**：`LOCAL_STREAM_NUM_THREADS`（默认 4）+ `LOCAL_STREAM_BLANK_PENALTY`（默认 0.0，负值合法；NaN/inf/非法回落）；接线 `create_local_stream_recognizer` + `[LocalRT-DBG-317]` 打印三实际值。**无 env 逐位无变**；注释写明 blank_penalty 双向风险。
