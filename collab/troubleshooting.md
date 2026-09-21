@@ -225,3 +225,29 @@ done
 🔴 **覆盖前先 `diff`**：确认旧副本与根目录的差异只是「缺新内容」，而不是含本地定制。
 本次 diff 确认两个旧 `itn-rules.toml` 仅缺 `[protect.degree_adverbs]` 一块，其余逐字相同，
 故覆盖安全。用 `cp`（字节复制），**不要用 PowerShell Set-Content**（会把 UTF-8 写成 UTF-16 LE）。
+
+## [FILTERED-TEST-BLINDSPOT-001] 🔴 过滤跑测试查不出源码级护栏 —— 红了两次提交没人发现
+
+**事故**（2026-09-21）：`flicker_130_guard_tests::f1_mirror_before_gate` 在
+`4d49252`(329) 与 `7d3a3a5`(331) **两次提交中一直是红的**，主控与 coder-2 都没发现，
+直到 coder-1 做 332 时跑全量才暴露。
+
+**成因**：329 把镜像早写由 `*mirror = Some(text.clone())` 改成 `*mirror = Some(composed.clone())`。
+F1 是**源码级护栏**——它 `include_str!` 读自身源码、按**字面量**定位那行来验证
+「镜像早写先于 043 门闩」这个不变量。字面量一变，锚点就找不到，测试红。
+
+**为什么两道验证都漏掉**：
+- coder-2 自证跑的是 `reflow_persist_329` / `preview_reflow_325` / `053-B`（过滤）
+- 主控复核跑的是同一批过滤用例（`cargo test --bin feiyin-ime -- <filter>`）
+- 🔴 **过滤跑根本不会执行到 F1** —— 它不在过滤名单里，`filtered out` 数字里静静躺着
+
+**规矩**：
+1. 🔴 **改动落在源码级护栏覆盖区（main.rs 的 flicker_130 / overlay_075 / f1~f4 等模块）时，
+   提交前必须跑全量 `cargo test`，或至少整个护栏模块** —— 不能只跑本任务的目标用例；
+2. 过滤跑只适合「快速看本次改动对不对」，**不能当作提交判据**；
+3. 源码级护栏一旦因**正当改动**失配，**只同步锚点、不改断言语义**，并在注释写明何时为何同步
+   （332 即如此处理；人工复核不变量仍成立：早写 :6835 先于门 :6843）。
+
+**识别特征**：测试名里带 `guard` / `f1~f4` / 断言里出现 `count_startswith` `block_line_of`
+`main_prod_lines` `concat!("…", "…")`（故意拆字符串防自匹配）⇒ 就是源码级护栏，
+**它对无关改动敏感，这是设计使然，不是脆弱**。
