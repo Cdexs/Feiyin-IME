@@ -1941,3 +1941,17 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 新增 per-gen 权威前缀状态 `ACC_REFLOW_STATE` + 纯函数 `compose_with_acc_for_gen`；流式渲染/镜像前先合成（`StreamingText` 早写与渲染分支、`StreamingFinalPreview`） | ⚠️ **行为变更，平台中立逻辑**：`compose` 与状态定义在无 `#[cfg]` 区；但 `ACC_REFLOW_STATE` 只在 `PreviewReflow` 写，而 `PreviewReflow` 只有本地实时档发 ⇒ macOS 侧恒 None ⇒ `compose` 返回 raw（macOS 流式文本本就不渲染，行为不变） |
 | 镜像 `last_streaming_text` 早写内容由 raw 改 compose(raw)；`StreamingFinalPreview` 写镜像 | ✅ 平台中立；macOS 消费臂已具备该事件 arm（暂不渲染） |
 | macOS 侧需要做什么 | ✅ **无需改动**；未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未触 `src/platform/**` |
+
+## UI-LRMODEL-HINT-330（2026-09-21，coder-1）· 删除本地流式档「模型文件」提示块 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| 前端删除本地流式档提示块（`ui/src/pages/Voice.tsx`：`LocalRealtimeModelsInfo` 类型、`lrModelInfo` state、`checkLocalRealtimeModelsReady`、`lrModels`、`showLocalRealtimeAlert`、整块渲染，以及随之失去唯一调用者的 `handleCopyText`） | ✅ **平台中立**：`ui/` 是两端共用的同一份 React 代码 ⇒ macOS 构建自动一致，无需改动 |
+| 后端删除 `check_local_realtime_models_ready` 命令 + `LocalRealtimeModelsStatus` 结构 + `invoke_handler` 注册（`src-tauri/src/main.rs`） | ✅ 平台中立删除。**被删的正是「界面说假话」的来源**：该命令仍在找已不存在的 FunASR nano 目录（`encoder_adaptor/llm/embedding.int8.onnx` + `Qwen3-0.6B`），故恒报「缺失」。macOS 侧无引用 |
+| i18n 三份 locale 同步删除 6 个 key（`voice_asr_model_local_realtime_download_required` / `voice_asr_model_local_realtime_size` / `voice_local_realtime_model_ready` / `voice_local_realtime_model_missing` / `voice_local_realtime_online_label` / `voice_local_realtime_offline_label`） | ✅ 三份已同步；删除后键集**逐键完全一致（各 121 键）**，孤儿 key 归零（grep 见交付自证表） |
+| accuracy 档提示块（`showAccuracyAlert` / `modelInfo`） | ✅ **未动**（另一条独立链路；其判据已随 MIGRATE-QWEN3-320 迁到 Qwen3，是准的） |
+| 运行时 ASR 行为 | ✅ **零影响**（纯 UI + 无用命令清理） |
+| macOS 侧需要做什么 | ✅ **无需改动**；未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未引入依赖、未触 `src/platform/**` |
+
+⚠️ 已知代价（Gavin 已看过实际显示并明确要求删除）：被删块里「流式预览模型 228MB」那一行的检测原本是**准的**
+（`online_ready` 查的是真实在用的 streaming paraformer 目录）；整块删除后，**用户若真缺该模型，界面不再有任何提示**。

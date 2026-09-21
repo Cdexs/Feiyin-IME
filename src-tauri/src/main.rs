@@ -133,57 +133,6 @@ struct AccuracyModelStatus {
     download_url: String,
 }
 
-/// LOCAL-RT-READY-246: 本地 realtime **双模型**就位检测（供前端分别提示缺哪个）。
-///
-/// 🔴 判据必须与主程序实际加载路径一致（src-tauri 是独立 crate，无法复用
-/// `transcription::check_local_realtime_models_ready`，故此处镜像同一组文件名）：
-/// - online：streaming paraformer trilingual（encoder.int8.onnx + decoder.int8.onnx + tokens.txt）
-/// - offline：accuracy FunASR Nano native（encoder_adaptor/llm/embedding.int8.onnx + Qwen3-0.6B）
-/// command 名与字段名为前端契约，不得擅改。
-#[tauri::command]
-fn check_local_realtime_models_ready() -> LocalRealtimeModelsStatus {
-    const DOWNLOAD_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models";
-
-    let models_root = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("models");
-
-    let online_dir =
-        models_root.join("sherpa-onnx-streaming-paraformer-trilingual-zh-cantonese-en");
-    let online_ready = online_dir.join("encoder.int8.onnx").exists()
-        && online_dir.join("decoder.int8.onnx").exists()
-        && online_dir.join("tokens.txt").exists();
-
-    let offline_dir = models_root.join("sherpa-onnx-funasr-nano-int8-2025-12-30");
-    let offline_ready = offline_dir.join("encoder_adaptor.int8.onnx").exists()
-        && offline_dir.join("llm.int8.onnx").exists()
-        && offline_dir.join("embedding.int8.onnx").exists()
-        && offline_dir.join("Qwen3-0.6B").exists();
-
-    LocalRealtimeModelsStatus {
-        online_ready,
-        offline_ready,
-        models_root: models_root.display().to_string(),
-        online_dir: online_dir.display().to_string(),
-        offline_dir: offline_dir.display().to_string(),
-        online_download_url: DOWNLOAD_URL.to_string(),
-        offline_download_url: DOWNLOAD_URL.to_string(),
-    }
-}
-
-#[derive(Serialize)]
-struct LocalRealtimeModelsStatus {
-    online_ready: bool,
-    offline_ready: bool,
-    models_root: String,
-    online_dir: String,
-    offline_dir: String,
-    online_download_url: String,
-    offline_download_url: String,
-}
-
 #[cfg(target_os = "windows")]
 fn is_main_process_running() -> bool {
     use windows::Win32::Foundation::CloseHandle;
@@ -270,7 +219,6 @@ fn main() {
             get_audio_devices,
             check_hotkey_available,
             check_accuracy_model_ready,
-            check_local_realtime_models_ready,
             version_check::get_version_info,
             version_check::force_check_latest_version,
             version_check::open_url_in_browser,

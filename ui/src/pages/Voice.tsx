@@ -13,22 +13,9 @@ interface AccuracyModelInfo {
   download_url: string;
 }
 
-// LOCAL-RT-READY-246: 本地 realtime 双模型就位状态（后端 check_local_realtime_models_ready）
-interface LocalRealtimeModelsInfo {
-  online_ready: boolean;
-  offline_ready: boolean;
-  models_root: string;
-  online_dir: string;
-  offline_dir: string;
-  online_download_url: string;
-  offline_download_url: string;
-}
-
 const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
   const [devices, setDevices] = useState<string[]>([]);
   const [modelInfo, setModelInfo] = useState<AccuracyModelInfo | null>(null);
-  // LOCAL-RT-READY-246: 本地 realtime 双模型状态（与 accuracy 的 modelInfo 独立）
-  const [lrModelInfo, setLrModelInfo] = useState<LocalRealtimeModelsInfo | null>(null);
   const [copiedField, setCopiedField] = useState<string | null>(null);
   const t = getTranslations(config.ui_language);
 
@@ -76,7 +63,6 @@ const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
 
   useEffect(() => {
     checkAccuracyModelReady();
-    checkLocalRealtimeModelsReady();
   }, [asrModel]);
 
   // Keep latest values in ref for cleanup closure
@@ -114,17 +100,6 @@ const loadDevices = async () => {
     } catch (e) {
       console.warn("Failed to check accuracy model readiness:", e);
       setModelInfo(null);
-    }
-  };
-
-  // LOCAL-RT-READY-246: 本地 realtime 需两个模型，分别上报就位情况
-  const checkLocalRealtimeModelsReady = async () => {
-    try {
-      const info = await invoke<LocalRealtimeModelsInfo>("check_local_realtime_models_ready");
-      setLrModelInfo(info);
-    } catch (e) {
-      console.warn("Failed to check local realtime models readiness:", e);
-      setLrModelInfo(null);
     }
   };
 
@@ -242,44 +217,7 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
     }
   };
 
-  const handleCopyText = async (text: string, key: string) => {
-    const ok = await copyToClipboard(text);
-    if (ok) {
-      setCopiedField(key);
-      setTimeout(() => setCopiedField(null), 2000);
-    }
-  };
-
-  // LOCAL-RT-READY-246: local_realtime 双模型状态。
-  // 目录/URL 全部来自后端 check_local_realtime_models_ready（不再复用 accuracy 的 model_dir 推导）。
-  const lrModels = lrModelInfo
-    ? [
-        {
-          key: 'online',
-          label: t.voice_local_realtime_online_label,
-          name: 'sherpa-onnx-streaming-paraformer-trilingual-zh-cantonese-en',
-          size: '228 MB',
-          ready: lrModelInfo.online_ready,
-          dir: lrModelInfo.online_dir,
-          url: lrModelInfo.online_download_url,
-        },
-        {
-          key: 'offline',
-          label: t.voice_local_realtime_offline_label,
-          name: 'sherpa-onnx-funasr-nano-int8-2025-12-30',
-          size: '972 MB',
-          ready: lrModelInfo.offline_ready,
-          dir: lrModelInfo.offline_dir,
-          url: lrModelInfo.offline_download_url,
-        },
-      ]
-    : [];
-
   const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.ready;
-  const showLocalRealtimeAlert =
-    asrModel === 'local_realtime' &&
-    lrModelInfo !== null &&
-    !(lrModelInfo.online_ready && lrModelInfo.offline_ready);
 
   return (
     <div className="settings-page">
@@ -361,47 +299,6 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
                   </button>
                 </div>
               </div>
-              <p className="form-hint" style={{ marginTop: '8px' }}>
-                {t.voice_asr_model_manual_download}
-              </p>
-            </div>
-          )}
-
-          {showLocalRealtimeAlert && (
-            <div className="asr-model-alert">
-              <p className="asr-model-alert-title">{t.voice_asr_model_local_realtime_download_required}</p>
-              {lrModels.map((m, i) => (
-                <div key={m.key} style={{ marginBottom: '12px' }}>
-                  <div className="asr-model-field">
-                    <span className="asr-model-label">
-                      <span style={{ color: m.ready ? 'var(--status-success)' : 'var(--status-error)', fontWeight: 600 }}>
-                        {m.ready ? t.voice_local_realtime_model_ready : t.voice_local_realtime_model_missing}
-                      </span>
-                      {' · '}{m.label} · {m.name} · {t.voice_asr_model_local_realtime_size}: {m.size}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => invoke('open_url_in_browser', { url: m.url }).catch(() => {})}
-                      className="btn btn-primary btn-sm"
-                    >
-                      {t.voice_asr_model_open_download}
-                    </button>
-                  </div>
-                  <div className="asr-model-field">
-                    <span className="asr-model-label">{t.voice_asr_model_target_dir}</span>
-                    <div className="asr-model-path-row">
-                      <code className="asr-model-path">{m.dir}</code>
-                      <button
-                        type="button"
-                        onClick={() => handleCopyText(m.dir, `lr_dir_${i}`)}
-                        className="btn btn-secondary btn-sm"
-                      >
-                        {copiedField === `lr_dir_${i}` ? t.voice_copied : t.voice_copy}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              ))}
               <p className="form-hint" style={{ marginTop: '8px' }}>
                 {t.voice_asr_model_manual_download}
               </p>

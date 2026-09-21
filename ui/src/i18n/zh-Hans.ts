@@ -37,13 +37,6 @@ export const zhHans = {
   // LOCAL-RT-UI-240: 极客档（DEC-065），本页 Ctrl+M 解锁
   voice_asr_model_local_realtime: '本地流式实时模型',
   voice_asr_model_local_realtime_desc: '本地运行，边说边出字、无需联网。',
-  voice_asr_model_local_realtime_download_required: '该模式需要下载以下两个模型后才能使用',
-  voice_asr_model_local_realtime_size: '大小',
-  // LOCAL-RT-READY-246: 双模型分别就位状态
-  voice_local_realtime_model_ready: '已就位',
-  voice_local_realtime_model_missing: '缺失',
-  voice_local_realtime_online_label: '流式预览模型',
-  voice_local_realtime_offline_label: '最终转录模型',
   voice_asr_model_download_required: '该模型需要下载后才能使用',
   voice_asr_model_download_url: '下载模型',
   voice_asr_model_open_download: '打开下载页',

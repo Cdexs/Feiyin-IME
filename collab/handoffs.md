@@ -5,6 +5,15 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-1 — UI-LRMODEL-HINT-330 ✅ 交付（删除本地流式档「模型文件」提示块）
+
+- **根因**：`src-tauri/src/main.rs:144 check_local_realtime_models_ready` 未随 DEC-076 迁移，仍在找**已不存在**的 FunASR nano 目录 ⇒ 恒报「缺失 · 972MB」，而实际在跑的 Qwen3 是好的 ⇒ **界面说假话**。Gavin 裁定整块删。
+- **改动（纯删除 -176，`numstat`==`-w`）**：`ui/src/pages/Voice.tsx` -103；`src-tauri/src/main.rs` -52（命令 + 结构 + 注册行，删干净不留无人调用者）；i18n 三份各 -7（删 6 key，保留 `voice_asr_model_local_realtime(_desc)`）。
+- **验证**：`cargo check --all-targets` 0 error / warnings **110/101** 基线 ｜ src-tauri 0 error / 17w ｜ `npm run build` 0 error ｜ Vitest **100P/11S/0F** ｜ 三份 locale **逐键一致（各 121 键）**、被删 6 key 全仓 grep **0 命中**。
+- **只报不改**：① accuracy 提示块**未过期**（已迁 Qwen3）② `src/transcription/mod.rs:1508` **不找 nano** 且**无调用者**（死代码但判据正确）。
+- **已知代价**：被删块「流式预览 228MB」检测原本准，删后缺模型时界面不再提示（Gavin 已知悉）。
+- 🔴 **UI 视觉待 Gavin 目视确认，未声称已验证**。红线：未动版本 / 未 commit / 未出包 / 未碰 `src/main.rs` / 零凭证。
+
 ## 2026-09-21 — coder-2 — ACC-REFLOW-PERSIST-329 ✅ 交付（回灌持久化 + 镜像基准）
 
 - **缺陷A**：回灌被流式包冲掉 ⇒ 新增 per-gen `ACC_REFLOW_STATE` + `compose_with_acc_for_gen`；`StreamingText` 渲染分支走 `compose(raw)`（权威前缀 + 流式尾巴），不再被冲掉。
