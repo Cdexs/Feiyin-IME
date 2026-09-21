@@ -5,6 +5,16 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-1 — AUTOLEARN-DROP-PATHB-332 ✅ 交付（摘除「注入后观察窗口」自学习 + 连根清死代码 + 订正过期决策）
+
+- **由来**：DEC-058（2026-09-06）早已判定路径 B「不做」（观测不可靠=负资产），但代码一直跑；Gavin 2026-09-21 重申「永远找不到文本快照」⇒ 摘除。**与「窗口时长」无关**（别调 `AUTO_LEARN_OBSERVE_MS`）。
+- **删了什么**：① `maybe_learn_user_edit` + 调用点 + `text_snapshot` 早写 + `AUTO_LEARN_OBSERVE_MS` + `extract_changed_text`（**无单测**）② 平台三符号 `capture_focused_text_snapshot`/`read_text_from_hwnd`/`FocusedTextSnapshot` **两端同批删**（含 re-export/符号表/差异注释 + 失效 import）③ `transcription::check_local_realtime_models_ready` 死函数 ④ **legacy `src/injection/` 整模块连根删**（221 行，0 调用者）+ `mod injection;`。
+- **守住的边界**：编辑态提交路径（`learn_correction` 恰 1 调用点 ✅ 新增护栏）、`learn_llm_suggestions`、判定层——全未碰。
+- **订正**：`decisions-archive.md` 三处**纯追加**（DEC-058 过期结论 / DEC-018 stub 存废 / DEC-033 漂移样本）。
+- **验证**：fmt clean ｜ check --all-targets 0 error ｜ warnings **110/101 → 99/90**（如实报）｜ numstat==-w ｜ `cargo test` **0 failed** ｜ wordbook 66P/0F ｜ 新护栏 1P。
+- 🔴 **另修一条既存假红**（非本单引入，HEAD `7d3a3a5` 即红）：`f1_mirror_before_gate` 锚点被 329 改名失效，不变量仍成立 ⇒ 只同步锚点。
+- 红线：未动版本 / 未 commit / 未出包 / 零凭证。
+
 ## 2026-09-21 — coder-2 — AUTOLEARN-EDIT-SNAPSHOT-331 ✅ 交付（编辑入口快照学习基准，收口 329 gap）
 
 - **来源**：候选 A（编辑入口那份「显示文本」），经 `OverlayWindowState.edit_original` + `SubmitRequested` 第 3 参带给 controller。

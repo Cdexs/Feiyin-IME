@@ -26,10 +26,7 @@ use crate::config::AppConfig;
 use super::WindowId;
 
 pub use hotkey::{HotkeyEvent, HotkeyListener};
-pub use injection::{
-    capture_focused_text_snapshot, copy_text_to_clipboard, inject_text, read_text_from_hwnd,
-    FocusedTextSnapshot,
-};
+pub use injection::{copy_text_to_clipboard, inject_text};
 pub use tray::{
     build_tray, poll_pending_tray_states, request_tray_state, set_tray, shutdown_tray,
     StatusBarTray, TrayCommand,

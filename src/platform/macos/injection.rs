@@ -17,12 +17,6 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-#[derive(Debug, Clone)]
-pub struct FocusedTextSnapshot {
-    pub hwnd: usize,
-    pub text: String,
-}
-
 pub fn inject_text(text: &str, use_clipboard: bool, delay_ms: u64) -> Result<()> {
     if text.is_empty() {
         return Ok(());
@@ -55,14 +49,6 @@ pub fn inject_text(text: &str, use_clipboard: bool, delay_ms: u64) -> Result<()>
 
 pub fn copy_text_to_clipboard(text: &str) -> Result<()> {
     set_clipboard_text(text)
-}
-
-pub fn capture_focused_text_snapshot() -> Option<FocusedTextSnapshot> {
-    None
-}
-
-pub fn read_text_from_hwnd(_hwnd: usize) -> Option<String> {
-    None
 }
 
 /// Tier 1: inject text via macOS Accessibility API using kAXSelectedTextAttribute.

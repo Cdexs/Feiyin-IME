@@ -1963,3 +1963,28 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | `OverlayWindowState` 新增 `edit_original`（EnterEditMode 时存「屏幕上那份文本」）；`OverlayUiEvent::SubmitRequested` 增第 3 参携带；controller 用纯函数 `select_learning_baseline(is_local_realtime_tier, overlay_original, mirror)` 选基准 | ⚠️ **行为变更，平台中立**：字段/事件/纯函数均无 `#[cfg]`；**本地实时档**用快照、**在线/批处理恒 mirror**（逐位不变） |
 | gap 收口：停止后迟到包推进镜像但自学习基准改为编辑入口快照 | ✅ 平台中立逻辑；macOS 若将来接入本地实时档可直接复用 |
 | macOS 侧需要做什么 | ✅ **无需代码改动**；未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未触 `src/platform/**` |
+
+## AUTOLEARN-DROP-PATHB-332（2026-09-21，coder-1）· 摘除「注入后观察目标窗口」自学习路径 —— macOS 侧影响
+
+### 🔴 本条是**平台契约变更**：删掉了 3 个契约符号（请 macOS 侧务必读完）
+
+按 DEC-058（Gavin 2026-09-06 拍板、2026-09-21 重申「用户的编辑软件五花八门，永远找不到文本快照」），
+路径 B =「注入文本后 sleep 再重读目标窗口做 diff 学词」**整段摘除**。该路径专用的三个符号**同批从两侧删除**：
+
+| 被移除的契约符号 | Windows 侧原定义 | macOS 侧原定义 | 说明 |
+| --- | --- | --- | --- |
+| `capture_focused_text_snapshot()` | `platform/windows/injection.rs`（GetForegroundWindow + GetGUIThreadInfo 一组） | `platform/macos/injection.rs`（返回 `None` 的 stub） | 两侧定义 + 两侧 re-export + 契约注释**全部删除** |
+| `read_text_from_hwnd(hwnd)` | 同上（SendMessageW WM_GETTEXT） | 同上（stub） | Windows 侧随 `capture_focused_text_snapshot` 一并删（前者是后者的唯一调用者） |
+| `FocusedTextSnapshot`（含 `hwnd`/`text` 字段） | 同上 | 同上（`hwnd: usize`） | 类型本身删除 |
+
+**若你在 macOS 侧有镜像测试/代码引用这三个符号 ⇒ 会编译失败，请按本表删除引用**（这是本单对 macOS 侧唯一的影响面）。
+其余部分平台中立、无需改动。同步更新的还有 `src/platform/mod.rs` 的符号表与「平台相关类型差异」注释。
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| 移除 `capture_focused_text_snapshot` / `read_text_from_hwnd` / `FocusedTextSnapshot`（Windows + macOS **两端**） | 🔴 **契约变更**：本表即「15 个平台符号中移除了哪几个」的清单。⚠️ 原 `decisions-archive.md:178`（DEC-018）曾要求「keep 这两个 as explicit stubs for now」，**该条已订正**（原文保留、追加订正小节）：不是「留 stub 等 macOS 补」，而是这组契约随功能一起作废 |
+| `src/platform/mod.rs` 两个 cfg re-export 清单 + 文档符号表同步收窄 | ⚠️ 平台中立文件、两侧共用；若 macOS 侧有基于该表的对照检查需同步 |
+| 「平台相关类型差异」注释：`FocusedTextSnapshot.hwnd`（`HWND` vs `usize`）这条**移出**该列表 | ✅ 已订正原注释并**保留教训**：`#[cfg]` 切掉的代码不做类型检查的原理不变，剩余差异（`create_controller_window` / `destroy_controller_window` / `capture_scene_signals`）仍在，双平台 CI 仍是唯一可靠防线（另在 `decisions-archive.md` DEC-033 漂移记录处追加了同义订正） |
+| 路径 B 本体（`maybe_learn_user_edit` / `AUTO_LEARN_OBSERVE_MS` / `extract_changed_text`）与 legacy `src/injection/` 模块（Windows-only、Deprecated、全库 0 调用者） | ✅ 均在 Windows-only 域；macOS 侧无引用（legacy 模块本就 `#[cfg(target_os = "windows")]`，已连根删除） |
+| 「应用内编辑」学习路径（DEC-058 要求「必须保证」的那条） | ✅ **未动**：`learn_correction` 生产区仍恰 1 个调用点（编辑态提交），并新增源码级护栏 `pathb_332_learn_correction_single_call_site_and_no_pathb_symbols` 钉死 |
+| macOS 侧需要做什么 | ⚠️ **仅需删除对上述 3 个符号的引用**（若有）；其余无需改动。未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未引入依赖 |

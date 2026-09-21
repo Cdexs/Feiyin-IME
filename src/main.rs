@@ -9,8 +9,6 @@ mod homophone;
 #[cfg(target_os = "windows")]
 mod hotkey; // Deprecated: use platform::HotkeyListener instead
 mod i18n;
-#[cfg(target_os = "windows")]
-mod injection; // Deprecated: use platform::inject_text instead
 mod itn;
 mod llm;
 mod platform; // MAC-001+003: Platform abstraction layer
@@ -285,7 +283,6 @@ struct StartCmd {
     target_hwnd: platform::WindowId,
     translate: Arc<AtomicBool>,
 }
-const AUTO_LEARN_OBSERVE_MS: u64 = 300;
 #[cfg(target_os = "windows")]
 const OVERLAY_CLASS_NAME: &str = "voice-ime-overlay-window";
 #[cfg(target_os = "windows")]
@@ -10139,7 +10136,6 @@ fn run_pipeline_core(
                         send_event(event_tx, PipelineEvent::FocusLost(final_text));
                     } else {
                         log::info!("Injecting text...");
-                        let text_snapshot = platform::capture_focused_text_snapshot(); // MAC-004
                         if let Err(e) = platform::inject_text(
                             &final_text,
                             config.injection.use_clipboard,
@@ -10174,7 +10170,6 @@ fn run_pipeline_core(
                                 });
                             }
                         }
-                        maybe_learn_user_edit(&final_text, text_snapshot, runtime_config);
                         send_event(event_tx, PipelineEvent::Done);
                         // FORMAT-LLM-001-CORE (DEC-031-③): LLM 格式化失败 → 注入兜底原文后
                         // 发 FormatFailed overlay 提示（2500ms），让用户知道检查 LLM 配置。
@@ -10607,50 +10602,6 @@ mod pipeline_logic_tests {
         ));
     }
 }
-/// WORDBOOK-053-A: synchronous part of auto-learning. Must stay on the caller thread because
-/// `capture_focused_text_snapshot()` captures the *current* foreground window; moving it to a
-/// background thread would read the wrong window after the 300ms observation delay.
-fn maybe_learn_user_edit(
-    expected_text: &str,
-    snapshot: Option<platform::FocusedTextSnapshot>,
-    runtime_config: &Arc<RwLock<AppConfig>>,
-) {
-    // MAC-004
-    let Some(snapshot) = snapshot else {
-        return;
-    };
-    let expected_text = expected_text.trim().to_string();
-    if expected_text.is_empty() {
-        return;
-    }
-    let runtime_config = Arc::clone(runtime_config);
-    // Detach the heavy observation + diff + SQLite write so the caller thread (controller main
-    // message loop or worker thread) returns immediately. The HWND snapshot text is captured here
-    // and moved in; only the original foreground window's text is observed.
-    let hwnd_usize = snapshot.hwnd.0 as usize;
-    let before_text = snapshot.text;
-    thread::spawn(move || {
-        let hwnd = HWND(hwnd_usize as *mut std::ffi::c_void);
-        thread::sleep(Duration::from_millis(AUTO_LEARN_OBSERVE_MS));
-        let Some(after_text) = platform::read_text_from_hwnd(hwnd) else {
-            // MAC-004
-            return;
-        };
-        let Some(observed_text) = extract_changed_text(&before_text, &after_text) else {
-            return;
-        };
-        let observed_text = observed_text.trim();
-        if observed_text.is_empty() || expected_text == observed_text {
-            return;
-        }
-        let auto_learn_threshold = read_auto_learn_threshold(&runtime_config);
-        if let Err(e) = wordbook::Wordbook::open()
-            .and_then(|wb| wb.learn_correction(&expected_text, observed_text, auto_learn_threshold))
-        {
-            log::debug!("Auto-learning skipped: {}", e);
-        }
-    });
-}
 fn learn_llm_suggestions(
     suggestions: &[llm::SuggestionEntry],
     runtime_config: &Arc<RwLock<AppConfig>>,
@@ -10680,28 +10631,6 @@ fn read_auto_learn_threshold(runtime_config: &Arc<RwLock<AppConfig>>) -> u32 {
         Ok(cfg) => cfg.auto_learn_threshold.max(1),
         Err(poisoned) => poisoned.into_inner().auto_learn_threshold.max(1),
     }
-}
-fn extract_changed_text(before: &str, after: &str) -> Option<String> {
-    if before == after {
-        return None;
-    }
-    let before_chars: Vec<char> = before.chars().collect();
-    let after_chars: Vec<char> = after.chars().collect();
-    let common_prefix = before_chars
-        .iter()
-        .zip(after_chars.iter())
-        .take_while(|(lhs, rhs)| lhs == rhs)
-        .count();
-    let common_suffix = before_chars[common_prefix..]
-        .iter()
-        .rev()
-        .zip(after_chars[common_prefix..].iter().rev())
-        .take_while(|(lhs, rhs)| lhs == rhs)
-        .count();
-    let added_text = after_chars[common_prefix..after_chars.len() - common_suffix]
-        .iter()
-        .collect::<String>();
-    Some(added_text)
 }
 // ============================================================================
 // macOS Stub Module (MAC-001)
@@ -14195,7 +14124,7 @@ mod flicker_130_guard_tests {
 
     /// F1 🔴最重要：门闩仅抑制渲染、不抑制数据。
     ///
-    /// WORDBOOK-053-B 的镜像写入 `*mirror = Some(text.clone())` 必须在门闩
+    /// WORDBOOK-053-B 的镜像写入 `*mirror = Some(...)` 必须在门闩
     /// `if should_ignore_streaming_text(stopped)` 调用**之前**，且两者同处
     /// `process_controller_events` 函数体内。若有人把门闩挪到镜像之前 =
     /// 变成数据抑制 = 被截断的 raw 会学出伪修正。
@@ -14203,9 +14132,12 @@ mod flicker_130_guard_tests {
     /// 消融：① 把镜像行与门闩行对调 → 红；② 把门闩整体挪出 process_controller_events
     /// （行号先后可能仍满足，但函数归属被破坏）→ 红。
     ///
-    /// 🔴 判别力边界：锚点钉死在 `*mirror = Some(text.clone())` 形态上，若有人把它
+    /// 🔴 判别力边界：锚点钉死在 `*mirror = Some(composed.clone())` 形态上，若有人把它
     /// 重构成 `to_string()` 等其它赋值形态会**误红** —— 这是有意的：重构触红会逼人
     /// 来看一眼并同步更新护栏，护栏因重构而红是好事。
+    /// （2026-09-21 AUTOLEARN-DROP-PATHB-332：ACC-REFLOW-PERSIST-329 把早写内容从
+    /// `text.clone()` 改成 `compose(raw)` 的 `composed.clone()`，锚点已同步；
+    /// 不变量本身经人工复核仍成立 —— 早写仍在门闩之前。）
     #[test]
     fn f1_mirror_before_gate_within_process_controller_events() {
         let lines = main_prod_lines();
@@ -14217,7 +14149,7 @@ mod flicker_130_guard_tests {
         let mirror = block_line_of(
             &lines,
             fn_anchor,
-            concat!("*mirror = Some(text.", "clone())"),
+            concat!("*mirror = Some(composed.", "clone())"),
         );
         let gate = block_line_of(
             &lines,
@@ -14278,6 +14210,44 @@ mod flicker_130_guard_tests {
             dual_sig, 0,
             "F2: 双参签名（stopped, editing）不得出现 —— editing 维度已收敛，出现=复活豁免"
         );
+    }
+
+    /// AUTOLEARN-DROP-PATHB-332 路径唯一性护栏（对应任务书 §6.2）：
+    /// `learn_correction` 在**生产区恰 1 个调用点** —— 即编辑态提交那条，也就是 DEC-058
+    /// 要求「必须保证」的应用内学习路径；同时路径 B 的实现符号与它专用的观测符号**一个都不许回来**。
+    ///
+    /// 依据（DEC-058）：路径 B = 「注入后 sleep 再重读目标窗口做 diff」，读得到什么取决于目标
+    /// 应用的实现，**观测不可靠 ⇒ 不可靠信号进词库是负资产**。Gavin 2026-09-06 拍板不做，
+    /// 2026-09-21 再次确认「永远找不到文本快照」。
+    ///
+    /// 消融：① 在任意位置再加一处 `….learn_correction(` → 红；② 把任一被禁符号加回生产区 → 红。
+    /// 🔴 不写「路径 B 运行时行为」断言 —— 该路径已整段删除，对不存在的实现写行为断言=永远绿的假护栏。
+    #[test]
+    fn pathb_332_learn_correction_single_call_site_and_no_pathb_symbols() {
+        let lines = main_prod_lines();
+        let count_contains = |needle: &str| lines.iter().filter(|l| l.contains(needle)).count();
+
+        let learn_calls = count_contains("learn_correction(");
+        assert_eq!(
+            learn_calls, 1,
+            "332: learn_correction 生产区调用必须恰 1 处（编辑态提交），实测 {}（>1 = 路径B 被复活）",
+            learn_calls
+        );
+
+        for banned in [
+            "maybe_learn_user_edit",
+            "AUTO_LEARN_OBSERVE_MS",
+            "extract_changed_text",
+            "capture_focused_text_snapshot",
+            "read_text_from_hwnd",
+            "FocusedTextSnapshot",
+        ] {
+            let n = count_contains(banned);
+            assert_eq!(
+                n, 0,
+                "332: `{banned}` 必须为 0（路径B 已按 DEC-058 摘除，复活即回归），实测 {n}"
+            );
+        }
     }
 
     /// F3 `editing ⇒ stopped` 不变量：EditRequested 臂内 OVERLAY_EDITING.store(true)

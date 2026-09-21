@@ -3,8 +3,7 @@
 use anyhow::{anyhow, Result};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use windows::core::PWSTR;
-use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
@@ -13,17 +12,6 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL,
     VK_V,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, SendMessageW, GUITHREADINFO,
-    WM_GETTEXT, WM_GETTEXTLENGTH,
-};
-
-/// Snapshot of focused text field (hwnd + text content)
-#[derive(Debug, Clone)]
-pub struct FocusedTextSnapshot {
-    pub hwnd: HWND,
-    pub text: String,
-}
 
 /// Inject text into the currently focused input field.
 pub fn inject_text(text: &str, use_clipboard: bool, delay_ms: u64) -> Result<()> {
@@ -45,61 +33,6 @@ pub fn inject_text(text: &str, use_clipboard: bool, delay_ms: u64) -> Result<()>
 /// Copy text to system clipboard (alias for main.rs compatibility)
 pub fn copy_text_to_clipboard(text: &str) -> Result<()> {
     set_clipboard_text(text)
-}
-
-/// Capture current focused text field as snapshot (hwnd + text)
-pub fn capture_focused_text_snapshot() -> Option<FocusedTextSnapshot> {
-    let foreground = unsafe { GetForegroundWindow() };
-    if foreground.0.is_null() {
-        return None;
-    }
-
-    let thread_id = unsafe { GetWindowThreadProcessId(foreground, None) };
-    if thread_id == 0 {
-        return None;
-    }
-
-    let mut info = GUITHREADINFO {
-        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
-        ..Default::default()
-    };
-
-    let hwnd = unsafe {
-        if GetGUIThreadInfo(thread_id, &mut info).is_ok() && !info.hwndFocus.0.is_null() {
-            info.hwndFocus
-        } else {
-            foreground
-        }
-    };
-
-    Some(FocusedTextSnapshot {
-        hwnd,
-        text: read_text_from_hwnd(hwnd)?,
-    })
-}
-
-/// Read text from a specific window handle
-pub fn read_text_from_hwnd(hwnd: HWND) -> Option<String> {
-    if hwnd.0.is_null() {
-        return None;
-    }
-
-    unsafe {
-        let len = SendMessageW(hwnd, WM_GETTEXTLENGTH, WPARAM(0), LPARAM(0))
-            .0
-            .max(0) as usize;
-        let mut buffer = vec![0u16; len.saturating_add(1)];
-        let copied = SendMessageW(
-            hwnd,
-            WM_GETTEXT,
-            WPARAM(buffer.len()),
-            LPARAM(PWSTR(buffer.as_mut_ptr()).0 as isize),
-        )
-        .0
-        .max(0) as usize;
-        buffer.truncate(copied);
-        Some(String::from_utf16_lossy(&buffer))
-    }
 }
 
 fn inject_via_clipboard(text: &str, delay_ms: u64) -> Result<()> {

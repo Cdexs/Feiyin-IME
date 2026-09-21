@@ -1493,32 +1493,6 @@ pub fn check_accuracy_model_ready(model_dir: &Path) -> (bool, PathBuf) {
     check_qwen3_model_ready(model_dir)
 }
 
-/// LOCAL-RT-READY-246: 检测本地 realtime **双模型**是否就位。
-///
-/// 返回 `(online_ready, offline_ready, models_root)`。少任一个本档都跑不起来（DEC-067），
-/// 故必须分别上报，不能笼统说「就绪」。
-///
-/// 🔴 判据必须与**实际加载路径逐字一致**，否则检测与加载判据会漂移：
-/// - online：与 `local_stream::create_local_stream_recognizer` 同一组文件名
-///   （`sherpa-onnx-streaming-paraformer-trilingual-zh-cantonese-en/` +
-///   `encoder.int8.onnx` + `decoder.int8.onnx` + `tokens.txt`）
-/// - offline：复用 `check_accuracy_model_ready` 判据（accuracy 原生三件套 + tokenizer 目录）
-// 供主程序（239-B）接线；当前 root 侧无调用者，保留此 allow 以守 warnings 基线（接线时移除）。
-#[allow(dead_code)]
-pub fn check_local_realtime_models_ready(model_dir: &Path) -> (bool, bool, PathBuf) {
-    // online：与 local_stream::create_local_stream_recognizer 同一组文件名
-    let online_dir = model_dir.join("sherpa-onnx-streaming-paraformer-trilingual-zh-cantonese-en");
-    let online_ready = online_dir.join("encoder.int8.onnx").exists()
-        && online_dir.join("decoder.int8.onnx").exists()
-        && online_dir.join("tokens.txt").exists();
-
-    // offline：MIGRATE-QWEN3-320 起 offline（2pass）也是 Qwen3 ⇒ 用 Qwen3 判据
-    //（原 FunASR 判据已删）。保证「检测 == 实际加载」。
-    let (offline_ready, _) = check_qwen3_model_ready(model_dir);
-
-    (online_ready, offline_ready, model_dir.to_path_buf())
-}
-
 /// ASR-038-B: 从 wordbook 表加载热词 vocabulary（调用链证明）
 ///
 /// **调用链**：

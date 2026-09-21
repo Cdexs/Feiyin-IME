@@ -18,7 +18,7 @@
 //! | autolaunch | `enable`, `disable`, `is_enabled` |
 //! | event_loop | `create_controller_window`, `destroy_controller_window`, `run_message_loop`, `foreground_window_id` |
 //! | hotkey | `notify_config_changed`, `HotkeyEvent`, `HotkeyListener` |
-//! | injection | `capture_focused_text_snapshot`, `copy_text_to_clipboard`, `inject_text`, `read_text_from_hwnd`, `FocusedTextSnapshot` |
+//! | injection | `copy_text_to_clipboard`, `inject_text` |
 //! | scene | `capture_scene_signals`, `capture_scene_signals_by_id` |
 //!
 //! ### 平台中立符号（两侧签名完全一致，共享代码可直接调用）
@@ -39,16 +39,19 @@
 //!   - Windows: `Result<HWND>` / macOS: `Result<()>`
 //! - `destroy_controller_window(hwnd)`
 //!   - Windows: 入参 `HWND` / macOS: 无入参
-//! - `FocusedTextSnapshot.hwnd`
-//!   - Windows: `HWND` / macOS: `usize`
-//! - `read_text_from_hwnd(hwnd)`
-//!   - Windows: 入参 `HWND` / macOS: 入参 `usize`
 //! - `capture_scene_signals(hwnd)`
 //!   - Windows: 入参 `HWND` / macOS: 入参 `usize`（MACOS-COMPAT-001-CORE stub）
 //!
+//! 🔴 曾经还有一组平台相关差异：`FocusedTextSnapshot.hwnd`（Windows `HWND` / macOS `usize`）与
+//! `read_text_from_hwnd(hwnd)`（同上）。**该组已于 AUTOLEARN-DROP-PATHB-332 随三符号一并移除**
+//! （它们唯一的用途是「注入后观察目标窗口」自学习路径，该路径按 DEC-058 摘除）。
+//! ⚠️ 教训保留：当年 `#[cfg]` 切掉的代码不做类型检查，这两个符号的 `HWND`/`usize` 漂移
+//! 数周后才暴露（`decisions-archive.md:435`）。**删掉它们不等于这个坑不存在** ——
+//! 平台相关签名差异必须靠双平台 CI 兜底，不能指望编译器。
+//!
 //! ### 为什么不统一类型
 //!
-//! 统一 `HWND`/`usize` 需改 `src/injection/mod.rs` 与 `platform/windows/*`，
+//! 统一 `HWND`/`usize` 需改 `platform/windows/*`，
 //! 属 Windows 已交付路径（v0.7.2），违反 DEC-033 第 4 条硬约束
 //! "代码重构不得影响任何 Windows 代码功能"。故刻意保留差异，靠契约注释 + 双平台 CI 兜底。
 //!
@@ -69,10 +72,9 @@
 mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::{
-    capture_focused_text_snapshot, capture_scene_signals, capture_scene_signals_by_id,
-    copy_text_to_clipboard, create_controller_window, destroy_controller_window, disable, enable,
-    foreground_window_id, inject_text, is_enabled, notify_config_changed,
-    notify_translate_poll_stop, read_text_from_hwnd, run_message_loop, FocusedTextSnapshot,
+    capture_scene_signals, capture_scene_signals_by_id, copy_text_to_clipboard,
+    create_controller_window, destroy_controller_window, disable, enable, foreground_window_id,
+    inject_text, is_enabled, notify_config_changed, notify_translate_poll_stop, run_message_loop,
     HotkeyEvent, HotkeyListener,
 };
 
@@ -80,11 +82,10 @@ pub use windows::{
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{
-    capture_focused_text_snapshot, capture_scene_signals, capture_scene_signals_by_id,
-    copy_text_to_clipboard, create_controller_window, destroy_controller_window, disable, enable,
-    foreground_window_id, inject_text, is_enabled, notify_config_changed, read_text_from_hwnd,
-    request_stop, run_message_loop, run_message_loop_with_hotkey_listener, FocusedTextSnapshot,
-    HotkeyEvent, HotkeyListener, TrayCommand,
+    capture_scene_signals, capture_scene_signals_by_id, copy_text_to_clipboard,
+    create_controller_window, destroy_controller_window, disable, enable, foreground_window_id,
+    inject_text, is_enabled, notify_config_changed, request_stop, run_message_loop,
+    run_message_loop_with_hotkey_listener, HotkeyEvent, HotkeyListener, TrayCommand,
 };
 // TRAY-FIX-001: macOS status bar tray (NSStatusItem) — 单独导出，避免在顶行列表混淆。
 #[cfg(target_os = "macos")]

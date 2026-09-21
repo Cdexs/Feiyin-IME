@@ -184,6 +184,15 @@
   - clipboard restoration behavior is handled in the backend
   - readback remains open work for a later macOS accessibility task
 
+### 2026-09-21 订正（原正文不改，仅追加）· AUTOLEARN-DROP-PATHB-332
+
+上面「keep `capture_focused_text_snapshot()` and `read_text_from_hwnd()` as explicit stubs for now」
+中的**两个 stub 及 `FocusedTextSnapshot` 类型已整组移除**（Windows 实现 + macOS stub + 两侧 re-export + 契约注释同批）。
+原因不是 macOS 侧做完了 readback，而是**它们唯一的用途消失了**：这三个符号只服务「注入到目标窗口后，
+再观察/重读该窗口文本」这条自学习路径 B，而 DEC-058 已判定该路径不做（Gavin 2026-09-06 拍板、2026-09-21 重申
+「永远找不到文本快照」），`AUTOLEARN-DROP-PATHB-332` 把该路径整段摘除。
+⇒ 结论：不是「留 stub 等 macOS 补」，而是「这组契约本身随功能一起作废」。本订正**不改**原决策正文。
+
 ## DEC-019 路 Windows 自定义标题栏暂不继续押注 `decorations: false`
 
 - **背景**：`CUSTOM-TITLEBAR-001` 与 `WINDOW-TITLEBAR-002` 的真实运行验证均显示，Windows 上即使设置 `decorations: false` 并显式调用 `set_decorations(false)`，主窗口仍可能保留原生标题栏；`TASK-RESEARCH-TITLEBAR-WINDOWS` 进一步确认 Tauri 官方尚无 Windows overlay titlebar 能力。
@@ -438,6 +447,15 @@
 - **影响**：
   - `src/platform/mod.rs` 的 glob 导出（`pub use windows::*`）改为**显式清单**，使两侧导出面在同一文件内可肉眼比对；漏列会立即编译失败（响亮失败优于静默漂移）
   - **平台相关类型差异（`HWND` vs `usize` 等）刻意保留不统一**——统一需改 Windows 已交付路径，违反第 4 条硬约束。改为在契约注释中显式标注，由 CI 兜底
+
+> **2026-09-21 追加（原正文完整保留；AUTOLEARN-DROP-PATHB-332）**：上面列举的漂移样本之一是
+> `FocusedTextSnapshot.hwnd`（一侧 `HWND` 一侧 `usize`）。**该符号已于本日随「注入后观察窗口」自学习
+> 路径（DEC-058 判定不做）一并移除**，故它**不再**是活跃的漂移风险点。
+> 🔴 但**结论不降级**：`#[cfg]` 切掉的代码不做类型检查这条原理、以及「双平台 CI 是唯一可靠防线」的
+> 要求**继续有效** —— 剩余的平台相关差异（`create_controller_window` / `destroy_controller_window` /
+> `capture_scene_signals` 的 `HWND` vs `usize`）仍在，删掉一个样本不等于坑填了。
+> 同时新增一条运维教训：**符号被删除时，必须同批清理两侧定义 + re-export + 契约注释**，
+> 否则会留下「一侧有一侧无」的半拉契约 —— 这正是本单对 macOS 侧的最大风险点（已按此执行）。
   - `.gitignore` 对 `.github/` 的排除需解除，双平台 CI 入库
   - 实施批次：MACOS-COMPAT-001（A 阶段）
 - **与 DEC-000 的关系**：DEC-000「Windows 系统兼容性最高优先级」**继续有效且不降级**——它约束的是「Windows 上必须支持 Win10/11」，与本决策「新代码必须跨平台可编译」是**正交**的两件事。二者叠加后的完整含义是：**Windows 行为不可退化（DEC-000 + 本决策第 4 条），同时新代码不得阻断 macOS 编译（本决策第 2 条）**。
