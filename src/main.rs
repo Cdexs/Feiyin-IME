@@ -162,6 +162,16 @@ enum PipelineEvent {
         has_hole: bool,
         acc_text: String,
     },
+    /// LOCALRT-SEAM-337（自适应定界）：本片边界冻结通知。
+    ///
+    /// `committed_len = Some(n)`（分支 a 文本停止增长 / c 硬上限）⇒ 用该片 pending `acc_text`
+    /// 覆盖流式显示前 n 字符并渲染；`None`（分支 b 有声恢复）⇒ 该片**不回灌**，保持纯流式。
+    /// 只有本地实时档会发（在线/批处理结构上不发）。
+    ReflowCommit {
+        generation: u64,
+        seg_index: usize,
+        committed_len: Option<usize>,
+    },
 }
 // LATENCY-001: send event and immediately wake controller via PostMessageW
 fn send_event(tx: &crossbeam_channel::Sender<PipelineEvent>, event: PipelineEvent) {
@@ -270,6 +280,15 @@ static ACC_REFLOW_EDIT_LATCH: AtomicBool = AtomicBool::new(false);
 // - controller 单线程读写；`Mutex` 仅因是 `static`（同 `last_streaming_text` 先例）。
 #[cfg(target_os = "windows")]
 static ACC_REFLOW_STATE: Mutex<Option<(u64, String, usize)>> = Mutex::new(None);
+// LOCALRT-SEAM-337（自适应定界）：两个 pending 槽，**跨事件配对**（acc 文本与边界到达顺序不定）：
+// - `ACC_REFLOW_ACC`   = `(generation, seg_index, acc_text)`（由 PreviewReflow 写）；
+// - `ACC_REFLOW_BOUND` = `(generation, seg_index, committed_len: Option<usize>)`（由 ReflowCommit 写）。
+// 两者 seg/gen 匹配时 `try_resolve_reflow` 合成并渲染（`Some`）/ 作废（`None`），随后清空两槽。
+// `RecordingStarted` 清空。
+#[cfg(target_os = "windows")]
+static ACC_REFLOW_ACC: Mutex<Option<(u64, usize, String)>> = Mutex::new(None);
+#[cfg(target_os = "windows")]
+static ACC_REFLOW_BOUND: Mutex<Option<(u64, usize, Option<usize>)>> = Mutex::new(None);
 #[derive(Debug, Clone, Copy)]
 #[cfg(target_os = "windows")]
 struct SendHwnd(isize);
@@ -6794,6 +6813,13 @@ fn process_controller_events(
                 if let Ok(mut st) = ACC_REFLOW_STATE.lock() {
                     *st = None;
                 }
+                // 337：两 pending 槽（acc / boundary）同样 per-gen 清空。
+                if let Ok(mut slot) = ACC_REFLOW_ACC.lock() {
+                    *slot = None;
+                }
+                if let Ok(mut slot) = ACC_REFLOW_BOUND.lock() {
+                    *slot = None;
+                }
                 set_tray_state(tray, TrayState::Recording, ui_language);
                 show_overlay(
                     overlay_handle,
@@ -6932,38 +6958,31 @@ fn process_controller_events(
                     has_hole,
                     acc_text.is_empty(),
                 );
-                let mut preview_len = 0usize;
+                // 337：PreviewReflow 不再直接渲染 ⇒ preview_len 恒 0（实际渲染在 ReflowCommit 臂）。
+                let preview_len = 0usize;
                 if action == ReflowAction::Applied {
-                    let streaming = last_streaming_text
-                        .lock()
-                        .ok()
-                        .and_then(|m| m.clone())
-                        .unwrap_or_default();
-                    let preview = reflow_preview(&acc_text, &streaming, committed_len);
-                    preview_len = preview.chars().count();
+                    // LOCALRT-SEAM-337：本片**登记 acc 文本**，等边界事件配对后再渲染
+                    // （边界由 local_stream 的自适应定界 a/b/c 冻结，自适应、无固定 L）。
                     ACC_REFLOW_LAST_SEG.store(seg_index as i64, Ordering::Release);
-                    // 329：把权威前缀存为**本代持续状态**，供后续每次流式渲染复用（缺陷 A：
-                    // 修正不再被下一个流式包冲掉）。闩锁后不再更新，但**保留**（画面不倒退）。
-                    if let Ok(mut st) = ACC_REFLOW_STATE.lock() {
-                        *st = Some((generation, acc_text.clone(), committed_len));
+                    if let Ok(mut slot) = ACC_REFLOW_ACC.lock() {
+                        *slot = Some((generation, seg_index, acc_text.clone()));
                     }
-                    // 329：镜像恒 = 所显（缺陷 B：未编辑提交 ⇒ original == edited ⇒ 不学习）。
-                    if let Ok(mut mirror) = last_streaming_text.lock() {
-                        *mirror = Some(preview.clone());
+                    if log::log_enabled!(log::Level::Debug) {
+                        log::debug!(
+                            "[LocalRT-DBG-337] reflow acc ready: seg={} acc_len={} (等 boundary)",
+                            seg_index,
+                            acc_text.chars().count()
+                        );
                     }
-                    show_overlay(
-                        overlay_handle,
-                        opacity,
-                        ui_language,
-                        OverlayStatus::RecordingWithText { text: preview },
-                    );
+                    try_resolve_reflow(overlay_handle, opacity, ui_language, last_streaming_text);
                 } else if action == ReflowAction::SkippedEditing {
                     // 编辑态一旦出现（含已退出）⇒ 本代永久上闩，后续回灌不再改用户文本。
                     ACC_REFLOW_EDIT_LATCH.store(true, Ordering::Release);
                 }
                 if log::log_enabled!(log::Level::Debug) {
                     let action_str = match action {
-                        ReflowAction::Applied => "applied",
+                        // 337：Applied 现在只表示「登记 pending」，渲染推迟到 ReflowCommit。
+                        ReflowAction::Applied => "pending",
                         ReflowAction::SkippedEditing => "skipped-editing",
                         ReflowAction::SkippedCancel => "skipped-cancel",
                         ReflowAction::SkippedStale => "skipped-stale",
@@ -6979,6 +6998,26 @@ fn process_controller_events(
                         action_str
                     );
                 }
+            }
+            PipelineEvent::ReflowCommit {
+                generation,
+                seg_index,
+                committed_len,
+            } => {
+                // LOCALRT-SEAM-337（自适应定界）：登记该片边界，与 acc 槽配对后解析。
+                let current_gen = STREAMING_GENERATION.load(Ordering::Acquire);
+                if generation != current_gen {
+                    log::debug!(
+                        "337: dropping ReflowCommit from stale session (gen {} != current {})",
+                        generation,
+                        current_gen
+                    );
+                    continue;
+                }
+                if let Ok(mut slot) = ACC_REFLOW_BOUND.lock() {
+                    *slot = Some((generation, seg_index, committed_len));
+                }
+                try_resolve_reflow(overlay_handle, opacity, ui_language, last_streaming_text);
             }
             PipelineEvent::Processing(message) => {
                 set_tray_state(tray, TrayState::Processing, ui_language);
@@ -8132,6 +8171,8 @@ fn spawn_worker_thread(
                         let acc_script = config.audio.chinese_script;
                         // 325：acc worker 逐片回灌预览所用的事件发送端（代际在 worker 内捕获）。
                         let acc_event_tx = event_tx.clone();
+                        // 337：ASR 线程在句子确认时经此发 ReflowCommit（提交/作废回灌边界）。
+                        let reflow_commit_tx = event_tx.clone();
 
                         // scoped：ASR 线程借 online recognizer，worker 线程跑 record_streaming，
                         // accuracy worker 借 **offline** recognizer 并行转写派发片。
@@ -8243,6 +8284,15 @@ fn spawn_worker_thread(
                                     |idx, committed_len, segs| {
                                         // 派发片送 accuracy worker（worker 不存在 ⇒ send 失败，忽略）。
                                         let _ = acc_tx.send((idx, committed_len, segs));
+                                    },
+                                    |seg_index, committed_len| {
+                                        // 337：自适应边界冻结（a 文本停止增长 / b 有声恢复 / c 硬上限）。
+                                        let _ =
+                                            reflow_commit_tx.send(PipelineEvent::ReflowCommit {
+                                                generation: session_generation,
+                                                seg_index,
+                                                committed_len,
+                                            });
                                     },
                                 )
                             });
@@ -9038,6 +9088,8 @@ fn overlay_request_for_event(event: &PipelineEvent) -> platform::OverlayRequest 
         PipelineEvent::StreamingFinalPreview(_) => platform::OverlayRequest::Show,
         // ACC-PREVIEW-REFLOW-325: 本地档 accuracy 回灌预览（macOS 侧流式文本暂不渲染，同 StreamingText）
         PipelineEvent::PreviewReflow { .. } => platform::OverlayRequest::Show,
+        // LOCALRT-SEAM-337: 回灌边界提交/作废（macOS 侧暂不渲染，同上）
+        PipelineEvent::ReflowCommit { .. } => platform::OverlayRequest::Show,
         PipelineEvent::Done | PipelineEvent::Cancelled => platform::OverlayRequest::Hide,
     }
 }
@@ -9133,6 +9185,18 @@ fn handle_pipeline_event(event: &PipelineEvent, ui_language: config::UiLanguage)
             log::debug!(
                 "macOS pipeline: PreviewReflow ({} chars, 本地档专用，暂不渲染)",
                 acc_text.chars().count()
+            );
+        }
+        // LOCALRT-SEAM-337: 回灌边界提交/作废（macOS 侧暂不渲染）
+        PipelineEvent::ReflowCommit {
+            seg_index,
+            committed_len,
+            ..
+        } => {
+            log::debug!(
+                "macOS pipeline: ReflowCommit(seg={}, {:?}, 本地档专用，暂不渲染)",
+                seg_index,
+                committed_len
             );
         }
     }
@@ -9479,6 +9543,71 @@ fn select_learning_baseline(
     }
 }
 
+/// LOCALRT-SEAM-337：当某片的 `acc_text` 与 `boundary` 都到齐时解析——合成并渲染（`Some`），
+/// 或作废（`None`，保持纯流式）。两槽一次消费，防重复应用。
+#[cfg(target_os = "windows")]
+fn try_resolve_reflow(
+    overlay_handle: &OverlayThreadHandle,
+    opacity: f32,
+    ui_language: config::UiLanguage,
+    last_streaming_text: &Arc<Mutex<Option<String>>>,
+) {
+    let acc = ACC_REFLOW_ACC.lock().ok().and_then(|g| g.clone());
+    let bound = ACC_REFLOW_BOUND.lock().ok().and_then(|g| g.clone());
+    let (Some((ga, sa, acc_text)), Some((gb, sb, bound_opt))) = (acc, bound) else {
+        return;
+    };
+    if ga != gb || sa != sb {
+        return; // 尚未配对（另一槽未到或属不同片）
+    }
+    if let Ok(mut g) = ACC_REFLOW_ACC.lock() {
+        *g = None;
+    }
+    if let Ok(mut g) = ACC_REFLOW_BOUND.lock() {
+        *g = None;
+    }
+    match bound_opt {
+        Some(len) if !acc_text.is_empty() => {
+            let streaming = last_streaming_text
+                .lock()
+                .ok()
+                .and_then(|m| m.clone())
+                .unwrap_or_default();
+            let preview = reflow_preview(&acc_text, &streaming, len);
+            if let Ok(mut st) = ACC_REFLOW_STATE.lock() {
+                *st = Some((ga, acc_text.clone(), len));
+            }
+            if let Ok(mut mirror) = last_streaming_text.lock() {
+                *mirror = Some(preview.clone());
+            }
+            if log::log_enabled!(log::Level::Debug) {
+                log::debug!(
+                    "[LocalRT-DBG-337] reflow applied: seg={} committed_len={} acc_len={} preview_len={}",
+                    sa,
+                    len,
+                    acc_text.chars().count(),
+                    preview.chars().count()
+                );
+            }
+            show_overlay(
+                overlay_handle,
+                opacity,
+                ui_language,
+                OverlayStatus::RecordingWithText { text: preview },
+            );
+        }
+        _ => {
+            if let Ok(mut st) = ACC_REFLOW_STATE.lock() {
+                *st = None;
+            }
+            log::debug!(
+                "[LocalRT-DBG-337] reflow withheld: seg={} (boundary=b 或 acc 空 ⇒ 保持纯流式)",
+                sa
+            );
+        }
+    }
+}
+
 /// ACC-PREVIEW-REFLOW-325：回灌决策（纯函数，消费端 controller 线程调用）。
 ///
 /// 优先级（高 → 低）：
@@ -9705,6 +9834,62 @@ mod reflow_persist_329_tests {
             super::select_learning_baseline(true, Some(last_displayed), Some(mirror_after_late)),
             expected,
             "331：基准必须取编辑入口快照（所见），不得取被迟到包推进的镜像"
+        );
+    }
+}
+
+#[cfg(test)]
+mod seam_337_tests {
+    use super::{compose_with_acc_for_gen, reflow_preview, select_learning_baseline};
+
+    /// §六-1 重复消解：commit 合成 = acc 覆盖前 `confirmed_len` 字符 + 流式尾巴，无重叠。
+    #[test]
+    fn commit_compose_has_no_duplication() {
+        // 已确认权威文本 4 字；流式显示（含同句更多字）—— 只保留 confirmed_len 之后的尾巴
+        assert_eq!(
+            reflow_preview("甲乙丙丁", "甲乙丙丁戊己", 4),
+            "甲乙丙丁戊己"
+        );
+        // 若按旧的 last_display 总长切，则会重复；此处只验证 C 的切点语义
+        assert_eq!(reflow_preview("权威", "权威新句", 2), "权威新句");
+    }
+
+    /// §六-3 回修/缩短：流式文本短于 confirmed_len ⇒ 不 panic、尾巴为空。
+    #[test]
+    fn shrink_safe() {
+        assert_eq!(reflow_preview("权威前缀", "短", 5), "权威前缀");
+        assert_eq!(reflow_preview("权威前缀", "", 5), "权威前缀");
+    }
+
+    /// 未 commit（无 ACC_REFLOW_STATE / 非对齐作废后）⇒ 纯流式 passthrough（不空白、不回退）。
+    #[test]
+    fn not_committed_is_pure_streaming_passthrough() {
+        assert_eq!(
+            compose_with_acc_for_gen(None, 1, "纯流式全文"),
+            "纯流式全文"
+        );
+    }
+
+    /// §六-3 acc 为空（首片未回 / 未 commit）⇒ 原样流式全文（保留 325 契约）。
+    #[test]
+    fn empty_acc_passthrough() {
+        let empty = (1u64, String::new(), 0usize);
+        assert_eq!(
+            compose_with_acc_for_gen(Some(&empty), 1, "开口前几秒的流式文字"),
+            "开口前几秒的流式文字"
+        );
+    }
+
+    /// §六-5 学习基准不变式（331）在新时序下不变：本地档仍取编辑入口快照。
+    #[test]
+    fn learning_baseline_invariant_unchanged() {
+        assert_eq!(
+            select_learning_baseline(true, Some("所见".to_string()), Some("镜像".to_string())),
+            Some("所见".to_string())
+        );
+        assert_eq!(
+            select_learning_baseline(false, Some("快照".to_string()), Some("镜像".to_string())),
+            Some("镜像".to_string())
         );
     }
 }

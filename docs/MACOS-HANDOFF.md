@@ -2004,3 +2004,13 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | `local_stream.rs` 加一条 `log_enabled!(Debug)` 守卫的只读探针 `[LocalRT-DBG-336]`（读 `r.timestamps/tokens/is_final/segment/start_time`，**不改 `.map(|r| r.text)`**）+ 新增 `#[ignore]` 离线手工测试 `localrt_timestamp_336_probe_offline` | ✅ 平台中立、**零行为变更**（探针只在 Debug 级打日志；测试默认不跑）；macOS 编译同一代码 |
 | **验证结论**：4 个现成 wav × 78 条探针**全部 `ts=len=0`**（`timestamps` 非 NULL 但为空）⇒ **该流式 paraformer 不提供 token 时间戳**；`start_time` 恒 0.0、`segment` 恒 0、`is_final` 恒 false | ⚠️ 结论对 macOS 同样适用（同一模型/绑定）⇒ 预览切分**不可依赖时间戳**，两端都须另找依据 |
 | macOS 侧需要做什么 | ✅ **无需代码改动**；未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未触 `src/platform/**` |
+
+## LOCALRT-SEAM-337（2026-09-21，coder-2）· 预览接缝错位修复（候选 C：句子确认时提交边界） —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| `local_stream.rs`：派发点 P 起**自适应定界**（a 文本停止增长 / b 有声恢复 / c 硬上限 2000ms 最先者冻结），回调 `on_reflow_commit(seg, Option<committed_len>)`；b ⇒ `None`（该片不回灌，保持纯流式） | ⚠️ **行为变更，平台中立**：`local_stream.rs` 无 `#[cfg]`；macOS 编译同一代码 ⇒ 同继承「自适应定界、命中率受 b 分支影响」 |
+| `main.rs`：新事件 `PipelineEvent::ReflowCommit { generation, seg_index, committed_len: Option<usize> }`；`PreviewReflow` 登记 acc 槽、边界槽配对后 `try_resolve_reflow` 合成并写镜像+渲染；macOS 两个穷举 match 已补 arm | ✅ 事件/纯函数均平台中立；`ACC_REFLOW_ACC/BOUND` 只在本地实时档写 ⇒ macOS 恒 passthrough |
+| **lookahead 实测结论**（`seam337_lookahead_probe`，25 点）：滞后**非确定常数**（中位 440ms、≤640ms 72%、16% 达 1440–1840ms、每次仅 1–4 字）⇒ 故取**自适应停止条件**而非固定 L；`ACC_BOUNDARY_STABLE_MS=500`（≡config 一块）、`ACC_BOUNDARY_CAP_MS=2000`（实测最大 1840+余量） | ⚠️ 结论对 macOS 同样适用（同模型） |
+| 尾巴流方案实测：RTF 0.037~0.06 可接受，但**无左上下文质量明显差**（tail≠main_delta、头部常对不上）⇒ **已作废**，勿再走 | ✅ 平台中立结论 |
+| macOS 侧需要做什么 | ✅ **无需代码改动**；未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未触 `src/platform/**` |

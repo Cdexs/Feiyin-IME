@@ -5,6 +5,17 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-2 — LOCALRT-SEAM-337 ✅ 交付（预览接缝错位：自适应定界）
+
+- **根因**：`committed_len` 取在派发当刻、流式吐字滞后 ⇒ 后续补字被算进尾巴（重复）/ 回修变短（丢字）。
+- **方向**：A/B 否 → C 作废 → 尾巴流实测作废（无左上下文质量差）→ **Gavin「自己计数」自适应定界**（采纳）。
+- **lookahead 实测**（25 点）：中位 440ms、≤640ms 72%、16% 1440–1840ms、每次 1–4 字 ⇒ **非确定常数** ⇒ 自适应。
+- **实现**：派发点 P 后 a 文本停止增长（静默连续 500ms≡模型一块）/ b 有声恢复（不灌）/ c 硬上限 2000ms，三者最先者冻结；`main.rs` 两槽配对 `try_resolve_reflow` 合成渲染并写镜像。
+- **保留**：闩锁/SkippedHole/seg_index/档位闸门/acc 空 passthrough；G3 未触碰。
+- **埋点**：`[LocalRT-DBG-337] boundary=a|b|c (a/b/c=n/n/n)` + `reflow applied|withheld`（b 占比=收益折损）。
+- **验证**：fmt clean、check 0 error、warnings 99/90、numstat==-w（207/22、276/0）、seam_337 5P + 全量 cargo test EXIT 0/0 failed；证据入 evidence/。
+- 🔴 实机交 Gavin，未声称已验证。未动版本 / 未 commit / 未出包 / 未碰 `src/audio/mod.rs` / 零凭证。
+
 ## 2026-09-21 — coder-2 — LOCALRT-TIMESTAMP-336 ✅ 交付（流式 token 时间戳：模型不提供）
 
 - **结论**：该 streaming paraformer **不提供 token 时间戳**。78 条探针（4 个现成 wav：kv_long/kv_long_204/kv_short/colloq）**全部 `ts=len=0`**（非 NULL 但空 vec）；量具自检成立（text_chars/tokens 递增 1:1）。`start_time` 恒 0.0、`segment` 恒 0、`is_final` 恒 false ⇒ 亦不可对齐。

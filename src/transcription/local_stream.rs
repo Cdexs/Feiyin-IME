@@ -130,6 +130,15 @@ const ACC_DISPATCH_SILENCE_MS_DEFAULT: f32 = 800.0;
 /// 仍做成 env 可调（`LOCAL_RT_ACC_MIN_SEG_MS`），端测可比对不同取值。
 const ACC_MIN_SEGMENT_MS_DEFAULT: u64 = 5000;
 
+/// LOCALRT-SEAM-337：自适应定界的「文本停止增长」窗口（具名，非魔数）。
+/// 依据：流式模型按 `config.yaml: chunk_length: 500`（ms）+ `chunk_shift_ratio: 0.5`（步进 250ms）
+/// 分块处理 ⇒ **一个整块内无任何新输出**即可判「滞后补字已吐完」。
+const ACC_BOUNDARY_STABLE_MS: f32 = 500.0;
+
+/// LOCALRT-SEAM-337：定界硬上限（兜底，防无限等）。
+/// 依据：`seam337_lookahead_probe` 25 点实测最大 `last_grow_after_P = 1840ms` + 余量。
+const ACC_BOUNDARY_CAP_MS: f32 = 2000.0;
+
 /// LOCALRT-PARALLEL-ACC-298：accuracy 并行派发配置（三个 env 开关，端测可调）。
 ///
 /// | env | 默认 | 用途 |
@@ -384,6 +393,12 @@ pub fn transcribe_streaming_local(
     mut on_result: impl FnMut(&str, &[WordTiming]),
     acc_cfg: AccDispatchConfig,
     mut on_segment: impl FnMut(usize, usize, Vec<Vec<f32>>),
+    // LOCALRT-SEAM-337（自适应定界，主控定案）：派发点 P 后边界在**三者最先发生**时冻结：
+    //   a. 文本停止增长（静默中连续 `ACC_BOUNDARY_STABLE_MS` 无新增）⇒ `Some(当前显示长度)`，允许回灌；
+    //   b. 有声 chunk 恢复 ⇒ `None`，该 seg **不回灌**（保持纯流式；宁可这轮不修，也不吐残留重复）；
+    //   c. 硬上限 `ACC_BOUNDARY_CAP_MS` ⇒ 同 a（兜底）并记日志。
+    // 参数：`(seg_index, Option<committed_len>)`。
+    mut on_reflow_commit: impl FnMut(usize, Option<usize>),
 ) -> Result<(String, Vec<f32>)> {
     let is_cancelled = || {
         cancel_signal
@@ -428,6 +443,16 @@ pub fn transcribe_streaming_local(
     let mut acc_pending_has_speech = false;
     // 已派发片数（= 下一片的 seg_index）。
     let mut acc_seg_index: usize = 0;
+    // LOCALRT-SEAM-337：**自适应定界**状态（见 `on_reflow_commit` 参数文档）。
+    // `bound_seg = Some(i)` ⇒ 第 i 片已派发，正在等「文本停止增长 / 有声恢复 / 硬上限」最先发生。
+    let mut bound_seg: Option<usize> = None;
+    let mut bound_prev_len: usize = 0;
+    let mut bound_stable_ms: f32 = 0.0;
+    let mut bound_waited_ms: f32 = 0.0;
+    // 337 埋点：a/b/c 三分支累计计数（b 的占比 = 本方案收益折损，端测直接读）。
+    let mut bound_hit_a: u32 = 0;
+    let mut bound_hit_b: u32 = 0;
+    let mut bound_hit_c: u32 = 0;
 
     // LOCALRT-FIRSTCHAR-272：首字延迟埋点（**永久观测**，对齐现有 `[Latency] … at +N.Nms` 风格）。
     // t0 = 本函数进入时刻（ASR 线程起跑），把首字延迟拆成三段：
@@ -505,6 +530,60 @@ pub fn transcribe_streaming_local(
                 );
             }
             recognizer.decode(&stream);
+        }
+
+        // LOCALRT-SEAM-337：自适应定界推进（派发点 P 之后，a/b/c 最先者冻结边界）。
+        if let Some(seg) = bound_seg {
+            bound_waited_ms += chunk_ms;
+            if chunk_rms > silence_threshold {
+                // b：有声恢复 ⇒ 立即冻结、**不回灌**（宁可这轮不修，也不吐残留重复）。
+                bound_hit_b += 1;
+                log::debug!(
+                    "[LocalRT-DBG-337] boundary=b (speech resumed) seg={} waited={:.0}ms stable={:.0}ms",
+                    seg,
+                    bound_waited_ms,
+                    bound_stable_ms
+                );
+                on_reflow_commit(seg, None);
+                bound_seg = None;
+            } else {
+                let cur = last_display.chars().count();
+                if cur > bound_prev_len {
+                    bound_prev_len = cur;
+                    bound_stable_ms = 0.0;
+                } else {
+                    bound_stable_ms += chunk_ms;
+                }
+                if bound_stable_ms >= ACC_BOUNDARY_STABLE_MS {
+                    // a：静默 + 文本停止增长 ⇒ 滞后补字已吐完，精确边界。
+                    bound_hit_a += 1;
+                    log::debug!(
+                        "[LocalRT-DBG-337] boundary=a (stable {:.0}ms) seg={} committed_len={} (a/b/c={}/{}/{})",
+                        bound_stable_ms,
+                        seg,
+                        cur,
+                        bound_hit_a,
+                        bound_hit_b,
+                        bound_hit_c
+                    );
+                    on_reflow_commit(seg, Some(cur));
+                    bound_seg = None;
+                } else if bound_waited_ms >= ACC_BOUNDARY_CAP_MS {
+                    // c：硬上限兜底。
+                    bound_hit_c += 1;
+                    log::debug!(
+                        "[LocalRT-DBG-337] boundary=c (cap {:.0}ms) seg={} committed_len={} (a/b/c={}/{}/{})",
+                        ACC_BOUNDARY_CAP_MS,
+                        seg,
+                        cur,
+                        bound_hit_a,
+                        bound_hit_b,
+                        bound_hit_c
+                    );
+                    on_reflow_commit(seg, Some(cur));
+                    bound_seg = None;
+                }
+            }
         }
 
         let endpoint = recognizer.is_endpoint(&stream);
@@ -624,6 +703,22 @@ pub fn transcribe_streaming_local(
                     "[LocalRT-DBG-276] endpoint=true but result EMPTY (prev='{}')",
                     last_result_text
                 );
+            }
+            // LOCALRT-SEAM-337：endpoint 若仍有未冻结的边界（罕见：cap 未到但已切句），
+            // 按 c 兜底冻结（用确认前的显示长度，与镜像同源），避免悬置。
+            if let Some(seg) = bound_seg {
+                let cur = last_display.chars().count();
+                bound_hit_c += 1;
+                log::debug!(
+                    "[LocalRT-DBG-337] boundary=c (endpoint flush) seg={} committed_len={} (a/b/c={}/{}/{})",
+                    seg,
+                    cur,
+                    bound_hit_a,
+                    bound_hit_b,
+                    bound_hit_c
+                );
+                on_reflow_commit(seg, Some(cur));
+                bound_seg = None;
             }
             // LOCALRT-ENDPOINT-284 诊断（方案 A 取证）：每次切句打一行，行数=切句次数。
             log::debug!(
@@ -761,6 +856,11 @@ pub fn transcribe_streaming_local(
                 //    不用 `state.display_text()`（裸文本，标点差会造成回填边界偏移）。
                 let committed_len = last_display.chars().count();
                 on_segment(acc_seg_index, committed_len, padded);
+                // 337：派发点 P 起，等自适应边界冻结（a/b/c 最先者）。
+                bound_seg = Some(acc_seg_index);
+                bound_prev_len = committed_len;
+                bound_stable_ms = 0.0;
+                bound_waited_ms = 0.0;
                 acc_seg_index += 1;
             }
             // 无论 padded 是否为空都推进起点 + 上 latch：避免同一停顿反复尝试。
@@ -863,6 +963,24 @@ pub fn transcribe_streaming_local(
     stream.input_finished();
     while recognizer.is_ready(&stream) {
         recognizer.decode(&stream);
+    }
+    // LOCALRT-SEAM-337（补 1，自适应版）：松手收尾若仍有未冻结边界，按 a 冻结（流式已 flush，
+    // 滞后补字必已吐完）⇒ 末态带 acc 前缀。已冻结或从未派发则不动。
+    if let Some(seg) = bound_seg {
+        let cur = last_display.chars().count();
+        bound_hit_a += 1;
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "[LocalRT-DBG-337] boundary=a (recording end flush) seg={} committed_len={} (a/b/c={}/{}/{})",
+                seg,
+                cur,
+                bound_hit_a,
+                bound_hit_b,
+                bound_hit_c
+            );
+        }
+        on_reflow_commit(seg, Some(cur));
+        // 函数即将返回，`bound_seg` 不必再清（清了也无人读 ⇒ unused_assignments）。
     }
     let main_final = recognizer
         .get_result(&stream)
@@ -1289,6 +1407,164 @@ mod tests {
             n, expected,
             "口径须与 accuracy 侧 default_acc_num_threads 完全一致"
         );
+    }
+
+    /// LOCALRT-SEAM-337：**lookahead（滞后量）实测** —— 针对音频位置 P 的文本，还需再喂多少
+    /// 音频才不再增长。手法：喂真实 wav 到 P，然后**喂静音**（静音不产新字）继续解码，
+    /// 观察文本何时停止增长 ⇒ 该增长即为「音频 ≤ P 的滞后补字」，其耗时即 lookahead 上界。
+    ///
+    /// 手工跑：`cargo test --bin feiyin-ime seam337_lookahead -- --ignored --nocapture`
+    /// 对照：`config.yaml` `chunk_length: 500` × `chunk_shift_ratio: 0.5` ⇒ 块 500ms / 步进 250ms
+    /// ⇒ 理论滞后上界 = 一个块长 500ms。
+    #[test]
+    #[ignore = "手工：337 lookahead 实测（需模型 + wav）"]
+    fn seam337_lookahead_probe() {
+        use sherpa_onnx::Wave;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let rec = super::create_local_stream_recognizer(&root.join("models"))
+            .expect("create_local_stream_recognizer（模型须在位）");
+        let p = root.join("models/kv259/kv_long.wav");
+        let ps = p.to_string_lossy();
+        let wave = Wave::read(&ps).expect("kv_long.wav");
+        let rate = wave.sample_rate();
+        let samples = wave.samples();
+        let step = (rate as usize / 50).max(1); // 20ms
+        let cap_ms = 2000usize;
+        for p_ms in (2000..=50000).step_by(2000) {
+            let p_samples = rate as usize * p_ms / 1000;
+            if p_samples >= samples.len() {
+                continue;
+            }
+            let stream = rec.create_stream();
+            let mut pos = 0usize;
+            while pos < p_samples {
+                let end = (pos + step).min(p_samples);
+                stream.accept_waveform(rate, &samples[pos..end]);
+                while rec.is_ready(&stream) {
+                    rec.decode(&stream);
+                }
+                pos = end;
+            }
+            let len_at_p = rec
+                .get_result(&stream)
+                .map(|r| r.text)
+                .unwrap_or_default()
+                .chars()
+                .count();
+            let zeros = vec![0.0f32; step];
+            let mut extra_ms = 0usize;
+            let mut last_grow_ms = 0usize;
+            let mut prev = len_at_p;
+            while extra_ms < cap_ms {
+                stream.accept_waveform(rate, &zeros);
+                while rec.is_ready(&stream) {
+                    rec.decode(&stream);
+                }
+                extra_ms += 20;
+                let l = rec
+                    .get_result(&stream)
+                    .map(|r| r.text)
+                    .unwrap_or_default()
+                    .chars()
+                    .count();
+                if l > prev {
+                    last_grow_ms = extra_ms;
+                    prev = l;
+                }
+            }
+            println!(
+                "[337-LA] P={p_ms}ms len_at_P={len_at_p} final_len={prev} growth={} last_grow_after_P={last_grow_ms}ms",
+                prev - len_at_p
+            );
+        }
+    }
+
+    /// LOCALRT-SEAM-337：**尾巴流方案**可行性实测（CPU + 无左上下文质量）。
+    ///
+    /// 手工跑：`cargo test --bin feiyin-ime seam337_tail_feasibility -- --ignored --nocapture`
+    /// 做法：主流式连续喂全 wav 取增量文本；每 5s 音频模拟一次「派发」，同时**新开一条尾巴流**
+    /// 只喂该 5s 区间并计时，比较「尾巴流文本」vs「主流式同区间的增量文本」。
+    /// 🔴 只读实测，不改任何生产行为。
+    #[test]
+    #[ignore = "手工：337 尾巴流可行性实测（需模型 + wav）"]
+    fn seam337_tail_feasibility_probe() {
+        use sherpa_onnx::Wave;
+        use std::time::Instant;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let recognizer = super::create_local_stream_recognizer(&root.join("models"))
+            .expect("create_local_stream_recognizer（模型须在位）");
+        for rel in [
+            "models/kv259/kv_long.wav",
+            "models/kv259/kv_long_204.wav",
+            "models/kv259/kv_short.wav",
+        ] {
+            let p = root.join(rel);
+            let ps = p.to_string_lossy();
+            let Some(wave) = Wave::read(&ps) else {
+                println!("[337] skip missing {rel}");
+                continue;
+            };
+            let rate = wave.sample_rate();
+            let samples = wave.samples();
+            let chunk = (rate as usize / 10).max(1); // ≈100ms
+            let seg_samples = (rate as usize * 5).max(1); // 模拟派发间隔 = 5s 音频
+            let main = recognizer.create_stream();
+            let mut tail = recognizer.create_stream();
+            let mut main_text = String::new();
+            let mut prev_main_len = 0usize;
+            let mut tail_decode_ms = 0.0f64;
+            let mut tail_audio_ms = 0.0f64;
+            let mut pos = 0usize;
+            let mut next = seg_samples;
+            let mut seg = 0usize;
+            while pos < samples.len() {
+                let end = (pos + chunk).min(samples.len());
+                main.accept_waveform(rate, &samples[pos..end]);
+                while recognizer.is_ready(&main) {
+                    recognizer.decode(&main);
+                }
+                tail.accept_waveform(rate, &samples[pos..end]);
+                let t = Instant::now();
+                while recognizer.is_ready(&tail) {
+                    recognizer.decode(&tail);
+                }
+                tail_decode_ms += t.elapsed().as_secs_f64() * 1000.0;
+                tail_audio_ms += (end - pos) as f64 / rate as f64 * 1000.0;
+                pos = end;
+                if pos >= next || pos == samples.len() {
+                    let mt = recognizer
+                        .get_result(&main)
+                        .map(|r| r.text)
+                        .unwrap_or_default();
+                    let tt = recognizer
+                        .get_result(&tail)
+                        .map(|r| r.text)
+                        .unwrap_or_default();
+                    let delta: String = mt.chars().skip(prev_main_len).collect();
+                    let head: String = tt.chars().take(8).collect();
+                    println!(
+                        "[337] {rel} seg{seg}: audio={:.0}ms tail_decode={:.0}ms rtf={:.3} tail_len={} main_delta_len={} tail_eq_delta={} delta_starts_with_tail_head={}",
+                        tail_audio_ms,
+                        tail_decode_ms,
+                        tail_decode_ms / tail_audio_ms.max(1.0),
+                        tt.chars().count(),
+                        delta.chars().count(),
+                        !tt.is_empty() && tt == delta,
+                        !head.is_empty() && delta.starts_with(&head),
+                    );
+                    println!("[337]   tail_text={tt}");
+                    println!("[337]   main_delta={delta}");
+                    prev_main_len = mt.chars().count();
+                    main_text = mt;
+                    tail = recognizer.create_stream(); // 重建：丢弃旧尾巴
+                    tail_decode_ms = 0.0;
+                    tail_audio_ms = 0.0;
+                    next += seg_samples;
+                    seg += 1;
+                }
+            }
+            println!("[337] {rel} main_total_chars={}", main_text.chars().count());
+        }
     }
 
     /// LOCALRT-TIMESTAMP-336：**离线**验证流式 paraformer 是否给 token 时间戳。
