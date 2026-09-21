@@ -92,11 +92,19 @@ const SHADOW_MAX_AUDIO_SECS: f32 = 12.0;
 /// 并行转写」，**绝不触发** `reset()` / 切句 / `sentence_id += 1`（那是显示层的事）。
 const ACC_DISPATCH_SILENCE_MS_DEFAULT: f32 = 800.0;
 
-/// LOCALRT-PARALLEL-ACC-298：最小派发片长默认值（3s）。
+/// LOCALRT-PARALLEL-ACC-298：最小派发片长默认值（**5s**，Gavin 2026-09-21 拍板由 3s 上调）。
 ///
 /// 800ms 停顿在口语里很密，不设下限会切出 0.5s 碎片（每片固定解码开销 + 上下文过短伤精度）。
-/// **本值由 coder-2/主控提出、Gavin 未拍过** ⇒ 做成 env 可调，端测好比对。
-const ACC_MIN_SEGMENT_MS_DEFAULT: u64 = 3000;
+///
+/// 🔴 **为什么是 5s 而不是 3s**：段与段之间**没有任何上下文传递**
+/// （`user_prompt` 是构造期字段，per-stream 通道未接通 —— 见 upstream issue
+/// k2-fsa/sherpa-onnx#3970），片越短模型可用的声学/语言上下文越少、偏差越大。
+/// Gavin 原话：「长一点可识别误差小一点，否则切的碎了偏差大」。
+/// 代价是短句更不容易触发并行（<5s 的未派发区间不切），但短句本来就只等 ~1.6s，
+/// 并行收益小、风险却相同 ⇒ 这个取舍偏向质量是对的。
+///
+/// 仍做成 env 可调（`LOCAL_RT_ACC_MIN_SEG_MS`），端测可比对不同取值。
+const ACC_MIN_SEGMENT_MS_DEFAULT: u64 = 5000;
 
 /// LOCALRT-PARALLEL-ACC-298：accuracy 并行派发配置（三个 env 开关，端测可调）。
 ///
