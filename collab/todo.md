@@ -26,8 +26,9 @@
 
 | 单号 | 内容 | 负责人 | 状态 |
 | --- | --- | --- | --- |
-| `FIX-LOCALRT-TAILCHAR-291` | **中间句必丢尾字**。根因已定位：`endpoint` 分支直接 `recognizer.reset()`，**reset 前从未 `input_finished()`** ⇒ 解码器里压着的最后一个 token 被丢弃；全函数唯一一次 flush 在 loop 之后，只救最后一句。日志三句全中（电[影]／空[气]／问[题]）。方案：endpoint 时先 flush 再取结果，下一句改 `create_stream()` 而非 `reset()` | coder-2 | 🔄 已派 |
-| `DIAG-LOCALRT-FIRSTCHAR-292` | **首字不准**。已排除 283（四次全 `28800→28800`，按设计只在 ≥2 语音段时才裁，本场景 1 段）。出错那次 pre-roll 有语音贴在窗口末尾（`ratio=0.07`）= 「先开口后按键」。**「端」的声学起点在不在这 600ms 里」无法从日志判定** ⇒ 先做 debug-only WAV dump 拿音频 | coder-1 | 🔄 已派 |
+| `FIX-LOCALRT-TAILCHAR-291` | **中间句必丢尾字**。根因已定位：`endpoint` 分支直接 `recognizer.reset()`，**reset 前从未 `input_finished()`** ⇒ 解码器里压着的最后一个 token 被丢弃；全函数唯一一次 flush 在 loop 之后，只救最后一句。日志三句全中（电[影]／空[气]／问[题]）。方案：endpoint 时先 flush 再取结果，下一句改 `create_stream()` 而非 `reset()` | coder-2 | ✅ 已交付（`99799c5`，仅 `local_stream.rs`；实机 `gained` 待 tester-1/Gavin）|
+| `FIX-LOCALRT-FIRSTCHAR-293` | **首字爆破音被窗口削掉**（Gavin 2026-09-21 拍板，不等取证先修；新证据「输入**你**」→「输入**按**」）。方案：环形缓冲容量 600→**1000ms**（`audio/mod.rs:873` 一处），本地流式 `drain_pre_roll` 取 1000ms、**在线三档仍取 600ms**（`retain_recent_samples` 保留最近 N ms ⇒ 在线零改变）；分流用现成的 `record_streaming` 第 8 参 `trim_pre_roll_residual`；283 裁剪逻辑一行不改，窗口变长后正好由它兜住混进来的上句尾音 | coder-1 | 🔄 已派 |
+| `DIAG-LOCALRT-FIRSTCHAR-292` | **首字取证（293 的验证手段，不撤）**。已排除 283（四次全 `28800→28800`，按设计只在 ≥2 语音段时才裁，本场景 1 段）。出错那次 pre-roll 有语音贴在窗口末尾（`ratio=0.07`）= 「先开口后按键」。**「端」的声学起点在不在这 600ms 里」无法从日志判定** ⇒ 先做 debug-only WAV dump 拿音频 | coder-1 | 🔄 已派 |
 
 🔴 **284/289 影子机制为何没兜住**（别再往影子上打补丁）：① `shadow_done_for_pause` 在静默第一个 400ms 就上锁，之后 main 还在长 ⇒ endpoint 时恒 `shadow < main`，5 次 confirm **全 `used=main`**；② 超 `SHADOW_MAX_AUDIO_SECS=12s` 的句子影子被整个跳过。
 ✅ **反向价值**：`shadow finalize #6` 给 15 字而同刻 main 只有 14 —— 这正是 `input_finished()` 能多吐一个字的硬证据，291 方案据此成立。

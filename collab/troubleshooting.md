@@ -55,6 +55,7 @@
 | [REPLACE-WORKER-INJECT-LOST-001] | 重启脚本的注入结论**两个方向都会错**：早期报「完成」实为零字未收到；2026-09-17 报「三次均失败」实为三次全部提交成功 → **报错不携带真相**，必须 `capture-pane` 看状态行：有 `esc interrupt` = 已在跑别动；只有占位符 = 补一个 Enter |
 | [REPLACE-WORKER-TASKFILE-WIPED-001] | 重启会清空 `inbox/task.md`，Worker 转去读同目录陈旧 `task_*.md` 执行 → **先重启后写任务书**，inbox 只留三文件 |
 | [WORKER-RESTART-MODEL-RESET-001] | 重启后模型回落到额度耗尽的免费档，看着活着实则永不响应 → 先切模型再注入；ACK_FAIL 先看是否 `Insufficient balance` |
+| [ORCH-GIT-ADD-ALL-SWEEPS-WIP-001] | 主控 docs commit 里混进 378 行生产代码，Worker 交付时才发现 → `git add -A` 在多 Agent 工作区会扫走**在途 Worker 的半成品**；最坏把编译不过的中间态钉进历史，且逼 Worker 的「未 commit」判据失真。主控 commit 一律显式列路径，提交前 `git status --porcelain` 查有无 `src/`。已扫入的**不 rewrite**，在 CHANGELOG/logs 更正归属 |
 | [COLLAB-ACK-001] | Worker 正常干活却漏写 ack 文件触发假警报（3 次记录）→ `capture-pane` 确认活着就别重发重启，重发反而拖慢 Worker |
 | [WORKER-HANG-001] | Worker 屏幕完全冻结连计时器都不走 → 两次 `capture-pane` 的 md5 比对判定，Escape / C-c 唤醒 |
 | [COLLAB-WRITE-001] | OpenCode 写新文件到 `/d/...` MSYS 路径静默失败无报错 → 新建文件须用 Windows 风格 `D:\` 路径 |

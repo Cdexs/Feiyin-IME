@@ -5211,3 +5211,32 @@ pub fn uses_accuracy_engine(self) -> bool {
 **无闪烁**：overlay 从 `RecordingWithText` 单调过渡到 `FallingToProcessing`→`Processing`，无回退。
 
 **来源**：`LOCALRT-FIRSTCHAR-276 / 282`（2026-09-20，coder-2）＋主控方案裁定。
+
+---
+
+## [ORCH-GIT-ADD-ALL-SWEEPS-WIP-001] · 主控 `git add -A` 扫走在途 Worker 的半成品（2026-09-21）
+
+**现象**：主控提交 `99799c5`「docs: 291/292 根因分析落盘 + 删除 KV 512 回滚备份」，
+`git show --numstat` 显示实际含 `src/transcription/local_stream.rs`（+150/−46，coder-2 在途的 291）
+与 `src/audio/mod.rs`（+228，coder-1 在途的 292）。**由 coder-2 交付时主动指出，主控未自查出。**
+
+**为什么危险**
+
+1. Worker 完成判据含「未 commit」红线；主控代 commit 后其自证表无法如实填写。
+2. commit message 与内容不符，按 message 回溯必然定位错误。
+3. 最坏情况：Worker 正写到语法不全处被提交 ⇒ **编译不过的中间态入历史**，
+   任何人 checkout 到该点都是红的。本次仅因运气好（`cargo check` 0 error / warnings 110/101 基线）未爆。
+
+**判据 / 规则**
+
+- 只要有 Worker 在途，主控 commit **一律显式路径** `git add <file>…`；
+  禁 `git add -A` / `git add .` / `git commit -a`。
+- 提交前 `git status --porcelain`，出现 `src/` 下条目即为他人产出，不得纳入。
+- 主控自身产出限于 `collab/*.md`、`logs/`、`CHANGELOG.md`、`docs/`，列得清；
+  **列不清 = 不清楚自己改了什么 = 更不该提交**。
+- 已误扫入的**不得 rewrite history**（`--amend`/`reset` 属破坏性命令禁令，
+  见 `[GIT-RESET-INCIDENT-001]`）：在 CHANGELOG 与当日 `logs/` 写明真实归属，
+  下一条 commit message 内说明更正。
+
+**同族**：`[WORKER-DOC-OVERWRITE-001]` —— 批量操作省事、代价由别人承担。
+多 Agent 工作区里任何批量写 / 批量提交，先问「这里面有没有别人的东西」。
