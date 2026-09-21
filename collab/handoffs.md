@@ -5,6 +5,15 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-2 — LOCALRT-TAILPAD-340 ✅ 交付（尾字修复：末尾补静音）
+
+- **根因**：模型 500ms 块×250ms 步进需「未来音频」定末字；戛然而止 ⇒ 缺料 ⇒ 末字压住等下一句才吐（与 Gavin 观察一致）。
+- **改动**：`feed_tail_silence`，在 **shadow** 与 **松手收尾 flush（stream+full）** 的 `input_finished()` **之前**喂静音；`SHADOW_TAIL_PAD_MS=500` / `FLUSH_TAIL_PAD_MS=2000`（依据入注释）；**endpoint 重解码不改**（PCM 本就含 2s 静音）。
+- **顺序红线**：补静音必在 `input_finished()` 前（有源码护栏测试）。
+- **判据**：`[LocalRT-DBG-289]` `shadow_len` 应开始 > `main_len`、`used=shadow`（改前 11/11 main）。
+- **验证**：repo-wide `cargo fmt --check` clean、check 0 error、warnings 99/90、numstat==-w（94/0）、`tailpad340_*` 2P、**全量 cargo test EXIT 0 / 0 failed**。
+- 未动版本 / 未 commit / 未出包 / 未碰 `src/audio/mod.rs` / 零凭证。
+
 ## 2026-09-21 — coder-2 — LOCALRT-SEAM-337 ✅ 交付（预览接缝错位：自适应定界）
 
 - **根因**：`committed_len` 取在派发当刻、流式吐字滞后 ⇒ 后续补字被算进尾巴（重复）/ 回修变短（丢字）。

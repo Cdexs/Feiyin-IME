@@ -2014,3 +2014,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | **lookahead 实测结论**（`seam337_lookahead_probe`，25 点）：滞后**非确定常数**（中位 440ms、≤640ms 72%、16% 达 1440–1840ms、每次仅 1–4 字）⇒ 故取**自适应停止条件**而非固定 L；`ACC_BOUNDARY_STABLE_MS=500`（≡config 一块）、`ACC_BOUNDARY_CAP_MS=2000`（实测最大 1840+余量） | ⚠️ 结论对 macOS 同样适用（同模型） |
 | 尾巴流方案实测：RTF 0.037~0.06 可接受，但**无左上下文质量明显差**（tail≠main_delta、头部常对不上）⇒ **已作废**，勿再走 | ✅ 平台中立结论 |
 | macOS 侧需要做什么 | ✅ **无需代码改动**；未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未触 `src/platform/**` |
+
+## LOCALRT-TAILPAD-340（2026-09-21，coder-2）· 尾字修复：末尾补静音把最后一块喂满 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| `local_stream.rs` 新增 `feed_tail_silence(rec, stream, pad_ms)`，在 **shadow** 与 **松手收尾 flush（stream + full）** 的 `input_finished()` **之前**喂静音 | ⚠️ **行为变更，平台中立**：`local_stream.rs` 无 `#[cfg]`，macOS 编译同一代码 ⇒ 同继承「尾字补出、shadow 可能开始胜出」 |
+| 常量：`SHADOW_TAIL_PAD_MS=500`（shadow 每 400ms 可能跑，取小；实测 500ms 已出字、decode 22~30ms）、`FLUSH_TAIL_PAD_MS=2000`（只跑一次，全覆盖 337 实测最大滞后 1840ms）；**endpoint 整句重解码不改**（那段 PCM 由 rule2=2.0s 静默触发、末尾本就带足静音，补了白补） | ✅ 平台中立；理由写入代码注释 |
+| 机制：模型 500ms 块 × 250ms 步进需「未来音频」定末字；说完戛然而止 ⇒ 缺料 ⇒ 末字压在模型里，等下一句音频才吐出。补静音即补料 | ✅ 同模型同结论 |
+| macOS 侧需要做什么 | ✅ **无需代码改动**；未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未触 `src/platform/**` |

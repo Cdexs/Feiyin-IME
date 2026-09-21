@@ -130,6 +130,36 @@ const ACC_DISPATCH_SILENCE_MS_DEFAULT: f32 = 800.0;
 /// 仍做成 env 可调（`LOCAL_RT_ACC_MIN_SEG_MS`），端测可比对不同取值。
 const ACC_MIN_SEGMENT_MS_DEFAULT: u64 = 5000;
 
+/// LOCALRT-TAILPAD-340：**shadow** 补静音长度（具名）。
+/// 依据：shadow 在录音中每 400ms 就可能跑一次，取小值省成本；实测 pad **500ms 已能出尾字**
+/// （`kv_long_204` +1 字），解码仅 22~30ms。
+const SHADOW_TAIL_PAD_MS: usize = 500;
+
+/// LOCALRT-TAILPAD-340：**松手收尾 flush** 补静音长度（具名，只跑一次，成本无所谓）。
+/// 依据：337 `seam337_lookahead_probe` 实测滞后最大 **1840ms** ⇒ 取 2000ms 全覆盖。
+const FLUSH_TAIL_PAD_MS: usize = 2000;
+
+/// LOCALRT-TAILPAD-340：喂 `pad_ms` 静音把末尾那一块「补满」，**必须在 `input_finished()` 之前**调用
+/// （`input_finished()` 之后 stream 不可再喂音频）。分 ~100ms 小块喂并 decode，与生产喂流节奏一致。
+fn feed_tail_silence(
+    recognizer: &OnlineRecognizer,
+    stream: &sherpa_onnx::OnlineStream,
+    pad_ms: usize,
+) {
+    let total = SAMPLE_RATE as usize * pad_ms / 1000;
+    let step = SAMPLE_RATE as usize / 10; // 100ms
+    let zeros = vec![0.0f32; step];
+    let mut fed = 0usize;
+    while fed < total {
+        let n = step.min(total - fed);
+        stream.accept_waveform(SAMPLE_RATE, &zeros[..n]);
+        while recognizer.is_ready(stream) {
+            recognizer.decode(stream);
+        }
+        fed += n;
+    }
+}
+
 /// LOCALRT-SEAM-337：自适应定界的「文本停止增长」窗口（具名，非魔数）。
 /// 依据：流式模型按 `config.yaml: chunk_length: 500`（ms）+ `chunk_shift_ratio: 0.5`（步进 250ms）
 /// 分块处理 ⇒ **一个整块内无任何新输出**即可判「滞后补字已吐完」。
@@ -799,6 +829,10 @@ pub fn transcribe_streaming_local(
                 let t_shadow = log::log_enabled!(log::Level::Debug).then(Instant::now);
                 let shadow = recognizer.create_stream();
                 shadow.accept_waveform(SAMPLE_RATE, shadow_audio);
+                // LOCALRT-TAILPAD-340（主控定案）：shadow 也要**先喂静音再 input_finished**。
+                // 这是尾字修复的主战场：shadow 在 400ms 静默时重解当前句刷新预览，
+                // 但过去它和主流式一样缺「未来音频」⇒ 拿不到尾字 ⇒ 11/11 used=main 永远赢不了。
+                feed_tail_silence(recognizer, &shadow, SHADOW_TAIL_PAD_MS);
                 shadow.input_finished();
                 while recognizer.is_ready(&shadow) {
                     recognizer.decode(&shadow);
@@ -960,6 +994,9 @@ pub fn transcribe_streaming_local(
     }
 
     // flush 尾部：input_finished 后把剩余可解码帧吐完，再取最终结果（不丢尾字）。
+    // LOCALRT-TAILPAD-340：松手收尾的音频**戛然而止**（用户说完立刻松键）⇒ 末尾不足一块 ⇒
+    // 必须先喂静音补满再 input_finished（顺序不可反，`:603`）。这是本单的两处修复点之一。
+    feed_tail_silence(recognizer, &stream, FLUSH_TAIL_PAD_MS);
     stream.input_finished();
     while recognizer.is_ready(&stream) {
         recognizer.decode(&stream);
@@ -992,6 +1029,8 @@ pub fn transcribe_streaming_local(
     let t_full = log::log_enabled!(log::Level::Debug).then(Instant::now);
     let full = recognizer.create_stream();
     full.accept_waveform(SAMPLE_RATE, &pcm[sentence_pcm_start..]);
+    // LOCALRT-TAILPAD-340：同样先补静音再 input_finished（收尾重解码路径，末尾戛然而止）。
+    feed_tail_silence(recognizer, &full, FLUSH_TAIL_PAD_MS);
     full.input_finished();
     while recognizer.is_ready(&full) {
         recognizer.decode(&full);
@@ -1638,5 +1677,60 @@ mod tests {
             }
             println!("[336] {rel}: probes_printed={printed}");
         }
+    }
+
+    // ========================================================================
+    // LOCALRT-TAILPAD-340：补静音（尾字修复）两条契约
+    // ========================================================================
+
+    /// ① 补静音后文本**不变短**（「不得让文本变短或整句消失」的回落保护覆盖新补静音路径）：
+    /// 择优函数对「补后更长」取补后、「补后等长」取 main、「补后异常更短」回落到 main。
+    #[test]
+    fn tailpad340_padded_never_shorter() {
+        assert_eq!(
+            endpoint_confirm_text("尾", "尾字", None),
+            "尾字",
+            "补后更长取补后"
+        );
+        assert_eq!(
+            endpoint_confirm_text("尾字", "尾字", None),
+            "尾字",
+            "等长取 main"
+        );
+        assert_eq!(
+            endpoint_confirm_text("尾字完整", "尾字", None),
+            "尾字完整",
+            "补后更短 ⇒ 回落，绝不缩短"
+        );
+    }
+
+    /// ② 在线 / 批处理**逐位不变** + 顺序红线（补静音必须在 `input_finished()` 之前）：
+    /// - 补静音助手只存在于本地流式模块，`src/main.rs`（在线/批处理的编排层）零命中 ⇒ 结构上不生效；
+    /// - 每个 `feed_tail_silence(` 调用点的**下一行**必须是 `*.input_finished();`。
+    #[test]
+    fn tailpad340_local_only_and_order() {
+        let main_src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        assert!(
+            !main_src.contains("feed_tail_silence"),
+            "补静音助手不得出现在 main.rs（在线/批处理结构上不变）"
+        );
+        let self_src = include_str!("local_stream.rs");
+        let lines: Vec<&str> = self_src.lines().collect();
+        let mut checked = 0usize;
+        for (i, l) in lines.iter().enumerate() {
+            if l.trim_start().starts_with("feed_tail_silence(") {
+                let next = lines.get(i + 1).map(|s| s.trim()).unwrap_or("");
+                assert!(
+                    next.ends_with(".input_finished();"),
+                    "顺序红线：feed_tail_silence 必须紧随 input_finished（line {} 的下一行={next:?}）",
+                    i + 1
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 3,
+            "应至少有 3 处补静音（shadow + 收尾 stream + 收尾 full），实测 {checked}"
+        );
     }
 }
