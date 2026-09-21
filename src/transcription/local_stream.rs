@@ -46,31 +46,33 @@ impl<'a> SendOnlineRecognizerRef<'a> {
     }
 }
 
-/// 流式解码线程数。对齐 POC-LOCAL-STREAM-235 的实测最优（4 线程 RTF 最好）。
+/// 流式解码线程数。**默认 8**（Gavin 2026-09-21 拍板，由 4 上调）。
 ///
-/// TUNE-STREAM-317：可经 env `LOCAL_STREAM_NUM_THREADS` 覆盖（默认仍是 4，**无 env 行为零变**）。
-/// 🔴 背景：298 之后 accuracy（8 线程）与流式（4）**并发**，4+8=12 > 本机 8 物理核。
-/// 两个数当初各自独立定，并发后未重估；本单只开 env 让 tester-1 扫组合，**默认值不动**。
-const LOCAL_STREAM_NUM_THREADS: i32 = 4;
-
-/// TUNE-STREAM-317：`blank_penalty` 默认值（= 当前行为 0.0）。
+/// 沿革：POC-LOCAL-STREAM-235 实测 4 线程 RTF 最好（**单独运行**前提）；
+/// TUNE-STREAM-317 加 env `LOCAL_STREAM_NUM_THREADS`；本次直接把默认值提到 8。
 ///
-/// 调**负** ⇒ 更少输出 blank ⇒ 更愿意吐字（与 307「整句重解码」正交、可叠加）。
-/// 🔴 双向风险：调过头会**多吐字**（插入错误），不是单向改善。env `LOCAL_STREAM_BLANK_PENALTY`。
-const LOCAL_STREAM_BLANK_PENALTY_DEFAULT: f32 = 0.0;
+/// Gavin 的判断：现代 CPU 处理能力足够，且 298 并行后整体耗时已大幅缩短，
+/// 内核多任务切换本就是常态，不必为此纠结。
+///
+/// 🔴 **反向数据（保留备查，不是反对意见）**：271 在本机（8 物理核 / 16 逻辑核）测过
+/// accuracy 的线程曲线，长音频耗时 0/1/2/4/**8**/12/**16** 线程 =
+/// 30.9/31.1/20.9/22.4/**17.0**/19.8/**34.2** 秒 —— **16 线程比 8 线程慢一倍**，
+/// 甚至慢于单线程。298 之后流式(8) + accuracy(8) = 16 个计算线程，正落在那一列。
+/// 但该曲线是 accuracy **独占运行**时测的，而流式模型轻得多（RTF 0.042–0.076），
+/// 不一定同样陡。**若端测发现预览卡顿或首字变慢，先把本值调回 4 验证**（env 可调，无需出包）。
+// 🔴 TUNE-STREAM-317 / TEST-SWEEP-319：`blank_penalty` 对本模型**完全无效**，已撤。
+// 实测（tester-1，证据 collab/evidence/20260921-sweep319-blankpenalty/）：
+// 0 / -0.5 / -1.0 / -1.5 / +0.5 五档输出**逐字节相同**，追加极端值 ±100 仍逐字节相同；
+// 且已用临时 println 自证 env 确实被应用 ⇒ 不是没传进去，是流式 paraformer 路径不消费该字段。
+// 属 [PROVIDER-SILENT-FALLBACK-001] 同族：参数收下、静默不生效。
+// **不要再加回来**；要改流式的吐字倾向，得换别的机制。
+const LOCAL_STREAM_NUM_THREADS: i32 = 8;
 
 /// TUNE-STREAM-317：解析 `LOCAL_STREAM_NUM_THREADS`（非法/缺失 ⇒ 默认 4；要求 ≥1）。
 fn parse_stream_num_threads(v: Option<&str>) -> i32 {
     v.and_then(|s| s.trim().parse::<i32>().ok())
         .filter(|n| *n >= 1)
         .unwrap_or(LOCAL_STREAM_NUM_THREADS)
-}
-
-/// TUNE-STREAM-317：解析 `LOCAL_STREAM_BLANK_PENALTY`（非法/NaN/缺失 ⇒ 默认 0.0）。
-fn parse_stream_blank_penalty(v: Option<&str>) -> f32 {
-    v.and_then(|s| s.trim().parse::<f32>().ok())
-        .filter(|f| f.is_finite())
-        .unwrap_or(LOCAL_STREAM_BLANK_PENALTY_DEFAULT)
 }
 
 /// LOCAL-RT-ENGINE-239-A（DEC-067）：端点检测参数。
@@ -305,10 +307,7 @@ pub fn create_local_stream_recognizer(model_dir: &Path) -> Result<OnlineRecogniz
     c.model_config.num_threads = num_threads;
     c.model_config.provider = Some("cpu".to_string());
     // TUNE-STREAM-317：blank_penalty env 覆盖（默认 0.0 = 现行为，无 env 零变）。
-    let blank_penalty =
-        parse_stream_blank_penalty(std::env::var("LOCAL_STREAM_BLANK_PENALTY").ok().as_deref());
-    c.blank_penalty = blank_penalty;
-    c.model_config.debug = false;
+    let blank_penalty = c.model_config.debug = false;
     // DEC-067：本地预览用 greedy_search（streaming paraformer 仅支持 greedy）
     c.decoding_method = Some("greedy_search".to_string());
     // 端点：不开则 is_endpoint() 永不触发，sentence_end 分支成死代码
@@ -332,9 +331,8 @@ pub fn create_local_stream_recognizer(model_dir: &Path) -> Result<OnlineRecogniz
     // TUNE-STREAM-317：启动打三个调优点的**实际取值**，供端测对账。
     // 第三项 HomophoneReplacer 本单定性为「不做」（rule_fsts 需预编译 FST，见 result），固定 off。
     log::debug!(
-        "[LocalRT-DBG-317] stream tuning: num_threads={} blank_penalty={} homophone_replacer=off provider=cpu decoding=greedy_search endpoint=true (env LOCAL_STREAM_NUM_THREADS / LOCAL_STREAM_BLANK_PENALTY)",
+        "[LocalRT-DBG-317] stream tuning: num_threads={} homophone_replacer=off provider=cpu decoding=greedy_search endpoint=true (env LOCAL_STREAM_NUM_THREADS)",
         num_threads,
-        blank_penalty
     );
 
     OnlineRecognizer::create(&c).context("创建本地流式 (paraformer) recognizer 失败")
@@ -927,8 +925,8 @@ pub fn transcribe_streaming_local(
 #[cfg(test)]
 mod tests {
     use super::{
-        endpoint_confirm_text, parse_stream_blank_penalty, parse_stream_num_threads,
-        should_dispatch_acc, should_dispatch_tail, SAMPLE_RATE,
+        endpoint_confirm_text, parse_stream_num_threads, should_dispatch_acc, should_dispatch_tail,
+        SAMPLE_RATE,
     };
 
     /// FIX-LOCALRT-TAILCHAR-291/307：三方取最长（main / full / shadow），结果恒 ≥ main。
@@ -1282,28 +1280,5 @@ mod tests {
         assert_eq!(parse_stream_num_threads(Some("-3")), 4, "负数非法 ⇒ 默认");
         assert_eq!(parse_stream_num_threads(Some("abc")), 4, "非数字 ⇒ 默认");
         assert_eq!(parse_stream_num_threads(Some("2.5")), 4, "非整数 ⇒ 默认");
-    }
-
-    #[test]
-    fn tune317_parse_blank_penalty_invalid_falls_back_to_default_0() {
-        assert_eq!(parse_stream_blank_penalty(None), 0.0, "缺失 ⇒ 默认 0.0");
-        assert_eq!(parse_stream_blank_penalty(Some("0")), 0.0);
-        assert_eq!(
-            parse_stream_blank_penalty(Some("-1.5")),
-            -1.5,
-            "负值合法（更愿吐字）"
-        );
-        assert_eq!(parse_stream_blank_penalty(Some("0.25")), 0.25);
-        assert_eq!(parse_stream_blank_penalty(Some("NaN")), 0.0, "NaN ⇒ 默认");
-        assert_eq!(
-            parse_stream_blank_penalty(Some("inf")),
-            0.0,
-            "非有限 ⇒ 默认"
-        );
-        assert_eq!(
-            parse_stream_blank_penalty(Some("abc")),
-            0.0,
-            "非数字 ⇒ 默认"
-        );
     }
 }
