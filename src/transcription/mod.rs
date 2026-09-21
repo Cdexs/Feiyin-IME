@@ -1015,9 +1015,19 @@ static HOTWORDS_TOKENIZER: OnceLock<Option<tokenizers::Tokenizer>> = OnceLock::n
 /// 取（必要时加载）tokenizer。路径按 DEC-011 exe 同级 models 推导。
 fn hotwords_tokenizer() -> &'static Option<tokenizers::Tokenizer> {
     HOTWORDS_TOKENIZER.get_or_init(|| {
+        // 🔴 2026-09-21：由 FunASR Nano 目录改指 **Qwen3-ASR 自带 tokenizer**。
+        // 原路径依赖已迁移走的 nano 模型 —— 用户若只下 Qwen3，该路径会缺失，
+        // 词条计数会静默退化为「UTF-8 字节数上界」（高估约 50%，200 条上限实收约 130~150 条），
+        // 不崩不报错但词条被静默截断。tester-1 在 BUILD-321 核验时发现（我任务书里预设
+        // 「exe 不再引用 nano」，他如实报出不成立）。
+        //
+        // Qwen3-ASR 的 tokenizer 目录原本只有 vocab.json / merges.txt / tokenizer_config.json，
+        // 缺 tokenizer.json；已把 nano 那份（11.4MB）拷入。
+        // **精度零损失**：两侧 vocab.json 与 merges.txt 的 sha256 **逐字节相同**
+        // （ca10d7e9… / 8831e4f1…），是同一个 Qwen3 tokenizer，不是近似替代。
         let p = model_dir()
-            .join("sherpa-onnx-funasr-nano-int8-2025-12-30")
-            .join("Qwen3-0.6B")
+            .join("sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25")
+            .join("tokenizer")
             .join("tokenizer.json");
         let t = std::time::Instant::now();
         match tokenizers::Tokenizer::from_file(&p) {
@@ -1710,8 +1720,8 @@ mod tests {
     fn test_tokenizer() -> Option<tokenizers::Tokenizer> {
         let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("models")
-            .join("sherpa-onnx-funasr-nano-int8-2025-12-30")
-            .join("Qwen3-0.6B")
+            .join("sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25")
+            .join("tokenizer")
             .join("tokenizer.json");
         let t = std::time::Instant::now();
         let tk = tokenizers::Tokenizer::from_file(&p).ok();
