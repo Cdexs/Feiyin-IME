@@ -7857,6 +7857,7 @@ fn spawn_worker_thread(
                             &event_tx,
                             start.translate,
                             Some(streaming_text), // 流式文本，跳过转录
+                            None,                 // PARALLEL-ACC-298: 在线路径无并行预转写
                             i18n::get(config.ui_language).overlay_transcribing,
                         );
                         continue;
@@ -7936,10 +7937,73 @@ fn spawn_worker_thread(
                         // chunk channel：record_streaming 推 chunk，ASR 线程读
                         let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<Vec<f32>>(256);
 
-                        // scoped：ASR 线程借常驻 recognizer，worker 线程跑 record_streaming。
-                        // 二者在 scope 内并发、join 后才继续 ⇒ 无并发访问 recognizer
-                        // （见 SendOnlineRecognizerRef 的 SAFETY 论证）。
-                        let (asr_result, record_result) = std::thread::scope(|scope| {
+                        // PARALLEL-ACC-298：accuracy 并行派发。总开关关 / offline recognizer 缺失
+                        // ⇒ acc_enabled=false ⇒ 不建 worker、不派发，**逐位退回今天的串行行为**。
+                        let acc_cfg = transcription::local_stream::AccDispatchConfig::from_env();
+                        let acc_offline = transcriber.as_ref().and_then(|t| t.offline_recognizer());
+                        let acc_enabled = acc_cfg.enabled && acc_offline.is_some();
+                        let acc_cfg = transcription::local_stream::AccDispatchConfig {
+                            enabled: acc_enabled,
+                            ..acc_cfg
+                        };
+                        let send_offline = acc_offline.map(transcription::SendOfflineRecognizerRef);
+                        let (acc_tx, acc_rx) =
+                            crossbeam_channel::bounded::<(usize, Vec<Vec<f32>>)>(64);
+                        let acc_script = config.audio.chinese_script;
+
+                        // scoped：ASR 线程借 online recognizer，worker 线程跑 record_streaming，
+                        // accuracy worker 借 **offline** recognizer 并行转写派发片。
+                        // 🔴 298 是真并发：streaming 线程与 accuracy worker 同时在跑。两 recognizer
+                        // 是**不同对象**且各自**独占**（见 SendOfflineRecognizerRef 的 SAFETY 论证）。
+                        let scoped = std::thread::scope(|scope| {
+                            // accuracy 并行 worker：对象独占，唯一使用者（streaming 线程只用 online）。
+                            let acc_handle = if acc_enabled {
+                                let send_offline =
+                                    send_offline.expect("acc_enabled 蕴含 offline recognizer 存在");
+                                let cancel_acc = Arc::clone(&cancel_signal);
+                                let acc_rx = acc_rx;
+                                Some(scope.spawn(move || {
+                                        let recognizer = send_offline.into_inner();
+                                        let mut ordered: Vec<(usize, Vec<String>)> = Vec::new();
+                                        let mut all_native = true;
+                                        let mut total_decode_ms = 0.0f64;
+                                        for (idx, sub_segs) in acc_rx {
+                                            if cancel_acc.load(Ordering::Acquire) {
+                                                // 判据 #3：取消时不把已取消的结果带进下游。
+                                                break;
+                                            }
+                                            let mut texts = Vec::with_capacity(sub_segs.len());
+                                            for s in &sub_segs {
+                                                let t = log::log_enabled!(log::Level::Debug)
+                                                    .then(std::time::Instant::now);
+                                                let res = transcription::transcribe_accuracy_segment(
+                                                    recognizer, s, acc_script,
+                                                );
+                                                if let Some(t0) = t {
+                                                    total_decode_ms +=
+                                                        t0.elapsed().as_secs_f64() * 1000.0;
+                                                }
+                                                match res {
+                                                    Ok((txt, _np)) => texts.push(txt),
+                                                    Err(e) => {
+                                                        log::warn!(
+                                                            "PARALLEL-ACC-298 seg #{} sub-seg failed: {}",
+                                                            idx,
+                                                            e
+                                                        );
+                                                        texts.push(String::new());
+                                                        all_native = false;
+                                                    }
+                                                }
+                                            }
+                                            ordered.push((idx, texts));
+                                        }
+                                        (ordered, all_native, total_decode_ms)
+                                    }))
+                            } else {
+                                None
+                            };
+
                             let asr_handle = scope.spawn(move || {
                                 // into_inner 按值消费包装，强制闭包捕获整个 Send 包装
                                 // （Rust 2021 disjoint capture 若只取 .0 字段会退化为
@@ -7958,6 +8022,11 @@ fn spawn_worker_thread(
                                             display_text.to_string(),
                                             words.to_vec(),
                                         ));
+                                    },
+                                    acc_cfg,
+                                    |idx, segs| {
+                                        // 派发片送 accuracy worker（worker 不存在 ⇒ send 失败，忽略）。
+                                        let _ = acc_tx.send((idx, segs));
                                     },
                                 )
                             });
@@ -7987,9 +8056,52 @@ fn spawn_worker_thread(
                             );
                             // drop chunk_tx 让 ASR 线程的 channel 断开（触发 flush 收尾）
                             drop(chunk_tx);
+                            // tail_wait = 松键之后到「最终文本就绪」的等待（Gavin 要看的效果判据）。
+                            // 含 ASR flush + accuracy 尾片解码（中间片已在说话时并行算完）。
+                            let t_stop = std::time::Instant::now();
                             let asr_result = asr_handle.join();
-                            (asr_result, record_result)
+                            let acc_result = acc_handle.map(|h| h.join());
+                            (
+                                asr_result,
+                                record_result,
+                                acc_result,
+                                t_stop.elapsed().as_secs_f64() * 1000.0,
+                            )
                         });
+                        let (asr_result, record_result, acc_result, tail_wait_ms) = scoped;
+
+                        // PARALLEL-ACC-298：各片按 seg_index 有序拼接；取消/空 ⇒ 弃用回落旧路径。
+                        let (acc_texts, acc_all_native, acc_total_decode_ms) = match acc_result {
+                            Some(Ok((ordered, all_native, total))) => {
+                                (assemble_parallel_accuracy(ordered), all_native, total)
+                            }
+                            Some(Err(_)) => {
+                                log::error!("PARALLEL-ACC-298 accuracy worker panicked");
+                                (Vec::new(), false, 0.0)
+                            }
+                            None => (Vec::new(), false, 0.0),
+                        };
+                        let acc_joined = transcription::join_segment_texts(&acc_texts);
+                        if log::log_enabled!(log::Level::Debug) {
+                            log::debug!(
+                                "[LocalRT-DBG-298] join: segs={} total_decode={:.0}ms tail_wait={:.0}ms",
+                                acc_texts.len(),
+                                acc_total_decode_ms,
+                                tail_wait_ms
+                            );
+                        }
+                        let pretranscribed = if acc_parallel_result_usable(
+                            cancel_signal.load(Ordering::Acquire),
+                            &acc_joined,
+                        ) {
+                            let normalized = text_normalizer::normalize_text_for_language(
+                                &acc_joined,
+                                config.audio.chinese_script,
+                            );
+                            Some((normalized, acc_all_native))
+                        } else {
+                            None
+                        };
 
                         log::info!(
                             "[Latency] local realtime record_streaming() completed after +{:.1}ms",
@@ -8093,7 +8205,8 @@ fn spawn_worker_thread(
                             start.target_hwnd,
                             &event_tx,
                             start.translate,
-                            None, // 非流式：accuracy 2pass 出最终文本（主通道 ITN 启用）
+                            None, // 非流式：主通道 ITN 启用（B 路径由 pretranscribed 显式承载）
+                            pretranscribed, // PARALLEL-ACC-298: 并行 accuracy 结果（关时 None ⇒ 原有 accuracy 2pass）
                             i18n::get(config.ui_language).overlay_processing,
                         );
                         continue;
@@ -8177,6 +8290,7 @@ fn spawn_worker_thread(
                         &event_tx,
                         start.translate,
                         None,
+                        None, // PARALLEL-ACC-298: 批处理路径无并行预转写
                         i18n::get(config.ui_language).overlay_transcribing,
                     );
                 }
@@ -9031,6 +9145,62 @@ enum TranscriptionFailure {
     /// 其余错误转字符串，走既有 convert_to_friendly_error 显示链。
     Other(String),
 }
+/// PARALLEL-ACC-298：把 accuracy 并行各片的子段文本按 `seg_index` **升序**拼接成扁平列表。
+///
+/// 单 worker + channel FIFO 已保证顺序，这里仍显式排序（乱序/缺号输入也稳定），
+/// 是判据 #3「seg_index 有序拼接」的纯函数载体（可单测，无需真模型）。
+fn assemble_parallel_accuracy(mut segments: Vec<(usize, Vec<String>)>) -> Vec<String> {
+    segments.sort_by_key(|(idx, _)| *idx);
+    segments.into_iter().flat_map(|(_, texts)| texts).collect()
+}
+
+/// PARALLEL-ACC-298：并行 accuracy 结果是否可用作 `pretranscribed`。
+///
+/// 🔴 取消 ⇒ 一律弃用（判据 #3「取消时不带脏结果」）；拼接后为空 ⇒ 弃用回落旧路径
+/// （与 BUG-119「没说话」路径一致，由旧路径给出 NoSpeech）。
+fn acc_parallel_result_usable(cancelled: bool, joined: &str) -> bool {
+    !cancelled && !joined.trim().is_empty()
+}
+
+#[cfg(test)]
+mod parallel_acc_298_tests {
+    use super::{acc_parallel_result_usable, assemble_parallel_accuracy};
+
+    /// 判据 #3：seg_index 乱序输入 ⇒ 按序号升序拼接；片内子段顺序保持。
+    #[test]
+    fn assemble_parallel_accuracy_orders_by_seg_index() {
+        let got = assemble_parallel_accuracy(vec![
+            (2, vec!["c".to_string(), "d".to_string()]),
+            (0, vec!["a".to_string()]),
+            (1, vec!["b".to_string()]),
+        ]);
+        assert_eq!(got, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn assemble_parallel_accuracy_empty_and_single() {
+        assert!(assemble_parallel_accuracy(vec![]).is_empty());
+        assert_eq!(
+            assemble_parallel_accuracy(vec![(0, vec!["only".to_string()])]),
+            vec!["only"]
+        );
+        // 空子段列表（该片整体失败）不影响其它片
+        assert_eq!(
+            assemble_parallel_accuracy(vec![(0, vec![]), (1, vec!["x".to_string()])]),
+            vec!["x"]
+        );
+    }
+
+    /// 判据 #3：取消 ⇒ 结果一律弃用（不带脏结果）；空/纯空白 ⇒ 弃用回落旧路径。
+    #[test]
+    fn acc_parallel_result_usable_gate() {
+        assert!(!acc_parallel_result_usable(true, "有字"));
+        assert!(!acc_parallel_result_usable(false, ""));
+        assert!(!acc_parallel_result_usable(false, "   \n"));
+        assert!(acc_parallel_result_usable(false, "有字"));
+    }
+}
+
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 fn run_pipeline_core(
@@ -9050,6 +9220,13 @@ fn run_pipeline_core(
     // ASR-038-B: 流式模式传入已转录文本，跳过转录步骤直接走 LLM 后半段。
     // None = 正常模式（run_pipeline_core 内部转录）；Some(text) = 流式模式（跳过转录）
     initial_text: Option<String>,
+    // PARALLEL-ACC-298: 本地流式「并行 accuracy」整段结果 `(text, native_punctuated)`。
+    // Some ⇒ 跳过内部转录，直接用该文本走 LLM 后半段。🔴 与 initial_text **分开**：
+    // `from_online_streaming` 仍只由 `initial_text.is_some()` 决定（本路径 initial_text=None
+    // ⇒ false ⇒ 主通道 ITN 启用），**不得**用本参数反推来源（DEC-066）。
+    // native_punctuated 由各段是否全 native 成功决定（与 transcribe_segments_chunked 同口径），
+    // 不能用文本反推（DEC-047 误用）。
+    pretranscribed: Option<(String, bool)>,
     // PIPELINE-ORCH-239-B（DEC-066 附则一）：本地转录步骤的状态文案。
     // 现有三档传 `overlay_transcribing`（行为逐位零变）；本地 realtime 新管线传
     // `overlay_processing`，满足「松键后只显示『识别处理中』单状态」要求。
@@ -9097,6 +9274,25 @@ fn run_pipeline_core(
                     Err(TranscriptionFailure::NoSpeech)
                 } else {
                     let native_punctuated = punctuation::has_effective_punctuation(&text);
+                    Ok((text, native_punctuated))
+                }
+            } else if let Some((text, native_punctuated)) = pretranscribed {
+                // PARALLEL-ACC-298：本地流式「并行 accuracy」结果。路由与 accuracy 2pass
+                // **完全一致**：`from_online_streaming` 仍由 `initial_text`（本路径为 None）
+                // 决定 = false ⇒ 主通道 ITN 启用；标点用各段 all_native 的与（非文本反推）。
+                // 不在此再对全量 pcm 跑一次 accuracy（并行 worker 已逐片转写完）。
+                // 保持本地档单状态：仍发 `Processing(transcribing_status_text)`（文案同 :9127）。
+                send_event(
+                    event_tx,
+                    PipelineEvent::Processing(transcribing_status_text.to_string()),
+                );
+                log::info!(
+                    "PARALLEL-ACC-298: using parallel accuracy transcript ({} chars), skipping re-transcription",
+                    text.chars().count()
+                );
+                if text.trim().is_empty() {
+                    Err(TranscriptionFailure::NoSpeech)
+                } else {
                     Ok((text, native_punctuated))
                 }
             } else {

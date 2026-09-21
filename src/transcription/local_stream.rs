@@ -86,6 +86,102 @@ const SHADOW_FINALIZE_MS_DEFAULT: f32 = 400.0;
 /// 越来越长的音频（O(n²) 开销）。被跳过时打 warn 便于实测评估。
 const SHADOW_MAX_AUDIO_SECS: f32 = 12.0;
 
+/// LOCALRT-PARALLEL-ACC-298：派发静音阈值默认值（Gavin 拍板 800ms，不是 400ms）。
+///
+/// 🔴 **与 sherpa endpoint（rule2=2.0s）完全解耦**：本阈值只管「把已说完的一段派给 accuracy
+/// 并行转写」，**绝不触发** `reset()` / 切句 / `sentence_id += 1`（那是显示层的事）。
+const ACC_DISPATCH_SILENCE_MS_DEFAULT: f32 = 800.0;
+
+/// LOCALRT-PARALLEL-ACC-298：最小派发片长默认值（3s）。
+///
+/// 800ms 停顿在口语里很密，不设下限会切出 0.5s 碎片（每片固定解码开销 + 上下文过短伤精度）。
+/// **本值由 coder-2/主控提出、Gavin 未拍过** ⇒ 做成 env 可调，端测好比对。
+const ACC_MIN_SEGMENT_MS_DEFAULT: u64 = 3000;
+
+/// LOCALRT-PARALLEL-ACC-298：accuracy 并行派发配置（三个 env 开关，端测可调）。
+///
+/// | env | 默认 | 用途 |
+/// | --- | --- | --- |
+/// | `LOCAL_RT_ACC_PARALLEL` | `1`（开） | 总开关；`0` = 逐位退回今天的串行行为 |
+/// | `LOCAL_RT_ACC_SILENCE_MS` | `800` | 派发静音阈值 |
+/// | `LOCAL_RT_ACC_MIN_SEG_MS` | `3000` | 最小片长 |
+#[derive(Debug, Clone, Copy)]
+pub struct AccDispatchConfig {
+    pub enabled: bool,
+    pub silence_ms: f32,
+    pub min_seg_ms: u64,
+}
+
+impl AccDispatchConfig {
+    /// 从 env 读取（沿用 `LOCAL_RT_RULE2` / `LOCAL_RT_SHADOW_MS` 写法），并 `debug!` 打一行实际取值。
+    pub fn from_env() -> Self {
+        let enabled = std::env::var("LOCAL_RT_ACC_PARALLEL")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let silence_ms = std::env::var("LOCAL_RT_ACC_SILENCE_MS")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(ACC_DISPATCH_SILENCE_MS_DEFAULT);
+        let min_seg_ms = std::env::var("LOCAL_RT_ACC_MIN_SEG_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(ACC_MIN_SEGMENT_MS_DEFAULT);
+        log::debug!(
+            "[LocalRT-DBG-298] acc parallel cfg: enabled={} silence_ms={} min_seg_ms={} (env LOCAL_RT_ACC_PARALLEL/LOCAL_RT_ACC_SILENCE_MS/LOCAL_RT_ACC_MIN_SEG_MS)",
+            enabled,
+            silence_ms,
+            min_seg_ms
+        );
+        Self {
+            enabled,
+            silence_ms,
+            min_seg_ms,
+        }
+    }
+}
+
+impl Default for AccDispatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            silence_ms: ACC_DISPATCH_SILENCE_MS_DEFAULT,
+            min_seg_ms: ACC_MIN_SEGMENT_MS_DEFAULT,
+        }
+    }
+}
+
+/// PARALLEL-ACC-298：是否把「当前未派发区间」派发给 accuracy 并行 worker。
+///
+/// 三个条件同时成立：总开关开 且 本轮停顿未派过（latch，防同一停顿重复派）且
+/// 连续静默 ≥ `silence_ms`(800) 且 未派发区间样本数 ≥ `min_seg_ms`(3s)。
+fn should_dispatch_acc(
+    enabled: bool,
+    silent_ms: f32,
+    pending_samples: usize,
+    done_for_pause: bool,
+    silence_ms: f32,
+    min_seg_ms: u64,
+) -> bool {
+    if !enabled || done_for_pause {
+        return false;
+    }
+    if silent_ms < silence_ms {
+        return false;
+    }
+    let min_samples = min_seg_ms as usize * SAMPLE_RATE as usize / 1000;
+    pending_samples >= min_samples
+}
+
+/// PARALLEL-ACC-298：录音结束时是否派发尾片。
+///
+/// 🔴 **必须有语音才派**：纯静音尾片送 accuracy 会返回空 ⇒ 上层 `all_native` 翻 false ⇒
+/// 本地档多跑一遍标点引擎（路由漂移）。但**有语音的尾巴绝不能吞**——宁可多打一次标点也不丢字。
+fn should_dispatch_tail(enabled: bool, pending_samples: usize, has_speech: bool) -> bool {
+    enabled && has_speech && pending_samples > 0
+}
+
 /// LOCALRT-PUNCT-TIMER-269：预览标点的节流缓存。
 ///
 /// 只缓存**标点后的全量文本**与其对应的**原始字节长度**，不缓存原始文本本身
@@ -225,6 +321,11 @@ fn endpoint_confirm_text<'a>(before: &'a str, after: &'a str) -> &'a str {
 ///   同 `config.audio.silence_threshold`）。用于**独立**统计连续静默 ≥800ms 触发显示层打点；
 ///   🔴 与 sherpa endpoint 无关，不触发 reset/切句。
 /// - `on_result`：文本变化回调，传 `(display_text, display_words)`，与 qwen 路径同构
+/// - `acc_cfg`：LOCALRT-PARALLEL-ACC-298 派发配置（`enabled`/`silence_ms`/`min_seg_ms`）；
+///   `enabled=false` 时本函数**完全不派发**（逐位退回串行行为）
+/// - `on_segment`：accuracy 并行派发回调，传 `(seg_index, 已加 padding 的 16k f32 子段列表)`。
+///   子段列表通常 1 个；未派发区间超 20s 时由 `build_padded_segments` 硬切为多个。
+///   🔴 只在 `acc_cfg.enabled` 且满足 800ms/3s/latch 条件时被调用
 ///
 /// # 返回
 /// `(final_preview, pcm)`：
@@ -240,6 +341,8 @@ pub fn transcribe_streaming_local(
     mut punctuation_engine: Option<&mut PunctuationEngine>,
     silence_threshold: f32,
     mut on_result: impl FnMut(&str, &[WordTiming]),
+    acc_cfg: AccDispatchConfig,
+    mut on_segment: impl FnMut(usize, Vec<Vec<f32>>),
 ) -> Result<(String, Vec<f32>)> {
     let is_cancelled = || {
         cancel_signal
@@ -281,6 +384,16 @@ pub fn transcribe_streaming_local(
     let mut shadow_done_for_pause = false;
     // 影子触发计数（284 实测触发频率用）。
     let mut shadow_count: u32 = 0;
+
+    // PARALLEL-ACC-298：accuracy 并行派发状态（与影子/端点**完全独立**）。
+    // 已派发到的 `pcm` 位置（下一片从这里起算）。
+    let mut acc_dispatched_end: usize = 0;
+    // 本轮静默是否已派发过（同 shadow_done_for_pause 的 latch 写法）。
+    let mut acc_done_for_pause = false;
+    // 本次未派发区间内是否出现过语音（尾片「有语音才派」的判据）。
+    let mut acc_pending_has_speech = false;
+    // 已派发片数（= 下一片的 seg_index）。
+    let mut acc_seg_index: usize = 0;
 
     // LOCALRT-FIRSTCHAR-272：首字延迟埋点（**永久观测**，对齐现有 `[Latency] … at +N.Nms` 风格）。
     // t0 = 本函数进入时刻（ASR 线程起跑），把首字延迟拆成三段：
@@ -333,6 +446,9 @@ pub fn transcribe_streaming_local(
             // LOCALRT-ENDPOINT-284：有新语音进来 → 允许本轮停顿结束后再触发影子。
             // 不立即清 shadow_current：显示侧用「取更长者」避免瞬时缩短/闪烁（见下 base 选择）。
             shadow_done_for_pause = false;
+            // PARALLEL-ACC-298：有新语音 → 允许本轮停顿结束后再派发，并标记待派发区间含语音。
+            acc_done_for_pause = false;
+            acc_pending_has_speech = true;
         }
 
         pcm.extend_from_slice(&chunk);
@@ -528,6 +644,40 @@ pub fn transcribe_streaming_local(
             }
         }
 
+        // PARALLEL-ACC-298：静默 ≥800ms 且当前未派发区间 ≥3s ⇒ 把这一段派给 accuracy 并行 worker。
+        // 🔴 只推进 `acc_dispatched_end`，**不 reset / 不切句 / 不动 sentence_id**（与 endpoint 解耦）。
+        // 复用 `build_padded_segments`：自动加 200ms 边界 padding，且 >20s 的片会硬切成多个子段
+        // （native `max_total_len=512` 的硬限制，禁止整段 >20s 喂 accuracy）。
+        if should_dispatch_acc(
+            acc_cfg.enabled,
+            silent_ms,
+            pcm.len().saturating_sub(acc_dispatched_end),
+            acc_done_for_pause,
+            acc_cfg.silence_ms,
+            acc_cfg.min_seg_ms,
+        ) {
+            let pending = pcm.len() - acc_dispatched_end;
+            let raw = [(acc_dispatched_end, pending)];
+            let padded = super::build_padded_segments(&raw, pcm.len(), &pcm);
+            if !padded.is_empty() {
+                if log::log_enabled!(log::Level::Debug) {
+                    log::debug!(
+                        "[LocalRT-DBG-298] seg dispatch #{}: silence={:.0}ms seg_audio={:.2}s pcm_pos={}",
+                        acc_seg_index,
+                        silent_ms,
+                        pending as f32 / SAMPLE_RATE as f32,
+                        acc_dispatched_end
+                    );
+                }
+                on_segment(acc_seg_index, padded);
+                acc_seg_index += 1;
+            }
+            // 无论 padded 是否为空都推进起点 + 上 latch：避免同一停顿反复尝试。
+            acc_dispatched_end = pcm.len();
+            acc_pending_has_speech = false;
+            acc_done_for_pause = true;
+        }
+
         // LOCALRT-PUNCT-TIMER-269-B：显示刷新，两条件「或」——
         //   ① 距上次打点 ≥4s（preview_display 内判 due）
         //   ② 连续静默 ≥800ms（本处独立计数）且自上次打点后有新内容
@@ -591,6 +741,32 @@ pub fn transcribe_streaming_local(
         }
     }
 
+    // PARALLEL-ACC-298：尾片 —— 录音结束，把剩余未派发区间作为最后一片派给 accuracy。
+    // 短录音（总时长 < min_seg_ms）时未派发区间 = 全量 ⇒ 等价今天的「单片=全量」。
+    // 🔴 只有「本段出现过语音」才派（纯静音尾片会把 all_native 翻 false）；有语音的尾巴绝不吞。
+    if should_dispatch_tail(
+        acc_cfg.enabled,
+        pcm.len().saturating_sub(acc_dispatched_end),
+        acc_pending_has_speech,
+    ) {
+        let pending = pcm.len() - acc_dispatched_end;
+        let raw = [(acc_dispatched_end, pending)];
+        let padded = super::build_padded_segments(&raw, pcm.len(), &pcm);
+        if !padded.is_empty() {
+            if log::log_enabled!(log::Level::Debug) {
+                log::debug!(
+                    "[LocalRT-DBG-298] seg dispatch #{} (tail): seg_audio={:.2}s pcm_pos={}",
+                    acc_seg_index,
+                    pending as f32 / SAMPLE_RATE as f32,
+                    acc_dispatched_end
+                );
+            }
+            on_segment(acc_seg_index, padded);
+        }
+        // 尾片是最后一次派发：函数即将返回，无需再推进 `acc_dispatched_end`/`acc_seg_index`
+        // （推进了也无人读 ⇒ 触发 unused_assignments）。
+    }
+
     // flush 尾部：input_finished 后把剩余可解码帧吐完，再取最终结果（不丢尾字）。
     stream.input_finished();
     while recognizer.is_ready(&stream) {
@@ -625,7 +801,7 @@ pub fn transcribe_streaming_local(
 
 #[cfg(test)]
 mod tests {
-    use super::endpoint_confirm_text;
+    use super::{endpoint_confirm_text, should_dispatch_acc, should_dispatch_tail, SAMPLE_RATE};
 
     /// FIX-LOCALRT-TAILCHAR-291：endpoint flush 后确认文本不得回退。
     ///
@@ -865,5 +1041,93 @@ mod tests {
             confirms, 1,
             "G4: endpoint 确认（on_result ..., true, ...）必须恰 1 处（防重复确认），实测 {confirms}"
         );
+    }
+
+    // ========================================================================
+    // PARALLEL-ACC-298 · 派发触发条件纯函数
+    //   真实 recognizer 起不来 ⇒ 把触发判据抽纯函数钉死（判据 #3）。
+    // ========================================================================
+
+    /// 判据 #3-a：800ms + ≥3s + 本轮未派 三条件缺一不可。
+    #[test]
+    fn acc_should_dispatch_requires_all_three_conditions() {
+        let min3s = 3000u64;
+        let three_s = 3 * SAMPLE_RATE as usize;
+        // 全满足 ⇒ true
+        assert!(should_dispatch_acc(
+            true, 800.0, three_s, false, 800.0, min3s
+        ));
+        // 静默差 1ms ⇒ false
+        assert!(!should_dispatch_acc(
+            true, 799.0, three_s, false, 800.0, min3s
+        ));
+        // 区间差 1 样本 ⇒ false
+        assert!(!should_dispatch_acc(
+            true,
+            800.0,
+            three_s - 1,
+            false,
+            800.0,
+            min3s
+        ));
+        // 本轮已派（latch）⇒ false
+        assert!(!should_dispatch_acc(
+            true,
+            5000.0,
+            three_s * 10,
+            true,
+            800.0,
+            min3s
+        ));
+        // 总开关关 ⇒ false
+        assert!(!should_dispatch_acc(
+            false,
+            5000.0,
+            three_s * 10,
+            false,
+            800.0,
+            min3s
+        ));
+    }
+
+    /// 判据 #3-a2：两个阈值 env 可调（传进去即生效）。
+    #[test]
+    fn acc_should_dispatch_honors_env_thresholds() {
+        // silence 调到 400：400ms 即派
+        assert!(should_dispatch_acc(
+            true,
+            400.0,
+            3 * SAMPLE_RATE as usize,
+            false,
+            400.0,
+            3000
+        ));
+        // min_seg 调到 6000：3s 不够，6s 才够
+        assert!(!should_dispatch_acc(
+            true,
+            800.0,
+            3 * SAMPLE_RATE as usize,
+            false,
+            800.0,
+            6000
+        ));
+        assert!(should_dispatch_acc(
+            true,
+            800.0,
+            6 * SAMPLE_RATE as usize,
+            false,
+            800.0,
+            6000
+        ));
+    }
+
+    /// 判据 #3-b：尾片判据 —— 🔴 有语音必须派（哪怕只剩 1 样本，绝不吞尾字）；
+    /// 纯静音尾片不派（避免 all_native 翻 false）；空区间/开关关不派。
+    #[test]
+    fn acc_should_dispatch_tail_requires_speech() {
+        assert!(should_dispatch_tail(true, 1, true), "有语音的尾巴绝不能吞");
+        assert!(!should_dispatch_tail(true, 5 * SAMPLE_RATE as usize, false));
+        assert!(!should_dispatch_tail(true, 0, true));
+        assert!(!should_dispatch_tail(false, 5 * SAMPLE_RATE as usize, true));
     }
 }

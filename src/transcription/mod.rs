@@ -163,6 +163,62 @@ pub struct Transcriber {
 // LOCAL-RT-ENGINE-239-A: online_recognizer 与 offline_recognizer 共用本条 SAFETY 论证。
 unsafe impl Send for Transcriber {}
 
+/// PARALLEL-ACC-298：把 `&OfflineRecognizer` 送进 accuracy 并行 worker 线程的 Send 包装。
+///
+/// 🔴 SAFETY 论证 = **对象独占**，不是「时间上不重叠」（本条与 `SendOnlineRecognizerRef`
+/// 的论证**不同**：298 是**真并发**，streaming 线程与 accuracy worker 同时在跑，故
+/// 「scope 内串行、join 后才继续」那套时间论在此**不成立**，不得套用）。
+///
+/// 独占性两条证据（coder-2 核实的代码事实）：
+/// 1. **录音期间无人替换/访问该 offline recognizer**：唯一会 swap/drop `transcriber` 的是
+///    `apply_reload_result`，它只在 worker loop 顶（`main.rs:7442-7458`）或 D2 有界等待
+///    （`:7633-7653`）执行 —— 二者都在 LocalRealtime 的 `std::thread::scope` **之前**；
+///    scope 期间 worker 线程**就地阻塞**在 `record_streaming`（`:7965`），loop 顶不执行
+///    （`:7462` 注释「录音期间 loop 顶不执行，天然不会中途换引擎」）。后台 reload 线程
+///    （`:7254`）只构建**新**实例，绝不碰旧实例。
+/// 2. **scope 内只有一个线程访问本对象**：accuracy worker 是唯一使用者；主 worker 线程只跑
+///    音频（`record_streaming`），streaming ASR 线程用的是 **online** recognizer（另一个对象）。
+///    全仓 `transcribe_with_punct_info` 唯一生产调用点 `main.rs:9132` 在 scope **之后**，
+///    且 298 携带 pretranscribed 时该分支根本不执行。
+///
+/// 结论：全程无第二个线程访问**同一** offline recognizer，跨线程转移成立。
+pub struct SendOfflineRecognizerRef<'a>(pub &'a sherpa_onnx::OfflineRecognizer);
+unsafe impl<'a> Send for SendOfflineRecognizerRef<'a> {}
+
+impl<'a> SendOfflineRecognizerRef<'a> {
+    /// 按值消费包装取出引用（同 `SendOnlineRecognizerRef`，破 Rust2021 disjoint capture）。
+    pub fn into_inner(self) -> &'a sherpa_onnx::OfflineRecognizer {
+        self.0
+    }
+}
+
+/// PARALLEL-ACC-298：用常驻 offline(accuracy) recognizer 并行转写**一个**分段。
+///
+/// 与 [`Transcriber::transcribe_segment_detailed`] 的 accuracy 分支逐位同口径：
+/// `create_stream → accept_waveform → decode → get_result → trim → strip_asr_special_tokens
+/// → 空则 Err(NativeEmpty) → normalize_text_for_language + native_punctuated=true`。
+/// 独立成自由函数，是为了让 accuracy worker 在 scope 线程内**只借 recognizer、不入 `&self`**
+/// （`Transcriber` 非 `Sync`，不能跨线程共享 `&self`）。
+pub(crate) fn transcribe_accuracy_segment(
+    recognizer: &sherpa_onnx::OfflineRecognizer,
+    samples: &[f32],
+    script: ChineseScript,
+) -> Result<(String, bool)> {
+    let stream = recognizer.create_stream();
+    stream.accept_waveform(16000, samples);
+    recognizer.decode(&stream);
+    let result = stream.get_result().context("No transcription result")?;
+    let text = Transcriber::strip_asr_special_tokens(result.text.trim());
+    if text.is_empty() {
+        // 与 transcribe_segment_detailed 一致：accuracy 空输出 ⇒ 该段失败（上层 all_native=false）
+        anyhow::bail!("ASR accuracy model produced empty output");
+    }
+    Ok((
+        text_normalizer::normalize_text_for_language(&text, script),
+        true,
+    ))
+}
+
 impl Transcriber {
     /// Create new Transcriber with explicit ASR model selection
     ///
@@ -288,6 +344,13 @@ impl Transcriber {
     /// 供 239-B 接线 `local_stream::transcribe_streaming_local` 使用。
     pub fn online_recognizer(&self) -> Option<&sherpa_onnx::OnlineRecognizer> {
         self.online_recognizer.as_ref()
+    }
+
+    /// PARALLEL-ACC-298：取常驻的 accuracy offline recognizer（accuracy 引擎档位为 `Some`）。
+    ///
+    /// 供 `main.rs` 的 accuracy 并行 worker 经 [`SendOfflineRecognizerRef`] 在 scope 线程内使用。
+    pub fn offline_recognizer(&self) -> Option<&sherpa_onnx::OfflineRecognizer> {
+        self.offline_recognizer.as_ref()
     }
 
     /// ASR-038-B: 在线 ASR 的 Inference API 端点

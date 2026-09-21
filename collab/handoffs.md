@@ -5,6 +5,16 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-2 — LOCALRT-PARALLEL-ACC-298 ✅ 交付（800ms 静音切片 + accuracy 并行转写）
+
+- **派发**：`local_stream.rs` `AccDispatchConfig`（env 三开关）+ 纯函数 `should_dispatch_acc`/`should_dispatch_tail`；静默 ≥800ms ∧ ≥3s ∧ 本轮未派 ⇒ `build_padded_segments` 派发（复用 200ms padding + >20s 硬切）；循环末派尾片（有语音才派）。不 reset/不切句。
+- **转写**：`main.rs` 同 scope 新增 accuracy worker（`SendOfflineRecognizerRef`，对象独占），`cancel_signal` 即 break；join 后 `assemble_parallel_accuracy` 有序拼接 + `join_segment_texts` + normalize。
+- **下游**：`run_pipeline_core` 加显式参数 `pretranscribed: Option<(String,bool)>`，新分支跳过重转录、照发 `Processing`；`from_online_streaming` 一字未改 ⇒ 本地档 ITN/标点路由逐位一致；`native_punctuated`=各段 `all_native` 与（非文本反推）。
+- **🔴 SAFETY 更正（采纳主控意见）**：不再套 `SendOnlineRecognizerRef` 的时间论（298 真并发），改对象独占论证，并给出两条代码证据（reload 仅 loop 顶/D2、scope 前；唯一生产调用点在 scope 后）。详见 result.md §二。
+- **边界**：在线三档零改动；`LOCAL_RT_ACC_PARALLEL=0` 逐位退回串行。
+- **验证**：0 error、warnings **110/101** = 基线；三文件 `rustfmt --check` clean；`numstat`==`-w`；新增单测 **12P/0F**。🔴 实机 `tail_wait` 交 tester-1/Gavin。
+- **红线**：未动版本 / 未 commit / 未出包 / 零凭证。
+
 ## 2026-09-21 — coder-2 — TEST-SYNC-295 ✅ 交付（阶段三：给 coder-1 的 293-B 补 I5 调用点结构护栏）
 
 - **先查覆盖（不重复造）**：293-B 的 I1~I4/I6/I7 已被现有用例覆盖（详见 result.md §一）；主控猜的缺口②「样本未被改动」已在 `:2168` 钉住、缺口③「150/200 判别力」已被精确值断言覆盖 ⇒ **均不补**。
@@ -55,6 +65,20 @@
 - **验证**：`cargo check --all-targets` 0 error、warnings **110/101** = 基线；`rustfmt --check` clean；新增单测 `local_stream::tests` **2P/0F**（连跑 3 次）。🔴 实机（`gained` 实测）交 tester-1/Gavin。
 - **⚠️ 协作事件**：主控文档 commit `99799c5`（10:26:26）在本题进行中执行，**把我未完成的 `local_stream.rs` 与 coder-1 的 `src/audio/mod.rs` 一并扫入**（commit message 未反映代码改动）。本单改动已随之落盘、worktree 无额外 diff；`git status` 另见 `.gitignore` + `src/audio/mod.rs`（非本单）。请主控知悉该 commit 语义与文件归属。
 - **红线**：只改 `local_stream.rs` / 未动版本 / 未自行 commit / 未出包 / 未跑 `cargo build --release` / 零凭证。
+
+## 2026-09-21 — tester-1 — TEST-EXEC-296 + BUILD-296 ✅ 回归全绿 + 出包（八项 PASS + 294 假红定位）
+
+- **基线**：HEAD `a0334b9`（含 coder-1 `FIX-GUARD-297`），工作区 clean、`ui/` 零 diff。
+- **回归**：root **1298P/0F/15I**（EXIT 0；基线 1284P，**+17 新测 −3 改名 = 净 +14**）；`src-tauri` **85P/0F/0I**；Vitest **SKIP**（`ui/` 零 diff，酌情原则）。
+- **🔴 首跑即红 → 定位护栏缺陷（本单最大产出）**：`099ca7f` 树上 `guard291_g3` FAIL（endpoint 块 `recognizer.create_stream()` 实测 0、期望 1）。用与护栏同构的花括号游标复算：`endpoint_guard_regions()` 的「首个 `} else`」截断切在嵌套 `let confirm_text = if use_shadow {…} else {…}`（`:400`），扫描区截到 `:399`，真 `create_stream()`（`:450`）在区外 ⇒ **假红、生产代码正确**。报主控→裁定 coder-1 修（`FIX-GUARD-297`，改用 `endpoint_branch_bounds` 单遍游标），终版 g1~g4 全绿。
+- **消融**：仅 295/audio **I5** 三种改法（主控缩减令取消 291 四条，理由「给测试做测试」）全部 **RED** 且即时还原（`git diff src/audio/mod.rs` 空）：①调用移出 `trim_pre_roll_residual` 分支→`块 L638..646，调用 L637` 红；②`else`（在线）分支加第二调用→命中 3（期望 2）红；③删调用→命中 1（期望 2）红。
+- **在线三档零回归（正面取证）**：调用点隔离 `main.rs:7716` 在线=`false` / `main.rs:7965` 本地=`true`；现有测试**不执行** `record_streaming`（需音频设备）⇒ **在线调用路径零覆盖**（如实声明，不以「没红」当「没影响」）；分流纯函数 `pre_roll_ms_for_streaming(false)==600` 由 `pre_roll_streaming_ms_routes_by_existing_switch` 覆盖，唯一调用点+门控由 I5 护栏钉住。
+- **BUILD-296（Step1–4 全走）**：npm 1.67s（`index-CipQtFxc.js`）/ Tauri 1m53s（17w）/ 主程序 2m57s（110w + crash 9w）；🔴 源码 mtime 前后 md5 一致（`6593df97…`，无中途改动）。产物 main `117d0411…`（14,419,456B/11:05）/ ui `66b006e3…`（10,060,288B/11:05）/ crash `f013357a…`（24,879,104B/11:03）；两副本逐一相等；main 异于 BUILD-290（`835d402b…`）。
+- **八项核验逐项 PASS**：①时间戳 ②两副本 sha+异于上包 ③0.9.2（`0.9.2.0`/`0.9.2`/`0.9.2.0`）④冒烟 PID 20432 Responding=True/无新 crash.json/残留 0 ⑤config `da2be5da…`+wordbook `b6ab43ac…` 零变化 ⑥warnings 110/9/17=基线 ⑦字面量探针 ⑧toml 三副本全等。
+- **探针**：`[LocalRT-DBG-291]`=1 / `293`=1 / `292`=2 / `284`=3 / `289`=1 / `276`=1 / `277`=1 / `278`=2；`283`=0 属**预期**（293-B `1b49bb3` 把 283 日志字面量改名为 `293`，并删 `trim_pre_roll_*` 3 测）；`chunks dropped during THIS recording`=2。
+- **端测 5 项交 Gavin**（本机 LL 钩子不接受注入合成 Right-Alt，无法真人发声）：①连说 4~5 句每句停 >2s 验中间句尾字（291）②先开口再按键（293-A）③按键后立刻说（293-B）④按键后停 2s 再说（293-B）⑤本地流式+开翻译；**三条 293 必须分开测**；带 `-debug` 跑会落 `debug-audio/` pre-roll WAV。
+- **证据**：`collab/outbox/tester-1/testexec296/`（root/tauri 最终日志、build 日志、`abl_i5_1..3.log`）。
+- **红线**：版本 0.9.2 未动 / 未 commit / 未 `cargo clean` / 未破坏性 git / 零凭证 / `debug-audio/` 未入 git。
 
 ## 2026-09-21 — coder-2 — FIX-SHADOW-DISPLAY-289 ✅ 交付（endpoint 确认改用当前句最完整结果）
 

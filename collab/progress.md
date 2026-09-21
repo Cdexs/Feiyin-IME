@@ -829,3 +829,15 @@ load_wordbook_vocabulary()
 | 探针 | `[LocalRT-DBG-289]`=1；`chunks dropped during THIS recording`=2（288 功能性字面量） |
 | 自验 | 🔴 288 空闲 150s `[ASR-DROP]`=0；日志开关两头验通过（无 -debug 无文件 / 有 -debug 有数据） |
 | 端测 | 待 Gavin 录音验尾字与四条修复效果 |
+
+
+## v0.9.3（批次二 · BUILD-296）· 2026-09-21 · 尾字 flush 修复(291) + pre-roll 音频取证(292) + 首字锚定裁剪/窗口1000ms(293-B)（版本号不升）
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 291 endpoint 切句前先 `input_finished()` flush 再确认 + 下一句 `create_stream()` 取代 `reset()`（治中间句结构性丢尾字）；292 debug-only pre-roll WAV dump（手写零依赖 PCM16 writer，`debug-audio/`）；293-B pre-roll 容量 600→1000ms + `select_pre_roll_for_asr` 锚定语音起点统一裁剪（A/B/C+兜底），在线三档仍 600ms |
+| 回归 | TEST-EXEC-296 root **1298P/0F/15I**（+17 新测 −3 改名）+ src-tauri **85P/0F/0I**；Vitest SKIP（`ui/` 零 diff）；warnings 110/9/17 = 基线 |
+| 出包 | `BUILD-296` 八项核验逐项 PASS；产物 `feiyin-ime` 14.42MB `117d0411…` / `feiyin-ime-ui` 10.06MB `66b006e3…` / `crash-reporter` 24.88MB `f013357a…`，时间戳 11:03–11:05 |
+| 探针 | `[LocalRT-DBG-291]`=1 / `293`=1 / `292`=2 / `284`=3 / `289`=1 / `276`=1 / `277`=1 / `278`=2；`283`=0 属预期（293-B 改名） |
+| 关键发现 | 首跑 `guard291_g3` 假红 → 定位为 294 护栏区域定界缺陷（非生产缺陷），coder-1 `FIX-GUARD-297` 修复；295 I5 三种消融全 RED |
+| 端测 | 待 Gavin 真人录音 5 项（291 中间句尾字；293 三场景首字；本地流式+翻译）；带 `-debug` 落 `debug-audio/` WAV |
