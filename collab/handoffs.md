@@ -5,6 +5,27 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-1 — POC-ACC-CONTEXT-299 ✅ 交付（FunASR Nano 上下文注入路径验证，纯 PoC）
+
+- **结论（通了）**：不改 C++，靠「不传 hotwords + 自拼完整 user_prompt」（`has_override=false` ⇒ C++ 原样使用）即可注入任意上下文；`rag_chemistry` 基线 `只在/脂` → 注入「化学术语参考：酯…」后**纠正为 `酯`**。写法：`前文行` 是有效成分，已有前文时热词行无额外增益（P2==P3，P3 省 ~20 token）。
+- **per-stream 通道不通（致命）**：FunASR Nano 未 override 带 hotwords 的 `CreateStream`；基类默认 `SHERPA_ONNX_LOGE("Only transducer models support contextual biasing.") + SHERPA_ONNX_EXIT(-1)` ⇒ **桌面进程直接终止**，禁止调用（PoC 未调）。
+- **harness 自检**：baseline（传 hotwords 走官方 prefix）vs P1（自拼同串）**18/18 逐字相同** + `user_prompt_dyn` 相等。格式五条（半角 `, ` / 每处 3 `\n` / 全角标点 / prefix-task 直拼 / `system_prompt` 用官方默认 `You are a helpful assistant.`，非生产空串）逐条对齐。
+- **四组**：baseline==P1；P2/P3 chemistry 纠错、history 改标点；其余不变。KV `max_total_len=1024`，context_len baseline 185~295 / P2 +17~21 / P3 −20~24，**无 Truncating/Falling back**。
+- **字符上限**（6.84s 音频）：context_len ≤469（上下文≤390 字）正确；569 起**静默退化**；769 空；1169 `Falling back`。二级静默（DEC-073）无日志。
+- **T1**（itn.wav）：`不进行文本规整` 有效于**标点**、**不改数字**（DEC-030 延续）。**T2**（colloq.wav）：`去除口头禅与重复`/`去除语气词`/`口语顺滑` **全无效**，口语垃圾全留。
+- **每片不同上下文**：`user_prompt` 是 recognizer 级 config ⇒ 不改 C++ 只能每片重建 recognizer（972MB/~6s）；stream 级路径须改 C++（本单只出依据）。
+- **清理**：删 PoC 源 + exe + `collab/outbox/coder-1/poc299/`；未动 `Cargo.toml`；生产零改动；未动版本 / 未 commit / 零凭证。
+
+## 2026-09-21 — coder-2 — FIX-GUARD-301 ✅ 交付（生产区扫描边界整族修复，第三次复发）
+
+- **根因**：护栏用「首个 `#[cfg(test)]`」当生产区边界 —— 298 在 `main.rs:9165` 插 test mod 致切点塌缩 ⇒ 5 条锚点出扫描区 ⇒ `TEST-EXEC-300` 假红（生产无缺陷）。
+- **改法**（仅 `src/main.rs` test 区）：新增 `#[cfg(test)] mod guard_prod_lines`（`:13070`），语义改「**剔除全部 test-gated 项**」；4 处调用点全改用它（旧 `starts_with` 命中 0）。
+- **test 判据扩严（主控批准）**：`#[cfg(` ∧ 含 `test` ∧ 不含 `not(test)` —— 同时剔除 8 处 `#[cfg(all(test, target_os="windows"))]`，防其被当生产区扫。`#[cfg_attr(test,…)]` 不命中（不误剔）。
+- **剔除清单**：恰 17 条属性行（9 plain + 8 all-test），逐条行号见 result.md §三；与主控预期 25 的差异已说明（6 条为注释行，非属性行）。
+- **静态复算**：main.rs 扫描 9164→10109 行；三组护栏 needle 计数旧→新无一变化 ⇒ 预测无护栏变红。
+- **验证**：0 error、warnings **110/101** 基线、`rustfmt --check` clean、`numstat`==`-w`（106/40）。🔴 **未跑 `cargo test`**（DEC-048），复跑在 tester-1。
+- **红线**：未动版本 / 未 commit / 未碰 `src/transcription/**` 与 `poc_acc_context.rs` / 零凭证。
+
 ## 2026-09-21 — coder-2 — LOCALRT-PARALLEL-ACC-298 ✅ 交付（800ms 静音切片 + accuracy 并行转写）
 
 - **派发**：`local_stream.rs` `AccDispatchConfig`（env 三开关）+ 纯函数 `should_dispatch_acc`/`should_dispatch_tail`；静默 ≥800ms ∧ ≥3s ∧ 本轮未派 ⇒ `build_padded_segments` 派发（复用 200ms padding + >20s 硬切）；循环末派尾片（有语音才派）。不 reset/不切句。
@@ -65,6 +86,18 @@
 - **验证**：`cargo check --all-targets` 0 error、warnings **110/101** = 基线；`rustfmt --check` clean；新增单测 `local_stream::tests` **2P/0F**（连跑 3 次）。🔴 实机（`gained` 实测）交 tester-1/Gavin。
 - **⚠️ 协作事件**：主控文档 commit `99799c5`（10:26:26）在本题进行中执行，**把我未完成的 `local_stream.rs` 与 coder-1 的 `src/audio/mod.rs` 一并扫入**（commit message 未反映代码改动）。本单改动已随之落盘、worktree 无额外 diff；`git status` 另见 `.gitignore` + `src/audio/mod.rs`（非本单）。请主控知悉该 commit 语义与文件归属。
 - **红线**：只改 `local_stream.rs` / 未动版本 / 未自行 commit / 未出包 / 未跑 `cargo build --release` / 零凭证。
+
+## 2026-09-21 — tester-1 — TEST-EXEC-300 ⚠️ 298 回归 5 FAIL（全为测试侧扫描边界假红，非生产回归）
+
+- **基线**：HEAD `9133c32`（298），`ui/` 零 diff，工作区仅多**未跟踪** `src/bin/poc_acc_context.rs`（coder-1 在途，未碰、未删）。
+- **回归**：root `cargo test --no-fail-fast` = **1299P/5F/15I**；`src-tauri` **85P/0F/0I**；Vitest **SKIP**（`ui/` 零 diff）。`poc_acc_context` **0P/0F 编译通过**（不构成阻断）。
+- **新测**：`#[test]` 新增 **6**（非任务书 12；「12」= 断言数）：`parallel_acc_298_tests::{assemble_*×2, acc_parallel_result_usable_gate}` + `local_stream::tests::acc_should_dispatch_{requires_all_three_conditions,honors_env_thresholds,tail_requires_speech}`。NEW 6 / GONE 0，净 +1 自洽。
+- **🔴 5 FAIL 根因（沙箱复算证明，非推测）**：`nospeech_122_guard_tests::h4` + `guard_214_215::g7/g9/g10/g11` 均从 `include_str!("main.rs")` 取生产区，切点=「**首个 `#[cfg(test)]`**」（`punctuation/mod.rs:720`、`main.rs:13074`）。298 在 **`main.rs:9165`** 插入 `#[cfg(test)] mod parallel_acc_298_tests`（`run_pipeline_core` 定义 `:9206` 之前）⇒ 扫描区截到 **9164 行**；5 条锚点全在 **9265–9503**（`:9503 apply_l2_postprocess` / `:9265 from_online_streaming` / `:9391 pre_llm_text` / `:9478 normalize_unit_symbols_only` / `:9266 transcription_result`）⇒ 全部 panic「锚点不存在」。锚点在全文逐字存在、语义未变（G7 两实参齐、G9 `from_online_streaming` 非注释恰 2、G10/G11 分支结构未动）⇒ **修好边界应全绿**。
+- **同族与隐患**：与上轮 `guard291_g3`（294 护栏区域定界）同族；295 的 coder-2 已用 `mod tests {` 规避同坑，main.rs 这几组未规避。⚠️ 附**自发现在内**：main.rs 生产区扫描自 298 起被静默收窄到 9164 行（锚点 <9165 的护栏暂未暴露）。**建议**（交主控裁定）：切点改稳定上界标记或显式 `// ==PRODUCTION-END==`，或作者把新测试模块移到文件尾。
+- **Q1 `LOCAL_RT_ACC_PARALLEL=0`**：`from_env`⇒enabled=false；`should_dispatch_acc` 首行短路 / `should_dispatch_tail` 首条件（均有单测）；`main.rs:7946 acc_enabled=false`⇒`:7960 acc_handle=None`⇒`:8063 acc_result=None`⇒`acc_parallel_result_usable(c, "")=false`⇒`pretranscribed=None`⇒`:9279` 新分支不进、走原 accuracy 2pass。**代码级等价串行**；🔴 本机无法触发录音，**非运行时逐样本对照**。
+- **Q2 在线三档**：在线调用 `main.rs:7845` 传 `initial_text=Some(streaming_text)` + `pretranscribed=None`（注释「在线路径无并行预转写」）⇒ 新 `else if pretranscribed`（`:9279`）**结构不可达**；批处理 `:8278` 双 None。`transcription/mod.rs` 改动**纯新增**（`SendOfflineRecognizerRef`/`transcribe_accuracy_segment`/`offline_recognizer()`）。**运行时覆盖=0**，不以「没红」当「没影响」。
+- **证据**：`collab/outbox/tester-1/testexec300/{root_test.log,tauri_test.log}`。
+- **红线**：未出包 / 版本 0.9.2 未动 / 未 `cargo clean` / 未改生产代码 / 未碰 `poc_acc_context.rs` / 零凭证。
 
 ## 2026-09-21 — tester-1 — TEST-EXEC-296 + BUILD-296 ✅ 回归全绿 + 出包（八项 PASS + 294 假红定位）
 

@@ -13050,6 +13050,95 @@ mod overlay_109_d2d_p2p3_guard_tests {
     }
 }
 // =====================================================================
+// FIX-GUARD-301：结构护栏共享「生产区」扫描文本提取
+// ---------------------------------------------------------------------
+// 三次复发教训：用「第一个出现的某标记」当区域边界，任何人在前面插一个同类
+// 标记就塌缩（guard291 的 `} else`、295 预见的中途 cfg(test)、本次 298 插入
+// 的 `mod parallel_acc_298_tests`）。故本 helper **不再截断**，而是**剔除全部
+// test-gated 项、保留其余全文**，从语义上消除「位置敏感」。
+//
+// 🔴 test 判据不止 `#[cfg(test)]`：本文件另有 8 处
+// `#[cfg(all(test, target_os = "windows"))]` 测试模块（9878/11529/11728/11953/
+// 12434/12682/13408/13614），旧实现在 9165 就截断、从未扫到它们；改剔除法后若
+// 只认 `#[cfg(test)]`，这 8 个测试模块会被当成生产区扫进去 ⇒ 假红。故判据取
+// 「以 `#[cfg(` 开头 且含 `test` 且不含 `not(test)`」：
+//   - `#[cfg(test)]`                          → 剔除
+//   - `#[cfg(all(test, target_os = "windows"))]` → 剔除
+//   - `#[cfg(target_os = "windows")]`（生产）  → 保留（不含 test）
+//   - `#[cfg(not(test))]`（生产侧）            → 保留
+// =====================================================================
+#[cfg(test)]
+mod guard_prod_lines {
+    /// 单个 cfg 属性行是否把紧随的项 gate 成 test-only。
+    fn is_test_gated_attr(t: &str) -> bool {
+        let t = t.trim();
+        t.starts_with("#[cfg(") && t.contains("test") && !t.contains("not(test)")
+    }
+
+    /// 返回 `src` 的「生产区」逐行 trim 文本：**剔除所有 test-gated 项**
+    /// （`mod` / `fn` / 任意项），保留其余全文 —— 不再「截断到首个标记」。
+    ///
+    /// 健壮性（对任意位置 / 任意数量的 test 项都成立）：
+    /// - 逐行扫描，遇到 test-gated 属性即进入「跳过态」，**跳过完该项后回到正常态
+    ///   继续收集**（这是与旧实现的本质差别）；
+    /// - 属性与其后的项之间允许夹文档注释 / 其它属性 / 空行（`//`、`#[`、`#!`、空行都容忍）；
+    /// - 项结束判据：在第一个 `{` 之前先遇 `;` ⇒ 无花括号项（`use`/`const`/`static`/`type`），
+    ///   跳到该 `;`；否则花括号配平到深度归零（覆盖 `mod x { … }` / `fn x() { … }` 及嵌套）。
+    pub(crate) fn prod_lines_excluding_cfg_test(src: &str) -> Vec<String> {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out: Vec<String> = Vec::new();
+        let mut i = 0usize;
+        while i < lines.len() {
+            let t = lines[i].trim();
+            if !is_test_gated_attr(t) {
+                out.push(t.to_string());
+                i += 1;
+                continue;
+            }
+            // 跳过属性行本身及其后的文档注释 / 其它属性 / 空行，定位到被 gate 的项首行。
+            i += 1;
+            while i < lines.len() {
+                let t2 = lines[i].trim();
+                if t2.is_empty()
+                    || t2.starts_with("//")
+                    || t2.starts_with("#[")
+                    || t2.starts_with("#!")
+                {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            // 跳过该项本体。
+            let mut depth: i32 = 0;
+            let mut opened = false;
+            while i < lines.len() {
+                let mut semi = false;
+                for ch in lines[i].chars() {
+                    match ch {
+                        '{' => {
+                            depth += 1;
+                            opened = true;
+                        }
+                        '}' => depth -= 1,
+                        ';' if !opened => {
+                            semi = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                i += 1;
+                if semi || (opened && depth <= 0) {
+                    break;
+                }
+            }
+        }
+        out
+    }
+}
+
+// =====================================================================
 // TEST-SYNC-122 / BUG-119「用户没说话」类型化信号 8 条护栏（阶段三，只写用例）
 // ---------------------------------------------------------------------
 // 契约（写在 NoSpeechError 类型文档里）：新增第三个「没说话」产出源时只需
@@ -13057,8 +13146,9 @@ mod overlay_109_d2d_p2p3_guard_tests {
 // 「有人图省事又回去改字符串」。
 //
 // 结构护栏写法（前几轮教训）：
-//   1) include_str! 自读源码，按首个 `#[cfg(test)]` 切分只扫生产区 —— 测试
-//      代码（本 mod）永不进入扫描区；
+//   1) include_str! 自读源码，用 `guard_prod_lines::prod_lines_excluding_cfg_test`
+//      **剔除所有 test-gated 项**后只扫生产区 —— 测试代码（本 mod）永不进入扫描区；
+//      不再「截断到首个 #[cfg(test)]」（FIX-GUARD-301：位置敏感会塌缩）；
 //   2) 匹配一律 startswith（禁 contains），needle 全部 concat! 拆串；
 //   3) H3 是唯一子串例外（要在函数体内找「禁止出现的嗅探串」），仍先花括号
 //      深度定界到 convert_to_friendly_error 函数体再查；
@@ -13066,17 +13156,9 @@ mod overlay_109_d2d_p2p3_guard_tests {
 // =====================================================================
 #[cfg(test)]
 mod nospeech_122_guard_tests {
-    /// 读取源码并截断到首个 `#[cfg(test)]`，逐行 trim（只扫生产区）。
+    /// 生产区逐行 trim：**剔除所有 test-gated 项**（共享 helper，FIX-GUARD-301）。
     fn prod_lines(src: &'static str) -> Vec<String> {
-        let mut out = Vec::new();
-        for line in src.lines() {
-            let t = line.trim();
-            if t.starts_with("#[cfg(test)]") {
-                break;
-            }
-            out.push(t.to_string());
-        }
-        out
+        crate::guard_prod_lines::prod_lines_excluding_cfg_test(src)
     }
 
     fn main_prod_lines() -> Vec<String> {
@@ -13112,13 +13194,7 @@ mod nospeech_122_guard_tests {
                 "/src/transcription/vad.rs"
             )),
         ] {
-            for line in src.lines() {
-                let t = line.trim();
-                if t.starts_with("#[cfg(test)]") {
-                    break;
-                }
-                out.push(t.to_string());
-            }
+            out.extend(crate::guard_prod_lines::prod_lines_excluding_cfg_test(src));
         }
         out
     }
@@ -13349,7 +13425,7 @@ mod nospeech_122_guard_tests {
     ///
     /// 消融：生产区任意处写回一个 `apply_overlay_window_region(` 调用（或恢复函数定义）
     /// → 本测试红。
-    /// 判别力边界：只扫生产区（首个 #[cfg(test)] 之前），测试区内若有人引用该名不计数。
+    /// 判别力边界：只扫生产区（已剔除全部 test-gated 项），测试区内若有人引用该名不计数。
     #[test]
     fn h7_overlay_corner_radius_snapshot() {
         let lines = main_prod_lines();
@@ -13407,17 +13483,12 @@ mod nospeech_122_guard_tests {
 //   F4 行为真值表（函数本体）—— 与 F2 成对，缺一废一
 #[cfg(all(test, target_os = "windows"))]
 mod flicker_130_guard_tests {
-    /// 读取 src/main.rs 生产区（首个 #[cfg(test)] 之前）。
+    /// 读取 src/main.rs 生产区：**剔除所有 test-gated 项**（共享 helper，FIX-GUARD-301）。
     fn main_prod_lines() -> Vec<String> {
-        let mut out = Vec::new();
-        for line in include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).lines() {
-            let t = line.trim();
-            if t.starts_with("#[cfg(test)]") {
-                break;
-            }
-            out.push(t.to_string());
-        }
-        out
+        crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/main.rs"
+        )))
     }
 
     fn find_line(lines: &[String], needle: &str) -> Option<usize> {
@@ -13613,17 +13684,12 @@ mod flicker_130_guard_tests {
 //   G9 外框绘制半径单一来源（三类绘制调用实参必须引用 OVERLAY_FRAME_RADIUS_）
 #[cfg(all(test, target_os = "windows"))]
 mod overlay_121_guard_tests {
-    /// 读取 src/main.rs 生产区（首个 #[cfg(test)] 之前）。
+    /// 读取 src/main.rs 生产区：**剔除所有 test-gated 项**（共享 helper，FIX-GUARD-301）。
     fn main_prod_lines() -> Vec<String> {
-        let mut out = Vec::new();
-        for line in include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).lines() {
-            let t = line.trim();
-            if t.starts_with("#[cfg(test)]") {
-                break;
-            }
-            out.push(t.to_string());
-        }
-        out
+        crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/main.rs"
+        )))
     }
 
     fn find_line(lines: &[String], needle: &str) -> Option<usize> {
