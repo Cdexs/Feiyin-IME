@@ -730,10 +730,32 @@ mod tests {
             .unwrap_or_else(|| panic!("GUARD-291: 定位锚点不存在: {needle}"))
     }
 
-    /// 返回 (`生产区全部行`, `endpoint 分支块范围`, `函数体范围`)。
+    /// 定界 endpoint **真分支**（`if endpoint {` 到其闭合 `}` 的前一行）。
     ///
-    /// 🔴 `if endpoint { ... } else if ... {` 的花括号是同一条 if 表达式，会被定界并成
-    /// 一整块；I1/I3/I4 只针对 **endpoint 分支**，故把 `} else` 起的分支从块尾剔除。
+    /// 🔴 FIX-GUARD-297：原实现用「首个 `} else`」截断，会命中分支内**嵌套**的
+    /// `let confirm_text = if use_shadow { … } else { … }`（`:400`），把真正的
+    /// `recognizer.create_stream()`（`:450`）排除出扫描区 ⇒ G3 假红。
+    ///
+    /// 现改为**单遍花括号游标**：从 `if endpoint {` 起维护相对 `depth`；当 `depth == 1`
+    /// 且行首为 `}` 时，该 `}` 就是真分支的闭合花括号（Rust 的 `} else if … {` 里第一个
+    /// `}` 正是关真分支的），分支体止于其前一行。对任意层嵌套都成立——因为嵌套的 `}`
+    /// 出现时 `depth ≥ 2`，不会被 `depth == 1` 命中。
+    fn endpoint_branch_bounds(lines: &[String], ep_anchor: usize) -> (usize, usize) {
+        let mut depth = 0i32;
+        let mut open_idx = usize::MAX;
+        for (i, line) in lines.iter().enumerate().skip(ep_anchor) {
+            if open_idx != usize::MAX && depth == 1 && line.starts_with('}') {
+                return (open_idx, i - 1);
+            }
+            depth += brace_delta_291(line);
+            if open_idx == usize::MAX && depth > 0 {
+                open_idx = i;
+            }
+        }
+        panic!("GUARD-297: 未能定界 endpoint 真分支（anchor={ep_anchor}，源码结构已变）");
+    }
+
+    /// 返回 (`生产区全部行`, `endpoint 真分支范围`, `函数体范围`)。
     fn endpoint_guard_regions() -> (Vec<String>, (usize, usize), (usize, usize)) {
         let lines = ls_prod_lines();
         let fn_line = first_line(&lines, "pub fn transcribe_streaming_local(");
@@ -743,10 +765,19 @@ mod tests {
                 .iter()
                 .position(|l| l.starts_with("if endpoint {"))
                 .expect("GUARD-291: endpoint 分支锚点 `if endpoint {` 不存在");
-        let (ep_lo, mut ep_hi) = block_bounds_291(&lines, ep_anchor);
-        if let Some(else_pos) = (ep_lo..=ep_hi).find(|&i| lines[i].starts_with("} else")) {
-            ep_hi = else_pos - 1;
-        }
+        let (ep_lo, ep_hi) = endpoint_branch_bounds(&lines, ep_anchor);
+        // 自证区间「既不短也不长」：首行是 if 锚点；区间末行的下一行必须以 `}` 开头
+        // （即真分支的闭合花括号行）。任一不满足 ⇒ 区域定界又错了 ⇒ 立刻红。
+        assert!(
+            lines[ep_lo].starts_with("if endpoint {"),
+            "GUARD-297: endpoint 区间首行应为 `if endpoint {{`，实测: {}",
+            lines[ep_lo]
+        );
+        assert!(
+            ep_hi + 1 < lines.len() && lines[ep_hi + 1].starts_with('}'),
+            "GUARD-297: endpoint 区间末行的下一行应为闭合花括号，实测: {}",
+            lines.get(ep_hi + 1).map(String::as_str).unwrap_or("<EOF>")
+        );
         (lines, (ep_lo, ep_hi), (fn_lo, fn_hi))
     }
 

@@ -14,6 +14,14 @@
 - **验证**：`rustfmt --check` clean、`cargo check --all-targets` 0 error、warnings **110/101** 基线、`numstat`==`-w`（81/0）。🔴 **未跑 `cargo test`**（DEC-048 阶段三只许 fmt/check），首跑在阶段四。
 - **红线**：只改 `audio/mod.rs` test 区 / 未碰 `local_stream.rs` / 未动版本 / 未 commit / 未出包 / 零凭证。
 
+## 2026-09-21 — coder-1 — FIX-GUARD-297 ✅ 交付（修 294 护栏自身区域定界缺陷 / G3 假红）
+
+- **根因（护栏缺陷，非生产缺陷）**：`endpoint_guard_regions` 用「首个 `} else`」截断 endpoint 块，误命中块内嵌套的 `let confirm_text = if use_shadow {…} else {…}`（`:400`）⇒ 扫描区截到 `:399`，真正的 `recognizer.create_stream()`（`:450`）被排除 ⇒ G3 实测 0 假红；G1 两次 `get_result`（371/380）恰在错误区间内而偶然成立，本轮绿不作数。
+- **修法**：新增 `endpoint_branch_bounds`（单遍花括号游标）——从 `if endpoint {` 起维护相对 depth，`depth == 1 && 行首 == '}'` 即真分支闭合花括号（Rust `} else if … {` 的第一个 `}`）；嵌套 `}` 出现时 depth ≥ 2 天然不命中 ⇒ **对任意嵌套成立**。另加两条自证断言（区间首行 == `if endpoint {`、末行下一行 `starts_with('}')`）。
+- **新区间**：行 **362…455**（首行 `if endpoint {`，末行 `shadow_done_for_pause = false;`，下一行 456 为 `} else if …`）。四断言应得：G1 get_result{371,380} 夹 flush{375}／G2 函数体 reset=0／G3 create_stream={450}=1（**修复点**）／G4 on_result={435,482,604}=3 且 `, true,`={435}=1。**期望值无一改动**。
+- **验证**：`rustfmt --check` clean；`cargo check --all-targets` 0 error、warnings **110/101** = 基线；numstat==`-w`（38/7）；diff hunk 全在 `mod tests`，生产区零行。
+- 🔴 **未跑 `cargo test`**（DEC-048 白名单）——**未执行，首跑仍在 tester-1**。未动版本 / 未 commit / 未出包 / 未碰 `src/audio/mod.rs` / 零凭证。
+
 ## 2026-09-21 — coder-1 — TEST-SYNC-294 ✅ 交付（阶段三：给 coder-2 的 291 写源码级结构护栏）
 
 - **范围**：只改 `src/transcription/local_stream.rs` 的 `#[cfg(test)] mod tests` 区，`+168/0`，生产区零行。`OnlineRecognizer` 需真模型 ⇒ 行为级做不了，照 `src/main.rs::overlay_121_guard_tests` 读生产区源码 + needle 计数 + 花括号定界取块。
