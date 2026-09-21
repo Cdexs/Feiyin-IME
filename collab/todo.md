@@ -161,7 +161,7 @@ README 里教用户改 `config.toml` 的段落已全部删除。但 `translation
 | TECH-DEBT-001 | `parse_version` 主程序与 Tauri 侧实现不一致，prerelease 处理有差异 | `src/version_check/mod.rs` + `src-tauri/src/version_check.rs` |
 | ACC-DEGRADE-UI-001 | accuracy 静默降级时 UI 仍显示 accuracy（可观测性缺口） | `src/transcription/mod.rs` |
 | MOJIBAKE-COMMENT-001 | `main.rs` 5 处历史 mojibake 注释（`2483 / 2673 / 2689 / 2722 / 2962`），清理须 UTF-8 无 BOM 读写 | `src/main.rs` |
-| AUTOLEARN-REACH-001 | `218` 只修了闸门③（日志可见）。剩余三道按设计保留：落库 source=`system`（Gavin 09-17 拍板不改）／阈值 2 不上界面（DEC-031）／🔴 **只有在线流式路径有 `last_streaming_text`，本地模型路径自动学习不可达** —— 第三条是真缺口，若 Gavin 端测再报「没效果」先查是不是用的本地模型 | `src/wordbook/mod.rs` + `src/main.rs` |
+| AUTOLEARN-REACH-001 | `218` 只修了闸门③（日志可见）。剩余三道按设计保留：落库 source=`system`（Gavin 09-17 拍板不改）／阈值 2 不上界面（DEC-031）／~~只有在线流式路径有 `last_streaming_text`，本地模型路径自动学习不可达~~ 🔴 **2026-09-21 实测证伪、本条作废**：自学习在本地实时档每次都触发（BUILD-321 日志 4 条）。真因是候选抽取过宽，见 AUTOLEARN-CANDIDATE-327 | `src/wordbook/mod.rs` + `src/main.rs` |
 
 ---
 
@@ -229,10 +229,10 @@ Phase 4 完整规划见 `collab/research/macos-phase4-plan-001.md`，逐任务�
 
 | # | 问题 | 结论 / 处置 | 状态 |
 | --- | --- | --- | --- |
-| ① | ITN：「十分的重要」→「10分的重要」 | 🔴 **不是加保护词条就行**（主控原判已推翻）：`check_protection` 前缀匹配，加裸「十分」会打红 `十分钟→10分钟`(itn.rs:3997)、`三点二十分→3:20`(3896)、`三小时二十分→3:20`(3882)。且 DEC-038 禁保护表承载语法族 ⇒ **必须落成规则** | 🔵 **ITN-SHIFEN-323 → coder-2**（已 ACK，先报方案） |
+| ① | ITN：「十分的重要」→「10分的重要」 | 🔴 **不是加保护词条就行**（主控原判已推翻）：`check_protection` 前缀匹配，加裸「十分」会打红 `十分钟→10分钟`(itn.rs:3997)、`三点二十分→3:20`(3896)、`三小时二十分→3:20`(3882)。且 DEC-038 禁保护表承载语法族 ⇒ **必须落成规则** | ✅ **已交付** `5164a10`（itn 259P/0F） |
 | ② | tokenizer 报错 | 旧 exe（BUILD-321 构建于修复 `77313e5` 之前）指向已不存在的 nano 目录。**修复已入库，重建即消失** | ⏳ 待出包 |
-| ③ | 流式预览尾字丢失 | 🔴 **291（flush 信号）与 307（整句重解码）双双证伪**：`[LocalRT-DBG-307]` 21 条全 `gained=0`。同音频完整重解一字不差 ⇒ **流式 paraformer 本身不输出该字，再重解码无用**。新方向：拿 accuracy 分片结果**回灌预览**（298 并行下分片结果录音中即到，`seg dispatch` 带 `pcm_pos` 可作边界） | ⚪ 待派（撞 `main.rs`，排队） |
-| ④ | 编辑态自学习不触发（「指导灵」未入库） | 命中已记录的 `AUTOLEARN-REACH-001`：**只有在线流式路径写 `last_streaming_text`，本地模型路径不写** ⇒ 自学习拿不到原文做对比，整条路不可达。非回归，是从没通过 | ⚪ 待派（撞 `main.rs`，排队） |
+| ③ | 流式预览尾字丢失 | 🔴 **291（flush 信号）与 307（整句重解码）双双证伪**：`[LocalRT-DBG-307]` 21 条全 `gained=0`。同音频完整重解一字不差 ⇒ **流式 paraformer 本身不输出该字，再重解码无用**。新方向：拿 accuracy 分片结果**回灌预览**（298 并行下分片结果录音中即到，`seg dispatch` 带 `pcm_pos` 可作边界） | ✅ **已交付** `4c78ef3`(325) + `4d49252`(329 持久化) |
+| ④ | 编辑态自学习不触发（「指导灵」未入库） | 🔴 **主控原判（`AUTOLEARN-REACH-001`）已实测证伪并作废**：自学习**每次都触发了**（BUILD-321 日志 4 条）。真因 = 候选抽取按字符 diff，ASR 尾部也听错时公共后缀为空、跨度吞到句尾被句末标点校验整体拒 ⇒ 4 次只落 1 次计数，门槛 2 够不着 | ✅ **已交付** `291063c`(327 收窄) + `7d3a3a5`(331 基准) |
 | ⑤ | 上下文/词条是否真注入 | ✅ **已证实注入**：`terms_len=73` 每片都有；`acc_len` 录音内 0→12→29→57→79 增量；跨录音轮换 `prev1_len=97` → `prev2_len=97 prev1_len=14`；`cut=0` 从未截断。🔴 但护栏误触 **43%（6/14）** | ✅ **已修（ORCH-CTX-GUARD-FIX-324，主控直改）** |
 | ⑥ | Qwen3 的 ITN 是否启用 | **该模型没有这个开关**：`OfflineQwen3ASRModelConfig` 无 `itn` 字段（FunASR 有）。数字规整一直由自研 `src/itn.rs` 承担（DEC-030），换模型前后不变 | ✅ 已答，无需动作 |
 
@@ -245,7 +245,7 @@ Phase 4 完整规划见 `collab/research/macos-phase4-plan-001.md`，逐任务�
 | 线程数 8（随核心数） | ⚪ 生效但无可观测收益 | `num_threads=8` 两处确认；流式解码本无拥塞 |
 | Shadow 预览 | ⚠️ 日志内 **11:0 从未胜出**（`used=main` 11/11，`shadow_len` 恒 ≤ `main_len`），单次最贵 475ms。**但 Gavin 端测观察到「有时起作用」⇒ 保留不动** | `[LocalRT-DBG-289]` |
 | Pre-roll 前导缓冲 | 🔴 **全程空转** | `mean_abs=0.0000 peak=0.0000 speech_frames=0/50` **11/11**；`mode=tail` 11/11。缓冲满 100 chunks 但全是精确零 ⇒ 每次录音头部只贴 200ms 纯静音 | 
-| ↳ 处置 | 🔵 **PREROLL-DEAD-322 → coder-1**（先定根因再报方案；修不了就整块摘除，不许「留着不动只加注释」） | |
+| ↳ 处置 | ✅ **已交付** `4c78ef3`：**pre-roll 链路无 bug**，「全零」是 `{:.4}` 显示精度 + 16-bit 落盘量化共同造成的读数假象（实测 nz_ratio=1.000、peak 4e-8~1.3e-6）。已改打 dBFS + nz_ratio。原「修不了就整块摘除」的前提不成立，**该要求已撤销** | |
 
 ---
 
