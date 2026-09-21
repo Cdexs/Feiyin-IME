@@ -5,6 +5,15 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-1 — MIGRATE-QWEN3-314 ✅ 交付（accuracy 档换 Qwen3，识别器层）
+
+- **设计（DEC-076）**：**不新增 `AsrModel` 变体**，只切换 `Accuracy` 背后模型（避开 `[ENUM-EQ-CHECK-MISSES-NEW-VARIANT-001]`）；`uses_accuracy_engine()`/VAD/`native_punctuated` 判据全沿用。**枚举零改动**有 grep 正面证据（空输出）。
+- **改动**（仅 `src/transcription/mod.rs`，`+219/10`）：`AccuracyEngine` + `accuracy_engine_from()` + env `VOICE_IME_ACCURACY_ENGINE=funasr|qwen3`（默认 qwen3）；`create_qwen3_recognizer()`（四路径；`max_total_len=2048`、`max_new_tokens=256`、`temp=1e-6/top_p=0.8/seed=42`、**hotwords=None**）；`ensure_qwen3_model()`；`build_recognizer` Accuracy arm 按引擎分派；就位判据拆 funasr/qwen3 两版 + 按引擎分派；`check_local_realtime_models_ready` offline 用 FunASR 判据。
+- **验证**：`rustfmt --check` clean、`cargo check --all-targets` 0 error、warnings **110/101**=基线、`numstat`==`-w`（219/10）；3 单测（引擎选择/就位文件集/两引擎构造，后者 `--ignored` 本机跑通：构造均成功）。
+- **`native_punctuated`**：判据与引擎无关；313 实测 Qwen3 输出自带「，」「。」⇒ 不回归（原始输出见 result §四）。
+- **回滚**：`VOICE_IME_ACCURACY_ENGINE=funasr` 逐位退回 FunASR（模型与代码保留）。
+- **边界**：LocalRealtime offline 本单仍 FunASR（换引擎+前文注入下一单）；未碰 `main.rs`/`local_stream.rs`。未动版本 / 未 commit / 未出包 / 零凭证。
+
 ## 2026-09-21 — coder-1 — POC-QWEN3-FITNESS-313 ✅ 交付（Qwen3-ASR 端到端胜任性）
 
 - **结论：有条件胜任** —— 精度/语言/内存达标，**速度比基线慢 ~7.9%**（context+2048KV 代价）。

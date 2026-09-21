@@ -2699,3 +2699,32 @@ A(空)/B(英文现状)/C(259 中文)/D2(短强指令) 输出**本质逐字相同
 与 fp32（约 2.38GB），**关卡二本身是通过的**。
 
 **证据**：`RESEARCH-ACC-GPU-275`（releases assets 全量 grep + `session.cc:27/303` + ModelScope 文件列表）。
+
+## DEC-076 · accuracy 档迁移到 Qwen3-ASR 0.6B
+
+- **背景**：Gavin 要求「把前序分片已转写的文本作为上下文喂给后续分片」。
+  FunASR Nano 的 `user_prompt`/`hotwords` 是**构造期字段**，per-stream 通道未接
+  （基类 `CreateStream(hotwords)` 默认 `SHERPA_ONNX_EXIT(-1)`，调用即终止进程），
+  逐片换上下文=逐片重建 972MB 模型，不可行。已提 upstream issue k2-fsa/sherpa-onnx#3970。
+- **决策**（Gavin 2026-09-21 拍板）：**accuracy 档迁移到 `sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25`**。
+- **依据**（POC 306 / 310 / 313，原始数据 `collab/evidence/20260921-qwen3-poc/`）：
+
+  | 维度 | FunASR Nano | Qwen3-ASR | |
+  | --- | --- | --- | --- |
+  | 中文 CER（Gavin 真口述） | 0.0533 | **0.0444** | 相对降 17% |
+  | 速度 | 11.151s | 12.029s | 慢 7.9%（**306 无上下文时 11.19 vs 11.20 打平** ⇒ 该开销是上下文功能的价格，非模型劣势，可调） |
+  | 韩文 | 4/4 乱码 | **4/4 正确** | 产品设计要覆盖中英日韩 |
+  | per-stream 逐句参数 | ❌ | ✅ `hotwords`/`language`/`max_total_len`/`max_new_tokens`/`temperature`/`top_p` |
+  | KV 上限 | 1024（导出焊死，上游无更大变体） | **512 仅为配置默认，实测可开 4096+**，加载内存不变、精度逐字不变 |
+  | 内存 | 未测 | 20s 分片峰值 2010MB；52s 裸音频 4298MB |
+
+- 🔴 **前提条件**：**并行分片（LOCALRT-PARALLEL-ACC-298）是本迁移的前提，不是可选优化**。
+  不分片时长音频峰值达 4.3GB，对常驻后台输入法不可接受；分片后压掉 53%。
+- **同批定案（负面结论，避免日后重复试）**：
+  **「让模型按指令去口头禅/重复/结巴」在两个模型上均无效** ——
+  FunASR 中文三种措辞（299 T2）+ Qwen3 英文指令（313）全部只有标点抖动，
+  语气词与重复原样保留。**本地免费文本清理只剩规则层一条路**（FORMAT-FALLBACK-303 已实现并接线）。
+- **作废重来**：`DEC-068`/`071`/`072`/`073`/`074` 均基于 FunASR 的 KV 与 tokenizer 特性，
+  迁移后需对 Qwen3 重新标定，**不得直接沿用**。
+- **保留**：FunASR Nano 模型文件与既有结论暂不删除，作为回滚路径，直至 Qwen3 端测通过。
+

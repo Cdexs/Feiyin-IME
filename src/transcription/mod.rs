@@ -7,7 +7,9 @@ use std::sync::{Mutex, OnceLock};
 use crate::{config::ChineseScript, punctuation, text_normalizer};
 
 // Re-export SenseVoice config for convenience
-use sherpa_onnx::{OfflineFunASRNanoModelConfig, OfflineSenseVoiceModelConfig};
+use sherpa_onnx::{
+    OfflineFunASRNanoModelConfig, OfflineQwen3ASRModelConfig, OfflineSenseVoiceModelConfig,
+};
 
 pub mod local_stream;
 pub mod qwen_inference;
@@ -104,6 +106,36 @@ impl AsrModel {
     pub fn uses_accuracy_engine(self) -> bool {
         matches!(self, AsrModel::Accuracy | AsrModel::LocalRealtime)
     }
+}
+
+/// MIGRATE-QWEN3-314（DEC-076）：`AsrModel::Accuracy` 背后的识别器引擎。
+///
+/// 🔴 **不新增 `AsrModel` 变体** —— 新增变体要全仓 grep `==`/`!=` 逐个判断，编译器不报错
+/// （`[ENUM-EQ-CHECK-MISSES-NEW-VARIANT-001]`）。只切换 Accuracy 背后加载的模型，
+/// `uses_accuracy_engine()` / VAD 分段 / `native_punctuated` 等判据全部沿用不变。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AccuracyEngine {
+    /// 默认：Qwen3-ASR 0.6B（MIGRATE-QWEN3-314 / DEC-076）。
+    Qwen3,
+    /// 回滚路径：FunASR Nano native（原现役引擎，模型与代码保留不删）。
+    FunAsr,
+}
+
+/// 纯函数：解析引擎选择（便于单测，不碰全局 env）。
+fn accuracy_engine_from(v: Option<&str>) -> AccuracyEngine {
+    match v {
+        Some(s) if s.eq_ignore_ascii_case("funasr") => AccuracyEngine::FunAsr,
+        // 默认 qwen3；未知值也回落 qwen3（只有明确写 funasr 才回滚）
+        _ => AccuracyEngine::Qwen3,
+    }
+}
+
+/// 读取 env 回滚开关 `VOICE_IME_ACCURACY_ENGINE=funasr|qwen3`（默认 qwen3）。
+///
+/// 🔴 回滚用途（参照 298 的 `LOCAL_RT_ACC_PARALLEL` 先例）：端测出问题时**不用重新出包**，
+/// 设 `VOICE_IME_ACCURACY_ENGINE=funasr` 即逐位退回今天的行为。
+fn accuracy_engine() -> AccuracyEngine {
+    accuracy_engine_from(std::env::var("VOICE_IME_ACCURACY_ENGINE").ok().as_deref())
 }
 
 /// ASR transcriber using sherpa-onnx
@@ -924,7 +956,15 @@ fn build_recognizer(
         AsrModel::Accuracy => {
             // ASR-SINGLE-MODEL-001: accuracy 分支尝试加载 native 模型；失败则降级 performance
             // 不再预创建 CTC fallback recognizer（省 ~250-350MB 常驻）
-            match create_funasr_nano_recognizer(model_dir, hotwords) {
+            //
+            // MIGRATE-QWEN3-314（DEC-076）：背后引擎由 env 选择（默认 Qwen3-ASR；`funasr` 回滚）。
+            // 🔴 qwen3 分支**不传 hotwords**（config 留空）——词库改走 per-stream 注入（下一单），
+            //    不把词库塞进 config（避免两套并存）；funasr 回滚路径行为逐位不变。
+            let loaded = match accuracy_engine() {
+                AccuracyEngine::Qwen3 => create_qwen3_recognizer(model_dir),
+                AccuracyEngine::FunAsr => create_funasr_nano_recognizer(model_dir, hotwords),
+            };
+            match loaded {
                 Ok(recognizer) => Ok((recognizer, AsrModel::Accuracy, hotwords_version)),
                 Err(e) => {
                     log::warn!(
@@ -1142,6 +1182,69 @@ fn ensure_funasr_nano_model(model_dir: &Path) -> Result<PathBuf> {
     )
 }
 
+/// MIGRATE-QWEN3-314（DEC-076）：创建 Qwen3-ASR 0.6B 识别器（accuracy 档新引擎）。
+///
+/// 字段填法参照 `collab/evidence/20260921-qwen3-poc/poc_qwen3_compare.rs.txt`（306/310/313 已验证）。
+///
+/// - `max_total_len = 2048`（Gavin 拍板）：310 实测配置开大**零加载内存代价、零精度退化**，
+///   上下文容量随之放大（512→≤390 字 / 2048→≤2080 字）。
+/// - `max_new_tokens = 256`：**评估取值**。单片 ≤20s，音频 token ≈13/s×20≈260；生成量按 20s
+///   中文口述典型 ≤100 字（≤~130 token），256 足够覆盖且远低于 2048 KV，不引入截断
+///   （上游默认 128 对大段偏紧；官方 CLI 512 更宽松但非必需）⇒ 取 256，与现役 FunASR 一致。
+/// - `temperature = 1e-6 / top_p = 0.8 / seed = 42`：上游默认、近贪心 ⇒ 输出可复现（ASR 优先确定性）。
+/// - 🔴 `hotwords = None`：**本单 config 层留空**，词库改走 per-stream 注入（下一单）；
+///   不把词库塞进 config —— 避免 config 与 per-stream 两套并存，后面还要拆。
+fn create_qwen3_recognizer(model_dir: &Path) -> Result<sherpa_onnx::OfflineRecognizer> {
+    let model_dir_path = ensure_qwen3_model(model_dir)?;
+
+    let conv = model_dir_path.join("conv_frontend.onnx");
+    let enc = model_dir_path.join("encoder.int8.onnx");
+    let dec = model_dir_path.join("decoder.int8.onnx");
+    let tok = model_dir_path.join("tokenizer");
+
+    let offline_config = sherpa_onnx::OfflineRecognizerConfig {
+        model_config: sherpa_onnx::OfflineModelConfig {
+            // 与 create_funasr_nano_recognizer 同口径：min(逻辑核数, 8)，显式 cpu。
+            num_threads: std::thread::available_parallelism()
+                .map(|n| n.get().min(8) as i32)
+                .unwrap_or(4),
+            provider: Some("cpu".to_string()),
+            qwen3_asr: OfflineQwen3ASRModelConfig {
+                conv_frontend: Some(conv.to_str().unwrap_or("").to_string()),
+                encoder: Some(enc.to_str().unwrap_or("").to_string()),
+                decoder: Some(dec.to_str().unwrap_or("").to_string()),
+                tokenizer: Some(tok.to_str().unwrap_or("").to_string()),
+                max_total_len: 2048,
+                max_new_tokens: 256,
+                temperature: 1e-6,
+                top_p: 0.8,
+                seed: 42,
+                // 🔴 本单留空；词库改走 per-stream（下一单）。
+                hotwords: None,
+            },
+            tokens: Some(String::new()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    sherpa_onnx::OfflineRecognizer::create(&offline_config)
+        .context("Failed to create Qwen3-ASR offline recognizer")
+}
+
+/// MIGRATE-QWEN3-314：Qwen3-ASR 模型（954MB）就位检测（四个路径）。
+fn ensure_qwen3_model(model_dir: &Path) -> Result<PathBuf> {
+    let (ready, dir) = check_qwen3_model_ready(model_dir);
+    if ready {
+        log::info!("Qwen3-ASR model found at {:?}", dir);
+        return Ok(dir);
+    }
+    anyhow::bail!(
+        "Qwen3-ASR model not found at {:?} (need conv_frontend.onnx / encoder.int8.onnx / decoder.int8.onnx / tokenizer/). Download from:\n  https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models",
+        dir
+    )
+}
+
 /// Ensure SenseVoice (FunASR Nano CTC 兼容版，179MB) model is present
 fn ensure_sensevoice_model(model_dir: &Path) -> Result<PathBuf> {
     // FunASR Nano CTC 兼容版（179MB，2025-12-17）— DEC-025 路线 A 直换默认模型
@@ -1171,8 +1274,8 @@ pub fn model_dir() -> PathBuf {
     exe_dir.join("models")
 }
 
-/// 检测 accuracy 模型是否就位（供 Tauri command 调用）
-pub fn check_accuracy_model_ready(model_dir: &Path) -> (bool, PathBuf) {
+/// FunASR Nano native 就位判据（回滚路径；原 `check_accuracy_model_ready` 本体）。
+fn check_funasr_nano_model_ready(model_dir: &Path) -> (bool, PathBuf) {
     let dir = model_dir.join("sherpa-onnx-funasr-nano-int8-2025-12-30");
     let enc = dir.join("encoder_adaptor.int8.onnx");
     let llm = dir.join("llm.int8.onnx");
@@ -1180,6 +1283,29 @@ pub fn check_accuracy_model_ready(model_dir: &Path) -> (bool, PathBuf) {
     let tok = dir.join("Qwen3-0.6B");
     let ready = dir.exists() && enc.exists() && llm.exists() && emb.exists() && tok.exists();
     (ready, dir)
+}
+
+/// MIGRATE-QWEN3-314：Qwen3-ASR 就位判据（四个路径；与 `create_qwen3_recognizer` 加载清单逐字一致）。
+fn check_qwen3_model_ready(model_dir: &Path) -> (bool, PathBuf) {
+    let dir = model_dir.join("sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25");
+    let ready = dir.join("conv_frontend.onnx").exists()
+        && dir.join("encoder.int8.onnx").exists()
+        && dir.join("decoder.int8.onnx").exists()
+        && dir.join("tokenizer").exists();
+    (ready, dir)
+}
+
+/// 检测 accuracy 模型是否就位（供 Tauri command 调用）。
+///
+/// MIGRATE-QWEN3-314：**按当前引擎选择文件集**（默认 Qwen3；`VOICE_IME_ACCURACY_ENGINE=funasr`
+/// 时退回 FunASR 判据），与 `build_recognizer` 实际加载的模型保持一致。
+// 仅 `src-tauri` 侧（Tauri command）调用；root bin 不直接用，故 allow 以守 warnings 基线。
+#[allow(dead_code)]
+pub fn check_accuracy_model_ready(model_dir: &Path) -> (bool, PathBuf) {
+    match accuracy_engine() {
+        AccuracyEngine::Qwen3 => check_qwen3_model_ready(model_dir),
+        AccuracyEngine::FunAsr => check_funasr_nano_model_ready(model_dir),
+    }
 }
 
 /// LOCAL-RT-READY-246: 检测本地 realtime **双模型**是否就位。
@@ -1201,12 +1327,10 @@ pub fn check_local_realtime_models_ready(model_dir: &Path) -> (bool, bool, PathB
         && online_dir.join("decoder.int8.onnx").exists()
         && online_dir.join("tokens.txt").exists();
 
-    // offline：**直接调用** check_accuracy_model_ready，不复制判据。
-    // 🔴 主控 2026-09-20 裁定：此处曾就地复制五行判据以守 warnings 111 基线，
-    // 但那会制造一份必须手工同步的副本——一旦与 accuracy 判据漂移，界面显示
-    // 「已就位」而实际加载失败，属静默失效。warnings 基线是检查手段不是目标；
-    // 该函数由 never-used 变可达是改善，基线随之更新为 110/102。
-    let (offline_ready, _) = check_accuracy_model_ready(model_dir);
+    // offline：MIGRATE-QWEN3-314 起 `check_accuracy_model_ready` 变成**引擎相关**
+    // （默认 Qwen3），而 LocalRealtime 的 offline（2pass）本单仍走 FunASR（换引擎在下一单）
+    // ⇒ 这里显式用 FunASR 判据，保证「检测 == 实际加载」。仍复用同一函数、不复制判据。
+    let (offline_ready, _) = check_funasr_nano_model_ready(model_dir);
 
     (online_ready, offline_ready, model_dir.to_path_buf())
 }
@@ -1921,6 +2045,91 @@ mod tests {
     // ============================================================
     // ASR-SINGLE-MODEL-001 R1/R2 修订（验收第 2 轮）测试
     // ============================================================
+
+    // ============================================================
+    // MIGRATE-QWEN3-314：引擎选择（默认 qwen3 / env 回滚 funasr）+ 就位判据
+    // ============================================================
+
+    #[test]
+    fn migrate314_engine_selector_default_qwen3_funasr_override() {
+        assert_eq!(accuracy_engine_from(None), AccuracyEngine::Qwen3);
+        assert_eq!(accuracy_engine_from(Some("qwen3")), AccuracyEngine::Qwen3);
+        assert_eq!(accuracy_engine_from(Some("QWEN3")), AccuracyEngine::Qwen3);
+        assert_eq!(accuracy_engine_from(Some("funasr")), AccuracyEngine::FunAsr);
+        assert_eq!(accuracy_engine_from(Some("FunASR")), AccuracyEngine::FunAsr);
+        // 未知值回落默认 qwen3（只有明确写 funasr 才回滚）
+        assert_eq!(accuracy_engine_from(Some("garbage")), AccuracyEngine::Qwen3);
+    }
+
+    #[test]
+    fn migrate314_readiness_checks_engine_specific_files() {
+        let root = std::env::temp_dir().join(format!(
+            "voice-ime-mig314-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Qwen3 四件套
+        let q = root.join("sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25");
+        std::fs::create_dir_all(q.join("tokenizer")).unwrap();
+        for f in [
+            "conv_frontend.onnx",
+            "encoder.int8.onnx",
+            "decoder.int8.onnx",
+        ] {
+            std::fs::write(q.join(f), b"x").unwrap();
+        }
+        let (ready, dir) = check_qwen3_model_ready(&root);
+        assert!(ready, "Qwen3 四件套齐全应 ready");
+        assert_eq!(dir, q);
+        // 少一个即 not ready
+        std::fs::remove_file(q.join("decoder.int8.onnx")).unwrap();
+        assert!(!check_qwen3_model_ready(&root).0, "少 decoder 应 not ready");
+        std::fs::write(q.join("decoder.int8.onnx"), b"x").unwrap();
+
+        // FunASR 四件套
+        let f = root.join("sherpa-onnx-funasr-nano-int8-2025-12-30");
+        std::fs::create_dir_all(f.join("Qwen3-0.6B")).unwrap();
+        for n in [
+            "encoder_adaptor.int8.onnx",
+            "llm.int8.onnx",
+            "embedding.int8.onnx",
+        ] {
+            std::fs::write(f.join(n), b"x").unwrap();
+        }
+        assert!(
+            check_funasr_nano_model_ready(&root).0,
+            "FunASR 齐全应 ready"
+        );
+        assert!(
+            check_qwen3_model_ready(&root).0,
+            "两套并存时 Qwen3 也应 ready"
+        );
+        std::fs::remove_file(f.join("llm.int8.onnx")).unwrap();
+        assert!(
+            !check_funasr_nano_model_ready(&root).0,
+            "少 llm 应 not ready"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[ignore = "requires real Qwen3 + FunASR models in project models/ dir"]
+    fn migrate314_both_engine_recognizers_construct() {
+        let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models");
+        assert!(check_qwen3_model_ready(&model_dir).0);
+        assert!(check_funasr_nano_model_ready(&model_dir).0);
+        assert!(
+            create_qwen3_recognizer(&model_dir).is_ok(),
+            "Qwen3 recognizer 构造应成功"
+        );
+        assert!(
+            create_funasr_nano_recognizer(&model_dir, None).is_ok(),
+            "FunASR recognizer 构造应成功"
+        );
+    }
 
     /// R2: build_recognizer 返回 3-tuple (recognizer, effective_model, hotwords_version)。
     /// accuracy 降级 CTC 时 effective_model=Performance（语义归位三处）。
