@@ -3,6 +3,7 @@ pub mod db;
 
 use anyhow::Result;
 use std::cell::RefCell;
+use std::sync::OnceLock;
 
 #[allow(unused_imports)]
 pub use cache::{WordbookCache, WordbookEntry, WordbookStats};
@@ -195,9 +196,125 @@ impl Wordbook {
     }
 }
 
+/// AUTOLEARN-CANDIDATE-327：候选收窄规则（外置，根 `wordbook-rules.toml`）。
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ExtractRules {
+    #[serde(default = "default_sentence_enders")]
+    sentence_enders: String,
+    #[serde(default = "default_function_words")]
+    function_words: String,
+}
+fn default_sentence_enders() -> String {
+    "。！？；".to_string()
+}
+fn default_function_words() -> String {
+    "的了吗呢吧啊呀嘛哦嗯是在".to_string()
+}
+impl Default for ExtractRules {
+    fn default() -> Self {
+        Self {
+            sentence_enders: default_sentence_enders(),
+            function_words: default_function_words(),
+        }
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct WordbookRulesFile {
+    #[serde(default)]
+    extract: ExtractRules,
+}
+
+const BUILTIN_WORDBOOK_RULES: &str = include_str!("../../wordbook-rules.toml");
+
+/// 收窄规则缓存（exe 同级优先、内置默认兜底，见根 `wordbook-rules.toml`）。
+static EXTRACT_RULES: OnceLock<ExtractRules> = OnceLock::new();
+
+fn extract_rules() -> &'static ExtractRules {
+    EXTRACT_RULES.get_or_init(|| {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let path = dir.join("wordbook-rules.toml");
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    match toml::from_str::<WordbookRulesFile>(&content) {
+                        Ok(r) => {
+                            log::info!("Wordbook extract rules loaded from {:?}", path);
+                            return r.extract;
+                        }
+                        Err(e) => log::warn!(
+                            "wordbook-rules.toml parse error in {:?}, falling back to builtin: {}",
+                            path,
+                            e
+                        ),
+                    }
+                }
+            }
+        }
+        match toml::from_str::<WordbookRulesFile>(BUILTIN_WORDBOOK_RULES) {
+            Ok(r) => r.extract,
+            Err(e) => {
+                log::warn!("wordbook builtin rules parse error: {}", e);
+                ExtractRules::default()
+            }
+        }
+    })
+}
+
+/// AUTOLEARN-CANDIDATE-327：把 diff 出的跨度**二次收窄**为「干净词」。
+///
+/// 为什么需要：`extract_correction_word` 按【字符】diff（掐公共前缀+公共后缀）。当 ASR 把句子
+/// 后半段也听错时公共后缀为空，候选会一路吞到句尾（连标点/整短语）——如
+/// `"指导灵的信息吗？"` 被 `is_valid_candidate` 以「含句末标点」拒，4 次只落 1 次计数。
+///
+/// 三级（保守）：
+/// 1. **句末标点截断**：首个 `。！？；` 之前；
+/// 2. **虚词切前导词块**：首个虚词之前（`指导灵的信息吗` → `指导灵`）；
+/// 3. **保守丢弃**：发生过切分且结果 <2 字，或仍含句末标点 ⇒ `None`
+///    （未发生切分则**原样返回**：单字交 `is_valid_candidate` 拒，保持既有 `Some("好")` 用例不变）。
+///
+/// 🔴 只让「送进校验的东西更干净」，不放宽任何校验/门槛；宁可抽不出也不送垃圾。
+fn narrow_candidate(span: &str) -> Option<String> {
+    let rules = extract_rules();
+    let mut cut_applied = false;
+    let mut s = span.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // 1) 句末标点截断
+    if let Some(i) = s.find(|c| rules.sentence_enders.contains(c)) {
+        cut_applied = true;
+        s = s[..i].trim_end();
+    }
+    if s.is_empty() {
+        return None;
+    }
+    // 2) 首个虚词处切前导词块
+    if let Some((i, _)) = s
+        .char_indices()
+        .find(|(_, c)| rules.function_words.contains(*c))
+    {
+        cut_applied = true;
+        s = s[..i].trim_end();
+    }
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // 3) 保守丢弃
+    if cut_applied && s.chars().count() < 2 {
+        return None;
+    }
+    if s.chars().any(|c| rules.sentence_enders.contains(c)) {
+        return None;
+    }
+    Some(s.to_string())
+}
+
 /// WORDBOOK-SINGLEWORD-001-CORE: Extract corrected-side word from original vs edited text.
 /// Preserves the diff extraction logic but returns only the corrected part (the word to learn).
 /// This is for future WORDBOOK-CORRECTION-UI-001 纠错入口 reuse.
+///
+/// AUTOLEARN-CANDIDATE-327：diff 跨度再经 [`narrow_candidate`] 二次收窄（只收窄、不放宽校验）。
 fn extract_correction_word(original: &str, edited: &str) -> Option<String> {
     if original == edited {
         return None;
@@ -231,12 +348,8 @@ fn extract_correction_word(original: &str, edited: &str) -> Option<String> {
         return None;
     }
 
-    let trimmed = corrected_part.trim().to_string();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    Some(trimmed)
+    // AUTOLEARN-CANDIDATE-327：二次收窄（收窄后仍为空 ⇒ None）。
+    narrow_candidate(&corrected_part)
 }
 
 fn tokenize(text: &str) -> Vec<String> {
@@ -343,6 +456,64 @@ mod tests {
             learned
         );
         assert_eq!(learned, "運");
+    }
+
+    // AUTOLEARN-CANDIDATE-327：候选二次收窄
+    use super::narrow_candidate;
+
+    /// 🔴 本单验收核心：ASR 尾部也听错 ⇒ 公共后缀为空 ⇒ diff 跨度吞到句尾；
+    /// 收窄应得「指导灵」，而不是「指导灵的信息吗？」（后者被句末标点拒）。
+    #[test]
+    fn autolearn327_gavin_case_narrows_to_word() {
+        let orig = "这是一条来自自导灵的信息吗。";
+        let edited = "这是一条来自指导灵的信息吗？";
+        assert_eq!(
+            extract_correction_word(orig, edited),
+            Some("指导灵".to_string())
+        );
+    }
+
+    /// 尾部听对的情形（公共后缀存在，08:43:45 那类）⇒ 仍直接得「指导灵」，收窄不改行为。
+    #[test]
+    fn autolearn327_tail_correct_still_yields_word() {
+        let orig = "这是一条来自知道零的信息吗？";
+        let edited = "这是一条来自指导灵的信息吗？";
+        assert_eq!(
+            extract_correction_word(orig, edited),
+            Some("指导灵".to_string())
+        );
+    }
+
+    /// 🔴 主控指出的不对称代价：无句末标点、也不超 30 上限的整短语若不被虚词切开，
+    /// 会径直进候选表。收窄应在「是」处切出「指导灵」。
+    #[test]
+    fn autolearn327_asymmetric_phrase_is_narrowed() {
+        assert_eq!(
+            narrow_candidate("指导灵是一种能量"),
+            Some("指导灵".to_string())
+        );
+    }
+
+    /// 切出来只剩单字 / 以虚词开头 ⇒ None（宁可抽不出），不靠 is_valid_candidate 兜底。
+    #[test]
+    fn autolearn327_narrowed_to_single_char_is_dropped() {
+        assert_eq!(narrow_candidate("这是一条信息"), None);
+        assert_eq!(narrow_candidate("是的"), None);
+    }
+
+    /// 反例护栏：整句被改写 ⇒ 不许抽出一长串短语。
+    #[test]
+    fn autolearn327_whole_sentence_rewrite_no_candidate() {
+        let orig = "甲乙丙丁戊己庚辛";
+        let edited = "这是一条来自指导灵的信息吗？";
+        assert_eq!(extract_correction_word(orig, edited), None);
+    }
+
+    /// 未发生切分 ⇒ 原样返回（单字交 is_valid_candidate 拒，保持既有用例语义）。
+    #[test]
+    fn autolearn327_no_cut_is_passthrough() {
+        assert_eq!(narrow_candidate("好"), Some("好".to_string()));
+        assert_eq!(narrow_candidate(" 测试词 "), Some("测试词".to_string()));
     }
 
     // WORDBOOK-053-C: is_valid_candidate guard tests

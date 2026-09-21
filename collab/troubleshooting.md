@@ -168,3 +168,34 @@ cargo fmt -- <具体文件>                          # 或只点名文件
 coder-2 **自查发现风险并主动上报**，主控实测 `357/11` vs `-w 357/11` 逐字相同 ⇒ 本次未实际夹带
 （`rustfmt --check` 当时仍报 audio/mod.rs 两处未格式化，与「没写进去」一致）。
 **记录本条是因为风险真实存在且下次未必落空**，不是因为这次出了事。
+
+## [AUTOLEARN-REACH-001] 🔴 已作废（2026-09-21 实测证伪）—— 原记录「本地档自学习不可达」是错的
+
+**原记录内容**：「只有在线流式路径写 `last_streaming_text`，本地模型路径不写 ⇒ 自学习拿不到原文 ⇒ 整条路不可达」。
+
+**证伪**（BUILD-321，Gavin 的 LocalRealtime 会话，`collab/evidence/20260921-build321-e2e/debug-build321.log`）：
+
+```
+08:42:56 DEBUG wordbook] Auto-learn candidate rejected (contains sentence-ending punctuation): "指导灵的信息吗？"
+08:43:14 DEBUG wordbook] Auto-learn candidate rejected (contains sentence-ending punctuation): "指导灵的信息吗？"
+08:43:45 WARN  wordbook] [AUTOLEARN] candidate observed: '指导灵' (1/2)
+08:44:10 DEBUG wordbook] Auto-learn candidate rejected (contains sentence-ending punctuation): "指导灵的信息吗？"
+```
+
+`learn_correction` **确实被调用**，原文非空，比对跑出了差异 ⇒ LocalRealtime 的学习镜像是通的
+（写入点 `main.rs:8167`）。**原记录对 LocalRealtime 不成立。**
+
+非流式本地档（Accuracy / Performance / 批处理）走 `record()`，不发 `StreamingText`，
+**且没有编辑入口**（`text_hit_rect` 仅在 `RecordingWithText` 下设置）⇒ 对它们而言不是「不可达」，
+而是**本就没有这条交互**，改镜像也不会触发 `SubmitRequested`。
+
+**真因**（`src/wordbook/mod.rs:203` `extract_correction_word`）：`tokenize` 按**字符**切，
+候选 = 掐公共前缀 + 公共后缀后的中间段。**ASR 若把句子后半段也听错，公共后缀为空，
+候选就一路吞到句尾**（连标点），被 `is_valid_candidate` 的句末标点校验整体拒掉。
+4 次尝试只有 1 次 ASR 尾部恰好听对、抽出干净的「指导灵」⇒ 计数 1，门槛 2 永远够不着。
+
+⇒ 后续单 **AUTOLEARN-CANDIDATE-327**：修抽取（收窄跨度），**不降门槛、不放宽校验**。
+
+**教训**：主控凭「字段在某路径没写」就断定整条链路不可达，**没有翻运行日志核实**。
+`AUTOLEARN-REACH-001` 这条错记录还被写进了任务书当前提派发，Worker 停手反证才拦住。
+🔴 **下结论前先 grep 运行日志**——功能有没有跑过，日志比代码阅读更直接。

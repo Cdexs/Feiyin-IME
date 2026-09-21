@@ -1924,3 +1924,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 新增 `PipelineEvent::PreviewReflow { generation, seg_index, committed_len, has_hole, acc_text }`；**只有本地实时档**的 accuracy worker 会发（在线/批处理结构上永不发） | ⚠️ **行为变更，平台中立事件**：事件定义在无 `#[cfg]` 区；macOS 侧 `overlay_request_for_event` / `handle_pipeline_event` 已补 arm（映射 `Show`，暂不渲染，同 `StreamingText`/`StreamingFinalPreview` 先例）⇒ macOS 编译通过、行为与「流式文本暂不渲染」一致 |
 | 消费端回灌 gate（编辑闩锁 / 取消 / 陈旧 seg / 有洞 / 空）与 `reflow_preview` 合成 | ✅ 平台中立纯逻辑（`reflow_action` / `reflow_preview` 纯函数，可单测）；macOS 若将来渲染流式文本可直接复用 |
 | macOS 侧需要做什么 | ✅ **无需改动**；未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未触 `src/platform/**` |
+
+## AUTOLEARN-CANDIDATE-327（2026-09-21，coder-2）· 自学习候选二次收窄 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| `src/wordbook/mod.rs::extract_correction_word` 在 diff 跨度后新增 `narrow_candidate`（句末标点截断 + 虚词切前导词块 + 保守丢弃） | ⚠️ **行为变更，平台中立**：`wordbook/mod.rs` 无 `#[cfg]`；macOS 编译同一份代码 ⇒ 自动继承同一收窄行为 |
+| 新增根 `wordbook-rules.toml`（`include_str!` 内置默认 + exe 同级覆盖 + 降级，照 itn/homophone 先例） | ✅ 外置规则；macOS 打包同步该 toml 即可，不打包亦用内置默认（DEC-011） |
+| 门槛 `threshold` 与 `is_valid_candidate` 校验 | ✅ **一字未动**；只让送进校验的候选更干净 |
+| macOS 侧需要做什么 | ✅ **无需代码改动**；未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未触 `src/platform/**` |

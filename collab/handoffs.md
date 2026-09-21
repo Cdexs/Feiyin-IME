@@ -5,6 +5,23 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-2 — AUTOLEARN-CANDIDATE-327 ✅ 交付（候选抽取二次收窄）
+
+- **根因**：字符 diff 后公共后缀为空 ⇒ 候选吞到句尾（`指导灵的信息吗？`）⇒ 被句末标点校验拒、阈值够不着。
+- **改法**：`extract_correction_word` 后追加 `narrow_candidate`（`wordbook/mod.rs:276`）：句末标点截断 → 虚词切前导块 → 切过且 <2 字/仍含标点 ⇒ None；未切分原样返回。
+- **不动**：threshold、is_valid_candidate 一字未改；「是/在」保留（主控拍板，注释列真实碰撞项）。
+- **外置**：新增根 `wordbook-rules.toml`（include_str! 内置 + exe 同级覆盖 + 降级）。
+- **验证**：fmt clean（skip_children）/ check 0 error / warnings 110/101 基线 / numstat==-w（177/6）/ `autolearn327` 6P + `wordbook::` 61P 全绿。
+- 🔴 实机交 Gavin（判据 `[AUTOLEARN] promoted after threshold` + 词库可见），未声称已验证；出包同步 toml 三副本。
+- 未动版本 / 未 commit / 未出包 / 未碰 `src/audio/mod.rs`、`src/main.rs` / 零凭证。
+
+## 2026-09-21 — coder-2 — AUTOLEARN-LOCALRT-326 🔴 盘点完成 / 前提被推翻 / 停手等裁定（零代码）
+
+- **盘点**：学习镜像 `Arc<Mutex<Option<String>>>`（`main.rs:8527`；唯一写 `:6802` / 唯一读 `:7104`）vs 浮层渲染字段（`:1396`/`:2992`，不参与学习）。
+- **逐档**：在线流式 `:7816` ✅；本地实时 `:8167` ✅；本地 Accuracy/Performance/批处理 不发 StreamingText + **无编辑入口**（`text_hit_rect` 仅 `:2988`）⇒ N/A。
+- **🔴 反证**（`debug-build321.log`，LocalRealtime 会话）：`learn_correction` 被调用（`Auto-learn candidate rejected … "指导灵的信息吗？"`、`[AUTOLEARN] candidate observed: '指导灵' (1/2)`）⇒ 镜像非空、路可达；真因在**判定层**（候选含句末 `？` 被拒 + 阈值 2）。
+- **结论**：按「不碰判定逻辑」约束本单无对象可改 ⇒ 请主控裁定（撤单 / 转判定层 / 加编辑入口）。**未改任何代码**。
+
 ## 2026-09-21 — coder-1 — PREROLL-DEAD-322 ✅ 交付（pre-roll「全零」定根因：链路无 bug + 诊断口径修正）
 
 - **根因（实测证伪两个候选 + 主控候选 C）**：空闲期采集流**是活的**（10ms 节拍、时间戳 0~500ms）、payload **100% 非零**（`nz_ratio=1.000`/`exact_zero=0`）、重建流/积压/连续消费三对照一致、端点采集音量 0.84 正常。「纯零」= `{:.4}` + i16 落盘把 ~1e-7(≈-140 dBFS) **显示/量化没了**。候选 C 由**同一缓冲内**「前 1000ms=0 → 热键后 3510」证伪（恒定缩放不能只作用一段）⇒ 变的是声学输入；候选 B 由「持续消费不抬幅度」证伪。
