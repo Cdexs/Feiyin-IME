@@ -1841,3 +1841,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | `local_stream.rs` endpoint confirm 改用「main vs shadow 更完整者」 | ✅ **平台中立**，两端编译同一份；macOS 若启用本地 realtime 预览自动获得同一行为 |
 | `shadow_current` 空结果置 None（防陈旧） | ✅ 平台中立，无平台分支 |
 | 新增 `[LocalRT-DBG-289]` 诊断（debug! + `log_enabled!` 守卫） | ✅ 平台中立；无行为变更 |
+
+## FIX-ASR-DROP-288（2026-09-21，coder-1）· 音频回调日志风暴 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| `audio/mod.rs` 音频数据回调（F32/I16/U16 三处）删 `[ASR-DROP]` warn，仅保留 `dropped_chunks.fetch_add(1, Relaxed)` | ✅ **平台中立**（`audio/` 为跨平台层）；macOS 使用同一份回调，同样不再刷屏 |
+| 新增 `report_recording_drops_throttled()` + 消费端节流上报（`record_streaming`/`collect_recording` 主循环） | ✅ 平台中立；消费端只在录音期存在的性质两端一致 ⇒ 空闲/录音区分行为相同 |
+| 汇总口径改为「录音前后差值」 | ✅ 平台中立；无平台分支。macOS 无需改动 |
+| 丢弃行为 / 队列容量 256 | ✅ **未动**；两端一致 |

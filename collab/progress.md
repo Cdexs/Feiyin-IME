@@ -817,3 +817,15 @@ load_wordbook_vocabulary()
 | 探针 | `[LocalRT-DBG-276/277/278/283/284]`=1/1/2/1/3；284 `LOCAL_RT_SHADOW_MS`=1 |
 | 自验 | 日志开关两头：无 -debug 0 条 / 有 -debug 有输出 |
 | 端测 | 待 Gavin 录音验四条修复效果 |
+
+
+## v0.9.2（七包 · BUILD-290）· 2026-09-21 · 尾字修复(289) + 音频日志风暴治理(288)（版本号不升）
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 289 endpoint 定稿改用「当前句最完整结果」（治尾字被缺字结果盖回）；288 音频回调日志风暴治理（实时线程只原子自增、消费端节流上报、汇总改「THIS recording」） |
+| 回归 | TEST-EXEC-290 root 1284P/0F/15I + src-tauri 85P/0F + Vitest 100P/0F/11S；warnings 110/101/17 |
+| 出包 | `BUILD-290` 八项核验逐项 PASS；产物 `feiyin-ime` 14.38MB `835d402b…` / `feiyin-ime-ui` 10.06MB `0454b288…` / `crash-reporter` 24.88MB `ae914a08…`，时间戳 01:45–01:47 |
+| 探针 | `[LocalRT-DBG-289]`=1；`chunks dropped during THIS recording`=2（288 功能性字面量） |
+| 自验 | 🔴 288 空闲 150s `[ASR-DROP]`=0；日志开关两头验通过（无 -debug 无文件 / 有 -debug 有数据） |
+| 端测 | 待 Gavin 录音验尾字与四条修复效果 |

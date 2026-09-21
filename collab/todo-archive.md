@@ -4726,3 +4726,101 @@ coder-1 已把 `words={}` 加进日志。**新包出来后 Gavin 跑一次 `-deb
 L2「剥服务端句尾标点、整段交本地 CT-Transformer 重打」（PUNCT-GOVERNANCE-030 定源头优先）。
 另一未知风险只能靠端测暴露：语义模式下服务端若憋着批量发中间结果 → overlay 预览变顿。
 
+
+---
+
+## v0.9.3 批次（2026-09-20/21）· 从 todo.md 移入的逐单跟踪
+
+> 2026-09-21 归档：259~290 全部交付出包（BUILD-290），todo.md 超 250 行上限，明细移此。
+
+## 当前状态（2026-09-20）
+
+| 项 | 状态 |
+| --- | --- |
+| 版本 | **v0.9.2 已出包**（`BUILD-232`）。🔄 **v0.9.3 开发中**（本地流式实时模型，DEC-065/066/067），已 commit 至 `cdf256b`。🔴 未 push、未打 tag，等 Gavin 明示 |
+| 端测待办 | ① **v0.9.2 两轴 2×2**（`asr_online_max_sentence_silence` 800/2000 × `asr_online_semantic_punctuation_enabled` false/true）🔴 须手改 `Publish/config.toml:29` 的 800 那一行 + **重启进程**（热重载不含二者）② v0.9.1 四项：overlay 编辑态剥尾标点 ／ Key 输入框 placeholder ／ 繁中 ITN（`三點半→3:30`）／「API 配置」新文案布局 |
+| Worker | ✅ 09-20 新 session 三 Worker 全部就绪（`commandgo/deepseek-v4.1-flash`），coder-1 / coder-2 / tester-1 均已 ACK |
+| 文档 | 09-20 已归档 handoffs 26 条（288 → 7 行）。DEC-064 两层结构；**新增条目必须 archive 与索引两边都写** |
+| 下一步 | v0.9.3 主线：`239-A 阶段二`（coder-1 跑着）→ `239-B` 新管线编排 → `246` 双模型就位检测 → 回归 → `BUILD-244` 出包。**其余待办全部让位主线**，不并行 |
+
+---
+
+## 🔴 待做
+
+### 🔄 v0.9.3 批次二 · Gavin 端测反馈 + accuracy 调优（259~272）
+
+**Gavin 报的 bug**
+
+| # | Gavin 原话 | 单号 | 状态 |
+| --- | --- | --- | --- |
+| B1 | 输出文本出现标点符号重复 | `FIX-252` | ✅ 已修，BUILD-258 已出包 |
+| B2 | 长段语音识别无输出，报「请说话哦」 | `FIX-252` | ✅ 已修，BUILD-258 已出包 |
+| B3 | 流式上屏窗口右侧一大段空白 | `FIX-255` | ✅ 已修，BUILD-258 已出包 |
+| B4 | 流式上屏不显示标点符号 | `LOCALRT-PREVIEW-PUNCT-256` | ✅ 已做（方式②复用 CT-Transformer） |
+| B5 | 标点要等 20 秒才打，延迟太高；要静默 800ms 或满 4 秒就全量重打 | `269` + `269-B` | ✅ 已完成，**待出包** |
+| B6 | accuracy 处理时间过长 | `RESEARCH-ACC-LATENCY-271` | 🔄 取证中 |
+| B7 | 首次按热键先弹波纹动效才显示上屏窗口 | `LOCALRT-FIRSTCHAR-272` | 🔄 取证中（先量首字延迟再调） |
+
+**Gavin 要的优化**
+
+| # | Gavin 原话 | 单号 | 状态 |
+| --- | --- | --- | --- |
+| O1 | 把 accuracy 模型做到最大化调优 | `259`~`262` | ✅ KV 512→1024、`max_new_tokens` 0→256、`system_prompt` 置空 |
+| O2 | 热词上限调到 200（后确认为 120） | `265` + `268` | ✅ 实装 2字75/3字54/4字常用71/生僻33/5字51 |
+| O3 | KV 512 上限能不能改 | `260` + `262` | ✅ 换 `llm_int8_max_token_1024`，20s 段预算 149→691 |
+| O4 | 词条按频率维度筛选，数据库加字段 | `WORDBOOK-HITCOUNT-263` | ✅ `migrations/004` + `hit_count DESC, id DESC` |
+| O5 | 配置界面词库列表按频率排序显示 | `WORDBOOK-UI-SORT-266` | ✅ 删 UI 侧重排，底层排序直通 |
+
+**本批已出包**：`BUILD-267`（23:18，含 O1~O5 的 262/263/265/266）
+**待出包**：`268`（token 预算）+ `269`/`269-B`（标点触发）→ 回归后合并出包，**不出两次**
+
+**🔴 待 Gavin 拍板三件**
+
+| 事项 | 说明 |
+| --- | --- |
+| `.512.bak` 删不删 | 两处共 **1.12 GB**，是 1024 的回滚路径；端测确认 1024 无问题后可删 |
+| `git push` | 已积 `223ffa3`、`277b2fc` 等多个 commit，**一直等 Gavin 明示**，未推 |
+| 版本号 | 仍 0.9.2。本批动了数据库 schema + 模型文件，与上一个 0.9.2 已非同物，是否给新号由 Gavin 定 |
+
+**未验证的交叉场景**
+
+- **本地流式 + 开启翻译**：代码上通（复用同一 `run_pipeline_core`，无 `LocalRealtime` 特判绕过翻译），
+  状态文案也统一为「识别处理中...」，但**从未实际测过**。已列入端测清单。
+
+### 🔄 v0.9.3 批次 · 本地流式实时模型（DEC-065/066/067）逐单跟踪
+
+| 单号 | 内容 | 状态 | 证据 |
+| --- | --- | --- | --- |
+| `POC-LOCAL-STREAM-235` | paraformer 流式四数实测 | ✅ 已验收 | RTF 0.042–0.076／首字 625–652ms／跳动 0-0 |
+| `POC-LOCAL-STREAM-236` | zipformer 热词三组 A/B/C | ✅ 已验收 | 热词 2/5、首字 718–1031ms、beam 破坏前缀单调 ⇒ **否决** |
+| `PIPELINE-ORCH-238` | N5 场景采集 + N9 标点决策提取 | ✅ 已验收 | `842e30c`，回归 1266P/0F |
+| `LOCAL-RT-UI-240` | Ctrl+M 解锁 + 配置双写 + 下载卡片 | ✅ 已验收 | `26f87d4` + 文案修正 `c6828e9` |
+| `TEST-EXEC-241` | 238+240 合并回归 | ✅ 全绿 | `3db8285`，三项与基线逐位吻合 |
+| `WORDBOOK-MINLEN-242` | 候选词补最小字数下限（Gavin 端测报 bug） | ✅ 已修 | `baa5534`，48P/0F |
+| `PIPELINE-ORCH-238-B` | N6 LLM 格式化/翻译提取（159 行） | ✅ 已验收 | `cdb4255`，回归 1267P/0F |
+| `LOCAL-RT-ENGINE-239-A` 阶段一 | `local_stream.rs` + `online_recognizer` 槽位 + VAD 注释 | ✅ 已验收 | `f198f61`，主控 Read 代码核实现有路径零触碰 |
+| `LOCAL-RT-ENGINE-239-A` 阶段二 | 枚举变体 + 双模型构建 + `main.rs:8536` arm + 测试穷举 + 缺失即报错 | 🔄 **进行中** | 前处理跟 **Accuracy**；endpoint rule2 **1.2→2.0**（防复发 ASR-SEG-229）|
+| `LOCAL-RT-ENGINE-239-B` | 新管线独立编排 + Info 加载提示 | ✅ 已交付 09-20 | DEC-066 编排独立 + 附则一浮层单状态 |
+| `WORDBOOK-EDIT-LEARN-243` | 新管线编辑态提交后走词库自学习 | ✅ 随 239-B 交付 09-20 | 主控核实：新管线同样发 `StreamingText` ⇒ `last_streaming_text` 自动填充，编辑态学习**零改动生效**。只需接线时确认事件链通 + 修正 `main.rs:6850` 那条「Local-model pipeline never reaches here」过时注释 |
+| `LOCAL-RT-READY-246` | 🆕 **双模型就位检测**：现有 `check_accuracy_model_ready` 只查 accuracy 一个，新管线要**两个**（paraformer 流式 + accuracy）。未就位时 UI 卡片与运行时都要能正确判断 | ⏸ 未派 | 240 复用了 accuracy 的命令，是临时凑合 |
+| `LOCAL-RT-FALLBACK-247` | **模型缺失直接报错，不降级**（Gavin 2026-09-20 拍板，DEC-067 附则一）：浮层提示「所选模型不可用」，与 accuracy 的静默降级策略**有意不同**；错误文案补三份 locale | ✅ 随 239-B 交付 09-20 | 编排待决第④项**已定策** |
+| `LOCAL-RT-RELOAD-248` | 🆕 **切档热重载**：从别的档切到 local_realtime 要触发双模型加载。`asr_cheap_reload_needed` 的触发键是否含新字段？切档 ~6s 的 Info 提示挂在这条链上 | ✅ 随 239-B 交付 09-20 | 与 239-B 的 Info 提示同源，可合并 |
+| `LOCAL-RT-E2E-CHECKLIST-249` | 端测清单 10 项成文 | ✅ 已交付 | `cdf256b` `collab/e2e-checklist-local-realtime.md` |
+| `MACOS-HANDOFF-250` | 跨端交接 6 项结论 | ✅ 已交付 | `cdf256b` `docs/MACOS-HANDOFF.md` +18 行 |
+| `BUILD-244` | v0.9.3 出包 | ⏸ 未派 | 全部验收 + 回归绿后 |
+
+🔴 **贯穿约束（Gavin 2026-09-20 强调）**：**千万不能改坏现有管线**。
+238/238-B 是零行为变更提取，唯一硬证据是全量回归与基线逐位吻合，每轮必跑。
+
+
+### ✅ v0.9.1 / v0.9.2 两批已出包并销项 → 全文见 `todo-archive.md` 末尾
+
+### 🆕 ASR-DROP-234 · 冒烟日志逐帧 `[ASR-DROP]` WARN（`BUILD-232` 发现，主控定下批修）
+
+| 项 | 内容 |
+| --- | --- |
+| 现象 | 冒烟 stdout 出现 `[ASR-DROP]` WARN 刷屏 |
+| 位置 | `src/audio/mod.rs:492-495` |
+| 定性 | 非本批引入、已按「非本批缺陷不拦出包」放行；**尚未定性是真丢帧还是日志级别用错**，取证先行不动代码 |
+| 影响文件 | `src/audio/mod.rs`（与 v0.9.2 批次零重叠，可独立派发） |
+

@@ -1402,3 +1402,21 @@ FIX-192 | 编辑态右侧空白结构修复：EnterEditMode 重排为先扩窗�
 - **诊断**：`[LocalRT-DBG-289] endpoint confirm: main_len/shadow_len/used`（debug! + `log_enabled!` 守卫）。
 - **验证**：cargo check 0 error、warnings 110/101 = 基线；rustfmt clean；RULE1/2/3 未动；在线档未动。
 - **负责人**：coder-2 ｜ **日期**：2026-09-21
+
+## FIX-ASR-DROP-288（=ASR-DROP-234）· 2026-09-21 · ✅ 音频回调 [ASR-DROP] 日志风暴
+
+- **方案**（协商后采纳「消费端方案」）：回调线程删日志只留 `dropped_chunks.fetch_add(1, Relaxed)`；节流告警（≤1/s）+ 汇总移到消费端主循环——消费端**只在录音期存在**，故天然区分「空闲正常丢弃」（静默计数）与「录音期异常丢弃」（告警），无需 `AtomicBool`。
+- **口径修正**：汇总由「全局累计」（曾把 3.7s 录音报成丢 23s）改为**录音前后快照差值**＝本次真实丢包。
+- **改动**：`audio/mod.rs` 回调 3 处（F32/I16/U16）+ 新增 `report_recording_drops_throttled()` + `collect_recording` 加 `&AtomicU64` 参数（5 处调用点）+ `record_streaming`/`collect_recording` 汇总。
+- **验证**：cargo check 0 error、warnings 110/101；rustfmt clean；`audio::tests` 62/62（含新增 `asr_drop_288_*`）；**实测空闲 15s `[ASR-DROP]`=0 条**（改前数千）。
+- **红线**：丢弃行为/队列容量未动；未新增锁/分配到实时回调；未动版本；零凭证。
+- **负责人**：coder-1 ｜ **日期**：2026-09-21
+
+## BUILD-290 · 2026-09-21 · ✅ 288+289 合并出包（v0.9.2 七包，八项 PASS + 288 空闲零日志实测）
+
+- **构建**：Step1–4；源码 mtime 开工前后一致；产物 main `835d402b…`(14.38MB/01:47:50) / ui `0454b288…` / crash `ae914a08…`，两副本相等、均异于 BUILD-287；版本维持 0.9.2；warnings 110/9/17 = 基线。
+- **回归（clean 树）**：root 1284P/0F/15I + src-tauri 85P/0F + Vitest 100P/0F/11S。
+- **探针**：`[LocalRT-DBG-289]`=1；`chunks dropped during THIS recording`=2（288）；284/276/277/278/283 = 3/1/1/2/1。
+- **288 核心自验**：`-debug` 静置 150s 不录音 → `[ASR-DROP]` **0 条**。
+- **日志开关两头验**：无 -debug → 无 debug.log / DBG 0；有 -debug → 有数据（本地档 `[LocalRT-DBG-284]` 实写）。
+- **负责人**：tester-1 ｜ **日期**：2026-09-21
