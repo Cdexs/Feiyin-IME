@@ -302,18 +302,28 @@ pub fn create_local_stream_recognizer(model_dir: &Path) -> Result<OnlineRecogniz
     OnlineRecognizer::create(&c).context("创建本地流式 (paraformer) recognizer 失败")
 }
 
-/// FIX-LOCALRT-TAILCHAR-291：endpoint 切句时选取最终确认文本。
+/// FIX-LOCALRT-TAILCHAR-291/307：切句 / 收尾确认文本的**三方取最长**（不回退）。
 ///
-/// endpoint 分支会先 `input_finished()` flush 出压在解码器里的尾字，再用 flush 后的结果
-/// 确认本句。但 flush 后可能拿到空串（异常情况），此时**显式回落** flush 前文本，绝不让
-/// 整句消失；若 flush 后反而更短，同样取更长的 flush 前版本，保证确认文本相对 flush 前
-/// **不回退**（greedy 下 flush 后应恒 ≥ flush 前，此处只做防御）。
-fn endpoint_confirm_text<'a>(before: &'a str, after: &'a str) -> &'a str {
-    if after.chars().count() >= before.chars().count() {
-        after
-    } else {
-        before
+/// 291 的「flush 前/后取长者」语义扩为三方（**不新造一套**）：
+/// - `main`：主 stream flush 后结果（调用方已做「after 空/更短则回落 before」再传进来）
+/// - `full`：**307 整句全量重解码**结果（另起 stream 重喂整句，能补出分块末尾解不出的尾字）
+/// - `shadow`：400ms 影子快照（可空），仅作补充候选
+///
+/// 返回字符数**严格更多**者；等长不切换（优先级 main → full → shadow）⇒ 结果长度恒 ≥ `main`，
+/// **绝不回退**且同长输入不抖动。全空返回空串（调用方据此走 EMPTY 分支）。
+fn endpoint_confirm_text<'a>(main: &'a str, full: &'a str, shadow: Option<&'a str>) -> &'a str {
+    let mut best = main;
+    let mut best_len = main.chars().count();
+    if full.chars().count() > best_len {
+        best = full;
+        best_len = full.chars().count();
     }
+    if let Some(sh) = shadow {
+        if sh.chars().count() > best_len {
+            best = sh;
+        }
+    }
+    best
 }
 
 /// 本地真流式转录（边收音频边解码），与 `transcribe_streaming_realtime` 平行。
@@ -513,17 +523,41 @@ pub fn transcribe_streaming_local(
                 );
             }
             // 🔴 显式回落：flush 后为空 / 更短则用 flush 前，绝不让整句消失或回退。
-            let flush_text = endpoint_confirm_text(&before_text, &after_text);
-            // FIX-SHADOW-DISPLAY-289：影子仍参与「取更完整者」（修好后预期恒为 main，保留不删，
-            // 删减留待下一单评估）。影子只服务「停顿中提前显示」，与本次 flush 无关。
-            let use_shadow = shadow_current
-                .as_ref()
-                .is_some_and(|sh| sh.chars().count() > flush_text.chars().count());
-            let confirm_text: &str = if use_shadow {
-                shadow_current.as_deref().unwrap_or(flush_text)
+            let flush_text: &str = if after_text.chars().count() >= before_text.chars().count() {
+                &after_text
             } else {
-                flush_text
+                &before_text
             };
+            // FIX-LOCALRT-TAILCHAR-307：整句全量重解码。291 的 `[LocalRT-DBG-291] … gained`
+            // 实测**恒 0** ⇒ 流式分块编码下，末尾不足一块的音频靠 `input_finished()` 信号补不出；
+            // 真正能补出尾字的是**另起全新 stream 重喂整句重解码**（分块边界不同）。
+            // 🔴 不设时长上限：句子最长受 rule3=20s 约束（20s 解码约 700ms，且已在静默 2s 之后，
+            // 用户基本无感），且只影响预览（最终文本走 accuracy 2pass）；SHADOW_MAX_AUDIO_SECS
+            // 是给 400ms 影子用的，**不适用于此处**。
+            let t_full = log::log_enabled!(log::Level::Debug).then(Instant::now);
+            let full = recognizer.create_stream();
+            full.accept_waveform(SAMPLE_RATE, &pcm[sentence_pcm_start..]);
+            full.input_finished();
+            while recognizer.is_ready(&full) {
+                recognizer.decode(&full);
+            }
+            let full_text = recognizer
+                .get_result(&full)
+                .map(|r| r.text)
+                .unwrap_or_default();
+            if log::log_enabled!(log::Level::Debug) {
+                log::debug!(
+                    "[LocalRT-DBG-307] endpoint full-decode: main_len={} full_len={} gained={} decode={:.1}ms",
+                    flush_text.chars().count(),
+                    full_text.chars().count(),
+                    full_text.chars().count() as i64 - flush_text.chars().count() as i64,
+                    t_full.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0)
+                );
+            }
+            // FIX-LOCALRT-TAILCHAR-291/307：三方取最长（main=flush / full=全量重解码 / shadow）。
+            // 307 后预期 full 多数时候最长 ⇒ 尾字不再等下一句。影子保留（服务「停顿中提前显示」）。
+            let confirm_text: &str =
+                endpoint_confirm_text(flush_text, &full_text, shadow_current.as_deref());
             if !confirm_text.is_empty() {
                 // LOCALRT-FIRSTCHAR-272：首次拿到非空识别文本（首次推理产出）。
                 if !first_result_seen {
@@ -537,14 +571,26 @@ pub fn transcribe_streaming_local(
                 }
                 // URGENT-286：诊断块仅在 Debug 级启用时执行 ⇒ 默认 Warn 下零开销。
                 if log::log_enabled!(log::Level::Debug) {
+                    // 307：used 扩为 main / full / shadow 三源（按指针判定胜出者）。
+                    let used = if std::ptr::eq(confirm_text, full_text.as_str()) {
+                        "full"
+                    } else if shadow_current
+                        .as_deref()
+                        .is_some_and(|s| std::ptr::eq(confirm_text, s))
+                    {
+                        "shadow"
+                    } else {
+                        "main"
+                    };
                     log::debug!(
-                        "[LocalRT-DBG-289] endpoint confirm: main_len={} shadow_len={} used={}",
+                        "[LocalRT-DBG-289] endpoint confirm: main_len={} full_len={} shadow_len={} used={}",
                         flush_text.chars().count(),
+                        full_text.chars().count(),
                         shadow_current
                             .as_ref()
                             .map(|s| s.chars().count())
                             .unwrap_or(0),
-                        if use_shadow { "shadow" } else { "main" }
+                        used
                     );
                     if confirm_text != last_result_text {
                         log::debug!(
@@ -780,27 +826,60 @@ pub fn transcribe_streaming_local(
     while recognizer.is_ready(&stream) {
         recognizer.decode(&stream);
     }
+    let main_final = recognizer
+        .get_result(&stream)
+        .map(|r| r.text)
+        .unwrap_or_default();
+    // FIX-LOCALRT-TAILCHAR-307（Gavin 第二症状：录音最后一个字不显示）：收尾段与 endpoint
+    // 是**同一失效机制**（291 的 `gained` 恒 0）⇒ 同样对**最后一句**做整句全量重解码，
+    // 与收尾 flush 结果取更长者。
+    let t_full = log::log_enabled!(log::Level::Debug).then(Instant::now);
+    let full = recognizer.create_stream();
+    full.accept_waveform(SAMPLE_RATE, &pcm[sentence_pcm_start..]);
+    full.input_finished();
+    while recognizer.is_ready(&full) {
+        recognizer.decode(&full);
+    }
+    let full_final = recognizer
+        .get_result(&full)
+        .map(|r| r.text)
+        .unwrap_or_default();
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "[LocalRT-DBG-307] final full-decode: main_len={} full_len={} gained={} decode={:.1}ms",
+            main_final.chars().count(),
+            full_final.chars().count(),
+            full_final.chars().count() as i64 - main_final.chars().count() as i64,
+            t_full
+                .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0)
+        );
+    }
+    // 取更长者（与 endpoint 同一「不回退」语义）；全空则跳过（沿用原行为）。
+    let final_seg = if full_final.chars().count() > main_final.chars().count() {
+        full_final
+    } else {
+        main_final
+    };
     // LOCALRT-FIRSTCHAR-282：最终（含标点）预览全文；供调用方以 `StreamingFinalPreview` 收尾显示。
     // （239-B 丢弃本预览文本、以 pcm 走 accuracy 2pass；此返回值只服务于收尾显示。）
     let mut final_preview = last_display.clone();
-    if let Some(r) = recognizer.get_result(&stream) {
-        if !r.text.is_empty() {
-            state.on_result(sentence_id, &r.text, false, &[]);
-            // 收尾强制打点一次，保证关闭前的预览带标点。
-            let raw_full = state.display_text();
-            let display = preview_display(
-                &raw_full,
-                punctuation_engine.as_deref_mut(),
-                &mut punct_cache,
-                PUNCT_REFRESH_INTERVAL,
-                true,
-            );
-            if !display.is_empty() {
-                if display != last_display {
-                    on_result(&display, &state.display_words());
-                }
-                final_preview = display;
+    if !final_seg.is_empty() {
+        state.on_result(sentence_id, &final_seg, false, &[]);
+        // 收尾强制打点一次，保证关闭前的预览带标点。
+        let raw_full = state.display_text();
+        let display = preview_display(
+            &raw_full,
+            punctuation_engine.as_deref_mut(),
+            &mut punct_cache,
+            PUNCT_REFRESH_INTERVAL,
+            true,
+        );
+        if !display.is_empty() {
+            if display != last_display {
+                on_result(&display, &state.display_words());
             }
+            final_preview = display;
         }
     }
 
@@ -811,43 +890,51 @@ pub fn transcribe_streaming_local(
 mod tests {
     use super::{endpoint_confirm_text, should_dispatch_acc, should_dispatch_tail, SAMPLE_RATE};
 
-    /// FIX-LOCALRT-TAILCHAR-291：endpoint flush 后确认文本不得回退。
+    /// FIX-LOCALRT-TAILCHAR-291/307：三方取最长（main / full / shadow），结果恒 ≥ main。
     ///
-    /// 覆盖四条路径：flush 多出尾字（正常）、flush 为空（回落）、两边都空（调用方走 EMPTY
-    /// 分支不确认）、flush 反而更短（防御性取更长的 flush 前版本）。
+    /// 覆盖：full 更长取 full（307 主路径）；full 为空/更短回落 main；shadow 更长取 shadow；
+    /// 三者等长不抖动（取 main）；全空返回空（调用方走 EMPTY 分支）。
     #[test]
-    fn endpoint_confirm_text_never_regresses() {
-        // 正常：flush 后多出尾字 ⇒ 取 flush 后。
+    fn endpoint_confirm_text_takes_longest_of_three() {
+        // full 更长（307 主路径：整句全量重解码补出尾字）。
         assert_eq!(
-            endpoint_confirm_text("看看有什么好看的电", "看看有什么好看的电影"),
+            endpoint_confirm_text("看看有什么好看的电", "看看有什么好看的电影", None),
             "看看有什么好看的电影"
         );
-        // flush 后为空 ⇒ 回落 flush 前，句子不消失。
-        assert_eq!(endpoint_confirm_text("端测发现的问", ""), "端测发现的问");
-        // 两边都空 ⇒ 空（调用方据此走 EMPTY 分支，不做确认）。
-        assert_eq!(endpoint_confirm_text("", ""), "");
-        // 异常：flush 后更短 ⇒ 取更长的 flush 前，绝不回退。
-        assert_eq!(endpoint_confirm_text("你好世界", "你好"), "你好世界");
-        // 等长 ⇒ 取 flush 后（优先使用最新解码结果，不改变内容长度）。
-        assert_eq!(endpoint_confirm_text("你好", "您好"), "您好");
+        // full 为空 ⇒ 回落 main，句子不消失。
+        assert_eq!(
+            endpoint_confirm_text("端测发现的问", "", None),
+            "端测发现的问"
+        );
+        // full 更短 ⇒ 回落 main（绝不回退）。
+        assert_eq!(endpoint_confirm_text("你好世界", "你好", None), "你好世界");
+        // shadow 更长 ⇒ 取 shadow。
+        assert_eq!(
+            endpoint_confirm_text("看看有什么好看的电", "", Some("看看有什么好看的电影")),
+            "看看有什么好看的电影"
+        );
+        // 三者等长 ⇒ 取 main（不抖动；main 与 full 等长时不被 full 顶掉）。
+        assert_eq!(endpoint_confirm_text("你好", "您好", Some("您好")), "你好");
+        // 全空 ⇒ 空（调用方据此走 EMPTY 分支，不做确认）。
+        assert_eq!(endpoint_confirm_text("", "", None), "");
     }
 
-    /// 判据 #4 的不变量：选定文本长度恒 ≥ flush 前长度（按字符计）。
+    /// 判据 #4 的不变量：三方取最长后，长度恒 ≥ main（按字符计）。
     #[test]
-    fn endpoint_confirm_text_len_not_below_before() {
-        let cases = [
-            ("", ""),
-            ("", "尾"),
-            ("端测发现的问", ""),
-            ("端测发现的问", "端测发现的问题"),
-            ("长一点的前文", "短"),
-            ("ab", "abcd"),
+    fn endpoint_confirm_text_len_not_below_main() {
+        let cases: [(&str, &str, Option<&str>); 6] = [
+            ("", "", None),
+            ("", "尾", None),
+            ("端测发现的问", "", None),
+            ("端测发现的问", "端测发现的问题", None),
+            ("长一点的前文", "短", Some("更短")),
+            ("ab", "abcd", Some("abc")),
         ];
-        for (before, after) in cases {
-            let chosen = endpoint_confirm_text(before, after);
+        for (main, full, shadow) in cases {
+            let chosen = endpoint_confirm_text(main, full, shadow);
             assert!(
-                chosen.chars().count() >= before.chars().count(),
-                "before={before:?} after={after:?} chosen={chosen:?}"
+                chosen.chars().count() >= main.chars().count(),
+                "main={main:?} full={full:?} shadow={shadow:?} chosen={chosen:?}"
             );
         }
     }
@@ -862,7 +949,7 @@ mod tests {
     // 钉死的四条不变式（I1~I4 见 291 handoff）：
     //   I1 endpoint 分支 `stream.input_finished()` 必须早于「取 after_text 的 get_result」
     //   I2 endpoint 分支不得再出现 `recognizer.reset(`
-    //   I3 endpoint 分支必须用 `recognizer.create_stream()` 换新流
+    //   I3 endpoint 分支必须用 `recognizer.create_stream()` 换新流（307 后为 2 处：全量重解码 + 换流）
     //   I4 本句 `state.on_result(..., true, ...)` 只确认一次
     // ========================================================================
 
@@ -1015,16 +1102,18 @@ mod tests {
         );
     }
 
-    /// G3（I3）：endpoint 分支内 `recognizer.create_stream()` 恰 1 处（本句结束换新流）。
+    /// G3（I3，307 后修订）：endpoint 分支内 `recognizer.create_stream()` 恰 **2** 处 ——
+    /// ① 307 整句全量重解码（另起 stream 重喂整句，补分块末尾尾字）
+    /// ② 291 句末换新流（`input_finished()` 后旧流不可复用）。
     ///
-    /// **改错怎么红**：删掉换流 ⇒ 计数 0 ⇒ 红；在分支内重复建流 ⇒ 计数 2 ⇒ 红。
+    /// **改错怎么红**：删任一（全量重解码 / 换流）⇒ 计数 1 ⇒ 红；分支内再多建流 ⇒ 3 ⇒ 红。
     #[test]
     fn guard291_g3_endpoint_creates_new_stream_once() {
         let (lines, (lo, hi), _) = endpoint_guard_regions();
         let n = count_contains(&lines, lo, hi, "recognizer.create_stream()");
         assert_eq!(
-            n, 1,
-            "G3: endpoint 分支内必须换新流恰 1 次（recognizer.create_stream()），实测 {n}"
+            n, 2,
+            "G3: endpoint 分支内应有 2 处 create_stream（307 全量重解码 + 291 句末换流），实测 {n}"
         );
     }
 
