@@ -162,6 +162,10 @@ struct Protect {
     /// 规则性语法族，本表只承载「抑制后缀」这一规则参数，不逐条枚举 N 年级 M 班。
     #[serde(default)]
     serial_suffixes: ProtectList,
+    /// ITN-SHIFEN-323：「十分/万分/百般/万般」程度副词组。
+    /// **右邻条件在 `check_protection` 里**（非本表）：命中该词且右邻不构成数字读法 ⇒ 保护。
+    #[serde(default)]
+    degree_adverbs: ProtectList,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -236,6 +240,8 @@ struct CompiledRules {
     /// ITN-FIX-GRADECLASS-016: 紧跟 2 位逐位串时抑制合并的后缀集合
     /// （年级班级简写等语法族，如「班」）
     serial_suffix_set: HashSet<String>,
+    /// ITN-SHIFEN-323：程度副词组（十分/万分/百般/万般）；右邻条件在 `check_protection`。
+    degree_adverb_set: HashSet<String>,
 }
 
 /// V091-ITN-HANT-SYSTEMIC-221-FIX (DEADRULE)：规则表 key 的**加载期归一**。
@@ -390,6 +396,7 @@ impl CompiledRules {
         let classifier_set = rep.set(&r.protect.classifiers.words);
         let historical_set = rep.set(&r.protect.historical.words);
         let serial_suffix_set = rep.set(&r.protect.serial_suffixes.words);
+        let degree_adverb_set = rep.set(&r.protect.degree_adverbs.words);
 
         // 单位前缀碰撞保护词：按**归一后**首字分桶（桶内按字符数降序 = 最长匹配优先）
         let unit_collision_map = {
@@ -479,6 +486,7 @@ impl CompiledRules {
             unit_hierarchy,
             decimalizable_units,
             serial_suffix_set,
+            degree_adverb_set,
         };
         rep.finish_and_log();
         compiled
@@ -486,6 +494,16 @@ impl CompiledRules {
 
     fn is_unit(&self, s: &str) -> bool {
         self.all_units.iter().any(|u| s.starts_with(u))
+    }
+
+    /// ITN-SHIFEN-323：「十分」消歧专用 —— `s` 是否以**多字（≥2 字）单位**起首。
+    ///
+    /// 为什么不能直接用 `is_unit`：`分` 本身是 currency 单字单位 ⇒ `is_unit("分满意")`
+    /// 会为 true，把「十分满意」误判成数词读法。故此处要求单位长度 ≥2（分钟/分贝…）。
+    fn is_unit_multichar(&self, s: &str) -> bool {
+        self.all_units
+            .iter()
+            .any(|u| u.chars().count() >= 2 && s.starts_with(u.as_str()))
     }
 
     /// ITN-V2-003 (甲型守卫)：判定是否「真单位」（在 all_units 但不在 classifiers）。
@@ -2785,6 +2803,39 @@ fn check_protection(chars: &[char], start: usize, r: &CompiledRules) -> Option<u
         return Some(skip);
     }
 
+    // ITN-SHIFEN-323：「十分/万分/百般/万般」右邻消歧（程度副词 vs 数词读法）。
+    //
+    // 背景：裸词入保护表会被**前缀匹配**吃掉更长词（十分钟/十分之一），故本条是**带右邻条件
+    // 的保护**，词放 toml（protect.degree_adverbs）、条件写在此处（遵守 DEC-038：词表不承载语法族）。
+    //
+    // 🔴 三条「数词读法」判据，**各自判在哪个串上已写死**（勿混，主控曾在此拦截过一版）：
+    //   ① 判在【词尾】：`chars[start+1..]`（"分/般"起）以 **≥2 字单位**起首 → 分钟/分贝
+    //   ② 判在【整词右邻】：`chars[start+skip..]` 以单位起首 → 十分米（米∈length）
+    //   ③ 判在【整词右邻】：`chars[start+skip..]` 以「之」起首 → 十分之一（分数通道紧随其后）
+    //
+    // 三者任一成立 ⇒ 不保护，落回数字/分数路径；否则保护（保持汉字）。
+    //
+    // 🔴 句末裸「十分」取向：**保持汉字**。依据：句末「十分」作程度副词本就不成句
+    // （「这个人十分。」不通），本应判数词（他考了十分→10分）；但本次报障是**过度转换**，
+    // 且「十分」表程度是高频义项 ⇒ 保守方向优先，**知情地把这句留成汉字**，非漏判。
+    // 若端测反馈「考了十分」需转数字，再单独评估（改动仅在本块条件）。
+    let matched_degree = r
+        .degree_adverb_set
+        .iter()
+        .filter(|w| rest.starts_with(w.as_str()))
+        .map(|w| w.chars().count())
+        .max();
+    if let Some(skip) = matched_degree {
+        let tail: String = chars[start + 1..].iter().collect(); // ① 词尾（第二字起）
+        let after_word: String = chars[start + skip..].iter().collect(); // ②③ 整词右邻
+        let number_reading = r.is_unit_multichar(&tail)       // ①
+            || r.is_unit(&after_word)                          // ②
+            || after_word.starts_with('之'); // ③
+        if !number_reading {
+            return Some(skip);
+        }
+    }
+
     // ITN-COLLISION-TYPEA-002: 单位前缀碰撞保护（机器派生词表，优先级低于上方人工分组）
     if let Some(bucket) = r.unit_collision_map.get(&chars[start]) {
         let remaining = chars.len() - start;
@@ -3007,6 +3058,42 @@ mod tests {
     #[test]
     fn fraction_one_third() {
         assert_eq!(normalize_test("三分之一"), "1/3");
+    }
+
+    // ============================================================
+    // ITN-SHIFEN-323：「十分/万分/百般/万般」右邻消歧
+    // ============================================================
+
+    /// 程度副词（右邻为形容词/动词/副词/「的」）⇒ 保持汉字。
+    #[test]
+    fn itn_shifen_323_degree_adverb_kept() {
+        assert_eq!(normalize_test("十分的重要"), "十分的重要"); // Gavin 原始报障
+        assert_eq!(normalize_test("十分重要"), "十分重要");
+        assert_eq!(normalize_test("十分满意"), "十分满意");
+        assert_eq!(normalize_test("万分感谢"), "万分感谢");
+        assert_eq!(normalize_test("百般刁难"), "百般刁难");
+        assert_eq!(normalize_test("万般无奈"), "万般无奈");
+    }
+
+    /// 🔴 回归闸门（任务 §5-3/4/5）：数词读法逐条不变。
+    #[test]
+    fn itn_shifen_323_number_reading_preserved() {
+        // ① 词尾接 ≥2 字单位
+        assert_eq!(normalize_test("十分钟"), "10分钟");
+        assert_eq!(normalize_test("十分贝"), "10分贝");
+        // ② 整词右邻本身是单位
+        assert_eq!(normalize_test("十分米"), "10分米");
+        // ③ 整词右邻「之」⇒ 落回分数/逐字通道（**现行行为不变**）
+        assert_eq!(normalize_test("十分之一"), "1/10");
+        // 「万」单独作分母 `parse_cn_number` 不成立 ⇒ 现行即保持汉字（非本次回归；照实锁住）
+        assert_eq!(normalize_test("万分之一"), "万分之一");
+    }
+
+    /// 句末裸「十分」：取向 = **保持汉字**（保守；依据见 check_protection 的知情权衡注释）。
+    #[test]
+    fn itn_shifen_323_bare_trailing_kept_by_choice() {
+        assert_eq!(normalize_test("他考了十分"), "他考了十分");
+        assert_eq!(normalize_test("他考了十分。"), "他考了十分。");
     }
 
     // ============================================================
