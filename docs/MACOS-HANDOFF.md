@@ -1955,3 +1955,11 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 
 ⚠️ 已知代价（Gavin 已看过实际显示并明确要求删除）：被删块里「流式预览模型 228MB」那一行的检测原本是**准的**
 （`online_ready` 查的是真实在用的 streaming paraformer 目录）；整块删除后，**用户若真缺该模型，界面不再有任何提示**。
+
+## AUTOLEARN-EDIT-SNAPSHOT-331（2026-09-21，coder-2）· 编辑入口快照学习基准 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| `OverlayWindowState` 新增 `edit_original`（EnterEditMode 时存「屏幕上那份文本」）；`OverlayUiEvent::SubmitRequested` 增第 3 参携带；controller 用纯函数 `select_learning_baseline(is_local_realtime_tier, overlay_original, mirror)` 选基准 | ⚠️ **行为变更，平台中立**：字段/事件/纯函数均无 `#[cfg]`；**本地实时档**用快照、**在线/批处理恒 mirror**（逐位不变） |
+| gap 收口：停止后迟到包推进镜像但自学习基准改为编辑入口快照 | ✅ 平台中立逻辑；macOS 若将来接入本地实时档可直接复用 |
+| macOS 侧需要做什么 | ✅ **无需代码改动**；未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未触 `src/platform/**` |

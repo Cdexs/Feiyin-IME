@@ -9,11 +9,19 @@ use std::sync::OnceLock;
 pub use cache::{WordbookCache, WordbookEntry, WordbookStats};
 
 /// WORDBOOK-053-C: Maximum character count for a valid wordbook candidate.
-/// Rationale: Chinese idioms/proper nouns are typically <=10 chars; English phrases
-/// like "Claude Code" are <=12 chars. 30 chars leaves ample headroom for legitimate
-/// short phrases while rejecting full sentences (which are usually 40+ chars).
-/// "维生素B12" (6 chars), "飞音输入法" (5 chars), "Claude Code" (11 chars) all pass.
-const MAX_CANDIDATE_CHARS: usize = 30;
+///
+/// 🔴 **30 → 12（Gavin 2026-09-21 拍板）。** 原值 30 是按「拒绝整句（通常 40+ 字）」设的下限思路，
+/// 但**挡不住短语**：无句末标点、无虚词的 25 字跨度今天能原样进用户词库。
+/// 而候选来自 `extract_correction_word` 的字符级 diff —— ASR 尾部听错时公共后缀为空，
+/// 跨度会一路吞到句尾（AUTOLEARN-CANDIDATE-327 的成因），**短语进候选表是真实发生的路径**。
+///
+/// 12 的依据是实际词条形态，不是拍的：中文专名/成语一般 ≤10 字（「飞音输入法」5、
+/// 「五代十国」4、「维生素B12」6），最长的现实参照是英文短语 "Claude Code" = **11 字**。
+/// 取 12 = 覆盖已知最长正例 + 1 字余量。
+///
+/// 🔴 词库是**用户可见资产且参与 ASR 热词偏置**，脏词条进去会长期起作用 ⇒ 宁可少收。
+/// 再放宽前先回答：放进来的多出那几字，是真词条，还是没被 327 收窄干净的短语残留？
+const MAX_CANDIDATE_CHARS: usize = 12;
 
 /// WORDBOOK-MINLEN-242: 候选词最小字符数。单字候选对热词偏置无实效但持续制造噪声，
 /// 一律拒绝。2 是下限而非经验值——中文专名最短即 2 字（飞音/玄戒），
@@ -368,6 +376,8 @@ pub struct WordEntry {
 #[cfg(test)]
 mod tests {
     use super::extract_correction_word;
+    // 上限收窄护栏用：边界断言绑定常量而非字面量，改了常量断言自动跟随。
+    use super::MAX_CANDIDATE_CHARS;
 
     #[test]
     fn test_extract_correction_word_uses_changed_middle_segment() {
@@ -573,9 +583,44 @@ mod tests {
 
     #[test]
     fn test_is_valid_candidate_rejects_too_long() {
-        // Exceeds MAX_CANDIDATE_CHARS=30 (31 chars)
+        // 整句：远超上限，任何取值下都必须拒
         let long = "一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十一";
         assert!(is_valid_candidate(long).is_err());
+        // 🔴 边界断言**绑定常量**，不写死字面量：改了 MAX_CANDIDATE_CHARS 这两条自动跟随，
+        //    不会像原注释那样留下「Exceeds MAX_CANDIDATE_CHARS=30」这种与代码脱节的说明。
+        let at_cap: String = "字".repeat(MAX_CANDIDATE_CHARS);
+        assert!(
+            is_valid_candidate(&at_cap).is_ok(),
+            "恰好等于上限必须放行（{} 字）",
+            MAX_CANDIDATE_CHARS
+        );
+        let over_cap: String = "字".repeat(MAX_CANDIDATE_CHARS + 1);
+        assert!(
+            is_valid_candidate(&over_cap).is_err(),
+            "超出上限 1 字必须拒（{} 字）",
+            MAX_CANDIDATE_CHARS + 1
+        );
+    }
+
+    /// 🔴 上限收窄护栏（30→12，Gavin 2026-09-21）：已知最长的**真实正例**必须仍能入库。
+    /// 这条是防「日后有人为挡短语继续往下收」—— 收到 10 以下就会伤到真词条。
+    #[test]
+    fn test_is_valid_candidate_longest_real_world_positives_still_pass() {
+        assert!(is_valid_candidate("Claude Code").is_ok(), "11 字英文短语");
+        assert!(is_valid_candidate("维生素B12").is_ok(), "6 字含数字专名");
+        assert!(is_valid_candidate("飞音输入法").is_ok(), "5 字产品名");
+        // 反向：短语必须被挡住。取 Gavin 端测原句去掉问号 = 13 字，
+        // 无句末标点、无编号、非整句长度 —— **上限 30 时它能原样进词库**，正是本次收窄的目标。
+        let phrase = "这是一条来自指导灵的信息吗";
+        assert_eq!(
+            phrase.chars().count(),
+            13,
+            "样例长度须 > 上限 12，否则本断言失去意义"
+        );
+        assert!(
+            is_valid_candidate(phrase).is_err(),
+            "13 字短语不得入库；此断言变红 = 上限又被放宽了"
+        );
     }
 
     #[test]

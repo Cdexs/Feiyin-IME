@@ -214,7 +214,9 @@ enum OverlayUiEvent {
     /// ASR 侧接收后：关 WebSocket → 丢弃 StreamingAsrState → 置 pipeline_cancelled=true
     EditRequested,
     /// ASR-038-C: 用户完成编辑，提交 EDIT 控件内容 + 原始目标窗口句柄回主控
-    SubmitRequested(String, platform::WindowId),
+    /// AUTOLEARN-EDIT-SNAPSHOT-331: 第 3 参 = **编辑入口快照**（用户开始编辑时屏幕上那份文本，
+    /// 与 EDIT 初值/渲染字段同源）——仅本地实时档用作自学习基准，天然免疫迟到包/渲染门/时序。
+    SubmitRequested(String, platform::WindowId, Option<String>),
 }
 #[derive(Debug, Clone)]
 #[cfg(target_os = "windows")]
@@ -1068,6 +1070,7 @@ unsafe extern "system" fn edit_subclass_wnd_proc(
                                             state.event_tx.send(OverlayUiEvent::SubmitRequested(
                                                 text,
                                                 request.target_hwnd,
+                                                state.edit_original.clone(),
                                             ));
                                     }
                                 }
@@ -1401,6 +1404,9 @@ struct OverlayWindowState {
     target_size: [i32; 2],
     /// OVERLAY-043: last displayed streaming text to avoid repaint on unchanged content
     last_streaming_text: Option<String>,
+    /// AUTOLEARN-EDIT-SNAPSHOT-331: 进入编辑态当刻「屏幕上那份文本」的快照（EnterEditMode 时
+    /// 由与 EDIT 初值**同一变量**写入）。SubmitRequested 带回主控作自学习基准；Recording 清空。
+    edit_original: Option<String>,
     /// OVERLAY-051-F/G: cached ClearType font so we don't create/destroy HFONT every frame.
     cached_font: Option<HFONT>,
     /// STREAMFONT-189: 流式两态（RecordingStreamingIdle 占位 / RecordingWithText）自绘
@@ -1594,6 +1600,7 @@ fn run_overlay_thread(
         current_size: RECORDING_OVERLAY_SIZE,
         target_size: RECORDING_OVERLAY_SIZE,
         last_streaming_text: None,
+        edit_original: None,
         cached_font: None,
         streaming_font: None,
         displayed_chars: 0,
@@ -1782,6 +1789,8 @@ fn run_overlay_thread(
                             // Only clear it on a fresh Recording session.
                             if matches!(request.status, OverlayStatus::Recording) {
                                 state.last_streaming_text = None;
+                                // 331：快照 per-gen 清理（新录音不得带入上一代）。
+                                state.edit_original = None;
                                 // OVERLAY-051-G-FIN: reset typewriter cursor + timestamp-driven
                                 // state on a fresh recording session.
                                 state.displayed_chars = 0;
@@ -1943,6 +1952,9 @@ fn run_overlay_thread(
                             })
                             .or_else(|| state.last_streaming_text.clone())
                             .unwrap_or_default();
+                        // AUTOLEARN-EDIT-SNAPSHOT-331：把「用户开始编辑时屏幕上那份文本」快照下来
+                        // （与下方 EDIT 初值**同一变量**），SubmitRequested 带回主控作学习基准。
+                        state.edit_original = Some(text.clone());
                         // OVERLAY-051-G-FIN: when entering edit mode, stop tweening and use full text.
                         state.displayed_chars = text.chars().count();
                         state.tween_target_chars = state.displayed_chars;
@@ -2395,6 +2407,7 @@ unsafe extern "system" fn overlay_wnd_proc(
                                     let _ = state.event_tx.send(OverlayUiEvent::SubmitRequested(
                                         text,
                                         request.target_hwnd,
+                                        state.edit_original.clone(),
                                     ));
                                 }
                             }
@@ -2442,9 +2455,12 @@ unsafe extern "system" fn overlay_wnd_proc(
                             {
                                 if let Some(edit_hwnd) = state.edit_hwnd {
                                     if let Ok(text) = get_window_text(edit_hwnd) {
-                                        let _ = state.event_tx.send(
-                                            OverlayUiEvent::SubmitRequested(text, target_hwnd),
-                                        );
+                                        let _ =
+                                            state.event_tx.send(OverlayUiEvent::SubmitRequested(
+                                                text,
+                                                target_hwnd,
+                                                state.edit_original.clone(),
+                                            ));
                                     }
                                 }
                             }
@@ -7142,15 +7158,22 @@ fn process_controller_events(
                 // 通知 overlay 线程切换到 StreamingEditing 态并创建 EDIT 控件
                 overlay_handle.send(OverlayCommand::EnterEditMode);
             }
-            OverlayUiEvent::SubmitRequested(text, target_hwnd) => {
+            OverlayUiEvent::SubmitRequested(text, target_hwnd, overlay_original) => {
                 OVERLAY_EDITING.store(false, Ordering::Release);
                 STREAMING_STOPPED.store(true, Ordering::Release);
                 // WORDBOOK-053-B: learn the explicit user correction (original ASR text vs submitted
-                // edited text) in a detached thread. `last_streaming_text` is populated by
-                // `StreamingText` events — produced by the online streaming path AND by
-                // LOCAL-RT-ENGINE-239-B 本地 realtime 新管线（本地流式预览同发 StreamingText）。
-                // 本地 performance/accuracy 批处理路径不发 StreamingText，故其编辑提交不触发本学习。
-                let original_text = last_streaming_text.lock().ok().and_then(|m| m.clone());
+                // edited text) in a detached thread.
+                // 331：基准来源按**档位**选择（不是「回灌是否活跃」——零回灌短录音同样有 gap）：
+                //   本地实时档 ⇒ 编辑入口快照 `overlay_original`（与所见/EDIT 初值同源），缺失回落镜像；
+                //   在线 / 批处理档 ⇒ 恒 `mirror`（逐位不变）。
+                let is_local_realtime_tier = {
+                    let cfg = clone_runtime_config(&runtime_config);
+                    transcription::AsrModel::from_config(&cfg.audio.asr_model)
+                        == transcription::AsrModel::LocalRealtime
+                };
+                let mirror = last_streaming_text.lock().ok().and_then(|m| m.clone());
+                let original_text =
+                    select_learning_baseline(is_local_realtime_tier, overlay_original, mirror);
                 if let Some(original) = original_text {
                     let runtime_config = Arc::clone(runtime_config);
                     let edited = text.clone();
@@ -9408,6 +9431,28 @@ fn compose_with_acc_for_gen(
     }
 }
 
+/// AUTOLEARN-EDIT-SNAPSHOT-331：自学习比对基准的选择（纯函数）。
+///
+/// - **本地实时档** ⇒ 用「编辑入口快照」`overlay_original`（用户开始编辑时屏幕上那份；
+///   与 EDIT 初值/渲染字段同源），缺失才回落 `mirror`；
+/// - **在线 / 批处理档** ⇒ **恒用 `mirror`**（逐位不变，守住红线）。
+///
+/// 🔴 闸门是**档位**（`is_local_realtime_tier`），**不是**「回灌是否活跃」：
+/// gap 的成因是「迟到包推进镜像 + 043 门抑制渲染」，**零回灌（一片未派）时同样发生**，
+/// 用回灌状态当闸门会漏掉短录音这一常见场景。快照本就只在 EnterEditMode 产生，
+/// 「有快照就用」天然对齐语义。
+fn select_learning_baseline(
+    is_local_realtime_tier: bool,
+    overlay_original: Option<String>,
+    mirror: Option<String>,
+) -> Option<String> {
+    if is_local_realtime_tier {
+        overlay_original.or(mirror)
+    } else {
+        mirror
+    }
+}
+
 /// ACC-PREVIEW-REFLOW-325：回灌决策（纯函数，消费端 controller 线程调用）。
 ///
 /// 优先级（高 → 低）：
@@ -9613,19 +9658,89 @@ mod reflow_persist_329_tests {
         );
     }
 
-    /// 残留 gap（053-B 既定契约「渲染抑制 ≠ 数据抑制」，本单不处理，仅钉住现状）：
-    /// 停止后迟到包仍写镜像（更完整），但 043 门闩抑制渲染 ⇒ 镜像可**领先于**最后所见。
-    /// 触发条件：Stop→StreamingFinalPreview 的亚秒窗口内用户进编辑且**零修改提交**；
-    /// 且需累计 2 次才入库。见 result.md 结论。此处断言防未来无声恶化。
+    /// 🔴 残留 gap（053-B 既定契约「渲染抑制 ≠ 数据抑制」）。
+    ///
+    /// **AUTOLEARN-EDIT-SNAPSHOT-331 已收口此 gap ⇒ 断言语义随之变更**（由「钉住缺陷」改为
+    /// 「钉住收口后的新契约」；非静默删除）：镜像仍会因迟到包领先于最后所见（053-B 要求），
+    /// 但**自学习基准改用编辑入口快照**，不再取被推进的镜像 ⇒ gap 不再产生伪候选。
     #[test]
-    fn stopped_late_packet_advances_mirror_beyond_display() {
+    fn stopped_late_packet_advances_mirror_but_baseline_uses_snapshot() {
         let state = (1u64, "权威".to_string(), 2usize);
         let last_displayed = compose_with_acc_for_gen(Some(&state), 1, "早年");
         let mirror_after_late = compose_with_acc_for_gen(Some(&state), 1, "晚年更长尾");
+        // 053-B 事实不变：迟到包推进镜像（渲染仍被抑制）
         assert_ne!(
             last_displayed, mirror_after_late,
-            "迟到包推进镜像、渲染被抑制 ⇒ 镜像领先所见（既定 gap，勿无声扩大）"
+            "迟到包仍推进镜像（053-B 渲染抑制≠数据抑制，勿改）"
         );
+        // 331 收口：本地实时档的学习基准 = 最后渲染文本，而非被推进的镜像
+        let expected = Some(last_displayed.clone());
+        assert_eq!(
+            super::select_learning_baseline(true, Some(last_displayed), Some(mirror_after_late)),
+            expected,
+            "331：基准必须取编辑入口快照（所见），不得取被迟到包推进的镜像"
+        );
+    }
+}
+
+#[cfg(test)]
+mod edit_snapshot_331_tests {
+    use super::select_learning_baseline;
+
+    /// 🔴 收口核心（任务 §五-1）：停止后迟到包推进镜像 ⇒ 随后进编辑 ⇒ 基准 = **最后渲染文本**。
+    #[test]
+    fn baseline_uses_snapshot_not_advanced_mirror() {
+        let snapshot = Some("屏幕上最后那份".to_string());
+        let advanced_mirror = Some("被迟到包推进过的更完整文本".to_string());
+        assert_eq!(
+            select_learning_baseline(true, snapshot.clone(), advanced_mirror),
+            snapshot
+        );
+    }
+
+    /// 🔴 主控补的场景：**本地档 + 零回灌（一片未派）** + 迟到包推进镜像 ⇒ 基准仍取快照。
+    /// （用「回灌是否活跃」当闸门会漏掉这条 —— 故闸门必须是档位。）
+    #[test]
+    fn baseline_local_zero_reflow_still_uses_snapshot() {
+        // 零回灌 ⇒ ACC_REFLOW_STATE 为 None（本函数无该入参，正体现闸门与回灌状态解耦）
+        let snapshot = Some("短录音屏幕上那份".to_string());
+        let advanced_mirror = Some("停后迟到包推进的文本".to_string());
+        assert_eq!(
+            select_learning_baseline(true, snapshot.clone(), advanced_mirror),
+            snapshot
+        );
+    }
+
+    /// 边界 5：在线 / 批处理 ⇒ **恒 mirror**（逐位不变），即便带了快照也忽略。
+    #[test]
+    fn baseline_online_batch_uses_mirror_only() {
+        assert_eq!(
+            select_learning_baseline(false, Some("快照".to_string()), Some("镜像".to_string())),
+            Some("镜像".to_string())
+        );
+        assert_eq!(
+            select_learning_baseline(false, Some("快照".to_string()), None),
+            None
+        );
+    }
+
+    /// 本地档无快照（理论不发生）⇒ 回落镜像；代际清空后等价于此。
+    #[test]
+    fn baseline_local_falls_back_to_mirror_without_snapshot() {
+        assert_eq!(
+            select_learning_baseline(true, None, Some("镜像".to_string())),
+            Some("镜像".to_string())
+        );
+    }
+
+    /// 未编辑不学习：快照 == 提交文本 ⇒ `original == edited` ⇒ diff 为空（wordbook 对相同串返回 None）。
+    #[test]
+    fn unedited_submit_yields_equal_baseline_and_edited() {
+        let displayed = "这是一条来自指导灵的信息吗？".to_string();
+        let baseline = select_learning_baseline(true, Some(displayed.clone()), Some("别的".into()));
+        // 零修改提交时 edited 就是 EDIT 初值 == 快照
+        let edited = displayed.clone();
+        assert_eq!(baseline, Some(edited));
     }
 }
 
@@ -12945,6 +13060,7 @@ mod overlay_086_d2d_p1_guard_tests {
             current_size: RECORDING_OVERLAY_SIZE,
             target_size: RECORDING_OVERLAY_SIZE,
             last_streaming_text: None,
+            edit_original: None,
             cached_font: None,
             streaming_font: None,
             displayed_chars: 0,
@@ -13568,6 +13684,7 @@ mod overlay_109_d2d_p2p3_guard_tests {
             current_size: RECORDING_OVERLAY_SIZE,
             target_size: RECORDING_OVERLAY_SIZE,
             last_streaming_text: None,
+            edit_original: None,
             cached_font: None,
             streaming_font: None,
             displayed_chars: 0,

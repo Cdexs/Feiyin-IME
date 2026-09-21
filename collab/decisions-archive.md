@@ -2062,6 +2062,40 @@ BUILD-118 端测第 4 项，Gavin 问「上屏文字经用户编辑后会走两�
 - 🔴 **待办**：闸 2/3/4 目前无端到端验证证据，只有单元测试。
   排入 BUG-119 之后的 TEST-SYNC，补「应用内编辑 → 词库」全链路验证
 
+### 2026-09-21 订正（本节结论已过期；原正文一字未改，仅追加）
+
+**订正的两处：**
+
+1. **上面「「保证应用内修改能学」的现状核查」小节末句「本地模型路径不产生 `StreamingText`，
+   overlay 里根本没有文本可点、进不了编辑态」已不成立。** 该结论写于**本地实时（local_realtime）
+   管线成型之前**：当时本地档只有离线整段识别、不进流式渲染，故确实没有可点文本；
+   现在本地实时档**会发 `StreamingText`、浮层文本可点可编辑**，与在线流式档走**同一条**编辑学习路径。
+   ⇒ 「闸 1 路径限定 = 结构必然（仅在线流式）」这条**同样过期**：它是**档位无关**的，本地实时档一样满足。
+2. **上面「### 影响」首条「路径 B 代码不删（直接注入场景仍在用）」已被推翻。**
+   Gavin 2026-09-21 再次确认该路径不可行（原话：「这一条之前早就讨论过，根本不可行……
+   因为用户的编辑软件五花八门，永远找不到文本快照」）⇒ 路径 B 代码按 `AUTOLEARN-DROP-PATHB-332` **整段摘除**，
+   连带其观测用的平台符号（见该单交付）。
+
+**证据（BUILD-321 端测日志 `collab/evidence/20260921-build321-e2e/debug-build321.log`，同一会话铁证链）：**
+
+```
+08:43:24.011 INFO  [Latency] local realtime record_streaming() completed after +6667.2ms
+08:43:24.011 WARN  LocalRealtime recording ended with cancel_signal=true, skipping ASR join
+08:43:24.011 INFO  ASR-038-C: suppressing Done/Cancelled → Idle/Hide while editing   ← 本地实时档进入编辑态
+08:43:45.622 DEBUG ESC-178: EDIT subclass received WM_KEYDOWN wparam=0xd             ← 编辑框回车（提交）
+08:43:45.627 DEBUG OVERLAY-149-PROBE F1: post-destroy caret hwndCaret=HWND(0x0) …     ← 编辑态销毁 = 提交完成
+08:43:45.644 WARN  [AUTOLEARN] candidate observed: '指导灵' (1/2)                     ← 应用内编辑学习路径触发
+```
+
+- 该会话**全程无 `Injecting text`**（下一次注入在 08:43:54.652，晚于学习 9 秒）
+  ⇒ 不可能是路径 B 的「注入后 300ms 观察」，**只可能是应用内编辑提交**。
+- 同一份日志共 4 条自学习记录（08:42:56 / 08:43:14 / 08:43:45 / 08:44:10），**全部发生在 local_realtime 档会话中**。
+
+**为什么必须留下这条订正**：主控 2026-09-21 正是被另一条同类过期记录（`AUTOLEARN-REACH-001`）
+误导，据此写出错误任务书派发出去，靠 Worker 停手反证才拦住。
+**过期记录比没有记录更危险** —— 凡「某档位/某路径不具备某能力」的结论，都须标注其成立时的管线形态。
+
+
 ## DEC-059 · 系统提示词按独立模块对待：改动须有 A/B 实证，快照护栏机器拦截
 
 - **背景**（Gavin 2026-09-06 重申）：

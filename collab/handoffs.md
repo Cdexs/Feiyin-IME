@@ -5,6 +5,15 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-2 — AUTOLEARN-EDIT-SNAPSHOT-331 ✅ 交付（编辑入口快照学习基准，收口 329 gap）
+
+- **来源**：候选 A（编辑入口那份「显示文本」），经 `OverlayWindowState.edit_original` + `SubmitRequested` 第 3 参带给 controller。
+- **闸门 = 档位**（主控急停订正）：`select_learning_baseline(is_local_realtime_tier, snapshot, mirror)`；本地 ⇒ 快照优先，在线/批处理 ⇒ 恒 mirror（逐位不变）。**不用「回灌是否活跃」**（会漏本地零回灌短录音）。
+- **329 锚**：`..._advances_mirror_beyond_display` 改名 `..._but_baseline_uses_snapshot` 并改写语义（显式，非静默删）。
+- **未碰** 053-B 契约测试 / 判定层 / 329-325 行为。
+- **验证**：fmt clean（skip_children）/ check 0 error / warnings 110/101 / numstat==-w（133/16）/ 331 5P + 329 6P + 325 6P + 053-B 1P。
+- 🔴 实机交 tester-1/Gavin，未声称已验证。未动版本 / 未 commit / 未出包 / 零凭证。
+
 ## 2026-09-21 — coder-1 — UI-LRMODEL-HINT-330 ✅ 交付（删除本地流式档「模型文件」提示块）
 
 - **根因**：`src-tauri/src/main.rs:144 check_local_realtime_models_ready` 未随 DEC-076 迁移，仍在找**已不存在**的 FunASR nano 目录 ⇒ 恒报「缺失 · 972MB」，而实际在跑的 Qwen3 是好的 ⇒ **界面说假话**。Gavin 裁定整块删。
