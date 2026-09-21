@@ -153,3 +153,8 @@ desktop.ini
 # vitest browser 运行时附件与失败截图，本地产物，无入库价值
 ui/.vitest-attachments/
 ui/src/test/browser/__screenshots__/
+
+# ===== DIAG-LOCALRT-FIRSTCHAR-292：debug 模式落盘的前置音频（敏感）=====
+# exe 同级 debug-audio/ 下的 WAV 载荷是用户真实口述录音（隐私非密钥），
+# 内容正则永久盲区（[GATE-MATCHES-SHAPE-NOT-CONTENT-001]），必须靠路径拦截。
+debug-audio/

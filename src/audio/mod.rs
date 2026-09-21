@@ -21,7 +21,28 @@ use windows::Win32::Media::Audio::{
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 
+// FIX-LOCALRT-FIRSTCHAR-293：`PRE_ROLL_MS` 现为**在线三档 / 批处理路径**的 pre-roll 取值。
+// 环形缓冲容量另由 `PRE_ROLL_CAPACITY_MS` 决定（必须 ≥ 所有取用值），见下。
 const PRE_ROLL_MS: u64 = 600; // HOTKEY-LATENCY-V2-001: 500→600ms to collect more initial audio for cold start
+/// FIX-LOCALRT-FIRSTCHAR-293：环形缓冲**容量**（三路共用的 `max_pre_roll_samples` 用它）。
+/// 本地流式要取 1000ms，故容量必须 ≥1000；在线/批处理只取 `PRE_ROLL_MS`(600)，
+/// 因此容量变大对它们零影响（`retain_recent_samples` 只保留最近 N ms）。
+const PRE_ROLL_CAPACITY_MS: u64 = 1000;
+/// FIX-LOCALRT-FIRSTCHAR-293：本地流式管线的 pre-roll 取用长度。
+/// 600ms 窗口会把首字开头的爆破音声母削掉（Gavin 端测「输入你」→「输入按」），
+/// 加长到 1000ms 争取完整声学起点；窗口长 ≠ 全喂进去，由裁剪规则锚定语音起点。
+const PRE_ROLL_LOCAL_RT_MS: u64 = 1000;
+/// FIX-LOCALRT-FIRSTCHAR-293：锚定语音起点时往前多留的 padding。
+/// 150ms（原 283 为 100ms）：送气清声母 / 爆破段能量低于阈值、检不出来，不能切掉
+/// （`[FIRSTCHAR-001]`/`[FIRSTCHAR-002]` 老坑，不许复发）。
+const PRE_ROLL_PAD_MS: u64 = 150;
+/// FIX-LOCALRT-FIRSTCHAR-293：整窗无语音段时只保留的末尾长度（场景 B：先按键后开口，
+/// 不把窗口里的静音/底噪全灌给 ASR）。
+const PRE_ROLL_TAIL_KEEP_MS: u64 = 200;
+/// 能量 VAD 静音阈值（沿用 283 的 0.005）。
+const PRE_ROLL_SIL_THRESHOLD: f32 = 0.005;
+/// 段间静音 ≥ 此值才判为分隔（沿用 283 的 200ms）。
+const PRE_ROLL_MIN_SILENCE_MS: u64 = 200;
 const PRIME_TIMEOUT_MS: u64 = 450; // HOTKEY-LATENCY-V2-001: 350→450ms for deeper cold-start audio collection
 const PRIME_TICK_MS: u64 = 20; // HOTKEY-LATENCY-FIX-001: recv_timeout tick, allows up to 17 ticks before timeout
 
@@ -245,6 +266,7 @@ impl PreRollDump {
     }
 
     /// 测试入口：可注入目录。Warn 级下与 `new` 同样完全不动作（连目录都不建）。
+    #[cfg(test)]
     fn new_in(dir: PathBuf, chunks: &[Vec<f32>], rate: u32) -> Option<Self> {
         if !log::log_enabled!(log::Level::Debug) {
             return None;
@@ -254,7 +276,10 @@ impl PreRollDump {
 
     fn build(dir: PathBuf, chunks: &[Vec<f32>], rate: u32) -> Option<Self> {
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            log::warn!("[LocalRT-DBG-292] cannot create dump dir {}: {e}", dir.display());
+            log::warn!(
+                "[LocalRT-DBG-292] cannot create dump dir {}: {e}",
+                dir.display()
+            );
             return None;
         }
         let preroll: Vec<f32> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
@@ -315,50 +340,88 @@ impl Drop for PreRollDump {
     }
 }
 
-/// FIX-LOCALRT-FIRSTCHAR-283（方案 D）：从前置音频里取**最后一个语音段**。
+/// FIX-LOCALRT-FIRSTCHAR-283/293（统一规则）：把 pre-roll 窗口裁成「喂给 ASR 的那一段」。
 ///
-/// - 用轻量**能量 VAD**（20ms 帧 RMS）把音频切成语音段；段间需有 ≥200ms 静音才算分隔。
-///   （音频层保持平台中立、不引入 ASR 模型依赖，故用能量法而非 silero VAD；对
-///   「上一句尾音 vs 本次说话」的分隔判定足够。）
-/// - 若存在 **≥2 个**语音段 ⇒ 只保留**最后一段**（+100ms 前置 padding），丢掉更早的语音
-///   （即上一句尾音残留）。
-/// - 若 **0 或 1 段**（整段连续无停顿）⇒ **原样返回**——这正是「说得比按键快」的场景，
-///   保证首字不丢（FIRSTCHAR 系列老 bug 不许复活）。
-/// - 不改 `PRE_ROLL_MS`（600ms 取值不动），只改「怎么用这 600ms」。
-fn trim_pre_roll_last_speech_segment(samples: &[f32], rate: u32) -> Vec<f32> {
-    // 🔴 用**样本级**静音游程（非帧级）：帧级在边界量化上会把「正好 200ms 静音」算成 9 帧
-    // 而漏切（离线复现过），样本级无此问题。
-    const SIL_THRESHOLD: f32 = 0.005;
-    let min_silence = (rate as usize * 200) / 1000; // 200ms
-    let pad = (rate as usize * 100) / 1000; // 100ms 前置 padding
-    let mut segs: Vec<(usize, usize)> = Vec::new(); // (start_sample, end_sample)
-    let mut cur: Option<usize> = None;
+/// 窗口加长到 1000ms 是为了**不错过早到的语音**，但**窗口长 ≠ 全喂进去**。本函数用轻量
+/// **样本级能量 VAD**（阈值 `PRE_ROLL_SIL_THRESHOLD`，段间静音 ≥`PRE_ROLL_MIN_SILENCE_MS`）
+/// 把窗口切成语音段，一条规则同时覆盖端测三种场景：
+///
+/// | 场景 | 检出 | 保留 |
+/// | --- | --- | --- |
+/// | A 先开口后按键（首字被 600ms 边界削掉） | ≥1 段 | 最后一段起点 − `PRE_ROLL_PAD_MS` 起，带出完整声母 |
+/// | B 先按键后开口（旧 buffer / 静音干扰首字） | 0 段 | 只留末尾 `PRE_ROLL_TAIL_KEEP_MS` |
+/// | C 上句尾音残留 | ≥2 段 | 取最后一段（283 原有能力） |
+/// | 兜底：整窗找不到任何 ≥200ms 静音游程（嘈杂环境，判据不可靠） | — | **原样返回**，绝不比现状更差 |
+///
+/// 🔴 只用能量法（平台中立、不引入 ASR 模型依赖）。**仅本地流式调用**；在线三档
+/// `trim_pre_roll_residual=false`，根本不进本函数 ⇒ 在线零改变。
+fn select_pre_roll_for_asr(samples: &[f32], rate: u32) -> Vec<f32> {
+    if rate == 0 || samples.is_empty() {
+        return samples.to_vec();
+    }
+    let min_silence = rate as usize * PRE_ROLL_MIN_SILENCE_MS as usize / 1000;
+    let pad = rate as usize * PRE_ROLL_PAD_MS as usize / 1000;
+
+    // 样本级静音游程切段（帧级在「正好 200ms 静音」边界会量化漏切，283 离线复现过）。
+    let mut starts: Vec<usize> = Vec::new();
+    let mut in_speech = false;
     let mut run = 0usize;
+    let mut has_long_silence = false;
     for (idx, &x) in samples.iter().enumerate() {
-        if x.abs() <= SIL_THRESHOLD {
+        if x.abs() <= PRE_ROLL_SIL_THRESHOLD {
             run += 1;
-            if cur.is_some() && run >= min_silence {
-                let start = cur.unwrap();
-                segs.push((start, idx - run));
-                cur = None;
-                run = 0;
+            if run >= min_silence {
+                has_long_silence = true;
+                in_speech = false; // 关闭当前语音段
             }
         } else {
-            if cur.is_none() {
-                cur = Some(idx);
+            if !in_speech {
+                starts.push(idx);
+                in_speech = true;
             }
             run = 0;
         }
     }
-    if let Some(start) = cur {
-        segs.push((start, samples.len() - 1));
+
+    // 兜底：没有任何 ≥200ms 静音游程 ⇒ 能量判据不可靠，退回现状（原样全保留）。
+    if !has_long_silence {
+        log_pre_roll_select(samples.len(), samples.len(), rate, "fallback", None);
+        return samples.to_vec();
     }
-    if segs.len() <= 1 {
-        return samples.to_vec(); // 0/1 段 → 原样（「说得比按键快」不丢字）
+
+    // 场景 B：整窗无语音段 ⇒ 只留末尾 TAIL_KEEP_MS（不得为空）。
+    if starts.is_empty() {
+        let tail = rate as usize * PRE_ROLL_TAIL_KEEP_MS as usize / 1000;
+        let st = samples.len().saturating_sub(tail);
+        let out = samples[st..].to_vec();
+        log_pre_roll_select(samples.len(), out.len(), rate, "tail", None);
+        return out;
     }
-    let last = segs.last().unwrap().0;
+
+    // 场景 A / C：锚定最后一段起点，往前留 PAD_MS（saturating：起点在 PAD 内不下溢）。
+    let last = *starts.last().unwrap();
     let st = last.saturating_sub(pad);
-    samples[st..].to_vec()
+    let out = samples[st..].to_vec();
+    log_pre_roll_select(samples.len(), out.len(), rate, "onset", Some(last));
+    out
+}
+
+/// `[LocalRT-DBG-293]` 只读埋点：`debug!` + `log_enabled!` 守卫（默认 Warn 零开销）。
+fn log_pre_roll_select(window: usize, kept: usize, rate: u32, mode: &str, onset: Option<usize>) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    let ms = |n: usize| n as f64 / rate as f64 * 1000.0;
+    let onset_at = onset
+        .map(|s| format!("{}ms", ms(s) as u64))
+        .unwrap_or_else(|| "-".to_string());
+    log::debug!(
+        "[LocalRT-DBG-293] pre_roll select: window={}ms kept={}ms mode={} onset_at={}",
+        ms(window) as u64,
+        ms(kept) as u64,
+        mode,
+        onset_at
+    );
 }
 
 pub struct AudioCapture {
@@ -532,10 +595,10 @@ impl AudioCapture {
         max_seconds: u64,
         level_buf: Option<AudioLevelBuf>,
         device_name: Option<&str>,
-        // FIX-LOCALRT-FIRSTCHAR-283（方案 D）：仅**本地流式**路径传 true——
-        // pre_roll 里若有被静音分隔的多个语音段，只保留最后一段（丢掉上一句尾音）；
-        // 整段连续无停顿 → 原样保留（保护「说得比按键快」不丢字）。
-        // 在线流式三档传 false ⇒ 行为完全不变。
+        // FIX-LOCALRT-FIRSTCHAR-283/293：仅**本地流式**路径传 true——用
+        // `select_pre_roll_for_asr` 把加长后的 pre-roll 锚定到语音起点（A 先开口 /
+        // B 先按键 / C 上句尾音），同时把取用长度切到 `PRE_ROLL_LOCAL_RT_MS`(1000ms)。
+        // 在线流式三档传 false ⇒ 取 `PRE_ROLL_MS`(600ms) 且不进裁剪函数，行为完全不变。
         trim_pre_roll_residual: bool,
         mut on_chunk: impl FnMut(&[f32]),
     ) -> Result<()> {
@@ -548,7 +611,8 @@ impl AudioCapture {
 
         // pre-roll：从 VecDeque drain 出热键前的音频，作为首批 chunk 推给回调
         // 这是「建连后补发」的 pre-roll 来源 —— 热键前的音频不丢
-        let pre_roll_chunks = warm.drain_pre_roll(PRE_ROLL_MS);
+        let pre_roll_chunks =
+            warm.drain_pre_roll(pre_roll_ms_for_streaming(trim_pre_roll_residual));
         log::info!(
             "[Latency] record_streaming drain_pre_roll: {} chunks at +{:.1}ms",
             pre_roll_chunks.len(),
@@ -562,24 +626,16 @@ impl AudioCapture {
         // 🔴 注意：此处取的是 **trim 之前** 的原始 pre_roll —— 正是要看的输入。
         let mut preroll_dump = PreRollDump::new(&pre_roll_chunks, warm.sample_rate);
 
-        // FIX-LOCALRT-FIRSTCHAR-283（方案 D，仅本地流式 trim_pre_roll_residual=true）：
-        // 拼成单块 → 取最后一个语音段 → 丢掉更早的语音段（上一句残尾），避免污染本次首字。
+        // FIX-LOCALRT-FIRSTCHAR-283/293（统一裁剪，仅本地流式 trim_pre_roll_residual=true）：
+        // 拼成单块 → 按「锚定语音起点」规则选出喂 ASR 的那一段（A 先开口 / B 先按键 /
+        // C 上句尾音；拥挤/无静音游程时原样返回）。埋点 [LocalRT-DBG-293] 在函数内部。
         let pre_roll_chunks = if trim_pre_roll_residual {
             let mut all: Vec<f32> =
                 Vec::with_capacity(pre_roll_chunks.iter().map(|c| c.len()).sum());
             for c in &pre_roll_chunks {
                 all.extend_from_slice(c);
             }
-            // URGENT-286：trim 本身是生产逻辑（不可守卫）；只有这条日志降为 debug。
-            // all.len()/kept.len() 是廉价取长，无需再包 log_enabled!。
-            let kept = trim_pre_roll_last_speech_segment(&all, warm.sample_rate);
-            log::debug!(
-                "[LocalRT-DBG-283] pre_roll residual trim: {} -> {} samples ({:.0}ms -> {:.0}ms)",
-                all.len(),
-                kept.len(),
-                all.len() as f64 / warm.sample_rate as f64 * 1000.0,
-                kept.len() as f64 / warm.sample_rate as f64 * 1000.0
-            );
+            let kept = select_pre_roll_for_asr(&all, warm.sample_rate);
             if kept.is_empty() {
                 Vec::new()
             } else {
@@ -866,7 +922,7 @@ impl AudioCapture {
         let tx_err = tx.clone();
         let stream_failed = Arc::new(AtomicBool::new(false));
         let pre_roll = Arc::new(Mutex::new(VecDeque::<Vec<f32>>::new()));
-        let max_pre_roll_samples = pre_roll_samples(sample_rate, PRE_ROLL_MS);
+        let max_pre_roll_samples = pre_roll_samples(sample_rate, PRE_ROLL_CAPACITY_MS);
         // ASR-074 Step 1: 丢帧计数器，回调闭包递增，record_streaming 结束时读取
         let dropped_chunks = Arc::new(AtomicU64::new(0));
 
@@ -1403,6 +1459,17 @@ fn pre_roll_samples(sample_rate: u32, pre_roll_ms: u64) -> usize {
     (sample_rate as u64 * pre_roll_ms / 1000) as usize
 }
 
+/// FIX-LOCALRT-FIRSTCHAR-293：`record_streaming` 按**现成开关** `trim_pre_roll_residual`
+/// 分流 pre-roll 取用长度——本地流式（true）取 1000ms，在线三档（false）取 600ms。
+/// 复用该开关，不新增参数穿透（主控要求③）。
+fn pre_roll_ms_for_streaming(trim_pre_roll_residual: bool) -> u64 {
+    if trim_pre_roll_residual {
+        PRE_ROLL_LOCAL_RT_MS
+    } else {
+        PRE_ROLL_MS
+    }
+}
+
 fn retain_recent_samples(chunks: Vec<Vec<f32>>, max_samples: usize) -> Vec<Vec<f32>> {
     if max_samples == 0 {
         return Vec::new();
@@ -1825,30 +1892,103 @@ mod tests {
         vec![0.0f32; 16000 * ms / 1000]
     }
 
+    // ------------------------------------------------------------
+    // FIX-LOCALRT-FIRSTCHAR-283/293：统一 pre-roll 选择规则（A/B/C + 兜底）
+    // 输入均为 1000ms @16k（16000 样本），模拟本地流式加长后的窗口。
+    // ------------------------------------------------------------
+
+    /// 场景 C：旧语音 + 300ms 静音 + 新语音 ⇒ 只保留新语音段（起点 − PAD）
     #[test]
-    fn trim_pre_roll_keeps_last_segment_when_separated_by_silence() {
-        // [上句尾 250][静音 200][本句 500] → 只留最后一段（丢掉前段）
-        let mut s = speech(250);
-        s.extend(silence(200));
-        s.extend(speech(500));
-        let out = trim_pre_roll_last_speech_segment(&s, 16000);
-        assert!(out.len() < s.len(), "多语音段应被裁剪");
-        assert!(out.len() >= 16000 * 500 / 1000, "至少保留最后一段");
+    fn pre_roll_select_c_keeps_only_new_segment_after_gap() {
+        let mut s = speech(200); // 旧语音 [0,200)
+        s.extend(silence(300)); // 静音 [200,500)
+        s.extend(speech(500)); // 新语音 [500,1000)
+        assert_eq!(s.len(), 16000);
+        let out = select_pre_roll_for_asr(&s, 16000);
+        assert_eq!(
+            out.len(),
+            16000 * 650 / 1000,
+            "新语音起点 500ms − PAD 150ms = 350ms 起，长度 650ms"
+        );
     }
 
+    /// 场景 A：语音从 300ms 起持续到末尾 ⇒ 保留起点 150ms（300−PAD），头部一个样本不丢
     #[test]
-    fn trim_pre_roll_unchanged_for_continuous_speech() {
-        // 连续无停顿（「说得比按键快」）→ 原样，防丢字
-        let s = speech(600);
-        let out = trim_pre_roll_last_speech_segment(&s, 16000);
-        assert_eq!(out.len(), s.len(), "单段连续必须原样返回（不丢字）");
+    fn pre_roll_select_a_speech_from_300ms_keeps_from_150ms() {
+        let mut s = silence(300);
+        s.extend(speech(700));
+        assert_eq!(s.len(), 16000);
+        let out = select_pre_roll_for_asr(&s, 16000);
+        assert_eq!(out.len(), 16000 * 850 / 1000, "应从 150ms 起（300−150）");
+        assert!(out.len() >= 16000 * 700 / 1000, "语音本体必须完整在内");
     }
 
+    /// 场景 A 极端：语音从 50ms 就开始（< PAD）⇒ saturating_sub 不下溢，保留从 0 开始
     #[test]
-    fn trim_pre_roll_unchanged_for_pure_silence() {
-        let s = silence(600);
-        let out = trim_pre_roll_last_speech_segment(&s, 16000);
-        assert_eq!(out.len(), s.len(), "纯静音原样返回");
+    fn pre_roll_select_a_extreme_onset_under_pad_no_underflow() {
+        let mut s = silence(50);
+        s.extend(speech(950));
+        let out = select_pre_roll_for_asr(&s, 16000);
+        // 前导静音仅 50ms（<200ms）⇒ 无长静音游程 ⇒ 兜底原样返回，起点必为 0，绝不下溢/丢头
+        assert_eq!(out, s, "不得丢头/下溢；原样返回");
+    }
+
+    /// 场景 B：1000ms 全静音 ⇒ 只剩末尾 200ms，且不得为空
+    #[test]
+    fn pre_roll_select_b_pure_silence_keeps_tail_only_not_empty() {
+        let s = silence(1000);
+        let out = select_pre_roll_for_asr(&s, 16000);
+        assert_eq!(out.len(), 16000 * 200 / 1000, "整窗静音只留末尾 200ms");
+        assert!(!out.is_empty(), "不得返回空");
+    }
+
+    /// 场景 B 边界：前 800ms 静音、最后 200ms 有语音 ⇒ 语音完整保留（起点 800−150=650）
+    #[test]
+    fn pre_roll_select_b_boundary_silence_then_tail_speech() {
+        let mut s = silence(800);
+        s.extend(speech(200));
+        let out = select_pre_roll_for_asr(&s, 16000);
+        assert_eq!(out.len(), 16000 * 350 / 1000, "从 650ms 起到末尾 = 350ms");
+        assert!(out.len() >= 16000 * 200 / 1000, "末尾语音必须完整");
+    }
+
+    /// 兜底：整窗无 ≥200ms 静音游程（连续语音）⇒ 原样返回，长度不变
+    #[test]
+    fn pre_roll_select_fallback_no_long_silence_returns_unchanged() {
+        let s = speech(1000);
+        let out = select_pre_roll_for_asr(&s, 16000);
+        assert_eq!(out.len(), s.len(), "判据不可靠时必须退回现状");
+        assert_eq!(out, s, "内容逐样本一致");
+    }
+
+    /// 冷启动：缓冲只攒到 300ms ⇒ 不 panic、不补零、不返空
+    #[test]
+    fn pre_roll_select_cold_start_buffer_not_full() {
+        let chunks = vec![vec![1.0f32; 4800], vec![2.0f32; 9600]]; // 100ms + 200ms @48k
+        let available: usize = chunks.iter().map(Vec::len).sum();
+        let max_samples = pre_roll_samples(48000, PRE_ROLL_CAPACITY_MS);
+        let retained = retain_recent_samples(chunks.clone(), max_samples);
+        assert_eq!(
+            retained.iter().map(Vec::len).sum::<usize>(),
+            available,
+            "未攒满必须原样返回已有音频：不 panic、不补零、不返回空"
+        );
+        assert_eq!(retained, chunks, "内容逐样本一致");
+    }
+
+    /// 现成分流开关：本地流式 true ⇒ 1000ms；在线三档 false ⇒ 600ms（供 292 `dur` 核对）
+    #[test]
+    fn pre_roll_streaming_ms_routes_by_existing_switch() {
+        assert_eq!(pre_roll_ms_for_streaming(true), PRE_ROLL_LOCAL_RT_MS);
+        assert_eq!(pre_roll_ms_for_streaming(false), PRE_ROLL_MS);
+        assert_eq!(PRE_ROLL_LOCAL_RT_MS, 1000);
+        assert_eq!(PRE_ROLL_MS, 600);
+        assert!(
+            PRE_ROLL_CAPACITY_MS >= PRE_ROLL_LOCAL_RT_MS,
+            "容量必须容纳最长取用值"
+        );
+        assert_eq!(pre_roll_samples(16000, PRE_ROLL_LOCAL_RT_MS), 16000);
+        assert_eq!(pre_roll_samples(16000, PRE_ROLL_MS), 9600);
     }
 
     // ============================================================
@@ -1884,6 +2024,7 @@ mod tests {
 
     #[test]
     fn urgent286_pre_roll_diag_quiet_at_warn_full_at_debug() {
+        let _level_guard = LOG_LEVEL_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _ = log::set_boxed_logger(Box::new(CapLogger));
         let chunks = vec![vec![0.2f32; 16000]]; // 1s 语音，足以触发能量统计
 
@@ -1913,6 +2054,150 @@ mod tests {
         assert_eq!(dbg_hits, 1, "-debug 下 [278] 必须完整输出 1 条");
 
         log::set_max_level(log::LevelFilter::Warn); // 复原
+    }
+
+    // ============================================================
+    // DIAG-LOCALRT-FIRSTCHAR-292：pre-roll WAV 落盘
+    //   - 串行化所有会改全局 max_level 的用例（否则与 286 并行时
+    //     互相翻转 Warn/Debug ⇒ 随机红，[TESTENV-SHARED-DIR-RACE-001] 同族）。
+    // ============================================================
+    static LOG_LEVEL_MUTEX: Mutex<()> = Mutex::new(());
+    static DUMP_TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn dump_test_dir(tag: &str) -> PathBuf {
+        let seq = DUMP_TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "voice-ime-dump292-{}-{}-{}",
+            std::process::id(),
+            tag,
+            seq
+        ))
+    }
+
+    fn list_wavs(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|n| n.ends_with(".wav"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// 解析 RIFF/WAVE 头，返回 (sample_rate, channels, block_align, data_len)。
+    fn read_wav_header(path: &Path) -> (u32, u16, u16, u32) {
+        let bytes = std::fs::read(path).unwrap();
+        assert!(bytes.len() >= 44, "WAV 必须有 44 字节头");
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        assert_eq!(&bytes[12..16], b"fmt ");
+        assert_eq!(&bytes[36..40], b"data");
+        (
+            u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]),
+            u16::from_le_bytes([bytes[22], bytes[23]]),
+            u16::from_le_bytes([bytes[32], bytes[33]]),
+            u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]),
+        )
+    }
+
+    #[test]
+    fn diag292_dump_quiet_at_warn_and_writes_valid_wav_at_debug() {
+        let _level_guard = LOG_LEVEL_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = log::set_boxed_logger(Box::new(CapLogger));
+        let dir = dump_test_dir("warn");
+        // 4800 静音 + 7200 语音 @48k：首个非静音样本在 100ms ⇒ head_clipped=false
+        let chunks = vec![vec![0.0f32; 4800], vec![0.5f32; 7200]];
+        let original = chunks.clone();
+
+        // 不带 -debug（release 默认）：必须完全不动作
+        log::set_max_level(log::LevelFilter::Warn);
+        assert!(!log::log_enabled!(log::Level::Debug));
+        assert!(
+            PreRollDump::new_in(dir.clone(), &chunks, 48000).is_none(),
+            "Warn 下必须不创建 dump"
+        );
+        assert!(!dir.exists(), "Warn 下连目录都不许建");
+
+        // 带 -debug：文件 ① 立即落盘，② 由 Drop 收尾
+        log::set_max_level(log::LevelFilter::Debug);
+        assert!(log::log_enabled!(log::Level::Debug));
+        {
+            let dump = PreRollDump::new_in(dir.clone(), &chunks, 48000).expect("Debug 下应落盘");
+            assert_eq!(list_wavs(&dir).len(), 1, "构造后应只有文件 ①");
+            drop(dump);
+        }
+        let files = list_wavs(&dir);
+        assert_eq!(files.len(), 2, "Drop 后应补写文件 ②");
+
+        // 文件 ① = 原始 pre-roll；WAV 头必须按真实值（硬要求②）
+        let file1 = files
+            .iter()
+            .find(|n| !n.contains("-2s"))
+            .expect("应有原始 pre-roll 文件");
+        let (rate, ch, align, data_len) = read_wav_header(&dir.join(file1));
+        assert_eq!(rate, 48000, "采样率必须是真实值，不得照抄 16000");
+        assert_eq!(ch, 1);
+        assert_eq!(align, 2);
+        assert_eq!(data_len as usize, 12000 * 2, "12000 样本 × i16");
+
+        // 独立解码验证（硬要求③）：用 sherpa-onnx 的 Wave 解析器**真实读回**我们写的
+        // 文件，等价于「系统播放器能打开」——只验字节数不算数。
+        let decoded = sherpa_onnx::Wave::read(
+            dir.join(file1)
+                .to_str()
+                .expect("temp WAV 路径应为有效 UTF-8"),
+        )
+        .expect("sherpa Wave 必须能解析我们写的 WAV");
+        assert_eq!(decoded.sample_rate(), 48000, "解码采样率须对得上");
+        assert_eq!(
+            decoded.samples().len(),
+            12000,
+            "解码样本数须对得上（250ms@48k）"
+        );
+
+        // head_clipped 判据（写死 100ms > 40ms 窗口 ⇒ false）
+        let flat: Vec<f32> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+        let first = first_speech_offset_ms(&flat, 48000);
+        assert_eq!(first, Some(100), "首个非静音样本应落在 100ms");
+        assert!(first.unwrap() > HEAD_CLIP_WINDOW_MS);
+
+        // 🔴 只读性（验收 #5）：dump 前后输入逐样本一致
+        assert_eq!(chunks, original, "dump 不得改动喂给 ASR 的样本一个 bit");
+
+        log::set_max_level(log::LevelFilter::Warn); // 复原
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn diag292_dump_limit_removes_oldest_and_spares_non_dump_files() {
+        let dir = dump_test_dir("limit");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"keep").unwrap();
+        for i in 0..5 {
+            std::fs::write(dir.join(format!("preroll-20260101-00000{i}.wav")), b"x").unwrap();
+        }
+        let removed = enforce_dump_limit(&dir, 3);
+        assert_eq!(removed, 2, "5 → 3 应删最旧 2 个");
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "notes.txt",
+                "preroll-20260101-000002.wav",
+                "preroll-20260101-000003.wav",
+                "preroll-20260101-000004.wav",
+            ],
+            "保留最新 3 个 dump + 不误删非 dump 文件"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // FIX-ASR-DROP-288：消费端节流上报的差值语义 + 1s 节流

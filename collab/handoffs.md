@@ -5,6 +5,32 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-1 — FIX-LOCALRT-FIRSTCHAR-293（293-B 修订版）✅ 交付（pre-roll 窗口 600→1000ms + 锚定语音起点裁剪）
+
+- **由来/修订**：Gavin 拍板先修「首字爆破音被 600ms 边界削掉」（`输入你`→`输入按`）；但又补「先按键后开口、旧 buffer 干扰首字」——**只加长窗口会让后者更差**。故 293-B：窗口容量拉 1000ms（不错过早到语音），但喂 ASR 的只从语音起点前 150ms 起。
+- **改动（`src/audio/mod.rs` 单文件）**：`PRE_ROLL_CAPACITY_MS=1000`（环形缓冲容量一处）；`PRE_ROLL_LOCAL_RT_MS=1000` + `pre_roll_ms_for_streaming(trim_pre_roll_residual)` 分流（本地 1000 / 在线 600，复用现成第 8 参，不新增穿透）；`trim_pre_roll_last_speech_segment` **泛化**为 `select_pre_roll_for_asr`（≥1 段→最后一段起点−150ms；0 段→末尾 200ms 不为空；无 ≥200ms 静音游程→原样返回兜底）；`PRE_ROLL_PAD_MS` 100→150；埋点 `[LocalRT-DBG-293] window/kept/mode/onset_at`（debug!+守卫）。
+- **在线零改变**：`retain_recent_samples` 只留最近 N ms + 在线 `trim_pre_roll_residual=false` **不进裁剪函数**；`record()`（批处理）仍取 600。
+- **验证**：`cargo check --all-targets` 0 error、warnings **110/101**=基线；`rustfmt --check` clean；numstat==`-w`（352/67）；新增/替换 8 条单测（A/B/C/兜底/冷启动/分流）+ 292 两条 → `audio::tests` **69P/0F**；root 全量 `cargo test` **1293P/0F/15I**。🔴 实机 `dur=1000ms` 观测交 tester-1/Gavin（我不能跑）。`urgent286_...` 用例加 `LOG_LEVEL_MUTEX` 串行化防并行翻转 max_level。
+- **红线**：未碰 `src/transcription/`（coder-2 在途）/ 未动版本 / 未自行 commit / 未出包 / 未跑 release / 零凭证。
+
+## 2026-09-21 — coder-1 — DIAG-LOCALRT-FIRSTCHAR-292 ✅ 交付（debug-only pre-roll WAV 落盘取证）
+
+- **目的**：Gavin 报流式档首字不准（`我自翻` vs `端`）。日志只能证明「先开口后按键」那次语音贴 600ms 窗口末尾，**无法判定声学起点是否被窗口削掉**，两个处置方向相反 ⇒ 先取音频。
+- **改动（`src/audio/mod.rs` 单文件 + `.gitignore`）**：`PreRollDump`（`new` 首行 `log_enabled!(Debug)` 守卫 ⇒ 默认 Warn 零文件零计算；写 ① 原始 pre-roll ② pre-roll+其后 2s 实时，Drop 补写）；`write_wav_pcm16` 手写零依赖 PCM16（采样率写真实值，`f32` 先 `clamp` 再 `*32767`）；`enforce_dump_limit(dir,20)` 删最旧防撑爆盘；`debug_audio_dir` exe 同级（DEC-011）；埋点 `[LocalRT-DBG-292]` 含 `head_clipped`（首个 |s|>0.01 落在窗前 40ms 内）。**只读旁路，喂 ASR 音频逐 bit 不变**（单测断言）。
+- **验证**：0 error、warnings 110/101=基线、`rustfmt --check` clean、numstat==`-w`；落盘 WAV 经 **Python `wave`** 独立解码 `ch=1/16bit/48000Hz/0.250s` + sherpa `Wave::read` 回读通过。Gavin 产 WAV 步骤见 `result.md` §一。
+- **红线**：WAV 属用户语音，`debug-audio/` 已入 `.gitignore`，未提交 / 未动版本 / 零凭证。
+
+## 2026-09-21 — coder-2 — FIX-LOCALRT-TAILCHAR-291 ✅ 交付（中间句丢尾字：endpoint reset 前先 flush）
+
+- **根因**：`transcribe_streaming_local` 的 `input_finished()` 全函数只在 loop 结束后调一次（只救最后一句）；中间句走 `endpoint → recognizer.reset()`，**reset 前从未 flush** ⇒ 解码器压着的最后 token 被丢，每句结构性少尾字。
+- **修法（方案 A）**：endpoint 时 `get_result`(flush 前，回落用) → `stream.input_finished()` → drain `decode` → `get_result`(flush 后完整) → 确认本句。新增私有纯函数 `endpoint_confirm_text`（取更长者，flush 后空/更短回落 flush 前）⇒ 绝不整句消失/回退。`input_finished()` 后 stream 不可复用 ⇒ 换 `recognizer.create_stream()`（`let stream`→`let mut stream`），不再 `reset()`。
+- **不重复确认**：endpoint 一次 + 非 endpoint 一次（原样）⇒ FIX-252 不复发。
+- **诊断**：`[LocalRT-DBG-291] endpoint flush: before_len/after_len/gained`（`debug!`+`log_enabled!` 守卫）。预期 `gained` 多为 1；**若实测恒 0 立刻停手报主控**。
+- **未动**：284/289 影子代码（`use_shadow` 预期恒假，删减下一单）；`RULE1/2/3`／`PRE_ROLL_MS`／`SHADOW_MAX_AUDIO_SECS`／269/269-B 标点触发；在线三档（唯一调用点 `main.rs:7948` LocalRealtime）。
+- **验证**：`cargo check --all-targets` 0 error、warnings **110/101** = 基线；`rustfmt --check` clean；新增单测 `local_stream::tests` **2P/0F**（连跑 3 次）。🔴 实机（`gained` 实测）交 tester-1/Gavin。
+- **⚠️ 协作事件**：主控文档 commit `99799c5`（10:26:26）在本题进行中执行，**把我未完成的 `local_stream.rs` 与 coder-1 的 `src/audio/mod.rs` 一并扫入**（commit message 未反映代码改动）。本单改动已随之落盘、worktree 无额外 diff；`git status` 另见 `.gitignore` + `src/audio/mod.rs`（非本单）。请主控知悉该 commit 语义与文件归属。
+- **红线**：只改 `local_stream.rs` / 未动版本 / 未自行 commit / 未出包 / 未跑 `cargo build --release` / 零凭证。
+
 ## 2026-09-21 — coder-2 — FIX-SHADOW-DISPLAY-289 ✅ 交付（endpoint 确认改用当前句最完整结果）
 
 - **根因**：影子解码正常（finalize 有结果），但 endpoint 固定用 main 的 `r.text` confirm ⇒ main 缺尾字 ⇒ 影子完整显示被回退（尾字不显示 / 等下一句才出）。
