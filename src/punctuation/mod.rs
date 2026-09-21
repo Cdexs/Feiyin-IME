@@ -712,17 +712,15 @@ mod tests {
     mod guard_214_215 {
         use super::*;
 
-        /// 读取源码并截断到首个 `#[cfg(test)]`，逐行 trim（只扫生产区，测试代码不进入扫描区）。
+        /// 生产区逐行 trim：**剔除所有 test-gated 项**（共享 helper，FIX-GUARD-301-B）。
+        ///
+        /// 🔴 本组护栏扫的是 **`main.rs`**（不是本文件）。原实现「截断到首个 `#[cfg(test)]`」
+        /// 在 298 于 `main.rs:9165` 插入 `mod parallel_acc_298_tests` 后塌缩，
+        /// G7/G9/G10/G11 四条锚点（L9265/9391/9478/9503）全落扫描区外 ⇒ 假红
+        /// （`TEST-EXEC-302` 实测）。301 当时只改了 `main.rs` 内部的 4 处，
+        /// **漏了本处跨文件扫描的第 5 处**（主控 grep 只扫了 main.rs，范围定窄）。
         fn prod_lines(src: &'static str) -> Vec<String> {
-            let mut out = Vec::new();
-            for line in src.lines() {
-                let t = line.trim();
-                if t.starts_with("#[cfg(test)]") {
-                    break;
-                }
-                out.push(t.to_string());
-            }
-            out
+            crate::guard_prod_lines::prod_lines_excluding_cfg_test(src)
         }
 
         fn main_prod_lines() -> Vec<String> {
