@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
@@ -100,6 +101,218 @@ fn pre_roll_diag(chunks: &[Vec<f32>], rate: u32) {
         ratio,
         gap
     );
+}
+
+// ============================================================================
+// DIAG-LOCALRT-FIRSTCHAR-292：把 pre-roll 原始音频落盘，回答「首字声学起点到底
+// 在不在这 600ms 窗口里」——Gavin 2026-09-21 报流式档首字不准（`我自翻` vs `端`）。
+//
+// 🔴 这是**只读旁路**：本模块只借用 `&[f32]`，不修改、不重排、不丢弃任何样本，
+//    喂给 ASR 的音频因此逐 bit 不变。全部工作在 `log::log_enabled!(Debug)` 为真时
+//    才发生；默认 Warn 下 `PreRollDump::new` 直接返回 None，连目录名都不构造。
+//
+// 依赖说明：仓库无 WAV 写入能力（sherpa `Wave` 只读、未引入 hound），故手写
+// 44 字节 PCM16 WAV 头 + 样本，避免为一个诊断功能新增依赖。
+// ============================================================================
+
+/// 每个 dump 事件最多 2 个文件 ⇒ 最多保留最近 `DUMP_MAX_FILES` 个文件（超出删最旧）。
+const DUMP_MAX_FILES: usize = 20;
+/// 第二个文件 = pre-roll + 其后这么多秒的实时音频。
+const DUMP_REALTIME_SECS: usize = 2;
+/// `head_clipped` 判据：首个非静音样本落在窗口前这么多 ms 以内 ⇒ 认为语音在窗口
+/// 打开前就已开始、头部被 600ms 边界削掉。
+const HEAD_CLIP_WINDOW_MS: u64 = 40;
+/// `head_clipped` 用的「非静音」绝对幅度阈值（与 278 的能量阈值同源，但为样本级）。
+const HEAD_CLIP_ABS_THRESHOLD: f32 = 0.01;
+
+/// 诊断音频落盘目录：exe 同级 `debug-audio/`（DEC-011：不依赖运行时工作目录）。
+fn debug_audio_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("debug-audio")
+}
+
+/// 首个 |sample| > `HEAD_CLIP_ABS_THRESHOLD` 的样本相对窗口起点的偏移（ms）。
+/// 全静音返回 None。
+fn first_speech_offset_ms(samples: &[f32], rate: u32) -> Option<u64> {
+    if rate == 0 {
+        return None;
+    }
+    samples
+        .iter()
+        .position(|s| s.abs() > HEAD_CLIP_ABS_THRESHOLD)
+        .map(|i| i as u64 * 1000 / rate as u64)
+}
+
+/// 最小 WAV 写入：单声道 16-bit PCM，采样率写真实值（端测现场 48000，写错即
+/// `[ASR-SAMPLERATE-STREAM-001]`）。刻意不引入 hound —— 44 字节头手写足够。
+fn write_wav_pcm16(path: &Path, samples: &[f32], rate: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    let data_len = (samples.len() * 2) as u32;
+    let mut header = Vec::with_capacity(44);
+    header.extend_from_slice(b"RIFF");
+    header.extend_from_slice(&(36 + data_len).to_le_bytes());
+    header.extend_from_slice(b"WAVE");
+    header.extend_from_slice(b"fmt ");
+    header.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+    header.extend_from_slice(&1u16.to_le_bytes()); // audio format = PCM
+    header.extend_from_slice(&1u16.to_le_bytes()); // channels = mono
+    header.extend_from_slice(&rate.to_le_bytes()); // sample rate (真实值)
+    header.extend_from_slice(&(rate * 2).to_le_bytes()); // byte rate
+    header.extend_from_slice(&2u16.to_le_bytes()); // block align
+    header.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    header.extend_from_slice(b"data");
+    header.extend_from_slice(&data_len.to_le_bytes());
+
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(&header)?;
+    let mut pcm = Vec::with_capacity(data_len as usize);
+    for &s in samples {
+        let v = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+        pcm.extend_from_slice(&v.to_le_bytes());
+    }
+    file.write_all(&pcm)
+}
+
+fn is_dump_file(name: &str) -> bool {
+    name.starts_with("preroll-") && name.ends_with(".wav")
+}
+
+/// 上限闸门：`preroll-<ts>*.wav` 超过 `max_files` 时删最旧的（按文件名升序 =
+/// 时间戳升序）。返回删除数量。不设上限 = 端测跑一晚撑爆盘。
+fn enforce_dump_limit(dir: &Path, max_files: usize) -> usize {
+    let mut names: Vec<String> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| is_dump_file(n))
+            .collect(),
+        Err(_) => return 0,
+    };
+    if names.len() <= max_files {
+        return 0;
+    }
+    names.sort();
+    let excess = names.len() - max_files;
+    let mut removed = 0;
+    for name in names.iter().take(excess) {
+        if std::fs::remove_file(dir.join(name)).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// 2026-09-21 现场诊断用格式：`first_speech_at` 为 none 时窗口内无语音。
+fn dump_log(name: &str, rate: u32, offset: Option<u64>, head_clipped: bool) {
+    let at = offset
+        .map(|ms| format!("{}ms", ms))
+        .unwrap_or_else(|| "none".to_string());
+    log::debug!(
+        "[LocalRT-DBG-292] preroll dump: file={} rate={} first_speech_at={} head_clipped={}",
+        name,
+        rate,
+        at,
+        head_clipped
+    );
+}
+
+/// 一次录音的 pre-roll 落盘器。
+///
+/// - 构造即写文件 ①（原始 600ms pre-roll）。
+/// - `push` 累积实时原始 chunk，凑满 pre-roll + 2s 时写文件 ②。
+/// - 录音提前结束时由 `Drop` 写文件 ②（不足 2s 就写多少算多少）。
+struct PreRollDump {
+    dir: PathBuf,
+    ts: String,
+    rate: u32,
+    offset: Option<u64>,
+    head_clipped: bool,
+    buf2: Vec<f32>,
+    target2: usize,
+    done2: bool,
+}
+
+impl PreRollDump {
+    /// 生产入口：目录固定 exe 同级 `debug-audio/`。
+    fn new(chunks: &[Vec<f32>], rate: u32) -> Option<Self> {
+        if !log::log_enabled!(log::Level::Debug) {
+            return None;
+        }
+        Self::build(debug_audio_dir(), chunks, rate)
+    }
+
+    /// 测试入口：可注入目录。Warn 级下与 `new` 同样完全不动作（连目录都不建）。
+    fn new_in(dir: PathBuf, chunks: &[Vec<f32>], rate: u32) -> Option<Self> {
+        if !log::log_enabled!(log::Level::Debug) {
+            return None;
+        }
+        Self::build(dir, chunks, rate)
+    }
+
+    fn build(dir: PathBuf, chunks: &[Vec<f32>], rate: u32) -> Option<Self> {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log::warn!("[LocalRT-DBG-292] cannot create dump dir {}: {e}", dir.display());
+            return None;
+        }
+        let preroll: Vec<f32> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+        let offset = first_speech_offset_ms(&preroll, rate);
+        let head_clipped = offset.map(|ms| ms <= HEAD_CLIP_WINDOW_MS).unwrap_or(false);
+        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        let name1 = format!("preroll-{}.wav", ts);
+        if let Err(e) = write_wav_pcm16(&dir.join(&name1), &preroll, rate) {
+            log::warn!("[LocalRT-DBG-292] WAV write failed ({}): {e}", name1);
+            return None;
+        }
+        dump_log(&name1, rate, offset, head_clipped);
+        enforce_dump_limit(&dir, DUMP_MAX_FILES);
+
+        let target2 = preroll.len() + rate as usize * DUMP_REALTIME_SECS;
+        Some(PreRollDump {
+            dir,
+            ts,
+            rate,
+            offset,
+            head_clipped,
+            buf2: preroll,
+            target2,
+            done2: false,
+        })
+    }
+
+    fn push(&mut self, chunk: &[f32]) {
+        if self.done2 || chunk.is_empty() {
+            return;
+        }
+        self.buf2.extend_from_slice(chunk);
+        if self.buf2.len() >= self.target2 {
+            self.buf2.truncate(self.target2);
+            self.write_part2();
+        }
+    }
+
+    fn write_part2(&mut self) {
+        if self.done2 {
+            return;
+        }
+        self.done2 = true;
+        let name = format!("preroll-{}-2s.wav", self.ts);
+        match write_wav_pcm16(&self.dir.join(&name), &self.buf2, self.rate) {
+            Ok(()) => dump_log(&name, self.rate, self.offset, self.head_clipped),
+            Err(e) => log::warn!("[LocalRT-DBG-292] WAV write failed ({}): {e}", name),
+        }
+        enforce_dump_limit(&self.dir, DUMP_MAX_FILES);
+    }
+}
+
+impl Drop for PreRollDump {
+    fn drop(&mut self) {
+        if !self.done2 && !self.buf2.is_empty() {
+            self.write_part2();
+        }
+    }
 }
 
 /// FIX-LOCALRT-FIRSTCHAR-283（方案 D）：从前置音频里取**最后一个语音段**。
@@ -343,6 +556,11 @@ impl AudioCapture {
         );
         // RESEARCH-ACC-FIRSTCHAR-278 埋点（只读）：pre_roll 能量特征 + 距上次录音结束间隔
         pre_roll_diag(&pre_roll_chunks, warm.sample_rate);
+        // DIAG-LOCALRT-FIRSTCHAR-292：**只读旁路**。debug 级下把原始 600ms pre-roll
+        // 落盘（并在凑满「pre-roll + 其后 2s 实时」时再落一份），用于离线判定首字
+        // 声学起点是否被窗口边界削掉。Warn 级下 `new` 返回 None，零文件、零计算。
+        // 🔴 注意：此处取的是 **trim 之前** 的原始 pre_roll —— 正是要看的输入。
+        let mut preroll_dump = PreRollDump::new(&pre_roll_chunks, warm.sample_rate);
 
         // FIX-LOCALRT-FIRSTCHAR-283（方案 D，仅本地流式 trim_pre_roll_residual=true）：
         // 拼成单块 → 取最后一个语音段 → 丢掉更早的语音段（上一句残尾），避免污染本次首字。
@@ -438,6 +656,12 @@ impl AudioCapture {
                 on_chunk(&resampled);
             }
         }
+        // DIAG-LOCALRT-FIRSTCHAR-292：只读累积原始实时 chunk（未重采样，与 WAV 采样率一致）
+        if let Some(dump) = preroll_dump.as_mut() {
+            for chunk in &post_hotkey_chunks {
+                dump.push(chunk);
+            }
+        }
 
         // RMS 静音检测状态（与 record() 的 RecordingState 逻辑一致，但只管停录+level_buf）
         let silence_frames = (silence_duration_ms as f32 / 1000.0 * sample_rate as f32) as usize;
@@ -522,6 +746,10 @@ impl AudioCapture {
 
             match warm.rx.recv_timeout(recv_timeout) {
                 Ok((_ts, chunk)) if !chunk.is_empty() => {
+                    // DIAG-LOCALRT-FIRSTCHAR-292：只读旁路，喂 ASR 前顺手抄一份原始 chunk
+                    if let Some(dump) = preroll_dump.as_mut() {
+                        dump.push(&chunk);
+                    }
                     let rms =
                         (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32).sqrt();
 

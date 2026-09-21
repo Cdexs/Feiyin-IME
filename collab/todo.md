@@ -22,6 +22,17 @@
 
 ## 🔴 待做
 
+### 🆕 v0.9.4 批次一 · Gavin 2026-09-21 端测 BUILD-290 反馈（证据 `collab/evidence/20260921-gavin-e2e/debug-1018.log`）
+
+| 单号 | 内容 | 负责人 | 状态 |
+| --- | --- | --- | --- |
+| `FIX-LOCALRT-TAILCHAR-291` | **中间句必丢尾字**。根因已定位：`endpoint` 分支直接 `recognizer.reset()`，**reset 前从未 `input_finished()`** ⇒ 解码器里压着的最后一个 token 被丢弃；全函数唯一一次 flush 在 loop 之后，只救最后一句。日志三句全中（电[影]／空[气]／问[题]）。方案：endpoint 时先 flush 再取结果，下一句改 `create_stream()` 而非 `reset()` | coder-2 | 🔄 已派 |
+| `DIAG-LOCALRT-FIRSTCHAR-292` | **首字不准**。已排除 283（四次全 `28800→28800`，按设计只在 ≥2 语音段时才裁，本场景 1 段）。出错那次 pre-roll 有语音贴在窗口末尾（`ratio=0.07`）= 「先开口后按键」。**「端」的声学起点在不在这 600ms 里」无法从日志判定** ⇒ 先做 debug-only WAV dump 拿音频 | coder-1 | 🔄 已派 |
+
+🔴 **284/289 影子机制为何没兜住**（别再往影子上打补丁）：① `shadow_done_for_pause` 在静默第一个 400ms 就上锁，之后 main 还在长 ⇒ endpoint 时恒 `shadow < main`，5 次 confirm **全 `used=main`**；② 超 `SHADOW_MAX_AUDIO_SECS=12s` 的句子影子被整个跳过。
+✅ **反向价值**：`shadow finalize #6` 给 15 字而同刻 main 只有 14 —— 这正是 `input_finished()` 能多吐一个字的硬证据，291 方案据此成立。
+
+
 ### ⏸ v0.9.3 收尾三件 · 等 Gavin 拍板
 
 | 事项 | 说明 |
