@@ -1866,3 +1866,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | `src/main.rs` 新增节点自由函数 `apply_filler_strip(final_text: String, enabled: bool) -> String`，挂在 `run_pipeline_core` 的 `apply_local_punctuation` 之后、`platform::inject_text` 之前 | ✅ **平台中立节点**：`run_pipeline_core` 已无 `#[cfg]`（MACOS-P4-NEUTRAL-002），macOS 侧编译同一份代码 ⇒ 自动继承同一节点与同一位置 |
 | `enabled` 实参 = `!llm_handled`（LLM 未接手才生效） | ✅ 纯布尔，无平台分支、无新用户开关（遵守 DEC-031 单开关） |
 | macOS 侧需要做什么 | ✅ **无需改动**；未新增任何 `#[cfg]`、未触碰 `src/platform/**`、未动配置结构 |
+
+## HOMOPHONE-NODE-318（2026-09-21，coder-2）· 同音纠错可挂载节点 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| 新增平台中立模块 `src/homophone/mod.rs`（规则外置 + 纯函数 `apply_homophone_fix`）+ 根目录 `homophone-rules.toml` | ✅ **平台中立**：纯字符串替换，无 IO（规则构造期一次加载）、无平台 API、不接 `&AppConfig`/`AsrModel`；两端编译同一份代码 |
+| 挂载点 `run_pipeline_core` 内、转录之后、ITN 主通道之前（`main.rs`） | ✅ `run_pipeline_core` 已无 `#[cfg]`，macOS 自动继承同一节点与位置；四档共用 ⇒ 一处调用全覆盖 |
+| 规则加载：exe 同级 `homophone-rules.toml` 优先，缺失/解析失败回退 `include_str!` 内置默认（DEC-011） | ✅ 两端同一份路径语义；macOS 需打包时把 toml 放 exe 同级可选，**不打包也能用内置默认** |
+| macOS 侧需要做什么 | ✅ **无需改动**；未新增任何 `#[cfg]`、未触碰 `src/platform/**`、未动配置结构、未加用户开关（DEC-031） |

@@ -5,6 +5,7 @@
 mod audio;
 mod config;
 mod crash;
+mod homophone;
 #[cfg(target_os = "windows")]
 mod hotkey; // Deprecated: use platform::HotkeyListener instead
 mod i18n;
@@ -9375,6 +9376,12 @@ fn run_pipeline_core(
                         send_event(event_tx, PipelineEvent::Cancelled);
                         return;
                     }
+                    // HOMOPHONE-NODE-318：ASR 同音纠错节点。**转录之后、ITN 主通道之前**：
+                    // 修的是 ASR **听错**，越早修正下游（ITN/LLM/标点）越干净；在 LLM 前也不触
+                    // DEC-041（该条禁的是对 LLM 输出做程序化后处理）。恒 `enabled=true`，
+                    // 表内只放无歧义项，不新增用户可见开关（DEC-031）。
+                    // 四档共用 run_pipeline_core ⇒ 一处调用即覆盖 local_realtime/accuracy/performance/qwen3。
+                    let raw_text = homophone::apply_homophone_fix(raw_text, true);
                     // ITN-V2-001 (R1 主通道)：ITN 从「LLM 后」回移到「LLM 前」。
                     // Gavin 2026-07-31 指令：LLM 会曲解原始数字表达（如「四点三刻」→「4:30」，
                     // 信息被销毁），故主通道在 LLM 之前先把中文数字→阿拉伯 + 单位符号定型，

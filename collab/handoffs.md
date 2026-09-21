@@ -5,6 +5,15 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-2 — HOMOPHONE-NODE-318 ✅ 交付（同音纠错可挂载节点）
+
+- **交付**：`src/homophone/mod.rs`（新，规则外置 + 纯函数 `apply_homophone_fix`）+ 根 `homophone-rules.toml`（**129 条**）+ `main.rs` 挂载（`:9384`）+ MACOS-HANDOFF + `evidence/20260921-homophone-318/`。
+- **挂载**：`run_pipeline_core` 内、`is_effective_text` 后、ITN 主通道前；恒 `true`；三处调用共用 ⇒ 四档全覆盖。
+- **词表**：自查语料同音错 ≈0 ⇒ 主要来自 pycorrector 筛选池，六道过滤 →129（详见 evidence `rules-318.md`）。
+- **坑**：子串越界（jingba 可嵌入性剔除）、幂等（改单趟 + `t8` 不变量）、繁体安全（剔 `锺→钟`）。
+- **验证**：fmt clean、check 0 error、warnings **110/101** 基线、`numstat`==`-w`、`homophone` **8P/0F**。
+- ⚠️ `src/bin/poc_local_stream.rs` 被改非本单（coder-1 在途）。未动版本 / 未 commit / 未出包 / 未碰 `src/transcription/**` / 零凭证。
+
 ## 2026-09-21 — coder-1 — MIGRATE-QWEN3-315 ✅ 交付（迁移收尾：线程 env + 词库不注入 + 硬编码排查）
 
 - **2.1 `ACC_NUM_THREADS`**：`default_acc_num_threads()`(=min(逻辑核数,8) 兜底 4)+`acc_num_threads_from()`（非法/缺失/<1 回落）+`acc_num_threads()`；FunASR/Qwen3 两处接线 + `[MIGRATE-QWEN3-315]` 日志。**默认=现状，无 env 逐位无变**（配 317 扫流式N+accuracyM 组合）。
