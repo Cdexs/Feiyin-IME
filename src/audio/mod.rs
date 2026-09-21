@@ -62,11 +62,66 @@ fn proc_now_ms() -> u64 {
     PROC_START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
+// ============================================================================
+// PREROLL-DEAD-322：诊断口径修正（**只读**，不参与任何行为决策、不改动音频一个 bit）。
+//
+// 事故：`{:.4}` 会把 1e-7 打印成 `0.0000`；16-bit WAV 落盘会把 1e-7 量化成 0。
+// 于是「pre-roll 是纯零 ⇒ 设备交数字静音 ⇒ 整块摘除」这个错误结论先后得出两轮。
+// 2026-09-21 实测（`pr322_idle_probe_manual`）：空闲期环形缓冲的样本 **100% 非零**，
+// 峰值 ≈2^-24 ≈ 6e-8（≈-140 dBFS）—— 是 24-bit 量化格上的最低位抖动，**不是数字零**。
+//
+// ⇒ 诊断一律改用两个**与小数位无关**的口径：
+//   - `peak_to_dbfs`：dB 刻度。1e-7 显示成 -140.0，永远不会被小数位吃掉；
+//   - `nonzero_ratio`：非零样本占比。数字静音 = 0.000，最低位抖动 = 1.000，一眼可辨。
+// ============================================================================
+
+/// dBFS 下限：避免 `log10(0)` 的 -inf / NaN 混进日志（`peak <= 0` 含 NaN 都归到这一档）。
+const DIAG_DBFS_FLOOR: f32 = -200.0;
+
+/// 峰值幅度 → dBFS（满刻度 1.0 = 0 dBFS），下限钳到 `DIAG_DBFS_FLOOR`。
+fn peak_to_dbfs(peak: f32) -> f32 {
+    if peak > 0.0 {
+        (20.0 * peak.log10()).max(DIAG_DBFS_FLOOR)
+    } else {
+        DIAG_DBFS_FLOOR
+    }
+}
+
+/// 非零样本占比（0.0..=1.0）。**区分「数字静音」与「极低电平底噪」的硬指标**：
+/// 数字静音恒为 0.000；哪怕只有 ±1 个最低位抖动也是 1.000。
+/// `total == 0` 时返回 0.0（无样本 ⇒ 不算「有信号」）。
+fn nonzero_ratio(nonzero: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        nonzero as f64 / total as f64
+    }
+}
+
+/// 诊断用一次遍历：返回 (峰值, 非零样本数, 总样本数)。
+fn diag_peak_nz(samples: &[f32]) -> (f32, usize, usize) {
+    let mut peak = 0f32;
+    let mut nonzero = 0usize;
+    for &s in samples {
+        let a = s.abs();
+        if a > peak {
+            peak = a;
+        }
+        if s != 0.0 {
+            nonzero += 1;
+        }
+    }
+    (peak, nonzero, samples.len())
+}
+
 /// [LocalRT-DBG-278] 记录 pre_roll 那 600ms 的能量/内容特征（只读）。
 ///
 /// URGENT-286：本函数全部计算（能量/峰值/语音帧统计，O(600ms 样本)）都是
 /// **为日志而算**，故先过 `log_enabled!` 守卫——默认 `max_level=Warn` 下直接返回，
 /// 连遍历都不发生（零开销）；仅带 `-debug`（`filter_level(Debug)`）端测时统计。
+///
+/// PREROLL-DEAD-322：口径升级为 `peak_dbfs` + `nz_ratio`（见上方常量注释块）。
+/// 原 `peak={:.4}` 在 ≈-140 dBFS 的底噪上恒显示 `0.0000`，是本单两轮误判的直接来源。
 fn pre_roll_diag(chunks: &[Vec<f32>], rate: u32) {
     if !log::log_enabled!(log::Level::Debug) {
         return;
@@ -78,6 +133,7 @@ fn pre_roll_diag(chunks: &[Vec<f32>], rate: u32) {
     }
     let mut peak = 0f32;
     let mut sum_abs = 0f64;
+    let mut nonzero = 0usize;
     let frame = ((rate / 50).max(1)) as usize; // 20ms 帧
     let mut frames = 0usize;
     let mut speech_frames = 0usize;
@@ -88,6 +144,9 @@ fn pre_roll_diag(chunks: &[Vec<f32>], rate: u32) {
             let a = s.abs();
             if a > peak {
                 peak = a;
+            }
+            if s != 0.0 {
+                nonzero += 1;
             }
             sum_abs += a as f64;
             f_sum_sq += (s * s) as f64;
@@ -116,11 +175,13 @@ fn pre_roll_diag(chunks: &[Vec<f32>], rate: u32) {
         0.0
     };
     log::debug!(
-        "[LocalRT-DBG-278] pre_roll chunks={} dur={:.0}ms mean_abs={:.4} peak={:.4} speech_frames={}/{} ratio={:.2} gap_since_last_record={}ms",
+        "[LocalRT-DBG-278] pre_roll chunks={} dur={:.0}ms peak={:.3e}({:.1}dBFS) mean_abs={:.3e} nz_ratio={:.3} speech_frames={}/{} ratio={:.2} gap_since_last_record={}ms",
         chunks.len(),
         dur_ms,
-        sum_abs / total as f64,
         peak,
+        peak_to_dbfs(peak),
+        sum_abs / total as f64,
+        nonzero_ratio(nonzero, total),
         speech_frames,
         frames,
         ratio,
@@ -231,16 +292,29 @@ fn enforce_dump_limit(dir: &Path, max_files: usize) -> usize {
 }
 
 /// 2026-09-21 现场诊断用格式：`first_speech_at` 为 none 时窗口内无语音。
-fn dump_log(name: &str, rate: u32, offset: Option<u64>, head_clipped: bool) {
+///
+/// PREROLL-DEAD-322：加打 `peak`(dBFS) + `nz_ratio`，理由同 278 —— 「首个超过 0.01
+/// 的样本」在 ≈-140 dBFS 的底噪上只会给出「全静音」的假象，而 `nz_ratio` 能一眼区分
+/// 「数字零」与「最低位抖动」。
+///
+/// 🔴 每条日志报的是**它自己那段样本**的 offset（起点 = 该 WAV 的起点）。文件 ② 起点是
+/// pre-roll 起点，故其 `first_speech_at` ≥ pre-roll 长度 ⇔ 语音出现在热键之后。
+/// 旧写法让文件 ② 复用文件 ① 的 offset，会给**含语音**的文件 ② 打上 `first_speech_at=none`
+/// —— 2026-09-21 本单取证时差点被这一行误导，故一并纠正。
+fn dump_log(name: &str, rate: u32, offset: Option<u64>, head_clipped: bool, samples: &[f32]) {
+    let (peak, nonzero, total) = diag_peak_nz(samples);
     let at = offset
         .map(|ms| format!("{}ms", ms))
         .unwrap_or_else(|| "none".to_string());
     log::debug!(
-        "[LocalRT-DBG-292] preroll dump: file={} rate={} first_speech_at={} head_clipped={}",
+        "[LocalRT-DBG-292] preroll dump: file={} rate={} first_speech_at={} head_clipped={} peak={:.3e}({:.1}dBFS) nz_ratio={:.3}",
         name,
         rate,
         at,
-        head_clipped
+        head_clipped,
+        peak,
+        peak_to_dbfs(peak),
+        nonzero_ratio(nonzero, total)
     );
 }
 
@@ -253,8 +327,6 @@ struct PreRollDump {
     dir: PathBuf,
     ts: String,
     rate: u32,
-    offset: Option<u64>,
-    head_clipped: bool,
     buf2: Vec<f32>,
     target2: usize,
     done2: bool,
@@ -295,7 +367,7 @@ impl PreRollDump {
             log::warn!("[LocalRT-DBG-292] WAV write failed ({}): {e}", name1);
             return None;
         }
-        dump_log(&name1, rate, offset, head_clipped);
+        dump_log(&name1, rate, offset, head_clipped, &preroll);
         enforce_dump_limit(&dir, DUMP_MAX_FILES);
 
         let target2 = preroll.len() + rate as usize * DUMP_REALTIME_SECS;
@@ -303,8 +375,6 @@ impl PreRollDump {
             dir,
             ts,
             rate,
-            offset,
-            head_clipped,
             buf2: preroll,
             target2,
             done2: false,
@@ -328,8 +398,12 @@ impl PreRollDump {
         }
         self.done2 = true;
         let name = format!("preroll-{}-2s.wav", self.ts);
+        // PREROLL-DEAD-322：文件 ② 的 first_speech_at / head_clipped 按**它自己**的样本重算
+        // （起点 = pre-roll 起点 ⇒ 数值 ≥ pre-roll 长度即语音出现在热键之后）。
+        let off2 = first_speech_offset_ms(&self.buf2, self.rate);
+        let hc2 = off2.map(|ms| ms <= HEAD_CLIP_WINDOW_MS).unwrap_or(false);
         match write_wav_pcm16(&self.dir.join(&name), &self.buf2, self.rate) {
-            Ok(()) => dump_log(&name, self.rate, self.offset, self.head_clipped),
+            Ok(()) => dump_log(&name, self.rate, off2, hc2, &self.buf2),
             Err(e) => log::warn!("[LocalRT-DBG-292] WAV write failed ({}): {e}", name),
         }
         enforce_dump_limit(&self.dir, DUMP_MAX_FILES);
@@ -1928,6 +2002,282 @@ pub fn is_mic_muted() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =================== PREROLL-DEAD-322 手工硬件探针（#[ignore]，不进常规回归）===================
+    //
+    // 测什么：**空闲期**（没按热键、没人说话）采集流到底是「被暂停 / 没数据」还是
+    //   「有数据但幅度极低」。这是本单的判决性测量。
+    // 为什么留：本单结论「环形缓冲装的是麦克风当时的真实输出、pre-roll 链路无 bug、
+    //   空闲底噪是 24-bit 最低位抖动（≈2^-24≈-140 dBFS）而非数字零」正是靠它测出来的。
+    //   而 `{:.4}` 会把该底噪显示成 `0.0000`、16-bit 落盘会把它量化成 0，先后两次把人
+    //   带向「纯零 ⇒ 系统门控 ⇒ 整块摘除」。留一支可复跑的探针，后人不必再猜一遍。
+    // 零副作用：只开默认输入设备、只读；不播放声音、不写文件。
+    // 跑法：`cargo test pr322_idle_probe -- --ignored --nocapture`
+    //
+    // 四段对照：
+    //   A 持续消费 channel（排除「队列满 ⇒ 引擎交零」）
+    //   B 留 2s 不消费再看积压（排除「只在消费时才有数据」）
+    //   C 整条流拆掉重建后再探（排除「流老化 ⇒ 交零」）
+    //   D 底噪取值结构 + 端点采集音量（判「很轻的模拟底噪」还是「数字栅格最低位」）
+    // 并记录被消费 chunk 的**时间戳年龄**：全是大龄 ⇒ 回调早已停摆（缓冲是陈的）；
+    // 0~500ms ⇒ 回调活着 —— 交的到底是什么，看 nz_ratio 与 dBFS。
+    #[test]
+    #[ignore = "PREROLL-DEAD-322 手工硬件探针（开麦克风、只读、需真实设备）：不进常规回归"]
+    fn pr322_idle_probe_manual() {
+        fn probe(
+            label: &str,
+            rx: &crossbeam_channel::Receiver<AudioChunk>,
+            pre: &Arc<Mutex<VecDeque<Vec<f32>>>>,
+            drain: bool,
+        ) {
+            std::thread::sleep(Duration::from_millis(500));
+            let (ring_peak, ring_nz, ring_chunks) = {
+                let g = pre.lock().unwrap();
+                let mut pk = 0f32;
+                let mut nz = 0usize;
+                for c in g.iter() {
+                    for &s in c.iter() {
+                        if s != 0.0 {
+                            nz += 1;
+                        }
+                        pk = pk.max(s.abs());
+                    }
+                }
+                (pk, nz, g.len())
+            };
+            let (mut cnt, mut n, mut nz, mut pk) = (0usize, 0usize, 0usize, 0f32);
+            let (mut age_min, mut age_max) = (u128::MAX, 0u128);
+            if drain {
+                while let Ok((ts, c)) = rx.try_recv() {
+                    let age = ts.elapsed().as_millis();
+                    age_min = age_min.min(age);
+                    age_max = age_max.max(age);
+                    cnt += 1;
+                    n += c.len();
+                    for &s in c.iter() {
+                        if s != 0.0 {
+                            nz += 1;
+                        }
+                        pk = pk.max(s.abs());
+                    }
+                }
+            }
+            let ages = if cnt == 0 {
+                "-".to_string()
+            } else {
+                format!("{age_min}..{age_max}ms")
+            };
+            println!(
+                "[PR322] {label}: ring={ring_chunks}ch peak={ring_peak:.8} nz={ring_nz} | drained={cnt}ch/{n}smp nz={nz} peak={pk:.8} ts_age={ages}"
+            );
+        }
+
+        println!(
+            "[PR322] mic_muted={} (endpoint volume mute)",
+            is_mic_muted()
+        );
+        let mut cap = AudioCapture::new();
+        cap.prewarm(None).expect("prewarm failed");
+        let (rate, rx, pre) = {
+            let w = cap.warm_stream.as_ref().expect("warm stream missing");
+            (w.sample_rate, w.rx.clone(), Arc::clone(&w.pre_roll))
+        };
+        println!("[PR322] prewarmed rate={rate}, idle-only probe begins");
+
+        probe("A0 idle/drain(500ms)", &rx, &pre, true);
+        probe("A1 idle/drain(500ms)", &rx, &pre, true);
+        probe("A2 idle/drain(500ms)", &rx, &pre, true);
+
+        println!(
+            "[PR322] A3: leaving channel UNCONSUMED for 2000ms (to observe full-queue payload)"
+        );
+        std::thread::sleep(Duration::from_millis(2000));
+        probe("A3 idle/backlog", &rx, &pre, true);
+
+        println!("[PR322] forcing full stream teardown + rebuild");
+        cap.warm_stream = None;
+        cap.prewarm(None).expect("rewarm failed");
+        let (rate2, rx2, pre2) = {
+            let w = cap
+                .warm_stream
+                .as_ref()
+                .expect("warm stream missing after rebuild");
+            (w.sample_rate, w.rx.clone(), Arc::clone(&w.pre_roll))
+        };
+        println!("[PR322] rebuilt rate={rate2}");
+
+        probe("B0 fresh/drain(500ms)", &rx2, &pre2, true);
+        probe("B1 fresh/drain(500ms)", &rx2, &pre2, true);
+        probe("B2 fresh/drain(500ms)", &rx2, &pre2, true);
+
+        // D：底噪取值结构 + 端点采集音量。
+        // 判据：若空闲样本只取少数几个值、且都是 2^-24 的整数倍 ⇒ 数字栅格最低位抖动
+        //       （设备侧闸/DSP），而非「很轻的模拟底噪」；端点音量再排除「采集音量被调低」。
+        #[cfg(target_os = "windows")]
+        {
+            let (lvl, mute) = pr322_endpoint_volume_level();
+            println!("[PR322] D: capture endpoint volume={lvl:.4} mute={mute} (0.0/负值=读不到)");
+        }
+        println!("[PR322] D: floor spectrum (800ms idle, no drain)");
+        let mut distinct: Vec<f32> = Vec::new();
+        let mut zeros = 0usize;
+        let mut n = 0usize;
+        let mut min_nz = f32::MAX;
+        let mut max_nz = 0f32;
+        let deadline = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < deadline {
+            if let Ok((_ts, c)) = rx2.recv_timeout(Duration::from_millis(20)) {
+                for &s in c.iter() {
+                    n += 1;
+                    if s == 0.0 {
+                        zeros += 1;
+                        continue;
+                    }
+                    let a = s.abs();
+                    min_nz = min_nz.min(a);
+                    max_nz = max_nz.max(a);
+                    if distinct.len() < 12 && !distinct.iter().any(|&x| x == a) {
+                        distinct.push(a);
+                    }
+                }
+            }
+        }
+        distinct.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "[PR322] D: n={n} exact_zero={zeros} nz_ratio={:.3} min_nonzero={min_nz:.3e} peak={max_nz:.3e}({:.1}dBFS) distinct<={}",
+            nonzero_ratio(n - zeros, n),
+            peak_to_dbfs(max_nz),
+            distinct.len()
+        );
+        println!(
+            "[PR322] D: distinct x2^24 (整数 ⇒ 24-bit LSB 栅格): {:?}",
+            distinct
+                .iter()
+                .map(|v| format!("{:.3}", v * 16777216.0))
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "[PR322] D: distinct x2^31 (整数 ⇒ 32-bit LSB 栅格): {:?}",
+            distinct
+                .iter()
+                .map(|v| format!("{:.1}", v * 2147483648.0))
+                .collect::<Vec<_>>()
+        );
+
+        println!("[PR322] probe complete");
+    }
+
+    // 端点采集音量（只读）：排除「麦克风采集音量被调低 ⇒ 幅度小」这条缩放解释。
+    // 由 `pr322_idle_probe_manual` 的 D 段使用。
+    #[cfg(target_os = "windows")]
+    fn pr322_endpoint_volume_level() -> (f32, bool) {
+        unsafe {
+            let enumerator: IMMDeviceEnumerator =
+                match CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) {
+                    Ok(e) => e,
+                    Err(_) => return (-1.0, false),
+                };
+            let device = match enumerator.GetDefaultAudioEndpoint(eCapture, eMultimedia) {
+                Ok(d) => d,
+                Err(_) => return (-1.0, false),
+            };
+            let endpoint: IAudioEndpointVolume =
+                match device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
+                    Ok(e) => e,
+                    Err(_) => return (-1.0, false),
+                };
+            let lvl = endpoint
+                .GetMasterVolumeLevelScalar()
+                .map(|v: f32| v)
+                .unwrap_or(-1.0);
+            let mute = endpoint
+                .GetMute()
+                .map(|b: BOOL| b.as_bool())
+                .unwrap_or(false);
+            (lvl, mute)
+        }
+    }
+
+    // =================== PREROLL-DEAD-322：诊断口径回归（纯函数，无硬件）===================
+    //
+    // 教训固化：`{:.4}` 把 ≈-140 dBFS 的底噪显示成 `0.0000`，16-bit 落盘再把它量化成 0，
+    // 于是「pre-roll 是纯零 ⇒ 设备交数字静音 ⇒ 整块摘除」这个错误结论连出两轮。
+    // 以下用例把新口径（dBFS + nz_ratio）与「文件② 报自己的 offset」钉死。
+    #[test]
+    fn pr322_peak_to_dbfs_is_independent_of_decimal_places() {
+        assert_eq!(peak_to_dbfs(0.0), DIAG_DBFS_FLOOR, "数字零 ⇒ 落到下限");
+        assert_eq!(
+            peak_to_dbfs(f32::NAN),
+            DIAG_DBFS_FLOOR,
+            "NaN 也必须落到下限"
+        );
+        assert!((peak_to_dbfs(1.0) - 0.0).abs() < 1e-6, "满刻度 = 0 dBFS");
+        assert!((peak_to_dbfs(0.1) + 20.0).abs() < 1e-4, "0.1 ⇒ -20 dBFS");
+        assert_eq!(peak_to_dbfs(1e-30), DIAG_DBFS_FLOOR, "极低值必须钳到下限");
+    }
+
+    #[test]
+    fn pr322_nonzero_ratio_distinguishes_dither_from_digital_silence() {
+        assert_eq!(nonzero_ratio(0, 48000), 0.0, "数字静音 ⇒ 0.000");
+        assert_eq!(nonzero_ratio(0, 0), 0.0, "无样本不算「有信号」");
+        assert_eq!(nonzero_ratio(48000, 48000), 1.0);
+        // 实测底噪形态：24-bit 最低位抖动（±2^-24），非零占比 100%、峰值 ≈-144 dBFS。
+        let lsb = 2f32.powi(-24);
+        let buf: Vec<f32> = (0..48000)
+            .map(|i| if i % 2 == 0 { lsb } else { -lsb })
+            .collect();
+        let (peak, nz, total) = diag_peak_nz(&buf);
+        assert_eq!(
+            nonzero_ratio(nz, total),
+            1.0,
+            "最低位抖动必须报成「几乎全非零」而不是零"
+        );
+        assert!(peak_to_dbfs(peak) < -140.0, "2^-24 应约 -144 dBFS");
+        // 🔴 事故本体：旧口径（4 位小数）会把这个信号显示成 0.0000 —— 本单两轮误判的根。
+        assert_eq!(format!("{peak:.4}"), "0.0000");
+    }
+
+    /// 文件 ② 的 `first_speech_at` 必须是**它自己**那段样本的 offset，不得复用文件 ① 的。
+    /// 旧写法会给「pre-roll 全静音 + 之后才有语音」的文件 ② 打上 `first_speech_at=none`。
+    #[test]
+    fn pr322_dump_part2_reports_its_own_offset_and_ratio() {
+        let _level_guard = LOG_LEVEL_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = log::set_boxed_logger(Box::new(CapLogger));
+        log::set_max_level(log::LevelFilter::Debug);
+        let dir = dump_test_dir("pr322-offset2");
+        // pre-roll 100ms 全静音（模拟 PREROLL-DEAD-322 现场：空闲段是底噪，不是语音）
+        let chunks = vec![vec![0.0f32; 4800]];
+        let before = diag_captured().len();
+        {
+            let mut dump =
+                PreRollDump::new_in(dir.clone(), &chunks, 48000).expect("Debug 下应落盘");
+            dump.push(&vec![0.0f32; 9600]); // 再 200ms 静音（热键后仍未开口）
+            dump.push(&vec![0.5f32; 14400]); // 300ms 语音
+        } // Drop 写文件 ②
+        let logs: Vec<String> = diag_captured()[before..]
+            .iter()
+            .filter(|s| s.contains("[LocalRT-DBG-292]"))
+            .cloned()
+            .collect();
+        assert_eq!(logs.len(), 2, "应有文件①与文件②两条 dump 日志: {logs:?}");
+        assert!(
+            logs[0].contains("first_speech_at=none"),
+            "文件① 全静音 ⇒ 起点偏移 none: {}",
+            logs[0]
+        );
+        assert!(
+            logs[1].contains("first_speech_at=300ms"),
+            "文件② 必须报自己的偏移(=4800+9600 样本 @48k = 300ms): {}",
+            logs[1]
+        );
+        assert!(
+            logs[1].contains("nz_ratio="),
+            "必须带 nz_ratio: {}",
+            logs[1]
+        );
+        log::set_max_level(log::LevelFilter::Warn); // 复原
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     // FIX-LOCALRT-FIRSTCHAR-283（方案 D）纯函数用例
     fn speech(ms: usize) -> Vec<f32> {

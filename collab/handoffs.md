@@ -5,6 +5,36 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-1 — PREROLL-DEAD-322 ✅ 交付（pre-roll「全零」定根因：链路无 bug + 诊断口径修正）
+
+- **根因（实测证伪两个候选 + 主控候选 C）**：空闲期采集流**是活的**（10ms 节拍、时间戳 0~500ms）、payload **100% 非零**（`nz_ratio=1.000`/`exact_zero=0`）、重建流/积压/连续消费三对照一致、端点采集音量 0.84 正常。「纯零」= `{:.4}` + i16 落盘把 ~1e-7(≈-140 dBFS) **显示/量化没了**。候选 C 由**同一缓冲内**「前 1000ms=0 → 热键后 3510」证伪（恒定缩放不能只作用一段）⇒ 变的是声学输入；候选 B 由「持续消费不抬幅度」证伪。
+- **定案**：环形缓冲装的是麦克风真实输出，**pre-roll 链路无 bug**；主控撤销「修不了就整块摘除」。
+- **改动（仅 `src/audio/mod.rs`）**：A = 诊断精度：`pre_roll_diag`/`dump_log` 打 `peak`(dBFS)+`nz_ratio`（新增 `DIAG_DBFS_FLOOR`/`peak_to_dbfs`/`nonzero_ratio`/`diag_peak_nz`，Debug 守卫⇒Warn 零开销）；顺带修 292 **文件② 复用文件① offset** 的误导。保留 1 支 `#[ignore]` 探针 `pr322_idle_probe_manual` + 3 条纯函数回归。
+- **验证**：fmt clean ｜ check --all-targets 0 error ｜ warnings **110/101** 基线 ｜ `cargo test` **0 failed**（+3P/+1 ignored）。证据 `collab/evidence/20260921-preroll-dead-322/`。
+- **下游线索（🔴 不在本单）**：C920 空闲 ≈-120~-140 dBFS vs 说话 ≈-16 dBFS ⇒ 电平触发的降噪/AGC，其 **attack 疑吃首字爆破音**，与 Gavin「你/按」首字不准吻合；判据折进下次端测。
+- **红线**：未动版本 / 未 commit / 未出包 / 未碰 `src/main.rs` 与 `src/transcription/**` / 零凭证。
+
+## 2026-09-21 — coder-2 — ACC-PREVIEW-REFLOW-325 ✅ 交付（accuracy 分片回灌预览）
+
+- **方向**：296/307 证伪「流式补尾字」（gained 恒 0）⇒ 用 298 accuracy 已完成片权威文本回灌浮层。
+- **边界**：`committed_len = last_display.chars().count()`（已上屏含标点串，与镜像同源）；新事件 `PreviewReflow{gen,seg_index,committed_len,has_hole,acc_text}`；合成 `acc + mirror[committed_len..]`。
+- **编辑态**：per-gen 闩锁（EditRequested 置位/RecordingStarted 复位）——进过一次编辑本次录音回灌全停。
+- **主控三订正**：① 单调键=seg_index ② 编辑闩锁（非当前标志）③ 失败片留洞→`SkippedHole`。
+- **只本地档**：唯一发送点 `main.rs:8140`（LocalRealtime acc worker）；在线/批处理结构上永不发。
+- **验证**：fmt clean（main 用 skip_children）/ check 0 error / warnings 110/101 基线 / numstat==-w（275/5、12/4）/ `preview_reflow_325` 6P + 298 3P + local_stream 10P。
+- 中间态曾致整仓短时不编译，已按要求补齐后立即 check 恢复并通知；主动上报 rustfmt 递归子模块风险（主控核 audio 无夹带）。
+- 🔴 实机未声称已验证，交 tester-1/Gavin。未动版本 / 未 commit / 未出包 / 未碰 audio 与 transcription/mod.rs / 零凭证。
+
+## 2026-09-21 — coder-2 — ITN-SHIFEN-323 ✅ 交付（「十分」程度副词误转修复）
+
+- **根因**：`十分` 未在保护表 ⇒ `十`→10、`分` 保留 =「10分」；百般/万般 同族。
+- **改法**：`[protect.degree_adverbs]`（十分/万分/百般/万般）+ `check_protection:2806` 右邻条件（词放 toml、条件写代码，DEC-038）。
+- 🔴 数词读法三判据**判定串写死**：① 词尾以 ≥2 字单位起首（分钟/分贝，`is_unit_multichar` 排除裸 `分`）② 整词右邻单位（十分米）③ 整词右邻「之」（十分之一）。主控拦截：③ 初版误判在词尾，已更正。
+- **取向**：句末裸「十分」保持汉字（知情权衡 + 断言锁）；「千万」不碰。
+- **验证**：fmt clean、0 error、warnings **110/101** 基线、`numstat`==`-w`(87/0)、itn **259P/0F**（含 4 闸门）。
+- 🔴 **交 tester-1**：出包时同步 `itn-rules.toml` 三副本（否则 exe 同级旧副本覆盖内置默认，修复失效）。
+- 未动版本 / 未 commit / 未出包 / 未碰 `src/transcription/**` 与 `src/audio/mod.rs` / 零凭证。
+
 ## 2026-09-21 — coder-1 — LOCALRT-CTX-INJECT-320 追加 ✅ 交付（删回滚开关 + 全 env 删除 + 词库单引擎化）
 
 - **原则（Gavin）**：不允许开发端/用户端行为不一致——用户机无 env，env 覆盖是假路径，且残留 env 会污染端测结论。

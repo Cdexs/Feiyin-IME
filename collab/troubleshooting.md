@@ -138,3 +138,33 @@
 | [POC-BYPASSES-PROD-WRAPPER-001] | PoC 报出「产品级严重缺陷」（如 accuracy >28s 空输出）→ **先核对它调的是不是生产同一条代码路径**，不是核对数据。数据全真但路径不同 ⇒ 结论完全无效。同批教训：判断既有模块行为前先按 ID 搜 `decisions-archive.md` 全文（`use_itn`/`itn:1` 实际无效已载于 DEC-030 背景，主控却凭字段值推断出不存在的「双重 ITN」） |
 | [ENUM-EQ-CHECK-MISSES-NEW-VARIANT-001] | 新增枚举变体后出现两个看似无关的 bug（标点重复 + 长句无输出）→ 根因是 `== Enum::Variant` **相等比较**漏改，**编译器不报错**（只有穷举 `match` 有保护）。派单只补 match arm 不够，**必须全仓 grep `==`/`!=` 逐个判断**。修法：在枚举上加语义化判定方法作收敛点（`matches!` 穷举形式），禁散落写 `== A \|\| == B`。同族 [CONFIG-MIRROR-DRIFT-001] |
 | [BINARY-PROBE-SYMBOL-INLINED-001] | 用**函数名**做 release 二进制探针，命中 0 被误判为「代码没进包」→ 小函数（尤其 `matches!` 展开的判定方法）release 下必被内联，符号根本不入二进制。**只有字符串字面量才进 .rdata**，探针必须选字面量（模型目录名、config 键名、日志前缀），禁用函数/方法/类型名。主控 2026-09-20 出题即犯此错，tester-1 发现 |
+
+## [FMT-COLLATERAL-001] rustfmt 吃 crate 根 main.rs 会递归进所有子模块（多人并行时隐性触碰他人在飞文件）
+
+**现象**：对 crate 根 `src/main.rs` 跑 `rustfmt src/main.rs`，rustfmt 会沿 `mod xxx;` 声明
+**递归格式化整棵模块树**（`src/audio/mod.rs`、`src/itn.rs` …），而不是只格式化你给的那个文件。
+
+**为什么危险**：多 Worker 并行时，A 只被授权动 `src/main.rs`，一次 rustfmt 却可能改写
+B 正在编辑的 `src/audio/mod.rs`。改动是纯 whitespace，**编译照过、测试照绿**，
+但会污染 B 的 diff，且在 `numstat == -w` 自证里暴露成「B 夹带了无关空白改动」——**冤枉 B**。
+更糟的情况是 B 正在写盘，两边互相覆盖。
+
+**判据（谁都能跑，读操作）**：
+```bash
+git diff --numstat -- <文件>      # 含空白
+git diff -w --numstat -- <文件>   # 忽略空白
+```
+两者**逐字相同 ⇒ 无 whitespace-only 改动 ⇒ 没有夹带**；不同则差额即为纯空白行数。
+
+**正确做法**：
+```bash
+rustfmt --config skip_children=true <具体文件>   # 禁止递归子模块
+cargo fmt -- <具体文件>                          # 或只点名文件
+```
+🔴 **不要对 crate 根 `main.rs` 裸跑 rustfmt**，除非你确实持有整棵树。
+
+**实例（2026-09-21）**：coder-2 做 ACC-PREVIEW-REFLOW-325 时为恢复编译跑了
+`rustfmt main.rs local_stream.rs`，同期 coder-1 正在 `src/audio/mod.rs` 上做 PREROLL-DEAD-322。
+coder-2 **自查发现风险并主动上报**，主控实测 `357/11` vs `-w 357/11` 逐字相同 ⇒ 本次未实际夹带
+（`rustfmt --check` 当时仍报 audio/mod.rs 两处未格式化，与「没写进去」一致）。
+**记录本条是因为风险真实存在且下次未必落空**，不是因为这次出了事。

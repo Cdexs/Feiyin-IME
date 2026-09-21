@@ -30,7 +30,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     Arc, Mutex, RwLock,
 };
 use std::thread::{self, JoinHandle};
@@ -146,6 +146,24 @@ enum PipelineEvent {
     /// 在线档代码路径结构上不变（它永不发也永不收本事件）。
     /// 消费：在 `RecordingWithText` 态下展示收尾预览（不 auto-close、不改状态机）。
     StreamingFinalPreview(String),
+    /// ACC-PREVIEW-REFLOW-325：本地实时档 **accuracy 分片的权威文本回灌预览**。
+    ///
+    /// 296/307 已证伪「在流式模型上补尾字」（`gained` 恒 0）；本单换层面：298 的 accuracy
+    /// 分片结果在录音过程中陆续回来，用它对**已完成片**的覆盖区做权威替换，尾字自然补齐。
+    ///
+    /// 字段：`generation` 代际（防串场，同 `StreamingText`）；`seg_index` 该片序号
+    /// （**单调键**，worker 按序产生、构造上严格递增）；`committed_len` 派发当刻浮层已显示
+    /// 文本的**字符数**（回灌边界）；`has_hole` 本片覆盖范围内是否含 accuracy 失败片
+    /// （含则**不得回灌**，否则会把带洞文本灌上浮层）；`acc_text` 覆盖区内的权威文本。
+    ///
+    /// 🔴 只有 LocalRealtime 会发；在线/批处理结构上永不发（同 282 专用通道先例）。
+    PreviewReflow {
+        generation: u64,
+        seg_index: usize,
+        committed_len: usize,
+        has_hole: bool,
+        acc_text: String,
+    },
 }
 // LATENCY-001: send event and immediately wake controller via PostMessageW
 fn send_event(tx: &crossbeam_channel::Sender<PipelineEvent>, event: PipelineEvent) {
@@ -234,6 +252,17 @@ static STREAMING_STOPPED: AtomicBool = AtomicBool::new(false);
 // which is orthogonal to generation (cross-session identity). The two gates AND together.
 #[cfg(target_os = "windows")]
 static STREAMING_GENERATION: AtomicU64 = AtomicU64::new(0);
+// ACC-PREVIEW-REFLOW-325：本地实时档回灌的 **per-generation** 状态（**controller 线程单写者**：
+// 二者只在消费循环内读写；`RecordingStarted` 重置，`PreviewReflow` 处理时读/写 —— 同一线程，
+// 故无竞态，无需原子以外同步）。
+// - `ACC_REFLOW_LAST_SEG`：已应用回灌的最大 `seg_index`（**单调键 = seg_index**，不是
+//   committed_len —— 后者是长度，句边界丢影子/punctuation 重打可使其合法回落，见 325 端测日志）。
+// - `ACC_REFLOW_EDIT_LATCH`：本次录音内**只要进过一次编辑态**即上闩，后续回灌一律停到下一代
+//   （防「编辑退出后迟到的回灌把用户刚打的字冲掉」）。
+#[cfg(target_os = "windows")]
+static ACC_REFLOW_LAST_SEG: AtomicI64 = AtomicI64::new(-1);
+#[cfg(target_os = "windows")]
+static ACC_REFLOW_EDIT_LATCH: AtomicBool = AtomicBool::new(false);
 #[derive(Debug, Clone, Copy)]
 #[cfg(target_os = "windows")]
 struct SendHwnd(isize);
@@ -6738,6 +6767,9 @@ fn process_controller_events(
                 // New recording session resets any stale editing state from a previous session.
                 OVERLAY_EDITING.store(false, Ordering::Release);
                 STREAMING_STOPPED.store(false, Ordering::Release);
+                // 325：回灌状态按代重置（新代重新开始回灌、编辑闩锁解除）。
+                ACC_REFLOW_LAST_SEG.store(-1, Ordering::Release);
+                ACC_REFLOW_EDIT_LATCH.store(false, Ordering::Release);
                 set_tray_state(tray, TrayState::Recording, ui_language);
                 show_overlay(
                     overlay_handle,
@@ -6814,6 +6846,75 @@ fn process_controller_events(
                         opacity,
                         ui_language,
                         OverlayStatus::RecordingWithText { text },
+                    );
+                }
+            }
+            PipelineEvent::PreviewReflow {
+                generation,
+                seg_index,
+                committed_len,
+                has_hole,
+                acc_text,
+            } => {
+                // 325：本地实时档 accuracy 分片权威文本回灌（**只有本地档会发本事件**）。
+                // 代际门与 StreamingText 同源：陈旧 session 的回灌不得改本 session 浮层。
+                let current_gen = STREAMING_GENERATION.load(Ordering::Acquire);
+                if generation != current_gen {
+                    log::debug!(
+                        "325: dropping PreviewReflow from stale session (gen {} != current {})",
+                        generation,
+                        current_gen
+                    );
+                    continue;
+                }
+                // 🔴 controller 线程单写者：这三个状态只在消费循环内读写，无竞态。
+                let edit_latched = ACC_REFLOW_EDIT_LATCH.load(Ordering::Acquire);
+                let stopped = STREAMING_STOPPED.load(Ordering::Acquire);
+                let last_seg = ACC_REFLOW_LAST_SEG.load(Ordering::Acquire);
+                let action = reflow_action(
+                    edit_latched,
+                    stopped,
+                    seg_index,
+                    last_seg,
+                    has_hole,
+                    acc_text.is_empty(),
+                );
+                let mut preview_len = 0usize;
+                if action == ReflowAction::Applied {
+                    let streaming = last_streaming_text
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.clone())
+                        .unwrap_or_default();
+                    let preview = reflow_preview(&acc_text, &streaming, committed_len);
+                    preview_len = preview.chars().count();
+                    ACC_REFLOW_LAST_SEG.store(seg_index as i64, Ordering::Release);
+                    show_overlay(
+                        overlay_handle,
+                        opacity,
+                        ui_language,
+                        OverlayStatus::RecordingWithText { text: preview },
+                    );
+                } else if action == ReflowAction::SkippedEditing {
+                    // 编辑态一旦出现（含已退出）⇒ 本代永久上闩，后续回灌不再改用户文本。
+                    ACC_REFLOW_EDIT_LATCH.store(true, Ordering::Release);
+                }
+                if log::log_enabled!(log::Level::Debug) {
+                    let action_str = match action {
+                        ReflowAction::Applied => "applied",
+                        ReflowAction::SkippedEditing => "skipped-editing",
+                        ReflowAction::SkippedCancel => "skipped-cancel",
+                        ReflowAction::SkippedStale => "skipped-stale",
+                        ReflowAction::SkippedHole => "skipped-hole",
+                        ReflowAction::SkippedEmpty => "skipped-empty",
+                    };
+                    log::debug!(
+                        "[LocalRT-DBG-325] acc reflow: seg={} committed_len={} acc_len={} preview_len={} action={}",
+                        seg_index,
+                        committed_len,
+                        acc_text.chars().count(),
+                        preview_len,
+                        action_str
                     );
                 }
             }
@@ -6980,6 +7081,9 @@ fn process_controller_events(
                 // ASR-038-C-REWORK-001: set controller-side editing flag BEFORE cancel_signal, so the
                 // inevitable PipelineEvent::Cancelled from the worker does not hide the overlay.
                 OVERLAY_EDITING.store(true, Ordering::Release);
+                // 325：编辑态一出现即上闩（**per-gen**）——此后本次录音的 accuracy 回灌一律停，
+                // 直到下一代（防「编辑退出后迟到回灌把用户刚打的字冲掉」）。
+                ACC_REFLOW_EDIT_LATCH.store(true, Ordering::Release);
                 // ASR-038-C: 用户点击 overlay 文本区进入编辑态
                 // 停录音 + 取消 pipeline（关 WebSocket 由 ASR 线程检测 cancel_signal 处理）
                 cancel_signal.store(true, Ordering::Relaxed);
@@ -7953,9 +8057,12 @@ fn spawn_worker_thread(
                             ..acc_cfg
                         };
                         let send_offline = acc_offline.map(transcription::SendOfflineRecognizerRef);
+                        // 325：载荷加 `committed_len`（派发当刻浮层显示字符数，回灌边界）。
                         let (acc_tx, acc_rx) =
-                            crossbeam_channel::bounded::<(usize, Vec<Vec<f32>>)>(64);
+                            crossbeam_channel::bounded::<(usize, usize, Vec<Vec<f32>>)>(64);
                         let acc_script = config.audio.chinese_script;
+                        // 325：acc worker 逐片回灌预览所用的事件发送端（代际在 worker 内捕获）。
+                        let acc_event_tx = event_tx.clone();
 
                         // scoped：ASR 线程借 online recognizer，worker 线程跑 record_streaming，
                         // accuracy worker 借 **offline** recognizer 并行转写派发片。
@@ -7981,7 +8088,9 @@ fn spawn_worker_thread(
                                         let mut total_decode_ms = 0.0f64;
                                         // 320：前序分片累计文本（本 worker 按序解码 ⇒ 天然因果可用、无并行损失）。
                                         let mut acc_text = String::new();
-                                        for (idx, sub_segs) in acc_rx {
+                                        // 325：本片覆盖范围（segs 0..=idx）内是否含失败片 ⇒ 有洞则回灌一律跳。
+                                        let mut has_hole = false;
+                                        for (idx, committed_len, sub_segs) in acc_rx {
                                             if cancel_acc.load(Ordering::Acquire) {
                                                 // 判据 #3：取消时不把已取消的结果带进下游。
                                                 break;
@@ -8020,10 +8129,21 @@ fn spawn_worker_thread(
                                                         );
                                                         texts.push(String::new());
                                                         all_native = false;
+                                                        // 325：覆盖区有洞 ⇒ 该片及后续片的回灌全部跳过。
+                                                        has_hole = true;
                                                     }
                                                 }
                                             }
                                             ordered.push((idx, texts));
+                                            // 325：把本片覆盖区的权威文本回灌预览（代际盖章，走既有事件通道）。
+                                            // 空串/有洞也照发，由消费端 gate 判定并记 action 遥测（不在此静默丢）。
+                                            let _ = acc_event_tx.send(PipelineEvent::PreviewReflow {
+                                                generation: session_generation,
+                                                seg_index: idx,
+                                                committed_len,
+                                                has_hole,
+                                                acc_text: acc_text.clone(),
+                                            });
                                         }
                                         (ordered, all_native, total_decode_ms)
                                     }))
@@ -8051,9 +8171,9 @@ fn spawn_worker_thread(
                                         ));
                                     },
                                     acc_cfg,
-                                    |idx, segs| {
+                                    |idx, committed_len, segs| {
                                         // 派发片送 accuracy worker（worker 不存在 ⇒ send 失败，忽略）。
-                                        let _ = acc_tx.send((idx, segs));
+                                        let _ = acc_tx.send((idx, committed_len, segs));
                                     },
                                 )
                             });
@@ -8841,6 +8961,8 @@ fn overlay_request_for_event(event: &PipelineEvent) -> platform::OverlayRequest 
         PipelineEvent::StreamingText(_, _, _) => platform::OverlayRequest::Show, // macOS 侧流式文本暂不渲染
         // LOCALRT-FIRSTCHAR-282: 本地流式收尾预览（macOS 侧流式文本暂不渲染，同 StreamingText）
         PipelineEvent::StreamingFinalPreview(_) => platform::OverlayRequest::Show,
+        // ACC-PREVIEW-REFLOW-325: 本地档 accuracy 回灌预览（macOS 侧流式文本暂不渲染，同 StreamingText）
+        PipelineEvent::PreviewReflow { .. } => platform::OverlayRequest::Show,
         PipelineEvent::Done | PipelineEvent::Cancelled => platform::OverlayRequest::Hide,
     }
 }
@@ -8929,6 +9051,13 @@ fn handle_pipeline_event(event: &PipelineEvent, ui_language: config::UiLanguage)
             log::debug!(
                 "macOS pipeline: StreamingFinalPreview ({} chars)",
                 text.len()
+            );
+        }
+        // ACC-PREVIEW-REFLOW-325: 本地档 accuracy 回灌预览（macOS 侧流式文本暂不渲染）
+        PipelineEvent::PreviewReflow { acc_text, .. } => {
+            log::debug!(
+                "macOS pipeline: PreviewReflow ({} chars, 本地档专用，暂不渲染)",
+                acc_text.chars().count()
             );
         }
     }
@@ -9192,6 +9321,147 @@ fn assemble_parallel_accuracy(mut segments: Vec<(usize, Vec<String>)>) -> Vec<St
 /// （与 BUG-119「没说话」路径一致，由旧路径给出 NoSpeech）。
 fn acc_parallel_result_usable(cancelled: bool, joined: &str) -> bool {
     !cancelled && !joined.trim().is_empty()
+}
+
+/// ACC-PREVIEW-REFLOW-325：合成回灌预览 —— `acc_text` 替换 `streaming` 的前 `committed_len`
+/// 个**字符**，其余保留流式尾巴。按**字符**（非字节）切，避免 UTF-8 切裂。
+fn reflow_preview(acc_text: &str, streaming: &str, committed_len: usize) -> String {
+    let mut out = String::with_capacity(acc_text.len() + streaming.len());
+    out.push_str(acc_text);
+    out.extend(streaming.chars().skip(committed_len));
+    out
+}
+
+/// ACC-PREVIEW-REFLOW-325：回灌决策（纯函数，消费端 controller 线程调用）。
+///
+/// 优先级（高 → 低）：
+/// 1. **编辑闩锁**（本次录音进过一次编辑态即永久停，per-gen）——
+///    防「编辑退出后迟到的回灌把用户刚打的字冲掉」；
+/// 2. **取消/停止**（`STREAMING_STOPPED`；编辑也置它）；
+/// 3. **陈旧 seg**（`seg_index <= 已应用`）—— 单调键是 seg_index，不是 committed_len；
+/// 4. **覆盖区有洞**（该片覆盖范围内含 accuracy 失败片）—— 带洞文本比空串更糟；
+/// 5. **acc 空**（不能把已显示前缀抹白）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReflowAction {
+    Applied,
+    SkippedEditing,
+    SkippedCancel,
+    SkippedStale,
+    SkippedHole,
+    SkippedEmpty,
+}
+
+fn reflow_action(
+    edit_latched: bool,
+    stopped: bool,
+    seg_index: usize,
+    last_applied_seg: i64,
+    has_hole: bool,
+    acc_empty: bool,
+) -> ReflowAction {
+    if edit_latched {
+        return ReflowAction::SkippedEditing;
+    }
+    if stopped {
+        return ReflowAction::SkippedCancel;
+    }
+    if (seg_index as i64) <= last_applied_seg {
+        return ReflowAction::SkippedStale;
+    }
+    if has_hole {
+        return ReflowAction::SkippedHole;
+    }
+    if acc_empty {
+        return ReflowAction::SkippedEmpty;
+    }
+    ReflowAction::Applied
+}
+
+#[cfg(test)]
+mod preview_reflow_325_tests {
+    use super::{reflow_action, reflow_preview, ReflowAction};
+
+    /// 硬点 1 边界：committed_len 之前用 acc、之后保留流式尾巴。
+    #[test]
+    fn reflow_preview_boundary() {
+        // acc 覆盖前 2 字，保留尾巴「CD」
+        assert_eq!(reflow_preview("Xy", "ABCD", 2), "XyCD");
+        // committed_len = 0 ⇒ acc + 全部流式
+        assert_eq!(reflow_preview("Xy", "ABCD", 0), "XyABCD");
+        // committed_len = 流式长度 ⇒ 只剩 acc
+        assert_eq!(reflow_preview("Xy", "ABCD", 4), "Xy");
+        // committed_len 超过流式长度 ⇒ 仍只剩 acc（不 panic、不越界）
+        assert_eq!(reflow_preview("Xy", "AB", 9), "Xy");
+        // acc 空 ⇒ 等于「砍掉前缀」，本身不由本函数负责（调用方 SkippedEmpty）；此处只锁行为
+        assert_eq!(reflow_preview("", "ABCD", 2), "CD");
+    }
+
+    /// 硬点 2：编辑闩锁 —— 一旦上闩，即便 `stopped` 已复位也一律 SkippedEditing。
+    /// 这覆盖「进编辑 → 退出编辑 → 再来回灌」的序列（闩锁在 controller 线程置位，不随退出清）。
+    #[test]
+    fn reflow_action_edit_latch_persists() {
+        // 编辑中：编辑态 + 停止态
+        assert_eq!(
+            reflow_action(true, true, 3, 1, false, false),
+            ReflowAction::SkippedEditing
+        );
+        // 退出编辑后（OVERLAY_EDITING 复位、甚至 STREAMING_STOPPED 也复位）——闩锁仍在 ⇒ 仍跳
+        assert_eq!(
+            reflow_action(true, false, 4, 1, false, false),
+            ReflowAction::SkippedEditing
+        );
+    }
+
+    /// 取消/停止 ⇒ SkippedCancel。
+    #[test]
+    fn reflow_action_cancel() {
+        assert_eq!(
+            reflow_action(false, true, 3, 1, false, false),
+            ReflowAction::SkippedCancel
+        );
+    }
+
+    /// 单调键 = seg_index：`seg <= 已应用` ⇒ SkippedStale（防迟到回灌回退预览）。
+    /// 🔴 反例锁定：即便 committed_len/内容不同，只要 seg 不增即跳。
+    #[test]
+    fn reflow_action_stale_by_seg_not_len() {
+        assert_eq!(
+            reflow_action(false, false, 2, 2, false, false),
+            ReflowAction::SkippedStale
+        );
+        assert_eq!(
+            reflow_action(false, false, 1, 5, false, false),
+            ReflowAction::SkippedStale
+        );
+        // seg 前进 ⇒ 通过（即便 has_hole 之后再判）
+        assert_eq!(
+            reflow_action(false, false, 6, 5, false, false),
+            ReflowAction::Applied
+        );
+    }
+
+    /// 覆盖区有洞（accuracy 失败片）⇒ SkippedHole（带洞文本不得上屏，保留流式预览）。
+    #[test]
+    fn reflow_action_hole() {
+        assert_eq!(
+            reflow_action(false, false, 6, 5, true, false),
+            ReflowAction::SkippedHole
+        );
+        // 洞优先于空（都成立时报洞，语义更准）
+        assert_eq!(
+            reflow_action(false, false, 6, 5, true, true),
+            ReflowAction::SkippedHole
+        );
+    }
+
+    /// acc 空 ⇒ SkippedEmpty（约束 4：不得把已显示预览抹白）。
+    #[test]
+    fn reflow_action_empty() {
+        assert_eq!(
+            reflow_action(false, false, 6, 5, false, true),
+            ReflowAction::SkippedEmpty
+        );
+    }
 }
 
 #[cfg(test)]

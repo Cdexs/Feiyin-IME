@@ -1892,3 +1892,35 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 2. `CLEANUP_INSTR_EN` **不替代** `src/text_normalizer.rs` 的 `apply_filler_strip` 确定性兜底，两者并存，勿摘。
 
 **平台特有代码**：无改动（未触 `src/platform/**`）。**构建产物/依赖/工具链**：无变化。
+
+## ITN-SHIFEN-323（2026-09-21，coder-2）· 「十分」程度副词误转修复 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| `src/itn.rs::check_protection` 新增带**右邻条件**的 `protect.degree_adverbs` 组（十分/万分/百般/万般）：右邻构成数词读法（分钟/米/之…）则不保护，否则保持汉字 | ⚠️ **行为变更，平台中立**：`src/itn.rs` 无 `#[cfg]`，macOS 编译同一份代码 ⇒ 自动继承同一行为，无需重写 |
+| `itn-rules.toml` 新增 `[protect.degree_adverbs]`（`src/itn.rs` 经 `include_str!` 内置默认 + exe 同级覆盖） | ✅ 外置规则；macOS 打包时同步该 toml 即可，不打包亦用内置默认（DEC-011） |
+| macOS 侧需要做什么 | ✅ **无需代码改动**；未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未触 `src/platform/**` |
+
+## PREROLL-DEAD-322（2026-09-21，coder-1）· pre-roll「全零」定根因 + 诊断口径修正 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| 结论：环形缓冲装的是麦克风当时的**真实输出**，不是空转 | ✅ **平台中立结论**。空闲期回调 **100% 非零**（`nz_ratio=1.000` / `exact_zero=0`，峰值 ≈1e-7~1e-6），曾被 `{:.4}` 显示成 `0.0000`、16-bit 落盘量化成 0。macOS 侧排查同类问题同样应看 **dBFS / 非零占比**，不要看 4 位小数或 16-bit 落盘 |
+| `src/audio/mod.rs` 新增 `DIAG_DBFS_FLOOR` / `peak_to_dbfs` / `nonzero_ratio` / `diag_peak_nz`；`pre_roll_diag` 与 `dump_log` 改打 `peak`(dBFS) + `nz_ratio` | ⚠️ **行为变更（仅日志文本）**：该文件平台中立、无 `#[cfg]` ⇒ macOS 编译同一份代码、同一日志格式；解析 `[LocalRT-DBG-278]` / `[LocalRT-DBG-292]` 的脚本需同步字段名 |
+| `[LocalRT-DBG-292]` 文件② 的 `first_speech_at` / `head_clipped` 改为按**文件②自己的样本**重算（旧写法复用文件①，会给含语音的文件②打 `first_speech_at=none`） | ⚠️ **日志语义修正**，平台中立。`PreRollDump` 内部删去 `offset` / `head_clipped` 两个字段（模块私有不对外，无外部契约） |
+| 新增一支 `#[ignore]` 手工硬件探针 `pr322_idle_probe_manual` | ✅ 手动跑法 `cargo test pr322_idle_probe -- --ignored --nocapture`；只开默认输入设备只读，不播放声音、不写文件。macOS 上可跑：探针内含的端点音量段 `pr322_endpoint_volume_level` 是 `#[cfg(target_os = "windows")]`，macOS 自动跳过该段，其余照跑 |
+| 新增 3 条纯函数回归用例（dBFS 口径 / LSB 抖动 nz_ratio / 文件② 自报 offset） | ✅ 平台中立，macOS 一并生效 |
+| macOS 侧需要做什么 | ✅ **无需代码改动**；未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未引入依赖、未触 `src/platform/**` |
+
+**下游线索（不在本单范围，勿顺手改）**：C920 采集链在无人说话时 ≈-120~-140 dBFS、说话时才抬到 ≈-16 dBFS
+（~120 dB 落差）⇒ 链路上有**电平触发的降噪/AGC（设备 DSP 或端点 APO）**。该闸的 **attack 时间**疑正在吃掉
+**首字爆破音**，与 Gavin 长期报的「首字不准（『你』听成『按』）」吻合。macOS 侧若用内置麦
+（CoreAudio + 系统级「语音隔离」）也可能存在同类闸门，排查首字问题时建议先确认链路是否被闸。
+
+## ACC-PREVIEW-REFLOW-325（2026-09-21，coder-2）· accuracy 分片权威文本回灌预览 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| 新增 `PipelineEvent::PreviewReflow { generation, seg_index, committed_len, has_hole, acc_text }`；**只有本地实时档**的 accuracy worker 会发（在线/批处理结构上永不发） | ⚠️ **行为变更，平台中立事件**：事件定义在无 `#[cfg]` 区；macOS 侧 `overlay_request_for_event` / `handle_pipeline_event` 已补 arm（映射 `Show`，暂不渲染，同 `StreamingText`/`StreamingFinalPreview` 先例）⇒ macOS 编译通过、行为与「流式文本暂不渲染」一致 |
+| 消费端回灌 gate（编辑闩锁 / 取消 / 陈旧 seg / 有洞 / 空）与 `reflow_preview` 合成 | ✅ 平台中立纯逻辑（`reflow_action` / `reflow_preview` 纯函数，可单测）；macOS 若将来渲染流式文本可直接复用 |
+| macOS 侧需要做什么 | ✅ **无需改动**；未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未触 `src/platform/**` |

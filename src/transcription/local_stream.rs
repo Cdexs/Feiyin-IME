@@ -361,7 +361,10 @@ fn endpoint_confirm_text<'a>(main: &'a str, full: &'a str, shadow: Option<&'a st
 /// - `on_result`：文本变化回调，传 `(display_text, display_words)`，与 qwen 路径同构
 /// - `acc_cfg`：LOCALRT-PARALLEL-ACC-298 派发配置（`enabled`/`silence_ms`/`min_seg_ms`）；
 ///   `enabled=false` 时本函数**完全不派发**（逐位退回串行行为）
-/// - `on_segment`：accuracy 并行派发回调，传 `(seg_index, 已加 padding 的 16k f32 子段列表)`。
+/// - `on_segment`：accuracy 并行派发回调，传
+///   `(seg_index, committed_len, 已加 padding 的 16k f32 子段列表)`。
+///   `committed_len` = **派发当刻浮层已显示文本的字符数**（325 回灌边界；取 `last_display`，
+///   与消费侧 `last_streaming_text` 镜像同源）。
 ///   子段列表通常 1 个；未派发区间超 20s 时由 `build_padded_segments` 硬切为多个。
 ///   🔴 只在 `acc_cfg.enabled` 且满足 800ms/3s/latch 条件时被调用
 ///
@@ -380,7 +383,7 @@ pub fn transcribe_streaming_local(
     silence_threshold: f32,
     mut on_result: impl FnMut(&str, &[WordTiming]),
     acc_cfg: AccDispatchConfig,
-    mut on_segment: impl FnMut(usize, Vec<Vec<f32>>),
+    mut on_segment: impl FnMut(usize, usize, Vec<Vec<f32>>),
 ) -> Result<(String, Vec<f32>)> {
     let is_cancelled = || {
         cancel_signal
@@ -736,7 +739,11 @@ pub fn transcribe_streaming_local(
                         acc_dispatched_end
                     );
                 }
-                on_segment(acc_seg_index, padded);
+                // ACC-PREVIEW-REFLOW-325：记下**派发当刻浮层已显示文本的字符数**（committed_len）。
+                // 🔴 用 `last_display`（实际已上屏、含标点的串，与镜像 `last_streaming_text` 同源），
+                //    不用 `state.display_text()`（裸文本，标点差会造成回填边界偏移）。
+                let committed_len = last_display.chars().count();
+                on_segment(acc_seg_index, committed_len, padded);
                 acc_seg_index += 1;
             }
             // 无论 padded 是否为空都推进起点 + 上 latch：避免同一停顿反复尝试。
@@ -828,7 +835,8 @@ pub fn transcribe_streaming_local(
                     acc_dispatched_end
                 );
             }
-            on_segment(acc_seg_index, padded);
+            let committed_len = last_display.chars().count();
+            on_segment(acc_seg_index, committed_len, padded);
         }
         // 尾片是最后一次派发：函数即将返回，无需再推进 `acc_dispatched_end`/`acc_seg_index`
         // （推进了也无人读 ⇒ 触发 unused_assignments）。
