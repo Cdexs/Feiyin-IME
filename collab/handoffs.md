@@ -225,6 +225,20 @@
 - **⚠️ 协作事件**：主控文档 commit `99799c5`（10:26:26）在本题进行中执行，**把我未完成的 `local_stream.rs` 与 coder-1 的 `src/audio/mod.rs` 一并扫入**（commit message 未反映代码改动）。本单改动已随之落盘、worktree 无额外 diff；`git status` 另见 `.gitignore` + `src/audio/mod.rs`（非本单）。请主控知悉该 commit 语义与文件归属。
 - **红线**：只改 `local_stream.rs` / 未动版本 / 未自行 commit / 未出包 / 未跑 `cargo build --release` / 零凭证。
 
+## 2026-09-21 — tester-1 — TEST-EXEC + BUILD-321 ✅ 全量回归 + 出包（八项 PASS，Qwen3 迁移批次）
+
+- **基线**：HEAD `51df565`（320 收尾），clean、`ui/` 零 diff。包含 307/308/303+305/318/314+315+320/317+320。
+- **回归**：root **1367P/0F/16I**（EXIT 0，**与 coder-1 独立复现一致**）；`src-tauri` **85P/0F/0I**；Vitest **SKIP**（`ui/` 零 diff）。
+- **增量**（对比 TEST-EXEC-309 1349P/15I）：**NEW 19 / GONE 0** = 8 `homophone::tests` + 10 `transcription::tests`（320）+ 1 `local_stream`（317+320）；`migrate320_qwen3_recognizer_constructs` `#[ignore]` ⇒ **+18 运行/+1 ignored**（1349→1367、15→16 ✓）。
+- **🔴 逐条点名护栏 38/38 ok**：`guard291_g1..g4`、`guard_293_i5`、`nospeech_122` 8/8、`guard_214_215` 12/12、`overlay_121` 10/10、`flicker_130` 3/3 ⇒ 三处源码改动未致扫描区塌缩；318 同音边界 `homophone::tests t1~t8` 8/8。
+- **附带核实**：`src/transcription/` 可调 env 读取点**归零**（仅剩 `current_exe`/`temp_dir`）；`homophone-rules.toml` 为 `include_str!` 内嵌（exe 同级覆盖），Publish 侧无该 toml 也走内置 = 正确规则，**非缺陷**。
+- **BUILD-321**：Step1–4 全走；源码 mtime 前后 md5 一致（`7ace5bba…`）。产物 main `ea426a0c…`（14,612,480B/15:29，较 306 **+120,832B**）/ ui `8a0a891f…`（10,060,288B）/ crash `c9d7f17c…`（24,879,104B/15:28）；两副本相等；main 异于 BUILD-306（`bc043e25…`）。八项逐项 PASS（①时间戳 ②sha ③0.9.2 ④冒烟 PID 26352 Responding=True/无新 crash.json/残 0 ⑤config `da2be5da…`+wordbook `b6ab43ac…` 零变化 ⑥110/9/17 ⑦探针 ⑧toml 三副本全等）。
+- **探针**：`[LocalRT-DBG-320]`=1 / `[MIGRATE-QWEN3-320]`=1 / `[LocalRT-DBG-307]`=2 / `293`=1 / `298`=4 / `291`=1 / `292`=2 / `284`=4 / `289`=1 / `276`=3 / `277`=1 / `278`=2；同音规则 `满头大汉`=1 / `满头大汗`=1（318 进包）。
+- **🔴 两条模型附加核验**：① **Qwen3 进 `Publish/models/`** ✅（构建前缺失已上报；内容级 sha 三主文件 + tokenizer 三文件两侧全等）；② **FunASR Nano ⚠️ 仍有一处引用**——`mod.rs:1019` `hotwords_tokenizer()` 仍从 nano 目录取 `Qwen3-0.6B/tokenizer.json`（**只计 token，非 ASR**；accuracy ASR 已是 Qwen3 单引擎）⇒「exe 不再引用 nano」不成立，如实报出；建议改指 Qwen3 ASR 模型自带 tokenizer，等主控定。sense-voice=2 属 performance 档/报错文案，预期内。
+- **Gavin 端测四组**：A 浮层预览（307 `gained` 多数应为 1／308 `mode=residual`）／B 最终文字（Qwen3 CER、**韩文应正确**、口水词）／C `tail_wait` + `[LocalRT-DBG-320] action=redecode` 频次／D 本地流式+翻译。🔴 **本包无任何 env 可调**（切片5s/静默800ms/上下文500字/词条200/线程按核数）。
+- **证据**：`collab/outbox/tester-1/testexec321/`。
+- **红线**：版本 0.9.2 未动 / 未 commit / 未 `cargo clean` / 未破坏性 git / 零凭证。
+
 ## 2026-09-21 — tester-1 — TEST-SWEEP-319 🔴 blank_penalty 曲线：对流式 paraformer 完全无效（只测量）
 
 - **归属**：HEAD `2d814a7`；工作区非 clean（`M src/transcription/mod.rs`，coder-1 315 在途）；只测量、不出包。
@@ -383,3 +397,11 @@
 - **诚实边界**：本机 LL 钩子不接受注入 Right-Alt → 运行时未触发录音路径（276/277/278/283/289 由探针+单测坐实）；尾字与四条修复效果待 Gavin 录音。
 - **证据**：`collab/outbox/tester-1/testexec290/` + `build290/`。
 - **红线**：版本 0.9.2 未动 / 未 commit / 未改生产代码 / 备份未删 / 零凭证。
+
+## 2026-09-21 — 主控 — ORCH-CTX-GUARD-FIX-324 ✅ 护栏收窄 + 埋点修正 + 清理指令恒发
+
+- **背景**：BUILD-321 端测日志分析（`collab/evidence/20260921-build321-e2e/debug-build321.log`，11 次录音）。
+- **改动**：`src/transcription/mod.rs` 单文件，53+/19-。① 护栏 LCS 比对面由整个 system 收窄为仅 `ctx`，并加无前文跳过门；② `out_chars` 改记判决当时长度、新增 `final_chars`；③ 新增 `CLEANUP_INSTR_EN` 恒发，`build_ctx_system` 契约改为恒返回 `Some`，`CTX_INSTR_EN` 拆出仅在有前文时追加。
+- **验证**：fmt clean / check 0 error / warnings **101** = 基线 / `ctx320` **6/6**。
+- **红线**：未动版本号 / 未出包 / 未碰 coder-1（`src/audio/mod.rs`）与 coder-2（`src/itn.rs`、`itn-rules.toml`）在飞文件 / 零凭证。
+- **待端测判据**：`action=redecode` 频次应显著低于改前的 43%（6/14）。

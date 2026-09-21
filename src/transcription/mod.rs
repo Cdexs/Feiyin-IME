@@ -228,6 +228,17 @@ const CTX_DEFAULT_CHARS: usize = 500;
 const CTX_ECHO_LCS_ABS: usize = 20;
 /// 回显判定：LCS ≥ 输出的此比例（短输出也可能整段回显）。
 const CTX_ECHO_LCS_RATIO: f64 = 0.5;
+/// 输出清理指令：**恒发**，与有没有上下文、有没有词条都无关（Gavin 2026-09-21 指示）。
+///
+/// 口吃、重复词、口水词在 ASR 原始输出里很常见，模型自己顺掉最好。Gavin 口径：
+/// 「指令不要太长，反正即使不起作用，它也占不了多少上下文的窗口。」
+/// ⇒ 一句话、十来个 token，对 DEC-068 零和预算的挤占可忽略。
+///
+/// 🔴 这**不替代**下游 `apply_filler_strip`（`src/text_normalizer.rs`）：
+///    那是确定性兜底，本指令是尽力而为，两者并存，别因为加了这句就去摘兜底。
+const CLEANUP_INSTR_EN: &str =
+    "Transcribe cleanly: drop stutters, repeated words, and filler words.";
+/// 上下文说明句：**只在真有前文时**才发（没有前文还说「以下是前文」纯属误导模型）。
 const CTX_INSTR_EN: &str = "The following is the preceding context of this recording. Use it to keep terminology and wording consistent.";
 
 /// 取字符串**最后** n 个字符（最近的最相关）；不足 n 全取。
@@ -245,11 +256,13 @@ fn last_n_chars(s: &str, n: usize) -> String {
 fn build_ctx_system(context: Option<&str>, terms: Option<&str>) -> Option<String> {
     let c = context.unwrap_or("").trim();
     let t = terms.unwrap_or("").trim();
-    if c.is_empty() && t.is_empty() {
-        return None;
-    }
-    let mut s = String::from(CTX_INSTR_EN);
+    // 🔴 **恒返回 Some**（2026-09-21 契约变更）：清理指令与上下文/词条无关，永远要发。
+    //    旧行为是「都空 ⇒ None ⇒ 整段不注入」，那样一来新用户（词库为空）本次录音的
+    //    第一片就拿不到清理指令 —— 正是最需要它的时候。别改回去。
+    let mut s = String::from(CLEANUP_INSTR_EN);
     if !c.is_empty() {
+        s.push('\n');
+        s.push_str(CTX_INSTR_EN);
         s.push_str(&format!("\nContext: {c}"));
     }
     if !t.is_empty() {
@@ -414,21 +427,32 @@ pub(crate) fn transcribe_acc_ctx(
         script,
     )?;
     // D：ctx 定稿后才做长跨回显护栏（命中 ⇒ 无上下文重解，不丢片）。
+    //
+    // 🔴 比对面**只取 `ctx`**（前文时间线），不含 `CTX_INSTR_EN` 指令句、也不含 `Terms:` 词库段。
+    //    2026-09-21 BUILD-321 端测实测：原先拿整个 system 串比对，73 字词库一并进了 LCS，
+    //    于是「用户说到词库里的词」被判成回显 —— 14 次触发 6 次重解（43%）。
+    //    词库本来就是注入去帮模型认词的，认对了反而被护栏抵消掉，等于自己打自己。
+    //    回显要防的是**前文被逐字念回**，与词条无关、与英文指令更无关。改回 sys = 直接复发。
+    //
+    // 🔴 `ctx` 为空时整块跳过：没有前文就不存在「回显前文」，此时只注了词库，
+    //    再比对必然是误判（上面那 43% 里就有这种）。
     let mut lcs = 0usize;
     let mut action = CtxEchoAction::Keep;
-    if inject_on {
-        if let Some(sys) = system.as_deref() {
-            let (l, a) = ctx_echo_action(&normalize_ctx_probe(&text), &normalize_ctx_probe(sys));
-            lcs = l;
-            if a == CtxEchoAction::Redecode {
-                action = CtxEchoAction::Redecode;
-                text = decode_accuracy_once(recognizer, samples, None, script)?;
-            }
+    // 🔴 判决依据是**带上下文那一次**的输出；命中后 `text` 会被重解结果覆盖。
+    //    埋点必须记判决当时的长度，否则日志里 lcs 与 out_chars 对不上（lcs=7/out=15 看着
+    //    既不够 20 也不够 50%，实际判决时输出比 15 短）——监控失真，护栏误触就查不出来。
+    let decided_out_chars = text.chars().count();
+    if inject_on && !ctx.is_empty() {
+        let (l, a) = ctx_echo_action(&normalize_ctx_probe(&text), &normalize_ctx_probe(&ctx));
+        lcs = l;
+        if a == CtxEchoAction::Redecode {
+            action = CtxEchoAction::Redecode;
+            text = decode_accuracy_once(recognizer, samples, None, script)?;
         }
     }
     if log::log_enabled!(log::Level::Debug) {
         log::debug!(
-            "[LocalRT-DBG-320] ctx inject: seg={} prev2_len={} prev1_len={} acc_len={} ctx_raw_len={} ctx_len={} cut={} terms_len={} out_chars={} lcs={} action={}",
+            "[LocalRT-DBG-320] ctx inject: seg={} prev2_len={} prev1_len={} acc_len={} ctx_raw_len={} ctx_len={} cut={} terms_len={} out_chars={} final_chars={} lcs={} action={}",
             seg_idx,
             lens[0],
             lens[1],
@@ -437,6 +461,7 @@ pub(crate) fn transcribe_acc_ctx(
             ctx_len,
             cut,
             terms_len,
+            decided_out_chars,
             text.chars().count(),
             lcs,
             if action == CtxEchoAction::Redecode {
@@ -2229,14 +2254,23 @@ mod tests {
     #[test]
     fn ctx320_build_system_labels_and_timeline_order() {
         let s = build_ctx_system(Some("前文内容"), Some("词A,词B")).unwrap();
-        assert!(s.starts_with(CTX_INSTR_EN), "第一行英文说明句");
-        assert!(s.contains("\nContext: 前文内容"), "第二行 Context 标签");
-        assert!(s.contains("\nTerms: 词A,词B"), "第三行 Terms 标签");
-        assert!(build_ctx_system(None, None).is_none(), "都空 ⇒ 不注入");
-        assert!(
-            build_ctx_system(Some("  "), Some(" ")).is_none(),
+        assert!(s.starts_with(CLEANUP_INSTR_EN), "第一行恒为清理指令");
+        assert!(s.contains(CTX_INSTR_EN), "有前文 ⇒ 带上下文说明句");
+        assert!(s.contains("\nContext: 前文内容"), "Context 标签");
+        assert!(s.contains("\nTerms: 词A,词B"), "Terms 标签");
+        // 🔴 契约（Gavin 2026-09-21）：清理指令**恒发**，都空时也要有，且此时只有它。
+        let bare = build_ctx_system(None, None).expect("都空也必须注入清理指令");
+        assert_eq!(
+            bare, CLEANUP_INSTR_EN,
+            "都空 ⇒ 仅清理指令，无 Context/Terms"
+        );
+        assert_eq!(
+            build_ctx_system(Some("  "), Some(" ")).expect("空白等同空，但仍发清理指令"),
+            CLEANUP_INSTR_EN,
             "空白等同空"
         );
+        // 无前文时不得出现「以下是前文」这句，否则等于骗模型去找不存在的上文
+        assert!(!bare.contains(CTX_INSTR_EN), "无前文 ⇒ 不带上下文说明句");
         // 时间线：顺序恒为 上上次 → 上一次 → 本次；超长只砍最旧端（取尾）
         let (raw, lens) = merge_ctx_timeline(Some("上上次"), Some("上一次"), Some("本次片一"));
         assert_eq!(raw, "上上次\n上一次\n本次片一", "时间顺序不可颠倒");

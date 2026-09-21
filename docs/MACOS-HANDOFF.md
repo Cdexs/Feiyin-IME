@@ -1875,3 +1875,20 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 挂载点 `run_pipeline_core` 内、转录之后、ITN 主通道之前（`main.rs`） | ✅ `run_pipeline_core` 已无 `#[cfg]`，macOS 自动继承同一节点与位置；四档共用 ⇒ 一处调用全覆盖 |
 | 规则加载：exe 同级 `homophone-rules.toml` 优先，缺失/解析失败回退 `include_str!` 内置默认（DEC-011） | ✅ 两端同一份路径语义；macOS 需打包时把 toml 放 exe 同级可选，**不打包也能用内置默认** |
 | macOS 侧需要做什么 | ✅ **无需改动**；未新增任何 `#[cfg]`、未触碰 `src/platform/**`、未动配置结构、未加用户开关（DEC-031） |
+
+## 2026-09-21 · ORCH-CTX-GUARD-FIX-324（平台中立，macOS 需知悉）
+
+**改动文件**：`src/transcription/mod.rs` —— **平台中立模块，两端编译同一份代码**。
+
+| 项 | 改前 | 改后 | 对 macOS 的影响 |
+| --- | --- | --- | --- |
+| 回显护栏比对面 | 整个 system 串（英文指令 + `Context:` + `Terms:`） | **仅 `ctx`**；`ctx` 为空则整块跳过护栏 | **行为变更**。macOS 若已按旧行为写断言/文档需同步。误触率预期从 43% 大幅下降 |
+| `[LocalRT-DBG-320]` 埋点 | `out_chars` = 重解**后**长度 | `out_chars` = **判决当时**长度；新增 `final_chars` | 日志字段增加一个，解析该行的脚本需同步 |
+| `build_ctx_system` 返回 | ctx 与 terms 都空 ⇒ `None`（不注入） | **恒返回 `Some`**（至少含清理指令） | **契约变更**，影响最大的一条。依赖「都空 ⇒ 不注入」的调用方/测试必须改 |
+| ASR 提示词 | 仅 `CTX_INSTR_EN` | 新增恒发的 `CLEANUP_INSTR_EN`（结巴/重复/口水词）；`CTX_INSTR_EN` 仅在有前文时追加 | 两端 ASR 输出形态可能同步变化（更少口水词） |
+
+**是否需要 macOS 同步改动**：不需要单独改动（同一份代码），但**需知悉两点**：
+1. `build_ctx_system` 恒 `Some` 是契约变更，macOS 侧若有镜像测试会红，按新契约改。
+2. `CLEANUP_INSTR_EN` **不替代** `src/text_normalizer.rs` 的 `apply_filler_strip` 确定性兜底，两者并存，勿摘。
+
+**平台特有代码**：无改动（未触 `src/platform/**`）。**构建产物/依赖/工具链**：无变化。
