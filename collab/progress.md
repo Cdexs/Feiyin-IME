@@ -893,3 +893,14 @@ load_wordbook_vocabulary()
 | 出包 | `BUILD-333` 八项核验逐项 PASS；产物 `feiyin-ime` 14.66MB `703788ed…`（+1,536B）/ `feiyin-ime-ui` 10.05MB `80d79937…`（**−10,240B** = 删提示块）/ `crash-reporter` 24.88MB `c71d46c6…`，时间戳 19:19–19:21；四张规则表三副本全等 |
 | 探针 | 正向 `[LocalRT-DBG-325] streaming render`=1 / `[AUTOLEARN]`=1 / `degree_adverbs`=2 / `nz_ratio`=2；🔴 **反向 5 符号全 0**（332 摘除彻底） |
 | 端测 | 待 Gavin 七条（尾字 325 不归零／🔴 预览编辑不被冲／🔴 自学习=编辑改对后提交、同词连续两次 + 反向不编辑无 `[AUTOLEARN]`／十分·十分钟／pre-roll onset／redecode<43%／🔴 配置界面无模型提示块） |
+
+
+## v0.9.3（批次六 · BUILD-338）· 2026-09-21 · 重复标点修复 + 尾字接缝自适应定界（版本号不升）
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 334 最终输出重复标点 `。。`/`，。`——一片解码失败即误判「文本无标点」致 CT-Transformer 对已打标点全文再打一遍，改为实测 `has_effective_punctuation`；336 流式 paraformer 不提供 token 时间戳（78 条探针全 ts=0，已定性，仅加诊断探针）；337 尾字接缝自适应定界（`committed_len` 记在派发那刻、流式未吐完 ⇒ 按 a 文本稳定 / b 有声恢复 / c 硬上限 三者最先冻结边界，`boundary=a|b|c`） |
+| 回归 | TEST-EXEC + BUILD-338 root **1407P/0F/22I**（全量，NEW 14 = 运行 +9/ignored +5）+ src-tauri **92P/0F/0I**（不变）+ Vitest **100P/11S/0F**；`cargo fmt --check`（不带 `skip_children`）EXIT 0；warnings **99/90/17** |
+| 出包 | `BUILD-338` 八项核验逐项 PASS；产物 `feiyin-ime` 14.68MB `91710a71…`（+14,336B）/ `feiyin-ime-ui` 10.05MB `f729ec28…` / `crash-reporter` 24.88MB `268ad4c7…`，时间戳 22:26–22:28；四张规则表三副本全等 |
+| 探针 | 自检基准 `feiyin`=19；正向 `LocalRT-DBG-337`=4 / `336`=1 / `325`=1 / `AUTOLEARN`=4 / `degree_adverbs`=2 / `nz_ratio`=2；🔴 反向 5 符号全 0 |
+| 端测 | 待 Gavin 五条（🔴 337 尾字接缝 + **b 占比=收益折损须报**／预览编辑闩锁／重复标点消失／自学习两次+反向／335 电平闸旁证） |

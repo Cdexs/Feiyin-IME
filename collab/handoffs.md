@@ -339,6 +339,18 @@
 - **⚠️ 协作事件**：主控文档 commit `99799c5`（10:26:26）在本题进行中执行，**把我未完成的 `local_stream.rs` 与 coder-1 的 `src/audio/mod.rs` 一并扫入**（commit message 未反映代码改动）。本单改动已随之落盘、worktree 无额外 diff；`git status` 另见 `.gitignore` + `src/audio/mod.rs`（非本单）。请主控知悉该 commit 语义与文件归属。
 - **红线**：只改 `local_stream.rs` / 未动版本 / 未自行 commit / 未出包 / 未跑 `cargo build --release` / 零凭证。
 
+## 2026-09-21 — tester-1 — TEST-EXEC + BUILD-338 ✅ 第三批全量回归 + 出包（八项 PASS + 自检基准探针）
+
+- **基线**：HEAD `2ba8b97`，clean，版本 0.9.2。含 334/336/337。
+- **回归（全量未过滤；`cargo fmt --check` 不带 `skip_children` EXIT 0）**：root `cargo test --no-fail-fast` **1407P/0F/22I**（NEW 14/GONE 0：运行 +9 = `punct_double_334_tests` 4 + `seam_337_tests` 5；ignored +5 = `gate335_{asr_ab,capture_envelope}_manual` 2 + `local_stream::tests::{localrt_timestamp_336_probe_offline, seam337_lookahead_probe, seam337_tail_feasibility_probe}` 3）；`src-tauri` **92P/0F/0I**（不变）；Vitest **7 files/100P/11S/0F**。
+- **BUILD-338**：Step1–4 全走；源码 mtime 前后 md5 一致（`c6debf14…`）。产物 main `91710a71…`（14,678,528B/22:28，+14,336B）/ ui `f729ec28…`（10,050,048B，ui 零 diff）/ crash `268ad4c7…`（24,879,104B/22:26）；两副本相等；main 异于 BUILD-333（`703788ed…`）。
+- **八项逐项 PASS**：①时间戳 22:24–22:28 ②sha ③0.9.2（Cargo.toml + tauri.conf.json 未动）④冒烟 PID 20732 Responding=True/无新 crash.json/残 0 ⑤config/wordbook 三时点零变化（两处）⑥**warnings 99/90/17** ⑦四张规则表三副本全等（itn `ab950ba4…`/scene `8ea93bb1…`/homophone `a5fd4a61…`/wordbook `ac9a72ee…`，每张 distinct=1，构建未清空 target/release）⑧探针。
+- **探针（`grep -a -c`，🔴 先打自检基准）**：自检 `feiyin`=**19**（量具可用）；正向 `LocalRT-DBG-337`=4 / `LocalRT-DBG-336`=1 / `LocalRT-DBG-325`=1 / `AUTOLEARN`=4 / `degree_adverbs`=2 / `nz_ratio`=2；反向 `maybe_learn_user_edit`/`AUTO_LEARN_OBSERVE_MS`/`extract_changed_text`/`capture_focused_text_snapshot`/`read_text_from_hwnd` **全 0**。
+- **BUILD-333 小差异已解释**：`grep -a -c "AUTOLEARN"`=4 vs `grep -a -F -c "[AUTOLEARN]"`=1，纯 pattern 差，均 >0。
+- **Gavin 端测五条**：① 🔴 尾字接缝（正常语速连说多句，读 `[LocalRT-DBG-337] boundary=a/b/c` 与 `(a/b/c=?/?/?)`；**b 占比 = 收益折损，须报主控**）② 🔴 预览编辑闩锁 ③ 重复标点 `。。`/`，。` 消失 ④ 自学习同词两次 `(1/2)→(2/2)` + 反向不编辑无 `[AUTOLEARN]` ⑤ 335 电平闸旁证（不必刻意）。
+- **证据**：`collab/outbox/tester-1/testexec338/`。
+- **红线**：版本 0.9.2 未动 / 未改生产代码 / 未 push / 零凭证。
+
 ## 2026-09-21 — tester-1 — TEST-EXEC + BUILD-333 ✅ 第二批全量回归 + 出包（八项 PASS + 反向探针全 0）
 
 - **基线/归属**：HEAD 实测 **`eba918a`**（任务书写 `b0eca48`；其上是**纯文档提交** `docs: [FILTERED-TEST-BLINDSPOT-001]`，仅改 troubleshooting.md +26，无代码影响），clean，版本 0.9.2。含 329/330/331/332。
