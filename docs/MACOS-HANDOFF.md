@@ -1858,3 +1858,11 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 新增 `text_normalizer::strip_fillers_conservative(text: &str) -> String`（规则 A 句首犹豫词 / 规则 B 紧邻重复折叠） | ✅ **平台中立**：纯字符串函数，无 IO、无配置、无全局状态、不接 `&AppConfig`/`AsrModel`/语言档；两端编译同一份代码 |
 | 四语言（中/英/日/韩）规则靠**字面与位置**判定，同时生效，不感知平台/语言 | ✅ macOS 无需改动，无平台分支 |
 | 本单**未接入任何管线**（挂载点由下一单在编排层加） | ✅ 对 macOS 侧零影响；下一单的节点包装亦为平台无关，macOS 想挂同样一行调用 |
+
+## WIRE-FF303-305（2026-09-21，coder-2）· 语气词过滤接入管线 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| `src/main.rs` 新增节点自由函数 `apply_filler_strip(final_text: String, enabled: bool) -> String`，挂在 `run_pipeline_core` 的 `apply_local_punctuation` 之后、`platform::inject_text` 之前 | ✅ **平台中立节点**：`run_pipeline_core` 已无 `#[cfg]`（MACOS-P4-NEUTRAL-002），macOS 侧编译同一份代码 ⇒ 自动继承同一节点与同一位置 |
+| `enabled` 实参 = `!llm_handled`（LLM 未接手才生效） | ✅ 纯布尔，无平台分支、无新用户开关（遵守 DEC-031 单开关） |
+| macOS 侧需要做什么 | ✅ **无需改动**；未新增任何 `#[cfg]`、未触碰 `src/platform/**`、未动配置结构 |

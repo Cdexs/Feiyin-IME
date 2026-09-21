@@ -5,6 +5,14 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-2 — WIRE-FF303-305 ✅ 交付（口水词过滤接进管线，Gavin 要求进本包）
+
+- **改动三文件**：`main.rs`（节点 `apply_filler_strip` `:9849` + 唯一调用点 `:9499`）、`text_normalizer.rs`（删 1 行 `#[allow(dead_code)]`）、`docs/MACOS-HANDOFF.md`（+8）。
+- **位置**：`apply_local_punctuation`（`:9486-9493`）**之后**、`platform::inject_text`（`:9555`）**之前**，实参 `!llm_handled`。
+- **DEC-041 不触**：`enabled=false` 首行原样返回，开 LLM 时完全不执行；四档共用 `run_pipeline_core`，无新判据/开关。
+- **验证**：`rustfmt --check` clean、check 0 error、warnings **110/101** 基线、`numstat`==`-w`、新增 `filler_strip_303_tests` **3P/0F** + `ff303` **35P/0F**。
+- **边界**：未动 298 常量/逻辑（`ACC_MIN_SEGMENT_MS_DEFAULT=5000` 未碰）；未动版本 / 未 commit / 未出包 / 零凭证。
+
 ## 2026-09-21 — coder-1 — FIX-FF303-B ✅ 交付（规则 B 白名单门控 + 韩语空白分词）
 
 - **规则 B 白名单门控**：只有重复单元本身是已知话语标记才折叠（ZH `然后/就是/那个/这个/所以/反正/其实`；EN `i/the/a/and/so/but/like/you/we/it`；JA `その/あの/えー/まあ`；KO `그/저/음`）。`然后然后`→折叠、`研究研究`→原样、`I I`→折叠、`had had`/`that that`→原样。

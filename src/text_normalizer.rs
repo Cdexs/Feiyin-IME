@@ -268,7 +268,6 @@ pub fn is_effective_text(text: &str) -> bool {
 ///   中文限 2–3 字单元（`看看`/`哈哈` 单字叠词与 `研究研究` ABAB 重叠是正常语法，绝不折叠）；
 ///   英/韩按空白分词、查各自白名单（`I I` → `I`、`그 그` → `그`，但 `had had`/`that that` 原样）。
 /// - 全程不做「看起来像」的猜测；只在两条规则明确命中时改动。
-#[allow(dead_code)] // FORMAT-FALLBACK-303 第一步：纯函数先落地，挂载点由下一单接入
 pub fn strip_fillers_conservative(text: &str) -> String {
     let a = strip_leading_fillers(text);
     // 规则 B 可能折叠出新的可折叠串（4 连叠 → 2 连叠）⇒ 迭代到不动点，保证幂等。

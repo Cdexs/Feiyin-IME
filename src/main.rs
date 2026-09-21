@@ -9491,6 +9491,12 @@ fn run_pipeline_core(
                         native_punctuated,
                         punctuation_engine.as_deref_mut(),
                     );
+                    // FORMAT-FALLBACK-303 / WIRE-FF303-305：本地免费口水词过滤。
+                    // 🔴 位置三条件（勿挪）：① 在标点节点之后 ⇒ 规则 A 的「句首」有句读可依；
+                    // ② 在 inject_text 之前；③ `enabled = !llm_handled` ⇒ 只有 LLM 未接手时才动，
+                    // 不触 DEC-041（该条禁的是对 LLM 输出做程序化后处理，此处压根没有 LLM 输出）。
+                    // 四档共用 run_pipeline_core，一处调用即全覆盖，不新增任何管线判据（DEC-066）。
+                    let final_text = apply_filler_strip(final_text, !llm_handled);
                     // PUNCT-GOVERNANCE-030-A L2 后处理补位（架构定位：L1 源头控制为主，L2 补位）
                     // 只负责两件 L1 物理上够不着的事：
                     //   (a) 开关关闭 → 全文剥标点（Qwen3 在线 ASR / 本地 native / NLLB 翻译不可控源兜底）
@@ -9829,6 +9835,58 @@ fn apply_local_punctuation(
         }
     } else {
         final_text
+    }
+}
+/// FORMAT-FALLBACK-303：本地免费口水词过滤节点（**管线无关**，谁要谁挂）。
+///
+/// 仅在 LLM **未接手**时执行：开了 LLM 时 F1 Filler Removal 做得比规则层好，
+/// 且 DEC-041 禁止 Rust 侧对 LLM 输出做程序化后处理。
+///
+/// - `enabled == false` ⇒ **原样返回**，一个字符不动（开 LLM 时本节点完全不执行）
+/// - `enabled == true` ⇒ 返回 `text_normalizer::strip_fillers_conservative(&final_text)`
+///
+/// 变化时打一行 `log::info!`（与 `apply_local_punctuation` 同风格，只在真的改了文本时打）。
+fn apply_filler_strip(final_text: String, enabled: bool) -> String {
+    if !enabled {
+        return final_text;
+    }
+    let stripped = text_normalizer::strip_fillers_conservative(&final_text);
+    if stripped != final_text {
+        log::info!("Filler strip applied: '{}' -> '{}'", final_text, stripped);
+    }
+    stripped
+}
+
+#[cfg(test)]
+mod filler_strip_303_tests {
+    use super::apply_filler_strip;
+
+    /// WIRE-FF303-305 契约 1：`enabled=false` ⇒ 输出与输入**逐字相同**（含语气词也不动）。
+    #[test]
+    fn filler_strip_disabled_is_identity() {
+        let input = "呃，我觉得这个方案可以".to_string();
+        assert_eq!(apply_filler_strip(input.clone(), false), input);
+        // 开 LLM 时走的就是这条路径：一个字符不动。
+        assert_eq!(
+            apply_filler_strip("嗯嗯，可以".to_string(), false),
+            "嗯嗯，可以"
+        );
+    }
+
+    /// 契约 2：`enabled=true` 且含句首语气词 ⇒ 被摘（证明确实接到了纯函数）。
+    #[test]
+    fn filler_strip_enabled_removes_leading_filler() {
+        assert_eq!(
+            apply_filler_strip("呃，我觉得这个方案可以".to_string(), true),
+            "我觉得这个方案可以"
+        );
+    }
+
+    /// 契约 3：`enabled=true` 且无可摘内容 ⇒ 输出与输入逐字相同（不误改）。
+    #[test]
+    fn filler_strip_enabled_noop_when_nothing_to_strip() {
+        let input = "看看有什么好看的电影".to_string();
+        assert_eq!(apply_filler_strip(input.clone(), true), input);
     }
 }
 // MACOS-P4-NEUTRAL-001: 原 #[cfg(target_os = "windows")] 去除——平台中立纯 Rust，run_pipeline_core 调用，对 Windows 为 no-op。
