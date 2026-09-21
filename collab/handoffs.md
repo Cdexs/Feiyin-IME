@@ -348,6 +348,19 @@
 - **⚠️ 协作事件**：主控文档 commit `99799c5`（10:26:26）在本题进行中执行，**把我未完成的 `local_stream.rs` 与 coder-1 的 `src/audio/mod.rs` 一并扫入**（commit message 未反映代码改动）。本单改动已随之落盘、worktree 无额外 diff；`git status` 另见 `.gitignore` + `src/audio/mod.rs`（非本单）。请主控知悉该 commit 语义与文件归属。
 - **红线**：只改 `local_stream.rs` / 未动版本 / 未自行 commit / 未出包 / 未跑 `cargo build --release` / 零凭证。
 
+## 2026-09-22 — tester-1 — TEST-EXEC + BUILD-342 ✅ 出包（八项 PASS）＋🔴 crash 产物待裁
+
+- **基线**：HEAD `fbec727`，clean，版本 0.9.2。含 342（D OR 根因 / A 松手非取消 / F1+F3 假 endpoint 护栏 / padding / B 结论）。
+- **回归（全量未过滤；`cargo fmt --check` 不带 `skip_children` EXIT 0）**：root `cargo test --no-fail-fast` **1416P/0F/22I**（NEW 8/GONE 1）；`src-tauri` **92P/0F/0I**；Vitest **100P/11S/0F**。
+- **BUILD-342**：Step1–4 全走；源码 mtime 前后 md5 一致（`b07b91b3…`）。产物 main `8758ca66…`（14,683,136B/00:18，+4,608B）/ ui `94f2a97a…` / crash `a4e2672d…`；两副本相等；三者异于 BUILD-341。
+- **八项逐项 PASS**：①时间戳 00:13–00:18 ②sha ③0.9.2 ④冒烟 PID 28292 Responding=True/无新 crash.json/残 0 ⑤config+wordbook 本次窗口内零变化 ⑥warnings 99/90/17 ⑦四表三副本全等 ⑧探针（自检 `feiyin`=19；正向 `[LocalRT-DBG-342]`=3/`337`=4/`336`=1/`325`=1/`AUTOLEARN`=4/`degree_adverbs`=2/`nz_ratio`=2；反向 5 符号全 0）。
+- 🔴 **发现 1（待主控裁）**：`target/release/crash.json`（mtime **00:00:34**，早于本 build）报 `Panic: byte index 235 is not a char boundary; it is inside '斯'`（对含中文串按字节下标切片，栈顶 `core::str::slice_error_fail`）。**`fbec727` 未显式修**（`git show fbec727 | grep raw_len` 空）。候选根因：`local_stream.rs:315 raw_full[cache.raw_len..]`（只判长度未判字符边界；`raw_full` 在 shadow/main 间切换时 `raw_len` 可落中文字符中间）。已备份 `testexec342/crash-20260922-0000.json`；**未改生产代码**。
+- **发现 2**：`target/release/wordbook.sqlite` 341→342 间被 app 写（`72dc9738…`→`9477887b…`）；本次窗口内三时点恒定，非本次构建所致。
+- **量化**：冒烟 idle CPU 5s = **0.04%**（31.2ms/5020ms/16核）、WS 1791MB（🔴 idle ≠ 录音期，测不到 D 真实开销）；历史改前（fbec727 前）47 次非尾派发 **最小 silence=800ms（37×800 + 其余各 1，无一 <800）**；`join: total_decode/tail_wait` 历史与本机日志均未捕到 ⇒ **如实报无数据**。
+- **Gavin 端测五条**：① 🔴 D：一口气连说 15s+，`[LocalRT-DBG-298] seg dispatch` 应出现 **silence<800ms** 的派发（改前一次都没有）② 🔴 尾字：说完停住不松手，`[LocalRT-DBG-325/337] reflow applied` 且 action 非 `skipped-cancel` ③ 句尾幻字 ④ 接缝重复（「也可以。」孤立片段）⑤ 其余照旧。
+- **证据**：`collab/outbox/tester-1/testexec342/`（含 `crash-20260922-0000.json`）。
+- **红线**：版本 0.9.2 未动 / 未改生产代码 / 未 push / 零凭证。
+
 ## 2026-09-21 — tester-1 — TEST-EXEC + BUILD-341 ✅ 全量回归 + 出包（含 340 尾字直接修；八项 PASS，340 探针 N/A 已说明）
 
 - **基线**：HEAD `62484a1`（LOCALRT-TAILPAD-340），clean，版本 0.9.2。含 340 + 继承 334/336/337。
@@ -586,4 +599,14 @@
 - **B 结论**：`[DBG-325]` 打点在消费端；15:33 seg#3 的 7.13s 是**真解码**（worker 空闲 3.97s 无排队），因 `action=redecode`（`out_chars=222`/`lcs=197`）触发第二次无上下文重解；主线程重解码仅 304.6ms 非主因；F1 对该片仅省 104.5ms。
 - **padding 结论**：实时单段路径前向 padding 被 clamp=0、后向填充为 0.0 静音 ⇒ 无音频重叠、无「接缝转写两遍」；建议后续移除后向零填充，**本单未改**。
 - **验证**：fmt clean / check 0 error / warnings **99/90** 基线 / numstat==-w / 全量 `cargo test` 0 failed。
+- **红线**：未动版本号 / 未出包 / 未 commit / 零凭证。
+
+---
+
+## LOCALRT-344（coder-2，2026-09-22）
+
+- **背景**：BUILD-342 端测 `crash.json` 报 `byte index 235 is not a char boundary`；Gavin 要求主路径不得加拖累机制。
+- **改动（仅 `src/transcription/local_stream.rs`）**：①P0 复核采纳 `is_char_boundary`（O(1)），抽 `punct_cache_reuse` + 2 条回归单测；②回滚 340 shadow 补静音 / 340 收尾补静音 / 307 整句全量重解码，删 `feed_tail_silence`+3 调用+2 常量（无死代码），`endpoint_confirm_text` 三方→两方；③护栏：tailpad340 顺序红线随机制移除（原位注释），G3 计数 2→1 同步断言。
+- **字节切片清单**：全文件仅 `&raw[raw_len..]` 一处 `&str` 切片（已修），其余 `Vec<f32>`/`Vec<String>` 切片 N/A。
+- **验证**：fmt clean / check 0 error / warnings **99/90**（未下降，如实报）/ numstat==-w / 全量 `cargo test` 0 failed（1328+52+…）。
 - **红线**：未动版本号 / 未出包 / 未 commit / 零凭证。

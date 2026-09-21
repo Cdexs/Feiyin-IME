@@ -11,12 +11,12 @@
 
 | 项 | 状态 |
 | --- | --- |
-| 版本 | 仍 **0.9.2**。v0.9.3 批次七已出包：最新包 **BUILD-341**（HEAD `62484a1`，含 338 全部 + **尾字直接修 340**：`feed_tail_silence` 补静音喂满末尾一块）。🔴 未 push、未打 tag，等 Gavin 明示 |
-| 本轮出包史 | BUILD-258 → 267 → 274 → 280（诊断包）→ 285（🛑 作废）→ 287 → 290 → 296 → 302 → 306 → 321 → 328 → 333 → 338 → **341（当前）** |
-| 端测待办 | ① 🆕 **BUILD-341 六条**（须 Gavin 真人录音，带 `-debug`）：**1** 🔴 **停顿处尾字（本包核心）**：说一句后**停 0.5~1s**，硬判据日志 `[LocalRT-DBG-289] endpoint confirm` 应出现 **`shadow_len > main_len` / `used=shadow`**（改前 11/11 全 `used=main`），**请报实际分布**；同时（337）读 `[LocalRT-DBG-337] boundary=a/b/c` 与 `(a/b/c)`，🔴 **b 占比 = 收益折损须报主控**；**2** 🔴 录音中进预览窗编辑打字⇒不被冲；退出编辑继续说⇒仍不被冲（闩锁）；**3** 重复标点：最终上屏不应再出现 `。。`/`，。`；**4** 自学习（编辑改对后提交、同词两次 `(1/2)→(2/2)` + 词库可见；**反向：不编辑直接上屏不应有任何 `[AUTOLEARN]` 行**）；**5** 335 电平闸旁证（不必刻意）；**6** 首字：「你」是否被听成「按」（吵时，旁证，不必刻意）② v0.9.1 四项遗留：overlay 编辑态剥尾标点／Key 输入框 placeholder／繁中 ITN（`三點半→3:30`）／「API 配置」新文案布局 |
+| 版本 | 仍 **0.9.2**。v0.9.3 批次八已出包：最新包 **BUILD-342**（HEAD `fbec727`，含 **派发条件改回 OR 根因(D)** / 松手非取消(A) / 假 endpoint 护栏(F1+F3) / 接缝 padding / + 341/340 tailpad）。🔴 未 push、未打 tag，等 Gavin 明示 |
+| 本轮出包史 | BUILD-258 → 267 → 274 → 280（诊断包）→ 285（🛑 作废）→ 287 → 290 → 296 → 302 → 306 → 321 → 328 → 333 → 338 → 341 → **342（当前）** |
+| 端测待办 | ① 🆕 **BUILD-342 五条**（须 Gavin 真人录音，带 `-debug`）：**1** 🔴 **D（最重要）** 一口气连说 15s+（不要停顿），`[LocalRT-DBG-298] seg dispatch` 应出现 **silence<800ms** 的派发（改前 47 次最小=800ms，一次都没有 <800），请贴回原行；**2** 🔴 尾字：说完**停住不松手**，`[LocalRT-DBG-325/337] reflow applied` 且 action **非 `skipped-cancel`**；**3** 句尾幻字（停顿后不冒没说过的字）；**4** 接缝重复（不再出现「也可以。」孤立片段）；**5** 其余照旧（重复标点／预览编辑／自学习两次+反向／配置界面／首字「你→按」）。🔴 并报 D 后分片变密的**派发次数 / `join: total_decode` / `tail_wait` / CPU**。⚠️ 挂起待裁：`target/release/crash.json` char-boundary panic（§见 result.md §零）② v0.9.1 四项遗留：overlay 编辑态剥尾标点／Key 输入框 placeholder／繁中 ITN（`三點半→3:30`）／「API 配置」新文案布局 |
 | Worker | ✅ 09-21 新 session 三 Worker 就绪（OpenCode `commandgo/deepseek-v4.1-flash`），coder-1 / coder-2 已 ACK |
 | 文档 | 09-21 归档 handoffs 57 条（610 → 89 行）、todo 批次明细入 archive。DEC-064 两层结构：**新增条目必须 archive 与索引两边都写** |
-| 下一步 | **等 Gavin 端测 BUILD-341 反馈**（重点：340 尾字 `used=shadow` 分布 + 337 b 占比）。无新 bug 则清存量待办（223 ITN ／ 213 翻译语言 UI ／ 194 护栏 ／ 204 提示词）。⏸ 335 电平闸挂起（待 Gavin 环境安静后采集） |
+| 下一步 | **等 Gavin 端测 BUILD-342 反馈**（重点：D 的 silence<800ms 派发 + 尾字 reflow applied）。🔴 **待主控裁定**：`target/release/crash.json` byte-index 非字符边界 panic（00:00:34，早于本 build；候选 `local_stream.rs:315`）是否热修。⏸ 335 电平闸挂起 |
 
 ---
 

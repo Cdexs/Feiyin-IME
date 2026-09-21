@@ -915,3 +915,16 @@ load_wordbook_vocabulary()
 | 出包 | `BUILD-341` 八项核验逐项 PASS；产物 `feiyin-ime` 14.68MB `68e4528b…`（大小同 338 但 sha 异）/ `feiyin-ime-ui` 10.05MB `a39b9474…` / `crash-reporter` 24.88MB `1942611d…`，时间戳 22:57–22:59；四张规则表三副本全等 |
 | 探针 | 自检基准 `feiyin`=19；正向 `LocalRT-DBG-337`=4 / `336`=1 / `325`=1 / `AUTOLEARN`=4 / `degree_adverbs`=2 / `nz_ratio`=2；反向 5 符号全 0；🆕 340 无字面量 ⇒ N/A（降级「源码引用 5 处 + 时间戳/sha + `tailpad340_*` 2/2」） |
 | 端测 | 待 Gavin 六条（🔴 停顿处尾字硬判据 `[LocalRT-DBG-289] used=shadow`/`shadow_len>main_len` 分布／337 b 占比／预览编辑闩锁／重复标点／自学习两次+反向／首字「你/按」旁证） |
+
+
+## v0.9.3（批次八 · BUILD-342）· 2026-09-22 · 派发条件改回 OR（根因）+ 松手非取消 + 假 endpoint 护栏 + 接缝 padding（版本号不升）
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 342（`fbec727`）：**D 根因** accuracy 派发条件由「静默 且 满5s」改回设计原意「静默 **或** 满5s」；**A** 松手不再当取消（原 `skipped-cancel` 丢弃算好的 accuracy 文本）；**F1+F3** 静音流上的假 endpoint 与幻字护栏；**padding** 分片前后各扩 200ms；**B** 仅结论未改码 |
+| 回归 | TEST-EXEC + BUILD-342 root **1416P/0F/22I**（全量，NEW 8/GONE 1）+ src-tauri **92P/0F/0I** + Vitest **100P/11S/0F**；`cargo fmt --check`（不带 `skip_children`）EXIT 0；warnings **99/90/17** |
+| 出包 | `BUILD-342` 八项核验逐项 PASS；产物 `feiyin-ime` 14.68MB `8758ca66…`（+4,608B）/ `feiyin-ime-ui` 10.05MB `94f2a97a…` / `crash-reporter` 24.88MB `a4e2672d…`，时间戳 00:16–00:18；四张规则表三副本全等 |
+| 探针 | 自检 `feiyin`=19；正向 `[LocalRT-DBG-342]`=3 / `337`=4 / `336`=1 / `325`=1 / `AUTOLEARN`=4 / `degree_adverbs`=2 / `nz_ratio`=2；反向 5 符号全 0 |
+| 🔴 待裁发现 | `target/release/crash.json`（**00:00:34，早于本 build**）byte-index 非字符边界 panic（`inside '斯'`）；`fbec727` 未显式修；候选 `local_stream.rs:315 raw_full[cache.raw_len..]`；已备份、未改代码 |
+| 量化 | 冒烟 idle CPU 0.04%、WS 1791MB；历史改前 47 次派发**最小 silence=800ms**（无一 <800）；`join/total_decode/tail_wait` 本机无数据 |
+| 端测 | 待 Gavin 五条（🔴 D：连说 15s+ 出 silence<800ms 派发／🔴 尾字 reflow applied 非 skipped-cancel／句尾幻字／接缝重复／其余照旧） |

@@ -8170,8 +8170,9 @@ fn spawn_worker_thread(
                         };
                         let send_offline = acc_offline.map(transcription::SendOfflineRecognizerRef);
                         // 325：载荷加 `committed_len`（派发当刻浮层显示字符数，回灌边界）。
+                        // 344-G：载荷加 `seg_streaming`（本片流式文本，失败片的填补来源）。
                         let (acc_tx, acc_rx) =
-                            crossbeam_channel::bounded::<(usize, usize, Vec<Vec<f32>>)>(64);
+                            crossbeam_channel::bounded::<(usize, usize, Vec<Vec<f32>>, String)>(64);
                         let acc_script = config.audio.chinese_script;
                         // 325：acc worker 逐片回灌预览所用的事件发送端（代际在 worker 内捕获）。
                         let acc_event_tx = event_tx.clone();
@@ -8204,12 +8205,17 @@ fn spawn_worker_thread(
                                         let mut acc_text = String::new();
                                         // 325：本片覆盖范围（segs 0..=idx）内是否含失败片 ⇒ 有洞则回灌一律跳。
                                         let mut has_hole = false;
-                                        for (idx, committed_len, sub_segs) in acc_rx {
+                                        for (idx, committed_len, sub_segs, seg_streaming) in acc_rx {
                                             if cancel_acc.load(Ordering::Acquire) {
                                                 // 判据 #3：取消时不把已取消的结果带进下游。
                                                 break;
                                             }
                                             let mut texts = Vec::with_capacity(sub_segs.len());
+                                            // 344-G：本片是否已用流式文本填补（多子段时只填一次，防重复）。
+                                            // 🔴 实时档 D（OR 派发）下每片必为单子段（≤5s，不会触发 >20s 硬切）；
+                                            //    多子段属 >20s 长片，保守地退回「空串 + 记洞」旧行为。
+                                            let can_fill = sub_segs.len() == 1;
+                                            let mut filled_by_streaming = false;
                                             for s in &sub_segs {
                                                 let t = log::log_enabled!(log::Level::Debug)
                                                     .then(std::time::Instant::now);
@@ -8230,10 +8236,17 @@ fn spawn_worker_thread(
                                                     total_decode_ms +=
                                                         t0.elapsed().as_secs_f64() * 1000.0;
                                                 }
+                                                // 失败（Err）与「解出空」都走同一条填补路径。
+                                                let mut needs_fill = false;
                                                 match res {
                                                     Ok((txt, _np)) => {
+                                                        let empty = txt.is_empty();
                                                         acc_text.push_str(&txt);
                                                         texts.push(txt);
+                                                        if empty {
+                                                            needs_fill = true;
+                                                            all_native = false;
+                                                        }
                                                     }
                                                     Err(e) => {
                                                         log::warn!(
@@ -8243,8 +8256,36 @@ fn spawn_worker_thread(
                                                         );
                                                         texts.push(String::new());
                                                         all_native = false;
-                                                        // 325：覆盖区有洞 ⇒ 该片及后续片的回灌全部跳过。
+                                                        needs_fill = true;
+                                                    }
+                                                }
+                                                if needs_fill {
+                                                    // 🔴 344-G：空/失败片**不留洞** —— 用该片流式文本填补，
+                                                    //    否则累积 `acc_text` 出现永久缺口（325 `has_hole` 一旦为真
+                                                    //    便永不复位 ⇒ 一片失败、本次后续回灌全废）。
+                                                    let (fill, is_hole) = hole_fill_decision(
+                                                        can_fill && !filled_by_streaming,
+                                                        &seg_streaming,
+                                                    );
+                                                    filled_by_streaming = true;
+                                                    if is_hole {
+                                                        // 真·无法填补（连预览文本都没有 / 多子段保守）⇒ 记洞兜底。
+                                                        log::warn!(
+                                                            "PARALLEL-ACC-298 seg #{} empty/failed -> hole (unfillable: no streaming fill)",
+                                                            idx
+                                                        );
                                                         has_hole = true;
+                                                    } else {
+                                                        log::warn!(
+                                                            "PARALLEL-ACC-298 seg #{} empty/failed -> filled by streaming ({} chars)",
+                                                            idx,
+                                                            fill.chars().count()
+                                                        );
+                                                        acc_text.push_str(&fill);
+                                                        // 替换刚 push 的空串（Ok 空 或 Err 均已 push ""）。
+                                                        if let Some(last) = texts.last_mut() {
+                                                            *last = fill;
+                                                        }
                                                     }
                                                 }
                                             }
@@ -8285,9 +8326,10 @@ fn spawn_worker_thread(
                                         ));
                                     },
                                     acc_cfg,
-                                    |idx, committed_len, segs| {
+                                    |idx, committed_len, segs, seg_streaming| {
                                         // 派发片送 accuracy worker（worker 不存在 ⇒ send 失败，忽略）。
-                                        let _ = acc_tx.send((idx, committed_len, segs));
+                                        let _ =
+                                            acc_tx.send((idx, committed_len, segs, seg_streaming));
                                     },
                                     |seg_index, committed_len| {
                                         // 337：自适应边界冻结（a 文本停止增长 / b 有声恢复 / c 硬上限）。
@@ -9466,6 +9508,22 @@ fn acc_parallel_result_usable(cancelled: bool, joined: &str) -> bool {
     !cancelled && !joined.trim().is_empty()
 }
 
+/// LOCALRT-REFLOW-HOLE-344-G：空/失败分片的填补决策（纯函数，可单测）。
+///
+/// 返回 `(填补文本, 是否记洞)`：
+/// - `can_fill && !seg_streaming.is_empty()` ⇒ **用该段流式文本填补，不记洞**（回灌不中断）；
+/// - 否则（流式也为空 / 多子段保守 / 本片已填过）⇒ `("", true)`，走 `SkippedHole` 兜底。
+///
+/// 🔴 修的是 325 的设计硬伤：累积 `acc_text` 一旦留空 ⇒ `has_hole` 永不复位 ⇒ 一片失败后
+/// 本次录音**后续回灌全废**。失败片用流式文本填满即无洞。
+fn hole_fill_decision(can_fill: bool, seg_streaming: &str) -> (String, bool) {
+    if can_fill && !seg_streaming.is_empty() {
+        (seg_streaming.to_string(), false)
+    } else {
+        (String::new(), true)
+    }
+}
+
 /// PUNCT-DOUBLE-334：本地并行 accuracy 文本的 `native_punctuated` 判定。
 ///
 /// DEC-047 口径 = **文本实测**：`punctuation::has_effective_punctuation`（词内嵌标点豁免，
@@ -10062,7 +10120,7 @@ mod punct_double_334_tests {
 
 #[cfg(test)]
 mod parallel_acc_298_tests {
-    use super::{acc_parallel_result_usable, assemble_parallel_accuracy};
+    use super::{acc_parallel_result_usable, assemble_parallel_accuracy, hole_fill_decision};
 
     /// 判据 #3：seg_index 乱序输入 ⇒ 按序号升序拼接；片内子段顺序保持。
     #[test]
@@ -10096,6 +10154,35 @@ mod parallel_acc_298_tests {
         assert!(!acc_parallel_result_usable(false, ""));
         assert!(!acc_parallel_result_usable(false, "   \n"));
         assert!(acc_parallel_result_usable(false, "有字"));
+    }
+
+    /// LOCALRT-REFLOW-HOLE-344-G：空/失败片用流式文本填补 ⇒ **不记洞**（回灌不中断）；
+    /// 流式也为空 / 不可填补 ⇒ 记洞兜底（`SkippedHole` 仍保留）。
+    #[test]
+    fn reflow_hole_344_fill_by_streaming_not_a_hole() {
+        // 有流式文本可填 ⇒ 填补、不记洞。
+        assert_eq!(
+            hole_fill_decision(true, "多认识几个朋友"),
+            ("多认识几个朋友".to_string(), false)
+        );
+        // 流式也为空 ⇒ 真·无法填补、记洞。
+        assert_eq!(hole_fill_decision(true, ""), (String::new(), true));
+        // 多子段/已填过（can_fill=false）⇒ 保守记洞。
+        assert_eq!(hole_fill_decision(false, "有文本"), (String::new(), true));
+    }
+
+    /// 344-G 端到端拼接口径：失败片填补后 `assemble_parallel_accuracy` 仍输出连续文本（无空片）。
+    #[test]
+    fn reflow_hole_344_assembled_text_stays_continuous() {
+        // seg0 成功；seg1 失败 ⇒ 用流式填补；seg2 成功。
+        let (fill, is_hole) = hole_fill_decision(true, "第二句流式");
+        assert!(!is_hole);
+        let got = assemble_parallel_accuracy(vec![
+            (0, vec!["第一句".to_string()]),
+            (1, vec![fill]),
+            (2, vec!["第三句".to_string()]),
+        ]);
+        assert_eq!(got.join(""), "第一句第二句流式第三句");
     }
 }
 
