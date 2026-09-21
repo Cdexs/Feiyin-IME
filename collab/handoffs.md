@@ -5,6 +5,13 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-1 — TUNE-STREAM-317 ✅ 交付（流式三调优点）
+
+- **①② env（默认不变）**：`LOCAL_STREAM_NUM_THREADS`（默认 4）+ `LOCAL_STREAM_BLANK_PENALTY`（默认 0.0，负值合法；NaN/inf/非法回落）；接线 `create_local_stream_recognizer` + `[LocalRT-DBG-317]` 打印三实际值。**无 env 逐位无变**；注释写明 blank_penalty 双向风险。
+- **③ HomophoneReplacer**：`rule_fsts` **需预编译二进制 .fst**（源码 `TextNormalizer` `binary=true` / `ReadFstKaldi`，无文本分支）；`lexicon.txt` 才是纯文本。**可离线编译一次随包发**（作者侧 WSL/Colab pynini，用户零工具链）；最小形态：lexicon 用 jieba+pypinyin 生成（纯 Python，Windows 可跑，235 已验）+ 每词 1 条 cross 规则（含前后鼻音变体）+ `hr{lexicon,rule_fsts}` 接线。风险：同音误伤（P2 前科）/ 仅中文 / 词库变更须离线重产。**235 实证**：3/3 修对、0/5 越界、2/2 碰撞改写，lexicon-only=no-op。**未实现**。
+- **上报**：accuracy 侧 `num_threads`（mod.rs `:1124`/`:1208`）**无 env**；建议主控协调加 `ACC_NUM_THREADS`（本单未跨文件改）。
+- **验证**：仅改 `local_stream.rs`（`+81/2`）；fmt clean / check 0 error / warnings 110/101 / numstat==-w；2 单测（env 非法回落）通过。🔴 实机交 tester-1/Gavin。未动版本 / 未 commit / 未出包 / 零凭证。
+
 ## 2026-09-21 — coder-2 — POC-QWEN3-CTX-VALUE-316 ✅ 交付（上下文价值 PoC，只变一变量）
 
 - **方法**：Qwen3-ASR 固定，full.wav 298 切 3 片，只变 system 段：A 空/B 词库/C ctx150/D ctx300/E 不截断/F 词库+ctx/G 无关菜谱；补扫 cap 0/40/80/120/全文。`t10_ctx_value` 164.6s EXIT0。

@@ -47,7 +47,31 @@ impl<'a> SendOnlineRecognizerRef<'a> {
 }
 
 /// 流式解码线程数。对齐 POC-LOCAL-STREAM-235 的实测最优（4 线程 RTF 最好）。
+///
+/// TUNE-STREAM-317：可经 env `LOCAL_STREAM_NUM_THREADS` 覆盖（默认仍是 4，**无 env 行为零变**）。
+/// 🔴 背景：298 之后 accuracy（8 线程）与流式（4）**并发**，4+8=12 > 本机 8 物理核。
+/// 两个数当初各自独立定，并发后未重估；本单只开 env 让 tester-1 扫组合，**默认值不动**。
 const LOCAL_STREAM_NUM_THREADS: i32 = 4;
+
+/// TUNE-STREAM-317：`blank_penalty` 默认值（= 当前行为 0.0）。
+///
+/// 调**负** ⇒ 更少输出 blank ⇒ 更愿意吐字（与 307「整句重解码」正交、可叠加）。
+/// 🔴 双向风险：调过头会**多吐字**（插入错误），不是单向改善。env `LOCAL_STREAM_BLANK_PENALTY`。
+const LOCAL_STREAM_BLANK_PENALTY_DEFAULT: f32 = 0.0;
+
+/// TUNE-STREAM-317：解析 `LOCAL_STREAM_NUM_THREADS`（非法/缺失 ⇒ 默认 4；要求 ≥1）。
+fn parse_stream_num_threads(v: Option<&str>) -> i32 {
+    v.and_then(|s| s.trim().parse::<i32>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(LOCAL_STREAM_NUM_THREADS)
+}
+
+/// TUNE-STREAM-317：解析 `LOCAL_STREAM_BLANK_PENALTY`（非法/NaN/缺失 ⇒ 默认 0.0）。
+fn parse_stream_blank_penalty(v: Option<&str>) -> f32 {
+    v.and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|f| f.is_finite())
+        .unwrap_or(LOCAL_STREAM_BLANK_PENALTY_DEFAULT)
+}
 
 /// LOCAL-RT-ENGINE-239-A（DEC-067）：端点检测参数。
 ///
@@ -275,8 +299,15 @@ pub fn create_local_stream_recognizer(model_dir: &Path) -> Result<OnlineRecogniz
         decoder: Some(dec.to_string_lossy().to_string()),
     };
     c.model_config.tokens = Some(tok.to_string_lossy().to_string());
-    c.model_config.num_threads = LOCAL_STREAM_NUM_THREADS;
+    // TUNE-STREAM-317：线程数 env 覆盖（默认 4 = 现行为，无 env 零变）。
+    let num_threads =
+        parse_stream_num_threads(std::env::var("LOCAL_STREAM_NUM_THREADS").ok().as_deref());
+    c.model_config.num_threads = num_threads;
     c.model_config.provider = Some("cpu".to_string());
+    // TUNE-STREAM-317：blank_penalty env 覆盖（默认 0.0 = 现行为，无 env 零变）。
+    let blank_penalty =
+        parse_stream_blank_penalty(std::env::var("LOCAL_STREAM_BLANK_PENALTY").ok().as_deref());
+    c.blank_penalty = blank_penalty;
     c.model_config.debug = false;
     // DEC-067：本地预览用 greedy_search（streaming paraformer 仅支持 greedy）
     c.decoding_method = Some("greedy_search".to_string());
@@ -297,6 +328,13 @@ pub fn create_local_stream_recognizer(model_dir: &Path) -> Result<OnlineRecogniz
         LOCAL_STREAM_RULE1_MIN_TRAILING_SILENCE,
         rule2,
         LOCAL_STREAM_RULE3_MIN_UTTERANCE_LENGTH
+    );
+    // TUNE-STREAM-317：启动打三个调优点的**实际取值**，供端测对账。
+    // 第三项 HomophoneReplacer 本单定性为「不做」（rule_fsts 需预编译 FST，见 result），固定 off。
+    log::debug!(
+        "[LocalRT-DBG-317] stream tuning: num_threads={} blank_penalty={} homophone_replacer=off provider=cpu decoding=greedy_search endpoint=true (env LOCAL_STREAM_NUM_THREADS / LOCAL_STREAM_BLANK_PENALTY)",
+        num_threads,
+        blank_penalty
     );
 
     OnlineRecognizer::create(&c).context("创建本地流式 (paraformer) recognizer 失败")
@@ -888,7 +926,10 @@ pub fn transcribe_streaming_local(
 
 #[cfg(test)]
 mod tests {
-    use super::{endpoint_confirm_text, should_dispatch_acc, should_dispatch_tail, SAMPLE_RATE};
+    use super::{
+        endpoint_confirm_text, parse_stream_blank_penalty, parse_stream_num_threads,
+        should_dispatch_acc, should_dispatch_tail, SAMPLE_RATE,
+    };
 
     /// FIX-LOCALRT-TAILCHAR-291/307：三方取最长（main / full / shadow），结果恒 ≥ main。
     ///
@@ -1226,5 +1267,43 @@ mod tests {
         assert!(!should_dispatch_tail(true, 5 * SAMPLE_RATE as usize, false));
         assert!(!should_dispatch_tail(true, 0, true));
         assert!(!should_dispatch_tail(false, 5 * SAMPLE_RATE as usize, true));
+    }
+
+    // ============================================================
+    // TUNE-STREAM-317：流式侧两个 env 的解析（非法值回落默认；默认 = 现行为）
+    // ============================================================
+
+    #[test]
+    fn tune317_parse_num_threads_invalid_falls_back_to_default_4() {
+        assert_eq!(parse_stream_num_threads(None), 4, "缺失 ⇒ 默认 4");
+        assert_eq!(parse_stream_num_threads(Some("8")), 8);
+        assert_eq!(parse_stream_num_threads(Some(" 2 ")), 2, "容忍空白");
+        assert_eq!(parse_stream_num_threads(Some("0")), 4, "<1 非法 ⇒ 默认");
+        assert_eq!(parse_stream_num_threads(Some("-3")), 4, "负数非法 ⇒ 默认");
+        assert_eq!(parse_stream_num_threads(Some("abc")), 4, "非数字 ⇒ 默认");
+        assert_eq!(parse_stream_num_threads(Some("2.5")), 4, "非整数 ⇒ 默认");
+    }
+
+    #[test]
+    fn tune317_parse_blank_penalty_invalid_falls_back_to_default_0() {
+        assert_eq!(parse_stream_blank_penalty(None), 0.0, "缺失 ⇒ 默认 0.0");
+        assert_eq!(parse_stream_blank_penalty(Some("0")), 0.0);
+        assert_eq!(
+            parse_stream_blank_penalty(Some("-1.5")),
+            -1.5,
+            "负值合法（更愿吐字）"
+        );
+        assert_eq!(parse_stream_blank_penalty(Some("0.25")), 0.25);
+        assert_eq!(parse_stream_blank_penalty(Some("NaN")), 0.0, "NaN ⇒ 默认");
+        assert_eq!(
+            parse_stream_blank_penalty(Some("inf")),
+            0.0,
+            "非有限 ⇒ 默认"
+        );
+        assert_eq!(
+            parse_stream_blank_penalty(Some("abc")),
+            0.0,
+            "非数字 ⇒ 默认"
+        );
     }
 }
