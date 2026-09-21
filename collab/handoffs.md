@@ -123,6 +123,19 @@
 - **⚠️ 协作事件**：主控文档 commit `99799c5`（10:26:26）在本题进行中执行，**把我未完成的 `local_stream.rs` 与 coder-1 的 `src/audio/mod.rs` 一并扫入**（commit message 未反映代码改动）。本单改动已随之落盘、worktree 无额外 diff；`git status` 另见 `.gitignore` + `src/audio/mod.rs`（非本单）。请主控知悉该 commit 语义与文件归属。
 - **红线**：只改 `local_stream.rs` / 未动版本 / 未自行 commit / 未出包 / 未跑 `cargo build --release` / 零凭证。
 
+## 2026-09-21 — tester-1 — TEST-EXEC + BUILD-306 ✅ 全量回归 + 出包（八项 PASS，303+305 口水词过滤接线）
+
+- **基线**：HEAD `60c0457`（305 接线），clean、`ui/` 零 diff。（本单首次「放行」口头消息因含 shell 元字符被误当命令执行、未送达，主控改走任务书重发。）
+- **回归**：root **1342P/0F/15I**（EXIT 0；上轮 77ef6aa 1339P → **+3**）；`src-tauri` **85P/0F/0I**；Vitest **SKIP**（`ui/` 零 diff）。
+- **+3 增量**（全在 `main.rs::filler_strip_303_tests`）：`filler_strip_disabled_is_identity` / `filler_strip_enabled_removes_leading_filler` / `filler_strip_enabled_noop_when_nothing_to_strip`。
+- **🔴 逐条点名扫描 main.rs 生产区的护栏**（305 动 main.rs）：`nospeech_122_guard_tests` 8/8 ok、`guard_214_215` 12/12 ok（含上两轮修好的 g7/g9/g10/g11）、`overlay_121_guard_tests` 10/10、`flicker_130_guard_tests` 3/3、`overlay_075/086/109` 全 ok ⇒ **新节点未造成扫描区塌缩/锚点位移**。
+- **额外核对**：`ACC_MIN_SEGMENT_MS_DEFAULT` 源码恰 1 处 = **5000**（`local_stream.rs:107`）；测试里的 `3000` 是显式入参（非默认写死）。⚠️ `local_stream.rs:115/166` doc 注释仍写 3000/3s（注释滞后，非缺陷，未改，可下批校）。调用点 `main.rs:9499`：`apply_filler_strip(final_text, !llm_handled)`，在 `apply_local_punctuation` 后、inject 前；`enabled=!llm_handled` ⇒ LLM 接手时 no-op。
+- **BUILD-306**：Step1–4 全走；源码 mtime 前后 md5 一致（`2ed2b891…`）。产物 main `bc043e25…`（14,491,648B/13:04，较 302 **+13,824B**）/ ui `467232cd…`（10,060,288B/13:04）/ crash `2d05df22…`（24,879,104B/13:02）；两副本相等；main 异于 BUILD-302（`5a318429…`）。八项逐项 PASS（①时间戳 ②sha ③0.9.2 ④冒烟 PID 27244 Responding=True/无新 crash.json/残 0 ⑤config `da2be5da…`+wordbook `b6ab43ac…` 零变化 ⑥110/9/17 ⑦探针 ⑧toml 三副本全等）。
+- **探针**：`[LocalRT-DBG-298]`=4 / `291`=1 / `293`=1 / `292`=2 / `284`=3 / `289`=1 / `276`=1 / `277`=1 / `278`=2（与 302 一致）；`283`=0 既定预期；🆕 **`然后`=6、`えー`=1**（303 口水词字面量进包）；反例符号名 `apply_filler_strip`/`strip_fillers_conservative`=0（release 内联，不可作探针）。
+- **端测六类交 Gavin**：① 中间句尾字 ② 首字三场景**分开测** ③ 长语音看 `[LocalRT-DBG-298] join:` 的 `tail_wait` ④ 本地流式+翻译 ⑤ 切片粒度 A/B/C（默认 / `LOCAL_RT_ACC_MIN_SEG_MS=15000` / `LOCAL_RT_ACC_PARALLEL=0`）⑥ **口水词过滤**（关 LLM 说「呃，然后然后我们开始吧」→ 期望「我们开始吧」；开 LLM 行为不变）。
+- **证据**：`collab/outbox/tester-1/testexec304/`。
+- **红线**：版本 0.9.2 未动 / 未 commit / 未 `cargo clean` / 未破坏性 git / 零凭证。
+
 ## 2026-09-21 — tester-1 — TEST-EXEC + BUILD-302 ✅ 复跑全绿 + 出包（八项 PASS，301 首跑 4 红已收口）
 
 - **基线**：HEAD `90acbf1`（301-B），clean、`ui/` 零 diff。

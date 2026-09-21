@@ -853,3 +853,14 @@ load_wordbook_vocabulary()
 | 探针 | `[LocalRT-DBG-298]`=4 / `291`=1 / `293`=1 / `292`=2 / `284`=3 / `289`=1 / `276`=1 / `277`=1 / `278`=2 |
 | 关键发现 | 301 首跑只修 1/5（漏 `punctuation/mod.rs` 自带 `prod_lines`）→ 301-B 收口；「扫到第一个 X 就停」的边界一律先问「谁能在 X 前插一个 X」 |
 | 端测 | 待 Gavin 真人录音四类（291 尾字／293-B 三场景首字／298 长语音看 `tail_wait`／本地流式+翻译）；应急 `LOCAL_RT_ACC_PARALLEL=0` |
+
+
+## v0.9.3（批次二 · BUILD-306）· 2026-09-21 · 口水词过滤接线(303+305) + 并行最小片长 3s→5s（版本号不升）
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 303 本地免费口水词过滤（中英日韩保守版，纯函数）+ 305 **接线**：`main.rs:9499 apply_filler_strip(final_text, !llm_handled)`（标点节点后、inject 前；仅 LLM 未接手时生效，不触 DEC-041）；`ACC_MIN_SEGMENT_MS_DEFAULT` 3s→**5s** |
+| 回归 | TEST-EXEC + BUILD-306 root **1342P/0F/15I**（+3 = `filler_strip_303_tests`）+ src-tauri **85P/0F/0I**；Vitest SKIP（`ui/` 零 diff）；扫描 main.rs 生产区护栏逐条点名全绿；warnings 110/9/17 = 基线 |
+| 出包 | `BUILD-306` 八项核验逐项 PASS；产物 `feiyin-ime` 14.49MB `bc043e25…`（较 302 +13,824B）/ `feiyin-ime-ui` 10.06MB `467232cd…` / `crash-reporter` 24.88MB `2d05df22…`，时间戳 13:02–13:04 |
+| 探针 | `[LocalRT-DBG-298]`=4 / `291`=1 / `293`=1 / `292`=2 / `284`=3 / `289`=1 / `276`=1 / `277`=1 / `278`=2；🆕 `然后`=6、`えー`=1 证 303/305 进包 |
+| 端测 | 待 Gavin 真人录音六类（新增第 5 类切片粒度 A/B/C、第 6 类口水词过滤） |
