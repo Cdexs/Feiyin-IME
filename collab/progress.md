@@ -841,3 +841,15 @@ load_wordbook_vocabulary()
 | 探针 | `[LocalRT-DBG-291]`=1 / `293`=1 / `292`=2 / `284`=3 / `289`=1 / `276`=1 / `277`=1 / `278`=2；`283`=0 属预期（293-B 改名） |
 | 关键发现 | 首跑 `guard291_g3` 假红 → 定位为 294 护栏区域定界缺陷（非生产缺陷），coder-1 `FIX-GUARD-297` 修复；295 I5 三种消融全 RED |
 | 端测 | 待 Gavin 真人录音 5 项（291 中间句尾字；293 三场景首字；本地流式+翻译）；带 `-debug` 落 `debug-audio/` WAV |
+
+
+## v0.9.3（批次二 · BUILD-302）· 2026-09-21 · 本地流式 accuracy 并行转写(298) + 护栏扫描边界收口(301/301-B)（版本号不升）
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 298 本地流式说话中按 **800ms 静音切片**并行丢给 accuracy、说完只等尾片；新增显式 `pretranscribed` 参数与 3 个 env 开关（`LOCAL_RT_ACC_PARALLEL`=1 / `_SILENCE_MS`=800 / `_MIN_SEG_MS`=3000）；301/301-B 统一「生产区扫描」为剔除全部 test-gated 项（修 5 条假红，含跨文件漏网的第 5 处 `punctuation/mod.rs`） |
+| 回归 | TEST-EXEC + BUILD-302 root **1304P/0F/15I**（上轮 5 条假红逐条 5/5 恢复）+ src-tauri **85P/0F/0I**；Vitest SKIP（`ui/` 零 diff）；warnings 110/9/17 = 基线 |
+| 出包 | `BUILD-302` 八项核验逐项 PASS；产物 `feiyin-ime` 14.48MB `5a318429…`（较 296 +58,368B）/ `feiyin-ime-ui` 10.06MB `1cb71954…` / `crash-reporter` 24.88MB `4844bd21…`，时间戳 12:01–12:03 |
+| 探针 | `[LocalRT-DBG-298]`=4 / `291`=1 / `293`=1 / `292`=2 / `284`=3 / `289`=1 / `276`=1 / `277`=1 / `278`=2 |
+| 关键发现 | 301 首跑只修 1/5（漏 `punctuation/mod.rs` 自带 `prod_lines`）→ 301-B 收口；「扫到第一个 X 就停」的边界一律先问「谁能在 X 前插一个 X」 |
+| 端测 | 待 Gavin 真人录音四类（291 尾字／293-B 三场景首字／298 长语音看 `tail_wait`／本地流式+翻译）；应急 `LOCAL_RT_ACC_PARALLEL=0` |

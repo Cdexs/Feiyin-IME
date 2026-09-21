@@ -1850,3 +1850,11 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 新增 `report_recording_drops_throttled()` + 消费端节流上报（`record_streaming`/`collect_recording` 主循环） | ✅ 平台中立；消费端只在录音期存在的性质两端一致 ⇒ 空闲/录音区分行为相同 |
 | 汇总口径改为「录音前后差值」 | ✅ 平台中立；无平台分支。macOS 无需改动 |
 | 丢弃行为 / 队列容量 256 | ✅ **未动**；两端一致 |
+
+## FORMAT-FALLBACK-303（2026-09-21，coder-1）· 本地语气词去除纯函数 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| 新增 `text_normalizer::strip_fillers_conservative(text: &str) -> String`（规则 A 句首犹豫词 / 规则 B 紧邻重复折叠） | ✅ **平台中立**：纯字符串函数，无 IO、无配置、无全局状态、不接 `&AppConfig`/`AsrModel`/语言档；两端编译同一份代码 |
+| 四语言（中/英/日/韩）规则靠**字面与位置**判定，同时生效，不感知平台/语言 | ✅ macOS 无需改动，无平台分支 |
+| 本单**未接入任何管线**（挂载点由下一单在编排层加） | ✅ 对 macOS 侧零影响；下一单的节点包装亦为平台无关，macOS 想挂同样一行调用 |

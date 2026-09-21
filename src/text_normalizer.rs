@@ -252,6 +252,358 @@ pub fn is_effective_text(text: &str) -> bool {
     cleaned.trim().chars().count() >= 2
 }
 
+/// FORMAT-FALLBACK-303: 保守的本地语气词去除（中/英/日/韩）。**纯函数、无 IO、无配置**。
+///
+/// 只做两件事，看不懂上下文就不动：
+/// - **规则 A**：摘除**句首**（文本开头或句末标点之后）的纯犹豫词；句中一律不动。
+/// - **规则 B**：折叠**紧邻的字面重复**（≥2 次，中间可选逗号/空白）。
+///
+/// 🔴 保守口径（宁可漏摘，不可误摘）：
+/// - 规则 A 只收几乎无实义的犹豫词；有实义用法的（`那个`/`就是`/`然后`/`あの`/`그`…）**一概不收**
+///   —— 词表刻意比 `is_effective_text` 的检测表窄，两者不共用。
+/// - 摘除后要求其后紧跟 空白/逗号/顿号/句末标点/文本末尾，否则视为「可能是实词」而不摘
+///   —— **英/日/韩全部 + 中文 T2 字**（防 `Uhura`/`어디`/`まあまあ`/`唉声叹气`/`呐喊`）；
+///   中文 **T1 字 `呃`/`嗯`** 几乎不作词首，不受此限（`呃我觉得` 也摘，第 17 条）。
+/// - 规则 B 只折叠**完全字面相同**的相邻重复，**且重复单元须在「话语标记白名单」内**：
+///   中文限 2–3 字单元（`看看`/`哈哈` 单字叠词与 `研究研究` ABAB 重叠是正常语法，绝不折叠）；
+///   英/韩按空白分词、查各自白名单（`I I` → `I`、`그 그` → `그`，但 `had had`/`that that` 原样）。
+/// - 全程不做「看起来像」的猜测；只在两条规则明确命中时改动。
+#[allow(dead_code)] // FORMAT-FALLBACK-303 第一步：纯函数先落地，挂载点由下一单接入
+pub fn strip_fillers_conservative(text: &str) -> String {
+    let a = strip_leading_fillers(text);
+    // 规则 B 可能折叠出新的可折叠串（4 连叠 → 2 连叠）⇒ 迭代到不动点，保证幂等。
+    let mut cur = collapse_adjacent_repeats(&a);
+    loop {
+        let next = collapse_adjacent_repeats(&cur);
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    cur
+}
+
+/// 规则 A 的句首犹豫词表。**刻意只收几乎无实义者**，中文按「能否起头组成实义词」分两档。
+///
+/// T1（无边界即可摘）：`呃`/`嗯` 几乎不作常用词词首（`呃逆` 是唯一生僻医学词），可无边界摘。
+/// T2（须边界才摘）：`啊哦噢唉诶欸呐` 能起头组词（`唉声叹气`/`呐喊`/`哦豁`…），直接接汉字则不摘。
+/// 🔴 拿不准的字一律放 T2 —— 漏摘只是没优化到，误摘是吞字。
+const LEADING_FILLERS_ZH_T1: &[&str] = &["呃", "嗯"];
+const LEADING_FILLERS_ZH_T2: &[&str] = &["啊", "哦", "噢", "唉", "诶", "欸", "呐"];
+const LEADING_FILLERS_JA: &[&str] = &[
+    "えーと",
+    "えっと",
+    "ええと",
+    "うーん",
+    "あのー",
+    "あのう",
+    "まあ",
+];
+const LEADING_FILLERS_KO: &[&str] = &["어", "음", "에", "아"];
+const LEADING_FILLERS_EN: &[&str] = &["hmm", "erm", "um", "uh", "er", "mm", "ah", "eh"];
+
+/// 🔴 FORMAT-FALLBACK-303 / FIX-FF303-B：规则 B 的**可折叠单元白名单**（只有这些词的紧邻重复才判为口吃）。
+///
+/// 为什么必须白名单：`然后然后`（口吃）与 `研究研究`（ABAB 动词重叠＝稍微研究一下）在字面上
+/// 完全无法区分，按长度放宽会两头误伤（英文 `had had` / `that that` 同理）。故只折叠
+/// **本身即已知话语标记**的重复；任何能独立承担实义的词都不许进表。
+///
+/// ⚠️ 本表**与规则 A 的句首表用途不同，不要合并**：`然后/就是/那个/这个` 有实义用法，
+/// 单独出现时不能摘（故不在 A 表）；但它们的**紧邻重复**是口吃的可靠信号（故在 B 表）。
+const REPEAT_COLLAPSIBLE_ZH: &[&str] = &["然后", "就是", "那个", "这个", "所以", "反正", "其实"];
+const REPEAT_COLLAPSIBLE_EN: &[&str] = &[
+    "i", "the", "a", "and", "so", "but", "like", "you", "we", "it",
+];
+const REPEAT_COLLAPSIBLE_JA: &[&str] = &["その", "あの", "えー", "まあ"];
+const REPEAT_COLLAPSIBLE_KO: &[&str] = &["그", "저", "음"];
+
+/// 规则 B：**连写语言**（中/日）的 CJK 单元是否在可折叠白名单里（ZH ∪ JA）。
+/// 韩语走空白分词分支，不经过本函数。
+fn is_collapsible_cjk_unit(unit: &str) -> bool {
+    REPEAT_COLLAPSIBLE_ZH.contains(&unit) || REPEAT_COLLAPSIBLE_JA.contains(&unit)
+}
+
+/// 连写语言（中/日）字符：Han / 假名（含长音符 ー）。**不含韩文** —— 韩语是空白分词语言，
+/// 规则 B 按 token 处理（口径同英文）。
+fn is_cjk_char(c: char) -> bool {
+    matches!(c as u32,
+        0x3040..=0x30FF        // 平假名 / 片假名（含长音符 ー）
+        | 0x3400..=0x4DBF      // CJK 扩展 A
+        | 0x4E00..=0x9FFF      // CJK 统一表意
+        | 0xF900..=0xFAFF      // CJK 兼容表意
+    )
+}
+
+/// 韩文字符（音节 / 字母）。韩语按空白分词 ⇒ 规则 B 用 token 比对（同英文口径）。
+fn is_hangul_char(c: char) -> bool {
+    matches!(c as u32, 0xAC00..=0xD7AF | 0x1100..=0x11FF)
+}
+
+/// 规则 A：句末标点（可含后续空白）之后视为新的「句首」。
+fn is_sentence_end(c: char) -> bool {
+    matches!(c, '。' | '！' | '？' | '.' | '!' | '?' | '；' | ';')
+}
+
+/// 规则 A：链路后允许出现的边界（否则判为可能是实词，不摘）。
+fn is_filler_boundary(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '，' | ',' | '、' | '。' | '！' | '？' | '.' | '!' | '?' | '；' | ';'
+        )
+}
+
+/// 规则 A：摘掉后若紧跟的标点/空白也一并吃掉。
+fn is_filler_trailing_sep(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '，' | ',' | '、')
+}
+
+/// 规则 B：相邻重复之间允许的间隔（仅逗号/顿号/空白，不含句末标点）。
+fn is_repeat_sep(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '，' | ',' | '、')
+}
+
+/// 在 `k` 处匹配一个犹豫词，取**最长**命中（防 `erm` 被 `er` 截断）。
+/// 返回 `(字符长度, 是否要求后续边界)`：
+/// - 中文单字犹豫词几乎无实义 ⇒ **不要求**边界（`呃我觉得` 也摘，见 FF303 第 17 条用例）。
+/// - 英/日/韩 ⇒ **要求**边界（防 `Uhura` 抠 `uh`、`어디` 抠 `어`）。
+fn match_filler_token(chars: &[char], k: usize) -> Option<(usize, bool)> {
+    let n = chars.len();
+    let starts_with = |tok: &str| -> bool {
+        let t: Vec<char> = tok.chars().collect();
+        k + t.len() <= n && chars[k..k + t.len()] == t[..]
+    };
+    let starts_with_ci = |tok: &str| -> bool {
+        let t: Vec<char> = tok.chars().collect();
+        k + t.len() <= n
+            && chars[k..k + t.len()]
+                .iter()
+                .zip(t.iter())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    };
+    let mut best_len = 0usize;
+    let mut best_strict = false;
+    // 中文 T1（呃/嗯）：几乎无实义 ⇒ 无边界要求。
+    for tok in LEADING_FILLERS_ZH_T1 {
+        if starts_with(tok) {
+            let l = tok.chars().count();
+            if l > best_len {
+                best_len = l;
+                best_strict = false;
+            }
+        }
+    }
+    // 中文 T2（啊哦噢唉诶欸呐）：能起头组词 ⇒ 要求边界。
+    for tok in LEADING_FILLERS_ZH_T2 {
+        if starts_with(tok) {
+            let l = tok.chars().count();
+            if l > best_len {
+                best_len = l;
+                best_strict = true;
+            }
+        }
+    }
+    for tok in LEADING_FILLERS_JA.iter().chain(LEADING_FILLERS_KO) {
+        if starts_with(tok) {
+            let l = tok.chars().count();
+            if l > best_len {
+                best_len = l;
+                best_strict = true;
+            }
+        }
+    }
+    for tok in LEADING_FILLERS_EN {
+        // 英文必须词边界：前一个字符不能是字母数字（防从 "Uhura" 里抠 "uh"）。
+        if starts_with_ci(tok) && (k == 0 || !chars[k - 1].is_ascii_alphanumeric()) {
+            let l = tok.chars().count();
+            if l > best_len {
+                best_len = l;
+                best_strict = true;
+            }
+        }
+    }
+    if best_len > 0 {
+        Some((best_len, best_strict))
+    } else {
+        None
+    }
+}
+
+/// 从 `start` 起（允许前导空白）贪婪吃掉一串犹豫词。
+/// 只有链中含「要求边界」的词时，才要求链路后是边界；纯中文链不受此限。
+fn match_leading_filler_chain(chars: &[char], start: usize) -> Option<usize> {
+    let n = chars.len();
+    let mut k = start;
+    while k < n && chars[k].is_whitespace() {
+        k += 1;
+    }
+    let mut cursor = k;
+    let mut matched = false;
+    let mut needs_boundary = false;
+    while let Some((len, strict)) = match_filler_token(chars, cursor) {
+        cursor += len;
+        matched = true;
+        needs_boundary |= strict;
+    }
+    if !matched {
+        return None;
+    }
+    if needs_boundary && cursor < n && !is_filler_boundary(chars[cursor]) {
+        return None;
+    }
+    Some(cursor)
+}
+
+/// 规则 A 主体：只改「文本开头 / 句末标点后」的句首位置。
+fn strip_leading_fillers(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    let mut at_slot_start = true;
+    while i < n {
+        if at_slot_start {
+            if let Some(end) = match_leading_filler_chain(&chars, i) {
+                i = end;
+                while i < n && is_filler_trailing_sep(chars[i]) {
+                    i += 1;
+                }
+                continue; // 内容尚未输出，仍处于句首
+            }
+        }
+        let c = chars[i];
+        at_slot_start = is_sentence_end(c);
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// 规则 B：折叠紧邻的字面重复（≥2 次，中间可选逗号/空白）。
+///
+/// 🔴 **白名单门控**（FIX-FF303-B）：只有重复单元本身是**已知话语标记**（`REPEAT_COLLAPSIBLE_*`）
+/// 才判为口吃并折叠；否则一律原样 —— 因为 `然后然后`（口吃）与 `研究研究`（ABAB 动词重叠）
+/// 字面上无法区分，英文 `had had`/`that that` 同理。
+/// 英文按空白分词（小写归一后查表，字面完全相同）；中日韩按 2–3 字 CJK 单元查表。
+fn collapse_adjacent_repeats(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < n {
+        let c = chars[i];
+        if c.is_ascii_alphanumeric() {
+            let mut e = i;
+            while e < n && chars[e].is_ascii_alphanumeric() {
+                e += 1;
+            }
+            let word: String = chars[i..e].iter().collect();
+            // FIX-FF303-B：只有白名单词（小写归一）的紧邻重复才折叠（`I I`→`I`；
+            // `had had`/`that that` 不在表内 ⇒ 原样）。
+            let foldable = REPEAT_COLLAPSIBLE_EN.contains(&word.to_ascii_lowercase().as_str());
+            let mut k = e;
+            let mut cnt = 1usize;
+            if foldable {
+                loop {
+                    let mut j = k;
+                    while j < n && is_repeat_sep(chars[j]) {
+                        j += 1;
+                    }
+                    let mut e2 = j;
+                    while e2 < n && chars[e2].is_ascii_alphanumeric() {
+                        e2 += 1;
+                    }
+                    if e2 > j
+                        && chars[j..e2]
+                            .iter()
+                            .collect::<String>()
+                            .eq_ignore_ascii_case(&word)
+                    {
+                        cnt += 1;
+                        k = e2;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            out.push_str(&word);
+            i = if cnt >= 2 { k } else { e };
+        } else if is_hangul_char(c) {
+            // 韩语：**按空白分词**（同英文口径，不管 CJK 单元）。这样 KO 白名单的单字
+            // 才能命中：`그 그 사람` → `그 사람`；`그 그림` 不是同 token 重复 ⇒ 不动。
+            let mut e = i;
+            while e < n && is_hangul_char(chars[e]) {
+                e += 1;
+            }
+            let word: String = chars[i..e].iter().collect();
+            let foldable = REPEAT_COLLAPSIBLE_KO.contains(&word.as_str());
+            let mut k = e;
+            let mut cnt = 1usize;
+            if foldable {
+                loop {
+                    let mut j = k;
+                    while j < n && is_repeat_sep(chars[j]) {
+                        j += 1;
+                    }
+                    let mut e2 = j;
+                    while e2 < n && is_hangul_char(chars[e2]) {
+                        e2 += 1;
+                    }
+                    if e2 > j && chars[j..e2] == chars[i..e] {
+                        cnt += 1;
+                        k = e2;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            out.push_str(&word);
+            i = if cnt >= 2 { k } else { e };
+        } else if is_cjk_char(c) {
+            let mut folded = false;
+            // FIX-FF303-A：单字单元一律不折叠（p 从 2 起）。
+            // FIX-FF303-B：**且单元必须在白名单内**（`然后然后`→折叠；`研究研究`→原样）。
+            for p in 2..=3usize {
+                if i + p > n || chars[i..i + p].iter().any(|&x| !is_cjk_char(x)) {
+                    continue;
+                }
+                let unit: String = chars[i..i + p].iter().collect();
+                if !is_collapsible_cjk_unit(&unit) {
+                    continue;
+                }
+                let mut k = i + p;
+                let mut cnt = 1usize;
+                loop {
+                    let mut j = k;
+                    while j < n && is_repeat_sep(chars[j]) {
+                        j += 1;
+                    }
+                    if j + p <= n && chars[j..j + p] == chars[i..i + p] {
+                        cnt += 1;
+                        k = j + p;
+                    } else {
+                        break;
+                    }
+                }
+                if cnt >= 2 {
+                    out.push_str(&unit);
+                    i = k;
+                    folded = true;
+                    break;
+                }
+            }
+            if !folded {
+                out.push(c);
+                i += 1;
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,6 +1143,309 @@ mod tests {
     #[test]
     fn effective_text_two_chars() {
         assert!(is_effective_text("你好"));
+    }
+
+    // ============================================================
+    // FORMAT-FALLBACK-303: strip_fillers_conservative（保守语气词去除，中/英/日/韩）
+    // ============================================================
+
+    // ---- 必须摘（7 条）----
+
+    #[test]
+    fn ff303_strip_chinese_leading_filler() {
+        assert_eq!(
+            strip_fillers_conservative("呃，我觉得这个方案可以"),
+            "我觉得这个方案可以"
+        );
+    }
+
+    #[test]
+    fn ff303_strip_english_leading_filler() {
+        assert_eq!(strip_fillers_conservative("Um, I think so."), "I think so.");
+    }
+
+    #[test]
+    fn ff303_strip_japanese_leading_filler() {
+        assert_eq!(
+            strip_fillers_conservative("えーと、ちょっと待って"),
+            "ちょっと待って"
+        );
+    }
+
+    #[test]
+    fn ff303_strip_korean_leading_filler() {
+        assert_eq!(strip_fillers_conservative("음, 좋아요"), "좋아요");
+    }
+
+    #[test]
+    fn ff303_strip_stacked_filler() {
+        assert_eq!(strip_fillers_conservative("嗯嗯，可以"), "可以");
+    }
+
+    #[test]
+    fn ff303_rule_b_chinese_repeat() {
+        assert_eq!(
+            strip_fillers_conservative("然后然后我们开始"),
+            "然后我们开始"
+        );
+    }
+
+    #[test]
+    fn ff303_rule_b_english_repeat() {
+        assert_eq!(strip_fillers_conservative("I I think"), "I think");
+    }
+
+    // ---- 绝不许摘（边界外，8 条）----
+
+    #[test]
+    fn ff303_keep_demonstrative_nage() {
+        assert_eq!(
+            strip_fillers_conservative("那个文件删了吗"),
+            "那个文件删了吗"
+        );
+    }
+
+    #[test]
+    fn ff303_keep_copula_jiushi() {
+        assert_eq!(strip_fillers_conservative("问题就是这里"), "问题就是这里");
+    }
+
+    #[test]
+    fn ff303_keep_midsentence_ranhou() {
+        assert_eq!(
+            strip_fillers_conservative("先存盘然后重启"),
+            "先存盘然后重启"
+        );
+    }
+
+    #[test]
+    fn ff303_keep_japanese_ano() {
+        assert_eq!(
+            strip_fillers_conservative("あの人は誰ですか"),
+            "あの人は誰ですか"
+        );
+    }
+
+    #[test]
+    fn ff303_keep_korean_geu() {
+        assert_eq!(
+            strip_fillers_conservative("그 사람이 왔어요"),
+            "그 사람이 왔어요"
+        );
+    }
+
+    #[test]
+    fn ff303_keep_word_internal_uhura() {
+        assert_eq!(
+            strip_fillers_conservative("Uhura is a character."),
+            "Uhura is a character."
+        );
+    }
+
+    #[test]
+    fn ff303_keep_midsentence_filler() {
+        assert_eq!(
+            strip_fillers_conservative("我觉得呃这个不行"),
+            "我觉得呃这个不行"
+        );
+    }
+
+    // ---- 两种文本形态（第 16/17 条，供下一单节点包装）----
+
+    #[test]
+    fn ff303_multisentence_punctuated_strips_each_sentence_head() {
+        // 已带标点多句：每个句首都能摘。
+        assert_eq!(
+            strip_fillers_conservative("呃，我觉得可以。嗯，那就这样。"),
+            "我觉得可以。那就这样。"
+        );
+    }
+
+    #[test]
+    fn ff303_unpunctuated_single_run_strips_only_leading() {
+        // 无标点单段：只有开头那一个能摘；句中「嗯」分不出句子，保守不动。
+        assert_eq!(
+            strip_fillers_conservative("呃我觉得可以嗯那就这样"),
+            "我觉得可以嗯那就这样"
+        );
+    }
+
+    // ---- FIX-FF303-A 追加（18~27）：单字叠词不折叠 + 中文 T2 分档 ----
+
+    #[test]
+    fn ff303a_18_keep_verb_reduplication_kanakan() {
+        // Gavin 真实语料：动词重叠表短时/尝试，折叠即改变语义。
+        assert_eq!(
+            strip_fillers_conservative("看看有什么好看的电影"),
+            "看看有什么好看的电影"
+        );
+    }
+
+    #[test]
+    fn ff303a_19_keep_emotional_reduplication_hahaha() {
+        assert_eq!(
+            strip_fillers_conservative("哈哈哈太好笑了"),
+            "哈哈哈太好笑了"
+        );
+    }
+
+    #[test]
+    fn ff303a_20_keep_other_verb_reduplication() {
+        assert_eq!(strip_fillers_conservative("想想再说"), "想想再说");
+        assert_eq!(strip_fillers_conservative("试试看"), "试试看");
+    }
+
+    #[test]
+    fn ff303a_21_keep_aoshengtanqi() {
+        assert_eq!(
+            strip_fillers_conservative("唉声叹气了一整天"),
+            "唉声叹气了一整天"
+        );
+    }
+
+    #[test]
+    fn ff303a_22_keep_nahan() {
+        assert_eq!(strip_fillers_conservative("呐喊了一声"), "呐喊了一声");
+    }
+
+    #[test]
+    fn ff303a_23_keep_ohuo() {
+        assert_eq!(strip_fillers_conservative("哦豁完蛋了"), "哦豁完蛋了");
+    }
+
+    #[test]
+    fn ff303a_24_rule_a_covers_stacked_filler() {
+        // 句首叠写由规则 A 独立摘除，不依赖规则 B 的单字折叠。
+        assert_eq!(strip_fillers_conservative("嗯嗯，可以"), "可以");
+    }
+
+    #[test]
+    fn ff303a_25_t1_still_strips_without_boundary() {
+        assert_eq!(strip_fillers_conservative("呃我觉得可以"), "我觉得可以");
+    }
+
+    #[test]
+    fn ff303a_26_t2_strips_when_followed_by_punct() {
+        assert_eq!(strip_fillers_conservative("唉，今天真累"), "今天真累");
+    }
+
+    #[test]
+    fn ff303a_27_rule_b_multichar_still_folds() {
+        assert_eq!(
+            strip_fillers_conservative("然后然后我们开始"),
+            "然后我们开始"
+        );
+    }
+
+    // ---- FIX-FF303-B 追加（28~34 + 韩语分词）：规则 B 白名单门控 ----
+
+    #[test]
+    fn ff303b_28_keep_abab_verb_reduplication() {
+        assert_eq!(
+            strip_fillers_conservative("研究研究这个方案"),
+            "研究研究这个方案"
+        );
+    }
+
+    #[test]
+    fn ff303b_29_keep_other_abab_reduplication() {
+        assert_eq!(strip_fillers_conservative("讨论讨论"), "讨论讨论");
+        assert_eq!(strip_fillers_conservative("商量商量"), "商量商量");
+        assert_eq!(strip_fillers_conservative("休息休息"), "休息休息");
+    }
+
+    #[test]
+    fn ff303b_30_keep_english_past_perfect() {
+        assert_eq!(
+            strip_fillers_conservative("I had had enough"),
+            "I had had enough"
+        );
+    }
+
+    #[test]
+    fn ff303b_31_keep_english_that_that() {
+        assert_eq!(
+            strip_fillers_conservative("the thing that that man said"),
+            "the thing that that man said"
+        );
+    }
+
+    #[test]
+    fn ff303b_32_fold_whitelisted_ranhou() {
+        assert_eq!(
+            strip_fillers_conservative("然后然后我们开始"),
+            "然后我们开始"
+        );
+    }
+
+    #[test]
+    fn ff303b_33_fold_whitelisted_jiushi() {
+        assert_eq!(
+            strip_fillers_conservative("就是就是这个意思"),
+            "就是这个意思"
+        );
+    }
+
+    #[test]
+    fn ff303b_34_fold_whitelisted_english_i() {
+        assert_eq!(strip_fillers_conservative("I I think so"), "I think so");
+    }
+
+    #[test]
+    fn ff303b_korean_token_fold_and_nonrepeat_safe() {
+        // 韩语按空白分词：白名单词的同 token 重复折叠；不同 token 不动。
+        assert_eq!(strip_fillers_conservative("그 그 사람"), "그 사람");
+        assert_eq!(strip_fillers_conservative("그 그림"), "그 그림");
+    }
+
+    // ---- 幂等（第 15 条）----
+    #[test]
+    fn ff303_idempotent() {
+        let cases = [
+            "呃，我觉得这个方案可以",
+            "Um, I think so.",
+            "えーと、ちょっと待って",
+            "음, 좋아요",
+            "嗯嗯，可以",
+            "然后然后我们开始",
+            "I I think",
+            "那个文件删了吗",
+            "问题就是这里",
+            "先存盘然后重启",
+            "あの人は誰ですか",
+            "그 사람이 왔어요",
+            "Uhura is a character.",
+            "我觉得呃这个不行",
+            "哈哈哈",
+            "看看有什么好看的电影",
+            "哈哈哈太好笑了",
+            "想想再说",
+            "试试看",
+            "唉声叹气了一整天",
+            "呐喊了一声",
+            "哦豁完蛋了",
+            "呃我觉得可以",
+            "唉，今天真累",
+            "研究研究这个方案",
+            "讨论讨论",
+            "商量商量",
+            "休息休息",
+            "I had had enough",
+            "the thing that that man said",
+            "然后然后我们开始",
+            "就是就是这个意思",
+            "I I think so",
+            "그 그 사람",
+            "그 그림",
+        ];
+        for c in cases {
+            let once = strip_fillers_conservative(c);
+            let twice = strip_fillers_conservative(&once);
+            assert_eq!(
+                twice, once,
+                "幂等失败（输入 {c:?}）：once={once:?} twice={twice:?}"
+            );
+        }
     }
 }
 

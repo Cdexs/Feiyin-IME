@@ -5,6 +5,34 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-1 — FIX-FF303-B ✅ 交付（规则 B 白名单门控 + 韩语空白分词）
+
+- **规则 B 白名单门控**：只有重复单元本身是已知话语标记才折叠（ZH `然后/就是/那个/这个/所以/反正/其实`；EN `i/the/a/and/so/but/like/you/we/it`；JA `その/あの/えー/まあ`；KO `그/저/음`）。`然后然后`→折叠、`研究研究`→原样、`I I`→折叠、`had had`/`that that`→原样。
+- **两张表用途不同不合并**：A 表＝「单独出现即可摘」（那些有实义的 `然后/就是/那个` 不进 A）；B 表＝「只有紧邻重复才折叠」（它们进 B）。
+- **韩语改空白分词**（orchestrator 补充）：新增 `is_hangul_char` + Hangul token 分支（口径同英文），`is_cjk_char` 移除韩文范围 —— 修复此前「KO 表全单字 + p≥2 ⇒ 韩语规则 B 静默缺失」。`그 그 사람`→`그 사람`；`그 그림` 不动。
+- **验证**：`rustfmt --check` clean；`cargo check --all-targets` 0 error、warnings **110/101**=基线；`numstat`==`-w`（**655/0**）；`cargo test --bin feiyin-ime text_normalizer::` **104P/0F**（原 27 零回退 + 新增 28~34 + 韩语 8 条）。
+- **残余风险**：B 表为人工枚举 ⇒ 新口吃词漏摘（有意代价）；`呃逆` 生僻词句首被摘；逗号后语气词保持不摘。
+- **红线**：仅改 `src/text_normalizer.rs`；未碰 `src/main.rs`/`src/llm/**`；未动版本 / 未 commit / 未出包 / 零凭证。
+
+## 2026-09-21 — coder-1 — FIX-FF303-A ✅ 交付（修 303 两条误摘，必修）
+
+- **必修一（规则 B）**：CJK 折叠单元下限 1→2 —— `看看`/`想想`/`试试`（动词重叠）、`哈哈哈`（情绪叠词）不再折叠；`然后然后`（2 字）仍折叠；英文按词不变。🔴 句首叠写 `嗯嗯/呃呃` 由**规则 A** 独立摘除（用例 24 钉死，不依赖规则 B）。
+- **必修二（规则 A 分档）**：`LEADING_FILLERS_ZH` 拆 **T1 无边界**（`呃`/`嗯`）与 **T2 须边界**（`啊`/`哦`/`噢`/`唉`/`诶`/`欸`/`呐`）—— `唉声叹气`/`呐喊`/`哦豁` 不再被啃词头；`唉，今天真累`（后接逗号）仍正确摘除。
+- **改判**：`唉，今天真累` 句首叹词摘除是**预期行为**（非风险），用例 26 覆盖。
+- **验证**：`rustfmt --check` clean；`cargo check --all-targets` 0 error、warnings **110/101**=基线；`numstat`==`-w`（**507/0**）；`cargo test --bin feiyin-ime text_normalizer::` **96P/0F**（原 17 + 新增 18~27，原 17 一条未退）。
+- **残余风险**（改后）：① 规则 B 仍折叠 4 连及以上 `哈哈哈哈`→`哈哈`；② T1 `呃逆` 句首会被摘（生僻医学词）；③ 逗号后语气词不摘（符合规格）。
+- **红线**：仅改 `src/text_normalizer.rs`；未碰 `src/main.rs`/`src/llm/**`；未动版本 / 未 commit / 未出包 / 零凭证。
+
+## 2026-09-21 — coder-1 — FORMAT-FALLBACK-303 ✅ 交付（本地免费语气词去除纯函数，第一步）
+
+- **接口**：`text_normalizer::strip_fillers_conservative(text: &str) -> String` —— 管线无关（不接管线类型/language）、不做启停判断、无日志/IO/配置、零新依赖（无正则）；暂带 `#[allow(dead_code)]`（挂载点下一单，warnings 保持 110/101）。
+- **规则 A（句首犹豫词）**：中 9 单字 / 英 8 / 日 7 / 韩 4，最长命中，摘后吃 `，,、`/空白。🔴 中文单字**不要求后续边界**（`呃我觉得` 也摘，第 17 条）；英/日/韩**要求边界**（防 `Uhura`/`어디`/`まあまあ`）。
+- **规则 B（紧邻重复折叠）**：≥2 次字面相同（中间可选逗号/空白），英按词、中日韩 1–3 字 CJK 单元；迭代到不动点 ⇒ 幂等。
+- **主动排除**：那个/就是/然后/所以/但是、裸 あの、그/저기/그러니까（均有实义，理由见 result.md §三）。
+- **验证**：`rustfmt --check` clean；`cargo check --all-targets` 0 error、warnings **110/101**=基线；`numstat`==`-w`（**411/0**）；`cargo test --bin feiyin-ime text_normalizer::` **86P/0F**（含 17 条 ff303：必需 7 + 边界外 8 + 形态 2 + 幂等）。`docs/MACOS-HANDOFF.md` 补一节（平台中立）。
+- **残余风险**（已声明）：规则 B 会折叠 `看看`→`看`/`哈哈哈`→`哈`；中文无边界 ⇒ `唉声叹气` 句首被摘。按规格实现，未擅改。
+- **红线**：仅改 `src/text_normalizer.rs`（+ docs）；未碰 `src/main.rs` / `src/llm/**`；未动版本 / 未 commit / 未出包 / 零凭证。
+
 ## 2026-09-21 — coder-1 — POC-ACC-CONTEXT-299 ✅ 交付（FunASR Nano 上下文注入路径验证，纯 PoC）
 
 - **结论（通了）**：不改 C++，靠「不传 hotwords + 自拼完整 user_prompt」（`has_override=false` ⇒ C++ 原样使用）即可注入任意上下文；`rag_chemistry` 基线 `只在/脂` → 注入「化学术语参考：酯…」后**纠正为 `酯`**。写法：`前文行` 是有效成分，已有前文时热词行无额外增益（P2==P3，P3 省 ~20 token）。
@@ -86,6 +114,19 @@
 - **验证**：`cargo check --all-targets` 0 error、warnings **110/101** = 基线；`rustfmt --check` clean；新增单测 `local_stream::tests` **2P/0F**（连跑 3 次）。🔴 实机（`gained` 实测）交 tester-1/Gavin。
 - **⚠️ 协作事件**：主控文档 commit `99799c5`（10:26:26）在本题进行中执行，**把我未完成的 `local_stream.rs` 与 coder-1 的 `src/audio/mod.rs` 一并扫入**（commit message 未反映代码改动）。本单改动已随之落盘、worktree 无额外 diff；`git status` 另见 `.gitignore` + `src/audio/mod.rs`（非本单）。请主控知悉该 commit 语义与文件归属。
 - **红线**：只改 `local_stream.rs` / 未动版本 / 未自行 commit / 未出包 / 未跑 `cargo build --release` / 零凭证。
+
+## 2026-09-21 — tester-1 — TEST-EXEC + BUILD-302 ✅ 复跑全绿 + 出包（八项 PASS，301 首跑 4 红已收口）
+
+- **基线**：HEAD `90acbf1`（301-B），clean、`ui/` 零 diff。
+- **首跑 `b08c376`（301 原版）仍 4 FAIL**：301 只修好 `nospeech_122_guard_tests::h4`；`guard_214_215::g7/g9/g10/g11` 仍红——**301 漏了 `src/punctuation/mod.rs:718` 自带的 `prod_lines`**（扫 `main.rs`，仍被 `main.rs:9165` 的 `mod parallel_acc_298_tests` 截断，锚点 `:9503/9265/9391/9478` 落区外）。如实上报 → 主控修 `301-B`。
+- **复跑（`90acbf1`）全绿**：root **1304P/0F/15I**（crash 52P/2I + bin 1216P/0F/13I + integration 36P）；`src-tauri` **85P/0F/0I**；Vitest **SKIP**（`ui/` 零 diff）。
+- **🔴 逐条点名**（不只看总数）：上轮 5 条假红 **5/5 恢复 ok**（`h4` + `g7/g9/g10/g11`）；298 六条新测全绿；`1304−1299=+5` = 假红恢复，无新增测试。
+- **在线 / PARALLEL=0**（沿用 300 取证）：在线 `main.rs:7845` `initial_text=Some`+`pretranscribed=None` ⇒ 新分支 `:9279` 结构不可达；`LOCAL_RT_ACC_PARALLEL=0` ⇒ 两派发口 false ⇒ `pretranscribed=None` ⇒ 原 accuracy 2pass，代码级等价串行。
+- **BUILD-302**：Step1–4 全走；源码 mtime 前后 md5 一致（`e0656ba4…`）。产物 main `5a318429…`（14,477,824B/12:02，较 296 **+58,368B**）/ ui `1cb71954…`（10,060,288B）/ crash `4844bd21…`（24,879,104B）；两副本相等；main 异于 BUILD-296。八项逐项 PASS（①时间戳 ②sha ③0.9.2 ④冒烟 PID 22620 Responding=True/无 crash.json/残 0 ⑤config `da2be5da…`+wordbook 零变化 ⑥110/9/17 ⑦探针 `[LocalRT-DBG-298]`=4 等 ⑧toml 三副本全等）。
+- **探针**：`[LocalRT-DBG-298]`=4（进包）/ `291`=1 / `293`=1 / `292`=2 / `284`=3 / `289`=1 / `276`=1 / `277`=1 / `278`=2；`283`=0 既定预期（293-B 改名）。
+- **端测四类交 Gavin**：291 中间句尾字／293-B 三场景**分开测**首字／298 长语音看 `[LocalRT-DBG-298] join:` 的 **`tail_wait`**／本地流式+翻译。应急开关 `LOCAL_RT_ACC_PARALLEL=0`（+ `_SILENCE_MS` 800 / `_MIN_SEG_MS` 3000）。
+- **证据**：`collab/outbox/tester-1/testexec302/`。
+- **红线**：版本 0.9.2 未动 / 未 commit / 未 `cargo clean` / 未破坏性 git / 零凭证。
 
 ## 2026-09-21 — tester-1 — TEST-EXEC-300 ⚠️ 298 回归 5 FAIL（全为测试侧扫描边界假红，非生产回归）
 

@@ -11,12 +11,12 @@
 
 | 项 | 状态 |
 | --- | --- |
-| 版本 | 仍 **0.9.2**。v0.9.3 本地流式批次已并入 0.9.2 出包，最新包 **BUILD-296**（HEAD `a0334b9`，含 291 尾字 / 292 dump / 293-B 首字 + 294/295 护栏）。🔴 未 push、未打 tag，等 Gavin 明示 |
-| 本轮出包史 | BUILD-258 → 267 → 274 → 280（诊断包）→ 285（🛑 作废）→ 287 → 290 → **296（当前）** |
-| 端测待办 | ① 🆕 **BUILD-296 五项**（须 Gavin 真人录音）：291 中间句尾字／293 先开口·按键后立刻·按键后停 2s **三场景分开测**首字／本地流式+开启翻译交叉场景；带 `-debug` 见 `debug-audio/` pre-roll WAV ② v0.9.1 四项遗留：overlay 编辑态剥尾标点／Key 输入框 placeholder／繁中 ITN（`三點半→3:30`）／「API 配置」新文案布局 |
+| 版本 | 仍 **0.9.2**。v0.9.3 本地流式批次已并入 0.9.2 出包，最新包 **BUILD-302**（HEAD `90acbf1`，含 291 尾字 / 292 dump / 293-B 首字 / 294·295·297·301 护栏 + 298 accuracy 并行转写）。🔴 未 push、未打 tag，等 Gavin 明示 |
+| 本轮出包史 | BUILD-258 → 267 → 274 → 280（诊断包）→ 285（🛑 作废）→ 287 → 290 → 296 → **302（当前）** |
+| 端测待办 | ① 🆕 **BUILD-302 四类**（须 Gavin 真人录音）：291 中间句尾字／293 先开口·按键后立刻·按键后停 2s **三场景分开测**首字／298 **长语音**看 `[LocalRT-DBG-298] join:` 的 **`tail_wait`**／本地流式+开启翻译交叉场景；应急开关 `LOCAL_RT_ACC_PARALLEL=0`（+ `_SILENCE_MS`/`_MIN_SEG_MS`）；带 `-debug` 见 `debug-audio/` pre-roll WAV ② v0.9.1 四项遗留：overlay 编辑态剥尾标点／Key 输入框 placeholder／繁中 ITN（`三點半→3:30`）／「API 配置」新文案布局 |
 | Worker | ✅ 09-21 新 session 三 Worker 就绪（OpenCode `commandgo/deepseek-v4.1-flash`），coder-1 / coder-2 已 ACK |
 | 文档 | 09-21 归档 handoffs 57 条（610 → 89 行）、todo 批次明细入 archive。DEC-064 两层结构：**新增条目必须 archive 与索引两边都写** |
-| 下一步 | **等 Gavin 端测 BUILD-296 反馈**。无新 bug 则清存量待办（223 ITN ／ 213 翻译语言 UI ／ 194 护栏 ／ 204 提示词） |
+| 下一步 | **等 Gavin 端测 BUILD-302 反馈**。无新 bug 则清存量待办（223 ITN ／ 213 翻译语言 UI ／ 194 护栏 ／ 204 提示词） |
 
 ---
 
