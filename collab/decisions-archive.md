@@ -1185,6 +1185,16 @@ Gavin 原话是「万层如果能**被亿整除**就升到亿」。严格数学�
 
 **决策时间**：2026-08-08
 
+**追加订正（2026-09-21，PUNCT-DOUBLE-334；只追加，不改正文）**：
+上文「**适用范围限制**」的前提**已失效** —— DEC-076 把本地 accuracy 引擎迁为 Qwen3 后，
+本地并行 accuracy 路径（`main.rs` 的 `pretranscribed`）现在跑的**也是 Qwen3**。故该路径的
+`native_punctuated` **也应改用本决策的实测口径** `punctuation::has_effective_punctuation`。
+此前它被误传为「各分片是否都解码成功」（`acc_all_native`）：任一片失败即误判「无标点」⇒
+`apply_local_punctuation` 对**已带标点**全文再跑 CT-Transformer ⇒ 位置重合处 `。。`、不重合处各占一个
+（Gavin 2026-09-21 端测报障的叠加指纹）。
+🔴 **本决策正文与「已知接受边界」表均不变**（含「引号无句号判 true → 接受」那条，不得当 bug 重修）；
+仅此「适用范围限制」随前提失效而作废。
+
 ---
 
 ## DEC-048 · 阶段三（TEST-SYNC）开命令白名单：只放 `cargo fmt` + `cargo check`

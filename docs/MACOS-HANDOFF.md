@@ -1988,3 +1988,11 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 路径 B 本体（`maybe_learn_user_edit` / `AUTO_LEARN_OBSERVE_MS` / `extract_changed_text`）与 legacy `src/injection/` 模块（Windows-only、Deprecated、全库 0 调用者） | ✅ 均在 Windows-only 域；macOS 侧无引用（legacy 模块本就 `#[cfg(target_os = "windows")]`，已连根删除） |
 | 「应用内编辑」学习路径（DEC-058 要求「必须保证」的那条） | ✅ **未动**：`learn_correction` 生产区仍恰 1 个调用点（编辑态提交），并新增源码级护栏 `pathb_332_learn_correction_single_call_site_and_no_pathb_symbols` 钉死 |
 | macOS 侧需要做什么 | ⚠️ **仅需删除对上述 3 个符号的引用**（若有）；其余无需改动。未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未引入依赖 |
+
+## PUNCT-DOUBLE-334（2026-09-21，coder-2）· 本地并行 accuracy 的 `native_punctuated` 改文本实测 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| `run_pipeline_core` 构造 `pretranscribed` 时，第二元由 `acc_all_native`（各片是否都解码成功）改为 `pretranscribed_native_punctuated(&normalized)` = `punctuation::has_effective_punctuation`（DEC-047 实测口径） | ⚠️ **行为变更，平台中立**：`compose`/detector 均无 `#[cfg]`；macOS 编译同一代码 ⇒ 同继承「不再二次打点」 |
+| `acc_all_native` 挪到 join 的 debug 日志继续观测（语义不再被误用） | ✅ 平台中立 |
+| macOS 侧需要做什么 | ✅ **无需代码改动**；未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未触 `src/platform/**` |

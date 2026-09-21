@@ -8300,8 +8300,9 @@ fn spawn_worker_thread(
                         let acc_joined = transcription::join_segment_texts(&acc_texts);
                         if log::log_enabled!(log::Level::Debug) {
                             log::debug!(
-                                "[LocalRT-DBG-298] join: segs={} total_decode={:.0}ms tail_wait={:.0}ms",
+                                "[LocalRT-DBG-298] join: segs={} all_native={} total_decode={:.0}ms tail_wait={:.0}ms",
                                 acc_texts.len(),
+                                acc_all_native,
                                 acc_total_decode_ms,
                                 tail_wait_ms
                             );
@@ -8314,7 +8315,12 @@ fn spawn_worker_thread(
                                 &acc_joined,
                                 config.audio.chinese_script,
                             );
-                            Some((normalized, acc_all_native))
+                            // PUNCT-DOUBLE-334：第二元 = 「文本**实际**是否已有有效标点」（DEC-047 口径，
+                            // 与 :9855 的 Qwen3 分支同一 detector），**不是**「各分片是否都解码成功」。
+                            // 旧值 `acc_all_native` 语义错配：任一片失败 ⇒ 误判「无标点」⇒ 对已带标点全文
+                            // 再跑 CT-Transformer ⇒ `。。`/`，。` 叠加（Gavin 端测报障）。
+                            let native_punctuated = pretranscribed_native_punctuated(&normalized);
+                            Some((normalized, native_punctuated))
                         } else {
                             None
                         };
@@ -9392,6 +9398,29 @@ fn acc_parallel_result_usable(cancelled: bool, joined: &str) -> bool {
     !cancelled && !joined.trim().is_empty()
 }
 
+/// PUNCT-DOUBLE-334：本地并行 accuracy 文本的 `native_punctuated` 判定。
+///
+/// DEC-047 口径 = **文本实测**：`punctuation::has_effective_punctuation`（词内嵌标点豁免，
+/// `3.14`/`3:30`/`example.com` 不算真标点），与 `main.rs` 的 Qwen3 `initial_text` 分支同一 detector。
+///
+/// 🔴 为什么不能用「各分片是否都解码成功」（原 `acc_all_native` 的语义）：分片失败 ≠ 文本无标点。
+/// 任一片 Err ⇒ 旧值 false ⇒ `apply_local_punctuation` 的 `!native_punctuated` 门通过 ⇒
+/// CT-Transformer 对**已带标点**的全文再打一遍 ⇒ 位置重合处 `。。`、不重合处各占一个（叠加指纹）。
+///
+/// 已知取舍（**记录在案，不得当 bug 重修**）：
+/// 1. 带洞（失败片留空串）且其余已带标点 ⇒ 判 true ⇒ 跳过引擎 ⇒ 洞那段不补标点。
+///    可接受：洞（缺整段文字）是更大缺陷；**为补洞而补跑会把旁边已打标点的好段二次打点**
+///    （正是本单要消除的 `。。` 叠加）；且预览侧 `SkippedHole`（325/329）已拦住带洞回灌。
+/// 2. `has_effective_punctuation` 口径是「任一无 ASCII 夹持的标点出现即 true」，**不要求句末标点**：
+///    文本只有一个逗号、没有句号 ⇒ true ⇒ 跳过引擎 ⇒ **最终输出没有句号**。
+///    这**不是新缺陷**，是 DEC-047 白纸黑字记录过的「已知接受边界」
+///    （`decisions-archive.md:1174` 表格：「`他说“好”`（中文引号，无句号）→ 本决策口径 true →
+///    跳过标点引擎 → **接受** —— 引号无句号不是用户会报的缺陷」，该表开头即「不得当 bug 重修」）。
+///    🔴 放宽此判据会直接把重复标点带回来 ⇒ 见到「少个句号」**不要动判据**。
+fn pretranscribed_native_punctuated(text: &str) -> bool {
+    punctuation::has_effective_punctuation(text)
+}
+
 /// ACC-PREVIEW-REFLOW-325：合成回灌预览 —— `acc_text` 替换 `streaming` 的前 `committed_len`
 /// 个**字符**，其余保留流式尾巴。按**字符**（非字节）切，避免 UTF-8 切裂。
 fn reflow_preview(acc_text: &str, streaming: &str, committed_len: usize) -> String {
@@ -9742,6 +9771,56 @@ mod edit_snapshot_331_tests {
 }
 
 #[cfg(test)]
+mod punct_double_334_tests {
+    use super::{pretranscribed_native_punctuated, transcription};
+
+    /// 🔴 回归核心（§五-1）：构造「部分分片失败 + 其余已带标点」⇒ 必须 true ⇒ 不再二次打标点。
+    /// 失败片贡献空串（`texts.push(String::new())`），拼出来带洞但已带标点。
+    #[test]
+    fn partial_failed_segment_with_punctuated_text_skips_engine() {
+        let joined = transcription::join_segment_texts(&[
+            "下台进行另一次人生时。".to_string(),
+            String::new(), // 失败片留下的空洞
+            "灵魂自愿经历某些事件。".to_string(),
+        ]);
+        assert!(
+            pretranscribed_native_punctuated(&joined),
+            "带洞但文本已带标点 ⇒ native_punctuated=true ⇒ 跳过引擎（旧实现误判 false ⇒ 。。 叠加）"
+        );
+    }
+
+    /// §五-2：全部分片成功且带标点 ⇒ 行为不变（仍跳过引擎）。
+    #[test]
+    fn all_segments_success_punctuated_unchanged() {
+        let joined = transcription::join_segment_texts(&["甲。".to_string(), "乙。".to_string()]);
+        assert!(pretranscribed_native_punctuated(&joined));
+    }
+
+    /// 🔴 §五-3 反向：文本**确实没有标点**（模型未输出）⇒ false ⇒ 引擎**必须**跑。
+    /// 这是 DEC-047 当初要解决的原始缺陷，别修回去。
+    #[test]
+    fn text_without_punctuation_still_runs_engine() {
+        let joined = transcription::join_segment_texts(&[
+            "今天天气不错".to_string(),
+            "我们出去走走".to_string(),
+        ]);
+        assert!(
+            !pretranscribed_native_punctuated(&joined),
+            "模型未输出标点 ⇒ false ⇒ CT-Transformer 必须跑（DEC-047 原始缺陷不复现）"
+        );
+    }
+
+    /// §五-4 口径：词内嵌标点豁免（与 :9855 Qwen3 分支同一 detector）。
+    #[test]
+    fn inline_punctuation_is_not_effective() {
+        assert!(!pretranscribed_native_punctuated("圆周率是3.14"));
+        assert!(!pretranscribed_native_punctuated("3:30 开会"));
+        assert!(!pretranscribed_native_punctuated("example.com"));
+        assert!(pretranscribed_native_punctuated("今天天气不错。"));
+    }
+}
+
+#[cfg(test)]
 mod parallel_acc_298_tests {
     use super::{acc_parallel_result_usable, assemble_parallel_accuracy};
 
@@ -9803,8 +9882,9 @@ fn run_pipeline_core(
     // Some ⇒ 跳过内部转录，直接用该文本走 LLM 后半段。🔴 与 initial_text **分开**：
     // `from_online_streaming` 仍只由 `initial_text.is_some()` 决定（本路径 initial_text=None
     // ⇒ false ⇒ 主通道 ITN 启用），**不得**用本参数反推来源（DEC-066）。
-    // native_punctuated 由各段是否全 native 成功决定（与 transcribe_segments_chunked 同口径），
-    // 不能用文本反推（DEC-047 误用）。
+    // 🔴 native_punctuated 是**文本实测**：`punctuation::has_effective_punctuation(&text)`
+    // （DEC-047 的结论正是「实测文本，而非假设/外推」；原注释把它引反了，PUNCT-DOUBLE-334 订正）。
+    // 由调用方在构造时用 `pretranscribed_native_punctuated` 算好，本参数只接收结果。
     pretranscribed: Option<(String, bool)>,
     // PIPELINE-ORCH-239-B（DEC-066 附则一）：本地转录步骤的状态文案。
     // 现有三档传 `overlay_transcribing`（行为逐位零变）；本地 realtime 新管线传
@@ -9858,7 +9938,9 @@ fn run_pipeline_core(
             } else if let Some((text, native_punctuated)) = pretranscribed {
                 // PARALLEL-ACC-298：本地流式「并行 accuracy」结果。路由与 accuracy 2pass
                 // **完全一致**：`from_online_streaming` 仍由 `initial_text`（本路径为 None）
-                // 决定 = false ⇒ 主通道 ITN 启用；标点用各段 all_native 的与（非文本反推）。
+                // 决定 = false ⇒ 主通道 ITN 启用；标点标记用**文本实测**
+                // `has_effective_punctuation`（DEC-047 口径，见 `pretranscribed_native_punctuated`；
+                // 原「各段 all_native 的与」是语义错配，PUNCT-DOUBLE-334 已订正）。
                 // 不在此再对全量 pcm 跑一次 accuracy（并行 worker 已逐片转写完）。
                 // 保持本地档单状态：仍发 `Processing(transcribing_status_text)`（文案同 :9127）。
                 send_event(

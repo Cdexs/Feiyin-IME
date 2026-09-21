@@ -5,6 +5,15 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-2 — PUNCT-DOUBLE-334 ✅ 交付（最终输出重复标点 `。。`/`，。`）
+
+- **根因**：`main.rs:8317` 把「各片是否解码成功」`acc_all_native` 当 `native_punctuated` ⇒ 任一片失败即误判无标点 ⇒ 对已带标点全文二次打点。
+- **改法**：`:8322` 改 `pretranscribed_native_punctuated` = `has_effective_punctuation`（DEC-047 实测口径）；不动门控、不加去重兜底。
+- **评估**：`acc_all_native` 唯一消费点即此处 ⇒ 挪进 `:8302` join debug 日志保观测；带洞不补标点可接受（入注释）。
+- **注释订正 + archive 追加**：`main.rs` 两处把引反的 DEC-047 改对；`decisions-archive.md:1188` 追加订正（只追加）。
+- **验证**：fmt clean（skip_children）/ check 0 error / warnings **99/90** 新基线 / numstat==-w（87/5）/ `punct_double_334` 4P / **全量 cargo test EXIT 0 / 0 failed**（1402 passed / 19 ignored）。
+- 🔴 实机交 Gavin，未声称已验证。未动版本 / 未 commit / 未出包 / 未碰 `src/transcription/**`、`src/audio/mod.rs` / 零凭证。
+
 ## 2026-09-21 — coder-1 — AUTOLEARN-DROP-PATHB-332 ✅ 交付（摘除「注入后观察窗口」自学习 + 连根清死代码 + 订正过期决策）
 
 - **由来**：DEC-058（2026-09-06）早已判定路径 B「不做」（观测不可靠=负资产），但代码一直跑；Gavin 2026-09-21 重申「永远找不到文本快照」⇒ 摘除。**与「窗口时长」无关**（别调 `AUTO_LEARN_OBSERVE_MS`）。
