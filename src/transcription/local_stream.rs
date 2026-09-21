@@ -301,13 +301,12 @@ pub fn create_local_stream_recognizer(model_dir: &Path) -> Result<OnlineRecogniz
         decoder: Some(dec.to_string_lossy().to_string()),
     };
     c.model_config.tokens = Some(tok.to_string_lossy().to_string());
-    // TUNE-STREAM-317：线程数 env 覆盖（默认 4 = 现行为，无 env 零变）。
+    // TUNE-STREAM-317：线程数 env 覆盖（默认 8，见常量处沿革与 271 反向数据）。
     let num_threads =
         parse_stream_num_threads(std::env::var("LOCAL_STREAM_NUM_THREADS").ok().as_deref());
     c.model_config.num_threads = num_threads;
     c.model_config.provider = Some("cpu".to_string());
-    // TUNE-STREAM-317：blank_penalty env 覆盖（默认 0.0 = 现行为，无 env 零变）。
-    let blank_penalty = c.model_config.debug = false;
+    c.model_config.debug = false;
     // DEC-067：本地预览用 greedy_search（streaming paraformer 仅支持 greedy）
     c.decoding_method = Some("greedy_search".to_string());
     // 端点：不开则 is_endpoint() 永不触发，sentence_end 分支成死代码
@@ -926,7 +925,7 @@ pub fn transcribe_streaming_local(
 mod tests {
     use super::{
         endpoint_confirm_text, parse_stream_num_threads, should_dispatch_acc, should_dispatch_tail,
-        SAMPLE_RATE,
+        LOCAL_STREAM_NUM_THREADS, SAMPLE_RATE,
     };
 
     /// FIX-LOCALRT-TAILCHAR-291/307：三方取最长（main / full / shadow），结果恒 ≥ main。
@@ -1272,13 +1271,19 @@ mod tests {
     // ============================================================
 
     #[test]
-    fn tune317_parse_num_threads_invalid_falls_back_to_default_4() {
-        assert_eq!(parse_stream_num_threads(None), 4, "缺失 ⇒ 默认 4");
-        assert_eq!(parse_stream_num_threads(Some("8")), 8);
+    fn tune317_parse_num_threads_invalid_falls_back_to_default_8() {
+        // 🔴 默认值由 4 提到 8（Gavin 2026-09-21 拍板），断言随之更新。
+        assert_eq!(
+            parse_stream_num_threads(None),
+            LOCAL_STREAM_NUM_THREADS,
+            "缺失 ⇒ 默认（绑常量，避免默认值再改时测试与实现脱节）"
+        );
+        assert_eq!(LOCAL_STREAM_NUM_THREADS, 8, "默认值应为 8");
+        assert_eq!(parse_stream_num_threads(Some("4")), 4, "显式 4 仍可回退");
         assert_eq!(parse_stream_num_threads(Some(" 2 ")), 2, "容忍空白");
-        assert_eq!(parse_stream_num_threads(Some("0")), 4, "<1 非法 ⇒ 默认");
-        assert_eq!(parse_stream_num_threads(Some("-3")), 4, "负数非法 ⇒ 默认");
-        assert_eq!(parse_stream_num_threads(Some("abc")), 4, "非数字 ⇒ 默认");
-        assert_eq!(parse_stream_num_threads(Some("2.5")), 4, "非整数 ⇒ 默认");
+        assert_eq!(parse_stream_num_threads(Some("0")), 8, "<1 非法 ⇒ 默认");
+        assert_eq!(parse_stream_num_threads(Some("-3")), 8, "负数非法 ⇒ 默认");
+        assert_eq!(parse_stream_num_threads(Some("abc")), 8, "非数字 ⇒ 默认");
+        assert_eq!(parse_stream_num_threads(Some("2.5")), 8, "非整数 ⇒ 默认");
     }
 }
