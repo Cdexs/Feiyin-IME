@@ -251,3 +251,30 @@ F1 是**源码级护栏**——它 `include_str!` 读自身源码、按**字面�
 **识别特征**：测试名里带 `guard` / `f1~f4` / 断言里出现 `count_startswith` `block_line_of`
 `main_prod_lines` `concat!("…", "…")`（故意拆字符串防自匹配）⇒ 就是源码级护栏，
 **它对无关改动敏感，这是设计使然，不是脆弱**。
+
+## [FMT-COLLATERAL-001] 再补（2026-09-21）：`skip_children=true` 可以**用来格式化**，但**不能用来验收**
+
+本条是主控给错指引后的订正，**责任在主控**。
+
+**背景**：为防止 rustfmt 吃 crate 根 `main.rs` 时沿 `mod` 递归污染他人在飞文件（本条第一节），
+主控要求 Worker 一律用 `rustfmt --config skip_children=true`。**防污染这个目的是对的。**
+
+🔴 **但把它同时当作验收命令就是假通过**：`skip_children=true` 会**跳过所有经 `mod` 到达的子文件**，
+于是 `rustfmt --config skip_children=true --check src/main.rs` 只检查了 `main.rs` 自己。
+`src/audio/mod.rs` 正是 `main.rs` 的子模块 ⇒ 它不 clean 也照样报 clean
+（coder-1 2026-09-21 自查发现并上报）。
+
+**规矩（两条分开，别混用）**：
+
+| 目的 | 命令 |
+| --- | --- |
+| **格式化**（避免碰他人文件） | `rustfmt --config skip_children=true <自己的文件>` 或 `cargo fmt -- <文件>` |
+| **验收/提交前**（必须覆盖全仓） | 🔴 `cargo fmt --check`（**不带** skip_children） |
+
+⇒ Worker 自证里写「fmt clean」时**必须注明用的哪一条**；写 `skip_children` 的那条只能证明
+「我自己的文件干净」，**不能证明仓库干净**。主控提交前自己跑一次不带参数的 `cargo fmt --check`。
+
+**与本文件 `[FILTERED-TEST-BLINDSPOT-001]` 同型**：两者都是「**为缩小范围而加的参数，
+被当成了全量验收**」。识别特征：命令里出现任何 **缩小检查面** 的开关
+（`--config skip_children`、`cargo test -- <filter>`、`grep` 带限定路径）⇒
+它的绿色只覆盖被检查的那部分，**不能推广为整体结论**。
