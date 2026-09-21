@@ -246,3 +246,44 @@ Phase 4 完整规划见 `collab/research/macos-phase4-plan-001.md`，逐任务�
 | Shadow 预览 | ⚠️ 日志内 **11:0 从未胜出**（`used=main` 11/11，`shadow_len` 恒 ≤ `main_len`），单次最贵 475ms。**但 Gavin 端测观察到「有时起作用」⇒ 保留不动** | `[LocalRT-DBG-289]` |
 | Pre-roll 前导缓冲 | 🔴 **全程空转** | `mean_abs=0.0000 peak=0.0000 speech_frames=0/50` **11/11**；`mode=tail` 11/11。缓冲满 100 chunks 但全是精确零 ⇒ 每次录音头部只贴 200ms 纯静音 | 
 | ↳ 处置 | 🔵 **PREROLL-DEAD-322 → coder-1**（先定根因再报方案；修不了就整块摘除，不许「留着不动只加注释」） | |
+
+---
+
+## 2026-09-21 本批收口（BUILD-333 已出包）—— 台账对账
+
+🔴 **本节存在的理由**：上方 09-21 台账表在本批开工后**数小时未同步**，其中 ④ 一直挂着
+已被证伪作废的 `AUTOLEARN-REACH-001`。而主控当天正是照着那条过期记录写了错误任务书派发，
+靠 Worker 停手反证才拦住。**过期台账比没有台账更危险** —— 已就地订正，本节为最终状态。
+
+### 已出包（BUILD-333，产物 main `703788ed…`，版本 0.9.2 未动）
+
+| 单号 | 内容 | 提交 |
+| --- | --- | --- |
+| ITN-SHIFEN-323 | 「十分的重要」误转 | `5164a10` |
+| ORCH-CTX-GUARD-FIX-324 | 回显护栏比对面收窄 + 埋点修正 + 清理指令恒发 | `7cc7cea` |
+| PREROLL-DEAD-322 | pre-roll 根因定案（**无 bug**）+ 诊断精度 dBFS/nz_ratio | `4c78ef3` |
+| ACC-PREVIEW-REFLOW-325 | accuracy 分片结果回灌预览（尾字换方向） | `4c78ef3` |
+| AUTOLEARN-CANDIDATE-327 | 候选二次收窄（真因） | `291063c` |
+| ACC-REFLOW-PERSIST-329 | 回灌持久化 + 学习镜像基准对齐 | `4d49252` |
+| UI-LRMODEL-HINT-330 | 删除指向已废弃 nano 的假提示块 | `b20f733` |
+| AUTOLEARN-EDIT-SNAPSHOT-331 | 编辑入口快照学习基准 + 词条上限 30→12 | `7d3a3a5` |
+| AUTOLEARN-DROP-PATHB-332 | 摘路径B（对齐 DEC-058）+ 清三处死代码 | `b0eca48` |
+
+### 待 Gavin 端测验证（判据见 `collab/outbox/tester-1/result.md`）
+
+| # | 项 | 判据 |
+| --- | --- | --- |
+| 1 | 尾字（本包核心） | `[LocalRT-DBG-325] streaming render` 的 `has_acc_prefix` / `committed_len` 连续说话期间**不归零** |
+| 2 | 预览窗编辑（风险最高） | 录音中编辑不被回灌冲掉；**退出编辑后继续录音仍不被冲**（闩锁） |
+| 3 | 自学习 | 编辑改对同一词**两次** ⇒ `(1/2) observed` → `(2/2) promoted` + 词库可见；**反向：不编辑不应出现任何 `[AUTOLEARN]` 行** |
+| 4 | 配置界面 | 本地流式档下方**无任何模型文件提示块**（UI 只能目视验） |
+| 5 | 先说半句再按热键 | `[LocalRT-DBG-293] mode=onset`（不再恒 tail） |
+| 6 | 护栏误触 | `[LocalRT-DBG-320] action=redecode` 频次显著低于改前 **43%（6/14）** |
+
+### 🔴 已知遗留（非本批引入，未动）
+
+| 项 | 说明 |
+| --- | --- |
+| 电平闸 attack 吃首字爆破音 | coder-1 在 322 发现的下游线索：C920 采集链的电平触发降噪闸有 attack 时间，疑似压掉首字声母，与长期报的「你→按」吻合。**未动手**，待端测第 5 项观察后立单 |
+| `maybe_learn_user_edit` 的窄 gap | 已由 331 收口，329 的锚断言已改写语义 |
+| KV `max_total_len` 取值 | 代码 4096（与词库预算 3000 耦合，仅在 4096 下成立）。Gavin 早期口径 2048 已在注释中说明耦合关系，**改需同批下调词库预算** |
