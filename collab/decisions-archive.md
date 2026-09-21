@@ -1,54 +1,57 @@
-# 架构决策全文归档 · voice-ime
-
-> **索引在 `decisions.md`**（一句话判据 + 状态）。本文件是全文，按 `DEC-XXX` 搜索。
-> 归档于 2026-09-10：原 decisions.md 2293 行 ≈50K token，每次 session 启动全量加载，
-> 与「启动必读合计 ≤20K token」约束冲突。**内容零删改**，只是搬了个地方。
-> 🔴 新增决策：全文写进本文件，同时在 `decisions.md` 索引里补一行。
 
 ---
 
+## DEC-078 · 用户词库只做解码偏置，不做文本级硬替换（Gavin 2026-09-22 拍板：A）
 
----
+### 背景
 
-## ⚠️ DEC-000 · 基础约束：Windows 系统兼容性【最高优先级】
+Gavin 端测：「铭印」经三次编辑学习成功入库后，再说同一段话——
 
-- **目标系统**：Windows 11、Windows 10（**已移除 Win7，2026-04-17 Gavin 决策**）
-- **约束级别**：所有技术选型、API 调用、代码实现必须满足此兼容性要求
-- **落地检查点**：
-  - Win32 API：可使用 Win10+ 特性（如 `SetProcessDpiAwarenessContext`）
-  - DWM API：`DwmSetWindowAttribute` 圆角/Acrylic 等 Win10/11 特性均可用
-  - 热键：`RegisterHotKey` ✅ | 托盘：`tray-icon` ✅ | Overlay：`SetWindowRgn` ✅
-- **解锁事项**（原 Win7 禁区，现可使用）：
-  - Win10 1607+ 专属 API（如 `SetProcessDpiAwarenessContext`）
-  - Win11 视觉特性（Mica 材质、系统圆角边框）
-  - WebView2（Win10+，为后续 UI 框架升级解锁路径）
+> 你可以从阿卡西记录提取资料。将这些资料**铭印**在灵魂里。所**明印**的资料，就成为他们的经验
 
----
+**第一处替换成功、第二处失败，重复多次现象一致。** Gavin 提问：
+「按照道理，都是 acc 模型输出回灌的文本，两个词都应该被替换」。
 
-## DEC-001 · tray-first 主程序采用 Win32 controller
+### 事实（主控查证）
 
-- 主线程维护隐藏 Win32 controller 窗口和消息循环
-- tray、hotkey、worker、overlay 事件统一由 controller 分发
-- **原因**：`eframe/winit` 不适合作为 tray-first Windows 工具的主控消息泵（已验证两条失败路线，见 troubleshooting.md [ARCH-001]）
+全仓词库只有两条生效路径，**都是提示/偏置，没有任何文本级查找替换**：
 
-## DEC-002 · 设置窗口独立 `--settings-ui` 入口
+| 路径 | 机制 |
+| --- | --- |
+| 本地 accuracy（Qwen3） | `stream.set_option("hotwords", terms)` —— 注入提示词 |
+| 在线档 | `load_wordbook_vocabulary()` → API `vocabulary` 参数 |
 
-- 设置窗口保留 `eframe`，但从主程序主循环中解耦
-- 主程序通过子进程拉起配置窗口，不共享主事件循环
+`record_hits` 仅统计命中次数，不改文本。
+🔴 **流式 paraformer 完全拿不到词库**（`greedy_search` 无热词通道），
+预览在回灌前本就不带词库效果。
 
-## DEC-003 · 录音悬浮层统一为原生 Win32 overlay
+⇒ 两处结果不同**不是漏注入**，是同一份提示词在**不同语境**下效果不同：
+「资料铭印在灵魂里」搭配下提示能推动；「所 X 的资料」结构下模型对「明」先验更强，推不动。
+现象可稳定复现，正说明是确定性的模型行为而非偶发。
 
-- 音频波形条、处理中提示、失焦预览全部改为原生 Win32 overlay 窗口
-- **原因**：Win32 对短生命周期悬浮层更直接，避免 viewport 可见性问题
+### 决策
 
-## DEC-004 · 热键从低层 hook 切换为 RegisterHotKey
+**维持现状：词库只做解码偏置，不新增文本级硬替换节点。**
 
-- 全局热键使用 `RegisterHotKey`；PTT 模式通过独立线程轮询检测释放（`Arc<AtomicBool>` + crossbeam channel）
-- **原因**：更贴合场景，与 controller 消息循环整合更自然；Windows Timer 在 PTT 场景不可靠
+### 原因
 
-## DEC-005 · 退出由 controller 统一收口
+主控提出的备选是「让词库词条参与同音纠错节点（`homophone-rules.toml` 已有该机制）」，
+Gavin 选 A（不做）。风险面：
 
-- 顺序：停止 hotkey → 停止 worker/录音 → 关闭 overlay → 关闭 settings 子进程 → 销毁 tray → 结束主进程
+1. **过度替换不可绕过**：词库有「铭印」，则「明印」「鸣音」是否一律替换？
+   一旦误伤，用户想输入「明印」将**永远打不出来**，且无手段绕过（程序强制）；
+2. **词库是自学习产物**，含噪风险高于人工词表，用它做强制替换等于放大噪声；
+3. **落在主路径上** —— 违反 DEC-077（无实测收益不得新增主路径机制）。
+
+### 影响
+
+- 预览在 accuracy 回灌前不带词库效果，属**预期行为**，不作为缺陷受理；
+- 词库偏置「推不动」的个案不单独修；若某词条长期无效，应视为**模型偏置能力上限**，
+  不以增加强制替换为解；
+- 🔴 后续若再提「词库硬替换」，须先出具误伤率实测，并与本条一并复议。
+
+**决策时间**：2026-09-22
+→ 关闭 overlay → 关闭 settings 子进程 → 销毁 tray → 结束主进程
 
 ## DEC-006 · 配置窗口左侧 Tab 导航布局
 
