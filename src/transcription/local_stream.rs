@@ -667,4 +667,172 @@ mod tests {
             );
         }
     }
+
+    // ========================================================================
+    // GUARD-291 · FIX-LOCALRT-TAILCHAR-291 源码级结构护栏（交叉，非作者：coder-1）
+    //
+    // 行为级护栏在这里做不了：`OnlineRecognizer` 需要真模型，单测里起不来。
+    // 故照仓库既有源码结构护栏写法（`src/main.rs::overlay_121_guard_tests`）：
+    // 读本文件生产区源码 → needle 计数 → 花括号定界取块。
+    //
+    // 钉死的四条不变式（I1~I4 见 291 handoff）：
+    //   I1 endpoint 分支 `stream.input_finished()` 必须早于「取 after_text 的 get_result」
+    //   I2 endpoint 分支不得再出现 `recognizer.reset(`
+    //   I3 endpoint 分支必须用 `recognizer.create_stream()` 换新流
+    //   I4 本句 `state.on_result(..., true, ...)` 只确认一次
+    // ========================================================================
+
+    /// 本文件生产区（首个 `#[cfg(test)]` 之前）的逐行 trim 文本。
+    fn ls_prod_lines() -> Vec<String> {
+        let mut out = Vec::new();
+        for line in include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/transcription/local_stream.rs"
+        ))
+        .lines()
+        {
+            let t = line.trim();
+            if t.starts_with("#[cfg(test)]") {
+                break;
+            }
+            out.push(t.to_string());
+        }
+        out
+    }
+
+    fn brace_delta_291(line: &str) -> i32 {
+        line.matches('{').count() as i32 - line.matches('}').count() as i32
+    }
+
+    /// 花括号定界：以 anchor 行为起点，返回 (open_idx, close_idx)。
+    fn block_bounds_291(lines: &[String], anchor: usize) -> (usize, usize) {
+        let mut depth = 0i32;
+        let mut opened = false;
+        let mut open_idx = usize::MAX;
+        for (i, line) in lines.iter().enumerate().skip(anchor) {
+            depth += brace_delta_291(line);
+            if depth > 0 && !opened {
+                opened = true;
+                open_idx = i;
+            }
+            if opened && depth == 0 {
+                return (open_idx, i);
+            }
+        }
+        panic!("GUARD-291: 未能用花括号定界 anchor={anchor} 起的块（源码结构已变）");
+    }
+
+    /// 生产区中首个 `startswith(needle)` 的 0-based 行号。
+    fn first_line(lines: &[String], needle: &str) -> usize {
+        lines
+            .iter()
+            .position(|l| l.starts_with(needle))
+            .unwrap_or_else(|| panic!("GUARD-291: 定位锚点不存在: {needle}"))
+    }
+
+    /// 返回 (`生产区全部行`, `endpoint 分支块范围`, `函数体范围`)。
+    ///
+    /// 🔴 `if endpoint { ... } else if ... {` 的花括号是同一条 if 表达式，会被定界并成
+    /// 一整块；I1/I3/I4 只针对 **endpoint 分支**，故把 `} else` 起的分支从块尾剔除。
+    fn endpoint_guard_regions() -> (Vec<String>, (usize, usize), (usize, usize)) {
+        let lines = ls_prod_lines();
+        let fn_line = first_line(&lines, "pub fn transcribe_streaming_local(");
+        let (fn_lo, fn_hi) = block_bounds_291(&lines, fn_line);
+        let ep_anchor = fn_lo
+            + lines[fn_lo..=fn_hi]
+                .iter()
+                .position(|l| l.starts_with("if endpoint {"))
+                .expect("GUARD-291: endpoint 分支锚点 `if endpoint {` 不存在");
+        let (ep_lo, mut ep_hi) = block_bounds_291(&lines, ep_anchor);
+        if let Some(else_pos) = (ep_lo..=ep_hi).find(|&i| lines[i].starts_with("} else")) {
+            ep_hi = else_pos - 1;
+        }
+        (lines, (ep_lo, ep_hi), (fn_lo, fn_hi))
+    }
+
+    fn count_starts(lines: &[String], lo: usize, hi: usize, needle: &str) -> usize {
+        lines[lo..=hi]
+            .iter()
+            .filter(|l| l.starts_with(needle))
+            .count()
+    }
+
+    fn count_contains(lines: &[String], lo: usize, hi: usize, needle: &str) -> usize {
+        lines[lo..=hi].iter().filter(|l| l.contains(needle)).count()
+    }
+
+    /// G1（I1）：endpoint 分支内 `stream.input_finished()` 必须夹在两次
+    /// `.get_result(&stream)` 之间（flush 前 before_text ＜ flush ＜ flush 后 after_text）。
+    ///
+    /// **改错怎么红**：把 flush 删掉 ⇒ 找不到 `stream.input_finished()` ⇒ panic 红；
+    /// 把 flush 挪到取 after_text 之后 ⇒ after 侧不再有 get_result（计数/顺序断言红）。
+    #[test]
+    fn guard291_g1_flush_before_after_text() {
+        let (lines, (lo, hi), _) = endpoint_guard_regions();
+        let fi = (lo..=hi)
+            .find(|&i| lines[i].starts_with("stream.input_finished()"))
+            .expect("G1: endpoint 分支内必须有 stream.input_finished()（flush 被删 ⇒ 红）");
+        let grs: Vec<usize> = (lo..=hi)
+            .filter(|&i| lines[i].starts_with(".get_result(&stream)"))
+            .collect();
+        assert_eq!(
+            grs.len(),
+            2,
+            "G1: endpoint 分支内 .get_result(&stream) 应恰 2 处（before_text / after_text），实测 {:?}",
+            grs
+        );
+        assert!(
+            grs[0] < fi && fi < grs[1],
+            "G1: input_finished() 必须位于两次 get_result 之间（before<flush<after），实测 flush={fi} gets={grs:?}"
+        );
+    }
+
+    /// G2（I2）：`transcribe_streaming_local` 函数体内 `recognizer.reset(` 计数必须为 0。
+    ///
+    /// **改错怎么红**：任何地方把换新流改回 `recognizer.reset(` ⇒ 计数 ≥1 ⇒ 红。
+    #[test]
+    fn guard291_g2_no_recognizer_reset() {
+        let (lines, _, (fn_lo, fn_hi)) = endpoint_guard_regions();
+        let n = count_contains(&lines, fn_lo, fn_hi, "recognizer.reset(");
+        assert_eq!(
+            n, 0,
+            "G2: input_finished() 后旧流不可复用 ⇒ 函数体内不得出现 recognizer.reset(，实测 {n} 处"
+        );
+    }
+
+    /// G3（I3）：endpoint 分支内 `recognizer.create_stream()` 恰 1 处（本句结束换新流）。
+    ///
+    /// **改错怎么红**：删掉换流 ⇒ 计数 0 ⇒ 红；在分支内重复建流 ⇒ 计数 2 ⇒ 红。
+    #[test]
+    fn guard291_g3_endpoint_creates_new_stream_once() {
+        let (lines, (lo, hi), _) = endpoint_guard_regions();
+        let n = count_contains(&lines, lo, hi, "recognizer.create_stream()");
+        assert_eq!(
+            n, 1,
+            "G3: endpoint 分支内必须换新流恰 1 次（recognizer.create_stream()），实测 {n}"
+        );
+    }
+
+    /// G4（I4）：`state.on_result(` 函数体内恰 3 处 ——
+    /// ① endpoint 确认（true）② 非 endpoint 中间结果（false）③ loop 后 flush 收尾（false）；
+    /// 且带 `true` 的确认恰 1 处（防 FIX-252 重复确认）。
+    ///
+    /// **改错怎么红**：endpoint 分支再补一次确认 ⇒ 带 true 的计数变 2 ⇒ 红；
+    /// 少一路（如删收尾）⇒ 总数变 2 ⇒ 红。
+    #[test]
+    fn guard291_g4_on_result_sites() {
+        let (lines, _, (fn_lo, fn_hi)) = endpoint_guard_regions();
+        let total = count_starts(&lines, fn_lo, fn_hi, "state.on_result(");
+        assert_eq!(
+            total, 3,
+            "G4: state.on_result( 应恰 3 处（endpoint true / 非 endpoint false / 收尾 false），实测 {total}"
+        );
+        let confirms = (fn_lo..=fn_hi)
+            .filter(|&i| lines[i].starts_with("state.on_result(") && lines[i].contains(", true,"))
+            .count();
+        assert_eq!(
+            confirms, 1,
+            "G4: endpoint 确认（on_result ..., true, ...）必须恰 1 处（防重复确认），实测 {confirms}"
+        );
+    }
 }

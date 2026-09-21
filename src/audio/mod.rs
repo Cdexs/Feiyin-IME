@@ -1992,6 +1992,87 @@ mod tests {
     }
 
     // ============================================================
+    // TEST-SYNC-295：I5 调用点级结构护栏
+    //   「在线三档零改变」是**调用点级**事实，纯函数用例钉不住（调用点被挪到无条件处，
+    //   I1~I4 的纯函数用例照样全绿）。故直接扫生产源码结构（参考 main.rs
+    //   `overlay_121_guard_tests` 的 include_str! 手法）。
+    // ============================================================
+    mod guard_293_i5 {
+        /// 生产区源码：切到首个 `mod tests {` 之前。
+        ///
+        /// 🔴 切点是 `mod tests {` 而**不是**「首个 `#[cfg(test)]`」——本文件在
+        /// `PreRollDump` 内有一处 `#[cfg(test)] fn new_in`（`:269`）夹在生产段中间，
+        /// 用首个 `#[cfg(test)]` 会在它那里截断，把真正的调用点（`record_streaming`）
+        /// 排除在扫描区外，护栏形同虚设。
+        fn prod_src() -> String {
+            let src = include_str!("mod.rs");
+            let cut = src
+                .lines()
+                .position(|l| l.trim() == "mod tests {")
+                .expect("I5: 找不到 mod tests 边界");
+            src.lines().take(cut).collect::<Vec<_>>().join("\n")
+        }
+
+        fn brace_delta(line: &str) -> i32 {
+            line.matches('{').count() as i32 - line.matches('}').count() as i32
+        }
+
+        /// 花括号定界：以 anchor 行为起点返回 (open_idx, close_idx)。
+        fn block_bounds(lines: &[String], anchor: usize) -> Option<(usize, usize)> {
+            let mut depth = 0i32;
+            let mut opened = false;
+            let mut open_idx = usize::MAX;
+            for (i, line) in lines.iter().enumerate().skip(anchor) {
+                depth += brace_delta(line);
+                if depth > 0 && !opened {
+                    opened = true;
+                    open_idx = i;
+                }
+                if opened && depth == 0 {
+                    return Some((open_idx, i));
+                }
+            }
+            None
+        }
+
+        /// I5：`select_pre_roll_for_asr` 生产区恰 1 个调用点，且落在
+        /// `let pre_roll_chunks = if trim_pre_roll_residual {` 分支块内。
+        ///
+        /// 消融：① 把调用移出 trim 分支（无条件调用）→ 块内断言红；
+        ///       ② 在生产区加第二处调用（如接进在线路径）→ 命中数 2→3 红；
+        ///       ③ 删掉调用 → 命中数 2→1 红（1 定义 + 0 调用）。
+        #[test]
+        fn i5_pre_roll_select_single_call_inside_local_rt_branch() {
+            let src = prod_src();
+            // 命中 = 定义行 `fn select_pre_roll_for_asr(` + 调用行，恰 2。
+            let hits = src.matches("select_pre_roll_for_asr(").count();
+            assert_eq!(
+                hits, 2,
+                "I5: 生产区 select_pre_roll_for_asr 命中必须恰 2 处（1 定义 + 1 调用），实测 {} 处",
+                hits
+            );
+
+            let lines: Vec<String> = src.lines().map(|l| l.trim().to_string()).collect();
+            let anchor = lines
+                .iter()
+                .position(|l| l.starts_with("let pre_roll_chunks = if trim_pre_roll_residual {"))
+                .expect("I5 anchor: trim_pre_roll_residual 分支");
+            let call_line = lines
+                .iter()
+                .position(|l| l.contains("select_pre_roll_for_asr(&all"))
+                .expect("I5 anchor: 裁剪调用行");
+            let (lo, hi) = block_bounds(&lines, anchor).expect("I5: 分支块定界失败");
+            assert!(
+                (lo..=hi).contains(&call_line),
+                "I5: 裁剪调用必须处于 if trim_pre_roll_residual 块内（块 L{}..=L{}，调用 L{}）",
+                lo + 1,
+                hi + 1,
+                call_line + 1
+            );
+        }
+    }
+
+    // ============================================================
     // URGENT-286：诊断埋点「两头验证」回归
     //   - 默认 Warn（端测不带 -debug）：守卫为 false ⇒ 重计算被跳过；
     //     [LocalRT-DBG-278] 必须零输出。

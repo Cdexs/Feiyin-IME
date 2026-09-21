@@ -5,6 +5,23 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-2 — TEST-SYNC-295 ✅ 交付（阶段三：给 coder-1 的 293-B 补 I5 调用点结构护栏）
+
+- **先查覆盖（不重复造）**：293-B 的 I1~I4/I6/I7 已被现有用例覆盖（详见 result.md §一）；主控猜的缺口②「样本未被改动」已在 `:2168` 钉住、缺口③「150/200 判别力」已被精确值断言覆盖 ⇒ **均不补**。
+- **唯一真缺口 I5**：新增 `mod tests::guard_293_i5`（`src/audio/mod.rs:2000`，纯 **+81/−0**，单 hunk 全在 `mod tests`）。`include_str!` 自读生产源码：`select_pre_roll_for_asr(` 生产区**恰 2**（1 定义 `:358` + 1 调用 `:638`），且调用落在 `let pre_roll_chunks = if trim_pre_roll_residual {` 块内。
+- **消融**：移出 trim 分支 / 加第二调用点 / 删调用 ⇒ 红。
+- 🔴 **实现坑**：生产区切点用 `mod tests {` 而非「首个 `#[cfg(test)]`」——`:269` 有 `#[cfg(test)] fn PreRollDump::new_in` 夹在生产段中间，误切会漏真实调用点致护栏恒绿。
+- **验证**：`rustfmt --check` clean、`cargo check --all-targets` 0 error、warnings **110/101** 基线、`numstat`==`-w`（81/0）。🔴 **未跑 `cargo test`**（DEC-048 阶段三只许 fmt/check），首跑在阶段四。
+- **红线**：只改 `audio/mod.rs` test 区 / 未碰 `local_stream.rs` / 未动版本 / 未 commit / 未出包 / 零凭证。
+
+## 2026-09-21 — coder-1 — TEST-SYNC-294 ✅ 交付（阶段三：给 coder-2 的 291 写源码级结构护栏）
+
+- **范围**：只改 `src/transcription/local_stream.rs` 的 `#[cfg(test)] mod tests` 区，`+168/0`，生产区零行。`OnlineRecognizer` 需真模型 ⇒ 行为级做不了，照 `src/main.rs::overlay_121_guard_tests` 读生产区源码 + needle 计数 + 花括号定界取块。
+- **四条护栏**：G1（I1）`stream.input_finished()` 行号夹在 endpoint 分支两次 `.get_result(&stream)` 之间；G2（I2）函数体 `recognizer.reset(` == 0；G3（I3）endpoint 分支 `recognizer.create_stream()` == 1；G4（I4）函数体 `state.on_result(` == 3（`:435` true / `:482` false / `:604` 收尾 false）且 `, true,` 确认恰 1。每条在 doc 注释写明「改错怎么红」。
+- **关键坑**：`if endpoint {…} else if …` 是同一 if 表达式、花括号定界会并成一块 ⇒ `endpoint_guard_regions` 块尾剔除 `} else` 分支（否则 G1 的 get_result 数到 3 而非 2）。needle 全带完整前缀并逐条 grep 核实（`[FMT-COLLATERAL-001]` 教训）。
+- **验证**：`rustfmt --check` clean；`cargo check --all-targets` 0 error、warnings **110/101** = 基线；numstat==`-w`（168/0）；hunk `@@ -669,0 +670,168 @@ mod tests {` 全在 test 区。
+- 🔴 **未跑 `cargo test`**（DEC-048 阶段三白名单只许 `cargo fmt` / `cargo check`）——护栏**未执行过，首跑在阶段四 tester-1**，如实声明，不写「已验证通过」。未动版本 / 未 commit / 未出包 / 零凭证。
+
 ## 2026-09-21 — coder-1 — FIX-LOCALRT-FIRSTCHAR-293（293-B 修订版）✅ 交付（pre-roll 窗口 600→1000ms + 锚定语音起点裁剪）
 
 - **由来/修订**：Gavin 拍板先修「首字爆破音被 600ms 边界削掉」（`输入你`→`输入按`）；但又补「先按键后开口、旧 buffer 干扰首字」——**只加长窗口会让后者更差**。故 293-B：窗口容量拉 1000ms（不错过早到语音），但喂 ASR 的只从语音起点前 150ms 起。
