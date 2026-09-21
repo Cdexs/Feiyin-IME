@@ -348,6 +348,18 @@
 - **⚠️ 协作事件**：主控文档 commit `99799c5`（10:26:26）在本题进行中执行，**把我未完成的 `local_stream.rs` 与 coder-1 的 `src/audio/mod.rs` 一并扫入**（commit message 未反映代码改动）。本单改动已随之落盘、worktree 无额外 diff；`git status` 另见 `.gitignore` + `src/audio/mod.rs`（非本单）。请主控知悉该 commit 语义与文件归属。
 - **红线**：只改 `local_stream.rs` / 未动版本 / 未自行 commit / 未出包 / 未跑 `cargo build --release` / 零凭证。
 
+## 2026-09-21 — tester-1 — TEST-EXEC + BUILD-341 ✅ 全量回归 + 出包（含 340 尾字直接修；八项 PASS，340 探针 N/A 已说明）
+
+- **基线**：HEAD `62484a1`（LOCALRT-TAILPAD-340），clean，版本 0.9.2。含 340 + 继承 334/336/337。
+- **回归（全量未过滤；`cargo fmt --check` 不带 `skip_children` EXIT 0）**：root `cargo test --no-fail-fast` **1409P/0F/22I**（NEW 2/GONE 0 = `local_stream::tests::{tailpad340_padded_never_shorter, tailpad340_local_only_and_order}`）；`src-tauri` **92P/0F/0I**（不变）；Vitest **7 files/100P/11S/0F**。
+- **BUILD-341**：Step1–4 全走；源码 mtime 前后 md5 一致（`8f414d74…`）。产物 main `68e4528b…`（14,678,528B/22:59）/ ui `a39b9474…`（10,050,048B，ui 零 diff）/ crash `1942611d…`（24,879,104B/22:57）；两副本相等；**三者均异于 BUILD-338**。⚠️ main 字节数与 338 相同但 sha 不同 ⇒ 内容确变、非漏构建（如实记）。
+- **八项逐项 PASS**：①时间戳 22:54–22:59 ②sha ③0.9.2（Cargo.toml + tauri.conf.json 未动）④冒烟 PID 22040 Responding=True/无新 crash.json/残 0 ⑤config/wordbook 三时点零变化（两处）⑥**warnings 99/90/17** ⑦四张规则表三副本全等（itn `ab950ba4…`/scene `8ea93bb1…`/homophone `a5fd4a61…`/wordbook `ac9a72eee…`，每张 distinct=1）⑧探针。
+- **探针（`grep -a -c`，先打自检基准）**：自检 `feiyin`=**19**；正向 `LocalRT-DBG-337`=4 / `336`=1 / `325`=1 / `AUTOLEARN`=4 / `degree_adverbs`=2 / `nz_ratio`=2；反向 5 符号全 0。
+- 🆕 **340 探针 N/A**：`feed_tail_silence` / `SHADOW_TAIL_PAD_MS` 均为函数名/常量名、release 内联无字面量（实测 0）；按任务书降级报「三证 + 护栏」= 源码引用（`feed_tail_silence(` 5 处、`SHADOW_TAIL_PAD_MS=500`/`FLUSH_TAIL_PAD_MS=2000`）+ 构建时间戳/sha 异于上包 + `tailpad340_*` 2/2 通过。
+- **Gavin 端测六条**：① 🔴 **停顿处尾字（本包核心）**：说一句后停 0.5~1s，硬判据 `[LocalRT-DBG-289] endpoint confirm` 应出现 `shadow_len > main_len` / `used=shadow`（改前 11/11 全 `used=main`），**请报实际分布** ② 🔴 337 `boundary=a/b/c` 的 **b 占比 = 收益折损须报** ③ 预览编辑闩锁 ④ 重复标点 `。。`/`，。` 消失 ⑤ 自学习同词两次 `(1/2)→(2/2)` + 反向不编辑无 `[AUTOLEARN]` ⑥ 首字「你/按」旁证（不必刻意）。
+- **证据**：`collab/outbox/tester-1/testexec341/`。
+- **红线**：版本 0.9.2 未动 / 未改生产代码 / 未 push / 零凭证。
+
 ## 2026-09-21 — tester-1 — TEST-EXEC + BUILD-338 ✅ 第三批全量回归 + 出包（八项 PASS + 自检基准探针）
 
 - **基线**：HEAD `2ba8b97`，clean，版本 0.9.2。含 334/336/337。

@@ -904,3 +904,14 @@ load_wordbook_vocabulary()
 | 出包 | `BUILD-338` 八项核验逐项 PASS；产物 `feiyin-ime` 14.68MB `91710a71…`（+14,336B）/ `feiyin-ime-ui` 10.05MB `f729ec28…` / `crash-reporter` 24.88MB `268ad4c7…`，时间戳 22:26–22:28；四张规则表三副本全等 |
 | 探针 | 自检基准 `feiyin`=19；正向 `LocalRT-DBG-337`=4 / `336`=1 / `325`=1 / `AUTOLEARN`=4 / `degree_adverbs`=2 / `nz_ratio`=2；🔴 反向 5 符号全 0 |
 | 端测 | 待 Gavin 五条（🔴 337 尾字接缝 + **b 占比=收益折损须报**／预览编辑闩锁／重复标点消失／自学习两次+反向／335 电平闸旁证） |
+
+
+## v0.9.3（批次七 · BUILD-341）· 2026-09-21 · 尾字直接修（补静音喂满末尾一块）（版本号不升）
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 340 `feed_tail_silence()`：在 shadow 与松手收尾 flush 的 `input_finished()` **之前**补静音（`SHADOW_TAIL_PAD_MS=500` / `FLUSH_TAIL_PAD_MS=2000`），把末尾不完整的一块喂满，逼流式模型吐出压着的尾字。机制：流式 paraformer 需约一个整块（500ms）未来音频才能定当前段字，说完没有未来音频 ⇒ 末字永不吐出；Gavin 观察到豆包同现象 ⇒ 结构性特征，本包主动越过 |
+| 回归 | TEST-EXEC + BUILD-341 root **1409P/0F/22I**（全量，NEW 2 = `tailpad340_*`）+ src-tauri **92P/0F/0I** + Vitest **100P/11S/0F**；`cargo fmt --check`（不带 `skip_children`）EXIT 0；warnings **99/90/17** |
+| 出包 | `BUILD-341` 八项核验逐项 PASS；产物 `feiyin-ime` 14.68MB `68e4528b…`（大小同 338 但 sha 异）/ `feiyin-ime-ui` 10.05MB `a39b9474…` / `crash-reporter` 24.88MB `1942611d…`，时间戳 22:57–22:59；四张规则表三副本全等 |
+| 探针 | 自检基准 `feiyin`=19；正向 `LocalRT-DBG-337`=4 / `336`=1 / `325`=1 / `AUTOLEARN`=4 / `degree_adverbs`=2 / `nz_ratio`=2；反向 5 符号全 0；🆕 340 无字面量 ⇒ N/A（降级「源码引用 5 处 + 时间戳/sha + `tailpad340_*` 2/2」） |
+| 端测 | 待 Gavin 六条（🔴 停顿处尾字硬判据 `[LocalRT-DBG-289] used=shadow`/`shadow_len>main_len` 分布／337 b 占比／预览编辑闩锁／重复标点／自学习两次+反向／首字「你/按」旁证） |
