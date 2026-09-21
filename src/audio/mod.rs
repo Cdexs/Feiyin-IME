@@ -43,6 +43,10 @@ const PRE_ROLL_TAIL_KEEP_MS: u64 = 200;
 const PRE_ROLL_SIL_THRESHOLD: f32 = 0.005;
 /// 段间静音 ≥ 此值才判为分隔（沿用 283 的 200ms）。
 const PRE_ROLL_MIN_SILENCE_MS: u64 = 200;
+/// FIX-PREROLL-RESIDUAL-308：最后一段语音的**结束点**距窗口末尾的静音 ≥ 此值 ⇒ 判为
+/// 「上一句尾音残留」（按键前已说完），与场景 B 一样只留末尾 tail。取值同
+/// `PRE_ROLL_MIN_SILENCE_MS`（200ms），不新增语义。
+const PRE_ROLL_RESIDUAL_SILENCE_MS: u64 = 200;
 const PRIME_TIMEOUT_MS: u64 = 450; // HOTKEY-LATENCY-V2-001: 350→450ms for deeper cold-start audio collection
 const PRIME_TICK_MS: u64 = 20; // HOTKEY-LATENCY-FIX-001: recv_timeout tick, allows up to 17 ticks before timeout
 
@@ -348,9 +352,10 @@ impl Drop for PreRollDump {
 ///
 /// | 场景 | 检出 | 保留 |
 /// | --- | --- | --- |
-/// | A 先开口后按键（首字被 600ms 边界削掉） | ≥1 段 | 最后一段起点 − `PRE_ROLL_PAD_MS` 起，带出完整声母 |
+/// | A 先开口后按键（首字被 600ms 边界削掉） | ≥1 段且语音连到窗口末尾 | 最后一段起点 − `PRE_ROLL_PAD_MS` 起，带出完整声母 |
 /// | B 先按键后开口（旧 buffer / 静音干扰首字） | 0 段 | 只留末尾 `PRE_ROLL_TAIL_KEEP_MS` |
-/// | C 上句尾音残留 | ≥2 段 | 取最后一段（283 原有能力） |
+/// | C 上句尾音残留（多段） | ≥2 段且末段连到末尾 | 取最后一段（283 原有能力） |
+/// | **D 上句尾音残留（单段）** | ≥1 段但**末段结束后跟 ≥`PRE_ROLL_RESIDUAL_SILENCE_MS` 静音** | 同场景 B：只留末尾 tail |
 /// | 兜底：整窗找不到任何 ≥200ms 静音游程（嘈杂环境，判据不可靠） | — | **原样返回**，绝不比现状更差 |
 ///
 /// 🔴 只用能量法（平台中立、不引入 ASR 模型依赖）。**仅本地流式调用**；在线三档
@@ -367,6 +372,8 @@ fn select_pre_roll_for_asr(samples: &[f32], rate: u32) -> Vec<f32> {
     let mut in_speech = false;
     let mut run = 0usize;
     let mut has_long_silence = false;
+    // FIX-PREROLL-RESIDUAL-308：记录最后一个**非静音样本**的下标（= 最后一段的结束点）。
+    let mut last_speech_end: Option<usize> = None;
     for (idx, &x) in samples.iter().enumerate() {
         if x.abs() <= PRE_ROLL_SIL_THRESHOLD {
             run += 1;
@@ -380,12 +387,13 @@ fn select_pre_roll_for_asr(samples: &[f32], rate: u32) -> Vec<f32> {
                 in_speech = true;
             }
             run = 0;
+            last_speech_end = Some(idx);
         }
     }
 
     // 兜底：没有任何 ≥200ms 静音游程 ⇒ 能量判据不可靠，退回现状（原样全保留）。
     if !has_long_silence {
-        log_pre_roll_select(samples.len(), samples.len(), rate, "fallback", None);
+        log_pre_roll_select(samples.len(), samples.len(), rate, "fallback", None, None);
         return samples.to_vec();
     }
 
@@ -394,20 +402,53 @@ fn select_pre_roll_for_asr(samples: &[f32], rate: u32) -> Vec<f32> {
         let tail = rate as usize * PRE_ROLL_TAIL_KEEP_MS as usize / 1000;
         let st = samples.len().saturating_sub(tail);
         let out = samples[st..].to_vec();
-        log_pre_roll_select(samples.len(), out.len(), rate, "tail", None);
+        log_pre_roll_select(samples.len(), out.len(), rate, "tail", None, None);
         return out;
+    }
+
+    // 场景 D（FIX-PREROLL-RESIDUAL-308）：最后一段语音结束点距窗口末尾 ≥ RESIDUAL_SILENCE_MS
+    // ⇒ 判为「上一句尾音残留」（按键前已说完）⇒ 与场景 B 同样只留末尾 tail。
+    //
+    // 🔴 有意的取舍：说完最后一个字、停顿一下才按键的情形也会被判残留而丢弃 pre-roll。
+    //    那时用户已经说完，丢旧的不会影响本次要说的内容；留着它必然产生幻影文字。
+    //    「宁可丢旧的，不可污染新的」。真·先开口者按键时通常仍在说 ⇒ 末尾有能量 ⇒ 不触发。
+    if let Some(last_end) = last_speech_end {
+        let trailing_samples = samples.len().saturating_sub(last_end + 1);
+        let trailing_ms = trailing_samples as u64 * 1000 / rate as u64;
+        if trailing_ms >= PRE_ROLL_RESIDUAL_SILENCE_MS {
+            let tail = rate as usize * PRE_ROLL_TAIL_KEEP_MS as usize / 1000;
+            let st = samples.len().saturating_sub(tail);
+            let out = samples[st..].to_vec();
+            log_pre_roll_select(
+                samples.len(),
+                out.len(),
+                rate,
+                "residual",
+                None,
+                Some(trailing_ms),
+            );
+            return out;
+        }
     }
 
     // 场景 A / C：锚定最后一段起点，往前留 PAD_MS（saturating：起点在 PAD 内不下溢）。
     let last = *starts.last().unwrap();
     let st = last.saturating_sub(pad);
     let out = samples[st..].to_vec();
-    log_pre_roll_select(samples.len(), out.len(), rate, "onset", Some(last));
+    log_pre_roll_select(samples.len(), out.len(), rate, "onset", Some(last), None);
     out
 }
 
 /// `[LocalRT-DBG-293]` 只读埋点：`debug!` + `log_enabled!` 守卫（默认 Warn 零开销）。
-fn log_pre_roll_select(window: usize, kept: usize, rate: u32, mode: &str, onset: Option<usize>) {
+/// `trailing_silence_ms` 仅在 `mode=residual` 时给出（FIX-PREROLL-RESIDUAL-308 的判定依据）。
+fn log_pre_roll_select(
+    window: usize,
+    kept: usize,
+    rate: u32,
+    mode: &str,
+    onset: Option<usize>,
+    trailing_silence_ms: Option<u64>,
+) {
     if !log::log_enabled!(log::Level::Debug) {
         return;
     }
@@ -415,12 +456,16 @@ fn log_pre_roll_select(window: usize, kept: usize, rate: u32, mode: &str, onset:
     let onset_at = onset
         .map(|s| format!("{}ms", ms(s) as u64))
         .unwrap_or_else(|| "-".to_string());
+    let trailing = trailing_silence_ms
+        .map(|t| format!(" trailing_silence_ms={t}"))
+        .unwrap_or_default();
     log::debug!(
-        "[LocalRT-DBG-293] pre_roll select: window={}ms kept={}ms mode={} onset_at={}",
+        "[LocalRT-DBG-293] pre_roll select: window={}ms kept={}ms mode={} onset_at={}{}",
         ms(window) as u64,
         ms(kept) as u64,
         mode,
-        onset_at
+        onset_at,
+        trailing
     );
 }
 
@@ -1989,6 +2034,103 @@ mod tests {
         );
         assert_eq!(pre_roll_samples(16000, PRE_ROLL_LOCAL_RT_MS), 16000);
         assert_eq!(pre_roll_samples(16000, PRE_ROLL_MS), 9600);
+    }
+
+    // ============================================================
+    // FIX-PREROLL-RESIDUAL-308：窗口开头的旧语音要判为残留
+    // ============================================================
+
+    fn assert_residual_idempotent(s: &[f32]) {
+        let once = select_pre_roll_for_asr(s, 16000);
+        let twice = select_pre_roll_for_asr(&once, 16000);
+        assert_eq!(once, twice, "residual 选择必须幂等");
+    }
+
+    /// 按「每十分位 100ms、幅度 = 值/400」构造样本（复刻 292 落盘 WAV 的十分位 RMS）。
+    fn rms_decile_samples(deciles: &[u32], rate: u32) -> Vec<f32> {
+        let per = rate as usize / 10;
+        let mut v = Vec::with_capacity(per * deciles.len());
+        for &d in deciles {
+            let amp = d as f32 / 400.0;
+            v.extend(std::iter::repeat(amp).take(per));
+        }
+        v
+    }
+
+    #[test]
+    fn pre_roll_residual_308_single_segment_then_long_silence() {
+        // 1000ms：前 400ms 语音 + 后 600ms 静音 ⇒ residual，只剩末尾 200ms。
+        let mut s = speech(400);
+        s.extend(silence(600));
+        let out = select_pre_roll_for_asr(&s, 16000);
+        assert_eq!(out.len(), 16000 * 200 / 1000, "判残留 ⇒ 只留末尾 200ms");
+        assert_eq!(out, s[s.len() - out.len()..].to_vec());
+        assert_residual_idempotent(&s);
+    }
+
+    #[test]
+    fn pre_roll_residual_308_boundary_exactly_200ms() {
+        // 600ms：前 400ms 语音 + 恰好 200ms 静音 ⇒ 阈值含（>=）⇒ residual。
+        let mut s = speech(400);
+        s.extend(silence(200));
+        let out = select_pre_roll_for_asr(&s, 16000);
+        assert_eq!(out.len(), 16000 * 200 / 1000, "恰好 200ms 判 residual");
+        assert_residual_idempotent(&s);
+    }
+
+    #[test]
+    fn pre_roll_residual_308_real_decile_shape() {
+        // 真实形态（292 落盘 WAV 的十分位 RMS [174,341,120,270,48,3,1,1,2,1]）⇒ residual。
+        let s = rms_decile_samples(&[174, 341, 120, 270, 48, 3, 1, 1, 2, 1], 16000);
+        assert_eq!(s.len(), 16000);
+        let out = select_pre_roll_for_asr(&s, 16000);
+        assert_eq!(out.len(), 16000 * 200 / 1000, "判残留 ⇒ 只留末尾 200ms");
+        assert_residual_idempotent(&s);
+    }
+
+    #[test]
+    fn pre_roll_residual_308_speech_to_window_end_stays_onset() {
+        // 真·先开口：语音连到窗口末尾（末尾无静音）⇒ 仍 onset（不许被吞）。
+        let mut s = silence(300);
+        s.extend(speech(700));
+        let out = select_pre_roll_for_asr(&s, 16000);
+        assert_eq!(out.len(), 16000 * 850 / 1000, "从 150ms 起，850ms");
+        assert_residual_idempotent(&s);
+    }
+
+    #[test]
+    fn pre_roll_residual_308_trailing_150ms_below_threshold_stays_onset() {
+        // 末尾仅 150ms 静音（未达 200ms 阈值）⇒ 仍 onset。
+        let mut s = silence(300);
+        s.extend(speech(550));
+        s.extend(silence(150));
+        let out = select_pre_roll_for_asr(&s, 16000);
+        assert_eq!(out.len(), 16000 * 850 / 1000, "仍 onset：从 150ms 起 850ms");
+        assert_residual_idempotent(&s);
+    }
+
+    #[test]
+    fn pre_roll_residual_308_all_silence_stays_tail() {
+        // 场景 B 不变。
+        let s = silence(1000);
+        let out = select_pre_roll_for_asr(&s, 16000);
+        assert_eq!(out.len(), 16000 * 200 / 1000);
+        assert_residual_idempotent(&s);
+    }
+
+    #[test]
+    fn pre_roll_residual_308_gap_then_new_speech_still_anchors_new() {
+        // 旧语音 + 300ms 静音 + 新语音直到末尾 ⇒ 仍锚定新语音起点（场景 C 不退化）。
+        let mut s = speech(200);
+        s.extend(silence(300));
+        s.extend(speech(500));
+        let out = select_pre_roll_for_asr(&s, 16000);
+        assert_eq!(
+            out.len(),
+            16000 * 650 / 1000,
+            "从新语音起点−150ms（350ms）起，650ms"
+        );
+        assert_residual_idempotent(&s);
     }
 
     // ============================================================

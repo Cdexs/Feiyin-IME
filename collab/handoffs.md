@@ -5,6 +5,34 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行，超 200 行上限）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-21 — coder-1 — FIX-PREROLL-RESIDUAL-308 ✅ 交付（窗口开头旧语音判残留）
+
+- **根因**：`select_pre_roll_for_asr` 只看「几段语音」不看「末段在哪结束」⇒ 292 落盘的真实形态（语音贴窗口开头 + 后 500ms 静音）被整段喂入 ⇒ 未说话已有文字（首果 `很好` 是旧话尾巴）。
+- **修法（一条判据）**：记录**最后一段结束点**（最后非静音样本）；其到窗口末尾静音 ≥ `PRE_ROLL_RESIDUAL_SILENCE_MS`(200ms) ⇒ 判残留 ⇒ 同场景 B 只留末尾 200ms。日志加 `mode=residual` + `trailing_silence_ms=<n>`。段切分未重写；未动 4 个 PRE_ROLL 常量 / T1/T2 词表 / `is_effective_text`。
+- **有意取舍（写入注释）**：说完末字停顿一下才按键也会判残留丢弃 pre-roll —— 用户已说完，丢旧不污染新；真·先开口者按键时仍在说 ⇒ 末尾有能量 ⇒ 不触发。
+- **验证**：`rustfmt --check` clean；`cargo check --all-targets` 0 error、warnings **110/101**=基线；`numstat`==`-w`（**150/8**）；新增 7 单测 + 幂等 → `audio::tests` **77P/0F**（原 7 条零回退 + `guard_293_i5` 绿）。
+- **在线三档零改动**：唯一生产调用点 `audio/mod.rs:689`（在 `trim_pre_roll_residual` 分支内）；`main.rs:7716` 在线传 `false`、`main.rs:8034` 仅 LocalRealtime 传 `true`。
+- 🔴 **实机效果交 Gavin**（未声称已验证）。红线：仅改 `src/audio/mod.rs`；未碰 `src/transcription/**`；未动版本 / 未 commit / 未出包 / 零凭证。
+
+## 2026-09-21 — coder-2 — FIX-LOCALRT-TAILCHAR-307 ✅ 交付（尾字改整句全量重解码）
+
+- **根因**：291 `input_finished()` 方案被实测证伪（`gained` 七次恒 0）；起作用的是**另起 stream 重喂整句重解码**。Gavin「最后一个字不显示」同因。
+- **两处**：endpoint 分支 `:536-561` + 录音结束收尾 `:826-861`，各对最后一句全量重解码，取更长者。
+- **选择器**：`endpoint_confirm_text` 两方→三方 `(main, full, shadow)`，严格更多才切换、等长不抖动。
+- **保留**：291 flush/换流、284 影子、rule1/2/3、298 常量逻辑（`ACC_MIN_SEGMENT_MS_DEFAULT=5000` 未碰）。**294 G3** endpoint create_stream 计数 1→2。
+- **验证**：rustfmt clean、check 0 error、warnings **110/101** 基线、`local_stream::tests` **9P/0F**。⚠️ `numstat` vs `-w` 差 13/13（收尾块去嵌套缩进，非格式化夹带）。
+- 🔴 实机 `gained` 交 tester-1/Gavin，未声称已验证。未动版本 / 未 commit / 未出包 / 零凭证。
+
+## 2026-09-21 — coder-1 — POC-QWEN3ASR-306 ✅ 交付（Qwen3-ASR vs FunASR Nano 选型对比，纯 PoC）
+
+- **结论：各有优劣**（不替 Gavin 决定）。耗时有效音频**打平**（分段 53.84s：11.20 vs 11.19s）；准确率**互有胜负**（Qwen3 `para3` CER 0.0、间隔号更全；FunASR `rag_chemistry` 酯 与 `飞音` 更准）；**语言 Qwen3 决定性胜**（韩文 4/4 Hangul vs FunASR 乱码）；**上下文容量 FunASR 胜**（6.84s 音频 ≤~520 字 vs Qwen3 ≤~390 字）。
+- **KV/token 必测**：`max_total_len` FunASR **1024** / Qwen3 **512**（metadata 上限）。Qwen3 **per-stream 逐句可调且实测生效**（512/256 全量、160 截断、128/64 `language`，日志报 `audio_token_len=123 -> keep_audio=113`）；音频速率 Qwen3 **13.0 tok/s** / FunASR ~16.5 tok/s；20s 音频 ≈260 vs ≈330 token；裸长音频上限 Qwen3 ~38s / FunASR ~60s（52s 实测两者都失败）。
+- **🔴 撞顶（单独成条）**：输入溢出两模型都有日志、Qwen3 更精确（`context_len (692) exceeds max_total_len (512). Truncating audio placeholders…` + suggestions）；**但「生成饿死」二级静默两者相同**（Qwen3 ctx=520 截断 11 字无日志）。⇒ **不是「强一个量级」**。
+- **per-stream hotwords 实测生效**（`只在`→`指在`）⇒ 逐片上下文可行，FunASR 无此能力。
+- **范围**：新增临时 `tests/poc_qwen3_compare.rs`（`#[ignore]`，未跟踪，去留听主控通知）；生产零改动、未动 `Cargo.toml`。
+- **清理**：删 poc306 日志 + 韩文模型包（418MB）；保留 Qwen3 模型与 `models/korean-testwavs/`；`target/debug/deps/` 补 7 DLL（System32 onnxruntime 1.17.1 遮蔽 1.24.4 致崩溃，纯构建产物）。
+- **红线**：未动版本 / 未 commit / 未出包 / 零凭证。
+
 ## 2026-09-21 — coder-2 — WIRE-FF303-305 ✅ 交付（口水词过滤接进管线，Gavin 要求进本包）
 
 - **改动三文件**：`main.rs`（节点 `apply_filler_strip` `:9849` + 唯一调用点 `:9499`）、`text_normalizer.rs`（删 1 行 `#[allow(dead_code)]`）、`docs/MACOS-HANDOFF.md`（+8）。
