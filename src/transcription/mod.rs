@@ -12,6 +12,9 @@ use sherpa_onnx::{OfflineQwen3ASRModelConfig, OfflineSenseVoiceModelConfig};
 pub mod local_stream;
 pub mod qwen_inference;
 mod vad;
+// SLIDING-WINDOW-367：路A 逐片解码摘接线后，`join_segment_texts` 等 re-export 暂无人用；
+// **保留**（可回挂），故局部 allow。
+#[allow(unused_imports)]
 pub use vad::{
     build_padded_segments, join_segment_texts, naive_chunk, should_segment, VadSegmenter,
     SEGMENT_MAX_SECS, SEGMENT_PADDING_SAMPLES, SEGMENT_TRIGGER_SECS,

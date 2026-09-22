@@ -8206,113 +8206,97 @@ fn spawn_worker_thread(
                                 let ctx_prev1_snapshot = ctx_prev1.clone();
                                 Some(scope.spawn(move || {
                                         let recognizer = send_offline.into_inner();
-                                        let mut ordered: Vec<(usize, Vec<String>)> = Vec::new();
+                                        // ── SLIDING-WINDOW-367：滑动窗口（当前片+前1~3，12s 封顶）──
                                         let mut all_native = true;
                                         let mut total_decode_ms = 0.0f64;
-                                        // 320：前序分片累计文本（本 worker 按序解码 ⇒ 天然因果可用、无并行损失）。
-                                        let mut acc_text = String::new();
-                                        // 325：本片覆盖范围（segs 0..=idx）内是否含失败片 ⇒ 有洞则回灌一律跳。
-                                        let mut has_hole = false;
-                                        for (idx, committed_len, sub_segs, seg_streaming) in acc_rx {
+                                        // 最近窗口的音频片（≤ WINDOW_MAX_SLICES）与上一窗文本 / 已定稿前缀。
+                                        let mut recent_slices: Vec<Vec<f32>> = Vec::new();
+                                        let mut committed = String::new();
+                                        let mut last_window_text = String::new();
+                                        let mut window_seq: usize = 0;
+                                        for (_idx, committed_len, sub_segs, _seg_streaming) in acc_rx {
                                             if cancel_acc.load(Ordering::Acquire) {
-                                                // 判据 #3：取消时不把已取消的结果带进下游。
                                                 break;
                                             }
-                                            let mut texts = Vec::with_capacity(sub_segs.len());
-                                            // 344-G：本片是否已用流式文本填补（多子段时只填一次，防重复）。
-                                            // 🔴 实时档 D（OR 派发）下每片必为单子段（≤5s，不会触发 >20s 硬切）；
-                                            //    多子段属 >20s 长片，保守地退回「空串 + 记洞」旧行为。
-                                            let can_fill = sub_segs.len() == 1;
-                                            let mut filled_by_streaming = false;
                                             for s in &sub_segs {
-                                                let t = log::log_enabled!(log::Level::Debug)
-                                                    .then(std::time::Instant::now);
-                                                let res = transcription::transcribe_acc_ctx(
-                                                    recognizer,
-                                                    s,
-                                                    acc_script,
-                                                    idx,
-                                                    transcription::CtxInject {
-                                                        prev_older: ctx_prev2_snapshot.as_deref(),
-                                                        prev_latest: ctx_prev1_snapshot.as_deref(),
-                                                        current: (!acc_text.is_empty())
-                                                            .then_some(acc_text.as_str()),
-                                                        terms: acc_terms.as_deref(),
-                                                    },
-                                                );
-                                                if let Some(t0) = t {
-                                                    total_decode_ms +=
-                                                        t0.elapsed().as_secs_f64() * 1000.0;
-                                                }
-                                                // 失败（Err）与「解出空」都走同一条填补路径。
-                                                let mut needs_fill = false;
-                                                match res {
-                                                    Ok((txt, _np)) => {
-                                                        let empty = txt.is_empty();
-                                                        acc_text.push_str(&txt);
-                                                        texts.push(txt);
-                                                        if empty {
-                                                            needs_fill = true;
-                                                            all_native = false;
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        log::warn!(
-                                                            "PARALLEL-ACC-298 seg #{} sub-seg failed: {}",
-                                                            idx,
-                                                            e
-                                                        );
-                                                        texts.push(String::new());
-                                                        all_native = false;
-                                                        needs_fill = true;
-                                                    }
-                                                }
-                                                if needs_fill {
-                                                    // 🔴 344-G：空/失败片**不留洞** —— 用该片流式文本填补，
-                                                    //    否则累积 `acc_text` 出现永久缺口（325 `has_hole` 一旦为真
-                                                    //    便永不复位 ⇒ 一片失败、本次后续回灌全废）。
-                                                    let (fill, is_hole) = hole_fill_decision(
-                                                        can_fill && !filled_by_streaming,
-                                                        &seg_streaming,
+                                                recent_slices.push(s.clone());
+                                            }
+                                            while recent_slices.len()
+                                                > transcription::WINDOW_MAX_SLICES
+                                            {
+                                                recent_slices.remove(0);
+                                            }
+                                            let durs: Vec<f32> = recent_slices
+                                                .iter()
+                                                .map(|s| s.len() as f32 / 16000.0)
+                                                .collect();
+                                            let start = transcription::group_window_start_secs(
+                                                &durs,
+                                                transcription::WINDOW_MAX_SECS,
+                                            );
+                                            let window_audio: Vec<f32> = recent_slices[start..]
+                                                .iter()
+                                                .flat_map(|s| s.iter().copied())
+                                                .collect();
+                                            // 单窗口一段音频、**一次 decode**（(A)：不做窗口内分片解）。
+                                            // 🔴 (B) 窗口间并发池：待接（当前顺序）。
+                                            let t0 = std::time::Instant::now();
+                                            let res = decode_window(
+                                                recognizer,
+                                                &window_audio,
+                                                window_seq,
+                                                acc_script,
+                                                ctx_prev2_snapshot.as_deref(),
+                                                ctx_prev1_snapshot.as_deref(),
+                                                acc_terms.as_deref(),
+                                            );
+                                            total_decode_ms += t0.elapsed().as_secs_f64() * 1000.0;
+                                            let new_text = match res {
+                                                Ok((t, _np)) => t,
+                                                Err(err) => {
+                                                    all_native = false;
+                                                    log::warn!(
+                                                        "SLIDING-WINDOW-367 window #{} decode failed: {}",
+                                                        window_seq,
+                                                        err
                                                     );
-                                                    filled_by_streaming = true;
-                                                    if is_hole {
-                                                        // 真·无法填补（连预览文本都没有 / 多子段保守）⇒ 记洞兜底。
-                                                        log::warn!(
-                                                            "PARALLEL-ACC-298 seg #{} empty/failed -> hole (unfillable: no streaming fill)",
-                                                            idx
-                                                        );
-                                                        has_hole = true;
-                                                    } else {
-                                                        log::warn!(
-                                                            "PARALLEL-ACC-298 seg #{} empty/failed -> filled by streaming ({} chars)",
-                                                            idx,
-                                                            fill.chars().count()
-                                                        );
-                                                        acc_text.push_str(&fill);
-                                                        // 替换刚 push 的空串（Ok 空 或 Err 均已 push ""）。
-                                                        if let Some(last) = texts.last_mut() {
-                                                            *last = fill;
-                                                        }
-                                                    }
+                                                    String::new()
+                                                }
+                                            };
+                                            // ④ 对齐：上一窗与当前窗的重叠 ⇒ 滑出片定稿（双门不过则不滑动）。
+                                            if !last_window_text.is_empty() && !new_text.is_empty() {
+                                                let a = transcription::align_overlap(
+                                                    &last_window_text,
+                                                    &new_text,
+                                                );
+                                                if a.ok {
+                                                    committed.push_str(&a.committed_prefix);
+                                                } else if log::log_enabled!(log::Level::Debug) {
+                                                    log::debug!(
+                                                        "[SLIDING-WINDOW-367] align not ok, 保守不滑动 (seq={} prev_len={} new_len={})",
+                                                        window_seq,
+                                                        last_window_text.chars().count(),
+                                                        new_text.chars().count()
+                                                    );
                                                 }
                                             }
-                                            ordered.push((idx, texts));
-                                            // 325：把本片覆盖区的权威文本回灌预览（代际盖章，走既有事件通道）。
-                                            // 空串/有洞也照发，由消费端 gate 判定并记 action 遥测（不在此静默丢）。
+                                            if !new_text.is_empty() {
+                                                last_window_text = new_text;
+                                            }
+                                            // ⑤ 回灌：整段替换预览为「committed + 最新窗口文本」（replace_all=true）。
+                                            let authoritative =
+                                                format!("{}{}", committed, last_window_text);
                                             let _ = acc_event_tx.send(PipelineEvent::PreviewReflow {
                                                 generation: session_generation,
-                                                seg_index: idx,
+                                                seg_index: window_seq,
                                                 committed_len,
-                                                has_hole,
-                                                acc_text: acc_text.clone(),
-                                                // 🔴 SLIDING-WINDOW-367：滑窗 worker 重写后此处改 `true`
-                                                //    （整段替换）。**当前仍是逐片 worker ⇒ 保持 325 语义
-                                                //    （false）**，避免半成品行为变更。
-                                                replace_all: false,
+                                                has_hole: false,
+                                                acc_text: authoritative,
+                                                replace_all: true,
                                             });
+                                            window_seq += 1;
                                         }
-                                        (ordered, all_native, total_decode_ms)
+                                        (committed, last_window_text, all_native, total_decode_ms)
                                     }))
                             } else {
                                 None
@@ -8394,22 +8378,23 @@ fn spawn_worker_thread(
                         });
                         let (asr_result, record_result, acc_result, tail_wait_ms) = scoped;
 
-                        // PARALLEL-ACC-298：各片按 seg_index 有序拼接；取消/空 ⇒ 弃用回落旧路径。
-                        let (acc_texts, acc_all_native, acc_total_decode_ms) = match acc_result {
-                            Some(Ok((ordered, all_native, total))) => {
-                                (assemble_parallel_accuracy(ordered), all_native, total)
-                            }
-                            Some(Err(_)) => {
-                                log::error!("PARALLEL-ACC-298 accuracy worker panicked");
-                                (Vec::new(), false, 0.0)
-                            }
-                            None => (Vec::new(), false, 0.0),
-                        };
-                        let acc_joined = transcription::join_segment_texts(&acc_texts);
+                        // SLIDING-WINDOW-367：worker 返回 (定稿前缀, 最新窗口文本, all_native, 总解码ms)。
+                        let (acc_committed, acc_last_window, acc_all_native, acc_total_decode_ms) =
+                            match acc_result {
+                                Some(Ok((c, lw, an, total))) => (c, lw, an, total),
+                                Some(Err(_join_err)) => {
+                                    log::error!("SLIDING-WINDOW-367 accuracy worker panicked");
+                                    (String::new(), String::new(), false, 0.0)
+                                }
+                                None => (String::new(), String::new(), false, 0.0),
+                            };
+                        // 最终文本 = 定稿前缀（滑出片） + 最新窗口文本。
+                        let acc_joined = format!("{}{}", acc_committed, acc_last_window);
                         if log::log_enabled!(log::Level::Debug) {
                             log::debug!(
-                                "[LocalRT-DBG-298] join: segs={} all_native={} total_decode={:.0}ms tail_wait={:.0}ms",
-                                acc_texts.len(),
+                                "[SLIDING-WINDOW-367] join: committed={} window={} all_native={} total_decode={:.0}ms tail_wait={:.0}ms",
+                                acc_committed.chars().count(),
+                                acc_last_window.chars().count(),
                                 acc_all_native,
                                 acc_total_decode_ms,
                                 tail_wait_ms
@@ -8420,8 +8405,11 @@ fn spawn_worker_thread(
                         // 无需在采集/回调路径额外累积 ⇒ **路A 主路径零新增开销**。
                         // 路B 在 `acc_handle.join()` 之后才跑（路A worker 已结束）⇒ 不与预览刷新竞争。
                         // 预算够且解码成功 ⇒ 用路B 全文；否则**降级**退回现有切片拼装（绝不硬塞，DEC-069）。
+                        // 🔴 SLIDING-WINDOW-367：路B（松手全量解码）+ 364 预算闸门**已摘接线**（保留代码可回挂）；
+                        //    最终文本改由滑动窗口（committed + 最新窗口）产出。恢复：把本 const 置 `true`。
+                        const PATH_B_WIRED_367: bool = false;
                         let path_b_terms = load_hotwords_for_accuracy(&config);
-                        let path_b_text: Option<String> = {
+                        let path_b_text: Option<String> = if PATH_B_WIRED_367 {
                             // 借用 `local_pcm`，不消费 `asr_result`（后面还要 destructure）。
                             let pcm_opt: Option<&[f32]> = match &asr_result {
                                 Ok(Ok((_, pcm))) => Some(pcm.as_slice()),
@@ -8510,6 +8498,8 @@ fn spawn_worker_thread(
                                 }
                                 _ => None,
                             }
+                        } else {
+                            None
                         };
                         // 最终文本来源：路B（若成功）**整体替换**切片拼装（不再算拼接边界）。
                         let final_src: &str = path_b_text.as_deref().unwrap_or(acc_joined.as_str());
@@ -8522,25 +8512,17 @@ fn spawn_worker_thread(
                                 config.audio.chinese_script,
                             );
                             // ── PUNCT-FINAL-REDO-350 节点（重打前先剥光标点）──
-                            // 🔴 UNWIRE-STRIP-NODE-365（2026-09-22）：**该节点已从「路B 主路径」摘除**，
-                            //    但**降级分支仍挂**（条件挂载，非删代码）。
-                            //  · 何时摘：365。路B（363）落地后，最终文本由**全量音频一次解出**、
-                            //    不再多片拼装 ⇒ **无拼接接缝 ⇒ 350 的前提（接缝处标点乱）消失**，
-                            //    再剥光重打属多余处理，还可能把模型本已全局一致的好标点打坏。
-                            //  · 为何保留降级分支：若预算不足**降级回「多片拼装」**（`path_b_text` 为 None），
-                            //    接缝标点问题**会回来** ⇒ 此时仍按 350 剥光重打。
-                            //  · 何时整体回挂：若未来最终文本来源又改回「多片拼装」（无路B），
-                            //    把 `b_strip_enabled` 恢复为 `config.punctuation.enabled && !translate` 即可
-                            //    （节点代码、7 条单测、源码级顺序护栏均原样保留，随时可挂回）。
-                            //  · 原门保留：`punctuation.enabled && !translate`（翻译路径下游
-                            //    `apply_local_punctuation` 被 `translate_requested` 挡住 ⇒ 剥光补不回）；
-                            //    `llm_handled` 接线点读不到，核实为无害（LLM 输入剥光、其输出自带标点）。
+                            // 🔴 SLIDING-WINDOW-367 + DEC-080（2026-09-22）：**该节点无条件摘除**
+                            //    （`B_STRIP_WIRED_367 = false`，接线保留、非删代码）。
+                            //  · 为何无条件摘：滑窗输出同样是**模型一次解出的完整文本、无拼接接缝**
+                            //    ⇒ 「剥光重打」前提消失；357 实测重打会**反噬**（把「二比一」改成「2比1」）。
+                            //    Gavin 已拍 DEC-080：当前管线不走「全量剥标点 + 二次打点」。
+                            //  · 何时回挂：若未来最终文本来源又改回「多片拼装」（无滑窗），接缝标点问题会回来，
+                            //    把 `B_STRIP_WIRED_367` 置 `true` 即可（节点代码/7 单测/共享谓词/顺序护栏全部保留）。
                             // 🔴 334 老 bug 不复发：`apply_local_punctuation` 的 `!native_punctuated` 门**仍在**
-                            //    （334 防的是「对已带标点文本再打一遍 ⇒ 。。 叠加」）。本节点摘下后，
-                            //    路B 全量文本 `native_punctuated=true` ⇒ 引擎跳过、保留模型标点，天然免疫。
-                            let b_strip_enabled = path_b_text.is_none()
-                                && config.punctuation.enabled
-                                && !start.translate.load(Ordering::Acquire);
+                            //    （334 防的是「对已带标点文本再打一遍 ⇒ 。。 叠加」）；摘本节点后模型标点原样保留，天然免疫。
+                            const B_STRIP_WIRED_367: bool = false;
+                            let b_strip_enabled = B_STRIP_WIRED_367;
                             let stripped = strip_punctuation_node(normalized, b_strip_enabled);
                             // PUNCT-DOUBLE-334：第二元 = 「文本**实际**是否已有有效标点」（DEC-047 口径，
                             // 与 :9855 的 Qwen3 分支同一 detector），**不是**「各分片是否都解码成功」。
@@ -9626,6 +9608,32 @@ enum TranscriptionFailure {
 ///
 /// 单 worker + channel FIFO 已保证顺序，这里仍显式排序（乱序/缺号输入也稳定），
 /// 是判据 #3「seg_index 有序拼接」的纯函数载体（可单测，无需真模型）。
+// SLIDING-WINDOW-367：单窗口解码（窗口音频 + 注入集中一处）。
+fn decode_window(
+    recognizer: &sherpa_onnx::OfflineRecognizer,
+    window_audio: &[f32],
+    window_seq: usize,
+    script: config::ChineseScript,
+    prev_older: Option<&str>,
+    prev_latest: Option<&str>,
+    terms: Option<&str>,
+) -> anyhow::Result<(String, bool)> {
+    transcription::transcribe_acc_ctx(
+        recognizer,
+        window_audio,
+        script,
+        window_seq,
+        transcription::CtxInject {
+            prev_older,
+            prev_latest,
+            current: None,
+            terms,
+        },
+    )
+}
+
+// SLIDING-WINDOW-367：路A 逐片拼装摘接线后暂无人用（**保留可回挂**）。
+#[allow(dead_code)]
 fn assemble_parallel_accuracy(mut segments: Vec<(usize, Vec<String>)>) -> Vec<String> {
     segments.sort_by_key(|(idx, _)| *idx);
     segments.into_iter().flat_map(|(_, texts)| texts).collect()
@@ -9647,6 +9655,8 @@ fn acc_parallel_result_usable(cancelled: bool, joined: &str) -> bool {
 ///
 /// 🔴 修的是 325 的设计硬伤：累积 `acc_text` 一旦留空 ⇒ `has_hole` 永不复位 ⇒ 一片失败后
 /// 本次录音**后续回灌全废**。失败片用流式文本填满即无洞。
+// SLIDING-WINDOW-367：路A 失败片填补摘接线后暂无人用（**保留可回挂**）。
+#[allow(dead_code)]
 fn hole_fill_decision(can_fill: bool, seg_streaming: &str) -> (String, bool) {
     if can_fill && !seg_streaming.is_empty() {
         (seg_streaming.to_string(), false)
@@ -15519,21 +15529,20 @@ mod sync352_punct_node_guard_tests {
             "365：调用点必须传门变量 `b_strip_enabled`"
         );
         // 门变量定义必须含三项。
+        // 🔴 锚点同步（367 + DEC-080，2026-09-22）：门由「路B 条件」改为**无条件摘**常量
+        //    `B_STRIP_WIRED_367 = false`。断言语义更新为「节点仍唯一挂载、且由显式常量控制
+        //    （可一键回挂）」，不再断言 365 的条件门。
         let def_at = s
             .find(concat!("let b_strip_enabled", " ="))
-            .expect("365 门变量 `b_strip_enabled` 定义必须存在");
-        let def = &s[def_at..(def_at + 260).min(s.len())];
+            .expect("`b_strip_enabled` 定义必须存在");
+        let def = &s[def_at..(def_at + 120).min(s.len())];
         assert!(
-            def.contains("config.punctuation.enabled"),
-            "节点门必须含 `config.punctuation.enabled`（关标点时本节点无意义）"
+            def.contains("B_STRIP_WIRED_367"),
+            "367/DEC-080：门必须由显式常量 `B_STRIP_WIRED_367` 控制（可一键回挂）"
         );
         assert!(
-            def.contains("!start.translate"),
-            "节点门必须含 `!start.translate`（翻译路径下游不重打标点，剥光会丢标点）"
-        );
-        assert!(
-            def.contains("path_b_text.is_none()"),
-            "365：门必须含 `path_b_text.is_none()`（路B 成功即摘节点、降级才挂）"
+            s.contains("const B_STRIP_WIRED_367: bool = false;"),
+            "367/DEC-080：`B_STRIP_WIRED_367` 必须为 false（无条件摘除 350 节点）"
         );
     }
 
