@@ -3531,6 +3531,125 @@ mod poc_qwen3_17b_351 {
             );
         }
     }
+
+    // ============================================================
+    // POC-TIMESTAMP-DECODE-CURVE-361：RP-1 时间戳可用性 + RP-3① decode 开销曲线
+    // 运行：cargo test --bin feiyin-ime -- --ignored --nocapture poc_361_timestamp_curve
+    // 只读复用生产 recognizer（create_qwen3_recognizer_at），不手搓 config。
+    // ============================================================
+    /// 一次完整解码，返回**原始** `OfflineRecognizerResult`（为了看 timestamps/durations/tokens）。
+    fn decode_full_result(
+        rec: &sherpa_onnx::OfflineRecognizer,
+        samples: &[f32],
+        rate: i32,
+    ) -> (sherpa_onnx::OfflineRecognizerResult, f64) {
+        let stream = rec.create_stream();
+        stream.accept_waveform(rate, samples);
+        let t0 = Instant::now();
+        rec.decode(&stream);
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        (stream.get_result().expect("result"), ms)
+    }
+
+    #[test]
+    #[ignore = "PoC: cargo test --bin feiyin-ime -- --ignored --nocapture poc_361_timestamp_curve"]
+    fn poc_361_timestamp_curve() {
+        let root = manifest_dir();
+        let rec = create_qwen3_recognizer_at(
+            &root.join("models/sherpa-onnx-qwen3-asr-1.7B-int8-2026-09-22"),
+        )
+        .expect("1.7B");
+        let (fs, rate) = read_wav(&root, "collab/research/audio-real-gavin/processed/full.wav");
+        println!(
+            "POC361 machine cores={} acc_threads={} full_dur={:.2}s",
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(0),
+            default_acc_num_threads(),
+            fs.len() as f64 / rate as f64
+        );
+
+        // ---- RP-1：时间戳可用性（full.wav 0-20s，内容已知）----
+        println!("POC361 === RP-1 timestamps ===");
+        let n20 = (rate * 20).min(fs.len());
+        let (r, ms) = decode_full_result(&rec, &fs[..n20], rate as i32);
+        println!(
+            "POC361 ts decode={:.0}ms text_chars={} tokens_len={}",
+            ms,
+            r.text.chars().count(),
+            r.tokens.len()
+        );
+        match &r.timestamps {
+            Some(v) => {
+                let first: Vec<String> = v.iter().take(8).map(|x| format!("{x:.3}")).collect();
+                let last: Vec<String> = v.iter().rev().take(3).map(|x| format!("{x:.3}")).collect();
+                let mono = v.windows(2).all(|w| w[0] <= w[1] + 1e-6);
+                println!(
+                    "POC361 ts Some len={} monotonic={} first8={:?} last3={:?}",
+                    v.len(),
+                    mono,
+                    first,
+                    last
+                );
+            }
+            None => println!("POC361 ts None"),
+        }
+        match &r.durations {
+            Some(v) => println!(
+                "POC361 dur Some len={} first3={:?}",
+                v.len(),
+                v.iter().take(3).collect::<Vec<_>>()
+            ),
+            None => println!("POC361 dur None"),
+        }
+        println!(
+            "POC361 ts text_head={} tokens_first12={:?}",
+            head(&r.text, 40),
+            r.tokens.iter().take(12).collect::<Vec<_>>()
+        );
+
+        // ---- RP-3①：decode 开销曲线（递增前缀，每步新建 stream）----
+        println!("POC361 === RP-3 decode 开销曲线 ===");
+        let mut texts: Vec<(usize, String)> = Vec::new();
+        for secs in [1usize, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 25, 30, 40, 56] {
+            let n = (rate * secs).min(fs.len());
+            let (r, ms) = decode_full_result(&rec, &fs[..n], rate as i32);
+            println!(
+                "POC361 curve secs={} decode={:.0}ms text_chars={} head={}",
+                secs,
+                ms,
+                r.text.chars().count(),
+                head(&r.text, 30)
+            );
+            texts.push((secs, r.text));
+        }
+
+        // ---- 重解前文稳定性：短前缀文本是否为长前缀文本的前缀 ----
+        println!("POC361 === 重解前文稳定性 ===");
+        let norm = |t: &str| super::Transcriber::strip_asr_special_tokens(t.trim());
+        for w in texts.windows(2) {
+            let (s1, t1) = &w[0];
+            let (s2, t2) = &w[1];
+            let n1 = norm(t1);
+            let n2 = norm(t2);
+            println!(
+                "POC361 stable {s1}s->{s2}s is_prefix_of_next={} chars {}->{}",
+                n2.starts_with(&n1),
+                n1.chars().count(),
+                n2.chars().count()
+            );
+        }
+        // 同一前缀重复解码是否逐字稳定
+        let n10 = (rate * 10).min(fs.len());
+        let (a, _) = decode_full_result(&rec, &fs[..n10], rate as i32);
+        let (b, _) = decode_full_result(&rec, &fs[..n10], rate as i32);
+        println!(
+            "POC361 repeat 10s identical={} chars_a={} chars_b={}",
+            a.text == b.text,
+            a.text.chars().count(),
+            b.text.chars().count()
+        );
+    }
 }
 
 // ============================================================
