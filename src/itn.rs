@@ -5783,4 +5783,73 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
             );
         }
     }
+
+    // ============================================================
+    // ITN-IDIOM-DUFAMILY-354：「度」字固定语保护（Gavin 2026-09-22）
+    //
+    // 取证：`度` ∈ [units.temperature]，任何「中文数字+度」都会被转
+    //   （梅开二度 → 梅开2度）。含「度=次/维度/音程」义的**固定语**被误转。
+    // 处置：不可推导固定语入 [protect.idioms] 整词保护（DEC-044）；
+    //   productive 的 N度空间 / N度出山 / N度烧伤 / 裸 一度·二度·三度
+    //   **不往词表堆**（DEC-038），已在 result.md 上报主控另立规则单评估。
+    // ============================================================
+
+    /// 354：固定语整词保护 —— 其中「度」不得被 [units.temperature] 转掉。
+    #[test]
+    fn itn354_du_fixed_idioms_preserved() {
+        for t in [
+            "梅开二度",
+            "六度万行",
+            "八度空间",
+            "八度音程",
+            "八度音阶",
+            "八度音",
+            "高八度",
+            "低八度",
+        ] {
+            assert_eq!(normalize_test(t), t, "「度」固定语被误转：{t}");
+        }
+        // 真实上下文（Gavin 原始报障场景的局部）
+        assert_eq!(
+            normalize_test("梅开二度帮助球队"),
+            "梅开二度帮助球队",
+            "固定语在句中仍须保持"
+        );
+    }
+
+    /// 354 边界外红线（`[ITN-LOCAL-RULE-OVERREACH-001]`）：真温度 / 角度 / 度电
+    /// 必须**逐字仍正确**。**与新护栏同批写**。
+    #[test]
+    fn itn354_temperature_boundary_still_converts() {
+        assert_eq!(normalize_test("三十度"), "30度");
+        assert_eq!(normalize_test("一百度"), "100度");
+        assert_eq!(normalize_test("零下五度"), "零下5度");
+        assert_eq!(normalize_test("九十度角"), "90度角");
+        assert_eq!(normalize_test("摄氏二十五度"), "摄氏25度");
+        assert_eq!(normalize_test("二十五度"), "25度");
+        assert_eq!(normalize_test("零度"), "0度");
+        assert_eq!(normalize_test("三十度角"), "30度角");
+        // 单位链：度电（千瓦时），不是温度
+        assert_eq!(normalize_test("一度电"), "1度电");
+    }
+
+    /// 354 前缀遮蔽自检（`[ITN-PREFIX-SHADOW-001]`）：新增固定语不得吃掉**其后**
+    /// 的真温度 / 单位表达。逐条意图见 result.md「会遮蔽什么」。
+    #[test]
+    fn itn354_new_idioms_do_not_shadow_later_numbers() {
+        assert_eq!(normalize_test("梅开二度三十度"), "梅开二度30度");
+        assert_eq!(normalize_test("八度音程二十五度"), "八度音程25度");
+        assert_eq!(normalize_test("高八度零下五度"), "高八度零下5度");
+        assert_eq!(normalize_test("六度万行三十度"), "六度万行30度");
+        // 🔴 主控点名必验：`八度音` 是 `八度音程`/`八度音阶` 的前缀，三条共存不得互相吃
+        // （`check_protection` 用 `.max()` 最长匹配 ⇒ 长条优先；短条只在无长条时命中）。
+        assert_eq!(normalize_test("八度音"), "八度音");
+        assert_eq!(normalize_test("八度音程"), "八度音程");
+        assert_eq!(normalize_test("八度音阶"), "八度音阶");
+        assert_eq!(normalize_test("八度音阶三十度"), "八度音阶30度");
+        assert_eq!(
+            normalize_test("八度音程八度音阶八度音"),
+            "八度音程八度音阶八度音"
+        );
+    }
 }
