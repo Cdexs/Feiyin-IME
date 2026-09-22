@@ -3301,4 +3301,71 @@ mod poc_qwen3_17b_351 {
             println!("POC355L ja lang={lang:?} {} : {}", pref(&t), head(&t, 70));
         }
     }
+
+    // ---- 355 追加二：language=None（生产实际）下，多语种**正文**对不对 + 设正确语种对照 ----
+    #[test]
+    #[ignore = "PoC: cargo test --bin feiyin-ime -- --ignored --nocapture poc_355_lang_none_multilingual"]
+    fn poc_355_lang_none_multilingual() {
+        let root = manifest_dir();
+        let rec = create_qwen3_recognizer_at(
+            &root.join("models/sherpa-onnx-qwen3-asr-1.7B-int8-2026-09-22"),
+        )
+        .expect("1.7B");
+        let (fs, rate) = read_wav(&root, "collab/research/audio-real-gavin/processed/full.wav");
+        let slices = slice_fitness(&fs, rate);
+        let zh_seg0 = fs[slices[0].0..slices[0].1].to_vec();
+        let t = "models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/test_wavs/";
+        // (tag, wav 绝对相对路径, 参考文本, 正确语种)
+        let cases: Vec<(&str, String, &str, &str, Vec<f32>)> = vec![
+            ("zh-seg0", String::new(), ANSWERS[0], "Chinese", zh_seg0),
+            (
+                "en",
+                format!("{t}f1_noise.wav"),
+                "Okay, Charles. It looks like we have a problem with the radio. What happened? Yeah, someone spilled water on their machine. I uh, yeah. Charles, can you hear us? Mamma mia.",
+                "English",
+                Vec::new(),
+            ),
+            (
+                "ja",
+                format!("{t}ja1.wav"),
+                "抜群の運動神経を持ち合わせ、どんな要求にも応えてきた。",
+                "Japanese",
+                Vec::new(),
+            ),
+            ("ko0", "models/korean-testwavs/0.wav".into(), "그는 괜찮은 척하려고 애쓰는 것 같았다.", "Korean", Vec::new()),
+            ("ko1", "models/korean-testwavs/1.wav".into(), "지하철에서 다리를 벌리고 앉지 마라.", "Korean", Vec::new()),
+            ("yue", format!("{t}cantonese.wav"), "今次寻寻觅觅，终于揾到my princess，肯借个场俾我哋玩。你知啦，喺香港地喺繁忙时间要揾个场嚟拍嘢系非常之难嘅。再一次多谢你哋，亦都好多谢片入边嘅每一个人。", "Cantonese", Vec::new()),
+            ("mix", format!("{t}codeswitch.wav"), "I'm alone, all by myself. Je suis tout seul. Sono tutto. Estoy solo.", "English", Vec::new()),
+            ("de", format!("{t}de.wav"), "Raptorium Bergbau scheint profitierter als Monroe als Reaktion auf die wirtschaftlichen Ausfälle zu sein.", "German", Vec::new()),
+            ("fr", format!("{t}fr1.wav"), "Alice et moi sommes allés à Paris voyager en train au printemps, c'était très amusant.", "French", Vec::new()),
+            ("ru", format!("{t}ru1.wav"), "Барсук, живущий в киевском зоопарке, совершил побег из своего вольера.", "Russian", Vec::new()),
+            ("ar", format!("{t}ar1.wav"), "إطلالات مكياج عيون ذهبي لسهرات صيف عشرين واحد وعشرين بأسلوب النجوم.", "Arabic", Vec::new()),
+        ];
+        for (tag, rel, reference, lang, pre) in cases {
+            let samples = if pre.is_empty() {
+                read_wav(&root, &rel).0
+            } else {
+                pre
+            };
+            let none = decode_with_lang(&rec, &samples, ChineseScript::Simplified, None);
+            let forced = decode_with_lang(&rec, &samples, ChineseScript::Simplified, Some(lang));
+            let strip_prefix = |s: &str| -> String {
+                match s.find("<asr_text>") {
+                    Some(p) => s[p + "<asr_text>".len()..].to_string(),
+                    None => s.to_string(),
+                }
+            };
+            let body_none = strip_prefix(&none);
+            println!(
+                "POC355M {tag} lang=None: cer={:.3} body={}",
+                cer(&body_none, reference),
+                head(&body_none, 70)
+            );
+            println!(
+                "POC355M {tag} lang={lang}: cer={:.3} body={}",
+                cer(&forced, reference),
+                head(&forced, 70)
+            );
+        }
+    }
 }
