@@ -6,6 +6,17 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-22 — coder-1 — RESEARCH-QWEN3-1.7B-347 ✅ 交付（纯调研，零生产代码）
+
+- **任务**：Gavin 要求「上 HF 找下载率最高的 qwen3-asr 1.7b，评估替代 0.6B 可行性；1.7b 也找 onnx 版，最大化向现役 0.6B 推理框架兼容」。
+- **结论**：**有条件可行**。产出 `collab/research/qwen3-asr-1.7b-eval-347.md`。
+- **头号门禁**：官方（k2-fsa / csukuangfj）**无** 1.7B sherpa-onnx 四件套 —— GitHub release `asr-models` **全量 499 asset 仅 1 个 qwen = 0.6B**；k2-fsa 文档只文档化 0.6B；`csukuangfj` HF 767 repo 含 qwen 者 0；`csukuangfj2` 仅 0.6B 镜像。⚠️ `releases/expanded_assets/...?page=N` 不响应分页，枚举须走 assets API。
+- **关键发现（本单价值）**：现役 0.6B 的**同一来源** ModelScope `zengshuishui/Qwen3-ASR-onnx` 同时含 **`model_1.7B/`**；本机 0.6B 三文件 sha256 与该仓库 `model_0.6B/` **逐字节相同** ⇒ 1.7B 与现役 0.6B 同作者/同导出脚本（`Wasser1462/Qwen3-ASR-onnx`）/同四件套布局，**`OfflineQwen3ASRModelConfig` 代码零改动**。HF `thieunv-asilla` / `ilmina` 为逐字节相同镜像；`solavr` 为 mixed INT8/FP32（Q/K/V/O 保 FP32 防复读）独立导出。
+- **数据**：1.7B int8 四件套 = 2,399,761,248 B（decoder 2,037,458,645 / encoder 314,222,162 / conv 48,080,441），+1.32 GiB；KV 每 token 与 0.6B 相同（28 层/8 KV 头/128，4096 → 896 MiB/流，cache 为动态轴无需重导）；官方 Offline 平均 WER 2.69 vs 0.6B 3.48；Apache-2.0。
+- **🔴 诚实边界**：本机 CPU RTF **未查到**（唯一公开点 solavr RTF 0.743@2线程，CPU 型号缺失且为更重 mixed 导出）；1.7B 中文 CER 未查到；内存为以 0.6B 实测 4298MB 外推的**估算**。
+- **建议**：不直接换默认，先做同音频 A/B PoC（判据：CER 显著优于 0.0444 + 延迟可接受 + 峰值内存不越界）。
+- **红线**：未下载模型 / 未改 `src/` / 未改版本号 / 未 commit / 未 push / 未碰 `local_stream.rs` / 零凭证。
+
 ## 2026-09-22 — tester-1 — TEST-EXEC + BUILD-345 ✅ 出包（P0 崩溃修复 + DEC-077 回滚 + 344-G；八项 PASS，三机制探针归零）
 
 - **基线/归属**：HEAD `d87b8b4`，**源码 clean**，版本 0.9.2。本包替换作废的 `8758ca66`。🔴 开工前 `M src/main.rs`（纯注释 4+/2−）→ 上报主控提交 `d87b8b4` 后放行（脏树不自行 commit）。
@@ -40,3 +51,12 @@
 - **验证**：fmt clean / check 0 error / warnings **99/90**（未下降，如实报）/ numstat==-w / 全量 `cargo test` 0 failed（1328+52+…）。
 - **红线**：未动版本号 / 未出包 / 未 commit / 零凭证。
 - **追加 G（344-G）**：修复「回灌洞永久失效」—— `acc_text` 累积、失败/空片留洞 ⇒ `has_hole` 永不复位 ⇒ 一片失败后续回灌全废。`on_segment` 载荷加 `seg_streaming_text`（`last_display` 自上一片 `committed_len` 起的字符后缀，按 char 切片）；worker 对 `Err` 与「Ok 空」统一 `hole_fill_decision`：非空填空不记洞，真·无法填补才兜底 `has_hole`；`SkippedHole` 保留。单测 3 条。**顺带查**：短片空输出 = 该段音频本身无语音（shadow/streaming/accuracy 三方同时为空），非 padding/静音判据。改动 `src/transcription/local_stream.rs` + `src/main.rs`；全量 `cargo test` 0 failed（1331）。
+
+## 2026-09-22 — coder-2 — ACC-DISPATCH-SILENCE-ONLY-346 ✅ 交付（派发规则只判静默 1200ms + 修共享计数器坑）
+
+- **Gavin 原话**：「改成只判断静默1200ms，不按时长来切片」。
+- **改动（仅 `src/transcription/local_stream.rs`，`numstat`==`-w` 206/133）**：①阈值 800→**1200ms**；②删长度支（原 800ms OR 累计 5s）—— 按 DEC-077 连根删 `ACC_MIN_SEGMENT_MS_DEFAULT` / `AccDispatchConfig.min_seg_ms` / `should_dispatch_acc` 的 `min_seg_ms` 参数与分支，无死代码；③🔴 **核心坑**：`silent_ms` 是唯一共享计数器，标点路径 800ms 打点后清零它 ⇒ 阈值抬到 1200 后静默支**结构上不可达**。修法 =**方案 A**：新增 acc 专用 `acc_silent_ms`，只在静音累加/语音归零两处同步，**不被标点清零**；调用点改读它。shadow(400)/标点(800) 行为逐位不变。未选 B（删清零会连带动 shadow 时序）。④订正 5 处过期注释（含 `:970` 错误的「本处独立计数」）。
+- **核心判据（测试）**：`acc346_acc_counter_survives_punct_reset` —— 逐 chunk 模拟「标点 800ms 清零」后，**正证** acc 计数器仍能走到 1200 并派发；**反证** 误用 `silent_ms` 则不可达。另 `guard346_acc_counter_wiring` 源码级护栏钉死接线。
+- **验证**：`cargo fmt --check`（不带 `skip_children`）EXIT 0 ｜ `cargo check` 0 error ｜ warnings **99** = 基线 ｜ `numstat`==`-w` ｜ 全量 `cargo test --no-fail-fast` **1420P/0F/22I**（NEW 3 / GONE 2）。
+- **只报不改**：`src/main.rs:9570` 注释「要攒够 `min_seg_ms` 且静默 800ms 才派片」已过期（越界项，报主控）。
+- 🔴 实机 `tail_wait` / 派发分布交 tester-1/Gavin，未声称已验证。未动版本号（0.9.3 主控已升）/ 未 commit / 未出包 / 未碰 `src/main.rs`、`src/audio/**` / 零凭证。

@@ -109,26 +109,22 @@ const SHADOW_FINALIZE_MS_DEFAULT: f32 = 400.0;
 /// 越来越长的音频（O(n²) 开销）。被跳过时打 warn 便于实测评估。
 const SHADOW_MAX_AUDIO_SECS: f32 = 12.0;
 
-/// LOCALRT-PARALLEL-ACC-298：派发静音阈值默认值（Gavin 拍板 800ms，不是 400ms）。
+/// LOCALRT-PARALLEL-ACC-298 / ACC-DISPATCH-SILENCE-ONLY-346：派发静音阈值默认值。
+///
+/// 沿革：298 初版 800ms（Gavin 拍板，不是 400ms）→ **ACC-DISPATCH-SILENCE-ONLY-346 Gavin
+/// 2026-09-22 改为 1200ms，且「只判断静默，不按时长来切片」**。原「或 未派发累计 ≥5s（长度支）」
+/// 已按 DEC-077（零收益机制即移除）连根删除，常量 `ACC_MIN_SEGMENT_MS_DEFAULT` 一并移除。
 ///
 /// 🔴 **与 sherpa endpoint（rule2=2.0s）完全解耦**：本阈值只管「把已说完的一段派给 accuracy
 /// 并行转写」，**绝不触发** `reset()` / 切句 / `sentence_id += 1`（那是显示层的事）。
-const ACC_DISPATCH_SILENCE_MS_DEFAULT: f32 = 800.0;
-
-/// LOCALRT-PARALLEL-ACC-298：最小派发片长默认值（**5s**，Gavin 2026-09-21 最终定值）。
 ///
-/// 沿革：初版 3s（主控拍的，未经实测）→ **5s（Gavin 最终定值：切碎了偏差大）**；期间一度议到 4s，最终仍取 5s。
-///
-/// 800ms 停顿在口语里很密，不设下限会切出 0.5s 碎片（每片固定解码开销 + 上下文过短伤精度）。
-/// 片越短，模型可用的声学/语言上下文越少、偏差越大；5s 是「够长不碎、又不至于让短句拿不到并行」
-/// 的折中。配套的静默判据 `ACC_DISPATCH_SILENCE_MS_DEFAULT` = 800ms 不变。
-///
-/// 🔴 注意：LOCALRT-CTX-INJECT-320 之后，片与片之间**已经有上下文传递**
-/// （Qwen3 per-stream 注入前序分片文本），故「片短 ⇒ 无上下文」这条旧理由已不完全成立；
-/// 但声学上下文仍随片长增加，故仍设下限。
-///
-/// 仍做成 env 可调（`LOCAL_RT_ACC_MIN_SEG_MS`），端测可比对不同取值。
-const ACC_MIN_SEGMENT_MS_DEFAULT: u64 = 5000;
+/// 🔴 **本阈值必须读 acc 专用计数器 `acc_silent_ms`，不能读显示层的 `silent_ms`**：
+/// 显示层标点在 `PUNCT_SILENCE_TRIGGER_MS=800` 打点后会把 `silent_ms` 清零（见函数内
+/// `if silence_due { silent_ms = 0.0; }`）。若 1200ms 阈值读同一个 `silent_ms`，则静默每到
+/// 800ms 就被标点路径归零 ⇒ **1200ms 永远到不了**，叠加删除长度支后 accuracy 在录音中将
+/// **一次都不会被派发**（298/342-D 整个废掉）。故 `acc_silent_ms` 只与 `silent_ms` 在静音
+/// 累加/语音归零两处同步，**不受标点清零影响**。
+const ACC_DISPATCH_SILENCE_MS_DEFAULT: f32 = 1200.0;
 
 /// LOCALRT-SEAM-337：自适应定界的「文本停止增长」窗口（具名，非魔数）。
 /// 依据：流式模型按 `config.yaml: chunk_length: 500`（ms）+ `chunk_shift_ratio: 0.5`（步进 250ms）
@@ -139,18 +135,15 @@ const ACC_BOUNDARY_STABLE_MS: f32 = 500.0;
 /// 依据：`seam337_lookahead_probe` 25 点实测最大 `last_grow_after_P = 1840ms` + 余量。
 const ACC_BOUNDARY_CAP_MS: f32 = 2000.0;
 
-/// LOCALRT-PARALLEL-ACC-298：accuracy 并行派发配置（三个 env 开关，端测可调）。
+/// LOCALRT-PARALLEL-ACC-298 / ACC-DISPATCH-SILENCE-ONLY-346：accuracy 并行派发配置。
 ///
-/// | env | 默认 | 用途 |
-/// | --- | --- | --- |
-/// | `LOCAL_RT_ACC_PARALLEL` | `1`（开） | 总开关；`0` = 逐位退回今天的串行行为 |
-/// | `LOCAL_RT_ACC_SILENCE_MS` | `800` | 派发静音阈值 |
-/// | `LOCAL_RT_ACC_MIN_SEG_MS` | `3000` | 最小片长 |
+/// `enabled` 总开关（关 = 逐位退回串行行为）、`silence_ms` 派发静音阈值。
+/// ACC-DISPATCH-SILENCE-ONLY-346：原长度支（最小片长 `min_seg_ms`）已按 DEC-077 连根删除，
+/// 不再有对应字段 —— 派发**只判静默**。
 #[derive(Debug, Clone, Copy)]
 pub struct AccDispatchConfig {
     pub enabled: bool,
     pub silence_ms: f32,
-    pub min_seg_ms: u64,
 }
 
 impl AccDispatchConfig {
@@ -160,17 +153,14 @@ impl AccDispatchConfig {
     pub fn new() -> Self {
         let enabled = true;
         let silence_ms = ACC_DISPATCH_SILENCE_MS_DEFAULT;
-        let min_seg_ms = ACC_MIN_SEGMENT_MS_DEFAULT;
         log::debug!(
-            "[LocalRT-DBG-298] acc parallel cfg: enabled={} silence_ms={} min_seg_ms={}",
+            "[LocalRT-DBG-298] acc parallel cfg: enabled={} silence_ms={}",
             enabled,
-            silence_ms,
-            min_seg_ms
+            silence_ms
         );
         Self {
             enabled,
             silence_ms,
-            min_seg_ms,
         }
     }
 }
@@ -180,23 +170,21 @@ impl Default for AccDispatchConfig {
         Self {
             enabled: true,
             silence_ms: ACC_DISPATCH_SILENCE_MS_DEFAULT,
-            min_seg_ms: ACC_MIN_SEGMENT_MS_DEFAULT,
         }
     }
 }
 
-/// PARALLEL-ACC-298 / LOCALRT-DISPATCH-OR-342-D：是否把「当前未派发区间」派发给 accuracy 并行 worker。
+/// PARALLEL-ACC-298 / ACC-DISPATCH-SILENCE-ONLY-346：是否把「当前未派发区间」派发给 accuracy 并行 worker。
 ///
-/// 🔴 设计口径（Gavin 原始意图，342-D 定案）：**静默 ≥ `silence_ms`(800) 或 未派发累计 ≥ `min_seg_ms`(5000)**
-/// **任一成立即派**。原实现误写成「静默 且 累计」两条件同时成立（`:221` 注释白纸黑字），
-/// 导致连续说话 >5s 不停顿时**永不派**、短句停顿**也不派** ⇒ accuracy 拿不到音频。
+/// 🔴 设计口径（Gavin 2026-09-22 原话）：**「改成只判断静默1200ms，不按时长来切片」**。
+/// 原 342-D 的 OR 口径（静默 ≥800ms **或** 未派发累计 ≥5s）已废：长度支按 DEC-077
+/// （零收益机制即移除）连根删除，`min_seg_ms` 参数与对应分支一并消失。
 ///
-/// 两条支路：
-/// - **静默支**：`silent_ms >= silence_ms` —— 一句话说完的停顿。受 `done_for_pause` 约束
-///   （同一停顿只派一次）。
-/// - **长度支**：`pending >= min_seg_ms` —— 一口气说不停顿。**不受** `done_for_pause` 约束；
-///   派发后调用方把 `acc_dispatched_end = pcm.len()`，pending 归零 ⇒ 需再攒满 `min_seg_ms`
-///   才会再次成立，**天然节流**，不会每 chunk 都派。
+/// 判据：`silent_ms >= silence_ms` 即派，受 `done_for_pause` 约束（同一停顿只派一次）。
+///
+/// 🔴 调用方传入的 `silent_ms` 必须是 **acc 专用计数器 `acc_silent_ms`**，不是显示层那个会被
+/// 标点路径在 800ms 清零的 `silent_ms`（理由见 `ACC_DISPATCH_SILENCE_MS_DEFAULT` 常量文档）。
+/// 参数名保留 `silent_ms` —— 纯函数这一层它只是「一个静默毫秒值」，语义由调用方保证。
 ///
 /// 🔴 `has_speech` 护栏（保留）：**纯静音区间不派** —— 送 accuracy 会返回空 ⇒ 上层
 /// `all_native` 翻 false ⇒ 本地档多跑一遍标点引擎（路由漂移）。
@@ -207,16 +195,11 @@ fn should_dispatch_acc(
     done_for_pause: bool,
     has_speech: bool,
     silence_ms: f32,
-    min_seg_ms: u64,
 ) -> bool {
     if !enabled || !has_speech || pending_samples == 0 {
         return false;
     }
-    if silent_ms >= silence_ms {
-        return !done_for_pause;
-    }
-    let min_samples = min_seg_ms as usize * SAMPLE_RATE as usize / 1000;
-    pending_samples >= min_samples
+    silent_ms >= silence_ms && !done_for_pause
 }
 
 /// PARALLEL-ACC-298：录音结束时是否派发尾片。
@@ -433,7 +416,7 @@ fn endpoint_action(segment_has_speech: bool, confirm_text_empty: bool) -> Endpoi
 ///   同 `config.audio.silence_threshold`）。用于**独立**统计连续静默 ≥800ms 触发显示层打点；
 ///   🔴 与 sherpa endpoint 无关，不触发 reset/切句。
 /// - `on_result`：文本变化回调，传 `(display_text, display_words)`，与 qwen 路径同构
-/// - `acc_cfg`：LOCALRT-PARALLEL-ACC-298 派发配置（`enabled`/`silence_ms`/`min_seg_ms`）；
+/// - `acc_cfg`：LOCALRT-PARALLEL-ACC-298 派发配置（`enabled`/`silence_ms`；346 起无长度支）；
 ///   `enabled=false` 时本函数**完全不派发**（逐位退回串行行为）
 /// - `on_segment`：accuracy 并行派发回调，传
 ///   `(seg_index, committed_len, 已加 padding 的 16k f32 子段列表, seg_streaming_text)`。
@@ -443,7 +426,7 @@ fn endpoint_action(segment_has_speech: bool, confirm_text_empty: bool) -> Endpoi
 ///   起的字符后缀，**按 char 切片**）—— LOCALRT-REFLOW-HOLE-344-G：worker 解出空/失败时用它
 ///   填补，避免累积 `acc_text` 留洞导致后续回灌**永久失效**。
 ///   子段列表通常 1 个；未派发区间超 20s 时由 `build_padded_segments` 硬切为多个。
-///   🔴 只在 `acc_cfg.enabled` 且满足 800ms/5s 任一 + latch 条件时被调用
+///   🔴 只在 `acc_cfg.enabled` 且静默 ≥ `acc_cfg.silence_ms`(1200ms) 且未上 latch 时被调用
 ///
 /// # 返回
 /// `(final_preview, pcm)`：
@@ -488,7 +471,12 @@ pub fn transcribe_streaming_local(
         last_punct_at: None,
     };
     // LOCALRT-PUNCT-TIMER-269-B：连续静默累计（ms）。独立于 sherpa endpoint，只驱动显示层打点。
+    // 🔴 ACC-DISPATCH-SILENCE-ONLY-346：本计数器会被**标点路径**在 800ms 打点后清零（见函数内
+    // `if silence_due { silent_ms = 0.0; }`），故 accuracy 派发**不得**复用它。
     let mut silent_ms: f32 = 0.0;
+    // ACC-DISPATCH-SILENCE-ONLY-346：accuracy 派发专用静默累计（ms）。仅与 `silent_ms` 在
+    // 「静音累加 / 语音归零」两处同步，**不被标点清零** —— 保证 1200ms 阈值可达。
+    let mut acc_silent_ms: f32 = 0.0;
 
     // LOCALRT-ENDPOINT-284（方案 B）：影子收尾（只动显示层）。
     let shadow_trigger_ms: f32 = SHADOW_FINALIZE_MS_DEFAULT;
@@ -576,8 +564,11 @@ pub fn transcribe_streaming_local(
         let chunk_rms = (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32).sqrt();
         if chunk_rms <= silence_threshold {
             silent_ms += chunk_ms;
+            // 346：acc 专用计数器同步累加（标点路径清 silent_ms 时不动它）。
+            acc_silent_ms += chunk_ms;
         } else {
             silent_ms = 0.0;
+            acc_silent_ms = 0.0;
             // LOCALRT-ENDPOINT-EMPTY-342：本句出现过有声 chunk ⇒ 后续 endpoint 是真切句。
             speech_since_last_reset = true;
             // LOCALRT-ENDPOINT-284：有新语音进来 → 允许本轮停顿结束后再触发影子。
@@ -917,19 +908,19 @@ pub fn transcribe_streaming_local(
             }
         }
 
-        // PARALLEL-ACC-298 / 342-D：**静默 ≥800ms 或 未派发 ≥5s** 任一成立即把这一段派给 accuracy。
+        // PARALLEL-ACC-298 / ACC-DISPATCH-SILENCE-ONLY-346：**静默 ≥1200ms 即把这一段派给 accuracy**。
         // 🔴 只推进 `acc_dispatched_end`，**不 reset / 不切句 / 不动 sentence_id**（与 endpoint 解耦）。
         // 复用 `build_padded_segments`：自动加 200ms 边界 padding，且 >20s 的片会硬切成多个子段
         // （native `max_total_len=512` 的硬限制，禁止整段 >20s 喂 accuracy）。
         let acc_pending = pcm.len().saturating_sub(acc_dispatched_end);
         if should_dispatch_acc(
             acc_cfg.enabled,
-            silent_ms,
+            // 346：必须用 acc 专用计数器（不被标点清零），不能用显示层 silent_ms。
+            acc_silent_ms,
             acc_pending,
             acc_done_for_pause,
             acc_pending_has_speech,
             acc_cfg.silence_ms,
-            acc_cfg.min_seg_ms,
         ) {
             let pending = pcm.len() - acc_dispatched_end;
             let raw = [(acc_dispatched_end, pending)];
@@ -939,7 +930,7 @@ pub fn transcribe_streaming_local(
                     log::debug!(
                         "[LocalRT-DBG-298] seg dispatch #{}: silence={:.0}ms seg_audio={:.2}s pcm_pos={}",
                         acc_seg_index,
-                        silent_ms,
+                        acc_silent_ms,
                         pending as f32 / SAMPLE_RATE as f32,
                         acc_dispatched_end
                     );
@@ -967,7 +958,9 @@ pub fn transcribe_streaming_local(
 
         // LOCALRT-PUNCT-TIMER-269-B：显示刷新，两条件「或」——
         //   ① 距上次打点 ≥4s（preview_display 内判 due）
-        //   ② 连续静默 ≥800ms（本处独立计数）且自上次打点后有新内容
+        //   ② 连续静默 ≥800ms（读显示层 `silent_ms`）且自上次打点后有新内容
+        //      🔴 346：本处打点后会把 `silent_ms` 清零（见下），故 accuracy 派发改用另一个
+        //      不被清零的 `acc_silent_ms`，两者**不共用**（否则 1200ms 永远到不了）。
         // 两条件都**只刷新显示**，不动状态机（不 reset / 不切句 / 不改 sentence_id）。
         // 显示基文本：影子收尾（confirmed + 影子当前句）与主 stream（confirmed + current）**取更长者**，
         // 避免新语音进来后主文本还没追上时显示瞬时缩短/闪烁。
@@ -993,7 +986,8 @@ pub fn transcribe_streaming_local(
                 shadow_fired || silence_due,
             );
             if silence_due {
-                // 打完重置静默计数；4s 计时由 preview_display 内的 last_punct_at 一并重置。
+                // 打完重置**显示层**静默计数；4s 计时由 preview_display 内的 last_punct_at 一并重置。
+                // 🔴 346：只清 `silent_ms`，**绝不动 `acc_silent_ms`**（动了 accuracy 的 1200ms 就不可达）。
                 silent_ms = 0.0;
             }
             if display != last_display {
@@ -1029,7 +1023,7 @@ pub fn transcribe_streaming_local(
     }
 
     // PARALLEL-ACC-298：尾片 —— 录音结束，把剩余未派发区间作为最后一片派给 accuracy。
-    // 短录音（总时长 < min_seg_ms）时未派发区间 = 全量 ⇒ 等价今天的「单片=全量」。
+    // 本段未在静默 1200ms 前派出的音频（含短录音全量）在此一次性交出 ⇒ 等价「单片=全量」。
     // 🔴 只有「本段出现过语音」才派（纯静音尾片会把 all_native 翻 false）；有语音的尾巴绝不吞。
     if should_dispatch_tail(
         acc_cfg.enabled,
@@ -1531,101 +1525,180 @@ mod tests {
     }
 
     // ========================================================================
-    // PARALLEL-ACC-298 · 派发触发条件纯函数
+    // PARALLEL-ACC-298 → ACC-DISPATCH-SILENCE-ONLY-346 · 派发触发条件纯函数 + 接线护栏
     //   真实 recognizer 起不来 ⇒ 把触发判据抽纯函数钉死（判据 #3）。
+    //
+    //   346 按 Gavin「只判断静默1200ms，不按时长来切片」删除长度支：
+    //   原 `acc_should_dispatch_or_semantics` 的 3s/5s 长度用例及
+    //   `acc_should_dispatch_honors_env_thresholds`（两阈值 env 早已在 320 删除，测试名已失真）
+    //   一并删除 —— 它们断言的是已按 DEC-077 移除的机制，保留会锁死一个不该存在的分支。
     // ========================================================================
 
-    /// 判据 #3-a（342-D 修订）：**静默 ≥800ms 或 未派发 ≥5s** 任一成立即派（OR，不是 AND）。
+    /// ACC-DISPATCH-SILENCE-ONLY-346：**只判静默阈值**。
+    /// 静默 <1200 不派 / ≥1200 且未上 latch 则派 / 已上 latch 不派 / 纯静音不派 /
+    /// 空区间不派 / 总开关关不派；自定义阈值传入即生效。
     #[test]
-    fn acc_should_dispatch_or_semantics() {
-        let min3s = 3000u64;
-        let three_s = 3 * SAMPLE_RATE as usize;
-        // 静默支：silent>=800 + 有语音 + 未派 ⇒ true（pending 可以远小于 min_seg）
+    fn acc346_should_dispatch_silence_only() {
+        let noise = 1usize;
+        // 静默 <1200 ⇒ 不派（哪怕区间很长：长度不再参与判据）。
+        assert!(!should_dispatch_acc(
+            true, 1199.0, noise, false, true, 1200.0
+        ));
+        // 静默 ≥1200 且未上 latch ⇒ 派。
         assert!(should_dispatch_acc(
-            true, 800.0, 1, false, true, 800.0, min3s
+            true, 1200.0, noise, false, true, 1200.0
         ));
-        // 长度支：pending>=min_seg + 有语音 ⇒ true（**即使 silent=0，连续说话**）
-        assert!(should_dispatch_acc(
-            true, 0.0, three_s, false, true, 800.0, min3s
-        ));
-        // 🔴 旧实现（AND）在此为 false 的核心场景：连续说话满 5s 不停顿
-        assert!(should_dispatch_acc(
-            true,
-            0.0,
-            three_s * 2,
-            false,
-            true,
-            800.0,
-            min3s
-        ));
-        // 两条件都不满足 ⇒ false（静默差 1ms 且区间差 1 样本）
+        // 已上 latch ⇒ 同一停顿不重复派（即使静默继续增长）。
         assert!(!should_dispatch_acc(
-            true,
-            799.0,
-            three_s - 1,
-            false,
-            true,
-            800.0,
-            min3s
+            true, 5000.0, noise, true, true, 1200.0
         ));
-        // 🔴 纯静音不派（has_speech=false），两条支都不放过。
+        // 纯静音区间不派（has_speech=false），无论静默多久。
         assert!(!should_dispatch_acc(
-            true,
-            5000.0,
-            three_s * 10,
-            false,
-            false,
-            800.0,
-            min3s
+            true, 5000.0, noise, false, false, 1200.0
         ));
-        // 静默支受 done_for_pause 约束（同一停顿只派一次）；长度支不受。
+        // 空区间不派。
+        assert!(!should_dispatch_acc(true, 5000.0, 0, false, true, 1200.0));
+        // 总开关关 ⇒ 不派。
         assert!(!should_dispatch_acc(
-            true, 5000.0, 100, true, true, 800.0, min3s
+            false, 5000.0, noise, false, true, 1200.0
         ));
-        assert!(should_dispatch_acc(
-            true, 0.0, three_s, true, true, 800.0, min3s
-        ));
-        // 总开关关 / 空区间 ⇒ false。
-        assert!(!should_dispatch_acc(
-            false,
-            5000.0,
-            three_s * 10,
-            false,
-            true,
-            800.0,
-            min3s
-        ));
-        assert!(!should_dispatch_acc(
-            true, 5000.0, 0, false, true, 800.0, min3s
-        ));
+        // 阈值参数传入即生效（400ms 阈值下 400ms 即派）。
+        assert!(should_dispatch_acc(true, 400.0, noise, false, true, 400.0));
     }
 
-    /// 判据 #3-a2：两个阈值 env 可调（传进去即生效）。
+    /// 🔴 ACC-DISPATCH-SILENCE-ONLY-346 **核心判据**：acc 计数器不被标点路径清零 ⇒ 1200ms 可达。
+    ///
+    /// 生产时序（见 `transcribe_streaming_local` 循环）：
+    ///   静音累加 → acc 检查（本函数）→ … → 标点检查（静默 ≥800 打点后 `silent_ms = 0.0`）。
+    /// 若 acc 阈值读显示层 `silent_ms`，则每 800ms 被清零 ⇒ 永远到不了 1200 ⇒ **录音中一次都不派**。
+    /// 本测试逐 chunk 模拟该时序，正/反两面各证一次。
     #[test]
-    fn acc_should_dispatch_honors_env_thresholds() {
-        // silence 调到 400：400ms 即派
-        assert!(should_dispatch_acc(
-            true, 400.0, 1, false, true, 400.0, 3000
-        ));
-        // min_seg 调到 6000：无静默时 3s 不够，6s 才够
-        assert!(!should_dispatch_acc(
-            true,
-            0.0,
-            3 * SAMPLE_RATE as usize,
-            false,
-            true,
-            800.0,
-            6000
-        ));
-        assert!(should_dispatch_acc(
-            true,
-            0.0,
-            6 * SAMPLE_RATE as usize,
-            false,
-            true,
-            800.0,
-            6000
-        ));
+    fn acc346_acc_counter_survives_punct_reset() {
+        let chunk_ms = 100.0f32;
+        let pending = SAMPLE_RATE as usize; // 有音频待派（>0）
+
+        // 正：读 acc 专用计数器（不被标点清零）⇒ 1200ms 可达并派发。
+        let mut silent_ms = 0.0f32;
+        let mut acc_silent_ms = 0.0f32;
+        let mut dispatched = false;
+        for _ in 0..20 {
+            silent_ms += chunk_ms;
+            acc_silent_ms += chunk_ms;
+            // acc 检查先于标点（与生产循环同序）。
+            if should_dispatch_acc(true, acc_silent_ms, pending, dispatched, true, 1200.0) {
+                dispatched = true;
+            }
+            // 标点路径：静默 ≥800 打点后清显示层计数器（生产 `if silence_due { silent_ms = 0.0; }`）。
+            if silent_ms >= 800.0 {
+                silent_ms = 0.0;
+            }
+        }
+        assert!(
+            dispatched,
+            "acc_silent_ms 不被标点清零 ⇒ 1200ms 必须可达（本单核心）"
+        );
+
+        // 反：误用被标点清零的 silent_ms ⇒ 永远到不了 1200（复现本单要防的坑）。
+        let mut silent_ms = 0.0f32;
+        let mut dispatched_wrong = false;
+        for _ in 0..20 {
+            silent_ms += chunk_ms;
+            if should_dispatch_acc(true, silent_ms, pending, dispatched_wrong, true, 1200.0) {
+                dispatched_wrong = true;
+            }
+            if silent_ms >= 800.0 {
+                silent_ms = 0.0;
+            }
+        }
+        assert!(
+            !dispatched_wrong,
+            "误用显示层 silent_ms 则 800ms 被清零 ⇒ 1200ms 不可达（反证）"
+        );
+    }
+
+    /// 🔴 ACC-DISPATCH-SILENCE-ONLY-346 源码级护栏：钉死「acc 派发读 `acc_silent_ms`、
+    /// 且该计数器不被标点路径清零」这一不变式。纯函数测试证不了生产接线，故读源码。
+    ///
+    /// **改错怎么红**：
+    /// - 调用点改回 `silent_ms` ⇒ 接线断言失败；
+    /// - `acc_silent_ms` 不再在静音支累加 ⇒ 「累加恰 1 处」失败；
+    /// - 在标点路径（`if silence_due`）里清 `acc_silent_ms` ⇒ 「代码行不触碰」失败。
+    #[test]
+    fn guard346_acc_counter_wiring() {
+        let lines = ls_prod_lines();
+        // 声明恰 1 处，且初值 0。
+        let decl: Vec<usize> = (0..lines.len())
+            .filter(|&i| lines[i].starts_with("let mut acc_silent_ms: f32 = 0.0;"))
+            .collect();
+        assert_eq!(
+            decl.len(),
+            1,
+            "346: acc_silent_ms 声明应恰 1 处，实测 {:?}",
+            decl
+        );
+        // 静音支同步累加恰 1 处。
+        let inc: Vec<usize> = (0..lines.len())
+            .filter(|&i| lines[i].starts_with("acc_silent_ms += chunk_ms;"))
+            .collect();
+        assert_eq!(
+            inc.len(),
+            1,
+            "346: acc_silent_ms 应在静音支恰 1 处累加，实测 {:?}",
+            inc
+        );
+        // 归零恰 1 处，且必须落在**语音支**（紧邻显示层 silent_ms 归零）。
+        let reset: Vec<usize> = (0..lines.len())
+            .filter(|&i| lines[i].starts_with("acc_silent_ms = 0.0;"))
+            .collect();
+        assert_eq!(
+            reset.len(),
+            1,
+            "346: acc_silent_ms 应恰 1 处归零（且只在语音支），实测 {:?}",
+            reset
+        );
+        let r = reset[0];
+        assert!(
+            lines[r - 1].starts_with("silent_ms = 0.0;"),
+            "346: acc_silent_ms 归零应紧邻显示层 silent_ms 归零（prev={:?}）",
+            lines[r - 1]
+        );
+        assert!(
+            lines[r + 1..(r + 4).min(lines.len())]
+                .iter()
+                .any(|l| l.starts_with("speech_since_last_reset = true;")),
+            "346: acc_silent_ms 归零必须落在语音支（后续应出现 speech_since_last_reset = true）"
+        );
+        // 🔴 标点清零块内**代码行**不得出现 acc_silent_ms（注释行不算）。
+        let sd = (0..lines.len())
+            .find(|&i| lines[i].starts_with("if silence_due {"))
+            .expect("346: 未找到标点清零块 `if silence_due {`");
+        let sd_end = sd
+            + (sd..lines.len())
+                .find(|&i| lines[i] == "}")
+                .map(|i| i - sd)
+                .expect("346: 标点清零块未闭合");
+        let n = (sd..=sd_end)
+            .filter(|&i| !lines[i].starts_with("//") && lines[i].contains("acc_silent_ms"))
+            .count();
+        assert_eq!(
+            n, 0,
+            "346: 标点路径不得触碰 acc_silent_ms（否则 1200ms 不可达），实测 {n} 处"
+        );
+        // 调用点必须传 acc_silent_ms 而非显示层 silent_ms。
+        let call = (0..lines.len())
+            .find(|&i| lines[i].starts_with("if should_dispatch_acc("))
+            .expect("346: 未找到 should_dispatch_acc 调用点");
+        let block = &lines[call..(call + 12).min(lines.len())];
+        assert!(
+            block.iter().any(|l| l.starts_with("acc_silent_ms,")),
+            "346: should_dispatch_acc 调用点必须传 `acc_silent_ms,`，实测块={:?}",
+            block
+        );
+        assert!(
+            !block.iter().any(|l| l.starts_with("silent_ms,")),
+            "346: 调用点不得再传显示层 `silent_ms,`，实测块={:?}",
+            block
+        );
     }
 
     /// 判据 #3-b：尾片判据 —— 🔴 有语音必须派（哪怕只剩 1 样本，绝不吞尾字）；
