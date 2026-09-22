@@ -112,9 +112,10 @@ fn check_accuracy_model_ready() -> AccuracyModelStatus {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("models");
     // MIGRATE-QWEN3-320：accuracy 就是 Qwen3，单一路径（原按引擎分派已删）。
-    // 🔴 src-tauri 是独立 crate，无法复用 `transcription::check_accuracy_model_ready`，
+    // 🔴 src-tauri 是独立 crate，无法复用 `transcription::QWEN3_MODEL_SUBDIR`，
     // 故此处镜像同一组文件名——两处判据必须逐字一致，否则 UI 显示「已就位」而主程序加载失败。
-    let dir = model_dir.join("sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25");
+    // MIGRATE-1.13.8-1.7B-359：随主程序同步切到 1.7B 目录名。
+    let dir = model_dir.join("sherpa-onnx-qwen3-asr-1.7B-int8-2026-09-22");
     let ready = dir.join("conv_frontend.onnx").exists()
         && dir.join("encoder.int8.onnx").exists()
         && dir.join("decoder.int8.onnx").exists()

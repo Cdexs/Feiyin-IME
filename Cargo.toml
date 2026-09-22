@@ -19,7 +19,8 @@ tokio = { version = "1", features = ["rt", "time"] }
 cpal = "0.15"
 
 # sherpa-onnx for Paraformer ASR (v0.3.2)
-sherpa-onnx = { version = "1.12", default-features = false, features = ["shared"] }
+# MIGRATE-1.13.8-1.7B-359：升 1.13.8（含 Qwen3 静音幻觉修复 #3907、centered-STFT #3873、PRNG 竞态 #3912；ORT 1.28.2）
+sherpa-onnx = { version = "1.13.8", default-features = false, features = ["shared"] }
 
 # Offline translation via CTranslate2. Tokenization stays on the Rust side.
 ctranslate2 = { version = "2.1.1", default-features = false, features = ["tokenizers"] }

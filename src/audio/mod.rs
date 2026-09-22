@@ -2438,7 +2438,7 @@ mod tests {
     /// （max_total_len=4096、max_new_tokens=256、temperature=1e-6、top_p=0.8、seed=42、hotwords=None）。
     /// 生产那份对 `audio` 模块不可见，故此处按 `src/transcription/mod.rs` 的清单复刻同一组文件与参数。
     fn gate335_qwen3_recognizer(model_root: &Path) -> sherpa_onnx::OfflineRecognizer {
-        let d = model_root.join("sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25");
+        let d = model_root.join(crate::transcription::QWEN3_MODEL_SUBDIR);
         assert!(
             d.join("conv_frontend.onnx").exists()
                 && d.join("encoder.int8.onnx").exists()

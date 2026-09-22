@@ -1,3 +1,5 @@
 [env]
 # sherpa-onnx 预编译库路径 (shared-MD 版本)
-SHERPA_ONNX_LIB_DIR = "D:\\Workspace\\CodeLab\\voice-ime\\vendor\\sherpa-onnx\\sherpa-onnx-v1.12.38-win-x64-shared-MD-Release\\lib"
+# MIGRATE-1.13.8-1.7B-359：升 1.13.8（ORT 1.28.2）。旧 1.12.38 目录保留作整批回滚备份。
+# 目录名去掉官方的 `-lib` 后缀以复用既有 .gitignore 规则（`*-Release/` 与 `*-Release.tar.bz2`）。
+SHERPA_ONNX_LIB_DIR = "D:\\Workspace\\CodeLab\\voice-ime\\vendor\\sherpa-onnx\\sherpa-onnx-v1.13.8-win-x64-shared-MD-Release\\lib"

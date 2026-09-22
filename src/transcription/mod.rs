@@ -474,6 +474,62 @@ pub(crate) fn transcribe_acc_ctx(
     Ok((text, true))
 }
 
+/// MIGRATE-1.13.8-1.7B-359：Qwen3-ASR 1.7B 的**自造语种标注前缀**是否为「标签样」。
+///
+/// 认可两种形态（355 实测 + Qwen3-ASR 官方协议）：
+/// - A. 官方：`language`（其后可跟空格/`-`/`_` + 语种名），如 `language chinese`
+/// - B. 语种名单词：**无空白、纯字母、≤8 字**，如 `汉语` / `中文` / `日本語` / `English`
+///
+/// 不认可：含空白（非 A 形态）、含标点/数字、超长 —— 防误伤正文。
+fn is_qwen3_language_label(prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return false;
+    }
+    let lower = prefix.to_ascii_lowercase();
+    if lower == "language"
+        || lower.starts_with("language ")
+        || lower.starts_with("language-")
+        || lower.starts_with("language_")
+    {
+        return true;
+    }
+    prefix.chars().count() <= 8
+        && !prefix.chars().any(char::is_whitespace)
+        && prefix.chars().all(char::is_alphabetic)
+}
+
+/// MIGRATE-1.13.8-1.7B-359：剥掉 Qwen3-ASR 1.7B **自造**的语种标注前缀（语言无关，方案 B）。
+///
+/// 355 实测形态：`language chinese<asr_text>正文`（官方）、或 `汉语<asr_text>正文`（模型自造、
+/// 语种词可为中/英/日/韩…；`language ` 段可能整个缺失）。1.12 的 C++ 只剥「以 `language ` 开头」
+/// 的形态，故非中文语种会漏到我们这 ⇒ 本函数是**语言无关的兜底**。
+///
+/// 🔴 边界（只认开头、不误伤正文）：
+/// - 必须是**开头**的 `<asr_text>`（`text.trim_start()` 之后，且其前缀段是 [`is_qwen3_language_label`] 认可的标签）；
+/// - 前缀段不得含换行、不得再含 `<`、不得含标点/数字；
+/// - 无 `<asr_text>` 或形态不符 ⇒ **原样返回**（0.6B 不吐前缀 ⇒ no-op；正文含尖括号 ⇒ 不误伤）。
+///
+/// 返回原串的切片（调用方 `to_string()`）——避免多一次分配。
+fn strip_qwen3_language_prefix(text: &str) -> &str {
+    const MARKER: &str = "<asr_text>";
+    let t = text.trim_start();
+    let Some(pos) = t.find(MARKER) else {
+        return text;
+    };
+    let prefix = &t[..pos];
+    // 🔴 `<asr_text>` 必须**紧贴**标签（真实前缀形态 `language chinese<asr_text>` / `汉语<asr_text>`
+    //    皆无尾空格）。若前一位是空白，多为正文里的「某词 空格 <asr_text>」⇒ 不剥。
+    if prefix.ends_with(char::is_whitespace)
+        || prefix.contains('\n')
+        || prefix.contains('<')
+        || !is_qwen3_language_label(prefix)
+    {
+        return text;
+    }
+    // 截到 `<asr_text>` 之后，顺带吃掉紧随的空白与常见分隔冒号。
+    t[pos + MARKER.len()..].trim_start_matches(|c: char| c.is_whitespace() || c == ':' || c == '：')
+}
+
 impl Transcriber {
     /// Create new Transcriber with explicit ASR model selection
     ///
@@ -697,7 +753,9 @@ impl Transcriber {
             result.push(chars[i]);
             i += 1;
         }
-        result
+        // MIGRATE-1.13.8-1.7B-359：<|…|> 剥完后，再剥 Qwen3-ASR 1.7B 自造的裸语种前缀
+        // （语言无关；对 0.6B / 无前缀输入是 no-op）。
+        strip_qwen3_language_prefix(&result).to_string()
     }
     /// 转录并返回标点来源标记（ASR-PUNCT-OPT-001）
     ///
@@ -1056,7 +1114,7 @@ fn hotwords_tokenizer() -> &'static Option<tokenizers::Tokenizer> {
         // **精度零损失**：两侧 vocab.json 与 merges.txt 的 sha256 **逐字节相同**
         // （ca10d7e9… / 8831e4f1…），是同一个 Qwen3 tokenizer，不是近似替代。
         let p = model_dir()
-            .join("sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25")
+            .join(QWEN3_MODEL_SUBDIR)
             .join("tokenizer")
             .join("tokenizer.json");
         let t = std::time::Instant::now();
@@ -1486,9 +1544,17 @@ pub fn model_dir() -> PathBuf {
     exe_dir.join("models")
 }
 
+/// MIGRATE-1.13.8-1.7B-359：Qwen3-ASR 模型子目录名（**唯一来源**，防多处硬编码漂移）。
+///
+/// 历史上该名字散落在 `check_qwen3_model_ready` / `hotwords_tokenizer` / 测试夹具 /
+/// `src-tauri` 镜像处；本批切 0.6B→1.7B 时收敛到本常量。
+/// 🔴 `src-tauri` 是独立 crate，**无法复用本常量**，仍须各自镜像同一字符串
+/// （那里有注释警示：两处判据必须逐字一致，否则 UI 显示「已就位」而主程序加载失败）。
+pub(crate) const QWEN3_MODEL_SUBDIR: &str = "sherpa-onnx-qwen3-asr-1.7B-int8-2026-09-22";
+
 /// MIGRATE-QWEN3-314：Qwen3-ASR 就位判据（四个路径；与 `create_qwen3_recognizer` 加载清单逐字一致）。
 fn check_qwen3_model_ready(model_dir: &Path) -> (bool, PathBuf) {
-    let dir = model_dir.join("sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25");
+    let dir = model_dir.join(QWEN3_MODEL_SUBDIR);
     let ready = dir.join("conv_frontend.onnx").exists()
         && dir.join("encoder.int8.onnx").exists()
         && dir.join("decoder.int8.onnx").exists()
@@ -1758,7 +1824,7 @@ mod tests {
     fn test_tokenizer() -> Option<tokenizers::Tokenizer> {
         let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("models")
-            .join("sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25")
+            .join(QWEN3_MODEL_SUBDIR)
             .join("tokenizer")
             .join("tokenizer.json");
         let t = std::time::Instant::now();
@@ -2357,7 +2423,7 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let q = root.join("sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25");
+        let q = root.join(QWEN3_MODEL_SUBDIR);
         std::fs::create_dir_all(q.join("tokenizer")).unwrap();
         for f in [
             "conv_frontend.onnx",
@@ -3464,5 +3530,120 @@ mod poc_qwen3_17b_351 {
                 )
             );
         }
+    }
+}
+
+// ============================================================
+// MIGRATE-1.13.8-1.7B-359：Qwen3-ASR 1.7B 语种前缀剥离（语言无关，方案 B）
+// 运行：cargo test --bin feiyin-ime -- strip_lang_prefix
+// ============================================================
+#[cfg(test)]
+mod strip_lang_prefix_359_tests {
+    use super::{strip_qwen3_language_prefix, Transcriber};
+
+    /// 🔴 核心：各语种前缀都能剥（语言无关，不只 chinese）。
+    #[test]
+    fn strips_all_language_prefixes() {
+        // 官方形态 language <X><asr_text>
+        assert_eq!(
+            strip_qwen3_language_prefix("language chinese<asr_text>今天天气不错"),
+            "今天天气不错"
+        );
+        assert_eq!(
+            strip_qwen3_language_prefix("language english<asr_text>hello world"),
+            "hello world"
+        );
+        assert_eq!(
+            strip_qwen3_language_prefix("language japanese<asr_text>こんにちは"),
+            "こんにちは"
+        );
+        // 模型自造的中文语种词（355 实测：韩语音频被标成「汉语」）
+        assert_eq!(
+            strip_qwen3_language_prefix("汉语<asr_text>그는 괜찮은 척"),
+            "그는 괜찮은 척"
+        );
+        assert_eq!(strip_qwen3_language_prefix("中文<asr_text>你好"), "你好");
+        assert_eq!(
+            strip_qwen3_language_prefix("日本語<asr_text>こんにちは"),
+            "こんにちは"
+        );
+        assert_eq!(strip_qwen3_language_prefix("English<asr_text>hi"), "hi");
+        // 前缀后带空白（分隔）——标记紧贴标签
+        assert_eq!(
+            strip_qwen3_language_prefix("language chinese<asr_text> 你好"),
+            "你好"
+        );
+    }
+
+    /// 🔴 无前缀 ⇒ 原样返回（证明对 0.6B 零影响：0.6B 不吐前缀）。
+    #[test]
+    fn no_prefix_returns_unchanged() {
+        for t in [
+            "今天天气不错。",
+            "hello world",
+            "그는 괜찮은 척 하려고 애쓰는 것 같았다.",
+            "",
+            " 前后带空白 ",
+        ] {
+            assert_eq!(
+                strip_qwen3_language_prefix(t),
+                t,
+                "无前缀必须原样返回：{t:?}"
+            );
+        }
+    }
+
+    /// 🔴 退化用例：正文含 `<` / `asr_text` / `<asr_text>` 但不应误伤（前缀非标签样）。
+    #[test]
+    fn degenerate_does_not_harm_body() {
+        // 含尖括号但无 <asr_text> ⇒ 不变
+        assert_eq!(
+            strip_qwen3_language_prefix("小于号 < 和大于号 >"),
+            "小于号 < 和大于号 >"
+        );
+        // 含 asr_text 字样但无 <> 标记 ⇒ 不变
+        assert_eq!(
+            strip_qwen3_language_prefix("变量 asr_text 的值"),
+            "变量 asr_text 的值"
+        );
+        // 前缀含标点（非标签样）⇒ 不变
+        assert_eq!(
+            strip_qwen3_language_prefix("句子：<asr_text>正文"),
+            "句子：<asr_text>正文"
+        );
+        // 前缀含空白但不是 language 形态 ⇒ 不变
+        assert_eq!(
+            strip_qwen3_language_prefix("我说 <asr_text> 然后"),
+            "我说 <asr_text> 然后"
+        );
+        // 前缀超长（> 8 字且非 language）⇒ 不变
+        assert_eq!(
+            strip_qwen3_language_prefix("这是一段很长的中文内容哦<asr_text>正文"),
+            "这是一段很长的中文内容哦<asr_text>正文"
+        );
+        // `<asr_text>` 出现在正文靠后（非开头）⇒ prefix 非标签样或超长 ⇒ 不变
+        assert_eq!(
+            strip_qwen3_language_prefix("今天天气不错我说了这么一段话然后<asr_text>标记"),
+            "今天天气不错我说了这么一段话然后<asr_text>标记"
+        );
+    }
+
+    /// 端到端：并入 `strip_asr_special_tokens` 后，<|…|> 与裸前缀一起被剥。
+    #[test]
+    fn via_strip_asr_special_tokens() {
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("language chinese<asr_text><|zh|>你好"),
+            "你好"
+        );
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("汉语<asr_text><|nospeech|>안녕"),
+            "안녕"
+        );
+        // 无前缀（0.6B 形态）⇒ 与旧行为一致
+        assert_eq!(Transcriber::strip_asr_special_tokens("<|zh|>你好"), "你好");
+        assert_eq!(
+            Transcriber::strip_asr_special_tokens("今天天气不错。"),
+            "今天天气不错。"
+        );
     }
 }
