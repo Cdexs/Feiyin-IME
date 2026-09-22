@@ -1390,7 +1390,19 @@ fn create_sensevoice_recognizer(
 ///   不把词库塞进 config —— 避免 config 与 per-stream 两套并存，后面还要拆。
 fn create_qwen3_recognizer(model_dir: &Path) -> Result<sherpa_onnx::OfflineRecognizer> {
     let model_dir_path = ensure_qwen3_model(model_dir)?;
+    create_qwen3_recognizer_at(&model_dir_path)
+}
 
+/// POC-QWEN3-1.7B-351：按**物理模型目录**建 Qwen3 recognizer（`create_qwen3_recognizer` 的
+/// 底座抽取，**零行为变更提取**）。
+///
+/// 分工：`create_qwen3_recognizer` 负责「解析出模型物理目录」（经 `ensure_qwen3_model`，其中含
+/// 硬编码子目录名）；本函数只负责「给定物理目录 → 按生产字段建 recognizer」。
+/// 抽取目的：让需要**显式指定模型目录**的调用方（如 POC-QWEN3-1.7B-351 用
+/// `models/…-1.7B-…/`）复用同一条生产配置链，而不是自己手搓 recognizer 配置
+/// （`[POC-BYPASSES-PROD-WRAPPER-001]`）。
+/// 🔴 本函数不含任何子目录解析逻辑，也不改 `check_qwen3_model_ready` 的硬编码目录名。
+fn create_qwen3_recognizer_at(model_dir_path: &Path) -> Result<sherpa_onnx::OfflineRecognizer> {
     let conv = model_dir_path.join("conv_frontend.onnx");
     let enc = model_dir_path.join("encoder.int8.onnx");
     let dec = model_dir_path.join("decoder.int8.onnx");
