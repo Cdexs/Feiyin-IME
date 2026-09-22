@@ -19,6 +19,14 @@
 - **Gavin 端测六条**：①核心=预览标点不打句中 ②⚠️已知代价：长不停顿说话预览持续无标点（到期 1200ms 才打）——请明确能否接受 ③350 最终标点无 `。。` ④在线 realtime / 本地 performance 两档标点须与上版完全一致 ⑤346 `[LocalRT-DBG-298] seg dispatch` 的 `silence=` 恒 ≥1200ms ⑥不得新增 `target/release/crash.json`。
 - **红线**：版本由主控升未动 / 未改生产代码 / 未 push / 未 `cargo clean` / 未动 `models/…-1.7B-…`（2.2GiB）/ 零凭证。
 
+## 2026-09-22 — coder-1 — UNWIRE-STRIP-NODE-365（365+366 收口）✅ 交付
+
+- **365 条件挂载**：350「剥光标点重打」节点**路B 主路径摘除、降级分支仍挂**（保留代码）。`main.rs`：`b_strip_enabled = path_b_text.is_none() && config.punctuation.enabled && !start.translate`，调用 `strip_punctuation_node(normalized, b_strip_enabled)`；注释记录 何时/为何摘、为何留降级分支、何时整体回挂、334 由 `!native_punctuated` 门兜住。源码级顺序护栏 `sync352-4` 仅同步锚点、语义不变。
+- **366 三件全不做**：🥇 满核**实测负收益**（16 vs 8：20s 慢 1.73×、56s 慢 1.79×）⇒ 取消；② 取消路A 在飞会丢降级 fallback ⇒ 不做；③ 路B 无中断 API ⇒ 不做。
+- **366 PoC 保留为证据**：`make_qwen3_threads` + `#[ignore] poc_366_threads`；`default_acc_num_threads` 注释补「min(cores,8)=实测最优、别调高」。
+- **验证**：`cargo build --release` EXIT 0（构建前 kill 占用 exe 的残留 `feiyin-ime` PID 12220）；全量 `cargo test --no-fail-fast` 0 failed（1363P/28I）；350 七单测 + sync352 护栏全绿；warnings 98/89 基线；numstat==-w。未碰 `local_stream.rs`。
+- **未出包**（DEC-079）；未改版本；未 push；零凭证。
+
 ## 2026-09-22 — coder-1 — DUAL-PATH-REFINE-364 ✅ 交付（录音上限 180s + 预算精确计算）
 
 - **Gavin**：批准「估算→精确计算、缩小余量」；录音上限 300→180s。

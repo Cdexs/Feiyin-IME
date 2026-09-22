@@ -8511,28 +8511,27 @@ fn spawn_worker_thread(
                                 final_src,
                                 config.audio.chinese_script,
                             );
-                            // PUNCT-FINAL-REDO-350：**仅本地 realtime** 在此串接「标点剥离节点」
-                            // （Gavin 2026-09-22；节点谁要谁挂，DEC-066）。剥光后交给下游既有标点
-                            // 节点全量重打 —— 见本文件 `strip_punctuation_node`。
-                            //
-                            // 🔴 门 = `punctuation.enabled && !translate_requested`：
-                            //  - 必须 `!translate_requested`：翻译路径下游 `apply_local_punctuation`
-                            //    被 `translate_requested` 挡住、**不会**重打标点；若此时剥光，
-                            //    标点就只能靠翻译引擎给，风险实 ⇒ 翻译时**整段跳过**本节点。
-                            //  - `llm_handled` 在接线点读不到（在 run_pipeline_core 内、LLM 调用后才定）。
-                            //    核实结论：LLM 路径下剥光文本只是 **LLM 的输入**，LLM 自行输出带标点
-                            //    结果、`llm_handled` 分支保留其标点 ⇒ 无害（详见 result.md）。
-                            //  - `punctuation.enabled=false`：本节点无意义（下游 L2 会全文剥）。
-                            //
-                            // 剥光后 `native_punctuated` 恒 false ⇒ 下游 `!native_punctuated` 门
-                            // 自己放行做全量重打；334 的「已带标点则跳过」门**一行未改**，
-                            // 仍原样保护在线 realtime 与本地离线两档。
-                            // 先剥光 ⇒ 进引擎文本无标点 ⇒ 不可能再叠加 `。。`/`，。`。
-                            let stripped = strip_punctuation_node(
-                                normalized,
-                                config.punctuation.enabled
-                                    && !start.translate.load(Ordering::Acquire),
-                            );
+                            // ── PUNCT-FINAL-REDO-350 节点（重打前先剥光标点）──
+                            // 🔴 UNWIRE-STRIP-NODE-365（2026-09-22）：**该节点已从「路B 主路径」摘除**，
+                            //    但**降级分支仍挂**（条件挂载，非删代码）。
+                            //  · 何时摘：365。路B（363）落地后，最终文本由**全量音频一次解出**、
+                            //    不再多片拼装 ⇒ **无拼接接缝 ⇒ 350 的前提（接缝处标点乱）消失**，
+                            //    再剥光重打属多余处理，还可能把模型本已全局一致的好标点打坏。
+                            //  · 为何保留降级分支：若预算不足**降级回「多片拼装」**（`path_b_text` 为 None），
+                            //    接缝标点问题**会回来** ⇒ 此时仍按 350 剥光重打。
+                            //  · 何时整体回挂：若未来最终文本来源又改回「多片拼装」（无路B），
+                            //    把 `b_strip_enabled` 恢复为 `config.punctuation.enabled && !translate` 即可
+                            //    （节点代码、7 条单测、源码级顺序护栏均原样保留，随时可挂回）。
+                            //  · 原门保留：`punctuation.enabled && !translate`（翻译路径下游
+                            //    `apply_local_punctuation` 被 `translate_requested` 挡住 ⇒ 剥光补不回）；
+                            //    `llm_handled` 接线点读不到，核实为无害（LLM 输入剥光、其输出自带标点）。
+                            // 🔴 334 老 bug 不复发：`apply_local_punctuation` 的 `!native_punctuated` 门**仍在**
+                            //    （334 防的是「对已带标点文本再打一遍 ⇒ 。。 叠加」）。本节点摘下后，
+                            //    路B 全量文本 `native_punctuated=true` ⇒ 引擎跳过、保留模型标点，天然免疫。
+                            let b_strip_enabled = path_b_text.is_none()
+                                && config.punctuation.enabled
+                                && !start.translate.load(Ordering::Acquire);
+                            let stripped = strip_punctuation_node(normalized, b_strip_enabled);
                             // PUNCT-DOUBLE-334：第二元 = 「文本**实际**是否已有有效标点」（DEC-047 口径，
                             // 与 :9855 的 Qwen3 分支同一 detector），**不是**「各分片是否都解码成功」。
                             // 旧值 `acc_all_native` 语义错配：任一片失败 ⇒ 误判「无标点」⇒ 对已带标点全文
@@ -15460,10 +15459,15 @@ mod sync352_punct_node_guard_tests {
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).to_string()
     }
 
-    /// sync352-4：节点唯一挂载 + 门含 `config.punctuation.enabled` 与 `!start.translate`。
+    /// sync352-4：节点唯一挂载 + 门含 `punctuation.enabled` / `!start.translate`
+    /// （+ 365 新增 `path_b_text.is_none()`）。
     ///
     /// **防的退化**：a. 把节点也挂到在线 realtime / 本地离线档（Gavin 红线：只动本地 realtime）；
     /// b. 丢掉 `!translate_requested` 门 ⇒ 翻译路径被剥光后无节点重打 ⇒ 标点丢失。
+    ///
+    /// 🔴 锚点同步（365，2026-09-22）：门由「调用实参内联表达式」改为「先算的 `b_strip_enabled`」
+    /// （条件挂载：路B 成功即摘、降级才挂）。**断言语义不变** —— 仍是「本地 realtime 唯一挂载、
+    /// 门含 `punctuation.enabled` + `!translate`」，另按 365 新增 `path_b_text.is_none()` 一项。
     #[test]
     fn sync352_node_wired_once_with_translate_gate() {
         let s = main_src();
@@ -15481,14 +15485,27 @@ mod sync352_punct_node_guard_tests {
             "剥离节点必须恰好挂载一次（只本地 realtime 一条管线；Gavin 红线）"
         );
         let at = mounts[0];
-        let window = &s[at..(at + 400).min(s.len())];
+        let window = &s[at..(at + 200).min(s.len())];
         assert!(
-            window.contains("config.punctuation.enabled"),
+            window.contains("b_strip_enabled"),
+            "365：调用点必须传门变量 `b_strip_enabled`"
+        );
+        // 门变量定义必须含三项。
+        let def_at = s
+            .find(concat!("let b_strip_enabled", " ="))
+            .expect("365 门变量 `b_strip_enabled` 定义必须存在");
+        let def = &s[def_at..(def_at + 260).min(s.len())];
+        assert!(
+            def.contains("config.punctuation.enabled"),
             "节点门必须含 `config.punctuation.enabled`（关标点时本节点无意义）"
         );
         assert!(
-            window.contains("!start.translate"),
+            def.contains("!start.translate"),
             "节点门必须含 `!start.translate`（翻译路径下游不重打标点，剥光会丢标点）"
+        );
+        assert!(
+            def.contains("path_b_text.is_none()"),
+            "365：门必须含 `path_b_text.is_none()`（路B 成功即摘节点、降级才挂）"
         );
     }
 
@@ -15522,9 +15539,9 @@ mod sync352_punct_node_guard_tests {
 
     /// sync352-6：门关（`enabled=false`）⇒ 逐字返回原文（含空串）。
     ///
-    /// 本条**同时覆盖「`translate_requested=true`」分支**：调用点的门是
-    /// `enabled && !start.translate`，翻译时 `enabled` 实参为 false ⇒ 走的就是本分支
-    /// （由 sync352-4 的 `!start.translate` 结构断言绑定）。
+    /// 本条**同时覆盖「`translate_requested=true`」分支**：调用点的门是 `b_strip_enabled`
+    /// （`path_b_text.is_none() && punctuation.enabled && !start.translate`，见 sync352-4），
+    /// 翻译时 `!start.translate` 为 false ⇒ 实参 false ⇒ 走的就是本分支。
     /// **防的退化**：门关时仍动手（用户关标点 / 走翻译却看到文本被改）。
     #[test]
     fn sync352_gate_off_returns_verbatim() {

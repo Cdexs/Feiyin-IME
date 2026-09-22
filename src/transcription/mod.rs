@@ -117,6 +117,11 @@ impl AsrModel {
 
 /// accuracy 侧解码线程数（**唯一来源，无 env**）：`min(逻辑核数, 8)`
 /// （RESEARCH-ACC-LATENCY-271 实测最优；取不到兜底 4）。
+///
+/// 🔴 **`min(cores, 8)` 不是保守取值，是实测最优 —— 别想当然调高到满核。**
+/// 366（2026-09-22）实测对照：同音频同参数，16 线程比 8 线程 **20s 慢 1.73×、56s 慢 1.79×**
+/// （16 核机）。自回归解码**逐 token 串行**、受**内存带宽**限制，加线程只在算子内并行，
+/// 反而造成线程争抢 ⇒ 越加越慢。证据：`poc_366_threads`（`#[ignore]`）。
 fn default_acc_num_threads() -> i32 {
     std::thread::available_parallelism()
         .map(|n| n.get().min(8) as i32)
@@ -1246,6 +1251,135 @@ pub(crate) fn path_b_budget_ok(
         + PATH_B_GEN_RESERVE
         + PATH_B_SAFETY_MARGIN
         <= PATH_B_MAX_TOTAL_LEN
+}
+
+// ============================================================
+// SLIDING-WINDOW-367：滑动窗口组窗 + 对齐合并（纯函数，可单测）
+// ============================================================
+
+/// 滑动窗口最多纳入的片数：**当前片 + 前 3 片**（Gavin 定）。
+pub(crate) const WINDOW_MAX_SLICES: usize = 4;
+/// 窗口音频时长上限（秒）。单片仍超此值 ⇒ 直接单片组窗（不切分）。
+pub(crate) const WINDOW_MAX_SECS: f32 = 12.0;
+
+/// SLIDING-WINDOW-367 ①：组窗起点（返回 `slices` 的起始索引；选中 `slices[start..]`）。
+///
+/// 规则（Gavin 定）：取「当前片 + 前 1~3 片」；若合计 > [`WINDOW_MAX_SECS`]，
+/// **从最远开始逐片丢**（前3 → 前2 → 前1），每丢一片重判；丢到只剩当前片仍超 ⇒ 直接单片组窗。
+///
+/// `durations_secs` 按**时间顺序**（最后一个是当前片）。
+pub(crate) fn group_window_start_secs(durations_secs: &[f32], max_secs: f32) -> usize {
+    let n = durations_secs.len();
+    if n == 0 {
+        return 0;
+    }
+    let mut start = n.saturating_sub(WINDOW_MAX_SLICES);
+    while start + 1 < n {
+        let sum: f32 = durations_secs[start..].iter().sum();
+        if sum <= max_secs {
+            break;
+        }
+        start += 1; // 丢最远一片
+    }
+    start
+}
+
+/// 对齐/合并时忽略的字符：空白与标点（标点抖动不该影响「哪些字重叠」的判定）。
+fn align_keep_char(c: char) -> bool {
+    !c.is_whitespace() && !crate::punctuation::PUNCT_CHARS.contains(&c)
+}
+
+/// 重叠区允许的最大编辑距离比例（质量门）。> 此值视为「模型大幅改写」⇒ 不滑动。
+/// 推导：361 实测模型重解是**局部纠错**（个别字，如「二比零→二比一」），重叠区若大幅改写
+/// 说明两窗已非同段 ⇒ 宁可不更新，绝不错位。取 15% 给局部纠错留余量、又不放到误对齐。
+pub(crate) const ALIGN_MAX_EDIT_RATIO: f32 = 0.15;
+/// 重叠有效字符数下限（长度门）。
+pub(crate) const ALIGN_MIN_OVERLAP_CHARS: usize = 8;
+/// 重叠相对「新窗有效字」的比例下限（长度门）。
+pub(crate) const ALIGN_MIN_OVERLAP_RATIO: f32 = 0.30;
+
+/// 对齐结果。
+pub(crate) struct AlignResult {
+    /// `prev` 中**可定稿**的前缀（原文，含标点）；空 = 不滑动。
+    pub committed_prefix: String,
+    /// 重叠的**有效字符**数（去标点/空白）。
+    pub overlap_chars: usize,
+    /// 是否同时满足「长度门 + 质量门」⇒ 允许滑动定稿。
+    pub ok: bool,
+}
+
+fn edit_distance_chars(a: &[char], b: &[char]) -> usize {
+    let (m, n) = (a.len(), b.len());
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+    let mut prev: Vec<usize> = (0..=n).collect();
+    for i in 1..=m {
+        let mut cur = vec![i; n + 1];
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        prev = cur;
+    }
+    prev[n]
+}
+
+/// SLIDING-WINDOW-367 ④：滑动对齐 —— 找 `prev` 的后缀与 `new` 的前缀的最长**可接受**重叠
+/// （按去标点/空白后的内容比对；容许 [`ALIGN_MAX_EDIT_RATIO`] 内的编辑距离以吸收局部纠错）。
+///
+/// 🔴 **滑动需同时满足两条件**：
+/// 1. **长度门**：`overlap ≥ max(ALIGN_MIN_OVERLAP_CHARS, new有效字 × ALIGN_MIN_OVERLAP_RATIO)`；
+/// 2. **质量门**：重叠区 `编辑距离 / overlap ≤ ALIGN_MAX_EDIT_RATIO`。
+/// 两者都满足才返回 `ok=true`；否则 `ok=false`（调用方**不滑动、不定稿**，保持上一次结果）。
+pub(crate) fn align_overlap(prev: &str, new: &str) -> AlignResult {
+    let prev_keep: Vec<(usize, char)> = prev
+        .char_indices()
+        .filter(|(_, c)| align_keep_char(*c))
+        .collect();
+    let new_keep: Vec<char> = new.chars().filter(|c| align_keep_char(*c)).collect();
+    if prev_keep.is_empty() || new_keep.is_empty() {
+        return AlignResult {
+            committed_prefix: String::new(),
+            overlap_chars: 0,
+            ok: false,
+        };
+    }
+    let max_k = prev_keep.len().min(new_keep.len());
+    let min_len = ALIGN_MIN_OVERLAP_CHARS
+        .max((new_keep.len() as f32 * ALIGN_MIN_OVERLAP_RATIO).ceil() as usize);
+    if max_k < min_len {
+        return AlignResult {
+            committed_prefix: String::new(),
+            overlap_chars: 0,
+            ok: false,
+        };
+    }
+    // 从最长重叠往短找，取第一个质量合格者（长重叠优先 ⇒ 边界更靠前、更稳）。
+    for k in (min_len..=max_k).rev() {
+        let p_tail: Vec<char> = prev_keep[prev_keep.len() - k..]
+            .iter()
+            .map(|(_, c)| *c)
+            .collect();
+        let dist = edit_distance_chars(&p_tail, &new_keep[..k]);
+        let ratio = dist as f32 / k as f32;
+        if ratio <= ALIGN_MAX_EDIT_RATIO {
+            let cut_byte = prev_keep[prev_keep.len() - k].0;
+            return AlignResult {
+                committed_prefix: prev[..cut_byte].to_string(),
+                overlap_chars: k,
+                ok: true,
+            };
+        }
+    }
+    AlignResult {
+        committed_prefix: String::new(),
+        overlap_chars: 0,
+        ok: false,
+    }
 }
 
 /// ASR-ACC-OPT-001 方案 A：判定词条是否为纯 ASCII（纯英文/数字）。
@@ -3259,6 +3393,66 @@ mod poc_qwen3_17b_351 {
         sherpa_onnx::OfflineRecognizer::create(&cfg).expect("create qwen3")
     }
 
+    // ---- 366-🥇：8 线程 vs 满核 实测对照（临时 recognizer，不改生产）----
+    fn make_qwen3_threads(dir: &Path, num_threads: i32) -> sherpa_onnx::OfflineRecognizer {
+        let cfg = sherpa_onnx::OfflineRecognizerConfig {
+            model_config: sherpa_onnx::OfflineModelConfig {
+                num_threads,
+                provider: Some("cpu".to_string()),
+                qwen3_asr: sherpa_onnx::OfflineQwen3ASRModelConfig {
+                    conv_frontend: Some(
+                        dir.join("conv_frontend.onnx")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    encoder: Some(dir.join("encoder.int8.onnx").to_string_lossy().into_owned()),
+                    decoder: Some(dir.join("decoder.int8.onnx").to_string_lossy().into_owned()),
+                    tokenizer: Some(dir.join("tokenizer").to_string_lossy().into_owned()),
+                    max_total_len: 4096,
+                    max_new_tokens: 256,
+                    temperature: 1e-6,
+                    top_p: 0.8,
+                    seed: 42,
+                    hotwords: None,
+                },
+                tokens: Some(String::new()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        sherpa_onnx::OfflineRecognizer::create(&cfg).expect("create qwen3")
+    }
+
+    #[test]
+    #[ignore = "PoC: cargo test --bin feiyin-ime -- --ignored --nocapture poc_366_threads"]
+    fn poc_366_threads() {
+        let root = manifest_dir();
+        let dir = root.join("models/sherpa-onnx-qwen3-asr-1.7B-int8-2026-09-22");
+        let (fs, rate) = read_wav(&root, "collab/research/audio-real-gavin/processed/full.wav");
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0);
+        println!(
+            "POC366 cores={} default_threads={}",
+            cores,
+            default_acc_num_threads()
+        );
+        for secs in [20usize, 56] {
+            let n = (rate * secs).min(fs.len());
+            for threads in [8i32, cores as i32] {
+                let rec = make_qwen3_threads(&dir, threads);
+                // 预热一次（首次分配/池创建不计入对照）
+                let _ = decode_full_result(&rec, &fs[..(rate * 5).min(fs.len())], rate as i32);
+                let (r, ms) = decode_full_result(&rec, &fs[..n], rate as i32);
+                println!(
+                    "POC366 secs={secs} threads={threads} decode={ms:.0}ms chars={}",
+                    r.text.chars().count()
+                );
+                drop(rec);
+            }
+        }
+    }
+
     fn raw_decode(
         rec: &sherpa_onnx::OfflineRecognizer,
         samples: &[f32],
@@ -3852,11 +4046,99 @@ mod strip_lang_prefix_359_tests {
 }
 
 // ============================================================
-// DUAL-PATH-REFINE-364：路B 预算闸门单测（精确计算版）
-// 运行：cargo test --bin feiyin-ime -- path_b_budget
+// SLIDING-WINDOW-367：组窗（①）+ 对齐合并（④）单测
+// 运行：cargo test --bin feiyin-ime -- sliding_window_367
 // ============================================================
 #[cfg(test)]
+mod sliding_window_367_tests {
+    use super::{align_overlap, group_window_start_secs, WINDOW_MAX_SECS};
+
+    // ---- ① 组窗 ----
+    #[test]
+    fn window_keeps_up_to_current_plus_three() {
+        // 4 片之和 ≤12 ⇒ 全取（起点 0）
+        assert_eq!(
+            group_window_start_secs(&[3.0, 3.0, 3.0, 3.0], WINDOW_MAX_SECS),
+            0
+        );
+        // 5 片 ⇒ 最多当前+前3（起点 1）
+        assert_eq!(
+            group_window_start_secs(&[1.0, 1.0, 1.0, 1.0, 1.0], WINDOW_MAX_SECS),
+            1
+        );
+    }
+
+    #[test]
+    fn window_drops_oldest_until_within_limit() {
+        // [4,4,4,4]=16>12 ⇒ 丢最远 → [4,4,4]=12 ⇒ 起点 1
+        assert_eq!(
+            group_window_start_secs(&[4.0, 4.0, 4.0, 4.0], WINDOW_MAX_SECS),
+            1
+        );
+        // [5,5,5,5]=20>12 ⇒ 丢到 [5,5,5]=15>12 ⇒ [5,5]=10 ⇒ 起点 2
+        assert_eq!(
+            group_window_start_secs(&[5.0, 5.0, 5.0, 5.0], WINDOW_MAX_SECS),
+            2
+        );
+    }
+
+    #[test]
+    fn window_single_slice_over_limit_is_kept() {
+        // 单片 13s > 12 ⇒ 不切分、直接单片（起点 0，n=1）
+        assert_eq!(group_window_start_secs(&[13.0], WINDOW_MAX_SECS), 0);
+        // 当前片 20s + 前片 1s：丢前片后仍 >12 ⇒ 只剩当前片（起点 1）
+        assert_eq!(group_window_start_secs(&[1.0, 20.0], WINDOW_MAX_SECS), 1);
+    }
+
+    #[test]
+    fn window_empty() {
+        assert_eq!(group_window_start_secs(&[], WINDOW_MAX_SECS), 0);
+    }
+
+    // ---- ④ 对齐合并 ----
+    #[test]
+    fn align_normal_overlap_commits_the_slid_out_prefix() {
+        // prev 后缀 = new 前缀「甲乙丙丁戊己庚辛壬癸」(10 字)
+        let prev = "第一段滑出内容甲乙丙丁戊己庚辛壬癸";
+        let new = "甲乙丙丁戊己庚辛壬癸然后是新片内容";
+        let r = align_overlap(prev, new);
+        assert!(r.ok, "正常重叠应可滑动");
+        assert_eq!(r.overlap_chars, 10);
+        assert_eq!(r.committed_prefix, "第一段滑出内容", "滑出片文本应定稿");
+    }
+
+    #[test]
+    fn align_tolerates_local_revision() {
+        // 重叠区 10 字里有 1 字不同（局部纠错）⇒ 编辑距离比 0.1 ≤ 0.15 ⇒ 仍可滑动
+        let prev = "前缀滑出甲乙丙丁戊己庚辛壬癸";
+        let new = "甲乙丙丁戊己庚辛壬X后续";
+        let r = align_overlap(prev, new);
+        assert!(r.ok, "15% 内局部纠错应容忍");
+        assert_eq!(r.overlap_chars, 10);
+    }
+
+    #[test]
+    fn align_no_overlap_is_conservative() {
+        // 无足够重叠（<8 且 <30%）⇒ 不滑动
+        let r = align_overlap("完全不同的第一段文字", "毫不相干的新窗口文本");
+        assert!(!r.ok, "无重叠必须保守不滑动");
+        assert!(r.committed_prefix.is_empty());
+    }
+
+    #[test]
+    fn align_short_text_below_min_length_is_conservative() {
+        // 重叠只有 3 字（<8）⇒ 即使完全相同也不滑动
+        let r = align_overlap("滑出甲乙丙", "甲乙丙后续");
+        assert!(!r.ok, "短文本低于长度门必须保守");
+    }
+}
+
+#[cfg(test)]
 mod path_b_budget_364_tests {
+    // ============================================================
+    // DUAL-PATH-REFINE-364：路B 预算闸门单测（精确计算版）
+    // 运行：cargo test --bin feiyin-ime -- path_b_budget
+    // ============================================================
     use super::{estimate_inject_tokens, expected_audio_tokens, path_b_budget_ok};
 
     /// 精确音频 token：20s→260（=13.0 tok/s 实测）、180s→2340。

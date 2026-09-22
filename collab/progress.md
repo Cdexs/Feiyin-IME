@@ -1,4 +1,10 @@
 
+### 2026-09-22 · UNWIRE-STRIP-NODE-365（365+366 收口）交付
+
+- 350 剥离节点从路B 主路径摘除、降级分支仍挂（条件挂载 `b_strip_enabled`）；代码/7 单测/护栏保留可回挂；sync352-4 锚点同步、语义不变。
+- 366 三件全不做（🥇 满核实测负收益 16 vs 8 慢 1.73×/1.79×；② 取消路A 丢 fallback；③ 无中断 API）；366 PoC 保留为证据，`default_acc_num_threads` 注释写明「8 是实测最优」。
+- 验证：release EXIT 0；全量 cargo test 0 failed（1363P）；warnings 98/89；numstat==-w。未出包。
+
 ### 2026-09-22 · DUAL-PATH-REFINE-364 交付（录音上限 180s + 预算精确计算）
 
 - 录音上限 `MAX_RECORD_SECONDS` 300→**180**（含断言/文案/注释连带）。
