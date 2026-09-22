@@ -4210,7 +4210,10 @@ mod sliding_window_367_tests {
     fn ordered_reflow_holds_until_gap_filled() {
         let mut o = OrderedReflow::new();
         assert_eq!(o.push(0, "A".to_string()).len(), 1);
-        assert!(o.push(2, "C".to_string()).is_empty(), "缺 seq1 ⇒ seq2 不得定稿");
+        assert!(
+            o.push(2, "C".to_string()).is_empty(),
+            "缺 seq1 ⇒ seq2 不得定稿"
+        );
         assert_eq!(
             o.push(1, "B".to_string()).len(),
             2,
