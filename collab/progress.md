@@ -1,4 +1,12 @@
 
+### 2026-09-22 · POC-TIMESTAMP-DECODE-CURVE-361 交付（RP-1 时间戳不填值；decode 线性、无增量复用）
+
+- 纯 PoC 零生产代码。
+- **RP-1 失败**：Qwen3 1.7B `timestamps`/`durations` 均 `Some(len=0)`（tokens 有 61）⇒ 不填值 ⇒ RP-2 路断。
+- **RP-3①**：decode 开销随长度近似线性（1s 691ms → 20s 6633ms → 56s 22885ms，斜率≈0.41 s/s）⇒ 每次从头解、无增量复用 ⇒ 累积重识别须窗口封顶。
+- **前文改写**：同前缀重复解稳定；增长时前文被改（二比零→二比一）⇒ 豆包式回改文字层存在。
+- 结果入 `collab/research/qwen3-1.7b-capability-roadmap.md`；PoC `d7650b3`（纯测试）。未改生产代码/未改版本/未 push。
+
 ### 2026-09-22 · MIGRATE-1.13.8-1.7B-359 交付（升库+换 1.7B+剥前缀，一批到位）
 
 - Gavin 拍板不分两批：升 sherpa 1.13.8 + 换 Qwen3 1.7B + 应用层剥前缀（方案 B，语言无关）；回滚整批一起回。
