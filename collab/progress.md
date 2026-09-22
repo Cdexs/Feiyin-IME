@@ -1,4 +1,11 @@
 
+### 2026-09-22 · PUNCT-FINAL-REDO-350 交付（标点剥离独立节点，只挂本地 realtime）
+
+- Gavin 要求：本地 realtime 最终 acc 文本先剥光已有标点、再整段重打，避免分片接缝处标点乱打、破坏语义连续性；**其余管线不能动**（在线 ASR 标点可能更准）。
+- 落地为**独立节点** `strip_punctuation_node`（照 `apply_filler_strip` 形态），只挂本地 realtime 自有编排块；剥光后 `native_punctuated` 恒 false ⇒ 下游既有 `apply_local_punctuation` 门自动放行整段重打。
+- 共享代码零 diff（`apply_local_punctuation` 与 HEAD md5 相同、`run_pipeline_core` 签名未动）⇒ 其余两档结构上不可能受影响（DEC-066）。验证全绿（fmt / check 0 error / warnings 99/90 / numstat==-w / 全量 cargo test 0 failed）。
+- 版本仍 0.9.3；未出包、未 commit。等 Gavin 端测本地 realtime 实机效果。
+
 ### 2026-09-21 · BUILD-321 端测复盘与处置
 
 - 六条端测问题全部定性：2 条已修（⑤护栏、⑥无需动作）、1 条待重建即消（②tokenizer）、2 条已派单（①ITN → coder-2、pre-roll → coder-1）、2 条排队待派（③尾字、④自学习，均撞 `main.rs`）。

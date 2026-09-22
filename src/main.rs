@@ -8413,12 +8413,34 @@ fn spawn_worker_thread(
                                 &acc_joined,
                                 config.audio.chinese_script,
                             );
+                            // PUNCT-FINAL-REDO-350：**仅本地 realtime** 在此串接「标点剥离节点」
+                            // （Gavin 2026-09-22；节点谁要谁挂，DEC-066）。剥光后交给下游既有标点
+                            // 节点全量重打 —— 见本文件 `strip_punctuation_node`。
+                            //
+                            // 🔴 门 = `punctuation.enabled && !translate_requested`：
+                            //  - 必须 `!translate_requested`：翻译路径下游 `apply_local_punctuation`
+                            //    被 `translate_requested` 挡住、**不会**重打标点；若此时剥光，
+                            //    标点就只能靠翻译引擎给，风险实 ⇒ 翻译时**整段跳过**本节点。
+                            //  - `llm_handled` 在接线点读不到（在 run_pipeline_core 内、LLM 调用后才定）。
+                            //    核实结论：LLM 路径下剥光文本只是 **LLM 的输入**，LLM 自行输出带标点
+                            //    结果、`llm_handled` 分支保留其标点 ⇒ 无害（详见 result.md）。
+                            //  - `punctuation.enabled=false`：本节点无意义（下游 L2 会全文剥）。
+                            //
+                            // 剥光后 `native_punctuated` 恒 false ⇒ 下游 `!native_punctuated` 门
+                            // 自己放行做全量重打；334 的「已带标点则跳过」门**一行未改**，
+                            // 仍原样保护在线 realtime 与本地离线两档。
+                            // 先剥光 ⇒ 进引擎文本无标点 ⇒ 不可能再叠加 `。。`/`，。`。
+                            let stripped = strip_punctuation_node(
+                                normalized,
+                                config.punctuation.enabled
+                                    && !start.translate.load(Ordering::Acquire),
+                            );
                             // PUNCT-DOUBLE-334：第二元 = 「文本**实际**是否已有有效标点」（DEC-047 口径，
                             // 与 :9855 的 Qwen3 分支同一 detector），**不是**「各分片是否都解码成功」。
                             // 旧值 `acc_all_native` 语义错配：任一片失败 ⇒ 误判「无标点」⇒ 对已带标点全文
                             // 再跑 CT-Transformer ⇒ `。。`/`，。` 叠加（Gavin 端测报障）。
-                            let native_punctuated = pretranscribed_native_punctuated(&normalized);
-                            Some((normalized, native_punctuated))
+                            let native_punctuated = pretranscribed_native_punctuated(&stripped);
+                            Some((stripped, native_punctuated))
                         } else {
                             None
                         };
@@ -10121,6 +10143,92 @@ mod punct_double_334_tests {
 }
 
 #[cfg(test)]
+mod punct_final_redo_350_tests {
+    use super::{pretranscribed_native_punctuated, strip_punctuation_node};
+    use crate::punctuation::has_effective_punctuation;
+
+    /// 节点关闭（`enabled=false`）⇒ 输入逐字返回（用户关标点时不介入）。
+    #[test]
+    fn strip_node_disabled_returns_input_verbatim() {
+        assert_eq!(
+            strip_punctuation_node("你好。。".to_string(), false),
+            "你好。。"
+        );
+        assert_eq!(strip_punctuation_node(String::new(), false), "");
+    }
+
+    /// 节点开启 ⇒ 剥光所有有效标点，词内嵌标点保留。
+    #[test]
+    fn strip_node_strips_effective_only() {
+        assert_eq!(strip_punctuation_node("你好。。".to_string(), true), "你好");
+        assert_eq!(
+            strip_punctuation_node("今天天气不错，。".to_string(), true),
+            "今天天气不错"
+        );
+        // 词内嵌（小数 / 时间 / 域名 / 英文缩写 / 中文量级）不被剥
+        for t in ["3.14", "3:30 开会", "example.com", "don't", "3.5亿"] {
+            assert_eq!(strip_punctuation_node(t.to_string(), true), t);
+        }
+    }
+
+    /// 🔴 「剥光了必定打得回来」不变式（Gavin 的担忧，350 核心）：
+    /// 只要剥离节点真的动手（`enabled=true` 且非翻译），剥光文本的 `native_punctuated`
+    /// 必为 false ⇒ 下游 `apply_local_punctuation` 的门
+    /// `enabled && !translate_requested && !native_punctuated` 必定放行
+    /// ⇒ 不会出现「剥光了没打回来」。
+    /// （`llm_handled=true` 是 LLM 路径，由 LLM 自带标点；见 result.md 核实结论。）
+    #[test]
+    fn strip_node_implies_downstream_punctuation_gate() {
+        for t in [
+            "你好。。",
+            "今天天气不错，。",
+            "甲。乙。",
+            "3:30 开会。",
+            "Hello, world.",
+        ] {
+            let stripped = strip_punctuation_node(t.to_string(), true);
+            assert!(
+                !has_effective_punctuation(&stripped),
+                "剥光后仍含有效标点 ⇒ 下游门不成立：{t} -> {stripped}"
+            );
+            // 节点门（enabled=true 且非翻译）⇒ 下游门的三项条件齐备
+            let enabled = true;
+            let translate_requested = false;
+            let native_punctuated = pretranscribed_native_punctuated(&stripped);
+            assert!(
+                enabled && !translate_requested && !native_punctuated,
+                "不变式破坏：剥光后下游门不成立，用户会拿到无标点文本：{t} -> {stripped}"
+            );
+        }
+    }
+
+    /// 🔴 回归：本地 realtime 路径不再出现重复标点（`PUNCT-DOUBLE-334` 老 bug 不复发）。
+    /// 本节点保证进引擎的文本**无有效标点**；此处用「末尾补句号」的最简引擎模型验证不叠加
+    /// （真实引擎效果留端测）。
+    #[test]
+    fn strip_node_no_double_punctuation_regression() {
+        for (input, engine_input, redone) in [
+            ("你好。。", "你好", "你好。"),
+            ("今天天气不错，。", "今天天气不错", "今天天气不错。"),
+            ("甲。乙。", "甲乙", "甲乙。"),
+        ] {
+            let staged = strip_punctuation_node(input.to_string(), true);
+            assert_eq!(staged, engine_input, "进引擎文本不符预期：{input}");
+            assert!(
+                !has_effective_punctuation(&staged),
+                "进引擎文本仍含有效标点：{staged}"
+            );
+            let out = format!("{staged}。");
+            assert_eq!(out, redone);
+            assert!(
+                !out.contains("。。") && !out.contains("，。"),
+                "重复标点复发：{out}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod parallel_acc_298_tests {
     use super::{acc_parallel_result_usable, assemble_parallel_accuracy, hole_fill_decision};
 
@@ -10831,6 +10939,34 @@ fn apply_local_punctuation(
         final_text
     }
 }
+/// PUNCT-FINAL-REDO-350：标点剥离**节点**（独立、管线无关、谁要谁挂）。
+///
+/// 形态照 [`apply_filler_strip`]（自由函数、显式传参、管线无关）；判定体是
+/// `punctuation::strip_effective_punctuation`（可单测的纯函数）。
+/// 🔴 **只挂本地 realtime 一条管线**（Gavin 2026-09-22 细化设计），在线 realtime 与
+/// 本地离线**不挂**，序列一字不变 ⇒ 结构上不可能受影响（DEC-066：节点各自编排、谁要谁挂）。
+///
+/// 语义：把整段已有标点剥光，交给下游**既有的**标点节点（`apply_local_punctuation`）
+/// 全量重打。剥光后 `native_punctuated` 恒 false ⇒ 下游 `!native_punctuated` 门自己放行；
+/// 而该门本身**一行都不改**，`PUNCT-DOUBLE-334` 对其它两档的保护原样保留。
+/// 先剥光 ⇒ 进引擎的文本无标点 ⇒ 结构上不可能再出现 `。。`/`，。` 叠加。
+///
+/// - `enabled == false` ⇒ **原样返回**（用户关闭标点：本节点无意义，下游 L2 会全文剥）
+/// - `enabled == true`  ⇒ `strip_effective_punctuation(&final_text)`
+///
+/// ⚠️ 仅在「下游必定重打标点」时才可挂：见调用点关于 `!translate_requested` 的门注释。
+/// 变化时打一行 `log::info!`（与 [`apply_local_punctuation`] / [`apply_filler_strip`] 同风格）。
+fn strip_punctuation_node(final_text: String, enabled: bool) -> String {
+    if !enabled {
+        return final_text;
+    }
+    let stripped = punctuation::strip_effective_punctuation(&final_text);
+    if stripped != final_text {
+        log::info!("Punctuation strip node: '{}' -> '{}'", final_text, stripped);
+    }
+    stripped
+}
+
 /// FORMAT-FALLBACK-303：本地免费口水词过滤节点（**管线无关**，谁要谁挂）。
 ///
 /// 仅在 LLM **未接手**时执行：开了 LLM 时 F1 Filler Removal 做得比规则层好，

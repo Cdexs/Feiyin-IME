@@ -6,6 +6,17 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-22 — coder-1 — PUNCT-FINAL-REDO-350 ✅ 交付（标点剥离独立节点，只挂本地 realtime）
+
+- **需求（Gavin 2026-09-22）**：最终 acc 转写完成后剥光整段已有标点、再交标点模型整段重打；**只针对本地 realtime，其他管线不能动**（在线 ASR 标点可能更准）。设计细化：剥离做成**独立节点**、谁要谁挂，不绑死管线。主控前两稿 v1（四档一视同仁）/v2（`run_pipeline_core` 加 Fill/RedoWhole 模式参数）均作废，**v3 为准**。
+- **实现**：`src/punctuation/mod.rs` 新增共享谓词 `is_effective_punctuation`（`has_effective_punctuation` 改调它、行为不变）+ 严格对偶纯函数 `strip_effective_punctuation`；`src/main.rs` 新增自由函数节点 `strip_punctuation_node`（形态照 `apply_filler_strip`），接线在本地 realtime 自有编排块（normalize 之后、`native_punctuated` 之前）⇒ 剥光后 `native_punctuated` 恒 false ⇒ 下游既有门自动放行整段重打。
+- 🔴 **DEC-066 证据（共享代码零 diff）**：`run_pipeline_core` 签名**不在 diff**；`apply_local_punctuation` 与 HEAD **md5 逐字节相同**（`8094f722…`）；v1/v2 期间动过的共享代码（`native_punctuated` 参数、`pretranscribed_native_punctuated`、334 测试名、`PunctuationNodeMode`/`PunctuationRunner`）**全部恢复原状**。其余两档结构上不可能受影响。
+- **门 = `punctuation.enabled && !start.translate.load(...)`**：翻译路径下游 `apply_local_punctuation` 被挡不重打 ⇒ 整段跳过；`llm_handled` 接线点读不到，核实结论 = LLM 路径下剥光文本只是 LLM 输入（LLM 自带标点输出）、LLM 失败回落 CT 重打 ⇒ 无害。
+- **单测 7 条**：穷举性质测试（`has(strip(t))==false`）、词内嵌边界外、334 重复标点回归、「剥光了必定打得回来」不变式。
+- **验证**：fmt 全仓 clean / `check --all-targets` 0 error、warnings 99/90 / `--numstat`==`-w`（main 138/2、punctuation 126/10）/ 全量 `cargo test --no-fail-fast` **0 failed**。
+- **未决边界（只报不改）**：并行 acc 不可用回落内部转录时不经本节点（原行为）。
+- **红线**：未动版本号 / 未 commit / 未 push / 未碰 `src/transcription/local_stream.rs` / 零凭证。
+
 ## 2026-09-22 — coder-1 — RESEARCH-QWEN3-1.7B-347 ✅ 交付（纯调研，零生产代码）
 
 - **任务**：Gavin 要求「上 HF 找下载率最高的 qwen3-asr 1.7b，评估替代 0.6B 可行性；1.7b 也找 onnx 版，最大化向现役 0.6B 推理框架兼容」。
@@ -60,3 +71,13 @@
 - **验证**：`cargo fmt --check`（不带 `skip_children`）EXIT 0 ｜ `cargo check` 0 error ｜ warnings **99** = 基线 ｜ `numstat`==`-w` ｜ 全量 `cargo test --no-fail-fast` **1420P/0F/22I**（NEW 3 / GONE 2）。
 - **只报不改**：`src/main.rs:9570` 注释「要攒够 `min_seg_ms` 且静默 800ms 才派片」已过期（越界项，报主控）。
 - 🔴 实机 `tail_wait` / 派发分布交 tester-1/Gavin，未声称已验证。未动版本号（0.9.3 主控已升）/ 未 commit / 未出包 / 未碰 `src/main.rs`、`src/audio/**` / 零凭证。
+
+## 2026-09-22 — coder-2 — PUNCT-PREVIEW-SEMANTIC-349 ✅ 交付（预览标点打在句中 · 只认静默 1200ms）
+
+- **Gavin 原话**：「流式预览...标点打在这个句子的中间，掐断了整个句意」；诉求「按语义停顿打标点」。
+- **先证后改（真实引擎探针 + 实机日志）**：① 真实 CT-Transformer 对任意截断的半句**恒在末尾补「。」**（8~32 字七档全中）；② `punct_cache_reuse` 把该终止符作前缀保留、新字追加其后 ⇒ **落到句中**；③ `debug-build321.log` 单会话 53 次重打点，大量落在 10~34 字前缀（4s/800ms/shadow 三条与语义无关）。证据 `collab/evidence/20260922-punct349/`。
+- **改动（仅 `local_stream.rs`，`numstat`==`-w` 92/49）**：`PUNCT_SILENCE_TRIGGER_MS` 800→**1200**；删 `PUNCT_REFRESH_INTERVAL`(4s 定时) + `preview_display` 的 `interval/due`；删 `shadow_fired` 对 force 的贡献；新判据纯函数 `should_repunctuate_preview`；删 `PunctPreviewCache.last_punct_at`（`has_new` 改长度比较）；收尾强制打点保留。**shadow/acc/endpoint 状态机零改动**。
+- **验证**：`cargo fmt --check`（不带 `skip_children`）EXIT 0 / check 0 error / `local_stream.rs` 零 warning / 全量 `cargo test` 0 failed（feiyin-ime 1337P，NEW 2；探针已删）。
+- 🔴 **归属**：全量树含 coder-1 在飞 350 未提交改动，总数 1420→1425（本单 2 + 350 3），**本单隔离 +2**。
+- **残余**：1200ms 停顿处若其实没说完仍会出现「。」（语义边界固有代价，符合 Gavin 口径）。
+- 🔴 实机交 tester-1/Gavin，未声称已验证。未动版本号 / 未 commit / 未出包 / 未碰 `src/main.rs`、`src/punctuation/mod.rs` / 零凭证。

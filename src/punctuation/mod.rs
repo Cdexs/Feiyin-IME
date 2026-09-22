@@ -50,11 +50,23 @@ pub fn is_punctuation(c: char) -> bool {
     PUNCT_CHARS.contains(&c)
 }
 
+/// 「某字符是否为**有效标点**」的唯一判据（词内嵌豁免，PUNCT-GOVERNANCE-030-A-2）。
+///
+/// 字符虽属 `PUNCT_CHARS`，但若同时被左右两个 ASCII 字母/数字夹住
+/// （`3.14` 小数点、`don't` 缩写撇号、`3:30` 时间冒号、`example.com` 域名点），
+/// 视为词内嵌入字符而非标点语义；其余（未被夹持）的标点字符即「有效标点」。
+///
+/// 🔴 `has_effective_punctuation` 与 `strip_effective_punctuation`
+/// （PUNCT-FINAL-REDO-350）**必须共用本谓词，不得各写一份循环** —— 两份实现早晚分家
+/// （`[FIRST-MARKER-BOUNDARY-001]` / `[CONFIG-MIRROR-DRIFT-001]` 教训）。
+/// 位置 0 的前驱取 `' '` 哨兵（`usize::wrapping_sub(1)` ⇒ `get` 取不到），末尾后继同理。
+fn is_effective_punctuation(c: char, prev: char, next: char) -> bool {
+    is_punctuation(c) && !(prev.is_ascii_alphanumeric() && next.is_ascii_alphanumeric())
+}
+
 /// 判定文本是否含「有效标点」（PUNCT-GOVERNANCE-030-A-2，主控 c 方案）
 ///
-/// 对 `PUNCT_CHARS` 全集合统一做「词内嵌豁免」：字符虽属标点集合，但若同时被
-/// 左右两个 ASCII 字母/数字夹住（`3.14` 小数点、`don't` 缩写撇号、`3:30` 时间
-/// 冒号、`example.com` 域名点），视为词内嵌入字符而非标点语义，不计为有效标点。
+/// 对 `PUNCT_CHARS` 全集合统一做「词内嵌豁免」（谓词见 `is_effective_punctuation`）。
 /// 任何其余（未被夹持）的标点字符出现即返回 `true`。
 ///
 /// 判据与 `strip_trailing_punctuation` 共用「什么算标点」的边界口径（同源、不分裂），
@@ -62,23 +74,45 @@ pub fn is_punctuation(c: char) -> bool {
 ///
 /// 已知口径（主控 2026-08-08 裁定，勿当 bug 重修）：
 /// - 无句号仅引号（`他说“好”`）→ 有效标点 `true`（引号虽非句子级标点，但属标点，
-///   主控裁定接受，跳过标点引擎；与句子级方案的差异已钉测试）
+///   主控裁定接受；与句子级方案的差异已钉测试）
 /// - 全角数字（`３.１４`）两侧非 ASCII 字母数字 → 不豁免 → `true`，与半角行为
 ///   不一致（已实测钉测试，只报不改）
 pub fn has_effective_punctuation(text: &str) -> bool {
     let chars: Vec<char> = text.chars().collect();
     for (i, &c) in chars.iter().enumerate() {
-        if !is_punctuation(c) {
-            continue;
-        }
         let prev = chars.get(i.wrapping_sub(1)).copied().unwrap_or(' ');
         let next = chars.get(i + 1).copied().unwrap_or(' ');
-        if prev.is_ascii_alphanumeric() && next.is_ascii_alphanumeric() {
-            continue;
+        if is_effective_punctuation(c, prev, next) {
+            return true;
         }
-        return true;
     }
     false
+}
+
+/// 剥离文本中的**有效标点**，返回剥离后的文本（PUNCT-FINAL-REDO-350）。
+///
+/// 是 `has_effective_punctuation` 的**严格对偶**：两者共用 `is_effective_punctuation`，
+/// 因此恒有 `has_effective_punctuation(strip_effective_punctuation(t)) == false`
+/// （已由穷举性质测试覆盖，见本文件 `test_350_*`）。
+///
+/// 🔴 **词内嵌字符一字不剥**：`3.14` / `3:30` / `example.com` / `don't` / `3.5亿`
+/// 剥完**逐字不变** —— 剥错会把 `3.14` 变 `314`、`3:30` 变 `330`，毁掉 ITN
+/// （DEC-030/036）规整出来的结果。
+///
+/// 用途：CT-Transformer 重打标点前先清空已有标点，从结构上根除
+/// 「对已带标点文本二次打点 ⇒ `。。` 叠加」（PUNCT-DOUBLE-334 的老 bug）——
+/// 输入无标点 ⇒ 不可能叠加。
+pub fn strip_effective_punctuation(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    for (i, &c) in chars.iter().enumerate() {
+        let prev = chars.get(i.wrapping_sub(1)).copied().unwrap_or(' ');
+        let next = chars.get(i + 1).copied().unwrap_or(' ');
+        if !is_effective_punctuation(c, prev, next) {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// 统计文本的"字/词"单位数（PUNCT-GOVERNANCE-030-A B1，口径 Gavin 2026-08-08）
@@ -584,6 +618,88 @@ mod tests {
     #[test]
     fn test_effective_punctuation_empty_string() {
         assert!(!has_effective_punctuation(""));
+    }
+
+    // ============================================================
+    // PUNCT-FINAL-REDO-350: strip_effective_punctuation（has_ 的严格对偶）
+    // ============================================================
+
+    /// 🔴 性质测试：对任意 t，`has_effective_punctuation(strip_effective_punctuation(t)) == false`。
+    /// 用小字母表做**穷举**（长度 ≤ 4，覆盖 CJK / ASCII 字母数字 / 全半角标点 / 空白 / 撇号），
+    /// 这是「严格对偶」这一不变量最直接的机器证明。
+    #[test]
+    fn test_350_strip_is_strict_dual_of_has_exhaustive() {
+        const ALPHABET: &[char] = &['3', '.', '1', 'a', '，', '。', ':', '中', ' ', '\'', '５'];
+        let mut corpus: Vec<String> = vec![String::new()];
+        let mut frontier: Vec<String> = vec![String::new()];
+        for _ in 0..4 {
+            let mut next = Vec::with_capacity(frontier.len() * ALPHABET.len());
+            for base in &frontier {
+                for &c in ALPHABET {
+                    let mut s = base.clone();
+                    s.push(c);
+                    next.push(s.clone());
+                    corpus.push(s);
+                }
+            }
+            frontier = next;
+        }
+        for t in &corpus {
+            let stripped = strip_effective_punctuation(t);
+            assert!(
+                !has_effective_punctuation(&stripped),
+                "严格对偶被破坏：strip({t:?}) = {stripped:?} 仍含有效标点"
+            );
+            // 幂等：再剥一次不改变结果
+            assert_eq!(strip_effective_punctuation(&stripped), stripped);
+        }
+    }
+
+    /// 词内嵌边界外用例：剥完**逐字不变**（剥错会毁 ITN 的 `3.14` / `3:30` / `3.5亿`）。
+    #[test]
+    fn test_350_inline_punctuation_survives_strip() {
+        for t in [
+            "3.14",
+            "3:30",
+            "3：30 开会",
+            "example.com",
+            "don't",
+            "3.5亿",
+            "圆周率是3.14",
+            "I don't know",
+        ] {
+            assert_eq!(strip_effective_punctuation(t), t, "词内嵌标点被误剥：{t}");
+        }
+    }
+
+    /// 🔴 回归：钉死 PUNCT-DOUBLE-334 的老 bug（`。。` / `，。` 叠加）不复发。
+    ///
+    /// 334 的修法是「已带标点就跳过引擎」；350 改为「先剥光再整段重打」——
+    /// 机制保证进引擎的文本**已无有效标点**，故结构上不可能叠加。
+    /// （引擎级最终效果需端测；本测试钉住可单测的那一半不变量。）
+    #[test]
+    fn test_350_no_double_punctuation_fingerprint() {
+        assert_eq!(strip_effective_punctuation("你好。。"), "你好");
+        assert_eq!(
+            strip_effective_punctuation("今天天气不错，。"),
+            "今天天气不错"
+        );
+        assert_eq!(strip_effective_punctuation("Hello, world.."), "Hello world");
+        assert_eq!(strip_effective_punctuation("好！！"), "好");
+        assert_eq!(strip_effective_punctuation("，。、"), "");
+        // 指纹输入剥完必须「无有效标点」⇒ 重打不会叠加
+        for t in [
+            "你好。。",
+            "今天天气不错，。",
+            "Hello, world..",
+            "好！！",
+            "，。、",
+        ] {
+            assert!(
+                !has_effective_punctuation(&strip_effective_punctuation(t)),
+                "重复标点指纹未剥净：{t}"
+            );
+        }
     }
 
     /// PUNCT_CHARS ↔ TRAILING_PUNCT_CHARS 逐字符对照护栏（030-A-2 验收返工补）。
