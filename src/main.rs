@@ -15772,3 +15772,74 @@ mod reflow_preview_367_tests {
         assert_eq!(reflow_preview_367(false, "AB", "XYZ", 3), "AB");
     }
 }
+
+// =====================================================================
+// TEST-SYNC-371（阶段三 · 非作者视角，tester-1）：C 接线护栏
+// ---------------------------------------------------------------------
+// Gavin 明确要求「计数器在松开录音键后一定要重置」。`window_spans` /
+// `window_samples` 必须**每次录音新建的局部 `let mut Vec::new()`**（per-recording，
+// 松手即失效），且不得退化为 static/全局（否则跨录音累积 ⇒ 污染下一次对齐）。
+// 生产区扫描用 `guard_prod_lines`（剔除所有 test-gated 项，位置无关）。
+// =====================================================================
+#[cfg(test)]
+mod testsync371_window_counter_guard_tests {
+    fn prod_lines() -> Vec<String> {
+        crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"))
+    }
+
+    /// 设计 C：两计数器必须是 per-recording 局部（`let mut ... = Vec::new()`），不得 static。
+    #[test]
+    fn counters_are_per_recording_locals() {
+        let p = prod_lines();
+        let starts = |pre: &str| p.iter().filter(|l| l.starts_with(pre)).count();
+        assert_eq!(
+            starts("let mut window_spans:"),
+            1,
+            "window_spans 应恰有 1 处 `let mut` 局部声明"
+        );
+        assert_eq!(
+            starts("let mut window_samples:"),
+            1,
+            "window_samples 应恰有 1 处 `let mut` 局部声明"
+        );
+        assert!(
+            p.iter()
+                .any(|l| l.starts_with("let mut window_spans:") && l.contains("Vec::new()")),
+            "window_spans 必须每次录音从空表起（Vec::new）"
+        );
+        assert!(
+            p.iter()
+                .any(|l| l.starts_with("let mut window_samples:") && l.contains("Vec::new()")),
+            "window_samples 必须每次录音从空表起（Vec::new）"
+        );
+        assert!(
+            !p.iter()
+                .any(|l| l.starts_with("static") && l.contains("window_spans")),
+            "window_spans 不得是 static/全局（否则跨录音泄漏）"
+        );
+        assert!(
+            !p.iter()
+                .any(|l| l.starts_with("static") && l.contains("window_samples")),
+            "window_samples 不得是 static/全局（否则跨录音泄漏）"
+        );
+    }
+
+    /// 设计 C：两表必须**同批 push**（区间 ↔ 样本数一一对应，否则期望比例算错）。
+    #[test]
+    fn counters_are_pushed_together() {
+        let p = prod_lines();
+        assert!(
+            p.iter().any(|l| l.contains("window_samples.push(")),
+            "window_samples 必须在生产区被 push"
+        );
+        // window_spans 的 push 跨行书写（标识符独占一行 + 紧接 `.push(`）
+        assert!(
+            p.iter().any(|l| l == "window_spans"),
+            "window_spans 的 push 调用点应存在（标识符独占一行）"
+        );
+        assert!(
+            p.iter().any(|l| l.starts_with(".push(")),
+            "紧接 window_spans 的 push 调用应存在"
+        );
+    }
+}

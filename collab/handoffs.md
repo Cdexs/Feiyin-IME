@@ -6,6 +6,17 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-22 — tester-1 — TEST-SYNC-371 ✅ 交付（阶段三 · 非作者视角补 23 条护栏；生产代码零改动）
+
+- **性质**：阶段三 TEST-SYNC，**按设计契约写用例**（不读实现反推），只改 `#[cfg(test)]` 区。目标 = `FIX-PREFIX-AND-EAT-371`（A 语种前缀剥离 / B 滑窗对齐 / C 接线）。
+- **新增 23 条**（`src/transcription/mod.rs` +381、`src/main.rs` +71）：
+  - **A 前缀剥离 11 条**（`testsync371_prefix_contract_tests`）：只取首个 `<asr_text>` / 尾随空白半角全角冒号 / 截完即空 / `QWEN3_PREFIX_MAX_BYTES=64` / 起点 63·64·65 / 跨边界多字节不 panic / 任意前缀形态（换行·`<`·数字标点）/ 语言无关（日韩英俄）/ 空串半空 / 正文不误伤 / 与 `<|…|>` token 叠加顺序。
+  - **B 滑窗对齐 10 条**（`testsync371_align_contract_tests`）：近周期差 1/2 字卡质量门 0.15 / 周期 4·5 遍不丢 / 期望比例 0·负·NaN 退化 / 极短窗保守 / `prev_extra_slices=0` 不设硬上界且无重叠不强行提交 / `slice_samples` 不自洽安全退化 / 乱序+中间空窗 / 混合序列全程不丢 / 极长窗不 panic。
+  - **C 接线 2 条**（`testsync371_window_counter_guard_tests`）：`include_str!` 扫生产区 —— 两计数器必须 per-recording `let mut Vec::new()`、不得 static；两表同批 push。
+- **验证（白名单）**：`cargo fmt` clean / `--check` **EXIT 0**；`cargo check --all-targets` **0 error**、warnings **98/88** = 基线未升；`numstat`==`-w`（71/0、381/0）。🔴 **未跑 `cargo test`**（护栏首跑在阶段四）。
+- **发现**：**未发现真实缺陷**（全部按设计契约静态推演一致）。
+- **红线**：未改生产代码 / 未 commit / 未 push / 版本号 0.9.3 未动 / 零凭证。
+
 ## 2026-09-22 — tester-1 — TEST-EXEC + BUILD-349 ✅ 重出包（修滑窗丢字 + 13s 安全阀 + 300s 录音；八项 + 三特殊点全 PASS）｜🔴 BUILD-348 作废
 
 - **重出原因**：BUILD-348 含 **P0 丢字**（12s 封顶把窗口切到零重叠 ⇒ 对齐必败 ⇒ 「整窗跳过」⇒ 该窗内容全丢）。由 **369（`24c452a`）+ 370（`919a59e`）** 修复。

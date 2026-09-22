@@ -5031,3 +5031,384 @@ mod path_b_budget_364_tests {
         assert!(big > small, "词库越多注入越大");
     }
 }
+
+// =====================================================================
+// TEST-SYNC-371（阶段三 · 非作者视角，tester-1）
+// ---------------------------------------------------------------------
+// 按**设计契约**编写（不读实现反推），生产代码零改动。覆盖：
+//   A · 语种前缀剥离 `strip_qwen3_language_prefix`（371 恢复的无条件规则）
+//   B · 滑窗对齐 `align_overlap_with_prior` / `OrderedReflow` 的边界攻击面
+// =====================================================================
+#[cfg(test)]
+mod testsync371_prefix_contract_tests {
+    use super::{strip_qwen3_language_prefix, QWEN3_PREFIX_MAX_BYTES};
+
+    /// 设计 A：**只认第一个** `<asr_text>`（头部一个 + 正文中段一个 ⇒ 截第一个）。
+    #[test]
+    fn prefix_cuts_at_first_marker_only() {
+        assert_eq!(
+            strip_qwen3_language_prefix("language chinese<asr_text>你好<asr_text>世界"),
+            "你好<asr_text>世界"
+        );
+        assert_eq!(
+            strip_qwen3_language_prefix("<asr_text>甲乙<asr_text>丙丁"),
+            "甲乙<asr_text>丙丁"
+        );
+    }
+
+    /// 设计 A：标记后紧跟空白 / 半角冒号 / 全角冒号 ⇒ 一并吃掉。
+    #[test]
+    fn prefix_eats_trailing_whitespace_and_colons() {
+        assert_eq!(
+            strip_qwen3_language_prefix("language chinese<asr_text>   你好"),
+            "你好"
+        );
+        assert_eq!(
+            strip_qwen3_language_prefix("language chinese<asr_text>:你好"),
+            "你好"
+        );
+        assert_eq!(
+            strip_qwen3_language_prefix("language chinese<asr_text>：你好"),
+            "你好"
+        );
+        assert_eq!(
+            strip_qwen3_language_prefix("language chinese<asr_text>:  你好"),
+            "你好"
+        );
+    }
+
+    /// 设计 A：标记后什么都没有 ⇒ 截完即空串。
+    #[test]
+    fn prefix_marker_with_nothing_after_is_empty() {
+        assert_eq!(
+            strip_qwen3_language_prefix("language chinese<asr_text>"),
+            ""
+        );
+        assert_eq!(
+            strip_qwen3_language_prefix("language chinese<asr_text>   "),
+            ""
+        );
+        assert_eq!(strip_qwen3_language_prefix("<asr_text>"), "");
+    }
+
+    /// 设计 A：唯一护栏是「标记起点 ≤ 64 字节」——常量值钉死。
+    #[test]
+    fn prefix_max_bytes_is_64() {
+        assert_eq!(QWEN3_PREFIX_MAX_BYTES, 64);
+    }
+
+    /// 设计 A：起点恰在 63 / 64 / 65 字节 ⇒ 63/64 剥、65 不剥。
+    #[test]
+    fn prefix_position_guard_63_64_65() {
+        let at63 = format!("{}<asr_text>正文", "a".repeat(63));
+        let at64 = format!("{}<asr_text>正文", "a".repeat(64));
+        let at65 = format!("{}<asr_text>正文", "a".repeat(65));
+        assert_eq!(
+            strip_qwen3_language_prefix(&at63),
+            "正文",
+            "起点 63 ≤64 ⇒ 剥"
+        );
+        assert_eq!(
+            strip_qwen3_language_prefix(&at64),
+            "正文",
+            "起点 64 =上限 ⇒ 剥（含边界）"
+        );
+        assert_eq!(
+            strip_qwen3_language_prefix(&at65),
+            at65.as_str(),
+            "起点 65 >64 ⇒ 视为正文、原样返回"
+        );
+    }
+
+    /// 设计 A：多字节字符恰跨 64 字节边界 ⇒ 不 panic 且按字节位判定。
+    #[test]
+    fn prefix_multibyte_at_boundary_does_not_panic() {
+        let p63 = format!("{}<asr_text>正文", "中".repeat(21)); // 21×3=63B
+        let p64 = format!("{}a<asr_text>正文", "中".repeat(21)); // 64B
+        let p65 = format!("{}ab<asr_text>正文", "中".repeat(21)); // 65B
+        assert_eq!(strip_qwen3_language_prefix(&p63), "正文");
+        assert_eq!(strip_qwen3_language_prefix(&p64), "正文");
+        assert_eq!(strip_qwen3_language_prefix(&p65), p65.as_str());
+    }
+
+    /// 设计 A：前缀含换行 / `<` / 数字标点 —— 371 不要求「标签样」。
+    #[test]
+    fn prefix_arbitrary_prefix_forms_are_stripped() {
+        assert_eq!(
+            strip_qwen3_language_prefix("language\nchinese<asr_text>正文"),
+            "正文"
+        );
+        assert_eq!(strip_qwen3_language_prefix("<tag><asr_text>正文"), "正文");
+        assert_eq!(
+            strip_qwen3_language_prefix("123 45,6.<asr_text>正文"),
+            "正文"
+        );
+        assert_eq!(strip_qwen3_language_prefix("x<y<asr_text>正文"), "正文");
+    }
+
+    /// 设计 A：**语言无关** —— 中/日/韩/英/俄 + 空前缀一律生效。
+    #[test]
+    fn prefix_is_language_agnostic() {
+        for (pre, body) in [
+            ("language korean", "안녕하세요"),
+            ("language russian", "привет"),
+            ("language japanese", "こんにちは"),
+            ("language english", "hello"),
+            ("", "你好"),
+        ] {
+            let input = format!("{pre}<asr_text>{body}");
+            assert_eq!(
+                strip_qwen3_language_prefix(&input),
+                body,
+                "前缀须语言无关：{input}"
+            );
+        }
+    }
+
+    /// 设计 A：空串 / 纯空白 / 半截标记 ⇒ 原样返回、不 panic。
+    #[test]
+    fn prefix_degenerate_inputs_return_original() {
+        assert_eq!(strip_qwen3_language_prefix(""), "");
+        assert_eq!(strip_qwen3_language_prefix("   "), "   ");
+        assert_eq!(strip_qwen3_language_prefix("<asr_tex"), "<asr_tex");
+        assert_eq!(strip_qwen3_language_prefix("asr_text>"), "asr_text>");
+        assert_eq!(
+            strip_qwen3_language_prefix("language<asr_text"),
+            "language<asr_text"
+        );
+    }
+
+    /// 设计 A：无标记的普通正文原样返回（含尖括号也不误伤）。
+    #[test]
+    fn prefix_plain_body_unchanged() {
+        let t = "今天天气不错，我们出去走走吧。";
+        assert_eq!(strip_qwen3_language_prefix(t), t);
+        assert_eq!(
+            strip_qwen3_language_prefix("a < b 且 c > d"),
+            "a < b 且 c > d"
+        );
+    }
+
+    /// 设计 A：与 `<|…|>` token 叠加 —— 生产顺序 = 先剥 token、再剥前缀，两者都清。
+    #[test]
+    fn prefix_after_special_tokens_both_gone() {
+        let raw = "<|lang|>language chinese<asr_text>你好";
+        let no_tok = super::Transcriber::strip_asr_special_tokens(raw);
+        assert_eq!(strip_qwen3_language_prefix(&no_tok), "你好");
+    }
+}
+
+#[cfg(test)]
+mod testsync371_align_contract_tests {
+    use super::{align_overlap, align_overlap_with_prior, AlignPrior, OrderedReflow};
+
+    const S: &str = "今天天气真好我们出去玩吧"; // 12 个有效字（无标点）
+
+    /// 设计 B（③质量门边界）：重叠段差 1 字（≤0.15）应能对齐；差 2 字（>0.15）保守不对齐。
+    #[test]
+    fn near_period_one_diff_aligns_two_diffs_degrades() {
+        let prev = "PQRSTABCDEFGHIJKL"; // 前 5 字 + 12 字重叠段
+        let r1 = align_overlap_with_prior(
+            prev,
+            "ABCDEFGHIJKM", // 与重叠段差 1 字
+            AlignPrior {
+                expected_ratio: None,
+                prev_extra_slices: 1,
+            },
+        );
+        assert!(r1.ok, "差 1 字（1/12≈0.083 ≤0.15）应能对齐");
+        assert_eq!(r1.committed_prefix, "PQRST");
+        let r2 = align_overlap_with_prior(
+            prev,
+            "ABCDEFGHIJMN", // 差 2 字（2/12≈0.167 >0.15）
+            AlignPrior {
+                expected_ratio: None,
+                prev_extra_slices: 1,
+            },
+        );
+        assert!(!r2.ok, "差 2 字超过质量门 ⇒ 保守不对齐（丢字由拼接兜底）");
+    }
+
+    /// 设计 B（周期性 4 遍）：全文不丢、不重复。
+    #[test]
+    fn periodic_4x_no_sentence_lost() {
+        let dur = 4_400 * 16;
+        let samples = vec![dur; 4];
+        let mut o = OrderedReflow::new();
+        assert_eq!(
+            o.push_window(0, 0, 4, samples.clone(), format!("{S}{S}{S}{S}"))
+                .len(),
+            1
+        );
+        assert_eq!(
+            o.push_window(1, 1, 5, samples, format!("{S}{S}{S}{S}"))
+                .len(),
+            1
+        );
+        let (committed, last) = o.finish();
+        let full = format!("{committed}{last}");
+        assert!(committed.contains(S), "滑出句必须定稿：{committed:?}");
+        assert_eq!(
+            full.matches(S).count(),
+            5,
+            "全文该句恰 5 次（丢/多都错）：{full}"
+        );
+    }
+
+    /// 设计 B（周期性 5 遍）：同上，周期更长。
+    #[test]
+    fn periodic_5x_no_sentence_lost() {
+        let dur = 4_400 * 16;
+        let samples = vec![dur; 5];
+        let mut o = OrderedReflow::new();
+        assert_eq!(
+            o.push_window(0, 0, 5, samples.clone(), format!("{S}{S}{S}{S}{S}"))
+                .len(),
+            1
+        );
+        assert_eq!(
+            o.push_window(1, 1, 6, samples, format!("{S}{S}{S}{S}{S}"))
+                .len(),
+            1
+        );
+        let (committed, last) = o.finish();
+        let full = format!("{committed}{last}");
+        assert_eq!(full.matches(S).count(), 6, "全文该句恰 6 次：{full}");
+    }
+
+    /// 设计 B（期望比例为 0/负/NaN）：不 panic，退化为「小 k 优先」与无先验同解。
+    #[test]
+    fn invalid_expected_ratio_degrades_safely() {
+        let prev = format!("{S}{S}{S}");
+        let new = format!("{S}{S}{S}");
+        let base = align_overlap_with_prior(&prev, &new, AlignPrior::none());
+        for bad in [0.0f32, -1.0, f32::NAN] {
+            let r = align_overlap_with_prior(
+                &prev,
+                &new,
+                AlignPrior {
+                    expected_ratio: Some(bad),
+                    prev_extra_slices: 0,
+                },
+            );
+            assert_eq!(r.ok, base.ok, "非法比例 {bad} 应与无先验同解");
+            assert_eq!(
+                r.overlap_chars, base.overlap_chars,
+                "非法比例 {bad} k 应一致"
+            );
+            assert_eq!(r.committed_prefix, base.committed_prefix);
+            assert!(
+                !r.committed_prefix.is_empty(),
+                "非法比例 {bad} 必须退化到小 k（committed 非空、不丢字）"
+            );
+        }
+    }
+
+    /// 设计 B：极短窗（1~2 字）低于最小重叠长度 ⇒ 保守不对齐；经 OrderedReflow 也不丢。
+    #[test]
+    fn tiny_windows_are_conservative() {
+        for (p, n) in [("你", "你"), ("你好", "你好"), ("你", "好")] {
+            assert!(!align_overlap(p, n).ok, "极短窗必须保守不对齐（{p}/{n}）");
+        }
+        let mut o = OrderedReflow::new();
+        let _ = o.push(0, 0, 1, "甲".to_string());
+        let _ = o.push(1, 1, 2, "乙".to_string());
+        let (c, l) = o.finish();
+        let full = format!("{c}{l}");
+        assert!(
+            full.contains('甲') && full.contains('乙'),
+            "极短窗内容不得丢：{full}"
+        );
+    }
+
+    /// 设计 B：`prev_extra_slices=0`（两窗起点相同）不施加硬上界；无真重叠不强行提交。
+    #[test]
+    fn zero_extra_slices_no_hard_cap_but_no_force_commit() {
+        let r = align_overlap_with_prior(
+            "0123456789ABCDEF",
+            "6789ABCDEFGHIJKL", // 真值重叠 10 字
+            AlignPrior {
+                expected_ratio: None,
+                prev_extra_slices: 0,
+            },
+        );
+        assert!(r.ok, "m=0 不设硬上界，真重叠应能对上");
+        assert_eq!(r.overlap_chars, 10, "真值 10 不得被硬上界压小");
+        assert_eq!(r.committed_prefix, "012345");
+        let r2 = align_overlap_with_prior(
+            "aaaabbbb",
+            "ccccdddd", // 无真重叠
+            AlignPrior {
+                expected_ratio: None,
+                prev_extra_slices: 0,
+            },
+        );
+        assert!(!r2.ok, "无真实重叠不得强行提交");
+    }
+
+    /// 设计 B：`slice_samples` 与区间不自洽（长度对不上）⇒ 安全退化、不丢内容。
+    #[test]
+    fn inconsistent_slice_samples_degrade_safely() {
+        let mut o = OrderedReflow::new();
+        assert_eq!(
+            o.push_window(0, 0, 3, vec![100, 200, 300], "甲乙丙".to_string())
+                .len(),
+            1
+        );
+        // 区间 [1,4) 长 3，样本表 len=2 ⇒ 不自洽
+        let out = o.push_window(1, 1, 4, vec![100, 200], "乙丙丁".to_string());
+        assert_eq!(out.len(), 1);
+        let (c, l) = o.finish();
+        let full = format!("{c}{l}");
+        assert!(
+            full.contains('甲') && full.contains('丁'),
+            "不自洽信息下不得丢内容：{full}"
+        );
+    }
+
+    /// 设计 B：乱序到达 + 中间窗空文本（解码失败）⇒ 按 seq 有序定稿、空窗不污染。
+    #[test]
+    fn out_of_order_with_empty_middle_window() {
+        let mut o = OrderedReflow::new();
+        assert_eq!(o.push(0, 0, 2, "甲乙".to_string()).len(), 1);
+        assert!(
+            o.push(2, 4, 6, "戊己".to_string()).is_empty(),
+            "seq1 未到 ⇒ seq2 挂起"
+        );
+        let out = o.push(1, 2, 4, String::new());
+        assert_eq!(out.len(), 1, "空窗推进 next 后 seq2 应可定稿");
+        let (c, l) = o.finish();
+        let full = format!("{c}{l}");
+        assert!(
+            full.contains('甲') && full.contains('戊'),
+            "乱序+空窗后内容不得丢：{full}"
+        );
+    }
+
+    /// 设计 B（全程不变量）：混合序列（零重叠 / 对齐失败 / 正常重叠）下不丢任何窗口独有内容。
+    #[test]
+    fn no_window_content_is_ever_lost() {
+        let mut o = OrderedReflow::new();
+        let _ = o.push(0, 0, 3, "甲乙丙".to_string());
+        let _ = o.push(1, 3, 6, "丁戊己".to_string()); // 零重叠 ⇒ 拼接
+        let _ = o.push_window(2, 5, 8, vec![1], "戊己庚辛".to_string()); // 信息不自洽
+        let _ = o.push_window(3, 7, 10, vec![100, 100, 100], "庚辛壬癸".to_string());
+        let (c, l) = o.finish();
+        let full = format!("{c}{l}");
+        for ch in ['甲', '乙', '丙', '丁', '戊', '己', '庚', '辛', '壬', '癸'] {
+            assert!(full.contains(ch), "窗口独有内容 '{ch}' 丢失：{full}");
+        }
+    }
+
+    /// 设计 B：极长窗（300 字）不 panic、内容不丢。
+    #[test]
+    fn very_long_window_aligns_without_panic() {
+        let long = S.repeat(30); // 360 字
+        let mut o = OrderedReflow::new();
+        let _ = o.push(0, 0, 10, long.clone());
+        let out = o.push(1, 5, 15, long);
+        assert_eq!(out.len(), 1);
+        let (c, l) = o.finish();
+        assert!(!format!("{c}{l}").is_empty());
+    }
+}
