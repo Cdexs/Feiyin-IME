@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
 
-/// 最大录音时长（秒），硬编码，不可通过 config 修改
-pub const MAX_RECORD_SECONDS: u64 = 300;
+/// 最大录音时长（秒），硬编码，不可通过 config 修改。
+/// DUAL-PATH-REFINE-364（Gavin 2026-09-22）：300 → **180**（配合路B 全量解码预算）。
+pub const MAX_RECORD_SECONDS: u64 = 180;
 /// 最长静默间隔（毫秒），超过此时长无声音则自动停止录音
 pub const SILENCE_DURATION_MS: u64 = 30_000;
 
@@ -1607,11 +1608,12 @@ clipboard_delay_ms = 150
 
     /// ASR-038-B-008: MAX_RECORD_SECONDS 是录音/轮询硬上限的唯一权威来源，
     /// 039 的 translate poll 硬上限 = MAX_RECORD_SECONDS + 5 依赖此值不被随意改动。
+    /// DUAL-PATH-REFINE-364（Gavin 2026-09-22）：300 → 180。
     #[test]
-    fn max_record_seconds_is_300() {
+    fn max_record_seconds_is_180() {
         assert_eq!(
-            MAX_RECORD_SECONDS, 300,
-            "MAX_RECORD_SECONDS must stay 300s (translate poll hard cap derives from it)"
+            MAX_RECORD_SECONDS, 180,
+            "MAX_RECORD_SECONDS must stay 180s (translate poll hard cap derives from it)"
         );
     }
 

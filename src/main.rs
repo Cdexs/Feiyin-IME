@@ -8405,12 +8405,110 @@ fn spawn_worker_thread(
                                 tail_wait_ms
                             );
                         }
+                        // ── DUAL-PATH-ACC-363：路B（累积全量解码，松手后**一次**）──
+                        // 全量音频 = ASR 线程返回的 `local_pcm`（`local_stream.rs:462` 第二元），
+                        // 无需在采集/回调路径额外累积 ⇒ **路A 主路径零新增开销**。
+                        // 路B 在 `acc_handle.join()` 之后才跑（路A worker 已结束）⇒ 不与预览刷新竞争。
+                        // 预算够且解码成功 ⇒ 用路B 全文；否则**降级**退回现有切片拼装（绝不硬塞，DEC-069）。
+                        let path_b_terms = load_hotwords_for_accuracy(&config);
+                        let path_b_text: Option<String> = {
+                            // 借用 `local_pcm`，不消费 `asr_result`（后面还要 destructure）。
+                            let pcm_opt: Option<&[f32]> = match &asr_result {
+                                Ok(Ok((_, pcm))) => Some(pcm.as_slice()),
+                                _ => None,
+                            };
+                            match pcm_opt {
+                                Some(pcm) if !pcm.is_empty() => {
+                                    let audio_secs = pcm.len() as f32 / 16000.0;
+                                    let audio_tokens =
+                                        transcription::expected_audio_tokens(pcm.len());
+                                    let inject_tokens = transcription::estimate_inject_tokens(
+                                        ctx_prev2.as_deref(),
+                                        path_b_terms.as_deref(),
+                                    );
+                                    if transcription::path_b_budget_ok(
+                                        pcm.len(),
+                                        ctx_prev2.as_deref(),
+                                        path_b_terms.as_deref(),
+                                    ) {
+                                        match transcriber
+                                            .as_ref()
+                                            .and_then(|t| t.offline_recognizer())
+                                        {
+                                            Some(rec) => {
+                                                // 🔴 与路A 同款注入：**跨录音**上下文（前两次录音，320）
+                                                // + 词库。全量解**不带 current**（本次录音全在音频里、
+                                                // 无需前文文字），但**必须**带 prev_older/prev_latest
+                                                // —— 上次说的话不在本次音频里，全量解自己拿不到。
+                                                let inject = transcription::CtxInject {
+                                                    prev_older: ctx_prev2.as_deref(),
+                                                    prev_latest: ctx_prev1.as_deref(),
+                                                    current: None,
+                                                    terms: path_b_terms.as_deref(),
+                                                };
+                                                match transcription::transcribe_acc_ctx(
+                                                    rec,
+                                                    pcm,
+                                                    config.audio.chinese_script,
+                                                    0,
+                                                    inject,
+                                                ) {
+                                                    Ok((t, _)) if !t.trim().is_empty() => {
+                                                        log::info!(
+                                                            "DUAL-PATH-363 路B 全量解成功：audio={:.1}s audio_tok={} inject_tok={} chars={}",
+                                                            audio_secs,
+                                                            audio_tokens,
+                                                            inject_tokens,
+                                                            t.chars().count()
+                                                        );
+                                                        Some(t)
+                                                    }
+                                                    Ok(_) => {
+                                                        log::info!(
+                                                            "DUAL-PATH-363 路B 全量解为空，退回切片拼装（audio={:.1}s）",
+                                                            audio_secs
+                                                        );
+                                                        None
+                                                    }
+                                                    Err(e) => {
+                                                        log::info!(
+                                                            "DUAL-PATH-363 路B 全量解失败，退回切片拼装：{}（audio={:.1}s）",
+                                                            e,
+                                                            audio_secs
+                                                        );
+                                                        None
+                                                    }
+                                                }
+                                            }
+                                            None => {
+                                                log::info!(
+                                                    "DUAL-PATH-363 路B 无 offline recognizer，退回切片拼装"
+                                                );
+                                                None
+                                            }
+                                        }
+                                    } else {
+                                        log::info!(
+                                            "DUAL-PATH-363 路B 降级（预算不足）：退回切片拼装；audio={:.1}s audio_tok={} inject_tok={} max_total_len={}",
+                                            audio_secs,
+                                            audio_tokens,
+                                            inject_tokens,
+                                            transcription::PATH_B_MAX_TOTAL_LEN
+                                        );
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            }
+                        };
+                        // 最终文本来源：路B（若成功）**整体替换**切片拼装（不再算拼接边界）。
+                        let final_src: &str = path_b_text.as_deref().unwrap_or(acc_joined.as_str());
                         let pretranscribed = if acc_parallel_result_usable(
                             cancel_signal.load(Ordering::Acquire),
-                            &acc_joined,
+                            final_src,
                         ) {
                             let normalized = text_normalizer::normalize_text_for_language(
-                                &acc_joined,
+                                final_src,
                                 config.audio.chinese_script,
                             );
                             // PUNCT-FINAL-REDO-350：**仅本地 realtime** 在此串接「标点剥离节点」

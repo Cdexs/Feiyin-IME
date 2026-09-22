@@ -1164,6 +1164,90 @@ fn estimate_word_tokens(tk: Option<&tokenizers::Tokenizer>, word: &str) -> usize
     estimate_word_tokens_with(tk, word, HOTWORDS_CPP_SAFETY_FACTOR)
 }
 
+// ============================================================
+// DUAL-PATH-ACC-363/364：路B（累积全量解码）预算闸门 —— 精确计算版
+// ============================================================
+
+/// 生成预留 = 生产 `max_new_tokens`（256）。
+pub(crate) const PATH_B_GEN_RESERVE: usize = 256;
+/// 只防取整/边界的安全余量（DUAL-PATH-REFINE-364：512 → **64**）。
+/// 🔴 不再承担「估算不准」兜底 —— 音频/注入段两项都已**精确计算**（见下）；
+/// 本余量仅覆盖取整与最后 ±1 token 边界。DEC-069 撞顶静默丢字，故不取 0。
+pub(crate) const PATH_B_SAFETY_MARGIN: usize = 64;
+/// 与 `create_qwen3_recognizer` 的 `max_total_len` 耦合（当前 4096，本单不改）。
+pub(crate) const PATH_B_MAX_TOTAL_LEN: usize = 4096;
+/// Whisper mel 帧 hop（16kHz，10ms/帧，hop=160 样本）。
+const QWEN3_MEL_HOP_SAMPLES: usize = 160;
+/// Qwen3 conv 前端分块大小（sherpa C++ `kQwen3ChunkSize`，单位=mel 帧）。
+const QWEN3_CONV_CHUNK_SIZE: i32 = 100;
+
+/// 移植 sherpa C++ `FeatToAudioTokensLen(feat_len, chunk_size)`（`offline-recognizer-qwen3-asr-impl.cc:77`）。
+/// 纯函数、**精确**：每 `chunk_size`(100) mel 帧 → `conv_out_len_3x_stride2(100)`=13 个 audio token，
+/// 余数走 `aftercnn`。20s(2000 帧) ⇒ 20×13 = 260，与实测 13.0 tok/s 吻合。
+fn feat_to_audio_tokens(feat_len: i32, chunk_size: i32) -> i32 {
+    if feat_len <= 0 || chunk_size <= 0 {
+        return 0;
+    }
+    fn conv_out_len_3x_stride2(n: i32) -> i32 {
+        let x = (n + 1) / 2;
+        let x = (x + 1) / 2;
+        (x + 1) / 2
+    }
+    fn aftercnn(x: i32) -> i32 {
+        if x <= 0 {
+            return 0;
+        }
+        let x = (x - 1) / 2 + 1;
+        let x = (x - 1) / 2 + 1;
+        (x - 1) / 2 + 1
+    }
+    let full = feat_len / chunk_size;
+    let rem = feat_len % chunk_size;
+    let mut out = full * conv_out_len_3x_stride2(chunk_size);
+    if rem > 0 {
+        out += aftercnn(rem);
+    }
+    out.max(0)
+}
+
+/// 路B 音频 token 数（**精确**）：mel 帧数取上界 `ceil(samples/hop)`（保守 ±1 帧），
+/// 再走 C++ 同款降采样公式。
+pub(crate) fn expected_audio_tokens(num_samples: usize) -> usize {
+    let feat_len = num_samples.div_ceil(QWEN3_MEL_HOP_SAMPLES) as i32;
+    feat_to_audio_tokens(feat_len, QWEN3_CONV_CHUNK_SIZE).max(0) as usize
+}
+
+/// 路B 注入段 token 数（**精确**）：对**实际要注入的 system 串**（`build_ctx_system`：清理指令
+/// + **跨录音上下文**（320）+ 词库）用 tokenizer 实数，再乘 `HOTWORDS_CPP_SAFETY_FACTOR`(2.0)
+/// 以覆盖「我方 tokenizer 与 C++ 手搓 BPE 的计数差异」（DEC-074）。三项一次算准，不重复扣。
+pub(crate) fn estimate_inject_tokens(context: Option<&str>, terms: Option<&str>) -> usize {
+    match build_ctx_system(context, terms) {
+        Some(s) => estimate_word_tokens(hotwords_tokenizer().as_ref(), &s),
+        None => 0,
+    }
+}
+
+/// DUAL-PATH-ACC-364：路B 预算闸门 —— **精确计算**。
+///
+/// 判据：`音频token(精确) + 注入段token(精确) + 生成预留 + 安全余量 ≤ max_total_len`。
+/// - 音频：`expected_audio_tokens`（C++ 同款降采样公式，**非** 13.0 tok/s 估算）；
+/// - 注入段：`estimate_inject_tokens`（tokenizer 实数 × C++ 差异系数，含跨录音上下文 + 词库
+///   + 提示词脚手架）；
+/// - 余量仅 64（取整边界），不再承担估算兜底。
+///
+/// `true` ⇒ 路B 跑全量；`false` ⇒ 降级退回切片拼装（绝不硬塞）。180s 上限下**不会降级**。
+pub(crate) fn path_b_budget_ok(
+    num_samples: usize,
+    context: Option<&str>,
+    terms: Option<&str>,
+) -> bool {
+    expected_audio_tokens(num_samples)
+        + estimate_inject_tokens(context, terms)
+        + PATH_B_GEN_RESERVE
+        + PATH_B_SAFETY_MARGIN
+        <= PATH_B_MAX_TOTAL_LEN
+}
+
 /// ASR-ACC-OPT-001 方案 A：判定词条是否为纯 ASCII（纯英文/数字）。
 /// 纯 ASCII 词条（worker1/tester1/todo 等无关词）带偏 native decoder，
 /// 研究证实全量 wordbook 含此类词性能从 62.5% 降到 60%。
@@ -3764,5 +3848,61 @@ mod strip_lang_prefix_359_tests {
             Transcriber::strip_asr_special_tokens("今天天气不错。"),
             "今天天气不错。"
         );
+    }
+}
+
+// ============================================================
+// DUAL-PATH-REFINE-364：路B 预算闸门单测（精确计算版）
+// 运行：cargo test --bin feiyin-ime -- path_b_budget
+// ============================================================
+#[cfg(test)]
+mod path_b_budget_364_tests {
+    use super::{estimate_inject_tokens, expected_audio_tokens, path_b_budget_ok};
+
+    /// 精确音频 token：20s→260（=13.0 tok/s 实测）、180s→2340。
+    #[test]
+    fn exact_audio_tokens_match_measured_rate() {
+        assert_eq!(
+            expected_audio_tokens(16_000 * 20),
+            260,
+            "20s 应 260（实测 13.0 tok/s）"
+        );
+        assert_eq!(expected_audio_tokens(16_000 * 180), 2340, "180s 应 2340");
+    }
+
+    /// 🔴 180s（当前 MAX_RECORD_SECONDS 上限）在典型词库/上下文下**不降级**。
+    #[test]
+    fn no_degrade_within_180s_limit() {
+        assert!(path_b_budget_ok(16_000 * 180, None, None), "180s 裸音频");
+        assert!(
+            path_b_budget_ok(
+                16_000 * 180,
+                None,
+                Some("哈兰德,挪威,世界杯,巴西,英格兰,迈阿密")
+            ),
+            "180s + 典型词库"
+        );
+        // 带跨录音上下文（最多 CTX_DEFAULT_CHARS=500 字）
+        let ctx = "上一轮我讲了很多关于这个项目的内容".repeat(20);
+        assert!(path_b_budget_ok(16_000 * 180, Some(&ctx), Some("哈兰德")));
+    }
+
+    /// 超长 / 巨词库 ⇒ 仍会降级（闸门逻辑必须保留，防未来改上限/大词库）。
+    #[test]
+    fn still_degrades_when_truly_over() {
+        assert!(!path_b_budget_ok(16_000 * 600, None, None), "600s 应超预算");
+        assert!(
+            !path_b_budget_ok(16_000 * 180, None, Some(&"超长词库".repeat(2000))),
+            "巨词库即使 180s 也应超"
+        );
+    }
+
+    /// 注入段计数：含提示词脚手架 ⇒ 恒 >0；词库越多越大。
+    #[test]
+    fn inject_tokens_positive_and_monotonic() {
+        let small = estimate_inject_tokens(None, None);
+        let big = estimate_inject_tokens(None, Some(&"词条".repeat(50)));
+        assert!(small > 0, "即使无上下文/词库，也含清理指令脚手架 ⇒ >0");
+        assert!(big > small, "词库越多注入越大");
     }
 }

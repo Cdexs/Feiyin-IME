@@ -19,6 +19,27 @@
 - **Gavin 端测六条**：①核心=预览标点不打句中 ②⚠️已知代价：长不停顿说话预览持续无标点（到期 1200ms 才打）——请明确能否接受 ③350 最终标点无 `。。` ④在线 realtime / 本地 performance 两档标点须与上版完全一致 ⑤346 `[LocalRT-DBG-298] seg dispatch` 的 `silence=` 恒 ≥1200ms ⑥不得新增 `target/release/crash.json`。
 - **红线**：版本由主控升未动 / 未改生产代码 / 未 push / 未 `cargo clean` / 未动 `models/…-1.7B-…`（2.2GiB）/ 零凭证。
 
+## 2026-09-22 — coder-1 — DUAL-PATH-REFINE-364 ✅ 交付（录音上限 180s + 预算精确计算）
+
+- **Gavin**：批准「估算→精确计算、缩小余量」；录音上限 300→180s。
+- **Part1**：`config/mod.rs` `MAX_RECORD_SECONDS=180`；连带断言 `max_record_seconds_is_180`、`hotkey` 文案 305→185（`+5` 算式未动）、`qwen_inference` 注释 300→180；全仓 grep 无其它硬编码。
+- **Part2**：`expected_audio_tokens`（移植 C++ `FeatToAudioTokensLen`，chunk=100；20s→260 吻合实测、180s→2340）+ `estimate_inject_tokens`（对实际注入 system 串 tokenizer 实数 ×2.0 差异系数，含跨录音上下文+词库）；`SAFETY_MARGIN` **512→64**；删旧估算常量。判据 `audio+inject+256+64 ≤ 4096` ⇒ 阈值 ≈`(3776−inject)/13`s（典型≈272s、带满上下文≈213s）；**180s 不降级**；闸门保留防未来大词库/改上限。
+- **CONTEXT_RESERVE 含义不变**（跨录音语意背景，必须扣），数值来源改实数。
+- **验证**：`cargo build --release` EXIT 0；全量 `cargo test --no-fail-fast` 0 failed（1363P/27I）；warnings 98/89 基线；numstat==-w；单测全绿。路A 未碰 `local_stream.rs`。
+- **未出包**（DEC-079）；未改版本；未 push；零凭证。
+- **端测**：180s 满长仍不降级（若日志见 `路B 降级` 回报）；满长松手等待（~74s）实感。
+
+## 2026-09-22 — coder-1 — DUAL-PATH-ACC-363 ✅ 交付（acc 双路：路A 切片刷预览 + 路B 累积全量出终文）
+
+- **Gavin 指示**：acc 后台分两路 —— 一路实时预览的最新切片回灌刷新预览；一路累积喂入形成最终输出文本。
+- **路A 零改动**：1200ms 静默探测（346）/ 派发 / 回灌（325/329）判定体一行未动，**不碰 local_stream.rs**。
+- **路B 新增**：松手后在 `acc_handle.join()` 之后跑**一次全量解**。全量音频 = ASR 线程返回的 `local_pcm`（`local_stream.rs:462`）⇒ **无额外累积、主路径零新增开销**；**不中途预解**（361 证无增量复用）。调用 `transcribe_acc_ctx`，**注入跨录音上下文（ctx_prev2/ctx_prev1）+ 词库**，`current=None`。成功 ⇒ 全文**整体替换**切片拼装；失败/降级 ⇒ 退回拼装。复用 `pretranscribed` 通路、最小改动。
+- **预算闸门** `path_b_budget_ok(audio_secs, terms_tokens)`：`音频×13 + 词库 + 生成256 + 提示词45 + 上下文385 + 余量512 ≤ 4096`；不够 ⇒ 路B 降级 + log::info!（原因+秒数）。常量注释：CONTEXT_RESERVE=跨录音背景（真实需要必须扣）/ SAFETY_MARGIN=防估算偏差撞顶（DEC-069，故意不用满）/ 200s=典型词库等价参考值非实测边界。
+- **验证**：check 0 error；**`cargo build --release` EXIT 0**；**全量 `cargo test --no-fail-fast` 0 failed**（root 1363P/27I）；warnings **98/89 = 基线**；`--numstat`==`-w`（main 94/2、transcription 100/0）；闸门单测 4 条全绿。
+- **阶段一方案**主控确认（并纠回第③点：CONTEXT_RESERVE 保留 + 路B 必须注入跨录音上下文）。
+- **未出包**（DEC-079）；未改版本 / 未 push / 零凭证。
+- **端测清单（交 Gavin）**：① 接缝重复（多名多名）是否消失 ② 预览刷新是否仍然快（路A 未动）③ 松手后等待（一次全量解，RTF≈0.41）实感是否可接受 ④ 超长录音（>~200s）是否正确降级并打日志 ⑤ 全量解是否自我纠错前文。
+
 ## 2026-09-22 — coder-1 — POC-TIMESTAMP-DECODE-CURVE-361 ✅ 交付（RP-1 时间戳不填值；decode 线性、无增量复用）
 
 - **任务**：RP-1 时间戳可用性 + RP-3① decode 开销曲线（纯 PoC，零生产代码；走生产 `create_qwen3_recognizer_at` 路径）。

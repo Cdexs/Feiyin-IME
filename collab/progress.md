@@ -1,4 +1,17 @@
 
+### 2026-09-22 · DUAL-PATH-REFINE-364 交付（录音上限 180s + 预算精确计算）
+
+- 录音上限 `MAX_RECORD_SECONDS` 300→**180**（含断言/文案/注释连带）。
+- 路B 预算改**精确计算**：音频 token 移植 C++ `FeatToAudioTokensLen`（20s→260 吻合实测、180s→2340）；注入段（清理指令+跨录音上下文+词库）tokenizer 实数×2.0；`SAFETY_MARGIN` 512→64。判据 `audio+inject+256+64 ≤ 4096` ⇒ 阈值 ≈`(3776−inject)/13`s，**180s 不降级**；闸门保留。
+- 验证：`cargo build --release` EXIT 0；全量 `cargo test --no-fail-fast` 0 failed（1363P）；warnings 98/89 基线；numstat==-w。**未出包**（DEC-079）。
+
+### 2026-09-22 · DUAL-PATH-ACC-363 交付（acc 双路：路A 切片刷预览 + 路B 累积全量出终文）
+
+- Gavin 拍板：acc 后台分两路。路A 保持现状（1200ms 静默→最新片→回灌预览，零改动）；路B 松手后跑一次**累积全量解**，全文整体替换切片拼装作最终输出（无拼装 ⇒ 接缝重复消失 + 自我纠错前文）。
+- 全量音频取 ASR 线程返回的 `local_pcm` ⇒ 主路径零新增开销；不中途预解（361 证无增量复用）。路B 走 `transcribe_acc_ctx`，注入跨录音上下文 + 词库。
+- 预算闸门 `path_b_budget_ok`（音+词库+生成+提示+上下文+余量 ≤ 4096）；不够则路B 降级退回拼装并打日志。
+- 验证：`cargo build --release` EXIT 0；全量 `cargo test --no-fail-fast` 0 failed（1363P）；warnings 98/89 基线；numstat==-w；闸门单测 4 条。**未出包**（DEC-079）。
+
 ### 2026-09-22 · POC-TIMESTAMP-DECODE-CURVE-361 交付（RP-1 时间戳不填值；decode 线性、无增量复用）
 
 - 纯 PoC 零生产代码。
