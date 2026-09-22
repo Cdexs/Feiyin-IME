@@ -6,6 +6,15 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-22 — tester-1 — TEST-EXEC-371 ✅ 阶段四全量回归（不出包；三套全绿，NEW 33/GONE 0）
+
+- **交付源码**：HEAD `77185aa`（`7398459` FIX-PREFIX-AND-EAT-371 + `77185aa` TEST-SYNC-371），工作区 clean。🔴 **未出包**（DEC-079，等 Gavin）、未 build release、未动 `Publish/`。
+- **三套测试**：root `cargo test --no-fail-fast`（全量未过滤）**1511P/0F/30I**（EXIT 0；`feiyin-ime` bin **1423P/28I**）；`src-tauri` **92P/0F/0I**；Vitest **7 files/100P/11S/0F**；`cargo fmt --check`（不带 `skip_children`）**EXIT 0**；warnings **98/88/17** = 基线未升。
+- **NEW/GONE 对账（基线 1390P/28I ⇒ 净 +33P）**：NEW **33** = `7398459` 实测 **10** 条（8 条 `fix371_repeat_align_tests` + **2 条前缀模块新增** `near_head_non_label_is_stripped`/`mid_body_marker_is_not_stripped`）+ `77185aa` 阶段三 **23** 条；**GONE 0**（`-#[test]`=0；`degenerate_does_not_harm_body` 仅改断言、名未变；删的 `is_qwen3_language_label` 是辅助函数）。
+- 🔴 **与任务书预期差异（如实报）**：任务书按 371=8 条算预期 31（1421）；**实测 371=10**（漏计前缀模块 2 条）⇒ `1390+33=1423` 才吻合。
+- **重点失效模式（吃字/重复字）核查**：`align` / `ordered_reflow` / `periodic` / `strip_qwen3` / `prefix` 相关用例**全部通过、0 失败**，无停手条件；无失败用例需贴 panic。
+- **红线**：未改代码 / 未改版本号 0.9.3 / 未 push / 零凭证。
+
 ## 2026-09-22 — tester-1 — TEST-SYNC-371 ✅ 交付（阶段三 · 非作者视角补 23 条护栏；生产代码零改动）
 
 - **性质**：阶段三 TEST-SYNC，**按设计契约写用例**（不读实现反推），只改 `#[cfg(test)]` 区。目标 = `FIX-PREFIX-AND-EAT-371`（A 语种前缀剥离 / B 滑窗对齐 / C 接线）。
