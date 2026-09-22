@@ -92,7 +92,7 @@ const DEFAULT_MAX_SENTENCE_SILENCE: i64 = 2000;
 /// ASR-056: heartbeat 心跳
 ///
 /// 调优结论：**不设置**（保持默认）
-/// - 我们录音最长 180s（MAX_RECORD_SECONDS），finish-task 后 10s 静音超时已覆盖
+/// - 我们录音最长 300s（MAX_RECORD_SECONDS），finish-task 后 10s 静音超时已覆盖
 /// - 录音期间持续发送音频帧（每 100ms 一片），本身就是「心跳」，服务端不会因静音断开
 /// - 长静音场景：用户按住热键不说话，本地 VAD 2s 保底建连后会发 pre-roll + 环境噪声帧
 /// - 依据：官方文档 heartbeat 字段功能描述为「维持连接」，我们音频流本身就是持续信号

@@ -5,8 +5,11 @@ use std::io::Write;
 use std::path::PathBuf;
 
 
-/// 最大录音时长（秒），硬编码，不可通过 config 修改
-pub const MAX_RECORD_SECONDS: u64 = 180;
+/// 最大录音时长（秒），硬编码，不可通过 config 修改。
+/// 🔴 FIX-REMOVE-HARDSPLIT-370：与主程序 `src/config/mod.rs` 的
+/// `MAX_RECORD_SECONDS` **保持同值**（180 → 300，Gavin 定）；本文件当前无引用点，
+/// 保留作 UI 侧镜像，改主程序时必须同步此值。
+pub const MAX_RECORD_SECONDS: u64 = 300;
 /// 最长静默间隔（毫秒），超过此时长无声音则自动停止录音
 pub const SILENCE_DURATION_MS: u64 = 8_000;
 

@@ -6,7 +6,19 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
-## 2026-09-22 — tester-1 — TEST-EXEC + BUILD-347 ✅ 出包（v0.9.3 批次十一；八项 + 三特殊点全 PASS）
+## 2026-09-22 — tester-1 — TEST-EXEC + BUILD-348 ✅ 重出包（修 P0 吃字；八项 + 三特殊点全 PASS）｜🔴 BUILD-347 作废
+
+- **重出原因**：BUILD-347 含 **P0 吃字**（`OrderedReflow::push` 对齐失败时无条件替换 `last_window_text` ⇒ 滑出文本永久丢失）。由 **`FIX-ORDERED-REFLOW-DROP-368`（HEAD `4201d39`）** 修复：新增常量 `REFLOW_FALLBACK_FAILS=3`，连续失败达阈值把旧 `last_window_text` 整体并入 committed（兜底不去重）。
+- **差异**：368 仅改 `src/transcription/mod.rs`（+133/−18）+文档；**未动** `align_overlap`/`group_window_start_secs`/管线接线/dll/模型/itn ⇒ dll 与 itn 三副本、`Publish/models/` 1.7B **仅核验不重拷**（结果均通过）。
+- **回归（@ `4201d39`）**：root `cargo test --no-fail-fast` **1467P/0F/30I**（EXIT 0；`feiyin-ime` bin **1379P/28I** = 任务书基线逐位吻合）；`src-tauri` **92P/0F/0I**；Vitest **7 files/100P/11S/0F**（`ui/` 无 diff 仍执行）；`cargo fmt --check`（不带 `skip_children`）**EXIT 0**。
+- **NEW/GONE**：NEW **3** = 368 三条 `ordered_reflow_*`；**GONE 0**（3 条旧乱序测试原地换长文本样本、名字仍在）。⚠️ 任务书写「4 条新单测」，实测 `git diff` 增 `#[test]`=3；`1376+3=1379` 与基线自洽 ⇒ 以实测 3 为准。
+- **BUILD-348**：Step1 残 0 → Step2 npm 610ms + Tauri 1m51s（17w）→ Step3 主程序 2m43s（**98w** + crash 9w）→ Step4 UI 同步 + 三 exe→Publish。产物 main `f9ba2822c731…`（14,739,456B/20:02:04）/ ui `7d72bced2fc6…`（10,050,048B/19:59:10）/ crash `61e3ab00869b…`（24,879,104B/20:00:19）；两副本全等、均异于作废的 BUILD-347（`edf7d088…`/`af045bc8…`/`6d71c620…`）。
+- **八项逐项 PASS**：①时间戳 19:59–20:02 ②sha 两副本 + 异于上包 ③**0.9.3** ④冒烟 PID **8112 Responding=True** / 两处无新 crash.json / panic 0 / 残 0 ⑤config `da2be5da…` 三时点不变 + wordbook 不变 ⑥warnings **98/88/17**（test 88 vs 基线 89，−1 如实报）⑦探针（正 `SLIDING-WINDOW-367`=**4**/`[LocalRT-DBG-298]`=**3**/`AUTOLEARN`=**11**；反 `sub-seg failed`=0/`PUNCT_REFRESH_INTERVAL`=0/`ACC_MIN_SEGMENT_MS_DEFAULT`=0/`min_seg_ms`=0）⑧四表三副本全等。
+- **三特殊点（仅核验）**：① dll 四张 `sherpa-onnx-lib`=`Publish`=`target-release` 三副本全等，`onnxruntime.dll`=`422d776a…`、**ProductVersion=1.28.2**；② itn-rules 三副本 `60b227de…` 全等；③ `Publish/models/` 1.7B 齐全且与源逐一 sha256 全等（0.6B 保留）。
+- **Gavin 端测**：🔴 **置顶新增=吃字/重复字重点复测**（说 4 句以上让滑窗多次，看最终文本有无整段消失，368 修的就是这个）+ 原九条（松手等待时间/预览修正/接缝重复/标点语义/1.7B 质量/梅开二度·一度/长录音 180s/不新增 crash.json/重启输入法）。
+- **红线**：版本未动 / 未改生产代码 / 未 push / 未 `cargo clean` / 未动 models 源目录 / 零凭证。
+
+## 2026-09-22 — tester-1 — TEST-EXEC + BUILD-347 ✅ 出包（v0.9.3 批次十一；八项 + 三特殊点全 PASS）🔴 后因 P0 吃字作废
 
 - **交付源码**：HEAD **`ae166e6`**（含主控 fmt 修复），版本 0.9.3。范围：354/356 ITN、359（sherpa 1.13.8/ORT 1.28.2 + Qwen3 **1.7B** + 剥前缀）、363/364（双路 + 上限 300→180s）、DEC-080/365（摘剥光标点节点）、367（滑动窗口四阶段）。
 - **🔴 fmt 卡点（过程）**：首轮 `cargo fmt --check` EXIT=1（唯一 `src/transcription/mod.rs:4210`，367 测试 `assert!` 超宽）。判断「必须出包前修、否则重出」→ 上报主控；主控以 `ae166e6` 纯 rustfmt 折行修复。**tester 未改 src**，在 `ae166e6` **重跑全量**绑定交付。
@@ -262,3 +274,32 @@
 - **单测**：4 条新增全绿（中途失败不丢字 / 失败不产出 / 连续失败兜底 / next 推进）；3 条旧乱序测试改用长文本同步。
 - **验证**：`cargo fmt --check` EXIT 0；全量 cargo test 0 failed（1379P/28I）；`cargo build --release` EXIT 0；warnings 98/89 基线；numstat（transcription 115/18 vs -w 111/14，差 4 行 whitespace-only 落改动区块内）。
 - **未改版本 / 未 push / 零凭证**。🔴 BUILD-347 含此缺陷，须重出包。
+## 2026-09-22 — coder-1 — FIX-WINDOW-DISJOINT-369 🔴 P0 ✅ 交付
+
+- **缺陷**：12s 封顶把窗口切到「与上一窗零重叠」（单片 9.34s 顶满）⇒ 对齐必败；368 的「失败 ⇒ 整窗跳过」
+  在必败场景下变成**整窗内容全丢**（Gavin BUILD-348：6 片 31s ⇒ 最终 50 字，后半段消失）。
+- **修法**：`OrderedReflow` 改用**切片区间**判重叠（`push(seq, start_slice, end_slice, text)`）——
+  ①零重叠 ⇒ **直接拼接**（无重复可去，绝不跳过）；②有重叠 + 对齐成功 ⇒ 去重；
+  ③有重叠 + 对齐失败（长度门误拒）⇒ **退回拼接**（宁可重复不可丢字）。
+  `main.rs` 传窗口全局区间 `[total_slices - recent_slices.len() + start, total_slices)`。
+- **范围**：`src/transcription/mod.rs`（OrderedReflow + 单测）、`src/main.rs`（切片区间追踪）；
+  **未动** `align_overlap`/`group_window_start_secs`/长度门常量；移除死状态 `fail_streak`/`REFLOW_FALLBACK_FAILS`；未碰 `itn.rs`。
+- **单测**：新增 4（真实日志序列 6 片全在 / 零重叠拼接 / 有重叠去重 / 有重叠失败退回拼接）；删 1（368 阈值兜底，已被③取代）；改 6（签名 + 语义）。
+- **反证**：临时改回 368「跳过整窗」⇒ 真实序列测试 FAILED（片5 整窗丢失，复现 Gavin 现象）。
+- **验证**：`cargo fmt --check` EXIT 0；全量 cargo test 0 failed（1382P/28I）；`cargo build --release` EXIT 0；warnings 98/88；
+  numstat main 32/2、mod 212/82（-w 205/75，7 行 whitespace-only 落改动区块内）。
+- **未改版本 / 未 push / 零凭证**。🔴 **BUILD-348 含此缺陷，须重出包。**
+## 2026-09-22 — coder-1 — FIX-REMOVE-HARDSPLIT-370 ✅ 交付（含 300s 上限同批）
+
+- **缺陷**：滑窗派发路径经 `build_padded_segments` 按 `SEGMENT_MAX_SECS`(20s) **硬切** —— 不看语义、
+  与「只按 1200ms 静默切片」原则冲突，且硬切出的非停顿子段加重 369 的零重叠。
+- **修法**：`vad::build_padded_segments_capped(.., max_seg_secs)`（显式上限，DEC-066）+ `build_padded_segments` 变薄包装；
+  滑窗专用 `local_stream::build_dispatch_segment` 上限 `SLIDING_SLICE_MAX_SECS`=**90s**（安全阀，超出继续切不丢弃）。
+  200ms padding 与 FIX-VAD-STATE-RESET-001 越界护栏**保留**；`main.rs` 派发点加 `path_b_budget_ok` 撞顶 warn。
+- **90s 依据**：KV 非瓶颈（1170 tok ⇒ 占 4096 的 45%，剩 2240 给词库）；120s 则 55%/剩 1850 且解码 49s vs 37s；
+  真天花板是解码耗时+内存；零和预算提醒：词库 3000 tok ⇒ 可用音频仅 32s ⇒ 撞顶日志护栏不可省。
+- **同批**：`MAX_RECORD_SECONDS` 180 → **300**（5 分钟）——滑窗后与 KV 解耦，代价仅 18MB 缓冲 + 松手只解 ≤12s 窗；
+  连带 `src-tauri/src/config.rs` 镜像常量、`hotkey` 断言 185→305。
+- **单测**：新增 8（vad 5 + local_stream 3，含「旧包装 ≡ capped(SEGMENT_MAX_SECS)」逐位证明）；改名 2。
+- **验证**：fmt EXIT 0；全量 cargo test 0 failed（**1390P/28I**）；release EXIT 0；src-tauri check EXIT 0；warnings 98/88。
+- 🔴 内存提示：90s 外推 ≈6.5~8.5GB（1.7B）；未改版本/未 push/零凭证。369 同批未提交。

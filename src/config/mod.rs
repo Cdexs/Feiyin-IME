@@ -5,8 +5,15 @@ use std::io::Write;
 use std::path::PathBuf;
 
 /// 最大录音时长（秒），硬编码，不可通过 config 修改。
-/// DUAL-PATH-REFINE-364（Gavin 2026-09-22）：300 → **180**（配合路B 全量解码预算）。
-pub const MAX_RECORD_SECONDS: u64 = 180;
+/// 沿革：DUAL-PATH-REFINE-364（Gavin 2026-09-22）300 → **180**（当时为配合路B 全量解码预算）。
+/// 🔴 FIX-REMOVE-HARDSPLIT-370（Gavin 2026-09-22）：180 → **300**（5 分钟，产品特性）。
+/// **为什么现在能放开**：滑动窗口（367）落地后，录音总时长与 KV 预算**彻底解耦** ——
+/// 进模型的永远是「一个窗口」而非整段录音，单次解码输入恒 ≤ `SLIDING_SLICE_MAX_SECS`(120s)
+/// （典型窗口仅 12s），与录 3 分钟还是 5 分钟无关。实际代价仅两项且都很小：
+/// ① 音频缓冲 300s×16000×4B ≈ 18MB；② 松手后只解最后一窗（≤12s），约等 5 秒。
+/// 对比已摘接线的 363 路B 全量解码（`PATH_B_WIRED_367=false`）：300s 要解整段、约等 123 秒
+/// 且 KV 逼近撞顶 —— 那正是当初压到 180s 的原因，该理由现已不成立。
+pub const MAX_RECORD_SECONDS: u64 = 300;
 /// 最长静默间隔（毫秒），超过此时长无声音则自动停止录音
 pub const SILENCE_DURATION_MS: u64 = 30_000;
 
@@ -1608,12 +1615,12 @@ clipboard_delay_ms = 150
 
     /// ASR-038-B-008: MAX_RECORD_SECONDS 是录音/轮询硬上限的唯一权威来源，
     /// 039 的 translate poll 硬上限 = MAX_RECORD_SECONDS + 5 依赖此值不被随意改动。
-    /// DUAL-PATH-REFINE-364（Gavin 2026-09-22）：300 → 180。
+    /// FIX-REMOVE-HARDSPLIT-370（Gavin 2026-09-22）：180 → 300（5 分钟，与 KV 已解耦）。
     #[test]
-    fn max_record_seconds_is_180() {
+    fn max_record_seconds_is_300() {
         assert_eq!(
-            MAX_RECORD_SECONDS, 180,
-            "MAX_RECORD_SECONDS must stay 180s (translate poll hard cap derives from it)"
+            MAX_RECORD_SECONDS, 300,
+            "MAX_RECORD_SECONDS must stay 300s (translate poll hard cap derives from it)"
         );
     }
 

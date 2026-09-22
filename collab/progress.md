@@ -1054,3 +1054,51 @@ load_wordbook_vocabulary()
 
 - OrderedReflow 对齐失败时 last_window_text 被覆盖 ⇒ 吃字；修为失败即彻底保守（committed/last 都不动、不回灌、next 仍推进）+ 连续失败≥3 兜底并入（宁可重复不丢字）。
 - 仅改 OrderedReflow；新增 4 单测；全量 cargo test 0 failed（1379P）/ fmt --check EXIT 0 / release EXIT 0 / warnings 98-89 基线。BUILD-347 须重出包。
+
+
+## BUILD-348（重出包 · 修 P0 吃字）· 2026-09-22 · BUILD-347 作废
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | `FIX-ORDERED-REFLOW-DROP-368`（HEAD `4201d39`）：`OrderedReflow::push` 对齐失败时**不再**无条件替换 `last_window_text`；新增 `REFLOW_FALLBACK_FAILS=3`，连续失败达阈值触发兜底（旧文本整体并入 committed，不去重）。仅改 `src/transcription/mod.rs`（+133/−18） |
+| 回归 | root `cargo test --no-fail-fast` **1467P/0F/30I**（EXIT 0；`feiyin-ime` bin **1379P/28I** = 基线逐位吻合；NEW 3 / GONE 0）+ src-tauri **92P/0F/0I** + Vitest **7 files/100P/11S/0F**；`cargo fmt --check` EXIT 0；warnings **98/88/17**（test −1 如实报） |
+| 出包 | `BUILD-348` 八项核验逐项 PASS；产物 `feiyin-ime` 14.74MB `f9ba2822c731…`（20:02:04）/ `feiyin-ime-ui` 10.05MB `7d72bced2fc6…`（19:59:10）/ `crash-reporter` 24.88MB `61e3ab00869b…`（20:00:19）；两副本全等、均异于作废的 BUILD-347 |
+| 三特殊点 | ① dll 四张三副本全等 + onnxruntime 1.28.2；② itn-rules 三副本 `60b227de…` 全等；③ Publish/models 1.7B 与源逐一 sha256 全等（仅核验，未重拷） |
+| 探针 | 正 `SLIDING-WINDOW-367`=4 / `[LocalRT-DBG-298]`=3 / `AUTOLEARN`=11；反 `sub-seg failed` / `PUNCT_REFRESH_INTERVAL` / `ACC_MIN_SEGMENT_MS_DEFAULT` / `min_seg_ms` 全 0 |
+| 端测 | 🔴 **置顶：吃字/重复字重点复测**（>4 句让滑窗多次，看有无整段消失）+ 原九条 |
+### 2026-09-22 · FIX-WINDOW-DISJOINT-369（🔴 P0 整窗丢字）交付
+
+- **根因**：12s 封顶 vs 长单片（片2 9.34s）⇒ 窗口与上一窗**零重叠** ⇒ 对齐必败；而 368 的「失败 ⇒ 整窗跳过」
+  使必败场景变成**整窗丢失**（Gavin BUILD-348：6 片 31s ⇒ 最终 50 字）。
+- **修法**：不再靠文本猜重叠 —— `main.rs` 记 `total_slices`/`window_spans`，把窗口切片区间
+  `[total_slices - recent_slices.len() + start, total_slices)` 传给 `OrderedReflow::push(seq, ws, we, text)`：
+  零重叠 ⇒ **直接拼接**（绝不跳过）；有重叠 ⇒ `align_overlap` 去重；有重叠但对齐失败 ⇒ **退回拼接**（宁可重复不丢字）。
+- **清理**：删除被新规则完全取代的 `fail_streak` + `REFLOW_FALLBACK_FAILS`。
+- **单测**：+4（含真实日志时长序列复刻，断言 6 片全在）/ −1（368 阈值兜底）/ 改 6 ⇒ bin 1379→1382P。
+- **反证**：临时回归 368「跳过整窗」⇒ 真实序列测试 FAILED（片5 整窗丢失）⇒ 证明该测试真能抓到本 P0。
+
+| 项 | 内容 |
+| --- | --- |
+| 改动文件 | `src/transcription/mod.rs`（OrderedReflow + 单测）、`src/main.rs`（切片区间追踪） |
+| 未动 | `align_overlap` / `group_window_start_secs` / `ALIGN_MIN_OVERLAP_RATIO` / `itn.rs` / 版本 0.9.3 |
+| 验证 | `cargo fmt --check` **EXIT 0**；全量 `cargo test --no-fail-fast` **0 failed**（bin **1382P/28I**）；`cargo build --release` **EXIT 0**；warnings **98/88** ≤ 基线 98/89 |
+| numstat | main `32/2`（== -w）；mod `212/82`（vs -w `205/75`，7 行 whitespace-only 落改动区块内） |
+| 结论 | 🔴 **BUILD-348 含此 P0，须重出包**；未 push / 零凭证 |
+### 2026-09-22 · FIX-REMOVE-HARDSPLIT-370 + 录音上限 300s 交付
+
+- **根因**：滑窗派发路径仍有 20s 硬切（`SEGMENT_MAX_SECS`，native 时代遗留）⇒ 违背「只按静默停顿切片」，
+  并加重 369 的零重叠丢字。
+- **修法**：`build_padded_segments_capped(.., max_seg_secs)` 显式上限 + 旧函数变薄包装（其它路径**逐位不变**，有单测证明）；
+  滑窗两处调用点走 `build_dispatch_segment`，上限 **90s** 安全阀（超出继续切、不丢弃）；护栏（越界过滤/clamp + 200ms padding）保留；
+  派发点加 KV 撞顶 warn。
+- **同批**：`MAX_RECORD_SECONDS` 180 → **300**（滑窗后与 KV 解耦：只解最后一窗 ≤12s；音频缓冲 18MB）。
+- **单测**：+8 / 改名 2 ⇒ bin 1382→1390P。
+
+| 项 | 内容 |
+| --- | --- |
+| 改动文件 | `vad.rs`、`local_stream.rs`、`main.rs`、`config/mod.rs`、`platform/windows/hotkey.rs`、`transcription/mod.rs`、`qwen_inference.rs`、`src-tauri/src/config.rs` |
+| 未动 | `align_overlap` / `group_window_start_secs` / 369 OrderedReflow / `itn.rs` / 版本 0.9.3 |
+| 验证 | `cargo fmt --check` EXIT 0；全量 `cargo test --no-fail-fast` **0 failed**（bin **1390P/28I**）；`cargo build --release` EXIT 0；`cargo check --manifest-path src-tauri/Cargo.toml` EXIT 0；warnings 98/88（≤ 基线） |
+| 90s 依据 | KV 占 4096 的 45%（剩 2240 给词库）；120s 为 55%/剩 1850 且解码 49s vs 37s ⇒ 90s 更优；真天花板=解码耗时+内存 |
+| 内存提示 | 🔴 90s 单片外推 ≈6.5~8.5GB（1.7B 口径）；仅「说满 90s 无停顿」触发，待 E2E 实测 |
+| 结论 | 未 push / 零凭证；🔴 369+370 同在未提交工作区，由主控一并提交 |

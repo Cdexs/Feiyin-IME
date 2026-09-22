@@ -1131,8 +1131,8 @@ mod tests {
     fn translate_poll_hard_deadline_is_max_record_plus_5() {
         assert_eq!(
             crate::config::MAX_RECORD_SECONDS + 5,
-            185,
-            "hard deadline must stay MAX_RECORD_SECONDS+5 = 185s"
+            305,
+            "hard deadline must stay MAX_RECORD_SECONDS+5 = 305s"
         );
         // 轮询常量不可漂移（spawn_translate_poll_thread :130 与 main.rs 依赖）。
         assert_eq!(TRANSLATE_POLL_MS, 10, "poll interval must stay 10ms");

@@ -16,8 +16,9 @@ mod vad;
 // **保留**（可回挂），故局部 allow。
 #[allow(unused_imports)]
 pub use vad::{
-    build_padded_segments, join_segment_texts, naive_chunk, should_segment, VadSegmenter,
-    SEGMENT_MAX_SECS, SEGMENT_PADDING_SAMPLES, SEGMENT_TRIGGER_SECS,
+    build_padded_segments, build_padded_segments_capped, join_segment_texts, naive_chunk,
+    should_segment, VadSegmenter, SEGMENT_MAX_SECS, SEGMENT_PADDING_SAMPLES, SEGMENT_TRIGGER_SECS,
+    SLIDING_SLICE_MAX_SECS,
 };
 
 /// BUG-119（BUILD-118 端测第 1 项）：「用户没说话」的类型化信号，不是设备/网络错误。
@@ -1243,7 +1244,8 @@ pub(crate) fn estimate_inject_tokens(context: Option<&str>, terms: Option<&str>)
 ///   + 提示词脚手架）；
 /// - 余量仅 64（取整边界），不再承担估算兜底。
 ///
-/// `true` ⇒ 路B 跑全量；`false` ⇒ 降级退回切片拼装（绝不硬塞）。180s 上限下**不会降级**。
+/// `true` ⇒ 路B 跑全量；`false` ⇒ 降级退回切片拼装（绝不硬塞）。
+/// 180s 不降级；`MAX_RECORD_SECONDS` 现为 300 ⇒ 300s 会降级（370 起整段解码已摘接线，见 `main.rs`）。
 pub(crate) fn path_b_budget_ok(
     num_samples: usize,
     context: Option<&str>,
@@ -1396,16 +1398,24 @@ pub(crate) const WINDOW_DECODE_CONCURRENCY: usize = 2;
 /// 🔴 解码可**乱序完成**，但对齐状态机**必须按 seq 串行**（`align_overlap` 依赖前一窗文本）
 /// ⇒ 结果先入 `pending`，等 `next` 到齐才依次 align/定稿，产出「应回灌的权威全文」（可 0..n 条）。
 /// 乱序合并会推进错 `committed` ⇒ 文本必错，故**唯一入口 `push` 保证按序**。
-/// 连续对齐失败达到此计数 ⇒ 触发兜底（见 `push`）。
-pub(crate) const REFLOW_FALLBACK_FAILS: usize = 3;
-
+///
+/// 🔴 FIX-WINDOW-DISJOINT-369（P0）：合并策略由**切片区间**判定（不再只靠文本猜重叠）——
+/// 调用方本就知道每个窗口含哪几片（`[start_slice, end_slice)`），别丢掉这个信息：
+/// 1. **零重叠**（`new.start >= prev.end`，两窗不含同一片）⇒ **直接拼接**：
+///    没有重叠就没有重复可去，拼接即正确答案。**绝不可跳过该窗**（那正是 369 的丢字根因）。
+/// 2. **共享切片**（`new.start < prev.end`，确实有真实重叠）⇒ 走 [`align_overlap`] 去重；
+///    对齐成功 ⇒ 定稿滑出前缀；对齐失败（如长度门误拒）⇒ **退回拼接**
+///    —— 有重叠也不算错，取向明确：**宁可接缝重复，绝不整窗丢失**（重复可删，丢字找不回）。
+///
+/// 不变量：**任何非空窗的文本都不会被丢弃**（要么与旧窗去重后定稿，要么整体并入 `committed`）。
 pub(crate) struct OrderedReflow {
     next: usize,
-    pending: std::collections::BTreeMap<usize, String>,
+    /// `seq -> (start_slice, end_slice, text)`；`end_slice` 为开区间端点。
+    pending: std::collections::BTreeMap<usize, (usize, usize, String)>,
     committed: String,
     last_window_text: String,
-    /// 连续「对齐失败（未定稿）」计数；成功即清零。达 [`REFLOW_FALLBACK_FAILS`] 触发兜底。
-    fail_streak: usize,
+    /// 与 `last_window_text` 对应的切片区间 `[start, end)`；`None` = 尚无有效前窗。
+    last_span: Option<(usize, usize)>,
 }
 
 impl OrderedReflow {
@@ -1415,59 +1425,65 @@ impl OrderedReflow {
             pending: std::collections::BTreeMap::new(),
             committed: String::new(),
             last_window_text: String::new(),
-            fail_streak: 0,
+            last_span: None,
         }
     }
 
-    /// 收到 `seq` 的解码文本；返回本次**按序**定稿后应回灌的权威全文（可能 0..n 条）。
+    /// 收到 `seq` 的解码文本（`[start_slice, end_slice)` = 该窗含哪些派发片）；
+    /// 返回本次**按序**定稿后应回灌的权威全文（可能 0..n 条）。
     ///
-    /// 🔴 FIX-ORDERED-REFLOW-DROP-368（P0）：对齐失败时必须**彻底保守** ——
-    /// 不滑动、**不更新 `last_window_text`**、**不产出回灌**（否则「本该定稿的滑出片」两边都不在 ⇒ 吃字）；
-    /// `next` 仍 `+=1`（否则后续 seq 卡死）。
-    /// 下一个窗口仍可与**旧** `last_window_text` 对齐（重叠变小但通常仍在）。
-    /// 🔴 连续失败达 [`REFLOW_FALLBACK_FAILS`] ⇒ 兜底：把旧 `last_window_text` **整体并入 committed（不去重）**
-    /// 再接新窗口 —— 取向明确：**宁可重复，绝不丢字**（重复可删，丢字找不回）。
-    pub(crate) fn push(&mut self, seq: usize, text: String) -> Vec<String> {
-        self.pending.insert(seq, text);
+    /// 合并规则见 [`OrderedReflow`] 文档；`next` 始终 `+=1`（否则后续 seq 卡死）。
+    pub(crate) fn push(
+        &mut self,
+        seq: usize,
+        start_slice: usize,
+        end_slice: usize,
+        text: String,
+    ) -> Vec<String> {
+        self.pending.insert(seq, (start_slice, end_slice, text));
         let mut out = Vec::new();
-        while let Some(text) = self.pending.remove(&self.next) {
-            let can_align = !self.last_window_text.is_empty() && !text.is_empty();
-            let a = if can_align {
-                align_overlap(&self.last_window_text, &text)
-            } else {
-                // 首窗 / 空窗：无需对齐，直接推进（行为与本缺陷无关）。
-                AlignResult {
-                    committed_prefix: String::new(),
-                    overlap_chars: 0,
-                    ok: true,
-                }
-            };
-            if a.ok {
-                if !a.committed_prefix.is_empty() {
-                    self.committed.push_str(&a.committed_prefix);
-                }
-                if !text.is_empty() {
+        while let Some((ws, we, text)) = self.pending.remove(&self.next) {
+            // 空解码结果：不动文本状态（避免空串污染 last_window_text / 制造假重叠），仅推进 next。
+            if text.is_empty() {
+                self.next += 1;
+                continue;
+            }
+            match self.last_span {
+                None => {
+                    // 首窗（或此前全为空）：无对齐对象，直接采用。
                     self.last_window_text = text;
+                    self.last_span = Some((ws, we));
                 }
-                self.fail_streak = 0;
-                out.push(format!("{}{}", self.committed, self.last_window_text));
-            } else {
-                // 保守：保持上一次结果（last_window_text 不动）、不回灌。
-                self.fail_streak += 1;
-                if self.fail_streak >= REFLOW_FALLBACK_FAILS {
-                    // 兜底：宁可重复不可丢字 —— 旧 last 整体并入 committed，再采用新窗。
-                    self.committed.push_str(&self.last_window_text);
+                Some((_prev_start, prev_end)) => {
+                    if ws >= prev_end {
+                        // 零重叠 ⇒ 无重复可去 ⇒ 拼接即正确答案（不得跳过）。
+                        self.committed.push_str(&self.last_window_text);
+                    } else {
+                        // 共享切片 ⇒ 确有真实重叠 ⇒ 对齐去重。
+                        let a = align_overlap(&self.last_window_text, &text);
+                        if a.ok {
+                            if !a.committed_prefix.is_empty() {
+                                self.committed.push_str(&a.committed_prefix);
+                            }
+                        } else {
+                            // 有重叠但对齐未过（如长度门误拒）⇒ 退回拼接：宁可重复不可丢字。
+                            self.committed.push_str(&self.last_window_text);
+                            if log::log_enabled!(log::Level::Debug) {
+                                log::debug!(
+                                    "[SLIDING-WINDOW-367] reflow 有重叠但对齐未过，退回拼接（seq={} span=[{},{}) prev_end={}）",
+                                    seq,
+                                    ws,
+                                    we,
+                                    prev_end
+                                );
+                            }
+                        }
+                    }
                     self.last_window_text = text;
-                    self.fail_streak = 0;
-                    out.push(format!("{}{}", self.committed, self.last_window_text));
-                } else if log::log_enabled!(log::Level::Debug) {
-                    log::debug!(
-                        "[SLIDING-WINDOW-367] reflow align 未过，保持上一次（seq={} fail_streak={}）",
-                        seq,
-                        self.fail_streak
-                    );
+                    self.last_span = Some((ws, we));
                 }
             }
+            out.push(format!("{}{}", self.committed, self.last_window_text));
             self.next += 1;
         }
         out
@@ -4148,7 +4164,9 @@ mod strip_lang_prefix_359_tests {
 // ============================================================
 #[cfg(test)]
 mod sliding_window_367_tests {
-    use super::{align_overlap, group_window_start_secs, OrderedReflow, WINDOW_MAX_SECS};
+    use super::{
+        align_overlap, group_window_start_secs, OrderedReflow, WINDOW_MAX_SECS, WINDOW_MAX_SLICES,
+    };
 
     // ---- ① 组窗 ----
     #[test]
@@ -4236,12 +4254,12 @@ mod sliding_window_367_tests {
     fn ordered_reflow_commits_in_seq_despite_out_of_order_arrival() {
         let mut o = OrderedReflow::new();
         assert!(
-            o.push(1, "BBBB CCCC DDDD".to_string()).is_empty(),
+            o.push(1, 0, 2, "BBBB CCCC DDDD".to_string()).is_empty(),
             "缺 seq0 ⇒ seq1 先到也不得定稿（必须先对齐再推进）"
         );
-        let out = o.push(0, "AAAA BBBB CCCC".to_string());
+        let out = o.push(0, 0, 1, "AAAA BBBB CCCC".to_string());
         assert_eq!(out.len(), 2, "seq0 到齐后应**依次**产出 0 与 1 两条回灌");
-        assert_eq!(o.push(2, "CCCC DDDD EEEE".to_string()).len(), 1);
+        assert_eq!(o.push(2, 1, 3, "CCCC DDDD EEEE".to_string()).len(), 1);
         let (_committed, last) = o.finish();
         assert_eq!(last, "CCCC DDDD EEEE", "最后窗口文本应为 seq2");
     }
@@ -4250,13 +4268,13 @@ mod sliding_window_367_tests {
     #[test]
     fn ordered_reflow_holds_until_gap_filled() {
         let mut o = OrderedReflow::new();
-        assert_eq!(o.push(0, "AAAA BBBB CCCC".to_string()).len(), 1);
+        assert_eq!(o.push(0, 0, 1, "AAAA BBBB CCCC".to_string()).len(), 1);
         assert!(
-            o.push(2, "CCCC DDDD EEEE".to_string()).is_empty(),
+            o.push(2, 1, 3, "CCCC DDDD EEEE".to_string()).is_empty(),
             "缺 seq1 ⇒ seq2 不得定稿"
         );
         assert_eq!(
-            o.push(1, "BBBB CCCC DDDD".to_string()).len(),
+            o.push(1, 0, 2, "BBBB CCCC DDDD".to_string()).len(),
             2,
             "seq1 到齐 ⇒ 1、2 一起按序定稿"
         );
@@ -4266,27 +4284,27 @@ mod sliding_window_367_tests {
     #[test]
     fn ordered_reflow_sequential_arrival_is_immediate() {
         let mut o = OrderedReflow::new();
-        assert_eq!(o.push(0, "AAAA BBBB CCCC".to_string()).len(), 1);
-        assert_eq!(o.push(1, "BBBB CCCC DDDD".to_string()).len(), 1);
-        assert_eq!(o.push(2, "CCCC DDDD EEEE".to_string()).len(), 1);
+        assert_eq!(o.push(0, 0, 1, "AAAA BBBB CCCC".to_string()).len(), 1);
+        assert_eq!(o.push(1, 0, 2, "BBBB CCCC DDDD".to_string()).len(), 1);
+        assert_eq!(o.push(2, 1, 3, "CCCC DDDD EEEE".to_string()).len(), 1);
         let (_committed, last) = o.finish();
         assert_eq!(last, "CCCC DDDD EEEE");
     }
 
-    // ---- FIX-ORDERED-REFLOW-DROP-368（P0 吃字）----
-    /// 🔴 中途对齐失败**不丢字**：失败窗保持上一次、不产出；后续窗仍与旧窗对齐 ⇒ 滑出片不丢。
+    // ---- FIX-ORDERED-REFLOW-DROP-368（P0 吃字）→ FIX-WINDOW-DISJOINT-369 语义 ----
+    /// 🔴 中途对齐失败**不丢字**（369 起：失败窗**退回拼接**而非跳过，故也产出回灌）。
     #[test]
     fn ordered_reflow_mid_failure_does_not_drop_text() {
         let mut o = OrderedReflow::new();
-        assert_eq!(o.push(0, "AAAA BBBB CCCC".to_string()).len(), 1);
-        assert_eq!(o.push(1, "BBBB CCCC DDDD".to_string()).len(), 1); // ok ⇒ committed="AAAA "
+        assert_eq!(o.push(0, 0, 1, "AAAA BBBB CCCC".to_string()).len(), 1);
+        assert_eq!(o.push(1, 0, 2, "BBBB CCCC DDDD".to_string()).len(), 1); // 对齐成功 ⇒ committed="AAAA "
         assert_eq!(
-            o.push(2, "XXXX YYYY ZZZZ".to_string()).len(),
-            0,
-            "对齐失败（2）⇒ 不产出回灌"
+            o.push(2, 1, 2, "XXXX YYYY ZZZZ".to_string()).len(),
+            1,
+            "共享切片但对齐失败（如长度门误拒）⇒ 退回拼接，仍产出（369 取代 368 的「不产出」）"
         );
-        let out3 = o.push(3, "CCCC DDDD EEEE".to_string());
-        assert_eq!(out3.len(), 1, "后续窗仍与**旧**窗对齐 ⇒ 正常定稿");
+        let out3 = o.push(3, 1, 3, "CCCC DDDD EEEE".to_string());
+        assert_eq!(out3.len(), 1, "后续窗仍正常定稿");
         let (committed, last) = o.finish();
         let final_text = format!("{}{}", committed, last);
         for tok in ["AAAA", "BBBB", "CCCC", "DDDD", "EEEE"] {
@@ -4297,36 +4315,150 @@ mod sliding_window_367_tests {
         }
     }
 
-    /// 🔴 连续失败达阈值 ⇒ 兜底（宁可重复不可丢字）：旧 last 并入 committed 后再接新窗。
+    /// 🔴 FIX-WINDOW-DISJOINT-369 核心：**用切片序号判重叠**。
+    /// 零重叠（`start >= prev.end`）⇒ **直接拼接**（无重复可去），**绝不跳过整窗**。
     #[test]
-    fn ordered_reflow_consecutive_failures_fallback_no_loss() {
+    fn ordered_reflow_zero_overlap_concatenates_instead_of_skipping() {
         let mut o = OrderedReflow::new();
-        assert_eq!(o.push(0, "AAAA BBBB CCCC".to_string()).len(), 1);
-        assert!(o.push(1, "XXXX YYYY".to_string()).is_empty());
-        assert!(o.push(2, "QQQQ RRRR".to_string()).is_empty());
-        let out3 = o.push(3, "ZZZZ WWWW".to_string());
-        assert_eq!(out3.len(), 1, "连续失败 ≥3 ⇒ 兜底产出");
+        let a = "AAAA BBBB CCCC".to_string();
+        let b = "DDDD EEEE FFFF".to_string();
+        assert_eq!(o.push(0, 0, 1, a.clone()).len(), 1);
+        assert_eq!(
+            o.push(1, 1, 2, b.clone()).len(),
+            1,
+            "零重叠窗必须产出（拼接），跳过即整窗丢字"
+        );
+        let (committed, last) = o.finish();
+        assert_eq!(committed, a, "零重叠 ⇒ 前窗整体定稿");
+        assert_eq!(last, b, "新窗成为 last");
+        assert_eq!(
+            format!("{}{}", committed, last),
+            format!("{}{}", a, b),
+            "零重叠 ⇒ 拼接即正确答案"
+        );
+    }
+
+    /// 🔴 有重叠（`start < prev.end`）⇒ **仍走对齐去重**，不得退化成无脑拼接（否则接缝重复回来）。
+    #[test]
+    fn ordered_reflow_shared_overlap_still_dedupes() {
+        let mut o = OrderedReflow::new();
+        assert_eq!(o.push(0, 0, 1, "AAAA BBBB CCCC".to_string()).len(), 1);
+        assert_eq!(o.push(1, 0, 2, "BBBB CCCC DDDD".to_string()).len(), 1);
         let (committed, last) = o.finish();
         let final_text = format!("{}{}", committed, last);
-        assert!(
-            final_text.contains("AAAA"),
-            "兜底后旧文本仍在（不丢字）：{final_text}"
+        assert_eq!(
+            final_text, "AAAA BBBB CCCC DDDD",
+            "有重叠必须去重（不得无脑拼接）"
         );
-        assert!(final_text.contains("ZZZZ"), "新窗文本接上：{final_text}");
+        assert_eq!(final_text.matches("BBBB").count(), 1, "接缝不得重复");
+    }
+
+    /// 🔴 有重叠但对齐失败 ⇒ **退回拼接**（宁可重复不可丢字）；绝不跳过整窗。
+    #[test]
+    fn ordered_reflow_shared_overlap_align_failure_falls_back_to_concat() {
+        let mut o = OrderedReflow::new();
+        assert_eq!(o.push(0, 0, 1, "AAAA BBBB CCCC".to_string()).len(), 1);
+        let out = o.push(1, 0, 2, "XXXX YYYY ZZZZ".to_string());
+        assert_eq!(out.len(), 1, "对齐失败也必须产出（退回拼接），绝不跳过整窗");
+        let (committed, last) = o.finish();
+        let final_text = format!("{}{}", committed, last);
+        assert!(final_text.contains("AAAA"), "旧窗文本不得丢：{final_text}");
+        assert!(final_text.contains("XXXX"), "新窗文本不得丢：{final_text}");
     }
 
     /// 失败后 `next` 仍推进 ⇒ 后续 seq 不卡死。
     #[test]
     fn ordered_reflow_next_advances_after_failure() {
         let mut o = OrderedReflow::new();
-        assert_eq!(o.push(0, "AAAA BBBB CCCC".to_string()).len(), 1);
-        assert!(o.push(1, "XXXX YYYY".to_string()).is_empty());
-        let out = o.push(2, "BBBB CCCC DDDD".to_string());
+        assert_eq!(o.push(0, 0, 1, "AAAA BBBB CCCC".to_string()).len(), 1);
+        assert_eq!(o.push(1, 0, 2, "XXXX YYYY ZZZZ".to_string()).len(), 1);
+        let out = o.push(2, 1, 3, "BBBB CCCC DDDD".to_string());
         assert_eq!(
             out.len(),
             1,
             "失败后 next 仍推进，后续 seq 能处理（不卡死）"
         );
+    }
+
+    // ---- FIX-WINDOW-DISJOINT-369：复刻 Gavin 端测实测序列（12s 封顶 ⇒ 零重叠）----
+    /// 复刻 `main.rs` 的组窗：每来一片算一次窗口，返回全局切片区间 + 该窗文本。
+    fn windows_for(durations_secs: &[f32], slice_text: &[String]) -> Vec<(usize, usize, String)> {
+        let mut recent: Vec<f32> = Vec::new();
+        let mut total: usize = 0;
+        let mut out = Vec::new();
+        for d in durations_secs {
+            recent.push(*d);
+            total += 1;
+            while recent.len() > WINDOW_MAX_SLICES {
+                recent.remove(0);
+            }
+            let start = group_window_start_secs(&recent, WINDOW_MAX_SECS);
+            let base = total - recent.len();
+            let ws = base + start;
+            let we = total;
+            let text = slice_text[ws..we].join(" ");
+            out.push((ws, we, text));
+        }
+        out
+    }
+
+    /// 🔴 369 验收：Gavin BUILD-348 实测 6 片 / 31 秒（`debug-2009.log`）。
+    /// 12s 封顶把 #2/#3 切成**零重叠单片** ⇒ 旧逻辑整窗跳过 ⇒ 丢字；
+    /// 用真实时长序列构造，断言**所有片的内容都出现在最终文本中**（无整窗丢失）。
+    #[test]
+    fn ordered_reflow_real_log_sequence_keeps_every_slice() {
+        // 逐字时长 ≈ 4.4 字/秒（实测），让「重叠字/新窗字」比例与真实音频一致
+        // （seq5 重叠仅 ~11 字 < 41×0.30≈13 字 ⇒ 长度门必拒 —— 正是 369 的第二根因）。
+        let durs = [4.43f32, 2.83, 9.34, 5.15, 2.44, 6.78];
+        let filler = [
+            '乙', '丙', '丁', '戊', '己', '庚', '辛', '壬', '癸', '子', '丑', '寅',
+        ];
+        let slices: Vec<String> = durs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let n = (d * 4.4).round() as usize;
+                let mut s = format!("片{i}甲");
+                while s.chars().count() < n {
+                    let k = s.chars().count() % filler.len();
+                    s.push(filler[k]);
+                }
+                s
+            })
+            .collect();
+
+        let wins = windows_for(&durs, &slices);
+        assert!(
+            wins.iter().any(|(ws, we, _)| *we - *ws == 1 && *ws >= 2),
+            "本场景必须复现「单片零重叠窗」（否则测不到 369 根因）：{wins:?}"
+        );
+        // 且必须走到「共享切片 + 对齐失败（长度门误拒）」路径 —— 369 的第二根因。
+        let mut shared_align_fail = false;
+        for pair in wins.windows(2) {
+            let (_, prev_end, prev_text) = &pair[0];
+            let (ws, _we, text) = &pair[1];
+            if *ws < *prev_end && !align_overlap(prev_text, text).ok {
+                shared_align_fail = true;
+            }
+        }
+        assert!(
+            shared_align_fail,
+            "本场景必须走到「有重叠但对齐失败 ⇒ 退回拼接」路径：{wins:?}"
+        );
+
+        let mut o = OrderedReflow::new();
+        for (seq, (ws, we, text)) in wins.iter().enumerate() {
+            o.push(seq, *ws, *we, text.clone());
+        }
+        let (committed, last) = o.finish();
+        let final_text = format!("{}{}", committed, last);
+        for i in 0..slices.len() {
+            let marker = format!("片{i}甲");
+            assert!(
+                final_text.contains(&marker),
+                "切片 {i}（{marker}）整窗丢失（final={final_text}）"
+            );
+        }
     }
 }
 
@@ -4349,9 +4481,13 @@ mod path_b_budget_364_tests {
         assert_eq!(expected_audio_tokens(16_000 * 180), 2340, "180s 应 2340");
     }
 
-    /// 🔴 180s（当前 MAX_RECORD_SECONDS 上限）在典型词库/上下文下**不降级**。
+    /// 🔴 180s 在典型词库/上下文下**不降级**；300s（`MAX_RECORD_SECONDS` 新上限）**会降级**
+    /// ⇒ 走切片拼装（DEC-069 绝不硬塞）。
+    ///
+    /// 注：路B（363 全量解码）已按 367 置 `PATH_B_WIRED_367=false` 摘接线，本闸门仅保留可回挂；
+    /// 之所以 180s 仍不降级、300s 降级，是这条闸门自身的性质（与是否接线无关）。
     #[test]
-    fn no_degrade_within_180s_limit() {
+    fn budget_180s_ok_but_300s_degrades() {
         assert!(path_b_budget_ok(16_000 * 180, None, None), "180s 裸音频");
         assert!(
             path_b_budget_ok(
@@ -4364,6 +4500,12 @@ mod path_b_budget_364_tests {
         // 带跨录音上下文（最多 CTX_DEFAULT_CHARS=500 字）
         let ctx = "上一轮我讲了很多关于这个项目的内容".repeat(20);
         assert!(path_b_budget_ok(16_000 * 180, Some(&ctx), Some("哈兰德")));
+        // 300s（新 MAX_RECORD_SECONDS）：3900 audio token ⇒ 超 4096 ⇒ 降级切片拼装。
+        assert_eq!(expected_audio_tokens(16_000 * 300), 3900, "300s 应 3900");
+        assert!(
+            !path_b_budget_ok(16_000 * 300, None, None),
+            "300s 裸音频已超 4096 ⇒ 必须降级（这正是 370 把整段解码摘掉的原因）"
+        );
     }
 
     /// 超长 / 巨词库 ⇒ 仍会降级（闸门逻辑必须保留，防未来改上限/大词库）。

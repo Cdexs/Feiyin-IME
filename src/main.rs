@@ -8212,6 +8212,11 @@ fn spawn_worker_thread(
                                         let mut all_native = true;
                                         let mut total_decode_ms = 0.0f64;
                                         let mut recent_slices: Vec<Vec<f32>> = Vec::new();
+                                        // FIX-WINDOW-DISJOINT-369：累计派发片总数 ⇒ 由 `recent_slices` 长度
+                                        // 反推窗口的**全局切片区间**（传给 OrderedReflow 判重叠，别再靠文本猜）。
+                                        let mut total_slices: usize = 0;
+                                        // `window_seq -> (start_slice, end_slice)`（dispatch 与 drain 同线程读写）。
+                                        let mut window_spans: Vec<(usize, usize)> = Vec::new();
                                         let mut window_seq: usize = 0;
                                         let mut ordered = transcription::OrderedReflow::new();
                                         let concurrency = transcription::WINDOW_DECODE_CONCURRENCY.max(1);
@@ -8265,6 +8270,7 @@ fn spawn_worker_thread(
                                                 for s in &sub_segs {
                                                     recent_slices.push(s.clone());
                                                 }
+                                                total_slices += sub_segs.len();
                                                 while recent_slices.len()
                                                     > transcription::WINDOW_MAX_SLICES
                                                 {
@@ -8279,13 +8285,43 @@ fn spawn_worker_thread(
                                                         &durs,
                                                         transcription::WINDOW_MAX_SECS,
                                                     );
+                                                // FIX-WINDOW-DISJOINT-369：窗口 = `recent_slices[start..]`，
+                                                // 其全局切片区间为 `[total_slices - recent_slices.len() + start, total_slices)`。
+                                                let window_start_slice = total_slices
+                                                    .saturating_sub(recent_slices.len())
+                                                    + start;
+                                                let window_end_slice = total_slices;
                                                 let window_audio: Vec<f32> = recent_slices[start..]
                                                     .iter()
                                                     .flat_map(|s| s.iter().copied())
                                                     .collect();
+                                                // FIX-REMOVE-HARDSPLIT-370：滑窗片上限定为 90s（**解码耗时+内存**
+                                                // 安全阀，见 SLIDING_SLICE_MAX_SECS），故单个窗口音频可达 90s。
+                                                // KV 通常不是瓶颈（90s=1170 tok ≈ 4096 的 45%），但**零和预算**下
+                                                // 词库撑满 3000 tok 时可用音频仅 ~32s，长片会撞顶；而撞顶是
+                                                // **静默丢字**（DEC-069）⇒ 用精确预算闸门显式告警（不改流程）。
+                                                if !transcription::path_b_budget_ok(
+                                                    window_audio.len(),
+                                                    p2,
+                                                    terms,
+                                                ) {
+                                                    log::warn!(
+                                                        "[FIX-REMOVE-HARDSPLIT-370] 窗口音频超 KV 预算（撞顶会被静默截断）：{:.1}s audio_tok={} inject_tok={} max_total_len={}",
+                                                        window_audio.len() as f32 / 16000.0,
+                                                        transcription::expected_audio_tokens(
+                                                            window_audio.len()
+                                                        ),
+                                                        transcription::estimate_inject_tokens(
+                                                            p2, terms
+                                                        ),
+                                                        transcription::PATH_B_MAX_TOTAL_LEN
+                                                    );
+                                                }
                                                 // 投池、**不等**（窗口2 不需等窗口1）；dispatch_idx 用于与 337 配对。
                                                 let _ = task_txs[rr % concurrency]
                                                     .send((window_seq, idx, window_audio));
+                                                window_spans
+                                                    .push((window_start_slice, window_end_slice));
                                                 rr += 1;
                                                 window_seq += 1;
                                                 // 把已完成结果按 seq 有序定稿 + 回灌（replace_all 整段替换）。
@@ -8305,7 +8341,15 @@ fn spawn_worker_thread(
                                                             String::new()
                                                         }
                                                     };
-                                                    for authoritative in ordered.push(seq, text) {
+                                                    // FIX-WINDOW-DISJOINT-369：把该窗的切片区间一并交给 reflow 判重叠
+                                                    // （missing ⇒ 保守当零重叠，拼接保字、不丢）。
+                                                    let (win_ws, win_we) = window_spans
+                                                        .get(seq)
+                                                        .copied()
+                                                        .unwrap_or((seq, seq + 1));
+                                                    for authoritative in
+                                                        ordered.push(seq, win_ws, win_we, text)
+                                                    {
                                                         let _ = acc_event_tx.send(
                                                             PipelineEvent::PreviewReflow {
                                                                 generation: session_generation,
@@ -8340,7 +8384,15 @@ fn spawn_worker_thread(
                                                         String::new()
                                                     }
                                                 };
-                                                for authoritative in ordered.push(seq, text) {
+                                                // FIX-WINDOW-DISJOINT-369：把该窗的切片区间一并交给 reflow 判重叠
+                                                // （missing ⇒ 保守当零重叠，拼接保字、不丢）。
+                                                let (win_ws, win_we) = window_spans
+                                                    .get(seq)
+                                                    .copied()
+                                                    .unwrap_or((seq, seq + 1));
+                                                for authoritative in
+                                                    ordered.push(seq, win_ws, win_we, text)
+                                                {
                                                     let _ = acc_event_tx.send(
                                                         PipelineEvent::PreviewReflow {
                                                             generation: session_generation,

@@ -23,6 +23,27 @@ pub const SEGMENT_MAX_SECS: f64 = 20.0;
 /// 段前后 padding：保护边界音节（送气清声母 ~60-100ms）。200ms = 3200 samples @ 16kHz。
 pub const SEGMENT_PADDING_SAMPLES: usize = 3200;
 
+/// FIX-REMOVE-HARDSPLIT-370：**滑窗（accuracy 派发）路径**的单片上限 = 90s（Gavin 定，最终值）。
+///
+/// 🔴 **为什么是 90s**（不是 KV 决定的，KV 不是瓶颈；也别当 KV 限制去误调）：
+/// - **KV**：90s ≈ 1170 audio token（13.0 tok/s；精确式 `expected_audio_tokens`），
+///   加固定扣除 686（生成 256 + 上下文 385 + 提示词 45）= 1856 ⇒ 占 `max_total_len=4096`
+///   的 **45%**，尚余 **2240** 给词库。
+/// - **对比 120s**：占 55%、剩 1850 ⇒ 90s 给词库多 390 token（+21%），且解码约 **37s**
+///   （vs 120s 约 49s，RTF 0.41）⇒ 少等 12 秒。两头都更优。
+/// - **代价**：仅「一口气说 90~120 秒」这种几乎不存在的场景会多切一刀 —— 而**多切一刀不丢内容**
+///   （369：零重叠 ⇒ 直接拼接）。
+/// - 🔴 **真天花板不是 KV，而是单次解码耗时与内存**：90s 解码约 37 秒，期间该窗**不刷新预览**；
+///   内存随音频长度增长（361 实测 Qwen3-1.7B @56s 峰值 ≈ 4967MB）。
+/// - ⚠️ **零和预算提醒**：4096 是零和 —— 词库占用会挤压可用音频：词库 1000 token ⇒ 可用音频
+///   降至 ~185s；词库撑满 `HOTWORDS_MAX_TOTAL_TOKENS`(3000) ⇒ 仅 ~32s（**比 90s 阀还小**），
+///   此时长片会**静默截断**（DEC-069）。故 370 的「撞顶打日志」护栏
+///   （`main.rs` 派发点 `path_b_budget_ok` warn）**不可省**。
+/// - **它不是常规切片规则**：切片只认 1200ms 静默（Gavin 原则）；本值只兜
+///   「一路说满 90s 都没有 1200ms 停顿」的极端情况，超出继续切下一片、**不丢弃**
+///   （单测 `sliding_slice_370_*`）。
+pub const SLIDING_SLICE_MAX_SECS: f64 = 90.0;
+
 /// silero VAD 窗口大小（512 samples = 32ms @ 16kHz，silero_vad.onnx 要求）
 const VAD_WINDOW_SIZE: i32 = 512;
 
@@ -208,13 +229,31 @@ pub fn build_padded_segments(
     total_samples: usize,
     full_audio: &[f32],
 ) -> Vec<Vec<f32>> {
+    build_padded_segments_capped(raw, total_samples, full_audio, SEGMENT_MAX_SECS)
+}
+
+/// FIX-REMOVE-HARDSPLIT-370：`max_seg_secs` **显式声明**单段长度上限（DEC-066，不靠输入长度反推）。
+///
+/// 两个调用方的上限与**理由都不同**：
+/// - 其它路径（VAD 分段 / 本地离线 accuracy）：`SEGMENT_MAX_SECS`(20s) —— native
+///   `max_total_len=512` 时代遗留，逐位不变；
+/// - 滑窗派发路径：`SLIDING_SLICE_MAX_SECS`(90s) —— **内存**安全阀（见该常量注释），
+///   不是常规切片规则：静默切出的片原样解码，只在「一路说满 90s 无停顿」时才切。
+///
+/// 无论上限多少，都保留 FIX-VAD-STATE-RESET-001 的边界过滤/clamp 与 200ms 边界 padding。
+pub fn build_padded_segments_capped(
+    raw: &[(usize, usize)],
+    total_samples: usize,
+    full_audio: &[f32],
+    max_seg_secs: f64,
+) -> Vec<Vec<f32>> {
     if raw.is_empty() {
         return Vec::new();
     }
-    let max_seg_samples = (SEGMENT_MAX_SECS * 16000.0) as usize;
+    let max_seg_samples = (max_seg_secs * 16000.0) as usize;
     let pad = SEGMENT_PADDING_SAMPLES;
 
-    // 第一步：边界过滤 + 合并相邻短段 → (start, end) 列表
+    // 第一步：边界过滤 + 硬切/合并相邻短段 → (start, end) 列表
     // FIX-VAD-STATE-RESET-001: 丢弃 start 越界的段（detector 游标未重置
     // 致 seg.start() 返回跨音频累计坐标），clamp end 越界段
     let mut merged: Vec<(usize, usize)> = Vec::new();
@@ -233,7 +272,7 @@ pub fn build_padded_segments(
             continue;
         }
         if clamped_len >= max_seg_samples {
-            // 单段超上限：硬切
+            // 单段超上限：硬切（滑窗路径 90s 安全阀 / 其它路径 20s 遗留上限）
             let mut pos = start;
             while pos < end {
                 let sub_end = (pos + max_seg_samples).min(end);
@@ -885,5 +924,123 @@ mod tests {
         );
         assert!(VadSegmenter::try_new_for_streaming(dir).is_none());
         assert!(VadSegmenter::try_new(dir).is_none());
+    }
+
+    // ========================================================================
+    // FIX-REMOVE-HARDSPLIT-370：`build_padded_segments_capped` 上限参数化
+    //   验证：① 上限可显式传入并生效 ② 滑窗上限=90s（不是 20s）
+    //        ③ 旧路径（`build_padded_segments`）与 `capped(.., SEGMENT_MAX_SECS)` **逐位相同**
+    //        ④ FIX-VAD-STATE-RESET-001 边界护栏在任意上限下都保留
+    // ========================================================================
+
+    /// 上限参数**显式生效**：5s 单片配 cap=2s ⇒ 按 2s 切成 3 段（2/2/1s）。
+    #[test]
+    fn capped_honors_explicit_cap() {
+        let sec = 16_000usize;
+        let total = 5 * sec;
+        let audio = vec![0.1f32; total];
+        let segs = build_padded_segments_capped(&[(0, total)], total, &audio, 2.0);
+        assert_eq!(segs.len(), 3, "5s / cap 2s ⇒ 3 段");
+        assert_eq!(
+            segs.iter().map(|s| s.len()).collect::<Vec<_>>(),
+            vec![2 * sec, 2 * sec, 1 * sec],
+            "每段 ≤ 2s（无 padding 余量：段间/末尾都被夹在边界内）"
+        );
+    }
+
+    /// 🔴 滑窗上限 = **90s**（不是 20s）：25s 的片**不被切**。
+    #[test]
+    fn capped_sliding_slice_max_is_90s_not_20s() {
+        assert_eq!(
+            SLIDING_SLICE_MAX_SECS, 90.0,
+            "Gavin 定（最终值）：单片上限 90s"
+        );
+        assert!(
+            SLIDING_SLICE_MAX_SECS > SEGMENT_MAX_SECS,
+            "滑窗上限必须高于其它路径的 20s 遗留上限"
+        );
+        let sec = 16_000usize;
+        let total = 25 * sec;
+        let audio = vec![0.1f32; total];
+        // 25s > 20s 但 < 90s ⇒ 1 段（旧 20s 上限下会切成 2 段 —— 见下对照）
+        let segs =
+            build_padded_segments_capped(&[(0, total)], total, &audio, SLIDING_SLICE_MAX_SECS);
+        assert_eq!(segs.len(), 1, "25s 片在 90s 上限下不得被切");
+        assert_eq!(segs[0].len(), total, "整片原样（首段前 padding 被 0 夹住）");
+        // 对照：同一输入配旧 20s 上限 ⇒ 2 段（证明 cap 参数确实在起作用）
+        let legacy = build_padded_segments_capped(&[(0, total)], total, &audio, SEGMENT_MAX_SECS);
+        assert_eq!(legacy.len(), 2, "旧 20s 上限下同一片会切成 2 段");
+    }
+
+    /// 🔴 安全阀：>90s 的片仍按 90s 切（180s ⇒ 90+90），**不丢弃**。
+    #[test]
+    fn capped_over_90s_still_splits_by_90s() {
+        let sec = 16_000usize;
+        let total = 180 * sec;
+        let audio = vec![0.1f32; total];
+        let segs =
+            build_padded_segments_capped(&[(0, total)], total, &audio, SLIDING_SLICE_MAX_SECS);
+        assert_eq!(
+            segs.len(),
+            2,
+            "180s ⇒ 90+90（安全阀生效，超出继续切/不丢弃）"
+        );
+        assert_eq!(
+            segs.iter().map(|s| s.len()).collect::<Vec<_>>(),
+            vec![90 * sec, 90 * sec]
+        );
+    }
+
+    /// 🔴 其它路径**逐位不变**证明：`build_padded_segments` ≡ `capped(.., SEGMENT_MAX_SECS)`。
+    ///
+    /// 覆盖：空输入 / 单短段 / 超限单段 / 多段可合并 / 多段不可合并 / 越界段 / 越界 end。
+    #[test]
+    fn legacy_wrapper_is_bit_identical_to_capped_segment_max() {
+        let sec = 16_000usize;
+        let total = 60 * sec;
+        let audio: Vec<f32> = (0..total).map(|i| (i % 97) as f32 / 97.0).collect();
+        let fixtures: Vec<Vec<(usize, usize)>> = vec![
+            vec![],
+            vec![(sec, 2 * sec)],
+            vec![(0, 25 * sec)],                          // 超 20s ⇒ 旧路径硬切
+            vec![(0, 5 * sec), (5 * sec + 100, 5 * sec)], // 相邻可合并
+            vec![(0, 15 * sec), (16 * sec, 15 * sec)],    // 合并后 31s > 20s ⇒ 不合并
+            vec![(total, 1000)],                          // start 越界 ⇒ 丢弃
+            vec![(total - 1000, 5000)],                   // end 越界 ⇒ clamp
+        ];
+        for raw in fixtures {
+            let a = build_padded_segments(&raw, total, &audio);
+            let b = build_padded_segments_capped(&raw, total, &audio, SEGMENT_MAX_SECS);
+            assert_eq!(
+                a, b,
+                "旧路径必须与 capped(SEGMENT_MAX_SECS) 逐位相同：raw={raw:?}"
+            );
+        }
+    }
+
+    /// 🔴 FIX-VAD-STATE-RESET-001 护栏在**滑窗上限**下同样保留：
+    /// start 越界 ⇒ 丢弃（不 panic、返回空）；end 越界 ⇒ clamp（不 panic）。
+    #[test]
+    fn capped_sliding_cap_keeps_bounds_guards() {
+        let sec = 16_000usize;
+        let total = 30 * sec;
+        let audio = vec![0.2f32; total];
+        assert!(
+            build_padded_segments_capped(&[(total, 1000)], total, &audio, SLIDING_SLICE_MAX_SECS)
+                .is_empty(),
+            "start >= total_samples ⇒ 丢弃"
+        );
+        let segs = build_padded_segments_capped(
+            &[(total - 1000, 5000)],
+            total,
+            &audio,
+            SLIDING_SLICE_MAX_SECS,
+        );
+        assert_eq!(segs.len(), 1);
+        assert_eq!(
+            segs[0].len(),
+            1000 + SEGMENT_PADDING_SAMPLES,
+            "end 超界 clamp 到 total，再补前向 200ms padding"
+        );
     }
 }
