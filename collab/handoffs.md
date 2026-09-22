@@ -6,6 +6,18 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-22 — coder-1 — POC-QWEN3-1.7B-351 ✅ 交付（1.7B 实测：不换；发现输出前缀硬不兼容）
+
+- **任务**：填 347 留的两个空白（本机 CPU RTF + 1.7B 中文 CER），纯 PoC 零生产逻辑。
+- **前置重构**（主控批准）：`create_qwen3_recognizer_at` **零行为变更提取**，独立 commit **`e829c67`**（+12/-0，函数体原样搬入、原函数缩为委托、签名/调用点不变、不动硬编码目录名）。
+- **PoC**：commit **`f335bd8`**（`src/transcription/mod.rs` `#[cfg(test)] mod poc_qwen3_17b_351`，+271/-0）；复用生产构造链 + `transcribe_acc_ctx`，不手搓配置；机器 16 核 / acc_threads=8 / full.wav 56.15s / 切片与 313 逐字相同。
+- **读数**（原始日志 `collab/evidence/20260922-poc-qwen3-17b-351/poc-351-raw.log`）：0.6B `peak_priv=2020MB rtf=0.218 cer=0.0356`；1.7B `peak_priv=4967MB rtf=0.324 cer=0.1556(含前缀)`；**剥前缀后 1.7B cer=0.0444**。
+- 🔴 **控制前缀（推翻 347 结论）**：1.7B 输出含 `language chinese<asr_text>`，生产 `strip_asr_special_tokens` 只剥 `<|…|>` ⇒ 漏进用户文本；两模型 tokenizer 逐字节相同 ⇒ 是 ONNX 图/元数据不兼容。**1.7B 非 drop-in。**
+- **结论：不换**——①CER 未优反劣（0.0444>0.0356）②RTF 1.36–1.49× ③**分片态**峰值 4.97GB 越界（> DEC-076 否决的 4.3GB）。
+- **方法教训**：按 decoder 权重比 2.70× 外推耗时 → 实测 1.36–1.49×，高估 1.8–2.0×；选型须实测。
+- **边界**：CER n=1（单条 56s），非统计结论；`andrewleech/...-onnx` 未用（主控已证不兼容）。
+- **红线**：未改版本 / 未 push / PoC 不夹带产品决策 / 未碰 local_stream.rs / 零凭证。
+
 ## 2026-09-22 — coder-1 — PUNCT-FINAL-REDO-350 ✅ 交付（标点剥离独立节点，只挂本地 realtime）
 
 - **需求（Gavin 2026-09-22）**：最终 acc 转写完成后剥光整段已有标点、再交标点模型整段重打；**只针对本地 realtime，其他管线不能动**（在线 ASR 标点可能更准）。设计细化：剥离做成**独立节点**、谁要谁挂，不绑死管线。主控前两稿 v1（四档一视同仁）/v2（`run_pipeline_core` 加 Fill/RedoWhole 模式参数）均作废，**v3 为准**。
