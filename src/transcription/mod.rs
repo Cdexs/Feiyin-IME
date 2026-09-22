@@ -2698,3 +2698,274 @@ mod tests {
         );
     }
 }
+
+// ============================================================
+// POC-QWEN3-1.7B-351 · 1.7B vs 0.6B 实测填空（CPU RTF + 中文 CER）
+//
+// 纯 PoC：`#[ignore]` manual test，仅在本文件 `#[cfg(test)]` 内，**不改任何生产逻辑**。
+// 运行：cargo test --bin feiyin-ime -- --ignored --nocapture poc_17b_351_fitness
+// 🔴 唯一变量 = 模型目录；其余锁死与生产一致 —— 复用 `create_qwen3_recognizer[_at]` +
+//    `transcribe_acc_ctx`，**不手搓 recognizer 配置**（[POC-BYPASSES-PROD-WRAPPER-001]）。
+// 机器信息在 stdout 打印（CPU 核数 / accuracy 线程数），否则速度数字无意义。
+// ============================================================
+#[cfg(test)]
+mod poc_qwen3_17b_351 {
+    use super::{
+        create_qwen3_recognizer, create_qwen3_recognizer_at, default_acc_num_threads,
+        transcribe_acc_ctx, CtxInject,
+    };
+    use crate::config::ChineseScript;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    /// Gavin 真口述三段标准答案（与 313 `poc_qwen3_compare.rs.txt::ANSWERS` 逐字相同）。
+    const ANSWERS: [&str; 3] = [
+        "上一轮1/8决赛，凭借哈兰德梅开二度，挪威队2比1爆冷淘汰五届世界杯冠军巴西队，历史性闯入世界杯八强。如今，他们将在迈阿密挑战英格兰队。",
+        "然而，据报道，近期挪威队内出现了疾病传播，多名球员受到发烧、咳嗽等症状困扰，球队正与时间赛跑，希望能在比赛前恢复最佳状态。",
+        "水晶宫前锋约根·斯特兰德·拉尔森因发烧缺席了世界杯首战对阵伊拉克队前的训练，并最终无缘那场比赛。效力于意甲萨索洛的马库斯·霍尔姆格伦·佩德森虽然在小组赛第二轮对阵塞内加尔队时取得进球，但由于生病，缺席了上一场对阵巴西队的淘汰赛。",
+    ];
+
+    /// 与 313 同一份词表（仅用于 per-stream terms 注入；两模型注入完全相同 ⇒ 不构成变量差异）。
+    const FIT_WORDLIST: &str = "哈兰德,挪威,世界杯,巴西,英格兰,迈阿密,萨索洛,塞内加尔,斯特兰德,拉尔森,霍尔姆格伦,佩德森,约根,犹地亚";
+
+    // 298 切片常量（与 313 `poc_qwen3_compare.rs.txt` 逐字相同）。
+    const AB_SIL_MS: f32 = 800.0;
+    const AB_MIN_SEG_MS: usize = 5000;
+    const AB_SIL_THRESHOLD: f32 = 0.01;
+
+    fn manifest_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn segment_298(samples: &[f32], rate: usize) -> Vec<(usize, usize)> {
+        let min_seg = rate * AB_MIN_SEG_MS / 1000;
+        let sil_need = (rate as f32 * AB_SIL_MS / 1000.0) as usize;
+        let mut segs = Vec::new();
+        let mut seg_start = 0usize;
+        let mut silent_run = 0usize;
+        let mut done_for_pause = false;
+        for (i, &s) in samples.iter().enumerate() {
+            if s.abs() <= AB_SIL_THRESHOLD {
+                silent_run += 1;
+                if !done_for_pause && silent_run >= sil_need {
+                    let cut = i + 1 - silent_run;
+                    if cut.saturating_sub(seg_start) >= min_seg {
+                        segs.push((seg_start, cut));
+                        seg_start = cut;
+                        done_for_pause = true;
+                    }
+                }
+            } else {
+                silent_run = 0;
+                done_for_pause = false;
+            }
+        }
+        if samples.len() > seg_start
+            && samples[seg_start..]
+                .iter()
+                .any(|s| s.abs() > AB_SIL_THRESHOLD)
+        {
+            segs.push((seg_start, samples.len()));
+        }
+        segs
+    }
+
+    fn slice_fitness(samples: &[f32], rate: usize) -> Vec<(usize, usize)> {
+        let raw = segment_298(samples, rate);
+        let maxn = rate * 20; // ≤20s
+        let pad = rate / 5; // 200ms
+        let mut caps: Vec<(usize, usize)> = Vec::new();
+        for (a, b) in raw {
+            let mut s = a;
+            while b - s > maxn {
+                caps.push((s, s + maxn));
+                s += maxn;
+            }
+            if b > s {
+                caps.push((s, b));
+            }
+        }
+        caps.into_iter()
+            .map(|(a, b)| (a.saturating_sub(pad), (b + pad).min(samples.len())))
+            .collect()
+    }
+
+    // ---- CER（与 313 逐字相同的口径：去标点空白后编辑距离）----
+    fn normalize_for_cer(text: &str) -> String {
+        const PUNCT: &[char] = &[
+            '。', '，', '、', '！', '？', '；', '：', '「', '」', '『', '』', '“', '”', '‘', '’',
+            '…', '—', '.', ',', '!', '?', ';', ':', '"', '\'', '(', ')', '[', ']', ' ', '\t', '\n',
+            '\r',
+        ];
+        text.chars().filter(|c| !PUNCT.contains(c)).collect()
+    }
+
+    fn edit_distance(a: &[char], b: &[char]) -> usize {
+        let (m, n) = (a.len(), b.len());
+        if m == 0 {
+            return n;
+        }
+        if n == 0 {
+            return m;
+        }
+        let mut prev: Vec<usize> = (0..=n).collect();
+        for i in 1..=m {
+            let mut cur = vec![i; n + 1];
+            for j in 1..=n {
+                let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+                cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+            }
+            prev = cur;
+        }
+        prev[n]
+    }
+
+    fn cer(hyp: &str, reference: &str) -> f64 {
+        let h: Vec<char> = normalize_for_cer(hyp).chars().collect();
+        let r: Vec<char> = normalize_for_cer(reference).chars().collect();
+        if r.is_empty() {
+            return if h.is_empty() { 0.0 } else { 1.0 };
+        }
+        edit_distance(&h, &r) as f64 / r.len() as f64
+    }
+
+    /// 进程内存（工作集, 私有），MB。与 313 同款 PowerShell 读法。
+    fn process_mem_mb() -> (f64, f64) {
+        let pid = std::process::id();
+        let script = format!(
+            "$p=Get-Process -Id {pid} -ErrorAction SilentlyContinue; if($p){{ \"{{0}} {{1}}\" -f $p.WorkingSet64,$p.PrivateMemorySize64 }} else {{ \"0 0\" }}"
+        );
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .output();
+        if let Ok(o) = out {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let mut it = s.split_whitespace();
+            let ws = it.next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+            let pv = it.next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+            return (ws / 1048576.0, pv / 1048576.0);
+        }
+        (0.0, 0.0)
+    }
+
+    /// 跑一个模型：逐片 `transcribe_acc_ctx`（前文累积 + 同一词表），返回
+    /// `(拼接文本, 总解码秒, peak 私有 MB)`。
+    fn run_model(
+        rec: &sherpa_onnx::OfflineRecognizer,
+        slices: &[(usize, usize)],
+        samples: &[f32],
+        load_priv_mb: f64,
+        tag: &str,
+    ) -> (String, f64, f64) {
+        let mut acc = String::new();
+        let mut total = 0.0f64;
+        let mut peak = load_priv_mb;
+        for (i, (a, b)) in slices.iter().enumerate() {
+            let current = if acc.is_empty() {
+                None
+            } else {
+                Some(acc.as_str())
+            };
+            let inject = CtxInject {
+                prev_older: None,
+                prev_latest: None,
+                current,
+                terms: Some(FIT_WORDLIST),
+            };
+            let t0 = Instant::now();
+            let (text, _native) =
+                transcribe_acc_ctx(rec, &samples[*a..*b], ChineseScript::Simplified, i, inject)
+                    .unwrap_or_else(|e| panic!("{tag} seg{i} decode failed: {e}"));
+            let secs = t0.elapsed().as_secs_f64();
+            total += secs;
+            let (_, pv) = process_mem_mb();
+            peak = peak.max(pv);
+            println!(
+                "POC351 {tag} seg{i} {:.2}-{:.2}s decode={:.3}s out_chars={} text={}",
+                *a as f64 / 16000.0,
+                *b as f64 / 16000.0,
+                secs,
+                text.chars().count(),
+                text.replace('\n', " ")
+            );
+            acc.push_str(&text);
+        }
+        (acc, total, peak)
+    }
+
+    #[test]
+    #[ignore = "PoC: cargo test --bin feiyin-ime -- --ignored --nocapture poc_17b_351_fitness"]
+    fn poc_17b_351_fitness() {
+        let root = manifest_dir();
+        let wav = root.join("collab/research/audio-real-gavin/processed/full.wav");
+        let wave =
+            sherpa_onnx::Wave::read(wav.to_str().expect("wav path utf8")).expect("read full.wav");
+        let rate = wave.sample_rate() as usize;
+        let samples = wave.samples().to_vec();
+        let dur = samples.len() as f64 / rate as f64;
+        let slices = slice_fitness(&samples, rate);
+        let full_ref = ANSWERS.concat();
+
+        println!(
+            "POC351 machine cores={} acc_threads={} dur={:.2}s",
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(0),
+            default_acc_num_threads(),
+            dur
+        );
+        println!(
+            "POC351 slices={:?}",
+            slices
+                .iter()
+                .map(|(a, b)| format!(
+                    "{:.1}-{:.1}s",
+                    *a as f64 / rate as f64,
+                    *b as f64 / rate as f64
+                ))
+                .collect::<Vec<_>>()
+        );
+
+        // ---- 0.6B：生产 create_qwen3_recognizer（经硬编码目录解析）----
+        let (ws0, pv0) = process_mem_mb();
+        let rec06 = create_qwen3_recognizer(&root.join("models")).expect("create 0.6B recognizer");
+        let (ws06_load, pv06_load) = process_mem_mb();
+        let (text06, secs06, peak06) = run_model(&rec06, &slices, &samples, pv06_load, "0.6B");
+        drop(rec06);
+        let (_, pv_after06) = process_mem_mb();
+        let _ = ws0;
+
+        // ---- 1.7B：同一生产构造链，**仅模型目录不同** ----
+        let dir17 = root.join("models/sherpa-onnx-qwen3-asr-1.7B-int8-2026-09-22");
+        let rec17 = create_qwen3_recognizer_at(&dir17).expect("create 1.7B recognizer");
+        let (ws17_load, pv17_load) = process_mem_mb();
+        let (text17, secs17, peak17) = run_model(&rec17, &slices, &samples, pv17_load, "1.7B");
+        let _ = ws17_load;
+
+        println!("POC351 RESULT");
+        println!(
+            "POC351 baseline_priv0={:.0}MB after06_priv={:.0}MB",
+            pv0, pv_after06
+        );
+        println!(
+            "POC351 0.6B load_priv={:.0}MB peak_priv={:.0}MB decode={:.3}s rtf={:.3} cer={:.4}",
+            pv06_load,
+            peak06,
+            secs06,
+            secs06 / dur,
+            cer(&text06, &full_ref)
+        );
+        println!(
+            "POC351 1.7B load_priv={:.0}MB peak_priv={:.0}MB decode={:.3}s rtf={:.3} cer={:.4}",
+            pv17_load,
+            peak17,
+            secs17,
+            secs17 / dur,
+            cer(&text17, &full_ref)
+        );
+        println!("POC351 0.6B text={}", text06.replace('\n', " "));
+        println!("POC351 1.7B text={}", text17.replace('\n', " "));
+        println!("POC351 ref  text={}", full_ref.replace('\n', " "));
+        let _ = ws06_load;
+    }
+}
