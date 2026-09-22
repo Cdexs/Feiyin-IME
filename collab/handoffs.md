@@ -19,6 +19,53 @@
 - **Gavin 端测六条**：①核心=预览标点不打句中 ②⚠️已知代价：长不停顿说话预览持续无标点（到期 1200ms 才打）——请明确能否接受 ③350 最终标点无 `。。` ④在线 realtime / 本地 performance 两档标点须与上版完全一致 ⑤346 `[LocalRT-DBG-298] seg dispatch` 的 `silence=` 恒 ≥1200ms ⑥不得新增 `target/release/crash.json`。
 - **红线**：版本由主控升未动 / 未改生产代码 / 未 push / 未 `cargo clean` / 未动 `models/…-1.7B-…`（2.2GiB）/ 零凭证。
 
+## 2026-09-22 — coder-1 — MIGRATE-1.13.8-1.7B-359 ✅ 交付（升库+换 1.7B+剥前缀，一批到位）
+
+- **Gavin 决策**：不分两批，直接升 1.13.8 + 上 1.7b + 前缀 B（不锁语种）；**回滚整批一起回**。
+- **① 升库**：`Cargo.toml` sherpa-onnx → `1.13.8`；lock 已 `sherpa-onnx(-sys) 1.13.8`。
+- **② 换 dll**：官方 1.13.8 `shared-MD-Release` 归档 → `vendor/sherpa-onnx/sherpa-onnx-v1.13.8-win-x64-shared-MD-Release/`（ORT **1.28.2**）；`SHERPA_ONNX_LIB_DIR` 指其 `lib/`。🔴 **旧 1.12.38 目录原样保留＝整批回滚备份**；新目录去 `-lib` 后缀复用 `.gitignore`（不入 git，同 1.12.38）。
+- **③ 换模型目录**：常量 `QWEN3_MODEL_SUBDIR`（唯一来源）接入 5 处：`check_qwen3_model_ready` / `hotwords_tokenizer` 生产 tokenizer.json 路径 / `test_tokenizer()` 与 readiness 测试夹具 / `src-tauri/src/main.rs`（独立 crate 镜像）/ `audio` gate335 helper。生产路径无 0.6B 残留；旧 0.6B 目录保留（回滚+test_wavs）。
+- **④ 剥前缀（语言无关）**：`strip_qwen3_language_prefix` + `is_qwen3_language_label` 并入 `strip_asr_special_tokens`；规则=开头 `<asr_text>` 且前缀「标签样」（官方 `language …` 或 ≤8 字纯字母语种名单词、且 `<asr_text>` 紧贴）；无标记⇒原样（**0.6B no-op**）。单测 4 条（多语种/无前缀/退化不误伤/与 `<|…|>` 叠加）。
+- **验证**：`cargo build`(debug) + **`cargo build --release`** 均 EXIT 0；src-tauri check EXIT 0；**全量 `cargo test --no-fail-fast` 0 failed**（root 1359P/0F/26I）；warnings bin release **98**<基线 99、debug test 89<90；`--numstat`==`-w`。
+- **⚠️ 瞬时 FAIL 排除**：首轮一次 `itn::tests::itn356_*` FAIL（单跑 ok、二轮全绿）；`src/itn.rs` 正被 coder-2 356 编辑 ⇒ 他人 WIP，非本批，未改任何 itn 文件。
+- **未出包**（DEC-079）；dll 分发副本同步（Publish/target）归 tester-1 出包时做。回滚三步：Cargo.toml→1.12 / cargo update / 指回旧 lib。
+- **红线**：未碰 `src/itn.rs`·`itn-rules.toml` / 未改主程序版本 0.9.3 / 未设 `language` 选项 / 未 push / 零凭证。
+
+## 2026-09-22 — coder-1 — UPGRADE-SHERPA-1.13.8-358 ✅ 交付（接口 diff：接口零风险、行为有真风险）
+
+- **任务**：Gavin「升级 1.13.8 适配 1.7b，注意接口参数有无变化」；**第一步只做接口 diff，不真升级**。纯读源，零文件改动。
+- **方法**：下载 crates.io `sherpa-onnx(-sys) 1.13.8` .crate 解压到临时目录，与本地 1.12.38 源逐项 diff + 读 release notes/PR diff。
+- **① 接口兼容**：`offline_asr.rs` diff **仅 +8 行**（新 `unsafe impl Send/Sync` for OfflineRecognizer/OfflineStream）；`lib.rs` 仅 doc；其它模块仅 +Send/Sync；**10 字段/所有签名零变化 ⇒ 预期零改动编译通过**（A 级；B 级编译待真升级单）。✅ 无冲突（仅对自有类型 `SendHwnd`/`Transcriber`/`SendOfflineRecognizerRef` impl Send）。features 不变。
+- **② 行为风险**：🔴 **#3873（1.13.7）centered-STFT 改特征 ⇒ 同一音频输出可能变、**含 0.6B** ⇒ 升级后必须全量回归 + 0.6B/1.7B 端测**。**#3907（1.13.7）只覆盖「整段全静音」**（不修 ja1「有语音却幻觉」）。**#3912（1.13.8）PRNG 竞态现状不触发**（accuracy worker 单线程串行 `transcribe_acc_ctx`，main.rs:8210；num_threads=8 是 ORT 内并行）。onnxruntime 1.24.4→1.28.2。
+- **③ dll**：`SHERPA_ONNX_LIB_DIR` 短路由 1.13.8 sys build.rs **保留** ⇒ 换目录即可；选 **`shared-MD-Release`** 档（与现 1.12.38 同 CRT），归档 `sherpa-onnx-v1.13.8-win-x64-shared-MD-Release-lib.tar.bz2`（已确认存在）；含 `sherpa-onnx-c-api.dll`/`onnxruntime.dll(1.28.2)` 等，随 exe 分发。
+- **④ 步骤草案**（未执行）：下归档→换 `SHERPA_ONNX_LIB_DIR`→改 Cargo.toml 版本→build（更新 lock，属下一单）→`cp` dll→全量回归→0.6B&1.7B 端测；回滚=指回 1.12.38。版本/出包按 DEC-079 须 Gavin 同意。
+- **产出** `collab/research/sherpa-1.13.8-upgrade-358.md`。
+- **红线**：未真升级 / 未改 Cargo.toml·lock / 未编译 / 未碰 `src/itn.rs`·`itn-rules.toml` / 未改版本 / 未 push / 零凭证。
+
+## 2026-09-22 — coder-1 — RESEARCH-QWEN3-CALL-OPTIMIZE-357 ✅ 交付（提示词能传但模型不照做）
+
+- **任务**：Gavin「摸清 1.7B 特性，看提示词传入/文本优化/ITN 有没有能起作用的」；前提=换 1.7B 已拍板。纯调研+只读实测，零生产代码。
+- 🔴 **命门结论**：**`hotwords` 通道 = system prompt 通道**（C++ `offline-recognizer-qwen3-asr-impl.cc:49-52` 把 `hotwords` 包进 `<|im_start|>system\n…<|im_end|>`；`:56-59` 逗号→空格）⇒ **提示词能传、且我们一直在传**（生产 `decode_accuracy_once` 的 `set_option("hotwords", s)`）。**A/B 答案 = B（能，入口叫 hotwords），不是「不吃」也不是「没接线」。**
+- 🔴 **但「能传」≠「照做」**：ITN 指令 **零效果**（`itn.wav` 3 条指令逐字不变）；去口水词**几乎不变**（英文指令→**空输出**）；格式指令**反噬**（「用简体中文输出」→输出大幅截断）。**与 DEC-070 同型。** ⇒ ITN/文本清理**继续自研，不甩给模型**。
+- **通道细节**：逗号被换成空格（`Terms: a,b,c`→`a b c`）；hotwords token 计入 `before_len` 挤音频 KV（C++ `:849-871` 告警）。
+- **版本侧**：`sherpa-onnx 1.12.38` 与最新 `1.13.8` 的 `OfflineQwen3ASRModelConfig` **字段相同（10 个、无 prompt/itn）**；上游 C++ master 的 `BuildSourceIds` 只有 `hotwords`+`language` ⇒ **升级 crate 拿不到 prompt 字段**。
+- **参数建议**：7 个写死值对 1.7B **保持**（同 355）。
+- **PoC** `fab61cc`（+97/-0，纯 `#[cfg(test)]`）；产出 `collab/research/qwen3-call-optimize-357.md` + `collab/evidence/20260922-qwen3-357/`。
+- **红线**：未改生产代码 / 未碰 `src/itn.rs`、`itn-rules.toml` / 未改版本 / 未 push / 零凭证。
+
+## 2026-09-22 — coder-1 — RESEARCH-QWEN3-1.7B-CAPABILITY-355 ✅ 交付（能力增量：无 B 级增量；调用层：无可调优点）
+
+- **任务**：Gavin「看换 1.7B 有哪些收益（0.6B 没有的）」+「注意调用上与 0.6B 的不同点、可着手调优的」。纯调研+PoC，零生产代码。
+- **结论**：**无 B 级能力增量**。官方卡对 0.6B/1.7B 同一段功能描述 ⇒ 功能集相同；实测 ITN/文本清理**无增量**，专名 `·` 1.7B **更差**，语种识别两者都有（1.7B 前缀**判错**：韩语→`汉语`）。
+- **调用层**：①7 个写死字段对 1.7B **语义相同、无需改**；唯一行为差异=1.7B 吐 `X<asr_text>` 前缀。②建议全部保持（`max_new_tokens=256` 对 30s 单段 135 字未截断，256/512 逐字相同）。③**未发现只对 1.7B 划算的调用方式**（30s 大分片两者都可行）。④前缀**无法从配置关闭**（`SherpaOnnxOfflineQwen3ASRModelConfig` 仅 10 字段、无 language/prompt/itn，`c-api.h:999-1021`），只能应用层剥离。
+- **附带**：生产恒发注入是**承重墙**（`system=None` 时 ja1/codeswitch 两模型都幻觉，带注入才正常）；**1.7B 对注入更敏感**（同 `CLEANUP_INSTR_EN` 出「传播不名」）。
+- 🔴 **崩溃未定性**：4 次运行 1 成功 / 3 次 `0xffffffff`，崩点不定（1.7B 重建/首建/S1 1.7B 解码）；无 `crash.json`；空闲内存 30GB ⇒ **非系统 OOM**；**不宣称根因**，建议空闲机专项复现。
+- **PoC**：`5651ccc`（+196/-3，纯 `#[cfg(test)]`）；产出 `collab/research/qwen3-1.7b-capability-355.md` + `collab/evidence/20260922-poc-qwen3-17b-355/`。
+- **待 Gavin 真实语料**：中英混/日韩差异、`·` 是否普遍、注入敏感是否稳定、精度实际幅度。
+- **追加（前缀可抑制）**：运行时支持 **per-stream `language` 选项**（`offline-recognizer-qwen3-asr-impl.cc:823-826`）；设对⇒前缀消失、部分语种更准；设错⇒改坏输出；`language=None`（现生产）下正文对错并存（ja→中文幻觉、中英混→中文乱写、英语带噪→空输出）⇒「不设+语言无关剥离」非安全方案。运行时已内置 1.7B 复读坍缩兜底（upstream #3535）。**所有结论 n=1，须扩充真实语料。** 报告已加「最终收尾」；1.7B 模型目录保留不动。
+- **追加（崩溃）**：`0xffffffff` = `SHERPA_ONNX_EXIT(-1)`（`_Exit(-1)`，`macros.h:54-59`），用于 ONNX metadata 读取失败等；**但崩溃前无 LOGE 文案** ⇒ 仍未定性。探针 `06d54a6`。
+- **红线**：未改生产代码 / 未碰 `src/itn.rs`、`itn-rules.toml` / 未改版本 / 未 push / 未测 CER、未报速度内存 / 零凭证。
+
 ## 2026-09-22 — coder-1 — POC-QWEN3-1.7B-RETEST-353 ✅ 交付（生产口径重测：**无统计显著差异**；口径修正是重点）
 
 - **背景**：Gavin 新约束「本地 realtime 只有极客用户、内存不是问题、要精度」⇒ 347 §五内存/速度判据作废、**唯一判据=生产口径精度**。主控发现 351 在 **ITN 之前**测 CER。
@@ -140,3 +187,17 @@
 - **验证**：`cargo fmt --check` EXIT 0 ｜ `cargo check` 0 error、warnings **99/90**=基线 ｜ `numstat`==`-w`（69/0、7/0）｜ 全量 `cargo test` **0 failed**、`itn::` **262P/0F**（NEW 3）。边界外同批钉死。临时探针已删干净。
 - 🔴 `itn-rules.toml` 三副本：root 已改，`Publish/` + `target/release/` **待 tester-1 出包同步**。
 - **B 单未碰**。未动版本号 / 未 commit / 未 push / 未出包 / 零凭证。
+
+## 2026-09-22 — coder-2 — ITN-DU-AMBIGUITY-356 ✅ 交付（单字数字+「度」义项消歧，354 的 B 单核心）
+
+- **核心缺陷**：`他一度以为 → 他1度以为`（量词/副词义「度」被温度单位规则误转）。
+- **先证后改 + 方案经主控批准（Option 1）**。规则：单字数字（**一..九 + 两**）+「度」**默认保护**，
+  仅「度」后 ∈ **END（串末/空白/标点）** 或测量续接词 **{电,角,左右,以上,以下,多,有余}** 才转；多位数不受影响。
+- **已证**：A 侧（一度以为/中断/夺冠…）全保护；B 侧（一度电/相差一度/零下一度/三十度/九十度角/一度水…）保持现状。
+- **条件 3 收口**：移除 13 条被规则覆盖的冗余词条（含 354 的 六度万行/八度空间/八度音…），
+  `N度空间` 族**一致保护**；**保留** `五度五关`（规则只护「五度」、后半「五关」被 `unit_preceded` 转 ⇒ 覆盖不到）。
+- **条件 2 已知代价（显式断言）**：单字+度+名词（`一度水/二度低温/五度低温`）保护（不转）。
+- **音程族建议不做**（能产族 + 频次极低）。
+- **验证**：`cargo fmt --check` EXIT 0 ｜ `cargo check` 0 error、warnings **98≤99** ｜ `numstat`==`-w`（246/0、19/8）｜ 全量 `cargo test` **0 failed**、`itn::` **267P/0F**（+5）。临时探针已删。
+- 🔴 `itn-rules.toml` 三副本：root 已改，`Publish/` + `target/release/` **待 tester-1 出包同步**。
+- 未动版本号 / 未 commit / 未 push / 未出包（DEC-079）/ 未碰甲/乙型 / 零凭证。

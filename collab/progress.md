@@ -1,4 +1,36 @@
 
+### 2026-09-22 · MIGRATE-1.13.8-1.7B-359 交付（升库+换 1.7B+剥前缀，一批到位）
+
+- Gavin 拍板不分两批：升 sherpa 1.13.8 + 换 Qwen3 1.7B + 应用层剥前缀（方案 B，语言无关）；回滚整批一起回。
+- 升库 `sherpa-onnx 1.13.8`（lock 已更）；换官方 `shared-MD-Release`（**ORT 1.28.2**）到 `vendor/`（旧 1.12.38 目录保留＝回滚备份）。
+- 换模型目录：唯一来源常量 `QWEN3_MODEL_SUBDIR` 接入 5 处（生产路径无 0.6B 残留）。
+- 新增语言无关前缀剥离，并入 `strip_asr_special_tokens`；对 0.6B/无前缀 no-op；单测 4 条。
+- 验证：`cargo build --release` EXIT 0；**全量 `cargo test --no-fail-fast` 0 failed**（1359P）；warnings 98<99；numstat==-w。**未出包**（DEC-079）。⚠️ 首轮一次 `itn356_*` FAIL 系 coder-2 356 在飞中间态，非本批。
+
+### 2026-09-22 · UPGRADE-SHERPA-1.13.8-358 交付（接口 diff：接口零风险、行为有真风险）
+
+- 第一步只做接口 diff，不真升级，零文件改动。
+- **接口兼容**：1.13.8 相对 1.12.38，`offline_asr.rs` 仅 +8 行（新 `unsafe impl Send/Sync`）、`lib.rs` 仅 doc、其余仅 +Send/Sync；**10 字段与签名零变化 ⇒ 预期零改动编译通过**；无 Send 冲突；features 不变。
+- **行为风险**：🔴 **#3873 改 centered-STFT 特征 ⇒ 输出可能变（含 0.6B）⇒ 必须全量回归 + 端测**；#3907 仅覆盖整段全静音；#3912 竞态现状不触发；onnxruntime 1.24.4→1.28.2。
+- **dll**：选 `shared-MD-Release` 档、换 `SHERPA_ONNX_LIB_DIR` 即可。
+- 产出 `collab/research/sherpa-1.13.8-upgrade-358.md`。未真升级/未改 Cargo.toml·lock/未编译/未 push。
+
+### 2026-09-22 · RESEARCH-QWEN3-CALL-OPTIMIZE-357 交付（提示词能传但模型不照做）
+
+- 前提：换 1.7B 已拍板；本单只摸调用接口。零生产代码。
+- 🔴 **`hotwords` 通道 = system prompt 通道**（C++ 把 hotwords 包进 `<|im_start|>system…`）⇒ 提示词能传、且生产一直在传（`decode_accuracy_once` 的 `set_option("hotwords", s)`）。**A/B = B（能）。**
+- 🔴 但**模型不照做**：ITN 指令零效果、去口水词几乎不变（英文指令→空输出）、格式指令反噬 ⇒ **与 DEC-070 同型**，ITN/文本清理继续自研。
+- 版本侧：1.12.38 与 1.13.8 的 Qwen3 config 字段相同（10 个、无 prompt/itn），上游 C++ 亦无独立 prompt 字段 ⇒ 升级拿不到。
+- PoC `fab61cc`（纯测试）；产出 `collab/research/qwen3-call-optimize-357.md`。未改生产代码/未改版本/未 push。
+
+### 2026-09-22 · RESEARCH-QWEN3-1.7B-CAPABILITY-355 交付（能力增量：无 B 级增量）
+
+- Gavin 问「换 1.7B 有哪些 0.6B 没有的收益」+「调用上可调优点」。官方卡：0.6B/1.7B **同一段功能描述** ⇒ 功能集相同，1.7B 唯一官方差异=精度（已给定，不再测）。
+- 实测（只读生产链）：ITN/文本清理**无增量**；专名 `·` 1.7B **更差**；语种识别两者都有但 1.7B 泄漏 `X<asr_text>` 前缀且**判错**（韩语→`汉语`）。
+- 调用层：7 个写死字段对 1.7B 语义相同、无需改；前缀**无法配置关闭**（Qwen3 config 仅 10 字段）；**未发现只对 1.7B 划算的调用方式**（30s 大分片两者都可行）。
+- 附带：生产恒发注入是**承重墙**；1.7B 对注入更敏感。🔴 崩溃未定性（4 次 1 成 3 崩，崩点不定，非系统 OOM）。
+- PoC `5651ccc`（纯测试）；产出 `collab/research/qwen3-1.7b-capability-355.md`。未改生产代码/未改版本/未 push。
+
 ### 2026-09-22 · POC-QWEN3-1.7B-RETEST-353 交付（生产口径重测：无统计显著差异）
 
 - 判据变更（Gavin）：内存/速度不再是障碍 ⇒ **唯一判据=生产口径精度**；351 在 ITN 前测 CER 的口径缺陷已修正。
