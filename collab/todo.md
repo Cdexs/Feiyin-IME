@@ -11,28 +11,46 @@
 
 | 项 | 状态 |
 | --- | --- |
-| 版本 | 仍 **0.9.2**。v0.9.3 批次九已出包：最新包 **BUILD-345**（HEAD `d87b8b4`，含 **P0 中文切片崩溃修复** / **DEC-077 回滚 340+307 三机制** / 失败片流式填补 G / 342 D/OR 等）。**已替换作废的 8758ca66**。✅ **已 push**：`origin/main` = 本地 HEAD `1ec4143`（2026-09-22 主控 `git ls-remote` 核实，工作区 clean）；**未打 tag**（远端最新 tag 仍 `v0.9.1`），打不打由 Gavin 定 |
+| 版本 | 🆕 **已升 0.9.3**（Gavin 2026-09-22 指示，主控改 5 处：`Cargo.toml:3`/`Cargo.lock:5893`/`src-tauri/Cargo.toml:3`/`src-tauri/Cargo.lock:934`/`tauri.conf.json:9`，全仓复扫无残留）。上一个包仍是 0.9.2 时代的：v0.9.3 批次九已出包：最新包 **BUILD-345**（HEAD `d87b8b4`，含 **P0 中文切片崩溃修复** / **DEC-077 回滚 340+307 三机制** / 失败片流式填补 G / 342 D/OR 等）。**已替换作废的 8758ca66**。✅ **已 push**：`origin/main` = 本地 HEAD `1ec4143`（2026-09-22 主控 `git ls-remote` 核实，工作区 clean）；**未打 tag**（远端最新 tag 仍 `v0.9.1`），打不打由 Gavin 定 |
 | 本轮出包史 | BUILD-258 → 267 → 274 → 280（诊断包）→ 285（🛑 作废）→ 287 → 290 → 296 → 302 → 306 → 321 → 328 → 333 → 338 → 341 → 342（带 P0 已作废）→ **345（当前）** |
 | 端测待办 | ① 🆕 **BUILD-345 五条**（须 Gavin 真人录音，带 `-debug`）：**1** 🔴 **长句一口气说到底**（中间尽量不停顿）：预览**后半部分**应与最终输出一致；`[LocalRT-DBG-325] action=skipped-hole` **应基本消失**（上一版一次录音 7 片里 6 片是它），请贴 action 分布；**2** 🔴 **不得崩溃**：`target/release/crash.json` 不应新增（P0 修复重点）；**3** 停手不松手 ⇒ 尾字应在 1~3s 内被 accuracy 补上；**4** D 复核：连续说话应有 `silence<800ms` 的派发（改前 47 次最小 800ms）；**5** 其余（重复标点／编辑不被冲／自学习两次+反向／配置界面／首字「你→按」）有观察记一句 ② v0.9.1 四项遗留：overlay 编辑态剥尾标点／Key 输入框 placeholder／繁中 ITN（`三點半→3:30`）／「API 配置」新文案布局 |
 | Worker | ✅ 09-22 新 session 三 Worker 全部就绪（OpenCode `deepseek-v4.1-flash`）：coder-1 / tester-1 主动 ACK，coder-2 经 capture-pane 核实存活并已 ACK。三方 inbox 均空，待派发 |
 | 文档 | 09-22 归档 handoffs 09-21 共 59 条（626 → 42 行）。DEC-064 两层结构：**新增条目必须 archive 与索引两边都写** |
-| 下一步 | **等 Gavin 端测 BUILD-345 反馈**（重点：长句 `skipped-hole` 是否基本消失 + 不得新增 `crash.json`）。✅ P0 char-boundary 崩溃已由 `8282203` 修复（单测 + 冒烟双证），原现场待 Gavin 长口述复核。⏸ 335 电平闸挂起 |
+| 下一步 | 🔄 **v0.9.3 批次十在飞**：`ACC-DISPATCH-SILENCE-ONLY-346`（coder-2，切片规则改只判静默 1200ms）+ `RESEARCH-QWEN3-1.7B-347`（coder-1，纯调研）。两者均已 ACK 同意方案。并行等 Gavin 端测 BUILD-345 五条反馈。⏸ 335 电平闸挂起 |
 
 ---
 
 ## 🔴 待做
 
-### 🆕 v0.9.4 批次一 · Gavin 2026-09-21 端测 BUILD-290 反馈（证据 `collab/evidence/20260921-gavin-e2e/debug-1018.log`）
+### 🆕 v0.9.3 批次十 · Gavin 2026-09-22 三项（版本已升 0.9.3）
+
+**版本号**：`0.9.2 → 0.9.3`，Gavin 2026-09-22 明确指示。主控已改 5 处：
+`Cargo.toml:3` / `Cargo.lock:5893` / `src-tauri/Cargo.toml:3` / `src-tauri/Cargo.lock:934` /
+`src-tauri/tauri.conf.json:9`。全仓复扫无 `0.9.2` 残留（`ui/package.json` 是 `0.1.0`，历来独立，未动）。
 
 | 单号 | 内容 | 负责人 | 状态 |
 | --- | --- | --- | --- |
-| `FIX-LOCALRT-TAILCHAR-291` | **中间句必丢尾字**。根因已定位：`endpoint` 分支直接 `recognizer.reset()`，**reset 前从未 `input_finished()`** ⇒ 解码器里压着的最后一个 token 被丢弃；全函数唯一一次 flush 在 loop 之后，只救最后一句。日志三句全中（电[影]／空[气]／问[题]）。方案：endpoint 时先 flush 再取结果，下一句改 `create_stream()` 而非 `reset()` | coder-2 | ✅ 已交付（`99799c5`，仅 `local_stream.rs`；实机 `gained` 待 tester-1/Gavin）|
-| `FIX-LOCALRT-FIRSTCHAR-293` | **首字爆破音被窗口削掉**（Gavin 2026-09-21 拍板，不等取证先修；新证据「输入**你**」→「输入**按**」）。方案：环形缓冲容量 600→**1000ms**（`audio/mod.rs:873` 一处），本地流式 `drain_pre_roll` 取 1000ms、**在线三档仍取 600ms**（`retain_recent_samples` 保留最近 N ms ⇒ 在线零改变）；分流用现成的 `record_streaming` 第 8 参 `trim_pre_roll_residual`；283 裁剪逻辑一行不改，窗口变长后正好由它兜住混进来的上句尾音 | coder-1 | ✅ 已交付（293-B 修订：容量 1000ms 保留，新增「锚定语音起点」统一裁剪 A/B/C+兜底；实机 `dur=1000ms` 待 tester-1/Gavin）|
-| `DIAG-LOCALRT-FIRSTCHAR-292` | **首字取证（293 的验证手段，不撤）**。已排除 283（四次全 `28800→28800`，按设计只在 ≥2 语音段时才裁，本场景 1 段）。出错那次 pre-roll 有语音贴在窗口末尾（`ratio=0.07`）= 「先开口后按键」。**「端」的声学起点在不在这 600ms 里」无法从日志判定** ⇒ 先做 debug-only WAV dump 拿音频 | coder-1 | ✅ 已交付（WAV dump + `[LocalRT-DBG-292]`；待 tester-1/Gavin 实机产出音频）|
+| `ACC-DISPATCH-SILENCE-ONLY-346` | 切片派发规则改「只判静默 1200ms」，删长度支（原 800ms OR 累计 5s）。🔴 **必须同批解决共享计数器**：`silent_ms`（`local_stream.rs:491`）是唯一计数器，标点路径 `:997` 在 800ms 打点后把它清零 ⇒ 阈值抬到 1200 后静默支**结构上不可达**，不解决则 accuracy 录音中永不派发 | coder-2 | 🔄 已派发 |
+| `RESEARCH-QWEN3-1.7B-347` | HuggingFace 查下载量最高的 Qwen3-ASR 1.7B，评估替代现役 0.6B 可行性。🔴 头号门禁 = **有无 sherpa-onnx 可用的 ONNX 导出**（我们走进程内 sherpa-onnx，不是 transformers），没有即不可行 | coder-1 | 🔄 已派发（纯调研，零生产代码） |
+| `QUERY-PUNCT-MECHANISM-348` | 查前端流式模型调标点模型的机制 | 主控 | ✅ 已查清并答复 Gavin（结论见下） |
 
-🔴 **284/289 影子机制为何没兜住**（别再往影子上打补丁）：① `shadow_done_for_pause` 在静默第一个 400ms 就上锁，之后 main 还在长 ⇒ endpoint 时恒 `shadow < main`，5 次 confirm **全 `used=main`**；② 超 `SHADOW_MAX_AUDIO_SECS=12s` 的句子影子被整个跳过。
-✅ **反向价值**：`shadow finalize #6` 给 15 字而同刻 main 只有 14 —— 这正是 `input_finished()` 能多吐一个字的硬证据，291 方案据此成立。
+#### 346 的取舍（Gavin 拍板，照做，端测须盯）
 
+删长度支 ⇒ **一口气连说不停顿时录音中不派发**，全压到松手后的尾片。
+- ✅ **无 OOM/无界音频风险**：`build_padded_segments`（`vad.rs:233-241`）对 ≥ `SEGMENT_MAX_SECS=20.0` 的片
+  硬切成子段，单次喂 accuracy 的音频恒 ≤20s，这条安全网与派发规则无关、独立成立。
+- ⚠️ **代价是延迟**：BUILD-321 实测「后端并行派发」是该版最大收益
+  （后台共解码 20.0s，用户实际等待均值 **0.63s** / 中位 0.32s）。连说 40s 不停顿 ⇒ 这 40s 全部
+  在松手后才开始解码。端测请盯 `[LocalRT-DBG-298] join: tail_wait`。
+
+#### 348 结论 · 本地流式档的标点机制（主控已读实际运行代码取证）
+
+**一句话**：预览与最终输出是**两个独立阶段**，共用同一个 CT-Transformer 引擎，但触发判据不同 ——
+预览按「4s 定时 **或** 静默 800ms + 有新内容」打（`local_stream.rs:987` / `preview_display():254`）；
+最终输出**先验文本里实际有没有标点**（`has_effective_punctuation`，DEC-047 口径），
+已有就**跳过引擎**，没有才跑（`main.rs:9551` / `:8421`）。
+🔴 全文（含性能实测 0.15ms/字、增量缓存与 344 P0 崩溃的关系、三层阈值为何不能混用）
+见 `todo-archive.md` §「【归档四】QUERY-PUNCT-MECHANISM-348」。
 
 ### ⏸ v0.9.3 收尾三件 · 等 Gavin 拍板
 
@@ -115,10 +133,8 @@ README 里教用户改 `config.toml` 的段落已全部删除。但 `translation
 
 | # | 项 | 说明 |
 | --- | --- | --- |
-| 1 | ~~README 正文更新~~ | ✅ **已完成 README-212**（2026-09-10）：中英 README 重写为叙事式产品页，英文名定为 **FlashVoice Input** |
 | 1b | 🔴 **命名不一致待定** | 产品英文名已改 FlashVoice Input，但这些**还是旧名**：仓库名 `Feiyin-IME`、产物名 `feiyin-ime.exe` / `feiyin-ime-ui.exe`、GitHub Release 标题「飞音智能语音输入 v0.9.0」、安装包脚本 `voice-ime.iss`。**改产物名会动构建链和用户升级路径，等 Gavin 决定改到哪一层** |
 | 2 | Release 挂安装包 | 本次 Release 未挂二进制。`voice-ime.iss` 是 Inno Setup 脚本但未构建。需对外分发时：出 release 包 → 构建 setup.exe → upload asset |
-| 3 | ~~`Publish/models` 缺 performance 模型~~ | ✅ **已销项（09-20 主控文件系统复核）**：`Publish/models/` 下五个模型目录齐全，含 `sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17`。与 tester-1 在 `BUILD-228` 的上报一致，原条目系当时取证时点问题 |
 
 ---
 
@@ -225,107 +241,17 @@ Phase 4 完整规划见 `collab/research/macos-phase4-plan-001.md`，逐任务�
 
 ---
 
-## 2026-09-21 BUILD-321 端测六条 + 日志调优复盘 — 处置台账
-
-| # | 问题 | 结论 / 处置 | 状态 |
-| --- | --- | --- | --- |
-| ① | ITN：「十分的重要」→「10分的重要」 | 🔴 **不是加保护词条就行**（主控原判已推翻）：`check_protection` 前缀匹配，加裸「十分」会打红 `十分钟→10分钟`(itn.rs:3997)、`三点二十分→3:20`(3896)、`三小时二十分→3:20`(3882)。且 DEC-038 禁保护表承载语法族 ⇒ **必须落成规则** | ✅ **已交付** `5164a10`（itn 259P/0F） |
-| ② | tokenizer 报错 | 旧 exe（BUILD-321 构建于修复 `77313e5` 之前）指向已不存在的 nano 目录。**修复已入库，重建即消失** | ⏳ 待出包 |
-| ③ | 流式预览尾字丢失 | 🔴 **291（flush 信号）与 307（整句重解码）双双证伪**：`[LocalRT-DBG-307]` 21 条全 `gained=0`。同音频完整重解一字不差 ⇒ **流式 paraformer 本身不输出该字，再重解码无用**。新方向：拿 accuracy 分片结果**回灌预览**（298 并行下分片结果录音中即到，`seg dispatch` 带 `pcm_pos` 可作边界） | ✅ **已交付** `4c78ef3`(325) + `4d49252`(329 持久化) |
-| ④ | 编辑态自学习不触发（「指导灵」未入库） | 🔴 **主控原判（`AUTOLEARN-REACH-001`）已实测证伪并作废**：自学习**每次都触发了**（BUILD-321 日志 4 条）。真因 = 候选抽取按字符 diff，ASR 尾部也听错时公共后缀为空、跨度吞到句尾被句末标点校验整体拒 ⇒ 4 次只落 1 次计数，门槛 2 够不着 | ✅ **已交付** `291063c`(327 收窄) + `7d3a3a5`(331 基准) |
-| ⑤ | 上下文/词条是否真注入 | ✅ **已证实注入**：`terms_len=73` 每片都有；`acc_len` 录音内 0→12→29→57→79 增量；跨录音轮换 `prev1_len=97` → `prev2_len=97 prev1_len=14`；`cut=0` 从未截断。🔴 但护栏误触 **43%（6/14）** | ✅ **已修（ORCH-CTX-GUARD-FIX-324，主控直改）** |
-| ⑥ | Qwen3 的 ITN 是否启用 | **该模型没有这个开关**：`OfflineQwen3ASRModelConfig` 无 `itn` 字段（FunASR 有）。数字规整一直由自研 `src/itn.rs` 承担（DEC-030），换模型前后不变 | ✅ 已答，无需动作 |
-
-### 调优复盘结论（BUILD-321 日志，11 次录音）
-
-| 调优项 | 判定 | 证据 |
-| --- | --- | --- |
-| 后端并行派发（800ms / 5s） | ✅ **本版最大收益，保留** | 十次录音后台共解码 **20.0s**，用户实际等待均值 **0.63s**、中位 **0.32s**（`join: total_decode` vs `tail_wait`） |
-| Endpoint 门限 2.4/2.0/20 | ✅ **有效，值别动** | 11 次录音仅 11 次断句，无碎切 |
-| 线程数 8（随核心数） | ⚪ 生效但无可观测收益 | `num_threads=8` 两处确认；流式解码本无拥塞 |
-| Shadow 预览 | ⚠️ 日志内 **11:0 从未胜出**（`used=main` 11/11，`shadow_len` 恒 ≤ `main_len`），单次最贵 475ms。**但 Gavin 端测观察到「有时起作用」⇒ 保留不动** | `[LocalRT-DBG-289]` |
-| Pre-roll 前导缓冲 | 🔴 **全程空转** | `mean_abs=0.0000 peak=0.0000 speech_frames=0/50` **11/11**；`mode=tail` 11/11。缓冲满 100 chunks 但全是精确零 ⇒ 每次录音头部只贴 200ms 纯静音 | 
-| ↳ 处置 | ✅ **已交付** `4c78ef3`：**pre-roll 链路无 bug**，「全零」是 `{:.4}` 显示精度 + 16-bit 落盘量化共同造成的读数假象（实测 nz_ratio=1.000、peak 4e-8~1.3e-6）。已改打 dBFS + nz_ratio。原「修不了就整块摘除」的前提不成立，**该要求已撤销** | |
-
----
-
-## 2026-09-21 本批收口（BUILD-333 已出包）—— 台账对账
-
-🔴 **本节存在的理由**：上方 09-21 台账表在本批开工后**数小时未同步**，其中 ④ 一直挂着
-已被证伪作废的 `AUTOLEARN-REACH-001`。而主控当天正是照着那条过期记录写了错误任务书派发，
-靠 Worker 停手反证才拦住。**过期台账比没有台账更危险** —— 已就地订正，本节为最终状态。
-
-### 已出包（BUILD-333，产物 main `703788ed…`，版本 0.9.2 未动）
-
-| 单号 | 内容 | 提交 |
-| --- | --- | --- |
-| ITN-SHIFEN-323 | 「十分的重要」误转 | `5164a10` |
-| ORCH-CTX-GUARD-FIX-324 | 回显护栏比对面收窄 + 埋点修正 + 清理指令恒发 | `7cc7cea` |
-| PREROLL-DEAD-322 | pre-roll 根因定案（**无 bug**）+ 诊断精度 dBFS/nz_ratio | `4c78ef3` |
-| ACC-PREVIEW-REFLOW-325 | accuracy 分片结果回灌预览（尾字换方向） | `4c78ef3` |
-| AUTOLEARN-CANDIDATE-327 | 候选二次收窄（真因） | `291063c` |
-| ACC-REFLOW-PERSIST-329 | 回灌持久化 + 学习镜像基准对齐 | `4d49252` |
-| UI-LRMODEL-HINT-330 | 删除指向已废弃 nano 的假提示块 | `b20f733` |
-| AUTOLEARN-EDIT-SNAPSHOT-331 | 编辑入口快照学习基准 + 词条上限 30→12 | `7d3a3a5` |
-| AUTOLEARN-DROP-PATHB-332 | 摘路径B（对齐 DEC-058）+ 清三处死代码 | `b0eca48` |
-
-### 待 Gavin 端测验证（判据见 `collab/outbox/tester-1/result.md`）
-
-| # | 项 | 判据 |
-| --- | --- | --- |
-| 1 | 尾字（本包核心） | `[LocalRT-DBG-325] streaming render` 的 `has_acc_prefix` / `committed_len` 连续说话期间**不归零** |
-| 2 | 预览窗编辑（风险最高） | 录音中编辑不被回灌冲掉；**退出编辑后继续录音仍不被冲**（闩锁） |
-| 3 | 自学习 | 编辑改对同一词**两次** ⇒ `(1/2) observed` → `(2/2) promoted` + 词库可见；**反向：不编辑不应出现任何 `[AUTOLEARN]` 行** |
-| 4 | 配置界面 | 本地流式档下方**无任何模型文件提示块**（UI 只能目视验） |
-| 5 | 先说半句再按热键 | `[LocalRT-DBG-293] mode=onset`（不再恒 tail） |
-| 6 | 护栏误触 | `[LocalRT-DBG-320] action=redecode` 频次显著低于改前 **43%（6/14）** |
-
-### 🔴 已知遗留（非本批引入，未动）
-
-| 项 | 说明 |
-| --- | --- |
-| 电平闸 attack 吃首字爆破音 | coder-1 在 322 发现的下游线索：C920 采集链的电平触发降噪闸有 attack 时间，疑似压掉首字声母，与长期报的「你→按」吻合。**未动手**，待端测第 5 项观察后立单 |
-| `maybe_learn_user_edit` 的窄 gap | 已由 331 收口，329 的锚断言已改写语义 |
-| KV `max_total_len` 取值 | 代码 4096（与词库预算 3000 耦合，仅在 4096 下成立）。Gavin 早期口径 2048 已在注释中说明耦合关系，**改需同批下调词库预算** |
-
----
-
 ## ⏸ 挂起中（等外部条件，非阻塞出包）
 
-### GATE-ATTACK-PROBE-335 · 电平闸 attack 是否吃掉首字爆破音
+### GATE-ATTACK-PROBE-335 · 电平闸 attack 是否吃掉首字爆破音 —— ⏸ 挂起
 
-**挂起原因**（Gavin 2026-09-21）：「我现在环境有声音，没办法做到静默啊。」
-⇒ 环境有底噪 ⇒ 闸一直开着 ⇒ **「冷起振」这个被测条件不成立**，此时采集的数据无效。
-
-**Gavin 口径**：等环境安静了再跑，届时他会告知。
-
-🔴 **恢复流程（别记错，这不是看普通录音日志）**：
-1. Gavin 说「可以了」
-2. 主控让 coder-1 跑 `cargo test gate335_capture_envelope_manual -- --ignored --nocapture`（45s 采集窗）
-3. Gavin 按脚本说约 34 秒（脚本见下，届时由主控贴给他，他不必记）
-4. coder-1 依次做：量 attack/亏欠 → 切 A/B 片段 → 跑 `gate335_asr_ab_manual` → 出结论
-
-**采集脚本**：
-```
-静默2s → 说「你好」→ 停2s → 说「你说」→ 停2s
-→ 一口气连读：今天天气不错你好我们开始吧我这边都准备好了你说是不是
-→ 停2s → 整段再来一遍
-```
-⚠️ 段间静默不可缩短（唯一分段依据）；🔴 **不可拍手/敲桌做标记**（会把闸打开，毁掉冷起振条件）。
-
-**为什么要这么设计**：「你好」「你说」各出现两次 —— 一次冷起振（闸未开）、一次藏在连读句中（闸已开）。
-同一人、同一字、同一次录音，**唯一差别就是过不过闸** ⇒ A 错 B 对即因果坐实，两组一样即线索证伪。
-
-**已就绪（零生产代码改动，numstat 279/0 全在 test cfg）**：
-`gate335_capture_envelope_manual`（45s 采集 → capture.wav + envelope-1ms.txt）、
-`gate335_asr_ab_manual`（走生产解码路径 `transcribe_acc_ctx`）、
-`analyze_attack.py`、`cut_segments.py`（均带量具自检）。跑法见 `collab/outbox/coder-1/result.md`。
-
-**预备读数（n=2，不是结论）**：attack 31ms / 326ms；首 30ms 相对稳态亏欠 42.9dB / 35.9dB。
-
-**零成本旁证（已请 Gavin 日常端测留意）**：环境吵 ⇒ 闸开着 ⇒ 此时首字应不易出错。
-若反馈「现在『你』不再被听成『按』」⇒ 强旁证；若「照样出错」⇒ 与闸无关，线索可划掉。
-
+**挂起原因**（Gavin 2026-09-21）：「我现在环境有声音，没办法做到静默啊。」⇒ 有底噪 ⇒ 闸一直开着
+⇒ 「冷起振」这个被测条件不成立。**等 Gavin 说环境安静了再跑**。
+🔴 **恢复流程、采集脚本、为什么这么设计、已就绪的两个 manual 测试与两个 py 量具、
+预备读数（attack 31/326ms，首 30ms 亏欠 42.9/35.9dB）—— 全文见 `todo-archive.md`
+§「【归档三】GATE-ATTACK-PROBE-335 全文」**。别凭这 8 行开跑，会漏掉「不可拍手做标记」这类硬约束。
+**零成本旁证**（已请 Gavin 日常端测留意）：环境吵 ⇒ 闸开 ⇒ 首字应不易错。
+反馈「『你』不再被听成『按』」⇒ 强旁证；「照样出错」⇒ 与闸无关，线索划掉。
 ### 已知遗留（非本批引入）
 - KV `max_total_len=4096` 与 `HOTWORDS_MAX_TOTAL_TOKENS=3000` 耦合，改需同批核算（注释已写明）
 - `MAX_WHITESPACE_SEGMENTS=4` 等其余候选闸门未复核（本批只改了长度上限 30→12）
