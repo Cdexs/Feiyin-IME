@@ -6212,3 +6212,214 @@ mod testsync371_align_contract_tests {
         assert!(!format!("{c}{l}").is_empty());
     }
 }
+
+// =====================================================================
+// TEST-SYNC-377（阶段三 · 非作者视角，tester-1）
+// ---------------------------------------------------------------------
+// 目标：377「注入按规格收窄」——`build_ctx_system` 只产出纯 ASCII 逗号词表；
+// 并确认 374/375/371/368/369 不回归。生产代码零改动、按设计写用例。
+// =====================================================================
+#[cfg(test)]
+mod testsync377_inject_spec_tests {
+    use super::{build_ctx_system, should_inject_ctx};
+
+    // ---------- 377：build_ctx_system 行为 ----------
+
+    /// 设计：纯词表 ⇒ 逐字返回（不得重排 / 去重 / 加标签）。
+    #[test]
+    fn ctx377_pure_list_verbatim() {
+        let t = "你好,铭印,银线,朵洛莉丝";
+        assert_eq!(
+            build_ctx_system(Some(t)).as_deref(),
+            Some(t),
+            "纯词表必须逐字返回"
+        );
+    }
+
+    /// 设计：只 trim 首尾；内部空白原样保留。
+    #[test]
+    fn ctx377_trims_ends_only_preserves_inner() {
+        assert_eq!(
+            build_ctx_system(Some("  你好, 铭印  ")).as_deref(),
+            Some("你好, 铭印")
+        );
+        assert_eq!(
+            build_ctx_system(Some("\t你好,铭印\n")).as_deref(),
+            Some("你好,铭印")
+        );
+    }
+
+    /// 设计：None / 空串 / 纯空白 / 纯换行 ⇒ None（不调 set_option hotwords）。
+    #[test]
+    fn ctx377_none_on_empty_or_blank() {
+        for t in [None, Some(""), Some("   "), Some("\t\n "), Some("\r\n")] {
+            assert_eq!(build_ctx_system(t), None, "空/纯空白 ⇒ None：{t:?}");
+        }
+    }
+
+    /// 设计：逗号结构逐字保留（连续逗号 / 尾随逗号 / 只有逗号 / 重复词条都不动）。
+    #[test]
+    fn ctx377_commas_verbatim() {
+        assert_eq!(build_ctx_system(Some("a,,b,")).as_deref(), Some("a,,b,"));
+        assert_eq!(
+            build_ctx_system(Some(",")).as_deref(),
+            Some(","),
+            "只有逗号=非空 ⇒ 原样"
+        );
+        assert_eq!(
+            build_ctx_system(Some("a,b,a")).as_deref(),
+            Some("a,b,a"),
+            "不去重"
+        );
+    }
+
+    /// 设计：产出不得含旧注入片段（英文指令句 / `Context:` / `Terms:`）。
+    #[test]
+    fn ctx377_no_instruction_or_labels() {
+        let out = build_ctx_system(Some("你好,铭印,银线")).expect("非空");
+        for needle in ["Transcribe", "The following is", "Context:", "Terms:"] {
+            assert!(
+                !out.contains(needle),
+                "产出不得含旧注入片段 `{needle}`：{out:?}"
+            );
+        }
+    }
+
+    /// 设计：单行词表不得被组装成多行。
+    #[test]
+    fn ctx377_no_newline_introduced() {
+        let out = build_ctx_system(Some("你好,铭印,银线")).expect("非空");
+        assert!(!out.contains('\n'), "单行词表不得含换行：{out:?}");
+    }
+
+    /// 设计（换行括注）：含换行不崩；「原样返回」契约下内部换行保留（与「不带进 system 段」的
+    /// 张力见 result.md 备注，未擅自改断言）。
+    #[test]
+    fn ctx377_internal_newline_is_passthrough_no_panic() {
+        let out = build_ctx_system(Some("你好,\n铭印")).expect("非空");
+        assert_eq!(out, "你好,\n铭印", "仅首尾 trim、内部换行按原样保留");
+    }
+
+    /// 设计：注入门 —— 空 ⇒ 不注入；非空 ⇒ 注入。
+    #[test]
+    fn ctx377_should_inject_gate() {
+        assert!(!should_inject_ctx(build_ctx_system(None).as_deref()));
+        assert!(!should_inject_ctx(build_ctx_system(Some("   ")).as_deref()));
+        assert!(should_inject_ctx(build_ctx_system(Some("词A")).as_deref()));
+    }
+
+    /// 设计（KV 预算）：空/纯空白 ⇒ 注入 token 估算 = 0。
+    #[test]
+    fn ctx377_estimate_tokens_zero_when_blank() {
+        assert_eq!(super::estimate_inject_tokens(None), 0);
+        assert_eq!(super::estimate_inject_tokens(Some("")), 0);
+        assert_eq!(super::estimate_inject_tokens(Some("   ")), 0);
+    }
+
+    // ---------- 374 / 375：确认不回归（独立夹具） ----------
+
+    /// 374：377 新格式（裸词表）被逐字吐回 ⇒ 仍须命中并整段剥掉。
+    #[test]
+    fn echo374_new_format_run_is_stripped() {
+        let terms = "甲词,乙词,丙词,丁词,戊词";
+        let sys = build_ctx_system(Some(terms)).expect("注入串");
+        let hit = super::strip_terms_echo(&sys, Some(terms)).expect("新格式应命中");
+        assert!(
+            hit.matched_terms >= 4,
+            "连续词条 run 应 ≥4：{}",
+            hit.matched_terms
+        );
+        assert_eq!(hit.stripped, "", "整段回显 ⇒ 剥空");
+    }
+
+    /// 374：句子里自然说到 1~2 个词库词 ⇒ 不得剥。
+    #[test]
+    fn echo374_natural_one_or_two_terms_kept() {
+        let terms = "明天,天气,心情,咖啡,电影";
+        let text = "明天天气不错，我想喝咖啡。";
+        assert!(
+            super::strip_terms_echo(text, Some(terms)).is_none(),
+            "1~2 个词不是回显：{text}"
+        );
+    }
+
+    /// 375：冷启动三条路径（无均值 / 无音频 / 期望产出太少）⇒ 一律判正常。
+    #[test]
+    fn rate375_cold_start_three_paths_ok() {
+        assert!(super::output_rate_ok(0, 10.0, None), "无均值 ⇒ 不判");
+        assert!(super::output_rate_ok(0, 0.0, Some(4.4)), "无音频 ⇒ 不判");
+        assert!(
+            super::output_rate_ok(0, 1.0, Some(4.4)),
+            "期望产出 4.4 < 8 ⇒ 不判"
+        );
+        assert!(super::output_rate_ok(0, 10.0, Some(0.0)), "非正均值 ⇒ 不判");
+        assert!(
+            super::output_rate_ok(0, 10.0, Some(f32::INFINITY)),
+            "非有限均值 ⇒ 不判"
+        );
+    }
+
+    // ---------- 371 / 368 / 369：确认不回归 ----------
+
+    /// 371：只截第一个标记 + 64B 位置护栏 + 正文中段不误剥。
+    #[test]
+    fn prefix371_guard_first_only_and_midbody() {
+        use super::strip_qwen3_language_prefix as strip;
+        assert_eq!(
+            strip("language chinese<asr_text>甲<asr_text>乙"),
+            "甲<asr_text>乙",
+            "只截第一个标记"
+        );
+        let at64 = format!("{}<asr_text>正文", "a".repeat(64));
+        let at65 = format!("{}<asr_text>正文", "a".repeat(65));
+        assert_eq!(strip(&at64), "正文", "起点 64 ⇒ 剥");
+        assert_eq!(strip(&at65), at65.as_str(), "起点 65 ⇒ 原样");
+        let mid = format!("{}<asr_text>尾", "正文".repeat(40));
+        assert_eq!(strip(&mid), mid.as_str(), "中段标记 ⇒ 不剥");
+    }
+
+    /// 371：周期性重复内容不丢字。
+    #[test]
+    fn align371_periodic_keeps_every_sentence() {
+        let s = "今天天气真好我们出去玩吧";
+        let dur = 4_400 * 16;
+        let samples = vec![dur; 3];
+        let mut o = super::OrderedReflow::new();
+        let _ = o.push_window(0, 0, 3, samples.clone(), format!("{s}{s}{s}"));
+        let _ = o.push_window(1, 1, 4, samples, format!("{s}{s}{s}"));
+        let (c, l) = o.finish();
+        let full = format!("{c}{l}");
+        assert_eq!(full.matches(s).count(), 4, "周期内容不得丢字：{full}");
+    }
+
+    /// 369：零重叠 ⇒ 必须拼接、不得丢。
+    #[test]
+    fn align369_zero_overlap_concatenates() {
+        let mut o = super::OrderedReflow::new();
+        let _ = o.push(0, 0, 3, "甲乙丙".into());
+        let out = o.push(1, 3, 6, "丁戊己".into());
+        assert_eq!(out.len(), 1);
+        let (c, l) = o.finish();
+        let full = format!("{c}{l}");
+        assert!(
+            full.contains('甲') && full.contains('丁'),
+            "零重叠必须拼接不丢：{full}"
+        );
+    }
+
+    /// 368：对齐失败 ⇒ 不得丢上一窗滑出文本（退回拼接）。
+    #[test]
+    fn align368_align_failure_keeps_slid_text() {
+        let mut o = super::OrderedReflow::new();
+        let _ = o.push_window(0, 0, 2, vec![100, 100], "甲乙".into());
+        // 共享片但样本表与区间不自洽 ⇒ 对齐失败 ⇒ 退回拼接
+        let out = o.push_window(1, 1, 3, vec![100], "乙丙".into());
+        assert_eq!(out.len(), 1);
+        let (c, l) = o.finish();
+        let full = format!("{c}{l}");
+        assert!(
+            full.contains('甲') && full.contains('丙'),
+            "对齐失败不得丢字：{full}"
+        );
+    }
+}

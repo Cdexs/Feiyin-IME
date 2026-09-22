@@ -6,6 +6,32 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-23 — tester-1 — TEST-EXEC-377 + BUILD-379 ✅ 出包（阶段四全绿 → 出包，替换作废的 BUILD-373；八项 + 三特殊点全 PASS）
+
+- **交付源码**：HEAD `243dcc4` + 工作区阶段三 18 条护栏（未提交），版本 0.9.3。🔴 **BUILD-373 作废**（词条回显 + 预览刷不进 + 出字延迟）。DEC-081：Gavin 已预授权「全绿即直接出包」。
+- **阶段四（全量未过滤；fmt `--check` 不带 `skip_children` EXIT 0）**：root `cargo test --no-fail-fast` **1546P/0F/31I**（EXIT 0；`feiyin-ime` bin **1458P/29I**）；`src-tauri` **92P/0F/0I**；Vitest **7 files/100P/11S/0F**；warnings **98/88/17** = 基线。
+- **NEW/GONE（基线 1423P/28I ⇒ 净 +35P/+1I = 1458P/29I 逐位吻合）**：374/375 **+20P** + 377 **净 -3P/+1I**（删 3 条 `ctx320_*` ctx 注入单测 + 1 PoC `#[ignore]`）+ 阶段三 **+18P**。GONE 3 条（随 377 删 `Context:`/`Terms:`/`last_n_chars`/`merge_ctx_timeline` 特性移除）。⚠️ 任务书按 377「删 4」记，实测净 -3P/+1I，**总数一致**（差异仅在拆法，如实报）。
+- 🔴 **重点失效模式**：`strip_terms_echo`/`apply_acc_disposition`/`output_rate_ok`/`reflow_monotonic_key`/`build_ctx_system`/`align`/`ordered_reflow`/`strip_qwen3` 相关**全通过 0 失败**，无停手条件。
+- **BUILD-379**：Step1 残 0 → Step2 npm 667ms + Tauri 1m43s（17w）→ Step3 主程序 2m58s（**98w** + crash 9w）→ Step4 UI 同步 + 三 exe→Publish。产物 main `7e14a0fee986…`（14,765,568B/01:13:03）/ ui `e4f1c53298f8…`（10,050,048B/01:10:03）/ crash `926ed04bd72f…`（24,879,104B/01:11:08）；两副本全等、三者均异于作废的 BUILD-373。
+- **八项逐项 PASS**：①时间戳 01:10–01:13 ②sha ③**0.9.3** ④冒烟 PID **12852 Responding=True** / 两处无新 crash.json / panic 0 / 残 0 ⑤config `da2be5da…` 三时点不变 ⑥warnings 98/88/17 ⑦探针 ⑧四表三副本全等。
+- **探针**：源码级正 `build_ctx_system`(2)/`strip_terms_echo`/`apply_acc_disposition`/`output_rate_ok`/`reflow_monotonic_key`/`QWEN3_PREFIX_MAX_BYTES`/`align_overlap_with_prior`/`AlignPrior` 均 ≥1；二进制正 `SLIDING-WINDOW-367`=4/`[LocalRT-DBG-298]`=3；🔴 反 `CLEANUP_INSTR_EN`/`CTX_INSTR_EN`/`merge_ctx_timeline`/`CTX_DEFAULT_CHARS`/`ctx_prev1`/`ctx_prev2`/`is_qwen3_language_label` **二进制全 0**（源码命中全为注释/PoC 测试常量/测试护栏 ⇒ 无生产符号）。
+- **三特殊点（仅核验）**：① dll 四张三副本全等 + `onnxruntime` **1.28.2**；② itn-rules 三副本全等；③ `Publish/models/` 1.7B 七文件与源 sha256 全等、0.6B 保留。
+- 🔴 **Step1 强杀输入法进程 ⇒ 已提醒 Gavin 重启后端测**。
+- **红线**：未 push（需 Gavin 指示）/ 版本号未动 / 未改生产代码 / 未 `cargo clean` / 零凭证。
+
+## 2026-09-23 — tester-1 — TEST-SYNC-377 ✅ 交付（阶段三 · 非作者视角补 18 条护栏；生产代码零改动）
+
+- **性质**：阶段三 TEST-SYNC，**按设计契约写用例**（不读实现反推），只改 `#[cfg(test)]` 区。目标 = `FIX-INJECT-TO-SPEC-377`（注入按 sherpa 规格砍成纯逗号词表）+ 374/375/371/368/369 不回归。
+- **新增 18 条**（`src/transcription/mod.rs` +211、`src/main.rs` +38）：
+  - **A `build_ctx_system` 9 条**：纯词表逐字返回 / 仅 trim 首尾 / None·空·纯空白·纯换行⇒None / 逗号结构原样（连续·尾随·只有逗号·重复）/ 产出不含指令句·`Context:`·`Terms:` / 不组装多行 / 含换行不崩（原样保留）/ 注入门 / 空⇒token 估算 0。
+  - **B 374/375 不回归 3 条**（独立夹具）：新格式裸词表回显仍命中 ≥4 并剥空 / 句中 1~2 词不剥 / `output_rate_ok` 冷启动三路径（无均值·无音频·期望产出少）⇒ 判正常。
+  - **C 371/368/369 不回归 4 条**：64B 位置护栏+只截首个+中段不剥 / 周期不丢 / 零重叠拼接 / 对齐失败不丢滑出文本。
+  - **D 源码级护栏 2 条**（`testsync377_source_guard_tests`，`include_str!` + `guard_prod_lines`）：`transcription/mod.rs` 生产区（注释剔除）无 `CLEANUP_INSTR_EN`/`CTX_INSTR_EN`/`CTX_DEFAULT_CHARS`；`main.rs` 生产区 `ctx_prev1`/`ctx_prev2` 计数 0。
+- **验证（白名单）**：`cargo fmt` clean / `--check` **EXIT 0**；`cargo check --all-targets` **0 error**、warnings **98/88** = 基线未升；`numstat`==`-w`（38/0、211/0）。🔴 **未跑 `cargo test`**（首跑在阶段四）。
+- **发现**：**未发现生产缺陷**。初查 `CLEANUP_INSTR_EN` 等「1 文件命中」经逐行核实为**注释 + PoC 测试常量**（`_377` 后缀，`#[cfg(test)]` 内），非生产残留。
+- ⚠️ **设计-实现张力（待主控裁）**：设计括注「词表含换行**不得带进** system 段」与主契约「trim 后**原样返回**」在**内部换行**上冲突；实现按「原样保留」，本单按主契约写断言并上报，**未擅自改绿**。若需硬清换行 ⇒ 属生产改动，请派 coder。
+- **红线**：未改生产代码 / 未 commit / 未 push / 版本号未动 / 零凭证。
+
 ## 2026-09-22 — tester-1 — BUILD-373 ✅ 出包（阶段五 · 替换作废的 BUILD-349；八项 + 三特殊点全 PASS）
 
 - **交付源码**：HEAD `dff4fad`，版本 0.9.3，工作区 clean。含 `7398459` FIX-PREFIX-AND-EAT-371（P0×2）+ `77185aa` TEST-SYNC-371 + `dff4fad` TEST-EXEC-371。阶段四已全绿（root 1511P/0F/30I / src-tauri 92P / Vitest 100P/11S / fmt EXIT 0 / warnings 98/88/17），**本单不重跑回归**。

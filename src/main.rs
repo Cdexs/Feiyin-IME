@@ -10988,7 +10988,13 @@ fn run_pipeline_core(
                         punctuation_engine.as_deref_mut(),
                     );
                     // FORMAT-FALLBACK-303 / WIRE-FF303-305：本地免费口水词过滤。
-                    // 🔴 位置三条件（勿挪）：① 在标点节点之后 ⇒ 规则 A 的「句首」有句读可依；
+                    // 🔴 位置三条件（勿挪）：① **文本此刻必须已带标点**（规则 A 的「句首」要有句读可依）。
+                    //    ⚠️ FIX-FILLER-NODE-COMMENT-378：标点的**实际来源有两条**，勿以为是上游节点供给 ——
+                    //    本地 realtime 滑窗路径 `native_punctuated=true`（日志恒 `all_native=true`）⇒
+                    //    `apply_local_punctuation` 的门 `!native_punctuated` 不成立 ⇒ **引擎整块跳过、常态空转**，
+                    //    标点全部来自 acc 模型自带；只有 native 失败时才轮到引擎补。两条路都保证「此刻有标点」，
+                    //    故本节点仍须排在其后。**已知边界**（非本批引入、概率低、暂不修）：
+                    //    `native_punctuated=false` 且 `punctuation.enabled=false` ⇒ 文本无任何标点 ⇒ 规则 A 失依据。
                     // ② 在 inject_text 之前；③ `enabled = !llm_handled` ⇒ 只有 LLM 未接手时才动，
                     // 不触 DEC-041（该条禁的是对 LLM 输出做程序化后处理，此处压根没有 LLM 输出）。
                     // 四档共用 run_pipeline_core，一处调用即全覆盖，不新增任何管线判据（DEC-066）。
@@ -15957,5 +15963,43 @@ mod testsync371_window_counter_guard_tests {
             p.iter().any(|l| l.starts_with(".push(")),
             "紧接 window_spans 的 push 调用应存在"
         );
+    }
+}
+
+// =====================================================================
+// TEST-SYNC-377（阶段三 · 非作者视角，tester-1）：源码级护栏
+// ---------------------------------------------------------------------
+// 设计 377：被删的注入符号（CLEANUP_INSTR_EN / CTX_INSTR_EN / CTX_DEFAULT_CHARS）
+// 与跨录音上下文缓存（ctx_prev1 / ctx_prev2）不得在生产区复活。
+// 生产区扫描用 `guard_prod_lines`（剔除所有 test-gated 项），注释行一并剔除。
+// =====================================================================
+#[cfg(test)]
+mod testsync377_source_guard_tests {
+    fn prod(src: &'static str) -> Vec<String> {
+        crate::guard_prod_lines::prod_lines_excluding_cfg_test(src)
+    }
+
+    /// 377：`transcription/mod.rs` 生产区（注释不计）不得再出现被删注入符号。
+    #[test]
+    fn source_has_no_removed_inject_symbols() {
+        let p = prod(include_str!("transcription/mod.rs"));
+        for sym in ["CLEANUP_INSTR_EN", "CTX_INSTR_EN", "CTX_DEFAULT_CHARS"] {
+            let hit: Vec<&String> = p
+                .iter()
+                .filter(|l| !l.starts_with("//"))
+                .filter(|l| l.contains(sym))
+                .collect();
+            assert!(hit.is_empty(), "生产区不得再出现 `{sym}`：{hit:?}");
+        }
+    }
+
+    /// 377：`main.rs` 生产区不得再有跨录音上下文缓存 `ctx_prev1`/`ctx_prev2`（计数 0）。
+    #[test]
+    fn main_has_no_cross_recording_ctx_cache() {
+        let p = prod(include_str!("main.rs"));
+        for sym in ["ctx_prev1", "ctx_prev2"] {
+            let n = p.iter().filter(|l| l.contains(sym)).count();
+            assert_eq!(n, 0, "main.rs 生产区 `{sym}` 计数必须为 0，实得 {n}");
+        }
     }
 }

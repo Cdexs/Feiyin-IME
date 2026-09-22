@@ -1149,3 +1149,15 @@ load_wordbook_vocabulary()
   变为塞 prompt 文本）。PoC 无法回答（音频里没有词表专名的发音点）。
 - **待 Gavin 定**：是否先做词库有效性验证（需他录含词库专名的语音）。
   无效 ⇒ 直接不注入，回显从源头消失并省算力/KV。
+
+
+## BUILD-379（阶段四全绿 → 出包）· 2026-09-23 · 替换作废的 BUILD-373
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | `4f73117` FIX-TERMS-ECHO-374 + FIX-PREVIEW-STALE-AND-COLLAPSE-375 + POC-376；`243dcc4` FIX-INJECT-TO-SPEC-377（注入按 sherpa 规格砍成纯逗号词表）；+ 阶段三 18 条护栏。版本 0.9.3 |
+| 回归 | root `cargo test --no-fail-fast` **1546P/0F/31I**（EXIT 0；`feiyin-ime` bin **1458P/29I**；NEW 净 +35P/+1I = 374/375 +20 + 377 净 -3P/+1I + 阶段三 +18）+ src-tauri **92P/0F/0I** + Vitest **7 files/100P/11S/0F**；fmt EXIT 0；warnings **98/88/17** |
+| 出包 | `BUILD-379` 八项核验逐项 PASS；产物 `feiyin-ime` 14.77MB `7e14a0fee986…`（01:13:03）/ `feiyin-ime-ui` 10.05MB `e4f1c53298f8…`（01:10:03）/ `crash-reporter` 24.88MB `926ed04bd72f…`（01:11:08）；两副本全等、均异于作废的 BUILD-373 |
+| 三特殊点 | ① dll 四张三副本全等 + onnxruntime 1.28.2；② itn-rules 三副本全等；③ Publish/models 1.7B 与源逐一 sha256 全等（0.6B 保留） |
+| 探针 | 源码级正 8 符号均 ≥1；二进制正 `SLIDING-WINDOW-367`=4 / `[LocalRT-DBG-298]`=3；🔴 反 `CLEANUP_INSTR_EN`/`CTX_INSTR_EN`/`merge_ctx_timeline`/`CTX_DEFAULT_CHARS`/`ctx_prev1`/`ctx_prev2`/`is_qwen3_language_label` 二进制全 0（源码命中全为注释/PoC/测试护栏） |
+| 端测 | 🔴 **Step1 强杀输入法 ⇒ 请重启后端测**；重点：词条回显不漏进正文 / 预览能刷进 / 出字延迟 / 吃字重复 / 长录音 300s / 不新增 crash.json |
