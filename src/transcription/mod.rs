@@ -2711,11 +2711,11 @@ mod tests {
 #[cfg(test)]
 mod poc_qwen3_17b_351 {
     use super::{
-        create_qwen3_recognizer, create_qwen3_recognizer_at, default_acc_num_threads,
-        transcribe_acc_ctx, CtxInject,
+        create_qwen3_recognizer, create_qwen3_recognizer_at, decode_accuracy_once,
+        default_acc_num_threads, transcribe_acc_ctx, CtxInject,
     };
     use crate::config::ChineseScript;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Instant;
 
     /// Gavin 真口述三段标准答案（与 313 `poc_qwen3_compare.rs.txt::ANSWERS` 逐字相同）。
@@ -3049,6 +3049,199 @@ mod poc_qwen3_17b_351 {
                 crate::itn::normalize_numbers(s),
                 crate::itn::normalize_unit_symbols_only(s)
             );
+        }
+    }
+
+    // ============================================================
+    // RESEARCH-QWEN3-1.7B-CAPABILITY-355 · 1.7B 能力增量盘点（不测 CER / 不报速度内存）
+    //
+    // 严格区分 A（文档）/ B（我方实测可用），只用生产链 `transcribe_acc_ctx`（只读）。
+    // 运行：cargo test --bin feiyin-ime -- --ignored --nocapture poc_355_capability
+    // ============================================================
+    fn head(s: &str, n: usize) -> String {
+        let t: String = s.chars().take(n).collect();
+        if s.chars().count() > n {
+            format!("{t}…")
+        } else {
+            t
+        }
+    }
+
+    // ============================================================
+    // RESEARCH-QWEN3-1.7B-CAPABILITY-355 · 1.7B 能力增量盘点 / 调用层差异
+    //   🔴 顺序解码：先建 0.6B、跑完、drop，再建 1.7B（避免两模型同时驻留；
+    //      首版并存时在 1.7B 解码处异常退出 0xffffffff，本版验证是否与并存有关）。
+    //   运行：cargo test --bin feiyin-ime -- --ignored --nocapture poc_355_capability
+    // ============================================================
+
+    /// 与生产 `create_qwen3_recognizer_at` **逐字段一致**，仅 `max_total_len`/`max_new_tokens`
+    /// 可变的对照构造器（调用层参数扫描专用；生产值 = 4096 / 256）。
+    fn make_qwen3(
+        dir: &Path,
+        max_total_len: i32,
+        max_new_tokens: i32,
+    ) -> sherpa_onnx::OfflineRecognizer {
+        let cfg = sherpa_onnx::OfflineRecognizerConfig {
+            model_config: sherpa_onnx::OfflineModelConfig {
+                num_threads: default_acc_num_threads(),
+                provider: Some("cpu".to_string()),
+                qwen3_asr: sherpa_onnx::OfflineQwen3ASRModelConfig {
+                    conv_frontend: Some(
+                        dir.join("conv_frontend.onnx")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    encoder: Some(dir.join("encoder.int8.onnx").to_string_lossy().into_owned()),
+                    decoder: Some(dir.join("decoder.int8.onnx").to_string_lossy().into_owned()),
+                    tokenizer: Some(dir.join("tokenizer").to_string_lossy().into_owned()),
+                    max_total_len,
+                    max_new_tokens,
+                    temperature: 1e-6,
+                    top_p: 0.8,
+                    seed: 42,
+                    hotwords: None,
+                },
+                tokens: Some(String::new()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        sherpa_onnx::OfflineRecognizer::create(&cfg).expect("create qwen3")
+    }
+
+    fn raw_decode(
+        rec: &sherpa_onnx::OfflineRecognizer,
+        samples: &[f32],
+        script: ChineseScript,
+    ) -> String {
+        // 生产 decode 函数、system=None ⇒ 纯模型输出（用于看控制前缀 / 语种）
+        decode_accuracy_once(rec, samples, None, script).expect("decode")
+    }
+
+    fn read_wav(root: &Path, rel: &str) -> (Vec<f32>, usize) {
+        let w = sherpa_onnx::Wave::read(root.join(rel).to_str().expect("utf8")).expect("read wav");
+        (w.samples().to_vec(), w.sample_rate() as usize)
+    }
+
+    fn tail(s: &str, n: usize) -> String {
+        let v: Vec<char> = s.chars().collect();
+        let start = v.len().saturating_sub(n);
+        v[start..].iter().collect()
+    }
+
+    fn run_355_model(tag: &str, dir: &Path, root: &Path) {
+        let rec = make_qwen3(dir, 4096, 256);
+        let (fs, rate) = read_wav(root, "collab/research/audio-real-gavin/processed/full.wav");
+        let slices = slice_fitness(&fs, rate);
+
+        // S1：纯模型输出（system=None）——控制前缀 / 语种
+        println!("POC355 === S1 {tag} 纯模型输出（无注入）===");
+        let pref = |t: &str| -> String {
+            match t.find("<asr_text>") {
+                Some(p) => format!("PREFIX={:?}", &t[..p]),
+                None => "PREFIX=(none)".to_string(),
+            }
+        };
+        let seg0_raw = raw_decode(
+            &rec,
+            &fs[slices[0].0..slices[0].1],
+            ChineseScript::Simplified,
+        );
+        println!(
+            "POC355 S1 {tag} full-seg0 {}: {}",
+            pref(&seg0_raw),
+            head(&seg0_raw, 130)
+        );
+        for rel in [
+            "models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/test_wavs/ja1.wav",
+            "models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/test_wavs/de.wav",
+            "models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/test_wavs/cantonese.wav",
+            "models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/test_wavs/codeswitch.wav",
+            "models/korean-testwavs/0.wav",
+        ] {
+            let (s, _) = read_wav(root, rel);
+            let t = raw_decode(&rec, &s, ChineseScript::Simplified);
+            println!("POC355 S1 {tag} {rel} {}: {}", pref(&t), head(&t, 80));
+        }
+
+        // S2：生产注入路径（transcribe_acc_ctx，恒发 CLEANUP_INSTR_EN）
+        println!("POC355 === S2 {tag} 生产注入路径（有注入）===");
+        let inject = CtxInject {
+            prev_older: None,
+            prev_latest: None,
+            current: None,
+            terms: None,
+        };
+        let seg0 = transcribe_acc_ctx(
+            &rec,
+            &fs[slices[0].0..slices[0].1],
+            ChineseScript::Simplified,
+            0,
+            inject,
+        )
+        .expect("decode")
+        .0;
+        println!("POC355 S2 {tag} seg0: {}", head(&seg0, 130));
+
+        // S2b：口水词 / 重复清理（colloq.wav，纯模型输出）
+        let (cs, _) = read_wav(root, "models/kv259/colloq.wav");
+        println!(
+            "POC355 S2b {tag} colloq: {}",
+            head(&raw_decode(&rec, &cs, ChineseScript::Simplified), 240)
+        );
+
+        // S3：更大分片可行性（0-30s 单段，生产是 20s×3）
+        println!("POC355 === S3 {tag} 30s 单段（更大分片可行性）===");
+        let n30 = (rate * 30).min(fs.len());
+        let t30 = raw_decode(&rec, &fs[..n30], ChineseScript::Simplified);
+        println!(
+            "POC355 S3 {tag} 0-30s len={} head={} tail={}",
+            t30.chars().count(),
+            head(&t30, 70),
+            tail(&t30, 40)
+        );
+
+        drop(rec);
+    }
+
+    #[test]
+    #[ignore = "PoC: cargo test --bin feiyin-ime -- --ignored --nocapture poc_355_capability"]
+    fn poc_355_capability() {
+        let root = manifest_dir();
+        println!(
+            "POC355 threads={} cores={}",
+            default_acc_num_threads(),
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(0)
+        );
+        // 顺序：0.6B 建→跑→drop → 1.7B 建→跑→drop
+        run_355_model(
+            "0.6B",
+            &root.join("models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25"),
+            &root,
+        );
+        run_355_model(
+            "1.7B",
+            &root.join("models/sherpa-onnx-qwen3-asr-1.7B-int8-2026-09-22"),
+            &root,
+        );
+
+        // S4：调用层参数对照（仅 1.7B）——max_new_tokens 256 vs 512（长输出是否被截断）
+        println!("POC355 === S4 1.7B max_new_tokens 对照（30s 单段）===");
+        let dir17 = root.join("models/sherpa-onnx-qwen3-asr-1.7B-int8-2026-09-22");
+        let (fs, rate) = read_wav(&root, "collab/research/audio-real-gavin/processed/full.wav");
+        let n30 = (rate * 30).min(fs.len());
+        for mnt in [256, 512] {
+            let rec = make_qwen3(&dir17, 4096, mnt);
+            let t = raw_decode(&rec, &fs[..n30], ChineseScript::Simplified);
+            println!(
+                "POC355 S4 mnt={mnt} len_chars={} head={} tail={}",
+                t.chars().count(),
+                head(&t, 60),
+                tail(&t, 40)
+            );
+            drop(rec);
         }
     }
 }
