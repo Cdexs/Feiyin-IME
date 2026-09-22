@@ -8295,11 +8295,11 @@ fn spawn_worker_thread(
                                                     .iter()
                                                     .flat_map(|s| s.iter().copied())
                                                     .collect();
-                                                // FIX-REMOVE-HARDSPLIT-370：滑窗片上限定为 90s（**解码耗时+内存**
-                                                // 安全阀，见 SLIDING_SLICE_MAX_SECS），故单个窗口音频可达 90s。
-                                                // KV 通常不是瓶颈（90s=1170 tok ≈ 4096 的 45%），但**零和预算**下
-                                                // 词库撑满 3000 tok 时可用音频仅 ~32s，长片会撞顶；而撞顶是
-                                                // **静默丢字**（DEC-069）⇒ 用精确预算闸门显式告警（不改流程）。
+                                                // FIX-REMOVE-HARDSPLIT-370：滑窗片上限定为 13s（**极端长句兜底**，
+                                                // 对齐滑窗封顶 12s 的**实测体验**：13s≈5.3s vs 12s 的 4.9s，仅差 0.4s；
+                                                // 见 SLIDING_SLICE_MAX_SECS），故单个窗口音频可达 13s。
+                                                // KV 完全不是瓶颈（13s 仅 ~169 tok），本闸门在当前常量下已不可能触发，
+                                                // 保留为**未来调大上限时的廉价不变量护栏**（撞顶是静默丢字，DEC-069）。
                                                 if !transcription::path_b_budget_ok(
                                                     window_audio.len(),
                                                     p2,

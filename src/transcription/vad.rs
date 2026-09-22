@@ -23,26 +23,22 @@ pub const SEGMENT_MAX_SECS: f64 = 20.0;
 /// 段前后 padding：保护边界音节（送气清声母 ~60-100ms）。200ms = 3200 samples @ 16kHz。
 pub const SEGMENT_PADDING_SAMPLES: usize = 3200;
 
-/// FIX-REMOVE-HARDSPLIT-370：**滑窗（accuracy 派发）路径**的单片上限 = 90s（Gavin 定，最终值）。
+/// FIX-REMOVE-HARDSPLIT-370：**滑窗（accuracy 派发）路径**的单片上限 = 13s（Gavin 定，最终值）。
 ///
-/// 🔴 **为什么是 90s**（不是 KV 决定的，KV 不是瓶颈；也别当 KV 限制去误调）：
-/// - **KV**：90s ≈ 1170 audio token（13.0 tok/s；精确式 `expected_audio_tokens`），
-///   加固定扣除 686（生成 256 + 上下文 385 + 提示词 45）= 1856 ⇒ 占 `max_total_len=4096`
-///   的 **45%**，尚余 **2240** 给词库。
-/// - **对比 120s**：占 55%、剩 1850 ⇒ 90s 给词库多 390 token（+21%），且解码约 **37s**
-///   （vs 120s 约 49s，RTF 0.41）⇒ 少等 12 秒。两头都更优。
-/// - **代价**：仅「一口气说 90~120 秒」这种几乎不存在的场景会多切一刀 —— 而**多切一刀不丢内容**
+/// 🔴 这是【**极端情况的上限值**】，**不是常态参数** —— 一口气不停顿说满 13 秒已不常见；
+/// 常态片由 1200ms 静默切出（通常几秒～十几秒）⇒ 该阀只在极端长句时兜底。
+///
+/// 🔴 **取值依据 = 对齐滑动窗口封顶（`WINDOW_MAX_SECS`=12s）的同一水平**（Gavin 端测**实测体验**，非估算）：
+/// - Gavin 端测确认：滑窗「**12s 窗口解码 + 回灌刷新预览**」这条链**没有明显卡顿、比较流畅**
+///   ⇒ 以该实测体验为基准取 13s。
+/// - 13s 解码约 **5.3 秒**（RTF 0.41），与典型 12s 窗的 **4.9 秒**仅差 0.4 秒（1.08 倍）
+///   ⇒ 触发该阀时的体验与平时几乎无差别，不会出现突兀卡顿。
+/// - 被否的取值：16s ⇒ 6.6 秒（Gavin：「还是有点长」）；30s ⇒ 12.3 秒；90s ⇒ **36.9 秒**（典型窗 7.5 倍）。
+/// - **KV 与内存均非瓶颈**：13s 仅约 **169** audio token，占 `max_total_len=4096` 的极小部分。
+///   ⚠️ 先前按 90s 做的「6.5~8.5GB 内存外推 + E2E 实测建议」**已随本阀值作废**。
+/// - **与「只按 1200ms 静默切片」原则的关系**：本阀仅在极端长句时兜底；超出继续切、**不丢内容**
 ///   （369：零重叠 ⇒ 直接拼接）。
-/// - 🔴 **真天花板不是 KV，而是单次解码耗时与内存**：90s 解码约 37 秒，期间该窗**不刷新预览**；
-///   内存随音频长度增长（361 实测 Qwen3-1.7B @56s 峰值 ≈ 4967MB）。
-/// - ⚠️ **零和预算提醒**：4096 是零和 —— 词库占用会挤压可用音频：词库 1000 token ⇒ 可用音频
-///   降至 ~185s；词库撑满 `HOTWORDS_MAX_TOTAL_TOKENS`(3000) ⇒ 仅 ~32s（**比 90s 阀还小**），
-///   此时长片会**静默截断**（DEC-069）。故 370 的「撞顶打日志」护栏
-///   （`main.rs` 派发点 `path_b_budget_ok` warn）**不可省**。
-/// - **它不是常规切片规则**：切片只认 1200ms 静默（Gavin 原则）；本值只兜
-///   「一路说满 90s 都没有 1200ms 停顿」的极端情况，超出继续切下一片、**不丢弃**
-///   （单测 `sliding_slice_370_*`）。
-pub const SLIDING_SLICE_MAX_SECS: f64 = 90.0;
+pub const SLIDING_SLICE_MAX_SECS: f64 = 13.0;
 
 /// silero VAD 窗口大小（512 samples = 32ms @ 16kHz，silero_vad.onnx 要求）
 const VAD_WINDOW_SIZE: i32 = 512;
@@ -237,8 +233,8 @@ pub fn build_padded_segments(
 /// 两个调用方的上限与**理由都不同**：
 /// - 其它路径（VAD 分段 / 本地离线 accuracy）：`SEGMENT_MAX_SECS`(20s) —— native
 ///   `max_total_len=512` 时代遗留，逐位不变；
-/// - 滑窗派发路径：`SLIDING_SLICE_MAX_SECS`(90s) —— **内存**安全阀（见该常量注释），
-///   不是常规切片规则：静默切出的片原样解码，只在「一路说满 90s 无停顿」时才切。
+/// - 滑窗派发路径：`SLIDING_SLICE_MAX_SECS`(13s) —— **极端长句兜底**（见该常量注释），
+///   不是常规切片规则：常态片原样解码，只在「一口气说满 13s 无停顿」时才切。
 ///
 /// 无论上限多少，都保留 FIX-VAD-STATE-RESET-001 的边界过滤/clamp 与 200ms 边界 padding。
 pub fn build_padded_segments_capped(
@@ -272,7 +268,7 @@ pub fn build_padded_segments_capped(
             continue;
         }
         if clamped_len >= max_seg_samples {
-            // 单段超上限：硬切（滑窗路径 90s 安全阀 / 其它路径 20s 遗留上限）
+            // 单段超上限：硬切（滑窗路径 13s 兜底 / 其它路径 20s 遗留上限）
             let mut pos = start;
             while pos < end {
                 let sub_end = (pos + max_seg_samples).min(end);
@@ -928,7 +924,7 @@ mod tests {
 
     // ========================================================================
     // FIX-REMOVE-HARDSPLIT-370：`build_padded_segments_capped` 上限参数化
-    //   验证：① 上限可显式传入并生效 ② 滑窗上限=90s（不是 20s）
+    //   验证：① 上限可显式传入并生效 ② 滑窗上限=13s（对齐 12s 窗实测体验）
     //        ③ 旧路径（`build_padded_segments`）与 `capped(.., SEGMENT_MAX_SECS)` **逐位相同**
     //        ④ FIX-VAD-STATE-RESET-001 边界护栏在任意上限下都保留
     // ========================================================================
@@ -948,33 +944,43 @@ mod tests {
         );
     }
 
-    /// 🔴 滑窗上限 = **90s**（不是 20s）：25s 的片**不被切**。
+    /// 🔴 滑窗上限 = **13s**（极端情况兜底，非常态参数）：≤13s 的片**不被切**。
     #[test]
-    fn capped_sliding_slice_max_is_90s_not_20s() {
+    fn capped_sliding_slice_max_is_13s() {
         assert_eq!(
-            SLIDING_SLICE_MAX_SECS, 90.0,
-            "Gavin 定（最终值）：单片上限 90s"
-        );
-        assert!(
-            SLIDING_SLICE_MAX_SECS > SEGMENT_MAX_SECS,
-            "滑窗上限必须高于其它路径的 20s 遗留上限"
+            SLIDING_SLICE_MAX_SECS, 13.0,
+            "Gavin 定（最终值）：单片上限 13s"
         );
         let sec = 16_000usize;
-        let total = 25 * sec;
+        for dsecs in [2usize, 4, 8, 12, 13] {
+            let total = dsecs * sec;
+            let audio = vec![0.1f32; total];
+            let segs =
+                build_padded_segments_capped(&[(0, total)], total, &audio, SLIDING_SLICE_MAX_SECS);
+            assert_eq!(segs.len(), 1, "{dsecs}s 片（≤13s）不得被切");
+            assert_eq!(segs[0].len(), total, "整片原样（首段前 padding 被 0 夹住）");
+        }
+        // 恰好 13s：触发切分但只切出一段 ⇒ 仍是 1 段（边界不误伤）
+        let total = 13 * sec;
         let audio = vec![0.1f32; total];
-        // 25s > 20s 但 < 90s ⇒ 1 段（旧 20s 上限下会切成 2 段 —— 见下对照）
         let segs =
             build_padded_segments_capped(&[(0, total)], total, &audio, SLIDING_SLICE_MAX_SECS);
-        assert_eq!(segs.len(), 1, "25s 片在 90s 上限下不得被切");
-        assert_eq!(segs[0].len(), total, "整片原样（首段前 padding 被 0 夹住）");
-        // 对照：同一输入配旧 20s 上限 ⇒ 2 段（证明 cap 参数确实在起作用）
-        let legacy = build_padded_segments_capped(&[(0, total)], total, &audio, SEGMENT_MAX_SECS);
-        assert_eq!(legacy.len(), 2, "旧 20s 上限下同一片会切成 2 段");
+        assert_eq!(segs.len(), 1, "恰好 13s 仍为 1 段");
+        // >13s ⇒ 按 13s 切（25s ⇒ 13+12）
+        let total = 25 * sec;
+        let audio = vec![0.1f32; total];
+        let segs =
+            build_padded_segments_capped(&[(0, total)], total, &audio, SLIDING_SLICE_MAX_SECS);
+        assert_eq!(segs.len(), 2, "25s ⇒ 13+12");
+        assert_eq!(
+            segs.iter().map(|s| s.len()).collect::<Vec<_>>(),
+            vec![13 * sec, 12 * sec]
+        );
     }
 
-    /// 🔴 安全阀：>90s 的片仍按 90s 切（180s ⇒ 90+90），**不丢弃**。
+    /// 🔴 安全阀：>13s 的片仍按 13s 切（180s ⇒ 13×13 + 11 = 14 段），**不丢弃**。
     #[test]
-    fn capped_over_90s_still_splits_by_90s() {
+    fn capped_over_13s_still_splits_by_13s() {
         let sec = 16_000usize;
         let total = 180 * sec;
         let audio = vec![0.1f32; total];
@@ -982,13 +988,13 @@ mod tests {
             build_padded_segments_capped(&[(0, total)], total, &audio, SLIDING_SLICE_MAX_SECS);
         assert_eq!(
             segs.len(),
-            2,
-            "180s ⇒ 90+90（安全阀生效，超出继续切/不丢弃）"
+            14,
+            "180s ⇒ 13×13 + 11 ⇒ 14 段（安全阀生效，超出继续切/不丢弃）"
         );
-        assert_eq!(
-            segs.iter().map(|s| s.len()).collect::<Vec<_>>(),
-            vec![90 * sec, 90 * sec]
-        );
+        let lens: Vec<usize> = segs.iter().map(|s| s.len()).collect();
+        assert_eq!(lens[0], 13 * sec, "首段 13s");
+        assert_eq!(lens[13], 11 * sec, "末段为余量");
+        assert_eq!(lens.iter().sum::<usize>(), total, "切分不丢样本");
     }
 
     /// 🔴 其它路径**逐位不变**证明：`build_padded_segments` ≡ `capped(.., SEGMENT_MAX_SECS)`。

@@ -294,12 +294,13 @@
 - **缺陷**：滑窗派发路径经 `build_padded_segments` 按 `SEGMENT_MAX_SECS`(20s) **硬切** —— 不看语义、
   与「只按 1200ms 静默切片」原则冲突，且硬切出的非停顿子段加重 369 的零重叠。
 - **修法**：`vad::build_padded_segments_capped(.., max_seg_secs)`（显式上限，DEC-066）+ `build_padded_segments` 变薄包装；
-  滑窗专用 `local_stream::build_dispatch_segment` 上限 `SLIDING_SLICE_MAX_SECS`=**90s**（安全阀，超出继续切不丢弃）。
-  200ms padding 与 FIX-VAD-STATE-RESET-001 越界护栏**保留**；`main.rs` 派发点加 `path_b_budget_ok` 撞顶 warn。
-- **90s 依据**：KV 非瓶颈（1170 tok ⇒ 占 4096 的 45%，剩 2240 给词库）；120s 则 55%/剩 1850 且解码 49s vs 37s；
-  真天花板是解码耗时+内存；零和预算提醒：词库 3000 tok ⇒ 可用音频仅 32s ⇒ 撞顶日志护栏不可省。
-- **同批**：`MAX_RECORD_SECONDS` 180 → **300**（5 分钟）——滑窗后与 KV 解耦，代价仅 18MB 缓冲 + 松手只解 ≤12s 窗；
+  滑窗专用 `local_stream::build_dispatch_segment` 上限 `SLIDING_SLICE_MAX_SECS`=**13s**（极端长句兜底，超出继续切不丢弃）。
+  200ms padding 与 FIX-VAD-STATE-RESET-001 越界护栏**保留**；`main.rs` 派发点保留 `path_b_budget_ok` 撞顶 warn。
+- **13s 依据（Gavin 实测体验，非估算）**：对齐滑窗封顶 `WINDOW_MAX_SECS`=12s 的同一水平 —— 端测确认
+  「12s 窗口解码+回灌刷新预览」无明显卡顿；13s 解码 ≈5.3s vs 12s 的 4.9s（+0.4s）⇒ 触发时体验无差别。
+  被否：16s(6.6s, Gavin「还是有点长」)/30s(12.3s)/90s(36.9s)。KV 与内存均非瓶颈（13s≈169 tok）。
+- **同批**：`MAX_RECORD_SECONDS` 180 → **300**（5 分钟）——滑窗后与 KV 解耦，代价仅 18MB 缓冲 + 松手只解 ≤13s 窗；
   连带 `src-tauri/src/config.rs` 镜像常量、`hotkey` 断言 185→305。
 - **单测**：新增 8（vad 5 + local_stream 3，含「旧包装 ≡ capped(SEGMENT_MAX_SECS)」逐位证明）；改名 2。
 - **验证**：fmt EXIT 0；全量 cargo test 0 failed（**1390P/28I**）；release EXIT 0；src-tauri check EXIT 0；warnings 98/88。
-- 🔴 内存提示：90s 外推 ≈6.5~8.5GB（1.7B）；未改版本/未 push/零凭证。369 同批未提交。
+- 未改版本/未 push/零凭证。369 同批未提交。

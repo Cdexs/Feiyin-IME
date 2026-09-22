@@ -411,19 +411,19 @@ fn endpoint_action(segment_has_speech: bool, confirm_text_empty: bool) -> Endpoi
     }
 }
 
-/// FIX-REMOVE-HARDSPLIT-370：滑窗（accuracy 派发）路径的片构建 —— 上限 **90s**（Gavin 定，最终值）。
+/// FIX-REMOVE-HARDSPLIT-370：滑窗（accuracy 派发）路径的片构建 —— 上限 **13s**（Gavin 定，最终值）。
 ///
 /// 原实现走 `build_padded_segments`，会把 >20s 的片按 20s **硬切**（native/FunASR 时代
 /// `max_total_len=512` 的遗留）。切片只认 1200ms 静默（Gavin 原则），20s 到点一刀正是
-/// 「从句子中间生硬切断，转写有偏差」⇒ 本路径上限显式改为 `SLIDING_SLICE_MAX_SECS`(90s)：
-/// **正常停顿切出的片（几乎必然 <90s）原样送解码**，只有「一路说满 90s 无停顿」才切。
+/// 「从句子中间生硬切断，转写有偏差」⇒ 本路径上限显式改为 `SLIDING_SLICE_MAX_SECS`(13s)：
+/// **常态片（静默切出，通常几秒~十几秒）原样送解码**，只有「一口气说满 13s 无停顿」才切。
 ///
-/// 🔴 90s 的取值依据见 `SLIDING_SLICE_MAX_SECS` 注释：KV 不是瓶颈（90s 占 4096 的 45%），
-/// 真天花板是单次解码耗时（90s≈37s，RTF 0.41）与内存，且 90s 比 120s 多留 390 token 给词库。
+/// 🔴 13s 的取值依据见 `SLIDING_SLICE_MAX_SECS` 注释：**对齐滑窗封顶 12s 的实测体验**
+/// （Gavin 端测：12s 窗解码+回灌「没有明显卡顿」）；13s≈5.3s vs 12s 的 4.9s，仅差 0.4s。
 ///
 /// 只保留 `build_padded_segments` 的 200ms 边界 padding 与 `FIX-VAD-STATE-RESET-001`
 /// 边界过滤/clamp（start 越界丢弃并 warn、end 超界 clamp）。抽成独立函数 ⇒
-/// 「滑窗路径上限 90s、护栏不丢」成为**可单测的契约**（`sliding_slice_370_*`）。
+/// 「滑窗路径上限 13s、护栏不丢」成为**可单测的契约**（`sliding_slice_370_*`）。
 fn build_dispatch_segment(
     start: usize,
     len: usize,
@@ -461,8 +461,8 @@ fn build_dispatch_segment(
 ///   `seg_streaming_text` = 本片对应的**流式文本**（`last_display` 自上一片 `committed_len`
 ///   起的字符后缀，**按 char 切片**）—— LOCALRT-REFLOW-HOLE-344-G：worker 解出空/失败时用它
 ///   填补，避免累积 `acc_text` 留洞导致后续回灌**永久失效**。
-///   子段列表通常 1 个；`FIX-REMOVE-HARDSPLIT-370` 起单片上限 90s（`SLIDING_SLICE_MAX_SECS`），
-///   只有 >90s 才按 90s 切、超出继续切不丢弃（安全阀，非常规切片规则）。
+///   子段列表通常 1 个；`FIX-REMOVE-HARDSPLIT-370` 起单片上限 13s（`SLIDING_SLICE_MAX_SECS`），
+///   只有 >13s 才按 13s 切、超出继续切不丢弃（极端长句兜底，非常态切片规则）。
 ///   🔴 只在 `acc_cfg.enabled` 且静默 ≥ `acc_cfg.silence_ms`(1200ms) 且未上 latch 时被调用
 ///
 /// # 返回
@@ -944,8 +944,8 @@ pub fn transcribe_streaming_local(
 
         // PARALLEL-ACC-298 / ACC-DISPATCH-SILENCE-ONLY-346：**静默 ≥1200ms 即把这一段派给 accuracy**。
         // 🔴 只推进 `acc_dispatched_end`，**不 reset / 不切句 / 不动 sentence_id**（与 endpoint 解耦）。
-        // FIX-REMOVE-HARDSPLIT-370：经 `build_dispatch_segment`（上限 90s）——
-        // 自动加 200ms 边界 padding；>20s 的片**不再**被 20s 硬切，只有 >90s 才按 90s 切（安全阀）。
+        // FIX-REMOVE-HARDSPLIT-370：经 `build_dispatch_segment`（上限 13s，极端长句兜底）——
+        // 自动加 200ms 边界 padding；常态片（静默切出，通常 <13s）原样解码，>13s 才按 13s 切（不丢弃）。
         let acc_pending = pcm.len().saturating_sub(acc_dispatched_end);
         if should_dispatch_acc(
             acc_cfg.enabled,
@@ -2050,21 +2050,22 @@ mod tests {
 
     // ========================================================================
     // FIX-REMOVE-HARDSPLIT-370 · 滑窗（accuracy 派发）路径的片构建契约
-    //   `build_dispatch_segment` = 上限 `SLIDING_SLICE_MAX_SECS`(90s)，不是 20s。
+    //   `build_dispatch_segment` = 上限 `SLIDING_SLICE_MAX_SECS`(13s)，
+    //   是**极端长句兜底**（非常态参数）：常态片（静默切出，通常几秒~十几秒）原样解码。
     // ========================================================================
 
-    /// 🔴 核心验收：**>20s 且 <90s 的片不被切**（旧 20s 上限下会切成多段）。
+    /// 🔴 核心：**≤13s 的片不被切**（常态片覆盖：2/4/8/12s + 恰好 13s 边界）。
     #[test]
-    fn sliding_slice_370_over_20s_under_90s_is_not_split() {
+    fn sliding_slice_370_typical_slices_are_not_split() {
         let sec = SAMPLE_RATE as usize;
-        for dsecs in [21usize, 25, 60, 89] {
+        for dsecs in [2usize, 4, 8, 12, 13] {
             let total = dsecs * sec;
             let pcm = vec![0.1f32; total];
             let segs = build_dispatch_segment(0, total, pcm.len(), &pcm);
             assert_eq!(
                 segs.len(),
                 1,
-                "{dsecs}s 片（>20s 且 <90s）不得被切成多段（per Gavin：切片只认 1200ms 静默）"
+                "{dsecs}s 片（≤13s）不得被切（per Gavin：切片只认 1200ms 静默）"
             );
             assert_eq!(
                 segs[0].len(),
@@ -2074,18 +2075,18 @@ mod tests {
         }
     }
 
-    /// 🔴 安全阀：**>90s** 的片仍按 90s 切（兜底，非常规切片规则；超出继续切、不丢弃）。
+    /// 🔴 安全阀：**>13s** 的片仍按 13s 切（兜底，非常规切片规则；超出继续切、不丢弃）。
     #[test]
-    fn sliding_slice_370_over_90s_splits_by_90s() {
+    fn sliding_slice_370_over_13s_splits_by_13s() {
         let sec = SAMPLE_RATE as usize;
         let total = 200 * sec;
         let pcm = vec![0.1f32; total];
         let segs = build_dispatch_segment(0, total, pcm.len(), &pcm);
-        assert_eq!(segs.len(), 3, "200s ⇒ 90+90+20（90s 安全阀生效）");
-        assert_eq!(
-            segs.iter().map(|s| s.len()).collect::<Vec<_>>(),
-            vec![90 * sec, 90 * sec, 20 * sec]
-        );
+        assert_eq!(segs.len(), 16, "200s ⇒ 15×13 + 5 ⇒ 16 段（13s 安全阀生效）");
+        let lens: Vec<usize> = segs.iter().map(|s| s.len()).collect();
+        assert_eq!(lens[0], 13 * sec, "首段 13s");
+        assert_eq!(lens[15], 5 * sec, "末段为余量");
+        assert_eq!(lens.iter().sum::<usize>(), total, "切分不丢样本");
     }
 
     /// 🔴 边界护栏不丢（FIX-VAD-STATE-RESET-001）：start 越界 ⇒ 丢弃（不 panic）；

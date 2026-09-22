@@ -1089,9 +1089,9 @@ load_wordbook_vocabulary()
 - **根因**：滑窗派发路径仍有 20s 硬切（`SEGMENT_MAX_SECS`，native 时代遗留）⇒ 违背「只按静默停顿切片」，
   并加重 369 的零重叠丢字。
 - **修法**：`build_padded_segments_capped(.., max_seg_secs)` 显式上限 + 旧函数变薄包装（其它路径**逐位不变**，有单测证明）；
-  滑窗两处调用点走 `build_dispatch_segment`，上限 **90s** 安全阀（超出继续切、不丢弃）；护栏（越界过滤/clamp + 200ms padding）保留；
-  派发点加 KV 撞顶 warn。
-- **同批**：`MAX_RECORD_SECONDS` 180 → **300**（滑窗后与 KV 解耦：只解最后一窗 ≤12s；音频缓冲 18MB）。
+  滑窗两处调用点走 `build_dispatch_segment`，上限 **13s**（极端长句兜底，超出继续切、不丢弃）；护栏（越界过滤/clamp + 200ms padding）保留；
+  派发点保留 KV 撞顶 warn。
+- **同批**：`MAX_RECORD_SECONDS` 180 → **300**（滑窗后与 KV 解耦：只解最后一窗 ≤13s；音频缓冲 18MB）。
 - **单测**：+8 / 改名 2 ⇒ bin 1382→1390P。
 
 | 项 | 内容 |
@@ -1099,6 +1099,6 @@ load_wordbook_vocabulary()
 | 改动文件 | `vad.rs`、`local_stream.rs`、`main.rs`、`config/mod.rs`、`platform/windows/hotkey.rs`、`transcription/mod.rs`、`qwen_inference.rs`、`src-tauri/src/config.rs` |
 | 未动 | `align_overlap` / `group_window_start_secs` / 369 OrderedReflow / `itn.rs` / 版本 0.9.3 |
 | 验证 | `cargo fmt --check` EXIT 0；全量 `cargo test --no-fail-fast` **0 failed**（bin **1390P/28I**）；`cargo build --release` EXIT 0；`cargo check --manifest-path src-tauri/Cargo.toml` EXIT 0；warnings 98/88（≤ 基线） |
-| 90s 依据 | KV 占 4096 的 45%（剩 2240 给词库）；120s 为 55%/剩 1850 且解码 49s vs 37s ⇒ 90s 更优；真天花板=解码耗时+内存 |
-| 内存提示 | 🔴 90s 单片外推 ≈6.5~8.5GB（1.7B 口径）；仅「说满 90s 无停顿」触发，待 E2E 实测 |
+| 13s 依据 | **对齐滑窗封顶 12s 的实测体验**（Gavin 端测：12s 窗解码+回灌「没有明显卡顿」）；13s≈5.3s vs 12s 的 4.9s（+0.4s）；被否 16s/30s/90s |
+| KV/内存 | 均非瓶颈（13s≈169 token）；先前按 90s 的外推与 E2E 建议**作废** |
 | 结论 | 未 push / 零凭证；🔴 369+370 同在未提交工作区，由主控一并提交 |
