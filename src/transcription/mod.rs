@@ -3244,4 +3244,61 @@ mod poc_qwen3_17b_351 {
             drop(rec);
         }
     }
+
+    // ---- 355 追加：per-stream `language` 选项能否抑制 1.7B 前缀（只 1.7B，不做双模型对比）----
+    /// 生产 `decode_accuracy_once` 同款解码，但**额外**设 per-stream `language` 选项
+    /// （运行时支持，见 sherpa-onnx `offline-recognizer-qwen3-asr-impl.cc:824`）。
+    fn decode_with_lang(
+        rec: &sherpa_onnx::OfflineRecognizer,
+        samples: &[f32],
+        script: ChineseScript,
+        language: Option<&str>,
+    ) -> String {
+        let stream = rec.create_stream();
+        if let Some(l) = language {
+            stream.set_option("language", l);
+        }
+        stream.accept_waveform(16000, samples);
+        rec.decode(&stream);
+        let r = stream.get_result().expect("result");
+        let t = super::Transcriber::strip_asr_special_tokens(r.text.trim());
+        crate::text_normalizer::normalize_text_for_language(&t, script)
+    }
+
+    #[test]
+    #[ignore = "PoC: cargo test --bin feiyin-ime -- --ignored --nocapture poc_355_language_option"]
+    fn poc_355_language_option() {
+        let root = manifest_dir();
+        let rec = create_qwen3_recognizer_at(
+            &root.join("models/sherpa-onnx-qwen3-asr-1.7B-int8-2026-09-22"),
+        )
+        .expect("1.7B");
+        let pref = |t: &str| -> String {
+            match t.find("<asr_text>") {
+                Some(p) => format!("PREFIX={:?}", &t[..p]),
+                None => "PREFIX=(none)".to_string(),
+            }
+        };
+        let (fs, rate) = read_wav(&root, "collab/research/audio-real-gavin/processed/full.wav");
+        let slices = slice_fitness(&fs, rate);
+        let zh = &fs[slices[0].0..slices[0].1];
+        let (ko, _) = read_wav(&root, "models/korean-testwavs/0.wav");
+        let (ja, _) = read_wav(
+            &root,
+            "models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/test_wavs/ja1.wav",
+        );
+
+        for lang in [None, Some("Chinese"), Some("English")] {
+            let t = decode_with_lang(&rec, zh, ChineseScript::Simplified, lang);
+            println!("POC355L zh lang={lang:?} {} : {}", pref(&t), head(&t, 70));
+        }
+        for lang in [None, Some("Korean"), Some("Chinese")] {
+            let t = decode_with_lang(&rec, &ko, ChineseScript::Simplified, lang);
+            println!("POC355L ko lang={lang:?} {} : {}", pref(&t), head(&t, 70));
+        }
+        for lang in [None, Some("Japanese"), Some("English")] {
+            let t = decode_with_lang(&rec, &ja, ChineseScript::Simplified, lang);
+            println!("POC355L ja lang={lang:?} {} : {}", pref(&t), head(&t, 70));
+        }
+    }
 }
