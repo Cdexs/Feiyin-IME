@@ -32,6 +32,8 @@
 | --- | --- | --- | --- |
 | `ACC-DISPATCH-SILENCE-ONLY-346` | 切片派发规则改「只判静默 1200ms」，删长度支（原 800ms OR 累计 5s）。🔴 **必须同批解决共享计数器**：`silent_ms`（`local_stream.rs:491`）是唯一计数器，标点路径 `:997` 在 800ms 打点后把它清零 ⇒ 阈值抬到 1200 后静默支**结构上不可达**，不解决则 accuracy 录音中永不派发 | coder-2 | ✅ 已交付（2026-09-22：只判静默 1200ms + acc 专用计数器 `acc_silent_ms` 修共享坑；check 0err / 全量 **1420P/0F**；待 tester-1 出包）|
 | `RESEARCH-QWEN3-1.7B-347` | 评估 1.7B 替代现役 0.6B。🔴 门禁已答 | coder-1 | 🔄 ✅ **已交付并验收**：`collab/research/qwen3-asr-1.7b-eval-347.md`（15KB）。结论**有条件可行** —— 官方 k2-fsa 无 1.7B 导出（499 asset 全枚举），但 ModelScope `zengshuishui/Qwen3-ASR-onnx` 的 `model_1.7B/` 与现役 0.6B **同源同脚本**（本地三文件 sha256 与该库逐字节相同），四件套同构、`OfflineQwen3ASRModelConfig` **代码零改动**。代价：+1.32GiB、decoder 权重 2.70× ⇒ CPU 解码约 ×2.7；KV 每 token 与 0.6B **完全相同**（同 28 层/8 KV head/head_dim 128）⇒ 4096 仍成立。🔴 CPU RTF 与中文 CER **均未实测** |
+| `PUNCT-PREVIEW-SEMANTIC-349` | **问题①**：预览窗标点打在句中。主控定位（线索非结论，须先取证）：触发是「4s 定时 **或** 静默 800ms」，两条都与语义无关 —— 4s 一到就把半截句子喂 CT-Transformer，模型必在半句末尾补终止符。方向 A（只认 1200ms 静默、删 4s 定时，口径对齐 346，主控倾向）／ B（保留节奏但剥掉落在末尾的标点） | coder-2 | 🔄 已派发 |
+| `PUNCT-FINAL-REDO-350` | **Gavin 新增**：最终 acc 转写完 ⇒ **剥光全段标点 + 整段重打**。推翻 `apply_local_punctuation` 的 `!native_punctuated` 门（`main.rs:10802`）。🔴 剥离必须与 `has_effective_punctuation` **共用同一谓词**，词内嵌豁免照搬（`3.14`/`3:30`/`example.com`/`3.5亿` 不许剥）。🔴 **四档全覆盖**（`run_pipeline_core` 共用，DEC-066 禁管线判据），在线 Qwen3 档标点可能变差 ⇒ 必须端测 | coder-1 | 🔄 已派发 |
 | `QUERY-PUNCT-MECHANISM-348` | 查前端流式模型调标点模型的机制 | 主控 | ✅ 已查清并答复 Gavin（结论见下） |
 
 #### 346 的取舍（Gavin 拍板，照做，端测须盯）
