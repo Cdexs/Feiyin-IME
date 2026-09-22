@@ -1385,6 +1385,60 @@ pub(crate) fn align_overlap(prev: &str, new: &str) -> AlignResult {
     }
 }
 
+/// SLIDING-WINDOW-367（阶段四·B）：窗口解码**并发度**（默认 2）。
+///
+/// - `≥2` ⇒ 窗口间并发（窗口2 不等窗口1；同一 recognizer 多线程并发解，官方 `rng_mutex_` 支持）。
+/// - `=1` ⇒ **退化为顺序执行**（Gavin「不理想再退 A」的回退路径，无需重构）。
+pub(crate) const WINDOW_DECODE_CONCURRENCY: usize = 2;
+
+/// SLIDING-WINDOW-367（阶段四·B）：按 `window_seq` **有序定稿**的重排缓冲。
+///
+/// 🔴 解码可**乱序完成**，但对齐状态机**必须按 seq 串行**（`align_overlap` 依赖前一窗文本）
+/// ⇒ 结果先入 `pending`，等 `next` 到齐才依次 align/定稿，产出「应回灌的权威全文」（可 0..n 条）。
+/// 乱序合并会推进错 `committed` ⇒ 文本必错，故**唯一入口 `push` 保证按序**。
+pub(crate) struct OrderedReflow {
+    next: usize,
+    pending: std::collections::BTreeMap<usize, String>,
+    committed: String,
+    last_window_text: String,
+}
+
+impl OrderedReflow {
+    pub(crate) fn new() -> Self {
+        Self {
+            next: 0,
+            pending: std::collections::BTreeMap::new(),
+            committed: String::new(),
+            last_window_text: String::new(),
+        }
+    }
+
+    /// 收到 `seq` 的解码文本；返回本次**按序**定稿后应回灌的权威全文（可能 0..n 条）。
+    pub(crate) fn push(&mut self, seq: usize, text: String) -> Vec<String> {
+        self.pending.insert(seq, text);
+        let mut out = Vec::new();
+        while let Some(text) = self.pending.remove(&self.next) {
+            if !self.last_window_text.is_empty() && !text.is_empty() {
+                let a = align_overlap(&self.last_window_text, &text);
+                if a.ok {
+                    self.committed.push_str(&a.committed_prefix);
+                }
+            }
+            if !text.is_empty() {
+                self.last_window_text = text;
+            }
+            out.push(format!("{}{}", self.committed, self.last_window_text));
+            self.next += 1;
+        }
+        out
+    }
+
+    /// 收尾：返回 `(committed, last_window_text)`。
+    pub(crate) fn finish(self) -> (String, String) {
+        (self.committed, self.last_window_text)
+    }
+}
+
 /// ASR-ACC-OPT-001 方案 A：判定词条是否为纯 ASCII（纯英文/数字）。
 /// 纯 ASCII 词条（worker1/tester1/todo 等无关词）带偏 native decoder，
 /// 研究证实全量 wordbook 含此类词性能从 62.5% 降到 60%。
@@ -4054,7 +4108,7 @@ mod strip_lang_prefix_359_tests {
 // ============================================================
 #[cfg(test)]
 mod sliding_window_367_tests {
-    use super::{align_overlap, group_window_start_secs, WINDOW_MAX_SECS};
+    use super::{align_overlap, group_window_start_secs, OrderedReflow, WINDOW_MAX_SECS};
 
     // ---- ① 组窗 ----
     #[test]
@@ -4133,6 +4187,46 @@ mod sliding_window_367_tests {
         // 重叠只有 3 字（<8）⇒ 即使完全相同也不滑动
         let r = align_overlap("滑出甲乙丙", "甲乙丙后续");
         assert!(!r.ok, "短文本低于长度门必须保守");
+    }
+
+    // ---- (B) 窗口间并发：乱序完成 ⇒ 按 seq 有序定稿 ----
+    /// 🔴 造「后发先至」：seq1 先完成但 seq0 未到 ⇒ **不得定稿**；seq0 到齐 ⇒ 依次定稿 0、1。
+    #[test]
+    fn ordered_reflow_commits_in_seq_despite_out_of_order_arrival() {
+        let mut o = OrderedReflow::new();
+        assert!(
+            o.push(1, "B".to_string()).is_empty(),
+            "缺 seq0 ⇒ seq1 先到也不得定稿（必须先对齐再推进）"
+        );
+        let out = o.push(0, "A".to_string());
+        assert_eq!(out.len(), 2, "seq0 到齐后应**依次**产出 0 与 1 两条回灌");
+        assert_eq!(o.push(2, "C".to_string()).len(), 1);
+        let (_committed, last) = o.finish();
+        assert_eq!(last, "C", "最后窗口文本应为 seq2");
+    }
+
+    /// 中间有洞（seq1 缺）⇒ seq2 被暂存，填洞后 1、2 一起按序产出。
+    #[test]
+    fn ordered_reflow_holds_until_gap_filled() {
+        let mut o = OrderedReflow::new();
+        assert_eq!(o.push(0, "A".to_string()).len(), 1);
+        assert!(o.push(2, "C".to_string()).is_empty(), "缺 seq1 ⇒ seq2 不得定稿");
+        assert_eq!(
+            o.push(1, "B".to_string()).len(),
+            2,
+            "seq1 到齐 ⇒ 1、2 一起按序定稿"
+        );
+    }
+
+    /// 顺序到达（并发度=1 路径）⇒ 每条即时定稿，行为等同顺序版。
+    #[test]
+    fn ordered_reflow_sequential_arrival_is_immediate() {
+        let mut o = OrderedReflow::new();
+        assert_eq!(o.push(0, "甲".to_string()).len(), 1);
+        assert_eq!(o.push(1, "乙".to_string()).len(), 1);
+        assert_eq!(o.push(2, "丙".to_string()).len(), 1);
+        let (_committed, last) = o.finish();
+        assert_eq!(last, "丙");
     }
 }
 

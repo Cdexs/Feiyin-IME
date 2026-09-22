@@ -8207,96 +8207,156 @@ fn spawn_worker_thread(
                                 Some(scope.spawn(move || {
                                         let recognizer = send_offline.into_inner();
                                         // ── SLIDING-WINDOW-367：滑动窗口（当前片+前1~3，12s 封顶）──
+                                        // （阶段四·B）窗口解码投**并发池**（默认并发度 2，设 1 退顺序），
+                                        // 结果按 window_seq **有序定稿**（对齐状态机串行）。
                                         let mut all_native = true;
                                         let mut total_decode_ms = 0.0f64;
-                                        // 最近窗口的音频片（≤ WINDOW_MAX_SLICES）与上一窗文本 / 已定稿前缀。
                                         let mut recent_slices: Vec<Vec<f32>> = Vec::new();
-                                        let mut committed = String::new();
-                                        let mut last_window_text = String::new();
                                         let mut window_seq: usize = 0;
-                                        for (_idx, committed_len, sub_segs, _seg_streaming) in acc_rx {
-                                            if cancel_acc.load(Ordering::Acquire) {
-                                                break;
+                                        let mut ordered = transcription::OrderedReflow::new();
+                                        let concurrency = transcription::WINDOW_DECODE_CONCURRENCY.max(1);
+                                        // 注入素材按引用捕获（Option<&str> 为 Copy，可 move 进多个池线程）。
+                                        let p2 = ctx_prev2_snapshot.as_deref();
+                                        let p1 = ctx_prev1_snapshot.as_deref();
+                                        let terms = acc_terms.as_deref();
+
+                                        std::thread::scope(move |pool| {
+                                            // 结果 = (window_seq, dispatch_idx, Result, decode_ms)。
+                                            type DecRes =
+                                                (usize, usize, anyhow::Result<(String, bool)>, f64);
+                                            let (res_tx, res_rx) =
+                                                crossbeam_channel::unbounded::<DecRes>();
+                                            let mut task_txs = Vec::with_capacity(concurrency);
+                                            for _ in 0..concurrency {
+                                                let (ttx, trx) = crossbeam_channel::unbounded::<(
+                                                    usize,
+                                                    usize,
+                                                    Vec<f32>,
+                                                )>();
+                                                task_txs.push(ttx);
+                                                let rtx = res_tx.clone();
+                                                pool.spawn(move || {
+                                                    for (seq, dispatch_idx, audio) in trx {
+                                                        let t0 = std::time::Instant::now();
+                                                        let r = decode_window(
+                                                            recognizer,
+                                                            &audio,
+                                                            seq,
+                                                            acc_script,
+                                                            p2,
+                                                            p1,
+                                                            terms,
+                                                        );
+                                                        let ms =
+                                                            t0.elapsed().as_secs_f64() * 1000.0;
+                                                        let _ = rtx.send((seq, dispatch_idx, r, ms));
+                                                    }
+                                                });
                                             }
-                                            for s in &sub_segs {
-                                                recent_slices.push(s.clone());
-                                            }
-                                            while recent_slices.len()
-                                                > transcription::WINDOW_MAX_SLICES
+                                            drop(res_tx);
+                                            let mut rr: usize = 0;
+
+                                            for (idx, _committed_len, sub_segs, _seg_streaming) in
+                                                acc_rx
                                             {
-                                                recent_slices.remove(0);
-                                            }
-                                            let durs: Vec<f32> = recent_slices
-                                                .iter()
-                                                .map(|s| s.len() as f32 / 16000.0)
-                                                .collect();
-                                            let start = transcription::group_window_start_secs(
-                                                &durs,
-                                                transcription::WINDOW_MAX_SECS,
-                                            );
-                                            let window_audio: Vec<f32> = recent_slices[start..]
-                                                .iter()
-                                                .flat_map(|s| s.iter().copied())
-                                                .collect();
-                                            // 单窗口一段音频、**一次 decode**（(A)：不做窗口内分片解）。
-                                            // 🔴 (B) 窗口间并发池：待接（当前顺序）。
-                                            let t0 = std::time::Instant::now();
-                                            let res = decode_window(
-                                                recognizer,
-                                                &window_audio,
-                                                window_seq,
-                                                acc_script,
-                                                ctx_prev2_snapshot.as_deref(),
-                                                ctx_prev1_snapshot.as_deref(),
-                                                acc_terms.as_deref(),
-                                            );
-                                            total_decode_ms += t0.elapsed().as_secs_f64() * 1000.0;
-                                            let new_text = match res {
-                                                Ok((t, _np)) => t,
-                                                Err(err) => {
-                                                    all_native = false;
-                                                    log::warn!(
-                                                        "SLIDING-WINDOW-367 window #{} decode failed: {}",
-                                                        window_seq,
-                                                        err
-                                                    );
-                                                    String::new()
+                                                if cancel_acc.load(Ordering::Acquire) {
+                                                    break;
                                                 }
-                                            };
-                                            // ④ 对齐：上一窗与当前窗的重叠 ⇒ 滑出片定稿（双门不过则不滑动）。
-                                            if !last_window_text.is_empty() && !new_text.is_empty() {
-                                                let a = transcription::align_overlap(
-                                                    &last_window_text,
-                                                    &new_text,
-                                                );
-                                                if a.ok {
-                                                    committed.push_str(&a.committed_prefix);
-                                                } else if log::log_enabled!(log::Level::Debug) {
-                                                    log::debug!(
-                                                        "[SLIDING-WINDOW-367] align not ok, 保守不滑动 (seq={} prev_len={} new_len={})",
-                                                        window_seq,
-                                                        last_window_text.chars().count(),
-                                                        new_text.chars().count()
+                                                for s in &sub_segs {
+                                                    recent_slices.push(s.clone());
+                                                }
+                                                while recent_slices.len()
+                                                    > transcription::WINDOW_MAX_SLICES
+                                                {
+                                                    recent_slices.remove(0);
+                                                }
+                                                let durs: Vec<f32> = recent_slices
+                                                    .iter()
+                                                    .map(|s| s.len() as f32 / 16000.0)
+                                                    .collect();
+                                                let start =
+                                                    transcription::group_window_start_secs(
+                                                        &durs,
+                                                        transcription::WINDOW_MAX_SECS,
                                                     );
+                                                let window_audio: Vec<f32> = recent_slices[start..]
+                                                    .iter()
+                                                    .flat_map(|s| s.iter().copied())
+                                                    .collect();
+                                                // 投池、**不等**（窗口2 不需等窗口1）；dispatch_idx 用于与 337 配对。
+                                                let _ = task_txs[rr % concurrency]
+                                                    .send((window_seq, idx, window_audio));
+                                                rr += 1;
+                                                window_seq += 1;
+                                                // 把已完成结果按 seq 有序定稿 + 回灌（replace_all 整段替换）。
+                                                while let Ok((seq, dispatch_idx, r, ms)) =
+                                                    res_rx.try_recv()
+                                                {
+                                                    total_decode_ms += ms;
+                                                    let text = match r {
+                                                        Ok((t, _np)) => t,
+                                                        Err(err) => {
+                                                            all_native = false;
+                                                            log::warn!(
+                                                                "SLIDING-WINDOW-367 window #{} decode failed: {}",
+                                                                seq,
+                                                                err
+                                                            );
+                                                            String::new()
+                                                        }
+                                                    };
+                                                    for authoritative in ordered.push(seq, text) {
+                                                        let _ = acc_event_tx.send(
+                                                            PipelineEvent::PreviewReflow {
+                                                                generation: session_generation,
+                                                                seg_index: dispatch_idx,
+                                                                committed_len: 0,
+                                                                has_hole: false,
+                                                                acc_text: authoritative,
+                                                                replace_all: true,
+                                                            },
+                                                        );
+                                                    }
                                                 }
                                             }
-                                            if !new_text.is_empty() {
-                                                last_window_text = new_text;
+                                            // 收尾：等齐所有在飞窗口（共 window_seq 条）。
+                                            drop(task_txs);
+                                            let mut done = 0usize;
+                                            while done < window_seq {
+                                                let Ok((seq, dispatch_idx, r, ms)) = res_rx.recv()
+                                                else {
+                                                    break;
+                                                };
+                                                total_decode_ms += ms;
+                                                let text = match r {
+                                                    Ok((t, _np)) => t,
+                                                    Err(err) => {
+                                                        all_native = false;
+                                                        log::warn!(
+                                                            "SLIDING-WINDOW-367 window #{} decode failed: {}",
+                                                            seq,
+                                                            err
+                                                        );
+                                                        String::new()
+                                                    }
+                                                };
+                                                for authoritative in ordered.push(seq, text) {
+                                                    let _ = acc_event_tx.send(
+                                                        PipelineEvent::PreviewReflow {
+                                                            generation: session_generation,
+                                                            seg_index: dispatch_idx,
+                                                            committed_len: 0,
+                                                            has_hole: false,
+                                                            acc_text: authoritative,
+                                                            replace_all: true,
+                                                        },
+                                                    );
+                                                }
+                                                done += 1;
                                             }
-                                            // ⑤ 回灌：整段替换预览为「committed + 最新窗口文本」（replace_all=true）。
-                                            let authoritative =
-                                                format!("{}{}", committed, last_window_text);
-                                            let _ = acc_event_tx.send(PipelineEvent::PreviewReflow {
-                                                generation: session_generation,
-                                                seg_index: window_seq,
-                                                committed_len,
-                                                has_hole: false,
-                                                acc_text: authoritative,
-                                                replace_all: true,
-                                            });
-                                            window_seq += 1;
-                                        }
-                                        (committed, last_window_text, all_native, total_decode_ms)
+                                            let (committed, last_window_text) = ordered.finish();
+                                            (committed, last_window_text, all_native, total_decode_ms)
+                                        })
                                     }))
                             } else {
                                 None
