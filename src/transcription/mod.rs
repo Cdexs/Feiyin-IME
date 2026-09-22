@@ -227,67 +227,41 @@ impl<'a> SendOfflineRecognizerRef<'a> {
 /// （`Transcriber` 非 `Sync`，不能跨线程共享 `&self`）。
 /// LOCALRT-CTX-INJECT-320：上下文注入参数（accuracy worker 每片 **per-stream** 注入）。
 ///
-/// - `CTX_DEFAULT_CHARS`：**时间线合并后**的统一上限，**常量 500 字**（320 修正：三段合一取尾，
-///   超长只从**最旧**一端截 ⇒ 本次录音刚完成的片永远保留；KV 4096 余量充足）。
-/// - 上下文注入**恒开**（原 `LOCAL_RT_CTX_ENABLED` 已删；Gavin 2026-09-21：不允许存在开发端/用户端
-///   不一致，用户机器无 env ⇒ env 覆盖是假路径。止血手段不再保留）。
-/// - 🔴 per-stream 通道仅 Qwen3 可用（accuracy 引擎已固定 Qwen3）。
-const CTX_DEFAULT_CHARS: usize = 500;
+/// FIX-INJECT-TO-SPEC-377：ctx 注入已删 ⇒ 本护栏恒不触发；**保留回退能力**（主控裁定前不删）。
 /// 回显判定：LCS ≥ 此绝对长度（正常组 LCS=3、故障组 LCS=79；20 在两者之间、靠近正常侧）。
 const CTX_ECHO_LCS_ABS: usize = 20;
+#[allow(dead_code)] // 见上：377 起无调用点，保留待主控裁定
+/// FIX-INJECT-TO-SPEC-377：ctx 注入已删 ⇒ 本护栏恒不触发；**保留回退能力**（主控裁定前不删）。
 /// 回显判定：LCS ≥ 输出的此比例（短输出也可能整段回显）。
 const CTX_ECHO_LCS_RATIO: f64 = 0.5;
-/// 输出清理指令：**恒发**，与有没有上下文、有没有词条都无关（Gavin 2026-09-21 指示）。
+#[allow(dead_code)] // 见上：377 起无调用点，保留待主控裁定
+/// FIX-INJECT-TO-SPEC-377：产出 `hotwords` 通道内容 —— **只放纯 ASCII 逗号分隔词表**。
 ///
-/// 口吃、重复词、口水词在 ASR 原始输出里很常见，模型自己顺掉最好。Gavin 口径：
-/// 「指令不要太长，反正即使不起作用，它也占不了多少上下文的窗口。」
-/// ⇒ 一句话、十来个 token，对 DEC-068 零和预算的挤占可忽略。
+/// 依据（一手）：sherpa `offline-recognizer-qwen3-asr-impl.cc` 把 hotwords **原样**塞进
+/// `<|im_start|>system` + hotwords + `<|im_end|>` 后接 user 轮，注释写明期望形态是 `"foo,bar,baz"`；
+/// 官方 `transcribe()` 无上下文参数、对话只有一个 user 轮、无 system 段。
 ///
-/// 🔴 这**不替代**下游 `apply_filler_strip`（`src/text_normalizer.rs`）：
-///    那是确定性兜底，本指令是尽力而为，两者并存，别因为加了这句就去摘兜底。
-const CLEANUP_INSTR_EN: &str =
-    "Transcribe cleanly: drop stutters, repeated words, and filler words.";
-/// 上下文说明句：**只在真有前文时**才发（没有前文还说「以下是前文」纯属误导模型）。
-const CTX_INSTR_EN: &str = "The following is the preceding context of this recording. Use it to keep terminology and wording consistent.";
-
-/// 取字符串**最后** n 个字符（最近的最相关）；不足 n 全取。
-fn last_n_chars(s: &str, n: usize) -> String {
-    let v: Vec<char> = s.chars().collect();
-    if v.len() <= n {
-        s.to_string()
-    } else {
-        v[v.len() - n..].iter().collect()
-    }
-}
-
-/// 拼 system 段：英文说明句 + `Context:`（时间线）+ `Terms:`（词库），各占一行加标签。
-/// 两者皆空 ⇒ None（不注入）。
-fn build_ctx_system(context: Option<&str>, terms: Option<&str>) -> Option<String> {
-    let c = context.unwrap_or("").trim();
+/// 🔴 2026-09-23 前我们塞的是「英文指令句 ×2 + `Context:` 整段散文 + `Terms:` 标签」——
+/// POC-376 实证：英文指令句与 `Context:` 散文**各自独立**都会被模型当输出续写
+/// （ja·不设 language ⇒ 吐 68 字英文指令句；ja·Auto ⇒ 吐 82 字 Context 散文，LCS 77/81）⇒ 全部删除。
+/// 空词表 ⇒ `None`（**不调用** `set_option("hotwords", …)`，等同官方示例的「无 system 段」）。
+fn build_ctx_system(terms: Option<&str>) -> Option<String> {
     let t = terms.unwrap_or("").trim();
-    // 🔴 **恒返回 Some**（2026-09-21 契约变更）：清理指令与上下文/词条无关，永远要发。
-    //    旧行为是「都空 ⇒ None ⇒ 整段不注入」，那样一来新用户（词库为空）本次录音的
-    //    第一片就拿不到清理指令 —— 正是最需要它的时候。别改回去。
-    let mut s = String::from(CLEANUP_INSTR_EN);
-    if !c.is_empty() {
-        s.push('\n');
-        s.push_str(CTX_INSTR_EN);
-        s.push_str(&format!("\nContext: {c}"));
-    }
-    if !t.is_empty() {
-        s.push_str(&format!("\nTerms: {t}"));
-    }
-    Some(s)
+    (!t.is_empty()).then(|| t.to_string())
 }
 
-/// LOCALRT-CTX-INJECT-320：注入素材——三段按**严格时间顺序**（上上次 → 上一次 → 本次已完成片）+ 词库。
+/// 单窗解码的 per-stream 注入素材（FIX-INJECT-TO-SPEC-377 后的真实语义）。
 ///
-/// 🔴 三段**合成一条时间线**，超长时**只从最旧端截**（先砍上上次、再砍上一次，本次刚完成的片永不先掉）。
-/// 不设分段配额（Gavin 2026-09-21 修正，推翻主控的「分开留额度」草案）。
+/// - [`Self::terms`]：用户词库词条（ASCII 逗号分隔）—— **这就是 `hotwords` 规格要的全部内容**；
+/// - [`Self::avg_chars_per_sec`]：本次录音已接受窗口的产出率均值（375-B 判「解码坍塌」用，与注入无关）。
+///
+/// 🔴 **上下文注入（`Context:` 段 / `Terms:` 标签 / 英文指令句）已按 sherpa 规格整体移除**：
+///    C++ 侧把 `hotwords` 原样放进 `<|im_start|>system` 段、期望纯逗号词表；官方 `transcribe()` 无上下文参数。
+///    POC-376 实证「英文指令句」与「`Context:` 散文」**各自独立**都会被模型当输出续写
+///    ⇒ `prev_older`/`prev_latest`/`current` 三个字段已删除（不要再加回来）。
 pub struct CtxInject<'a> {
-    pub prev_older: Option<&'a str>,
-    pub prev_latest: Option<&'a str>,
-    pub current: Option<&'a str>,
+    /// 用户词库词条（ASCII 逗号分隔，原样）—— 就是 `hotwords` 规格要的东西。
+    /// `None`/空 ⇒ 不注入（不调 `set_option("hotwords", …)`）。
     pub terms: Option<&'a str>,
     /// FIX-PREVIEW-STALE-AND-COLLAPSE-375（B）：本次录音**已定稿窗口**的产出率均值（字/秒），
     /// 用于识别「解码坍塌」（[`output_rate_ok`]）。`None` = 冷启动/样本不足 ⇒ 不判坍塌。
@@ -295,25 +269,8 @@ pub struct CtxInject<'a> {
     pub avg_chars_per_sec: Option<f32>,
 }
 
-/// 按时间顺序合并三段为一条时间线（跳过空段）；返回 `(合并串, [上上次,上一次,本次] 各段字数)`。
-fn merge_ctx_timeline(
-    prev_older: Option<&str>,
-    prev_latest: Option<&str>,
-    current: Option<&str>,
-) -> (String, [usize; 3]) {
-    let mut merged: Vec<&str> = Vec::new();
-    let mut lens = [0usize; 3];
-    for (i, p) in [prev_older, prev_latest, current].into_iter().enumerate() {
-        let t = p.unwrap_or("").trim();
-        lens[i] = t.chars().count();
-        if !t.is_empty() {
-            merged.push(t);
-        }
-    }
-    (merged.join("\n"), lens)
-}
-
 /// 回显探针归一化：去空白与常见中英标点（回显是逐字文本，标点差异不应漏检）。
+#[allow(dead_code)] // 377 起仅被保留的 ctx 回显护栏使用，保留回退能力
 fn normalize_ctx_probe(s: &str) -> String {
     const PUNCT: &[char] = &[
         '。', '，', '、', '！', '？', '；', '：', '「', '」', '『', '』', '“', '”', '‘', '’', '…',
@@ -350,11 +307,17 @@ fn lcs_len(a: &str, b: &str) -> usize {
 
 /// 回显处置：命中 ⇒ Redecode（**不丢片**，同音频无上下文重解一次）。
 #[derive(PartialEq, Eq, Debug)]
+#[allow(dead_code)] // 377 起无调用点（ctx 注入已删），保留回退能力
 enum CtxEchoAction {
     Keep,
     Redecode,
 }
 
+#[allow(dead_code)] // 377 起无调用点（ctx 注入已删），保留回退能力
+///
+/// 🔴 **唯一正当回挂理由 = 上下文注入（`Context:` 段）被重新启用**。
+/// 见到「模型回显词条」**不是**回挂理由 —— 那由 374 的 `strip_terms_echo` 覆盖，
+/// 且把 Terms 放回本护栏的比对面正是 BUILD-321 实测 **43% 误判**的来源。
 fn ctx_echo_action(out_norm: &str, ctx_norm: &str) -> (usize, CtxEchoAction) {
     let l = lcs_len(out_norm, ctx_norm);
     let out_len = out_norm.chars().count();
@@ -545,8 +508,9 @@ struct TermsEchoHit {
 /// 🔴 **绝不把 Terms 段放回 LCS 比对面** —— 那正是 2026-09-21 实测 43%（14 次触发 6 次重解）
 /// 误判的来源；本函数的判据与 LCS 无关，故**没有**那个误伤面 ⇒ 可以**恒执行**。
 ///
-/// 🔴 与 `ctx` 是否为空**无关**：端测现场 `ctx_raw_len=0`（重启后第一次录音）时旧护栏整块被跳过，
-/// 词条照样回显（`seg=10 out_chars=77 terms_len=76`）⇒ 本步放在 ctx 护栏**之外**独立执行。
+/// 🔴 **不受任何前置条件影响**：FIX-INJECT-TO-SPEC-377 起已无 `Context:` 注入（无 ctx 概念），
+/// 本步仍然**恒执行** —— 端测现场 `ctx_raw_len=0`（重启后第一次录音）时旧护栏整块被跳过、
+/// 词条照样回显（`seg=10 out_chars=77 terms_len=76`）⇒ 判据必须与「有无前文」无关。
 ///
 /// 处置 = **剥离**（不重解；重解要再等约 4s 且仍带注入、可能再次回显）：
 /// 只删「首个匹配词条 → 末个匹配词条」之间的原文字符，再清掉**接缝上的列表分隔符**
@@ -672,55 +636,23 @@ pub(crate) fn transcribe_acc_ctx(
     seg_idx: usize,
     inject: CtxInject<'_>,
 ) -> Result<(String, bool)> {
-    // B/C：三段按时间顺序合并成一条时间线（上上次 → 上一次 → 本次已完成片）。
-    // 🔴🔴 截断方向：**从头部（时间最远）截，保留尾部（时间最近）**——即 `last_n_chars(_, CAP)`
-    //   保留最后 CAP 个字符。举例：CAP=500，三段 200+180+150=530 ⇒ 砍掉「上上次」开头 80 字，
-    //   结果 = 上上次后 120 + 上一次全部 180 + 本次全部 150。本次刚完成的片**永远最后才被考虑**。
-    //   ⚠️ 方向极易被后人改反；改反 = 丢掉最相关的刚说内容、留一堆最旧的，比不加还糟。
-    let (ctx_raw, lens) = merge_ctx_timeline(inject.prev_older, inject.prev_latest, inject.current);
-    let ctx_raw_len = ctx_raw.chars().count();
-    let ctx = last_n_chars(&ctx_raw, CTX_DEFAULT_CHARS);
-    let ctx_len = ctx.chars().count();
-    let cut = ctx_raw_len.saturating_sub(ctx_len);
+    // FIX-INJECT-TO-SPEC-377：注入内容**只剩纯词表**（见 `build_ctx_system`）。
+    // 「英文指令句 ×2 + `Context:` 散文 + `Terms:` 标签」已全部删除 ⇒ 无 ctx 概念、ctx 回显护栏不再参与。
     let terms_len = inject.terms.map(|s| s.chars().count()).unwrap_or(0);
-    let ctx_opt = (!ctx.is_empty()).then_some(ctx.as_str());
-    let system = build_ctx_system(ctx_opt, inject.terms);
+    let system = build_ctx_system(inject.terms);
     let inject_on = should_inject_ctx(system.as_deref());
-    let mut text = decode_accuracy_once(
+    let text = decode_accuracy_once(
         recognizer,
         samples,
         system.as_deref().filter(|_| inject_on),
         script,
     )?;
-    // D：ctx 定稿后才做长跨回显护栏（命中 ⇒ 无上下文重解，不丢片）。
-    //
-    // 🔴 比对面**只取 `ctx`**（前文时间线），不含 `CTX_INSTR_EN` 指令句、也不含 `Terms:` 词库段。
-    //    2026-09-21 BUILD-321 端测实测：原先拿整个 system 串比对，73 字词库一并进了 LCS，
-    //    于是「用户说到词库里的词」被判成回显 —— 14 次触发 6 次重解（43%）。
-    //    词库本来就是注入去帮模型认词的，认对了反而被护栏抵消掉，等于自己打自己。
-    //    回显要防的是**前文被逐字念回**，与词条无关、与英文指令更无关。改回 sys = 直接复发。
-    //
-    // 🔴 `ctx` 为空时整块跳过：没有前文就不存在「回显前文」，此时只注了词库，
-    //    再比对必然是误判（上面那 43% 里就有这种）。
-    let mut lcs = 0usize;
-    let mut action = CtxEchoAction::Keep;
-    // 🔴 判决依据是**带上下文那一次**的输出；命中后 `text` 会被重解结果覆盖。
-    //    埋点必须记判决当时的长度，否则日志里 lcs 与 out_chars 对不上（lcs=7/out=15 看着
-    //    既不够 20 也不够 50%，实际判决时输出比 15 短）——监控失真，护栏误触就查不出来。
     let decided_out_chars = text.chars().count();
-    if inject_on && !ctx.is_empty() {
-        let (l, a) = ctx_echo_action(&normalize_ctx_probe(&text), &normalize_ctx_probe(&ctx));
-        lcs = l;
-        if a == CtxEchoAction::Redecode {
-            action = CtxEchoAction::Redecode;
-            text = decode_accuracy_once(recognizer, samples, None, script)?;
-        }
-    }
     // FIX-TERMS-ECHO-374 + 375（B）：**统一的处置阶梯**（一处实现，两条判据）。
     //
-    // 🔴 放在 ctx 护栏**之外**、**恒执行**（与 `ctx` 是否为空无关）：端测 374 现场 `ctx_raw_len=0`
-    //    （重启后第一次录音）时旧护栏整块被跳过，`seg=10` 零转写只吐 77 字词条列表；
-    //    375 现场则是「短输出从相对阈值下溜走」。两条判据都与 LCS 无关 ⇒ 无 43% 误伤面。
+    // 🔴 **恒执行、不受任何前置条件影响**：377 起已无 `Context:` 注入；374 现场（`ctx_raw_len=0`
+    //    的「重启后第一次录音」）旧护栏整块被跳过、`seg=10` 零转写只吐 77 字词条列表，375 现场则是
+    //    「短输出从相对阈值下溜走」。两条判据都与 LCS 无关 ⇒ 无 BUILD-321 的 43% 误伤面。
     let audio_secs = samples.len() as f32 / 16000.0;
     let (text, disp) = apply_acc_disposition(
         text,
@@ -731,23 +663,11 @@ pub(crate) fn transcribe_acc_ctx(
     );
     if log::log_enabled!(log::Level::Debug) {
         log::debug!(
-            "[LocalRT-DBG-320] ctx inject: seg={} prev2_len={} prev1_len={} acc_len={} ctx_raw_len={} ctx_len={} cut={} terms_len={} out_chars={} final_chars={} lcs={} action={}",
+            "[LocalRT-DBG-320] hotwords inject: seg={} terms_len={} out_chars={} final_chars={}",
             seg_idx,
-            lens[0],
-            lens[1],
-            lens[2],
-            ctx_raw_len,
-            ctx_len,
-            cut,
             terms_len,
             decided_out_chars,
-            text.chars().count(),
-            lcs,
-            if action == CtxEchoAction::Redecode {
-                "redecode"
-            } else {
-                "keep"
-            }
+            text.chars().count()
         );
     }
     // FIX-TERMS-ECHO-374 埋点：命中回显才打（匹配词条数 / 剥掉字数 / 剩余字数 / 是否重解 / 最终字数）。
@@ -1519,11 +1439,11 @@ pub(crate) fn expected_audio_tokens(num_samples: usize) -> usize {
     feat_to_audio_tokens(feat_len, QWEN3_CONV_CHUNK_SIZE).max(0) as usize
 }
 
-/// 路B 注入段 token 数（**精确**）：对**实际要注入的 system 串**（`build_ctx_system`：清理指令
-/// + **跨录音上下文**（320）+ 词库）用 tokenizer 实数，再乘 `HOTWORDS_CPP_SAFETY_FACTOR`(2.0)
+/// 路B 注入段 token 数（**精确**）：对**实际要注入的 hotwords 串**（`build_ctx_system`，377 起
+/// **只剩纯词表**）用 tokenizer 实数，再乘 `HOTWORDS_CPP_SAFETY_FACTOR`(2.0)
 /// 以覆盖「我方 tokenizer 与 C++ 手搓 BPE 的计数差异」（DEC-074）。三项一次算准，不重复扣。
-pub(crate) fn estimate_inject_tokens(context: Option<&str>, terms: Option<&str>) -> usize {
-    match build_ctx_system(context, terms) {
+pub(crate) fn estimate_inject_tokens(terms: Option<&str>) -> usize {
+    match build_ctx_system(terms) {
         Some(s) => estimate_word_tokens(hotwords_tokenizer().as_ref(), &s),
         None => 0,
     }
@@ -1533,19 +1453,15 @@ pub(crate) fn estimate_inject_tokens(context: Option<&str>, terms: Option<&str>)
 ///
 /// 判据：`音频token(精确) + 注入段token(精确) + 生成预留 + 安全余量 ≤ max_total_len`。
 /// - 音频：`expected_audio_tokens`（C++ 同款降采样公式，**非** 13.0 tok/s 估算）；
-/// - 注入段：`estimate_inject_tokens`（tokenizer 实数 × C++ 差异系数，含跨录音上下文 + 词库
+/// - 注入段：`estimate_inject_tokens`（tokenizer 实数 × C++ 差异系数，377 起**只剩纯词表**
 ///   + 提示词脚手架）；
 /// - 余量仅 64（取整边界），不再承担估算兜底。
 ///
 /// `true` ⇒ 路B 跑全量；`false` ⇒ 降级退回切片拼装（绝不硬塞）。
 /// 180s 不降级；`MAX_RECORD_SECONDS` 现为 300 ⇒ 300s 会降级（370 起整段解码已摘接线，见 `main.rs`）。
-pub(crate) fn path_b_budget_ok(
-    num_samples: usize,
-    context: Option<&str>,
-    terms: Option<&str>,
-) -> bool {
+pub(crate) fn path_b_budget_ok(num_samples: usize, terms: Option<&str>) -> bool {
     expected_audio_tokens(num_samples)
-        + estimate_inject_tokens(context, terms)
+        + estimate_inject_tokens(terms)
         + PATH_B_GEN_RESERVE
         + PATH_B_SAFETY_MARGIN
         <= PATH_B_MAX_TOTAL_LEN
@@ -2245,10 +2161,9 @@ fn create_sensevoice_recognizer(
 ///   | 扣项 | token |
 ///   | --- | --- |
 ///   | 20s 音频（13.0 tok/s） | 260 |
-///   | 上下文 `CTX_DEFAULT_CHARS=500` 字 × ~0.77 | 385 |
-///   | 清理指令 + 上下文说明句 + `Context:`/`Terms:` 标签 | ~55 |
+///   | ~~上下文 500 字 + 指令句/标签 ~55~~ | ~~440~~（**FIX-INJECT-TO-SPEC-377 起不再注入**） |
 ///   | 生成预留 `max_new_tokens` | 256 |
-///   | **剩给词库** | **4096 ⇒ 3140** ／ **2048 ⇒ 1092** |
+///   | **剩给词库** | **4096 ⇒ 3580** ／ **2048 ⇒ 1532** |
 ///
 ///   词库预算是 **3000** ⇒ 在 4096 下余量仅 ~140，**在 2048 下超出约 1900**。
 ///   超预算的后果不是截断而是**空输出**（同文件 `HOTWORDS_MAX_ENTRIES` 注释记录：
@@ -3136,100 +3051,65 @@ mod tests {
     }
 
     // ============================================================
-    // LOCALRT-CTX-INJECT-320：上下文注入（截取 / 回显护栏 / 门控）
+    // FIX-INJECT-TO-SPEC-377：注入内容 = 纯 ASCII 逗号分隔词表（规格化）
+    //   （旧的 320 上下文/指令句/截断测试随实现整体删除；ctx 回显护栏代码保留但已无调用点）
     // ============================================================
 
     #[test]
-    fn ctx320_last_n_chars_truncates_to_tail_by_chars() {
-        assert_eq!(last_n_chars("abcdef", 3), "def", "取最后 N 个字符");
-        assert_eq!(last_n_chars("abc", 10), "abc", "不足 N 全取");
-        assert_eq!(last_n_chars("", 5), "");
-        assert_eq!(last_n_chars("中文测试", 2), "测试", "按字符不是字节");
-    }
-
-    #[test]
-    fn ctx320_build_system_labels_and_timeline_order() {
-        let s = build_ctx_system(Some("前文内容"), Some("词A,词B")).unwrap();
-        assert!(s.starts_with(CLEANUP_INSTR_EN), "第一行恒为清理指令");
-        assert!(s.contains(CTX_INSTR_EN), "有前文 ⇒ 带上下文说明句");
-        assert!(s.contains("\nContext: 前文内容"), "Context 标签");
-        assert!(s.contains("\nTerms: 词A,词B"), "Terms 标签");
-        // 🔴 契约（Gavin 2026-09-21）：清理指令**恒发**，都空时也要有，且此时只有它。
-        let bare = build_ctx_system(None, None).expect("都空也必须注入清理指令");
+    fn fix377_build_ctx_system_is_bare_terms_only() {
+        let terms = "你好,铭印,银线,朵洛莉丝,费曼学习法";
+        let s = build_ctx_system(Some(terms)).expect("非空词表 ⇒ 注入");
         assert_eq!(
-            bare, CLEANUP_INSTR_EN,
-            "都空 ⇒ 仅清理指令，无 Context/Terms"
+            s, terms,
+            "产出必须与输入词表**逐字相同**（ASCII 逗号、无换行）"
         );
-        assert_eq!(
-            build_ctx_system(Some("  "), Some(" ")).expect("空白等同空，但仍发清理指令"),
-            CLEANUP_INSTR_EN,
-            "空白等同空"
+        // 🔴 不得再带任何超规格自由文本（POC-376 实证它们会被模型当输出续写）
+        assert!(!s.contains("Context:"), "不得含 Context 标签");
+        assert!(!s.contains("Terms:"), "不得含 Terms 标签");
+        assert!(
+            !s.chars().any(|c| c.is_ascii_alphabetic()),
+            "不得含英文指令句：{s}"
         );
-        // 无前文时不得出现「以下是前文」这句，否则等于骗模型去找不存在的上文
-        assert!(!bare.contains(CTX_INSTR_EN), "无前文 ⇒ 不带上下文说明句");
-        // 时间线：顺序恒为 上上次 → 上一次 → 本次；超长只砍最旧端（取尾）
-        let (raw, lens) = merge_ctx_timeline(Some("上上次"), Some("上一次"), Some("本次片一"));
-        assert_eq!(raw, "上上次\n上一次\n本次片一", "时间顺序不可颠倒");
-        assert_eq!(lens, [3, 3, 4], "各段字数（上上次/上一次/本次）");
-        assert_eq!(last_n_chars(&raw, 4), "本次片一", "取尾只砍最旧端");
-        let (empty, _) = merge_ctx_timeline(None, None, None);
-        assert!(empty.is_empty());
+        assert!(!s.contains('\n'), "不得含换行");
+        // 前后空白被 trim（词表本身不含空白）
+        assert_eq!(build_ctx_system(Some("  词A,词B  ")).unwrap(), "词A,词B");
     }
 
     #[test]
-    fn ctx320_truncation_keeps_tail_drops_oldest_head() {
-        // 🔴 方向钉死：超长时从**头部（最旧）**砍，保留**尾部（最新）**。
-        // 三段可区分：上上次 a*200 / 上一次 b*180 / 本次 c*150（合计 532 > CAP 450）。
-        let a = "a".repeat(200);
-        let b = "b".repeat(180);
-        let c = "c".repeat(150);
-        let (raw, _) = merge_ctx_timeline(Some(&a), Some(&b), Some(&c));
-        let kept = last_n_chars(&raw, 450);
-        assert_eq!(kept.chars().count(), 450);
-        assert!(kept.ends_with(&c), "必须保留本次内容（在尾部）");
-        assert_eq!(kept.matches('c').count(), 150, "本次 150 字全保留");
-        assert_eq!(kept.matches('b').count(), 180, "上一次 180 字全保留");
-        assert_eq!(
-            kept.matches('a').count(),
-            118,
-            "上上次只剩后 118 字（头部被砍 80）"
-        );
-        assert!(kept.starts_with('a'), "保留段仍以（上上次的）残尾开头");
+    fn fix377_build_ctx_system_empty_terms_injects_nothing() {
+        for t in [
+            None,
+            Some(""),
+            Some("   "),
+            Some(
+                "
+	",
+            ),
+        ] {
+            assert!(
+                build_ctx_system(t).is_none(),
+                "空词表 ⇒ None（不调 set_option hotwords）：{t:?}"
+            );
+        }
+        // 门控：无内容 ⇒ 不注入（`should_inject_ctx` 的契约不变）
+        assert!(!should_inject_ctx(build_ctx_system(None).as_deref()));
+        assert!(should_inject_ctx(build_ctx_system(Some("词A")).as_deref()));
     }
 
+    /// 🔴 钉死：374 的 `strip_terms_echo` 对**新格式**（裸词表本身）仍能正确命中。
     #[test]
-    fn ctx320_lcs_normal_keeps_echo_redecodes() {
-        let (l, a) = ctx_echo_action(
-            &normalize_ctx_probe("今天天气不错我们出去走走吧"),
-            &normalize_ctx_probe("甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉"),
-        );
-        assert!(l < CTX_ECHO_LCS_ABS, "正常输出 LCS 应小，实测 {l}");
-        assert_eq!(a, CtxEchoAction::Keep);
-        let ctx = "上一轮八分之一决赛凭借哈兰德梅开二度挪威队爆冷淘汰巴西队";
-        let (l2, a2) = ctx_echo_action(&normalize_ctx_probe(ctx), &normalize_ctx_probe(ctx));
-        assert!(l2 >= CTX_ECHO_LCS_ABS, "逐字回显 LCS 应 ≥20，实测 {l2}");
-        assert_eq!(a2, CtxEchoAction::Redecode);
-    }
-
-    #[test]
-    fn ctx320_lcs_ratio_triggers_for_short_output() {
-        // LCS(9) < 20 绝对阈值，但 ≥ 输出(11 字)的 50% ⇒ 触发
-        let ctx = "甲公司乙公司丙公司丁公司戊公司";
-        let out = "甲公司乙公司丙公司结果";
-        let (l, a) = ctx_echo_action(&normalize_ctx_probe(out), &normalize_ctx_probe(ctx));
-        assert!(l < CTX_ECHO_LCS_ABS, "LCS {l} 应 <20");
-        let out_len = normalize_ctx_probe(out).chars().count() as f64;
-        assert!(l as f64 >= CTX_ECHO_LCS_RATIO * out_len, "应命中 50% 判据");
-        assert_eq!(a, CtxEchoAction::Redecode);
-    }
-
-    #[test]
-    fn ctx320_constants_and_gate() {
-        // MIGRATE-QWEN3-320：env 全删 ⇒ 值即常量。
-        assert_eq!(CTX_DEFAULT_CHARS, 500, "上下文上限常量 500");
-        // 门控：有内容即注入（恒开）
-        assert!(should_inject_ctx(Some("x")));
-        assert!(!should_inject_ctx(None), "无内容 ⇒ 不注入");
+    fn fix377_terms_echo_still_hits_new_format() {
+        let terms = "你好,铭印,银线,朵洛莉丝,费曼学习法,子未穿害,低质,罗斯柴尔德,维生素b12";
+        let sys = build_ctx_system(Some(terms)).expect("注入串");
+        // 模型把注入串逐字吐回（新格式下即裸词表）⇒ 必须命中并剥空
+        let hit = strip_terms_echo(&sys, build_ctx_system(Some(terms)).as_deref())
+            .expect("新格式下仍须命中");
+        assert_eq!(hit.matched_terms, 9);
+        assert_eq!(hit.stripped, "");
+        // 真实转写 + 尾部裸词表 ⇒ 只剥尾部
+        let text = format!("可以看看周边的风景。{sys}");
+        let hit2 = strip_terms_echo(&text, Some(terms)).expect("尾部裸词表应命中");
+        assert_eq!(hit2.stripped, "可以看看周边的风景。");
     }
 
     #[test]
@@ -3744,15 +3624,8 @@ mod poc_qwen3_17b_351 {
         let mut total = 0.0f64;
         let mut peak = load_priv_mb;
         for (i, (a, b)) in slices.iter().enumerate() {
-            let current = if acc.is_empty() {
-                None
-            } else {
-                Some(acc.as_str())
-            };
+            // 377：注入已无「本次已完成片」通道（`CtxInject` 只剩词表）⇒ 不再构造 current。
             let inject = CtxInject {
-                prev_older: None,
-                prev_latest: None,
-                current,
                 terms: Some(FIT_WORDLIST),
                 avg_chars_per_sec: None,
             };
@@ -4111,9 +3984,6 @@ mod poc_qwen3_17b_351 {
         // S2：生产注入路径（transcribe_acc_ctx，恒发 CLEANUP_INSTR_EN）
         println!("POC355 === S2 {tag} 生产注入路径（有注入）===");
         let inject = CtxInject {
-            prev_older: None,
-            prev_latest: None,
-            current: None,
             terms: None,
             avg_chars_per_sec: None,
         };
@@ -4362,6 +4232,11 @@ mod poc_qwen3_17b_351 {
         out
     }
 
+    // 377 起生产已删除，PoC 内保留原文（仅用于复现历史对照）
+    const CLEANUP_INSTR_EN_377: &str =
+        "Transcribe cleanly: drop stutters, repeated words, and filler words.";
+    const CTX_INSTR_EN_377: &str = "The following is the preceding context of this recording. Use it to keep terminology and wording consistent.";
+
     #[test]
     #[ignore = "PoC: cargo test --bin feiyin-ime -- --ignored --nocapture poc_376_language_separator"]
     fn poc_376_language_separator() {
@@ -4379,7 +4254,14 @@ mod poc_qwen3_17b_351 {
         let terms =
             "你好,铭印,银线,朵洛莉丝,费曼学习法,子未穿害,低质,罗斯柴尔德,维生素b12,三五成群,\
 主控,派安盈,隋变,摄氏度,艾丁湖,风无心,文案,漫剧,采编";
-        let full = super::build_ctx_system(Some(context), Some(terms)).expect("system");
+        // FIX-INJECT-TO-SPEC-377 起生产注入已删掉指令句/Context（`build_ctx_system` 只剩纯词表）⇒
+        // PoC 内**保留历史原文**，以便继续复现「旧 FULL 形态」的对照。
+        let full = format!(
+            "{CLEANUP_INSTR_EN_377}
+{CTX_INSTR_EN_377}
+Context: {context}
+Terms: {terms}"
+        );
         // TERMS_PLUS_CTX：**去掉两句英文指令**，保留同样的标签与顺序
         // ⇒ 与 FULL 的差 = 指令句的贡献；与 TERMS_ONLY 的差 = 散文 Context 的贡献。
         let terms_plus_ctx = format!(
@@ -5915,22 +5797,16 @@ mod path_b_budget_364_tests {
     /// 之所以 180s 仍不降级、300s 降级，是这条闸门自身的性质（与是否接线无关）。
     #[test]
     fn budget_180s_ok_but_300s_degrades() {
-        assert!(path_b_budget_ok(16_000 * 180, None, None), "180s 裸音频");
+        assert!(path_b_budget_ok(16_000 * 180, None), "180s 裸音频");
         assert!(
-            path_b_budget_ok(
-                16_000 * 180,
-                None,
-                Some("哈兰德,挪威,世界杯,巴西,英格兰,迈阿密")
-            ),
+            path_b_budget_ok(16_000 * 180, Some("哈兰德,挪威,世界杯,巴西,英格兰,迈阿密")),
             "180s + 典型词库"
         );
-        // 带跨录音上下文（最多 CTX_DEFAULT_CHARS=500 字）
-        let ctx = "上一轮我讲了很多关于这个项目的内容".repeat(20);
-        assert!(path_b_budget_ok(16_000 * 180, Some(&ctx), Some("哈兰德")));
+        assert!(path_b_budget_ok(16_000 * 180, Some("哈兰德")));
         // 300s（新 MAX_RECORD_SECONDS）：3900 audio token ⇒ 超 4096 ⇒ 降级切片拼装。
         assert_eq!(expected_audio_tokens(16_000 * 300), 3900, "300s 应 3900");
         assert!(
-            !path_b_budget_ok(16_000 * 300, None, None),
+            !path_b_budget_ok(16_000 * 300, None),
             "300s 裸音频已超 4096 ⇒ 必须降级（这正是 370 把整段解码摘掉的原因）"
         );
     }
@@ -5938,9 +5814,9 @@ mod path_b_budget_364_tests {
     /// 超长 / 巨词库 ⇒ 仍会降级（闸门逻辑必须保留，防未来改上限/大词库）。
     #[test]
     fn still_degrades_when_truly_over() {
-        assert!(!path_b_budget_ok(16_000 * 600, None, None), "600s 应超预算");
+        assert!(!path_b_budget_ok(16_000 * 600, None), "600s 应超预算");
         assert!(
-            !path_b_budget_ok(16_000 * 180, None, Some(&"超长词库".repeat(2000))),
+            !path_b_budget_ok(16_000 * 180, Some(&"超长词库".repeat(2000))),
             "巨词库即使 180s 也应超"
         );
     }
@@ -5948,9 +5824,10 @@ mod path_b_budget_364_tests {
     /// 注入段计数：含提示词脚手架 ⇒ 恒 >0；词库越多越大。
     #[test]
     fn inject_tokens_positive_and_monotonic() {
-        let small = estimate_inject_tokens(None, None);
-        let big = estimate_inject_tokens(None, Some(&"词条".repeat(50)));
-        assert!(small > 0, "即使无上下文/词库，也含清理指令脚手架 ⇒ >0");
+        // FIX-INJECT-TO-SPEC-377：注入内容**只剩纯词表** ⇒ 空词表 = 零 token（不调 set_option）。
+        let small = estimate_inject_tokens(None);
+        let big = estimate_inject_tokens(Some(&"词条".repeat(50)));
+        assert_eq!(small, 0, "空词表 ⇒ 不注入 ⇒ 0 token（377 新契约）");
         assert!(big > small, "词库越多注入越大");
     }
 }

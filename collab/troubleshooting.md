@@ -370,3 +370,52 @@ Gavin 的优先级是**丢字 P0、重复可容忍**，所以任何退化/兜底
 → ③ 编辑距离质量门（在候选区间内定切点，沿用现有）→ ④ 兜底偏**小** k。
 只有②挡不住 `k=53` 这类（提交 1 字、仍吃 17 字）；只有①只挡得住最极端那个。
 ②宁可放宽：把真值挡在外面（回落兜底 ⇒ 重复）比放进一个错值（⇒ 丢字）代价小。
+
+---
+
+## [PROMPT-SLOT-ABUSE-377] 把自由文本塞进专用模型的固定模板槽位
+
+**现象**（同一病根的三个症状）：① 输出开头出现 `language chinese<asr_text>`；
+② 末尾整串吐出用户词库；③ 末尾吐出上一次录音文本的变形（「上一下文传路的」）。
+
+**判据**：输出里出现的内容**能在我们注入的 prompt 里逐字或近似找到** ⇒ 就是这一类。
+
+**根因**：Qwen3-ASR 是从 Qwen3-Omni 微调的**专用 ASR 模型**，模板固定三段
+（system 放偏置词 → user 放音频 → assistant 出「语种 + 正文」）。
+sherpa 的 `hotwords` 被**原样**塞进 `<|im_start|>system` 段，C++ 注释写死期望形态是
+**`"foo,bar,baz"` 这样的 ASCII 逗号分隔词表**。而我们塞了：两句英文指令 + `Context:` 整段中文散文
++ `Terms:` 标签 + 词表 —— **四样里只有词表合规**。
+LLM 的输出本质是 prompt 的续写 ⇒ 超规格的自由文本会被当成「要输出的内容」。
+
+**POC-376 实证**：英文指令句与 `Context:` 散文**各自独立**都能被吐出来
+（ja·不设 language ⇒ 吐 68 字英文指令句；ja·Auto ⇒ 吐 82 字 Context 散文，LCS 77/81）。
+设 `language`（含 `Auto`/空串）**不能**消除回显，只是换了回显的内容。
+
+🔴 **三条可复用的判据**：
+1. **接口同名 ≠ 语义相同**。`set_option("hotwords", …)` 在 CTC/transducer 上是**解码打分偏置**
+   （词条物理上出不来），在 Qwen3 上是**prompt 文本**（可以原样回来）。
+   换模型时，**同名接口的语义可能整个变了**，代码一行不改也会静默漂移。
+2. **专用模型不是 chat 模型**。往固定模板里塞自由指令，模型不会「遵守」，只会「转写」。
+   实证：模型把 `Transcribe cleanly: drop stutters...` 这句指令**原样吐了出来**。
+3. **研究结论里带「必须/不得」的判据，落地时只能放宽不能收紧**（见 `[QWEN3-PREFIX-LEAK-371]`）。
+
+**修法（377）**：注入内容砍成**纯 ASCII 逗号分隔词表**；词表为空 ⇒ 不调 `set_option`
+（等同官方示例的「无 system 段」）。`language` **保持不设**——官方 `language=None` 即自动语种判别，
+其评测原文「none of the tests specified a language parameter」。
+
+---
+
+## [DEAD-FEATURE-CLEANUP-INSTR] 加提示词前先问「管线上是不是已经有人在干这事」
+
+`CLEANUP_INSTR_EN`（"Transcribe cleanly: drop stutters, repeated words, and filler words."）
+由 `7cc7cea`（2026-09-21）**夹带**在一个护栏修复单里加入（commit 标题第三项「输出清理指令恒发」），
+**无单独立单、无 A/B 实证** —— 违反 Gavin 既定的「提示词是独立模块，禁夹带顺手改」。
+
+**它是三重多余**：
+1. **模型根本没执行**（POC-376：模型把这句话原样吐了出来 ⇒ 当成转写内容而非指令）；
+2. **管线上早有专门节点**：`apply_filler_strip`（`main.rs`，`enabled = !llm_handled`，
+   调 `text_normalizer::strip_fillers_conservative`）+ LLM 路径的 **F1 Filler Removal**，两条互补全覆盖；
+3. **白占 KV 预算**（指令句 + 标签约 55 token）。
+
+🔴 **教训**：加提示词之前必须回答「**现有管线上是不是已经有节点在干这件事**」。
+单独立单会被迫回答这个问题；夹带进别的单子就不会 —— 这正是「禁夹带」规矩要防的。

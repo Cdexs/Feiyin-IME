@@ -8,6 +8,27 @@
 
 ## 0 · 先读这份，再读那两份
 
+### 0.5 · FIX-INJECT-TO-SPEC-377 注入按 sherpa 规格化（`hotwords` 只放纯词表）（2026-09-23）
+
+- **文件域**：`src/transcription/mod.rs`（**平台中立**）+ `src/main.rs`（Windows 侧接线）+ `src/audio/mod.rs`（PoC 构造点）。
+- 🔴 **编译影响（必须同步）**：`CtxInject` **删掉 3 个字段** `prev_older` / `prev_latest` / `current`
+  ⇒ 现只剩 `{ terms, avg_chars_per_sec }`。macOS 侧任何构造 `CtxInject` 的地方**必须删掉这三个字段**。
+  另外 `estimate_inject_tokens(terms)` 与 `path_b_budget_ok(num_samples, terms)` **去掉了 `context` 参数**。
+- **行为变更（核心）**：`build_ctx_system(terms) -> Option<String>` 现在**只产出纯 ASCII 逗号分隔词表**
+  （与输入词表逐字相同、无换行/无标签）；**空词表 ⇒ `None` ⇒ 不调 `set_option("hotwords", …)`**。
+  删除了：`CLEANUP_INSTR_EN`（英文清理指令）、`CTX_INSTR_EN`、`Context:` 段（跨录音上下文时间线）、
+  `Terms:` 标签。依据：sherpa C++ 把 hotwords 原样塞进 `<|im_start|>system` 段、注释写明期望 `"foo,bar,baz"`；
+  官方 `transcribe()` 无上下文参数、对话只有一个 user 轮。POC-376 实证「英文指令句」与「Context 散文」
+  **各自独立**都会被模型当输出续写（ja·不设 language ⇒ 吐 68 字指令句；ja·Auto ⇒ 吐 82 字散文）。
+- **连带删除**：`merge_ctx_timeline` / `last_n_chars` / `CTX_DEFAULT_CHARS` 及对应旧单测。
+- **保留（未删，带 `#[allow(dead_code)]`）**：`ctx_echo_action` / `normalize_ctx_probe` / `CtxEchoAction` /
+  `CTX_ECHO_LCS_ABS` / `CTX_ECHO_LCS_RATIO` —— ctx 注入既已删除，它们**恒不触发**；保留是为「回退能力」，
+  是否连根删由主控裁定（见 Windows 侧 result.md 的评估）。
+- **`ctx_prev1`/`ctx_prev2` 跨录音缓存**：✅ **已连根删**（声明 + 轮换赋值，`main.rs` 内部状态）。
+  🔴 **已评估：对另一端无影响** —— 该缓存只在 Windows 侧 `main.rs` 的录音循环内自轮换、无消费者，
+  未触及任何平台中立模块的接口。
+- **未动**：374 的 `strip_terms_echo` / `apply_acc_disposition` / `output_rate_ok` / `reflow_seq`（兜底网）。
+
 ### 0.4 · FIX-TERMS-ECHO-374 + FIX-PREVIEW-STALE-AND-COLLAPSE-375 词条回显剥离/解码坍塌/预览回灌过期（2026-09-22）
 
 - **文件域**：`src/transcription/mod.rs`（**平台中立**，macOS 编译同一份）+ `src/main.rs`（Windows 侧接线）

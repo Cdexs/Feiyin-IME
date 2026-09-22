@@ -2480,9 +2480,6 @@ mod tests {
             crate::config::ChineseScript::Simplified,
             0,
             crate::transcription::CtxInject {
-                prev_older: None,
-                prev_latest: None,
-                current: None,
                 terms: None,
                 avg_chars_per_sec: None,
             },

@@ -7681,11 +7681,6 @@ fn spawn_worker_thread(
                 None
             };
 
-        // LOCALRT-CTX-INJECT-320-A：跨录音轮换的上上次/上一次转写（内存态，进程重启即空，不落盘）。
-        // 每次录音**成功产出最终文本**时轮换：prev2 = prev1; prev1 = final；取消/无语音/出错一律不动。
-        let mut ctx_prev2: Option<String> = None;
-        let mut ctx_prev1: Option<String> = None;
-
         loop {
             let cmd = match worker_rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(cmd) => Some(cmd),
@@ -8226,9 +8221,6 @@ fn spawn_worker_thread(
                                 // LOCALRT-CTX-INJECT-320：词库词条随 per-stream 注入
                                 // （读 DB + 按引擎预算裁剪，每段录音一次，毫秒级）。
                                 let acc_terms = load_hotwords_for_accuracy(&config);
-                                // LOCALRT-CTX-INJECT-320-A：捕获跨录音轮换值（克隆进 worker）。
-                                let ctx_prev2_snapshot = ctx_prev2.clone();
-                                let ctx_prev1_snapshot = ctx_prev1.clone();
                                 Some(scope.spawn(move || {
                                         let recognizer = send_offline.into_inner();
                                         // ── SLIDING-WINDOW-367：滑动窗口（当前片+前1~3，12s 封顶）──
@@ -8252,9 +8244,6 @@ fn spawn_worker_thread(
                                         let mut reflow_seq: usize = 0;
                                         let mut ordered = transcription::OrderedReflow::new();
                                         let concurrency = transcription::WINDOW_DECODE_CONCURRENCY.max(1);
-                                        // 注入素材按引用捕获（Option<&str> 为 Copy，可 move 进多个池线程）。
-                                        let p2 = ctx_prev2_snapshot.as_deref();
-                                        let p1 = ctx_prev1_snapshot.as_deref();
                                         let terms = acc_terms.as_deref();
 
                                         std::thread::scope(move |pool| {
@@ -8281,8 +8270,6 @@ fn spawn_worker_thread(
                                                             &audio,
                                                             seq,
                                                             acc_script,
-                                                            p2,
-                                                            p1,
                                                             terms,
                                                             avg_snapshot,
                                                         );
@@ -8342,7 +8329,6 @@ fn spawn_worker_thread(
                                                 // 保留为**未来调大上限时的廉价不变量护栏**（撞顶是静默丢字，DEC-069）。
                                                 if !transcription::path_b_budget_ok(
                                                     window_audio.len(),
-                                                    p2,
                                                     terms,
                                                 ) {
                                                     log::warn!(
@@ -8351,9 +8337,7 @@ fn spawn_worker_thread(
                                                         transcription::expected_audio_tokens(
                                                             window_audio.len()
                                                         ),
-                                                        transcription::estimate_inject_tokens(
-                                                            p2, terms
-                                                        ),
+                                                        transcription::estimate_inject_tokens(terms),
                                                         transcription::PATH_B_MAX_TOTAL_LEN
                                                     );
                                                 }
@@ -8629,12 +8613,10 @@ fn spawn_worker_thread(
                                     let audio_tokens =
                                         transcription::expected_audio_tokens(pcm.len());
                                     let inject_tokens = transcription::estimate_inject_tokens(
-                                        ctx_prev2.as_deref(),
                                         path_b_terms.as_deref(),
                                     );
                                     if transcription::path_b_budget_ok(
                                         pcm.len(),
-                                        ctx_prev2.as_deref(),
                                         path_b_terms.as_deref(),
                                     ) {
                                         match transcriber
@@ -8642,14 +8624,10 @@ fn spawn_worker_thread(
                                             .and_then(|t| t.offline_recognizer())
                                         {
                                             Some(rec) => {
-                                                // 🔴 与路A 同款注入：**跨录音**上下文（前两次录音，320）
-                                                // + 词库。全量解**不带 current**（本次录音全在音频里、
-                                                // 无需前文文字），但**必须**带 prev_older/prev_latest
-                                                // —— 上次说的话不在本次音频里，全量解自己拿不到。
+                                                // FIX-INJECT-TO-SPEC-377：注入只剩**纯词表**（上下文段已按
+                                                // sherpa 规格移除，见 `build_ctx_system`）。本块（366 起摘接线）
+                                                // 保留为可回挂路径，但不再传任何前文。
                                                 let inject = transcription::CtxInject {
-                                                    prev_older: ctx_prev2.as_deref(),
-                                                    prev_latest: ctx_prev1.as_deref(),
-                                                    current: None,
                                                     terms: path_b_terms.as_deref(),
                                                     // 路B（367 起已摘接线）：无滑窗产出率均值 ⇒ 不判坍塌
                                                     avg_chars_per_sec: None,
@@ -8850,11 +8828,6 @@ fn spawn_worker_thread(
                             pretranscribed, // PARALLEL-ACC-298: 并行 accuracy 结果（关时 None ⇒ 原有 accuracy 2pass）
                             i18n::get(config.ui_language).overlay_processing,
                         );
-                        // 320-A：本次录音成功产出转写文本 ⇒ 轮换跨录音缓存（取消/无语音/出错不动）。
-                        if !acc_joined.trim().is_empty() && !cancel_signal.load(Ordering::Acquire) {
-                            ctx_prev2 = ctx_prev1.take();
-                            ctx_prev1 = Some(acc_joined.clone());
-                        }
                         continue;
                     }
 
@@ -9824,8 +9797,6 @@ fn decode_window(
     window_audio: &[f32],
     window_seq: usize,
     script: config::ChineseScript,
-    prev_older: Option<&str>,
-    prev_latest: Option<&str>,
     terms: Option<&str>,
     // FIX-PREVIEW-STALE-AND-COLLAPSE-375（B）：本次录音已定稿窗口的产出率均值快照（冷启动 None）。
     avg_chars_per_sec: Option<f32>,
@@ -9836,9 +9807,6 @@ fn decode_window(
         script,
         window_seq,
         transcription::CtxInject {
-            prev_older,
-            prev_latest,
-            current: None,
             terms,
             avg_chars_per_sec,
         },
