@@ -1126,3 +1126,15 @@ load_wordbook_vocabulary()
 - 主控 22 条清单逐条 Read 代码验收（`collab/acceptance-371.md`）：首轮 20 过 → B3 容差改判不对称、C3 补跨端文档 → 复验全过。
 - **下一步**：阶段三 TEST-SYNC → 阶段四 TEST-EXEC → **出包须先问 Gavin**（DEC-079）。BUILD-349 已作废。
 - **待观察**：`FORCED-ALIGN-372`（小模型精确对齐设想，未立项，等端测结果决定）。
+
+
+## BUILD-373（阶段五 · 出包）· 2026-09-22 · 替换作废的 BUILD-349
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | `7398459` FIX-PREFIX-AND-EAT-371（P0×2：语种前缀漏出 + 重复句吃字）+ `77185aa` TEST-SYNC-371（阶段三 23 条）+ `dff4fad` TEST-EXEC-371（阶段四全绿）。版本 0.9.3 |
+| 回归 | 阶段四已全绿（引用）：root **1511P/0F/30I**（bin 1423P/28I）+ src-tauri **92P** + Vitest **100P/11S/0F**；fmt EXIT 0；warnings **98/88/17** = 基线 |
+| 出包 | `BUILD-373` 八项核验逐项 PASS；产物 `feiyin-ime` 14.74MB `3453c6006186…`（23:28:17）/ `feiyin-ime-ui` 10.05MB `dd7b6e4866d7…`（23:25:12）/ `crash-reporter` 24.88MB `29a36303bd4f…`（23:26:19）；两副本全等、均异于作废的 BUILD-349 |
+| 三特殊点 | ① dll 四张三副本全等 + onnxruntime 1.28.2；② itn-rules 三副本全等；③ Publish/models 1.7B 与源逐一 sha256 全等（0.6B 保留） |
+| 探针 | 源码级正 6 符号均 ≥1；二进制级正 `SLIDING-WINDOW-367`=4 / `[LocalRT-DBG-298]`=3；🔴 反 `is_qwen3_language_label` / `PUNCT_REFRESH_INTERVAL` / `ACC_MIN_SEGMENT_MS_DEFAULT` / `min_seg_ms` / `sub-seg failed` 全 0 |
+| 端测 | 🔴 **Step1 强杀输入法 ⇒ 请重启后端测**；重点：吃字/重复字复测（>4 句含 8~10s 长句）+ 连录两次互不污染 + 长录音 300s |

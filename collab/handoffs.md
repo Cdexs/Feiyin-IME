@@ -6,6 +6,16 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-22 — tester-1 — BUILD-373 ✅ 出包（阶段五 · 替换作废的 BUILD-349；八项 + 三特殊点全 PASS）
+
+- **交付源码**：HEAD `dff4fad`，版本 0.9.3，工作区 clean。含 `7398459` FIX-PREFIX-AND-EAT-371（P0×2）+ `77185aa` TEST-SYNC-371 + `dff4fad` TEST-EXEC-371。阶段四已全绿（root 1511P/0F/30I / src-tauri 92P / Vitest 100P/11S / fmt EXIT 0 / warnings 98/88/17），**本单不重跑回归**。
+- **BUILD-373**：Step1 强杀进程残 0 → Step2 npm 718ms + Tauri 1m47s（17w）→ Step3 主程序 3m03s（**98w** + crash 9w）→ Step4 UI 同步 + 三 exe→Publish（dll/itn/models 仅核验）。产物 main `3453c6006186…`（14,744,064B/23:28:17）/ ui `dd7b6e4866d7…`（10,050,048B/23:25:12）/ crash `29a36303bd4f…`（24,879,104B/23:26:19）；两副本全等、三者均异于作废的 BUILD-349。
+- **八项逐项 PASS**：①时间戳 23:25–23:28 ②sha 两副本 + 异于上包 ③**0.9.3** ④冒烟 PID **26744 Responding=True** / 两处无新 crash.json / panic 0 / 残 0 ⑤config `da2be5da…` 三时点不变 + wordbook 不变 ⑥warnings **98/88/17** = 基线 ⑦探针 ⑧四表三副本全等。
+- **探针**：源码级正 `QWEN3_PREFIX_MAX_BYTES`/`align_overlap_with_prior`/`push_window`/`AlignPrior`/`ALIGN_EXPECTED_K_TOL_DOWN`/`UP` 均 ≥1；二进制级正 `SLIDING-WINDOW-367`=**4**/`[LocalRT-DBG-298]`=**3**；🔴 反 **`is_qwen3_language_label`=0**（371 旧闸已清）/`PUNCT_REFRESH_INTERVAL`=0/`ACC_MIN_SEGMENT_MS_DEFAULT`=0/`min_seg_ms`=0/`sub-seg failed`=0。
+- **三特殊点（仅核验）**：① dll 四张三副本全等 + `onnxruntime` **1.28.2**；② itn-rules 三副本 `60b227de…` 全等；③ `Publish/models/` 1.7B 七文件与源逐一 sha256 全等、**0.6B 保留**。
+- 🔴 **Step1 强杀了 Gavin 正在使用的输入法进程** ⇒ 已提醒**重启后端测**。
+- **红线**：未 push（需 Gavin 指示）/ 版本号未动 / 未改代码 / 未 `cargo clean` / 未动 models 源目录 / 零凭证。
+
 ## 2026-09-22 — tester-1 — TEST-EXEC-371 ✅ 阶段四全量回归（不出包；三套全绿，NEW 33/GONE 0）
 
 - **交付源码**：HEAD `77185aa`（`7398459` FIX-PREFIX-AND-EAT-371 + `77185aa` TEST-SYNC-371），工作区 clean。🔴 **未出包**（DEC-079，等 Gavin）、未 build release、未动 `Publish/`。
