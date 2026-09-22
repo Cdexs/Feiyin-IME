@@ -2968,4 +2968,77 @@ mod poc_qwen3_17b_351 {
         println!("POC351 ref  text={}", full_ref.replace('\n', " "));
         let _ = ws06_load;
     }
+
+    // ============================================================
+    // POC-QWEN3-1.7B-RETEST-353 · 按生产口径（含 ITN）重测 CER
+    //
+    // 生产链（local realtime accuracy，无 LLM / 无翻译分支，见 main.rs:10501/10582）：
+    //   raw_text → itn::normalize_numbers → normalize_text_for_language
+    //            → itn::normalize_unit_symbols_only
+    // 只读调用生产入口，不手搓规则、不改任何生产代码。
+    // 运行：cargo test --bin feiyin-ime -- --ignored --nocapture poc_353_itn_cer
+    // ============================================================
+    /// 生产完整后处理链（严格按 main.rs 顺序；`decode_accuracy_once` 里已先做过一次
+    /// `normalize_text_for_language`，此处按生产再补一次，幂等）。
+    fn production_itn(t: &str) -> String {
+        let main = crate::itn::normalize_numbers(t);
+        let norm =
+            crate::text_normalizer::normalize_text_for_language(&main, ChineseScript::Simplified);
+        crate::itn::normalize_unit_symbols_only(&norm)
+    }
+
+    #[test]
+    #[ignore = "PoC: cargo test --bin feiyin-ime -- --ignored --nocapture poc_353_itn_cer"]
+    fn poc_353_itn_cer() {
+        let root = manifest_dir();
+        let wav = root.join("collab/research/audio-real-gavin/processed/full.wav");
+        let wave =
+            sherpa_onnx::Wave::read(wav.to_str().expect("wav path utf8")).expect("read full.wav");
+        let rate = wave.sample_rate() as usize;
+        let samples = wave.samples().to_vec();
+        let slices = slice_fitness(&samples, rate);
+        let full_ref = ANSWERS.concat();
+
+        let rec06 = create_qwen3_recognizer(&root.join("models")).expect("create 0.6B recognizer");
+        let (t06, _, _) = run_model(&rec06, &slices, &samples, 0.0, "0.6B-353");
+        drop(rec06);
+        let dir17 = root.join("models/sherpa-onnx-qwen3-asr-1.7B-int8-2026-09-22");
+        let rec17 = create_qwen3_recognizer_at(&dir17).expect("create 1.7B recognizer");
+        let (t17raw, _, _) = run_model(&rec17, &slices, &samples, 0.0, "1.7B-353");
+        let t17 = t17raw
+            .split("<asr_text>")
+            .last()
+            .unwrap_or(&t17raw)
+            .to_string();
+
+        let p06 = production_itn(&t06);
+        let p17raw = production_itn(&t17raw);
+        let p17 = production_itn(&t17);
+
+        println!("POC353 === CER（裸 ASR 口径 vs 生产口径含 ITN）===");
+        println!("POC353 0.6B raw       cer={:.4}", cer(&t06, &full_ref));
+        println!("POC353 0.6B prod(ITN) cer={:.4}", cer(&p06, &full_ref));
+        println!("POC353 1.7B raw       cer={:.4}", cer(&t17raw, &full_ref));
+        println!(
+            "POC353 1.7B prod(ITN) cer={:.4}  (含泄漏前缀)",
+            cer(&p17raw, &full_ref)
+        );
+        println!("POC353 1.7B prod+前缀已剥 cer={:.4}", cer(&p17, &full_ref));
+        println!("POC353 0.6B prod_text={}", p06.replace('\n', " "));
+        println!("POC353 1.7B prod_text={}", p17raw.replace('\n', " "));
+        println!("POC353 1.7B prod+剥prefix text={}", p17.replace('\n', " "));
+
+        println!("POC353 === ITN「比」/分数 探针 ===");
+        for s in [
+            "二比一",
+            "八分之一决赛",
+            "2比1",
+            "三分之一",
+            "二比一爆冷",
+            "五届",
+            "小组赛第二轮",
+        ] {
+            println!("POC353 probe {:?} -> {:?}", s, production_itn(s));
+        }
+    }
 }
