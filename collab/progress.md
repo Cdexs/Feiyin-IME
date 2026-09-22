@@ -1138,3 +1138,14 @@ load_wordbook_vocabulary()
 | 三特殊点 | ① dll 四张三副本全等 + onnxruntime 1.28.2；② itn-rules 三副本全等；③ Publish/models 1.7B 与源逐一 sha256 全等（0.6B 保留） |
 | 探针 | 源码级正 6 符号均 ≥1；二进制级正 `SLIDING-WINDOW-367`=4 / `[LocalRT-DBG-298]`=3；🔴 反 `is_qwen3_language_label` / `PUNCT_REFRESH_INTERVAL` / `ACC_MIN_SEGMENT_MS_DEFAULT` / `min_seg_ms` / `sub-seg failed` 全 0 |
 | 端测 | 🔴 **Step1 强杀输入法 ⇒ 请重启后端测**；重点：吃字/重复字复测（>4 句含 8~10s 长句）+ 连录两次互不污染 + 长录音 300s |
+
+## 2026-09-23 · 374/375 兜底网交付 + 376 PoC 证伪 language 方向
+
+- 374/375 三条修复已验收提交（词条回显剥离 / 预览 stale 修复 / 解码坍塌重解）。
+- 🔴 **POC-376 证伪主控的 language 推理**：设 `language` 不消回显，只换回显内容。
+  官方资料证实 `language=None` 是主用法、前缀是官方输出格式、官方接口无上下文参数、
+  sherpa hotwords 期望纯词表而我们塞了指令句+散文。
+- 🔴 **新发现的空白**：换 Qwen3 后「词库偏置」是否仍有效**从未验证**（机制已从解码打分偏置
+  变为塞 prompt 文本）。PoC 无法回答（音频里没有词表专名的发音点）。
+- **待 Gavin 定**：是否先做词库有效性验证（需他录含词库专名的语音）。
+  无效 ⇒ 直接不注入，回显从源头消失并省算力/KV。

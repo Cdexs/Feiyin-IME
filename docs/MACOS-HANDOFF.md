@@ -8,6 +8,40 @@
 
 ## 0 · 先读这份，再读那两份
 
+### 0.4 · FIX-TERMS-ECHO-374 + FIX-PREVIEW-STALE-AND-COLLAPSE-375 词条回显剥离/解码坍塌/预览回灌过期（2026-09-22）
+
+- **文件域**：`src/transcription/mod.rs`（**平台中立**，macOS 编译同一份）+ `src/main.rs`（Windows 侧接线）
+  + `src/audio/mod.rs`（仅 PoC 构造点补字段）。
+- 🔴 **编译影响（必须同步）**：`CtxInject` **新增字段** `avg_chars_per_sec: Option<f32>`
+  （本次录音已定稿窗口的产出率均值，用于识别解码坍塌；`None` = 冷启动不判）。
+  macOS 侧若有构造 `CtxInject` 的代码，**必须补该字段**（否则编译失败）。`src/audio/mod.rs` 的
+  PoC 构造点已补 `None`。
+
+- **① 词条回显剥离（374，行为新增，平台中立）**：`strip_terms_echo(text, terms)`
+  - 判据是**结构性**的：输出里出现「**连续 ≥4 个注入词条且顺序与注入一致**」才算回显（`TERMS_ECHO_MIN_RUN=4`）；
+    用户自然说到 1~2 个词库词**不剥**。
+  - 🔴 明确**不把 Terms 段放回 LCS 比对面**（那是 43% 误判的来源）。
+  - 剥离只删「首个命中词条 → 末个命中词条」之间的原文字符 + 接缝列表分隔符（不动 `。！？`）。
+  - 打点：`[LocalRT-DBG-374] terms echo stripped: ...`。
+
+- **② 统一处置阶梯（374 + 375 合并，平台中立）**：`apply_acc_disposition(text, terms, audio_secs, avg, redecode)`
+  - 触发重解的两条路径：**剥完为空**（374）/ **产出率坍塌**（375，`output_rate_ok`：
+    本窗字/秒 < 本次录音已接受窗口均值 × 1/3，冷启动与期望产出 <8 字不判）；
+  - 重解**不带注入、至多一次**；重解结果验收：375 坍塌路径须再过产出率，374 路径非空即用
+    （避免「用户真只说了两个词」被误丢）；
+  - 重解空/仍坍塌 ⇒ **空串**（滑窗 `push_inner` 的空解码分支：只推进 next、不污染窗口）。
+  - 打点：`[LocalRT-DBG-375] collapse: seq=… audio=… out=… rate=… avg=… action=keep|redecode|empty`
+
+- **③ 预览回灌「过期」判据换键（375-A，**Windows 专用**）**：`PipelineEvent::PreviewReflow` 新增
+  `reflow_seq: Option<usize>`；`replace_all=true` 的过期判据改用 `reflow_seq`（滑窗快照自有单调序号），
+  **不再用 `seg_index`**（= 切片下标，窗口并发下会重复 ⇒ 会把后到的完整文本误杀成 stale ⇒ 预览永不刷新）。
+  `replace_all=false`（老逐片路径）仍用 `seg_index`，行为逐位不变。
+  - **macOS 影响**：`PreviewReflow` 的事件臂在 macOS 走 `{ .. }` 通配（不渲染本地档预览）⇒ 只需
+    **编译期**跟着补字段（若 macOS 侧也构造该事件）；语义上 macOS 不受影响。
+
+- **④ 未动**：`merge_ctx_timeline`（跨录音上下文是否砍待 Gavin 拍板）、371 的四层对齐判据、
+  368/369 合并分支、`ctx_echo_action` 的 LCS 护栏（`ctx` 为空时仍整块跳过）。
+
 ### 0.3 · FIX-PREFIX-AND-EAT-371 语种前缀剥离规则变更 + 滑窗对齐接口新增（2026-09-22）
 
 - **文件域**：`src/transcription/mod.rs`（**平台中立模块**，macOS 侧编译同一份代码）+ `src/main.rs`（Windows 侧滑窗接线）。

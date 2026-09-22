@@ -160,6 +160,11 @@ enum PipelineEvent {
     PreviewReflow {
         generation: u64,
         seg_index: usize,
+        /// FIX-PREVIEW-STALE-AND-COLLAPSE-375（A）：**滑窗权威快照自有**的单调序号（仅
+        /// `replace_all=true` 时给；发送方 = 滑窗 acc worker 的递增计数器，与 `OrderedReflow`
+        /// 的快照顺序一致）。过期判据用它而非 `seg_index` —— 后者是切片下标，**会重复**（窗口间
+        /// 并发 + 收尾 drain 可让多窗撞同一下标）⇒ 会把后到的完整文本误判成 stale。
+        reflow_seq: Option<usize>,
         committed_len: usize,
         has_hole: bool,
         acc_text: String,
@@ -278,6 +283,11 @@ static STREAMING_GENERATION: AtomicU64 = AtomicU64::new(0);
 //   （防「编辑退出后迟到的回灌把用户刚打的字冲掉」）。
 #[cfg(target_os = "windows")]
 static ACC_REFLOW_LAST_SEG: AtomicI64 = AtomicI64::new(-1);
+/// FIX-PREVIEW-STALE-AND-COLLAPSE-375（A）：`replace_all=true` 路径**专用**的单调键 = 滑窗快照的
+/// `reflow_seq`（`seg_index` 在滑窗路径会重复，见事件字段注释）。两条路径各用一个计数器，
+/// 互不干扰 ⇒ 老逐片路径行为逐位不变。
+#[cfg(target_os = "windows")]
+static ACC_REFLOW_LAST_REFLOW_SEQ: AtomicI64 = AtomicI64::new(-1);
 #[cfg(target_os = "windows")]
 static ACC_REFLOW_EDIT_LATCH: AtomicBool = AtomicBool::new(false);
 // ACC-REFLOW-PERSIST-329：本代已确定的**权威前缀**状态 `(generation, acc_text, committed_len)`。
@@ -6815,6 +6825,8 @@ fn process_controller_events(
                 STREAMING_STOPPED.store(false, Ordering::Release);
                 // 325：回灌状态按代重置（新代重新开始回灌、编辑闩锁解除）。
                 ACC_REFLOW_LAST_SEG.store(-1, Ordering::Release);
+                // 375-A：滑窗路径的单调键计数器同样按代重置。
+                ACC_REFLOW_LAST_REFLOW_SEQ.store(-1, Ordering::Release);
                 ACC_REFLOW_EDIT_LATCH.store(false, Ordering::Release);
                 // 329（边界 3）：权威前缀状态 per-gen，随录音开始清空，旧代残留不得污染新录音。
                 if let Ok(mut st) = ACC_REFLOW_STATE.lock() {
@@ -6938,6 +6950,7 @@ fn process_controller_events(
             PipelineEvent::PreviewReflow {
                 generation,
                 seg_index,
+                reflow_seq,
                 committed_len,
                 has_hole,
                 acc_text,
@@ -6961,12 +6974,20 @@ fn process_controller_events(
                 let editing = OVERLAY_EDITING.load(Ordering::Acquire);
                 let cancelled = cancel_signal.load(Ordering::Acquire);
                 let stop_state = reflow_stop_state(cancelled, editing);
-                let last_seg = ACC_REFLOW_LAST_SEG.load(Ordering::Acquire);
+                // 375-A：过期判据的单调键按路径选 —— `replace_all=true`（滑窗权威全文）用
+                // `reflow_seq`（快照自有序号，严格递增）；`replace_all=false` 仍用 `seg_index`
+                // （逐片严格递增）⇒ 老路径行为逐位不变。
+                let key = reflow_monotonic_key(replace_all, seg_index, reflow_seq);
+                let last_key = if replace_all {
+                    ACC_REFLOW_LAST_REFLOW_SEQ.load(Ordering::Acquire)
+                } else {
+                    ACC_REFLOW_LAST_SEG.load(Ordering::Acquire)
+                };
                 let action = reflow_action(
                     edit_latched,
                     stop_state,
-                    seg_index,
-                    last_seg,
+                    key,
+                    last_key,
                     has_hole,
                     acc_text.is_empty(),
                 );
@@ -6975,7 +6996,11 @@ fn process_controller_events(
                 if action == ReflowAction::Applied {
                     // LOCALRT-SEAM-337：本片**登记 acc 文本**，等边界事件配对后再渲染
                     // （边界由 local_stream 的自适应定界 a/b/c 冻结，自适应、无固定 L）。
-                    ACC_REFLOW_LAST_SEG.store(seg_index as i64, Ordering::Release);
+                    if replace_all {
+                        ACC_REFLOW_LAST_REFLOW_SEQ.store(key, Ordering::Release);
+                    } else {
+                        ACC_REFLOW_LAST_SEG.store(key, Ordering::Release);
+                    }
                     if let Ok(mut slot) = ACC_REFLOW_ACC.lock() {
                         *slot = Some((generation, seg_index, acc_text.clone(), replace_all));
                     }
@@ -8221,6 +8246,10 @@ fn spawn_worker_thread(
                                         // —— 与切片区间一起算期望重叠比例，约束 reflow 的对齐 k。
                                         let mut window_samples: Vec<Vec<usize>> = Vec::new();
                                         let mut window_seq: usize = 0;
+                                        // FIX-PREVIEW-STALE-AND-COLLAPSE-375（A）：滑窗权威快照的**自有单调序号**
+                                        // —— `dispatch_idx`（切片下标）在窗口间并发 + 收尾 drain 下**会重复**，
+                                        // 不能拿它当「过期」判据（会把后到的完整文本误杀成 stale，预览永不更新）。
+                                        let mut reflow_seq: usize = 0;
                                         let mut ordered = transcription::OrderedReflow::new();
                                         let concurrency = transcription::WINDOW_DECODE_CONCURRENCY.max(1);
                                         // 注入素材按引用捕获（Option<&str> 为 Copy，可 move 进多个池线程）。
@@ -8240,11 +8269,12 @@ fn spawn_worker_thread(
                                                     usize,
                                                     usize,
                                                     Vec<f32>,
+                                                    Option<f32>,
                                                 )>();
                                                 task_txs.push(ttx);
                                                 let rtx = res_tx.clone();
                                                 pool.spawn(move || {
-                                                    for (seq, dispatch_idx, audio) in trx {
+                                                        for (seq, dispatch_idx, audio, avg_snapshot) in trx {
                                                         let t0 = std::time::Instant::now();
                                                         let r = decode_window(
                                                             recognizer,
@@ -8254,6 +8284,7 @@ fn spawn_worker_thread(
                                                             p2,
                                                             p1,
                                                             terms,
+                                                            avg_snapshot,
                                                         );
                                                         let ms =
                                                             t0.elapsed().as_secs_f64() * 1000.0;
@@ -8263,6 +8294,12 @@ fn spawn_worker_thread(
                                             }
                                             drop(res_tx);
                                             let mut rr: usize = 0;
+                                            // FIX-PREVIEW-STALE-AND-COLLAPSE-375（B）：本次录音**已接受窗口**的
+                                            // 产出率累计（字 / 秒 / 窗数）⇒ 运行均值，用于识别「解码坍塌」。
+                                            // （放在投池作用域内：唯一读写者就是这个循环，不跨闭包捕获）
+                                            let mut rate_sum_chars: usize = 0;
+                                            let mut rate_sum_secs: f32 = 0.0;
+                                            let mut rate_windows: usize = 0;
 
                                             for (idx, _committed_len, sub_segs, _seg_streaming) in
                                                 acc_rx
@@ -8321,8 +8358,20 @@ fn spawn_worker_thread(
                                                     );
                                                 }
                                                 // 投池、**不等**（窗口2 不需等窗口1）；dispatch_idx 用于与 337 配对。
-                                                let _ = task_txs[rr % concurrency]
-                                                    .send((window_seq, idx, window_audio));
+                                                // FIX-PREVIEW-STALE-AND-COLLAPSE-375（B）：随载荷带上产出率均值快照
+                                                // （冷启动 ⇒ None ⇒ 该窗不判坍塌；重解在 worker 内进行，那里有音频）。
+                                                let avg_snapshot =
+                                                    transcription::acc_avg_chars_per_sec(
+                                                        rate_sum_chars,
+                                                        rate_sum_secs,
+                                                        rate_windows,
+                                                    );
+                                                let _ = task_txs[rr % concurrency].send((
+                                                    window_seq,
+                                                    idx,
+                                                    window_audio,
+                                                    avg_snapshot,
+                                                ));
                                                 window_spans
                                                     .push((window_start_slice, window_end_slice));
                                                 // FIX-PREFIX-AND-EAT-371（B）：本窗各片样本数（与
@@ -8364,6 +8413,11 @@ fn spawn_worker_thread(
                                                         .get(seq)
                                                         .cloned()
                                                         .unwrap_or_default();
+                                                    // 375：本窗秒数（供产出率均值）+ 最终字数（计入判据）
+                                                    let win_secs =
+                                                        win_samples.iter().sum::<usize>() as f32
+                                                            / 16000.0;
+                                                    let text_chars = text.chars().count();
                                                     for authoritative in ordered.push_window(
                                                         seq,
                                                         win_ws,
@@ -8375,12 +8429,21 @@ fn spawn_worker_thread(
                                                             PipelineEvent::PreviewReflow {
                                                                 generation: session_generation,
                                                                 seg_index: dispatch_idx,
+                                                                reflow_seq: Some(reflow_seq),
                                                                 committed_len: 0,
                                                                 has_hole: false,
                                                                 acc_text: authoritative,
                                                                 replace_all: true,
                                                             },
                                                         );
+                                                        reflow_seq += 1;
+                                                    }
+                                                    // 375：只把「最终非空」的窗口计入均值
+                                                    // （坍塌→空的窗口不拖低均值；374 剥离后重解出的真内容照常计入）
+                                                    if text_chars > 0 {
+                                                        rate_sum_chars += text_chars;
+                                                        rate_sum_secs += win_secs;
+                                                        rate_windows += 1;
                                                     }
                                                 }
                                             }
@@ -8415,6 +8478,8 @@ fn spawn_worker_thread(
                                                 // 比例约束对齐 k（missing ⇒ 空表 ⇒ 退化小 k 优先）。
                                                 let win_samples =
                                                     window_samples.get(seq).cloned().unwrap_or_default();
+                                                // 🔴 收尾 drain 之后不再有派发 ⇒ 无需再累计产出率
+                                                //（375 的均值只服务于后续窗口的坍塌判据；这里的累计永远没人读）。
                                                 for authoritative in ordered.push_window(
                                                     seq,
                                                     win_ws,
@@ -8426,12 +8491,14 @@ fn spawn_worker_thread(
                                                         PipelineEvent::PreviewReflow {
                                                             generation: session_generation,
                                                             seg_index: dispatch_idx,
+                                                            reflow_seq: Some(reflow_seq),
                                                             committed_len: 0,
                                                             has_hole: false,
                                                             acc_text: authoritative,
                                                             replace_all: true,
                                                         },
                                                     );
+                                                    reflow_seq += 1;
                                                 }
                                                 done += 1;
                                             }
@@ -8584,6 +8651,8 @@ fn spawn_worker_thread(
                                                     prev_latest: ctx_prev1.as_deref(),
                                                     current: None,
                                                     terms: path_b_terms.as_deref(),
+                                                    // 路B（367 起已摘接线）：无滑窗产出率均值 ⇒ 不判坍塌
+                                                    avg_chars_per_sec: None,
                                                 };
                                                 match transcription::transcribe_acc_ctx(
                                                     rec,
@@ -9758,6 +9827,8 @@ fn decode_window(
     prev_older: Option<&str>,
     prev_latest: Option<&str>,
     terms: Option<&str>,
+    // FIX-PREVIEW-STALE-AND-COLLAPSE-375（B）：本次录音已定稿窗口的产出率均值快照（冷启动 None）。
+    avg_chars_per_sec: Option<f32>,
 ) -> anyhow::Result<(String, bool)> {
     transcription::transcribe_acc_ctx(
         recognizer,
@@ -9769,6 +9840,7 @@ fn decode_window(
             prev_latest,
             current: None,
             terms,
+            avg_chars_per_sec,
         },
     )
 }
@@ -10019,11 +10091,28 @@ enum ReflowAction {
     SkippedEmpty,
 }
 
+/// FIX-PREVIEW-STALE-AND-COLLAPSE-375（A）：回灌「过期」判据的**单调键**选择。
+///
+/// - `replace_all=true`（滑窗权威全文，语义 = 整段替换、每条取代前一条）⇒ 用**滑窗快照自有**的
+///   `reflow_seq`（严格递增）。🔴 **不得**用 `seg_index`：滑窗路径传的是切片下标，窗口间并发
+///   （`WINDOW_DECODE_CONCURRENCY=2`）+ 收尾 drain 会让多个窗口带**同一个下标** ⇒ 后到的那个
+///   （= `OrderedReflow` 合并后的完整文本）被误判 stale 丢掉 ⇒ 预览永远停在纯流式文本。
+/// - `replace_all=false`（老逐片路径）⇒ 仍用 `seg_index`（逐片严格递增），**行为逐位不变**。
+///
+/// `reflow_seq` 缺失（老发送方/异常）⇒ 退回 `seg_index`（保守：沿用旧行为，不至于整片不回灌）。
+fn reflow_monotonic_key(replace_all: bool, seg_index: usize, reflow_seq: Option<usize>) -> i64 {
+    if replace_all {
+        reflow_seq.unwrap_or(seg_index) as i64
+    } else {
+        seg_index as i64
+    }
+}
+
 fn reflow_action(
     edit_latched: bool,
     stop_state: ReflowStopState,
-    seg_index: usize,
-    last_applied_seg: i64,
+    key: i64,
+    last_applied_key: i64,
     has_hole: bool,
     acc_empty: bool,
 ) -> ReflowAction {
@@ -10033,7 +10122,7 @@ fn reflow_action(
     if stop_state == ReflowStopState::Cancelled {
         return ReflowAction::SkippedCancel;
     }
-    if (seg_index as i64) <= last_applied_seg {
+    if key <= last_applied_key {
         return ReflowAction::SkippedStale;
     }
     if has_hole {
@@ -10047,7 +10136,10 @@ fn reflow_action(
 
 #[cfg(test)]
 mod preview_reflow_325_tests {
-    use super::{reflow_action, reflow_preview, reflow_stop_state, ReflowAction, ReflowStopState};
+    use super::{
+        reflow_action, reflow_monotonic_key, reflow_preview, reflow_stop_state, ReflowAction,
+        ReflowStopState,
+    };
 
     /// 硬点 1 边界：committed_len 之前用 acc、之后保留流式尾巴。
     #[test]
@@ -10126,6 +10218,62 @@ mod preview_reflow_325_tests {
         assert_eq!(
             reflow_action(false, ReflowStopState::Released, 6, 5, false, false),
             ReflowAction::Applied
+        );
+    }
+
+    /// 🔴 FIX-PREVIEW-STALE-AND-COLLAPSE-375（A）：单调键选择 —— `replace_all=true` 必须用
+    /// **滑窗快照自有**的 `reflow_seq`，**不得**用 `seg_index`（后者在滑窗路径会重复）。
+    #[test]
+    fn reflow_monotonic_key_prefers_reflow_seq_for_replace_all() {
+        assert_eq!(
+            reflow_monotonic_key(true, 7, Some(0)),
+            0,
+            "replace_all ⇒ 用 reflow_seq（忽略切片下标）"
+        );
+        assert_eq!(reflow_monotonic_key(true, 7, Some(9)), 9);
+        assert_eq!(
+            reflow_monotonic_key(true, 7, None),
+            7,
+            "缺失 ⇒ 保守退回 seg_index（沿用旧行为，不至于整片不回灌）"
+        );
+        assert_eq!(
+            reflow_monotonic_key(false, 7, Some(0)),
+            7,
+            "老逐片路径行为逐位不变（仍用 seg_index）"
+        );
+    }
+
+    /// 🔴 375（A）核心：**同一 `dispatch_idx` 的两次 replace_all 都不得被判 stale**。
+    ///
+    /// 现场：`seg=0 acc_len=37 pending` → `seg=0 acc_len=45 skipped-stale`（完整文本被丢）。
+    /// 修法后两条事件的键是 **0、1**（滑窗自有计数器）⇒ 第二条按 Applied 通过。
+    #[test]
+    fn same_dispatch_idx_twice_not_stale_for_replace_all() {
+        let seg = 0usize; // 两窗撞同一切片下标
+        let key1 = reflow_monotonic_key(true, seg, Some(0));
+        let key2 = reflow_monotonic_key(true, seg, Some(1));
+        assert_eq!(
+            reflow_action(false, ReflowStopState::Released, key1, -1, false, false),
+            ReflowAction::Applied,
+            "第一条（37 字）应回灌"
+        );
+        assert_eq!(
+            reflow_action(false, ReflowStopState::Released, key2, key1, false, false),
+            ReflowAction::Applied,
+            "第二条（45 字完整文本）**不得**被判 stale（375-A 的 P0）"
+        );
+        // 对照：沿用旧行为（键=seg_index）⇒ 第二条必被误杀（复现现场日志）
+        assert_eq!(
+            reflow_action(
+                false,
+                ReflowStopState::Released,
+                seg as i64,
+                seg as i64,
+                false,
+                false
+            ),
+            ReflowAction::SkippedStale,
+            "旧键（切片下标）在同下标时会误杀 ⇒ 证明本修复必要"
         );
     }
 

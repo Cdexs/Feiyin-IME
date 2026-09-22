@@ -289,6 +289,10 @@ pub struct CtxInject<'a> {
     pub prev_latest: Option<&'a str>,
     pub current: Option<&'a str>,
     pub terms: Option<&'a str>,
+    /// FIX-PREVIEW-STALE-AND-COLLAPSE-375（B）：本次录音**已定稿窗口**的产出率均值（字/秒），
+    /// 用于识别「解码坍塌」（[`output_rate_ok`]）。`None` = 冷启动/样本不足 ⇒ 不判坍塌。
+    /// 由调用方（`main.rs` 滑窗 worker）在派发当刻算出快照传入。
+    pub avg_chars_per_sec: Option<f32>,
 }
 
 /// 按时间顺序合并三段为一条时间线（跳过空段）；返回 `(合并串, [上上次,上一次,本次] 各段字数)`。
@@ -369,6 +373,259 @@ fn ctx_echo_action(out_norm: &str, ctx_norm: &str) -> (usize, CtxEchoAction) {
 /// 是否注入：有可注入文本即注入（**恒开、无 env**；引擎固定 Qwen3）。
 fn should_inject_ctx(system: Option<&str>) -> bool {
     system.is_some()
+}
+
+// ============================================================
+// FIX-TERMS-ECHO-374 + FIX-PREVIEW-STALE-AND-COLLAPSE-375：**统一的处置阶梯**
+//   （374 词条回显剥离 与 375 产出率坍塌 共用一套，不各写一套）
+// ============================================================
+
+/// FIX-PREVIEW-STALE-AND-COLLAPSE-375（B）：产出率坍塌判据的**相对比例**。
+///
+/// 本窗「字/秒」< 本次录音已定稿窗口均值 × 该比例 ⇒ 判**解码坍塌**（不问原因：回显、幻觉、
+/// 截断都算）。取 **1/3** 的理由：正常窗口间的产字率波动来自语速（±30~50%）与短窗统计噪声，
+/// 1/3 给出足够裕量避免误杀「慢语速的正常窗」；而端测坍塌窗（8 字 / 10.4s ≈ 0.77 字/s
+/// vs 正常 ≈4.4 字/s）只有均值的 ~17% ⇒ 远低于 1/3 ⇒ 抓得住。
+pub(crate) const COLLAPSE_RATE_RATIO: f32 = 1.0 / 3.0;
+
+/// 期望产出低于此值（字）时**判据不成立**（一律视为正常）：字太少则相对比例无统计意义
+/// ⇒ 宁漏勿误杀（短尾窗、极短片）。
+pub(crate) const COLLAPSE_MIN_EXPECTED_CHARS: f32 = 8.0;
+
+/// 产出率均值至少由这么多个「已接受窗口」支撑才可用（否则视为冷启动、不判坍塌）。
+pub(crate) const COLLAPSE_MIN_AVG_WINDOWS: usize = 2;
+
+/// FIX-PREVIEW-STALE-AND-COLLAPSE-375（B）：本窗产出率是否**合理**（不坍塌）。
+///
+/// `真` ⇒ 正常/无法判定；`假` ⇒ 判为坍塌（调用方走重解阶梯）。
+/// 冷启动（`avg` 为 None / 非有限 / ≤0）、音频时长非正、期望产出 < [`COLLAPSE_MIN_EXPECTED_CHARS`]
+/// ⇒ 一律 `真`（**宁漏勿误杀**：判据缺输入时不得反过来把正常窗判坍塌）。
+pub(crate) fn output_rate_ok(
+    out_chars: usize,
+    audio_secs: f32,
+    avg_chars_per_sec: Option<f32>,
+) -> bool {
+    let Some(avg) = avg_chars_per_sec.filter(|a| a.is_finite() && *a > 0.0) else {
+        return true; // 冷启动：均值样本不足 ⇒ 不判
+    };
+    if !(audio_secs > 0.0) {
+        return true;
+    }
+    let expected = avg * audio_secs;
+    if expected < COLLAPSE_MIN_EXPECTED_CHARS {
+        return true; // 期望产出太少 ⇒ 判据不成立
+    }
+    (out_chars as f32) >= expected * COLLAPSE_RATE_RATIO
+}
+
+/// 产出率均值（字/秒）：由调用方累计的 `Σ已接受窗口字数` / `Σ窗口秒数` / `窗口数` 得。
+/// 窗口数不足 [`COLLAPSE_MIN_AVG_WINDOWS`] 或无有效秒数 ⇒ `None`（冷启动）。
+pub(crate) fn acc_avg_chars_per_sec(
+    sum_chars: usize,
+    sum_secs: f32,
+    windows: usize,
+) -> Option<f32> {
+    if windows < COLLAPSE_MIN_AVG_WINDOWS || !(sum_secs > 0.0) {
+        None
+    } else {
+        Some(sum_chars as f32 / sum_secs)
+    }
+}
+
+/// 统一处置阶梯的结果（供埋点：374 + 375）。
+pub(crate) struct AccDispositionOutcome {
+    /// 匹配到的**连续**注入词条数（0 = 无回显）。
+    pub matched_terms: usize,
+    /// 剥掉的字符数。
+    pub removed_chars: usize,
+    /// 剥掉回显段后的剩余字数。
+    pub remaining_chars: usize,
+    /// 是否触发了「不带注入重解一次」。
+    pub redecoded: bool,
+    /// 是否因**产出率坍塌**触发（375）—— 与 374 的「剥空触发」区分开，便于端测判断。
+    pub collapse: bool,
+}
+
+/// FIX-TERMS-ECHO-374 + 375（B）：**统一的处置阶梯**（一套实现，两个判据）。
+///
+/// 第一轮：词条回显**结构性**剥离（374）。
+/// 需要重解的两条路径（**至多一次、必须不带注入**）：
+/// - 374 阶梯 2：剥完**为空**（整窗都是回显）—— 端测现场该窗含 **10.45s 真实语音**，整窗丢弃不可接受；
+/// - 375：**产出率坍塌**（`matched == 0` 时判，见下）。
+///
+/// 重解结果校验：非空 **且** 产出率通过 ⇒ 用它；否则 ⇒ **空串**（上层 `push_inner` 的
+/// `text.is_empty()` 分支：只推进 `next`、不污染 `last_window_text`、不制造假重叠）。
+///
+/// 🔴 375 的坍塌判据**只在未发生词条回显时启用**（`matched == 0`）：一旦剥离过回显，产出率偏低
+///    已有已知解释（模型把预算花在背词条上）⇒ 不再叠加坍塌判据，避免多触发一次重解。
+/// 🔴 剥完**还有内容**且未判坍塌 ⇒ 直接用剩余文本、**不重解**（避免把低频事件变常态开销）。
+fn apply_acc_disposition(
+    text: String,
+    terms: Option<&str>,
+    audio_secs: f32,
+    avg_chars_per_sec: Option<f32>,
+    redecode: impl FnOnce() -> Result<String>,
+) -> (String, AccDispositionOutcome) {
+    // 第一轮：词条回显剥离（374）
+    let (stripped, matched_terms, removed_chars) = match strip_terms_echo(&text, terms) {
+        Some(h) => (h.stripped, h.matched_terms, h.removed_chars),
+        None => (text, 0usize, 0usize),
+    };
+    let remaining_chars = stripped.chars().count();
+    let mut outcome = AccDispositionOutcome {
+        matched_terms,
+        removed_chars,
+        remaining_chars,
+        redecoded: false,
+        collapse: false,
+    };
+    if matched_terms > 0 {
+        if remaining_chars > 0 {
+            return (stripped, outcome); // 374 阶梯 1：还有真内容 ⇒ 直接用
+        }
+        // 374 阶梯 2：整窗都是回显 ⇒ 落下去重解
+    } else if output_rate_ok(remaining_chars, audio_secs, avg_chars_per_sec) {
+        return (stripped, outcome); // 产出率正常 ⇒ 直接用
+    } else {
+        outcome.collapse = true; // 375：坍塌 ⇒ 落下去重解
+    }
+    // 公共：不带注入重解**一次**（带注入可能再次回显；不得循环）
+    outcome.redecoded = true;
+    let recovered = match redecode() {
+        Ok(t) => strip_terms_echo(&t, terms).map(|h| h.stripped).unwrap_or(t), // 防御性再剥
+        Err(_) => String::new(),
+    };
+    // 验收（按**触发者**取对应口径）：
+    // - 375 坍塌触发 ⇒ 必须**通过产出率判据**（任务书明文），否则按空处理；
+    // - 374 剥空触发 ⇒ **非空即用**（补充明文「重解结果非空 ⇒ 用它」）——不叠加产出率判据，
+    //   否则「用户真的只说了一两个短词 + 模型把预算花在背词条上」这种真实短转写会被误丢（丢字 P0）。
+    let acceptable = !recovered.is_empty()
+        && (!outcome.collapse
+            || output_rate_ok(recovered.chars().count(), audio_secs, avg_chars_per_sec));
+    if acceptable {
+        (recovered, outcome)
+    } else {
+        (String::new(), outcome) // 重解空 / 仍坍塌 ⇒ 按空解码处理
+    }
+}
+
+/// FIX-TERMS-ECHO-374：判定「输出**结构性**回显了注入的 `Terms:` 列表」所需的最小**连续**词条数。
+///
+/// 注入顺序 = `hit_count DESC, id DESC`（与口述内容无关）⇒ 用户要「**连续 N 个词条、且顺序与
+/// 注入完全一致**」地说出来，纯属巧合的概率极低：
+/// - N=3：3 个特定词（且都是词库里的高频词）按特定顺序连说 —— 仍可能偶然命中；
+/// - N=4：连说 4 个且顺序全中 ⇒ 自然口语实际不可能；而真实的「列表回显」长度是**整个词库**
+///   （端测实证：59 个词条 / 77 字）⇒ 提高 N **不会漏掉真实回显**。
+/// ⇒ 取 **4**：宁可漏掉「词库只有 2~3 条」时的短回显，也绝不误伤自然口语 —— 43% 误判的代价
+///   远大于 2~3 个词的漏网（且短词库回显危害极小）。
+const TERMS_ECHO_MIN_RUN: usize = 4;
+
+/// 列表分隔符（剥离接缝处要清掉的字符）：半/全角逗号、顿号、分号、冒号、空白。
+/// 🔴 **刻意不含** `。！？…` 等句末标点 —— 那些往往是**真实转写**的一部分（如「…的风景。」），
+///    清掉会把真句子也削掉。
+fn is_list_separator(c: char) -> bool {
+    c.is_whitespace() || matches!(c, ',' | '，' | '、' | ';' | '；' | ':' | '：')
+}
+
+/// FIX-TERMS-ECHO-374：命中「词库列表回显」时的剥离结果。
+struct TermsEchoHit {
+    /// 匹配到的**连续**词条数。
+    matched_terms: usize,
+    /// 剥掉的字符数（按原文本字符计）。
+    removed_chars: usize,
+    /// 剥离后的剩余文本（可能为空串 ⇒ 调用方按「空解码」处理）。
+    stripped: String,
+}
+
+/// FIX-TERMS-ECHO-374：**结构性**识别并剥掉「注入词库列表被逐字回显」的那一段。
+///
+/// 🔴 **判据是结构，不是「输出里有没有词条」**：注入的 Terms 是「已知词条、按已知顺序、用已知
+/// 分隔符连起来」⇒ 只有「**连续 N 个注入词条且顺序与注入一致**」才算回显（见
+/// [`TERMS_ECHO_MIN_RUN`]）；用户在句子里说到一两个词库词是**正常**的。
+/// 🔴 **绝不把 Terms 段放回 LCS 比对面** —— 那正是 2026-09-21 实测 43%（14 次触发 6 次重解）
+/// 误判的来源；本函数的判据与 LCS 无关，故**没有**那个误伤面 ⇒ 可以**恒执行**。
+///
+/// 🔴 与 `ctx` 是否为空**无关**：端测现场 `ctx_raw_len=0`（重启后第一次录音）时旧护栏整块被跳过，
+/// 词条照样回显（`seg=10 out_chars=77 terms_len=76`）⇒ 本步放在 ctx 护栏**之外**独立执行。
+///
+/// 处置 = **剥离**（不重解；重解要再等约 4s 且仍带注入、可能再次回显）：
+/// 只删「首个匹配词条 → 末个匹配词条」之间的原文字符，再清掉**接缝上的列表分隔符**
+/// （[`is_list_separator`]，不动句末标点）。剥空 ⇒ `stripped` 为空串（上层按空解码处理，不污染窗口）。
+///
+/// 未命中 ⇒ `None`（零分配、行为不变）。
+fn strip_terms_echo(text: &str, terms: Option<&str>) -> Option<TermsEchoHit> {
+    let terms = terms?;
+    // 注入侧：按 `,` 切分 → 归一化（去空白/标点） → 保留**注入顺序**。
+    let injected: Vec<Vec<char>> = terms
+        .split(',')
+        .map(|t| {
+            t.chars()
+                .filter(|c| align_keep_char(*c))
+                .collect::<Vec<char>>()
+        })
+        .filter(|t| !t.is_empty())
+        .collect();
+    if injected.len() < TERMS_ECHO_MIN_RUN {
+        return None;
+    }
+    // 输出侧：逐字归一化，并保住「归一化序号 → 原文字符序号」的映射（剥离要回到原文坐标）。
+    let chars: Vec<char> = text.chars().collect();
+    let mut norm: Vec<char> = Vec::with_capacity(chars.len());
+    let mut norm_orig: Vec<usize> = Vec::with_capacity(chars.len());
+    for (i, c) in chars.iter().enumerate() {
+        if align_keep_char(*c) {
+            norm.push(*c);
+            norm_orig.push(i);
+        }
+    }
+    if norm.is_empty() {
+        return None;
+    }
+    // 找**最长**的「连续注入词条（顺序一致）」run（长度 ≥ TERMS_ECHO_MIN_RUN）。
+    let mut best: Option<(usize, usize, usize)> = None; // (起点, 词条数, 终点（不含）)
+    for (ti, head) in injected.iter().enumerate() {
+        let mut p = 0usize;
+        while p + head.len() <= norm.len() {
+            if norm[p..p + head.len()] == head[..] {
+                let mut end = p + head.len();
+                let mut m = 1usize;
+                while ti + m < injected.len() {
+                    let nxt = &injected[ti + m];
+                    if end + nxt.len() <= norm.len() && norm[end..end + nxt.len()] == nxt[..] {
+                        end += nxt.len();
+                        m += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if m >= TERMS_ECHO_MIN_RUN && best.is_none_or(|(_, bm, _)| m > bm) {
+                    best = Some((p, m, end));
+                }
+                p += 1;
+            } else {
+                p += 1;
+            }
+        }
+    }
+    let (p, matched_terms, end) = best?;
+    // 回到原文坐标：删 [first, last] 之间的字符。
+    let first = norm_orig[p];
+    let last = norm_orig[end - 1];
+    let prefix: String = chars[..first].iter().collect();
+    let suffix: String = chars[last + 1..].iter().collect();
+    let mut stripped = String::with_capacity(text.len());
+    stripped.push_str(prefix.trim_end_matches(is_list_separator));
+    stripped.push_str(suffix.trim_start_matches(is_list_separator));
+    // 剥完只剩分隔符/空白 ⇒ 视为**空解码**（不给下游留一个孤零零的逗号）。
+    if stripped.trim_matches(is_list_separator).is_empty() {
+        stripped.clear();
+    }
+    let removed_chars = chars.len() - stripped.chars().count();
+    Some(TermsEchoHit {
+        matched_terms,
+        removed_chars,
+        stripped,
+    })
 }
 
 /// 一次 accuracy 解码（可选 per-stream system 段）。返回规范化后的文本。
@@ -459,6 +716,19 @@ pub(crate) fn transcribe_acc_ctx(
             text = decode_accuracy_once(recognizer, samples, None, script)?;
         }
     }
+    // FIX-TERMS-ECHO-374 + 375（B）：**统一的处置阶梯**（一处实现，两条判据）。
+    //
+    // 🔴 放在 ctx 护栏**之外**、**恒执行**（与 `ctx` 是否为空无关）：端测 374 现场 `ctx_raw_len=0`
+    //    （重启后第一次录音）时旧护栏整块被跳过，`seg=10` 零转写只吐 77 字词条列表；
+    //    375 现场则是「短输出从相对阈值下溜走」。两条判据都与 LCS 无关 ⇒ 无 43% 误伤面。
+    let audio_secs = samples.len() as f32 / 16000.0;
+    let (text, disp) = apply_acc_disposition(
+        text,
+        inject.terms,
+        audio_secs,
+        inject.avg_chars_per_sec,
+        || decode_accuracy_once(recognizer, samples, None, script),
+    );
     if log::log_enabled!(log::Level::Debug) {
         log::debug!(
             "[LocalRT-DBG-320] ctx inject: seg={} prev2_len={} prev1_len={} acc_len={} ctx_raw_len={} ctx_len={} cut={} terms_len={} out_chars={} final_chars={} lcs={} action={}",
@@ -478,6 +748,45 @@ pub(crate) fn transcribe_acc_ctx(
             } else {
                 "keep"
             }
+        );
+    }
+    // FIX-TERMS-ECHO-374 埋点：命中回显才打（匹配词条数 / 剥掉字数 / 剩余字数 / 是否重解 / 最终字数）。
+    if disp.matched_terms > 0 && log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "[LocalRT-DBG-374] terms echo stripped: matched={} removed_chars={} remaining_chars={} redecode={} final_chars={}",
+            disp.matched_terms,
+            disp.removed_chars,
+            disp.remaining_chars,
+            if disp.redecoded { "yes" } else { "no" },
+            text.chars().count()
+        );
+    }
+    // FIX-PREVIEW-STALE-AND-COLLAPSE-375（B）埋点：每个窗口的产出率 vs 均值 + 处置动作。
+    if log::log_enabled!(log::Level::Debug) {
+        let action375 = if disp.collapse {
+            if text.is_empty() {
+                "empty"
+            } else {
+                "redecode"
+            }
+        } else {
+            "keep"
+        };
+        log::debug!(
+            "[LocalRT-DBG-375] collapse: seq={} audio={:.2}s out={}字 rate={:.2} avg={} action={}",
+            seg_idx,
+            audio_secs,
+            decided_out_chars,
+            if audio_secs > 0.0 {
+                decided_out_chars as f32 / audio_secs
+            } else {
+                0.0
+            },
+            match inject.avg_chars_per_sec {
+                Some(a) => format!("{a:.2}"),
+                None => "cold".to_string(),
+            },
+            action375
         );
     }
     Ok((text, true))
@@ -3445,6 +3754,7 @@ mod poc_qwen3_17b_351 {
                 prev_latest: None,
                 current,
                 terms: Some(FIT_WORDLIST),
+                avg_chars_per_sec: None,
             };
             let t0 = Instant::now();
             let (text, _native) =
@@ -3805,6 +4115,7 @@ mod poc_qwen3_17b_351 {
             prev_latest: None,
             current: None,
             terms: None,
+            avg_chars_per_sec: None,
         };
         let seg0 = transcribe_acc_ctx(
             &rec,
@@ -3897,6 +4208,288 @@ mod poc_qwen3_17b_351 {
         let r = stream.get_result().expect("result");
         let t = super::Transcriber::strip_asr_special_tokens(r.text.trim());
         crate::text_normalizer::normalize_text_for_language(&t, script)
+    }
+
+    // ========================================================================
+    // POC-LANGUAGE-SEPARATOR-376：`language` 分隔符 × 注入形状（**只读 PoC，不改生产**）
+    //   运行：cargo test --bin feiyin-ime -- --ignored --nocapture poc_376_language_separator
+    // ========================================================================
+
+    /// POC-376：**不剥**任何前缀的裸解码（要观测 `<asr_text>` 是否出现/被模型自造）。
+    fn poc376_decode_raw(
+        rec: &sherpa_onnx::OfflineRecognizer,
+        samples: &[f32],
+        language: Option<&str>,
+        system: Option<&str>,
+    ) -> String {
+        let stream = rec.create_stream();
+        if let Some(l) = language {
+            stream.set_option("language", l);
+        }
+        if let Some(s) = system {
+            stream.set_option("hotwords", s);
+        }
+        stream.accept_waveform(16000, samples);
+        rec.decode(&stream);
+        stream.get_result().expect("result").text.trim().to_string()
+    }
+
+    /// POC-376：输出里「**连续**注入词条且顺序与注入一致」的**最大 run 长度**
+    /// （与 374 判据同构，但独立实现 ⇒ 便于同时报 ≥3 / ≥4 两个口径）。
+    fn poc376_terms_run(text: &str, terms: &str) -> usize {
+        let norm = |s: &str| -> Vec<char> {
+            s.chars()
+                .filter(|c| !c.is_whitespace() && !crate::punctuation::PUNCT_CHARS.contains(c))
+                .collect()
+        };
+        let injected: Vec<String> = terms
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let out = norm(text);
+        let mut best = 0usize;
+        for ti in 0..injected.len() {
+            let head = norm(&injected[ti]);
+            if head.is_empty() {
+                continue;
+            }
+            let mut p = 0usize;
+            while p + head.len() <= out.len() {
+                if out[p..p + head.len()] == head[..] {
+                    let mut end = p + head.len();
+                    let mut m = 1usize;
+                    while ti + m < injected.len() {
+                        let nt = norm(&injected[ti + m]);
+                        if !nt.is_empty()
+                            && end + nt.len() <= out.len()
+                            && out[end..end + nt.len()] == nt[..]
+                        {
+                            end += nt.len();
+                            m += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    best = best.max(m);
+                    p += 1;
+                } else {
+                    p += 1;
+                }
+            }
+        }
+        best
+    }
+
+    fn poc376_rms_frames(fs: &[f32], rate: usize) -> (Vec<f32>, usize) {
+        let frame = (rate / 10).max(1); // 100ms
+        let f = fs
+            .chunks(frame)
+            .map(|c| (c.iter().map(|x| x * x).sum::<f32>() / c.len() as f32).sqrt())
+            .collect();
+        (f, frame)
+    }
+
+    /// POC-376：**低信息量**短片（回显在现场就发生在句尾/停顿边缘/低能量段）。
+    /// 判据：帧 RMS 落在「略高于纯静音底噪」与「中位能量的 45% 处」之间（低能量但非纯静音）。
+    fn poc376_low_info_clips(
+        fs: &[f32],
+        rate: usize,
+        n: usize,
+        clip_secs: f32,
+    ) -> Vec<(usize, usize)> {
+        let (frames, frame) = poc376_rms_frames(fs, rate);
+        if frames.len() < 10 {
+            return vec![(0, fs.len())];
+        }
+        let mut sorted = frames.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p05 = sorted[sorted.len() / 20];
+        let p50 = sorted[sorted.len() / 2];
+        let floor = p05 + (p50 - p05) * 0.05;
+        let cap = p05 + (p50 - p05) * 0.45;
+        let half = (clip_secs * rate as f32 / 2.0) as usize;
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        let steps = 160usize;
+        for k in 0..steps {
+            if out.len() >= n {
+                break;
+            }
+            let idx = 3 + k * frames.len().saturating_sub(6) / steps;
+            if idx >= frames.len() {
+                break;
+            }
+            if frames[idx] < floor || frames[idx] > cap {
+                continue;
+            }
+            let c = idx * frame;
+            if out
+                .iter()
+                .any(|(a, b)| c + half > *a && c < b.saturating_sub(half) || (c >= *a && c < *b))
+            {
+                continue;
+            }
+            let a = c.saturating_sub(half);
+            let b = (c + half).min(fs.len());
+            if b.saturating_sub(a) < rate {
+                continue;
+            }
+            out.push((a, b));
+        }
+        out
+    }
+
+    /// POC-376：**正常长片**（文章能量高的不重叠长窗）⇒ 校验「正文质量没被改坏」。
+    fn poc376_loud_clips(fs: &[f32], rate: usize, n: usize, clip_secs: f32) -> Vec<(usize, usize)> {
+        let len = (clip_secs * rate as f32) as usize;
+        if fs.len() <= len {
+            return vec![(0, fs.len())];
+        }
+        let (frames, frame) = poc376_rms_frames(fs, rate);
+        let mut idx: Vec<usize> = (0..frames.len()).collect();
+        idx.sort_by(|a, b| frames[*b].partial_cmp(&frames[*a]).unwrap());
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for i in idx {
+            if out.len() >= n {
+                break;
+            }
+            let c = (i * frame).min(fs.len() - len);
+            if out.iter().any(|(a, b)| c + len > *a && c < *b) {
+                continue;
+            }
+            out.push((c, c + len));
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "PoC: cargo test --bin feiyin-ime -- --ignored --nocapture poc_376_language_separator"]
+    fn poc_376_language_separator() {
+        let root = manifest_dir();
+        let rec = create_qwen3_recognizer_at(
+            &root.join("models/sherpa-onnx-qwen3-asr-1.7B-int8-2026-09-22"),
+        )
+        .expect("1.7B recognizer");
+
+        // 注入素材：**生产同款**（FULL 走 build_ctx_system；TERMS_ONLY 只给词表本身）
+        let context =
+            "我记得当初设计的时候磁条是作为上下文串用的，也就是说上一次的识别结果会被带进这次\
+的提示词里面，用来帮助模型理解前后文，避免同一句话在不同分片里被切碎之后语义断裂。";
+        // 与端测取证日志逐字一致的真实词条列表（59 字词条 + 18 逗号 = 77 字）
+        let terms =
+            "你好,铭印,银线,朵洛莉丝,费曼学习法,子未穿害,低质,罗斯柴尔德,维生素b12,三五成群,\
+主控,派安盈,隋变,摄氏度,艾丁湖,风无心,文案,漫剧,采编";
+        let full = super::build_ctx_system(Some(context), Some(terms)).expect("system");
+        // TERMS_PLUS_CTX：**去掉两句英文指令**，保留同样的标签与顺序
+        // ⇒ 与 FULL 的差 = 指令句的贡献；与 TERMS_ONLY 的差 = 散文 Context 的贡献。
+        let terms_plus_ctx = format!(
+            "Context: {context}
+Terms: {terms}"
+        );
+        let shapes: [(&str, Option<&str>); 4] = [
+            ("FULL", Some(full.as_str())),
+            ("TERMS_PLUS_CTX", Some(terms_plus_ctx.as_str())),
+            ("TERMS_ONLY", Some(terms)),
+            ("NONE", None),
+        ];
+        // language 维度按补充二降级：主基线 = 不设（= 生产现状 = 官方主用法）；"Auto"/"" 只作次要对照。
+        // （"Chinese" 已删；小写 "auto" 只在 1 段非中文上抽测）
+        const PRIMARY_LANG: (&str, Option<&str>) = ("unset", None);
+        let secondary_langs: [(&str, Option<&str>); 2] =
+            [("Auto", Some("Auto")), ("empty", Some(""))];
+
+        let (fs, rate) = read_wav(&root, "collab/research/audio-real-gavin/processed/full.wav");
+        let low = poc376_low_info_clips(&fs, rate, 6, 1.8);
+        let loud = poc376_loud_clips(&fs, rate, 2, 8.0);
+        let (ko, _) = read_wav(&root, "models/korean-testwavs/0.wav");
+        let (ja, _) = read_wav(
+            &root,
+            "models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/test_wavs/ja1.wav",
+        );
+
+        println!(
+            "POC376 material: ctx_chars={} terms_chars={} full_chars={} tpc_chars={}",
+            context.chars().count(),
+            terms.chars().count(),
+            full.chars().count(),
+            terms_plus_ctx.chars().count()
+        );
+
+        let ctx_norm = super::normalize_ctx_probe(context);
+        let measure = |tag: &str,
+                       samples: &[f32],
+                       lang: Option<&str>,
+                       lang_name: &str,
+                       shape: &str,
+                       system: Option<&str>| {
+            let t = poc376_decode_raw(&rec, samples, lang, system);
+            let marker = t.contains("<asr_text>");
+            let prefix = match t.find("<asr_text>") {
+                Some(p) => format!("{:?}", &t[..p]),
+                None => "none".to_string(),
+            };
+            let run = poc376_terms_run(&t, terms);
+            let lcs = super::lcs_len(&super::normalize_ctx_probe(&t), &ctx_norm);
+            let secs = samples.len() as f32 / rate as f32;
+            let chars = t.chars().count();
+            println!(
+                "POC376 cell clip={} lang={} shape={} | marker={} prefix={} terms_run={} ctx_lcs={} chars={} secs={:.2} rate={:.2} | text={}",
+                tag,
+                lang_name,
+                shape,
+                if marker { "YES" } else { "no" },
+                prefix,
+                run,
+                lcs,
+                chars,
+                secs,
+                chars as f32 / secs.max(0.01),
+                t
+            );
+            println!(
+                "POC376 TABLE {}	{}	{}	{}	{}	{}	{}",
+                tag,
+                lang_name,
+                shape,
+                if marker { "MARKER" } else { "-" },
+                run,
+                lcs,
+                chars
+            );
+        };
+
+        // ① 主矩阵（机时主要花这里）：**不设 language** × 4 形状 × 全部 10 段
+        //    （6 低信息量 = 回显最易发；2 正常长片 = 正文质量；2 非中文 = 语种不被锁）
+        let mut all: Vec<(String, &[f32])> = Vec::new();
+        for (i, (a, b)) in low.iter().enumerate() {
+            all.push((format!("low{}", i + 1), &fs[*a..*b]));
+        }
+        for (i, (a, b)) in loud.iter().enumerate() {
+            all.push((format!("loud{}", i + 1), &fs[*a..*b]));
+        }
+        all.push(("ko".to_string(), ko.as_slice()));
+        all.push(("ja".to_string(), ja.as_slice()));
+        for (tag, seg) in &all {
+            for (sn, sv) in shapes {
+                measure(tag, seg, PRIMARY_LANG.1, PRIMARY_LANG.0, sn, sv);
+            }
+        }
+        // ② 次要对照：Auto / "" × 4 形状，只在 2 段非中文（验语种信号）+ 1 段低信息量（ja 是重现场）
+        for (tag, seg) in [
+            ("ko", ko.as_slice()),
+            ("ja", ja.as_slice()),
+            ("low3", &fs[low[2].0..low[2].1]),
+        ] {
+            for (ln, lv) in secondary_langs {
+                for (sn, sv) in shapes {
+                    measure(tag, seg, lv, ln, sn, sv);
+                }
+            }
+        }
+        // ③ 抽测小写 "auto"（只在 1 段非中文上，省机时）
+        for (sn, sv) in shapes {
+            measure("ko", ko.as_slice(), Some("auto"), "auto", sn, sv);
+        }
     }
 
     #[test]
@@ -4381,6 +4974,336 @@ mod strip_lang_prefix_359_tests {
 // SLIDING-WINDOW-367：组窗（①）+ 对齐合并（④）单测
 // 运行：cargo test --bin feiyin-ime -- sliding_window_367
 // ============================================================
+// ============================================================
+// FIX-TERMS-ECHO-374：词库列表回显的**结构性**剥离
+// 运行：cargo test --bin feiyin-ime -- fix374
+// ============================================================
+#[cfg(test)]
+mod fix374_terms_echo_tests {
+    use super::{apply_acc_disposition, strip_terms_echo};
+    use std::cell::Cell;
+
+    /// 真实注入形态（`build_hotwords_string` = 半角 `,` 连接）；端测现场尾部 77 字即此列表。
+    const INJ: &str = "你好,铭印,银线,朵洛莉丝,费曼学习法,子未穿害,低质,罗斯柴尔德,维生素b12";
+
+    /// 端测现场形态：整窗**逐字回显**（全角逗号），**零转写**。
+    const FULL_ECHO: &str =
+        "你好，铭印，银线，朵洛莉丝，费曼学习法，子未穿害，低质，罗斯柴尔德，维生素b12";
+
+    /// 🔴 正例：输出 = 注入 Terms 逐字（模型把整段 `Terms:` 念回来）⇒ **全剥 ⇒ 空**
+    ///    （上层 `push_inner` 的 `text.is_empty()` 分支：只推进 next，不污染窗口）。
+    #[test]
+    fn full_echo_is_stripped_to_empty() {
+        // 输出用**全角**逗号（模型实际输出形态），注入是半角 ⇒ 归一化后仍逐字相等。
+        let echoed =
+            "你好，铭印，银线，朵洛莉丝，费曼学习法，子未穿害，低质，罗斯柴尔德，维生素b12";
+        let hit = strip_terms_echo(echoed, Some(INJ)).expect("应命中回显");
+        assert_eq!(hit.matched_terms, 9, "整列表 9 个词条连续命中");
+        assert_eq!(hit.stripped, "", "全剥 ⇒ 空 ⇒ 按空解码处理");
+        assert_eq!(
+            hit.removed_chars,
+            echoed.chars().count(),
+            "剥掉字符数 = 原文本长度"
+        );
+    }
+
+    /// 🔴 正例：真实转写 + 尾部拼了 Terms ⇒ **只剥尾部，真实转写一字不动**（端测现场形态）。
+    #[test]
+    fn tail_echo_is_stripped_keeping_real_text() {
+        let text = "可以看看周边的风景。你好，铭印，银线，朵洛莉丝，";
+        let hit = strip_terms_echo(text, Some(INJ)).expect("应命中尾部回显");
+        assert_eq!(hit.matched_terms, 4);
+        assert_eq!(
+            hit.stripped, "可以看看周边的风景。",
+            "真句子（含句末「。」）完整保留"
+        );
+    }
+
+    /// 🔴 反例（防误伤）：用户句子里**自然说到 1~2 个词库词** ⇒ **不得剥**（43% 误判的教训）。
+    #[test]
+    fn natural_mention_of_terms_is_kept() {
+        for t in [
+            "我最近在看费曼学习法",
+            "你好，今天天气不错",
+            "银线怎么卖掉",
+            "你好，铭印", // 连续 2 个（顺序也对）但 < N ⇒ 仍不剥
+        ] {
+            assert!(
+                strip_terms_echo(t, Some(INJ)).is_none(),
+                "自然口语不得被判回显：{t}"
+            );
+        }
+    }
+
+    /// 🔴 反例：输出含这些词条但**顺序与注入不同** ⇒ 不得剥。
+    #[test]
+    fn out_of_order_terms_are_not_stripped() {
+        let inj = "苹果,香蕉,橘子,葡萄,西瓜";
+        for t in ["西瓜，葡萄，橘子，香蕉，苹果", "苹果，橘子，香蕉，西瓜"]
+        {
+            assert!(
+                strip_terms_echo(t, Some(inj)).is_none(),
+                "顺序不一致不得剥：{t}"
+            );
+        }
+    }
+
+    /// 退化：`terms` 为 None / 空 / 词条数不足 N / 文本为空 ⇒ 不 panic、返回 None（行为不变）。
+    #[test]
+    fn degenerate_terms_are_noop() {
+        assert!(strip_terms_echo("任意文本", None).is_none());
+        assert!(strip_terms_echo("任意文本", Some("")).is_none());
+        assert!(strip_terms_echo("任意文本", Some(",,,")).is_none());
+        assert!(strip_terms_echo("任意文本", Some("单条词")).is_none());
+        assert!(strip_terms_echo("", Some(INJ)).is_none());
+        // 词条数 < N（4）⇒ 即使整列表逐字回显也不剥（N=4 的取舍，见常量注释）
+        let three = "你好,铭印,银线";
+        assert!(strip_terms_echo("你好，铭印，银线", Some(three)).is_none());
+        // 词条数够但只连续命中 3 个 ⇒ 不剥
+        let text = "你好，铭印，银线，这里换成别的话了";
+        assert!(strip_terms_echo(text, Some(INJ)).is_none());
+    }
+
+    /// 归一化容错：全/半角分隔符、空白差异**不影响**识别（回显是逐字文本，标点差异不该漏检）。
+    #[test]
+    fn separator_and_space_differences_still_detected() {
+        let hit = strip_terms_echo("你好 、 铭印，银线 朵洛莉丝", Some(INJ)).expect("应命中");
+        assert_eq!(hit.matched_terms, 4);
+        assert_eq!(hit.stripped, "", "剥空 ⇒ 空串");
+    }
+
+    /// 回显在**中段**时：前缀保留、后缀保留，只删回显那一段。
+    #[test]
+    fn middle_echo_is_removed_with_both_sides_kept() {
+        let text = "前面这句是真的。你好，铭印，银线，朵洛莉丝，后面这句也是真的";
+        let hit = strip_terms_echo(text, Some(INJ)).expect("应命中中段回显");
+        assert_eq!(hit.matched_terms, 4);
+        assert_eq!(
+            hit.stripped, "前面这句是真的。后面这句也是真的",
+            "只删回显段与其接缝分隔符"
+        );
+    }
+
+    // ---- FIX-TERMS-ECHO-374 补充：处置**阶梯**（纯函数，重解用闭包注入）----
+
+    /// 🔴 阶梯 1：剥完**还有内容** ⇒ 用剩余文本，**且绝不重解**（闭包一旦被调用即失败）。
+    #[test]
+    fn ladder_uses_remaining_and_never_redecodes() {
+        let text = format!("可以看看周边的风景。{INJ}");
+        let called = Cell::new(false);
+        let (out, oc) = apply_acc_disposition(text, Some(INJ), 11.8, Some(4.4), || {
+            called.set(true);
+            Ok("不应被调用".to_string())
+        });
+        assert!(
+            !called.get(),
+            "剥完还有内容时**不得**重解（避免低频事件变常态开销）"
+        );
+        assert_eq!(out, "可以看看周边的风景。");
+        assert_eq!(oc.matched_terms, 9);
+        assert_eq!(oc.remaining_chars, "可以看看周边的风景。".chars().count());
+        assert!(!oc.redecoded);
+    }
+
+    /// 🔴 阶梯 2/3：整窗都是回显 ⇒ 剥空 ⇒ **不带注入重解一次** ⇒ 用重解结果（救回真实内容）。
+    #[test]
+    fn ladder_redecodes_once_when_strip_is_empty() {
+        let calls = Cell::new(0);
+        let (out, oc) =
+            apply_acc_disposition(FULL_ECHO.to_string(), Some(INJ), 11.8, Some(4.4), || {
+                calls.set(calls.get() + 1);
+                Ok("这是被回显掩盖的真实转写内容".to_string())
+            });
+        assert_eq!(calls.get(), 1, "重解**至多一次**");
+        assert_eq!(out, "这是被回显掩盖的真实转写内容", "用重解结果");
+        assert!(oc.redecoded);
+        assert_eq!(oc.remaining_chars, 0, "剥完为空");
+        assert_eq!(oc.matched_terms, 9);
+    }
+
+    /// 🔴 阶梯 4：重解**仍空/失败** ⇒ 空串（上层按空解码处理：推进 next、不污染窗口）。
+    #[test]
+    fn ladder_falls_back_to_empty_when_redecode_fails() {
+        for fail in [true, false] {
+            let calls = Cell::new(0);
+            let (out, oc) =
+                apply_acc_disposition(FULL_ECHO.to_string(), Some(INJ), 11.8, Some(4.4), || {
+                    calls.set(calls.get() + 1);
+                    if fail {
+                        Err(anyhow::anyhow!("ASR accuracy model produced empty output"))
+                    } else {
+                        Ok(String::new())
+                    }
+                });
+            assert_eq!(calls.get(), 1);
+            assert_eq!(out, "", "重解空/失败 ⇒ 空串（不冒泡错误）");
+            assert!(oc.redecoded);
+        }
+    }
+
+    /// 重解结果**又吐词条**（防御）：再剥一次 ⇒ 仍空（且**不再**重解第二次）。
+    #[test]
+    fn ladder_strips_redecoded_echo_without_looping() {
+        let calls = Cell::new(0);
+        let (out, oc) =
+            apply_acc_disposition(FULL_ECHO.to_string(), Some(INJ), 11.8, Some(4.4), || {
+                calls.set(calls.get() + 1);
+                Ok(FULL_ECHO.to_string()) // 无注入重解却仍吐词条
+            });
+        assert_eq!(calls.get(), 1, "不得循环重解");
+        assert_eq!(out, "", "重解结果再剥 ⇒ 空");
+        assert!(oc.redecoded);
+    }
+
+    /// 未命中 ⇒ 原样返回、零埋点、**不重解**。
+    #[test]
+    fn ladder_is_noop_when_no_echo() {
+        let called = Cell::new(false);
+        let (out, oc) = apply_acc_disposition(
+            "今天天气不错".to_string(),
+            Some(INJ),
+            2.0,
+            None,
+            || {
+                called.set(true);
+                Ok("x".to_string())
+            },
+        );
+        assert!(!called.get());
+        assert_eq!(out, "今天天气不错");
+        assert_eq!(oc.matched_terms, 0);
+        assert_eq!(oc.remaining_chars, 6);
+        assert!(!oc.redecoded);
+    }
+}
+
+// ============================================================
+// FIX-PREVIEW-STALE-AND-COLLAPSE-375（B）：产出率坍塌判据 + 与 374 共用的阶梯
+// 运行：cargo test --bin feiyin-ime -- fix375
+// ============================================================
+#[cfg(test)]
+mod fix375_collapse_tests {
+    use super::{
+        acc_avg_chars_per_sec, apply_acc_disposition, output_rate_ok, COLLAPSE_MIN_AVG_WINDOWS,
+    };
+    use std::cell::Cell;
+
+    /// 端测坍塁现场的数字：均值 ≈4.4 字/s、窗 10.4s、输出仅 8 字（≈0.77 字/s）。
+    const AVG: f32 = 4.4;
+    const SECS: f32 = 10.4;
+
+    /// 冷启动 / 期望产出过少 ⇒ 一律判「正常」（宁漏勿误杀）。
+    #[test]
+    fn rate_ok_cold_start_and_tiny_expectation_always_ok() {
+        assert!(output_rate_ok(0, SECS, None), "无均值 ⇒ 不判");
+        assert!(output_rate_ok(0, SECS, Some(f32::NAN)), "非有限 ⇒ 不判");
+        assert!(output_rate_ok(0, SECS, Some(0.0)), "非正 ⇒ 不判");
+        assert!(output_rate_ok(0, 0.0, Some(AVG)), "无音频 ⇒ 不判");
+        // 期望产出 < COLLAPSE_MIN_EXPECTED_CHARS(8)：avg 4.4 × 1.0s = 4.4 < 8 ⇒ 即使 0 字也放行
+        assert!(
+            output_rate_ok(0, 1.0, Some(AVG)),
+            "短窗（期望产出太少）⇒ 不判"
+        );
+    }
+
+    /// 🔴 坍塌窗必须被抓、正常窗不得误判（含边界：恰为均值 1/3）。
+    #[test]
+    fn rate_ok_detects_collapse_but_not_normal() {
+        assert!(
+            !output_rate_ok(8, SECS, Some(AVG)),
+            "端测现场（8 字/10.4s ≈ 均值 17%）必须判坍塌"
+        );
+        assert!(
+            output_rate_ok(45, SECS, Some(AVG)),
+            "正常窗（45 字/10.4s）不得误判"
+        );
+        // 边界：均值 × 1/3 × 秒数 = 4.4/3×10.4 ≈ 15.25
+        assert!(output_rate_ok(16, SECS, Some(AVG)), "恰在阈值之上 ⇒ 正常");
+        assert!(!output_rate_ok(15, SECS, Some(AVG)), "恰在阈值之下 ⇒ 坍塌");
+        // 相对判据随均值自适应：均值降到 2.0 时阈值 = 2.0/3×10.4 ≈ 6.9 ⇒ 8 字**不算**坍塌
+        assert!(
+            output_rate_ok(8, SECS, Some(2.0)),
+            "慢语速均值 ⇒ 同一产出不再判坍塌"
+        );
+        assert!(
+            !output_rate_ok(4, SECS, Some(2.0)),
+            "低于自适应阈值 ⇒ 仍判坍塌"
+        );
+    }
+
+    /// 均值需要 ≥ `COLLAPSE_MIN_AVG_WINDOWS` 个已接受窗口才可用（否则冷启动）。
+    #[test]
+    fn avg_needs_min_windows() {
+        assert_eq!(acc_avg_chars_per_sec(0, 0.0, 0), None);
+        assert_eq!(acc_avg_chars_per_sec(50, 10.0, 1), None);
+        assert_eq!(acc_avg_chars_per_sec(50, 0.0, 5), None, "无有效秒数 ⇒ None");
+        assert_eq!(
+            acc_avg_chars_per_sec(50, 10.0, COLLAPSE_MIN_AVG_WINDOWS),
+            Some(5.0)
+        );
+    }
+
+    /// 🔴 阶梯：坍塌 ⇒ 不带注入重解一次 ⇒ 重解正常则采用（`collapse=true`、`redecoded=true`）。
+    #[test]
+    fn ladder_redecodes_on_collapse() {
+        let calls = Cell::new(0);
+        let (out, oc) = apply_acc_disposition(
+            "上一下文传路的".to_string(),
+            None,
+            SECS,
+            Some(AVG),
+            || {
+                calls.set(calls.get() + 1);
+                Ok("我记得当初设计的时候磁条是作为上下文串用的".to_string())
+            },
+        );
+        assert_eq!(calls.get(), 1, "坍塌 ⇒ 重解**至多一次**");
+        assert_eq!(out, "我记得当初设计的时候磁条是作为上下文串用的");
+        assert!(oc.collapse, "应标记为坍塌触发");
+        assert!(oc.redecoded);
+        assert_eq!(oc.matched_terms, 0);
+    }
+
+    /// 🔴 阶梯：重解**仍坍塌** ⇒ 按空解码处理（空串，交给 `push_inner` 的空分支）。
+    #[test]
+    fn ladder_falls_back_to_empty_when_redecode_still_collapses() {
+        let calls = Cell::new(0);
+        let (out, oc) = apply_acc_disposition(
+            "上一下文传路的".to_string(),
+            None,
+            SECS,
+            Some(AVG),
+            || {
+                calls.set(calls.get() + 1);
+                Ok("还是很短的一句".to_string()) // 7 字 / 10.4s ⇒ 仍坍塌
+            },
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(out, "", "仍坍塌 ⇒ 空解码（不污染窗口）");
+        assert!(oc.collapse);
+        assert!(oc.redecoded);
+    }
+
+    /// 正常窗：不判坍塌 ⇒ **绝不重解**（闭包被调用即失败）。
+    #[test]
+    fn ladder_leaves_normal_window_untouched() {
+        let real = "我记得当初设计的时候磁条是作为上下文串用的这句话挺长的";
+        assert!(
+            real.chars().count() as f32 >= AVG * SECS / 3.0,
+            "自检：该窗应属正常"
+        );
+        let called = Cell::new(false);
+        let (out, oc) = apply_acc_disposition(real.to_string(), None, SECS, Some(AVG), || {
+            called.set(true);
+            Ok("x".to_string())
+        });
+        assert!(!called.get());
+        assert_eq!(out, real);
+        assert!(!oc.collapse);
+        assert!(!oc.redecoded);
+    }
+}
+
 #[cfg(test)]
 mod sliding_window_367_tests {
     use super::{

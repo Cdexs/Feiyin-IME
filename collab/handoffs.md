@@ -362,3 +362,17 @@
 - **主控验收**：22 条清单（`collab/acceptance-371.md`）逐条 Read 代码，首轮 20 过 → B3 改判 + C3 补 → 复验全过。
 - **验证**：fmt EXIT 0 / check 0 error（主控复跑）/ 全量 test 0 failed（**1400P/28I**）/ warnings 98/88 = 基线。
 - `docs/MACOS-HANDOFF.md` 新增 0.3 节。未改版本 / 未 push / 未出包（BUILD-349 已作废）。
+
+## FIX-TERMS-ECHO-374 + FIX-PREVIEW-STALE-AND-COLLAPSE-375 + POC-376（coder-1，2026-09-23）
+
+- **374**：结构性判据（连续 ≥4 注入词条、顺序一致）剥词条回显；**未**把 Terms 放回 LCS（43% 误判来源）；
+  判据在 ctx 护栏外恒执行 ⇒ 堵住「重启后首次录音 `ctx_raw_len=0` 跳过护栏」。
+- **375-A**：`reflow_action` 的 `seg_index` 单调闸对滑窗不适用（切片下标会重复）⇒ 新增 `reflow_seq`。
+  🔴 **自 367 起存在（BUILD-347），非 371 引入**。
+- **375-B**：新增与回显无关的**产出率**判据识别解码坍塌；冷启动宁漏勿误杀。
+  两条合并一套阶梯 `apply_acc_disposition`，至多重解一次、必须不带注入。
+- **POC-376**：**主控的 language 推理被证伪** —— 设 `language` 不消回显、只换回显内容。
+  官方一手资料：`language=None` 是主用法（评测全程不设）、前缀是官方输出格式（有 `parse_asr_output`）、
+  官方 `transcribe()` 无上下文参数、sherpa 的 hotwords 期望「ASCII 逗号分隔词表」却被我们塞了
+  指令句+散文。🔴 **换 Qwen3 后词库偏置是否仍有效，至今无证据**（PoC 音频无词表专名发音点）。
+- 主控逐条 Read 验收通过；fmt/check 复跑干净；全量 test 0 failed（1443P/28I）；warnings 88 = 基线。

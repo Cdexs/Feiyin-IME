@@ -2484,6 +2484,7 @@ mod tests {
                 prev_latest: None,
                 current: None,
                 terms: None,
+                avg_chars_per_sec: None,
             },
         )
         .map(|(t, _)| t)
