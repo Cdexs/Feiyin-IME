@@ -6,6 +6,19 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-22 — tester-1 — TEST-EXEC + BUILD-347 ✅ 出包（v0.9.3 批次十一；八项 + 三特殊点全 PASS）
+
+- **交付源码**：HEAD **`ae166e6`**（含主控 fmt 修复），版本 0.9.3。范围：354/356 ITN、359（sherpa 1.13.8/ORT 1.28.2 + Qwen3 **1.7B** + 剥前缀）、363/364（双路 + 上限 300→180s）、DEC-080/365（摘剥光标点节点）、367（滑动窗口四阶段）。
+- **🔴 fmt 卡点（过程）**：首轮 `cargo fmt --check` EXIT=1（唯一 `src/transcription/mod.rs:4210`，367 测试 `assert!` 超宽）。判断「必须出包前修、否则重出」→ 上报主控；主控以 `ae166e6` 纯 rustfmt 折行修复。**tester 未改 src**，在 `ae166e6` **重跑全量**绑定交付。
+- **回归（全量未过滤）**：root `cargo test --no-fail-fast` **1464P/0F/30I**（EXIT 0，11 二进制；`feiyin-ime` bin **1376P/28I** = 任务书基线逐位吻合）；`src-tauri` **92P/0F/0I**；Vitest **7 files/100P/11S/0F**（`ui/` 无 diff，仍执行）；`cargo fmt --check` **EXIT 0**。
+- **NEW/GONE（对 BUILD-346，逐位对账 1376−1347=+29P / 28−21=+7I）**：NEW 30 runnable（356 ITN 8 / 367 滑窗+对齐+有序定稿 12 / 359 剥前缀 4 / 363-364 预算 4 / 365-DEC080 2 / 重命名 1）+ 7 ignored PoC；**GONE 1 = `max_record_seconds_is_300`→`_is_180`**（上限调整，机制随单）。367 重写**未删任何测试函数**（`-#[test]`=0），核心有序定稿判据 `ordered_reflow_*` 3 条为新增。
+- **BUILD-347**：Step1 残 0 → Step2 npm 640ms + Tauri 1m47s（17w）→ Step3 主程序 2m53s（**98w** + crash 9w）→ Step4 三 exe→Publish + dll 三副本 + 四表三副本 + 补 1.7B。产物 main `edf7d088b74e…`（14,737,920B/19:28:12）/ ui `af045bc855c7…`（10,050,048B/19:25:18）/ crash `6d71c620bbe9…`（24,879,104B/19:26:21）；两副本全等、均异于 BUILD-346。
+- **八项逐项 PASS**：①时间戳 19:25–19:28 ②sha 两副本 + 异于上包 ③**0.9.3**（main/crash `0.9.3.0`、ui `0.9.3`）④冒烟 PID **28280 Responding=True** / 两处无新 crash.json / panic 0 / 残 0 ⑤config `da2be5da…` 三时点不变 + wordbook 40960B/Sep10 不变 ⑥warnings **98 / 88 / 17**（基线 98/89/17 ⇒ **test 88 −1 如实报**，方向为减少）⑦探针 ⑧四表三副本全等（itn `60b227de…`/scene `8ea93bb1…`/homophone `a5fd4a61…`/wordbook `ac9a72ee…`）。
+- **探针（`grep -a -o -F` 字面量）**：正 `SLIDING-WINDOW-367`=**3** / `[LocalRT-DBG-298]`=**3** / `AUTOLEARN`=**11**；🆕 反 `sub-seg failed`=**0**（路A 每片解码字面量，随 367 废弃）/ `PUNCT_REFRESH_INTERVAL`=0 / `ACC_MIN_SEGMENT_MS_DEFAULT`=0 / `min_seg_ms`=0。⚠️ `PARALLEL-ACC-298` **不可作反向探针**（该机制仍活，`main.rs:10583` 有生产字面量），故取其被删的 `sub-seg failed` 分支。
+- **三特殊点**：① **dll 三副本**：出包前 `target/release` 已是新 1.28.2，但 `Publish/` 与 `sherpa-onnx-lib/` 仍旧 1.24.4 ⇒ 已同步，四张 dll 三副本 sha256 **全等**；`onnxruntime.dll`=`422d776a…`、**ProductVersion=1.28.2**；旧 1.12.38 目录**保留未动**。② **itn-rules.toml**：出包前 root `60b227de` vs Publish/target-release `ab950ba4` 分叉 ⇒ 已同步，三行全等 `60b227de`。③ **Publish/models 1.7B**：出包前**缺失** ⇒ 已补拷（3 onnx + tokenizer，与源逐一 sha256 全等）；0.6B 保留。
+- **Gavin 端测九条**：🔴 松手后等待时间（核心收益）／预览修正质量（二比零→二比一）／🔴 **吃字重字（最大风险，重点观察）**／接缝重复消失／标点按语义／1.7B 转写质量／「梅开二度」「他一度以为」不再误转／长录音近 180s + 不新增 crash.json／⚠️ 出包强杀输入法，完成后重启。
+- **红线**：版本未动 / 未改生产代码 / 未 push / 未 `cargo clean` / 未动 models 源目录 / 零凭证。⚠️ 模型拷贝首次 robocopy 挂死，改分步 `cp` 完成。
+
 ## 2026-09-22 — tester-1 — TEST-EXEC + BUILD-346 ✅ 出包（v0.9.3 批次十；八项 PASS，正反向探针 3 归零）
 
 - **范围**：`701c4d8`(ACC-DISPATCH-SILENCE-ONLY-346) / `e2f259f`(PUNCT-PREVIEW-SEMANTIC-349) / `c9b59b3`(PUNCT-FINAL-REDO-350) / `e829c67`(零行为提取) / `1269ddc`(TEST-SYNC-352) / `f335bd8`(351 PoC) + 版本升 **0.9.3**。绿灯前置：允许 351 停写并单独 commit 后才开跑（脏树风险已上报主控确认）。
@@ -240,3 +253,12 @@
 - **验证**：`cargo fmt --check` EXIT 0 ｜ `cargo check` 0 error、warnings **98≤99** ｜ `numstat`==`-w`（246/0、19/8）｜ 全量 `cargo test` **0 failed**、`itn::` **267P/0F**（+5）。临时探针已删。
 - 🔴 `itn-rules.toml` 三副本：root 已改，`Publish/` + `target/release/` **待 tester-1 出包同步**。
 - 未动版本号 / 未 commit / 未 push / 未出包（DEC-079）/ 未碰甲/乙型 / 零凭证。
+
+## 2026-09-22 — coder-1 — FIX-ORDERED-REFLOW-DROP-368（🔴 P0 吃字）✅ 交付
+
+- **缺陷**：`OrderedReflow::push` 对齐失败时 `committed` 不推进但 `last_window_text` 被无条件覆盖 ⇒ 本该定稿的滑出片永久丢失（吃字）。
+- **修法**：失败 ⇒ committed 不动 + last_window_text 不动 + 不产出回灌 + next 仍 +=1；连续失败 ≥ `REFLOW_FALLBACK_FAILS(3)` ⇒ 兜底旧 last 整体并入 committed（不去重）再接新窗；取向「宁可重复不可丢字」写入注释。
+- **范围**：仅 `OrderedReflow`（+常量）；未动 `align_overlap`/`group_window_start_secs`；未碰 `itn.rs`。
+- **单测**：4 条新增全绿（中途失败不丢字 / 失败不产出 / 连续失败兜底 / next 推进）；3 条旧乱序测试改用长文本同步。
+- **验证**：`cargo fmt --check` EXIT 0；全量 cargo test 0 failed（1379P/28I）；`cargo build --release` EXIT 0；warnings 98/89 基线；numstat（transcription 115/18 vs -w 111/14，差 4 行 whitespace-only 落改动区块内）。
+- **未改版本 / 未 push / 零凭证**。🔴 BUILD-347 含此缺陷，须重出包。

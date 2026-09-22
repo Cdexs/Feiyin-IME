@@ -1396,11 +1396,16 @@ pub(crate) const WINDOW_DECODE_CONCURRENCY: usize = 2;
 /// 🔴 解码可**乱序完成**，但对齐状态机**必须按 seq 串行**（`align_overlap` 依赖前一窗文本）
 /// ⇒ 结果先入 `pending`，等 `next` 到齐才依次 align/定稿，产出「应回灌的权威全文」（可 0..n 条）。
 /// 乱序合并会推进错 `committed` ⇒ 文本必错，故**唯一入口 `push` 保证按序**。
+/// 连续对齐失败达到此计数 ⇒ 触发兜底（见 `push`）。
+pub(crate) const REFLOW_FALLBACK_FAILS: usize = 3;
+
 pub(crate) struct OrderedReflow {
     next: usize,
     pending: std::collections::BTreeMap<usize, String>,
     committed: String,
     last_window_text: String,
+    /// 连续「对齐失败（未定稿）」计数；成功即清零。达 [`REFLOW_FALLBACK_FAILS`] 触发兜底。
+    fail_streak: usize,
 }
 
 impl OrderedReflow {
@@ -1410,24 +1415,59 @@ impl OrderedReflow {
             pending: std::collections::BTreeMap::new(),
             committed: String::new(),
             last_window_text: String::new(),
+            fail_streak: 0,
         }
     }
 
     /// 收到 `seq` 的解码文本；返回本次**按序**定稿后应回灌的权威全文（可能 0..n 条）。
+    ///
+    /// 🔴 FIX-ORDERED-REFLOW-DROP-368（P0）：对齐失败时必须**彻底保守** ——
+    /// 不滑动、**不更新 `last_window_text`**、**不产出回灌**（否则「本该定稿的滑出片」两边都不在 ⇒ 吃字）；
+    /// `next` 仍 `+=1`（否则后续 seq 卡死）。
+    /// 下一个窗口仍可与**旧** `last_window_text` 对齐（重叠变小但通常仍在）。
+    /// 🔴 连续失败达 [`REFLOW_FALLBACK_FAILS`] ⇒ 兜底：把旧 `last_window_text` **整体并入 committed（不去重）**
+    /// 再接新窗口 —— 取向明确：**宁可重复，绝不丢字**（重复可删，丢字找不回）。
     pub(crate) fn push(&mut self, seq: usize, text: String) -> Vec<String> {
         self.pending.insert(seq, text);
         let mut out = Vec::new();
         while let Some(text) = self.pending.remove(&self.next) {
-            if !self.last_window_text.is_empty() && !text.is_empty() {
-                let a = align_overlap(&self.last_window_text, &text);
-                if a.ok {
+            let can_align = !self.last_window_text.is_empty() && !text.is_empty();
+            let a = if can_align {
+                align_overlap(&self.last_window_text, &text)
+            } else {
+                // 首窗 / 空窗：无需对齐，直接推进（行为与本缺陷无关）。
+                AlignResult {
+                    committed_prefix: String::new(),
+                    overlap_chars: 0,
+                    ok: true,
+                }
+            };
+            if a.ok {
+                if !a.committed_prefix.is_empty() {
                     self.committed.push_str(&a.committed_prefix);
                 }
+                if !text.is_empty() {
+                    self.last_window_text = text;
+                }
+                self.fail_streak = 0;
+                out.push(format!("{}{}", self.committed, self.last_window_text));
+            } else {
+                // 保守：保持上一次结果（last_window_text 不动）、不回灌。
+                self.fail_streak += 1;
+                if self.fail_streak >= REFLOW_FALLBACK_FAILS {
+                    // 兜底：宁可重复不可丢字 —— 旧 last 整体并入 committed，再采用新窗。
+                    self.committed.push_str(&self.last_window_text);
+                    self.last_window_text = text;
+                    self.fail_streak = 0;
+                    out.push(format!("{}{}", self.committed, self.last_window_text));
+                } else if log::log_enabled!(log::Level::Debug) {
+                    log::debug!(
+                        "[SLIDING-WINDOW-367] reflow align 未过，保持上一次（seq={} fail_streak={}）",
+                        seq,
+                        self.fail_streak
+                    );
+                }
             }
-            if !text.is_empty() {
-                self.last_window_text = text;
-            }
-            out.push(format!("{}{}", self.committed, self.last_window_text));
             self.next += 1;
         }
         out
@@ -4191,31 +4231,32 @@ mod sliding_window_367_tests {
 
     // ---- (B) 窗口间并发：乱序完成 ⇒ 按 seq 有序定稿 ----
     /// 🔴 造「后发先至」：seq1 先完成但 seq0 未到 ⇒ **不得定稿**；seq0 到齐 ⇒ 依次定稿 0、1。
+    /// （用长文本保证与 `align_overlap` 双门兼容：短文本会被保守策略拒绝，见 P0 修复。）
     #[test]
     fn ordered_reflow_commits_in_seq_despite_out_of_order_arrival() {
         let mut o = OrderedReflow::new();
         assert!(
-            o.push(1, "B".to_string()).is_empty(),
+            o.push(1, "BBBB CCCC DDDD".to_string()).is_empty(),
             "缺 seq0 ⇒ seq1 先到也不得定稿（必须先对齐再推进）"
         );
-        let out = o.push(0, "A".to_string());
+        let out = o.push(0, "AAAA BBBB CCCC".to_string());
         assert_eq!(out.len(), 2, "seq0 到齐后应**依次**产出 0 与 1 两条回灌");
-        assert_eq!(o.push(2, "C".to_string()).len(), 1);
+        assert_eq!(o.push(2, "CCCC DDDD EEEE".to_string()).len(), 1);
         let (_committed, last) = o.finish();
-        assert_eq!(last, "C", "最后窗口文本应为 seq2");
+        assert_eq!(last, "CCCC DDDD EEEE", "最后窗口文本应为 seq2");
     }
 
     /// 中间有洞（seq1 缺）⇒ seq2 被暂存，填洞后 1、2 一起按序产出。
     #[test]
     fn ordered_reflow_holds_until_gap_filled() {
         let mut o = OrderedReflow::new();
-        assert_eq!(o.push(0, "A".to_string()).len(), 1);
+        assert_eq!(o.push(0, "AAAA BBBB CCCC".to_string()).len(), 1);
         assert!(
-            o.push(2, "C".to_string()).is_empty(),
+            o.push(2, "CCCC DDDD EEEE".to_string()).is_empty(),
             "缺 seq1 ⇒ seq2 不得定稿"
         );
         assert_eq!(
-            o.push(1, "B".to_string()).len(),
+            o.push(1, "BBBB CCCC DDDD".to_string()).len(),
             2,
             "seq1 到齐 ⇒ 1、2 一起按序定稿"
         );
@@ -4225,11 +4266,67 @@ mod sliding_window_367_tests {
     #[test]
     fn ordered_reflow_sequential_arrival_is_immediate() {
         let mut o = OrderedReflow::new();
-        assert_eq!(o.push(0, "甲".to_string()).len(), 1);
-        assert_eq!(o.push(1, "乙".to_string()).len(), 1);
-        assert_eq!(o.push(2, "丙".to_string()).len(), 1);
+        assert_eq!(o.push(0, "AAAA BBBB CCCC".to_string()).len(), 1);
+        assert_eq!(o.push(1, "BBBB CCCC DDDD".to_string()).len(), 1);
+        assert_eq!(o.push(2, "CCCC DDDD EEEE".to_string()).len(), 1);
         let (_committed, last) = o.finish();
-        assert_eq!(last, "丙");
+        assert_eq!(last, "CCCC DDDD EEEE");
+    }
+
+    // ---- FIX-ORDERED-REFLOW-DROP-368（P0 吃字）----
+    /// 🔴 中途对齐失败**不丢字**：失败窗保持上一次、不产出；后续窗仍与旧窗对齐 ⇒ 滑出片不丢。
+    #[test]
+    fn ordered_reflow_mid_failure_does_not_drop_text() {
+        let mut o = OrderedReflow::new();
+        assert_eq!(o.push(0, "AAAA BBBB CCCC".to_string()).len(), 1);
+        assert_eq!(o.push(1, "BBBB CCCC DDDD".to_string()).len(), 1); // ok ⇒ committed="AAAA "
+        assert_eq!(
+            o.push(2, "XXXX YYYY ZZZZ".to_string()).len(),
+            0,
+            "对齐失败（2）⇒ 不产出回灌"
+        );
+        let out3 = o.push(3, "CCCC DDDD EEEE".to_string());
+        assert_eq!(out3.len(), 1, "后续窗仍与**旧**窗对齐 ⇒ 正常定稿");
+        let (committed, last) = o.finish();
+        let final_text = format!("{}{}", committed, last);
+        for tok in ["AAAA", "BBBB", "CCCC", "DDDD", "EEEE"] {
+            assert!(
+                final_text.contains(tok),
+                "不得丢字：缺 {tok}（final={final_text}）"
+            );
+        }
+    }
+
+    /// 🔴 连续失败达阈值 ⇒ 兜底（宁可重复不可丢字）：旧 last 并入 committed 后再接新窗。
+    #[test]
+    fn ordered_reflow_consecutive_failures_fallback_no_loss() {
+        let mut o = OrderedReflow::new();
+        assert_eq!(o.push(0, "AAAA BBBB CCCC".to_string()).len(), 1);
+        assert!(o.push(1, "XXXX YYYY".to_string()).is_empty());
+        assert!(o.push(2, "QQQQ RRRR".to_string()).is_empty());
+        let out3 = o.push(3, "ZZZZ WWWW".to_string());
+        assert_eq!(out3.len(), 1, "连续失败 ≥3 ⇒ 兜底产出");
+        let (committed, last) = o.finish();
+        let final_text = format!("{}{}", committed, last);
+        assert!(
+            final_text.contains("AAAA"),
+            "兜底后旧文本仍在（不丢字）：{final_text}"
+        );
+        assert!(final_text.contains("ZZZZ"), "新窗文本接上：{final_text}");
+    }
+
+    /// 失败后 `next` 仍推进 ⇒ 后续 seq 不卡死。
+    #[test]
+    fn ordered_reflow_next_advances_after_failure() {
+        let mut o = OrderedReflow::new();
+        assert_eq!(o.push(0, "AAAA BBBB CCCC".to_string()).len(), 1);
+        assert!(o.push(1, "XXXX YYYY".to_string()).is_empty());
+        let out = o.push(2, "BBBB CCCC DDDD".to_string());
+        assert_eq!(
+            out.len(),
+            1,
+            "失败后 next 仍推进，后续 seq 能处理（不卡死）"
+        );
     }
 }
 

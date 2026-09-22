@@ -1036,3 +1036,21 @@ load_wordbook_vocabulary()
 | 探针 | 正：`[LocalRT-DBG-298]`=4 / `[LocalRT-DBG-325]`=2 / `AUTOLEARN`=11 / `Punctuation strip node`=1；🆕 **反：`PUNCT_REFRESH_INTERVAL`=0 / `ACC_MIN_SEGMENT_MS_DEFAULT`=0 / `min_seg_ms`=0** ⇒ 349 定时 + 346 长度支彻底移除 |
 | 端测 | 待 Gavin 六条（🔴 核心=预览标点不打句中／⚠️已知代价：长不停顿说话预览无标点（1200ms 才打）请表态／350 最终标点无 `。。`／在线 realtime 与本地 performance 两档须无变化／346 `silence=` 恒 ≥1200ms／不得新增 crash.json） |
 | 🔴 边界 | 353(`4112354`,+73)/`mod.rs`(+10) 均晚于本包提交、纯 `#[cfg(test)]` 不进 release，未纳入本次回归（超本批范围） |
+
+
+## v0.9.3（批次十一 · BUILD-347）· 2026-09-22 · 滑动窗口重构 + 1.7B + 标点语义（版本 0.9.3）
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 354/356（ITN「度」义项消歧 + 固定语保护）/ 359（sherpa 1.13.8 + ORT **1.28.2** + accuracy 换 Qwen3 **1.7B** + 应用层剥语种前缀）/ 363/364（acc 双路 + 录音上限 **300→180s** + 预算精确计算）/ DEC-080-365（摘除「剥光标点+二次打点」节点）/ 367（**滑动窗口四阶段**：路A 废弃、松手后不再全量解码、窗口间并发池 + 有序定稿）/ `ae166e6` fmt 修复 |
+| 回归 | TEST-EXEC + BUILD-347 root **1464P/0F/30I**（全量，11 二进制；`feiyin-ime` bin **1376P/28I** = 基线逐位吻合；NEW 30+7I / GONE 1）+ src-tauri **92P/0F/0I** + Vitest **7 files/100P/11S/0F**；`cargo fmt --check`（不带 `skip_children`）EXIT 0；warnings **98/88/17**（基线 98/89/17，test −1 如实报） |
+| 出包 | `BUILD-347` 八项核验逐项 PASS；产物 `feiyin-ime` 14.74MB `edf7d088b74e…`（19:28:12）/ `feiyin-ime-ui` 10.05MB `af045bc855c7…`（19:25:18）/ `crash-reporter` 24.88MB `6d71c620bbe9…`（19:26:21）；两副本全等、均异于 BUILD-346 |
+| 三特殊点 | ① **dll 三副本**：`sherpa-onnx-lib`/`Publish`/`target-release` 四张 dll sha256 全等，`onnxruntime.dll`=`422d776a…` 且 **ProductVersion 1.28.2**；旧 1.12.38 目录保留 ② **itn-rules.toml 三副本**：出包前 root `60b227de` vs 另两处 `ab950ba4` 分叉 → 已同步全等 ③ **Publish/models 补 1.7B**：出包前缺失 → 补拷并与源 sha256 全等；0.6B 保留 |
+| 探针 | 正 `SLIDING-WINDOW-367`=3 / `[LocalRT-DBG-298]`=3 / `AUTOLEARN`=11；🆕 反 `sub-seg failed`=0（路A 每片解码，随 367 废弃）/ `PUNCT_REFRESH_INTERVAL`=0 / `ACC_MIN_SEGMENT_MS_DEFAULT`=0 / `min_seg_ms`=0 |
+| 端测 | 待 Gavin 九条（🔴 松手等待时间（核心收益）／预览修正质量／🔴 吃字重字（最大风险）／接缝重复／标点语义／1.7B 转写质量／「梅开二度·一度」不再误转／长录音 180s + 不新增 crash.json／重启输入法） |
+| 过程 | 首轮 `cargo fmt --check` EXIT 1（`mod.rs:4210`）→ 上报主控 `ae166e6` 修复 → `ae166e6` 重跑全量绑定交付 |
+
+### 2026-09-22 · FIX-ORDERED-REFLOW-DROP-368（P0 吃字）交付
+
+- OrderedReflow 对齐失败时 last_window_text 被覆盖 ⇒ 吃字；修为失败即彻底保守（committed/last 都不动、不回灌、next 仍推进）+ 连续失败≥3 兜底并入（宁可重复不丢字）。
+- 仅改 OrderedReflow；新增 4 单测；全量 cargo test 0 failed（1379P）/ fmt --check EXIT 0 / release EXIT 0 / warnings 98-89 基线。BUILD-347 须重出包。
