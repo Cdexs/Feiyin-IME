@@ -1,4 +1,13 @@
 
+### 2026-09-22 · POC-QWEN3-1.7B-RETEST-353 交付（生产口径重测：无统计显著差异）
+
+- 判据变更（Gavin）：内存/速度不再是障碍 ⇒ **唯一判据=生产口径精度**；351 在 ITN 前测 CER 的口径缺陷已修正。
+- 只读复现生产链（`itn::normalize_numbers → normalize_text_for_language → normalize_unit_symbols_only`）后：
+  0.6B **0.0267**(6/225)、1.7B **0.0356**(8/225，剥前缀)；差距 2/225 且全部集中在一个人名的中点号 `·`；含泄漏前缀时 1.7B=0.1467。
+- 🔴 「二比一→2比1」ITN **不修**（已查实，只查不改）；ITN 反引入 2 处过度转换（只报不改）；控制前缀修复 ~5–10 行、须端测（只查不改）。
+- **结论：n=1 无统计显著差异，需扩充语料才能定论**；「为精度换 1.7B」在当前证据下不成立。
+- PoC `4112354`（+73/-0，纯测试）。未改生产代码/未改版本/未 push。
+
 ### 2026-09-22 · POC-QWEN3-1.7B-351 交付（1.7B 实测：**不换**）
 
 - 目标：填 347 留的两个空白（本机 CPU RTF / 1.7B 中文 CER）。实测（16 核 / acc_threads=8 / full.wav 56.15s / 与 313 同切片）：
@@ -956,3 +965,15 @@ load_wordbook_vocabulary()
 | P0 验证 | 单测 `charboundary344_mid_char_raw_len_does_not_panic` 通过 + 删旧 crash.json 后冒烟**未新增**；原现场（长口述）交 Gavin |
 | 探针 | 自检 `feiyin`=19；正向 `337`=4/`336`=1/`325`=1/`AUTOLEARN`=4/`degree_adverbs`=2/`nz_ratio`=2；🆕 **反向 345 `feed_tail_silence`/`SHADOW_TAIL_PAD_MS`/`FLUSH_TAIL_PAD_MS` 全 0** ⇒ 三机制彻底移除 |
 | 端测 | 待 Gavin 五条（🔴 长句说到底 `skipped-hole` 基本消失／不得新增 crash.json／停手尾字 1~3s 补上／D 复核／其余照旧） |
+
+
+## v0.9.3（批次十 · BUILD-346）· 2026-09-22 · 预览/最终标点语义修复 + 派发只判静默（版本 0.9.3）
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 346（`701c4d8`）切片派发只判静默 **1200ms** + 删长度支（DEC-077）/ 349（`e2f259f`）预览标点只在静默 1200ms 打、删 4s 定时与 shadow 强制 / 350（`c9b59b3`）标点剥离独立节点、**只挂本地 realtime**（DEC-066）/ e829c67 零行为提取 `create_qwen3_recognizer_at` / 352（`1269ddc`）6 条独立护栏 / 351（`f335bd8`）1.7B PoC `#[ignore]` |
+| 回归 | TEST-EXEC + BUILD-346 root **1435P/0F/23I**（全量，NEW 15+1I / GONE 0；相对 BUILD-345 GONE=2）+ src-tauri **92P/0F/0I** + Vitest **7 files/100P/11S/0F**；`cargo fmt --check`（不带 `skip_children`）EXIT 0；warnings **99/90/17** |
+| 出包 | `BUILD-346` 八项核验逐项 PASS；产物 `feiyin-ime` 14.68MB `98df432cccca…`（11:37:09）/ `feiyin-ime-ui` 10.05MB `ea68c4023e52…`（11:33:49）/ `crash-reporter` 24.88MB `887957b195f7…`（11:35:11）；两副本全等、均异于 BUILD-345；四张规则表三副本全等 |
+| 探针 | 正：`[LocalRT-DBG-298]`=4 / `[LocalRT-DBG-325]`=2 / `AUTOLEARN`=11 / `Punctuation strip node`=1；🆕 **反：`PUNCT_REFRESH_INTERVAL`=0 / `ACC_MIN_SEGMENT_MS_DEFAULT`=0 / `min_seg_ms`=0** ⇒ 349 定时 + 346 长度支彻底移除 |
+| 端测 | 待 Gavin 六条（🔴 核心=预览标点不打句中／⚠️已知代价：长不停顿说话预览无标点（1200ms 才打）请表态／350 最终标点无 `。。`／在线 realtime 与本地 performance 两档须无变化／346 `silence=` 恒 ≥1200ms／不得新增 crash.json） |
+| 🔴 边界 | 353(`4112354`,+73)/`mod.rs`(+10) 均晚于本包提交、纯 `#[cfg(test)]` 不进 release，未纳入本次回归（超本批范围） |

@@ -6,6 +6,31 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-22 — tester-1 — TEST-EXEC + BUILD-346 ✅ 出包（v0.9.3 批次十；八项 PASS，正反向探针 3 归零）
+
+- **范围**：`701c4d8`(ACC-DISPATCH-SILENCE-ONLY-346) / `e2f259f`(PUNCT-PREVIEW-SEMANTIC-349) / `c9b59b3`(PUNCT-FINAL-REDO-350) / `e829c67`(零行为提取) / `1269ddc`(TEST-SYNC-352) / `f335bd8`(351 PoC) + 版本升 **0.9.3**。绿灯前置：允许 351 停写并单独 commit 后才开跑（脏树风险已上报主控确认）。
+- **回归（全量未过滤；`cargo fmt --check` 不带 `skip_children` EXIT 0）**：root `cargo test --no-fail-fast` **1435P/0F/23I**（EXIT 0，11 二进制）；`src-tauri` **92P/0F/0I** = 基线；Vitest **7 files/100P/11S/0F** = 基线。
+- **NEW/GONE 对账（逐位）**：1420→1435 = **+15P**，22→23 = **+1I**。NEW = 349 2 条 + 350 7 条（`strip_node_*`/`test_350_*`）+ 352 6 条（`sync352_*`）+ 351 `poc_17b_351_fitness`（`#[ignore]`）。**GONE = 0**：346 两条（`acc_should_dispatch_or_semantics`/`acc_should_dispatch_honors_env_thresholds`）**已被 coder-2 的 1420 基线吸收**；349 实测 `+2/-0`、无删除用例（任务书预期的「349 删 4s 定时用例」与实测不符）。相对 BUILD-345（`d87b8b4` 1419P/22I）则 GONE=2、NEW=18+1I（1435=1419+18−2 自洽）。
+- **e829c67 零行为提取鉴定**：`+12/-0`，函数体原样搬入 `create_qwen3_recognizer_at` + 原函数委托，签名/调用点/硬编码目录名不变；0 failed / 无 GONE / 无行为差异 ⇒ **判据成立**。
+- **BUILD-346**：Step1 清残 0 → Step2 npm 1.45s + Tauri 1m25s（17w）→ Step3 主程序 3m11s（**99w** + crash 9w）→ Step4 同步 `Publish/` 三 exe + 四表三副本；UI 两处时间戳 `cp -p` 后逐位一致（11:33:49.338）。产物 main `98df432cccca…`（14,677,504B/11:37:09）/ ui `ea68c4023e52…`（10,050,048B/11:33:49）/ crash `887957b195f7…`（24,879,104B/11:35:11）；两副本全等、三者均异于 BUILD-345。
+- **八项逐项 PASS**：①时间戳 11:33–11:37 ②sha 两副本 + 异于上包 ③**0.9.3**（main/crash `0.9.3.0`、ui `0.9.3`）④冒烟 PID **18876 Responding=True** / `%APPDATA%` 与 `target/release` 两处**均无新 crash.json** / panic 扫描 0 / 残 0 ⑤config `da2be5da…` 三时点不变 + wordbook 40960B/Sep10 不变 ⑥**warnings 99/90/17** = 基线 ⑦探针 ⑧四表三副本全等（itn `ab950ba4…`/scene `8ea93bb1…`/homophone `a5fd4a61…`/wordbook `ac9a72ee…`）。
+- **探针（`grep -a -o -F` 字面量）**：正向 `[LocalRT-DBG-298]`=**4** / `[LocalRT-DBG-325]`=**2** / `AUTOLEARN`=**11** / `Punctuation strip node`=**1**（`main.rs:10965` 生产日志，非 test）；🆕 **反向 `PUNCT_REFRESH_INTERVAL`=0 / `ACC_MIN_SEGMENT_MS_DEFAULT`=0 / `min_seg_ms`=0** ⇒ 349 的 4s 定时与 346 的长度支彻底移除。三符号在 src 仅残留注释，与二进制 0 自洽。
+- 🔴 **时间线边界（待主控知悉）**：回归/构建均基于 7-commit 范围（`f335bd8`）；`4112354`(353 RETEST, +73) 于 **11:38:07** 提交（晚于主程序产物 11:37:09），`mod.rs` 于 11:39:46 再次 dirty（+10）—— 两者均纯 `#[cfg(test)] mod poc_qwen3_17b_351`、不进 release、不影响产物，但 **353 测试代码未纳入本次回归**（超范围，若需覆盖须补跑 `cargo test`）。绿灯时树为 clean（仅两份 `.bak` untracked）。
+- **Gavin 端测六条**：①核心=预览标点不打句中 ②⚠️已知代价：长不停顿说话预览持续无标点（到期 1200ms 才打）——请明确能否接受 ③350 最终标点无 `。。` ④在线 realtime / 本地 performance 两档标点须与上版完全一致 ⑤346 `[LocalRT-DBG-298] seg dispatch` 的 `silence=` 恒 ≥1200ms ⑥不得新增 `target/release/crash.json`。
+- **红线**：版本由主控升未动 / 未改生产代码 / 未 push / 未 `cargo clean` / 未动 `models/…-1.7B-…`（2.2GiB）/ 零凭证。
+
+## 2026-09-22 — coder-1 — POC-QWEN3-1.7B-RETEST-353 ✅ 交付（生产口径重测：**无统计显著差异**；口径修正是重点）
+
+- **背景**：Gavin 新约束「本地 realtime 只有极客用户、内存不是问题、要精度」⇒ 347 §五内存/速度判据作废、**唯一判据=生产口径精度**。主控发现 351 在 **ITN 之前**测 CER。
+- **生产链复现**（只读调用、零生产改动）：`itn::normalize_numbers → normalize_text_for_language → itn::normalize_unit_symbols_only`（`main.rs:10501/10582`）；其后标点/口水词/L2 不影响 CER。日志 `collab/evidence/20260922-poc-qwen3-17b-351/poc-353-itn-raw.log`。
+- **两套数字**：0.6B 裸 0.0356(8) → **生产 0.0267(6)**；1.7B 裸 0.0444(10) → **生产 0.0356(8)**（剥前缀）；含泄漏前缀 0.1467(33)。
+- **逐条差异**：0.6B 裸 8 = 八分之一(4,ITN可修)+二比一(2,ITN不修)+多名重复(2,切片伪影)；生产 6 含 **ITN 反引入 2 处过度转换**(梅开2度/第2轮)。1.7B 与 0.6B 差距 = 仅 2 个缺 `·`。
+- 🔴 **「比」不修**（`二比一`→`二比一`；`八分之一`→`1/8` 命中分数通道）。**只查不改**。附带发现 ITN 过度转换 2 处，亦只报不改。
+- 🔴 **前缀代价**：锚定剥 `^language \w+<asr_text>`，~5–10 行+单测、无接口改动、误剥 0.6B 风险低、须端测。**只查不改**。
+- **结论**：n=1（差 2/225，集中在专名中点号）**无统计显著差异，需扩充语料**；「为精度换 1.7B」当前不成立。
+- **PoC**：`4112354`（+73/-0，纯 `#[cfg(test)]`）。
+- **红线**：未改任何生产代码 / 未改版本 / 未 push / 无速度数字 / 零凭证。
+
 ## 2026-09-22 — coder-1 — POC-QWEN3-1.7B-351 ✅ 交付（1.7B 实测：不换；发现输出前缀硬不兼容）
 
 - **任务**：填 347 留的两个空白（本机 CPU RTF + 1.7B 中文 CER），纯 PoC 零生产逻辑。
