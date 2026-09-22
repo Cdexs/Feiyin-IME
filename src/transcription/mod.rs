@@ -3368,4 +3368,101 @@ mod poc_qwen3_17b_351 {
             );
         }
     }
+
+    // ---- 357：hotwords 通道 = system prompt 通道，实测指令是否被服从 ----
+    /// 生产 decode 同款，但把 `hotwords` 设为任意文本（＝写进 `<|im_start|>system` 段）。
+    fn decode_with_hotwords(
+        rec: &sherpa_onnx::OfflineRecognizer,
+        samples: &[f32],
+        script: ChineseScript,
+        hotwords: Option<&str>,
+    ) -> String {
+        let stream = rec.create_stream();
+        if let Some(h) = hotwords {
+            stream.set_option("hotwords", h);
+        }
+        stream.accept_waveform(16000, samples);
+        rec.decode(&stream);
+        let r = stream.get_result().expect("result");
+        crate::text_normalizer::normalize_text_for_language(
+            &super::Transcriber::strip_asr_special_tokens(r.text.trim()),
+            script,
+        )
+    }
+
+    #[test]
+    #[ignore = "PoC: cargo test --bin feiyin-ime -- --ignored --nocapture poc_357_prompt"]
+    fn poc_357_prompt() {
+        let root = manifest_dir();
+        let rec = create_qwen3_recognizer_at(
+            &root.join("models/sherpa-onnx-qwen3-asr-1.7B-int8-2026-09-22"),
+        )
+        .expect("1.7B");
+        let (fs, rate) = read_wav(&root, "collab/research/audio-real-gavin/processed/full.wav");
+        let slices = slice_fitness(&fs, rate);
+        let zh = &fs[slices[0].0..slices[0].1];
+        let (itn, _) = read_wav(&root, "models/kv259/itn.wav");
+        let (colloq, _) = read_wav(&root, "models/kv259/colloq.wav");
+
+        println!("POC357 === ITN 指令（itn.wav）===");
+        println!(
+            "POC357 itn base: {}",
+            head(
+                &decode_with_hotwords(&rec, &itn, ChineseScript::Simplified, None),
+                200
+            )
+        );
+        for ins in [
+            "把数字都写成阿拉伯数字",
+            "请把数字、日期、时间、金额、单位都规整成阿拉伯数字和标准写法",
+            "输出时做 inverse text normalization",
+        ] {
+            println!(
+                "POC357 itn ins={ins:?}: {}",
+                head(
+                    &decode_with_hotwords(&rec, &itn, ChineseScript::Simplified, Some(ins)),
+                    200
+                )
+            );
+        }
+
+        println!("POC357 === 口水词指令（colloq.wav）===");
+        println!(
+            "POC357 colloq base: {}",
+            head(
+                &decode_with_hotwords(&rec, &colloq, ChineseScript::Simplified, None),
+                240
+            )
+        );
+        for ins in [
+            "去掉嗯、啊、呃等口水词和重复",
+            "Remove filler words, stutters and repetitions.",
+        ] {
+            println!(
+                "POC357 colloq ins={ins:?}: {}",
+                head(
+                    &decode_with_hotwords(&rec, &colloq, ChineseScript::Simplified, Some(ins)),
+                    240
+                )
+            );
+        }
+
+        println!("POC357 === 标点/格式指令（full seg0）===");
+        println!(
+            "POC357 zh base: {}",
+            head(
+                &decode_with_hotwords(&rec, zh, ChineseScript::Simplified, None),
+                150
+            )
+        );
+        for ins in ["在句末加标点", "用简体中文输出"] {
+            println!(
+                "POC357 zh ins={ins:?}: {}",
+                head(
+                    &decode_with_hotwords(&rec, zh, ChineseScript::Simplified, Some(ins)),
+                    150
+                )
+            );
+        }
+    }
 }
