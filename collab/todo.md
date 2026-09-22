@@ -34,6 +34,23 @@
 | `RESEARCH-QWEN3-1.7B-347` | 评估 1.7B 替代现役 0.6B。🔴 门禁已答 | coder-1 | 🔄 ✅ **已交付并验收**：`collab/research/qwen3-asr-1.7b-eval-347.md`（15KB）。结论**有条件可行** —— 官方 k2-fsa 无 1.7B 导出（499 asset 全枚举），但 ModelScope `zengshuishui/Qwen3-ASR-onnx` 的 `model_1.7B/` 与现役 0.6B **同源同脚本**（本地三文件 sha256 与该库逐字节相同），四件套同构、`OfflineQwen3ASRModelConfig` **代码零改动**。代价：+1.32GiB、decoder 权重 2.70× ⇒ CPU 解码约 ×2.7；KV 每 token 与 0.6B **完全相同**（同 28 层/8 KV head/head_dim 128）⇒ 4096 仍成立。🔴 CPU RTF 与中文 CER **均未实测** |
 | `PUNCT-PREVIEW-SEMANTIC-349` | **问题①**：预览窗标点打在句中。主控定位（线索非结论，须先取证）：触发是「4s 定时 **或** 静默 800ms」，两条都与语义无关 —— 4s 一到就把半截句子喂 CT-Transformer，模型必在半句末尾补终止符。方向 A（只认 1200ms 静默、删 4s 定时，口径对齐 346，主控倾向）／ B（保留节奏但剥掉落在末尾的标点） | coder-2 | ✅ 已交付（2026-09-22：先证后改，只认静默 1200ms、删 4s 定时与 shadow 400ms 强制；check 0err / 全量 0F；待 tester-1 出包）|
 | `PUNCT-FINAL-REDO-350` | **Gavin 新增**：最终 acc 转写完 ⇒ **剥光全段标点 + 整段重打**。推翻 `apply_local_punctuation` 的 `!native_punctuated` 门（`main.rs:10802`）。🔴 剥离必须与 `has_effective_punctuation` **共用同一谓词**，词内嵌豁免照搬（`3.14`/`3:30`/`example.com`/`3.5亿` 不许剥）。🔴 **四档全覆盖**（`run_pipeline_core` 共用，DEC-066 禁管线判据），在线 Qwen3 档标点可能变差 ⇒ 必须端测 | coder-1 | 🔄 已派发 |
+| `TEST-SYNC-352` | 阶段三：给 350 补独立护栏（非作者 = coder-2）。重点补作者心智模型照不到的：`has_` 重构等价性的机器护栏（现仅人工论证）／退化输入／UTF-8 边界（344 P0 刚崩过）／门两分支逐字返回原文／剥离必须在 `pretranscribed_native_punctuated` 之前的源码级顺序护栏 | coder-2 | 🔄 已派发 |
+| `POC-QWEN3-1.7B-351` | 填 347 的两个空白：`full.wav` 上的中文 CER（对照 0.6B 的 **0.0444**）+ 本机 CPU RTF。铁律「只变一变量」= 只换模型目录，其余参数锁死；🔴 必须走生产同一条代码路径（`[POC-BYPASSES-PROD-WRAPPER-001]`）；0.6B/1.7B 同次运行同机对比。判据三条缺一不换 | coder-1 | 🔄 已派发 |
+
+**🔴 346/349 不派 TEST-SYNC（主控决定，理由记录在案）**：按
+`feedback_verification_proportional`「问这一步能证明什么之前没证过的东西，答不出就砍」——
+346 已带**源码级结构护栏**（改回读共享计数器就红）、349 有**真实 CT-Transformer 探针**的
+因果证据 + 2 条单测，独立方补护栏边际价值低。350 改的是**用户可见的最终输出**，
+故只对它走阶段三。
+
+**🔴 `andrewleech/qwen3-asr-1.7b-onnx` 已查证不可用**（Gavin 2026-09-22 问，下载 149/likes 8）：
+它是 `decoder_init` + `decoder_step` + 外置 `decoder_weights.data` 的 **KV-cache 外置导出**，
+缺 `conv_frontend.onnx`，且 README 写明 `library_name: onnxruntime`、目标引擎是
+**`transcribe-rs` 不是 sherpa-onnx**。图签名对不上 `OfflineQwen3ASRModelConfig`。
+⇒ **下载量在这里是误导性指标**，跨运行时不可比；真正判据是导出拓扑。
+要用它须改 sherpa-onnx C++（我们用预编译 crate）或整个换引擎，均远超「换模型目录」量级。
+它的 **int4** 变体值得记一笔：若 351 实测 ×2.7 解码开销不可接受，int4 比 int8 更小更快，
+是后续可回看的线索 —— 但须先回答「值不值得为它换引擎」（Gavin 口径）。
 | `QUERY-PUNCT-MECHANISM-348` | 查前端流式模型调标点模型的机制 | 主控 | ✅ 已查清并答复 Gavin（结论见下） |
 
 #### 346 的取舍（Gavin 拍板，照做，端测须盯）
