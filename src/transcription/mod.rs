@@ -3040,5 +3040,15 @@ mod poc_qwen3_17b_351 {
         ] {
             println!("POC353 probe {:?} -> {:?}", s, production_itn(s));
         }
+        // 353-补：定位「过度转换」走哪条通道（主通道 normalize_with_rules vs 补丁通道 unit_symbols）
+        println!("POC353 === 过度转换通道定位 ===");
+        for s in ["梅开二度", "二度", "第二轮", "第2轮", "一度", "一年一度"] {
+            println!(
+                "POC353 ch {:?}: normalize_numbers={:?} | unit_symbols_only={:?}",
+                s,
+                crate::itn::normalize_numbers(s),
+                crate::itn::normalize_unit_symbols_only(s)
+            );
+        }
     }
 }
