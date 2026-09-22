@@ -163,6 +163,11 @@ enum PipelineEvent {
         committed_len: usize,
         has_hole: bool,
         acc_text: String,
+        /// SLIDING-WINDOW-367：`true` ⇒ 消费端**整段替换**预览为 `acc_text`（滑窗权威全文，
+        /// 非前缀关系，不能按 `committed_len` 切；Gavin 方案「整体替换」）；`false` ⇒ 沿用 325
+        /// 原语义（替换前 `committed_len` 字符、保留流式尾巴）。**显式声明节点行为（DEC-066）**，
+        /// 不靠长度关系反推。
+        replace_all: bool,
     },
     /// LOCALRT-SEAM-337（自适应定界）：本片边界冻结通知。
     ///
@@ -283,12 +288,12 @@ static ACC_REFLOW_EDIT_LATCH: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static ACC_REFLOW_STATE: Mutex<Option<(u64, String, usize)>> = Mutex::new(None);
 // LOCALRT-SEAM-337（自适应定界）：两个 pending 槽，**跨事件配对**（acc 文本与边界到达顺序不定）：
-// - `ACC_REFLOW_ACC`   = `(generation, seg_index, acc_text)`（由 PreviewReflow 写）；
+// - `ACC_REFLOW_ACC`   = `(generation, seg_index, acc_text, replace_all)`（由 PreviewReflow 写）；
 // - `ACC_REFLOW_BOUND` = `(generation, seg_index, committed_len: Option<usize>)`（由 ReflowCommit 写）。
 // 两者 seg/gen 匹配时 `try_resolve_reflow` 合成并渲染（`Some`）/ 作废（`None`），随后清空两槽。
 // `RecordingStarted` 清空。
 #[cfg(target_os = "windows")]
-static ACC_REFLOW_ACC: Mutex<Option<(u64, usize, String)>> = Mutex::new(None);
+static ACC_REFLOW_ACC: Mutex<Option<(u64, usize, String, bool)>> = Mutex::new(None);
 #[cfg(target_os = "windows")]
 static ACC_REFLOW_BOUND: Mutex<Option<(u64, usize, Option<usize>)>> = Mutex::new(None);
 #[derive(Debug, Clone, Copy)]
@@ -6936,6 +6941,7 @@ fn process_controller_events(
                 committed_len,
                 has_hole,
                 acc_text,
+                replace_all,
             } => {
                 // 325：本地实时档 accuracy 分片权威文本回灌（**只有本地档会发本事件**）。
                 // 代际门与 StreamingText 同源：陈旧 session 的回灌不得改本 session 浮层。
@@ -6971,7 +6977,7 @@ fn process_controller_events(
                     // （边界由 local_stream 的自适应定界 a/b/c 冻结，自适应、无固定 L）。
                     ACC_REFLOW_LAST_SEG.store(seg_index as i64, Ordering::Release);
                     if let Ok(mut slot) = ACC_REFLOW_ACC.lock() {
-                        *slot = Some((generation, seg_index, acc_text.clone()));
+                        *slot = Some((generation, seg_index, acc_text.clone(), replace_all));
                     }
                     if log::log_enabled!(log::Level::Debug) {
                         log::debug!(
@@ -8300,6 +8306,10 @@ fn spawn_worker_thread(
                                                 committed_len,
                                                 has_hole,
                                                 acc_text: acc_text.clone(),
+                                                // 🔴 SLIDING-WINDOW-367：滑窗 worker 重写后此处改 `true`
+                                                //    （整段替换）。**当前仍是逐片 worker ⇒ 保持 325 语义
+                                                //    （false）**，避免半成品行为变更。
+                                                replace_all: false,
                                             });
                                         }
                                         (ordered, all_native, total_decode_ms)
@@ -9677,6 +9687,22 @@ fn reflow_preview(acc_text: &str, streaming: &str, committed_len: usize) -> Stri
     out
 }
 
+/// SLIDING-WINDOW-367：预览合成选择（纯函数，可单测）。
+/// - `replace_all == true`  ⇒ **整段替换**为 `acc_text`（滑窗权威全文，与流式文本无前缀关系）；
+/// - `replace_all == false` ⇒ 沿用 325 的 `reflow_preview`（替换前 `committed_len` 字 + 流式尾巴）。
+fn reflow_preview_367(
+    replace_all: bool,
+    acc_text: &str,
+    streaming: &str,
+    committed_len: usize,
+) -> String {
+    if replace_all {
+        acc_text.to_string()
+    } else {
+        reflow_preview(acc_text, streaming, committed_len)
+    }
+}
+
 /// ACC-REFLOW-PERSIST-329：流式渲染/镜像前的权威前缀合成。
 ///
 /// `state` = 本代已确定的 `(generation, acc_text, committed_len)`（见 [`ACC_REFLOW_STATE`]）。
@@ -9737,7 +9763,7 @@ fn try_resolve_reflow(
 ) {
     let acc = ACC_REFLOW_ACC.lock().ok().and_then(|g| g.clone());
     let bound = ACC_REFLOW_BOUND.lock().ok().and_then(|g| g.clone());
-    let (Some((ga, sa, acc_text)), Some((gb, sb, bound_opt))) = (acc, bound) else {
+    let (Some((ga, sa, acc_text, replace_all)), Some((gb, sb, bound_opt))) = (acc, bound) else {
         return;
     };
     if ga != gb || sa != sb {
@@ -9756,7 +9782,9 @@ fn try_resolve_reflow(
                 .ok()
                 .and_then(|m| m.clone())
                 .unwrap_or_default();
-            let preview = reflow_preview(&acc_text, &streaming, len);
+            // SLIDING-WINDOW-367：replace_all ⇒ 整段替换预览为权威全文（滑窗文本非流式前缀
+            // 关系，不能按 committed_len 切）；否则沿用 325「替换前 len 字、保留流式尾巴」。
+            let preview = reflow_preview_367(replace_all, &acc_text, &streaming, len);
             if let Ok(mut st) = ACC_REFLOW_STATE.lock() {
                 *st = Some((ga, acc_text.clone(), len));
             }
@@ -15558,5 +15586,39 @@ mod sync352_punct_node_guard_tests {
             strip_punctuation_node("3.14 不错".to_string(), true),
             "3.14 不错"
         );
+    }
+}
+
+// ============================================================
+// SLIDING-WINDOW-367：PreviewReflow `replace_all` 两分支单测
+// 运行：cargo test --bin feiyin-ime -- reflow_preview_367
+// ============================================================
+#[cfg(test)]
+mod reflow_preview_367_tests {
+    use super::reflow_preview_367;
+
+    /// replace_all=true ⇒ **整段替换**：预览 = acc_text，**不拼流式尾巴**（即使尾部更长）。
+    #[test]
+    fn replace_all_whole_replaces() {
+        let acc = "整段权威全文";
+        let streaming = "整段权威全文多余的流式尾巴xyz";
+        assert_eq!(
+            reflow_preview_367(true, acc, streaming, 2),
+            "整段权威全文",
+            "replace_all 必须整段替换、不保留流式尾巴"
+        );
+        // 权威比流式短也不残留尾巴（325 按 committed_len 切会残留 —— 这正是 367 要修的）
+        assert_eq!(
+            reflow_preview_367(true, "短权威", "非常非常长的流式预览文本", 1),
+            "短权威"
+        );
+    }
+
+    /// replace_all=false ⇒ 沿用 325：acc_text + streaming[committed_len..]（逐字不变）。
+    #[test]
+    fn legacy_325_semantics_unchanged() {
+        assert_eq!(reflow_preview_367(false, "AB", "XYZ", 1), "ABYZ");
+        assert_eq!(reflow_preview_367(false, "AB", "XYZ", 0), "ABXYZ");
+        assert_eq!(reflow_preview_367(false, "AB", "XYZ", 3), "AB");
     }
 }
