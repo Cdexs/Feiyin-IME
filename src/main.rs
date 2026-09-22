@@ -8217,6 +8217,9 @@ fn spawn_worker_thread(
                                         let mut total_slices: usize = 0;
                                         // `window_seq -> (start_slice, end_slice)`（dispatch 与 drain 同线程读写）。
                                         let mut window_spans: Vec<(usize, usize)> = Vec::new();
+                                        // FIX-PREFIX-AND-EAT-371（B）：`window_seq -> 本窗各片样本数`
+                                        // —— 与切片区间一起算期望重叠比例，约束 reflow 的对齐 k。
+                                        let mut window_samples: Vec<Vec<usize>> = Vec::new();
                                         let mut window_seq: usize = 0;
                                         let mut ordered = transcription::OrderedReflow::new();
                                         let concurrency = transcription::WINDOW_DECODE_CONCURRENCY.max(1);
@@ -8322,6 +8325,14 @@ fn spawn_worker_thread(
                                                     .send((window_seq, idx, window_audio));
                                                 window_spans
                                                     .push((window_start_slice, window_end_slice));
+                                                // FIX-PREFIX-AND-EAT-371（B）：本窗各片样本数（与
+                                                // `recent_slices[start..]` 一一对应）。
+                                                window_samples.push(
+                                                    recent_slices[start..]
+                                                        .iter()
+                                                        .map(|s| s.len())
+                                                        .collect(),
+                                                );
                                                 rr += 1;
                                                 window_seq += 1;
                                                 // 把已完成结果按 seq 有序定稿 + 回灌（replace_all 整段替换）。
@@ -8347,9 +8358,19 @@ fn spawn_worker_thread(
                                                         .get(seq)
                                                         .copied()
                                                         .unwrap_or((seq, seq + 1));
-                                                    for authoritative in
-                                                        ordered.push(seq, win_ws, win_we, text)
-                                                    {
+                                                    // FIX-PREFIX-AND-EAT-371（B）：带上各片样本数 ⇒ 期望重叠
+                                                    // 比例约束对齐 k（missing ⇒ 空表 ⇒ 退化小 k 优先）。
+                                                    let win_samples = window_samples
+                                                        .get(seq)
+                                                        .cloned()
+                                                        .unwrap_or_default();
+                                                    for authoritative in ordered.push_window(
+                                                        seq,
+                                                        win_ws,
+                                                        win_we,
+                                                        win_samples,
+                                                        text,
+                                                    ) {
                                                         let _ = acc_event_tx.send(
                                                             PipelineEvent::PreviewReflow {
                                                                 generation: session_generation,
@@ -8390,9 +8411,17 @@ fn spawn_worker_thread(
                                                     .get(seq)
                                                     .copied()
                                                     .unwrap_or((seq, seq + 1));
-                                                for authoritative in
-                                                    ordered.push(seq, win_ws, win_we, text)
-                                                {
+                                                // FIX-PREFIX-AND-EAT-371（B）：带上各片样本数 ⇒ 期望重叠
+                                                // 比例约束对齐 k（missing ⇒ 空表 ⇒ 退化小 k 优先）。
+                                                let win_samples =
+                                                    window_samples.get(seq).cloned().unwrap_or_default();
+                                                for authoritative in ordered.push_window(
+                                                    seq,
+                                                    win_ws,
+                                                    win_we,
+                                                    win_samples,
+                                                    text,
+                                                ) {
                                                     let _ = acc_event_tx.send(
                                                         PipelineEvent::PreviewReflow {
                                                             generation: session_generation,

@@ -483,58 +483,42 @@ pub(crate) fn transcribe_acc_ctx(
     Ok((text, true))
 }
 
-/// MIGRATE-1.13.8-1.7B-359：Qwen3-ASR 1.7B 的**自造语种标注前缀**是否为「标签样」。
+/// FIX-PREFIX-AND-EAT-371：`<asr_text>` 标记必须落在**头部**的字节上限（唯一的护栏）。
 ///
-/// 认可两种形态（355 实测 + Qwen3-ASR 官方协议）：
-/// - A. 官方：`language`（其后可跟空格/`-`/`_` + 语种名），如 `language chinese`
-/// - B. 语种名单词：**无空白、纯字母、≤8 字**，如 `汉语` / `中文` / `日本語` / `English`
-///
-/// 不认可：含空白（非 A 形态）、含标点/数字、超长 —— 防误伤正文。
-fn is_qwen3_language_label(prefix: &str) -> bool {
-    if prefix.is_empty() {
-        return false;
-    }
-    let lower = prefix.to_ascii_lowercase();
-    if lower == "language"
-        || lower.starts_with("language ")
-        || lower.starts_with("language-")
-        || lower.starts_with("language_")
-    {
-        return true;
-    }
-    prefix.chars().count() <= 8
-        && !prefix.chars().any(char::is_whitespace)
-        && prefix.chars().all(char::is_alphabetic)
-}
+/// 取 **64 字节**的理由：已知前缀形态都很短 —— 官方 `language chinese`(16B) / `language cantonese`(18B)，
+/// 模型自造 `<语种词>`（≤8 字，中文 ≈24B）；64B 给出 2× 以上余量覆盖未见过的标签变体
+/// （如 `language <lang> <region>`），而 64B 之后才出现标记 ⇒ 其前已有 ≥21 个汉字正文。
+/// 355 结论：真实语音**不可能念出 `<asr_text>` 这个串** ⇒ 判为正文、不剥（防超长正文里的偶发尖括号）。
+const QWEN3_PREFIX_MAX_BYTES: usize = 64;
 
-/// MIGRATE-1.13.8-1.7B-359：剥掉 Qwen3-ASR 1.7B **自造**的语种标注前缀（语言无关，方案 B）。
+/// MIGRATE-1.13.8-1.7B-359 / FIX-PREFIX-AND-EAT-371：剥掉 Qwen3-ASR 1.7B **自造**的语种标注前缀。
 ///
-/// 355 实测形态：`language chinese<asr_text>正文`（官方）、或 `汉语<asr_text>正文`（模型自造、
-/// 语种词可为中/英/日/韩…；`language ` 段可能整个缺失）。1.12 的 C++ 只剥「以 `language ` 开头」
-/// 的形态，故非中文语种会漏到我们这 ⇒ 本函数是**语言无关的兜底**。
+/// 🔴 **规则（355 定，371 恢复）**：**无条件截断到第一个 `<asr_text>`（含）**、**语言无关** ——
+/// 不要求前缀「标签样」、也不要求 `<asr_text>` 紧贴标签。
 ///
-/// 🔴 边界（只认开头、不误伤正文）：
-/// - 必须是**开头**的 `<asr_text>`（`text.trim_start()` 之后，且其前缀段是 [`is_qwen3_language_label`] 认可的标签）；
-/// - 前缀段不得含换行、不得再含 `<`、不得含标点/数字；
-/// - 无 `<asr_text>` 或形态不符 ⇒ **原样返回**（0.6B 不吐前缀 ⇒ no-op；正文含尖括号 ⇒ 不误伤）。
+/// 359 实现时收窄了 355 规则（加「标签样」+「紧贴标签」两闸），而生产 `decode_accuracy_once`
+/// 每次都注入 ctx + 词库，**注入改变了模型自造前缀的形态** ⇒ 两闸拦不住 ⇒ 整条前缀漏进正文
+/// （Gavin 端测 21:43：`language chinese<asr_text>` 26 字进了用户文本）。371 去掉两闸。
 ///
-/// 返回原串的切片（调用方 `to_string()`）——避免多一次分配。
+/// **唯一保留的护栏是位置**：标记起点必须在前 [`QWEN3_PREFIX_MAX_BYTES`] 字节内（见其理由）。
+/// 无 `<asr_text>` / 标记靠后 ⇒ **原样返回**（0.6B 不吐前缀 ⇒ no-op；正文含尖括号 ⇒ 不误伤）。
+///
+/// 命中时打 DEBUG 埋点（原样打印被剥掉的整段头部），便于下次变形时直接从日志看到模型吐了什么。
 fn strip_qwen3_language_prefix(text: &str) -> &str {
     const MARKER: &str = "<asr_text>";
     let t = text.trim_start();
     let Some(pos) = t.find(MARKER) else {
         return text;
     };
-    let prefix = &t[..pos];
-    // 🔴 `<asr_text>` 必须**紧贴**标签（真实前缀形态 `language chinese<asr_text>` / `汉语<asr_text>`
-    //    皆无尾空格）。若前一位是空白，多为正文里的「某词 空格 <asr_text>」⇒ 不剥。
-    if prefix.ends_with(char::is_whitespace)
-        || prefix.contains('\n')
-        || prefix.contains('<')
-        || !is_qwen3_language_label(prefix)
-    {
+    if pos > QWEN3_PREFIX_MAX_BYTES {
+        // 正文中段（靠后）的标记 ⇒ 视为正文，不剥。
         return text;
     }
+    // FIX-PREFIX-AND-EAT-371：把被剥掉的原始头部（前缀 + 标记）原样打进日志。
+    log::debug!(
+        "[LocalRT-DBG-371] qwen3 prefix stripped: {:?}",
+        &t[..pos + MARKER.len()]
+    );
     // 截到 `<asr_text>` 之后，顺带吃掉紧随的空白与常见分隔冒号。
     t[pos + MARKER.len()..].trim_start_matches(|c: char| c.is_whitespace() || c == ':' || c == '：')
 }
@@ -1333,53 +1317,58 @@ fn edit_distance_chars(a: &[char], b: &[char]) -> usize {
     prev[n]
 }
 
-/// SLIDING-WINDOW-367 ④：滑动对齐 —— 找 `prev` 的后缀与 `new` 的前缀的最长**可接受**重叠
-/// （按去标点/空白后的内容比对；容许 [`ALIGN_MAX_EDIT_RATIO`] 内的编辑距离以吸收局部纠错）。
+/// FIX-PREFIX-AND-EAT-371（B·层②）：软范围容差 —— **不对称，向下宽、向上紧**。
 ///
-/// 🔴 **滑动需同时满足两条件**：
-/// 1. **长度门**：`overlap ≥ max(ALIGN_MIN_OVERLAP_CHARS, new有效字 × ALIGN_MIN_OVERLAP_RATIO)`；
-/// 2. **质量门**：重叠区 `编辑距离 / overlap ≤ ALIGN_MAX_EDIT_RATIO`。
-/// 两者都满足才返回 `ok=true`；否则 `ok=false`（调用方**不滑动、不定稿**，保持上一次结果）。
-pub(crate) fn align_overlap(prev: &str, new: &str) -> AlignResult {
-    let prev_keep: Vec<(usize, char)> = prev
-        .char_indices()
-        .filter(|(_, c)| align_keep_char(*c))
+/// | 方向 | 选到的 `k` | 切点 | 后果 |
+/// | --- | --- | --- | --- |
+/// | 向**小**放宽（本常量） | `k < 真值` | 靠后 | `committed` 偏长 ⇒ **重复**（可容忍） |
+/// | 向**大**放宽（[`ALIGN_EXPECTED_K_TOL_UP`]） | `k > 真值` | 靠前 | `committed` 偏短 ⇒ **吃掉一小段**（P0） |
+///
+/// 🔴 层① 只保证 `committed_prefix` **非空**，**不保证不吃半句** ⇒ 两方向代价不对等
+/// ⇒ 上界收紧（+25%）、下界放宽（−50%）。「宁宽勿窄」只适用于**安全方向**。
+pub(crate) const ALIGN_EXPECTED_K_TOL_DOWN: f32 = 0.50;
+/// 见 [`ALIGN_EXPECTED_K_TOL_DOWN`]：向上（危险方向）收紧到 +25%。
+pub(crate) const ALIGN_EXPECTED_K_TOL_UP: f32 = 0.25;
+
+/// FIX-PREFIX-AND-EAT-371（B·层②）：期望 `k` 的候选区间 `[lo, hi]`（已按 `min_len` / `hi_all` 夹紧）。
+///
+/// `hi_all` 已含层① 的硬上界（`prev_extra_slices ≥ 1 ⇒ k < prev 有效字数`）⇒ 本函数不重复处理硬约束。
+/// 不对称性见 [`ALIGN_EXPECTED_K_TOL_DOWN`]（向下 −50% 宽 / 向上 +25% 紧）。
+fn expected_k_band(expected_k: usize, min_len: usize, hi_all: usize) -> (usize, usize) {
+    let down = ((expected_k as f32) * ALIGN_EXPECTED_K_TOL_DOWN).ceil() as usize;
+    let up = ((expected_k as f32) * ALIGN_EXPECTED_K_TOL_UP).ceil() as usize;
+    (
+        expected_k.saturating_sub(down).max(min_len),
+        (expected_k + up).min(hi_all),
+    )
+}
+
+/// 取 `k` 作为重叠长度试一次质量门；通过 ⇒ 返回定稿结果，否则 `None`。
+fn align_try_k(
+    prev: &str,
+    prev_keep: &[(usize, char)],
+    new_keep: &[char],
+    k: usize,
+) -> Option<AlignResult> {
+    let p_tail: Vec<char> = prev_keep[prev_keep.len() - k..]
+        .iter()
+        .map(|(_, c)| *c)
         .collect();
-    let new_keep: Vec<char> = new.chars().filter(|c| align_keep_char(*c)).collect();
-    if prev_keep.is_empty() || new_keep.is_empty() {
-        return AlignResult {
-            committed_prefix: String::new(),
-            overlap_chars: 0,
-            ok: false,
-        };
+    let dist = edit_distance_chars(&p_tail, &new_keep[..k]);
+    let ratio = dist as f32 / k as f32;
+    if ratio <= ALIGN_MAX_EDIT_RATIO {
+        let cut_byte = prev_keep[prev_keep.len() - k].0;
+        Some(AlignResult {
+            committed_prefix: prev[..cut_byte].to_string(),
+            overlap_chars: k,
+            ok: true,
+        })
+    } else {
+        None
     }
-    let max_k = prev_keep.len().min(new_keep.len());
-    let min_len = ALIGN_MIN_OVERLAP_CHARS
-        .max((new_keep.len() as f32 * ALIGN_MIN_OVERLAP_RATIO).ceil() as usize);
-    if max_k < min_len {
-        return AlignResult {
-            committed_prefix: String::new(),
-            overlap_chars: 0,
-            ok: false,
-        };
-    }
-    // 从最长重叠往短找，取第一个质量合格者（长重叠优先 ⇒ 边界更靠前、更稳）。
-    for k in (min_len..=max_k).rev() {
-        let p_tail: Vec<char> = prev_keep[prev_keep.len() - k..]
-            .iter()
-            .map(|(_, c)| *c)
-            .collect();
-        let dist = edit_distance_chars(&p_tail, &new_keep[..k]);
-        let ratio = dist as f32 / k as f32;
-        if ratio <= ALIGN_MAX_EDIT_RATIO {
-            let cut_byte = prev_keep[prev_keep.len() - k].0;
-            return AlignResult {
-                committed_prefix: prev[..cut_byte].to_string(),
-                overlap_chars: k,
-                ok: true,
-            };
-        }
-    }
+}
+
+fn align_fail() -> AlignResult {
     AlignResult {
         committed_prefix: String::new(),
         overlap_chars: 0,
@@ -1387,11 +1376,153 @@ pub(crate) fn align_overlap(prev: &str, new: &str) -> AlignResult {
     }
 }
 
+/// SLIDING-WINDOW-367 ④：滑动对齐 —— 找 `prev` 的后缀与 `new` 的前缀的**可接受**重叠
+/// （按去标点/空白后的内容比对；容许 [`ALIGN_MAX_EDIT_RATIO`] 内的编辑距离以吸收局部纠错）。
+///
+/// 🔴 **滑动需同时满足两条件**：
+/// 1. **长度门**：`overlap ≥ max(ALIGN_MIN_OVERLAP_CHARS, new有效字 × ALIGN_MIN_OVERLAP_RATIO)`；
+/// 2. **质量门**：重叠区 `编辑距离 / overlap ≤ ALIGN_MAX_EDIT_RATIO`。
+/// 两者都满足才返回 `ok=true`；否则 `ok=false`（调用方**不滑动、不定稿**，保持上一次结果）。
+///
+/// **无区间先验**的退化入口（等价 `AlignPrior::none()`）⇒ 小 `k` 优先；生产走
+/// [`align_overlap_with_prior`]（带切片区间/时长先验）。保留供单测直接考察退化路径。
+#[allow(dead_code)]
+pub(crate) fn align_overlap(prev: &str, new: &str) -> AlignResult {
+    align_overlap_with_prior(prev, new, AlignPrior::none())
+}
+
+/// FIX-PREFIX-AND-EAT-371（B）：对齐可用的**区间先验**（四层判据的 ① ② 层输入）。
+#[derive(Clone, Copy)]
+pub(crate) struct AlignPrior {
+    /// ② 软范围（**估算，只做粗筛**）：期望重叠比例 = 共享片样本和 / 本窗样本和。
+    /// `None` = 拿不到区间信息 ⇒ 退化层 ④ 偏小 `k`。
+    pub expected_ratio: Option<f32>,
+    /// ① 硬约束（**精确，零假设**）：上一窗比本窗**多出的有声切片数** `m = ws_new - ws_prev`。
+    /// VAD 切出的片都对应非空话音 ⇒ `m ≥ 1` 时那些片的话必须在 `committed_prefix` 里
+    /// ⇒ `k` **严格小于** `prev` 有效字数（否则切点在开头 ⇒ `committed_prefix` 为空 ⇒ 吃字）。
+    pub prev_extra_slices: usize,
+}
+
+impl AlignPrior {
+    /// 无任何区间先验（退化入口用）。
+    pub(crate) fn none() -> Self {
+        Self {
+            expected_ratio: None,
+            prev_extra_slices: 0,
+        }
+    }
+}
+
+/// FIX-PREFIX-AND-EAT-371（B）：用**已知的切片区间/音频时长**约束重叠长度 `k`。
+///
+/// 🔴 **为什么不能在全区间自由搜**：原实现「从最长重叠 `max_k` 往短找、取第一个质量合格者」
+/// 在**周期性内容**下是错的 —— `prev = S1S2S3`、`new = S2S3S4`（同一句连说）时 `k = max_k`
+/// 处的 `p_tail` 与 `new` 前缀**逐字相等**（`dist = 0`）⇒ 先命中 ⇒ 切点钉在最左
+/// ⇒ `committed_prefix = ""` ⇒ **整段滑出文本被丢**（Gavin 端测 21:43 丢了「明天天气好的话，可以一起」）。
+///
+/// 🔴 **四层判据（按顺序）**：
+/// 1. **① 硬约束（精确）**：`prev_extra_slices ≥ 1` ⇒ `k` 必须 `< prev有效字数`（⇒ `committed_prefix` 非空）。
+/// 2. **② 软范围（估算，只做粗筛）**：期望 `k ≈ 新窗有效字 × expected_ratio`，取其 ±
+///    [`expected_k_band`]（**不对称**：向下 −50% 宽、向上 +25% 紧）的窄带。**按时长估字数本身不精确**（语速不匀、句中停顿 ⇒
+///    秒数涨字数不涨 ⇒ 估值虚高），故它**只用于排除自相矛盾的候选，不用于精确定位**；
+///    容差宁可放宽 —— 把真值挡在外面（⇒ 回落兜底 ⇒ 重复）比放进一个错值（⇒ 丢字）更糟。
+/// 3. **③ 质量门**：在候选内用编辑距离挑切点（现有机制，未改）。
+/// 4. **④ 兜底**：拿不到区间信息 ⇒ **升序**（小 `k` 优先）：`k` 小 ⇒ 切点靠后 ⇒ `committed` 更长
+///    ⇒ 最坏是**重复**；`k` 大 ⇒ 切点靠前 ⇒ **丢字**。Gavin 优先级：**丢字 P0、重复可容忍**
+///    ⇒ 退化方向只能往重复偏，绝不能往丢字偏。
+pub(crate) fn align_overlap_with_prior(prev: &str, new: &str, prior: AlignPrior) -> AlignResult {
+    let prev_keep: Vec<(usize, char)> = prev
+        .char_indices()
+        .filter(|(_, c)| align_keep_char(*c))
+        .collect();
+    let new_keep: Vec<char> = new.chars().filter(|c| align_keep_char(*c)).collect();
+    if prev_keep.is_empty() || new_keep.is_empty() {
+        return align_fail();
+    }
+    let max_k = prev_keep.len().min(new_keep.len());
+    let min_len = ALIGN_MIN_OVERLAP_CHARS
+        .max((new_keep.len() as f32 * ALIGN_MIN_OVERLAP_RATIO).ceil() as usize);
+    if max_k < min_len {
+        return align_fail();
+    }
+    // ① 硬上界（精确）：m ≥ 1 ⇒ k < prev 有效字数。
+    let hi_hard = if prior.prev_extra_slices >= 1 {
+        prev_keep.len().saturating_sub(1)
+    } else {
+        max_k
+    };
+    let hi_all = max_k.min(hi_hard);
+    if min_len > hi_all {
+        return align_fail();
+    }
+    // ② 软范围（估算，粗筛）
+    if let Some(e_raw) = prior
+        .expected_ratio
+        .filter(|r| r.is_finite() && *r > 0.0 && *r <= 1.0)
+        .map(|r| ((new_keep.len() as f32) * r).round() as usize)
+    {
+        let (lo, hi) = expected_k_band(e_raw, min_len, hi_all);
+        if lo <= hi {
+            let e = e_raw.clamp(lo, hi);
+            // ③ 质量门：期望值本身 → 向小 → 向大
+            if let Some(r) = align_try_k(prev, &prev_keep, &new_keep, e) {
+                return r;
+            }
+            for k in (lo..e).rev() {
+                if let Some(r) = align_try_k(prev, &prev_keep, &new_keep, k) {
+                    return r;
+                }
+            }
+            for k in (e + 1)..=hi {
+                if let Some(r) = align_try_k(prev, &prev_keep, &new_keep, k) {
+                    return r;
+                }
+            }
+        }
+        // 窄带内无解 ⇒ 落到 ④ 兜底（**硬约束仍生效**：hi_all 已按 ① 收紧）
+    }
+    // ④ 兜底 / 退化：**升序**（小 k 优先 ⇒ 最坏是重复，绝不丢字）
+    for k in min_len..=hi_all {
+        if let Some(r) = align_try_k(prev, &prev_keep, &new_keep, k) {
+            return r;
+        }
+    }
+    align_fail()
+}
+
 /// SLIDING-WINDOW-367（阶段四·B）：窗口解码**并发度**（默认 2）。
 ///
 /// - `≥2` ⇒ 窗口间并发（窗口2 不等窗口1；同一 recognizer 多线程并发解，官方 `rng_mutex_` 支持）。
 /// - `=1` ⇒ **退化为顺序执行**（Gavin「不理想再退 A」的回退路径，无需重构）。
 pub(crate) const WINDOW_DECODE_CONCURRENCY: usize = 2;
+
+/// FIX-PREFIX-AND-EAT-371（B）：期望重叠比例 —— 「与上一窗**共享的切片**样本和 / 本窗样本和」。
+///
+/// - `ws`/`we` = 本窗切片区间（开区间）；`prev_end` = 上一窗切片的结束下标；
+/// - `slice_samples[i]` = 本窗第 `i` 片（全局号 `ws + i`）的样本数。
+///
+/// 共享切片数 = `prev_end - ws`（窗口结束下标单调不减 ⇒ `prev_end <= we` ⇒ 共享片全在本窗样本表内）。
+/// 任一处信息缺失/不自洽 ⇒ `None`（调用方退化为**小 k 优先**，见 [`align_overlap_with_prior`]）。
+fn expected_overlap_ratio(
+    ws: usize,
+    we: usize,
+    prev_end: usize,
+    slice_samples: &[usize],
+) -> Option<f32> {
+    if we <= ws || slice_samples.len() != we - ws {
+        return None;
+    }
+    let shared = prev_end.saturating_sub(ws);
+    if shared == 0 || shared > slice_samples.len() {
+        return None;
+    }
+    let total: usize = slice_samples.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let overlap: usize = slice_samples[..shared].iter().sum();
+    Some(overlap as f32 / total as f32)
+}
 
 /// SLIDING-WINDOW-367（阶段四·B）：按 `window_seq` **有序定稿**的重排缓冲。
 ///
@@ -1403,15 +1534,19 @@ pub(crate) const WINDOW_DECODE_CONCURRENCY: usize = 2;
 /// 调用方本就知道每个窗口含哪几片（`[start_slice, end_slice)`），别丢掉这个信息：
 /// 1. **零重叠**（`new.start >= prev.end`，两窗不含同一片）⇒ **直接拼接**：
 ///    没有重叠就没有重复可去，拼接即正确答案。**绝不可跳过该窗**（那正是 369 的丢字根因）。
-/// 2. **共享切片**（`new.start < prev.end`，确实有真实重叠）⇒ 走 [`align_overlap`] 去重；
+/// 2. **共享切片**（`new.start < prev.end`，确实有真实重叠）⇒ 走 [`align_overlap_with_prior`] 去重；
 ///    对齐成功 ⇒ 定稿滑出前缀；对齐失败（如长度门误拒）⇒ **退回拼接**
 ///    —— 有重叠也不算错，取向明确：**宁可接缝重复，绝不整窗丢失**（重复可删，丢字找不回）。
+///
+/// 🔴 FIX-PREFIX-AND-EAT-371（B）：共享切片时**把每片时长也算进去**（[`push_window`]），
+/// 用「共享片样本和 / 本窗样本和」把重叠长度 `k` 约束在期望值附近，避免周期性内容下
+/// 「最长重叠优先」把切点钉在最左 ⇒ 丢字（详见 [`align_overlap_with_prior`]）。
 ///
 /// 不变量：**任何非空窗的文本都不会被丢弃**（要么与旧窗去重后定稿，要么整体并入 `committed`）。
 pub(crate) struct OrderedReflow {
     next: usize,
-    /// `seq -> (start_slice, end_slice, text)`；`end_slice` 为开区间端点。
-    pending: std::collections::BTreeMap<usize, (usize, usize, String)>,
+    /// `seq -> (start_slice, end_slice, 各片样本数, text)`；`end_slice` 为开区间端点。
+    pending: std::collections::BTreeMap<usize, (usize, usize, Vec<usize>, String)>,
     committed: String,
     last_window_text: String,
     /// 与 `last_window_text` 对应的切片区间 `[start, end)`；`None` = 尚无有效前窗。
@@ -1432,7 +1567,10 @@ impl OrderedReflow {
     /// 收到 `seq` 的解码文本（`[start_slice, end_slice)` = 该窗含哪些派发片）；
     /// 返回本次**按序**定稿后应回灌的权威全文（可能 0..n 条）。
     ///
-    /// 合并规则见 [`OrderedReflow`] 文档；`next` 始终 `+=1`（否则后续 seq 卡死）。
+    /// **不带**各片样本数 ⇒ 区间先验整块缺失（等价 [`AlignPrior::none`]）⇒ 重叠搜索退化到
+    /// 层 ④「小 k 优先」（安全方向）。生产路径用 [`push_window`]（带样本数 ⇒ ① ② 层都生效）。
+    /// 保留供单测直接考察退化路径。
+    #[allow(dead_code)]
     pub(crate) fn push(
         &mut self,
         seq: usize,
@@ -1440,9 +1578,38 @@ impl OrderedReflow {
         end_slice: usize,
         text: String,
     ) -> Vec<String> {
-        self.pending.insert(seq, (start_slice, end_slice, text));
+        self.push_inner(seq, start_slice, end_slice, Vec::new(), text)
+    }
+
+    /// FIX-PREFIX-AND-EAT-371（B）：带上「本窗各片样本数」的入口。
+    ///
+    /// `slice_samples[i]` = 本窗第 `i` 片（全局切片号 `start_slice + i`）的样本数；
+    /// 与切片区间一起算出期望重叠比例（[`expected_overlap_ratio`]），交给
+    /// [`align_overlap_with_prior`] 把 `k` 锁在期望值附近（层 ① 硬约束 + 层 ② 软范围）。
+    pub(crate) fn push_window(
+        &mut self,
+        seq: usize,
+        start_slice: usize,
+        end_slice: usize,
+        slice_samples: Vec<usize>,
+        text: String,
+    ) -> Vec<String> {
+        self.push_inner(seq, start_slice, end_slice, slice_samples, text)
+    }
+
+    /// 合并规则见 [`OrderedReflow`] 文档；`next` 始终 `+=1`（否则后续 seq 卡死）。
+    fn push_inner(
+        &mut self,
+        seq: usize,
+        start_slice: usize,
+        end_slice: usize,
+        slice_samples: Vec<usize>,
+        text: String,
+    ) -> Vec<String> {
+        self.pending
+            .insert(seq, (start_slice, end_slice, slice_samples, text));
         let mut out = Vec::new();
-        while let Some((ws, we, text)) = self.pending.remove(&self.next) {
+        while let Some((ws, we, samples, text)) = self.pending.remove(&self.next) {
             // 空解码结果：不动文本状态（避免空串污染 last_window_text / 制造假重叠），仅推进 next。
             if text.is_empty() {
                 self.next += 1;
@@ -1454,13 +1621,20 @@ impl OrderedReflow {
                     self.last_window_text = text;
                     self.last_span = Some((ws, we));
                 }
-                Some((_prev_start, prev_end)) => {
+                Some((prev_start, prev_end)) => {
                     if ws >= prev_end {
                         // 零重叠 ⇒ 无重复可去 ⇒ 拼接即正确答案（不得跳过）。
                         self.committed.push_str(&self.last_window_text);
                     } else {
-                        // 共享切片 ⇒ 确有真实重叠 ⇒ 对齐去重。
-                        let a = align_overlap(&self.last_window_text, &text);
+                        // 共享切片 ⇒ 确有真实重叠 ⇒ 对齐去重（371：k 受**区间先验**约束）。
+                        let prior = AlignPrior {
+                            // ② 软范围：期望重叠比例（估算，只做粗筛）
+                            expected_ratio: expected_overlap_ratio(ws, we, prev_end, &samples),
+                            // ① 硬约束（精确）：上一窗比本窗多出的有声片数 m
+                            //    —— VAD 片都有话音 ⇒ 那些片文本必须落在 committed_prefix 里。
+                            prev_extra_slices: ws.saturating_sub(prev_start),
+                        };
+                        let a = align_overlap_with_prior(&self.last_window_text, &text, prior);
                         if a.ok {
                             if !a.committed_prefix.is_empty() {
                                 self.committed.push_str(&a.committed_prefix);
@@ -1470,11 +1644,14 @@ impl OrderedReflow {
                             self.committed.push_str(&self.last_window_text);
                             if log::log_enabled!(log::Level::Debug) {
                                 log::debug!(
-                                    "[SLIDING-WINDOW-367] reflow 有重叠但对齐未过，退回拼接（seq={} span=[{},{}) prev_end={}）",
+                                    "[SLIDING-WINDOW-367] reflow 有重叠但对齐未过，退回拼接（seq={} span=[{},{}) prev=[{}, {}) m={} ratio={:?}）",
                                     seq,
                                     ws,
                                     we,
-                                    prev_end
+                                    prev_start,
+                                    prev_end,
+                                    prior.prev_extra_slices,
+                                    prior.expected_ratio
                                 );
                             }
                         }
@@ -4103,7 +4280,11 @@ mod strip_lang_prefix_359_tests {
         }
     }
 
-    /// 🔴 退化用例：正文含 `<` / `asr_text` / `<asr_text>` 但不应误伤（前缀非标签样）。
+    /// 🔴 退化用例：正文里偶发尖括号/`asr_text` 字样，或标记**靠后**（超出头部护栏）⇒ 不误伤。
+    ///
+    /// 🔴 FIX-PREFIX-AND-EAT-371 起规则恢复 355 的「无条件截断到第一个 `<asr_text>`」，
+    /// 唯一护栏是**位置**（`QWEN3_PREFIX_MAX_BYTES`=64B）⇒ 原先靠「非标签样」拦下的
+    /// `句子：<asr_text>正文`（标记在 9B）现在**会被剥**（见下方 `near_head_non_label_is_stripped`）。
     #[test]
     fn degenerate_does_not_harm_body() {
         // 含尖括号但无 <asr_text> ⇒ 不变
@@ -4116,26 +4297,64 @@ mod strip_lang_prefix_359_tests {
             strip_qwen3_language_prefix("变量 asr_text 的值"),
             "变量 asr_text 的值"
         );
-        // 前缀含标点（非标签样）⇒ 不变
+        // 前缀超长（> 64B）⇒ 标记不在头部 ⇒ 不变；恰好 63B(21 汉字) 仍算头部 ⇒ 剥（边界）
+        let head = |n: usize| -> String {
+            "这是一段很长的中文内容哦".chars().cycle().take(n).collect()
+        };
+        let long = head(22);
+        assert_eq!(long.len(), 66, "自检：22 汉字 = 66B > 64B");
+        let t = format!("{long}<asr_text>正文");
+        assert_eq!(strip_qwen3_language_prefix(&t), t, "标记不在头部 ⇒ 不剥");
+        let short = head(21);
+        assert_eq!(short.len(), 63, "自检：21 汉字 = 63B ≤ 64B");
         assert_eq!(
-            strip_qwen3_language_prefix("句子：<asr_text>正文"),
-            "句子：<asr_text>正文"
+            strip_qwen3_language_prefix(&format!("{short}<asr_text>正文")),
+            "正文",
+            "21 汉字仍在头部护栏内 ⇒ 剥"
         );
-        // 前缀含空白但不是 language 形态 ⇒ 不变
+    }
+
+    /// 🔴 FIX-PREFIX-AND-EAT-371：**去掉闸1/闸2** 后的正面用例。
+    ///
+    /// - 「带空格」`language chinese <asr_text>正文`（359 闸2「紧贴标签」会拦 ⇒ 现在必须剥）
+    /// - 「非标签样」`zh-CN auto<asr_text>正文`（359 闸1「标签样」会拦 ⇒ 现在必须剥）
+    #[test]
+    fn near_head_non_label_is_stripped() {
         assert_eq!(
-            strip_qwen3_language_prefix("我说 <asr_text> 然后"),
-            "我说 <asr_text> 然后"
+            strip_qwen3_language_prefix("language chinese <asr_text>正文内容"),
+            "正文内容",
+            "带空格（标记不紧贴标签）也必须剥（355 规则：无条件截断）"
         );
-        // 前缀超长（> 8 字且非 language）⇒ 不变
         assert_eq!(
-            strip_qwen3_language_prefix("这是一段很长的中文内容哦<asr_text>正文"),
-            "这是一段很长的中文内容哦<asr_text>正文"
+            strip_qwen3_language_prefix("zh-CN auto<asr_text>正文内容"),
+            "正文内容",
+            "非标签样前缀（含连字符/空格）也必须剥"
         );
-        // `<asr_text>` 出现在正文靠后（非开头）⇒ prefix 非标签样或超长 ⇒ 不变
+        // 真实生产形态（Gavin 端测 21:43 漏出的那条）：前缀 + 正文
         assert_eq!(
-            strip_qwen3_language_prefix("今天天气不错我说了这么一段话然后<asr_text>标记"),
-            "今天天气不错我说了这么一段话然后<asr_text>标记"
+            strip_qwen3_language_prefix("language chinese<asr_text>明天天气好的话"),
+            "明天天气好的话"
         );
+    }
+
+    /// 🔴 FIX-PREFIX-AND-EAT-371：**正文中段出现标记不误剥**（位置护栏）。
+    ///
+    /// 标记起点 > 64B ⇒ 其前已有 ≥21 个汉字正文 ⇒ 判为正文（真实语音念不出 `<asr_text>`）。
+    #[test]
+    fn mid_body_marker_is_not_stripped() {
+        // 21 个汉字 = 63B，标记紧跟其后（起点 63B ≤ 64 ⇒ 仍算头部，剥）
+        let head_21 = "一二三四五六七八九十一二三四五六七八九十一";
+        assert_eq!(head_21.chars().count(), 21);
+        assert_eq!(
+            strip_qwen3_language_prefix(&format!("{head_21}<asr_text>后文")),
+            "后文",
+            "21 汉字(63B)仍属头部（≤64B）⇒ 剥"
+        );
+        // 22 个汉字 = 66B > 64 ⇒ 标记不在头部 ⇒ 不剥
+        let head_22 = "一二三四五六七八九十一二三四五六七八九十一二";
+        assert_eq!(head_22.chars().count(), 22);
+        let t = format!("{head_22}<asr_text>后文");
+        assert_eq!(strip_qwen3_language_prefix(&t), t, "22 汉字(66B) ⇒ 不剥");
     }
 
     /// 端到端：并入 `strip_asr_special_tokens` 后，<|…|> 与裸前缀一起被剥。
@@ -4459,6 +4678,291 @@ mod sliding_window_367_tests {
                 "切片 {i}（{marker}）整窗丢失（final={final_text}）"
             );
         }
+    }
+}
+
+// ============================================================
+// FIX-PREFIX-AND-EAT-371（B）：周期性重复内容下的对齐（丢字 P0）
+// 运行：cargo test --bin feiyin-ime -- fix371
+// ============================================================
+#[cfg(test)]
+mod fix371_repeat_align_tests {
+    use super::{
+        align_overlap, align_overlap_with_prior, expected_k_band, AlignPrior, OrderedReflow,
+        ALIGN_EXPECTED_K_TOL_DOWN, ALIGN_EXPECTED_K_TOL_UP,
+    };
+
+    /// Gavin 端测原句（19 字，其中「，」「？」为标点 ⇒ 有效 17 字）。
+    const S: &str = "明天天气好的话，可以一起出来看电影吗？";
+
+    fn eff_chars(t: &str) -> usize {
+        t.chars()
+            .filter(|c| !c.is_whitespace() && !crate::punctuation::PUNCT_CHARS.contains(c))
+            .count()
+    }
+
+    /// `n` 个互异汉字（全部算「有效字符」：非空白、非标点）——用于精确构造重叠长度。
+    fn distinct_chars(n: usize) -> Vec<char> {
+        (0..n)
+            .map(|i| char::from_u32(0x4E00 + i as u32).unwrap())
+            .collect()
+    }
+
+    /// prev(40) / new(40)，且 `new[..20] == prev[20..40]` ⇒ **真重叠 = 20**。
+    fn overlap20_pair() -> (String, String) {
+        let p = distinct_chars(60);
+        let prev: String = p[..40].iter().collect();
+        let new: String = p[20..40].iter().chain(p[40..60].iter()).collect();
+        assert_eq!(prev.chars().count(), 40);
+        assert_eq!(new.chars().count(), 40);
+        assert!(new.starts_with(&prev.chars().skip(20).collect::<String>()));
+        (prev, new)
+    }
+
+    /// 🔴 **B3 改判**：软范围容差**不对称** —— 向下宽（安全：重复）/ 向上紧（危险：吃字）。
+    #[test]
+    fn expected_k_band_is_asymmetric() {
+        let (lo, hi) = expected_k_band(40, 8, 10_000);
+        assert_eq!(lo, 20, "向下 −50%");
+        assert_eq!(hi, 50, "向上 +25%");
+        assert!(
+            40 - lo > hi - 40,
+            "向下(20) 必须比向上(10) 宽：安全方向多留余量"
+        );
+        for e in [10usize, 13, 37, 54, 120] {
+            let (lo, hi) = expected_k_band(e, 1, 10_000);
+            assert_eq!(
+                e - lo,
+                ((e as f32) * ALIGN_EXPECTED_K_TOL_DOWN).ceil() as usize,
+                "下放宽量必须 = e×DOWN（e={e}）"
+            );
+            assert_eq!(
+                hi - e,
+                ((e as f32) * ALIGN_EXPECTED_K_TOL_UP).ceil() as usize,
+                "上放宽量必须 = e×UP（e={e}）"
+            );
+            assert!(e - lo > hi - e, "向下必须严格宽于向上（e={e}）");
+        }
+        // 夹紧：`hi_all`（层① 硬上界）/ `min_len` 均生效
+        assert_eq!(expected_k_band(10, 8, 9).1, 9, "hi 受层① 硬上界夹紧");
+        assert_eq!(expected_k_band(4, 8, 10_000).0, 8, "lo 受 min_len 夹紧");
+    }
+
+    /// 🔴 安全方向**够得着**：估算高估 40%（超出 +25% 但落在 −50% 内）⇒ 仍能从带内够到真值附近。
+    #[test]
+    fn safe_side_reaches_truth_when_estimate_overshoots() {
+        let (prev, new) = overlap20_pair();
+        let (lo, _hi) = expected_k_band(28, 12, 39); // e = 40×0.7 = 28（高估 40%）
+        assert!(lo <= 20, "真值 20 必须落在**向下**可达范围内（lo={lo}）");
+        let r = align_overlap_with_prior(
+            &prev,
+            &new,
+            AlignPrior {
+                expected_ratio: Some(0.7),
+                prev_extra_slices: 1,
+            },
+        );
+        assert!(r.ok, "应找到切点");
+        assert!(
+            (19..=21).contains(&r.overlap_chars),
+            "必须够到真值(20)附近：k={}",
+            r.overlap_chars
+        );
+        assert!(!r.committed_prefix.is_empty());
+    }
+
+    /// 🔴 危险方向**够不着**：估算低估（真值在 `+UP` 之外）⇒ 上界不放行（回落安全兜底）⇒ 绝不过真值。
+    #[test]
+    fn dangerous_up_reach_is_bounded() {
+        let (prev, new) = overlap20_pair();
+        // e = 40×0.3 = 12 ⇒ 上界仅到 +25% = 15（真值 20 在带外）；若对称 ±50% 会放到 18。
+        let (_lo, hi) = expected_k_band(12, 12, 39);
+        assert_eq!(hi, 15, "上界必须紧：+25% ⇒ 15");
+        assert!(hi < 20, "危险方向不得触及真值以上的 k");
+        let r = align_overlap_with_prior(
+            &prev,
+            &new,
+            AlignPrior {
+                expected_ratio: Some(0.3),
+                prev_extra_slices: 1,
+            },
+        );
+        if r.ok {
+            assert!(
+                r.overlap_chars <= 20,
+                "结果永不进入吃字方向（k={} 不得 > 真值 20）",
+                r.overlap_chars
+            );
+        }
+    }
+
+    /// 🔴 **371 验收核心**：周期性重复内容（同一句连说 3 遍 + ASR 变体字）下**全文不丢字**。
+    ///
+    /// 场景（Gavin 端测 21:43）：`prev = S1 S2 S3`、`new = S2 S3 S4`。
+    /// 旧实现「最长重叠优先」在 `k = max_k` 处因 S1..S4 逐字（或 1 字之差）相等 ⇒ 质量门通过
+    /// ⇒ 先命中 ⇒ `committed_prefix = ""` ⇒ **S1 整段被丢**（「明天天气好的话，可以一起」消失）。
+    /// 371 用已知切片时长把 `k` 约束在期望值 ⇒ `k ≈ 2/3` 处 ⇒ `committed = S1` ⇒ 不丢。
+    #[test]
+    fn periodic_repeat_keeps_every_sentence() {
+        let dur_samples = 4_400 * 16; // 每片 ≈4.4s @16k
+        let samples = vec![dur_samples, dur_samples, dur_samples];
+        let mut o = OrderedReflow::new();
+        assert_eq!(
+            o.push_window(0, 0, 3, samples.clone(), format!("{S}{S}{S}"))
+                .len(),
+            1
+        );
+        // 下一窗 [1,4)：新片带 ASR 变体（「明天」→「明甸」）
+        let s4 = S.replacen("明天", "明甸", 1);
+        assert_eq!(
+            o.push_window(1, 1, 4, samples, format!("{S}{S}{s4}")).len(),
+            1
+        );
+        let (committed, last) = o.finish();
+        let full = format!("{committed}{last}");
+        assert!(
+            committed.contains(S),
+            "周期性内容下**滑出句必须定稿**（旧实现丢字）：committed={committed:?}"
+        );
+        assert!(full.contains("明天天气好的话"), "全文不得丢字：{full}");
+        assert!(full.contains("明甸"), "新窗变体字也应在：{full}");
+        // 全文恰为 S1 + (S2 S3 S4') ⇒ 该句出现 3 次（既未丢也未多插一份）
+        assert_eq!(
+            full.matches("明天天气好的话").count(),
+            3,
+            "语句次数必须恰为 3（丢字<3、重复>3 都算错）：{full}"
+        );
+    }
+
+    /// 🔴 **反证（P0 证据固化）**：把**旧算法**（最长重叠优先）在同一输入上跑一遍 ⇒ 命中 `max_k`
+    /// ⇒ 切点在 `prev` 开头 ⇒ `committed_prefix` 为空 ⇒ 丢字。
+    ///
+    /// 旧算法**内联**在测试里（不依赖当前实现），保证这条 P0 的证据不随实现改动而丢失。
+    #[test]
+    fn old_longest_first_would_drop_the_slid_sentence() {
+        let prev = format!("{S}{S}{S}");
+        let new = format!("{S}{S}{S}");
+        let keep = |t: &str| -> Vec<char> {
+            t.chars()
+                .filter(|c| !c.is_whitespace() && !crate::punctuation::PUNCT_CHARS.contains(c))
+                .collect()
+        };
+        let pk = keep(&prev);
+        let nk = keep(&new);
+        let max_k = pk.len().min(nk.len());
+        let min_len = super::ALIGN_MIN_OVERLAP_CHARS
+            .max((nk.len() as f32 * super::ALIGN_MIN_OVERLAP_RATIO).ceil() as usize);
+        let mut old_cut_k = None;
+        for k in (min_len..=max_k).rev() {
+            let p_tail: Vec<char> = pk[pk.len() - k..].to_vec();
+            let dist = super::edit_distance_chars(&p_tail, &nk[..k]);
+            if dist as f32 / k as f32 <= super::ALIGN_MAX_EDIT_RATIO {
+                old_cut_k = Some(k);
+                break;
+            }
+        }
+        assert_eq!(
+            old_cut_k,
+            Some(max_k),
+            "旧算法在周期性内容上会命中 max_k（=切点在 prev 开头 ⇒ committed 空 ⇒ 丢字）"
+        );
+        // 同一输入下新算法（带期望比例）不丢字
+        let new_r = align_overlap_with_prior(
+            &prev,
+            &new,
+            AlignPrior {
+                expected_ratio: Some(2.0 / 3.0),
+                prev_extra_slices: 1,
+            },
+        );
+        assert!(
+            new_r.ok && !new_r.committed_prefix.is_empty(),
+            "新算法必须定稿滑出句（不丢字）"
+        );
+    }
+
+    /// 🔴 有期望比例 ⇒ `k` **钉在期望值**（不因周期性而选到 `max_k`）。
+    #[test]
+    fn expected_ratio_pins_k_near_estimate() {
+        let prev = format!("{S}{S}{S}");
+        let new = format!("{S}{S}{S}");
+        let ratio = 2.0f32 / 3.0;
+        let r = align_overlap_with_prior(
+            &prev,
+            &new,
+            AlignPrior {
+                expected_ratio: Some(ratio),
+                prev_extra_slices: 1,
+            },
+        );
+        assert!(r.ok, "期望区间内应能对齐");
+        let expected = (eff_chars(&new) as f32 * ratio).round() as usize;
+        assert_eq!(r.overlap_chars, expected, "k 必须钉在期望值附近");
+        assert_eq!(
+            r.committed_prefix, S,
+            "切点应落在 S1/S2 边界 ⇒ 只定稿 S1（既不去重过度也不丢字）"
+        );
+    }
+
+    /// 🔴 退化路径（无区间信息）⇒ **小 k 优先**：最坏是重复，绝不丢字。
+    #[test]
+    fn missing_spans_biases_to_small_k() {
+        let prev = format!("{S}{S}{S}");
+        let new = format!("{S}{S}{S}");
+        let r = align_overlap(&prev, &new); // 无期望值 ⇒ 升序（小 k 优先）
+        assert!(r.ok);
+        assert!(
+            !r.committed_prefix.is_empty(),
+            "退化路径必须偏向小 k（切点靠后、committed 更长）⇒ 绝不切在开头丢字（k={}）",
+            r.overlap_chars
+        );
+    }
+
+    /// 🔴 **371 层① 硬约束（精确）优先于层② 估算** —— 补充要求新增。
+    ///
+    /// 构造 `m ≥ 1`（上一窗比本窗多出至少一片**有声**片）且 `prev` 与 `new` 在最长 `k` 上**逐字相等**
+    /// （⇒ 层③ 质量门在 `k = max_k` 处必过）。此时**即使估算比例荒谬**（`ratio = 1.0` ⇒ 期望 k = max_k），
+    /// 层① 也必须把 `k` 压到 `prev` 有效字数以下 ⇒ `committed_prefix` **非空**。
+    ///
+    /// 下半段**去掉硬约束**跑同一坏估算 ⇒ 选到 `max_k` ⇒ `committed_prefix` 为空
+    /// （= Gavin 端测 21:43 的 P0 现场）⇒ 证明层① 不可缺、且必须**先于**②执行。
+    #[test]
+    fn hard_constraint_beats_a_bad_estimate() {
+        let prev = format!("{S}{S}{S}");
+        let new = format!("{S}{S}{S}");
+        // 层① + 坏估算：仍必须非空提交
+        let r = align_overlap_with_prior(
+            &prev,
+            &new,
+            AlignPrior {
+                expected_ratio: Some(1.0),
+                prev_extra_slices: 1,
+            },
+        );
+        assert!(r.ok, "硬约束内应有解");
+        assert!(
+            !r.committed_prefix.is_empty(),
+            "层① 必须否决 k = max_k 的空提交（k={}，prev 有效字={}）",
+            r.overlap_chars,
+            eff_chars(&prev)
+        );
+        assert!(
+            r.overlap_chars < eff_chars(&prev),
+            "k 必须严格小于 prev 有效字数"
+        );
+        // 反证：无层① ⇒ 同一坏估算选到 max_k ⇒ committed 为空（旧行为/P0 现场）
+        let r2 = align_overlap_with_prior(
+            &prev,
+            &new,
+            AlignPrior {
+                expected_ratio: Some(1.0),
+                prev_extra_slices: 0,
+            },
+        );
+        assert!(
+            r2.ok && r2.committed_prefix.is_empty(),
+            "无层① 时坏估算会空提交（本单要防的现象）"
+        );
     }
 }
 

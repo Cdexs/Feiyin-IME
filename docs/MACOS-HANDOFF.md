@@ -8,6 +8,43 @@
 
 ## 0 · 先读这份，再读那两份
 
+### 0.3 · FIX-PREFIX-AND-EAT-371 语种前缀剥离规则变更 + 滑窗对齐接口新增（2026-09-22）
+
+- **文件域**：`src/transcription/mod.rs`（**平台中立模块**，macOS 侧编译同一份代码）+ `src/main.rs`（Windows 侧滑窗接线）。
+  这是**行为变更 + 接口新增**，不是零影响 —— 若 macOS 侧有按旧行为写的单测/文档，必须同步。
+
+- **① 剥前缀规则变更（🔴 行为变更）**：`strip_qwen3_language_prefix`
+  - **旧（359）**：`<asr_text>` 必须①前缀「标签样」（`language …` 或 ≤8 字纯字母）且②紧贴标签，否则不剥。
+  - **新（371）**：恢复 355 定的「**无条件截断到第一个 `<asr_text>`（含）**、语言无关」，
+    **唯一护栏是位置** —— 标记起点必须在前 `QWEN3_PREFIX_MAX_BYTES`(64 字节) 内；超出视为正文、不剥。
+  - **为什么改**：359 两道闸在生产下（`decode_accuracy_once` 每次都注入 ctx+词库，改变了模型自造前缀的形态）
+    拦不住 ⇒ `language chinese<asr_text>` 整条漏进用户文本（Windows 端测 P0）。
+  - **macOS 侧动作**：若你写了断言「非标签样/带空格前缀**不剥**」的测试或文档 ⇒ 那些断言**现在是错的**
+    （如 `句子：<asr_text>正文`、`我说 <asr_text> 然后` 这类「标记在 64B 内」的输入现在**会被剥**）。
+    Windows 侧同一测试（`degenerate_does_not_harm_body`）已按新规则改；另有新增
+    `near_head_non_label_is_stripped` / `mid_body_marker_is_not_stripped`（63B 剥 / 66B 不剥）。
+  - 新增 DEBUG 埋点：`[LocalRT-DBG-371] qwen3 prefix stripped: {:?}`（命中时打印被剥掉的头部原样，未命中不打）。
+
+- **② 滑窗对齐接口新增（接口变更，**旧接口保留**）**：`align_overlap` / `OrderedReflow::push`
+  - 新增 `AlignPrior { expected_ratio, prev_extra_slices }` + `align_overlap_with_prior(prev, new, prior)`；
+    `align_overlap(prev, new)` 保留为**退化入口**（等价 `AlignPrior::none()`，`#[allow(dead_code)]`）。
+  - 新增 `OrderedReflow::push_window(seq, start_slice, end_slice, slice_samples, text)`
+    （`slice_samples[i]` = 本窗第 i 片样本数）；`push(...)` 保留为**退化入口**。
+  - **调用方影响**：旧签名**仍编译、仍可用**（退化路径 = 滑动对齐「小 k 优先」，安全方向、不丢字），
+    但**拿不到周期性重复内容的吃字修复** —— 要拿到修复必须走 `push_window` 并传每片样本数。
+    Windows 侧 `main.rs` 的做法可照抄：维护 `window_spans` + `window_samples`（与窗口同批 push），
+    drain 时 `ordered.push_window(seq, ws, we, samples, text)`；缺信息 ⇒ 空表 ⇒ 自动退化。
+  - `align_overlap_with_prior` 的判据是**四层**：① 硬约束（上一窗多出的有声片数 `m≥1` ⇒ `k < prev` 有效字数）；
+    ② 软范围（时长比率估期望 `k`，容差**不对称**：向下 −50% / 向上 +25%）；③ 质量门（编辑距离，未改）；
+    ④ 兜底（无区间信息 ⇒ 升序小 `k`）。细节看函数注释。
+
+- **③ 编译/依赖影响**：**无** —— 不新增 crate、不新增平台符号、不改 `platform/` 契约面；
+  `cargo check --all-targets` 在 Windows 侧 0 error，warnings 未升。
+
+- **结论**：macOS 侧**必须做**的是「更新按旧剥前缀行为写的测试/文档」；
+  **建议做**的是「滑窗调用点改走 `push_window`」（否则拿不到周期性重复内容的吃字修复）。
+  无编译阻塞。平台中立代码已共享 ⇒ 你 clone 到 371 之后的提交即自带前缀修复。
+
 ### 0.2 · ASR-074 音频上行背压修复（2026-09-03）
 
 - **文件域**：`src/audio/mod.rs` + `src/transcription/qwen_inference.rs`

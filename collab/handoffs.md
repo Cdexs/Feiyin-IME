@@ -6,6 +6,18 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-22 — tester-1 — TEST-EXEC + BUILD-349 ✅ 重出包（修滑窗丢字 + 13s 安全阀 + 300s 录音；八项 + 三特殊点全 PASS）｜🔴 BUILD-348 作废
+
+- **重出原因**：BUILD-348 含 **P0 丢字**（12s 封顶把窗口切到零重叠 ⇒ 对齐必败 ⇒ 「整窗跳过」⇒ 该窗内容全丢）。由 **369（`24c452a`）+ 370（`919a59e`）** 修复。
+- **差异**：369 零重叠⇒**直接拼接**、有重叠对齐失败⇒退回拼接（**无一分支丢整窗**）；370 去 20s 硬切、单片安全阀 **13s**（超出继续切不丢弃）、`MAX_RECORD_SECONDS` 180→**300**。涉及 `transcription/mod.rs`、`local_stream.rs`、`vad.rs`、`main.rs`、`config/mod.rs`、`src-tauri/src/config.rs`。**未动** dll/itn/模型/版本。
+- **回归（@ `919a59e`）**：root `cargo test --no-fail-fast` **1478P/0F/30I**（EXIT 0；`feiyin-ime` bin **1390P/28I** = 任务书基线逐位吻合）；`src-tauri` **92P/0F/0I**；Vitest **7 files/100P/11S/0F**；`cargo fmt --check` **EXIT 0**；warnings **98/88/17** = 基线 **98/88**。
+- **NEW/GONE**：NEW **11**（369 滑窗 4 + 370 切分 7；`1390−1379=+11` 逐位吻合）；**GONE 0** —— 3 处改名（`max_record_seconds_is_180`→`_is_300`、`no_degrade_within_180s_limit`→`budget_180s_ok_but_300s_degrades`、368 的 `ordered_reflow_consecutive_failures_fallback_no_loss`→`..._falls_back_to_concat`），`+#[test]`/`-#[test]` = 11/0。
+- **BUILD-349**：Step1 残 0 → Step2 npm 684ms + Tauri 1m42s（17w）→ Step3 主程序 2m52s（**98w** + crash 9w）→ Step4 UI 同步 + 三 exe→Publish。产物 main `a645825ffec7…`（14,740,992B/21:36:09）/ ui `b78dc71d48f5…`（10,050,048B/21:33:16）/ crash `f7c199e4547a…`（24,879,104B/21:34:21）；两副本全等、均异于作废的 BUILD-348。
+- **八项逐项 PASS**：①时间戳 21:33–21:36 ②sha 两副本 + 异于上包 ③**0.9.3** ④冒烟 PID **12380 Responding=True** / 两处无新 crash.json / panic 0 / 残 0 ⑤config `da2be5da…` 三时点不变 + wordbook 不变 ⑥warnings **98/88/17** = 基线 ⑦探针（正 `SLIDING-WINDOW-367`=4/`[LocalRT-DBG-298]`=3/`AUTOLEARN`=11；反 `sub-seg failed`=0/`PUNCT_REFRESH_INTERVAL`=0/`ACC_MIN_SEGMENT_MS_DEFAULT`=0/`min_seg_ms`=0）⑧四表三副本全等。
+- **三特殊点（仅核验）**：① dll 四张三副本全等 + onnxruntime **1.28.2**；② itn-rules 三副本 `60b227de…` 全等；③ `Publish/models/` 1.7B 七文件与源逐一 sha256 全等（0.6B 保留）。
+- **Gavin 端测十一条**：① 🔴 吃字复测（>4 句，含一句 8~10s 长句造零重叠）② 🔴 连录两次互不污染（Gavin 点名）③ 松手等待时间 ④ 前文被改对 ⑤ 接缝重复 ⑥ 标点语义 ⑦ 1.7B 质量 ⑧ 梅开二度/一度 ⑨ 长录音 2~3 分钟（验 300s）⑩ 不新增 crash.json ⑪ 重启输入法。
+- **红线**：版本未动 / 未改生产代码 / 未 push / 未 `cargo clean` / 未动 models 源目录 / 零凭证。
+
 ## 2026-09-22 — tester-1 — TEST-EXEC + BUILD-348 ✅ 重出包（修 P0 吃字；八项 + 三特殊点全 PASS）｜🔴 BUILD-347 作废
 
 - **重出原因**：BUILD-347 含 **P0 吃字**（`OrderedReflow::push` 对齐失败时无条件替换 `last_window_text` ⇒ 滑出文本永久丢失）。由 **`FIX-ORDERED-REFLOW-DROP-368`（HEAD `4201d39`）** 修复：新增常量 `REFLOW_FALLBACK_FAILS=3`，连续失败达阈值把旧 `last_window_text` 整体并入 committed（兜底不去重）。
@@ -304,3 +316,19 @@
 - **单测**：新增 8（vad 5 + local_stream 3，含「旧包装 ≡ capped(SEGMENT_MAX_SECS)」逐位证明）；改名 2。
 - **验证**：fmt EXIT 0；全量 cargo test 0 failed（**1390P/28I**）；release EXIT 0；src-tauri check EXIT 0；warnings 98/88。
 - 未改版本/未 push/零凭证。369 同批未提交。
+
+## FIX-PREFIX-AND-EAT-371（coder-1，2026-09-22）— P0 两缺陷：前缀漏出 + 重复句吃字
+
+- **触发**：Gavin 端测 BUILD-349，输出 `language chinese<asr_text>明天…吗？明天…吗？来看电影吧。明天…吗？明天…吗`。
+- **A（前缀）**：355 定「无条件截断到第一个 `<asr_text>`（含）」，359 私加两闸（标签样 / 紧贴标签）。
+  355 观测时 `raw_decode` **无 hotwords**，生产每次注入 ctx+词库 ⇒ 前缀形态变 ⇒ 两闸失效。
+  修：删 `is_qwen3_language_label` + 两闸；唯一护栏 `QWEN3_PREFIX_MAX_BYTES=64`；新增 `[LocalRT-DBG-371]` 打被剥原文。
+- **B（吃字）**：`align_overlap` 从 `max_k` 往短找 ⇒ 周期性内容下 `S1S2S3` ≡ `S2S3S4` ⇒ 切点归零 ⇒ 整窗丢。
+  修：四层判据 ①硬约束（`prev_extra_slices≥1 ⇒ k<prev有效字数`，精确、最先）②软范围（期望 k ± **不对称**
+  `DOWN=0.50/UP=0.25`）③质量门未改 ④兜底升序小 k。接线 `push_window` + `AlignPrior`；`main.rs` 加 `window_samples`。
+- **不对称容差的理由**（写进 `ALIGN_EXPECTED_K_TOL_DOWN` 注释）：层①只保证 `committed_prefix` **非空**、
+  **不保证不吃半句** ⇒ 向小=重复（可容忍）、向大=吃字（P0）⇒「宁宽勿窄」**只适用于安全方向**。
+- **单测 +8**，含两条反证：旧算法内联证必命中 `max_k`；去层①同输入即空提交。
+- **主控验收**：22 条清单（`collab/acceptance-371.md`）逐条 Read 代码，首轮 20 过 → B3 改判 + C3 补 → 复验全过。
+- **验证**：fmt EXIT 0 / check 0 error（主控复跑）/ 全量 test 0 failed（**1400P/28I**）/ warnings 98/88 = 基线。
+- `docs/MACOS-HANDOFF.md` 新增 0.3 节。未改版本 / 未 push / 未出包（BUILD-349 已作废）。

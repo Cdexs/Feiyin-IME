@@ -1102,3 +1102,27 @@ load_wordbook_vocabulary()
 | 13s 依据 | **对齐滑窗封顶 12s 的实测体验**（Gavin 端测：12s 窗解码+回灌「没有明显卡顿」）；13s≈5.3s vs 12s 的 4.9s（+0.4s）；被否 16s/30s/90s |
 | KV/内存 | 均非瓶颈（13s≈169 token）；先前按 90s 的外推与 E2E 建议**作废** |
 | 结论 | 未 push / 零凭证；🔴 369+370 同在未提交工作区，由主控一并提交 |
+
+
+## BUILD-349（重出包 · 修滑窗丢字 + 13s 安全阀 + 300s 录音）· 2026-09-22 · BUILD-348 作废
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 369（`24c452a`）零重叠⇒**直接拼接**、有重叠对齐失败⇒退回拼接（**无分支丢整窗**）；370（`919a59e`）去 20s 硬切、单片安全阀 **13s**、`MAX_RECORD_SECONDS` 180→**300**。涉及 `transcription/mod.rs`、`local_stream.rs`、`vad.rs`、`main.rs`、`config`（主+Tauri）。**未动** dll/itn/模型/版本 |
+| 回归 | root `cargo test --no-fail-fast` **1478P/0F/30I**（EXIT 0；`feiyin-ime` bin **1390P/28I** = 基线逐位吻合；NEW 11 / GONE 0）+ src-tauri **92P/0F/0I** + Vitest **7 files/100P/11S/0F**；`cargo fmt --check` EXIT 0；warnings **98/88/17** = 基线 **98/88** |
+| 出包 | `BUILD-349` 八项核验逐项 PASS；产物 `feiyin-ime` 14.74MB `a645825ffec7…`（21:36:09）/ `feiyin-ime-ui` 10.05MB `b78dc71d48f5…`（21:33:16）/ `crash-reporter` 24.88MB `f7c199e4547a…`（21:34:21）；两副本全等、均异于作废的 BUILD-348 |
+| 三特殊点 | ① dll 四张三副本全等 + onnxruntime 1.28.2；② itn-rules 三副本 `60b227de…` 全等；③ Publish/models 1.7B 七文件与源逐一 sha256 全等（仅核验未重拷） |
+| 探针 | 正 `SLIDING-WINDOW-367`=4 / `[LocalRT-DBG-298]`=3 / `AUTOLEARN`=11；反 `sub-seg failed` / `PUNCT_REFRESH_INTERVAL` / `ACC_MIN_SEGMENT_MS_DEFAULT` / `min_seg_ms` 全 0 |
+| 端测 | 🔴 ①吃字复测（>4 句，含一句 8~10s 长句造零重叠）②连录两次互不污染（Gavin 点名）+ 其余九条（松手等待/前文改对/接缝重复/标点语义/1.7B 质量/梅开二度·一度/长录音 2~3 分钟/不新增 crash.json/重启输入法） |
+
+## 2026-09-22 · FIX-PREFIX-AND-EAT-371（P0 两缺陷）已交付验收
+
+- **A 语种前缀漏进正文**：恢复 355 定的「无条件截断到第一个 `<asr_text>`（含）」，删 359 私加的两闸；
+  唯一护栏 `QWEN3_PREFIX_MAX_BYTES=64`；新增 `[LocalRT-DBG-371]` 打印被剥原文。
+- **B 重复语句吃掉中间文本**：`align_overlap_with_prior` + `AlignPrior` 四层判据
+  （①硬约束精确 → ②软范围**不对称**容差 DOWN 0.50 / UP 0.25 → ③质量门未改 → ④兜底升序小 k）；
+  `OrderedReflow::push_window` 接线，`main.rs` 加 `window_samples`（per-recording）。
+- 单测 +8（含两条反证：旧算法内联、去层①）；368/369 既有单测全绿；fmt/check 主控复跑干净。
+- 主控 22 条清单逐条 Read 代码验收（`collab/acceptance-371.md`）：首轮 20 过 → B3 容差改判不对称、C3 补跨端文档 → 复验全过。
+- **下一步**：阶段三 TEST-SYNC → 阶段四 TEST-EXEC → **出包须先问 Gavin**（DEC-079）。BUILD-349 已作废。
+- **待观察**：`FORCED-ALIGN-372`（小模型精确对齐设想，未立项，等端测结果决定）。
