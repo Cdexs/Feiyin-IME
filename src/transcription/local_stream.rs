@@ -17,7 +17,7 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use sherpa_onnx::{OnlineParaformerModelConfig, OnlineRecognizer, OnlineRecognizerConfig};
 
@@ -81,20 +81,20 @@ const LOCAL_STREAM_RULE1_MIN_TRAILING_SILENCE: f32 = 2.4;
 const LOCAL_STREAM_RULE2_MIN_TRAILING_SILENCE: f32 = 2.0;
 const LOCAL_STREAM_RULE3_MIN_UTTERANCE_LENGTH: f32 = 20.0;
 
-/// LOCALRT-PUNCT-TIMER-269：预览标点刷新间隔。
+/// PUNCT-PREVIEW-SEMANTIC-349：预览打点的静默阈值（Gavin 2026-09-22）。
 ///
-/// 实测 `add_punctuation`（CT-Transformer，单线程 CPU）约 **0.15ms/字**：
-/// 20/50/100/200/400 字 = **3.6 / 8.2 / 15.6 / 30.0 / 58.4 ms**（各 10 次中位）。
-/// 4s 一次即使 400 字文本也仅 ~58ms，摊到 4s 窗口对 RTF 影响 <1.5%（可忽略）；
-/// 故取 Gavin 参考值 4s。
-const PUNCT_REFRESH_INTERVAL: Duration = Duration::from_millis(4000);
-
-/// LOCALRT-PUNCT-TIMER-269-B：静默触发打点的阈值（Gavin：静默 800ms 也打一次）。
+/// 沿革：269-B 静默 800ms 打点 + 269 的 4s 定时 + 284 shadow 400ms 强制 —— **三个触发都与语义无关**，
+/// 会在用户还没说完时对「半句」打点；CT-Transformer 对未完成文本必在**末尾补终止符**，
+/// 该终止符经 `punct_cache_reuse` 复用后落到句中（因果取证见
+/// `collab/evidence/20260922-punct349/causal-evidence.md`）⇒ Gavin 报「标点打在句子中间，掐断句意」。
+///
+/// ⇒ 349 改成**只认静默 ≥ 1200ms**（与 346 同一口径）：4s 定时与 shadow 400ms 强制**一并删除**。
+/// 用户停顿 1.2s = 语义边界，此时打点落在真正的停顿处；连续不停顿期间预览保持裸文本（无标点）。
 ///
 /// 🔴 **与 sherpa endpoint 完全独立**：本阈值只影响**显示层**刷新（判早了只是标点早出现），
 /// 绝不 `reset()` / 切句 / `sentence_id += 1`。切句仍由 `LOCAL_STREAM_RULE2=2.0` 的
 /// sherpa endpoint 决定（说话中间换气不会被切句）。两者是不同层的东西，不要混用。
-const PUNCT_SILENCE_TRIGGER_MS: f32 = 800.0;
+const PUNCT_SILENCE_TRIGGER_MS: f32 = 1200.0;
 
 /// LOCALRT-ENDPOINT-284（方案 B）：静默多久触发「影子收尾」——
 /// 另起一个 `OnlineStream` 把**当前句**音频喂进去 + `input_finished()`，拿完整结果，
@@ -119,11 +119,15 @@ const SHADOW_MAX_AUDIO_SECS: f32 = 12.0;
 /// 并行转写」，**绝不触发** `reset()` / 切句 / `sentence_id += 1`（那是显示层的事）。
 ///
 /// 🔴 **本阈值必须读 acc 专用计数器 `acc_silent_ms`，不能读显示层的 `silent_ms`**：
-/// 显示层标点在 `PUNCT_SILENCE_TRIGGER_MS=800` 打点后会把 `silent_ms` 清零（见函数内
-/// `if silence_due { silent_ms = 0.0; }`）。若 1200ms 阈值读同一个 `silent_ms`，则静默每到
-/// 800ms 就被标点路径归零 ⇒ **1200ms 永远到不了**，叠加删除长度支后 accuracy 在录音中将
-/// **一次都不会被派发**（298/342-D 整个废掉）。故 `acc_silent_ms` 只与 `silent_ms` 在静音
-/// 累加/语音归零两处同步，**不受标点清零影响**。
+/// 显示层标点打点后会把 `silent_ms` 清零（`if silence_due { silent_ms = 0.0; }`）。
+/// 346 落地时标点阈值 `PUNCT_SILENCE_TRIGGER_MS=800` < 本阈值 1200 ⇒ 若读共享 `silent_ms`，
+/// 静默每到 800ms 就被标点路径归零，**1200ms 永远到不了**，叠加删长度支后 accuracy 在录音中
+/// **一次都不会被派发**（298/342-D 整个废掉）。
+///
+/// PUNCT-PREVIEW-SEMANTIC-349 起标点阈值也抬到 **1200ms**，与本阈值相等：此时读共享计数器
+/// 「恰好」也能工作（acc 检查在标点清零之前，同一帧先派后清），但**依赖两条阈值恒相等 +
+/// 循环内检查顺序**，是脆弱耦合。独立计数器让两个消费者互不影响（与 shadow/acc 各自 latch
+/// 同构），故**保留** —— 阈值今后各自调整都不会互相踩踏。
 const ACC_DISPATCH_SILENCE_MS_DEFAULT: f32 = 1200.0;
 
 /// LOCALRT-SEAM-337：自适应定界的「文本停止增长」窗口（具名，非魔数）。
@@ -218,45 +222,49 @@ struct PunctPreviewCache {
     /// 上次打点产出的全量标点文本（对应 raw[..raw_len]）。
     prefix: String,
     /// `prefix` 覆盖的原始字节长度（raw 的合法 char 边界）。
+    /// 🔴 PUNCT-349：同时充当「是否打过点」的判据 —— `raw_full.len() > raw_len` 即「有新内容」。
     raw_len: usize,
-    /// 上次实际调用标点引擎的时刻（`None` = 尚未打过点）。
-    last_punct_at: Option<Instant>,
+}
+
+/// PUNCT-PREVIEW-SEMANTIC-349：预览打点是否触发 —— **只认静默 ≥ 阈值 + 有新内容**。
+///
+/// 349 删除了原先另外两条触发（4s 定时、284 shadow 400ms 强制）：两者都与语义无关，
+/// 会在用户没说完时对「半句」打点 ⇒ CT-Transformer 在半句末尾补终止符、经缓存复用落到句中
+/// （因果取证见 `collab/evidence/20260922-punct349/causal-evidence.md`）。
+/// 现口径与 346 一致：只按语义停顿（静默 ≥1200ms）打点。
+fn should_repunctuate_preview(silent_ms: f32, has_new: bool, threshold_ms: f32) -> bool {
+    silent_ms >= threshold_ms && has_new
 }
 
 /// LOCALRT-PUNCT-TIMER-269：把**原始无标点全文**转成 overlay 预览文本。
 ///
-/// - 距上次打点 ≥ `interval`（或 `force`）：对 `raw_full` **整体重打**一次标点并更新缓存。
-///   全量重打能随上下文修正先前标点，比逐句打更准（Gavin 指定）。
+/// - `force`（由 `should_repunctuate_preview` 给出，即静默 ≥1200ms）：对 `raw_full`
+///   **整体重打**一次标点并更新缓存。全量重打能随上下文修正先前标点，比逐句打更准（Gavin 指定）。
 /// - 否则：`上次标点文本 + raw_full 新增后缀` —— 新字即时上屏，已出现的标点不闪回。
 /// - `engine` 为 `None`（用户关标点）：直接返回 `raw_full`，行为与未启用标点一致，不引入额外开销。
 ///
 /// 🔴 关键：输入始终是**原始裸文本**，绝不把已打点文本再次送引擎 ⇒ 不会「标点重复 / 错乱」
 /// （FIX-252 场景不复发）。
 ///
-/// 触发均要求「自上次打点后**有新内容**」：持续静默不会反复重打同一段（269-B 条件③）。
+/// 🔴 PUNCT-349：**不再有 4s 周期重打**（原 `PUNCT_REFRESH_INTERVAL` 已删）。打点只在
+/// 「静默 ≥1200ms 的语义停顿」触发；触发前持续静默不会反复重打同一段（`has_new` 护栏）。
 fn preview_display(
     raw_full: &str,
     engine: Option<&mut PunctuationEngine>,
     cache: &mut PunctPreviewCache,
-    interval: Duration,
     force: bool,
 ) -> String {
     let Some(engine) = engine else {
         return raw_full.to_string();
     };
-    let now = Instant::now();
-    let due = cache
-        .last_punct_at
-        .map_or(true, |t| now.duration_since(t) >= interval);
     // 有新内容才打：raw 单调增长（greedy 0 回退），长度增长即新内容。
-    let has_new = cache.last_punct_at.is_none() || raw_full.len() > cache.raw_len;
-    if (force || due) && has_new {
+    let has_new = raw_full.len() > cache.raw_len;
+    if force && has_new {
         let t = Instant::now();
         cache.prefix = engine
             .add_punctuation(raw_full)
             .unwrap_or_else(|| raw_full.to_string());
         cache.raw_len = raw_full.len();
-        cache.last_punct_at = Some(now);
         log::debug!(
             "LOCALRT-PUNCT-TIMER-269: repunctuated {} chars in {:.1}ms",
             raw_full.chars().count(),
@@ -413,7 +421,8 @@ fn endpoint_action(segment_has_speech: bool, confirm_text_empty: bool) -> Endpoi
 ///   （`None` = 用户关标点）。**仅对已确认句（endpoint=true）打点**；中间句逐帧在变，
 ///   打点会拖垮 RTF，故不打。引擎不在此新建（否则重复加载 972MB 级模型）。
 /// - `silence_threshold`：LOCALRT-PUNCT-TIMER-269-B，静默判定口径（RMS ≤ 阈值即静音，
-///   同 `config.audio.silence_threshold`）。用于**独立**统计连续静默 ≥800ms 触发显示层打点；
+///   同 `config.audio.silence_threshold`）。用于**独立**统计连续静默（≥ `PUNCT_SILENCE_TRIGGER_MS`，
+///   349 起 1200ms）触发显示层打点；
 ///   🔴 与 sherpa endpoint 无关，不触发 reset/切句。
 /// - `on_result`：文本变化回调，传 `(display_text, display_words)`，与 qwen 路径同构
 /// - `acc_cfg`：LOCALRT-PARALLEL-ACC-298 派发配置（`enabled`/`silence_ms`；346 起无长度支）；
@@ -468,10 +477,9 @@ pub fn transcribe_streaming_local(
     let mut punct_cache = PunctPreviewCache {
         prefix: String::new(),
         raw_len: 0,
-        last_punct_at: None,
     };
     // LOCALRT-PUNCT-TIMER-269-B：连续静默累计（ms）。独立于 sherpa endpoint，只驱动显示层打点。
-    // 🔴 ACC-DISPATCH-SILENCE-ONLY-346：本计数器会被**标点路径**在 800ms 打点后清零（见函数内
+    // 🔴 ACC-DISPATCH-SILENCE-ONLY-346：本计数器会被**标点路径**在打点后清零（见函数内
     // `if silence_due { silent_ms = 0.0; }`），故 accuracy 派发**不得**复用它。
     let mut silent_ms: f32 = 0.0;
     // ACC-DISPATCH-SILENCE-ONLY-346：accuracy 派发专用静默累计（ms）。仅与 `silent_ms` 在
@@ -857,7 +865,6 @@ pub fn transcribe_streaming_local(
 
         // LOCALRT-ENDPOINT-284（方案 B）：静默 ≥ 阈值 → 影子 stream 收尾当前句（**只动显示**）。
         // 影子 = 另起 OnlineStream 喂当前句音频 + input_finished()，拿完整结果；主 stream 不受影响。
-        let mut shadow_fired = false;
         if silent_ms >= shadow_trigger_ms && !shadow_done_for_pause {
             shadow_done_for_pause = true;
             let shadow_audio = &pcm[sentence_pcm_start..];
@@ -899,7 +906,6 @@ pub fn transcribe_streaming_local(
                             .unwrap_or(0)
                     );
                 }
-                shadow_fired = true;
             } else if !shadow_audio.is_empty() {
                 // LOCALRT-ENDPOINT-EMPTY-342（F3）：静音段不跑影子（避免静音流幻字进入预览）。
                 log::debug!(
@@ -956,12 +962,11 @@ pub fn transcribe_streaming_local(
             acc_done_for_pause = true;
         }
 
-        // LOCALRT-PUNCT-TIMER-269-B：显示刷新，两条件「或」——
-        //   ① 距上次打点 ≥4s（preview_display 内判 due）
-        //   ② 连续静默 ≥800ms（读显示层 `silent_ms`）且自上次打点后有新内容
-        //      🔴 346：本处打点后会把 `silent_ms` 清零（见下），故 accuracy 派发改用另一个
-        //      不被清零的 `acc_silent_ms`，两者**不共用**（否则 1200ms 永远到不了）。
-        // 两条件都**只刷新显示**，不动状态机（不 reset / 不切句 / 不改 sentence_id）。
+        // PUNCT-PREVIEW-SEMANTIC-349：显示刷新 —— 打点**只认静默 ≥1200ms**（读显示层 `silent_ms`）
+        // 且有新内容（4s 定时与 shadow 400ms 强制已删，见 `PUNCT_SILENCE_TRIGGER_MS` 与
+        // `should_repunctuate_preview`）。🔴 本处打点后会把 `silent_ms` 清零（见下），故 accuracy 派发
+        // 用的是另一个不被清零的 `acc_silent_ms`（346），两者**不共用**。
+        // 无论打不打点都**只刷新显示**，不动状态机（不 reset / 不切句 / 不改 sentence_id）。
         // 显示基文本：影子收尾（confirmed + 影子当前句）与主 stream（confirmed + current）**取更长者**，
         // 避免新语音进来后主文本还没追上时显示瞬时缩短/闪烁。
         let main_view = state.display_text();
@@ -975,18 +980,18 @@ pub fn transcribe_streaming_local(
             _ => main_view,
         };
         if !raw_full.is_empty() {
-            let has_new =
-                punct_cache.last_punct_at.is_none() || raw_full.len() > punct_cache.raw_len;
-            let silence_due = silent_ms >= PUNCT_SILENCE_TRIGGER_MS && has_new;
+            // 有新内容 = raw 比上次打点时长（`raw_len` 初值 0 且 raw 非空 ⇒ 首次恒 true）。
+            let has_new = raw_full.len() > punct_cache.raw_len;
+            let silence_due =
+                should_repunctuate_preview(silent_ms, has_new, PUNCT_SILENCE_TRIGGER_MS);
             let display = preview_display(
                 &raw_full,
                 punctuation_engine.as_deref_mut(),
                 &mut punct_cache,
-                PUNCT_REFRESH_INTERVAL,
-                shadow_fired || silence_due,
+                silence_due,
             );
             if silence_due {
-                // 打完重置**显示层**静默计数；4s 计时由 preview_display 内的 last_punct_at 一并重置。
+                // 打完重置**显示层**静默计数。
                 // 🔴 346：只清 `silent_ms`，**绝不动 `acc_silent_ms`**（动了 accuracy 的 1200ms 就不可达）。
                 silent_ms = 0.0;
             }
@@ -1090,13 +1095,12 @@ pub fn transcribe_streaming_local(
     let mut final_preview = last_display.clone();
     if !final_seg.is_empty() {
         state.on_result(sentence_id, &final_seg, false, &[]);
-        // 收尾强制打点一次，保证关闭前的预览带标点。
+        // 收尾强制打点一次（录音结束 = 真边界，不属「句中断点」），保证关闭前的预览带标点。
         let raw_full = state.display_text();
         let display = preview_display(
             &raw_full,
             punctuation_engine.as_deref_mut(),
             &mut punct_cache,
-            PUNCT_REFRESH_INTERVAL,
             true,
         );
         if !display.is_empty() {
@@ -1114,8 +1118,8 @@ pub fn transcribe_streaming_local(
 mod tests {
     use super::{
         endpoint_action, endpoint_confirm_text, local_stream_num_threads, punct_cache_reuse,
-        segment_streaming_text, should_dispatch_acc, should_dispatch_tail, EndpointAction,
-        SAMPLE_RATE,
+        segment_streaming_text, should_dispatch_acc, should_dispatch_tail,
+        should_repunctuate_preview, EndpointAction, SAMPLE_RATE,
     };
 
     /// LOCALRT-REFLOW-HOLE-344-G：片段流式文本按**字符**切片，绝不字节切片（中文安全、不 panic）。
@@ -1978,4 +1982,43 @@ mod tests {
     //   该函数已随 340 机制整体删除（shadow 每次停顿多解 500ms、收尾多解 2000ms，`[DBG-289]`
     //   13/13 实测零收益），守的对象不存在 ⇒ 一并移除，**不是放宽或删除断言**。
     // ========================================================================
+
+    // ========================================================================
+    // PUNCT-PREVIEW-SEMANTIC-349 · 预览打点口径（只认静默 ≥1200ms）
+    //   因果取证（真实 CT-Transformer 探针 + 实机日志）见
+    //   `collab/evidence/20260922-punct349/causal-evidence.md`（探针按 DEC-077 已删）。
+    // ========================================================================
+
+    /// PUNCT-349：预览打点**只认静默 ≥1200ms 且有新内容**。
+    /// 改前另有「4s 定时」与「shadow 400ms 强制」两条与语义无关的触发 —— 已删除。
+    /// 本测试钉死「无 1200ms 静默不打点」（核心新判据）。
+    #[test]
+    fn punct349_preview_only_on_1200ms_silence() {
+        let t = 1200.0f32;
+        // 无 1200ms 静默 ⇒ 不打点（哪怕有新内容：4s 定时 / shadow 400ms 已不再触发）。
+        assert!(!should_repunctuate_preview(1199.0, true, t));
+        assert!(!should_repunctuate_preview(400.0, true, t));
+        assert!(!should_repunctuate_preview(0.0, true, t));
+        // 无新内容 ⇒ 不打点（持续静默不反复重打同一段）。
+        assert!(!should_repunctuate_preview(5000.0, false, t));
+        // 静默 ≥1200 且有新内容 ⇒ 打点。
+        assert!(should_repunctuate_preview(1200.0, true, t));
+        assert!(should_repunctuate_preview(3000.0, true, t));
+    }
+
+    /// PUNCT-349 根因表征：触发时刻补的**末尾终止符**会经 `punct_cache_reuse` 落到**句中**
+    /// —— 这正是 Gavin 报的「标点打在句子中间」的机制。锁定该复用行为，
+    /// 保证「只认 1200ms 语义停顿」这一前置条件不被绕过。
+    #[test]
+    fn punct349_cache_reuse_carries_terminal_into_midsentence() {
+        // 上一次打点发生在「半句」上（触发与语义无关时），引擎在末尾补了「。」：
+        let prefix = "今天天气不错，我们准备开始。";
+        let raw = "今天天气不错我们准备开始讨论这个项目的具";
+        let shown = punct_cache_reuse(prefix, raw, "今天天气不错我们准备开始".len());
+        assert_eq!(shown, "今天天气不错，我们准备开始。讨论这个项目的具");
+        assert!(
+            shown.contains("开始。讨论"),
+            "触发时刻的末尾终止符会落到句中（本单要防的现象）"
+        );
+    }
 }
