@@ -81,3 +81,12 @@
 - 🔴 **归属**：全量树含 coder-1 在飞 350 未提交改动，总数 1420→1425（本单 2 + 350 3），**本单隔离 +2**。
 - **残余**：1200ms 停顿处若其实没说完仍会出现「。」（语义边界固有代价，符合 Gavin 口径）。
 - 🔴 实机交 tester-1/Gavin，未声称已验证。未动版本号 / 未 commit / 未出包 / 未碰 `src/main.rs`、`src/punctuation/mod.rs` / 零凭证。
+
+## 2026-09-22 — coder-2 — TEST-SYNC-352 ✅ 交付（阶段三：给 350 补独立护栏，非作者）
+
+- **性质**：阶段三，**只写测试、零生产代码改动**；命令白名单（DEC-048）仅 `cargo fmt` / `cargo check`，🔴 **未跑 `cargo test`**（首跑在阶段四 tester-1）。
+- **产出 6 条（`sync352_` 前缀）**：`punctuation/mod.rs` +131 = ① `has_` 重构等价性（旧语义逐字重写进测试 + 41,371 串穷举比对 + 「strip 恒等 ⟺ has false」不变量）② 退化输入（对偶/幂等/恒等）③ UTF-8 多字节紧邻标点（防 344 P0 同族）；`main.rs` +102 = ④ 节点唯一挂载 + 门含 `!start.translate` ⑤ 剥离早于 `pretranscribed_native_punctuated`（源码级顺序）⑥ 门关逐字返回（同覆盖 translate 分支）。
+- **坑（已规避）**：`let stripped = strip_punctuation_node(` 在作者测试里也出现 ⇒ 不能数全文件，改用生产独有首参 `normalized` 过滤；护栏字面量一律 `concat!` 拆开防自命中。
+- **验证**：`cargo fmt --check` EXIT 0 ｜ `cargo check --all-targets` 0 error、warnings **99/90** = 基线 ｜ `numstat`==`-w`（102/0、131/0）。
+- **静态复核**（保首跑通过）：挂载过滤后恰 1；剥离 `:8433` < native `:8442`，距 785B < 1500；门窗口含两 switch。
+- **结论**：**未发现 350 真实缺陷**。未 commit / 未 push / 版本号未动 / 零凭证。

@@ -15343,3 +15343,105 @@ mod overlay_121_guard_tests {
         );
     }
 }
+
+// ============================================================================
+// TEST-SYNC-352（阶段三，非作者 coder-2）：PUNCT-FINAL-REDO-350 接线护栏
+//
+// 只读 main.rs 源码做结构断言，不改生产代码。350 的剥离节点必须：
+//   ① 唯一挂载（只本地 realtime 一条管线 —— Gavin 红线「其他管线不能动」）；
+//   ② 门含 `!start.translate`（翻译时整段跳过 ⇒ 逐字返回原文）；
+//   ③ 顺序在 `pretranscribed_native_punctuated` **之前**（先剥光再判，否则 native 判定
+//      读到未剥离文本 ⇒ 「剥光了必定打得回来」的不变量失效）。
+// 字面量一律用 `concat!` 拆开，避免护栏源码自命中（[FILTERED-TEST-BLINDSPOT-001] 教训）。
+// ============================================================================
+#[cfg(test)]
+mod sync352_punct_node_guard_tests {
+    use super::strip_punctuation_node;
+
+    fn main_src() -> String {
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).to_string()
+    }
+
+    /// sync352-4：节点唯一挂载 + 门含 `config.punctuation.enabled` 与 `!start.translate`。
+    ///
+    /// **防的退化**：a. 把节点也挂到在线 realtime / 本地离线档（Gavin 红线：只动本地 realtime）；
+    /// b. 丢掉 `!translate_requested` 门 ⇒ 翻译路径被剥光后无节点重打 ⇒ 标点丢失。
+    #[test]
+    fn sync352_node_wired_once_with_translate_gate() {
+        let s = main_src();
+        // 注意：该调用文本在**作者测试**里也出现（传 `t.to_string()`），不能直接数全文件；
+        // 用生产调用独有的首参（变量 `normalized` 后跟逗号）过滤出真实挂载点。
+        let call = concat!("let stripped = strip_punctuation_node", "(");
+        let mounts: Vec<usize> = s
+            .match_indices(call)
+            .map(|(i, _)| i)
+            .filter(|&i| s[i..(i + 200).min(s.len())].contains("normalized,"))
+            .collect();
+        assert_eq!(
+            mounts.len(),
+            1,
+            "剥离节点必须恰好挂载一次（只本地 realtime 一条管线；Gavin 红线）"
+        );
+        let at = mounts[0];
+        let window = &s[at..(at + 400).min(s.len())];
+        assert!(
+            window.contains("config.punctuation.enabled"),
+            "节点门必须含 `config.punctuation.enabled`（关标点时本节点无意义）"
+        );
+        assert!(
+            window.contains("!start.translate"),
+            "节点门必须含 `!start.translate`（翻译路径下游不重打标点，剥光会丢标点）"
+        );
+    }
+
+    /// sync352-5：接线顺序 —— 剥离节点必须在 `pretranscribed_native_punctuated` **之前**。
+    ///
+    /// **防的退化**：把顺序调换（先判 native 再剥）⇒ `native_punctuated` 读到**未剥离**文本，
+    /// 剥光后下游 `!native_punctuated` 门可能不放行 ⇒「剥光了没打回来」。
+    #[test]
+    fn sync352_strip_node_before_native_punctuated() {
+        let s = main_src();
+        let strip_at = s
+            .find(concat!("let stripped = strip_punctuation_node", "("))
+            .expect("剥离节点调用点必须存在");
+        let punct_at = s
+            .find(concat!(
+                "let native_punctuated = pretranscribed_native_punctuated(&stripped)",
+                ";"
+            ))
+            .expect("下游 native_punctuated 判定必须存在");
+        assert!(
+            strip_at < punct_at,
+            "接线顺序错误：必须先 `strip_punctuation_node` 再算 `native_punctuated`"
+        );
+        // 同一 block：两者相距很近（防「生产中 strip 存在但 punct 命中别处」的假绿）。
+        assert!(
+            punct_at - strip_at < 1500,
+            "两处调用距离异常（{} 字节），接线可能已被拆散",
+            punct_at - strip_at
+        );
+    }
+
+    /// sync352-6：门关（`enabled=false`）⇒ 逐字返回原文（含空串）。
+    ///
+    /// 本条**同时覆盖「`translate_requested=true`」分支**：调用点的门是
+    /// `enabled && !start.translate`，翻译时 `enabled` 实参为 false ⇒ 走的就是本分支
+    /// （由 sync352-4 的 `!start.translate` 结构断言绑定）。
+    /// **防的退化**：门关时仍动手（用户关标点 / 走翻译却看到文本被改）。
+    #[test]
+    fn sync352_gate_off_returns_verbatim() {
+        for t in ["你好。。", "今天天气不错，。", "3.14", "", "中。"] {
+            assert_eq!(
+                strip_punctuation_node(t.to_string(), false),
+                t,
+                "门关闭时必须逐字返回原文：{t:?}"
+            );
+        }
+        // 反向 sanity：门开且确有有效标点 ⇒ 必须真的剥（防「恒返回原文」的假实现）。
+        assert_eq!(strip_punctuation_node("你好。。".to_string(), true), "你好");
+        assert_eq!(
+            strip_punctuation_node("3.14 不错".to_string(), true),
+            "3.14 不错"
+        );
+    }
+}

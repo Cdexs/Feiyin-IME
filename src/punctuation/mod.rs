@@ -1223,3 +1223,134 @@ mod tests {
         }
     }
 }
+
+// ============================================================================
+// TEST-SYNC-352（阶段三，非作者 coder-2）：给 PUNCT-FINAL-REDO-350 补独立护栏
+//
+// 350 把 `has_effective_punctuation` 由内联循环改为调共享谓词 `is_effective_punctuation`，
+// 等价性当时**只有人工论证**。本模块用「旧语义显式重写版」做机器对照，并补退化 / UTF-8 边界。
+// 🔴 只读生产符号，不改任何生产代码。
+// ============================================================================
+#[cfg(test)]
+mod sync352_punct_final_350_tests {
+    use super::*;
+
+    /// 旧语义显式重写（350 重构前 `has_effective_punctuation` 的逐字逻辑，取自 `c9b59b3^`）。
+    /// **刻意不复用生产共享谓词**：一旦生产谓词被改坏，这份独立重写真值表才是判别基准。
+    fn has_effective_punctuation_legacy(text: &str) -> bool {
+        let chars: Vec<char> = text.chars().collect();
+        for (i, &c) in chars.iter().enumerate() {
+            if !is_punctuation(c) {
+                continue;
+            }
+            let prev = chars.get(i.wrapping_sub(1)).copied().unwrap_or(' ');
+            let next = chars.get(i + 1).copied().unwrap_or(' ');
+            if prev.is_ascii_alphanumeric() && next.is_ascii_alphanumeric() {
+                continue;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// 🔴 sync352-1：`has_effective_punctuation` 重构等价性（新 vs 旧逐字逻辑逐串相同）。
+    ///
+    /// **防的退化**：内联循环改调共享谓词时，若哨兵（位置 0/末尾）、索引、夹持方向被改错，
+    /// 行为会**静默漂移**（`[ENUM-EQ-CHECK-MISSES-NEW-VARIANT-001]` 同族：编译器不报错）。
+    /// 用小字母表穷举长度 ≤4，覆盖 CJK / ASCII 字母数字 / 全半角标点 / 空白 / 撇号 / 多字节。
+    #[test]
+    fn sync352_has_refactor_equals_legacy_semantics() {
+        const ALPHABET: &[char] = &[
+            '.', ':', '！', 'a', '1', '中', '，', '。', '５', '．', '👍', 'é', ' ', '\'',
+        ];
+        let mut corpus: Vec<String> = vec![String::new()];
+        let mut frontier: Vec<String> = vec![String::new()];
+        for _ in 0..4 {
+            let mut next = Vec::with_capacity(frontier.len() * ALPHABET.len());
+            for base in &frontier {
+                for &c in ALPHABET {
+                    let mut s = base.clone();
+                    s.push(c);
+                    next.push(s.clone());
+                    corpus.push(s);
+                }
+            }
+            frontier = next;
+        }
+        for t in &corpus {
+            let new = has_effective_punctuation(t);
+            assert_eq!(
+                new,
+                has_effective_punctuation_legacy(t),
+                "重构等价性被破坏（新旧语义不一致）：{t:?}"
+            );
+            // 补充不变量：`strip` 恒等 ⟺ `has` 为 false（严格对偶的可判形式）。
+            assert_eq!(
+                strip_effective_punctuation(t) == *t,
+                !new,
+                "strip 恒等性与 has 不一致：{t:?}"
+            );
+        }
+    }
+
+    /// 🔴 sync352-2：退化输入下「严格对偶 + 幂等 + 无有效标点则恒等」三条性质仍成立。
+    ///
+    /// **防的退化**：空串 / 纯标点串 / 首尾即标点 / 单字符 / 超长串等边界上 strip 与 has 走岔
+    /// （典型：空串哨兵退化、纯标点末字符被漏剥）。
+    #[test]
+    fn sync352_degenerate_inputs_dual_identity_idempotent() {
+        let long: String = "中".repeat(300) + "。" + &"a".repeat(300);
+        let cases: Vec<String> = vec![
+            String::new(),
+            "，。、".to_string(),
+            "。".to_string(),
+            "a".to_string(),
+            "中".to_string(),
+            "。开头".to_string(),
+            "结尾。".to_string(),
+            "。。".to_string(),
+            "，，，".to_string(),
+            long.clone(),
+        ];
+        for t in &cases {
+            let s = strip_effective_punctuation(t);
+            assert!(
+                !has_effective_punctuation(&s),
+                "严格对偶被破坏：strip({t:?}) = {s:?} 仍含有效标点"
+            );
+            assert_eq!(strip_effective_punctuation(&s), s, "非幂等：{t:?}");
+            if !has_effective_punctuation(t) {
+                assert_eq!(&s, t, "无有效标点时 strip 必须恒等：{t:?}");
+            }
+        }
+    }
+
+    /// 🔴 sync352-3：UTF-8 安全 —— 多字节字符紧邻标点 / emoji 混排（344 P0 崩溃同族防线）。
+    ///
+    /// **防的退化**：`strip_` 若哪天被改成按**字节**切片，会在多字节字符中间 panic 或产出坏串；
+    /// 也要钉住「多字节字符本身绝不被当标点剥掉」。
+    #[test]
+    fn sync352_utf8_multibyte_adjacent_to_punctuation() {
+        assert_eq!(strip_effective_punctuation("中。"), "中");
+        assert_eq!(strip_effective_punctuation("。中"), "中");
+        assert_eq!(strip_effective_punctuation("中，文"), "中文");
+        assert_eq!(strip_effective_punctuation("👍。"), "👍");
+        assert_eq!(strip_effective_punctuation("。👍。"), "👍");
+        // 无有效标点 ⇒ 多字节原样保留（emoji / 重音字母必须完整）
+        assert_eq!(strip_effective_punctuation("a👍b"), "a👍b");
+        assert_eq!(strip_effective_punctuation("é中é"), "é中é");
+        // 🔴 钉住既有口径（半/全角不一致，非本单引入，只报不改）：全角数字两侧**非** ASCII
+        //    ⇒ 不豁免 ⇒ 判为有效标点，与半角 `3.14` 行为不同。
+        assert!(has_effective_punctuation("５.５"));
+        assert!(!has_effective_punctuation("3.14"));
+        // 多字节紧邻不 panic，且不产生替换字符（编码损坏的指纹 U+FFFD）
+        for t in ["。é。", "👍👍。", "中。é。", "。👍中。"] {
+            let s = strip_effective_punctuation(t);
+            assert!(!has_effective_punctuation(&s), "对偶破坏：{t:?} -> {s:?}");
+            assert!(
+                !s.contains('\u{FFFD}'),
+                "输出出现替换字符（编码损坏）：{t:?} -> {s:?}"
+            );
+        }
+    }
+}
