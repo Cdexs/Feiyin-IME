@@ -63,6 +63,30 @@ pub fn vad_window_size() -> usize {
     VAD_WINDOW_SIZE as usize
 }
 
+/// FIX-VAD-FEED-BY-WINDOW-391：按 `VAD_WINDOW_SIZE`(512) **逐块**喂入 `audio`（末尾不足一块照常喂入）。
+/// 返回喂入次数（= `ceil(len / 512)`）。纯逻辑，可单测。
+///
+/// 🔴 **为什么不能整段一次性 `accept_waveform`**（sherpa `voice-activity-detector.cc` `AcceptWaveform`）：
+/// - 注释原文：`// note n is usually window_size` 与 `// NOTE(fangjun): Please don't use a very large n.`；
+/// - 一次调用内对所有窗 `is_speech = is_speech || this_window_is_speech`（**整次调用只得一个结论**）；
+/// - 语音开始时 `start_ = max(buffer_.Tail() - 2*WindowSize - MinSpeechDurationSamples, Head)`
+///   ⇒ 起点被定在**本次输入末尾往前约 0.164s**。
+/// ⇒ 一次性喂整段只得到末尾一小段（388 现场 `in=6.31s out=0.37s`）；**必须逐 512 块喂**。
+/// 🔴 388 记录里「384 任务书补充第 2 条：整块一次 `accept_waveform`、不要切 512」**该指示错误**，
+/// 本单纠正 —— 原 `segment()` 按 512 切块喂入才是正确用法。
+fn feed_in_vad_windows<F: FnMut(&[f32])>(audio: &[f32], mut accept: F) -> usize {
+    let win = VAD_WINDOW_SIZE as usize;
+    let mut offset = 0usize;
+    let mut calls = 0usize;
+    while offset < audio.len() {
+        let end = (offset + win).min(audio.len());
+        accept(&audio[offset..end]);
+        offset = end;
+        calls += 1;
+    }
+    calls
+}
+
 const VAD_THRESHOLD: f32 = 0.5;
 /// ASR-038-B: 入口门控 VAD 阈值（低于分段用 0.5）
 /// 设计文档 §2.2：0.3 对应「只要有微弱语音特征就建连」，牺牲纯静音不建连效果换取首字安全
@@ -283,14 +307,19 @@ impl VadSegmenter {
     ///（样本下标，未加 pad；`end` 为**开区间**端点）。
     ///
     /// 做法（`segment()` 的精简版，只取区间、不做 padding/合并）：
-    /// `reset()` → `accept_waveform(整段一次)` → `flush()` → 逐个 `front()/pop()` 收集
-    /// `(start, start+n)` → `clear() + reset()`（游标归零，供下次复用）。
+    /// `reset()` → **逐 512 块** `accept_waveform`（[`feed_in_vad_windows`]）→ `flush()`
+    /// → 逐个 `front()/pop()` 收集 `(start, start+n)` → `clear() + reset()`（游标归零，供下次复用）。
+    ///
+    /// 🔴 FIX-VAD-FEED-BY-WINDOW-391：388 原实现「整段一次性 `accept_waveform`」**错误**
+    ///（依据见 [`feed_in_vad_windows`]：一次调用只得一个结论、起点定在输入末尾前 ~0.164s）
+    /// ⇒ 5s 语音只留 ~0.37s。现改**逐 512 块**喂入。
     pub fn speech_ranges(&self, audio: &[f32]) -> Vec<(usize, usize)> {
         if audio.is_empty() {
             return Vec::new();
         }
         self.detector.reset();
-        self.detector.accept_waveform(audio);
+        // FIX-391：逐 512 块喂入（整段一次会命中 sherpa 的「大 n」语义陷阱）。
+        let _ = feed_in_vad_windows(audio, |block| self.detector.accept_waveform(block));
         self.detector.flush();
         let ranges: Vec<(usize, usize)> = std::iter::from_fn(|| {
             self.detector.front().map(|seg| {
@@ -339,18 +368,18 @@ impl VadSegmenter {
         Some(Self { detector })
     }
 
-    /// LOCALRT-VAD-SILENCE-384：本地 realtime「本 chunk 是否有人声」——**整块喂入**。
+    /// LOCALRT-VAD-SILENCE-384 / FIX-VAD-FEED-BY-WINDOW-391：本地 realtime「本 chunk 是否有人声」。
     ///
-    /// 调用方式最优化（Gavin 2026-09-23）：
-    /// - `accept_waveform` 对**整块** chunk 只调一次（sherpa 内部自带按 `window_size`=512 分窗的
-    ///   缓冲，Rust 侧**不**再切 512 小块多次跨 FFI）；
-    /// - 每 chunk 只调一次 `detected()`；
+    /// 🔴 **逐 512 块喂入**（[`feed_in_vad_windows`]），**每块后不查询**；整块喂完后只调一次
+    /// `detected()` 返回。现网录音块约 10ms（<512）故与旧行为一致，本单**消除对块大小的依赖**
+    ///（>512 的大块若一次性喂入会命中 [`feed_in_vad_windows`] 描述的 sherpa 语义陷阱）。
+    ///
     /// - 每 chunk 把**已完成**的语音段 `pop` 掉（只清段队列、**不 reset** 检测状态），
     ///   使长录音（≤300s）内部段队列不增长（内存有界）。
-    ///
-    /// 供本地 realtime 静默计时使用；与在线门控的 `accept_and_check` 平行、互不影响。
+    /// 供本地 realtime 静音计时使用；与在线门控的 `accept_and_check` 平行、互不影响。
     pub fn feed_is_speech(&self, samples: &[f32]) -> bool {
-        self.detector.accept_waveform(samples);
+        // FIX-391：逐 512 块喂入（不再一次性喂整块）。
+        let _ = feed_in_vad_windows(samples, |block| self.detector.accept_waveform(block));
         let detected = self.detector.detected();
         // 清掉本次已完成的段（队列有界：只保留进行中的段；不 reset 检测状态）。
         while !self.detector.is_empty() {
@@ -1892,8 +1921,8 @@ mod tests {
         );
     }
 
-    /// LOCALRT-VAD-SILENCE-384：`feed_is_speech` **整块喂入**且每 chunk 排空已完成段 ⇒
-    /// 长录音（300s）内部段队列**不增长**（内存有界）。需要 silero 模型 + full.wav。
+    /// LOCALRT-VAD-SILENCE-384 / FIX-391：`feed_is_speech`（391 起**逐 512 块喂入**）每 chunk
+    /// 排空已完成段 ⇒ 长录音（300s）内部段队列**不增长**（内存有界）。需要 silero 模型 + full.wav。
     #[test]
     #[ignore = "requires silero model + full.wav; cargo test --bin feiyin-ime -- --ignored localrt_vad_feed_drains"]
     fn localrt_vad_feed_drains_queue_bounded() {
@@ -1942,5 +1971,163 @@ mod tests {
             audio.len() / 1600,
             n_speech
         );
+    }
+
+    // ========================================================================
+    // FIX-VAD-FEED-BY-WINDOW-391：逐 512 块喂入（speech_ranges / feed_is_speech）
+    // ========================================================================
+
+    /// FIX-391-④（纯逻辑）：`feed_in_vad_windows` 喂入次数 = `ceil(len/512)`、每块 ∈ (0,512]；
+    /// 源码级护栏：`speech_ranges` 与 `feed_is_speech` 都走它（不再一次性 `accept` 整块）。
+    #[test]
+    fn vad391_feed_in_vad_windows_counts_ceil() {
+        fn plan(len: usize) -> (usize, Vec<usize>) {
+            let mut sizes = Vec::new();
+            let n = feed_in_vad_windows(&vec![0.0f32; len], |b| sizes.push(b.len()));
+            (n, sizes)
+        }
+        assert_eq!(plan(0), (0, vec![]));
+        assert_eq!(plan(512), (1, vec![512]));
+        assert_eq!(plan(513), (2, vec![512, 1]));
+        let (n, sizes) = plan(1250);
+        assert_eq!(n, 3, "ceil(1250/512)=3");
+        assert_eq!(sizes, vec![512, 512, 226]);
+        assert_eq!(n, (1250 + 511) / 512);
+        assert!(sizes.iter().all(|&s| s > 0 && s <= 512));
+        // 源码级护栏（needle 用 concat! 拆串，避免命中本测试自身字符串）。
+        let src = include_str!("vad.rs");
+        assert!(
+            src.contains(concat!("feed_in_vad_windows(audio, |", "block|")),
+            "speech_ranges 必须逐块喂入"
+        );
+        assert!(
+            src.contains(concat!("feed_in_vad_windows(samples, |", "block|")),
+            "feed_is_speech 必须逐块喂入"
+        );
+    }
+
+    /// FIX-391-①②（必须实际运行，需 silero 模型 + full.wav）：4 段各 6s 语音 + 前后各 3s 静音：
+    /// ① `speech_ranges` + `trim_to_speech` 后时长 ≥ 原片段 × 0.9（不吞语音）；
+    /// ② ≤ 原片段 + 0.8s（静音被剪）；③ 对照：同一段**整块一次**喂入（旧写法，本测复刻）⇒ 显著更短。
+    #[test]
+    #[ignore = "requires silero model + full.wav; cargo test --bin feiyin-ime -- --ignored --nocapture vad391"]
+    fn vad391_speech_ranges_keeps_speech_cuts_silence() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let model_dir = root.join("models");
+        let wav = root.join("collab/research/audio-real-gavin/processed/full.wav");
+        let Some(wave) = sherpa_onnx::Wave::read(wav.to_str().unwrap()) else {
+            eprintln!("skip: full.wav 缺失");
+            return;
+        };
+        let all = wave.samples();
+        let rate = 16_000usize;
+        let clip = 6 * rate;
+        let pad = 3 * rate;
+        let pad_samples = (LOCALRT_TRIM_PAD_SECS * rate as f32) as usize;
+        let starts = [2 * rate, 9 * rate, 16 * rate, 23 * rate];
+        for (i, &s) in starts.iter().enumerate() {
+            let src = &all[s..(s + clip).min(all.len())];
+            let mut audio = vec![0.0f32; pad];
+            audio.extend_from_slice(src);
+            audio.extend(std::iter::repeat(0.0f32).take(pad));
+            let src_secs = src.len() as f32 / rate as f32;
+
+            let Some(vad) = VadSegmenter::try_new_for_local_trim(&model_dir) else {
+                eprintln!("skip: silero VAD 不可用");
+                return;
+            };
+            let ranges = vad.speech_ranges(&audio);
+            let out = crate::transcription::trim_to_speech(&audio, &ranges, pad_samples);
+            let out_secs = out.len() as f32 / rate as f32;
+            println!(
+                "vad391 clip#{i} start={}s in={src_secs:.2}s ranges={ranges:?} out={out_secs:.2}s",
+                s / rate
+            );
+            assert!(
+                out_secs >= src_secs * 0.9,
+                "clip#{i} 不得吞语音（out={out_secs:.2} src={src_secs:.2}）"
+            );
+            assert!(
+                out_secs <= src_secs + 0.8,
+                "clip#{i} 静音应被剪（out={out_secs:.2}）"
+            );
+
+            // 对照：旧「整块一次 accept_waveform」（本测复刻，不经生产函数）。
+            let d = VadSegmenter::try_new_for_local_trim(&model_dir).unwrap();
+            d.detector.reset();
+            d.detector.accept_waveform(&audio);
+            d.detector.flush();
+            let mut old_ranges: Vec<(usize, usize)> = Vec::new();
+            while let Some(seg) = d.detector.front() {
+                let st = seg.start() as usize;
+                let n = seg.n() as usize;
+                d.detector.pop();
+                old_ranges.push((st, st + n));
+            }
+            d.detector.clear();
+            d.detector.reset();
+            let old_out = crate::transcription::trim_to_speech(&audio, &old_ranges, pad_samples);
+            let old_secs = old_out.len() as f32 / rate as f32;
+            println!("vad391 clip#{i} OLD-whole-feed ranges={old_ranges:?} out={old_secs:.2}s");
+            assert!(
+                old_secs < src_secs * 0.5,
+                "旧整块写法应显著更短（证根因）：old={old_secs:.2} src={src_secs:.2}"
+            );
+        }
+    }
+
+    /// FIX-391-③（必须实际运行，需 silero 模型 + full.wav）：同一音频按 160 / 512 / 1600 / 16000
+    /// 样本块喂入 `feed_is_speech`、每块后取结果，人声开始 / 结束的判定差异 ≤ 一个喂入块
+    ///（≤512 的块数 ≤ 512 ⇒ 与 VAD 窗口同粒度；块越大，观测粒度=块大小）。
+    #[test]
+    #[ignore = "requires silero model + full.wav; cargo test --bin feiyin-ime -- --ignored --nocapture vad391"]
+    fn vad391_feed_is_speech_block_size_invariant() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let model_dir = root.join("models");
+        let wav = root.join("collab/research/audio-real-gavin/processed/full.wav");
+        let Some(wave) = sherpa_onnx::Wave::read(wav.to_str().unwrap()) else {
+            eprintln!("skip: full.wav 缺失");
+            return;
+        };
+        let audio: Vec<f32> = wave.samples().to_vec();
+        let sizes = [160usize, 512, 1600, 16000];
+        let mut ranges = Vec::new();
+        for &bs in &sizes {
+            let Some(vad) = VadSegmenter::try_new_for_local_trim(&model_dir) else {
+                eprintln!("skip: silero VAD 不可用");
+                return;
+            };
+            let mut first: Option<usize> = None;
+            let mut last = 0usize;
+            let mut off = 0usize;
+            while off < audio.len() {
+                let end = (off + bs).min(audio.len());
+                if vad.feed_is_speech(&audio[off..end]) {
+                    if first.is_none() {
+                        first = Some(off);
+                    }
+                    last = end;
+                }
+                off = end;
+            }
+            let f = first.unwrap_or(0);
+            println!("vad391 feed bs={bs} first_speech={f} last_speech={last}");
+            ranges.push((f, last));
+        }
+        // 以 512 为基准（VAD 窗口粒度）。
+        let (rf, rl) = ranges[1];
+        for (i, &(f, l)) in ranges.iter().enumerate() {
+            let bs = sizes[i];
+            assert!(
+                f.abs_diff(rf) <= bs.max(512),
+                "bs={bs} 开始判定差异 {} 应 ≤ 喂入块",
+                f.abs_diff(rf)
+            );
+            assert!(
+                l.abs_diff(rl) <= bs.max(512),
+                "bs={bs} 结束判定差异 {} 应 ≤ 喂入块",
+                l.abs_diff(rl)
+            );
+        }
     }
 }

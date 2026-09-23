@@ -2216,3 +2216,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | `main.rs` 仅一处注释（`reflow_monotonic_key` 去掉具体并发值） | ✅ 无行为影响 |
 | 新增单测 `fix390_tests`(3) | ✅ 平台中立、无 `#[cfg]`；macOS 同跑 |
 | macOS 侧需要做什么 | ✅ **无需代码改动**；未新增用户开关/env（DEC-031）、未触 `src/platform/macos/**`、未改构建脚本/依赖 |
+
+## FIX-VAD-FEED-BY-WINDOW-391（2026-09-23，coder-1）· VAD 改逐 512 块喂入（修「说话到一半卡住」P0）—— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| `vad.rs` 新增 `feed_in_vad_windows`（逐 `VAD_WINDOW_SIZE`=512 块喂）；`speech_ranges`/`feed_is_speech` 改走它（纠正 388「整段一次性 `accept_waveform`」错误用法） | ✅ **行为修复，平台中立**：`vad.rs` 无 `cfg`、同一 sherpa 绑定 ⇒ macOS 同继承「不再只留末尾 0.164s」；未改常量/旧构造/`segment()`/pub 签名 |
+| 根因属 sherpa `voice-activity-detector.cc` 的「大 n」语义陷阱（非本仓库平台差异） | ✅ 同模型同结论 |
+| 新增单测 `vad391_*`（1 纯 + 2 `#[ignore]` 真模型） | ✅ 平台中立、无 `#[cfg]`；macOS 同跑（`#[ignore]` 默认不跑） |
+| macOS 侧需要做什么 | ✅ **无需代码改动**；未新增用户开关/env（DEC-031）、未触 `src/platform/macos/**`、未改构建脚本/依赖 |
