@@ -2131,3 +2131,163 @@ mod tests {
         }
     }
 }
+
+// ========================================================================
+// TEST-SYNC-391（阶段三 · 非作者护栏）：逐块喂入覆盖性质 / 源码护栏 / 旧写法反例
+// ========================================================================
+#[cfg(test)]
+mod testsync391_tests {
+    use super::{feed_in_vad_windows, VadSegmenter};
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn n(&mut self, lo: usize, hi: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lo as u64 + (self.0 >> 33) % ((hi - lo + 1) as u64)) as usize
+        }
+    }
+
+    /// 1. 逐块覆盖性质：300 组随机长度 0~200000，收集 accept 收到的块 —— 每块长度 ∈ (0,512]、
+    ///    除末块外均 512、按序拼接**逐样本等于**原音频、次数 = `ceil(len/512)`。
+    #[test]
+    fn ts391_feed_windows_covers_all_samples_in_order() {
+        let mut rng = Lcg(0x391_5EED);
+        for case in 0..300usize {
+            let len = rng.n(0, 200_000);
+            // 唯一值 = 原下标（f32 对 ≤2^24 整数精确）⇒ 可逐样本校验拼接。
+            let audio: Vec<f32> = (0..len).map(|i| i as f32).collect();
+            let mut blocks: Vec<Vec<f32>> = Vec::new();
+            let calls = feed_in_vad_windows(&audio, |b| blocks.push(b.to_vec()));
+            assert_eq!(
+                calls,
+                len.div_ceil(512),
+                "case {case}: 次数 = ceil(len/512)"
+            );
+            assert_eq!(blocks.len(), calls, "case {case}: 接受块数 = 调用次数");
+            for (j, b) in blocks.iter().enumerate() {
+                assert!(
+                    !b.is_empty() && b.len() <= 512,
+                    "case {case}: 块 {j} 长度 {} 越界（应 ∈(0,512]）",
+                    b.len()
+                );
+                if j + 1 < blocks.len() {
+                    assert_eq!(b.len(), 512, "case {case}: 非末块必须满 512");
+                }
+            }
+            let flat: Vec<f32> = blocks.iter().flatten().copied().collect();
+            assert_eq!(flat, audio, "case {case}: 按序拼接必须逐样本等于原音频");
+        }
+    }
+
+    /// 2. 源码护栏：`speech_ranges` 与 `feed_is_speech` 函数体（**剔除注释行**）内**不得**直接对
+    ///    整段 `accept_waveform(audio)` / `accept_waveform(samples)`，必须经 `feed_in_vad_windows(`。
+    #[test]
+    fn ts391_entry_points_feed_by_window_only() {
+        let src = include_str!("vad.rs");
+        for (anchor, arg) in [
+            ("pub fn speech_ranges(", "audio"),
+            ("pub fn feed_is_speech(", "samples"),
+        ] {
+            let body = src.split(anchor).nth(1).expect("锚点缺失");
+            // 函数体：截到下一个 `pub fn` 或 impl 结束。
+            let body = body.split("\n    pub fn ").next().unwrap();
+            let body = body.split("\n}\n").next().unwrap();
+            let code: String = body
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let direct = format!("accept_waveform({arg})");
+            assert!(
+                !code.contains(&direct),
+                "{anchor} 函数体内不得直接 `{direct}`（必须逐块）"
+            );
+            assert!(
+                code.contains("feed_in_vad_windows("),
+                "{anchor} 必须经 feed_in_vad_windows 逐块喂入"
+            );
+        }
+    }
+
+    /// 3. 旧写法反例留证（`#[ignore]`，需 silero + full.wav）：同一「3s 静音 + 6s 语音 + 3s 静音」
+    ///    —— **整块一次**喂入 ⇒ 区间只落在**末尾**（总长 ≤0.3s、起点贴近末尾）；
+    ///    **逐块**喂入（生产 `speech_ranges`）⇒ 覆盖语音主体（起点在补静音之后 0.5s 内）。
+    #[test]
+    #[ignore = "requires silero model + full.wav; cargo test --bin feiyin-ime -- --ignored --nocapture ts391"]
+    fn ts391_whole_feed_tail_only_vs_windowed_covers_speech() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let model_dir = root.join("models");
+        let wav = root.join("collab/research/audio-real-gavin/processed/full.wav");
+        let Some(wave) = sherpa_onnx::Wave::read(wav.to_str().unwrap()) else {
+            eprintln!("skip: full.wav 缺失");
+            return;
+        };
+        let all = wave.samples();
+        let rate = 16_000usize;
+        let clip = 6 * rate;
+        let pad = 3 * rate;
+        let src = &all[2 * rate..(2 * rate + clip).min(all.len())];
+        let mut audio = vec![0.0f32; pad];
+        audio.extend_from_slice(src);
+        audio.extend(std::iter::repeat(0.0f32).take(pad));
+        let audio_secs = audio.len() as f32 / rate as f32;
+        let speech_secs = src.len() as f32 / rate as f32;
+
+        let Some(vad) = VadSegmenter::try_new_for_local_trim(&model_dir) else {
+            eprintln!("skip: silero VAD 不可用");
+            return;
+        };
+        // 逐块（生产路径）：起点在补静音之后 0.5s 内 + 覆盖语音主体。
+        let ranges = vad.speech_ranges(&audio);
+        assert!(!ranges.is_empty(), "逐块喂入应检出语音区间");
+        let first_start = ranges[0].0 as f32 / rate as f32;
+        assert!(
+            first_start <= (pad as f32 / rate as f32) + 0.5,
+            "逐块：起点应在补静音(3s)之后 0.5s 内，实测 {first_start:.2}s"
+        );
+        let covered = ranges
+            .iter()
+            .map(|&(s, e)| e.saturating_sub(s))
+            .sum::<usize>() as f32
+            / rate as f32;
+        assert!(
+            covered >= speech_secs * 0.9,
+            "逐块：应覆盖语音主体（covered={covered:.2}s / speech={speech_secs:.2}s）"
+        );
+
+        // 对照：旧「整块一次」（本测复刻，不经生产函数）。
+        let d = VadSegmenter::try_new_for_local_trim(&model_dir).unwrap();
+        d.detector.reset();
+        d.detector.accept_waveform(&audio);
+        d.detector.flush();
+        let mut old: Vec<(usize, usize)> = Vec::new();
+        while let Some(seg) = d.detector.front() {
+            let s = seg.start() as usize;
+            let n = seg.n() as usize;
+            d.detector.pop();
+            old.push((s, s + n));
+        }
+        d.detector.clear();
+        d.detector.reset();
+        let old_secs =
+            old.iter().map(|&(s, e)| e.saturating_sub(s)).sum::<usize>() as f32 / rate as f32;
+        let old_start = old
+            .first()
+            .map(|&(s, _)| s as f32 / rate as f32)
+            .unwrap_or(audio_secs);
+        println!(
+            "ts391 windowed first_start={first_start:.2}s covered={covered:.2}s | whole old_start={old_start:.2}s old_total={old_secs:.2}s (audio={audio_secs:.2}s)"
+        );
+        assert!(
+            old_secs <= 0.3,
+            "整块一次：区间总长应 ≤0.3s（只落末尾），实测 {old_secs:.2}s"
+        );
+        assert!(
+            old_start >= audio_secs - 0.3,
+            "整块一次：区间起点应贴近末尾，实测 {old_start:.2}s（末尾 {audio_secs:.2}s）"
+        );
+    }
+}
