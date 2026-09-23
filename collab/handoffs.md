@@ -123,3 +123,20 @@
 - **验证**：fmt EXIT 0 ｜ check 0 error、warnings 88=基线 ｜ 全量 test **0 failed**（bin 1500P/32I）｜ numstat==-w。
 - **未验证**：实机噪声环境端测（`silence detector=vad` / `vad cost` / 1200ms 触发一致性）交 tester-1/Gavin。
 - **未改版本 / 未 push / 未 build release / 零凭证**。
+
+## 2026-09-23 — LOCALRT-NEARFIELD-GATE-385（coder-2，✅ 阶段一交付：近场音量门）
+
+- **需求**（Gavin）：本地 realtime 区分「录音人说话」与「背景人声」。方案 A：录音人离麦近音量大 ⇒ 在线学录音人音量做门。
+- **改动（仅 `local_stream.rs`）**：`NearFieldLevel`（30s 窗口 / 80 分位 / 1s 热身）+ `nearfield_gate` / `vad_branch_decision` + `ChunkJudgment`；`chunk_has_speech` 加门（VAD 分支；兜底分支不加、同 384）；补偿只认 VAD 翻转；埋点。
+- 🔴 关键决策：**先判门、后更新**（防背景人声自我放行）；已知局限：背景人一样近一样大分不开。
+- **单测**：新增 4 条（level 窗口/分位、门就绪/热身、补偿只在 VAD 翻转、录音人→背景场景）全 PASS；384 用例不破。
+- **验证**：fmt EXIT 0 ｜ check 0 error、warnings 88=基线 ｜ 全量 test **0 failed**（bin 1504P/32I）｜ numstat==-w。
+- **未验证**：实机噪声/背景人声端测交 tester-1/Gavin（盯 `nearfield gate`/`summary` / 1200ms 一致性）。
+- **未改版本 / 未 push / 未 build release / 零凭证**。只改本地 realtime，其它管线未动。
+
+## 2026-09-23 — LOCALRT-NEARFIELD-GATE-385 第 1 轮退回修复（coder-2，✅ 已修）
+
+- **退回问题**：`NearFieldLevel` 窗口按「已入样本累计时长」滑动 ⇒ 录音人中途降音量到 <0.25×level 后永不过门 ⇒ 窗口不滑、level 永久锁死 ⇒ 剩余录音全判静默。
+- **修法**：样本记入样时刻 `now_ms`（会话音频 ms）；判门前 `prune(now)` 剔除早于 `now−30s` 的样本（按会话时间过期）；有效样本 <1s ⇒ 未就绪（门不生效、重新热身）；最坏锁定 ≤30s；「先判门、后更新」保留。
+- **补测**：`nearfield385_window_expires_by_session_time_not_sample_duration`（PASS）；384 回退单测按新签名适配、断言不变。
+- **验证**：fmt EXIT 0 ｜ check 0 error、warnings 88=基线 ｜ 全量 test **0 failed**（bin 1505P/32I）｜ numstat==-w（390/18）。仅改 `local_stream.rs`。

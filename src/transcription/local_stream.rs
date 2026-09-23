@@ -480,19 +480,33 @@ fn localrt_vad_session(model_dir: &Path) -> MutexGuard<'static, LocalRtVadCache>
     guard
 }
 
-/// LOCALRT-VAD-SILENCE-384：本 chunk「是否有人声」的**唯一判定**。
+/// LOCALRT-VAD-SILENCE-384 / LOCALRT-NEARFIELD-GATE-385：本 chunk「是否有人声」的**唯一判定**。
 ///
-/// VAD 可用 ⇒ `feed_is_speech`（silero）；不可用 ⇒ 退回**音量阈值**（口径与改前逐位相同）。
-/// 🔴 显示层打点 / acc 派发 / 影子 / 端点 / 337 边界 b **全部**用本判定，不许有的用 VAD、有的用音量。
+/// VAD 可用 ⇒ `feed_is_speech`（silero）再过**近场音量门**（385）；不可用 ⇒ 退回**音量阈值**
+/// （口径与 384 逐位相同，**不加近场门**）。返回 `(最终 has_speech, VAD 原始 vad_speech)`。
+/// 🔴 显示层打点 / acc 派发 / 影子 / 端点 / 337 边界 b **全部**用同一个 `has_speech`，不许分叉。
 fn chunk_has_speech(
     vad: Option<&VadSegmenter>,
     chunk: &[f32],
     chunk_rms: f32,
+    chunk_ms: f32,
+    now_ms: f32,
     silence_threshold: f32,
-) -> bool {
+    level: &mut NearFieldLevel,
+) -> ChunkJudgment {
     match vad {
-        Some(v) => v.feed_is_speech(chunk),
-        None => chunk_rms > silence_threshold,
+        Some(v) => {
+            let vad_speech = v.feed_is_speech(chunk);
+            let has_speech = vad_branch_decision(vad_speech, chunk_rms, chunk_ms, now_ms, level);
+            ChunkJudgment {
+                has_speech,
+                vad_speech,
+            }
+        }
+        None => ChunkJudgment {
+            has_speech: chunk_rms > silence_threshold,
+            vad_speech: false,
+        },
     }
 }
 
@@ -503,6 +517,129 @@ fn chunk_has_speech(
 /// **补记**这么多，使「从真实停顿起算满 1200ms」与改前一致。
 fn localrt_vad_seed_ms() -> f32 {
     LOCALRT_VAD_MIN_SILENCE_SECS * 1000.0
+}
+
+// ===========================================================================
+// LOCALRT-NEARFIELD-GATE-385：近场音量门 —— 区分「录音人」与「背景人声」
+//   （Gavin：silero VAD 只能分「人声 vs 噪声」，分不开「录音人 vs 背景别人说话」；
+//    录音人离麦近、音量大，背景人声到麦通常只有录音人的 1/3~1/10 ⇒ 在线学录音人音量做门。
+//    🔴 已知局限：背景人若与录音人一样近、一样大，分不开。）
+// ===========================================================================
+
+/// 近场音量门：录音人音量估计的滑动窗口（秒）。
+const NEARFIELD_HISTORY_SECS: f32 = 30.0;
+/// 近场音量门：取窗口内人声 chunk RMS 的**百分位**（偏高分位 ⇒ 背景人声偶尔混入也拉不低）。
+const NEARFIELD_LEVEL_PERCENTILE: f32 = 0.8;
+/// 近场音量门：累计人声满此秒数前视为「未就绪」（门不生效，一律放行）。
+const NEARFIELD_WARMUP_SECS: f32 = 1.0;
+/// 近场音量门：通过阈值 = 录音人音量估计 × 本比例（约 −12dB）。
+///
+/// 取偏宽值 0.25：远处人声通常比近场低 −10~−20dB（≈0.1~0.32 倍），0.25 落在其下沿，
+/// 以免把录音人的轻声字误判成静默（宁可放进一点背景，也不吞录音人的字）。
+const NEARFIELD_RATIO: f32 = 0.25;
+
+/// LOCALRT-NEARFIELD-GATE-385：录音人音量估计（**每次录音新建**，不跨录音）。
+///
+/// 只用**通过近场门**的人声 chunk 的 RMS 更新（见 [`vad_branch_decision`] 的「先判门、后更新」）；
+/// 估计 = 最近 `NEARFIELD_HISTORY_SECS`(30s) 已收录 chunk 的 `NEARFIELD_LEVEL_PERCENTILE`(80%) 分位。
+///
+/// 🔴 **窗口按会话音频时间过期，不按「已入样本累计时长」**（主控 385 验收退回）：
+/// 入样只在过门时发生 ⇒ 若录音人中途音量降到 `< ratio×level`，就再没有新样本；若按样本时长
+/// 滑窗则窗口永不滑动、level 永久锁死 ⇒ 本次录音剩余部分录音人**全被判静默**。
+/// 故每条样本记录**入样时刻**（会话已处理音频毫秒数，由 chunk 时长累加、不用系统时钟），
+/// 判门/估计前先剔除早于 `now − 30s` 的样本；样本累计不足 warmup 即未就绪 ⇒ 门不生效、重新热身。
+/// **最坏锁定时长 = 30s**（旧样本全部过期所需时间）。
+/// 实现：`VecDeque<(rms, t_ms, chunk_ms)>`（时间序，按时刻过期）；`estimate()` 排序拷贝（n ≤ 约 300，可忽略）。
+struct NearFieldLevel {
+    samples: std::collections::VecDeque<(f32, f32, f32)>,
+    total_ms: f32,
+}
+
+impl NearFieldLevel {
+    fn new() -> Self {
+        Self {
+            samples: std::collections::VecDeque::new(),
+            total_ms: 0.0,
+        }
+    }
+
+    /// 收录一个通过门的人声 chunk：`now_ms` = 入样时刻（会话音频毫秒），`chunk_ms` = 该 chunk 时长。
+    fn push(&mut self, rms: f32, now_ms: f32, chunk_ms: f32) {
+        self.samples.push_back((rms, now_ms, chunk_ms));
+        self.total_ms += chunk_ms;
+    }
+
+    /// 按**会话音频时间**剔除过期样本（`now_ms − t > 30s`）。与是否有新样本无关。
+    fn prune(&mut self, now_ms: f32) {
+        let limit = NEARFIELD_HISTORY_SECS * 1000.0;
+        while let Some(&(_, t_ms, chunk_ms)) = self.samples.front() {
+            if now_ms - t_ms > limit {
+                self.samples.pop_front();
+                self.total_ms -= chunk_ms;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// 是否已累计足够人声（≥ warmup）——未就绪（含被剔空）时门不生效。
+    fn is_ready(&self) -> bool {
+        self.total_ms >= NEARFIELD_WARMUP_SECS * 1000.0
+    }
+
+    /// 录音人音量估计（80 分位）；无样本返回 0。**须先 `prune(now_ms)`**。
+    fn estimate(&self) -> f32 {
+        if self.samples.is_empty() {
+            return 0.0;
+        }
+        let mut v: Vec<f32> = self.samples.iter().map(|(r, _, _)| *r).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let idx = ((v.len() as f32 * NEARFIELD_LEVEL_PERCENTILE) as usize).min(v.len() - 1);
+        v[idx]
+    }
+}
+
+/// 单个 chunk 的判定结果：`has_speech`（最终，含近场门）/ `vad_speech`（VAD 原始判定）。
+struct ChunkJudgment {
+    has_speech: bool,
+    vad_speech: bool,
+}
+
+/// LOCALRT-NEARFIELD-GATE-385：近场门**纯判定**（不含更新）。
+///
+/// `vad_speech && (未就绪 || rms ≥ level × ratio)`。VAD 非人声 ⇒ 恒 false（门不制造人声）。
+fn nearfield_gate(vad_speech: bool, ready: bool, level: f32, chunk_rms: f32, ratio: f32) -> bool {
+    vad_speech && (!ready || chunk_rms >= level * ratio)
+}
+
+/// LOCALRT-NEARFIELD-GATE-385：VAD 分支的判定 + 音量估计更新（纯逻辑，可单测）。
+///
+/// 🔴 **先判门、后更新**（用更新前的 level 判）：只有**通过门**的 chunk 才进估计。
+/// 若反过来「先更新、后判门」，一段持续的背景人声会被收进估计 ⇒ level 被拉低 ⇒
+/// 背景人声把自己放行（自我强化失效）。先判门可确保背景人声永远进不了估计。
+/// 代价：warmup 期（门未就绪、一律放行）若恰是背景人声会被学进估计 —— 已知局限，见节首注释。
+///
+/// 🔴 `now_ms` = 会话已处理音频毫秒数（chunk 时长累加）：判门前先 `prune(now_ms)` 按会话时间
+/// 过期旧样本 ⇒ 录音人中途降音量不再导致 level 永久锁死（最坏 30s 后重开门、重新热身）。
+fn vad_branch_decision(
+    vad_speech: bool,
+    chunk_rms: f32,
+    chunk_ms: f32,
+    now_ms: f32,
+    level: &mut NearFieldLevel,
+) -> bool {
+    level.prune(now_ms);
+    let pass = nearfield_gate(
+        vad_speech,
+        level.is_ready(),
+        level.estimate(),
+        chunk_rms,
+        NEARFIELD_RATIO,
+    );
+    if pass {
+        level.push(chunk_rms, now_ms, chunk_ms);
+    }
+    pass
 }
 
 /// 本地真流式转录（边收音频边解码），与 `transcribe_streaming_realtime` 平行。
@@ -573,6 +710,15 @@ pub fn transcribe_streaming_local(
         );
     }
     let mut prev_has_speech = false;
+    // LOCALRT-NEARFIELD-GATE-385：VAD **原始**判定与近场门挡住的 chunk 计数（与 prev_has_speech 区分）。
+    let mut prev_vad_speech = false;
+    let mut prev_gated = false;
+    let mut nearfield = NearFieldLevel::new();
+    // LOCALRT-NEARFIELD-GATE-385：会话已处理音频毫秒数（chunk 时长累加，不用系统时钟）——
+    // 近场门窗口按此过期。
+    let mut session_ms = 0.0f32;
+    let mut gated_chunks = 0u64;
+    let mut vad_speech_chunks = 0u64;
     let mut vad_total_ms = 0.0f64;
     let mut vad_max_ms = 0.0f64;
     let mut vad_chunks = 0u64;
@@ -676,13 +822,25 @@ pub fn transcribe_streaming_local(
             );
         }
 
-        // LOCALRT-PUNCT-TIMER-269-B / LOCALRT-VAD-SILENCE-384：本 chunk「是否有人声」——
-        // VAD 可用走 silero（`feed_is_speech`），不可用退回音量阈值（`chunk_has_speech` 内兜底）。
+        // LOCALRT-PUNCT-TIMER-269-B / LOCALRT-VAD-SILENCE-384 / LOCALRT-NEARFIELD-GATE-385：
+        // 本 chunk「是否有人声」—— VAD 可用走 silero + 近场音量门，不可用退回音量阈值。
         // 🔴 显示层打点、acc 派发、影子、端点、337 边界 b **全部**用这同一个判定。
         let chunk_ms = chunk.len() as f32 / SAMPLE_RATE as f32 * 1000.0;
         let chunk_rms = (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32).sqrt();
+        // 385：会话音频时间（本 chunk 结束时刻）；供近场门窗口按时间过期。
+        session_ms += chunk_ms;
         let t_vad0 = Instant::now();
-        let has_speech = chunk_has_speech(session_vad, &chunk, chunk_rms, silence_threshold);
+        let judgment = chunk_has_speech(
+            session_vad,
+            &chunk,
+            chunk_rms,
+            chunk_ms,
+            session_ms,
+            silence_threshold,
+            &mut nearfield,
+        );
+        let has_speech = judgment.has_speech;
+        let vad_speech = judgment.vad_speech;
         if vad_on {
             let dt_ms = t_vad0.elapsed().as_secs_f64() * 1000.0;
             vad_total_ms += dt_ms;
@@ -691,6 +849,23 @@ pub fn transcribe_streaming_local(
                 vad_max_ms = dt_ms;
             }
         }
+        if vad_speech {
+            vad_speech_chunks += 1;
+        }
+        // 385：近场门挡掉 VAD 人声 ⇒ 只在**状态切换**（进入被挡）时打，不逐 chunk 刷屏。
+        let gated_now = vad_speech && !has_speech;
+        if gated_now {
+            gated_chunks += 1;
+            if !prev_gated && log::log_enabled!(log::Level::Debug) {
+                log::debug!(
+                    "[LocalRT-DBG-385] nearfield gate: vad=on rms={:.5} level={:.5} ratio={:.2} => silent",
+                    chunk_rms,
+                    nearfield.estimate(),
+                    NEARFIELD_RATIO
+                );
+            }
+        }
+        prev_gated = gated_now;
         if has_speech {
             silent_ms = 0.0;
             acc_silent_ms = 0.0;
@@ -702,9 +877,10 @@ pub fn transcribe_streaming_local(
             // PARALLEL-ACC-298：有新语音 → 允许本轮停顿结束后再派发，并标记待派发区间含语音。
             acc_done_for_pause = false;
             acc_pending_has_speech = true;
-        } else if prev_has_speech && vad_on {
-            // LOCALRT-VAD-SILENCE-384：人声→无人声转换（VAD 过了 min_silence 才报「无人声」）⇒
-            // 把这段已静的时间补记回来，使「真实停顿起算满 1200ms」与改前一致。
+        } else if vad_on && prev_vad_speech && !vad_speech {
+            // LOCALRT-VAD-SILENCE-384/385：补偿**只针对 VAD 自身**的「人声→无人声」翻转
+            // （silero 过了 min_silence(0.3s) 才报无人声）⇒ 把这段已静时间补记回来。
+            // 🔴 近场门造成的「有声→静默」是**即时**的（VAD 仍报人声）⇒ 走下面的普通累加，不补。
             silent_ms = localrt_vad_seed_ms();
             acc_silent_ms = localrt_vad_seed_ms();
         } else {
@@ -721,6 +897,7 @@ pub fn transcribe_streaming_local(
             );
         }
         prev_has_speech = has_speech;
+        prev_vad_speech = vad_speech;
 
         pcm.extend_from_slice(&chunk);
         stream.accept_waveform(SAMPLE_RATE, &chunk);
@@ -1254,6 +1431,17 @@ pub fn transcribe_streaming_local(
         );
     }
 
+    // LOCALRT-NEARFIELD-GATE-385：近场门汇总（Debug 守卫）。
+    if vad_on && log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "[LocalRT-DBG-385] nearfield summary: level={:.5} ready={} gated_chunks={} vad_speech_chunks={}",
+            nearfield.estimate(),
+            nearfield.is_ready(),
+            gated_chunks,
+            vad_speech_chunks
+        );
+    }
+
     Ok((final_preview, pcm))
 }
 
@@ -1261,9 +1449,10 @@ pub fn transcribe_streaming_local(
 mod tests {
     use super::{
         build_dispatch_segment, chunk_has_speech, endpoint_action, endpoint_confirm_text,
-        local_stream_num_threads, localrt_vad_seed_ms, punct_cache_reuse, segment_streaming_text,
-        should_dispatch_acc, should_dispatch_tail, should_repunctuate_preview, EndpointAction,
-        LOCALRT_VAD_MIN_SILENCE_SECS, SAMPLE_RATE,
+        local_stream_num_threads, localrt_vad_seed_ms, nearfield_gate, punct_cache_reuse,
+        segment_streaming_text, should_dispatch_acc, should_dispatch_tail,
+        should_repunctuate_preview, vad_branch_decision, EndpointAction, NearFieldLevel,
+        LOCALRT_VAD_MIN_SILENCE_SECS, NEARFIELD_RATIO, SAMPLE_RATE,
     };
 
     /// LOCALRT-REFLOW-HOLE-344-G：片段流式文本按**字符**切片，绝不字节切片（中文安全、不 panic）。
@@ -2240,25 +2429,29 @@ mod tests {
     // LOCALRT-VAD-SILENCE-384：本地 realtime 静默判定改 VAD（音量阈值兜底）
     // ========================================================================
 
-    /// 测 #2：VAD 不可用 ⇒ 判定与 `chunk_rms > silence_threshold` **逐位相同**。
+    /// 测 #2 / 385-测 #5：VAD 不可用 ⇒ 判定与 `chunk_rms > silence_threshold` **逐位相同**，
+    /// 且**不加近场门**（385 只在 VAD 分支加门）。
     #[test]
     fn localrt384_fallback_matches_energy_threshold() {
         const THR: f32 = 0.01;
+        let mut lv = NearFieldLevel::new();
         for k in 0..200usize {
             let amp = (k % 60) as f32 / 1000.0; // 0.000..0.059，跨越阈值两侧
             let chunk: Vec<f32> = (0..1600)
                 .map(|i| if i % 2 == 0 { amp } else { -amp })
                 .collect();
             let rms = (chunk.iter().map(|s| s * s).sum::<f32>() / 1600.0).sqrt();
+            let j = chunk_has_speech(None, &chunk, rms, 100.0, 100.0, THR, &mut lv);
             assert_eq!(
-                chunk_has_speech(None, &chunk, rms, THR),
+                j.has_speech,
                 rms > THR,
                 "VAD 不可用 ⇒ 判定必须等于 `chunk_rms > silence_threshold`（amp={amp}）"
             );
+            assert!(!j.vad_speech, "VAD 不可用 ⇒ vad_speech 恒 false");
         }
         let chunk = vec![THR; 1600];
         assert!(
-            !chunk_has_speech(None, &chunk, THR, THR),
+            !chunk_has_speech(None, &chunk, THR, 100.0, 100.0, THR, &mut lv).has_speech,
             "rms 恰为阈值 ⇒ false（> 而非 >=）"
         );
     }
@@ -2356,6 +2549,185 @@ mod tests {
         assert_eq!(
             n_cmp, 1,
             "384: 兜底判定 chunk_has_speech 必须恰含一处音量阈值比较"
+        );
+    }
+
+    // ========================================================================
+    // LOCALRT-NEARFIELD-GATE-385：近场音量门（区分录音人 vs 背景人声）
+    // ========================================================================
+
+    /// 测 #1：`NearFieldLevel` 未满 warmup 未就绪 / 稳定 X ⇒ 估计≈X /
+    /// 混入 20% 小音量后仍≈X（80 分位抗干扰）/ 30s 窗口按**会话时间**过期。
+    #[test]
+    fn nearfield385_level_warmup_percentile_and_window() {
+        let mut lv = NearFieldLevel::new();
+        let mut t = 0.0f32;
+        // 未满 1s：5×100ms（t=100..500）
+        for _ in 0..5 {
+            t += 100.0;
+            lv.push(1.0, t, 100.0);
+        }
+        lv.prune(t);
+        assert!(!lv.is_ready(), "累计 0.5s < 1s ⇒ 未就绪");
+        // 累计 1.0s ⇒ 就绪
+        for _ in 0..5 {
+            t += 100.0;
+            lv.push(1.0, t, 100.0);
+        }
+        lv.prune(t);
+        assert!(lv.is_ready(), "累计 1.0s ⇒ 就绪");
+        assert!((lv.estimate() - 1.0).abs() < 1e-3, "稳定 X ⇒ 估计≈X");
+        // 20% 小音量（0.1X）+ 80% X ⇒ 80 分位仍 ≈ X
+        for _ in 0..20 {
+            t += 100.0;
+            lv.push(0.1, t, 100.0);
+        }
+        for _ in 0..80 {
+            t += 100.0;
+            lv.push(1.0, t, 100.0);
+        }
+        lv.prune(t);
+        assert!(
+            (lv.estimate() - 1.0).abs() < 1e-3,
+            "80 分位抗 20% 干扰 ⇒ 估计仍≈X"
+        );
+        // 30s 窗口按会话时间过期：持续喂 0.5 共 31s ⇒ 旧值全部滑出，估计≈0.5
+        for _ in 0..310 {
+            t += 100.0;
+            lv.push(0.5, t, 100.0);
+        }
+        lv.prune(t);
+        assert!(lv.is_ready());
+        assert!((lv.estimate() - 0.5).abs() < 1e-3, "旧值应滑出 30s 窗口");
+    }
+
+    /// 测 #2：近场门就绪后 `0.3×level` 通过 / `0.2×level` 被挡；未就绪一律通过。
+    #[test]
+    fn nearfield385_gate_ready_and_warmup() {
+        // 未就绪（ready=false）⇒ 一律放行（VAD 说是人声就通过）。
+        assert!(nearfield_gate(true, false, 999.0, 0.0, NEARFIELD_RATIO));
+        // 就绪：0.3×level 通过、0.2×level 被挡。
+        assert!(nearfield_gate(true, true, 1.0, 0.3, NEARFIELD_RATIO));
+        assert!(!nearfield_gate(true, true, 1.0, 0.2, NEARFIELD_RATIO));
+        // VAD 非人声 ⇒ 恒 false（门不制造人声）。
+        assert!(!nearfield_gate(false, true, 1.0, 5.0, NEARFIELD_RATIO));
+        // 边界：rms 恰 = level×ratio ⇒ 通过（>=）。
+        assert!(nearfield_gate(
+            true,
+            true,
+            1.0,
+            NEARFIELD_RATIO,
+            NEARFIELD_RATIO
+        ));
+    }
+
+    /// 测 #3：补偿只认 **VAD 自身翻转**；近场门挡掉（VAD 仍为真）按普通累加、不补。
+    #[test]
+    fn nearfield385_compensation_only_on_vad_flip() {
+        const CHUNK_MS: f32 = 100.0;
+        // 复刻生产三分支（inline，受 guard346 约束不可抽函数）。
+        let step = |has_speech: bool,
+                    prev_vad: bool,
+                    vad_speech: bool,
+                    vad_on: bool,
+                    silent: f32,
+                    acc: f32|
+         -> (f32, f32) {
+            if has_speech {
+                (0.0, 0.0)
+            } else if vad_on && prev_vad && !vad_speech {
+                (localrt_vad_seed_ms(), localrt_vad_seed_ms())
+            } else {
+                (silent + CHUNK_MS, acc + CHUNK_MS)
+            }
+        };
+        // VAD 真翻转（prev_vad=true、本 chunk vad_speech=false）⇒ 补 300ms。
+        assert_eq!(step(false, true, false, true, 0.0, 0.0), (300.0, 300.0));
+        // 近场门挡掉（prev_vad=true、本 chunk vad_speech 仍 true、has_speech=false）⇒ 累加、不补。
+        assert_eq!(
+            step(false, true, true, true, 300.0, 300.0),
+            (400.0, 400.0),
+            "近场门导致的静默是即时的，按普通累加（不补 min_silence）"
+        );
+        // 门连续挡 ⇒ 继续累加。
+        assert_eq!(
+            step(false, false, true, true, 1200.0, 1200.0),
+            (1300.0, 1300.0)
+        );
+        // VAD 不可用时永不补记（逐位同 384）。
+        assert_eq!(step(false, true, false, false, 0.0, 0.0), (100.0, 100.0));
+    }
+
+    /// 测 #4 场景：先 5s 录音人（音量 1.0）→ 5s 背景人声（VAD=true、音量 0.1）
+    /// ⇒ 背景段 `has_speech` 全为假，静默计时从背景段起累计并可到 1200ms；level 不被拉低。
+    #[test]
+    fn nearfield385_scenario_recording_person_then_background() {
+        let mut lv = NearFieldLevel::new();
+        let mut now = 0.0f32;
+        // 1) 录音人 1.0 热身 1s ⇒ 就绪。
+        for _ in 0..10 {
+            now += 100.0;
+            assert!(vad_branch_decision(true, 1.0, 100.0, now, &mut lv));
+        }
+        assert!(lv.is_ready());
+        // 2) 录音人再 5s（音量 1.0）⇒ 全通过。
+        for _ in 0..50 {
+            now += 100.0;
+            assert!(vad_branch_decision(true, 1.0, 100.0, now, &mut lv));
+        }
+        assert!((lv.estimate() - 1.0).abs() < 1e-3, "level≈1.0");
+        // 3) 背景人声 5s（VAD=true、音量 0.1）⇒ 全被挡；静默累计可到 1200ms。
+        let mut silent_ms = 0.0f32;
+        for _ in 0..50 {
+            now += 100.0;
+            assert!(
+                !vad_branch_decision(true, 0.1, 100.0, now, &mut lv),
+                "背景人声（0.1×level）必须被挡"
+            );
+            silent_ms += 100.0;
+        }
+        assert!(silent_ms >= 1200.0, "背景段静默应累计到 1200ms（可派发）");
+        assert!(
+            (lv.estimate() - 1.0).abs() < 1e-3,
+            "背景人声不得污染 level（防自我放行）"
+        );
+    }
+
+    /// 测 #7（主控 385 验收退回修复）：录音人中途降到 `<ratio×level` 后音频里再没有过门样本，
+    /// 窗口必须按**会话时间**过期（而非「已入样本累计时长」）⇒ 最坏 30s 后门重新放行并重新学到新音量。
+    ///
+    /// 修复前（按样本时长滑窗）：窗口永不滑动 ⇒ level 永久锁死 1.0 ⇒ 录音人剩余部分全被判静默。
+    #[test]
+    fn nearfield385_window_expires_by_session_time_not_sample_duration() {
+        let mut lv = NearFieldLevel::new();
+        let mut now = 0.0f32;
+        // 先学到 level≈1.0（2s）。
+        for _ in 0..20 {
+            now += 100.0;
+            assert!(vad_branch_decision(true, 1.0, 100.0, now, &mut lv));
+        }
+        assert!((lv.estimate() - 1.0).abs() < 1e-3);
+        // 录音人降到 0.2（< 0.25×1.0）持续：前 28s 必被挡（旧样本尚未过期/未掉到 warmup 以下）。
+        for _ in 0..280 {
+            now += 100.0;
+            assert!(
+                !vad_branch_decision(true, 0.2, 100.0, now, &mut lv),
+                "降音量后前 28s 应被挡"
+            );
+        }
+        // 继续 5s（越过 ~30s 窗口过期点）⇒ 门重新放行（未就绪 ⇒ 纯 VAD），并重新学到 ≈0.2。
+        let mut passed = 0usize;
+        for _ in 0..50 {
+            now += 100.0;
+            if vad_branch_decision(true, 0.2, 100.0, now, &mut lv) {
+                passed += 1;
+            }
+        }
+        assert!(passed > 0, "30s 后门必须重新放行（不再永久锁死）");
+        assert!(
+            (lv.estimate() - 0.2).abs() < 1e-3,
+            "应重新学到录音人新音量 ≈0.2，实测 {}",
+            lv.estimate()
         );
     }
 }

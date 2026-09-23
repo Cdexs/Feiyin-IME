@@ -1220,3 +1220,19 @@ load_wordbook_vocabulary()
 | 隔离 | 只改本地 realtime；其它 VAD 用途 / `src/audio` / 在线流式 / `src/main.rs` 均未动 |
 | 验证 | `cargo fmt --check` EXIT 0 ｜ `cargo check --all-targets` 0 error、warnings 88=基线 ｜ 全量 `cargo test --no-fail-fast` 0 failed（bin 1500P/32I）｜ numstat==-w ｜ ignore 真模型 300s 队列不增长 PASS（≈0.66ms/chunk） |
 | 下一步 | 阶段三 TEST-SYNC（非作者）→ 阶段四 TEST-EXEC → 出包；端测盯 `silence detector=vad` / `vad cost` / 1200ms 一致性 |
+
+## LOCALRT-NEARFIELD-GATE-385（阶段一·交付）· 2026-09-23 · coder-2
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 本地 realtime 新增**近场音量门**：VAD 判人声后再要求「chunk 音量 ≥ 录音人音量估计 × 0.25」⇒ 挡掉背景人声（更小）。`local_stream.rs` 新增 `NearFieldLevel`（30s 窗口/80 分位/1s 热身）+ 门纯函数 + `ChunkJudgment`；补偿只认 VAD 自身翻转；Debug 埋点 |
+| 隔离 | **只改 `local_stream.rs`**；`vad.rs`/`main.rs`/`audio`/在线/离线管线未动 |
+| 关键决策 | 先判门、后更新（防背景人声自我放行）；已知局限：背景人一样近一样大分不开 |
+| 验证 | fmt EXIT 0 ｜ check 0 error、warnings 88=基线 ｜ 全量 test 0 failed（bin 1504P/32I，新增 4 条）｜ numstat==-w |
+| 下一步 | 阶段三 TEST-SYNC（非作者）→ 阶段四 TEST-EXEC → 出包；端测盯 `nearfield gate`/`summary` |
+
+### LOCALRT-NEARFIELD-GATE-385 · 第 1 轮验收退回修复（2026-09-23，coder-2）
+
+- 主控退回：窗口按「已入样本累计时长」滑动 ⇒ 录音人中途降音量后永不过门 ⇒ level 永久锁死、剩余录音全判静默。
+- 修复：`NearFieldLevel` 改**按会话音频时间过期**（样本记 `now_ms`，判门前 `prune(now−30s)`）；有效样本 <1s ⇒ 未就绪（门不生效、重新热身）；最坏锁定 ≤30s。补回归单测。
+- 验证：fmt EXIT 0 ｜ check 0 error、warnings 88=基线 ｜ 全量 test 0 failed（bin 1505P/32I，385 共 5 条）｜ numstat==-w（390/18）。

@@ -2158,3 +2158,19 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 🔴 不改 | `VadSegmenter::try_new` / `try_new_for_streaming` / `accept_and_check` / `VAD_THRESHOLD`·`VAD_STREAMING_THRESHOLD` 等既有常量 / `src/audio/mod.rs` 的 `speech_detected` / 在线流式 `qwen_inference.rs` | 其它管线零影响；`src/main.rs` **未改**（模型目录经 `transcription::model_dir()` 内部取，与 `try_new_for_streaming` 调用方同源、遵守 DEC-011） |
 
 无新平台 API、无依赖 / 构建脚本变化 ⇒ macOS 侧无需同步改动。
+
+## LOCALRT-NEARFIELD-GATE-385（2026-09-23，coder-2）· 本地 realtime 近场音量门（区分录音人 vs 背景人声）—— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `local_stream.rs` 新增 `NearFieldLevel`（30s 滑动窗口 / 80 分位 / 1s 热身）+ `nearfield_gate` / `vad_branch_decision` + 常量 `NEARFIELD_HISTORY_SECS=30` / `NEARFIELD_LEVEL_PERCENTILE=0.8` / `NEARFIELD_WARMUP_SECS=1.0` / `NEARFIELD_RATIO=0.25` | VAD 判为人声后，再过「音量 ≥ 录音人估计×0.25（≈−12dB）」的近场门；背景人声（更小）被挡为静默 | 平台中立纯逻辑，无 `cfg` 分支，macOS 同吃 |
+| `chunk_has_speech` 返回 `ChunkJudgment{has_speech, vad_speech}`（VAD 分支加门；音量兜底分支不加门） | 显示打点 / acc 派发 / 影子 / 端点 / 337 边界 b 仍共用同一 `has_speech` | 同上 |
+| 计时补偿收紧为只认 VAD 自身翻转（`prev_vad_speech && !vad_speech`）；门挡掉的静默即时累加 | 1200ms 语义在「真停顿」时不变；门挡掉的段从被挡那刻即时起算 | 无 |
+| 埋点（Debug 守卫） | `[LocalRT-DBG-385] nearfield gate: vad=on rms=.. level=.. ratio=.. => silent`（切换时）/ `nearfield summary: level=.. ready=.. gated_chunks=.. vad_speech_chunks=..` | 无 |
+| 🔴 不改 | `vad.rs` 未动；其它 VAD 用途 / `src/audio` / 在线流式 / `src/main.rs` 均未动 | 其它管线零影响 |
+
+已知局限（已写进代码注释）：背景人若与录音人一样近、一样大，近场门分不开。无新平台 API、无依赖 / 构建脚本变化 ⇒ macOS 侧无需同步改动。
+
+### LOCALRT-NEARFIELD-GATE-385 · 修复补充（2026-09-23，coder-2）
+
+主控第 1 轮验收退回后修复：`NearFieldLevel` 的 30s 窗口由「按已入样本累计时长滑动」改为**按会话音频时间过期**（每条样本记入样时刻，判门前剔除早于 `now−30s` 的样本）。对 macOS 无额外影响：仍是平台中立纯逻辑、无 `cfg` 分支；无新平台 API / 依赖 / 构建脚本变化。行为差异：录音人中途降音量后，最坏 ~30s（窗口过期）门会重新放行并重新学习，而非永久锁死。
