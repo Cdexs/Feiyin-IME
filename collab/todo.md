@@ -36,6 +36,11 @@
 取证 `collab/evidence/20260923-eat-front/debug.log`；`hook_to_controller_ms` 全部 0 ⇒ 按键传递无延迟。
 
 
+### ✅ LOCALRT-VAD-SILENCE-384 + LOCALRT-NEARFIELD-GATE-385（作者已交付）+ ✅ 阶段三 TEST-SYNC-384-385（coder-1，2026-09-23）
+
+- **384/385**（coder-2，已交付）：本地 realtime 有声判定改 silero VAD（音量阈值兜底）+ 近场音量门区分「录音人 vs 背景人声」。
+- **✅ 阶段三 TEST-SYNC-384-385**（2026-09-23，coder-1）：仅 `local_stream.rs` `#[cfg(test)]` **+5 条非作者护栏**（随机 500 组兜底逐位·门免疫 / 近场门 0.26·0.24 两侧 / 30s 锁死恢复 / 背景 3s 无补记 @1200ms 达派发 / 补偿只认 VAD 翻转）；`cargo fmt --check` EXIT 0、`check --all-targets` 0 error、warnings ≤基线；**未跑 `cargo test`**（首跑阶段四）；**未发现生产缺陷**。
+
 ### ✅ FIX-PREVIEW-HARVEST-380 · 预览结果到即收 + 松键时延埋点（BUILD-379 端测，2026-09-23）— ✅ 已出包 BUILD-380（`cc83917`），待 Gavin 端测：停顿时预览是否一两秒内刷新；带 `-debug` 看 `[LocalRT-DBG-380]` 两个时延
 
 **Gavin 原话**：「输入一整段话的中间、还有尾部（特别是）的文字明明已经被改写修正，但始终不刷新，即使录音后我停顿等了好几秒也都不刷新」

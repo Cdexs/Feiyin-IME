@@ -1236,3 +1236,12 @@ load_wordbook_vocabulary()
 - 主控退回：窗口按「已入样本累计时长」滑动 ⇒ 录音人中途降音量后永不过门 ⇒ level 永久锁死、剩余录音全判静默。
 - 修复：`NearFieldLevel` 改**按会话音频时间过期**（样本记 `now_ms`，判门前 `prune(now−30s)`）；有效样本 <1s ⇒ 未就绪（门不生效、重新热身）；最坏锁定 ≤30s。补回归单测。
 - 验证：fmt EXIT 0 ｜ check 0 error、warnings 88=基线 ｜ 全量 test 0 failed（bin 1505P/32I，385 共 5 条）｜ numstat==-w（390/18）。
+
+## TEST-SYNC-384-385 · 非作者护栏：兜底/近场门/锁死恢复/背景人声/补偿只认 VAD 翻转 · 2026-09-23 · coder-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 仅 `src/transcription/local_stream.rs` 的 `#[cfg(test)]` 区（+238/−0，生产零改动）。给 coder-2 的 384/385 按契约补 5 条独立用例（`ts384385_`） |
+| 覆盖 | ① 随机 500 组兜底恒等 `rms>thr` + 门免疫 ② 门两侧 0.26/0.24 ③ 锁死恢复（1.0→0.2：28.5s 挡、≤31.5s 重开、1.2s 重学）④ 背景 3s 无补记 @1200ms 达派发 ⑤ 补偿只认 VAD 翻转（门挡不补/翻转覆盖 300ms/VAD 关不补） |
+| 验证 | `cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**、warnings **97/88** ≤ 基线 98/88；numstat == -w（238/0）。🔴 **未跑 `cargo test`**（白名单；首跑阶段四） |
+| 结论 | **未发现生产缺陷**；无停手项 |

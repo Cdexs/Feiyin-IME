@@ -2730,4 +2730,242 @@ mod tests {
             lv.estimate()
         );
     }
+
+    // ========================================================================
+    // TEST-SYNC-384-385（阶段三 · 非作者护栏 · coder-1）：按设计契约补独立用例，
+    //   不照实现反推、不与作者 `localrt384_*` / `nearfield385_*` 重复。
+    //   本文件三个计时分支内联在 `transcribe_streaming_local` 内（受 guard346 源码护栏约束、
+    //   不可抽函数）⇒ 涉及「静默计时推进」的项按**契约三分支**复刻（同作者注释所承认）；
+    //   判定类（兜底 / 近场门 / 门-未就绪）全部走**生产纯函数**。
+    // ========================================================================
+
+    /// 确定性伪随机（xorshift32），供 #1 的 500 组随机对照复现。
+    struct Ts384Rng(u32);
+    impl Ts384Rng {
+        fn next(&mut self) -> u32 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            self.0 = x;
+            x
+        }
+    }
+
+    /// #1 兜底逐位：VAD 不可用时，**随机 500 组** (rms, threshold) 判定恒等于 `rms > threshold`，
+    /// 且**不受近场门影响**（同一对值在「未就绪」与「就绪且 level=1000」下结论一致）。
+    /// 含大量贴边与精确相等对（相等必须 false，`>` 而非 `>=`）。
+    #[test]
+    fn ts384385_fallback_500_random_bit_identical_and_gate_immune() {
+        let mut rng = Ts384Rng(0x0385_5EED);
+        let empty: &[f32] = &[];
+        // lv_hot：就绪且 estimate=1000（兜底若误用近场门，会把 <250 的 rms 挡掉 ⇒ 结论分叉）。
+        let mut lv_cold = NearFieldLevel::new();
+        let mut lv_hot = NearFieldLevel::new();
+        for _ in 0..10 {
+            lv_hot.push(1000.0, 0.0, 100.0);
+        }
+        lv_hot.prune(0.0);
+        assert!(lv_hot.is_ready(), "对照组必须已就绪");
+
+        for k in 0..500 {
+            // rms / threshold ∈ [0, 0.2)，步进 0.0001 ⇒ 覆盖大量相等与贴边。
+            let rms = (rng.next() % 2000) as f32 / 10_000.0;
+            let thr = (rng.next() % 2000) as f32 / 10_000.0;
+            let a = chunk_has_speech(None, empty, rms, 100.0, k as f32 * 100.0, thr, &mut lv_cold);
+            let b = chunk_has_speech(None, empty, rms, 100.0, k as f32 * 100.0, thr, &mut lv_hot);
+            assert_eq!(
+                a.has_speech,
+                rms > thr,
+                "k={k} rms={rms} thr={thr}（未就绪）"
+            );
+            assert_eq!(
+                b.has_speech,
+                rms > thr,
+                "k={k} rms={rms} thr={thr}（就绪 level=1000）⇒ 兜底不得受近场门影响"
+            );
+            assert!(
+                !a.vad_speech && !b.vad_speech,
+                "VAD 不可用 ⇒ vad_speech 恒 false"
+            );
+        }
+        // 精确相等（rms == thr）必须 false；阈值上/下一档分别为 true。
+        let mut lv = NearFieldLevel::new();
+        assert!(!chunk_has_speech(None, empty, 0.125, 100.0, 0.0, 0.125, &mut lv).has_speech);
+        assert!(chunk_has_speech(None, empty, 0.1251, 100.0, 0.0, 0.125, &mut lv).has_speech);
+        assert!(!chunk_has_speech(None, empty, 0.1249, 100.0, 0.0, 0.125, &mut lv).has_speech);
+    }
+
+    /// #2 近场门开关：未就绪一律放行；就绪后 `level=1.0` 下 **0.26 放行 / 0.24 挡住**（ratio=0.25 两侧）；
+    /// 边界 `rms == level×ratio` 恰通过（`>=`）；VAD 非人声恒 false。
+    #[test]
+    fn ts384385_nearfield_gate_ready_sides_and_warmup_pass() {
+        let r = NEARFIELD_RATIO; // 0.25
+        let level = 1.0f32;
+        // 未就绪：rms=0 也放行（门不生效）。
+        assert!(nearfield_gate(true, false, level, 0.0, r), "未就绪必须放行");
+        assert!(nearfield_gate(true, false, level, 1e9, r));
+        // 就绪：ratio 两侧。
+        assert!(
+            nearfield_gate(true, true, level, 0.26, r),
+            "0.26×level 必须放行"
+        );
+        assert!(
+            !nearfield_gate(true, true, level, 0.24, r),
+            "0.24×level 必须挡住"
+        );
+        // 边界 = level×ratio ⇒ 通过（>=）；再低一点即挡。
+        assert!(nearfield_gate(true, true, level, level * r, r));
+        assert!(!nearfield_gate(true, true, level, level * r - 1e-6, r));
+        // VAD 非人声 ⇒ 恒 false（门不制造人声）。
+        assert!(!nearfield_gate(false, false, level, 1e9, r));
+        assert!(!nearfield_gate(false, true, level, 1e9, r));
+
+        // 集成旁证：就绪后 0.26 过、0.24 不过（走生产 `vad_branch_decision`）。
+        let mut lv = NearFieldLevel::new();
+        for _ in 0..10 {
+            lv.push(1.0, 0.0, 100.0);
+        }
+        lv.prune(0.0);
+        assert!(vad_branch_decision(true, 0.26, 100.0, 0.0, &mut lv));
+        assert!(!vad_branch_decision(true, 0.24, 100.0, 0.0, &mut lv));
+    }
+
+    /// #3 锁死恢复：学到 1.0 后录音人降到 0.2 连续说话 ⇒ **30s 内被挡、30s 后门重新放行**，
+    /// 放行后再 1s 学到 ≈0.2。（合同：窗口按会话音频时间过期 ⇒ 最坏锁定时长 30s。）
+    #[test]
+    fn ts384385_lock_recovery_within_bound_then_relearn() {
+        let mut lv = NearFieldLevel::new();
+        let mut now = 0.0f32;
+        for _ in 0..20 {
+            now += 100.0;
+            assert!(vad_branch_decision(true, 1.0, 100.0, now, &mut lv));
+        }
+        assert!((lv.estimate() - 1.0).abs() < 1e-3, "先学到 level≈1.0");
+        let drop_start = now;
+        // 28.5s 内持续被挡（旧样本仍在 30s 窗口内、level 仍高）。
+        for _ in 0..285 {
+            now += 100.0;
+            assert!(
+                !vad_branch_decision(true, 0.2, 100.0, now, &mut lv),
+                "降音量后 28.5s 内应被挡（now-drop={:.0}ms）",
+                now - drop_start
+            );
+        }
+        // 30s 附近门必须重新放行（最坏 30s；给到 31.5s 容差）。
+        let mut reopened = None;
+        for _ in 0..60 {
+            now += 100.0;
+            if vad_branch_decision(true, 0.2, 100.0, now, &mut lv) {
+                reopened = Some(now);
+                break;
+            }
+        }
+        let reopened = reopened.expect("30s 后门必须重新放行（不得永久锁死）");
+        assert!(
+            reopened - drop_start <= 31_500.0,
+            "重开时间 {:.2}s 应 ≤31.5s（最坏锁定时长 30s）",
+            (reopened - drop_start) / 1000.0
+        );
+        // 放行后再喂 1.2s 0.2 ⇒ 就绪且 estimate ≈ 0.2。
+        for _ in 0..12 {
+            now += 100.0;
+            let _ = vad_branch_decision(true, 0.2, 100.0, now, &mut lv);
+        }
+        assert!(lv.is_ready(), "重新热身 1s 后应就绪");
+        assert!(
+            (lv.estimate() - 0.2).abs() < 1e-3,
+            "应重新学到录音人新音量 ≈0.2，实测 {}",
+            lv.estimate()
+        );
+    }
+
+    /// #4 背景人声：录音人 1.0 说 5s → 背景 0.1（VAD 真）持续 3s ⇒ 背景段**全判静默**；
+    /// 静默按 chunk 时长累加（VAD 未翻转 ⇒ **无 300ms 补记**），在背景开始后 **1200ms**
+    /// 达到派发条件（`should_dispatch_acc`）。
+    #[test]
+    fn ts384385_background_3s_no_seed_dispatch_at_1200ms() {
+        let mut lv = NearFieldLevel::new();
+        let mut now = 0.0f32;
+        // 录音人 1.0 说 5s（门未就绪→热身并放行，随后仍放行）。
+        for _ in 0..50 {
+            now += 100.0;
+            assert!(
+                vad_branch_decision(true, 1.0, 100.0, now, &mut lv),
+                "录音人 1.0 必过"
+            );
+        }
+        assert!(lv.is_ready() && (lv.estimate() - 1.0).abs() < 1e-3);
+
+        let bg_start = now;
+        let mut silent_ms = 0.0f32;
+        let mut dispatch_at: Option<f32> = None;
+        for _ in 0..30 {
+            now += 100.0;
+            assert!(
+                !vad_branch_decision(true, 0.1, 100.0, now, &mut lv),
+                "背景 0.1 必被挡"
+            );
+            // 合同：VAD 未翻转 ⇒ 普通累加（若误补 300ms 会在第 9 个 chunk 就达 1200）。
+            silent_ms += 100.0;
+            if dispatch_at.is_none()
+                && should_dispatch_acc(true, silent_ms, 1000, false, true, 1200.0)
+            {
+                dispatch_at = Some(now);
+            }
+        }
+        let d = dispatch_at.expect("背景段应累计到 1200ms 达到派发条件");
+        assert!(
+            (d - bg_start - 1200.0).abs() < 1e-3,
+            "应在背景开始后恰 1200ms 达到派发，实测 {:.0}ms",
+            d - bg_start
+        );
+        assert!((silent_ms - 3000.0).abs() < 1e-3, "3s 背景 ⇒ 累计 3000ms");
+        assert!(
+            (lv.estimate() - 1.0).abs() < 1e-3,
+            "背景不得污染 level（防自我放行）"
+        );
+    }
+
+    /// #5 补偿只认 VAD 翻转：连续会话里，**近场门挡掉（VAD 仍真）⇒ 不补**（纯累加）；
+    /// **VAD 真翻转 ⇒ 补 300ms**（覆盖而非累加）；VAD 不可用即便 prev_vad=true 也不补。
+    #[test]
+    fn ts384385_seed_only_on_vad_flip_in_continuous_run() {
+        let chunk_ms = 100.0f32;
+        // 合同三分支（生产内联、guard346 约束不可抽函数；按契约复刻，同作者注释）。
+        let step =
+            |has_speech: bool, prev_vad: bool, vad_speech: bool, vad_on: bool, t: f32| -> f32 {
+                if has_speech {
+                    0.0
+                } else if vad_on && prev_vad && !vad_speech {
+                    localrt_vad_seed_ms()
+                } else {
+                    t + chunk_ms
+                }
+            };
+        // 场景 A：近场门挡掉（has_speech=false、vad_speech=true）连续 8 chunk
+        // ⇒ 生产判定确认「静默」，计时纯累加到 800ms（无 300ms 补记）。
+        let mut lv = NearFieldLevel::new();
+        for _ in 0..10 {
+            lv.push(1.0, 0.0, 100.0);
+        }
+        lv.prune(0.0);
+        let mut t = 0.0f32;
+        for _ in 0..8 {
+            assert!(
+                !vad_branch_decision(true, 0.1, chunk_ms, 0.0, &mut lv),
+                "门挡 ⇒ 静默"
+            );
+            t = step(false, true, true, true, t);
+        }
+        assert!(
+            (t - 800.0).abs() < 1e-3,
+            "门挡路径必须纯累加（无补记），实测 {t}"
+        );
+        // 场景 B：VAD 真翻转 ⇒ 计时被**覆盖**为 300ms（不是 800+300）。
+        assert_eq!(step(false, true, false, true, t), localrt_vad_seed_ms());
+        assert_eq!(localrt_vad_seed_ms(), 300.0);
+        // 场景 C：VAD 不可用（vad_on=false）⇒ 即便 prev_vad=true 也不补（逐位同 384）。
+        assert!((step(false, true, false, false, 0.0) - chunk_ms).abs() < 1e-3);
+    }
 }

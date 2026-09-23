@@ -140,3 +140,18 @@
 - **修法**：样本记入样时刻 `now_ms`（会话音频 ms）；判门前 `prune(now)` 剔除早于 `now−30s` 的样本（按会话时间过期）；有效样本 <1s ⇒ 未就绪（门不生效、重新热身）；最坏锁定 ≤30s；「先判门、后更新」保留。
 - **补测**：`nearfield385_window_expires_by_session_time_not_sample_duration`（PASS）；384 回退单测按新签名适配、断言不变。
 - **验证**：fmt EXIT 0 ｜ check 0 error、warnings 88=基线 ｜ 全量 test **0 failed**（bin 1505P/32I）｜ numstat==-w（390/18）。仅改 `local_stream.rs`。
+
+## 2026-09-23 — coder-1 — TEST-SYNC-384-385 ✅ 交付（阶段三·非作者护栏，只改 `local_stream.rs` 的 `#[cfg(test)]` 区）
+
+- **被测**：`LOCALRT-VAD-SILENCE-384` + `LOCALRT-NEARFIELD-GATE-385`（coder-2，已交付）。按契约写、不与作者 `localrt384_*`/`nearfield385_*` 重复。
+- **范围**：`src/transcription/local_stream.rs` **仅** `mod tests`（+238/−0，生产零改动）；5 条 `#[test]`（`ts384385_`）。
+- **覆盖**：
+  1. **兜底逐位**：VAD 不可用 ⇒ 随机 **500 组** (rms,thr) 判定恒等 `rms > thr`（含大量贴边/相等，**相等必 false**）；同一对值在「未就绪」与「就绪且 level=1000」下结论一致 ⇒ **兜底不受近场门影响**（`chunk_has_speech(None,..)` 生产真函数）。
+  2. **近场门开关**：未就绪一律放行（含 rms=0）；就绪 `level=1.0` 下 **0.26 放行 / 0.24 挡住**；边界 `=level×ratio` 恰通过（`>=`）；VAD 非人声恒 false；附 `vad_branch_decision` 集成旁证。
+  3. **锁死恢复**：学到 1.0 → 降到 0.2 ⇒ 28.5s 全挡、≤31.5s 门重开（最坏锁死 30s）、放行后 1.2s 重学 ≈0.2（`NearFieldLevel` + `vad_branch_decision` 生产真函数，无复刻）。
+  4. **背景人声**：录音人 1.0 说 5s → 背景 0.1（VAD 真）3s ⇒ 背景段全判静默、**无 300ms 补记**、于背景开始后**恰 1200ms** 达 `should_dispatch_acc` 派发条件、level 不被污染。
+  5. **补偿只认 VAD 翻转**：连续会话中门挡（VAD 仍真）⇒ 纯累加不补；VAD 真翻转 ⇒ 计时**被覆盖**为 300ms（非 +300）；VAD 不可用即便 prev_vad=true 也不补。
+- **验证（白名单）**：`cargo fmt --check` **EXIT 0**；`cargo check --all-targets` **0 error**、warnings **97/88** ≤ 基线 98/88；numstat == -w（238/0）。🔴 **未跑 `cargo test`**（任务书禁止，首跑在阶段四）。
+- **结论**：**未发现生产缺陷** ⇒ 无停手项。
+- ⚠️ **说明**：三个静默计时分支内联在 `transcribe_streaming_local` 内（受 `guard346` 源码护栏约束不可抽函数）⇒ #4/#5 的计时推进按**契约三分支**复刻（同作者注释所承认）；判定类（兜底/门/门-未就绪）全部走**生产纯函数**。
+- **未改生产代码 / 未改版本 / 未 push / 零凭证**。
