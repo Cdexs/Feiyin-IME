@@ -6241,6 +6241,87 @@ mod fix390_tests {
 }
 
 #[cfg(test)]
+mod testsync390_tests {
+    use super::{max_new_tokens_for, WINDOW_DECODE_CONCURRENCY};
+
+    /// 1. **不截断正常语速**：s ∈ {0.5, 1, 2, …, 25}，`cap ≥ ceil(7 字/s × s) + 5`（快语速 7 字/s +
+    ///    语种前缀约 5 token）**或**已达上限 256；且 cap 随 s **单调不减**。
+    #[test]
+    fn ts390_cap_never_truncates_fast_speech_and_is_monotone() {
+        let mut s = 0.5f32;
+        let mut last = 0i32;
+        while s <= 25.0 {
+            let cap = max_new_tokens_for(s);
+            let fast = (7.0f32 * s).ceil() as i32 + 5;
+            assert!(
+                cap >= fast || cap == 256,
+                "s={s}: cap={cap} 小于快语速需求 {fast} 且未达上限"
+            );
+            assert!(cap >= last, "s={s}: cap 应单调不减（{last} -> {cap}）");
+            last = cap;
+            s += 0.5;
+        }
+        // 整数点也必须覆盖（0.5 步进已含 1..25，额外显式核 25s 触顶）。
+        assert_eq!(max_new_tokens_for(25.0), 256, "25s ⇒ 触上限");
+    }
+
+    /// 2. 源码护栏：
+    /// (a) `transcribe_acc_ctx` 内 cap 计算位置在「剪后音频遮蔽 `samples`」**之后**（用剪后时长）；
+    /// (b) `decode_accuracy_once` 函数体**不出现** `max_new_tokens`（其他调用方不设 per-stream cap）。
+    #[test]
+    fn ts390_cap_after_trim_shadow_and_once_has_no_cap() {
+        let src = include_str!("mod.rs");
+        let ctx = src
+            .split("pub(crate) fn transcribe_acc_ctx(")
+            .nth(1)
+            .expect("transcribe_acc_ctx 锚点缺失");
+        let ctx = ctx.split("FIX-PREFIX-AND-EAT-371").next().unwrap();
+        let shadow = ctx
+            .find("let samples: &[f32] = &samples_used;")
+            .expect("剪后音频遮蔽 samples 的锚点缺失");
+        let cap_pos = ctx.find("max_new_tokens_for(").expect("cap 计算锚点缺失");
+        assert!(
+            cap_pos > shadow,
+            "cap 必须在「剪后音频遮蔽 samples」之后计算（否则用的是原始时长）"
+        );
+        let once = src
+            .split("fn decode_accuracy_once(")
+            .nth(1)
+            .expect("decode_accuracy_once 锚点缺失");
+        let once = once
+            .split("fn decode_accuracy_allow_empty(")
+            .next()
+            .unwrap();
+        // 契约：`decode_accuracy_once` 不得设 per-stream cap（必须传 `None`）⇒ 体内不出现任何 `Some(`。
+        assert!(
+            !once.contains("Some("),
+            "decode_accuracy_once 不得设 per-stream max_new_tokens（必须传 None）"
+        );
+    }
+
+    /// 3. 并发度 = 1（串行），且常量注释须留**实测依据关键字**（`274` 与 `476`）——防被无依据改回。
+    #[test]
+    fn ts390_concurrency_serial_with_measured_comment() {
+        assert_eq!(WINDOW_DECODE_CONCURRENCY, 1, "TUNE-390：窗口解码须串行");
+        let src = include_str!("mod.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let cidx = lines
+            .iter()
+            .position(|l| l.contains("pub(crate) const WINDOW_DECODE_CONCURRENCY"))
+            .expect("WINDOW_DECODE_CONCURRENCY 锚点缺失");
+        let mut j = cidx;
+        while j > 0 && lines[j - 1].trim_start().starts_with("///") {
+            j -= 1;
+        }
+        let block = lines[j..cidx].join("\n");
+        assert!(
+            block.contains("274") && block.contains("476"),
+            "常量注释须含实测依据 274/476 ms/音频秒，实测注释块={block:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod sliding_window_367_tests {
     use super::{
         align_overlap, group_window_start_secs, OrderedReflow, WINDOW_MAX_SECS, WINDOW_MAX_SLICES,

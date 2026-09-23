@@ -267,3 +267,10 @@
 - **单测**：新增 `fix390_tests` 3 条（并发度=1 / `max_new_tokens_for` 取值·界·非有限·负·单调·极大值不 panic / 源码护栏：首解重解都带 `Some(token_cap)` 且 `decode_accuracy_once` 传 `None`）。
 - **验证**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**、warnings **97/88** = 基线；全量 `cargo test --no-fail-fast` **1642P/0F/35I**（EXIT 0）。numstat main 2/2、mod 138/10（== -w）。
 - **未改版本 / 未 push / 未 build release / 零凭证**。
+
+## 2026-09-23 — TEST-SYNC-390（coder-2，✅ 阶段三交付：非作者护栏 3 条）
+
+- **性质**：只写测试、零生产改动；仅 `src/transcription/mod.rs` `#[cfg(test)] mod testsync390_tests`。被测 `TUNE-DECODE-SERIAL-AND-TOKEN-CAP-390`（HEAD `9ae53d2`）。🔴 **未跑 `cargo test`**（阶段四首跑）。
+- **新增 3 条**：快语速不截断（s∈{0.5..25}，cap≥ceil(7s)+5 或 256，单调）；源码护栏（cap 在剪后遮蔽 samples 之后 + `decode_accuracy_once` 无 `Some(`）；并发度 ==1 且注释含实测依据 274/476。
+- **验证**：`rustfmt` + `cargo check --all-targets` **0 error**、warnings **97/88**=基线；`cargo fmt --check` EXIT 0；numstat==-w（mod 81/0）。独立 Python 复刻 `max_new_tokens_for` 逐点 bad=0 + 源码锚点实测成立。
+- **未发现生产缺陷**。**未改版本 / 未 push / 零凭证**。
