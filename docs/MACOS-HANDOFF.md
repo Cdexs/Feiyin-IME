@@ -2195,3 +2195,14 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | D2：`output_rate_ok` 冷启动下限（`COLD_MIN_AUDIO_SECS=3.0` / `COLD_MIN_CHARS_PER_SEC=1.0`） | ✅ 平台中立；**契约变更**（`None`/`NaN`/`0.0`/`±inf` 一律按无均值、`<3s` 不判） |
 | 新增单测 `fix388_trim_and_floor_tests`（含 `#[ignore]` 真模型） | ✅ 平台中立、无 `#[cfg]`；macOS 同跑（`#[ignore]` 默认不跑） |
 | macOS 侧需要做什么 | ✅ **无需代码改动**；未新增用户开关/env（DEC-031）、未触 `src/platform/macos/**`、未改构建脚本/依赖 |
+
+## FIX-NEARFIELD-BY-SEGMENT-AND-PREVIEW-389（2026-09-23，coder-2；主控合入）· 近场门整句判定 + 跨录音沿用音量 + 部分窗预览 —— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `local_stream.rs` 近场门：逐块门 → `SegmentGate`（VAD 段内峰值 ≥0.3×录音人音量即整句确认） | 句内轻音 / 句尾不再被切成静默 | 纯数值逻辑，无 `cfg`，macOS 同吃 |
+| 跨录音沿用 `LOCALRT_CARRY_LEVEL`（进程内存，key=`config.audio.input_device`，10 分钟） | 短录音第一句即可挡背景人声 | 跨平台字段，macOS 同吃 |
+| `transcribe_streaming_local` 新增入参 `vad_device: &str` | — | macOS 若有调用方须同步传参（当前唯一调用点在 `main.rs`） |
+| `main.rs` 部分窗折算 `partial_win_committed` + `PreviewReflow.boundary_usable` | 多片派发时预览不回退 | `ReflowFastState` 本为 `cfg(windows)`；事件字段与折算函数平台中立 |
+
+无新平台 API / 依赖 / 构建脚本变化。
