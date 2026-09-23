@@ -34,8 +34,10 @@
 | ✅ `FIX-VAD-FEED-BY-WINDOW-391` | 修「说话到一半卡住 / 只出前半段」P0：`speech_ranges`/`feed_is_speech` 改**逐 512 块**喂入（388 整段一次性喂入命中 sherpa「大 n」语义陷阱 ⇒ 6.31s 只剩 0.37s）。**2026-09-23 阶段一交付 coder-1**：新增真模型 `#[ignore]` 实跑（4 段 6s 语音剪后 **6.44/6.31/6.38/5.78s**、旧整块写法复现 **0.36s**、`feed_is_speech` 块大小 160/512/1600/16000 差异 ≤ 喂入块）+ 纯逻辑喂入次数测试；`fmt --check` EXIT0、`check --all-targets` 0 error、全量 **1646P/0F/37I**。**待 tester-1 阶段四回归 + 392 合包 + 端测** | coder-1（`vad.rs`） |
 | ✅ `FIX-GATE-TIMING-ONLY-392`（+ ✅ 阶段三 `TEST-SYNC-392`） | `local_stream.rs` 门只管时序、内容去留只看 VAD、下中位数、首段不学。**阶段三 2026-09-23 交付 coder-1**：仅 `local_stream.rs` 的 `#[cfg(test)]` **+4 条**（门误判不丢内容恰派发一次 / 背景+录音人恰 2 次 / 首段不学+下中位 / VAD 不可用两标志逐位一致），`fmt --check` EXIT 0、`check --all-targets` 0 error、warnings **97/88**=基线；**未跑 `cargo test`**；**未发现生产缺陷** | coder-2（实现）+ coder-1（阶段三护栏） |
 | ✅ `VAD-V6-AND-TIMELINE-REUSE-393`（第一轮验收退回 `VAD-393-REWORK`：R1 派发时 VAD 仍在语音段中 ⇒ 回退 391 自跑防吞字；R2 尾片 flush 护栏；R3 逐子片对照 E2E diff ≤0.02s；R4/R5 小修。**第二轮验收通过，commit `ae2d8a9`**，1582P/0F/39I。**阶段三 TEST-SYNC-393 已派 tester-1，之后与 394 合包回归**；出包须同步 `Publish/models/silero-vad` v6.2.3） | silero VAD 同路径升 **v6.2.3**（v4 备份 evidence、**无回退机制**）+ 本地实时 `max_speech 60s` + **实时时间线复用剪静音**（A1~A4；空区间+流式非空⇒整窗不吞字，无时间线或派发时 VAD 仍在段中⇒回退 391 自跑 VAD 仍 v6） | coder-1（`vad`/`local_stream`/`main`/`transcription`） |
-| 🔄 `TRANS-NLLB-AND-SENTENCE-BATCH-394`（**第一轮验收退回** `TRANS-394-REWORK`，见 `acceptance-394.md`：R1 模型析构 `translator_destroy` 可能挂死，生产在退出 / 关翻译 / 重载时都会触发 ⇒ 改进程级缓存永不析构；R2 恢复误删的方向判定用例；R3 缩写表误伤断句） | 本地翻译换 NLLB-600M int8 + 逐句批量 + 漏译重译；只改 `translation/mod.rs` | coder-2 |
-| 🔄 `TEST-SYNC-393`（阶段三，23:30 派发） | 393 补护栏 9 条（时间线跨片映射 / 三数组同步 / 路B 不接时间线 / 20s 路径相邻段等），只写测试、只许 fmt/check | tester-1 |
+| ✅ `TRANS-NLLB-AND-SENTENCE-BATCH-394`（第一轮退回 `TRANS-394-REWORK`：R1 取证坐实 CT2 销毁推理过的模型会死锁 ⇒ 模型进程级常驻永不析构；R2 恢复方向判定用例；R3 缩写表。**第二轮验收通过，commit `c1475ac`**） | 本地翻译换 NLLB-600M int8 + 逐句批量 + 漏译重译；只改 `translation/mod.rs` | coder-2 |
+| ✅ `TEST-SYNC-393`（tester-1 交付 10 条，commit `56c1503`；1 条期望值算错由主控 `c0baf8c` 修正） | 393 补护栏（时间线跨片映射 / 三数组同步 / 路B 不接时间线 / 20s 路径相邻段等） | tester-1 |
+| 🔄 `TEST-SYNC-394`（阶段三，00:02 派发） | 翻译补护栏 8 项（分句不丢字不变式 / 缩写断句 / 重译出错或更短保留原译 / 永不析构源码护栏等），只写测试、只许 fmt/check | tester-1 |
+| 🔄 `TRANS-COPY-395`（00:03 派发，小改动短路径） | 翻译热键页说明去掉「目标语言」，改为「说中文译英文，说英文译中文」，三份 locale（DEC-082） | coder-2 |
 
 > 🔴 **出包模型核验（Gavin 2026-09-23：「新的vad和翻译模型同时也要拷贝到release下的model目录下，那是我本地端侧的执行目录」）**：
 > `target/release/models` 是指向 `models/` 的**目录联接**（主控 21:5x 核实：VAD 已是 v6.2.3 `1a153a22…`，NLLB 目录已可见）⇒ 自动同步、不要复制进去（复制会写穿到源目录）。
