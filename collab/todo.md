@@ -22,6 +22,10 @@
 
 ## 🔴 待做
 
+### 🆕 UNIFY-SLICE-CUT-383 · 残留 20s 硬切改为「10s 后字缝切」（381/382 出包后派）
+
+Gavin 2026-09-23：「现在已经没有秒切法了」「没有20秒切法了」。残留调用方仅两处：旧离线 accuracy 档（UI 已隐藏）与本地实时档**兜底**（`acc_parallel_result_usable` 为假 ⇒ 整段重转写，`transcription/mod.rs:1052` `transcribe_offline_detailed` → `vad.rs` `build_padded_segments` / `naive_chunk`，20s）。改为同一 `plan_gap_cuts`，全项目只留一种切片规则。🔴 须评估 20s → 10s 对离线 accuracy 长音频片数 / KV 的影响（DEC-026/027/072）。
+
 ### 🆕🔴🔴 P0 · BUILD-380 端测两 bug + 回灌提速 + 切片/窗口统一 10s（Gavin 已确认）— 382 ✅ 2026-09-23 交付 coder-1，381 待 coder-2
 
 | 单号 | 内容 | 负责 |
