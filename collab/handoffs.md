@@ -257,3 +257,13 @@
 - **新增 5 条**：`trim_to_speech` 性质（300 组随机：不增长/递增序/不丢语音）；首解空进 Empty 重解恰 1 次；`has_content` 全角/假名/emoji 边界；冷启动 2.99/3.0/3.01 + avg 非有限等价；重解至多一次性质（`invalid⇒空串`）。
 - **验证**：`rustfmt` + `cargo check --all-targets` **0 error**、warnings **97/88**=基线；`cargo fmt --check` EXIT 0；numstat==-w（mod 149/0）。独立 Python 复刻 `trim_to_speech` 500 组性质 bad=0。
 - **未发现生产缺陷**。**未改版本 / 未 push / 零凭证**。
+
+## 2026-09-23 — coder-1 — TUNE-DECODE-SERIAL-AND-TOKEN-CAP-390 ✅ 交付（阶段一）
+
+- **需求**（Gavin）：研究 B 路径窗口解码能否用框架并行接口优化性能。**依据**（主控查证）：sherpa 1.13.8 `DecodeStreams` 对 Qwen3 **无并行收益**（逐 `Decode`）；两解码线程共用同一 recognizer（ORT 8 线程池）**互相争抢** ⇒ 实测单独 **274** vs 并发 **476** ms/音频秒（每窗慢 74%、总吞吐仅 +15%）；预览按窗序回灌 ⇒ 单窗变慢直接推迟刷新。
+- **改动1**：`WINDOW_DECODE_CONCURRENCY` **2 → 1**（注释写实测 + 「改回须附新实测」）；共享队列 / `drive_acc_windows` / 收尾逻辑不变（=1 自然退顺序）。
+- **改动2**：新增 `TOKEN_CAP_PER_SEC=12`/`BASE=24`/`MIN=48`/`MAX=256` + 纯函数 `max_new_tokens_for(speech_secs)`（非有限/负 ⇒ 256；饱和防溢出）；`decode_accuracy_allow_empty` 增 `max_new_tokens: Option<i32>`；`decode_accuracy_once` 传 `None`（其它调用方逐位不变）；`transcribe_acc_ctx` 用**剪静音后**时长算 cap、首解与重解都带 `Some(cap)`（重解改走 `allow_empty`，空输出 `Ok("")` 与原 `unwrap_or_default` 语义一致）；`[DBG-388] trim` 追加 `max_new_tokens=`。不改任何 `pub` 签名。
+- **main.rs**：`reflow_monotonic_key` 注释去具体并发值（中性表述，仅注释）。
+- **单测**：新增 `fix390_tests` 3 条（并发度=1 / `max_new_tokens_for` 取值·界·非有限·负·单调·极大值不 panic / 源码护栏：首解重解都带 `Some(token_cap)` 且 `decode_accuracy_once` 传 `None`）。
+- **验证**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**、warnings **97/88** = 基线；全量 `cargo test --no-fail-fast` **1642P/0F/35I**（EXIT 0）。numstat main 2/2、mod 138/10（== -w）。
+- **未改版本 / 未 push / 未 build release / 零凭证**。

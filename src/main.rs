@@ -10406,8 +10406,8 @@ enum ReflowAction {
 /// FIX-PREVIEW-STALE-AND-COLLAPSE-375（A）：回灌「过期」判据的**单调键**选择。
 ///
 /// - `replace_all=true`（滑窗权威全文，语义 = 整段替换、每条取代前一条）⇒ 用**滑窗快照自有**的
-///   `reflow_seq`（严格递增）。🔴 **不得**用 `seg_index`：滑窗路径传的是切片下标，窗口间并发
-///   （`WINDOW_DECODE_CONCURRENCY=2`）+ 收尾 drain 会让多个窗口带**同一个下标** ⇒ 后到的那个
+///   `reflow_seq`（严格递增）。🔴 **不得**用 `seg_index`：滑窗路径传的是切片下标，窗口间
+///   （滑窗调度 + 收尾 drain）会让多个窗口带**同一个下标** ⇒ 后到的那个
 ///   （= `OrderedReflow` 合并后的完整文本）被误判 stale 丢掉 ⇒ 预览永远停在纯流式文本。
 /// - `replace_all=false`（老逐片路径）⇒ 仍用 `seg_index`（逐片严格递增），**行为逐位不变**。
 ///

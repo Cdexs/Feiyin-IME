@@ -2206,3 +2206,13 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | `main.rs` 部分窗折算 `partial_win_committed` + `PreviewReflow.boundary_usable` | 多片派发时预览不回退 | `ReflowFastState` 本为 `cfg(windows)`；事件字段与折算函数平台中立 |
 
 无新平台 API / 依赖 / 构建脚本变化。
+
+## TUNE-DECODE-SERIAL-AND-TOKEN-CAP-390（2026-09-23，coder-1）· 窗口解码改串行 + 按语音时长限制生成长度 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| `WINDOW_DECODE_CONCURRENCY` **2 → 1**（串行）；共享队列 / `drive_acc_windows` / 收尾逻辑不变 | ✅ **行为变更，平台中立**：常量在 `transcription/mod.rs`、消费在 `main.rs` 滑窗线程，均无 `cfg`；macOS 同继承 |
+| `max_new_tokens_for` + `decode_accuracy_allow_empty` 增 `max_new_tokens: Option<i32>`（per-stream `set_option("max_new_tokens", …)`）；`transcribe_acc_ctx` 首解/重解带 cap | ✅ 平台中立纯逻辑；`transcribe_acc_ctx` 仅滑窗调用 ⇒ **只影响本地 realtime 管线**；未改任何 `pub` 签名 |
+| `main.rs` 仅一处注释（`reflow_monotonic_key` 去掉具体并发值） | ✅ 无行为影响 |
+| 新增单测 `fix390_tests`(3) | ✅ 平台中立、无 `#[cfg]`；macOS 同跑 |
+| macOS 侧需要做什么 | ✅ **无需代码改动**；未新增用户开关/env（DEC-031）、未触 `src/platform/macos/**`、未改构建脚本/依赖 |

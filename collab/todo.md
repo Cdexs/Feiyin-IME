@@ -28,6 +28,7 @@
 | --- | --- | --- |
 | ✅ `FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388` | 解码前 VAD 剪静音（根因：静音多+热词触发 sherpa #3509 类幻觉）；重解统一查有内容+产出率；冷启动坍塌绝对下限。**2026-09-23 阶段一交付 coder-1**：`vad.rs` 只新增 `try_new_for_local_trim`/`speech_ranges` + `trim_to_speech` + 线程级 VAD 缓存 + `has_content`/`output_rate_ok` 下限；新增单测 7+`#[ignore]`1，**契约变更更新 6 条既有期望（不变量未动）**；`fmt --check` EXIT0、`check --all-targets` 0 error、warnings **97/88**=基线、全量 **1621P/0F/35I**。**待 tester-1 阶段四回归 + 出包 + 端测** | coder-1（`transcription/mod.rs`、`vad.rs` 只新增） |
 | ✅ `FIX-NEARFIELD-BY-SEGMENT-AND-PREVIEW-389`（+ ✅ 阶段三 `TEST-SYNC-389`） | 近场门改按 VAD 整句判定（段峰值 ≥0.3×level 即整句确认）；多片派发部分窗按时长比例估流式字数，防预览回退。**阶段三 2026-09-23 交付 coder-1**：仅 `local_stream.rs`+`main.rs` 的 `#[cfg(test)]` **+5 条**（整句不切/背景挡住+峰值不入样/防锁死重学/seed 流程与边界/部分窗折算随机性质），`fmt --check` EXIT 0、`check --all-targets` 0 error、warnings **97/88**=基线；**未跑 `cargo test`**；**未发现生产缺陷** | coder-2（实现）+ coder-1（阶段三护栏） |
+| ✅ `TUNE-DECODE-SERIAL-AND-TOKEN-CAP-390` | 窗口解码改串行（`WINDOW_DECODE_CONCURRENCY` 2→1，实测单独 274 vs 并发 476 ms/音频秒）；`max_new_tokens_for` 按剪静音后语音时长限制 per-stream 生成长度，首解/重解都带 cap。**2026-09-23 阶段一交付 coder-1**：新增单测 `fix390_*` 3 条；`fmt --check` EXIT0、`check --all-targets` 0 error、warnings **97/88**=基线、全量 **1642P/0F/35I**。**待 tester-1 阶段四回归 + 388/389/390 合包 + 端测** | coder-1（`transcription/mod.rs`、`main.rs` 注释一处） |
 
 ### ✅ BUILD-387 已出包（2026-09-23 17:10，HEAD `3646b4d`）· 待 Gavin 端测
 

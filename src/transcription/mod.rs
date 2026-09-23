@@ -742,6 +742,34 @@ fn strip_terms_echo(text: &str, terms: Option<&str>) -> Option<TermsEchoHit> {
     })
 }
 
+// ===========================================================================
+// TUNE-DECODE-SERIAL-AND-TOKEN-CAP-390：按语音时长限制 per-stream 生成长度
+// ===========================================================================
+
+/// TUNE-390：per-stream `max_new_tokens` 上限的**每秒 token 预算**。
+///
+/// 汉字 + 标点 + 语种前缀余量；快语速 6~7 字/s 仍有近 2 倍余量。
+const TOKEN_CAP_PER_SEC: f32 = 12.0;
+/// TUNE-390：基础余量（短音频也够出完整句子）。
+const TOKEN_CAP_BASE: i32 = 24;
+/// TUNE-390：下限 —— 再短的音频也至少给这么多（覆盖首字/短句）。
+const TOKEN_CAP_MIN: i32 = 48;
+/// TUNE-390：上限 = 原全局 `max_new_tokens`（模型跑偏时不再无限生成）。
+const TOKEN_CAP_MAX: i32 = 256;
+
+/// TUNE-390：按**语音时长**折算 per-stream `max_new_tokens`（纯函数，可单测）。
+///
+/// 现状全局 256：模型跑偏（念词表/幻觉）时会一直生成（1.12s 窗念 77 字耗 7.8s）⇒ 按语音时长收紧。
+/// 非有限 / 负数 ⇒ [`TOKEN_CAP_MAX`]（不限，退回现状）。
+fn max_new_tokens_for(speech_secs: f32) -> i32 {
+    if !speech_secs.is_finite() || speech_secs < 0.0 {
+        return TOKEN_CAP_MAX;
+    }
+    let want = (speech_secs * TOKEN_CAP_PER_SEC).ceil() as i32; // 极大有限值 `as i32` 饱和，不 panic
+    want.saturating_add(TOKEN_CAP_BASE)
+        .clamp(TOKEN_CAP_MIN, TOKEN_CAP_MAX)
+}
+
 /// 一次 accuracy 解码（可选 per-stream system 段）。返回规范化后的文本。
 fn decode_accuracy_once(
     recognizer: &sherpa_onnx::OfflineRecognizer,
@@ -749,7 +777,8 @@ fn decode_accuracy_once(
     system: Option<&str>,
     script: ChineseScript,
 ) -> Result<String> {
-    let text = decode_accuracy_allow_empty(recognizer, samples, system, script)?;
+    // 其他调用方行为逐位不变 ⇒ 传 `None`（不设 `max_new_tokens`，沿用全局 256）。
+    let text = decode_accuracy_allow_empty(recognizer, samples, system, script, None)?;
     if text.is_empty() {
         // 与 transcribe_segment_detailed 一致：accuracy 空输出 ⇒ 该段失败（上层 all_native=false）
         anyhow::bail!("ASR accuracy model produced empty output");
@@ -765,10 +794,16 @@ fn decode_accuracy_allow_empty(
     samples: &[f32],
     system: Option<&str>,
     script: ChineseScript,
+    max_new_tokens: Option<i32>,
 ) -> Result<String> {
     let stream = recognizer.create_stream();
     if let Some(s) = system {
         stream.set_option("hotwords", s);
+    }
+    // TUNE-390：per-stream 生成长度上限（sherpa `offline-recognizer-qwen3-asr-impl.cc:774` 的
+    // `GetOptionInt` 按字符串解析）。`None` ⇒ 不设，沿用全局 `max_new_tokens`。
+    if let Some(n) = max_new_tokens {
+        stream.set_option("max_new_tokens", &n.to_string());
     }
     stream.accept_waveform(16000, samples);
     recognizer.decode(&stream);
@@ -881,14 +916,18 @@ pub(crate) fn transcribe_acc_ctx(
     }
     // 后续（首解 / 产出率 / 重解）一律用剪静音后的 `samples`（shadow 原参数）。
     let samples: &[f32] = &samples_used;
+    let speech_secs = samples.len() as f32 / 16000.0;
+    // TUNE-390：按（剪静音后）语音时长折算本窗生成长度上限（首解与重解共用）。
+    let token_cap = max_new_tokens_for(speech_secs);
     if log::log_enabled!(log::Level::Debug) {
         log::debug!(
-            "[LocalRT-DBG-388] trim: seg={} in={:.2}s out={:.2}s ranges={} vad={}",
+            "[LocalRT-DBG-388] trim: seg={} in={:.2}s out={:.2}s ranges={} vad={} max_new_tokens={}",
             seg_idx,
             in_secs,
-            samples.len() as f32 / 16000.0,
+            speech_secs,
             n_ranges,
-            trimmed
+            trimmed,
+            token_cap
         );
     }
     // FIX-INJECT-TO-SPEC-377：注入内容**只剩纯词表**（见 `build_ctx_system`）。
@@ -902,6 +941,7 @@ pub(crate) fn transcribe_acc_ctx(
         samples,
         system.as_deref().filter(|_| inject_on),
         script,
+        Some(token_cap),
     )?;
     let decided_out_chars = text.chars().count();
     // FIX-TERMS-ECHO-374 + 375（B）：**统一的处置阶梯**（一处实现，两条判据）。
@@ -909,13 +949,15 @@ pub(crate) fn transcribe_acc_ctx(
     // 🔴 **恒执行、不受任何前置条件影响**：377 起已无 `Context:` 注入；374 现场（`ctx_raw_len=0`
     //    的「重启后第一次录音」）旧护栏整块被跳过、`seg=10` 零转写只吐 77 字词条列表，375 现场则是
     //    「短输出从相对阈值下溜走」。两条判据都与 LCS 无关 ⇒ 无 BUILD-321 的 43% 误伤面。
-    let audio_secs = samples.len() as f32 / 16000.0;
+    let audio_secs = speech_secs;
     let (text, disp) = apply_acc_disposition(
         text,
         inject.terms,
         audio_secs,
         inject.avg_chars_per_sec,
-        || decode_accuracy_once(recognizer, samples, None, script),
+        // TUNE-390：重解同样带 cap；用 `decode_accuracy_allow_empty`（空输出返回 Ok("")，
+        // 与原 `decode_accuracy_once(..).unwrap_or_default()` 语义一致），不改任何 pub 签名。
+        || decode_accuracy_allow_empty(recognizer, samples, None, script, Some(token_cap)),
     );
     if log::log_enabled!(log::Level::Debug) {
         log::debug!(
@@ -1999,11 +2041,19 @@ pub(crate) fn align_overlap_with_prior(prev: &str, new: &str, prior: AlignPrior)
     align_fail()
 }
 
-/// SLIDING-WINDOW-367（阶段四·B）：窗口解码**并发度**（默认 2）。
+/// SLIDING-WINDOW-367（阶段四·B）/ TUNE-DECODE-SERIAL-AND-TOKEN-CAP-390：窗口解码**并发度**。
 ///
-/// - `≥2` ⇒ 窗口间并发（窗口2 不等窗口1；同一 recognizer 多线程并发解，官方 `rng_mutex_` 支持）。
-/// - `=1` ⇒ **退化为顺序执行**（Gavin「不理想再退 A」的回退路径，无需重构）。
-pub(crate) const WINDOW_DECODE_CONCURRENCY: usize = 2;
+/// 🔴 **现为 1（串行）** —— Gavin 2026-09-23 端测确认。依据（主控四份端测日志实测）：
+/// - sherpa 1.13.8 `OfflineRecognizerQwen3ASRImpl::DecodeStreams` 只是 `for` 循环逐个 `Decode`
+///  （`offline-recognizer-qwen3-asr-impl.cc:1149`）⇒ **批处理接口对 Qwen3 无并行收益**；
+/// - 两个解码线程共用**同一个** recognizer（ORT 会话 8 线程池）⇒ 同时解码互相争抢：
+///   单独解码中位 **274 ms/音频秒**、并发解码中位 **476 ms/音频秒**（每窗慢 74%，总吞吐仅 +15%）；
+/// - 预览按窗口顺序回灌 ⇒ **单窗变慢直接推迟刷新**。
+///
+/// - `=1` ⇒ **顺序执行**（共享队列 / `drive_acc_windows` / 收尾逻辑不变，自然退化）。
+/// - `≥2` ⇒ 窗口间并发（**改回须附新实测**证明吞吐有净收益，否则别改）。
+/// 366「线程数 min(cores,8)」结论不变 —— 那是 ORT 会话内部线程，与本常量无关。
+pub(crate) const WINDOW_DECODE_CONCURRENCY: usize = 1;
 
 /// FIX-PREFIX-AND-EAT-371（B）：期望重叠比例 —— 「与上一窗**共享的切片**样本和 / 本窗样本和」。
 ///
@@ -6109,6 +6159,84 @@ mod testsync387_tests {
                 assert_eq!(out, "", "case {case}: invalid ⇒ 必须空串");
             }
         }
+    }
+}
+
+// ============================================================
+// TUNE-DECODE-SERIAL-AND-TOKEN-CAP-390：解码串行 + 按语音时长限制生成长度
+// ============================================================
+#[cfg(test)]
+mod fix390_tests {
+    use super::{max_new_tokens_for, WINDOW_DECODE_CONCURRENCY};
+
+    /// TUNE-390-③：窗口解码并发度 = 1（串行）。依据见常量注释（`DecodeStreams` 逐 `Decode` 无并行
+    /// 收益 + 共用 ORT 会话争抢：实测单独 274 vs 并发 476 ms/音频秒）；改回 ≥2 须附新实测。
+    #[test]
+    fn window_decode_concurrency_is_serial() {
+        assert_eq!(WINDOW_DECODE_CONCURRENCY, 1, "TUNE-390：窗口解码须串行");
+    }
+
+    /// TUNE-390-①：`max_new_tokens_for` 取值 + 界 + 非有限/负 + 单调 + 极大有限值不 panic。
+    #[test]
+    fn max_new_tokens_for_values_bounds_monotone() {
+        assert_eq!(max_new_tokens_for(0.0), 48, "0s ⇒ 下限");
+        assert_eq!(
+            max_new_tokens_for(1.12),
+            48,
+            "ceil(13.44)=14 +24=38 ⇒ 下限 48"
+        );
+        assert_eq!(max_new_tokens_for(10.0), 144, "120+24");
+        assert_eq!(max_new_tokens_for(20.0), 256, "240+24=264 ⇒ 上限 256");
+        // 非有限 / 负数 ⇒ 上限（退回现状、不限）
+        assert_eq!(max_new_tokens_for(f32::NAN), 256);
+        assert_eq!(max_new_tokens_for(-1.0), 256);
+        assert_eq!(max_new_tokens_for(f32::INFINITY), 256);
+        assert_eq!(max_new_tokens_for(f32::NEG_INFINITY), 256);
+        // 单调不减 + 恒在 [48, 256]
+        let mut last = 0i32;
+        let mut s = 0.0f32;
+        while s <= 30.0 {
+            let v = max_new_tokens_for(s);
+            assert!((48..=256).contains(&v), "s={s} ⇒ {v} 越界");
+            assert!(v >= last, "s={s} 处应单调不减（{last} -> {v}）");
+            last = v;
+            s += 0.5;
+        }
+        assert_eq!(max_new_tokens_for(1e30), 256, "极大有限值不得溢出/panic");
+    }
+
+    /// TUNE-390-②：源码级护栏 —— `transcribe_acc_ctx` 首解与重解**都带** `Some(token_cap)`；
+    /// `decode_accuracy_once` 内部传 `None`（其他调用方逐位不变）。
+    #[test]
+    fn token_cap_wired_in_both_decodes_source_guard() {
+        let src = include_str!("mod.rs");
+        // (a) transcribe_acc_ctx 函数体（截到下一个函数文档 `FIX-PREFIX-AND-EAT-371` 前）。
+        let ctx = src
+            .split("pub(crate) fn transcribe_acc_ctx(")
+            .nth(1)
+            .expect("transcribe_acc_ctx");
+        let ctx = ctx.split("FIX-PREFIX-AND-EAT-371").next().unwrap();
+        assert_eq!(
+            ctx.matches("decode_accuracy_allow_empty(").count(),
+            2,
+            "首解 + 重解都应走 decode_accuracy_allow_empty"
+        );
+        assert_eq!(
+            ctx.matches("Some(token_cap)").count(),
+            2,
+            "首解与重解都必须带 token cap"
+        );
+        // (b) decode_accuracy_once 传 None（逐位不变）。
+        let once = src
+            .split("fn decode_accuracy_once(")
+            .nth(1)
+            .expect("decode_accuracy_once");
+        let once = once
+            .split("fn decode_accuracy_allow_empty(")
+            .next()
+            .unwrap();
+        assert_eq!(once.matches("decode_accuracy_allow_empty(").count(), 1);
+        assert!(once.contains(", None)"), "decode_accuracy_once 必须传 None");
     }
 }
 

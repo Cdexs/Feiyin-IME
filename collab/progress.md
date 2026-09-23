@@ -1325,3 +1325,12 @@ load_wordbook_vocabulary()
 | 覆盖 | ① 整句不切（首个高值后到段末全有声）② 背景 0.2 全静默 + 峰值不进样本 ③ 防锁死（35s/0.25 ⇒ 过期后整句确认并重学 ≈0.25）④ seed 流程（0.5 确认 / 两句 0.1 ⇒ `seed_dropped` / `seed_usable` 边界）⑤ `partial_win_committed` 随机 500 组界+单调 |
 | 验证 | `cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**、warnings **97/88** = 基线；numstat == -w。🔴 **未跑 `cargo test`**（白名单；首跑阶段四） |
 | 结论 | **未发现生产缺陷**；未改版本/未 push/零凭证 |
+
+## TUNE-DECODE-SERIAL-AND-TOKEN-CAP-390 · 窗口解码改串行 + 按语音时长限制生成长度 · 2026-09-23 · coder-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | `transcription/mod.rs`(138/10) + `main.rs`(2/2 注释)。`WINDOW_DECODE_CONCURRENCY` 2→1（实测：单独 274 vs 并发 476 ms/音频秒）；新增 `max_new_tokens_for` + `decode_accuracy_allow_empty` 的 `max_new_tokens` 参数，`transcribe_acc_ctx` 首解/重解按剪静音后时长带 cap |
+| 回归 | root `cargo test --no-fail-fast` **1642P/0F/35I**（EXIT 0）；`cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**；warnings **97/88** = 基线 |
+| NEW | `fix390_tests` 3 条（并发度=1 / `max_new_tokens_for` 取值·界·非有限·负·单调·极大值 / 源码护栏：首解重解都带 cap、`decode_accuracy_once` 传 `None`） |
+| 端测 | 🔴 待 tester-1 阶段四回归 + 388/389/390 合包 + Gavin 端测：解码耗时/预览刷新是否改善、是否仍念词表 |
