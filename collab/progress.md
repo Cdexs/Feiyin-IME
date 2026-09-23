@@ -1297,3 +1297,22 @@ load_wordbook_vocabulary()
 | 三特殊点 | ① dll 四张三副本全等 + onnxruntime 1.28.2；② itn-rules 三副本全等；③ Publish/models 1.7B 七文件与源逐一 sha256 全等（0.6B 保留） |
 | 探针 | 正：`[LocalRT-DBG-386]`=1 / `[LocalRT-DBG-387]`=2 / `[LocalRT-DBG-385]`=2 / `[LocalRT-DBG-382]`=3；反：无（本批未删字面量） |
 | 端测 | 🔴 **Step1 强杀输入法 ⇒ 请重启后端测**；重点：① 386 中途末片延后组窗 + 松键短尾合并重解（防吃字/尾巴丢）；② 386 预览不再闪回更短（保留流式尾巴）；③ 387 念词表/标签/空输出判无效后重解（防回显/坍塌）；④ 387 近场门 300ms 平滑音量（防误挡）；⑤ 吃字/重复字；⑥ 长录音 300s；⑦ 不新增 crash.json |
+
+## FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388 · 解码前剪静音 + 重解产出率 + 冷启动下限（阶段一）· 2026-09-23 · coder-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | `transcription/mod.rs`(377/24) + `vad.rs`(70/0，只新增)。**A**：VAD 取语音区间 + `trim_to_speech` 剪静音（首尾 ≤200ms、段间 >400ms 压到 400ms），整窗无语音早退空解码，时长用剪后；**D1**：`has_content` 取代 `is_only_punct` + 重解后所有 kind 统一查产出率；**D2**：`output_rate_ok` 冷启动下限（audio≥3s 且 <1 字/s ⇒ 坍塌） |
+| 回归 | root `cargo test --no-fail-fast` **1621P/0F/35I**（EXIT 0）；`cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**；warnings **97/88** = 基线 |
+| 契约变更 | D1/D2 更新 6 条既有用例期望（不变量未动）：`ladder_redecodes_on_echo_even_with_residual`、`ladder_redecodes_once_when_strip_is_empty`、`guard_echo_redecodes_and_uses_recovered`、`guard_empty_redecodes`、`rate_ok_cold_start_and_tiny_expectation_always_ok`、`rate375_cold_start_three_paths_ok`（详见 CHANGELOG/result.md） |
+| 端测 | 🔴 待 tester-1 阶段四回归 + 出包 + Gavin 端测：松键后处理时延是否回落、是否仍念词表/丢结尾；`[LocalRT-DBG-388] trim` / `[LocalRT-DBG-387] guard` |
+
+## FIX-NEARFIELD-BY-SEGMENT-AND-PREVIEW-389（阶段一·交付）· 2026-09-23 · coder-2
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | C 近场门改整句段判（`SegmentPeakLevel` 段峰值中位数 + `SegmentGate`：未就绪整句确认 / 段峰值 ≥ level×0.3 即整句确认 / 只学已确认段）+ C2 跨录音沿用（进程内存、同设备 10min、连续 2 拒丢弃 seed、录音结束写回、新增 `vad_device` 入参）+ D3 预览不回退（`PreviewReflow.boundary_usable` + `partial_win_committed` 折算 + 部分窗不重渲） |
+| 文件 | `src/transcription/local_stream.rs` / `src/main.rs`（🔴 未改 `mod.rs`/`vad.rs`） |
+| 单测 | 新增 14 条（段门 5 / C2 4 / ts389 2 / D3 3）+ 384 兜底与计时适配 |
+| 验证 | fmt EXIT 0 ｜ check 0 error、warnings 97/88=基线 ｜ 全量 test 0 failed（bin 1540P/33I）｜ numstat main 180/28、ls 495/685 |
+| 下一步 | 阶段三 TEST-SYNC（非作者）→ 阶段四 TEST-EXEC → 出包；端测盯 `[DBG-389] nearfield summary` rejected 比例、`carry level`、预览不缩短 |

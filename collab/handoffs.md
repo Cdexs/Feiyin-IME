@@ -218,3 +218,22 @@
 - **验证**：`rustfmt` + `cargo check --all-targets` **0 error**、warnings **88**=基线；`cargo fmt --check` EXIT 0；numstat==-w（main 139/0）。独立 Python 复刻 `plan_windows` 校验用例 2/3 逐条吻合 + 5000 会话属性模拟 bad=0（弥补不能跑单测）。
 - **未发现生产缺陷**。**未改版本 / 未 push / 零凭证**。
 - 🔴 注意：同工作区 `local_stream.rs` 有 coder-1 在飞的 TEST-SYNC-387（+112 行未提交），非本单、未触碰。
+
+## 2026-09-23 — coder-1 — FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388 ✅ 交付（阶段一，只改 `transcription/mod.rs` + `vad.rs`）
+
+- **背景**（Gavin BUILD-387）：松键后处理久、模型频繁低级错误。根因：带 hotwords 的 Qwen3-ASR 遇静音吐热词（sherpa #3509），派发片把长停顿带进窗口。
+- **A**：`vad.rs` 只新增 `LOCALRT_TRIM_PAD_SECS(0.2)` / `try_new_for_local_trim` / `speech_ranges`（`reset→accept 整段→flush→front/pop→clear+reset`）；`mod.rs` 新增 `trim_to_speech` 纯函数 + 线程级 `thread_local!` VAD 缓存；`transcribe_acc_ctx` 开头剪静音，**整窗无语音 ⇒ 早退 `Ok(("", true))`**（交 386 流式兜底，不进模型），首解/重解/产出率时长全用剪后 `samples`。
+- **D1**：新增 `has_content`（≥1 `is_alphanumeric`）；首解无内容 ⇒ `Tag`/`Empty`（取代 `is_only_punct`，覆盖 `**`）；重解后 `acceptable` **所有 kind 统一** `has_content && !still_echo && output_rate_ok`。
+- **D2**：`output_rate_ok` 冷启动（`None`/`NaN`/`0.0`/`±inf` 均按无均值）且 `audio_secs ≥ COLD_MIN_AUDIO_SECS(3.0)` 且 `< COLD_MIN_CHARS_PER_SEC(1.0)` ⇒ 坍塌；`<3s` 不判；不 panic/不除零。
+- **单测**：新增 `fix388_trim_and_floor_tests` 7 条 + `#[ignore]` 真模型 `speech_ranges` 1 条。**契约变更**（主控已裁定同意）：更新 6 条既有用例期望 —— D1：「重解」四条从「收下短文本」改「invalid 空串」；D2：两条冷启动 `None/NaN/0.0/±inf @ ≥3s` 从 `true` 改「坍塌」。**「重解至多一次」等不变量断言一条未动**；每条变更处注释 `【388 契约变更】` + old→new。
+- **验证**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**、warnings **97/88** = 基线；全量 `cargo test --no-fail-fast` **1621P/0F/35I**（EXIT 0）。numstat：mod.rs 377/24、vad.rs 70/0（== -w）。
+- **未改版本 / 未 push / 未 build release / 零凭证**。🔴 同工作区 `main.rs`/`local_stream.rs` 属 coder-2 的 389（非本单）；期间曾因其在飞不可编译/单测红，待其转绿后复跑全量得 0F。
+
+## 2026-09-23 — FIX-NEARFIELD-BY-SEGMENT-AND-PREVIEW-389（coder-2，✅ 阶段一交付）
+
+- **需求**（Gavin BUILD-387）：近场门仍误挡 ~40%（不能直接关，优化算法）；预览回灌仍「缩短后又恢复」。
+- **改动**：`local_stream.rs`（C 整句段门 `SegmentGate`/`SegmentPeakLevel`；C2 跨录音沿用 `LOCALRT_CARRY_LEVEL` + `with_seed`/拒段丢弃/写回 + 新增 `vad_device` 入参）；`main.rs`（D3 `PreviewReflow.boundary_usable` + `partial_win_committed` + `ReflowFastState` 部分窗不截短；调用点传 device）。🔴 未改 `mod.rs`/`vad.rs`（coder-1 的 388）。
+- **单测 +14**（旧逐块门单测改写为新算法版本）。
+- **验证**：fmt EXIT 0 ｜ check 0 error、warnings 97/88=基线 ｜ 全量 test **0 failed**（bin 1540P/33I）｜ numstat main 180/28、ls 495/685（-w 178/26、473/663，差额为替换块内缩进重排）。
+- **未验证**：实机端测（`[LocalRT-DBG-389] nearfield summary` rejected 比例、`carry level`、预览不缩短）交 tester-1/Gavin。
+- **未改版本 / 未 push / 零凭证**；`docs/MACOS-HANDOFF.md` 未改（结论交主控合入）。

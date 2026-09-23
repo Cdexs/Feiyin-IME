@@ -168,6 +168,11 @@ enum PipelineEvent {
         /// 并发 + 收尾 drain 可让多窗撞同一下标）⇒ 会把后到的完整文本误判成 stale。
         reflow_seq: Option<usize>,
         committed_len: usize,
+        /// FIX-NEARFIELD-BY-SEGMENT-AND-PREVIEW-389（D3）：`committed_len` 是否为**准确边界**。
+        /// `true` = 本窗**含该次派发的末片**（或收尾合并窗）⇒ `committed_len` 已覆盖整次派发；
+        /// `false` = **部分窗**（一次多片派发被延后末片前的中间窗）⇒ `committed_len` 按片样本占比
+        /// 折算，**不得**用 `ReflowCommit` 的整次派发边界（否则会截掉被延后末片那段流式文字）。
+        boundary_usable: bool,
         has_hole: bool,
         acc_text: String,
         /// SLIDING-WINDOW-367：`true` ⇒ 消费端**整段替换**预览为 `acc_text`（滑窗权威全文，
@@ -7018,6 +7023,7 @@ fn process_controller_events(
                 seg_index,
                 reflow_seq,
                 committed_len,
+                boundary_usable,
                 has_hole,
                 acc_text,
                 replace_all,
@@ -7074,6 +7080,7 @@ fn process_controller_events(
                                 seg_index,
                                 acc_text.clone(),
                                 committed_len,
+                                boundary_usable,
                                 suppressed,
                             ),
                             Err(_) => ReflowFastOutcome::None,
@@ -7933,6 +7940,8 @@ fn spawn_worker_thread(
                     } else {
                         Some(config.audio.input_device.as_str())
                     };
+                    // FIX-NEARFIELD-BY-SEGMENT-AND-PREVIEW-389（C2）：跨录音沿用录音人音量的设备 key。
+                    let vad_device = config.audio.input_device.clone();
 
                     // ASR-DUAL-B-001: 检查是否需要热重载 transcriber
                     // 触发条件：asr_model 变更 / transcription_language 变更 /
@@ -8392,6 +8401,9 @@ fn spawn_worker_thread(
                                         // 382（3A）：`window_seq -> 派发当刻浮层字符数`（边界未到时的 fallback，
                                         // 随 `PreviewReflow.committed_len` 带到消费端）。
                                         let mut window_committed_lens: Vec<usize> = Vec::new();
+                                        // FIX-NEARFIELD-BY-SEGMENT-AND-PREVIEW-389（D3）：`window_seq -> 本窗
+                                        // committed_len 是否准确边界`（部分窗 = false）。随 `PreviewReflow.boundary_usable`。
+                                        let mut window_boundary_usable: Vec<bool> = Vec::new();
                                         // 386（C）：`window_seq -> 本窗各片流式文本拼接`（解码失败/空时的兜底）。
                                         let mut window_streaming_texts: Vec<String> = Vec::new();
                                         // 386（C）：与 `recent_slices` 一一对应的各片流式文本（同批 sub_seg 共享）。
@@ -8526,6 +8538,11 @@ fn spawn_worker_thread(
                                                                 seg_index: dispatch_idx,
                                                                 reflow_seq: Some(reflow_seq),
                                                                 committed_len: fallback_committed,
+                                                                boundary_usable:
+                                                                    window_boundary_usable
+                                                                        .get(seq)
+                                                                        .copied()
+                                                                        .unwrap_or(false),
                                                                 has_hole: false,
                                                                 acc_text: authoritative,
                                                                 replace_all: true,
@@ -8548,7 +8565,7 @@ fn spawn_worker_thread(
                                             // 386（A）：派发一个窗口（含 C 的流式文本记账）。`gs/ge` = 全局切片区间。
                                             // 单一定义 ⇒ 批次路径与收尾合并共用，防两份漂移。
                                             macro_rules! dispatch_window {
-                                                ($gs:expr, $ge:expr, $idx:expr, $committed_len:expr) => {{
+                                                ($gs:expr, $ge:expr, $idx:expr, $win_committed:expr, $usable:expr) => {{
                                                     let gs: usize = $gs;
                                                     let ge: usize = $ge;
                                                     let buf_base = total_slices - recent_slices.len();
@@ -8600,7 +8617,8 @@ fn spawn_worker_thread(
                                                     );
                                                     window_streaming_texts
                                                         .push(recent_streaming[start..stop].concat());
-                                                    window_committed_lens.push($committed_len);
+                                                    window_committed_lens.push($win_committed);
+                                                    window_boundary_usable.push($usable);
                                                     window_seq += 1;
                                                 }};
                                             }
@@ -8618,6 +8636,8 @@ fn spawn_worker_thread(
                                                             // 386（A）：按「中途末片延后 / 下次派发纳入 / 收尾合并」规则组窗
                                                             //（规则与不变量见 `plan_windows`）。382 旧行为「每片立刻组窗」会把
                                                             // 11.27s ⇒ 10.15s+1.12s 的尾片单独成窗 ⇒ 模型念词表。
+                                                            // 389（D3）：本次派发前的 committed_len（会话首次 0），供部分窗折算。
+                                                            let prev_committed = last_committed_len;
                                                             last_dispatch_idx = idx;
                                                             last_committed_len = committed_len;
                                                             let prev_base = total_slices - recent_slices.len();
@@ -8625,6 +8645,10 @@ fn spawn_worker_thread(
                                                                 .iter()
                                                                 .map(|s| s.len() as f32 / 16000.0)
                                                                 .collect();
+                                                            let new_lens: Vec<usize> =
+                                                                sub_segs.iter().map(|s| s.len()).collect();
+                                                            let total_new: usize = new_lens.iter().sum();
+                                                            let n_new = sub_segs.len();
                                                             let new_durs: Vec<f32> = sub_segs
                                                                 .iter()
                                                                 .map(|s| s.len() as f32 / 16000.0)
@@ -8638,7 +8662,9 @@ fn spawn_worker_thread(
                                                             );
                                                             pending_slice = plan.pending;
                                                             let mut wi = 0usize;
+                                                            let mut cum_new = 0usize;
                                                             for (k, s) in sub_segs.into_iter().enumerate() {
+                                                                cum_new += new_lens[k];
                                                                 recent_slices.push(s);
                                                                 recent_streaming
                                                                     .push(slice_streaming_text(k, &seg_streaming));
@@ -8656,7 +8682,20 @@ fn spawn_worker_thread(
                                                                 {
                                                                     let (gs, ge) = plan.windows[wi];
                                                                     wi += 1;
-                                                                    dispatch_window!(gs, ge, idx, committed_len);
+                                                                    // 389（D3）：含本次派发末片 ⇒ 准确边界；
+                                                                    // 部分窗 ⇒ 按前 0..=k 片样本占比折算 committed_len。
+                                                                    let usable = k + 1 == n_new;
+                                                                    let win_committed = if usable {
+                                                                        committed_len
+                                                                    } else {
+                                                                        partial_win_committed(
+                                                                            prev_committed,
+                                                                            committed_len,
+                                                                            cum_new,
+                                                                            total_new,
+                                                                        )
+                                                                    };
+                                                                    dispatch_window!(gs, ge, idx, win_committed, usable);
                                                                 }
                                                                 // 否则：本片是**延后的待覆盖片**（本批末片），本轮不组窗。
                                                             }
@@ -8693,11 +8732,13 @@ fn spawn_worker_thread(
                                                     "386：收尾后不应再有待覆盖片"
                                                 );
                                                 for (gs, ge) in plan.windows {
+                                                    // 389（D3）：收尾合并窗含该次派发末片（pending）⇒ 准确边界。
                                                     dispatch_window!(
                                                         gs,
                                                         ge,
                                                         last_dispatch_idx,
-                                                        last_committed_len
+                                                        last_committed_len,
+                                                        true
                                                     );
                                                 }
                                             }
@@ -8732,6 +8773,7 @@ fn spawn_worker_thread(
                                     Some(&cancel_clone),
                                     punctuation,
                                     config.audio.silence_threshold,
+                                    vad_device.as_str(),
                                     |display_text, words| {
                                         // OVERLAY-075：与在线流式同构，代际盖章。
                                         let _ = event_tx_clone.send(PipelineEvent::StreamingText(
@@ -11134,6 +11176,25 @@ fn window_text_with_fallback(decoded: &str, streaming: &str) -> String {
     }
 }
 
+/// FIX-NEARFIELD-BY-SEGMENT-AND-PREVIEW-389（D3）：**部分窗**（不含本次派发末片）的 `committed_len` 折算。
+///
+/// `frac = 前 0..=k 片样本数 / 本次派发全部片样本数`；`win = prev_committed + round((committed_len −
+/// prev_committed) × frac)`。部分窗若用整次派发的边界（覆盖被延后末片）会把预览截短。
+fn partial_win_committed(
+    prev_committed: usize,
+    committed_len: usize,
+    cum_samples: usize,
+    total_samples: usize,
+) -> usize {
+    let frac = if total_samples > 0 {
+        cum_samples as f32 / total_samples as f32
+    } else {
+        1.0
+    };
+    prev_committed
+        + (((committed_len.saturating_sub(prev_committed)) as f32) * frac).round() as usize
+}
+
 /// 386：短尾合并阈值（秒）—— 收尾时待覆盖片 < 此值且前面有片 ⇒ 与前一并重解。
 const TAIL_MERGE_MAX_SECS: f32 = 3.0;
 
@@ -11530,8 +11591,9 @@ enum ReflowFastOutcome {
 #[cfg(target_os = "windows")]
 #[derive(Default)]
 struct ReflowFastState {
-    /// 最新登记全文 + 派发当刻 fallback：`(gen, seg, text, fallback_len)`。
-    latest: Option<(u64, usize, String, usize)>,
+    /// 最新登记全文 + 派发当刻 fallback：`(gen, seg, text, fallback_len, boundary_usable)`。
+    /// `boundary_usable=false`（部分窗）⇒ 不用 `bound_of` 的整次派发边界、且晚到边界不重渲。
+    latest: Option<(u64, usize, String, usize, bool)>,
     /// 边界登记 `(gen, seg) -> Option<usize>`（`None` = b 类「本片无准确边界」）。小 map，按代清空。
     bounds: Vec<((u64, usize), Option<usize>)>,
     /// 最近一次**应渲染**的 `(gen, seg)`（判断晚到边界是否该重渲染）。
@@ -11555,6 +11617,8 @@ impl ReflowFastState {
     }
 
     /// 收到一条权威全文（已过 `reflow_action` 的编辑/取消/陈旧/洞/空判据）。
+    /// `boundary_usable`：见 `PreviewReflow`——`false`（部分窗）时**不用** `bound_of` 的整次派发边界，
+    /// 直接用 `fallback_len`（按片样本占比折算的 `win_committed`）。
     /// `suppressed` = 本代已进入 Processing（只跳过重画，权威状态照常更新）。
     fn on_text(
         &mut self,
@@ -11562,13 +11626,19 @@ impl ReflowFastState {
         seg: usize,
         text: String,
         fallback_len: usize,
+        boundary_usable: bool,
         suppressed: bool,
     ) -> ReflowFastOutcome {
-        self.latest = Some((gen, seg, text.clone(), fallback_len));
+        self.latest = Some((gen, seg, text.clone(), fallback_len, boundary_usable));
         self.rendered = Some((gen, seg));
-        let (len, accurate) = match self.bound_of(gen, seg) {
-            Some(Some(l)) => (l, true),
-            _ => (fallback_len, false),
+        let (len, accurate) = if boundary_usable {
+            match self.bound_of(gen, seg) {
+                Some(Some(l)) => (l, true),
+                _ => (fallback_len, false),
+            }
+        } else {
+            // 部分窗：`bound_of` 若为整次派发边界（覆盖被延后末片）会截短预览 ⇒ 用折算值。
+            (fallback_len, false)
         };
         ReflowFastOutcome::Apply {
             text,
@@ -11578,7 +11648,7 @@ impl ReflowFastState {
         }
     }
 
-    /// 收到一条边界。若对应 seg 是**最新已渲染**全文 ⇒ 用准确边界再渲染一次。
+    /// 收到一条边界。若对应 seg 是**最新已渲染**全文 **且该次渲染边界可用**（非部分窗）⇒ 用准确边界再渲染一次。
     fn on_bound(
         &mut self,
         gen: u64,
@@ -11596,8 +11666,9 @@ impl ReflowFastState {
             self.bounds.push(((gen, seg), len));
         }
         if self.rendered == Some((gen, seg)) {
-            if let (Some(l), Some((g2, s2, text, _))) = (len, self.latest.as_ref()) {
-                if (*g2, *s2) == (gen, seg) {
+            if let (Some(l), Some((g2, s2, text, _, usable))) = (len, self.latest.as_ref()) {
+                // 🔴 D3：部分窗的最新渲染**不得**用整次派发边界重渲（否则截短预览）。
+                if (*g2, *s2) == (gen, seg) && *usable {
                     return ReflowFastOutcome::Apply {
                         text: text.clone(),
                         committed_len: l,
@@ -11631,7 +11702,7 @@ mod reflow_fast_382_tests {
     #[test]
     fn text_then_bound_renders_twice_final_accurate() {
         let mut st = ReflowFastState::default();
-        let a = apply(st.on_text(1, 5, "acc".into(), 3, false));
+        let a = apply(st.on_text(1, 5, "acc".into(), 3, true, false));
         assert_eq!(a, ("acc".into(), 3, false, true));
         let b = apply(st.on_bound(1, 5, Some(7), false));
         assert_eq!(b, ("acc".into(), 7, true, true));
@@ -11642,7 +11713,7 @@ mod reflow_fast_382_tests {
     fn bound_then_text_renders_once_accurate() {
         let mut st = ReflowFastState::default();
         assert_eq!(st.on_bound(1, 5, Some(7), false), ReflowFastOutcome::None);
-        let a = apply(st.on_text(1, 5, "acc".into(), 3, false));
+        let a = apply(st.on_text(1, 5, "acc".into(), 3, true, false));
         assert_eq!(a, ("acc".into(), 7, true, true));
     }
 
@@ -11650,7 +11721,7 @@ mod reflow_fast_382_tests {
     #[test]
     fn b_bound_uses_fallback_and_no_rerender() {
         let mut st = ReflowFastState::default();
-        let a = apply(st.on_text(1, 5, "acc".into(), 3, false));
+        let a = apply(st.on_text(1, 5, "acc".into(), 3, true, false));
         assert_eq!(a, ("acc".into(), 3, false, true));
         assert_eq!(st.on_bound(1, 5, None, false), ReflowFastOutcome::None);
     }
@@ -11659,8 +11730,8 @@ mod reflow_fast_382_tests {
     #[test]
     fn interleaved_segs_only_latest_rerenders() {
         let mut st = ReflowFastState::default();
-        apply(st.on_text(1, 5, "five".into(), 1, false));
-        apply(st.on_text(1, 6, "six".into(), 1, false));
+        apply(st.on_text(1, 5, "five".into(), 1, true, false));
+        apply(st.on_text(1, 6, "six".into(), 1, true, false));
         assert_eq!(st.on_bound(1, 5, Some(9), false), ReflowFastOutcome::None);
         let b = apply(st.on_bound(1, 6, Some(4), false));
         assert_eq!(b, ("six".into(), 4, true, true));
@@ -11670,9 +11741,9 @@ mod reflow_fast_382_tests {
     #[test]
     fn suppressed_after_processing_skips_render_only() {
         let mut st = ReflowFastState::default();
-        let before = apply(st.on_text(1, 5, "a".into(), 2, false));
+        let before = apply(st.on_text(1, 5, "a".into(), 2, true, false));
         assert!(before.3, "Processing 之前的回灌必须正常渲染");
-        let after = apply(st.on_text(1, 6, "b".into(), 2, true));
+        let after = apply(st.on_text(1, 6, "b".into(), 2, true, true));
         assert!(!after.3, "Processing 之后的回灌不得重画浮层");
         assert_eq!(after.0, "b", "但权威状态照常更新");
     }
@@ -11955,11 +12026,11 @@ mod testsync382_tests {
         #[test]
         fn cross_gen_bound_not_reused() {
             let mut st = ReflowFastState::default();
-            let _ = apply(st.on_text(1, 5, "one".into(), 3, false));
+            let _ = apply(st.on_text(1, 5, "one".into(), 3, true, false));
             let b = apply(st.on_bound(1, 5, Some(7), false));
             assert_eq!(b, ("one".into(), 7, true, true));
             // gen2 同 seg ⇒ 不得拿 gen1 的 7
-            let a = apply(st.on_text(2, 5, "two".into(), 9, false));
+            let a = apply(st.on_text(2, 5, "two".into(), 9, true, false));
             assert_eq!(a, ("two".into(), 9, false, true), "旧代边界必须失效");
         }
 
@@ -11967,7 +12038,7 @@ mod testsync382_tests {
         #[test]
         fn same_seg_bound_none_then_some_rerenders() {
             let mut st = ReflowFastState::default();
-            let a = apply(st.on_text(1, 5, "acc".into(), 3, false));
+            let a = apply(st.on_text(1, 5, "acc".into(), 3, true, false));
             assert_eq!(a, ("acc".into(), 3, false, true));
             assert_eq!(st.on_bound(1, 5, None, false), ReflowFastOutcome::None);
             let b = apply(st.on_bound(1, 5, Some(7), false));
@@ -11981,9 +12052,9 @@ mod testsync382_tests {
             let mut st = ReflowFastState::default();
             // seg6 边界先到（seg6 尚未渲染）⇒ None，但被登记
             assert_eq!(st.on_bound(1, 6, Some(4), false), ReflowFastOutcome::None);
-            let _ = apply(st.on_text(1, 5, "five".into(), 1, false));
+            let _ = apply(st.on_text(1, 5, "five".into(), 1, true, false));
             // seg6 全文到：应直接用先前登记的边界 4（accurate）
-            let six = apply(st.on_text(1, 6, "six".into(), 1, false));
+            let six = apply(st.on_text(1, 6, "six".into(), 1, true, false));
             assert_eq!(six, ("six".into(), 4, true, true));
             // seg5 边界后到：它已不是最新已渲染 ⇒ None
             assert_eq!(st.on_bound(1, 5, Some(9), false), ReflowFastOutcome::None);
@@ -11996,7 +12067,7 @@ mod testsync382_tests {
         #[test]
         fn suppressed_on_bound_renders_state_only() {
             let mut st = ReflowFastState::default();
-            let _ = apply(st.on_text(1, 5, "acc".into(), 3, true));
+            let _ = apply(st.on_text(1, 5, "acc".into(), 3, true, true));
             let b = apply(st.on_bound(1, 5, Some(7), true));
             assert_eq!(
                 (b.1, b.2, b.3),
@@ -12010,11 +12081,11 @@ mod testsync382_tests {
         #[test]
         fn clear_resets_all_state() {
             let mut st = ReflowFastState::default();
-            let _ = apply(st.on_text(1, 5, "acc".into(), 3, false));
+            let _ = apply(st.on_text(1, 5, "acc".into(), 3, true, false));
             let _ = apply(st.on_bound(1, 5, Some(7), false));
             st.clear();
             // clear 后同 gen 同 seg 也不得复用 7 ⇒ 用 fallback
-            let a = apply(st.on_text(1, 5, "new".into(), 4, false));
+            let a = apply(st.on_text(1, 5, "new".into(), 4, true, false));
             assert_eq!(a, ("new".into(), 4, false, true), "clear 后旧边界必须失效");
         }
     }
@@ -17315,6 +17386,87 @@ mod fix386_tests {
         assert_eq!(window_text_with_fallback("", "流式兜底"), "流式兜底");
         assert_eq!(window_text_with_fallback("", ""), "");
         assert_eq!(window_text_with_fallback("解码文本", "流式"), "解码文本");
+    }
+}
+
+// =====================================================================
+// FIX-NEARFIELD-BY-SEGMENT-AND-PREVIEW-389（D3）：部分窗 committed_len 折算 + 状态机不截短
+// =====================================================================
+#[cfg(all(test, target_os = "windows"))]
+mod fix389_partial_window_tests {
+    use super::{partial_win_committed, ReflowFastOutcome, ReflowFastState};
+
+    fn apply(o: ReflowFastOutcome) -> (String, usize, bool, bool) {
+        match o {
+            ReflowFastOutcome::Apply {
+                text,
+                committed_len,
+                accurate,
+                render,
+            } => (text, committed_len, accurate, render),
+            ReflowFastOutcome::None => panic!("expected Apply, got None"),
+        }
+    }
+
+    /// 契约数值：派发 `[10.55s, 5.56s]`、`prev_committed=0`、`committed_len=71`
+    /// ⇒ 首窗（含第 0 片）`win_committed ≈ 47`（= round(71 × 10.55/16.11)）。
+    #[test]
+    fn fix389_partial_committed_matches_sample_fraction() {
+        // 16kHz 样本数（与生产 `sub_segs.len()` 同口径）。
+        let s0 = (10.55f32 * 16000.0) as usize;
+        let s1 = (5.56f32 * 16000.0) as usize;
+        let total = s0 + s1;
+        let win = partial_win_committed(0, 71, s0, total);
+        assert_eq!(win, 46, "round(71×10.55/16.11)=46（任务书 ≈47）");
+        assert!(
+            (win as f32 - 47.0).abs() <= 1.0,
+            "应与 47 相差 ≤1，实测 {win}"
+        );
+        assert!(
+            win > 0 && win < 71,
+            "必须落在 (prev_committed, committed_len) 内"
+        );
+        // 含末片窗：k=1 ⇒ cum=total ⇒ frac=1 ⇒ = committed_len(71)。
+        assert_eq!(
+            partial_win_committed(0, 71, total, total),
+            71,
+            "含末片窗折算应等于 committed_len"
+        );
+        // prev_committed 非 0：从 prev 起算增量。
+        assert_eq!(partial_win_committed(30, 71, total, total), 71);
+    }
+
+    /// 部分窗：即便该 seg 的**整次派发边界已到（71）**，`on_text` 也必须用折算值(46)，不得用 71；
+    /// 且晚到边界**不得**对部分窗重渲（否则截短预览）。
+    #[test]
+    fn fix389_partial_window_uses_fallback_and_bound_does_not_rerender() {
+        let mut st = ReflowFastState::default();
+        // 先登记整次派发边界 = 71（这是被延后末片所属派发的边界）。
+        assert_eq!(st.on_bound(1, 5, Some(71), false), ReflowFastOutcome::None);
+        // 部分窗全文到：boundary_usable=false ⇒ 用 fallback(46)，忽略已到的 71。
+        let o = apply(st.on_text(1, 5, "acc".into(), 46, false, false));
+        assert_eq!(
+            o,
+            ("acc".into(), 46, false, true),
+            "部分窗必须用折算值 46，不得用整次派发边界 71"
+        );
+        // 晚到边界（同 seg 仍最新）⇒ 部分窗不重渲。
+        assert_eq!(
+            st.on_bound(1, 5, Some(71), false),
+            ReflowFastOutcome::None,
+            "部分窗的最新渲染不得被整次派发边界重渲"
+        );
+    }
+
+    /// 对照（含末片窗 = 准确边界）：`boundary_usable=true` ⇒ 用登记边界、晚到边界可重渲。
+    #[test]
+    fn fix389_usable_window_uses_bound_and_rerenders() {
+        let mut st = ReflowFastState::default();
+        assert_eq!(st.on_bound(1, 6, Some(71), false), ReflowFastOutcome::None);
+        let o = apply(st.on_text(1, 6, "acc".into(), 46, true, false));
+        assert_eq!(o, ("acc".into(), 71, true, true), "含末片窗用准确边界 71");
+        let r = apply(st.on_bound(1, 6, Some(72), false));
+        assert_eq!(r, ("acc".into(), 72, true, true), "含末片窗晚到边界可重渲");
     }
 }
 

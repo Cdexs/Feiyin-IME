@@ -26,7 +26,7 @@
 
 | 单号 | 内容 | 负责 |
 | --- | --- | --- |
-| `FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388` | 解码前 VAD 剪静音（根因：静音多+热词触发 sherpa #3509 类幻觉）；重解统一查有内容+产出率；冷启动坍塌绝对下限 | coder-1（`transcription/mod.rs`、`vad.rs` 只新增） |
+| ✅ `FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388` | 解码前 VAD 剪静音（根因：静音多+热词触发 sherpa #3509 类幻觉）；重解统一查有内容+产出率；冷启动坍塌绝对下限。**2026-09-23 阶段一交付 coder-1**：`vad.rs` 只新增 `try_new_for_local_trim`/`speech_ranges` + `trim_to_speech` + 线程级 VAD 缓存 + `has_content`/`output_rate_ok` 下限；新增单测 7+`#[ignore]`1，**契约变更更新 6 条既有期望（不变量未动）**；`fmt --check` EXIT0、`check --all-targets` 0 error、warnings **97/88**=基线、全量 **1621P/0F/35I**。**待 tester-1 阶段四回归 + 出包 + 端测** | coder-1（`transcription/mod.rs`、`vad.rs` 只新增） |
 | `FIX-NEARFIELD-BY-SEGMENT-AND-PREVIEW-389` | 近场门改按 VAD 整句判定（段峰值 ≥0.3×level 即整句确认）；多片派发部分窗按时长比例估流式字数，防预览回退 | coder-2（`local_stream.rs`、`main.rs`） |
 
 ### ✅ BUILD-387 已出包（2026-09-23 17:10，HEAD `3646b4d`）· 待 Gavin 端测
