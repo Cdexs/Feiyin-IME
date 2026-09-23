@@ -2174,3 +2174,13 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 ### LOCALRT-NEARFIELD-GATE-385 · 修复补充（2026-09-23，coder-2）
 
 主控第 1 轮验收退回后修复：`NearFieldLevel` 的 30s 窗口由「按已入样本累计时长滑动」改为**按会话音频时间过期**（每条样本记入样时刻，判门前剔除早于 `now−30s` 的样本）。对 macOS 无额外影响：仍是平台中立纯逻辑、无 `cfg` 分支；无新平台 API / 依赖 / 构建脚本变化。行为差异：录音人中途降音量后，最坏 ~30s（窗口过期）门会重新放行并重新学习，而非永久锁死。
+
+## FIX-TAIL-WINDOW-AND-FALLBACK-386（2026-09-23，coder-1）· 组窗末片延后/收尾短尾合并 + 回灌合成 + 失败窗流式兜底 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| A：`plan_windows` 改为 `WindowPlan{windows,pending}`（单片立刻 / 单次 ≥2 片末片延后 / 下次派发首个窗口强制含 pending 可超 `WINDOW_MAX_SECS` / 松键收尾 <3s 与前片合窗重解、否则单独）；滑窗线程接计划 + `dispatch_window!` 宏 | ✅ **行为变更，平台中立**：滑窗 worker 在 `spawn_worker_thread`（已去 `#[cfg]`），macOS 编译同一代码 ⇒ 同继承；`plan_windows`/`WindowPlan` 纯逻辑无平台分支 |
+| B：回灌渲染改 `compose_reflow_preview`（= `compose_with_acc_for_gen`：acc 全文 + `streaming[committed_len..]`）；删除 `reflow_preview_367` | ✅ **合成函数平台中立**（无 `#[cfg]`）；`render_authoritative_reflow` 是 Windows-only，`compose_reflow_preview` 加了 `#[cfg_attr(not(windows), allow(dead_code))]`。macOS 侧 `PreviewReflow` 本就「暂不渲染」（`overlay_request_for_event`），用户可见行为不变 |
+| C：窗口解码 Err/空 ⇒ `window_text_with_fallback` 用本窗流式文本兜底 | ✅ 平台中立（`main.rs` 无 `cfg`），macOS 同继承 |
+| 新增单测 `plan_windows_386_tests`(8) / `fix386_tests`(2) | ✅ 平台中立、无 `#[cfg]`；macOS 同跑 |
+| macOS 侧需要做什么 | ✅ **无需代码改动**；未新增用户开关/env（DEC-031）、未触 `src/platform/macos/**`、未改构建脚本/依赖 |

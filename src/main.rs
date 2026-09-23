@@ -7094,7 +7094,6 @@ fn process_controller_events(
                                     generation,
                                     seg_index,
                                     &text,
-                                    true,
                                     len,
                                     accurate,
                                     decode_done_at,
@@ -7196,7 +7195,6 @@ fn process_controller_events(
                             generation,
                             seg_index,
                             &text,
-                            true,
                             len,
                             accurate,
                             None,
@@ -8394,6 +8392,15 @@ fn spawn_worker_thread(
                                         // 382（3A）：`window_seq -> 派发当刻浮层字符数`（边界未到时的 fallback，
                                         // 随 `PreviewReflow.committed_len` 带到消费端）。
                                         let mut window_committed_lens: Vec<usize> = Vec::new();
+                                        // 386（C）：`window_seq -> 本窗各片流式文本拼接`（解码失败/空时的兜底）。
+                                        let mut window_streaming_texts: Vec<String> = Vec::new();
+                                        // 386（C）：与 `recent_slices` 一一对应的各片流式文本（同批 sub_seg 共享）。
+                                        let mut recent_streaming: Vec<String> = Vec::new();
+                                        // 386（A）：待覆盖片全局下标（多片派发的末片延后，等下次派发/收尾纳入）。
+                                        let mut pending_slice: Option<usize> = None;
+                                        // 386（A）：收尾窗用的最近 dispatch_idx / committed_len。
+                                        let mut last_dispatch_idx: usize = 0;
+                                        let mut last_committed_len: usize = 0;
                                         let mut window_seq: usize = 0;
                                         // FIX-PREVIEW-STALE-AND-COLLAPSE-375（A）：滑窗权威快照的**自有单调序号**
                                         // —— `dispatch_idx`（切片下标）在窗口间并发 + 收尾 drain 下**会重复**，
@@ -8473,6 +8480,21 @@ fn spawn_worker_thread(
                                                             String::new()
                                                         }
                                                     };
+                                                    // 386（C）：解码 Err / 最终为空 ⇒ 用本窗**流式文本**兜底
+                                                    //（流式也为空才保持空）；防结尾整段丢失（本次 seq7 `<location>` 丢 40+ 字）。
+                                                    let decoded = text;
+                                                    let fb = window_streaming_texts
+                                                        .get(seq)
+                                                        .map(|s| s.as_str())
+                                                        .unwrap_or("");
+                                                    let text = window_text_with_fallback(&decoded, fb);
+                                                    if decoded.is_empty() && !text.is_empty() {
+                                                        log::warn!(
+                                                            "[LocalRT-DBG-386] window #{} fallback to streaming text ({} chars)",
+                                                            seq,
+                                                            text.chars().count()
+                                                        );
+                                                    }
                                                     // FIX-WINDOW-DISJOINT-369：把该窗的切片区间一并交给 reflow 判重叠
                                                     // （missing ⇒ 保守当零重叠，拼接保字、不丢）。
                                                     let (win_ws, win_we) = window_spans
@@ -8523,6 +8545,65 @@ fn spawn_worker_thread(
                                                     done += 1;
                                                 }};
                                             }
+                                            // 386（A）：派发一个窗口（含 C 的流式文本记账）。`gs/ge` = 全局切片区间。
+                                            // 单一定义 ⇒ 批次路径与收尾合并共用，防两份漂移。
+                                            macro_rules! dispatch_window {
+                                                ($gs:expr, $ge:expr, $idx:expr, $committed_len:expr) => {{
+                                                    let gs: usize = $gs;
+                                                    let ge: usize = $ge;
+                                                    let buf_base = total_slices - recent_slices.len();
+                                                    debug_assert!(
+                                                        gs >= buf_base && ge <= total_slices,
+                                                        "386：窗口区间 [{gs},{ge}) 必须落在当前 buffer [{buf_base},{total_slices}) 内"
+                                                    );
+                                                    let start = gs.saturating_sub(buf_base);
+                                                    let stop = ge
+                                                        .saturating_sub(buf_base)
+                                                        .min(recent_slices.len());
+                                                    let window_audio: Vec<f32> = recent_slices[start..stop]
+                                                        .iter()
+                                                        .flat_map(|s| s.iter().copied())
+                                                        .collect();
+                                                    if !transcription::path_b_budget_ok(
+                                                        window_audio.len(),
+                                                        terms,
+                                                    ) {
+                                                        log::warn!(
+                                                            "[FIX-REMOVE-HARDSPLIT-370] 窗口音频超 KV 预算（撞顶会被静默截断）：{:.1}s audio_tok={} inject_tok={} max_total_len={}",
+                                                            window_audio.len() as f32 / 16000.0,
+                                                            transcription::expected_audio_tokens(
+                                                                window_audio.len()
+                                                            ),
+                                                            transcription::estimate_inject_tokens(terms),
+                                                            transcription::PATH_B_MAX_TOTAL_LEN
+                                                        );
+                                                    }
+                                                    let avg_snapshot =
+                                                        transcription::acc_avg_chars_per_sec(
+                                                            rate_sum_chars,
+                                                            rate_sum_secs,
+                                                            rate_windows,
+                                                        );
+                                                    let _ = task_tx.send((
+                                                        window_seq,
+                                                        $idx,
+                                                        window_audio,
+                                                        avg_snapshot,
+                                                        std::time::Instant::now(),
+                                                    ));
+                                                    window_spans.push((gs, ge));
+                                                    window_samples.push(
+                                                        recent_slices[start..stop]
+                                                            .iter()
+                                                            .map(|s| s.len())
+                                                            .collect(),
+                                                    );
+                                                    window_streaming_texts
+                                                        .push(recent_streaming[start..stop].concat());
+                                                    window_committed_lens.push($committed_len);
+                                                    window_seq += 1;
+                                                }};
+                                            }
                                             // FIX-PREVIEW-HARVEST-380（A）：select 循环 —— 新切片与解码结果
                                             // **任一先到即处理**，不再等下一个切片（Gavin 现象①：停顿即停刷）。
                                             let mut step =
@@ -8532,12 +8613,13 @@ fn spawn_worker_thread(
                                                             idx,
                                                             committed_len,
                                                             sub_segs,
-                                                            _seg_streaming,
+                                                            seg_streaming,
                                                         )) => {
-                                                            // 382（问题1）：**逐片**组窗 —— 一次派发带 N 片 ⇒ 派 N 个窗口，
-                                                            // 每窗以**当前这片**收尾。旧实现把 N 片一起 push 后只组**一个**窗口，
-                                                            // 一次派发 18.37s（被切成 13s+5.37s）时只有末尾 5.37s 进窗、13s 那片
-                                                            // 从不进任何窗口 ⇒ 永不解码（Gavin「吃掉前文」）。
+                                                            // 386（A）：按「中途末片延后 / 下次派发纳入 / 收尾合并」规则组窗
+                                                            //（规则与不变量见 `plan_windows`）。382 旧行为「每片立刻组窗」会把
+                                                            // 11.27s ⇒ 10.15s+1.12s 的尾片单独成窗 ⇒ 模型念词表。
+                                                            last_dispatch_idx = idx;
+                                                            last_committed_len = committed_len;
                                                             let prev_base = total_slices - recent_slices.len();
                                                             let prev_durs: Vec<f32> = recent_slices
                                                                 .iter()
@@ -8547,80 +8629,35 @@ fn spawn_worker_thread(
                                                                 .iter()
                                                                 .map(|s| s.len() as f32 / 16000.0)
                                                                 .collect();
-                                                            // 覆盖不变量由 plan_windows 保证（每个新片都被某窗覆盖）。
-                                                            let planned = plan_windows(
+                                                            let plan = plan_windows(
                                                                 &prev_durs,
                                                                 &new_durs,
                                                                 prev_base,
+                                                                pending_slice,
+                                                                false,
                                                             );
-                                                            for (k, s) in sub_segs.into_iter().enumerate() {
+                                                            pending_slice = plan.pending;
+                                                            let mut wi = 0usize;
+                                                            for (_k, s) in sub_segs.into_iter().enumerate() {
                                                                 recent_slices.push(s);
+                                                                recent_streaming.push(seg_streaming.clone());
                                                                 total_slices += 1;
                                                                 while recent_slices.len()
                                                                     > transcription::WINDOW_MAX_SLICES
                                                                 {
                                                                     recent_slices.remove(0);
+                                                                    recent_streaming.remove(0);
                                                                 }
-                                                                let (window_start_slice, window_end_slice) =
-                                                                    planned[k];
-                                                                debug_assert_eq!(
-                                                                    window_end_slice, total_slices,
-                                                                    "382：窗口必须以当前新片收尾"
-                                                                );
-                                                                // 全局区间换算本窗在（已裁剪）buffer 中的起点。
-                                                                let buf_base =
-                                                                    total_slices - recent_slices.len();
-                                                                debug_assert!(window_start_slice >= buf_base);
-                                                                let start = window_start_slice - buf_base;
-                                                                let window_audio: Vec<f32> = recent_slices[start..]
-                                                                    .iter()
-                                                                    .flat_map(|s| s.iter().copied())
-                                                                    .collect();
-                                                                // FIX-SLICE-CUT-AT-GAP-381：切片超 10s 在字缝切（单片约 10~12s，
-                                                                // 窗口上限 10s）。KV 不是瓶颈，本闸门保留为未来调大
-                                                                // 上限时的廉价不变量护栏 —— 撞顶是静默丢字，DEC-069。
-                                                                if !transcription::path_b_budget_ok(
-                                                                    window_audio.len(),
-                                                                    terms,
-                                                                ) {
-                                                                    log::warn!(
-                                                                        "[FIX-REMOVE-HARDSPLIT-370] 窗口音频超 KV 预算（撞顶会被静默截断）：{:.1}s audio_tok={} inject_tok={} max_total_len={}",
-                                                                        window_audio.len() as f32 / 16000.0,
-                                                                        transcription::expected_audio_tokens(
-                                                                            window_audio.len()
-                                                                        ),
-                                                                        transcription::estimate_inject_tokens(terms),
-                                                                        transcription::PATH_B_MAX_TOTAL_LEN
-                                                                    );
+                                                                // 窗口以「当前片」收尾：其 end == 推送后的 total_slices。
+                                                                let end = total_slices;
+                                                                if wi < plan.windows.len()
+                                                                    && plan.windows[wi].1 == end
+                                                                {
+                                                                    let (gs, ge) = plan.windows[wi];
+                                                                    wi += 1;
+                                                                    dispatch_window!(gs, ge, idx, committed_len);
                                                                 }
-                                                                // 投**共享**队列、**不等**；dispatch_idx 用于与 337 配对。
-                                                                // 375-B：随载荷带上产出率均值快照（冷启动 ⇒ None ⇒ 不判坍塌）。
-                                                                let avg_snapshot =
-                                                                    transcription::acc_avg_chars_per_sec(
-                                                                        rate_sum_chars,
-                                                                        rate_sum_secs,
-                                                                        rate_windows,
-                                                                    );
-                                                                let _ = task_tx.send((
-                                                                    window_seq,
-                                                                    idx,
-                                                                    window_audio,
-                                                                    avg_snapshot,
-                                                                    std::time::Instant::now(),
-                                                                ));
-                                                                window_spans
-                                                                    .push((window_start_slice, window_end_slice));
-                                                                // FIX-PREFIX-AND-EAT-371（B）：本窗各片样本数（与
-                                                                // `recent_slices[start..]` 一一对应）。
-                                                                window_samples.push(
-                                                                    recent_slices[start..]
-                                                                        .iter()
-                                                                        .map(|s| s.len())
-                                                                        .collect(),
-                                                                );
-                                                                // 382（3A）：派发当刻浮层字符数（fallback 边界）。
-                                                                window_committed_lens.push(committed_len);
-                                                                window_seq += 1;
+                                                                // 否则：本片是**延后的待覆盖片**（本批末片），本轮不组窗。
                                                             }
                                                         }
                                                         AccWindowStep::Result(res) => {
@@ -8635,6 +8672,34 @@ fn spawn_worker_thread(
                                                 &mut step,
                                             );
                                             drop(step);
+                                            // 386（A.4）：松键收尾 —— 处理仍待覆盖的片：
+                                            // <3s 且前面有片 ⇒ 与前一并重解；否则单独组窗。
+                                            if pending_slice.is_some() {
+                                                let prev_base = total_slices - recent_slices.len();
+                                                let prev_durs: Vec<f32> = recent_slices
+                                                    .iter()
+                                                    .map(|s| s.len() as f32 / 16000.0)
+                                                    .collect();
+                                                let plan = plan_windows(
+                                                    &prev_durs,
+                                                    &[],
+                                                    prev_base,
+                                                    pending_slice,
+                                                    true,
+                                                );
+                                                debug_assert!(
+                                                    plan.pending.is_none(),
+                                                    "386：收尾后不应再有待覆盖片"
+                                                );
+                                                for (gs, ge) in plan.windows {
+                                                    dispatch_window!(
+                                                        gs,
+                                                        ge,
+                                                        last_dispatch_idx,
+                                                        last_committed_len
+                                                    );
+                                                }
+                                            }
                                             // 收尾：等齐所有在飞窗口（共 window_seq 条）。
                                             // select 期间已收的已计入 `done`；本段只等还没收的。
                                             drop(task_tx);
@@ -10064,22 +10129,6 @@ fn reflow_preview(acc_text: &str, streaming: &str, committed_len: usize) -> Stri
     out
 }
 
-/// SLIDING-WINDOW-367：预览合成选择（纯函数，可单测）。
-/// - `replace_all == true`  ⇒ **整段替换**为 `acc_text`（滑窗权威全文，与流式文本无前缀关系）；
-/// - `replace_all == false` ⇒ 沿用 325 的 `reflow_preview`（替换前 `committed_len` 字 + 流式尾巴）。
-fn reflow_preview_367(
-    replace_all: bool,
-    acc_text: &str,
-    streaming: &str,
-    committed_len: usize,
-) -> String {
-    if replace_all {
-        acc_text.to_string()
-    } else {
-        reflow_preview(acc_text, streaming, committed_len)
-    }
-}
-
 /// ACC-REFLOW-PERSIST-329：流式渲染/镜像前的权威前缀合成。
 ///
 /// `state` = 本代已确定的 `(generation, acc_text, committed_len)`（见 [`ACC_REFLOW_STATE`]）。
@@ -10105,6 +10154,22 @@ fn compose_with_acc_for_gen(
         }
         _ => raw.to_string(),
     }
+}
+
+/// FIX-TAIL-WINDOW-AND-FALLBACK-386（B）：回灌渲染与后续 `StreamingText` 渲染用**同一个合成函数**
+///（acc 全文 + `streaming[committed_len..]` 流式尾巴）。
+///
+/// 🔴 不得再走已删除的 `reflow_preview_367`：它对 `replace_all` 只返回 `acc_text`、**丢掉流式尾巴** ⇒
+/// 说话中途回灌会把预览截短（实测 31→28、78→69、191→146），下一次 `StreamingText` 才拼回 ⇒ 闪回。
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn compose_reflow_preview(
+    generation: u64,
+    acc_text: &str,
+    streaming: &str,
+    committed_len: usize,
+) -> String {
+    let state = (generation, acc_text.to_string(), committed_len);
+    compose_with_acc_for_gen(Some(&state), generation, streaming)
 }
 
 /// AUTOLEARN-EDIT-SNAPSHOT-331：自学习比对基准的选择（纯函数）。
@@ -10150,7 +10215,6 @@ fn render_authoritative_reflow(
     generation: u64,
     seg_index: usize,
     acc_text: &str,
-    replace_all: bool,
     committed_len: usize,
     accurate: bool,
     decode_done_at: Option<std::time::Instant>,
@@ -10160,9 +10224,9 @@ fn render_authoritative_reflow(
         .ok()
         .and_then(|m| m.clone())
         .unwrap_or_default();
-    // SLIDING-WINDOW-367：replace_all ⇒ 整段替换预览为权威全文（滑窗文本非流式前缀关系，
-    // 不能按 committed_len 切）；否则沿用 325「替换前 len 字、保留流式尾巴」。
-    let preview = reflow_preview_367(replace_all, acc_text, &streaming, committed_len);
+    // 386（B）：与 `compose_with_acc_for_gen` **同一个合成函数**（acc 全文 + `streaming[committed_len..]`），
+    // 不再走 `reflow_preview_367`（replace_all 会丢流式尾巴 ⇒ 回灌把预览截短 ⇒ 闪回更短文本）。
+    let preview = compose_reflow_preview(generation, acc_text, &streaming, committed_len);
     set_acc_reflow_state_only(generation, acc_text, committed_len);
     if let Ok(mut mirror) = last_streaming_text.lock() {
         *mirror = Some(preview.clone());
@@ -10207,7 +10271,7 @@ fn try_resolve_reflow(
 ) {
     let acc = ACC_REFLOW_ACC.lock().ok().and_then(|g| g.clone());
     let bound = ACC_REFLOW_BOUND.lock().ok().and_then(|g| g.clone());
-    let (Some((ga, sa, acc_text, replace_all)), Some((gb, sb, bound_opt))) = (acc, bound) else {
+    let (Some((ga, sa, acc_text, _replace_all)), Some((gb, sb, bound_opt))) = (acc, bound) else {
         return;
     };
     if ga != gb || sa != sb {
@@ -10230,7 +10294,6 @@ fn try_resolve_reflow(
                 ga,
                 sa,
                 &acc_text,
-                replace_all,
                 len,
                 true,
                 None,
@@ -11048,88 +11111,225 @@ mod preview_harvest_380_tests {
 // FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382（问题1）：逐片组窗（纯函数）
 // ============================================================
 
-/// 382：按「**逐片**派发窗口」计划组窗（纯函数，可单测）。
+/// FIX-TAIL-WINDOW-AND-FALLBACK-386（C）：窗口文本选择 —— 解码文本为空（含解码 Err）⇒ 用**本窗流式文本**
+/// 兜底；流式也为空才保持空。防结尾整段丢失（本次 seq7 `<location>` 丢 40+ 字）。纯函数，可单测。
+fn window_text_with_fallback(decoded: &str, streaming: &str) -> String {
+    if decoded.is_empty() {
+        streaming.to_string()
+    } else {
+        decoded.to_string()
+    }
+}
+
+/// 386：短尾合并阈值（秒）—— 收尾时待覆盖片 < 此值且前面有片 ⇒ 与前一并重解。
+const TAIL_MERGE_MAX_SECS: f32 = 3.0;
+
+/// 386：组窗计划（纯函数输出）。
+#[derive(Debug, PartialEq, Eq)]
+struct WindowPlan {
+    /// 本次要**立刻派发**的窗口（全局切片区间 `[start,end)`，按序）。
+    windows: Vec<(usize, usize)>,
+    /// 更新后的「待覆盖片」全局下标（`None` = 无待覆盖）。
+    pending: Option<usize>,
+}
+
+/// FIX-TAIL-WINDOW-AND-FALLBACK-386：组窗纯函数（在 382 基础上加「延后尾片 / 收尾合并」）。
 ///
-/// 输入：`prev_durs` = 已派发片时长（时间序，调用方保证已按 `WINDOW_MAX_SLICES` 裁剪）；
-/// `new_durs` = 本次派发携带的新片时长（时间序）；`prev_base` = `prev_durs[0]` 的**全局切片下标**。
+/// 输入：`prev_durs` 已派发片时长（时间序，调用方保证已按 `WINDOW_MAX_SLICES` 裁剪）；
+/// `prev_base` = `prev_durs[0]` 的全局下标；`new_durs` = 本次派发携带的新片时长（时间序）；
+/// `pending` = 上一次遗留的**待覆盖片**全局下标（`None` = 无）；`is_tail` = 是否收尾（松键、不再有新片）。
 ///
-/// 输出：每个新片对应**一个**窗口的全局切片区间 `[start, end)`（`end` 开区间），长度 = `new_durs.len()`；
-/// 第 k 个窗口以第 k 个新片收尾（`end-1` == 该新片全局下标）。
-///
-/// 🔴 覆盖不变量（本函数存在的理由）：逐片组窗 ⇒ **每个新切片的全局下标都落在至少一个窗口区间内**。
-/// 旧实现把同一次派发的 N 片一起 push 后只组**一个**窗口 ⇒ 一次派发带 2 片（18.37s ⇒ 13s+5.37s）时
-/// 只有末尾片进窗、13s 那片从不解码（Gavin「吃掉前文」）。
-fn plan_windows(prev_durs: &[f32], new_durs: &[f32], prev_base: usize) -> Vec<(usize, usize)> {
+/// 规则（Gavin 2026-09-23 BUILD-385 端测）：
+/// 1. 单次派发 **1 片**（常态）⇒ 与旧行为相同，立刻组窗（含把 `pending` 强制纳入）。
+/// 2. 单次派发 **≥2 片**（被切分）⇒ 除**最后一片**外每片立刻组窗；最后一片不组窗，记为待覆盖片。
+/// 3. 有 `pending` 时，**本批第一个窗口起点强制 ≤ pending**（把待覆盖片纳入，**哪怕总长超 `WINDOW_MAX_SECS`**）。
+/// 4. `is_tail` 且仍有待覆盖片：其时长 < [`TAIL_MERGE_MAX_SECS`] 且**前面有片** ⇒ 组窗 `[待覆盖片-1, 待覆盖片+1)`
+///    （**前一片重解**，Gavin 要的）；否则 ⇒ 单独组窗 `[待覆盖片, 待覆盖片+1)`。
+/// 5. 🔴 覆盖不变量：**每个已派发切片在收尾时都至少被一个窗口覆盖**（延后片由「下次首个窗」或「收尾窗」覆盖）。
+fn plan_windows(
+    prev_durs: &[f32],
+    new_durs: &[f32],
+    prev_base: usize,
+    pending: Option<usize>,
+    is_tail: bool,
+) -> WindowPlan {
     let mut buf: Vec<f32> = prev_durs.to_vec();
     let mut base = prev_base; // buf[0] 的全局下标
-    let mut out = Vec::with_capacity(new_durs.len());
-    for nd in new_durs {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut pend = pending;
+    let n = new_durs.len();
+
+    for (k, nd) in new_durs.iter().enumerate() {
         buf.push(*nd);
         while buf.len() > transcription::WINDOW_MAX_SLICES {
             buf.remove(0);
             base += 1;
         }
         let end = base + buf.len();
-        let s = transcription::group_window_start_secs(&buf, transcription::WINDOW_MAX_SECS);
-        out.push((base + s, end));
+        let is_last = k + 1 == n;
+        // 规则 2：一次派发 ≥2 片 ⇒ 最后一片**延后**（不收尾时）。
+        if is_last && !is_tail && n >= 2 {
+            pend = Some(end - 1);
+            continue;
+        }
+        let mut start =
+            base + transcription::group_window_start_secs(&buf, transcription::WINDOW_MAX_SECS);
+        // 规则 3：本批第一个窗口强制纳入待覆盖片（允许超 WINDOW_MAX_SECS）。
+        if let Some(p) = pend {
+            if p < start {
+                start = p;
+            }
+            pend = None;
+        }
+        out.push((start, end));
     }
-    out
+
+    // 规则 4：收尾处理仍待覆盖的片。
+    if is_tail {
+        if let Some(p) = pend {
+            let idx = p.checked_sub(base);
+            let dur = idx.and_then(|i| buf.get(i).copied());
+            let has_prev = idx.map_or(false, |i| i > 0);
+            if has_prev && matches!(dur, Some(d) if d < TAIL_MERGE_MAX_SECS) {
+                out.push((p - 1, p + 1)); // 短尾与前一并（前片重解）
+            } else {
+                out.push((p, p + 1)); // 单独
+            }
+            pend = None;
+        }
+    }
+
+    WindowPlan {
+        windows: out,
+        pending: pend,
+    }
 }
 
 #[cfg(test)]
-mod plan_windows_382_tests {
-    use super::plan_windows;
+mod plan_windows_386_tests {
+    use super::{plan_windows, WindowPlan, TAIL_MERGE_MAX_SECS};
     use crate::transcription;
 
     fn covered(windows: &[(usize, usize)], idx: usize) -> bool {
         windows.iter().any(|(s, e)| *s <= idx && idx < *e)
     }
 
-    /// 主判据：新片 [10.3, 5.37]（无前片）⇒ 2 个窗口 `[0,1)` / `[1,2)`，全覆盖。
+    /// 常态单片（无 pending）：与旧行为相同 —— 立刻 1 窗、无待覆盖。
     #[test]
-    fn plan_covers_all_new_slices_no_prev() {
-        let w = plan_windows(&[], &[10.3, 5.37], 0);
-        assert_eq!(w, vec![(0, 1), (1, 2)]);
-        assert!(covered(&w, 0) && covered(&w, 1), "每个新片都必须被覆盖");
-        assert_eq!(w[0].1, 1, "第 0 窗以新片 0 收尾");
-        assert_eq!(w[1].1, 2, "第 1 窗以新片 1 收尾");
-    }
-
-    /// 新片 [10.2,10.6,4] + 前片 [3,2] ⇒ 每个新片（全局 2/3/4）都被覆盖。
-    #[test]
-    fn plan_covers_all_new_slices_with_prev() {
-        let w = plan_windows(&[3.0, 2.0], &[10.2, 10.6, 4.0], 0);
-        for idx in 2..5 {
-            assert!(covered(&w, idx), "新片全局下标 {} 必须被某窗口覆盖", idx);
-        }
-        assert_eq!(
-            w.iter().map(|(_, e)| *e).collect::<Vec<_>>(),
-            vec![3, 4, 5],
-            "每窗以对应新片收尾"
-        );
-    }
-
-    /// 常态单片派发 ⇒ 与改前「单片组窗」结果**完全一致**（回归护栏）。
-    #[test]
-    fn plan_single_slice_matches_legacy_grouping() {
+    fn single_slice_no_pending_is_immediate() {
         let prev = vec![1.0f32, 1.0, 1.0];
-        let w = plan_windows(&prev, &[3.0], 0);
+        let p = plan_windows(&prev, &[3.0], 0, None, false);
         let mut buf = prev.clone();
         buf.push(3.0);
         let s = transcription::group_window_start_secs(&buf, transcription::WINDOW_MAX_SECS);
-        assert_eq!(w, vec![(s, 4)]);
+        assert_eq!(
+            p,
+            WindowPlan {
+                windows: vec![(s, 4)],
+                pending: None
+            }
+        );
     }
 
-    /// 覆盖不变量：任意片长序列，逐片计划后**每个**全局下标都被覆盖（含触发裁剪的长序列）。
+    /// 中途多片：除最后一片外立刻组窗；**最后一片延后**（pending）。
+    /// 反例：382 旧行为会给 [10.3,5.37] 组 [0,1)、[1,2)（第二窗只含 1.12s 短尾 ⇒ 模型念词表）。
     #[test]
-    fn plan_covers_every_index_for_arbitrary_lengths() {
-        let all = [9.0f32, 9.0, 9.0, 9.0, 2.0, 14.0, 1.0, 11.0];
-        let mut windows: Vec<(usize, usize)> = Vec::new();
-        for i in 0..all.len() {
-            windows.extend(plan_windows(&all[..i], &all[i..=i], 0));
+    fn multi_slice_defers_last() {
+        let p = plan_windows(&[], &[10.3, 5.37], 0, None, false);
+        assert_eq!(p.windows, vec![(0, 1)], "只有首片立刻组窗");
+        assert_eq!(p.pending, Some(1), "末片延后");
+    }
+
+    /// 下次派发：首个窗口**必须含待覆盖片**（起点 ≤ pending），哪怕总长超 `WINDOW_MAX_SECS`。
+    #[test]
+    fn next_dispatch_forces_pending_inclusion_even_over_max() {
+        // prev=[4,4,4]（global0..2，pending=2）；新片[9]（global3）。
+        // 常规组窗：buf=[4,4,4,9]=21s>10 ⇒ 逐丢到只剩新片（起点=3）；pending=2 ⇒ 强制起点=2。
+        let p = plan_windows(&[4.0, 4.0, 4.0], &[9.0], 0, Some(2), false);
+        assert_eq!(
+            p.windows,
+            vec![(2, 4)],
+            "首个窗口必须含 pending(2)，可超 10s"
+        );
+        assert!(p.pending.is_none(), "pending 被纳入后清空");
+    }
+
+    /// 收尾：待覆盖片 < 3s 且前面有片 ⇒ 与前一并重解 `[p-1, p+1)`。
+    #[test]
+    fn tail_merges_short_pending_with_prev() {
+        let p = plan_windows(&[10.0, 1.2], &[], 0, Some(1), true);
+        assert_eq!(p.windows, vec![(0, 2)], "短尾与前一并（前片重解）");
+        assert!(p.pending.is_none());
+        assert!(1.2 < TAIL_MERGE_MAX_SECS);
+    }
+
+    /// 收尾：待覆盖片 ≥ 3s ⇒ 单独组窗。
+    #[test]
+    fn tail_large_pending_alone() {
+        let p = plan_windows(&[10.0, 3.5], &[], 0, Some(1), true);
+        assert_eq!(p.windows, vec![(1, 2)], "≥3s 单独组窗");
+    }
+
+    /// 收尾：待覆盖片是首片（无前片）⇒ 即便 <3s 也单独组窗。
+    #[test]
+    fn tail_short_pending_without_prev_alone() {
+        let p = plan_windows(&[1.2], &[], 0, Some(0), true);
+        assert_eq!(p.windows, vec![(0, 1)]);
+    }
+
+    /// 「延后后直接收尾」链路：多片派发 ⇒ pending；无下次派发 ⇒ 直接收尾合并。
+    #[test]
+    fn defer_then_tail_directly() {
+        let p1 = plan_windows(&[], &[5.0, 2.0], 0, None, false);
+        assert_eq!(p1.pending, Some(1));
+        let p2 = plan_windows(&[5.0, 2.0], &[], 0, p1.pending, true);
+        assert_eq!(p2.windows, vec![(0, 2)], "2s<3s ⇒ 与前一并");
+        assert!(p2.pending.is_none());
+    }
+
+    /// 覆盖不变量（随机性质）：任意「多次派发 + 收尾」，收尾时**每个切片**都被某窗覆盖。
+    #[test]
+    fn property_every_slice_covered() {
+        struct Lcg(u64);
+        impl Lcg {
+            fn n(&mut self, lo: usize, hi: usize) -> usize {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (lo as u64 + (self.0 >> 33) % ((hi - lo + 1) as u64)) as usize
+            }
         }
-        for idx in 0..all.len() {
-            assert!(covered(&windows, idx), "全局下标 {} 未被任何窗口覆盖", idx);
+        let mut rng = Lcg(0x386_2026_5eed);
+        for case in 0..200 {
+            let n_dispatch = rng.n(1, 5);
+            let mut all_durs: Vec<f32> = Vec::new();
+            let mut windows: Vec<(usize, usize)> = Vec::new();
+            let mut pending: Option<usize> = None;
+            for _ in 0..n_dispatch {
+                let n_new = rng.n(1, 4);
+                let mut new_durs = Vec::new();
+                for _ in 0..n_new {
+                    new_durs.push(rng.n(1, 120) as f32 / 10.0);
+                }
+                let prev_len = transcription::WINDOW_MAX_SLICES.min(all_durs.len());
+                let prev_base = all_durs.len() - prev_len;
+                let prev_durs = all_durs[prev_base..].to_vec();
+                let plan = plan_windows(&prev_durs, &new_durs, prev_base, pending, false);
+                windows.extend(plan.windows);
+                pending = plan.pending;
+                all_durs.extend(new_durs);
+            }
+            let prev_len = transcription::WINDOW_MAX_SLICES.min(all_durs.len());
+            let prev_base = all_durs.len() - prev_len;
+            let prev_durs = all_durs[prev_base..].to_vec();
+            windows.extend(plan_windows(&prev_durs, &[], prev_base, pending, true).windows);
+            for idx in 0..all_durs.len() {
+                assert!(
+                    covered(&windows, idx),
+                    "case {case}: 切片 {idx} 未被覆盖（durs={all_durs:?} windows={windows:?}）"
+                );
+            }
         }
     }
 }
@@ -11498,18 +11698,29 @@ mod testsync382_tests {
                 new.push(rng.f32_in(0.3, 12.0));
             }
             let base = rng.usize_in(0, 50);
-            let wins = super::plan_windows(&prev, &new, base);
-            assert_eq!(wins.len(), new.len(), "窗数必须等于新片数");
-            for (k, (s, e)) in wins.iter().enumerate() {
+            let plan = super::plan_windows(&prev, &new, base, None, false);
+            // 386：`nnew>=2` ⇒ 末片**延后**（立刻窗数 = nnew-1、pending = 末片）；`nnew==1` ⇒ 全部立刻。
+            let expected_imm = if nnew >= 2 { nnew - 1 } else { nnew };
+            assert_eq!(plan.windows.len(), expected_imm, "立刻组窗数");
+            for (k, (s, e)) in plan.windows.iter().enumerate() {
                 let gidx = base + nprev + k; // 第 k 个新片的全局下标
-                assert_eq!(*e - 1, gidx, "第 k 窗必须以第 k 个新片收尾");
+                assert_eq!(*e - 1, gidx, "第 k 个立刻窗口必须以第 k 个新片收尾");
                 assert!(*s >= base, "窗起点不得早于 prev_base");
                 assert!(*e > *s, "窗必须非空");
                 assert!(
                     *e - *s <= max_prev,
-                    "窗宽不得超过 WINDOW_MAX_SLICES（不变量被裁片打破）"
+                    "无 pending 时窗宽不得超过 WINDOW_MAX_SLICES"
                 );
                 assert!(*s <= gidx && gidx < *e, "新片全局下标必须被本窗覆盖");
+            }
+            if nnew >= 2 {
+                assert_eq!(
+                    plan.pending,
+                    Some(base + nprev + nnew - 1),
+                    "末片必须延后为待覆盖片"
+                );
+            } else {
+                assert_eq!(plan.pending, None, "单片派发不延后");
             }
         }
     }
@@ -11531,15 +11742,16 @@ mod testsync382_tests {
             }
             let x = rng.f32_in(0.3, 12.0);
             let base = rng.usize_in(0, 50);
-            let wins = super::plan_windows(&prev, &[x], base);
+            let plan = super::plan_windows(&prev, &[x], base, None, false);
             let mut buf = prev.clone();
             buf.push(x);
             let s = transcription::group_window_start_secs(&buf, transcription::WINDOW_MAX_SECS);
             assert_eq!(
-                wins,
+                plan.windows,
                 vec![(base + s, base + prev.len() + 1)],
                 "常态单片必须等于旧组窗算法"
             );
+            assert_eq!(plan.pending, None, "单片不延后");
         }
     }
 
@@ -11547,8 +11759,12 @@ mod testsync382_tests {
     /// 理由：调用方若以「本次派发携带 0 片」调用（防御性），不得制造空窗或越界。
     #[test]
     fn plan_windows_empty_new_is_empty() {
-        assert!(super::plan_windows(&[1.0, 2.0], &[], 7).is_empty());
-        assert!(super::plan_windows(&[], &[], 0).is_empty());
+        assert!(super::plan_windows(&[1.0, 2.0], &[], 7, None, false)
+            .windows
+            .is_empty());
+        assert!(super::plan_windows(&[], &[], 0, None, false)
+            .windows
+            .is_empty());
     }
 
     // ---- 2. ReflowFastState 退化输入（作者未覆盖） ----
@@ -16899,36 +17115,39 @@ mod sync352_punct_node_guard_tests {
 }
 
 // ============================================================
-// SLIDING-WINDOW-367：PreviewReflow `replace_all` 两分支单测
-// 运行：cargo test --bin feiyin-ime -- reflow_preview_367
+// FIX-TAIL-WINDOW-AND-FALLBACK-386（阶段一）：B 回灌合成 / C 流式兜底
+//   （原 SLIDING-WINDOW-367 的 `reflow_preview_367` 两分支单测随该函数一并删除：
+//   386-B 起 `replace_all` 也不丢流式尾巴，两分支统一走 `compose_with_acc_for_gen`。）
 // ============================================================
 #[cfg(test)]
-mod reflow_preview_367_tests {
-    use super::reflow_preview_367;
+mod fix386_tests {
+    use super::{compose_reflow_preview, compose_with_acc_for_gen, window_text_with_fallback};
 
-    /// replace_all=true ⇒ **整段替换**：预览 = acc_text，**不拼流式尾巴**（即使尾部更长）。
+    /// B：回灌渲染结果 == 后续 `StreamingText` 渲染结果（**同一合成函数**），
+    /// 且**保留流式尾巴**（不得截短为纯 acc —— 382 回归）。
     #[test]
-    fn replace_all_whole_replaces() {
-        let acc = "整段权威全文";
-        let streaming = "整段权威全文多余的流式尾巴xyz";
+    fn reflow_preview_reuses_streaming_compose_and_keeps_tail() {
+        let g = 7u64;
+        let acc = "权威改写A";
+        let streaming = "原始流式文本B";
+        let len = 2usize;
+        let reflow = compose_reflow_preview(g, acc, streaming, len);
+        let state = (g, acc.to_string(), len);
+        let subsequent = compose_with_acc_for_gen(Some(&state), g, streaming);
         assert_eq!(
-            reflow_preview_367(true, acc, streaming, 2),
-            "整段权威全文",
-            "replace_all 必须整段替换、不保留流式尾巴"
+            reflow, subsequent,
+            "回灌必须与 StreamingText 用同一合成函数"
         );
-        // 权威比流式短也不残留尾巴（325 按 committed_len 切会残留 —— 这正是 367 要修的）
-        assert_eq!(
-            reflow_preview_367(true, "短权威", "非常非常长的流式预览文本", 1),
-            "短权威"
-        );
+        assert_eq!(reflow, "权威改写A流式文本B", "必须保留流式尾巴");
+        assert_ne!(reflow, acc, "不得截短为纯 acc（382 回归）");
     }
 
-    /// replace_all=false ⇒ 沿用 325：acc_text + streaming[committed_len..]（逐字不变）。
+    /// C：解码空（含 Err 置空）⇒ 用本窗流式文本兜底；流式也空 ⇒ 保持空；解码非空 ⇒ 原样。
     #[test]
-    fn legacy_325_semantics_unchanged() {
-        assert_eq!(reflow_preview_367(false, "AB", "XYZ", 1), "ABYZ");
-        assert_eq!(reflow_preview_367(false, "AB", "XYZ", 0), "ABXYZ");
-        assert_eq!(reflow_preview_367(false, "AB", "XYZ", 3), "AB");
+    fn window_text_fallback_semantics() {
+        assert_eq!(window_text_with_fallback("", "流式兜底"), "流式兜底");
+        assert_eq!(window_text_with_fallback("", ""), "");
+        assert_eq!(window_text_with_fallback("解码文本", "流式"), "解码文本");
     }
 }
 
@@ -16984,21 +17203,31 @@ mod testsync371_window_counter_guard_tests {
     }
 
     /// 设计 C：两表必须**同批 push**（区间 ↔ 样本数一一对应，否则期望比例算错）。
+    ///
+    /// 🔴 386：组窗改走 `dispatch_window!` 宏后，`window_spans.push((gs, ge));` 与
+    /// `window_samples.push(` 仍**同处成对**（相邻两行）。**只更新锚点定位方式**（不再要求
+    /// `window_spans` 单独占一行），断言强度不放宽：两 push 各**恰 1 处**且**必须成对相邻**。
     #[test]
     fn counters_are_pushed_together() {
         let p = prod_lines();
-        assert!(
-            p.iter().any(|l| l.contains("window_samples.push(")),
-            "window_samples 必须在生产区被 push"
-        );
-        // window_spans 的 push 跨行书写（标识符独占一行 + 紧接 `.push(`）
-        assert!(
-            p.iter().any(|l| l == "window_spans"),
-            "window_spans 的 push 调用点应存在（标识符独占一行）"
-        );
-        assert!(
-            p.iter().any(|l| l.starts_with(".push(")),
-            "紧接 window_spans 的 push 调用应存在"
+        let spans: Vec<usize> = p
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("window_spans.push("))
+            .map(|(i, _)| i)
+            .collect();
+        let samples: Vec<usize> = p
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("window_samples.push("))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(spans.len(), 1, "window_spans 的 push 调用点应恰 1 处");
+        assert_eq!(samples.len(), 1, "window_samples 的 push 调用点应恰 1 处");
+        assert_eq!(
+            samples[0],
+            spans[0] + 1,
+            "window_samples.push 必须紧随 window_spans.push（同批成对，防一一对应错位）"
         );
     }
 }
