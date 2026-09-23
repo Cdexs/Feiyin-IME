@@ -1375,3 +1375,15 @@ load_wordbook_vocabulary()
 | 覆盖 | ① 门误判整句不丢内容且静默满 1200ms 恰派发一次 ② 背景 10s + 录音人 2s + 停顿 1.5s ⇒ 恰 2 次派发 ③ 首段不学 + 下中位数（0.02 / 0.1）④ VAD 不可用 ⇒ 两标志 == rms>thr 且随机 300 组标志更新逐位一致 |
 | 验证 | `cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**、warnings **97/88** = 基线；numstat == -w。🔴 **未跑 `cargo test`**（白名单；首跑阶段四） |
 | 结论 | **未发现生产缺陷**；未改版本/未 push/零凭证 |
+
+## BUILD-392（阶段四全绿 → 出包 · 388/389/390/391/392 合包）· 2026-09-23 · tester-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 388（VAD 剪静音 / 重解把关 / 冷启动下限）/ 389（整句近场门 + 跨录音沿用音量 + 部分窗预览不回退）/ 390（解码串行 + `max_new_tokens` 限流）/ 391（VAD 按 512 逐块喂入）/ 392（门只管时序、内容看 VAD；下中位估计、首段不学）。HEAD `ad08251`，版本 0.9.3 |
+| 回归 | root `cargo test --no-fail-fast` **1657P/0F/38I**（EXIT 0；`feiyin-ime` bin **1569P/36I** = 基线 1645P/35I 净 **+12P/+3I**）；`src-tauri` **92P/0F/0I**；Vitest **SKIP**（`ui/` 无 diff）；`cargo fmt --check`（不带 `skip_children`）**EXIT 0**；warnings **97/88/17** = 基线；🔴 **`guard346_acc_counter_wiring` 由上轮 FAILED 转 `ok`**（`ad08251` 修复） |
+| NEW/GONE | NEW **15**（12P+3I）= `gate392_*` 5 + `ts392n_*` 4 + `ts391_*` 3（2 ignored）+ `vad391_*` 3（3 ignored）；GONE **0**（8 条 `seg389_*` 属期望值改写，同名保留） |
+| 出包 | `BUILD-392` 八项逐项 PASS；产物 `feiyin-ime` 14.87MB `4746f7bff754…`（21:04:27）/ `feiyin-ime-ui` 10.05MB `b8b8e6444663…`（21:01:30）/ `crash-reporter` 24.88MB `efdd988056f9…`（21:02:37）；两副本全等、均异于 BUILD-390 |
+| 三特殊点 | ① dll 四张三副本全等 + onnxruntime 1.28.2；② itn-rules 三副本全等；③ Publish/models 1.7B 七文件与源逐一 sha256 全等（0.6B 保留） |
+| 探针 | 正：`[LocalRT-DBG-388]`=2 / `vad_only_speech_chunks`=1 / `learned=`=1；反：`nearfield gate: vad=on`=**0**（385 逐块门已删） |
+| 端测 | 🔴 **Step1 强杀输入法 ⇒ 请重启 + 带 `-debug` 端测**；重点：① 391 VAD 逐块喂入（修剪静音吞字是否修复）；② 392 门只管时序/内容看 VAD（不再卡住吞字）+ 下中位估计 + 首段不学；③ 388 剪静音 + 重解把关；④ 390 解码耗时/是否截断快语速；⑤ 是否仍念词表；⑥ 吃字/重复字；⑦ 长录音 300s；⑧ 不新增 crash.json |
