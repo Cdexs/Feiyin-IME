@@ -22,12 +22,12 @@
 
 ## 🔴 待做
 
-### 🆕🔴 FIX-PREVIEW-HARVEST-380 · 预览迟迟不刷新 + 松键时延埋点（BUILD-379 端测，2026-09-23）🔄 已派 coder-1（12:13，Gavin 确认方案后）
+### ✅ FIX-PREVIEW-HARVEST-380 · 预览结果到即收 + 松键时延埋点（BUILD-379 端测，2026-09-23）— 阶段一代码已交付 coder-1
 
 **Gavin 原话**：「输入一整段话的中间、还有尾部（特别是）的文字明明已经被改写修正，但始终不刷新，即使录音后我停顿等了好几秒也都不刷新」
 **根因（主控读 log + 代码坐实）**：路 B 窗口解出后，结果只在**下一次派发新窗口时**才被收取（`main.rs:8372` 的 `res_rx.try_recv()` 在 `for … in acc_rx` 循环体内，`:8291`）；停顿期间没有新窗口 ⇒ 结果躺在通道里。6 次录音全部复现：解出→上屏滞后 2~17.6s，**最后一窗每次都要等松键才上屏**。
-**修法**：`crossbeam::select!` 同时等 `acc_rx` 与 `res_rx`，结果到即收；两处重复的收取代码合并成一个函数。取证 `collab/evidence/20260923-preview-stale/debug-0134.log`
 **问题 2（松键后约 4s 才注入）**：log 里松键→注入仅 4~11ms（`tail_wait=0ms`），**后端无 4s 等待**；须补「按键→主控收到」时延埋点再端测定位。
+**✅ 交付（2026-09-23，coder-1，阶段一·只改代码）**：`main.rs` 路 B 滑窗线程改 `crossbeam_channel::select!`（模块级 `drive_acc_windows`）结果到即收；两份收取合一 `harvest_acc_window!` 宏 ⇒ `push_window(` 该线程仅一处；B 埋点就位（`[LocalRT-DBG-380]`，非钩子路径打 `n/a`）。验证：fmt EXIT 0 / `cargo check --all-targets` 0 error / warnings 98/88 = 基线 / 全量 `cargo test --no-fail-fast` **1547P/0F/31I**（+1 新单测）。取证 `collab/evidence/20260923-preview-stale/debug-0134.log`。**待 tester-1 阶段四回归 + 出包 + Gavin 端测**；本轮未改版本/未 push/未 build release。详见 `CHANGELOG.md` / `progress.md`。
 
 ### 🧊 待观察 · FORCED-ALIGN-372（设想，**未立项**，等 371 端测结果）
 

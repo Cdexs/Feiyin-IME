@@ -73,6 +73,8 @@ use windows::Win32::System::Registry::{
     KEY_WRITE, REG_SZ,
 };
 #[cfg(target_os = "windows")]
+use windows::Win32::System::SystemInformation::GetTickCount64;
+#[cfg(target_os = "windows")]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetFocus, SetActiveWindow, SetFocus, VK_ESCAPE, VK_RETURN,
 };
@@ -306,6 +308,12 @@ static ACC_REFLOW_STATE: Mutex<Option<(u64, String, usize)>> = Mutex::new(None);
 static ACC_REFLOW_ACC: Mutex<Option<(u64, usize, String, bool)>> = Mutex::new(None);
 #[cfg(target_os = "windows")]
 static ACC_REFLOW_BOUND: Mutex<Option<(u64, usize, Option<usize>)>> = Mutex::new(None);
+/// FIX-PREVIEW-HARVEST-380（B）：controller 收到 `HotkeyEvent::Stop` 当刻的
+/// `GetTickCount64()` tick，供 worker 走到 `Injection completed` 时算 `stop_to_inject_ms`
+///（松键 → 最终上屏）。`0` = 本代没有 hotkey stop（如 VAD 自动停），注入完成侧据此不打点。
+/// 每个 session 的 `Start` 复位，避免跨代复用陈旧值。
+#[cfg(target_os = "windows")]
+static STOP_RECEIVED_TICK: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone, Copy)]
 #[cfg(target_os = "windows")]
 struct SendHwnd(isize);
@@ -6677,6 +6685,23 @@ fn process_controller_events(
                     "Controller received hotkey start (translate={})",
                     translate.load(Ordering::Acquire)
                 );
+                // FIX-PREVIEW-HARVEST-380（B）：钩子事件 → 控制器接收的投递时延；并复位本代
+                // stop tick（防跨代陈旧）。take 语义：拿到即清零，非钩子路径拿 0 打 n/a。
+                if log::log_enabled!(log::Level::Debug) {
+                    let hook_tick = platform::take_last_hook_event_tick();
+                    let now = unsafe { GetTickCount64() };
+                    if hook_tick == 0 {
+                        log::debug!(
+                            "[LocalRT-DBG-380] hotkey latency: event=start hook_to_controller_ms=n/a"
+                        );
+                    } else {
+                        log::debug!(
+                            "[LocalRT-DBG-380] hotkey latency: event=start hook_to_controller_ms={}",
+                            (now as u32).wrapping_sub(hook_tick as u32)
+                        );
+                    }
+                }
+                STOP_RECEIVED_TICK.store(0, Ordering::Release);
                 maybe_refresh_settings_child(settings_child, runtime_config);
                 if is_recording.load(Ordering::Acquire) {
                     stop_recording_signal.store(true, Ordering::Release);
@@ -6763,6 +6788,23 @@ fn process_controller_events(
             }
             HotkeyEvent::Stop => {
                 log::info!("Controller received hotkey stop");
+                // FIX-PREVIEW-HARVEST-380（B）：记录 stop tick（供 worker 算 stop→inject），
+                // 并打印钩子事件 → 控制器的投递时延。take 语义：拿到即清零。
+                let stop_now = unsafe { GetTickCount64() };
+                STOP_RECEIVED_TICK.store(stop_now, Ordering::Release);
+                if log::log_enabled!(log::Level::Debug) {
+                    let hook_tick = platform::take_last_hook_event_tick();
+                    if hook_tick == 0 {
+                        log::debug!(
+                            "[LocalRT-DBG-380] hotkey latency: event=stop hook_to_controller_ms=n/a"
+                        );
+                    } else {
+                        log::debug!(
+                            "[LocalRT-DBG-380] hotkey latency: event=stop hook_to_controller_ms={}",
+                            (stop_now as u32).wrapping_sub(hook_tick as u32)
+                        );
+                    }
+                }
                 stop_recording_signal.store(true, Ordering::Release);
                 STREAMING_STOPPED.store(true, Ordering::Release);
                 // OVERLAY-149 (F2): 编辑态按停止热键缺守卫 —— OVERLAY_EDITING 不清则
@@ -8287,14 +8329,81 @@ fn spawn_worker_thread(
                                             let mut rate_sum_chars: usize = 0;
                                             let mut rate_sum_secs: f32 = 0.0;
                                             let mut rate_windows: usize = 0;
-
-                                            for (idx, _committed_len, sub_segs, _seg_streaming) in
-                                                acc_rx
-                                            {
-                                                if cancel_acc.load(Ordering::Acquire) {
-                                                    break;
-                                                }
-                                                for s in &sub_segs {
+                                            // FIX-PREVIEW-HARVEST-380（A）：本代**已处理**的结果数（收尾按 window_seq 等齐）。
+                                            let mut done = 0usize;
+                                            // FIX-PREVIEW-HARVEST-380（A）：结果处理**单一定义** —— select 循环与
+                                            // 收尾 drain 共用，保证该线程内 `push_window(` 只出现一处（防两份再漂移）。
+                                            macro_rules! harvest_acc_window {
+                                                ($res:expr) => {{
+                                                    let (seq, dispatch_idx, r, ms) = $res;
+                                                    total_decode_ms += ms;
+                                                    let text = match r {
+                                                        Ok((t, _np)) => t,
+                                                        Err(err) => {
+                                                            all_native = false;
+                                                            log::warn!(
+                                                                "SLIDING-WINDOW-367 window #{} decode failed: {}",
+                                                                seq,
+                                                                err
+                                                            );
+                                                            String::new()
+                                                        }
+                                                    };
+                                                    // FIX-WINDOW-DISJOINT-369：把该窗的切片区间一并交给 reflow 判重叠
+                                                    // （missing ⇒ 保守当零重叠，拼接保字、不丢）。
+                                                    let (win_ws, win_we) = window_spans
+                                                        .get(seq)
+                                                        .copied()
+                                                        .unwrap_or((seq, seq + 1));
+                                                    // FIX-PREFIX-AND-EAT-371（B）：带上各片样本数 ⇒ 期望重叠
+                                                    // 比例约束对齐 k（missing ⇒ 空表 ⇒ 退化小 k 优先）。
+                                                    let win_samples = window_samples
+                                                        .get(seq)
+                                                        .cloned()
+                                                        .unwrap_or_default();
+                                                    // 375：本窗秒数（供产出率均值）+ 最终字数（计入判据）
+                                                    let win_secs =
+                                                        win_samples.iter().sum::<usize>() as f32
+                                                            / 16000.0;
+                                                    let text_chars = text.chars().count();
+                                                    for authoritative in ordered.push_window(
+                                                        seq, win_ws, win_we, win_samples, text,
+                                                    ) {
+                                                        let _ = acc_event_tx.send(
+                                                            PipelineEvent::PreviewReflow {
+                                                                generation: session_generation,
+                                                                seg_index: dispatch_idx,
+                                                                reflow_seq: Some(reflow_seq),
+                                                                committed_len: 0,
+                                                                has_hole: false,
+                                                                acc_text: authoritative,
+                                                                replace_all: true,
+                                                            },
+                                                        );
+                                                        reflow_seq += 1;
+                                                    }
+                                                    // 375：只把「最终非空」的窗口计入均值
+                                                    // （坍塌→空的窗口不拖低均值；374 剥离后重解出的真内容照常计入）
+                                                    if text_chars > 0 {
+                                                        rate_sum_chars += text_chars;
+                                                        rate_sum_secs += win_secs;
+                                                        rate_windows += 1;
+                                                    }
+                                                    done += 1;
+                                                }};
+                                            }
+                                            // FIX-PREVIEW-HARVEST-380（A）：select 循环 —— 新切片与解码结果
+                                            // **任一先到即处理**，不再等下一个切片（Gavin 现象①：停顿即停刷）。
+                                            let mut step =
+                                                |ev: AccWindowStep<AccSliceMsg, AccDecodeResult>| {
+                                                    match ev {
+                                                        AccWindowStep::Slice((
+                                                            idx,
+                                                            _committed_len,
+                                                            sub_segs,
+                                                            _seg_streaming,
+                                                        )) => {
+                                                            for s in &sub_segs {
                                                     recent_slices.push(s.clone());
                                                 }
                                                 total_slices += sub_segs.len();
@@ -8368,124 +8477,31 @@ fn spawn_worker_thread(
                                                 );
                                                 rr += 1;
                                                 window_seq += 1;
-                                                // 把已完成结果按 seq 有序定稿 + 回灌（replace_all 整段替换）。
-                                                while let Ok((seq, dispatch_idx, r, ms)) =
-                                                    res_rx.try_recv()
-                                                {
-                                                    total_decode_ms += ms;
-                                                    let text = match r {
-                                                        Ok((t, _np)) => t,
-                                                        Err(err) => {
-                                                            all_native = false;
-                                                            log::warn!(
-                                                                "SLIDING-WINDOW-367 window #{} decode failed: {}",
-                                                                seq,
-                                                                err
-                                                            );
-                                                            String::new()
                                                         }
-                                                    };
-                                                    // FIX-WINDOW-DISJOINT-369：把该窗的切片区间一并交给 reflow 判重叠
-                                                    // （missing ⇒ 保守当零重叠，拼接保字、不丢）。
-                                                    let (win_ws, win_we) = window_spans
-                                                        .get(seq)
-                                                        .copied()
-                                                        .unwrap_or((seq, seq + 1));
-                                                    // FIX-PREFIX-AND-EAT-371（B）：带上各片样本数 ⇒ 期望重叠
-                                                    // 比例约束对齐 k（missing ⇒ 空表 ⇒ 退化小 k 优先）。
-                                                    let win_samples = window_samples
-                                                        .get(seq)
-                                                        .cloned()
-                                                        .unwrap_or_default();
-                                                    // 375：本窗秒数（供产出率均值）+ 最终字数（计入判据）
-                                                    let win_secs =
-                                                        win_samples.iter().sum::<usize>() as f32
-                                                            / 16000.0;
-                                                    let text_chars = text.chars().count();
-                                                    for authoritative in ordered.push_window(
-                                                        seq,
-                                                        win_ws,
-                                                        win_we,
-                                                        win_samples,
-                                                        text,
-                                                    ) {
-                                                        let _ = acc_event_tx.send(
-                                                            PipelineEvent::PreviewReflow {
-                                                                generation: session_generation,
-                                                                seg_index: dispatch_idx,
-                                                                reflow_seq: Some(reflow_seq),
-                                                                committed_len: 0,
-                                                                has_hole: false,
-                                                                acc_text: authoritative,
-                                                                replace_all: true,
-                                                            },
-                                                        );
-                                                        reflow_seq += 1;
+                                                        AccWindowStep::Result(res) => {
+                                                            harvest_acc_window!(res)
+                                                        }
                                                     }
-                                                    // 375：只把「最终非空」的窗口计入均值
-                                                    // （坍塌→空的窗口不拖低均值；374 剥离后重解出的真内容照常计入）
-                                                    if text_chars > 0 {
-                                                        rate_sum_chars += text_chars;
-                                                        rate_sum_secs += win_secs;
-                                                        rate_windows += 1;
-                                                    }
-                                                }
-                                            }
+                                                };
+                                            drive_acc_windows(
+                                                &acc_rx,
+                                                &res_rx,
+                                                || cancel_acc.load(Ordering::Acquire),
+                                                &mut step,
+                                            );
+                                            drop(step);
                                             // 收尾：等齐所有在飞窗口（共 window_seq 条）。
+                                            // select 期间已收的已计入 `done`；本段只等还没收的。
                                             drop(task_txs);
-                                            let mut done = 0usize;
                                             while done < window_seq {
-                                                let Ok((seq, dispatch_idx, r, ms)) = res_rx.recv()
-                                                else {
+                                                let Ok(res) = res_rx.recv() else {
                                                     break;
                                                 };
-                                                total_decode_ms += ms;
-                                                let text = match r {
-                                                    Ok((t, _np)) => t,
-                                                    Err(err) => {
-                                                        all_native = false;
-                                                        log::warn!(
-                                                            "SLIDING-WINDOW-367 window #{} decode failed: {}",
-                                                            seq,
-                                                            err
-                                                        );
-                                                        String::new()
-                                                    }
-                                                };
-                                                // FIX-WINDOW-DISJOINT-369：把该窗的切片区间一并交给 reflow 判重叠
-                                                // （missing ⇒ 保守当零重叠，拼接保字、不丢）。
-                                                let (win_ws, win_we) = window_spans
-                                                    .get(seq)
-                                                    .copied()
-                                                    .unwrap_or((seq, seq + 1));
-                                                // FIX-PREFIX-AND-EAT-371（B）：带上各片样本数 ⇒ 期望重叠
-                                                // 比例约束对齐 k（missing ⇒ 空表 ⇒ 退化小 k 优先）。
-                                                let win_samples =
-                                                    window_samples.get(seq).cloned().unwrap_or_default();
-                                                // 🔴 收尾 drain 之后不再有派发 ⇒ 无需再累计产出率
-                                                //（375 的均值只服务于后续窗口的坍塌判据；这里的累计永远没人读）。
-                                                for authoritative in ordered.push_window(
-                                                    seq,
-                                                    win_ws,
-                                                    win_we,
-                                                    win_samples,
-                                                    text,
-                                                ) {
-                                                    let _ = acc_event_tx.send(
-                                                        PipelineEvent::PreviewReflow {
-                                                            generation: session_generation,
-                                                            seg_index: dispatch_idx,
-                                                            reflow_seq: Some(reflow_seq),
-                                                            committed_len: 0,
-                                                            has_hole: false,
-                                                            acc_text: authoritative,
-                                                            replace_all: true,
-                                                        },
-                                                    );
-                                                    reflow_seq += 1;
-                                                }
-                                                done += 1;
+                                                harvest_acc_window!(res);
                                             }
+                                            // 380：收尾 drain 之后不再有派发 ⇒ 产出率均值无人再读（原实现
+                                            // 亦不在 drain 累计）。显式消费，避免 `unused_assignments` 假红。
+                                            let _ = (rate_sum_chars, rate_sum_secs, rate_windows);
                                             let (committed, last_window_text) = ordered.finish();
                                             (committed, last_window_text, all_native, total_decode_ms)
                                         })
@@ -10688,6 +10704,113 @@ mod parallel_acc_298_tests {
     }
 }
 
+/// FIX-PREVIEW-HARVEST-380（A）：accuracy 滑窗线程的切片载荷
+/// `(切片下标, 派发当刻浮层字符数, 本片音频, 本片流式文本)`。
+type AccSliceMsg = (usize, usize, Vec<Vec<f32>>, String);
+
+/// FIX-PREVIEW-HARVEST-380（A）：滑窗解码结果载荷
+/// `(window_seq, dispatch_idx, 解码结果, 解码耗时 ms)`。
+type AccDecodeResult = (usize, usize, anyhow::Result<(String, bool)>, f64);
+
+/// FIX-PREVIEW-HARVEST-380（A）：滑窗线程的一步（新切片 / 解码结果）。
+enum AccWindowStep<A, R> {
+    Slice(A),
+    Result(R),
+}
+
+/// FIX-PREVIEW-HARVEST-380（A）：滑窗线程「结果到即收」驱动器。
+///
+/// 同时等 `acc_rx`（新切片）与 `res_rx`（解码结果），**任一先到即处理**；`acc_rx` 关闭
+///（松键）或 `cancelled()` 为真即返回，由调用方做收尾 drain（复用同一 `step` 闭包）。
+///
+/// 缺陷本体（Gavin 2026-09-23 端测 BUILD-379）：原实现是 `for … in acc_rx` —— 没有新切片时
+/// 不进循环体，已解出的结果要压到下一次切片或松键才回灌（用户停顿 ⇒ 预览不刷新，每次的
+/// 最后一窗都要等松键）。抽成独立函数的唯一目的，是让「结果在 `acc_rx` 仍打开时就被处理」
+/// 这条不变量**可对生产代码单测**（见 `preview_harvest_380_tests`），而不是测一份复制品。
+fn drive_acc_windows<A, R>(
+    acc_rx: &crossbeam_channel::Receiver<A>,
+    res_rx: &crossbeam_channel::Receiver<R>,
+    cancelled: impl Fn() -> bool,
+    step: &mut impl FnMut(AccWindowStep<A, R>),
+) {
+    loop {
+        if cancelled() {
+            break;
+        }
+        crossbeam_channel::select! {
+            recv(acc_rx) -> msg => match msg {
+                Ok(slice) => step(AccWindowStep::Slice(slice)),
+                // 发送端关闭 = 松键 ⇒ 退出，交给收尾 drain 收齐在飞窗口。
+                Err(_) => break,
+            },
+            recv(res_rx) -> msg => match msg {
+                Ok(result) => step(AccWindowStep::Result(result)),
+                // 收尾段之外 res_rx 不该断开（worker 未全部退出前持有发送端）；
+                // 真断开按「不再有结果」处理，避免死循环。
+                Err(_) => break,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod preview_harvest_380_tests {
+    use super::{drive_acc_windows, AccWindowStep};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// FIX-PREVIEW-HARVEST-380（A）：结果必须在 `acc_rx` **仍打开**时就被处理，
+    /// 不得等 `acc_rx` 关闭（旧 `for … in acc_rx` 的缺陷）。
+    ///
+    /// 先后由通道制造、不用 sleep 定时序：先派 1 片、阻塞等它被处理（此时 driver 已回到
+    /// select 等下一件事，`acc_tx` 仍被本测试持有 ⇒ `acc_rx` 恒打开）；再送 1 个结果，
+    /// 它必须在 `acc_tx` 关闭之前被 `step` 消费。若 driver 退回「只在收到切片时才收结果」，
+    /// 第 2 次 `recv` 必然超时 ⇒ 红。`recv_timeout` 仅作挂死兜底，不承担排序职责。
+    #[test]
+    fn drive_acc_windows_harvests_result_while_acc_open() {
+        let (acc_tx, acc_rx) = crossbeam_channel::unbounded::<u32>();
+        let (res_tx, res_rx) = crossbeam_channel::unbounded::<u32>();
+        // step 每处理一步即回执，供测试线程按先后推进。
+        let (step_tx, step_rx) = crossbeam_channel::unbounded::<&'static str>();
+        let seen = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let seen_worker = Arc::clone(&seen);
+
+        let handle = std::thread::spawn(move || {
+            let mut step = |ev: AccWindowStep<u32, u32>| {
+                let tag = match ev {
+                    AccWindowStep::Slice(_) => "slice",
+                    AccWindowStep::Result(_) => "result",
+                };
+                seen_worker.lock().unwrap().push(tag);
+                let _ = step_tx.send(tag);
+            };
+            drive_acc_windows(&acc_rx, &res_rx, || false, &mut step);
+        });
+
+        // 1) 派发 1 窗；阻塞等它被处理（先后由通道制造，非 sleep）。
+        acc_tx.send(0).expect("send slice");
+        assert_eq!(
+            step_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("slice step"),
+            "slice"
+        );
+        // 2) 结果回来 —— 此刻 acc_tx 仍被本测试持有 ⇒ acc_rx 恒打开。
+        res_tx.send(1).expect("send result");
+        assert_eq!(
+            step_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("结果必须在 acc_rx 仍打开时被处理（不得等 acc_rx 关闭）"),
+            "result"
+        );
+        // 关切片通道，driver 退出。
+        drop(acc_tx);
+        drop(res_tx);
+        handle.join().expect("driver thread");
+        assert_eq!(&*seen.lock().unwrap(), &["slice", "result"]);
+    }
+}
+
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 fn run_pipeline_core(
@@ -11061,6 +11184,22 @@ fn run_pipeline_core(
                             log::error!("Injection failed: {}", e);
                         } else {
                             log::info!("Injection completed successfully");
+                            // FIX-PREVIEW-HARVEST-380（B）：松键(stop) → 最终上屏的时延。
+                            // 🔴 run_pipeline_core 是平台中立共享代码，只有 Windows 有该埋点
+                            //（macOS 无 hook tick，结论「不适用」）。
+                            #[cfg(target_os = "windows")]
+                            {
+                                if log::log_enabled!(log::Level::Debug) {
+                                    let stop_tick = STOP_RECEIVED_TICK.load(Ordering::Acquire);
+                                    if stop_tick != 0 {
+                                        log::debug!(
+                                            "[LocalRT-DBG-380] stop_to_inject_ms={}",
+                                            (unsafe { GetTickCount64() } as u32)
+                                                .wrapping_sub(stop_tick as u32)
+                                        );
+                                    }
+                                }
+                            }
                             // WORDBOOK-HITCOUNT-263: 上屏后用**最终文本**记词频（仅使用 hotwords
                             // 的 accuracy 引擎档位：Accuracy / LocalRealtime）。放在注入成功之后，
                             // 不挡输入法延迟；用 final_text 而非 raw_text（常说但常认错的词最该占额度）。

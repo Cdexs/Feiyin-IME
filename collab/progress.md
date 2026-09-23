@@ -1161,3 +1161,12 @@ load_wordbook_vocabulary()
 | 三特殊点 | ① dll 四张三副本全等 + onnxruntime 1.28.2；② itn-rules 三副本全等；③ Publish/models 1.7B 与源逐一 sha256 全等（0.6B 保留） |
 | 探针 | 源码级正 8 符号均 ≥1；二进制正 `SLIDING-WINDOW-367`=4 / `[LocalRT-DBG-298]`=3；🔴 反 `CLEANUP_INSTR_EN`/`CTX_INSTR_EN`/`merge_ctx_timeline`/`CTX_DEFAULT_CHARS`/`ctx_prev1`/`ctx_prev2`/`is_qwen3_language_label` 二进制全 0（源码命中全为注释/PoC/测试护栏） |
 | 端测 | 🔴 **Step1 强杀输入法 ⇒ 请重启后端测**；重点：词条回显不漏进正文 / 预览能刷进 / 出字延迟 / 吃字重复 / 长录音 300s / 不新增 crash.json |
+
+## FIX-PREVIEW-HARVEST-380 · 预览结果到即收 + 松键时延埋点（阶段一·只改代码）· 2026-09-23 · coder-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | `src/main.rs` + `src/platform/windows/hotkey.rs`（+ `platform/mod.rs`/`windows/mod.rs` 两处导出）。**A**：路 B 滑窗线程 `for … in acc_rx` → `crossbeam_channel::select!`（模块级 `drive_acc_windows`），结果**到即收**回灌预览；两份收取合一 `harvest_acc_window!` 宏。**B**：钩子目标键 DOWN/UP tick 埋点 + `[LocalRT-DBG-380]` `hook_to_controller_ms`（非钩子路径 `n/a`）/ `stop_to_inject_ms` |
+| 回归 | root `cargo test --no-fail-fast` **1547P/0F/31I**（EXIT 0；`feiyin-ime` bin **1459P/29I**）；`cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**；warnings **98/88** = 基线 |
+| NEW | +1：`preview_harvest_380_tests::drive_acc_windows_harvests_result_while_acc_open`（通道先后制造「`acc_rx` 未关、结果已到」，非 sleep；退回旧语义必超时） |
+| 端测 | 🔴 待 tester-1 阶段四全量回归 + 出包，再交 Gavin 端测：现象①预览停顿即刷；现象②看 `hook_to_controller_ms`/`stop_to_inject_ms` 定位 4s 来源 |

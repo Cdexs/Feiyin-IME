@@ -77,6 +77,14 @@ static LAST_TARGET_DOWN_TICKS: AtomicU64 = AtomicU64::new(0);
 ///（≤2s）远优于无判据时的永久失灵；两态（TOGGLE_ACTIVE 等）由 B3 收口与
 /// KEYUP 复位保障语义正确，故误吞一次后下一次按压行为自动恢复正常。
 const STALE_DOWN_THRESHOLD_MS: u64 = 2000;
+/// FIX-PREVIEW-HARVEST-380（B）：钩子最近一次看到**目标键**事件的系统 tick
+///（`KBDLLHOOKSTRUCT.time`，毫秒）。controller 收到 Start/Stop 时与 `GetTickCount64()`
+/// 求差 ⇒ `hook_to_controller_ms`（钩子→控制器的事件投递时延）。
+/// 🔴 记**每个**目标键事件（DOWN 与 UP 都记）：PTT 的 Stop 触发于 KEYUP（松键）、
+/// Toggle 的 Stop 触发于第二次 DOWN —— 只记 DOWN 会把「按住时长」计入时延、对 PTT 失真。
+/// 与 `LAST_TARGET_DOWN_TICKS` 分开：后者是陈旧自愈判据（只在 DOWN 路径写），
+/// 本值纯诊断（读写都只 Relaxed 级别），不参与任何判定 ⇒ 零行为影响。
+static LAST_HOOK_EVENT_TICK: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
 struct WakeTarget {
@@ -115,6 +123,14 @@ fn hook_wake_target() -> Option<WakeTarget> {
     let hwnd = HOOK_WAKE_HWND.load(Ordering::Relaxed);
     let message = HOOK_WAKE_MSG.load(Ordering::Relaxed);
     (hwnd != 0 && message != 0).then_some(WakeTarget { hwnd, message })
+}
+
+/// FIX-PREVIEW-HARVEST-380（B）：取走最近一次目标键钩子事件的 tick 并**清零**
+///（take 语义：读取即清，杜绝把上一次按键的陈旧 tick 当本次用）。返回 0 ⇒ 本次事件
+/// 不来自钩子（RegisterHotKey 注册路径 / `poll_ptt_release_thread` 轮询松键都拿不到
+/// `kb.time`），调用方据此打 `n/a`，不得用 0 或陈旧值冒充。
+pub fn take_last_hook_event_tick() -> u64 {
+    LAST_HOOK_EVENT_TICK.swap(0, Ordering::AcqRel)
 }
 
 fn translation_pressed() -> bool {
@@ -207,6 +223,10 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
         let target_vk = TARGET_VK.load(Ordering::Relaxed);
 
         if kb.vkCode == target_vk {
+            // FIX-PREVIEW-HARVEST-380（B）：记录**本事件的**系统 tick（DOWN/UP 都记，
+            // 见 LAST_HOOK_EVENT_TICK 注释）——PTT 的 Stop 在 KEYUP、Toggle 在二次 DOWN，
+            // 两种触发都能取到真正的那次事件。纯诊断，不参与任何判定。
+            LAST_HOOK_EVENT_TICK.store(kb.time as u64, Ordering::Relaxed);
             let msg_type = wparam.0 as u32;
             let mode = TARGET_MODE.load(Ordering::Relaxed);
 

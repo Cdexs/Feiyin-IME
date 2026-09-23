@@ -8,7 +8,10 @@ mod scene;
 
 pub use autolaunch::{disable, enable, is_enabled};
 pub use event_loop::{create_controller_window, destroy_controller_window, run_message_loop};
-pub use hotkey::{notify_config_changed, notify_translate_poll_stop, HotkeyEvent, HotkeyListener};
+pub use hotkey::{
+    notify_config_changed, notify_translate_poll_stop, take_last_hook_event_tick, HotkeyEvent,
+    HotkeyListener,
+};
 pub use injection::{copy_text_to_clipboard, inject_text};
 pub use scene::capture_scene_signals;
 // MACOS-P4-NEUTRAL-001: 新增 re-export，保持既有 use 行逐字不动（Windows 侧纯新增红线）。

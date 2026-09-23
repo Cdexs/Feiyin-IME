@@ -46,3 +46,13 @@
   官方 `transcribe()` 无上下文参数、sherpa 的 hotwords 期望「ASCII 逗号分隔词表」却被我们塞了
   指令句+散文。🔴 **换 Qwen3 后词库偏置是否仍有效，至今无证据**（PoC 音频无词表专名发音点）。
 - 主控逐条 Read 验收通过；fmt/check 复跑干净；全量 test 0 failed（1443P/28I）；warnings 88 = 基线。
+
+## 2026-09-23 — coder-1 — FIX-PREVIEW-HARVEST-380 ✅ 交付（阶段一·只改代码）
+
+- **缺陷**（Gavin BUILD-379 端测）：① 预览中途/尾部已改对却不刷新，停顿数秒也不刷；② 松键后约 4s 才注入。
+- **A（问题①根因）**：`main.rs` 路 B 滑窗线程 `for … in acc_rx` 阻塞等下一片，解码结果只在「下次派发」时才 `try_recv` ⇒ 停顿无新片 ⇒ 结果不回灌（6 次录音解出→上屏滞后 2~17.6s，最后一窗每次等松键）。
+- **A 修法**：模块级 `drive_acc_windows(acc_rx,res_rx,cancelled,&mut step)` 用 `crossbeam_channel::select!` 同时等两通道，**任一先到即处理**；滑窗线程改单个 `step` 闭包；两份收取合并 `harvest_acc_window!` 宏 ⇒ 该线程 `push_window(` 仅一处；`done` 计入 select 已收，收尾只等未收。**未动**切分/对齐/`push_window` 合并规则/`replace_all` 语义/派发（1200ms）/并发/坍塌判据/词表注入/取消语义。
+- **B（问题②定位埋点）**：hotkey.rs 对目标键 **DOWN/UP 都记** `KBDLLHOOKSTRUCT.time`；`take_last_hook_event_tick()` take 语义（读即清，防陈旧）。controller Start/Stop 打 `hook_to_controller_ms`；非钩子路径（RegisterHotKey/`poll_ptt_release_thread`）打 `n/a`（不用 0/陈旧 tick 冒充）。worker `Injection completed` 打 `stop_to_inject_ms`。全部 `log_enabled!(Debug)` 守卫（DEC-077）。B 仅 Windows（macOS 结论：**不适用**，见 `docs/MACOS-HANDOFF.md`）。
+- **单测**：+1 `preview_harvest_380_tests::drive_acc_windows_harvests_result_while_acc_open` —— 用**通道先后**制造「`acc_rx` 未关、结果已到」，断言 step 在 acc 关闭前被调；**非 sleep 定时序**（`recv_timeout` 仅作挂死兜底）；退回旧「只在收切片时收结果」语义必超时。
+- **验证**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**、warnings **98/88** = 基线；全量 `cargo test --no-fail-fast` **1547P/0F/31I**（EXIT 0）；368/369/371/374/375/377 既有单测全绿。numstat：main 257/118、hotkey 20/0、platform/mod 1/1、windows/mod 4/1（-w main 254/115，3 行 whitespace 落改动块内）。
+- **未改版本号 / 未 push / 未 build release / 零凭证**。🔴 实机时延读数交 tester-1/Gavin，未声称已验证。

@@ -75,7 +75,7 @@ pub use windows::{
     capture_scene_signals, capture_scene_signals_by_id, copy_text_to_clipboard,
     create_controller_window, destroy_controller_window, disable, enable, foreground_window_id,
     inject_text, is_enabled, notify_config_changed, notify_translate_poll_stop, run_message_loop,
-    HotkeyEvent, HotkeyListener,
+    take_last_hook_event_tick, HotkeyEvent, HotkeyListener,
 };
 
 #[cfg(target_os = "macos")]

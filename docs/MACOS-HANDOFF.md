@@ -2115,3 +2115,13 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 常量：`SHADOW_TAIL_PAD_MS=500`（shadow 每 400ms 可能跑，取小；实测 500ms 已出字、decode 22~30ms）、`FLUSH_TAIL_PAD_MS=2000`（只跑一次，全覆盖 337 实测最大滞后 1840ms）；**endpoint 整句重解码不改**（那段 PCM 由 rule2=2.0s 静默触发、末尾本就带足静音，补了白补） | ✅ 平台中立；理由写入代码注释 |
 | 机制：模型 500ms 块 × 250ms 步进需「未来音频」定末字；说完戛然而止 ⇒ 缺料 ⇒ 末字压在模型里，等下一句音频才吐出。补静音即补料 | ✅ 同模型同结论 |
 | macOS 侧需要做什么 | ✅ **无需代码改动**；未新增 `#[cfg]`、未新增用户开关/env（DEC-031）、未触 `src/platform/**` |
+
+## FIX-PREVIEW-HARVEST-380（2026-09-23，coder-1）· 预览结果到即收 + 松键时延埋点 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| A：`main.rs` 路 B 滑窗线程 `for … in acc_rx` → `drive_acc_windows`（`crossbeam_channel::select!`）+ `harvest_acc_window!` 宏；解码结果**到即收**、不等下一个切片 | ✅ **行为变更，平台中立**：`main.rs` 该段无 `#[cfg]`，macOS 编译同一代码 ⇒ 同继承「停顿即刷预览」；`push_window`/`replace_all`/派发规则**未动** |
+| B：钩子事件 tick（`KBDLLHOOKSTRUCT.time`）+ `[LocalRT-DBG-380]` `hook_to_controller_ms` / `stop_to_inject_ms` | ❌ **不适用**：`take_last_hook_event_tick` 只存在于 `platform/windows/hotkey.rs`，仅在 Windows-only 的 `process_controller_events` 调用；`stop_to_inject` 埋点以 `#[cfg(target_os = "windows")]` 包裹 ⇒ macOS 侧零影响、**未新增 macOS stub** |
+| `src/platform/mod.rs` 仅 Windows 导出清单新增 `take_last_hook_event_tick`（macOS 清单未动） | ⚠️ 平台中立文件、两侧共用；该符号**不被平台中立代码引用**（故 macOS 无需 stub），若 macOS 侧有基于导出清单的对照检查知悉即可 |
+| 新增单测 `preview_harvest_380_tests::drive_acc_windows_harvests_result_while_acc_open` | ✅ 平台中立、无 `#[cfg]`；macOS 同跑 |
+| macOS 侧需要做什么 | ✅ **无需代码改动**；未新增用户开关/env（DEC-031）、未触 `src/platform/macos/**` |
