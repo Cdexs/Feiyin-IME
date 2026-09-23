@@ -8638,9 +8638,10 @@ fn spawn_worker_thread(
                                                             );
                                                             pending_slice = plan.pending;
                                                             let mut wi = 0usize;
-                                                            for (_k, s) in sub_segs.into_iter().enumerate() {
+                                                            for (k, s) in sub_segs.into_iter().enumerate() {
                                                                 recent_slices.push(s);
-                                                                recent_streaming.push(seg_streaming.clone());
+                                                                recent_streaming
+                                                                    .push(slice_streaming_text(k, &seg_streaming));
                                                                 total_slices += 1;
                                                                 while recent_slices.len()
                                                                     > transcription::WINDOW_MAX_SLICES
@@ -11113,6 +11114,18 @@ mod preview_harvest_380_tests {
 
 /// FIX-TAIL-WINDOW-AND-FALLBACK-386（C）：窗口文本选择 —— 解码文本为空（含解码 Err）⇒ 用**本窗流式文本**
 /// 兜底；流式也为空才保持空。防结尾整段丢失（本次 seq7 `<location>` 丢 40+ 字）。纯函数，可单测。
+/// 386 主控验收补：一次派发切成多片时，该派发的流式文本只记在**第一片**上，其余片记空。
+/// `seg_streaming` 是整次派发的流式文本；若每片都存一份，含同次派发两片的窗口（如收尾
+/// `[大片, 短尾]` 合并窗）解码失败时，兜底文本会把整段拼两遍 ⇒ 最终文本重复。
+/// 只记第一片不丢内容：第一片所在的窗口已带上整段文本。
+fn slice_streaming_text(k: usize, seg_streaming: &str) -> String {
+    if k == 0 {
+        seg_streaming.to_string()
+    } else {
+        String::new()
+    }
+}
+
 fn window_text_with_fallback(decoded: &str, streaming: &str) -> String {
     if decoded.is_empty() {
         streaming.to_string()
@@ -11331,6 +11344,21 @@ mod plan_windows_386_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod slice_streaming_386_review_tests {
+    use super::{slice_streaming_text, window_text_with_fallback};
+
+    /// 同次派发切 2 片、收尾合并窗 [大片, 短尾] 解码失败 ⇒ 兜底文本只出现一次（不重复）。
+    #[test]
+    fn merged_window_fallback_not_duplicated() {
+        let seg = "如果有机会开这个会我们都会好好把握";
+        let per_slice: Vec<String> = (0..2).map(|k| slice_streaming_text(k, seg)).collect();
+        let window_fallback = per_slice.concat();
+        assert_eq!(window_text_with_fallback("", &window_fallback), seg);
+        assert_eq!(slice_streaming_text(1, seg), "");
     }
 }
 
