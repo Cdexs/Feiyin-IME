@@ -2184,3 +2184,14 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | C：窗口解码 Err/空 ⇒ `window_text_with_fallback` 用本窗流式文本兜底 | ✅ 平台中立（`main.rs` 无 `cfg`），macOS 同继承 |
 | 新增单测 `plan_windows_386_tests`(8) / `fix386_tests`(2) | ✅ 平台中立、无 `#[cfg]`；macOS 同跑 |
 | macOS 侧需要做什么 | ✅ **无需代码改动**；未新增用户开关/env（DEC-031）、未触 `src/platform/macos/**`、未改构建脚本/依赖 |
+
+## FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388（2026-09-23，coder-1）· 解码前剪静音 + 重解产出率 + 冷启动下限 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| A1：`vad.rs` **只新增** `LOCALRT_TRIM_PAD_SECS` / `VadSegmenter::try_new_for_local_trim` / `VadSegmenter::speech_ranges`（旧构造/常量不动） | ✅ 平台中立（`vad.rs` 无 `cfg`）；macOS 编译同一代码、同可用 |
+| A2：`transcription/mod.rs` 的 `transcribe_acc_ctx` 开头用**线程级** VAD 缓存（`thread_local!`）剪静音；`trim_to_speech` 纯函数 | ✅ **行为变更，平台中立**：只服务本地 realtime（`transcribe_acc_ctx` 的生产调用方仅滑窗）；macOS 同继承「解码前剪静音」。未新增用户开关/env（DEC-031） |
+| D1：`apply_acc_disposition` 首解判据改 `has_content`（覆盖 `**`）；重解后**所有 kind** 统一查 `output_rate_ok` | ✅ 平台中立纯逻辑；**契约变更**（连带更新 4 条既有单测期望，见 main.rs/logs） |
+| D2：`output_rate_ok` 冷启动下限（`COLD_MIN_AUDIO_SECS=3.0` / `COLD_MIN_CHARS_PER_SEC=1.0`） | ✅ 平台中立；**契约变更**（`None`/`NaN`/`0.0`/`±inf` 一律按无均值、`<3s` 不判） |
+| 新增单测 `fix388_trim_and_floor_tests`（含 `#[ignore]` 真模型） | ✅ 平台中立、无 `#[cfg]`；macOS 同跑（`#[ignore]` 默认不跑） |
+| macOS 侧需要做什么 | ✅ **无需代码改动**；未新增用户开关/env（DEC-031）、未触 `src/platform/macos/**`、未改构建脚本/依赖 |

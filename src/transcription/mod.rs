@@ -361,6 +361,14 @@ pub(crate) const COLLAPSE_MIN_EXPECTED_CHARS: f32 = 8.0;
 /// 产出率均值至少由这么多个「已接受窗口」支撑才可用（否则视为冷启动、不判坍塌）。
 pub(crate) const COLLAPSE_MIN_AVG_WINDOWS: usize = 2;
 
+/// FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388（D2）：**冷启动坍塌下限**的音频时长门槛（秒）。
+///
+/// 冷启动（无均值样本）时不再一律放行：音频 ≥ 本值且字/秒 < [`COLD_MIN_CHARS_PER_SEC`] ⇒ 判坍塌。
+/// 依据：BUILD-387 seq1 6.85s 只出 6 字（0.88 字/s）因冷启动放行 ⇒ 内容丢失。
+pub(crate) const COLD_MIN_AUDIO_SECS: f32 = 3.0;
+/// FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388（D2）：冷启动最低产出率（字/秒）。
+pub(crate) const COLD_MIN_CHARS_PER_SEC: f32 = 1.0;
+
 /// FIX-PREVIEW-STALE-AND-COLLAPSE-375（B）：本窗产出率是否**合理**（不坍塌）。
 ///
 /// `真` ⇒ 正常/无法判定；`假` ⇒ 判为坍塌（调用方走重解阶梯）。
@@ -372,7 +380,13 @@ pub(crate) fn output_rate_ok(
     avg_chars_per_sec: Option<f32>,
 ) -> bool {
     let Some(avg) = avg_chars_per_sec.filter(|a| a.is_finite() && *a > 0.0) else {
-        return true; // 冷启动：均值样本不足 ⇒ 不判
+        // FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388（D2）：冷启动**不再一律放行** ——
+        // 音频 ≥ COLD_MIN_AUDIO_SECS 且字/秒 < COLD_MIN_CHARS_PER_SEC ⇒ 判坍塌（长音频产出过低）。
+        // 短于门槛 / 无音频时长 ⇒ 仍不判（宁漏勿误杀）。
+        if audio_secs >= COLD_MIN_AUDIO_SECS {
+            return (out_chars as f32) / audio_secs >= COLD_MIN_CHARS_PER_SEC;
+        }
+        return true;
     };
     if !(audio_secs > 0.0) {
         return true;
@@ -443,9 +457,12 @@ pub(crate) struct AccDispositionOutcome {
     pub invalid: bool,
 }
 
-/// FIX-ACC-OUTPUT-GUARD-387：文本是否**只剩标点/空白**（`align_keep_char` 全为假）。
-fn is_only_punct(text: &str) -> bool {
-    !text.chars().any(align_keep_char)
+/// FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388（D1）：文本是否**含实质内容** —— 至少 1 个
+/// `char::is_alphanumeric()`（CJK 也算）。`**`、`。`、`…`、空白、空串 ⇒ `false`。
+///
+/// 取代 387 的 `is_only_punct`（后者按 `align_keep_char` 判，`**` 之类会被当成「有内容」而漏过）。
+fn has_content(text: &str) -> bool {
+    text.chars().any(|c| c.is_alphanumeric())
 }
 
 /// FIX-ACC-OUTPUT-GUARD-387：剥掉结果里的**标签** `<[A-Za-z_/][^<>]{0,30}>`（如 `<location>`）。
@@ -548,7 +565,8 @@ fn apply_acc_disposition(
         None => (after_tags, 0usize, 0usize),
     };
     let remaining_chars = stripped.chars().count();
-    let only_punct = is_only_punct(&stripped);
+    // 388-D1：无实质内容（`**`/标点/空白/空）才触发；取代 387 的 `is_only_punct`（漏 `**`）。
+    let no_content = !has_content(&stripped);
     // 387-2：残余**全部由词表条目构成** ⇒ 视同回显。
     let residual_all_terms =
         !stripped.trim().is_empty() && all_segments_are_terms(&stripped, terms);
@@ -566,9 +584,9 @@ fn apply_acc_disposition(
 
     let trigger = if echo_hit {
         Some(GuardKind::Echo)
-    } else if had_tag && only_punct {
+    } else if had_tag && no_content {
         Some(GuardKind::Tag)
-    } else if only_punct {
+    } else if no_content {
         Some(GuardKind::Empty)
     } else if !output_rate_ok(remaining_chars, audio_secs, avg_chars_per_sec) {
         Some(GuardKind::Collapse)
@@ -590,13 +608,12 @@ fn apply_acc_disposition(
         Some(h) => h.stripped,
         None => re_tags,
     };
-    // 校验：非空 + 无连续 ≥4 条回显 +（非坍塌触发或产出率通过）。
+    // 校验（388-D1：**所有 kind 统一**）：含实质内容 + 无连续 ≥4 条回显 + 产出率通过。
+    // 旧实现只对 Collapse 查产出率 ⇒ 11.6s 重解出「嗯。」也被收下；且 `!is_only_punct` 漏 `**`。
     let still_echo = strip_terms_echo(&recovered, terms).is_some();
-    // 主控验收补：只剩标点（如重解只出「。」）也判无效 ⇒ 交 386-C 流式兜底，不许把空内容当正文收下。
-    let acceptable = !is_only_punct(&recovered)
+    let acceptable = has_content(&recovered)
         && !still_echo
-        && (kind != GuardKind::Collapse
-            || output_rate_ok(recovered.chars().count(), audio_secs, avg_chars_per_sec));
+        && output_rate_ok(recovered.chars().count(), audio_secs, avg_chars_per_sec);
     if acceptable {
         (recovered, outcome)
     } else {
@@ -732,6 +749,23 @@ fn decode_accuracy_once(
     system: Option<&str>,
     script: ChineseScript,
 ) -> Result<String> {
+    let text = decode_accuracy_allow_empty(recognizer, samples, system, script)?;
+    if text.is_empty() {
+        // 与 transcribe_segment_detailed 一致：accuracy 空输出 ⇒ 该段失败（上层 all_native=false）
+        anyhow::bail!("ASR accuracy model produced empty output");
+    }
+    Ok(text)
+}
+
+/// 388 主控验收补：同 [`decode_accuracy_once`]，但空输出返回 `Ok("")` 而不是报错。
+/// 供 `transcribe_acc_ctx` 首解使用：空输出必须进入 `apply_acc_disposition` 的 Empty 判据
+///（不带注入重解一次，387-D4 / 388-D1），否则 `?` 提前返回、重解永不发生。
+fn decode_accuracy_allow_empty(
+    recognizer: &sherpa_onnx::OfflineRecognizer,
+    samples: &[f32],
+    system: Option<&str>,
+    script: ChineseScript,
+) -> Result<String> {
     let stream = recognizer.create_stream();
     if let Some(s) = system {
         stream.set_option("hotwords", s);
@@ -741,8 +775,7 @@ fn decode_accuracy_once(
     let result = stream.get_result().context("No transcription result")?;
     let text = Transcriber::strip_asr_special_tokens(result.text.trim());
     if text.is_empty() {
-        // 与 transcribe_segment_detailed 一致：accuracy 空输出 ⇒ 该段失败（上层 all_native=false）
-        anyhow::bail!("ASR accuracy model produced empty output");
+        return Ok(String::new());
     }
     Ok(text_normalizer::normalize_text_for_language(&text, script))
 }
@@ -757,6 +790,49 @@ pub(crate) fn transcribe_accuracy_segment(
     decode_accuracy_once(recognizer, samples, None, script).map(|t| (t, true))
 }
 
+// ===========================================================================
+// FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388（A）：解码前剪静音（只本地 realtime 走本函数）
+// ===========================================================================
+
+thread_local! {
+    /// FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388：解码线程级 VAD 缓存（按 `model_dir` 懒建一次，
+    /// 失败**记住不重试**）。外层 `Option` = 是否已尝试；内层 `Option` = 是否可用（`None` ⇒ 原样不剪）。
+    static LOCALRT_TRIM_VAD: std::cell::RefCell<Option<Option<VadSegmenter>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388（A2）：纯函数 —— 每个语音区间两侧各扩 `pad` 样本
+///（clamp 到 `[0, audio.len())`），重叠/相接的**合并**，再按序拼接。
+///
+/// ⇒ 首尾静音剩 ≤`pad`；段间停顿 ≤`2×pad` 原样保留（被合并）、`>2×pad` 压到 `2×pad`。
+fn trim_to_speech(audio: &[f32], ranges: &[(usize, usize)], pad: usize) -> Vec<f32> {
+    if ranges.is_empty() || audio.is_empty() {
+        return Vec::new();
+    }
+    let len = audio.len();
+    let mut spans: Vec<(usize, usize)> = ranges
+        .iter()
+        .map(|&(s, e)| (s.saturating_sub(pad), e.saturating_add(pad).min(len)))
+        .filter(|&(s, e)| e > s)
+        .collect();
+    spans.sort_by_key(|&(s, _)| s);
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in spans {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1 {
+                last.1 = last.1.max(e);
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+    let mut out = Vec::with_capacity(merged.iter().map(|(s, e)| e - s).sum());
+    for (s, e) in merged {
+        out.extend_from_slice(&audio[s..e]);
+    }
+    out
+}
+
 /// LOCALRT-CTX-INJECT-320：带「上下文 + 词库」per-stream 注入 + 长跨回显护栏的 accuracy 单段解码。
 ///
 /// - `context`：前序分片累计文本（调用方已截到最后 300 字；第 1 片传 None）。
@@ -769,12 +845,59 @@ pub(crate) fn transcribe_acc_ctx(
     seg_idx: usize,
     inject: CtxInject<'_>,
 ) -> Result<(String, bool)> {
+    // FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388（A）：解码前剪静音（本地 realtime 专用）。
+    // 根因：sherpa #3509 —— 带 hotwords 的 Qwen3-ASR 遇静音会吐热词/坍塌；派发片把「上句说完到
+    // 本句开口」的长停顿全带进窗口 ⇒ 大量静音 + 少量语音。先 VAD 取语音区间、每侧留 200ms。
+    let in_secs = samples.len() as f32 / 16000.0;
+    let pad = (vad::LOCALRT_TRIM_PAD_SECS * 16000.0) as usize;
+    let trim_model_dir = model_dir();
+    let (samples_used, trimmed, n_ranges) = LOCALRT_TRIM_VAD.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(VadSegmenter::try_new_for_local_trim(&trim_model_dir));
+        }
+        match slot.as_ref().and_then(|o| o.as_ref()) {
+            Some(vseg) => {
+                let ranges = vseg.speech_ranges(samples);
+                if ranges.is_empty() {
+                    (Vec::new(), true, 0usize)
+                } else {
+                    (trim_to_speech(samples, &ranges, pad), true, ranges.len())
+                }
+            }
+            None => (samples.to_vec(), false, 0usize),
+        }
+    });
+    if trimmed && n_ranges == 0 {
+        // 整窗无语音 ⇒ 空解码（交 386-C 流式兜底），**不**进模型（避免念词表 / 失败日志刷屏）。
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "[LocalRT-DBG-388] trim: seg={} in={:.2}s out=0.00s ranges=0 vad=true",
+                seg_idx,
+                in_secs
+            );
+        }
+        return Ok((String::new(), true));
+    }
+    // 后续（首解 / 产出率 / 重解）一律用剪静音后的 `samples`（shadow 原参数）。
+    let samples: &[f32] = &samples_used;
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "[LocalRT-DBG-388] trim: seg={} in={:.2}s out={:.2}s ranges={} vad={}",
+            seg_idx,
+            in_secs,
+            samples.len() as f32 / 16000.0,
+            n_ranges,
+            trimmed
+        );
+    }
     // FIX-INJECT-TO-SPEC-377：注入内容**只剩纯词表**（见 `build_ctx_system`）。
     // 「英文指令句 ×2 + `Context:` 散文 + `Terms:` 标签」已全部删除 ⇒ 无 ctx 概念、ctx 回显护栏不再参与。
     let terms_len = inject.terms.map(|s| s.chars().count()).unwrap_or(0);
     let system = build_ctx_system(inject.terms);
     let inject_on = should_inject_ctx(system.as_deref());
-    let text = decode_accuracy_once(
+    // 388 主控验收补：首解用 allow_empty ⇒ 空输出也进入 Empty 判据（不带注入重解一次）。
+    let text = decode_accuracy_allow_empty(
         recognizer,
         samples,
         system.as_deref().filter(|_| inject_on),
@@ -5140,7 +5263,10 @@ mod fix374_terms_echo_tests {
             Ok("可以看看周边的风景。".to_string())
         });
         assert_eq!(calls.get(), 1, "387：命中回显必须重解一次（不保留残余）");
-        assert_eq!(out, "可以看看周边的风景。", "用重解结果（残余已清）");
+        // 【388 契约变更 · D1】重解后**所有 kind** 统一查产出率：
+        // old：收下「可以看看周边的风景。」(10 字)；new：10 字/11.8s < avg4.4/3(≈1.47 字/s) ⇒ invalid 空串。
+        assert_eq!(out, "", "D1：重解产出率不足 ⇒ invalid 空串（old：10 字）");
+        assert!(oc.invalid, "D1：invalid 置位（old：false）");
         assert_eq!(oc.matched_terms, 9);
         assert!(oc.redecoded);
     }
@@ -5155,7 +5281,9 @@ mod fix374_terms_echo_tests {
                 Ok("这是被回显掩盖的真实转写内容".to_string())
             });
         assert_eq!(calls.get(), 1, "重解**至多一次**");
-        assert_eq!(out, "这是被回显掩盖的真实转写内容", "用重解结果");
+        // 【388 契约变更 · D1】old：收下 14 字；new：14 字/11.8s < avg4.4/3 ⇒ invalid 空串。
+        assert_eq!(out, "", "D1：重解产出率不足 ⇒ invalid 空串（old：14 字）");
+        assert!(oc.invalid, "D1：invalid 置位（old：false）");
         assert!(oc.redecoded);
         assert_eq!(oc.remaining_chars, 0, "剥完为空");
         assert_eq!(oc.matched_terms, 9);
@@ -5235,15 +5363,30 @@ mod fix375_collapse_tests {
     /// 冷启动 / 期望产出过少 ⇒ 一律判「正常」（宁漏勿误杀）。
     #[test]
     fn rate_ok_cold_start_and_tiny_expectation_always_ok() {
-        assert!(output_rate_ok(0, SECS, None), "无均值 ⇒ 不判");
-        assert!(output_rate_ok(0, SECS, Some(f32::NAN)), "非有限 ⇒ 不判");
-        assert!(output_rate_ok(0, SECS, Some(0.0)), "非正 ⇒ 不判");
+        // 【388 契约变更 · D2 冷启动下限】old：无均值一律 true；
+        // new：无均值 + 音频 ≥ COLD_MIN_AUDIO_SECS(3.0) + 字/秒 < COLD_MIN_CHARS_PER_SEC(1.0) ⇒ 坍塌。
+        assert!(
+            !output_rate_ok(0, SECS, None),
+            "D2：无均值长音频（0 字/10.4s）⇒ 坍塌（old：true）"
+        );
+        assert!(
+            !output_rate_ok(0, SECS, Some(f32::NAN)),
+            "D2：非有限均值按无均值处理 ⇒ 坍塌（old：true）"
+        );
+        assert!(
+            !output_rate_ok(0, SECS, Some(0.0)),
+            "D2：非正均值按无均值处理 ⇒ 坍塌（old：true）"
+        );
         assert!(output_rate_ok(0, 0.0, Some(AVG)), "无音频 ⇒ 不判");
         // 期望产出 < COLLAPSE_MIN_EXPECTED_CHARS(8)：avg 4.4 × 1.0s = 4.4 < 8 ⇒ 即使 0 字也放行
         assert!(
             output_rate_ok(0, 1.0, Some(AVG)),
             "短窗（期望产出太少）⇒ 不判"
         );
+        // D2 边界：短于门槛（<3s）不判；恰 3s 时 1 字/s（含等号）判 ok、低于则坍塌。
+        assert!(output_rate_ok(0, 2.9, None), "D2：<3s 不判");
+        assert!(output_rate_ok(3, 3.0, None), "D2：恰 3s、恰 1 字/s ⇒ ok");
+        assert!(!output_rate_ok(2, 3.0, None), "D2：恰 3s、0.67 字/s ⇒ 坍塌");
     }
 
     /// 🔴 坍塌窗必须被抓、正常窗不得误判（含边界：恰为均值 1/3）。
@@ -5367,9 +5510,13 @@ mod fix387_output_guard_tests {
             Ok("可以看看周边的风景。".to_string())
         });
         assert_eq!(calls.get(), 1);
-        assert_eq!(out, "可以看看周边的风景。");
+        // 【388 契约变更 · D1】old：收下 10 字；new：10 字/11.8s < avg4.4/3 ⇒ invalid 空串。
+        assert_eq!(out, "", "D1：产出率不足 ⇒ 空串（old：收下）");
         assert_eq!(oc.guard, GuardKind::Echo);
-        assert!(oc.redecoded && !oc.invalid);
+        assert!(
+            oc.redecoded && oc.invalid,
+            "D1：invalid 置位（old：!invalid）"
+        );
     }
 
     /// 残余**全部由词表条目构成**（如落单的 `维生素b12`）⇒ 视同回显、重解；
@@ -5427,7 +5574,9 @@ mod fix387_output_guard_tests {
             Ok("真实内容".to_string())
         });
         assert_eq!(calls.get(), 1);
-        assert_eq!(out, "真实内容");
+        // 【388 契约变更 · D1+D2】old：收下「真实内容」(4 字)；new：4 字/5.0s = 0.8 字/s < 1 ⇒ invalid 空串。
+        assert_eq!(out, "", "D1/D2：产出率不足 ⇒ 空串（old：收下 4 字）");
+        assert!(oc.invalid, "D1：invalid 置位（old：false）");
         assert_eq!(oc.guard, GuardKind::Empty);
     }
 
@@ -5465,6 +5614,222 @@ mod guard387_review_tests {
         assert!(oc.redecoded);
         assert!(oc.invalid, "重解只剩标点必须判无效");
         assert_eq!(out, "");
+    }
+}
+
+// ============================================================
+// FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388（阶段一）：剪静音 / has_content / 重解产出率 / 冷启动下限
+// ============================================================
+#[cfg(test)]
+mod fix388_trim_and_floor_tests {
+    use super::{
+        apply_acc_disposition, has_content, output_rate_ok, trim_to_speech, COLD_MIN_AUDIO_SECS,
+        COLD_MIN_CHARS_PER_SEC,
+    };
+
+    const RATE: usize = 16000;
+
+    /// 测 #1a：首尾静音剪到 200ms（`pad`）。
+    #[test]
+    fn trim388_head_tail_to_pad() {
+        let pad = (0.2 * RATE as f32) as usize;
+        let mut audio = vec![0.0f32; 3 * RATE];
+        for x in &mut audio[RATE..2 * RATE] {
+            *x = 0.5;
+        }
+        let out = trim_to_speech(&audio, &[(RATE, 2 * RATE)], pad);
+        assert_eq!(out.len(), RATE + 2 * pad, "语音 1s + 两侧各 200ms");
+        assert!(out[..pad].iter().all(|&x| x == 0.0), "头部静音 = pad");
+        assert_eq!(out[pad], 0.5, "语音起点紧接 pad");
+        assert!(
+            out[out.len() - pad..].iter().all(|&x| x == 0.0),
+            "尾部静音 = pad"
+        );
+    }
+
+    /// 测 #1b：段间 300ms 停顿**原样保留**（被合并）；段间 3s 停顿**压到 400ms**。
+    #[test]
+    fn trim388_gap_keep_small_compress_large() {
+        let pad = (0.2 * RATE as f32) as usize;
+        let speech = RATE; // 1s
+                           // -- 300ms 间隔 --
+        let gap300 = 300 * 16;
+        let mut a = vec![0.0f32; pad + speech + gap300 + speech + pad];
+        for x in &mut a[pad..pad + speech] {
+            *x = 0.5;
+        }
+        let s2 = pad + speech + gap300;
+        for x in &mut a[s2..s2 + speech] {
+            *x = 0.5;
+        }
+        let out = trim_to_speech(&a, &[(pad, pad + speech), (s2, s2 + speech)], pad);
+        assert_eq!(
+            out.len(),
+            2 * speech + gap300 + 2 * pad,
+            "300ms ≤ 2×pad(400ms) ⇒ 停顿原样保留（合并）"
+        );
+        // -- 3s 间隔 --
+        let gap3s = 3000 * 16;
+        let mut b = vec![0.0f32; pad + speech + gap3s + speech + pad];
+        for x in &mut b[pad..pad + speech] {
+            *x = 0.5;
+        }
+        let t2 = pad + speech + gap3s;
+        for x in &mut b[t2..t2 + speech] {
+            *x = 0.5;
+        }
+        let out2 = trim_to_speech(&b, &[(pad, pad + speech), (t2, t2 + speech)], pad);
+        assert_eq!(
+            out2.len(),
+            2 * (speech + 2 * pad),
+            "3s > 400ms ⇒ 停顿压到 2×pad(400ms)"
+        );
+        // 压缩后的中间静音恰为 2×pad 个 0（block1 尾 pad + block2 头 pad）。
+        let boundary = speech + 2 * pad;
+        assert!(
+            out2[boundary - pad..boundary + pad]
+                .iter()
+                .all(|&x| x == 0.0),
+            "压缩后中间静音 = 2×pad"
+        );
+        assert_eq!(out2[boundary - pad - 1], 0.5, "压缩前是语音");
+        assert_eq!(out2[boundary + pad], 0.5, "压缩后是语音");
+    }
+
+    /// 测 #1c：区间越界 clamp；空区间 / 空音频 / 倒置区间 ⇒ 空。
+    #[test]
+    fn trim388_bounds_and_empty() {
+        let pad = 100usize;
+        let audio = vec![0.5f32; 1000];
+        let out = trim_to_speech(&audio, &[(0, 5000)], pad);
+        assert_eq!(out.len(), 1000, "end 越界 ⇒ clamp 到 len（无尾 pad 空间）");
+        assert!(
+            trim_to_speech(&audio, &[(2000, 3000)], pad).is_empty(),
+            "start 越界 ⇒ 整段落在 len 外 ⇒ 丢弃"
+        );
+        assert!(trim_to_speech(&audio, &[], pad).is_empty(), "空区间 ⇒ 空");
+        assert!(
+            trim_to_speech(&[], &[(0, 10)], pad).is_empty(),
+            "空音频 ⇒ 空"
+        );
+        assert!(
+            trim_to_speech(&audio, &[(500, 100)], pad).is_empty(),
+            "倒置区间 ⇒ 空"
+        );
+    }
+
+    /// 测 #2：整窗无语音 ⇒ 纯判定返回空；`transcribe_acc_ctx` 的 `n_ranges==0` 早退必须在
+    /// **首次解码之前**（源码级护栏：无语音不调用解码即返回空）。
+    #[test]
+    fn trim388_no_speech_returns_empty_before_decode() {
+        assert!(trim_to_speech(&[0.0f32; 100], &[], 100).is_empty());
+        let src = include_str!("mod.rs");
+        let body = src
+            .split("pub(crate) fn transcribe_acc_ctx(")
+            .nth(1)
+            .expect("transcribe_acc_ctx 必须存在");
+        let early = body
+            .find("if trimmed && n_ranges == 0")
+            .expect("无语音早退锚点缺失");
+        let ret = body[early..]
+            .find("return Ok((String::new(), true));")
+            .expect("无语音早退返回缺失");
+        // 388 主控验收补：首解改为 `decode_accuracy_allow_empty(`（空输出进 Empty 判据）；不变量不变。
+        let decode = body
+            .find("decode_accuracy_allow_empty(")
+            .expect("首解调用缺失");
+        assert!(
+            early < decode && early + ret < decode,
+            "无语音早退必须早于首次解码"
+        );
+    }
+
+    /// 测 #3：`has_content` —— `**`/`。`/`…`/空白/空 ⇒ false；`嗯`/`a`/`3` ⇒ true。
+    #[test]
+    fn has_content388_semantics() {
+        for t in ["", "**", "。", "…", "  ", "。。**……"] {
+            assert!(!has_content(t), "应判无内容：{t:?}");
+        }
+        for t in ["嗯", "a", "3", "维生素b12", "嗯。"] {
+            assert!(has_content(t), "应判有内容：{t:?}");
+        }
+    }
+
+    /// 测 #4（D1）：重解出「嗯。」（11.6s、avg 2.0）⇒ invalid 空串；重解出 48 字 ⇒ 收下。
+    #[test]
+    fn floor388_redecode_short_invalid_long_kept() {
+        let (out, oc) = apply_acc_disposition(
+            "上一下文传路的".to_string(),
+            None,
+            11.6,
+            Some(2.0),
+            || Ok("嗯。".to_string()),
+        );
+        assert!(oc.redecoded, "产出率不足 ⇒ 触发重解");
+        assert!(oc.invalid, "重解过短 ⇒ invalid");
+        assert_eq!(out, "", "invalid ⇒ 空串");
+        // 48 字 / 11.6s / avg 2.0：阈值 = 2.0×11.6/3 ≈ 7.73 ⇒ 48 字过门。
+        let long48: String = std::iter::repeat("内容").take(24).collect();
+        assert_eq!(long48.chars().count(), 48);
+        let (out2, oc2) = apply_acc_disposition(
+            "上一下文传路的".to_string(),
+            None,
+            11.6,
+            Some(2.0),
+            || Ok(long48.clone()),
+        );
+        assert!(!oc2.invalid, "48 字应过产出率");
+        assert_eq!(out2, long48);
+    }
+
+    /// 测 #5（D2）：冷启动 6.85s 出 6 字 ⇒ 不 ok；2s 出 1 字（<3s 门槛）⇒ ok。
+    #[test]
+    fn floor388_cold_start_floor() {
+        assert!(
+            !output_rate_ok(6, 6.85, None),
+            "6.85s/6 字（0.876/s）⇒ 坍塌（BUILD-387 seq1 现场）"
+        );
+        assert!(output_rate_ok(1, 2.0, None), "2s/1 字：短于门槛 ⇒ ok");
+        assert!(
+            output_rate_ok(3, 3.0, None),
+            "恰门槛：3 字/3s = 1 字/s ⇒ ok"
+        );
+        assert!(!output_rate_ok(2, 3.0, None), "恰门槛：0.67 字/s ⇒ 坍塌");
+        assert_eq!(COLD_MIN_AUDIO_SECS, 3.0);
+        assert_eq!(COLD_MIN_CHARS_PER_SEC, 1.0);
+    }
+
+    /// 测 #6（`#[ignore]`，需真模型）：`speech_ranges` 对 wav 片段 + 前后各补 5s 静音 ⇒
+    /// 区间**不落在**补的静音里。
+    #[test]
+    #[ignore = "手工：需 silero 模型 + kv_long.wav"]
+    fn trim388_speech_ranges_real_model_excludes_padded_silence() {
+        use sherpa_onnx::Wave;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let model_dir = root.join("models");
+        let Some(vad) = super::VadSegmenter::try_new_for_local_trim(&model_dir) else {
+            eprintln!("skip: silero VAD 不可用（模型缺失）");
+            return;
+        };
+        let wav_path = root.join("models/kv259/kv_long.wav");
+        let Some(wave) = Wave::read(wav_path.to_str().expect("utf-8 path")) else {
+            eprintln!("skip: kv_long.wav 缺失");
+            return;
+        };
+        let clip_len = wave.samples().len().min(4 * 16000);
+        let pad_s = 5 * 16000usize;
+        let mut audio = vec![0.0f32; pad_s];
+        audio.extend_from_slice(&wave.samples()[..clip_len]);
+        audio.extend(std::iter::repeat(0.0f32).take(pad_s));
+        let ranges = vad.speech_ranges(&audio);
+        assert!(!ranges.is_empty(), "wav 片段应检出语音区间");
+        assert!(
+            ranges
+                .iter()
+                .all(|&(s, e)| s >= pad_s.saturating_sub(1600) && e <= pad_s + clip_len + 1600),
+            "区间不得落在补的 5s 静音里（允许 VAD 边界 ~100ms）：{ranges:?} clip_end={}",
+            pad_s + clip_len
+        );
     }
 }
 
@@ -6771,16 +7136,24 @@ mod testsync377_inject_spec_tests {
     /// 375：冷启动三条路径（无均值 / 无音频 / 期望产出太少）⇒ 一律判正常。
     #[test]
     fn rate375_cold_start_three_paths_ok() {
-        assert!(super::output_rate_ok(0, 10.0, None), "无均值 ⇒ 不判");
+        // 【388 契约变更 · D2】old：无均值/非正/非有限一律 true；
+        // new：按「无均值」处理 + 音频 10s ≥ 3s + 0 字 ⇒ 字/秒 0 < 1 ⇒ 坍塌。
+        assert!(
+            !super::output_rate_ok(0, 10.0, None),
+            "D2：无均值长音频 0 字 ⇒ 坍塌（old：true）"
+        );
         assert!(super::output_rate_ok(0, 0.0, Some(4.4)), "无音频 ⇒ 不判");
         assert!(
             super::output_rate_ok(0, 1.0, Some(4.4)),
             "期望产出 4.4 < 8 ⇒ 不判"
         );
-        assert!(super::output_rate_ok(0, 10.0, Some(0.0)), "非正均值 ⇒ 不判");
         assert!(
-            super::output_rate_ok(0, 10.0, Some(f32::INFINITY)),
-            "非有限均值 ⇒ 不判"
+            !super::output_rate_ok(0, 10.0, Some(0.0)),
+            "D2：非正均值按无均值 ⇒ 坍塌（old：true）"
+        );
+        assert!(
+            !super::output_rate_ok(0, 10.0, Some(f32::INFINITY)),
+            "D2：非有限均值按无均值 ⇒ 坍塌（old：true）"
         );
     }
 

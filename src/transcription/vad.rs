@@ -98,6 +98,12 @@ pub const LOCALRT_VAD_MIN_SILENCE_SECS: f32 = 0.3;
 /// （≈3.8MB @16k f32），而非既有的 300s（≈19.2MB）。
 pub const LOCALRT_VAD_BUFFER_SECS: f32 = 60.0;
 
+/// FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388：本地 realtime **窗口剪静音**时，语音段两侧各留的 padding 秒数。
+///
+/// 200ms 与既有多处边界 padding 同口径（保护送气清声母 ~60-100ms）。效果：
+/// 首尾静音剩 ≤200ms；段间停顿 ≤400ms 原样保留、>400ms 压到 400ms（见 `trim_to_speech`）。
+pub const LOCALRT_TRIM_PAD_SECS: f32 = 0.2;
+
 /// VAD 分段器（懒加载，仅 accuracy 长音频使用）
 pub struct VadSegmenter {
     detector: VoiceActivityDetector,
@@ -236,6 +242,70 @@ impl VadSegmenter {
     // ===========================================================================
     // LOCALRT-VAD-SILENCE-384：本地 realtime 静默判定（只新增，不改既有方法/常量）
     // ===========================================================================
+
+    // ===========================================================================
+    // FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388：本地 realtime **窗口剪静音**（只新增，不改既有方法/常量）
+    // ===========================================================================
+
+    /// FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388：本地 realtime **窗口剪静音**专用工厂。
+    ///
+    /// 参数同 [`try_new_for_local_silence`]（阈值 0.5 / min_silence 0.3s / window 512），
+    /// buffer 取 [`LOCALRT_VAD_BUFFER_SECS`](60s)。**只新增**：旧构造一律不动。
+    pub fn try_new_for_local_trim(model_dir: &Path) -> Option<Self> {
+        let vad_model = find_silero_vad_model(model_dir)?;
+        let config = VadModelConfig {
+            silero_vad: sherpa_onnx::SileroVadModelConfig {
+                model: vad_model.to_str().map(|s| s.to_string()),
+                threshold: LOCALRT_VAD_THRESHOLD,
+                min_silence_duration: LOCALRT_VAD_MIN_SILENCE_SECS,
+                min_speech_duration: VAD_MIN_SPEECH_DURATION,
+                window_size: VAD_WINDOW_SIZE,
+                max_speech_duration: VAD_MAX_SPEECH_DURATION,
+            },
+            ten_vad: sherpa_onnx::TenVadModelConfig::default(),
+            sample_rate: 16000,
+            num_threads: 1,
+            provider: Some("cpu".to_string()),
+            debug: false,
+        };
+        let detector = VoiceActivityDetector::create(&config, LOCALRT_VAD_BUFFER_SECS)?;
+        log::info!(
+            "VAD local-trim initialized (silero, threshold={}, min_silence={}s, buffer={}s, model={})",
+            LOCALRT_VAD_THRESHOLD,
+            LOCALRT_VAD_MIN_SILENCE_SECS,
+            LOCALRT_VAD_BUFFER_SECS,
+            vad_model.display()
+        );
+        Some(Self { detector })
+    }
+
+    /// FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388：返回 `audio` 中的**语音区间** `[(start, end)]`
+    ///（样本下标，未加 pad；`end` 为**开区间**端点）。
+    ///
+    /// 做法（`segment()` 的精简版，只取区间、不做 padding/合并）：
+    /// `reset()` → `accept_waveform(整段一次)` → `flush()` → 逐个 `front()/pop()` 收集
+    /// `(start, start+n)` → `clear() + reset()`（游标归零，供下次复用）。
+    pub fn speech_ranges(&self, audio: &[f32]) -> Vec<(usize, usize)> {
+        if audio.is_empty() {
+            return Vec::new();
+        }
+        self.detector.reset();
+        self.detector.accept_waveform(audio);
+        self.detector.flush();
+        let ranges: Vec<(usize, usize)> = std::iter::from_fn(|| {
+            self.detector.front().map(|seg| {
+                let start = seg.start() as usize;
+                let n = seg.n() as usize;
+                self.detector.pop();
+                (start, start + n)
+            })
+        })
+        .collect();
+        // 与 `segment()` 同款：clear 清段队列 + reset 归零全局样本游标，防下次 start 变绝对坐标。
+        self.detector.clear();
+        self.detector.reset();
+        ranges
+    }
 
     /// LOCALRT-VAD-SILENCE-384：本地 realtime 静默判定专用工厂（silero，阈值 0.5）。
     ///
