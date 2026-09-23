@@ -5086,3 +5086,11 @@ sherpa endpoint `rule2=2.0s`（切句）、`ACC_DISPATCH_SILENCE_MS`（派发 ac
 已有就**跳过引擎**，没有才跑（`main.rs:9551` / `:8421`）。
 🔴 全文（含性能实测 0.15ms/字、增量缓存与 344 P0 崩溃的关系、三层阈值为何不能混用）
 见 `todo-archive.md` §「【归档四】QUERY-PUNCT-MECHANISM-348」。
+
+
+## 【归档六】2026-09-23 从 todo 移出的已作废 / 已完成行
+
+| `git push` | 🔴 **本条已作废（2026-09-22 主控取证订正，属 `[DOC-STATE-DRIFT-001]`）**：`git ls-remote origin refs/heads/main` = `1ec4143` = 本地 HEAD ⇒ **早已全部推送，无未推 commit**。原记「56 个未推、最新 `ad74b64`」为过期记录。剩余待 Gavin 定的只有**打不打 tag** |
+| 版本号 | 仍 0.9.2，但本轮动了数据库 schema + 模型文件 + 新增本地流式档位，与最初的 0.9.2 已非同物，是否给新号由 Gavin 定 |
+**259~290 全部已交付并出包** → 单号明细见 `CHANGELOG.md`，过程取证见 `todo-archive.md` §「v0.9.3 批次（2026-09-20/21）」。
+`ASR-DROP-234` 已由 `FIX-ASR-DROP-288` 修复并随 BUILD-290 出包（`-debug` 静置 150s，`[ASR-DROP]` 0 条）。
