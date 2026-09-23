@@ -112,7 +112,7 @@ export const en = {
   hotkey_press_translation: 'Press translation key...',
   hotkey_set_translation: 'Recommended: left or right Ctrl / Alt; must not duplicate the recording hotkey',
   hotkey_set_first: '⚠ Please set translation hotkey first',
-  hotkey_translation_usage: 'Hold translation key + voice key together to translate the result to target language.',
+  hotkey_translation_usage: 'Hold the translation key + voice key together: Chinese speech is translated into English, English speech into Chinese.',
   hotkey_conflict: 'Hotkey Conflict',
   hotkey_conflict_prefix: '"',
   hotkey_conflict_suffix: '" is already registered by another app. Use it anyway?',

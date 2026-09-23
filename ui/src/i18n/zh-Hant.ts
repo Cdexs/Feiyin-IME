@@ -111,7 +111,7 @@ export const zhHant = {
   hotkey_press_translation: '請按下翻譯熱鍵...',
   hotkey_set_translation: '推薦：左右 Ctrl / Alt，不可和錄音熱鍵重複',
   hotkey_set_first: '⚠ 請先設定翻譯熱鍵',
-  hotkey_translation_usage: '同時按住翻譯熱鍵 + 錄音熱鍵，識別結果將自動翻譯為目標語言。',
+  hotkey_translation_usage: '同時按住翻譯熱鍵 + 錄音熱鍵：說中文譯為英文，說英文譯為中文。',
   hotkey_conflict: '熱鍵衝突',
   hotkey_conflict_prefix: '「',
   hotkey_conflict_suffix: '」已被其他應用註冊。仍要使用此熱鍵嗎？',
