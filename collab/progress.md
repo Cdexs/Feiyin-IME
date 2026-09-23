@@ -1276,3 +1276,12 @@ load_wordbook_vocabulary()
 | 单测 | 新增 6 条（`fix387_*` 5 + `ts387_smoothed_volume_*`），384/385 兜底适配签名 |
 | 验证 | `cargo fmt --check` EXIT 0 ｜ check 0 error、warnings 88=基线 ｜ 全量 test 0 failed（bin 1520P/32I）｜ numstat==-w |
 | 下一步 | 阶段三 TEST-SYNC（非作者）→ 阶段四 TEST-EXEC → 出包；端测盯 `[DBG-387]` / `nearfield summary` gated 比例 |
+
+## TEST-SYNC-387 · 非作者护栏：标签边界/回显残余/重解次数/平滑音量/近场门抗误挡 · 2026-09-23 · coder-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 仅 `src/transcription/mod.rs` + `local_stream.rs` 的 `#[cfg(test)]` 区（130/0 + 115/0，**生产零改动**）。给 coder-2 的 387 按契约补 5 条独立用例（`ts387_`） |
+| 覆盖 | ① `strip_angle_tags` 标签边界（剥/不剥各 4+ 组 + 30/31/未闭合长度边界）② 末条残余⇒重解、句中单条⇒不触发 ③ 随机 300 组重解≤1 ④ `EnergySmoother` 平滑波动<逐块 + 30 万块稳定 ⑤ 平滑门误挡<5% vs 原始门>20% + 背景全挡 |
+| 验证 | `cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**、warnings **97/88** = 基线；numstat == -w。🔴 **未跑 `cargo test`**（白名单；首跑阶段四） |
+| 结论 | **未发现新生产缺陷**；未改版本/未 push/零凭证 |

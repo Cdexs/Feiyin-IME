@@ -27,7 +27,7 @@
 | 单号 | 内容 | 负责 |
 | --- | --- | --- |
 | ✅ `FIX-TAIL-WINDOW-AND-FALLBACK-386` | 中途多片末片延后与后续组窗（可超 10s）；松键短尾 <3s 与前片合窗重解；预览回灌保留流式尾巴；失败窗用流式文字兜底。**2026-09-23 阶段一交付 coder-1**（仅 `main.rs`）：`plan_windows`→`WindowPlan`+`dispatch_window!`；`compose_reflow_preview` 统一合成；`window_text_with_fallback` 兜底；新增单测 8+2、更新 testsync382/371 锚点（不放宽）。`cargo fmt --check` EXIT 0、`check --all-targets` 0 error、warnings **97/88**=基线、全量 **1608P/0F/34I**。**待 tester-1 阶段四回归 + 出包 + 端测** | coder-1（`main.rs`） |
-| `FIX-ACC-OUTPUT-GUARD-AND-GATE-SMOOTH-387` | 念词表 / `<标签>` / 空输出判无效 → 不带注入重解一次；近场门改 300ms 平滑音量 | coder-2（`transcription/mod.rs`、`local_stream.rs`） |
+| ✅ `FIX-ACC-OUTPUT-GUARD-AND-GATE-SMOOTH-387`（+ ✅ 阶段三 `TEST-SYNC-387`） | 念词表 / `<标签>` / 空输出判无效 → 不带注入重解一次；近场门改 300ms 平滑音量。**阶段三 2026-09-23 交付 coder-1**：仅 `mod.rs`+`local_stream.rs` 的 `#[cfg(test)]` **+5 条**（标签边界/回显残余/重解次数/平滑波动与 30 万块稳定/门抗误挡对比），`fmt --check` EXIT 0、`check --all-targets` 0 error、warnings **97/88**=基线；**未跑 `cargo test`**；**未发现新生产缺陷** | coder-2（实现）+ coder-1（阶段三护栏） |
 
 ### ✅ BUILD-385 已出包（2026-09-23 14:56，HEAD `0c443a5`）· 待 Gavin 端测
 

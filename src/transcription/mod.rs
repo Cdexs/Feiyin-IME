@@ -5451,6 +5451,136 @@ mod fix387_output_guard_tests {
     }
 }
 
+// ============================================================
+// TEST-SYNC-387（阶段三 · 非作者护栏 · coder-1）：标签边界 / 回显残余 / 重解次数
+//   契约：先剥 `<[A-Za-z_/][^<>]{0,30}>`；词表回显（连续 ≥4 条）或剥后残余全为词条 /
+//   只剩标点 / 空 ⇒ 不带注入重解一次；重解仍无效 ⇒ 空串 + `invalid=true`；正文夹标签只剥不重解。
+// ============================================================
+#[cfg(test)]
+mod testsync387_tests {
+    use super::{apply_acc_disposition, strip_angle_tags, GuardKind};
+    use std::cell::Cell;
+
+    const INJ: &str = "你好,铭印,银线,朵洛莉丝,费曼学习法,子未穿害,低质,罗斯柴尔德,维生素b12";
+
+    /// 测 #1 标签边界：被剥 `<location>` / `</x>` / `<_a>`（含夹在正文中）；
+    /// 不被剥 `<3岁` / `a<b` / `< 空格>` / 中文 `<你好>` / 内容 31 字符 / 未闭合超 31。
+    #[test]
+    fn ts387_tag_boundaries() {
+        for input in ["<location>", "</x>", "<_a>"] {
+            let (out, hit) = strip_angle_tags(input);
+            assert_eq!(out, "", "应整体剥掉：{input}");
+            assert!(hit, "应标记剥到过：{input}");
+        }
+        let (out, hit) = strip_angle_tags("规划会议<location>很难得");
+        assert_eq!(out, "规划会议很难得", "夹在正文中的标签只删标签本身");
+        assert!(hit);
+
+        for (input, why) in [
+            ("<3岁", "首字符非 [字母/_//]"),
+            ("a<b", "无闭合 `>`"),
+            ("< 空格>", "首字符为空格"),
+            ("<你好>", "首字符非 ASCII 字母"),
+        ] {
+            let (out, hit) = strip_angle_tags(input);
+            assert_eq!(out, input, "不得剥（{why}）：{input}");
+            assert!(!hit, "不应标记（{why}）：{input}");
+        }
+        // 内容长度边界：恰 30 字符 ⇒ 剥；31 字符 / 未闭合（>31）⇒ 不剥。
+        let t30 = format!("<{}>", "a".repeat(30));
+        assert_eq!(
+            strip_angle_tags(&t30),
+            (String::new(), true),
+            "恰 30 字符应剥"
+        );
+        let t31 = format!("<{}>", "a".repeat(31));
+        assert_eq!(
+            strip_angle_tags(&t31),
+            (t31.clone(), false),
+            "31 字符不得剥"
+        );
+        let unclosed = format!("<{}", "a".repeat(40));
+        assert_eq!(
+            strip_angle_tags(&unclosed),
+            (unclosed.clone(), false),
+            "未闭合超 31 不得剥"
+        );
+    }
+
+    /// 测 #2 回显残余：词表末条单独残留（`维生素b12`）⇒ 触发重解（Echo）；
+    /// 正常句子里**恰好含 1 个词条** ⇒ 不触发、原样返回。
+    #[test]
+    fn ts387_residual_last_term_triggers_but_single_in_sentence_not() {
+        // (a) 残余恰为词表末条 ⇒ 触发重解一次。
+        let calls = Cell::new(0);
+        let (out, oc) =
+            apply_acc_disposition("维生素b12".to_string(), Some(INJ), 1.0, None, || {
+                calls.set(calls.get() + 1);
+                Ok("真实内容".to_string())
+            });
+        assert_eq!(calls.get(), 1, "残余=末条词表 ⇒ 必须重解");
+        assert_eq!(oc.guard, GuardKind::Echo);
+        assert_eq!(out, "真实内容");
+
+        // (b) 正常句子里恰含 1 个词条 ⇒ 不触发、不重解、原样返回。
+        let text = "我最近在看维生素b12的相关资料。";
+        let called = Cell::new(false);
+        let (out2, oc2) = apply_acc_disposition(text.to_string(), Some(INJ), 8.0, None, || {
+            called.set(true);
+            Ok("x".to_string())
+        });
+        assert!(!called.get(), "句中恰 1 个词条不得触发重解");
+        assert_eq!(out2, text, "原样返回");
+        assert_eq!(oc2.guard, GuardKind::None);
+        assert!(!oc2.redecoded);
+    }
+
+    /// 测 #3 重解次数：任意随机输入下 redecode 闭包**最多被调用 1 次**；
+    /// `redecoded == (calls == 1)`；`invalid` ⇒ 返回空串。
+    #[test]
+    fn ts387_redecode_at_most_once_property() {
+        struct Lcg(u64);
+        impl Lcg {
+            fn n(&mut self, m: usize) -> usize {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((self.0 >> 33) as usize) % m
+            }
+        }
+        let mut rng = Lcg(0x387_5eed_2026);
+        let pool: Vec<char> =
+            "<>/_abc你好，。,. 维生素b12铭印银线朵洛莉丝费曼学习法子未穿害低质罗斯柴尔德"
+                .chars()
+                .collect();
+        for case in 0..300usize {
+            let len = 1 + rng.n(40);
+            let text: String = (0..len).map(|_| pool[rng.n(pool.len())]).collect();
+            let rlen = 1 + rng.n(24);
+            let recovered: String = (0..rlen).map(|_| pool[rng.n(pool.len())]).collect();
+            let calls = Cell::new(0);
+            let (out, oc) = apply_acc_disposition(text.clone(), Some(INJ), 5.0, None, || {
+                calls.set(calls.get() + 1);
+                Ok(recovered.clone())
+            });
+            assert!(
+                calls.get() <= 1,
+                "case {case}: 重解至多一次（实测 {}）",
+                calls.get()
+            );
+            assert_eq!(
+                oc.redecoded,
+                calls.get() == 1,
+                "case {case}: redecoded 与调用次数必须一致（text={text:?}）"
+            );
+            if oc.invalid {
+                assert_eq!(out, "", "case {case}: invalid ⇒ 必须空串");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod sliding_window_367_tests {
     use super::{

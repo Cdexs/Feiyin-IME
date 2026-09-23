@@ -3100,4 +3100,119 @@ mod tests {
         }
         assert!(bg_gated, "背景人声（0.1×level）应被挡");
     }
+
+    // ========================================================================
+    // TEST-SYNC-387（阶段三 · 非作者护栏 · coder-1）：EnergySmoother / 近场门抗误挡
+    //   契约：近场门的比较与 level 学习用 300ms 滑动窗口 RMS（EnergySmoother）。
+    //   不与作者 `ts387_smoothed_volume_not_gated_for_syllabic_speech` 重复。
+    // ========================================================================
+
+    /// 逐块 RMS 波动 vs 平滑波动（span = max−min）。
+    fn ts387_span(v: &[f32]) -> f32 {
+        let hi = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let lo = v.iter().cloned().fold(f32::INFINITY, f32::min);
+        hi - lo
+    }
+
+    /// 测 #4：音节（150ms 高能 + 50ms 近零）交替 ⇒ **平滑波动 < 逐块波动**；
+    /// 30 万块长跑后仍**有限、非负**（浮点累计误差不得产出 NaN/负数）。
+    #[test]
+    fn ts387_smoother_fluctuation_lt_raw_and_300k_blocks_stable() {
+        let n = 160u64;
+        let hi = (1.0f64) * n as f64; // amp 1.0
+        let lo = (0.001f64).powi(2) * n as f64; // amp 0.001（近零字缝）
+        let mut sm = EnergySmoother::new();
+        let (mut raw, mut smoothed) = (Vec::new(), Vec::new());
+        for k in 0..600usize {
+            let high = (k % 20) < 15;
+            let (sum, rms) = if high { (hi, 1.0f32) } else { (lo, 0.001f32) };
+            smoothed.push(sm.push(sum, n, 10.0));
+            raw.push(rms);
+        }
+        // 跳过前 300ms 预热（窗口未满），比稳态波动。
+        assert!(
+            ts387_span(&smoothed[30..]) < ts387_span(&raw[30..]),
+            "平滑波动 {} 应 < 逐块波动 {}",
+            ts387_span(&smoothed[30..]),
+            ts387_span(&raw[30..])
+        );
+        assert!(
+            smoothed[30..].iter().all(|v| v.is_finite() && *v >= 0.0),
+            "平滑值必须有限且非负"
+        );
+
+        // 30 万块：有限、非负（`.max(0.0)` 钳位必须生效）。
+        let mut sm2 = EnergySmoother::new();
+        for k in 0..300_000usize {
+            let high = (k % 20) < 15;
+            let sum = if high { hi } else { lo };
+            let v = sm2.push(sum, n, 10.0);
+            assert!(
+                v.is_finite() && v >= 0.0,
+                "k={k}: 平滑值 {v} 非法（NaN/负数）"
+            );
+        }
+    }
+
+    /// 测 #5 反证：同一音节模式（150ms 高能 + 50ms 近零、VAD 全真）——
+    /// **平滑门**误挡 <5%；**原始逐块门**误挡显著更高（证明收益来自平滑）；
+    /// 背景（平滑 0.1×level）**全部**被挡。
+    #[test]
+    fn ts387_smoothing_is_why_syllabic_speech_passes_but_raw_gates() {
+        let n = 160u64;
+        let hi_amp = 1.0f32;
+        let lo_amp = 0.001f32;
+        let mut sm = EnergySmoother::new();
+        let mut lv_smooth = NearFieldLevel::new();
+        let mut lv_raw = NearFieldLevel::new();
+        let mut now = 0.0f32;
+        let (mut g_smooth, mut g_raw, mut total) = (0usize, 0usize, 0usize);
+        for k in 0..500usize {
+            let high = (k % 20) < 15;
+            let amp = if high { hi_amp } else { lo_amp };
+            let energy = (amp as f64).powi(2) * n as f64;
+            let smooth = sm.push(energy, n, 10.0);
+            now += 10.0;
+            let pass_smooth = vad_branch_decision(true, smooth, 10.0, now, &mut lv_smooth);
+            let pass_raw = vad_branch_decision(true, amp, 10.0, now, &mut lv_raw); // 反证：原始逐块
+            if now > 1000.0 {
+                total += 1;
+                if !pass_smooth {
+                    g_smooth += 1;
+                }
+                if !pass_raw {
+                    g_raw += 1;
+                }
+            }
+        }
+        assert!(lv_smooth.is_ready() && lv_raw.is_ready(), "5s 应已就绪");
+        assert!(
+            g_smooth * 100 < total * 5,
+            "平滑门误挡 {g_smooth}/{total} 应 <5%"
+        );
+        assert!(
+            g_raw > total / 5,
+            "原始逐块门误挡 {g_raw}/{total} 应 >20%（反证平滑是收益来源）"
+        );
+
+        // 背景：先喂满 300ms 平滑窗，之后全部被挡。
+        lv_smooth.prune(now);
+        let level = lv_smooth.estimate();
+        assert!(level > 0.0, "level 应已学到正值");
+        let bg_amp = 0.1f32 * level;
+        let bg = (bg_amp as f64).powi(2) * n as f64;
+        for _ in 0..30 {
+            now += 10.0;
+            let _ = sm.push(bg, n, 10.0);
+        }
+        let mut bg_gated = 0usize;
+        for _ in 0..200 {
+            now += 10.0;
+            let s = sm.push(bg, n, 10.0);
+            if !vad_branch_decision(true, s, 10.0, now, &mut lv_smooth) {
+                bg_gated += 1;
+            }
+        }
+        assert_eq!(bg_gated, 200, "背景 0.1×level（平滑）必须全部被挡");
+    }
 }

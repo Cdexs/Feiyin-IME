@@ -185,3 +185,25 @@
 - **验证**：fmt EXIT 0 ｜ check 0 error、warnings 88=基线 ｜ 全量 test **0 failed**（bin 1520P/32I）｜ numstat==-w。🔴 过程：初期 386 在飞致树不可编译，按主控批示待命未动 main.rs；386 落地后复跑全绿。
 - **未验证**：实机端测（端测盯 `[DBG-387] guard`、`[DBG-385] nearfield summary` gated 比例回落）交 tester-1/Gavin。
 - **未改版本 / 未 push / 未 build release / 零凭证**。
+
+## 2026-09-23 — coder-1 — TEST-SYNC-387 ✅ 交付（阶段三·非作者护栏，只改 `mod.rs` + `local_stream.rs` 的 `#[cfg(test)]` 区）
+
+- **被测**：`FIX-ACC-OUTPUT-GUARD-AND-GATE-SMOOTH-387`（coder-2，HEAD `5cd14aa`）。按契约、不与作者 `fix387_*`/`ts387_smoothed_volume_*` 重复。
+- **范围**：`src/transcription/mod.rs` **仅** `mod testsync387_tests`（+130/0）、`local_stream.rs` **仅** `mod tests` 追加（+115/0）；生产代码零改动。
+- **5 条**：
+  1. **标签边界**（`strip_angle_tags`）：剥 `<location>`/`</x>`/`<_a>`/正文夹标签（保留正文）；不剥 `<3岁`/`a<b`/`< 空格>`/`<你好>`/内容 31 字符/未闭合超 31；恰 30 字符剥。
+  2. **回显残余**：末条残留（`维生素b12`）⇒ `Echo` 重解一次；句中恰含 1 词条 ⇒ 不触发、原样返回。
+  3. **重解次数**：300 组随机输入 ⇒ 闭包至多 1 次、`redecoded==(calls==1)`、`invalid⇒空串`。
+  4. **平滑音量**：音节 150ms 高能 + 50ms 近零 ⇒ 平滑波动 < 逐块波动；30 万块长跑有限、非负。
+  5. **近场门抗误挡**：平滑门误挡 <5%、**原始逐块门误挡 >20%**（反证平滑收益）；背景（平滑 0.1×level）全部被挡。
+- **验证（白名单）**：`cargo fmt --check` **EXIT 0**；`cargo check --all-targets` **0 error**、warnings **97/88** = 基线；numstat==-w。🔴 **未跑 `cargo test`**（禁止，首跑阶段四）。
+- **未发现新生产缺陷**。⚠️ 已知「待修 2（387：重解只出标点被收下）」由主控后续修复；本单测试按**契约**写、未断言未修行为 ⇒ 修复后仍绿。「待修 1（386：兜底文本重复）」在 `main.rs`（coder-2 的 TEST-SYNC-386 在飞），非本单。
+- **未改生产代码 / 未改版本 / 未 push / 零凭证**。
+
+## 2026-09-23 — TEST-SYNC-386（coder-2，✅ 阶段三交付：非作者护栏 5 条）
+
+- **性质**：只写测试、零生产改动；仅 `src/main.rs` `#[cfg(test)] mod testsync386_tests`。被测 `FIX-TAIL-WINDOW-AND-FALLBACK-386`（HEAD `4168960`）。🔴 **未跑 `cargo test`**（阶段四 tester-1 首跑）。
+- **新增 5 条**：会话级性质（200 次 × 3~8 派发 × 1~3 片 × 0.3~12s、末次收尾：全覆盖 / 无 pending / `s<e≤总片数`）；中途一大一小含 pending；结尾一大一小（短尾合并 vs 长尾单独）；预览随 streaming 增长不回退且与同参数 StreamingText 渲染逐字相等；兜底（空/非空/双空/纯空白）。
+- **验证**：`rustfmt` + `cargo check --all-targets` **0 error**、warnings **88**=基线；`cargo fmt --check` EXIT 0；numstat==-w（main 139/0）。独立 Python 复刻 `plan_windows` 校验用例 2/3 逐条吻合 + 5000 会话属性模拟 bad=0（弥补不能跑单测）。
+- **未发现生产缺陷**。**未改版本 / 未 push / 零凭证**。
+- 🔴 注意：同工作区 `local_stream.rs` 有 coder-1 在飞的 TEST-SYNC-387（+112 行未提交），非本单、未触碰。
