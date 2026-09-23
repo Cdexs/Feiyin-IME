@@ -12,13 +12,16 @@ use sherpa_onnx::{OfflineQwen3ASRModelConfig, OfflineSenseVoiceModelConfig};
 pub mod local_stream;
 pub mod qwen_inference;
 mod vad;
+// FIX-SLICE-CUT-AT-GAP-381：§4/§5 实测 PoC（纯 `#[cfg(test)]`，无 lib target 故不能放 src/bin|tests）
+#[cfg(test)]
+mod poc_slice_cut_381;
 // SLIDING-WINDOW-367：路A 逐片解码摘接线后，`join_segment_texts` 等 re-export 暂无人用；
 // **保留**（可回挂），故局部 allow。
 #[allow(unused_imports)]
 pub use vad::{
-    build_padded_segments, build_padded_segments_capped, join_segment_texts, naive_chunk,
-    should_segment, VadSegmenter, SEGMENT_MAX_SECS, SEGMENT_PADDING_SAMPLES, SEGMENT_TRIGGER_SECS,
-    SLIDING_SLICE_MAX_SECS,
+    build_padded_segments, build_padded_segments_capped, build_sliding_segments,
+    join_segment_texts, naive_chunk, should_segment, VadSegmenter, SEGMENT_MAX_SECS,
+    SEGMENT_PADDING_SAMPLES, SEGMENT_TRIGGER_SECS, SLIDING_CUT_SEARCH_START_SECS,
 };
 
 /// BUG-119（BUILD-118 端测第 1 项）：「用户没说话」的类型化信号，不是设备/网络错误。
@@ -1474,7 +1477,12 @@ pub(crate) fn path_b_budget_ok(num_samples: usize, terms: Option<&str>) -> bool 
 /// 滑动窗口最多纳入的片数：**当前片 + 前 3 片**（Gavin 定）。
 pub(crate) const WINDOW_MAX_SLICES: usize = 4;
 /// 窗口音频时长上限（秒）。单片仍超此值 ⇒ 直接单片组窗（不切分）。
-pub(crate) const WINDOW_MAX_SECS: f32 = 12.0;
+///
+/// 🔴 FIX-SLICE-CUT-AT-GAP-381（Gavin 2026-09-23）：**12.0 → 10.0**。理由：与切片起搜点
+/// [`SLIDING_CUT_SEARCH_START_SECS`] 统一为 10s（原「12s 窗 / 13s 硬切点」两个时间点作废）。
+/// 收益 = 回灌更快（单窗解码更短）；代价 = 前文纠正范围变小、接缝变多 ——
+/// 由本单 §5 的 12s vs 10s 生产路径 CER 实测把关（判据：10s 不比 12s 差 >0.01 绝对值）。
+pub(crate) const WINDOW_MAX_SECS: f32 = 10.0;
 
 /// SLIDING-WINDOW-367 ①：组窗起点（返回 `slices` 的起始索引；选中 `slices[start..]`）。
 ///
@@ -5195,12 +5203,13 @@ mod sliding_window_367_tests {
     // ---- ① 组窗 ----
     #[test]
     fn window_keeps_up_to_current_plus_three() {
-        // 4 片之和 ≤12 ⇒ 全取（起点 0）
+        // 🔴 FIX-SLICE-CUT-AT-GAP-381：WINDOW_MAX_SECS 12→10。
+        // [3,3,3,3]=12 > 10 ⇒ 丢最远一片 ⇒ [3,3,3]=9 ⇒ 起点 1（改前 12≤12 ⇒ 起点 0）
         assert_eq!(
             group_window_start_secs(&[3.0, 3.0, 3.0, 3.0], WINDOW_MAX_SECS),
-            0
+            1
         );
-        // 5 片 ⇒ 最多当前+前3（起点 1）
+        // 5 片 ⇒ 最多当前+前3（起点 1，4×1=4 ≤ 10；不受上限变化影响）
         assert_eq!(
             group_window_start_secs(&[1.0, 1.0, 1.0, 1.0, 1.0], WINDOW_MAX_SECS),
             1
@@ -5209,23 +5218,35 @@ mod sliding_window_367_tests {
 
     #[test]
     fn window_drops_oldest_until_within_limit() {
-        // [4,4,4,4]=16>12 ⇒ 丢最远 → [4,4,4]=12 ⇒ 起点 1
+        // 🔴 FIX-SLICE-CUT-AT-GAP-381：WINDOW_MAX_SECS 12→10。
+        // [4,4,4,4]=16>10 ⇒ 丢 → [4,4,4]=12>10 ⇒ 丢 → [4,4]=8 ⇒ 起点 2（改前 12≤12 ⇒ 起点 1）
         assert_eq!(
             group_window_start_secs(&[4.0, 4.0, 4.0, 4.0], WINDOW_MAX_SECS),
-            1
+            2
         );
-        // [5,5,5,5]=20>12 ⇒ 丢到 [5,5,5]=15>12 ⇒ [5,5]=10 ⇒ 起点 2
+        // [5,5,5,5]=20>10 ⇒ 丢到 [5,5,5]=15>10 ⇒ [5,5]=10 ≤10 ⇒ 起点 2（不受上限变化影响）
         assert_eq!(
             group_window_start_secs(&[5.0, 5.0, 5.0, 5.0], WINDOW_MAX_SECS),
             2
         );
     }
 
+    /// 🔴 FIX-SLICE-CUT-AT-GAP-381：**窗口上限与切片起搜点必须相等**（Gavin 统一 10s）。
+    /// 锁定二者，防日后单改一处造成「切片 10s 起搜、窗口 12s」之类的静默漂移。
+    #[test]
+    fn sliding_cut_search_start_equals_window_max() {
+        assert_eq!(
+            super::SLIDING_CUT_SEARCH_START_SECS as f32,
+            WINDOW_MAX_SECS,
+            "SLIDING_CUT_SEARCH_START_SECS(vad) 必须 == WINDOW_MAX_SECS(mod)"
+        );
+    }
+
     #[test]
     fn window_single_slice_over_limit_is_kept() {
-        // 单片 13s > 12 ⇒ 不切分、直接单片（起点 0，n=1）
+        // 单片 13s > 10 ⇒ 不切分、直接单片（起点 0，n=1）
         assert_eq!(group_window_start_secs(&[13.0], WINDOW_MAX_SECS), 0);
-        // 当前片 20s + 前片 1s：丢前片后仍 >12 ⇒ 只剩当前片（起点 1）
+        // 当前片 20s + 前片 1s：丢前片后仍 >10 ⇒ 只剩当前片（起点 1）
         assert_eq!(group_window_start_secs(&[1.0, 20.0], WINDOW_MAX_SECS), 1);
     }
 

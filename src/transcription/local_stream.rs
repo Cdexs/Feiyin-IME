@@ -411,31 +411,25 @@ fn endpoint_action(segment_has_speech: bool, confirm_text_empty: bool) -> Endpoi
     }
 }
 
-/// FIX-REMOVE-HARDSPLIT-370：滑窗（accuracy 派发）路径的片构建 —— 上限 **13s**（Gavin 定，最终值）。
+/// FIX-SLICE-CUT-AT-GAP-381：滑窗（accuracy 派发）路径的片构建 —— 超限片按**字缝**切。
 ///
-/// 原实现走 `build_padded_segments`，会把 >20s 的片按 20s **硬切**（native/FunASR 时代
-/// `max_total_len=512` 的遗留）。切片只认 1200ms 静默（Gavin 原则），20s 到点一刀正是
-/// 「从句子中间生硬切断，转写有偏差」⇒ 本路径上限显式改为 `SLIDING_SLICE_MAX_SECS`(13s)：
-/// **常态片（静默切出，通常几秒~十几秒）原样送解码**，只有「一口气说满 13s 无停顿」才切。
+/// 原实现走 `build_padded_segments`（>20s 按 20s 硬切，native/FunASR 时代遗留）；
+/// 370 改为固定 13s 硬切 —— 但**硬切点可能正好落在字上，把字切碎导致识别出错**
+/// （Gavin 2026-09-23）。本单改为：单片剩余 > 10s 时，从「本片起点 + 10s」往后
+/// 找第一个**字缝**（能量低谷）切，最晚 12s 兜底（[`super::vad::plan_gap_cuts`]）。
 ///
-/// 🔴 13s 的取值依据见 `SLIDING_SLICE_MAX_SECS` 注释：**对齐滑窗封顶 12s 的实测体验**
-/// （Gavin 端测：12s 窗解码+回灌「没有明显卡顿」）；13s≈5.3s vs 12s 的 4.9s，仅差 0.4s。
+/// 🔴 口径统一（Gavin 2026-09-23）：**窗口上限与切片起搜点都改为 10s**
+/// （`WINDOW_MAX_SECS` 12→10、删除 `SLIDING_SLICE_MAX_SECS` 13s）。
 ///
 /// 只保留 `build_padded_segments` 的 200ms 边界 padding 与 `FIX-VAD-STATE-RESET-001`
-/// 边界过滤/clamp（start 越界丢弃并 warn、end 超界 clamp）。抽成独立函数 ⇒
-/// 「滑窗路径上限 13s、护栏不丢」成为**可单测的契约**（`sliding_slice_370_*`）。
+/// 边界过滤/clamp（start 越界丢弃并 warn、end 超界 clamp）。
 fn build_dispatch_segment(
     start: usize,
     len: usize,
     total_samples: usize,
     pcm: &[f32],
 ) -> Vec<Vec<f32>> {
-    super::build_padded_segments_capped(
-        &[(start, len)],
-        total_samples,
-        pcm,
-        super::SLIDING_SLICE_MAX_SECS,
-    )
+    super::build_sliding_segments(&[(start, len)], total_samples, pcm)
 }
 
 /// 本地真流式转录（边收音频边解码），与 `transcribe_streaming_realtime` 平行。
@@ -461,8 +455,8 @@ fn build_dispatch_segment(
 ///   `seg_streaming_text` = 本片对应的**流式文本**（`last_display` 自上一片 `committed_len`
 ///   起的字符后缀，**按 char 切片**）—— LOCALRT-REFLOW-HOLE-344-G：worker 解出空/失败时用它
 ///   填补，避免累积 `acc_text` 留洞导致后续回灌**永久失效**。
-///   子段列表通常 1 个；`FIX-REMOVE-HARDSPLIT-370` 起单片上限 13s（`SLIDING_SLICE_MAX_SECS`），
-///   只有 >13s 才按 13s 切、超出继续切不丢弃（极端长句兜底，非常态切片规则）。
+///   子段列表通常 1 个；`FIX-SLICE-CUT-AT-GAP-381` 起单片剩余 >10s 即按**字缝**切
+///   （从 10s 起找能量低谷、最晚 12s 兜底，`vad::plan_gap_cuts`），切点严格相接、不丢内容。
 ///   🔴 只在 `acc_cfg.enabled` 且静默 ≥ `acc_cfg.silence_ms`(1200ms) 且未上 latch 时被调用
 ///
 /// # 返回
@@ -944,8 +938,8 @@ pub fn transcribe_streaming_local(
 
         // PARALLEL-ACC-298 / ACC-DISPATCH-SILENCE-ONLY-346：**静默 ≥1200ms 即把这一段派给 accuracy**。
         // 🔴 只推进 `acc_dispatched_end`，**不 reset / 不切句 / 不动 sentence_id**（与 endpoint 解耦）。
-        // FIX-REMOVE-HARDSPLIT-370：经 `build_dispatch_segment`（上限 13s，极端长句兜底）——
-        // 自动加 200ms 边界 padding；常态片（静默切出，通常 <13s）原样解码，>13s 才按 13s 切（不丢弃）。
+        // FIX-SLICE-CUT-AT-GAP-381：经 `build_dispatch_segment`（超 10s 按**字缝**切、最晚 12s 兜底）——
+        // 自动加 200ms 边界 padding；常态片（静默切出，通常 <10s）原样解码，>10s 才从 10s 起找字缝切（不丢弃）。
         let acc_pending = pcm.len().saturating_sub(acc_dispatched_end);
         if should_dispatch_acc(
             acc_cfg.enabled,
@@ -2049,23 +2043,23 @@ mod tests {
     }
 
     // ========================================================================
-    // FIX-REMOVE-HARDSPLIT-370 · 滑窗（accuracy 派发）路径的片构建契约
-    //   `build_dispatch_segment` = 上限 `SLIDING_SLICE_MAX_SECS`(13s)，
-    //   是**极端长句兜底**（非常态参数）：常态片（静默切出，通常几秒~十几秒）原样解码。
+    // FIX-SLICE-CUT-AT-GAP-381 · 滑窗（accuracy 派发）路径的片构建契约
+    //   `build_dispatch_segment`：单片剩余 >10s ⇒ 从 10s 起找**字缝**切、最晚 12s 兜底；
+    //   常态片（静默切出，通常 <10s）原样解码。
     // ========================================================================
 
-    /// 🔴 核心：**≤13s 的片不被切**（常态片覆盖：2/4/8/12s + 恰好 13s 边界）。
+    /// 🔴 核心：**≤10s 的片不被切**（常态片覆盖：2/4/8s + 恰好 10s 边界）。
     #[test]
-    fn sliding_slice_370_typical_slices_are_not_split() {
+    fn sliding_slice_381_short_slices_are_not_split() {
         let sec = SAMPLE_RATE as usize;
-        for dsecs in [2usize, 4, 8, 12, 13] {
+        for dsecs in [2usize, 4, 8, 10] {
             let total = dsecs * sec;
             let pcm = vec![0.1f32; total];
             let segs = build_dispatch_segment(0, total, pcm.len(), &pcm);
             assert_eq!(
                 segs.len(),
                 1,
-                "{dsecs}s 片（≤13s）不得被切（per Gavin：切片只认 1200ms 静默）"
+                "{dsecs}s 片（≤10s）不得被切（per Gavin：只按语义停顿/字缝切）"
             );
             assert_eq!(
                 segs[0].len(),
@@ -2075,24 +2069,33 @@ mod tests {
         }
     }
 
-    /// 🔴 安全阀：**>13s** 的片仍按 13s 切（兜底，非常规切片规则；超出继续切、不丢弃）。
+    /// 🔴 超 10s：**按字缝切**（无字缝时最晚 12s 兜底），切点严格相接、不丢样本。
     #[test]
-    fn sliding_slice_370_over_13s_splits_by_13s() {
+    fn sliding_slice_381_over_10s_uses_gap_cut() {
         let sec = SAMPLE_RATE as usize;
         let total = 200 * sec;
-        let pcm = vec![0.1f32; total];
+        let pcm = vec![0.1f32; total]; // 恒定能量 ⇒ 无字缝 ⇒ 兜底取 RMS 最低帧（全相等取最早）
         let segs = build_dispatch_segment(0, total, pcm.len(), &pcm);
-        assert_eq!(segs.len(), 16, "200s ⇒ 15×13 + 5 ⇒ 16 段（13s 安全阀生效）");
+        assert!(segs.len() >= 2, "200s 必被切：{}", segs.len());
         let lens: Vec<usize> = segs.iter().map(|s| s.len()).collect();
-        assert_eq!(lens[0], 13 * sec, "首段 13s");
-        assert_eq!(lens[15], 5 * sec, "末段为余量");
         assert_eq!(lens.iter().sum::<usize>(), total, "切分不丢样本");
+        for (i, &l) in lens.iter().enumerate() {
+            if i + 1 < lens.len() {
+                assert!(
+                    l >= 10 * sec && l <= 12 * sec,
+                    "非尾片 {i} 长度 {:.2}s 应 ∈[10,12]s",
+                    l as f64 / sec as f64
+                );
+            } else {
+                assert!(l < 11 * sec, "尾片 {:.2}s 应 <11s", l as f64 / sec as f64);
+            }
+        }
     }
 
     /// 🔴 边界护栏不丢（FIX-VAD-STATE-RESET-001）：start 越界 ⇒ 丢弃（不 panic）；
     /// end 越界 ⇒ clamp 并补 200ms padding。
     #[test]
-    fn sliding_slice_370_keeps_vad_state_reset_guards() {
+    fn sliding_slice_381_keeps_vad_state_reset_guards() {
         let sec = SAMPLE_RATE as usize;
         let total = 30 * sec;
         let pcm = vec![0.2f32; total];

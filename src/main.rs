@@ -175,6 +175,10 @@ enum PipelineEvent {
         /// 原语义（替换前 `committed_len` 字符、保留流式尾巴）。**显式声明节点行为（DEC-066）**，
         /// 不靠长度关系反推。
         replace_all: bool,
+        /// FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382（3C）：本窗**解码完成**时刻
+        /// （worker `Instant::now()`，随解码结果一路带到事件）。消费端在**实际 `show_overlay` 渲染**时
+        /// 打 `decode_done→render_ms`（端到端口径：解完 → 浮层重画）。`None` = 老发送方 / 非滑窗路径。
+        decode_done_at: Option<std::time::Instant>,
     },
     /// LOCALRT-SEAM-337（自适应定界）：本片边界冻结通知。
     ///
@@ -308,6 +312,21 @@ static ACC_REFLOW_STATE: Mutex<Option<(u64, String, usize)>> = Mutex::new(None);
 static ACC_REFLOW_ACC: Mutex<Option<(u64, usize, String, bool)>> = Mutex::new(None);
 #[cfg(target_os = "windows")]
 static ACC_REFLOW_BOUND: Mutex<Option<(u64, usize, Option<usize>)>> = Mutex::new(None);
+/// FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382（3A）：`replace_all` 回灌的快速路径状态机
+///（最新全文 / `(gen,seg)` 边界小 map / 最新已渲染 seg）。按代清空。
+#[cfg(target_os = "windows")]
+static ACC_REFLOW_FAST: Mutex<ReflowFastState> = Mutex::new(ReflowFastState {
+    latest: None,
+    bounds: Vec::new(),
+    rendered: None,
+});
+/// FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382（问题2 防闪回）：本代浮层**已进入处理态**。
+/// controller **处理到本代 `Processing` 事件时**由 controller 线程置位（按通道实际顺序：排在
+/// Processing 之前入队的回灌照常渲染，之后的只更新状态、不重画）⇒ 提前发 Processing 后，acc
+/// 尾窗的迟到回灌不会把浮层拉回预览态。`RecordingStarted` 复位。只作用于本地实时档
+///（只有它会发 `PreviewReflow`）。
+#[cfg(target_os = "windows")]
+static ACC_REFLOW_SUPPRESS: AtomicBool = AtomicBool::new(false);
 /// FIX-PREVIEW-HARVEST-380（B）：controller 收到 `HotkeyEvent::Stop` 当刻的
 /// `GetTickCount64()` tick，供 worker 走到 `Injection completed` 时算 `stop_to_inject_ms`
 ///（松键 → 最终上屏）。`0` = 本代没有 hotkey stop（如 VAD 自动停），注入完成侧据此不打点。
@@ -6881,6 +6900,11 @@ fn process_controller_events(
                 if let Ok(mut slot) = ACC_REFLOW_BOUND.lock() {
                     *slot = None;
                 }
+                // 382：快速路径状态机 + 处理态抑制闩锁按代清空。
+                if let Ok(mut st) = ACC_REFLOW_FAST.lock() {
+                    st.clear();
+                }
+                ACC_REFLOW_SUPPRESS.store(false, Ordering::Release);
                 set_tray_state(tray, TrayState::Recording, ui_language);
                 show_overlay(
                     overlay_handle,
@@ -6997,6 +7021,7 @@ fn process_controller_events(
                 has_hole,
                 acc_text,
                 replace_all,
+                decode_done_at,
             } => {
                 // 325：本地实时档 accuracy 分片权威文本回灌（**只有本地档会发本事件**）。
                 // 代际门与 StreamingText 同源：陈旧 session 的回灌不得改本 session 浮层。
@@ -7036,24 +7061,75 @@ fn process_controller_events(
                 // 337：PreviewReflow 不再直接渲染 ⇒ preview_len 恒 0（实际渲染在 ReflowCommit 臂）。
                 let preview_len = 0usize;
                 if action == ReflowAction::Applied {
-                    // LOCALRT-SEAM-337：本片**登记 acc 文本**，等边界事件配对后再渲染
-                    // （边界由 local_stream 的自适应定界 a/b/c 冻结，自适应、无固定 L）。
                     if replace_all {
+                        // 382（3A）：**立即渲染** —— 不再等同片 ReflowCommit 边界配对（唯一发送点恒
+                        // replace_all，等边界只会白白延迟）。已知边界 ⇒ 用准确的；未知 ⇒ 用派发当刻
+                        // `committed_len` 先渲染，边界后到且本 seg 仍是最新已渲染 ⇒ 再用准确值重渲一次。
                         ACC_REFLOW_LAST_REFLOW_SEQ.store(key, Ordering::Release);
+                        // 382（防闪回）：Processing 已开始 ⇒ 只更新状态、不重画浮层。
+                        let suppressed = ACC_REFLOW_SUPPRESS.load(Ordering::Acquire);
+                        let outcome = match ACC_REFLOW_FAST.lock() {
+                            Ok(mut st) => st.on_text(
+                                generation,
+                                seg_index,
+                                acc_text.clone(),
+                                committed_len,
+                                suppressed,
+                            ),
+                            Err(_) => ReflowFastOutcome::None,
+                        };
+                        if let ReflowFastOutcome::Apply {
+                            text,
+                            committed_len: len,
+                            accurate,
+                            render,
+                        } = outcome
+                        {
+                            if render {
+                                render_authoritative_reflow(
+                                    overlay_handle,
+                                    opacity,
+                                    ui_language,
+                                    last_streaming_text,
+                                    generation,
+                                    seg_index,
+                                    &text,
+                                    true,
+                                    len,
+                                    accurate,
+                                    decode_done_at,
+                                );
+                            } else {
+                                set_acc_reflow_state_only(generation, &text, len);
+                                if log::log_enabled!(log::Level::Debug) {
+                                    log::debug!(
+                                        "[LocalRT-DBG-382] reflow suppressed after processing: seg={} acc_len={}",
+                                        seg_index,
+                                        text.chars().count()
+                                    );
+                                }
+                            }
+                        }
                     } else {
+                        // 老逐片路径（382 起已无发送方）：保持逐位不变。
                         ACC_REFLOW_LAST_SEG.store(key, Ordering::Release);
-                    }
-                    if let Ok(mut slot) = ACC_REFLOW_ACC.lock() {
-                        *slot = Some((generation, seg_index, acc_text.clone(), replace_all));
-                    }
-                    if log::log_enabled!(log::Level::Debug) {
-                        log::debug!(
-                            "[LocalRT-DBG-337] reflow acc ready: seg={} acc_len={} (等 boundary)",
-                            seg_index,
-                            acc_text.chars().count()
+                        if let Ok(mut slot) = ACC_REFLOW_ACC.lock() {
+                            *slot = Some((generation, seg_index, acc_text.clone(), replace_all));
+                        }
+                        if log::log_enabled!(log::Level::Debug) {
+                            log::debug!(
+                                "[LocalRT-DBG-337] reflow acc ready: seg={} acc_len={} (等 boundary)",
+                                seg_index,
+                                acc_text.chars().count()
+                            );
+                        }
+                        try_resolve_reflow(
+                            overlay_handle,
+                            opacity,
+                            ui_language,
+                            last_streaming_text,
                         );
                     }
-                    try_resolve_reflow(overlay_handle, opacity, ui_language, last_streaming_text);
                 } else if action == ReflowAction::SkippedEditing {
                     // 编辑态一旦出现（含已退出）⇒ 本代永久上闩，后续回灌不再改用户文本。
                     ACC_REFLOW_EDIT_LATCH.store(true, Ordering::Release);
@@ -7096,9 +7172,45 @@ fn process_controller_events(
                 if let Ok(mut slot) = ACC_REFLOW_BOUND.lock() {
                     *slot = Some((generation, seg_index, committed_len));
                 }
+                // 老逐片路径（已无发送方）：ACC_REFLOW_ACC 恒 None ⇒ 本调用为 no-op，保持逐位不变。
                 try_resolve_reflow(overlay_handle, opacity, ui_language, last_streaming_text);
+                // 382（3A）：replace_all 快速路径 —— 边界后到且该 seg 仍是最新已渲染 ⇒ 用准确边界重渲。
+                let suppressed = ACC_REFLOW_SUPPRESS.load(Ordering::Acquire);
+                let outcome = match ACC_REFLOW_FAST.lock() {
+                    Ok(mut st) => st.on_bound(generation, seg_index, committed_len, suppressed),
+                    Err(_) => ReflowFastOutcome::None,
+                };
+                if let ReflowFastOutcome::Apply {
+                    text,
+                    committed_len: len,
+                    accurate,
+                    render,
+                } = outcome
+                {
+                    if render {
+                        render_authoritative_reflow(
+                            overlay_handle,
+                            opacity,
+                            ui_language,
+                            last_streaming_text,
+                            generation,
+                            seg_index,
+                            &text,
+                            true,
+                            len,
+                            accurate,
+                            None,
+                        );
+                    } else {
+                        set_acc_reflow_state_only(generation, &text, len);
+                    }
+                }
             }
             PipelineEvent::Processing(message) => {
+                // 382（问题2 防闪回）：controller **处理到本代 Processing** 时置位 ⇒ 之后到达的
+                // `replace_all` 回灌只更新状态、不重画浮层（提前发 Processing 后 acc 尾窗回灌可能后到）。
+                // 按通道实际顺序：排在 Processing **之前**入队的回灌照常渲染，不受影响。
+                ACC_REFLOW_SUPPRESS.store(true, Ordering::Release);
                 set_tray_state(tray, TrayState::Processing, ui_language);
                 show_overlay(
                     overlay_handle,
@@ -8279,6 +8391,9 @@ fn spawn_worker_thread(
                                         // FIX-PREFIX-AND-EAT-371（B）：`window_seq -> 本窗各片样本数`
                                         // —— 与切片区间一起算期望重叠比例，约束 reflow 的对齐 k。
                                         let mut window_samples: Vec<Vec<usize>> = Vec::new();
+                                        // 382（3A）：`window_seq -> 派发当刻浮层字符数`（边界未到时的 fallback，
+                                        // 随 `PreviewReflow.committed_len` 带到消费端）。
+                                        let mut window_committed_lens: Vec<usize> = Vec::new();
                                         let mut window_seq: usize = 0;
                                         // FIX-PREVIEW-STALE-AND-COLLAPSE-375（A）：滑窗权威快照的**自有单调序号**
                                         // —— `dispatch_idx`（切片下标）在窗口间并发 + 收尾 drain 下**会重复**，
@@ -8289,23 +8404,22 @@ fn spawn_worker_thread(
                                         let terms = acc_terms.as_deref();
 
                                         std::thread::scope(move |pool| {
-                                            // 结果 = (window_seq, dispatch_idx, Result, decode_ms)。
-                                            type DecRes =
-                                                (usize, usize, anyhow::Result<(String, bool)>, f64);
                                             let (res_tx, res_rx) =
-                                                crossbeam_channel::unbounded::<DecRes>();
-                                            let mut task_txs = Vec::with_capacity(concurrency);
+                                                crossbeam_channel::unbounded::<AccDecodeResult>();
+                                            // 382（3B）：**一个共享任务通道**，所有 worker 从同一通道取
+                                            //（crossbeam 通道天然多消费者）。旧实现 `rr % concurrency` 把第 N 窗
+                                            // 固定派给第 N%2 个 worker ⇒ 一个 worker 在解长窗时下一窗仍排在它后面、
+                                            // 另一个空闲也不接（实测一窗实解 ~2.5s、出结果 5.8s）。
+                                            let (task_tx, task_rx) =
+                                                crossbeam_channel::unbounded::<AccTaskMsg>();
                                             for _ in 0..concurrency {
-                                                let (ttx, trx) = crossbeam_channel::unbounded::<(
-                                                    usize,
-                                                    usize,
-                                                    Vec<f32>,
-                                                    Option<f32>,
-                                                )>();
-                                                task_txs.push(ttx);
+                                                let trx = task_rx.clone();
                                                 let rtx = res_tx.clone();
                                                 pool.spawn(move || {
-                                                        for (seq, dispatch_idx, audio, avg_snapshot) in trx {
+                                                    for (seq, dispatch_idx, audio, avg_snapshot, dispatched_at) in trx {
+                                                        // 382（3C）：排队时间 = 派发 → worker 开始解码。
+                                                        let queued_ms =
+                                                            dispatched_at.elapsed().as_secs_f64() * 1000.0;
                                                         let t0 = std::time::Instant::now();
                                                         let r = decode_window(
                                                             recognizer,
@@ -8315,14 +8429,24 @@ fn spawn_worker_thread(
                                                             terms,
                                                             avg_snapshot,
                                                         );
-                                                        let ms =
-                                                            t0.elapsed().as_secs_f64() * 1000.0;
-                                                        let _ = rtx.send((seq, dispatch_idx, r, ms));
+                                                        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                                        // 382（3C）：解码完成时刻（端到端「解完 → 浮层重画」）。
+                                                        let decode_done_at = std::time::Instant::now();
+                                                        if log::log_enabled!(log::Level::Debug) {
+                                                            log::debug!(
+                                                                "[LocalRT-DBG-382] window queue: seq={} queued_ms={:.0} decode_ms={:.0}",
+                                                                seq,
+                                                                queued_ms,
+                                                                ms
+                                                            );
+                                                        }
+                                                        let _ =
+                                                            rtx.send((seq, dispatch_idx, r, ms, decode_done_at));
                                                     }
                                                 });
                                             }
                                             drop(res_tx);
-                                            let mut rr: usize = 0;
+                                            drop(task_rx); // 生产侧只保留唯一 `task_tx`；这份接收端不需要
                                             // FIX-PREVIEW-STALE-AND-COLLAPSE-375（B）：本次录音**已接受窗口**的
                                             // 产出率累计（字 / 秒 / 窗数）⇒ 运行均值，用于识别「解码坍塌」。
                                             // （放在投池作用域内：唯一读写者就是这个循环，不跨闭包捕获）
@@ -8335,7 +8459,7 @@ fn spawn_worker_thread(
                                             // 收尾 drain 共用，保证该线程内 `push_window(` 只出现一处（防两份再漂移）。
                                             macro_rules! harvest_acc_window {
                                                 ($res:expr) => {{
-                                                    let (seq, dispatch_idx, r, ms) = $res;
+                                                    let (seq, dispatch_idx, r, ms, decode_done_at) = $res;
                                                     total_decode_ms += ms;
                                                     let text = match r {
                                                         Ok((t, _np)) => t,
@@ -8369,15 +8493,22 @@ fn spawn_worker_thread(
                                                     for authoritative in ordered.push_window(
                                                         seq, win_ws, win_we, win_samples, text,
                                                     ) {
+                                                        // 382（3A）：边界未到时的 fallback = 派发当刻浮层字符数。
+                                                        let fallback_committed = window_committed_lens
+                                                            .get(seq)
+                                                            .copied()
+                                                            .unwrap_or(0);
                                                         let _ = acc_event_tx.send(
                                                             PipelineEvent::PreviewReflow {
                                                                 generation: session_generation,
                                                                 seg_index: dispatch_idx,
                                                                 reflow_seq: Some(reflow_seq),
-                                                                committed_len: 0,
+                                                                committed_len: fallback_committed,
                                                                 has_hole: false,
                                                                 acc_text: authoritative,
                                                                 replace_all: true,
+                                                                // 382（3C）：本窗解码完成时刻（端到端埋点）。
+                                                                decode_done_at: Some(decode_done_at),
                                                             },
                                                         );
                                                         reflow_seq += 1;
@@ -8399,84 +8530,98 @@ fn spawn_worker_thread(
                                                     match ev {
                                                         AccWindowStep::Slice((
                                                             idx,
-                                                            _committed_len,
+                                                            committed_len,
                                                             sub_segs,
                                                             _seg_streaming,
                                                         )) => {
-                                                            for s in &sub_segs {
-                                                    recent_slices.push(s.clone());
-                                                }
-                                                total_slices += sub_segs.len();
-                                                while recent_slices.len()
-                                                    > transcription::WINDOW_MAX_SLICES
-                                                {
-                                                    recent_slices.remove(0);
-                                                }
-                                                let durs: Vec<f32> = recent_slices
-                                                    .iter()
-                                                    .map(|s| s.len() as f32 / 16000.0)
-                                                    .collect();
-                                                let start =
-                                                    transcription::group_window_start_secs(
-                                                        &durs,
-                                                        transcription::WINDOW_MAX_SECS,
-                                                    );
-                                                // FIX-WINDOW-DISJOINT-369：窗口 = `recent_slices[start..]`，
-                                                // 其全局切片区间为 `[total_slices - recent_slices.len() + start, total_slices)`。
-                                                let window_start_slice = total_slices
-                                                    .saturating_sub(recent_slices.len())
-                                                    + start;
-                                                let window_end_slice = total_slices;
-                                                let window_audio: Vec<f32> = recent_slices[start..]
-                                                    .iter()
-                                                    .flat_map(|s| s.iter().copied())
-                                                    .collect();
-                                                // FIX-REMOVE-HARDSPLIT-370：滑窗片上限定为 13s（**极端长句兜底**，
-                                                // 对齐滑窗封顶 12s 的**实测体验**：13s≈5.3s vs 12s 的 4.9s，仅差 0.4s；
-                                                // 见 SLIDING_SLICE_MAX_SECS），故单个窗口音频可达 13s。
-                                                // KV 完全不是瓶颈（13s 仅 ~169 tok），本闸门在当前常量下已不可能触发，
-                                                // 保留为**未来调大上限时的廉价不变量护栏**（撞顶是静默丢字，DEC-069）。
-                                                if !transcription::path_b_budget_ok(
-                                                    window_audio.len(),
-                                                    terms,
-                                                ) {
-                                                    log::warn!(
-                                                        "[FIX-REMOVE-HARDSPLIT-370] 窗口音频超 KV 预算（撞顶会被静默截断）：{:.1}s audio_tok={} inject_tok={} max_total_len={}",
-                                                        window_audio.len() as f32 / 16000.0,
-                                                        transcription::expected_audio_tokens(
-                                                            window_audio.len()
-                                                        ),
-                                                        transcription::estimate_inject_tokens(terms),
-                                                        transcription::PATH_B_MAX_TOTAL_LEN
-                                                    );
-                                                }
-                                                // 投池、**不等**（窗口2 不需等窗口1）；dispatch_idx 用于与 337 配对。
-                                                // FIX-PREVIEW-STALE-AND-COLLAPSE-375（B）：随载荷带上产出率均值快照
-                                                // （冷启动 ⇒ None ⇒ 该窗不判坍塌；重解在 worker 内进行，那里有音频）。
-                                                let avg_snapshot =
-                                                    transcription::acc_avg_chars_per_sec(
-                                                        rate_sum_chars,
-                                                        rate_sum_secs,
-                                                        rate_windows,
-                                                    );
-                                                let _ = task_txs[rr % concurrency].send((
-                                                    window_seq,
-                                                    idx,
-                                                    window_audio,
-                                                    avg_snapshot,
-                                                ));
-                                                window_spans
-                                                    .push((window_start_slice, window_end_slice));
-                                                // FIX-PREFIX-AND-EAT-371（B）：本窗各片样本数（与
-                                                // `recent_slices[start..]` 一一对应）。
-                                                window_samples.push(
-                                                    recent_slices[start..]
-                                                        .iter()
-                                                        .map(|s| s.len())
-                                                        .collect(),
-                                                );
-                                                rr += 1;
-                                                window_seq += 1;
+                                                            // 382（问题1）：**逐片**组窗 —— 一次派发带 N 片 ⇒ 派 N 个窗口，
+                                                            // 每窗以**当前这片**收尾。旧实现把 N 片一起 push 后只组**一个**窗口，
+                                                            // 一次派发 18.37s（被切成 13s+5.37s）时只有末尾 5.37s 进窗、13s 那片
+                                                            // 从不进任何窗口 ⇒ 永不解码（Gavin「吃掉前文」）。
+                                                            let prev_base = total_slices - recent_slices.len();
+                                                            let prev_durs: Vec<f32> = recent_slices
+                                                                .iter()
+                                                                .map(|s| s.len() as f32 / 16000.0)
+                                                                .collect();
+                                                            let new_durs: Vec<f32> = sub_segs
+                                                                .iter()
+                                                                .map(|s| s.len() as f32 / 16000.0)
+                                                                .collect();
+                                                            // 覆盖不变量由 plan_windows 保证（每个新片都被某窗覆盖）。
+                                                            let planned = plan_windows(
+                                                                &prev_durs,
+                                                                &new_durs,
+                                                                prev_base,
+                                                            );
+                                                            for (k, s) in sub_segs.into_iter().enumerate() {
+                                                                recent_slices.push(s);
+                                                                total_slices += 1;
+                                                                while recent_slices.len()
+                                                                    > transcription::WINDOW_MAX_SLICES
+                                                                {
+                                                                    recent_slices.remove(0);
+                                                                }
+                                                                let (window_start_slice, window_end_slice) =
+                                                                    planned[k];
+                                                                debug_assert_eq!(
+                                                                    window_end_slice, total_slices,
+                                                                    "382：窗口必须以当前新片收尾"
+                                                                );
+                                                                // 全局区间换算本窗在（已裁剪）buffer 中的起点。
+                                                                let buf_base =
+                                                                    total_slices - recent_slices.len();
+                                                                debug_assert!(window_start_slice >= buf_base);
+                                                                let start = window_start_slice - buf_base;
+                                                                let window_audio: Vec<f32> = recent_slices[start..]
+                                                                    .iter()
+                                                                    .flat_map(|s| s.iter().copied())
+                                                                    .collect();
+                                                                // FIX-SLICE-CUT-AT-GAP-381：切片超 10s 在字缝切（单片约 10~12s，
+                                                                // 窗口上限 10s）。KV 不是瓶颈，本闸门保留为未来调大
+                                                                // 上限时的廉价不变量护栏 —— 撞顶是静默丢字，DEC-069。
+                                                                if !transcription::path_b_budget_ok(
+                                                                    window_audio.len(),
+                                                                    terms,
+                                                                ) {
+                                                                    log::warn!(
+                                                                        "[FIX-REMOVE-HARDSPLIT-370] 窗口音频超 KV 预算（撞顶会被静默截断）：{:.1}s audio_tok={} inject_tok={} max_total_len={}",
+                                                                        window_audio.len() as f32 / 16000.0,
+                                                                        transcription::expected_audio_tokens(
+                                                                            window_audio.len()
+                                                                        ),
+                                                                        transcription::estimate_inject_tokens(terms),
+                                                                        transcription::PATH_B_MAX_TOTAL_LEN
+                                                                    );
+                                                                }
+                                                                // 投**共享**队列、**不等**；dispatch_idx 用于与 337 配对。
+                                                                // 375-B：随载荷带上产出率均值快照（冷启动 ⇒ None ⇒ 不判坍塌）。
+                                                                let avg_snapshot =
+                                                                    transcription::acc_avg_chars_per_sec(
+                                                                        rate_sum_chars,
+                                                                        rate_sum_secs,
+                                                                        rate_windows,
+                                                                    );
+                                                                let _ = task_tx.send((
+                                                                    window_seq,
+                                                                    idx,
+                                                                    window_audio,
+                                                                    avg_snapshot,
+                                                                    std::time::Instant::now(),
+                                                                ));
+                                                                window_spans
+                                                                    .push((window_start_slice, window_end_slice));
+                                                                // FIX-PREFIX-AND-EAT-371（B）：本窗各片样本数（与
+                                                                // `recent_slices[start..]` 一一对应）。
+                                                                window_samples.push(
+                                                                    recent_slices[start..]
+                                                                        .iter()
+                                                                        .map(|s| s.len())
+                                                                        .collect(),
+                                                                );
+                                                                // 382（3A）：派发当刻浮层字符数（fallback 边界）。
+                                                                window_committed_lens.push(committed_len);
+                                                                window_seq += 1;
+                                                            }
                                                         }
                                                         AccWindowStep::Result(res) => {
                                                             harvest_acc_window!(res)
@@ -8492,7 +8637,7 @@ fn spawn_worker_thread(
                                             drop(step);
                                             // 收尾：等齐所有在飞窗口（共 window_seq 条）。
                                             // select 期间已收的已计入 `done`；本段只等还没收的。
-                                            drop(task_txs);
+                                            drop(task_tx);
                                             while done < window_seq {
                                                 let Ok(res) = res_rx.recv() else {
                                                     break;
@@ -8576,6 +8721,34 @@ fn spawn_worker_thread(
                             // 含 ASR flush + accuracy 尾片解码（中间片已在说话时并行算完）。
                             let t_stop = std::time::Instant::now();
                             let asr_result = asr_handle.join();
+                            // FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382（问题2）：路A（ASR flush）已结束，
+                            // 但路B 尾窗可能仍在解码 ⇒ **立即**推「收尾预览 + 识别处理中」，不等
+                            // `acc_handle.join()`（否则界面停在录音态，用户感知卡顿）。282 顺序不变：
+                            // 预览先、处理态后。文案与 `run_pipeline_core` 同源（`overlay_processing`）。
+                            if let Ok(Ok((preview_text, _pcm))) = &asr_result {
+                                if !preview_text.is_empty() {
+                                    let _ = event_tx.send(PipelineEvent::StreamingFinalPreview(
+                                        preview_text.clone(),
+                                    ));
+                                }
+                            }
+                            let _ = event_tx.send(PipelineEvent::Processing(
+                                i18n::get(config.ui_language).overlay_processing.to_string(),
+                            ));
+                            // 382（问题2 埋点）：松键 → 处理态显示的时延（仅 Windows）。
+                            #[cfg(target_os = "windows")]
+                            {
+                                if log::log_enabled!(log::Level::Debug) {
+                                    let stop_tick = STOP_RECEIVED_TICK.load(Ordering::Acquire);
+                                    if stop_tick != 0 {
+                                        log::debug!(
+                                            "[LocalRT-DBG-380] stop_to_processing_ms={}",
+                                            (unsafe { GetTickCount64() } as u32)
+                                                .wrapping_sub(stop_tick as u32)
+                                        );
+                                    }
+                                }
+                            }
                             let acc_result = acc_handle.map(|h| h.join());
                             (
                                 asr_result,
@@ -8757,7 +8930,10 @@ fn spawn_worker_thread(
                             continue;
                         }
 
-                        let (final_preview, local_pcm) = match asr_result {
+                        // 382（问题2）：收尾预览已在 `acc_handle.join()` **之前**发出（见上，
+                        // `StreamingFinalPreview` 立刻上屏、不等路B 尾窗）⇒ 这里的预览文本不再重复发送
+                        //（否则会把已切到处理态的浮层拉回预览态 = 闪回）。最终文本仍由 accuracy 2pass 重打。
+                        let (_final_preview, local_pcm) = match asr_result {
                             // 预览文本本用于收尾显示（282）；最终文本仍由 accuracy 2pass 重打（DEC-067）。
                             Ok(Ok((preview_text, pcm))) => (preview_text, pcm),
                             Ok(Err(e)) => {
@@ -8780,15 +8956,9 @@ fn spawn_worker_thread(
                             }
                         };
 
-                        // LOCALRT-FIRSTCHAR-282：把 flush 的最终预览全文经**专用事件**送达 overlay
-                        // （`StreamingText` 会被 `STREAMING_STOPPED` latch 丢掉；本事件只有本地档发/收）。
-                        // 必须早于 run_pipeline_core 的 `Processing` 事件 ⇒ 收尾预览先显示、再切处理态。
-                        if !final_preview.is_empty() {
-                            send_event(
-                                &event_tx,
-                                PipelineEvent::StreamingFinalPreview(final_preview),
-                            );
-                        }
+                        // LOCALRT-FIRSTCHAR-282 的 `StreamingFinalPreview` 发送已上移到
+                        // `acc_handle.join()` 之前（382 问题2）⇒ 此处不再发送，避免把已切到处理态的浮层
+                        // 拉回预览态（闪回）。`StreamingText` 仍会被 `STREAMING_STOPPED` latch 丢掉。
 
                         // 下游与批处理路径同构：PCM 作 samples，initial_text=None。
                         let transcriber = match &transcriber {
@@ -9959,8 +10129,75 @@ fn select_learning_baseline(
     }
 }
 
+/// 382：只更新权威状态（`ACC_REFLOW_STATE`），**不重画浮层**。用于「本代 Processing 已开始 ⇒
+/// 回灌只更新状态、不重画」的抑制路径（防闪回）。
+#[cfg(target_os = "windows")]
+fn set_acc_reflow_state_only(generation: u64, acc_text: &str, committed_len: usize) {
+    if let Ok(mut st) = ACC_REFLOW_STATE.lock() {
+        *st = Some((generation, acc_text.to_string(), committed_len));
+    }
+}
+
+/// 382：权威回灌的**渲染**（更新权威状态 + 镜像 + 重画浮层）。`accurate` 仅用于埋点标注
+/// `boundary=known|fallback`；`decode_done_at` 用于 3C 的端到端 `decode_done→render_ms`。
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn render_authoritative_reflow(
+    overlay_handle: &OverlayThreadHandle,
+    opacity: f32,
+    ui_language: config::UiLanguage,
+    last_streaming_text: &Arc<Mutex<Option<String>>>,
+    generation: u64,
+    seg_index: usize,
+    acc_text: &str,
+    replace_all: bool,
+    committed_len: usize,
+    accurate: bool,
+    decode_done_at: Option<std::time::Instant>,
+) {
+    let streaming = last_streaming_text
+        .lock()
+        .ok()
+        .and_then(|m| m.clone())
+        .unwrap_or_default();
+    // SLIDING-WINDOW-367：replace_all ⇒ 整段替换预览为权威全文（滑窗文本非流式前缀关系，
+    // 不能按 committed_len 切）；否则沿用 325「替换前 len 字、保留流式尾巴」。
+    let preview = reflow_preview_367(replace_all, acc_text, &streaming, committed_len);
+    set_acc_reflow_state_only(generation, acc_text, committed_len);
+    if let Ok(mut mirror) = last_streaming_text.lock() {
+        *mirror = Some(preview.clone());
+    }
+    if let Some(t0) = decode_done_at {
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "[LocalRT-DBG-382] reflow latency: seq={} decode_done→render_ms={:.0} boundary={}",
+                seg_index,
+                t0.elapsed().as_secs_f64() * 1000.0,
+                if accurate { "known" } else { "fallback" }
+            );
+        }
+    }
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "[LocalRT-DBG-337] reflow applied: seg={} committed_len={} acc_len={} preview_len={}",
+            seg_index,
+            committed_len,
+            acc_text.chars().count(),
+            preview.chars().count()
+        );
+    }
+    show_overlay(
+        overlay_handle,
+        opacity,
+        ui_language,
+        OverlayStatus::RecordingWithText { text: preview },
+    );
+}
+
 /// LOCALRT-SEAM-337：当某片的 `acc_text` 与 `boundary` 都到齐时解析——合成并渲染（`Some`），
 /// 或作废（`None`，保持纯流式）。两槽一次消费，防重复应用。
+/// 🔴 382 起 `replace_all` 不再走本函数（改走 [`ReflowFastState`] 立即渲染）；本函数仅供
+/// **老逐片路径**（已无发送方），逐位不变。
 #[cfg(target_os = "windows")]
 fn try_resolve_reflow(
     overlay_handle: &OverlayThreadHandle,
@@ -9984,34 +10221,19 @@ fn try_resolve_reflow(
     }
     match bound_opt {
         Some(len) if !acc_text.is_empty() => {
-            let streaming = last_streaming_text
-                .lock()
-                .ok()
-                .and_then(|m| m.clone())
-                .unwrap_or_default();
-            // SLIDING-WINDOW-367：replace_all ⇒ 整段替换预览为权威全文（滑窗文本非流式前缀
-            // 关系，不能按 committed_len 切）；否则沿用 325「替换前 len 字、保留流式尾巴」。
-            let preview = reflow_preview_367(replace_all, &acc_text, &streaming, len);
-            if let Ok(mut st) = ACC_REFLOW_STATE.lock() {
-                *st = Some((ga, acc_text.clone(), len));
-            }
-            if let Ok(mut mirror) = last_streaming_text.lock() {
-                *mirror = Some(preview.clone());
-            }
-            if log::log_enabled!(log::Level::Debug) {
-                log::debug!(
-                    "[LocalRT-DBG-337] reflow applied: seg={} committed_len={} acc_len={} preview_len={}",
-                    sa,
-                    len,
-                    acc_text.chars().count(),
-                    preview.chars().count()
-                );
-            }
-            show_overlay(
+            // 老逐片路径：边界已配对 ⇒ 用准确边界渲染（accurate=true），无 3C 埋点。
+            render_authoritative_reflow(
                 overlay_handle,
                 opacity,
                 ui_language,
-                OverlayStatus::RecordingWithText { text: preview },
+                last_streaming_text,
+                ga,
+                sa,
+                &acc_text,
+                replace_all,
+                len,
+                true,
+                None,
             );
         }
         _ => {
@@ -10709,8 +10931,19 @@ mod parallel_acc_298_tests {
 type AccSliceMsg = (usize, usize, Vec<Vec<f32>>, String);
 
 /// FIX-PREVIEW-HARVEST-380（A）：滑窗解码结果载荷
-/// `(window_seq, dispatch_idx, 解码结果, 解码耗时 ms)`。
-type AccDecodeResult = (usize, usize, anyhow::Result<(String, bool)>, f64);
+/// `(window_seq, dispatch_idx, 解码结果, 解码耗时 ms, 解码完成时刻)`。
+/// 382（3C）：末元 `Instant` 随 `PreviewReflow.decode_done_at` 带到消费端，测「解完 → 浮层重画」。
+type AccDecodeResult = (
+    usize,
+    usize,
+    anyhow::Result<(String, bool)>,
+    f64,
+    std::time::Instant,
+);
+
+/// FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382：滑窗解码任务载荷
+/// `(window_seq, dispatch_idx, 本窗音频, 产出率均值快照, 派发时刻)`（末元供 3C `queued_ms`）。
+type AccTaskMsg = (usize, usize, Vec<f32>, Option<f32>, std::time::Instant);
 
 /// FIX-PREVIEW-HARVEST-380（A）：滑窗线程的一步（新切片 / 解码结果）。
 enum AccWindowStep<A, R> {
@@ -10808,6 +11041,405 @@ mod preview_harvest_380_tests {
         drop(res_tx);
         handle.join().expect("driver thread");
         assert_eq!(&*seen.lock().unwrap(), &["slice", "result"]);
+    }
+}
+
+// ============================================================
+// FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382（问题1）：逐片组窗（纯函数）
+// ============================================================
+
+/// 382：按「**逐片**派发窗口」计划组窗（纯函数，可单测）。
+///
+/// 输入：`prev_durs` = 已派发片时长（时间序，调用方保证已按 `WINDOW_MAX_SLICES` 裁剪）；
+/// `new_durs` = 本次派发携带的新片时长（时间序）；`prev_base` = `prev_durs[0]` 的**全局切片下标**。
+///
+/// 输出：每个新片对应**一个**窗口的全局切片区间 `[start, end)`（`end` 开区间），长度 = `new_durs.len()`；
+/// 第 k 个窗口以第 k 个新片收尾（`end-1` == 该新片全局下标）。
+///
+/// 🔴 覆盖不变量（本函数存在的理由）：逐片组窗 ⇒ **每个新切片的全局下标都落在至少一个窗口区间内**。
+/// 旧实现把同一次派发的 N 片一起 push 后只组**一个**窗口 ⇒ 一次派发带 2 片（18.37s ⇒ 13s+5.37s）时
+/// 只有末尾片进窗、13s 那片从不解码（Gavin「吃掉前文」）。
+fn plan_windows(prev_durs: &[f32], new_durs: &[f32], prev_base: usize) -> Vec<(usize, usize)> {
+    let mut buf: Vec<f32> = prev_durs.to_vec();
+    let mut base = prev_base; // buf[0] 的全局下标
+    let mut out = Vec::with_capacity(new_durs.len());
+    for nd in new_durs {
+        buf.push(*nd);
+        while buf.len() > transcription::WINDOW_MAX_SLICES {
+            buf.remove(0);
+            base += 1;
+        }
+        let end = base + buf.len();
+        let s = transcription::group_window_start_secs(&buf, transcription::WINDOW_MAX_SECS);
+        out.push((base + s, end));
+    }
+    out
+}
+
+#[cfg(test)]
+mod plan_windows_382_tests {
+    use super::plan_windows;
+    use crate::transcription;
+
+    fn covered(windows: &[(usize, usize)], idx: usize) -> bool {
+        windows.iter().any(|(s, e)| *s <= idx && idx < *e)
+    }
+
+    /// 主判据：新片 [10.3, 5.37]（无前片）⇒ 2 个窗口 `[0,1)` / `[1,2)`，全覆盖。
+    #[test]
+    fn plan_covers_all_new_slices_no_prev() {
+        let w = plan_windows(&[], &[10.3, 5.37], 0);
+        assert_eq!(w, vec![(0, 1), (1, 2)]);
+        assert!(covered(&w, 0) && covered(&w, 1), "每个新片都必须被覆盖");
+        assert_eq!(w[0].1, 1, "第 0 窗以新片 0 收尾");
+        assert_eq!(w[1].1, 2, "第 1 窗以新片 1 收尾");
+    }
+
+    /// 新片 [10.2,10.6,4] + 前片 [3,2] ⇒ 每个新片（全局 2/3/4）都被覆盖。
+    #[test]
+    fn plan_covers_all_new_slices_with_prev() {
+        let w = plan_windows(&[3.0, 2.0], &[10.2, 10.6, 4.0], 0);
+        for idx in 2..5 {
+            assert!(covered(&w, idx), "新片全局下标 {} 必须被某窗口覆盖", idx);
+        }
+        assert_eq!(
+            w.iter().map(|(_, e)| *e).collect::<Vec<_>>(),
+            vec![3, 4, 5],
+            "每窗以对应新片收尾"
+        );
+    }
+
+    /// 常态单片派发 ⇒ 与改前「单片组窗」结果**完全一致**（回归护栏）。
+    #[test]
+    fn plan_single_slice_matches_legacy_grouping() {
+        let prev = vec![1.0f32, 1.0, 1.0];
+        let w = plan_windows(&prev, &[3.0], 0);
+        let mut buf = prev.clone();
+        buf.push(3.0);
+        let s = transcription::group_window_start_secs(&buf, transcription::WINDOW_MAX_SECS);
+        assert_eq!(w, vec![(s, 4)]);
+    }
+
+    /// 覆盖不变量：任意片长序列，逐片计划后**每个**全局下标都被覆盖（含触发裁剪的长序列）。
+    #[test]
+    fn plan_covers_every_index_for_arbitrary_lengths() {
+        let all = [9.0f32, 9.0, 9.0, 9.0, 2.0, 14.0, 1.0, 11.0];
+        let mut windows: Vec<(usize, usize)> = Vec::new();
+        for i in 0..all.len() {
+            windows.extend(plan_windows(&all[..i], &all[i..=i], 0));
+        }
+        for idx in 0..all.len() {
+            assert!(covered(&windows, idx), "全局下标 {} 未被任何窗口覆盖", idx);
+        }
+    }
+}
+
+// ============================================================
+// FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382（3A）：replace_all 回灌
+// 「立即渲染」状态机（纯函数；controller 线程侧只做 I/O 转接）
+// ============================================================
+
+/// 382（3A）：一次状态机推进的结果。
+#[cfg(target_os = "windows")]
+#[derive(Debug, PartialEq, Eq)]
+enum ReflowFastOutcome {
+    /// 无动作（例如边界到、但对应 seg 已不是最新已渲染）。
+    None,
+    /// 应更新权威状态；`render=true` 才重画浮层（`false` = Processing 已开始，只更新状态不重画）。
+    Apply {
+        text: String,
+        committed_len: usize,
+        accurate: bool,
+        render: bool,
+    },
+}
+
+/// 382（3A）：`replace_all=true` 回灌的快速路径状态机。
+///
+/// 背景：325/337 时代 `PreviewReflow` 只登记全文、必须等同片 `ReflowCommit` 边界配对才渲染；
+/// 现在唯一发送点恒 `replace_all=true`（整段替换），「等边界」只会**白白延迟**（日志：1 次多等 0.4s、
+/// 2 次单槽被覆盖永不配对、1 次 `boundary=b` 整次扣下）。本状态机：全文一到**立即**用「已知边界 or
+/// 派发当刻 `committed_len`」渲染；边界后到且该 seg 仍是最新已渲染 ⇒ 用准确边界再渲染一次。
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct ReflowFastState {
+    /// 最新登记全文 + 派发当刻 fallback：`(gen, seg, text, fallback_len)`。
+    latest: Option<(u64, usize, String, usize)>,
+    /// 边界登记 `(gen, seg) -> Option<usize>`（`None` = b 类「本片无准确边界」）。小 map，按代清空。
+    bounds: Vec<((u64, usize), Option<usize>)>,
+    /// 最近一次**应渲染**的 `(gen, seg)`（判断晚到边界是否该重渲染）。
+    rendered: Option<(u64, usize)>,
+}
+
+#[cfg(target_os = "windows")]
+impl ReflowFastState {
+    fn clear(&mut self) {
+        self.latest = None;
+        self.bounds.clear();
+        self.rendered = None;
+    }
+
+    fn bound_of(&self, gen: u64, seg: usize) -> Option<Option<usize>> {
+        self.bounds
+            .iter()
+            .rev()
+            .find(|((g, s), _)| *g == gen && *s == seg)
+            .map(|(_, v)| *v)
+    }
+
+    /// 收到一条权威全文（已过 `reflow_action` 的编辑/取消/陈旧/洞/空判据）。
+    /// `suppressed` = 本代已进入 Processing（只跳过重画，权威状态照常更新）。
+    fn on_text(
+        &mut self,
+        gen: u64,
+        seg: usize,
+        text: String,
+        fallback_len: usize,
+        suppressed: bool,
+    ) -> ReflowFastOutcome {
+        self.latest = Some((gen, seg, text.clone(), fallback_len));
+        self.rendered = Some((gen, seg));
+        let (len, accurate) = match self.bound_of(gen, seg) {
+            Some(Some(l)) => (l, true),
+            _ => (fallback_len, false),
+        };
+        ReflowFastOutcome::Apply {
+            text,
+            committed_len: len,
+            accurate,
+            render: !suppressed,
+        }
+    }
+
+    /// 收到一条边界。若对应 seg 是**最新已渲染**全文 ⇒ 用准确边界再渲染一次。
+    fn on_bound(
+        &mut self,
+        gen: u64,
+        seg: usize,
+        len: Option<usize>,
+        suppressed: bool,
+    ) -> ReflowFastOutcome {
+        if let Some(e) = self
+            .bounds
+            .iter_mut()
+            .find(|((g, s), _)| *g == gen && *s == seg)
+        {
+            e.1 = len;
+        } else {
+            self.bounds.push(((gen, seg), len));
+        }
+        if self.rendered == Some((gen, seg)) {
+            if let (Some(l), Some((g2, s2, text, _))) = (len, self.latest.as_ref()) {
+                if (*g2, *s2) == (gen, seg) {
+                    return ReflowFastOutcome::Apply {
+                        text: text.clone(),
+                        committed_len: l,
+                        accurate: true,
+                        render: !suppressed,
+                    };
+                }
+            }
+        }
+        ReflowFastOutcome::None
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod reflow_fast_382_tests {
+    use super::{ReflowFastOutcome, ReflowFastState};
+
+    fn apply(o: ReflowFastOutcome) -> (String, usize, bool, bool) {
+        match o {
+            ReflowFastOutcome::Apply {
+                text,
+                committed_len,
+                accurate,
+                render,
+            } => (text, committed_len, accurate, render),
+            ReflowFastOutcome::None => panic!("expected Apply, got None"),
+        }
+    }
+
+    /// 边界**后到**：全文先渲染（fallback），边界到后用准确值再渲染一次。
+    #[test]
+    fn text_then_bound_renders_twice_final_accurate() {
+        let mut st = ReflowFastState::default();
+        let a = apply(st.on_text(1, 5, "acc".into(), 3, false));
+        assert_eq!(a, ("acc".into(), 3, false, true));
+        let b = apply(st.on_bound(1, 5, Some(7), false));
+        assert_eq!(b, ("acc".into(), 7, true, true));
+    }
+
+    /// 边界**先到**：全文一到即用准确边界渲染（只渲染一次）。
+    #[test]
+    fn bound_then_text_renders_once_accurate() {
+        let mut st = ReflowFastState::default();
+        assert_eq!(st.on_bound(1, 5, Some(7), false), ReflowFastOutcome::None);
+        let a = apply(st.on_text(1, 5, "acc".into(), 3, false));
+        assert_eq!(a, ("acc".into(), 7, true, true));
+    }
+
+    /// b 类边界（`None`）：全文用 fallback 渲染；边界到**不**重渲染（无准确值）。
+    #[test]
+    fn b_bound_uses_fallback_and_no_rerender() {
+        let mut st = ReflowFastState::default();
+        let a = apply(st.on_text(1, 5, "acc".into(), 3, false));
+        assert_eq!(a, ("acc".into(), 3, false, true));
+        assert_eq!(st.on_bound(1, 5, None, false), ReflowFastOutcome::None);
+    }
+
+    /// 两个 seg 交错：旧 seg 的边界到不改浮层；最新 seg 的边界到才重渲染。
+    #[test]
+    fn interleaved_segs_only_latest_rerenders() {
+        let mut st = ReflowFastState::default();
+        apply(st.on_text(1, 5, "five".into(), 1, false));
+        apply(st.on_text(1, 6, "six".into(), 1, false));
+        assert_eq!(st.on_bound(1, 5, Some(9), false), ReflowFastOutcome::None);
+        let b = apply(st.on_bound(1, 6, Some(4), false));
+        assert_eq!(b, ("six".into(), 4, true, true));
+    }
+
+    /// Processing 之后到达的 PreviewReflow：只更新状态、不重画（render=false）；之前正常（render=true）。
+    #[test]
+    fn suppressed_after_processing_skips_render_only() {
+        let mut st = ReflowFastState::default();
+        let before = apply(st.on_text(1, 5, "a".into(), 2, false));
+        assert!(before.3, "Processing 之前的回灌必须正常渲染");
+        let after = apply(st.on_text(1, 6, "b".into(), 2, true));
+        assert!(!after.3, "Processing 之后的回灌不得重画浮层");
+        assert_eq!(after.0, "b", "但权威状态照常更新");
+    }
+}
+
+#[cfg(test)]
+mod problem2_order_382_tests {
+    /// 生产区（剔除 cfg(test) 与纯注释行）。
+    fn code_lines() -> Vec<String> {
+        crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"))
+            .into_iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect()
+    }
+
+    /// 382（问题2）源码级顺序护栏：`StreamingFinalPreview` 发送 < `Processing` 发送 < `acc_handle` 的
+    /// join；且 join 之后不得再发 `StreamingFinalPreview`（防把已切处理态的浮层拉回预览态 = 闪回）。
+    #[test]
+    fn early_preview_then_processing_before_acc_join() {
+        let lines = code_lines();
+        let asr = lines
+            .iter()
+            .position(|l| {
+                l.trim_start()
+                    .starts_with("let asr_result = asr_handle.join();")
+            })
+            .expect("382: asr_handle.join 锚点");
+        let acc = lines
+            .iter()
+            .position(|l| {
+                l.trim_start()
+                    .starts_with("let acc_result = acc_handle.map")
+            })
+            .expect("382: acc_handle.join 锚点");
+        assert!(asr < acc, "382: asr_handle.join 必须先于 acc_handle.join");
+        let fp = lines[asr..acc]
+            .iter()
+            .position(|l| l.contains("send(PipelineEvent::StreamingFinalPreview("))
+            .expect("382: StreamingFinalPreview 必须在 acc_join 之前发（问题2）");
+        let pr = lines[asr..acc]
+            .iter()
+            .position(|l| l.contains("send(PipelineEvent::Processing("))
+            .expect("382: Processing 必须在 acc_join 之前发（问题2）");
+        assert!(
+            fp < pr,
+            "282 顺序：StreamingFinalPreview 必须先于 Processing"
+        );
+        assert!(
+            !lines[acc..]
+                .iter()
+                .any(|l| l.contains("send(PipelineEvent::StreamingFinalPreview(")),
+            "382：acc_join 之后不得再发 StreamingFinalPreview（闪回）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shared_queue_382_tests {
+    /// 382（3B）：单个共享任务通道的**多消费者**语义 —— 一个 worker 卡在长任务时，下一个任务被
+    /// 空闲 worker 立刻取走（旧 `rr % concurrency` 会把它排在忙的 worker 后面）。先后由通道制造、
+    /// 不用 sleep 定时序；`recv_timeout` 仅作挂死兜底。
+    #[test]
+    fn idle_worker_takes_next_while_other_busy() {
+        let (task_tx, task_rx) = crossbeam_channel::unbounded::<u32>();
+        let (started_tx, started_rx) = crossbeam_channel::unbounded::<u32>();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded::<()>();
+        let (done_tx, done_rx) = crossbeam_channel::unbounded::<u32>();
+        for _ in 0..2 {
+            let trx = task_rx.clone();
+            let stx = started_tx.clone();
+            let rrx = release_rx.clone();
+            let dtx = done_tx.clone();
+            std::thread::spawn(move || {
+                for id in trx {
+                    let _ = stx.send(id);
+                    if id == 1 {
+                        let _ = rrx.recv(); // 任务 1 = 长任务：卡住该 worker
+                    }
+                    let _ = dtx.send(id);
+                }
+            });
+        }
+        drop(started_tx);
+        drop(done_tx);
+        let dl = std::time::Duration::from_secs(5);
+        task_tx.send(1).expect("send task1");
+        assert_eq!(started_rx.recv_timeout(dl).expect("task1 taken"), 1);
+        task_tx.send(2).expect("send task2");
+        assert_eq!(
+            started_rx
+                .recv_timeout(dl)
+                .expect("task2 must be taken by the idle worker"),
+            2
+        );
+        release_tx.send(()).expect("release task1");
+        let mut got = vec![
+            done_rx.recv_timeout(dl).expect("task done"),
+            done_rx.recv_timeout(dl).expect("task done"),
+        ];
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2]);
+    }
+
+    /// 生产侧结构护栏：必须用**单一共享** task 通道（`task_rx.clone()` 给每个 worker），
+    /// 不得退回「每 worker 一个发送端 + `rr % concurrency`」。
+    #[test]
+    fn production_uses_single_shared_task_queue() {
+        let lines: Vec<String> =
+            crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"))
+                .into_iter()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.contains("let (task_tx, task_rx) ="))
+                .count(),
+            1,
+            "382(3B): 必须恰有一处单一共享 task 通道 `let (task_tx, task_rx)`"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("for _ in 0..concurrency")),
+            "382(3B): 必须有并发 worker 循环"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("task_rx.clone()")),
+            "382(3B): worker 必须 clone 同一个 task_rx（共享队列）"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("task_txs") || l.contains("% concurrency")),
+            "382(3B): 不得退回每 worker 一个发送端 / `rr % concurrency`"
+        );
     }
 }
 

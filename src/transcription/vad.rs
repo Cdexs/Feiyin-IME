@@ -23,22 +23,37 @@ pub const SEGMENT_MAX_SECS: f64 = 20.0;
 /// 段前后 padding：保护边界音节（送气清声母 ~60-100ms）。200ms = 3200 samples @ 16kHz。
 pub const SEGMENT_PADDING_SAMPLES: usize = 3200;
 
-/// FIX-REMOVE-HARDSPLIT-370：**滑窗（accuracy 派发）路径**的单片上限 = 13s（Gavin 定，最终值）。
+/// FIX-SLICE-CUT-AT-GAP-381：滑窗（accuracy 派发）路径的**字缝切点起始搜索位置** = 10s。
 ///
-/// 🔴 这是【**极端情况的上限值**】，**不是常态参数** —— 一口气不停顿说满 13 秒已不常见；
-/// 常态片由 1200ms 静默切出（通常几秒～十几秒）⇒ 该阀只在极端长句时兜底。
+/// 🔴 Gavin 2026-09-23 统一口径（原话见本单任务书）：**窗口上限与切片起搜点统一为 10s**
+/// ——「单窗口主窗最大音频长度 12 秒」与「最长连续语音硬切点 13 秒」这两个时间点同时作废。
+/// 单片剩余长度超过 10s ⇒ 从「本片起点 + 10s」往后找第一个**字缝**切（见 [`plan_gap_cuts`]），
+/// 不再按固定秒数硬切 —— 硬切点可能正好落在字上，把字切碎导致识别出错。
 ///
-/// 🔴 **取值依据 = 对齐滑动窗口封顶（`WINDOW_MAX_SECS`=12s）的同一水平**（Gavin 端测**实测体验**，非估算）：
-/// - Gavin 端测确认：滑窗「**12s 窗口解码 + 回灌刷新预览**」这条链**没有明显卡顿、比较流畅**
-///   ⇒ 以该实测体验为基准取 13s。
-/// - 13s 解码约 **5.3 秒**（RTF 0.41），与典型 12s 窗的 **4.9 秒**仅差 0.4 秒（1.08 倍）
-///   ⇒ 触发该阀时的体验与平时几乎无差别，不会出现突兀卡顿。
-/// - 被否的取值：16s ⇒ 6.6 秒（Gavin：「还是有点长」）；30s ⇒ 12.3 秒；90s ⇒ **36.9 秒**（典型窗 7.5 倍）。
-/// - **KV 与内存均非瓶颈**：13s 仅约 **169** audio token，占 `max_total_len=4096` 的极小部分。
-///   ⚠️ 先前按 90s 做的「6.5~8.5GB 内存外推 + E2E 实测建议」**已随本阀值作废**。
-/// - **与「只按 1200ms 静默切片」原则的关系**：本阀仅在极端长句时兜底；超出继续切、**不丢内容**
-///   （369：零重叠 ⇒ 直接拼接）。
-pub const SLIDING_SLICE_MAX_SECS: f64 = 13.0;
+/// 🔴 必须与 `WINDOW_MAX_SECS`（`transcription/mod.rs`，组窗上限）**相等** ——
+/// 由单测 `sliding_cut_search_start_equals_window_max` 锁定，防二者再次漂移。
+pub const SLIDING_CUT_SEARCH_START_SECS: f64 = 10.0;
+
+/// FIX-SLICE-CUT-AT-GAP-381：字缝搜索的**最远兜底偏移** = 2.0s（即最晚切到 12s）。
+///
+/// 从 [`SLIDING_CUT_SEARCH_START_SECS`](10s) 起最多再往后搜这么久；仍找不到达标字缝 ⇒
+/// 在 [10s, 12s] 内取 RMS **最低**的帧切。任何情况下都不会无限变长（有硬上限）。
+pub const GAP_SEARCH_MAX_SECS: f64 = 2.0;
+
+/// FIX-SLICE-CUT-AT-GAP-381：字缝能量判据 —— 帧 RMS ≤ 该比值 × 本片前 10s 帧 RMS 的**中位数**。
+///
+/// 用**相对阈值**（对本片前 10s 的中位数取比）⇒ 不受麦克风增益 / 整体音量影响。
+/// 初值 0.3（主控方案），由本单实测校准（`poc_slice_cut_381`）。
+pub const GAP_RMS_RATIO: f32 = 0.3;
+
+/// FIX-SLICE-CUT-AT-GAP-381：**尾巴保护** —— 剩余长度 < 起搜点 + 此值 ⇒ 不切。
+///
+/// 即剩余 < 11s 时整段作为一片（最长约 11s），避免切出零点几秒的碎片单独解码；
+/// 超过窗口上限的单片由 `group_window_start_secs` 单独成窗，KV 远非瓶颈。
+pub const MIN_TAIL_SECS: f64 = 1.0;
+
+/// FIX-SLICE-CUT-AT-GAP-381：字缝能量帧长 = 20ms @16kHz = 320 样本。
+pub const GAP_FRAME_SAMPLES: usize = 320;
 
 /// silero VAD 窗口大小（512 samples = 32ms @ 16kHz，silero_vad.onnx 要求）
 const VAD_WINDOW_SIZE: i32 = 512;
@@ -230,11 +245,9 @@ pub fn build_padded_segments(
 
 /// FIX-REMOVE-HARDSPLIT-370：`max_seg_secs` **显式声明**单段长度上限（DEC-066，不靠输入长度反推）。
 ///
-/// 两个调用方的上限与**理由都不同**：
-/// - 其它路径（VAD 分段 / 本地离线 accuracy）：`SEGMENT_MAX_SECS`(20s) —— native
-///   `max_total_len=512` 时代遗留，逐位不变；
-/// - 滑窗派发路径：`SLIDING_SLICE_MAX_SECS`(13s) —— **极端长句兜底**（见该常量注释），
-///   不是常规切片规则：常态片原样解码，只在「一口气说满 13s 无停顿」时才切。
+/// 其它路径（VAD 分段 / 本地离线 accuracy）传 `SEGMENT_MAX_SECS`(20s) —— native
+/// `max_total_len=512` 时代遗留，逐位不变。
+/// 🔴 滑窗派发路径**不再**走本函数（FIX-SLICE-CUT-AT-GAP-381 起改走 [`build_sliding_segments`]）。
 ///
 /// 无论上限多少，都保留 FIX-VAD-STATE-RESET-001 的边界过滤/clamp 与 200ms 边界 padding。
 pub fn build_padded_segments_capped(
@@ -243,15 +256,37 @@ pub fn build_padded_segments_capped(
     full_audio: &[f32],
     max_seg_secs: f64,
 ) -> Vec<Vec<f32>> {
+    let merged = plan_hard_cuts(raw, total_samples, max_seg_secs);
+    pad_and_extract(&merged, total_samples, full_audio)
+}
+
+/// FIX-SLICE-CUT-AT-GAP-381：滑窗（accuracy 派发）路径专用片构建 —— 超限片按**字缝**切。
+///
+/// 与 [`build_padded_segments_capped`] 的差异**仅在「超限片怎么切」**：
+/// - 前者：固定秒数**硬切**（切点可能落在字中间，把字切碎 ⇒ 识别出错）；
+/// - 本函数：超限片交给 [`plan_gap_cuts`] 从 10s 起找字缝切（找不到取 RMS 最低帧兜底）。
+///
+/// 200ms 边界 padding 与 FIX-VAD-STATE-RESET-001 边界过滤/clamp **完全沿用**
+/// （`plan_sliding_cuts` 与 `plan_hard_cuts` 共用同一段过滤代码）。
+pub fn build_sliding_segments(
+    raw: &[(usize, usize)],
+    total_samples: usize,
+    full_audio: &[f32],
+) -> Vec<Vec<f32>> {
+    let merged = plan_sliding_cuts(raw, total_samples, full_audio);
+    pad_and_extract(&merged, total_samples, full_audio)
+}
+
+/// FIX-VAD-STATE-RESET-001 边界过滤 + 固定秒数硬切/合并相邻短段（原 `build_padded_segments_capped` 第一步）。
+fn plan_hard_cuts(
+    raw: &[(usize, usize)],
+    total_samples: usize,
+    max_seg_secs: f64,
+) -> Vec<(usize, usize)> {
     if raw.is_empty() {
         return Vec::new();
     }
     let max_seg_samples = (max_seg_secs * 16000.0) as usize;
-    let pad = SEGMENT_PADDING_SAMPLES;
-
-    // 第一步：边界过滤 + 硬切/合并相邻短段 → (start, end) 列表
-    // FIX-VAD-STATE-RESET-001: 丢弃 start 越界的段（detector 游标未重置
-    // 致 seg.start() 返回跨音频累计坐标），clamp end 越界段
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for &(start, len) in raw {
         if start >= total_samples {
@@ -268,7 +303,7 @@ pub fn build_padded_segments_capped(
             continue;
         }
         if clamped_len >= max_seg_samples {
-            // 单段超上限：硬切（滑窗路径 13s 兜底 / 其它路径 20s 遗留上限）
+            // 单段超上限：硬切
             let mut pos = start;
             while pos < end {
                 let sub_end = (pos + max_seg_samples).min(end);
@@ -286,12 +321,188 @@ pub fn build_padded_segments_capped(
         }
         merged.push((start, end));
     }
+    merged
+}
 
+/// FIX-SLICE-CUT-AT-GAP-381：滑窗路径的切片规划 —— 与 [`plan_hard_cuts`] 同构，
+/// 唯一差异是「超限片」改走 [`plan_gap_cuts`]（字缝切）；边界过滤/clamp/相邻短段合并**逐位不变**。
+///
+/// 合并上限取 [`SLIDING_CUT_SEARCH_START_SECS`](10s)：合并后 ≤10s 的相邻段直接并成一片（不切）。
+fn plan_sliding_cuts(
+    raw: &[(usize, usize)],
+    total_samples: usize,
+    full_audio: &[f32],
+) -> Vec<(usize, usize)> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let max_seg_samples = (SLIDING_CUT_SEARCH_START_SECS * 16000.0) as usize;
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for &(start, len) in raw {
+        if start >= total_samples {
+            log::warn!(
+                "VAD segment start {} >= total_samples {}, dropping (detector cursor not reset?)",
+                start,
+                total_samples
+            );
+            continue;
+        }
+        let end = (start + len).min(total_samples);
+        let clamped_len = end - start;
+        if clamped_len == 0 {
+            continue;
+        }
+        if clamped_len >= max_seg_samples {
+            // 超限片：按字缝切（切点严格相接、不重不漏）
+            merged.extend(plan_gap_cuts(full_audio, start, end));
+            continue;
+        }
+        if let Some(last) = merged.last_mut() {
+            let combined = end - last.0;
+            if combined <= max_seg_samples {
+                last.1 = end;
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
+/// FIX-SLICE-CUT-AT-GAP-381：**纯函数** —— 把 `[start, end)` 按「字缝」切成严格相接的若干片。
+///
+/// 规则（Gavin 2026-09-23 口径，取值依据见各常量注释）：
+/// 1. 剩余长度 < 起搜点(10s) + [`MIN_TAIL_SECS`](1s) ⇒ **不切**，整段作一片（尾巴保护，最长约 11s）；
+/// 2. 否则从「本片起点 + 10s」往后搜，最远 `GAP_SEARCH_MAX_SECS`(2s)（即到 12s）：
+///    以 [`GAP_FRAME_SAMPLES`](20ms) 为一帧算 RMS，**字缝** = 该帧 RMS ≤
+///    [`GAP_RMS_RATIO`] × 本片前 10s 帧 RMS 中位数，且为局部极小（≤ 左右相邻帧）；
+///    取**最早**达标帧的**中心样本**为切点；
+/// 3. 搜不到达标帧 ⇒ 在 [10s, 12s] 内取 RMS **最低**帧的中心切（硬兜底，绝不无限变长）；
+/// 4. 切点严格相接（第 i 片 end == 第 i+1 片 start），不重不漏。
+///
+/// 用**相对阈值** ⇒ 整体增益变化不改变切点位置（单测 `gap_cut_scale_invariant`）。
+pub fn plan_gap_cuts(audio: &[f32], start: usize, end: usize) -> Vec<(usize, usize)> {
+    const RATE: usize = 16000;
+    let frame = GAP_FRAME_SAMPLES;
+    let search_start = (SLIDING_CUT_SEARCH_START_SECS * RATE as f64) as usize;
+    let search_max = (GAP_SEARCH_MAX_SECS * RATE as f64) as usize;
+    let min_tail = (MIN_TAIL_SECS * RATE as f64) as usize;
+
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut pos = start;
+    while pos < end {
+        let remaining = end - pos;
+        // 尾巴保护：剩余不足 10s + 1s ⇒ 不切，整段作一片
+        if remaining < search_start + min_tail {
+            out.push((pos, end));
+            break;
+        }
+        let lower = pos + search_start;
+        // 兜底上限：最晚 12s，且至少给尾巴留 min_tail
+        let upper = (pos + search_start + search_max).min(end - min_tail);
+        let cut = find_gap_cut(audio, pos, lower, upper, frame);
+        out.push((pos, cut));
+        pos = cut;
+    }
+    out
+}
+
+/// FIX-SLICE-CUT-AT-GAP-381：在 `[lower, upper]`（限定帧**中心**落点）内找一个字缝切点。
+///
+/// - 基线中位数取自 `[piece_start, piece_start + 10s)` 的完整帧（相对阈值）；
+/// - 优先返回**最早**的达标帧（RMS ≤ ratio×中位数 且 ≤ 左右相邻帧）中心；
+/// - 无达标帧 ⇒ 返回 RMS **最低**帧的中心（并列取最早）。
+fn find_gap_cut(
+    audio: &[f32],
+    piece_start: usize,
+    lower: usize,
+    upper: usize,
+    frame: usize,
+) -> usize {
+    let total = audio.len();
+    let search_start = (SLIDING_CUT_SEARCH_START_SECS * 16000.0) as usize;
+
+    // 基线：本片前 10s 所有完整帧的 RMS 中位数
+    let median_src_end = (piece_start + search_start).min(total);
+    let mut rms_vals: Vec<f32> = Vec::new();
+    let mut fs = piece_start;
+    while fs + frame <= median_src_end {
+        rms_vals.push(frame_rms(audio, fs, frame, total));
+        fs += frame;
+    }
+    rms_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = if rms_vals.is_empty() {
+        0.0
+    } else {
+        rms_vals[rms_vals.len() / 2]
+    };
+    let threshold = GAP_RMS_RATIO * median;
+
+    // 候选帧：中心 center = piece_start + j*frame + half ∈ [lower, upper]
+    let half = frame / 2;
+    let first_j = {
+        let need = lower.saturating_sub(piece_start + half);
+        (need + frame - 1) / frame // ceil
+    };
+    let last_j = upper.saturating_sub(piece_start + half) / frame;
+
+    let mut best_j: Option<usize> = None;
+    let mut best_rms = f32::INFINITY;
+    let mut j = first_j;
+    while j <= last_j {
+        let fstart = piece_start + j * frame;
+        if fstart + frame > total {
+            break;
+        }
+        let rms = frame_rms(audio, fstart, frame, total);
+        // 局部极小（边界帧只比存在的一侧；邻居帧超界时 frame_rms 返回 0 ⇒ 不误判）
+        let prev = if j == 0 {
+            f32::INFINITY
+        } else {
+            frame_rms(audio, piece_start + (j - 1) * frame, frame, total)
+        };
+        let next = frame_rms(audio, piece_start + (j + 1) * frame, frame, total);
+        let local_min = rms <= prev && rms <= next;
+        if rms <= threshold && local_min {
+            best_j = Some(j);
+            break; // 取最早达标帧
+        }
+        if rms < best_rms {
+            best_rms = rms;
+            best_j = Some(j);
+        }
+        j += 1;
+    }
+
+    match best_j {
+        Some(j) => piece_start + j * frame + half,
+        // 兜底（[lower,upper] 不足一个完整帧时）——保守用 lower，保证严格推进
+        None => lower,
+    }
+}
+
+/// 单帧 RMS（越界按可用长度算；空帧返回 0）。
+fn frame_rms(audio: &[f32], frame_start: usize, frame: usize, total: usize) -> f32 {
+    let begin = frame_start.min(total);
+    let end = (frame_start + frame).min(total);
+    if begin >= end {
+        return 0.0;
+    }
+    let s = &audio[begin..end];
+    (s.iter().map(|x| x * x).sum::<f32>() / s.len() as f32).sqrt()
+}
+
+/// 原 `build_padded_segments_capped` 第二步，逐位不变：按 (start,end) 列表加 padding 并提取样本。
+fn pad_and_extract(
+    merged: &[(usize, usize)],
+    total_samples: usize,
+    full_audio: &[f32],
+) -> Vec<Vec<f32>> {
     if merged.is_empty() {
         return Vec::new();
     }
+    let pad = SEGMENT_PADDING_SAMPLES;
 
-    // 第二步：加 padding 并提取样本
     let mut result: Vec<Vec<f32>> = Vec::with_capacity(merged.len());
     for (i, &(start, end)) in merged.iter().enumerate() {
         // padding 起点：首段 saturating_sub；后续段与前段间隙取中点
@@ -924,9 +1135,11 @@ mod tests {
 
     // ========================================================================
     // FIX-REMOVE-HARDSPLIT-370：`build_padded_segments_capped` 上限参数化
-    //   验证：① 上限可显式传入并生效 ② 滑窗上限=13s（对齐 12s 窗实测体验）
-    //        ③ 旧路径（`build_padded_segments`）与 `capped(.., SEGMENT_MAX_SECS)` **逐位相同**
-    //        ④ FIX-VAD-STATE-RESET-001 边界护栏在任意上限下都保留
+    //   验证：① 上限可显式传入并生效 ② 20s 路径（`build_padded_segments` / capped）逐位不变
+    //        ③ FIX-VAD-STATE-RESET-001 边界护栏保留
+    // ========================================================================
+    // FIX-SLICE-CUT-AT-GAP-381：滑窗路径改「字缝切」，见下方 gap_cut_* / sliding_* 用例
+    //   （`SLIDING_SLICE_MAX_SECS` 已删除，滑窗不再按固定秒数硬切）。
     // ========================================================================
 
     /// 上限参数**显式生效**：5s 单片配 cap=2s ⇒ 按 2s 切成 3 段（2/2/1s）。
@@ -944,62 +1157,11 @@ mod tests {
         );
     }
 
-    /// 🔴 滑窗上限 = **13s**（极端情况兜底，非常态参数）：≤13s 的片**不被切**。
-    #[test]
-    fn capped_sliding_slice_max_is_13s() {
-        assert_eq!(
-            SLIDING_SLICE_MAX_SECS, 13.0,
-            "Gavin 定（最终值）：单片上限 13s"
-        );
-        let sec = 16_000usize;
-        for dsecs in [2usize, 4, 8, 12, 13] {
-            let total = dsecs * sec;
-            let audio = vec![0.1f32; total];
-            let segs =
-                build_padded_segments_capped(&[(0, total)], total, &audio, SLIDING_SLICE_MAX_SECS);
-            assert_eq!(segs.len(), 1, "{dsecs}s 片（≤13s）不得被切");
-            assert_eq!(segs[0].len(), total, "整片原样（首段前 padding 被 0 夹住）");
-        }
-        // 恰好 13s：触发切分但只切出一段 ⇒ 仍是 1 段（边界不误伤）
-        let total = 13 * sec;
-        let audio = vec![0.1f32; total];
-        let segs =
-            build_padded_segments_capped(&[(0, total)], total, &audio, SLIDING_SLICE_MAX_SECS);
-        assert_eq!(segs.len(), 1, "恰好 13s 仍为 1 段");
-        // >13s ⇒ 按 13s 切（25s ⇒ 13+12）
-        let total = 25 * sec;
-        let audio = vec![0.1f32; total];
-        let segs =
-            build_padded_segments_capped(&[(0, total)], total, &audio, SLIDING_SLICE_MAX_SECS);
-        assert_eq!(segs.len(), 2, "25s ⇒ 13+12");
-        assert_eq!(
-            segs.iter().map(|s| s.len()).collect::<Vec<_>>(),
-            vec![13 * sec, 12 * sec]
-        );
-    }
-
-    /// 🔴 安全阀：>13s 的片仍按 13s 切（180s ⇒ 13×13 + 11 = 14 段），**不丢弃**。
-    #[test]
-    fn capped_over_13s_still_splits_by_13s() {
-        let sec = 16_000usize;
-        let total = 180 * sec;
-        let audio = vec![0.1f32; total];
-        let segs =
-            build_padded_segments_capped(&[(0, total)], total, &audio, SLIDING_SLICE_MAX_SECS);
-        assert_eq!(
-            segs.len(),
-            14,
-            "180s ⇒ 13×13 + 11 ⇒ 14 段（安全阀生效，超出继续切/不丢弃）"
-        );
-        let lens: Vec<usize> = segs.iter().map(|s| s.len()).collect();
-        assert_eq!(lens[0], 13 * sec, "首段 13s");
-        assert_eq!(lens[13], 11 * sec, "末段为余量");
-        assert_eq!(lens.iter().sum::<usize>(), total, "切分不丢样本");
-    }
-
     /// 🔴 其它路径**逐位不变**证明：`build_padded_segments` ≡ `capped(.., SEGMENT_MAX_SECS)`。
     ///
     /// 覆盖：空输入 / 单短段 / 超限单段 / 多段可合并 / 多段不可合并 / 越界段 / 越界 end。
+    /// 🔴 FIX-SLICE-CUT-AT-GAP-381 单测 #5「20s 路径不变」由本用例 + 既有 `build_padded_long_hard_cut`
+    /// 共同承担（既有断言未改）。
     #[test]
     fn legacy_wrapper_is_bit_identical_to_capped_segment_max() {
         let sec = 16_000usize;
@@ -1024,24 +1186,145 @@ mod tests {
         }
     }
 
-    /// 🔴 FIX-VAD-STATE-RESET-001 护栏在**滑窗上限**下同样保留：
+    // ========================================================================
+    // FIX-SLICE-CUT-AT-GAP-381：滑窗路径「字缝切」纯函数 `plan_gap_cuts`
+    //   口径：窗口上限与切片起搜点统一 10s；超 10s 从 10s 起找字缝（最晚 12s）
+    // ========================================================================
+
+    /// 合成音频：`period_ms` 周期内 `speech_ms` 正弦 + 其余近静音（模拟「字缝」）。
+    fn synth_speech_with_gaps(total_secs: usize, speech_amp: f32) -> Vec<f32> {
+        let rate = 16_000usize;
+        let total = total_secs * rate;
+        let period = 3840usize; // 240ms = 200ms 语音 + 40ms 近静音
+        let speech = 3200usize; // 200ms 语音（@16kHz）
+        let mut v = Vec::with_capacity(total);
+        for i in 0..total {
+            let ph = i % period;
+            if ph < speech {
+                let t = i as f32 / rate as f32;
+                v.push((2.0 * std::f32::consts::PI * 220.0 * t).sin() * speech_amp);
+            } else {
+                v.push(0.001);
+            }
+        }
+        v
+    }
+
+    fn max_abs(audio: &[f32], lo: usize, hi: usize) -> f32 {
+        audio[lo.min(audio.len())..hi.min(audio.len())]
+            .iter()
+            .fold(0.0f32, |m, x| m.max(x.abs()))
+    }
+
+    /// 单测 #1：**切点落在低谷** —— 每个切点落在近静音段内，且相邻切点相距 ≥10s。
+    #[test]
+    fn gap_cut_falls_in_low_energy_gap() {
+        let audio = synth_speech_with_gaps(20, 0.3);
+        let total = audio.len();
+        let cuts = plan_gap_cuts(&audio, 0, total);
+        assert!(cuts.len() >= 2, "20s 有字缝应切成 ≥2 片：{cuts:?}");
+        // 连续相接
+        assert_eq!(cuts[0].0, 0);
+        assert_eq!(cuts.last().unwrap().1, total);
+        for w in cuts.windows(2) {
+            assert_eq!(w[0].1, w[1].0, "切点必须严格相接：{cuts:?}");
+        }
+        // 每个内部切点在近静音内（±10ms 最大幅度远低于语音）
+        for c in cuts.iter().skip(1) {
+            let cut = c.0;
+            let m = max_abs(&audio, cut.saturating_sub(160), cut + 160);
+            assert!(
+                m < 0.05,
+                "切点 {cut} 落在有声区（±10ms max_abs={m}）：{cuts:?}"
+            );
+        }
+        // 相邻切点相距 ≥10s（10s 起搜，不会更早）
+        for w in cuts.windows(2) {
+            let gap = w[1].0 - w[0].0;
+            assert!(gap >= 10 * 16_000, "相邻切点相距 {} samples < 10s", gap);
+        }
+    }
+
+    /// 单测 #2：**兜底** —— 20s 不间断正弦（无低谷）⇒ 切点在 [10s, 12s] 内，片数正确。
+    #[test]
+    fn gap_cut_fallback_when_no_gap() {
+        let rate = 16_000usize;
+        let total = 20 * rate;
+        let audio: Vec<f32> = (0..total)
+            .map(|i| (2.0 * std::f32::consts::PI * 220.0 * i as f32 / rate as f32).sin() * 0.3)
+            .collect();
+        let cuts = plan_gap_cuts(&audio, 0, total);
+        assert_eq!(cuts.len(), 2, "20s 无低谷 ⇒ 恰切一次（2 片）：{cuts:?}");
+        let cut = cuts[0].1;
+        assert!(
+            cut >= 10 * rate && cut <= 12 * rate,
+            "兜底切点必在 [10s,12s]：{}s",
+            cut as f64 / rate as f64
+        );
+        assert_eq!(cuts[1], (cut, total));
+    }
+
+    /// 单测 #3：**尾巴保护** —— 10.5s ⇒ 1 片；11.5s ⇒ 2 片且尾片 ≥1s。
+    #[test]
+    fn gap_cut_tail_protection() {
+        let rate = 16_000usize;
+        let sine = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (2.0 * std::f32::consts::PI * 220.0 * i as f32 / rate as f32).sin() * 0.3)
+                .collect()
+        };
+        let a = sine(10 * rate + rate / 2); // 10.5s
+        let cuts = plan_gap_cuts(&a, 0, a.len());
+        assert_eq!(cuts.len(), 1, "10.5s 尾片 <1s ⇒ 不切（1 片）：{cuts:?}");
+
+        let b = sine(11 * rate + rate / 2); // 11.5s
+        let cuts = plan_gap_cuts(&b, 0, b.len());
+        assert_eq!(cuts.len(), 2, "11.5s ⇒ 切 2 片：{cuts:?}");
+        let tail = cuts[1].1 - cuts[1].0;
+        assert!(tail >= rate, "尾片 {}s < 1s", tail as f64 / rate as f64);
+    }
+
+    /// 单测 #4：**不丢不重** —— 各片按序拼接（原音频全区间 ⇒ 无外层 padding）与原音频逐样本相等。
+    #[test]
+    fn gap_cut_no_loss_no_overlap() {
+        let audio = synth_speech_with_gaps(25, 0.25);
+        let total = audio.len();
+        let cuts = plan_gap_cuts(&audio, 0, total);
+        let mut pos = 0usize;
+        let mut rebuilt: Vec<f32> = Vec::with_capacity(total);
+        for &(s, e) in &cuts {
+            assert_eq!(s, pos, "必须严格相接、不留缝：{cuts:?}");
+            assert!(e > s, "空片：{cuts:?}");
+            rebuilt.extend_from_slice(&audio[s..e]);
+            pos = e;
+        }
+        assert_eq!(pos, total, "末尾必须覆盖到 total");
+        assert_eq!(rebuilt, audio, "拼接必须与原音频逐样本相等");
+    }
+
+    /// 单测 #6：**相对阈值** —— 整体乘 0.1 增益，切点位置不变。
+    #[test]
+    fn gap_cut_scale_invariant() {
+        let audio = synth_speech_with_gaps(20, 0.3);
+        let total = audio.len();
+        let a = plan_gap_cuts(&audio, 0, total);
+        let scaled: Vec<f32> = audio.iter().map(|x| x * 0.1).collect();
+        let b = plan_gap_cuts(&scaled, 0, total);
+        assert_eq!(a, b, "相对阈值下整体增益不应改变切点");
+    }
+
+    /// 🔴 FIX-VAD-STATE-RESET-001 护栏在**滑窗路径**下同样保留：
     /// start 越界 ⇒ 丢弃（不 panic、返回空）；end 越界 ⇒ clamp（不 panic）。
     #[test]
-    fn capped_sliding_cap_keeps_bounds_guards() {
+    fn sliding_segments_keeps_bounds_guards() {
         let sec = 16_000usize;
         let total = 30 * sec;
         let audio = vec![0.2f32; total];
         assert!(
-            build_padded_segments_capped(&[(total, 1000)], total, &audio, SLIDING_SLICE_MAX_SECS)
-                .is_empty(),
+            build_sliding_segments(&[(total, 1000)], total, &audio).is_empty(),
             "start >= total_samples ⇒ 丢弃"
         );
-        let segs = build_padded_segments_capped(
-            &[(total - 1000, 5000)],
-            total,
-            &audio,
-            SLIDING_SLICE_MAX_SECS,
-        );
+        let segs = build_sliding_segments(&[(total - 1000, 5000)], total, &audio);
         assert_eq!(segs.len(), 1);
         assert_eq!(
             segs[0].len(),

@@ -67,3 +67,28 @@
 - **单测**：+1 `preview_harvest_380_tests::drive_acc_windows_harvests_result_while_acc_open` —— 用**通道先后**制造「`acc_rx` 未关、结果已到」，断言 step 在 acc 关闭前被调；**非 sleep 定时序**（`recv_timeout` 仅作挂死兜底）；退回旧「只在收切片时收结果」语义必超时。
 - **验证**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**、warnings **98/88** = 基线；全量 `cargo test --no-fail-fast` **1547P/0F/31I**（EXIT 0）；368/369/371/374/375/377 既有单测全绿。numstat：main 257/118、hotkey 20/0、platform/mod 1/1、windows/mod 4/1（-w main 254/115，3 行 whitespace 落改动块内）。
 - **未改版本号 / 未 push / 未 build release / 零凭证**。🔴 实机时延读数交 tester-1/Gavin，未声称已验证。
+
+## 2026-09-23 — coder-1 — FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382 ✅ 交付（阶段一·只改代码）
+
+- **问题1（P0 吃前文）**：Gavin 一口气 18.37s ⇒ 只出末尾一句。根因：一次 `Slice` 带 2 片（13s+5.37s），旧实现 2 片一起 push 后只组**一个**窗口，`group_window_start_secs` 丢最远片 ⇒ 13s 那片从不进任何窗口、永不解码。
+- **问题1 修法**：Slice 分支改**逐片组窗**（N 片 ⇒ N 窗，每窗以当前片收尾）；新增纯函数 `plan_windows(prev_durs,new_durs,prev_base)`（主控指定放 `main.rs`），生产调用 + 单测断言**覆盖不变量**（每个新片都被某窗覆盖；每窗 end-1 = 对应新片）。**未动** `group_window_start_secs` / `WINDOW_MAX_SECS` / `WINDOW_MAX_SLICES` / `push_window` / `OrderedReflow` / 对齐规则。
+- **问题2（松键后处理态出得晚）**：`StreamingFinalPreview`（原 `:8789`）+ `Processing`（run_pipeline_core）都排在 `asr_join`+`acc_join` 之后 ⇒ B 尾窗解码期界面停在录音态。修法：`asr_handle.join()` 后、`acc_handle.join()` 前立即发 预览→处理态（282 顺序、文案同源 `i18n::get(..).overlay_processing`）；删 join 后那次预览发送（防闪回）；埋点 `[LocalRT-DBG-380] stop_to_processing_ms`（复用 `STOP_RECEIVED_TICK`，仅 Windows）。
+- **问题2 防闪回（主控裁定②）**：controller 处理到本代 `Processing` 事件时置 `ACC_REFLOW_SUPPRESS` ⇒ 其后 `replace_all` 回灌**只更新权威状态、不重画浮层**（排前面的照常渲染）；`RecordingStarted` 复位；只影响本地实时档。单测 `suppressed_after_processing_skips_render_only`。
+- **问题3A（回灌不等边界配对）**：`replace_all` 回灌 `Applied` **立即渲染**（`ReflowFastState` 纯状态机）：边界已知⇒准确的；未知⇒派发当刻 `committed_len`（Slice `_committed_len` → `window_committed_lens` → `PreviewReflow.committed_len`）；边界按 `(gen,seg)` 小 map 记录，后到且该 seg 仍最新已渲染 ⇒ 准确值再渲一次；`boundary=b` 不再扣下。老非 replace_all 路径保留、逐位不变（`try_resolve_reflow` 保留，`ACC_REFLOW_ACC` 恒 None ⇒ no-op）。
+- **问题3B（共享队列）**：`rr % concurrency` 固定派发 ⇒ 改**单一共享任务通道**（`task_rx.clone()` 多消费者），`WINDOW_DECODE_CONCURRENCY` 不变。
+- **问题3C（埋点）**：`PreviewReflow` 新增 `decode_done_at: Option<Instant>`（worker 解完 `Instant::now()`，经 harvest 带入）；渲染时打 `[LocalRT-DBG-382] reflow latency: seq decode_done→render_ms boundary=known|fallback`；worker 打 `window queue: seq queued_ms decode_ms`。全 Debug 守卫。
+- **验证**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**、warnings **98/88** = 基线；全量 `cargo test --no-fail-fast` **1563P/0F/33I**（新增 12 条 / GONE 0；368/369/371/374/375/377/380 全绿）。numstat main 776/144（-w 723/91）。
+- 🔴 **踩坑（重要）**：`prod_lines_excluding_cfg_test` 跳过 `#[cfg(test)]` 项时用**朴素花括号计数、会把字符串里的 `{`/`}` 算进去** —— 我在新测试模块里写了 `contains("for _ in 0..concurrency {")`，那个 `{` 令扫描**越过模块边界、吞掉其后 `run_pipeline_core` 全部生产行**，导致 `nospeech_122`/`guard_214_215`/`testsync371` 共 5 条跨文件护栏假红。改为不含 `{` 的字串即愈。已记 `collab/troubleshooting.md`。**写测试字符串时禁含 `{`/`}`**（或与现有写法一样保证成对）。
+- **未改版本号 / 未 push / 未 build release / 零凭证**。🔴 实机读数（回灌准实时 / 处理态时延 / 吃字）交 tester-1/Gavin，未声称已验证。
+
+## 2026-09-23 — FIX-SLICE-CUT-AT-GAP-381（coder-2，✅ 阶段一交付：切片字缝化 + 窗口统一 10s）
+
+- **Gavin 口径**：硬切可能切碎字 ⇒ 原「12s 窗 / 13s 硬切点」统一改 **10s**；超 10s 在 10s 后找能量低谷的**字缝**切。
+- **改动文件**：`src/transcription/vad.rs`（删 `SLIDING_SLICE_MAX_SECS`；新增 4 常量 + `GAP_FRAME_SAMPLES`；`plan_gap_cuts`/`find_gap_cut`/`frame_rms`；`build_sliding_segments`/`plan_sliding_cuts`；`build_padded_segments_capped` 拆 `plan_hard_cuts`+`pad_and_extract` 逐位不变）、`src/transcription/local_stream.rs`（`build_dispatch_segment` 改调 `build_sliding_segments`；注释/单测改名）、`src/transcription/mod.rs`（`WINDOW_MAX_SECS` 12→10；re-export；`#[cfg(test)] mod poc_slice_cut_381;`）、**新文件** `src/transcription/poc_slice_cut_381.rs`。🔴 **未碰 `src/main.rs`**。
+- **单测**：vad 9 条（低谷/兜底/尾巴/不丢不重/20s 逐位不变/增益不变/边界护栏）+ local_stream 3 条（改名 `sliding_slice_381_*`）+ `sliding_cut_search_start_equals_window_max`。2 条既有 group_window 断言随上限合法变化（[3,3,3,3] 起点 0→1；[4,4,4,4] 1→2，已注明）。
+- **§4 实测**（`cargo test --bin feiyin-ime -- --ignored --nocapture poc_slice_cut_381_cer`）：字缝 CER **0.0356** vs 固定 10s 硬切 **0.0311/0.0400/0.1111/0.0800**（off 0/1.3/2.7/4.1），均值 0.0656；硬切边界出现重复「多」/丢「烧」/幻觉插入/乱码，字缝切无。🔴 **唯一反例 off=0（+0.0044=1 字）**待主控裁量。
+- **§5 实测**（`... poc_window_10s_381`）：cap12 与 cap10 窗口完全相同（7 窗），ΔCER=**0.0000** ≤ 0.01 ⇒ 照 10s 交付。⚠️ 本音频无 ≥1200ms 静默 ⇒ 子片全 ≥10s，两档 cap 不可区分（真实带停顿录音才显现差异）。
+- **验证**：`cargo fmt --check` EXIT 0 ｜ `cargo check --all-targets` **0 error**、warnings **88**=基线 ｜ 全量 `cargo test --no-fail-fast` **0 failed**（bin 1475P/31I）｜ `--numstat`==`-w`。
+- **未验证**：实机端测（字缝切体感 / 长句 >10s）交 tester-1/Gavin，本单未声称已验证。
+- 🔴 **跨文件待改（越界）**：`src/config/mod.rs:11`、`src/main.rs:8579`（及历史注释 `:8539/:11060`）仍写 13s，已列 result.md，请主控路由给 coder-1。
+- **未改版本号 / 未 push / 未 build release / 零凭证**。

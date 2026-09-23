@@ -2125,3 +2125,25 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | `src/platform/mod.rs` 仅 Windows 导出清单新增 `take_last_hook_event_tick`（macOS 清单未动） | ⚠️ 平台中立文件、两侧共用；该符号**不被平台中立代码引用**（故 macOS 无需 stub），若 macOS 侧有基于导出清单的对照检查知悉即可 |
 | 新增单测 `preview_harvest_380_tests::drive_acc_windows_harvests_result_while_acc_open` | ✅ 平台中立、无 `#[cfg]`；macOS 同跑 |
 | macOS 侧需要做什么 | ✅ **无需代码改动**；未新增用户开关/env（DEC-031）、未触 `src/platform/macos/**` |
+
+## FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382（2026-09-23，coder-1）· 逐片组窗 + 提前处理态 + 回灌提速 —— macOS 侧影响
+
+| 项 | 对 macOS 的结论 |
+| --- | --- |
+| 问题1：Slice 分支改**逐片组窗**（N 片 ⇒ N 窗）+ 新增纯函数 `plan_windows`（`main.rs`，平台中立） | ✅ **行为变更，平台中立**：滑窗 worker 在 `spawn_worker_thread`（已去 `#[cfg]`），macOS 编译同一代码 ⇒ 同继承「长句不再吃前文」；`plan_windows` 只用 `transcription::WINDOW_MAX_*` 常量，无平台分支 |
+| 问题2：`StreamingFinalPreview` + `Processing` 提前到 `acc_handle.join()` 之前发（本地实时档的 `thread::scope` 内）；埋点 `stop_to_processing_ms` 以 `#[cfg(target_os = "windows")]` 包裹 | ⚠️ **事件顺序变更，平台中立**：两事件经 `PipelineEvent` 通道，macOS 的 `overlay_request_for_event` 同样处理（`StreamingFinalPreview`/`Processing` 两臂已存在）⇒ macOS 同继承「松键即切处理态」；仅 `stop_to_processing_ms` 埋点为 Windows-only、macOS 不打点 |
+| 问题3A：`replace_all` 回灌立即渲染的 `ReflowFastState` / `ReflowFastOutcome` / `ACC_REFLOW_FAST` / `ACC_REFLOW_SUPPRESS` 全部 `#[cfg(target_os = "windows")]` | ❌ **不适用**：仅 Windows 的 `process_controller_events` 消费 `PreviewReflow`（macOS 侧 `overlay_request_for_event` 对 `PreviewReflow`「暂不渲染」）⇒ macOS 零影响、未新增 macOS stub |
+| 问题3B：解码任务改单一共享通道（`task_rx.clone()` 多消费者）；3C：`PreviewReflow` 新增 `decode_done_at: Option<std::time::Instant>` 字段 | ✅ **平台中立**：`main.rs` 无 `#[cfg]`；`PipelineEvent` 是本文件内的平台中立枚举，macOS 的匹配用 `{ acc_text, .. }` ⇒ 新增字段不影响 |
+| 新增单测 12 条（`plan_windows_382_tests` / `reflow_fast_382_tests` / `problem2_order_382_tests` / `shared_queue_382_tests`） | ✅ 除 `reflow_fast_382_tests`（`#[cfg(all(test, target_os="windows"))]`）外均平台中立；macOS 同跑 |
+| macOS 侧需要做什么 | ✅ **无需代码改动**；未新增用户开关/env（DEC-031）、未触 `src/platform/macos/**` |
+
+## FIX-SLICE-CUT-AT-GAP-381（2026-09-23，coder-2；主控合入）· 滑窗切片改「10s 后字缝切」+ 窗口上限 12→10s —— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `vad.rs` 新增 `build_sliding_segments` / `plan_gap_cuts`，`local_stream.rs::build_dispatch_segment` 改用它 | 滑窗单片 ≥13s 时固定 13s 硬切（可能切碎字）→ 超 10s 后按 20ms 帧 RMS 找字缝切（相对中位数 ×0.3 且局部极小；兜底 [10,12]s 最低能量；尾巴 <1s 不切） | 平台中立，无 `cfg` 分支，macOS 同吃 |
+| `transcription::WINDOW_MAX_SECS` 12.0 → 10.0 | 组窗上限 12s → 10s（回灌更快；实测 full.wav cap12/cap10 ΔCER=0.0000） | 同上 |
+| 删除 `SLIDING_SLICE_MAX_SECS`(13s) | 常量移除，引用与注释已同步 | macOS 若有引用该常量的在途代码须改用 `SLIDING_CUT_SEARCH_START_SECS` |
+| 20s 路径（`build_padded_segments`，离线 accuracy / VAD 分段） | 逐位不变 | 无 |
+
+无新平台 API、无依赖 / 构建脚本变化 ⇒ macOS 侧无需同步改动。

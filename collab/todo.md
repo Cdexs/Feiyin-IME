@@ -22,11 +22,11 @@
 
 ## 🔴 待做
 
-### 🆕🔴🔴 P0 · BUILD-380 端测两 bug + 回灌提速 + 切片/窗口统一 10s（Gavin 已确认，🔄 已派发）
+### 🆕🔴🔴 P0 · BUILD-380 端测两 bug + 回灌提速 + 切片/窗口统一 10s（Gavin 已确认）— 382 ✅ 2026-09-23 交付 coder-1，381 待 coder-2
 
 | 单号 | 内容 | 负责 |
 | --- | --- | --- |
-| `FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382` | 每片单独组窗（吃字）／松键立即「识别处理中」／回灌不等边界配对／解码共享队列／埋点 | coder-1（`main.rs`） |
+| ✅ `FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382` | 每片单独组窗（吃字）／松键立即「识别处理中」／回灌不等边界配对／解码共享队列／埋点。**2026-09-23 阶段一交付 coder-1**：`plan_windows` 逐片组窗 + `StreamingFinalPreview`/`Processing` 提前到 `acc_join` 前 + `ReflowFastState` 立即渲染 + 单一共享解码队列 + `[LocalRT-DBG-382]` 埋点；`cargo fmt --check` EXIT 0、`check --all-targets` 0 error、warnings **98/88**=基线、全量 **1563P/0F/33I**（+12 新单测）。**待 tester-1 阶段四回归 + 出包 + Gavin 端测** | coder-1（`main.rs`） |
 | `FIX-SLICE-CUT-AT-GAP-381` | 超 10s 在字缝切／`WINDOW_MAX_SECS` 12→10／字缝切 vs 硬切、10s vs 12s 实测 | coder-2（`vad.rs`/`local_stream.rs`/`transcription/mod.rs`） |
 
 

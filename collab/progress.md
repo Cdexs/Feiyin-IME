@@ -1171,6 +1171,15 @@ load_wordbook_vocabulary()
 | NEW | +1：`preview_harvest_380_tests::drive_acc_windows_harvests_result_while_acc_open`（通道先后制造「`acc_rx` 未关、结果已到」，非 sleep；退回旧语义必超时） |
 | 端测 | 🔴 待 tester-1 阶段四全量回归 + 出包，再交 Gavin 端测：现象①预览停顿即刷；现象②看 `hook_to_controller_ms`/`stop_to_inject_ms` 定位 4s 来源 |
 
+## FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382 · 逐片组窗 + 松键立即处理态 + 回灌提速（阶段一·只改代码）· 2026-09-23 · coder-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 仅 `src/main.rs`。**问题1**：Slice 改逐片组窗（N 片⇒N 窗，修「13s 那片从不进窗」P0 吃字），新增纯函数 `plan_windows` + 覆盖不变量单测。**问题2**：`StreamingFinalPreview`+`Processing` 提到 `acc_join()` 之前发、删后置预览发送，埋点 `stop_to_processing_ms`；`ACC_REFLOW_SUPPRESS` 防闪回（controller 处理 Processing 时置位）。**3A**：`ReflowFastState` 立即渲染（不等边界配对）+ `PreviewReflow.committed_len` 带派发fallback。**3B**：解码共享队列。**3C**：`decode_done_at` 字段 + reflow/queue 埋点 |
+| 回归 | root `cargo test --no-fail-fast` **1563P/0F/33I**（EXIT 0；`feiyin-ime` bin **1475P/31I**）；`cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**；warnings **98/88** = 基线 |
+| NEW | +12：`plan_windows_382_tests` 4（覆盖不变量/单片回归/任意序列）、`reflow_fast_382_tests` 5（边界先/后到、b 类、两 seg 交错、Processing 后抑制）、`problem2_order_382_tests` 1（源码顺序：预览<处理态<acc_join，join 后不再发预览）、`shared_queue_382_tests` 2（空闲 worker 取下一任务 + 生产单一共享队列结构护栏）。GONE 0 |
+| 端测 | 🔴 待 tester-1 阶段四回归 + 出包 + Gavin 端测：①一口气长句不再吃前文；②松键即显「识别处理中」；③`[LocalRT-DBG-382]` 看回灌解码→重画/排队时延 |
+
 ## BUILD-380（阶段四全绿 → 出包）· 2026-09-23 · tester-1
 
 | 项 | 内容 |
@@ -1182,3 +1191,14 @@ load_wordbook_vocabulary()
 | 三特殊点 | ① dll 四张三副本全等 + onnxruntime 1.28.2；② itn-rules 三副本全等；③ Publish/models 1.7B 七文件与源逐一 sha256 全等（0.6B 保留） |
 | 探针 | 正：`[LocalRT-DBG-380]`=3 / `hook_to_controller_ms`=2 / `stop_to_inject_ms`=1；反：无（本单未删字面量） |
 | 端测 | 🔴 **Step1 强杀输入法 ⇒ 请重启后端测**；重点：现象①停顿即刷预览；现象②`hook_to_controller_ms`/`stop_to_inject_ms` 定位出字延迟 |
+
+## FIX-SLICE-CUT-AT-GAP-381（阶段一·交付）· 2026-09-23 · coder-2
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 滑窗切片「固定 13s 硬切」→「10s 起找字缝切」（20ms 帧 RMS ≤ 0.3×本片前 10s 中位数且局部极小；[10,12]s 最低能量兜底；剩余 <11s 不切；严格相接）；`WINDOW_MAX_SECS` 12→10，删 `SLIDING_SLICE_MAX_SECS`；20s/VAD 路径逐位不变。纯平台中立，macOS 同吃 |
+| 文件 | `vad.rs` / `local_stream.rs` / `transcription/mod.rs` / 新 `poc_slice_cut_381.rs`（🔴 未碰 `main.rs`） |
+| §4 实测 | 字缝 CER **0.0356** vs 固定 10s 硬切均值 **0.0656**（3/4 组更优；off=2.7 硬切 0.1111 + 边界幻觉插入）；🔴 off=0 反例 +0.0044=1 字待裁量 |
+| §5 实测 | 生产静默 1200ms 切片（2 片）→ 字缝 7 片 → cap12/cap10 窗口相同；ΔCER **0.0000** ≤0.01 ⇒ 照 10s 交付 |
+| 验证 | `cargo fmt --check` EXIT 0 ｜ check 0 error、warnings 88=基线 ｜ 全量 `cargo test --no-fail-fast` 0 failed（1475P/31I）｜ numstat==-w |
+| 下一步 | 阶段三 TEST-SYNC（非作者）→ 阶段四 TEST-EXEC → 出包（Gavin 已授权「直接走测试出包」）；跨文件 13s 过期注释待路由 |

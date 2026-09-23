@@ -419,3 +419,25 @@ LLM 的输出本质是 prompt 的续写 ⇒ 超规格的自由文本会被当成
 
 🔴 **教训**：加提示词之前必须回答「**现有管线上是不是已经有节点在干这件事**」。
 单独立单会被迫回答这个问题；夹带进别的单子就不会 —— 这正是「禁夹带」规矩要防的。
+
+## [GUARD-SKIP-BRACE-IN-STRING-382] `prod_lines_excluding_cfg_test` 的花括号计数会被**字符串里的 `{`/`}`** 带偏 —— 一次假红 5 条跨文件护栏
+
+**现象**：FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382 新增若干 `#[cfg(test)]` 模块后，全量回归出现 6 条 FAILED，全部是**跨文件结构护栏**：
+`punctuation::tests::guard_214_215::{g7,g9,g10,g11}`（扫 `main.rs`）、`nospeech_122_guard_tests::h4`（扫 `main.rs`）、
+`testsync371_window_counter_guard_tests::counters_are_pushed_together`。报错都是「锚点必须存在」——但锚点明明在源码里。
+
+**根因**：`guard_prod_lines::prod_lines_excluding_cfg_test`（`main.rs`）跳过 `#[cfg(test)]` 项时用**朴素的逐字符花括号计数**
+（`'{' → depth++`、`'}' → depth--`，`opened && depth<=0` 停）**来决定「该项本体到哪里结束」**。
+它**不区分字符串字面量 / 注释**：我在新测试模块里写了 `assert!(..., l.contains("for _ in 0..concurrency {"))` ——
+那个 `{` 令 `depth` 多算一层，模块真正的收尾 `}` 之后 `depth` 仍为 1，于是扫描器**越过模块边界继续吞**，
+一路吃到下一个平衡点（实测 `11353→15268`，把整个 `run_pipeline_core` 都当成了测试区剔除）⇒ 其后所有生产锚点「消失」。
+
+**判据**：护栏报「锚点必须存在」但 `grep` 源码明明有 ⇒ 先怀疑**扫描器把生产区误剔了**，而不是锚点真丢了。
+
+**修法（本单）**：把测试字符串里的 `{` 去掉（`"for _ in 0..concurrency"` 即可）⇒ 6 条立刻转绿。
+
+**可复用规则**：
+1. **写 `#[cfg(test)]` 模块内的字符串时禁含裸 `{`/`}`**（要含就保证成对，但这很脆——最好直接避免）；注释同理（注释里的花括号也会被算）。
+2. 新增/移动 `#[cfg(test)]` 模块后，**必跑全量**（`cargo test --no-fail-fast`）—— 跨文件护栏不在 `cargo check` 覆盖内。
+3. 诊断方法（Think-in-Code）：用脚本**复刻** `prod_lines_excluding_cfg_test` 并打印每个 skip 的 `[start,end]`，
+   一眼看出哪个 skip 跨越了几百行（正常测试模块多在几十~百余行；跨越 >400 行即高度可疑）。
