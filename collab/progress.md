@@ -1334,3 +1334,15 @@ load_wordbook_vocabulary()
 | 回归 | root `cargo test --no-fail-fast` **1642P/0F/35I**（EXIT 0）；`cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**；warnings **97/88** = 基线 |
 | NEW | `fix390_tests` 3 条（并发度=1 / `max_new_tokens_for` 取值·界·非有限·负·单调·极大值 / 源码护栏：首解重解都带 cap、`decode_accuracy_once` 传 `None`） |
 | 端测 | 🔴 待 tester-1 阶段四回归 + 388/389/390 合包 + Gavin 端测：解码耗时/预览刷新是否改善、是否仍念词表 |
+
+## BUILD-390（阶段四全绿 → 出包 · 388/389/390 合包）· 2026-09-23 · tester-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 388（解码前 VAD 剪静音 / 重解统一查有内容+产出率 / 冷启动坍塌下限 / 首解空进 Empty）/ 389（近场门按 VAD 整句判定 / 跨录音沿用录音人音量 / 部分窗预览不回退 / C2 写回规则）/ 390（窗口解码并发 2→1 / 按剪后语音时长限制 `max_new_tokens`）。HEAD `02c57c8`，版本 0.9.3 |
+| 回归 | root `cargo test --no-fail-fast` **1645P/0F/35I**（EXIT 0；`feiyin-ime` bin **1557P/33I** = 基线 1639P/35I 净 **+6P/+0I**）；`src-tauri` **92P/0F/0I**；Vitest **SKIP**（`ui/` 无 diff）；`cargo fmt --check`（不带 `skip_children`）**EXIT 0**；warnings **97/88/17** = 基线 |
+| NEW/GONE | NEW **6**（`fix390_tests` 3 + `testsync390_tests` 3）；GONE **0**；+6P 与 1639→1645 逐位吻合（与任务书「fix390 3 + testsync390 3」一致） |
+| 出包 | `BUILD-390` 八项逐项 PASS；产物 `feiyin-ime` 14.87MB `52bd009437a1…`（19:38:48）/ `feiyin-ime-ui` 10.05MB `3a531013225f…`（19:35:55）/ `crash-reporter` 24.88MB `d62b82cc3bf0…`（19:37:02）；两副本全等、均异于 BUILD-387 |
+| 三特殊点 | ① dll 四张三副本全等 + onnxruntime 1.28.2；② itn-rules 三副本全等；③ Publish/models 1.7B 七文件与源逐一 sha256 全等（0.6B 保留） |
+| 探针 | 正：`[LocalRT-DBG-388]`=2 / `[LocalRT-DBG-389]`=4 / `max_new_tokens=`=1；反：`nearfield gate: vad=on`=**0**（385 逐块门已删） |
+| 端测 | 🔴 **Step1 强杀输入法 ⇒ 请重启 + 带 `-debug` 端测**；重点：① 390 解码并发 2→1 + 按语音时长限 `max_new_tokens`（解码耗时/是否截断快语速）；② 388 剪静音（无语音不解码）+ 重解质量把关；③ 389 近场门整句判定 + 跨录音沿用音量 + 预览不回退；④ 是否仍念词表；⑤ 吃字/重复字；⑥ 长录音 300s；⑦ 不新增 crash.json |

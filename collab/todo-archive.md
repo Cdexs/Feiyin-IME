@@ -5138,3 +5138,19 @@ sherpa endpoint `rule2=2.0s`（切句）、`ACC_DISPATCH_SILENCE_MS`（派发 ac
 
 合包 381（10s 后字缝切 / 窗口 12→10s）+ 382（逐片组窗修吃前文 / 松键立即「识别处理中」/ 回灌立即渲染 / 共享解码队列）+ 384（静默判定改 silero VAD，音量阈值兜底）+ 385（近场音量门挡背景人声）。回归 1598P/0F/34I。
 **端测重点**：①一口气 >10s 不丢前文 ②停顿后预览 1~2s 内刷新 ③松键立刻出「识别处理中」、无闪回 ④有背景噪声/背景人声时照常 1.2s 切片与打标点。`-debug` 看 `[LocalRT-DBG-380/382/384/385]`。明细见 `todo-archive.md`【归档七】。
+
+
+## 【归档九】2026-09-23 移出：BUILD-387 条目与 388/389 派发表（已随 BUILD-390 出包）
+
+### 🔄 BUILD-387 端测修复（2026-09-23 派发，Gavin 授权开发→测试→出包不再请示）
+
+| 单号 | 内容 | 负责 |
+| --- | --- | --- |
+| ✅ `FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388` | 解码前 VAD 剪静音（根因：静音多+热词触发 sherpa #3509 类幻觉）；重解统一查有内容+产出率；冷启动坍塌绝对下限。**2026-09-23 阶段一交付 coder-1**：`vad.rs` 只新增 `try_new_for_local_trim`/`speech_ranges` + `trim_to_speech` + 线程级 VAD 缓存 + `has_content`/`output_rate_ok` 下限；新增单测 7+`#[ignore]`1，**契约变更更新 6 条既有期望（不变量未动）**；`fmt --check` EXIT0、`check --all-targets` 0 error、warnings **97/88**=基线、全量 **1621P/0F/35I**。**待 tester-1 阶段四回归 + 出包 + 端测** | coder-1（`transcription/mod.rs`、`vad.rs` 只新增） |
+| ✅ `FIX-NEARFIELD-BY-SEGMENT-AND-PREVIEW-389`（+ ✅ 阶段三 `TEST-SYNC-389`） | 近场门改按 VAD 整句判定（段峰值 ≥0.3×level 即整句确认）；多片派发部分窗按时长比例估流式字数，防预览回退。**阶段三 2026-09-23 交付 coder-1**：仅 `local_stream.rs`+`main.rs` 的 `#[cfg(test)]` **+5 条**（整句不切/背景挡住+峰值不入样/防锁死重学/seed 流程与边界/部分窗折算随机性质），`fmt --check` EXIT 0、`check --all-targets` 0 error、warnings **97/88**=基线；**未跑 `cargo test`**；**未发现生产缺陷** | coder-2（实现）+ coder-1（阶段三护栏） |
+| ✅ `TUNE-DECODE-SERIAL-AND-TOKEN-CAP-390` | 窗口解码改串行（`WINDOW_DECODE_CONCURRENCY` 2→1，实测单独 274 vs 并发 476 ms/音频秒）；`max_new_tokens_for` 按剪静音后语音时长限制 per-stream 生成长度，首解/重解都带 cap。**2026-09-23 阶段一交付 coder-1**：新增单测 `fix390_*` 3 条；`fmt --check` EXIT0、`check --all-targets` 0 error、warnings **97/88**=基线、全量 **1642P/0F/35I**。**待 tester-1 阶段四回归 + 388/389/390 合包 + 端测** | coder-1（`transcription/mod.rs`、`main.rs` 注释一处） |
+
+### ✅ BUILD-387 已出包（2026-09-23 17:10，HEAD `3646b4d`）· 待 Gavin 端测
+
+合包 386（中途末片延后组窗 / 松键短尾 <3s 合窗重解 / 预览回灌保留流式尾巴 / 失败窗流式兜底）+ 387（念词表·`<标签>`·空输出判无效后不带注入重解 / 近场门 300ms 平滑音量）+ 主控验收补 2 处。回归 1620P/0F/34I。
+**端测重点**：①不再出现「维生素b12」等词条 ②结尾不截断、无 `<location>` ③说话中预览不回退变短 ④近场门不误挡自己（`[LocalRT-DBG-385] nearfield summary` 看 gated 比例）。明细见 `todo-archive.md`【归档八】。

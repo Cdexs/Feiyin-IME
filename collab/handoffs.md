@@ -7,6 +7,17 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-23 — tester-1 — TEST-EXEC + BUILD-390 ✅ 出包（388/389/390 合包；八项 + 三特殊点全 PASS）
+
+- **交付源码**：HEAD `02c57c8`（`af3a0ad`/`1af43a0`/`e91cccb`/`1efa987`/`9ae53d2`/`02c57c8`），工作区 clean，版本 0.9.3。核心单 388（解码前 VAD 剪静音 + 重解统一质量把关 + 冷启动坍塌下限）/ 389（近场门按 VAD 整句判定 + 跨录音沿用录音人音量 + 部分窗预览不回退）/ 390（窗口解码并发 2→1 + 按剪后语音时长限制 `max_new_tokens`）。DEC-081：任务书已下达「现在可以出包」。
+- **阶段四（全量未过滤；fmt `--check` 不带 `skip_children`）**：root `cargo test --no-fail-fast` **1645P/0F/35I**（EXIT 0；`feiyin-ime` bin **1557P/33I**）；`src-tauri` **92P/0F/0I**；Vitest **SKIP**（`ui/` 无 diff）；warnings **97/88/17** = 基线；fmt **EXIT 0**。
+- **NEW/GONE（精确集合差）**：基线（1efa987 实测）1639P/35I ⇒ 净 **+6P/+0I**。NEW **6** = `transcription::fix390_tests` 3 + `transcription::testsync390_tests` 3；**GONE 0**。6 条全部 `ok`，+6P 逐位吻合。
+- **重点失效模式**：其他管线（`build_padded`/`naive_chunk`/`ts381_padded_20s_snapshot`）、`fix388`/`testsync388`/`trim388`、`seg389`/`fix389`/`testsync389`、`fix390`/`testsync390`、`shared_queue`/`drive_acc_windows`（并发 2→1）、`plan_windows`/`testsync386`/`testsync371`、`localrt384`/`ts384385` 共 **96 条 ok、0 失败**，无停手。
+- **BUILD-390**：Step1 残 0 → Step2 npm 677ms + Tauri 1m34s（17w，**完整重做未复用**）→ Step2c UI cp（19:35 / `3a531013…`）→ Step3 主程序 2m47s（97w + crash 9w）→ Step4 三 exe→Publish。产物 main `52bd009437a1…`（14,870,016B/19:38:48）/ ui `3a531013225f…`（10,050,048B/19:35:55）/ crash `d62b82cc3bf0…`（24,879,104B/19:37:02）；两副本全等、三者均异于 BUILD-387。
+- **八项逐项 PASS**：①时间戳 19:35–19:38 ②两副本 sha 相等且异于上包 ③ProductVersion **0.9.3** ④冒烟 PID **21560 Responding=True** / 两处无新 crash.json / panic 0 / 残 0 ⑤config `da2be5da…` 三时点不变 ⑥warnings 97/88/17 ⑦正探针 `[LocalRT-DBG-388]`=2 / `[LocalRT-DBG-389]`=4 / `max_new_tokens=`=1，反探针 `nearfield gate: vad=on`=**0** ⑧scene/itn 两 toml 三副本全等。
+- **三特殊点（仅核验）**：① dll 四张三副本（`sherpa-onnx-lib`/`Publish`/`target-release`）全等 + `onnxruntime` **1.28.2**；② itn-rules 三副本 `60b227de…` 全等；③ `Publish/models/` 1.7B 七文件与源 sha256 全等、0.6B 保留。
+- 🔴 **Step1 强杀输入法进程 ⇒ 已提醒 Gavin 重启 + 带 `-debug` 端测**。红线：未 push（需 Gavin 指示）/ 版本号未动 / 未改生产代码 / 未 `cargo clean` / 零凭证。
+
 ## 2026-09-23 — tester-1 — TEST-EXEC + BUILD-387 ✅ 出包（386/387 合包；八项 + 三特殊点全 PASS）
 
 - **交付源码**：HEAD `3646b4d`（`4168960`/`2d972ac`/`69d046d`/`5cd14aa`/`a65ef9b`/`3646b4d`），工作区 clean，版本 0.9.3。核心单 386（中途末片延后组窗 / 松键短尾合并重解 / 预览回灌保留流式尾巴 / 失败窗流式兜底）/ 387（念词表·`<标签>`·空输出判无效后不带注入重解 + 近场门 300ms 平滑音量）。DEC-081：任务书已下达「现在可以出包」。
