@@ -17468,6 +17468,53 @@ mod fix389_partial_window_tests {
         let r = apply(st.on_bound(1, 6, Some(72), false));
         assert_eq!(r, ("acc".into(), 72, true, true), "含末片窗晚到边界可重渲");
     }
+
+    /// TEST-SYNC-389-5（非作者性质）：随机 500 组 `(prev ≤ cur、cum ≤ total)`：
+    /// ① 结果恒 ∈ `[prev, cur]` ② 随 `cum` **单调不减** ③ `cum=total ⇒ cur` ④ `total=0 ⇒ cur`。
+    #[test]
+    fn ts389n_partial_committed_property_bounds_and_monotone() {
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0
+            }
+        }
+        let mut rng = Lcg(0x389_D3_2026);
+        for case in 0..500usize {
+            let total = (rng.next() % 50_000) as usize; // 可能为 0
+            let cur = (rng.next() % 10_000) as usize;
+            let prev = (rng.next() % (cur as u64 + 1)) as usize; // 保证 prev ≤ cur
+                                                                 // ③ cum=total ⇒ cur
+            assert_eq!(
+                partial_win_committed(prev, cur, total, total),
+                cur,
+                "case {case}: cum=total 必须等于 cur"
+            );
+            // ④ total=0 ⇒ cur
+            if total == 0 {
+                assert_eq!(partial_win_committed(prev, cur, 0, 0), cur, "total=0 ⇒ cur");
+            }
+            // ① 界 + ② 单调（cum 分 11 档递增）
+            let mut last = prev;
+            for k in 0..=10u64 {
+                let cum = ((total as u64) * k / 10) as usize;
+                let w = partial_win_committed(prev, cur, cum.min(total), total);
+                assert!(
+                    w >= prev && w <= cur,
+                    "case {case}: {w} 越界 [{prev}, {cur}]（total={total} cum={cum}）"
+                );
+                assert!(
+                    w >= last,
+                    "case {case}: cum 增大结果不得减（{last} -> {w}）"
+                );
+                last = w;
+            }
+        }
+    }
 }
 
 // =====================================================================

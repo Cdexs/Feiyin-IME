@@ -3064,4 +3064,138 @@ mod tests {
         }
         assert!(g.level.ready(), "学到 2 段 ⇒ 就绪 ⇒ 写回");
     }
+
+    // ========================================================================
+    // TEST-SYNC-389（阶段三 · 非作者护栏 · coder-1）：SegmentGate / SegmentPeakLevel / seed
+    //   契约见任务书；不与作者 `ts389_*` / `seg389c2_*` 重复。
+    // ========================================================================
+
+    /// 学习两段峰值 1.0 ⇒ 就绪、estimate=1.0（返回门，便于后续用例复用）。
+    fn ts389n_ready_level_1() -> SegmentGate {
+        let mut g = SegmentGate::with_seed(None);
+        let mut now = 0.0f32;
+        for _ in 0..2 {
+            now += 100.0;
+            g.update(true, 1.0, now);
+            now += 100.0;
+            g.update(false, 0.0, now);
+        }
+        assert!(g.level.ready() && (g.level.estimate() - 1.0).abs() < 1e-3);
+        g
+    }
+
+    /// 测 #1 整句不切：就绪 level=1.0，段内序列 [0.8, 0.05×10, 0.7, 0.02×20]（VAD 全真）
+    /// ⇒ **第一个高值后到段结束全部有声**（轻音/句尾近零都不切）。
+    #[test]
+    fn ts389n_whole_sentence_not_cut_after_first_peak() {
+        let mut g = ts389n_ready_level_1();
+        let mut now = 0.0f32;
+        let seq = std::iter::once(0.8f32)
+            .chain(std::iter::repeat(0.05).take(10))
+            .chain(std::iter::once(0.7))
+            .chain(std::iter::repeat(0.02).take(20));
+        let mut n = 0usize;
+        for sm in seq {
+            now += 10.0;
+            assert!(g.update(true, sm, now), "第 n={n} 帧（sm={sm}）应为有声");
+            n += 1;
+        }
+        assert_eq!(n, 32, "序列长度 1+10+1+20");
+        now += 10.0;
+        assert!(!g.update(false, 0.0, now), "段结束后应静默");
+    }
+
+    /// 测 #2 背景整句挡住：峰值恒 0.2 < 0.3×1.0 ⇒ 全 false，且该段峰值**不进学习样本**。
+    #[test]
+    fn ts389n_background_sentence_all_silent_and_peak_not_learned() {
+        let mut g = ts389n_ready_level_1();
+        let mut now = 0.0f32;
+        let samples_before = g.level.samples.len();
+        let rejected_before = g.rejected;
+        for _ in 0..50 {
+            now += 10.0;
+            assert!(!g.update(true, 0.2, now), "背景 0.2 应判静默");
+        }
+        now += 10.0;
+        g.update(false, 0.0, now);
+        assert_eq!(
+            g.level.samples.len(),
+            samples_before,
+            "背景段峰值不得进学习样本"
+        );
+        assert_eq!(g.rejected, rejected_before + 1, "背景段应计为被拒");
+    }
+
+    /// 测 #3 防锁死：学到 1.0 后录音人整句 0.25（<0.3）连续 35s（逐段结束）：
+    /// 30s 内样本未过期 ⇒ 每段被拒；样本按**会话时间**过期后回到未就绪 ⇒ 整句确认并重学 ≈0.25。
+    #[test]
+    fn ts389n_lock_recovery_after_sample_expiry() {
+        let mut g = ts389n_ready_level_1();
+        let mut now = 0.0f32;
+        let seg_start = now;
+        let mut rejected_early = 0usize;
+        let mut whole_confirmed_seen = 0usize;
+        while now - seg_start < 35_000.0 {
+            now += 100.0;
+            let sp = g.update(true, 0.25, now);
+            if sp {
+                whole_confirmed_seen += 1;
+            } else if now - seg_start < 29_000.0 {
+                rejected_early += 1;
+            }
+            now += 100.0;
+            g.update(false, 0.0, now);
+        }
+        assert!(rejected_early > 0, "30s 内样本未过期 ⇒ 0.25 段应被拒");
+        assert!(whole_confirmed_seen > 0, "样本过期后应回未就绪 ⇒ 整句确认");
+        assert!(g.level.samples_ready(), "重学后样本应就绪");
+        assert!(
+            (g.level.estimate() - 0.25).abs() < 1e-3,
+            "应重学到 ≈0.25，实测 {:.4}",
+            g.level.estimate()
+        );
+    }
+
+    /// 测 #4 seed 流程：seed=1.0 第一句峰值 0.5（≥0.3×seed）⇒ 确认；
+    /// seed=1.0 连续两句 0.1 ⇒ `seed_dropped`、第三句未就绪直接整句确认；
+    /// `seed_usable`：同设备 600s true、601s / 换设备 false。
+    #[test]
+    fn ts389n_seed_flow_and_usability_boundary() {
+        // (a) seed=1.0 ⇒ 第一句 0.5 确认、seed 不丢
+        let mut g = SegmentGate::with_seed(Some(1.0));
+        let mut now = 0.0f32;
+        now += 100.0;
+        assert!(g.update(true, 0.5, now), "0.5 ≥ 0.3×seed ⇒ 确认");
+        now += 100.0;
+        g.update(false, 0.0, now);
+        assert!(!g.seed_dropped, "确认句不得丢 seed");
+
+        // (b) seed=1.0 ⇒ 两句 0.1 被拒 ⇒ seed_dropped；第三句直接确认
+        let mut g2 = SegmentGate::with_seed(Some(1.0));
+        let mut t = 0.0f32;
+        for _ in 0..2 {
+            t += 100.0;
+            assert!(!g2.update(true, 0.1, t), "0.1 < 0.3×seed ⇒ 静默");
+            t += 100.0;
+            g2.update(false, 0.0, t);
+        }
+        assert!(g2.seed_dropped, "连续两句被拒 ⇒ seed_dropped");
+        assert!(!g2.level.ready(), "丢 seed 后回到未就绪");
+        t += 100.0;
+        assert!(g2.update(true, 0.05, t), "未就绪 ⇒ 第三句直接整句确认");
+
+        // (c) seed_usable 边界
+        assert!(
+            seed_usable("mic", Duration::from_secs(600), "mic"),
+            "600s ⇒ true"
+        );
+        assert!(
+            !seed_usable("mic", Duration::from_secs(601), "mic"),
+            "601s ⇒ false"
+        );
+        assert!(
+            !seed_usable("mic", Duration::from_secs(1), "other"),
+            "换设备 ⇒ false"
+        );
+    }
 }
