@@ -11443,6 +11443,272 @@ mod shared_queue_382_tests {
     }
 }
 
+// ============================================================
+// TEST-SYNC-382（阶段三 · 非作者护栏，coder-2）
+//   被测 FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382（HEAD 1af7212）。
+//   按**设计契约**写用例，不照实现反推；补作者（plan_windows_382_tests /
+//   reflow_fast_382_tests / problem2_order_382_tests / shared_queue_382_tests）照不到的边界。
+//   🔴 全部为测试代码，不改生产逻辑。
+// ============================================================
+#[cfg(test)]
+mod testsync382_tests {
+    use crate::transcription;
+
+    /// 确定性伪随机（无外部依赖）：64-bit LCG（Knuth MMIX 常数）。
+    struct Lcg(u64);
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Lcg(seed | 1)
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+        fn usize_in(&mut self, lo: usize, hi: usize) -> usize {
+            debug_assert!(hi >= lo);
+            lo + (self.next_u64() % (hi - lo + 1) as u64) as usize
+        }
+        fn f32_in(&mut self, lo: f32, hi: f32) -> f32 {
+            let t = (self.next_u64() >> 11) as f32 / (1u64 << 53) as f32;
+            lo + t * (hi - lo)
+        }
+    }
+
+    // ---- 1. plan_windows 覆盖不变量的**性质测试** ----
+
+    /// 200 组随机 (prev_durs, new_durs, prev_base)：
+    /// ① 每个新片全局下标被某窗覆盖 ② 第 k 窗以第 k 新片收尾
+    /// ③ `start >= prev_base` 且 `end - start <= WINDOW_MAX_SLICES`
+    #[test]
+    fn plan_windows_property_cover_and_shape() {
+        let max_prev = transcription::WINDOW_MAX_SLICES;
+        let mut rng = Lcg::new(0x0381_0382_u64);
+        for _case in 0..200usize {
+            let nprev = rng.usize_in(0, max_prev);
+            let mut prev: Vec<f32> = Vec::with_capacity(nprev);
+            for _ in 0..nprev {
+                prev.push(rng.f32_in(0.3, 12.0));
+            }
+            let nnew = rng.usize_in(1, 4);
+            let mut new: Vec<f32> = Vec::with_capacity(nnew);
+            for _ in 0..nnew {
+                new.push(rng.f32_in(0.3, 12.0));
+            }
+            let base = rng.usize_in(0, 50);
+            let wins = super::plan_windows(&prev, &new, base);
+            assert_eq!(wins.len(), new.len(), "窗数必须等于新片数");
+            for (k, (s, e)) in wins.iter().enumerate() {
+                let gidx = base + nprev + k; // 第 k 个新片的全局下标
+                assert_eq!(*e - 1, gidx, "第 k 窗必须以第 k 个新片收尾");
+                assert!(*s >= base, "窗起点不得早于 prev_base");
+                assert!(*e > *s, "窗必须非空");
+                assert!(
+                    *e - *s <= max_prev,
+                    "窗宽不得超过 WINDOW_MAX_SLICES（不变量被裁片打破）"
+                );
+                assert!(*s <= gidx && gidx < *e, "新片全局下标必须被本窗覆盖");
+            }
+        }
+    }
+
+    /// 常态**单片**派发（`prev_durs` 未满 `WINDOW_MAX_SLICES` ⇒ 不触发裁片）：
+    /// 结果必须等于旧算法「pre+new 后直接 `group_window_start_secs`」。
+    ///
+    /// 说明：`prev` 已满 `WINDOW_MAX_SLICES` 时 plan 会先裁最远片再组窗（382 设计），
+    /// 与「不裁直接 group」不同 —— 那一条由上面 shape 性质覆盖，不在本用例范围。
+    #[test]
+    fn plan_windows_single_matches_legacy_property() {
+        let max_prev = transcription::WINDOW_MAX_SLICES;
+        let mut rng = Lcg::new(0x0381_0383_u64);
+        for _case in 0..200usize {
+            let nprev = rng.usize_in(0, max_prev - 1); // 保证 push 后不裁片
+            let mut prev: Vec<f32> = Vec::with_capacity(nprev);
+            for _ in 0..nprev {
+                prev.push(rng.f32_in(0.3, 12.0));
+            }
+            let x = rng.f32_in(0.3, 12.0);
+            let base = rng.usize_in(0, 50);
+            let wins = super::plan_windows(&prev, &[x], base);
+            let mut buf = prev.clone();
+            buf.push(x);
+            let s = transcription::group_window_start_secs(&buf, transcription::WINDOW_MAX_SECS);
+            assert_eq!(
+                wins,
+                vec![(base + s, base + prev.len() + 1)],
+                "常态单片必须等于旧组窗算法"
+            );
+        }
+    }
+
+    /// 边界：`new_durs` 为空 ⇒ 返回空计划（不 panic、不产出窗口）。
+    /// 理由：调用方若以「本次派发携带 0 片」调用（防御性），不得制造空窗或越界。
+    #[test]
+    fn plan_windows_empty_new_is_empty() {
+        assert!(super::plan_windows(&[1.0, 2.0], &[], 7).is_empty());
+        assert!(super::plan_windows(&[], &[], 0).is_empty());
+    }
+
+    // ---- 2. ReflowFastState 退化输入（作者未覆盖） ----
+    #[cfg(target_os = "windows")]
+    mod reflow {
+        use crate::{ReflowFastOutcome, ReflowFastState};
+
+        fn apply(o: ReflowFastOutcome) -> (String, usize, bool, bool) {
+            match o {
+                ReflowFastOutcome::Apply {
+                    text,
+                    committed_len,
+                    accurate,
+                    render,
+                } => (text, committed_len, accurate, render),
+                ReflowFastOutcome::None => panic!("expected Apply, got None"),
+            }
+        }
+
+        /// 跨代：gen1 的准确边界**不得**被 gen2 同 seg 复用（须回退 fallback）。
+        #[test]
+        fn cross_gen_bound_not_reused() {
+            let mut st = ReflowFastState::default();
+            let _ = apply(st.on_text(1, 5, "one".into(), 3, false));
+            let b = apply(st.on_bound(1, 5, Some(7), false));
+            assert_eq!(b, ("one".into(), 7, true, true));
+            // gen2 同 seg ⇒ 不得拿 gen1 的 7
+            let a = apply(st.on_text(2, 5, "two".into(), 9, false));
+            assert_eq!(a, ("two".into(), 9, false, true), "旧代边界必须失效");
+        }
+
+        /// 同 seg 边界 `None`（b 类）先到、随后升为 `Some`：应补一次准确渲染。
+        #[test]
+        fn same_seg_bound_none_then_some_rerenders() {
+            let mut st = ReflowFastState::default();
+            let a = apply(st.on_text(1, 5, "acc".into(), 3, false));
+            assert_eq!(a, ("acc".into(), 3, false, true));
+            assert_eq!(st.on_bound(1, 5, None, false), ReflowFastOutcome::None);
+            let b = apply(st.on_bound(1, 5, Some(7), false));
+            assert_eq!(b, ("acc".into(), 7, true, true), "升级为准确边界应重渲");
+        }
+
+        /// 两个 seg 交错 + 边界**乱序**到达：只有「最新已渲染 seg」的边界才重渲；
+        /// 预先登记的边界（seg 尚未渲染）在 text 到达时应被采用。
+        #[test]
+        fn out_of_order_bounds_only_latest_seg_renders() {
+            let mut st = ReflowFastState::default();
+            // seg6 边界先到（seg6 尚未渲染）⇒ None，但被登记
+            assert_eq!(st.on_bound(1, 6, Some(4), false), ReflowFastOutcome::None);
+            let _ = apply(st.on_text(1, 5, "five".into(), 1, false));
+            // seg6 全文到：应直接用先前登记的边界 4（accurate）
+            let six = apply(st.on_text(1, 6, "six".into(), 1, false));
+            assert_eq!(six, ("six".into(), 4, true, true));
+            // seg5 边界后到：它已不是最新已渲染 ⇒ None
+            assert_eq!(st.on_bound(1, 5, Some(9), false), ReflowFastOutcome::None);
+            // seg6 边界更新：仍是最新已渲染 ⇒ 重渲准确值
+            let upd = apply(st.on_bound(1, 6, Some(8), false));
+            assert_eq!(upd, ("six".into(), 8, true, true));
+        }
+
+        /// `suppressed=true`：边界重渲也必须 `render=false`，但状态（committed_len）照常更新。
+        #[test]
+        fn suppressed_on_bound_renders_state_only() {
+            let mut st = ReflowFastState::default();
+            let _ = apply(st.on_text(1, 5, "acc".into(), 3, true));
+            let b = apply(st.on_bound(1, 5, Some(7), true));
+            assert_eq!(
+                (b.1, b.2, b.3),
+                (7, true, false),
+                "suppressed 下仍以准确边界更新状态，但不得重画浮层"
+            );
+        }
+
+        /// 作者未覆盖的**会话复位点**：`clear()` 必须清空 latest/bounds/rendered，
+        /// 否则跨会话会复用陈旧边界（新代同 seg 拿到旧值）。
+        #[test]
+        fn clear_resets_all_state() {
+            let mut st = ReflowFastState::default();
+            let _ = apply(st.on_text(1, 5, "acc".into(), 3, false));
+            let _ = apply(st.on_bound(1, 5, Some(7), false));
+            st.clear();
+            // clear 后同 gen 同 seg 也不得复用 7 ⇒ 用 fallback
+            let a = apply(st.on_text(1, 5, "new".into(), 4, false));
+            assert_eq!(a, ("new".into(), 4, false, true), "clear 后旧边界必须失效");
+        }
+    }
+
+    // ---- 3. 源码级护栏 ----
+
+    fn prod_lines() -> Vec<String> {
+        crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"))
+            .into_iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect()
+    }
+
+    /// 滑窗派发**区域**不得退回「每 worker 一个发送端 / 轮询取模」，
+    /// 且必须 clone **同一** `task_rx`（单一队列多消费者）。
+    ///
+    /// 与作者全局护栏的分工：本用例把负面断言**限定在派发点邻域**（旧 `rr % concurrency`
+    /// 就写在 worker 循环旁），并补正向「共享 task_rx 被 clone」。
+    #[test]
+    fn window_dispatch_single_shared_queue_no_round_robin() {
+        let lines = prod_lines();
+        let idx = lines
+            .iter()
+            .position(|l| l.contains("task_tx.send("))
+            .expect("382: 滑窗派发锚点 task_tx.send 缺失");
+        let lo = idx.saturating_sub(300);
+        let hi = (idx + 20).min(lines.len());
+        for l in &lines[lo..hi] {
+            assert!(
+                !l.contains("task_txs"),
+                "382: 滑窗派发区不得出现多发送端 task_txs"
+            );
+            assert!(
+                !l.contains("% concurrency") && !l.contains("rr %"),
+                "382: 滑窗派发区不得出现轮询取模派发"
+            );
+        }
+        assert!(
+            lines.iter().any(|l| l.contains("task_rx.clone()")),
+            "382: worker 必须 clone 共享 task_rx（单一队列多消费者）"
+        );
+    }
+
+    /// `ACC_REFLOW_SUPPRESS` 置位**只**允许出现在 `PipelineEvent::Processing` 处理臂内
+    /// （防闪回机制的唯一开关；散落到别处会把正常回灌也静默掉）。
+    #[test]
+    fn suppress_flag_only_set_inside_processing_arm() {
+        let lines = prod_lines();
+        let stores: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("ACC_REFLOW_SUPPRESS.store(true"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            stores.len(),
+            1,
+            "382: ACC_REFLOW_SUPPRESS.store(true 必须恰一处（本代 Processing 时置位）"
+        );
+        let idx = stores[0];
+        let arm = (0..idx)
+            .rev()
+            .find(|&i| lines[i].contains("PipelineEvent::") && lines[i].contains("=>"))
+            .expect("382: 置位必须位于某个 PipelineEvent 处理臂内");
+        assert!(
+            lines[arm].contains("PipelineEvent::Processing("),
+            "382: ACC_REFLOW_SUPPRESS 置位必须落在 Processing 处理臂内，实际最近臂为其它事件"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("ACC_REFLOW_SUPPRESS.store(false")),
+            "382: 必须有复位点（新代 RecordingStarted），否则一旦置位永不回灌"
+        );
+    }
+}
+
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 fn run_pipeline_core(

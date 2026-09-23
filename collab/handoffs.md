@@ -92,3 +92,11 @@
 - **未验证**：实机端测（字缝切体感 / 长句 >10s）交 tester-1/Gavin，本单未声称已验证。
 - 🔴 **跨文件待改（越界）**：`src/config/mod.rs:11`、`src/main.rs:8579`（及历史注释 `:8539/:11060`）仍写 13s，已列 result.md，请主控路由给 coder-1。
 - **未改版本号 / 未 push / 未 build release / 零凭证**。
+
+## 2026-09-23 — TEST-SYNC-382（coder-2，✅ 阶段三交付：非作者护栏 10 条）
+
+- **性质**：只写测试、零生产改动；仅 `src/main.rs` `#[cfg(test)] mod testsync382_tests`。被测 `FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382`（HEAD `1af7212`）。🔴 **未跑 `cargo test`**（阶段四 tester-1 首跑）。
+- **新增 10 条**：`plan_windows` 性质（LCG 200 组覆盖/收尾/形状 + 200 组单片等价旧算法 + 空 new）；`ReflowFastState` 退化（跨代 / None→Some / 交错乱序 / suppressed 边界 / `clear()` 复位）；源码级（滑窗派发邻域无 `task_txs`·`% concurrency`·`rr %` + 正向 `task_rx.clone()`；`ACC_REFLOW_SUPPRESS.store(true` 恰一处且在 `Processing` 臂内）。
+- **验证**：`rustfmt --config skip_children=true --check src/main.rs` **EXIT 0**；`cargo check --all-targets` **0 error**、warnings **88**=基线；numstat==-w（266/0）。独立 Python 端口 `prod_lines_excluding_cfg_test` 核实护栏前提 + 40 万组 `plan_windows` 模拟 0 反例（弥补不能跑单测）。
+- **未发现生产缺陷**（无停手项）。**未改版本 / 未 push / 零凭证**。
+- 🔴 **交阶段四注意**：全仓 `cargo fmt --check` 目前**仅在 `src/transcription/vad.rs:1572`**（另一 Worker 在飞的 TEST-SYNC-381 `ts381_*`，+298 行未提交）非 0；本单未触碰该文件，请主控确认其作者处理后再出包。
