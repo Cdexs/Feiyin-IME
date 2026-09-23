@@ -1332,4 +1332,411 @@ mod tests {
             "end 超界 clamp 到 total，再补前向 200ms padding"
         );
     }
+
+    // ========================================================================
+    // TEST-SYNC-381（阶段三 · 非作者视角）：按**设计契约**给 `FIX-SLICE-CUT-AT-GAP-381`
+    //   补独立护栏。作者用例覆盖「有字缝 / 无字缝兜底 / 尾巴保护 / 不丢不重 / 相对阈值 /
+    //   边界 clamp」；本组补作者心智模型照不到的：性质测试、退化输入、最早字缝优先、
+    //   非帧对齐 start、空/倒置区间、滑窗 10s 合并阈值。
+    //   🔴 任务书第 4 条「20s 路径逐位不变快照」经主控 2026-09-23 **恢复并强化**：本批只动
+    //   本地 realtime 管线，离线 accuracy 的 20s 路径与 `naive_chunk` **不得变** ⇒ 对二者用
+    //   固定输入做**逐位快照**（对 `1af7212^` 即 381 之前），见
+    //   `ts381_padded_20s_snapshot_bit_identical_to_pre_381` /
+    //   `ts381_naive_chunk_snapshot_bit_identical_to_pre_381`。
+    // ========================================================================
+
+    /// 契约常量（避免测试里写死 10/12 数字与实现漂移）。
+    const TS381_RATE: usize = 16_000;
+    const TS381_FRAME: usize = GAP_FRAME_SAMPLES; // 320（20ms）
+
+    /// 确定性伪随机（xorshift64），让性质测试**可复现**、不引外部 crate。
+    struct Ts381Rng(u64);
+    impl Ts381Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed | 1)
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        /// [0, 1)
+        fn unit(&mut self) -> f32 {
+            (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+        }
+        /// [lo, hi] 闭区间
+        fn range(&mut self, lo: usize, hi: usize) -> usize {
+            lo + (self.next_u64() as usize) % (hi - lo + 1)
+        }
+    }
+
+    /// 混合「正弦 / 噪声 / 静音」块的伪随机音频，幅度 0.001~1.0。
+    fn ts381_mixed_audio(rng: &mut Ts381Rng, total: usize) -> Vec<f32> {
+        let mut v: Vec<f32> = Vec::with_capacity(total);
+        let mut phase: f32 = 0.0;
+        while v.len() < total {
+            let block = rng.range(160, 3200); // 10ms ~ 200ms
+            let kind = rng.next_u64() % 3; // 0 正弦 / 1 噪声 / 2 静音
+            let amp = 0.001 + rng.unit() * 0.999;
+            let freq = 100.0 + rng.unit() * 400.0;
+            let inc = 2.0 * std::f32::consts::PI * freq / TS381_RATE as f32;
+            for _ in 0..block {
+                if v.len() >= total {
+                    break;
+                }
+                let s = match kind {
+                    0 => {
+                        phase += inc;
+                        phase.sin() * amp
+                    }
+                    1 => (rng.unit() * 2.0 - 1.0) * amp,
+                    _ => 0.0,
+                };
+                v.push(s);
+            }
+        }
+        v
+    }
+
+    /// 契约常量纯正弦（幅度 amp）。
+    fn ts381_sine(n: usize, amp: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                (2.0 * std::f32::consts::PI * 220.0 * i as f32 / TS381_RATE as f32).sin() * amp
+            })
+            .collect()
+    }
+
+    /// 契约断言：严格相接 + 并集 == [start,end) + 非末片 ∈[10s,12s] + 末片 <11s（或整段 <11s）。
+    fn ts381_assert_contract(cuts: &[(usize, usize)], start: usize, end: usize, ctx: &str) {
+        assert!(!cuts.is_empty(), "{ctx}: 非空区间必须至少一片");
+        assert_eq!(cuts[0].0, start, "{ctx}: 首片必须从 start 起");
+        for w in cuts.windows(2) {
+            assert_eq!(w[0].1, w[1].0, "{ctx}: 切点必须严格相接：{cuts:?}");
+        }
+        assert_eq!(cuts.last().unwrap().1, end, "{ctx}: 末片必须覆盖到 end");
+        for &(s, e) in cuts.iter() {
+            assert!(e > s, "{ctx}: 不允许空片 {s}..{e}");
+        }
+        let span = end - start;
+        for (i, &(s, e)) in cuts.iter().enumerate() {
+            if i + 1 == cuts.len() {
+                continue;
+            }
+            let len = e - s;
+            assert!(
+                (10 * TS381_RATE..=12 * TS381_RATE).contains(&len),
+                "{ctx}: 非末片 #{i} 长度 {:.3}s ∉ [10,12]s：{cuts:?}",
+                len as f64 / TS381_RATE as f64
+            );
+        }
+        let last_len = cuts.last().unwrap().1 - cuts.last().unwrap().0;
+        assert!(
+            last_len < 11 * TS381_RATE || span < 11 * TS381_RATE,
+            "{ctx}: 末片 {:.3}s 应 <11s（整段 {:.3}s）",
+            last_len as f64 / TS381_RATE as f64,
+            span as f64 / TS381_RATE as f64
+        );
+    }
+
+    /// #1 性质测试：100 段伪随机音频（0.5~60s，混合正弦/噪声/静音，幅度 0.001~1.0），
+    /// 断言契约四性质：①严格相接且并集==[start,end) ②非末片∈[10,12]s ③末片<11s（或整段<11s）
+    /// ④不 panic（能跑完即证）。
+    #[test]
+    fn ts381_property_plan_gap_cuts_invariants() {
+        let mut rng = Ts381Rng::new(0x5EED_0381_C0DE_1234);
+        for case in 0..100 {
+            // 偏小分布（u^4）覆盖 0.5~60s，同时把 100 段的样本总量压在可控范围。
+            let u = rng.unit();
+            let secs = 0.5 + u * u * u * u * 59.5;
+            let total = ((secs * TS381_RATE as f32) as usize).max(1);
+            let audio = ts381_mixed_audio(&mut rng, total);
+            assert_eq!(audio.len(), total, "case {case}: 生成样本数不符");
+            let cuts = plan_gap_cuts(&audio, 0, total);
+            ts381_assert_contract(&cuts, 0, total, &format!("case {case} total={total}"));
+        }
+    }
+
+    /// #2a 全零音频：前 10s 中位数为 0 ⇒ 阈值 0 ⇒ **所有**帧并列达标，取**最早**候选帧。
+    /// 最早候选帧中心 = 10s + 半帧（不是 12s 兜底、不是任意帧）。
+    #[test]
+    fn ts381_degenerate_all_zero_picks_earliest_at_threshold_zero() {
+        let total = 20 * TS381_RATE;
+        let audio = vec![0.0f32; total];
+        let cuts = plan_gap_cuts(&audio, 0, total);
+        ts381_assert_contract(&cuts, 0, total, "all-zero");
+        assert_eq!(
+            cuts[0],
+            (0, 10 * TS381_RATE + TS381_FRAME / 2),
+            "阈值 0 下必须取最早达标帧中心（10s + 半帧）"
+        );
+    }
+
+    /// #2b NaN / ±inf：不得 panic、不得死循环；结构仍自洽（能返回即证无死循环）。
+    #[test]
+    fn ts381_degenerate_nan_inf_no_panic() {
+        let total = 20 * TS381_RATE;
+        let mut audio = ts381_sine(total, 0.3);
+        for &pos in &[0usize, 12345, 160_000, 161_000, total - 1] {
+            audio[pos] = f32::NAN;
+        }
+        audio[160_500] = f32::INFINITY;
+        audio[160_600] = f32::NEG_INFINITY;
+        let cuts = plan_gap_cuts(&audio, 0, total);
+        ts381_assert_contract(&cuts, 0, total, "nan/inf-mixed");
+
+        // 全 NaN
+        let all_nan = vec![f32::NAN; total];
+        let cn = plan_gap_cuts(&all_nan, 0, total);
+        ts381_assert_contract(&cn, 0, total, "all-nan");
+
+        // 全 +inf
+        let all_inf = vec![f32::INFINITY; total];
+        let ci = plan_gap_cuts(&all_inf, 0, total);
+        ts381_assert_contract(&ci, 0, total, "all-inf");
+    }
+
+    /// #2c `end` 超出音频长度：`plan_gap_cuts` **不**负责 clamp（clamp 由调用方
+    /// `plan_sliding_cuts` 在进入前完成）。契约要求是**不 panic / 不死循环 / 结构自洽**，
+    /// 且末片 end 严格用调用方给的 `end`（不擅自改）。
+    #[test]
+    fn ts381_degenerate_end_beyond_audio_is_safe_no_clamp() {
+        let audio_len = 12 * TS381_RATE; // 只有 12s 音频
+        let audio = vec![0.2f32; audio_len];
+        let end = 20 * TS381_RATE; // 声称到 20s（越界）
+        let cuts = plan_gap_cuts(&audio, 0, end);
+        assert!(!cuts.is_empty());
+        assert_eq!(cuts[0].0, 0);
+        for w in cuts.windows(2) {
+            assert_eq!(w[0].1, w[1].0, "越界 end 下仍须严格相接：{cuts:?}");
+        }
+        assert_eq!(
+            cuts.last().unwrap().1,
+            end,
+            "末片 end 用调用方给的 end（clamp 是调用方的职责）"
+        );
+    }
+
+    /// #2d 长度恰为 10s / 11s / 11s+1 样本 / 12s 的边界。
+    /// 11s 与 11s+1 时 `[lower,upper]` 内无任何帧**中心**落点 ⇒ 兜底切 `lower`(=10s)，
+    /// 与音频内容无关 ⇒ 可精确断言。
+    #[test]
+    fn ts381_boundary_lengths_10_11_12s() {
+        assert_eq!(
+            plan_gap_cuts(&ts381_sine(10 * TS381_RATE, 0.3), 0, 10 * TS381_RATE),
+            vec![(0, 10 * TS381_RATE)],
+            "10s：剩余 <11s ⇒ 不切"
+        );
+        assert_eq!(
+            plan_gap_cuts(&ts381_sine(11 * TS381_RATE, 0.3), 0, 11 * TS381_RATE),
+            vec![(0, 10 * TS381_RATE), (10 * TS381_RATE, 11 * TS381_RATE)],
+            "11s：恰达下限 ⇒ 切 10s + 1s 尾"
+        );
+        assert_eq!(
+            plan_gap_cuts(
+                &ts381_sine(11 * TS381_RATE + 1, 0.3),
+                0,
+                11 * TS381_RATE + 1
+            ),
+            vec![(0, 10 * TS381_RATE), (10 * TS381_RATE, 11 * TS381_RATE + 1)],
+            "11s+1 样本：同上（尾巴 1s + 1 样本）"
+        );
+        let d = ts381_sine(12 * TS381_RATE, 0.3);
+        let cuts = plan_gap_cuts(&d, 0, 12 * TS381_RATE);
+        ts381_assert_contract(&cuts, 0, 12 * TS381_RATE, "12s");
+        assert_eq!(cuts.len(), 2, "12s ⇒ 2 片：{cuts:?}");
+    }
+
+    /// #3 字缝优先（**最早达标**而非最深）：前 10s 语音，10.5s 一个 40ms 近静音、
+    /// 11.5s 一个更深的静音 ⇒ 必须切在 10.5s（最早达标帧中心），不得跳到更深的 11.5s。
+    #[test]
+    fn ts381_gap_priority_earliest_not_deepest() {
+        let total = 20 * TS381_RATE;
+        let mut audio = ts381_sine(total, 0.3);
+        let shallow = 10 * TS381_RATE + TS381_RATE / 2; // 10.5s
+        let shallow_end = shallow + 40 * 16; // 40ms
+        let deep = 11 * TS381_RATE + TS381_RATE / 2; // 11.5s
+        let deep_end = deep + 40 * 16;
+        for x in &mut audio[shallow..shallow_end] {
+            *x = 0.002; // 浅静音
+        }
+        for x in &mut audio[deep..deep_end] {
+            *x = 0.0002; // 更深静音
+        }
+        let cuts = plan_gap_cuts(&audio, 0, total);
+        assert_eq!(cuts.len(), 2, "20s ⇒ 一次切 + 尾巴：{cuts:?}");
+        let cut = cuts[0].1;
+        assert!(
+            (shallow..shallow_end).contains(&cut),
+            "必须切在较早的 10.5s 字缝内：cut={cut}"
+        );
+        assert!(cut < deep, "不得跳到更深的 11.5s 静音：cut={cut}");
+        assert_eq!(cut, shallow + TS381_FRAME / 2, "取最早达标帧的中心样本");
+        assert_eq!(cuts[1], (cut, total));
+    }
+
+    /// 逐位相等（`to_bits`）—— 比 `f32 ==` 更严（`-0.0` 与 `0.0` 也会被区分）。
+    fn ts381_bits_eq(a: &[f32], b: &[f32]) -> bool {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b.iter())
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    /// 构造期望段：`zeros(pre) ++ audio[main] ++ zeros(post)`。
+    fn ts381_expected_segment(
+        audio: &[f32],
+        pre: usize,
+        main: (usize, usize),
+        post: usize,
+    ) -> Vec<f32> {
+        let mut v = Vec::with_capacity(pre + (main.1 - main.0) + post);
+        v.extend(std::iter::repeat(0.0f32).take(pre));
+        v.extend_from_slice(&audio[main.0..main.1]);
+        v.extend(std::iter::repeat(0.0f32).take(post));
+        v
+    }
+
+    /// #4 20s 路径（`build_padded_segments`）**逐位不变快照**（基线 = `1af7212^`，381 之前）。
+    ///
+    /// 固定输入写死每段的 `(前置 padding, 主段区间, 后置 padding)`；断言：
+    /// ① 段数 / 每段长度与快照一致 ② 每段样本与「zeros ++ 原音频切片 ++ zeros」**逐位相等**。
+    /// 覆盖：硬切(25s→20+5) / 相邻合并 / 不合并(含间隔 padding) / 越界丢弃 / end clamp。
+    /// （本批只动本地 realtime 管线，此路径属离线 accuracy，须零变化。）
+    #[test]
+    fn ts381_padded_20s_snapshot_bit_identical_to_pre_381() {
+        let pad = SEGMENT_PADDING_SAMPLES; // 3200
+        let r = TS381_RATE;
+        let total = 30 * r; // 480000
+                            // 每样本非零（padding 恒 0，便于核对），并按位比对主段。
+        let audio: Vec<f32> = (0..total).map(|i| ((i % 1000) as f32) + 1.0).collect();
+
+        // (raw, 期望各段 (pre_pad, main_start, main_end, post_pad))
+        let cases: Vec<(Vec<(usize, usize)>, Vec<(usize, usize, usize, usize)>)> = vec![
+            // 25s 单段 ⇒ 硬切 20s + 5s；末段补 200ms 尾 padding
+            (
+                vec![(0, 25 * r)],
+                vec![(0, 0, 20 * r, 0), (0, 20 * r, 25 * r, pad)],
+            ),
+            // 相邻两短段合并后 10.00625s ≤20s ⇒ 单段 + 尾 padding
+            (
+                vec![(0, 5 * r), (5 * r + 100, 5 * r)],
+                vec![(0, 0, 10 * r + 100, pad)],
+            ),
+            // 不相邻且合并后 30s >20s ⇒ 不合并 ⇒ 两段，中间各补 11200 个 0
+            (
+                vec![(0, 15 * r), (16 * r, 15 * r)],
+                vec![(0, 0, 15 * r, 11_200), (11_200, 16 * r, total, 0)],
+            ),
+            // start 越界 ⇒ 丢弃 ⇒ 无段
+            (vec![(total, 1000)], vec![]),
+            // end 越界 ⇒ clamp 到 total ⇒ 前向 padding 3200（末段无尾 padding）
+            (
+                vec![(total - 1000, 5000)],
+                vec![(pad, total - 1000, total, 0)],
+            ),
+        ];
+        for (raw, expected) in cases {
+            let segs = build_padded_segments(&raw, total, &audio);
+            assert_eq!(segs.len(), expected.len(), "段数快照（raw={raw:?}）");
+            for (k, (seg, &(pre, ms, me, post))) in segs.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(
+                    seg.len(),
+                    pre + (me - ms) + post,
+                    "段 #{k} 长度快照（raw={raw:?}）"
+                );
+                let want = ts381_expected_segment(&audio, pre, (ms, me), post);
+                assert!(
+                    ts381_bits_eq(seg, &want),
+                    "段 #{k} 样本必须与 381 之前逐位相等（raw={raw:?}）"
+                );
+            }
+        }
+    }
+
+    /// #4b 兜底路径 `naive_chunk`（381 未触及的其它管线）**逐位不变快照**：
+    /// 固定输入按 20s 等分；断言每段样本与原音频对应切片逐位相等、区间首尾相接。
+    #[test]
+    fn ts381_naive_chunk_snapshot_bit_identical_to_pre_381() {
+        let r = TS381_RATE;
+        let audio: Vec<f32> = (0..30 * r).map(|i| ((i % 97) as f32) - 48.0).collect();
+
+        let cases: Vec<(usize, Vec<(usize, usize)>)> = vec![
+            (0, vec![]),
+            (10 * r, vec![(0, 10 * r)]),
+            (20 * r, vec![(0, 20 * r)]),
+            (20 * r + 1, vec![(0, 20 * r), (20 * r, 20 * r + 1)]),
+            (25 * r, vec![(0, 20 * r), (20 * r, 25 * r)]),
+            (30 * r, vec![(0, 20 * r), (20 * r, 30 * r)]),
+        ];
+        for (n, expected) in cases {
+            let segs = naive_chunk(&audio[..n]);
+            assert_eq!(segs.len(), expected.len(), "naive_chunk 段数（n={n}）");
+            let mut pos = 0usize;
+            for (k, (seg, &(s, e))) in segs.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(s, pos, "naive_chunk 区间必须首尾相接（n={n}）");
+                assert_eq!(e - s, seg.len(), "段 #{k} 长度（n={n}）");
+                assert!(
+                    ts381_bits_eq(seg, &audio[s..e]),
+                    "段 #{k} 必须与原音频切片逐位相等（n={n}）"
+                );
+                pos = e;
+            }
+            assert_eq!(pos, n, "naive_chunk 必须覆盖到末尾（n={n}）");
+        }
+    }
+
+    /// #5a 非零、且**非帧对齐**的 `start`：首片必须从 `start` 起（作者用例全从 0 起）。
+    #[test]
+    fn ts381_plan_gap_cuts_nonzero_unaligned_start() {
+        let total = 40 * TS381_RATE;
+        let mut audio = vec![0.5f32; total];
+        for i in (5 * TS381_RATE)..(25 * TS381_RATE) {
+            audio[i] = (2.0 * std::f32::consts::PI * 220.0 * (i - 5 * TS381_RATE) as f32
+                / TS381_RATE as f32)
+                .sin()
+                * 0.3;
+        }
+        let start = 5 * TS381_RATE + 123; // 非 320 对齐
+        let end = 25 * TS381_RATE; // 20s 跨度 ⇒ 会切
+        let cuts = plan_gap_cuts(&audio, start, end);
+        ts381_assert_contract(&cuts, start, end, "nonzero-unaligned-start");
+    }
+
+    /// #5b 空区间 / 倒置区间 / 空音频：必须返回空、不 panic。
+    #[test]
+    fn ts381_plan_gap_cuts_empty_or_inverted_range() {
+        let audio = vec![0.1f32; 20 * TS381_RATE];
+        assert!(
+            plan_gap_cuts(&audio, 5 * TS381_RATE, 5 * TS381_RATE).is_empty(),
+            "start == end ⇒ 空"
+        );
+        assert!(
+            plan_gap_cuts(&audio, 8 * TS381_RATE, 3 * TS381_RATE).is_empty(),
+            "start > end ⇒ 空"
+        );
+        assert!(plan_gap_cuts(&[], 0, 0).is_empty(), "空音频 + 空区间 ⇒ 空");
+    }
+
+    /// #5c 滑窗路径的**合并阈值 = 10s**，与 20s 路径不同（作者用例未覆盖该差异）：
+    /// 两相邻段合并后 16.00625s —— ≤20s（20s 路径合并成 1 段）但 >10s（滑窗不合并 ⇒ 2 段）。
+    #[test]
+    fn ts381_sliding_merge_threshold_is_10s_not_20s() {
+        let total = 30 * TS381_RATE;
+        let audio = vec![0.2f32; total];
+        let raw = vec![(0, 8 * TS381_RATE), (8 * TS381_RATE + 100, 8 * TS381_RATE)];
+        assert_eq!(
+            build_padded_segments(&raw, total, &audio).len(),
+            1,
+            "20s 路径：合并后 16.00625s ≤20s ⇒ 1 段"
+        );
+        assert_eq!(
+            build_sliding_segments(&raw, total, &audio).len(),
+            2,
+            "滑窗路径：合并上限 10s ⇒ 16.00625s 不合并 ⇒ 2 段"
+        );
+    }
 }

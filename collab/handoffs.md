@@ -100,3 +100,17 @@
 - **验证**：`rustfmt --config skip_children=true --check src/main.rs` **EXIT 0**；`cargo check --all-targets` **0 error**、warnings **88**=基线；numstat==-w（266/0）。独立 Python 端口 `prod_lines_excluding_cfg_test` 核实护栏前提 + 40 万组 `plan_windows` 模拟 0 反例（弥补不能跑单测）。
 - **未发现生产缺陷**（无停手项）。**未改版本 / 未 push / 零凭证**。
 - 🔴 **交阶段四注意**：全仓 `cargo fmt --check` 目前**仅在 `src/transcription/vad.rs:1572`**（另一 Worker 在飞的 TEST-SYNC-381 `ts381_*`，+298 行未提交）非 0；本单未触碰该文件，请主控确认其作者处理后再出包。
+
+## 2026-09-23 — coder-1 — TEST-SYNC-381 ✅ 交付（阶段三·非作者护栏，只改 `vad.rs` 的 `#[cfg(test)]` 区）
+
+- **被测**：`FIX-SLICE-CUT-AT-GAP-381`（coder-2，已验收 HEAD `1af7212`）。按**设计契约**写、不照实现反推；不重复作者 `gap_cut_*` / `sliding_segments_*` / `legacy_wrapper_*`。
+- **范围**：`src/transcription/vad.rs` **仅** `mod tests`（+407/−0，生产代码零改动）；11 条 `#[test]`（`ts381_` 前缀）。
+- **覆盖**：
+  1. **性质**：确定性 xorshift64 + 正弦/噪声/静音混合（幅度 0.001~1.0）100 段（0.5~60s）⇒ 断言严格相接且并集==[start,end)、非末片∈[10,12]s、末片<11s（或整段<11s）、不 panic。
+  2. **退化**：全零（阈值 0 ⇒ **取最早帧中心 = 10s+半帧**，精确断言）／NaN·±inf·全 NaN·全 +inf（不 panic、不死循环）／`end` 越界（`plan_gap_cuts` 不 clamp —— 记明 clamp 由调用方 `plan_sliding_cuts` 负责，只断言安全+结构自洽）／长度恰 10s·11s·11s+1 样本·12s（11s 系无帧中心落点 ⇒ 精确切 `lower`）。
+  3. **字缝优先**：10.5s 浅静音 + 11.5s 更深静音 ⇒ 精确切 **10.5s（最早达标帧中心 168160）**，不得跳更深。
+  4. **20s 路径逐位不变快照**（主控先作废后**恢复并强化**，最终按恢复版）：`build_padded_segments` 固定输入写死每段 `(前置 padding, 主段区间, 后置 padding)`，断言段数/长度 + 样本与原音频切片 **`to_bits` 逐位相等**；`naive_chunk` 同做切片逐位快照；基线 = **`1af7212^`**（已 `git show` 读 pre-381 源码确认 `build_padded_segments_capped`/`naive_chunk` 逻辑一致）。
+  5. **其它边界**：非零且**非帧对齐** `start`／空·倒置区间／滑窗合并阈值 = **10s**（对比 20s 路径 20s）。
+- **验证（白名单）**：`cargo fmt --check` **EXIT 0**；`cargo check --all-targets` **0 error**、warnings **88** = 基线；numstat == -w（407/0）。🔴 **未跑 `cargo test`**（任务书禁止，首跑在阶段四）。
+- **结论**：**未发现生产缺陷**（NaN/全零无 panic；每轮切点 ≥ 起搜点 ⇒ 严格推进、无死循环）⇒ 无停手项。
+- **未改生产代码 / 未改版本 / 未 push / 零凭证**。

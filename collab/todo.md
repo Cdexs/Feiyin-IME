@@ -27,7 +27,7 @@
 | 单号 | 内容 | 负责 |
 | --- | --- | --- |
 | ✅ `FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382` | 每片单独组窗（吃字）／松键立即「识别处理中」／回灌不等边界配对／解码共享队列／埋点。**2026-09-23 阶段一交付 coder-1**：`plan_windows` 逐片组窗 + `StreamingFinalPreview`/`Processing` 提前到 `acc_join` 前 + `ReflowFastState` 立即渲染 + 单一共享解码队列 + `[LocalRT-DBG-382]` 埋点；`cargo fmt --check` EXIT 0、`check --all-targets` 0 error、warnings **98/88**=基线、全量 **1563P/0F/33I**（+12 新单测）。**待 tester-1 阶段四回归 + 出包 + Gavin 端测** | coder-1（`main.rs`） |
-| `FIX-SLICE-CUT-AT-GAP-381` | 超 10s 在字缝切／`WINDOW_MAX_SECS` 12→10／字缝切 vs 硬切、10s vs 12s 实测 | coder-2（`vad.rs`/`local_stream.rs`/`transcription/mod.rs`） |
+| ✅ `FIX-SLICE-CUT-AT-GAP-381`（+ ✅ 阶段三 `TEST-SYNC-381`） | 超 10s 在字缝切／`WINDOW_MAX_SECS` 12→10／字缝切 vs 硬切、10s vs 12s 实测。**381 已验收（HEAD `1af7212`）**；**阶段三 `TEST-SYNC-381` 2026-09-23 交付 coder-1**：仅 `vad.rs` `#[cfg(test)]` +11 条（性质/退化/字缝优先/20s 路径与 `naive_chunk` 逐位快照/非帧对齐 start 等），`fmt --check` EXIT 0、`check --all-targets` 0 error、warnings 88=基线；**未跑 `cargo test`**（首跑阶段四）；**未发现生产缺陷** | coder-2（`vad.rs`/`local_stream.rs`/`transcription/mod.rs`）+ coder-1（阶段三护栏） |
 
 
 **Gavin 原话**：①「连续一口气不停顿说了这一段话……结果最终输出只有这一小段：『我连以太也看得见，实在太美了，就像欣赏北极光一样』」②「按下结束热键后，要等会儿才会显示识别处理中，前台的界面更新不及时，给用户一种卡顿感」

@@ -1202,3 +1202,12 @@ load_wordbook_vocabulary()
 | §5 实测 | 生产静默 1200ms 切片（2 片）→ 字缝 7 片 → cap12/cap10 窗口相同；ΔCER **0.0000** ≤0.01 ⇒ 照 10s 交付 |
 | 验证 | `cargo fmt --check` EXIT 0 ｜ check 0 error、warnings 88=基线 ｜ 全量 `cargo test --no-fail-fast` 0 failed（1475P/31I）｜ numstat==-w |
 | 下一步 | 阶段三 TEST-SYNC（非作者）→ 阶段四 TEST-EXEC → 出包（Gavin 已授权「直接走测试出包」）；跨文件 13s 过期注释待路由 |
+
+## TEST-SYNC-381 · 非作者护栏：`plan_gap_cuts` 性质/退化/字缝优先 + 20s 路径与 naive_chunk 逐位快照 · 2026-09-23 · coder-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 仅 `src/transcription/vad.rs` 的 `#[cfg(test)]` 区（+407/−0，**生产代码零改动**）。给 coder-2 的 `FIX-SLICE-CUT-AT-GAP-381`（HEAD `1af7212`）按设计契约补 11 条独立用例 |
+| 覆盖 | ① 性质：100 段伪随机（0.5~60s，正弦/噪声/静音，幅度 0.001~1.0）四性质 ② 退化：全零/NaN·±inf/end 越界/长度 10s·11s·11s+1·12s ③ 字缝优先（10.5s 浅 vs 11.5s 更深 ⇒ 精确切 10.5s）④ 20s 路径 + `naive_chunk` **逐位快照**（基线 `1af7212^`）⑤ 非帧对齐 start／空·倒置区间／滑窗 10s 合并阈值 |
+| 验证 | `cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**、warnings **88** = 基线；numstat == -w（407/0）。🔴 **未跑 `cargo test`**（白名单；首跑在阶段四） |
+| 结论 | **未发现生产缺陷**（NaN/全零无 panic、每轮切点严格推进无死循环）；无停手项 |
