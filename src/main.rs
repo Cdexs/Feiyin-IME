@@ -7562,11 +7562,19 @@ fn set_auto_start(enabled: bool) -> Result<()> {
 /// ASR-DUAL-B-001: 加载 hotwords 字符串（使用 accuracy 引擎的档位需要）
 /// 从 wordbook 读取所有单词，按 id 排序保证哈希稳定，构建逗号分隔字符串
 /// performance 模式返回 None（不支持 hotwords）
-// FIX-LOCALRT-ENGINE-EQ-252: 判据收敛到 uses_accuracy_engine()——LocalRealtime 的最终转录
-// 引擎也是 accuracy（带 hotwords），否则本地 realtime 档拿不到词库热词。
-// MACOS-P4-NEUTRAL-002: 原 #[cfg(target_os = "windows")] 去除——平台中立纯 Rust（AsrModel 判定 + wordbook 读取 + build_hotwords_string），spawn_worker_thread（已去 cfg）调用，对 Windows 为 no-op。
+// LOCALRT-NO-HOTWORDS-396（DEC-083）：本地实时 B 路径 1.7B **不再注入词库** —— 注入时首解异常率 28%
+//（窗空 / 坍塌 2 字 / 念出词条 / 截尾 / 跳到词条），不注入重解均完整。词库只在开启 LLM 优化时生效。
+// 🔴 判据：`AsrModel::LocalRealtime` 在读词库**之前**早退 `None`；`AsrModel::Accuracy` 行为逐位不变。
+// FIX-LOCALRT-ENGINE-EQ-252（已被 396 取代）：原判据「LocalRealtime 的最终转录引擎也是 accuracy（带
+// hotwords）」不再成立 —— 本地实时 B 路径的滑窗精解不再带热词，改词库不再触发 1.7B 重载。
+// MACOS-P4-NEUTRAL-002: 平台中立纯 Rust（AsrModel 判定 + wordbook 读取 + build_hotwords_string）。
 fn load_hotwords_for_accuracy(config: &AppConfig) -> Option<String> {
-    if !transcription::AsrModel::from_config(&config.audio.asr_model).uses_accuracy_engine() {
+    let model = transcription::AsrModel::from_config(&config.audio.asr_model);
+    // LOCALRT-NO-HOTWORDS-396（DEC-083）：本地实时不注入词库（在读词库之前早退）。
+    if model == transcription::AsrModel::LocalRealtime {
+        return None;
+    }
+    if !model.uses_accuracy_engine() {
         return None;
     }
     match wordbook::Wordbook::open() {
@@ -11179,6 +11187,46 @@ fn drive_acc_windows<A, R>(
                 Err(_) => break,
             },
         }
+    }
+}
+
+/// LOCALRT-NO-HOTWORDS-396（DEC-083）：`load_hotwords_for_accuracy` 对本地实时档早退 `None`。
+#[cfg(test)]
+mod fix396_tests {
+    /// 源码护栏：`load_hotwords_for_accuracy` 函数体内，对 `AsrModel::LocalRealtime` 的早退出现在
+    /// **读词库（`Wordbook::open(`）之前**，且早退分支确实以 `LocalRealtime` 为条件。
+    #[test]
+    fn fix396_local_realtime_returns_none_before_wordbook_read() {
+        let src = include_str!("main.rs");
+        let body = src
+            .split("fn load_hotwords_for_accuracy(")
+            .nth(1)
+            .expect("load_hotwords_for_accuracy 锚点缺失");
+        // 函数体：截到下一次顶层 `}\n`（顶层 fn 闭合）。
+        let body = body.split("\n}\n").next().unwrap();
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let early = code
+            .find("AsrModel::LocalRealtime")
+            .expect("396：LocalRealtime 早退判据缺失");
+        let read = code.find("Wordbook::open(").expect("396：读词库调用缺失");
+        assert!(
+            early < read,
+            "396：LocalRealtime 早退必须在读词库之前（early={early} read={read}）"
+        );
+        // 早退条件必须绑定 LocalRealtime（而非其它变体）。
+        assert!(
+            code.contains("== transcription::AsrModel::LocalRealtime"),
+            "396：早退条件必须 `== AsrModel::LocalRealtime`"
+        );
+        // Accuracy 路径不变：仍保留 uses_accuracy_engine() 门。
+        assert!(
+            code.contains("uses_accuracy_engine()"),
+            "396：Accuracy 路径的 uses_accuracy_engine() 门不得删除"
+        );
     }
 }
 

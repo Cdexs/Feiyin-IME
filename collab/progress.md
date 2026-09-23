@@ -1435,3 +1435,17 @@ load_wordbook_vocabulary()
 | 覆盖 | ①不丢字不变式（4 组手算句数 6/8/1/2）②中文单 `…` vs `……` + `Node.js 3.14` 不因 `.` 断 ③英文 `no.` 数字后置条件（2/1/1 句 + `ends_with_abbreviation` 直测）④`split_and_merge` 全短合成 1 句==原文 ⑤`finalize_sentence` 三态 calls 1/1/0 ⑥`strip_target_prefix` 非目标不丢首词 ⑦`join_parts` 空串无多余空格 + 英→中直连 ⑧源码护栏（无 `Arc<NllbModel>`/`mem::forget`、`&'static` 字段、`new()?` 先于写缓存） |
 | 验证 | 本文件 `rustfmt --config skip_children=true --check` **CLEAN**；**全仓** `cargo fmt --check` **EXIT 0**；`cargo check --all-targets` **EXIT 0**、warnings **92/87 ≤ 97/88**；numstat==-w（232/0）。🔴 **未跑 `cargo test`**（白名单；首跑阶段四） |
 | 结论 | 8 条要求全部落地；**未发现生产缺陷**；未改版本/未 commit/未 push/零凭证 |
+
+## BUILD-395（阶段四全绿 → 出包 · 393/394/395 合包）· 2026-09-24 · tester-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 393（VAD v6.2 全管线 + 本地 realtime 时间线复用剪静音）/ 394（NLLB-200-distilled-600M int8 + 逐句批量 + 漏译重译 + 模型进程级常驻永不析构）/ 395（翻译热键页文案三 locale）。HEAD `1a8f00d`（=`240042b`+docs），版本 0.9.3 |
+| 回归 | root `cargo test --no-fail-fast` **1682P/0F/45I**（EXIT 0；`feiyin-ime` bin **1594P/43I** = 基线 1657P/38I 净 **+25P/+7I**）；`src-tauri` **92P/0F/0I**；**Vitest 7 files/100P/11S/0F**；`cargo fmt --check` **EXIT 0**；warnings **92/87/17/9** ≤ 基线 |
+| NEW/GONE | NEW **57**（50P+7I：393/394/TS-393·394 用例 + 7 ignored 实跑）；GONE **25**（opus-mt 专有：`segment_text_*` 7 + 旧解码参数 7 + metaspace 2 + 双目录清单 6 + 旧分段 3）；🔴 `derive_target_*` 五条仍在且全绿（DEC-082） |
+| 出包 | `BUILD-395` 十项逐项 PASS；产物 `feiyin-ime` 14.92MB `42e16d64889b…`（00:16:10）/ `feiyin-ime-ui` 10.05MB `61cc642c0881…`（00:13:21）/ `crash-reporter` 24.88MB `3b54e58f9d2a…`（00:14:26）；两副本全等、均异于 BUILD-392 |
+| 模型同步 | `Publish/models/silero-vad` v4→v6.2 覆盖（`1a153a22…`）；新建 `Publish/models/nllb-200-distilled-600M-ct2-int8/` 四文件（sha 与源逐一相等）；`target/release/models` 只核联接与 sha（未复制）；`opus-mt-*` 未删 |
+| 三特殊点 | ① dll 四张三副本全等 + onnxruntime 1.28.2；② itn-rules 三副本全等；③ Publish/models 1.7B 七文件与源逐一 sha256 全等（0.6B 保留） |
+| 探针 | 二进制正：`[LocalRT-DBG-388] trim:`=2 / `source=`=2 / `timeline fallback`=1 / `NLLB model loaded once`=1；反：`opus-mt-zh-en`=**0**；UI：`说中文译为英文` 在 ui/dist =1 |
+| 冒烟 | 正常退出（对 controller 窗口投 `WM_CLOSE`，非强杀）⇒ 进程 **1s 内消失**、无 crash.json ⇒ **394 退出不卡死实证通过** |
+| 端测 | 🔴 **Step1 强杀输入法 ⇒ 请重启 + 带 `-debug` 端测**；重点：① 393 VAD v6.2 全管线 + 剪静音时间线（吞字是否绝迹）；② 394 离线翻译换 NLLB（质量/漏译重译/长文本完整性）；③ 退出不卡死、关翻译不卡死；④ 翻译热键页文案三语言；⑤ 数字/专名保留；⑥ 长录音 300s；⑦ 不新增 crash.json |

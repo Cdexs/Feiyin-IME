@@ -2257,3 +2257,9 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | pub API 签名 | 不变（`new` / `translate` / `is_available` / `model_files` / `direction` / `load_for_direction` / `ensure_translation_direction`） | ✅ 调用方零改动 |
 | 方向判定 | 不变：按内容自动判定（DEC-082） | ✅ |
 | **macOS 侧需要做什么** | | ① 模型目录换 NLLB 四文件；② 确认翻译只在单一线程加载，或改 static 缓存；③ 运行中与退出路径都不得触发 `translator_destroy`（模型常驻到进程结束） |
+
+## LOCALRT-NO-HOTWORDS-396（2026-09-24，coder-1；主控合入）· 本地实时 B 路径 1.7B 不注入词库 —— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `main.rs` `load_hotwords_for_accuracy`：`AsrModel::LocalRealtime` 在读词库前早退 `None`（DEC-083） | 本地实时滑窗精解每窗 `set_option("hotwords", 词库)` → **不注入**；改词库不再触发 1.7B 重载。本地精确档 / 在线识别 / LLM 不变 | ✅ 平台中立（无 `cfg`），macOS 同继承。macOS 若另有本地实时热词注入实现，须同样去掉（依据：带注入首解异常 28%，见 DEC-083） |
