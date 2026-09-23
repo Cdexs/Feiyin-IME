@@ -1069,14 +1069,16 @@ pub fn transcribe_streaming_local(
                 acc_silent_ms += chunk_ms;
             }
         } else {
-            silent_ms = 0.0;
-            acc_silent_ms = 0.0;
             // 392 主控验收补：「本轮停顿已派发 / 已触发影子」的复位属于**时序**，必须跟静默计时同源
             //（has_speech）。若随 vad_speech 复位：背景人声被门拒 ⇒ acc_silent_ms 持续累加不清零，
             // 而 done 标记每个 chunk 被清 ⇒ 静默已 ≥1200ms ⇒ **每个 chunk（~10ms）派发一次**，
             // 串行解码队列被碎片窗口淹没。改回 has_speech：背景人声只随一次派发送出，之后要等录音人开口。
+            // 392 主控验收补（续）：done 复位写在计时清零**之前**，使 346 护栏（归零紧邻 silent_ms、
+            // 其后 3 行内出现 speech_since_last_reset）与 392 护栏（done 复位在 else 分支）同时成立。
             shadow_done_for_pause = false;
             acc_done_for_pause = false;
+            silent_ms = 0.0;
+            acc_silent_ms = 0.0;
         }
         if vad_speech {
             speech_since_last_reset = true;
