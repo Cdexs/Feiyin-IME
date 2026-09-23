@@ -37,7 +37,7 @@
 | ✅ `TRANS-NLLB-AND-SENTENCE-BATCH-394`（第一轮退回 `TRANS-394-REWORK`：R1 取证坐实 CT2 销毁推理过的模型会死锁 ⇒ 模型进程级常驻永不析构；R2 恢复方向判定用例；R3 缩写表。**第二轮验收通过，commit `c1475ac`**） | 本地翻译换 NLLB-600M int8 + 逐句批量 + 漏译重译；只改 `translation/mod.rs` | coder-2 |
 | ✅ `TEST-SYNC-393`（tester-1 交付 10 条，commit `56c1503`；1 条期望值算错由主控 `c0baf8c` 修正） | 393 补护栏（时间线跨片映射 / 三数组同步 / 路B 不接时间线 / 20s 路径相邻段等） | tester-1 |
 | 🔄 `TEST-SYNC-394`（阶段三，00:02 派发） | 翻译补护栏 8 项（分句不丢字不变式 / 缩写断句 / 重译出错或更短保留原译 / 永不析构源码护栏等），只写测试、只许 fmt/check | tester-1 |
-| 🔄 `TRANS-COPY-395`（00:03 派发，小改动短路径） | 翻译热键页说明去掉「目标语言」，改为「说中文译英文，说英文译中文」，三份 locale（DEC-082） | coder-2 |
+| ✅ `TRANS-COPY-395`（commit `d82c59e`；三份 locale 仅改 1 key，禁词 grep 0，vitest 100P/11S/0F；端测时请 Gavin 目视翻译热键页说明） | 翻译热键页说明去掉「目标语言」，改为「说中文译英文，说英文译中文」，三份 locale（DEC-082） | coder-2 |
 
 > 🔴 **出包模型核验（Gavin 2026-09-23：「新的vad和翻译模型同时也要拷贝到release下的model目录下，那是我本地端侧的执行目录」）**：
 > `target/release/models` 是指向 `models/` 的**目录联接**（主控 21:5x 核实：VAD 已是 v6.2.3 `1a153a22…`，NLLB 目录已可见）⇒ 自动同步、不要复制进去（复制会写穿到源目录）。
