@@ -1426,3 +1426,12 @@ load_wordbook_vocabulary()
 | 文件 | `src/translation/mod.rs` + `collab/troubleshooting.md`（未改 main.rs/transcription/vad/local_stream；pub 签名不变） |
 | 验证 | fmt EXIT 0 ｜ check 0 error、warnings **92/87** ≤ 97/88 ｜ translation 26P/0F ｜ `--ignored …translation::tests::trans394` **4P/0F/95.79s，进程 exit 0** ｜ 全量 bin **1585P/1F**（唯一失败 = TEST-SYNC-393 期望值错，主控 `c0baf8c` 已修，与本单无关） |
 | 下一步 | 主控验收；阶段三 TEST-SYNC（非作者）→ 阶段四 TEST-EXEC → 出包 |
+
+## TEST-SYNC-394（阶段三 · 非作者护栏）· 2026-09-24 · tester-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 给 `TRANS-NLLB-AND-SENTENCE-BATCH-394`（+返工）补 8 条独立用例，**只改 `src/translation/mod.rs` 的 `#[cfg(test)]` 区、生产零改动**；未碰 coder-2 在改的 `ui/src/i18n/*` |
+| 覆盖 | ①不丢字不变式（4 组手算句数 6/8/1/2）②中文单 `…` vs `……` + `Node.js 3.14` 不因 `.` 断 ③英文 `no.` 数字后置条件（2/1/1 句 + `ends_with_abbreviation` 直测）④`split_and_merge` 全短合成 1 句==原文 ⑤`finalize_sentence` 三态 calls 1/1/0 ⑥`strip_target_prefix` 非目标不丢首词 ⑦`join_parts` 空串无多余空格 + 英→中直连 ⑧源码护栏（无 `Arc<NllbModel>`/`mem::forget`、`&'static` 字段、`new()?` 先于写缓存） |
+| 验证 | 本文件 `rustfmt --config skip_children=true --check` **CLEAN**；**全仓** `cargo fmt --check` **EXIT 0**；`cargo check --all-targets` **EXIT 0**、warnings **92/87 ≤ 97/88**；numstat==-w（232/0）。🔴 **未跑 `cargo test`**（白名单；首跑阶段四） |
+| 结论 | 8 条要求全部落地；**未发现生产缺陷**；未改版本/未 commit/未 push/零凭证 |

@@ -7,6 +7,13 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-24 — tester-1 — TEST-SYNC-394 ✅ 交付（阶段三 · 非作者护栏 8 条；生产零改动）
+
+- **性质**：阶段三 TEST-SYNC，给 `TRANS-NLLB-AND-SENTENCE-BATCH-394`（+返工 R1~R3）按**设计契约**补独立护栏。只改 `src/translation/mod.rs` 的 `#[cfg(test)]` 区；**未碰** `ui/src/i18n/*`（coder-2 TRANS-COPY-395）；**未跑 `cargo test`/`build`**（白名单）。**每条期望值手算写进注释**（上一单 `ts393c_lens_shorter` 期望值算错的教训）。
+- **新增 8 条**：不丢字不变式（4 组，手算句数 6/8/1/2）/ 中文单 `…` vs `……` + `Node.js 3.14` 不因 `.` 断 / 英文 `no.` 数字后置条件（`ends_with_abbreviation` 直测）/ `split_and_merge` 全短合成 1 句==原文 / `finalize_sentence` 三态（calls 1/1/0）/ `strip_target_prefix` 非目标不丢首词 / `join_parts` 空串无多余空格 + 英→中直连 / 源码护栏（无 `Arc<NllbModel>`/`mem::forget`；字段 `&'static NllbModel`；`NllbModel::new(...)?` 在 `*slot = Some(` 之前）。
+- **验证（白名单）**：本文件 `rustfmt --config skip_children=true --check` **CLEAN**；**全仓** `cargo fmt --check` **EXIT 0**；`cargo check --all-targets` **EXIT 0**、0 error，warnings **bin 92 / test 87 ≤ 97/88**；`numstat == -w`（232/0）。🔴 **未跑 `cargo test`**（首跑阶段四）。
+- **红线**：未改生产代码 / 未 commit / 未 push / 版本号未动 / 零凭证。
+
 ## 2026-09-23 — tester-1 — TEST-SYNC-393 ✅ 交付（阶段三 · 非作者护栏 10 条；生产零改动）
 
 - **性质**：阶段三 TEST-SYNC，给 `VAD-V6-AND-TIMELINE-REUSE-393`（返工 R1~R5）按**设计契约**补独立护栏（不读实现反推）。只改 `#[cfg(test)]` 区；**未碰** coder-2 在飞的 `src/translation/mod.rs`；**未跑 `cargo test`/`build`**（白名单）。

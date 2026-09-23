@@ -1515,6 +1515,238 @@ mod tests {
         );
     }
 
+    // ---- TEST-SYNC-394 护栏（非作者；纯函数，无需模型）----
+    // 🔴 每条期望值均**手算**写进注释（上一单 `ts393c_lens_shorter` 期望值算错的教训）。
+
+    /// S394-1 不丢字不变式：`split_sentences` 只切句、不丢字、不改字 ——
+    /// 各句去掉**所有空白**后拼接 == 输入去掉所有空白。4 类易丢字形态。
+    #[test]
+    fn s394_split_sentences_preserves_all_non_whitespace() {
+        let strip_ws = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+        // 中文逗号连写 88 字（>80）：按 `，` 切 8 个子句（各 11 字 ≥ 下限 10）。
+        let long_zh = "一二三四五六七八九十，".repeat(8);
+        // (输入, 方向, 手算句数)
+        let cases: [(&str, TranslationLanguage, usize); 4] = [
+            // `。！？；……。` ⇒ 6 个句末（`……` 记 1）⇒ 6 句。
+            (
+                "第一句。第二句！第三句？第四句；第五句……第六句。",
+                TranslationLanguage::English,
+                6,
+            ),
+            // 8 子句（见上）⇒ 8 句。
+            (long_zh.as_str(), TranslationLanguage::English, 8),
+            // 英文 17 词 ≤ 60，且 Mr./Dr./3.14/p.m./U.S./No. 5 全不断 ⇒ 1 句。
+            (
+                "Mr. Smith met Dr. Jones at 3.14 p.m. He lives in the U.S. See No. 5 today.",
+                TranslationLanguage::Chinese,
+                1,
+            ),
+            // `。` 断两次 ⇒ 2 句；`Node.js` 的 `.` 非中文终止符。
+            (
+                "我使用Node.js开发。它是JavaScript运行时。",
+                TranslationLanguage::English,
+                2,
+            ),
+        ];
+        for (text, dir, expect_n) in cases {
+            let sents = split_sentences(text, dir);
+            assert_eq!(sents.len(), expect_n, "句数不符：{text:?}");
+            assert_eq!(
+                strip_ws(&sents.concat()),
+                strip_ws(text),
+                "分句丢字/改字：{text:?}"
+            );
+        }
+    }
+
+    /// S394-2：`split_zh_sentences` —— 单个 `…` 不断；`……` 断在第二个 `…` 后；
+    /// 中文句中夹英文 `Node.js 3.14` 不在 `.` 处断。
+    #[test]
+    fn s394_split_zh_single_vs_double_ellipsis_and_dot() {
+        // 单个 `…`：无终止符 ⇒ 1 句。
+        assert_eq!(
+            split_zh_sentences("前半…后半"),
+            vec!["前半…后半".to_string()]
+        );
+        // `……`：第二个 `…` 处断 ⇒ 2 句。
+        assert_eq!(
+            split_zh_sentences("前半……后半"),
+            vec!["前半……".to_string(), "后半".to_string()]
+        );
+        // `……` 收尾：断后 cur 为空 ⇒ 不产空句 ⇒ 1 句。
+        assert_eq!(split_zh_sentences("前半……"), vec!["前半……".to_string()]);
+        // 夹 `Node.js 3.14`：`.` 非中文终止符 ⇒ 只按 `。` ⇒ 1 句。
+        assert_eq!(
+            split_zh_sentences("我喜欢Node.js 3.14版本的功能测试。"),
+            vec!["我喜欢Node.js 3.14版本的功能测试。".to_string()]
+        );
+    }
+
+    /// S394-3：英文分句 + `ends_with_abbreviation`（`no` 的数字后置条件）。
+    #[test]
+    fn s394_split_en_no_abbrev_and_sentence_count() {
+        // `no.` 后接 `W`（非数字）⇒ 断句 ⇒ 2 句。
+        let two: Vec<String> = split_en_sentences("The answer is no. We left.")
+            .iter()
+            .map(|s| s.trim().to_string())
+            .collect();
+        assert_eq!(
+            two,
+            vec!["The answer is no.".to_string(), "We left.".to_string()]
+        );
+        // `No. 5` 后接数字 ⇒ 缩写不断 ⇒ 1 句。
+        assert_eq!(split_en_sentences("See No. 5 today.").len(), 1);
+        // `U.S.` 含点 ⇒ 缩写不断 ⇒ 1 句。
+        assert_eq!(split_en_sentences("I live in the U.S. now.").len(), 1);
+        // 直接测判定：`no.` 的数字后置条件 + 含点缩写 + 普通句末。
+        assert!(!ends_with_abbreviation("no.", Some('W')));
+        assert!(ends_with_abbreviation("no.", Some('5')));
+        assert!(ends_with_abbreviation("U.S.", None));
+        assert!(ends_with_abbreviation("Mr.", Some('S')));
+        assert!(!ends_with_abbreviation("today.", None));
+    }
+
+    /// S394-4：`split_and_merge` 全部子句 < 下限 ⇒ 合成 1 句且内容 == 原文。
+    #[test]
+    fn s394_split_and_merge_all_short_collapses_to_original() {
+        // 手算：子句 "短，"(2) / "很短，"(3) / "也短"(2) 均 <10 ⇒ 依次并入 ⇒ 1 句 == 原文。
+        let src = "短，很短，也短";
+        assert_eq!(
+            split_and_merge(src, &['，'], ZH_MIN_CLAUSE_CHARS, true),
+            vec![src.to_string()]
+        );
+        // 对照：两子句 "一二三四五六七八九十，"(11) / "甲乙丙丁戊己庚辛壬癸"(10) 均 ≥10 ⇒ 不合并 ⇒ 2 句。
+        assert_eq!(
+            split_and_merge(
+                "一二三四五六七八九十，甲乙丙丁戊己庚辛壬癸",
+                &['，'],
+                ZH_MIN_CLAUSE_CHARS,
+                true
+            ),
+            vec![
+                "一二三四五六七八九十，".to_string(),
+                "甲乙丙丁戊己庚辛壬癸".to_string()
+            ]
+        );
+    }
+
+    /// S394-5：`finalize_sentence` —— 重译至多一次；`None`（出错）保留原译；更短保留原译；正常不调用。
+    #[test]
+    fn s394_finalize_sentence_retry_once_keep_or_skip() {
+        use std::cell::Cell;
+        // src "你好世界" 4 字 ⇒ 阈值 4×0.35=1.4；"Hi" 1 词 <1.4 ⇒ 疑似漏译。
+        let src = "你好世界";
+        // (a) 重译返回 None（出错）⇒ 保留 "Hi"、calls=1、仍疑似。
+        let calls_a = Cell::new(0usize);
+        let (out_a, n_a, still_a) =
+            finalize_sentence(src, "Hi".to_string(), TranslationLanguage::English, || {
+                calls_a.set(calls_a.get() + 1);
+                None
+            });
+        assert_eq!((out_a.as_str(), n_a, still_a), ("Hi", 1, true));
+        assert_eq!(calls_a.get(), 1, "重译应恰 1 次");
+        // (b) 重译更短（"H" 1 字 < "Hi" 2 字）⇒ 保留 "Hi"、calls=1。
+        let (out_b, n_b, _) =
+            finalize_sentence(src, "Hi".to_string(), TranslationLanguage::English, || {
+                Some("H".to_string())
+            });
+        assert_eq!((out_b.as_str(), n_b), ("Hi", 1));
+        // (c) 原译正常（"你好" 2 字 ⇒ 阈值 0.7；"Hello world" 2 词 ≥0.7）⇒ 不调用重译（闭包 panic 即证）。
+        let (out_c, n_c, still_c) = finalize_sentence(
+            "你好",
+            "Hello world".to_string(),
+            TranslationLanguage::English,
+            || panic!("原译正常时不得调用重译"),
+        );
+        assert_eq!((out_c.as_str(), n_c, still_c), ("Hello world", 0, false));
+    }
+
+    /// S394-6：`strip_target_prefix` —— 首 token 非目标语种 ⇒ 原样（不丢首词）；空 ⇒ 空。
+    #[test]
+    fn s394_strip_target_prefix_keeps_first_when_not_target() {
+        let t = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // 首 token == 目标 ⇒ 剥掉。
+        assert_eq!(
+            strip_target_prefix(&t(&["eng_Latn", "Hello"]), "eng_Latn"),
+            t(&["Hello"])
+        );
+        // 首 token != 目标 ⇒ 原样，**不丢首词**。
+        assert_eq!(
+            strip_target_prefix(&t(&["Hello", "world"]), "eng_Latn"),
+            t(&["Hello", "world"])
+        );
+        assert_eq!(
+            strip_target_prefix(&t(&["zho_Hans", "你好"]), "eng_Latn"),
+            t(&["zho_Hans", "你好"])
+        );
+        // 空输入 ⇒ 空。
+        assert_eq!(strip_target_prefix(&[], "eng_Latn"), Vec::<String>::new());
+    }
+
+    /// S394-7：`join_parts` —— 含空串 ⇒ 中→英无连续/首尾空格；英→中直连无空格。
+    #[test]
+    fn s394_join_parts_no_extra_spaces() {
+        let t = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // 中→英：空串夹中间 ⇒ join(" ") 得 "Hello  world"（两空格）⇒ 归一为 1 空格。
+        assert_eq!(
+            join_parts(&t(&["Hello", "", "world"]), TranslationLanguage::English),
+            "Hello world"
+        );
+        // 首空 ⇒ 无前导空格。
+        assert_eq!(
+            join_parts(&t(&["", "Hello"]), TranslationLanguage::English),
+            "Hello"
+        );
+        // 尾空 ⇒ 无尾随空格。
+        assert_eq!(
+            join_parts(&t(&["Hello", ""]), TranslationLanguage::English),
+            "Hello"
+        );
+        // 英→中：直连、无空格。
+        assert_eq!(
+            join_parts(&t(&["你", "好"]), TranslationLanguage::Chinese),
+            "你好"
+        );
+    }
+
+    /// S394-8 源码护栏（非作者；剔除注释行）：进程级模型永不析构的**结构不变式**。
+    #[test]
+    fn s394_source_guard_model_resident_and_no_arc_no_forget() {
+        let src = include_str!("mod.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("Arc<NllbModel>"),
+            "生产区不得用 Arc<NllbModel>（thread_local + Box::leak 常驻）"
+        );
+        assert!(
+            !code.contains("mem::forget"),
+            "生产区不得 mem::forget（R1-c 已全删）"
+        );
+        assert!(
+            code.contains("model: &'static NllbModel,"),
+            "TranslationEngine 模型字段类型必须是 &'static NllbModel"
+        );
+        let sm = code
+            .split("fn shared_model(")
+            .nth(1)
+            .expect("shared_model 锚点缺失");
+        let new_pos = sm
+            .find("NllbModel::new(model_dir)?")
+            .expect("shared_model 内应有 NllbModel::new(model_dir)?");
+        let slot_pos = sm
+            .find("*slot = Some(")
+            .expect("shared_model 内应有 *slot = Some(");
+        assert!(
+            new_pos < slot_pos,
+            "加载失败不得写缓存：NllbModel::new(...)? 必须在 *slot = Some( 之前"
+        );
+    }
+
     // ---- 真模型实跑（#[ignore]） ----
 
     /// TRANS-394 验收：真 NLLB 实跑 —— 中→英 3 段（短 / ≥5 句长段 / 逗号连写 100+ 字）、
