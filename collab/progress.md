@@ -1285,3 +1285,15 @@ load_wordbook_vocabulary()
 | 覆盖 | ① `strip_angle_tags` 标签边界（剥/不剥各 4+ 组 + 30/31/未闭合长度边界）② 末条残余⇒重解、句中单条⇒不触发 ③ 随机 300 组重解≤1 ④ `EnergySmoother` 平滑波动<逐块 + 30 万块稳定 ⑤ 平滑门误挡<5% vs 原始门>20% + 背景全挡 |
 | 验证 | `cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**、warnings **97/88** = 基线；numstat == -w。🔴 **未跑 `cargo test`**（白名单；首跑阶段四） |
 | 结论 | **未发现新生产缺陷**；未改版本/未 push/零凭证 |
+
+## BUILD-387（阶段四全绿 → 出包 · 386/387 合包）· 2026-09-23 · tester-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 386（中途末片延后组窗 / 松键短尾合并重解 / 预览回灌保留流式尾巴 / 失败窗流式兜底）/ 387（念词表·`<标签>`·空输出判无效后不带注入重解 + 近场门 300ms 平滑音量）。HEAD `3646b4d`，版本 0.9.3 |
+| 回归 | root `cargo test --no-fail-fast` **1620P/0F/34I**（EXIT 0；`feiyin-ime` bin **1532P/32I** = 基线 1598P/34I 净 **+22P/+0I**）；`src-tauri` **92P/0F/0I**；Vitest **SKIP**（`ui/` 无 diff）；`cargo fmt --check`（不带 `skip_children`）**EXIT 0**；warnings **97/88/17** = 基线 |
+| NEW/GONE | NEW **29**（`plan_windows_386_tests` 8 / `fix386_tests` 2 / `slice_streaming_386_review_tests` 1 / `testsync386_tests` 5 / `fix374_terms_echo_tests` 1 / `fix387_output_guard_tests` 5 / `guard387_review_tests` 1 / `local_stream::tests` 3 / `testsync387_tests` 3）；GONE **7**（旧 `reflow_preview_367_tests` 2 + 旧 `plan_windows_382_tests` 4 + `ladder_uses_remaining_and_never_redecodes`）。⚠️ 任务书预估 28/2，实测 29/7（模块重写，净 +22P 逐位吻合） |
+| 出包 | `BUILD-387` 八项逐项 PASS；产物 `feiyin-ime` 14.84MB `a592182ca12f…`（17:10:09）/ `feiyin-ime-ui` 10.05MB `1a8650c06fcb…`（17:07:14）/ `crash-reporter` 24.88MB `99096bbcc139…`（17:08:21）；两副本全等、均异于 BUILD-385 |
+| 三特殊点 | ① dll 四张三副本全等 + onnxruntime 1.28.2；② itn-rules 三副本全等；③ Publish/models 1.7B 七文件与源逐一 sha256 全等（0.6B 保留） |
+| 探针 | 正：`[LocalRT-DBG-386]`=1 / `[LocalRT-DBG-387]`=2 / `[LocalRT-DBG-385]`=2 / `[LocalRT-DBG-382]`=3；反：无（本批未删字面量） |
+| 端测 | 🔴 **Step1 强杀输入法 ⇒ 请重启后端测**；重点：① 386 中途末片延后组窗 + 松键短尾合并重解（防吃字/尾巴丢）；② 386 预览不再闪回更短（保留流式尾巴）；③ 387 念词表/标签/空输出判无效后重解（防回显/坍塌）；④ 387 近场门 300ms 平滑音量（防误挡）；⑤ 吃字/重复字；⑥ 长录音 300s；⑦ 不新增 crash.json |

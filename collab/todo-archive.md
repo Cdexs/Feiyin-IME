@@ -5123,3 +5123,18 @@ sherpa endpoint `rule2=2.0s`（切句）、`ACC_DISPATCH_SILENCE_MS`（派发 ac
 **根因（主控读 log + 代码坐实）**：路 B 窗口解出后，结果只在**下一次派发新窗口时**才被收取（`main.rs:8372` 的 `res_rx.try_recv()` 在 `for … in acc_rx` 循环体内，`:8291`）；停顿期间没有新窗口 ⇒ 结果躺在通道里。6 次录音全部复现：解出→上屏滞后 2~17.6s，**最后一窗每次都要等松键才上屏**。
 **问题 2（松键后约 4s 才注入）**：log 里松键→注入仅 4~11ms（`tail_wait=0ms`），**后端无 4s 等待**；须补「按键→主控收到」时延埋点再端测定位。
 **✅ 交付（2026-09-23，coder-1，阶段一·只改代码）**：`main.rs` 路 B 滑窗线程改 `crossbeam_channel::select!`（模块级 `drive_acc_windows`）结果到即收；两份收取合一 `harvest_acc_window!` 宏 ⇒ `push_window(` 该线程仅一处；B 埋点就位（`[LocalRT-DBG-380]`，非钩子路径打 `n/a`）。验证：fmt EXIT 0 / `cargo check --all-targets` 0 error / warnings 98/88 = 基线 / 全量 `cargo test --no-fail-fast` **1547P/0F/31I**（+1 新单测）。取证 `collab/evidence/20260923-preview-stale/debug-0134.log`。**待 tester-1 阶段四回归 + 出包 + Gavin 端测**；本轮未改版本/未 push/未 build release。详见 `CHANGELOG.md` / `progress.md`。
+
+
+## 【归档八】2026-09-23 移出：BUILD-385 条目与 386/387 派发表（已随 BUILD-387 出包）
+
+### 🔄 BUILD-385 端测 bug 修复（Gavin 已确认，2026-09-23 派发，授权开发→测试→出包不再请示）
+
+| 单号 | 内容 | 负责 |
+| --- | --- | --- |
+| ✅ `FIX-TAIL-WINDOW-AND-FALLBACK-386` | 中途多片末片延后与后续组窗（可超 10s）；松键短尾 <3s 与前片合窗重解；预览回灌保留流式尾巴；失败窗用流式文字兜底。**2026-09-23 阶段一交付 coder-1**（仅 `main.rs`）：`plan_windows`→`WindowPlan`+`dispatch_window!`；`compose_reflow_preview` 统一合成；`window_text_with_fallback` 兜底；新增单测 8+2、更新 testsync382/371 锚点（不放宽）。`cargo fmt --check` EXIT 0、`check --all-targets` 0 error、warnings **97/88**=基线、全量 **1608P/0F/34I**。**待 tester-1 阶段四回归 + 出包 + 端测** | coder-1（`main.rs`） |
+| ✅ `FIX-ACC-OUTPUT-GUARD-AND-GATE-SMOOTH-387`（+ ✅ 阶段三 `TEST-SYNC-387`） | 念词表 / `<标签>` / 空输出判无效 → 不带注入重解一次；近场门改 300ms 平滑音量。**阶段三 2026-09-23 交付 coder-1**：仅 `mod.rs`+`local_stream.rs` 的 `#[cfg(test)]` **+5 条**（标签边界/回显残余/重解次数/平滑波动与 30 万块稳定/门抗误挡对比），`fmt --check` EXIT 0、`check --all-targets` 0 error、warnings **97/88**=基线；**未跑 `cargo test`**；**未发现新生产缺陷** | coder-2（实现）+ coder-1（阶段三护栏） |
+
+### ✅ BUILD-385 已出包（2026-09-23 14:56，HEAD `0c443a5`）· 待 Gavin 端测
+
+合包 381（10s 后字缝切 / 窗口 12→10s）+ 382（逐片组窗修吃前文 / 松键立即「识别处理中」/ 回灌立即渲染 / 共享解码队列）+ 384（静默判定改 silero VAD，音量阈值兜底）+ 385（近场音量门挡背景人声）。回归 1598P/0F/34I。
+**端测重点**：①一口气 >10s 不丢前文 ②停顿后预览 1~2s 内刷新 ③松键立刻出「识别处理中」、无闪回 ④有背景噪声/背景人声时照常 1.2s 切片与打标点。`-debug` 看 `[LocalRT-DBG-380/382/384/385]`。明细见 `todo-archive.md`【归档七】。
