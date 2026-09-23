@@ -1346,3 +1346,23 @@ load_wordbook_vocabulary()
 | 三特殊点 | ① dll 四张三副本全等 + onnxruntime 1.28.2；② itn-rules 三副本全等；③ Publish/models 1.7B 七文件与源逐一 sha256 全等（0.6B 保留） |
 | 探针 | 正：`[LocalRT-DBG-388]`=2 / `[LocalRT-DBG-389]`=4 / `max_new_tokens=`=1；反：`nearfield gate: vad=on`=**0**（385 逐块门已删） |
 | 端测 | 🔴 **Step1 强杀输入法 ⇒ 请重启 + 带 `-debug` 端测**；重点：① 390 解码并发 2→1 + 按语音时长限 `max_new_tokens`（解码耗时/是否截断快语速）；② 388 剪静音（无语音不解码）+ 重解质量把关；③ 389 近场门整句判定 + 跨录音沿用音量 + 预览不回退；④ 是否仍念词表；⑤ 吃字/重复字；⑥ 长录音 300s；⑦ 不新增 crash.json |
+
+## FIX-VAD-FEED-BY-WINDOW-391 · VAD 改逐 512 块喂入（修「说话到一半卡住」P0）· 2026-09-23 · coder-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 仅 `src/transcription/vad.rs`(200/13)。新增 `feed_in_vad_windows`（逐 512 块喂）；`speech_ranges`/`feed_is_speech` 改走它；注释写 sherpa 依据 + 纠正 384「整块喂入」错误指示。未改常量/`segment()`/pub 签名 |
+| 真模型实跑 | 4 段 6s 语音 + 前后各 3s 静音 ⇒ 剪后 **6.44/6.31/6.38/5.78s**；旧整块写法 **0.36s**（复现根因）；`feed_is_speech` 块大小 160/512/1600/16000 差异 ≤ 喂入块 |
+| 回归 | root `cargo test --no-fail-fast` **1646P/0F/37I**（EXIT 0）；`cargo fmt --check` EXIT 0；`cargo check --all-targets` 0 error；warnings `vad.rs` 0 新增（bin 98 的 +1 属 coder-2 在飞的 392） |
+| NEW | `vad391_feed_in_vad_windows_counts_ceil`（纯） + `vad391_speech_ranges_keeps_speech_cuts_silence`(#[ignore]) + `vad391_feed_is_speech_block_size_invariant`(#[ignore]) |
+| 端测 | 🔴 待 tester-1 阶段四回归 + 392 合包 + Gavin 端测：说话不再中途卡住/只出前半段 |
+
+## FIX-GATE-TIMING-ONLY-392（阶段一·交付）· 2026-09-23 · coder-2
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 近场门拆分为「门只管时序、内容去留只看 VAD」——修 BUILD-390「说一半卡住只出前半段」（根因：门结果同时驱动时序与内容去留 + 偶数上中位锁死 level）。另：`estimate` 偶数取下中位、首段不学习、埋点 `learned=`/`vad_only_speech_chunks`；VAD 不可用兜底逐位同 384 |
+| 文件 | `src/transcription/local_stream.rs`（未改 `vad.rs`/`main.rs`/`mod.rs`、未改 pub 签名） |
+| 单测 | 新增 `gate392_*` 4 条；改写 8 条（392 契约变更）；既有 342/346/349/337/384/389/ts389 全通过 |
+| 验证 | fmt EXIT 0 ｜ check 0 error、warnings 97/88=基线 ｜ 全量 test 0 failed（bin 1562P/35I）｜ numstat==-w（262/54） |
+| 下一步 | 阶段三 TEST-SYNC（非作者）→ 阶段四 TEST-EXEC → 出包；端测盯「不再中途卡住 / 输出完整 / learned= / vad_only_speech_chunks」 |

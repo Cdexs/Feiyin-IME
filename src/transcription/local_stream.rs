@@ -504,10 +504,15 @@ fn chunk_has_speech(
                 vad_speech,
             }
         }
-        None => ChunkJudgment {
-            has_speech: chunk_rms > silence_threshold,
-            vad_speech: false,
-        },
+        None => {
+            // GATE-TIMING-ONLY-392：VAD 不可用时 `vad_speech` 取**音量兜底判定**（= has_speech）⇒
+            // 「内容去留看 vad_speech」的整条判定与 384 **逐位相同**（门不参与）。
+            let energy_speech = chunk_rms > silence_threshold;
+            ChunkJudgment {
+                has_speech: energy_speech,
+                vad_speech: energy_speech,
+            }
+        }
     }
 }
 
@@ -621,6 +626,9 @@ struct SegmentPeakLevel {
     seed: Option<f32>,
     /// C2：seed 沿用期的连续被拒段计数。
     consecutive_rejects: u32,
+    /// GATE-TIMING-ONLY-392：本次录音的**第一个已确认段不学习**（避开按键声 / 起音高峰）；
+    /// 该段仍按规则确认、仍算有声，只是不 `push` 峰值。
+    first_learn_skipped: bool,
 }
 
 impl SegmentPeakLevel {
@@ -630,7 +638,19 @@ impl SegmentPeakLevel {
             samples: std::collections::VecDeque::new(),
             seed,
             consecutive_rejects: 0,
+            first_learn_skipped: false,
         }
+    }
+
+    /// GATE-TIMING-ONLY-392：收录一个**已确认段**峰值到学习样本；**第一个已确认段跳过**（不学习）。
+    /// 返回本次是否真的写入（供埋点 `learned=`）。
+    fn learn_segment(&mut self, peak: f32, now_ms: f32) -> bool {
+        if !self.first_learn_skipped {
+            self.first_learn_skipped = true;
+            return false; // 392：第一段不学习（避开按键声/起音高峰）
+        }
+        self.push(peak, now_ms);
+        true
     }
 
     /// 收录一个**已确认段**的峰值：`now_ms` = 入样会话毫秒（会话音频时长累加）。
@@ -684,12 +704,15 @@ impl SegmentPeakLevel {
     }
 
     /// 录音人整句峰值估计：本次样本就绪 ⇒ **中位数**（seed 不再参与）；否则 seed；否则 0。
+    ///
+    /// 🔴 GATE-TIMING-ONLY-392：偶数样本取**下中位数**（`v[(len-1)/2]`）—— 两样本时取**较小者**。
+    /// BUILD-390 现场 `[peak=0.0966(含按键声), 0.0215]` 取上中位数得 0.0966 ⇒ 门限 0.029 ⇒ 录音人后续整句被误判。
     /// 须先 `prune(now_ms)`。
     fn estimate(&self) -> f32 {
         if self.samples_ready() {
             let mut v: Vec<f32> = self.samples.iter().map(|(p, _)| *p).collect();
             v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            v[v.len() / 2]
+            v[(v.len() - 1) / 2]
         } else {
             self.seed.unwrap_or(0.0)
         }
@@ -757,11 +780,12 @@ impl SegmentGate {
         }
         let has_speech = vad_speech && self.seg_confirmed;
         if !vad_speech && self.in_seg {
-            // 段结束：只学**已确认段**峰值（背景段被拒 ⇒ 不污染 level）。
+            // 段结束：只学**已确认段**峰值（背景段被拒 ⇒ 不污染 level）；392：第一段不学习。
             self.segments += 1;
+            let mut learned = false;
             if self.seg_confirmed {
                 self.confirmed += 1;
-                self.level.push(self.seg_peak, now_ms);
+                learned = self.level.learn_segment(self.seg_peak, now_ms);
             } else {
                 self.rejected += 1;
             }
@@ -779,10 +803,11 @@ impl SegmentGate {
             }
             if log::log_enabled!(log::Level::Debug) {
                 log::debug!(
-                    "[LocalRT-DBG-389] segment end: peak={:.5} level={:.5} confirmed={}",
+                    "[LocalRT-DBG-389] segment end: peak={:.5} level={:.5} confirmed={} learned={}",
                     self.seg_peak,
                     self.level.estimate(),
-                    self.seg_confirmed
+                    self.seg_confirmed,
+                    learned
                 );
             }
             self.in_seg = false;
@@ -893,6 +918,8 @@ pub fn transcribe_streaming_local(
     let mut vad_total_ms = 0.0f64;
     let mut vad_max_ms = 0.0f64;
     let mut vad_chunks = 0u64;
+    // GATE-TIMING-ONLY-392 埋点：VAD 判人声但门判非近场（被门拒）的 chunk 数。
+    let mut vad_only_speech_chunks = 0u64;
 
     let mut stream = recognizer.create_stream();
     let mut state = StreamingAsrState::new();
@@ -1024,28 +1051,42 @@ pub fn transcribe_streaming_local(
                 vad_max_ms = dt_ms;
             }
         }
-        if has_speech {
+        // GATE-TIMING-ONLY-392：**时序**（停顿计时 / 派发时机 / 预览打点 / 337 边界 b）继续用
+        // **过门结果** `has_speech`；**内容去留**（`speech_since_last_reset` / `acc_pending_has_speech` /
+        // `*_done_for_pause` 复位）改用 **VAD 原始判定** `vad_speech` ——
+        // 门误判时最坏只是停顿判断不准，**绝不丢录音人的话**（BUILD-390：门误判 ⇒ 342 丢流式文本 +
+        // 298 不派发 ⇒ 预览/最终输出卡在 0 或前半段）。代价：VAD 判人声的背景说话可能被识别进结果。
+        // 🔴 VAD 不可用时 `vad_speech` == 音量兜底判定 ⇒ 整条判定与 384 逐位相同。
+        if !has_speech {
+            if vad_on && prev_has_speech && !vad_speech {
+                // LOCALRT-VAD-SILENCE-384/389：VAD 自身「人声→无人声」翻转（silero 过 min_silence 才报）
+                // ⇒ 把这段已静时间补记回来。只有**已确认段**结束才走到这里（prev_has_speech=true）。
+                silent_ms = localrt_vad_seed_ms();
+                acc_silent_ms = localrt_vad_seed_ms();
+            } else {
+                silent_ms += chunk_ms;
+                // 346：acc 专用计数器同步累加（标点路径清 silent_ms 时不动它）。
+                acc_silent_ms += chunk_ms;
+            }
+        } else {
             silent_ms = 0.0;
             acc_silent_ms = 0.0;
-            // LOCALRT-ENDPOINT-EMPTY-342：本句出现过有声 chunk ⇒ 后续 endpoint 是真切句。
-            speech_since_last_reset = true;
-            // LOCALRT-ENDPOINT-284：有新语音进来 → 允许本轮停顿结束后再触发影子。
-            // 不立即清 shadow_current：显示侧用「取更长者」避免瞬时缩短/闪烁（见下 base 选择）。
+            // 392 主控验收补：「本轮停顿已派发 / 已触发影子」的复位属于**时序**，必须跟静默计时同源
+            //（has_speech）。若随 vad_speech 复位：背景人声被门拒 ⇒ acc_silent_ms 持续累加不清零，
+            // 而 done 标记每个 chunk 被清 ⇒ 静默已 ≥1200ms ⇒ **每个 chunk（~10ms）派发一次**，
+            // 串行解码队列被碎片窗口淹没。改回 has_speech：背景人声只随一次派发送出，之后要等录音人开口。
             shadow_done_for_pause = false;
-            // PARALLEL-ACC-298：有新语音 → 允许本轮停顿结束后再派发，并标记待派发区间含语音。
             acc_done_for_pause = false;
+        }
+        if vad_speech {
+            speech_since_last_reset = true;
             acc_pending_has_speech = true;
-        } else if vad_on && prev_has_speech && !vad_speech {
-            // LOCALRT-VAD-SILENCE-384/389：补偿**只针对 VAD 自身**的「人声→无人声」翻转
-            // （silero 过了 min_silence(0.3s) 才报无人声）⇒ 把这段已静时间补记回来。
-            // 🔴 只有**已确认段**结束才走到这里（prev_has_speech=true）；未确认段（背景）全程
-            //    has_speech=false ⇒ 走下面的普通累加、不补记。
-            silent_ms = localrt_vad_seed_ms();
-            acc_silent_ms = localrt_vad_seed_ms();
-        } else {
-            silent_ms += chunk_ms;
-            // 346：acc 专用计数器同步累加（标点路径清 silent_ms 时不动它）。
-            acc_silent_ms += chunk_ms;
+            // LOCALRT-ENDPOINT-EMPTY-342（392 契约变更）：本句 VAD 判有人声 ⇒ 342 后续 endpoint 文本不丢；
+            // 门只管时序（见上）；门误判时最坏只是停顿判断不准，**绝不丢录音人的话**。
+        }
+        // 392 埋点：VAD 判人声但门判非近场（被门拒）的 chunk 数 ⇒ 端测观察背景占比（可观测性）。
+        if vad_speech && !has_speech {
+            vad_only_speech_chunks += 1;
         }
         // LOCALRT-VAD-SILENCE-384 埋点：人声 ↔ 静默切换（端测对照噪声环境下两种判定的差异）。
         if has_speech != prev_has_speech && log::log_enabled!(log::Level::Debug) {
@@ -1592,11 +1633,12 @@ pub fn transcribe_streaming_local(
     // LOCALRT-NEARFIELD-GATE-389：近场段门汇总（Debug 守卫）。
     if vad_on && log::log_enabled!(log::Level::Debug) {
         log::debug!(
-            "[LocalRT-DBG-389] nearfield summary: segments={} confirmed={} rejected={} level={:.5}",
+            "[LocalRT-DBG-389] nearfield summary: segments={} confirmed={} rejected={} level={:.5} vad_only_speech_chunks={}",
             segment_gate.segments,
             segment_gate.confirmed,
             segment_gate.rejected,
-            segment_gate.level.estimate()
+            segment_gate.level.estimate(),
+            vad_only_speech_chunks
         );
     }
 
@@ -2627,7 +2669,11 @@ mod tests {
                 rms > THR,
                 "VAD 不可用 ⇒ 判定必须等于 `chunk_rms > silence_threshold`（amp={amp}）"
             );
-            assert!(!j.vad_speech, "VAD 不可用 ⇒ vad_speech 恒 false");
+            assert_eq!(
+                j.vad_speech,
+                rms > THR,
+                "392 契约变更：VAD 不可用时 vad_speech 取音量兜底判定（⇒ 内容去留与 384 逐位相同）"
+            );
         }
         let chunk = vec![THR; 1600];
         assert!(
@@ -2750,7 +2796,8 @@ mod tests {
     // LOCALRT-NEARFIELD-GATE-389：近场门改「按整句（VAD 段）判定」——段峰值估计 + 段门状态机
     // ========================================================================
 
-    /// 测 #1：`SegmentPeakLevel` — 样本 <2 未就绪；估计取**中位数**；按会话时间 30s 过期。
+    /// 测 #1（392 契约变更）：`SegmentPeakLevel` — 样本 <2 未就绪；估计取**下中位数**
+    /// （偶数样本取较小者）；按会话时间 30s 过期。
     #[test]
     fn seg389_level_ready_median_and_window() {
         let mut lv = SegmentPeakLevel::with_seed(None);
@@ -2759,27 +2806,32 @@ mod tests {
         assert!(!lv.ready(), "1 样本仍未就绪（需 ≥2）");
         lv.push(0.5, 10.0);
         assert!(lv.ready());
-        // 2 样本 [0.5,1.0]：中位数索引 len/2=1 ⇒ 1.0（上中位）。
-        assert!((lv.estimate() - 1.0).abs() < 1e-3);
+        // 392：2 样本 [0.5,1.0] 取**下中位数** idx (len-1)/2=0 ⇒ 0.5（较小者）。
+        assert!(
+            (lv.estimate() - 0.5).abs() < 1e-3,
+            "392：偶数样本取下中位（较小者）"
+        );
         lv.push(0.2, 20.0);
         // 3 样本 [0.2,0.5,1.0] ⇒ 中位 0.5。
-        assert!((lv.estimate() - 0.5).abs() < 1e-3, "中位数应为 0.5");
+        assert!((lv.estimate() - 0.5).abs() < 1e-3, "奇数样本取中位 0.5");
         // 会话时间过期：now=30001 ⇒ t=0 过期；t=10/20 保留。
         lv.prune(30_001.0);
         assert_eq!(lv.samples.len(), 2, "t=0 应过期");
         assert!(
-            (lv.estimate() - 0.5).abs() < 1e-3,
-            "剩 [0.2,0.5] 上中位 = 0.5"
+            (lv.estimate() - 0.2).abs() < 1e-3,
+            "剩 [0.2,0.5] 下中位 = 0.2"
         );
     }
 
     /// 测 #2：段内出现响亮峰值 ⇒ 整句确认；其后**轻音/句尾**全算有声（不再句中切静默）。
+    ///
+    /// 392 契约变更：本次录音**第一个已确认段不学习** ⇒ 需 **3** 个已确认段才就绪（2 个学习样本）。
     #[test]
     fn seg389_confirms_on_peak_then_holds_through_light_tail() {
         let mut g = SegmentGate::with_seed(None);
         let mut now = 0.0f32;
-        // 两段响亮（peak 1.0）⇒ 就绪（未就绪期段直接确认）。
-        for _ in 0..2 {
+        // 三段响亮（peak 1.0）：第一段不学习、后两段学习 ⇒ 就绪（未就绪期段直接确认）。
+        for _ in 0..3 {
             for _ in 0..3 {
                 now += 100.0;
                 assert!(g.update(true, 1.0, now));
@@ -2787,9 +2839,9 @@ mod tests {
             now += 100.0;
             assert!(!g.update(false, 0.0, now));
         }
-        assert!(g.level.ready(), "2 段后应就绪");
+        assert!(g.level.ready(), "392：3 段（首段不学习）后应就绪");
         assert!((g.level.estimate() - 1.0).abs() < 1e-3);
-        // 段 3：响亮起始确认，随后轻音尾巴仍算有声。
+        // 段 4：响亮起始确认，随后轻音尾巴仍算有声。
         now += 100.0;
         assert!(g.update(true, 1.0, now), "响亮起始应确认整句");
         now += 100.0;
@@ -2798,15 +2850,17 @@ mod tests {
         assert!(g.update(true, 0.05, now), "句尾/清辅音仍算有声（已确认）");
         now += 100.0;
         assert!(!g.update(false, 0.0, now));
-        assert_eq!(g.confirmed, 3);
+        assert_eq!(g.confirmed, 4);
     }
 
     /// 测 #3：背景段（整句峰值均 < `level × 0.3`）⇒ 全程 has_speech=false，**不得污染 level**（防自我放行）。
+    ///
+    /// 392 契约变更：首段不学习 ⇒ 需 3 个已确认段才就绪。
     #[test]
     fn seg389_background_segment_rejected_no_self_admit() {
         let mut g = SegmentGate::with_seed(None);
         let mut now = 0.0f32;
-        for _ in 0..2 {
+        for _ in 0..3 {
             for _ in 0..3 {
                 now += 100.0;
                 g.update(true, 1.0, now);
@@ -2814,7 +2868,7 @@ mod tests {
             now += 100.0;
             g.update(false, 0.0, now);
         }
-        assert!(g.level.ready());
+        assert!(g.level.ready(), "392：3 段后应就绪");
         let lvl_before = g.level.estimate();
         // 背景段：vad 全程 true、平滑音量恒 0.2（< 0.3×1.0）⇒ 整段静默。
         let mut silent_chunks = 0usize;
@@ -2848,11 +2902,13 @@ mod tests {
     }
 
     /// 测 #5：会话时间过期 —— 30s 无已确认段后旧样本过期 ⇒ 未就绪 ⇒ 重新热身（最坏锁定 ≤30s）。
+    ///
+    /// 392 契约变更：首段不学习 ⇒ 需 3 个已确认段才就绪。
     #[test]
     fn seg389_window_expires_then_relearns() {
         let mut g = SegmentGate::with_seed(None);
         let mut now = 0.0f32;
-        for _ in 0..2 {
+        for _ in 0..3 {
             for _ in 0..3 {
                 now += 100.0;
                 g.update(true, 1.0, now);
@@ -2860,7 +2916,7 @@ mod tests {
             now += 100.0;
             g.update(false, 0.0, now);
         }
-        assert!(g.level.ready());
+        assert!(g.level.ready(), "392：3 段后应就绪");
         // 30s 静默（vad=false）⇒ 旧样本按会话时间过期。
         for _ in 0..310 {
             now += 100.0;
@@ -2915,12 +2971,14 @@ mod tests {
 
     /// 整句段门契约：录音人音节语音（VAD 全真、平滑音量在响亮 1.0 / 轻音 0.05 间波动）
     /// ⇒ **整段全部判有声**（不再句中切静默）；背景段（整句峰值 0.1×level）⇒ **整段判静默**。
+    ///
+    /// 392 契约变更：首段不学习 ⇒ 需 3 个已确认段才就绪。
     #[test]
     fn ts389_segment_gate_syllabic_all_speech_background_all_silent() {
         let mut g = SegmentGate::with_seed(None);
         let mut now = 0.0f32;
-        // 学两段响亮（peak 1.0）⇒ 就绪。
-        for _ in 0..2 {
+        // 学三段响亮（peak 1.0；首段不学习）⇒ 就绪。
+        for _ in 0..3 {
             for _ in 0..3 {
                 now += 100.0;
                 g.update(true, 1.0, now);
@@ -2928,7 +2986,7 @@ mod tests {
             now += 100.0;
             g.update(false, 0.0, now);
         }
-        assert!(g.level.ready());
+        assert!(g.level.ready(), "392：3 段后应就绪");
         // 录音人音节段：响亮峰值 + 轻音交替 ⇒ 整段有声。
         let mut speech = 0usize;
         let mut total = 0usize;
@@ -3007,6 +3065,8 @@ mod tests {
     }
 
     /// C2-②：有 seed ⇒ 立即就绪、estimate=seed；本次样本就绪后 seed 不再参与。
+    ///
+    /// 392 契约变更：首段不学习 ⇒ 需 3 个已确认段（2 学习样本）才 `samples_ready`。
     #[test]
     fn seg389c2_seed_makes_ready_and_used_until_samples_ready() {
         let mut g = SegmentGate::with_seed(Some(1.0));
@@ -3014,18 +3074,24 @@ mod tests {
         assert!((g.level.estimate() - 1.0).abs() < 1e-3, "estimate=seed");
         assert!(g.level.seed_in_use());
         let mut now = 0.0f32;
-        // 第 1 句响亮（1.0 ≥ 0.3×seed）⇒ 确认。
+        // 第 1 句响亮（1.0 ≥ 0.3×seed）⇒ 确认（392：首段不学习 ⇒ 0 样本）。
         now += 100.0;
         assert!(g.update(true, 1.0, now));
         now += 100.0;
         assert!(!g.update(false, 0.0, now));
-        assert!(g.level.seed_in_use(), "本次仅 1 样本 ⇒ seed 仍参与");
-        // 第 2 句响亮 ⇒ 本次 2 样本就绪 ⇒ seed 不再参与估计。
+        assert!(g.level.seed_in_use(), "392：首段不学习 ⇒ seed 仍参与");
+        // 第 2 句响亮 ⇒ 1 学习样本（<2）⇒ seed 仍参与。
         now += 100.0;
         assert!(g.update(true, 1.0, now));
         now += 100.0;
         assert!(!g.update(false, 0.0, now));
-        assert!(!g.level.seed_in_use(), "本次样本就绪 ⇒ seed 不再参与");
+        assert!(g.level.seed_in_use(), "本次 1 样本 <2 ⇒ seed 仍参与");
+        // 第 3 句响亮 ⇒ 2 学习样本就绪 ⇒ seed 不再参与估计。
+        now += 100.0;
+        assert!(g.update(true, 1.0, now));
+        now += 100.0;
+        assert!(!g.update(false, 0.0, now));
+        assert!(!g.level.seed_in_use(), "本次样本就绪（2）⇒ seed 不再参与");
         assert!((g.level.estimate() - 1.0).abs() < 1e-3);
     }
 
@@ -3056,13 +3122,13 @@ mod tests {
         let mut g = SegmentGate::with_seed(None);
         assert!(!g.level.ready(), "未学到段 ⇒ 不就绪 ⇒ 不写回");
         let mut now = 0.0f32;
-        for _ in 0..2 {
+        for _ in 0..3 {
             now += 100.0;
             g.update(true, 1.0, now);
             now += 100.0;
             g.update(false, 0.0, now);
         }
-        assert!(g.level.ready(), "学到 2 段 ⇒ 就绪 ⇒ 写回");
+        assert!(g.level.ready(), "392：3 段（首段不学习）⇒ 就绪 ⇒ 写回");
     }
 
     // ========================================================================
@@ -3070,11 +3136,11 @@ mod tests {
     //   契约见任务书；不与作者 `ts389_*` / `seg389c2_*` 重复。
     // ========================================================================
 
-    /// 学习两段峰值 1.0 ⇒ 就绪、estimate=1.0（返回门，便于后续用例复用）。
+    /// 学习三段峰值 1.0（392 契约变更：首段不学习）⇒ 就绪、estimate=1.0（返回门，便于后续用例复用）。
     fn ts389n_ready_level_1() -> SegmentGate {
         let mut g = SegmentGate::with_seed(None);
         let mut now = 0.0f32;
-        for _ in 0..2 {
+        for _ in 0..3 {
             now += 100.0;
             g.update(true, 1.0, now);
             now += 100.0;
@@ -3197,5 +3263,212 @@ mod tests {
             !seed_usable("mic", Duration::from_secs(1), "other"),
             "换设备 ⇒ false"
         );
+    }
+}
+
+// ========================================================================
+// GATE-TIMING-ONLY-392：门只管时序、内容去留只看 VAD；首段不学习；下中位数
+// ========================================================================
+#[cfg(test)]
+mod gate392_tests {
+    use super::{chunk_has_speech, localrt_vad_seed_ms, SegmentGate, SegmentPeakLevel};
+
+    /// 1. 复现 BUILD-390 峰值序列 [0.0966, 0.0215, 0.0157, 0.0228, 0.0244]（VAD 全真）：
+    ///    **第一段不学习**（0 样本），后续段**全部确认**；level = 后 4 段下中位 = 0.0215。
+    #[test]
+    fn gate392_repro_peak_sequence_first_not_learned_all_confirmed() {
+        let mut g = SegmentGate::with_seed(None);
+        let mut now = 0.0f32;
+        let peaks = [0.0966f32, 0.0215, 0.0157, 0.0228, 0.0244];
+        let mut samples_after = Vec::new();
+        for (i, &p) in peaks.iter().enumerate() {
+            for _ in 0..3 {
+                now += 100.0;
+                assert!(g.update(true, p, now), "段 {i}（peak={p}）应确认整句");
+            }
+            now += 100.0;
+            assert!(!g.update(false, 0.0, now));
+            samples_after.push(g.level.samples.len());
+        }
+        assert_eq!(samples_after[0], 0, "392：第一段不学习");
+        assert_eq!(samples_after[1], 1);
+        assert_eq!(samples_after[4], 4);
+        assert_eq!(g.confirmed, 5, "后续段全部确认");
+        assert_eq!(g.rejected, 0, "无段被误判为背景");
+        let want = 0.0215f32; // sorted [0.0157,0.0215,0.0228,0.0244] 下中位 idx1
+        assert!(
+            (g.level.estimate() - want).abs() < 1e-3,
+            "392：下中位应为 0.0215，实测 {}",
+            g.level.estimate()
+        );
+    }
+
+    /// 2. 门拒绝的段（背景）⇒ **内容标志仍置位**（不丢录音人内容），**时序照常累加**。
+    ///    复刻生产三分支 + 内容块（396 契约）。并源码级护栏：内容标志挂在 `if vad_speech` 下。
+    #[test]
+    fn gate392_gated_segment_sets_content_flags_and_accumulates_timing() {
+        let step = |has_speech: bool,
+                    vad_speech: bool,
+                    prev_has_speech: bool,
+                    vad_on: bool,
+                    silent0: f32,
+                    sfr0: bool,
+                    aph0: bool|
+         -> (f32, bool, bool) {
+            let mut silent = silent0;
+            if !has_speech {
+                if vad_on && prev_has_speech && !vad_speech {
+                    silent = localrt_vad_seed_ms();
+                } else {
+                    silent += 100.0;
+                }
+            } else {
+                silent = 0.0;
+            }
+            let (mut sfr, mut aph) = (sfr0, aph0);
+            if vad_speech {
+                sfr = true;
+                aph = true;
+            }
+            (silent, sfr, aph)
+        };
+        // 门拒但 VAD 真（has_speech=false, vad_speech=true）：内容标志置位、时序累加。
+        let (mut silent, mut sfr, mut aph) = (0.0f32, false, false);
+        for _ in 0..5 {
+            let (s, a, b) = step(false, true, false, true, silent, sfr, aph);
+            silent = s;
+            sfr = a;
+            aph = b;
+        }
+        assert!(
+            sfr,
+            "392：门拒段仍应置 speech_since_last_reset（342 文本不丢）"
+        );
+        assert!(
+            aph,
+            "392：门拒段仍应置 acc_pending_has_speech（要派发解码）"
+        );
+        assert_eq!(silent, 500.0, "时序照常累加 5×100ms");
+        // VAD 也判静默 ⇒ 内容标志不置、时序累加。
+        let (s2, sfr2, aph2) = step(false, false, false, true, 0.0, false, false);
+        assert!(!sfr2 && !aph2, "VAD 无人的段不置内容标志");
+        assert_eq!(s2, 100.0);
+        // 过门有声 ⇒ 时序清零。
+        let (s3, _, _) = step(true, true, false, true, 999.0, true, true);
+        assert_eq!(s3, 0.0, "过门有声 ⇒ 时序清零");
+
+        // 源码级护栏：内容标志必须挂在 `if vad_speech {` 下（不是 `if has_speech`）。
+        let src = include_str!("local_stream.rs");
+        let body = src
+            .split("pub fn transcribe_streaming_local(")
+            .nth(1)
+            .expect("transcribe_streaming_local 锚点缺失");
+        let lines: Vec<&str> = body.lines().collect();
+        let sfr_line = lines
+            .iter()
+            .position(|l| l.trim() == "speech_since_last_reset = true;")
+            .expect("speech_since_last_reset 锚点缺失");
+        let nearest_if = lines[..sfr_line]
+            .iter()
+            .rposition(|l| l.trim_start().starts_with("if "))
+            .expect("内容块应有 enclosing if");
+        assert!(
+            lines[nearest_if]
+                .trim_start()
+                .starts_with("if vad_speech {"),
+            "392：内容标志必须挂在 `if vad_speech {{` 下，实测 enclosing={:?}",
+            lines[nearest_if]
+        );
+    }
+
+    /// 392 主控验收补：「本轮停顿已派发」`acc_done_for_pause` 的复位属于**时序**，必须在
+    /// `if !has_speech { … } else { <这里> }` 的 else 分支（过门有声），**不得**挂在 `if vad_speech {` 下。
+    /// 否则背景人声被门拒时 acc_silent_ms 持续 ≥1200ms 而 done 每 chunk 被清 ⇒ 每 ~10ms 派发一次。
+    #[test]
+    fn gate392_review_done_reset_is_timing_not_content() {
+        let src = include_str!("local_stream.rs");
+        let body = src
+            .split("pub fn transcribe_streaming_local(")
+            .nth(1)
+            .expect("transcribe_streaming_local 锚点缺失");
+        let lines: Vec<&str> = body.lines().collect();
+        let done = lines
+            .iter()
+            .position(|l| l.trim() == "acc_done_for_pause = false;")
+            .expect("acc_done_for_pause 复位锚点缺失");
+        let nearest_branch = lines[..done]
+            .iter()
+            .rposition(|l| {
+                let t = l.trim_start();
+                t.starts_with("if ") || t.starts_with("} else")
+            })
+            .expect("复位应有 enclosing 分支");
+        assert_eq!(
+            lines[nearest_branch].trim(),
+            "} else {",
+            "done 复位必须在 `if !has_speech` 的 else（过门有声）分支，实测 {:?}",
+            lines[nearest_branch]
+        );
+        let enclosing_if = lines[..nearest_branch]
+            .iter()
+            .rposition(|l| l.trim_start().starts_with("if !has_speech {"))
+            .expect("应在 `if !has_speech {` 之后");
+        assert!(enclosing_if < nearest_branch);
+        // 背景人声（门拒、VAD 真）连续 5s：派发判据只在静默首次满 1200ms 时成立一次。
+        let mut acc_silent = 0.0f32;
+        let mut done = false;
+        let mut pending_speech = false;
+        let mut dispatches = 0;
+        for _ in 0..500 {
+            let (has_speech, vad_speech) = (false, true);
+            if !has_speech {
+                acc_silent += 10.0;
+            } else {
+                acc_silent = 0.0;
+                done = false;
+            }
+            if vad_speech {
+                pending_speech = true;
+            }
+            if super::should_dispatch_acc(true, acc_silent, 160, done, pending_speech, 1200.0) {
+                dispatches += 1;
+                done = true;
+                pending_speech = false;
+            }
+        }
+        assert_eq!(
+            dispatches, 1,
+            "背景人声持续 5s 只应派发一次，实测 {dispatches}"
+        );
+    }
+
+    /// 3. `estimate`：偶数样本取**下中位数**（两样本取较小者）；奇数样本取中位。
+    #[test]
+    fn gate392_estimate_lower_median_even_middle_odd() {
+        let mut lv = SegmentPeakLevel::with_seed(None);
+        lv.push(0.9, 0.0);
+        lv.push(0.1, 1.0);
+        assert!(
+            (lv.estimate() - 0.1).abs() < 1e-3,
+            "392：两样本取下中位（较小者）"
+        );
+        lv.push(0.5, 2.0);
+        assert!((lv.estimate() - 0.5).abs() < 1e-3, "奇数样本取中位 0.5");
+    }
+
+    /// 4. VAD 不可用 ⇒ `vad_speech == has_speech`（音量兜底判定）⇒ 内容去留与 384 逐位一致。
+    #[test]
+    fn gate392_vad_unavailable_content_flags_match_384() {
+        let mut g = SegmentGate::with_seed(None);
+        const THR: f32 = 0.01;
+        for rms in [0.0f32, 0.005, THR, 0.02, 0.5] {
+            let chunk = vec![rms; 160];
+            let j = chunk_has_speech(None, &chunk, rms, rms, 0.0, THR, &mut g);
+            assert_eq!(j.has_speech, rms > THR);
+            assert_eq!(
+                j.vad_speech, j.has_speech,
+                "392：VAD 不可用 ⇒ vad_speech 必须等于 has_speech（内容去留与 384 逐位相同）"
+            );
+        }
     }
 }

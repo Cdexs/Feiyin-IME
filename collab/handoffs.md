@@ -285,3 +285,22 @@
 - **新增 3 条**：快语速不截断（s∈{0.5..25}，cap≥ceil(7s)+5 或 256，单调）；源码护栏（cap 在剪后遮蔽 samples 之后 + `decode_accuracy_once` 无 `Some(`）；并发度 ==1 且注释含实测依据 274/476。
 - **验证**：`rustfmt` + `cargo check --all-targets` **0 error**、warnings **97/88**=基线；`cargo fmt --check` EXIT 0；numstat==-w（mod 81/0）。独立 Python 复刻 `max_new_tokens_for` 逐点 bad=0 + 源码锚点实测成立。
 - **未发现生产缺陷**。**未改版本 / 未 push / 零凭证**。
+
+## 2026-09-23 — coder-1 — FIX-VAD-FEED-BY-WINDOW-391 ✅ 交付（阶段一·只改 `vad.rs`）
+
+- **缺陷**（Gavin BUILD-390，P0）：说话到一半卡住、预览与最终输出只出前半段、结果出错。根因（主控查 sherpa 源码）：388 的 `speech_ranges`/`feed_is_speech` 把整段一次性 `accept_waveform`；sherpa `voice-activity-detector.cc`「一次调用内全窗 OR、起点定在输入末尾前 ~0.164s」⇒ 5s 语音只剩 ~0.37s（日志 `in=6.31s out=0.37s`）。🔴 该错误用法出自主控 **384 任务书补充第 2 条**「整块一次喂、不要切 512」——本单纠正（原 `segment()` 逐 512 块才是正确用法）。
+- **改动**（只 `vad.rs`）：新增 `feed_in_vad_windows(audio, accept)`（按 `VAD_WINDOW_SIZE`=512 逐块喂、末尾不足一块照常、返回 `ceil(len/512)`）；`speech_ranges` 与 `feed_is_speech` 改走它（`feed_is_speech` 每块后不查询、整块喂完只调一次 `detected()`）；注释写 sherpa 依据 + 注明 384 指示错误。未改常量/旧构造/`segment()`/pub 签名。
+- **必须实跑的真模型验证**（`--ignored --nocapture vad391`，输出原样见 result.md）：① 4 段各 6s 语音 + 前后各 3s 静音 ⇒ 剪后 **6.44 / 6.31 / 6.38 / 5.78s**；② 对照旧整块写法 ⇒ **0.36s**（复现根因）；③ `feed_is_speech` 块大小 160/512/1600/16000 ⇒ 人声开始/结束差异均 ≤ 喂入块。
+- **单测**：新增 `vad391_feed_in_vad_windows_counts_ceil`（纯） + 2 条 `#[ignore]` 真模型。
+- **验证**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**、warnings test **88**（`vad.rs` **0 新增**；bin 98 的 +1 属 coder-2 在飞的 392 `local_stream.rs:657`）；全量 `cargo test --no-fail-fast` **1646P/0F/37I**（EXIT 0）。numstat `vad.rs` 200/13。
+- **未改版本 / 未 push / 未 build release / 零凭证**。
+
+## 2026-09-23 — FIX-GATE-TIMING-ONLY-392（coder-2，✅ 阶段一交付）
+
+- **需求**（Gavin BUILD-390）：「说一半卡住、只出前半段」根因修复。
+- **根因**：门结果 `has_speech` 同时驱动时序与**内容去留** ⇒ 门误判（偶数上中位锁死 level）就丢录音人内容（342 丢流式 + 298 不派发）。
+- **改动（仅 `local_stream.rs`）**：时序用 `has_speech`、内容去留改用 `vad_speech`；`estimate` 偶数取下中位；首段不学习；埋点 `learned=`/`vad_only_speech_chunks`；VAD 不可用兜底逐位同 384。
+- **单测**：新增 `gate392_*` 4 条 + 改写 8 条（392 契约变更：首段不学习⇒就绪需 3 段 / 下中位 / vad_speech 取值）。
+- **验证**：fmt EXIT 0 ｜ check 0 error、warnings 97/88=基线 ｜ 全量 test **0 failed**（bin 1562P/35I）｜ numstat==-w。
+- **未验证**：实机端测（不再中途卡住 / 预览与最终完整 / `segment end learned=` / `vad_only_speech_chunks`）交 tester-1/Gavin。
+- **未改版本 / 未 push / 零凭证**；未改 `docs/MACOS-HANDOFF.md`（结论交主控合入）。

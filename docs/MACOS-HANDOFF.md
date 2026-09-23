@@ -2225,3 +2225,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 根因属 sherpa `voice-activity-detector.cc` 的「大 n」语义陷阱（非本仓库平台差异） | ✅ 同模型同结论 |
 | 新增单测 `vad391_*`（1 纯 + 2 `#[ignore]` 真模型） | ✅ 平台中立、无 `#[cfg]`；macOS 同跑（`#[ignore]` 默认不跑） |
 | macOS 侧需要做什么 | ✅ **无需代码改动**；未新增用户开关/env（DEC-031）、未触 `src/platform/macos/**`、未改构建脚本/依赖 |
+
+## FIX-VAD-FEED-BY-WINDOW-391 补充 + FIX-GATE-TIMING-ONLY-392（2026-09-23，coder-2；主控合入）—— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| 近场门只管时序：静默计时与「本轮停顿已派发」复位看过门判定；「本句文字保留 / 本段要派发」看 VAD | 门误判不再丢录音人内容（BUILD-390 卡住吞字） | 平台中立，macOS 同吃 |
+| 录音人音量估计：偶数样本取下中位；每次录音首个确认段不学习 | 首句按键声 / 起音不再把门限抬高 | 同上 |
+
+无新平台 API / 依赖 / 构建脚本变化。
