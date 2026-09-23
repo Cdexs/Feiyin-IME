@@ -1257,3 +1257,22 @@ load_wordbook_vocabulary()
 | 三特殊点 | ① dll 四张三副本全等 + onnxruntime 1.28.2；② itn-rules 三副本全等；③ Publish/models 1.7B 七文件与源逐一 sha256 全等（0.6B 保留） |
 | 探针 | 正：`[LocalRT-DBG-382]`=3 / `stop_to_processing_ms`=1 / `reflow suppressed after processing`=1 / `[LocalRT-DBG-384]`=4 / `[LocalRT-DBG-385]`=2；反：无（本批未删字面量） |
 | 端测 | 🔴 **Step1 强杀输入法 ⇒ 请重启后端测**；重点：① 384 静默判定改 VAD（停顿切片更贴语义）；② 385 近场门挡背景人声（录音人优先，背景人声不触发）；③ 382 松键立即「识别处理中」不闪回 + 回灌立即刷新；④ 吃字/重复字；⑤ 长录音 300s；⑥ 不新增 crash.json |
+
+## FIX-TAIL-WINDOW-AND-FALLBACK-386 · 组窗末片延后/收尾短尾合并 + 回灌合成 + 失败窗流式兜底（阶段一·只改 `main.rs`）· 2026-09-23 · coder-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 仅 `src/main.rs`。**A**：`plan_windows` 重写为 `WindowPlan{windows,pending}`（单片立刻 / ≥2 片末片延后 / 下次派发强制含 pending 可超 10s / 松键收尾 <3s 合并前片重解、否则单独）；滑窗线程接计划 + `dispatch_window!` 宏。**B**：回灌渲染改 `compose_reflow_preview`（= `compose_with_acc_for_gen`），删 `reflow_preview_367`。**C**：失败/空窗用流式文本兜底 |
+| 回归 | root `cargo test --no-fail-fast` **1608P/0F/34I**（EXIT 0）；`cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**；warnings **97/88** = 基线 |
+| NEW | `plan_windows_386_tests` 8（含覆盖不变量随机性质）+ `fix386_tests` 2；更新 `testsync382_tests` 3 条与 `testsync371` 锚点（不放宽） |
+| 端测 | 🔴 待 tester-1 阶段四回归 + 出包 + Gavin 端测：①一口气 >10s 不再念「维生素b12」/丢前文；②结尾不再缺字/冒 `<location>`；③预览中途不再闪回更短文本；④松键短尾与前一并重解 |
+
+## FIX-ACC-OUTPUT-GUARD-AND-GATE-SMOOTH-387（阶段一·交付）· 2026-09-23 · coder-2
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | D 解码输出守卫（`transcription/mod.rs`）：回显命中不再保留残余、直接不带注入重解；残余全词表视同回显；标签 `<[A-Za-z_/][^<>]{0,30}>` 剥后空/只剩标点 ⇒ 重解（有正文只剥标签）；空 ⇒ 重解；重解无效 ⇒ 空 + `[LocalRT-DBG-387]` warn。E 近场门改 300ms 平滑音量（O(1) 滑动窗口 RMS），修 BUILD-385 误挡 ~70%；兜底逐位同 384 |
+| 文件 | `src/transcription/mod.rs` / `src/transcription/local_stream.rs`（🔴 未改 main.rs） |
+| 单测 | 新增 6 条（`fix387_*` 5 + `ts387_smoothed_volume_*`），384/385 兜底适配签名 |
+| 验证 | `cargo fmt --check` EXIT 0 ｜ check 0 error、warnings 88=基线 ｜ 全量 test 0 failed（bin 1520P/32I）｜ numstat==-w |
+| 下一步 | 阶段三 TEST-SYNC（非作者）→ 阶段四 TEST-EXEC → 出包；端测盯 `[DBG-387]` / `nearfield summary` gated 比例 |

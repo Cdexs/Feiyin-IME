@@ -482,13 +482,15 @@ fn localrt_vad_session(model_dir: &Path) -> MutexGuard<'static, LocalRtVadCache>
 
 /// LOCALRT-VAD-SILENCE-384 / LOCALRT-NEARFIELD-GATE-385：本 chunk「是否有人声」的**唯一判定**。
 ///
-/// VAD 可用 ⇒ `feed_is_speech`（silero）再过**近场音量门**（385）；不可用 ⇒ 退回**音量阈值**
+/// VAD 可用 ⇒ `feed_is_speech`（silero）再过**近场音量门**（385/387）；不可用 ⇒ 退回**音量阈值**
 /// （口径与 384 逐位相同，**不加近场门**）。返回 `(最终 has_speech, VAD 原始 vad_speech)`。
+/// 🔴 387：VAD 分支的门比较与 level 学习用 `smooth_rms`（300ms 平滑）；兜底分支仍用原始 `chunk_rms`。
 /// 🔴 显示层打点 / acc 派发 / 影子 / 端点 / 337 边界 b **全部**用同一个 `has_speech`，不许分叉。
 fn chunk_has_speech(
     vad: Option<&VadSegmenter>,
     chunk: &[f32],
     chunk_rms: f32,
+    smooth_rms: f32,
     chunk_ms: f32,
     now_ms: f32,
     silence_threshold: f32,
@@ -497,7 +499,7 @@ fn chunk_has_speech(
     match vad {
         Some(v) => {
             let vad_speech = v.feed_is_speech(chunk);
-            let has_speech = vad_branch_decision(vad_speech, chunk_rms, chunk_ms, now_ms, level);
+            let has_speech = vad_branch_decision(vad_speech, smooth_rms, chunk_ms, now_ms, level);
             ChunkJudgment {
                 has_speech,
                 vad_speech,
@@ -537,6 +539,59 @@ const NEARFIELD_WARMUP_SECS: f32 = 1.0;
 /// 取偏宽值 0.25：远处人声通常比近场低 −10~−20dB（≈0.1~0.32 倍），0.25 落在其下沿，
 /// 以免把录音人的轻声字误判成静默（宁可放进一点背景，也不吞录音人的字）。
 const NEARFIELD_RATIO: f32 = 0.25;
+
+/// LOCALRT-NEARFIELD-GATE-387（E）：近场门比较与学习所用的**平滑音量窗口**（毫秒）。
+///
+/// 根因：BUILD-385 端测 chunk=10ms，逐 10ms 原始 RMS 在一句话内随辅音/字缝剧烈波动
+/// （被挡 chunk RMS≈0.009 vs level 0.04~0.09 ⇒ 误挡约 70%）⇒ 门与 level 都必须用**平滑值**。
+/// 取 300ms：覆盖约 1~2 个音节周期，既抹平字缝又不至于跨句滞后。
+const NEARFIELD_SMOOTH_MS: f32 = 300.0;
+
+/// LOCALRT-NEARFIELD-GATE-387（E）：滑动窗口 RMS（O(1) 增量）。
+///
+/// 维护最近 `NEARFIELD_SMOOTH_MS` 内 chunk 的能量和与样本数：`rms = sqrt(Σx² / Σn)`。
+/// 只做增量加减，无排序/无重扫；窗口未满时即用当前已入部分（前 300ms 渐进预热）。
+struct EnergySmoother {
+    win: std::collections::VecDeque<(f64, u64, f32)>, // (能量和, 样本数, ms)
+    sum_sq: f64,
+    n: u64,
+    ms: f32,
+}
+
+impl EnergySmoother {
+    fn new() -> Self {
+        Self {
+            win: std::collections::VecDeque::new(),
+            sum_sq: 0.0,
+            n: 0,
+            ms: 0.0,
+        }
+    }
+
+    /// 推入一个 chunk 的能量和/样本数/时长，返回**更新后**的平滑 RMS。
+    fn push(&mut self, sum_sq: f64, n: u64, chunk_ms: f32) -> f32 {
+        self.win.push_back((sum_sq, n, chunk_ms));
+        self.sum_sq += sum_sq;
+        self.n += n;
+        self.ms += chunk_ms;
+        while self.ms > NEARFIELD_SMOOTH_MS {
+            match self.win.pop_front() {
+                Some((s, c, m)) => {
+                    self.sum_sq -= s;
+                    self.n = self.n.saturating_sub(c);
+                    self.ms -= m;
+                }
+                None => break,
+            }
+        }
+        if self.n == 0 {
+            0.0
+        } else {
+            // 主控验收补：长时间加减的浮点累计误差可使 sum_sq 落为极小负数 ⇒ sqrt 得 NaN ⇒ 门比较失效。钳到 ≥0。
+            (self.sum_sq.max(0.0) / self.n as f64).sqrt() as f32
+        }
+    }
+}
 
 /// LOCALRT-NEARFIELD-GATE-385：录音人音量估计（**每次录音新建**，不跨录音）。
 ///
@@ -621,9 +676,12 @@ fn nearfield_gate(vad_speech: bool, ready: bool, level: f32, chunk_rms: f32, rat
 ///
 /// 🔴 `now_ms` = 会话已处理音频毫秒数（chunk 时长累加）：判门前先 `prune(now_ms)` 按会话时间
 /// 过期旧样本 ⇒ 录音人中途降音量不再导致 level 永久锁死（最坏 30s 后重开门、重新热身）。
+///
+/// 🔴 387（E）：`smooth_rms` 必须是**平滑音量**（最近 300ms 滑动窗口 RMS）——门比较与 level 学习
+/// 都用它，避免逐 10ms 原始 RMS 的字缝波动造成 ~70% 误挡。
 fn vad_branch_decision(
     vad_speech: bool,
-    chunk_rms: f32,
+    smooth_rms: f32,
     chunk_ms: f32,
     now_ms: f32,
     level: &mut NearFieldLevel,
@@ -633,11 +691,11 @@ fn vad_branch_decision(
         vad_speech,
         level.is_ready(),
         level.estimate(),
-        chunk_rms,
+        smooth_rms,
         NEARFIELD_RATIO,
     );
     if pass {
-        level.push(chunk_rms, now_ms, chunk_ms);
+        level.push(smooth_rms, now_ms, chunk_ms);
     }
     pass
 }
@@ -714,6 +772,8 @@ pub fn transcribe_streaming_local(
     let mut prev_vad_speech = false;
     let mut prev_gated = false;
     let mut nearfield = NearFieldLevel::new();
+    // LOCALRT-NEARFIELD-GATE-387（E）：近场门用的**平滑音量**（最近 300ms 滑动窗口 RMS）。
+    let mut energy_smoother = EnergySmoother::new();
     // LOCALRT-NEARFIELD-GATE-385：会话已处理音频毫秒数（chunk 时长累加，不用系统时钟）——
     // 近场门窗口按此过期。
     let mut session_ms = 0.0f32;
@@ -826,7 +886,11 @@ pub fn transcribe_streaming_local(
         // 本 chunk「是否有人声」—— VAD 可用走 silero + 近场音量门，不可用退回音量阈值。
         // 🔴 显示层打点、acc 派发、影子、端点、337 边界 b **全部**用这同一个判定。
         let chunk_ms = chunk.len() as f32 / SAMPLE_RATE as f32 * 1000.0;
-        let chunk_rms = (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32).sqrt();
+        // 387（E）：能量和（= 原 chunk_rms 的分子，保持 chunk_rms 逐位不变），并推入 300ms 平滑窗。
+        let chunk_energy_sum: f32 = chunk.iter().map(|s| s * s).sum::<f32>();
+        let chunk_rms = (chunk_energy_sum / chunk.len() as f32).sqrt();
+        let smooth_rms =
+            energy_smoother.push(chunk_energy_sum as f64, chunk.len() as u64, chunk_ms);
         // 385：会话音频时间（本 chunk 结束时刻）；供近场门窗口按时间过期。
         session_ms += chunk_ms;
         let t_vad0 = Instant::now();
@@ -834,6 +898,7 @@ pub fn transcribe_streaming_local(
             session_vad,
             &chunk,
             chunk_rms,
+            smooth_rms,
             chunk_ms,
             session_ms,
             silence_threshold,
@@ -1451,8 +1516,8 @@ mod tests {
         build_dispatch_segment, chunk_has_speech, endpoint_action, endpoint_confirm_text,
         local_stream_num_threads, localrt_vad_seed_ms, nearfield_gate, punct_cache_reuse,
         segment_streaming_text, should_dispatch_acc, should_dispatch_tail,
-        should_repunctuate_preview, vad_branch_decision, EndpointAction, NearFieldLevel,
-        LOCALRT_VAD_MIN_SILENCE_SECS, NEARFIELD_RATIO, SAMPLE_RATE,
+        should_repunctuate_preview, vad_branch_decision, EndpointAction, EnergySmoother,
+        NearFieldLevel, LOCALRT_VAD_MIN_SILENCE_SECS, NEARFIELD_RATIO, SAMPLE_RATE,
     };
 
     /// LOCALRT-REFLOW-HOLE-344-G：片段流式文本按**字符**切片，绝不字节切片（中文安全、不 panic）。
@@ -2441,7 +2506,7 @@ mod tests {
                 .map(|i| if i % 2 == 0 { amp } else { -amp })
                 .collect();
             let rms = (chunk.iter().map(|s| s * s).sum::<f32>() / 1600.0).sqrt();
-            let j = chunk_has_speech(None, &chunk, rms, 100.0, 100.0, THR, &mut lv);
+            let j = chunk_has_speech(None, &chunk, rms, rms, 100.0, 100.0, THR, &mut lv);
             assert_eq!(
                 j.has_speech,
                 rms > THR,
@@ -2451,7 +2516,7 @@ mod tests {
         }
         let chunk = vec![THR; 1600];
         assert!(
-            !chunk_has_speech(None, &chunk, THR, 100.0, 100.0, THR, &mut lv).has_speech,
+            !chunk_has_speech(None, &chunk, THR, THR, 100.0, 100.0, THR, &mut lv).has_speech,
             "rms 恰为阈值 ⇒ false（> 而非 >=）"
         );
     }
@@ -2772,8 +2837,26 @@ mod tests {
             // rms / threshold ∈ [0, 0.2)，步进 0.0001 ⇒ 覆盖大量相等与贴边。
             let rms = (rng.next() % 2000) as f32 / 10_000.0;
             let thr = (rng.next() % 2000) as f32 / 10_000.0;
-            let a = chunk_has_speech(None, empty, rms, 100.0, k as f32 * 100.0, thr, &mut lv_cold);
-            let b = chunk_has_speech(None, empty, rms, 100.0, k as f32 * 100.0, thr, &mut lv_hot);
+            let a = chunk_has_speech(
+                None,
+                empty,
+                rms,
+                rms,
+                100.0,
+                k as f32 * 100.0,
+                thr,
+                &mut lv_cold,
+            );
+            let b = chunk_has_speech(
+                None,
+                empty,
+                rms,
+                rms,
+                100.0,
+                k as f32 * 100.0,
+                thr,
+                &mut lv_hot,
+            );
             assert_eq!(
                 a.has_speech,
                 rms > thr,
@@ -2791,9 +2874,15 @@ mod tests {
         }
         // 精确相等（rms == thr）必须 false；阈值上/下一档分别为 true。
         let mut lv = NearFieldLevel::new();
-        assert!(!chunk_has_speech(None, empty, 0.125, 100.0, 0.0, 0.125, &mut lv).has_speech);
-        assert!(chunk_has_speech(None, empty, 0.1251, 100.0, 0.0, 0.125, &mut lv).has_speech);
-        assert!(!chunk_has_speech(None, empty, 0.1249, 100.0, 0.0, 0.125, &mut lv).has_speech);
+        assert!(
+            !chunk_has_speech(None, empty, 0.125, 0.125, 100.0, 0.0, 0.125, &mut lv).has_speech
+        );
+        assert!(
+            chunk_has_speech(None, empty, 0.1251, 0.1251, 100.0, 0.0, 0.125, &mut lv).has_speech
+        );
+        assert!(
+            !chunk_has_speech(None, empty, 0.1249, 0.1249, 100.0, 0.0, 0.125, &mut lv).has_speech
+        );
     }
 
     /// #2 近场门开关：未就绪一律放行；就绪后 `level=1.0` 下 **0.26 放行 / 0.24 挡住**（ratio=0.25 两侧）；
@@ -2967,5 +3056,48 @@ mod tests {
         assert_eq!(localrt_vad_seed_ms(), 300.0);
         // 场景 C：VAD 不可用（vad_on=false）⇒ 即便 prev_vad=true 也不补（逐位同 384）。
         assert!((step(false, true, false, false, 0.0) - chunk_ms).abs() < 1e-3);
+    }
+
+    /// #387（E）平滑音量：录音人「音节 150ms 高能 + 字缝 50ms 低能」语音（VAD 全真）就绪后
+    /// 被挡比例 < 5%；背景人声（平滑音量 0.1×level）仍被挡。
+    #[test]
+    fn ts387_smoothed_volume_not_gated_for_syllabic_speech() {
+        let mut sm = EnergySmoother::new();
+        let mut lv = NearFieldLevel::new();
+        let mut now = 0.0f32;
+        // 录音人音节语音：周期 20×10ms = 15 高能(0.3) + 5 低能字缝(0.03)，共 5s。
+        let mut gated = 0usize;
+        let mut total = 0usize;
+        for i in 0..500usize {
+            let high = (i % 20) < 15;
+            let amp = if high { 0.3f32 } else { 0.03f32 };
+            let energy = (amp * amp) * 160.0; // 160 样本 × amp²
+            let smooth = sm.push(energy as f64, 160, 10.0);
+            now += 10.0;
+            let passed = vad_branch_decision(true, smooth, 10.0, now, &mut lv);
+            if now > 1000.0 {
+                total += 1;
+                if !passed {
+                    gated += 1;
+                }
+            }
+        }
+        assert!(lv.is_ready(), "5s 应已就绪");
+        let ratio = gated as f32 / total.max(1) as f32;
+        assert!(ratio < 0.05, "音节语音被挡比例应 <5%，实测 {ratio:.3}");
+
+        // 背景人声：平滑音量 0.1×level ⇒ 仍被挡。
+        let level = lv.estimate();
+        let bg_amp = level * 0.1;
+        let mut bg_gated = false;
+        for _ in 0..120usize {
+            let energy = (bg_amp * bg_amp) * 160.0;
+            let smooth = sm.push(energy as f64, 160, 10.0);
+            now += 10.0;
+            if !vad_branch_decision(true, smooth, 10.0, now, &mut lv) {
+                bg_gated = true;
+            }
+        }
+        assert!(bg_gated, "背景人声（0.1×level）应被挡");
     }
 }

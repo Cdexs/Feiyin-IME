@@ -398,7 +398,34 @@ pub(crate) fn acc_avg_chars_per_sec(
     }
 }
 
-/// 统一处置阶梯的结果（供埋点：374 + 375）。
+/// FIX-ACC-OUTPUT-GUARD-387：处置阶梯的**触发类别**（供埋点 `kind=`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GuardKind {
+    /// 未触发任何守卫（正常保留）。
+    None,
+    /// 词条回显（374 命中）/ 剥后残余全为词表条目。
+    Echo,
+    /// 标签输出（剥后为空 / 只剩标点）。
+    Tag,
+    /// 空输出（含只剩标点）。
+    Empty,
+    /// 375 产出率坍塌。
+    Collapse,
+}
+
+impl GuardKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            GuardKind::None => "none",
+            GuardKind::Echo => "echo",
+            GuardKind::Tag => "tag",
+            GuardKind::Empty => "empty",
+            GuardKind::Collapse => "collapse",
+        }
+    }
+}
+
+/// 统一处置阶梯的结果（供埋点：374 + 375 + 387）。
 pub(crate) struct AccDispositionOutcome {
     /// 匹配到的**连续**注入词条数（0 = 无回显）。
     pub matched_terms: usize,
@@ -410,21 +437,102 @@ pub(crate) struct AccDispositionOutcome {
     pub redecoded: bool,
     /// 是否因**产出率坍塌**触发（375）—— 与 374 的「剥空触发」区分开，便于端测判断。
     pub collapse: bool,
+    /// FIX-ACC-OUTPUT-GUARD-387：本次处置的**触发类别**（供埋点 `kind=`）。
+    pub guard: GuardKind,
+    /// FIX-ACC-OUTPUT-GUARD-387：重解后仍无效（已返回空串）。
+    pub invalid: bool,
 }
 
-/// FIX-TERMS-ECHO-374 + 375（B）：**统一的处置阶梯**（一套实现，两个判据）。
+/// FIX-ACC-OUTPUT-GUARD-387：文本是否**只剩标点/空白**（`align_keep_char` 全为假）。
+fn is_only_punct(text: &str) -> bool {
+    !text.chars().any(align_keep_char)
+}
+
+/// FIX-ACC-OUTPUT-GUARD-387：剥掉结果里的**标签** `<[A-Za-z_/][^<>]{0,30}>`（如 `<location>`）。
 ///
-/// 第一轮：词条回显**结构性**剥离（374）。
-/// 需要重解的两条路径（**至多一次、必须不带注入**）：
-/// - 374 阶梯 2：剥完**为空**（整窗都是回显）—— 端测现场该窗含 **10.45s 真实语音**，整窗丢弃不可接受；
-/// - 375：**产出率坍塌**（`matched == 0` 时判，见下）。
+/// 🔴 371 的 `<asr_text>` 前缀剥离更早（`decode_accuracy_once` → `strip_asr_special_tokens`）；
+/// 本函数是其后方的**通用兜底**，不改 371 逻辑。返回 `(剥后文本, 是否剥到过)`。
+fn strip_angle_tags(text: &str) -> (String, bool) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut hit = false;
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '<' {
+            // 首字符须为 `[A-Za-z_/]`；内部无 `<`/`>`；总长（不含尖括号）1..=31；以 `>` 收尾。
+            let mut j = i + 1;
+            let mut closed = false;
+            while j < chars.len() && (j - i) <= 31 {
+                match chars[j] {
+                    '>' => {
+                        closed = true;
+                        break;
+                    }
+                    '<' => break,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if closed && j > i + 1 {
+                let first = chars[i + 1];
+                if first.is_ascii_alphabetic() || first == '_' || first == '/' {
+                    hit = true;
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    (out, hit)
+}
+
+/// FIX-ACC-OUTPUT-GUARD-387：`text` 是否**全部由词表条目构成**（按列表分隔符切分后每段都在词表里）。
 ///
-/// 重解结果校验：非空 **且** 产出率通过 ⇒ 用它；否则 ⇒ **空串**（上层 `push_inner` 的
-/// `text.is_empty()` 分支：只推进 `next`、不污染 `last_window_text`、不制造假重叠）。
+/// 用于识别「374 剥完的残余」（如末尾落单的 `维生素b12`）：残余虽不足连续 4 条，但只要**整段
+/// 都是词表条目**即视为回显残余。空文本 / 无词表 / 任一段不在词表 ⇒ `false`。
+fn all_segments_are_terms(text: &str, terms: Option<&str>) -> bool {
+    let Some(terms) = terms else {
+        return false;
+    };
+    let set: Vec<Vec<char>> = terms
+        .split(',')
+        .map(|t| {
+            t.chars()
+                .filter(|c| align_keep_char(*c))
+                .collect::<Vec<char>>()
+        })
+        .filter(|t: &Vec<char>| !t.is_empty())
+        .collect();
+    if set.is_empty() {
+        return false;
+    }
+    let mut any = false;
+    for raw in text.split(is_list_separator) {
+        let seg: Vec<char> = raw.chars().filter(|c| align_keep_char(*c)).collect();
+        if seg.is_empty() {
+            continue;
+        }
+        any = true;
+        if !set.iter().any(|t| t == &seg) {
+            return false;
+        }
+    }
+    any
+}
+
+/// FIX-TERMS-ECHO-374 + 375（B）+ FIX-ACC-OUTPUT-GUARD-387：**统一的处置阶梯**（一套实现，多个判据）。
 ///
-/// 🔴 375 的坍塌判据**只在未发生词条回显时启用**（`matched == 0`）：一旦剥离过回显，产出率偏低
-///    已有已知解释（模型把预算花在背词条上）⇒ 不再叠加坍塌判据，避免多触发一次重解。
-/// 🔴 剥完**还有内容**且未判坍塌 ⇒ 直接用剩余文本、**不重解**（避免把低频事件变常态开销）。
+/// 触发 ⇒ **不带注入重解一次**（至多一次，不得循环）。触发类别（优先级）：
+/// - `Echo`（387-1/2）：374 连续 ≥4 条命中，**或**剥离后残余**全部由词表条目构成**
+///   ⇒ 不再保留残余（残余正是 `维生素b12` 漏进正文的成因）⇒ 重解；重解结果若仍含连续 ≥4 条 ⇒ 无效。
+/// - `Tag`（387-3）：含标签 `<[A-Za-z_/][^<>]{0,30}>`（如 `<location>`）剥后为空 / 只剩标点 ⇒ 重解。
+/// - `Empty`（387-4）：输出为空 / 只剩标点 ⇒ 重解。
+/// - `Collapse`（375）：产出率坍塌 ⇒ 重解（**仅在未回显时启用**，原约束不变）。
+///
+/// 重解结果校验：非空 **且** 无连续 ≥4 条词条回显 **且**（非坍塌触发 或 产出率通过）⇒ 用它；
+/// 否则 ⇒ 返回空串（由 386-C 用流式文本兜底；`outcome.invalid=true`）。
 fn apply_acc_disposition(
     text: String,
     terms: Option<&str>,
@@ -432,46 +540,67 @@ fn apply_acc_disposition(
     avg_chars_per_sec: Option<f32>,
     redecode: impl FnOnce() -> Result<String>,
 ) -> (String, AccDispositionOutcome) {
-    // 第一轮：词条回显剥离（374）
-    let (stripped, matched_terms, removed_chars) = match strip_terms_echo(&text, terms) {
+    // 387-3：先剥标签（通用兜底）。
+    let (after_tags, had_tag) = strip_angle_tags(&text);
+    // 374：词条回显剥离（结构性）。
+    let (stripped, matched_terms, removed_chars) = match strip_terms_echo(&after_tags, terms) {
         Some(h) => (h.stripped, h.matched_terms, h.removed_chars),
-        None => (text, 0usize, 0usize),
+        None => (after_tags, 0usize, 0usize),
     };
     let remaining_chars = stripped.chars().count();
+    let only_punct = is_only_punct(&stripped);
+    // 387-2：残余**全部由词表条目构成** ⇒ 视同回显。
+    let residual_all_terms =
+        !stripped.trim().is_empty() && all_segments_are_terms(&stripped, terms);
+    let echo_hit = matched_terms > 0 || residual_all_terms;
+
     let mut outcome = AccDispositionOutcome {
         matched_terms,
         removed_chars,
         remaining_chars,
         redecoded: false,
         collapse: false,
+        guard: GuardKind::None,
+        invalid: false,
     };
-    if matched_terms > 0 {
-        if remaining_chars > 0 {
-            return (stripped, outcome); // 374 阶梯 1：还有真内容 ⇒ 直接用
-        }
-        // 374 阶梯 2：整窗都是回显 ⇒ 落下去重解
-    } else if output_rate_ok(remaining_chars, audio_secs, avg_chars_per_sec) {
-        return (stripped, outcome); // 产出率正常 ⇒ 直接用
+
+    let trigger = if echo_hit {
+        Some(GuardKind::Echo)
+    } else if had_tag && only_punct {
+        Some(GuardKind::Tag)
+    } else if only_punct {
+        Some(GuardKind::Empty)
+    } else if !output_rate_ok(remaining_chars, audio_secs, avg_chars_per_sec) {
+        Some(GuardKind::Collapse)
     } else {
-        outcome.collapse = true; // 375：坍塌 ⇒ 落下去重解
-    }
-    // 公共：不带注入重解**一次**（带注入可能再次回显；不得循环）
-    outcome.redecoded = true;
-    let recovered = match redecode() {
-        Ok(t) => strip_terms_echo(&t, terms).map(|h| h.stripped).unwrap_or(t), // 防御性再剥
-        Err(_) => String::new(),
+        None
     };
-    // 验收（按**触发者**取对应口径）：
-    // - 375 坍塌触发 ⇒ 必须**通过产出率判据**（任务书明文），否则按空处理；
-    // - 374 剥空触发 ⇒ **非空即用**（补充明文「重解结果非空 ⇒ 用它」）——不叠加产出率判据，
-    //   否则「用户真的只说了一两个短词 + 模型把预算花在背词条上」这种真实短转写会被误丢（丢字 P0）。
+
+    let Some(kind) = trigger else {
+        return (stripped, outcome); // 正常 ⇒ 直接用（不重解）
+    };
+    outcome.guard = kind;
+    outcome.collapse = kind == GuardKind::Collapse;
+    // 公共：不带注入重解**一次**（带注入可能再次回显；不得循环）。
+    outcome.redecoded = true;
+    let raw = redecode().unwrap_or_default();
+    // 防御性再剥（标签 + 词条）。
+    let (re_tags, _) = strip_angle_tags(&raw);
+    let recovered = match strip_terms_echo(&re_tags, terms) {
+        Some(h) => h.stripped,
+        None => re_tags,
+    };
+    // 校验：非空 + 无连续 ≥4 条回显 +（非坍塌触发或产出率通过）。
+    let still_echo = strip_terms_echo(&recovered, terms).is_some();
     let acceptable = !recovered.is_empty()
-        && (!outcome.collapse
+        && !still_echo
+        && (kind != GuardKind::Collapse
             || output_rate_ok(recovered.chars().count(), audio_secs, avg_chars_per_sec));
     if acceptable {
         (recovered, outcome)
     } else {
-        (String::new(), outcome) // 重解空 / 仍坍塌 ⇒ 按空解码处理
+        outcome.invalid = true;
+        (String::new(), outcome) // 重解仍无效 ⇒ 空解码（交给 386-C 流式兜底）
     }
 }
 
@@ -710,6 +839,29 @@ pub(crate) fn transcribe_acc_ctx(
                 None => "cold".to_string(),
             },
             action375
+        );
+    }
+    // FIX-ACC-OUTPUT-GUARD-387 埋点：每次判定一行（触发类别 + 动作）；重解后仍无效单独 warn。
+    if log::log_enabled!(log::Level::Debug) {
+        let action387 = if !disp.redecoded {
+            "keep"
+        } else if text.is_empty() {
+            "empty"
+        } else {
+            "redecode"
+        };
+        log::debug!(
+            "[LocalRT-DBG-387] guard: seq={} kind={} action={}",
+            seg_idx,
+            disp.guard.as_str(),
+            action387
+        );
+    }
+    if disp.invalid {
+        log::warn!(
+            "[LocalRT-DBG-387] window #{} invalid output after redecode: kind={}",
+            seg_idx,
+            disp.guard.as_str()
         );
     }
     Ok((text, true))
@@ -4976,23 +5128,20 @@ mod fix374_terms_echo_tests {
 
     // ---- FIX-TERMS-ECHO-374 补充：处置**阶梯**（纯函数，重解用闭包注入）----
 
-    /// 🔴 阶梯 1：剥完**还有内容** ⇒ 用剩余文本，**且绝不重解**（闭包一旦被调用即失败）。
+    /// 🔴 387 改判：374 命中（连续 ≥4 条）⇒ **不再保留残余**，一律不带注入重解一次
+    /// （残余 `维生素b12` 会漏进正文）；重解救回真实内容。
     #[test]
-    fn ladder_uses_remaining_and_never_redecodes() {
+    fn ladder_redecodes_on_echo_even_with_residual() {
         let text = format!("可以看看周边的风景。{INJ}");
-        let called = Cell::new(false);
+        let calls = Cell::new(0);
         let (out, oc) = apply_acc_disposition(text, Some(INJ), 11.8, Some(4.4), || {
-            called.set(true);
-            Ok("不应被调用".to_string())
+            calls.set(calls.get() + 1);
+            Ok("可以看看周边的风景。".to_string())
         });
-        assert!(
-            !called.get(),
-            "剥完还有内容时**不得**重解（避免低频事件变常态开销）"
-        );
-        assert_eq!(out, "可以看看周边的风景。");
+        assert_eq!(calls.get(), 1, "387：命中回显必须重解一次（不保留残余）");
+        assert_eq!(out, "可以看看周边的风景。", "用重解结果（残余已清）");
         assert_eq!(oc.matched_terms, 9);
-        assert_eq!(oc.remaining_chars, "可以看看周边的风景。".chars().count());
-        assert!(!oc.redecoded);
+        assert!(oc.redecoded);
     }
 
     /// 🔴 阶梯 2/3：整窗都是回显 ⇒ 剥空 ⇒ **不带注入重解一次** ⇒ 用重解结果（救回真实内容）。
@@ -5191,6 +5340,114 @@ mod fix375_collapse_tests {
         assert_eq!(out, real);
         assert!(!oc.collapse);
         assert!(!oc.redecoded);
+    }
+}
+
+// ============================================================
+// FIX-ACC-OUTPUT-GUARD-387：解码输出守卫（回显残余 / 标签 / 空）
+// 运行：cargo test --bin feiyin-ime -- fix387
+// ============================================================
+#[cfg(test)]
+mod fix387_output_guard_tests {
+    use super::{apply_acc_disposition, GuardKind};
+    use std::cell::Cell;
+
+    const INJ: &str = "你好,铭印,银线,朵洛莉丝,费曼学习法,子未穿害,低质,罗斯柴尔德,维生素b12";
+    const FULL_ECHO: &str =
+        "你好，铭印，银线，朵洛莉丝，费曼学习法，子未穿害，低质，罗斯柴尔德，维生素b12";
+
+    /// 回显（连续 ≥4 条）⇒ 重解一次、用重解结果（残余不再保留）。
+    #[test]
+    fn guard_echo_redecodes_and_uses_recovered() {
+        let text = "可以看看周边的风景。你好，铭印，银线，朵洛莉丝".to_string();
+        let calls = Cell::new(0);
+        let (out, oc) = apply_acc_disposition(text, Some(INJ), 11.8, Some(4.4), || {
+            calls.set(calls.get() + 1);
+            Ok("可以看看周边的风景。".to_string())
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(out, "可以看看周边的风景。");
+        assert_eq!(oc.guard, GuardKind::Echo);
+        assert!(oc.redecoded && !oc.invalid);
+    }
+
+    /// 残余**全部由词表条目构成**（如落单的 `维生素b12`）⇒ 视同回显、重解；
+    /// 重解若吐回同一条词（非 ≥4 条）⇒ 仍采用（不误丢真人内容）。
+    #[test]
+    fn guard_residual_all_terms_triggers_redecode() {
+        let calls = Cell::new(0);
+        let (out, oc) =
+            apply_acc_disposition("维生素b12".to_string(), Some(INJ), 1.0, None, || {
+                calls.set(calls.get() + 1);
+                Ok("维生素b12".to_string())
+            });
+        assert_eq!(calls.get(), 1, "残余全词表 ⇒ 必须重解");
+        assert_eq!(out, "维生素b12", "重解非空且无 ≥4 连条 ⇒ 采用");
+        assert_eq!(oc.guard, GuardKind::Echo);
+        assert!(!oc.invalid);
+    }
+
+    /// 标签：`<location>` 剥后为空/只剩标点 ⇒ 重解；含正文的标签 ⇒ 只剥标签、保留正文、不重解。
+    #[test]
+    fn guard_tag_only_redecodes_but_tag_with_text_keeps() {
+        // (a) 标签是唯一内容（连同标点）⇒ Tag 触发重解
+        let calls = Cell::new(0);
+        let (out, oc) =
+            apply_acc_disposition("。。<location>".to_string(), None, 5.0, None, || {
+                calls.set(calls.get() + 1);
+                Ok("这是真实内容".to_string())
+            });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(out, "这是真实内容");
+        assert_eq!(oc.guard, GuardKind::Tag);
+        // (b) 标签 + 正文 ⇒ 剥标签、保留正文、不重解
+        let called = Cell::new(false);
+        let (out2, oc2) = apply_acc_disposition(
+            "规划会议很难得。<location>".to_string(),
+            None,
+            5.0,
+            None,
+            || {
+                called.set(true);
+                Ok("x".to_string())
+            },
+        );
+        assert!(!called.get(), "有正文时不得重解");
+        assert_eq!(out2, "规划会议很难得。");
+        assert_eq!(oc2.guard, GuardKind::None);
+    }
+
+    /// 空 / 只剩标点 ⇒ Empty 触发重解。
+    #[test]
+    fn guard_empty_redecodes() {
+        let calls = Cell::new(0);
+        let (out, oc) = apply_acc_disposition("。".to_string(), None, 5.0, None, || {
+            calls.set(calls.get() + 1);
+            Ok("真实内容".to_string())
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(out, "真实内容");
+        assert_eq!(oc.guard, GuardKind::Empty);
+    }
+
+    /// 重解后仍无效（又吐整段回显）⇒ 返回空串 + `invalid=true`（**不循环**重解）。
+    #[test]
+    fn guard_invalid_after_redecode_returns_empty() {
+        let calls = Cell::new(0);
+        let (out, oc) = apply_acc_disposition(
+            format!("正文。{FULL_ECHO}"),
+            Some(INJ),
+            11.8,
+            Some(4.4),
+            || {
+                calls.set(calls.get() + 1);
+                Ok(FULL_ECHO.to_string()) // 无注入重解却仍吐整段词表
+            },
+        );
+        assert_eq!(calls.get(), 1, "不得循环重解");
+        assert_eq!(out, "");
+        assert!(oc.invalid);
+        assert_eq!(oc.guard, GuardKind::Echo);
     }
 }
 

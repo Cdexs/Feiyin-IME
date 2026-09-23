@@ -166,3 +166,22 @@
 - **结论**：**未发现生产缺陷** ⇒ 无停手项。
 - ⚠️ **说明**：三个静默计时分支内联在 `transcribe_streaming_local` 内（受 `guard346` 源码护栏约束不可抽函数）⇒ #4/#5 的计时推进按**契约三分支**复刻（同作者注释所承认）；判定类（兜底/门/门-未就绪）全部走**生产纯函数**。
 - **未改生产代码 / 未改版本 / 未 push / 零凭证**。
+
+## 2026-09-23 — coder-1 — FIX-TAIL-WINDOW-AND-FALLBACK-386 ✅ 交付（阶段一·只改 `main.rs`）
+
+- **背景**（Gavin BUILD-385）：① 常念「维生素b12」；② 结尾缺字+`<location>`；③ 预览中途闪回更短；④ 短尾应与前/后窗重组。
+- **A**：重写纯函数 `plan_windows(prev,new,base,pending,is_tail) -> WindowPlan{windows,pending}`：单片立刻组窗（含强制纳入 pending）；**≥2 片末片延后**；下次派发首个窗口起点强制 ≤ pending（可超 `WINDOW_MAX_SECS`）；松键收尾 pending <3s 且有前片 ⇒ `[p-1,p+1)` 重解前片、否则单独。滑窗线程新增 `pending_slice`/`recent_streaming`/`window_streaming_texts`/`last_dispatch_idx`/`last_committed_len`，`dispatch_window!` 宏统一派发（批次与收尾单一定义）；收尾在 `drop(task_tx)` 前。
+- **B**：`render_authoritative_reflow` 改用 `compose_reflow_preview`（= `compose_with_acc_for_gen`：acc 全文 + `streaming[committed_len..]`）；删 `reflow_preview_367`（replace_all 丢尾 ⇒ 截短闪回）与其 2 条旧单测。
+- **C**：窗口解码 Err/空 ⇒ `window_text_with_fallback` 用该窗流式文本兜底 + `[LocalRT-DBG-386]` warn；流式也空才空。
+- **单测**：新增 `plan_windows_386_tests` 8 + `fix386_tests` 2；**更新**（非放宽）`testsync382_tests` 的 3 条 plan_windows 用例与 `testsync371_window_counter_guard_tests::counters_are_pushed_together`（386 走宏后 `window_spans.push`/`window_samples.push` 仍**恰 1 处且相邻**，锚点改 `contains`+相邻断言）。
+- **验证**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**、warnings **97/88** = 基线；全量 `cargo test --no-fail-fast` **1608P/0F/34I**（EXIT 0）。numstat main 410/182（-w 404/176）。
+- **未改版本 / 未 push / 未 build release / 零凭证**。🔴 同日 `local_stream.rs`/`transcription/mod.rs` 属 coder-2 的 387，非本单。
+
+## 2026-09-23 — FIX-ACC-OUTPUT-GUARD-AND-GATE-SMOOTH-387（coder-2，✅ 阶段一交付）
+
+- **需求**（Gavin）：词条 `维生素b12` 漏进正文 / `<location>` 当正文 / 查其它 bug。
+- **改动**：`transcription/mod.rs`（D 输出守卫：回显一律重解不保留残余 / 残余全词表视同回显 / 标签守卫 / 空守卫 / 重解无效 ⇒ 空 + warn + `[DBG-387]` 埋点）；`local_stream.rs`（E 近场门改 300ms 平滑音量，O(1) `EnergySmoother`，门比较与 level 学习都用平滑值；兜底逐位同 384）。**未改 main.rs**。
+- **单测**：`fix387_output_guard_tests` 5 条 + `ts387_smoothed_volume_not_gated_for_syllabic_speech` PASS；384/385 兜底测试适配签名、断言不变。
+- **验证**：fmt EXIT 0 ｜ check 0 error、warnings 88=基线 ｜ 全量 test **0 failed**（bin 1520P/32I）｜ numstat==-w。🔴 过程：初期 386 在飞致树不可编译，按主控批示待命未动 main.rs；386 落地后复跑全绿。
+- **未验证**：实机端测（端测盯 `[DBG-387] guard`、`[DBG-385] nearfield summary` gated 比例回落）交 tester-1/Gavin。
+- **未改版本 / 未 push / 未 build release / 零凭证**。
