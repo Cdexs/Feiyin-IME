@@ -2147,3 +2147,14 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 20s 路径（`build_padded_segments`，离线 accuracy / VAD 分段） | 逐位不变 | 无 |
 
 无新平台 API、无依赖 / 构建脚本变化 ⇒ macOS 侧无需同步改动。
+
+## LOCALRT-VAD-SILENCE-384（2026-09-23，coder-2）· 本地 realtime 静默判定改 silero VAD（音量阈值兜底）—— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `src/transcription/vad.rs` 新增 `try_new_for_local_silence` / `feed_is_speech` + 常量 `LOCALRT_VAD_THRESHOLD=0.5` / `LOCALRT_VAD_MIN_SILENCE_SECS=0.3` / `LOCALRT_VAD_BUFFER_SECS=60` | 本地 realtime「是否有人声」由固定音量阈值（`rms > silence_threshold`）→ silero VAD 判定（阈值 0.5）；模型缺失/失败退回音量阈值（逐位同改前） | 平台中立纯逻辑，无 `cfg` 分支，macOS 同吃 |
+| `src/transcription/local_stream.rs`：进程级缓存 `LOCALRT_VAD_CACHE`（`OnceLock<Mutex<..>>`）+ `chunk_has_speech` 唯一判定 + 计时补偿 `localrt_vad_seed_ms` | 模型只加载一次、跨录音复用（每次 `reset` 状态）；显示打点 / acc 派发 / 影子 / 端点 / 337 边界 b 共用同一判定；「人声→无人声」转换 chunk 补记 min_silence(300ms) 使 1200ms 语义不变 | 同上；VAD 在 ASR 消费线程创建，不阻塞录音线程 |
+| 埋点（Debug 守卫，DEC-077） | `[LocalRT-DBG-384] silence detector=vad\|energy` / `speech=on\|off rms=..` / `vad cost: total_ms=.. chunks=.. max_chunk_ms=..` | 无 |
+| 🔴 不改 | `VadSegmenter::try_new` / `try_new_for_streaming` / `accept_and_check` / `VAD_THRESHOLD`·`VAD_STREAMING_THRESHOLD` 等既有常量 / `src/audio/mod.rs` 的 `speech_detected` / 在线流式 `qwen_inference.rs` | 其它管线零影响；`src/main.rs` **未改**（模型目录经 `transcription::model_dir()` 内部取，与 `try_new_for_streaming` 调用方同源、遵守 DEC-011） |
+
+无新平台 API、无依赖 / 构建脚本变化 ⇒ macOS 侧无需同步改动。

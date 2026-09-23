@@ -114,3 +114,12 @@
 - **验证（白名单）**：`cargo fmt --check` **EXIT 0**；`cargo check --all-targets` **0 error**、warnings **88** = 基线；numstat == -w（407/0）。🔴 **未跑 `cargo test`**（任务书禁止，首跑在阶段四）。
 - **结论**：**未发现生产缺陷**（NaN/全零无 panic；每轮切点 ≥ 起搜点 ⇒ 严格推进、无死循环）⇒ 无停手项。
 - **未改生产代码 / 未改版本 / 未 push / 零凭证**。
+
+## 2026-09-23 — LOCALRT-VAD-SILENCE-384（coder-2，✅ 阶段一交付：本地 realtime 静默判定改 VAD）
+
+- **需求**（Gavin）：环境背景有声音时音量阈值判静默失效 ⇒ 本地 realtime 改 silero VAD 判「有没有人声」，音量阈值兜底（方案 A）；调用方式须最优化。
+- **改动**：`vad.rs`（只新增：3 常量 + `try_new_for_local_silence` + `feed_is_speech`）；`local_stream.rs`（进程级缓存 `LOCALRT_VAD_CACHE` + 唯一判定 `chunk_has_speech` + 计时补偿 `localrt_vad_seed_ms` + 埋点 + 边界 b）；**`main.rs` 未改**（模型目录内部取 `transcription::model_dir()`）。
+- **单测**：`localrt_vad_feed_drains_queue_bounded`（#[ignore] 真模型 300s，队列恒空 + 对照不排空会累积，PASS）/ `localrt384_fallback_matches_energy_threshold` / `localrt384_seed_is_min_silence_ms` / `localrt384_silence_timing_seeds_then_accumulates` / `guard384_single_speech_judgment_via_chunk_has_speech`。
+- **验证**：fmt EXIT 0 ｜ check 0 error、warnings 88=基线 ｜ 全量 test **0 failed**（bin 1500P/32I）｜ numstat==-w。
+- **未验证**：实机噪声环境端测（`silence detector=vad` / `vad cost` / 1200ms 触发一致性）交 tester-1/Gavin。
+- **未改版本 / 未 push / 未 build release / 零凭证**。

@@ -72,6 +72,32 @@ const VAD_MIN_SILENCE_DURATION: f32 = 0.3;
 const VAD_MIN_SPEECH_DURATION: f32 = 0.1;
 const VAD_MAX_SPEECH_DURATION: f32 = SEGMENT_MAX_SECS as f32;
 
+// ===========================================================================
+// LOCALRT-VAD-SILENCE-384：**本地 realtime 静默判定**专用 silero VAD 配置
+//   （Gavin：环境有背景声时音量阈值判静默失效，改用 VAD 判「有没有人声」；
+//    VAD 缺失/失败退回原音量阈值兜底。只服务本地 realtime 管线，不动其它 VAD 用途。）
+// ===========================================================================
+
+/// LOCALRT-VAD-SILENCE-384：本地 realtime 静默判定专用 VAD 阈值。
+///
+/// 取 **0.5**（silero 标准值，同离线分段 `VAD_THRESHOLD`）：比在线门控的 `VAD_STREAMING_THRESHOLD`
+/// (0.3) 更不易被环境噪声触发 —— 本用途是「判是否有人声以计时静默」，误报「有人声」会让
+/// 1200ms 静默永不到达（正是本单要修的噪声环境病）⇒ 宁可保守。
+pub const LOCALRT_VAD_THRESHOLD: f32 = 0.5;
+
+/// LOCALRT-VAD-SILENCE-384：本地 realtime 专用 `min_silence_duration`（秒）。
+///
+/// 与既有 VAD 同值 0.3，但**独立命名**以便后续单独调；1200ms 计时补偿
+/// （`local_stream::localrt_vad_seed_ms`）引用本常量。
+pub const LOCALRT_VAD_MIN_SILENCE_SECS: f32 = 0.3;
+
+/// LOCALRT-VAD-SILENCE-384：本地 realtime 专用 VAD 环形缓冲秒数（`buffer_size_in_seconds`）。
+///
+/// 取值依据：本用途只查 `detected()`，且每个 chunk 把**已完成**段 `pop` 掉 ⇒ 缓冲只需容纳
+/// 「当前进行中的一段人声」。正常口述「连续 >60s 无 0.3s 停顿」已极罕见 ⇒ 取 **60s**
+/// （≈3.8MB @16k f32），而非既有的 300s（≈19.2MB）。
+pub const LOCALRT_VAD_BUFFER_SECS: f32 = 60.0;
+
 /// VAD 分段器（懒加载，仅 accuracy 长音频使用）
 pub struct VadSegmenter {
     detector: VoiceActivityDetector,
@@ -205,6 +231,62 @@ impl VadSegmenter {
     pub fn reset_for_new_session(&self) {
         self.detector.clear();
         self.detector.reset();
+    }
+
+    // ===========================================================================
+    // LOCALRT-VAD-SILENCE-384：本地 realtime 静默判定（只新增，不改既有方法/常量）
+    // ===========================================================================
+
+    /// LOCALRT-VAD-SILENCE-384：本地 realtime 静默判定专用工厂（silero，阈值 0.5）。
+    ///
+    /// 模型缺失/失败返回 `None` → 调用方退回**音量阈值**兜底。**只新增**：
+    /// 不改 `try_new`（离线分段）/ `try_new_for_streaming`（在线门控）的行为。
+    pub fn try_new_for_local_silence(model_dir: &Path) -> Option<Self> {
+        let vad_model = find_silero_vad_model(model_dir)?;
+        let config = VadModelConfig {
+            silero_vad: sherpa_onnx::SileroVadModelConfig {
+                model: vad_model.to_str().map(|s| s.to_string()),
+                threshold: LOCALRT_VAD_THRESHOLD,
+                min_silence_duration: LOCALRT_VAD_MIN_SILENCE_SECS,
+                min_speech_duration: VAD_MIN_SPEECH_DURATION,
+                window_size: VAD_WINDOW_SIZE,
+                max_speech_duration: VAD_MAX_SPEECH_DURATION,
+            },
+            ten_vad: sherpa_onnx::TenVadModelConfig::default(),
+            sample_rate: 16000,
+            num_threads: 1,
+            provider: Some("cpu".to_string()),
+            debug: false,
+        };
+        let detector = VoiceActivityDetector::create(&config, LOCALRT_VAD_BUFFER_SECS)?;
+        log::info!(
+            "VAD local-silence initialized (silero, threshold={}, min_silence={}s, buffer={}s, model={})",
+            LOCALRT_VAD_THRESHOLD,
+            LOCALRT_VAD_MIN_SILENCE_SECS,
+            LOCALRT_VAD_BUFFER_SECS,
+            vad_model.display()
+        );
+        Some(Self { detector })
+    }
+
+    /// LOCALRT-VAD-SILENCE-384：本地 realtime「本 chunk 是否有人声」——**整块喂入**。
+    ///
+    /// 调用方式最优化（Gavin 2026-09-23）：
+    /// - `accept_waveform` 对**整块** chunk 只调一次（sherpa 内部自带按 `window_size`=512 分窗的
+    ///   缓冲，Rust 侧**不**再切 512 小块多次跨 FFI）；
+    /// - 每 chunk 只调一次 `detected()`；
+    /// - 每 chunk 把**已完成**的语音段 `pop` 掉（只清段队列、**不 reset** 检测状态），
+    ///   使长录音（≤300s）内部段队列不增长（内存有界）。
+    ///
+    /// 供本地 realtime 静默计时使用；与在线门控的 `accept_and_check` 平行、互不影响。
+    pub fn feed_is_speech(&self, samples: &[f32]) -> bool {
+        self.detector.accept_waveform(samples);
+        let detected = self.detector.detected();
+        // 清掉本次已完成的段（队列有界：只保留进行中的段；不 reset 检测状态）。
+        while !self.detector.is_empty() {
+            self.detector.pop();
+        }
+        detected
     }
 }
 
@@ -1737,6 +1819,58 @@ mod tests {
             build_sliding_segments(&raw, total, &audio).len(),
             2,
             "滑窗路径：合并上限 10s ⇒ 16.00625s 不合并 ⇒ 2 段"
+        );
+    }
+
+    /// LOCALRT-VAD-SILENCE-384：`feed_is_speech` **整块喂入**且每 chunk 排空已完成段 ⇒
+    /// 长录音（300s）内部段队列**不增长**（内存有界）。需要 silero 模型 + full.wav。
+    #[test]
+    #[ignore = "requires silero model + full.wav; cargo test --bin feiyin-ime -- --ignored localrt_vad_feed_drains"]
+    fn localrt_vad_feed_drains_queue_bounded() {
+        let project_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let model_dir = project_root.join("models");
+        let seg = VadSegmenter::try_new_for_local_silence(&model_dir)
+            .expect("local-silence VAD (needs models/silero-vad/silero_vad.onnx)");
+        let wav = project_root.join("collab/research/audio-real-gavin/processed/full.wav");
+        let wave = sherpa_onnx::Wave::read(wav.to_str().expect("utf8")).expect("read full.wav");
+        let speech = wave.samples().to_vec();
+        assert!(!speech.is_empty(), "full.wav 应有样本");
+        // 300s：full.wav（~56s）循环拼接。
+        let target = 300 * 16_000usize;
+        let mut audio = Vec::with_capacity(target);
+        while audio.len() < target {
+            let remain = target - audio.len();
+            let n = remain.min(speech.len());
+            audio.extend_from_slice(&speech[..n]);
+        }
+
+        // 对照：不 pop 时段队列会累积（证明确有段产生，排空不是空转）。
+        let ctrl = VadSegmenter::try_new_for_local_silence(&model_dir).unwrap();
+        for c in audio.chunks(1600) {
+            ctrl.detector.accept_waveform(c);
+        }
+        assert!(
+            !ctrl.detector.is_empty(),
+            "对照：不排空时段队列应已累积（否则本测无鉴别力）"
+        );
+        ctrl.detector.clear();
+
+        // 被测：feed_is_speech 每个 chunk 排空 ⇒ 队列恒空，且确实检测到人声。
+        let mut n_speech = 0usize;
+        for c in audio.chunks(1600) {
+            if seg.feed_is_speech(c) {
+                n_speech += 1;
+            }
+            assert!(
+                seg.detector.is_empty(),
+                "feed_is_speech 后段队列必须为空（不随录音增长）"
+            );
+        }
+        assert!(n_speech > 0, "应检测到人声 chunk（否则判定失效）");
+        println!(
+            "LOCALRT384 feed 300s: chunks={} speech_chunks={}",
+            audio.len() / 1600,
+            n_speech
         );
     }
 }

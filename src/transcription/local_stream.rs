@@ -15,13 +15,15 @@
 //! reset 后 `get_result()` 从空串重新累积，与 `StreamingAsrState` 的句切换天然对齐。
 
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use sherpa_onnx::{OnlineParaformerModelConfig, OnlineRecognizer, OnlineRecognizerConfig};
 
 use super::qwen_inference::{StreamingAsrState, WordTiming};
+use super::vad::{VadSegmenter, LOCALRT_VAD_MIN_SILENCE_SECS};
 use crate::punctuation::PunctuationEngine;
 
 /// 本地流式 recognizer 采样率（streaming paraformer trilingual 固定 16kHz 单声道）。
@@ -432,6 +434,77 @@ fn build_dispatch_segment(
     super::build_sliding_segments(&[(start, len)], total_samples, pcm)
 }
 
+// ===========================================================================
+// LOCALRT-VAD-SILENCE-384：本地 realtime 静默判定的「是否有人声」唯一判定 + 进程级 VAD 缓存
+//   （Gavin 2026-09-23：环境背景有声音时音量阈值判静默失效 ⇒ 上 silero VAD，原音量阈值作兜底。
+//    只服务本地 realtime 管线，不碰其他管线。）
+// ===========================================================================
+
+/// 本地 realtime VAD 的**进程级缓存**（Gavin：模型只加载一次、跨录音复用）。
+///
+/// - 按模型目录缓存：目录不变则复用同一实例；每次录音开始只 `reset_for_new_session()` 清状态。
+/// - 首次加载失败**记住**（`vad=None`），不每次录音重试。
+static LOCALRT_VAD_CACHE: OnceLock<Mutex<LocalRtVadCache>> = OnceLock::new();
+
+struct LocalRtVadCache {
+    /// 已尝试加载的模型目录（`None` = 从未尝试）。
+    dir: Option<PathBuf>,
+    /// `Some` = 可用；`None` = 该目录加载失败（记住，不重试）。
+    vad: Option<VadSegmenter>,
+}
+
+/// 取本次录音的本地 realtime VAD（返回持有进程级缓存的 guard；`vad=None` ⇒ 用音量兜底）。
+///
+/// 首次调用加载模型（约几十 ms，在 ASR 消费线程内，**不阻塞录音线程**）；之后复用。
+fn localrt_vad_session(model_dir: &Path) -> MutexGuard<'static, LocalRtVadCache> {
+    let cell = LOCALRT_VAD_CACHE.get_or_init(|| {
+        Mutex::new(LocalRtVadCache {
+            dir: None,
+            vad: None,
+        })
+    });
+    let mut guard = cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.dir.as_deref() != Some(model_dir) {
+        guard.vad = VadSegmenter::try_new_for_local_silence(model_dir);
+        if guard.vad.is_none() {
+            log::warn!(
+                "[LocalRT-DBG-384] silero VAD unavailable at {:?}; fallback to energy threshold",
+                model_dir
+            );
+        }
+        guard.dir = Some(model_dir.to_path_buf());
+    }
+    if let Some(v) = guard.vad.as_ref() {
+        v.reset_for_new_session();
+    }
+    guard
+}
+
+/// LOCALRT-VAD-SILENCE-384：本 chunk「是否有人声」的**唯一判定**。
+///
+/// VAD 可用 ⇒ `feed_is_speech`（silero）；不可用 ⇒ 退回**音量阈值**（口径与改前逐位相同）。
+/// 🔴 显示层打点 / acc 派发 / 影子 / 端点 / 337 边界 b **全部**用本判定，不许有的用 VAD、有的用音量。
+fn chunk_has_speech(
+    vad: Option<&VadSegmenter>,
+    chunk: &[f32],
+    chunk_rms: f32,
+    silence_threshold: f32,
+) -> bool {
+    match vad {
+        Some(v) => v.feed_is_speech(chunk),
+        None => chunk_rms > silence_threshold,
+    }
+}
+
+/// LOCALRT-VAD-SILENCE-384：人声 → 无人声**转换 chunk** 的静默补偿毫秒数。
+///
+/// silero 在人声结束后须过 `LOCALRT_VAD_MIN_SILENCE_SECS` 才报「无人声」，若从该刻才计时 ⇒
+/// 实际要停 1.5s 才到 1200ms。故在转换的那个 chunk 把 `silent_ms` / `acc_silent_ms` 直接
+/// **补记**这么多，使「从真实停顿起算满 1200ms」与改前一致。
+fn localrt_vad_seed_ms() -> f32 {
+    LOCALRT_VAD_MIN_SILENCE_SECS * 1000.0
+}
+
 /// 本地真流式转录（边收音频边解码），与 `transcribe_streaming_realtime` 平行。
 ///
 /// # 参数
@@ -487,6 +560,22 @@ pub fn transcribe_streaming_local(
             .map(|s| s.load(Ordering::Relaxed))
             .unwrap_or(false)
     };
+
+    // LOCALRT-VAD-SILENCE-384：本地 realtime VAD（进程级缓存，只加载一次、跨录音复用）。
+    // guard 持有缓存到本函数结束；`session_vad=None` ⇒ 音量阈值兜底（逐位同改前）。
+    let _vad_guard = localrt_vad_session(&super::model_dir());
+    let session_vad: Option<&VadSegmenter> = _vad_guard.vad.as_ref();
+    let vad_on = session_vad.is_some();
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "[LocalRT-DBG-384] silence detector={}",
+            if vad_on { "vad" } else { "energy" }
+        );
+    }
+    let mut prev_has_speech = false;
+    let mut vad_total_ms = 0.0f64;
+    let mut vad_max_ms = 0.0f64;
+    let mut vad_chunks = 0u64;
 
     let mut stream = recognizer.create_stream();
     let mut state = StreamingAsrState::new();
@@ -587,16 +676,22 @@ pub fn transcribe_streaming_local(
             );
         }
 
-        // LOCALRT-PUNCT-TIMER-269-B：独立静默计数（口径同 config.audio.silence_threshold：
-        // RMS ≤ 阈值即静音）。🔴 只驱动显示层打点，**绝不触发 sherpa endpoint / reset / 切句**——
-        // 切句仍由 rule2=2.0 的端点在静默 2s 时决定，说话中间换气（~1s）不会被切。
+        // LOCALRT-PUNCT-TIMER-269-B / LOCALRT-VAD-SILENCE-384：本 chunk「是否有人声」——
+        // VAD 可用走 silero（`feed_is_speech`），不可用退回音量阈值（`chunk_has_speech` 内兜底）。
+        // 🔴 显示层打点、acc 派发、影子、端点、337 边界 b **全部**用这同一个判定。
         let chunk_ms = chunk.len() as f32 / SAMPLE_RATE as f32 * 1000.0;
         let chunk_rms = (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32).sqrt();
-        if chunk_rms <= silence_threshold {
-            silent_ms += chunk_ms;
-            // 346：acc 专用计数器同步累加（标点路径清 silent_ms 时不动它）。
-            acc_silent_ms += chunk_ms;
-        } else {
+        let t_vad0 = Instant::now();
+        let has_speech = chunk_has_speech(session_vad, &chunk, chunk_rms, silence_threshold);
+        if vad_on {
+            let dt_ms = t_vad0.elapsed().as_secs_f64() * 1000.0;
+            vad_total_ms += dt_ms;
+            vad_chunks += 1;
+            if dt_ms > vad_max_ms {
+                vad_max_ms = dt_ms;
+            }
+        }
+        if has_speech {
             silent_ms = 0.0;
             acc_silent_ms = 0.0;
             // LOCALRT-ENDPOINT-EMPTY-342：本句出现过有声 chunk ⇒ 后续 endpoint 是真切句。
@@ -607,7 +702,25 @@ pub fn transcribe_streaming_local(
             // PARALLEL-ACC-298：有新语音 → 允许本轮停顿结束后再派发，并标记待派发区间含语音。
             acc_done_for_pause = false;
             acc_pending_has_speech = true;
+        } else if prev_has_speech && vad_on {
+            // LOCALRT-VAD-SILENCE-384：人声→无人声转换（VAD 过了 min_silence 才报「无人声」）⇒
+            // 把这段已静的时间补记回来，使「真实停顿起算满 1200ms」与改前一致。
+            silent_ms = localrt_vad_seed_ms();
+            acc_silent_ms = localrt_vad_seed_ms();
+        } else {
+            silent_ms += chunk_ms;
+            // 346：acc 专用计数器同步累加（标点路径清 silent_ms 时不动它）。
+            acc_silent_ms += chunk_ms;
         }
+        // LOCALRT-VAD-SILENCE-384 埋点：人声 ↔ 静默切换（端测对照噪声环境下两种判定的差异）。
+        if has_speech != prev_has_speech && log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "[LocalRT-DBG-384] speech={} rms={:.5}",
+                if has_speech { "on" } else { "off" },
+                chunk_rms
+            );
+        }
+        prev_has_speech = has_speech;
 
         pcm.extend_from_slice(&chunk);
         stream.accept_waveform(SAMPLE_RATE, &chunk);
@@ -634,7 +747,7 @@ pub fn transcribe_streaming_local(
         // LOCALRT-SEAM-337：自适应定界推进（派发点 P 之后，a/b/c 最先者冻结边界）。
         if let Some(seg) = bound_seg {
             bound_waited_ms += chunk_ms;
-            if chunk_rms > silence_threshold {
+            if has_speech {
                 // b：有声恢复 ⇒ 立即冻结、**不回灌**（宁可这轮不修，也不吐残留重复）。
                 bound_hit_b += 1;
                 log::debug!(
@@ -1131,15 +1244,26 @@ pub fn transcribe_streaming_local(
         }
     }
 
+    // LOCALRT-VAD-SILENCE-384：本次录音 VAD 开销（证明可忽略；Debug 守卫，DEC-077）。
+    if vad_on && log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "[LocalRT-DBG-384] vad cost: total_ms={:.1} chunks={} max_chunk_ms={:.1}",
+            vad_total_ms,
+            vad_chunks,
+            vad_max_ms
+        );
+    }
+
     Ok((final_preview, pcm))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_dispatch_segment, endpoint_action, endpoint_confirm_text, local_stream_num_threads,
-        punct_cache_reuse, segment_streaming_text, should_dispatch_acc, should_dispatch_tail,
-        should_repunctuate_preview, EndpointAction, SAMPLE_RATE,
+        build_dispatch_segment, chunk_has_speech, endpoint_action, endpoint_confirm_text,
+        local_stream_num_threads, localrt_vad_seed_ms, punct_cache_reuse, segment_streaming_text,
+        should_dispatch_acc, should_dispatch_tail, should_repunctuate_preview, EndpointAction,
+        LOCALRT_VAD_MIN_SILENCE_SECS, SAMPLE_RATE,
     };
 
     /// LOCALRT-REFLOW-HOLE-344-G：片段流式文本按**字符**切片，绝不字节切片（中文安全、不 panic）。
@@ -2109,6 +2233,129 @@ mod tests {
             segs[0].len(),
             1000 + crate::transcription::SEGMENT_PADDING_SAMPLES,
             "end 超界 clamp 到 total，再补前向 200ms padding"
+        );
+    }
+
+    // ========================================================================
+    // LOCALRT-VAD-SILENCE-384：本地 realtime 静默判定改 VAD（音量阈值兜底）
+    // ========================================================================
+
+    /// 测 #2：VAD 不可用 ⇒ 判定与 `chunk_rms > silence_threshold` **逐位相同**。
+    #[test]
+    fn localrt384_fallback_matches_energy_threshold() {
+        const THR: f32 = 0.01;
+        for k in 0..200usize {
+            let amp = (k % 60) as f32 / 1000.0; // 0.000..0.059，跨越阈值两侧
+            let chunk: Vec<f32> = (0..1600)
+                .map(|i| if i % 2 == 0 { amp } else { -amp })
+                .collect();
+            let rms = (chunk.iter().map(|s| s * s).sum::<f32>() / 1600.0).sqrt();
+            assert_eq!(
+                chunk_has_speech(None, &chunk, rms, THR),
+                rms > THR,
+                "VAD 不可用 ⇒ 判定必须等于 `chunk_rms > silence_threshold`（amp={amp}）"
+            );
+        }
+        let chunk = vec![THR; 1600];
+        assert!(
+            !chunk_has_speech(None, &chunk, THR, THR),
+            "rms 恰为阈值 ⇒ false（> 而非 >=）"
+        );
+    }
+
+    /// 测 #3a：计时补偿值 = `min_silence` 毫秒数（0.3s ⇒ 300ms）。
+    #[test]
+    fn localrt384_seed_is_min_silence_ms() {
+        assert_eq!(localrt_vad_seed_ms(), 300.0);
+        assert_eq!(localrt_vad_seed_ms(), LOCALRT_VAD_MIN_SILENCE_SECS * 1000.0);
+    }
+
+    /// 测 #3b：静默计时三分支（复刻生产 `transcribe_streaming_local` 内联逻辑）。
+    ///
+    /// ⚠️ 生产逻辑内联在函数体内（受 `guard346` 源码护栏约束、不可抽成函数），故此处**逐字复刻**
+    /// 三分支：`has_speech ⇒ 双清零` / `人声→无人声 且 vad_on ⇒ 双补 min_silence` / `否则累加`。
+    #[test]
+    fn localrt384_silence_timing_seeds_then_accumulates() {
+        const CHUNK_MS: f32 = 100.0;
+        let step =
+            |has_speech: bool, prev: bool, vad_on: bool, silent: f32, acc: f32| -> (f32, f32) {
+                if has_speech {
+                    (0.0, 0.0)
+                } else if prev && vad_on {
+                    (localrt_vad_seed_ms(), localrt_vad_seed_ms())
+                } else {
+                    (silent + CHUNK_MS, acc + CHUNK_MS)
+                }
+            };
+
+        let mut silent = 0.0f32;
+        let mut acc = 0.0f32;
+        let mut prev = false;
+        // 3 个有声 chunk ⇒ 立即清零。
+        for _ in 0..3 {
+            let (s, a) = step(true, prev, true, silent, acc);
+            silent = s;
+            acc = a;
+            prev = true;
+        }
+        assert_eq!((silent, acc), (0.0, 0.0));
+        // 人声→无人声转换 chunk ⇒ 补记 min_silence 毫秒数。
+        let (s, a) = step(false, prev, true, silent, acc);
+        silent = s;
+        acc = a;
+        assert_eq!(
+            (silent, acc),
+            (300.0, 300.0),
+            "转换 chunk 必须补记 min_silence(300ms)，否则要从真实停顿 1.5s 才触发"
+        );
+        // 之后 9 个静默 chunk ⇒ 从真实停顿起算满 1200ms。
+        for _ in 0..9 {
+            let (s, a) = step(false, false, true, silent, acc);
+            silent = s;
+            acc = a;
+        }
+        assert_eq!((silent, acc), (1200.0, 1200.0));
+        // 有人声 ⇒ 立即清零。
+        assert_eq!(step(true, false, true, silent, acc), (0.0, 0.0));
+        // 兜底（vad_on=false）永不补记 ⇒ 逐位同改前（首次静默即 +100）。
+        assert_eq!(step(false, true, false, 0.0, 0.0), (CHUNK_MS, CHUNK_MS));
+    }
+
+    /// 测 #4：源码级护栏 ——「是否有人声」判定**只有** `chunk_has_speech` 一处；
+    /// 音量阈值比较不得散落在 `transcribe_streaming_local` 函数体内。
+    #[test]
+    fn guard384_single_speech_judgment_via_chunk_has_speech() {
+        let lines = ls_prod_lines();
+        let is_code = |i: usize| !lines[i].starts_with("//");
+        let fn_line = first_line(&lines, "pub fn transcribe_streaming_local(");
+        let (fn_lo, fn_hi) = block_bounds_291(&lines, fn_line);
+        let cmp = (fn_lo..=fn_hi)
+            .filter(|&i| {
+                is_code(i)
+                    && (lines[i].contains("chunk_rms > silence_threshold")
+                        || lines[i].contains("chunk_rms <= silence_threshold"))
+            })
+            .count();
+        assert_eq!(
+            cmp, 0,
+            "384: transcribe_streaming_local 函数体（剔除注释）内不得直接比较音量阈值（必须走 chunk_has_speech）"
+        );
+        let n_call = (fn_lo..=fn_hi)
+            .filter(|&i| is_code(i) && lines[i].contains("chunk_has_speech("))
+            .count();
+        assert_eq!(
+            n_call, 1,
+            "384: 函数体应恰调用一次共享判定 chunk_has_speech"
+        );
+        // 兜底判定函数内恰含一处音量阈值比较（VAD 不可用时的唯一来源）。
+        let ch_line = first_line(&lines, "fn chunk_has_speech(");
+        let (ch_lo, ch_hi) = block_bounds_291(&lines, ch_line);
+        let n_cmp = (ch_lo..=ch_hi)
+            .filter(|&i| is_code(i) && lines[i].contains("chunk_rms > silence_threshold"))
+            .count();
+        assert_eq!(
+            n_cmp, 1,
+            "384: 兜底判定 chunk_has_speech 必须恰含一处音量阈值比较"
         );
     }
 }

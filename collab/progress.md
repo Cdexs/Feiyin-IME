@@ -1211,3 +1211,12 @@ load_wordbook_vocabulary()
 | 覆盖 | ① 性质：100 段伪随机（0.5~60s，正弦/噪声/静音，幅度 0.001~1.0）四性质 ② 退化：全零/NaN·±inf/end 越界/长度 10s·11s·11s+1·12s ③ 字缝优先（10.5s 浅 vs 11.5s 更深 ⇒ 精确切 10.5s）④ 20s 路径 + `naive_chunk` **逐位快照**（基线 `1af7212^`）⑤ 非帧对齐 start／空·倒置区间／滑窗 10s 合并阈值 |
 | 验证 | `cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**、warnings **88** = 基线；numstat == -w（407/0）。🔴 **未跑 `cargo test`**（白名单；首跑在阶段四） |
 | 结论 | **未发现生产缺陷**（NaN/全零无 panic、每轮切点严格推进无死循环）；无停手项 |
+
+## LOCALRT-VAD-SILENCE-384（阶段一·交付）· 2026-09-23 · coder-2
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 本地 realtime 静默判定改 **silero VAD 判「有没有人声」**（方案 A），音量阈值兜底。`vad.rs` 新增 `try_new_for_local_silence` / `feed_is_speech`（整块喂入 + 每 chunk 一次 `detected()` + 排空已完成段）+ 3 常量；`local_stream.rs` 新增进程级 VAD 缓存（只加载一次、跨录音复用、失败记住、每次 reset）+ 唯一判定 `chunk_has_speech` + 1200ms 计时补偿 + Debug 埋点 |
+| 隔离 | 只改本地 realtime；其它 VAD 用途 / `src/audio` / 在线流式 / `src/main.rs` 均未动 |
+| 验证 | `cargo fmt --check` EXIT 0 ｜ `cargo check --all-targets` 0 error、warnings 88=基线 ｜ 全量 `cargo test --no-fail-fast` 0 failed（bin 1500P/32I）｜ numstat==-w ｜ ignore 真模型 300s 队列不增长 PASS（≈0.66ms/chunk） |
+| 下一步 | 阶段三 TEST-SYNC（非作者）→ 阶段四 TEST-EXEC → 出包；端测盯 `silence detector=vad` / `vad cost` / 1200ms 一致性 |
