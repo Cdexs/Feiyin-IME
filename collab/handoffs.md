@@ -7,6 +7,17 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-23 — tester-1 — TEST-EXEC + BUILD-385 ✅ 出包（381/382/384/385 合包；八项 + 三特殊点全 PASS）
+
+- **交付源码**：HEAD `0c443a5`（`1af7212`/`f37b767`/`5f19eca`/`e8e7b6c`/`f8367a6`/`0c443a5`），工作区 clean，版本 0.9.3。核心单 381（滑窗字缝切 + `WINDOW_MAX_SECS` 12→10）/ 382（逐片组窗 + 早显处理态 + 回灌提速）/ 384（静默判定改 silero VAD + 音量兜底）/ 385（近场音量门）。DEC-081：任务书已下达「现在可以出包」。
+- **阶段四（全量未过滤；fmt `--check` 不带 `skip_children`）**：root `cargo test --no-fail-fast` **1598P/0F/34I**（EXIT 0；`feiyin-ime` bin **1510P/32I**）；`src-tauri` **92P/0F/0I**；Vitest **SKIP**（`ui/` 无 diff）；warnings **97/88/17** = 基线（384 起主程序 98→97）；fmt **EXIT 0**。
+- **NEW/GONE**：基线 1584P/33I ⇒ 净 **+14P/+1I**。NEW 15（14P+1I）= 384 **5**（`guard384_*` 1 + `localrt384_*` 3 + ignored `localrt_vad_feed_drains_queue_bounded`）+ 385 **5**（`nearfield385_*`）+ TEST-SYNC-384-385 **5**（`ts384385_*`）；**GONE 0**。
+- **重点失效模式**：其他管线（`build_padded`/`naive_chunk`/`should_segment`/`ts381_padded_20s_snapshot`）、滑窗（`plan_windows`/`plan_gap_cuts`/`ordered_reflow`/`align`）、静默判定（`localrt384`/`guard384`/`nearfield385`）、回灌（`reflow_fast`/`testsync382`/`problem2_order`/`shared_queue`/`drive_acc_windows`）、368/369/371/374/375/377/380 共 **92 条 ok、0 失败**，无停手。
+- **BUILD-385**：Step1 残 0 → Step2 npm 656ms + Tauri 1m52s（17w）→ Step2c UI cp（14:52 / `d51a599c…`）→ Step3 主程序 2m59s（97w + crash 9w）→ Step4 三 exe→Publish。产物 main `dc88612f4aaf…`（14,818,816B/14:55:58）/ ui `d51a599cafc4…`（10,050,048B/14:52:53）/ crash `ea5beaf8c0f1…`（24,879,104B/14:54:05）；两副本全等、三者均异于 BUILD-380。
+- **八项逐项 PASS**：①时间戳 14:52–14:55 ②两副本 sha 相等且异于上包 ③ProductVersion **0.9.3** ④冒烟 PID **29592 Responding=True** / 两处无新 crash.json / panic 0 / 残 0 ⑤config `da2be5da…` 三时点不变 ⑥warnings 97/88/17 ⑦二进制正探针 `[LocalRT-DBG-382]`=3 / `stop_to_processing_ms`=1 / `reflow suppressed after processing`=1 / `[LocalRT-DBG-384]`=4 / `[LocalRT-DBG-385]`=2，反探针无 ⑧scene/itn 两 toml 三副本全等。
+- **三特殊点（仅核验）**：① dll 四张三副本（`sherpa-onnx-lib`/`Publish`/`target-release`）全等 + `onnxruntime` **1.28.2**；② itn-rules 三副本 `60b227de…` 全等；③ `Publish/models/` 1.7B 七文件与源 sha256 全等、0.6B 保留。
+- 🔴 **Step1 强杀输入法进程 ⇒ 已提醒 Gavin 重启后端测**。红线：未 push（需 Gavin 指示）/ 版本号未动 / 未改生产代码 / 未 `cargo clean` / 零凭证。
+
 ## 2026-09-23 — tester-1 — TEST-EXEC-380 + BUILD-380 ✅ 出包（阶段四全绿 → 出包；八项 + 三特殊点全 PASS）
 
 - **交付源码**：HEAD `cc83917`，工作区 clean，版本 0.9.3。核心单 `FIX-PREVIEW-HARVEST-380`（路 B 窗口解完即 `push_window` 合并刷新预览 + `[LocalRT-DBG-380]` 松键时延埋点）。DEC-081：任务书已下达「现在可以出包」。

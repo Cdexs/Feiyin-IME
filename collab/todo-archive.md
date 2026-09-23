@@ -5094,3 +5094,32 @@ sherpa endpoint `rule2=2.0s`（切句）、`ACC_DISPATCH_SILENCE_MS`（派发 ac
 | 版本号 | 仍 0.9.2，但本轮动了数据库 schema + 模型文件 + 新增本地流式档位，与最初的 0.9.2 已非同物，是否给新号由 Gavin 定 |
 **259~290 全部已交付并出包** → 单号明细见 `CHANGELOG.md`，过程取证见 `todo-archive.md` §「v0.9.3 批次（2026-09-20/21）」。
 `ASR-DROP-234` 已由 `FIX-ASR-DROP-288` 修复并随 BUILD-290 出包（`-debug` 静置 150s，`[ASR-DROP]` 0 条）。
+
+
+## 【归档七】2026-09-23 移出：380 / 381 / 382 / 384 / 385（已随 BUILD-380 / BUILD-385 出包）
+
+### 🆕🔴🔴 P0 · BUILD-380 端测两 bug + 回灌提速 + 切片/窗口统一 10s（Gavin 已确认）— 382 ✅ 2026-09-23 交付 coder-1，381 待 coder-2
+
+| 单号 | 内容 | 负责 |
+| --- | --- | --- |
+| ✅ `FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382` | 每片单独组窗（吃字）／松键立即「识别处理中」／回灌不等边界配对／解码共享队列／埋点。**2026-09-23 阶段一交付 coder-1**：`plan_windows` 逐片组窗 + `StreamingFinalPreview`/`Processing` 提前到 `acc_join` 前 + `ReflowFastState` 立即渲染 + 单一共享解码队列 + `[LocalRT-DBG-382]` 埋点；`cargo fmt --check` EXIT 0、`check --all-targets` 0 error、warnings **98/88**=基线、全量 **1563P/0F/33I**（+12 新单测）。**待 tester-1 阶段四回归 + 出包 + Gavin 端测** | coder-1（`main.rs`） |
+| ✅ `FIX-SLICE-CUT-AT-GAP-381`（+ ✅ 阶段三 `TEST-SYNC-381`） | 超 10s 在字缝切／`WINDOW_MAX_SECS` 12→10／字缝切 vs 硬切、10s vs 12s 实测。**381 已验收（HEAD `1af7212`）**；**阶段三 `TEST-SYNC-381` 2026-09-23 交付 coder-1**：仅 `vad.rs` `#[cfg(test)]` +11 条（性质/退化/字缝优先/20s 路径与 `naive_chunk` 逐位快照/非帧对齐 start 等），`fmt --check` EXIT 0、`check --all-targets` 0 error、warnings 88=基线；**未跑 `cargo test`**（首跑阶段四）；**未发现生产缺陷** | coder-2（`vad.rs`/`local_stream.rs`/`transcription/mod.rs`）+ coder-1（阶段三护栏） |
+
+
+**Gavin 原话**：①「连续一口气不停顿说了这一段话……结果最终输出只有这一小段：『我连以太也看得见，实在太美了，就像欣赏北极光一样』」②「按下结束热键后，要等会儿才会显示识别处理中，前台的界面更新不及时，给用户一种卡顿感」
+**① 根因（吃字）**：一次派发 >13s 被切成多片（18.37s → 13s + 5.37s），`group_window_start_secs`（`transcription/mod.rs:1485`）按 12s 上限丢最远片 ⇒ 窗口只含最后一片，前 13s **从未进任何窗口**。今日两次命中（18.37s→解 5.37s；16.19s→解 3.19s）。
+**② 根因**：本地实时档松键不切处理态（`main.rs:6818`），要等流式 flush **和** B 路径尾窗都 join（`:8575-8576`）后才发 `StreamingFinalPreview` + `Processing`（`:8789`）⇒ 尾窗解码期（0.45~2s）界面不动。
+取证 `collab/evidence/20260923-eat-front/debug.log`；`hook_to_controller_ms` 全部 0 ⇒ 按键传递无延迟。
+
+
+### ✅ LOCALRT-VAD-SILENCE-384 + LOCALRT-NEARFIELD-GATE-385（作者已交付）+ ✅ 阶段三 TEST-SYNC-384-385（coder-1，2026-09-23）
+
+- **384/385**（coder-2，已交付）：本地 realtime 有声判定改 silero VAD（音量阈值兜底）+ 近场音量门区分「录音人 vs 背景人声」。
+- **✅ 阶段三 TEST-SYNC-384-385**（2026-09-23，coder-1）：仅 `local_stream.rs` `#[cfg(test)]` **+5 条非作者护栏**（随机 500 组兜底逐位·门免疫 / 近场门 0.26·0.24 两侧 / 30s 锁死恢复 / 背景 3s 无补记 @1200ms 达派发 / 补偿只认 VAD 翻转）；`cargo fmt --check` EXIT 0、`check --all-targets` 0 error、warnings ≤基线；**未跑 `cargo test`**（首跑阶段四）；**未发现生产缺陷**。
+
+### ✅ FIX-PREVIEW-HARVEST-380 · 预览结果到即收 + 松键时延埋点（BUILD-379 端测，2026-09-23）— ✅ 已出包 BUILD-380（`cc83917`），待 Gavin 端测：停顿时预览是否一两秒内刷新；带 `-debug` 看 `[LocalRT-DBG-380]` 两个时延
+
+**Gavin 原话**：「输入一整段话的中间、还有尾部（特别是）的文字明明已经被改写修正，但始终不刷新，即使录音后我停顿等了好几秒也都不刷新」
+**根因（主控读 log + 代码坐实）**：路 B 窗口解出后，结果只在**下一次派发新窗口时**才被收取（`main.rs:8372` 的 `res_rx.try_recv()` 在 `for … in acc_rx` 循环体内，`:8291`）；停顿期间没有新窗口 ⇒ 结果躺在通道里。6 次录音全部复现：解出→上屏滞后 2~17.6s，**最后一窗每次都要等松键才上屏**。
+**问题 2（松键后约 4s 才注入）**：log 里松键→注入仅 4~11ms（`tail_wait=0ms`），**后端无 4s 等待**；须补「按键→主控收到」时延埋点再端测定位。
+**✅ 交付（2026-09-23，coder-1，阶段一·只改代码）**：`main.rs` 路 B 滑窗线程改 `crossbeam_channel::select!`（模块级 `drive_acc_windows`）结果到即收；两份收取合一 `harvest_acc_window!` 宏 ⇒ `push_window(` 该线程仅一处；B 埋点就位（`[LocalRT-DBG-380]`，非钩子路径打 `n/a`）。验证：fmt EXIT 0 / `cargo check --all-targets` 0 error / warnings 98/88 = 基线 / 全量 `cargo test --no-fail-fast` **1547P/0F/31I**（+1 新单测）。取证 `collab/evidence/20260923-preview-stale/debug-0134.log`。**待 tester-1 阶段四回归 + 出包 + Gavin 端测**；本轮未改版本/未 push/未 build release。详见 `CHANGELOG.md` / `progress.md`。

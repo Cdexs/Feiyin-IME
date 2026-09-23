@@ -1245,3 +1245,15 @@ load_wordbook_vocabulary()
 | 覆盖 | ① 随机 500 组兜底恒等 `rms>thr` + 门免疫 ② 门两侧 0.26/0.24 ③ 锁死恢复（1.0→0.2：28.5s 挡、≤31.5s 重开、1.2s 重学）④ 背景 3s 无补记 @1200ms 达派发 ⑤ 补偿只认 VAD 翻转（门挡不补/翻转覆盖 300ms/VAD 关不补） |
 | 验证 | `cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**、warnings **97/88** ≤ 基线 98/88；numstat == -w（238/0）。🔴 **未跑 `cargo test`**（白名单；首跑阶段四） |
 | 结论 | **未发现生产缺陷**；无停手项 |
+
+## BUILD-385（阶段四全绿 → 出包 · 381/382/384/385 合包）· 2026-09-23 · tester-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 381（滑窗字缝切 + `WINDOW_MAX_SECS` 12→10）/ 382（逐片组窗 + 早显处理态 + 回灌提速）/ 384（静默判定改 silero VAD + 音量兜底）/ 385（近场音量门）。HEAD `0c443a5`，版本 0.9.3 |
+| 回归 | root `cargo test --no-fail-fast` **1598P/0F/34I**（EXIT 0；`feiyin-ime` bin **1510P/32I** = 基线 1584P/33I 净 **+14P/+1I**）；`src-tauri` **92P/0F/0I**；Vitest **SKIP**（`ui/` 无 diff）；`cargo fmt --check`（不带 `skip_children`）**EXIT 0**；warnings **97/88/17** = 基线 |
+| NEW | 15（14P+1I）：384 **5**（含 ignored `localrt_vad_feed_drains_queue_bounded`）+ 385 **5**（`nearfield385_*`）+ TEST-SYNC-384-385 **5**（`ts384385_*`）；GONE **0** |
+| 出包 | `BUILD-385` 八项逐项 PASS；产物 `feiyin-ime` 14.82MB `dc88612f4aaf…`（14:55:58）/ `feiyin-ime-ui` 10.05MB `d51a599cafc4…`（14:52:53）/ `crash-reporter` 24.88MB `ea5beaf8c0f1…`（14:54:05）；两副本全等、均异于 BUILD-380 |
+| 三特殊点 | ① dll 四张三副本全等 + onnxruntime 1.28.2；② itn-rules 三副本全等；③ Publish/models 1.7B 七文件与源逐一 sha256 全等（0.6B 保留） |
+| 探针 | 正：`[LocalRT-DBG-382]`=3 / `stop_to_processing_ms`=1 / `reflow suppressed after processing`=1 / `[LocalRT-DBG-384]`=4 / `[LocalRT-DBG-385]`=2；反：无（本批未删字面量） |
+| 端测 | 🔴 **Step1 强杀输入法 ⇒ 请重启后端测**；重点：① 384 静默判定改 VAD（停顿切片更贴语义）；② 385 近场门挡背景人声（录音人优先，背景人声不触发）；③ 382 松键立即「识别处理中」不闪回 + 回灌立即刷新；④ 吃字/重复字；⑤ 长录音 300s；⑥ 不新增 crash.json |
