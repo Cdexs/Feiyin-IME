@@ -11217,10 +11217,12 @@ mod vad393_window_ranges_tests {
     #[test]
     fn ts393c_lens_shorter_than_slices_uses_zero_offset_no_panic() {
         let slices = vec![Some(vec![(1usize, 2usize)]), Some(vec![(3, 4)])];
+        // 主控修正期望：片 k 的偏移 = lens[0..k] 之和。第 0 片长 10 已给出 ⇒ 第 1 片偏移 10；
+        // 缺的是第 1 片自己的长度，只影响其后的片（此处没有）。原期望 (3,4) 把偏移算错了。
         assert_eq!(
             shift_and_concat_ranges(&slices, &[10usize]),
-            Some(vec![(1, 2), (3, 4)]),
-            "第 1 片缺长度 ⇒ 按 0 偏移，不得 panic"
+            Some(vec![(1, 2), (13, 14)]),
+            "第 1 片缺长度 ⇒ 不 panic；第 1 片偏移仍为第 0 片长度 10"
         );
         assert_eq!(
             shift_and_concat_ranges(&slices, &[]),
