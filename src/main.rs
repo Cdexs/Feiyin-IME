@@ -11334,6 +11334,145 @@ mod plan_windows_386_tests {
     }
 }
 
+// =====================================================================
+// TEST-SYNC-386（阶段三 · 非作者护栏，coder-2）：组窗契约 / 预览回灌 / 兜底
+//   被测：FIX-TAIL-WINDOW-AND-FALLBACK-386（契约见任务书）。
+//   按契约写、不照实现反推；白名单只 `cargo fmt` / `cargo check --all-targets`（首跑阶段四）。
+// =====================================================================
+#[cfg(test)]
+mod testsync386_tests {
+    use super::{
+        compose_reflow_preview, compose_with_acc_for_gen, plan_windows, window_text_with_fallback,
+    };
+    use crate::transcription;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn n(&mut self, lo: usize, hi: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lo as u64 + (self.0 >> 33) % ((hi - lo + 1) as u64)) as usize
+        }
+    }
+
+    /// 1. 会话级性质：200 次录音，每次 3~8 次派发（每次 1~3 片、每片 0.3~12s），最后一次 is_tail=true。
+    ///    断言：① 每个切片全局下标至少被一窗覆盖 ② 会话结束无 pending 残留
+    ///    ③ 每窗非空且不越界（`s < e ≤ 总片数`）。
+    #[test]
+    fn sync386_session_property_cover_no_pending_valid_end() {
+        let max_prev = transcription::WINDOW_MAX_SLICES;
+        let mut rng = Lcg(0x386_5E55_10AA);
+        for case in 0..200usize {
+            let n_dispatch = rng.n(3, 8);
+            let mut all_durs: Vec<f32> = Vec::new();
+            let mut windows: Vec<(usize, usize)> = Vec::new();
+            let mut pending: Option<usize> = None;
+            for d in 0..n_dispatch {
+                let n_new = rng.n(1, 3);
+                let mut new_durs = Vec::new();
+                for _ in 0..n_new {
+                    new_durs.push(0.3 + rng.n(0, 117) as f32 / 10.0); // 0.3..12.0
+                }
+                let prev_len = max_prev.min(all_durs.len());
+                let prev_base = all_durs.len() - prev_len;
+                let prev_durs = all_durs[prev_base..].to_vec();
+                let is_tail = d + 1 == n_dispatch;
+                let plan = plan_windows(&prev_durs, &new_durs, prev_base, pending, is_tail);
+                windows.extend(plan.windows);
+                pending = plan.pending;
+                all_durs.extend(new_durs);
+            }
+            let total = all_durs.len();
+            assert!(pending.is_none(), "case {case}: 收尾后不得有 pending 残留");
+            for idx in 0..total {
+                assert!(
+                    windows.iter().any(|(s, e)| *s <= idx && idx < *e),
+                    "case {case}: 切片 {idx} 未被任何窗口覆盖（windows={windows:?}）"
+                );
+            }
+            for (s, e) in &windows {
+                assert!(*s < *e, "case {case}: 窗口不得为空");
+                assert!(
+                    *e <= total,
+                    "case {case}: end 不得越界（end={e} ≤ total={total}）"
+                );
+            }
+        }
+    }
+
+    /// 2. 中途一大一小：派发 `[10.2, 1.1]` ⇒ 1 窗（大片）+ `pending`=小片；
+    ///    下次派发 `[4.0]` ⇒ 首窗含小片与 `4.0`（`pending` 强制纳入并清空）。
+    #[test]
+    fn sync386_mid_big_small_then_next_includes_pending() {
+        let p1 = plan_windows(&[], &[10.2, 1.1], 0, None, false);
+        assert_eq!(p1.windows, vec![(0, 1)], "多片非收尾 ⇒ 只有大片立刻组窗");
+        assert_eq!(p1.pending, Some(1), "小片延后为 pending");
+        let p2 = plan_windows(&[10.2, 1.1], &[4.0], 0, p1.pending, false);
+        assert_eq!(
+            p2.windows,
+            vec![(1, 3)],
+            "首窗必须含小片(index1)与 4.0(index2)"
+        );
+        assert!(p2.pending.is_none(), "pending 纳入后清空");
+    }
+
+    /// 3. 结尾一大一小：短尾（<3s）⇒ 与前一并 `[大片, 小片]`；长尾（≥3s）⇒ 单独成窗。
+    #[test]
+    fn sync386_tail_big_small_merge_or_alone() {
+        let p = plan_windows(&[], &[10.2, 1.1], 0, None, false);
+        let t = plan_windows(&[10.2, 1.1], &[], 0, p.pending, true);
+        assert_eq!(t.windows, vec![(0, 2)], "1.1s < 3s ⇒ 与前一并（前片重解）");
+        assert!(t.pending.is_none());
+
+        let p2 = plan_windows(&[], &[10.2, 3.5], 0, None, false);
+        let t2 = plan_windows(&[10.2, 3.5], &[], 0, p2.pending, true);
+        assert_eq!(t2.windows, vec![(1, 2)], "3.5s ≥ 3s ⇒ 单独成窗");
+        assert!(t2.pending.is_none());
+    }
+
+    /// 4. 预览不回退：给定 acc、streaming 不断增长 ⇒ 回灌渲染字数 **≥** 仅 acc 字数，
+    ///    且与**同参数** StreamingText 渲染逐字相等（同一合成函数）。
+    #[test]
+    fn sync386_preview_grows_with_streaming_and_never_shorter_than_acc() {
+        let g = 0x386u64;
+        let acc = "权威前缀文本";
+        let committed = 3usize;
+        let base = "原始流式文本从这继续";
+        for extra in 0..=12usize {
+            let streaming: String = base
+                .chars()
+                .chain("不断增长的内容尾巴".chars().take(extra))
+                .collect();
+            let reflow = compose_reflow_preview(g, acc, &streaming, committed);
+            let state = (g, acc.to_string(), committed);
+            let same = compose_with_acc_for_gen(Some(&state), g, &streaming);
+            assert_eq!(
+                reflow, same,
+                "回灌必须与同参数 StreamingText 渲染逐字相等（extra={extra}）"
+            );
+            assert!(
+                reflow.chars().count() >= acc.chars().count(),
+                "回灌字数不得少于仅 acc（不回退，extra={extra}）"
+            );
+        }
+    }
+
+    /// 5. 兜底：解码空 ⇒ 流式文本；解码非空 ⇒ 原文不变；两者都空 ⇒ 空；
+    ///    解码为纯空白（非空）⇒ 仍以解码为准（不做 trim 判定）。
+    #[test]
+    fn sync386_fallback_decoded_empty_uses_streaming() {
+        assert_eq!(window_text_with_fallback("", "流式文本"), "流式文本");
+        assert_eq!(
+            window_text_with_fallback("解码文本", "流式文本"),
+            "解码文本"
+        );
+        assert_eq!(window_text_with_fallback("", ""), "");
+        assert_eq!(window_text_with_fallback(" ", "流式"), " ");
+    }
+}
+
 // ============================================================
 // FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382（3A）：replace_all 回灌
 // 「立即渲染」状态机（纯函数；controller 线程侧只做 I/O 转接）
