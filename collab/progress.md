@@ -1170,3 +1170,15 @@ load_wordbook_vocabulary()
 | 回归 | root `cargo test --no-fail-fast` **1547P/0F/31I**（EXIT 0；`feiyin-ime` bin **1459P/29I**）；`cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**；warnings **98/88** = 基线 |
 | NEW | +1：`preview_harvest_380_tests::drive_acc_windows_harvests_result_while_acc_open`（通道先后制造「`acc_rx` 未关、结果已到」，非 sleep；退回旧语义必超时） |
 | 端测 | 🔴 待 tester-1 阶段四全量回归 + 出包，再交 Gavin 端测：现象①预览停顿即刷；现象②看 `hook_to_controller_ms`/`stop_to_inject_ms` 定位 4s 来源 |
+
+## BUILD-380（阶段四全绿 → 出包）· 2026-09-23 · tester-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | `FIX-PREVIEW-HARVEST-380`（HEAD `cc83917`）：路 B 滑窗 `select!` 结果到即收 + `replace_all` 刷新预览；`[LocalRT-DBG-380]` `hook_to_controller_ms`/`stop_to_inject_ms`。版本 0.9.3 |
+| 回归 | root `cargo test --no-fail-fast` **1547P/0F/31I**（EXIT 0；`feiyin-ime` bin **1459P/29I** = 基线 1546P/31I 净 **+1P**）；`src-tauri` **92P/0F/0I**；Vitest **SKIP**（`ui/` 无 diff）；`cargo fmt --check`（不带 `skip_children`）**EXIT 0**；warnings **98/88/17** = 基线 |
+| NEW | +1：`preview_harvest_380_tests::drive_acc_windows_harvests_result_while_acc_open`（GONE 无） |
+| 出包 | `BUILD-380` 八项逐项 PASS；产物 `feiyin-ime` 14.78MB `266cd61bc23e…`（12:35:59）/ `feiyin-ime-ui` 10.05MB `21bf38fd7f3a…`（12:32:54）/ `crash-reporter` 24.88MB `6011c8cb2e68…`（12:34:17）；两副本全等、均异于 BUILD-379 |
+| 三特殊点 | ① dll 四张三副本全等 + onnxruntime 1.28.2；② itn-rules 三副本全等；③ Publish/models 1.7B 七文件与源逐一 sha256 全等（0.6B 保留） |
+| 探针 | 正：`[LocalRT-DBG-380]`=3 / `hook_to_controller_ms`=2 / `stop_to_inject_ms`=1；反：无（本单未删字面量） |
+| 端测 | 🔴 **Step1 强杀输入法 ⇒ 请重启后端测**；重点：现象①停顿即刷预览；现象②`hook_to_controller_ms`/`stop_to_inject_ms` 定位出字延迟 |

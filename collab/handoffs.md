@@ -7,6 +7,17 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-23 — tester-1 — TEST-EXEC-380 + BUILD-380 ✅ 出包（阶段四全绿 → 出包；八项 + 三特殊点全 PASS）
+
+- **交付源码**：HEAD `cc83917`，工作区 clean，版本 0.9.3。核心单 `FIX-PREVIEW-HARVEST-380`（路 B 窗口解完即 `push_window` 合并刷新预览 + `[LocalRT-DBG-380]` 松键时延埋点）。DEC-081：任务书已下达「现在可以出包」。
+- **阶段四（全量未过滤；fmt `--check` 不带 `skip_children`）**：root `cargo test --no-fail-fast` **1547P/0F/31I**（EXIT 0；`feiyin-ime` bin **1459P/29I**）；`src-tauri` **92P/0F/0I**；Vitest **SKIP**（`ui/` 无 diff）；warnings **98/88/17** = 基线；fmt **EXIT 0**。
+- **NEW/GONE**：基线 1546P/31I ⇒ 净 **+1P** = 新增 `preview_harvest_380_tests::drive_acc_windows_harvests_result_while_acc_open`（bin 1458→1459P 逐位吻合）；GONE 无。
+- **重点失效模式**：`ordered_reflow`/`align`/`strip_terms_echo`/`apply_acc_disposition`/`output_rate_ok`/`reflow_monotonic_key`/`preview_harvest_380` 命中 **38 条 ok、0 失败**，无停手。
+- **BUILD-380**：Step1 残 0 → Step2 npm 1.55s + Tauri 1m48s（17w）→ Step2c UI cp（两处 12:32 / sha `21bf38fd7f3a…` 一致）→ Step3 主程序 3m00s（98w + crash 9w）→ Step4 三 exe→Publish。产物 main `266cd61bc23e…`（14,781,440B/12:35:59）/ ui `21bf38fd7f3a…`（10,050,048B/12:32:54）/ crash `6011c8cb2e68…`（24,879,104B/12:34:17）；两副本全等、三者均异于 BUILD-379。
+- **八项逐项 PASS**：①时间戳 12:32–12:35 ②两副本 sha 相等且异于上包 ③ProductVersion **0.9.3** ④冒烟 PID **23452 Responding=True** / 两处无新 crash.json / panic 0 / 残 0 ⑤config `da2be5da…` 三时点不变 ⑥warnings 98/88/17 ⑦二进制正探针 `[LocalRT-DBG-380]`=3 / `hook_to_controller_ms`=2 / `stop_to_inject_ms`=1，反探针无（本单未删字面量）⑧scene/itn 两 toml 三副本全等。
+- **三特殊点（仅核验）**：① dll 四张三副本（`sherpa-onnx-lib`/`Publish`/`target-release`）全等 + `onnxruntime` **1.28.2**；② itn-rules 三副本全等；③ `Publish/models/` 1.7B 七文件与源 sha256 全等、0.6B 保留。
+- 🔴 **Step1 强杀输入法进程 ⇒ 已提醒 Gavin 重启后端测**。红线：未 push（需 Gavin 指示）/ 版本号未动 / 未改生产代码 / 未 `cargo clean` / 零凭证。
+
 ## 2026-09-23 — tester-1 — TEST-EXEC-377 + BUILD-379 ✅ 出包（阶段四全绿 → 出包，替换作废的 BUILD-373；八项 + 三特殊点全 PASS）
 
 - **交付源码**：HEAD `243dcc4` + 工作区阶段三 18 条护栏（未提交），版本 0.9.3。🔴 **BUILD-373 作废**（词条回显 + 预览刷不进 + 出字延迟）。DEC-081：Gavin 已预授权「全绿即直接出包」。
