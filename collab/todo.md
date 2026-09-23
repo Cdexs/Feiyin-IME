@@ -32,7 +32,7 @@
 | 单号 | 内容 | 负责 |
 | --- | --- | --- |
 | ✅ `FIX-VAD-FEED-BY-WINDOW-391` | 修「说话到一半卡住 / 只出前半段」P0：`speech_ranges`/`feed_is_speech` 改**逐 512 块**喂入（388 整段一次性喂入命中 sherpa「大 n」语义陷阱 ⇒ 6.31s 只剩 0.37s）。**2026-09-23 阶段一交付 coder-1**：新增真模型 `#[ignore]` 实跑（4 段 6s 语音剪后 **6.44/6.31/6.38/5.78s**、旧整块写法复现 **0.36s**、`feed_is_speech` 块大小 160/512/1600/16000 差异 ≤ 喂入块）+ 纯逻辑喂入次数测试；`fmt --check` EXIT0、`check --all-targets` 0 error、全量 **1646P/0F/37I**。**待 tester-1 阶段四回归 + 392 合包 + 端测** | coder-1（`vad.rs`） |
-| 🔄 392（coder-2 在飞） | `local_stream.rs` 门只管时序、内容去留只看 VAD、下中位数、首段不学 | coder-2（`local_stream.rs`） |
+| ✅ `FIX-GATE-TIMING-ONLY-392`（+ ✅ 阶段三 `TEST-SYNC-392`） | `local_stream.rs` 门只管时序、内容去留只看 VAD、下中位数、首段不学。**阶段三 2026-09-23 交付 coder-1**：仅 `local_stream.rs` 的 `#[cfg(test)]` **+4 条**（门误判不丢内容恰派发一次 / 背景+录音人恰 2 次 / 首段不学+下中位 / VAD 不可用两标志逐位一致），`fmt --check` EXIT 0、`check --all-targets` 0 error、warnings **97/88**=基线；**未跑 `cargo test`**；**未发现生产缺陷** | coder-2（实现）+ coder-1（阶段三护栏） |
 
 ### 🧊 待观察 · FORCED-ALIGN-372（设想，**未立项**，等 371 端测结果）
 

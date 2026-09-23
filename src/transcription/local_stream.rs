@@ -3271,7 +3271,9 @@ mod tests {
 // ========================================================================
 #[cfg(test)]
 mod gate392_tests {
-    use super::{chunk_has_speech, localrt_vad_seed_ms, SegmentGate, SegmentPeakLevel};
+    use super::{
+        chunk_has_speech, localrt_vad_seed_ms, should_dispatch_acc, SegmentGate, SegmentPeakLevel,
+    };
 
     /// 1. 复现 BUILD-390 峰值序列 [0.0966, 0.0215, 0.0157, 0.0228, 0.0244]（VAD 全真）：
     ///    **第一段不学习**（0 样本），后续段**全部确认**；level = 后 4 段下中位 = 0.0215。
@@ -3469,6 +3471,192 @@ mod gate392_tests {
                 j.vad_speech, j.has_speech,
                 "392：VAD 不可用 ⇒ vad_speech 必须等于 has_speech（内容去留与 384 逐位相同）"
             );
+        }
+    }
+
+    // ========================================================================
+    // TEST-SYNC-392（阶段三 · 非作者护栏 · coder-1）：门只管时序、内容只看 VAD
+    //   契约见任务书；不与作者 392 用例重复。
+    // ========================================================================
+
+    /// 392 契约状态机（测试内复刻生产标志更新 `:1046-1090` + 派发/复位 `:1432-1472`）。
+    struct Flags392 {
+        silent_ms: f32,
+        acc_silent_ms: f32,
+        shadow_done_for_pause: bool,
+        acc_done_for_pause: bool,
+        speech_since_last_reset: bool,
+        acc_pending_has_speech: bool,
+        prev_has_speech: bool,
+        dispatches: usize,
+    }
+    impl Flags392 {
+        fn new() -> Self {
+            Self {
+                silent_ms: 0.0,
+                acc_silent_ms: 0.0,
+                shadow_done_for_pause: false,
+                acc_done_for_pause: false,
+                speech_since_last_reset: false,
+                acc_pending_has_speech: false,
+                prev_has_speech: false,
+                dispatches: 0,
+            }
+        }
+        /// 推进一帧。`vad_on` = VAD 可用；`silence_ms` = 派发静音阈值(1200)。
+        fn step(
+            &mut self,
+            has_speech: bool,
+            vad_speech: bool,
+            chunk_ms: f32,
+            vad_on: bool,
+            silence_ms: f32,
+            pending_samples: usize,
+        ) {
+            // 时序（has_speech）
+            if !has_speech {
+                if vad_on && self.prev_has_speech && !vad_speech {
+                    self.silent_ms = localrt_vad_seed_ms();
+                    self.acc_silent_ms = localrt_vad_seed_ms();
+                } else {
+                    self.silent_ms += chunk_ms;
+                    self.acc_silent_ms += chunk_ms;
+                }
+            } else {
+                self.silent_ms = 0.0;
+                self.acc_silent_ms = 0.0;
+                self.shadow_done_for_pause = false;
+                self.acc_done_for_pause = false;
+            }
+            // 内容（vad_speech）
+            if vad_speech {
+                self.speech_since_last_reset = true;
+                self.acc_pending_has_speech = true;
+            }
+            // 派发（should_dispatch_acc + 上 latch）
+            if should_dispatch_acc(
+                true,
+                self.acc_silent_ms,
+                pending_samples,
+                self.acc_done_for_pause,
+                self.acc_pending_has_speech,
+                silence_ms,
+            ) {
+                self.dispatches += 1;
+                self.acc_pending_has_speech = false;
+                self.acc_done_for_pause = true;
+            }
+            self.prev_has_speech = has_speech;
+        }
+    }
+
+    /// 测 #1（392）：门误判（has_speech 恒 false、vad_speech 真）一整句 ⇒
+    /// 内容标志 `speech_since_last_reset` / `acc_pending_has_speech` 被置位；
+    /// 其后静默满 1200ms ⇒ `should_dispatch_acc` 成立**恰一次**（不丢录音人内容、不碎片化）。
+    #[test]
+    fn ts392n_gate_misjudge_keeps_content_and_dispatches_once() {
+        let mut f = Flags392::new();
+        // 一整句 0.8s：门恒拒（has_speech=false），VAD 真。
+        for _ in 0..80 {
+            f.step(false, true, 10.0, true, 1200.0, 16000);
+        }
+        assert!(f.acc_pending_has_speech, "内容：门误判也不得丢录音人话");
+        assert!(f.speech_since_last_reset, "内容标志须置位");
+        // 随后 2s 静默（VAD 转假）。
+        for _ in 0..200 {
+            f.step(false, false, 10.0, true, 1200.0, 16000);
+        }
+        assert_eq!(f.dispatches, 1, "全程恰派发一次（内容不丢、也不碎片化）");
+    }
+
+    /// 测 #2（392）：背景人声（门拒、VAD 真）持续 10s + 录音人开口 2s + 停顿 1.5s ⇒
+    /// `should_dispatch_acc` 全程**恰 2 次**（背景一次、录音人一次）。
+    #[test]
+    fn ts392n_background_then_person_dispatches_exactly_twice() {
+        let mut f = Flags392::new();
+        for _ in 0..1000 {
+            f.step(false, true, 10.0, true, 1200.0, 16000); // 背景 10s
+        }
+        assert_eq!(f.dispatches, 1, "背景只随一次派发（done latch 生效）");
+        for _ in 0..200 {
+            f.step(true, true, 10.0, true, 1200.0, 16000); // 录音人 2s
+        }
+        for _ in 0..150 {
+            f.step(false, false, 10.0, true, 1200.0, 16000); // 停顿 1.5s
+        }
+        assert_eq!(f.dispatches, 2, "录音人一次 + 背景一次 = 恰 2 次");
+    }
+
+    /// 测 #3（392）：`SegmentPeakLevel` 首个确认段不学习 + 偶数样本取**下中位**。
+    #[test]
+    fn ts392n_peak_level_first_skipped_lower_median() {
+        let mut lv = SegmentPeakLevel::with_seed(None);
+        // [0.09(首段=按键高峰), 0.02, 0.02, 0.025]：首段不学。
+        assert!(!lv.learn_segment(0.09, 0.0), "首个确认段不得学习");
+        assert!(lv.learn_segment(0.02, 100.0));
+        assert!(lv.learn_segment(0.02, 200.0));
+        assert!(lv.learn_segment(0.025, 300.0));
+        assert_eq!(lv.samples.len(), 3, "首个 0.09 未进样本");
+        assert!(
+            (lv.estimate() - 0.02).abs() < 1e-6,
+            "三样本取下中位 = 0.02，实测 {}",
+            lv.estimate()
+        );
+        // 偶数样本取下中位：push [0.3, 0.1] ⇒ 0.1。
+        let mut lv2 = SegmentPeakLevel::with_seed(None);
+        lv2.push(0.3, 0.0);
+        lv2.push(0.1, 100.0);
+        assert!(
+            (lv2.estimate() - 0.1).abs() < 1e-6,
+            "偶数样本取下中位 = 0.1，实测 {}",
+            lv2.estimate()
+        );
+    }
+
+    /// 测 #4（392）：VAD 不可用 ⇒ `chunk_has_speech(None)` 的 `has_speech == vad_speech == rms>thr`；
+    /// 随机 300 组「内容/时序标志更新」与「均取 rms>thr」**逐位一致**（与 384 同）。
+    #[test]
+    fn ts392n_vad_unavailable_flags_bit_identical_to_energy() {
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0
+            }
+        }
+        let mut rng = Lcg(0x392_5eed);
+        let mut gate = SegmentGate::with_seed(None);
+        let mut fa = Flags392::new(); // 用 chunk_has_speech(None) 的判定
+        let mut fb = Flags392::new(); // 参考：两者皆取 rms>thr
+        for k in 0..300usize {
+            let rms = (rng.next() % 2000) as f32 / 10_000.0;
+            let thr = (rng.next() % 2000) as f32 / 10_000.0;
+            let chunk: &[f32] = &[];
+            let j = chunk_has_speech(None, chunk, rms, rms, k as f32 * 10.0, thr, &mut gate);
+            let e = rms > thr;
+            assert_eq!(j.has_speech, e, "k={k}: 兜底 has_speech == rms>thr");
+            assert_eq!(j.vad_speech, e, "k={k}: 兜底 vad_speech == rms>thr");
+            assert_eq!(j.has_speech, j.vad_speech, "兜底两标志必须相等");
+            fa.step(j.has_speech, j.vad_speech, 10.0, false, 1200.0, 16000);
+            fb.step(e, e, 10.0, false, 1200.0, 16000);
+            assert_eq!(fa.silent_ms, fb.silent_ms, "k={k}: silent_ms 逐位一致");
+            assert_eq!(fa.acc_silent_ms, fb.acc_silent_ms, "k={k}: acc_silent_ms");
+            assert_eq!(
+                fa.speech_since_last_reset, fb.speech_since_last_reset,
+                "k={k}: speech_since_last_reset"
+            );
+            assert_eq!(
+                fa.acc_pending_has_speech, fb.acc_pending_has_speech,
+                "k={k}: acc_pending_has_speech"
+            );
+            assert_eq!(
+                fa.acc_done_for_pause, fb.acc_done_for_pause,
+                "k={k}: acc_done_for_pause"
+            );
+            assert_eq!(fa.dispatches, fb.dispatches, "k={k}: 派发次数");
         }
     }
 }

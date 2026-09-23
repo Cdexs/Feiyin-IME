@@ -286,6 +286,15 @@
 - **验证**：`rustfmt` + `cargo check --all-targets` **0 error**、warnings **97/88**=基线；`cargo fmt --check` EXIT 0；numstat==-w（mod 81/0）。独立 Python 复刻 `max_new_tokens_for` 逐点 bad=0 + 源码锚点实测成立。
 - **未发现生产缺陷**。**未改版本 / 未 push / 零凭证**。
 
+## 2026-09-23 — coder-1 — TEST-SYNC-392 ✅ 交付（阶段三·非作者护栏，只改 `local_stream.rs` 的 `#[cfg(test)]` 区）
+
+- **被测**：`FIX-GATE-TIMING-ONLY-392`（coder-2，HEAD `a752455`，含主控补 done 复位）。按契约、不与作者 `gate392_tests` 重复。
+- **范围**：`src/transcription/local_stream.rs` **仅** `mod gate392_tests` 追加（+189/−1，生产零改动；那 1 行为补测模块 `use` 的 `should_dispatch_acc`）。
+- **4 条**：① 门误判（has_speech 恒 false、vad_speech 真）一整句 ⇒ 内容标志置位，其后静默满 1200ms ⇒ `should_dispatch_acc` 恰一次 ② 背景 10s + 录音人 2s + 停顿 1.5s ⇒ 恰 2 次派发（背景仅一次，done latch）③ 首段不学（0.09 不进样本）+ 下中位（[0.02,0.02,0.025]⇒0.02；[0.3,0.1]⇒0.1）④ VAD 不可用 ⇒ `chunk_has_speech(None)` 两标志 == rms>thr，随机 300 组标志更新逐位一致。
+- **方法**：测试内契约状态机 `Flags392`（复刻 `:1046-1090` + `:1432-1472`，循环内联不可抽函数）；判定走生产真函数。
+- **验证（白名单）**：`cargo fmt --check` **EXIT 0**；`cargo check --all-targets` **0 error**、warnings **97/88** = 基线；numstat==-w。🔴 **未跑 `cargo test`**（禁止，首跑阶段四）。
+- **未发现生产缺陷**；**未改生产代码 / 未改版本 / 未 push / 零凭证**。
+
 ## 2026-09-23 — coder-1 — FIX-VAD-FEED-BY-WINDOW-391 ✅ 交付（阶段一·只改 `vad.rs`）
 
 - **缺陷**（Gavin BUILD-390，P0）：说话到一半卡住、预览与最终输出只出前半段、结果出错。根因（主控查 sherpa 源码）：388 的 `speech_ranges`/`feed_is_speech` 把整段一次性 `accept_waveform`；sherpa `voice-activity-detector.cc`「一次调用内全窗 OR、起点定在输入末尾前 ~0.164s」⇒ 5s 语音只剩 ~0.37s（日志 `in=6.31s out=0.37s`）。🔴 该错误用法出自主控 **384 任务书补充第 2 条**「整块一次喂、不要切 512」——本单纠正（原 `segment()` 逐 512 块才是正确用法）。
@@ -304,3 +313,10 @@
 - **验证**：fmt EXIT 0 ｜ check 0 error、warnings 97/88=基线 ｜ 全量 test **0 failed**（bin 1562P/35I）｜ numstat==-w。
 - **未验证**：实机端测（不再中途卡住 / 预览与最终完整 / `segment end learned=` / `vad_only_speech_chunks`）交 tester-1/Gavin。
 - **未改版本 / 未 push / 零凭证**；未改 `docs/MACOS-HANDOFF.md`（结论交主控合入）。
+
+## 2026-09-23 — TEST-SYNC-391（coder-2，✅ 阶段三交付：非作者护栏 3 条）
+
+- **性质**：只写测试、零生产改动；仅 `src/transcription/vad.rs` `#[cfg(test)] mod testsync391_tests`。被测 `FIX-VAD-FEED-BY-WINDOW-391`（HEAD `a752455`）。🔴 **未跑 `cargo test`**（阶段四首跑）。
+- **新增 3 条**：逐块覆盖性质（300 组逐样本拼接校验）、源码护栏（无直接整段 accept、必经 `feed_in_vad_windows`）、`#[ignore]` 旧写法反例（整块只落末尾 vs 逐块覆盖语音主体）。
+- **验证**：`rustfmt` + `cargo check --all-targets` **0 error**、warnings **97/88**=基线；`cargo fmt --check` EXIT 0；numstat==-w（vad 160/0）。独立 Python 复刻 `feed_in_vad_windows` 5000 组 bad=0 + 源码护栏实跑成立。
+- **未发现生产缺陷**。**未改版本 / 未 push / 零凭证**。

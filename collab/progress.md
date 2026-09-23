@@ -1366,3 +1366,12 @@ load_wordbook_vocabulary()
 | 单测 | 新增 `gate392_*` 4 条；改写 8 条（392 契约变更）；既有 342/346/349/337/384/389/ts389 全通过 |
 | 验证 | fmt EXIT 0 ｜ check 0 error、warnings 97/88=基线 ｜ 全量 test 0 failed（bin 1562P/35I）｜ numstat==-w（262/54） |
 | 下一步 | 阶段三 TEST-SYNC（非作者）→ 阶段四 TEST-EXEC → 出包；端测盯「不再中途卡住 / 输出完整 / learned= / vad_only_speech_chunks」 |
+
+## TEST-SYNC-392 · 非作者护栏：门只管时序、内容只看 VAD · 2026-09-23 · coder-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 仅 `src/transcription/local_stream.rs` 的 `#[cfg(test)]` 区（189/1，**生产零改动**）。给 coder-2 的 392 按契约补 4 条独立用例（`ts392n_`） |
+| 覆盖 | ① 门误判整句不丢内容且静默满 1200ms 恰派发一次 ② 背景 10s + 录音人 2s + 停顿 1.5s ⇒ 恰 2 次派发 ③ 首段不学 + 下中位数（0.02 / 0.1）④ VAD 不可用 ⇒ 两标志 == rms>thr 且随机 300 组标志更新逐位一致 |
+| 验证 | `cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**、warnings **97/88** = 基线；numstat == -w。🔴 **未跑 `cargo test`**（白名单；首跑阶段四） |
+| 结论 | **未发现生产缺陷**；未改版本/未 push/零凭证 |
