@@ -425,6 +425,9 @@ fn endpoint_action(segment_has_speech: bool, confirm_text_empty: bool) -> Endpoi
 ///
 /// 只保留 `build_padded_segments` 的 200ms 边界 padding 与 `FIX-VAD-STATE-RESET-001`
 /// 边界过滤/clamp（start 越界丢弃并 warn、end 超界 clamp）。
+/// VAD-393（A3）：生产派发改走 [`build_dispatch_segment_with_spans`]（带时间线映射）；本无 spans
+/// 版本保留供单测（对照音频逐位相等）⇒ 生产非测试构建无调用点，允许 dead_code。
+#[allow(dead_code)]
 fn build_dispatch_segment(
     start: usize,
     len: usize,
@@ -432,6 +435,60 @@ fn build_dispatch_segment(
     pcm: &[f32],
 ) -> Vec<Vec<f32>> {
     super::build_sliding_segments(&[(start, len)], total_samples, pcm)
+}
+
+/// VAD-393（A2）：同 [`build_dispatch_segment`]，**额外**返回每片 `(pcm_start, pcm_end, pad_before)`。
+/// 供把实时 VAD 时间线映射为片内坐标（复用实时判断、不再对每窗重跑 VAD）。
+fn build_dispatch_segment_with_spans(
+    start: usize,
+    len: usize,
+    total_samples: usize,
+    pcm: &[f32],
+) -> (Vec<Vec<f32>>, Vec<(usize, usize, usize)>) {
+    super::build_sliding_segments_with_spans(&[(start, len)], total_samples, pcm)
+}
+
+/// VAD-393（A2）：把会话语音时间线（`pcm` 绝对坐标）按各片的 `spans`（`(pcm_start, pcm_end, pad_before)`）
+/// 映射为**片内坐标**：与 `[pcm_start, pcm_end)` 相交的部分平移 `- pcm_start + pad_before`。
+/// 与某片无交 ⇒ 该片为空表。纯函数，可单测。
+fn slice_ranges_from_timeline(
+    timeline: &[(usize, usize)],
+    spans: &[(usize, usize, usize)],
+) -> Vec<Vec<(usize, usize)>> {
+    spans
+        .iter()
+        .map(|&(ps, pe, pad_before)| {
+            let mut out = Vec::new();
+            for &(ts, te) in timeline {
+                let s = ts.max(ps);
+                let e = te.min(pe);
+                if s < e {
+                    out.push((s - ps + pad_before, e - ps + pad_before));
+                }
+            }
+            out
+        })
+        .collect()
+}
+
+/// VAD-393-R1：派发片的片内区间。VAD 不可用，**或派发时刻 VAD 仍在语音段中** ⇒ `None`
+///（调用方回退 391 自跑 VAD，整窗重判，不会漏掉进行中段）。
+///
+/// 依据（sherpa-onnx 1.13.8 `voice-activity-detector.cc`）：`IsSpeechDetected()` 返回 `start_ != -1`
+///（:196）—— 进行中段的标志；段只在**非语音分支**入队（:110-120）或 `Flush()`（:187）里产出，
+/// 且同一次处理里 `start_ = -1`（:134 或 :190）。C API `SherpaOnnxVoiceActivityDetectorDetected`
+/// → `impl->IsSpeechDetected()`（`c-api.cc:1391-1398`）。⇒ `vad_speech == true` 时该段尚未进
+/// `timeline`，据残缺时间线剪静音会把它剪掉（吞字），故回退自跑 VAD。
+fn dispatch_slice_ranges(
+    vad_on: bool,
+    vad_mid_speech: bool,
+    timeline: &[(usize, usize)],
+    spans: &[(usize, usize, usize)],
+) -> Option<Vec<Vec<(usize, usize)>>> {
+    if !vad_on || vad_mid_speech {
+        return None;
+    }
+    Some(slice_ranges_from_timeline(timeline, spans))
 }
 
 // ===========================================================================
@@ -494,10 +551,13 @@ fn chunk_has_speech(
     now_ms: f32,
     silence_threshold: f32,
     gate: &mut SegmentGate,
+    // VAD-393（A2）：会话语音时间线（`pcm` 绝对坐标），喂入同时收集已完成段。
+    timeline: &mut Vec<(usize, usize)>,
 ) -> ChunkJudgment {
     match vad {
         Some(v) => {
-            let vad_speech = v.feed_is_speech(chunk);
+            // VAD-393：feed_speech = 逐 512 块喂 + 收集已完成段（time）；返回值等价 feed_is_speech。
+            let vad_speech = v.feed_speech(chunk, timeline);
             let has_speech = gate.update(vad_speech, smooth_rms, now_ms);
             ChunkJudgment {
                 has_speech,
@@ -863,7 +923,9 @@ pub fn transcribe_streaming_local(
     vad_device: &str,
     mut on_result: impl FnMut(&str, &[WordTiming]),
     acc_cfg: AccDispatchConfig,
-    mut on_segment: impl FnMut(usize, usize, Vec<Vec<f32>>, String),
+    // VAD-393（A2）：新增第 5 参 `slice_ranges`：**片内坐标**的语音区间（VAD 时间线映射而来）；
+    // VAD 不可用 ⇒ `None`（调用方回退自行跑 VAD）。
+    mut on_segment: impl FnMut(usize, usize, Vec<Vec<f32>>, String, Option<Vec<Vec<(usize, usize)>>>),
     // LOCALRT-SEAM-337（自适应定界，主控定案）：派发点 P 后边界在**三者最先发生**时冻结：
     //   a. 文本停止增长（静默中连续 `ACC_BOUNDARY_STABLE_MS` 无新增）⇒ `Some(当前显示长度)`，允许回灌；
     //   b. 有声 chunk 恢复 ⇒ `None`，该 seg **不回灌**（保持纯流式；宁可这轮不修，也不吐残留重复）；
@@ -951,6 +1013,9 @@ pub fn transcribe_streaming_local(
     // 用于区分「真 endpoint（本句有语音）」与「静音流上的假 endpoint」：后者不确认、
     // 不推进游标、不并入预览（F3 幻字抑制）。
     let mut speech_since_last_reset: bool = false;
+    // VAD-393（A2）：会话语音时间线（`pcm` 绝对坐标，按序）。实时 VAD 逐 chunk 产出，派发时
+    // 映射为片内 ranges ⇒ **复用实时判断、不再对每个窗口重跑 VAD**（且窗口开头有前文、结论与实时一致）。
+    let mut speech_timeline: Vec<(usize, usize)> = Vec::new();
     // 影子收尾产出的当前句文本（仅显示；新语音进来即作废）。
     let mut shadow_current: Option<String> = None;
     // 本轮静默是否已跑过影子（同一停顿不重复解码）。
@@ -1040,6 +1105,7 @@ pub fn transcribe_streaming_local(
             session_ms,
             silence_threshold,
             &mut segment_gate,
+            &mut speech_timeline, // VAD-393（A2）：喂入同时收集已完成段
         );
         let has_speech = judgment.has_speech;
         let vad_speech = judgment.vad_speech;
@@ -1442,7 +1508,8 @@ pub fn transcribe_streaming_local(
             acc_cfg.silence_ms,
         ) {
             let pending = pcm.len() - acc_dispatched_end;
-            let padded = build_dispatch_segment(acc_dispatched_end, pending, pcm.len(), &pcm);
+            let (padded, spans) =
+                build_dispatch_segment_with_spans(acc_dispatched_end, pending, pcm.len(), &pcm);
             if !padded.is_empty() {
                 if log::log_enabled!(log::Level::Debug) {
                     log::debug!(
@@ -1460,7 +1527,27 @@ pub fn transcribe_streaming_local(
                 // 344-G：本片流式文本（失败片的填补来源），按 char 切片，字符安全。
                 let seg_streaming = segment_streaming_text(&last_display, acc_prev_committed);
                 acc_prev_committed = committed_len;
-                on_segment(acc_seg_index, committed_len, padded, seg_streaming);
+                // VAD-393（A2/R1）：派发由**静默 1200ms**（门 `has_speech`）触发，不保证派发当刻
+                // VAD 段已结束（门拒背景人声 / 误拒录音人轻声 / 本句与背景声无缝相接 ⇒ VAD 仍在段中）。
+                // VAD 已结束 ⇒ 时间线完整、可用；VAD 仍在段中（进行中段尚未入队）⇒ 回退 391 自跑 VAD
+                //（`dispatch_slice_ranges` 返回 None），绝不据缺失时间线剪掉这一段（= 吞字）。
+                let slice_ranges =
+                    dispatch_slice_ranges(vad_on, vad_speech, &speech_timeline, &spans);
+                if slice_ranges.is_none() && vad_on && vad_speech {
+                    if log::log_enabled!(log::Level::Debug) {
+                        log::debug!(
+                            "[LocalRT-DBG-393] timeline fallback: vad mid-speech at dispatch seg={}",
+                            acc_seg_index
+                        );
+                    }
+                }
+                on_segment(
+                    acc_seg_index,
+                    committed_len,
+                    padded,
+                    seg_streaming,
+                    slice_ranges,
+                );
                 // 337：派发点 P 起，等自适应边界冻结（a/b/c 最先者）。
                 bound_seg = Some(acc_seg_index);
                 bound_prev_len = committed_len;
@@ -1542,13 +1629,19 @@ pub fn transcribe_streaming_local(
     // PARALLEL-ACC-298：尾片 —— 录音结束，把剩余未派发区间作为最后一片派给 accuracy。
     // 本段未在静默 1200ms 前派出的音频（含短录音全量）在此一次性交出 ⇒ 等价「单片=全量」。
     // 🔴 只有「本段出现过语音」才派（纯静音尾片会把 all_native 翻 false）；有语音的尾巴绝不吞。
+    // VAD-393（A2）：🔴 尾片派发**之前** flush 实时 VAD，把尾句剩余语音补进时间线
+    //（否则尾句未达 min_silence、不在 timeline ⇒ ranges 缺尾句）。
+    if let Some(v) = session_vad {
+        v.flush_speech(&mut speech_timeline);
+    }
     if should_dispatch_tail(
         acc_cfg.enabled,
         pcm.len().saturating_sub(acc_dispatched_end),
         acc_pending_has_speech,
     ) {
         let pending = pcm.len() - acc_dispatched_end;
-        let padded = build_dispatch_segment(acc_dispatched_end, pending, pcm.len(), &pcm);
+        let (padded, spans) =
+            build_dispatch_segment_with_spans(acc_dispatched_end, pending, pcm.len(), &pcm);
         if !padded.is_empty() {
             if log::log_enabled!(log::Level::Debug) {
                 log::debug!(
@@ -1561,7 +1654,16 @@ pub fn transcribe_streaming_local(
             let committed_len = last_display.chars().count();
             // 344-G：尾片流式文本（同 mid-loop，按 char 切片）。
             let seg_streaming = segment_streaming_text(&last_display, acc_prev_committed);
-            on_segment(acc_seg_index, committed_len, padded, seg_streaming);
+            // VAD-393（A2/R1）：尾片前已 `flush_speech` ⇒ 无进行中段 ⇒ `mid_speech=false`
+            //（`vad_on=false` ⇒ None，回退 391 自跑 VAD，与中途派发同口径）。
+            let slice_ranges = dispatch_slice_ranges(vad_on, false, &speech_timeline, &spans);
+            on_segment(
+                acc_seg_index,
+                committed_len,
+                padded,
+                seg_streaming,
+                slice_ranges,
+            );
         }
         // 尾片是最后一次派发：函数即将返回，无需再推进 `acc_dispatched_end`/`acc_seg_index`
         // （推进了也无人读 ⇒ 触发 unused_assignments）。
@@ -1666,6 +1768,344 @@ pub fn transcribe_streaming_local(
     }
 
     Ok((final_preview, pcm))
+}
+
+/// VAD-393（A2）：实时 VAD 时间线 → 片内坐标映射（纯函数，无需模型）。
+#[cfg(test)]
+mod timeline393_tests {
+    use super::{
+        build_dispatch_segment_with_spans, dispatch_slice_ranges, slice_ranges_from_timeline,
+        VadSegmenter,
+    };
+
+    /// 393-R1：`dispatch_slice_ranges` 四种组合 —— `!vad_on` 或 `mid_speech` ⇒ `None`（回退自跑）。
+    #[test]
+    fn ts393_dispatch_slice_ranges_fallback_when_mid_speech() {
+        let timeline = [(100usize, 200usize)];
+        let spans = [(0usize, 400usize, 0usize)];
+        assert!(dispatch_slice_ranges(false, false, &timeline, &spans).is_none());
+        assert!(dispatch_slice_ranges(false, true, &timeline, &spans).is_none());
+        assert!(dispatch_slice_ranges(true, true, &timeline, &spans).is_none());
+        assert_eq!(
+            dispatch_slice_ranges(true, false, &timeline, &spans),
+            Some(vec![vec![(100, 200)]])
+        );
+    }
+
+    /// 393-R2 源码护栏：`transcribe_streaming_local` 生产区（剔除注释行）中，尾片派发前必须
+    /// `flush_speech(&mut speech_timeline)` —— 出现在 `if should_dispatch_tail(` **之前**。
+    #[test]
+    fn ts393_flush_speech_before_tail_dispatch_source_guard() {
+        let src = include_str!("local_stream.rs");
+        let body = src
+            .split("pub fn transcribe_streaming_local(")
+            .nth(1)
+            .expect("transcribe_streaming_local 锚点缺失");
+        // 生产区 = 到第一个 `#[cfg(test)]` 之前。
+        let prod = body.split("#[cfg(test)]").next().unwrap();
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let flush = code
+            .find("flush_speech(&mut speech_timeline)")
+            .expect("flush_speech 调用缺失");
+        let tail = code
+            .find("if should_dispatch_tail(")
+            .expect("should_dispatch_tail 调用缺失");
+        assert!(flush < tail, "flush_speech 必须在尾片派发之前");
+    }
+
+    /// 单片段：时间线落在片段内 ⇒ 平移 `-pcm_start + pad_before`。
+    #[test]
+    fn ts393_slice_ranges_maps_single_span() {
+        // 片段 pcm 绝对 [1000, 4000)，前置 pad 200 ⇒ 语音 [1500,3000) → 片内 [700,2200)。
+        let timeline = [(1500usize, 3000usize)];
+        let spans = [(1000usize, 4000usize, 200usize)];
+        assert_eq!(
+            slice_ranges_from_timeline(&timeline, &spans),
+            vec![vec![(700, 2200)]]
+        );
+    }
+
+    /// 无交 ⇒ 该片空表；部分相交 ⇒ 裁剪到片段边界后平移。
+    #[test]
+    fn ts393_slice_ranges_clips_and_empties() {
+        let timeline = [(0usize, 100usize), (1500, 9000)];
+        let spans = [(1000usize, 2000usize, 0usize)];
+        // (0,100) 无交 ⇒ 丢；(1500,9000)∩(1000,2000)=(1500,2000) ⇒ 平移 -1000 = (500,1000)。
+        assert_eq!(
+            slice_ranges_from_timeline(&timeline, &spans),
+            vec![vec![(500, 1000)]]
+        );
+    }
+
+    /// 多片段：跨片段的时间线分别落到各片（各片独立平移）。
+    #[test]
+    fn ts393_slice_ranges_multi_span() {
+        let timeline = [(1200usize, 1800usize), (2500, 3200)];
+        let spans = [
+            (1000usize, 2000usize, 0usize),
+            (2000usize, 3000usize, 0usize),
+        ];
+        assert_eq!(
+            slice_ranges_from_timeline(&timeline, &spans),
+            vec![vec![(200, 800)], vec![(500, 1000)]]
+        );
+    }
+
+    /// `build_dispatch_segment_with_spans` 与 `build_dispatch_segment` 音频逐位一致，
+    /// 且 `spans.len() == padded.len()`、`pcm_start == pad_before`（片内语音起点）。
+    #[test]
+    fn ts393_dispatch_with_spans_matches_plain_audio() {
+        let pcm: Vec<f32> = (0..16000).map(|i| (i as f32) * 0.001).collect();
+        let (padded, spans) = build_dispatch_segment_with_spans(0, pcm.len(), pcm.len(), &pcm);
+        let plain = super::build_dispatch_segment(0, pcm.len(), pcm.len(), &pcm);
+        assert_eq!(padded.len(), plain.len());
+        assert_eq!(spans.len(), padded.len());
+        for &(ps, pe, pad_before) in &spans {
+            assert!(ps <= pe);
+            assert_eq!(pad_before, 0, "整段无前置 pad ⇒ pad_before=0");
+        }
+    }
+
+    /// E2E（需 silero v6 模型 + full.wav）：**实时时间线复用**端到端 ——
+    /// 逐 512 样本喂 `feed_speech` 收集时间线 → 组一个整段派发 → 映射为片内区间 →
+    /// `trim_to_speech` 剪静音。断言：① 时间线非空；② 映射区间都落在片段内且有序非空；
+    /// ③ 剪后保留语音（不增长）且**短于**原片段（首尾 2s 静音被剪）。
+    #[test]
+    #[ignore = "requires silero model + full.wav; cargo test --bin feiyin-ime -- --ignored --nocapture timeline393"]
+    fn timeline393_realtime_timeline_trim_e2e() {
+        const RATE: usize = 16_000;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let model_dir = root.join("models");
+        let wav = root.join("collab/research/audio-real-gavin/processed/full.wav");
+        let Some(wave) = sherpa_onnx::Wave::read(wav.to_str().unwrap()) else {
+            eprintln!("skip: full.wav 缺失");
+            return;
+        };
+        let Some(vad) = VadSegmenter::try_new_for_local_silence(&model_dir) else {
+            eprintln!("skip: silero VAD 不可用");
+            return;
+        };
+        // 首尾各 2s 静音 ⇒ 保证剪静音有可剪之处；中间为真人声 full.wav。
+        let mut audio = vec![0.0f32; 2 * RATE];
+        audio.extend_from_slice(wave.samples());
+        audio.extend(std::iter::repeat(0.0f32).take(2 * RATE));
+        // 逐 512 喂入（与生产 realtime 一致），收集已完成段为时间线。
+        let mut timeline: Vec<(usize, usize)> = Vec::new();
+        for chunk in audio.chunks(512) {
+            vad.feed_speech(chunk, &mut timeline);
+        }
+        vad.flush_speech(&mut timeline);
+        assert!(!timeline.is_empty(), "v6 时间线应检测到语音段");
+        // 组一个整段派发（span 覆盖全量）→ 映射为**每子段**的片内区间。
+        let (padded, spans) =
+            build_dispatch_segment_with_spans(0, audio.len(), audio.len(), &audio);
+        let slice_ranges = slice_ranges_from_timeline(&timeline, &spans);
+        assert_eq!(slice_ranges.len(), padded.len(), "每子段一组区间");
+        assert!(
+            slice_ranges.iter().any(|r| !r.is_empty()),
+            "至少一个子段应含语音区间"
+        );
+        // 模拟 main.rs `shift_and_concat_ranges`：拼窗 + 各子段区间偏移到窗内坐标。
+        let lens: Vec<usize> = padded.iter().map(|s| s.len()).collect();
+        let window_audio: Vec<f32> = padded.concat();
+        let mut flat: Vec<(usize, usize)> = Vec::new();
+        let mut off = 0usize;
+        for (j, r) in slice_ranges.iter().enumerate() {
+            for &(s, e) in r {
+                flat.push((s + off, e + off));
+            }
+            off += lens[j];
+        }
+        let mut prev = 0usize;
+        for &(s, e) in &flat {
+            assert!(
+                s < e && e <= window_audio.len(),
+                "区间越界/倒置: {s}..{e} / {}",
+                window_audio.len()
+            );
+            assert!(s >= prev, "区间应有序");
+            prev = e;
+        }
+        let pad = (crate::transcription::vad::LOCALRT_TRIM_PAD_SECS * RATE as f32) as usize;
+        let trimmed = crate::transcription::trim_to_speech(&window_audio, &flat, pad);
+        let in_secs = window_audio.len() as f32 / RATE as f32;
+        let out_secs = trimmed.len() as f32 / RATE as f32;
+        println!(
+            "timeline393 e2e: in={in_secs:.2}s out={out_secs:.2}s timeline={} subsegs={} ranges={}",
+            timeline.len(),
+            padded.len(),
+            flat.len()
+        );
+        assert!(!trimmed.is_empty(), "剪后不得为空");
+        assert!(out_secs <= in_secs + 1e-3, "剪静音不应增长");
+        assert!(out_secs < in_secs, "首尾 2s 静音应被剪 ⇒ out 应短于 in");
+    }
+
+    /// 393-R3：对一个派发片逐子片做「实时时间线剪静音」(tl) vs「391 自跑 VAD 剪静音」(vad) 对照。
+    /// 追加行到 `rows`；超差 / 吞字记入 `fails`。模块级（无闭包捕获），供 R3 E2E 调用。
+    fn check_dispatch_393(
+        seg: usize,
+        pcm: &[f32],
+        start: usize,
+        end: usize,
+        mid_speech: bool,
+        timeline: &[(usize, usize)],
+        probe: &VadSegmenter,
+        pad: usize,
+        rows: &mut Vec<String>,
+        fails: &mut Vec<String>,
+    ) {
+        if end <= start {
+            return;
+        }
+        let (slices, spans) = build_dispatch_segment_with_spans(start, end - start, pcm.len(), pcm);
+        if slices.is_empty() {
+            return;
+        }
+        let ranges = dispatch_slice_ranges(true, mid_speech, timeline, &spans);
+        for (k, slice) in slices.iter().enumerate() {
+            let in_secs = slice.len() as f32 / 16_000.0;
+            let vad_out =
+                crate::transcription::trim_to_speech(slice, &probe.speech_ranges(slice), pad);
+            let vad_secs = vad_out.len() as f32 / 16_000.0;
+            match &ranges {
+                Some(rs) => {
+                    let tl_out = crate::transcription::trim_to_speech(slice, &rs[k], pad);
+                    let tl_secs = tl_out.len() as f32 / 16_000.0;
+                    let diff = (tl_secs - vad_secs).abs();
+                    rows.push(format!(
+                        "seg={seg} sub={k} in={in_secs:.2} tl_out={tl_secs:.2} vad_out={vad_secs:.2} diff={diff:.2}"
+                    ));
+                    if diff > 0.3 {
+                        fails.push(format!(
+                            "seg={seg} sub={k} |tl-vad|={diff:.2}>0.3 (tl={tl_secs:.2} vad={vad_secs:.2})"
+                        ));
+                    }
+                    if vad_secs > 0.0 && tl_secs <= 0.0 {
+                        fails.push(format!(
+                            "seg={seg} sub={k} vad_out={vad_secs:.2}>0 但 tl_out=0（时间线少剪出语音）"
+                        ));
+                    }
+                }
+                None => rows.push(format!(
+                    "seg={seg} sub={k} in={in_secs:.2} tl_out=fallback vad_out={vad_secs:.2}"
+                )),
+            }
+        }
+    }
+
+    /// 393-R3：真模型 E2E —— 按 1200ms 静默切派发片，逐子片对照「实时时间线剪静音」(tl) 与
+    /// 「391 自跑 VAD 剪静音」(vad)。断言非回退子片 `|tl − vad| ≤ 0.3s`，且 vad 有语音时 tl 不得为 0。
+    /// 原 `timeline393_realtime_timeline_trim_e2e` **保留不删**（本测为其加强版）。
+    #[test]
+    #[ignore = "requires silero model + full.wav; cargo test --bin feiyin-ime -- --ignored --nocapture timeline393r3"]
+    fn timeline393_r3_per_dispatch_vs_391_e2e() {
+        const RATE: usize = 16_000;
+        const CHUNK: usize = 160; // 10ms，与生产 realtime 同粒度喂入
+        const SILENCE_TRIGGER_MS: f32 = 1200.0;
+
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let model_dir = root.join("models");
+        let wav = root.join("collab/research/audio-real-gavin/processed/full.wav");
+        let Some(wave) = sherpa_onnx::Wave::read(wav.to_str().unwrap()) else {
+            eprintln!("skip: full.wav 缺失");
+            return;
+        };
+        let Some(vad) = VadSegmenter::try_new_for_local_silence(&model_dir) else {
+            eprintln!("skip: silero VAD 不可用");
+            return;
+        };
+        let Some(probe) = VadSegmenter::try_new_for_local_trim(&model_dir) else {
+            eprintln!("skip: silero trim VAD 不可用");
+            return;
+        };
+        // 首尾各 2s 静音 ⇒ 保证有可剪静音 + 尾片。
+        let mut audio = vec![0.0f32; 2 * RATE];
+        audio.extend_from_slice(wave.samples());
+        audio.extend(std::iter::repeat(0.0f32).take(2 * RATE));
+
+        let pad = (crate::transcription::vad::LOCALRT_TRIM_PAD_SECS * RATE as f32) as usize;
+        let min_silence_ms = crate::transcription::vad::LOCALRT_VAD_MIN_SILENCE_SECS * 1000.0;
+
+        let mut timeline: Vec<(usize, usize)> = Vec::new();
+        let mut pcm: Vec<f32> = Vec::with_capacity(audio.len());
+        let mut dispatched_end = 0usize;
+        let mut silent_ms = 0.0f32;
+        let mut prev_vad = false;
+        let mut seg_has_speech = false;
+        let mut seg = 0usize;
+        let mut rows: Vec<String> = Vec::new();
+        let mut fails: Vec<String> = Vec::new();
+
+        for off in (0..audio.len()).step_by(CHUNK) {
+            let end = (off + CHUNK).min(audio.len());
+            let chunk = &audio[off..end];
+            pcm.extend_from_slice(chunk);
+            let vad_speech = vad.feed_speech(chunk, &mut timeline);
+            let cms = chunk.len() as f32 / RATE as f32 * 1000.0;
+            if vad_speech {
+                silent_ms = 0.0;
+                seg_has_speech = true;
+            } else if prev_vad {
+                // LOCALRT-VAD-SILENCE-384：VAD「人声→无人声」翻转补 min_silence（同生产）。
+                silent_ms = min_silence_ms;
+            } else {
+                silent_ms += cms;
+            }
+            prev_vad = vad_speech;
+            // 静默 ≥1200ms 且本段有语音 ⇒ 派发；`vad_speech` 作为 mid-speech 判据（本测不模拟近场门）。
+            if silent_ms >= SILENCE_TRIGGER_MS && seg_has_speech && pcm.len() > dispatched_end {
+                check_dispatch_393(
+                    seg,
+                    &pcm,
+                    dispatched_end,
+                    pcm.len(),
+                    vad_speech,
+                    &timeline,
+                    &probe,
+                    pad,
+                    &mut rows,
+                    &mut fails,
+                );
+                seg += 1;
+                dispatched_end = pcm.len();
+                seg_has_speech = false;
+            }
+        }
+        // 尾片：flush 后无进行中段 ⇒ mid_speech=false。
+        vad.flush_speech(&mut timeline);
+        if pcm.len() > dispatched_end && seg_has_speech {
+            check_dispatch_393(
+                seg,
+                &pcm,
+                dispatched_end,
+                pcm.len(),
+                false,
+                &timeline,
+                &probe,
+                pad,
+                &mut rows,
+                &mut fails,
+            );
+        }
+
+        println!(
+            "timeline393-r3 per-dispatch comparison ({} rows):",
+            rows.len()
+        );
+        for r in &rows {
+            println!("  {r}");
+        }
+        for f in &fails {
+            eprintln!("  FAIL: {f}");
+        }
+        assert!(!rows.is_empty(), "应至少产生一个派发子片");
+        assert!(fails.is_empty(), "存在超差/吞字子片：{}", fails.join("; "));
+    }
 }
 
 #[cfg(test)]
@@ -2665,7 +3105,7 @@ mod tests {
                 .map(|i| if i % 2 == 0 { amp } else { -amp })
                 .collect();
             let rms = (chunk.iter().map(|s| s * s).sum::<f32>() / 1600.0).sqrt();
-            let j = chunk_has_speech(None, &chunk, rms, rms, 100.0, THR, &mut g);
+            let j = chunk_has_speech(None, &chunk, rms, rms, 100.0, THR, &mut g, &mut Vec::new());
             assert_eq!(
                 j.has_speech,
                 rms > THR,
@@ -2679,7 +3119,8 @@ mod tests {
         }
         let chunk = vec![THR; 1600];
         assert!(
-            !chunk_has_speech(None, &chunk, THR, THR, 100.0, THR, &mut g).has_speech,
+            !chunk_has_speech(None, &chunk, THR, THR, 100.0, THR, &mut g, &mut Vec::new())
+                .has_speech,
             "rms 恰为阈值 ⇒ false（> 而非 >=）"
         );
     }
@@ -3467,7 +3908,7 @@ mod gate392_tests {
         const THR: f32 = 0.01;
         for rms in [0.0f32, 0.005, THR, 0.02, 0.5] {
             let chunk = vec![rms; 160];
-            let j = chunk_has_speech(None, &chunk, rms, rms, 0.0, THR, &mut g);
+            let j = chunk_has_speech(None, &chunk, rms, rms, 0.0, THR, &mut g, &mut Vec::new());
             assert_eq!(j.has_speech, rms > THR);
             assert_eq!(
                 j.vad_speech, j.has_speech,
@@ -3637,7 +4078,16 @@ mod gate392_tests {
             let rms = (rng.next() % 2000) as f32 / 10_000.0;
             let thr = (rng.next() % 2000) as f32 / 10_000.0;
             let chunk: &[f32] = &[];
-            let j = chunk_has_speech(None, chunk, rms, rms, k as f32 * 10.0, thr, &mut gate);
+            let j = chunk_has_speech(
+                None,
+                chunk,
+                rms,
+                rms,
+                k as f32 * 10.0,
+                thr,
+                &mut gate,
+                &mut Vec::new(),
+            );
             let e = rms > thr;
             assert_eq!(j.has_speech, e, "k={k}: 兜底 has_speech == rms>thr");
             assert_eq!(j.vad_speech, e, "k={k}: 兜底 vad_speech == rms>thr");

@@ -2234,3 +2234,15 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 录音人音量估计：偶数样本取下中位；每次录音首个确认段不学习 | 首句按键声 / 起音不再把门限抬高 | 同上 |
 
 无新平台 API / 依赖 / 构建脚本变化。
+
+## VAD-V6-AND-TIMELINE-REUSE-393（2026-09-23，coder-1）· silero VAD 升 v6.2.3 + 实时时间线复用剪静音 —— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `models/silero-vad/silero_vad.onnx` **同路径替换**为 silero **v6.2.3**（2,327,524B，sha256 `1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3`） | v4 小模型 → v6.2 大模型；小声/闷声/低质电话明显改善；纯正弦不再判语音 | 🔴 **构建产物变化**：macOS 侧必须**同路径替换同版本模型文件**（同名同路径、sha256 一致），否则两端 VAD 判定不一致；**代码无需改**（`find_silero_vad_model` 路径未动）。🔴 模型目录 `/models` 受 `.gitignore` 忽略 ⇒ **不进 commit**，两端均须经各自模型分发路径携带 |
+| `CtxInject` 新增字段 `speech_ranges: Option<&'a [(usize, usize)]>` + `streaming_nonempty: bool` | 时间线剪静音来源由调用方下发；`None` 回退自跑 VAD | 🔴 **平台契约变更**（`transcription/mod.rs` 平台中立）：macOS **所有 `CtxInject { .. }` 构造点必须补这两个字段**，否则编译失败。Windows 侧已补齐：`transcription/mod.rs` ×2、`main.rs` ×2、`poc_slice_cut_381.rs` ×2、`audio/mod.rs` ×1 |
+| `VadSegmenter` 新增 `feed_speech`/`flush_speech`（pub）；`feed_is_speech` 改薄包装 | 逐 512 块喂入同时收集已完成语音段为时间线 | ✅ 平台中立，macOS 同继承；未删任何 pub 符号 |
+| `LOCALRT_VAD_MAX_SPEECH_SECS=60.0`（仅 `try_new_for_local_silence`/`try_new_for_local_trim`） | 本地实时单段上限 20s → 60s；离线/在线仍 20s | ✅ 平台中立纯逻辑，只影响本地 realtime 管线 |
+| `transcribe_streaming_local` 的 `on_segment` 闭包新增第 5 参 `Option<Vec<Vec<(usize,usize)>>>` | 派发时带上各子段片内语音区间 | ✅ 平台中立；macOS 若另有该闭包实现点需同步（当前仅 `main.rs` 一处生产实现） |
+| A4 剪静音日志加 `source=timeline\|vad\|none`（Debug 级） | 可核对剪静音来源分布 | ✅ 平台中立 |
+| **macOS 侧需要做什么** | | ① 同路径替换 `models/silero-vad/silero_vad.onnx` 为 v6.2.3（sha256 一致）；② 编译前在所有 `CtxInject` 构造点补 `speech_ranges`/`streaming_nonempty`。未新增用户开关/env（DEC-031）、未触 `src/platform/macos/**`、未改构建脚本/依赖 |

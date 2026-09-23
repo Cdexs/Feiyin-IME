@@ -33,6 +33,7 @@
 | --- | --- | --- |
 | ✅ `FIX-VAD-FEED-BY-WINDOW-391` | 修「说话到一半卡住 / 只出前半段」P0：`speech_ranges`/`feed_is_speech` 改**逐 512 块**喂入（388 整段一次性喂入命中 sherpa「大 n」语义陷阱 ⇒ 6.31s 只剩 0.37s）。**2026-09-23 阶段一交付 coder-1**：新增真模型 `#[ignore]` 实跑（4 段 6s 语音剪后 **6.44/6.31/6.38/5.78s**、旧整块写法复现 **0.36s**、`feed_is_speech` 块大小 160/512/1600/16000 差异 ≤ 喂入块）+ 纯逻辑喂入次数测试；`fmt --check` EXIT0、`check --all-targets` 0 error、全量 **1646P/0F/37I**。**待 tester-1 阶段四回归 + 392 合包 + 端测** | coder-1（`vad.rs`） |
 | ✅ `FIX-GATE-TIMING-ONLY-392`（+ ✅ 阶段三 `TEST-SYNC-392`） | `local_stream.rs` 门只管时序、内容去留只看 VAD、下中位数、首段不学。**阶段三 2026-09-23 交付 coder-1**：仅 `local_stream.rs` 的 `#[cfg(test)]` **+4 条**（门误判不丢内容恰派发一次 / 背景+录音人恰 2 次 / 首段不学+下中位 / VAD 不可用两标志逐位一致），`fmt --check` EXIT 0、`check --all-targets` 0 error、warnings **97/88**=基线；**未跑 `cargo test`**；**未发现生产缺陷** | coder-2（实现）+ coder-1（阶段三护栏） |
+| 🔄 `VAD-V6-AND-TIMELINE-REUSE-393`（**主控验收退回返工** `VAD-393-REWORK`，见 `acceptance-393.md`：R1 派发时 VAD 仍在语音段中 ⇒ 时间线缺段 ⇒ 吞字，改回退 391 自跑；R2 缺尾片 flush 护栏；R3 E2E 未按任务书逐片对照；R4/R5 小修） | silero VAD 同路径升 **v6.2.3**（v4 备份 evidence、**无回退机制**）+ 本地实时 `max_speech 60s` + **实时时间线复用剪静音**（A1~A4；空区间+流式非空⇒整窗不吞字，无时间线⇒回退 391 自跑 VAD 仍 v6）。**2026-09-23 阶段一交付 coder-1**：`fmt --check` EXIT 0、`check --all-targets` 0 error、warnings **97/88**=基线；新增单测 **11 条** + 真模型 E2E（60.15s→53.79s）；`--ignored vad` 11/11；全量 **1580P/0F/38I**。**待 tester-1 阶段四回归 + 端测（与 393 同包）** | coder-1（`vad`/`local_stream`/`main`/`transcription`） |
 
 ### 🧊 待观察 · FORCED-ALIGN-372（设想，**未立项**，等 371 端测结果）
 
@@ -92,19 +93,20 @@ Gavin 2026-09-22 原话：
 | 待定 | A/B 谁来跑：主控用生产 key 跑（花钱）／ Gavin 端测充当 A/B |
 | 详情 | `todo-archive.md` §「提示词优化三单」（202 已完成、203 已撤单） |
 
-### TRANS-LANG-UI-213 · 翻译目标语言补设置界面开关
+### ~~TRANS-LANG-UI-213~~ 已撤销 → TRANS-COPY-395 · 翻译说明文案改为「自动方向」
 
-**由来**：Gavin 定原则「程序内部加载处理的逻辑不暴露给用户，防止误操作导致处理异常」，
-README 里教用户改 `config.toml` 的段落已全部删除。但 `translation.target_language`
-**没有界面控件**（`grep ui/src` 确认，仅 `HotkeySettings.tsx:145` 作默认值透传），
-删掉说明后用户就无从切换方向 —— **README 已写「切换选项正在补进设置界面」，这是对用户的承诺，必须兑现**。
+**2026-09-23 Gavin 拍板（DEC-082）**：「保持现在目前的自动探测翻译方向的这个机制，界面先不要加翻译方向的这个下拉选项。」
+⇒ 213（界面加目标语言下拉）撤销；README「切换选项正在补进设置界面」已由主控删除改写。
+
+剩余只是文案对齐：界面说明仍写「翻译为**目标语言**」，而界面上没有目标语言可选。
 
 | 项 | 内容 |
 | --- | --- |
-| 影响文件 | `ui/src/pages/HotkeySettings.tsx`（翻译热键区加下拉）+ `ui/src/i18n/{en,zh-Hans,zh-Hant}.ts` 三份补 key |
-| 改动 | 中文 / 英文 二选一下拉，写回 `translation.target_language`；Rust 侧字段已存在，**后端零改动** |
-| 注意 | 🔴 三份 locale 必须同时补，参照 `I18N-HANT-GAP-001`（繁中曾漏一个 key）|
-| 验收 | 切换后 `config.toml` 落盘正确 + 重启保持 + 三语言界面文案齐全 |
+| 派给 | coder-2，**394 交付后**（同属 coder-2，不并发）；随 393/394 同一包出 |
+| 影响文件 | `ui/src/i18n/{en,zh-Hans,zh-Hant}.ts` 的 `hotkey_translation_usage` 一个 key，三份同改 |
+| 改动 | 中：「同时按住翻译热键 + 录音热键：说中文译为英文，说英文译为中文。」（繁、英同义） |
+| 路径 | 小改动短路径：改完 grep 三份 + Vitest 由 tester-1 在合包回归里跑 |
+| 顺带 | 394 验收通过时主控把 README「翻译」节的「本地 opus-mt 模型」改为 NLLB |
 
 ### TEST-SYNC-194 · FIX-192 顺序护栏
 
@@ -156,7 +158,6 @@ README 里教用户改 `config.toml` 的段落已全部删除。但 `translation
 | ITN-FIX-BIGNUM-027 遗留三条 | `一万亿`→`10000亿` 是否改；`十万个为什么`→`10万个为什么` 专名被改写是否开单；`两万五百`→`20500` 备查 | §「ITN-FIX-BIGNUM-027」 |
 | RESEARCH-SCENE-COVERAGE-001 | 场景词表扩展研究，三项已拍板落地，剩余争议项待定 | §「RESEARCH-SCENE-COVERAGE-001」 |
 | 领域级泛化关键词第二批 | `思维导图` / `白板` / `表格` 是否收进词表 | §「领域级泛化关键词第二批」 |
-| 翻译方向是否改双向全自动 | 现方向由 `translation.target_language` 决定；改双向 LLM 路径易改，离线 NLLB 需按方向换模型 | §「等 Gavin 拍板」 |
 | FORMAT 保底层（A 方案） | 不开 LLM 的用户要不要规则层语气词去除保底 | §「等 Gavin 拍板」 |
 | `qwen3_asr_url` 默认值 | 维持 dashscope 还是留空强制用户配置 | §「等 Gavin 拍板」 |
 | TELEGRAM-RESTART-001 | Telegram 通道恢复路线（降级 CLI / 等官方放开 / 手动轮询） | §「未排期任务」 |

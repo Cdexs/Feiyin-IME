@@ -20,8 +20,9 @@ mod poc_slice_cut_381;
 #[allow(unused_imports)]
 pub use vad::{
     build_padded_segments, build_padded_segments_capped, build_sliding_segments,
-    join_segment_texts, naive_chunk, should_segment, VadSegmenter, SEGMENT_MAX_SECS,
-    SEGMENT_PADDING_SAMPLES, SEGMENT_TRIGGER_SECS, SLIDING_CUT_SEARCH_START_SECS,
+    build_sliding_segments_with_spans, join_segment_texts, naive_chunk, should_segment,
+    VadSegmenter, SEGMENT_MAX_SECS, SEGMENT_PADDING_SAMPLES, SEGMENT_TRIGGER_SECS,
+    SLIDING_CUT_SEARCH_START_SECS,
 };
 
 /// BUG-119（BUILD-118 端测第 1 项）：「用户没说话」的类型化信号，不是设备/网络错误。
@@ -270,6 +271,16 @@ pub struct CtxInject<'a> {
     /// 用于识别「解码坍塌」（[`output_rate_ok`]）。`None` = 冷启动/样本不足 ⇒ 不判坍塌。
     /// 由调用方（`main.rs` 滑窗 worker）在派发当刻算出快照传入。
     pub avg_chars_per_sec: Option<f32>,
+    /// VAD-393（A4）：本窗**窗内坐标**的语音区间（由实时 VAD 时间线映射而来）。
+    ///
+    /// - `Some(r)` 且 `r` 非空 ⇒ 直接据此剪静音（**不再对窗口重跑 VAD**）；
+    /// - `Some(r)` 且 `r` 为空 + [`Self::streaming_nonempty`] ⇒ 不复剪、**整窗解码**（时间线判无语音
+    ///   但流式有文本时宁可多解、不吞字）；
+    /// - `Some(r)` 且 `r` 为空 + `!streaming_nonempty` ⇒ 提前返回空串；
+    /// - `None` ⇒ **回退 388/391**：自跑线程级 VAD 取区间（仍用 v6 模型），VAD 不可用则原样解码。
+    pub speech_ranges: Option<&'a [(usize, usize)]>,
+    /// VAD-393（A4）：本窗**流式文本**是否非空（区间空表时的兜底判据，见 [`Self::speech_ranges`]）。
+    pub streaming_nonempty: bool,
 }
 
 /// 回显探针归一化：去空白与常见中英标点（回显是逐字文本，标点差异不应漏检）。
@@ -868,6 +879,38 @@ fn trim_to_speech(audio: &[f32], ranges: &[(usize, usize)], pad: usize) -> Vec<f
     out
 }
 
+/// VAD-393（A4）：实时时间线剪静音的**动作**（纯决策，可单测，无需模型）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TimelineTrim {
+    /// 非空区间 ⇒ 据此剪静音。
+    Apply(Vec<(usize, usize)>),
+    /// 时间线判无语音但本窗流式有文本 ⇒ **不复剪、整窗解码**（宁可多解，不吞字）。
+    WholeWindow,
+    /// 时间线判无语音且流式也空 ⇒ 提前返回空串。
+    Empty,
+}
+
+/// VAD-393（A4）：给定「实时时间线区间 + 本窗流式是否非空」决定剪静音动作。
+///
+/// `speech_ranges = None` ⇒ 返回 `None`（调用方**回退 388/391 自跑 VAD**）；`Some` 的三种情形见
+/// [`TimelineTrim`]。纯函数，把「时间线是否可用 / 是否空表 / 流式兜底」三态从模型调用里剥出。
+fn plan_timeline_trim(
+    speech_ranges: Option<&[(usize, usize)]>,
+    streaming_nonempty: bool,
+) -> Option<TimelineTrim> {
+    speech_ranges.map(|ranges| {
+        if ranges.is_empty() {
+            if streaming_nonempty {
+                TimelineTrim::WholeWindow
+            } else {
+                TimelineTrim::Empty
+            }
+        } else {
+            TimelineTrim::Apply(ranges.to_vec())
+        }
+    })
+}
+
 /// LOCALRT-CTX-INJECT-320：带「上下文 + 词库」per-stream 注入 + 长跨回显护栏的 accuracy 单段解码。
 ///
 /// - `context`：前序分片累计文本（调用方已截到最后 300 字；第 1 片传 None）。
@@ -883,33 +926,57 @@ pub(crate) fn transcribe_acc_ctx(
     // FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388（A）：解码前剪静音（本地 realtime 专用）。
     // 根因：sherpa #3509 —— 带 hotwords 的 Qwen3-ASR 遇静音会吐热词/坍塌；派发片把「上句说完到
     // 本句开口」的长停顿全带进窗口 ⇒ 大量静音 + 少量语音。先 VAD 取语音区间、每侧留 200ms。
+    // VAD-393（A4）：优先用调用方给的**实时时间线**（窗内坐标）⇒ 不再对每窗重跑 VAD；
+    //   无时间线（`None`）才回退 388/391 的线程级自跑 VAD（仍用同一 v6 模型）。
     let in_secs = samples.len() as f32 / 16000.0;
     let pad = (vad::LOCALRT_TRIM_PAD_SECS * 16000.0) as usize;
-    let trim_model_dir = model_dir();
-    let (samples_used, trimmed, n_ranges) = LOCALRT_TRIM_VAD.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(VadSegmenter::try_new_for_local_trim(&trim_model_dir));
-        }
-        match slot.as_ref().and_then(|o| o.as_ref()) {
-            Some(vseg) => {
-                let ranges = vseg.speech_ranges(samples);
-                if ranges.is_empty() {
-                    (Vec::new(), true, 0usize)
-                } else {
-                    (trim_to_speech(samples, &ranges, pad), true, ranges.len())
-                }
+    // 返回 `(解码用样本, 是否经 VAD 判定, 区间数, 剪静音来源)`；`source` ∈ {timeline, vad, none}。
+    let (samples_used, trimmed, n_ranges, trim_src) =
+        match plan_timeline_trim(inject.speech_ranges, inject.streaming_nonempty) {
+            Some(TimelineTrim::Apply(ranges)) => (
+                trim_to_speech(samples, &ranges, pad),
+                true,
+                ranges.len(),
+                "timeline",
+            ),
+            // 时间线判无语音但本窗流式有文本 ⇒ 不复剪、整窗解码（宁可多解，不吞字）。
+            Some(TimelineTrim::WholeWindow) => (samples.to_vec(), false, 0usize, "timeline"),
+            // 时间线判无语音且流式也空 ⇒ 空结果（下方 `trimmed && n_ranges == 0` 统一早退）。
+            Some(TimelineTrim::Empty) => (Vec::new(), true, 0usize, "timeline"),
+            None => {
+                let trim_model_dir = model_dir();
+                LOCALRT_TRIM_VAD.with(|cell| {
+                    let mut slot = cell.borrow_mut();
+                    if slot.is_none() {
+                        *slot = Some(VadSegmenter::try_new_for_local_trim(&trim_model_dir));
+                    }
+                    match slot.as_ref().and_then(|o| o.as_ref()) {
+                        Some(vseg) => {
+                            let ranges = vseg.speech_ranges(samples);
+                            if ranges.is_empty() {
+                                (Vec::new(), true, 0usize, "vad")
+                            } else {
+                                (
+                                    trim_to_speech(samples, &ranges, pad),
+                                    true,
+                                    ranges.len(),
+                                    "vad",
+                                )
+                            }
+                        }
+                        None => (samples.to_vec(), false, 0usize, "none"),
+                    }
+                })
             }
-            None => (samples.to_vec(), false, 0usize),
-        }
-    });
+        };
     if trimmed && n_ranges == 0 {
         // 整窗无语音 ⇒ 空解码（交 386-C 流式兜底），**不**进模型（避免念词表 / 失败日志刷屏）。
         if log::log_enabled!(log::Level::Debug) {
             log::debug!(
-                "[LocalRT-DBG-388] trim: seg={} in={:.2}s out=0.00s ranges=0 vad=true",
+                "[LocalRT-DBG-388] trim: seg={} in={:.2}s out=0.00s ranges=0 source={}",
                 seg_idx,
-                in_secs
+                in_secs,
+                trim_src
             );
         }
         return Ok((String::new(), true));
@@ -921,12 +988,12 @@ pub(crate) fn transcribe_acc_ctx(
     let token_cap = max_new_tokens_for(speech_secs);
     if log::log_enabled!(log::Level::Debug) {
         log::debug!(
-            "[LocalRT-DBG-388] trim: seg={} in={:.2}s out={:.2}s ranges={} vad={} max_new_tokens={}",
+            "[LocalRT-DBG-388] trim: seg={} in={:.2}s out={:.2}s ranges={} source={} max_new_tokens={}",
             seg_idx,
             in_secs,
             speech_secs,
             n_ranges,
-            trimmed,
+            trim_src,
             token_cap
         );
     }
@@ -3962,6 +4029,8 @@ mod poc_qwen3_17b_351 {
             let inject = CtxInject {
                 terms: Some(FIT_WORDLIST),
                 avg_chars_per_sec: None,
+                speech_ranges: None,
+                streaming_nonempty: false,
             };
             let t0 = Instant::now();
             let (text, _native) =
@@ -4320,6 +4389,8 @@ mod poc_qwen3_17b_351 {
         let inject = CtxInject {
             terms: None,
             avg_chars_per_sec: None,
+            speech_ranges: None,
+            streaming_nonempty: false,
         };
         let seg0 = transcribe_acc_ctx(
             &rec,
@@ -5888,6 +5959,47 @@ mod fix388_trim_and_floor_tests {
 //   契约：先剥 `<[A-Za-z_/][^<>]{0,30}>`；词表回显（连续 ≥4 条）或剥后残余全为词条 /
 //   只剩标点 / 空 ⇒ 不带注入重解一次；重解仍无效 ⇒ 空串 + `invalid=true`；正文夹标签只剥不重解。
 // ============================================================
+/// VAD-393（A4）：时间线剪静音的**纯决策**（三态），无需模型。
+#[cfg(test)]
+mod testsync393_tests {
+    use super::{plan_timeline_trim, TimelineTrim};
+
+    /// `None`（无时间线）⇒ 一律返回 `None`，调用方回退自跑 VAD（与流式是否非空无关）。
+    #[test]
+    fn ts393_plan_none_falls_back_to_vad() {
+        assert_eq!(plan_timeline_trim(None, true), None);
+        assert_eq!(plan_timeline_trim(None, false), None);
+    }
+
+    /// 非空区间 ⇒ `Apply`（原样带上区间，供 `trim_to_speech`）。
+    #[test]
+    fn ts393_plan_nonempty_applies_ranges() {
+        let r = [(10usize, 20usize), (30, 40)];
+        assert_eq!(
+            plan_timeline_trim(Some(&r), false),
+            Some(TimelineTrim::Apply(vec![(10, 20), (30, 40)]))
+        );
+    }
+
+    /// 空区间 + 流式非空 ⇒ `WholeWindow`（不复剪、整窗解码，防漏判吞字）。
+    #[test]
+    fn ts393_plan_empty_with_streaming_decodes_whole_window() {
+        assert_eq!(
+            plan_timeline_trim(Some(&[]), true),
+            Some(TimelineTrim::WholeWindow)
+        );
+    }
+
+    /// 空区间 + 流式也空 ⇒ `Empty`（提前返回空串）。
+    #[test]
+    fn ts393_plan_empty_without_streaming_is_empty() {
+        assert_eq!(
+            plan_timeline_trim(Some(&[]), false),
+            Some(TimelineTrim::Empty)
+        );
+    }
+}
+
 #[cfg(test)]
 mod testsync388_tests {
     use super::{apply_acc_disposition, has_content, output_rate_ok, trim_to_speech, GuardKind};

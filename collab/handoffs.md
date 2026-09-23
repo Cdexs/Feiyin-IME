@@ -7,6 +7,15 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-23 — coder-1 — VAD-V6-AND-TIMELINE-REUSE-393 ✅ 交付（阶段一；待主控验收）
+
+- **C 换模型**：`models/silero-vad/silero_vad.onnx` **同路径替换为 silero v6.2.3**（`2,327,524B`，sha256 `1a153a22…`）；v4（`643,854B`，`9e2449e1…`）备份至 `collab/evidence/vad-v4-backup/`（**运行时不引用**）。🔴 **无 v4 回退机制**（Gavin 裁定）。v6 下原 2 条以 440Hz 正弦冒充语音的夹具改用 `full.wav` 真人声（断言/参数不动）+ 新增 `v6_pure_sine_not_detected_as_speech`。
+- **B**：新增 `LOCALRT_VAD_MAX_SPEECH_SECS=60.0`，仅本地实时两构造使用；离线 `try_new` / 在线 `try_new_for_streaming` 仍 `VAD_MAX_SPEECH_DURATION`（20s）。
+- **A 时间线复用**（不再每窗重跑 VAD）：A1 `vad.rs` `feed_speech`/`flush_speech` + `build_sliding_segments_with_spans`；A2 `local_stream.rs` `slice_ranges_from_timeline` + `on_segment` 第 5 参 + `chunk_has_speech` 收集时间线；A3 `main.rs` `shift_and_concat_ranges` + `AccSliceMsg`/`AccTaskMsg`/`decode_window` 接线；A4 `mod.rs` `CtxInject` 增 `speech_ranges`+`streaming_nonempty`、`plan_timeline_trim` 三态分派（空区间 + 流式非空 ⇒ 整窗解码不吞字；`None` ⇒ 回退 391 自跑 VAD，仍 v6），日志 `source=timeline|vad|none`。
+- **验证**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**、warnings **97/88** = 基线；新增单测 **11 条** + 真模型 E2E `timeline393`（**60.15s → 53.79s**）；`--ignored vad` **11/11 通过**；全量 `cargo test --bin feiyin-ime` **1580P/0F/38I**。
+- **同步改动**：`ts391_entry_points_feed_by_window_only` 按 A1 新结构更新（`feed_speech` 走 `feed_in_vad_windows`；`feed_is_speech` 断言委托 `feed_speech`）；`poc_slice_cut_381.rs` / `audio/mod.rs` 仅补 `CtxInject` 新字段。`docs/MACOS-HANDOFF.md` 新增本次节。
+- 红线：未 commit / 未 push / 未出包 / 版本号未动 / 零凭证。**待 tester-1 阶段四回归 + 端测**。
+
 ## 2026-09-23 — tester-1 — TEST-EXEC + BUILD-392 ✅ 出包（388/389/390/391/392 合包；八项 + 三特殊点全 PASS；guard346 修复后重派）
 
 - **交付源码**：HEAD `ad08251`，工作区 clean，版本 0.9.3。核心单 388（VAD 剪静音+重解把关）/ 389（整句近场门+跨录音沿用音量+预览不回退）/ 390（解码串行+`max_new_tokens` 限流）/ 391（VAD 按 512 逐块喂入，修剪静音吞字）/ 392（近场门只管时序、内容去留只看 VAD；音量估计下中位、首段不学）。**上一轮 HEAD `bfe584b` 全量回归捕捉 `guard346_acc_counter_wiring` FAILED，停手上报；主控 `ad08251` 修复后重派**。

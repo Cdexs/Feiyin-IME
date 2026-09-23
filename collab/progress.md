@@ -1,4 +1,11 @@
 
+### 2026-09-23 · VAD-V6-AND-TIMELINE-REUSE-393 交付（silero VAD v6.2.3 + 本地实时 60s + 实时时间线复用剪静音）
+
+- **C**：`models/silero-vad/silero_vad.onnx` 同路径替换为 silero **v6.2.3**（2,327,524B，sha256 `1a153a22…`）；v4 备份 `collab/evidence/vad-v4-backup/`（运行时不引用）；**无 v4 回退机制**。v6 下 2 条正弦冒充语音夹具改 `full.wav` 真人声 + 新增纯正弦负例 ⇒ `--ignored vad` 11/11。
+- **B**：`LOCALRT_VAD_MAX_SPEECH_SECS=60.0` 仅本地实时两构造使用，离线/在线仍 20s。
+- **A**：实时 VAD 时间线随派发下发，剪静音优先复用（不再每窗重跑 VAD）；空区间 + 流式非空 ⇒ 整窗解码不吞字；无时间线 ⇒ 回退 391 自跑 VAD（仍 v6）。
+- **验证**：`cargo fmt --check` EXIT 0；`check --all-targets` 0 error、warnings 97/88=基线；新增单测 11 条 + 真模型 E2E（60.15s→53.79s）；全量 `cargo test --bin feiyin-ime` **1580P/0F/38I**。未出包。
+
 ### 2026-09-22 · UNWIRE-STRIP-NODE-365（365+366 收口）交付
 
 - 350 剥离节点从路B 主路径摘除、降级分支仍挂（条件挂载 `b_strip_enabled`）；代码/7 单测/护栏保留可回挂；sync352-4 锚点同步、语义不变。

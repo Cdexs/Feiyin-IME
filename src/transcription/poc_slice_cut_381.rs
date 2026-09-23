@@ -111,6 +111,8 @@ fn decode_cuts(
         let inject = CtxInject {
             terms,
             avg_chars_per_sec: None,
+            speech_ranges: None,
+            streaming_nonempty: false,
         };
         let t0 = Instant::now();
         let (text, _) = transcribe_acc_ctx(rec, &audio[a..b], ChineseScript::Simplified, i, inject)
@@ -224,6 +226,8 @@ fn run_windows(
             CtxInject {
                 terms,
                 avg_chars_per_sec: None,
+                speech_ranges: None,
+                streaming_nonempty: false,
             },
         )
         .unwrap_or_default();

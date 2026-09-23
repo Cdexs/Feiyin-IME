@@ -2482,6 +2482,8 @@ mod tests {
             crate::transcription::CtxInject {
                 terms: None,
                 avg_chars_per_sec: None,
+                speech_ranges: None,
+                streaming_nonempty: false,
             },
         )
         .map(|(t, _)| t)

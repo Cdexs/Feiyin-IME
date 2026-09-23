@@ -8360,8 +8360,8 @@ fn spawn_worker_thread(
                         let send_offline = acc_offline.map(transcription::SendOfflineRecognizerRef);
                         // 325：载荷加 `committed_len`（派发当刻浮层显示字符数，回灌边界）。
                         // 344-G：载荷加 `seg_streaming`（本片流式文本，失败片的填补来源）。
-                        let (acc_tx, acc_rx) =
-                            crossbeam_channel::bounded::<(usize, usize, Vec<Vec<f32>>, String)>(64);
+                        // VAD-393（A3）：载荷再加班 `seg_ranges`（各片内语音区间，见 `AccSliceMsg`）。
+                        let (acc_tx, acc_rx) = crossbeam_channel::bounded::<AccSliceMsg>(64);
                         let acc_script = config.audio.chinese_script;
                         // 325：acc worker 逐片回灌预览所用的事件发送端（代际在 worker 内捕获）。
                         let acc_event_tx = event_tx.clone();
@@ -8408,6 +8408,10 @@ fn spawn_worker_thread(
                                         let mut window_streaming_texts: Vec<String> = Vec::new();
                                         // 386（C）：与 `recent_slices` 一一对应的各片流式文本（同批 sub_seg 共享）。
                                         let mut recent_streaming: Vec<String> = Vec::new();
+                                        // VAD-393（A3）：与 `recent_slices` 一一对应的各片**片内语音区间**
+                                        //（`None` = VAD 不可用 / 该片未给区间 ⇒ 组窗后整窗回退自跑 VAD）。
+                                        let mut recent_slice_ranges: Vec<Option<Vec<(usize, usize)>>> =
+                                            Vec::new();
                                         // 386（A）：待覆盖片全局下标（多片派发的末片延后，等下次派发/收尾纳入）。
                                         let mut pending_slice: Option<usize> = None;
                                         // 386（A）：收尾窗用的最近 dispatch_idx / committed_len。
@@ -8435,7 +8439,16 @@ fn spawn_worker_thread(
                                                 let trx = task_rx.clone();
                                                 let rtx = res_tx.clone();
                                                 pool.spawn(move || {
-                                                    for (seq, dispatch_idx, audio, avg_snapshot, dispatched_at) in trx {
+                                                    for (
+                                                        seq,
+                                                        dispatch_idx,
+                                                        audio,
+                                                        avg_snapshot,
+                                                        dispatched_at,
+                                                        window_ranges,
+                                                        streaming_nonempty,
+                                                    ) in trx
+                                                    {
                                                         // 382（3C）：排队时间 = 派发 → worker 开始解码。
                                                         let queued_ms =
                                                             dispatched_at.elapsed().as_secs_f64() * 1000.0;
@@ -8447,6 +8460,8 @@ fn spawn_worker_thread(
                                                             acc_script,
                                                             terms,
                                                             avg_snapshot,
+                                                            window_ranges.as_deref(),
+                                                            streaming_nonempty,
                                                         );
                                                         let ms = t0.elapsed().as_secs_f64() * 1000.0;
                                                         // 382（3C）：解码完成时刻（端到端「解完 → 浮层重画」）。
@@ -8601,12 +8616,27 @@ fn spawn_worker_thread(
                                                             rate_sum_secs,
                                                             rate_windows,
                                                         );
+                                                    // VAD-393（A3）：把本窗各片的**片内语音区间**拼成「窗内坐标」
+                                                    //（各片偏移 = 其前所有片样本数累计）；任一源片 `None` ⇒ 整窗 `None`。
+                                                    let window_ranges = shift_and_concat_ranges(
+                                                        &recent_slice_ranges[start..stop],
+                                                        &recent_slices[start..stop]
+                                                            .iter()
+                                                            .map(|s| s.len())
+                                                            .collect::<Vec<_>>(),
+                                                    );
+                                                    let window_streaming =
+                                                        recent_streaming[start..stop].concat();
+                                                    let streaming_nonempty =
+                                                        !window_streaming.trim().is_empty();
                                                     let _ = task_tx.send((
                                                         window_seq,
                                                         $idx,
                                                         window_audio,
                                                         avg_snapshot,
                                                         std::time::Instant::now(),
+                                                        window_ranges,
+                                                        streaming_nonempty,
                                                     ));
                                                     window_spans.push((gs, ge));
                                                     window_samples.push(
@@ -8615,8 +8645,7 @@ fn spawn_worker_thread(
                                                             .map(|s| s.len())
                                                             .collect(),
                                                     );
-                                                    window_streaming_texts
-                                                        .push(recent_streaming[start..stop].concat());
+                                                    window_streaming_texts.push(window_streaming);
                                                     window_committed_lens.push($win_committed);
                                                     window_boundary_usable.push($usable);
                                                     window_seq += 1;
@@ -8632,6 +8661,7 @@ fn spawn_worker_thread(
                                                             committed_len,
                                                             sub_segs,
                                                             seg_streaming,
+                                                            seg_ranges,
                                                         )) => {
                                                             // 386（A）：按「中途末片延后 / 下次派发纳入 / 收尾合并」规则组窗
                                                             //（规则与不变量见 `plan_windows`）。382 旧行为「每片立刻组窗」会把
@@ -8666,6 +8696,12 @@ fn spawn_worker_thread(
                                                             for (k, s) in sub_segs.into_iter().enumerate() {
                                                                 cum_new += new_lens[k];
                                                                 recent_slices.push(s);
+                                                                recent_slice_ranges.push(
+                                                                    seg_ranges
+                                                                        .as_ref()
+                                                                        .and_then(|v| v.get(k))
+                                                                        .cloned(),
+                                                                );
                                                                 recent_streaming
                                                                     .push(slice_streaming_text(k, &seg_streaming));
                                                                 total_slices += 1;
@@ -8673,6 +8709,7 @@ fn spawn_worker_thread(
                                                                     > transcription::WINDOW_MAX_SLICES
                                                                 {
                                                                     recent_slices.remove(0);
+                                                                    recent_slice_ranges.remove(0);
                                                                     recent_streaming.remove(0);
                                                                 }
                                                                 // 窗口以「当前片」收尾：其 end == 推送后的 total_slices。
@@ -8783,10 +8820,15 @@ fn spawn_worker_thread(
                                         ));
                                     },
                                     acc_cfg,
-                                    |idx, committed_len, segs, seg_streaming| {
+                                    |idx, committed_len, segs, seg_streaming, seg_ranges| {
                                         // 派发片送 accuracy worker（worker 不存在 ⇒ send 失败，忽略）。
-                                        let _ =
-                                            acc_tx.send((idx, committed_len, segs, seg_streaming));
+                                        let _ = acc_tx.send((
+                                            idx,
+                                            committed_len,
+                                            segs,
+                                            seg_streaming,
+                                            seg_ranges,
+                                        ));
                                     },
                                     |seg_index, committed_len| {
                                         // 337：自适应边界冻结（a 文本停止增长 / b 有声恢复 / c 硬上限）。
@@ -8928,6 +8970,9 @@ fn spawn_worker_thread(
                                                     terms: path_b_terms.as_deref(),
                                                     // 路B（367 起已摘接线）：无滑窗产出率均值 ⇒ 不判坍塌
                                                     avg_chars_per_sec: None,
+                                                    // VAD-393：路B 无实时时间线 ⇒ 回退自跑 VAD 剪静音。
+                                                    speech_ranges: None,
+                                                    streaming_nonempty: false,
                                                 };
                                                 match transcription::transcribe_acc_ctx(
                                                     rec,
@@ -10081,6 +10126,28 @@ enum TranscriptionFailure {
     /// 其余错误转字符串，走既有 convert_to_friendly_error 显示链。
     Other(String),
 }
+
+/// VAD-393（A3）：把「窗内各片的片内语音区间」按各片样本数偏移，拼成**窗内坐标**的合并区间表。
+///
+/// `slices[k]` 为第 k 片的 `Option<区间表>`（`None` = 该片无实时时间线）；`lens[k]` 为第 k 片样本数。
+/// 任一源片为 `None` ⇒ 返回 `None`（整窗回退自跑 VAD）；全为 `Some` ⇒ 拼接（不做合并，语义上
+/// 各片区间本就不重叠）。纯函数，可单测。
+fn shift_and_concat_ranges(
+    slices: &[Option<Vec<(usize, usize)>>],
+    lens: &[usize],
+) -> Option<Vec<(usize, usize)>> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut offset = 0usize;
+    for (i, s) in slices.iter().enumerate() {
+        let ranges = s.as_ref()?;
+        for &(a, b) in ranges {
+            out.push((a + offset, b + offset));
+        }
+        offset += lens.get(i).copied().unwrap_or(0);
+    }
+    Some(out)
+}
+
 /// PARALLEL-ACC-298：把 accuracy 并行各片的子段文本按 `seg_index` **升序**拼接成扁平列表。
 ///
 /// 单 worker + channel FIFO 已保证顺序，这里仍显式排序（乱序/缺号输入也稳定），
@@ -10094,6 +10161,10 @@ fn decode_window(
     terms: Option<&str>,
     // FIX-PREVIEW-STALE-AND-COLLAPSE-375（B）：本次录音已定稿窗口的产出率均值快照（冷启动 None）。
     avg_chars_per_sec: Option<f32>,
+    // VAD-393（A3）：本窗**窗内坐标**的语音区间（实时 VAD 时间线映射而来）；`None` ⇒ 回退自跑 VAD。
+    speech_ranges: Option<&[(usize, usize)]>,
+    // VAD-393（A4）：本窗流式文本是否非空（区间为空串时决定「整窗解码 vs 提前返回」）。
+    streaming_nonempty: bool,
 ) -> anyhow::Result<(String, bool)> {
     transcription::transcribe_acc_ctx(
         recognizer,
@@ -10103,6 +10174,8 @@ fn decode_window(
         transcription::CtxInject {
             terms,
             avg_chars_per_sec,
+            speech_ranges,
+            streaming_nonempty,
         },
     )
 }
@@ -11033,8 +11106,15 @@ mod parallel_acc_298_tests {
 }
 
 /// FIX-PREVIEW-HARVEST-380（A）：accuracy 滑窗线程的切片载荷
-/// `(切片下标, 派发当刻浮层字符数, 本片音频, 本片流式文本)`。
-type AccSliceMsg = (usize, usize, Vec<Vec<f32>>, String);
+/// `(切片下标, 派发当刻浮层字符数, 本片音频, 本片流式文本, 各片内语音区间)`。
+/// VAD-393（A3）：第 5 元为**片内坐标**的语音区间（实时 VAD 时间线映射）；VAD 不可用 ⇒ `None`。
+type AccSliceMsg = (
+    usize,
+    usize,
+    Vec<Vec<f32>>,
+    String,
+    Option<Vec<Vec<(usize, usize)>>>,
+);
 
 /// FIX-PREVIEW-HARVEST-380（A）：滑窗解码结果载荷
 /// `(window_seq, dispatch_idx, 解码结果, 解码耗时 ms, 解码完成时刻)`。
@@ -11048,8 +11128,18 @@ type AccDecodeResult = (
 );
 
 /// FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382：滑窗解码任务载荷
-/// `(window_seq, dispatch_idx, 本窗音频, 产出率均值快照, 派发时刻)`（末元供 3C `queued_ms`）。
-type AccTaskMsg = (usize, usize, Vec<f32>, Option<f32>, std::time::Instant);
+/// `(window_seq, dispatch_idx, 本窗音频, 产出率均值快照, 派发时刻, 本窗语音区间, 本窗流式文本非空)`
+/// （派发时刻供 3C `queued_ms`）。VAD-393（A3）：第 6 元为**窗内坐标**的合并语音区间；
+/// `None` ⇒ 回退 391 自跑 VAD。
+type AccTaskMsg = (
+    usize,
+    usize,
+    Vec<f32>,
+    Option<f32>,
+    std::time::Instant,
+    Option<Vec<(usize, usize)>>,
+    bool,
+);
 
 /// FIX-PREVIEW-HARVEST-380（A）：滑窗线程的一步（新切片 / 解码结果）。
 enum AccWindowStep<A, R> {
@@ -11089,6 +11179,38 @@ fn drive_acc_windows<A, R>(
                 Err(_) => break,
             },
         }
+    }
+}
+
+/// VAD-393（A3）：窗口语音区间拼接（片内坐标 → 窗内坐标）纯函数。
+#[cfg(test)]
+mod vad393_window_ranges_tests {
+    use super::shift_and_concat_ranges;
+
+    #[test]
+    fn ts393_all_some_offsets_by_cumulative_lens() {
+        let slices = vec![
+            Some(vec![(10usize, 20usize)]),
+            Some(vec![(5, 15), (30, 40)]),
+        ];
+        let lens = [100usize, 200usize];
+        // 第 0 片偏移 0；第 1 片偏移 100。
+        assert_eq!(
+            shift_and_concat_ranges(&slices, &lens),
+            Some(vec![(10, 20), (105, 115), (130, 140)])
+        );
+    }
+
+    #[test]
+    fn ts393_empty_slices_yield_some_empty() {
+        let slices: Vec<Option<Vec<(usize, usize)>>> = vec![Some(vec![]), Some(vec![])];
+        assert_eq!(shift_and_concat_ranges(&slices, &[10, 20]), Some(vec![]));
+    }
+
+    #[test]
+    fn ts393_any_none_yields_none() {
+        let slices = vec![Some(vec![(1usize, 2usize)]), None];
+        assert_eq!(shift_and_concat_ranges(&slices, &[10, 20]), None);
     }
 }
 

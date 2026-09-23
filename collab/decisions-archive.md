@@ -16,7 +16,7 @@ accuracy 提示词里的去口水话指令
 🔴 **不得据 DEC-077 正文自行移除本条。** 真正去口水话的是下游确定性节点
 `text_normalizer::strip_fillers_conservative`（`apply_filler_strip`），
 **两者并存，也不得因为「有了兜底」就摘掉兜底**。
-��同一份提示词在**不同语境**下效果不同：
+��同一份提示词在**不同语境**下效果不同：
 「资料铭印在灵魂里」搭配下提示能推动；「所 X 的资料」结构下模型对「明」先验更强，推不动。
 现象可稳定复现，正说明是确定性的模型行为而非偶发。
 
@@ -2925,3 +2925,30 @@ DEC-053（2026-08-16）的理由是「出包不落外网、请示拦不住风险
 
 DEC-047（标点判据 `has_effective_punctuation`）、`PUNCT-DOUBLE-334`（`。。` 老 bug）、
 DEC-041（禁止对 LLM 输出做程序化后处理补救）、357（提示词指令反噬实测）。
+
+---
+
+## DEC-082 · 翻译方向保持按内容自动判定，界面不加方向选项（2026-09-23）
+
+### 背景
+
+- 现状（TRANS-BIDIR-001，已验收）：`translation::derive_translation_target(text)` 按识别文本判方向，
+  含汉字 ⇒ 译英文，否则 ⇒ 译中文；`config.remember_translation_direction` 把实际方向写回
+  `translation.target_language`，该字段只是「上次方向」缓存，不再门控方向。
+- 设置界面核实（`ui/src` 全量）：只有「开启翻译」开关与翻译热键，**没有目标语言 / 方向控件**；
+  `target_language` 仅 `HotkeySettings.tsx:145` 作默认值透传。
+- 主控曾提议加「目标语言：英文 / 中文」下拉并改为按界面选择定方向（拟 395/396）。
+
+### 决策
+
+Gavin 原话：「那就保持现在目前的自动探测翻译方向的这个机制吧，界面先不要加翻译方向的这个下拉选项。」
+
+- 方向继续按内容自动判定；本地（394 起为 NLLB，`zho_Hans`↔`eng_Latn`）与 LLM 路径都不改方向逻辑
+- 设置界面不加方向选项；TRANS-LANG-UI-213 撤销；拟议的 395/396 不派发
+- 对外文案与现状对齐：README 删「切换选项正在补进设置界面」；界面说明 `hotkey_translation_usage`
+  由「翻译为目标语言」改为「说中文译英文，说英文译中文」（TRANS-COPY-395，三份 locale）
+
+### 影响
+
+- 代码逻辑零改动；`remember_translation_direction` 写回保留
+- 🔴 以后若有人再提「按界面选择定方向 / 加方向下拉」，先回查本条，须 Gavin 重新拍板

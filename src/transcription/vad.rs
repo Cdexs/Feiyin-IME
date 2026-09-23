@@ -122,6 +122,16 @@ pub const LOCALRT_VAD_MIN_SILENCE_SECS: f32 = 0.3;
 /// （≈3.8MB @16k f32），而非既有的 300s（≈19.2MB）。
 pub const LOCALRT_VAD_BUFFER_SECS: f32 = 60.0;
 
+/// VAD-393（B）：本地 realtime 两个构造（`try_new_for_local_silence` / `try_new_for_local_trim`）的
+/// **单段最长语音**，取 60s = [`LOCALRT_VAD_BUFFER_SECS`]。
+///
+/// 依据（sherpa `voice-activity-detector.cc:51-53, 227-229`）：`max_speech_duration` 超限后
+/// **阈值升 0.90、min_silence 降 0.1s 强制切段**；本地 realtime 需要「整句尽量不切」，
+/// 故把上限定到缓冲允许的 60s（而非离线/在线的 20s），避免长句被强制切。
+/// 🔴 离线分段 `try_new` / 在线门控 `try_new_for_streaming` 继续用
+/// [`VAD_MAX_SPEECH_DURATION`](20s)，**不动**。
+pub const LOCALRT_VAD_MAX_SPEECH_SECS: f32 = 60.0;
+
 /// FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388：本地 realtime **窗口剪静音**时，语音段两侧各留的 padding 秒数。
 ///
 /// 200ms 与既有多处边界 padding 同口径（保护送气清声母 ~60-100ms）。效果：
@@ -284,7 +294,7 @@ impl VadSegmenter {
                 min_silence_duration: LOCALRT_VAD_MIN_SILENCE_SECS,
                 min_speech_duration: VAD_MIN_SPEECH_DURATION,
                 window_size: VAD_WINDOW_SIZE,
-                max_speech_duration: VAD_MAX_SPEECH_DURATION,
+                max_speech_duration: LOCALRT_VAD_MAX_SPEECH_SECS,
             },
             ten_vad: sherpa_onnx::TenVadModelConfig::default(),
             sample_rate: 16000,
@@ -349,7 +359,7 @@ impl VadSegmenter {
                 min_silence_duration: LOCALRT_VAD_MIN_SILENCE_SECS,
                 min_speech_duration: VAD_MIN_SPEECH_DURATION,
                 window_size: VAD_WINDOW_SIZE,
-                max_speech_duration: VAD_MAX_SPEECH_DURATION,
+                max_speech_duration: LOCALRT_VAD_MAX_SPEECH_SECS,
             },
             ten_vad: sherpa_onnx::TenVadModelConfig::default(),
             sample_rate: 16000,
@@ -377,15 +387,45 @@ impl VadSegmenter {
     /// - 每 chunk 把**已完成**的语音段 `pop` 掉（只清段队列、**不 reset** 检测状态），
     ///   使长录音（≤300s）内部段队列不增长（内存有界）。
     /// 供本地 realtime 静音计时使用；与在线门控的 `accept_and_check` 平行、互不影响。
+    ///
+    /// 🔴 VAD-393（A1）：生产本地实时改走 [`Self::feed_speech`]（逐块喂 + 收集时间线）；本方法保留为
+    /// **薄包装**（391 契约的「逐块喂」入口，供单测与跨端；生产已无调用点 ⇒ 允许 dead_code）。
+    #[allow(dead_code)]
     pub fn feed_is_speech(&self, samples: &[f32]) -> bool {
+        // VAD-393（A1）：改为薄包装（仍逐 512 块喂入、行为不变），段队列照常清空。
+        let mut ignored: Vec<(usize, usize)> = Vec::new();
+        self.feed_speech(samples, &mut ignored)
+    }
+
+    /// VAD-393（A1）：逐 512 块喂入本 chunk，**同时把已完成的语音段收集到 `done`**，返回 `detected()`。
+    ///
+    /// 🔴 `(start, n)` 是 sherpa **自本实例 reset 起**的绝对样本坐标；`local_stream` 用**同一实例**、
+    /// 按**同一顺序喂入同样的 chunk**（见 `feed_in_vad_windows`），且实例在每次录音开始 `reset_for_new_session`
+    /// ⇒ `start` 即该录音 `pcm` 的样本下标（二者同序同量）。`(start, start+n)` 为**开区间**端点。
+    pub fn feed_speech(&self, samples: &[f32], done: &mut Vec<(usize, usize)>) -> bool {
         // FIX-391：逐 512 块喂入（不再一次性喂整块）。
         let _ = feed_in_vad_windows(samples, |block| self.detector.accept_waveform(block));
         let detected = self.detector.detected();
-        // 清掉本次已完成的段（队列有界：只保留进行中的段；不 reset 检测状态）。
-        while !self.detector.is_empty() {
+        // 收集已完成段（只清段队列、不 reset 检测状态 ⇒ 内存有界）。
+        while let Some(seg) = self.detector.front() {
+            let start = seg.start() as usize;
+            let n = seg.n() as usize;
             self.detector.pop();
+            done.push((start, start + n));
         }
         detected
+    }
+
+    /// VAD-393（A1）：录音收尾 —— `flush()` 后把剩余段收集到 `done`（尾句可能未达 min_silence）。
+    /// 调用方：`local_stream` 在**尾片派发之前**调用（否则尾句语音不在时间线里）。
+    pub fn flush_speech(&self, done: &mut Vec<(usize, usize)>) {
+        self.detector.flush();
+        while let Some(seg) = self.detector.front() {
+            let start = seg.start() as usize;
+            let n = seg.n() as usize;
+            self.detector.pop();
+            done.push((start, start + n));
+        }
     }
 }
 
@@ -449,6 +489,10 @@ pub fn build_padded_segments_capped(
 ///
 /// 200ms 边界 padding 与 FIX-VAD-STATE-RESET-001 边界过滤/clamp **完全沿用**
 /// （`plan_sliding_cuts` 与 `plan_hard_cuts` 共用同一段过滤代码）。
+///
+/// 🔴 VAD-393（A1）：带 spans 的姐妹函数 [`build_sliding_segments_with_spans`] 是新滑窗入口；本函数
+/// 保留供 20s 路径 / PoC / 单测（生产非测试构建已无调用点 ⇒ 允许 dead_code）。
+#[allow(dead_code)]
 pub fn build_sliding_segments(
     raw: &[(usize, usize)],
     total_samples: usize,
@@ -456,6 +500,20 @@ pub fn build_sliding_segments(
 ) -> Vec<Vec<f32>> {
     let merged = plan_sliding_cuts(raw, total_samples, full_audio);
     pad_and_extract(&merged, total_samples, full_audio)
+}
+
+/// VAD-393（A1）：同 [`build_sliding_segments`]，**额外**返回每片在 `pcm` 中的区间与前置零 padding 数。
+///
+/// `spans[k] = (pcm_start_k, pcm_end_k, pad_before_k)`：第 k 片的**语音区间** `[pcm_start_k, pcm_end_k)`
+///（`pcm` 坐标）与其片内**前置零样本数**（200ms padding 的一部分）。语音区间在片内起点 = `pad_before_k`。
+/// 只供滑窗路径（把实时 VAD 时间线映射为片内坐标）；`build_sliding_segments` / 20s 路径**逐位不变**。
+pub fn build_sliding_segments_with_spans(
+    raw: &[(usize, usize)],
+    total_samples: usize,
+    full_audio: &[f32],
+) -> (Vec<Vec<f32>>, Vec<(usize, usize, usize)>) {
+    let merged = plan_sliding_cuts(raw, total_samples, full_audio);
+    pad_and_extract_with_spans(&merged, total_samples, full_audio)
 }
 
 /// FIX-VAD-STATE-RESET-001 边界过滤 + 固定秒数硬切/合并相邻短段（原 `build_padded_segments_capped` 第一步）。
@@ -679,12 +737,24 @@ fn pad_and_extract(
     total_samples: usize,
     full_audio: &[f32],
 ) -> Vec<Vec<f32>> {
+    // VAD-393（A1）：单一实现 —— `pad_and_extract` 只是丢弃 spans（输出与旧实现逐位相同）。
+    pad_and_extract_with_spans(merged, total_samples, full_audio).0
+}
+
+/// VAD-393（A1）：[`pad_and_extract`] 的**全量**版 —— 额外返回每片 `(pcm_start, pcm_end, pad_before)`。
+/// 见 [`build_sliding_segments_with_spans`]。旧 `pad_and_extract` 委托本函数 ⇒ 20s 路径逐位不变。
+fn pad_and_extract_with_spans(
+    merged: &[(usize, usize)],
+    total_samples: usize,
+    full_audio: &[f32],
+) -> (Vec<Vec<f32>>, Vec<(usize, usize, usize)>) {
     if merged.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let pad = SEGMENT_PADDING_SAMPLES;
 
     let mut result: Vec<Vec<f32>> = Vec::with_capacity(merged.len());
+    let mut spans: Vec<(usize, usize, usize)> = Vec::with_capacity(merged.len());
     for (i, &(start, end)) in merged.iter().enumerate() {
         // padding 起点：首段 saturating_sub；后续段与前段间隙取中点
         let pad_start = if i == 0 {
@@ -725,8 +795,16 @@ fn pad_and_extract(
             seg.extend(std::iter::repeat(0.0f32).take(pad_end - end));
         }
         result.push(seg);
+        // VAD-393（A1）：语音区间（clamp 到 total）+ 片内前置零样本数。
+        // 393-R4：用 `saturating_sub`（`pad_start ≥ start` 时原式在 debug 下 panic；该函数现被
+        // 20s 路径共用）。片内语音起点 = 前置零个数，二者一致。
+        spans.push((
+            start,
+            end.min(total_samples),
+            start.saturating_sub(pad_start),
+        ));
     }
-    result
+    (result, spans)
 }
 
 /// 纯函数：是否应触发分段（音频时长 > SEGMENT_TRIGGER_SECS）
@@ -788,6 +866,32 @@ pub fn join_segment_texts(segments: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 393：读真人声 `full.wav`（供夹具用；缺失 ⇒ `None` ⇒ 用例跳过）。
+    fn real_speech_samples() -> Option<Vec<f32>> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let wav = root.join("collab/research/audio-real-gavin/processed/full.wav");
+        sherpa_onnx::Wave::read(wav.to_str()?).map(|w| w.samples().to_vec())
+    }
+
+    /// 393：总长 `total`，`windows`（样本区间）内用 `speech[src_off..]` 依序填「语音」，其余填 0。
+    fn speech_with_silence(
+        total: usize,
+        windows: &[(usize, usize)],
+        speech: &[f32],
+        src_off: usize,
+    ) -> Vec<f32> {
+        let mut v = vec![0.0f32; total];
+        let mut off = src_off;
+        for &(s, e) in windows {
+            let len = e - s;
+            let end = (off + len).min(speech.len());
+            let avail = end.saturating_sub(off);
+            v[s..s + avail].copy_from_slice(&speech[off..end]);
+            off += len;
+        }
+        v
+    }
 
     #[test]
     fn should_segment_below_threshold() {
@@ -984,30 +1088,26 @@ mod tests {
             }
         };
 
-        // 合成第一段长音频：30s 含两个语音段（用 sine 模拟语音能量）
-        let audio1: Vec<f32> = (0..480000)
-            .map(|i| {
-                let t = i as f32 / 16000.0;
-                // 0-10s 有语音 + 10-20s 静音 + 20-30s 有语音
-                if (5.0..=10.0).contains(&t) || (25.0..=30.0).contains(&t) {
-                    (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.3
-                } else {
-                    0.0
-                }
-            })
-            .collect();
-
-        // 合成第二段长音频：40s（比第一段长，验证游标归零后起点在界内）
-        let audio2: Vec<f32> = (0..640000)
-            .map(|i| {
-                let t = i as f32 / 16000.0;
-                if (5.0..=15.0).contains(&t) || (25.0..=35.0).contains(&t) {
-                    (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.3
-                } else {
-                    0.0
-                }
-            })
-            .collect();
+        // 🔴 393：v6.2 不再把纯正弦判为语音 ⇒ 夹具由「440Hz 正弦模拟语音」改用 full.wav
+        // **真人声**片段（断言语义与所有 VAD 参数不动）。
+        let Some(speech) = real_speech_samples() else {
+            eprintln!("skip: full.wav not found");
+            return;
+        };
+        // 第一段 30s：语音 [5,10]s 与 [25,30]s（素材自 full.wav 1s 起）
+        let audio1 = speech_with_silence(
+            30 * 16000,
+            &[(5 * 16000, 10 * 16000), (25 * 16000, 30 * 16000)],
+            &speech,
+            16000,
+        );
+        // 第二段 40s（比第一段长，验证游标归零后起点在界内）：语音 [5,15]s 与 [25,35]s
+        let audio2 = speech_with_silence(
+            40 * 16000,
+            &[(5 * 16000, 15 * 16000), (25 * 16000, 35 * 16000)],
+            &speech,
+            10 * 16000,
+        );
 
         // 第一次调用：不应 panic
         let segs1 = segmenter.segment(&audio1);
@@ -1238,7 +1338,41 @@ mod tests {
                 return;
             }
         };
-        // 440Hz sine 模拟语音能量，持续 1s（~31 个窗口）
+        // 🔴 393：v6.2 不再把纯正弦判为语音 ⇒ 夹具改用 full.wav 真人声（1s，自 2s 起）。
+        let Some(speech) = real_speech_samples() else {
+            eprintln!("skip: full.wav not found");
+            return;
+        };
+        let win = VAD_WINDOW_SIZE as usize;
+        let src_off = 2 * 16000usize;
+        let mut detected = false;
+        for i in 0..31 {
+            let start = i * win;
+            let chunk: Vec<f32> = (0..win)
+                .map(|j| speech.get(src_off + start + j).copied().unwrap_or(0.0))
+                .collect();
+            if segmenter.accept_and_check(&chunk) {
+                detected = true;
+            }
+        }
+        assert!(
+            detected,
+            "sustained real-speech energy should trigger speech detection"
+        );
+    }
+
+    /// 393：固化 v6.2 特性 —— **纯 440Hz 正弦不判为语音**（v4 会）⇒ 夹具须用真人声。
+    #[test]
+    #[ignore = "requires working ORT runtime + silero_vad.onnx"]
+    fn v6_pure_sine_not_detected_as_speech() {
+        let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models");
+        let segmenter = match VadSegmenter::try_new_for_streaming(&model_dir) {
+            Some(s) => s,
+            None => {
+                eprintln!("skip: silero_vad.onnx not found");
+                return;
+            }
+        };
         let win = VAD_WINDOW_SIZE as usize;
         let mut detected = false;
         for i in 0..31 {
@@ -1254,8 +1388,8 @@ mod tests {
             }
         }
         assert!(
-            detected,
-            "sustained sine energy should trigger speech detection"
+            !detected,
+            "393：v6.2 纯 440Hz 正弦不得被判为语音（夹具须用真人声）"
         );
     }
 
@@ -2182,14 +2316,16 @@ mod testsync391_tests {
         }
     }
 
-    /// 2. 源码护栏：`speech_ranges` 与 `feed_is_speech` 函数体（**剔除注释行**）内**不得**直接对
-    ///    整段 `accept_waveform(audio)` / `accept_waveform(samples)`，必须经 `feed_in_vad_windows(`。
+    /// 2. 源码护栏：**逐块喂入口**（`speech_ranges` / `feed_speech`）的函数体（**剔除注释行**）内
+    ///    **不得**直接对整段 `accept_waveform(audio)` / `accept_waveform(samples)`，必须经
+    ///    `feed_in_vad_windows(`；VAD-393（A1）后 `feed_is_speech` 改为薄包装 ⇒ 另断言其委托
+    ///    `feed_speech(`（同样逐块），且自身不直接整块喂。
     #[test]
     fn ts391_entry_points_feed_by_window_only() {
         let src = include_str!("vad.rs");
         for (anchor, arg) in [
             ("pub fn speech_ranges(", "audio"),
-            ("pub fn feed_is_speech(", "samples"),
+            ("pub fn feed_speech(", "samples"),
         ] {
             let body = src.split(anchor).nth(1).expect("锚点缺失");
             // 函数体：截到下一个 `pub fn` 或 impl 结束。
@@ -2210,6 +2346,25 @@ mod testsync391_tests {
                 "{anchor} 必须经 feed_in_vad_windows 逐块喂入"
             );
         }
+        // 393：`feed_is_speech` 薄包装 ⇒ 委托 `feed_speech(`（逐块），自身不直接整块喂。
+        let body = src
+            .split("pub fn feed_is_speech(")
+            .nth(1)
+            .expect("feed_is_speech 锚点缺失");
+        let body = body.split("\n    pub fn ").next().unwrap();
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("accept_waveform(samples)"),
+            "feed_is_speech 不得直接整块 accept_waveform"
+        );
+        assert!(
+            code.contains("feed_speech("),
+            "feed_is_speech 必须委托 feed_speech（逐块喂）"
+        );
     }
 
     /// 3. 旧写法反例留证（`#[ignore]`，需 silero + full.wav）：同一「3s 静音 + 6s 语音 + 3s 静音」
