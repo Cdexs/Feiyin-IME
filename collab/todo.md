@@ -22,6 +22,20 @@
 
 ## 🔴 待做
 
+### 🆕🔴🔴 P0 · BUILD-380 端测两 bug + 回灌提速 + 切片/窗口统一 10s（Gavin 已确认，🔄 已派发）
+
+| 单号 | 内容 | 负责 |
+| --- | --- | --- |
+| `FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382` | 每片单独组窗（吃字）／松键立即「识别处理中」／回灌不等边界配对／解码共享队列／埋点 | coder-1（`main.rs`） |
+| `FIX-SLICE-CUT-AT-GAP-381` | 超 10s 在字缝切／`WINDOW_MAX_SECS` 12→10／字缝切 vs 硬切、10s vs 12s 实测 | coder-2（`vad.rs`/`local_stream.rs`/`transcription/mod.rs`） |
+
+
+**Gavin 原话**：①「连续一口气不停顿说了这一段话……结果最终输出只有这一小段：『我连以太也看得见，实在太美了，就像欣赏北极光一样』」②「按下结束热键后，要等会儿才会显示识别处理中，前台的界面更新不及时，给用户一种卡顿感」
+**① 根因（吃字）**：一次派发 >13s 被切成多片（18.37s → 13s + 5.37s），`group_window_start_secs`（`transcription/mod.rs:1485`）按 12s 上限丢最远片 ⇒ 窗口只含最后一片，前 13s **从未进任何窗口**。今日两次命中（18.37s→解 5.37s；16.19s→解 3.19s）。
+**② 根因**：本地实时档松键不切处理态（`main.rs:6818`），要等流式 flush **和** B 路径尾窗都 join（`:8575-8576`）后才发 `StreamingFinalPreview` + `Processing`（`:8789`）⇒ 尾窗解码期（0.45~2s）界面不动。
+取证 `collab/evidence/20260923-eat-front/debug.log`；`hook_to_controller_ms` 全部 0 ⇒ 按键传递无延迟。
+
+
 ### ✅ FIX-PREVIEW-HARVEST-380 · 预览结果到即收 + 松键时延埋点（BUILD-379 端测，2026-09-23）— ✅ 已出包 BUILD-380（`cc83917`），待 Gavin 端测：停顿时预览是否一两秒内刷新；带 `-debug` 看 `[LocalRT-DBG-380]` 两个时延
 
 **Gavin 原话**：「输入一整段话的中间、还有尾部（特别是）的文字明明已经被改写修正，但始终不刷新，即使录音后我停顿等了好几秒也都不刷新」
