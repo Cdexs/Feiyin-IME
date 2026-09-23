@@ -2445,4 +2445,32 @@ mod testsync391_tests {
             "整块一次：区间起点应贴近末尾，实测 {old_start:.2}s（末尾 {audio_secs:.2}s）"
         );
     }
+
+    /// 393-A1⑨（TEST-SYNC）：`pad_and_extract`（20s 路径共用）与 `build_sliding_segments_with_spans`
+    /// 在**相邻段**（`prev_end == start`）输入下：不 panic；音频输出逐位相等；首片 `pad_before == 0`。
+    /// （重叠输入不在契约内：上游合并保证段不重叠，故不测。）
+    #[test]
+    fn ts393c_adjacent_segments_bitequal_and_pad_before_zero() {
+        use super::{build_sliding_segments_with_spans, pad_and_extract};
+        let total = 2000usize;
+        let audio: Vec<f32> = (0..total).map(|i| (i as f32) * 0.01).collect();
+        // 相邻段：seg0 [0,1000)、seg1 [1000,2000)（prev_end == start）。
+        let raw = [(0usize, 1000usize), (1000, 1000)];
+        let (padded_full, spans) = build_sliding_segments_with_spans(&raw, total, &audio);
+        // plan_sliding_cuts 把相邻短段并成一片 [0,2000) ⇒ 首片 pad_before = 0 - 0 = 0。
+        assert_eq!(
+            spans.len(),
+            1,
+            "相邻段应合并为一片，实测 {} 片",
+            spans.len()
+        );
+        assert_eq!(spans[0].2, 0, "首片 pad_before 应为 0");
+        // 直接以合并后的区间走 20s 路径 ⇒ 与滑窗入口音频逐位相等。
+        let merged = [(0usize, 2000usize)];
+        let padded_direct = pad_and_extract(&merged, total, &audio);
+        assert_eq!(
+            padded_direct, padded_full,
+            "pad_and_extract 与 build_sliding_segments_with_spans 音频输出必须逐位相等"
+        );
+    }
 }

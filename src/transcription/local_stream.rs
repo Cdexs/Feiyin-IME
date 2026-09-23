@@ -2106,6 +2106,75 @@ mod timeline393_tests {
         assert!(!rows.is_empty(), "应至少产生一个派发子片");
         assert!(fails.is_empty(), "存在超差/吞字子片：{}", fails.join("; "));
     }
+
+    /// 393-A2①（TEST-SYNC）：一条时间线段**横跨两个子片** ⇒ 两片各得截断后的部分、平移正确；
+    /// 首片 `pad_before > 0` 时区间起点 = `pad_before + (ts − pcm_start)`。
+    #[test]
+    fn ts393c_one_segment_spans_two_slices_truncates_and_translates() {
+        // 片0 pcm [1000,2000) 前置 pad 200；片1 pcm [2000,3000) 前置 pad 50。
+        let spans = [(1000usize, 2000usize, 200usize), (2000, 3000, 50)];
+        let timeline = [(1500usize, 2500usize)]; // 一条段横跨两片
+        let out = slice_ranges_from_timeline(&timeline, &spans);
+        // 片0：∩[1500,2000) ⇒ 起点 = 200 + (1500-1000) = 700；终点 = 200 + (2000-1000) = 1200。
+        // 片1：∩[2000,2500) ⇒ 起点 = 50 + (2000-2000) = 50；终点 = 50 + (2500-2000) = 550。
+        assert_eq!(out, vec![vec![(700, 1200)], vec![(50, 550)]]);
+        assert_eq!(
+            out[0][0].0,
+            200 + (1500 - 1000),
+            "首片起点必须 = pad_before + (ts − pcm_start)"
+        );
+        for (k, ranges) in out.iter().enumerate() {
+            for &(s, e) in ranges {
+                assert!(s < e, "片{k}: 区间必须非空");
+            }
+        }
+    }
+
+    /// 393-A2②（TEST-SYNC）：时间线段与子片**首尾相接**（`te == ps` 或 `ts == pe`）⇒ 不产生空区间。
+    #[test]
+    fn ts393c_touching_boundaries_produce_no_empty_ranges() {
+        let spans = [(1000usize, 2000usize, 0usize)];
+        // 前段 te == ps(1000)；后段 ts == pe(2000) —— 均只「相接」不「相交」。
+        let timeline = [(500usize, 1000usize), (2000, 2500)];
+        let out = slice_ranges_from_timeline(&timeline, &spans);
+        assert_eq!(out, vec![Vec::<(usize, usize)>::new()]);
+        assert!(
+            out[0].iter().all(|&(s, e)| e > s),
+            "首尾相接不得产生空区间（仅 s<e 才 push）"
+        );
+        // 对照：真正相交（ts < pe 且 te > ps）才产出。
+        let overlapping = [(1500usize, 2500usize)];
+        assert_eq!(
+            slice_ranges_from_timeline(&overlapping, &spans),
+            vec![vec![(500, 1000)]]
+        );
+    }
+
+    /// 393-R1 源码护栏（TEST-SYNC，非作者）：`transcribe_streaming_local` 生产区（剔除注释行）中，
+    /// **中途派发**只以 `dispatch_slice_ranges(vad_on, vad_speech,` 调用（VAD 进行中段 ⇒ 回退自跑）；
+    /// **尾片**只以 `dispatch_slice_ranges(vad_on, false,` 调用（flush 后无进行中段）。各恰 1 处。
+    #[test]
+    fn ts393c_dispatch_slice_ranges_two_call_sites_source_guard() {
+        let src = include_str!("local_stream.rs");
+        // 生产区 = 首个 `#[cfg(test)]` 之前；剔除注释行（含 `///` 文档）防误命中。
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code.matches("dispatch_slice_ranges(vad_on, vad_speech,")
+                .count(),
+            1,
+            "中途派发必须恰 1 处以 vad_speech 传入（进行中段回退）"
+        );
+        assert_eq!(
+            code.matches("dispatch_slice_ranges(vad_on, false,").count(),
+            1,
+            "尾片派发必须恰 1 处以 false 传入（flush 后无进行中段）"
+        );
+    }
 }
 
 #[cfg(test)]

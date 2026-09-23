@@ -5962,7 +5962,7 @@ mod fix388_trim_and_floor_tests {
 /// VAD-393（A4）：时间线剪静音的**纯决策**（三态），无需模型。
 #[cfg(test)]
 mod testsync393_tests {
-    use super::{plan_timeline_trim, TimelineTrim};
+    use super::{plan_timeline_trim, trim_to_speech, TimelineTrim};
 
     /// `None`（无时间线）⇒ 一律返回 `None`，调用方回退自跑 VAD（与流式是否非空无关）。
     #[test]
@@ -5996,6 +5996,43 @@ mod testsync393_tests {
         assert_eq!(
             plan_timeline_trim(Some(&[]), false),
             Some(TimelineTrim::Empty)
+        );
+    }
+
+    /// 393-A2④（TEST-SYNC）：`plan_timeline_trim(Apply)` + `trim_to_speech` 组合 —— 区间右端
+    /// **超出**窗口样本数 ⇒ 不 panic（clamp），且输出长度不超过原长。
+    #[test]
+    fn ts393c_trim_range_beyond_window_clamps_no_panic() {
+        let audio: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let ranges = [(3usize, 100usize)]; // 右端远超 len=8
+        assert_eq!(
+            plan_timeline_trim(Some(&ranges), false),
+            Some(TimelineTrim::Apply(vec![(3, 100)]))
+        );
+        let pad = 1usize;
+        let out = trim_to_speech(&audio, &ranges, pad);
+        assert!(out.len() <= audio.len(), "剪后长度不得超过原长");
+        // pad=1 ⇒ [3-1, min(100+1, 8)) = [2,8) ⇒ 6 样本。
+        assert_eq!(out, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        // 起点也越界 ⇒ 不 panic、输出为空（clamp 后 e <= s 被过滤）。
+        let beyond = [(50usize, 60usize)];
+        assert!(trim_to_speech(&audio, &beyond, pad).is_empty());
+    }
+
+    /// 393-A4 源码护栏（TEST-SYNC，非作者）：`transcribe_acc_ctx` 的 `Some(TimelineTrim::WholeWindow)`
+    /// 分支返回**原样整窗**（`samples.to_vec()`），不是空 —— 时间线空但流式有文本时不得吞掉整窗。
+    #[test]
+    fn ts393c_whole_window_branch_returns_whole_samples_source_guard() {
+        let src = include_str!("mod.rs");
+        let body = src
+            .split("pub(crate) fn transcribe_acc_ctx(")
+            .nth(1)
+            .expect("transcribe_acc_ctx 锚点缺失");
+        // 与既有护栏同界：截到下一个函数文档前。
+        let body = body.split("FIX-PREFIX-AND-EAT-371").next().unwrap();
+        assert!(
+            body.contains("Some(TimelineTrim::WholeWindow) => (samples.to_vec()"),
+            "WholeWindow 分支必须返回 samples.to_vec()（原样整窗），不得返回空"
         );
     }
 }

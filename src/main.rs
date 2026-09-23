@@ -11212,6 +11212,80 @@ mod vad393_window_ranges_tests {
         let slices = vec![Some(vec![(1usize, 2usize)]), None];
         assert_eq!(shift_and_concat_ranges(&slices, &[10, 20]), None);
     }
+
+    /// 393-A3⑥a（TEST-SYNC）：`lens` 比 `slices` 短（缺长度）⇒ 不 panic，缺长度按 0 偏移。
+    #[test]
+    fn ts393c_lens_shorter_than_slices_uses_zero_offset_no_panic() {
+        let slices = vec![Some(vec![(1usize, 2usize)]), Some(vec![(3, 4)])];
+        assert_eq!(
+            shift_and_concat_ranges(&slices, &[10usize]),
+            Some(vec![(1, 2), (3, 4)]),
+            "第 1 片缺长度 ⇒ 按 0 偏移，不得 panic"
+        );
+        assert_eq!(
+            shift_and_concat_ranges(&slices, &[]),
+            Some(vec![(1, 2), (3, 4)]),
+            "空 lens ⇒ 全部按 0 偏移"
+        );
+    }
+
+    /// 393-A3⑥b（TEST-SYNC）：三片全 `Some` ⇒ 偏移逐片累计（片 k 偏移 = 前 k 片长度之和）。
+    #[test]
+    fn ts393c_three_some_cumulative_offsets() {
+        let slices = vec![
+            Some(vec![(2usize, 5usize)]),
+            Some(vec![(1, 2)]),
+            Some(vec![(0, 4)]),
+        ];
+        let lens = [100usize, 200, 300];
+        assert_eq!(
+            shift_and_concat_ranges(&slices, &lens),
+            Some(vec![(2, 5), (101, 102), (300, 304)])
+        );
+    }
+
+    /// 393-A3⑦ 源码护栏（TEST-SYNC，非作者；剔除 `#[cfg(test)]` 区）：`recent_slice_ranges.remove(0)`
+    /// 与 `recent_slices.remove(0)` 各恰 1 处且**相邻**（三数组同步，防以后只删一个导致区间错位）。
+    #[test]
+    fn ts393c_three_arrays_remove_adjacent_source_guard() {
+        let lines = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"));
+        let idx = |needle: &str| -> Vec<usize> {
+            lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.as_str() == needle)
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let a = idx("recent_slices.remove(0);");
+        let b = idx("recent_slice_ranges.remove(0);");
+        assert_eq!(a.len(), 1, "recent_slices.remove(0) 应恰 1 处，实测 {a:?}");
+        assert_eq!(
+            b.len(),
+            1,
+            "recent_slice_ranges.remove(0) 应恰 1 处，实测 {b:?}"
+        );
+        assert_eq!(
+            (a[0] as isize - b[0] as isize).abs(),
+            1,
+            "两数组 remove(0) 必须相邻（同一 while 块内同步）"
+        );
+    }
+
+    /// 393-A3⑧ 源码护栏（TEST-SYNC，非作者；剔除 `#[cfg(test)]` 区）：路B 的 `CtxInject` 仍为
+    /// `speech_ranges: None`（路B 无实时时间线，不得误接时间线剪静音）。全局恰 1 处。
+    #[test]
+    fn ts393c_path_b_speech_ranges_none_source_guard() {
+        let lines = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"));
+        let n = lines
+            .iter()
+            .filter(|l| l.as_str() == "speech_ranges: None,")
+            .count();
+        assert_eq!(
+            n, 1,
+            "路B CtxInject 的 speech_ranges 必须恒为 None，实测 {n} 处"
+        );
+    }
 }
 
 #[cfg(test)]
