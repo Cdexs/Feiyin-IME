@@ -1316,3 +1316,12 @@ load_wordbook_vocabulary()
 | 单测 | 新增 14 条（段门 5 / C2 4 / ts389 2 / D3 3）+ 384 兜底与计时适配 |
 | 验证 | fmt EXIT 0 ｜ check 0 error、warnings 97/88=基线 ｜ 全量 test 0 failed（bin 1540P/33I）｜ numstat main 180/28、ls 495/685 |
 | 下一步 | 阶段三 TEST-SYNC（非作者）→ 阶段四 TEST-EXEC → 出包；端测盯 `[DBG-389] nearfield summary` rejected 比例、`carry level`、预览不缩短 |
+
+## TEST-SYNC-389 · 非作者护栏：整句段门/背景挡住/防锁死/seed 流程/部分窗折算性质 · 2026-09-23 · coder-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 仅 `local_stream.rs`(134/0) + `main.rs`(47/0) 的 `#[cfg(test)]` 区（**生产零改动**）。给 coder-2 的 389 按契约补 5 条独立用例（`ts389n_`） |
+| 覆盖 | ① 整句不切（首个高值后到段末全有声）② 背景 0.2 全静默 + 峰值不进样本 ③ 防锁死（35s/0.25 ⇒ 过期后整句确认并重学 ≈0.25）④ seed 流程（0.5 确认 / 两句 0.1 ⇒ `seed_dropped` / `seed_usable` 边界）⑤ `partial_win_committed` 随机 500 组界+单调 |
+| 验证 | `cargo fmt --check` EXIT 0；`cargo check --all-targets` **0 error**、warnings **97/88** = 基线；numstat == -w。🔴 **未跑 `cargo test`**（白名单；首跑阶段四） |
+| 结论 | **未发现生产缺陷**；未改版本/未 push/零凭证 |

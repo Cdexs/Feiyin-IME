@@ -5839,6 +5839,155 @@ mod fix388_trim_and_floor_tests {
 //   只剩标点 / 空 ⇒ 不带注入重解一次；重解仍无效 ⇒ 空串 + `invalid=true`；正文夹标签只剥不重解。
 // ============================================================
 #[cfg(test)]
+mod testsync388_tests {
+    use super::{apply_acc_disposition, has_content, output_rate_ok, trim_to_speech, GuardKind};
+    use std::cell::Cell;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn n(&mut self, lo: usize, hi: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lo as u64 + (self.0 >> 33) % ((hi - lo + 1) as u64)) as usize
+        }
+    }
+
+    /// 1. `trim_to_speech` 性质：300 组（音频 0~20s、区间 0~6 个、可重叠/越界/倒序）。
+    ///    断言：① 输出长度 ≤ 输入 ② 输出按原音频**递增序**拼接（非递减回溯）③ 每个**有效区间**
+    ///    内样本都出现在输出（不丢语音）。
+    #[test]
+    fn ts388_trim_property_no_growth_ordered_and_covers_speech() {
+        let pad = 3200usize; // 200ms @16k
+        let mut rng = Lcg(0x388_5EED);
+        for case in 0..300usize {
+            let audio_len = rng.n(0, 20 * 16000);
+            // 唯一值 = 原下标（f32 对 ≤2^24 的整数精确）⇒ 可逐样本回溯来源。
+            let audio: Vec<f32> = (0..audio_len).map(|i| i as f32).collect();
+            let nr = rng.n(0, 6);
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
+            for _ in 0..nr {
+                let a = rng.n(0, audio_len.max(1));
+                let b = rng.n(0, audio_len.max(1));
+                ranges.push((a, b));
+            }
+            let out = trim_to_speech(&audio, &ranges, pad);
+            assert!(out.len() <= audio.len(), "case {case}: 输出不得长于输入");
+            let mut covered = vec![false; audio_len];
+            let mut prev = 0usize;
+            for (k, &v) in out.iter().enumerate() {
+                let i = v as usize;
+                assert!(i < audio_len, "case {case}: 输出含非原音频样本 {v}");
+                if k > 0 {
+                    assert!(i >= prev, "case {case}: 输出必须按原音频递增序拼接");
+                }
+                prev = i;
+                covered[i] = true;
+            }
+            for &(s, e) in &ranges {
+                if s < e {
+                    let lo = s.min(audio_len);
+                    let hi = e.min(audio_len);
+                    for i in lo..hi {
+                        assert!(covered[i], "case {case}: 语音样本 {i}（区间 {s}..{e}）丢失");
+                    }
+                }
+            }
+        }
+    }
+
+    /// 2. 首解空输出进入 `Empty` 判据 ⇒ 不带注入重解一次；重解给出正常长度文本 ⇒ 收下。
+    #[test]
+    fn ts388_first_decode_empty_enters_empty_and_redecodes() {
+        let calls = Cell::new(0);
+        let recovered = "这是一段正常的转写内容用于通过产出率门槛的足够长文本";
+        let (out, oc) = apply_acc_disposition(String::new(), None, 5.0, Some(4.0), || {
+            calls.set(calls.get() + 1);
+            Ok(recovered.to_string())
+        });
+        assert_eq!(calls.get(), 1, "首解空输出必须触发不带注入重解一次");
+        assert_eq!(oc.guard, GuardKind::Empty);
+        assert!(oc.redecoded && !oc.invalid);
+        assert_eq!(out, recovered);
+    }
+
+    /// 3. `has_content` 边界：全角数字/英文/假名 ⇒ true；emoji ⇒ false；`**嗯**` ⇒ true。
+    #[test]
+    fn ts388_has_content_boundaries() {
+        assert!(has_content("３"), "全角数字 ３ 是 Nd ⇒ true");
+        assert!(has_content("A"));
+        assert!(has_content("あ"), "平假名是字母（is_alphabetic）⇒ true");
+        assert!(!has_content("😀"), "emoji 既非字母也非数字 ⇒ false");
+        assert!(has_content("**嗯**"), "含 嗯 ⇒ true");
+        assert!(!has_content("。。**……"), "仅标点/星号/空白 ⇒ false");
+    }
+
+    /// 4. 冷启动边界：audio 2.99/3.0/3.01 × 1.0 字/s 两侧；avg=NaN/0/−1/±inf 与 None 同口径。
+    #[test]
+    fn ts388_cold_start_boundary_and_avg_variants() {
+        assert!(output_rate_ok(0, 2.99, None), "<3s ⇒ 不判");
+        assert!(!output_rate_ok(2, 3.0, None), "3.0s 2 字 ⇒ 0.67<1 ⇒ 坍塌");
+        assert!(output_rate_ok(3, 3.0, None), "3.0s 3 字 ⇒ 1.0≥1 ⇒ 正常");
+        assert!(
+            !output_rate_ok(3, 3.01, None),
+            "3.01s 3 字 ⇒ 0.997<1 ⇒ 坍塌"
+        );
+        assert!(output_rate_ok(4, 3.01, None), "3.01s 4 字 ⇒ ≥1 ⇒ 正常");
+        for v in [f32::NAN, 0.0, -1.0, f32::INFINITY, f32::NEG_INFINITY] {
+            for (out_chars, audio) in [
+                (0usize, 2.99f32),
+                (2, 3.0),
+                (3, 3.0),
+                (3, 3.01),
+                (50, 10.0),
+                (5, 10.0),
+            ] {
+                assert_eq!(
+                    output_rate_ok(out_chars, audio, Some(v)),
+                    output_rate_ok(out_chars, audio, None),
+                    "avg={v} 应与 None 同口径（out={out_chars} audio={audio}）"
+                );
+            }
+        }
+    }
+
+    /// 5. 重解至多一次：300 组随机（回显 / 标签 / 空 / 坍塌），重解调用次数恒 ≤1，`invalid ⇒ 输出空串`。
+    #[test]
+    fn ts388_redecode_at_most_once_property() {
+        let inj = "你好,铭印,银线,朵洛莉丝,费曼学习法,子未穿害,低质,罗斯柴尔德,维生素b12";
+        let full_echo =
+            "你好，铭印，银线，朵洛莉丝，费曼学习法，子未穿害，低质，罗斯柴尔德，维生素b12";
+        let pool = [
+            "",
+            "。。",
+            "**",
+            "<location>",
+            full_echo,
+            "今天天气不错我们来测试一下这段文本的长度是否足够",
+            "维生素b12",
+            "正常内容一句话",
+        ];
+        let mut rng = Lcg(0x388_C0FFEE);
+        for case in 0..300usize {
+            let t = pool[rng.n(0, pool.len() - 1)].to_string();
+            let audio = 1.0 + rng.n(0, 150) as f32 / 10.0; // 1.0..16.0
+            let avg = if rng.n(0, 1) == 0 { None } else { Some(4.0f32) };
+            let re = pool[rng.n(0, pool.len() - 1)].to_string();
+            let calls = Cell::new(0);
+            let (out, oc) = apply_acc_disposition(t, Some(inj), audio, avg, || {
+                calls.set(calls.get() + 1);
+                Ok(re.clone())
+            });
+            assert!(calls.get() <= 1, "case {case}: 重解不得超过一次");
+            if oc.invalid {
+                assert!(out.is_empty(), "case {case}: invalid ⇒ 输出空串");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod testsync387_tests {
     use super::{apply_acc_disposition, strip_angle_tags, GuardKind};
     use std::cell::Cell;

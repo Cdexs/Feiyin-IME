@@ -237,3 +237,23 @@
 - **验证**：fmt EXIT 0 ｜ check 0 error、warnings 97/88=基线 ｜ 全量 test **0 failed**（bin 1540P/33I）｜ numstat main 180/28、ls 495/685（-w 178/26、473/663，差额为替换块内缩进重排）。
 - **未验证**：实机端测（`[LocalRT-DBG-389] nearfield summary` rejected 比例、`carry level`、预览不缩短）交 tester-1/Gavin。
 - **未改版本 / 未 push / 零凭证**；`docs/MACOS-HANDOFF.md` 未改（结论交主控合入）。
+
+## 2026-09-23 — coder-1 — TEST-SYNC-389 ✅ 交付（阶段三·非作者护栏，只改 `local_stream.rs` + `main.rs` 的 `#[cfg(test)]` 区）
+
+- **被测**：`FIX-NEARFIELD-BY-SEGMENT-AND-PREVIEW-389`（coder-2，HEAD `af3a0ad`）。按契约、不与作者 `ts389_*`/`seg389c2_*`/`fix389_*` 重复。
+- **范围**：`src/transcription/local_stream.rs` **仅** `mod tests` 追加（+134/0）、`src/main.rs` **仅** `fix389_partial_window_tests` 追加（+47/0）；生产代码零改动。
+- **5 条**：
+  1. **整句不切**：level=1.0，段内 `[0.8, 0.05×10, 0.7, 0.02×20]`（VAD 全真）⇒ 第一个高值后到段末全部有声。
+  2. **背景整句挡住**：峰值恒 0.2 < 0.3×1.0 ⇒ 全 false，且峰值不进学习样本、`rejected` +1。
+  3. **防锁死**：学到 1.0 后整句 0.25（<0.3）连续 35s ⇒ 30s 内全被拒；样本按会话时间过期后回未就绪 ⇒ 整句确认并重学 ≈0.25。
+  4. **seed 流程**：seed=1.0 首句 0.5（≥0.3×seed）⇒ 确认；连续两句 0.1 ⇒ `seed_dropped`、第三句未就绪直接确认；`seed_usable` 同设备 600s true / 601s·换设备 false。
+  5. **部分窗折算性质**：随机 500 组 `(prev ≤ cur、cum ≤ total)` ⇒ 恒 ∈ `[prev,cur]`、随 cum 单调不减、`cum=total⇒cur`、`total=0⇒cur`。
+- **验证（白名单）**：`cargo fmt --check` **EXIT 0**；`cargo check --all-targets` **0 error**、warnings **97/88** = 基线；numstat==-w。🔴 **未跑 `cargo test`**（禁止，首跑阶段四）。
+- **未发现生产缺陷**；**未改生产代码 / 未改版本 / 未 push / 零凭证**。
+
+## 2026-09-23 — TEST-SYNC-388（coder-2，✅ 阶段三交付：非作者护栏 5 条）
+
+- **性质**：只写测试、零生产改动；仅 `src/transcription/mod.rs` `#[cfg(test)] mod testsync388_tests`。被测 `FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388`（HEAD `af3a0ad`）。🔴 **未跑 `cargo test`**（阶段四 tester-1 首跑）。
+- **新增 5 条**：`trim_to_speech` 性质（300 组随机：不增长/递增序/不丢语音）；首解空进 Empty 重解恰 1 次；`has_content` 全角/假名/emoji 边界；冷启动 2.99/3.0/3.01 + avg 非有限等价；重解至多一次性质（`invalid⇒空串`）。
+- **验证**：`rustfmt` + `cargo check --all-targets` **0 error**、warnings **97/88**=基线；`cargo fmt --check` EXIT 0；numstat==-w（mod 149/0）。独立 Python 复刻 `trim_to_speech` 500 组性质 bad=0。
+- **未发现生产缺陷**。**未改版本 / 未 push / 零凭证**。
