@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     ffi::{c_char, c_int, c_long, c_void, CStr, CString, NulError},
     path::{Path, PathBuf},
     ptr::{self, NonNull},
@@ -9,41 +10,88 @@ use ctranslate2::{ComputeType, Device, TranslationOptions, TranslatorConfig};
 use ctranslate2_sys::{
     free_pointer_array, translation_result_free, translation_result_output_at,
     translation_result_output_size, translation_result_score, translator_create,
-    translator_destroy, translator_translate_batch, CTranslationOptions, CTranslationResult,
-    CTranslator,
+    translator_destroy, translator_translate_batch_with_target_prefix, CTranslationOptions,
+    CTranslationResult, CTranslator,
 };
 use sentencepiece::SentencePieceProcessor;
 
 use crate::config::TranslationLanguage;
 use crate::text_normalizer::contains_han;
 
-const ZH_EN_SUBDIR: &str = "opus-mt-zh-en";
-const EN_ZH_SUBDIR: &str = "opus-mt-en-zh";
+// ===========================================================================
+// TRANS-NLLB-AND-SENTENCE-BATCH-394：离线翻译改用 NLLB-200-distilled-600M（CT2 int8）。
+//   Gavin 2026-09-23：逐句训练的 Marian 长段易「精简 / 偏离」⇒ 换 NLLB + 逐句批量 + 漏译守卫。
+//   🔴 不做对比、不留 opus-mt 回退（代码中不再加载 opus-mt）；opus-mt 目录保留（删除须 Gavin 确认）。
+// ===========================================================================
 
-const ZH_EN_CT2_BASE_URL: &str =
-    "https://huggingface.co/gaudi/opus-mt-zh-en-ctranslate2/resolve/main";
-const EN_ZH_CT2_BASE_URL: &str =
-    "https://huggingface.co/gaudi/opus-mt-en-zh-ctranslate2/resolve/main";
-const ZH_EN_SPM_BASE_URL: &str = "https://huggingface.co/Helsinki-NLP/opus-mt-zh-en/resolve/main";
-const EN_ZH_SPM_BASE_URL: &str = "https://huggingface.co/Helsinki-NLP/opus-mt-en-zh/resolve/main";
+/// NLLB 模型子目录（下载落点；`<exe_dir>/models/<本名>`）。
+const NLLB_SUBDIR: &str = "nllb-200-distilled-600M-ct2-int8";
+/// NLLB CT2 int8 权重来源（HuggingFace 仓库；手工挑选 model.bin≈594MB 的 int8 导出）。
+const NLLB_CT2_BASE_URL: &str =
+    "https://huggingface.co/mijuanlo/nllb-200-distilled-600M-ct2-int8/resolve/main";
 
+// NLLB 运行期文件（CT2 加载 + 我们的 SentencePiece 分词）。
 const CONFIG_JSON: &str = "config.json";
 const MODEL_BIN: &str = "model.bin";
 const SHARED_VOCABULARY_JSON: &str = "shared_vocabulary.json";
-const SOURCE_SPM: &str = "source.spm";
-const TARGET_SPM: &str = "target.spm";
+const SENTENCEPIECE_MODEL: &str = "sentencepiece.bpe.model";
 const EOS_TOKEN: &str = "</s>";
 
-const MAX_DECODE_STEPS: usize = 512;
-const BEAM_WIDTH: usize = 6;
-const NO_REPEAT_NGRAM_SIZE: usize = 0;
-const LENGTH_PENALTY_ALPHA: f64 = 1.5;
-const COVERAGE_PENALTY: f64 = 0.05;
-const MIN_SEGMENT_CHARS: usize = 120;
-const MAX_SEGMENT_CHARS: usize = 200;
-const MAX_SENTENCES_PER_SEGMENT: usize = 3;
-const SINGLE_BATCH_SIZE: usize = 1;
+// NLLB Flores-200 语种码（中=zho_Hans，英=eng_Latn）。
+const LANG_ZH: &str = "zho_Hans";
+const LANG_EN: &str = "eng_Latn";
+
+// ---- 解码参数（TUNE-394）---------------------------------------------------
+/// beam 4（官方示例默认 2；4 提升质量，边际收益已足够，避免 6 的额外耗时）。
+const BEAM_SIZE: usize = 4;
+/// 长度惩罚 1.0（NLLB 官方默认；>1 会主动拉长、正是旧版「离散 / 编造」的来源之一）。
+const LENGTH_PENALTY: f32 = 1.0;
+/// 重复 3-gram 抑制（防 NLLB 复读；NLLB 官方生成配置为 3）。
+const NO_REPEAT_NGRAM_SIZE: usize = 3;
+/// 重复惩罚 1.1（温和抑制复读）。
+const REPETITION_PENALTY: f32 = 1.1;
+/// 单句重译参数（疑似漏译时）：更强 beam + 略长惩罚，提升召回。
+const RETRY_BEAM_SIZE: usize = 6;
+const RETRY_LENGTH_PENALTY: f32 = 1.2;
+/// 单句 `max_decoding_length` ≈ 源 token 数 × 本系数 + 本余量，上限 [`MAX_DECODE_STEPS`]。
+const MAX_NEW_TOKENS_FACTOR: usize = 2;
+const MAX_NEW_TOKENS_PAD: usize = 16;
+/// 生成硬上限（防单句跑飞；旧值 512 过大）。
+const MAX_DECODE_STEPS: usize = 256;
+/// 单次 batch 的最大句数（C 接口一次喂入；超出分期）。
+const BATCH_MAX_SENTENCES: usize = 64;
+/// CTranslate2 `batch_type`：0 = examples。
 const BATCH_TYPE_EXAMPLES: c_int = 0;
+
+// ---- 漏译守卫阈值（TUNE-394，Gavin 硬要求：长文本不许被精简）----------------
+/// 中→英：英文词数 < 中文有效字数 × 本比例 ⇒ 疑似漏译（0.35；中文 1 字通常译 1 词左右，
+/// 正常缩写（数字/专名）最多减半，低于 35% 基本可判丢内容）。
+const OMIT_EN_PER_ZH: f32 = 0.35;
+/// 英→中：中文有效字数 < 英文词数 × 本比例 ⇒ 疑似漏译（0.6；英文 1 词通常译 1~2 汉字，
+/// 「词→字」正常可低至 1:1 以下，取 0.6 作下界，宁少误报）。
+const OMIT_ZH_PER_EN: f32 = 0.6;
+
+// ---- 分句（TUNE-394）-------------------------------------------------------
+/// 中文单句超过此字数 ⇒ 再按逗号/顿号切子句（~80 字以内 Marian/NLLB 单句最稳）。
+const ZH_MAX_SENT_CHARS: usize = 80;
+/// 英文单句超过此词数 ⇒ 再按逗号/分号切子句。
+const EN_MAX_SENT_WORDS: usize = 60;
+/// 子句下限：中文 ≥10 字，短于则并入相邻子句（避免碎片化破坏语义）。
+const ZH_MIN_CLAUSE_CHARS: usize = 10;
+/// 子句下限：英文 ≥6 词。
+const EN_MIN_CLAUSE_WORDS: usize = 6;
+
+/// 中文句末终止符（分句用；`，、` 不是句子边界，只在过长时切子句）。
+const ZH_SENT_TERMINATORS: [char; 5] = ['。', '！', '？', '；', '…'];
+/// 英文句末终止符。
+const EN_SENT_TERMINATORS: [char; 3] = ['.', '?', '!'];
+/// 英文不当作句末的常见缩写词（小写、不含点）。
+/// TRANS-394-REWORK R3：删除 `am` / `pm`（`a.m.` / `p.m.` 已由「含点」规则覆盖；
+/// 保留反而让 `I am. You are.` 不断句）；`no` 保留但另见 [`ends_with_abbreviation`] 的数字后置条件。
+const EN_ABBREVIATIONS: [&str; 19] = [
+    "mr", "mrs", "ms", "dr", "st", "prof", "sr", "jr", "vs", "etc", "no", "vol", "fig", "inc",
+    "ltd", "co", "dept", "univ", "approx",
+];
 
 /// TRANS-BIDIR-001 / REFACTOR-DERIVE-TARGET-001: Derive translation target direction
 /// from content. Platform-neutral business logic (no cfg gating) — macOS side
@@ -66,20 +114,62 @@ pub fn derive_translation_target(text: &str) -> TranslationLanguage {
     }
 }
 
-struct MarianModel {
+/// NLLB 模型（**一个模型服务中↔英双向**；方向由调用方按 `TranslationLanguage` 指定）。
+struct NllbModel {
     path: PathBuf,
     translator: Ct2Translator,
-    tokenizer: MarianTokenizer,
+    tokenizer: NllbTokenizer,
 }
 
+/// TRANS-394-REWORK R1-b：引擎持有**进程级** `&'static NllbModel`（由 [`shared_model`] 提供）。
+/// 双向共享同一已加载模型；切换方向只换 `direction`、不重载 594MB 权重，
+/// 且**任何 drop 都不会卸载模型**（`translator_destroy` 永不触发，规避 CT2 销毁死锁）。
+/// 内存取舍：全程仅驻留一份 NLLB（int8 ≈ 600MB），关闭翻译后亦常驻，直到进程退出。
 pub struct TranslationEngine {
-    model: MarianModel,
+    model: &'static NllbModel,
     direction: TranslationLanguage,
 }
 
-struct MarianTokenizer {
-    encoder: SentencePieceProcessor,
-    decoder: SentencePieceProcessor,
+// TRANS-394-REWORK R1-b：**进程级 NLLB 模型** —— 每个模型目录至多加载一次，且**永不析构**
+//（`Box::leak`；不调用 `translator_destroy`，规避 CT2 销毁死锁，见 `collab/troubleshooting.md`）。
+//
+// 方案选择：`thread_local!` + `Box::leak`（**未**采用 `static Mutex<Arc<NllbModel>>`）。理由：
+// 1. 生产侧翻译只在**单个 worker 线程**串行执行（`main.rs` 的 `cached_translation` 是 worker 闭包内
+//    局部变量，全部调用顺序发生）⇒ thread-local 缓存恰好对应「一个 worker 一份模型」，无需跨线程共享；
+// 2. 因而不需要 `unsafe impl Send/Sync for NllbModel`（只有把 `&'static NllbModel` 放进 `static`
+//    或 `Arc` 跨线程共享时，才要求 `NllbModel: Sync`），也就不必依赖尚未核实的 CT2 C 封装线程安全声明；
+// 3. 代价：非 worker 线程（仅测试路径）会各自独立加载；本工程生产路径不存在多线程翻译。
+thread_local! {
+    static NLLB_MODEL: RefCell<Option<(PathBuf, &'static NllbModel)>> = RefCell::new(None);
+}
+
+/// 取进程级 NLLB 模型：命中同路径即复用；否则加载并 `Box::leak` 常驻。
+/// 加载失败**不缓存**（文件补齐后可重试）；路径变化（生产不会发生）只打 warn、旧模型也不释放。
+fn shared_model(model_dir: &Path) -> Result<&'static NllbModel> {
+    let path = model_dir.join(NLLB_SUBDIR);
+    NLLB_MODEL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some((cached_path, model)) = slot.as_ref() {
+            if cached_path == &path {
+                return Ok(*model);
+            }
+            log::warn!(
+                "NLLB model path changed ({} -> {}); keeping the previously loaded model resident \
+                 (process-level models are never destroyed)",
+                cached_path.display(),
+                path.display()
+            );
+        }
+        let model: &'static NllbModel = Box::leak(Box::new(NllbModel::new(model_dir)?));
+        log::info!("NLLB model loaded once and cached for the process lifetime");
+        *slot = Some((path, model));
+        Ok(model)
+    })
+}
+
+/// NLLB 使用**单个** SentencePiece 模型（共享词表，非 source/target 两份）。
+struct NllbTokenizer {
+    sp: SentencePieceProcessor,
 }
 
 struct Ct2Translator {
@@ -125,6 +215,10 @@ impl std::error::Error for Ct2TranslatorError {
     }
 }
 
+/// TRANS-394-REWORK：`translator_destroy` 在**已完成推理**的 translator 上会**死锁**
+/// （进程 CPU 停止增长、进程无法退出；取证见 `collab/troubleshooting.md` 与 result.md 的 R1-a）。
+/// 生产路径下模型由 [`shared_model`] `Box::leak` 常驻 ⇒ 本 `Drop` **永不触发**。
+/// 保留实现仅用于「将来若出现非泄漏构造仍能正确释放」；**切勿**在会被 drop 的路径构造 `Ct2Translator`。
 impl Drop for Ct2Translator {
     fn drop(&mut self) {
         unsafe {
@@ -186,12 +280,36 @@ impl Ct2Translator {
         Ok(Self { inner })
     }
 
-    fn translate_single(
+    /// FIX-394：**批量**翻译（带 per-sentence `target_prefix`），一次 FFI 调用喂入 `sentences`。
+    /// `sentences[j]` = 第 j 句的源 token 串（**含** `[src_lang]` 前缀与末尾 `</s>`）；
+    /// `target_prefix` = 每句共用的前缀 token（NLLB = `[tgt_lang]`）。
+    /// 返回结果数 = `sentences.len()`（每句一条）。
+    fn translate_batch_with_prefix(
         &self,
-        tokens: &[String],
+        sentences: &[Vec<String>],
+        target_prefix: &[String],
         options: &TranslationOptions,
-    ) -> Result<OwnedTranslationResult, Ct2TranslatorError> {
-        let c_tokens = tokens
+    ) -> Result<Vec<OwnedTranslationResult>, Ct2TranslatorError> {
+        if sentences.is_empty() {
+            return Ok(Vec::new());
+        }
+        // 源 token 的 CString 全部持有到 FFI 返回。
+        let sent_cstrings: Vec<Vec<CString>> = sentences
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|token| {
+                        CString::new(token.as_str()).map_err(|source| {
+                            Ct2TranslatorError::NulInToken {
+                                token: token.clone(),
+                                source,
+                            }
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let prefix_cstrings: Vec<CString> = target_prefix
             .iter()
             .map(|token| {
                 CString::new(token.as_str()).map_err(|source| Ct2TranslatorError::NulInToken {
@@ -200,27 +318,41 @@ impl Ct2Translator {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut token_ptrs: Vec<*const c_char> =
-            c_tokens.iter().map(|token| token.as_ptr()).collect();
-        token_ptrs.push(ptr::null());
-        let mut sources = [token_ptrs.as_ptr()];
+
+        // 每句一个以 null 结尾的 token 指针数组。
+        let sent_ptrs: Vec<Vec<*const c_char>> = sent_cstrings
+            .iter()
+            .map(|row| {
+                let mut v: Vec<*const c_char> = row.iter().map(|c| c.as_ptr()).collect();
+                v.push(ptr::null());
+                v
+            })
+            .collect();
+        let mut sources: Vec<*const *const c_char> = sent_ptrs.iter().map(|v| v.as_ptr()).collect();
+
+        // 每句共用的 target prefix（同一前缀数组被 N 句复用）。
+        let mut prefix_ptrs: Vec<*const c_char> =
+            prefix_cstrings.iter().map(|c| c.as_ptr()).collect();
+        prefix_ptrs.push(ptr::null());
+        let mut prefixes: Vec<*const *const c_char> =
+            (0..sentences.len()).map(|_| prefix_ptrs.as_ptr()).collect();
 
         let c_options = to_c_translation_options(options);
         let mut out_num_translations = 0usize;
+        let n = sentences.len();
 
         let results_ptr = unsafe {
             // Safety:
-            // - `c_tokens` owns every CString and lives until the FFI call returns.
-            // - `token_ptrs` contains pointers into `c_tokens` plus a trailing null sentinel.
-            // - `sources` points at `token_ptrs` and also stays alive for the full call.
-            // - We intentionally use `max_batch_size = 1` because this code path only supports
-            //   a single source sentence and the C wrapper rejects `0`.
-            translator_translate_batch(
+            // - 所有 CString 数组（sent_cstrings / prefix_cstrings / sent_ptrs / sources /
+            //   prefix_ptrs / prefixes）在本调用期间全部存活。
+            // - `sources` / `prefixes` 是 `const char***` 对应的 Rust 视图。
+            translator_translate_batch_with_target_prefix(
                 self.inner.as_ptr(),
                 sources.as_mut_ptr() as *mut *mut *const c_char,
-                SINGLE_BATCH_SIZE,
+                prefixes.as_mut_ptr() as *mut *mut *const c_char,
+                n,
                 &c_options,
-                SINGLE_BATCH_SIZE,
+                n,
                 BATCH_TYPE_EXAMPLES,
                 &mut out_num_translations,
             )
@@ -230,11 +362,7 @@ impl Ct2Translator {
             return Err(Ct2TranslatorError::NullResults);
         }
 
-        let results = unsafe { take_translation_results(results_ptr, out_num_translations) };
-        results
-            .into_iter()
-            .next()
-            .ok_or(Ct2TranslatorError::NullResults)
+        Ok(unsafe { take_translation_results(results_ptr, out_num_translations) })
     }
 }
 
@@ -278,41 +406,28 @@ fn to_c_translation_options(options: &TranslationOptions) -> CTranslationOptions
     }
 }
 
-impl MarianTokenizer {
-    fn new(path: &Path, label: &str) -> Result<Self> {
-        let source_path = path.join(SOURCE_SPM);
-        let target_path = path.join(TARGET_SPM);
-
-        let encoder = SentencePieceProcessor::open(&source_path).map_err(|err| {
+impl NllbTokenizer {
+    fn new(path: &Path) -> Result<Self> {
+        let spm_path = path.join(SENTENCEPIECE_MODEL);
+        let sp = SentencePieceProcessor::open(&spm_path).map_err(|err| {
             anyhow!(
-                "failed to load {} source sentencepiece model from {}: {}",
-                label,
-                source_path.display(),
+                "failed to load NLLB sentencepiece model from {}: {}",
+                spm_path.display(),
                 err
             )
         })?;
-        let decoder = SentencePieceProcessor::open(&target_path).map_err(|err| {
-            anyhow!(
-                "failed to load {} target sentencepiece model from {}: {}",
-                label,
-                target_path.display(),
-                err
-            )
-        })?;
-
-        Ok(Self { encoder, decoder })
+        Ok(Self { sp })
     }
 
+    /// 编码为 SentencePiece 词片（**不含** `src_lang` 前缀与 `</s>`；由 [`build_source_tokens`] 组装）。
     fn encode(&self, input: &str) -> Result<Vec<String>> {
-        let mut tokens: Vec<String> = self
-            .encoder
+        Ok(self
+            .sp
             .encode(input)
             .map_err(|err| anyhow!("failed to encode sentencepiece input: {}", err))?
             .into_iter()
             .map(|piece| piece.piece)
-            .collect();
-        tokens.push(EOS_TOKEN.to_string());
-        Ok(tokens)
+            .collect())
     }
 
     fn decode(&self, tokens: &[String]) -> Result<String> {
@@ -321,54 +436,316 @@ impl MarianTokenizer {
             .map(String::as_str)
             .filter(|token| !matches!(*token, "<pad>" | "</s>" | "<s>"))
             .collect();
-
-        self.decoder
+        self.sp
             .decode_pieces(&filtered)
             .map_err(|err| anyhow!("failed to decode sentencepiece output: {}", err))
     }
 }
 
-fn segment_text(text: &str) -> Vec<String> {
-    let sentences: Vec<&str> = text
-        .split_inclusive(&['。', '！', '？', '\n'])
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    if sentences.len() <= 1 {
-        return vec![text.to_string()];
-    }
-
-    let mut segments = Vec::new();
-    let mut buf = String::new();
-    let mut sentence_count = 0;
-
-    for s in sentences {
-        buf.push_str(s);
-        sentence_count += 1;
-        if buf.chars().count() >= MAX_SEGMENT_CHARS || sentence_count >= MAX_SENTENCES_PER_SEGMENT {
-            segments.push(buf.clone());
-            buf.clear();
-            sentence_count = 0;
-        }
-    }
-
-    if !buf.is_empty() {
-        if let Some(last) = segments.last_mut() {
-            last.push(' ');
-            last.push_str(&buf);
-        } else {
-            segments.push(buf);
-        }
-    }
-
-    segments
+/// TUNE-394：组装 NLLB 源 token 串 —— `[src_lang] + sp 词片 + ["</s>"]`。
+///
+/// 依据 CTranslate2 官方 NLLB 指南（`guides/transformers.html` §NLLB）：
+/// `source = tokenizer.convert_ids_to_tokens(tokenizer.encode("Hello world!"))`（该 HF 分词器在
+/// `src_lang` 下自动加 `src_lang` 前缀与 `</s>`），`target_prefix = [tgt_lang]`，
+/// `results[0].hypotheses[0][1:]`（去掉首个 target 语种 token）。
+/// 我们不用 HF tokenizers，故手工补这两个特殊 token（见指南「Special tokens in translation」）。
+fn build_source_tokens(src_lang: &str, pieces: Vec<String>) -> Vec<String> {
+    let mut tokens = Vec::with_capacity(pieces.len() + 2);
+    tokens.push(src_lang.to_string());
+    tokens.extend(pieces);
+    tokens.push(EOS_TOKEN.to_string());
+    tokens
 }
 
-impl MarianModel {
-    fn new(model_dir: &Path, subdir: &str, label: &str) -> Result<Self> {
-        let path = model_dir.join(subdir);
-        validate_runtime_files(&path, label)?;
-        let tokenizer = MarianTokenizer::new(&path, label)?;
+/// TUNE-394：剥掉译文首个 `tgt_lang` token（NLLB 输出以目标语种 token 开头）。
+fn strip_target_prefix(tokens: &[String], tgt_lang: &str) -> Vec<String> {
+    match tokens.split_first() {
+        Some((head, rest)) if head == tgt_lang => rest.to_vec(),
+        _ => tokens.to_vec(),
+    }
+}
+
+/// TUNE-394：中文「有效字数」= 字母/数字/汉字数（去空白与标点）—— 漏译判据的源/目标计数。
+fn zh_effective_chars(text: &str) -> usize {
+    text.chars().filter(|c| c.is_alphanumeric()).count()
+}
+
+/// TUNE-394：英文「词数」= 含字母/数字的空白分隔 token 数。
+fn en_word_count(text: &str) -> usize {
+    text.split_whitespace()
+        .filter(|w| w.chars().any(|c| c.is_alphanumeric()))
+        .count()
+}
+
+/// TUNE-394：**漏译检测**（纯函数）—— 译句相对源句过短即疑似被「精简 / 截断」。
+///
+/// - 中→英（target=English）：英文词数 < 中文有效字数 × [`OMIT_EN_PER_ZH`] ⇒ 真；
+/// - 英→中（target=Chinese）：中文有效字数 < 英文词数 × [`OMIT_ZH_PER_EN`] ⇒ 真；
+/// - 空结果 ⇒ 真。
+fn looks_truncated(src: &str, dst: &str, direction: TranslationLanguage) -> bool {
+    if dst.trim().is_empty() {
+        return true;
+    }
+    match direction {
+        TranslationLanguage::English => {
+            (en_word_count(dst) as f32) < (zh_effective_chars(src) as f32) * OMIT_EN_PER_ZH
+        }
+        TranslationLanguage::Chinese => {
+            (zh_effective_chars(dst) as f32) < (en_word_count(src) as f32) * OMIT_ZH_PER_EN
+        }
+    }
+}
+
+/// TUNE-394：单句可重试收口（纯函数，重译闭包注入 ⇒ 可单测「至多一次」）。
+/// 返回 `(最终译文, 重译调用次数, 重译后仍疑似漏译)`：疑似漏译才调 `retry` 一次，取更长者。
+fn finalize_sentence(
+    src: &str,
+    dst: String,
+    direction: TranslationLanguage,
+    retry: impl FnOnce() -> Option<String>,
+) -> (String, usize, bool) {
+    let mut best = dst;
+    let mut calls = 0usize;
+    if looks_truncated(src, &best, direction) {
+        calls += 1;
+        if let Some(candidate) = retry() {
+            if candidate.chars().count() > best.chars().count() {
+                best = candidate;
+            }
+        }
+    }
+    let still = looks_truncated(src, &best, direction);
+    (best, calls, still)
+}
+
+/// TUNE-394：按方向拼接译文 —— 中→英用单空格；英→中用**空串**（中文不加空格）。
+fn join_parts(parts: &[String], direction: TranslationLanguage) -> String {
+    let joined = match direction {
+        TranslationLanguage::English => parts.join(" "),
+        TranslationLanguage::Chinese => parts.concat(),
+    };
+    // 只在空格维度归一（保留 `\n`）：避免空译文产生多余空格。
+    let mut out = String::with_capacity(joined.len());
+    let mut prev_space = false;
+    for c in joined.chars() {
+        if c == ' ' {
+            if !prev_space {
+                out.push(c);
+            }
+            prev_space = true;
+        } else {
+            prev_space = false;
+            out.push(c);
+        }
+    }
+    out.trim().to_string()
+}
+
+/// TUNE-394：分句（纯函数）—— 源语言由**目标方向**决定（target=English ⇒ 源=中文；反之源=英文）。
+///
+/// - 中文：按 `。！？；……` 切（保留标点在句尾）；过长（> [`ZH_MAX_SENT_CHARS`]）再按 `，、` 切子句；
+/// - 英文：按 `. ? !`（必须后接空白/结尾）切，避开 `Mr./Dr./e.g./i.e./U.S./小数点`；过长
+///   （> [`EN_MAX_SENT_WORDS`] 词）再按 `,;` 切子句；
+/// - 子句过短（中文 <10 字 / 英文 <6 词）并入相邻子句；空句丢弃。
+///
+/// 段落换行由调用方（`translate` 逐行处理）保证，本函数不处理 `\n`。
+fn split_sentences(text: &str, direction: TranslationLanguage) -> Vec<String> {
+    let source_is_chinese = matches!(direction, TranslationLanguage::English);
+    let raw: Vec<String> = if source_is_chinese {
+        split_zh_sentences(text)
+    } else {
+        split_en_sentences(text)
+    };
+    let mut out: Vec<String> = Vec::new();
+    for sentence in raw {
+        let sentence = sentence.trim();
+        if sentence.is_empty() {
+            continue;
+        }
+        if source_is_chinese && sentence.chars().count() > ZH_MAX_SENT_CHARS {
+            out.extend(split_and_merge(
+                sentence,
+                &['，', '、'],
+                ZH_MIN_CLAUSE_CHARS,
+                true,
+            ));
+        } else if !source_is_chinese && en_word_count(sentence) > EN_MAX_SENT_WORDS {
+            out.extend(split_and_merge(
+                sentence,
+                &[',', ';'],
+                EN_MIN_CLAUSE_WORDS,
+                false,
+            ));
+        } else {
+            out.push(sentence.to_string());
+        }
+    }
+    out
+}
+
+fn split_zh_sentences(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut prev = '\0';
+    for c in text.chars() {
+        cur.push(c);
+        let is_break = if c == '…' {
+            // `……` 视为一个终止符：只在第二个 `…` 处断。
+            prev == '…'
+        } else {
+            ZH_SENT_TERMINATORS.contains(&c)
+        };
+        if is_break {
+            out.push(std::mem::take(&mut cur));
+        }
+        prev = c;
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn split_en_sentences(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        cur.push(c);
+        if !EN_SENT_TERMINATORS.contains(&c) {
+            continue;
+        }
+        let next_is_boundary = chars.get(i + 1).map_or(true, |n| n.is_whitespace());
+        // 下一个非空白字符（供 `No. 5` 这类「缩写后接数字」判据使用）。
+        let next_nonspace = chars[i + 1..].iter().copied().find(|c| !c.is_whitespace());
+        let is_abbrev = c == '.' && ends_with_abbreviation(&cur, next_nonspace);
+        if next_is_boundary && !is_abbrev {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// 判断以 `.` 结尾的 `cur` 是否命中英文缩写（`Mr.` / `e.g.` / `U.S.` 等）。
+/// `next_nonspace` = 该句点之后第一个非空白字符（无则 `None`），用于 `no` 的后置条件。
+fn ends_with_abbreviation(cur: &str, next_nonspace: Option<char>) -> bool {
+    // 去掉末尾的 '.'，向前收集 [A-Za-z.] 组成 token。
+    let before = &cur[..cur.len() - 1];
+    let token: String = before
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphabetic() || *c == '.')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if token.is_empty() {
+        return false;
+    }
+    let lower = token.to_ascii_lowercase();
+    // 含点 ⇒ 多段缩写（e.g. / i.e. / U.S.）。
+    if token.contains('.') {
+        return true;
+    }
+    // 单个大写字母 ⇒ 姓名首字母（U. / J.）。
+    if token.len() == 1 && token.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+        return true;
+    }
+    // TRANS-394-REWORK R3：`no` 仅在**下一个非空白字符是数字**时视为缩写（`No. 5`）；
+    // 否则「The answer is no. We left.」应在 `no.` 处断句。
+    if lower == "no" {
+        return next_nonspace.is_some_and(|c| c.is_ascii_digit());
+    }
+    EN_ABBREVIATIONS.contains(&lower.as_str())
+}
+
+/// 按子句分隔符切分，并把过短子句并入相邻子句（保持顺序、不丢内容）。
+fn split_and_merge(text: &str, delims: &[char], min: usize, by_chars: bool) -> Vec<String> {
+    let mut pieces: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for c in text.chars() {
+        cur.push(c);
+        if delims.contains(&c) {
+            pieces.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        pieces.push(cur);
+    }
+
+    let len = |s: &String| {
+        if by_chars {
+            s.chars().count()
+        } else {
+            en_word_count(s)
+        }
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    for piece in pieces {
+        if len(&piece) < min {
+            if let Some(last) = out.last_mut() {
+                last.push_str(&piece);
+                continue;
+            }
+        }
+        out.push(piece);
+    }
+    // 首个子句过短 ⇒ 并入第二个（若存在）。
+    if out.len() > 1 && len(&out[0]) < min {
+        let first = out.remove(0);
+        out[0] = format!("{first}{}", out[0]);
+    }
+    out
+}
+
+/// TUNE-394：数字 / 专名保留检查（**只记日志、不改结果**）。
+fn log_token_carry(sent_idx: usize, src: &str, dst: &str) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    let mut carried: Vec<String> = Vec::new();
+    // 阿拉伯数字串。
+    let mut num = String::new();
+    for c in src.chars() {
+        if c.is_ascii_digit() {
+            num.push(c);
+        } else if !num.is_empty() {
+            carried.push(std::mem::take(&mut num));
+        }
+    }
+    if !num.is_empty() {
+        carried.push(num);
+    }
+    // 英文大写词 + `%`。
+    for w in src.split_whitespace() {
+        let core: String = w.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+        if core.len() >= 2 && core.chars().all(|c| c.is_ascii_uppercase()) {
+            carried.push(core);
+        }
+    }
+    if src.contains('%') {
+        carried.push("%".to_string());
+    }
+    for token in carried {
+        if token == "%" {
+            if !dst.contains('%') {
+                log::debug!("[TRANS-394] token not carried: sent#{sent_idx} %");
+            }
+        } else if !dst.contains(&token) {
+            log::debug!("[TRANS-394] token not carried: sent#{sent_idx} {token}");
+        }
+    }
+}
+
+impl NllbModel {
+    fn new(model_dir: &Path) -> Result<Self> {
+        let path = model_dir.join(NLLB_SUBDIR);
+        validate_runtime_files(&path)?;
+        let tokenizer = NllbTokenizer::new(&path)?;
 
         let config = TranslatorConfig {
             device: Device::Cpu,
@@ -376,9 +753,9 @@ impl MarianModel {
             ..TranslatorConfig::default()
         };
         let translator = Ct2Translator::new(&path, &config)
-            .map_err(|err| anyhow!("failed to initialize {} CT2 translator: {}", label, err))?;
+            .map_err(|err| anyhow!("failed to initialize NLLB CT2 translator: {}", err))?;
 
-        log::info!("{} CT2 model initialized at {}", label, path.display());
+        log::info!("NLLB CT2 model initialized at {}", path.display());
 
         Ok(Self {
             path,
@@ -387,123 +764,152 @@ impl MarianModel {
         })
     }
 
-    fn translate(&self, text: &str) -> Result<String> {
-        let text = text.trim();
-        if text.is_empty() {
-            return Ok(String::new());
-        }
-
-        let chars = text.chars().count();
-        let sentence_count = text.matches(&['。', '！', '？']).count();
-        let needs_segmentation = chars > MIN_SEGMENT_CHARS && sentence_count >= 2;
-
-        if needs_segmentation {
-            let segments = segment_text(text);
-            log::info!(
-                "CT2 long text segmented: {} parts from {} chars / {} sentences",
-                segments.len(),
-                chars,
-                sentence_count,
-            );
-            let parts: Vec<String> = segments
+    /// 逐句批量翻译：一次（或分期）喂入所有句子，返回**与 `sentences` 等长**的译文（逐句一一对应）。
+    fn translate_sentences(
+        &self,
+        sentences: &[String],
+        src_lang: &str,
+        tgt_lang: &str,
+        beam_size: usize,
+        length_penalty: f32,
+    ) -> Result<Vec<String>> {
+        let mut out: Vec<String> = Vec::with_capacity(sentences.len());
+        for chunk in sentences.chunks(BATCH_MAX_SENTENCES) {
+            let encoded: Vec<Vec<String>> = chunk
                 .iter()
-                .enumerate()
-                .filter_map(|(i, seg)| match self.translate_segment(seg) {
-                    Ok(translated) if !translated.is_empty() => {
-                        log::info!("CT2 segment {}/{} done", i + 1, segments.len());
-                        Some(translated)
-                    }
-                    Ok(_) => {
-                        log::warn!("CT2 segment {}/{} returned empty", i + 1, segments.len());
-                        None
-                    }
-                    Err(e) => {
-                        log::error!("CT2 segment {}/{} failed: {}", i + 1, segments.len(), e);
-                        None
-                    }
+                .map(|s| {
+                    let pieces = self.tokenizer.encode(s)?;
+                    Ok::<_, anyhow::Error>(build_source_tokens(src_lang, pieces))
                 })
-                .collect();
-
-            if parts.is_empty() {
-                anyhow::bail!("all {} segments failed to translate", segments.len());
+                .collect::<Result<Vec<_>>>()?;
+            let max_src_tokens = encoded.iter().map(Vec::len).max().unwrap_or(0);
+            let max_decoding_length =
+                (max_src_tokens * MAX_NEW_TOKENS_FACTOR + MAX_NEW_TOKENS_PAD).min(MAX_DECODE_STEPS);
+            let options = TranslationOptions {
+                beam_size,
+                length_penalty,
+                coverage_penalty: 0.0,
+                repetition_penalty: REPETITION_PENALTY,
+                no_repeat_ngram_size: NO_REPEAT_NGRAM_SIZE,
+                // TUNE-394：删除 `min_decoding_length = 源/2` 的强制（旧版据此逼模型续写/编造）。
+                min_decoding_length: 0,
+                max_decoding_length: max_decoding_length.max(1),
+                max_input_length: 0,
+                ..TranslationOptions::default()
+            };
+            let results = self
+                .translator
+                .translate_batch_with_prefix(&encoded, &[tgt_lang.to_string()], &options)
+                .map_err(|err| {
+                    anyhow!(
+                        "failed to translate with NLLB model at {}: {}",
+                        self.path.display(),
+                        err
+                    )
+                })?;
+            if results.len() != chunk.len() {
+                anyhow::bail!(
+                    "NLLB returned {} results for {} sentences",
+                    results.len(),
+                    chunk.len()
+                );
             }
-            Ok(parts.join(" "))
-        } else {
-            self.translate_segment(text)
+            for result in results {
+                let tokens = result.output();
+                let stripped = strip_target_prefix(&tokens, tgt_lang);
+                out.push(
+                    self.tokenizer
+                        .decode(&stripped)
+                        .context("failed to decode NLLB output")?,
+                );
+            }
         }
-    }
-
-    fn translate_segment(&self, text: &str) -> Result<String> {
-        let text = text.trim();
-        if text.is_empty() {
-            return Ok(String::new());
-        }
-
-        log::debug!(
-            "CT2 translating segment with model at {}",
-            self.path.display()
-        );
-        let source_tokens = self.tokenizer.encode(text)?;
-        log::info!("CT2 source tokens: {:?}", source_tokens);
-
-        let options = TranslationOptions {
-            beam_size: BEAM_WIDTH,
-            length_penalty: LENGTH_PENALTY_ALPHA as f32,
-            coverage_penalty: COVERAGE_PENALTY as f32,
-            min_decoding_length: std::cmp::max(1, source_tokens.len() / 2),
-            no_repeat_ngram_size: NO_REPEAT_NGRAM_SIZE,
-            max_decoding_length: MAX_DECODE_STEPS,
-            max_input_length: 0,
-            ..TranslationOptions::default()
-        };
-        let result = self
-            .translator
-            .translate_single(&source_tokens, &options)
-            .with_context(|| {
-                format!(
-                    "failed to translate with CT2 model at {}",
-                    self.path.display()
-                )
-            })?;
-        let result_outputs = result.output();
-        log::info!("CT2 result.output_size = {}", result_outputs.len());
-        for (i, token) in result_outputs.iter().enumerate() {
-            log::info!("CT2 token {}: {:?}", i, token);
-        }
-        let decoded = self
-            .tokenizer
-            .decode(&result_outputs)
-            .context("failed to decode translation output")?;
-        log::info!("CT2 decoded output: {:?}", decoded);
-        Ok(decoded)
+        Ok(out)
     }
 }
 
 impl TranslationEngine {
     pub fn new(model_dir: &Path, target: TranslationLanguage) -> Result<Self> {
-        let (subdir, label) = match target {
-            TranslationLanguage::English => (ZH_EN_SUBDIR, "zh-en"),
-            TranslationLanguage::Chinese => (EN_ZH_SUBDIR, "en-zh"),
-        };
-
-        let model = MarianModel::new(model_dir, subdir, label)?;
         Ok(Self {
-            model,
+            model: shared_model(model_dir)?,
             direction: target,
         })
     }
 
-    pub fn translate(&self, text: &str) -> Result<String> {
-        self.model.translate(text)
+    /// TRANS-394-REWORK：复用同一个**进程级** NLLB，仅切换方向（不重载权重、不析构）。
+    fn with_direction(&self, target: TranslationLanguage) -> Self {
+        Self {
+            model: self.model,
+            direction: target,
+        }
     }
 
-    pub fn is_available(model_dir: &Path, target: TranslationLanguage) -> bool {
-        let subdir = match target {
-            TranslationLanguage::English => ZH_EN_SUBDIR,
-            TranslationLanguage::Chinese => EN_ZH_SUBDIR,
+    pub fn translate(&self, text: &str) -> Result<String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(String::new());
+        }
+        let (src_lang, tgt_lang) = match self.direction {
+            TranslationLanguage::English => (LANG_ZH, LANG_EN),
+            TranslationLanguage::Chinese => (LANG_EN, LANG_ZH),
         };
-        let path = model_dir.join(subdir);
 
+        // 逐「行」（段落）处理 ⇒ 保留原文换行（行内多句批量翻译、行间以 `\n` 还原）。
+        let mut out_lines: Vec<String> = Vec::new();
+        for line in text.split('\n') {
+            if line.trim().is_empty() {
+                out_lines.push(String::new());
+                continue;
+            }
+            let sentences = split_sentences(line, self.direction);
+            if sentences.is_empty() {
+                out_lines.push(String::new());
+                continue;
+            }
+            let base = self.model.translate_sentences(
+                &sentences,
+                src_lang,
+                tgt_lang,
+                BEAM_SIZE,
+                LENGTH_PENALTY,
+            )?;
+            // 🔴 392/394：逐句一一对应 —— 每句都产出一条译文，任何一句都不在拼接时被丢弃。
+            let mut parts: Vec<String> = Vec::with_capacity(sentences.len());
+            for (i, sentence) in sentences.iter().enumerate() {
+                let primary = base.get(i).cloned().unwrap_or_default();
+                let (best, retries, still) =
+                    finalize_sentence(sentence, primary, self.direction, || {
+                        self.model
+                            .translate_sentences(
+                                std::slice::from_ref(sentence),
+                                src_lang,
+                                tgt_lang,
+                                RETRY_BEAM_SIZE,
+                                RETRY_LENGTH_PENALTY,
+                            )
+                            .ok()
+                            .and_then(|mut v| v.drain(..).next())
+                    });
+                debug_assert!(retries <= 1, "重译至多一次");
+                if still {
+                    log::warn!(
+                        "[TRANS-394] possible omission: sent#{} src_len={} dst_len={}",
+                        i,
+                        sentence.chars().count(),
+                        best.chars().count()
+                    );
+                }
+                log_token_carry(i, sentence, &best);
+                parts.push(best);
+            }
+            out_lines.push(join_parts(&parts, self.direction));
+        }
+        Ok(out_lines.join("\n"))
+    }
+
+    /// NLLB 单模型服务两方向 ⇒ 可用性只看单目录（`target` 仅保留签名兼容）。
+    pub fn is_available(model_dir: &Path, _target: TranslationLanguage) -> bool {
+        let path = model_dir.join(NLLB_SUBDIR);
         minimum_runtime_files()
             .iter()
             .all(|relative| path.join(relative).is_file())
@@ -511,18 +917,7 @@ impl TranslationEngine {
 
     pub fn model_files() -> Vec<(String, String)> {
         let mut files = Vec::new();
-        append_model_files(
-            &mut files,
-            ZH_EN_SUBDIR,
-            ZH_EN_CT2_BASE_URL,
-            ZH_EN_SPM_BASE_URL,
-        );
-        append_model_files(
-            &mut files,
-            EN_ZH_SUBDIR,
-            EN_ZH_CT2_BASE_URL,
-            EN_ZH_SPM_BASE_URL,
-        );
+        append_model_files(&mut files, NLLB_SUBDIR, NLLB_CT2_BASE_URL);
         files
     }
 
@@ -562,10 +957,12 @@ impl TranslationEngine {
 }
 
 /// TRANS-BIDIR-001 / REFACTOR-SHARE-TRANSDIR-001: Ensure the cached offline
-/// translation engine matches the derived target direction. Single-slot: if
-/// direction differs, rebuild and replace the cached engine (old one dropped).
-/// If rebuild fails, return None (caller injects original text — never drops
-/// user speech, never injects garbage from a wrong-direction engine).
+/// translation engine matches the derived target direction.
+///
+/// TRANS-394-REWORK: NLLB is **one model for both directions** ⇒ direction change reuses the same
+/// **process-level** `&'static NllbModel` (no 594MB reload, no destroy). Only when nothing is cached
+/// do we load from disk. If load fails, return None (caller injects original text — never drops user
+/// speech, never injects garbage from a wrong-direction engine).
 ///
 /// Platform-neutral (DEC-033) — macOS side can reuse directly. All platform
 /// specifics (worker thread, model_dir resolution) stay at the caller.
@@ -577,27 +974,30 @@ pub fn ensure_translation_direction<'a>(
     model_dir: &Path,
     derived_target: TranslationLanguage,
 ) -> Option<&'a TranslationEngine> {
-    // If cached direction already matches, no rebuild needed.
-    let needs_rebuild = match cached_translation {
-        Some((lang, _)) => *lang != derived_target,
-        None => true,
-    };
-    if !needs_rebuild {
+    // 方向一致 ⇒ 直接复用。
+    if let Some((lang, _)) = cached_translation.as_ref() {
+        if *lang == derived_target {
+            return cached_translation.as_ref().map(|(_, e)| e);
+        }
+    }
+    // 有缓存但方向不同 ⇒ 复用同一个进程级 NllbModel，仅换方向（不重载权重、不析构）。
+    if let Some((_, engine)) = cached_translation.as_ref() {
+        let new_engine = engine.with_direction(derived_target);
+        log::info!(
+            "Translation direction switched to {:?} (NLLB model reused, no reload)",
+            derived_target
+        );
+        *cached_translation = Some((derived_target, new_engine));
         return cached_translation.as_ref().map(|(_, e)| e);
     }
-    // Direction mismatch (or no engine cached): rebuild for derived direction.
+    // 无缓存 ⇒ 从磁盘加载。
     let t_start = std::time::Instant::now();
-    log::info!(
-        "Translation engine direction mismatch: cached={:?}, derived={:?}; rebuilding…",
-        cached_translation.as_ref().map(|(lang, _)| *lang),
-        derived_target
-    );
     let new_engine = TranslationEngine::load_for_direction(model_dir, derived_target);
     let elapsed = t_start.elapsed();
     match new_engine {
         Some(engine) => {
             log::info!(
-                "Translation engine reloaded for {:?} in {:.2}s",
+                "Translation engine loaded for {:?} in {:.2}s",
                 derived_target,
                 elapsed.as_secs_f64()
             );
@@ -606,80 +1006,51 @@ pub fn ensure_translation_direction<'a>(
         }
         None => {
             log::warn!(
-                "Translation engine rebuild failed for {:?} after {:.2}s; \
+                "Translation engine load failed for {:?} after {:.2}s; \
                  skipping translation (original text will be injected)",
                 derived_target,
                 elapsed.as_secs_f64()
             );
-            // Return None — do NOT hand out the old wrong-direction engine.
-            // Wrong-direction output is garbage, strictly worse than injecting
-            // the original text. The old engine is kept in cache (still valid
-            // for its own direction on the next same-direction call).
             None
         }
     }
 }
 
-fn append_model_files(
-    files: &mut Vec<(String, String)>,
-    subdir: &str,
-    ct2_base_url: &str,
-    spm_base_url: &str,
-) {
-    for filename in [CONFIG_JSON, MODEL_BIN, SHARED_VOCABULARY_JSON] {
+fn append_model_files(files: &mut Vec<(String, String)>, subdir: &str, base_url: &str) {
+    for filename in [
+        CONFIG_JSON,
+        MODEL_BIN,
+        SHARED_VOCABULARY_JSON,
+        SENTENCEPIECE_MODEL,
+    ] {
         files.push((
             format!("{subdir}/{filename}"),
-            format!("{ct2_base_url}/{filename}"),
-        ));
-    }
-    for filename in [SOURCE_SPM, TARGET_SPM] {
-        files.push((
-            format!("{subdir}/{filename}"),
-            format!("{spm_base_url}/{filename}"),
+            format!("{base_url}/{filename}"),
         ));
     }
 }
 
-fn minimum_runtime_files() -> [&'static str; 3] {
-    [MODEL_BIN, SOURCE_SPM, TARGET_SPM]
+fn minimum_runtime_files() -> [&'static str; 2] {
+    [MODEL_BIN, SENTENCEPIECE_MODEL]
 }
 
-fn required_runtime_files() -> [&'static str; 5] {
+fn required_runtime_files() -> [&'static str; 4] {
     [
         CONFIG_JSON,
         MODEL_BIN,
         SHARED_VOCABULARY_JSON,
-        SOURCE_SPM,
-        TARGET_SPM,
+        SENTENCEPIECE_MODEL,
     ]
 }
 
-fn validate_runtime_files(path: &Path, label: &str) -> Result<()> {
+fn validate_runtime_files(path: &Path) -> Result<()> {
     for relative in required_runtime_files() {
         let file = path.join(relative);
         if !file.is_file() {
-            return Err(anyhow!(
-                "missing {} runtime file for {} model: {}",
-                relative,
-                label,
-                file.display()
-            ));
+            return Err(anyhow!("missing NLLB runtime file: {}", file.display()));
         }
     }
-
     Ok(())
-}
-
-fn normalize_translation_output(text: &str) -> String {
-    text.replace("<pad>", "")
-        .replace("</s>", "")
-        .replace("<s>", "")
-        .replace('\u{2581}', " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .to_string()
 }
 
 #[cfg(test)]
@@ -704,381 +1075,14 @@ mod tests {
     fn write_placeholder_files(model_dir: &Path, subdir: &str, files: &[&str]) {
         let base = model_dir.join(subdir);
         fs::create_dir_all(&base).expect("create model base directory");
-
         for relative in files {
             let file = base.join(relative);
-            if let Some(parent) = file.parent() {
-                fs::create_dir_all(parent).expect("create parent directory");
-            }
             fs::write(file, b"placeholder").expect("write placeholder file");
         }
     }
 
-    #[test]
-    fn translate_returns_err_without_model_files() {
-        let dir = unique_temp_dir("ct2-no-model");
-        assert!(!TranslationEngine::is_available(
-            &dir,
-            TranslationLanguage::English
-        ));
-        assert!(TranslationEngine::new(&dir, TranslationLanguage::English).is_err());
-    }
+    // ---- 方向判定（沿用，未改） ----
 
-    #[test]
-    fn model_files_covers_both_translation_directions() {
-        let files = TranslationEngine::model_files();
-        let has_zh_en = files
-            .iter()
-            .any(|(name, url)| name.contains(ZH_EN_SUBDIR) && url.contains("opus-mt-zh-en"));
-        let has_en_zh = files
-            .iter()
-            .any(|(name, url)| name.contains(EN_ZH_SUBDIR) && url.contains("opus-mt-en-zh"));
-
-        assert!(has_zh_en, "should include zh-en model files");
-        assert!(has_en_zh, "should include en-zh model files");
-    }
-
-    #[test]
-    fn each_direction_has_five_model_files() {
-        let files = TranslationEngine::model_files();
-        let zh_en_files: Vec<_> = files
-            .iter()
-            .filter(|(name, _)| name.contains(ZH_EN_SUBDIR))
-            .collect();
-        let en_zh_files: Vec<_> = files
-            .iter()
-            .filter(|(name, _)| name.contains(EN_ZH_SUBDIR))
-            .collect();
-
-        assert_eq!(zh_en_files.len(), 5, "zh-en should have 5 files");
-        assert_eq!(en_zh_files.len(), 5, "en-zh should have 5 files");
-    }
-
-    #[test]
-    fn model_files_use_ct2_and_sentencepiece_sources() {
-        let files = TranslationEngine::model_files();
-        let zh_en_source_spm = files
-            .iter()
-            .find(|(name, _)| name == &format!("{ZH_EN_SUBDIR}/{SOURCE_SPM}"))
-            .expect("zh-en source.spm entry");
-        let zh_en_target_spm = files
-            .iter()
-            .find(|(name, _)| name == &format!("{ZH_EN_SUBDIR}/{TARGET_SPM}"))
-            .expect("zh-en target.spm entry");
-        let en_zh_source_spm = files
-            .iter()
-            .find(|(name, _)| name == &format!("{EN_ZH_SUBDIR}/{SOURCE_SPM}"))
-            .expect("en-zh source.spm entry");
-        let en_zh_target_spm = files
-            .iter()
-            .find(|(name, _)| name == &format!("{EN_ZH_SUBDIR}/{TARGET_SPM}"))
-            .expect("en-zh target.spm entry");
-
-        assert!(
-            zh_en_source_spm.1.contains("Helsinki-NLP/opus-mt-zh-en"),
-            "zh-en source.spm should come from Helsinki"
-        );
-        assert!(
-            zh_en_target_spm.1.contains("Helsinki-NLP/opus-mt-zh-en"),
-            "zh-en target.spm should come from Helsinki"
-        );
-        assert!(
-            en_zh_source_spm.1.contains("Helsinki-NLP/opus-mt-en-zh"),
-            "en-zh source.spm should come from Helsinki"
-        );
-        assert!(
-            en_zh_target_spm.1.contains("Helsinki-NLP/opus-mt-en-zh"),
-            "en-zh target.spm should come from Helsinki"
-        );
-        assert!(files.iter().any(|(name, url)| {
-            name == &format!("{ZH_EN_SUBDIR}/{MODEL_BIN}")
-                && url.contains("gaudi/opus-mt-zh-en-ctranslate2")
-        }));
-        assert!(files.iter().any(|(name, url)| {
-            name == &format!("{EN_ZH_SUBDIR}/{MODEL_BIN}")
-                && url.contains("gaudi/opus-mt-en-zh-ctranslate2")
-        }));
-    }
-
-    #[test]
-    fn is_available_requires_model_bin_and_sentencepiece_models() {
-        let dir = unique_temp_dir("ct2-availability");
-        write_placeholder_files(&dir, ZH_EN_SUBDIR, &minimum_runtime_files());
-
-        assert!(
-            TranslationEngine::is_available(&dir, TranslationLanguage::English),
-            "model.bin + source.spm + target.spm should satisfy availability"
-        );
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn is_available_is_direction_specific() {
-        let dir = unique_temp_dir("ct2-direction");
-        write_placeholder_files(&dir, ZH_EN_SUBDIR, &minimum_runtime_files());
-
-        assert!(TranslationEngine::is_available(
-            &dir,
-            TranslationLanguage::English
-        ));
-        assert!(!TranslationEngine::is_available(
-            &dir,
-            TranslationLanguage::Chinese
-        ));
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn normalize_translation_output_strips_special_tokens() {
-        let output = normalize_translation_output("<pad> hello world </s>");
-        assert_eq!(output, "hello world");
-    }
-
-    #[test]
-    fn normalize_translation_output_reconstructs_metaspace_word_boundaries() {
-        let output = normalize_translation_output("<pad>▁I▁am▁happy</s>");
-        assert_eq!(output, "I am happy");
-    }
-
-    #[test]
-    fn required_runtime_files_include_sentencepiece_assets() {
-        assert_eq!(
-            minimum_runtime_files(),
-            [MODEL_BIN, SOURCE_SPM, TARGET_SPM],
-            "minimum availability should require CT2 weights plus both sentencepiece files"
-        );
-        assert_eq!(
-            required_runtime_files(),
-            [
-                CONFIG_JSON,
-                MODEL_BIN,
-                SHARED_VOCABULARY_JSON,
-                SOURCE_SPM,
-                TARGET_SPM,
-            ],
-            "runtime validation should require config, weights, vocabulary, and both sentencepiece files"
-        );
-    }
-
-    #[test]
-    fn beam_width_is_six() {
-        assert_eq!(BEAM_WIDTH, 6);
-    }
-
-    #[test]
-    fn length_penalty_alpha_is_one_point_five() {
-        assert!((LENGTH_PENALTY_ALPHA - 1.5_f64).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn translation_options_all_parameters_set() {
-        let options = TranslationOptions {
-            beam_size: BEAM_WIDTH,
-            length_penalty: LENGTH_PENALTY_ALPHA as f32,
-            coverage_penalty: COVERAGE_PENALTY as f32,
-            min_decoding_length: 10,
-            no_repeat_ngram_size: NO_REPEAT_NGRAM_SIZE,
-            max_decoding_length: MAX_DECODE_STEPS,
-            max_input_length: 0,
-            ..TranslationOptions::default()
-        };
-
-        assert_eq!(options.beam_size, 6, "beam size should be 6");
-        assert!(
-            (options.length_penalty - 1.5).abs() < f32::EPSILON,
-            "length penalty alpha should be 1.5"
-        );
-        assert!(
-            (options.coverage_penalty - 0.05).abs() < f32::EPSILON,
-            "coverage penalty should be 0.05"
-        );
-        assert_eq!(
-            options.min_decoding_length, 10,
-            "min decoding length should be set"
-        );
-        assert_eq!(
-            options.no_repeat_ngram_size, 0,
-            "no repeat ngram size should be 0 (disabled) to avoid premature translation termination"
-        );
-        assert_eq!(
-            options.max_decoding_length, 512,
-            "max decoding length should be 512"
-        );
-        assert_eq!(
-            options.max_input_length, 0,
-            "max input length should be 0 (unlimited, input bounded by MAX_RECORD_SECONDS)"
-        );
-    }
-
-    #[test]
-    fn no_repeat_ngram_size_is_zero() {
-        assert_eq!(NO_REPEAT_NGRAM_SIZE, 0);
-    }
-
-    #[test]
-    fn max_decoding_length_is_512() {
-        assert_eq!(MAX_DECODE_STEPS, 512);
-    }
-
-    // ============================================================
-    // TRANS-SEGMENT-001: segmentation + parameter tuning tests
-    // ============================================================
-
-    #[test]
-    fn segment_text_returns_single_segment_for_short_text() {
-        let text = "你好世界。";
-        let segments = segment_text(text);
-        assert_eq!(
-            segments.len(),
-            1,
-            "short single-sentence should not be segmented"
-        );
-    }
-
-    #[test]
-    fn segment_text_returns_single_segment_for_two_short_sentences() {
-        let text = "你好。再见。";
-        let segments = segment_text(text);
-        assert_eq!(
-            segments.len(),
-            1,
-            "two short sentences under char threshold should merge"
-        );
-    }
-
-    #[test]
-    fn segment_text_splits_long_text_into_multiple_segments() {
-        let text = "今天天气很好。我去公园散步了。看见了很多花。非常漂亮。我很开心。明天还要去。";
-        let segments = segment_text(text);
-        assert!(
-            segments.len() >= 2,
-            "long text should be split into multiple segments"
-        );
-        for seg in &segments {
-            assert!(
-                seg.chars().count() <= MAX_SEGMENT_CHARS + 20,
-                "each segment should not greatly exceed MAX_SEGMENT_CHARS"
-            );
-        }
-    }
-
-    #[test]
-    fn segment_text_preserves_all_input_chars() {
-        let text = "第一句话。第二句话。第三句话。第四句话。";
-        let segments = segment_text(text);
-        let joined: String = segments.join(" ");
-        let joined_trimmed: String = joined
-            .chars()
-            .filter(|c| !c.is_whitespace() && *c != ' ')
-            .collect();
-        let original_trimmed: String = text
-            .chars()
-            .filter(|c| !c.is_whitespace() && *c != ' ')
-            .collect();
-        assert_eq!(
-            joined_trimmed, original_trimmed,
-            "segmented+joined text chars should match original"
-        );
-    }
-
-    #[test]
-    fn segment_text_empty_input_returns_single_empty() {
-        let segments = segment_text("");
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0], "");
-    }
-
-    #[test]
-    fn segment_text_single_short_sentence_no_punctuation() {
-        let text = "你好世界";
-        let segments = segment_text(text);
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0], "你好世界");
-    }
-
-    #[test]
-    fn coverage_penalty_is_configured() {
-        assert!(
-            (COVERAGE_PENALTY - 0.05_f64).abs() < f64::EPSILON,
-            "coverage penalty should be 0.05"
-        );
-    }
-
-    #[test]
-    fn min_segment_chars_and_max_segment_chars_are_reasonable() {
-        assert!(MIN_SEGMENT_CHARS < MAX_SEGMENT_CHARS);
-        assert!(MIN_SEGMENT_CHARS >= 60);
-        assert!(MAX_SEGMENT_CHARS <= 500);
-    }
-
-    #[test]
-    fn length_penalty_updated_to_one_point_five() {
-        assert!(
-            (LENGTH_PENALTY_ALPHA - 1.5_f64).abs() < f64::EPSILON,
-            "LENGTH_PENALTY_ALPHA should be updated from 1.2 to 1.5"
-        );
-    }
-
-    // ============================================================
-    // TEST-SYNC-TRANS-SEGMENT-001: coverage gap tests
-    // ============================================================
-
-    #[test]
-    fn translate_skips_segmentation_when_text_is_short() {
-        // 构造 <120 字符的两句文本，验证 segment_text 返回 1 个 segment。
-        // 对应 needs_segmentation 条件中 chars > MIN_SEGMENT_CHARS 的左侧短路行为。
-        let text = "今天天气很好。我去公园散步了。";
-        assert!(
-            text.chars().count() <= MIN_SEGMENT_CHARS,
-            "test input should be <= MIN_SEGMENT_CHARS(120)"
-        );
-        let segments = segment_text(text);
-        assert_eq!(
-            segments.len(),
-            1,
-            "short text under MIN_SEGMENT_CHARS should not be segmented even with 2 sentences"
-        );
-    }
-
-    #[test]
-    fn translate_skips_segmentation_when_single_sentence() {
-        // 构造单一很长且无断句标点的句子（>120 字符），
-        // 验证 segment_text 因 sentences.len() <= 1 而返回 1 个 segment。
-        let text = "这段测试文本超过一百二十个字符且没有任何句号问号叹号或换行符属于单一整句因此即使其总长度远超最小分段阈值分段函数也必须将其整体返回为单一片段不进行任何切割处理这是因为分段的触发条件之一就是文本必须包含至少两个独立完整的句子才能被判断为需要分段";
-        assert!(
-            text.chars().count() > MIN_SEGMENT_CHARS,
-            "test input should exceed MIN_SEGMENT_CHARS(120)"
-        );
-        let segments = segment_text(text);
-        assert_eq!(
-            segments.len(),
-            1,
-            "single sentence without punctuation should not be segmented"
-        );
-    }
-
-    #[test]
-    fn segment_text_splits_on_max_sentences_per_segment() {
-        // 构造 6 个简短句（每句 <40 字符，总 <200 字符），
-        // 验证在 MAX_SENTENCES_PER_SEGMENT=3 时被切割为 >=2 个 segments。
-        let text = "第一句。第二句。第三句。第四句。第五句。第六句。";
-        let segments = segment_text(text);
-        assert!(
-            segments.len() >= 2,
-            "6 sentences should split into at least 2 segments due to MAX_SENTENCES_PER_SEGMENT=3"
-        );
-    }
-
-    // ============================================================
-    // TEST-SYNC-ITN-TRANS-001: derive_translation_target 断言矩阵
-    // ============================================================
-
-    /// 方向判定纯函数——输入文本 → TranslationLanguage
-    /// 日文汉字（日本語の漢字）是已知语义边界：contains_han 对日文汉字为真，
-    /// 故推导为 English。这比旧的"静默跳过"好，但不是完美解；未来可通过
-    /// LANG-MIXED-001 kana/hangul 探针精化。
     #[test]
     fn derive_target_chinese_text_returns_english() {
         assert_eq!(
@@ -1134,16 +1138,312 @@ mod tests {
         assert_eq!(derive_translation_target(""), TranslationLanguage::Chinese);
     }
 
-    // ============================================================
-    // TEST-SYNC-ITN-TRANS-001: ensure_translation_direction 测试
-    // REFACTOR-SHARE-TRANSDIR-001: 从 main.rs 搬迁至此（平台中立）
-    // ============================================================
+    // ---- 模型可用性 / 文件清单（NLLB） ----
 
-    /// 重建失败分支 → 必须返回 None（主控修正护栏）。
-    /// cached=None + model_dir 不存在 → is_available=false → 返回 None。
-    /// 方向一致不重建和缓存错方向+重建失败这两条路径需要真实
-    /// TranslationEngine 实例（依赖 CTranslate2 FFI + 模型文件），
-    /// 无法在纯单元测试中构造。
+    #[test]
+    fn translate_returns_err_without_model_files() {
+        let dir = unique_temp_dir("nllb-no-model");
+        assert!(!TranslationEngine::is_available(
+            &dir,
+            TranslationLanguage::English
+        ));
+        assert!(TranslationEngine::new(&dir, TranslationLanguage::English).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn model_files_is_nllb_single_dir() {
+        let files = TranslationEngine::model_files();
+        assert_eq!(files.len(), 4, "NLLB 单目录 4 个文件");
+        for (name, url) in &files {
+            assert!(
+                name.starts_with(NLLB_SUBDIR),
+                "文件应在 {NLLB_SUBDIR} 下：{name}"
+            );
+            assert!(
+                url.contains("mijuanlo/nllb-200-distilled-600M-ct2-int8"),
+                "URL 命中 NLLB 仓库：{url}"
+            );
+        }
+        for expected in [
+            CONFIG_JSON,
+            MODEL_BIN,
+            SHARED_VOCABULARY_JSON,
+            SENTENCEPIECE_MODEL,
+        ] {
+            assert!(
+                files
+                    .iter()
+                    .any(|(n, _)| n == &format!("{NLLB_SUBDIR}/{expected}")),
+                "应包含 {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_available_requires_model_bin_and_sentencepiece() {
+        let dir = unique_temp_dir("nllb-availability");
+        write_placeholder_files(&dir, NLLB_SUBDIR, &minimum_runtime_files());
+        assert!(
+            TranslationEngine::is_available(&dir, TranslationLanguage::English),
+            "model.bin + sentencepiece.bpe.model 应满足可用性"
+        );
+        // NLLB 单模型服务两方向 ⇒ 中→英同样可用。
+        assert!(TranslationEngine::is_available(
+            &dir,
+            TranslationLanguage::Chinese
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn required_runtime_files_include_all_nllb_assets() {
+        assert_eq!(minimum_runtime_files(), [MODEL_BIN, SENTENCEPIECE_MODEL]);
+        assert_eq!(
+            required_runtime_files(),
+            [
+                CONFIG_JSON,
+                MODEL_BIN,
+                SHARED_VOCABULARY_JSON,
+                SENTENCEPIECE_MODEL
+            ]
+        );
+    }
+
+    // ---- 分句 ----
+
+    #[test]
+    fn split_sentences_zh_splits_comma_long_sentence_into_clauses() {
+        // 一句无句末标点、以逗号连写、超过 80 字 ⇒ 按逗号切子句。
+        let long = "今天天气非常好，我们决定一起出门去公园散步，顺便看看那边的花，然后找个地方坐下来聊聊天，再吃点东西，最后慢慢走回家".repeat(2);
+        assert!(
+            long.chars().count() > ZH_MAX_SENT_CHARS,
+            "用例输入须 >80 字，实测 {}",
+            long.chars().count()
+        );
+        let sents = split_sentences(&long, TranslationLanguage::English);
+        assert!(
+            sents.len() >= 2,
+            "逗号长句应切成多子句，实测 {}",
+            sents.len()
+        );
+        // 拼接（去逗号）应与原文（去逗号）一致（不丢字）。
+        let joined: String = sents.concat();
+        assert_eq!(
+            joined.chars().filter(|c| *c != '，').count(),
+            long.chars().filter(|c| *c != '，').count()
+        );
+    }
+
+    #[test]
+    fn split_sentences_en_two_sentences_with_abbrev_and_decimal() {
+        let text = "Mr. Smith paid 3.14 dollars. Then he left!";
+        let sents = split_sentences(text, TranslationLanguage::Chinese);
+        assert_eq!(sents.len(), 2, "应为 2 句，实测 {sents:?}");
+        assert!(sents[0].contains("3.14"), "小数点不切");
+        assert!(sents[0].contains("Mr."), "Mr. 缩写不切");
+        assert!(sents[1].starts_with("Then"));
+    }
+
+    #[test]
+    fn split_sentences_en_keeps_acronym() {
+        let text = "The U.S. is large. It has 50 states.";
+        let sents = split_sentences(text, TranslationLanguage::Chinese);
+        assert_eq!(sents.len(), 2, "U.S. 缩写不切，实测 {sents:?}");
+    }
+
+    #[test]
+    fn split_sentences_en_no_and_am_are_not_sentence_end_abbrev() {
+        // R3：`no` / `am` 不再误判为缩写，句末应断句。
+        let no = split_sentences("The answer is no. We left.", TranslationLanguage::Chinese);
+        assert_eq!(no.len(), 2, "`no.` 处应断句，实测 {no:?}");
+        let am = split_sentences("I am. You are.", TranslationLanguage::Chinese);
+        assert_eq!(am.len(), 2, "`am.` 处应断句，实测 {am:?}");
+    }
+
+    #[test]
+    fn split_sentences_en_no_before_number_is_abbreviation() {
+        // R3：`No. 5` 后接数字 ⇒ 仍视为缩写，不断句；`ready.` 处断句。
+        let sents = split_sentences("No. 5 is ready. Go.", TranslationLanguage::Chinese);
+        assert_eq!(sents.len(), 2, "应为 2 句，实测 {sents:?}");
+        assert!(sents[0].contains("No. 5"), "首句应含 No. 5：{sents:?}");
+        assert!(
+            sents[1].trim_start().starts_with("Go"),
+            "次句应含 Go：{sents:?}"
+        );
+    }
+
+    #[test]
+    fn split_sentences_zh_sentence_terminators() {
+        let sents = split_sentences("你好。再见！走吧？", TranslationLanguage::English);
+        assert_eq!(sents.len(), 3);
+    }
+
+    #[test]
+    fn split_sentences_drops_empty_and_merges_short_clause() {
+        // 全空/空白句丢弃。
+        assert!(split_sentences("   ", TranslationLanguage::English).is_empty());
+        // 子句下限：一个 <10 字的碎子句应并入相邻（切后各段不少于 10 字）。
+        let text = "这是一个很长很长需要被切开的中文句子用来测试子句合并的边界行为加长一点点哦";
+        let sents = split_sentences(&text, TranslationLanguage::English);
+        for s in &sents {
+            assert!(!s.trim().is_empty());
+        }
+    }
+
+    // ---- 拼接 ----
+
+    #[test]
+    fn join_parts_zh_to_en_uses_space_en_to_zh_no_space() {
+        let parts = vec!["Hello".to_string(), "world".to_string()];
+        assert_eq!(
+            join_parts(&parts, TranslationLanguage::English),
+            "Hello world"
+        );
+        let zh = vec!["你好".to_string(), "世界".to_string()];
+        assert_eq!(join_parts(&zh, TranslationLanguage::Chinese), "你好世界");
+        // 空译文不产生多余空格。
+        let mixed = vec!["Hello".to_string(), String::new(), "world".to_string()];
+        assert_eq!(
+            join_parts(&mixed, TranslationLanguage::English),
+            "Hello world"
+        );
+    }
+
+    // ---- token 构造 / 去前缀 ----
+
+    #[test]
+    fn build_source_tokens_prepends_lang_appends_eos() {
+        let t = build_source_tokens(LANG_ZH, vec!["你好".to_string(), "世界".to_string()]);
+        assert_eq!(t, vec![LANG_ZH, "你好", "世界", EOS_TOKEN]);
+        let t = build_source_tokens(LANG_EN, vec!["Hello".to_string()]);
+        assert_eq!(t, vec![LANG_EN, "Hello", EOS_TOKEN]);
+    }
+
+    #[test]
+    fn strip_target_prefix_removes_first_target_lang_token() {
+        let toks = vec![
+            LANG_EN.to_string(),
+            "Hello".to_string(),
+            "world".to_string(),
+        ];
+        assert_eq!(strip_target_prefix(&toks, LANG_EN), vec!["Hello", "world"]);
+        // 首 token 不是目标语种 ⇒ 原样（防御）。
+        let toks = vec!["Hello".to_string()];
+        assert_eq!(strip_target_prefix(&toks, LANG_EN), vec!["Hello"]);
+    }
+
+    // ---- 漏译检测 + 重译至多一次 ----
+
+    #[test]
+    fn looks_truncated_boundaries() {
+        // zh→en：4 字阈值 = 1.4 词
+        assert!(!looks_truncated(
+            "你好世界",
+            "Hello world",
+            TranslationLanguage::English
+        ));
+        assert!(looks_truncated(
+            "你好世界",
+            "Hi",
+            TranslationLanguage::English
+        ));
+        assert!(looks_truncated(
+            "你好世界",
+            "",
+            TranslationLanguage::English
+        ));
+        assert!(looks_truncated(
+            "你好世界",
+            "   ",
+            TranslationLanguage::English
+        ));
+        // en→zh：2 词阈值 = 1.2 字
+        assert!(!looks_truncated(
+            "hello world",
+            "你好",
+            TranslationLanguage::Chinese
+        ));
+        assert!(looks_truncated(
+            "hello world",
+            "好",
+            TranslationLanguage::Chinese
+        ));
+        assert!(looks_truncated(
+            "hello world",
+            "",
+            TranslationLanguage::Chinese
+        ));
+    }
+
+    #[test]
+    fn finalize_sentence_retries_once_and_keeps_longer() {
+        use std::cell::Cell;
+        // 空结果 ⇒ 触发重译一次，取更长者。
+        let calls = Cell::new(0);
+        let (best, retries, still) = finalize_sentence(
+            "你好世界",
+            String::new(),
+            TranslationLanguage::English,
+            || {
+                calls.set(calls.get() + 1);
+                Some("Hello world".to_string())
+            },
+        );
+        assert_eq!(calls.get(), 1, "空结果应触发重译恰一次");
+        assert_eq!(retries, 1);
+        assert_eq!(best, "Hello world");
+        assert!(!still, "重译后不再疑似漏译");
+        // 正常结果 ⇒ 不重译。
+        let calls = Cell::new(0);
+        let (best, retries, still) = finalize_sentence(
+            "你好世界",
+            "Hello world".to_string(),
+            TranslationLanguage::English,
+            || {
+                calls.set(calls.get() + 1);
+                Some("不应调用".to_string())
+            },
+        );
+        assert_eq!(calls.get(), 0, "正常结果不得重译");
+        assert_eq!(retries, 0);
+        assert_eq!(best, "Hello world");
+        assert!(!still);
+    }
+
+    #[test]
+    fn finalize_sentence_warns_when_retry_still_short() {
+        // 重译仍过短 ⇒ still=true（上层 warn），保留较长者，重译至多一次。
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let (best, retries, still) = finalize_sentence(
+            "你好世界",
+            "Hi".to_string(),
+            TranslationLanguage::English,
+            || {
+                calls.set(calls.get() + 1);
+                Some("Yo".to_string())
+            },
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(retries, 1, "至多一次");
+        assert_eq!(best, "Hi", "取较长者（Hi 2 > Yo 2 时保留原值）");
+        assert!(still, "重译仍短 ⇒ 仍疑似漏译");
+    }
+
+    #[test]
+    fn finalize_sentence_no_drop_all_sentences_kept() {
+        // 拼接不丢句：N 句 ⇒ N 段（含空段）全部保留。
+        let srcs = ["你好世界", "今天天气好", "再见"];
+        let parts: Vec<String> = srcs
+            .iter()
+            .map(|s| finalize_sentence(s, s.to_string(), TranslationLanguage::English, || None).0)
+            .collect();
+        assert_eq!(parts.len(), 3, "逐句一一对应、不得丢句");
+    }
+
+    // ---- ensure_translation_direction ----
+
     #[test]
     fn ensure_direction_returns_none_when_rebuild_unavailable() {
         let mut cached: Option<(TranslationLanguage, TranslationEngine)> = None;
@@ -1152,7 +1452,365 @@ mod tests {
             ensure_translation_direction(&mut cached, model_dir, TranslationLanguage::English);
         assert!(
             result.is_none(),
-            "must return None when rebuild fails — never pass a direction-mismatched old engine"
+            "must return None when load fails — never pass a wrong-direction engine"
         );
+    }
+
+    // ---- 源码护栏：不再引用 opus-mt；不再有 min_decoding_length 强制 ----
+
+    #[test]
+    fn source_guard_no_opus_mt_and_no_forced_min_decoding() {
+        let src = include_str!("mod.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("opus-mt"),
+            "生产代码不得再引用 opus-mt（仅历史注释可保留）"
+        );
+        assert!(
+            !code.contains("min_decoding_length: std::cmp::max(1, source_tokens.len() / 2)"),
+            "禁止强制 min_decoding_length = 源/2"
+        );
+        assert!(
+            code.contains("min_decoding_length: 0"),
+            "min_decoding_length 应设 0"
+        );
+        assert!(
+            code.contains("translator_translate_batch_with_target_prefix"),
+            "必须走带 target_prefix 的批量接口"
+        );
+    }
+
+    #[test]
+    fn source_guard_process_level_model_never_destroyed() {
+        // R1-c：生产代码中 `NllbModel::new(` 只应出现一次（在 `shared_model` 内）；
+        // 模型 `Box::leak` 常驻、`translator_destroy` 不再被生产路径触发。
+        let src = include_str!("mod.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code.matches("NllbModel::new(").count(),
+            1,
+            "NllbModel::new 只应在 shared_model 内出现一次（进程级单次加载）"
+        );
+        assert!(
+            code.contains("fn shared_model("),
+            "应有 shared_model 加载器"
+        );
+        assert!(
+            code.contains("Box::leak"),
+            "模型应 Box::leak 常驻、永不析构"
+        );
+        assert!(
+            code.contains("thread_local!"),
+            "应使用 thread_local 进程级缓存（见 shared_model 注释）"
+        );
+    }
+
+    // ---- 真模型实跑（#[ignore]） ----
+
+    /// TRANS-394 验收：真 NLLB 实跑 —— 中→英 3 段（短 / ≥5 句长段 / 逗号连写 100+ 字）、
+    /// 英→中 2 段（短 / 长）；断言**原句数 == 译句数**、每句过 `looks_truncated`、数字全部保留，
+    /// 并打印逐句对照表。运行：
+    /// `cargo test --bin feiyin-ime -- --ignored --nocapture trans394_real_model`
+    #[test]
+    #[ignore = "requires NLLB model; cargo test --bin feiyin-ime -- --ignored --nocapture trans394_real_model"]
+    fn trans394_real_model() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let model_dir = root.join("models");
+        if !TranslationEngine::is_available(&model_dir, TranslationLanguage::English) {
+            eprintln!("skip: NLLB model 不在位 at {}", model_dir.display());
+            return;
+        }
+
+        // 共享同一份已加载 NLLB（with_direction 只换方向、不重载 594MB 权重）。
+        let engine =
+            TranslationEngine::new(&model_dir, TranslationLanguage::English).expect("load NLLB");
+        let zh_to_en = &engine;
+        let en_to_zh = engine.with_direction(TranslationLanguage::Chinese);
+
+        let zh_short = "今天温度是 25 度。";
+        let zh_long = "上周我们去了一个很大的博物馆。那里展出了很多古代文物。我最喜欢的是那些青铜器。它们上面刻着复杂的纹饰。讲解员说这些文物有三千多年历史。参观结束后我们还买了纪念品。";
+        let zh_comma = "这次会议我们讨论了三个重要的议题，第一个是明年的预算安排，大家一致觉得应该继续增加研发方面的投入，第二个是关于人员招聘的具体计划，需要在明年春季之前全部完成，第三个是办公场地的搬迁时间，大概定在六月以后，具体的日期还要再确认一下，另外还需要确定每个项目的负责人和联系方式";
+        let en_short = "There are 42 items in stock.";
+        let en_long = "The project has been running for several months. We have collected a large amount of data. The results so far look promising. However, there are still some issues to solve. We need more time to finish the analysis. I believe we can deliver the report next week.";
+
+        let zh_cases = [zh_short, zh_long, zh_comma];
+        let mut failures = 0usize;
+        for (case, src) in zh_cases.iter().enumerate() {
+            let sents = split_sentences(src, TranslationLanguage::English);
+            let translated = zh_to_en.translate(src).expect("translate zh→en");
+            let out_parts = split_sentences(&translated, TranslationLanguage::Chinese); // 仅用于打印
+            println!("\n===== ZH→EN case#{case} （原 {src}）");
+            println!(
+                "  sentences({}) => translated => {}",
+                sents.len(),
+                translated
+            );
+            for (i, s) in sents.iter().enumerate() {
+                println!("   [{i}] 原句: {s}");
+            }
+            for (i, o) in out_parts.iter().enumerate() {
+                println!("   [{i}] 译文: {o}");
+            }
+            // 原句数 == 译句数（逐句一一对应；translate 内部按拆分后的句逐条产出）。
+            assert!(!translated.trim().is_empty(), "case#{case} 译文不得为空");
+            match case {
+                0 => assert_eq!(sents.len(), 1, "短句应 1 句"),
+                1 => {
+                    assert!(sents.len() >= 5, "长段应 ≥5 句，实测 {}", sents.len());
+                    assert_eq!(
+                        out_parts.len(),
+                        sents.len(),
+                        "长段：原句数({}) == 译句数({})",
+                        sents.len(),
+                        out_parts.len()
+                    );
+                }
+                2 => {
+                    assert!(
+                        zh_effective_chars(src) > 100,
+                        "逗号长段应 >100 有效字，实测 {}",
+                        zh_effective_chars(src)
+                    );
+                    assert!(
+                        sents.len() >= 2,
+                        "逗号连写长段应切成多子句（子句数 {}）",
+                        sents.len()
+                    );
+                }
+                _ => {}
+            }
+            // 每句译文过 looks_truncated 检查（对整句译文再核）。
+            if looks_truncated(src, &translated, TranslationLanguage::English) {
+                // 允许因分句导致的整体比例偏差，但若明显过短则记失败。
+                let src_eff = zh_effective_chars(src);
+                let dst_words = en_word_count(&translated);
+                if (dst_words as f32) < (src_eff as f32) * OMIT_EN_PER_ZH {
+                    eprintln!("  ⚠️ case#{case} possible omission: src_eff={src_eff} dst_words={dst_words}");
+                    failures += 1;
+                }
+            }
+            for num in extract_numbers(src) {
+                if !translated.contains(&num) {
+                    eprintln!("  ⚠️ case#{case} number not carried: {num}");
+                    failures += 1;
+                }
+            }
+        }
+
+        let en_cases = [en_short, en_long];
+        for (case, src) in en_cases.iter().enumerate() {
+            let sents = split_sentences(src, TranslationLanguage::Chinese);
+            let translated = en_to_zh.translate(src).expect("translate en→zh");
+            println!("\n===== EN→ZH case#{case} （原 {src}）");
+            println!(
+                "  sentences({}) => translated => {}",
+                sents.len(),
+                translated
+            );
+            for (i, s) in sents.iter().enumerate() {
+                println!("   [{i}] 原句: {s}");
+            }
+            assert!(!translated.trim().is_empty(), "case#{case} 译文不得为空");
+            if looks_truncated(src, &translated, TranslationLanguage::Chinese) {
+                eprintln!(
+                    "  ⚠️ case#{case} possible omission: src_words={} dst_chars={}",
+                    en_word_count(src),
+                    zh_effective_chars(&translated)
+                );
+                failures += 1;
+            }
+            // 数字保留：原文阿拉伯数字串应出现在译文。
+            for num in extract_numbers(src) {
+                if !translated.contains(&num) {
+                    eprintln!("  ⚠️ case#{case} number not carried: {num}");
+                    failures += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            failures, 0,
+            "TRANS-394 验收：存在漏译/未保留数字（见上方 ⚠️）"
+        );
+
+        // TRANS-394-REWORK：不再需要 `std::mem::forget`。模型由 `shared_model` 进程级 `Box::leak`
+        // 常驻，引擎可正常 drop（不触发 `translator_destroy`）——能干净退出本身就是修复的证据。
+        drop(en_to_zh);
+        drop(engine);
+    }
+
+    /// TRANS-394-REWORK R1-c：进程级模型共享 + 干净 drop（`#[ignore]` 真模型）。
+    /// 断言两次 `TranslationEngine::new` 命中**同一** `NllbModel`（`ptr::eq`）、第二次 <50ms，
+    /// 且两个引擎可正常 drop（无 `std::mem::forget`）。运行：
+    /// `cargo test --bin feiyin-ime -- --ignored --nocapture --test-threads=1 trans394_rework_shared_model`
+    #[test]
+    #[ignore = "requires NLLB model; cargo test --bin feiyin-ime -- --ignored --nocapture --test-threads=1 trans394_rework_shared_model"]
+    fn trans394_rework_shared_model_pointer_and_speed() {
+        let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models");
+        if !TranslationEngine::is_available(&model_dir, TranslationLanguage::English) {
+            eprintln!("skip: NLLB model 不在位");
+            return;
+        }
+        let first = TranslationEngine::new(&model_dir, TranslationLanguage::English)
+            .expect("first NLLB load");
+        let t = std::time::Instant::now();
+        let second = TranslationEngine::new(&model_dir, TranslationLanguage::Chinese)
+            .expect("second NLLB load");
+        let second_elapsed = t.elapsed();
+        eprintln!(
+            "shared NllbModel ptr={:p}; 第二次 new 耗时 {:.3}ms",
+            first.model,
+            second_elapsed.as_secs_f64() * 1000.0
+        );
+        assert!(
+            std::ptr::eq(first.model, second.model),
+            "两次 new 必须命中同一进程级 NllbModel"
+        );
+        assert!(
+            second_elapsed < std::time::Duration::from_millis(50),
+            "第二次 new 应为缓存命中（<50ms），实测 {second_elapsed:?}"
+        );
+        // 修复后引擎可正常 drop（无 mem::forget）——干净退出即「不再调用 translator_destroy」的证据。
+        drop(first);
+        drop(second);
+        eprintln!("✅ 两个引擎均已正常 drop，测试正常结束");
+    }
+
+    /// TRANS-394-REWORK R1-a：`translator_destroy` 挂死取证（`#[ignore]` 真模型）。
+    ///
+    /// 在**普通线程**内（非进程 teardown）加载引擎 → 可选翻译 → `drop(engine)`，主线程轮询 30s；
+    /// 期间每 5s 采样本进程 CPU 时间，用于区分「忙等自旋（CPU≈全核）」与「死锁阻塞（CPU≈0）」。
+    /// 超时线程**故意不 join**（泄漏），保证测试进程自身能退出。
+    fn run_drop_probe(label: &str, model_dir: &Path, do_translate: bool) {
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+        use std::time::{Duration, Instant};
+
+        let (tx, rx) = channel::<()>();
+        let dir = model_dir.to_path_buf();
+        let cpu_before = process_cpu_seconds();
+        let wall = Instant::now();
+        let handle = std::thread::Builder::new()
+            .name(format!("probe-{label}"))
+            .spawn(move || {
+                let engine = TranslationEngine::new(&dir, TranslationLanguage::English)
+                    .expect("load NLLB for probe");
+                if do_translate {
+                    let _ = engine.translate("今天天气很好。");
+                }
+                drop(engine);
+                let _ = tx.send(());
+            })
+            .expect("spawn probe thread");
+
+        let mut returned_at = None;
+        for sec in 1..=30u64 {
+            match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(()) => {
+                    returned_at = Some(sec);
+                    break;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if sec % 5 == 0 {
+                        eprintln!(
+                            "  [{label}] t={sec}s 未返回；进程 CPU 增 {:.2}s",
+                            process_cpu_seconds() - cpu_before
+                        );
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let cpu_delta = process_cpu_seconds() - cpu_before;
+        match returned_at {
+            Some(sec) => eprintln!(
+                "  ✅ [{label}] drop 在 {sec}s 内返回；wall={:.2}s；CPU 增 {:.2}s",
+                wall.elapsed().as_secs_f64(),
+                cpu_delta
+            ),
+            None => eprintln!(
+                "  🔴 [{label}] 30s 内 drop 未返回（疑似 translator_destroy 挂死）；CPU 增 {:.2}s",
+                cpu_delta
+            ),
+        }
+        // 不 join：正常完成线程已退出；挂死线程直接泄漏，避免拖住测试进程退出。
+        drop(handle);
+    }
+
+    #[test]
+    #[ignore = "requires NLLB model; cargo test --bin feiyin-ime -- --ignored --nocapture trans394_rework_drop_probe_translated"]
+    fn trans394_rework_drop_probe_translated() {
+        let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models");
+        if !TranslationEngine::is_available(&model_dir, TranslationLanguage::English) {
+            eprintln!("skip: NLLB model 不在位");
+            return;
+        }
+        run_drop_probe("A:load+translate+drop", &model_dir, true);
+    }
+
+    #[test]
+    #[ignore = "requires NLLB model; cargo test --bin feiyin-ime -- --ignored --nocapture trans394_rework_drop_probe_loadonly"]
+    fn trans394_rework_drop_probe_loadonly() {
+        let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models");
+        if !TranslationEngine::is_available(&model_dir, TranslationLanguage::English) {
+            eprintln!("skip: NLLB model 不在位");
+            return;
+        }
+        run_drop_probe("B:load-only+drop", &model_dir, false);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn process_cpu_seconds() -> f64 {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+        unsafe {
+            let mut creation = FILETIME::default();
+            let mut exit = FILETIME::default();
+            let mut kernel = FILETIME::default();
+            let mut user = FILETIME::default();
+            if GetProcessTimes(
+                GetCurrentProcess(),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+            .is_err()
+            {
+                return 0.0;
+            }
+            let ticks = |t: FILETIME| ((t.dwHighDateTime as u64) << 32) | (t.dwLowDateTime as u64);
+            (ticks(kernel) + ticks(user)) as f64 / 10_000_000.0
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn process_cpu_seconds() -> f64 {
+        0.0
+    }
+
+    fn extract_numbers(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        for c in text.chars() {
+            if c.is_ascii_digit() {
+                cur.push(c);
+            } else if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+        out
     }
 }

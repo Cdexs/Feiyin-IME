@@ -2246,3 +2246,14 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | `transcribe_streaming_local` 的 `on_segment` 闭包新增第 5 参 `Option<Vec<Vec<(usize,usize)>>>` | 派发时带上各子段片内语音区间 | ✅ 平台中立；macOS 若另有该闭包实现点需同步（当前仅 `main.rs` 一处生产实现） |
 | A4 剪静音日志加 `source=timeline\|vad\|none`（Debug 级） | 可核对剪静音来源分布 | ✅ 平台中立 |
 | **macOS 侧需要做什么** | | ① 同路径替换 `models/silero-vad/silero_vad.onnx` 为 v6.2.3（sha256 一致）；② 编译前在所有 `CtxInject` 构造点补 `speech_ranges`/`streaming_nonempty`。未新增用户开关/env（DEC-031）、未触 `src/platform/macos/**`、未改构建脚本/依赖 |
+
+## TRANS-NLLB-AND-SENTENCE-BATCH-394 + TRANS-394-REWORK（2026-09-24，coder-2；主控合入）· 离线翻译换 NLLB + 模型永不析构 —— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| 离线翻译模型 `opus-mt-zh-en` / `opus-mt-en-zh`（两目录各 153MB）→ **`models/nllb-200-distilled-600M-ct2-int8/`**（单模型双向；`model.bin` 622,596,105B `398726640cc2…`、`sentencepiece.bpe.model` `14bb8dfb35c0…`、`shared_vocabulary.json` `af53bfd0e6f7…`、`config.json` `bf8ade7c3f16…`） | 两个方向两个模型 → 一个模型两方向（`zho_Hans`↔`eng_Latn`） | 🔴 **构建产物变化**：macOS 包须携带 NLLB 目录四文件（sha 一致）；opus-mt 目录代码已不再加载。`/models` 不入 git，经各自模型分发路径携带 |
+| `translation/mod.rs` 整体重写：逐句切分 + 批量 `translate_batch_with_target_prefix`、去 `min_decoding_length=源/2`、beam4/lp1.0/no_repeat3/rep1.1、漏译检测单句重译一次 | 长段不再被精简 / 编造；逐句一一对应 | ✅ 平台中立，无 `cfg`，macOS 同继承 |
+| 🔴 **模型进程级常驻、永不析构**：`thread_local!` + `Box::leak`（`shared_model`），`TranslationEngine` 持 `&'static NllbModel` | 以前关翻译 / 换向 / 退出会析构模型；现在加载一次常驻到进程结束（约 600MB） | 🔴 **必须照做**：CT2 `translator_destroy` 在**做过推理**的 translator 上**死锁**（`[CT2-DESTROY-DEADLOCK-394]`，Windows 实测 30s 不返回、进程退不出）。macOS 用同一 CT2，**不得**在任何路径 drop 已推理过的 translator；若 macOS 翻译不在单一 worker 线程调用，`thread_local` 会每线程各加载一份，须改为进程级 `static` 缓存（需 `Send/Sync` 依据） |
+| pub API 签名 | 不变（`new` / `translate` / `is_available` / `model_files` / `direction` / `load_for_direction` / `ensure_translation_direction`） | ✅ 调用方零改动 |
+| 方向判定 | 不变：按内容自动判定（DEC-082） | ✅ |
+| **macOS 侧需要做什么** | | ① 模型目录换 NLLB 四文件；② 确认翻译只在单一线程加载，或改 static 缓存；③ 运行中与退出路径都不得触发 `translator_destroy`（模型常驻到进程结束） |

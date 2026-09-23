@@ -441,3 +441,43 @@ LLM 的输出本质是 prompt 的续写 ⇒ 超规格的自由文本会被当成
 2. 新增/移动 `#[cfg(test)]` 模块后，**必跑全量**（`cargo test --no-fail-fast`）—— 跨文件护栏不在 `cargo check` 覆盖内。
 3. 诊断方法（Think-in-Code）：用脚本**复刻** `prod_lines_excluding_cfg_test` 并打印每个 skip 的 `[start,end]`，
    一眼看出哪个 skip 跨越了几百行（正常测试模块多在几十~百余行；跨越 >400 行即高度可疑）。
+
+---
+
+## [CT2-DESTROY-DEADLOCK-394] CTranslate2 `translator_destroy` 在**已完成推理**的 translator 上死锁 —— 退出卡死 / 运行中换向卡死
+
+**现象**（TRANS-394-REWORK R1-a，真模型 NLLB-200 int8，`#[ignore]` 普通线程取证）：
+线程内 `load → translate → drop(engine)` 后 `drop` 永不返回：
+
+```
+[A:load+translate+drop] t=5s 未返回；进程 CPU 增 16.48s
+[A:load+translate+drop] t=10s 未返回；进程 CPU 增 22.11s
+[A:load+translate+drop] t=15s..30s 未返回；进程 CPU 增 22.11s   ← CPU 停止增长（= 死锁，非自旋）
+🔴 [A:load+translate+drop] 30s 内 drop 未返回
+```
+
+`timeout 75 cargo test …` 退出码 **124** ⇒ 测试进程**自身也无法退出**（进程 teardown 同样卡住）。
+`main.rs` 全文件**没有** `process::exit`；退出序列 `worker_tx.send(WorkerCommand::Shutdown)` → `worker_join.join()`，
+worker 返回时 drop 局部 `cached_translation` ⇒ 触发 `translator_destroy` ⇒ **退出程序卡住**。
+
+**关键判据（本次实测最大的增量）**：挂死**不是**「create 后 destroy 就挂」——
+
+- **A 组**（load → **translate** → drop）：🔴 30s 不返回，CPU 停止增长，进程不能退出；
+- **B 组**（load → **不翻译** → drop）：✅ 1.28~1.64s 返回，退出码 0（复现 3 次一致）。
+
+⇒ 死锁**只在 translator 跑过推理之后**发生（CT2 CPU 线程池已启动/执行过计算，析构此处 join 卡死）。
+只按 `create → destroy` 写的最小复现**测不出来**，必须带一次 `translate`。
+
+**根因**：CTranslate2 `Translator` 析构在其 CPU 线程池已运行过后发生 join/锁死锁（本机 int8 CPU 路径实测）。
+
+**修法（R1-b，`src/translation/mod.rs`）**：模型是**进程级资源** ⇒ **加载一次、永不析构**：
+`thread_local! { static NLLB_MODEL: RefCell<Option<(PathBuf, &'static NllbModel)>> }` +
+`shared_model()`（命中同路径复用，否则 `Box::leak` 常驻）；`TranslationEngine` 持 `&'static NllbModel`；
+`impl Drop for Ct2Translator` 保留但**生产路径永不触发**。
+代价：关闭翻译后模型仍驻留（int8 ≈ 600MB）直到进程退出。
+
+**可复用规则**：
+
+1. **外部 C/C++ 资源的析构若不可靠，就不要析构** —— 进程级单例 + `Box::leak`；别把「释放 600MB」当收益（释放失败 = 卡死，代价远大于内存）。
+2. 复现「析构挂死」：**必须在真正用过的资源上试**；用 `recv_timeout` + 进程 CPU 采样区分「自旋（CPU 涨）/ 死锁（CPU 平）」；泄漏挂死线程、**不 join**，再用 `timeout` 看进程能否自行退出。
+3. 别写「生产走 `process::exit` 跳过析构故无碍」这类**未核实**的免责声明 —— 先 `grep` 调用方确认退出路径（本单即因该假设错误被验收退回）。

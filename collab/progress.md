@@ -1394,3 +1394,35 @@ load_wordbook_vocabulary()
 | 三特殊点 | ① dll 四张三副本全等 + onnxruntime 1.28.2；② itn-rules 三副本全等；③ Publish/models 1.7B 七文件与源逐一 sha256 全等（0.6B 保留） |
 | 探针 | 正：`[LocalRT-DBG-388]`=2 / `vad_only_speech_chunks`=1 / `learned=`=1；反：`nearfield gate: vad=on`=**0**（385 逐块门已删） |
 | 端测 | 🔴 **Step1 强杀输入法 ⇒ 请重启 + 带 `-debug` 端测**；重点：① 391 VAD 逐块喂入（修剪静音吞字是否修复）；② 392 门只管时序/内容看 VAD（不再卡住吞字）+ 下中位估计 + 首段不学；③ 388 剪静音 + 重解把关；④ 390 解码耗时/是否截断快语速；⑤ 是否仍念词表；⑥ 吃字/重复字；⑦ 长录音 300s；⑧ 不新增 crash.json |
+
+## TRANS-NLLB-AND-SENTENCE-BATCH-394（阶段一·交付）· 2026-09-23 · coder-2
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 离线翻译 opus-mt → **NLLB-200-distilled-600M（CT2 int8）**：官方调用规格（src/tgt lang + target_prefix + 去首 token）；`split_sentences` 分句/子句；逐句批量；解码参数 beam4/lenpen1.0/norepeat3/rep1.1、删 min_decoding 强制、max=源tok×2+16≤256；`looks_truncated` 漏译守卫 + 重译一次；数字/专名日志；`Arc<NllbModel>` 双向共享 |
+| 文件 | `src/translation/mod.rs` + 模型 `models/nllb-200-distilled-600M-ct2-int8/`（未改 main.rs/transcription/vad/local_stream；pub 签名不变） |
+| 模型 | `mijuanlo/nllb-200-distilled-600M-ct2-int8`（594MB int8；sha256 见 result.md） |
+| 验证 | fmt EXIT 0 ｜ check 0 error、warnings 92/87 ｜ 全量 test 0 failed（bin 1572P/40I）｜ **真模型实跑 1P/0F/84.27s** |
+| 下一步 | 阶段三 TEST-SYNC（非作者）→ 阶段四 TEST-EXEC → 出包；端测盯长文本完整性/数字保留 |
+
+## TEST-SYNC-393（阶段三 · 非作者护栏）· 2026-09-23 · tester-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 给 `VAD-V6-AND-TIMELINE-REUSE-393` 补 10 条独立用例，**只改 `#[cfg(test)]` 区、生产零改动**；未碰 coder-2 在飞的 `translation/mod.rs` |
+| 覆盖 | ①段跨两片各截断 + 首片起点 `pad_before+(ts−ps)` ②首尾相接不产空区间 ③中途 `vad_speech`/尾片 `false` 两调用点源码护栏 ④`plan_timeline_trim(Apply)`+`trim_to_speech` 越界 clamp 不 panic ⑤`WholeWindow` 返回 `samples.to_vec()` 源码护栏 ⑥`lens` 缺长度 0 偏移 + 三片累计偏移 ⑦三数组 `remove(0)` 相邻源码护栏 ⑧路B `speech_ranges: None` 源码护栏 ⑨相邻段不 panic + 两函数音频逐位相等 + `pad_before==0` |
+| 验证 | 我的 4 文件 `rustfmt --config skip_children=true --check` **4/4 CLEAN**；`cargo check --all-targets` **EXIT 0**、warnings **92/87 ≤ 97/88**；numstat==-w。🔴 **未跑 `cargo test`**（白名单；首跑阶段四）。⚠️ 全仓 `cargo fmt --check` EXIT 1 系 coder-2 在飞 `translation/mod.rs:1639`，非本单文件 |
+| 结论 | 9 条要求全部落地为 10 条用例；**未发现生产缺陷**；未改版本/未 commit/未 push/零凭证 |
+
+## TRANS-394-REWORK（阶段一返工 · 交付）· 2026-09-23 · coder-2
+
+| 项 | 内容 |
+| --- | --- |
+| 退回项 | R1 🔴 `translator_destroy` 死锁（运行期换向/关翻译 + 退出期都会触发）；R2 ❌ 误删 `derive_target_japanese_kanji…`；R3 ⚠️ `no`/`am`/`pm` 缩写误伤句末 |
+| R1-a 取证 | 真模型普通线程 drop + 进程 CPU 采样：**A** `load→translate→drop` 🔴 30s 不返回、CPU 16.48s→22.11s **停涨**（死锁非自旋）、`timeout 75` 退出码 **124**；**B** `load→不翻译→drop` ✅ 1.28~1.64s、exit 0（3 次）⇒ 死锁**只在推理过后**发生 |
+| R1-b 修法 | 模型改**进程级单例**：`thread_local! static NLLB_MODEL` + `shared_model()`（复用或 `Box::leak`）+ `TranslationEngine{ model: &'static NllbModel }`；`Drop for Ct2Translator` 保留不触发。代价：≈600MB 常驻到退出。选 `thread_local` 免 `unsafe impl Send/Sync`（生产单 worker 串行） |
+| R1-c 测试 | 两次 `new` `ptr::eq` 同指针 / 第二次 **0.005ms** / 干净 drop；源码护栏 `NllbModel::new` 生产区恰 1 次 + `Box::leak` + `thread_local!` |
+| R2 / R3 | 从 `HEAD` 恢复日文用例；`EN_ABBREVIATIONS` 21→19（删 `am`/`pm`）、`no` 仅后接数字算缩写（`No. 5`）；补 2 条单测 |
+| 文件 | `src/translation/mod.rs` + `collab/troubleshooting.md`（未改 main.rs/transcription/vad/local_stream；pub 签名不变） |
+| 验证 | fmt EXIT 0 ｜ check 0 error、warnings **92/87** ≤ 97/88 ｜ translation 26P/0F ｜ `--ignored …translation::tests::trans394` **4P/0F/95.79s，进程 exit 0** ｜ 全量 bin **1585P/1F**（唯一失败 = TEST-SYNC-393 期望值错，主控 `c0baf8c` 已修，与本单无关） |
+| 下一步 | 主控验收；阶段三 TEST-SYNC（非作者）→ 阶段四 TEST-EXEC → 出包 |

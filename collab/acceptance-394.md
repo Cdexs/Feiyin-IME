@@ -62,3 +62,19 @@ result.md：「`translator_destroy` 在测试进程 teardown 会挂死；**生�
 ⇒ ❌ 返工 R1（结构性保证运行期与退出期都不调用 `translator_destroy`）
 
 **结论（主控 2026-09-23 第一轮）**：R1（阻断）+ R2 + R3 ⇒ 不提交，退回 coder-2 返工。
+
+## 返工复验（TRANS-394-REWORK，主控 2026-09-24）
+
+| # | 返工要求 | 结论 |
+| --- | --- | --- |
+| R1-a | 普通线程取证 drop 是否挂死 | ✅ A 组（加载→翻译→drop）30s 不返回、CPU 停涨 = **死锁**，进程退不出（exit 124）；B 组（加载→不翻译→drop）1.3~1.6s 返回 ×3 ⇒ 只在**推理过**的 translator 上死锁。`troubleshooting.md` 新增 `[CT2-DESTROY-DEADLOCK-394]`。⇒ 第一轮判定的「退出卡死 / 关翻译卡死」风险**属实**（opus-mt 时代同一 CT2 同样存在，只是没人在做过离线翻译后退出时注意到） |
+| R1-b | 进程级缓存永不析构 | ✅ `thread_local! NLLB_MODEL` + `shared_model`（`mod.rs:142-168`）命中复用，否则 `Box::leak`；失败不缓存；`TranslationEngine.model: &'static NllbModel`；选 thread_local 理由（生产只在 worker 线程加载，免 unsafe Send/Sync）已写注释。已核 `main.rs` 4 处 `load_for_direction` 与 `ensure_translation_direction` 均在 `spawn_worker_thread` 线程内 |
+| R1-c | 同指针、第二次 <50ms、无 mem::forget、源码护栏 | ✅ ptr::eq 同指针、第二次 0.005ms；`mem::forget` 全删、测试干净退出（exit 0，改前 124）；护栏：生产区 `NllbModel::new(` 恰 1 次 + `Box::leak` + `thread_local!`；「process::exit 规避」错误说法已删 |
+| R2 | 恢复方向判定用例 | ✅ `derive_target_japanese_kanji_returns_english_known_boundary`（`:1119`）自 HEAD 原样恢复 |
+| R3 | 缩写表 | ✅ 删 `am`/`pm`；`no` 仅后接数字算缩写（`ends_with_abbreviation :634`，新增 `next_nonspace` 参数）；补 2 条单测 |
+| 复跑 | fmt / check | ✅ 主控复跑 `cargo fmt --check` EXIT 0（全仓）；`cargo check --all-targets` 0 error，warnings 92/87（低于 97/88）；Worker：translation 26P/0F，`--ignored trans394` 4P/0F/95.79s exit 0，全量 1585P/1F（唯一失败为 TEST-SYNC-393 期望值错误，主控已 `c0baf8c` 修正） |
+| ⚠️ 纪律 | — | coder-2 为复测 HEAD 用了 `git stash`（禁用命令）。主控核：`git stash list` 为空、工作区改动完整，无损失；已记入教训，下次派单重申 |
+
+**主控合入**：`docs/MACOS-HANDOFF.md` 394 节（模型换 NLLB 四文件 sha、永不析构的原因与 macOS 必做项）；README 中英文翻译节与发布包清单（opus-mt → NLLB、VAD ~2MB）。
+
+**结论（主控 2026-09-24 第二轮）**：全部落实 ⇒ **验收通过，提交**。下一步 TEST-SYNC-394（tester-1）+ TRANS-COPY-395（coder-2，界面说明文案）⇒ 合包回归出包。

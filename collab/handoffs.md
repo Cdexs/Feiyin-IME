@@ -7,6 +7,14 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-23 — tester-1 — TEST-SYNC-393 ✅ 交付（阶段三 · 非作者护栏 10 条；生产零改动）
+
+- **性质**：阶段三 TEST-SYNC，给 `VAD-V6-AND-TIMELINE-REUSE-393`（返工 R1~R5）按**设计契约**补独立护栏（不读实现反推）。只改 `#[cfg(test)]` 区；**未碰** coder-2 在飞的 `src/translation/mod.rs`；**未跑 `cargo test`/`build`**（白名单）。
+- **新增 10 条**（9 条要求，`#6` 拆两条）：`local_stream.rs` 3（跨两片截断+平移 / 首尾相接不产空区间 / 两调用点源码护栏）；`mod.rs` 2（越界 clamp 不 panic / `WholeWindow` 返回整窗源码护栏）；`main.rs` 4（缺长度 0 偏移 + 三片累计 / 三数组 remove 相邻源码护栏 / 路B `speech_ranges: None` 源码护栏）；`vad.rs` 1（相邻段不 panic + 两函数音频逐位相等 + `pad_before==0`）。
+- **验证（白名单）**：我的 4 文件 `rustfmt --config skip_children=true` 后 `--check` **4/4 CLEAN**；`cargo check --all-targets` **EXIT 0**、0 error，warnings **bin 92 / test 87 ≤ 97/88**；`numstat == -w`（74/0、69/0、38/1、28/0）。🔴 **未跑 `cargo test`**（首跑阶段四）。
+- ⚠️ **如实上报**：全仓 `cargo fmt --check` 当前 **EXIT 1**，失败点 = coder-2 在飞的 `src/translation/mod.rs:1639`（未提交 WIP 格式），**非本单任何文件**；待 coder-2 落定后需复跑不带参数的 `cargo fmt --check`。
+- **红线**：未改生产代码 / 未 commit / 未 push / 版本号未动 / 零凭证。
+
 ## 2026-09-23 — coder-1 — VAD-V6-AND-TIMELINE-REUSE-393 ✅ 交付（阶段一；待主控验收）
 
 - **C 换模型**：`models/silero-vad/silero_vad.onnx` **同路径替换为 silero v6.2.3**（`2,327,524B`，sha256 `1a153a22…`）；v4（`643,854B`，`9e2449e1…`）备份至 `collab/evidence/vad-v4-backup/`（**运行时不引用**）。🔴 **无 v4 回退机制**（Gavin 裁定）。v6 下原 2 条以 440Hz 正弦冒充语音的夹具改用 `full.wav` 真人声（断言/参数不动）+ 新增 `v6_pure_sine_not_detected_as_speech`。
@@ -340,3 +348,25 @@
 - **新增 3 条**：逐块覆盖性质（300 组逐样本拼接校验）、源码护栏（无直接整段 accept、必经 `feed_in_vad_windows`）、`#[ignore]` 旧写法反例（整块只落末尾 vs 逐块覆盖语音主体）。
 - **验证**：`rustfmt` + `cargo check --all-targets` **0 error**、warnings **97/88**=基线；`cargo fmt --check` EXIT 0；numstat==-w（vad 160/0）。独立 Python 复刻 `feed_in_vad_windows` 5000 组 bad=0 + 源码护栏实跑成立。
 - **未发现生产缺陷**。**未改版本 / 未 push / 零凭证**。
+
+## 2026-09-23 — TRANS-NLLB-AND-SENTENCE-BATCH-394（coder-2，✅ 阶段一交付）
+
+- **需求**（Gavin）：长文本翻译「被精简/偏离/离散」⇒ 换 NLLB + 优化调用 + 完整性硬要求（逐句一一对应 / 漏译检测重译 / 数字专名保留 / 真模型验收）。
+- **模型**：`mijuanlo/nllb-200-distilled-600M-ct2-int8` → `models/nllb-200-distilled-600M-ct2-int8/`（4 文件 sha256 见 result.md；opus-mt 目录保留、代码不再加载）。
+- **改动（仅 `src/translation/mod.rs`）**：NLLB 官方调用规格（src/tgt lang + target_prefix + 去首 token）；`split_sentences` 分句/子句；逐句批量；解码参数（beam4/lenpen1.0/norepeat3/rep1.1、删 min_decoding 强制、max=源tok×2+16≤256）；`looks_truncated` 漏译守卫 + 单句重译一次；数字/专名日志；`Arc<NllbModel>` 双向共享。pub 签名不变。
+- **真模型实跑**：`--ignored trans394_real_model` **1P/0F/84.27s**（中→英 3 + 英→中 2；原句数==译句数、无漏译、数字保留）。
+- **验证**：fmt EXIT 0 ｜ check 0 error、warnings 92/87 ｜ 全量 test **0 failed**（bin 1572P/40I）｜ numstat 1008/611（-w 987/590）。
+- 🔴 运行时观察：CT2 `translator_destroy` 测试 teardown 挂死（生产 `process::exit` 规避）。
+- **未改版本 / 未 push / 零凭证**；未改 `docs/MACOS-HANDOFF.md`（结论交主控合入）。
+
+## 2026-09-23 — TRANS-394-REWORK（coder-2，✅ 阶段一返工交付）
+
+- **退回项**：R1 `translator_destroy` 死锁（运行期/退出期都会调；原「生产走 `process::exit` 规避」说法经主控核实**不成立** —— `main.rs` 无 `process::exit`，退出走 `worker_join.join()`）；R2 误删方向判定用例；R3 `no`/`am`/`pm` 缩写误伤句末。
+- **R1-a 取证**（真模型 `#[ignore]`，普通线程 drop + 进程 CPU 采样）：
+  - A `load→translate→drop`：🔴 30s 不返回，CPU 16.48s→**22.11s 后停涨**（= 死锁非自旋），`timeout 75` 退出码 **124**（进程自身无法退出）；
+  - B `load→不翻译→drop`：✅ 1.28~1.64s 返回，exit 0（复现 3 次）⇒ 死锁**只在推理过的 translator 上**发生（create→destroy 最小复现测不出来）。
+- **R1-b 修法**：模型改**进程级、加载一次、永不析构** —— `thread_local! { static NLLB_MODEL }` + `shared_model()`（命中同路径复用，否则 `Box::leak`），`TranslationEngine` 持 `&'static NllbModel`；`Drop for Ct2Translator` 保留但生产路径永不触发。代价：模型常驻 ≈600MB 直到退出。方案选 `thread_local` 而非 `static Mutex<Arc>`（免 `unsafe impl Send/Sync`；生产单 worker 线程串行）。修复后 A 组 8s 返回、exit 0。
+- **R1-c**：两次 `new` `std::ptr::eq` 相同、第二次 **0.005ms**、干净 drop（无 `mem::forget`）；源码护栏：生产区 `NllbModel::new(` 恰 1 次 + `Box::leak` + `thread_local!`。
+- **R2**：从 `HEAD` 原样恢复 `derive_target_japanese_kanji_returns_english_known_boundary`。**R3**：`am`/`pm` 删除、`no` 加「下一非空白字符是数字」后置条件；补 2 条单测。
+- **验证**：`cargo fmt --check` EXIT 0 ｜ `check --all-targets` 0 error、warnings **92/87** ≤ 97/88 ｜ translation **26P/0F** ｜ `--ignored …translation::tests::trans394` **4P/0F/95.79s, exit 0** ｜ 全量 bin **1585P/1F**（唯一失败为 TEST-SYNC-393 期望值错，`c0baf8c` 已修）。
+- **未改 `main.rs` / transcription / vad / local_stream**（+`troubleshooting.md` 一条）；未改版本 / 未 commit / 未 push / 零凭证。

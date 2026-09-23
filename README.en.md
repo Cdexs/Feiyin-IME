@@ -236,12 +236,9 @@ Hold the translation hotkey (Right Ctrl, as recommended above) while recording, 
 text comes out directly. **It's off by default** — tick **Enable translation** and bind a key under
 **Hotkey → Translation Hotkey** first, per [Setup guide step 1](#step-1--set-your-hotkeys-required).
 
-- **Chinese is translated to English by default.** Speech already in the target language passes
-  through as-is, with no extra processing
-- **Uses your configured model when available**; otherwise the local opus-mt model, **fully offline**
-- Long passages are segmented automatically so nothing gets truncated
-
-> A switch for the translation direction is being added to the settings UI.
+- **Direction is detected automatically**: speak Chinese and you get English, speak English and you get Chinese
+- **Uses your configured model when available**; otherwise the local NLLB translation model, **fully offline**
+- Long passages are translated sentence by sentence, so nothing gets condensed or truncated
 
 ---
 
@@ -258,8 +255,8 @@ Feiyin-IME/
 └── models/
     ├── sherpa-onnx-sense-voice-funasr-nano-int8-*/  # Speech recognition (required, ~254MB)
     ├── punct-ct-transformer-zh/                     # Punctuation (optional, ~79MB)
-    ├── opus-mt-zh-en/ and opus-mt-en-zh/            # Offline translation (optional, ~153MB each)
-    └── silero-vad/                                  # Voice activity detection (~1MB)
+    ├── nllb-200-distilled-600M-ct2-int8/            # Offline translation, both directions (optional, ~600MB)
+    └── silero-vad/                                  # Voice activity detection (~2MB)
 ```
 
 **Everything loads relative to the executable's own directory**, so the folder is portable — move it,
