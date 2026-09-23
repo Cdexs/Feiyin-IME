@@ -592,7 +592,8 @@ fn apply_acc_disposition(
     };
     // 校验：非空 + 无连续 ≥4 条回显 +（非坍塌触发或产出率通过）。
     let still_echo = strip_terms_echo(&recovered, terms).is_some();
-    let acceptable = !recovered.is_empty()
+    // 主控验收补：只剩标点（如重解只出「。」）也判无效 ⇒ 交 386-C 流式兜底，不许把空内容当正文收下。
+    let acceptable = !is_only_punct(&recovered)
         && !still_echo
         && (kind != GuardKind::Collapse
             || output_rate_ok(recovered.chars().count(), audio_secs, avg_chars_per_sec));
@@ -5448,6 +5449,22 @@ mod fix387_output_guard_tests {
         assert_eq!(out, "");
         assert!(oc.invalid);
         assert_eq!(oc.guard, GuardKind::Echo);
+    }
+}
+
+#[cfg(test)]
+mod guard387_review_tests {
+    use super::apply_acc_disposition;
+
+    /// 重解只出标点 ⇒ 判无效返回空串（交 386-C 流式兜底），不把「。」当正文收下。
+    #[test]
+    fn redecode_punct_only_is_invalid() {
+        let (out, oc) = apply_acc_disposition("<location>".to_string(), None, 10.0, None, || {
+            Ok("。".to_string())
+        });
+        assert!(oc.redecoded);
+        assert!(oc.invalid, "重解只剩标点必须判无效");
+        assert_eq!(out, "");
     }
 }
 
