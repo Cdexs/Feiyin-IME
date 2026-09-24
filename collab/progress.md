@@ -1,4 +1,11 @@
 
+### 2026-09-24 · TRANS-CT2-DNNL-THREADS-397 交付（本地翻译提速：CT2 换 oneDNN + 线程数按核数传入）
+
+- Windows 目标依赖给 `ctranslate2-sys` 追加 `dnnl` + `openmp-runtime-comp`（通用依赖与 macOS 不变；`cargo tree --target aarch64-apple-darwin` 证无 dnnl/openmp）；`patches/ctranslate2-sys/build.rs` 两处补丁：① `CMAKE_PREFIX_PATH` 让 CT2 找到自编 oneDNN（否则 `WITH_DNNL` 必 FATAL_ERROR）② DLL 同步拷 `<target>/deps/`（修 `[CT2-DLL-SHADOW-397]`）。
+- 新增 `nllb_num_threads()`（`available_parallelism().min(8)`、回落 4，与识别侧同口径），`NllbModel::new` 加载时传 `num_threads_per_replica`（原 0⇒4）；生产不读 env/config。
+- **实测提速 10.8~15.6×**（新 DLL 8 线程 vs 旧 DLL 基线，S1~S4）；`CT2_VERBOSE=1` 证 `GEMM_S8 backend: DNNL` / `int8_float32` / `ISA AVX2`；导入表只多 `VCOMP140.DLL`。
+- 回归：`cargo fmt --check` EXIT 0；`check --all-targets` 0 error、warnings 92/87=基线；全量 **1685P/0F/46I**。阶段一交付，未出包。
+
 ### 2026-09-23 · VAD-V6-AND-TIMELINE-REUSE-393 交付（silero VAD v6.2.3 + 本地实时 60s + 实时时间线复用剪静音）
 
 - **C**：`models/silero-vad/silero_vad.onnx` 同路径替换为 silero **v6.2.3**（2,327,524B，sha256 `1a153a22…`）；v4 备份 `collab/evidence/vad-v4-backup/`（运行时不引用）；**无 v4 回退机制**。v6 下 2 条正弦冒充语音夹具改 `full.wav` 真人声 + 新增纯正弦负例 ⇒ `--ignored vad` 11/11。
@@ -1449,3 +1456,16 @@ load_wordbook_vocabulary()
 | 探针 | 二进制正：`[LocalRT-DBG-388] trim:`=2 / `source=`=2 / `timeline fallback`=1 / `NLLB model loaded once`=1；反：`opus-mt-zh-en`=**0**；UI：`说中文译为英文` 在 ui/dist =1 |
 | 冒烟 | 正常退出（对 controller 窗口投 `WM_CLOSE`，非强杀）⇒ 进程 **1s 内消失**、无 crash.json ⇒ **394 退出不卡死实证通过** |
 | 端测 | 🔴 **Step1 强杀输入法 ⇒ 请重启 + 带 `-debug` 端测**；重点：① 393 VAD v6.2 全管线 + 剪静音时间线（吞字是否绝迹）；② 394 离线翻译换 NLLB（质量/漏译重译/长文本完整性）；③ 退出不卡死、关翻译不卡死；④ 翻译热键页文案三语言；⑤ 数字/专名保留；⑥ 长录音 300s；⑦ 不新增 crash.json |
+
+## BUILD-396（小改动短路径 · 直接出包）· 2026-09-24 · tester-1
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | `LOCALRT-NO-HOTWORDS-396`（DEC-083）：本地实时 B 路径 1.7B 滑窗精解不再注入词库（`load_hotwords_for_accuracy` 对 LocalRealtime 早退 None）。HEAD `5218c92`（=`660378a`+docs），版本 0.9.3。**Gavin 指示不跑全量回归** |
+| 简单验证 | `cargo fmt --check` **EXIT 0**；`cargo test --bin feiyin-ime -- fix396` **1P/0F** |
+| 出包 | `BUILD-396` 八项逐项 PASS；产物 `feiyin-ime` 14.92MB `1fa081c4bde4…`（00:49:59）/ `feiyin-ime-ui` 10.05MB `34bb0e0c7b9c…`（00:46:59）/ `crash-reporter` 24.88MB `5579119aa19d…`（00:48:08）；两副本全等、均异于 BUILD-395 |
+| 模型 | 无变化，只核：`target/release/models` 仍 Junction；`Publish/models` silero `1a153a22…` + NLLB 四文件 sha 与 BUILD-395 一致；`opus-mt-*` 未删 |
+| 三特殊点 | ① dll 四张三副本全等 + onnxruntime 1.28.2；② itn-rules 三副本全等；③ 1.7B 七文件与源全等（0.6B 保留） |
+| 探针 | ⑦ **不可构造**（纯逻辑改动、无新增/删字面量）⇒ 三证：源码引用（`fix396` 护栏）+ 时间戳 + sha 异于上包 |
+| 冒烟 | 正常退出（`WM_CLOSE`，非强杀）⇒ **1s 内消失**、无 crash.json |
+| 端测 | 🔴 **Step1 强杀输入法 ⇒ 请重启 + 带 `-debug` 端测**；重点：本地实时 1.7B B 路径**不注词库后识别是否正确**（BUILD-395 端测 18 窗 5 异常 = 28% 是否消失）、窗空/坍塌/念词表/截尾/跳词条是否绝迹；Accuracy/在线档词库注入仍生效 |

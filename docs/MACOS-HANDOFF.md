@@ -8,6 +8,25 @@
 
 ## 0 · 先读这份，再读那两份
 
+### 0.6 · TRANS-CT2-DNNL-THREADS-397 本地翻译提速：CT2 换 oneDNN + 线程数按核数传入（2026-09-24）
+
+- **文件域**：`Cargo.toml`（**Windows 目标依赖**）、`patches/ctranslate2-sys/build.rs`（补丁）、
+  `src/translation/mod.rs`（平台中立 Rust）。
+- 🔴 **编译影响（macOS 不受影响，已证）**：`Cargo.toml` 只在
+  `[target.'cfg(target_os = "windows")'.dependencies]` 里给 `ctranslate2-sys` 追加 `dnnl` +
+  `openmp-runtime-comp` 两个特性；通用 `[dependencies]` 保持 `crt-dynamic`/`shared`/`ruy` 不变。
+  **证据**：`cargo tree --target aarch64-apple-darwin -e features -i ctranslate2-sys` 输出只有
+  `crt-dynamic` / `default` / `ruy` / `shared` 四项，**无 `dnnl` / `openmp`**（全文见
+  `collab/evidence/397/macos_cargo_tree.txt`）。⇒ macOS 侧 CT2 仍是 Ruy 后端、无 OpenMP、无 oneDNN。
+- **build.rs 补丁只在 Windows + `dnnl` 特性开启时执行**：`if dnnl { … CMAKE_PREFIX_PATH … }` 与 shared
+  分支的 `deps/` 拷贝，macOS 构建路径不进入。**macOS 无需同步任何接口/字段/常量。**
+- ⚠️ **唯一跨平台行为变化（需 macOS 团队知悉）**：`src/translation/mod.rs` 新增
+  `nllb_num_threads()`（= `available_parallelism().min(8)`，回落 4），`NllbModel::new` 把它传进
+  `TranslatorConfig.num_threads_per_replica`（**原来是 0 ⇒ CT2 默认 4**）。这是平台中立 Rust，
+  **macOS 上翻译也会用至多 8 线程（原 4）**。依据见函数注释（识别侧同口径 `default_acc_num_threads()`，
+  Gavin 2026-09-24 定 8）。若 macOS 团队认为这是需要单独签核的行为变化，请回报主控。
+- **未改**：翻译时机、beam / 长度惩罚 / 分句 / 重译逻辑、`TranslationEngine` 的 pub 接口、任何平台中立契约字段。
+
 ### 0.5 · FIX-INJECT-TO-SPEC-377 注入按 sherpa 规格化（`hotwords` 只放纯词表）（2026-09-23）
 
 - **文件域**：`src/transcription/mod.rs`（**平台中立**）+ `src/main.rs`（Windows 侧接线）+ `src/audio/mod.rs`（PoC 构造点）。

@@ -63,6 +63,23 @@ const BATCH_MAX_SENTENCES: usize = 64;
 /// CTranslate2 `batch_type`：0 = examples。
 const BATCH_TYPE_EXAMPLES: c_int = 0;
 
+// ---- 线程数（TRANS-CT2-DNNL-THREADS-397）-----------------------------------
+/// NLLB 解码线程上限 = 8，与识别侧 `default_acc_num_threads()`（`src/transcription/mod.rs:133`）
+/// **同口径**。依据：识别侧 366/271 实测「16 核机 8 最优、16 比 8 慢 1.7×」（自回归解码逐 token
+/// 串行、受内存带宽限制，加线程只在算子内并行、越加越慢）。
+///
+/// Gavin 2026-09-24 原话：「后面也不用再测试八线程、16 线程这样试了，直接就设置为 8 线程吧。
+/// CPU 内核数一样，之前测那个语音解码已经测试过了，发现那是最快的。」
+///
+/// 397 实测（2026-09-24，oneDNN，本机 16 逻辑核，中位数 ms，见 `collab/evidence/397/threads_new.txt`）：
+/// | 线程 | S1 | S2 | S3 | S4 |
+/// | 4    | 376 | 1547 | 1811 | 3452 |
+/// | 8    | 386 | 1163 | 1308 | 2749 |
+/// | 16   | 444 | 1135 | 1251 | 2806 |
+/// ⇒ 8 与 16 基本持平（差在噪声内），16 无优势；取 8 与识别侧一致。对照旧 DLL 基线（4 线程）
+/// S1 6114 / S2 13916 / S3 17650 / S4 30470，8 线程提速 15.8× / 12.0× / 13.5× / 11.1×。
+const NLLB_THREADS_CAP: usize = 8;
+
 // ---- 漏译守卫阈值（TUNE-394，Gavin 硬要求：长文本不许被精简）----------------
 /// 中→英：英文词数 < 中文有效字数 × 本比例 ⇒ 疑似漏译（0.35；中文 1 字通常译 1 词左右，
 /// 正常缩写（数字/专名）最多减半，低于 35% 基本可判丢内容）。
@@ -741,6 +758,23 @@ fn log_token_carry(sent_idx: usize, src: &str, dst: &str) {
     }
 }
 
+/// TRANS-CT2-DNNL-THREADS-397：NLLB 解码线程数 —— 依本机逻辑核数、上限 [`NLLB_THREADS_CAP`]。
+///
+/// Gavin 2026-09-24 拍板：「翻译库重新编译，可以不写死线程数，在运行调用的时候根据 cpu 内核数
+/// 来传入线程数」。线程数只在模型加载时传一次（CT2 `TranslatorConfig.num_threads_per_replica`），
+/// 不写死常量、不加 config.toml 字段、**生产不读 env**（开发端与用户端行为一致）。
+///
+/// 🔴 397 实测（2026-09-24，16 逻辑核，oneDNN）：4 / 8 / 16 线程三组数字见
+/// `collab/evidence/397/threads.txt`；上限取 8（与识别侧同口径，实测 16 不更快）。
+fn nllb_num_threads() -> usize {
+    // 🔴 生产**不读任何 env / config**：只看本机核数。397 扫 4/8/16 时曾用临时 env 覆盖，
+    // 扫完即删（Gavin 已定 8），保持生产纯净，也不在 prod 区引入测试门控打断源码护栏
+    // （护栏按「首个测试门控标记」截断生产区，见 `source_guard_*`）。
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(NLLB_THREADS_CAP))
+        .unwrap_or(4)
+}
+
 impl NllbModel {
     fn new(model_dir: &Path) -> Result<Self> {
         let path = model_dir.join(NLLB_SUBDIR);
@@ -750,12 +784,17 @@ impl NllbModel {
         let config = TranslatorConfig {
             device: Device::Cpu,
             compute_type: ComputeType::Default,
+            num_threads_per_replica: nllb_num_threads(),
             ..TranslatorConfig::default()
         };
         let translator = Ct2Translator::new(&path, &config)
             .map_err(|err| anyhow!("failed to initialize NLLB CT2 translator: {}", err))?;
 
-        log::info!("NLLB CT2 model initialized at {}", path.display());
+        log::info!(
+            "NLLB CT2 model initialized at {} (threads={})",
+            path.display(),
+            config.num_threads_per_replica
+        );
 
         Ok(Self {
             path,
@@ -1998,6 +2037,176 @@ mod tests {
             return;
         }
         run_drop_probe("B:load-only+drop", &model_dir, false);
+    }
+
+    // ---- TRANS-CT2-DNNL-THREADS-397 基准（#[ignore] 真模型） -----------------
+    //
+    // 目的：量化「CT2 换 oneDNN + 按核数传线程」前后的翻译耗时。
+    // 用 `Publish/models` 下 NLLB（缺则回落仓库 `models/`），S1~S4（Gavin 2026-09-24 端测原句）
+    // 各预热 1 次、再跑 3 次取**中位数**；分开记录「首批翻译」与「重译」耗时，并标注重译是否触发。
+    //
+    // 线程数由生产 `NllbModel::new` 决定（397 前 = CT2 默认 4；397 后 = `nllb_num_threads()`）。
+    // 4/8/16 扫描已完成（结果见 `collab/evidence/397/threads_new.txt`，临时覆盖已移除）——
+    // 本基准现在恒用生产线程数（本机 8）。
+    //
+    // 运行：
+    //   cargo test --bin feiyin-ime -- --ignored --nocapture bench397_real_model
+    struct BenchResult {
+        first_ms: f64,
+        retry_ms: f64,
+        retries: usize,
+        out: String,
+    }
+
+    /// 复刻 `TranslationEngine::translate` 的逐行/逐句流程，但分别计时「首批」与「重译」。
+    /// 与生产同源：`split_sentences` / `translate_sentences` / `finalize_sentence` / `join_parts`
+    /// 全部是生产函数，本函数只补计时与计数。
+    fn translate_timed(
+        model: &NllbModel,
+        text: &str,
+        direction: TranslationLanguage,
+    ) -> BenchResult {
+        let (src_lang, tgt_lang) = match direction {
+            TranslationLanguage::English => (LANG_ZH, LANG_EN),
+            TranslationLanguage::Chinese => (LANG_EN, LANG_ZH),
+        };
+        let mut first_ms = 0.0f64;
+        let mut retry_ms = 0.0f64;
+        let mut retries = 0usize;
+        let mut out_lines: Vec<String> = Vec::new();
+        for line in text.split('\n') {
+            if line.trim().is_empty() {
+                out_lines.push(String::new());
+                continue;
+            }
+            let sentences = split_sentences(line, direction);
+            if sentences.is_empty() {
+                out_lines.push(String::new());
+                continue;
+            }
+            let t0 = std::time::Instant::now();
+            let base = model
+                .translate_sentences(&sentences, src_lang, tgt_lang, BEAM_SIZE, LENGTH_PENALTY)
+                .expect("translate_sentences 首批");
+            first_ms += t0.elapsed().as_secs_f64() * 1000.0;
+            let mut parts: Vec<String> = Vec::with_capacity(sentences.len());
+            for (i, sentence) in sentences.iter().enumerate() {
+                let primary = base.get(i).cloned().unwrap_or_default();
+                let (best, calls, _still) = finalize_sentence(sentence, primary, direction, || {
+                    let t1 = std::time::Instant::now();
+                    let candidate = model
+                        .translate_sentences(
+                            std::slice::from_ref(sentence),
+                            src_lang,
+                            tgt_lang,
+                            RETRY_BEAM_SIZE,
+                            RETRY_LENGTH_PENALTY,
+                        )
+                        .ok()
+                        .and_then(|mut v| v.drain(..).next());
+                    retry_ms += t1.elapsed().as_secs_f64() * 1000.0;
+                    candidate
+                });
+                retries += calls;
+                parts.push(best);
+            }
+            out_lines.push(join_parts(&parts, direction));
+        }
+        BenchResult {
+            first_ms,
+            retry_ms,
+            retries,
+            out: out_lines.join("\n"),
+        }
+    }
+
+    fn median_ms(mut values: Vec<f64>) -> f64 {
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        values[values.len() / 2]
+    }
+
+    #[test]
+    #[ignore = "requires NLLB model; cargo test --bin feiyin-ime --release -- --ignored --nocapture bench397_real_model"]
+    fn bench397_real_model() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let publish_models = root.join("Publish").join("models");
+        let model_dir =
+            if TranslationEngine::is_available(&publish_models, TranslationLanguage::English) {
+                publish_models
+            } else {
+                root.join("models")
+            };
+        if !TranslationEngine::is_available(&model_dir, TranslationLanguage::English) {
+            eprintln!("skip: NLLB model 不在位 at {}", model_dir.display());
+            return;
+        }
+
+        let engine =
+            TranslationEngine::new(&model_dir, TranslationLanguage::English).expect("load NLLB");
+        let model = engine.model;
+
+        let threads_label = format!("production:{}", nllb_num_threads());
+        println!(
+            "\n===== BENCH-397 model_dir={} threads={} cores={} =====",
+            model_dir.display(),
+            threads_label,
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(0)
+        );
+
+        let cases: [(&str, &str); 4] = [
+            ("S1", "这个事情，你也做。"),
+            (
+                "S2",
+                "最近有什么好看的电影吗？可以推荐一下吗？我喜欢看科幻片。特别是那种科幻惊悚片，有推荐的吗？",
+            ),
+            (
+                "S3",
+                "最近你的状况如何？你感觉自己的身体好吗？心情好不好？不要因为工作压力太大。感觉不开心，最重要的就是要开心哦。",
+            ),
+            (
+                "S4",
+                "这附近有一个小公园景色还挺不错的里面有一小湖湖水也很清澈在湖水的边上有散的的小道道路两边全部都是柳树沉浸风景特别好边上有散步的小道，道路两边全部都是树，柳树成荫，风景特别好。",
+            ),
+        ];
+
+        for (name, text) in cases {
+            // 预热 1 次（不计入）。
+            let warm = engine.translate(text).expect("warmup translate");
+            let mut totals = Vec::new();
+            let mut firsts = Vec::new();
+            let mut retrys = Vec::new();
+            let mut retry_hits = 0usize;
+            let mut last_out = String::new();
+            let mut last_retries = 0usize;
+            for _ in 0..3 {
+                let r = translate_timed(model, text, TranslationLanguage::English);
+                // 复刻结果必须与生产 `translate` 逐字一致（防基准与生产漂移）。
+                if r.out != warm {
+                    eprintln!("  🔴 [{name}] 基准复刻输出与生产 translate 不一致！");
+                    eprintln!("     prod: {warm}");
+                    eprintln!("     bench: {}", r.out);
+                }
+                totals.push(r.first_ms + r.retry_ms);
+                firsts.push(r.first_ms);
+                retrys.push(r.retry_ms);
+                if r.retries > 0 {
+                    retry_hits += 1;
+                }
+                last_retries = r.retries;
+                last_out = r.out;
+            }
+            println!(
+                "{name} total_median={:.1}ms first_median={:.1}ms retry_median={:.1}ms retried={}/3 (retries={last_retries})",
+                median_ms(totals),
+                median_ms(firsts),
+                median_ms(retrys),
+                retry_hits,
+            );
+            println!("  src: {text}");
+            println!("  out: {last_out}");
+        }
     }
 
     #[cfg(target_os = "windows")]

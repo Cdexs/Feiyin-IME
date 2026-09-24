@@ -89,6 +89,11 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 
 # Windows-specific dependencies
 [target.'cfg(target_os = "windows")'.dependencies]
+# TRANS-CT2-DNNL-THREADS-397：Windows 下给 CT2 追加 oneDNN（x86 int8 GEMM 加速）+ MSVC OpenMP 运行时。
+# Cargo 特性合并：通用 [dependencies] 的 crt-dynamic/shared/ruy 保留，Windows 额外拿到 dnnl/openmp-runtime-comp；
+# macOS 只拿通用三项，行为不变（验收 6）。oneDNN 3.1.1 由 ctranslate2-src-build-support 自编为静态库，
+# 由 patches/ctranslate2-sys/build.rs 的 CMAKE_PREFIX_PATH 补丁让 CT2 的 find_package 命中。
+ctranslate2-sys = { version = "0.1.5", features = ["dnnl", "openmp-runtime-comp"] }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

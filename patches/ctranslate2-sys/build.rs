@@ -447,6 +447,30 @@ fn main() {
             Some(cuda_root()).expect("CUDA_TOOLKIT_ROOT_DIR is not specified"),
             shared,
         );
+
+        // TRANS-CT2-DNNL-THREADS-397 补丁（仅 Windows + dnnl 特性生效，macOS / 不开 dnnl 不受影响）：
+        // 上面 `link()` 已调 `build_dnnl(!shared)` 把 oneDNN 编成静态库并**安装到本 build script 的
+        // OUT_DIR**（`<OUT_DIR>/lib/dnnl.lib` + `<OUT_DIR>/include/dnnl.h`）。但 CT2 自己的 CMakeLists
+        // 只去 `${INTEL_ROOT}/oneapi/dnnl/latest/cpu_gomp` 找 dnnl（PATHS 是提示、真正靠 CMAKE_PREFIX_PATH
+        // / CMAKE_INCLUDE_PATH / CMAKE_LIBRARY_PATH 命中），二者不通 ⇒ WITH_DNNL 必 `FATAL_ERROR: DNNL include
+        // directory not found`。这里把 OUT_DIR 前插进 `CMAKE_PREFIX_PATH`（cmake crate 会把它转发给 cmake 进程，
+        // find_path/find_library 会搜索 `<prefix>/include`、`<prefix>/lib`），CT2 即可命中上面编好的 oneDNN。
+        // 只影响本 build script 进程，且只在 dnnl 特性开启时执行。
+        if dnnl {
+            let out_dir = env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
+            let mut prefix = vec![PathBuf::from(&out_dir)];
+            if let Some(existing) = env::var_os("CMAKE_PREFIX_PATH") {
+                prefix.extend(env::split_paths(&existing));
+            }
+            // SAFETY: build script 单线程，且在 spawn cmake 之前设置。
+            unsafe {
+                env::set_var(
+                    "CMAKE_PREFIX_PATH",
+                    env::join_paths(prefix).expect("join CMAKE_PREFIX_PATH"),
+                );
+            }
+        }
+
         let release = std::env::var("CTRANSLATE2_RELEASE").unwrap_or_else(|_| "4.6.0".to_owned());
         let url =
             format!("https://github.com/OpenNMT/CTranslate2/archive/refs/tags/v{release}.tar.gz");
@@ -529,6 +553,15 @@ fn main() {
     if shared {
         let target_dir = get_dir();
         copy_dlls_to_target(&lib_path, &target_dir);
+
+        // TRANS-CT2-DNNL-THREADS-397：`cargo test` 的测试可执行文件落在 `<target>/deps/`，
+        // 而 Windows 加载 DLL 时**先查 exe 所在目录** ⇒ deps 里若留有旧 `ctranslate2.dll`，
+        // 会盖住刚落地的库（397 实测：换 DNNL 后因 deps 旧副本全程被加载，提速零效果）。
+        // 故同一份新 DLL 也写进 deps/，保证测试 / bench 用的就是本次构建产物。
+        let deps_dir = target_dir.join("deps");
+        if deps_dir.exists() {
+            copy_dlls_to_target(&lib_path, &deps_dir);
+        }
     }
 
     let mut builder = cc::Build::new();

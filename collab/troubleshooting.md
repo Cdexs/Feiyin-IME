@@ -89,6 +89,7 @@
 | [PLAYWRIGHT-FIX-001] | 9 个 UI 测试全 ScopeMismatch → session 作用域 fixture 依赖了 module fixture，改同级 scope |
 | [HAPPYDOM-ALTGR-INDISTINGUISHABLE-001] | happy-dom 把 AltGraph 直接映射到 `altKey` → 真按 Ctrl+Alt 与 AltGr 单测里无法区分，只能靠端测 |
 | [TESTER-SCREENSHOT-FAIL] / [SCREENSHOT-METHOD-001] | 连续截到桌面背景或别的窗口 → 像素统计自验不可靠；须 MoveWindow + 置顶 + ShowWindow 三连后截固定区域 |
+| [CT2-DLL-SHADOW-397] | 换 native DLL（CT2/oneDNN）后行为或性能**逐毫秒没变** → `cargo test` exe 在 `target/<profile>/deps/`，Windows 先加载 exe 同目录 ⇒ deps 里的旧 DLL 静默盖住新库。`ls -la` + `sha256sum` 两处对比即坐实；`build.rs` shared 分支须同时拷 `deps/` |
 
 ## ASR / overlay / 产品行为
 

@@ -5275,3 +5275,37 @@ pub fn uses_accuracy_engine(self) -> bool {
 另 `hotkey.rs:1220/1235`、`local_stream.rs:871` 仍是旧截断写法，各自只扫本文件、
 本文件仅一处 `#[cfg(test)]` 且位于测试模块首行，当前不受影响，刻意未动（避免扩大扫描范围引入新红）。
 
+---
+
+## [CT2-DLL-SHADOW-397] `cargo test` 加载 `target/<profile>/deps/` 里的旧 ctranslate2.dll —— 换 DNNL 提速零效果
+
+**现象**（2026-09-24，TRANS-CT2-DNNL-THREADS-397）：CT2 重新编译开 oneDNN 后，bench 在 4 线程下与旧 DLL
+基线**逐毫秒几乎相同**（S1 6143 vs 6114ms、S4 30338 vs 30470ms）⇒ 误判「DNNL 没生效」；8 线程的 1.77×
+其实只来自线程数。把新 DLL 拷进 `deps/` 后 S1 立刻 6.1s → 0.38s（8~16×）。
+
+**判据**：Windows 加载 DLL **先查可执行文件所在目录**。`cargo test` 的 test exe 在
+`target/<profile>/deps/`，而本项目 patch 的 `patches/ctranslate2-sys/build.rs` 原本只把 cmake 产出的
+`ctranslate2.dll` 拷到 `target/<profile>/`（`copy_dlls_to_target(&lib_path, &target_dir)`，
+`target_dir = get_dir()`）⇒ `deps/` 里任何历史遗留的旧 `ctranslate2.dll` 都会**静默盖住**新库。
+
+**识别方法（三步）**：
+1. `ls -la target/debug/ctranslate2.dll target/debug/deps/ctranslate2.dll`：大小 / 日期不一致即中招
+   （本例 `27,405,312B @12:47` vs `8,167,936B @09-21`）。
+2. `sha256sum` 两份不同。
+3. `cp target/debug/ctranslate2.dll target/debug/deps/` 后重跑 bench，数字骤变 ⇒ 坐实。
+
+**修法**：`patches/ctranslate2-sys/build.rs` 的 shared 分支除拷到 `<target>/` 外，**再拷一份到
+`<target>/deps/`**（`deps_dir.exists()` 才拷）。此后 test / bench 用的必是本次构建产物。
+（本仓库 patched crate 才有此补丁；上游 crate 无。）
+
+**可复用规则**：
+1. 本仓库「改了 native DLL（CT2 / sherpa / onnxruntime）但行为或性能没变」的排查，
+   **先核 test / fixture 实际加载的 DLL 路径与 sha**，别先怀疑算法或参数。
+2. `cargo test`（含 `--release`）的 exe 在 `target/<profile>/deps/`；`cargo run` / 直接启动的在
+   `target/<profile>/`。两处都要有同一份 DLL。
+3. DLL 搜到旧副本时**不报错、不崩溃**，功能照跑（旧版），是最典型的「静默降级」——
+   与 `[PROVIDER-SILENT-FALLBACK-001]`（设了 provider 实际没生效）、`[TOML-STALE-001]`（旧副本盖新默认）同族。
+4. 与 `[FIRST-MARKER-BOUNDARY-001]` 的联动：源码护栏用「首个测试门控标记」切生产区时，
+   **生产代码里既不能有真门控属性、也不能在注释里写出该字面量**（397 曾在注释里写 `#[cfg(test)]`
+   导致 `source_guard_no_opus_mt_and_no_forced_min_decoding` 假红）。
+
