@@ -1,4 +1,4 @@
-; Voice IME Inno Setup Script
+﻿; Voice IME Inno Setup Script
 ; Version: 0.9.3
 ; Compile with: Inno Setup 6.x (https://jrsoftware.org/isinfo.php)
 ; RELEASE-ISS-FROM-PUBLISH-400：全部产物改从 ..\Publish\ 取；安装包不带模型（Gavin 定）。
@@ -55,8 +55,8 @@ ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName} {#MyAppVersion}
 
-; Windows version requirement (Windows 7+ for DEC-000 compatibility)
-MinVersion=6.1
+; Windows version requirement (Windows 10/11; DEC-000 — Win7 support removed 2026-04-17)
+MinVersion=10.0
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -138,9 +138,13 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "--settings"; \
     Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-; Kill the running process before uninstall
+; Kill running processes before uninstall (main / settings UI / crash reporter)
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#MyAppExeName}"; \
     Flags: runhidden; RunOnceId: "KillVoiceIME"
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM feiyin-ime-ui.exe"; \
+    Flags: runhidden; RunOnceId: "KillVoiceIMEUI"
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM crash-reporter.exe"; \
+    Flags: runhidden; RunOnceId: "KillCrashReporter"
 
 [UninstallDelete]
 ; Remove user data (optional, commented out by default to preserve user settings)
