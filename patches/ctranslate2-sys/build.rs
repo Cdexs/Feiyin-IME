@@ -413,9 +413,18 @@ fn main() {
     ) = load_features();
 
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/sys");
+    // LOCALRT-PERF-405（收集表 #3）：**只对存在的路径**发 `rerun-if-changed`。
+    // `src/sys` 与 `CTranslate2` 在本仓库**不存在**，而 cargo 对「缺失的 rerun-if-changed 路径」判
+    // `FsStatusOutdated(StaleItem(MissingFile))` ⇒ **每次构建都重跑 build script**（连带重编 CT2，
+    // 多 4~5 分钟；BUILD-399 实测 sha b7a5e2c1→5655295e）。二者都不是本地可变输入
+    //（CT2 源码由 `download_helper` 下到 `target/` 的固定 4.6.0 版本），故仅在存在时才登记。
+    if Path::new("src/sys").exists() {
+        println!("cargo:rerun-if-changed=src/sys");
+    }
     println!("cargo:rerun-if-changed=include");
-    println!("cargo:rerun-if-changed=CTranslate2");
+    if Path::new("CTranslate2").exists() {
+        println!("cargo:rerun-if-changed=CTranslate2");
+    }
 
     let mut found = None;
 

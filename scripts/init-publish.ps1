@@ -189,7 +189,8 @@ if (-not (Test-Path $Models)) {
 
 # Step 5: Copy current EXEs to Publish/
 Write-Host "`n[Step 5] Copy EXEs to Publish/" -ForegroundColor Yellow
-$exes = @("voice-ime.exe", "voice-ime-ui.exe", "crash-reporter.exe")
+# RELEASE-ISS-FROM-PUBLISH-400/405：实际产物名为 feiyin-ime*.exe（旧 voice-ime.exe 已作废，见 .iss）。
+$exes = @("feiyin-ime.exe", "feiyin-ime-ui.exe", "crash-reporter.exe")
 foreach ($exe in $exes) {
     $src = Join-Path $TargetRelease $exe
     $dst = Join-Path $Publish $exe
@@ -197,7 +198,8 @@ foreach ($exe in $exes) {
         Copy-Item -Path $src -Destination $dst -Force
         Write-Host "  OK $exe"
     } else {
-        Write-Host "  SKIP $exe (not built yet)"
+        Write-Host "  ERROR: $exe missing (run cargo build --release first)" -ForegroundColor Red
+        exit 1
     }
 }
 

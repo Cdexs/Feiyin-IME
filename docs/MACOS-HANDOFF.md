@@ -8,6 +8,18 @@
 
 ## 0 · 先读这份，再读那两份
 
+### 0.8 · LOCALRT-PERF-405 本地实时流式性能：移除影子收尾等（平台中立）（2026-09-24）
+
+- **文件域**：`src/transcription/local_stream.rs`（**平台中立**，macOS 编译同一份）、
+  `src/transcription/qwen_inference.rs`（删 1 个死方法）、`patches/ctranslate2-sys/build.rs`（Windows 构建补丁）、
+  `scripts/init-publish.ps1`（Windows 出包脚本）。
+- **平台中立行为变更**：① 删除本地实时「影子收尾」（DEC-086，`local_stream.rs` 内**本地流式专属**状态与分支，
+  在线/其它管线不动）；② 新增纯内存 `DisplayCache`（显示文本增量缓存，与 `StreamingAsrState::display_text()`
+  逐字等价）；③ 删 `qwen_inference.rs::StreamingAsrState::confirmed_text()`（仅被影子显示层调用的死方法）。
+- ✅ **对 macOS 无契约变更**：无 pub 结构字段/函数签名变化，macOS 编译同一份源码即自动继承；
+  **无需任何同步**。`build.rs` / `.ps1` 是 Windows 专属，macOS 不进入。
+- **行为**：只删「另一路 stream 同步重解当前句」的重活（实测零净收益、阻塞预览线程）；识别/切句/注入/翻译不变。
+
 ### 0.7 · RELEASE-VCRT-APPLOCAL-399 + RELEASE-ISS-FROM-PUBLISH-400 打包相关（纯 Windows）（2026-09-24）
 
 - **纯 Windows 打包改动，macOS 无影响**：399 动 `scripts/init-publish.ps1`（新增 Step 2 拷 VC++ 运行库）、

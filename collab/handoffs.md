@@ -8,6 +8,15 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-24 — coder-1 — LOCALRT-PERF-405 ✅ 阶段一交付（待主控验收）
+
+- **性质**：只动 `local_stream.rs` / `patches/ctranslate2-sys/build.rs` / `scripts/init-publish.ps1`（+ 主控许可的 `qwen_inference.rs` 删 1 死方法）；**未动** `main.rs`/`transcription/mod.rs`（coder-2 的 406）。
+- **① 影子收尾移除（DEC-086）**：删常量/`endpoint_confirm_text`/影子状态/**整段影子重解分支**/DBG-284·289 shadow 日志/2 测试；显示改主解；新增护栏 `guard405_no_shadow_in_production`。未动切句/342/派发/sentence_id。
+- **② F-C-01**：`DisplayCache` 增量缓存 + 5000 随机序列逐字等价测试。**③ F-A-02**：热循环只为日志的计时/计数收进 `log_enabled!(Debug)`。
+- **④ CT2 每次重编根因**：build.rs `rerun-if-changed=src/sys`/`CTranslate2` 缺路径 ⇒ `MissingFile` 每次重跑；改仅存在路径登记，实测第二次 build **0.89s 不编 CT2**。**⑤ ps1 Step5** 产物名改 `feiyin-ime.exe` 等 + 缺件 exit1（保持 BOM）。
+- **验证**：`fmt --check` EXIT 0；`check --all-targets` 0 error、warnings 92/87=基线；全量 `cargo test` **1597P/0F/48I**；真模型流式 E2E in=60.15s→out=53.79s。证据 `collab/evidence/405/`。
+- ⚠️ CT2 首建遇一次 MSBuild `MSB4175`（masm temp DLL）重试即过（与改动无关）；bash `TMP=/tmp` 会加剧，构建用 Windows TEMP。红线：未 commit/未 push/未 build release/版本未动/零凭证。
+
 ## 2026-09-24 — coder-1 — POC-SPEAKER-VERIFY-404B ✅ 交付（PoC，待主控验收）
 
 - **性质**：延续 404，只改 `#[cfg(test)]` PoC + 文档，未改生产。语言按主控确认「中英韩日」。

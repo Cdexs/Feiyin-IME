@@ -497,12 +497,6 @@ impl StreamingAsrState {
         text
     }
 
-    /// LOCALRT-ENDPOINT-284：仅已确认句拼接。
-    /// 供本地流式的「影子收尾显示」= `confirmed_text() + shadow最终当前句`（在线档不使用）。
-    pub fn confirmed_text(&self) -> String {
-        self.confirmed_sentences.join("")
-    }
-
     /// OVERLAY-051-G: 合并出完整 word timings（与 display_text 字符级对齐）
     ///
     /// 每次 on_result 后调用，返回与 `display_text()` 完全对齐的全量词表。

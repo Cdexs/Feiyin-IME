@@ -98,19 +98,6 @@ const LOCAL_STREAM_RULE3_MIN_UTTERANCE_LENGTH: f32 = 20.0;
 /// sherpa endpoint 决定（说话中间换气不会被切句）。两者是不同层的东西，不要混用。
 const PUNCT_SILENCE_TRIGGER_MS: f32 = 1200.0;
 
-/// LOCALRT-ENDPOINT-284（方案 B）：静默多久触发「影子收尾」——
-/// 另起一个 `OnlineStream` 把**当前句**音频喂进去 + `input_finished()`，拿完整结果，
-/// **只用于显示**（不 reset / 不切句 / 不动 `sentence_id`）；主 stream 完全不受影响。
-///
-/// 目的：Gavin 说完停顿 ~300-500ms 最后一个字就出现（不必等 rule2=2.0 的切句）。
-/// 默认 400ms，可经 env `LOCAL_RT_SHADOW_MS` 覆盖以实测选值。
-const SHADOW_FINALIZE_MS_DEFAULT: f32 = 400.0;
-
-/// LOCALRT-ENDPOINT-284（方案 B）安全上限：影子只收尾「当前句」，若当前句音频超过本值
-/// （说明长时间连续说话、rule2=2.0 一直没切句）则跳过本次影子，避免每停顿一次就重解一段
-/// 越来越长的音频（O(n²) 开销）。被跳过时打 warn 便于实测评估。
-const SHADOW_MAX_AUDIO_SECS: f32 = 12.0;
-
 /// LOCALRT-PARALLEL-ACC-298 / ACC-DISPATCH-SILENCE-ONLY-346：派发静音阈值默认值。
 ///
 /// 沿革：298 初版 800ms（Gavin 拍板，不是 400ms）→ **ACC-DISPATCH-SILENCE-ONLY-346 Gavin
@@ -128,7 +115,7 @@ const SHADOW_MAX_AUDIO_SECS: f32 = 12.0;
 ///
 /// PUNCT-PREVIEW-SEMANTIC-349 起标点阈值也抬到 **1200ms**，与本阈值相等：此时读共享计数器
 /// 「恰好」也能工作（acc 检查在标点清零之前，同一帧先派后清），但**依赖两条阈值恒相等 +
-/// 循环内检查顺序**，是脆弱耦合。独立计数器让两个消费者互不影响（与 shadow/acc 各自 latch
+/// 循环内检查顺序**，是脆弱耦合。独立计数器让两个消费者互不影响（与 acc 自身 latch
 /// 同构），故**保留** —— 阈值今后各自调整都不会互相踩踏。
 const ACC_DISPATCH_SILENCE_MS_DEFAULT: f32 = 1200.0;
 
@@ -302,6 +289,43 @@ fn punct_cache_reuse(prefix: &str, raw: &str, raw_len: usize) -> String {
     }
 }
 
+/// LOCALRT-PERF-405（F-C-01）：显示文本增量缓存。
+///
+/// `StreamingAsrState::display_text()` 每次调用都 `confirmed_sentences.join("") + current`
+/// （O(总长) 分配 + 拷贝）；流式循环每 chunk（~100/s）调一次，长录音下随文本线性增长。
+/// 本结构在**切句时**才更新 confirmed 区，当前句中间结果只替换尾部 current 区：
+/// - `on_confirm(text)`：丢弃 current、把 `text` 追加进 confirmed 区（切句事件，低频）；
+/// - `on_current(text)`：截断到 confirmed 末尾、写入 current（每 chunk，O(current)）。
+///
+/// 🔴 与 `StreamingAsrState::display_text()` 在**同一批 `on_result` 调用序列**下**逐字等价**，
+/// 由 `tests::display_cache_matches_state_display_text` 随机验证。`confirmed_bytes` 恒为 confirmed
+/// 区字节长度、也是合法 char 边界 ⇒ `truncate` 安全（不 panic）。
+#[derive(Default)]
+struct DisplayCache {
+    buf: String,
+    confirmed_bytes: usize,
+}
+
+impl DisplayCache {
+    fn new() -> Self {
+        Self::default()
+    }
+    /// 切句确认：`confirm` 并入 confirmed 区，current 清空（对应 `on_result(.., true, ..)`）。
+    fn on_confirm(&mut self, confirm: &str) {
+        self.buf.truncate(self.confirmed_bytes);
+        self.buf.push_str(confirm);
+        self.confirmed_bytes = self.buf.len();
+    }
+    /// 当前句中间结果：替换 current 区、confirmed 区不变（对应 `on_result(.., false, ..)`）。
+    fn on_current(&mut self, current: &str) {
+        self.buf.truncate(self.confirmed_bytes);
+        self.buf.push_str(current);
+    }
+    fn text(&self) -> &str {
+        &self.buf
+    }
+}
+
 /// LOCAL-RT-ENGINE-239-A：构建本地流式 paraformer recognizer（greedy_search）。
 ///
 /// 模型目录（DEC-011，exe 同级 models）：`sherpa-onnx-streaming-paraformer-trilingual-zh-cantonese-en/`，
@@ -354,28 +378,6 @@ pub fn create_local_stream_recognizer(model_dir: &Path) -> Result<OnlineRecogniz
     );
 
     OnlineRecognizer::create(&c).context("创建本地流式 (paraformer) recognizer 失败")
-}
-
-/// FIX-LOCALRT-TAILCHAR-291：切句 / 收尾确认文本的**两方取最长**（不回退）。
-///
-/// 291 的「flush 前/后取长者」语义扩为两方（**不新造一套**）：
-/// - `main`：主 stream flush 后结果（调用方已做「after 空/更短则回落 before」再传进来）
-/// - `shadow`：400ms 影子快照（可空），仅作补充候选
-///
-/// 🔴 LOCALRT-ROLLBACK-344：原第三方 `full`（307 整句全量重解码）已移除 —— 每次断句 ~104.5ms
-/// 且 26/26 `gained=0`，主路径零收益纯开销。择优语义（更长者胜）不变。
-///
-/// 返回字符数**严格更多**者；等长不切换（优先级 main → shadow）⇒ 结果长度恒 ≥ `main`，
-/// **绝不回退**且同长输入不抖动。全空返回空串（调用方据此走 EMPTY 分支）。
-fn endpoint_confirm_text<'a>(main: &'a str, shadow: Option<&'a str>) -> &'a str {
-    let mut best = main;
-    let best_len = main.chars().count();
-    if let Some(sh) = shadow {
-        if sh.chars().count() > best_len {
-            best = sh;
-        }
-    }
-    best
 }
 
 /// LOCALRT-REFLOW-HOLE-344-G：取「第 i 片对应的流式文本」——
@@ -1003,9 +1005,6 @@ pub fn transcribe_streaming_local(
     // 「静音累加 / 语音归零」两处同步，**不被标点清零** —— 保证 1200ms 阈值可达。
     let mut acc_silent_ms: f32 = 0.0;
 
-    // LOCALRT-ENDPOINT-284（方案 B）：影子收尾（只动显示层）。
-    let shadow_trigger_ms: f32 = SHADOW_FINALIZE_MS_DEFAULT;
-    log::debug!("[LocalRT-DBG-284] shadow_trigger_ms={}", shadow_trigger_ms);
     // 当前句音频在 `pcm` 中的起点（上次 endpoint reset 之后）。
     let mut sentence_pcm_start: usize = 0;
     // LOCALRT-ENDPOINT-EMPTY-342：自上次 endpoint 以来是否出现过**有声** chunk
@@ -1016,17 +1015,14 @@ pub fn transcribe_streaming_local(
     // VAD-393（A2）：会话语音时间线（`pcm` 绝对坐标，按序）。实时 VAD 逐 chunk 产出，派发时
     // 映射为片内 ranges ⇒ **复用实时判断、不再对每个窗口重跑 VAD**（且窗口开头有前文、结论与实时一致）。
     let mut speech_timeline: Vec<(usize, usize)> = Vec::new();
-    // 影子收尾产出的当前句文本（仅显示；新语音进来即作废）。
-    let mut shadow_current: Option<String> = None;
-    // 本轮静默是否已跑过影子（同一停顿不重复解码）。
-    let mut shadow_done_for_pause = false;
-    // 影子触发计数（284 实测触发频率用）。
-    let mut shadow_count: u32 = 0;
+    // LOCALRT-PERF-405（F-C-01）：显示文本增量缓存（替代每 chunk `state.display_text()` 的
+    // 全量 join + 分配）。切句时更新 confirmed 区，当前句只替换尾部 current 区。
+    let mut display_cache = DisplayCache::new();
 
-    // PARALLEL-ACC-298：accuracy 并行派发状态（与影子/端点**完全独立**）。
+    // PARALLEL-ACC-298：accuracy 并行派发状态（与端点**完全独立**）。
     // 已派发到的 `pcm` 位置（下一片从这里起算）。
     let mut acc_dispatched_end: usize = 0;
-    // 本轮静默是否已派发过（同 shadow_done_for_pause 的 latch 写法）。
+    // 本轮静默是否已派发过（latch 写法）。
     let mut acc_done_for_pause = false;
     // 本次未派发区间内是否出现过语音（尾片「有语音才派」的判据）。
     let mut acc_pending_has_speech = false;
@@ -1096,7 +1092,9 @@ pub fn transcribe_streaming_local(
             energy_smoother.push(chunk_energy_sum as f64, chunk.len() as u64, chunk_ms);
         // 385：会话音频时间（本 chunk 结束时刻）；供段峰值窗口按时间过期。
         session_ms += chunk_ms;
-        let t_vad0 = Instant::now();
+        // F-A-02（LOCALRT-PERF-405）：VAD 计时**仅喂 Debug 汇总**（见函数尾 `[DBG-384] vad cost`）⇒
+        // 非 Debug 下连 `Instant::now()` 都不取（DEC-077：诊断埋点不拖累实时主路径）。
+        let t_vad0 = (vad_on && log::log_enabled!(log::Level::Debug)).then(Instant::now);
         let judgment = chunk_has_speech(
             session_vad,
             &chunk,
@@ -1109,8 +1107,8 @@ pub fn transcribe_streaming_local(
         );
         let has_speech = judgment.has_speech;
         let vad_speech = judgment.vad_speech;
-        if vad_on {
-            let dt_ms = t_vad0.elapsed().as_secs_f64() * 1000.0;
+        if let Some(t0v) = t_vad0 {
+            let dt_ms = t0v.elapsed().as_secs_f64() * 1000.0;
             vad_total_ms += dt_ms;
             vad_chunks += 1;
             if dt_ms > vad_max_ms {
@@ -1135,13 +1133,12 @@ pub fn transcribe_streaming_local(
                 acc_silent_ms += chunk_ms;
             }
         } else {
-            // 392 主控验收补：「本轮停顿已派发 / 已触发影子」的复位属于**时序**，必须跟静默计时同源
-            //（has_speech）。若随 vad_speech 复位：背景人声被门拒 ⇒ acc_silent_ms 持续累加不清零，
-            // 而 done 标记每个 chunk 被清 ⇒ 静默已 ≥1200ms ⇒ **每个 chunk（~10ms）派发一次**，
-            // 串行解码队列被碎片窗口淹没。改回 has_speech：背景人声只随一次派发送出，之后要等录音人开口。
+            // 392 主控验收补：「本轮停顿已派发」的复位属于**时序**，必须跟静默计时同源（has_speech）。
+            // 若随 vad_speech 复位：背景人声被门拒 ⇒ acc_silent_ms 持续累加不清零，而 done 标记每个 chunk
+            // 被清 ⇒ 静默已 ≥1200ms ⇒ **每个 chunk（~10ms）派发一次**，串行解码队列被碎片窗口淹没。
+            // 改回 has_speech：背景人声只随一次派发送出，之后要等录音人开口。
             // 392 主控验收补（续）：done 复位写在计时清零**之前**，使 346 护栏（归零紧邻 silent_ms、
             // 其后 3 行内出现 speech_since_last_reset）与 392 护栏（done 复位在 else 分支）同时成立。
-            shadow_done_for_pause = false;
             acc_done_for_pause = false;
             silent_ms = 0.0;
             acc_silent_ms = 0.0;
@@ -1153,7 +1150,8 @@ pub fn transcribe_streaming_local(
             // 门只管时序（见上）；门误判时最坏只是停顿判断不准，**绝不丢录音人的话**。
         }
         // 392 埋点：VAD 判人声但门判非近场（被门拒）的 chunk 数 ⇒ 端测观察背景占比（可观测性）。
-        if vad_speech && !has_speech {
+        // F-A-02（405）：只喂 Debug 汇总（`[DBG-389] nearfield summary`）⇒ Debug 守卫。
+        if vad_speech && !has_speech && log::log_enabled!(log::Level::Debug) {
             vad_only_speech_chunks += 1;
         }
         // LOCALRT-VAD-SILENCE-384 埋点：人声 ↔ 静默切换（端测对照噪声环境下两种判定的差异）。
@@ -1193,13 +1191,16 @@ pub fn transcribe_streaming_local(
             bound_waited_ms += chunk_ms;
             if has_speech {
                 // b：有声恢复 ⇒ 立即冻结、**不回灌**（宁可这轮不修，也不吐残留重复）。
-                bound_hit_b += 1;
-                log::debug!(
-                    "[LocalRT-DBG-337] boundary=b (speech resumed) seg={} waited={:.0}ms stable={:.0}ms",
-                    seg,
-                    bound_waited_ms,
-                    bound_stable_ms
-                );
+                // F-A-02（405）：bound_hit_b 仅喂 DBG-337 日志 ⇒ Debug 守卫。
+                if log::log_enabled!(log::Level::Debug) {
+                    bound_hit_b += 1;
+                    log::debug!(
+                        "[LocalRT-DBG-337] boundary=b (speech resumed) seg={} waited={:.0}ms stable={:.0}ms",
+                        seg,
+                        bound_waited_ms,
+                        bound_stable_ms
+                    );
+                }
                 on_reflow_commit(seg, None);
                 bound_seg = None;
             } else {
@@ -1212,30 +1213,36 @@ pub fn transcribe_streaming_local(
                 }
                 if bound_stable_ms >= ACC_BOUNDARY_STABLE_MS {
                     // a：静默 + 文本停止增长 ⇒ 滞后补字已吐完，精确边界。
-                    bound_hit_a += 1;
-                    log::debug!(
-                        "[LocalRT-DBG-337] boundary=a (stable {:.0}ms) seg={} committed_len={} (a/b/c={}/{}/{})",
-                        bound_stable_ms,
-                        seg,
-                        cur,
-                        bound_hit_a,
-                        bound_hit_b,
-                        bound_hit_c
-                    );
+                    // F-A-02（405）：bound_hit_a 仅喂 DBG-337 日志 ⇒ Debug 守卫。
+                    if log::log_enabled!(log::Level::Debug) {
+                        bound_hit_a += 1;
+                        log::debug!(
+                            "[LocalRT-DBG-337] boundary=a (stable {:.0}ms) seg={} committed_len={} (a/b/c={}/{}/{})",
+                            bound_stable_ms,
+                            seg,
+                            cur,
+                            bound_hit_a,
+                            bound_hit_b,
+                            bound_hit_c
+                        );
+                    }
                     on_reflow_commit(seg, Some(cur));
                     bound_seg = None;
                 } else if bound_waited_ms >= ACC_BOUNDARY_CAP_MS {
                     // c：硬上限兜底。
-                    bound_hit_c += 1;
-                    log::debug!(
-                        "[LocalRT-DBG-337] boundary=c (cap {:.0}ms) seg={} committed_len={} (a/b/c={}/{}/{})",
-                        ACC_BOUNDARY_CAP_MS,
-                        seg,
-                        cur,
-                        bound_hit_a,
-                        bound_hit_b,
-                        bound_hit_c
-                    );
+                    // F-A-02（405）：bound_hit_c 仅喂 DBG-337 日志 ⇒ Debug 守卫。
+                    if log::log_enabled!(log::Level::Debug) {
+                        bound_hit_c += 1;
+                        log::debug!(
+                            "[LocalRT-DBG-337] boundary=c (cap {:.0}ms) seg={} committed_len={} (a/b/c={}/{}/{})",
+                            ACC_BOUNDARY_CAP_MS,
+                            seg,
+                            cur,
+                            bound_hit_a,
+                            bound_hit_b,
+                            bound_hit_c
+                        );
+                    }
                     on_reflow_commit(seg, Some(cur));
                     bound_seg = None;
                 }
@@ -1251,7 +1258,7 @@ pub fn transcribe_streaming_local(
             // 最后一句因 loop 之后的 flush 而完整，这正是「只有中间句丢」的原因。
             //
             // 修法：reset 之前先 flush 主 stream，取到真正完整的句子文本再确认。
-            // flush 前文本仅作**回落**用（见 `endpoint_confirm_text`）。
+            // flush 前文本仅作**回落**用（after 空/更短则用 before，见下方 `flush_text`）。
             let before_text = recognizer
                 .get_result(&stream)
                 .map(|r| r.text)
@@ -1283,20 +1290,17 @@ pub fn transcribe_streaming_local(
             // ~104.5ms，而 `[DBG-307]` **26/26 `gained=0`**（一个字都没捞回），属语音输入主路径
             // 纯开销（Gavin 2026-09-22 约束）。290 的 flush 回落（`flush_text`）保留：它零额外解码，
             // 只做「after 空/更短则用 before」的**不回退保护**。
-            // FIX-LOCALRT-TAILCHAR-291：两方取最长（main=flush / shadow）。
-            let confirm_text: &str = endpoint_confirm_text(flush_text, shadow_current.as_deref());
+            // FIX-LOCALRT-TAILCHAR-291：flush 前/后取长者（`flush_text` 已在上面算好，绝不回退）。
+            // DEC-086：影子收尾已移除，原「main / shadow 两方取长」的辅助函数一并删除。
+            let confirm_text: &str = flush_text;
             // LOCALRT-ENDPOINT-EMPTY-342（F1+F3）：自上次 endpoint 无有声 chunk ⇒ 静音流上的
             // **假 endpoint**。不确认、不推进游标、不并入预览（静音流吐出的字一律丢弃，幻字抑制）。
             let segment_has_speech = speech_since_last_reset;
             let action = endpoint_action(segment_has_speech, confirm_text.is_empty());
             if action == EndpointAction::SuppressSilence {
                 log::debug!(
-                    "[LocalRT-DBG-342] endpoint on silence-only segment: suppressed (main_len={} shadow_len={} suppress_len={})",
+                    "[LocalRT-DBG-342] endpoint on silence-only segment: suppressed (main_len={} suppress_len={})",
                     flush_text.chars().count(),
-                    shadow_current
-                        .as_ref()
-                        .map(|s| s.chars().count())
-                        .unwrap_or(0),
                     confirm_text.chars().count()
                 );
             } else if action == EndpointAction::Confirm {
@@ -1312,24 +1316,7 @@ pub fn transcribe_streaming_local(
                 }
                 // URGENT-286：诊断块仅在 Debug 级启用时执行 ⇒ 默认 Warn 下零开销。
                 if log::log_enabled!(log::Level::Debug) {
-                    // ROLLBACK-344：307 移除后只剩 main / shadow 两源（按指针判定胜出者）。
-                    let used = if shadow_current
-                        .as_deref()
-                        .is_some_and(|s| std::ptr::eq(confirm_text, s))
-                    {
-                        "shadow"
-                    } else {
-                        "main"
-                    };
-                    log::debug!(
-                        "[LocalRT-DBG-289] endpoint confirm: main_len={} shadow_len={} used={}",
-                        flush_text.chars().count(),
-                        shadow_current
-                            .as_ref()
-                            .map(|s| s.chars().count())
-                            .unwrap_or(0),
-                        used
-                    );
+                    // DEC-086：影子收尾已移除 ⇒ `[DBG-289]`（main/shadow 取舍）日志随之删除；只剩主解。
                     if confirm_text != last_result_text {
                         log::debug!(
                             "[LocalRT-DBG-276] result='{}' (chars={}) endpoint=true will_reset=true",
@@ -1341,6 +1328,8 @@ pub fn transcribe_streaming_local(
                 }
                 // 🔴 始终把**原始无标点**文本喂状态机，且本句**只确认这一次**（避免 FIX-252 重复打点）。
                 state.on_result(sentence_id, confirm_text, true, &[]);
+                // F-C-01（405）：同步增量缓存（confirmed 追加 confirm_text、current 清空）。
+                display_cache.on_confirm(confirm_text);
             } else {
                 log::debug!(
                     "[LocalRT-DBG-276] endpoint=true but result EMPTY (prev='{}')",
@@ -1351,15 +1340,18 @@ pub fn transcribe_streaming_local(
             // 按 c 兜底冻结（用确认前的显示长度，与镜像同源），避免悬置。
             if let Some(seg) = bound_seg {
                 let cur = last_display.chars().count();
-                bound_hit_c += 1;
-                log::debug!(
-                    "[LocalRT-DBG-337] boundary=c (endpoint flush) seg={} committed_len={} (a/b/c={}/{}/{})",
-                    seg,
-                    cur,
-                    bound_hit_a,
-                    bound_hit_b,
-                    bound_hit_c
-                );
+                // F-A-02（405）：bound_hit_c 仅喂 DBG-337 日志 ⇒ Debug 守卫。
+                if log::log_enabled!(log::Level::Debug) {
+                    bound_hit_c += 1;
+                    log::debug!(
+                        "[LocalRT-DBG-337] boundary=c (endpoint flush) seg={} committed_len={} (a/b/c={}/{}/{})",
+                        seg,
+                        cur,
+                        bound_hit_a,
+                        bound_hit_b,
+                        bound_hit_c
+                    );
+                }
                 on_reflow_commit(seg, Some(cur));
                 bound_seg = None;
             }
@@ -1384,8 +1376,6 @@ pub fn transcribe_streaming_local(
             };
             // 新句从当前总音频长度起算（342：假 endpoint 保持不动）；作废影子。
             sentence_pcm_start = next_sentence_start;
-            shadow_current = None;
-            shadow_done_for_pause = false;
             speech_since_last_reset = false;
         } else if let Some(r) = recognizer.get_result(&stream) {
             if !r.text.is_empty() && speech_since_last_reset {
@@ -1431,6 +1421,8 @@ pub fn transcribe_streaming_local(
                 // 杜绝「对已打点文本二次打点 / 标点重复」（FIX-252 场景）。
                 // 非 endpoint → 仅替换当前句中间结果（本函数内唯一另一处 on_result）。
                 state.on_result(sentence_id, &r.text, false, &[]);
+                // F-C-01（405）：同步增量缓存（替换 current 区；confirmed 区不变）。
+                display_cache.on_current(&r.text);
             } else if !r.text.is_empty() && log::log_enabled!(log::Level::Debug) {
                 // LOCALRT-ENDPOINT-EMPTY-342（F3）：静音段（自上次 endpoint 无有声 chunk）
                 // 的流式文本一律丢弃，不并入预览（幻字抑制）。
@@ -1442,56 +1434,9 @@ pub fn transcribe_streaming_local(
             }
         }
 
-        // LOCALRT-ENDPOINT-284（方案 B）：静默 ≥ 阈值 → 影子 stream 收尾当前句（**只动显示**）。
-        // 影子 = 另起 OnlineStream 喂当前句音频 + input_finished()，拿完整结果；主 stream 不受影响。
-        if silent_ms >= shadow_trigger_ms && !shadow_done_for_pause {
-            shadow_done_for_pause = true;
-            let shadow_audio = &pcm[sentence_pcm_start..];
-            let shadow_secs = shadow_audio.len() as f32 / SAMPLE_RATE as f32;
-            if !shadow_audio.is_empty() && shadow_secs > SHADOW_MAX_AUDIO_SECS {
-                log::debug!(
-                    "[LocalRT-DBG-284] shadow skipped: current sentence {:.1}s > cap {:.1}s (no endpoint yet)",
-                    shadow_secs,
-                    SHADOW_MAX_AUDIO_SECS
-                );
-            } else if !shadow_audio.is_empty() && speech_since_last_reset {
-                // URGENT-286：decode 计时只为日志用 ⇒ 仅 Debug 级才取样（默认 Warn 下零开销）。
-                let t_shadow = log::log_enabled!(log::Level::Debug).then(Instant::now);
-                let shadow = recognizer.create_stream();
-                shadow.accept_waveform(SAMPLE_RATE, shadow_audio);
-                // LOCALRT-ROLLBACK-344：340 的「shadow 补 500ms 静音」已移除 ——
-                // `[DBG-289]` 实测 13/13 `main_len==full_len==shadow_len`，补静音一字未增，
-                // 却让**每次停顿**多解 500ms（主路径纯开销）。shadow 机制本身保留（Gavin 明令）。
-                shadow.input_finished();
-                while recognizer.is_ready(&shadow) {
-                    recognizer.decode(&shadow);
-                }
-                // FIX-289：影子结果为空 ⇒ 置 None（不保留上一轮陈旧值，避免被误当「更完整」）。
-                shadow_current = recognizer
-                    .get_result(&shadow)
-                    .map(|r| r.text)
-                    .filter(|t| !t.is_empty());
-                shadow_count += 1;
-                if let Some(t0) = t_shadow {
-                    log::debug!(
-                        "[LocalRT-DBG-284] shadow finalize #{}: silence={:.0}ms sentence_audio={:.2}s decode={:.1}ms text_len={}",
-                        shadow_count,
-                        silent_ms,
-                        shadow_audio.len() as f32 / SAMPLE_RATE as f32,
-                        t0.elapsed().as_secs_f64() * 1000.0,
-                        shadow_current
-                            .as_ref()
-                            .map(|s| s.chars().count())
-                            .unwrap_or(0)
-                    );
-                }
-            } else if !shadow_audio.is_empty() {
-                // LOCALRT-ENDPOINT-EMPTY-342（F3）：静音段不跑影子（避免静音流幻字进入预览）。
-                log::debug!(
-                    "[LocalRT-DBG-342] shadow skipped: silence-only segment (no speech since last endpoint)"
-                );
-            }
-        }
+        // DEC-086（LOCALRT-PERF-405）：原「静默 ≥400ms 影子收尾（另起 stream 重解当前句）」分支
+        // **整段移除** —— 实测零净收益（endpoint 定稿极少采用影子结果、尾字也补不回），却在本流式
+        // 解码线程内同步重解整句（单次峰值 1267ms），严重阻塞预览实时性。末字补全改由后续机制解决。
 
         // PARALLEL-ACC-298 / ACC-DISPATCH-SILENCE-ONLY-346：**静默 ≥1200ms 即把这一段派给 accuracy**。
         // 🔴 只推进 `acc_dispatched_end`，**不 reset / 不切句 / 不动 sentence_id**（与 endpoint 解耦）。
@@ -1562,29 +1507,20 @@ pub fn transcribe_streaming_local(
         }
 
         // PUNCT-PREVIEW-SEMANTIC-349：显示刷新 —— 打点**只认静默 ≥1200ms**（读显示层 `silent_ms`）
-        // 且有新内容（4s 定时与 shadow 400ms 强制已删，见 `PUNCT_SILENCE_TRIGGER_MS` 与
-        // `should_repunctuate_preview`）。🔴 本处打点后会把 `silent_ms` 清零（见下），故 accuracy 派发
+        // 且有新内容（4s 定时与 shadow 400ms 强制已删；整个影子机制按 DEC-086 亦已移除，见
+        // `PUNCT_SILENCE_TRIGGER_MS` 与 `should_repunctuate_preview`）。🔴 本处打点后会把 `silent_ms` 清零（见下），故 accuracy 派发
         // 用的是另一个不被清零的 `acc_silent_ms`（346），两者**不共用**。
         // 无论打不打点都**只刷新显示**，不动状态机（不 reset / 不切句 / 不改 sentence_id）。
-        // 显示基文本：影子收尾（confirmed + 影子当前句）与主 stream（confirmed + current）**取更长者**，
-        // 避免新语音进来后主文本还没追上时显示瞬时缩短/闪烁。
-        let main_view = state.display_text();
-        let shadow_view = shadow_current.as_ref().map(|sh| {
-            let mut s = state.confirmed_text();
-            s.push_str(sh);
-            s
-        });
-        let raw_full = match shadow_view {
-            Some(sv) if sv.len() > main_view.len() => sv,
-            _ => main_view,
-        };
+        // 显示基文本（LOCALRT-PERF-405 F-C-01 增量缓存）：`confirmed` 区 + 当前句 current 区。
+        // DEC-086：影子收尾已移除，不再有 main/shadow 取长切换。
+        let raw_full: &str = display_cache.text();
         if !raw_full.is_empty() {
             // 有新内容 = raw 比上次打点时长（`raw_len` 初值 0 且 raw 非空 ⇒ 首次恒 true）。
             let has_new = raw_full.len() > punct_cache.raw_len;
             let silence_due =
                 should_repunctuate_preview(silent_ms, has_new, PUNCT_SILENCE_TRIGGER_MS);
             let display = preview_display(
-                &raw_full,
+                raw_full,
                 punctuation_engine.as_deref_mut(),
                 &mut punct_cache,
                 silence_due,
@@ -1680,8 +1616,9 @@ pub fn transcribe_streaming_local(
     // 滞后补字必已吐完）⇒ 末态带 acc 前缀。已冻结或从未派发则不动。
     if let Some(seg) = bound_seg {
         let cur = last_display.chars().count();
-        bound_hit_a += 1;
+        // F-A-02（405）：bound_hit_a 仅喂 DBG-337 日志 ⇒ Debug 守卫。
         if log::log_enabled!(log::Level::Debug) {
+            bound_hit_a += 1;
             log::debug!(
                 "[LocalRT-DBG-337] boundary=a (recording end flush) seg={} committed_len={} (a/b/c={}/{}/{})",
                 seg,
@@ -1708,10 +1645,12 @@ pub fn transcribe_streaming_local(
     let mut final_preview = last_display.clone();
     if !final_seg.is_empty() {
         state.on_result(sentence_id, &final_seg, false, &[]);
+        // F-C-01（405）：同步增量缓存（替换 current 区）。
+        display_cache.on_current(&final_seg);
         // 收尾强制打点一次（录音结束 = 真边界，不属「句中断点」），保证关闭前的预览带标点。
-        let raw_full = state.display_text();
+        let raw_full = display_cache.text();
         let display = preview_display(
-            &raw_full,
+            raw_full,
             punctuation_engine.as_deref_mut(),
             &mut punct_cache,
             true,
@@ -2180,10 +2119,10 @@ mod timeline393_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_dispatch_segment, chunk_has_speech, endpoint_action, endpoint_confirm_text,
-        local_stream_num_threads, localrt_vad_seed_ms, punct_cache_reuse, seed_usable,
-        segment_streaming_text, should_dispatch_acc, should_dispatch_tail,
-        should_repunctuate_preview, EndpointAction, EnergySmoother, SegmentGate, SegmentPeakLevel,
+        build_dispatch_segment, chunk_has_speech, endpoint_action, local_stream_num_threads,
+        localrt_vad_seed_ms, punct_cache_reuse, seed_usable, segment_streaming_text,
+        should_dispatch_acc, should_dispatch_tail, should_repunctuate_preview, DisplayCache,
+        EndpointAction, EnergySmoother, SegmentGate, SegmentPeakLevel,
         LOCALRT_VAD_MIN_SILENCE_SECS, SAMPLE_RATE,
     };
     use std::time::Duration;
@@ -2237,47 +2176,78 @@ mod tests {
         );
     }
 
-    /// FIX-LOCALRT-TAILCHAR-291（344 修订为两方）：两方取最长（main / shadow），结果恒 ≥ main。
+    // LOCALRT-PERF-405（DEC-086）：影子收尾移除后，`endpoint_confirm_text`（main/shadow 两方取长）
+    // 及其两条测试一并删除。「flush 前/后取长、绝不回退」语义仍由生产调用方的 `flush_text`
+    // （`after_text` 空/更短则回落 `before_text`）保证，行为由流式回归与 §`flush` 结构覆盖。
+
+    /// LOCALRT-PERF-405（F-C-01）：`DisplayCache` 与 `StreamingAsrState::display_text()` **逐字等价**。
     ///
-    /// 覆盖：shadow 更长取 shadow；shadow 为空/更短/等长回落 main（绝不回退）；
-    /// 全空返回空（调用方走 EMPTY 分支）。307 的 `full` 来源已按 344 移除。
+    /// 随机（确定性 LCG）生成一批 `on_result` 事件序列（切句 / 同句中间结果 / 新句），
+    /// 分别喂给 `DisplayCache` 与 `StreamingAsrState`，断言两者全文恒等（含中文多字节边界）。
     #[test]
-    fn endpoint_confirm_text_takes_longest_of_two() {
-        // shadow 为空 ⇒ 回落 main，句子不消失。
-        assert_eq!(endpoint_confirm_text("端测发现的问", None), "端测发现的问");
-        // shadow 更短 ⇒ 回落 main（绝不回退）。
-        assert_eq!(endpoint_confirm_text("你好世界", Some("你好")), "你好世界");
-        // shadow 更长 ⇒ 取 shadow。
-        assert_eq!(
-            endpoint_confirm_text("看看有什么好看的电", Some("看看有什么好看的电影")),
-            "看看有什么好看的电影"
-        );
-        // 等长 ⇒ 取 main（不抖动）。
-        assert_eq!(
-            endpoint_confirm_text("你好", Some("您好")),
+    fn display_cache_matches_state_display_text() {
+        use super::StreamingAsrState;
+        let mut seed: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed
+        };
+        let frags = [
             "你好",
-            "等长取 main"
-        );
-        // 全空 ⇒ 空（调用方据此走 EMPTY 分支，不做确认）。
-        assert_eq!(endpoint_confirm_text("", None), "");
+            "世界，",
+            "今天天气",
+            "不错。",
+            "",
+            "测",
+            "试一下",
+            "。",
+        ];
+        let mut cache = DisplayCache::new();
+        let mut state = StreamingAsrState::new();
+        let mut sid: i64 = 1;
+        for i in 0..5000 {
+            let text = frags[(next() % frags.len() as u64) as usize];
+            let end = next() % 4 == 0;
+            if end {
+                state.on_result(sid, text, true, &[]);
+                cache.on_confirm(text);
+                sid += 1;
+            } else {
+                state.on_result(sid, text, false, &[]);
+                cache.on_current(text);
+            }
+            assert_eq!(
+                cache.text(),
+                state.display_text(),
+                "iter={i} end={end} text={text:?} sid={sid}: 缓存版与全量版显示文本必须逐字相等"
+            );
+        }
     }
 
-    /// 判据 #4 的不变量：两方取最长后，长度恒 ≥ main（按字符计）。
+    /// LOCALRT-PERF-405（DEC-086）源码护栏：`local_stream.rs` **生产区**不得再出现「影子重解」。
+    ///
+    /// 扫 `local_stream.rs` 自身源码（剔除全部 `#[cfg(test)]` 起至文件尾的测试区），断言无
+    /// `shadow`/`SHADOW`/`endpoint_confirm_text` 字样 ⇒ 影子收尾不会被人加回。
     #[test]
-    fn endpoint_confirm_text_len_not_below_main() {
-        let cases: [(&str, Option<&str>); 6] = [
-            ("", None),
-            ("", Some("尾")),
-            ("端测发现的问", None),
-            ("端测发现的问", Some("端测发现的问题")),
-            ("长一点的前文", Some("更短")),
-            ("ab", Some("abc")),
-        ];
-        for (main, shadow) in cases {
-            let chosen = endpoint_confirm_text(main, shadow);
+    fn guard405_no_shadow_in_production() {
+        let src = include_str!("local_stream.rs");
+        // 生产区 = 第一个 `#[cfg(test)]` 之前（本文件测试集中在文件后段的 `mod tests`）。
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        // 只查**机制标识符**（历史注释里的散文 'shadow' 不算）。
+        for needle in [
+            "SHADOW_FINALIZE_MS_DEFAULT",
+            "SHADOW_MAX_AUDIO_SECS",
+            "shadow_trigger_ms",
+            "shadow_current",
+            "shadow_done_for_pause",
+            "shadow_count",
+            "endpoint_confirm_text",
+        ] {
             assert!(
-                chosen.chars().count() >= main.chars().count(),
-                "main={main:?} shadow={shadow:?} chosen={chosen:?}"
+                !prod.contains(needle),
+                "LOCALRT-PERF-405：生产区不得再出现 `{needle}`（影子收尾已按 DEC-086 移除）"
             );
         }
     }
@@ -2456,9 +2426,8 @@ mod tests {
 
     /// 定界 endpoint **真分支**（`if endpoint {` 到其闭合 `}` 的前一行）。
     ///
-    /// 🔴 FIX-GUARD-297：原实现用「首个 `} else`」截断，会命中分支内**嵌套**的
-    /// `let confirm_text = if use_shadow { … } else { … }`（`:400`），把真正的
-    /// `recognizer.create_stream()`（`:450`）排除出扫描区 ⇒ G3 假红。
+    /// 🔴 FIX-GUARD-297：原实现用「首个 `} else`」截断，会命中分支内**嵌套**的 `if … {} else {}`
+    /// （如 `endpoint_action` 的判据分支），把真正的 `recognizer.create_stream()` 排除出扫描区 ⇒ G3 假红。
     ///
     /// 现改为**单遍花括号游标**：从 `if endpoint {` 起维护相对 `depth`；当 `depth == 1`
     /// 且行首为 `}` 时，该 `}` 就是真分支的闭合花括号（Rust 的 `} else if … {` 里第一个
@@ -3039,13 +3008,12 @@ mod tests {
     //
     // 移除时间/原因（2026-09-22，Gavin 最高约束「主路径不得加拖累性能的机制」）：
     // - ① `tailpad340_padded_never_shorter`：依赖 `endpoint_confirm_text(main, full, shadow)`
-    //   三方签名；307 全量重解码与补静音移除后签名收为 `(main, shadow)`，故该断言随签名消失。
-    //   「不得让文本变短或整句消失」的不变量**未失守**：改由
-    //   `endpoint_confirm_text_len_not_below_main` + `endpoint_confirm_text_takes_longest_of_two`
-    //   覆盖（同一条「恒 ≥ main、绝不回退」判据），另由收尾 flush 的
-    //   `final_preview = last_display.clone()` + `if !final_seg.is_empty()` 结构保证。
+    //   三方签名；307 全量重解码与补静音移除后签名收为 `(main, shadow)`；LOCALRT-PERF-405
+    //   （DEC-086）影子整体移除后该函数亦删除 ⇒ 断言无对象。
+    //   「不得让文本变短或整句消失」的不变量**未失守**：由调用方 `flush_text`（after 空/更短则回落
+    //   before）与收尾 `final_preview = last_display.clone()` + `if !final_seg.is_empty()` 结构保证。
     // - ② `tailpad340_local_only_and_order`：守的是 `feed_tail_silence` 调用顺序红线；
-    //   该函数已随 340 机制整体删除（shadow 每次停顿多解 500ms、收尾多解 2000ms，`[DBG-289]`
+    //   该函数已随 340 机制整体删除（阴影收尾每次停顿多解 500ms、收尾多解 2000ms，`[DBG-289]`
     //   13/13 实测零收益），守的对象不存在 ⇒ 一并移除，**不是放宽或删除断言**。
     // ========================================================================
 
@@ -3056,7 +3024,7 @@ mod tests {
     // ========================================================================
 
     /// PUNCT-349：预览打点**只认静默 ≥1200ms 且有新内容**。
-    /// 改前另有「4s 定时」与「shadow 400ms 强制」两条与语义无关的触发 —— 已删除。
+    /// 改前另有「4s 定时」与「阴影收尾 400ms 强制」两条与语义无关的触发 —— 已删除。
     /// 本测试钉死「无 1200ms 静默不打点」（核心新判据）。
     #[test]
     fn punct349_preview_only_on_1200ms_silence() {
@@ -3995,7 +3963,6 @@ mod gate392_tests {
     struct Flags392 {
         silent_ms: f32,
         acc_silent_ms: f32,
-        shadow_done_for_pause: bool,
         acc_done_for_pause: bool,
         speech_since_last_reset: bool,
         acc_pending_has_speech: bool,
@@ -4007,7 +3974,6 @@ mod gate392_tests {
             Self {
                 silent_ms: 0.0,
                 acc_silent_ms: 0.0,
-                shadow_done_for_pause: false,
                 acc_done_for_pause: false,
                 speech_since_last_reset: false,
                 acc_pending_has_speech: false,
@@ -4037,7 +4003,6 @@ mod gate392_tests {
             } else {
                 self.silent_ms = 0.0;
                 self.acc_silent_ms = 0.0;
-                self.shadow_done_for_pause = false;
                 self.acc_done_for_pause = false;
             }
             // 内容（vad_speech）

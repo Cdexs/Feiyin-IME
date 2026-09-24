@@ -1,4 +1,11 @@
 
+### 2026-09-24 · LOCALRT-PERF-405 交付（本地实时流式性能五项）
+
+- **影子收尾移除**（DEC-086）：删影子重解分支/状态/常量/`endpoint_confirm_text`/DBG 日志/测试，显示改主解，新增护栏；未动切句/342/派发/sentence_id。
+- **F-C-01** `DisplayCache` 增量缓存（+等价性测试）；**F-A-02** 只为日志的计时/计数收进 Debug 守卫。
+- **CT2 每次重编根因**：build.rs `rerun-if-changed` 指向不存在路径 ⇒ `MissingFile`；改为仅存在路径登记，第二次 build **0.89s 不编 CT2**。
+- **ps1 Step5** 产物名改 `feiyin-ime.exe` 等 + 缺件 exit1。仅动 3 文件（+主控许可删 `qwen_inference.confirmed_text` 死方法）。未出包。
+
 ### 2026-09-24 · POC-SPEAKER-VERIFY-404B 交付（声纹四语复测 + 跨语言注册 PoC）
 
 - 四语数据：zh=AISHELL-1 10 人 / en=LibriSpeech 12 人 / ko=Zeroth 12 人，各 ≥10 条 ≥2s；**ja=缺口**（无公开带标注自然人语料）。
