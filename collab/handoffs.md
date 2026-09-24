@@ -13,7 +13,8 @@
 - **改动**（`src/transcription/speaker.rs`；`mod.rs` 仅 +1 源码锚点测试）：新增纯函数 `merge_speech_units` + `MERGE_GAP_SECS=0.5s`（**暂定，待端测校准**）+ `SpeechUnit`（语音时长不含间隔；退化零长区间保留为零长成员保一一对应）；`filter_ranges_by_voiceprint` 改**按单元**判定（单元 ≥2s 拼接全部成员语音算一次声纹、判定作用全成员；<2s `KeepShort`）；注册/漂移按单元 offer（**起点** ≥ `new_slice_from`，跨界单元保守不 offer）。
 - **7 条影响面逐条结论+测试**：① `kept` 仍原各段（剪静音喂 `f.kept`，388 不变）② kept/dropped 口径同改前 ③ 解码后重解用原 ranges+整窗音频 ④ 漂移上限仍 0.25（8s/100s 单元同位移）⑤ 跨界单元不 offer ⑥ 无就绪档逐位一致 ⑦ 缺模型合并未执行。
 - **测试**：`ts412_*` 9 + `mod.rs` 锚点 1 = **10P/1I**；`#[ignore]` 真模型单元 vs 2.4s 长段 **0.915**。同步更新 408B `ts408b_new_slice_from_contract_anchor` 锚点（**契约不变**）。
-- **验证**：`fmt --check` EXIT 0；`check --all-targets` 0 error、warnings 92/87=基线；全量 `cargo test` **1697P/0F/53I**。证据 `collab/evidence/412/`。
+- **验证**：`fmt --check` EXIT 0；`check --all-targets` 0 error、warnings 92/87=基线；全量 `cargo test` **1701P/0F/53I**。证据 `collab/evidence/412/`。
+- **R1 返修（数据校准，主控退回）**：`MERGE_GAP_SECS` **0.5→0.8s**（BUILD-409 同窗相邻间隔一半以上 0.5~0.8s，原阈值下窗#4 一段拼不上）；规则改 **只为凑够 2s 才拼**（单元 ≥2s 即封口）+ **尾段并入前单元** + **≥2s 单段独立**；安全性（拼错只令混合单元得分居中 ⇒ 不误删）入注释；补 4 条测试（窗#4 真实区间/凑 2s 封口/长段独立/尾段并入）⇒ `ts412` **14P/1I**；7 条影响面复核结论不变。
 - 红线：未碰 `main.rs` / 未 commit / 未 build release / 版本未动 / 零凭证。
 
 ## 2026-09-25 — coder-1 — FIX-TAIL-GUARD-410 ✅ 阶段一交付（待主控验收，只改 main.rs）

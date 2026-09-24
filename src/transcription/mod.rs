@@ -8305,6 +8305,37 @@ mod fix408b_tests {
         ));
         assert!(!p.exists(), "src/bin/poc_speaker_408.rs 必须删除");
     }
+
+    /// 契约（影响①③）：412 合并且**只**作用于「解码前剪静音」的声纹判定 —— 剪静音喂 `f.kept`
+    /// （**原各段**，不并入间隔）；解码后语种保护重解用**原 ranges**（`ranges_orig`）+ **整窗音频**。
+    /// 该约束内联在 `transcribe_acc_ctx`（无纯函数）⇒ 以源码锚点锁死契约形状。
+    #[test]
+    fn ts412_merge_confined_to_predecode_trim_anchor() {
+        let src = include_str!("mod.rs");
+        let body = src
+            .split("pub(crate) fn transcribe_acc_ctx(")
+            .nth(1)
+            .expect("transcribe_acc_ctx 锚点缺失");
+        let body = body.split("FIX-PREFIX-AND-EAT-371").next().unwrap();
+        // 影响①：剪静音喂的是 kept（原各段）—— 合并只用于判定，绝不把间隔并进剪静音区间。
+        assert!(
+            body.contains("trim_to_speech(samples, &f.kept, pad)"),
+            "剪静音必须用 f.kept（原各段，不并入间隔）——否则改变 388 剪静音结果"
+        );
+        // 影响③：原 ranges 在声纹过滤**之前**捕获，供解码后重解。
+        let cap = body
+            .find("ranges_orig = ranges.clone()")
+            .expect("原 ranges 捕获锚点缺失");
+        let filt = body
+            .find("speaker::filter_ranges_by_voiceprint(")
+            .expect("声纹过滤锚点缺失");
+        assert!(cap < filt, "必须在声纹过滤之前捕获原 ranges");
+        // 影响③：解码后语种保护重解用原 ranges + 整窗音频（不受合并影响）。
+        assert!(
+            body.contains("&ranges_orig,") && body.contains("window_audio,"),
+            "解码后语种保护重解必须用原 ranges + 整窗音频"
+        );
+    }
 }
 
 // =====================================================================
