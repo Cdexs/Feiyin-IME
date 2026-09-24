@@ -8,6 +8,15 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-24 — coder-1 — RELEASE-ISS-FIX-401 ✅ 阶段一交付（待主控验收）
+
+- **性质**：只改两份 `.iss`（逐字相同），未改 Rust/Cargo/tauri.conf，未构建、未编安装包。
+- ① 两份 `.iss` → **UTF-8 with BOM**（首三字节 `efbbbf`）；加 BOM 前后去 BOM 的内容 sha256 均 `55ba0349…` ⇒ 中文逐字未变（`collab/evidence/401/encoding_evidence.txt`）。
+- ② `MinVersion=6.1` → **`10.0`**（DEC-000：Win7 已移除，注释同步）。
+- ③ `[UninstallRun]` 增 `feiyin-ime-ui.exe`（`KillVoiceIMEUI`）/ `crash-reporter.exe`（`KillCrashReporter`）两条 `taskkill`，均 `runhidden`。
+- 全文扫描 `[Icons]`/`[Registry]`/`[Run]`/`[Code]`：**无** 写死 `voice-ime.exe` 残留。
+- 两份 sha256 全等 `faed9765…`。红线：未 commit / 未 push / 未构建 / 版本号未动 / 零凭证。
+
 ## 2026-09-24 — coder-1 — RELEASE-ISS-FROM-PUBLISH-400 ✅ 阶段一交付（待主控验收）
 
 - **性质**：只改安装脚本与文档，**未改 Rust/Cargo/tauri.conf 版本，未构建、未编安装包**。
@@ -38,6 +47,16 @@
 - **新增 troubleshooting**：`[CT2-DLL-SHADOW-397]`（archive 全文 + 索引一行）。
 - 🔴 **交班 tester-1 注意**：① DLL 依赖新增 `VCOMP140.DLL`（VC++ 2015-2022 Redist 自带，与 MSVCP140/VCRUNTIME140 同包）；CT2 DLL 体积 8.2MB → 27.4MB；② 出 release 时 oneDNN 会按 Release 重编（dev 档 bench 是 Debug oneDNN，release 只会更快/相近）；③ 首次 release 构建 ctranslate2-sys 会多编 oneDNN（约 +2~3 分钟，本机 debug 实测 3m41s）。
 - 红线：未 commit / 未 push / 未出包 / 版本号未动 / 未 `cargo clean` / 零凭证。
+
+## 2026-09-24 — tester-1 — BUILD-399 ✅ 出包（撤回 398 词库前缀 · 直接出包；九项 + 专项 + 三特殊点全 PASS）
+
+- **交付源码**：HEAD `49bae07`（`src/` 与 `678c7a0` 逐字节一致：本地实时恢复不注入词库、无 `Technical terms:` 前缀；397 翻译提速保留），版本 0.9.3。**Gavin 明示不跑回归**。
+- **构建**：Step1 残 0 → Step2 **SKIP**（`ui/`+`src-tauri/` 无 diff）→ Step3 main **6m14s**（92w + crash 9w）→ Step4 `scripts/init-publish.ps1`（DLL + VC++ runtime）+ 手工 cp 三 exe/四 rules toml。产物 main `0dba0c97e553…`(14,922,240B/15:37:19) / ui `ee7f2571f1d4…`(10,050,048B/13:45:21 未改) / crash `a3ee1930d585…`(24,879,104B/15:35:40) / ct2 `5655295e195e…`(27,405,312B/15:34:42)；两副本全等。
+- **九项逐项 PASS**：①时间戳 15:31–15:39 ②两副本 sha 相等（main/crash 异于 398；ui 未改属预期）③**0.9.3** ④冒烟 PID **12492 Responding=True**/无新 crash.json/无新 panic/`WM_CLOSE`→controller **328ms**/残 0 ⑤config `da2be5da…` 不变 ⑥warnings 92/9（+`ctranslate2-sys` 18=397 基线）⑦反探针 `Technical terms: `=**0**、正探针 `(threads=`=1 ⑧scene/itn/homophone/wordbook 四表三副本全等 ⑨**VC++ 五个运行库齐全 + sha 与 Redist `14.44.35112` 源一致**。
+- **专项**：冒烟 `-debug` 新窗 `[LocalRT-DBG-320] hotwords inject`=**0** + 源码 `main.rs:7574` LocalRealtime 早退存在 + 时间戳 + sha（未真实录音，按 N/A 三证）。
+- **三特殊点（仅核验）**：① sherpa 四 DLL 三副本全等 + `onnxruntime` **1.28.2**；② itn-rules 三副本 `60b227de…` 全等；③ `Publish/models/` 1.7B 七文件与源 sha256 全等、0.6B 保留。
+- ⚠️ **与预期不符两处**：(1) **CT2 被重编** —— `patches/ctranslate2-sys/build.rs` 的 `cargo:rerun-if-changed=CTranslate2` 使每次 release 重跑 build script；sha `b7a5e2c1`→`5655295e`，**同大小 27,405,312B、不同字节 18.17%**（C++ 并行构建不可复现），导入表与 398 完全一致（含 `VCOMP140.DLL`、无 `dnnl.dll`），冒烟实证 `(threads=8)` ⇒ 功能正常，代价是每次出包多 ~4–5min；建议另单收窄 `rerun-if-changed`。(2) `init-publish.ps1` Step5 exe 名过期（`voice-ime.exe`）→ 两主 exe 被 SKIP，本次手工 `cp` 补齐；建议另单改为 `feiyin-ime.exe`/`feiyin-ime-ui.exe`。
+- 🔴 **Step1 强杀输入法进程 ⇒ 已提醒 Gavin 重启 + 带 `-debug` 端测**。未 push / 版本号未动 / 未改生产代码 / 未 `cargo clean` / 零凭证。证据 `collab/evidence/399/`。
 
 ## 2026-09-24 — tester-1 — TEST-EXEC + BUILD-398 ✅ 出包（397+398 合包；八项 + 专项 A~D + 三特殊点全 PASS；回归与构建并行）
 
@@ -90,3 +109,11 @@
 - **文档**：`decisions.md`（DEC-083→已推翻 + 新增 DEC-084 索引行）、`decisions-archive.md`（DEC-084 全文）、`docs/MACOS-HANDOFF.md`、`logs/20260924.md`、`CHANGELOG.md`、`progress.md`。
 - 🔴 **未验证**：中文场景端测（词库词召回 / 是否仍念词表 / `Technical terms` 是否漏进正文 / 空输出 / 截尾）交 tester-1 / Gavin。
 - **未改版本 / 未 commit / 未 push / 未 build release / 零凭证**。
+
+## 2026-09-24 — coder-2 — RT-PERF-AUDIT-403 ✅ 交付（本地实时管线只读性能审计，无代码改动）
+
+- **性质**：只读审计本地实时全链路（采集 → 流式预览 → 路B 精解 → 预览上屏 → 松键上屏），**未改任何代码/配置/Publish**；产出 `collab/research/rt-perf-audit-403.md`。证据源 `target/release/debug.log`（本会话 525 行）。
+- **前提核对**：`log::debug!/info!` 宏自身按级别短路（默认 Warn ⇒ 宏内参数不求值）⇒ 真问题是**宏外累计 + 真实分配/测量**。
+- **Top5**：① `local_stream.rs:1447-1494` shadow 收尾在流式线程同步重解（本会话 7 次合计 2903ms、单次峰值 **1267.9ms**；`endpoint confirm` **2/2 used=main** 零净收益，**Gavin 明令保留 ⇒ 只报告**）；② 每 chunk 全文 `display_text`/`confirmed_text`/shadow_view 拼接 + `preview_display` 分配（`:1571-1580`）；③ 每帧 GDI 量宽 + D2D `CreateTextLayout` + 两次 Vec 分配（`main.rs:3755/5293/5356/3063`；浮层 16ms 循环 `main.rs:2419`）；④ hot-loop 只为日志的计时/计数未守卫（`:1099/1113-1118/1156/1196/1215/1229/1354/1474/1683`，违 DEC-077）；⑤ 流式 / 路B 精解各 `min(核,8)` 并发争用（`local_stream.rs:64` + `mod.rs:133`）。
+- **六类均结论**（B 类「已查无」）；**确定冗余** F-C-01/F-A-01/F-A-02、**需 Gavin 定** shadow（F-D-01）、**需实测** 线程数（F-F-01）。**已核正确**：audio pre-roll 诊断全守卫、`t_shadow`/DBG-380/382/277 已守卫、VAD 185.2ms/1541 chunks 可忽略、无 sleep 轮询。
+- **红线**：未改生产代码 / 未 `cargo build` / 未 commit / 未 push / 零凭证。

@@ -1,10 +1,24 @@
 
+### 2026-09-24 · RELEASE-ISS-FIX-401 交付（安装脚本三处小修：BOM / MinVersion / 卸载杀进程）
+
+- 两份 `.iss` → UTF-8 with BOM（`efbbbf`；加 BOM 前后去 BOM 内容 sha 相同 ⇒ 中文逐字未变）。
+- `MinVersion` 6.1→10.0（DEC-000）；`[UninstallRun]` 增杀 `feiyin-ime-ui.exe` / `crash-reporter.exe`（各独立 RunOnceId、runhidden）。
+- 全文无写死 `voice-ime.exe` 残留；两份 sha 全等。未构建/未出包。
+
 ### 2026-09-24 · RELEASE-ISS-FROM-PUBLISH-400 交付（安装脚本改从 Publish 取 + 过期内容修正，不带模型）
 
 - `installer/voice-ime.iss`（+`Publish/voice-ime.iss` 逐字副本）`[Files]` 全部改从 `..\Publish\`（17 Publish + 2 assets 白名单，无通配）：三 exe、sherpa×2、onnxruntime×2、`ctranslate2.dll`、五运行库、四规则表；删弃用 paraformer。
 - 排除 `models\`（Gavin 定不带）+ 用户数据 + 开发脚本 + `cudnn64_9.dll`/`libiomp5md.dll`（dumpbin 证无导入）；`MyAppVersion`→0.9.3、`MyAppExeName`→`feiyin-ime.exe`、`MyAppId` 未动。两份 sha 全等。
 - 实证 Source 实存 **19/19 OK**；规则表 exe 同级读取行号已给。
 - 🔴 **核查**：程序无自动模型下载器，缺口单列（仅 Accuracy 有 UI 引导）。未构建/未出包。
+
+### 2026-09-24 · BUILD-399 出包（撤回 398 词库前缀 · 直接出包，不跑回归）
+
+- 源码 `49bae07`（`src/` 与 `678c7a0` 逐字节一致）；Gavin 明示不跑 `cargo test`/Vitest。
+- Step1 残 0 → Step2 SKIP（ui/src-tauri 无 diff）→ Step3 main 6m14s → Step4 `init-publish.ps1` + 手工 cp。产物 main `0dba0c97…` / ui `ee7f2571…`(未改) / crash `a3ee1930…` / ct2 `5655295e…`；两副本全等。
+- 九项 + 专项 + 三特殊点全 PASS；冒烟 `-debug` 新窗 `hotwords inject`=0、`WM_CLOSE` **328ms** 退出。
+- ⚠️ CT2 被重编（`rerun-if-changed=CTranslate2`）sha 变、同大小、导入表不变、冒烟 `(threads=8)` 证正常；`init-publish.ps1` Step5 exe 名过期已手工补齐。
+- 🔴 出包强杀输入法，已提醒 Gavin 重启 + 带 `-debug` 端测。
 
 ### 2026-09-24 · TEST-EXEC + BUILD-398 出包（397 + 398 合包；回归与构建并行）
 
