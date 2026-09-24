@@ -2213,12 +2213,17 @@ mod testsync412_guard_tests {
             (secs(1.0), secs(1.9)),
             (secs(2.1), secs(3.0)),
         ];
+        // 期望 = 各段时长之和（由数据导出，勿手算常量）。
+        let total: f32 = ranges
+            .iter()
+            .map(|(s, e)| (e - s) as f32 / SAMPLE_RATE as f32)
+            .sum();
         let (kept, ksec, drop) = partition_ranges(&ranges, &[SegVerdict::DropNonUser(0.1); 3]);
         assert!(kept.is_empty(), "单元 Drop ⇒ 全成员剔除");
         assert_eq!(ksec, 0.0);
         assert!(
-            (drop - 2.8).abs() < 1e-3,
-            "dropped==0.8+0.9+0.9，实测 {drop}"
+            (drop - total).abs() < 1e-3,
+            "dropped==成员语音之和 {total}，实测 {drop}"
         );
         let (kept2, ksec2, drop2) = partition_ranges(&ranges, &[SegVerdict::KeepUser(0.9); 3]);
         assert_eq!(
@@ -2226,7 +2231,7 @@ mod testsync412_guard_tests {
             ranges.to_vec(),
             "保留=原各段（间隔不并入剪静音区间）"
         );
-        assert!((ksec2 - 2.8).abs() < 1e-3 && drop2 == 0.0);
+        assert!((ksec2 - total).abs() < 1e-3 && drop2 == 0.0);
     }
 
     /// 契约5：无就绪档 ⇒ 判定 KeepNotReady（与改前一致）；缺模型 ⇒ 生产早退还**原样保留**（源码护栏）。

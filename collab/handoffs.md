@@ -290,3 +290,4 @@
 - **契约2 措辞（主控裁量 A）**：③ 收尾「<2s 尾段并入前一单元」为 412 R1 有意例外（非缺陷）；契约2 限定「前向累积阶段」，据此分别钉住。
 - **验证（白名单）**：`rustfmt --config skip_children=true src/transcription/speaker.rs` CLEAN；`cargo check --all-targets` **EXIT 0**、0 error、warnings **92/87** = 基线；sandbox 复刻 `merge_speech_units` 500 组性质 bad=0 + 边界 + BUILD-409 ✅。🔴 **未跑 `cargo test`**（阶段三禁止，首跑由 tester-1）。
 - **疑似生产缺陷：未发现**；**未改生产代码 / 未 commit / 未 push / 零凭证**。
+- **返修（tester-1 回归红，测试自身错误）**：`ts412b_unit_scope_three_members` 三段 0.8+0.9+0.9=2.6s，两处期望手算成 2.8 ⇒ 红；改为由数据导出 `total=Σ(e-s)/SR` 再比。sandbox 未覆盖之因：复刻只移植 `merge_speech_units`、未移植 `partition_ranges` 秒数累计，且阶段三禁 `cargo test`。复跑：`rustfmt --skip_children` CLEAN；`cargo check --all-targets` 0 error、warnings 92/87=基线。
