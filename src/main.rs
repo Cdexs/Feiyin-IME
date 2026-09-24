@@ -8455,6 +8455,7 @@ fn spawn_worker_thread(
                                                         dispatched_at,
                                                         window_ranges,
                                                         streaming_nonempty,
+                                                        new_slice_from,
                                                     ) in trx
                                                     {
                                                         // 382（3C）：排队时间 = 派发 → worker 开始解码。
@@ -8470,6 +8471,7 @@ fn spawn_worker_thread(
                                                             avg_snapshot,
                                                             window_ranges.as_deref(),
                                                             streaming_nonempty,
+                                                            new_slice_from,
                                                         );
                                                         let ms = t0.elapsed().as_secs_f64() * 1000.0;
                                                         // 382（3C）：解码完成时刻（端到端「解完 → 浮层重画」）。
@@ -8503,8 +8505,15 @@ fn spawn_worker_thread(
                                                 ($res:expr) => {{
                                                     let (seq, dispatch_idx, r, ms, decode_done_at) = $res;
                                                     total_decode_ms += ms;
+                                                    // SPEAKER-VERIFY-408B：本窗声纹剔除统计（供 406 放宽）。
+                                                    let win_drop = match &r {
+                                                        Ok((_, _, stats)) => *stats,
+                                                        Err(_) => {
+                                                            transcription::AccDropStats::default()
+                                                        }
+                                                    };
                                                     let text = match r {
-                                                        Ok((t, _np)) => t,
+                                                        Ok((t, _np, _stats)) => t,
                                                         Err(err) => {
                                                             all_native = false;
                                                             log::warn!(
@@ -8526,18 +8535,24 @@ fn spawn_worker_thread(
                                                     // 比对内容保留度；不通过 ⇒ 用流式替换精解（防精解漏整句 /
                                                     // 幻觉导致预览回缩与最终丢句）。🔴 仅本地实时滑窗路B。
                                                     let verdict =
-                                                        transcription::acc_vs_streaming(&decoded, fb);
+                                                        transcription::acc_vs_streaming_after_drop(
+                                                            &decoded,
+                                                            fb,
+                                                            win_drop.dropped_speech_secs,
+                                                            win_drop.kept_speech_secs,
+                                                        );
                                                     // 406 验收补：Debug 档下**每窗**打一行 verdict + 双方原文
                                                     // （各截前 80 字），供端测校准阈值 —— 此前缺的正是 acc 字符串不落盘。
                                                     if log::log_enabled!(log::Level::Debug) {
                                                         let trunc =
                                                             |s: &str| -> String { s.chars().take(80).collect() };
                                                         log::debug!(
-                                                            "[LocalRT-DBG-406] verdict window #{}: retention={:.2} len_ratio={:.2} accept={} acc_chars={} stream_chars={} acc=\"{}\" stream=\"{}\"",
+                                                            "[LocalRT-DBG-406] verdict window #{}: retention={:.2} len_ratio={:.2} accept={} dropped={:.2}s acc_chars={} stream_chars={} acc=\"{}\" stream=\"{}\"",
                                                             seq,
                                                             verdict.retention,
                                                             verdict.len_ratio,
                                                             verdict.accept,
+                                                            win_drop.dropped_speech_secs,
                                                             decoded.chars().count(),
                                                             fb.chars().count(),
                                                             trunc(&decoded),
@@ -8675,6 +8690,16 @@ fn spawn_worker_thread(
                                                         recent_streaming[start..stop].concat();
                                                     let streaming_nonempty =
                                                         !window_streaming.trim().is_empty();
+                                                    // 408B：本窗**最后一片**在窗内的起点样本下标（声纹注册只计新片）。
+                                                    let new_slice_from: usize = recent_slices
+                                                        [start..stop]
+                                                        .iter()
+                                                        .take(
+                                                            stop.saturating_sub(start)
+                                                                .saturating_sub(1),
+                                                        )
+                                                        .map(|s| s.len())
+                                                        .sum();
                                                     let _ = task_tx.send((
                                                         window_seq,
                                                         $idx,
@@ -8683,6 +8708,7 @@ fn spawn_worker_thread(
                                                         std::time::Instant::now(),
                                                         window_ranges,
                                                         streaming_nonempty,
+                                                        new_slice_from,
                                                     ));
                                                     window_spans.push((gs, ge));
                                                     window_samples.push(
@@ -8723,6 +8749,9 @@ fn spawn_worker_thread(
                                                         rate_windows,
                                                     );
                                                     let streaming_nonempty = !streaming.trim().is_empty();
+                                                    // 408B：末尾窗新片 = pending（末段）；前缀部分样本数 = samples[0]。
+                                                    let new_slice_from =
+                                                        if samples.len() >= 2 { samples[0] } else { 0 };
                                                     let _ = task_tx.send((
                                                         window_seq,
                                                         last_dispatch_idx,
@@ -8731,6 +8760,7 @@ fn spawn_worker_thread(
                                                         std::time::Instant::now(),
                                                         None, // 407：部分前片 ⇒ 传 None 回退自跑 VAD
                                                         streaming_nonempty,
+                                                        new_slice_from,
                                                     ));
                                                     window_spans.push((gs, ge));
                                                     window_samples.push(samples);
@@ -9128,6 +9158,7 @@ fn spawn_worker_thread(
                                                     // VAD-393：路B 无实时时间线 ⇒ 回退自跑 VAD 剪静音。
                                                     speech_ranges: None,
                                                     streaming_nonempty: false,
+                                                    new_slice_from: 0,
                                                 };
                                                 match transcription::transcribe_acc_ctx(
                                                     rec,
@@ -9136,7 +9167,7 @@ fn spawn_worker_thread(
                                                     0,
                                                     inject,
                                                 ) {
-                                                    Ok((t, _)) if !t.trim().is_empty() => {
+                                                    Ok((t, _, _)) if !t.trim().is_empty() => {
                                                         log::info!(
                                                             "DUAL-PATH-363 路B 全量解成功：audio={:.1}s audio_tok={} inject_tok={} chars={}",
                                                             audio_secs,
@@ -10320,7 +10351,9 @@ fn decode_window(
     speech_ranges: Option<&[(usize, usize)]>,
     // VAD-393（A4）：本窗流式文本是否非空（区间为空串时决定「整窗解码 vs 提前返回」）。
     streaming_nonempty: bool,
-) -> anyhow::Result<(String, bool)> {
+    // SPEAKER-VERIFY-408B：本窗新片起点样本下标（声纹注册只计新片）。
+    new_slice_from: usize,
+) -> anyhow::Result<(String, bool, transcription::AccDropStats)> {
     transcription::transcribe_acc_ctx(
         recognizer,
         window_audio,
@@ -10331,6 +10364,7 @@ fn decode_window(
             avg_chars_per_sec,
             speech_ranges,
             streaming_nonempty,
+            new_slice_from,
         },
     )
 }
@@ -11288,15 +11322,15 @@ enum AccInput {
 type AccDecodeResult = (
     usize,
     usize,
-    anyhow::Result<(String, bool)>,
+    anyhow::Result<(String, bool, transcription::AccDropStats)>,
     f64,
     std::time::Instant,
 );
 
 /// FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382：滑窗解码任务载荷
-/// `(window_seq, dispatch_idx, 本窗音频, 产出率均值快照, 派发时刻, 本窗语音区间, 本窗流式文本非空)`
+/// `(window_seq, dispatch_idx, 本窗音频, 产出率均值快照, 派发时刻, 本窗语音区间, 本窗流式文本非空, 本窗新片起点样本下标)`
 /// （派发时刻供 3C `queued_ms`）。VAD-393（A3）：第 6 元为**窗内坐标**的合并语音区间；
-/// `None` ⇒ 回退 391 自跑 VAD。
+/// `None` ⇒ 回退 391 自跑 VAD。SPEAKER-VERIFY-408B：第 8 元 `new_slice_from`（声纹注册只计新片）。
 type AccTaskMsg = (
     usize,
     usize,
@@ -11305,6 +11339,7 @@ type AccTaskMsg = (
     std::time::Instant,
     Option<Vec<(usize, usize)>>,
     bool,
+    usize,
 );
 
 /// FIX-PREVIEW-HARVEST-380（A）：滑窗线程的一步（新切片 / 解码结果）。
@@ -11362,8 +11397,8 @@ mod fix406_tests {
         // 截到下一个 `macro_rules!`（若首段即全部则到末尾）。
         let body = body.split("macro_rules!").next().unwrap();
         assert!(
-            body.contains("acc_vs_streaming("),
-            "406：harvest_acc_window! 内必须调用 acc_vs_streaming"
+            body.contains("acc_vs_streaming_after_drop("),
+            "406/408B：harvest_acc_window! 内必须调用 acc_vs_streaming_after_drop"
         );
         assert!(
             body.contains("from_streaming"),

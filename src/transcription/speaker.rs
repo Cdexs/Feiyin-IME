@@ -1,23 +1,26 @@
-// SPEAKER-VERIFY-408A · 声纹模块（独立模块，暂不接入管线）
+// SPEAKER-VERIFY-408 · 声纹模块（408A 独立模块 + 408B 接入本地实时路B）
 //
 // 背景：BUILD-399 端测「背景人声被近场门放行」——本人与背景只差约 1dB，靠音量从原理上分不开
 //（`collab/research/rt-perf-audit-403.md` / 404·404B 声纹选型 PoC）⇒ 改为「按声纹认人」。
 //
-// 本模块按主控设计（Gavin 拍板「声纹模型选 cam++双语版」「自动注册、只存本机、不误删」）实现：
-// - 模型：`3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx`（CAM++ 中英，404B §B6 推荐）。
-// - **自动注册、无设置界面**：从本人语音积累，**攒够 ≥12s 且 ≥3 段才就绪**；未就绪一律不剔除。
-// - **只判 ≥2s 的段**；**只在高置信「非本人」时剔除**（`score < DROP_THR`），其余一律保留。
-// - **日语 / 未知语言一律保留**（404B 未测日语，且中文→日语注册不通用）。
-// - 声纹只存本机（调用方给路径），不含音频、不上传。
+// 主控设计（Gavin：「声纹模型选 cam++双语版」「自动注册、只存本机、不误删」
+//「语音识别模型给出的标签是哪个语言，就用对应语言版本的声纹存档来比照」）：
+// - 模型：`3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx`（CAM++ 中英）。
+// - **先解码、后判定**：先按现有流程出首解（不剔除）→ 取 1.7B 语种前缀得 L（无前缀按字符集粗判）；
+//   L=ja ｜ L 未知 ｜ L 档未就绪 ⇒ **不剔除**，直接用首解结果；否则用 **L 档**声纹逐段判定
+//   （≥2s、score < `DROP_THR` 剔）→ 有段被剔 ⇒ 用**剔除后的 ranges** 重解一次并采用；
+//   无段被剔 ⇒ 直接用首解结果。
+// - **按语种分档**的声纹存档（同一文件）；自动注册：该档 ≥12s 且 ≥3 段才就绪；未就绪不剔。
+// - **跨语种保守**：新语种注册时，若已有其它就绪档，候选与之最高分 < `NEW_LANG_MIN_SCORE` ⇒ 不收
+//   （多半是背景人，防学成新语种声纹）。
+// - 声纹只存本机（`<exe>/voiceprint.bin`），不含音频、不上传。
 //
-// 🔴 本单（408A）**不接入管线**（剪静音 / main.rs 是 408B）。模块顶部 `#![allow(dead_code)]`
-//    是给「未接入」用的，**408B 接入后应移除本行**。
-//
-// ⚠️ 临时：`src/transcription/mod.rs` 的 `pub(crate) mod speaker;` 由主控在 406 交付后合入；
-//    在此之前用 `src/bin/poc_speaker_408.rs` 的 `#[path]` 宿主跑 `cargo test --bin poc_speaker_408`。
-#![allow(dead_code)] // 408B 接入管线后移除（本单仅新增文件、无调用方）
+// ⚠️ 408A 的单档存档从未发布 ⇒ 直接按**多语种档案**格式实现；存档带版本号，升级迁移不丢弃，
+//    仅当**换了声纹模型**（向量空间不同）才无法迁移、需重建（日志说明）。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use sherpa_onnx::{SpeakerEmbeddingExtractor, SpeakerEmbeddingExtractorConfig};
@@ -26,10 +29,14 @@ use sherpa_onnx::{SpeakerEmbeddingExtractor, SpeakerEmbeddingExtractorConfig};
 pub(crate) const MODEL_SUBDIR: &str = "speaker-campplus-zh-en";
 /// 模型文件名（404B §B6 推荐：CAM++ 中英，27MB，192 维）。
 pub(crate) const MODEL_FILE: &str = "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx";
-/// 声纹存档格式版本（结构变更时递增 ⇒ 旧档丢弃重建）。
-const FORMAT_VERSION: u32 = 1;
-/// 存档内记录的模型标识；与当前不符 ⇒ 丢弃重建（换模型后旧声纹不可用）。
+/// 声纹存档格式版本（结构变更时递增）。
+///
+/// v1 → **v2**（408B）：单档 → **按语种分档**（`profiles: {lang → profile}`）；v1 档迁移到 `und`（不丢弃）。
+const FORMAT_VERSION: u32 = 2;
+/// 存档内记录的模型标识；与当前不符 ⇒ 丢弃重建（换模型后向量空间不同，旧声纹不可用）。
 const MODEL_TAG: &str = "campplus-zh_en-16k-common-advanced-v1";
+/// v1 单档迁移到该语种键（语种未知）。
+const MIGRATED_LANG: &str = "und";
 
 /// 只判 ≥2s 的段（<2s 声纹不稳，404B 实测 1-2s 明显偏弱）。
 pub(crate) const MIN_JUDGE_SECS: f32 = 2.0;
@@ -42,10 +49,13 @@ pub(crate) const ENROLL_OUTLIER_THR: f32 = 0.5;
 pub(crate) const UPDATE_THR: f32 = 0.75;
 /// 漂移更新单段权重上限：防被单段（哪怕很长）带偏。
 pub(crate) const UPDATE_MAX_WEIGHT: f32 = 0.25;
-/// 剔除阈：`score < 此值` 且段 ≥2s 且语言受支持且已就绪 ⇒ 高置信非本人 ⇒ 剔除。
+/// 剔除阈：最高分 < 此值且段 ≥2s 且该语种档就绪 ⇒ 高置信非本人 ⇒ 剔除。
 ///
 /// 依据 404B §B6：跨语言通用建议 0.45~0.65，取 **0.45 偏保守**（宁放过、不误删，守 390 教训）。
 pub(crate) const DROP_THR: f32 = 0.45;
+/// 新语种注册闸（408B）：已有其它就绪档时，新语种候选段与**已有就绪档**最高分须 ≥ 此值，
+/// 否则多半是背景人 ⇒ 不收入候选（防把别人学成新语种声纹）。
+pub(crate) const NEW_LANG_MIN_SCORE: f32 = 0.3;
 
 const SAMPLE_RATE: i32 = 16_000;
 
@@ -82,6 +92,7 @@ fn centroid_of(embs: &[Vec<f32>]) -> Vec<f32> {
 }
 
 /// 语言是否受声纹判定支持（404B 仅验中/英/韩）。`ja` / `None`（未知）一律不支持 ⇒ 保留。
+#[allow(dead_code)] // 408A `judge` 契约 API；生产预解码走 `judge_voiceprint`（跨档最高分）
 fn lang_supported(lang: Option<&str>) -> bool {
     match lang {
         Some(l) => {
@@ -149,36 +160,31 @@ impl SpeakerVerifier {
 pub(crate) enum SegVerdict {
     /// 段 < [`MIN_JUDGE_SECS`] ⇒ 保留（不判）。
     KeepShort,
-    /// 声纹未就绪（积累不足）⇒ 保留。
+    /// 声纹未就绪（该语种档未就绪 / 提取失败 / 无 emb）⇒ 保留。
     KeepNotReady,
     /// 语言不受支持（日语 / 未知）⇒ 保留。
+    #[allow(dead_code)] // 408A `judge` 契约；生产预解码走 `judge_voiceprint`
     KeepLanguage,
-    /// 已就绪且像本人（score ≥ [`DROP_THR`]）⇒ 保留（附 score，供漂移/调参）。
+    /// 已就绪且像本人（最高分 ≥ [`DROP_THR`]）⇒ 保留（附 score）。
     KeepUser(f32),
-    /// 已就绪且高置信非本人（score < [`DROP_THR`]）⇒ 剔除（附 score）。
+    /// 已绪且高置信非本人（最高分 < [`DROP_THR`]）⇒ 剔除（附 score）。
     DropNonUser(f32),
 }
 
-/// 判定：段 ≥2s + 语言受支持 + 声纹就绪 + 声纹非本人 ⇒ `DropNonUser`；否则一律保留。
-pub(crate) fn judge(
-    vp: &Voiceprint,
-    emb: Option<&[f32]>,
-    secs: f32,
-    lang: Option<&str>,
-) -> SegVerdict {
+/// SPEAKER-VERIFY-408B：**语言无关**的判定核心（`<2s → 无就绪档/无 emb → 阈值`）。
+///
+/// 取**本人所有已就绪语种档的最高分**；至少一档就绪且最高分 < [`DROP_THR`] 才剔除。
+/// 语种选择交给「最高分」自动完成（解码前语种未知）。
+pub(crate) fn judge_voiceprint(vp: &Voiceprint, emb: Option<&[f32]>, secs: f32) -> SegVerdict {
     if secs < MIN_JUDGE_SECS {
         return SegVerdict::KeepShort;
-    }
-    if !lang_supported(lang) {
-        return SegVerdict::KeepLanguage;
-    }
-    if !vp.is_ready() {
-        return SegVerdict::KeepNotReady;
     }
     let Some(e) = emb else {
         return SegVerdict::KeepNotReady;
     };
-    let score = cosine(&vp.centroid, e);
+    let Some(score) = vp.max_score_ready(e) else {
+        return SegVerdict::KeepNotReady;
+    };
     if score < DROP_THR {
         SegVerdict::DropNonUser(score)
     } else {
@@ -186,18 +192,26 @@ pub(crate) fn judge(
     }
 }
 
-/// 声纹存档（JSON；仅质心/时长/段数，**不含任何音频**）。
-#[derive(Serialize, Deserialize)]
-struct PersistedVp {
-    version: u32,
-    model: String,
-    centroid: Vec<f32>,
-    total_secs: f32,
-    segments: u32,
+/// 判定：段 ≥2s + 语言受支持 + **该语种档**就绪 + 非本人 ⇒ `DropNonUser`；否则一律保留。
+///
+/// 🔴 **短段门（`<2s`）最优先**（408A 契约：1.9s+ja ⇒ `KeepShort`）⇒ 语言门仅对 `≥2s` 生效；
+/// 判定逻辑收敛到 [`judge_voiceprint`]（单一出处）。
+#[allow(dead_code)] // 408A 契约 API（保留供未来按已知语言判定）；408B 生产预解码走 `judge_voiceprint`
+pub(crate) fn judge(
+    vp: &Voiceprint,
+    emb: Option<&[f32]>,
+    secs: f32,
+    lang: Option<&str>,
+) -> SegVerdict {
+    if secs >= MIN_JUDGE_SECS && !lang_supported(lang) {
+        return SegVerdict::KeepLanguage;
+    }
+    judge_voiceprint(vp, emb, secs)
 }
 
-/// 使用人声纹：就绪前积累候选、就绪后按时长加权 EMA 漂移更新。
-pub(crate) struct Voiceprint {
+/// 单语种声纹档。
+#[derive(Default, Clone)]
+struct LangProfile {
     centroid: Vec<f32>,
     total_secs: f32,
     segments: u32,
@@ -205,78 +219,134 @@ pub(crate) struct Voiceprint {
     candidates: Vec<(Vec<f32>, f32)>,
 }
 
-impl Default for Voiceprint {
-    fn default() -> Self {
-        Self {
-            centroid: Vec::new(),
-            total_secs: 0.0,
-            segments: 0,
-            candidates: Vec::new(),
-        }
-    }
-}
-
-impl Voiceprint {
-    pub(crate) fn is_ready(&self) -> bool {
+impl LangProfile {
+    fn is_ready(&self) -> bool {
         !self.centroid.is_empty()
             && self.total_secs >= ENROLL_MIN_SECS
             && self.segments >= ENROLL_MIN_SEGS
     }
+}
 
-    /// 喂入一段「本人候选」声纹（`emb` 应已 L2 归一化或任意，内部归一化）。
+/// 使用人声纹：**按语种分档**（每种语言一份质心/时长/段数/就绪态）。
+#[derive(Default)]
+pub(crate) struct Voiceprint {
+    profiles: BTreeMap<String, LangProfile>,
+}
+
+impl Voiceprint {
+    /// 任一语种档已就绪。
+    pub(crate) fn has_any_ready(&self) -> bool {
+        self.profiles.values().any(|p| p.is_ready())
+    }
+
+    /// 该语种是否已有**已就绪**档。
+    pub(crate) fn lang_ready(&self, lang: &str) -> bool {
+        self.profiles.get(lang).is_some_and(|p| p.is_ready())
+    }
+
+    /// 该语种已就绪档的质心（未就绪 / 无该档 ⇒ `None`）。测试与诊断用。
+    #[allow(dead_code)]
+    pub(crate) fn ready_centroid(&self, lang: &str) -> Option<&[f32]> {
+        self.profiles
+            .get(lang)
+            .filter(|p| p.is_ready())
+            .map(|p| p.centroid.as_slice())
+    }
+
+    /// 各已就绪档时长合计（日志/节流用）。
+    pub(crate) fn total_ready_secs(&self) -> f32 {
+        self.profiles
+            .values()
+            .filter(|p| p.is_ready())
+            .map(|p| p.total_secs)
+            .sum()
+    }
+
+    /// 对**所有已就绪档**取最高余弦（新语种注册闸用）；无就绪档 ⇒ `None`。
+    fn max_score_ready(&self, emb: &[f32]) -> Option<f32> {
+        let mut best: Option<f32> = None;
+        for p in self.profiles.values().filter(|p| p.is_ready()) {
+            let s = cosine(&p.centroid, emb);
+            best = Some(best.map_or(s, |b| b.max(s)));
+        }
+        best
+    }
+
+    /// 喂入一段「本人候选」声纹（`emb` 任意，内部归一化），按 `lang` 进入对应档。
     ///
-    /// - 未就绪：入候选；若候选足以定稿（≥[`ENROLL_MIN_SECS`]/≥[`ENROLL_MIN_SEGS`]），
-    ///   先算候选质心、剔除 `cos < [`ENROLL_OUTLIER_THR`]` 的离群段，剩余仍达标才就绪。
-    /// - 已就绪：`score_if_ready`（缺省用 `cosine(质心, emb)`）≥[`UPDATE_THR`] 才按
-    ///   `alpha = min(secs/(total+secs), UPDATE_MAX_WEIGHT)` 做 EMA：`c←normalize((1-α)c + α·emb)`。
-    pub(crate) fn offer(&mut self, emb: &[f32], secs: f32, score_if_ready: Option<f32>) {
+    /// - 该档已就绪：`score >= UPDATE_THR` 才按 `alpha = min(secs/(total+secs), UPDATE_MAX_WEIGHT)`
+    ///   做 EMA 漂移；
+    /// - 该档未就绪：作为该档注册候选（≥12s/≥3 段 + 离群剔除）；🔴 若**已有其它就绪档**，候选与之
+    ///   最高分 < [`NEW_LANG_MIN_SCORE`] ⇒ **不收**（多半是背景人，防学成新语种声纹）；
+    /// - `lang` 未知 / 空 ⇒ 不注册（无处归档）。
+    pub(crate) fn offer(
+        &mut self,
+        emb: &[f32],
+        secs: f32,
+        score_if_ready: Option<f32>,
+        lang: Option<&str>,
+    ) {
+        let Some(lang) = lang.filter(|l| !l.is_empty()) else {
+            return;
+        };
         if emb.is_empty() || secs <= 0.0 {
             return;
         }
         let emb = l2_normalize(emb);
-        if self.is_ready() {
-            let score = score_if_ready.unwrap_or_else(|| cosine(&self.centroid, &emb));
+        // 先算「已有其它就绪档的最高分」（entry 前借用，避免同时可变/不可变借用）。
+        let best_ready = self.max_score_ready(&emb);
+        let prof = self.profiles.entry(lang.to_string()).or_default();
+        if prof.is_ready() {
+            let score = score_if_ready.unwrap_or_else(|| cosine(&prof.centroid, &emb));
             if score >= UPDATE_THR {
-                let alpha = (secs / (self.total_secs + secs).max(1e-6)).min(UPDATE_MAX_WEIGHT);
-                for (c, e) in self.centroid.iter_mut().zip(emb.iter()) {
+                let alpha = (secs / (prof.total_secs + secs).max(1e-6)).min(UPDATE_MAX_WEIGHT);
+                for (c, e) in prof.centroid.iter_mut().zip(emb.iter()) {
                     *c = *c * (1.0 - alpha) + *e * alpha;
                 }
-                self.centroid = l2_normalize(&self.centroid);
-                self.total_secs += secs;
-                self.segments += 1;
+                prof.centroid = l2_normalize(&prof.centroid);
+                prof.total_secs += secs;
+                prof.segments += 1;
             }
         } else {
-            self.candidates.push((emb, secs));
-            self.try_finalize();
+            // 新语种档注册：已有就绪档时须过「非背景人」闸。
+            if let Some(b) = best_ready {
+                if b < NEW_LANG_MIN_SCORE {
+                    return;
+                }
+            }
+            prof.candidates.push((emb, secs));
+            Self::try_finalize(prof);
         }
     }
 
-    /// 候选定稿：候选达标后算质心、剔除离群、复检（防开头混入他人）。
-    fn try_finalize(&mut self) {
-        let total: f32 = self.candidates.iter().map(|(_, s)| s).sum();
-        if total < ENROLL_MIN_SECS || self.candidates.len() < ENROLL_MIN_SEGS as usize {
+    /// 单档候选定稿：候选达标后算质心、剔除离群、复检（防开头混入他人）。
+    fn try_finalize(prof: &mut LangProfile) {
+        let total: f32 = prof.candidates.iter().map(|(_, s)| s).sum();
+        if total < ENROLL_MIN_SECS || prof.candidates.len() < ENROLL_MIN_SEGS as usize {
             return;
         }
-        let embs: Vec<Vec<f32>> = self.candidates.iter().map(|(e, _)| e.clone()).collect();
+        let embs: Vec<Vec<f32>> = prof.candidates.iter().map(|(e, _)| e.clone()).collect();
         let c0 = centroid_of(&embs);
         let mut kept: Vec<(Vec<f32>, f32)> = Vec::new();
-        for (e, s) in self.candidates.drain(..) {
+        for (e, s) in prof.candidates.drain(..) {
             if cosine(&c0, &e) >= ENROLL_OUTLIER_THR {
                 kept.push((e, s));
             }
         }
         let kept_total: f32 = kept.iter().map(|(_, s)| s).sum();
         if kept_total >= ENROLL_MIN_SECS && kept.len() >= ENROLL_MIN_SEGS as usize {
-            self.centroid = centroid_of(&kept.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>());
-            self.total_secs = kept_total;
-            self.segments = kept.len() as u32;
+            let ce: Vec<Vec<f32>> = kept.iter().map(|(e, _)| e.clone()).collect();
+            prof.centroid = centroid_of(&ce);
+            prof.total_secs = kept_total;
+            prof.segments = kept.len() as u32;
         } else {
             // 未达标：保留剔除后的候选继续积累（本次剔除的离群段已丢弃）。
-            self.candidates = kept;
+            prof.candidates = kept;
         }
     }
 
-    /// 读档；版本 / 模型名不符或解析失败 ⇒ 空（丢弃重建）。
+    /// 读档；**模型名不符**（向量空间不同）或解析失败 ⇒ 空（丢弃重建，日志说明）。
+    /// 版本升级（v1→v2）⇒ **迁移不丢弃**（v1 单档 → `und`）。
     pub(crate) fn load(path: &Path) -> Self {
         let Ok(text) = std::fs::read_to_string(path) else {
             return Self::default();
@@ -288,37 +358,75 @@ impl Voiceprint {
             );
             return Self::default();
         };
-        if p.version != FORMAT_VERSION || p.model != MODEL_TAG || p.centroid.is_empty() {
-            log::info!(
-                "speaker: voiceprint discarded (version={} model={} expected={})",
-                p.version,
+        if p.model != MODEL_TAG {
+            log::warn!(
+                "speaker: voiceprint model mismatch ({} vs {}); rebuild (vector space differs)",
                 p.model,
                 MODEL_TAG
             );
             return Self::default();
         }
-        Self {
-            centroid: p.centroid,
-            total_secs: p.total_secs,
-            segments: p.segments,
-            candidates: Vec::new(),
+        let mut vp = Self::default();
+        if p.version >= FORMAT_VERSION {
+            for (lang, pp) in p.profiles {
+                if !pp.centroid.is_empty() {
+                    vp.profiles.insert(
+                        lang,
+                        LangProfile {
+                            centroid: pp.centroid,
+                            total_secs: pp.total_secs,
+                            segments: pp.segments,
+                            candidates: Vec::new(),
+                        },
+                    );
+                }
+            }
+        } else if !p.centroid.is_empty() {
+            // v1 单档 ⇒ 迁移到 `und`，不丢弃。
+            log::info!("speaker: migrating v1 voiceprint to per-language format ({MIGRATED_LANG})");
+            vp.profiles.insert(
+                MIGRATED_LANG.to_string(),
+                LangProfile {
+                    centroid: p.centroid,
+                    total_secs: p.total_secs,
+                    segments: p.segments,
+                    candidates: Vec::new(),
+                },
+            );
         }
+        vp
     }
 
-    /// 存档（best-effort；失败仅 warn，不影响运行）。
+    /// 存档（best-effort；失败仅 warn，不影响运行）。只落**已就绪**档。
     pub(crate) fn save(&self, path: &Path) {
-        if !self.is_ready() {
+        if !self.has_any_ready() {
             return; // 未就绪不落盘（避免半成品档）
         }
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        let profiles: BTreeMap<String, PersistedProfile> = self
+            .profiles
+            .iter()
+            .filter(|(_, p)| p.is_ready())
+            .map(|(k, p)| {
+                (
+                    k.clone(),
+                    PersistedProfile {
+                        centroid: p.centroid.clone(),
+                        total_secs: p.total_secs,
+                        segments: p.segments,
+                    },
+                )
+            })
+            .collect();
         let p = PersistedVp {
             version: FORMAT_VERSION,
             model: MODEL_TAG.to_string(),
-            centroid: self.centroid.clone(),
-            total_secs: self.total_secs,
-            segments: self.segments,
+            profiles,
+            centroid: Vec::new(),
+            total_secs: 0.0,
+            segments: 0,
         };
         match serde_json::to_string(&p) {
             Ok(s) => {
@@ -329,29 +437,291 @@ impl Voiceprint {
             Err(e) => log::warn!("speaker: voiceprint serialize failed: {e}"),
         }
     }
+}
 
-    /// 声纹默认存储路径（调用方通常用配置目录；408B 用 wordbook 同级）。
-    pub(crate) fn default_path(config_dir: &Path) -> PathBuf {
-        config_dir.join("voiceprint.json")
+/// 单语种存档（JSON）。
+#[derive(Serialize, Deserialize, Default)]
+struct PersistedProfile {
+    #[serde(default)]
+    centroid: Vec<f32>,
+    #[serde(default)]
+    total_secs: f32,
+    #[serde(default)]
+    segments: u32,
+}
+
+/// 声纹存档（JSON；按语种分档；仅质心/时长/段数，**不含任何音频**）。
+#[derive(Serialize, Deserialize)]
+struct PersistedVp {
+    version: u32,
+    model: String,
+    /// v2：按语种分档。
+    #[serde(default)]
+    profiles: BTreeMap<String, PersistedProfile>,
+    // v1 遗留单档字段（仅用于迁移；v2 序列化为空）。
+    #[serde(default)]
+    centroid: Vec<f32>,
+    #[serde(default)]
+    total_secs: f32,
+    #[serde(default)]
+    segments: u32,
+}
+
+// ===========================================================================
+// SPEAKER-VERIFY-408B：进程级状态 + 单窗判定（接入本地实时路B）
+// ===========================================================================
+
+/// 进程级声纹状态（懒加载一次；`saved_total_secs` 为节流写盘水位）。
+struct ProcessVp {
+    vp: Voiceprint,
+    saved_total_secs: f32,
+}
+
+/// 进程级声纹（跨窗 / 跨录音复用）。
+static VOICEPRINT: Mutex<Option<ProcessVp>> = Mutex::new(None);
+
+thread_local! {
+    /// 提取器**线程级**懒加载（仿 `LOCALRT_TRIM_VAD`）：外层 = 是否已尝试，内层 = 是否可用。
+    static SPEAKER_EXTRACTOR: std::cell::RefCell<Option<Option<SpeakerVerifier>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// 声纹存档路径：`<exe 目录>/voiceprint.bin`（与 `wordbook.sqlite` 同目录约定）。
+pub(crate) fn voiceprint_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("voiceprint.bin")
+}
+
+/// 每区间判定明细（日志用）。
+pub(crate) struct RangeJudgement {
+    pub start: usize,
+    pub end: usize,
+    pub secs: f32,
+    pub verdict: SegVerdict,
+    pub score: f32,
+}
+
+/// 408B：延后到解码后落地的注册/漂移 offer（需窗口语种 L）。
+pub(crate) struct PendingOffer {
+    pub emb: Vec<f32>,
+    pub secs: f32,
+    pub score_if_ready: Option<f32>,
+}
+
+/// 408B 声纹过滤结果（解码前判定；供调用方 trim / 日志 / 406 放宽 / 注册）。
+pub(crate) struct VoiceprintFilter {
+    pub kept: Vec<(usize, usize)>,
+    pub kept_secs: f32,
+    pub dropped_secs: f32,
+    /// 是否有任一已就绪档（无 ⇒ 全部保留）。
+    pub any_ready: bool,
+    pub enrolled_secs: f32,
+    pub details: Vec<RangeJudgement>,
+    /// 注册/漂移 offer（延后到解码后 `commit_voiceprint_offers`，带 L）。
+    pub pending_offers: Vec<PendingOffer>,
+}
+
+fn secs_of(ranges: &[(usize, usize)]) -> f32 {
+    ranges
+        .iter()
+        .map(|(s, e)| (e - s) as f32 / SAMPLE_RATE as f32)
+        .sum()
+}
+
+fn verdict_score(v: SegVerdict) -> f32 {
+    match v {
+        SegVerdict::KeepUser(s) | SegVerdict::DropNonUser(s) => s,
+        _ => 0.0,
     }
 }
 
+/// SPEAKER-VERIFY-408B ①：**解码前**判定 —— 每 ≥2s 区间与**本人所有已就绪档**逐一比、取最高分；
+/// ≥一档就绪且最高分 < [`DROP_THR`] ⇒ 剔除（无就绪档 ⇒ 全部保留）。
+///
+/// 模型缺失 ⇒ 原样返回（功能静默关闭）。注册/漂移延后到解码后（需 L）⇒ 只收集本窗新片的
+/// **保留**区间 `pending_offers`。
+pub(crate) fn filter_ranges_by_voiceprint(
+    samples: &[f32],
+    ranges: &[(usize, usize)],
+    new_slice_from: usize,
+) -> VoiceprintFilter {
+    if ranges.is_empty() {
+        return VoiceprintFilter {
+            kept: Vec::new(),
+            kept_secs: 0.0,
+            dropped_secs: 0.0,
+            any_ready: false,
+            enrolled_secs: 0.0,
+            details: Vec::new(),
+            pending_offers: Vec::new(),
+        };
+    }
+    SPEAKER_EXTRACTOR.with(|cell| {
+        let mut details: Vec<RangeJudgement> = Vec::new();
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(SpeakerVerifier::load(&super::model_dir()));
+        }
+        let Some(verifier) = slot.as_ref().and_then(|o| o.as_ref()) else {
+            return VoiceprintFilter {
+                kept: ranges.to_vec(),
+                kept_secs: secs_of(ranges),
+                dropped_secs: 0.0,
+                any_ready: false,
+                enrolled_secs: 0.0,
+                details,
+                pending_offers: Vec::new(),
+            };
+        };
+        let mut guard = VOICEPRINT.lock().unwrap_or_else(|e| e.into_inner());
+        let proc = guard.get_or_insert_with(|| ProcessVp {
+            vp: Voiceprint::load(&voiceprint_path()),
+            saved_total_secs: 0.0,
+        });
+        let mut verdicts: Vec<SegVerdict> = Vec::with_capacity(ranges.len());
+        let mut embs: Vec<Option<Vec<f32>>> = Vec::with_capacity(ranges.len());
+        for &(start, end) in ranges {
+            let secs = (end - start) as f32 / SAMPLE_RATE as f32;
+            if secs < MIN_JUDGE_SECS {
+                verdicts.push(SegVerdict::KeepShort);
+                embs.push(None);
+                continue;
+            }
+            let emb = verifier.embed(&samples[start..end]);
+            let v = judge_voiceprint(&proc.vp, emb.as_deref(), secs);
+            verdicts.push(v);
+            embs.push(emb);
+        }
+        let (kept, kept_secs, dropped_secs) = partition_ranges(ranges, &verdicts);
+        let mut pending_offers: Vec<PendingOffer> = Vec::new();
+        for (i, &(start, end)) in ranges.iter().enumerate() {
+            if start < new_slice_from {
+                continue;
+            }
+            let secs = (end - start) as f32 / SAMPLE_RATE as f32;
+            if let Some(e) = embs[i].as_deref() {
+                match verdicts[i] {
+                    SegVerdict::KeepUser(s) => pending_offers.push(PendingOffer {
+                        emb: e.to_vec(),
+                        secs,
+                        score_if_ready: Some(s),
+                    }),
+                    SegVerdict::KeepNotReady => pending_offers.push(PendingOffer {
+                        emb: e.to_vec(),
+                        secs,
+                        score_if_ready: None,
+                    }),
+                    _ => {}
+                }
+            }
+        }
+        for (i, &(start, end)) in ranges.iter().enumerate() {
+            let secs = (end - start) as f32 / SAMPLE_RATE as f32;
+            details.push(RangeJudgement {
+                start,
+                end,
+                secs,
+                verdict: verdicts[i],
+                score: verdict_score(verdicts[i]),
+            });
+        }
+        VoiceprintFilter {
+            kept,
+            kept_secs,
+            dropped_secs,
+            any_ready: proc.vp.has_any_ready(),
+            enrolled_secs: proc.vp.total_ready_secs(),
+            details,
+            pending_offers,
+        }
+    })
+}
+
+/// SPEAKER-VERIFY-408B ④：把本窗 offer 落地进 **L 档**（带窗口语种），并节流写盘。
+///
+/// 延后到解码后调用（L 来自模型前缀或解码文本字符集）。
+pub(crate) fn commit_voiceprint_offers(offers: &[PendingOffer], lang: Option<&str>) {
+    if offers.is_empty() {
+        return;
+    }
+    let mut guard = VOICEPRINT.lock().unwrap_or_else(|e| e.into_inner());
+    let proc = guard.get_or_insert_with(|| ProcessVp {
+        vp: Voiceprint::load(&voiceprint_path()),
+        saved_total_secs: 0.0,
+    });
+    for o in offers {
+        proc.vp.offer(&o.emb, o.secs, o.score_if_ready, lang);
+    }
+    if proc.vp.has_any_ready() && proc.vp.total_ready_secs() - proc.saved_total_secs >= 5.0 {
+        proc.vp.save(&voiceprint_path());
+        proc.saved_total_secs = proc.vp.total_ready_secs();
+    }
+}
+
+/// SPEAKER-VERIFY-408B ③：进程级声纹**该语种档是否已就绪**。须在**本窗 offer 之前**查询
+///（用于「L 档未就绪 ⇒ 原 ranges 重解」）。
+pub(crate) fn voiceprint_lang_ready(lang: &str) -> bool {
+    let mut guard = VOICEPRINT.lock().unwrap_or_else(|e| e.into_inner());
+    let proc = guard.get_or_insert_with(|| ProcessVp {
+        vp: Voiceprint::load(&voiceprint_path()),
+        saved_total_secs: 0.0,
+    });
+    proc.vp.lang_ready(lang)
+}
+
+/// 纯逻辑：按逐区间判定划分 keep / drop（`<2s` 的 `KeepShort` 由调用方先算好）。
+///
+/// 返回 `(保留区间, 保留秒数, 剔除秒数)`。判定数组缺位 ⇒ 保守保留。
+pub(crate) fn partition_ranges(
+    ranges: &[(usize, usize)],
+    verdicts: &[SegVerdict],
+) -> (Vec<(usize, usize)>, f32, f32) {
+    let mut kept = Vec::new();
+    let mut kept_secs = 0.0f32;
+    let mut dropped_secs = 0.0f32;
+    for (i, &(s, e)) in ranges.iter().enumerate() {
+        let secs = (e - s) as f32 / SAMPLE_RATE as f32;
+        match verdicts.get(i).copied().unwrap_or(SegVerdict::KeepShort) {
+            SegVerdict::DropNonUser(_) => dropped_secs += secs,
+            _ => {
+                kept.push((s, e));
+                kept_secs += secs;
+            }
+        }
+    }
+    (kept, kept_secs, dropped_secs)
+}
+
+// =====================================================================
+// 测试
+// =====================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 造一个与 `centroid=[1,0]` 余弦恰为 `c` 的单位向量（二维足够）。
     fn unit_with_cos(c: f32) -> Vec<f32> {
         let s = (1.0 - c * c).max(0.0).sqrt();
         vec![c, s]
     }
+    /// 单语种已就绪声纹（`lang` 档）。
+    fn vp_ready_lang(lang: &str, centroid: Vec<f32>) -> Voiceprint {
+        let mut vp = Voiceprint::default();
+        vp.profiles.insert(
+            lang.to_string(),
+            LangProfile {
+                centroid,
+                total_secs: ENROLL_MIN_SECS,
+                segments: ENROLL_MIN_SEGS,
+                candidates: Vec::new(),
+            },
+        );
+        vp
+    }
     fn vp_ready(centroid: Vec<f32>) -> Voiceprint {
-        Voiceprint {
-            centroid,
-            total_secs: ENROLL_MIN_SECS,
-            segments: ENROLL_MIN_SEGS,
-            candidates: Vec::new(),
-        }
+        vp_ready_lang("zh", centroid)
     }
 
     #[test]
@@ -359,7 +729,6 @@ mod tests {
         assert!((cosine(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
         assert!(cosine(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
         assert!(cosine(&[1.0, 0.0], &[-1.0, 0.0]) + 1.0 < 1e-6);
-        // 长度不等 / 空 ⇒ 0（不 panic）
         assert_eq!(cosine(&[1.0], &[1.0, 2.0]), 0.0);
         assert_eq!(cosine(&[], &[]), 0.0);
     }
@@ -371,14 +740,13 @@ mod tests {
             judge(&vp, Some(&unit_with_cos(0.1)), 1.9, Some("zh")),
             SegVerdict::KeepShort
         );
-        // 即便语言不支持，<2s 仍是 KeepShort（顺序：短段优先）。
         assert_eq!(judge(&vp, None, 0.5, Some("ja")), SegVerdict::KeepShort);
     }
 
     #[test]
     fn judge_not_ready_is_kept() {
         let vp = Voiceprint::default();
-        assert!(!vp.is_ready());
+        assert!(!vp.has_any_ready());
         assert_eq!(
             judge(&vp, Some(&unit_with_cos(0.1)), 3.0, Some("zh")),
             SegVerdict::KeepNotReady
@@ -388,7 +756,6 @@ mod tests {
     #[test]
     fn judge_ja_or_unknown_language_is_kept() {
         let vp = vp_ready(vec![1.0, 0.0]);
-        // 高置信非本人，但语言不支持 ⇒ 仍保留。
         assert_eq!(
             judge(&vp, Some(&unit_with_cos(0.1)), 3.0, Some("ja")),
             SegVerdict::KeepLanguage
@@ -410,7 +777,6 @@ mod tests {
             SegVerdict::KeepUser(s) => assert!((s - 0.6).abs() < 1e-3),
             other => panic!("0.6 应 KeepUser，实测 {other:?}"),
         }
-        // 恰好阈值：0.45 不算 Drop（>= DROP_THR 保留）。
         assert!(matches!(
             judge(&vp, Some(&unit_with_cos(DROP_THR)), 3.0, Some("zh")),
             SegVerdict::KeepUser(_)
@@ -421,81 +787,75 @@ mod tests {
     fn enrollment_needs_min_secs_and_segs() {
         let e = l2_normalize(&[1.0, 0.0]);
         let mut vp = Voiceprint::default();
-        // 2 段共 12s：段数不足。
-        vp.offer(&e, 6.0, None);
-        vp.offer(&e, 6.0, None);
-        assert!(!vp.is_ready(), "2 段 < ENROLL_MIN_SEGS");
-        // 3 段共 6s：时长不足。
+        vp.offer(&e, 6.0, None, Some("zh"));
+        vp.offer(&e, 6.0, None, Some("zh"));
+        assert!(!vp.has_any_ready(), "2 段 < ENROLL_MIN_SEGS");
         let mut vp2 = Voiceprint::default();
-        vp2.offer(&e, 2.0, None);
-        vp2.offer(&e, 2.0, None);
-        vp2.offer(&e, 2.0, None);
-        assert!(!vp2.is_ready(), "6s < ENROLL_MIN_SECS");
-        // 3 段共 12s：就绪。
+        vp2.offer(&e, 2.0, None, Some("zh"));
+        vp2.offer(&e, 2.0, None, Some("zh"));
+        vp2.offer(&e, 2.0, None, Some("zh"));
+        assert!(!vp2.has_any_ready(), "6s < ENROLL_MIN_SECS");
         let mut vp3 = Voiceprint::default();
-        vp3.offer(&e, 4.0, None);
-        vp3.offer(&e, 4.0, None);
-        vp3.offer(&e, 4.0, None);
-        assert!(vp3.is_ready(), "12s/3 段应就绪");
+        vp3.offer(&e, 4.0, None, Some("zh"));
+        vp3.offer(&e, 4.0, None, Some("zh"));
+        vp3.offer(&e, 4.0, None, Some("zh"));
+        assert!(vp3.has_any_ready(), "12s/3 段应就绪");
+        assert!(vp3.lang_ready("zh") && !vp3.lang_ready("en"));
     }
 
     #[test]
     fn enrollment_outlier_removed_and_still_ready() {
         let e = l2_normalize(&[1.0, 0.0]);
         let mut vp = Voiceprint::default();
-        // 4 段本人（各 5s）+ 1 段离群（他人，与本人 cos≈0，4s）。
-        vp.offer(&e, 5.0, None);
-        vp.offer(&e, 5.0, None);
-        vp.offer(&e, 5.0, None);
-        vp.offer(&unit_with_cos(0.0), 4.0, None);
-        vp.offer(&e, 5.0, None); // 触发定稿
-        assert!(vp.is_ready(), "剔除离群后 4×5s 应就绪");
-        // 质心仍接近本人。
-        assert!(cosine(&vp.centroid, &e) > 0.99, "离群段不应污染质心");
+        vp.offer(&e, 5.0, None, Some("zh"));
+        vp.offer(&e, 5.0, None, Some("zh"));
+        vp.offer(&e, 5.0, None, Some("zh"));
+        vp.offer(&unit_with_cos(0.0), 4.0, None, Some("zh"));
+        vp.offer(&e, 5.0, None, Some("zh"));
+        assert!(vp.has_any_ready());
+        assert!(cosine(vp.ready_centroid("zh").unwrap(), &e) > 0.99);
     }
 
     #[test]
     fn enrollment_outlier_removed_but_not_ready() {
         let e = l2_normalize(&[1.0, 0.0]);
         let mut vp = Voiceprint::default();
-        // 本人仅 2 段 ×3s =6s，加 1 段离群 ⇒ 剔除后 6s/2 段，不达标。
-        vp.offer(&e, 3.0, None);
-        vp.offer(&unit_with_cos(0.0), 5.0, None);
-        vp.offer(&e, 3.0, None);
-        assert!(!vp.is_ready(), "剔除离群后 6s/2 段 < 门槛");
+        vp.offer(&e, 3.0, None, Some("zh"));
+        vp.offer(&unit_with_cos(0.0), 5.0, None, Some("zh"));
+        vp.offer(&e, 3.0, None, Some("zh"));
+        assert!(!vp.has_any_ready(), "剔除离群后 6s/2 段 < 门槛");
     }
 
     #[test]
     fn drift_low_score_no_update_high_score_updates_with_cap() {
         let e = l2_normalize(&[1.0, 0.0]);
         let mut vp = vp_ready(e.clone());
-        let before = vp.centroid.clone();
-        // 低分（<UPDATE_THR）不更新，也不增时长/段数。
-        vp.offer(&unit_with_cos(0.5), 10.0, Some(0.5));
-        assert_eq!(vp.centroid, before, "低分段不得更新质心");
-        assert_eq!(vp.segments, ENROLL_MIN_SEGS);
-        // 高分（≥UPDATE_THR）更新：质心朝新段移动。
+        let before = vp.profiles.get("zh").unwrap().centroid.clone();
+        vp.offer(&unit_with_cos(0.5), 10.0, Some(0.5), Some("zh"));
+        assert_eq!(vp.profiles.get("zh").unwrap().centroid, before);
+        assert_eq!(vp.profiles.get("zh").unwrap().segments, ENROLL_MIN_SEGS);
         let target = unit_with_cos(0.95);
-        vp.offer(&target, 6.0, Some(0.95));
-        assert_eq!(vp.segments, ENROLL_MIN_SEGS + 1);
-        let moved = cosine(&vp.centroid, &target) > cosine(&before, &target);
+        vp.offer(&target, 6.0, Some(0.95), Some("zh"));
+        assert_eq!(vp.profiles.get("zh").unwrap().segments, ENROLL_MIN_SEGS + 1);
+        let moved = cosine(vp.profiles.get("zh").unwrap().centroid.as_slice(), &target)
+            > cosine(&before, &target);
         assert!(moved, "高分段应把质心拉向自己");
-        // 权重上限：就算喂一段超长音频，单次 α ≤ UPDATE_MAX_WEIGHT。
         let e2 = l2_normalize(&[1.0, 0.0]);
         let mut vp2 = vp_ready(e2.clone());
-        let before2 = vp2.centroid.clone();
-        vp2.offer(&unit_with_cos(0.0), 100_000.0, Some(1.0));
-        let alpha_eff = 1.0 - cosine(&before2, &vp2.centroid); // 粗略：移动幅度受 α 限
-        assert!(
-            alpha_eff <= UPDATE_MAX_WEIGHT + 1e-3,
-            "单段权重须≤上限，实测 {alpha_eff}"
-        );
+        let before2 = vp2.profiles.get("zh").unwrap().centroid.clone();
+        vp2.offer(&unit_with_cos(0.0), 100_000.0, Some(1.0), Some("zh"));
+        let alpha_eff = 1.0
+            - cosine(
+                &before2,
+                vp2.profiles.get("zh").unwrap().centroid.as_slice(),
+            );
+        assert!(alpha_eff <= UPDATE_MAX_WEIGHT + 1e-3);
     }
 
     #[test]
     fn persisted_load_discards_on_model_mismatch() {
         let dir = std::env::temp_dir().join(format!(
-            "voice-ime-spk-408a-{}",
+            "voice-ime-spk-408b-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -503,33 +863,24 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("voiceprint.json");
-        // 好档：写后读回就绪。
         let mut vp = vp_ready(l2_normalize(&[1.0, 0.0]));
-        vp.total_secs = 20.0;
+        vp.profiles.get_mut("zh").unwrap().total_secs = 20.0;
         vp.save(&path);
         let back = Voiceprint::load(&path);
-        assert!(back.is_ready(), "正常档读回应就绪");
-        assert!((back.total_secs - 20.0).abs() < 1e-3);
-        // 模型名不符 ⇒ 丢弃（空）。
+        assert!(back.has_any_ready() && back.lang_ready("zh"));
         let bad = format!(
-            "{{\"version\":{},\"model\":\"OLD\",\"centroid\":[1.0,0.0],\"total_secs\":20.0,\"segments\":5}}",
-            FORMAT_VERSION
+            "{{\"version\":{FORMAT_VERSION},\"model\":\"OLD\",\"profiles\":{{\"zh\":{{\"centroid\":[1.0,0.0],\"total_secs\":20.0,\"segments\":5}}}}}}"
         );
         std::fs::write(&path, bad).unwrap();
-        assert!(!Voiceprint::load(&path).is_ready(), "模型名不符应丢弃");
-        // 版本不符 ⇒ 丢弃。
-        std::fs::write(&path, "{\"version\":999,\"model\":\"campplus-zh_en-16k-common-advanced-v1\",\"centroid\":[1.0,0.0],\"total_secs\":20.0,\"segments\":5}").unwrap();
-        assert!(!Voiceprint::load(&path).is_ready(), "版本不符应丢弃");
-        // 坏 JSON ⇒ 丢弃不 panic。
+        assert!(!Voiceprint::load(&path).has_any_ready(), "模型名不符应丢弃");
         std::fs::write(&path, "not json").unwrap();
-        assert!(!Voiceprint::load(&path).is_ready());
+        assert!(!Voiceprint::load(&path).has_any_ready());
         std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `#[ignore]` 真模型：加载 + embed 正常（本人 vs 他人 score），贴耗时。
-    /// 运行：`cargo test --bin poc_speaker_408 -- --ignored --nocapture spk408_real_model`
     #[test]
-    #[ignore = "requires CAM++ model + wav; cargo test --bin poc_speaker_408 -- --ignored --nocapture spk408_real_model"]
+    #[ignore = "requires CAM++ model + wav; cargo test --bin feiyin-ime -- --ignored --nocapture spk408_real_model"]
     fn spk408_real_model() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let model_dir = root.join("models");
@@ -555,7 +906,7 @@ mod tests {
         let dt = t.elapsed().as_secs_f64() * 1000.0;
         let self_cos = cosine(&e1, &e2);
         println!(
-            "\n[408A] dim={} 本人 para1 vs para2 cos={:.3}  (embed×2 {:.0}ms)",
+            "\n[408] dim={} 本人 para1 vs para2 cos={:.3}  (embed×2 {:.0}ms)",
             e1.len(),
             self_cos,
             dt
@@ -573,41 +924,99 @@ mod tests {
         }
         assert!(self_cos > DROP_THR, "本人自相似应高于剔除阈");
     }
+
+    /// `#[ignore]` 真模型：注册本人声纹后，**本人段保留、他人段被剔**（408B 判定链）。
+    /// 运行：`cargo test --bin feiyin-ime -- --ignored --nocapture spk408b_real_window`
+    #[test]
+    #[ignore = "requires CAM++ model + wav; cargo test --bin feiyin-ime -- --ignored --nocapture spk408b_real_window"]
+    fn spk408b_real_window() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let Some(v) = SpeakerVerifier::load(&root.join("models")) else {
+            eprintln!("skip: 模型不在位");
+            return;
+        };
+        let read = |p: &Path| {
+            sherpa_onnx::Wave::read(p.to_str().unwrap_or("")).map(|w| w.samples().to_vec())
+        };
+        let g = root.join("collab/research/audio-real-gavin/processed");
+        let self_a = read(&g.join("para1.wav")).expect("para1");
+        let self_b = read(&g.join("para2.wav")).expect("para2");
+        let other =
+            read(&root.join("models/speaker-408-scratch/leijun-test-sr-1.wav")).expect("leijun");
+        let (ea, eb, eo) = (
+            v.embed(&self_a).expect("embed self_a"),
+            v.embed(&self_b).expect("embed self_b"),
+            v.embed(&other).expect("embed other"),
+        );
+        // 注册本人（zh 档）。
+        let mut vp = Voiceprint::default();
+        for _ in 0..2 {
+            vp.offer(&ea, self_a.len() as f32 / 16000.0, None, Some("zh"));
+            vp.offer(&eb, self_b.len() as f32 / 16000.0, None, Some("zh"));
+        }
+        assert!(vp.lang_ready("zh"), "本人注册应就绪");
+        // 判定：本人 KeepUser、他人 DropNonUser。
+        let keep_self = matches!(
+            judge_voiceprint(&vp, Some(&ea), 3.0),
+            SegVerdict::KeepUser(_)
+        );
+        let drop_other = matches!(
+            judge_voiceprint(&vp, Some(&eo), 3.0),
+            SegVerdict::DropNonUser(_)
+        );
+        println!(
+            "\n[408B] self_cos={:.3} other_cos={:.3}",
+            vp.max_score_ready(&ea).unwrap(),
+            vp.max_score_ready(&eo).unwrap()
+        );
+        assert!(keep_self, "本人段应保留");
+        assert!(drop_other, "他人段应剔除");
+        // 区间划分：本人 + 他人 ⇒ 仅他人被剔。
+        let ranges = [
+            (0usize, self_a.len()),
+            (self_a.len(), self_a.len() + other.len()),
+        ];
+        let verdicts = [
+            judge_voiceprint(&vp, Some(&ea), self_a.len() as f32 / 16000.0),
+            judge_voiceprint(&vp, Some(&eo), other.len() as f32 / 16000.0),
+        ];
+        let (kept, _, dropped) = partition_ranges(&ranges, &verdicts);
+        assert_eq!(kept, vec![(0, self_a.len())]);
+        assert!(dropped > 0.0);
+    }
 }
 
 // =====================================================================
-// TEST-SYNC-408A（阶段三 · 非作者护栏，coder-2）
-// ---------------------------------------------------------------------
-// 按**设计契约**编写，不照抄实现；作者是 coder-1（408A）。仅追加本 `#[cfg(test)]` 模块，
-// 生产代码零改动。契约出处：`SPEAKER-VERIFY-408A` 设计（主控定）与 `speaker.rs` 各常量注释。
-// 白名单：本单只跑 `rustfmt` + `cargo check --all-targets`（测试执行由 tester-1 做）。
+// TEST-SYNC-408A（阶段三 · 非作者护栏，coder-2）—— 已按 408B 多语种档适配
 // =====================================================================
 #[cfg(test)]
 mod testsync408a_tests {
     use super::*;
 
-    /// 第 i 个坐标轴的单位向量（任意维）。
     fn unit(axis: usize, dim: usize) -> Vec<f32> {
         let mut v = vec![0f32; dim];
         v[axis] = 1.0;
         v
     }
-    /// 与 `[1,0]` 余弦恰为 `c` 的单位向量（`cosine` 实测 ≈ c）。
     fn at_cos(c: f32) -> Vec<f32> {
         vec![c, (1.0 - c * c).max(0.0).sqrt()]
     }
-    /// 直接构造「已就绪」声纹（质心给定）；非就绪状态用 `Voiceprint::default()`。
-    fn ready(centroid: Vec<f32>) -> Voiceprint {
-        Voiceprint {
-            centroid,
-            total_secs: ENROLL_MIN_SECS,
-            segments: ENROLL_MIN_SEGS,
-            candidates: Vec::new(),
-        }
+    fn ready_lang(lang: &str, centroid: Vec<f32>) -> Voiceprint {
+        let mut vp = Voiceprint::default();
+        vp.profiles.insert(
+            lang.to_string(),
+            LangProfile {
+                centroid,
+                total_secs: ENROLL_MIN_SECS,
+                segments: ENROLL_MIN_SEGS,
+                candidates: Vec::new(),
+            },
+        );
+        vp
     }
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!(
-            "voice-ime-spk-sync408a-{tag}-{}",
+            "voice-ime-spk-sync408-{tag}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -617,17 +1026,12 @@ mod testsync408a_tests {
         d
     }
 
-    // ---------- 契约点 1：判定顺序与边界（judge） ----------
-
-    /// 契约 1：短段门优先于一切 —— 1.9s 即便「ja + 已就绪 + 非本人分数」也 KeepShort；
-    /// 未就绪 + 无 emb + 1.5s 同样 KeepShort。
     #[test]
     fn ts408a_judge_short_beats_all() {
-        let vp = ready(unit(0, 2));
+        let vp = ready_lang("zh", unit(0, 2));
         assert_eq!(
             judge(&vp, Some(&at_cos(0.0)), 1.9, Some("ja")),
-            SegVerdict::KeepShort,
-            "短段优先于语言/就绪/分数"
+            SegVerdict::KeepShort
         );
         assert_eq!(
             judge(&Voiceprint::default(), None, 1.5, Some("ja")),
@@ -635,26 +1039,19 @@ mod testsync408a_tests {
         );
     }
 
-    /// 契约 1 边界：**恰 `MIN_JUDGE_SECS`(2.0s) 进入判定**；1.999s 仍在短段门内。
     #[test]
     fn ts408a_judge_exact_2s_enters_judgment() {
-        let vp = ready(unit(0, 2));
-        assert!(
-            matches!(
-                judge(&vp, Some(&at_cos(0.3)), MIN_JUDGE_SECS, Some("zh")),
-                SegVerdict::DropNonUser(_)
-            ),
-            "恰 2.0s 应进入判定（0.3 < 0.45 ⇒ 剔除）"
-        );
+        let vp = ready_lang("zh", unit(0, 2));
+        assert!(matches!(
+            judge(&vp, Some(&at_cos(0.3)), MIN_JUDGE_SECS, Some("zh")),
+            SegVerdict::DropNonUser(_)
+        ));
         assert_eq!(
             judge(&vp, Some(&at_cos(0.3)), MIN_JUDGE_SECS - 0.001, Some("zh")),
-            SegVerdict::KeepShort,
-            "1.999s 仍判短段"
+            SegVerdict::KeepShort
         );
     }
 
-    /// 契约 1 顺序：**语言门先于就绪门** —— 未就绪 + ja/未知 ⇒ KeepLanguage（非 KeepNotReady）；
-    /// 未就绪 + zh ⇒ KeepNotReady。
     #[test]
     fn ts408a_judge_language_beats_readiness() {
         let d = Voiceprint::default();
@@ -672,62 +1069,38 @@ mod testsync408a_tests {
         );
     }
 
-    /// 契约 1 边界：**恰 `DROP_THR`(0.45) 不剔除**（`>=` 保留）；0.44 剔除。
     #[test]
     fn ts408a_judge_exact_drop_thr_is_kept() {
-        let vp = ready(unit(0, 2));
+        let vp = ready_lang("zh", unit(0, 2));
         let at_thr = at_cos(DROP_THR);
-        assert!(
-            cosine(&vp.centroid, &at_thr) >= DROP_THR,
-            "测试向量须准确落在阈值上（实测 {})",
-            cosine(&vp.centroid, &at_thr)
-        );
-        assert!(
-            matches!(
-                judge(&vp, Some(&at_thr), 3.0, Some("zh")),
-                SegVerdict::KeepUser(_)
-            ),
-            "恰 0.45 不得剔除"
-        );
-        assert!(
-            matches!(
-                judge(&vp, Some(&at_cos(DROP_THR - 0.01)), 3.0, Some("zh")),
-                SegVerdict::DropNonUser(_)
-            ),
-            "0.44 应剔除"
-        );
+        assert!(cosine(vp.ready_centroid("zh").unwrap(), &at_thr) >= DROP_THR);
+        assert!(matches!(
+            judge(&vp, Some(&at_thr), 3.0, Some("zh")),
+            SegVerdict::KeepUser(_)
+        ));
+        assert!(matches!(
+            judge(&vp, Some(&at_cos(DROP_THR - 0.01)), 3.0, Some("zh")),
+            SegVerdict::DropNonUser(_)
+        ));
     }
 
-    /// 契约 1（保守兜底）：已就绪但 emb 缺失（提取失败）⇒ 不剔除，返回 KeepNotReady。
     #[test]
     fn ts408a_judge_missing_embedding_keeps() {
-        let vp = ready(unit(0, 2));
-        assert_eq!(
-            judge(&vp, None, 3.0, Some("zh")),
-            SegVerdict::KeepNotReady,
-            "无 emb ⇒ 无法判定 ⇒ 保守保留"
-        );
+        let vp = ready_lang("zh", unit(0, 2));
+        assert_eq!(judge(&vp, None, 3.0, Some("zh")), SegVerdict::KeepNotReady);
     }
 
-    // ---------- 契约点 2：注册防污染 ----------
-
-    /// 契约 2：3 段本人 + 1 段他人（正交）⇒ 他人被剔除、仍就绪、质心≈本人；
-    /// 就绪后判该他人 ⇒ DropNonUser，判本人 ⇒ KeepUser。
     #[test]
     fn ts408a_enroll_drops_outlier_still_ready() {
         let e = unit(0, 2);
         let o = unit(1, 2);
         let mut vp = Voiceprint::default();
-        vp.offer(&e, 4.0, None);
-        vp.offer(&e, 4.0, None);
-        vp.offer(&o, 4.0, None); // 混入的他人
-        vp.offer(&e, 4.0, None); // 触发定稿
-        assert!(vp.is_ready(), "剔除离群后 3×4s 应就绪");
-        assert!(
-            cosine(&vp.centroid, &e) > 0.99,
-            "他人段不得污染质心（实测 {})",
-            cosine(&vp.centroid, &e)
-        );
+        vp.offer(&e, 4.0, None, Some("zh"));
+        vp.offer(&e, 4.0, None, Some("zh"));
+        vp.offer(&o, 4.0, None, Some("zh"));
+        vp.offer(&e, 4.0, None, Some("zh"));
+        assert!(vp.has_any_ready());
+        assert!(cosine(vp.ready_centroid("zh").unwrap(), &e) > 0.99);
         assert!(matches!(
             judge(&vp, Some(&o), 3.0, Some("zh")),
             SegVerdict::DropNonUser(_)
@@ -738,145 +1111,131 @@ mod testsync408a_tests {
         ));
     }
 
-    /// 契约 2：2 段本人 + 2 段**不同**他人（相互正交）⇒ 两他人皆离群被剔除，
-    /// 剩余 6s / 2 段 < 门槛 ⇒ 不就绪。
     #[test]
     fn ts408a_enroll_two_self_two_others_not_ready() {
         let e = unit(0, 3);
         let mut vp = Voiceprint::default();
-        vp.offer(&e, 3.0, None);
-        vp.offer(&unit(1, 3), 3.0, None);
-        vp.offer(&unit(2, 3), 3.0, None);
-        vp.offer(&e, 3.0, None); // 共 12s / 4 段 ⇒ 触发定稿
-        assert!(!vp.is_ready(), "剔除两他人后 6s/2 段 < 门槛");
+        vp.offer(&e, 3.0, None, Some("zh"));
+        vp.offer(&unit(1, 3), 3.0, None, Some("zh"));
+        vp.offer(&unit(2, 3), 3.0, None, Some("zh"));
+        vp.offer(&e, 3.0, None, Some("zh"));
+        assert!(!vp.has_any_ready(), "剔除两他人后 6s/2 段 < 门槛");
     }
 
-    /// 契约 2（**已知局限**）：候选**全部来自同一个他人**时，模块无先验本人声纹、无法区分，
-    /// 会把该人注册为「本人」。**这是设计局限而非缺陷** —— 本用例只钉住当前行为，不改实现。
     #[test]
     fn ts408a_enroll_all_same_other_is_known_limitation() {
         let o = unit(1, 2);
         let mut vp = Voiceprint::default();
-        vp.offer(&o, 5.0, None);
-        vp.offer(&o, 5.0, None);
-        vp.offer(&o, 5.0, None);
+        vp.offer(&o, 5.0, None, Some("zh"));
+        vp.offer(&o, 5.0, None, Some("zh"));
+        vp.offer(&o, 5.0, None, Some("zh"));
         assert!(
-            vp.is_ready(),
-            "全为同一他人 ⇒ 按设计会注册（已知局限，记录在案，非缺陷）"
+            vp.has_any_ready(),
+            "全为同一他人 ⇒ 按设计会注册（已知局限）"
         );
-        assert!(cosine(&vp.centroid, &o) > 0.99);
     }
 
-    // ---------- 契约点 3：漂移上限 + 低分不动 ----------
-
-    /// 契约 3：低分段（score < `UPDATE_THR`）**永不改变**质心（逐位）、也不增时长/段数。
     #[test]
     fn ts408a_drift_low_score_bitwise_unchanged() {
-        let mut vp = ready(unit(0, 2));
-        let before = vp.centroid.clone();
-        let (seg0, sec0) = (vp.segments, vp.total_secs);
-        vp.offer(&at_cos(0.5), 8.0, Some(0.5));
-        vp.offer(&unit(1, 2), 100.0, Some(0.0));
-        assert_eq!(vp.centroid, before, "低分段不得改变质心（逐位）");
-        assert_eq!(vp.segments, seg0);
-        assert_eq!(vp.total_secs, sec0);
+        let mut vp = ready_lang("zh", unit(0, 2));
+        let before = vp.profiles.get("zh").unwrap().centroid.clone();
+        let (seg0, sec0) = {
+            let p = vp.profiles.get("zh").unwrap();
+            (p.segments, p.total_secs)
+        };
+        vp.offer(&at_cos(0.5), 8.0, Some(0.5), Some("zh"));
+        vp.offer(&unit(1, 2), 100.0, Some(0.0), Some("zh"));
+        let p = vp.profiles.get("zh").unwrap();
+        assert_eq!(p.centroid, before, "低分段不得改变质心（逐位）");
+        assert_eq!(p.segments, seg0);
+        assert_eq!(p.total_secs, sec0);
     }
 
-    /// 契约 3：单段权重上限 `UPDATE_MAX_WEIGHT`(0.25) —— 喂一段超长音频（100000s）也只用 0.25，
-    /// 质心仍单位范数、单步角位移有界。
     #[test]
     fn ts408a_drift_single_step_bounded_by_max_weight() {
-        let mut vp = ready(unit(0, 2));
-        let before = vp.centroid.clone();
-        vp.offer(&unit(1, 2), 100_000.0, Some(1.0)); // 与 before 正交、分数满
-        let n: f32 = vp.centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let mut vp = ready_lang("zh", unit(0, 2));
+        let before = vp.profiles.get("zh").unwrap().centroid.clone();
+        vp.offer(&unit(1, 2), 100_000.0, Some(1.0), Some("zh"));
+        let c = &vp.profiles.get("zh").unwrap().centroid;
+        let n: f32 = c.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((n - 1.0).abs() < 1e-3, "EMA 后应仍单位范数，实测 {n}");
-        let moved = cosine(&before, &vp.centroid);
-        // α≤0.25 时 cos(before,after) ≥ 0.75/√(0.75²+0.25²) ≈ 0.9487。
+        let moved = cosine(&before, c);
         assert!(
             moved >= 0.94,
             "单步位移须受 0.25 权重限制，实测 cos={moved}"
         );
     }
 
-    /// 契约 3：连续大量高分段（与初始质心 cos=0.8 ≥ `UPDATE_THR`）只会单调靠近目标、
-    /// 不越过目标方向；每步都受权重上限约束。
     #[test]
     fn ts408a_drift_many_high_updates_converge_bounded() {
-        let mut vp = ready(unit(0, 2));
-        let c0 = vp.centroid.clone();
+        let mut vp = ready_lang("zh", unit(0, 2));
+        let c0 = vp.profiles.get("zh").unwrap().centroid.clone();
         let tgt = at_cos(0.8);
         let start_cos = cosine(&c0, &tgt);
         for _ in 0..50 {
-            vp.offer(&tgt, 5.0, None); // score = cos(质心, tgt) 单调升，始终 ≥ 0.8 ≥ UPDATE_THR
+            vp.offer(&tgt, 5.0, None, Some("zh"));
         }
-        let end_cos = cosine(&vp.centroid, &tgt);
-        assert!(end_cos > start_cos, "高分段应把质心拉向目标");
-        assert!(end_cos <= 1.0 + 1e-6, "不得越过目标方向");
-        let n: f32 = vp.centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((n - 1.0).abs() < 1e-3, "质心始终单位范数");
+        let c = &vp.profiles.get("zh").unwrap().centroid;
+        let end_cos = cosine(c, &tgt);
+        assert!(end_cos > start_cos && end_cos <= 1.0 + 1e-6);
+        let n: f32 = c.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((n - 1.0).abs() < 1e-3);
     }
 
-    // ---------- 契约点 4：存档 ----------
-
-    /// 契约 4：往返一致；版本/模型不符或损坏 ⇒ 丢弃（空、不 panic）；**未就绪不落盘**。
     #[test]
     fn ts408a_persist_roundtrip_and_discard_guards() {
         let dir = temp_dir("persist");
         let path = dir.join("voiceprint.json");
-
-        // 就绪档往返：质心/时长/段数一致。
-        let mut vp = ready(l2_normalize(&[0.6, 0.8]));
-        vp.total_secs = 33.0;
-        vp.segments = 5;
+        let mut vp = ready_lang("zh", l2_normalize(&[0.6, 0.8]));
+        vp.profiles.get_mut("zh").unwrap().total_secs = 33.0;
+        vp.profiles.insert(
+            "en".to_string(),
+            LangProfile {
+                centroid: l2_normalize(&[1.0, 0.0]),
+                total_secs: 15.0,
+                segments: 4,
+                candidates: Vec::new(),
+            },
+        );
         vp.save(&path);
         let back = Voiceprint::load(&path);
-        assert!(back.is_ready(), "就绪档读回应就绪");
-        assert!((back.total_secs - 33.0).abs() < 1e-3);
-        assert_eq!(back.segments, 5);
-        assert!(
-            cosine(&back.centroid, &vp.centroid) > 0.999,
-            "质心往返应一致"
-        );
+        assert!(back.lang_ready("zh") && back.lang_ready("en"));
+        assert!((back.profiles.get("zh").unwrap().total_secs - 33.0).abs() < 1e-3);
 
-        // 未就绪不落盘。
         let p2 = dir.join("not_ready.json");
         Voiceprint::default().save(&p2);
-        assert!(!p2.exists(), "未就绪不得落盘（避免半成品档）");
+        assert!(!p2.exists(), "未就绪不得落盘");
 
-        // 损坏 / 版本不符 / 模型不符 ⇒ 丢弃且不 panic。
         for bad in [
             "not json{",
-            "{\"version\":0,\"model\":\"x\",\"centroid\":[1.0],\"total_secs\":1.0,\"segments\":1}",
-            "{\"version\":1,\"model\":\"WRONG\",\"centroid\":[1.0],\"total_secs\":20.0,\"segments\":5}",
-            "{\"version\":1,\"model\":\"campplus-zh_en-16k-common-advanced-v1\",\"centroid\":[],\"total_secs\":20.0,\"segments\":5}",
+            "{\"version\":2,\"model\":\"WRONG\",\"profiles\":{}}",
         ] {
             std::fs::write(&path, bad).unwrap();
             assert!(
-                !Voiceprint::load(&path).is_ready(),
-                "异常档应丢弃为空：{bad}"
+                !Voiceprint::load(&path).has_any_ready(),
+                "异常档应丢弃：{bad}"
             );
         }
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ---------- 契约点 5：跨用户（不得把 B 学进 A） ----------
-
-    /// 契约 5：A 就绪后，B 的段（与 A 正交、score<`UPDATE_THR`）反复喂入 ⇒ 逐位不变；
-    /// 判 B ⇒ DropNonUser，判 A ⇒ KeepUser。
     #[test]
     fn ts408a_cross_user_b_not_absorbed() {
         let a = unit(0, 2);
         let b = unit(1, 2);
-        let mut vp = ready(a.clone());
-        let before = vp.centroid.clone();
-        let (seg0, sec0) = (vp.segments, vp.total_secs);
+        let mut vp = ready_lang("zh", a.clone());
+        let before = vp.profiles.get("zh").unwrap().centroid.clone();
+        let (seg0, sec0) = {
+            let p = vp.profiles.get("zh").unwrap();
+            (p.segments, p.total_secs)
+        };
         for _ in 0..20 {
-            vp.offer(&b, 5.0, None);
+            vp.offer(&b, 5.0, None, Some("zh"));
         }
-        assert_eq!(vp.centroid, before, "不得把 B 学进 A 的质心（逐位）");
-        assert_eq!(vp.segments, seg0);
-        assert_eq!(vp.total_secs, sec0);
+        let p = vp.profiles.get("zh").unwrap();
+        assert_eq!(p.centroid, before, "不得把 B 学进 A 的质心（逐位）");
+        assert_eq!(p.segments, seg0);
+        assert_eq!(p.total_secs, sec0);
         assert!(matches!(
             judge(&vp, Some(&b), 3.0, Some("zh")),
             SegVerdict::DropNonUser(_)
@@ -887,19 +1246,182 @@ mod testsync408a_tests {
         ));
     }
 
-    // ---------- 契约点 6：余弦边界 ----------
-
-    /// 契约 6：零向量 / 长度不等 / 空 ⇒ 不 panic（返回 0）；非单位输入按归一化处理。
     #[test]
     fn ts408a_cosine_edge_cases_no_panic() {
-        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0, "零向量 ⇒ 0");
-        assert_eq!(cosine(&[0.0, 0.0], &[0.0, 0.0]), 0.0, "双零 ⇒ 0");
-        assert_eq!(cosine(&[1.0, 2.0], &[1.0]), 0.0, "长度不等 ⇒ 0");
-        assert_eq!(cosine(&[], &[1.0]), 0.0, "空 ⇒ 0");
-        assert!(cosine(&[2.0, 0.0], &[0.0, 3.0]).abs() < 1e-6, "正交 ⇒ 0");
-        assert!(
-            (cosine(&[2.0, 0.0], &[5.0, 0.0]) - 1.0).abs() < 1e-6,
-            "同向（非单位）⇒ 1"
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
+        assert_eq!(cosine(&[0.0, 0.0], &[0.0, 0.0]), 0.0);
+        assert_eq!(cosine(&[1.0, 2.0], &[1.0]), 0.0);
+        assert_eq!(cosine(&[], &[1.0]), 0.0);
+        assert!(cosine(&[2.0, 0.0], &[0.0, 3.0]).abs() < 1e-6);
+        assert!((cosine(&[2.0, 0.0], &[5.0, 0.0]) - 1.0).abs() < 1e-6);
+    }
+}
+
+// =====================================================================
+// TEST-SYNC-408B（阶段三 · 非作者护栏，coder-2）：多语种档 + 跨语言 + 迁移
+// =====================================================================
+#[cfg(test)]
+mod testsync408b_tests {
+    use super::*;
+
+    fn unit(axis: usize, dim: usize) -> Vec<f32> {
+        let mut v = vec![0f32; dim];
+        v[axis] = 1.0;
+        v
+    }
+
+    /// 多语种各自就绪：zh 与 en 各 12s/3 段 ⇒ 两档均就绪，各自需分数判定。
+    /// （en 与 zh 相似度取 0.5 ≥ `NEW_LANG_MIN_SCORE`，模拟同一使用者的双语声纹；否则会被新语种闸拒。）
+    #[test]
+    fn ts408b_multi_lang_each_ready() {
+        let e_zh = unit(0, 2);
+        let e_en = vec![0.5, (1.0f32 - 0.25).sqrt()];
+        let mut vp = Voiceprint::default();
+        for _ in 0..3 {
+            vp.offer(&e_zh, 4.0, None, Some("zh"));
+        }
+        for _ in 0..3 {
+            vp.offer(&e_en, 4.0, None, Some("en"));
+        }
+        assert!(vp.lang_ready("zh") && vp.lang_ready("en"));
+        assert!(matches!(
+            judge(&vp, Some(&e_zh), 3.0, Some("zh")),
+            SegVerdict::KeepUser(_)
+        ));
+        assert!(matches!(
+            judge(&vp, Some(&e_en), 3.0, Some("en")),
+            SegVerdict::KeepUser(_)
+        ));
+    }
+
+    /// 解码前判定取**所有已就绪档最高分**：仅有 zh 就绪，与 zh 正交的 en 段最高分 0 < 0.45 ⇒ Drop；
+    /// 「L 档未就绪 ⇒ 保留」由 mod.rs 解码后保护（原 ranges 重解）兜底，不在此层。
+    #[test]
+    fn ts408b_predecode_uses_max_score_across_ready() {
+        let e_zh = unit(0, 2);
+        let e_other = unit(1, 2); // 与 zh cos=0
+        let mut vp = Voiceprint::default();
+        for _ in 0..3 {
+            vp.offer(&e_zh, 4.0, None, Some("zh"));
+        }
+        assert!(vp.lang_ready("zh"));
+        assert!(matches!(
+            judge_voiceprint(&vp, Some(&e_other), 3.0),
+            SegVerdict::DropNonUser(_)
+        ));
+        assert!(vp.max_score_ready(&e_other).unwrap() < DROP_THR);
+    }
+
+    /// 新语种注册闸：已有 zh 就绪；与 zh 最高分 <0.3 的 en 段 ⇒ 不进 en 候选。
+    #[test]
+    fn ts408b_background_not_learned_as_new_language() {
+        let e_zh = unit(0, 2);
+        let e_bg = unit(1, 2); // 与 zh cos=0（<0.3）
+        let mut vp = Voiceprint::default();
+        for _ in 0..3 {
+            vp.offer(&e_zh, 4.0, None, Some("zh"));
+        }
+        vp.offer(&e_bg, 5.0, None, Some("en"));
+        let n = vp
+            .profiles
+            .get("en")
+            .map(|p| p.candidates.len())
+            .unwrap_or(0);
+        assert_eq!(n, 0, "背景段不得进新语种候选");
+    }
+
+    /// 新语种注册放行：有 zh 就绪，与 zh 最高分 ≥0.3 的 en 段 ⇒ 收进 en 候选。
+    #[test]
+    fn ts408b_bona_fide_new_language_candidate_accepted() {
+        let e_zh = unit(0, 2);
+        let e_en = vec![0.5, (1.0f32 - 0.25).sqrt()]; // 与 zh cos=0.5 ≥0.3
+        let mut vp = Voiceprint::default();
+        for _ in 0..3 {
+            vp.offer(&e_zh, 4.0, None, Some("zh"));
+        }
+        vp.offer(&e_en, 5.0, None, Some("en"));
+        assert!(vp
+            .profiles
+            .get("en")
+            .is_some_and(|p| !p.candidates.is_empty()));
+    }
+
+    /// ja 语言门：judge(ja) ⇒ KeepLanguage（保留）；judge_voiceprint（无语言门，408B 核心）按分判。
+    #[test]
+    fn ts408b_ja_language_gate_vs_core() {
+        let e = unit(0, 2);
+        let mut vp = Voiceprint::default();
+        for _ in 0..3 {
+            vp.offer(&e, 4.0, None, Some("zh"));
+        }
+        assert_eq!(
+            judge(&vp, Some(&e), 3.0, Some("ja")),
+            SegVerdict::KeepLanguage
         );
+        assert!(matches!(
+            judge_voiceprint(&vp, Some(&e), 3.0),
+            SegVerdict::KeepUser(_)
+        ));
+    }
+
+    /// 版本迁移：v1 单档 JSON ⇒ 迁移到 `und`，不丢弃。
+    #[test]
+    fn ts408b_v1_archive_migrates_not_discarded() {
+        let dir = std::env::temp_dir().join(format!(
+            "voice-ime-spk-408b-mig-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("voiceprint.json");
+        let v1 = format!(
+            "{{\"version\":1,\"model\":\"{MODEL_TAG}\",\"centroid\":[1.0,0.0],\"total_secs\":20.0,\"segments\":5}}"
+        );
+        std::fs::write(&path, v1).unwrap();
+        let vp = Voiceprint::load(&path);
+        assert!(vp.has_any_ready(), "v1 应迁移不丢弃");
+        assert!(vp.lang_ready(MIGRATED_LANG), "迁移到 und");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 模型不符 ⇒ 重建（不迁移）。
+    #[test]
+    fn ts408b_model_mismatch_rebuilds() {
+        let dir = std::env::temp_dir().join(format!(
+            "voice-ime-spk-408b-mm-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("voiceprint.json");
+        std::fs::write(
+            &path,
+            "{\"version\":2,\"model\":\"OTHER-MODEL\",\"profiles\":{\"zh\":{\"centroid\":[1.0,0.0],\"total_secs\":20.0,\"segments\":5}}}",
+        )
+        .unwrap();
+        assert!(!Voiceprint::load(&path).has_any_ready());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `partition_ranges` 纯逻辑：<2s 保留、Drop 剔除、缺位保守保留。
+    #[test]
+    fn ts408b_partition_ranges_pure() {
+        let ranges = [(0usize, 32_000usize), (32_000, 96_000), (96_000, 128_000)];
+        let verdicts = [
+            SegVerdict::KeepUser(0.9),
+            SegVerdict::DropNonUser(0.2),
+            SegVerdict::KeepShort,
+        ];
+        let (kept, kept_secs, dropped) = partition_ranges(&ranges, &verdicts);
+        assert_eq!(kept, vec![(0, 32_000), (96_000, 128_000)]);
+        assert!((kept_secs - 4.0).abs() < 1e-4);
+        assert!((dropped - 4.0).abs() < 1e-4);
+        let (kept2, _, dropped2) = partition_ranges(&ranges, &[SegVerdict::KeepUser(0.9)]);
+        assert_eq!(kept2.len(), 3);
+        assert_eq!(dropped2, 0.0);
     }
 }

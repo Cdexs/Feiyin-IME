@@ -184,3 +184,14 @@
 - **14 条 / 契约 1~6**：判定顺序与边界；注册防污染 + 已知局限；漂移上限 + 低分逐位不变；存档往返与丢弃；跨用户不吸收；余弦边界。
 - **验证（白名单）**：`rustfmt --config skip_children=true src/transcription/speaker.rs` **CLEAN**；`cargo check --all-targets` **EXIT 0**、0 error、warnings **92/87** = 基线、speaker.rs 零 warning。🔴 **未跑 `cargo test`**（阶段三禁止，首跑由 tester-1）。
 - **未发现生产缺陷**；**未改生产代码 / 未 commit / 未 push / 零凭证**。
+
+## 2026-09-24 — coder-2 — SPEAKER-VERIFY-408B ✅ 交付（声纹接入路B + 按语种分档存档）
+
+- **需求**（Gavin BUILD-399）：「背景人声被近场门放行」⇒ 按声纹认人；「识别模型给出的标签是哪个语言，就用对应语言版本的声纹档案比照」。
+- **改动（流程定稿）**：① 解码前 `speaker::filter_ranges_by_voiceprint`（每 ≥2s 区间对所有已就绪语种档取最高分，≥一档就绪且 <0.45 ⇒ 剔除）② 解码一次取 L（前缀优先 / 字符集兜底）③ 解码后 L=ja/未知/档未就绪 ⇒ `redecode_with_ranges(原 ranges)` 保护 ④ `commit_voiceprint_offers` 按 L 归档（新语种闸 <0.3 不收）⑤ 按语种分档存 `voiceprint.bin`（v2，v1 迁移不丢弃）⑥ 406 按剔除比例放宽。
+- **文件**：`transcription/speaker.rs`（重写 862/340）、`transcription/mod.rs`（418/49）、`main.rs`（45/10）、`audio/mod.rs`（2/1）、`poc_slice_cut_381.rs`（6/3）；**删 `src/bin/poc_speaker_408.rs`**。
+- **测试**：`speaker` 单测 + `testsync408a/b` + `mod.rs` `fix408b_tests`；真模型 `#[ignore]` 2 条（self 0.966/他人 ≤0.093；window self 0.992/他人 0.076）。
+- **验证**：`rustfmt --config skip_children=true` CLEAN；全仓 `cargo fmt --check` **EXIT 0**；`cargo check --all-targets` **0 error**、warnings **92/87** = 基线；全量 `cargo test --no-fail-fast` **0 failed**（bin **1641P/51I**）。
+- **出包提示**：Publish 需新增 `models/speaker-campplus-zh-en/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx`（28,281,164 B，sha256 `aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2`；gitignore）。
+- **未验证**：实机端测（背景人声是否被剔、本人不误剔、`[LocalRT-DBG-408]` 埋点）交 tester-1 / Gavin。
+- **红线**：未改近场门/1200ms 派发/滑窗规则/407 末尾窗；未加 config/UI/env；未 commit / 未 push / 未 build release / 零凭证。

@@ -113,10 +113,12 @@ fn decode_cuts(
             avg_chars_per_sec: None,
             speech_ranges: None,
             streaming_nonempty: false,
+            new_slice_from: 0,
         };
         let t0 = Instant::now();
-        let (text, _) = transcribe_acc_ctx(rec, &audio[a..b], ChineseScript::Simplified, i, inject)
-            .unwrap_or_default();
+        let (text, _, _) =
+            transcribe_acc_ctx(rec, &audio[a..b], ChineseScript::Simplified, i, inject)
+                .unwrap_or_default();
         secs += t0.elapsed().as_secs_f64();
         println!(
             "[POC381-4] {tag} piece{i} {:.2}-{:.2}s out={}字 text={}",
@@ -218,7 +220,7 @@ fn run_windows(
         let samples: Vec<usize> = recent[start..].iter().map(|x| x.len()).collect();
         let secs = window_audio.len() as f64 / RATE as f64;
         let t0 = Instant::now();
-        let (text, _) = transcribe_acc_ctx(
+        let (text, _, _) = transcribe_acc_ctx(
             rec,
             &window_audio,
             ChineseScript::Simplified,
@@ -228,6 +230,7 @@ fn run_windows(
                 avg_chars_per_sec: None,
                 speech_ranges: None,
                 streaming_nonempty: false,
+                new_slice_from: 0,
             },
         )
         .unwrap_or_default();

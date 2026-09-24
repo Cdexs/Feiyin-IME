@@ -1,4 +1,11 @@
 
+### 2026-09-24 · SPEAKER-VERIFY-408B 交付（声纹接入路B + 按语种分档存档）
+
+- 流程定稿：解码前对所有已就绪语种档取最高分 <0.45 ⇒ 剔除；解码一次取 L（前缀/字符集）；L=ja/未知/档未就绪 ⇒ 原 ranges 重解保护；注册漂移按 L 归档；分档存档（v2，v1 迁移不丢弃）。
+- 改动 `transcription/speaker.rs`（重写）+ `transcription/mod.rs` + `main.rs` + `audio/mod.rs` + `poc_slice_cut_381.rs`；删 `src/bin/poc_speaker_408.rs`。
+- 真模型 `#[ignore]`：self 0.966 / 他人 ≤0.093；window self 0.992 / 他人 0.076。
+- 验证：`fmt --check` EXIT 0；`check --all-targets` 0 error、warnings 92/87=基线；全量 `cargo test --no-fail-fast` **0 failed**（bin **1641P/51I**）。未出包。
+
 ### 2026-09-24 · LOCALRT-TAIL-WINDOW-407 交付（1900ms 长静默自动末尾组窗）
 
 - `local_stream.rs`：长静默（≥1900ms）只发一次 `on_long_silence(pcm_pos)`，恢复说话复位；`LONG_SILENCE_TAIL_MS`+纯函数。

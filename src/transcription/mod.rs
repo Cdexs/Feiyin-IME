@@ -11,6 +11,8 @@ use sherpa_onnx::{OfflineQwen3ASRModelConfig, OfflineSenseVoiceModelConfig};
 
 pub mod local_stream;
 pub mod qwen_inference;
+// SPEAKER-VERIFY-408B：声纹模块接入本地实时路B（408A 独立模块 + 408B 过滤/注册）。
+pub(crate) mod speaker;
 mod vad;
 // FIX-SLICE-CUT-AT-GAP-381：§4/§5 实测 PoC（纯 `#[cfg(test)]`，无 lib target 故不能放 src/bin|tests）
 #[cfg(test)]
@@ -284,6 +286,11 @@ pub struct CtxInject<'a> {
     pub speech_ranges: Option<&'a [(usize, usize)]>,
     /// VAD-393（A4）：本窗**流式文本**是否非空（区间空表时的兜底判据，见 [`Self::speech_ranges`]）。
     pub streaming_nonempty: bool,
+    /// SPEAKER-VERIFY-408B：本窗**新片**在窗内的起点**样本下标** —— 声纹注册/漂移只对
+    /// `start >= new_slice_from` 的区间 `offer`（窗口前文区间已在上一窗 offer 过，防重复计入）。
+    /// 非本地实时滑窗（在线 / 精确批量 / POC）传 `0`（对它们声纹不参与，见 `filter_ranges_by_voiceprint`
+    /// 仅在本地实时路径被调用）。
+    pub new_slice_from: usize,
 }
 
 /// 回显探针归一化：去空白与常见中英标点（回显是逐字文本，标点差异不应漏检）。
@@ -511,6 +518,42 @@ pub(crate) fn acc_vs_streaming(acc: &str, streaming: &str) -> MismatchVerdict {
     let retention = lcs as f32 / str_n.len() as f32;
     let len_ratio = acc_n.len() as f32 / str_n.len() as f32;
     let accept = retention >= MISMATCH_MIN_RETENTION && len_ratio >= MISMATCH_MIN_LEN_RATIO;
+    MismatchVerdict {
+        retention,
+        len_ratio,
+        accept,
+    }
+}
+
+/// SPEAKER-VERIFY-408B：声纹剔除后**放宽**的 406 判据。
+///
+/// 本窗剔除了 `dropped` 秒语音 ⇒ 精解相对流式的期望按保留比例 `scale = kept/(kept+dropped)` 放宽
+///（`retention` / `len_ratio` 门槛各乘 `scale`，**不低于 0.2**）。`dropped <= 0` ⇒ 与
+/// [`acc_vs_streaming`] **逐位一致**。
+pub(crate) fn acc_vs_streaming_after_drop(
+    acc: &str,
+    streaming: &str,
+    dropped: f32,
+    kept: f32,
+) -> MismatchVerdict {
+    if !(dropped > 0.0) {
+        return acc_vs_streaming(acc, streaming);
+    }
+    let scale = (kept / (kept + dropped).max(1e-6)).clamp(0.2, 1.0);
+    let acc_n = normalize_for_mismatch(acc);
+    let str_n = normalize_for_mismatch(streaming);
+    if str_n.len() < MISMATCH_MIN_STREAM_CHARS {
+        return MismatchVerdict {
+            retention: 1.0,
+            len_ratio: 1.0,
+            accept: true,
+        };
+    }
+    let lcs = lcs_subseq_len(&acc_n, &str_n);
+    let retention = lcs as f32 / str_n.len() as f32;
+    let len_ratio = acc_n.len() as f32 / str_n.len() as f32;
+    let accept =
+        retention >= MISMATCH_MIN_RETENTION * scale && len_ratio >= MISMATCH_MIN_LEN_RATIO * scale;
     MismatchVerdict {
         retention,
         len_ratio,
@@ -905,7 +948,7 @@ fn decode_accuracy_once(
     script: ChineseScript,
 ) -> Result<String> {
     // 其他调用方行为逐位不变 ⇒ 传 `None`（不设 `max_new_tokens`，沿用全局 256）。
-    let text = decode_accuracy_allow_empty(recognizer, samples, system, script, None)?;
+    let (text, _lang) = decode_accuracy_allow_empty(recognizer, samples, system, script, None)?;
     if text.is_empty() {
         // 与 transcribe_segment_detailed 一致：accuracy 空输出 ⇒ 该段失败（上层 all_native=false）
         anyhow::bail!("ASR accuracy model produced empty output");
@@ -922,7 +965,7 @@ fn decode_accuracy_allow_empty(
     system: Option<&str>,
     script: ChineseScript,
     max_new_tokens: Option<i32>,
-) -> Result<String> {
+) -> Result<(String, Option<String>)> {
     let stream = recognizer.create_stream();
     if let Some(s) = system {
         stream.set_option("hotwords", s);
@@ -935,11 +978,15 @@ fn decode_accuracy_allow_empty(
     stream.accept_waveform(16000, samples);
     recognizer.decode(&stream);
     let result = stream.get_result().context("No transcription result")?;
-    let text = Transcriber::strip_asr_special_tokens(result.text.trim());
+    // SPEAKER-VERIFY-408B：一并取出 Qwen3 自造语种前缀里的语种（日语保护用；剥离行为逐位不变）。
+    let (text, lang) = Transcriber::strip_asr_special_tokens_lang(result.text.trim());
     if text.is_empty() {
-        return Ok(String::new());
+        return Ok((String::new(), lang));
     }
-    Ok(text_normalizer::normalize_text_for_language(&text, script))
+    Ok((
+        text_normalizer::normalize_text_for_language(&text, script),
+        lang,
+    ))
 }
 
 /// 无注入的简版单段入口（保留兼容；生产路径已切 `transcribe_accuracy_segment_ctx`）。
@@ -1027,66 +1074,172 @@ fn plan_timeline_trim(
     })
 }
 
+/// SPEAKER-VERIFY-408B：本窗声纹剔除统计（供 406 守卫按保留比例放宽）。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AccDropStats {
+    /// 被声纹剔除的语音秒数。
+    pub dropped_speech_secs: f32,
+    /// 保留（送入解码）的语音秒数。
+    pub kept_speech_secs: f32,
+}
+
+/// SPEAKER-VERIFY-408B：按**字符集**粗判文本语种（无模型前缀时的兜底）：
+/// 假名 ⇒ `ja`；谚文 ⇒ `ko`；汉字 ⇒ `zh`；拉丁 ⇒ `en`；否则 `None`。优先级 假名 > 谚文 > 汉字 > 拉丁。
+fn lang_from_charset(text: &str) -> Option<&'static str> {
+    let mut han = false;
+    let mut latin = false;
+    for c in text.chars() {
+        let u = c as u32;
+        if (0x3040..=0x309F).contains(&u)
+            || (0x30A0..=0x30FF).contains(&u)
+            || (0xFF66..=0xFF9D).contains(&u)
+        {
+            return Some("ja");
+        }
+        if (0xAC00..=0xD7AF).contains(&u)
+            || (0x1100..=0x11FF).contains(&u)
+            || (0x3130..=0x318F).contains(&u)
+        {
+            return Some("ko");
+        }
+        if (0x4E00..=0x9FFF).contains(&u) || (0x3400..=0x4DBF).contains(&u) {
+            han = true;
+        }
+        if c.is_ascii_alphabetic() {
+            latin = true;
+        }
+    }
+    if han {
+        Some("zh")
+    } else if latin {
+        Some("en")
+    } else {
+        None
+    }
+}
+
+/// SPEAKER-VERIFY-408B：用**给定区间**重解一次（声纹剔除后重解用）。
+///
+/// 与首解同样走 `decode_accuracy_allow_empty`（带 per-stream token cap）。单独成函数
+/// （置于 `transcribe_acc_ctx` 之外）⇒ 不改 390 源码护栏对函数体内解码调用次数的断言。
+fn redecode_with_ranges(
+    recognizer: &sherpa_onnx::OfflineRecognizer,
+    window_audio: &[f32],
+    ranges: &[(usize, usize)],
+    pad: usize,
+    system: Option<&str>,
+    script: ChineseScript,
+) -> Option<String> {
+    let used = trim_to_speech(window_audio, ranges, pad);
+    if used.is_empty() {
+        return None;
+    }
+    let cap = max_new_tokens_for(used.len() as f32 / 16000.0);
+    decode_accuracy_allow_empty(recognizer, &used, system, script, Some(cap))
+        .ok()
+        .map(|(t, _)| t)
+}
+
 /// LOCALRT-CTX-INJECT-320：带「上下文 + 词库」per-stream 注入 + 长跨回显护栏的 accuracy 单段解码。
 ///
-/// - `context`：前序分片累计文本（调用方已截到最后 300 字；第 1 片传 None）。
 /// - `terms`：用户词库词条（原样；调用方给）。
 /// - 命中回显 ⇒ 同音频**无上下文重解一次**，用重解码结果（不丢片）。
+/// - SPEAKER-VERIFY-408B：返回第三元 [`AccDropStats`]（本窗声纹剔除/保留秒数，供 406 放宽）。
 pub(crate) fn transcribe_acc_ctx(
     recognizer: &sherpa_onnx::OfflineRecognizer,
     samples: &[f32],
     script: ChineseScript,
     seg_idx: usize,
     inject: CtxInject<'_>,
-) -> Result<(String, bool)> {
+) -> Result<(String, bool, AccDropStats)> {
     // FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388（A）：解码前剪静音（本地 realtime 专用）。
     // 根因：sherpa #3509 —— 带 hotwords 的 Qwen3-ASR 遇静音会吐热词/坍塌；派发片把「上句说完到
     // 本句开口」的长停顿全带进窗口 ⇒ 大量静音 + 少量语音。先 VAD 取语音区间、每侧留 200ms。
     // VAD-393（A4）：优先用调用方给的**实时时间线**（窗内坐标）⇒ 不再对每窗重跑 VAD；
     //   无时间线（`None`）才回退 388/391 的线程级自跑 VAD（仍用同一 v6 模型）。
     let in_secs = samples.len() as f32 / 16000.0;
+    // 原始整窗音频（408B：按 L 档判出需剔除时，用**保留区间**在此重剪重解）。
+    let window_audio = samples;
     let pad = (vad::LOCALRT_TRIM_PAD_SECS * 16000.0) as usize;
+    // 本窗语音区间（时间线优先 / 自跑 VAD 回退）。408B①：**解码前**按所有已就绪档最高分剔除。
+    let mut ranges_orig: Vec<(usize, usize)> = Vec::new();
+    let mut vp_filter: Option<speaker::VoiceprintFilter> = None;
     // 返回 `(解码用样本, 是否经 VAD 判定, 区间数, 剪静音来源)`；`source` ∈ {timeline, vad, none}。
     let (samples_used, trimmed, n_ranges, trim_src) =
         match plan_timeline_trim(inject.speech_ranges, inject.streaming_nonempty) {
-            Some(TimelineTrim::Apply(ranges)) => (
-                trim_to_speech(samples, &ranges, pad),
-                true,
-                ranges.len(),
-                "timeline",
-            ),
+            Some(TimelineTrim::Apply(ranges)) => {
+                ranges_orig = ranges.clone();
+                let f =
+                    speaker::filter_ranges_by_voiceprint(samples, &ranges, inject.new_slice_from);
+                let out = trim_to_speech(samples, &f.kept, pad);
+                let n = f.kept.len();
+                vp_filter = Some(f);
+                (out, true, n, "timeline")
+            }
             // 时间线判无语音但本窗流式有文本 ⇒ 不复剪、整窗解码（宁可多解，不吞字）。
             Some(TimelineTrim::WholeWindow) => (samples.to_vec(), false, 0usize, "timeline"),
             // 时间线判无语音且流式也空 ⇒ 空结果（下方 `trimmed && n_ranges == 0` 统一早退）。
             Some(TimelineTrim::Empty) => (Vec::new(), true, 0usize, "timeline"),
-            None => {
-                let trim_model_dir = model_dir();
-                LOCALRT_TRIM_VAD.with(|cell| {
-                    let mut slot = cell.borrow_mut();
-                    if slot.is_none() {
-                        *slot = Some(VadSegmenter::try_new_for_local_trim(&trim_model_dir));
-                    }
-                    match slot.as_ref().and_then(|o| o.as_ref()) {
-                        Some(vseg) => {
-                            let ranges = vseg.speech_ranges(samples);
-                            if ranges.is_empty() {
-                                (Vec::new(), true, 0usize, "vad")
-                            } else {
-                                (
-                                    trim_to_speech(samples, &ranges, pad),
-                                    true,
-                                    ranges.len(),
-                                    "vad",
-                                )
-                            }
+            None => LOCALRT_TRIM_VAD.with(|cell| {
+                let mut slot = cell.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(VadSegmenter::try_new_for_local_trim(&model_dir()));
+                }
+                match slot.as_ref().and_then(|o| o.as_ref()) {
+                    Some(vseg) => {
+                        let ranges = vseg.speech_ranges(samples);
+                        if ranges.is_empty() {
+                            (Vec::new(), true, 0usize, "vad")
+                        } else {
+                            ranges_orig = ranges.clone();
+                            let f = speaker::filter_ranges_by_voiceprint(
+                                samples,
+                                &ranges,
+                                inject.new_slice_from,
+                            );
+                            let out = trim_to_speech(samples, &f.kept, pad);
+                            let n = f.kept.len();
+                            vp_filter = Some(f);
+                            (out, true, n, "vad")
                         }
-                        None => (samples.to_vec(), false, 0usize, "none"),
                     }
-                })
-            }
+                    None => (samples.to_vec(), false, 0usize, "none"),
+                }
+            }),
         };
+    // 408B①：解码前剔除统计（供 406 放宽 / 日志）。
+    let drop_stats = vp_filter
+        .as_ref()
+        .map(|f| AccDropStats {
+            dropped_speech_secs: f.dropped_secs,
+            kept_speech_secs: f.kept_secs,
+        })
+        .unwrap_or_default();
+    let had_drop = drop_stats.dropped_speech_secs > 0.0;
+    if log::log_enabled!(log::Level::Debug) {
+        if let Some(f) = vp_filter.as_ref() {
+            for d in &f.details {
+                log::debug!(
+                    "[LocalRT-DBG-408] seg: win={} range={:.2}-{:.2}s secs={:.2} verdict={:?} score={:.3}",
+                    seg_idx,
+                    d.start as f32 / 16000.0,
+                    d.end as f32 / 16000.0,
+                    d.secs,
+                    d.verdict,
+                    d.score
+                );
+            }
+            log::debug!(
+                "[LocalRT-DBG-408] predecode: kept={:.2}s dropped={:.2}s any_ready={} enrolled_secs={:.1}",
+                f.kept_secs,
+                f.dropped_secs,
+                f.any_ready,
+                f.enrolled_secs
+            );
+        }
+    }
     if trimmed && n_ranges == 0 {
-        // 整窗无语音 ⇒ 空解码（交 386-C 流式兜底），**不**进模型（避免念词表 / 失败日志刷屏）。
+        // 整窗无语音 / 声纹**全部剔除** ⇒ 空解码（交 386-C 流式兜底），**不**进模型。
         if log::log_enabled!(log::Level::Debug) {
             log::debug!(
                 "[LocalRT-DBG-388] trim: seg={} in={:.2}s out=0.00s ranges=0 source={}",
@@ -1095,7 +1248,7 @@ pub(crate) fn transcribe_acc_ctx(
                 trim_src
             );
         }
-        return Ok((String::new(), true));
+        return Ok((String::new(), true, drop_stats));
     }
     // 后续（首解 / 产出率 / 重解）一律用剪静音后的 `samples`（shadow 原参数）。
     let samples: &[f32] = &samples_used;
@@ -1119,13 +1272,33 @@ pub(crate) fn transcribe_acc_ctx(
     let system = build_ctx_system(inject.terms);
     let inject_on = should_inject_ctx(system.as_deref());
     // 388 主控验收补：首解用 allow_empty ⇒ 空输出也进入 Empty 判据（不带注入重解一次）。
-    let text = decode_accuracy_allow_empty(
+    let (text, prefix_lang) = decode_accuracy_allow_empty(
         recognizer,
         samples,
         system.as_deref().filter(|_| inject_on),
         script,
         Some(token_cap),
     )?;
+    // SPEAKER-VERIFY-408B②③：本窗语种 L = 模型语种前缀优先，无前缀按解码文本字符集粗判。
+    let win_lang: Option<String> = prefix_lang
+        .clone()
+        .or_else(|| lang_from_charset(&text).map(|s| s.to_string()));
+    // ③ 保护判据：L=ja ｜ L 未知 ｜ **L 档未就绪** ⇒ 用原 ranges 重解（须在 commit 之前查）。
+    let lang_ready = win_lang
+        .as_deref()
+        .is_some_and(speaker::voiceprint_lang_ready);
+    // ④ 注册/漂移进 L 档（本窗新片 offer）。
+    if let Some(f) = vp_filter.as_ref() {
+        speaker::commit_voiceprint_offers(&f.pending_offers, win_lang.as_deref());
+    }
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "[LocalRT-DBG-408] lang L={:?} lang_ready={} predecode_dropped={:.2}s",
+            win_lang,
+            lang_ready,
+            drop_stats.dropped_speech_secs
+        );
+    }
     let decided_out_chars = text.chars().count();
     // FIX-TERMS-ECHO-374 + 375（B）：**统一的处置阶梯**（一处实现，两条判据）。
     //
@@ -1133,14 +1306,17 @@ pub(crate) fn transcribe_acc_ctx(
     //    的「重启后第一次录音」）旧护栏整块被跳过、`seg=10` 零转写只吐 77 字词条列表，375 现场则是
     //    「短输出从相对阈值下溜走」。两条判据都与 LCS 无关 ⇒ 无 BUILD-321 的 43% 误伤面。
     let audio_secs = speech_secs;
-    let (text, disp) = apply_acc_disposition(
+    let (mut text, disp) = apply_acc_disposition(
         text,
         inject.terms,
         audio_secs,
         inject.avg_chars_per_sec,
         // TUNE-390：重解同样带 cap；用 `decode_accuracy_allow_empty`（空输出返回 Ok("")，
         // 与原 `decode_accuracy_once(..).unwrap_or_default()` 语义一致），不改任何 pub 签名。
-        || decode_accuracy_allow_empty(recognizer, samples, None, script, Some(token_cap)),
+        || {
+            decode_accuracy_allow_empty(recognizer, samples, None, script, Some(token_cap))
+                .map(|(t, _)| t)
+        },
     );
     if log::log_enabled!(log::Level::Debug) {
         log::debug!(
@@ -1213,7 +1389,33 @@ pub(crate) fn transcribe_acc_ctx(
             disp.guard.as_str()
         );
     }
-    Ok((text, true))
+    // SPEAKER-VERIFY-408B③：本窗有剔除 且（L=ja ｜ L 未知 ｜ L 档未就绪）⇒ 用**原 ranges** 重解并采用。
+    let need_redo =
+        had_drop && (win_lang.as_deref() == Some("ja") || win_lang.is_none() || !lang_ready);
+    if need_redo && !ranges_orig.is_empty() {
+        if let Some(t2) = redecode_with_ranges(
+            recognizer,
+            window_audio,
+            &ranges_orig,
+            pad,
+            system.as_deref().filter(|_| inject_on),
+            script,
+        ) {
+            if log::log_enabled!(log::Level::Debug) {
+                log::debug!(
+                    "[LocalRT-DBG-408] redecode full ranges (reason: L={:?} lang_ready={} ja={}; dropped={:.2}s): {} → {} chars",
+                    win_lang,
+                    lang_ready,
+                    win_lang.as_deref() == Some("ja"),
+                    drop_stats.dropped_speech_secs,
+                    text.chars().count(),
+                    t2.chars().count()
+                );
+            }
+            text = t2;
+        }
+    }
+    Ok((text, true, drop_stats))
 }
 
 /// FIX-PREFIX-AND-EAT-371：`<asr_text>` 标记必须落在**头部**的字节上限（唯一的护栏）。
@@ -1237,15 +1439,22 @@ const QWEN3_PREFIX_MAX_BYTES: usize = 64;
 /// 无 `<asr_text>` / 标记靠后 ⇒ **原样返回**（0.6B 不吐前缀 ⇒ no-op；正文含尖括号 ⇒ 不误伤）。
 ///
 /// 命中时打 DEBUG 埋点（原样打印被剥掉的整段头部），便于下次变形时直接从日志看到模型吐了什么。
+#[allow(dead_code)] // 生产走 `strip_qwen3_language_prefix_lang`（需取语种）；本包装保留供测试/兼容
 fn strip_qwen3_language_prefix(text: &str) -> &str {
+    strip_qwen3_language_prefix_lang(text).0
+}
+
+/// SPEAKER-VERIFY-408B：同 [`strip_qwen3_language_prefix`]，额外解析并返回前缀里的**语种**。
+/// 剥离行为与旧实现逐位一致（同一份逻辑，旧函数只是取 `.0`）。
+fn strip_qwen3_language_prefix_lang(text: &str) -> (&str, Option<String>) {
     const MARKER: &str = "<asr_text>";
     let t = text.trim_start();
     let Some(pos) = t.find(MARKER) else {
-        return text;
+        return (text, None);
     };
     if pos > QWEN3_PREFIX_MAX_BYTES {
         // 正文中段（靠后）的标记 ⇒ 视为正文，不剥。
-        return text;
+        return (text, None);
     }
     // FIX-PREFIX-AND-EAT-371：把被剥掉的原始头部（前缀 + 标记）原样打进日志。
     log::debug!(
@@ -1253,7 +1462,32 @@ fn strip_qwen3_language_prefix(text: &str) -> &str {
         &t[..pos + MARKER.len()]
     );
     // 截到 `<asr_text>` 之后，顺带吃掉紧随的空白与常见分隔冒号。
-    t[pos + MARKER.len()..].trim_start_matches(|c: char| c.is_whitespace() || c == ':' || c == '：')
+    let body = t[pos + MARKER.len()..]
+        .trim_start_matches(|c: char| c.is_whitespace() || c == ':' || c == '：');
+    (body, qwen3_prefix_lang(&t[..pos]))
+}
+
+/// SPEAKER-VERIFY-408B：从 `<asr_text>` 前缀头部解析语种规范名（`"japanese"` 等）；识别不了 ⇒ `None`。
+///
+/// 前缀形态形如 `language Japanese` / `Japanese` / `日本語`。**只服务日语保护**（408B step4）。
+fn qwen3_prefix_lang(head: &str) -> Option<String> {
+    let h = head.to_ascii_lowercase();
+    if h.contains("japanese")
+        || h.contains("japan")
+        || head.contains("日本語")
+        || head.contains("日语")
+        || head.contains("日文")
+    {
+        Some("ja".to_string())
+    } else if h.contains("english") || head.contains("英文") || head.contains("英语") {
+        Some("en".to_string())
+    } else if h.contains("korean") || head.contains("韩语") || head.contains("韩文") {
+        Some("ko".to_string())
+    } else if h.contains("chinese") || head.contains("中文") || head.contains("汉语") {
+        Some("zh".to_string())
+    } else {
+        None
+    }
 }
 
 impl Transcriber {
@@ -1440,6 +1674,12 @@ impl Transcriber {
     /// 仅剥离完整 token，不误伤正常文本中的孤立 `<` 或 `>`。
     /// 多个连续 token 合并为一个空白分隔边界，避免产生多余空格。
     pub fn strip_asr_special_tokens(text: &str) -> String {
+        Self::strip_asr_special_tokens_lang(text).0
+    }
+
+    /// SPEAKER-VERIFY-408B：同 [`Self::strip_asr_special_tokens`]，额外返回 Qwen3 语种前缀里的语种
+    /// （`Some("japanese")` 等；无前缀 ⇒ `None`）。**剥离行为逐位不变**。
+    pub fn strip_asr_special_tokens_lang(text: &str) -> (String, Option<String>) {
         let mut result = String::with_capacity(text.len());
         let chars: Vec<char> = text.chars().collect();
         let mut i = 0;
@@ -1480,8 +1720,9 @@ impl Transcriber {
             i += 1;
         }
         // MIGRATE-1.13.8-1.7B-359：<|…|> 剥完后，再剥 Qwen3-ASR 1.7B 自造的裸语种前缀
-        // （语言无关；对 0.6B / 无前缀输入是 no-op）。
-        strip_qwen3_language_prefix(&result).to_string()
+        // （语言无关；对 0.6B / 无前缀输入是 no-op）。408B：一并取出语种。
+        let (body, lang) = strip_qwen3_language_prefix_lang(&result);
+        (body.to_string(), lang)
     }
     /// 转录并返回标点来源标记（ASR-PUNCT-OPT-001）
     ///
@@ -4147,9 +4388,10 @@ mod poc_qwen3_17b_351 {
                 avg_chars_per_sec: None,
                 speech_ranges: None,
                 streaming_nonempty: false,
+                new_slice_from: 0,
             };
             let t0 = Instant::now();
-            let (text, _native) =
+            let (text, _native, _stats) =
                 transcribe_acc_ctx(rec, &samples[*a..*b], ChineseScript::Simplified, i, inject)
                     .unwrap_or_else(|e| panic!("{tag} seg{i} decode failed: {e}"));
             let secs = t0.elapsed().as_secs_f64();
@@ -4507,6 +4749,7 @@ mod poc_qwen3_17b_351 {
             avg_chars_per_sec: None,
             speech_ranges: None,
             streaming_nonempty: false,
+            new_slice_from: 0,
         };
         let seg0 = transcribe_acc_ctx(
             &rec,
@@ -5969,7 +6212,7 @@ mod fix388_trim_and_floor_tests {
             .find("if trimmed && n_ranges == 0")
             .expect("无语音早退锚点缺失");
         let ret = body[early..]
-            .find("return Ok((String::new(), true));")
+            .find("return Ok((String::new(), true, drop_stats));")
             .expect("无语音早退返回缺失");
         // 388 主控验收补：首解改为 `decode_accuracy_allow_empty(`（空输出进 Empty 判据）；不变量不变。
         let decode = body
@@ -7935,5 +8178,131 @@ mod testsync377_inject_spec_tests {
             full.contains('甲') && full.contains('丙'),
             "对齐失败不得丢字：{full}"
         );
+    }
+}
+
+// =====================================================================
+// TEST-SYNC-408B（阶段三 · 非作者护栏，coder-2）：语种解析 + 406 放宽 + 源码护栏
+// =====================================================================
+#[cfg(test)]
+mod fix408b_tests {
+    use super::*;
+
+    /// 字符集粗判：假名=ja、谚文=ko、汉字=zh、拉丁=en、否则 None；假名优先于汉字。
+    #[test]
+    fn ts408b_lang_from_charset() {
+        assert_eq!(lang_from_charset("こんにちは"), Some("ja"));
+        assert_eq!(lang_from_charset("カタカナ"), Some("ja"));
+        assert_eq!(lang_from_charset("안녕하세요"), Some("ko"));
+        assert_eq!(lang_from_charset("你好世界"), Some("zh"));
+        assert_eq!(lang_from_charset("hello world"), Some("en"));
+        assert_eq!(lang_from_charset("12345。！"), None);
+        assert_eq!(lang_from_charset("日本語です"), Some("ja"));
+    }
+
+    /// 前缀语种解析：`language Japanese` ⇒ ja；`language Chinese` ⇒ zh（非日语）。
+    #[test]
+    fn ts408b_qwen3_prefix_lang() {
+        assert_eq!(
+            qwen3_prefix_lang("language Japanese"),
+            Some("ja".to_string())
+        );
+        assert_eq!(
+            qwen3_prefix_lang("language Chinese"),
+            Some("zh".to_string())
+        );
+        assert_eq!(qwen3_prefix_lang("japanese"), Some("ja".to_string()));
+        assert_eq!(qwen3_prefix_lang("日本語"), Some("ja".to_string()));
+        assert_eq!(qwen3_prefix_lang("gibberish"), None);
+    }
+
+    /// 剥离+取语种：前缀 Japanese + 全汉字正文 ⇒ 判日语；Chinese ⇒ 非日语；无前缀 ⇒ None；
+    /// 且剥离行为与旧函数逐位一致。
+    #[test]
+    fn ts408b_strip_prefix_returns_lang() {
+        let (body, lang) = strip_qwen3_language_prefix_lang("language Japanese<asr_text>漢字仮名");
+        assert_eq!(body, "漢字仮名");
+        assert_eq!(lang, Some("ja".to_string()));
+        let (body2, lang2) = strip_qwen3_language_prefix_lang("language Chinese<asr_text>你好");
+        assert_eq!(body2, "你好");
+        assert_eq!(lang2, Some("zh".to_string()));
+        let (body3, lang3) = strip_qwen3_language_prefix_lang("普通正文");
+        assert_eq!(body3, "普通正文");
+        assert_eq!(lang3, None);
+        for s in [
+            "language chinese<asr_text>你好",
+            "no marker here",
+            "<asr_text>正文",
+        ] {
+            assert_eq!(
+                strip_qwen3_language_prefix_lang(s).0,
+                strip_qwen3_language_prefix(s)
+            );
+        }
+    }
+
+    #[test]
+    fn ts408b_strip_asr_special_tokens_lang() {
+        let (t, l) = Transcriber::strip_asr_special_tokens_lang("<|zh|>你好");
+        assert_eq!(t, "你好");
+        assert_eq!(l, None);
+        let (t2, l2) =
+            Transcriber::strip_asr_special_tokens_lang("language Japanese<asr_text>漢字");
+        assert_eq!(t2, "漢字");
+        assert_eq!(l2, Some("ja".to_string()));
+    }
+
+    /// 406 放宽：`dropped=0` ⇒ 与 [`acc_vs_streaming`] 逐位一致；`dropped>0` ⇒ 门槛按比例放宽。
+    #[test]
+    fn ts408b_406_relax_scales() {
+        let acc = "天气如何会不会";
+        let stream = "最近的天气如何会不会下雨";
+        let plain = acc_vs_streaming(acc, stream);
+        let zero = acc_vs_streaming_after_drop(acc, stream, 0.0, 10.0);
+        assert_eq!(plain.retention, zero.retention);
+        assert_eq!(plain.len_ratio, zero.len_ratio);
+        assert_eq!(plain.accept, zero.accept);
+        assert!(!plain.accept, "该样本 plain 应 reject");
+        let scaled = acc_vs_streaming_after_drop(acc, stream, 6.0, 2.0); // scale=0.25
+        assert!(
+            scaled.accept,
+            "放宽后应 accept（ret={:.2} len={:.2}）",
+            scaled.retention, scaled.len_ratio
+        );
+        // 全剔（kept=0）⇒ scale 下限 0.2（不得更松）；仍按放宽判。
+        assert!(acc_vs_streaming_after_drop(acc, stream, 10.0, 0.0).accept);
+    }
+
+    /// 源码护栏：`transcribe_acc_ctx` 内调用声纹过滤 + 注册落地 + L 档就绪查询。
+    #[test]
+    fn ts408b_transcribe_calls_speaker() {
+        let src = include_str!("mod.rs");
+        let body = src
+            .split("pub(crate) fn transcribe_acc_ctx(")
+            .nth(1)
+            .expect("transcribe_acc_ctx 锚点缺失");
+        let body = body.split("FIX-PREFIX-AND-EAT-371").next().unwrap();
+        assert!(
+            body.contains("speaker::filter_ranges_by_voiceprint("),
+            "408B：必须解码前过滤（声纹判定）"
+        );
+        assert!(
+            body.contains("speaker::commit_voiceprint_offers("),
+            "408B：必须把注册/漂移 offer 落地"
+        );
+        assert!(
+            body.contains("speaker::voiceprint_lang_ready"),
+            "408B：必须查 L 档是否就绪（保护判据）"
+        );
+    }
+
+    /// 源码护栏：临时 PoC 宿主已删除（否则会被 cargo 当独立程序编进发布）。
+    #[test]
+    fn ts408b_poc_host_removed() {
+        let p = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/bin/poc_speaker_408.rs"
+        ));
+        assert!(!p.exists(), "src/bin/poc_speaker_408.rs 必须删除");
     }
 }

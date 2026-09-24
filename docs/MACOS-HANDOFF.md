@@ -2345,3 +2345,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | `main.rs` `harvest_acc_window!`：精解非空且 `acc_vs_streaming(...)` 不通过 ⇒ 用**同窗流式文本**替换精解（防漏整句/幻觉导致预览回缩 + 最终丢句）；打 `[LocalRT-DBG-406]` warn | 精解不再无条件覆盖已正确的预览；只作用于本地实时滑窗路B | ✅ 平台中立；🔴 macOS 若另有本地实时滑窗结果回灌点，须同接此守卫（判据与阈值同上） |
 | `transcription/mod.rs` `strip_angle_tags`：新增**未闭合标签**剥离（`<` + ≥3 连续 ASCII 字母、标签名 run 内无 `>`，如 `<translation`/`<asr_text`）；`a<b`/`3<5`/`<3块钱` 不误剥 | 模型吐出的未闭合标签不再漏进正文 | ✅ 平台中立纯逻辑，macOS 同继承 |
 | **macOS 侧需要做什么** | | ① 无新增依赖 / env / 平台 API，无需改构建脚本；② 若 macOS 有独立的实时滑窗回灌路径，按同判据接入 `acc_vs_streaming`；③ `strip_angle_tags` 行为变更自动继承 |
+
+## SPEAKER-VERIFY-408B（2026-09-24，coder-2）· 声纹接入本地实时路B（解码前剔除高置信非本人）—— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| 新增 `src/transcription/speaker.rs` 接入：`mod.rs` 加 `pub(crate) mod speaker;`；`CtxInject` 加 `new_slice_from: usize`；`transcribe_acc_ctx` 返回 `(String, bool, AccDropStats)`；**删 `src/bin/poc_speaker_408.rs`** | 路B 每窗解码前对 ≥2s 语音区间按**本人所有已就绪语种档最高分**判 `score<0.45` ⇒ 剔除（无就绪档不剔）；解码后 L=ja/未知/L档未就绪 ⇒ 原 ranges 重解保护 | ✅ 平台中立（`speaker.rs` 无 `cfg`）。🔴 **`CtxInject` 构造点必须补 `new_slice_from`**（macOS 另有的构造点会编译失败）；`transcribe_acc_ctx` 返回值多一元 |
+| `speaker.rs`：**按语种分档**声纹（`voiceprint.bin`，`<exe>` 同级）；v2 格式，v1 迁移不丢弃；换模型才重建；自动注册（≥12s/≥3 段+离群剔除）；漂移 EMA α≤0.25；新语种闸（候选对已就绪档最高分 <0.3 不收） | 多语种各自维护质心/就绪 | 🔴 **构建产物**：macOS 需携带 `models/speaker-campplus-zh-en/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx`（28,281,164 B，sha256 `aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2`）；`/models` 不入 git，经各自模型分发路径携带 |
+| `mod.rs` 新增 `lang_from_charset` / `qwen3_prefix_lang` / `strip_qwen3_language_prefix_lang` / `redecode_with_ranges` / `acc_vs_streaming_after_drop` | 语种解析（前缀优先/字符集兜底）+ 406 按剔除比例放宽 | ✅ 平台中立纯逻辑，macOS 同继承 |
+| **macOS 侧需要做什么** | | ① 在所有 `CtxInject` 构造点补 `new_slice_from`；② 适配 `transcribe_acc_ctx` 三元返回；③ 携带上述声纹模型文件（sha 一致）；④ 无新增开关/env（DEC-031） |

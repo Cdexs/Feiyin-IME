@@ -2484,9 +2484,10 @@ mod tests {
                 avg_chars_per_sec: None,
                 speech_ranges: None,
                 streaming_nonempty: false,
+                new_slice_from: 0,
             },
         )
-        .map(|(t, _)| t)
+        .map(|(t, _, _)| t)
         .map_err(|e| format!("{e:#}"))
     }
 
