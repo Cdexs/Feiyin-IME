@@ -236,3 +236,11 @@
 - **验证（白名单）**：`rustfmt --config skip_children=true`（两文件）CLEAN；`cargo check --all-targets` **EXIT 0**、0 error、warnings **92/87** = 基线、两文件零新增 warning。🔴 **未跑 `cargo test`**（阶段三禁止，首跑由 tester-1）。
 - **疑似生产缺陷：未发现**；**未改生产代码 / 未 commit / 未 push / 零凭证**。
 - **返修（tester-1 回归红，测试自身错误）**：`ts407_tail_only_when_pending_source_guard` 原用固定 2600 字符窗口截 `AccInput::LongSilence` 臂，而 `pending_slice = None;` 在臂内 ~5173 字符 ⇒ 假红。改为 `arm_body()`：对臂体 `{…}` **括号配平**（跳过字符串/字符/行·块注释内括号，防 `[GUARD-SKIP-BRACE-IN-STRING-382]`）截到**臂闭合 `}`**；sandbox 复刻验证 seg=5173、含三断言串。仅测试自身修正，生产零改动。验证：`rustfmt --skip_children` CLEAN；`cargo check --all-targets` 0 error、warnings 92/87=基线。
+
+## 2026-09-24 — coder-2 — TEST-SYNC-410 ✅ 交付（阶段三 · 末尾窗 × 406 配合护栏 6 条）
+
+- **被测**：`FIX-TAIL-GUARD-410`（末尾窗 × 406 守卫配合：`tail_streaming_baseline` / `TailPending` 只兜底 pending / 进程级标点服务线程），作者 coder-1，HEAD `e4cae44`。
+- **范围**：`src/main.rs` **仅**追加 `#[cfg(test)] mod testsync410_tests`（+186/0，6 条）；生产代码零改动。
+- **6 条**：真实数据比例基准 accept（整前片误拒）；幻觉/空拒；窗#0 带标点前片 → 末尾窗被拒 ⇒ 只追加加标点 pending、前片逐字不变；边界（suffix=0/≥prev/prev 空/prev_samples=0、比例四舍五入、多字节）；`run_punct_retries` 分类；`punct_cooldown_active` 冷却窗口。
+- **验证（白名单）**：`rustfmt --config skip_children=true src/main.rs` CLEAN；`cargo check --all-targets` **EXIT 0**、0 error、warnings **92/87** = 基线；sandbox 复刻 `acc_vs_streaming` + `tail_streaming_baseline` 验证 ①~④ 全分支 ✅。🔴 **未跑 `cargo test`**（阶段三禁止，首跑由 tester-1）。
+- **疑似生产缺陷：未发现**；**未改生产代码 / 未 commit / 未 push / 零凭证**。

@@ -18877,3 +18877,189 @@ mod testsync407_tests {
         );
     }
 }
+
+// =====================================================================
+// TEST-SYNC-410（阶段三 · 非作者护栏，coder-2）：末尾窗 × 406 守卫**配合**
+//   作者 coder-1（`fix410_tail_guard_tests`）；本模块只补独立护栏，不照抄实现。
+// =====================================================================
+#[cfg(test)]
+mod testsync410_tests {
+    use super::{
+        punct_cooldown_active, run_punct_retries, tail_streaming_baseline, PunctTry,
+        PUNCT_RESTART_COOLDOWN_SECS, PUNCT_START_MAX_RETRIES,
+    };
+    use crate::transcription::{acc_vs_streaming, OrderedReflow};
+
+    /// 契约1（真实数据 · BUILD-409 16:34Z）：整前片基准误拒；真实比例（4.0s/6.91s）基准 accept；
+    /// 基准字数随 suffix 单调不减且恒 ≤ 前片+pending。
+    #[test]
+    fn ts410_real_data_ratio_and_monotonic() {
+        let prev = "周末天气好的话一起出来玩吧我们一起可以出去看看电影也可以挤出去吃饭然后也可以到郊外去旅游旅游";
+        let pending = "或者到附进去旅游";
+        let jie = "然后也可以到郊外去旅游旅游，或者到附近去旅游。";
+        let old = format!("{prev}{pending}");
+        assert!(
+            !acc_vs_streaming(jie, &old).accept,
+            "整前片基准应误拒（复现 BUILD-409 缺陷）"
+        );
+        let prev_samples = 110_560usize; // 6.91s @16k
+        let baseline = tail_streaming_baseline(prev, 64_000, prev_samples, pending); // 4.0s
+        assert!(
+            acc_vs_streaming(jie, &baseline).accept,
+            "真实比例基准应 accept（ret={:.2} len={:.2}）",
+            acc_vs_streaming(jie, &baseline).retention,
+            acc_vs_streaming(jie, &baseline).len_ratio
+        );
+        // 单调 + 上界。
+        let total = prev.chars().count() + pending.chars().count();
+        let mut last = 0usize;
+        for ratio in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            let suffix = (prev_samples as f32 * ratio) as usize;
+            let n = tail_streaming_baseline(prev, suffix, prev_samples, pending)
+                .chars()
+                .count();
+            assert!(n >= last, "基准字数应随 suffix 单调不减");
+            assert!(n <= total, "基准不得超出 前片+pending");
+            last = n;
+        }
+    }
+
+    /// 契约2（反例）：幻觉（近零重合）/ 空精解 ⇒ 被 406 拒。
+    #[test]
+    fn ts410_hallucination_and_empty_rejected() {
+        let prev = "周末天气好的话一起出来玩吧";
+        let pending = "或者到附近去旅游";
+        let b = tail_streaming_baseline(prev, 64_000, 110_560, pending);
+        assert!(
+            !acc_vs_streaming("完全无关的另一段幻觉内容", &b).accept,
+            "幻觉应拒"
+        );
+        assert!(!acc_vs_streaming("", &b).accept, "空应拒");
+    }
+
+    /// 契约2+3（配合）：窗#0 已回灌带标点前片 → 末尾窗被拒 ⇒ 只以 span(p,p+1) 追加「加标点 pending」；
+    /// 前片文本**逐字不变**。
+    #[test]
+    fn ts410_reject_fallback_appends_pending_only_keeps_prev() {
+        let mut o = OrderedReflow::new();
+        let prev_punct = "周末天气好的话，一起出来玩吧。";
+        let pending_punct = "或者到附近去旅游。";
+        let _ = o.push_window(0, 0, 1, vec![120], prev_punct.to_string()); // 窗0 带标点
+        let _ = o.push_window(1, 1, 2, vec![60], pending_punct.to_string()); // 末尾窗被拒 ⇒ 兜底 pending
+        let (committed, last) = o.finish();
+        let full = format!("{committed}{last}");
+        assert!(
+            full.starts_with(prev_punct),
+            "前片已回灌文本须逐字不变：{full}"
+        );
+        assert_eq!(
+            full,
+            format!("{prev_punct}{pending_punct}"),
+            "只追加加标点 pending"
+        );
+    }
+
+    /// 契约4（边界语义）：suffix=0 ⇒ 仅 pending；suffix≥prev ⇒ 整前片+pending；prev 空 / prev_samples=0
+    /// ⇒ 仅 pending；比例四舍五入；多字节（emoji/中英）字数精确、不 panic。
+    #[test]
+    fn ts410_baseline_boundary_semantics() {
+        let prev = "一二三四五六七八九十"; // 10 chars
+        let pending = "尾";
+        assert_eq!(
+            tail_streaming_baseline(prev, 0, 100, pending),
+            pending.to_string()
+        );
+        assert_eq!(
+            tail_streaming_baseline(prev, 100, 100, pending),
+            format!("{prev}{pending}")
+        );
+        assert_eq!(
+            tail_streaming_baseline(prev, 999, 100, pending),
+            format!("{prev}{pending}"),
+            "suffix > 前片 ⇒ 封顶整前片"
+        );
+        assert_eq!(
+            tail_streaming_baseline("", 5, 10, pending),
+            pending.to_string()
+        );
+        assert_eq!(
+            tail_streaming_baseline(prev, 5, 10, pending),
+            format!("{}{pending}", "六七八九十"),
+            "10×0.5=5 字"
+        );
+        assert_eq!(
+            tail_streaming_baseline(prev, 5, 0, pending),
+            pending.to_string(),
+            "prev_samples=0 ⇒ 比例 0"
+        );
+        let multi = "hello你好😀世界"; // 10 chars
+        let b = tail_streaming_baseline(multi, 5, 10, "👋");
+        assert_eq!(b.chars().count(), 5 + 1, "多字节按 char 切、不越界");
+        assert!(b.ends_with("👋"));
+    }
+
+    /// 契约5：`run_punct_retries` 分类 —— Ok 短路；**Timeout 不重启（仅 1 次）**；
+    /// Unavailable/AbnormalExit 重启重试至多 `PUNCT_START_MAX_RETRIES` 次；中途成功即返回。
+    #[test]
+    fn ts410_punct_retries_classification() {
+        use std::cell::Cell;
+        let n = Cell::new(0);
+        let r = run_punct_retries(|_| {
+            n.set(n.get() + 1);
+            PunctTry::Ok("x".to_string())
+        });
+        assert_eq!((r.as_deref(), n.get()), (Ok("x"), 1));
+
+        let n = Cell::new(0);
+        let r = run_punct_retries(|_| {
+            n.set(n.get() + 1);
+            PunctTry::Timeout
+        });
+        assert_eq!((r, n.get()), (Err("timeout"), 1), "超时不得重启");
+
+        let n = Cell::new(0);
+        let r = run_punct_retries(|_| {
+            n.set(n.get() + 1);
+            PunctTry::Unavailable
+        });
+        assert_eq!(
+            (r, n.get()),
+            (Err("startup-failed"), PUNCT_START_MAX_RETRIES + 1),
+            "连续启动失败 ⇒ 无标点"
+        );
+
+        let k = Cell::new(0);
+        let r = run_punct_retries(|_| {
+            k.set(k.get() + 1);
+            if k.get() == 1 {
+                PunctTry::AbnormalExit
+            } else {
+                PunctTry::Ok("y".to_string())
+            }
+        });
+        assert_eq!((r.as_deref(), k.get()), (Ok("y"), 2), "异常退出后重启成功");
+    }
+
+    /// 契约5：冷却窗口 —— 距上次失败 < `PUNCT_RESTART_COOLDOWN_SECS` ⇒ 生效；到点 / 无记录 ⇒ 不生效。
+    #[test]
+    fn ts410_punct_cooldown_window() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        assert!(!punct_cooldown_active(None, now), "无失败记录 ⇒ 不冷却");
+        assert!(punct_cooldown_active(Some(now), now), "刚失败 ⇒ 冷却");
+        assert!(
+            punct_cooldown_active(
+                Some(now),
+                now + Duration::from_secs(PUNCT_RESTART_COOLDOWN_SECS - 1)
+            ),
+            "冷却期内"
+        );
+        assert!(
+            !punct_cooldown_active(
+                Some(now),
+                now + Duration::from_secs(PUNCT_RESTART_COOLDOWN_SECS)
+            ),
+            "冷却到点 ⇒ 可重试"
+        );
+    }
+}
