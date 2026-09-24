@@ -8,6 +8,14 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-24 — coder-1 — SPEAKER-VERIFY-408A ✅ 阶段一交付（待主控验收）
+
+- **新增 `src/transcription/speaker.rs`**（平台中立，**未接入管线**）：`SpeakerVerifier::load/embed`、`cosine`、`Voiceprint`（自动注册 ≥12s/≥3 段 + 离群剔除 `cos<0.5`；漂移 EMA `α=min(secs/(total+secs),0.25)` 仅 `score≥0.75` 段）、`judge`/`SegVerdict`（`<2s`/`ja·未知`/未就绪 保留；`score<0.45` 才剔除）。
+- **不改 `mod.rs`**：`src/bin/poc_speaker_408.rs`（`#[path="../transcription/speaker.rs"]`）临时宿主；**408B 接入后删本文件 + 模块 `#![allow(dead_code)]`**；mod 行待主控在 406 后合。
+- **模型**：`models/speaker-campplus-zh-en/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx`（28,281,164B，sha256 `aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2`，gitignore）。
+- **验证**：模块 **10P/1I**；真模型 本人 cos 0.966 vs 他人 ≤0.093；`fmt --check` EXIT 0；`check --all-targets` 0 error、warnings 92/87=基线；全量 `cargo test` 0 failed。证据 `collab/evidence/408a/`。
+- 红线：未改 `main.rs`/`mod.rs`/`local_stream.rs` / 未 commit / 未 build release / 版本未动 / 零凭证。
+
 ## 2026-09-24 — coder-1 — LOCALRT-PERF-405 ✅ 阶段一交付（待主控验收）
 
 - **性质**：只动 `local_stream.rs` / `patches/ctranslate2-sys/build.rs` / `scripts/init-publish.ps1`（+ 主控许可的 `qwen_inference.rs` 删 1 死方法）；**未动** `main.rs`/`transcription/mod.rs`（coder-2 的 406）。

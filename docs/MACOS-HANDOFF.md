@@ -8,6 +8,19 @@
 
 ## 0 · 先读这份，再读那两份
 
+### 0.9 · SPEAKER-VERIFY-408A 声纹模块（新增平台中立模块 + 新模型文件）（2026-09-24）
+
+- **新增文件**：`src/transcription/speaker.rs`（**平台中立**，macOS 编译同一份）——声纹提取（sherpa-onnx
+  CAM++）、自动注册、漂移更新、保守段判定。**本单未接入任何管线**（剪静音 / `main.rs` 是 408B）；
+  `mod` 声明由主控在 406 后合入 `src/transcription/mod.rs`。
+- **新增模型文件**：`models/speaker-campplus-zh-en/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx`
+  （28,281,164B，sha256 `aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2`）。
+  🔴 **macOS 侧若要启用声纹，需把同一模型放到 `<exe_dir>/models/<同名子目录>/`**（DEC-011）。
+- ✅ **无 Windows 专属依赖**：只依赖 `sherpa_onnx`（跨平台）+ `serde_json`；macOS 编译同一份源码即继承。
+- ⚠️ 临时 `src/bin/poc_speaker_408.rs` 仅用于本单测试，**408B 接入后删除**（不影响 macOS）。
+- 408B 接入点（预期）：本地实时流式「近场门已确认的本人候选段」调 `offer`；对每个 ≥2s 待定段调 `judge`，
+  仅 `DropNonUser` 才丢弃该段内容；**日语 / 未知语言一律保留**（404B 未测日语）。
+
 ### 0.8 · LOCALRT-PERF-405 本地实时流式性能：移除影子收尾等（平台中立）（2026-09-24）
 
 - **文件域**：`src/transcription/local_stream.rs`（**平台中立**，macOS 编译同一份）、

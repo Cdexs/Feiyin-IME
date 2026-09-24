@@ -1,4 +1,10 @@
 
+### 2026-09-24 · SPEAKER-VERIFY-408A 交付（声纹模块，独立，未接入管线）
+
+- 新增 `src/transcription/speaker.rs`（平台中立）：加载/embed、自动注册（≥12s/≥3 段 + 离群剔除）、漂移 EMA、保守判定（<2s / ja / 未就绪 全保留；score<0.45 才剔除）。
+- 模型 `models/speaker-campplus-zh-en/…advanced.onnx`（sha256 `aa3cfc…`，gitignore）。
+- 不改 `mod.rs`：临时 `src/bin/poc_speaker_408.rs`（`#[path]` 宿主）；模块 **10P/1I**、真模型本人 0.966 vs 他人 ≤0.093；`check --all-targets` 0 error、warnings 92/87=基线；全量 test 0 failed。未出包。
+
 ### 2026-09-24 · LOCALRT-PERF-405 交付（本地实时流式性能五项）
 
 - **影子收尾移除**（DEC-086）：删影子重解分支/状态/常量/`endpoint_confirm_text`/DBG 日志/测试，显示改主解，新增护栏；未动切句/342/派发/sentence_id。
