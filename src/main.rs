@@ -7562,20 +7562,18 @@ fn set_auto_start(enabled: bool) -> Result<()> {
 /// ASR-DUAL-B-001: 加载 hotwords 字符串（使用 accuracy 引擎的档位需要）
 /// 从 wordbook 读取所有单词，按 id 排序保证哈希稳定，构建逗号分隔字符串
 /// performance 模式返回 None（不支持 hotwords）
-// LOCALRT-TERMS-PREFIX-398（推翻 DEC-083）：本地实时 B 路径 1.7B **恢复注入词库** —— Gavin 2026-09-24
-// 拍板「我建议我们也在词条前加 Technical terms」「修改这么简单，就直接改了吧」。改用外部 184 次实测
-// 唯一有效格式 `Technical terms: a, b, c.`（见 `transcription::build_ctx_system` 注释与
-// `collab/research/qwen3-hotwords-failure-2026-09-24.md`）。
-// 🔴 判据：`AsrModel::LocalRealtime` 与 `AsrModel::Accuracy` 一样走 `uses_accuracy_engine()` 门、会读词库；
-// 其余分支（Performance / 在线）逐位不变。
-// 历史：LOCALRT-NO-HOTWORDS-396（DEC-083）曾对 LocalRealtime 在读词库前早退 `None`（注入裸词表首解
-// 异常率 28%：窗空 / 坍塌 2 字 / 念出词条 / 截尾 / 跳到词条）—— 398 用固定前缀格式取代裸词表，恢复注入。
-// FIX-LOCALRT-ENGINE-EQ-252：LocalRealtime 的最终转录引擎也是 accuracy（带热词）⇒ 改词库会触发重载
-// （`main.rs` `needs_reload` 判据用 `uses_accuracy_engine()`，本就覆盖 LocalRealtime）。
+// LOCALRT-NO-HOTWORDS-396（DEC-083）：本地实时 B 路径 1.7B **不再注入词库** —— 注入时首解异常率 28%
+//（窗空 / 坍塌 2 字 / 念出词条 / 截尾 / 跳到词条），不注入重解均完整。词库只在开启 LLM 优化时生效。
+// 🔴 判据：`AsrModel::LocalRealtime` 在读词库**之前**早退 `None`；`AsrModel::Accuracy` 行为逐位不变。
+// FIX-LOCALRT-ENGINE-EQ-252（已被 396 取代）：原判据「LocalRealtime 的最终转录引擎也是 accuracy（带
+// hotwords）」不再成立 —— 本地实时 B 路径的滑窗精解不再带热词，改词库不再触发 1.7B 重载。
 // MACOS-P4-NEUTRAL-002: 平台中立纯 Rust（AsrModel 判定 + wordbook 读取 + build_hotwords_string）。
 fn load_hotwords_for_accuracy(config: &AppConfig) -> Option<String> {
     let model = transcription::AsrModel::from_config(&config.audio.asr_model);
-    // LOCALRT-TERMS-PREFIX-398：LocalRealtime 不再早退（396/DEC-083 已推翻），与 Accuracy 同走下方读取。
+    // LOCALRT-NO-HOTWORDS-396（DEC-083）：本地实时不注入词库（在读词库之前早退）。
+    if model == transcription::AsrModel::LocalRealtime {
+        return None;
+    }
     if !model.uses_accuracy_engine() {
         return None;
     }
@@ -11192,14 +11190,13 @@ fn drive_acc_windows<A, R>(
     }
 }
 
-/// LOCALRT-TERMS-PREFIX-398（推翻 DEC-083）：`load_hotwords_for_accuracy` 对本地实时档**不再早退**，
-/// 与 Accuracy 一样读词库 —— 恢复路B 词库注入（格式见 `build_ctx_system` 的 `Technical terms:`）。
+/// LOCALRT-NO-HOTWORDS-396（DEC-083）：`load_hotwords_for_accuracy` 对本地实时档早退 `None`。
 #[cfg(test)]
-mod fix398_tests {
-    /// 源码护栏：`load_hotwords_for_accuracy` 函数体内**不含**「读词库前对 `LocalRealtime` 早退」
-    /// 的分支（396 已推翻）；`uses_accuracy_engine()` 门保留 ⇒ Accuracy 与 LocalRealtime 都会继续读词库。
+mod fix396_tests {
+    /// 源码护栏：`load_hotwords_for_accuracy` 函数体内，对 `AsrModel::LocalRealtime` 的早退出现在
+    /// **读词库（`Wordbook::open(`）之前**，且早退分支确实以 `LocalRealtime` 为条件。
     #[test]
-    fn fix398_local_realtime_no_longer_early_returns() {
+    fn fix396_local_realtime_returns_none_before_wordbook_read() {
         let src = include_str!("main.rs");
         let body = src
             .split("fn load_hotwords_for_accuracy(")
@@ -11212,19 +11209,23 @@ mod fix398_tests {
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        // 398：不得再出现 `AsrModel::LocalRealtime` 的早退判据。
+        let early = code
+            .find("AsrModel::LocalRealtime")
+            .expect("396：LocalRealtime 早退判据缺失");
+        let read = code.find("Wordbook::open(").expect("396：读词库调用缺失");
         assert!(
-            !code.contains("AsrModel::LocalRealtime"),
-            "398：LocalRealtime 早退判据必须删除（已恢复注入）：\n{code}"
+            early < read,
+            "396：LocalRealtime 早退必须在读词库之前（early={early} read={read}）"
         );
-        // 恢复注入的前提门：uses_accuracy_engine() 覆盖 LocalRealtime ⇒ 会继续读词库。
+        // 早退条件必须绑定 LocalRealtime（而非其它变体）。
+        assert!(
+            code.contains("== transcription::AsrModel::LocalRealtime"),
+            "396：早退条件必须 `== AsrModel::LocalRealtime`"
+        );
+        // Accuracy 路径不变：仍保留 uses_accuracy_engine() 门。
         assert!(
             code.contains("uses_accuracy_engine()"),
-            "398：uses_accuracy_engine() 门不得删除"
-        );
-        assert!(
-            code.contains("Wordbook::open("),
-            "398：恢复读词库路径（Wordbook::open 调用缺失）"
+            "396：Accuracy 路径的 uses_accuracy_engine() 门不得删除"
         );
     }
 }
