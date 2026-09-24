@@ -19,6 +19,16 @@
 - 🔴 **交班 tester-1 注意**：① DLL 依赖新增 `VCOMP140.DLL`（VC++ 2015-2022 Redist 自带，与 MSVCP140/VCRUNTIME140 同包）；CT2 DLL 体积 8.2MB → 27.4MB；② 出 release 时 oneDNN 会按 Release 重编（dev 档 bench 是 Debug oneDNN，release 只会更快/相近）；③ 首次 release 构建 ctranslate2-sys 会多编 oneDNN（约 +2~3 分钟，本机 debug 实测 3m41s）。
 - 红线：未 commit / 未 push / 未出包 / 版本号未动 / 未 `cargo clean` / 零凭证。
 
+## 2026-09-24 — tester-1 — TEST-EXEC + BUILD-398 ✅ 出包（397+398 合包；八项 + 专项 A~D + 三特殊点全 PASS；回归与构建并行）
+
+- **交付源码**：HEAD `9686621`（`678c7a0` 397 + `9686621` 398），工作区 clean，版本 0.9.3。单：`TRANS-CT2-DNNL-THREADS-397`（CT2 换 oneDNN + OpenMP、NLLB 线程 `min(核,8)`）+ `LOCALRT-TERMS-PREFIX-398`（本地实时路B 恢复词库注入 `Technical terms: a, b, c.` + 前缀回显剥离，推翻 DEC-083 立 DEC-084）。
+- **回归（与构建并行）**：root `cargo test --no-fail-fast` **1685P/0F/46I**（EXIT 0；11 二进制）；`src-tauri` **92P/0F/0I**；`cargo fmt --check` **EXIT 0**；Vitest **SKIP**（`ui/` 无 diff）。NEW/GONE 基线 **BUILD-395 `1a8f00d`**（1682P/45I）：**+8P**（`fix398_*` 4 + `ctx398_*` 4）**+1I**（`bench397_real_model`）**−5P**（`fix377_build_ctx_system_is_bare_terms_only` + `ctx377_*` 4）⇒ **1685P/46I**。🔴 `collab/evidence/397/full_test.log` 实为 398 状态（1685P/46I、含 `fix398`、无 `fix396`），**非可用基线**（397+398 同树跑后拆 commit）。
+- **构建**：Step1 残 0 → npm 1.47s + Tauri 3m16s(17w) → Step2c UI cp(`ee7f2571…`) → main 7m57s(92w + crash 9w，含 CT2 oneDNN release 编译) → Step4 三 exe + **ctranslate2.dll** + 四 rules toml → Publish。产物 main `15c3ec9f853e…`(14,934,528B/13:45:05) / ui `ee7f2571f1d4…`(10,050,048B/13:45:21) / crash `c6a38d5b9d49…`(24,879,104B/13:43:19)；两副本全等、三者均异于 BUILD-396。
+- **八项逐项 PASS**：①时间戳 13:37–13:45 ②两副本 sha 相等且异于上包 ③**0.9.3** ④冒烟 PID **24488 Responding=True** / 无新 crash.json / 无新 panic / `WM_CLOSE`→controller **335ms** 退出 / 残 0 ⑤config `da2be5da…` 不变 ⑥warnings 92/87/17/9（+ `ctranslate2-sys` 18=397 基线）⑦正探针 `Technical terms: `=1、`(threads=`=1；反探针 `initialized at {}"`=0、`Terms:`=0 ⑧scene/itn/homophone/wordbook 四表三副本全等。
+- **专项 A~D**：A 新 DLL `b7a5e2c1…` 27,405,312B，Publish==target/release，≠旧 `e28b44b8…` 8,168,448B；B pefile 导入 OLD 15→NEW 16，**仅多 `VCOMP140.DLL`、无 `dnnl.dll`**；C `target/release/deps/ctranslate2.dll`==`target/release/ctranslate2.dll`；D 冒烟 `-debug` 真实日志 **`NLLB CT2 model initialized at … (threads=8)`**（16 核 ⇒ 8）。
+- **三特殊点（仅核验）**：① sherpa 四 DLL 三副本全等 + `onnxruntime` **1.28.2**；② itn-rules 三副本 `60b227de…` 全等；③ `Publish/models/` 1.7B 七文件与源 sha256 全等、0.6B 保留。
+- 🔴 **Step1 强杀输入法进程 ⇒ 已提醒 Gavin 重启 + 带 `-debug` 端测**。未 push / 版本号未动 / 未改生产代码 / 未 `cargo clean` / 零凭证。证据 `collab/evidence/398/`。
+
 ## 2026-09-24 — tester-1 — BUILD-396 ✅ 出包（小改动短路径；八项 + 三特殊点全 PASS）
 
 - **交付源码**：HEAD `5218c92`（= 任务书 `660378a` + docs-only），工作区 clean，版本 0.9.3。单 `LOCALRT-NO-HOTWORDS-396`（DEC-083）：本地实时 B 路径 1.7B 滑窗精解**不再注入词库**（`load_hotwords_for_accuracy` 对 `AsrModel::LocalRealtime` 早退 `None`；Accuracy/在线/LLM 用词库不变）。**Gavin 指示：小改动精确范围 ⇒ 不跑全量回归**。

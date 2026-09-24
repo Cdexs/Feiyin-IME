@@ -1,4 +1,11 @@
 
+### 2026-09-24 · TEST-EXEC + BUILD-398 出包（397 + 398 合包；回归与构建并行）
+
+- 回归：root `cargo test --no-fail-fast` **1685P/0F/46I**（EXIT 0）/ `src-tauri` **92P/0F/0I** / `fmt --check` EXIT 0 / Vitest SKIP（`ui/` 无 diff）。
+- NEW/GONE（基线 BUILD-395 `1a8f00d`）：+8P −5P +1I（`fix396_*` 相对 395 净零）。
+- 出包八项 + 专项 A~D + 三特殊点全 PASS；产物 main `15c3ec9f…` / ui `ee7f2571…` / crash `c6a38d5b…`；CT2 DLL **27.4MB**（旧 8.1MB）已同步 `Publish/`，导入仅多 `VCOMP140.DLL`；冒烟 `-debug` 实证 `NLLB … (threads=8)`，`WM_CLOSE` **335ms** 退出。
+- 🔴 出包强杀输入法进程，已提醒 Gavin 重启 + 带 `-debug` 端测。
+
 ### 2026-09-24 · LOCALRT-TERMS-PREFIX-398 交付（本地实时路B 恢复词库注入，改用 `Technical terms: a, b, c.` 固定前缀）
 
 - **推翻 DEC-083、立 DEC-084**：删除 `load_hotwords_for_accuracy` 的 `AsrModel::LocalRealtime` 早退（与 Accuracy 同走 `uses_accuracy_engine()` 门）；`build_ctx_system` 输出由裸词表 `a,b,c` 改为 `Technical terms: a, b, c.`（前缀 + `, ` 连接 + 英文句点；按 `,` 切分逐条 trim、丢空段；空词表 None）。
