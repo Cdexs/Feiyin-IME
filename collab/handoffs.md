@@ -8,6 +8,15 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-24 — coder-1 — POC-SPEAKER-VERIFY-404B ✅ 交付（PoC，待主控验收）
+
+- **性质**：延续 404，只改 `#[cfg(test)]` PoC + 文档，未改生产。语言按主控确认「中英韩日」。
+- **数据**（~1.3GB scratch，已清理）：zh=AISHELL-1 10 人；en=LibriSpeech test-clean 12 人；ko=Zeroth-Korean 12 人；**ja=缺口**（逐源排除）。
+- **模型**：加 CAM++ zh_en / CAM++ en-vox / WeSpeaker ResNet34 en-vox / ERes2Net en-vox（+404 两个）。
+- **结果**：**推荐修正为 `CAM++ zh_en`**（中 0%、英 2-5s 0.10%、韩 1.33%）；备选 ERes2NetV2 / ERes2Net en-vox；**CAM++ en-vox 异常差不推荐**；1-2s 偏弱、≥2s 才可靠、韩语最难；高置信剔除率好模型 94~100%。
+- **缺口**：ja 未测 + 无「同一人多语」数据 ⇒ 补录清单（≥3~5 人、每人每语 ≥10 句 ≥2s、安静房+旁人说、16k WAV）。
+- 结论 `collab/research/speaker-verify-404.md`（404B 章节）；证据 `collab/evidence/404/corpus_404b.txt`。pyarrow 走 scratch 独立 venv（系统 Python 已还原）；删 scratch ~4.3GB。未 commit/未构建/版本未动/零凭证。
+
 ## 2026-09-24 — coder-1 — POC-SPEAKER-VERIFY-404 ✅ 交付（PoC，待主控验收）
 
 - **性质**：只新增 `#[cfg(test)]` PoC 模块 + 调研文档，**未改任何生产逻辑**。
@@ -15,7 +24,7 @@
 - **协议**（满足「不是只为我定制」）：8 名说话人（Gavin+外部 7）**每人轮流当使用人**、其余为背景；池化全局阈值 + 逐人 FAR/FRR + 最差。
 - **结果**：≥2s 池化 EER **CAM++ 0.26%（最优）**、其余中文 0.53%、ResNet293 2.51%（整位使用者被拒）；1-2s ERes2NetV2 3.07%；**<1s 全不可用**。CAM++ 最快（3s ~40ms）。**高置信剔除阈值 0.55~0.65 → 背景剔除 ~96~99%**、使用者误拒≈0；叠加 score 0.82→0.42（不剔除）。
 - **接入设计**：只做高置信剔除 + 延迟到最终注入前（不撤回预览）；最短音频 ≥2s。
-- 结论 `collab/research/speaker-verify-404.md`；证据 `collab/evidence/404/`。🔴 缺口：无「本人+旁边人同时说」实录，建议 Gavin 补录。清理 439MB scratch 模型。
+- 结论 `collab/research/speaker-verify-404.md`；证据 `collab/evidence/404/`。🔴 缺口：无「本人+旁边人同时说」实录，建议 Gavin 补录。清理 scratch 模型。
 - 红线：未 commit / 未构建 / 版本号未动 / 零凭证。
 
 ## 2026-09-24 — coder-1 — RELEASE-ISS-FIX-401 ✅ 阶段一交付（待主控验收）

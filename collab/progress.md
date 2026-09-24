@@ -1,4 +1,10 @@
 
+### 2026-09-24 · POC-SPEAKER-VERIFY-404B 交付（声纹四语复测 + 跨语言注册 PoC）
+
+- 四语数据：zh=AISHELL-1 10 人 / en=LibriSpeech 12 人 / ko=Zeroth 12 人，各 ≥10 条 ≥2s；**ja=缺口**（无公开带标注自然人语料）。
+- **推荐修正为 `CAM++ zh_en`**（中 0%、英 2-5s 0.10%、韩 1.33%）；备选 ERes2NetV2/ERes2Net en-vox；CAM++ en-vox 异常差不推荐；≥2s 才可靠、韩语最难。
+- 跨语言注册无「同一人多语」数据 ⇒ 缺口 + 补录清单。仅改 `#[cfg(test)]` PoC + 文档；scratch ~4.3GB 已清理。未出包。
+
 ### 2026-09-24 · POC-SPEAKER-VERIFY-404 交付（声纹判别模型选型 PoC）
 
 - 6 个 sherpa-onnx speaker-embedding 模型对比；**跨说话人轮流注册**（8 人，每人轮流当使用人，满足「不是只为我定制」）。

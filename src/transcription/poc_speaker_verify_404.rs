@@ -238,11 +238,23 @@ fn round_robin(
     len: usize,
     enroll_n: usize,
 ) -> Rr {
+    round_robin_cap(ex, spks, len, enroll_n, MAX_WIN_PER_SPK, MAX_PER_OTHER)
+}
+
+/// 同上，但窗口/背景上限可调（404B 语料说话人 utt 多，需另定上限）。
+fn round_robin_cap(
+    ex: &SpeakerEmbeddingExtractor,
+    spks: &[(String, Vec<f32>)],
+    len: usize,
+    enroll_n: usize,
+    win_cap: usize,
+    per_other: usize,
+) -> Rr {
     // 每个说话人窗口嵌入只算一次（缓存）
     let cache: Vec<(String, Vec<Vec<f32>>)> = spks
         .iter()
         .map(|(n, a)| {
-            let ws: Vec<Vec<f32>> = windows(a, len).into_iter().take(MAX_WIN_PER_SPK).collect();
+            let ws: Vec<Vec<f32>> = windows(a, len).into_iter().take(win_cap).collect();
             let embs: Vec<Vec<f32>> = ws.iter().filter_map(|w| embed(ex, w)).collect();
             (n.clone(), embs)
         })
@@ -264,7 +276,7 @@ fn round_robin(
             if i == j {
                 continue;
             }
-            for x in cache[j].1.iter().take(MAX_PER_OTHER) {
+            for x in cache[j].1.iter().take(per_other) {
                 imp.push(dot(&cent, x));
             }
         }
@@ -501,6 +513,127 @@ fn poc_speaker_404_timing() {
                 "{label}\t{threads}\t{:.0}\t{:.0}\t{:.0}",
                 cells[0], cells[1], cells[2]
             );
+        }
+    }
+}
+
+// ===========================================================================
+// 404B：四语语料（zh/en/ko 已建；ja 无公开可用「带说话人标注的自然人」语料 ⇒ 缺口）
+// ===========================================================================
+
+const MODELS_404B: [(&str, &str); 6] = [
+    (
+        "CAM++ zh-cn(中)",
+        "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
+    ),
+    (
+        "ERes2NetV2 zh-cn(中)",
+        "3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
+    ),
+    (
+        "CAM++ zh_en(中英)",
+        "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
+    ),
+    (
+        "CAM++ en-vox(英)",
+        "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",
+    ),
+    (
+        "WeSpeaker R34 en-vox(英)",
+        "wespeaker_en_voxceleb_resnet34.onnx",
+    ),
+    (
+        "ERes2Net en-vox(英)",
+        "3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx",
+    ),
+];
+
+/// 读 `<scratch>/corpus/<lang>/<spk>/*.wav`，按说话人拼接（上限 cap_secs）。
+fn corpus_lang(lang: &str, cap_secs: usize, max_spk: usize) -> Vec<(String, Vec<f32>)> {
+    let d = scratch().join("corpus").join(lang);
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(&d) else {
+        return out;
+    };
+    let mut spks: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    spks.sort();
+    for sp in spks.into_iter().take(max_spk) {
+        let name = sp.file_name().unwrap().to_string_lossy().to_string();
+        let mut wavs: Vec<PathBuf> = std::fs::read_dir(&sp)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("wav"))
+            .collect();
+        wavs.sort();
+        let cap = cap_secs * RATE as usize;
+        let mut audio = Vec::new();
+        for w in wavs {
+            if audio.len() >= cap {
+                break;
+            }
+            if let Some(mut s) = load(&w) {
+                audio.append(&mut s);
+            }
+        }
+        if audio.len() >= 3 * RATE as usize {
+            out.push((name, audio));
+        }
+    }
+    out
+}
+
+#[test]
+#[ignore = "PoC: cargo test --bin feiyin-ime -- --ignored --nocapture poc_speaker_404b_corpus"]
+fn poc_speaker_404b_corpus() {
+    println!("\n===== POC-SPEAKER-404B · 四语语料（zh/en/ko；ja 缺口）=====");
+    for lang in ["zh", "en", "ko"] {
+        let spks = corpus_lang(lang, 120, 10);
+        let total: usize = spks.iter().map(|(_, a)| a.len()).sum::<usize>() / RATE as usize;
+        println!("\n### 语言 {lang}: {} 说话人，共 {}s", spks.len(), total);
+        println!("model\tbucket\t#spk\t#gen/#imp\tEER\tthr\tworstFRR\tworstFAR\thc剔除率");
+        for (label, file) in MODELS_404B {
+            let Some(ex) = create(file, 1) else {
+                println!("{label}\tMISSING");
+                continue;
+            };
+            for (bl, len) in [("1-2s", 24_000usize), ("2-5s", 48_000), ("5-10s", 112_000)] {
+                let r = round_robin_cap(&ex, &spks, len, 5, 20, 16);
+                if r.per.is_empty() {
+                    println!("{label}\t{bl}\tn/a");
+                    continue;
+                }
+                let worst_frr = r
+                    .per
+                    .iter()
+                    .map(|p| p.5)
+                    .filter(|x| x.is_finite())
+                    .fold(0f32, f32::max);
+                let worst_far = r
+                    .per
+                    .iter()
+                    .map(|p| p.6)
+                    .filter(|x| x.is_finite())
+                    .fold(0f32, f32::max);
+                let ng: usize = r.per.iter().map(|p| p.1).sum();
+                let ni: usize = r.per.iter().map(|p| p.2).sum();
+                println!(
+                    "{label}\t{bl}\t{}\t{}/{}\t{:.2}%\t{:.3}\t{:.1}%\t{:.1}%\t{:.1}%",
+                    r.per.len(),
+                    ng,
+                    ni,
+                    r.pooled_eer * 100.0,
+                    r.thr,
+                    worst_frr * 100.0,
+                    worst_far * 100.0,
+                    (1.0 - r.hc_far) * 100.0
+                );
+            }
         }
     }
 }
