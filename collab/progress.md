@@ -1,4 +1,11 @@
 
+### 2026-09-24 · RELEASE-ISS-FROM-PUBLISH-400 交付（安装脚本改从 Publish 取 + 过期内容修正，不带模型）
+
+- `installer/voice-ime.iss`（+`Publish/voice-ime.iss` 逐字副本）`[Files]` 全部改从 `..\Publish\`（17 Publish + 2 assets 白名单，无通配）：三 exe、sherpa×2、onnxruntime×2、`ctranslate2.dll`、五运行库、四规则表；删弃用 paraformer。
+- 排除 `models\`（Gavin 定不带）+ 用户数据 + 开发脚本 + `cudnn64_9.dll`/`libiomp5md.dll`（dumpbin 证无导入）；`MyAppVersion`→0.9.3、`MyAppExeName`→`feiyin-ime.exe`、`MyAppId` 未动。两份 sha 全等。
+- 实证 Source 实存 **19/19 OK**；规则表 exe 同级读取行号已给。
+- 🔴 **核查**：程序无自动模型下载器，缺口单列（仅 Accuracy 有 UI 引导）。未构建/未出包。
+
 ### 2026-09-24 · TEST-EXEC + BUILD-398 出包（397 + 398 合包；回归与构建并行）
 
 - 回归：root `cargo test --no-fail-fast` **1685P/0F/46I**（EXIT 0）/ `src-tauri` **92P/0F/0I** / `fmt --check` EXIT 0 / Vitest SKIP（`ui/` 无 diff）。

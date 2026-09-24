@@ -8,6 +8,15 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-24 — coder-1 — RELEASE-ISS-FROM-PUBLISH-400 ✅ 阶段一交付（待主控验收）
+
+- **性质**：只改安装脚本与文档，**未改 Rust/Cargo/tauri.conf 版本，未构建、未编安装包**。
+- **`.iss` 改动**：`[Files]` 全部改从 `..\Publish\`（17 条 Publish + 2 条 assets，显式白名单无通配；含三 exe、sherpa×2、onnxruntime×2、`ctranslate2.dll`、五运行库、四规则表）；删弃用 paraformer；排除 `models\` + 用户/运行时数据 + 开发脚本 + `cudnn64_9.dll`/`libiomp5md.dll`（dumpbin 证无导入）；`MyAppVersion`→0.9.3、`MyAppExeName`→`feiyin-ime.exe`、`MyAppId` 未动。两份 sha256 全等 `4448d136…`。
+- **验证**：Source 实存检查 **19/19 OK**（`collab/evidence/400/source_check.txt`）；规则表 exe 同级读取行号已给；两份 `.iss` 逐字相同。
+- 🔴 **模型下载能力核查（只查不改，缺口单列）**：程序**无任何自动下载器**；七模型/组件均不能自动下载、仅 Accuracy 有 UI 引导（`src-tauri/src/main.rs:104-129`→`Voice.tsx:270`）；paraformer/VAD/punct 连 URL 都没有。安装包不带模型 ⇒ 干净安装后离线档/翻译在用户手动补模型前不可用。详见 result.md §七。
+- **偏差**：`.iss` UTF-8 无 BOM（未改编码）；`MinVersion=6.1`（Win7）与 DEC-000（Win10+）矛盾、`[UninstallRun]` 未杀 `feiyin-ime-ui.exe`——均未改，已报。
+- 红线：未 commit / 未 push / 未构建 / 版本号（Rust/Cargo/tauri.conf）未动 / 零凭证。
+
 ## 2026-09-24 — coder-1 — RELEASE-VCRT-APPLOCAL-399 ✅ 阶段一交付（待主控验收）
 
 - **性质**：纯脚本 / 安装脚本 / 文档，**不改 Rust 源码 / Cargo / 版本号 / 不构建**。
