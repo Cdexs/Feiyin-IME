@@ -1,4 +1,10 @@
 
+### 2026-09-24 · TEST-SYNC-406-408B 交付（阶段三·非作者护栏 16 条，生产零改动）
+
+- 只加 `#[cfg(test)]`：`mod.rs::testsync406_408b_tests` 10 + `speaker.rs::testsync408b_guard_tests` 6。
+- 406：门限常量/边界、归一化、同音错字/幻觉、精解更短、after_drop 逐位一致+下限、未闭合标签；408B：多档最高分、保留门、partition、新语种闸、new_slice_from、v1→v2 迁移/重建。
+- 契约 7、9(new_slice_from) 内联需模型 ⇒ 源码锚点护栏。白名单：rustfmt CLEAN、check 0 error/warnings 92/87=基线；未跑 cargo test。未发现缺陷。未出包。
+
 ### 2026-09-24 · SPEAKER-VERIFY-408B 交付（声纹接入路B + 按语种分档存档）
 
 - 流程定稿：解码前对所有已就绪语种档取最高分 <0.45 ⇒ 剔除；解码一次取 L（前缀/字符集）；L=ja/未知/档未就绪 ⇒ 原 ranges 重解保护；注册漂移按 L 归档；分档存档（v2，v1 迁移不丢弃）。

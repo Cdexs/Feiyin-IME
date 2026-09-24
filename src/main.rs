@@ -18203,3 +18203,131 @@ mod testsync377_source_guard_tests {
         }
     }
 }
+
+// =====================================================================
+// TEST-SYNC-405-407（阶段三 · 非作者护栏，coder-2）—— 407 1900ms 末尾组窗
+// =====================================================================
+#[cfg(test)]
+mod testsync407_tests {
+    use super::{plan_windows, tail_backtrack_secs, tail_window_span};
+
+    /// 407 契约5（源码）：长静默只在**有 pending** 时组末尾窗；用后清空（停止键不重复处理）。
+    #[test]
+    fn ts407_tail_only_when_pending_source_guard() {
+        let src = include_str!("main.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let arm = code
+            .find("AccInput::LongSilence(pcm_pos) =>")
+            .expect("长静默臂缺失");
+        let seg = &code[arm..(arm + 2600).min(code.len())];
+        assert!(
+            seg.contains("if let Some(p) = pending_slice"),
+            "末尾窗必须以 pending 存在为条件（无 pending 不产生窗口）"
+        );
+        assert!(
+            seg.contains("tail_window_span(Some(p)"),
+            "须用纯决策取 span"
+        );
+        assert!(seg.contains("pending_slice = None;"), "用后须清空 pending");
+    }
+
+    /// 407 契约5：`tail_window_span` 边界（无 pending / 首片 / 末片 / 越界 / p<base）。
+    #[test]
+    fn ts407_span_boundaries_independent() {
+        assert_eq!(tail_window_span(None, 0, 3), None);
+        // i == recent_len-1（末片）⇒ Some((p-1,p+1,i))。
+        assert_eq!(tail_window_span(Some(4), 1, 4), Some((3, 5, 3)));
+        // p < prev_base ⇒ None。
+        assert_eq!(tail_window_span(Some(0), 1, 5), None);
+        // i == recent_len ⇒ None。
+        assert_eq!(tail_window_span(Some(6), 1, 5), None);
+    }
+
+    /// 407 契约6：回溯时长对 2 / 3(冷启动) / 6 字每秒分别 ≥ 6.0 / 4.0 / 2.0，单调不增，
+    /// 且估计字数 ≥ `ALIGN_MIN_OVERLAP_CHARS + 4`（或已达 2s 下限）。
+    #[test]
+    fn ts407_backtrack_property_independent() {
+        for (rate, want) in [(2.0f32, 6.0f32), (3.0, 4.0), (6.0, 2.0)] {
+            assert!(tail_backtrack_secs(rate) >= want, "rate={rate}");
+        }
+        let need = (crate::transcription::ALIGN_MIN_OVERLAP_CHARS + 4) as f32;
+        let mut prev = f32::INFINITY;
+        let mut r = 1.0f32;
+        while r <= 12.0 {
+            let s = tail_backtrack_secs(r);
+            assert!(
+                s >= 2.0 && s <= prev + 1e-6,
+                "单调不增且 ≥2s：rate={r} s={s}"
+            );
+            assert!(
+                s * r >= need || s <= 2.0 + 1e-6,
+                "估计字数 ≥{need}（或已触下限）：rate={r} est={}",
+                s * r
+            );
+            prev = s;
+            r += 0.5;
+        }
+        assert!(
+            tail_backtrack_secs(1.0e9) <= 2.0 + 1e-6,
+            "极快语速 ⇒ 落 2s 下限"
+        );
+    }
+
+    /// 407 契约7：长静默末尾窗（收尾）后继续说话仍**全覆盖**，且收尾后无 pending。
+    #[test]
+    fn ts407_coverage_after_tail_independent() {
+        let durs = [2.0f32, 5.0, 1.2, 4.0, 2.5];
+        // 第 1 次：单片 ⇒ 立刻 1 窗。
+        let p1 = plan_windows(&[], &[durs[0]], 0, None, false);
+        let mut windows = p1.windows.clone();
+        let pending = p1.pending;
+        // 第 2 次：两片 ⇒ 末片 pending。
+        let p2 = plan_windows(&[durs[0]], &[durs[1], durs[2]], 0, pending, false);
+        windows.extend(p2.windows.clone());
+        assert!(p2.pending.is_some(), "两片派发末片应 pending");
+        // 长静默触发「末尾窗」（is_tail=true 的一次性 plan）⇒ pending 被覆盖清空。
+        let prev_len = crate::transcription::WINDOW_MAX_SLICES.min(durs.len());
+        let prev_durs = durs[..prev_len].to_vec();
+        let pt = plan_windows(&prev_durs, &[], 0, p2.pending, true);
+        windows.extend(pt.windows.clone());
+        assert!(
+            pt.pending.is_none(),
+            "收尾后不得再有 pending（停止键不重复处理）"
+        );
+        // 继续说话：新片正常组窗。
+        let p3 = plan_windows(&prev_durs, &[durs[3]], 0, pt.pending, false);
+        windows.extend(p3.windows);
+        for idx in 0..4 {
+            assert!(
+                windows.iter().any(|(s, e)| *s <= idx && idx < *e),
+                "片 {idx} 未被任何窗覆盖：windows={windows:?}"
+            );
+        }
+    }
+
+    /// 407 契约8：末尾窗文本与前片后缀有 1 字差异时，对齐合并不丢尾部独有内容、长度不无限重复。
+    #[test]
+    fn ts407_alignment_small_diff_no_loss() {
+        let mut ordered = crate::transcription::OrderedReflow::new();
+        let prev = "今天下午我们一起去市中心的那个大公园散步看花";
+        let _ = ordered.push_window(0, 0, 1, vec![200], prev.to_string());
+        // 与前片后缀（≥8 字重叠）**有 1 字不同**（公园 → 花园）。
+        let tail = "一起去市中心的那个大花园散步看花还看到了很多游客";
+        let _ = ordered.push_window(1, 0, 2, vec![120, 140], tail.to_string());
+        let (committed, last) = ordered.finish();
+        let full = format!("{committed}{last}");
+        assert!(
+            full.contains("还看到了很多游客"),
+            "尾部独有内容不得丢：{full}"
+        );
+        assert!(
+            full.chars().count() <= prev.chars().count() + tail.chars().count(),
+            "不得无限重复：{full}"
+        );
+    }
+}

@@ -4316,3 +4316,171 @@ mod gate392_tests {
         }
     }
 }
+
+// =====================================================================
+// TEST-SYNC-405-407（阶段三 · 非作者护栏，coder-2）—— 405 流式性能（DEC-086 / 审计 403）
+// =====================================================================
+#[cfg(test)]
+mod testsync405_407_tests {
+    use super::{
+        should_signal_long_silence, DisplayCache, StreamingAsrState, LONG_SILENCE_TAIL_MS,
+    };
+
+    /// 405 契约1（源码）：生产区不得再出现「另起 stream 重解整句」——
+    /// 生产区 `create_stream()` 恰 2 处（主 stream 建立 + endpoint 换流）；无 `shadow` 影子 stream。
+    #[test]
+    fn ts405b_no_extra_decode_stream_source_guard() {
+        let src = include_str!("local_stream.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code.matches("create_stream()").count(),
+            2,
+            "生产区只应有 2 处 create_stream()（主 stream + endpoint 换流），影子收尾不得回归"
+        );
+        assert!(!code.contains("shadow"), "生产区不得出现 shadow（DEC-086）");
+    }
+
+    /// 405 契约2（独立性质）：`DisplayCache` 与 `StreamingAsrState::display_text()` 在同一 `on_result`
+    /// 序列下**逐字相等**。独立夹具：中英混排 + emoji + 空 current + 4 字节字符；含「全切句 / 全中间」两端。
+    #[test]
+    fn ts405b_display_cache_equiv_independent() {
+        let frags = [
+            "中文",
+            "English ",
+            "🙂",
+            "",
+            "混合mixed",
+            "，。",
+            "𠀀", // 4 字节码点（多字节边界）
+            "a",
+        ];
+        let run = |mode: u8| {
+            let mut cache = DisplayCache::new();
+            let mut state = StreamingAsrState::new();
+            let mut seed = 0xDEAD_BEEF_u64;
+            let mut sid = 1i64;
+            for i in 0..3000 {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let text = frags[(seed >> 33) as usize % frags.len()];
+                let end = match mode {
+                    0 => (seed & 3) == 0,
+                    1 => true,
+                    _ => false,
+                };
+                if end {
+                    state.on_result(sid, text, true, &[]);
+                    cache.on_confirm(text);
+                    sid += 1;
+                } else {
+                    state.on_result(sid, text, false, &[]);
+                    cache.on_current(text);
+                }
+                assert_eq!(
+                    cache.text(),
+                    state.display_text(),
+                    "mode={mode} iter={i} text={text:?}"
+                );
+            }
+        };
+        run(0);
+        run(1); // 全切句
+        run(2); // 全中间
+    }
+
+    /// 405 契约3（源码）：只为日志的计时/计数**不得进入任何判定调用**。
+    /// 取 `should_dispatch_acc(` / `should_signal_long_silence(` / `should_dispatch_tail(` 的实参串，
+    /// 断言其中不含任何计时/计数变量（判定只许由功能量驱动）。
+    #[test]
+    fn ts405b_timing_counters_not_in_decisions_source_guard() {
+        let src = include_str!("local_stream.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let counters = [
+            "vad_total_ms",
+            "vad_chunks",
+            "vad_max_ms",
+            "vad_only_speech_chunks",
+            "bound_hit_a",
+            "bound_hit_b",
+            "bound_hit_c",
+        ];
+        for name in [
+            "should_dispatch_acc(",
+            "should_signal_long_silence(",
+            "should_dispatch_tail(",
+        ] {
+            let mut from = 0usize;
+            while let Some(pos) = code[from..].find(name) {
+                let start = from + pos + name.len();
+                // 实参内无嵌套括号/字符串 ⇒ 简单括号配平取实参串。
+                let bytes = code.as_bytes();
+                let mut depth = 1i32;
+                let mut j = start;
+                while j < bytes.len() && depth > 0 {
+                    match bytes[j] {
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 0 {
+                        break;
+                    }
+                    j += 1;
+                }
+                let args = &code[start..j];
+                for c in counters {
+                    assert!(
+                        !args.contains(c),
+                        "{name}...{args}... 实参不得含日志计时/计数 {c}"
+                    );
+                }
+                from = j + 1;
+            }
+        }
+    }
+
+    /// 407 契约4（触发时序模拟）：同一段静默只在首次 ≥1900ms 发一次；1200~1900 不发；
+    /// 恢复说话复位后，下一段静默可再发。
+    #[test]
+    fn ts407_trigger_sequence_once_per_pause() {
+        let mut done = false;
+        let step = |silent_ms: f32, speaking: bool, done: &mut bool| -> bool {
+            if speaking {
+                *done = false;
+                return false;
+            }
+            let fire = should_signal_long_silence(true, silent_ms, *done);
+            if fire {
+                *done = true;
+            }
+            fire
+        };
+        assert!(!step(1200.0, false, &mut done));
+        assert!(!step(1800.0, false, &mut done));
+        assert_eq!(LONG_SILENCE_TAIL_MS, 1900.0);
+        assert!(
+            step(LONG_SILENCE_TAIL_MS, false, &mut done),
+            "恰 1900 发一次"
+        );
+        assert!(!step(1899.0, false, &mut done));
+        assert!(!step(5000.0, false, &mut done), "同段静默只发一次");
+        // 恢复说话 ⇒ 复位。
+        assert!(!step(0.0, true, &mut done));
+        // 下一段静默可再发。
+        assert!(!step(1899.0, false, &mut done));
+        assert!(step(2000.0, false, &mut done), "复位后下一段可再发");
+        // 未启用 ⇒ 永不发。
+        assert!(!should_signal_long_silence(false, 9999.0, false));
+    }
+}

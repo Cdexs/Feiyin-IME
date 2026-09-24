@@ -8,6 +8,16 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-24 — coder-1 — TEST-SYNC-406-408B ✅ 交付（阶段三·非作者护栏 16 条；生产零改动）
+
+- **范围**：只在 `mod.rs` / `speaker.rs` 的 `#[cfg(test)]` 加两个模块 —— `testsync406_408b_tests`（10）+ `testsync408b_guard_tests`（6）；未碰生产 / `local_stream.rs` / `main.rs`。
+- **406 契约**：门限常量/边界(0.5·0.6)/归一(全半角·大小写·标点)/同音错字放行·零重合幻觉拒/精解更短 0.6~0.8/after_drop 逐位一致+下限 0.2/未闭合标签剥+4 负例。
+- **408B 契约**：多档最高分/无就绪·无 emb·<2s 保留/`partition_ranges` 缺位保守/新语种 <0.3 不收/`new_slice_from` 源码锚点/v1→v2 迁移·模型不符重建·坏档不 panic。
+- **契约 7**（有剔除 ∧ ja|未知|未就绪 ⇒ 原 ranges 重解）内联需模型 ⇒ **源码锚点护栏**锁死形状。
+- **白名单**：`rustfmt` 两文件 **EXIT 0 CLEAN**；`cargo check --all-targets` **0 error**、warnings **92/87 = 基线**；**未跑 cargo test**。**未发现生产缺陷**。
+- ⚠️ 过程如实上报：一度对 `MismatchVerdict`（无 Debug）用 `{:?}` 致 13 处错误阻塞 coder-2 ⇒ 改只打字段 + 修模块重名后 check 恢复 0 error（**未给生产加 derive(Debug)**）。
+- 红线：未改生产 / 未 commit / 未 push / 版本未动 / 零凭证。
+
 ## 2026-09-24 — coder-1 — LOCALRT-TAIL-WINDOW-407 ✅ 阶段一交付（待主控验收）
 
 - **触发（`local_stream.rs`）**：`LONG_SILENCE_TAIL_MS=1900` + 纯函数 `should_signal_long_silence` + 新回调 `on_long_silence(pcm_pos)`；读 `acc_silent_ms`，每段静默只发一次、恢复说话复位（L133/137/972/1070/1188/1558）。
@@ -195,3 +205,12 @@
 - **出包提示**：Publish 需新增 `models/speaker-campplus-zh-en/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx`（28,281,164 B，sha256 `aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2`；gitignore）。
 - **未验证**：实机端测（背景人声是否被剔、本人不误剔、`[LocalRT-DBG-408]` 埋点）交 tester-1 / Gavin。
 - **红线**：未改近场门/1200ms 派发/滑窗规则/407 末尾窗；未加 config/UI/env；未 commit / 未 push / 未 build release / 零凭证。
+
+## 2026-09-24 — coder-2 — TEST-SYNC-405-407 ✅ 交付（阶段三 · 非作者护栏 9 条）
+
+- **被测**：`LOCALRT-PERF-405`（DEC-086 影子移除 / `DisplayCache` / F-A-02 计时计数）与 `LOCALRT-TAIL-WINDOW-407`（1900ms 末尾组窗），作者 coder-1，HEAD `73537a2`。
+- **范围**：`src/transcription/local_stream.rs` **仅**追加 `mod testsync405_407_tests`（+168/0，4 条）、`src/main.rs` **仅**追加 `mod testsync407_tests`（+128/0，5 条）；生产代码零改动；未碰 mod.rs/speaker.rs。
+- **405**：源码（`create_stream()` 恰 2 处 + 无 `shadow`）；`DisplayCache` 与 `StreamingAsrState::display_text()` 逐字相等（独立夹具）；源码（判定实参不含日志计时/计数）；407 触发时序模拟。
+- **407**：源码（长静默以 pending 为条件、用后清空）；`tail_window_span` 边界；`tail_backtrack_secs` 性质；收尾后继续说话仍全覆盖；末尾窗 1 字差异不丢尾。
+- **验证（白名单）**：`rustfmt --config skip_children=true`（两文件）CLEAN；`cargo check --all-targets` **EXIT 0**、0 error、warnings **92/87** = 基线、两文件零新增 warning。🔴 **未跑 `cargo test`**（阶段三禁止，首跑由 tester-1）。
+- **疑似生产缺陷：未发现**；**未改生产代码 / 未 commit / 未 push / 零凭证**。
