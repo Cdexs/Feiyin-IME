@@ -1,4 +1,10 @@
 
+### 2026-09-25 · TEST-SYNC-411 交付（多片切分流式分配的非作者护栏 5 条，生产零改动）
+
+- 只加 `src/main.rs::testsync411_tests`（5 条）：性质（6 分布/边界/多字节）、真实 `plan_windows` 组窗组合、切分+末尾窗 accept、切分+末尾窗被拒（只替 pending、前片不动）、端到端 BUILD-409 16:44Z 真实三窗无重复。
+- 期望值经沙箱复刻 406（win0 accept 0.882 / 整段 reject 0.412，与生产一致）+ `plan_windows` 验算。
+- 白名单：rustfmt EXIT 0、check 0 error/warnings 92/87=基线；未跑 cargo test。观察：窗间同人短语重复仍在（非 411，组窗粒度；宁重复不丢字）。未出包。
+
 ### 2026-09-25 · SPEAKER-MERGE-SHORT-412 交付（相邻短段拼「连续说话单元」再判声纹，未出包）
 
 - 纯函数 `merge_speech_units`（间隔 <0.5s 暂定合并）+ `SpeechUnit`（只算语音、不含间隔；退化零长区间保留为零长成员保一一对应）；`filter_ranges_by_voiceprint` 按单元判定（≥2s 拼接成员语音算一次声纹、判定作用全成员；<2s KeepShort）；注册/漂移按单元 offer（起点 ≥ `new_slice_from`，跨界单元不 offer）。

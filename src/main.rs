@@ -19290,3 +19290,272 @@ mod fix411_tests {
         assert!(src.contains("&new_lens"), "生产调用须传各片样本数 new_lens");
     }
 }
+
+// =====================================================================
+// TEST-SYNC-411（阶段三 · 非作者护栏 · coder-1）：给 FIX-SPLIT-SLICE-STREAMING-411
+// （作者 coder-2）按**设计契约**补独立用例。重点是**组合**（切片分配 × 组窗 × 406 ×
+// 410 末尾窗 × OrderedReflow 回灌），不复用作者 `fix411_tests` 的夹具与断言。
+//
+// 契约出处：`collab/inbox/coder-1/task.md`（TEST-SYNC-411）与 411 result.md / 任务书。
+// 真实数据：BUILD-409 16:44Z 23.85s 录音（`target/release/debug.log:1212+`）——
+//   - 整段流式 86 字（日志按 80 字截断 ⇒ 夹具 `STREAM80` 为前 80 字，与作者一致）；
+//   - 三窗真实精解（日志 DBG-406 verdict #0/#1/#2）：ACC0/ACC1/ACC2；
+//   - 片样本 [10s,10s,3.85s] = [160000,160000,61600]。
+// 🔴 白名单：只 `rustfmt --config skip_children=true src/main.rs` + `cargo check --all-targets`；
+//    **未跑 `cargo test`**（阶段三禁止；由 tester-1 执行）。期望值经**沙箱复刻** 406 判据与
+//    `plan_windows` 逐条验算（ret/len 与生产一致：win0 accept 0.882/1.088、整段 reject 0.412/0.463）。
+// =====================================================================
+#[cfg(test)]
+mod testsync411_tests {
+    use super::{plan_windows, slice_streaming_text, tail_streaming_baseline};
+    use crate::transcription::{acc_vs_streaming, OrderedReflow};
+
+    /// BUILD-409 16:44Z 整段流式（日志 80 字截断版，与作者夹具逐字一致）。
+    const STREAM80: &str = "啊周周末周周周末有空吗可一起出来见个面吧我们可以一起喝杯咖啡一起出去吃个饭也可以起出来求政这样大家说来透透气这样挺好也不用整天待在家里面是不是我觉得这样可以你可";
+    /// 三窗真实精解（DBG-406 verdict #0/#1/#2，acc_chars=41/49/28）。
+    const ACC0: &str =
+        "你周末这周周末有空吗？可以一起出来见个面吗？我们可以一起喝杯咖啡，一起出去吃个饭。";
+    const ACC1: &str = "也可以一起出来走走，这样大家出来透透气，这样挺好。也不用整天待在家里面，是不是？我觉得这样可以吧。";
+    const ACC2: &str = "待在家里面，是不是？我觉得这样可以吧？你可以出来见面吗？";
+    /// 本次派发三片样本数（10s / 10s / 3.85s @16k）。
+    const SAMPLES: [usize; 3] = [160_000, 160_000, 61_600];
+    /// 对应片时长（秒），供 `plan_windows`。
+    const DURS: [f32; 3] = [10.0, 10.0, 3.85];
+
+    fn per_slice(seg: &str, samples: &[usize]) -> Vec<String> {
+        (0..samples.len())
+            .map(|k| slice_streaming_text(k, seg, samples))
+            .collect()
+    }
+
+    /// 契约 1（性质）：任意片数 / 任意样本分布（含 0 样本片、极不均匀）下**各片拼接逐字等于整段**；
+    /// 单片 == 整段；空文本 / 总样本 0 / k 越界 ⇒ 空且不 panic；多字节按 char 安全。
+    #[test]
+    fn ts411guard_split_property_all_distributions() {
+        let seg = STREAM80;
+        let dists: [&[usize]; 6] = [
+            &[1, 1, 1],
+            &[5, 1, 1, 1, 0, 0, 3], // 含 0 样本片
+            &[0, 0, 1],             // 前两片 0（极不均匀）
+            &[1, 0, 0, 2],          // 中间 0
+            &[7, 7, 7, 7, 7],       // 5 片
+            &[381_600],             // 单片
+        ];
+        for d in dists {
+            let per = per_slice(seg, d);
+            assert_eq!(per.len(), d.len());
+            assert_eq!(per.concat(), seg, "任意分布各片拼接==整段：{d:?}");
+        }
+        // 极不均匀：0 样本片为空、末片承载全部，仍不丢不重。
+        let per = per_slice(seg, &[0, 0, 1]);
+        assert!(per[0].is_empty() && per[1].is_empty(), "0 样本片应为空");
+        assert_eq!(per[2], seg, "0 样本片不占字、末片承载全部");
+        // 边界：空文本 / 总样本 0 / k 越界 ⇒ 空串（不 panic）；单片 ⇒ 整段。
+        assert_eq!(slice_streaming_text(0, "", &[1, 1]), "");
+        assert_eq!(slice_streaming_text(0, seg, &[0, 0]), "");
+        assert_eq!(slice_streaming_text(5, seg, &[1, 1]), "", "k 越界 ⇒ 空");
+        assert_eq!(slice_streaming_text(0, seg, &[123]), seg, "单片 ⇒ 整段");
+        // 多字节（含 emoji）：按 char 切、不落在字节中间。
+        let multi = "a你😀b好👋c"; // 7 chars
+        let per = per_slice(multi, &[1, 1]);
+        assert_eq!(per.concat(), multi, "多字节按 char、不丢不重");
+        assert_eq!(
+            per[0].chars().count() + per[1].chars().count(),
+            7,
+            "各片字数之和 == 总字数"
+        );
+        assert_eq!(per[0].chars().count(), 4, "边界 round(7×1/2)=4");
+    }
+
+    /// 契约 2（常规滑窗组合）：切成 3 片后，按**真实组窗规则**（`plan_windows`）组出的每窗，
+    /// 其流式基准 = 该窗**覆盖各片**的分配文本拼接 —— 不含未覆盖片、也不缺覆盖片。
+    #[test]
+    fn ts411guard_regular_window_composition_real() {
+        let per = per_slice(STREAM80, &SAMPLES);
+        // 真实组窗：一次派发 3 片 ⇒ 实时两窗 + 收尾一窗 = [0,1)(1,2)(2,3)。
+        let live = plan_windows(&[], &DURS, 0, None, false);
+        assert_eq!(live.windows, vec![(0usize, 1usize), (1, 2)]);
+        assert_eq!(live.pending, Some(2), "末片延后为待覆盖片");
+        let tail = plan_windows(&DURS, &[], 0, live.pending, true);
+        assert_eq!(tail.windows, vec![(2usize, 3usize)]);
+        assert_eq!(tail.pending, None);
+        let windows: Vec<(usize, usize)> = live
+            .windows
+            .iter()
+            .copied()
+            .chain(tail.windows.iter().copied())
+            .collect();
+        assert_eq!(windows, vec![(0, 1), (1, 2), (2, 3)]);
+
+        // 411 缺陷回归：非首片不得为空、首片不得含整段（旧逻辑首片=整段、后片=空）。
+        assert!(!per[0].is_empty() && !per[1].is_empty() && !per[2].is_empty());
+        assert!(
+            per[0].chars().count() < STREAM80.chars().count(),
+            "首片不得含整段（撑大基准）"
+        );
+        // 每窗基准 = 其覆盖片的分配文本拼接；三片合起来恰为整段（不缺不重）。
+        // 结构：首片=整段前缀、末片=整段后缀、窗 0+1 = 整段前缀。
+        assert!(STREAM80.starts_with(&per[0]), "首片应为整段前缀");
+        assert!(STREAM80.ends_with(&per[2]), "末片应为整段后缀");
+        assert!(
+            STREAM80.starts_with(&format!("{}{}", per[0], per[1])),
+            "窗 0+1 应为整段前缀"
+        );
+        assert_eq!(
+            format!("{}{}{}", per[0], per[1], per[2]),
+            STREAM80,
+            "窗 0+1+2 覆盖全部片 ⇒ 拼接 == 整段"
+        );
+        // 反向：任一窗基准不得吞并未覆盖片（与下一片拼接后长度严格增大）。
+        for k in 0..2 {
+            let mut joined = per[k].clone();
+            joined.push_str(&per[k + 1]);
+            assert!(
+                per[k].chars().count() < joined.chars().count(),
+                "窗 {k} 基准不得已含下一片"
+            );
+        }
+    }
+
+    /// 契约 3（切分 + 末尾窗 accept）：pending 为**非首片**时，410 基准（`tail_streaming_baseline`）
+    /// 两部分均非空，真实精解 accept；411 前该 pending 片为空 ⇒ 基准信息缺失。
+    #[test]
+    fn ts411guard_tail_window_baseline_split_accept() {
+        let per = per_slice(STREAM80, &SAMPLES);
+        assert!(
+            !per[1].is_empty() && !per[2].is_empty(),
+            "非首片（末尾窗前片/pending）不得为空（411 前为空）"
+        );
+        // 末尾窗：前片=片1（整片后缀）、pending=片2；410 基准 = 前片末尾相应字数 + pending 片。
+        let b = tail_streaming_baseline(&per[1], SAMPLES[1], SAMPLES[1], &per[2]);
+        assert!(
+            b.starts_with(&per[1]) && b.ends_with(&per[2]),
+            "基准 = 前片全 + pending 片"
+        );
+        // 末尾窗真实精解（片1+片2 的带标点结果）对切分后基准 accept。
+        let tail_acc = format!("{ACC1}{ACC2}");
+        let v = acc_vs_streaming(&tail_acc, &b);
+        assert!(
+            v.accept,
+            "真实精解对切分后基准应 accept（ret={:.2} len={:.2}）",
+            v.retention, v.len_ratio
+        );
+        // 411 前对照：pending 片为空 ⇒ 基准只剩前片（信息缺失）。
+        let stale = tail_streaming_baseline(&per[1], SAMPLES[1], SAMPLES[1], "");
+        assert_eq!(stale, per[1], "411 前 pending 为空 ⇒ 基准缺 pending 内容");
+    }
+
+    /// 契约 4（切分 + 末尾窗被拒）：幻觉仍被拒；被拒 ⇒ **只替 pending 片**兜底、文本非空、前片不动；
+    /// 411 前 pending 片为空 ⇒ 该片内容丢失（对照）。
+    #[test]
+    fn ts411guard_tail_reject_pending_only_no_loss() {
+        let per = per_slice(STREAM80, &SAMPLES);
+        let b = tail_streaming_baseline(&per[1], SAMPLES[1], SAMPLES[1], &per[2]);
+        assert!(
+            !acc_vs_streaming("完全无关的幻觉文本", &b).accept,
+            "幻觉对切分后基准仍应被拒"
+        );
+        let prev_punct = ACC1;
+        let pending_fallback = per[2].clone();
+        assert!(
+            !pending_fallback.is_empty(),
+            "pending 兜底文本不得为空（411 前为空 ⇒ 丢字）"
+        );
+        // 回灌：前窗（span 1..2）= 已通过精解；末尾窗（span 2..3）= pending 兜底。
+        let mut o = OrderedReflow::new();
+        let _ = o.push_window(0, 1, 2, vec![SAMPLES[1]], prev_punct.to_string());
+        let _ = o.push_window(1, 2, 3, vec![SAMPLES[2]], pending_fallback.clone());
+        let (committed, last) = o.finish();
+        assert_eq!(
+            format!("{committed}{last}"),
+            format!("{prev_punct}{pending_fallback}"),
+            "前片一字不动 + pending 只追加一次"
+        );
+        // 对照：411 前 pending 兜底为空 ⇒ 该片内容丢失。
+        let mut o_old = OrderedReflow::new();
+        let _ = o_old.push_window(0, 1, 2, vec![SAMPLES[1]], prev_punct.to_string());
+        let _ = o_old.push_window(1, 2, 3, vec![SAMPLES[2]], String::new());
+        let (c2, l2) = o_old.finish();
+        assert!(
+            !format!("{c2}{l2}").contains(pending_fallback.trim()),
+            "411 前 pending 为空 ⇒ 丢字（对照）"
+        );
+    }
+
+    /// 契约 5（端到端无重复）：BUILD-409 16:44Z 真实三窗文本走真实组窗 + 406 判据 + `OrderedReflow`
+    /// 回灌 —— 新逻辑（411）最终文本 == 三窗精解**各一次**、无整段流式兜底；旧逻辑（整段记首片）
+    /// 复现「整段原文重复一遍」。
+    #[test]
+    fn ts411guard_e2e_build409_no_duplication() {
+        let per = per_slice(STREAM80, &SAMPLES);
+        let acc = [ACC0.to_string(), ACC1.to_string(), ACC2.to_string()];
+        // 真实性复现：窗0 精解对**整段**基准误拒（BUILD-409），对**切分片0** accept。
+        assert!(
+            !acc_vs_streaming(&acc[0], STREAM80).accept,
+            "复现：整段基准误拒（ret={:.2}）",
+            acc_vs_streaming(&acc[0], STREAM80).retention
+        );
+        assert!(
+            acc_vs_streaming(&acc[0], &per[0]).accept,
+            "切分后片0 基准 accept（ret={:.2}）",
+            acc_vs_streaming(&acc[0], &per[0]).retention
+        );
+        // 真实组窗（与契约 2 同）：三窗 span (0,1)(1,2)(2,3)。
+        let live = plan_windows(&[], &DURS, 0, None, false);
+        let tail = plan_windows(&DURS, &[], 0, live.pending, true);
+        let windows: Vec<(usize, usize)> = live
+            .windows
+            .iter()
+            .copied()
+            .chain(tail.windows.iter().copied())
+            .collect();
+        assert_eq!(windows, vec![(0, 1), (1, 2), (2, 3)]);
+
+        // 逐窗回灌：基准由 `bases` 给（生产=覆盖片分配文本 / 旧=整段记首片），406 判据定精解或兜底。
+        let run = |bases: &[String]| -> String {
+            let mut o = OrderedReflow::new();
+            for (i, (ws, we)) in windows.iter().enumerate() {
+                let base = &bases[i];
+                let chosen = if acc_vs_streaming(&acc[i], base).accept {
+                    acc[i].clone()
+                } else {
+                    base.clone()
+                };
+                o.push_window(i, *ws, *we, SAMPLES[*ws..*we].to_vec(), chosen);
+            }
+            let (c, l) = o.finish();
+            format!("{c}{l}")
+        };
+        // NEW（411）：各窗基准 = 覆盖片分配文本。
+        let new_bases: Vec<String> = per.clone();
+        let new_final = run(&new_bases);
+        // OLD（411 前）：整段只记首片、其余为空 ⇒ 窗0 整段基准误拒 ⇒ 整段兜底。
+        let old_bases: Vec<String> = vec![STREAM80.to_string(), String::new(), String::new()];
+        let old_final = run(&old_bases);
+
+        // 无重复：新最终文本 == 三窗精解按序各一次。
+        assert_eq!(
+            new_final,
+            format!("{}{}{}", acc[0], acc[1], acc[2]),
+            "三窗精解拼接恰各一次（411 消除的是**整段流式**重复；相邻窗精解间同人短语重叠属组窗粒度、非 411）"
+        );
+        // 无缺失：三窗精解内容均在。
+        for a in &acc {
+            assert!(new_final.contains(a.trim()), "不得缺字：{a}");
+        }
+        // 411 后不得再把整段流式当兜底。
+        let head: String = STREAM80.chars().take(30).collect();
+        assert!(!new_final.contains(&head), "411 后不得含整段流式兜底");
+        // 旧逻辑对照：整段流式被当窗0 兜底 ⇒ 原文重复、更长。
+        assert!(
+            old_final.contains(&head),
+            "旧逻辑含整段流式兜底（复现重复）"
+        );
+        assert!(
+            old_final.chars().count() > new_final.chars().count(),
+            "旧逻辑因重复而更长（old={} new={}）",
+            old_final.chars().count(),
+            new_final.chars().count()
+        );
+    }
+}

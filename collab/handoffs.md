@@ -8,6 +8,15 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-1 — TEST-SYNC-411 ✅ 交付（阶段三·非作者护栏 5 条；生产零改动）
+
+- **范围**：只在 `src/main.rs` `#[cfg(test)] mod testsync411_tests`（5 条，`19309` 起）；未碰 `speaker.rs`/`mod.rs`（coder-2 的 412 护栏）、未碰生产区。
+- **契约 1~5**：性质（6 分布拼接==整段/边界/多字节）｜常规滑窗组合（真实 `plan_windows`：live `[(0,1),(1,2)]`+pending 2、tail `[(2,3)]`）｜切分+末尾窗 accept（410 基准两部分非空、真实精解 accept）｜切分+末尾窗被拒（只替 pending、前片不动）｜**端到端 BUILD-409 16:44Z 真实三窗无重复**（新 == 三窗精解各一次；旧复现整段重复）。
+- **真实数据**：`debug.log:1212+`（整段 86 字流式按 80 截断 = `STREAM80`；ACC0/1/2 = 41/49/28 字；样本 10/10/3.85s）。期望值经沙箱复刻 406（win0 0.882 / 整段 0.412）与 `plan_windows` 验算。
+- **白名单**：`rustfmt --config skip_children=true src/main.rs` EXIT 0；`cargo check --all-targets` 0 error、warnings 92/87=基线；**未跑 cargo test**。
+- **观察（只报告不修）**：相邻窗不共享切片 ⇒ `OrderedReflow` 不去重 ⇒ 窗间同人短语重复仍在（组窗粒度、非 411；取向宁重复不丢字）。
+- 红线：未碰生产代码 / 未 commit / 零凭证。
+
 ## 2026-09-25 — coder-1 — SPEAKER-MERGE-SHORT-412 ✅ 阶段一交付（待主控验收）
 
 - **改动**（`src/transcription/speaker.rs`；`mod.rs` 仅 +1 源码锚点测试）：新增纯函数 `merge_speech_units` + `MERGE_GAP_SECS=0.5s`（**暂定，待端测校准**）+ `SpeechUnit`（语音时长不含间隔；退化零长区间保留为零长成员保一一对应）；`filter_ranges_by_voiceprint` 改**按单元**判定（单元 ≥2s 拼接全部成员语音算一次声纹、判定作用全成员；<2s `KeepShort`）；注册/漂移按单元 offer（**起点** ≥ `new_slice_from`，跨界单元保守不 offer）。
@@ -272,3 +281,12 @@
 - **测试**：新增 `fix411_tests` 7 条（含真实数据、切分+末尾窗被拒兜底非空、源码护栏）；更新 386 用例计数（17⇒9+8）。**验证**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` 0 error、warnings 92/87=基线；全量 `cargo test --no-fail-fast` **0 failed**（bin **1697P/52I**）。
 - **未验证**：实机端测（多片切分不再误拒/重复、`[LocalRT-DBG-411]` 埋点）交 tester-1/Gavin。
 - **红线**：未改 406/407/410/声纹；未加 config/env；未 commit / 未 push / 未 build release / 零凭证。
+
+## 2026-09-25 — coder-2 — TEST-SYNC-412 ✅ 交付（阶段三 · 短段拼接非作者护栏 6 条）
+
+- **被测**：`SPEAKER-MERGE-SHORT-412`（相邻短段按 <0.8s 间隔拼「连续说话单元」再判；作者 coder-1，HEAD `25d097b`）。
+- **范围**：`src/transcription/speaker.rs` **仅**追加 `mod testsync412_guard_tests`（+173/0，6 条）；生产代码零改动；未碰 main.rs/mod.rs。
+- **10 条**（首轮 6 + 主控裁量 A 后补 4）：阈值精确边界（恰 0.8s 不拼）；随机性质 500 组（成员一一对应 / `speech_samples`==成员和 / 单元内间隔 <0.8s / 退化零长段）；BUILD-409 间隔集不 panic；三成员单元作用域（Drop 全剔 / Keep 原段）；无就绪 KeepNotReady + 缺模型生产早退源码护栏；空成员合成单元边界；**契约2 前向封口**；**③ 收尾例外**（`[2.1s,0.3gap,0.5s]`⇒1；`[2.1s,0.3gap,0.5s,0.3gap,2.5s]`⇒3）；**契约6 注册门**（起点边界 + 跨界不 offer + 源码护栏）；**契约3 窗#4 精确**（恰 2 单元均 ≥2s）。
+- **契约2 措辞（主控裁量 A）**：③ 收尾「<2s 尾段并入前一单元」为 412 R1 有意例外（非缺陷）；契约2 限定「前向累积阶段」，据此分别钉住。
+- **验证（白名单）**：`rustfmt --config skip_children=true src/transcription/speaker.rs` CLEAN；`cargo check --all-targets` **EXIT 0**、0 error、warnings **92/87** = 基线；sandbox 复刻 `merge_speech_units` 500 组性质 bad=0 + 边界 + BUILD-409 ✅。🔴 **未跑 `cargo test`**（阶段三禁止，首跑由 tester-1）。
+- **疑似生产缺陷：未发现**；**未改生产代码 / 未 commit / 未 push / 零凭证**。

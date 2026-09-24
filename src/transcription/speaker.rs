@@ -2088,3 +2088,274 @@ mod testsync412_merge_tests {
         assert!(cos_ul >= cos_us - 1e-3, "合并单元不应差于单短段");
     }
 }
+
+// =====================================================================
+// TEST-SYNC-412（阶段三 · 非作者护栏，coder-2）：短段拼接 —— 独立性质/边界/影响面
+//   作者 coder-1（`testsync412_merge_tests`）；本模块只补独立护栏，不照抄。
+// =====================================================================
+#[cfg(test)]
+mod testsync412_guard_tests {
+    use super::{
+        judge_voiceprint, merge_speech_units, partition_ranges, unit_offer_allowed, SegVerdict,
+        SpeechUnit, Voiceprint, MERGE_GAP_SECS, MIN_JUDGE_SECS, SAMPLE_RATE,
+    };
+
+    fn secs(x: f32) -> usize {
+        (x * SAMPLE_RATE as f32) as usize
+    }
+    fn gap_samples() -> usize {
+        (MERGE_GAP_SECS * SAMPLE_RATE as f32) as usize
+    }
+
+    /// 契约1 边界：间隔**恰 0.8s**（== 阈值）不拼（`<` 严格）；0.799s 拼。
+    #[test]
+    fn ts412b_gap_exactly_threshold_not_merged() {
+        let a = (0usize, secs(1.2));
+        let b_start = a.1 + gap_samples(); // 恰 0.8s
+        let b = (b_start, b_start + secs(1.1));
+        assert_eq!(
+            merge_speech_units(&[a, b]).len(),
+            2,
+            "恰 0.8s 间隔应断开（严格 <）"
+        );
+        let c_start = a.1 + gap_samples() - 1; // 0.8s 差 1 样本
+        let c = (c_start, c_start + secs(1.1));
+        assert_eq!(merge_speech_units(&[a, c]).len(), 1, "0.8s 内应拼");
+    }
+
+    /// 契约1/2（随机性质，500 组）：成员扁平序==输入（一一对应、无丢无重）；`speech_samples`==成员语音之和；
+    /// 单元内相邻成员间隔恒 < 0.8s；含退化零长段不 panic。
+    #[test]
+    fn ts412b_group_property_random() {
+        struct Lcg(u64);
+        impl Lcg {
+            fn n(&mut self, lo: usize, hi: usize) -> usize {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (lo as u64 + (self.0 >> 33) % ((hi - lo + 1) as u64)) as usize
+            }
+        }
+        let mut rng = Lcg(0x412_5EED);
+        let gap_thr = gap_samples();
+        for case in 0..500 {
+            let n = rng.n(0, 8);
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
+            let mut t = 0usize;
+            for _ in 0..n {
+                let len_ms = rng.n(0, 3000); // 0..=3s（含退化 0）
+                let gap_ms = rng.n(0, 1200); // 0..=1.2s
+                let s = t;
+                let e = t + len_ms * 16; // ms→samples
+                ranges.push((s, e));
+                t = e + gap_ms * 16;
+            }
+            let units = merge_speech_units(&ranges);
+            let flat: Vec<(usize, usize)> = units.iter().flat_map(|u| u.members.clone()).collect();
+            assert_eq!(
+                flat, ranges,
+                "case {case}: 成员须与输入一一对应（无丢无重）"
+            );
+            for u in &units {
+                assert!(!u.members.is_empty(), "case {case}: 单元不得为空");
+                let sum: usize = u.members.iter().map(|(s, e)| e - s).sum();
+                assert_eq!(
+                    sum, u.speech_samples,
+                    "case {case}: speech_samples==成员语音之和"
+                );
+                for w in u.members.windows(2) {
+                    let gap = w[1].0.saturating_sub(w[0].1);
+                    assert!(
+                        gap < gap_thr,
+                        "case {case}: 单元内间隔须 < 0.8s，实测 {gap}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 契约3（真实分布）：BUILD-409 各处间隔（0.29~1.96s）构造序列不 panic、成员一一对应、
+    /// 间隔 ≥0.8s 处必然断开为不同单元。
+    #[test]
+    fn ts412b_build409_gaps_no_panic_and_split_at_threshold() {
+        let gaps = [
+            0.29f32, 0.51, 0.74, 0.48, 0.55, 0.64, 0.77, 0.54, 0.61, 0.67, 0.86, 1.21, 1.96,
+        ];
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut t = 0usize;
+        for (i, g) in gaps.iter().enumerate() {
+            let len = secs(0.6 + (i % 3) as f32 * 0.4); // 0.6~1.4s 短段
+            let s = t;
+            let e = t + len;
+            ranges.push((s, e));
+            t = e + secs(*g);
+        }
+        let units = merge_speech_units(&ranges);
+        let flat: Vec<(usize, usize)> = units.iter().flat_map(|u| u.members.clone()).collect();
+        assert_eq!(flat, ranges, "不 panic 且成员一一对应（无丢无重）");
+        // 单元内相邻成员间隔恒 <0.8s（拼只在 <0.8s 发生；收尾并入亦然）。
+        for u in &units {
+            for w in u.members.windows(2) {
+                let gap = w[1].0.saturating_sub(w[0].1);
+                assert!(gap < gap_samples(), "单元内间隔须 <0.8s，实测 {gap}");
+            }
+        }
+        assert!(!units.is_empty(), "非空输入应有单元");
+    }
+
+    /// 契约4（作用域，3 成员单元）：单元 Drop ⇒ **全部 3 成员**剔除，dropped==成员语音之和；
+    /// Keep ⇒ kept==原各段（间隔不并入）。
+    #[test]
+    fn ts412b_unit_scope_three_members() {
+        let ranges = [
+            (0usize, secs(0.8)),
+            (secs(1.0), secs(1.9)),
+            (secs(2.1), secs(3.0)),
+        ];
+        let (kept, ksec, drop) = partition_ranges(&ranges, &[SegVerdict::DropNonUser(0.1); 3]);
+        assert!(kept.is_empty(), "单元 Drop ⇒ 全成员剔除");
+        assert_eq!(ksec, 0.0);
+        assert!(
+            (drop - 2.8).abs() < 1e-3,
+            "dropped==0.8+0.9+0.9，实测 {drop}"
+        );
+        let (kept2, ksec2, drop2) = partition_ranges(&ranges, &[SegVerdict::KeepUser(0.9); 3]);
+        assert_eq!(
+            kept2,
+            ranges.to_vec(),
+            "保留=原各段（间隔不并入剪静音区间）"
+        );
+        assert!((ksec2 - 2.8).abs() < 1e-3 && drop2 == 0.0);
+    }
+
+    /// 契约5：无就绪档 ⇒ 判定 KeepNotReady（与改前一致）；缺模型 ⇒ 生产早退还**原样保留**（源码护栏）。
+    #[test]
+    fn ts412b_no_ready_and_missing_model_source_guard() {
+        let vp = Voiceprint::default();
+        assert!(!vp.has_any_ready());
+        assert_eq!(
+            judge_voiceprint(&vp, Some(&[1.0, 0.0]), MIN_JUDGE_SECS),
+            SegVerdict::KeepNotReady
+        );
+        // 源码护栏：filter 在提取器不可用时 `kept: ranges.to_vec()`（原样保留，功能整体关闭）。
+        let src = include_str!("speaker.rs");
+        let i = src
+            .find("pub(crate) fn filter_ranges_by_voiceprint(")
+            .expect("filter_ranges_by_voiceprint 锚点缺失");
+        let body: String = src[i..].chars().take(1400).collect();
+        assert!(
+            body.contains("kept: ranges.to_vec()"),
+            "缺模型 / 提取器不可用 ⇒ 必须原样保留 ranges（功能关闭）"
+        );
+    }
+
+    /// 契约6（边界补充）：空成员合成单元 —— `members.first().unwrap_or(0)` ⇒ 仅 `new_slice_from==0` 时 offer。
+    #[test]
+    fn ts412b_unit_offer_allowed_empty_members() {
+        let empty = SpeechUnit {
+            members: Vec::new(),
+            speech_samples: 0,
+        };
+        assert!(unit_offer_allowed(&empty, 0), "空成员起点视作 0");
+        assert!(!unit_offer_allowed(&empty, 1));
+    }
+
+    /// 契约6（注册）：只有 **≥2s 且起点 ≥ `new_slice_from`** 的单元 offer；跨 `new_slice_from`（起点在前文）
+    /// 的单元不 offer。`unit_offer_allowed` 只管起点；≥2s 门在调用处 —— 一并以源码护栏锁死。
+    #[test]
+    fn ts412b_offer_requires_ge_2s_and_in_window() {
+        let u = SpeechUnit {
+            members: vec![(secs(1.0), secs(3.2))],
+            speech_samples: secs(2.2),
+        };
+        assert!(unit_offer_allowed(&u, secs(1.0)), "起点 == 边界 ⇒ offer");
+        assert!(
+            !unit_offer_allowed(&u, secs(1.5)),
+            "起点早于边界 ⇒ 不 offer"
+        );
+        // 跨界单元（起点在前文、延伸进新片）⇒ 按起点判 ⇒ 不 offer。
+        let cross = SpeechUnit {
+            members: vec![(secs(0.5), secs(1.5)), (secs(2.0), secs(3.5))],
+            speech_samples: secs(2.5),
+        };
+        assert!(!unit_offer_allowed(&cross, secs(1.0)), "跨界单元不 offer");
+        assert!(unit_offer_allowed(&cross, secs(0.5)), "起点在窗内 ⇒ offer");
+        // 源码护栏：offer 同时要求 `unit_secs >= MIN_JUDGE_SECS`（≥2s）与起点在窗内。
+        let src = include_str!("speaker.rs");
+        assert!(
+            src.contains("unit_secs >= MIN_JUDGE_SECS && unit_offer_allowed(unit, new_slice_from)"),
+            "offer 必须同时满足「≥2s」与「起点 ≥ new_slice_from」"
+        );
+    }
+
+    /// 契约3（窗 #4 真实区间）：1.02/1.70/1.41/0.96s，间隔 0.64/0.77/0.54 ⇒ **恰 2 个单元且均 ≥2s**
+    ///（非仅「不 panic」）。
+    #[test]
+    fn ts412b_window4_exact_two_units_both_ge_2s() {
+        let g1 = 0.64f32;
+        let g2 = 0.77f32;
+        let g3 = 0.54f32;
+        let at = |s: f32, l: f32| (secs(s), secs(s + l));
+        let ranges = [
+            at(0.0, 1.02),
+            at(1.02 + g1, 1.70),
+            at(1.02 + g1 + 1.70 + g2, 1.41),
+            at(1.02 + g1 + 1.70 + g2 + 1.41 + g3, 0.96),
+        ];
+        let units = merge_speech_units(&ranges);
+        assert_eq!(units.len(), 2, "窗#4 应恰 2 个单元");
+        assert_eq!(units[0].members.len(), 2, "1.02+1.70 ⇒ 2.72s");
+        assert_eq!(units[1].members.len(), 2, "1.41+0.96 ⇒ 2.37s");
+        for u in &units {
+            let s = u.speech_samples as f32 / SAMPLE_RATE as f32;
+            assert!(s >= MIN_JUDGE_SECS, "每个单元须 ≥2s（可判），实测 {s}");
+        }
+    }
+
+    /// 契约2（前向累积阶段）：≥2s 单段**不被**后续**非近邻**（间隔 ≥0.8s）段拼接；单独 ≥2s 段自成
+    /// 1 成员单元。**③ 收尾例外另测**（见下）。
+    #[test]
+    fn ts412b_ge2s_single_segment_independent_when_gap_ge_thr() {
+        // 2.1s 单段 + 0.9s（≥0.8）间隔的 0.5s 段 ⇒ 两个单元。
+        let units = merge_speech_units(&[(0, secs(2.1)), (secs(3.0), secs(3.0) + secs(0.5))]);
+        assert_eq!(units.len(), 2, "间隔 ≥0.8s ⇒ ≥2s 单段独立");
+        assert_eq!(units[0].members.len(), 1);
+        assert!(units[0].speech_samples as f32 / SAMPLE_RATE as f32 >= MIN_JUDGE_SECS);
+        assert_eq!(merge_speech_units(&[(0, secs(2.1))]).len(), 1);
+    }
+
+    /// ③ 收尾例外（主控裁量 A：有意行为，非缺陷）：**最后一个** <2s 且近邻（<0.8s）的段，无论前一单元
+    /// 是否已 ≥2s，都并入前一单元（防尾段落单不判）。
+    ///
+    /// - `[2.1s, 0.3gap, 0.5s]`（0.5s 为**最后**一段）⇒ **1** 个单元（尾段并入 2.1s）。
+    /// - `[2.1s, 0.3gap, 0.5s, 0.3gap, 2.5s]` ⇒ 中间 0.5s **不是**尾段 ⇒ 不并入 2.1s 单元，且末 2.5s 独立 ⇒ **3** 个单元。
+    #[test]
+    fn ts412b_tail_merge_exception_explicit() {
+        let merged = merge_speech_units(&[(0, secs(2.1)), (secs(2.4), secs(2.4) + secs(0.5))]);
+        assert_eq!(
+            merged.len(),
+            1,
+            "③：2.1s + 近邻**尾段** 0.5s ⇒ 1 个单元（尾段并入）"
+        );
+        assert_eq!(merged[0].members.len(), 2, "成员 = [2.1s, 0.5s]");
+        assert!(
+            (merged[0].speech_samples as f32 / SAMPLE_RATE as f32 - 2.6).abs() < 1e-3,
+            "语音总时长 2.6s（不含 0.3s 间隔）"
+        );
+        // 中间 0.5s（后面还有 2.5s）⇒ 非尾段 ⇒ 不并入 2.1s 单元。
+        let three = merge_speech_units(&[
+            (0, secs(2.1)),
+            (secs(2.4), secs(2.4) + secs(0.5)),
+            (secs(3.2), secs(3.2) + secs(2.5)),
+        ]);
+        assert_eq!(three.len(), 3, "中间 0.5s 自成单元、末 2.5s 独立");
+        for u in &three {
+            assert_eq!(
+                u.members.len(),
+                1,
+                "三单元各 1 成员（前向 ≥2s 单元不吸收中间段）"
+            );
+        }
+    }
+}
