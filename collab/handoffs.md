@@ -50,3 +50,13 @@
 - **新增 8 条**：不丢字不变式（4 组，手算句数 6/8/1/2）/ 中文单 `…` vs `……` + `Node.js 3.14` 不因 `.` 断 / 英文 `no.` 数字后置条件（`ends_with_abbreviation` 直测）/ `split_and_merge` 全短合成 1 句==原文 / `finalize_sentence` 三态（calls 1/1/0）/ `strip_target_prefix` 非目标不丢首词 / `join_parts` 空串无多余空格 + 英→中直连 / 源码护栏（无 `Arc<NllbModel>`/`mem::forget`；字段 `&'static NllbModel`；`NllbModel::new(...)?` 在 `*slot = Some(` 之前）。
 - **验证（白名单）**：本文件 `rustfmt --config skip_children=true --check` **CLEAN**；**全仓** `cargo fmt --check` **EXIT 0**；`cargo check --all-targets` **EXIT 0**、0 error，warnings **bin 92 / test 87 ≤ 97/88**；`numstat == -w`（232/0）。🔴 **未跑 `cargo test`**（首跑阶段四）。
 - **红线**：未改生产代码 / 未 commit / 未 push / 版本号未动 / 零凭证。
+
+## 2026-09-24 — coder-2 — LOCALRT-TERMS-PREFIX-398 ✅ 交付（阶段一·推翻 DEC-083，恢复路B 注入 + `Technical terms:` 固定前缀）
+
+- **需求**（Gavin 2026-09-24）：「我建议我们也在词条前加 Technical terms」「一定要按照你上次在网上找到的那个起作用的方法来传」「修改这么简单，就直接改了吧」（明示豁免 DEC-059 A/B，且不派阶段三）。
+- **改动（仅 `src/main.rs` + `src/transcription/mod.rs`，平台中立）**：① `load_hotwords_for_accuracy` 删除 `AsrModel::LocalRealtime` 早退，与 Accuracy 同走 `uses_accuracy_engine()` 门（恢复读词库 / 改词库重新触发 1.7B 重载）；② `build_ctx_system` 输出 `Technical terms: <词条, 连接>.`（按 `,` 切分逐条 `trim`、丢空段；空词表 `None`；`build_hotwords_string` 未动）；③ 抽取 `find_best_terms_run`（374 共用，`strip_terms_echo` 逻辑不变）+ 新增 `strip_technical_terms_echo`（前缀回显剥离；护栏：前缀后须有 ≥1 真词条），接入 `apply_acc_disposition` 3 处（首剥 / 重解再剥 / `still_echo`）。
+- **单测**：更新因行为变化变红 8 条（`fix377_build_ctx_system_is_bare_terms_only`→`fix398_build_ctx_system_technical_terms_prefix`、`fix377_terms_echo_still_hits_new_format`、testsync377 5 条 `ctx377_*`→`ctx398_*`/`echo374_new_format_run_is_stripped`、`fix396_*`→`fix398_tests`）；新增 3 条（`fix398_build_ctx_system_spec_example` / `fix398_technical_terms_prefix_echo_stripped` / `echo374_new_format_run_is_stripped` 的 398 前缀断言）。
+- **验证**：`cargo fmt --check` **EXIT 0** ｜ `cargo check --all-targets` **0 error**、warnings **92/87** = 基线 ｜ 全量 `cargo test --no-fail-fast` **0 failed**（bin **1597P/44I**）。
+- **文档**：`decisions.md`（DEC-083→已推翻 + 新增 DEC-084 索引行）、`decisions-archive.md`（DEC-084 全文）、`docs/MACOS-HANDOFF.md`、`logs/20260924.md`、`CHANGELOG.md`、`progress.md`。
+- 🔴 **未验证**：中文场景端测（词库词召回 / 是否仍念词表 / `Technical terms` 是否漏进正文 / 空输出 / 截尾）交 tester-1 / Gavin。
+- **未改版本 / 未 commit / 未 push / 未 build release / 零凭证**。

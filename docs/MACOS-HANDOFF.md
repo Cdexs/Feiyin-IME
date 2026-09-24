@@ -2282,3 +2282,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 改动 | 行为前 → 后 | macOS 影响 |
 | --- | --- | --- |
 | `main.rs` `load_hotwords_for_accuracy`：`AsrModel::LocalRealtime` 在读词库前早退 `None`（DEC-083） | 本地实时滑窗精解每窗 `set_option("hotwords", 词库)` → **不注入**；改词库不再触发 1.7B 重载。本地精确档 / 在线识别 / LLM 不变 | ✅ 平台中立（无 `cfg`），macOS 同继承。macOS 若另有本地实时热词注入实现，须同样去掉（依据：带注入首解异常 28%，见 DEC-083） |
+
+## LOCALRT-TERMS-PREFIX-398（2026-09-24，coder-2）· 本地实时 B 路径**恢复**词库注入 + `Technical terms:` 固定前缀 —— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `main.rs` `load_hotwords_for_accuracy`：删除 `AsrModel::LocalRealtime` 早退（396/DEC-083 被 DEC-084 推翻） | 本地实时滑窗精解**恢复**每窗 `set_option("hotwords", 词库)`；改词库重新触发 1.7B 重载。本地精确档 / 在线识别 / LLM 不变 | ✅ 平台中立（无 `cfg`），macOS 同继承。🔴 macOS 若按 396 去掉过本地实时注入，本单须**恢复**（依据 DEC-084） |
+| `transcription/mod.rs` `build_ctx_system`：裸词表 `a,b,c` → **`Technical terms: a, b, c.`**（前缀 `Technical terms: ` + `, ` 连接词条 + 英文句点；空词表仍不注入） | 注入格式变化（DEC-084）；前缀自动计入 `estimate_inject_tokens` 预算 | ✅ 平台中立纯逻辑，macOS 同继承。🔴 macOS 若另有注入串组装点，必须**逐字符对齐**该格式（`Technical terms: ` / `, ` / `.`） |
+| `transcription/mod.rs` 新增 `strip_technical_terms_echo`（前缀回显剥离；护栏：前缀后须有 ≥1 真词条）+ 抽取 `find_best_terms_run` 供 374/398 共用 | 带前缀的注入回显被整段剥掉、走 `apply_acc_disposition` 的 Echo ⇒ 不带注入重解同一路径；374 `strip_terms_echo` 逻辑不变 | ✅ 平台中立，macOS 同继承；**未改任何 `pub` 签名** |
+| **macOS 侧需要做什么** | | ① 本地实时恢复注入（若曾按 DEC-083 去掉）；② 注入格式逐字符对齐 `Technical terms: a, b, c.`；③ 无新增依赖 / env / 平台 API，无需改构建脚本 |

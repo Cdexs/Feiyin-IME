@@ -1,4 +1,11 @@
 
+### 2026-09-24 · LOCALRT-TERMS-PREFIX-398 交付（本地实时路B 恢复词库注入，改用 `Technical terms: a, b, c.` 固定前缀）
+
+- **推翻 DEC-083、立 DEC-084**：删除 `load_hotwords_for_accuracy` 的 `AsrModel::LocalRealtime` 早退（与 Accuracy 同走 `uses_accuracy_engine()` 门）；`build_ctx_system` 输出由裸词表 `a,b,c` 改为 `Technical terms: a, b, c.`（前缀 + `, ` 连接 + 英文句点；按 `,` 切分逐条 trim、丢空段；空词表 None）。
+- **回显防护**：抽取 `find_best_terms_run`（374/398 共用，`strip_terms_echo` 逻辑不变），新增 `strip_technical_terms_echo`（大小写不敏感识别前缀并整段剥离 + 误伤护栏「前缀后须有 ≥1 真词条」），走 `apply_acc_disposition` 的 Echo ⇒ 不带注入重解同一路径。
+- **依据**：外部 184 次实测（TypeWhisper#321，Qwen3-ASR）唯一 0 泄漏格式（WER 33.8%→18.2%）；Gavin 2026-09-24 拍板照搬，明示豁免 DEC-059 A/B。🔴 **中文场景外部未测 ⇒ 靠端测验证**。
+- **验证**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` 0 error、warnings 92/87=基线；全量 `cargo test --no-fail-fast` **0 failed**（bin **1597P/44I**）。未出包 / 未改版本 / 零凭证。
+
 ### 2026-09-24 · TRANS-CT2-DNNL-THREADS-397 交付（本地翻译提速：CT2 换 oneDNN + 线程数按核数传入）
 
 - Windows 目标依赖给 `ctranslate2-sys` 追加 `dnnl` + `openmp-runtime-comp`（通用依赖与 macOS 不变；`cargo tree --target aarch64-apple-darwin` 证无 dnnl/openmp）；`patches/ctranslate2-sys/build.rs` 两处补丁：① `CMAKE_PREFIX_PATH` 让 CT2 找到自编 oneDNN（否则 `WITH_DNNL` 必 FATAL_ERROR）② DLL 同步拷 `<target>/deps/`（修 `[CT2-DLL-SHADOW-397]`）。

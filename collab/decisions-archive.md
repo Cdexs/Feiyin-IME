@@ -2974,3 +2974,36 @@ Gavin 原话：「我说的是b路径上的1.7b模型，把词库注入去掉，
 
 - 与 [[feedback-wordbook-no-filter]] 的关系：那条禁止「按像不像专业词过滤词条」；本条是 Gavin 对路B **整体不注入**的拍板，不是过滤
 - 🔴 以后要恢复路B 注入，必须先有「注入不致首解异常」的实证，并由 Gavin 重新拍板
+- **已被 DEC-084 推翻（2026-09-24）**
+
+---
+
+## DEC-084 · 本地实时 B 路径恢复词库注入，改用 `Technical terms: a, b, c.` 固定前缀格式（2026-09-24）
+
+### 背景
+
+- 承接 DEC-083：BUILD-395 端测发现路B 注入**裸逗号词表**（`a,b,c`）首解异常率 28%（空 / 坍塌 / 念词表 / 截尾 / 跳到词条）⇒ 396 一度对 `AsrModel::LocalRealtime` 早退 `None`（整体不注入）。
+- 外部同类案例调研（`collab/research/qwen3-hotwords-failure-2026-09-24.md`）：TypeWhisper#321（Qwen3-ASR，英文 4 段 × 18 种格式 × 3 轮，共 184 次）实测——**唯一 0 泄漏格式**是固定前缀 `Technical terms: a, b, c.`（WER 33.8% → 18.2%）；`Terms:` / `Keywords:` / `Context:` 及裸词表一样差。机制：Qwen3-ASR SFT 训练不执行自然语言指令，把 system 段当「背景知识」；裸词表形似被截断的续写 ⇒ 模型接着念。
+- Gavin 2026-09-24 原话：「我建议我们也在词条前加 Technical terms」「荒唐，这个就别做离线对你测试了，修改这么简单，就直接改了吧」「一定要按照你上次在网上找到的那个起作用的方法来传」。
+
+### 决策
+
+- **推翻 DEC-083**：本地实时路B（`AsrModel::LocalRealtime`）恢复词库注入 —— 删除 `load_hotwords_for_accuracy` 中的 `LocalRealtime` 早退；与 `AsrModel::Accuracy` 同走 `uses_accuracy_engine()` 门（该函数本就覆盖 LocalRealtime）。改词库重新触发 1.7B 重载。
+- 注入格式（逐字符硬约束）改为 `Technical terms: <词条1, 词条2, …>.`：
+  - 前缀 `Technical terms: `（T 大写、t 小写、英文冒号、冒号后一个空格）；
+  - 词条之间 `, `（英文逗号 + 一个空格）；结尾 `.`（英文句点）；无换行、无其它说明句。
+  - 词条由 `terms` 按 `,` 切分、逐条 `trim`、丢弃空段。空词表 ⇒ `None`（不调 `set_option("hotwords", …)`）。
+  - 实现在 `transcription::build_ctx_system`；`build_hotwords_string` 不改（另供 `hotwords_version` 等用）。
+- 回显防护：保留 374 `strip_terms_echo`（连续 ≥4 条词条 run）不动；**新增** 398 `strip_technical_terms_echo`——识别大小写不敏感的 `Technical terms` 前缀，把「前缀起 → 其后最后一个匹配词条末尾（含紧邻 `.`）」整段剥掉，走 `apply_acc_disposition` 的 Echo ⇒ 不带注入重解同一路径。**误伤护栏**：仅当前缀之后还能找到 ≥1 个真词条才判回显（用户真说英文 `technical terms` 时不会误删）。
+
+### 原因
+
+- DEC-083 的「不注入」是保识别正确的权宜；根因是**注入格式**（裸词表被当续写），非注入本身。外部 184 次实测给出唯一有效格式，Gavin 明示照搬该「起作用的方法」。
+- Gavin 明示豁免 DEC-059 的真实 API A/B（「修改这么简单，就直接改了吧」）⇒ 本单以格式逐字符对齐 + 纯函数单测 + 端测验证落地，不做离线 A/B。
+
+### 影响
+
+- 🔴 **中文场景外部未测**（#321 只测英文）⇒ 中文（词条含汉字）的实际泄漏率与识别增益**必须靠端测验证**；若端测仍异常，回退路径 = 重新评估格式（`Vocabulary:` / `Proper nouns:` 同为 #321 有效前缀）。
+- 平台中立（`transcription/mod.rs` + `main.rs` 纯 Rust，无 `cfg`），macOS 同继承；`docs/MACOS-HANDOFF.md` 已记录。
+- 词库预算：`estimate_inject_tokens` 对 `build_ctx_system` 结果数 token ⇒ 新前缀自动计入，无需另改。
+- 端测关注点：本地实时模式词库词能否被正确识别；是否仍出现念词表 / `Technical terms` 漏进正文 / 空输出 / 截尾。

@@ -239,19 +239,41 @@ const CTX_ECHO_LCS_ABS: usize = 20;
 /// 回显判定：LCS ≥ 输出的此比例（短输出也可能整段回显）。
 const CTX_ECHO_LCS_RATIO: f64 = 0.5;
 #[allow(dead_code)] // 见上：377 起无调用点，保留待主控裁定
-/// FIX-INJECT-TO-SPEC-377：产出 `hotwords` 通道内容 —— **只放纯 ASCII 逗号分隔词表**。
+/// FIX-INJECT-TO-SPEC-377 + LOCALRT-TERMS-PREFIX-398：产出 `hotwords` 通道内容 ——
+/// **固定前缀 `Technical terms: ` + ASCII 逗号词表 + 英文句点 `.`**。
 ///
-/// 依据（一手）：sherpa `offline-recognizer-qwen3-asr-impl.cc` 把 hotwords **原样**塞进
-/// `<|im_start|>system` + hotwords + `<|im_end|>` 后接 user 轮，注释写明期望形态是 `"foo,bar,baz"`；
-/// 官方 `transcribe()` 无上下文参数、对话只有一个 user 轮、无 system 段。
+/// 依据（一手）：
+/// - LOCALRT-TERMS-PREFIX-398（2026-09-24）：外部 184 次实测（TypeWhisper#321，Qwen3-ASR，英文 4 段 ·
+///   18 种格式 · 3 轮）显示**唯一 0 泄漏格式**是 `Technical terms: a, b, c.`（WER 33.8% → 18.2%）；
+///   `Terms:` / `Keywords:` / `Context:` 与裸词表一样差。Gavin 2026-09-24 原话：
+///   「一定要按照你上次在网上找到的那个起作用的方法来传」。全文见
+///   `collab/research/qwen3-hotwords-failure-2026-09-24.md`。
+/// - sherpa `offline-recognizer-qwen3-asr-impl.cc` 把 hotwords **原样**塞进
+///   `<|im_start|>system` + hotwords + `<|im_end|>` 后接 user 轮。
 ///
-/// 🔴 2026-09-23 前我们塞的是「英文指令句 ×2 + `Context:` 整段散文 + `Terms:` 标签」——
-/// POC-376 实证：英文指令句与 `Context:` 散文**各自独立**都会被模型当输出续写
-/// （ja·不设 language ⇒ 吐 68 字英文指令句；ja·Auto ⇒ 吐 82 字 Context 散文，LCS 77/81）⇒ 全部删除。
+/// 🔴 演进：2026-09-23 前的「英文指令句 ×2 + `Context:` 散文 + `Terms:` 标签」被 POC-376 实证会被续写
+/// ⇒ 删除；377 起改裸词表（`a,b,c`），但 BUILD-395 端测带注入首解异常 28%（空 / 坍塌 / 念词表 /
+/// 截尾 / 跳到词条）⇒ 396 一度整体停注（DEC-083），398 按 Gavin 指示以本固定前缀格式恢复。
+///
+/// **格式硬约束（逐字符）**：前缀 `Technical terms: `（T 大写 / t 小写 / 英文冒号 / 冒号后一个空格），
+/// 词条用 `, `（英文逗号 + 一个空格）连接，结尾 `.`（英文句点），无换行、无其它说明句。
+/// 词条由 `terms` 按 `,` 切分、逐条 `trim`、丢弃空段（连续 / 尾随逗号不产生空词条）。
 /// 空词表 ⇒ `None`（**不调用** `set_option("hotwords", …)`，等同官方示例的「无 system 段」）。
 fn build_ctx_system(terms: Option<&str>) -> Option<String> {
     let t = terms.unwrap_or("").trim();
-    (!t.is_empty()).then(|| t.to_string())
+    if t.is_empty() {
+        return None;
+    }
+    let list = t
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if list.is_empty() {
+        return None;
+    }
+    Some(format!("Technical terms: {list}."))
 }
 
 /// 单窗解码的 per-stream 注入素材（FIX-INJECT-TO-SPEC-377 后的真实语义）。
@@ -570,10 +592,14 @@ fn apply_acc_disposition(
 ) -> (String, AccDispositionOutcome) {
     // 387-3：先剥标签（通用兜底）。
     let (after_tags, had_tag) = strip_angle_tags(&text);
-    // 374：词条回显剥离（结构性）。
+    // 374：词条回显剥离（结构性，裸词表 / 连续词条 run）。
+    // LOCALRT-TERMS-PREFIX-398：未命中再按 398 的 `Technical terms:` 前缀判 ⇒ 共用同一 Echo 重解路径。
     let (stripped, matched_terms, removed_chars) = match strip_terms_echo(&after_tags, terms) {
         Some(h) => (h.stripped, h.matched_terms, h.removed_chars),
-        None => (after_tags, 0usize, 0usize),
+        None => match strip_technical_terms_echo(&after_tags, terms) {
+            Some(h) => (h.stripped, h.matched_terms, h.removed_chars),
+            None => (after_tags, 0usize, 0usize),
+        },
     };
     let remaining_chars = stripped.chars().count();
     // 388-D1：无实质内容（`**`/标点/空白/空）才触发；取代 387 的 `is_only_punct`（漏 `**`）。
@@ -617,11 +643,15 @@ fn apply_acc_disposition(
     let (re_tags, _) = strip_angle_tags(&raw);
     let recovered = match strip_terms_echo(&re_tags, terms) {
         Some(h) => h.stripped,
-        None => re_tags,
+        None => match strip_technical_terms_echo(&re_tags, terms) {
+            Some(h) => h.stripped,
+            None => re_tags,
+        },
     };
     // 校验（388-D1：**所有 kind 统一**）：含实质内容 + 无连续 ≥4 条回显 + 产出率通过。
     // 旧实现只对 Collapse 查产出率 ⇒ 11.6s 重解出「嗯。」也被收下；且 `!is_only_punct` 漏 `**`。
-    let still_echo = strip_terms_echo(&recovered, terms).is_some();
+    let still_echo = strip_terms_echo(&recovered, terms).is_some()
+        || strip_technical_terms_echo(&recovered, terms).is_some();
     let acceptable = has_content(&recovered)
         && !still_echo
         && output_rate_ok(recovered.chars().count(), audio_secs, avg_chars_per_sec);
@@ -707,6 +737,37 @@ fn strip_terms_echo(text: &str, terms: Option<&str>) -> Option<TermsEchoHit> {
         return None;
     }
     // 找**最长**的「连续注入词条（顺序一致）」run（长度 ≥ TERMS_ECHO_MIN_RUN）。
+    let (p, matched_terms, end) = find_best_terms_run(&norm, &injected, TERMS_ECHO_MIN_RUN)?;
+    // 回到原文坐标：删 [first, last] 之间的字符。
+    let first = norm_orig[p];
+    let last = norm_orig[end - 1];
+    let prefix: String = chars[..first].iter().collect();
+    let suffix: String = chars[last + 1..].iter().collect();
+    let mut stripped = String::with_capacity(text.len());
+    stripped.push_str(prefix.trim_end_matches(is_list_separator));
+    stripped.push_str(suffix.trim_start_matches(is_list_separator));
+    // 剥完只剩分隔符/空白 ⇒ 视为**空解码**（不给下游留一个孤零零的逗号）。
+    if stripped.trim_matches(is_list_separator).is_empty() {
+        stripped.clear();
+    }
+    let removed_chars = chars.len() - stripped.chars().count();
+    Some(TermsEchoHit {
+        matched_terms,
+        removed_chars,
+        stripped,
+    })
+}
+
+/// LOCALRT-TERMS-PREFIX-398 / FIX-TERMS-ECHO-374：在归一化序列 `norm` 中找「连续注入词条
+/// （顺序一致）」的**最长** run（长度 ≥ `min_run`），返回 `(起点, 词条数, 终点（不含）)`。
+///
+/// 两个调用方共用同一实现（[`strip_terms_echo`] 与 [`strip_technical_terms_echo`]），
+/// **不得各写一份**（[FIRST-MARKER-BOUNDARY-001] 同族：两份实现早晚分家）。
+fn find_best_terms_run(
+    norm: &[char],
+    injected: &[Vec<char>],
+    min_run: usize,
+) -> Option<(usize, usize, usize)> {
     let mut best: Option<(usize, usize, usize)> = None; // (起点, 词条数, 终点（不含）)
     for (ti, head) in injected.iter().enumerate() {
         let mut p = 0usize;
@@ -723,7 +784,7 @@ fn strip_terms_echo(text: &str, terms: Option<&str>) -> Option<TermsEchoHit> {
                         break;
                     }
                 }
-                if m >= TERMS_ECHO_MIN_RUN && best.is_none_or(|(_, bm, _)| m > bm) {
+                if m >= min_run && best.is_none_or(|(_, bm, _)| m > bm) {
                     best = Some((p, m, end));
                 }
                 p += 1;
@@ -732,22 +793,81 @@ fn strip_terms_echo(text: &str, terms: Option<&str>) -> Option<TermsEchoHit> {
             }
         }
     }
-    let (p, matched_terms, end) = best?;
-    // 回到原文坐标：删 [first, last] 之间的字符。
-    let first = norm_orig[p];
-    let last = norm_orig[end - 1];
+    best
+}
+
+/// LOCALRT-TERMS-PREFIX-398：识别 398 新注入格式 `Technical terms: …`（大小写不敏感）**被回显**
+/// 的片段并整段剥掉。
+///
+/// 与 [`strip_terms_echo`] 的分工：后者按「连续 ≥[`TERMS_ECHO_MIN_RUN`] 个注入词条」判定（对裸词表
+/// 恒执行）；本函数专门补 398 的**前缀**形态 —— 前缀 `Technical terms` 是**人造 token**（用户不会自己
+/// 说），但其后可能只跟 1~3 个词条（词库小）或残缺词条，够不到 374 的「连续 4 条」门槛 ⇒ 单靠
+/// `strip_terms_echo` 会漏判、把前缀 `Technical terms` 漏进正文。
+///
+/// 🔴 **误伤护栏**：仅当「前缀之后还能找到 ≥1 个**真正的注入词条**」才判回显（`matched_terms ≥ 1`，
+/// 走 `apply_acc_disposition` 的 Echo ⇒ 不带注入重解同一路径）；只有前缀、后面没有任何词库词
+/// （如用户真说了英文 `technical terms`）⇒ `None`，绝不误删（374「宁可漏掉也不误伤」精神）。
+///
+/// 剥离范围 = 从 `Technical terms` 起、到其后最后一个匹配词条末尾（含紧邻的英文句点 `.`）。
+/// 找不到前缀 / 无词条跟随 ⇒ `None`（零分配早退）。
+fn strip_technical_terms_echo(text: &str, terms: Option<&str>) -> Option<TermsEchoHit> {
+    let terms = terms?;
+    // 注入侧：按 `,` 切分 → 归一化（去空白/标点、**统一小写**，因输出侧同样小写化）。
+    let injected: Vec<Vec<char>> = terms
+        .split(',')
+        .map(|t| {
+            t.chars()
+                .filter(|c| align_keep_char(*c))
+                .map(|c| c.to_ascii_lowercase())
+                .collect::<Vec<char>>()
+        })
+        .filter(|t| !t.is_empty())
+        .collect();
+    if injected.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    // 输出侧：逐字归一化 + 小写，保留「归一化序号 → 原文字符序号」映射（同 `strip_terms_echo`）。
+    let mut norm: Vec<char> = Vec::with_capacity(chars.len());
+    let mut norm_orig: Vec<usize> = Vec::with_capacity(chars.len());
+    for (i, c) in chars.iter().enumerate() {
+        if align_keep_char(*c) {
+            norm.push(c.to_ascii_lowercase());
+            norm_orig.push(i);
+        }
+    }
+    // 前缀 `Technical terms` 去掉空白/标点后即 `technicalterms`。
+    const MARKER: &str = "technicalterms";
+    let marker: Vec<char> = MARKER.chars().collect();
+    if norm.len() < marker.len() {
+        return None;
+    }
+    let marker_start =
+        (0..=norm.len() - marker.len()).find(|&p| norm[p..p + marker.len()] == marker[..])?;
+    let after = marker_start + marker.len();
+    // 护栏：前缀之后必须能找到 ≥1 个真词条，否则视为自然语言、不剥。
+    let (_, matched, run_end) = find_best_terms_run(&norm[after..], &injected, 1)?;
+    let first = norm_orig[marker_start];
+    let last = norm_orig[after + run_end - 1];
+    // 含入紧随其后的英文句点 `.`（398 注入串以 `.` 收尾）。
+    let mut end = last + 1;
+    while end < chars.len() && chars[end].is_whitespace() {
+        end += 1;
+    }
+    if end < chars.len() && chars[end] == '.' {
+        end += 1;
+    }
     let prefix: String = chars[..first].iter().collect();
-    let suffix: String = chars[last + 1..].iter().collect();
+    let suffix: String = chars[end..].iter().collect();
     let mut stripped = String::with_capacity(text.len());
     stripped.push_str(prefix.trim_end_matches(is_list_separator));
     stripped.push_str(suffix.trim_start_matches(is_list_separator));
-    // 剥完只剩分隔符/空白 ⇒ 视为**空解码**（不给下游留一个孤零零的逗号）。
     if stripped.trim_matches(is_list_separator).is_empty() {
         stripped.clear();
     }
     let removed_chars = chars.len() - stripped.chars().count();
     Some(TermsEchoHit {
-        matched_terms,
+        matched_terms: matched,
         removed_chars,
         stripped,
     })
@@ -3456,24 +3576,25 @@ mod tests {
     //   （旧的 320 上下文/指令句/截断测试随实现整体删除；ctx 回显护栏代码保留但已无调用点）
     // ============================================================
 
+    /// LOCALRT-TERMS-PREFIX-398（推翻 377 的裸词表格式）：产出 = `Technical terms: <词条, 连接>.`。
     #[test]
-    fn fix377_build_ctx_system_is_bare_terms_only() {
+    fn fix398_build_ctx_system_technical_terms_prefix() {
         let terms = "你好,铭印,银线,朵洛莉丝,费曼学习法";
         let s = build_ctx_system(Some(terms)).expect("非空词表 ⇒ 注入");
         assert_eq!(
-            s, terms,
-            "产出必须与输入词表**逐字相同**（ASCII 逗号、无换行）"
+            s, "Technical terms: 你好, 铭印, 银线, 朵洛莉丝, 费曼学习法.",
+            "固定前缀 + `, ` 连接 + 句点（398 逐字符格式）"
         );
-        // 🔴 不得再带任何超规格自由文本（POC-376 实证它们会被模型当输出续写）
+        assert!(s.starts_with("Technical terms: "), "前缀逐字符固定");
+        assert!(s.ends_with('.'), "以英文句点收尾");
+        // 🔴 不得再带 377 前的指令句 / `Context:` / `Terms:` 标签。
         assert!(!s.contains("Context:"), "不得含 Context 标签");
-        assert!(!s.contains("Terms:"), "不得含 Terms 标签");
-        assert!(
-            !s.chars().any(|c| c.is_ascii_alphabetic()),
-            "不得含英文指令句：{s}"
-        );
         assert!(!s.contains('\n'), "不得含换行");
-        // 前后空白被 trim（词表本身不含空白）
-        assert_eq!(build_ctx_system(Some("  词A,词B  ")).unwrap(), "词A,词B");
+        // 词条逐条 trim、空段丢弃。
+        assert_eq!(
+            build_ctx_system(Some("  词A , 词B  ")).unwrap(),
+            "Technical terms: 词A, 词B."
+        );
     }
 
     #[test]
@@ -3497,20 +3618,58 @@ mod tests {
         assert!(should_inject_ctx(build_ctx_system(Some("词A")).as_deref()));
     }
 
-    /// 🔴 钉死：374 的 `strip_terms_echo` 对**新格式**（裸词表本身）仍能正确命中。
+    /// 🔴 钉死：374 的 `strip_terms_echo` 对**带前缀的新格式**仍能命中词条 run；398 的
+    /// `strip_technical_terms_echo` 把前缀也一并剥掉（否则 `Technical terms` 会漏进正文）。
     #[test]
     fn fix377_terms_echo_still_hits_new_format() {
         let terms = "你好,铭印,银线,朵洛莉丝,费曼学习法,子未穿害,低质,罗斯柴尔德,维生素b12";
         let sys = build_ctx_system(Some(terms)).expect("注入串");
-        // 模型把注入串逐字吐回（新格式下即裸词表）⇒ 必须命中并剥空
-        let hit = strip_terms_echo(&sys, build_ctx_system(Some(terms)).as_deref())
-            .expect("新格式下仍须命中");
+        // 模型把注入串吐回 ⇒ 374 仍能命中 9 条连续词条 run（词表被剥，前缀骨架留下）。
+        let hit = strip_terms_echo(&sys, Some(terms)).expect("新格式下词条 run 仍须命中");
         assert_eq!(hit.matched_terms, 9);
-        assert_eq!(hit.stripped, "");
-        // 真实转写 + 尾部裸词表 ⇒ 只剥尾部
+        assert_eq!(hit.stripped, "Technical terms.");
+        // 398：前缀剥离器把整段（前缀 + 词表 + 句点）一次剥空。
+        let hit_prefix = strip_technical_terms_echo(&sys, Some(terms)).expect("398 前缀回显须命中");
+        assert_eq!(hit_prefix.stripped, "");
+        // 真实转写 + 尾部带前缀词表 ⇒ 只剥尾部，保留正文。
         let text = format!("可以看看周边的风景。{sys}");
-        let hit2 = strip_terms_echo(&text, Some(terms)).expect("尾部裸词表应命中");
+        let hit2 = strip_technical_terms_echo(&text, Some(terms)).expect("尾部带前缀词表应命中");
         assert_eq!(hit2.stripped, "可以看看周边的风景。");
+    }
+
+    /// LOCALRT-TERMS-PREFIX-398（任务书逐字示例）：`Some(" 维生素b12 ,飞音, ")` ⇒ 固定格式；
+    /// `None` / 空白 ⇒ `None`。
+    #[test]
+    fn fix398_build_ctx_system_spec_example() {
+        assert_eq!(
+            build_ctx_system(Some(" 维生素b12 ,飞音, ")).as_deref(),
+            Some("Technical terms: 维生素b12, 飞音.")
+        );
+        assert_eq!(build_ctx_system(None), None);
+        assert_eq!(build_ctx_system(Some("   ")), None);
+    }
+
+    /// LOCALRT-TERMS-PREFIX-398：前缀回显剥离 —— 带前缀整段剥空、正文保留、无词条跟随不误删。
+    #[test]
+    fn fix398_technical_terms_prefix_echo_stripped() {
+        let terms = "飞音,维生素b12";
+        // 词库仅 2 条（够不到 374 的「连续 ≥4」门槛）⇒ 前缀剥离器仍命中并剥空。
+        let echo = "Technical terms: 飞音, 维生素b12.";
+        let hit = strip_technical_terms_echo(echo, Some(terms)).expect("前缀回显须命中");
+        assert_eq!(hit.stripped, "");
+        // 正文 + 尾部回显 ⇒ 只剥尾部。
+        let text = format!("今天天气很好。{echo}");
+        let hit2 = strip_technical_terms_echo(&text, Some(terms)).expect("尾部须命中");
+        assert_eq!(hit2.stripped, "今天天气很好。");
+        // 误伤护栏：只有前缀、后面没有词库词 ⇒ 不剥。
+        assert!(
+            strip_technical_terms_echo("这里的技术术语就是 technical terms 的意思。", Some(terms))
+                .is_none(),
+            "无词条跟随 ⇒ 不得误删"
+        );
+        // 无词表 / 无前缀 ⇒ None。
+        assert!(strip_technical_terms_echo(echo, None).is_none());
+        assert!(strip_technical_terms_echo("普通一句话。", Some(terms)).is_none());
     }
 
     #[test]
@@ -7522,27 +7681,36 @@ mod testsync377_inject_spec_tests {
 
     // ---------- 377：build_ctx_system 行为 ----------
 
-    /// 设计：纯词表 ⇒ 逐字返回（不得重排 / 去重 / 加标签）。
+    /// LOCALRT-TERMS-PREFIX-398：产出 = `Technical terms: <词条, 连接>.`（前缀逐字符固定）。
     #[test]
-    fn ctx377_pure_list_verbatim() {
+    fn ctx398_prefix_and_list_format() {
         let t = "你好,铭印,银线,朵洛莉丝";
         assert_eq!(
             build_ctx_system(Some(t)).as_deref(),
-            Some(t),
-            "纯词表必须逐字返回"
+            Some("Technical terms: 你好, 铭印, 银线, 朵洛莉丝."),
+            "固定前缀 + `, ` 连接 + 句点"
         );
     }
 
-    /// 设计：只 trim 首尾；内部空白原样保留。
+    /// 398：词条逐条 trim、空段丢弃（连续 / 尾随逗号不产生空词条）；首尾空白不影响。
     #[test]
-    fn ctx377_trims_ends_only_preserves_inner() {
+    fn ctx398_trims_terms_and_drops_empty() {
         assert_eq!(
             build_ctx_system(Some("  你好, 铭印  ")).as_deref(),
-            Some("你好, 铭印")
+            Some("Technical terms: 你好, 铭印.")
         );
         assert_eq!(
             build_ctx_system(Some("\t你好,铭印\n")).as_deref(),
-            Some("你好,铭印")
+            Some("Technical terms: 你好, 铭印.")
+        );
+        assert_eq!(
+            build_ctx_system(Some("a,,b,")).as_deref(),
+            Some("Technical terms: a, b.")
+        );
+        assert_eq!(
+            build_ctx_system(Some(",")).as_deref(),
+            None,
+            "只有分隔符=无词条 ⇒ None"
         );
     }
 
@@ -7554,18 +7722,12 @@ mod testsync377_inject_spec_tests {
         }
     }
 
-    /// 设计：逗号结构逐字保留（连续逗号 / 尾随逗号 / 只有逗号 / 重复词条都不动）。
+    /// 398：不去重（词条顺序 / 重复按输入原样保留，仅规范化分隔符与空白）。
     #[test]
-    fn ctx377_commas_verbatim() {
-        assert_eq!(build_ctx_system(Some("a,,b,")).as_deref(), Some("a,,b,"));
-        assert_eq!(
-            build_ctx_system(Some(",")).as_deref(),
-            Some(","),
-            "只有逗号=非空 ⇒ 原样"
-        );
+    fn ctx398_no_dedup_keeps_order() {
         assert_eq!(
             build_ctx_system(Some("a,b,a")).as_deref(),
-            Some("a,b,a"),
+            Some("Technical terms: a, b, a."),
             "不去重"
         );
     }
@@ -7589,12 +7751,11 @@ mod testsync377_inject_spec_tests {
         assert!(!out.contains('\n'), "单行词表不得含换行：{out:?}");
     }
 
-    /// 设计（换行括注）：含换行不崩；「原样返回」契约下内部换行保留（与「不带进 system 段」的
-    /// 张力见 result.md 备注，未擅自改断言）。
+    /// 398：词条内换行被 `trim` 掉，产出单行固定格式（不崩、不引入换行）。
     #[test]
-    fn ctx377_internal_newline_is_passthrough_no_panic() {
+    fn ctx398_internal_newline_trimmed_no_panic() {
         let out = build_ctx_system(Some("你好,\n铭印")).expect("非空");
-        assert_eq!(out, "你好,\n铭印", "仅首尾 trim、内部换行按原样保留");
+        assert_eq!(out, "Technical terms: 你好, 铭印.");
     }
 
     /// 设计：注入门 —— 空 ⇒ 不注入；非空 ⇒ 注入。
@@ -7615,18 +7776,19 @@ mod testsync377_inject_spec_tests {
 
     // ---------- 374 / 375：确认不回归（独立夹具） ----------
 
-    /// 374：377 新格式（裸词表）被逐字吐回 ⇒ 仍须命中并整段剥掉。
+    /// 374：带 398 前缀的注入串被逐字吐回 ⇒ 连续词条 run 仍命中；398 前缀剥离器整段剥空。
     #[test]
     fn echo374_new_format_run_is_stripped() {
         let terms = "甲词,乙词,丙词,丁词,戊词";
         let sys = build_ctx_system(Some(terms)).expect("注入串");
-        let hit = super::strip_terms_echo(&sys, Some(terms)).expect("新格式应命中");
+        let hit = super::strip_terms_echo(&sys, Some(terms)).expect("词条 run 应命中");
         assert!(
             hit.matched_terms >= 4,
             "连续词条 run 应 ≥4：{}",
             hit.matched_terms
         );
-        assert_eq!(hit.stripped, "", "整段回显 ⇒ 剥空");
+        let hit2 = super::strip_technical_terms_echo(&sys, Some(terms)).expect("398 前缀应命中");
+        assert_eq!(hit2.stripped, "", "整段回显 ⇒ 剥空");
     }
 
     /// 374：句子里自然说到 1~2 个词库词 ⇒ 不得剥。
