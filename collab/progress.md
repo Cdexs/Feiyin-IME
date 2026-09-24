@@ -65,6 +65,13 @@
 - 实证 Source 实存 **19/19 OK**；规则表 exe 同级读取行号已给。
 - 🔴 **核查**：程序无自动模型下载器，缺口单列（仅 Accuracy 有 UI 引导）。未构建/未出包。
 
+### 2026-09-25 · TEST-EXEC + BUILD-409 出包（405~408B 合包）
+
+- 回归：首轮 bin 1664P/2F/51I（两条红系阶段三测试自身错，作者返修）→ 复跑 bin **1666P/0F/51I**、总 1754P/0F/53I；`src-tauri` 92P/0F；`fmt` EXIT 0；Vitest SKIP。NEW/GONE：对 408B +25/0；对 399 NEW 80/GONE 2。
+- 构建：Step3 #1 6m06s（CT2 重编 1 次）/#2 2m18s（CT2 0）/#3 0.90s 全增量；Step4 `init-publish.ps1` Step5 三 exe 全 OK + 声纹模型 + 四 toml。产物 main `b37aa194…` / ui `ee7f2571…` / crash `a555f11c…` / ct2 `efa16d81…`；两副本全等。
+- 九项 + 专项 A~E + 三特殊点全 PASS；冒烟 `WM_CLOSE` **340ms** 退出。
+- 🔴 出包强杀输入法，已提醒 Gavin 重启 + 带 `-debug` 端测。
+
 ### 2026-09-24 · BUILD-399 出包（撤回 398 词库前缀 · 直接出包，不跑回归）
 
 - 源码 `49bae07`（`src/` 与 `678c7a0` 逐字节一致）；Gavin 明示不跑 `cargo test`/Vitest。

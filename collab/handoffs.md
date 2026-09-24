@@ -106,6 +106,17 @@
 - 🔴 **交班 tester-1 注意**：① DLL 依赖新增 `VCOMP140.DLL`（VC++ 2015-2022 Redist 自带，与 MSVCP140/VCRUNTIME140 同包）；CT2 DLL 体积 8.2MB → 27.4MB；② 出 release 时 oneDNN 会按 Release 重编（dev 档 bench 是 Debug oneDNN，release 只会更快/相近）；③ 首次 release 构建 ctranslate2-sys 会多编 oneDNN（约 +2~3 分钟，本机 debug 实测 3m41s）。
 - 红线：未 commit / 未 push / 未出包 / 版本号未动 / 未 `cargo clean` / 零凭证。
 
+## 2026-09-25 — tester-1 — TEST-EXEC + BUILD-409 ✅ 出包（405~408B 合包；九项 + 专项 A~E + 三特殊点全 PASS）
+
+- **交付源码**：HEAD `d215a95`（`79240dd` + 返修 `05a6d7d`/`d215a95`），工作区 clean，版本 0.9.3。单：405（移除影子收尾 DEC-086 + 显示缓存 + CT2 不重编 + 脚本 exe 名）/406（精解与同窗流式比对守卫）/407（1900ms 末尾组窗）/408A+B（声纹 CAM++ 接入路B）+ 阶段三护栏。
+- **回归**：首轮 bin **1664P/2F/51I**，2 条红均为阶段三测试自身 bug（`ts407_tail_only_when_pending_source_guard` 源码护栏窗口 2600 字符过小；`ts408b_partition_ranges_conservative` 误按 32kHz 算时长），非生产缺陷；主控核实后派作者返修。复跑 bin **1666P/0F/51I**，总 **1754P/0F/53I**（EXIT 0）；`src-tauri` **92P/0F/0I**；`cargo fmt --check` **EXIT 0**；Vitest **SKIP**（`ui/` 无 diff）。
+- **NEW/GONE**：对 **408B `73537a2`**（bin 1641P/51I）**+25P/0G** ⇒ 1666P/51I；对**上包 BUILD-399 `49bae07`** NEW **80** 测试、GONE **2**（`endpoint_confirm_text_takes_longest_of_two`/`_len_not_below_main`）；`vad.rs::find_gap_cut` 为同名重构、不计 GONE。
+- **构建**：Step1 残 0 → Step2 **SKIP**（`ui/`+`src-tauri/` 无 diff）→ Step3 #1 **6m06s**（CT2 重编一次：405 改了 build.rs，属预期）/#2 **2m18s**（voice-ime 返修后重编；**CT2 编译计数 0、sha 不变**）/#3 **0.90s** 全增量（0 Compiling）→ Step4 `scripts/init-publish.ps1`（Step5 三 exe 全 OK）+ 声纹模型 + 四张 rules toml。产物 main `b37aa194d76f…`(15,031,296B/00:23:06) / ui `ee7f2571f1d4…`(未改) / crash `a555f11c4141…`(24,879,104B/00:21:35) / ct2 `efa16d8110bd…`(27,405,312B)；两副本全等。
+- **九项逐项 PASS**：①时间戳 00:12–00:23 ②两副本 sha 相等（main/crash/ct2 异于上包；ui 未改属预期）③**0.9.3** ④冒烟 PID **27040 Responding=True**/无新 crash.json/无 panic/`WM_CLOSE` **340ms**/残 0 ⑤config `da2be5da…` 不变 ⑥warnings 92/9（+`ctranslate2-sys` 18 基线）⑦正 `[LocalRT-DBG-408]`=3、反 `shadow finalize`=0 ⑧scene/itn/homophone/wordbook 四表三副本全等 ⑨**VC++ 五运行库 sha 与 Redist `14.44.35112` 全等**。
+- **专项 A~E**：A **CT2 第二次起不重编**（#2=0、#3=0.90s，sha `efa16d81…` 稳定）；B 声纹模型进包 `aa3cfc16963a…` 28,281,164B（与源等）；C `init-publish.ps1` Step5 自动复制 `feiyin-ime.exe`/`feiyin-ime-ui.exe`/`crash-reporter.exe`（**无 SKIP、无手工 cp**）；D 冒烟：未录音（N/A 三证 + exe `[LocalRT-DBG-408]`=3），新窗 `shadow finalize`=0、无 speaker warn；E 用户数据**只列不删**（`Publish/voiceprint.bin` 不存在；config.toml 2026-09-20 / wordbook.sqlite 2026-09-10）。
+- **三特殊点（仅核验）**：① sherpa 四 DLL 三副本全等 + `onnxruntime` **1.28.2**；② itn-rules 三副本 `60b227de…`；③ `Publish/models/` 1.7B 七文件与源全等、0.6B 保留。
+- 🔴 **Step1 强杀输入法进程 ⇒ 已提醒 Gavin 重启 + 带 `-debug` 端测**。未 push / 版本号未动 / 未改生产代码 / 未 `cargo clean` / 未删 Publish 用户数据 / 零凭证。证据 `collab/evidence/409/`。
+
 ## 2026-09-24 — tester-1 — BUILD-399 ✅ 出包（撤回 398 词库前缀 · 直接出包；九项 + 专项 + 三特殊点全 PASS）
 
 - **交付源码**：HEAD `49bae07`（`src/` 与 `678c7a0` 逐字节一致：本地实时恢复不注入词库、无 `Technical terms:` 前缀；397 翻译提速保留），版本 0.9.3。**Gavin 明示不跑回归**。
