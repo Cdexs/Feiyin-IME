@@ -115,6 +115,16 @@
 - 🔴 **交班 tester-1 注意**：① DLL 依赖新增 `VCOMP140.DLL`（VC++ 2015-2022 Redist 自带，与 MSVCP140/VCRUNTIME140 同包）；CT2 DLL 体积 8.2MB → 27.4MB；② 出 release 时 oneDNN 会按 Release 重编（dev 档 bench 是 Debug oneDNN，release 只会更快/相近）；③ 首次 release 构建 ctranslate2-sys 会多编 oneDNN（约 +2~3 分钟，本机 debug 实测 3m41s）。
 - 红线：未 commit / 未 push / 未出包 / 版本号未动 / 未 `cargo clean` / 零凭证。
 
+## 2026-09-25 — tester-1 — TEST-EXEC + BUILD-410 ✅ 出包（末尾窗 × 406 配合修正；九项 + 专项 A~D + 三特殊点全 PASS）
+
+- **交付源码**：HEAD `1814baf`（`e4cae44` FIX-TAIL-GUARD-410 + `1814baf` TEST-SYNC-410），工作区 clean，版本 0.9.3。单：末尾窗比对基准只取前片对应末尾 + pending、被拒只兜底 pending 前片不动、流式兜底经进程级标点服务线程打标点（懒启动/异常重启≤2/冷却 30s/超时不重启）+ 6 条非作者护栏。
+- **回归**：root bin **1680P/0F/52I**、总 **1768P/0F/54I**（EXIT 0）；`src-tauri` **92P/0F/0I**；`cargo fmt --check` **EXIT 0**；Vitest **SKIP**（`ui/` 无 diff）。**NEW/GONE**（对 BUILD-409 bin 1666P/51I）：**+14P**（`f410_*` 8 + `ts410_*` 6）**+1I**（`f410_real_punctuate`）；**GONE 0**⇒ 1680P/52I。预期逐位命中。
+- **构建**：Step1 残 0 → Step2 **SKIP**（`ui/`+`src-tauri/` 无 diff）→ Step3 #1 **2m57s**（**CT2 编译计数 0**）/#2 **0.94s** 全增量（0 Compiling）→ Step4 `scripts/init-publish.ps1`（Step5 三 exe 全 OK）+ 声纹模型 + 四张 rules toml。产物 main `a3365d7925e7…`(15,099,904B/01:05:59) / ui `ee7f2571f1d4…`(未变) / crash `b675b6f481a4…`(24,879,104B/01:04:01) / ct2 `efa16d8110bd…`(未重编)；两副本全等。
+- **九项逐项 PASS**：①时间戳 01:03–01:06 ②两副本 sha 相等（main/crash 异于上包；ct2/ui 未变属预期）③**0.9.3** ④冒烟 PID **3364 Responding=True**/无新 crash.json/无 panic/`WM_CLOSE` **380ms**/残 0 ⑤config `da2be5da…` 不变 ⑥warnings 92/9（+`ctranslate2-sys` 18 基线）⑦正 `[LocalRT-DBG-410]`=4（反探针 N/A：本批无删除字面量）⑧scene/itn 三副本全等 ⑨**VC++ 五运行库 sha 与 Redist `14.44.35112` 全等**。
+- **专项 A~D**：A **CT2 不重编**（#1=0、#2=0.94s，sha `efa16d81…` 与上包逐位相同）；B 声纹模型 `aa3cfc16963a…` 28,281,164B 仍在包内；C 冒烟（未录音：DBG-406/407/410 新窗=0，标点服务未 spawn 属正常，无 shadow finalize/speaker warn/panic）；D 用户数据**只列不删**（`voiceprint.bin` 不存在；config.toml 2026-09-20 / wordbook.sqlite 2026-09-10）。
+- **三特殊点（仅核验）**：① sherpa 四 DLL 三副本全等 + `onnxruntime` **1.28.2**；② itn-rules 三副本 `60b227de…`；③ `Publish/models/` 1.7B 七文件与源全等、0.6B 保留。
+- 🔴 **Step1 强杀输入法进程 ⇒ 已提醒 Gavin 重启 + 带 `-debug` 端测**。未 push / 版本号未动 / 未改生产代码 / 未 `cargo clean` / 未删用户数据 / 零凭证。证据 `collab/evidence/410/`。
+
 ## 2026-09-25 — tester-1 — TEST-EXEC + BUILD-409 ✅ 出包（405~408B 合包；九项 + 专项 A~E + 三特殊点全 PASS）
 
 - **交付源码**：HEAD `d215a95`（`79240dd` + 返修 `05a6d7d`/`d215a95`），工作区 clean，版本 0.9.3。单：405（移除影子收尾 DEC-086 + 显示缓存 + CT2 不重编 + 脚本 exe 名）/406（精解与同窗流式比对守卫）/407（1900ms 末尾组窗）/408A+B（声纹 CAM++ 接入路B）+ 阶段三护栏。

@@ -72,6 +72,13 @@
 - 实证 Source 实存 **19/19 OK**；规则表 exe 同级读取行号已给。
 - 🔴 **核查**：程序无自动模型下载器，缺口单列（仅 Accuracy 有 UI 引导）。未构建/未出包。
 
+### 2026-09-25 · TEST-EXEC + BUILD-410 出包（末尾窗 × 406 配合修正）
+
+- 回归：root bin **1680P/0F/52I**、总 1768P/0F/54I；`src-tauri` 92P/0F；`fmt` EXIT 0；Vitest SKIP。NEW/GONE（对 409）+14P/+1I（`f410_*` 8 + `ts410_*` 6 + ignored `f410_real_punctuate`），GONE 0。
+- 构建：Step2 SKIP；Step3 #1 2m57s（CT2 编译 0）/#2 0.94s；Step4 `init-publish.ps1` Step5 三 exe 全 OK + 声纹模型 + 四 toml。产物 main `a3365d79…` / ui `ee7f2571…` / crash `b675b6f4…` / ct2 `efa16d81…`（未重编）。
+- 九项 + 专项 A~D + 三特殊点全 PASS；冒烟 `WM_CLOSE` **380ms** 退出。
+- 🔴 出包强杀输入法，已提醒 Gavin 重启 + 带 `-debug` 端测。
+
 ### 2026-09-25 · TEST-EXEC + BUILD-409 出包（405~408B 合包）
 
 - 回归：首轮 bin 1664P/2F/51I（两条红系阶段三测试自身错，作者返修）→ 复跑 bin **1666P/0F/51I**、总 1754P/0F/53I；`src-tauri` 92P/0F；`fmt` EXIT 0；Vitest SKIP。NEW/GONE：对 408B +25/0；对 399 NEW 80/GONE 2。
