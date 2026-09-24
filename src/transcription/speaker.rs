@@ -574,3 +574,332 @@ mod tests {
         assert!(self_cos > DROP_THR, "本人自相似应高于剔除阈");
     }
 }
+
+// =====================================================================
+// TEST-SYNC-408A（阶段三 · 非作者护栏，coder-2）
+// ---------------------------------------------------------------------
+// 按**设计契约**编写，不照抄实现；作者是 coder-1（408A）。仅追加本 `#[cfg(test)]` 模块，
+// 生产代码零改动。契约出处：`SPEAKER-VERIFY-408A` 设计（主控定）与 `speaker.rs` 各常量注释。
+// 白名单：本单只跑 `rustfmt` + `cargo check --all-targets`（测试执行由 tester-1 做）。
+// =====================================================================
+#[cfg(test)]
+mod testsync408a_tests {
+    use super::*;
+
+    /// 第 i 个坐标轴的单位向量（任意维）。
+    fn unit(axis: usize, dim: usize) -> Vec<f32> {
+        let mut v = vec![0f32; dim];
+        v[axis] = 1.0;
+        v
+    }
+    /// 与 `[1,0]` 余弦恰为 `c` 的单位向量（`cosine` 实测 ≈ c）。
+    fn at_cos(c: f32) -> Vec<f32> {
+        vec![c, (1.0 - c * c).max(0.0).sqrt()]
+    }
+    /// 直接构造「已就绪」声纹（质心给定）；非就绪状态用 `Voiceprint::default()`。
+    fn ready(centroid: Vec<f32>) -> Voiceprint {
+        Voiceprint {
+            centroid,
+            total_secs: ENROLL_MIN_SECS,
+            segments: ENROLL_MIN_SEGS,
+            candidates: Vec::new(),
+        }
+    }
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "voice-ime-spk-sync408a-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    // ---------- 契约点 1：判定顺序与边界（judge） ----------
+
+    /// 契约 1：短段门优先于一切 —— 1.9s 即便「ja + 已就绪 + 非本人分数」也 KeepShort；
+    /// 未就绪 + 无 emb + 1.5s 同样 KeepShort。
+    #[test]
+    fn ts408a_judge_short_beats_all() {
+        let vp = ready(unit(0, 2));
+        assert_eq!(
+            judge(&vp, Some(&at_cos(0.0)), 1.9, Some("ja")),
+            SegVerdict::KeepShort,
+            "短段优先于语言/就绪/分数"
+        );
+        assert_eq!(
+            judge(&Voiceprint::default(), None, 1.5, Some("ja")),
+            SegVerdict::KeepShort
+        );
+    }
+
+    /// 契约 1 边界：**恰 `MIN_JUDGE_SECS`(2.0s) 进入判定**；1.999s 仍在短段门内。
+    #[test]
+    fn ts408a_judge_exact_2s_enters_judgment() {
+        let vp = ready(unit(0, 2));
+        assert!(
+            matches!(
+                judge(&vp, Some(&at_cos(0.3)), MIN_JUDGE_SECS, Some("zh")),
+                SegVerdict::DropNonUser(_)
+            ),
+            "恰 2.0s 应进入判定（0.3 < 0.45 ⇒ 剔除）"
+        );
+        assert_eq!(
+            judge(&vp, Some(&at_cos(0.3)), MIN_JUDGE_SECS - 0.001, Some("zh")),
+            SegVerdict::KeepShort,
+            "1.999s 仍判短段"
+        );
+    }
+
+    /// 契约 1 顺序：**语言门先于就绪门** —— 未就绪 + ja/未知 ⇒ KeepLanguage（非 KeepNotReady）；
+    /// 未就绪 + zh ⇒ KeepNotReady。
+    #[test]
+    fn ts408a_judge_language_beats_readiness() {
+        let d = Voiceprint::default();
+        assert_eq!(
+            judge(&d, Some(&at_cos(0.0)), 3.0, Some("ja")),
+            SegVerdict::KeepLanguage
+        );
+        assert_eq!(
+            judge(&d, Some(&at_cos(0.0)), 3.0, None),
+            SegVerdict::KeepLanguage
+        );
+        assert_eq!(
+            judge(&d, Some(&at_cos(0.0)), 3.0, Some("zh")),
+            SegVerdict::KeepNotReady
+        );
+    }
+
+    /// 契约 1 边界：**恰 `DROP_THR`(0.45) 不剔除**（`>=` 保留）；0.44 剔除。
+    #[test]
+    fn ts408a_judge_exact_drop_thr_is_kept() {
+        let vp = ready(unit(0, 2));
+        let at_thr = at_cos(DROP_THR);
+        assert!(
+            cosine(&vp.centroid, &at_thr) >= DROP_THR,
+            "测试向量须准确落在阈值上（实测 {})",
+            cosine(&vp.centroid, &at_thr)
+        );
+        assert!(
+            matches!(
+                judge(&vp, Some(&at_thr), 3.0, Some("zh")),
+                SegVerdict::KeepUser(_)
+            ),
+            "恰 0.45 不得剔除"
+        );
+        assert!(
+            matches!(
+                judge(&vp, Some(&at_cos(DROP_THR - 0.01)), 3.0, Some("zh")),
+                SegVerdict::DropNonUser(_)
+            ),
+            "0.44 应剔除"
+        );
+    }
+
+    /// 契约 1（保守兜底）：已就绪但 emb 缺失（提取失败）⇒ 不剔除，返回 KeepNotReady。
+    #[test]
+    fn ts408a_judge_missing_embedding_keeps() {
+        let vp = ready(unit(0, 2));
+        assert_eq!(
+            judge(&vp, None, 3.0, Some("zh")),
+            SegVerdict::KeepNotReady,
+            "无 emb ⇒ 无法判定 ⇒ 保守保留"
+        );
+    }
+
+    // ---------- 契约点 2：注册防污染 ----------
+
+    /// 契约 2：3 段本人 + 1 段他人（正交）⇒ 他人被剔除、仍就绪、质心≈本人；
+    /// 就绪后判该他人 ⇒ DropNonUser，判本人 ⇒ KeepUser。
+    #[test]
+    fn ts408a_enroll_drops_outlier_still_ready() {
+        let e = unit(0, 2);
+        let o = unit(1, 2);
+        let mut vp = Voiceprint::default();
+        vp.offer(&e, 4.0, None);
+        vp.offer(&e, 4.0, None);
+        vp.offer(&o, 4.0, None); // 混入的他人
+        vp.offer(&e, 4.0, None); // 触发定稿
+        assert!(vp.is_ready(), "剔除离群后 3×4s 应就绪");
+        assert!(
+            cosine(&vp.centroid, &e) > 0.99,
+            "他人段不得污染质心（实测 {})",
+            cosine(&vp.centroid, &e)
+        );
+        assert!(matches!(
+            judge(&vp, Some(&o), 3.0, Some("zh")),
+            SegVerdict::DropNonUser(_)
+        ));
+        assert!(matches!(
+            judge(&vp, Some(&e), 3.0, Some("zh")),
+            SegVerdict::KeepUser(_)
+        ));
+    }
+
+    /// 契约 2：2 段本人 + 2 段**不同**他人（相互正交）⇒ 两他人皆离群被剔除，
+    /// 剩余 6s / 2 段 < 门槛 ⇒ 不就绪。
+    #[test]
+    fn ts408a_enroll_two_self_two_others_not_ready() {
+        let e = unit(0, 3);
+        let mut vp = Voiceprint::default();
+        vp.offer(&e, 3.0, None);
+        vp.offer(&unit(1, 3), 3.0, None);
+        vp.offer(&unit(2, 3), 3.0, None);
+        vp.offer(&e, 3.0, None); // 共 12s / 4 段 ⇒ 触发定稿
+        assert!(!vp.is_ready(), "剔除两他人后 6s/2 段 < 门槛");
+    }
+
+    /// 契约 2（**已知局限**）：候选**全部来自同一个他人**时，模块无先验本人声纹、无法区分，
+    /// 会把该人注册为「本人」。**这是设计局限而非缺陷** —— 本用例只钉住当前行为，不改实现。
+    #[test]
+    fn ts408a_enroll_all_same_other_is_known_limitation() {
+        let o = unit(1, 2);
+        let mut vp = Voiceprint::default();
+        vp.offer(&o, 5.0, None);
+        vp.offer(&o, 5.0, None);
+        vp.offer(&o, 5.0, None);
+        assert!(
+            vp.is_ready(),
+            "全为同一他人 ⇒ 按设计会注册（已知局限，记录在案，非缺陷）"
+        );
+        assert!(cosine(&vp.centroid, &o) > 0.99);
+    }
+
+    // ---------- 契约点 3：漂移上限 + 低分不动 ----------
+
+    /// 契约 3：低分段（score < `UPDATE_THR`）**永不改变**质心（逐位）、也不增时长/段数。
+    #[test]
+    fn ts408a_drift_low_score_bitwise_unchanged() {
+        let mut vp = ready(unit(0, 2));
+        let before = vp.centroid.clone();
+        let (seg0, sec0) = (vp.segments, vp.total_secs);
+        vp.offer(&at_cos(0.5), 8.0, Some(0.5));
+        vp.offer(&unit(1, 2), 100.0, Some(0.0));
+        assert_eq!(vp.centroid, before, "低分段不得改变质心（逐位）");
+        assert_eq!(vp.segments, seg0);
+        assert_eq!(vp.total_secs, sec0);
+    }
+
+    /// 契约 3：单段权重上限 `UPDATE_MAX_WEIGHT`(0.25) —— 喂一段超长音频（100000s）也只用 0.25，
+    /// 质心仍单位范数、单步角位移有界。
+    #[test]
+    fn ts408a_drift_single_step_bounded_by_max_weight() {
+        let mut vp = ready(unit(0, 2));
+        let before = vp.centroid.clone();
+        vp.offer(&unit(1, 2), 100_000.0, Some(1.0)); // 与 before 正交、分数满
+        let n: f32 = vp.centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((n - 1.0).abs() < 1e-3, "EMA 后应仍单位范数，实测 {n}");
+        let moved = cosine(&before, &vp.centroid);
+        // α≤0.25 时 cos(before,after) ≥ 0.75/√(0.75²+0.25²) ≈ 0.9487。
+        assert!(
+            moved >= 0.94,
+            "单步位移须受 0.25 权重限制，实测 cos={moved}"
+        );
+    }
+
+    /// 契约 3：连续大量高分段（与初始质心 cos=0.8 ≥ `UPDATE_THR`）只会单调靠近目标、
+    /// 不越过目标方向；每步都受权重上限约束。
+    #[test]
+    fn ts408a_drift_many_high_updates_converge_bounded() {
+        let mut vp = ready(unit(0, 2));
+        let c0 = vp.centroid.clone();
+        let tgt = at_cos(0.8);
+        let start_cos = cosine(&c0, &tgt);
+        for _ in 0..50 {
+            vp.offer(&tgt, 5.0, None); // score = cos(质心, tgt) 单调升，始终 ≥ 0.8 ≥ UPDATE_THR
+        }
+        let end_cos = cosine(&vp.centroid, &tgt);
+        assert!(end_cos > start_cos, "高分段应把质心拉向目标");
+        assert!(end_cos <= 1.0 + 1e-6, "不得越过目标方向");
+        let n: f32 = vp.centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((n - 1.0).abs() < 1e-3, "质心始终单位范数");
+    }
+
+    // ---------- 契约点 4：存档 ----------
+
+    /// 契约 4：往返一致；版本/模型不符或损坏 ⇒ 丢弃（空、不 panic）；**未就绪不落盘**。
+    #[test]
+    fn ts408a_persist_roundtrip_and_discard_guards() {
+        let dir = temp_dir("persist");
+        let path = dir.join("voiceprint.json");
+
+        // 就绪档往返：质心/时长/段数一致。
+        let mut vp = ready(l2_normalize(&[0.6, 0.8]));
+        vp.total_secs = 33.0;
+        vp.segments = 5;
+        vp.save(&path);
+        let back = Voiceprint::load(&path);
+        assert!(back.is_ready(), "就绪档读回应就绪");
+        assert!((back.total_secs - 33.0).abs() < 1e-3);
+        assert_eq!(back.segments, 5);
+        assert!(
+            cosine(&back.centroid, &vp.centroid) > 0.999,
+            "质心往返应一致"
+        );
+
+        // 未就绪不落盘。
+        let p2 = dir.join("not_ready.json");
+        Voiceprint::default().save(&p2);
+        assert!(!p2.exists(), "未就绪不得落盘（避免半成品档）");
+
+        // 损坏 / 版本不符 / 模型不符 ⇒ 丢弃且不 panic。
+        for bad in [
+            "not json{",
+            "{\"version\":0,\"model\":\"x\",\"centroid\":[1.0],\"total_secs\":1.0,\"segments\":1}",
+            "{\"version\":1,\"model\":\"WRONG\",\"centroid\":[1.0],\"total_secs\":20.0,\"segments\":5}",
+            "{\"version\":1,\"model\":\"campplus-zh_en-16k-common-advanced-v1\",\"centroid\":[],\"total_secs\":20.0,\"segments\":5}",
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(
+                !Voiceprint::load(&path).is_ready(),
+                "异常档应丢弃为空：{bad}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---------- 契约点 5：跨用户（不得把 B 学进 A） ----------
+
+    /// 契约 5：A 就绪后，B 的段（与 A 正交、score<`UPDATE_THR`）反复喂入 ⇒ 逐位不变；
+    /// 判 B ⇒ DropNonUser，判 A ⇒ KeepUser。
+    #[test]
+    fn ts408a_cross_user_b_not_absorbed() {
+        let a = unit(0, 2);
+        let b = unit(1, 2);
+        let mut vp = ready(a.clone());
+        let before = vp.centroid.clone();
+        let (seg0, sec0) = (vp.segments, vp.total_secs);
+        for _ in 0..20 {
+            vp.offer(&b, 5.0, None);
+        }
+        assert_eq!(vp.centroid, before, "不得把 B 学进 A 的质心（逐位）");
+        assert_eq!(vp.segments, seg0);
+        assert_eq!(vp.total_secs, sec0);
+        assert!(matches!(
+            judge(&vp, Some(&b), 3.0, Some("zh")),
+            SegVerdict::DropNonUser(_)
+        ));
+        assert!(matches!(
+            judge(&vp, Some(&a), 3.0, Some("zh")),
+            SegVerdict::KeepUser(_)
+        ));
+    }
+
+    // ---------- 契约点 6：余弦边界 ----------
+
+    /// 契约 6：零向量 / 长度不等 / 空 ⇒ 不 panic（返回 0）；非单位输入按归一化处理。
+    #[test]
+    fn ts408a_cosine_edge_cases_no_panic() {
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0, "零向量 ⇒ 0");
+        assert_eq!(cosine(&[0.0, 0.0], &[0.0, 0.0]), 0.0, "双零 ⇒ 0");
+        assert_eq!(cosine(&[1.0, 2.0], &[1.0]), 0.0, "长度不等 ⇒ 0");
+        assert_eq!(cosine(&[], &[1.0]), 0.0, "空 ⇒ 0");
+        assert!(cosine(&[2.0, 0.0], &[0.0, 3.0]).abs() < 1e-6, "正交 ⇒ 0");
+        assert!(
+            (cosine(&[2.0, 0.0], &[5.0, 0.0]) - 1.0).abs() < 1e-6,
+            "同向（非单位）⇒ 1"
+        );
+    }
+}
