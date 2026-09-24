@@ -8306,3 +8306,197 @@ mod fix408b_tests {
         assert!(!p.exists(), "src/bin/poc_speaker_408.rs 必须删除");
     }
 }
+
+// =====================================================================
+// TEST-SYNC-406-408B（阶段三 · 非作者护栏 · coder-1）：按**设计契约**补独立用例，
+// 不与作者 406（`fix406_acc_vs_streaming_verdicts`）/ 408B（`fix408b_tests`）重复。
+// 契约出处：`collab/inbox` 任务书（406 / 408B）与 `logs/20260924.md` 定稿记录。
+// 🔴 白名单：只 `rustfmt` + `cargo check --all-targets`；本模块**只写测试**。
+// =====================================================================
+#[cfg(test)]
+mod testsync406_408b_tests {
+    use super::{
+        acc_vs_streaming, acc_vs_streaming_after_drop, lang_from_charset, qwen3_prefix_lang,
+        strip_angle_tags, strip_qwen3_language_prefix_lang, MISMATCH_MIN_LEN_RATIO,
+        MISMATCH_MIN_RETENTION, MISMATCH_MIN_STREAM_CHARS,
+    };
+
+    /// 契约 1：常量与「<6 字不判」的短样本门。
+    #[test]
+    fn ts406_threshold_constants_and_short_stream() {
+        assert_eq!(MISMATCH_MIN_STREAM_CHARS, 6, "契约：流式归一化 <6 字不判");
+        assert_eq!(MISMATCH_MIN_RETENTION, 0.5, "契约：保留率门 0.5");
+        assert_eq!(MISMATCH_MIN_LEN_RATIO, 0.6, "契约：长度比门 0.6");
+        // 归一化后 5 字（<6）⇒ accept（宁漏勿误杀）——即使与精解毫无关系。
+        assert!(
+            acc_vs_streaming("完全无关", "abcde").accept,
+            "5 字短样本放行"
+        );
+        assert!(acc_vs_streaming("x", "").accept, "空流式放行");
+    }
+
+    /// 契约 1：**门限边界**（作者用例未覆盖精确边界）。
+    #[test]
+    fn ts406_threshold_exact_boundaries() {
+        // 保留率恰 0.5、长度比 0.625 ⇒ accept（0.5>=0.5）。
+        // 流式 ABCDEFGH(8)，精解 ABCXE(5)：LCS=ABCE=4 ⇒ retention=4/8=0.5，len_ratio=5/8=0.625。
+        let v = acc_vs_streaming("ABCXE", "ABCDEFGH");
+        assert!((v.retention - 0.5).abs() < 1e-6, "retention 应恰 0.5");
+        assert!(v.accept, "恰在保留率门限上 ⇒ accept");
+        // 长度比恰 0.6、保留率恰 0.6 ⇒ accept（ABCDEF(6) vs ABCDEFGHIJ(10)）。
+        let v2 = acc_vs_streaming("ABCDEF", "ABCDEFGHIJ");
+        assert!((v2.len_ratio - 0.6).abs() < 1e-6, "len_ratio 应恰 0.6");
+        assert!(v2.accept, "恰在长度比门限上 ⇒ accept");
+        // 长度比 0.5（<0.6）⇒ reject，即便保留率恰 0.5。
+        let v3 = acc_vs_streaming("ABCDE", "ABCDEFGHIJ");
+        assert!(!v3.accept, "长度比 0.5<0.6 ⇒ reject");
+    }
+
+    /// 契约 1：全角/半角、大小写、标点**不影响结论**（归一化后等价）。
+    #[test]
+    fn ts406_normalize_fullwidth_case_punct() {
+        // 全角字母 + 全角标点 vs 半角小写：归一化后逐字相同 ⇒ accept。
+        assert!(
+            acc_vs_streaming("ＡＢＣＤＥＦ，你好世界！", "abcdef你好世界").accept,
+            "全角/标点/大小写归一后应一致"
+        );
+        // 半角标点 + 大小写混合。
+        assert!(acc_vs_streaming("Hello, World!", "hello world").accept);
+        // 差异只在标点/空白、归一后零差异。
+        assert!(acc_vs_streaming("你好，世界 呀", "你好世界呀").accept);
+    }
+
+    /// 契约 2：同音错字（每处 1 字、占比 ≤20%）⇒ 放行；与流式几乎零重合的幻觉 ⇒ 拒。
+    #[test]
+    fn ts406_homophone_accept_and_hallucination_reject() {
+        // 8 字句 1 字差异（12.5% ≤20%）⇒ accept。
+        let v = acc_vs_streaming("今天天气真不错呀", "今天天气真不错啊");
+        assert!(v.accept, "同音错字纠正应 accept");
+        // 拉丁幻觉 vs 中文流式 ⇒ 零重合 ⇒ reject。
+        let h = acc_vs_streaming("abcde", "今天天气真不错啊");
+        assert!(!h.accept, "几乎零重合的幻觉应 reject");
+    }
+
+    /// 契约 3：精解去掉口吃重复/语气词（长度比 0.6~0.8）⇒ 放行（Gavin 定 0.6 的依据）。
+    #[test]
+    fn ts406_shorter_dedup_still_accepted() {
+        // "嗯我今天真的很开心"(9) vs "我今天很开心"(6)：ret=6/9≈0.667、len=0.667 ∈[0.6,0.8)。
+        let v = acc_vs_streaming("我今天很开心", "嗯我今天真的很开心");
+        assert!(v.accept, "去掉口吃/语气词应 accept");
+        assert!(
+            v.len_ratio >= MISMATCH_MIN_LEN_RATIO && v.len_ratio < 0.8,
+            "长度比应落在 0.6~0.8"
+        );
+    }
+
+    /// 契约 4：`dropped<=0` ⇒ 与 406 原判**逐位一致**；`dropped>0` 门槛按比例放宽且**不低于 0.2**。
+    #[test]
+    fn ts406_after_drop_identity_and_scaling() {
+        let pairs = [
+            (
+                "看看最近有什么好看的电影",
+                "看看最近有什么好看的电影然后有什么好看的精彩的电影大片上",
+            ),
+            ("ABCDEF", "ABCDEFGHIJ"),
+            ("我今天很开心", "嗯我今天真的很开心"),
+            ("abc", "abcdefgh"),
+        ];
+        for (acc, s) in pairs {
+            let plain = acc_vs_streaming(acc, s);
+            for dropped in [0.0f32, -1.0, -0.001] {
+                let z = acc_vs_streaming_after_drop(acc, s, dropped, 5.0);
+                assert_eq!(
+                    (plain.retention, plain.len_ratio, plain.accept),
+                    (z.retention, z.len_ratio, z.accept),
+                    "dropped={dropped} 应与 406 逐位一致：acc={acc:?}"
+                );
+            }
+        }
+        // 放宽：base reject（ret 0.4 / len 0.5），dropped=6 kept=4 ⇒ scale=0.4 ⇒ 门槛 0.2/0.24 ⇒ accept。
+        let base = acc_vs_streaming("ABCDX", "ABCDEFGHIJ");
+        assert!(!base.accept, "base 应 reject");
+        let relax = acc_vs_streaming_after_drop("ABCDX", "ABCDEFGHIJ", 6.0, 4.0);
+        assert!(relax.accept, "dropped>0 按比例放宽后应 accept");
+        // 下限 0.2：kept=1/dropped=99 ⇒ 原始 scale=0.01 会被夹到 0.2 ⇒ 门槛 0.1/0.12。
+        // acc="A" vs 20 字流式：ret=0.05、len=0.05（<0.1）⇒ reject（若下限更低则会误放行）。
+        let floored = acc_vs_streaming_after_drop("A", "ABCDEFGHIJKLMNOPQRST", 99.0, 1.0);
+        assert!(!floored.accept, "放宽不得越过 0.2 下限");
+    }
+
+    /// 契约 5：未闭合标签剥除 + 不该剥的负例。
+    #[test]
+    fn ts406_strip_unclosed_tags() {
+        // 未闭合标签（`<` + ≥3 连续 ASCII 字母、无 `>`）⇒ 剥。
+        assert_eq!(strip_angle_tags("<translation"), (String::new(), true));
+        assert_eq!(
+            strip_angle_tags("文字<asr_text"),
+            ("文字".to_string(), true)
+        );
+        // 387 闭合标签仍剥。
+        assert_eq!(
+            strip_angle_tags("天气<location>不错"),
+            ("天气不错".to_string(), true)
+        );
+        // 🔴 负例：`<` 后字母不足 3 个 / 非字母 ⇒ 不剥。
+        assert_eq!(strip_angle_tags("a<b"), ("a<b".to_string(), false));
+        assert_eq!(strip_angle_tags("3<5"), ("3<5".to_string(), false));
+        assert_eq!(strip_angle_tags("<3块钱"), ("<3块钱".to_string(), false));
+        assert_eq!(strip_angle_tags("x<ab"), ("x<ab".to_string(), false));
+    }
+
+    /// 契约 8：字符集粗判语种 —— 优先级 假名 > 谚文 > 汉字 > 拉丁。
+    #[test]
+    fn ts408b_lang_charset_priority() {
+        assert_eq!(lang_from_charset("あ汉字"), Some("ja"), "假名优先于汉字");
+        assert_eq!(lang_from_charset("한漢"), Some("ko"), "谚文优先于汉字");
+        assert_eq!(lang_from_charset("漢字"), Some("zh"), "汉字 ⇒ zh");
+        assert_eq!(lang_from_charset("abc漢字"), Some("zh"), "汉字优先于拉丁");
+        assert_eq!(lang_from_charset("abc123"), Some("en"), "拉丁 ⇒ en");
+        assert_eq!(lang_from_charset("123。！"), None, "无可判字符 ⇒ None");
+    }
+
+    /// 契约 8：`<asr_text>` 前缀语种解析 + 剥离。
+    #[test]
+    fn ts408b_prefix_lang_parse_and_strip() {
+        let (body, lang) =
+            strip_qwen3_language_prefix_lang("language Japanese<asr_text>こんにちは");
+        assert_eq!(body, "こんにちは");
+        assert_eq!(lang, Some("ja".to_string()));
+        let (body2, lang2) = strip_qwen3_language_prefix_lang("language Chinese<asr_text>你好");
+        assert_eq!(body2, "你好");
+        assert_eq!(lang2, Some("zh".to_string()));
+        // 无 `<asr_text>` ⇒ 原样、None。
+        let (body3, lang3) = strip_qwen3_language_prefix_lang("普通正文没有标记");
+        assert_eq!(body3, "普通正文没有标记");
+        assert_eq!(lang3, None);
+        // 前缀解析（大小写不敏感 / 中文别名）。
+        assert_eq!(
+            qwen3_prefix_lang("language English"),
+            Some("en".to_string())
+        );
+        assert_eq!(qwen3_prefix_lang("korean"), Some("ko".to_string()));
+        assert_eq!(qwen3_prefix_lang("gibberish"), None);
+    }
+
+    /// 契约 7（解码后保护）：本窗有剔除 且（L=ja ｜ L 未知 ｜ L 档未就绪）⇒ 用原 ranges 重解。
+    ///
+    /// 该判据**内联**在 `transcribe_acc_ctx`（无纯函数、需模型）⇒ 以**源码锚点护栏**锁死契约形状。
+    /// 锚点用 `concat!` 拆两段拼，避免与 `include_str!` 自身文本偶然自匹配。
+    #[test]
+    fn ts408b_need_redo_contract_anchor() {
+        let src = include_str!("mod.rs");
+        let anchor = concat!(
+            "had_drop && (win_lang.as_deref() == Some(\"ja\")",
+            " || win_lang.is_none() || !lang_ready)"
+        );
+        assert!(
+            src.contains(anchor),
+            "契约 7 锚点缺失：有剔除且 (ja|未知|未就绪) ⇒ 必须用原 ranges 重解（need_redo 表达式）"
+        );
+        // 反向：不得把「L 为已就绪档且有剔除」也纳入重解（即不得无条件重解）。
+        assert!(
+            !src.contains("let need_redo =\n        had_drop;"),
+            "契约 7：已就绪档有剔除时**不**重解（不得无条件重解）"
+        );
+    }
+}

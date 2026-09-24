@@ -1425,3 +1425,177 @@ mod testsync408b_tests {
         assert_eq!(dropped2, 0.0);
     }
 }
+
+// =====================================================================
+// TEST-SYNC-406-408B（阶段三 · 非作者护栏 · coder-1）：408B 声纹接入契约，
+// 不与作者 408B（`ts408b_*` / `fix408b_tests`）重复。契约出处：408B 任务书 + `logs/20260924.md`。
+// =====================================================================
+#[cfg(test)]
+mod testsync408b_guard_tests {
+    use super::{
+        judge_voiceprint, partition_ranges, LangProfile, SegVerdict, Voiceprint, DROP_THR,
+        ENROLL_MIN_SECS, ENROLL_MIN_SEGS, MODEL_TAG,
+    };
+
+    fn ready(lang: &str, centroid: Vec<f32>) -> Voiceprint {
+        let mut vp = Voiceprint::default();
+        vp.profiles.insert(
+            lang.to_string(),
+            LangProfile {
+                centroid,
+                total_secs: ENROLL_MIN_SECS,
+                segments: ENROLL_MIN_SEGS,
+                candidates: Vec::new(),
+            },
+        );
+        vp
+    }
+
+    /// 契约 6：多档就绪取**最高分**（本人换语言但对另一档高分 ⇒ 保留）；两档皆不像 ⇒ 剔除。
+    #[test]
+    fn ts408b_judge_voiceprint_max_score_across_profiles() {
+        let mut vp = ready("zh", vec![1.0, 0.0]);
+        vp.profiles.insert(
+            "en".to_string(),
+            LangProfile {
+                centroid: vec![0.0, 1.0],
+                total_secs: ENROLL_MIN_SECS,
+                segments: ENROLL_MIN_SEGS,
+                candidates: Vec::new(),
+            },
+        );
+        // 对 en 满分、对 zh 零分 ⇒ 最高分 1.0 ⇒ KeepUser（换语言仍保留）。
+        match judge_voiceprint(&vp, Some(&[0.0, 1.0]), 3.0) {
+            SegVerdict::KeepUser(s) => assert!((s - 1.0).abs() < 1e-6, "最高分应为 1.0，实测 {s}"),
+            other => panic!("应 KeepUser，实测 {other:?}"),
+        }
+        // 与 en 正交（最高分 0 < DROP）⇒ Drop。
+        match judge_voiceprint(&vp, Some(&[-1.0, 0.0]), 3.0) {
+            SegVerdict::DropNonUser(s) => assert!(s < DROP_THR, "应低于剔除阈"),
+            other => panic!("应 DropNonUser，实测 {other:?}"),
+        }
+    }
+
+    /// 契约 6：无任何就绪档 ⇒ 不剔；无 emb（模型缺失）⇒ 保留；<2s ⇒ 永不剔。
+    #[test]
+    fn ts408b_judge_voiceprint_no_ready_and_short() {
+        let none = Voiceprint::default();
+        assert_eq!(
+            judge_voiceprint(&none, Some(&[1.0, 0.0]), 3.0),
+            SegVerdict::KeepNotReady,
+            "无就绪档 ⇒ 保留"
+        );
+        let vp = ready("zh", vec![1.0, 0.0]);
+        assert_eq!(judge_voiceprint(&vp, None, 3.0), SegVerdict::KeepNotReady);
+        assert_eq!(
+            judge_voiceprint(&vp, Some(&[-1.0, 0.0]), 1.999),
+            SegVerdict::KeepShort,
+            "<2s ⇒ 永不剔"
+        );
+        assert!(
+            matches!(
+                judge_voiceprint(&vp, Some(&[-1.0, 0.0]), 2.0),
+                SegVerdict::DropNonUser(_)
+            ),
+            "恰 2s 进入判定"
+        );
+    }
+
+    /// 契约 6/4：`partition_ranges` 划分 keep/drop（判定数组缺位 ⇒ 保守保留）。
+    #[test]
+    fn ts408b_partition_ranges_conservative() {
+        let ranges = [(0usize, 32_000usize), (32_000, 64_000), (64_000, 96_000)];
+        let (kept, kept_secs, dropped) = partition_ranges(
+            &ranges,
+            &[
+                SegVerdict::KeepShort,
+                SegVerdict::KeepUser(0.9),
+                SegVerdict::DropNonUser(0.1),
+            ],
+        );
+        assert_eq!(kept, vec![(0, 32_000), (32_000, 64_000)]);
+        assert!((kept_secs - 2.0).abs() < 1e-6 && (dropped - 1.0).abs() < 1e-6);
+        // 判定数组缺位 ⇒ 缺位区间按 KeepShort 保守保留。
+        let (kept2, kept2_secs, dropped2) =
+            partition_ranges(&ranges, &[SegVerdict::DropNonUser(0.1)]);
+        assert_eq!(kept2.len(), 2, "缺位区间必须保留");
+        assert!((kept2_secs - 2.0).abs() < 1e-6 && (dropped2 - 1.0).abs() < 1e-6);
+    }
+
+    /// 契约 9：新语种候选「对所有就绪档最高分 <0.3 ⇒ 不收」；≥0.3 ⇒ 可注册；lang 空/None ⇒ 不注册。
+    #[test]
+    fn ts408b_offer_new_language_gate() {
+        // 已有 zh 就绪；背景人（与 zh 正交、最高分 0）反复 offer en ⇒ 不收。
+        let mut vp = ready("zh", vec![1.0, 0.0]);
+        for _ in 0..4 {
+            vp.offer(&[0.0, 1.0], 5.0, None, Some("en"));
+        }
+        assert!(!vp.lang_ready("en"), "最高分<0.3 ⇒ 不得学成新语种档");
+        // 本人换语言的候选（与 zh 最高分 1.0 ≥0.3）⇒ 收；12s/3 段后 en 就绪。
+        for _ in 0..3 {
+            vp.offer(&[1.0, 0.0], 4.0, None, Some("en"));
+        }
+        assert!(vp.lang_ready("en"), "合格候选应注册并达成就绪");
+        // lang 未知 / 空 ⇒ 不注册。
+        let mut vp2 = Voiceprint::default();
+        vp2.offer(&[1.0, 0.0], 20.0, None, None);
+        vp2.offer(&[1.0, 0.0], 20.0, None, Some(""));
+        assert!(!vp2.has_any_ready(), "无语种 ⇒ 无处归档，不注册");
+    }
+
+    /// 契约 9：`new_slice_from` 之前的区间**不 offer**（防窗口前文重复计入）——内联在
+    /// `filter_ranges_by_voiceprint`（需模型、有界）⇒ 以源码锚点护栏锁死。锚点用 `concat!` 拆段防自匹配。
+    #[test]
+    fn ts408b_new_slice_from_contract_anchor() {
+        let src = include_str!("speaker.rs");
+        let anchor = concat!("if start < new_slice_from", " {");
+        assert!(
+            src.contains(anchor),
+            "契约 9 锚点缺失：new_slice_from 之前的区间不得 offer"
+        );
+    }
+
+    /// 契约 10：v1→v2 迁移不丢；模型标签不符 ⇒ 重建；损坏文件不 panic；v2 往返。
+    #[test]
+    fn ts408b_persistence_v1_migrate_rebuild_corrupt() {
+        use std::io::Write as _;
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("voice-ime-ts408b-{uniq}.json"));
+        // v1 单档 ⇒ 迁移到 und（保留就绪，不丢弃）。
+        let v1 = format!(
+            "{{\"version\":1,\"model\":\"{MODEL_TAG}\",\"centroid\":[1.0,0.0],\"total_secs\":20.0,\"segments\":5}}"
+        );
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(v1.as_bytes())
+            .unwrap();
+        assert!(
+            Voiceprint::load(&path).lang_ready("und"),
+            "v1 档必须迁移到 und 且保留就绪态"
+        );
+        // 模型标签不符 ⇒ 重建（空）。
+        let bad = "{\"version\":2,\"model\":\"OLD\",\"profiles\":{\"zh\":{\"centroid\":[1.0,0.0],\"total_secs\":20.0,\"segments\":5}}}";
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(bad.as_bytes())
+            .unwrap();
+        assert!(!Voiceprint::load(&path).has_any_ready(), "模型不符须重建");
+        // 损坏文件 ⇒ 空、不 panic。
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"not json at all")
+            .unwrap();
+        assert!(!Voiceprint::load(&path).has_any_ready(), "坏档须静默重建");
+        // v2 往返：就绪 zh 存后读回仍就绪。
+        let vp = ready("zh", vec![1.0, 0.0]);
+        vp.save(&path);
+        assert!(
+            Voiceprint::load(&path).lang_ready("zh"),
+            "v2 往返应保留 zh 档"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+}
