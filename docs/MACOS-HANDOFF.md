@@ -8,6 +8,13 @@
 
 ## 0 · 先读这份，再读那两份
 
+### 0.7 · RELEASE-VCRT-APPLOCAL-399 VC++ 运行库 app-local（纯 Windows 打包）（2026-09-24）
+
+- **纯 Windows 打包改动，macOS 无影响**：只动 `scripts/init-publish.ps1`（新增 Step 2 拷 VC++ 运行库）、
+  `installer/voice-ime.iss` + `Publish/voice-ime.iss`（`[Files]` 补 `ctranslate2.dll` + 五个运行库）、
+  `collab/build-test-guide.md`（新增出包核验第九项）与决策文档（DEC-085）。**未改任何 Rust 源码 / 平台中立契约**。
+- macOS 侧不涉及 app-local 运行库概念（macOS 用系统库），**无需任何同步**。
+
 ### 0.6 · TRANS-CT2-DNNL-THREADS-397 本地翻译提速：CT2 换 oneDNN + 线程数按核数传入（2026-09-24）
 
 - **文件域**：`Cargo.toml`（**Windows 目标依赖**）、`patches/ctranslate2-sys/build.rs`（补丁）、

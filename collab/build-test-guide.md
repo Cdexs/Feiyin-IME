@@ -107,6 +107,22 @@ Get-ChildItem -Path "Publish\*.exe" | Select-Object Name, LastWriteTime, Length
 > 🔴 **本步是动作，不是核验** —— 本步做完只证明「`cp` 发了」，不证明「内容对了」。
 > 结果级核验见 `一·五、出包核验清单`（第八项 `sha256sum` 三副本比对）。
 
+#### VC++ 运行库 app-local（DEC-085 / RELEASE-VCRT-APPLOCAL-399，2026-09-24 补入）
+
+`Publish/` 与安装包必须自带 VC++ 2015-2022 x64 运行库（**不是** Windows 自带；干净系统缺则 exe 启动失败）。
+最小清单（由 `Publish/` 下全部 exe/dll 的 `dumpbin /dependents` 汇总得出）：
+
+| DLL | 来源（VS Redist，vswhere 动态定位，版本号不写死） |
+| --- | --- |
+| `msvcp140.dll` / `msvcp140_1.dll` / `vcruntime140.dll` / `vcruntime140_1.dll` | `…\VC\Redist\MSVC\<最新数字版本>\x64\Microsoft.VC143.CRT\` |
+| `vcomp140.dll` | `…\x64\Microsoft.VC143.OpenMP\` |
+
+- 🔴 `api-ms-win-crt-*`（UCRT）属 Win10/11 系统组件，**不随包**；禁止从 `C:\Windows\System32` 取（不可再分发）。
+- **同步动作**：`scripts/init-publish.ps1` 的 Step 2 自动从 Redist 拷贝（可用 `-RuntimeOnly` 单独跑）；
+  它同时写 `Publish/` 与 `target/release/`（后者是 `.iss` 的 `Source` 目录）。找不到源或缺任一文件 ⇒ 脚本报错退出。
+- **核验**：见 `一·五` 第九项（五个文件齐全 + sha256 与 Redist 源一致）。
+- `installer/voice-ime.iss` 与 `Publish/voice-ime.iss` 的 `[Files]` 已含这五个 + `ctranslate2.dll`。
+
 ### 预期构建时间 & 产物大小
 
 > 🔴 **2026-08-09 BUILD-015 实测修正**：下表原值（~22MB / ~31MB / 合计 ~47s）是 **DEC-021 体积优化
@@ -135,7 +151,7 @@ Get-ChildItem -Path "Publish\*.exe" | Select-Object Name, LastWriteTime, Length
 
 ---
 
-## 一·五、出包核验清单【八项，出包任务必须逐项报 PASS/FAIL】
+## 一·五、出包核验清单【九项，出包任务必须逐项报 PASS/FAIL】
 
 > **由来**：本清单此前只活在历次 `handoffs.md` 的 `BUILD-xxx` 条目里，正文无成文判据 ——
 > 换人出包不知道要核哪几项，或核了但项目不一致，事后也无从对账。
@@ -242,10 +258,20 @@ Get-ChildItem -Path "Publish\*.exe" | Select-Object Name, LastWriteTime, Length
 | 失败意味着 | 用户实际跑的不是代码里的规则（`[TOML-STALE-001]`：陈旧外置 toml 静默覆盖内置默认，**无任何报错**）；或文件已损坏（`[TOML-ALL-NUL-001]`） |
 | 高危场景 | toml 由**另一端（macOS）改动后经 merge 进来**：本端源码没动、`cargo build` 一切正常，但运行时两副本还是合并前的旧版（2026-08-09 BUILD-015 实际发生过，差 3877B 实质内容） |
 
+**⑨ VC++ 运行库 app-local 齐全，且 sha256 与 VS Redist 源一致【2026-09-24 RELEASE-VCRT-APPLOCAL-399 新增】**
+
+| | |
+| --- | --- |
+| 判据 | `Publish/`（及 `target/release/`）下最小运行库 `msvcp140.dll` / `msvcp140_1.dll` / `vcruntime140.dll` / `vcruntime140_1.dll` / `vcomp140.dll` 五个文件**存在**，且 `Publish/` 副本的 sha256 与 VS Redist 源逐一相等 |
+| 命令 | `sha256sum Publish/msvcp140.dll Publish/msvcp140_1.dll Publish/vcruntime140.dll Publish/vcruntime140_1.dll Publish/vcomp140.dll`，再与 `…\VC\Redist\MSVC\<最新版>\x64\Microsoft.VC143.CRT\` / `…OpenMP\` 下同名文件逐一比对；来源行见 §一 Step 4 的新增小节 |
+| 期望 | 五个文件齐全；Publish / target/release / Redist 源三处 sha 全等 |
+| 失败意味着 | 干净系统缺 VC++ 2015-2022 运行库 ⇒ **exe 启动失败**（本次立项原因）；或 Redist 更新后包内仍是旧副本（`[PROVIDER-SILENT-FALLBACK-001]` 同族的静默降级） |
+| 依据 | **DEC-085**；`installer/voice-ime.iss` 与 `Publish/voice-ime.iss` 的 `[Files]` 必须含这五个 + `ctranslate2.dll`。生成/同步动作在 `scripts/init-publish.ps1` Step 2（`-RuntimeOnly` 可单独跑） |
+
 ### 报告格式【出包任务 result.md 末尾必须原样带出】
 
 ```
-出包核验（八项，逐项 PASS/FAIL，无实测输出 = 未核验）
+出包核验（九项，逐项 PASS/FAIL，无实测输出 = 未核验）
 
 | # | 项 | 结果 | 实测输出（命令 + 原始值） |
 | --- | --- | --- | --- |
@@ -257,6 +283,7 @@ Get-ChildItem -Path "Publish\*.exe" | Select-Object Name, LastWriteTime, Length
 | ⑥ | warnings 与基线持平 | PASS/FAIL | |
 | ⑦ | 二进制判别探针（正反） | PASS/FAIL/N-A(不可构造) | |
 | ⑧ | 规则 toml 三副本 hash 全等 | PASS/FAIL | |
+| ⑨ | VC++ 运行库 app-local 齐全 + sha 与 Redist 源一致 | PASS/FAIL | |
 ```
 
 **判 PASS 的门槛**：该项有**实测命令与原始输出**。只写「PASS」不贴输出 = 未核验，
@@ -276,7 +303,7 @@ Get-ChildItem -Path "Publish\*.exe" | Select-Object Name, LastWriteTime, Length
 
 **如实记录的三个偏差**：
 
-1. **「七项」名号长期与实际条数不符**（BUILD-145/151 实际 8 条；BUILD-098 报「七项」但正文只列 4 类内容）。本节起以**本节八项为准**，报告一律称「八项核验」。
+1. **「七项」名号长期与实际条数不符**（BUILD-145/151 实际 8 条；BUILD-098 报「七项」但正文只列 4 类内容）。本节起以**本节项数为准**；2026-09-24 RELEASE-VCRT-APPLOCAL-399 新增第九项后，报告一律称「**九项核验**」。
 2. **toml 三副本 hash 在 v0.8.x 恒为第③项，2026-09-07 BUILD-159 起被丢弃**，直到 `[TOML-ALL-NUL-001]`（09-08）出事才发现没人核 —— 本次以**第八项**补回。
 3. **大小对照（v0.8.x 第⑥项）已从清单移除**：BUILD-020 已确认「大小不作唯一判据」（ui 同大小但 sha 变），判别职责现由②的 sha 异动承担。
 

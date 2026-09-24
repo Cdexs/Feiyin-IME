@@ -8,6 +8,17 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-24 — coder-1 — RELEASE-VCRT-APPLOCAL-399 ✅ 阶段一交付（待主控验收）
+
+- **性质**：纯脚本 / 安装脚本 / 文档，**不改 Rust 源码 / Cargo / 版本号 / 不构建**。
+- **最小清单**（`dumpbin /dependents` 全量复核）：`MSVCP140.dll` / `MSVCP140_1.dll` / `VCRUNTIME140.dll` / `VCRUNTIME140_1.dll` / `VCOMP140.DLL`；`api-ms-win-crt-*` 属 UCRT 不带。证据 `collab/evidence/399/dumpbin_all.txt`。
+- **`scripts/init-publish.ps1`**：新增 Step 2（`Copy-VcRuntime`，原 Step2/3/4 顺延），vswhere 动态定位 VS Redist、不写死版本号、缺件 `exit 1`；拷到 `Publish/` + `target/release/`；新增 `-RuntimeOnly` 开关；🔴 补写 UTF-8 BOM（原文件实测无 BOM）。
+- **`.iss` 两份**：`[Files]` 补 `ctranslate2.dll` + 五个运行库；两份 sha256 全等 `ce37f315…`。
+- **`build-test-guide.md`**：Step 4 增小节 + 出包核验 **八项→九项**（⑨）。**`decisions.md`/`decisions-archive.md`**：DEC-085 索引 + 全文。**`docs/MACOS-HANDOFF.md`** §0.7（纯 Windows 打包，macOS 无影响）。
+- **实证**：`-RuntimeOnly` 实跑，源 / `Publish` / `target/release` 三处五个 DLL sha256 逐一 MATCH（`collab/evidence/399/{init-publish-runtimeonly.txt,runtime_sha.txt}`）；PowerShell `SYNTAX OK`、首三字节 `efbbbf`。
+- ⚠️ **任务书偏差（如实上报）**：任务书称 `init-publish.ps1` 是 UTF-8 **with BOM**，实测**无 BOM**（`23 20 69`）；已补 BOM。另发现既有问题（未修）：`.iss` 主程序 `Source` 指向 `voice-ime.exe`，实际产物名 `feiyin-ime.exe`（RELEASE-210 1b，等 Gavin）。
+- 红线：未 commit / 未 push / 未构建 / 版本号未动 / 零凭证。
+
 ## 2026-09-24 — coder-1 — TRANS-CT2-DNNL-THREADS-397 ✅ 阶段一交付（待主控验收）
 
 - **改动文件**：`Cargo.toml`（Windows 目标依赖追加 `ctranslate2-sys` 的 `dnnl`+`openmp-runtime-comp`）、`patches/ctranslate2-sys/build.rs`（补丁 2 处）、`src/translation/mod.rs`（`nllb_num_threads()` + 接线 + bench）。

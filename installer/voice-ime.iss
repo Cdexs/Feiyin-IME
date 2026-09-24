@@ -74,6 +74,16 @@ Source: "..\target\release\sherpa-onnx-cxx-api.dll"; DestDir: "{app}"; Flags: ig
 Source: "..\target\release\onnxruntime.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\onnxruntime_providers_shared.dll"; DestDir: "{app}"; Flags: ignoreversion
 
+; Translation runtime (CTranslate2 + oneDNN/OpenMP, RELEASE-VCRT-APPLOCAL-399)
+Source: "..\target\release\ctranslate2.dll"; DestDir: "{app}"; Flags: ignoreversion
+
+; VC++ 2015-2022 x64 runtime, app-local (DEC-085 / RELEASE-VCRT-APPLOCAL-399; dumpbin-derived minimal set)
+Source: "..\target\release\msvcp140.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\msvcp140_1.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\vcruntime140.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\vcruntime140_1.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\vcomp140.dll"; DestDir: "{app}"; Flags: ignoreversion
+
 ; ASR model (Paraformer-zh)
 Source: "..\models\paraformer-zh-int8-2025-10-07\*"; DestDir: "{app}\models\paraformer-zh-int8-2025-10-07"; Flags: ignoreversion recursesubdirs createallsubdirs
 

@@ -1,9 +1,10 @@
-# init-publish.ps1
+﻿# init-publish.ps1
 # One-time setup: initialize Publish/ and target/release/ with external dependencies
 # Run after: cargo build --release (DLLs must exist in target/release/)
 
 param(
-    [switch]$SkipModels   # Skip model junction creation
+    [switch]$SkipModels,  # Skip model junction creation
+    [switch]$RuntimeOnly  # Only run Step 2 (copy VC++ runtime DLLs) then exit — RELEASE-VCRT-APPLOCAL-399
 )
 
 $ProjectRoot = Split-Path $PSScriptRoot -Parent
@@ -16,6 +17,80 @@ Write-Host "Project root: $ProjectRoot"
 Write-Host "Publish dir:  $Publish"
 
 if (-not (Test-Path $Publish)) { New-Item -ItemType Directory -Path $Publish | Out-Null }
+
+# Step 2 wrapped in a function so it can be run in isolation:
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\init-publish.ps1 -RuntimeOnly
+function Copy-VcRuntime {
+    # TRANS / RELEASE-VCRT-APPLOCAL-399 + DEC-085：VC++ 2015-2022 x64 运行库随程序目录发布（app-local）。
+    # 清单来源：Publish 下全部 exe/dll 的 `dumpbin /dependents` 汇总（只带实际被导入的运行库）：
+    #   msvcp140 / msvcp140_1 / vcruntime140 / vcruntime140_1 / vcomp140（vcomp140 自 397 CT2 oneDNN 起引入）。
+    # api-ms-win-crt-*（UCRT）属 Win10/11 系统组件，不随包；🔴 禁止从 System32 取（不可再分发）。
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path $vswhere)) {
+        Write-Host "  ERROR: vswhere.exe not found: $vswhere" -ForegroundColor Red
+        exit 1
+    }
+    $vsInstall = @(& $vswhere -latest -products * -property installationPath)[0]
+    if ($vsInstall) { $vsInstall = $vsInstall.Trim() }
+    if (-not $vsInstall) {
+        Write-Host "  ERROR: no Visual Studio installation found via vswhere" -ForegroundColor Red
+        exit 1
+    }
+    $redistRoot = Join-Path $vsInstall "VC\Redist\MSVC"
+    if (-not (Test-Path $redistRoot)) {
+        Write-Host "  ERROR: VC Redist root not found: $redistRoot" -ForegroundColor Red
+        exit 1
+    }
+    # 取最新「数字版本」目录（忽略 v143 之类别名；它下面没有 x64/CRT），不写死版本号
+    $verDir = Get-ChildItem -Path $redistRoot -Directory |
+        Where-Object { $_.Name -match '^\d+(\.\d+)+$' } |
+        Sort-Object { [version]$_.Name } -Descending |
+        Select-Object -First 1
+    if (-not $verDir) {
+        Write-Host "  ERROR: no numeric version dir under $redistRoot" -ForegroundColor Red
+        exit 1
+    }
+    $x64Dir = Join-Path $verDir.FullName "x64"
+    $crtDir = Get-ChildItem -Path $x64Dir -Directory -Filter "Microsoft.VC14*.CRT" | Select-Object -First 1
+    $ompDir = Get-ChildItem -Path $x64Dir -Directory -Filter "Microsoft.VC14*.OpenMP" | Select-Object -First 1
+    if (-not $crtDir -or -not $ompDir) {
+        Write-Host "  ERROR: Microsoft.VC14*.CRT / Microsoft.VC14*.OpenMP not found under $x64Dir" -ForegroundColor Red
+        exit 1
+    }
+
+    # 同时放 Publish/ 与 target/release/：前者是直跑目录，后者是 .iss 的 Source 目录
+    $vcRuntime = @(
+        @{ Name = "msvcp140.dll";       Src = (Join-Path $crtDir.FullName "msvcp140.dll") },
+        @{ Name = "msvcp140_1.dll";     Src = (Join-Path $crtDir.FullName "msvcp140_1.dll") },
+        @{ Name = "vcruntime140.dll";   Src = (Join-Path $crtDir.FullName "vcruntime140.dll") },
+        @{ Name = "vcruntime140_1.dll"; Src = (Join-Path $crtDir.FullName "vcruntime140_1.dll") },
+        @{ Name = "vcomp140.dll";       Src = (Join-Path $ompDir.FullName "vcomp140.dll") }
+    )
+    foreach ($item in $vcRuntime) {
+        if (-not (Test-Path $item.Src)) {
+            Write-Host "  ERROR: missing runtime source $($item.Src)" -ForegroundColor Red
+            exit 1
+        }
+        Copy-Item -Path $item.Src -Destination (Join-Path $Publish $item.Name) -Force
+        Copy-Item -Path $item.Src -Destination (Join-Path $TargetRelease $item.Name) -Force
+        Write-Host "  OK $($item.Name) <- $($item.Src)"
+    }
+
+    # ctranslate2.dll 必须在 Step 1 的列表里（397 起 CT2 依赖 vcomp140；漏拷则翻译必挂）
+    if (Test-Path (Join-Path $Publish "ctranslate2.dll")) {
+        Write-Host "  OK ctranslate2.dll present in Publish (Step 1)"
+    } else {
+        Write-Host "  ERROR: ctranslate2.dll missing in Publish (Step 1 list incomplete)" -ForegroundColor Red
+        exit 1
+    }
+}
+
+if ($RuntimeOnly) {
+    Write-Host "`n[RuntimeOnly] Copy VC++ runtime DLLs (app-local)" -ForegroundColor Yellow
+    Copy-VcRuntime
+    Write-Host "`n=== Done (runtime DLLs only) ===" -ForegroundColor Green
+    exit 0
+}
 
 # Step 1: Copy DLLs to Publish/
 Write-Host "`n[Step 1] Copy DLLs to Publish/" -ForegroundColor Yellow
@@ -39,8 +114,13 @@ foreach ($dll in $dlls) {
     }
 }
 
-# Step 2: Copy default config template to Publish/ and target/release/
-Write-Host "`n[Step 2] Copy default config template" -ForegroundColor Yellow
+# Step 2: Copy VC++ 2015-2022 x64 runtime DLLs app-local (DEC-085 / RELEASE-VCRT-APPLOCAL-399)
+# 实现见上方 `function Copy-VcRuntime`；可用 `-RuntimeOnly` 单独运行本步。
+Write-Host "`n[Step 2] Copy VC++ runtime DLLs (app-local)" -ForegroundColor Yellow
+Copy-VcRuntime
+
+# Step 3: Copy default config template to Publish/ and target/release/
+Write-Host "`n[Step 3] Copy default config template" -ForegroundColor Yellow
 $defaultConfig = Join-Path $ProjectRoot "assets\default-config.toml"
 
 $publishConfig = Join-Path $Publish "config.toml"
@@ -70,8 +150,8 @@ if (Test-Path $debugDir) {
     }
 }
 
-# Step 3: Create models directory junctions (avoid 640MB+ copy)
-Write-Host "`n[Step 3] Create models directory junctions" -ForegroundColor Yellow
+# Step 4: Create models directory junctions (avoid 640MB+ copy)
+Write-Host "`n[Step 4] Create models directory junctions" -ForegroundColor Yellow
 
 if (-not (Test-Path $Models)) {
     Write-Host "  ERROR: models/ not found. Download models first." -ForegroundColor Red
@@ -107,8 +187,8 @@ if (-not (Test-Path $Models)) {
     }
 }
 
-# Step 4: Copy current EXEs to Publish/
-Write-Host "`n[Step 4] Copy EXEs to Publish/" -ForegroundColor Yellow
+# Step 5: Copy current EXEs to Publish/
+Write-Host "`n[Step 5] Copy EXEs to Publish/" -ForegroundColor Yellow
 $exes = @("voice-ime.exe", "voice-ime-ui.exe", "crash-reporter.exe")
 foreach ($exe in $exes) {
     $src = Join-Path $TargetRelease $exe

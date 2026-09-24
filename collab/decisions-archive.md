@@ -3007,3 +3007,49 @@ Gavin 原话：「我说的是b路径上的1.7b模型，把词库注入去掉，
 - 平台中立（`transcription/mod.rs` + `main.rs` 纯 Rust，无 `cfg`），macOS 同继承；`docs/MACOS-HANDOFF.md` 已记录。
 - 词库预算：`estimate_inject_tokens` 对 `build_ctx_system` 结果数 token ⇒ 新前缀自动计入，无需另改。
 - 端测关注点：本地实时模式词库词能否被正确识别；是否仍出现念词表 / `Technical terms` 漏进正文 / 空输出 / 截尾。
+
+---
+
+## DEC-085 · VC++ 2015-2022 x64 运行库随程序目录发布（app-local），不静默装 vc_redist（2026-09-24）
+
+### 背景
+
+- `Publish/` 里 `feiyin-ime.exe` / `feiyin-ime-ui.exe` / `crash-reporter.exe` / `onnxruntime.dll` /
+  `sherpa-onnx-*.dll` / `ctranslate2.dll` 依赖 VC++ 2015-2022 x64 运行库（**不是 Windows 自带**），
+  而 `Publish/` 与安装包都没带 ⇒ **干净系统启动失败**。
+- 397 起 `ctranslate2.dll` 换 oneDNN + MSVC OpenMP，新增对 `vcomp140.dll` 的依赖（此前只有 CRT）。
+- 主控给出两方案：A「安装包内静默装 `VC_redist.x64.exe`」/ B「DLL 随程序目录放（微软允许 app-local）」。
+- Gavin 2026-09-24 原话：「**B**」。
+
+### 决策
+
+- **采用方案 B**：把最小 VC++ 运行库 DLL 随程序目录发布（app-local），**不**在安装包里静默运行 redist。
+- **最小清单**（由 `Publish/` 下全部 exe/dll 的 `dumpbin /dependents` 汇总，只带实际被导入者）：
+  `msvcp140.dll` / `msvcp140_1.dll` / `vcruntime140.dll` / `vcruntime140_1.dll` / `vcomp140.dll`。
+  - 🔴 `api-ms-win-crt-*`（UCRT）属 Win10/11 系统组件，**不随包**。
+  - 🔴 只能取 VS Redist（`…\VC\Redist\MSVC\<最新版>\x64\Microsoft.VC143.CRT\` 与 `…OpenMP\`），
+    **禁止从 `C:\Windows\System32` 复制**（System32 版本不可控、不属于可再分发文件）。
+- **落地点**：
+  - `scripts/init-publish.ps1` Step 2：用 `vswhere.exe` 动态定位 VS 安装目录，取最新数字版本 Redist
+    目录，拷五个 DLL 到 `Publish/` 与 `target/release/`；**缺源或缺任一文件即报错退出**（不静默跳过）；
+    可用 `-RuntimeOnly` 单独运行。脚本保持 UTF-8 with BOM（PowerShell 5.1 读中文规则）。
+  - `installer/voice-ime.iss` 与 `Publish/voice-ime.iss` 的 `[Files]`：补 `ctranslate2.dll` +
+    上述五个运行库（`DestDir: "{app}"`）。两份保持一致。
+  - `collab/build-test-guide.md`：Step 4 增加「VC++ 运行库 app-local」小节；出包核验清单新增**第九项**
+    （五个文件齐全 + sha256 与 Redist 源一致）。
+- 本单**只改脚本 / 安装脚本 / 文档**，不改 Rust 源码、不构建、不动版本号。
+
+### 原因
+
+- 免装运行库：用户无需先装 VC++ Redist，干净系统解压即用；安装包更小、无需管理员权限跑 redist。
+- 官方文档明确允许 VC++ 运行库 app-local 随应用分发（微软「Redistributing Visual C++ Files」）。
+
+### 影响
+
+- **体积**：`Publish/` 增加约 1.1MB（五个 DLL）。
+- 🔴 **安全更新不会自动覆盖**：app-local 副本不参与 Windows Update，微软更新运行库后需**随版本出包时**用
+  `init-publish.ps1` 重新拷贝（源永远取本机 VS Redist 的最新版）。
+- **纯 Windows 打包，macOS 无影响**（`docs/MACOS-HANDOFF.md` 已记）。
+- 出包流程增加第九项核验；`build-test-guide.md` 的报告模板由「八项」改为「九项」。
+- ⚠️ 观察到的**既有问题（非本单引入、未修）**：`.iss` 主程序 `Source` 指向 `voice-ime.exe`，
+  而实际产物名是 `feiyin-ime.exe`（RELEASE-210 第 1b 项「命名不一致待定」，等 Gavin 决定改到哪一层）。

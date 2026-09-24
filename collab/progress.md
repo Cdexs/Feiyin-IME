@@ -13,6 +13,13 @@
 - **依据**：外部 184 次实测（TypeWhisper#321，Qwen3-ASR）唯一 0 泄漏格式（WER 33.8%→18.2%）；Gavin 2026-09-24 拍板照搬，明示豁免 DEC-059 A/B。🔴 **中文场景外部未测 ⇒ 靠端测验证**。
 - **验证**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` 0 error、warnings 92/87=基线；全量 `cargo test --no-fail-fast` **0 failed**（bin **1597P/44I**）。未出包 / 未改版本 / 零凭证。
 
+### 2026-09-24 · RELEASE-VCRT-APPLOCAL-399 交付（VC++ 运行库 app-local + 安装脚本补 ctranslate2.dll）
+
+- 最小运行库清单（dumpbin 全量复核）：`msvcp140` / `msvcp140_1` / `vcruntime140` / `vcruntime140_1` / `vcomp140`；`api-ms-win-crt-*`（UCRT）不带。
+- `scripts/init-publish.ps1` 新增 Step 2（vswhere 动态定位 VS Redist、缺件报错、拷 `Publish/`+`target/release/`、`-RuntimeOnly` 单跑、UTF-8 BOM）。
+- 两份 `voice-ime.iss` `[Files]` 补 `ctranslate2.dll` + 五个运行库（sha 全等）；`build-test-guide.md` 出包核验八项→九项；DEC-085 立档。
+- 实证：`-RuntimeOnly` 实跑，三处 sha256 逐一 MATCH。纯 Windows 打包，macOS 无影响。未出包。
+
 ### 2026-09-24 · TRANS-CT2-DNNL-THREADS-397 交付（本地翻译提速：CT2 换 oneDNN + 线程数按核数传入）
 
 - Windows 目标依赖给 `ctranslate2-sys` 追加 `dnnl` + `openmp-runtime-comp`（通用依赖与 macOS 不变；`cargo tree --target aarch64-apple-darwin` 证无 dnnl/openmp）；`patches/ctranslate2-sys/build.rs` 两处补丁：① `CMAKE_PREFIX_PATH` 让 CT2 找到自编 oneDNN（否则 `WITH_DNNL` 必 FATAL_ERROR）② DLL 同步拷 `<target>/deps/`（修 `[CT2-DLL-SHADOW-397]`）。
