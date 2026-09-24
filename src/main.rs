@@ -8390,6 +8390,9 @@ fn spawn_worker_thread(
                                 // LOCALRT-CTX-INJECT-320：词库词条随 per-stream 注入
                                 // （读 DB + 按引擎预算裁剪，每段录音一次，毫秒级）。
                                 let acc_terms = load_hotwords_for_accuracy(&config);
+                                // 410 item3：标点服务所需（进程级常驻服务线程；acc worker **不共享** ASR 的引擎）。
+                                let acc_punct_dir = model_dir.clone();
+                                let acc_punct_enabled = config.punctuation.enabled;
                                 Some(scope.spawn(move || {
                                         let recognizer = send_offline.into_inner();
                                         // ── SLIDING-WINDOW-367：滑动窗口（当前片+前1~3，12s 封顶）──
@@ -8414,6 +8417,8 @@ fn spawn_worker_thread(
                                         let mut window_boundary_usable: Vec<bool> = Vec::new();
                                         // 386（C）：`window_seq -> 本窗各片流式文本拼接`（解码失败/空时的兜底）。
                                         let mut window_streaming_texts: Vec<String> = Vec::new();
+                                        // FIX-TAIL-GUARD-410：`window_seq -> 末尾窗 pending 回灌元数据`（非末尾窗 None）。
+                                        let mut window_tail_pending: Vec<Option<TailPending>> = Vec::new();
                                         // 386（C）：与 `recent_slices` 一一对应的各片流式文本（同批 sub_seg 共享）。
                                         let mut recent_streaming: Vec<String> = Vec::new();
                                         // VAD-393（A3）：与 `recent_slices` 一一对应的各片**片内语音区间**
@@ -8571,6 +8576,7 @@ fn spawn_worker_thread(
                                                             fb.chars().count()
                                                         );
                                                     }
+                                                    let is_fallback = from_streaming || decoded.is_empty();
                                                     let text = if from_streaming {
                                                         fb.to_string()
                                                     } else {
@@ -8583,18 +8589,57 @@ fn spawn_worker_thread(
                                                             text.chars().count()
                                                         );
                                                     }
-                                                    // FIX-WINDOW-DISJOINT-369：把该窗的切片区间一并交给 reflow 判重叠
-                                                    // （missing ⇒ 保守当零重叠，拼接保字、不丢）。
-                                                    let (win_ws, win_we) = window_spans
-                                                        .get(seq)
-                                                        .copied()
-                                                        .unwrap_or((seq, seq + 1));
-                                                    // FIX-PREFIX-AND-EAT-371（B）：带上各片样本数 ⇒ 期望重叠
-                                                    // 比例约束对齐 k（missing ⇒ 空表 ⇒ 退化小 k 优先）。
-                                                    let win_samples = window_samples
-                                                        .get(seq)
-                                                        .cloned()
-                                                        .unwrap_or_default();
+                                                    // 410 item2/3：末尾窗被拒/空 ⇒ **只兜底 pending 片**
+                                                    //（span (p,p+1)、文本 = pending 流式经标点服务打点）；前片结果一字不动。
+                                                    let tail_meta =
+                                                        window_tail_pending.get(seq).and_then(|o| o.as_ref());
+                                                    let use_tail = tail_meta.is_some() && is_fallback;
+                                                    let (win_ws, win_we, win_samples, text) = if use_tail {
+                                                        let tp = tail_meta.unwrap();
+                                                        let punct = punctuate_via_service(
+                                                            &acc_punct_dir,
+                                                            acc_punct_enabled,
+                                                            &tp.streaming,
+                                                        );
+                                                        if log::log_enabled!(log::Level::Debug) {
+                                                            log::debug!(
+                                                                "[LocalRT-DBG-410] fallback scope=pending punctuated={} seq={} chars={}",
+                                                                punct != tp.streaming,
+                                                                seq,
+                                                                punct.chars().count()
+                                                            );
+                                                        }
+                                                        (tp.span.0, tp.span.1, tp.samples.clone(), punct)
+                                                    } else {
+                                                        let (ws, we) = window_spans
+                                                            .get(seq)
+                                                            .copied()
+                                                            .unwrap_or((seq, seq + 1));
+                                                        let smp = window_samples
+                                                            .get(seq)
+                                                            .cloned()
+                                                            .unwrap_or_default();
+                                                        // 常规窗兜底（流式替换 / 精解空）⇒ 先打标点；精解被采纳 ⇒ 不动。
+                                                        let t = if is_fallback {
+                                                            let punct = punctuate_via_service(
+                                                                &acc_punct_dir,
+                                                                acc_punct_enabled,
+                                                                &text,
+                                                            );
+                                                            if log::log_enabled!(log::Level::Debug) {
+                                                                log::debug!(
+                                                                    "[LocalRT-DBG-410] fallback scope=window punctuated={} seq={} chars={}",
+                                                                    punct != text,
+                                                                    seq,
+                                                                    punct.chars().count()
+                                                                );
+                                                            }
+                                                            punct
+                                                        } else {
+                                                            text
+                                                        };
+                                                        (ws, we, smp, t)
+                                                    };
                                                     // 375：本窗秒数（供产出率均值）+ 最终字数（计入判据）
                                                     let win_secs =
                                                         win_samples.iter().sum::<usize>() as f32
@@ -8720,6 +8765,7 @@ fn spawn_worker_thread(
                                                     window_streaming_texts.push(window_streaming);
                                                     window_committed_lens.push($win_committed);
                                                     window_boundary_usable.push($usable);
+                                                    window_tail_pending.push(None); // 410：常规窗无 pending 兜底
                                                     window_seq += 1;
                                                 }};
                                             }
@@ -8728,12 +8774,14 @@ fn spawn_worker_thread(
                                             // `span` 仍以 (p-1,p+1) 交对齐；VAD 区间传 `None`（前片取部分 ⇒ 片内区间
                                             // 偏移不再成立）⇒ 该窗回退自跑 VAD。`win_samples` = [前片后缀, pending]。
                                             macro_rules! dispatch_tail_window {
-                                                ($gs:expr, $ge:expr, $audio:expr, $samples:expr, $streaming:expr) => {{
+                                                ($gs:expr, $ge:expr, $audio:expr, $samples:expr, $streaming:expr, $pending_samples:expr, $pending_streaming:expr) => {{
                                                     let gs: usize = $gs;
                                                     let ge: usize = $ge;
                                                     let audio: Vec<f32> = $audio;
                                                     let samples: Vec<usize> = $samples;
                                                     let streaming: String = $streaming;
+                                                    let pending_samples: Vec<usize> = $pending_samples;
+                                                    let pending_streaming: String = $pending_streaming;
                                                     if !transcription::path_b_budget_ok(audio.len(), terms) {
                                                         log::warn!(
                                                             "[LocalRT-TAIL-WINDOW-407] tail window over KV budget: {:.1}s audio_tok={} inject_tok={} max_total_len={}",
@@ -8767,6 +8815,12 @@ fn spawn_worker_thread(
                                                     window_streaming_texts.push(streaming);
                                                     window_committed_lens.push(last_committed_len);
                                                     window_boundary_usable.push(true);
+                                                    // 410：末尾窗的 pending 回灌元数据（被拒/空时只兜底 pending）。
+                                                    window_tail_pending.push(Some(TailPending {
+                                                        span: (ge - 1, ge),
+                                                        samples: pending_samples,
+                                                        streaming: pending_streaming,
+                                                    }));
                                                     window_seq += 1;
                                                 }};
                                             }
@@ -8893,15 +8947,34 @@ fn spawn_worker_thread(
                                                                         audio.extend_from_slice(&recent_slices[i]);
                                                                         let samples =
                                                                             vec![prev_slice.len() - cut, recent_slices[i].len()];
-                                                                        let mut streaming =
-                                                                            recent_streaming[i - 1].clone();
-                                                                        streaming.push_str(&recent_streaming[i]);
+                                                                        // 410 item1：末尾窗音频只含前片**最后 `cut` 起**的后缀 ⇒ 比对基准的
+                                                                        // 前片部分也按样本占比只取末尾相应**字符数**（char 切、禁字节下标），
+                                                                        // 再接 pending 流式。否则基准含整片 ⇒ 正确精解被 406 误拒。
+                                                                        let prev_stream = &recent_streaming[i - 1];
+                                                                        let prev_chars = prev_stream.chars().count();
+                                                                        let suffix_samples = prev_slice.len() - cut;
+                                                                        let ratio = if prev_slice.is_empty() {
+                                                                            0.0
+                                                                        } else {
+                                                                            suffix_samples as f32
+                                                                                / prev_slice.len() as f32
+                                                                        };
+                                                                        let suffix_chars =
+                                                                            ((prev_chars as f32) * ratio).round() as usize;
+                                                                        let suffix_chars = suffix_chars.min(prev_chars);
+                                                                        let streaming = tail_streaming_baseline(
+                                                                            prev_stream,
+                                                                            suffix_samples,
+                                                                            prev_slice.len(),
+                                                                            &recent_streaming[i],
+                                                                        );
                                                                         if log::log_enabled!(log::Level::Debug) {
                                                                             let gap = if gap_found { "found" } else { "no_gap" };
                                                                             log::debug!(
-                                                                                "[LocalRT-DBG-407] tail window: pending={} prev_cut_secs={:.2} backtrack_secs={:.2} rate_cps={:.2} gap={} window_secs={:.2} pcm_pos={}",
+                                                                                "[LocalRT-DBG-407] tail window: pending={} prev_cut_secs={:.2} prev_suffix_chars={} backtrack_secs={:.2} rate_cps={:.2} gap={} window_secs={:.2} pcm_pos={}",
                                                                                 p,
                                                                                 cut as f32 / 16000.0,
+                                                                                suffix_chars,
                                                                                 backtrack_secs,
                                                                                 rate_cps,
                                                                                 gap,
@@ -8909,7 +8982,15 @@ fn spawn_worker_thread(
                                                                                 pcm_pos
                                                                             );
                                                                         }
-                                                                        dispatch_tail_window!(gs, ge, audio, samples, streaming);
+                                                                        dispatch_tail_window!(
+                                                                            gs,
+                                                                            ge,
+                                                                            audio,
+                                                                            samples,
+                                                                            streaming,
+                                                                            vec![recent_slices[i].len()],
+                                                                            recent_streaming[i].clone()
+                                                                        );
                                                                     }
                                                                     // pending 已被末尾窗覆盖 ⇒ 清空；停止键收尾不再重复处理。
                                                                     pending_slice = None;
@@ -11316,6 +11397,211 @@ enum AccInput {
     LongSilence(usize),
 }
 
+/// FIX-TAIL-GUARD-410：末尾窗的「pending 片」回灌元数据。
+///
+/// 末尾窗音频含前片后缀 + pending；若精解被 406 拒 / 为空，**只兜底 pending 片**
+///（span `(p,p+1)`、文本 = pending 片流式 + 标点），**前片已回灌结果一字不动**。
+struct TailPending {
+    span: (usize, usize),
+    samples: Vec<usize>,
+    streaming: String,
+}
+
+/// FIX-TAIL-GUARD-410 item3：兜底打点的**同步超时**（ms）。超时 ⇒ 原样用未打标点文本，绝不卡回灌。
+const PUNCT_FALLBACK_TIMEOUT_MS: u64 = 500;
+/// 410：服务线程**异常退出**后重建 + 重发，最多连续重试次数。
+const PUNCT_START_MAX_RETRIES: usize = 2;
+/// 410：连续启动失败后的**冷却**（秒）——冷却期内不再尝试启动，防模型缺失时每段都反复加载拖慢回灌。
+const PUNCT_RESTART_COOLDOWN_SECS: u64 = 30;
+
+/// 410 item3：标点服务线程的请求（文本 + 回执通道；回执 `None` = 引擎不可用）。
+struct PunctReq {
+    text: String,
+    reply: crossbeam_channel::Sender<Option<String>>,
+}
+
+/// 410 item3：**进程级常驻**标点服务状态。
+#[derive(Default)]
+struct PunctState {
+    /// 服务请求发送端（`None` = 未启动 / 已异常退出）。
+    tx: Option<crossbeam_channel::Sender<PunctReq>>,
+    /// 服务线程句柄（`is_finished()` ⇒ 已退出，可据此在发送前判异常退出）。
+    join: Option<std::thread::JoinHandle<()>>,
+    /// 上次「启动/重试全失败」时刻（冷却用）。
+    last_fail: Option<std::time::Instant>,
+}
+
+static PUNCT_SERVICE: std::sync::OnceLock<std::sync::Mutex<PunctState>> =
+    std::sync::OnceLock::new();
+
+/// 单次调用的结果分类。
+enum PunctTry {
+    /// 成功打点。
+    Ok(String),
+    /// 引擎不可用（模型缺失 / 加载失败）——属启动失败，计入重试/冷却。
+    Unavailable,
+    /// 线程已退出 / panic（send / recv 断开）——需重启。
+    AbnormalExit,
+    /// 线程活着但处理太慢 —— **不算异常退出、不重启**。
+    Timeout,
+}
+
+/// 410：冷却是否生效（距上次失败 < [`PUNCT_RESTART_COOLDOWN_SECS`] ⇒ 本次不尝试启动）。纯函数。
+fn punct_cooldown_active(last_fail: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last_fail.is_some_and(|t| {
+        now.saturating_duration_since(t)
+            < std::time::Duration::from_secs(PUNCT_RESTART_COOLDOWN_SECS)
+    })
+}
+
+/// 410：调用→重试循环（与 I/O 解耦，便于单测「异常退出后重启成功 / 两次失败走无标点 / 超时不重启」）。
+///
+/// - `Ok(s)` ⇒ 成功返回；
+/// - `Timeout` ⇒ 立即 `Err("timeout")`（**不重试**，④）；
+/// - `AbnormalExit` / `Unavailable` ⇒ **重启重试**，最多 [`PUNCT_START_MAX_RETRIES`] 次，全失败 ⇒ `Err("startup-failed")`。
+fn run_punct_retries<F: FnMut(usize) -> PunctTry>(mut attempt: F) -> Result<String, &'static str> {
+    for i in 0..=PUNCT_START_MAX_RETRIES {
+        match attempt(i) {
+            PunctTry::Ok(s) => return Ok(s),
+            PunctTry::Timeout => return Err("timeout"),
+            PunctTry::AbnormalExit | PunctTry::Unavailable => {}
+        }
+    }
+    Err("startup-failed")
+}
+
+/// 410：确保服务线程在跑（已退出 ⇒ 重启；引擎在**服务线程内**加载 ⇒ 不要求 `PunctuationEngine: Send`）。
+fn ensure_punct_service(state: &std::sync::Mutex<PunctState>, model_dir: &Path) {
+    let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
+    // 发送前判异常退出：线程句柄已完成 ⇒ 清掉发送端，下面重建。
+    if g.join.as_ref().is_some_and(|h| h.is_finished()) {
+        g.tx = None;
+        g.join = None;
+    }
+    if g.tx.is_some() {
+        return;
+    }
+    let (tx, rx) = crossbeam_channel::unbounded::<PunctReq>();
+    let dir = model_dir.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("punct-fallback-service".to_string())
+        .spawn(move || {
+            let t0 = std::time::Instant::now();
+            let mut engine = punctuation::PunctuationEngine::new(&dir);
+            log::info!(
+                "[LocalRT-DBG-410] punct fallback service: model load={:.1}ms status={}",
+                t0.elapsed().as_secs_f64() * 1000.0,
+                if engine.is_some() {
+                    "ok"
+                } else {
+                    "unavailable"
+                }
+            );
+            for req in rx {
+                let out = engine.as_mut().and_then(|e| {
+                    let t = std::time::Instant::now();
+                    let r = e.add_punctuation(&req.text);
+                    if log::log_enabled!(log::Level::Debug) {
+                        log::debug!(
+                            "[LocalRT-DBG-410] punct service call: {} chars in {:.1}ms ok={}",
+                            req.text.chars().count(),
+                            t.elapsed().as_secs_f64() * 1000.0,
+                            r.is_some()
+                        );
+                    }
+                    r
+                });
+                let _ = req.reply.send(out);
+            }
+        });
+    match spawned {
+        Ok(h) => {
+            g.tx = Some(tx);
+            g.join = Some(h);
+        }
+        Err(_) => {
+            log::warn!("[LocalRT-DBG-410] punct fallback service spawn failed");
+            g.tx = None;
+            g.join = None;
+        }
+    }
+}
+
+/// 410：单次尝试（确保服务在跑 → 发送 → 同步收结果）。
+fn punct_attempt(state: &std::sync::Mutex<PunctState>, model_dir: &Path, text: &str) -> PunctTry {
+    ensure_punct_service(state, model_dir);
+    let tx = state.lock().unwrap_or_else(|e| e.into_inner()).tx.clone();
+    let Some(tx) = tx else {
+        return PunctTry::Unavailable; // 启动失败
+    };
+    let (reply_tx, reply_rx) = crossbeam_channel::bounded::<Option<String>>(1);
+    let req = PunctReq {
+        text: text.to_string(),
+        reply: reply_tx,
+    };
+    if tx.send(req).is_err() {
+        // 线程已退出（含 panic）⇒ 标记，下一轮 ensure 重建。
+        let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
+        g.tx = None;
+        g.join = None;
+        return PunctTry::AbnormalExit;
+    }
+    match reply_rx.recv_timeout(std::time::Duration::from_millis(PUNCT_FALLBACK_TIMEOUT_MS)) {
+        Ok(Some(s)) => PunctTry::Ok(s),
+        Ok(None) => PunctTry::Unavailable, // 引擎加载失败（线程活着但引擎 None）
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            // 线程在本次请求中 panic ⇒ 标记，下一轮重建。
+            let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
+            g.tx = None;
+            g.join = None;
+            PunctTry::AbnormalExit
+        }
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => PunctTry::Timeout,
+    }
+}
+
+/// 410 item3：经进程级标点服务线程打点（同步、超时、异常退出自动重启，最多 2 次）。
+///
+/// `enabled=false` / 已含句读标点 / 冷却期内 / 重试全失败 / 超时 ⇒ 原样返回（并 warn），**绝不阻塞回灌**。
+fn punctuate_via_service(model_dir: &Path, enabled: bool, text: &str) -> String {
+    if !enabled || text.trim().is_empty() {
+        return text.to_string();
+    }
+    if text
+        .chars()
+        .any(|c| matches!(c, '。' | '！' | '？' | '；' | '，' | '、' | '：'))
+    {
+        return text.to_string(); // 已含标点 ⇒ 不重复打
+    }
+    let state = PUNCT_SERVICE.get_or_init(|| std::sync::Mutex::new(PunctState::default()));
+    let now = std::time::Instant::now();
+    {
+        let g = state.lock().unwrap_or_else(|e| e.into_inner());
+        if punct_cooldown_active(g.last_fail, now) {
+            log::warn!("[LocalRT-DBG-410] punct service in cooldown; using raw fallback text");
+            return text.to_string();
+        }
+    }
+    match run_punct_retries(|_i| punct_attempt(state, model_dir, text)) {
+        Ok(s) => {
+            state.lock().unwrap_or_else(|e| e.into_inner()).last_fail = None;
+            s
+        }
+        Err(why) => {
+            if why == "timeout" {
+                log::warn!("[LocalRT-DBG-410] punct fallback timeout; using raw fallback text");
+            } else {
+                // 启动/重试全失败 ⇒ 设冷却（③：下次仍需重试，但 30s 内不反复加载）。
+                state.lock().unwrap_or_else(|e| e.into_inner()).last_fail = Some(now);
+                log::warn!(
+                    "[LocalRT-DBG-410] punct service failed after retries ({why}); using raw fallback text"
+                );
+            }
+            text.to_string()
+        }
+    }
+}
+
 /// FIX-PREVIEW-HARVEST-380（A）：滑窗解码结果载荷
 /// `(window_seq, dispatch_idx, 解码结果, 解码耗时 ms, 解码完成时刻)`。
 /// 382（3C）：末元 `Instant` 随 `PreviewReflow.decode_done_at` 带到消费端，测「解完 → 浮层重画」。
@@ -11707,6 +11993,27 @@ fn tail_backtrack_secs(rate_cps: f32) -> f32 {
     (need / rate).max(2.0)
 }
 
+/// FIX-TAIL-GUARD-410 item1：末尾窗的 **406 比对基准** = 前片流式的**末尾相应字符数**（按
+/// `suffix_samples / prev_samples` 比例、**按 char 切**，禁字节下标，见 `LOCALRT-CHARBOUNDARY-344`）
+/// + pending 流式。**不得**用整个前片流式（否则基准含窗口外内容 ⇒ 正确精解被 406 误拒）。
+fn tail_streaming_baseline(
+    prev_streaming: &str,
+    suffix_samples: usize,
+    prev_samples: usize,
+    pending_streaming: &str,
+) -> String {
+    let prev_chars = prev_streaming.chars().count();
+    let ratio = if prev_samples == 0 {
+        0.0
+    } else {
+        suffix_samples as f32 / prev_samples as f32
+    };
+    let n = (((prev_chars as f32) * ratio).round() as usize).min(prev_chars);
+    let mut s: String = prev_streaming.chars().skip(prev_chars - n).collect();
+    s.push_str(pending_streaming);
+    s
+}
+
 /// FIX-TAIL-WINDOW-AND-FALLBACK-386：组窗纯函数（在 382 基础上加「延后尾片 / 收尾合并」）。
 ///
 /// 输入：`prev_durs` 已派发片时长（时间序，调用方保证已按 `WINDOW_MAX_SLICES` 裁剪）；
@@ -11776,6 +12083,186 @@ fn plan_windows(
     WindowPlan {
         windows: out,
         pending: pend,
+    }
+}
+
+// =====================================================================
+// FIX-TAIL-GUARD-410：末尾窗 × 406 守卫配合（比对基准只取前片后缀 / 兜底只覆 pending / 兜底打点）
+// =====================================================================
+#[cfg(test)]
+mod fix410_tail_guard_tests {
+    use super::{
+        punct_cooldown_active, punctuate_via_service, run_punct_retries, tail_streaming_baseline,
+        PunctTry, PUNCT_START_MAX_RETRIES,
+    };
+
+    /// 410 item1：真实数据构造 —— 整前片基准会**误拒**正确精解；比例基准（前片末尾相应字数 + pending）⇒ accept。
+    #[test]
+    fn f410_tail_baseline_ratio_corrects_false_reject() {
+        let prev = "周末天气好的话一起出来玩吧我们一起可以出去看看电影也可以挤出去吃饭然后也可以到郊外去旅游旅游";
+        let pending = "或者到附进去旅游";
+        let jie = "然后也可以到郊外去旅游旅游，或者到附近去旅游。";
+        // 旧基准 = 整个前片 + pending ⇒ 含窗口外内容 ⇒ 误拒（BUILD-409 现场 retention 0.39）。
+        let old = format!("{prev}{pending}");
+        assert!(
+            !crate::transcription::acc_vs_streaming(jie, &old).accept,
+            "整前片基准应误拒（复现缺陷）"
+        );
+        // 新基准：前片 6.91s，回溯 4.0s ⇒ 前片末尾 4.0/6.91 比例字数。
+        let prev_chars = prev.chars().count();
+        let suffix_samples = 64_000usize; // 4.0s @16k
+        let prev_samples = 110_560usize; // 6.91s @16k
+        let baseline = tail_streaming_baseline(prev, suffix_samples, prev_samples, pending);
+        let expect_suffix =
+            ((prev_chars as f32) * (suffix_samples as f32 / prev_samples as f32)).round() as usize;
+        assert_eq!(
+            baseline.chars().count(),
+            expect_suffix + pending.chars().count(),
+            "基准字数应 = 比例字数 + pending 字数"
+        );
+        assert!(
+            crate::transcription::acc_vs_streaming(jie, &baseline).accept,
+            "比例基准应 accept 正确精解（retention={:.2} len={:.2}）",
+            crate::transcription::acc_vs_streaming(jie, &baseline).retention,
+            crate::transcription::acc_vs_streaming(jie, &baseline).len_ratio
+        );
+    }
+
+    /// 410 item2：末尾窗被拒后**只**以 span `(p,p+1)` + pending 文本回灌 ⇒ 前片已回灌文本逐字不变。
+    #[test]
+    fn f410_tail_fallback_keeps_prev_and_appends_pending() {
+        let mut o = crate::transcription::OrderedReflow::new();
+        let prev = "周末天气好的话一起出来玩吧";
+        let pending_punct = "或者到附近去旅游。";
+        // 窗0：前片已回灌。
+        let _ = o.push_window(0, 0, 1, vec![100], prev.to_string());
+        // 末尾窗被拒 ⇒ 兜底 pending 片：span (1,2)、文本 = 加标点 pending。
+        let _ = o.push_window(1, 1, 2, vec![50], pending_punct.to_string());
+        let (committed, last) = o.finish();
+        let full = format!("{committed}{last}");
+        assert_eq!(
+            full,
+            format!("{prev}{pending_punct}"),
+            "前片须一字不动、pending 追加"
+        );
+        assert!(full.starts_with(prev), "前片已回灌文本必须逐字不变");
+    }
+
+    /// 410 item1：按 char 切片 —— 中英混合 + emoji 不 panic、字数正确。
+    #[test]
+    fn f410_tail_baseline_char_safe_mixed_emoji() {
+        let prev = "hello你好😀世界"; // 10 chars
+        let pending = "再见👋"; // 3 chars
+        let b = tail_streaming_baseline(prev, 5, 10, pending); // 后 5 字 + pending
+        assert!(b.ends_with(pending));
+        assert_eq!(b.chars().count(), 5 + pending.chars().count());
+        // 比例 0 / 超界 均不 panic。
+        let _ = tail_streaming_baseline(prev, 0, 10, pending);
+        let _ = tail_streaming_baseline(prev, 999, 10, pending);
+        let _ = tail_streaming_baseline("", 0, 0, "");
+    }
+
+    /// 410 item3：标点服务不带模型的两条守卫 —— 关闭 ⇒ 原样；已含句读标点 ⇒ 不重复打。
+    #[test]
+    fn f410_punctuate_guards_no_model() {
+        let dir = std::path::Path::new(".");
+        assert_eq!(
+            punctuate_via_service(dir, false, "你好世界"),
+            "你好世界",
+            "关闭 ⇒ 原样"
+        );
+        assert_eq!(
+            punctuate_via_service(dir, true, "你好，世界。"),
+            "你好，世界。",
+            "已含标点 ⇒ 不重复打（早退、不加载模型）"
+        );
+    }
+
+    /// 410 补充①②：异常退出（panic / 断开）⇒ 重启重试；首次异常、次次成功 ⇒ 返回成功。
+    #[test]
+    fn f410_punct_retry_after_abnormal_then_ok() {
+        let mut calls = 0usize;
+        let r = run_punct_retries(|i| {
+            calls += 1;
+            if i == 0 {
+                PunctTry::AbnormalExit
+            } else {
+                PunctTry::Ok("你好，世界。".to_string())
+            }
+        });
+        assert_eq!(r, Ok("你好，世界。".to_string()), "异常退出后重启应成功");
+        assert_eq!(calls, 2, "应恰重启重试 1 次");
+        // 连续多次异常退出 ⇒ 重试到上限；首两次异常、第三次成功。
+        let mut calls2 = 0usize;
+        let r2 = run_punct_retries(|i| {
+            calls2 += 1;
+            if i < 2 {
+                PunctTry::AbnormalExit
+            } else {
+                PunctTry::Ok("ok".to_string())
+            }
+        });
+        assert_eq!(r2, Ok("ok".to_string()));
+        assert_eq!(calls2, PUNCT_START_MAX_RETRIES + 1);
+    }
+
+    /// 410 补充②：连续两次启动失败（Unavailable）⇒ 本次走无标点（`Err("startup-failed")`）。
+    #[test]
+    fn f410_punct_two_startup_failures_give_raw() {
+        let mut calls = 0usize;
+        let r = run_punct_retries(|_| {
+            calls += 1;
+            PunctTry::Unavailable
+        });
+        assert_eq!(r, Err("startup-failed"), "连续失败应放弃、走无标点");
+        assert_eq!(
+            calls,
+            PUNCT_START_MAX_RETRIES + 1,
+            "尝试次数 = 1 + 2 次重试"
+        );
+    }
+
+    /// 410 补充④：超时（线程活着但慢）**不算异常退出、不重启** ⇒ 立即走无标点。
+    #[test]
+    fn f410_punct_timeout_no_restart() {
+        let mut calls = 0usize;
+        let r = run_punct_retries(|_| {
+            calls += 1;
+            PunctTry::Timeout
+        });
+        assert_eq!(r, Err("timeout"));
+        assert_eq!(calls, 1, "超时不得重试");
+    }
+
+    /// 410 补充③：冷却窗口 —— 失败后 `[0, 30s)` 内不再尝试，`≥30s` 可再试。
+    #[test]
+    fn f410_punct_cooldown_window() {
+        let base = std::time::Instant::now();
+        assert!(!punct_cooldown_active(None, base), "无失败记录 ⇒ 无冷却");
+        assert!(punct_cooldown_active(Some(base), base), "刚失败 ⇒ 冷却中");
+        assert!(punct_cooldown_active(
+            Some(base),
+            base + std::time::Duration::from_secs(29)
+        ));
+        assert!(
+            !punct_cooldown_active(Some(base), base + std::time::Duration::from_secs(30)),
+            "满 30s ⇒ 冷却结束、可重试"
+        );
+    }
+
+    /// 410 item3（真模型）：标点服务实际给裸流式文本加上标点。
+    /// 运行：`cargo test --bin feiyin-ime -- --ignored --nocapture f410_real_punctuate`
+    #[test]
+    #[ignore = "requires punctuation model; cargo test --bin feiyin-ime -- --ignored --nocapture f410_real_punctuate"]
+    fn f410_real_punctuate() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models");
+        let out = punctuate_via_service(&dir, true, "今天天气不错我们出去玩吧");
+        println!("\n[410] punctuated: {out}");
+        assert!(
+            out.chars()
+                .any(|c| matches!(c, '。' | '，' | '！' | '？' | '；' | '、')),
+            "真模型应对裸文本加上标点，实测 {out:?}"
+        );
     }
 }
 

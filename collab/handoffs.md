@@ -8,6 +8,15 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-1 — FIX-TAIL-GUARD-410 ✅ 阶段一交付（待主控验收，只改 main.rs）
+
+- **① 比对基准只取前片后缀**：纯函数 `tail_streaming_baseline`（前片流式按样本占比取末尾相应**字符数**、char 切 + pending 流式）替代「整前片 + pending」⇒ 不再误拒正确精解。
+- **② 末尾窗被拒/空只兜底 pending**：`TailPending` + `window_tail_pending`；harvest 用 span `(p,p+1)` + pending 文本 ⇒ 前片不动。406 逻辑未改。
+- **③ 兜底先打标点**：进程级常驻标点服务线程（首次兜底才 spawn、引擎线程内加载、全进程复用）；500ms 超时、失败/超时原样 + warn；**Gavin 追加**：异常退出 ⇒ 重启重试最多 2 次、全失败 ⇒ 无标点 + 30s 冷却、超时不重启。
+- **测试**：`f410_*` **8 条**（真实数据误拒→accept、前片不变+pending、char 切 emoji、关闭/已含标点、异常退出后重启成功、两次失败走无标点、超时不重启、冷却窗口）+ `#[ignore]` 真模型（`今天天气不错我们出去玩吧`→`今天天气不错，我们出去玩吧。`）。
+- **验证**：`fmt --check` EXIT 0；`check --all-targets` 0 error、warnings 92/87=基线；全量 `cargo test` **1674P/0F/52I**。证据 `collab/evidence/410/`。
+- 红线：只改 `src/main.rs` / 未 commit / 未 build release / 版本未动 / 零凭证。
+
 ## 2026-09-24 — coder-1 — TEST-SYNC-406-408B ✅ 交付（阶段三·非作者护栏 16 条；生产零改动）
 
 - **范围**：只在 `mod.rs` / `speaker.rs` 的 `#[cfg(test)]` 加两个模块 —— `testsync406_408b_tests`（10）+ `testsync408b_guard_tests`（6）；未碰生产 / `local_stream.rs` / `main.rs`。

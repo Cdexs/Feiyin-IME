@@ -1,4 +1,11 @@
 
+### 2026-09-25 · FIX-TAIL-GUARD-410 交付（末尾窗 × 406 配合三错 + 标点服务重试/冷却，只改 main.rs）
+
+- ① 比对基准按样本占比只取前片流式末尾相应字符数（char 切）+ pending（`tail_streaming_baseline`）⇒ 不再误拒正确精解。
+- ② 末尾窗被拒/空只兜底 pending（span `(p,p+1)`）⇒ 前片已回灌结果不动。
+- ③ 兜底先打标点：进程级常驻标点服务线程（首次兜底才启动、引擎线程内加载）；异常退出重启最多 2 次、全失败走无标点 + 30s 冷却、超时不重启。
+- 测试 `f410_*` 8 条 + `#[ignore]` 真模型；全量 `cargo test` 1674P/0F/52I。未出包。
+
 ### 2026-09-24 · TEST-SYNC-406-408B 交付（阶段三·非作者护栏 16 条，生产零改动）
 
 - 只加 `#[cfg(test)]`：`mod.rs::testsync406_408b_tests` 10 + `speaker.rs::testsync408b_guard_tests` 6。
