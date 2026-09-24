@@ -156,6 +156,7 @@ Gavin 2026-09-22 原话：
 | --- | --- | --- |
 | 1b | 🔴 **命名不一致待定** | 产品英文名已改 FlashVoice Input，但这些**还是旧名**：仓库名 `Feiyin-IME`、产物名 `feiyin-ime.exe` / `feiyin-ime-ui.exe`、GitHub Release 标题「飞音智能语音输入 v0.9.0」、安装包脚本 `voice-ime.iss`。**改产物名会动构建链和用户升级路径，等 Gavin 决定改到哪一层** |
 | 2 | Release 挂安装包 | 本次 Release 未挂二进制。`voice-ime.iss` 是 Inno Setup 脚本但未构建。需对外分发时：出 release 包 → 构建 setup.exe → upload asset |
+| 3 | 🆕 VC++ 运行库未随包 | 2026-09-24 主控核 `Publish/`：`feiyin-ime.exe` / `onnxruntime.dll` / `sherpa-onnx-c-api.dll` / `ctranslate2.dll` 均依赖 `MSVCP140` / `VCRUNTIME140` / `VCRUNTIME140_1`（397 起 CT2 另加 `VCOMP140`），同属 VC++ 2015-2022 x64 运行库，**不是 Windows 自带**，Publish 未带、`voice-ime.iss` 未装。干净系统会启动失败。对外分发前二选一：安装包内静默装 `VC_redist.x64.exe`，或四个 DLL 随程序目录放（微软允许 app-local）。另：`installer/voice-ime.iss:72-75` 只列 sherpa 两个 + onnxruntime 两个 DLL，**缺 `ctranslate2.dll`**（翻译必挂），出安装包前一并补。待 Gavin 定 |
 
 ---
 
