@@ -18211,6 +18211,62 @@ mod testsync377_source_guard_tests {
 mod testsync407_tests {
     use super::{plan_windows, tail_backtrack_secs, tail_window_span};
 
+    /// 取源码里 `match` 臂 `pat => { ... }` 的**完整臂体**：从 `at` 起找第一个 `{`，再括号配平到
+    /// 与之配对的 `}`。配平时**跳过字符串 / 字符 / 行注释 / 块注释**内的括号
+    ///（防 [GUARD-SKIP-BRACE-IN-STRING-382] 的「字符串内花括号」计数坑）。
+    fn arm_body(code: &str, at: usize) -> &str {
+        let bytes = code.as_bytes();
+        let open = code[at..].find('{').map(|d| at + d).expect("臂体 `{` 缺失");
+        let mut depth = 0i32;
+        let mut i = open;
+        let (mut string, mut ch, mut line_c, mut block_c) = (false, false, false, false);
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            let next = bytes.get(i + 1).copied().map(|b| b as char);
+            if line_c {
+                if c == '\n' {
+                    line_c = false;
+                }
+            } else if block_c {
+                if c == '*' && next == Some('/') {
+                    block_c = false;
+                    i += 1;
+                }
+            } else if string {
+                if c == '\\' {
+                    i += 1;
+                } else if c == '"' {
+                    string = false;
+                }
+            } else if ch {
+                if c == '\\' {
+                    i += 1;
+                } else if c == '\'' {
+                    ch = false;
+                }
+            } else if c == '"' {
+                string = true;
+            } else if c == '\'' {
+                ch = true;
+            } else if c == '/' && next == Some('/') {
+                line_c = true;
+                i += 1;
+            } else if c == '/' && next == Some('*') {
+                block_c = true;
+                i += 1;
+            } else if c == '{' {
+                depth += 1;
+            } else if c == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    return &code[at..=i];
+                }
+            }
+            i += 1;
+        }
+        &code[at..]
+    }
+
     /// 407 契约5（源码）：长静默只在**有 pending** 时组末尾窗；用后清空（停止键不重复处理）。
     #[test]
     fn ts407_tail_only_when_pending_source_guard() {
@@ -18224,7 +18280,8 @@ mod testsync407_tests {
         let arm = code
             .find("AccInput::LongSilence(pcm_pos) =>")
             .expect("长静默臂缺失");
-        let seg = &code[arm..(arm + 2600).min(code.len())];
+        // 🔴 截到**该 match 臂结束**（臂体括号配平），不用固定字符窗口（返修：2600 太短）。
+        let seg = arm_body(&code, arm);
         assert!(
             seg.contains("if let Some(p) = pending_slice"),
             "末尾窗必须以 pending 存在为条件（无 pending 不产生窗口）"
@@ -18234,6 +18291,8 @@ mod testsync407_tests {
             "须用纯决策取 span"
         );
         assert!(seg.contains("pending_slice = None;"), "用后须清空 pending");
+        // 臂体须显著长于旧魔数窗口（证明确实截到了 Arm 结束而非截断）。
+        assert!(seg.len() > 2600, "臂体长度 {} 应 > 2600", seg.len());
     }
 
     /// 407 契约5：`tail_window_span` 边界（无 pending / 首片 / 末片 / 越界 / p<base）。

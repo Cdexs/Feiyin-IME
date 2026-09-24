@@ -16,6 +16,7 @@
 - **契约 7**（有剔除 ∧ ja|未知|未就绪 ⇒ 原 ranges 重解）内联需模型 ⇒ **源码锚点护栏**锁死形状。
 - **白名单**：`rustfmt` 两文件 **EXIT 0 CLEAN**；`cargo check --all-targets` **0 error**、warnings **92/87 = 基线**；**未跑 cargo test**。**未发现生产缺陷**。
 - ⚠️ 过程如实上报：一度对 `MismatchVerdict`（无 Debug）用 `{:?}` 致 13 处错误阻塞 coder-2 ⇒ 改只打字段 + 修模块重名后 check 恢复 0 error（**未给生产加 derive(Debug)**）。
+- **返修（主控退回一处，只改测试）**：`ts408b_partition_ranges_conservative` 原按「32000 样本=1s」（应 =2.0s@16k）⇒ 期望修正为 kept=4.0/dropped=2.0，并改用 `SAMPLE_RATE` 换算、不硬编码样本数。`rustfmt` EXIT 0、`cargo check --all-targets` 0 error/warnings 92/87=基线。
 - 红线：未改生产 / 未 commit / 未 push / 版本未动 / 零凭证。
 
 ## 2026-09-24 — coder-1 — LOCALRT-TAIL-WINDOW-407 ✅ 阶段一交付（待主控验收）
@@ -214,3 +215,4 @@
 - **407**：源码（长静默以 pending 为条件、用后清空）；`tail_window_span` 边界；`tail_backtrack_secs` 性质；收尾后继续说话仍全覆盖；末尾窗 1 字差异不丢尾。
 - **验证（白名单）**：`rustfmt --config skip_children=true`（两文件）CLEAN；`cargo check --all-targets` **EXIT 0**、0 error、warnings **92/87** = 基线、两文件零新增 warning。🔴 **未跑 `cargo test`**（阶段三禁止，首跑由 tester-1）。
 - **疑似生产缺陷：未发现**；**未改生产代码 / 未 commit / 未 push / 零凭证**。
+- **返修（tester-1 回归红，测试自身错误）**：`ts407_tail_only_when_pending_source_guard` 原用固定 2600 字符窗口截 `AccInput::LongSilence` 臂，而 `pending_slice = None;` 在臂内 ~5173 字符 ⇒ 假红。改为 `arm_body()`：对臂体 `{…}` **括号配平**（跳过字符串/字符/行·块注释内括号，防 `[GUARD-SKIP-BRACE-IN-STRING-382]`）截到**臂闭合 `}`**；sandbox 复刻验证 seg=5173、含三断言串。仅测试自身修正，生产零改动。验证：`rustfmt --skip_children` CLEAN；`cargo check --all-targets` 0 error、warnings 92/87=基线。
