@@ -426,6 +426,98 @@ pub(crate) fn acc_avg_chars_per_sec(
     }
 }
 
+// ===========================================================================
+// FIX-ACC-MISMATCH-GUARD-406：精解结果与**同窗流式（预览）文本**比对
+// ===========================================================================
+
+/// 406：流式归一化后短于此长度 ⇒ 样本太少，不判（直接接受精解）。
+pub(crate) const MISMATCH_MIN_STREAM_CHARS: usize = 6;
+/// 406：接受精解所需的最低「内容保留率」（`retention`）。**步骤 C 已校准**（见 result.md）。
+pub(crate) const MISMATCH_MIN_RETENTION: f32 = 0.5;
+/// 406：接受精解所需的最低「长度比」（`len_ratio`）。**步骤 C 已校准**（见 result.md）。
+///
+/// 🔴 **0.8 → 0.6（406 验收下调）**：三个出错例单靠保留率（0.43 / 0.04 / 0.00，均 < 0.5）就全部拦下，
+/// 长度比不是必需的门；而当日连贯会话的代理样本有 0.758 / 0.795 两条，0.8 会把**正常纠错**误拒
+/// （精解常删掉流式里的口吃重复与语气词，天然更短）。取 0.6 只拦「严重变短」。
+pub(crate) const MISMATCH_MIN_LEN_RATIO: f32 = 0.6;
+
+/// 406：`acc_vs_streaming` 的判定结果（供埋点与测试读取）。
+pub(crate) struct MismatchVerdict {
+    /// 归一化后 `acc` 相对 `streaming` 的**最长公共子序列**占比（0.0~1.0）。
+    pub retention: f32,
+    /// 归一化后 `acc` 与 `streaming` 的长度比（`len(acc)/len(streaming)`）。
+    pub len_ratio: f32,
+    /// 是否接受精解（`true` = 用精解；`false` = 用同窗流式替换）。
+    pub accept: bool,
+}
+
+/// 406 归一化：全角 ASCII（U+FF01..=U+FF5E）→ 半角 → 去空白/标点（复用 [`align_keep_char`]）
+/// → ASCII 大写转小写。仅用于比对，不改动原文本。
+fn normalize_for_mismatch(s: &str) -> Vec<char> {
+    s.chars()
+        .map(|c| {
+            if ('\u{FF01}'..='\u{FF5E}').contains(&c) {
+                char::from_u32(c as u32 - 0xFEE0).unwrap_or(c)
+            } else {
+                c
+            }
+        })
+        .filter(|c| align_keep_char(*c))
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// 406：最长公共**子序列**长度（两行滚动 DP，O(n·m)）。
+///
+/// 🔴 与 [`lcs_len`] 不同：后者是**子串**（连续），本函数是**子序列**（可不连续）——
+/// 精解可能对预览做局部改写/补标点，子序列才能正确衡量「内容保留」。
+fn lcs_subseq_len(a: &[char], b: &[char]) -> usize {
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
+    let mut prev = vec![0usize; b.len() + 1];
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            cur[j] = if a[i - 1] == b[j - 1] {
+                prev[j - 1] + 1
+            } else {
+                prev[j].max(cur[j - 1])
+            };
+        }
+        std::mem::swap(&mut prev, &mut cur);
+        cur.iter_mut().for_each(|v| *v = 0); // 复位滚动行，供下一轮复用
+    }
+    prev[b.len()]
+}
+
+/// 406：比较**精解**（`acc`）与**同窗流式预览**（`streaming`），判精解是否可信。
+///
+/// 现状 `output_rate_ok` 只比「字/秒」，从不看同窗流式文本 ⇒ 精解漏整句 / 幻觉出无关短句时
+/// 照样放行（预览回缩 + 最终丢句）。本判据补「内容保留」维度：
+/// - 流式归一化后 `< MISMATCH_MIN_STREAM_CHARS` ⇒ 样本太少，`accept = true`（宁漏勿误杀）；
+/// - 否则 `accept = retention >= MISMATCH_MIN_RETENTION && len_ratio >= MISMATCH_MIN_LEN_RATIO`。
+pub(crate) fn acc_vs_streaming(acc: &str, streaming: &str) -> MismatchVerdict {
+    let acc_n = normalize_for_mismatch(acc);
+    let str_n = normalize_for_mismatch(streaming);
+    if str_n.len() < MISMATCH_MIN_STREAM_CHARS {
+        return MismatchVerdict {
+            retention: 1.0,
+            len_ratio: 1.0,
+            accept: true,
+        };
+    }
+    let lcs = lcs_subseq_len(&acc_n, &str_n);
+    let retention = lcs as f32 / str_n.len() as f32;
+    let len_ratio = acc_n.len() as f32 / str_n.len() as f32;
+    let accept = retention >= MISMATCH_MIN_RETENTION && len_ratio >= MISMATCH_MIN_LEN_RATIO;
+    MismatchVerdict {
+        retention,
+        len_ratio,
+        accept,
+    }
+}
+
 /// FIX-ACC-OUTPUT-GUARD-387：处置阶梯的**触发类别**（供埋点 `kind=`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GuardKind {
@@ -509,6 +601,27 @@ fn strip_angle_tags(text: &str) -> (String, bool) {
                 if first.is_ascii_alphabetic() || first == '_' || first == '/' {
                     hit = true;
                     i = j + 1;
+                    continue;
+                }
+            }
+            // FIX-ACC-MISMATCH-GUARD-406：**未闭合标签**守卫（如 `<translation`、`<asr_text`）。
+            // 判据：`<` 后紧跟 **≥3 个连续 ASCII 字母**（防误剥 `a<b` / `3<5` / `<3块钱`），
+            // 其后「标签名 run」（`[A-Za-z0-9_]`）直到文本结尾或首个非标签名字符，**其间没有 `>`**
+            // ⇒ 视为未闭合标签，剥掉 `<` + 标签名。若 run 末尾恰是 `>`（只是名字过长）⇒ 不剥，保持
+            // 387 的「>30 字符不算标签」契约。
+            if i + 3 < chars.len()
+                && chars[i + 1].is_ascii_alphabetic()
+                && chars[i + 2].is_ascii_alphabetic()
+                && chars[i + 3].is_ascii_alphabetic()
+            {
+                let mut k = i + 1;
+                while k < chars.len() && (chars[k].is_ascii_alphanumeric() || chars[k] == '_') {
+                    k += 1;
+                }
+                let ends_with_gt = k < chars.len() && chars[k] == '>';
+                if !ends_with_gt {
+                    hit = true;
+                    i = k;
                     continue;
                 }
             }
@@ -6197,7 +6310,9 @@ mod testsync387_tests {
     const INJ: &str = "你好,铭印,银线,朵洛莉丝,费曼学习法,子未穿害,低质,罗斯柴尔德,维生素b12";
 
     /// 测 #1 标签边界：被剥 `<location>` / `</x>` / `<_a>`（含夹在正文中）；
-    /// 不被剥 `<3岁` / `a<b` / `< 空格>` / 中文 `<你好>` / 内容 31 字符 / 未闭合超 31。
+    /// 不被剥 `<3岁` / `a<b` / `< 空格>` / 中文 `<你好>` / 内容 31 字符。
+    /// FIX-ACC-MISMATCH-GUARD-406：**未闭合标签**（`<` + ≥3 连续 ASCII 字母、名字 run 内无 `>`）
+    /// 现按标签剥掉（`<translation` / `<asr_text`）；`<` 后不足 3 字母 / 数字开头不剥。
     #[test]
     fn ts387_tag_boundaries() {
         for input in ["<location>", "</x>", "<_a>"] {
@@ -6232,12 +6347,103 @@ mod testsync387_tests {
             (t31.clone(), false),
             "31 字符不得剥"
         );
+        // FIX-ACC-MISMATCH-GUARD-406：未闭合标签（`<` + ≥3 连续 ASCII 字母，其名字 run 内无 `>`）
+        // 现按标签剥掉（387 契约变更）。>30 字符的**闭合**标签仍不剥（`t31` 保持 387）。
         let unclosed = format!("<{}", "a".repeat(40));
         assert_eq!(
             strip_angle_tags(&unclosed),
-            (unclosed.clone(), false),
-            "未闭合超 31 不得剥"
+            (String::new(), true),
+            "406：未闭合标签应剥（含超 40 字符）"
         );
+        assert_eq!(
+            strip_angle_tags("<translation"),
+            (String::new(), true),
+            "406：<translation 未闭合应剥"
+        );
+        assert_eq!(
+            strip_angle_tags("文字<asr_text"),
+            ("文字".to_string(), true),
+            "406：正文后的未闭合标签只删标签本身"
+        );
+        // 406 反例：`<` 后不足 3 个连续 ASCII 字母 / 数字开头 ⇒ 不剥（正常文字）。
+        for (input, why) in [
+            ("a<b", "不足 3 字母"),
+            ("x<ab", "仅 2 字母"),
+            ("3<5", "数字开头"),
+            ("<3块钱", "数字开头"),
+        ] {
+            let (out, hit) = strip_angle_tags(input);
+            assert_eq!(out, input, "406 不得误剥（{why}）：{input}");
+            assert!(!hit, "406 不应标记（{why}）：{input}");
+        }
+    }
+
+    /// FIX-ACC-MISMATCH-GUARD-406：`acc_vs_streaming` 判「精解是否可信」。
+    #[test]
+    fn fix406_acc_vs_streaming_verdicts() {
+        use super::acc_vs_streaming;
+
+        // 今日三例（任务书表格原文摘录，来自 BUILD-398 端测 #1/#1+/#7）⇒ 必须 reject。
+        let cases_reject: &[(&str, &str)] = &[
+            // 15:07：精解漏整句。
+            (
+                "看看最近有什么好看的电影",
+                "看看最近有什么好看的电影然后有什么好看的精彩的电影大片上",
+            ),
+            // 17:49：精解幻觉出无关短句。
+            (
+                "具体地址在哪个区",
+                "朋友聚去然后找一个优美的安静的地方自己待一待都挺好",
+            ),
+            // 17:59：精解只吐未闭合标签 `<translation`。
+            (
+                "<translation",
+                "先把精确的结果捎到越南区但这个时候用户已经停止录音",
+            ),
+        ];
+        for (acc, streaming) in cases_reject {
+            let v = acc_vs_streaming(acc, streaming);
+            assert!(
+                !v.accept,
+                "406：应 reject（retention={:.2} len_ratio={:.2}）：acc={acc:?} stream={streaming:?}",
+                v.retention, v.len_ratio
+            );
+        }
+
+        // 正常纠错（同音字改对 + 加标点）⇒ accept。
+        let v = acc_vs_streaming(
+            "最近的天气如何？会不会下雨？然后天气一直都是阴沉的",
+            "毕近的天气如何会不会下雨然后天气一直是一路成的",
+        );
+        assert!(
+            v.accept,
+            "406：正常纠错应 accept（retention={:.2} len_ratio={:.2}）",
+            v.retention, v.len_ratio
+        );
+
+        // 流式 < MISMATCH_MIN_STREAM_CHARS ⇒ 样本太少，accept（宁漏勿误杀）。
+        assert!(acc_vs_streaming("任意", "短").accept);
+        assert!(acc_vs_streaming("任意", "").accept);
+
+        // 406 验收：精解删掉口吃/语气词 ⇒ 天然更短（len_ratio 落在 [0.6,0.8)），但内容保留高
+        // ⇒ 0.6 门放行（0.8 门会把这正常纠错误拒）。
+        let v = acc_vs_streaming(
+            "周末天气好一起出去旅游看看有什么景点",
+            "周末天气好的话一起出去旅游呗看看有什么好玩的景点",
+        );
+        assert!(
+            v.accept && v.len_ratio < 0.8,
+            "更短但内容保留 ⇒ 应 accept（ret={:.2} len={:.2}）",
+            v.retention,
+            v.len_ratio
+        );
+
+        // 全角 / 标点 / 大小写不影响判定（流式 ≥6 字符，确实走到归一化比对而非 <6 短样本门）。
+        assert!(
+            acc_vs_streaming("ＡＢＣＤＥＦ，你好世界！", "abcdef你好世界").accept,
+            "全角+标点+大小写应归一后一致 ⇒ accept"
+        );
+        assert!(acc_vs_streaming("HELLO WORLD", "hello world").accept);
     }
 
     /// 测 #2 回显残余：词表末条单独残留（`维生素b12`）⇒ 触发重解（Echo）；

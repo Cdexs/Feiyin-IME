@@ -153,3 +153,15 @@
 - **Top5**：① `local_stream.rs:1447-1494` shadow 收尾在流式线程同步重解（本会话 7 次合计 2903ms、单次峰值 **1267.9ms**；`endpoint confirm` **2/2 used=main** 零净收益，**Gavin 明令保留 ⇒ 只报告**）；② 每 chunk 全文 `display_text`/`confirmed_text`/shadow_view 拼接 + `preview_display` 分配（`:1571-1580`）；③ 每帧 GDI 量宽 + D2D `CreateTextLayout` + 两次 Vec 分配（`main.rs:3755/5293/5356/3063`；浮层 16ms 循环 `main.rs:2419`）；④ hot-loop 只为日志的计时/计数未守卫（`:1099/1113-1118/1156/1196/1215/1229/1354/1474/1683`，违 DEC-077）；⑤ 流式 / 路B 精解各 `min(核,8)` 并发争用（`local_stream.rs:64` + `mod.rs:133`）。
 - **六类均结论**（B 类「已查无」）；**确定冗余** F-C-01/F-A-01/F-A-02、**需 Gavin 定** shadow（F-D-01）、**需实测** 线程数（F-F-01）。**已核正确**：audio pre-roll 诊断全守卫、`t_shadow`/DBG-380/382/277 已守卫、VAD 185.2ms/1541 chunks 可忽略、无 sleep 轮询。
 - **红线**：未改生产代码 / 未 `cargo build` / 未 commit / 未 push / 零凭证。
+
+## 2026-09-24 — coder-2 — FIX-ACC-MISMATCH-GUARD-406 ✅ 交付（同窗流式比对守卫 + 未闭合标签守卫）
+
+- **需求**（Gavin BUILD-398 端测 #1/#1+/#7）：精解漏整句 / 幻觉短句 / 吐未闭合标签 ⇒ 预览回缩 + 最终丢句。根因：`output_rate_ok` 只比字/秒；`strip_angle_tags` 只剥闭合标签。
+- **改动（仅 `src/main.rs` + `src/transcription/mod.rs`，平台中立）**：
+  - A `transcription/mod.rs:434-446` 常量 + `MismatchVerdict`；`:452` `normalize_for_mismatch`；`:470` `lcs_subseq_len`（**最长公共子序列**）；`:496` `pub(crate) acc_vs_streaming`。接入 `main.rs:8528-8554` `harvest_acc_window!`（精解非空且不通过 ⇒ 用同窗流式替换 + `[LocalRT-DBG-406]` warn）。
+  - B `strip_angle_tags`（`:574-625`）新增**未闭合标签**剥离（`<`+≥3 连续 ASCII 字母、名字 run 内无 `>`）；`a<b`/`3<5`/`<3块钱` 不误剥。
+- **校准（步骤 C）**：三例 reject（ret/len = 0.43/0.43、0.04/0.32、0.00/0.48）；正常纠错 accept（0.83/1.00、0.96/1.04、全角/大小写 1.00/1.00）；`reflow applied` **24** 条长度比代理 **21/24 ≥0.8**。🔴 历史 acc 串不落盘 ⇒ 字符串级 retention 不可还原（如实记录）。
+- **测试**：新增 `fix406_acc_vs_streaming_verdicts` / `fix406_harvest_acc_window_calls_acc_vs_streaming`；改写 `ts387_tag_boundaries`（未闭合标签契约变更）。
+- **验证**：`rustfmt --config skip_children=true`（我两文件）CLEAN；全仓 `cargo fmt --check` **EXIT 0**；`cargo check --all-targets` **0 error**、warnings **bin 92 / test 87** = 基线；全量 `cargo test --no-fail-fast` **0 failed**（bin **1597P/48I**）。
+- **未验证**：实机端测（三例是否不再回缩 / `[LocalRT-DBG-406]` 命中与 0 误拒）交 tester-1 / Gavin。
+- **红线**：未改 local_stream / patches / scripts（coder-1 405）；未 commit / 未 push / 未 build release / 零凭证。

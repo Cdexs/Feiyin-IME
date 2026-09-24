@@ -1,4 +1,11 @@
 
+### 2026-09-24 · FIX-ACC-MISMATCH-GUARD-406 交付（精解不得覆盖正确预览：同窗流式比对 + 未闭合标签）
+
+- 新增 `transcription::acc_vs_streaming`（LCS **子序列** 保留率 + 长度比；阈值 0.5/0.8；流式 <6 字符不判）+ `normalize_for_mismatch` + `lcs_subseq_len`；接入 `main.rs` `harvest_acc_window!`（精解非空且不通过 ⇒ 用同窗流式替换 + `[LocalRT-DBG-406]` warn，仅本地实时滑窗路B）。
+- `strip_angle_tags` 新增**未闭合标签**剥离（`<`+≥3 连续 ASCII 字母、名字 run 内无 `>`）；`a<b`/`3<5`/`<3块钱` 不误剥。
+- **校准**：三例 reject（0.43/0.43、0.04/0.32、0.00/0.48）；正常纠错 accept（0.83/1.00、0.96/1.04、全角/大小写 1.00/1.00）；`reflow applied` 24 条长度比代理 21/24≥0.8；🔴 历史 acc 串不落盘 ⇒ 字符串 retention 不可还原。
+- 验证：`rustfmt --skip_children`（两文件）CLEAN；全仓 `cargo fmt --check` EXIT 0；`check --all-targets` 0 error、warnings 92/87=基线；全量 `cargo test --no-fail-fast` **0 failed**（bin **1597P/48I**）。未改动 local_stream/patches/scripts；未出包。
+
 ### 2026-09-24 · SPEAKER-VERIFY-408A 交付（声纹模块，独立，未接入管线）
 
 - 新增 `src/transcription/speaker.rs`（平台中立）：加载/embed、自动注册（≥12s/≥3 段 + 离群剔除）、漂移 EMA、保守判定（<2s / ja / 未就绪 全保留；score<0.45 才剔除）。

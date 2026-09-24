@@ -8522,7 +8522,45 @@ fn spawn_worker_thread(
                                                         .get(seq)
                                                         .map(|s| s.as_str())
                                                         .unwrap_or("");
-                                                    let text = window_text_with_fallback(&decoded, fb);
+                                                    // FIX-ACC-MISMATCH-GUARD-406：精解非空时先与**同窗流式文本**
+                                                    // 比对内容保留度；不通过 ⇒ 用流式替换精解（防精解漏整句 /
+                                                    // 幻觉导致预览回缩与最终丢句）。🔴 仅本地实时滑窗路B。
+                                                    let verdict =
+                                                        transcription::acc_vs_streaming(&decoded, fb);
+                                                    // 406 验收补：Debug 档下**每窗**打一行 verdict + 双方原文
+                                                    // （各截前 80 字），供端测校准阈值 —— 此前缺的正是 acc 字符串不落盘。
+                                                    if log::log_enabled!(log::Level::Debug) {
+                                                        let trunc =
+                                                            |s: &str| -> String { s.chars().take(80).collect() };
+                                                        log::debug!(
+                                                            "[LocalRT-DBG-406] verdict window #{}: retention={:.2} len_ratio={:.2} accept={} acc_chars={} stream_chars={} acc=\"{}\" stream=\"{}\"",
+                                                            seq,
+                                                            verdict.retention,
+                                                            verdict.len_ratio,
+                                                            verdict.accept,
+                                                            decoded.chars().count(),
+                                                            fb.chars().count(),
+                                                            trunc(&decoded),
+                                                            trunc(fb)
+                                                        );
+                                                    }
+                                                    let from_streaming =
+                                                        !decoded.is_empty() && !verdict.accept;
+                                                    if from_streaming {
+                                                        log::warn!(
+                                                            "[LocalRT-DBG-406] window #{} mismatch: retention={:.2} len_ratio={:.2} acc_chars={} stream_chars={} ⇒ keep streaming",
+                                                            seq,
+                                                            verdict.retention,
+                                                            verdict.len_ratio,
+                                                            decoded.chars().count(),
+                                                            fb.chars().count()
+                                                        );
+                                                    }
+                                                    let text = if from_streaming {
+                                                        fb.to_string()
+                                                    } else {
+                                                        window_text_with_fallback(&decoded, fb)
+                                                    };
                                                     if decoded.is_empty() && !text.is_empty() {
                                                         log::warn!(
                                                             "[LocalRT-DBG-386] window #{} fallback to streaming text ({} chars)",
@@ -11187,6 +11225,30 @@ fn drive_acc_windows<A, R>(
                 Err(_) => break,
             },
         }
+    }
+}
+
+/// FIX-ACC-MISMATCH-GUARD-406：滑窗精解结果与同窗流式比对守卫的源码护栏。
+#[cfg(test)]
+mod fix406_tests {
+    /// 源码护栏：`harvest_acc_window!` 宏体内必须调用 `acc_vs_streaming`（406 主判据）。
+    #[test]
+    fn fix406_harvest_acc_window_calls_acc_vs_streaming() {
+        let src = include_str!("main.rs");
+        let body = src
+            .split("macro_rules! harvest_acc_window")
+            .nth(1)
+            .expect("harvest_acc_window 锚点缺失");
+        // 截到下一个 `macro_rules!`（若首段即全部则到末尾）。
+        let body = body.split("macro_rules!").next().unwrap();
+        assert!(
+            body.contains("acc_vs_streaming("),
+            "406：harvest_acc_window! 内必须调用 acc_vs_streaming"
+        );
+        assert!(
+            body.contains("from_streaming"),
+            "406：harvest_acc_window! 内必须按 406 判定用流式替换精解"
+        );
     }
 }
 

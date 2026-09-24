@@ -2324,3 +2324,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | `transcription/mod.rs` `build_ctx_system`：裸词表 `a,b,c` → **`Technical terms: a, b, c.`**（前缀 `Technical terms: ` + `, ` 连接词条 + 英文句点；空词表仍不注入） | 注入格式变化（DEC-084）；前缀自动计入 `estimate_inject_tokens` 预算 | ✅ 平台中立纯逻辑，macOS 同继承。🔴 macOS 若另有注入串组装点，必须**逐字符对齐**该格式（`Technical terms: ` / `, ` / `.`） |
 | `transcription/mod.rs` 新增 `strip_technical_terms_echo`（前缀回显剥离；护栏：前缀后须有 ≥1 真词条）+ 抽取 `find_best_terms_run` 供 374/398 共用 | 带前缀的注入回显被整段剥掉、走 `apply_acc_disposition` 的 Echo ⇒ 不带注入重解同一路径；374 `strip_terms_echo` 逻辑不变 | ✅ 平台中立，macOS 同继承；**未改任何 `pub` 签名** |
 | **macOS 侧需要做什么** | | ① 本地实时恢复注入（若曾按 DEC-083 去掉）；② 注入格式逐字符对齐 `Technical terms: a, b, c.`；③ 无新增依赖 / env / 平台 API，无需改构建脚本 |
+
+## FIX-ACC-MISMATCH-GUARD-406（2026-09-24，coder-2）· 精解结果不得覆盖正确的预览（同窗流式比对）+ 未闭合标签守卫 —— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `transcription/mod.rs` 新增 `acc_vs_streaming(acc, streaming) -> MismatchVerdict`（LCS **子序列** 保留率 + 长度比；阈值 `0.5 / 0.8`，流式 <6 字符不判）；`lcs_subseq_len` / `normalize_for_mismatch`（全角→半角、去空白标点、ASCII 小写） | 精解与同窗流式文本的「内容保留度」可量化判定（此前 `output_rate_ok` 只看字/秒） | ✅ 平台中立纯函数，无 `cfg`，macOS 同继承；`pub(crate)`，未改 pub 签名 |
+| `main.rs` `harvest_acc_window!`：精解非空且 `acc_vs_streaming(...)` 不通过 ⇒ 用**同窗流式文本**替换精解（防漏整句/幻觉导致预览回缩 + 最终丢句）；打 `[LocalRT-DBG-406]` warn | 精解不再无条件覆盖已正确的预览；只作用于本地实时滑窗路B | ✅ 平台中立；🔴 macOS 若另有本地实时滑窗结果回灌点，须同接此守卫（判据与阈值同上） |
+| `transcription/mod.rs` `strip_angle_tags`：新增**未闭合标签**剥离（`<` + ≥3 连续 ASCII 字母、标签名 run 内无 `>`，如 `<translation`/`<asr_text`）；`a<b`/`3<5`/`<3块钱` 不误剥 | 模型吐出的未闭合标签不再漏进正文 | ✅ 平台中立纯逻辑，macOS 同继承 |
+| **macOS 侧需要做什么** | | ① 无新增依赖 / env / 平台 API，无需改构建脚本；② 若 macOS 有独立的实时滑窗回灌路径，按同判据接入 `acc_vs_streaming`；③ `strip_angle_tags` 行为变更自动继承 |
