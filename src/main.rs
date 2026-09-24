@@ -8865,6 +8865,29 @@ fn spawn_worker_thread(
                                                                 false,
                                                             );
                                                             pending_slice = plan.pending;
+                                                            // FIX-SPLIT-SLICE-STREAMING-411 埋点（Debug 守卫，仅多片）：
+                                                            // 各片按样本占比分配到的流式字数 + 样本数。
+                                                            if n_new >= 2
+                                                                && log::log_enabled!(log::Level::Debug)
+                                                            {
+                                                                let chars: Vec<usize> = (0..n_new)
+                                                                    .map(|k| {
+                                                                        slice_streaming_text(
+                                                                            k,
+                                                                            &seg_streaming,
+                                                                            &new_lens,
+                                                                        )
+                                                                        .chars()
+                                                                        .count()
+                                                                    })
+                                                                    .collect();
+                                                                log::debug!(
+                                                                    "[LocalRT-DBG-411] split streaming: slices={} chars={:?} samples={:?}",
+                                                                    n_new,
+                                                                    chars,
+                                                                    new_lens
+                                                                );
+                                                            }
                                                             let mut wi = 0usize;
                                                             let mut cum_new = 0usize;
                                                             for (k, s) in sub_segs.into_iter().enumerate() {
@@ -8876,8 +8899,13 @@ fn spawn_worker_thread(
                                                                         .and_then(|v| v.get(k))
                                                                         .cloned(),
                                                                 );
-                                                                recent_streaming
-                                                                    .push(slice_streaming_text(k, &seg_streaming));
+                                                                recent_streaming.push(
+                                                                    slice_streaming_text(
+                                                                        k,
+                                                                        &seg_streaming,
+                                                                        &new_lens,
+                                                                    ),
+                                                                );
                                                                 total_slices += 1;
                                                                 while recent_slices.len()
                                                                     > transcription::WINDOW_MAX_SLICES
@@ -11905,16 +11933,34 @@ mod preview_harvest_380_tests {
 
 /// FIX-TAIL-WINDOW-AND-FALLBACK-386（C）：窗口文本选择 —— 解码文本为空（含解码 Err）⇒ 用**本窗流式文本**
 /// 兜底；流式也为空才保持空。防结尾整段丢失（本次 seq7 `<location>` 丢 40+ 字）。纯函数，可单测。
-/// 386 主控验收补：一次派发切成多片时，该派发的流式文本只记在**第一片**上，其余片记空。
-/// `seg_streaming` 是整次派发的流式文本；若每片都存一份，含同次派发两片的窗口（如收尾
-/// `[大片, 短尾]` 合并窗）解码失败时，兜底文本会把整段拼两遍 ⇒ 最终文本重复。
-/// 只记第一片不丢内容：第一片所在的窗口已带上整段文本。
-fn slice_streaming_text(k: usize, seg_streaming: &str) -> String {
-    if k == 0 {
-        seg_streaming.to_string()
-    } else {
-        String::new()
+/// FIX-SPLIT-SLICE-STREAMING-411：一次派发切成多片时，整段流式文本按**各片样本占比**分配到各片。
+///
+/// 旧实现（386 补）「`k == 0` 返回整段、其余返回空」会让**只含第一片**的窗口拿到整段文本 ⇒
+/// 406 比对基准含窗口外内容 ⇒ 正确精解被误拒（BUILD-409 16:44Z：窗#0 retention 0.38 误拒），
+/// 且整段被兜底回灌 ⇒ 最终文本**重复**。
+///
+/// 分配口径（与 `tail_streaming_baseline` 一致）：
+/// - 边界 `boundary(cum) = round(total_chars × cum / total_samples)`，对**同一累计样本单一定义**
+///   ⇒ 各片 `end == 下一片 start`、首 0、末 `total_chars` ⇒ 各片字数**求和恒等于总字数**（不丢不重）；
+/// - **按 char 切**（`chars().skip/take`），禁字节下标（`LOCALRT-CHARBOUNDARY-344`）。
+///
+/// `slice_samples` = 本次派发各片的**样本数**（时间序），`k` 为片下标；总样本 0 / 空文本 / k 越界 ⇒ 空串。
+fn slice_streaming_text(k: usize, seg_streaming: &str, slice_samples: &[usize]) -> String {
+    let total: u64 = slice_samples.iter().map(|s| *s as u64).sum();
+    let total_chars = seg_streaming.chars().count();
+    if total == 0 || total_chars == 0 || k >= slice_samples.len() {
+        return String::new();
     }
+    let cum_before: u64 = slice_samples[..k].iter().map(|s| *s as u64).sum();
+    let cum_after = cum_before + slice_samples[k] as u64;
+    let boundary =
+        |cum: u64| -> usize { ((total_chars as u64 * cum + total / 2) / total) as usize };
+    let (start, end) = (boundary(cum_before), boundary(cum_after));
+    seg_streaming
+        .chars()
+        .skip(start)
+        .take(end - start)
+        .collect()
 }
 
 fn window_text_with_fallback(decoded: &str, streaming: &str) -> String {
@@ -12463,11 +12509,19 @@ mod slice_streaming_386_review_tests {
     /// 同次派发切 2 片、收尾合并窗 [大片, 短尾] 解码失败 ⇒ 兜底文本只出现一次（不重复）。
     #[test]
     fn merged_window_fallback_not_duplicated() {
-        let seg = "如果有机会开这个会我们都会好好把握";
-        let per_slice: Vec<String> = (0..2).map(|k| slice_streaming_text(k, seg)).collect();
+        let seg = "如果有机会开这个会我们都会好好把握"; // 17 chars
+        let per_slice: Vec<String> = (0..2)
+            .map(|k| slice_streaming_text(k, seg, &[100, 100]))
+            .collect();
         let window_fallback = per_slice.concat();
-        assert_eq!(window_text_with_fallback("", &window_fallback), seg);
-        assert_eq!(slice_streaming_text(1, seg), "");
+        assert_eq!(
+            window_text_with_fallback("", &window_fallback),
+            seg,
+            "两片拼接正好等于整段（不重不漏，411 按样本占比）"
+        );
+        assert_eq!(per_slice[0].chars().count(), 9);
+        assert_eq!(per_slice[1].chars().count(), 8);
+        assert!(!per_slice[1].is_empty(), "非首片不再为空（411）");
     }
 }
 
@@ -19061,5 +19115,178 @@ mod testsync410_tests {
             ),
             "冷却到点 ⇒ 可重试"
         );
+    }
+}
+
+// =====================================================================
+// FIX-SPLIT-SLICE-STREAMING-411：多片切分流式文本按占比分配（含影响面 4 处消费）
+// =====================================================================
+#[cfg(test)]
+mod fix411_tests {
+    use super::{slice_streaming_text, tail_streaming_baseline};
+    use crate::transcription::{acc_vs_streaming, OrderedReflow};
+
+    const STREAM80: &str = "啊周周末周周周末有空吗可一起出来见个面吧我们可以一起喝杯咖啡一起出去吃个饭也可以起出来求政这样大家说来透透气这样挺好也不用整天待在家里面是不是我觉得这样可以你可";
+
+    fn per_slice(seg: &str, samples: &[usize]) -> Vec<String> {
+        (0..samples.len())
+            .map(|k| slice_streaming_text(k, seg, samples))
+            .collect()
+    }
+
+    /// 纯函数：各片字数求和 == 总字数（不丢不重）；1 片 == 整段；总样本 0 / k 越界 ⇒ 空；char 安全。
+    #[test]
+    fn ts411_split_property_sum_equals_total() {
+        // ASCII 精确：10 chars / 3 片等样本 ⇒ 边界 0,3,7,10。
+        let seg = "abcdefghij";
+        let s = [1usize, 1, 1];
+        let per = per_slice(seg, &s);
+        assert_eq!(per[0], "abc", "边界须单一定义、无缝");
+        assert_eq!(per[1], "defg");
+        assert_eq!(per[2], "hij");
+        assert_eq!(per.concat(), seg, "各片拼接 == 整段（不丢不重）");
+        assert_eq!(slice_streaming_text(0, seg, &[123]), seg, "1 片 ⇒ 整段");
+        assert_eq!(slice_streaming_text(0, seg, &[]), "", "总样本 0 ⇒ 空");
+        assert_eq!(slice_streaming_text(0, seg, &[0, 0]), "");
+        assert_eq!(slice_streaming_text(0, "", &[1, 1]), "", "空文本 ⇒ 空");
+        assert_eq!(slice_streaming_text(9, seg, &[1, 1]), "", "k 越界 ⇒ 空");
+        let multi = "a你😀b好👋c"; // 7 chars
+        let per = per_slice(multi, &[1, 1]);
+        assert_eq!(per.concat(), multi, "多字节按 char、不丢不重");
+        assert_eq!(per[0].chars().count() + per[1].chars().count(), 7);
+    }
+
+    /// 影响面①（常规窗 `recent_streaming[start..stop].concat()`）：切分后每窗基准 = **其覆盖片**的
+    /// 分配文本拼接 ⇒ 不撑大（旧逻辑首片含整段）也不缺字（旧逻辑后片为空）。
+    #[test]
+    fn ts411_regular_window_baseline_per_slice() {
+        let seg = STREAM80;
+        let samples = [160_000usize, 160_000, 61_600]; // 10s/10s/3.85s
+        let per = per_slice(seg, &samples);
+        let c0 = per[0].chars().count();
+        let c1 = per[1].chars().count();
+        assert_eq!(per[0], seg.chars().take(c0).collect::<String>());
+        assert_eq!(
+            format!("{}{}", per[0], per[1]),
+            seg.chars().take(c0 + c1).collect::<String>()
+        );
+        assert_eq!(
+            format!("{}{}{}", per[0], per[1], per[2]),
+            seg,
+            "全窗拼接 == 整段"
+        );
+        assert!(
+            !per[1].is_empty() && !per[2].is_empty(),
+            "非首片不得为空（旧逻辑缺陷）"
+        );
+        assert!(c0 < seg.chars().count(), "首片不得含整段（旧逻辑缺陷）");
+    }
+
+    /// 影响面②（末尾窗比对基准 `tail_streaming_baseline`）+ 真实数据：切分后窗#0（仅片0）基准 accept；
+    /// 整段基准仍误拒。
+    #[test]
+    fn ts411_real_data_window0_accept_and_tail_baseline() {
+        let acc0 =
+            "你周末这周周末有空吗？可以一起出来见个面吗？我们可以一起喝杯咖啡，一起出去吃个饭。";
+        let samples = [160_000usize, 160_000, 61_600];
+        let per = per_slice(STREAM80, &samples);
+        assert!(
+            !acc_vs_streaming(acc0, STREAM80).accept,
+            "整段基准应误拒（复现 BUILD-409）"
+        );
+        assert!(
+            acc_vs_streaming(acc0, &per[0]).accept,
+            "片0 基准应 accept（ret={:.2} len={:.2}）",
+            acc_vs_streaming(acc0, &per[0]).retention,
+            acc_vs_streaming(acc0, &per[0]).len_ratio
+        );
+        let b = tail_streaming_baseline(&per[1], samples[1], samples[1], &per[2]);
+        assert!(
+            b.starts_with(&per[1]) && b.ends_with(&per[2]),
+            "末尾窗基准 = 前片全 + pending 片"
+        );
+        assert!(!per[2].is_empty());
+    }
+
+    /// 影响面③（🔴 关键）：切分 + 末尾窗**被拒** ⇒ pending 兜底文本 = 该 pending 片的分配文本（非空）；
+    /// 经 OrderedReflow 回灌后最终文本**不重复不缺失**。（旧逻辑：非首片 recent_streaming 为空 ⇒ 兜底为空 ⇒ 丢字。）
+    #[test]
+    fn ts411_split_tail_reject_pending_fallback_nonempty_no_loss() {
+        let samples = [160_000usize, 160_000, 61_600];
+        let per = per_slice(STREAM80, &samples);
+        assert!(
+            !per[2].is_empty(),
+            "切分后 pending 片分配文本不得为空（旧逻辑缺陷）"
+        );
+        let tail_baseline = tail_streaming_baseline(&per[1], samples[1], samples[1], &per[2]);
+        assert!(
+            !acc_vs_streaming("完全无关的幻觉文本", &tail_baseline).accept,
+            "幻觉应拒"
+        );
+        let prev_punct = "你周末这周周末有空吗？可以一起出来见个面吗？";
+        let pending_punct = format!("{}。", per[2]);
+        let mut o = OrderedReflow::new();
+        let _ = o.push_window(0, 0, 2, vec![160_000, 160_000], prev_punct.to_string());
+        let _ = o.push_window(1, 2, 3, vec![61_600], pending_punct.clone());
+        let (committed, last) = o.finish();
+        let full = format!("{committed}{last}");
+        assert_eq!(
+            full,
+            format!("{prev_punct}{pending_punct}"),
+            "前片不重、pending 只能追加一次"
+        );
+        assert!(full.contains(per[2].trim()), "pending 片内容不得丢失");
+    }
+
+    /// 影响面③（被拒兜底、空文本）：pending 兜底文本为空时不得 panic、不产生孤立标点。
+    #[test]
+    fn ts411_pending_fallback_empty_text_no_panic() {
+        let mut o = OrderedReflow::new();
+        let _ = o.push_window(0, 0, 1, vec![100], "前文。".to_string());
+        let _ = o.push_window(1, 1, 2, vec![50], String::new());
+        let (c, l) = o.finish();
+        assert_eq!(format!("{c}{l}"), "前文。");
+    }
+
+    /// 影响面④ + partial_win_committed：344-G `hole_fill_decision` 生产区**无调用点**（保留可回挂）⇒
+    /// 411 不影响；`partial_win_committed` 只用样本/字数、不读流式文本 ⇒ 不受影响（源码护栏）。
+    #[test]
+    fn ts411_hole_fill_and_partial_win_unaffected_source_guard() {
+        // 注：main.rs 的 `#[cfg(test)]` 模块与生产代码**交错**，不能用 `split("#[cfg(test)]")` 取「生产区」
+        //（会把函数定义截掉）⇒ 改为**定位具体函数体**（该体自身不含测试）。
+        let src = include_str!("main.rs");
+        // 344-G：保留但已摘接线（`#[allow(dead_code)]` + 生产无调用点）。
+        assert!(
+            src.contains("#[allow(dead_code)]\nfn hole_fill_decision("),
+            "hole_fill_decision 应保留为 dead-code（344-G 摘接线）"
+        );
+        let i = src
+            .find("fn partial_win_committed(")
+            .expect("partial_win_committed 锚点缺失");
+        // 🔴 按 char 取（`src` 含中文，字节切片会落在多字节中间 panic）。
+        let body: String = src[i..].chars().take(900).collect();
+        assert!(
+            !body.contains("slice_streaming_text") && !body.contains("streaming"),
+            "partial_win_committed 不得依赖流式文本分配（389 预览边界不受 411 影响）"
+        );
+    }
+
+    /// 源码护栏：`slice_streaming_text` 不再有「k==0 返回整段、其余返回空」旧逻辑；生产调用传样本。
+    #[test]
+    fn ts411_no_k0_whole_legacy_source_guard() {
+        // 注：main.rs 测试模块与生产代码**交错**，不能按 `#[cfg(test)]` 前缀切分（会截掉函数定义）
+        // ⇒ 按**函数体**定位。
+        let src = include_str!("main.rs");
+        let i = src
+            .find("fn slice_streaming_text(")
+            .expect("slice_streaming_text 锚点缺失");
+        // 🔴 按 char 取（`src` 含中文，字节切片会落在多字节中间 panic）。
+        let body: String = src[i..].chars().take(700).collect();
+        assert!(body.contains("slice_samples"), "新实现须按各片样本数分配");
+        assert!(
+            !body.contains("if k == 0"),
+            "不得再有 `if k == 0` 整段旧逻辑"
+        );
+        assert!(src.contains("&new_lens"), "生产调用须传各片样本数 new_lens");
     }
 }

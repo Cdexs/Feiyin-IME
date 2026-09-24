@@ -8,6 +8,14 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-1 — SPEAKER-MERGE-SHORT-412 ✅ 阶段一交付（待主控验收）
+
+- **改动**（`src/transcription/speaker.rs`；`mod.rs` 仅 +1 源码锚点测试）：新增纯函数 `merge_speech_units` + `MERGE_GAP_SECS=0.5s`（**暂定，待端测校准**）+ `SpeechUnit`（语音时长不含间隔；退化零长区间保留为零长成员保一一对应）；`filter_ranges_by_voiceprint` 改**按单元**判定（单元 ≥2s 拼接全部成员语音算一次声纹、判定作用全成员；<2s `KeepShort`）；注册/漂移按单元 offer（**起点** ≥ `new_slice_from`，跨界单元保守不 offer）。
+- **7 条影响面逐条结论+测试**：① `kept` 仍原各段（剪静音喂 `f.kept`，388 不变）② kept/dropped 口径同改前 ③ 解码后重解用原 ranges+整窗音频 ④ 漂移上限仍 0.25（8s/100s 单元同位移）⑤ 跨界单元不 offer ⑥ 无就绪档逐位一致 ⑦ 缺模型合并未执行。
+- **测试**：`ts412_*` 9 + `mod.rs` 锚点 1 = **10P/1I**；`#[ignore]` 真模型单元 vs 2.4s 长段 **0.915**。同步更新 408B `ts408b_new_slice_from_contract_anchor` 锚点（**契约不变**）。
+- **验证**：`fmt --check` EXIT 0；`check --all-targets` 0 error、warnings 92/87=基线；全量 `cargo test` **1697P/0F/53I**。证据 `collab/evidence/412/`。
+- 红线：未碰 `main.rs` / 未 commit / 未 build release / 版本未动 / 零凭证。
+
 ## 2026-09-25 — coder-1 — FIX-TAIL-GUARD-410 ✅ 阶段一交付（待主控验收，只改 main.rs）
 
 - **① 比对基准只取前片后缀**：纯函数 `tail_streaming_baseline`（前片流式按样本占比取末尾相应**字符数**、char 切 + pending 流式）替代「整前片 + pending」⇒ 不再误拒正确精解。
@@ -254,3 +262,12 @@
 - **6 条**：真实数据比例基准 accept（整前片误拒）；幻觉/空拒；窗#0 带标点前片 → 末尾窗被拒 ⇒ 只追加加标点 pending、前片逐字不变；边界（suffix=0/≥prev/prev 空/prev_samples=0、比例四舍五入、多字节）；`run_punct_retries` 分类；`punct_cooldown_active` 冷却窗口。
 - **验证（白名单）**：`rustfmt --config skip_children=true src/main.rs` CLEAN；`cargo check --all-targets` **EXIT 0**、0 error、warnings **92/87** = 基线；sandbox 复刻 `acc_vs_streaming` + `tail_streaming_baseline` 验证 ①~④ 全分支 ✅。🔴 **未跑 `cargo test`**（阶段三禁止，首跑由 tester-1）。
 - **疑似生产缺陷：未发现**；**未改生产代码 / 未 commit / 未 push / 零凭证**。
+
+## 2026-09-25 — coder-2 — FIX-SPLIT-SLICE-STREAMING-411 ✅ 交付（多片切分流式按占比分配）
+
+- **缺陷**（BUILD-409 16:44Z）：23.85s 切 3 片 ⇒ `slice_streaming_text` 旧「k==0 整段 / 其余空」使窗#0 基准=整段 86 字（406 retention 0.38 误拒）⇒ 整段兜底回灌 ⇒ 最终文本重复；后片窗基准缺字；末尾窗 pending 兜底为空（410 潜在丢字）。
+- **改动（仅 `src/main.rs`）**：`slice_streaming_text(k, seg, &slice_samples)` 按样本占比分配（`round(total_chars×cum/total)` 单一定义 ⇒ 无缝、求和==总字数；char 切）；调用传 `&new_lens`；Debug 埋点 `[LocalRT-DBG-411]`。
+- **影响面**：常规窗 concat 基准逐片正确；末尾窗 `tail_streaming_baseline` 前后片非空；🔴 被拒 pending 兜底非空（旧为空⇒丢字）；344-G `hole_fill_decision` 生产无调用点 + `partial_win_committed` 不读流式 ⇒ 不受影响。
+- **测试**：新增 `fix411_tests` 7 条（含真实数据、切分+末尾窗被拒兜底非空、源码护栏）；更新 386 用例计数（17⇒9+8）。**验证**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` 0 error、warnings 92/87=基线；全量 `cargo test --no-fail-fast` **0 failed**（bin **1697P/52I**）。
+- **未验证**：实机端测（多片切分不再误拒/重复、`[LocalRT-DBG-411]` 埋点）交 tester-1/Gavin。
+- **红线**：未改 406/407/410/声纹；未加 config/env；未 commit / 未 push / 未 build release / 零凭证。
