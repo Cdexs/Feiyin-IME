@@ -8,6 +8,17 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-24 — coder-1 — LOCALRT-TAIL-WINDOW-407 ✅ 阶段一交付（待主控验收）
+
+- **触发（`local_stream.rs`）**：`LONG_SILENCE_TAIL_MS=1900` + 纯函数 `should_signal_long_silence` + 新回调 `on_long_silence(pcm_pos)`；读 `acc_silent_ms`，每段静默只发一次、恢复说话复位（L133/137/972/1070/1188/1558）。
+- **处理（`main.rs`）**：`enum AccInput{Slice,LongSilence(usize)}`；有 pending ⇒ 末尾窗（前片回溯 2s 找字缝 + pending，无字缝回落 2s 标 no_gap）→ 投解码 → 清 pending；无 pending 不动作。新增 `dispatch_tail_window!` + 纯函数 `tail_window_span`。
+- **对齐**：末尾窗交 `ordered.push_window`（span `(p-1,p+1)`），测试证明不重不漏；`ALIGN_MIN_OVERLAP_CHARS=8`（后缀 <8 字落宁重复兜底）。
+- **`vad.rs`（主控许可）**：`find_gap_cut` 提 `pub(crate)` + 拆内核；新增 `find_gap_cut_gap_only`；判据只一处。
+- **日志**：`[LocalRT-DBG-407] long silence 1900ms: pending=yes|no` / `tail window: … gap=found|no_gap …`（Debug 守卫）。
+- **测试**：`ts407_*` 2 + `tw407_*` 2 + 真模型 `poc_tailwindow_407`；更新 `counters_are_pushed_together`（2 处 push，强度不放宽）。`fmt` EXIT 0；`check --all-targets` 0 error/warnings 92/87=基线；全量 `cargo test` **1601P/0F/49I**。证据 `collab/evidence/407/`。
+- **R1（主控退回，只改 main.rs）**：固定回溯 2s 慢速下 <对齐门 8 ⇒ 接缝重复；改**按字速自适应** `max(2.0,(8+4)/rate)`（rate=本次产出率均值，冷启动 3.0 字/秒，封顶整前片）；日志加 `backtrack_secs`/`rate_cps`；补测试 `tw407_backtrack_...`（2/3/6 字/秒 ⇒ 12 字）。验证 `tail_window_407` 3P/0F、`check --all-targets` 0 error/warnings 92/87、`fmt --check` EXIT 0。
+- 红线：未改 1200ms 常规派发/常规滑窗/406 守卫/近场门；未 commit/未 build release/版本未动/零凭证。
+
 ## 2026-09-24 — coder-1 — SPEAKER-VERIFY-408A ✅ 阶段一交付（待主控验收）
 
 - **新增 `src/transcription/speaker.rs`**（平台中立，**未接入管线**）：`SpeakerVerifier::load/embed`、`cosine`、`Voiceprint`（自动注册 ≥12s/≥3 段 + 离群剔除 `cos<0.5`；漂移 EMA `α=min(secs/(total+secs),0.25)` 仅 `score≥0.75` 段）、`judge`/`SegVerdict`（`<2s`/`ja·未知`/未就绪 保留；`score<0.45` 才剔除）。
@@ -165,3 +176,11 @@
 - **验证**：`rustfmt --config skip_children=true`（我两文件）CLEAN；全仓 `cargo fmt --check` **EXIT 0**；`cargo check --all-targets` **0 error**、warnings **bin 92 / test 87** = 基线；全量 `cargo test --no-fail-fast` **0 failed**（bin **1597P/48I**）。
 - **未验证**：实机端测（三例是否不再回缩 / `[LocalRT-DBG-406]` 命中与 0 误拒）交 tester-1 / Gavin。
 - **红线**：未改 local_stream / patches / scripts（coder-1 405）；未 commit / 未 push / 未 build release / 零凭证。
+
+## 2026-09-24 — coder-2 — TEST-SYNC-408A ✅ 交付（阶段三 · 声纹模块非作者护栏 14 条）
+
+- **被测**：`SPEAKER-VERIFY-408A`（作者 coder-1，HEAD `190b105`）。按**设计契约**写，不照抄实现。
+- **范围**：`src/transcription/speaker.rs` **仅**追加 `#[cfg(test)] mod testsync408a_tests`（`:586-908`，+329/0）；生产代码零改动。
+- **14 条 / 契约 1~6**：判定顺序与边界；注册防污染 + 已知局限；漂移上限 + 低分逐位不变；存档往返与丢弃；跨用户不吸收；余弦边界。
+- **验证（白名单）**：`rustfmt --config skip_children=true src/transcription/speaker.rs` **CLEAN**；`cargo check --all-targets` **EXIT 0**、0 error、warnings **92/87** = 基线、speaker.rs 零 warning。🔴 **未跑 `cargo test`**（阶段三禁止，首跑由 tester-1）。
+- **未发现生产缺陷**；**未改生产代码 / 未 commit / 未 push / 零凭证**。

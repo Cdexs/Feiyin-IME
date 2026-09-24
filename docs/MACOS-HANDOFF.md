@@ -8,6 +8,18 @@
 
 ## 0 · 先读这份，再读那两份
 
+### 0.10 · LOCALRT-TAIL-WINDOW-407 1900ms 长静默自动末尾组窗（平台中立）（2026-09-24）
+
+- **文件域**：`src/transcription/local_stream.rs`、`src/transcription/vad.rs`（均**平台中立**，macOS 编译同一份）、
+  `src/main.rs`（Windows/macOS 共用主程序）。
+- **行为变更**：本地实时流式在**静默 ≥1900ms 且无新语音**时发一次「长静默」信号（新回调 `on_long_silence`），
+  main 侧据此把「遗留的待覆盖片 + 前一片后缀」组「末尾窗」并即时解码回灌，**不再依赖松键停止刷新末句**。
+  与既有 1200ms 常规派发并存。`vad::find_gap_cut` 提为 `pub(crate)` 并新增 `find_gap_cut_gap_only`
+  （同一套字缝判据只一处）。
+- ✅ **对 macOS 无接口契约破坏**：`transcribe_streaming_local` **新增一个回调参数**（`on_long_silence`）⇒
+  任何调用点须补该参数；模块其余 pub 签名不变。macOS 编译同一份源码即继承；无需额外同步。
+- **行为**：只影响本地实时流式的**组窗时机**（新增末尾窗路径）；识别/切句/注入/翻译/其它管线不变。
+
 ### 0.9 · SPEAKER-VERIFY-408A 声纹模块（新增平台中立模块 + 新模型文件）（2026-09-24）
 
 - **新增文件**：`src/transcription/speaker.rs`（**平台中立**，macOS 编译同一份）——声纹提取（sherpa-onnx

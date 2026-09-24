@@ -1,4 +1,11 @@
 
+### 2026-09-24 · LOCALRT-TAIL-WINDOW-407 交付（1900ms 长静默自动末尾组窗）
+
+- `local_stream.rs`：长静默（≥1900ms）只发一次 `on_long_silence(pcm_pos)`，恢复说话复位；`LONG_SILENCE_TAIL_MS`+纯函数。
+- `main.rs`：`AccInput::LongSilence`；有 pending ⇒ 末尾窗（前片回溯 2s 找字缝 + pending，无字缝回落 2s）→ 立即投解码回灌，无需停止键；新增 `dispatch_tail_window!`+`tail_window_span`。
+- `vad.rs`（主控许可）：`find_gap_cut` 提权+拆内核，新增 `find_gap_cut_gap_only`（判据只一处）。
+- 测试 `ts407_*`/`tw407_*`/真模型；全量 `cargo test` 1601P/0F/49I。未出包。
+
 ### 2026-09-24 · FIX-ACC-MISMATCH-GUARD-406 交付（精解不得覆盖正确预览：同窗流式比对 + 未闭合标签）
 
 - 新增 `transcription::acc_vs_streaming`（LCS **子序列** 保留率 + 长度比；阈值 0.5/0.8；流式 <6 字符不判）+ `normalize_for_mismatch` + `lcs_subseq_len`；接入 `main.rs` `harvest_acc_window!`（精解非空且不通过 ⇒ 用同窗流式替换 + `[LocalRT-DBG-406]` warn，仅本地实时滑窗路B）。

@@ -651,13 +651,47 @@ pub fn plan_gap_cuts(audio: &[f32], start: usize, end: usize) -> Vec<(usize, usi
 /// - 基线中位数取自 `[piece_start, piece_start + 10s)` 的完整帧（相对阈值）；
 /// - 优先返回**最早**的达标帧（RMS ≤ ratio×中位数 且 ≤ 左右相邻帧）中心；
 /// - 无达标帧 ⇒ 返回 RMS **最低**帧的中心（并列取最早）。
-fn find_gap_cut(
+///
+/// LOCALRT-TAIL-WINDOW-407：提为 `pub(crate)` —— 尾部组窗要在前一片「末尾回溯 ≥2s」区间里找字缝
+/// （`local_stream::find_tail_cut` 复用本函数，**同一套字缝判据只保留这一处**，不另写一份）。
+pub(crate) fn find_gap_cut(
     audio: &[f32],
     piece_start: usize,
     lower: usize,
     upper: usize,
     frame: usize,
 ) -> usize {
+    match find_gap_cut_impl(audio, piece_start, lower, upper, frame) {
+        // 取最早达标字缝帧
+        (Some(gap), _) => gap,
+        // 无达标帧 ⇒ 取区间内最低 RMS 帧（381 原语义）
+        (None, Some(lowest)) => lowest,
+        // [lower,upper] 不足一个完整帧 ⇒ 保守用 lower，保证严格推进
+        (None, None) => lower,
+    }
+}
+
+/// LOCALRT-TAIL-WINDOW-407：与 [`find_gap_cut`] **同一套字缝判据**，但**只返回真字缝**
+/// （`None` = 区间内无达标帧）。供尾部组窗用「找不到字缝 ⇒ 回落指定下界（回溯 2s）」的语义
+/// （与 `find_gap_cut` 的「无字缝取最低 RMS 帧」不同）。判据只此一处，不另写一份。
+pub(crate) fn find_gap_cut_gap_only(
+    audio: &[f32],
+    piece_start: usize,
+    lower: usize,
+    upper: usize,
+    frame: usize,
+) -> Option<usize> {
+    find_gap_cut_impl(audio, piece_start, lower, upper, frame).0
+}
+
+/// 381/407 共用的字缝搜索内核：返回 `(最早达标字缝帧中心, 区间内最低 RMS 帧中心)`。
+fn find_gap_cut_impl(
+    audio: &[f32],
+    piece_start: usize,
+    lower: usize,
+    upper: usize,
+    frame: usize,
+) -> (Option<usize>, Option<usize>) {
     let total = audio.len();
     let search_start = (SLIDING_CUT_SEARCH_START_SECS * 16000.0) as usize;
 
@@ -685,8 +719,9 @@ fn find_gap_cut(
     };
     let last_j = upper.saturating_sub(piece_start + half) / frame;
 
-    let mut best_j: Option<usize> = None;
-    let mut best_rms = f32::INFINITY;
+    let mut gap_center: Option<usize> = None;
+    let mut lowest_center: Option<usize> = None;
+    let mut lowest_rms = f32::INFINITY;
     let mut j = first_j;
     while j <= last_j {
         let fstart = piece_start + j * frame;
@@ -703,21 +738,17 @@ fn find_gap_cut(
         let next = frame_rms(audio, piece_start + (j + 1) * frame, frame, total);
         let local_min = rms <= prev && rms <= next;
         if rms <= threshold && local_min {
-            best_j = Some(j);
+            gap_center = Some(piece_start + j * frame + half);
             break; // 取最早达标帧
         }
-        if rms < best_rms {
-            best_rms = rms;
-            best_j = Some(j);
+        if rms < lowest_rms {
+            lowest_rms = rms;
+            lowest_center = Some(piece_start + j * frame + half);
         }
         j += 1;
     }
 
-    match best_j {
-        Some(j) => piece_start + j * frame + half,
-        // 兜底（[lower,upper] 不足一个完整帧时）——保守用 lower，保证严格推进
-        None => lower,
-    }
+    (gap_center, lowest_center)
 }
 
 /// 单帧 RMS（越界按可用长度算；空帧返回 0）。

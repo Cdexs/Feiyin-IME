@@ -8369,7 +8369,7 @@ fn spawn_worker_thread(
                         // 325：载荷加 `committed_len`（派发当刻浮层显示字符数，回灌边界）。
                         // 344-G：载荷加 `seg_streaming`（本片流式文本，失败片的填补来源）。
                         // VAD-393（A3）：载荷再加班 `seg_ranges`（各片内语音区间，见 `AccSliceMsg`）。
-                        let (acc_tx, acc_rx) = crossbeam_channel::bounded::<AccSliceMsg>(64);
+                        let (acc_tx, acc_rx) = crossbeam_channel::bounded::<AccInput>(64);
                         let acc_script = config.audio.chinese_script;
                         // 325：acc worker 逐片回灌预览所用的事件发送端（代际在 worker 内捕获）。
                         let acc_event_tx = event_tx.clone();
@@ -8697,18 +8697,62 @@ fn spawn_worker_thread(
                                                     window_seq += 1;
                                                 }};
                                             }
+                                            // LOCALRT-TAIL-WINDOW-407：派发「末尾窗」——与 `dispatch_window!`
+                                            // 同套记账，但**音频由调用方给定**（前片 `[cut..]` + pending，非整片），
+                                            // `span` 仍以 (p-1,p+1) 交对齐；VAD 区间传 `None`（前片取部分 ⇒ 片内区间
+                                            // 偏移不再成立）⇒ 该窗回退自跑 VAD。`win_samples` = [前片后缀, pending]。
+                                            macro_rules! dispatch_tail_window {
+                                                ($gs:expr, $ge:expr, $audio:expr, $samples:expr, $streaming:expr) => {{
+                                                    let gs: usize = $gs;
+                                                    let ge: usize = $ge;
+                                                    let audio: Vec<f32> = $audio;
+                                                    let samples: Vec<usize> = $samples;
+                                                    let streaming: String = $streaming;
+                                                    if !transcription::path_b_budget_ok(audio.len(), terms) {
+                                                        log::warn!(
+                                                            "[LocalRT-TAIL-WINDOW-407] tail window over KV budget: {:.1}s audio_tok={} inject_tok={} max_total_len={}",
+                                                            audio.len() as f32 / 16000.0,
+                                                            transcription::expected_audio_tokens(audio.len()),
+                                                            transcription::estimate_inject_tokens(terms),
+                                                            transcription::PATH_B_MAX_TOTAL_LEN
+                                                        );
+                                                    }
+                                                    let avg_snapshot = transcription::acc_avg_chars_per_sec(
+                                                        rate_sum_chars,
+                                                        rate_sum_secs,
+                                                        rate_windows,
+                                                    );
+                                                    let streaming_nonempty = !streaming.trim().is_empty();
+                                                    let _ = task_tx.send((
+                                                        window_seq,
+                                                        last_dispatch_idx,
+                                                        audio,
+                                                        avg_snapshot,
+                                                        std::time::Instant::now(),
+                                                        None, // 407：部分前片 ⇒ 传 None 回退自跑 VAD
+                                                        streaming_nonempty,
+                                                    ));
+                                                    window_spans.push((gs, ge));
+                                                    window_samples.push(samples);
+                                                    window_streaming_texts.push(streaming);
+                                                    window_committed_lens.push(last_committed_len);
+                                                    window_boundary_usable.push(true);
+                                                    window_seq += 1;
+                                                }};
+                                            }
                                             // FIX-PREVIEW-HARVEST-380（A）：select 循环 —— 新切片与解码结果
                                             // **任一先到即处理**，不再等下一个切片（Gavin 现象①：停顿即停刷）。
                                             let mut step =
-                                                |ev: AccWindowStep<AccSliceMsg, AccDecodeResult>| {
+                                                |ev: AccWindowStep<AccInput, AccDecodeResult>| {
                                                     match ev {
-                                                        AccWindowStep::Slice((
-                                                            idx,
-                                                            committed_len,
-                                                            sub_segs,
-                                                            seg_streaming,
-                                                            seg_ranges,
-                                                        )) => {
+                                                        AccWindowStep::Slice(input) => match input {
+                                                            AccInput::Slice((
+                                                                idx,
+                                                                committed_len,
+                                                                sub_segs,
+                                                                seg_streaming,
+                                                                seg_ranges,
+                                                            )) => {
                                                             // 386（A）：按「中途末片延后 / 下次派发纳入 / 收尾合并」规则组窗
                                                             //（规则与不变量见 `plan_windows`）。382 旧行为「每片立刻组窗」会把
                                                             // 11.27s ⇒ 10.15s+1.12s 的尾片单独成窗 ⇒ 模型念词表。
@@ -8782,7 +8826,66 @@ fn spawn_worker_thread(
                                                                 }
                                                                 // 否则：本片是**延后的待覆盖片**（本批末片），本轮不组窗。
                                                             }
-                                                        }
+                                                            }
+                                                            // LOCALRT-TAIL-WINDOW-407：长静默（≥1900ms 无新语音）
+                                                            // ⇒ 有 pending 就组「末尾窗」（前片后缀 + pending），
+                                                            // 无需停止键；无 pending 什么都不做（1200ms 已处理）。
+                                                            AccInput::LongSilence(pcm_pos) => {
+                                                                let has_pending = pending_slice.is_some();
+                                                                if log::log_enabled!(log::Level::Debug) {
+                                                                    log::debug!(
+                                                                        "[LocalRT-DBG-407] long silence 1900ms: pending={}",
+                                                                        if has_pending { "yes" } else { "no" }
+                                                                    );
+                                                                }
+                                                                if let Some(p) = pending_slice {
+                                                                    let prev_base = total_slices - recent_slices.len();
+                                                                    // 407 纯决策：有 pending 且有前片 ⇒ 末尾窗 span (p-1,p+1)、前片下标 i。
+                                                                    if let Some((gs, ge, i)) =
+                                                                        tail_window_span(Some(p), prev_base, recent_slices.len())
+                                                                    {
+                                                                        let prev_slice = &recent_slices[i - 1];
+                                                                        // 407 R1：回溯时长按本次字速自适应（冷启动 3.0 字/秒），再封顶为整个前片。
+                                                                        let rate_cps = transcription::acc_avg_chars_per_sec(
+                                                                            rate_sum_chars,
+                                                                            rate_sum_secs,
+                                                                            rate_windows,
+                                                                        )
+                                                                        .unwrap_or(3.0);
+                                                                        let backtrack_secs = tail_backtrack_secs(rate_cps);
+                                                                        let back = ((backtrack_secs * 16000.0) as usize)
+                                                                            .min(prev_slice.len())
+                                                                            .max(1);
+                                                                        let (cut, gap_found) =
+                                                                            transcription::local_stream::find_tail_cut(prev_slice, back);
+                                                                        let mut audio: Vec<f32> =
+                                                                            prev_slice[cut..].to_vec();
+                                                                        audio.extend_from_slice(&recent_slices[i]);
+                                                                        let samples =
+                                                                            vec![prev_slice.len() - cut, recent_slices[i].len()];
+                                                                        let mut streaming =
+                                                                            recent_streaming[i - 1].clone();
+                                                                        streaming.push_str(&recent_streaming[i]);
+                                                                        if log::log_enabled!(log::Level::Debug) {
+                                                                            let gap = if gap_found { "found" } else { "no_gap" };
+                                                                            log::debug!(
+                                                                                "[LocalRT-DBG-407] tail window: pending={} prev_cut_secs={:.2} backtrack_secs={:.2} rate_cps={:.2} gap={} window_secs={:.2} pcm_pos={}",
+                                                                                p,
+                                                                                cut as f32 / 16000.0,
+                                                                                backtrack_secs,
+                                                                                rate_cps,
+                                                                                gap,
+                                                                                audio.len() as f32 / 16000.0,
+                                                                                pcm_pos
+                                                                            );
+                                                                        }
+                                                                        dispatch_tail_window!(gs, ge, audio, samples, streaming);
+                                                                    }
+                                                                    // pending 已被末尾窗覆盖 ⇒ 清空；停止键收尾不再重复处理。
+                                                                    pending_slice = None;
+                                                                }
+                                                            }
+                                                        },
                                                         AccWindowStep::Result(res) => {
                                                             harvest_acc_window!(res)
                                                         }
@@ -8850,6 +8953,8 @@ fn spawn_worker_thread(
                                 // （Rust 2021 disjoint capture 若只取 .0 字段会退化为
                                 // 捕获裸引用，绕过 unsafe impl Send）。
                                 let recognizer = send_recognizer.into_inner();
+                                // LOCALRT-TAIL-WINDOW-407：长静默信号与切片共用同一 acc 通道（另一份发送端）。
+                                let acc_tx_long = acc_tx.clone();
                                 transcription::local_stream::transcribe_streaming_local(
                                     chunk_rx,
                                     recognizer,
@@ -8868,13 +8973,17 @@ fn spawn_worker_thread(
                                     acc_cfg,
                                     |idx, committed_len, segs, seg_streaming, seg_ranges| {
                                         // 派发片送 accuracy worker（worker 不存在 ⇒ send 失败，忽略）。
-                                        let _ = acc_tx.send((
+                                        let _ = acc_tx.send(AccInput::Slice((
                                             idx,
                                             committed_len,
                                             segs,
                                             seg_streaming,
                                             seg_ranges,
-                                        ));
+                                        )));
+                                    },
+                                    // LOCALRT-TAIL-WINDOW-407：长静默（≥1900ms）信号 ⇒ 走同一 acc 通道。
+                                    |pcm_pos| {
+                                        let _ = acc_tx_long.send(AccInput::LongSilence(pcm_pos));
                                     },
                                     |seg_index, committed_len| {
                                         // 337：自适应边界冻结（a 文本停止增长 / b 有声恢复 / c 硬上限）。
@@ -11162,6 +11271,17 @@ type AccSliceMsg = (
     Option<Vec<Vec<(usize, usize)>>>,
 );
 
+/// LOCALRT-TAIL-WINDOW-407：滑窗线程的**输入**（新切片 / 长静默信号）。
+///
+/// 380 起 `acc_tx` 只传切片元组；407 追加「长静默」信号（本地流式在静默 ≥1900ms 且无新语音时
+/// **只发一次**），main 侧据此把「待覆盖片 + 前一片后缀」组末尾窗并即时回灌，**无需按停止键**。
+/// `drive_acc_windows` 仍是泛型（380/406 守卫与单测不受影响）。
+enum AccInput {
+    Slice(AccSliceMsg),
+    /// 长静默信号，载荷 = 当刻 `pcm` 样本位置（仅日志/诊断用）。
+    LongSilence(usize),
+}
+
 /// FIX-PREVIEW-HARVEST-380（A）：滑窗解码结果载荷
 /// `(window_seq, dispatch_idx, 解码结果, 解码耗时 ms, 解码完成时刻)`。
 /// 382（3C）：末元 `Instant` 随 `PreviewReflow.decode_done_at` 带到消费端，测「解完 → 浮层重画」。
@@ -11515,6 +11635,43 @@ struct WindowPlan {
     pending: Option<usize>,
 }
 
+/// LOCALRT-TAIL-WINDOW-407：长静默末尾窗的**纯决策**。
+///
+/// `pending` = 待覆盖片全局下标；`prev_base` = `recent_slices[0]` 的全局下标；`recent_len` = 片数。
+/// 有 pending 且换算到 `recent` 后**存在前片**（下标 `i > 0`）⇒ 返回
+/// `(窗口 span 起点, 终点, 前片下标 i)` = `(p-1, p+1, i)`；否则 `None`（无 pending / 该片是首片）。
+fn tail_window_span(
+    pending: Option<usize>,
+    prev_base: usize,
+    recent_len: usize,
+) -> Option<(usize, usize, usize)> {
+    let p = pending?;
+    let i = p.checked_sub(prev_base)?;
+    if i > 0 && i < recent_len {
+        Some((p - 1, p + 1, i))
+    } else {
+        None
+    }
+}
+
+/// LOCALRT-TAIL-WINDOW-407（R1）：末尾窗的**回溯时长**。
+///
+/// R1 起因（主控）：固定回溯 2s 在**慢速语音**下只覆盖 6~9 字，**低于对齐质量门
+/// `ALIGN_MIN_OVERLAP_CHARS`（8）** ⇒ 对齐直接 fail ⇒ 末尾窗接缝**重复字**（历史反复出现的接缝重复）。
+/// 改为按**本次录音已有字速**（[`transcription::acc_avg_chars_per_sec`] 的运行均值；冷启动无均值按
+/// **3.0 字/秒**）估算出「至少 `ALIGN_MIN_OVERLAP_CHARS + 4` 个字」所需时长：
+/// `max(2.0, (ALIGN_MIN_OVERLAP_CHARS + 4) / rate)`。Gavin 口径是「不短于 2s」，更长符合要求。
+/// 调用方再把时长换算为样本并**封顶为整个前片**（前片不够取整片）。
+fn tail_backtrack_secs(rate_cps: f32) -> f32 {
+    let need = (transcription::ALIGN_MIN_OVERLAP_CHARS + 4) as f32; // 8 + 4 = 12 字
+    let rate = if rate_cps.is_finite() && rate_cps > 0.0 {
+        rate_cps
+    } else {
+        3.0
+    };
+    (need / rate).max(2.0)
+}
+
 /// FIX-TAIL-WINDOW-AND-FALLBACK-386：组窗纯函数（在 382 基础上加「延后尾片 / 收尾合并」）。
 ///
 /// 输入：`prev_durs` 已派发片时长（时间序，调用方保证已按 `WINDOW_MAX_SLICES` 裁剪）；
@@ -11584,6 +11741,67 @@ fn plan_windows(
     WindowPlan {
         windows: out,
         pending: pend,
+    }
+}
+
+/// LOCALRT-TAIL-WINDOW-407：末尾组窗纯决策 + 与已提交文本对齐合并不重不漏。
+#[cfg(test)]
+mod tail_window_407_tests {
+    use super::{tail_backtrack_secs, tail_window_span};
+
+    /// R1：慢速（2 字/秒）与快速（6 字/秒）下，回溯时长估算字数都 ≥ 对齐门+4（12），
+    /// 且都不短于 2s（Gavin 口径）；冷启动无均值按 3.0 字/秒。
+    #[test]
+    fn tw407_backtrack_covers_align_min_chars_at_slow_and_fast_rates() {
+        let need = (crate::transcription::ALIGN_MIN_OVERLAP_CHARS + 4) as f32;
+        for rate in [2.0f32, 3.0, 6.0] {
+            let secs = tail_backtrack_secs(rate);
+            assert!(secs >= 2.0, "回溯不短于 2s：rate={rate} secs={secs}");
+            assert!(
+                secs * rate >= need,
+                "回溯估算字数须 ≥{need}（对齐门+余量）：rate={rate} est={}",
+                secs * rate
+            );
+        }
+        // 慢速 2 字/秒 ⇒ 6s（12 字）；快速 6 字/秒 ⇒ 2s（12 字），均 > 对齐门 8。
+        assert_eq!(tail_backtrack_secs(2.0), 6.0);
+        assert_eq!(tail_backtrack_secs(6.0), 2.0);
+        // 冷启动 / 非法字速 ⇒ 按 3.0 字/秒。
+        assert_eq!(tail_backtrack_secs(3.0), 4.0);
+        assert_eq!(tail_backtrack_secs(f32::NAN), tail_backtrack_secs(3.0));
+        assert_eq!(tail_backtrack_secs(0.0), tail_backtrack_secs(3.0));
+    }
+
+    #[test]
+    fn tw407_span_requires_prev() {
+        // 无 pending ⇒ 无动作。
+        assert_eq!(tail_window_span(None, 0, 3), None);
+        // 有 pending 且有前片 ⇒ (p-1, p+1, i)。
+        assert_eq!(tail_window_span(Some(4), 1, 5), Some((3, 5, 3)));
+        // pending 是首片（i==0）⇒ None（无可回溯前片）。
+        assert_eq!(tail_window_span(Some(1), 1, 5), None);
+        // pending 越界 ⇒ None。
+        assert_eq!(tail_window_span(Some(9), 1, 5), None);
+    }
+
+    /// 末尾窗（前片后缀 + pending）与已提交的「前片全文」对齐合并 ⇒ 不重字、不漏字。
+    ///
+    /// 注：`ALIGN_MIN_OVERLAP_CHARS = 8` ⇒ 构造的重叠后缀须 ≥8 字（否则对齐层直接 fail，落「宁重复不丢字」兜底）。
+    #[test]
+    fn tw407_alignment_no_dup_no_loss() {
+        let mut ordered = crate::transcription::OrderedReflow::new();
+        let prev = "今天我们去了一个很大的博物馆";
+        // 窗0（常规）：覆盖片 [0,1)，文本 = 片0 全文。
+        let _ = ordered.push_window(0, 0, 1, vec![130], prev.to_string());
+        // 窗1（末尾窗）：span [0,2)，samples [前片后缀, 片1]，文本 = 前片后缀（8 字）+ 片1。
+        let tail = "一个很大的博物馆那里展出了很多古代文物";
+        let _ = ordered.push_window(1, 0, 2, vec![80, 110], tail.to_string());
+        let (committed, last) = ordered.finish();
+        assert_eq!(
+            format!("{committed}{last}"),
+            "今天我们去了一个很大的博物馆那里展出了很多古代文物",
+            "末尾窗须与已提交对齐合并：不重字、不漏字"
+        );
     }
 }
 
@@ -17879,8 +18097,9 @@ mod testsync371_window_counter_guard_tests {
     /// 设计 C：两表必须**同批 push**（区间 ↔ 样本数一一对应，否则期望比例算错）。
     ///
     /// 🔴 386：组窗改走 `dispatch_window!` 宏后，`window_spans.push((gs, ge));` 与
-    /// `window_samples.push(` 仍**同处成对**（相邻两行）。**只更新锚点定位方式**（不再要求
-    /// `window_spans` 单独占一行），断言强度不放宽：两 push 各**恰 1 处**且**必须成对相邻**。
+    /// `window_samples.push(` 仍**同处成对**（相邻两行）。
+    /// 🔴 407：新增 `dispatch_tail_window!`（末尾窗）后 push 有 **2 处**（常规窗 / 末尾窗）。
+    /// **断言强度不放宽**：两表 push **数量必须一致**，且**每一处** samples 都紧邻其 spans。
     #[test]
     fn counters_are_pushed_together() {
         let p = prod_lines();
@@ -17896,13 +18115,19 @@ mod testsync371_window_counter_guard_tests {
             .filter(|(_, l)| l.contains("window_samples.push("))
             .map(|(i, _)| i)
             .collect();
-        assert_eq!(spans.len(), 1, "window_spans 的 push 调用点应恰 1 处");
-        assert_eq!(samples.len(), 1, "window_samples 的 push 调用点应恰 1 处");
         assert_eq!(
-            samples[0],
-            spans[0] + 1,
-            "window_samples.push 必须紧随 window_spans.push（同批成对，防一一对应错位）"
+            spans.len(),
+            samples.len(),
+            "window_spans / window_samples 的 push 调用点数量必须一致"
         );
+        assert!(!spans.is_empty(), "至少应有 1 处组窗 push");
+        for (i, s) in samples.iter().enumerate() {
+            assert_eq!(
+                *s,
+                spans[i] + 1,
+                "第 {i} 处 window_samples.push 必须紧随 window_spans.push（同批成对，防一一对应错位）"
+            );
+        }
     }
 }
 

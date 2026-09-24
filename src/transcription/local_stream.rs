@@ -124,6 +124,41 @@ const ACC_DISPATCH_SILENCE_MS_DEFAULT: f32 = 1200.0;
 /// 分块处理 ⇒ **一个整块内无任何新输出**即可判「滞后补字已吐完」。
 const ACC_BOUNDARY_STABLE_MS: f32 = 500.0;
 
+/// LOCALRT-TAIL-WINDOW-407：长静默（不依赖停止键）触发「末尾组窗」的阈值。
+///
+/// Gavin 2026-09-24 原话：「不用等用户按停止键，我们等到 **1900ms 无输入**自动触发末尾组窗，
+/// 将末尾一片和前一片（2s+）组窗来解码」「现在有两种静默间隔触发组窗：常规 1200ms 触发常规派发，
+/// 长时静默 1900ms 触发末尾组窗机制」。二者并存：1200ms 已把片派出，1900ms 再让 main 侧据
+/// 遗留的**待覆盖片**组「末尾窗」并即时回灌。仅本地实时流式路B 使用。
+pub(crate) const LONG_SILENCE_TAIL_MS: f32 = 1900.0;
+
+/// LOCALRT-TAIL-WINDOW-407：是否发「长静默」信号 —— 启用 acc 派发、静默 ≥1900ms、且本段静默未发过。
+/// 纯函数，便于单测「只发一次 / 1200~1900 不发 / 恢复说话后复位」。
+fn should_signal_long_silence(enabled: bool, acc_silent_ms: f32, done_for_pause: bool) -> bool {
+    enabled && acc_silent_ms >= LONG_SILENCE_TAIL_MS && !done_for_pause
+}
+
+/// LOCALRT-TAIL-WINDOW-407：在前一片末尾**回溯 ≥2s** 的区间内找「字缝」切点，供末尾组窗
+/// 取「前片后缀」。**复用 381 的字缝判据**（[`vad::find_gap_cut_gap_only`]，同一套判据只保留一处，
+/// 主控要求不在 main 另写一份）。返回 `(片内样本切点, 是否找到真字缝)`：
+/// - `prev` 不足 `back_samples` ⇒ `(0, false)`（整片）；
+/// - 有字缝 ⇒ `(最早达标帧中心, true)`；无 ⇒ `(len-back, false)`（回落回溯 2s，Gavin 口径）。
+pub(crate) fn find_tail_cut(prev: &[f32], back_samples: usize) -> (usize, bool) {
+    if prev.len() <= back_samples {
+        return (0, false);
+    }
+    let lower = prev.len() - back_samples;
+    let frame = super::vad::GAP_FRAME_SAMPLES;
+    let upper = prev.len().saturating_sub(frame / 2);
+    if upper <= lower {
+        return (lower, false);
+    }
+    match super::vad::find_gap_cut_gap_only(prev, 0, lower, upper, frame) {
+        Some(cut) => (cut, true),
+        None => (lower, false),
+    }
+}
+
 /// LOCALRT-SEAM-337：定界硬上限（兜底，防无限等）。
 /// 依据：`seam337_lookahead_probe` 25 点实测最大 `last_grow_after_P = 1840ms` + 余量。
 const ACC_BOUNDARY_CAP_MS: f32 = 2000.0;
@@ -908,6 +943,9 @@ impl SegmentGate {
 ///   子段列表通常 1 个；`FIX-SLICE-CUT-AT-GAP-381` 起单片剩余 >10s 即按**字缝**切
 ///   （从 10s 起找能量低谷、最晚 12s 兜底，`vad::plan_gap_cuts`），切点严格相接、不丢内容。
 ///   🔴 只在 `acc_cfg.enabled` 且静默 ≥ `acc_cfg.silence_ms`(1200ms) 且未上 latch 时被调用
+/// - `on_long_silence`：LOCALRT-TAIL-WINDOW-407 长静默回调，传当刻 `pcm` 样本位置；
+///   `acc_cfg.enabled` 且静默 ≥ [`LONG_SILENCE_TAIL_MS`]（1900ms）且本段静默未发过时**只发一次**，
+///   恢复说话后复位。供 main 侧组「末尾窗」（不依赖停止键）。
 ///
 /// # 返回
 /// `(final_preview, pcm)`：
@@ -928,6 +966,10 @@ pub fn transcribe_streaming_local(
     // VAD-393（A2）：新增第 5 参 `slice_ranges`：**片内坐标**的语音区间（VAD 时间线映射而来）；
     // VAD 不可用 ⇒ `None`（调用方回退自行跑 VAD）。
     mut on_segment: impl FnMut(usize, usize, Vec<Vec<f32>>, String, Option<Vec<Vec<(usize, usize)>>>),
+    // LOCALRT-TAIL-WINDOW-407：长静默（同一段静默 ≥1900ms 且此后无新语音）**只发一次**信号，
+    // 携带当刻 `pcm` 样本位置。main 侧据此把「待覆盖片 + 前一片」组末尾窗即时解码回灌，
+    // 无需用户按停止键（Gavin 2026-09-24）。恢复说话即复位、可再次触发。
+    mut on_long_silence: impl FnMut(usize),
     // LOCALRT-SEAM-337（自适应定界，主控定案）：派发点 P 后边界在**三者最先发生**时冻结：
     //   a. 文本停止增长（静默中连续 `ACC_BOUNDARY_STABLE_MS` 无新增）⇒ `Some(当前显示长度)`，允许回灌；
     //   b. 有声 chunk 恢复 ⇒ `None`，该 seg **不回灌**（保持纯流式；宁可这轮不修，也不吐残留重复）；
@@ -1024,6 +1066,8 @@ pub fn transcribe_streaming_local(
     let mut acc_dispatched_end: usize = 0;
     // 本轮静默是否已派发过（latch 写法）。
     let mut acc_done_for_pause = false;
+    // LOCALRT-TAIL-WINDOW-407：本轮静默是否已发过「长静默末尾组窗」信号（同一停顿只发一次）。
+    let mut long_silence_done_for_pause = false;
     // 本次未派发区间内是否出现过语音（尾片「有语音才派」的判据）。
     let mut acc_pending_has_speech = false;
     // 已派发片数（= 下一片的 seg_index）。
@@ -1140,6 +1184,8 @@ pub fn transcribe_streaming_local(
             // 392 主控验收补（续）：done 复位写在计时清零**之前**，使 346 护栏（归零紧邻 silent_ms、
             // 其后 3 行内出现 speech_since_last_reset）与 392 护栏（done 复位在 else 分支）同时成立。
             acc_done_for_pause = false;
+            // 407：恢复说话 ⇒ 复位长静默 latch（同一停顿只发一次；下次停顿可再发）。
+            long_silence_done_for_pause = false;
             silent_ms = 0.0;
             acc_silent_ms = 0.0;
         }
@@ -1504,6 +1550,21 @@ pub fn transcribe_streaming_local(
             acc_dispatched_end = pcm.len();
             acc_pending_has_speech = false;
             acc_done_for_pause = true;
+        }
+
+        // LOCALRT-TAIL-WINDOW-407：长静默（≥1900ms 无新语音）**只发一次**「末尾组窗」信号。
+        // 与 1200ms 常规派发并存：1200 已把片派出；1900 让 main 侧据遗留的待覆盖片组末尾窗并即时回灌
+        //（Gavin：不必等停止键）。恢复说话时由上方 else 分支复位 latch。
+        if should_signal_long_silence(acc_cfg.enabled, acc_silent_ms, long_silence_done_for_pause) {
+            long_silence_done_for_pause = true;
+            if log::log_enabled!(log::Level::Debug) {
+                log::debug!(
+                    "[LocalRT-DBG-407] long silence {:.0}ms: signal tail compose (pcm_pos={})",
+                    acc_silent_ms,
+                    pcm.len()
+                );
+            }
+            on_long_silence(pcm.len());
         }
 
         // PUNCT-PREVIEW-SEMANTIC-349：显示刷新 —— 打点**只认静默 ≥1200ms**（读显示层 `silent_ms`）
@@ -2119,12 +2180,121 @@ mod timeline393_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_dispatch_segment, chunk_has_speech, endpoint_action, local_stream_num_threads,
-        localrt_vad_seed_ms, punct_cache_reuse, seed_usable, segment_streaming_text,
-        should_dispatch_acc, should_dispatch_tail, should_repunctuate_preview, DisplayCache,
-        EndpointAction, EnergySmoother, SegmentGate, SegmentPeakLevel,
-        LOCALRT_VAD_MIN_SILENCE_SECS, SAMPLE_RATE,
+        build_dispatch_segment, chunk_has_speech, endpoint_action, find_tail_cut,
+        local_stream_num_threads, localrt_vad_seed_ms, punct_cache_reuse, seed_usable,
+        segment_streaming_text, should_dispatch_acc, should_dispatch_tail,
+        should_repunctuate_preview, should_signal_long_silence, DisplayCache, EndpointAction,
+        EnergySmoother, SegmentGate, SegmentPeakLevel, LOCALRT_VAD_MIN_SILENCE_SECS,
+        LONG_SILENCE_TAIL_MS, SAMPLE_RATE,
     };
+
+    // ========================================================================
+    // LOCALRT-TAIL-WINDOW-407：长静默触发（只发一次 / 恢复复位）+ 尾部字缝切点
+    // ========================================================================
+
+    /// 407 触发：<1900 不发；≥1900 且未发过 ⇒ 发；已发过 ⇒ 不再发；未启用 ⇒ 不发。
+    #[test]
+    fn ts407_long_silence_triggers_once_then_resets() {
+        assert!(!should_signal_long_silence(true, 1200.0, false));
+        assert!(!should_signal_long_silence(true, 1899.0, false));
+        assert!(should_signal_long_silence(true, 1900.0, false));
+        assert!(should_signal_long_silence(true, 5000.0, false));
+        // 同一停顿已发过 ⇒ 不再发（只发一次）。
+        assert!(!should_signal_long_silence(true, 5000.0, true));
+        // 未启用 ⇒ 不发。
+        assert!(!should_signal_long_silence(false, 5000.0, false));
+        assert_eq!(LONG_SILENCE_TAIL_MS, 1900.0);
+    }
+
+    /// 407 字缝：有字缝 ⇒ (中心, true)（落在回溯区间内的静音处）；无字缝 ⇒ (len-back, false)；
+    /// 前片不足 back ⇒ (0, false)（整片）。
+    #[test]
+    fn ts407_find_tail_cut_gap_and_fallback() {
+        let rate = SAMPLE_RATE as usize;
+        // 前片 6s：4.0~4.2s 静音（字缝），其余 440Hz 正弦（幅度 0.5）。
+        let mut prev = vec![0f32; 6 * rate];
+        for (i, s) in prev.iter_mut().enumerate() {
+            let t = i as f32 / rate as f32;
+            *s = if (4.0..=4.2).contains(&t) {
+                0.0
+            } else {
+                (t * 440.0 * std::f32::consts::TAU).sin() * 0.5
+            };
+        }
+        let (cut, found) = find_tail_cut(&prev, 2 * rate);
+        assert!(found, "有静音字缝应判 found");
+        let cut_secs = cut as f32 / rate as f32;
+        assert!(
+            (4.0..4.25).contains(&cut_secs),
+            "切点应落在 4.0~4.2s 字缝附近，实测 {cut_secs:.3}s"
+        );
+
+        // 全程有声（无字缝）⇒ 回落 len-back、found=false。
+        let uniform: Vec<f32> = (0..6 * rate)
+            .map(|i| (i as f32 * 0.13).sin() * 0.5)
+            .collect();
+        assert_eq!(
+            find_tail_cut(&uniform, 2 * rate),
+            (4 * rate, false),
+            "无字缝 ⇒ 回落 len-back"
+        );
+
+        // 前片不足 back ⇒ 整片（0）、found=false。
+        assert_eq!(find_tail_cut(&vec![0.3f32; rate], 2 * rate), (0, false));
+    }
+
+    /// 407 真模型：真实连续语音（>10s）+ 3s 尾静默 ⇒ 长静默信号应在**静默满 ~1900ms** 时触发一次
+    /// （不依赖停止键）；打印触发时刻（wall）与静默起点（音频时间）。
+    /// 运行：`cargo test --bin feiyin-ime -- --ignored --nocapture poc_tailwindow_407`
+    #[test]
+    #[ignore = "requires streaming model; cargo test --bin feiyin-ime -- --ignored --nocapture poc_tailwindow_407"]
+    fn poc_tailwindow_407() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let Ok(recognizer) = super::create_local_stream_recognizer(&root.join("models")) else {
+            eprintln!("skip: 流式 paraformer 模型不在位");
+            return;
+        };
+        let wav = root.join("collab/research/audio-real-gavin/processed/full.wav");
+        let Some(w) = sherpa_onnx::Wave::read(wav.to_str().unwrap()) else {
+            eprintln!("skip: full.wav 不在位");
+            return;
+        };
+        // 12s 真实语音 + 3s 尾静默。
+        let mut audio: Vec<f32> = w.samples().iter().copied().take(12 * 16_000).collect();
+        let speech_secs = audio.len() as f32 / 16_000.0;
+        audio.extend(std::iter::repeat(0f32).take(3 * 16_000));
+        let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
+        let feeder = std::thread::spawn(move || {
+            for c in audio.chunks(1_600) {
+                let _ = tx.send(c.to_vec());
+            }
+        });
+        let t0 = std::time::Instant::now();
+        let mut signal_ms: Option<f64> = None;
+        let _ = super::transcribe_streaming_local(
+            rx,
+            &recognizer,
+            None,
+            None,
+            0.01,
+            "",
+            |_text, _words| {},
+            super::AccDispatchConfig::new(),
+            |_a, _b, _c, _d, _e| {},
+            |_pcm_pos| {
+                if signal_ms.is_none() {
+                    signal_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
+                }
+            },
+            |_a, _b| {},
+        );
+        feeder.join().ok();
+        println!(
+            "\n[407] 语音 {speech_secs:.1}s + 尾静默 3s ⇒ 长静默信号于喂入后 {:.0}ms（音频时间≈静默起点+1900ms）",
+            signal_ms.unwrap_or(f64::NAN)
+        );
+        assert!(signal_ms.is_some(), "长静默信号必须触发一次");
+    }
     use std::time::Duration;
 
     /// LOCALRT-REFLOW-HOLE-344-G：片段流式文本按**字符**切片，绝不字节切片（中文安全、不 panic）。
