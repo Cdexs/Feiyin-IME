@@ -1504,7 +1504,10 @@ mod testsync408b_guard_tests {
     /// 契约 6/4：`partition_ranges` 划分 keep/drop（判定数组缺位 ⇒ 保守保留）。
     #[test]
     fn ts408b_partition_ranges_conservative() {
-        let ranges = [(0usize, 32_000usize), (32_000, 64_000), (64_000, 96_000)];
+        // 区间长度按 `SAMPLE_RATE` 换算，**不硬编码样本数**（32000 样本 = 2.0s @16k）。
+        let sec = super::SAMPLE_RATE as usize;
+        // 三段各 2s。
+        let ranges = [(0usize, 2 * sec), (2 * sec, 4 * sec), (4 * sec, 6 * sec)];
         let (kept, kept_secs, dropped) = partition_ranges(
             &ranges,
             &[
@@ -1513,13 +1516,21 @@ mod testsync408b_guard_tests {
                 SegVerdict::DropNonUser(0.1),
             ],
         );
-        assert_eq!(kept, vec![(0, 32_000), (32_000, 64_000)]);
-        assert!((kept_secs - 2.0).abs() < 1e-6 && (dropped - 1.0).abs() < 1e-6);
+        assert_eq!(kept, vec![(0, 2 * sec), (2 * sec, 4 * sec)]);
+        // 保留 2 段 = 4.0s；剔除 1 段 = 2.0s。
+        assert!(
+            (kept_secs - 4.0).abs() < 1e-6,
+            "kept_secs 应 4.0，实测 {kept_secs}"
+        );
+        assert!(
+            (dropped - 2.0).abs() < 1e-6,
+            "dropped 应 2.0，实测 {dropped}"
+        );
         // 判定数组缺位 ⇒ 缺位区间按 KeepShort 保守保留。
         let (kept2, kept2_secs, dropped2) =
             partition_ranges(&ranges, &[SegVerdict::DropNonUser(0.1)]);
         assert_eq!(kept2.len(), 2, "缺位区间必须保留");
-        assert!((kept2_secs - 2.0).abs() < 1e-6 && (dropped2 - 1.0).abs() < 1e-6);
+        assert!((kept2_secs - 4.0).abs() < 1e-6 && (dropped2 - 2.0).abs() < 1e-6);
     }
 
     /// 契约 9：新语种候选「对所有就绪档最高分 <0.3 ⇒ 不收」；≥0.3 ⇒ 可注册；lang 空/None ⇒ 不注册。
