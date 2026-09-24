@@ -8,6 +8,16 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-24 — coder-1 — POC-SPEAKER-VERIFY-404 ✅ 交付（PoC，待主控验收）
+
+- **性质**：只新增 `#[cfg(test)]` PoC 模块 + 调研文档，**未改任何生产逻辑**。
+- **模型**（6 个，sha256 校验通过）：CAM++ zh-cn 27MB / ERes2NetV2 68MB / ERes2Net-large 110.7MB / WeSpeaker ResNet34-cn 25.3MB / ResNet293 109MB / NeMo TitaNet-large 96.7MB。
+- **协议**（满足「不是只为我定制」）：8 名说话人（Gavin+外部 7）**每人轮流当使用人**、其余为背景；池化全局阈值 + 逐人 FAR/FRR + 最差。
+- **结果**：≥2s 池化 EER **CAM++ 0.26%（最优）**、其余中文 0.53%、ResNet293 2.51%（整位使用者被拒）；1-2s ERes2NetV2 3.07%；**<1s 全不可用**。CAM++ 最快（3s ~40ms）。**高置信剔除阈值 0.55~0.65 → 背景剔除 ~96~99%**、使用者误拒≈0；叠加 score 0.82→0.42（不剔除）。
+- **接入设计**：只做高置信剔除 + 延迟到最终注入前（不撤回预览）；最短音频 ≥2s。
+- 结论 `collab/research/speaker-verify-404.md`；证据 `collab/evidence/404/`。🔴 缺口：无「本人+旁边人同时说」实录，建议 Gavin 补录。清理 439MB scratch 模型。
+- 红线：未 commit / 未构建 / 版本号未动 / 零凭证。
+
 ## 2026-09-24 — coder-1 — RELEASE-ISS-FIX-401 ✅ 阶段一交付（待主控验收）
 
 - **性质**：只改两份 `.iss`（逐字相同），未改 Rust/Cargo/tauri.conf，未构建、未编安装包。

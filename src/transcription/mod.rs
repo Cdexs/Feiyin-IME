@@ -15,6 +15,9 @@ mod vad;
 // FIX-SLICE-CUT-AT-GAP-381：§4/§5 实测 PoC（纯 `#[cfg(test)]`，无 lib target 故不能放 src/bin|tests）
 #[cfg(test)]
 mod poc_slice_cut_381;
+// POC-SPEAKER-VERIFY-404：声纹判别模型选型实测（纯 `#[cfg(test)]`，不改生产逻辑）
+#[cfg(test)]
+mod poc_speaker_verify_404;
 // SLIDING-WINDOW-367：路A 逐片解码摘接线后，`join_segment_texts` 等 re-export 暂无人用；
 // **保留**（可回挂），故局部 allow。
 #[allow(unused_imports)]
