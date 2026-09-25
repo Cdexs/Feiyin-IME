@@ -2376,3 +2376,308 @@ mod testsync412_guard_tests {
         }
     }
 }
+
+// =====================================================================
+// DIAG-SHORT-VOICEPRINT-432：1~2s 短句声纹能否区分本人 / 旁人（只读诊断，不改生产）
+//   运行：cargo test --bin feiyin-ime -- --ignored --nocapture diag432
+//   参考：target/release/voiceprint.bin（已注册 Gavin 声纹，**只读**）
+// =====================================================================
+#[cfg(test)]
+mod diag432_tests {
+    use super::{SpeakerVerifier, Voiceprint};
+    use std::path::{Path, PathBuf};
+
+    const SR: usize = 16000;
+
+    fn manifest() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn read_wav(p: &Path) -> Vec<f32> {
+        sherpa_onnx::Wave::read(p.to_str().expect("utf8 path"))
+            .expect("read wav")
+            .samples()
+            .to_vec()
+    }
+
+    #[test]
+    #[ignore = "diag432: cargo test --bin feiyin-ime -- --ignored --nocapture diag432"]
+    fn diag432_short_voiceprint_scores() {
+        let ver = SpeakerVerifier::load(&manifest().join("models")).expect("CAM++ 模型缺失");
+        let vp = Voiceprint::load(&manifest().join("target/release/voiceprint.bin"));
+        eprintln!(
+            "[DIAG432] ref any_ready={} enrolled_secs={:.1}",
+            vp.has_any_ready(),
+            vp.total_ready_secs()
+        );
+        let g = manifest().join("collab/evidence/gavin-sessions");
+        let score = |wav: &[f32], start_s: f32, secs: f32| -> Option<(f32, f32)> {
+            let s = (start_s * SR as f32) as usize;
+            let n = (secs * SR as f32) as usize;
+            if n == 0 || s + n > wav.len() {
+                return None;
+            }
+            let seg = &wav[s..s + n];
+            let rms = (seg.iter().map(|x| x * x).sum::<f32>() / n as f32).sqrt();
+            let emb = ver.embed(seg)?;
+            vp.max_score_ready(&emb).map(|sc| (sc, rms))
+        };
+        let lens = [0.5f32, 0.7, 1.0, 1.5, 1.8, 2.0];
+        // 本人：Gavin 照稿/自述录音。
+        for f in [
+            "session-20260925-175022.wav",
+            "session-20260925-175535.wav",
+            "session-20260925-173634.wav",
+            "session-20260925-211203.wav",
+        ] {
+            let wav = read_wav(&g.join(f));
+            let dur = wav.len() as f32 / SR as f32;
+            for &l in &lens {
+                for k in 0..10 {
+                    let start = (dur * (k as f32 + 1.0) / 12.0).min((dur - l).max(0.0));
+                    if let Some((s, r)) = score(&wav, start, l) {
+                        eprintln!("[DIAG432] OWN file={f} secs={l:.2} rms={r:.4} score={s:.4}");
+                    }
+                }
+            }
+        }
+        // 旁人：150350（他人音频）整体。
+        {
+            let f = "session-20260925-150350.wav";
+            let wav = read_wav(&g.join(f));
+            let dur = wav.len() as f32 / SR as f32;
+            for &l in &lens {
+                for k in 0..10 {
+                    let start = (dur * (k as f32 + 1.0) / 12.0).min((dur - l).max(0.0));
+                    if let Some((s, r)) = score(&wav, start, l) {
+                        eprintln!("[DIAG432] OTHER file={f} secs={l:.2} rms={r:.4} score={s:.4}");
+                    }
+                }
+            }
+        }
+        // 具体旁人短句（211641 窗#2 range 8.45-10.05s=1.60s；绝对位置按 win#1 pcm 388790 估算 ~32.7s）。
+        {
+            let wav = read_wav(&g.join("session-20260925-211641.wav"));
+            for (start, l) in [(32.70f32, 1.60f32), (32.90, 1.40), (33.10, 1.00)] {
+                if let Some((s, r)) = score(&wav, start, l) {
+                    eprintln!("[DIAG432] OTHER file=211641-w2-range start={start} secs={l:.2} rms={r:.4} score={s:.4}");
+                }
+            }
+        }
+    }
+}
+
+// =====================================================================
+// DIAG-SHORT-VOICEPRINT-432 R1：多说话人验证（AISHELL-1 6 人，轮流当使用人）
+//   运行：cargo test --bin feiyin-ime -- --ignored --nocapture diag432r1
+//   语料：models/speaker-432-scratch/train/S0002..S0007（AISHELL-1，Apache-2.0，只读临时）
+// =====================================================================
+#[cfg(test)]
+mod diag432r1_tests {
+    use super::{SpeakerVerifier, Voiceprint};
+    use std::path::{Path, PathBuf};
+
+    const SR: usize = 16000;
+
+    fn manifest() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn read_wav(p: &Path) -> Vec<f32> {
+        sherpa_onnx::Wave::read(p.to_str().unwrap())
+            .expect("wav")
+            .samples()
+            .to_vec()
+    }
+
+    fn list_wavs(dir: &Path) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "wav").unwrap_or(false))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    #[ignore = "diag432r1: cargo test --bin feiyin-ime -- --ignored --nocapture diag432r1"]
+    fn diag432r1_multispeaker() {
+        let root = manifest().join("models/speaker-432-scratch/train");
+        let spk = ["S0002", "S0003", "S0004", "S0005", "S0006", "S0007"];
+        let ver = SpeakerVerifier::load(&manifest().join("models")).expect("CAM++ 模型缺失");
+
+        let mut enroll: Vec<Vec<(f32, Vec<f32>)>> = vec![Vec::new(); spk.len()];
+        let mut tests: Vec<(usize, f32, Vec<f32>)> = Vec::new();
+        for (si, name) in spk.iter().enumerate() {
+            for (i, f) in list_wavs(&root.join(name)).iter().enumerate() {
+                let wav = read_wav(f);
+                let d = wav.len() as f32 / SR as f32;
+                if i < 8 {
+                    if d >= 2.0 {
+                        let take = ((d.min(5.0)) * SR as f32) as usize;
+                        if let Some(e) = ver.embed(&wav[..take.min(wav.len())]) {
+                            enroll[si].push((take as f32 / SR as f32, e));
+                        }
+                    }
+                    continue;
+                }
+                if i >= 8 + 20 {
+                    break;
+                }
+                for l in [1.0f32, 1.5, 1.8] {
+                    if d + 1e-3 >= l {
+                        let n = (l * SR as f32) as usize;
+                        if let Some(e) = ver.embed(&wav[..n]) {
+                            tests.push((si, l, e));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "[DIAG432R1] speakers={} enroll={:?} tests={}",
+            spk.len(),
+            enroll.iter().map(|v| v.len()).collect::<Vec<_>>(),
+            tests.len()
+        );
+        let empty = manifest().join("target/debug/__nonexistent_vp_432.bin");
+        let thrs = [0.30f32, 0.35, 0.40, 0.45];
+        let mut pooled_own: Vec<(f32, f32)> = Vec::new();
+        let mut pooled_other: Vec<(f32, f32)> = Vec::new();
+        for u in 0..spk.len() {
+            let mut vp = Voiceprint::load(&empty);
+            for (secs, e) in &enroll[u] {
+                vp.offer(e, *secs, None, Some("zh"));
+            }
+            if !vp.has_any_ready() {
+                eprintln!("[DIAG432R1] USER {} NOT_READY", spk[u]);
+                continue;
+            }
+            let (mut own, mut other): (Vec<(f32, f32)>, Vec<(f32, f32)>) = (Vec::new(), Vec::new());
+            for (si, l, e) in &tests {
+                if let Some(sc) = vp.max_score_ready(e) {
+                    if *si == u {
+                        own.push((*l, sc));
+                    } else {
+                        other.push((*l, sc));
+                    }
+                }
+            }
+            let stat = |v: &[(f32, f32)]| -> (usize, f32, f32, f32) {
+                if v.is_empty() {
+                    return (0, 0.0, 0.0, 0.0);
+                }
+                let mut s: Vec<f32> = v.iter().map(|x| x.1).collect();
+                s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                (s.len(), s[0], s[s.len() / 2], s[s.len() - 1])
+            };
+            let (on, omn, omed, omx) = stat(&own);
+            let (tn, tmn, tmed, tmx) = stat(&other);
+            eprintln!("[DIAG432R1] USER {} OWN n={} min={:.3} med={:.3} max={:.3} | OTH n={} min={:.3} med={:.3} max={:.3}", spk[u], on, omn, omed, omx, tn, tmn, tmed, tmx);
+            for &t in &thrs {
+                let frr = own.iter().filter(|x| x.1 < t).count() as f32 / on.max(1) as f32;
+                let dr = other.iter().filter(|x| x.1 < t).count() as f32 / tn.max(1) as f32;
+                eprintln!(
+                    "[DIAG432R1] USER {} thr={:.2} own_FRR={:.4} other_drop={:.4}",
+                    spk[u], t, frr, dr
+                );
+            }
+            for (lo, hi, tag) in [(1.0f32, 1.49f32, "1.0-1.5"), (1.49f32, 1.81f32, "1.5-1.8")] {
+                let ob: Vec<f32> = own
+                    .iter()
+                    .filter(|x| lo <= x.0 && x.0 < hi)
+                    .map(|x| x.1)
+                    .collect();
+                let tb: Vec<f32> = other
+                    .iter()
+                    .filter(|x| lo <= x.0 && x.0 < hi)
+                    .map(|x| x.1)
+                    .collect();
+                if !ob.is_empty() || !tb.is_empty() {
+                    let omin = ob.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let omax = tb.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    eprintln!(
+                        "[DIAG432R1] USER {} bucket {} own_n={} own_min={:.3} oth_n={} oth_max={:.3}",
+                        spk[u],
+                        tag,
+                        ob.len(),
+                        omin,
+                        tb.len(),
+                        omax
+                    );
+                }
+            }
+            pooled_own.extend(own.iter().cloned());
+            pooled_other.extend(other.iter().cloned());
+        }
+        let pool = |v: &[(f32, f32)]| {
+            for &t in &thrs {
+                let frr = v.iter().filter(|x| x.1 < t).count() as f32 / v.len().max(1) as f32;
+                eprintln!(
+                    "[DIAG432R1] POOLED n={} thr={:.2} below={:.4}",
+                    v.len(),
+                    t,
+                    frr
+                );
+            }
+            let mut s: Vec<f32> = v.iter().map(|x| x.1).collect();
+            s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            if !s.is_empty() {
+                eprintln!(
+                    "[DIAG432R1] POOLED min={:.3} med={:.3} max={:.3}",
+                    s[0],
+                    s[s.len() / 2],
+                    s[s.len() - 1]
+                );
+            }
+        };
+        eprintln!("[DIAG432R1] == POOLED OWN ==");
+        pool(&pooled_own);
+        eprintln!("[DIAG432R1] == POOLED OTHERS ==");
+        pool(&pooled_other);
+    }
+}
+
+// DIAG-432-R1 补充：在 211641 末尾按能量找最后一段语音（1.60s 窗）并打分。
+#[cfg(test)]
+mod diag432r1_locate_tests {
+    use super::{SpeakerVerifier, Voiceprint};
+    use std::path::PathBuf;
+    const SR: usize = 16000;
+    fn manifest() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+    #[test]
+    #[ignore = "diag432r1: cargo test --bin feiyin-ime -- --ignored --nocapture diag432r1_locate"]
+    fn diag432r1_locate_sentence() {
+        let p = manifest().join("collab/evidence/gavin-sessions/session-20260925-211641.wav");
+        let wav = sherpa_onnx::Wave::read(p.to_str().unwrap())
+            .unwrap()
+            .samples()
+            .to_vec();
+        let ver = SpeakerVerifier::load(&manifest().join("models")).unwrap();
+        let vp = Voiceprint::load(&manifest().join("target/release/voiceprint.bin"));
+        let dur = wav.len() as f32 / SR as f32;
+        eprintln!(
+            "[DIAG432R1-LOC] wav dur={dur:.2}s ref_ready={}",
+            vp.has_any_ready()
+        );
+        let n = (1.6 * SR as f32) as usize;
+        let mut t = 0.0;
+        while t + 1.6 <= dur {
+            let s = (t * SR as f32) as usize;
+            let seg = &wav[s..s + n];
+            let rms = (seg.iter().map(|x| x * x).sum::<f32>() / n as f32).sqrt();
+            let sc = ver
+                .embed(seg)
+                .and_then(|e| vp.max_score_ready(&e))
+                .unwrap_or(-1.0);
+            if rms > 0.01 {
+                eprintln!("[DIAG432R1-LOC] start={t:.2} rms={rms:.4} score={sc:.4}");
+            }
+            t += 0.2;
+        }
+    }
+}
