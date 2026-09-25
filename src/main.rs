@@ -11275,63 +11275,18 @@ mod fix_reflow_raw_base_420_tests {
             .join("\n")
     }
 
-    /// 取 `sig` 之后的函数体（花括号配平，跳过字符串 / 字符 / 注释内的括号，
-    /// 防 [GUARD-SKIP-BRACE-IN-STRING-382]）。返回含首尾花括号的切片文本。
+    /// 取 `sig` 之后的函数体（花括号配平，跳过字符串 / 字符 / 注释内的括号）。
+    /// FIX-GUARD-PRODLINES-422：复用 `guard_prod_lines::brace_match` 的**唯一状态机**（禁两份），
+    /// 根治 `[GUARD-SKIP-BRACE-IN-STRING-382]`（本 helper 的 `.find('{')` / `.expect("…{…")` 曾把
+    /// `prod_lines_excluding_cfg_test` 的朴素计数带偏）。
     fn fn_body(code: &str, sig: &str) -> String {
         let at = code.find(sig).unwrap_or_else(|| panic!("生产区缺 `{sig}`"));
         let open = code[at..]
             .find('{')
             .map(|d| at + d)
             .expect("函数体 `{` 缺失");
-        let bytes = code.as_bytes();
-        let mut depth = 0i32;
-        let mut i = open;
-        let (mut string, mut ch, mut line_c, mut block_c) = (false, false, false, false);
-        while i < bytes.len() {
-            let c = bytes[i] as char;
-            let next = bytes.get(i + 1).copied().map(|b| b as char);
-            if line_c {
-                if c == '\n' {
-                    line_c = false;
-                }
-            } else if block_c {
-                if c == '*' && next == Some('/') {
-                    block_c = false;
-                    i += 1;
-                }
-            } else if string {
-                if c == '\\' {
-                    i += 1;
-                } else if c == '"' {
-                    string = false;
-                }
-            } else if ch {
-                if c == '\\' {
-                    i += 1;
-                } else if c == '\'' {
-                    ch = false;
-                }
-            } else if c == '"' {
-                string = true;
-            } else if c == '\'' {
-                ch = true;
-            } else if c == '/' && next == Some('/') {
-                line_c = true;
-                i += 1;
-            } else if c == '/' && next == Some('*') {
-                block_c = true;
-                i += 1;
-            } else if c == '{' {
-                depth += 1;
-            } else if c == '}' {
-                depth -= 1;
-                if depth == 0 {
-                    return code[open..=i].to_string();
-                }
-            }
-            i += 1;
-        }
-        panic!("函数体未闭合：{sig}");
+        let close = crate::guard_prod_lines::brace_match(code, open).expect("函数体未闭合");
+        code[open..=close].to_string()
     }
 }
 
@@ -18838,30 +18793,178 @@ mod guard_prod_lines {
         t.starts_with("#[cfg(") && t.contains("test") && !t.contains("not(test)")
     }
 
+    /// 🔴 FIX-GUARD-PRODLINES-422：**字符串 / 字符 / 注释感知**的顶层词法扫描。
+    ///
+    /// 从 `from` 起返回第一个「顶层」遇到的 `{` / `}` / `;` 的 `(字节下标, 字符)`；
+    /// 跳过：普通字符串 `"…"`（含 `\"`）、原始字符串 `r"…"` / `r#"…"#`（任意 `#` 数）、
+    /// 字符字面量 `'x'` / `'\''` / `'\u{…}'`（与生命周期 `'a` 区分）、`//` 行注释、
+    /// `/* */` 块注释（**可嵌套**）。到末尾无顶层词 ⇒ `(len, None)`。
+    ///
+    /// 这是 `prod_lines_excluding_cfg_test` 与 TEST-SYNC-420 `fn_body` **共用的唯一状态机**
+    ///（禁两份；根治 `[GUARD-SKIP-BRACE-IN-STRING-382]`）。
+    pub(crate) fn next_top_token(src: &str, from: usize) -> (usize, Option<char>) {
+        let b = src.as_bytes();
+        let n = b.len();
+        let mut i = from;
+        while i < n {
+            match b[i] {
+                b'/' if i + 1 < n && b[i + 1] == b'/' => {
+                    i += 2;
+                    while i < n && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if i + 1 < n && b[i + 1] == b'*' => {
+                    i += 2;
+                    let mut d = 1i32;
+                    while i < n && d > 0 {
+                        if b[i] == b'/' && i + 1 < n && b[i + 1] == b'*' {
+                            d += 1;
+                            i += 2;
+                        } else if b[i] == b'*' && i + 1 < n && b[i + 1] == b'/' {
+                            d -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                b'"' => {
+                    i += 1;
+                    while i < n {
+                        if b[i] == b'\\' {
+                            i += 2;
+                        } else if b[i] == b'"' {
+                            i += 1;
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                b'r' if i + 1 < n && (b[i + 1] == b'"' || b[i + 1] == b'#') => {
+                    let mut j = i + 1;
+                    let mut hashes = 0usize;
+                    while j < n && b[j] == b'#' {
+                        hashes += 1;
+                        j += 1;
+                    }
+                    if j < n && b[j] == b'"' {
+                        j += 1;
+                        loop {
+                            if j >= n {
+                                break;
+                            }
+                            if b[j] == b'"' {
+                                let mut k = j + 1;
+                                let mut cnt = 0usize;
+                                while k < n && b[k] == b'#' && cnt < hashes {
+                                    cnt += 1;
+                                    k += 1;
+                                }
+                                if cnt == hashes {
+                                    j = k;
+                                    break;
+                                }
+                            }
+                            j += 1;
+                        }
+                        i = j;
+                    } else {
+                        i += 1; // 标识符 `r`，不是原始串前缀。
+                    }
+                }
+                b'\'' => {
+                    if i + 1 < n && b[i + 1] == b'\\' {
+                        // 转义字符字面量：扫到闭合单引号（`\u{…}` 内的花括号一并跳过）。
+                        let mut j = i + 2;
+                        while j < n && b[j] != b'\'' {
+                            j += 1;
+                        }
+                        i = if j < n { j + 1 } else { i + 1 };
+                    } else if i + 2 < n && b[i + 2] == b'\'' {
+                        i += 3; // `'x'`
+                    } else {
+                        i += 1; // 生命周期标记（`'a` / `'static`）。
+                    }
+                }
+                b'{' => return (i, Some('{')),
+                b'}' => return (i, Some('}')),
+                b';' => return (i, Some(';')),
+                _ => i += 1,
+            }
+        }
+        (n, None)
+    }
+
+    /// 从 `open`（指向 `{`）配平到匹配 `}`，**跳过**字符串 / 字符 / 注释。返回匹配 `}` 的字节下标。
+    pub(crate) fn brace_match(src: &str, open: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        let mut i = open;
+        loop {
+            let (pos, tok) = next_top_token(src, i);
+            match tok {
+                Some('{') => {
+                    depth += 1;
+                    i = pos + 1;
+                }
+                Some('}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(pos);
+                    }
+                    i = pos + 1;
+                }
+                Some(';') => i = pos + 1,
+                _ => return None,
+            }
+        }
+    }
+
+    /// 从 `from` 起定位一个「项」的结束：顶层 `;`（无花括号项）或花括号配平。返回结束后的字节下标。
+    fn item_end(src: &str, from: usize) -> usize {
+        let (pos, tok) = next_top_token(src, from);
+        match tok {
+            Some(';') => pos + 1,
+            Some('{') => brace_match(src, pos).map(|e| e + 1).unwrap_or(src.len()),
+            Some('}') => pos + 1,
+            _ => src.len(),
+        }
+    }
+
+    /// 各行的起始字节下标（按 `\n` 切分，与 `src.split('\n')` 对齐）。
+    fn line_starts(src: &str) -> Vec<usize> {
+        let mut v = vec![0usize];
+        for (i, b) in src.bytes().enumerate() {
+            if b == b'\n' {
+                v.push(i + 1);
+            }
+        }
+        v
+    }
+
     /// 返回 `src` 的「生产区」逐行 trim 文本：**剔除所有 test-gated 项**
     /// （`mod` / `fn` / 任意项），保留其余全文 —— 不再「截断到首个标记」。
     ///
-    /// 健壮性（对任意位置 / 任意数量的 test 项都成立）：
-    /// - 逐行扫描，遇到 test-gated 属性即进入「跳过态」，**跳过完该项后回到正常态
-    ///   继续收集**（这是与旧实现的本质差别）；
-    /// - 属性与其后的项之间允许夹文档注释 / 其它属性 / 空行（`//`、`#[`、`#!`、空行都容忍）；
-    /// - 项结束判据：在第一个 `{` 之前先遇 `;` ⇒ 无花括号项（`use`/`const`/`static`/`type`），
-    ///   跳到该 `;`；否则花括号配平到深度归零（覆盖 `mod x { … }` / `fn x() { … }` 及嵌套）。
+    /// 🔴 FIX-GUARD-PRODLINES-422：项体定界改用 [`item_end`]（字符串 / 字符 / 注释感知），
+    /// 不再朴素逐字数花括号 ⇒ 测试模块内字符串 / 字符 / 原始串 / 注释里的 `{`/`}` 不再带偏、
+    /// 不再把其后生产区整段当测试剔除（`[GUARD-SKIP-BRACE-IN-STRING-382]` 第二次复发的根治）。
     pub(crate) fn prod_lines_excluding_cfg_test(src: &str) -> Vec<String> {
-        let lines: Vec<&str> = src.lines().collect();
+        let parts: Vec<&str> = src.split('\n').collect();
+        let starts = line_starts(src);
         let mut out: Vec<String> = Vec::new();
         let mut i = 0usize;
-        while i < lines.len() {
-            let t = lines[i].trim();
-            if !is_test_gated_attr(t) {
-                out.push(t.to_string());
+        while i < parts.len() {
+            let line = parts[i].strip_suffix('\r').unwrap_or(parts[i]);
+            if !is_test_gated_attr(line.trim()) {
+                out.push(line.trim().to_string());
                 i += 1;
                 continue;
             }
             // 跳过属性行本身及其后的文档注释 / 其它属性 / 空行，定位到被 gate 的项首行。
             i += 1;
-            while i < lines.len() {
-                let t2 = lines[i].trim();
+            while i < parts.len() {
+                let t2 = parts[i].strip_suffix('\r').unwrap_or(parts[i]).trim();
                 if t2.is_empty()
                     || t2.starts_with("//")
                     || t2.starts_with("#[")
@@ -18872,32 +18975,89 @@ mod guard_prod_lines {
                     break;
                 }
             }
-            // 跳过该项本体。
-            let mut depth: i32 = 0;
-            let mut opened = false;
-            while i < lines.len() {
-                let mut semi = false;
-                for ch in lines[i].chars() {
-                    match ch {
-                        '{' => {
-                            depth += 1;
-                            opened = true;
-                        }
-                        '}' => depth -= 1,
-                        ';' if !opened => {
-                            semi = true;
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
+            if i >= parts.len() {
+                break;
+            }
+            // 跳过该项本体（字符串 / 字符 / 注释感知）。
+            let end = item_end(src, starts[i]);
+            while i < parts.len() && starts[i] < end {
                 i += 1;
-                if semi || (opened && depth <= 0) {
-                    break;
-                }
             }
         }
         out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::prod_lines_excluding_cfg_test;
+
+        fn prod(src: &str) -> Vec<String> {
+            prod_lines_excluding_cfg_test(src)
+        }
+
+        /// 🔴 422 核心：cfg(test) 模块里含字符串 `"{"`、字符 `'{'`、原始串 `r#"{"#`、注释
+        /// `// {`、`/* { */`、生命周期 `'a` ⇒ 其后生产代码行**必须保留**（旧朴素计数会被带偏）。
+        #[test]
+        fn braces_in_strings_chars_raw_and_comments_do_not_break_skipping() {
+            let src = r##"
+fn a() {}
+#[cfg(test)]
+mod t {
+    fn x() {
+        let s = "{";
+        let c = '{';
+        let r = r#"{"#;
+        // {
+        /* { */
+        let lt = &'a ();
+    }
+}
+fn b() {}
+"##;
+            let p = prod(src);
+            assert!(p.iter().any(|l| l == "fn a() {}"), "a 应保留");
+            assert!(
+                p.iter().any(|l| l == "fn b() {}"),
+                "跳过 test 模块后 b 必须保留（旧实现会整段剔除）"
+            );
+            assert!(
+                !p.iter().any(|l| l.contains("let s =")),
+                "cfg(test) 模块内容应被剔除"
+            );
+        }
+
+        /// 正常嵌套模块正确剔除 + 无花括号项（`use`/`const`）正确跳过。
+        #[test]
+        fn nested_mod_and_no_brace_item() {
+            let src = "#[cfg(test)]\nmod t {\n    mod inner { fn y() {} }\n}\nfn c() {}\n";
+            let p = prod(src);
+            assert!(p.iter().any(|l| l == "fn c() {}"));
+            assert!(!p.iter().any(|l| l.contains("inner")));
+
+            // `#[cfg(test)]` 只 gate **紧随的一项**：`use` 被剔除，`const`/`fn` 属生产，保留。
+            let src2 = "#[cfg(test)]\nuse std::x;\nconst K: i32 = 1;\nfn d() {}\n";
+            let p2 = prod(src2);
+            assert!(
+                !p2.iter().any(|l| l.contains("use std")),
+                "紧随 test 属性的 use 应剔除"
+            );
+            assert!(
+                p2.iter().any(|l| l.contains("const K")),
+                "只 gate 紧随一项，const 保留"
+            );
+            assert!(p2.iter().any(|l| l == "fn d() {}"));
+        }
+
+        /// 生命周期 `'a`（非字符字面量）不得吞掉后续；转义字符 `'\''` / `'\u{...}'` 内花括号不得带偏。
+        #[test]
+        fn lifetimes_and_escaped_chars() {
+            let src = "#[cfg(test)]\nmod t { fn x<'a>() { let q = '\\''; let u = '\\u{1F600}'; } }\nfn e<'a>() {}\n";
+            let p = prod(src);
+            assert!(
+                p.iter().any(|l| l == "fn e<'a>() {}"),
+                "生命周期/转义字符后生产行应保留"
+            );
+        }
     }
 }
 
@@ -20383,12 +20543,23 @@ mod testsync377_source_guard_tests {
     }
 
     /// 377：`main.rs` 生产区不得再有跨录音上下文缓存 `ctx_prev1`/`ctx_prev2`（计数 0）。
+    ///
+    /// FIX-GUARD-PRODLINES-422：本模块顶部**注释**（非 cfg(test) 项）按文档契约「注释行一并剔除」
+    /// 需过滤 —— 旧扫描器把该区域整段误剔 ⇒ 注释没被计入 ⇒ 碰巧绿；422 修正扫描面后暴露本测试
+    /// 漏过滤注释。**只过滤注释、不放宽代码不变量**（与上方 `source_has_no_removed_inject_symbols` 同口径）。
     #[test]
     fn main_has_no_cross_recording_ctx_cache() {
         let p = prod(include_str!("main.rs"));
         for sym in ["ctx_prev1", "ctx_prev2"] {
-            let n = p.iter().filter(|l| l.contains(sym)).count();
-            assert_eq!(n, 0, "main.rs 生产区 `{sym}` 计数必须为 0，实得 {n}");
+            let n = p
+                .iter()
+                .filter(|l| !l.starts_with("//"))
+                .filter(|l| l.contains(sym))
+                .count();
+            assert_eq!(
+                n, 0,
+                "main.rs 生产区（注释不计）`{sym}` 计数必须为 0，实得 {n}"
+            );
         }
     }
 }

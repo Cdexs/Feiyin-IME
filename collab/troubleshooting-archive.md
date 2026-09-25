@@ -5309,3 +5309,40 @@ pub fn uses_accuracy_engine(self) -> bool {
    **生产代码里既不能有真门控属性、也不能在注释里写出该字面量**（397 曾在注释里写 `#[cfg(test)]`
    导致 `source_guard_no_opus_mt_and_no_forced_min_decoding` 假红）。
 
+---
+
+## [GUARD-SKIP-BRACE-IN-STRING-382] 全文（422 根治后归档）
+
+（索引与首版全文见 `troubleshooting.md` §382；此处为 2026-09-25 复发与根治后的**完整条目**。）
+
+**现象**：FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382 新增若干 `#[cfg(test)]` 模块后，全量回归出现 6 条 FAILED，
+全部是**跨文件结构护栏**（`punctuation::tests::guard_214_215::{g7,g9,g10,g11}`、`nospeech_122_guard_tests::h4`、
+`testsync371_window_counter_guard_tests::counters_are_pushed_together`），报错都是「锚点必须存在」但锚点明明在源码里。
+
+**根因**：`guard_prod_lines::prod_lines_excluding_cfg_test`（`main.rs`）跳过 `#[cfg(test)]` 项时用**朴素的逐字符花括号计数**
+（`'{' → depth++`、`'}' → depth--`，`opened && depth<=0` 停）决定项体边界，**不区分字符串 / 字符 / 注释**：
+测试里写 `l.contains("for _ in 0..concurrency {")` 令 `depth` 多算一层 ⇒ 越过模块边界继续吞（实测 `11353→15268`，
+把整个 `run_pipeline_core` 当测试剔除）⇒ 其后生产锚点「消失」。
+
+**判据**：护栏报「锚点必须存在」但 `grep` 源码明明有 ⇒ 先怀疑**扫描器把生产区误剔了**。
+
+**首版修法**：把测试字符串里的 `{` 去掉（治标）。
+
+**🔴 2026-09-25 复发（第二次）⇒ FIX-GUARD-PRODLINES-422 根治**：
+TEST-SYNC-420 给 `fix_reflow_raw_base_420_tests` 加 `fn_body` helper，内含 `.find('{')` 与
+`.expect("函数体 `{` 缺失")` 等**非代码 `{`** ⇒ 朴素计数再次被带偏，收尾 `depth>0` ⇒ 把其后生产区
+（L11144~L12409）整段误剔（唯一失败 `testsync421_tests::ts421g_source_anchors`）。
+**根治**：项体定界改为**字符串 / 字符 / 注释感知**的**共用状态机**：
+- `next_top_token(src, from)`：返回第一个顶层 `{`/`}`/`;`；跳过普通串 `"…"`（含 `\"`）、原始串
+  `r"…"` / `r#"…"#`（任意 `#` 数）、字符 `'x'`/`'\''`/`'\u{…}'`（与生命周期 `'a` 区分）、`//`、`/* */`（可嵌套）；
+- `brace_match(src, open)`：配平到匹配 `}`；
+- `item_end` / `prod_lines_excluding_cfg_test` 用上述；TEST-SYNC-420 `fn_body` **也改用它（禁两份）**。
+
+**教训**：同一形态一天内二次复发 ⇒ **不再靠「别写裸 `{`」约定**，把词法感知做进工具本身。
+**可复用规则**：新增/移动 `#[cfg(test)]` 模块后必跑全量；工具类护栏扫描器一旦「按字符计数」就必须显式处理
+串/字符/注释/生命周期。
+
+**422 验证**：全量 `cargo test --no-fail-fast` **0 failed**（bin 1802P/0F/55I）；连同 `testsync421` 由红转绿；
+新增 `guard_prod_lines::tests` 3 条（串/字符/原始串/注释/生命周期 + 嵌套 mod + 无花括号项）。
+附带暴露并修正 `testsync377::main_has_no_cross_recording_ctx_cache` 漏过滤注释的假绿（旧扫描器把含符号的注释误剔）。
+
