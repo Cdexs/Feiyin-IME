@@ -380,3 +380,14 @@
 - **专项**：A CT2 `efa16d81…` 未重编；B 声纹 `aa3cfc16…` 在包内、junction 保持；D 用户数据未动、无 voiceprint.bin；三特殊点 A+B+D 全 PASS。**冒烟**：427 运行期 `[LocalRT-DBG-413] prev_cut_secs=0.75 window_secs=20.37 gap=found`（非零，生效）；423 运行期 `[LocalRT-DBG-407] tail window (src=long_silence)` 触发（统一宏）；🔴 `src=stop` 未捕获——本轮麦克风拾音不稳（5 次尝试仅 1 次 `speech_detected=true`），且该次停止前有 ≥1.9s 静音使 pending 先被长静默消费；423 由共用宏 + 源码锚点 + 消融保证。
 - **debug-audio（新规则）**：ls 差集**点名删除本人本次生成的 15 个**（5 `session-2004xx` + 10 `preroll-2004xx`，全名见 result.md）；Gavin 既有 `session-*`/`preroll-*` 未动。附注：10 个旧 preroll（13:17/14:52/14:53/14:54/15:03）系**程序滚动裁剪**消失，非我删除。
 - **红线**：未改生产代码（消融全还原）/ 版本号未动 / 未 push / 未 `cargo clean` / 零凭证。证据 `collab/evidence/429/`。
+
+## 2026-09-25 — tester-1 — TEST-EXEC + BUILD-432（431+432 合包）✅ 回归 + 出包
+
+- **性质**：阶段四回归 + 阶段五出包（431 重叠区以前一窗为准 + 半全局对齐；432 声纹判定门槛 2.0→1.5s，offer 仍 2.0s）。HEAD `7309f82`，版本 0.9.3 未动，基线 Publish=BUILD-429。
+- **回归**：bin **1844P/0F/64I**（对 BUILD-429 1825P/61I）⇒ NEW **25** / GONE **3**；root 1932P/0F/66I；`src-tauri` **92P/0F/0I**；Vitest/Browser SKIP（ui 无 diff）。GONE 3=（`ts412b_offer_requires_ge_2s_and_in_window`、`ts412b_window4_exact_two_units_both_ge_2s`、`ts412_merge_only_to_reach_2s`）→ 432 拆分判定 1.5s / offer 2.0s 后按新契约改名，属预期。
+- **消融（过滤跑，全还原，`git diff -- src/`=0）**：431a `push_inner` 对齐成功分支改回不 splice ⇒ `ts431g_source_anchors` 1 红（`fix431_*` 5 条 `--ignored` 实跑全绿 —— 纯函数不经过 `push_inner`，如实记录）；431b `semiglobal_continuation` 平局取较小 j ⇒ 4 红（`fix431_real_175022_keeps_prev_shishi` 等）；432a `MIN_JUDGE_SECS`→2.0 ⇒ 5 红；432b `unit_offer_eligible`→`MIN_JUDGE_SECS` ⇒ 2 红。
+- **构建**：Step1 清进程 0 残留；Step2 npm 691ms + Tauri 1m23s(17w) + cp；Step3 2m53s（main 91w / crash 9w）；Step4 三 exe + 两 toml 同步 Publish。
+- **九项**：全项 PASS。①22:24–22:27 ②两副本 sha 全等且异于 BUILD-429（main `65ef7d53…` / ui `650d5562…` / crash `15b8db21…`）③0.9.3 ④冒烟 Responding + 无 crash.json + 零残留 ⑤config `da2be5da…` 不变 ⑥91/9/17=基线 ⑦正探针 `[DBG-416]`=1/`keep_prev=`=1，反探针 N-A（无删除生产字面量，报三证）⑧两 toml 三副本全等 ⑨VC 五件 sha 与 Redist 源三处全等。
+- **专项**：A CT2 `efa16d81…` 未重编；B 声纹 `aa3cfc16…` 在包内、junction 保持；D 用户数据未动、`Publish/voiceprint.bin` 不存在（只列）。三特殊点 A+B+D 全 PASS。**冒烟**：`kv_long.wav` 录制，实测 `[DBG-416] seam: layer=strict k=8 e=3 edit=0.00 seq=1 span=[0, 2) prev=[0, 1) m=0 ratio=Some(0.27627) keep_prev=1 new_head_dropped="赶紧上去，给拦住了"`（431 生效）；无 panic/crash。
+- **debug-audio（新规则）**：ls 差集**点名删除本人 3 个**（`session-20260925-222827.wav`、`preroll-20260925-222827.wav`、`preroll-20260925-222827-2s.wav`），移除 0；Gavin 既有 `session-*`/`preroll-*` 未动；测后计数回 24。
+- **红线**：未改生产代码（消融全还原）/ 版本号未动 / 未 push / 未 `cargo clean` / 零凭证。证据 `collab/evidence/432/`。
