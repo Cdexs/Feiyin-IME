@@ -48,22 +48,21 @@ impl<'a> SendOnlineRecognizerRef<'a> {
     }
 }
 
-/// 流式解码线程数：**按运行机器的 CPU 核数取，不写死**（Gavin 2026-09-21 定）。
+/// 流式解码线程数：**按运行机器的 CPU 核数取，不写死**，**封顶 4**（Gavin 2026-09-25 定）。
 ///
-/// 写死具体数字的问题：8 在 4 核机器上就是超订两倍；不同用户机器核数不同，
-/// 开发机上的最优值搬到用户机器上可能恰是最差值。
+/// 🔴 Gavin 2026-09-25：「预览和精确识别两边抢 CPU……将预览的线程调为 4」。
+/// 根因（RT-PERF-AUDIT-403 F-F-01）：流式与精解线程各 `min(核, 8)` 并发争用。预览（流式）
+/// 实时性优先、且其模型远小于精解模型，故**预览侧封顶 4**，把余下核让给精解侧。
 ///
-/// 口径与 accuracy 侧 `default_acc_num_threads()` **完全一致**：
-/// `available_parallelism().min(8)`，取不到时回落 4。
-/// 🔴 上限 8 的依据：271 本机实测 accuracy 线程曲线，长音频 0/1/2/4/**8**/12/**16** 线程 =
-/// 30.9/31.1/20.9/22.4/**17.0**/19.8/**34.2** 秒 —— 8 最优，**16 比 8 慢一倍**、甚至慢于单线程。
-/// 故机器核再多也不超过 8。
+/// 口径：`available_parallelism().min(4)`，取不到时回落 4（核数不足 4 的机器不超订）。
+/// 🔴 **与 accuracy 侧 `default_acc_num_threads()`（`min(8)`）刻意不再同口径** ——
+/// 见本文件 `stream_num_threads_follows_machine_cores_and_caps_at_4` 用例。
 ///
-/// 沿革：POC-LOCAL-STREAM-235 定 4（独占运行前提）→ TUNE-STREAM-317 加 env →
-/// Gavin 提到 8 → 本次改为按核数动态取，并删除 env（开发端与用户端行为必须一致）。
+/// 沿革：POC-LOCAL-STREAM-235 定 4（独占运行前提）→ TUNE-STREAM-317 加 env → Gavin 提到 8
+/// ⇒ 按核数动态取（`min(8)`）→ **本单改回封顶 4** 并删 env（开发端与用户端行为必须一致）。
 fn local_stream_num_threads() -> i32 {
     std::thread::available_parallelism()
-        .map(|n| n.get().min(8) as i32)
+        .map(|n| n.get().min(4) as i32)
         .unwrap_or(4)
 }
 
@@ -384,7 +383,7 @@ pub fn create_local_stream_recognizer(model_dir: &Path) -> Result<OnlineRecogniz
         decoder: Some(dec.to_string_lossy().to_string()),
     };
     c.model_config.tokens = Some(tok.to_string_lossy().to_string());
-    // TUNE-STREAM-317：线程数常量（8，沿革与 271 反向数据见常量处）。无 env 覆盖。
+    // LOCALRT-STREAM-THREADS-417：线程数按核数取、**封顶 4**（Gavin 2026-09-25；沿革见常量处）。无 env 覆盖。
     let num_threads = local_stream_num_threads();
     c.model_config.num_threads = num_threads;
     c.model_config.provider = Some("cpu".to_string());
@@ -2922,24 +2921,34 @@ mod tests {
 
     // ============================================================
     // TUNE-STREAM-317 / Gavin 2026-09-21：env 覆盖已全部删除，线程数按机器核数取。
+    // LOCALRT-STREAM-THREADS-417（Gavin 2026-09-25）：预览侧封顶 4，与精解侧刻意分口径。
     // ============================================================
 
-    /// 线程数须**随机器核数变化**且封顶 8，不得写死。
+    /// 线程数须**随机器核数变化**且**封顶 4**，不得写死；核数不足 4 不超订。
     #[test]
-    fn stream_num_threads_follows_machine_cores_and_caps_at_8() {
+    fn stream_num_threads_follows_machine_cores_and_caps_at_4() {
         let n = local_stream_num_threads();
         assert!(n >= 1, "至少 1；取不到核数时回落 4");
         assert!(
-            n <= 8,
-            "封顶 8（271 实测：16 线程比 8 慢一倍，甚至慢于单线程）"
+            n <= 4,
+            "封顶 4（Gavin 2026-09-25：预览与精解抢 CPU，预览侧让核）"
         );
         let expected = std::thread::available_parallelism()
-            .map(|c| c.get().min(8) as i32)
+            .map(|c| c.get().min(4) as i32)
             .unwrap_or(4);
         assert_eq!(
             n, expected,
-            "口径须与 accuracy 侧 default_acc_num_threads 完全一致"
+            "口径 = available_parallelism().min(4)，取不到回落 4"
         );
+        // LOCALRT-STREAM-THREADS-417：与精解侧 `default_acc_num_threads()`（min(8)）
+        // **刻意不再同口径** —— 预览封顶更低以让核给精解；≥8 核时必不同（4 vs 8）。
+        let acc = crate::transcription::default_acc_num_threads();
+        let cores = std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(4);
+        if cores >= 8 {
+            assert_ne!(n, acc, "≥8 核：预览侧 4、精解侧 8，两者刻意分口径（417）");
+        }
     }
 
     /// LOCALRT-SEAM-337：**lookahead（滞后量）实测** —— 针对音频位置 P 的文本，还需再喂多少

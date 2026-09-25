@@ -266,14 +266,19 @@ fn is_dump_file(name: &str) -> bool {
     name.starts_with("preroll-") && name.ends_with(".wav")
 }
 
-/// 上限闸门：`preroll-<ts>*.wav` 超过 `max_files` 时删最旧的（按文件名升序 =
-/// 时间戳升序）。返回删除数量。不设上限 = 端测跑一晚撑爆盘。
-fn enforce_dump_limit(dir: &Path, max_files: usize) -> usize {
+/// DEBUG-SESSION-WAV-418：整段录音 dump 文件名（与 preroll **分开计数**）。
+fn is_session_dump_file(name: &str) -> bool {
+    name.starts_with("session-") && name.ends_with(".wav")
+}
+
+/// 上限闸门（按 `keep` 谓词选择计入的文件）：超过 `max_files` 时删最旧的（按文件名
+/// 升序 = 时间戳升序）。返回删除数量。preroll 与 session **各自独立计数**（谓词不同）。
+fn enforce_dump_limit_where(dir: &Path, max_files: usize, keep: impl Fn(&str) -> bool) -> usize {
     let mut names: Vec<String> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
             .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| is_dump_file(n))
+            .filter(|n| keep(n))
             .collect(),
         Err(_) => return 0,
     };
@@ -289,6 +294,11 @@ fn enforce_dump_limit(dir: &Path, max_files: usize) -> usize {
         }
     }
     removed
+}
+
+/// preroll dump 上限（`preroll-*.wav`；行为逐位不变）。
+fn enforce_dump_limit(dir: &Path, max_files: usize) -> usize {
+    enforce_dump_limit_where(dir, max_files, is_dump_file)
 }
 
 /// 2026-09-21 现场诊断用格式：`first_speech_at` 为 none 时窗口内无语音。
@@ -415,6 +425,123 @@ impl Drop for PreRollDump {
         if !self.done2 && !self.buf2.is_empty() {
             self.write_part2();
         }
+    }
+}
+
+// ============================================================================
+// DEBUG-SESSION-WAV-418：`-debug` 下保存**整段录音**（喂给本地实时管线的 16k 单声道音频），
+// 供离线重放定因（Gavin 2026-09-25：「问题 5 赶紧做，记得千万别影响生产运行路径」）。
+//
+// 硬约束：
+//   ① 不带 `-debug`（Warn）时**零动作**：`new` 直接返回 None（不分配 / 不建目录 / 不起线程），
+//      门控与 `PreRollDump` 一致（`log::log_enabled!(Debug)` 为假 ⇒ None）。
+//   ② 带 `-debug` 时不得阻塞录音/识别线程：录音中只 `extend_from_slice` 累积；写 WAV 放
+//      `Drop` 的**后台线程**里，写失败只 `warn`。
+//   ③ 只读旁路：只借用 `&[f32]`，送给识别的音频逐 bit 不变。
+//
+// 上限：session 文件最多保留 `SESSION_DUMP_MAX_FILES` 个（超出删最旧），与 preroll 的
+// `DUMP_MAX_FILES`(20) **分开计数**（`is_session_dump_file` 前缀不同）。
+// ============================================================================
+
+/// DEBUG-SESSION-WAV-418：整段录音 dump 最多保留的文件数（与 preroll 20 分开）。
+const SESSION_DUMP_MAX_FILES: usize = 10;
+
+/// 一次录音的整段音频落盘器（仅 `-debug` 下存在）。
+///
+/// - `push` 在录音线程累积**重采样后的 16k 单声道**音频（喂给本地实时管线的实际数据）。
+/// - 录音结束（含提前结束 / 出错提前返回）由 `Drop` 起后台线程写
+///   `debug-audio/session-<YYYYMMDD-HHMMSS>.wav`，不阻塞录音线程。
+struct SessionDump {
+    dir: PathBuf,
+    ts: String,
+    rate: u32,
+    buf: Vec<f32>,
+    written: bool,
+}
+
+impl SessionDump {
+    /// 生产入口：目录固定 exe 同级 `debug-audio/`；Warn 级返回 None（零动作）。
+    fn new(rate: u32) -> Option<Self> {
+        if !log::log_enabled!(log::Level::Debug) {
+            return None;
+        }
+        Self::build(debug_audio_dir(), rate)
+    }
+
+    /// 测试入口：可注入目录。Warn 级下与 `new` 同样完全不动作（连目录都不建）。
+    #[cfg(test)]
+    fn new_in(dir: PathBuf, rate: u32) -> Option<Self> {
+        if !log::log_enabled!(log::Level::Debug) {
+            return None;
+        }
+        Self::build(dir, rate)
+    }
+
+    fn build(dir: PathBuf, rate: u32) -> Option<Self> {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log::warn!("[DBG-418] cannot create dump dir {}: {e}", dir.display());
+            return None;
+        }
+        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        Some(Self {
+            dir,
+            ts,
+            rate,
+            buf: Vec::new(),
+            written: false,
+        })
+    }
+
+    /// 录音线程内只累积（不写盘、不阻塞）。
+    fn push(&mut self, chunk: &[f32]) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.buf.extend_from_slice(chunk);
+    }
+
+    /// 测试入口：**同步**写盘（生产 Drop 走后台线程，异步）。
+    #[cfg(test)]
+    fn finish_blocking(&mut self) -> std::io::Result<()> {
+        if self.written {
+            return Ok(());
+        }
+        self.written = true;
+        write_session_file(&self.dir, &self.ts, self.rate, &self.buf)
+    }
+}
+
+/// DEBUG-SESSION-WAV-418：写 session WAV + 日志 + 上限闸门。生产由 `Drop` 的**后台线程**
+/// 调用（失败只 warn，不影响任何流程）；测试同步调用以断言 WAV 内容。
+fn write_session_file(dir: &Path, ts: &str, rate: u32, buf: &[f32]) -> std::io::Result<()> {
+    let name = format!("session-{}.wav", ts);
+    write_wav_pcm16(&dir.join(&name), buf, rate)?;
+    log::debug!(
+        "[DBG-418] session dump: file={} rate={} secs={:.2} samples={}",
+        name,
+        rate,
+        buf.len() as f32 / rate.max(1) as f32,
+        buf.len()
+    );
+    enforce_dump_limit_where(dir, SESSION_DUMP_MAX_FILES, is_session_dump_file);
+    Ok(())
+}
+
+impl Drop for SessionDump {
+    fn drop(&mut self) {
+        if self.written || self.buf.is_empty() {
+            return;
+        }
+        // 硬约束②：写盘移到后台线程，绝不阻塞录音/识别线程。
+        let buf = std::mem::take(&mut self.buf);
+        let dir = self.dir.clone();
+        let ts = self.ts.clone();
+        let rate = self.rate;
+        std::thread::spawn(move || {
+            if let Err(e) = write_session_file(&dir, &ts, rate, &buf) {
+                log::warn!("[DBG-418] session WAV write failed: {e}");
+            }
+        });
     }
 }
 
@@ -817,18 +944,30 @@ impl AudioCapture {
             );
         }
 
+        // DEBUG-SESSION-WAV-418：`-debug` 下累积**送入本地实时管线的 16k 单声道音频**
+        // （模型实际吃到的数据，即重采样后的 resampled），录音结束后由 `SessionDump::drop`
+        // 的后台线程写 WAV。Warn 级 `new` 返回 None ⇒ 零分配/零文件。所有 `on_chunk` 出口
+        // 统一经 `emit` ⇒ 三种录制模式只要走本采集链都被完整录下。
+        let mut session_dump = SessionDump::new(ASR_TARGET_RATE);
+        let mut emit = |buf: &[f32]| {
+            if let Some(d) = session_dump.as_mut() {
+                d.push(buf);
+            }
+            on_chunk(buf);
+        };
+
         // 推 pre-roll chunks 给回调（ASR 线程的 VAD 门控+建连会收到这些）
         for chunk in &pre_roll_chunks {
             let resampled = resampler.push(chunk);
             if !resampled.is_empty() {
-                on_chunk(&resampled);
+                emit(&resampled);
             }
         }
         // 推 post-hotkey chunks
         for chunk in &post_hotkey_chunks {
             let resampled = resampler.push(chunk);
             if !resampled.is_empty() {
-                on_chunk(&resampled);
+                emit(&resampled);
             }
         }
         // DIAG-LOCALRT-FIRSTCHAR-292：只读累积原始实时 chunk（未重采样，与 WAV 采样率一致）
@@ -873,7 +1012,7 @@ impl AudioCapture {
                         Ok((_ts, chunk)) if !chunk.is_empty() => {
                             let resampled = resampler.push(&chunk);
                             if !resampled.is_empty() {
-                                on_chunk(&resampled);
+                                emit(&resampled);
                             }
                             total_samples += chunk.len();
                             drained += 1;
@@ -949,7 +1088,7 @@ impl AudioCapture {
                     // 重采样后推回调（原始 chunk 的 RMS/level_buf 已在上面处理完）
                     let resampled = resampler.push(&chunk);
                     if !resampled.is_empty() {
-                        on_chunk(&resampled);
+                        emit(&resampled);
                     }
                     total_samples += chunk.len();
                 }
@@ -969,7 +1108,7 @@ impl AudioCapture {
         // 尾部截断行为一致。非空则最后再推一次回调。
         let tail = resampler.finish();
         if !tail.is_empty() {
-            on_chunk(&tail);
+            emit(&tail);
         }
 
         // FIX-ASR-DROP-288：只报**本次录音**真实丢包（全局累计 - 录音前基线），
@@ -3050,6 +3189,101 @@ mod tests {
             ],
             "保留最新 3 个 dump + 不误删非 dump 文件"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ============================================================
+    // DEBUG-SESSION-WAV-418：`-debug` 整段录音落盘
+    //   （与 292 同用 LOG_LEVEL_MUTEX 串行化全局 max_level）
+    // ============================================================
+
+    #[test]
+    fn diag418_quiet_at_warn_and_writes_full_session_at_debug() {
+        let _level_guard = LOG_LEVEL_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = log::set_boxed_logger(Box::new(CapLogger));
+        let dir = dump_test_dir("session418");
+
+        // 不带 -debug（Warn）：零动作
+        log::set_max_level(log::LevelFilter::Warn);
+        assert!(!log::log_enabled!(log::Level::Debug));
+        assert!(
+            SessionDump::new_in(dir.clone(), 16000).is_none(),
+            "Warn 下必须不创建 session dump"
+        );
+        assert!(!dir.exists(), "Warn 下连目录都不许建");
+
+        // 带 -debug：累积 16k 单声道 → finish_blocking 同步写盘
+        log::set_max_level(log::LevelFilter::Debug);
+        let chunks: Vec<Vec<f32>> = vec![vec![0.25f32; 1600], vec![-0.5f32; 3200]];
+        let original = chunks.clone();
+        {
+            let mut d = SessionDump::new_in(dir.clone(), 16000).expect("Debug 下应有 session dump");
+            for c in &chunks {
+                d.push(c);
+            }
+            d.finish_blocking().expect("写盘应成功");
+        }
+        let files = list_wavs(&dir);
+        assert_eq!(files.len(), 1, "应恰 1 个 session 文件");
+        assert!(files[0].starts_with("session-"), "文件名前缀 session-");
+        let (rate, ch, align, data_len) = read_wav_header(&dir.join(&files[0]));
+        assert_eq!(rate, 16000, "采样率写真实值 16000");
+        assert_eq!(ch, 1);
+        assert_eq!(align, 2);
+        assert_eq!(data_len as usize, 4800 * 2, "4800 样本 × i16");
+        // 独立解码（等价「系统播放器能打开」）
+        let decoded = sherpa_onnx::Wave::read(
+            dir.join(&files[0])
+                .to_str()
+                .expect("temp WAV 路径应为有效 UTF-8"),
+        )
+        .expect("sherpa Wave 必须能解析 session WAV");
+        assert_eq!(decoded.sample_rate(), 16000);
+        assert_eq!(decoded.samples().len(), 4800, "时长/样本数须与输入一致");
+        // 只读性：dump 不得改动喂给管线的样本
+        assert_eq!(chunks, original, "dump 不得改动一个 bit");
+        log::set_max_level(log::LevelFilter::Warn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn diag418_session_limit_10_separate_from_preroll() {
+        let dir = dump_test_dir("session418limit");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"keep").unwrap();
+        for i in 0..12 {
+            std::fs::write(dir.join(format!("session-20260101-0000{i:02}.wav")), b"x").unwrap();
+        }
+        for i in 0..3 {
+            std::fs::write(dir.join(format!("preroll-20260101-00000{i}.wav")), b"x").unwrap();
+        }
+        let removed = enforce_dump_limit_where(&dir, SESSION_DUMP_MAX_FILES, is_session_dump_file);
+        assert_eq!(removed, 2, "12 session → 10 应删最旧 2 个");
+        let sessions = || -> Vec<String> {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| is_session_dump_file(n))
+                .collect()
+        };
+        let mut s = sessions();
+        s.sort();
+        assert_eq!(s.len(), 10, "session 保留 10");
+        assert_eq!(
+            s.first().unwrap(),
+            "session-20260101-000002.wav",
+            "删的是最旧"
+        );
+        assert!(
+            dir.join("preroll-20260101-000000.wav").exists(),
+            "preroll 不动"
+        );
+        assert!(dir.join("notes.txt").exists(), "非 dump 文件不动");
+        // 反向：preroll 闸门不得动 session
+        let removed2 = enforce_dump_limit(&dir, 20);
+        assert_eq!(removed2, 0, "3 个 preroll ≤ 20 ⇒ 不删");
+        assert_eq!(sessions().len(), 10, "preroll 闸门不得动 session");
         std::fs::remove_dir_all(&dir).ok();
     }
 
