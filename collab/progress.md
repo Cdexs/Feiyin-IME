@@ -1,4 +1,9 @@
 
+### 2026-09-25 · LOCALRT-PREVIEW-HIDE-NONUSER-429 交付（声纹全剔段立即从预览移除，只改 main.rs）
+
+- `PreviewReflow` 加 `non_user_hide`；harvest full_drop 窗发回灌 = 已定稿权威文本 + 该段之后的流式尾巴（剔除本段流式，`[DBG-429]`）；`render_authoritative_reflow` hide 分支用 `reflow_preview`（acc 空也成立）。本人逐位不变、编辑态照拦、最终文本不受影响。
+- `fix429_tests` 2/2；fmt/check/全量 test 0 failed（bin 1817P/0F/61I）。harvest 平台中立、渲染 cfg(windows)（MACOS-HANDOFF 已记）。Gavin 目视：放他人音频该段精解完成后预览立即消失。未出包。
+
 ### 2026-09-25 · LOCALRT-ALWAYS-CONTEXT-427 交付（所有常规窗带前一片后缀，只改 main.rs）
 
 - `short_context_span` 判据改为「紧邻前一片仍在缓冲内即取后缀」（`must_start-1 >= buf_base`），不再受 `gs`/10s 组窗上限影响；首片 / 前片出缓冲无前文。其余沿 413 路径。
@@ -13,6 +18,12 @@
 
 - 新增 `emit_tail_window!` 宏统一组装末尾窗（有前片 ⇒ 前片后缀 + pending；首片 ⇒ `tail_window_alone` 单独解），长静默 407 与松键收尾共用；`plan_windows` 删 `is_tail`/规则 4、删 `TAIL_MERGE_MAX_SECS`；松键 `pending_slice.take()` 防重复。
 - 旧护栏 `ts413_rule4_*`→`ts423_*`、testsync386/407/411/413 改写；fmt EXIT0 / check 0 error、warnings 91/87≤基线 / 全量 test 0 failed（bin 1801P/0F/55I）。平台中立，MACOS-HANDOFF 已记。未出包。
+
+### 2026-09-25 · TEST-SYNC-426 交付（空/Err 重试的非作者护栏 9 条，生产零改动）
+
+- 只加 `src/transcription/mod.rs::testsync426_tests`（9 条）：首解成功不重解 / 空·Err 重解恰 1 次（Ok 采用、Err·空 invalid 返空）/ `lang_to_sherpa` 四语+未知 / 421 全剔早退序 / Echo·Tag·Collapse 触发重解 + 带语种锚点。
+- 🔴 报告：`lang_to_sherpa` 对 `ZH`/`zh-CN`/`en-US`/` ch` 均 None（静默不指定），生产现为小写短码不触发，只报告不改。
+- 白名单：fmt EXIT 0、check 0 error / warnings 91/87 ≤ 基线；未跑 `cargo test`。未出包。
 
 ### 2026-09-25 · DIAG-FRAG-AND-PREVIEW-428 交付（碎片窗 + 浮层预览他人语音，只读诊断）
 

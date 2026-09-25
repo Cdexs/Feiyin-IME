@@ -9,6 +9,13 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-1 — LOCALRT-PREVIEW-HIDE-NONUSER-429 ✅ 交付（方案 B1，只改 main.rs）
+
+- **范围**：`src/main.rs`：`PreviewReflow.non_user_hide` 字段；harvest `last_authoritative` + full_drop 回灌（`[DBG-429]`）；`render_authoritative_reflow` 增参 + hide 合成；`fix429_tests` 2 条。
+- **效果**：声纹整窗全剔后，该段精解完成即从预览移除该段文字、保留其后流式；本人（dropped=0）逐位不变；仍经 `reflow_action`（编辑态/取消照拦）；最终文本不受影响（421 已空）。
+- **验证**：fmt EXIT0 / check 0 error、warnings 91/87≤基线 / 全量 test 0 failed（bin 1817P/0F/61I）。harvest 平台中立、渲染 `cfg(windows)` 仅 Windows 浮层生效（MACOS-HANDOFF 已记）。未 commit / 未 build / 版本未动 / 零凭证。
+- **Gavin 目视**：放他人音频 ⇒ 该段精解完成后预览该段文字立即消失、其后本人文字保留。
+
 ## 2026-09-25 — coder-1 — LOCALRT-ALWAYS-CONTEXT-427 ✅ 交付（只改 main.rs 组窗/派发区）
 
 - **范围**：`src/main.rs`：`short_context_span` 判据/签名、调用点、doc；413/423 断言同步；新增 `ts427_*` 3 条 + `diag427_context`（`#[ignore]`）。
@@ -46,6 +53,14 @@
 - **改动**：新增共用状态机 `next_top_token`/`brace_match`/`item_end`（串/原始串/字符与生命周期区分/行块注释可嵌套），`prod_lines_excluding_cfg_test` 与 `fn_body` **共用同一份**（禁两份）。
 - **碰巧通过报告**：`testsync377::main_has_no_cross_recording_ctx_cache` 命中测试模块**前的注释**（旧扫描器误剔使其未计入）⇒ 按其文档契约补注释过滤（不放宽代码不变量）。
 - **验证**：新增 `guard_prod_lines::tests` 3 条；fmt EXIT0 / check 0 error、warnings 91/87=基线 / 全量 test **0 failed**（bin 1802P/0F/55I）；`testsync421` 由红转绿。未 commit / 未 build / 版本未动 / 零凭证。
+
+## 2026-09-25 — coder-2 — TEST-SYNC-426 ✅ 交付（阶段三·非作者护栏 9 条；生产零改动、不碰 main.rs）
+
+- **范围**：只在 `src/transcription/mod.rs` 新增 `#[cfg(test)] mod testsync426_tests`（9 条，`+158/0`）。
+- **契约**：① 首解成功不重解 ② 首解空/Err 进处置、重解恰 1 次（Ok 采用 / Err 或空 ⇒ invalid 返空）③ `lang_to_sherpa` 四语映射 + 未知/大小写/区域码 ⇒ None ④ 421 全剔早退在解码前（源码锚点序）⑤ Echo/Tag/Collapse 触发各自重解 1 次 + 重解带语种锚点。
+- 🔴 **报告**：`lang_to_sherpa` 对 `ZH`/`zh-CN`/`en-US`/` ch` 均 None ⇒ 重解静默不指定；生产现均为小写短码（`qwen3_prefix_lang`/`lang_from_charset`）不触发，但日后吐区域码会退化；**只报告未改生产**（加固 `trim+lowercase+split(['-','_'])` 另立单）。
+- **验证（白名单）**：fmt EXIT 0；check --all-targets 0 error、warnings 91/87 ≤ 基线、新模块零 warning；🔴 **未跑 cargo test**（阶段三禁止）。过程：coder-1 在途 main.rs（429）中间态致整 crate 一度失败，`mod.rs` 自身 0 error。
+- 红线：未改生产 / 未 commit / 未 push / 版本未动 / 零凭证。
 
 ## 2026-09-25 — coder-2 — DIAG-FRAG-AND-PREVIEW-428 ✅ 交付（只读诊断；生产零改动、未碰 main.rs）
 
