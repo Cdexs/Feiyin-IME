@@ -2352,6 +2352,43 @@ pub(crate) const ALIGN_MIN_OVERLAP_CHARS: usize = 8;
 /// 重叠相对「新窗有效字」的比例下限（长度门）。
 pub(crate) const ALIGN_MIN_OVERLAP_RATIO: f32 = 0.30;
 
+/// 🔴 FIX-ALIGN-GATE-416：**宽松对齐**（仅有区间先验时）允许的最大编辑率。
+/// 重叠区是同一段音频被两次精解，差一两个字、标点不同很常见；15%（[`ALIGN_MAX_EDIT_RATIO`]）
+/// 对 12 字的真实重叠只容忍 1 个字差 ⇒ 严格层失败后放宽到本值再试一次。
+pub(crate) const LOOSE_ALIGN_MAX_EDIT_RATIO: f32 = 0.35;
+/// 🔴 FIX-ALIGN-GATE-416：宽松对齐搜索范围 = 期望重叠 `e` 的 `[0.5e, 1.5e]`。
+pub(crate) const LOOSE_ALIGN_RANGE_FACTOR: f32 = 1.5;
+
+/// 🔴 FIX-ALIGN-GATE-416：接缝去重兜底 —— 认定「接缝重复」所需的最少连续有效字数。
+/// ≥4 保护口语本身的短重复（如「好的好的」2 字）；不足 4 字不判接缝。
+pub(crate) const SEAM_DEDUPE_MIN_CHARS: usize = 4;
+/// 🔴 FIX-ALIGN-GATE-416：接缝重复片段必须出现在新窗前 `factor × e` 有效字内（`e` = 期望重叠字数）。
+pub(crate) const SEAM_DEDUPE_WINDOW_FACTOR: f32 = 1.5;
+
+/// FIX-ALIGN-GATE-416：对齐命中的层级（供 `[DBG-416] seam` 统计与快照翻转）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AlignLayer {
+    /// 层 1 严格对齐（现有 ①②③ + 有先验时放宽的长度门）。
+    Strict,
+    /// 层 2 宽松对齐（编辑率 ≤ [`LOOSE_ALIGN_MAX_EDIT_RATIO`]）。
+    Loose,
+    /// 层 3 接缝去重（精确相同片段只留一份）。
+    Dedupe,
+    /// 层 4 原样拼接（最后手段；宁可重复不丢字）。
+    Concat,
+}
+
+impl AlignLayer {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            AlignLayer::Strict => "strict",
+            AlignLayer::Loose => "loose",
+            AlignLayer::Dedupe => "dedupe",
+            AlignLayer::Concat => "concat",
+        }
+    }
+}
+
 /// 对齐结果。
 pub(crate) struct AlignResult {
     /// `prev` 中**可定稿**的前缀（原文，含标点）；空 = 不滑动。
@@ -2360,6 +2397,10 @@ pub(crate) struct AlignResult {
     pub overlap_chars: usize,
     /// 是否同时满足「长度门 + 质量门」⇒ 允许滑动定稿。
     pub ok: bool,
+    /// FIX-416：命中层级（`ok=true` 才有意义）。
+    pub layer: AlignLayer,
+    /// FIX-416：命中 `k` 的编辑率（`edit / k`）。
+    pub edit_ratio: f32,
 }
 
 fn edit_distance_chars(a: &[char], b: &[char]) -> usize {
@@ -2408,29 +2449,45 @@ fn expected_k_band(expected_k: usize, min_len: usize, hi_all: usize) -> (usize, 
     )
 }
 
-/// 取 `k` 作为重叠长度试一次质量门；通过 ⇒ 返回定稿结果，否则 `None`。
-fn align_try_k(
+/// 取 `k` 作为重叠长度试一次质量门（编辑率 ≤ `max_ratio`）；通过 ⇒ 返回定稿结果，否则 `None`。
+fn align_try_k_ratio(
     prev: &str,
     prev_keep: &[(usize, char)],
     new_keep: &[char],
     k: usize,
+    max_ratio: f32,
 ) -> Option<AlignResult> {
+    if k == 0 || k > prev_keep.len() || k > new_keep.len() {
+        return None;
+    }
     let p_tail: Vec<char> = prev_keep[prev_keep.len() - k..]
         .iter()
         .map(|(_, c)| *c)
         .collect();
     let dist = edit_distance_chars(&p_tail, &new_keep[..k]);
     let ratio = dist as f32 / k as f32;
-    if ratio <= ALIGN_MAX_EDIT_RATIO {
+    if ratio <= max_ratio {
         let cut_byte = prev_keep[prev_keep.len() - k].0;
         Some(AlignResult {
             committed_prefix: prev[..cut_byte].to_string(),
             overlap_chars: k,
             ok: true,
+            layer: AlignLayer::Strict,
+            edit_ratio: ratio,
         })
     } else {
         None
     }
+}
+
+/// 严格质量门（编辑率 ≤ [`ALIGN_MAX_EDIT_RATIO`]）。
+fn align_try_k(
+    prev: &str,
+    prev_keep: &[(usize, char)],
+    new_keep: &[char],
+    k: usize,
+) -> Option<AlignResult> {
+    align_try_k_ratio(prev, prev_keep, new_keep, k, ALIGN_MAX_EDIT_RATIO)
 }
 
 fn align_fail() -> AlignResult {
@@ -2438,6 +2495,8 @@ fn align_fail() -> AlignResult {
         committed_prefix: String::new(),
         overlap_chars: 0,
         ok: false,
+        layer: AlignLayer::Concat,
+        edit_ratio: 1.0,
     }
 }
 
@@ -2495,6 +2554,12 @@ impl AlignPrior {
 /// 4. **④ 兜底**：拿不到区间信息 ⇒ **升序**（小 `k` 优先）：`k` 小 ⇒ 切点靠后 ⇒ `committed` 更长
 ///    ⇒ 最坏是**重复**；`k` 大 ⇒ 切点靠前 ⇒ **丢字**。Gavin 优先级：**丢字 P0、重复可容忍**
 ///    ⇒ 退化方向只能往重复偏，绝不能往丢字偏。
+///
+/// 🔴 FIX-ALIGN-GATE-416（2026-09-25）：**有区间先验时长度门放宽为 `≥ ALIGN_MIN_OVERLAP_CHARS(8)`**，
+/// 不再用比例门 `0.30 × 新窗有效字`。原因：413 起常规窗重叠只是**前一片后缀**（≈12 字），
+/// 新句一长比例就 <0.30 ⇒ 真实重叠被比例门挡在外面 ⇒ `align_fail` ⇒ 退回拼接 ⇒ 后缀重复（416 复现：
+/// 后缀 12 字 + 新句 30 字 ⇒ min_len 13 > 真重叠 12）。有先验时重叠有多长已由样本占比（① ②）约束，
+/// 无需再用比例门猜。**④ 兜底与无先验路径的比例门不变**（防误配、退化方向仍偏重复）。
 pub(crate) fn align_overlap_with_prior(prev: &str, new: &str, prior: AlignPrior) -> AlignResult {
     let prev_keep: Vec<(usize, char)> = prev
         .char_indices()
@@ -2505,9 +2570,13 @@ pub(crate) fn align_overlap_with_prior(prev: &str, new: &str, prior: AlignPrior)
         return align_fail();
     }
     let max_k = prev_keep.len().min(new_keep.len());
-    let min_len = ALIGN_MIN_OVERLAP_CHARS
-        .max((new_keep.len() as f32 * ALIGN_MIN_OVERLAP_RATIO).ceil() as usize);
-    if max_k < min_len {
+    // 🔴 FIX-ALIGN-GATE-416：两种长度门。
+    // - `floor`（有区间先验时）：只要求 ≥ ALIGN_MIN_OVERLAP_CHARS。413 后重叠只是前一片后缀
+    //   （≈12 字），占新窗比例随新句变长而变小，比例门会把真实重叠挡在外面 ⇒ 后缀重复。
+    // - `ratio_min`（④ 兜底 / 无先验）：保留原比例门「宁可重复、绝不丢字」。
+    let floor = ALIGN_MIN_OVERLAP_CHARS;
+    let ratio_min = floor.max((new_keep.len() as f32 * ALIGN_MIN_OVERLAP_RATIO).ceil() as usize);
+    if max_k < floor {
         return align_fail();
     }
     // ① 硬上界（精确）：m ≥ 1 ⇒ k < prev 有效字数。
@@ -2517,42 +2586,162 @@ pub(crate) fn align_overlap_with_prior(prev: &str, new: &str, prior: AlignPrior)
         max_k
     };
     let hi_all = max_k.min(hi_hard);
-    if min_len > hi_all {
-        return align_fail();
-    }
     // ② 软范围（估算，粗筛）
-    if let Some(e_raw) = prior
+    let prior_k = prior
         .expected_ratio
         .filter(|r| r.is_finite() && *r > 0.0 && *r <= 1.0)
-        .map(|r| ((new_keep.len() as f32) * r).round() as usize)
-    {
-        let (lo, hi) = expected_k_band(e_raw, min_len, hi_all);
-        if lo <= hi {
-            let e = e_raw.clamp(lo, hi);
-            // ③ 质量门：期望值本身 → 向小 → 向大
-            if let Some(r) = align_try_k(prev, &prev_keep, &new_keep, e) {
+        .map(|r| ((new_keep.len() as f32) * r).round() as usize);
+    if let Some(e_raw) = prior_k {
+        // 🔴 e < floor 时**不进入**放宽路径：窄带会把 `k` 抬到 `floor`(>e) ⇒ 切多 ⇒ 丢字。
+        // 交给 ④（比例门）/ 接缝去重 / 拼接（宁重复不丢字）。
+        if e_raw >= floor {
+            // 有先验 ⇒ 窄带用**放宽门** `floor` 夹紧（不再让比例门把真值挡在外面）。
+            if floor <= hi_all {
+                let (lo, hi) = expected_k_band(e_raw, floor, hi_all);
+                if lo <= hi {
+                    let e = e_raw.clamp(lo, hi);
+                    // ③ 质量门：期望值本身 → 向小 → 向大
+                    if let Some(r) = align_try_k(prev, &prev_keep, &new_keep, e) {
+                        return r;
+                    }
+                    for k in (lo..e).rev() {
+                        if let Some(r) = align_try_k(prev, &prev_keep, &new_keep, k) {
+                            return r;
+                        }
+                    }
+                    for k in (e + 1)..=hi {
+                        if let Some(r) = align_try_k(prev, &prev_keep, &new_keep, k) {
+                            return r;
+                        }
+                    }
+                }
+            }
+            // 🆕 层 2 宽松对齐（FIX-416，仅有区间先验时）：严格失败后，在期望重叠 `e` 的
+            // `[0.5e, 1.5e]` 内逐个 k 算编辑率，取**编辑率最低**者；≤ [`LOOSE_ALIGN_MAX_EDIT_RATIO`] 即采用。
+            // 理由：重叠区是同一段音频两次精解，差一两个字 / 标点不同很常见；15% 对 12 字只容忍 1 字差。
+            let loose_lo = (((e_raw as f32) * 0.5).ceil() as usize).max(floor).max(1);
+            let loose_hi =
+                (((e_raw as f32) * LOOSE_ALIGN_RANGE_FACTOR).floor() as usize).min(hi_all);
+            let mut best: Option<AlignResult> = None;
+            for k in loose_lo..=loose_hi {
+                if let Some(r) =
+                    align_try_k_ratio(prev, &prev_keep, &new_keep, k, LOOSE_ALIGN_MAX_EDIT_RATIO)
+                {
+                    let better = match &best {
+                        None => true,
+                        Some(b) => r.edit_ratio < b.edit_ratio,
+                    };
+                    if better {
+                        best = Some(r);
+                    }
+                }
+            }
+            if let Some(mut r) = best {
+                r.layer = AlignLayer::Loose;
                 return r;
             }
-            for k in (lo..e).rev() {
-                if let Some(r) = align_try_k(prev, &prev_keep, &new_keep, k) {
-                    return r;
-                }
-            }
-            for k in (e + 1)..=hi {
-                if let Some(r) = align_try_k(prev, &prev_keep, &new_keep, k) {
-                    return r;
-                }
-            }
         }
-        // 窄带内无解 ⇒ 落到 ④ 兜底（**硬约束仍生效**：hi_all 已按 ① 收紧）
+        // 窄带 / 宽松层均无解（或 e < floor）⇒ 落到 ④ 兜底（**比例门此时才生效**）。
     }
-    // ④ 兜底 / 退化：**升序**（小 k 优先 ⇒ 最坏是重复，绝不丢字）
-    for k in min_len..=hi_all {
+    // ④ 兜底 / 退化：原比例长度门，**升序**（小 k 优先 ⇒ 最坏是重复，绝不丢字）。
+    if ratio_min > hi_all {
+        return align_fail();
+    }
+    for k in ratio_min..=hi_all {
         if let Some(r) = align_try_k(prev, &prev_keep, &new_keep, k) {
             return r;
         }
     }
     align_fail()
+}
+
+/// 🔴 FIX-ALIGN-GATE-416 层 3：接缝去重兜底。
+///
+/// 前两层对齐都失败、即将退回拼接前调用：若「前文末尾」与「新窗开头」存在**紧挨着的精确相同片段**
+/// （去标点/空白后比较、≥ [`SEAM_DEDUPE_MIN_CHARS`] 有效字、且出现在新窗前
+/// `[`SEAM_DEDUPE_WINDOW_FACTOR`]×e` 有效字内），只保留一份。
+/// 返回 `(可定稿前缀, 重复片段有效字数)`；不满足 ⇒ `None`（原样拼接，宁可重复不丢字）。
+fn seam_dedupe(prev: &str, new: &str, expected_k: Option<usize>) -> Option<(String, usize)> {
+    let prev_keep: Vec<(usize, char)> = prev
+        .char_indices()
+        .filter(|(_, c)| align_keep_char(*c))
+        .collect();
+    let new_keep: Vec<char> = new.chars().filter(|c| align_keep_char(*c)).collect();
+    let max_m = prev_keep.len().min(new_keep.len());
+    if max_m < SEAM_DEDUPE_MIN_CHARS {
+        return None;
+    }
+    // 上限：接缝片段须落在新窗前 `factor×e` 内；无先验 ⇒ 只要求 ≥ MIN。
+    let cap = expected_k
+        .map(|e| ((e as f32) * SEAM_DEDUPE_WINDOW_FACTOR).ceil() as usize)
+        .unwrap_or(max_m);
+    let hi = max_m.min(cap);
+    if hi < SEAM_DEDUPE_MIN_CHARS {
+        return None;
+    }
+    // 从最长候选往短找：prev 末尾 m 有效字 == new 开头 m 有效字（精确）。
+    for m in (SEAM_DEDUPE_MIN_CHARS..=hi).rev() {
+        let tail = &prev_keep[prev_keep.len() - m..];
+        if tail
+            .iter()
+            .map(|(_, c)| *c)
+            .eq(new_keep[..m].iter().copied())
+        {
+            let cut_byte = tail[0].0;
+            return Some((prev[..cut_byte].to_string(), m));
+        }
+    }
+    None
+}
+
+/// FIX-ALIGN-GATE-416：一次「有重叠」的最终决策（层 1~4），供 `push_inner` 与单测共用。
+struct OverlapResolution {
+    /// 定稿前缀；`None` = 原样拼接（层 4）。
+    committed_prefix: Option<String>,
+    layer: AlignLayer,
+    /// 命中 `k`（有效字）；层 4 为 0。
+    k: usize,
+    /// 期望重叠字数 `e`（有先验时）。
+    expected_k: Option<usize>,
+    /// 命中 `k` 的编辑率；层 3/4 无意义（`NAN`）。
+    edit_ratio: f32,
+}
+
+/// FIX-ALIGN-GATE-416：**把拼接降为最后手段** —— 严格 → 宽松 → 接缝去重 → 拼接。
+fn resolve_overlap(prev: &str, new: &str, prior: AlignPrior) -> OverlapResolution {
+    let expected_k = prior
+        .expected_ratio
+        .filter(|r| r.is_finite() && *r > 0.0 && *r <= 1.0)
+        .map(|r| {
+            let eff = new.chars().filter(|c| align_keep_char(*c)).count();
+            ((eff as f32) * r).round() as usize
+        });
+    let a = align_overlap_with_prior(prev, new, prior);
+    if a.ok {
+        return OverlapResolution {
+            committed_prefix: Some(a.committed_prefix),
+            layer: a.layer,
+            k: a.overlap_chars,
+            expected_k,
+            edit_ratio: a.edit_ratio,
+        };
+    }
+    if let Some((prefix, m)) = seam_dedupe(prev, new, expected_k) {
+        return OverlapResolution {
+            committed_prefix: Some(prefix),
+            layer: AlignLayer::Dedupe,
+            k: m,
+            expected_k,
+            edit_ratio: f32::NAN,
+        };
+    }
+    OverlapResolution {
+        committed_prefix: None,
+        layer: AlignLayer::Concat,
+        k: 0,
+        expected_k,
+        edit_ratio: f32::NAN,
+    }
 }
 
 /// SLIDING-WINDOW-367（阶段四·B）/ TUNE-DECODE-SERIAL-AND-TOKEN-CAP-390：窗口解码**并发度**。
@@ -2707,26 +2896,36 @@ impl OrderedReflow {
                             //    —— VAD 片都有话音 ⇒ 那些片文本必须落在 committed_prefix 里。
                             prev_extra_slices: ws.saturating_sub(prev_start),
                         };
-                        let a = align_overlap_with_prior(&self.last_window_text, &text, prior);
-                        if a.ok {
-                            if !a.committed_prefix.is_empty() {
-                                self.committed.push_str(&a.committed_prefix);
+                        // 🔴 FIX-ALIGN-GATE-416：严格 → 宽松 → 接缝去重 → 拼接（把拼接降为最后手段）。
+                        let res = resolve_overlap(&self.last_window_text, &text, prior);
+                        match &res.committed_prefix {
+                            Some(p) => {
+                                if !p.is_empty() {
+                                    self.committed.push_str(p);
+                                }
                             }
-                        } else {
-                            // 有重叠但对齐未过（如长度门误拒）⇒ 退回拼接：宁可重复不可丢字。
-                            self.committed.push_str(&self.last_window_text);
-                            if log::log_enabled!(log::Level::Debug) {
-                                log::debug!(
-                                    "[SLIDING-WINDOW-367] reflow 有重叠但对齐未过，退回拼接（seq={} span=[{},{}) prev=[{}, {}) m={} ratio={:?}）",
-                                    seq,
-                                    ws,
-                                    we,
-                                    prev_start,
-                                    prev_end,
-                                    prior.prev_extra_slices,
-                                    prior.expected_ratio
-                                );
+                            None => {
+                                // 前 3 层都没能去重 ⇒ 原样拼接：宁可重复不可丢字。
+                                self.committed.push_str(&self.last_window_text);
                             }
+                        }
+                        if log::log_enabled!(log::Level::Debug) {
+                            log::debug!(
+                                "[DBG-416] seam: layer={} k={} e={} edit={:.2} seq={} span=[{}, {}) prev=[{}, {}) m={} ratio={:?}",
+                                res.layer.as_str(),
+                                res.k,
+                                res.expected_k
+                                    .map(|e| e.to_string())
+                                    .unwrap_or_else(|| "na".to_string()),
+                                res.edit_ratio,
+                                seq,
+                                ws,
+                                we,
+                                prev_start,
+                                prev_end,
+                                prior.prev_extra_slices,
+                                prior.expected_ratio
+                            );
                         }
                     }
                     self.last_window_text = text;
@@ -8724,5 +8923,478 @@ mod testsync406_408b_tests {
             !src.contains("let need_redo =\n        had_drop;"),
             "契约 7：已就绪档有剔除时**不**重解（不得无条件重解）"
         );
+    }
+}
+
+// =====================================================================
+// REPRO-413-ALIGN-GATE-416 / FIX-ALIGN-GATE-416：413 常规窗对齐长度门
+// ---------------------------------------------------------------------
+// 复现 → 修复 → 快照翻转。形状：窗 A span(0,1)=S1；窗 B span(0,2)、
+// samples=[后缀,新片]、文本=S1 末尾 k 字（±错字/标点）+ S2。
+// 层：严格 → 宽松 → 接缝去重 → 拼接（`resolve_overlap`）。
+// =====================================================================
+#[cfg(test)]
+mod repro416_tests {
+    use super::{
+        align_keep_char, resolve_overlap, seam_dedupe, AlignLayer, AlignPrior, OrderedReflow,
+        OverlapResolution,
+    };
+
+    /// 样本按 3.5 字/秒折算 ⇒ `expected_overlap_ratio` 与**字数**一致（1 字 = 4571 样本）。
+    const SAMPLES_PER_CHAR: usize = 4571;
+
+    fn eff(t: &str) -> usize {
+        t.chars().filter(|c| align_keep_char(*c)).count()
+    }
+
+    /// S1：一句 60 互异汉字（非空白/标点 ⇒ 有效字 60），避免周期性造成意外匹配。
+    fn s1_chars() -> Vec<char> {
+        (0..60)
+            .map(|i| char::from_u32(0x4E00 + i as u32).unwrap())
+            .collect()
+    }
+
+    /// S2：另一套互异汉字，取前 `n` 个（与 S1 无交集）。
+    fn s2(n: usize) -> String {
+        (0..n)
+            .map(|i| char::from_u32(0x5B00 + i as u32).unwrap())
+            .collect()
+    }
+
+    /// 在 `k` 字后缀上制造 `errors` 个错字（从首字起，替换为 \u{9F00}+i），可选插一个标点。
+    /// 🔴 错字放后缀**最前** ⇒ 接缝「头对齐」精确片段最短，是第 3 层去重的最坏情形。
+    fn build_suffix(s1: &[char], k: usize, errors: usize, punct: Option<char>) -> String {
+        let mut cs: Vec<char> = s1[s1.len() - k..].to_vec();
+        for (i, c) in cs.iter_mut().enumerate().take(errors.min(k)) {
+            *c = char::from_u32(0x9F00 + i as u32).unwrap();
+        }
+        let mut s: String = cs.into_iter().collect();
+        if let Some(p) = punct {
+            let mid = s.chars().count() / 2;
+            let byte = s.char_indices().nth(mid).map(|(b, _)| b).unwrap_or(s.len());
+            s.insert(byte, p);
+        }
+        s
+    }
+
+    /// 单格结果。`layer` = 命中层级；`dup`/`loss` = 最终长度相对理想。
+    struct Cell {
+        layer: AlignLayer,
+        dup: bool,
+        loss: bool,
+        final_len: usize,
+        ideal_len: usize,
+    }
+
+    /// 413 形状端到端跑 `OrderedReflow`；`layer` 取自同输入的 `resolve_overlap`。
+    fn run_cell(s1: &[char], n2: usize, k: usize, errors: usize, punct: Option<char>) -> Cell {
+        let s1_str: String = s1.iter().collect();
+        let text_b = format!("{}{}", build_suffix(s1, k, errors, punct), s2(n2));
+        let prior = AlignPrior {
+            expected_ratio: Some(k as f32 / (k + n2) as f32),
+            prev_extra_slices: 0,
+        };
+        let layer = resolve_overlap(&s1_str, &text_b, prior).layer;
+        let mut r = OrderedReflow::new();
+        // 窗 A：span (0,1)、S1 全文。
+        let _ = r.push_window(0, 0, 1, vec![s1.len() * SAMPLES_PER_CHAR], s1_str.clone());
+        // 窗 B：span (0,2)、samples=[后缀样本, 新片样本]、文本 = 后缀 + S2。
+        let _ = r.push_window(
+            1,
+            0,
+            2,
+            vec![k * SAMPLES_PER_CHAR, n2 * SAMPLES_PER_CHAR],
+            text_b,
+        );
+        let (committed, last) = r.finish();
+        let flen = format!("{}{}", committed, last).chars().count();
+        let ideal = s1.len() + n2;
+        Cell {
+            layer,
+            dup: flen > ideal,
+            loss: flen < ideal,
+            final_len: flen,
+            ideal_len: ideal,
+        }
+    }
+
+    fn layer_short(l: AlignLayer) -> char {
+        match l {
+            AlignLayer::Strict => 's',
+            AlignLayer::Loose => 'l',
+            AlignLayer::Dedupe => 'd',
+            AlignLayer::Concat => 'c',
+        }
+    }
+
+    fn status(c: &Cell) -> char {
+        if c.dup {
+            'D'
+        } else if c.loss {
+            'L'
+        } else {
+            '='
+        }
+    }
+
+    fn code(c: &Cell) -> String {
+        format!("{}{}", layer_short(c.layer), status(c))
+    }
+
+    const N2S: [usize; 5] = [10, 20, 30, 45, 60];
+    const KS: [usize; 3] = [8, 12, 16];
+
+    /// 状态网格（仅 `=`/`D`/`L`）。
+    fn status_grid(errors: usize) -> String {
+        let s1 = s1_chars();
+        let mut out = String::new();
+        for &n2 in &N2S {
+            let row: String = KS
+                .iter()
+                .map(|&k| status(&run_cell(&s1, n2, k, errors, None)))
+                .collect();
+            out.push_str(&format!("errors={} n2={:>2} : {}\n", errors, n2, row));
+        }
+        out
+    }
+
+    /// 层级网格（层 s/l/d/c + 状态 =/D/L）。
+    fn layer_grid() -> String {
+        let s1 = s1_chars();
+        let mut out = String::new();
+        for &errors in &[0usize, 1, 2, 3] {
+            for &n2 in &N2S {
+                let row: String = KS
+                    .iter()
+                    .map(|&k| code(&run_cell(&s1, n2, k, errors, None)))
+                    .collect();
+                out.push_str(&format!("errors={} n2={:>2} : {}\n", errors, n2, row));
+            }
+        }
+        out
+    }
+
+    /// 旧形状对照：整片重叠 ⇒ 真重叠 = S1 全长，对齐可成功去重、**无重复/丢字**。
+    #[test]
+    fn repro416_control_old_full_overlap_no_dup() {
+        let s1 = s1_chars();
+        let s1_str: String = s1.iter().collect();
+        for n2 in N2S {
+            let text_b = format!("{}{}", s1_str, s2(n2));
+            let mut r = OrderedReflow::new();
+            let _ = r.push_window(0, 0, 1, vec![s1.len() * SAMPLES_PER_CHAR], s1_str.clone());
+            let _ = r.push_window(
+                1,
+                0,
+                2,
+                vec![s1.len() * SAMPLES_PER_CHAR, n2 * SAMPLES_PER_CHAR],
+                text_b,
+            );
+            let (c, l) = r.finish();
+            let flen = format!("{}{}", c, l).chars().count();
+            assert_eq!(
+                flen,
+                s1.len() + n2,
+                "旧形状（整片重叠）不得重复/丢字：n2={n2}"
+            );
+        }
+    }
+
+    /// 🔴 修复后：0/1 错字全部**无重复、无丢字**（追加1 验收）；所有格**绝不丢字**；0 错字精确。
+    #[test]
+    fn repro416_post_fix_no_dup_no_loss() {
+        let s1 = s1_chars();
+        for &errors in &[0usize, 1, 2, 3] {
+            for &n2 in &N2S {
+                for &k in &KS {
+                    let c = run_cell(&s1, n2, k, errors, None);
+                    assert!(
+                        !c.loss,
+                        "丢字 P0：errors={errors} n2={n2} k={k} final={} ideal={}",
+                        c.final_len, c.ideal_len
+                    );
+                    if errors <= 1 {
+                        assert!(
+                            !c.dup,
+                            "0/1 错字不得重复：errors={errors} n2={n2} k={k} layer={:?}",
+                            c.layer
+                        );
+                    }
+                    if errors == 0 {
+                        assert_eq!(c.final_len, c.ideal_len, "0 错字应精确：n2={n2} k={k}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// 打印层级网格（`cargo test --bin feiyin-ime repro416 -- --nocapture`）。
+    #[test]
+    fn repro416_grid_prints_current_behavior() {
+        println!(
+            "\n[REPRO-416] 413 形状层级网格（层 s/l/d/c + 状态 =/D/L）：\n{}",
+            layer_grid()
+        );
+    }
+
+    /// 🔴 修复后快照：0/1/2 错字全 `=`（无重复无丢字）；3 错字仅 k=8 因宽松门 0.35 上限仍重复。
+    #[test]
+    fn repro416_snapshot_status() {
+        for &errors in &[0usize, 1, 2] {
+            for line in status_grid(errors).lines() {
+                let row = line.rsplit(':').next().unwrap().trim();
+                assert_eq!(row, "===", "errors={errors} 修复后应全 `=`：{line}");
+            }
+        }
+        for line in status_grid(3).lines() {
+            let row = line.rsplit(':').next().unwrap().trim();
+            assert_eq!(
+                row, "D==",
+                "errors=3 快照（k8 超宽松门上限 ⇒ 拼接）：{line}"
+            );
+        }
+    }
+
+    /// 标点差异（重叠区插逗号）不影响有效字对齐（`align_keep_char` 剥标点）。
+    #[test]
+    fn repro416_punct_variants_are_stripped() {
+        let s1 = s1_chars();
+        let s1_str: String = s1.iter().collect();
+        for &k in &KS {
+            for &n2 in &N2S {
+                let prior = AlignPrior {
+                    expected_ratio: Some(k as f32 / (k + n2) as f32),
+                    prev_extra_slices: 0,
+                };
+                let plain = format!("{}{}", build_suffix(&s1, k, 0, None), s2(n2));
+                let comma = format!("{}{}", build_suffix(&s1, k, 0, Some('，')), s2(n2));
+                let period = format!("{}{}", build_suffix(&s1, k, 0, Some('。')), s2(n2));
+                let lp = resolve_overlap(&s1_str, &plain, prior).layer;
+                assert_eq!(lp, AlignLayer::Strict, "无错字应为严格层");
+                assert_eq!(
+                    resolve_overlap(&s1_str, &comma, prior).layer,
+                    lp,
+                    "逗号不应改变层级"
+                );
+                assert_eq!(
+                    resolve_overlap(&s1_str, &period, prior).layer,
+                    lp,
+                    "句号不应改变层级"
+                );
+            }
+        }
+    }
+
+    /// 反例：完全不同的两段（无真重叠）⇒ **不得**被宽松层误对齐吃掉内容，走拼接且不丢字。
+    #[test]
+    fn repro416_guard_different_content_not_eaten() {
+        let prev = "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉";
+        let new = "一二三四五六七八九十百千万亿兆京垓秭穰沟涧";
+        let prior = AlignPrior {
+            expected_ratio: Some(0.4),
+            prev_extra_slices: 0,
+        };
+        let res = resolve_overlap(prev, new, prior);
+        assert_eq!(res.layer, AlignLayer::Concat, "无真重叠不得被宽松层命中");
+        assert!(res.committed_prefix.is_none());
+    }
+
+    /// 反例：口语本身 2 字重复不算接缝（<4 有效字）⇒ 第 3 层不处理。
+    #[test]
+    fn repro416_guard_short_colloquial_repeat_untouched() {
+        // 接缝处「好的」重复（2 字） < SEAM_DEDUPE_MIN_CHARS ⇒ 不去重。
+        assert!(seam_dedupe("我们走吧好的", "好的我们走吧", Some(4)).is_none());
+        // 同窗内「我觉得我觉得」不经接缝（seam 只看 prev 尾 / new 头）。
+        assert!(seam_dedupe("前文结束", "我觉得我觉得很有意思", Some(2)).is_none());
+    }
+
+    /// 反例：真实重叠 <8 字（floor）⇒ 仍 fail 走拼接（不丢字）。
+    #[test]
+    fn repro416_guard_true_overlap_below_floor_fails() {
+        let r = super::align_overlap_with_prior(
+            "甲乙丙丁戊己庚辛壬癸",
+            "辛壬癸ABC",
+            AlignPrior {
+                expected_ratio: Some(0.4),
+                prev_extra_slices: 0,
+            },
+        );
+        assert!(!r.ok, "真重叠 <8 字必须保守不对齐");
+    }
+
+    // ---- 真实数据回放（BUILD-399 会话 15 个真实窗精解文本，`target/release/debug.log`）----
+
+    /// 真实窗精解文本（`[LocalRT-DBG-406] verdict` 的 `acc="…"`，日志按 80 字截断）。
+    const REAL_ACC: [&str; 15] = [
+        "周末天气好的话，一起出来玩吧。我们一起可以出去看看电影，也可以一起出去吃饭，然后也可以到郊外去旅游旅游。",
+        "然后也可以到郊外去旅游旅游，或者到附近去旅游。",
+        "或者到附近去旅游，然后看一看，嗯，有什么好玩的景点。",
+        "哎，对了，最近有什么精彩的电影大片上映了吗？",
+        "我们也可以去看看有什么好玩的电影，然后找一个好的餐馆。",
+        "找一个好的餐馆去饱餐一顿，大吃一顿。",
+        "",
+        "也也可以去找一个餐馆，大吃一顿。",
+        "你喜欢看什么类型的电影？我喜欢看科幻片、恐怖片、惊悚片，特别是科幻惊悚片，觉得很刺激。",
+        "然后嘛，还喜欢看喜剧片，觉得也很有意思。",
+        "我还喜欢看一些搞笑的片子，特别一些老式的港片。我觉得很有情怀。",
+        "我觉得很有情怀。",
+        "你周末这周周末有空吗？可以一起出来见个面吗？我们可以一起喝杯咖啡，一起出去吃个饭。",
+        "也可以一起出来走走，这样大家出来透透气，这样挺好。也不用整天待在家里面，是不是？我觉得这样可以吧。",
+        "待在家里面，是不是？我觉得这样可以吧？你可以出来见面吗？",
+    ];
+
+    fn effective_chars(s: &str) -> Vec<char> {
+        s.chars().filter(|c| align_keep_char(*c)).collect()
+    }
+
+    /// 最长 `m`：`a` 末尾 `m` 字 == `b` 开头 `m` 字（精确，有效字）。
+    fn common_suffix_prefix(a: &[char], b: &[char]) -> usize {
+        let mx = a.len().min(b.len());
+        for m in (1..=mx).rev() {
+            if a[a.len() - m..] == b[..m] {
+                return m;
+            }
+        }
+        0
+    }
+
+    /// 回放判据：`m` = 真实重叠。切多 ⇒ 丢（`k>m`）、切少/拼接 ⇒ 重复。
+    fn classify(res: &OverlapResolution, m: usize) -> (bool, bool) {
+        match res.committed_prefix {
+            None => (true, false),
+            Some(_) => {
+                if res.k > m {
+                    (false, true)
+                } else if res.k < m {
+                    (true, false)
+                } else {
+                    (false, false)
+                }
+            }
+        }
+    }
+
+    /// **修前** 旧算法复刻（比例长度门 + 小 k 兜底；不依赖当前实现），返回命中的 `k`。
+    fn old_align(prev: &str, new: &str, prior: AlignPrior) -> Option<usize> {
+        let pk: Vec<(usize, char)> = prev
+            .char_indices()
+            .filter(|(_, c)| align_keep_char(*c))
+            .collect();
+        let nk: Vec<char> = new.chars().filter(|c| align_keep_char(*c)).collect();
+        if pk.is_empty() || nk.is_empty() {
+            return None;
+        }
+        let max_k = pk.len().min(nk.len());
+        let min_len = super::ALIGN_MIN_OVERLAP_CHARS
+            .max((nk.len() as f32 * super::ALIGN_MIN_OVERLAP_RATIO).ceil() as usize);
+        if max_k < min_len {
+            return None;
+        }
+        let hi_hard = if prior.prev_extra_slices >= 1 {
+            pk.len().saturating_sub(1)
+        } else {
+            max_k
+        };
+        let hi_all = max_k.min(hi_hard);
+        if min_len > hi_all {
+            return None;
+        }
+        let ok_k = |k: usize| -> bool {
+            let pt: Vec<char> = pk[pk.len() - k..].iter().map(|(_, c)| *c).collect();
+            super::edit_distance_chars(&pt, &nk[..k]) as f32 / k as f32
+                <= super::ALIGN_MAX_EDIT_RATIO
+        };
+        if let Some(e_raw) = prior
+            .expected_ratio
+            .filter(|r| r.is_finite() && *r > 0.0 && *r <= 1.0)
+            .map(|r| ((nk.len() as f32) * r).round() as usize)
+        {
+            let (lo, hi) = super::expected_k_band(e_raw, min_len, hi_all);
+            if lo <= hi {
+                let e = e_raw.clamp(lo, hi);
+                if ok_k(e) {
+                    return Some(e);
+                }
+                for k in (lo..e).rev() {
+                    if ok_k(k) {
+                        return Some(k);
+                    }
+                }
+                for k in (e + 1)..=hi {
+                    if ok_k(k) {
+                        return Some(k);
+                    }
+                }
+            }
+        }
+        for k in min_len..=hi_all {
+            if ok_k(k) {
+                return Some(k);
+            }
+        }
+        None
+    }
+
+    fn old_classify(prev: &str, new: &str, prior: AlignPrior, m: usize) -> (bool, bool) {
+        match old_align(prev, new, prior) {
+            None => (true, false),
+            Some(k) => {
+                if k > m {
+                    (false, true)
+                } else if k < m {
+                    (true, false)
+                } else {
+                    (false, false)
+                }
+            }
+        }
+    }
+
+    /// 🔴 真实数据回放：按 413 形状（prev=窗 N 精解；new=「窗 N 尾 m 字 + 窗 N+1 非重叠部分」）
+    /// 重放真实窗对，统计修前/修后接缝重复与丢字；**丢字必须为 0**。
+    #[test]
+    fn repro416_real_log_replay() {
+        let texts: Vec<Vec<char>> = REAL_ACC.iter().map(|s| effective_chars(s)).collect();
+        let (mut pre_dup, mut pre_loss) = (0usize, 0usize);
+        let (mut post_dup, mut post_loss) = (0usize, 0usize);
+        let mut pairs = 0usize;
+        for w in texts.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            if a.is_empty() || b.is_empty() {
+                continue;
+            }
+            let m = common_suffix_prefix(a, b);
+            if m == 0 {
+                continue;
+            }
+            pairs += 1;
+            let prev: String = a.iter().collect();
+            let mut new: String = a[a.len() - m..].iter().collect();
+            new.extend(b[m..].iter());
+            let ratio = m as f32 / eff(&new).max(1) as f32;
+            let prior = AlignPrior {
+                expected_ratio: Some(ratio),
+                prev_extra_slices: 1,
+            };
+            let (pd, pl) = classify(&resolve_overlap(&prev, &new, prior), m);
+            let (od, ol) = old_classify(&prev, &new, prior, m);
+            if pd {
+                post_dup += 1;
+            }
+            if pl {
+                post_loss += 1;
+            }
+            if od {
+                pre_dup += 1;
+            }
+            if ol {
+                pre_loss += 1;
+            }
+        }
+        println!(
+            "[REPRO-416] real replay pairs={pairs} | pre dup={pre_dup} loss={pre_loss} | post dup={post_dup} loss={post_loss}"
+        );
+        assert_eq!(post_loss, 0, "回放丢字必须为 0");
+        assert!(pairs >= 3, "可回放的相邻窗对太少（{pairs}）");
     }
 }
