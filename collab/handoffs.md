@@ -9,6 +9,14 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-1 — FIX-GUARD-PRODLINES-422 ✅ 交付（测试基建根治，生产零改动）
+
+- **范围**：只改 `src/main.rs` 的 `#[cfg(test)] mod guard_prod_lines` + `fix_reflow_raw_base_420_tests::fn_body` + `testsync377` 一处注释过滤 + `collab/troubleshooting*.md`。
+- **根因**：`prod_lines_excluding_cfg_test` 朴素逐字数花括号（不跳字符串/字符/注释），被 420 `fn_body` 的 `.find('{')`/`.expect("...`{`...")` 带偏 ⇒ 生产区 L11144~12409 误剔（`ts421g_source_anchors` 假红，382 二次复发）。
+- **改动**：新增共用状态机 `next_top_token`/`brace_match`/`item_end`（串/原始串/字符与生命周期区分/行块注释可嵌套），`prod_lines_excluding_cfg_test` 与 `fn_body` **共用同一份**（禁两份）。
+- **碰巧通过报告**：`testsync377::main_has_no_cross_recording_ctx_cache` 命中测试模块**前的注释**（旧扫描器误剔使其未计入）⇒ 按其文档契约补注释过滤（不放宽代码不变量）。
+- **验证**：新增 `guard_prod_lines::tests` 3 条；fmt EXIT0 / check 0 error、warnings 91/87=基线 / 全量 test **0 failed**（bin 1802P/0F/55I）；`testsync421` 由红转绿。未 commit / 未 build / 版本未动 / 零凭证。
+
 ## 2026-09-25 — coder-2 — TEST-SYNC-421 ✅ 交付（阶段三·非作者护栏 10 条；生产零改动）
 
 - **范围**：只在 `src/main.rs` 新增 `#[cfg(test)] mod testsync421_tests`（`:13364` 起，10 条，`+184/0`）；**未碰生产区**（未碰 `mod.rs`/`speaker.rs`）。
@@ -242,3 +250,15 @@
 - **九项**：全项 PASS。①14:49–14:52 ②两副本 sha 全等且异于 BUILD-419（main `d43666dc…` / ui `2e400215…` / crash `bb3b94f3…`）③0.9.3 ④冒烟 Responding + 无 crash.json + 零残留 ⑤config `da2be5da…` 不变 ⑥91/9/17=基线 ⑦N-A（420 无新增/删除字面量，按降级条款报三证）⑧两 toml 三副本全等 ⑨VC 五件 sha 与 Redist 源三处全等。
 - **专项**：A CT2 `efa16d81…` 前后未变；B 声纹 `aa3cfc16…` 在包内、junction 保持；D 用户数据未动、无 voiceprint.bin；**冒烟 `-debug`**：环境噪声短录不产生 reflow（`action=pending`/`reflow suppressed`），改用 SAPI TTS 带停顿诱导成功 —— `[LocalRT-DBG-337] reflow applied: seg=1 committed_len=42 acc_len=45 preview_len=45`（末窗差 0；对比 BUILD-419 现场 `124/126/133`）。
 - **红线**：未改生产代码（消融全还原）/ 版本号未动 / 未 push / 未 `cargo clean` / 零凭证。证据 `collab/evidence/420/`。
+
+## 2026-09-25 — tester-1 — TEST-EXEC + BUILD-421（重跑）✅ 回归 + 出包（含 422 自证）
+
+- **性质**：阶段四回归 + 阶段五出包（421 `006c5ce` + TEST-SYNC-420 `67060ce` + TEST-SYNC-421 `5e599ce` + FIX-GUARD-PRODLINES-422 `a87b9d0`）。HEAD `a87b9d0`，版本 0.9.3 未动，基线 Publish=BUILD-420。
+- **上一轮红**：`ts421g_source_anchors` 假红（`prod_lines_excluding_cfg_test` 朴素花括号计数被非代码 `{` 带偏 ⇒ 生产区 L11144~12409 误剔）。主控裁决 (a) 根治，coder-1 交付 `a87b9d0`（词法状态机 `next_top_token`/`brace_match`/`item_end`，420 `fn_body` 共用），本轮重跑绿。
+- **回归**：bin **1802P/0F/55I**（对 BUILD-420 1779P/54I，NEW 26 / GONE 2）、root 1890P/0F/57I、`src-tauri` **92P/0F/0I**；Vitest/Browser SKIP（ui 无 diff）。GONE 2=（`fix408b_tests::ts408b_406_relax_scales`、`testsync406_408b_tests::ts406_after_drop_identity_and_scaling`）408B scale 用例随补丁删除，属预期。
+- **消融**：420 护栏复测（底稿改回 `last_streaming_text`）⇒ `fix420_source_anchor_raw_base` **红**（恢复判别力）；421a `window_final_text` 去 `full_drop` ⇒ 3 红；421b `kept_streaming_text` 恒等 ⇒ 7 红；421c 恢复「含标点就跳过」⇒ `ts421g_source_anchors` 1 红。均还原，`git diff -- src/main.rs`=0。
+- **422 自证**：420 测试模块插 `const _BRACE_PROBE_422: &str = "{";` ⇒ 源码护栏 5P 全绿；还原零残留。
+- **构建**：Step1 清进程 0 残留；Step2 npm 750ms + Tauri 1m41s(17w) + cp；Step3 3m01s（main 91w / crash 9w）；Step4 三 exe + 两 toml 同步 Publish。
+- **九项**：全项 PASS。①15:51–15:54 ②两副本 sha 全等且异于 BUILD-420（main `986f305b…` / ui `1e60482a…` / crash `cc24bdcf…`）③0.9.3 ④冒烟 Responding + 录制/转写/注入 + 无 crash.json + 零残留 ⑤config `da2be5da…` 不变 ⑥91/9/17=基线 ⑦N-A（421 无新增字面量，报三证）⑧两 toml 三副本全等 ⑨VC 五件 sha 与 Redist 源三处全等。
+- **专项**：A CT2 `efa16d81…` 未重编；B 声纹 `aa3cfc16…` 在包内、junction 保持；D 用户数据未动、无 voiceprint.bin；三特殊点 = A+B+D 全 PASS；`-debug` 冒烟：TTS 触发录制 → `Streaming recording started` → `[LocalRT-DBG-337] reflow applied` → `Transcribed` → `Injection completed`，无 panic/crash。
+- **红线**：未改生产代码（消融全还原）/ 版本号未动 / 未 push / 未 `cargo clean` / 零凭证。证据 `collab/evidence/421/`。
