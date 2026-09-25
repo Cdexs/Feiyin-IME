@@ -1,4 +1,14 @@
 
+### 2026-09-25 · FIX-VOICEPRINT-FALLBACK-421 · R1 交付（估算路径防吞本人字）
+
+- 估算路径改为把流式字**只铺在语音时间轴**（kept∪dropped 裁剪到本段）并按「**落在 dropped 才删**」，其余一律保留；时间戳路径同改；`VoiceprintFilter`/`AccDropStats` 加 `dropped_ranges`。
+- `fix421_tests` 11P+1I（新增本人 kept/他人 dropped/中间静音用例）；fmt/check/全量 test 0 failed（bin 1789P/0F/55I）。未出包。
+
+### 2026-09-25 · FIX-VOICEPRINT-FALLBACK-421 交付（声纹剔除后兜底只取保留部分 + 全剔不兜底 + 补标点）
+
+- 全剔（dropped>0 ∧ kept≤0）⇒ 该窗空、不走流式兜底（`window_final_text`）；模型空(未剔)仍兜底。部分剔除 ⇒ 406 基准与兜底只取保留区间流式（`kept_streaming_text`：时间戳/估算两路；`AccDropStats.kept_ranges`）；删 408B `acc_vs_streaming_after_drop` scale，回统一门槛；410 pending 同筛。`punctuate_via_service` 先剥零星标点再整段送。
+- `fix421_tests` 10P+1I（含日志数值回放：窗 #0 空、窗 #2 不含他人语音）；fmt EXIT0 / check 0 error、warnings 91/87=基线 / 全量 test 0 failed（bin 1788P/0F/55I）。平台中立，MACOS-HANDOFF 已记。未出包。
+
 ### 2026-09-25 · FIX-REFLOW-RAW-BASE-420 交付（回灌底稿改原始流式文本，只改 main.rs，未出包）
 
 - 根因（BUILD-419 05:18）：`render_authoritative_reflow` 底稿用 `last_streaming_text` 镜像（= 合成文本），而 `committed_len` 是原始流式坐标 ⇒ 截尾错位多挂旧字（镜像131/acc126/committed124 ⇒ 133，多 7 旧字）。

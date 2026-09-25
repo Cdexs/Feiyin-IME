@@ -9,6 +9,22 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-1 — FIX-VOICEPRINT-FALLBACK-421 · R1 ✅ 交付（估算路径防吞本人字）
+
+- **起因**：估算路径把流式字均匀铺满整窗（含静音）且「在 kept 才留」⇒ 本人字落静音缝被删（吞字）。
+- **改法**：`VoiceprintFilter`/`AccDropStats` 加 `dropped_ranges`（窗内坐标）；`kept_streaming_text` 改为把字**只铺在语音时间轴**（kept∪dropped 裁剪到本段）并按「**落在 dropped 才删**」，其余（kept/无法归属）一律保留；时间戳路径同改为只删 dropped；`dropped` 空 ⇒ 原样。
+- **测试**：`fix421_tests` **11P + 1I**（新增「窗 10s 本人 0.5~3.5s kept / 他人 6~9s dropped / 中间静音 ⇒ 本人全留、他人全删」；日志回放保持通过）。
+- **验证**：fmt --check EXIT0；check 0 error、warnings 91/87=基线；全量 test 0 failed（bin **1789P/0F/55I**）。只改 main.rs/mod.rs/speaker.rs；未 commit / 未 build / 版本未动 / 零凭证。
+
+## 2026-09-25 — coder-1 — FIX-VOICEPRINT-FALLBACK-421 ✅ 交付（只改 main.rs + mod.rs）
+
+- **范围**：`src/main.rs`（`window_final_text` / `kept_streaming_text` / `strip_punct_for_repunct` / `punctuate_via_service` / harvest 兜底 / 410 pending 筛字）、`src/transcription/mod.rs`（`AccDropStats.kept_ranges`、删 `acc_vs_streaming_after_drop`）。未碰 `local_stream.rs`/`speaker.rs`。
+- **① 全剔不兜底**：`full_drop = dropped>0 && kept<=0` ⇒ 该窗空、`is_fallback=false`（同时挡 410 pending）；模型空(未剔)仍兜底。
+- **② 部分剔除只取保留流式**：`kept_streaming_text`（无剔除恒等 / 时间戳路径 / 估算路径）；`AccDropStats` 加 `kept_ranges`（窗内坐标）；删 408B scale，harvest 改统一 `acc_vs_streaming`。410 pending 按窗内偏移同筛。
+- **③ 补标点**：先 `strip_punct_for_repunct` 再整段送；失败/超时原样返回。
+- **时间戳路径**：流式 token 时间戳与窗内逐字坐标无法可靠对齐（DBG-336 常 none），生产传 `None` 走估算并打 `[LocalRT-DBG-421]`；函数支持时间戳路径且有单测。
+- **验证**：`fix421_tests` 10P+1I（含日志数值回放：窗 #0 空 / 窗 #2 不含「相识一个可实的地步…」）；fmt EXIT0 / check 0 error、warnings 91/87=基线 / 全量 test 0 failed（bin 1788P/0F/55I）。平台中立，MACOS-HANDOFF 已记。未 commit / 未 build / 版本未动 / 零凭证。
+
 ## 2026-09-25 — coder-1 — TEST-SYNC-420 ✅ 交付（阶段三·只写测试，生产零改动）
 
 - **范围**：只改 `src/main.rs` `fix_reflow_raw_base_420_tests`（测试区）。白名单仅 `cargo fmt` / `cargo check --all-targets`。

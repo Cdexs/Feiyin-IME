@@ -2401,3 +2401,11 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | --- | --- | --- |
 | `text_normalizer.rs`：`strip_fillers_conservative` 在规则 A/B 后加**规则 C**（`collapse_long_repeats`） | 紧挨着、一字不差重复的**整段**只留第一份（忽略标点/空白比较；中/日/韩 ≥6 字、英 ≥3 词；排除周期性单元与纯数字；差一字不动）。**不区分管线** —— 所有在 LLM 未接手时进入该节点的管线都适用（Gavin：「这是识别效果优化」） | ✅ 平台中立纯逻辑（无 `cfg`），macOS 同继承 |
 | **macOS 侧需要做什么** | | 无需改动（平台中立自动继承） |
+
+## FIX-VOICEPRINT-FALLBACK-421（2026-09-25，coder-1）· 声纹剔除后兜底只取保留部分 + 全剔不兜底 —— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `main.rs`：新增 `window_final_text`（全剔⇒空不兜底）/ `kept_streaming_text`（基准/兜底只取声纹保留区间流式；时间戳路径 + 样本占比估算）/ `strip_punct_for_repunct`；`punctuate_via_service` 先剥零星标点再整段送。`transcription/mod.rs`：`AccDropStats` 增 `kept_ranges`（窗内坐标），删 408B `acc_vs_streaming_after_drop` scale 放宽 | ① 整窗被声纹全剔（kept≤0 且 dropped>0）⇒ 该窗输出空、**不走流式兜底**（不再把他人语音放回），模型自身空(未剔)仍兜底；② 部分剔除 ⇒ 406 比对基准与兜底文本只取保留区间流式，回到统一 406 门槛（删 scale）；③ 兜底补标点不再「含任一标点就整段跳过」 | ✅ 平台中立纯逻辑（无 `cfg`），macOS 同继承；声纹模型（`speaker.rs`）与 kept 区间接口未改 |
+| R1：`speaker.rs` `VoiceprintFilter` / `AccDropStats` 增 `dropped_ranges`（窗内坐标）；`kept_streaming_text` 改为**把字只铺在语音时间轴（kept∪dropped）上、只删落在 dropped 的字**，其余（kept/无法归属）一律保留 | 修「估算把字均匀铺满整窗（含静音）⇒ 本人字落静音缝被吞」；偏保留、绝不吞字 | ✅ 平台中立纯逻辑（无 `cfg`），macOS 同继承 |
+| **macOS 侧需要做什么** | | 无需改动（平台中立自动继承） |
