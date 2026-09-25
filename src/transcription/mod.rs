@@ -9398,3 +9398,281 @@ mod repro416_tests {
         assert!(pairs >= 3, "可回放的相邻窗对太少（{pairs}）");
     }
 }
+
+// =====================================================================
+// TEST-SYNC-416（阶段三 · 非作者护栏 · coder-2）：FIX-ALIGN-GATE-416 接缝对齐分层
+//   契约（独立推导，不复用作者夹具/快照）：① 长句不重复 ② 各层不丢字 ③ 同编辑率取小 k
+//   ④ e<8 不放宽但不丢字 ⑤ 接缝去重不误伤 ⑥ 全不同⇒拼接 ⑦ 旧整片形状逐字一致
+//   ⑧ 源码锚点（resolve_overlap 调用 + [DBG-416] 在 Debug 门内）
+//   🔴 白名单：只 rustfmt + cargo check；未跑 cargo test。生产零改动。
+// =====================================================================
+#[cfg(test)]
+mod testsync416_tests {
+    use super::{
+        align_keep_char, resolve_overlap, AlignLayer, AlignPrior, OrderedReflow,
+        ALIGN_MIN_OVERLAP_CHARS, LOOSE_ALIGN_MAX_EDIT_RATIO, LOOSE_ALIGN_RANGE_FACTOR,
+        SEAM_DEDUPE_MIN_CHARS,
+    };
+
+    /// 样本按 4000/字折算 ⇒ `expected_overlap_ratio` 与**字数比**一致（独立于作者 4571）。
+    const SPC: usize = 4000;
+
+    fn eff(s: &str) -> usize {
+        s.chars().filter(|c| align_keep_char(*c)).count()
+    }
+
+    /// 独立字表（与作者 0x4E00/0x5B00 不同码段）：S1 = 60 个互异汉字。
+    fn s1() -> Vec<char> {
+        (0..60)
+            .map(|i| char::from_u32(0x6C00 + i as u32).unwrap())
+            .collect()
+    }
+    /// S2 = 另一套互异汉字取前 `n` 个（与 S1 无交集）。
+    fn s2(n: usize) -> String {
+        (0..n)
+            .map(|i| char::from_u32(0x7000 + i as u32).unwrap())
+            .collect()
+    }
+
+    /// 「窗 A = S1 全文 / 窗 B = 后缀 + S2」形状跑 `OrderedReflow`，返回最终文本。
+    /// `k_samples` = 窗 B 第 1 片（后缀）样本数（控制期望重叠字数）。
+    fn run(s1s: &str, suffix: &str, n2: usize, k_samples: usize) -> String {
+        let mut r = OrderedReflow::new();
+        let _ = r.push_window(0, 0, 1, vec![eff(s1s) * SPC], s1s.to_string());
+        let text_b = format!("{suffix}{}", s2(n2));
+        let _ = r.push_window(1, 0, 2, vec![k_samples * SPC, n2 * SPC], text_b);
+        let (c, l) = r.finish();
+        format!("{c}{l}")
+    }
+
+    fn s1s() -> String {
+        let v = s1();
+        v.iter().collect()
+    }
+
+    /// 契约前置：关键阈值常量（防被顺手改）。
+    #[test]
+    fn ts416g_threshold_constants() {
+        assert_eq!(ALIGN_MIN_OVERLAP_CHARS, 8);
+        assert_eq!(SEAM_DEDUPE_MIN_CHARS, 4);
+        assert!((LOOSE_ALIGN_MAX_EDIT_RATIO - 0.35).abs() < 1e-6);
+        assert!((LOOSE_ALIGN_RANGE_FACTOR - 1.5).abs() < 1e-6);
+    }
+
+    /// 契约 1：长句不重复 —— 后缀 12 字 + 新句 30/45/60 字，两窗后**逐字** == S1 + S2。
+    #[test]
+    fn ts416g_long_sentence_exact_no_dup() {
+        let base = s1s();
+        let suffix: String = s1()[48..60].iter().collect();
+        for n2 in [30usize, 45, 60] {
+            let got = run(&base, &suffix, n2, 12);
+            let want = format!("{base}{}", s2(n2));
+            assert_eq!(got, want, "n2={n2}：应逐字等于 S1+S2（无重复无丢字）");
+        }
+    }
+
+    /// 契约 2：宽松层/各层即使选错 `k` 也不得丢字 —— «S1 去掉真重叠后的前缀» 必须完整出现。
+    /// 覆盖重叠区 1~4 个错字（开头/中间/末尾）+ 插入/删除型差异。
+    #[test]
+    fn ts416g_never_loses_s1_prior_prefix() {
+        let v = s1();
+        let base: String = v.iter().collect();
+        let prefix: String = v[..48].iter().collect(); // 真重叠 = 12 ⇒ 前 48 字为独有前缀
+        for pos in ["start", "mid", "end"] {
+            for errors in [1usize, 2, 3, 4] {
+                let mut suf: Vec<char> = v[48..60].to_vec();
+                let idx: Vec<usize> = match pos {
+                    "start" => (0..errors).collect(),
+                    "mid" => (4..4 + errors).collect(),
+                    _ => (12 - errors..12).collect(),
+                };
+                for i in idx {
+                    suf[i] = char::from_u32(0x9F00 + i as u32).unwrap();
+                }
+                let suffix: String = suf.into_iter().collect();
+                let got = run(&base, &suffix, 30, 12);
+                assert!(
+                    got.starts_with(&prefix),
+                    "pos={pos} errors={errors}：丢 S1 独有前缀\n got={got}\n prefix={prefix}"
+                );
+            }
+        }
+        // 插入型：新窗在重叠末尾**之后**多一个字（真重叠仍按 12 字样本算）。
+        {
+            let mut suf: Vec<char> = v[48..60].to_vec();
+            suf.push(char::from_u32(0x9E00).unwrap());
+            let suffix: String = suf.into_iter().collect();
+            assert!(
+                run(&base, &suffix, 30, 12).starts_with(&prefix),
+                "插入型丢字"
+            );
+        }
+        // 删除型：重叠区少一个字。
+        {
+            let mut suf: Vec<char> = v[48..60].to_vec();
+            suf.remove(6);
+            let suffix: String = suf.into_iter().collect();
+            assert!(
+                run(&base, &suffix, 30, 12).starts_with(&prefix),
+                "删除型丢字"
+            );
+        }
+    }
+
+    /// 🔴 FINDING（非作者护栏发现，2026-09-25）→ 主控裁决「必须修，派 coder-1」：
+    /// 重叠区**中段**插入一个额外字时，宽松层取 `k=13`（其编辑率 2/13 < `k=12` 的 2/12，
+    /// 因宽松层取「最低编辑率」）⇒ `committed_prefix = prev[..47]` ⇒ **丢掉 S1 第 48 字的独有字**。
+    /// 即「新窗在重叠中段多 1 字」这一形态仍会丢 1 字（与 T2 其余形态的「绝不丢字」不符）。
+    ///
+    /// 🔧 **416-R1 修复后去掉 ignore**（由 coder-1 在 R1 执行）：R1 规则 = 宽松层改为按
+    /// 「**编辑距离绝对值最小**、打平取**较小 k**」选（偏重复不偏丢字）。修复前本断言为 RED，
+    /// 故以 `#[ignore]` 挂起，避免污染常规回归；R1 落地后删除 `/ ` 与 `#[ignore]` 属性即转正。
+    #[test]
+    #[ignore = "FINDING：重叠中段插入 1 字当前会丢 1 字；416-R1 修复后去掉 ignore（coder-1）"]
+    fn ts416g_finding_insertion_mid_loses_one_char() {
+        let v = s1();
+        let base: String = v.iter().collect();
+        let prefix: String = v[..48].iter().collect();
+        let mut suf: Vec<char> = v[48..60].to_vec();
+        suf.insert(6, char::from_u32(0x9E00).unwrap());
+        let suffix: String = suf.into_iter().collect();
+        let got = run(&base, &suffix, 30, 12);
+        assert!(
+            got.starts_with(&prefix),
+            "重叠中段插入 1 字不得丢 S1 独有前缀（FINDING）\n got={got}"
+        );
+    }
+
+    /// 契约 3：同编辑率打平 ⇒ **取较小 k**（偏重复不偏丢字）。
+    ///
+    /// 用嵌套精确重叠（`k=8` 与 `k=16` 编辑率同为 0）；无先验 ⇒ 走层④升序 ⇒ 取 8。
+    /// 取小 `k` ⇒ 定稿前缀更长（切得少）⇒ 最坏重复，绝不丢字。
+    #[test]
+    fn ts416g_tie_prefers_smaller_k() {
+        let p: String = (0..8)
+            .map(|i| char::from_u32(0x7500 + i as u32).unwrap())
+            .collect();
+        let prev = format!("{p}{p}");
+        let new = format!("{prev}{}", s2(10));
+        let res = resolve_overlap(&prev, &new, AlignPrior::none());
+        assert_eq!(res.k, 8, "两 k 编辑率相同 ⇒ 取较小 k=8");
+        assert_eq!(res.layer, AlignLayer::Strict);
+        assert_eq!(
+            res.committed_prefix.as_deref(),
+            Some(p.as_str()),
+            "小 k=8 ⇒ 定稿前缀 = 首个 P（不丢字）"
+        );
+    }
+
+    /// 契约 4：后缀仅 5~7 字 ⇒ 不进入放宽路径，但结果不丢字（此处精确接缝去重 ⇒ 逐字等于 S1+S2）。
+    #[test]
+    fn ts416g_short_suffix_no_relax_no_loss() {
+        let v = s1();
+        let base: String = v.iter().collect();
+        for k in [5usize, 6, 7] {
+            let suffix: String = v[60 - k..].iter().collect();
+            let got = run(&base, &suffix, 10, k);
+            let want = format!("{base}{}", s2(10));
+            assert_eq!(got, want, "k={k}：短后缀（e<8 不放宽）不得丢字");
+        }
+    }
+
+    /// 契约 5：接缝去重不得误伤。
+    #[test]
+    fn ts416g_seam_dedupe_no_false_removal() {
+        // ① 新窗开头是口语重复「好的好的」，但与前文末尾不同 ⇒ 不得去掉。
+        let prev = "今天天气不错呀";
+        let new = "好的好的我们走吧";
+        let mut r = OrderedReflow::new();
+        let _ = r.push_window(0, 0, 1, vec![eff(prev) * SPC], prev.to_string());
+        let _ = r.push_window(1, 0, 2, vec![eff(prev) * SPC, SPC], new.to_string());
+        let (c, l) = r.finish();
+        let got = format!("{c}{l}");
+        assert_eq!(got, format!("{prev}{new}"), "不得去掉口语短重复");
+        assert!(got.contains("好的好的"));
+
+        // ② 前文末尾与新窗开头**精确相同但只有 3 字** ⇒ < MIN(4) 不去重。
+        let prev2 = "我们走吧甲乙丙";
+        let new2 = "甲乙丙然后呢";
+        let mut r2 = OrderedReflow::new();
+        let _ = r2.push_window(0, 0, 1, vec![eff(prev2) * SPC], prev2.to_string());
+        let _ = r2.push_window(1, 0, 2, vec![eff(prev2) * SPC, SPC], new2.to_string());
+        let (c2, l2) = r2.finish();
+        let got2 = format!("{c2}{l2}");
+        assert_eq!(got2, format!("{prev2}{new2}"), "3 字相同 < 4 ⇒ 不去重");
+        assert_eq!(got2.matches("甲乙丙").count(), 2, "重复被保留");
+    }
+
+    /// 契约 6：完全不同的两段（重叠区全错）⇒ 走拼接，不吞内容。
+    #[test]
+    fn ts416g_disjoint_content_concat_intact() {
+        let base = s1s();
+        let new = s2(40); // 与 S1 无交集
+        let prior = AlignPrior {
+            expected_ratio: Some(12.0 / 52.0),
+            prev_extra_slices: 0,
+        };
+        assert_eq!(
+            resolve_overlap(&base, &new, prior).layer,
+            AlignLayer::Concat,
+            "无真重叠 ⇒ 必须拼接"
+        );
+        let mut r = OrderedReflow::new();
+        let _ = r.push_window(0, 0, 1, vec![60 * SPC], base.clone());
+        let _ = r.push_window(1, 0, 2, vec![12 * SPC, 40 * SPC], new.clone());
+        let (c, l) = r.finish();
+        assert_eq!(
+            format!("{c}{l}"),
+            format!("{base}{new}"),
+            "两段均须完整保留"
+        );
+    }
+
+    /// 契约 7：旧整片重叠形状（413 前）结果 == S1+S2（**独立期望**，非作者快照）。
+    #[test]
+    fn ts416g_old_full_overlap_shape_exact() {
+        let base = s1s();
+        for n2 in [10usize, 30, 60] {
+            let mut r = OrderedReflow::new();
+            let _ = r.push_window(0, 0, 1, vec![60 * SPC], base.clone());
+            let _ = r.push_window(
+                1,
+                0,
+                2,
+                vec![60 * SPC, n2 * SPC],
+                format!("{base}{}", s2(n2)),
+            );
+            let (c, l) = r.finish();
+            assert_eq!(
+                format!("{c}{l}"),
+                format!("{base}{}", s2(n2)),
+                "n2={n2}：旧整片重叠应逐字等于 S1+S2"
+            );
+        }
+    }
+
+    /// 契约 8：源码锚点 —— 重叠分支调 `resolve_overlap`；`[DBG-416] seam` 在 Debug 门内。
+    #[test]
+    fn ts416g_source_anchors() {
+        let prod: Vec<String> =
+            crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("mod.rs"));
+        let joined = prod.join("\n");
+        assert!(
+            joined.contains("resolve_overlap(&self.last_window_text, &text, prior)"),
+            "push_inner 重叠分支必须调 resolve_overlap"
+        );
+        assert!(joined.contains("[DBG-416] seam:"), "缺 [DBG-416] seam 日志");
+        let log_i = prod
+            .iter()
+            .position(|l| l.contains("[DBG-416] seam:"))
+            .expect("seam 日志行缺失");
+        let guard_i = prod[..log_i]
+            .iter()
+            .rposition(|l| l.contains("log_enabled!(log::Level::Debug)"))
+            .expect("seam 日志前应有 Debug 门");
+        assert!(
+            log_i - guard_i <= 4,
+            "[DBG-416] seam 必须在 Debug 门内（guard@{guard_i} log@{log_i}）"
+        );
+    }
+}
