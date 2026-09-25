@@ -11155,23 +11155,133 @@ mod fix_reflow_raw_base_420_tests {
         );
     }
 
-    /// 源码锚点：`render_authoritative_reflow` 底稿取自 `last_raw_streaming_text`（按 gen 过滤），
-    /// 且 StreamingText 镜像合成路径未改。
+    /// TEST-SYNC-420：源码锚点**只扫生产代码**（复用 `guard_prod_lines` 剔除所有 `#[cfg(test)]` 项），
+    /// 并截取 `fn render_authoritative_reflow` 函数体；断言字面量用 `concat!` 拆开 ⇒ 测试源码里
+    /// 不出现完整串，杜绝 `include_str!` 自匹配假绿（[FILTERED-TEST-BLINDSPOT-001]；tester-1 消融发现：
+    /// 底稿改回 `last_streaming_text` 后旧断言仍 PASS，因为锚点串就写在测试自身里）。
     #[test]
     fn fix420_source_anchor_raw_base() {
-        let src = include_str!("main.rs");
+        let prod = prod_src();
+        let body = strip_line_comments(&fn_body(
+            &prod,
+            concat!("fn render_authoritative_reflow", "("),
+        ));
+        // ① 底稿取自 last_raw_streaming_text（按 generation 过滤）。
         assert!(
-            src.contains("let streaming = last_raw_streaming_text"),
-            "回灌底稿必须取 last_raw_streaming_text"
+            body.contains(&concat!("let streaming = last_raw", "_streaming_text")),
+            "回灌底稿必须取 last_raw_streaming_text（生产区函数体内）"
         );
         assert!(
-            src.contains(".filter(|(g, _)| *g == generation)"),
+            body.contains(&concat!(".filter(|(g, _)| *g == ", "generation)")),
             "原始底稿必须按 generation 过滤（不符 ⇒ 空）"
         );
+        // ② render 内 last_streaming_text 只能作**回写镜像**（该行同现 `mirror`），不得读底稿。
+        for l in body.lines() {
+            if l.contains(concat!("last", "_streaming_text")) {
+                assert!(
+                    l.contains("mirror"),
+                    "render_authoritative_reflow 内 last_streaming_text 只能作回写镜像：{l}"
+                );
+            }
+        }
+        // ③ 明确否定旧写法（防回退）。
         assert!(
-            src.contains("compose_with_acc_for_gen(acc_state.as_ref(), gen, &text)"),
-            "StreamingText 镜像合成路径不变（053-B/331）"
+            !body.contains(&concat!("let streaming = last", "_streaming_text")),
+            "底稿不得取 last_streaming_text（合成镜像，坐标与 committed_len 不符）"
         );
+    }
+
+    /// TEST-SYNC-420：StreamingText 分支 —— `last_raw_streaming_text` 写在 generation 门**之后**、
+    /// 合成**之前**，写入的是合成前 `text`；合成后再写镜像。
+    #[test]
+    fn fix420_streaming_raw_write_order() {
+        let prod = prod_src();
+        let gen_gate = concat!("if gen != ", "current_gen");
+        let raw_write = concat!("*raw = Some((gen, ", "text.clone()))");
+        let compose = concat!(
+            "compose_with_acc_for_gen(acc_state.as_ref(), gen, &",
+            "text)"
+        );
+        let mirror_write = concat!("*mirror = Some(composed.", "clone())");
+        let p_gate = prod.find(gen_gate).expect("generation 门缺失");
+        let p_raw = prod.find(raw_write).expect("原始流式写入缺失");
+        let p_cmp = prod.find(compose).expect("合成调用缺失");
+        let p_mirror = prod.find(mirror_write).expect("镜像写入缺失");
+        assert!(p_gate < p_raw, "generation 门必须在 raw 写入之前");
+        assert!(p_raw < p_cmp, "raw（合成前 text）必须在合成之前写入");
+        assert!(p_cmp < p_mirror, "合成必须在镜像写入之前");
+    }
+
+    /// 生产区正文（剔除所有 `#[cfg(test)]` 项）。
+    fn prod_src() -> String {
+        crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs")).join("\n")
+    }
+
+    /// 逐行去掉 `//` 之后内容（提取出的函数体内这些行无「字符串内 `//`」）。
+    fn strip_line_comments(code: &str) -> String {
+        code.lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 取 `sig` 之后的函数体（花括号配平，跳过字符串 / 字符 / 注释内的括号，
+    /// 防 [GUARD-SKIP-BRACE-IN-STRING-382]）。返回含首尾花括号的切片文本。
+    fn fn_body(code: &str, sig: &str) -> String {
+        let at = code.find(sig).unwrap_or_else(|| panic!("生产区缺 `{sig}`"));
+        let open = code[at..]
+            .find('{')
+            .map(|d| at + d)
+            .expect("函数体 `{` 缺失");
+        let bytes = code.as_bytes();
+        let mut depth = 0i32;
+        let mut i = open;
+        let (mut string, mut ch, mut line_c, mut block_c) = (false, false, false, false);
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            let next = bytes.get(i + 1).copied().map(|b| b as char);
+            if line_c {
+                if c == '\n' {
+                    line_c = false;
+                }
+            } else if block_c {
+                if c == '*' && next == Some('/') {
+                    block_c = false;
+                    i += 1;
+                }
+            } else if string {
+                if c == '\\' {
+                    i += 1;
+                } else if c == '"' {
+                    string = false;
+                }
+            } else if ch {
+                if c == '\\' {
+                    i += 1;
+                } else if c == '\'' {
+                    ch = false;
+                }
+            } else if c == '"' {
+                string = true;
+            } else if c == '\'' {
+                ch = true;
+            } else if c == '/' && next == Some('/') {
+                line_c = true;
+                i += 1;
+            } else if c == '/' && next == Some('*') {
+                block_c = true;
+                i += 1;
+            } else if c == '{' {
+                depth += 1;
+            } else if c == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    return code[open..=i].to_string();
+                }
+            }
+            i += 1;
+        }
+        panic!("函数体未闭合：{sig}");
     }
 }
 
