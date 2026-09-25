@@ -2368,6 +2368,11 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 - **已评估，对 macOS 无影响。** 改动全部在 `src/main.rs` 的 `#[cfg(target_os = "windows")]` 浮层绘制区（GDI `measure_text_width` + D2D `mod d2d::streaming_text`），缓存为 Windows 绘制线程的 `thread_local`。
 - macOS 浮层走各自平台实现（`src/platform/macos/`），无 `measure_text_width` / `streaming_text` 对应物，也不共享本缓存。无 pub 签名 / 无新增 env / 无构建脚本改动。
 
+## LOCALRT-STREAM-THREADS-417 + DEBUG-SESSION-WAV-418（2026-09-25，coder-2）—— macOS 侧影响
+
+- **417 平台中立**：`local_stream_num_threads()` 改为 `available_parallelism().min(4)`（取不到回落 4），macOS 同继承；无 `cfg`、无新增 env / 构建脚本。**只改预览（流式）侧**，精解侧 `default_acc_num_threads()`（min 8）未动（Gavin 2026-09-25「将预览的线程调为 4」）。
+- **418 平台中立**：`src/audio/mod.rs` 的 `SessionDump`（`-debug` 整段录音落盘）+ `enforce_dump_limit_where` 仅用 `std::fs` + `chrono`，无平台 API；macOS 同继承。Warn 级零动作（`log_enabled!(Debug)` 为假 ⇒ `SessionDump::new` 返回 None）。**macOS 侧无需改动**（无 pub 签名 / env / 构建脚本变更）。
+
 ## LOCALRT-SHORT-CONTEXT-413（2026-09-25，coder-1）· 常规窗「少带前文」—— macOS 侧影响
 
 | 改动 | 行为前 → 后 | macOS 影响 |
@@ -2376,4 +2381,11 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | VAD 区间：前文后缀的片内区间经 `trim_and_shift_ranges` 裁剪平移后，与 must 片区间一起 `shift_and_concat_ranges` 拼窗内坐标（任一源 `None` ⇒ 整窗 `None`，393-A3 口径） | 常规窗不再像 407 那样传 `None` 回退自跑 VAD ⇒ 不新增每窗 VAD 开销 | ✅ 纯逻辑，macOS 同继承 |
 | **不变**：首片 / 无前文（`must_start == gs`）⇒ 只解新片；407 长静默末尾窗、410 pending 兜底、411 切分流式分配、412 声纹合并；`plan_windows` 规则 4 收尾短尾窗 `(p-1,p+1)`（Gavin 要的「前一片重解」）仍**整片送解**（`must_start = gs`） | — | ✅ 平台中立自动继承 |
 | R1：带前文常规窗被 406 拒 / 精解空 ⇒ **只兜底 must 片**（`context_tail_pending`，span `(must_start, ge)`）；前片后缀是上一窗已精解文本，不被流式兜底顶掉 | 与 410 末尾窗同一条路径（`TailPending`） | ✅ 平台中立自动继承 |
+
+## FIX-ALIGN-GATE-416（2026-09-25，coder-1）· 413 常规窗对齐长度门修复 —— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `transcription/mod.rs`：`align_overlap_with_prior` 分层（严格 → 宽松）；新增 `seam_dedupe` / `resolve_overlap` / `AlignLayer`；`OrderedReflow::push_inner` 走 `resolve_overlap` | 413 后重叠只是前一片后缀（≈12 字），占新窗比例随新句变长变小 ⇒ 原门 `max(8,0.30×新窗)` 挡真实重叠 ⇒ `align_fail` ⇒ 拼接 ⇒ 后缀重复。新：① 有先验且 `e≥8` 时门只要求 `≥8`；② 宽松对齐 `[0.5e,1.5e]` 取编辑率最低、≤0.35；③ 接缝去重（≥4 有效字精确片段只留一份）；④ 拼接降为最后手段。`e<8` 不进放宽路径（防切多丢字）；Debug `[DBG-416] seam: layer=…` | ✅ 平台中立纯逻辑（无 `cfg`），macOS 同继承；底线「绝不丢字」不变 |
+| **macOS 侧需要做什么** | | 无需改动（平台中立自动继承） |
 | **macOS 侧需要做什么** | | 无需改动（平台中立自动继承） |

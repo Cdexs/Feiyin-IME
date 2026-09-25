@@ -1,4 +1,15 @@
 
+### 2026-09-25 · REPRO-413-ALIGN-GATE-416 + FIX-ALIGN-GATE-416 交付（复现 + 修复，只改 mod.rs，未出包）
+
+- 413 后常规窗重叠占比随新句变长而变小 ⇒ 原比例长度门挡真实重叠 ⇒ 拼接 ⇒ 后缀重复（复现：后缀 8/12/16 在 S2 ≥19/29/41 起）。修复分层：严格（有先验且 e≥8 时门只要求 ≥8）→ 宽松（[0.5e,1.5e] 最低编辑率 ≤0.35）→ 接缝去重（≥4 有效字）→ 拼接（最后手段）；e<8 不进放宽路径防切多丢字；④/无先验不变。
+- 快照翻转（0/1/2 错字全 `=`、0 错字精确）；真实 debug.log 15 窗回放 修前 dup=2/丢=0 ⇒ 修后 dup=0/丢=0；反例 3 条。repro416 9 条；fmt EXIT0 / check 0 error、warnings 91/87≤基线 / 全量 test 0 failed（bin 1755P/0F/54I）。平台中立，MACOS-HANDOFF 已记。未出包。
+
+### 2026-09-25 · LOCALRT-STREAM-THREADS-417 + DEBUG-SESSION-WAV-418 交付（阶段一，未出包）
+
+- **417**：`local_stream_num_threads()` `min(8)`→**`min(4)`**（取不到回落 4），只改预览侧；doc 写 Gavin 09-25 指示 + F-F-01 理由；测试更名 `..._caps_at_4`、封顶 4、新增「≥8 核与精解侧刻意不同口径」断言。平台中立（MACOS-HANDOFF）。
+- **418**：`audio/mod.rs` 新增 `SessionDump`——`-debug` 累积送本地实时管线的 16k 单声道音频，`Drop` 后台线程写 `debug-audio/session-<ts>.wav` + `[DBG-418]`；`record_streaming` 内 `emit` 包裹全部 `on_chunk` 出口；`enforce_dump_limit_where`+`is_session_dump_file` ⇒ session 上限 10 与 preroll 20 分开计数。Warn 零动作 / 录音线程零阻塞 / 只读旁路。
+- 测试 `diag418_*` 2P；fmt EXIT 0 / check 0 error、warnings 92/87=基线 / 全量 test 排除 coder-1 在途 RED `repro416_tests` 后 0 failed（bin 1746P/54I）。未出包。
+
 ### 2026-09-25 · OVERLAY-MEASURE-CACHE-415 交付（浮层量宽结果缓存，阶段一，未出包）
 
 - 根因（F-A-01）：浮层每帧重绘都重量字宽（GDI `GetTextExtentPoint32W`+`encode_wide`；DWrite `CreateTextLayout`+`GetMetrics`+`encode_utf16`），文字只在流式/补间时变。

@@ -9,6 +9,30 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-1 — REPRO-413-ALIGN-GATE-416 + FIX-ALIGN-GATE-416 ✅ 交付（复现 + 修复，只改 mod.rs）
+
+- **范围**：只改 `src/transcription/mod.rs` —— `align_overlap_with_prior` / `OrderedReflow::push_inner`（+ `AlignLayer`/`AlignResult` 字段、`align_try_k_ratio`、`seam_dedupe`、`resolve_overlap`）+ `repro416_tests`（9 条）。**未碰** `main.rs` / `local_stream.rs`。
+- **复现**：413 形状两窗 ⇒ 原长度门 `max(8,0.30×新窗)` 挡真实重叠 ⇒ align_fail ⇒ 拼接 ⇒ 后缀重复；后缀 8/12/16 字在 S2 ≥19/29/41 字起重复。
+- **修复分层**：① 有先验且 `e≥8` 时长度门只要求 `≥8`（`e<8` 不进放宽路径，防切多丢字）；② 宽松对齐 `[0.5e,1.5e]` 取编辑率最低、≤0.35 采用；③ 接缝去重（≥4 有效字精确片段只留一份）；④ 比例门兜底/无先验不变，宁重复不丢字。Debug `[DBG-416] seam`。
+- **验证**：快照翻转（0/1/2 错字全 `=`，0 错字精确）；真实 debug.log 15 窗回放 修前 dup=2/丢=0 ⇒ 修后 dup=0/丢=0；反例 3 条。`fmt --check` EXIT 0；`check --all-targets` 0 error、warnings 91/87≤基线；全量 `cargo test` **0 failed**（bin 1755P/0F/54I）。平台中立，MACOS-HANDOFF 已记。
+- 红线：未 commit / 未 build release / 版本 0.9.3 未动 / 零凭证。
+
+## 2026-09-25 — coder-2 — LOCALRT-STREAM-THREADS-417 ✅ 阶段一交付（待主控验收，只改 local_stream.rs）
+
+- **改动**：`local_stream_num_threads()` 由 `available_parallelism().min(8)` 改 **`.min(4)`**（取不到回落 4）。doc 注释写明 Gavin 2026-09-25 指示与理由（F-F-01：流式/精解各 min(核,8) 抢 CPU，预览小模型让核）。`create_local_stream_recognizer` 处注释同步。**只改预览侧**，精解 `default_acc_num_threads()`（mod.rs，min 8）不动。
+- **测试**：`stream_num_threads_follows_machine_cores_and_caps_at_8` 更名 `..._caps_at_4`，封顶断言 8→4，新增「≥8 核时与精解侧刻意不同口径（4 vs 8）」断言、删「须完全一致」断言。
+- **验证**：fmt EXIT 0；check 0 error、warnings 92/87=基线；全量 test 排除 coder-1 在途 RED `repro416_tests` 后 0 failed。平台中立（MACOS-HANDOFF 已记）。小改动短路径，不单派阶段三。
+- 红线：未 commit / 未 build release / 版本未动 / 零凭证。
+
+## 2026-09-25 — coder-2 — DEBUG-SESSION-WAV-418 ✅ 阶段一交付（待主控验收，只改 audio/mod.rs）
+
+- **改动**：新增 `SessionDump`（`-debug` 时累积**送入本地实时管线的 16k 单声道音频**，录音结束 `Drop` 后台线程写 `debug-audio/session-<ts>.wav` + `[DBG-418]` 日志）；`record_streaming` 内 `emit` 闭包包裹全部 `on_chunk` 出口（pre-roll/post-hotkey/主循环/松手 drain/尾部 flush）；`enforce_dump_limit_where` + `is_session_dump_file` ⇒ session 上限 **10** 与 preroll **20 分开计数**。
+- **硬约束**：① Warn 级 `new` 返回 None（零动作）；② 录音线程只 `extend_from_slice`、写盘后台线程、失败只 `warn`；③ 只借 `&[f32]`，送识别音频逐 bit 不变。
+- **测试**：`diag418_quiet_at_warn_and_writes_full_session_at_debug`（Warn 零动作 / Debug WAV 头 rate=16000·单声道·4800×2 / sherpa 回读 4800 样本 / 输入不变）、`diag418_session_limit_10_separate_from_preroll`（12→10 删最旧 / preroll+notes 不动 / 反向闸门不动 session）**2P/0F**。
+- **覆盖**：`record_streaming`（本地实时+在线流式）生效；批处理 `record()`（本地精确档）不在本链，未覆盖（result 说明）。
+- **验证**：fmt EXIT 0；check 0 error、warnings 92/87=基线；全量 test 排除 coder-1 在途 RED `repro416_tests` 后 0 failed。平台中立（MACOS-HANDOFF 已记）。
+- 红线：未 commit / 未 build release / 版本未动 / 零凭证。
+
 ## 2026-09-25 — coder-2 — OVERLAY-MEASURE-CACHE-415 ✅ 阶段一交付（待主控验收，只改 main.rs 浮层区）
 
 - **改动**（`src/main.rs` 浮层区）：新增 `MeasureKey{text,font_size,dpi}`；GDI `LastMeasure<i32>` + `get_or_insert_with`（命中即返回、**未命中才 `encode_wide`+`GetTextExtentPoint32W`**）；DWrite `DwriteMeasure`（**额外缓存 `encode_utf16` 结果** ⇒ 命中不建 `CreateTextLayout`、不重编码，`DrawText` 复用缓存编码）；两套 `thread_local`（无锁，仅绘制线程）。`measure_text_width(hdc, text, font_size)` 加参（`draw_recording_overlay_with_text` 传 `OVERLAY_TEXT_FONT_SIZE`、`adjust_overlay_pos_size_for_text` 传 `font_size`）；`d2d::streaming_text` 先查缓存、未命中才 encode+量宽（绘制块移入缓存闭包）。
