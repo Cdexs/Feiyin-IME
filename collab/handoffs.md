@@ -79,6 +79,14 @@
 - **碰巧通过报告**：`testsync377::main_has_no_cross_recording_ctx_cache` 命中测试模块**前的注释**（旧扫描器误剔使其未计入）⇒ 按其文档契约补注释过滤（不放宽代码不变量）。
 - **验证**：新增 `guard_prod_lines::tests` 3 条；fmt EXIT0 / check 0 error、warnings 91/87=基线 / 全量 test **0 failed**（bin 1802P/0F/55I）；`testsync421` 由红转绿。未 commit / 未 build / 版本未动 / 零凭证。
 
+## 2026-09-25 — coder-2 — UI-FOCUSLOST-WINDOW-430 ✅ 阶段一交付（只改 main.rs 回显窗区）
+
+- **改动**：① 正文纵向滚动（`WM_MOUSEWHEEL` 48px/格 + GDI/D2D 裁剪+scroll 偏移+滚动条滑块；`overlay_wnd_proc`+`draw_preview_overlay`+`preview_layout`/`preview_max_scroll`/`preview_clamp_scroll`）。② 宽 ×1.7（320→544）夹紧工作区 + 高 ≤60%工作区（`preview_size`；`overlay_geometry` FocusLost + Show 非流式）。③ 正文底 `h−32`、按钮底栏 `h−28..h−10` **不重叠**、滚动不动 + 分隔线；命中 rect 仍 `preview_hit_rects` 单一源。文案未新增。
+- **macOS**：`overlay.rs` 同有「窄 + 单行无滚动」（按钮已分离）⇒ 需 Mac 端同改 + 验证；MACOS-HANDOFF 已记。本单只改 Windows。
+- **验证**：`cargo fmt --check` EXIT 0；`check --all-targets` 0 error、warnings 91/87 ≤ 基线；`preview430_tests` **3P/0F**。⚠️ 全量 `cargo test` 4 红全在 `mod.rs`（coder-1 在途 435：`fix433_tests`×2 + 416×2），非本单文件。
+- 🔴 需 Gavin 目视：长文本滚动 / 宽度 / 按钮位置 / 多显示器·DPI / 短文本外观。
+- 红线：未改 ui/ / 未 commit / 未 build release / 版本未动 / 零凭证。
+
 ## 2026-09-25 — coder-2 — TAIL-CUT-REAL-PAUSE-434 ✅ 阶段一交付（只改 local_stream.rs + vad.rs 新增）
 
 - **改动**：`vad.rs` 新增 `real_pause_cut_candidates`（连续 ≥6 帧(120ms) 低能量段中点；**旧 `find_gap_cut_impl`/`find_gap_cut_gap_only` 未动 ⇒ 381 逐位不变**）；`local_stream.rs` 新增 `TailCutKind{RealPause,WeakGap,NoGap}`+`find_tail_cut_ex`（首轮取最早真停顿；无则前扩 2×back 取最近；再无⇒旧 WeakGap/NoGap），`find_tail_cut` 返回 `(cut, kind!=NoGap)`（调用方不变）；`TAIL_CUT_MIN_PAUSE_MS=120`/`TAIL_CUT_EXPAND_FACTOR=2`；`[DBG-434]` 日志。

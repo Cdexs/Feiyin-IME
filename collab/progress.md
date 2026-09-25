@@ -35,6 +35,12 @@
 - 新增 `emit_tail_window!` 宏统一组装末尾窗（有前片 ⇒ 前片后缀 + pending；首片 ⇒ `tail_window_alone` 单独解），长静默 407 与松键收尾共用；`plan_windows` 删 `is_tail`/规则 4、删 `TAIL_MERGE_MAX_SECS`；松键 `pending_slice.take()` 防重复。
 - 旧护栏 `ts413_rule4_*`→`ts423_*`、testsync386/407/411/413 改写；fmt EXIT0 / check 0 error、warnings 91/87≤基线 / 全量 test 0 failed（bin 1801P/0F/55I）。平台中立，MACOS-HANDOFF 已记。未出包。
 
+### 2026-09-25 · UI-FOCUSLOST-WINDOW-430 交付（回显窗样式：可滚动 + 宽 ×1.7 + 按钮固定底栏，未出包）
+
+- 只改 `src/main.rs` 回显窗区：正文纵向滚动（`WM_MOUSEWHEEL` + 裁剪/偏移/滚动条滑块）、宽 ×1.7 夹紧工作区 + 高 ≤60%工作区（`preview_size`）、正文区与底栏按钮不重叠 + 分隔线。
+- macOS `overlay.rs` 同有「窄 + 单行无滚动」⇒ 需 Mac 端同改+验证（HANDOFF 已记）。文案未新增。
+- `preview430_tests` 3P；fmt EXIT0 / check 0 error、warnings 91/87≤基线。⚠️ 全量 test 4 红在 mod.rs（coder-1 在途 435），非本单。未出包。
+
 ### 2026-09-25 · TAIL-CUT-REAL-PAUSE-434 交付（前片后缀切点只落真停顿，阶段一，未出包）
 
 - `vad.rs` 新增 `real_pause_cut_candidates`（连续 ≥120ms 低能量段中点；旧内核未动）；`local_stream.rs` 新增 `TailCutKind`+`find_tail_cut_ex`（首轮最早真停顿→前扩 2×back→旧 WeakGap/NoGap），`find_tail_cut` 兼容返回。

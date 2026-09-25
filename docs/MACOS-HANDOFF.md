@@ -2373,6 +2373,15 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 - **417 平台中立**：`local_stream_num_threads()` 改为 `available_parallelism().min(4)`（取不到回落 4），macOS 同继承；无 `cfg`、无新增 env / 构建脚本。**只改预览（流式）侧**，精解侧 `default_acc_num_threads()`（min 8）未动（Gavin 2026-09-25「将预览的线程调为 4」）。
 - **418 平台中立**：`src/audio/mod.rs` 的 `SessionDump`（`-debug` 整段录音落盘）+ `enforce_dump_limit_where` 仅用 `std::fs` + `chrono`，无平台 API；macOS 同继承。Warn 级零动作（`log_enabled!(Debug)` 为假 ⇒ `SessionDump::new` 返回 None）。**macOS 侧无需改动**（无 pub 签名 / env / 构建脚本变更）。
 
+## UI-FOCUSLOST-WINDOW-430（2026-09-25，coder-2）· 回显「输入文本」窗样式修正—— macOS 侧影响
+
+- **macOS 需同改（未验证）**。Windows 侧本单改动：回显窗（FocusLost）正文**纵向滚动**（滚轮 + 裁剪 + 滚动条）、宽 **×1.7** 夹紧工作区、正文区与底部按钮区**不重叠**。
+- 核对 `src/platform/macos/overlay.rs`：`preview_geometry:1268` / `draw_preview_overlay:1296` / `PREVIEW_OVERLAY_W=320`（:94）：
+  - 🔴 **同有「过窄」**（固定 320，未 ×1.7）；
+  - 🔴 **同有「长文本无滚动」**（正文为**单行** `draw_text`，注释「raw objc2 单行近似」，连多行 wrap 都无）；
+  - ✅ **按钮已分离**（正文底 `h−40`、按钮顶 `h−28`，不重叠，与 Windows 现状同）。
+- **结论**：macOS 需等价改动（宽度 ×1.7 + 工作区夹紧 + 多行正文 + 滚动），**须 Mac 端实现并验证**（本单只改 Windows `main.rs`）。文案沿用现有 i18n key，无新增。
+
 ## TAIL-CUT-REAL-PAUSE-434（2026-09-25，coder-2）· 前片后缀切点只落真停顿—— macOS 侧影响
 
 - **平台中立，无影响。** 改动在 `src/transcription/local_stream.rs`（`find_tail_cut`）/`vad.rs`（新增 `real_pause_cut_candidates`），纯 DSP/数组逻辑、无 `cfg`、无平台 API。macOS 同继承；无 pub 签名 / env / 构建脚本变更。
