@@ -2773,6 +2773,157 @@ fn resolve_overlap(prev: &str, new: &str, prior: AlignPrior) -> OverlapResolutio
     }
 }
 
+/// SEAM-KEEP-PREV-TEXT-431：`new` 中**从第 `k` 个有效字之后**的原文起始字节位置
+///（按 `align_keep_char` 计有效字；不足 `k` 个 ⇒ `new.len()`）。多字节安全。纯函数。
+fn byte_after_k_effective(s: &str, k: usize) -> usize {
+    let mut cnt = 0usize;
+    for (i, c) in s.char_indices() {
+        if align_keep_char(c) {
+            cnt += 1;
+            if cnt == k {
+                return i + c.len_utf8();
+            }
+        }
+    }
+    s.len()
+}
+
+/// SEAM-KEEP-PREV-TEXT-431（R1，主控裁决 B）：`new` 中**第 `eff_idx` 个有效字**（0-based、
+/// 按 `align_keep_char`）的**结束字节位置**（即该字之后）。多字节安全；越界 ⇒ `new.len()`。纯函数。
+fn byte_after_effective_index(new: &str, eff_idx: usize) -> usize {
+    let mut cnt = 0usize;
+    for (i, c) in new.char_indices() {
+        if align_keep_char(c) {
+            if cnt == eff_idx {
+                return i + c.len_utf8();
+            }
+            cnt += 1;
+        }
+    }
+    new.len()
+}
+
+/// SEAM-KEEP-PREV-TEXT-431（R1，主控裁决 B）：**半全局编辑距离对齐**求「接续点」。
+///
+/// 把**前一窗重叠区有效字**（`prev_eff`，必须**完整对齐**）与**后一窗开头若干有效字**
+/// （`new_eff`，末端自由）做编辑距离对齐，回溯最优路径，取「前一窗最后一个有效字」在后一窗中
+/// **对应**（匹配/替换）的位置之后作为接续点；若它在路径上被**删除**（后一窗无对应），取其前一个
+/// **有对应**的字的位置之后。返回**后一窗有效字下标**（= 对应字下标 + 1；无对应 ⇒ 0）。
+///
+/// 🔴 不能用 `k` 直接换算：插入/删除会让两侧重叠长度不等（R1 起因：21:12 插入「不」、21:16 插入
+/// 「去」时，`prev` 末字与 `new` 第 k 字不是同一内容位置 ⇒ 边界 1 字重复）。纯函数，可单测。
+fn semiglobal_continuation(prev_eff: &[char], new_eff: &[char]) -> usize {
+    let m = prev_eff.len();
+    let n = new_eff.len();
+    if m == 0 {
+        return 0;
+    }
+    // dp[i][j] = prev[..i] 对齐 new[..j] 的最小编辑距离。
+    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    for (i, row) in dp.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for j in 0..=n {
+        dp[0][j] = j;
+    }
+    for i in 1..=m {
+        for j in 1..=n {
+            let cost = if prev_eff[i - 1] == new_eff[j - 1] {
+                0
+            } else {
+                1
+            };
+            dp[i][j] = (dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1)
+                .min(dp[i - 1][j - 1] + cost);
+        }
+    }
+    // 半全局：prev 全消费（i=m），new 末端自由 ⇒ 取 argmin_j dp[m][j]。
+    // 🔴 平局取**较大** j（更靠后的对应）：偏向「替换/匹配」而非「删除 prev 末字」——
+    // 否则「某一世/某一时」平局时会删 `世` ⇒ 接续点落在 `时` 前 ⇒ 产出「某一世时」重复。
+    let mut best_j = 0usize;
+    let mut best = dp[m][0];
+    for j in 1..=n {
+        if dp[m][j] <= best {
+            best = dp[m][j];
+            best_j = j;
+        }
+    }
+    // 回溯整条最优路径，取「prev 各字**有对应**（匹配/替换）的最大 new 下标 + 1」= 接续点。
+    // （等价于「prev 最后一个有对应的字」的位置之后；末字若被删除则自动落到前一个有对应的字。）
+    let (mut i, mut j) = (m, best_j);
+    let mut last_aligned_plus1 = 0usize;
+    while i > 0 {
+        if j == 0 {
+            i -= 1; // prev[i-1] 被删除
+            continue;
+        }
+        let cost = if prev_eff[i - 1] == new_eff[j - 1] {
+            0
+        } else {
+            1
+        };
+        if dp[i][j] == dp[i - 1][j - 1] + cost {
+            last_aligned_plus1 = last_aligned_plus1.max(j); // prev[i-1] ↔ new[j-1]
+            i -= 1;
+            j -= 1;
+        } else if dp[i][j] == dp[i][j - 1] + 1 {
+            j -= 1; // new[j-1] 是插入
+        } else {
+            i -= 1; // prev[i-1] 被删除
+        }
+    }
+    last_aligned_plus1
+}
+
+/// SEAM-KEEP-PREV-TEXT-431：去掉末尾的**窗末句末标点**（`。！？…` 与 ASCII `.` `!` `?`）及其后空白。纯函数。
+fn strip_trailing_sentence_punct(s: &str) -> &str {
+    let mut end = s.len();
+    for (i, c) in s.char_indices().rev() {
+        if c.is_whitespace() || matches!(c, '。' | '！' | '？' | '…' | '.' | '!' | '?') {
+            end = i;
+        } else {
+            break;
+        }
+    }
+    &s[..end]
+}
+
+/// SEAM-KEEP-PREV-TEXT-431（Gavin 2026-09-25「重叠区文字以前一窗为准，只采纳后一窗对边界标点的修正」）：
+/// 拼接「重叠区」文本 —— **字与内部标点全用前一窗**（`prev_overlap`），只把前一窗**窗末句末标点**
+/// 换成后一窗在重叠结束位置起的文本（含该位置的标点）。
+///
+/// - `prev_overlap` = 前一窗 `[cut..]`（= k 个有效字 + 其标点）；`new` = 后一窗原文；`k` = 对齐层给出的重叠有效字数。
+/// - `new` 在重叠结束位置起**无内容**（整窗都是重叠）⇒ 返回 `prev_overlap` 原文（含其窗末标点）。
+/// - `k == 0`（无重叠）⇒ 返回 `new`（调用方本走拼接分支，此分支不触发）。
+/// 多字节按 char。纯函数，可单测。
+fn splice_keep_prev_overlap(prev_overlap: &str, new: &str, k: usize) -> String {
+    if k == 0 {
+        return new.to_string();
+    }
+    let prev_eff: Vec<char> = prev_overlap
+        .chars()
+        .filter(|c| align_keep_char(*c))
+        .collect();
+    let new_eff_all: Vec<char> = new.chars().filter(|c| align_keep_char(*c)).collect();
+    // 只取后一窗开头 `k+4` 个有效字做半全局对齐（插入/删除至多 ±4）。
+    let n = new_eff_all.len().min(k + 4);
+    let cont_eff = semiglobal_continuation(&prev_eff, &new_eff_all[..n]);
+    let pos = if cont_eff == 0 {
+        0
+    } else {
+        byte_after_effective_index(new, cont_eff - 1)
+    };
+    if pos >= new.len() {
+        // 后一窗整窗都是重叠（对应字即末字）⇒ 保留前一窗重叠区原文（含其窗末标点）。
+        return prev_overlap.to_string();
+    }
+    let mut out = String::with_capacity(prev_overlap.len() + new.len() - pos);
+    out.push_str(strip_trailing_sentence_punct(prev_overlap));
+    out.push_str(&new[pos..]);
+    out
+}
+
 /// SLIDING-WINDOW-367（阶段四·B）/ TUNE-DECODE-SERIAL-AND-TOKEN-CAP-390：窗口解码**并发度**。
 ///
 /// 🔴 **现为 1（串行）** —— Gavin 2026-09-23 端测确认。依据（主控四份端测日志实测）：
@@ -2916,6 +3067,7 @@ impl OrderedReflow {
                     if ws >= prev_end {
                         // 零重叠 ⇒ 无重复可去 ⇒ 拼接即正确答案（不得跳过）。
                         self.committed.push_str(&self.last_window_text);
+                        self.last_window_text = text;
                     } else {
                         // 共享切片 ⇒ 确有真实重叠 ⇒ 对齐去重（371：k 受**区间先验**约束）。
                         let prior = AlignPrior {
@@ -2927,20 +3079,34 @@ impl OrderedReflow {
                         };
                         // 🔴 FIX-ALIGN-GATE-416：严格 → 宽松 → 接缝去重 → 拼接（把拼接降为最后手段）。
                         let res = resolve_overlap(&self.last_window_text, &text, prior);
+                        // SEAM-KEEP-PREV-TEXT-431：对齐成功时，重叠区文字用**前一窗**（保其字与内部标点），
+                        // 只把前一窗**窗末句末标点**换成后一窗在同一位置起的文本（含其标点）。
+                        let keep_prev: u8 = if res.committed_prefix.is_some() { 1 } else { 0 };
+                        let new_head_dropped: String = if keep_prev == 1 {
+                            let pos = byte_after_k_effective(&text, res.k);
+                            text[..pos].chars().take(20).collect()
+                        } else {
+                            String::new()
+                        };
                         match &res.committed_prefix {
                             Some(p) => {
                                 if !p.is_empty() {
                                     self.committed.push_str(p);
                                 }
+                                // `committed_prefix` 是前一窗前缀 ⇒ `[p.len()..]` = 重叠区原文。
+                                let prev_overlap = &self.last_window_text[p.len()..];
+                                self.last_window_text =
+                                    splice_keep_prev_overlap(prev_overlap, &text, res.k);
                             }
                             None => {
                                 // 前 3 层都没能去重 ⇒ 原样拼接：宁可重复不可丢字。
                                 self.committed.push_str(&self.last_window_text);
+                                self.last_window_text = text;
                             }
                         }
                         if log::log_enabled!(log::Level::Debug) {
                             log::debug!(
-                                "[DBG-416] seam: layer={} k={} e={} edit={:.2} seq={} span=[{}, {}) prev=[{}, {}) m={} ratio={:?}",
+                                "[DBG-416] seam: layer={} k={} e={} edit={:.2} seq={} span=[{}, {}) prev=[{}, {}) m={} ratio={:?} keep_prev={} new_head_dropped=\"{}\"",
                                 res.layer.as_str(),
                                 res.k,
                                 res.expected_k
@@ -2953,11 +3119,12 @@ impl OrderedReflow {
                                 prev_start,
                                 prev_end,
                                 prior.prev_extra_slices,
-                                prior.expected_ratio
+                                prior.expected_ratio,
+                                keep_prev,
+                                new_head_dropped
                             );
                         }
                     }
-                    self.last_window_text = text;
                     self.last_span = Some((ws, we));
                 }
             }
@@ -9931,6 +10098,118 @@ mod diag425_tests {
             eprintln!("[DIAG427R1] {tag} before=\"{}\"", before);
             eprintln!("[DIAG427R1] {tag} after =\"{}\"", after);
         }
+    }
+
+    fn eff(s: &str) -> usize {
+        s.chars().filter(|c| align_keep_char(*c)).count()
+    }
+
+    /// SEAM-KEEP-PREV-TEXT-431：纯函数边界。
+    #[test]
+    fn fix431_splice_bounds() {
+        // 后一窗整窗都是重叠 ⇒ 保留前一窗重叠区原文（含其窗末标点）。
+        assert_eq!(splice_keep_prev_overlap("某一世", "某一时", 3), "某一世");
+        // 前一窗窗末句末标点被去、后一窗从重叠结束起的文本（含标点）接上。
+        assert_eq!(
+            splice_keep_prev_overlap("事件，因为。", "事件，因为自愿经历", 4),
+            "事件，因为自愿经历"
+        );
+        // 重叠区内部标点用前一窗（后一窗仅边界标点不同）。
+        assert_eq!(
+            splice_keep_prev_overlap("甲、乙、丙。", "甲、乙、丙，丁", 3),
+            "甲、乙、丙，丁"
+        );
+        // k==0 ⇒ 原样后一窗。
+        assert_eq!(splice_keep_prev_overlap("x", "新窗", 0), "新窗");
+        // 多字节安全：emoji / CJK。
+        assert_eq!(splice_keep_prev_overlap("好👍。", "好👍呀", 2), "好👍呀");
+    }
+
+    /// 431 真实 21:12：后一窗把「与」误插成「不与」+ 窗末句号 —— 重叠区须保前一窗「似乎与他们…事件，因为」，
+    /// 且句号被后一窗的内容替换（不再出现「似乎不与他们」）。
+    #[test]
+    fn fix431_real_2112_keeps_prev_overlap() {
+        let prev = "有时在下来进行另一次人生时，灵魂自愿经历某些似乎与他们要过的人生很不相称的事件，因为。";
+        let new = "不与他们要过的人生很不相称的事件，因为自愿经历那样的体验，可以帮助他们解决许多原本要好几时才能处理的业。";
+        let n_eff = eff(new);
+        // 真实重叠「与他们要过的人生很不相称的事件因为」≈17 有效字。
+        let prior = super::AlignPrior {
+            expected_ratio: Some(17.0 / n_eff as f32),
+            prev_extra_slices: 0,
+        };
+        let r = super::resolve_overlap(prev, new, prior);
+        let p = r.committed_prefix.expect("应可对齐");
+        let spliced = splice_keep_prev_overlap(&prev[p.len()..], new, r.k);
+        let final_text = format!("{p}{spliced}");
+        eprintln!("[DBG-431] 2112 final=\"{final_text}\"");
+        assert!(
+            final_text.contains("似乎与他们"),
+            "须保前一窗：{final_text}"
+        );
+        assert!(
+            !final_text.contains("似乎不与他们"),
+            "不得插入「不」：{final_text}"
+        );
+        assert!(
+            !final_text.contains("因为为"),
+            "不得 1 字重复「因为为」：{final_text}"
+        );
+    }
+
+    /// 431 真实 21:16：后一窗把「取、」误插成「去，」—— 重叠区须保前一窗，丢掉「去」。
+    #[test]
+    fn fix431_real_2116_drops_inserted_char() {
+        let prev = "为了让这个个体适应地球生活，一定要有某些他可以获取、以便和日常生活经验对照或比较的基础。";
+        let new = "去，以便和日常生活经验对照或比较的基础。如不然，他会生活在适合和不对劲的情绪里。直到他累积了足够的类似经验，来。";
+        let n_eff = eff(new);
+        let prior = super::AlignPrior {
+            expected_ratio: Some(17.0 / n_eff as f32),
+            prev_extra_slices: 0,
+        };
+        let r = super::resolve_overlap(prev, new, prior);
+        if let Some(p) = r.committed_prefix {
+            let spliced = splice_keep_prev_overlap(&prev[p.len()..], new, r.k);
+            let final_text = format!("{p}{spliced}");
+            eprintln!("[DBG-431] 2116 final=\"{final_text}\" (k={})", r.k);
+            assert!(
+                !final_text.contains("获取、去"),
+                "不得出现「获取、去」：{final_text}"
+            );
+            assert!(
+                !final_text.contains("基础础"),
+                "不得 1 字重复「基础础」：{final_text}"
+            );
+            assert!(
+                final_text.contains("获取、以便"),
+                "须保前一窗「获取、以便」：{final_text}"
+            );
+        }
+    }
+
+    /// 431 R1（主控裁决 B）：175022 —— 后一窗把前一窗重叠区「某一世」重解成「某一时」⇒ 须保「某一世」。
+    #[test]
+    fn fix431_real_175022_keeps_prev_shishi() {
+        let prev_overlap = "某人在某一世。";
+        let new = "某人在某一时可能是你的伴侣。";
+        let spliced = splice_keep_prev_overlap(prev_overlap, new, 6);
+        eprintln!("[DBG-431] 175022 spliced=\"{spliced}\"");
+        assert!(spliced.contains("某一世"), "须保「某一世」：{spliced}");
+        assert!(
+            !spliced.contains("某一世时"),
+            "不得「某一世时」重复：{spliced}"
+        );
+        assert!(
+            !spliced.contains("某一时"),
+            "不得用后一窗「某一时」：{spliced}"
+        );
+    }
+
+    /// 431 R1：后一窗在重叠区**少 1 字**（删除）⇒ 仍保前一窗重叠区、无重复无丢字。
+    #[test]
+    fn fix431_deletion_keeps_prev() {
+        let spliced = splice_keep_prev_overlap("abcde", "abce后续", 4);
+        eprintln!("[DBG-431] deletion spliced=\"{spliced}\"");
+        assert_eq!(spliced, "abcde后续", "删除型：保前一窗重叠区 + 后一窗尾巴");
     }
 
     fn read_wav_rel(rel: &str) -> Vec<f32> {
