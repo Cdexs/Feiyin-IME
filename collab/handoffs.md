@@ -9,6 +9,23 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-2 — OVERLAY-MEASURE-CACHE-415 ✅ 阶段一交付（待主控验收，只改 main.rs 浮层区）
+
+- **改动**（`src/main.rs` 浮层区）：新增 `MeasureKey{text,font_size,dpi}`；GDI `LastMeasure<i32>` + `get_or_insert_with`（命中即返回、**未命中才 `encode_wide`+`GetTextExtentPoint32W`**）；DWrite `DwriteMeasure`（**额外缓存 `encode_utf16` 结果** ⇒ 命中不建 `CreateTextLayout`、不重编码，`DrawText` 复用缓存编码）；两套 `thread_local`（无锁，仅绘制线程）。`measure_text_width(hdc, text, font_size)` 加参（`draw_recording_overlay_with_text` 传 `OVERLAY_TEXT_FONT_SIZE`、`adjust_overlay_pos_size_for_text` 传 `font_size`）；`d2d::streaming_text` 先查缓存、未命中才 encode+量宽（绘制块移入缓存闭包）。
+- **约束达成**：① 存原值 ⇒ 命中与不缓存逐位一致；② 键含文本/字号/DPI，GDI 与 DWrite 分开缓存（281：同串差 143~155px 不互串）；③ 单条「上一次」、无锁 thread_local；④ 命中跳过编码；⑤ `log_draw_geo_277` 调用点/500ms 节流/参数不变；⑥ 平台中立性见 `docs/MACOS-HANDOFF.md`（**已评估，对 macOS 无影响**）。
+- **测试**：`omc415_hit_skips_measure_and_returns_same` / `omc415_key_covers_text_font_dpi` / `omc415_gdi_and_dwrite_are_independent` / `omc415_dwrite_put_hit_and_invalidate` **4P/0F**（纯逻辑 `LastMeasure`/`DwriteMeasure` 直测，无需 HDC）。
+- **验证**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` 0 error、warnings **92/87** = 基线；全量 `cargo test --no-fail-fast` **0 failed**（bin 1744P/54I）；`git diff --name-only` 仅 `src/main.rs`。
+- 🔴 **端测须 Gavin 目视**（浮层 Win32+D2D 原生绘制，自动化无覆盖）：文字滚动贴右、窗口随文字变宽、改字号后显示、多屏/DPI 切换。
+- 红线：未 commit / 未 build release / 版本未动 / 零凭证。
+
+## 2026-09-25 — coder-2 — TEST-SYNC-413 ✅ 交付（阶段三·非作者护栏 10 条；生产零改动）
+
+- **范围**：只在 `src/main.rs` 新增 `#[cfg(test)] mod testsync413_tests`（10 条）；**未碰生产区**、未碰 `transcription/mod.rs`。
+- **契约 1~7 逐条**：① 常态单片 `must_start=ge-1` + 前文只取 `ge-2` 后缀；首片/`must_start==gs` 无前文 ② 规则 3 集成（`plan_windows` 4×4s）：无 pending ⇒ 窗 `(2,4)`、pending=1 ⇒ 窗 `(1,4)` 且首窗 `must_start=pending`；非首窗/窗外 pending 忽略 ③ 规则 4 收尾窗 `(1,3)` + 传 `gs` ⇒ `short_context_span=None`（整片）④ 调用点源码锚点（常规窗第 3 参 `must_start`、收尾窗 `gs`）⑤ `trim_and_shift_ranges`（跨 cut 截断 / `b==cut` 丢弃 / `a>=cut` 平移 / `cut=0` 恒等）+ `shift_and_concat_ranges` 组合（窗内坐标、样本表首元素=后缀、None 传播）⑥ 字速 8/2/0（及 NaN/负）⇒ 回溯 2/6/4s；前片短于回溯取整片；多字节按 char 比例基准 ⑦ `context_tail_pending` 只覆 must 片 + 无前文 None 源码锚点 ⑧ BUILD-399「开心开」：末片 2.85s、前片 2.98s ⇒ 5.83s，上界 6.85s < 旧 9.33s。
+- **独立**：自建数值/场景、不复用作者夹具；期望值经 sandbox 复刻生产纯函数全部一致。
+- **验证（白名单）**：`cargo fmt --check` **EXIT 0**；`cargo check --all-targets` **0 error**、warnings **92/87** = 基线、新增模块零 warning；🔴 未跑 `cargo test`（阶段三禁止；tester-1 执行）。未发现生产缺陷。
+- 红线：未改生产代码 / 未 commit / 未 push / 版本未动 / 零凭证。
+
 ## 2026-09-25 — coder-1 — LOCALRT-SHORT-CONTEXT-413 ✅ 阶段一交付（待主控验收，只改 main.rs）
 
 - **范围**：只动 `src/main.rs` —— 组窗/派发区（`dispatch_window!` + 两处调用点 + 407 块 ~8689-9141）、纯函数区（`must_start_for_window` / `short_context_span` / `trim_and_shift_ranges` / `take_context_suffix` ~12141）、测试区（`short_context_413_tests` 9 条）。**未碰** `transcription/mod.rs`（coder-2 的 414）。

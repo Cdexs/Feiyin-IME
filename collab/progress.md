@@ -1,4 +1,17 @@
 
+### 2026-09-25 · OVERLAY-MEASURE-CACHE-415 交付（浮层量宽结果缓存，阶段一，未出包）
+
+- 根因（F-A-01）：浮层每帧重绘都重量字宽（GDI `GetTextExtentPoint32W`+`encode_wide`；DWrite `CreateTextLayout`+`GetMetrics`+`encode_utf16`），文字只在流式/补间时变。
+- 改动（只 `src/main.rs` 浮层区）：`MeasureKey{text,font_size,dpi}` + GDI `LastMeasure<i32>::get_or_insert_with`（命中不编码/不量宽）+ DWrite `DwriteMeasure`（缓存编码结果供 `DrawText` 复用）；两套无锁 thread_local，GDI/DWrite 分缓存（281 禁互串）；`measure_text_width` 加 `font_size`；`streaming_text` 先查缓存。
+- 不变：GDI 兜底、`log_draw_geo_277`、`streaming_scroll_offset` 口径。平台：Windows 专属，macOS 已评估无影响（MACOS-HANDOFF）。
+- 测试 `omc415_*` 4P/0F；fmt EXIT 0 / check 0 error、warnings 92/87=基线 / 全量 test 0 failed（bin 1744P/54I）。🔴 浮层视觉须 Gavin 目视（滚动贴右/随文字变宽/改字号/多屏 DPI）。未出包。
+
+### 2026-09-25 · TEST-SYNC-413 交付（常规窗「少带前文」的非作者护栏 10 条，生产零改动）
+
+- 只加 `src/main.rs::testsync413_tests`（10 条）：常态/首片 must_start+前文片、规则 3 pending 集成（`plan_windows` 4×4s）、规则 4 收尾整片、两处调用点源码锚点、区间裁剪平移+concat 窗内坐标、字速快慢冷启动回溯、多字节按 char 比例基准、兜底只覆 must、BUILD-399 数值（5.83/6.85 vs 旧 9.33）。
+- 期望值经 sandbox 复刻 `plan_windows`/`group_window_start_secs`/`tail_backtrack_secs`/`take_context_suffix`/`trim_and_shift_ranges`/`shift_and_concat_ranges` 全部一致。
+- 白名单：fmt EXIT 0、check 0 error / warnings 92/87=基线、`main.rs` 零新 warning；未跑 `cargo test`。未发现生产缺陷。未出包。
+
 ### 2026-09-25 · LOCALRT-SHORT-CONTEXT-413 交付（常规窗「少带前文」，阶段一，未出包）
 
 - 常规窗音频：整段前文片 → 紧邻前一片后缀（`tail_backtrack_secs` ≥2s/≥12 字 + `find_tail_cut`）+ `[must_start..ge)` 完整解。`must_start` 纯函数决定（常态=窗末片；规则 3 并入 pending 的首窗=pending）；对齐 span `(must_start-1, ge)`；VAD 区间 `trim_and_shift_ranges` 裁剪平移（不新增每窗 VAD）。

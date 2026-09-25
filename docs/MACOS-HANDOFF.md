@@ -2363,6 +2363,11 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 私有项：`self_vad_ranges` / `plan_self_vad_trim` / `SelfVadTrim` 均 `fn`/`struct`（crate 内，非 `pub`） | — | ✅ 未改 pub 签名 / 未新增 env / 未改构建脚本 |
 | **macOS 侧需要做什么** | | 无需改动（平台中立自动继承）；若 macOS 有独立的「时间线无语音」判定分支，按同判据接入复核 |
 
+## OVERLAY-MEASURE-CACHE-415（2026-09-25，coder-2）· 浮层量宽结果缓存—— macOS 侧影响
+
+- **已评估，对 macOS 无影响。** 改动全部在 `src/main.rs` 的 `#[cfg(target_os = "windows")]` 浮层绘制区（GDI `measure_text_width` + D2D `mod d2d::streaming_text`），缓存为 Windows 绘制线程的 `thread_local`。
+- macOS 浮层走各自平台实现（`src/platform/macos/`），无 `measure_text_width` / `streaming_text` 对应物，也不共享本缓存。无 pub 签名 / 无新增 env / 无构建脚本改动。
+
 ## LOCALRT-SHORT-CONTEXT-413（2026-09-25，coder-1）· 常规窗「少带前文」—— macOS 侧影响
 
 | 改动 | 行为前 → 后 | macOS 影响 |
