@@ -184,6 +184,11 @@ enum PipelineEvent {
         /// （worker `Instant::now()`，随解码结果一路带到事件）。消费端在**实际 `show_overlay` 渲染**时
         /// 打 `decode_done→render_ms`（端到端口径：解完 → 浮层重画）。`None` = 老发送方 / 非滑窗路径。
         decode_done_at: Option<std::time::Instant>,
+        /// LOCALRT-PREVIEW-HIDE-NONUSER-429：`true` ⇒ 本窗被声纹**整窗全剔**（421 full_drop），
+        /// 预览合成 = **已定稿权威文本** + `streaming[committed_len..]`（该段之后的流式尾巴），
+        /// **不含该段对应的流式文字**；`acc_text` 为空时也按此合成（不被 `compose_with_acc_for_gen`
+        /// 的「acc 空 ⇒ 原样 raw」规则短路）。其余场景恒 `false`（逐位不变）。
+        non_user_hide: bool,
     },
     /// LOCALRT-SEAM-337（自适应定界）：本片边界冻结通知。
     ///
@@ -7276,6 +7281,7 @@ fn process_controller_events(
                 acc_text,
                 replace_all,
                 decode_done_at,
+                non_user_hide,
             } => {
                 // 325：本地实时档 accuracy 分片权威文本回灌（**只有本地档会发本事件**）。
                 // 代际门与 StreamingText 同源：陈旧 session 的回灌不得改本 session 浮层。
@@ -7353,6 +7359,7 @@ fn process_controller_events(
                                     len,
                                     accurate,
                                     decode_done_at,
+                                    non_user_hide,
                                 );
                             } else {
                                 set_acc_reflow_state_only(generation, &text, len);
@@ -7462,6 +7469,7 @@ fn process_controller_events(
                             len,
                             accurate,
                             None,
+                            false,
                         );
                     } else {
                         set_acc_reflow_state_only(generation, &text, len);
@@ -8693,6 +8701,9 @@ fn spawn_worker_thread(
                                         // 不能拿它当「过期」判据（会把后到的完整文本误杀成 stale，预览永不更新）。
                                         let mut reflow_seq: usize = 0;
                                         let mut ordered = transcription::OrderedReflow::new();
+                                        // LOCALRT-PREVIEW-HIDE-NONUSER-429：最近一次「已定稿权威全文」
+                                        //（`OrderedReflow` 产出），供 full_drop 窗剔除合成使用。
+                                        let mut last_authoritative = String::new();
                                         let concurrency = transcription::WINDOW_DECODE_CONCURRENCY.max(1);
                                         let terms = acc_terms.as_deref();
 
@@ -8960,6 +8971,8 @@ fn spawn_worker_thread(
                                                             .get(seq)
                                                             .copied()
                                                             .unwrap_or(0);
+                                                        // 429：记录最新权威全文（供 full_drop 窗的剔除合成用）。
+                                                        last_authoritative = authoritative.clone();
                                                         let _ = acc_event_tx.send(
                                                             PipelineEvent::PreviewReflow {
                                                                 generation: session_generation,
@@ -8976,9 +8989,43 @@ fn spawn_worker_thread(
                                                                 replace_all: true,
                                                                 // 382（3C）：本窗解码完成时刻（端到端埋点）。
                                                                 decode_done_at: Some(decode_done_at),
+                                                                non_user_hide: false,
                                                             },
                                                         );
                                                         reflow_seq += 1;
+                                                    }
+                                                    // LOCALRT-PREVIEW-HIDE-NONUSER-429：声纹**整窗全剔**（421）
+                                                    // ⇒ 立即刷新预览为「已定稿权威文本 + 该段之后的流式尾巴」，
+                                                    // 剔除该段对应的流式文字（否则要等下一次回灌 / 松键才消失）。
+                                                    // `OrderedReflow` 对空文本不动状态 ⇒ `last_authoritative` 仍是
+                                                    // 上一窗的权威全文；`committed_len` = 派发当刻边界（本段末）。
+                                                    if full_drop {
+                                                        let fallback_committed = window_committed_lens
+                                                            .get(seq)
+                                                            .copied()
+                                                            .unwrap_or(0);
+                                                        let _ = acc_event_tx.send(
+                                                            PipelineEvent::PreviewReflow {
+                                                                generation: session_generation,
+                                                                seg_index: dispatch_idx,
+                                                                reflow_seq: Some(reflow_seq),
+                                                                committed_len: fallback_committed,
+                                                                boundary_usable: true,
+                                                                has_hole: false,
+                                                                acc_text: last_authoritative.clone(),
+                                                                replace_all: true,
+                                                                decode_done_at: Some(decode_done_at),
+                                                                non_user_hide: true,
+                                                            },
+                                                        );
+                                                        reflow_seq += 1;
+                                                        if log::log_enabled!(log::Level::Debug) {
+                                                            log::debug!(
+                                                                "[DBG-429] hide non-user segment: seq={} chars={}",
+                                                                seq,
+                                                                fallback_committed
+                                                            );
+                                                        }
                                                     }
                                                     // 375：只把「最终非空」的窗口计入均值
                                                     // （坍塌→空的窗口不拖低均值；374 剥离后重解出的真内容照常计入）
@@ -10991,6 +11038,62 @@ fn compose_reflow_preview(
     compose_with_acc_for_gen(Some(&state), generation, streaming)
 }
 
+// =====================================================================
+// LOCALRT-PREVIEW-HIDE-NONUSER-429：声纹整窗全剔 ⇒ 立即从预览移除该段
+// =====================================================================
+#[cfg(test)]
+mod fix429_tests {
+    use super::reflow_preview;
+
+    /// 全剔窗预览合成 = 已定稿权威文本 + `streaming[committed_len..]`（剔除本段流式文字）；
+    /// **acc 为空也成立**（不被 `compose_with_acc_for_gen` 的「acc 空 ⇒ 原样 raw」短路）。
+    #[test]
+    fn fix429_hide_preview_removes_segment_keeps_tail() {
+        // acc 空、段尾在 3：剔除前 3 字，保留尾巴「def」。
+        assert_eq!(reflow_preview("", "abcdef", 3), "def");
+        // 有权威前缀：前缀 + 尾巴。
+        assert_eq!(reflow_preview("权威", "abcdef", 3), "权威def");
+        // committed 到末尾 ⇒ 只剩权威前缀（本段之后的流式也为空）。
+        assert_eq!(reflow_preview("权威", "abcdef", 6), "权威");
+        // 本人段（dropped=0）不改：committed=0 时保留全部流式。
+        assert_eq!(reflow_preview("", "abc", 0), "abc");
+    }
+
+    /// 源码锚点：全剔窗在 `if full_drop` 内发 `non_user_hide: true` 的回灌 + `[DBG-429]`；
+    /// 常规回灌恒 `non_user_hide: false`；触发经 `reflow_action`（编辑态/取消照旧拦截）。
+    #[test]
+    fn fix429_source_anchors() {
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"))
+            .join("\n");
+        assert!(
+            prod.contains(concat!("[DBG-429] hide non-user segment")),
+            "须有 DBG-429 埋点"
+        );
+        assert_eq!(
+            prod.matches("non_user_hide: true").count(),
+            1,
+            "hide 回灌只应 1 处"
+        );
+        assert!(
+            prod.contains("non_user_hide: false"),
+            "常规回灌须显式 false"
+        );
+        let at = prod.find("non_user_hide: true").expect("hide 发送缺失");
+        let cond = prod[..at]
+            .rfind("if full_drop")
+            .expect("hide 须在 full_drop 条件内");
+        assert!(
+            at - cond < 1500,
+            "hide 发送须在 full_drop 块内（{at}-{cond}）"
+        );
+        // 渲染前经 `if action == ReflowAction::Applied`（编辑态/取消由 reflow_action 拦截）。
+        assert!(
+            prod.contains("if action == ReflowAction::Applied"),
+            "回灌渲染须经 reflow_action 门（编辑态不改）"
+        );
+    }
+}
+
 /// AUTOLEARN-EDIT-SNAPSHOT-331：自学习比对基准的选择（纯函数）。
 ///
 /// - **本地实时档** ⇒ 用「编辑入口快照」`overlay_original`（用户开始编辑时屏幕上那份；
@@ -11039,6 +11142,8 @@ fn render_authoritative_reflow(
     committed_len: usize,
     accurate: bool,
     decode_done_at: Option<std::time::Instant>,
+    // LOCALRT-PREVIEW-HIDE-NONUSER-429：整窗全剔 ⇒ 预览剔除本段流式文字。
+    non_user_hide: bool,
 ) {
     // FIX-REFLOW-RAW-BASE-420：底稿改用**原始流式文本**（与 `committed_len` 同坐标）；gen 不符 / 无
     //   ⇒ 空串 ⇒ 预览 = acc 全文（不挂任何旧尾）。**不再**取 `last_streaming_text` 镜像——那是
@@ -11052,7 +11157,12 @@ fn render_authoritative_reflow(
         .unwrap_or_default();
     // 386（B）：与 `compose_with_acc_for_gen` **同一个合成函数**（acc 全文 + `streaming[committed_len..]`），
     // 不再走 `reflow_preview_367`（replace_all 会丢流式尾巴 ⇒ 回灌把预览截短 ⇒ 闪回更短文本）。
-    let preview = compose_reflow_preview(generation, acc_text, &streaming, committed_len);
+    // 429：整窗全剔时改用 `reflow_preview`（同式，但 `acc_text` 为空也成立，不被「acc 空 ⇒ raw」短路）。
+    let preview = if non_user_hide {
+        reflow_preview(acc_text, &streaming, committed_len)
+    } else {
+        compose_reflow_preview(generation, acc_text, &streaming, committed_len)
+    };
     set_acc_reflow_state_only(generation, acc_text, committed_len);
     if let Ok(mut mirror) = last_streaming_text.lock() {
         *mirror = Some(preview.clone());
@@ -11125,6 +11235,7 @@ fn try_resolve_reflow(
                 len,
                 true,
                 None,
+                false,
             );
         }
         _ => {
