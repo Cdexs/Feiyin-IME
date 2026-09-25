@@ -9821,6 +9821,187 @@ mod diag425_tests {
         }
     }
 
+    fn strip_punct(s: &str) -> String {
+        s.chars()
+            .filter(|c| !crate::punctuation::PUNCT_CHARS.contains(c) && !c.is_whitespace())
+            .collect()
+    }
+    fn lev(a: &[char], b: &[char]) -> usize {
+        let (m, n) = (a.len(), b.len());
+        let mut prev: Vec<usize> = (0..=n).collect();
+        for i in 1..=m {
+            let mut cur = vec![i; n + 1];
+            for j in 1..=n {
+                let c = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+                cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + c);
+            }
+            prev = cur;
+        }
+        prev[n]
+    }
+    fn cer(refr: &str, out: &str) -> f32 {
+        let r = strip_punct(refr);
+        let o = strip_punct(out);
+        let (rc, oc): (Vec<char>, Vec<char>) = (r.chars().collect(), o.chars().collect());
+        if rc.is_empty() {
+            return 0.0;
+        }
+        lev(&rc, &oc) as f32 / rc.len() as f32
+    }
+    fn missing_grams(refr: &str, out: &str, n: usize) -> usize {
+        let r: Vec<char> = strip_punct(refr).chars().collect();
+        let o = strip_punct(out);
+        if r.len() < n {
+            return 0;
+        }
+        let mut miss = 0;
+        for w in r.windows(n) {
+            let g: String = w.iter().collect();
+            if !o.contains(&g) {
+                miss += 1;
+            }
+        }
+        miss
+    }
+
+    /// LOCALRT-ALWAYS-CONTEXT-427 R1：用**生产真实 acc 文本**对比「改前 span 不相交（拼接）」vs
+    /// 「改后 span 相交（前片后缀 + must，OrderedReflow 去重）」的最终文本 —— 核心验证**是否丢字**。
+    /// 运行：`cargo test --bin feiyin-ime -- --ignored --nocapture diag427_reflow`
+    #[test]
+    #[ignore = "diag427r1: cargo test --bin feiyin-ime -- --ignored --nocapture diag427_reflow"]
+    fn diag427_reflow_no_loss_real_texts() {
+        use super::OrderedReflow;
+        let cases: [(&str, &str, &[&str]); 2] = [
+            (
+                "175022",
+                "在生命的轮回中，特定一群人之间的特定连结会一再以不同的组合出现。比方说，某人在某一世可能是你的伴侣，另一世是你的父亲或母亲，而另一世是你的孩子或好友。这些连结会在不同的人世一再出现，有时连结强，有时连结弱，但一直持续在成长。而最后，当我们大家都到达终点时，这些连结已经发展到只要渴望，我们就能成为一个比我们所有个体加起来还要伟大的存在体的程度了。",
+                &[
+                    "在生命的轮回中，特定一群人之间的特定连接，会一再以不同的组合出现。比如说，某人在某一世。",
+                    "总会出现，比如说，某人在某一时可能是你的伴侣。",
+                    "另一是是你的父亲或母亲。",
+                    "而另一事是你的孩子或好友这些连接会在不同的人事一再出现，有时连接强。",
+                    "有时连接弱，但一直持续在增长。而最后，当我们大家都到达终点时，这些连接已经发展到只要渴望，我们就能成为一个。",
+                    "发展到只要渴望，我们就能成为一个比我们所有个体加起来还要伟大的存在体的程度了。",
+                ],
+            ),
+            (
+                "175535",
+                "有时在下来进行另一次人生时，灵魂自愿经历某些似乎与他们要过的人生很不相称的事件。因为自愿经历那样的体验，可以帮助他们解决许多原本要好几世才能处理的业。这不是因为他们曾经做过的任何事所受的惩罚，这只是他们觉得自己已经准备好，要用压缩的方式一次解决很多业。",
+                &[
+                    "有时，在下来进行另一次人生时，灵魂自愿经历某些似乎与他们要过的人生很不相称的事件。",
+                    "因为自愿经历那样的体验，可以帮助他们解决许多原本要好几时才能处理的业。这不是因为他们。",
+                    "曾经做过的任何事而做的惩罚，这只是他们觉得自己已经准备好，要用压缩的方式一次解决很多业。",
+                ],
+            ),
+        ];
+        for (tag, refr, accs) in cases {
+            // 改前（413）：span (i,i+1) 互不相交 ⇒ 直接拼接。
+            let mut ob = OrderedReflow::new();
+            for (i, t) in accs.iter().enumerate() {
+                let _ = ob.push_window(i, i, i + 1, vec![t.chars().count() * 10], t.to_string());
+            }
+            let (cb, lb) = ob.finish();
+            let before = format!("{cb}{lb}");
+            // 改后（427）：span (i-1,i+1)（首片 (0,1)）⇒ 与前一窗共享 1 片 ⇒ 对齐去重。
+            let mut oa = OrderedReflow::new();
+            for (i, t) in accs.iter().enumerate() {
+                let (ws, samples) = if i == 0 {
+                    (0usize, vec![t.chars().count() * 10])
+                } else {
+                    (i - 1, vec![4000usize, t.chars().count() * 10])
+                };
+                let _ = oa.push_window(i, ws, i + 1, samples, t.to_string());
+            }
+            let (ca, la) = oa.finish();
+            let after = format!("{ca}{la}");
+            eprintln!(
+                "[DIAG427R1] {tag} before CER={:.3} 句号={} 丢4gram={} len={}",
+                cer(refr, &before),
+                before.chars().filter(|&c| c == '。').count(),
+                missing_grams(refr, &before, 4),
+                strip_punct(&before).chars().count()
+            );
+            eprintln!(
+                "[DIAG427R1] {tag} after  CER={:.3} 句号={} 丢4gram={} len={}",
+                cer(refr, &after),
+                after.chars().filter(|&c| c == '。').count(),
+                missing_grams(refr, &after, 4),
+                strip_punct(&after).chars().count()
+            );
+            eprintln!("[DIAG427R1] {tag} before=\"{}\"", before);
+            eprintln!("[DIAG427R1] {tag} after =\"{}\"", after);
+        }
+    }
+
+    fn read_wav_rel(rel: &str) -> Vec<f32> {
+        let p = manifest().join(rel);
+        sherpa_onnx::Wave::read(p.to_str().unwrap())
+            .expect("read wav")
+            .samples()
+            .to_vec()
+    }
+
+    /// LOCALRT-ALWAYS-CONTEXT-427 回放：175022 两窗「改前（无前文）vs 改后（前片后缀 + must）」。
+    /// 运行：`cargo test --bin feiyin-ime -- --ignored --nocapture diag427_context`
+    #[test]
+    #[ignore = "diag427: cargo test --bin feiyin-ime -- --ignored --nocapture diag427_context"]
+    fn diag427_context_before_after_175022() {
+        let wav = read_wav_rel("collab/evidence/gavin-sessions/session-20260925-175022.wav");
+        let dir = manifest().join("models").join(QWEN3_MODEL_SUBDIR);
+        let rec = create_qwen3_recognizer_at(&dir).expect("load 1.7B recognizer");
+        let pad = (0.2f32 * 16000.0) as usize;
+        // 日志：win0 pcm=0 in=10.80 ranges=[(0.76,9.59)]；win1 pcm=172790 in=10.83 ranges=[(8.46,10.67)]
+        let w0 = Win {
+            name: "175022#0",
+            pcm_pos: 0,
+            in_secs: 10.80,
+            ranges: &[(0.76, 9.59)],
+        };
+        let w1 = Win {
+            name: "175022#1",
+            pcm_pos: 172790,
+            in_secs: 10.83,
+            ranges: &[(8.46, 10.67)],
+        };
+        for w in [&w0, &w1] {
+            let window = reconstruct(&wav, w);
+            let trimmed = trim_to_speech(&window, &ranges_samples(w.ranges), pad);
+            let t0 = std::time::Instant::now();
+            let before = raw_decode(&rec, &trimmed, None);
+            let ms_b = t0.elapsed().as_secs_f64() * 1000.0;
+            let (after, ms_a, after_secs) = if w.pcm_pos == 0 {
+                (before.clone(), ms_b, trimmed.len() as f32 / 16000.0)
+            } else {
+                // 427：前片（#0 的片 = wav[0..10.80s]）末尾回溯 4s 后缀 + must。
+                let prev_start = 0usize;
+                let prev_end = (w0.in_secs * 16000.0) as usize;
+                let back = (4.0 * 16000.0) as usize;
+                let sfx =
+                    &wav[prev_end.saturating_sub(back).max(prev_start)..prev_end.min(wav.len())];
+                let mut a: Vec<f32> = sfx.to_vec();
+                a.extend_from_slice(&trimmed);
+                let t1 = std::time::Instant::now();
+                let txt = raw_decode(&rec, &a, None);
+                (
+                    txt,
+                    t1.elapsed().as_secs_f64() * 1000.0,
+                    a.len() as f32 / 16000.0,
+                )
+            };
+            eprintln!(
+                "[DIAG427] {} before: {:.2}s {:.0}ms \"{}\"",
+                w.name,
+                trimmed.len() as f32 / 16000.0,
+                ms_b,
+                before
+            );
+            eprintln!(
+                "[DIAG427] {} after : {:.2}s {:.0}ms \"{}\"",
+                w.name, after_secs, ms_a, after
+            );
+        }
+    }
+
     /// FIX-ACC-EMPTY-RETRY-426 验收：425 复现的 #10 剪后音频，**带 `language=Chinese`** 解码应出正确句。
     /// 运行：`cargo test --bin feiyin-ime -- --ignored --nocapture diag426_lang10`
     #[test]
@@ -9843,6 +10024,171 @@ mod diag425_tests {
             out.contains("锻炼") && out.contains("身体"),
             "带 language=Chinese 重解应出正确句：{out}"
         );
+    }
+}
+
+// =====================================================================
+// DIAG-FRAG-AND-PREVIEW-428 A：碎片窗「剪静音段间停顿」纯计算诊断（**无模型**，不碰生产）
+//   运行：cargo test --bin feiyin-ime -- --ignored --nocapture diag428_gap
+// =====================================================================
+#[cfg(test)]
+mod diag428_tests {
+    use super::trim_to_speech;
+
+    const RATE: usize = 16000;
+    fn secs(x: f32) -> usize {
+        (x * RATE as f32) as usize
+    }
+
+    /// 合成「静音 1s + 语音 1s + gap G + 语音 1s + 静音 1s」，两语音用不同幅度定位；
+    /// 返回 trim 后**两语音之间的零样本数**（= 保留的段间停顿）。
+    fn inter_gap_after_trim(gap_secs: f32, pad_secs: f32) -> usize {
+        let mut a = vec![0.0f32; secs(1.0)];
+        a.extend(std::iter::repeat(0.5f32).take(secs(1.0)));
+        a.extend(std::iter::repeat(0.0f32).take(secs(gap_secs)));
+        a.extend(std::iter::repeat(0.25f32).take(secs(1.0)));
+        a.extend(std::iter::repeat(0.0f32).take(secs(1.0)));
+        let s1 = secs(1.0);
+        let s2 = secs(2.0) + secs(gap_secs); // = 语音1末尾 + gap ⇒ 语音2 起点
+        let ranges = [(s1, s1 + secs(1.0)), (s2, s2 + secs(1.0))];
+        let out = trim_to_speech(&a, &ranges, secs(pad_secs));
+        // 第一个 -0.25 之前、+0.5 之后的连续 0 段 = 段间停顿。
+        let last_pos = out.iter().rposition(|&x| x == 0.5).unwrap();
+        let first_neg = out.iter().position(|&x| x == 0.25).unwrap();
+        out[last_pos + 1..first_neg]
+            .iter()
+            .filter(|&&x| x == 0.0)
+            .count()
+    }
+
+    /// A1：段间 < 2×pad 的停顿**被完整保留**（span 合并）；> 2×pad 才被压到 2×pad。
+    #[test]
+    #[ignore = "diag428: cargo test --bin feiyin-ime -- --ignored --nocapture diag428_gap"]
+    fn diag428_gap_is_preserved_below_2pad() {
+        let pad = 0.2f32;
+        // 0.35s < 0.4s ⇒ 合并 ⇒ 保留 0.35s。
+        let g035 = inter_gap_after_trim(0.35, pad);
+        eprintln!(
+            "[DIAG428] gap=0.35s pad=0.2s -> inter-gap保留={:.3}s",
+            g035 as f32 / RATE as f32
+        );
+        assert_eq!(g035, secs(0.35), "0.35s<2×pad ⇒ 段间停顿原样保留");
+        // 1.0s > 0.4s ⇒ 各自剪 pad ⇒ 拼接后**只保留 2×pad=0.4s**（压缩掉 G−0.4=0.6s）。
+        let g10 = inter_gap_after_trim(1.0, pad);
+        eprintln!(
+            "[DIAG428] gap=1.00s pad=0.2s -> inter-gap保留={:.3}s",
+            g10 as f32 / RATE as f32
+        );
+        assert_eq!(
+            g10,
+            secs(0.4),
+            "1.0s>2×pad ⇒ 段间只保留 2×pad=0.4s（压缩掉 0.6s）"
+        );
+        // 恰 0.4s（=2×pad）⇒ s<=last.1 边界 ⇒ 合并 ⇒ 保留 0.4s。
+        let g040 = inter_gap_after_trim(0.40, pad);
+        eprintln!(
+            "[DIAG428] gap=0.40s pad=0.2s -> inter-gap保留={:.3}s",
+            g040 as f32 / RATE as f32
+        );
+        assert_eq!(g040, secs(0.40), "0.40s=2×pad ⇒ 边界合并、保留");
+    }
+
+    // ---- 真实窗变体字节等价（#5 碎片窗 + 正常窗 #0/#6/#7）----
+    struct Win {
+        name: &'static str,
+        pcm_pos: usize,
+        in_secs: f32,
+        ranges: &'static [(f32, f32)],
+    }
+
+    fn reconstruct(wav: &[f32], w: &Win) -> Vec<f32> {
+        let in_samples = (w.in_secs * RATE as f32) as usize;
+        let pre = 3200usize.min(w.pcm_pos);
+        let body = in_samples.saturating_sub(pre);
+        let mut v = vec![0.0f32; pre];
+        let end = (w.pcm_pos + body).min(wav.len());
+        v.extend_from_slice(&wav[w.pcm_pos..end]);
+        v
+    }
+
+    fn rs_samples(ranges: &[(f32, f32)]) -> Vec<(usize, usize)> {
+        ranges.iter().map(|&(s, e)| (secs(s), secs(e))).collect()
+    }
+
+    /// 合并「间隔 < thr」的区间（=不剪这些停顿）。
+    fn bridge(ranges: &[(usize, usize)], thr: usize) -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for &(s, e) in ranges {
+            if let Some(last) = out.last_mut() {
+                if s.saturating_sub(last.1) < thr {
+                    last.1 = last.1.max(e);
+                    continue;
+                }
+            }
+            out.push((s, e));
+        }
+        out
+    }
+
+    /// A2：对 #5 与正常窗，比较「现状 / 只剪首尾 / 间隔阈值 0.3·0.5·0.8」的剪后音频。
+    #[test]
+    #[ignore = "diag428: cargo test --bin feiyin-ime -- --ignored --nocapture diag428_gap"]
+    fn diag428_trim_variants_byte_identical_on_real_windows() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("collab/evidence/gavin-sessions/session-20260925-173634.wav");
+        let w = sherpa_onnx::Wave::read(p.to_str().unwrap()).expect("read 173634 wav");
+        let wav = w.samples();
+        let pad = secs(0.2);
+        let wins = [
+            Win {
+                name: "#0",
+                pcm_pos: 0,
+                in_secs: 2.51,
+                ranges: &[(0.24, 1.30)],
+            },
+            Win {
+                name: "#6",
+                pcm_pos: 781590,
+                in_secs: 9.92,
+                ranges: &[(6.38, 8.71)],
+            },
+            Win {
+                name: "#7",
+                pcm_pos: 937110,
+                in_secs: 5.68,
+                ranges: &[(3.73, 4.47)],
+            },
+            // #5 碎片窗：1.15s + 0.35s 停顿 + 3.14s。
+            Win {
+                name: "#5",
+                pcm_pos: 638230,
+                in_secs: 9.16,
+                ranges: &[(3.31, 4.46), (4.81, 7.95)],
+            },
+        ];
+        for win in &wins {
+            let window = reconstruct(wav, win);
+            let rs = rs_samples(win.ranges);
+            let current = trim_to_speech(&window, &rs, pad);
+            let headtail = trim_to_speech(&window, &[(rs[0].0, rs[rs.len() - 1].1)], pad);
+            let t03 = trim_to_speech(&window, &bridge(&rs, secs(0.3)), pad);
+            let t05 = trim_to_speech(&window, &bridge(&rs, secs(0.5)), pad);
+            let t08 = trim_to_speech(&window, &bridge(&rs, secs(0.8)), pad);
+            eprintln!(
+                "[DIAG428] {} ranges={:?} current={:.3}s headtail={:.3}s t.3={:.3} t.5={:.3} t.8={:.3}",
+                win.name,
+                win.ranges,
+                current.len() as f32 / RATE as f32,
+                headtail.len() as f32 / RATE as f32,
+                t03.len() as f32 / RATE as f32,
+                t05.len() as f32 / RATE as f32,
+                t08.len() as f32 / RATE as f32,
+            );
+            assert_eq!(current, headtail, "{}：只剪首尾 == 现状", win.name);
+            assert_eq!(current, t03, "{}：间隔阈值0.3 == 现状", win.name);
+            assert_eq!(current, t05, "{}：间隔阈值0.5 == 现状", win.name);
+            assert_eq!(current, t08, "{}：间隔阈值0.8 == 现状", win.name);
+        }
     }
 }
 
