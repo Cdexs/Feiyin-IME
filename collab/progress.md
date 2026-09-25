@@ -4,6 +4,13 @@
 - 新增 `emit_tail_window!` 宏统一组装末尾窗（有前片 ⇒ 前片后缀 + pending；首片 ⇒ `tail_window_alone` 单独解），长静默 407 与松键收尾共用；`plan_windows` 删 `is_tail`/规则 4、删 `TAIL_MERGE_MAX_SECS`；松键 `pending_slice.take()` 防重复。
 - 旧护栏 `ts413_rule4_*`→`ts423_*`、testsync386/407/411/413 改写；fmt EXIT0 / check 0 error、warnings 91/87≤基线 / 全量 test 0 failed（bin 1801P/0F/55I）。平台中立，MACOS-HANDOFF 已记。未出包。
 
+### 2026-09-25 · POC-QWEN3-PREFIX-424 交付（已识别文本作输出前缀续写，纯 PoC/研究，生产零改动）
+
+- 补丁 sherpa Qwen3 impl（per-stream `prefix`，置于 `language X<asr_text>` 后）+ 独立 C++ runner；四组对比（现状/甲后缀比例前缀/乙前片全文前缀/丙全部历史前缀）。
+- **结论：不建议上生产**——乙/丙 让模型把前缀当正文续写/复读 ⇒ 大段重复+丢窗（CER 0.67~11×）；甲与现状相当、略优、无回显，增益在噪声内。与 DEC-083 同源。
+- 专项①声纹未实测（缺 07:03:50 wav）/③13:17:53 wav 缺；②换语言部分。口径：runner 组窗为近似（非生产复刻）。
+- 产物 `collab/evidence/424/report.md`+patch+tsv+log；编译目录 2.6 GB 保留。未改生产。未出包。
+
 ### 2026-09-25 · TEST-SYNC-421 交付（声纹兜底的非作者护栏 10 条，生产零改动）
 
 - 只加 `src/main.rs::testsync421_tests`（10 条）：本人段窗首/尾/中全留、极短 KeepShort 段不吞、他人全删、全剔空且不兜底、dropped=0 逐位不变、模型空仍兜底、先剥后打、源码锚点。

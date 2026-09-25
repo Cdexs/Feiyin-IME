@@ -9,6 +9,14 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-1 — DIAG-ACC-EMPTY-425 ✅ 交付（只读诊断 + 离线重放，生产零改动）
+
+- **结论**：#5 = 解码硬 Err（`get_result()` None ⇒ `Err("No transcription result")` ⇒ `?` 上抛、跳过 387 处置）；#10 = 真·空（`Ok("")` ⇒ `kind=empty` ⇒ **已重解一次**仍空 ⇒ invalid）。🔴 更正：empty **会**触发一次无注入重解（386-D1/388-D1）。
+- **重放**（`src/transcription/mod.rs::diag425_tests` `#[ignore]`）：校准 #0/#6/#7 逐字等于生产 acc；#10 重放稳定吐正确文本（a/c/d/b 全对）⇒ 生产空间歇性（ORT 8 线程 + 近似贪心）；#5 各变体均拿不到正确句（VAD 切碎 1.15s+3.14s）；`ts=none` 无逐 token 时间戳。
+- **统计**（debug.log 全量）：decode failed=1、out=0字=1、kind=empty=1、声纹全剔空=0。
+- **建议**（未实施，待 Gavin）：解码 Err 纳入可重试；Empty/Err 重解换条件（language=Chinese/pad）；#5 类评估短段复核（须实测）。
+- **验证**：fmt EXIT0 / check 0 error、warnings 91/87≤基线；诊断重放 1P（61s）。证据 `collab/evidence/425/report.md`。未 commit / 未 build / 版本未动 / 零凭证。
+
 ## 2026-09-25 — coder-1 — LOCALRT-STOP-TAIL-UNIFY-423 ✅ 交付（只改 main.rs 组窗/派发区）
 
 - **范围**：`src/main.rs`：新增 `emit_tail_window!` 宏 + `tail_window_alone`；长静默分支改调宏；松键收尾删 `plan_windows(is_tail=true)` 改调宏；`plan_windows` 删 `is_tail`/规则 4、删 `TAIL_MERGE_MAX_SECS`。测试护栏 `ts413_rule4_*`→`ts423_*`、`testsync386/407/411/413` 改写。
@@ -23,6 +31,15 @@
 - **改动**：新增共用状态机 `next_top_token`/`brace_match`/`item_end`（串/原始串/字符与生命周期区分/行块注释可嵌套），`prod_lines_excluding_cfg_test` 与 `fn_body` **共用同一份**（禁两份）。
 - **碰巧通过报告**：`testsync377::main_has_no_cross_recording_ctx_cache` 命中测试模块**前的注释**（旧扫描器误剔使其未计入）⇒ 按其文档契约补注释过滤（不放宽代码不变量）。
 - **验证**：新增 `guard_prod_lines::tests` 3 条；fmt EXIT0 / check 0 error、warnings 91/87=基线 / 全量 test **0 failed**（bin 1802P/0F/55I）；`testsync421` 由红转绿。未 commit / 未 build / 版本未动 / 零凭证。
+
+## 2026-09-25 — coder-2 — POC-QWEN3-PREFIX-424 ✅ 交付（纯 PoC；生产零改动）
+
+- **结论：不建议上生产**。把已识别文本作 Qwen3 assistant 输出前缀续写：**乙（前片全文前缀）/丙（全部历史前缀）灾难性劣化**——模型把前缀当正文**续写/复读** ⇒ 大段重复 + 丢窗（multi-para CER 0.086→0.672/0.766，窗塌缩成 `。`；session 350/362 字 vs 参照 29）。**甲（后缀比例小前缀 + 官方 token 回退）** 与现状相当、略优、无回显（0.086→0.082），增益在噪声内，不足抵消复杂度/风险。与 `[PROMPT-SLOT-ABUSE-377]`/DEC-083 同源。
+- **做法**：仓库外 clone `sherpa-onnx v1.13.8` 打补丁（Qwen3 impl 增 per-stream `prefix`，`language X<asr_text>` 后 `insert(Encode(prefix))`；前缀属输入、不进 `generated_ids`）+ 独立 C++ runner（链 `sherpa-onnx-core`；能量 VAD 1200ms 切片 + 2s 回溯；四组；token 回退 encode→去尾5→decode）。伪参照=整段解码。
+- **专项**：①声纹（他人前缀须空）未实测（07:03:50 wav 不存在）②换语言部分/不确定（乙把中文前缀复读进英文窗）③13:17:53 wav 不存在，用 session-150350/multi-para 替代。
+- **口径限制**：runner 组窗为**近似**（非生产 `plan_windows`/`take_context_suffix`/407 逐行复刻）⇒ 方向判断，非生产数值。
+- **产物**：`collab/evidence/424/report.md`、`sherpa-prefix.patch`（81 行）、`windows-*.tsv`/`run-*.log`、夹具 `multi-para.wav`/`lang-zh-en.wav`；编译目录 `D:\Workspace\CodeLab\_poc\sherpa-onnx-prefix\`（2.6 GB 保留）。
+- **验证**：VS2022 BuildTools + pip cmake；lib+exe 构建 EXIT 0；runner 6 次 EXIT 0。**未改 `src/**`/`Cargo.toml`/`main.rs`**；未 commit / 未 build release / 版本未动 / 零凭证。
 
 ## 2026-09-25 — coder-2 — TEST-SYNC-421 ✅ 交付（阶段三·非作者护栏 10 条；生产零改动）
 
