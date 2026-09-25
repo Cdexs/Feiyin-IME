@@ -423,6 +423,19 @@
 - **debug-audio（新规则）**：ls 差集**点名删除本人本次生成的 15 个**（5 `session-2004xx` + 10 `preroll-2004xx`，全名见 result.md）；Gavin 既有 `session-*`/`preroll-*` 未动。附注：10 个旧 preroll（13:17/14:52/14:53/14:54/15:03）系**程序滚动裁剪**消失，非我删除。
 - **红线**：未改生产代码（消融全还原）/ 版本号未动 / 未 push / 未 `cargo clean` / 零凭证。证据 `collab/evidence/429/`。
 
+## 2026-09-26 — tester-1 — TEST-EXEC + BUILD-435（430/433/434/435 合包）✅ 回归 + 出包（首轮红 → 修 → 重跑绿）
+
+- **性质**：阶段四回归 + 阶段五出包（430 焦点丢失回显窗 / 433 预览原文裁判 + forced 长度比 / 434 切点只落 ≥120ms 真停顿 / 435 读音加权 + `pinyin 0.11.0`）。HEAD `b3aa853`，版本 0.9.3 未动，基线 Publish=BUILD-432。
+- **首轮红**：`ts433r_source_anchor`（`window_streaming_texts.get(seq)` 被 rustfmt 拆三行，单行 contains 假红）→ 主控派 coder-2 修（`e64b5f2` 去空白比对，反证有效）→ 重跑绿。废包期间未动 Publish。
+- **回归**：bin **1904P/0F/65I**（对 BUILD-432 1844P/64I）⇒ NEW **61** / GONE **0**；root 1992P/0F/67I；`src-tauri` **92P/0F/0I**；Vitest/Browser SKIP。
+- **消融**：433a 裁判恒取 A ⇒ 6 红；433b forced 恒 None ⇒ 2 红；434 `TAIL_CUT_MIN_PAUSE_MS`→20ms ⇒ 3 红；435 同音 0.2→1.0 ⇒ 3 红；430 宽度 1.7→1.0 ⇒ 4 红。均还原，`git diff -- src/`=0。
+- **构建**：Step1 清进程；Step2 npm 641ms + Tauri 1m36s(17w) + cp；Step3 3m03s（main 91w / crash 9w）；Step4 三 exe + 两 toml 同步 Publish。
+- **九项**：全项 PASS。①01:03–01:06 ②两副本 sha 全等且异于 BUILD-432（main `48142a62…` / ui `b4171802…` / crash `24d99504…`）③0.9.3 ④冒烟（见限） ⑤config `da2be5da…` ⑥91/9/17 ⑦正探针见上，反 N-A ⑧两 toml 三副本全等 ⑨VC 五件全等。
+- **专项**：A CT2 `efa16d81…` 未重编；B 声纹 `aa3cfc16…` 在包、junction；D 用户数据未动、无 voiceprint.bin；**E 主程序 +662,528B**（15,882,240 vs 15,219,712，`pinyin 0.11.0` 新依赖）。
+- **冒烟限制（环境，如实）**：`-debug` 能起/录制（≥55s）/无 crash，无 panic；但麦克风持续未拾取扬声器回放（`kv_long.wav` + TTS 多次重试均 `speech_detected=false`；音频端点疑切到断开蓝牙 EDIFIER，未改系统音频），`[DBG-416] seam … arb=` / `[DBG-433] win` / `[DBG-434] tail cut` **未取到**；433/434/430 行为由回归+消融+探针保证，运行期日志请 Gavin 端测确认。
+- **debug-audio**：点名删除本人 6 个（2 session + 4 preroll，见 result.md），移除 0；Gavin 数据未动；测后计数回 30。
+- **红线**：未改生产代码 / 版本未动 / 未 push / 零凭证。证据 `collab/evidence/435/`。
+
 ## 2026-09-25 — tester-1 — TEST-EXEC + BUILD-432（431+432 合包）✅ 回归 + 出包
 
 - **性质**：阶段四回归 + 阶段五出包（431 重叠区以前一窗为准 + 半全局对齐；432 声纹判定门槛 2.0→1.5s，offer 仍 2.0s）。HEAD `7309f82`，版本 0.9.3 未动，基线 Publish=BUILD-429。
