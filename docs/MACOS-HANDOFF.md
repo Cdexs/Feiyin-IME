@@ -2373,6 +2373,10 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 - **417 平台中立**：`local_stream_num_threads()` 改为 `available_parallelism().min(4)`（取不到回落 4），macOS 同继承；无 `cfg`、无新增 env / 构建脚本。**只改预览（流式）侧**，精解侧 `default_acc_num_threads()`（min 8）未动（Gavin 2026-09-25「将预览的线程调为 4」）。
 - **418 平台中立**：`src/audio/mod.rs` 的 `SessionDump`（`-debug` 整段录音落盘）+ `enforce_dump_limit_where` 仅用 `std::fs` + `chrono`，无平台 API；macOS 同继承。Warn 级零动作（`log_enabled!(Debug)` 为假 ⇒ `SessionDump::new` 返回 None）。**macOS 侧无需改动**（无 pub 签名 / env / 构建脚本变更）。
 
+## TAIL-CUT-REAL-PAUSE-434（2026-09-25，coder-2）· 前片后缀切点只落真停顿—— macOS 侧影响
+
+- **平台中立，无影响。** 改动在 `src/transcription/local_stream.rs`（`find_tail_cut`）/`vad.rs`（新增 `real_pause_cut_candidates`），纯 DSP/数组逻辑、无 `cfg`、无平台 API。macOS 同继承；无 pub 签名 / env / 构建脚本变更。
+
 ## FIX-REFLOW-RAW-BASE-420（2026-09-25，coder-2）· 回灌底稿改用原始流式文本—— macOS 侧影响
 
 - **已评估，对 macOS 无影响。** 改动全部在 `#[cfg(target_os = "windows")]` 的浮层回灌/渲染路径：`process_controller_events`（新增 `last_raw_streaming_text` 形参）、`render_authoritative_reflow` / `try_resolve_reflow`（底稿改取原始流式文本）。新增存储 `last_raw_streaming_text` 亦在 Windows controller 初始化段。

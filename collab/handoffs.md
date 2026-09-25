@@ -79,6 +79,14 @@
 - **碰巧通过报告**：`testsync377::main_has_no_cross_recording_ctx_cache` 命中测试模块**前的注释**（旧扫描器误剔使其未计入）⇒ 按其文档契约补注释过滤（不放宽代码不变量）。
 - **验证**：新增 `guard_prod_lines::tests` 3 条；fmt EXIT0 / check 0 error、warnings 91/87=基线 / 全量 test **0 failed**（bin 1802P/0F/55I）；`testsync421` 由红转绿。未 commit / 未 build / 版本未动 / 零凭证。
 
+## 2026-09-25 — coder-2 — TAIL-CUT-REAL-PAUSE-434 ✅ 阶段一交付（只改 local_stream.rs + vad.rs 新增）
+
+- **改动**：`vad.rs` 新增 `real_pause_cut_candidates`（连续 ≥6 帧(120ms) 低能量段中点；**旧 `find_gap_cut_impl`/`find_gap_cut_gap_only` 未动 ⇒ 381 逐位不变**）；`local_stream.rs` 新增 `TailCutKind{RealPause,WeakGap,NoGap}`+`find_tail_cut_ex`（首轮取最早真停顿；无则前扩 2×back 取最近；再无⇒旧 WeakGap/NoGap），`find_tail_cut` 返回 `(cut, kind!=NoGap)`（调用方不变）；`TAIL_CUT_MIN_PAUSE_MS=120`/`TAIL_CUT_EXPAND_FACTOR=2`；`[DBG-434]` 日志。
+- **实测**：21:16 窗#1 旧切点 6.090s（静音 20ms=「取」字内低谷）⇒ 新 6.520s（静音 400ms 真停顿，后缀 3.96→3.53s）⇒ **避开「获取」字内**；全部录音新切点均 RealPause、静音 ≥旧。
+- **测试**：`tail_cut_434_tests` 5P/0F；全量 `cargo test` **0 failed**（bin 1863P/64I）；381 `gap_cut` 9P、407 `ts407_find_tail_cut` 1P 全绿。
+- **验证**：`cargo fmt --check` EXIT 0；`check --all-targets` 0 error、warnings 91/87 ≤ 基线。平台中立，MACOS-HANDOFF 已记。
+- 红线：未碰 main.rs/mod.rs / 未 commit / 未 build release / 版本未动 / 零凭证。
+
 ## 2026-09-25 — coder-2 — TEST-SYNC-431 ✅ 交付（阶段三·非作者护栏 7 条；生产零改动）
 
 - **范围**：只在 `src/transcription/mod.rs` 新增 `#[cfg(test)] mod testsync431_tests`（7 条，`+177/0`）。

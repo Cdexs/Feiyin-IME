@@ -35,6 +35,12 @@
 - 新增 `emit_tail_window!` 宏统一组装末尾窗（有前片 ⇒ 前片后缀 + pending；首片 ⇒ `tail_window_alone` 单独解），长静默 407 与松键收尾共用；`plan_windows` 删 `is_tail`/规则 4、删 `TAIL_MERGE_MAX_SECS`；松键 `pending_slice.take()` 防重复。
 - 旧护栏 `ts413_rule4_*`→`ts423_*`、testsync386/407/411/413 改写；fmt EXIT0 / check 0 error、warnings 91/87≤基线 / 全量 test 0 failed（bin 1801P/0F/55I）。平台中立，MACOS-HANDOFF 已记。未出包。
 
+### 2026-09-25 · TAIL-CUT-REAL-PAUSE-434 交付（前片后缀切点只落真停顿，阶段一，未出包）
+
+- `vad.rs` 新增 `real_pause_cut_candidates`（连续 ≥120ms 低能量段中点；旧内核未动）；`local_stream.rs` 新增 `TailCutKind`+`find_tail_cut_ex`（首轮最早真停顿→前扩 2×back→旧 WeakGap/NoGap），`find_tail_cut` 兼容返回。
+- 实测：21:16 窗#1 旧 6.090s（静音 20ms=「取」字内）⇒ 新 6.520s（静音 400ms）⇒ 避开「获取」字内。
+- `tail_cut_434_tests` 5P；全量 test 0 failed（bin 1863P/64I），381 gap_cut 9P / 407 1P 全绿；fmt EXIT0 / check 0 error、warnings 91/87≤基线。未出包。
+
 ### 2026-09-25 · TEST-SYNC-431 交付（重叠区保前一窗文字的非作者护栏 7 条，生产零改动）
 
 - 只加 `src/transcription/mod.rs::testsync431_tests`（7 条）：性质 320 组（插入/替换⇒逐字 P+S）、插入首/中/末、删除首/中/近末、替换末字平局偏替换、标点三态、混合/emoji 不 panic、源码锚点（splice 生产区 1 定义+1 调用）。
