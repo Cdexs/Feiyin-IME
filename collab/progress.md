@@ -1,4 +1,11 @@
 
+### 2026-09-25 · LOCALRT-SHORT-CONTEXT-413 交付（常规窗「少带前文」，阶段一，未出包）
+
+- 常规窗音频：整段前文片 → 紧邻前一片后缀（`tail_backtrack_secs` ≥2s/≥12 字 + `find_tail_cut`）+ `[must_start..ge)` 完整解。`must_start` 纯函数决定（常态=窗末片；规则 3 并入 pending 的首窗=pending）；对齐 span `(must_start-1, ge)`；VAD 区间 `trim_and_shift_ranges` 裁剪平移（不新增每窗 VAD）。
+- 407/413 共用 `take_context_suffix`（非复制）；407 输出逐位不变；规则 4 收尾短尾窗仍整片重解（源码护栏锁）。
+- 验证：fmt EXIT 0 / check 0 error、warnings 92/87=基线 / 全量 test 0 failed（新增 9 条）。BUILD-399 09:48Z 末片 2.85s：旧送解 9.33s ⇒ 新约 5.83~6.85s。仅改 `main.rs`；MACOS-HANDOFF 已记。未出包。
+- **R1 返修（主控退回）**：带前文常规窗 406 兜底收窄为只兜底 must 片（`context_tail_pending` → span `(must_start,ge)`；无前文仍 None 不变），防前片后缀被流式顶掉（410 item2）；删重复注释。测试 +2 = 11/11；fmt EXIT0 / check 0 error、warnings 92/87 / 全量 test 0 failed（bin 1730P/0F/54I）。仍未出包。
+
 ### 2026-09-25 · TEST-SYNC-411 交付（多片切分流式分配的非作者护栏 5 条，生产零改动）
 
 - 只加 `src/main.rs::testsync411_tests`（5 条）：性质（6 分布/边界/多字节）、真实 `plan_windows` 组窗组合、切分+末尾窗 accept、切分+末尾窗被拒（只替 pending、前片不动）、端到端 BUILD-409 16:44Z 真实三窗无重复。
@@ -1598,3 +1605,15 @@ load_wordbook_vocabulary()
 | 探针 | ⑦ **不可构造**（纯逻辑改动、无新增/删字面量）⇒ 三证：源码引用（`fix396` 护栏）+ 时间戳 + sha 异于上包 |
 | 冒烟 | 正常退出（`WM_CLOSE`，非强杀）⇒ **1s 内消失**、无 crash.json |
 | 端测 | 🔴 **Step1 强杀输入法 ⇒ 请重启 + 带 `-debug` 端测**；重点：本地实时 1.7B B 路径**不注词库后识别是否正确**（BUILD-395 端测 18 窗 5 异常 = 28% 是否消失）、窗空/坍塌/念词表/截尾/跳词条是否绝迹；Accuracy/在线档词库注入仍生效 |
+
+## FIX-NOSPEECH-WINDOW-414（阶段一 · 交付）· 2026-09-25 · coder-2
+
+| 项 | 内容 |
+| --- | --- |
+| 内容 | 时间线判本窗无语音但流式非空 ⇒ **自跑 VAD 复核**（`TimelineTrim::Revad`），不再整窗 11.25s 送解；复核无语音 ⇒ 空结果交流式兜底（不进模型）；VAD 不可用 ⇒ 原样整窗。`Revad`/`None` 共用新抽 `self_vad_ranges` + 纯函数 `plan_self_vad_trim`（非复制） |
+| 文件 | `src/transcription/mod.rs`（只此一件）；另 `docs/MACOS-HANDOFF.md` 记跨平台 |
+| 不变项 | `Apply`/`Empty` 逐位不变；`None` 输出逐位一致；388 早退/390 cap/406/408B 声纹/412 合并 源码锚点护栏全过 |
+| 影响面 | 调用方仅本地实时滑窗路 B（`main.rs:9272/10466`）+ `audio/mod.rs` PoC + PoC bin；本地精确档/在线不调用（grep） |
+| 测试 | `fix414_*` 3P + 1I（`kv_long.wav` 真模型复核，实跑 PASS）；`ts393_plan_empty_with_streaming_needs_revad` + 源码护栏 `ts393c_revad_branch_uses_recheck_source_guard` |
+| 验证 | `cargo fmt --check` EXIT 0；`cargo check --all-targets` 0 error、warnings **92/87**=基线、mod.rs 0；全量 `cargo test` **0 failed** |
+| 状态 | 阶段一交付，待主控验收；未 commit / 未 build release / 版本 0.9.3 未动 / 零凭证 |

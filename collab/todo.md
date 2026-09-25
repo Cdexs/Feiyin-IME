@@ -2,6 +2,14 @@
 
 > **本文件只放「还没做的事」。** 已完成的功能 → `progress.md`；任务完成记录 → `CHANGELOG.md`；
 > 过程记录、取证细节、历史批次 → `todo-archive.md`。
+
+**🚀 下一包补做三项（2026-09-25 Gavin：「1.1、2、3.2 这三点做了吗？确认没做的要赶紧做，在接下来这个包里出」；主控核实三项均未做）** —— 与已回归通过的 411+412 合一个包出
+
+| 单号 | 内容 | 负责 | 文件 | 状态 |
+| --- | --- | --- | --- | --- |
+| `LOCALRT-SHORT-CONTEXT-413` | #6「末段少带前文」：常规窗前文从「前面整片（≤10s）」改为「前一片末尾 ≥2s/≥12 字后缀」（复用 407 末尾窗机制）；末段解码目标 ~2.2s→~1.3s | coder-1 | main.rs 组窗/派发区 | ✅ 交付（首轮 + R1 返修，待验收；rule4 收尾窗保持整片，源码护栏锁） |
+| `FIX-NOSPEECH-WINDOW-414` | #9 审计②：时间线无语音但流式非空 ⇒ 不再整窗送解，改自跑 VAD 复核；仍无语音 ⇒ 直接空结果走流式兜底 | coder-2 | transcription/mod.rs | ✅ 阶段一交付（待验收；全量 test 0F，新增 3P+1I 真模型复核 PASS） |
+| `OVERLAY-MEASURE-CACHE-415` | #2 F-A-01：浮层量宽结果缓存（文字不变不重量）；**须 Gavin 目视** | coder-2（等 413 交付，main.rs 同文件串行） | main.rs 浮层区 | ⏳ 排队 |
 **🚀 下一包开发编排（2026-09-24 Gavin：「声纹模型选 cam++双语版」「其他要确认的问题吗？没有的话就直接动手开发吧。然后进行必要的测试，然后出包」）**| 波次 | 单号 | 内容 | 负责 | 文件 | 状态 || --- | --- | --- | --- | --- | --- || 1 | `LOCALRT-PERF-405` | #2 去影子收尾（DEC-086）+ 每块全量拼接缓存 + 日志计时守卫；#3 CT2 重编；#4 出包脚本 exe 名 | coder-1 | local_stream.rs / ctranslate2-sys build.rs / init-publish.ps1 | 🔄 已派 || 1 | `FIX-ACC-MISMATCH-GUARD-406` | #1 同窗流式比对守卫（保留率 LCS 子序列 / 长度比，阈值用日志校准）+ #7 未闭合标签 | coder-2 | main.rs harvest / transcription/mod.rs | ✅ 交付（待验收） || 2 | `LOCALRT-TAIL-WINDOW-407` | #6 1900ms 长静默末尾组窗（仅有待合并短尾时生效；前片回溯 ≥2s 字缝切） | 待 405/406 完成 | local_stream.rs + main.rs plan_windows | ✅ `b533247` || 2 | `SPEAKER-VERIFY-408` | #5 声纹接入：CAM++ zh_en（27MB）；自动建声纹（无 UI）、≥2s 段、高置信非本人才剔除；剔除在解码前从剪静音区间去掉；日语暂不剔除 | 待 406 完成 | 新模块 + transcription/mod.rs 剪静音 + main.rs | ✅ 408A+408B 交付（408B 待验收） || 3 | TEST-SYNC / TEST-EXEC / BUILD | 非作者护栏 → 全量回归 → 出包（识别主路径改动，走完整流程） | — | — | 🔄 408A 独立模块已派 coder-1（不碰 main.rs/mod.rs）；408B 接入待 406 |
 > 每条待办的「详情」列指向 `todo-archive.md` 里的原始小节，细节一条没丢，别在这里展开。
 > 维护规则见文末。

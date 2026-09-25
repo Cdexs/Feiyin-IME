@@ -2354,3 +2354,21 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | `speaker.rs`：**按语种分档**声纹（`voiceprint.bin`，`<exe>` 同级）；v2 格式，v1 迁移不丢弃；换模型才重建；自动注册（≥12s/≥3 段+离群剔除）；漂移 EMA α≤0.25；新语种闸（候选对已就绪档最高分 <0.3 不收） | 多语种各自维护质心/就绪 | 🔴 **构建产物**：macOS 需携带 `models/speaker-campplus-zh-en/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx`（28,281,164 B，sha256 `aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2`）；`/models` 不入 git，经各自模型分发路径携带 |
 | `mod.rs` 新增 `lang_from_charset` / `qwen3_prefix_lang` / `strip_qwen3_language_prefix_lang` / `redecode_with_ranges` / `acc_vs_streaming_after_drop` | 语种解析（前缀优先/字符集兜底）+ 406 按剔除比例放宽 | ✅ 平台中立纯逻辑，macOS 同继承 |
 | **macOS 侧需要做什么** | | ① 在所有 `CtxInject` 构造点补 `new_slice_from`；② 适配 `transcribe_acc_ctx` 三元返回；③ 携带上述声纹模型文件（sha 一致）；④ 无新增开关/env（DEC-031） |
+
+## FIX-NOSPEECH-WINDOW-414（2026-09-25，coder-2）· 时间线无语音的窗不再整窗送解—— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `transcription/mod.rs`：`TimelineTrim::WholeWindow` 更名 `Revad`；新增共用纯函数 `plan_self_vad_trim` + 线程级 `self_vad_ranges`（抽自原 `None` 回退分支，**非复制**） | 实时时间线判本窗无语音、但流式文本非空时：旧「原样整窗 11.25s 送 1.7B」→ 新「自跑 VAD 复核」——复核有语音 ⇒ 按复核区间剪静音解码；复核无语音 ⇒ 空结果交流式兜底（**不进模型**）；VAD 不可用 ⇒ 仍原样整窗（不吞字最后防线）。Debug 埋点 `[LocalRT-DBG-414] revad` | ✅ 平台中立纯逻辑（无 `cfg`），macOS 同继承；声纹过滤（408B/412）在复核路径上与 `None` 分支一致生效 |
+| 私有项：`self_vad_ranges` / `plan_self_vad_trim` / `SelfVadTrim` 均 `fn`/`struct`（crate 内，非 `pub`） | — | ✅ 未改 pub 签名 / 未新增 env / 未改构建脚本 |
+| **macOS 侧需要做什么** | | 无需改动（平台中立自动继承）；若 macOS 有独立的「时间线无语音」判定分支，按同判据接入复核 |
+
+## LOCALRT-SHORT-CONTEXT-413（2026-09-25，coder-1）· 常规窗「少带前文」—— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `main.rs`：`dispatch_window!` 新增 `must_start` 形参；新增纯函数 `must_start_for_window` / `short_context_span` / `trim_and_shift_ranges` 与共用 `take_context_suffix`（407/413 同一份，禁止复制） | 常规窗音频由「`group_window_start_secs` 带上的**整段前文片** + 新片」→「**紧邻前一片的后缀**（`tail_backtrack_secs` 回溯，≥2s/≥12 字，`find_tail_cut` 找字缝）+ 必须完整解的片」。派发时无法预知是否末句 ⇒ 所有常规窗统一少带前文；解码耗时随音频长度线性增长（BUILD-399 末片 2.85s 却送解 9.33s / decode 2194ms）。Debug 埋点 `[LocalRT-DBG-413] prev_cut_secs / window_secs / must_slices` | ✅ 平台中立纯逻辑（无 `cfg`），macOS 同继承；对齐 span 收窄为 `(must_start-1, ge)`，`window_samples.len() == ge - span_start`（与 407 末尾窗同口径） |
+| VAD 区间：前文后缀的片内区间经 `trim_and_shift_ranges` 裁剪平移后，与 must 片区间一起 `shift_and_concat_ranges` 拼窗内坐标（任一源 `None` ⇒ 整窗 `None`，393-A3 口径） | 常规窗不再像 407 那样传 `None` 回退自跑 VAD ⇒ 不新增每窗 VAD 开销 | ✅ 纯逻辑，macOS 同继承 |
+| **不变**：首片 / 无前文（`must_start == gs`）⇒ 只解新片；407 长静默末尾窗、410 pending 兜底、411 切分流式分配、412 声纹合并；`plan_windows` 规则 4 收尾短尾窗 `(p-1,p+1)`（Gavin 要的「前一片重解」）仍**整片送解**（`must_start = gs`） | — | ✅ 平台中立自动继承 |
+| R1：带前文常规窗被 406 拒 / 精解空 ⇒ **只兜底 must 片**（`context_tail_pending`，span `(must_start, ge)`）；前片后缀是上一窗已精解文本，不被流式兜底顶掉 | 与 410 末尾窗同一条路径（`TailPending`） | ✅ 平台中立自动继承 |
+| **macOS 侧需要做什么** | | 无需改动（平台中立自动继承） |

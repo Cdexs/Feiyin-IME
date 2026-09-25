@@ -9,6 +9,25 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-1 — LOCALRT-SHORT-CONTEXT-413 ✅ 阶段一交付（待主控验收，只改 main.rs）
+
+- **范围**：只动 `src/main.rs` —— 组窗/派发区（`dispatch_window!` + 两处调用点 + 407 块 ~8689-9141）、纯函数区（`must_start_for_window` / `short_context_span` / `trim_and_shift_ranges` / `take_context_suffix` ~12141）、测试区（`short_context_413_tests` 9 条）。**未碰** `transcription/mod.rs`（coder-2 的 414）。
+- **核心**：常规窗音频由「`group_window_start_secs` 带上的整段前文片 + 新片」改为「紧邻前一片后缀（`tail_backtrack_secs` 回溯 ≥2s/≥12 字 + `find_tail_cut` 字缝）+ `[must_start..ge)` 完整解」。`must_start`：常态=窗末片；规则 3 并入 pending 的首窗=pending。对齐 span 收窄 `(must_start-1, ge)`（`window_samples.len()==ge-span_start`，与 407 同口径）。VAD 区间 `trim_and_shift_ranges` 裁剪平移（不新增每窗 VAD）。`new_slice_from` 改按窗内实际样本累计。
+- **共函数**：407 与 413 共用 `take_context_suffix`（抽自 407，**非复制**）；407 输出逐位不变。
+- **不变（主控确认）**：首片/无前文只解新片；`plan_windows` 规则 4 收尾短尾窗 `(p-1,p+1)` 仍**整片重解**（传 `must_start=gs`，源码护栏 `ts413_rule4_call_site_passes_gs_not_must_start` 锁）；407/410/411/412 行为不变。
+- **BUILD-399 09:48:21Z 时长**：旧 9.33s ⇒ 新 ≈ `min(回溯, 紧邻前片)` + 2.85s；冷启动 ≤6.85s，紧邻前片 ~2.98s ⇒ **5.83s**（主控预期 5~6s）。
+- **验证**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` 0 error、warnings 92/87 = 基线；全量 `cargo test --no-fail-fast` **0 failed**（`feiyin-ime` bin 1728P/0F/54I）。`docs/MACOS-HANDOFF.md` 已记一笔。
+- ⚠️ 过程如实上报：先改宏签名后改调用点，中间态被 coder-2 回归撞见编译失败（已补齐）。红线：未 commit / 未 build release / 版本 0.9.3 未动 / 零凭证。
+- **R1 返修（主控首轮退回，只改 main.rs）**：① 带前文常规窗的 406 兜底收窄为**只兜底 must 片**（新增 `context_tail_pending` → `TailPending{span:(must_start,ge),…}`；ctx Some push Some、无前文 push None 不变），防前片后缀（上一窗已精解准确文本）被流式顶掉（410 item2）；兜底 span 与上一窗零重叠 ⇒ 拼接不覆盖不漏字。② 删重复的「389（D3）…」注释一份。测试 11/11（+2 R1）；fmt EXIT0 / check 0 error、warnings 92/87=基线 / 全量 test 0 failed（bin 1730P/0F/54I）。仍未 commit / 未 build release / 版本未动 / 零凭证。
+
+## 2026-09-25 — coder-2 — FIX-NOSPEECH-WINDOW-414 ✅ 阶段一交付（待主控验收，只改 mod.rs）
+
+- **改动**（`src/transcription/mod.rs`）：`TimelineTrim::WholeWindow` 更名 `Revad`；`Revad` 与 `None` 回退分支共用新抽 `self_vad_ranges`（线程级 v6 VAD，懒建失败记住）+ 纯函数 `plan_self_vad_trim`（`SelfVadTrim`），**不复制**。时间线无语音 + 流式非空 ⇒ 自跑 VAD 复核：有语音剪静音（含 408B/412 声纹）解码；无语音 ⇒ `trimmed && n_ranges==0` 早退、不进模型；VAD 不可用 ⇒ 原样整窗。Debug `[LocalRT-DBG-414] revad: seg/in/ranges/src`。
+- **影响面**：① `Apply`/`Empty` 逐位不变、`None` 输出逐位一致（388 早退/390 cap/406/408B/412 源码锚点护栏全过）；② 调用方仅本地实时滑窗路 B（`main.rs:9272/10466`）+ `audio/mod.rs` PoC + PoC bin，本地精确档/在线识别不调用（grep）；③ 复核路径照常走 408B/412 声纹过滤（与 `None` 同路径）；④ 平台中立无 `cfg`，`docs/MACOS-HANDOFF.md` 已记。
+- **测试**：`fix414_*` 3 纯（有区间 ⇒ 剪静音 / 空区间 ⇒ 空样本 / VAD 不可用 ⇒ 原样整窗）+ 1 `#[ignore]` 真模型（`kv_long.wav` 补静音 ⇒ 有区间且剪后更短；纯静音 ⇒ 无区间空样本，**实跑 PASS**）；`ts393_plan_empty_with_streaming_needs_revad` + 源码护栏 `ts393c_revad_branch_uses_recheck_source_guard`（旧 393-A4 按新行为改写）。
+- **验证**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` 0 error、`feiyin-ime` **92/87**=基线、mod.rs 0 warning；全量 `cargo test --no-fail-fast` **0 failed**（本单 +3P/+1I）。⚠️ 回归期间 coder-1 在途 `main.rs` 一度 `dispatch_window!` 宏少一参致整 crate 编译失败（已由 coder-1 修复，非本单）。
+- 红线：未 commit / 未 build release / 版本未动 / 未碰 `main.rs` / 零凭证。
+
 ## 2026-09-25 — coder-1 — TEST-SYNC-411 ✅ 交付（阶段三·非作者护栏 5 条；生产零改动）
 
 - **范围**：只在 `src/main.rs` `#[cfg(test)] mod testsync411_tests`（5 条，`19309` 起）；未碰 `speaker.rs`/`mod.rs`（coder-2 的 412 护栏）、未碰生产区。
