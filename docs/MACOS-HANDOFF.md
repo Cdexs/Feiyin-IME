@@ -2444,3 +2444,10 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | --- | --- | --- |
 | `transcription/mod.rs`：`OrderedReflow::push_inner` 对齐成功时 `last_window_text = splice_keep_prev_overlap(prev[cut..], new, k)`；接续点由**半全局编辑距离对齐** `semiglobal_continuation` 定（前一窗重叠区有效字完整对齐、后一窗开头 k+4 末端自由；平局取较大 j 偏替换）；`[DBG-416]` 追加 `keep_prev/new_head_dropped` | 重叠区文字改用**前一窗**（字与内部标点），只把前一窗窗末句末标点换成后一窗同一位置起的文本；插入/删除不再产生边界 1 字重复 | ✅ 平台中立纯逻辑（无 `cfg`），macOS 同继承 |
 | **macOS 侧需要做什么** | | 无需改动（平台中立自动继承） |
+
+## VOICEPRINT-JUDGE-1P5S-432（2026-09-25，coder-1）· 判定门槛 1.5s / 注册 offer 保持 2.0s —— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `src/transcription/speaker.rs`：`MIN_JUDGE_SECS` 2.0→**1.5**（判定 + 412 合并目标 + 语种门）；**新增** `MIN_OFFER_SECS = 2.0`（注册/漂移 offer）；**新增纯函数** `unit_offer_eligible(unit_secs, unit, new_slice_from) = unit_secs >= MIN_OFFER_SECS && unit_offer_allowed(...)`，offer 调用处改调之；`DROP_THR` 不动 | 声纹**判定**门槛降 1.5s（1.5~1.8s 本人 min 0.542 > 0.45 ⇒ 可判，他人剔 96~100%）；**注册/漂移** 仍 ≥2.0s（1.5~2s 嵌入差，不得入档）；412 合并目标随判定门槛（凑够 1.5s 封口） | ✅ 平台中立纯逻辑（无 `cfg`），macOS 同继承（`speaker.rs` 编同一份） |
+| **macOS 侧需要做什么** | | 无需改动（无新增文件/开关/env；纯常数与纯函数改动，平台中立自动继承） |

@@ -9,6 +9,12 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-1 — VOICEPRINT-JUDGE-1P5S-432 ✅ 交付（拆判定/注册门槛，只改 speaker.rs）
+
+- **判定**门槛 `MIN_JUDGE_SECS` 2.0→**1.5s**（同时供 412 合并目标、语种门）；新增 **`MIN_OFFER_SECS=2.0`** 守**注册/漂移 offer**（1.5~2s 嵌入差，防拉低本人档）；`DROP_THR=0.45` 不动。原 `MIN_JUDGE_SECS` 身兼三职，不能整体下调（Gavin 09-25「A，432进包」）。
+- 增强：offer 两条件抽纯函数 `unit_offer_eligible(unit_secs,unit,new_slice_from)`，调用处 `:738` 改调之（可单测、语义显式）。
+- `fix432_tests` 5/5（1.49 KeepShort / 1.5 低分 Drop / 1.5 高分 Keep / 1.5~2 不 offer 2.0 offer / 合并 1.5 封口）；同步 5 处 412/408 用例（window#4 改判 3 单元 2 可判）。fmt EXIT0 / check 0 error、warnings bin 91=基线 / 全量 test 0 failed（bin 1844P/0F/64I）。平台中立，MACOS-HANDOFF 已记；未 commit / 未 build / 版本未动 / 零凭证。
+
 ## 2026-09-25 — coder-1 — SEAM-KEEP-PREV-TEXT-431 · R1 ✅ 交付（主控裁决 B，只改 mod.rs）
 
 - **R1**：接续点改**半全局编辑距离对齐** `semiglobal_continuation`（前一窗重叠区有效字完整对齐、后一窗开头 k+4 末端自由，回溯取前一窗最后一个**有对应**的字之后；平局取较大 j 偏替换）；`splice_keep_prev_overlap` 用该接续点。修首轮 `k` 直接换算在插入/删除时的边界 1 字重复。

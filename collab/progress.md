@@ -1,4 +1,9 @@
 
+### 2026-09-25 · VOICEPRINT-JUDGE-1P5S-432 交付（判定门槛 1.5s / 注册 offer 2.0s，只改 speaker.rs）
+
+- 拆常数：`MIN_JUDGE_SECS=1.5`（判定 + 412 合并目标 + 语种门）、新增 `MIN_OFFER_SECS=2.0`（注册/漂移 offer）；`DROP_THR=0.45` 不动。offer 两条件抽纯函数 `unit_offer_eligible`，调用处改调之。
+- `fix432_tests` 5/5 + 5 处 412/408 用例同步（`ts412_merge_only_to_reach_judge_secs`、window#4 改判 3 单元 2 可判）；fmt EXIT0 / check 0 error、warnings bin 91=基线 / 全量 test 0 failed（bin 1844P/0F/64I）。平台中立，MACOS-HANDOFF 已记。未出包。
+
 ### 2026-09-25 · SEAM-KEEP-PREV-TEXT-431 · R1 交付（主控裁决 B：半全局对齐定接续点，只改 mod.rs）
 
 - 重叠区文字以前一窗为准、只采纳后一窗边界标点；接续点改 `semiglobal_continuation`（前一窗重叠区有效字完整对齐、后一窗 k+4 末端自由，回溯取最后一个有对应的字之后；平局取较大 j 偏替换）。
