@@ -12070,6 +12070,13 @@ mod fix435_tests {
 mod testsync433_435_tests {
     use super::*;
 
+    /// 源码锚点统一口径：去掉一切空白与换行后再比对。
+    /// rustfmt 会把方法链拆成多行（`a` / `.get(x)`），单行 `contains` 恒找不到 ⇒ 假红；
+    /// 字符串字面量本身不断行，故生产字面量去空白后仍精确可锚。
+    fn ts_nows(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
     // ================= 433-1 裁判四态（sim = LCS/max，逐字比字形） =================
 
     #[test]
@@ -12120,27 +12127,28 @@ mod testsync433_435_tests {
         let prod =
             crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("../main.rs"))
                 .join("\n");
+        let flat = ts_nows(&prod);
         // 正：音频流向 window_streaming_texts → win_stream → push_window_streaming。
         for s in [
             concat!("window_streaming_texts", ".get(seq)"),
             concat!("window_streaming_texts", ".push(window_streaming)"),
             concat!("ordered.push_window", "_streaming("),
         ] {
-            assert!(prod.contains(s), "main.rs 生产区缺少 R 来源锚点：{s}");
+            let needle = ts_nows(s);
+            assert!(flat.contains(&needle), "main.rs 生产区缺少 R 来源锚点：{s}");
         }
         // win_stream 定义域内不得出现镜像/合成（禁 last_streaming_text 混入 R）。
-        let lines: Vec<&str> = prod.lines().collect();
-        let i = lines
-            .iter()
-            .position(|l| l.contains(&concat!("let win_stream = window", "_streaming_texts")))
-            .expect("win_stream 定义行缺失");
-        let zone = lines[i..(i + 12).min(lines.len())].join("\n");
+        // 按字符取窗（不用字节切片，防 CJK 处 panic；不用行窗，防 rustfmt 拆行）。
+        let anchor = ts_nows(concat!("let win_stream = window", "_streaming_texts"));
+        let bi = flat.find(&anchor).expect("win_stream 定义缺失");
+        let ci = flat[..bi].chars().count();
+        let zone: String = flat.chars().skip(ci).take(600).collect();
         assert!(
-            !zone.contains(&concat!("last_streaming", "_text")),
+            !zone.contains(&ts_nows(concat!("last_streaming", "_text"))),
             "R 不得取自 last_streaming_text 镜像"
         );
         assert!(
-            zone.contains(&concat!("push_window", "_streaming")),
+            zone.contains(&ts_nows(concat!("push_window", "_streaming"))),
             "win_stream 须直 feed push_window_streaming"
         );
     }
@@ -12257,8 +12265,9 @@ mod testsync433_435_tests {
         let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("mod.rs"))
             .join("\n");
         // 完全对不上（<4 字）⇒ 保留 concat 作最后兜底（warn 锚点）。
+        let flat = ts_nows(&prod);
         assert!(
-            prod.contains(&concat!("[DBG-433] concat", " fallback")),
+            flat.contains(&ts_nows(concat!("[DBG-433] concat", " fallback"))),
             "生产区缺少 concat 兜底日志锚点"
         );
         assert_eq!(ESTIMATE_MIN_OVERLAP_CHARS, 4);
@@ -12536,25 +12545,25 @@ mod testsync433_435_tests {
     fn ts435arbiter_uses_no_pinyin() {
         let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("mod.rs"))
             .join("\n");
-        for (entry, take) in [
-            ("fn lcs_sim(", 15usize),
-            ("fn arbitrate_sim(", 20usize),
-            ("fn effective_chars(", 8usize),
+        // 去空白口径（同 ts433r）：函数签名被 rustfmt 拆行也不假红；按字符取窗。
+        let flat = ts_nows(&prod);
+        for (entry_src, take) in [
+            (concat!("fn lcs", "_sim("), 600usize),
+            (concat!("fn arbitrate", "_sim("), 900usize),
+            (concat!("fn effective", "_chars("), 400usize),
         ] {
-            let zone: String = prod
-                .lines()
-                .skip_while(|l| !l.contains(entry))
-                .take(take)
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(zone.contains(entry), "生产区缺少函数：{entry}");
+            let entry = ts_nows(entry_src);
+            let bi = flat
+                .find(&entry)
+                .unwrap_or_else(|| panic!("生产区缺少函数：{entry_src}"));
+            let zone: String = flat[bi..].chars().take(take).collect();
             assert!(
-                !zone.contains(&concat!("char_sub", "_cost")),
-                "{entry} 裁判区不得用拼音代价"
+                !zone.contains(&ts_nows(concat!("char_sub", "_cost"))),
+                "{entry_src} 裁判区不得用拼音代价"
             );
             assert!(
-                !zone.contains(&concat!("pin", "yin")),
-                "{entry} 裁判区不得引用拼音"
+                !zone.contains(&ts_nows(concat!("pin", "yin"))),
+                "{entry_src} 裁判区不得引用拼音"
             );
         }
     }
