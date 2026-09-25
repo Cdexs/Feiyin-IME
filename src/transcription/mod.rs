@@ -12060,3 +12060,502 @@ mod fix435_tests {
         );
     }
 }
+
+/// TEST-SYNC-433-435：433/435 非作者护栏（只写测试；生产零改动）。
+///
+/// - 433（coder-1）：重叠区 A/B 由预览原文 R 裁判 + forced/估算层。
+/// - 435（coder-1）：重叠区对齐按读音加权；433 裁判仍逐字。
+/// - 本模块只新增断言，不碰生产区；白名单仅 `cargo fmt` / `cargo check`。
+#[cfg(test)]
+mod testsync433_435_tests {
+    use super::*;
+
+    // ================= 433-1 裁判四态（sim = LCS/max，逐字比字形） =================
+
+    #[test]
+    fn ts433arb_prev_wins() {
+        let (c, sa, sb) = arbitrate_sim("今天天气很好", "明天天气很好", "今天天气很好");
+        assert_eq!(c, ArbChoice::Prev);
+        assert!(
+            (sa - 1.0).abs() < 1e-6,
+            "A 与 R 全同 ⇒ sim_a=1.0，实得 {sa}"
+        );
+        assert!(
+            (sb - 5.0 / 6.0).abs() < 1e-6,
+            "B 差一字（LCS=5/6），实得 {sb}"
+        );
+    }
+
+    #[test]
+    fn ts433arb_new_wins() {
+        let (c, sa, sb) = arbitrate_sim("今天天气很好", "明天天气很好", "明天天气很好");
+        assert_eq!(c, ArbChoice::New);
+        assert!((sb - 1.0).abs() < 1e-6);
+        assert!((sa - 5.0 / 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ts433arb_tie_goes_prev() {
+        // A/B 与 R 各差一字、相似度打平 ⇒ 维持 431（取 A）。
+        let (c, sa, sb) = arbitrate_sim("今天很好", "明天很好", "天很好");
+        assert!((sa - 0.75).abs() < 1e-6, "LCS=3/4，实得 {sa}");
+        assert!((sb - 0.75).abs() < 1e-6, "LCS=3/4，实得 {sb}");
+        assert_eq!(c, ArbChoice::Tie);
+    }
+
+    #[test]
+    fn ts433arb_empty_r_goes_none() {
+        // R 无有效字（纯标点/空白/空）⇒ 取 A。
+        for r in ["", "，。", "  "] {
+            let (c, sa, sb) = arbitrate_sim("今天天气很好", "明天天气很好", r);
+            assert_eq!(c, ArbChoice::None, "R={r:?} 应取 None");
+            assert_eq!((sa, sb), (0.0, 0.0));
+        }
+    }
+
+    // ================= 433-2 R 来源锚点（main.rs 生产区） =================
+
+    #[test]
+    fn ts433r_source_anchor() {
+        let prod =
+            crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("../main.rs"))
+                .join("\n");
+        // 正：音频流向 window_streaming_texts → win_stream → push_window_streaming。
+        for s in [
+            concat!("window_streaming_texts", ".get(seq)"),
+            concat!("window_streaming_texts", ".push(window_streaming)"),
+            concat!("ordered.push_window", "_streaming("),
+        ] {
+            assert!(prod.contains(s), "main.rs 生产区缺少 R 来源锚点：{s}");
+        }
+        // win_stream 定义域内不得出现镜像/合成（禁 last_streaming_text 混入 R）。
+        let lines: Vec<&str> = prod.lines().collect();
+        let i = lines
+            .iter()
+            .position(|l| l.contains(&concat!("let win_stream = window", "_streaming_texts")))
+            .expect("win_stream 定义行缺失");
+        let zone = lines[i..(i + 12).min(lines.len())].join("\n");
+        assert!(
+            !zone.contains(&concat!("last_streaming", "_text")),
+            "R 不得取自 last_streaming_text 镜像"
+        );
+        assert!(
+            zone.contains(&concat!("push_window", "_streaming")),
+            "win_stream 须直 feed push_window_streaming"
+        );
+    }
+
+    // ================= 433-3 forced / 估算 / concat =================
+
+    #[test]
+    fn ts433forced_length_choice_bands() {
+        // 带内 ⇒ 走裁判（None）；超界 ⇒ 取有效字更多一版。
+        assert_eq!(forced_length_choice(12, 12), None);
+        assert_eq!(forced_length_choice(8, 8), None);
+        assert_eq!(forced_length_choice(7, 10), None); // 0.70 下界含内
+        assert_eq!(forced_length_choice(10, 7), None); // 1.428 < 1.43 含内
+        assert_eq!(forced_length_choice(20, 12), Some(ArbChoice::New));
+        assert_eq!(forced_length_choice(5, 12), Some(ArbChoice::Prev));
+    }
+
+    #[test]
+    fn ts433forced_overlap_gates() {
+        // 先验 e<8 ⇒ 不进 forced。
+        assert!(forced_overlap("前文重叠区文本内容", "重叠区文本内容后续", 5).is_none());
+        assert!(forced_overlap("前文重叠区文本内容", "重叠区文本内容后续", 7).is_none());
+        // 全同重叠 ⇒ Some（前一窗 cut 前前缀 + cont）。
+        assert_eq!(
+            forced_overlap("abcdefghABCDEFGH", "ABCDEFGHxxxxxxxx", 8),
+            Some(("abcdefgh".to_string(), 8))
+        );
+        // 全不相交（ASCII 无读音 ⇒ 代价全 1.0，best/e=1.0 > 0.90 安全网）⇒ None。
+        assert!(forced_overlap("abcdefghijklmnop", "qrstuvwxyz123456", 8).is_none());
+    }
+
+    #[test]
+    fn ts433estimate_overlap_bounds() {
+        // 太短（<4 有效字）⇒ None。
+        assert!(estimate_overlap("甲乙", "丙丁").is_none());
+        // 全不相交（编辑率 1.0 > 0.35）⇒ None。
+        assert!(estimate_overlap("abcdefghijklmnop", "qrstuvwxyz123456").is_none());
+        // 全同 8 字 ⇒ (前缀, k=8, cont=8)。
+        assert_eq!(
+            estimate_overlap("abcdefghABCDEFGH", "ABCDEFGH12345678"),
+            Some(("abcdefgh".to_string(), 8, 8))
+        );
+    }
+
+    #[test]
+    fn ts433arbitrate_or_longer_modes() {
+        // Forced 带内 ⇒ 走裁判（本例 A 胜）。
+        let (c, extra, _, _, _) = arbitrate_or_longer(
+            "今天天气很好",
+            "明天天气很好",
+            "今天天气很好",
+            12,
+            12,
+            ArbMode::Forced,
+        );
+        assert_eq!(c, ArbChoice::Prev);
+        assert_eq!(extra, "");
+        // Forced 超上界 ⇒ 取较长（B）；超下界 ⇒ 取较长（A）。
+        let (c, extra, _, _, _) = arbitrate_or_longer(
+            "今天天气很好",
+            "明天天气很好",
+            "今天天气很好",
+            12,
+            20,
+            ArbMode::Forced,
+        );
+        assert_eq!(c, ArbChoice::New);
+        assert_eq!(extra, "longer_");
+        let (c, extra, _, _, _) = arbitrate_or_longer(
+            "今天天气很好",
+            "明天天气很好",
+            "今天天气很好",
+            12,
+            5,
+            ArbMode::Forced,
+        );
+        assert_eq!(c, ArbChoice::Prev);
+        assert_eq!(extra, "longer_");
+        // Estimate 不等长 ⇒ 取较长；等长 ⇒ 走裁判。
+        let (c, extra, _, _, _) = arbitrate_or_longer(
+            "今天天气很好",
+            "明天天气很好",
+            "今天天气很好",
+            8,
+            10,
+            ArbMode::Estimate,
+        );
+        assert_eq!(c, ArbChoice::New);
+        assert_eq!(extra, "est_longer_");
+        let (c, extra, _, _, _) = arbitrate_or_longer(
+            "今天天气很好",
+            "明天天气很好",
+            "今天天气很好",
+            10,
+            8,
+            ArbMode::Estimate,
+        );
+        assert_eq!(c, ArbChoice::Prev);
+        assert_eq!(extra, "est_longer_");
+        let (c, extra, _, _, _) = arbitrate_or_longer(
+            "今天天气很好",
+            "明天天气很好",
+            "今天天气很好",
+            8,
+            8,
+            ArbMode::Estimate,
+        );
+        assert_eq!(c, ArbChoice::Prev);
+        assert_eq!(extra, "");
+    }
+
+    #[test]
+    fn ts433concat_fallback_anchor() {
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("mod.rs"))
+            .join("\n");
+        // 完全对不上（<4 字）⇒ 保留 concat 作最后兜底（warn 锚点）。
+        assert!(
+            prod.contains(&concat!("[DBG-433] concat", " fallback")),
+            "生产区缺少 concat 兜底日志锚点"
+        );
+        assert_eq!(ESTIMATE_MIN_OVERLAP_CHARS, 4);
+        assert_eq!(FORCED_MIN_OVERLAP_CHARS, 8);
+        assert!((FORCED_MIN_LEN_RATIO - 0.70).abs() < 1e-6);
+        assert!((FORCED_MAX_LEN_RATIO - 1.43).abs() < 1e-6);
+        assert!((FORCED_MAX_EDIT_RATIO - 0.90).abs() < 1e-6);
+    }
+
+    // ================= 433-4 五个真实接缝的真实流式 R =================
+
+    #[test]
+    fn ts433real_stream_arbitration() {
+        // 数据同源 fix435_real_stream_arbitration（debug.log 真实 verdict 行）；
+        // 前 4 例胜者与朗读原文一致，22:36 如实判 A（预览与 A 同错「步入」，GIGO 上限）。
+        let cases: [(&str, &str, &str, &str, ArbChoice, (f32, f32)); 5] = [
+            (
+                "175022 某一世/某一时",
+                "比如说，某人在某一世",
+                "比如说，某人在某一时",
+                "出现比如说某人在某",
+                ArbChoice::Tie,
+                (0.778, 0.778),
+            ),
+            (
+                "211203 似乎与/不与",
+                "似乎与他们要过的人生很不相称的事件，因为",
+                "不与他们要过的人生很不相称的事件，因为",
+                "似乎与他们要过的人生很不相称的事件因为",
+                ArbChoice::Prev,
+                (1.000, 0.895),
+            ),
+            (
+                "211641 获取/去",
+                "获取、以便和日常生活经验对照或比较的基础",
+                "去，以便和日常生活经验对照或比较的基础",
+                "它可以获取以便和日常生活经验对照或比",
+                ArbChoice::Prev,
+                (0.789, 0.722),
+            ),
+            (
+                "211203 事件，因为/自愿",
+                "事件，因为。",
+                "事件，因为自愿",
+                "事件因为",
+                ArbChoice::Prev,
+                (1.000, 0.667),
+            ),
+            (
+                "223620 有步入/由部落",
+                "有步入酋长到历任总统、市市长",
+                "由部落酋长到历任总统、市或市长",
+                "有步入囚藏大历任总统时或",
+                ArbChoice::Prev,
+                (0.538, 0.357),
+            ),
+        ];
+        for (name, a, b, r, want, (ea, eb)) in cases {
+            assert!(!r.is_empty(), "{name} R 不得为空（只用真实数据）");
+            let (got, sa, sb) = arbitrate_sim(a, b, r);
+            assert_eq!(got, want, "{name} 真实 R 裁判结论不符");
+            assert!(
+                (sa - ea).abs() < 0.01 && (sb - eb).abs() < 0.01,
+                "{name} 相似度漂移：实得 ({sa:.3},{sb:.3})，期望 ({ea:.3},{eb:.3})"
+            );
+        }
+    }
+
+    // ================= 435-5 char_sub_cost 分档 =================
+
+    #[test]
+    fn ts435sub_cost_table() {
+        // 同字 ⇒ 0。
+        for c in ['们', '天', 'A'] {
+            assert_eq!(char_sub_cost(c, c), 0.0, "{c} 同字应 0");
+        }
+        // 同音 ⇒ 0.2（含多音字任一读音）。
+        for (a, b) in [
+            ('世', '时'),
+            ('有', '由'),
+            ('步', '部'),
+            ('事', '是'),
+            ('在', '再'),
+            ('行', '航'),
+            ('长', '常'),
+        ] {
+            assert_eq!(char_sub_cost(a, b), 0.2, "{a}/{b} 应同音 0.2");
+            assert_eq!(char_sub_cost(b, a), 0.2, "{b}/{a} 应对称");
+        }
+        // 近音 ⇒ 0.6（n/l、zh/z、ch/c、sh/s、an/ang、en/eng、in/ing 归一）。
+        for (a, b) in [
+            ('你', '里'), // n/l
+            ('知', '资'), // zh/z
+            ('陈', '村'), // ch/c
+            ('山', '三'), // sh/s
+            ('安', '昂'), // an/ang
+            ('恩', '亨'), // en/eng
+            ('因', '英'), // in/ing
+        ] {
+            assert_eq!(char_sub_cost(a, b), 0.6, "{a}/{b} 应近音 0.6");
+        }
+        // 其余 ⇒ 1.0。
+        for (a, b) in [('天', '地'), ('甲', '钢')] {
+            assert_eq!(char_sub_cost(a, b), 1.0, "{a}/{b} 应 1.0");
+        }
+        // 非汉字：相等 0，否则 1.0。
+        assert_eq!(char_sub_cost('A', 'A'), 0.0);
+        assert_eq!(char_sub_cost('A', 'B'), 1.0);
+    }
+
+    // ================= 435-6 不丢字不重复性质测试（300 组） =================
+
+    struct TsXorShift64(u64);
+
+    impl TsXorShift64 {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x.wrapping_shl(13);
+            x ^= x >> 7;
+            x ^= x.wrapping_shl(17);
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+    }
+
+    /// P 含 P 或其同音替换版本（按序，同字/同音均可）.
+    fn ts_contains_homo_variant(hay: &[char], needle: &[char]) -> bool {
+        let mut j = 0;
+        for &c in hay {
+            if j < needle.len()
+                && (c == needle[j] || (char_sub_cost(c, needle[j]) - 0.2).abs() < 1e-6)
+            {
+                j += 1;
+            }
+        }
+        j == needle.len()
+    }
+
+    /// S 每个字都在（按序，精确）.
+    fn ts_contains_ordered(hay: &[char], needle: &[char]) -> bool {
+        let mut j = 0;
+        for &c in hay {
+            if j < needle.len() && c == needle[j] {
+                j += 1;
+            }
+        }
+        j == needle.len()
+    }
+
+    /// 最长相邻精确重复块（有效字）；无 ⇒ None。
+    fn ts_tandem_repeat(eff: &[char]) -> Option<String> {
+        let n = eff.len();
+        for len in 4..=n / 2 {
+            for i in 0..=n - 2 * len {
+                if eff[i..i + len] == eff[i + len..i + 2 * len] {
+                    return Some(eff[i..i + len].iter().collect());
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn ts435seam_property_no_loss_no_dup() {
+        const POOL: &[char] = &[
+            '世', '有', '步', '事', '在', '行', '长', '明', '生', '高', '张', '黄',
+        ];
+        const SPOOL: &[char] = &['海', '洋', '山', '川', '河', '流', '湖', '泊'];
+        const PREFIX: &str = "前文引子已定";
+        fn homo_partner(c: char) -> char {
+            match c {
+                '世' => '时',
+                '有' => '由',
+                '步' => '部',
+                '事' => '是',
+                '在' => '再',
+                '行' => '航',
+                '长' => '常',
+                '明' => '名',
+                '生' => '声',
+                '高' => '糕',
+                '张' => '章',
+                '黄' => '皇',
+                _ => unreachable!("POOL 外字符 {c}"),
+            }
+        }
+        let mut rng = TsXorShift64(0x1234_5678_9ABC_DEF0);
+        for g in 0..300 {
+            let p: Vec<char> = (0..12).map(|_| POOL[rng.below(POOL.len())]).collect();
+            let mut pp = p.clone();
+            for _ in 0..rng.below(3) {
+                match rng.below(3) {
+                    // 同音替换。
+                    0 => {
+                        let pos = rng.below(pp.len());
+                        pp[pos] = homo_partner(pp[pos]);
+                    }
+                    // 插入（不与邻字相同）。
+                    1 => {
+                        let pos = rng.below(pp.len() + 1);
+                        let mut ins = POOL[rng.below(POOL.len())];
+                        for _ in 0..10 {
+                            let clash = (pos > 0 && pp[pos - 1] == ins)
+                                || (pos < pp.len() && pp[pos] == ins);
+                            if !clash {
+                                break;
+                            }
+                            ins = POOL[rng.below(POOL.len())];
+                        }
+                        pp.insert(pos, ins);
+                    }
+                    // 删除（保留末字 ⇒ 接续点不吃进 S）。
+                    _ => {
+                        if pp.len() > 10 {
+                            let pos = rng.below(pp.len() - 1);
+                            pp.remove(pos);
+                        }
+                    }
+                }
+            }
+            let s: Vec<char> = (0..8).map(|_| SPOOL[rng.below(SPOOL.len())]).collect();
+            let prev: String = format!("{PREFIX}{}", p.iter().collect::<String>());
+            let new: String = format!(
+                "{}{}",
+                pp.iter().collect::<String>(),
+                s.iter().collect::<String>()
+            );
+            let samples = vec![19200usize, 12800];
+            let mut o = OrderedReflow::new();
+            let _ = o.push_window(0, 0, 1, vec![16000], prev.clone());
+            let _ = o.push_window(1, 0, 2, samples.clone(), new.clone());
+            let (committed, last) = o.finish();
+            let final_text = format!("{committed}{last}");
+            let feff = effective_chars(&final_text);
+            // 层级须落在严格/宽松（同 prior 直调生产函数复核）。
+            let prior = AlignPrior {
+                expected_ratio: expected_overlap_ratio(0, 2, 1, &samples),
+                prev_extra_slices: 0,
+            };
+            let res = resolve_overlap(&prev, &new, prior);
+            assert!(
+                matches!(res.layer, AlignLayer::Strict | AlignLayer::Loose),
+                "g={g} 层级偏离严格/宽松：{:?} prev={prev} new={new}",
+                res.layer
+            );
+            // ① 含 P 或其同音替换版本。
+            assert!(
+                ts_contains_homo_variant(&feff, &p),
+                "g={g} 丢 P：final={final_text} P={}",
+                p.iter().collect::<String>()
+            );
+            // ② S 每个字都在。
+            assert!(
+                ts_contains_ordered(&feff, &s),
+                "g={g} 丢 S：final={final_text} S={}",
+                s.iter().collect::<String>()
+            );
+            // ③ 无边界重复（≥4 字相邻精确重复，且输入中本无）。
+            if let Some(rep) = ts_tandem_repeat(&feff) {
+                assert!(
+                    prev.contains(&rep) || new.contains(&rep),
+                    "g={g} 接缝重复 {rep:?}：final={final_text}"
+                );
+            }
+        }
+    }
+
+    // ================= 435-7 裁判不用拼音（锚点） =================
+
+    #[test]
+    fn ts435arbiter_uses_no_pinyin() {
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("mod.rs"))
+            .join("\n");
+        for (entry, take) in [
+            ("fn lcs_sim(", 15usize),
+            ("fn arbitrate_sim(", 20usize),
+            ("fn effective_chars(", 8usize),
+        ] {
+            let zone: String = prod
+                .lines()
+                .skip_while(|l| !l.contains(entry))
+                .take(take)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(zone.contains(entry), "生产区缺少函数：{entry}");
+            assert!(
+                !zone.contains(&concat!("char_sub", "_cost")),
+                "{entry} 裁判区不得用拼音代价"
+            );
+            assert!(
+                !zone.contains(&concat!("pin", "yin")),
+                "{entry} 裁判区不得引用拼音"
+            );
+        }
+    }
+}
