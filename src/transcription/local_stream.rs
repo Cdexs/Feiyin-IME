@@ -4789,3 +4789,213 @@ mod diag434_tests {
         }
     }
 }
+
+// =====================================================================
+// TEST-SYNC-430-434（阶段三·非作者护栏 · coder-1）：434 真停顿切点契约，
+// 独立推导 + 定点合成信号（直流 0.5 有声 / 0.0 静音，帧 RMS 精确可算）。
+// 生产零改动；只覆盖 `find_tail_cut_ex` / `real_pause_cut_candidates` 行为
+// 与 381 共享内核未动锚点。白名单仅 fmt/check（未跑 cargo test）。
+// =====================================================================
+#[cfg(test)]
+mod testsync434_tests {
+    use super::{find_tail_cut, find_tail_cut_ex, TailCutKind, TAIL_CUT_MIN_PAUSE_MS};
+    use crate::transcription::vad::{real_pause_cut_candidates, GAP_FRAME_SAMPLES};
+
+    const RATE: usize = 16000;
+    const FRAME: usize = GAP_FRAME_SAMPLES; // 320 = 20ms
+                                            // 120ms ⇒ 6 帧（与生产 `min_frames` 公式一致：((120*16+320-1)/320).max(1)）。
+    const MIN_FRAMES: usize = 6;
+
+    /// 定点合成：`[0,len)` 直流有声（RMS 恒 0.5），`sil` 区间逐段置 0（静音）。
+    /// 中位数必落有声帧 ⇒ 阈值 0.3×0.5=0.15，静音帧恒低于阈值。
+    fn synth(len: usize, sil: &[(usize, usize)]) -> Vec<f32> {
+        let mut a = vec![0.5f32; len];
+        for &(s, e) in sil {
+            for x in a.iter_mut().take(e).skip(s) {
+                *x = 0.0;
+            }
+        }
+        a
+    }
+    /// 第 `j` 帧（320 样本）样本区间。
+    fn fr(j: usize) -> (usize, usize) {
+        (j * FRAME, (j + 1) * FRAME)
+    }
+    /// 真停顿段（`cnt` 帧，自 `j0` 起）的期望中点样本。
+    fn mid(j0: usize, cnt: usize) -> usize {
+        (j0 * FRAME + FRAME / 2 + (j0 + cnt - 1) * FRAME + FRAME / 2) / 2
+    }
+
+    /// 契约 1a：连续 120ms（6 帧）低能量 ⇒ 真停顿（RealPause）。
+    #[test]
+    fn tsync434_pause_120ms_is_real() {
+        // 6s 音频、回溯 2s ⇒ lower=4s（帧 200），upper≈6s-160。
+        let back = 2 * RATE;
+        let (s, e) = (fr(210).0, fr(215).1); // 恰 6 帧 120ms
+        let a = synth(6 * RATE, &[(s, e)]);
+        let (cut, kind) = find_tail_cut_ex(&a, back);
+        assert_eq!(kind, TailCutKind::RealPause, "120ms 连续低能量须为真停顿");
+        assert_eq!(cut, mid(210, 6), "切点须为静音段中点");
+    }
+
+    /// 契约 1b：仅 100ms（5 帧）低谷 ⇒ 不算真停顿（`real_pause` 候选为空）。
+    #[test]
+    fn tsync434_pause_100ms_not_real() {
+        let back = 2 * RATE;
+        let (s, e) = (fr(210).0, fr(214).1); // 恰 5 帧 100ms
+        let a = synth(6 * RATE, &[(s, e)]);
+        let lower = a.len() - back;
+        let upper = a.len() - FRAME / 2;
+        let cands = real_pause_cut_candidates(&a, lower, upper, FRAME, MIN_FRAMES);
+        assert!(
+            cands.is_empty(),
+            "100ms < 120ms 门槛，不得入选真停顿，实测 {cands:?}"
+        );
+        let (_, kind) = find_tail_cut_ex(&a, back);
+        assert_ne!(kind, TailCutKind::RealPause, "100ms 低谷不得走 RealPause");
+    }
+
+    /// 契约 1c：切点为静音段中点（200ms 段，10 帧，返回帧数亦断言）。
+    #[test]
+    fn tsync434_cut_is_pause_midpoint() {
+        let back = 2 * RATE;
+        let (s, e) = (fr(210).0, fr(219).1); // 恰 10 帧 200ms
+        let a = synth(6 * RATE, &[(s, e)]);
+        let lower = a.len() - back;
+        let upper = a.len() - FRAME / 2;
+        let cands = real_pause_cut_candidates(&a, lower, upper, FRAME, MIN_FRAMES);
+        assert_eq!(cands.len(), 1, "单段静音应恰一候选");
+        assert_eq!(cands[0].0, mid(210, 10), "候选中点须精确");
+        assert_eq!(cands[0].1, 10, "段内帧数须为 10");
+        let (cut, kind) = find_tail_cut_ex(&a, back);
+        assert_eq!(kind, TailCutKind::RealPause);
+        assert_eq!(cut, mid(210, 10));
+    }
+
+    /// 契约 2a：首轮区间多个真停顿 ⇒ 取最早者（离 len-back 最近，后缀不短于回溯）。
+    #[test]
+    fn tsync434_first_range_takes_earliest() {
+        let back = 2 * RATE;
+        let a = synth(6 * RATE, &[(fr(210).0, fr(215).1), (fr(250).0, fr(259).1)]);
+        let (cut, kind) = find_tail_cut_ex(&a, back);
+        assert_eq!(kind, TailCutKind::RealPause);
+        assert_eq!(cut, mid(210, 6), "两停顿取首轮最早者，不得取靠后者");
+    }
+
+    /// 契约 2b：首轮区间无、2×回溯内有 ⇒ 取扩展区内离 len-back 最近者；后缀变长但不超整片。
+    #[test]
+    fn tsync434_expanded_takes_nearest_lower() {
+        // 8s 音频、回溯 2s ⇒ lower=6s；停顿放在 5.0~5.16s（8 帧，仅扩展区可见）。
+        let back = 2 * RATE;
+        let (s, e) = (fr(250).0, fr(257).1);
+        let a = synth(8 * RATE, &[(s, e)]);
+        let lower = a.len() - back;
+        let (cut, kind) = find_tail_cut_ex(&a, back);
+        assert_eq!(kind, TailCutKind::RealPause, "扩展区应找到真停顿");
+        assert_eq!(cut, mid(250, 8), "取扩展区内离 lower 最近者");
+        assert!(cut < lower, "切点应在 len-back 之前（后缀变长）");
+        let suffix = a.len() - cut;
+        assert!(
+            suffix > back && suffix <= a.len(),
+            "后缀须 >back 且 ≤整片，实测 {suffix}"
+        );
+    }
+
+    /// 契约 2c：首轮/扩展区皆无 ⇒ weak_gap / no_gap 退回旧行为（非 RealPause 即退回）。
+    #[test]
+    fn tsync434_no_pause_anywhere_falls_back() {
+        // 4s 全程有声 ⇒ 无任何低能量段。
+        let a: Vec<f32> = (0..4 * RATE)
+            .map(|i| (i as f32 * 0.13).sin() * 0.5)
+            .collect();
+        let back = 2 * RATE;
+        let lower = a.len() - back;
+        let upper = a.len() - FRAME / 2;
+        let cands = real_pause_cut_candidates(&a, lower, upper, FRAME, MIN_FRAMES);
+        assert!(cands.is_empty(), "全程有声不得有真停顿候选");
+        let wide = real_pause_cut_candidates(&a, 0, upper, FRAME, MIN_FRAMES);
+        assert!(wide.is_empty(), "扩展区亦不得有候选");
+        let (cut, kind) = find_tail_cut_ex(&a, back);
+        assert_ne!(kind, TailCutKind::RealPause, "须退回旧行为");
+        if kind == TailCutKind::NoGap {
+            assert_eq!(cut, lower, "NoGap 回落 len-back");
+        }
+    }
+
+    /// 契约 3：prev 短于回溯 ⇒ (0, NoGap) 整片；`find_tail_cut` bool 兼容。
+    #[test]
+    fn tsync434_short_prev_zero_nogap() {
+        let a = vec![0.5f32; 1000];
+        assert_eq!(
+            find_tail_cut_ex(&a, 2 * RATE),
+            (0, TailCutKind::NoGap),
+            "不足 back ⇒ 整片"
+        );
+        assert_eq!(find_tail_cut(&a, 2 * RATE), (0, false));
+    }
+
+    /// 契约 3b：`gap_found` 兼容 —— RealPause ⇒ true；NoGap ⇒ false。
+    #[test]
+    fn tsync434_gap_found_compat() {
+        let back = 2 * RATE;
+        let (s, e) = (fr(210).0, fr(215).1);
+        let a = synth(6 * RATE, &[(s, e)]);
+        assert!(find_tail_cut(&a, back).1, "真停顿 ⇒ gap_found=true");
+        let b: Vec<f32> = (0..4 * RATE)
+            .map(|i| (i as f32 * 0.13).sin() * 0.5)
+            .collect();
+        let (cut_b, found_b) = find_tail_cut(&b, back);
+        let kind_b = find_tail_cut_ex(&b, back).1;
+        assert_eq!(
+            found_b,
+            kind_b != TailCutKind::NoGap,
+            "bool 须恒等于 kind != NoGap"
+        );
+        let _ = cut_b;
+    }
+
+    /// 契约 4（源码锚点）：381 共享内核 `find_gap_cut_impl` / `find_gap_cut_gap_only`
+    /// 未被改动 —— 生产区含定义 + 关键行（`concat!` 拆字面量防自匹配）。
+    #[test]
+    fn tsync434_source_anchors() {
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("vad.rs"))
+            .join("\n");
+        assert!(
+            prod.contains(concat!("fn find_gap_cut_", "impl(")),
+            "381 内核定义须在"
+        );
+        assert!(
+            prod.contains(concat!(
+                "let search_start = (SLIDING_CUT_SEARCH_START_SECS * 16000.0)",
+                " as usize;"
+            )),
+            "381 基线关键行须在（前 10s 中位数）"
+        );
+        assert!(
+            prod.contains(concat!("fn find_gap_cut_", "gap_only(")),
+            "旧单帧入口定义须在"
+        );
+        assert!(
+            prod.contains(concat!(
+                "find_gap_cut_impl(audio, piece_start, lower, upper, frame)",
+                ".0"
+            )),
+            "gap_only 须仍直调 impl（未改道）"
+        );
+        assert!(
+            prod.contains(concat!("fn real_pause_cut_", "candidates(")),
+            "434 新函数定义须在"
+        );
+    }
+
+    /// 契约 0：120ms 门槛常量自证（`TAIL_CUT_MIN_PAUSE_MS=120`，Gavin 原话）。
+    #[test]
+    fn tsync434_threshold_constant() {
+        assert_eq!(TAIL_CUT_MIN_PAUSE_MS, 120, "真停顿门槛须为 120ms");
+        assert_eq!(
+            (TAIL_CUT_MIN_PAUSE_MS as usize * 16 + FRAME - 1) / FRAME,
+            MIN_FRAMES,
+            "120ms/20ms ⇒ 6 帧，与生产公式一致"
+        );
+    }
+}

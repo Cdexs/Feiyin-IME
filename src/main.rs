@@ -22099,3 +22099,150 @@ mod preview430_tests {
         assert_eq!(preview_body_h(&lay), lay.body_bottom - lay.body_top);
     }
 }
+
+// =====================================================================
+// TEST-SYNC-430-434（阶段三·非作者护栏 · coder-1）：430 回显窗几何契约，
+// 独立推导 + 非 320×140 输入（作者用 320×140/1920×1080/800×200；本模块用窄屏、
+// 高 DPI、极窄、矮屏四组输入）。生产零改动。白名单仅 fmt/check（未跑 cargo test）。
+// =====================================================================
+#[cfg(all(test, target_os = "windows"))]
+mod testsync430_tests {
+    use super::{
+        preview_body_h, preview_clamp_scroll, preview_hit_rects, preview_layout,
+        preview_max_scroll, preview_size, PREVIEW_BOTTOM_BAR_H, PREVIEW_OVERLAY_SIZE,
+        PREVIEW_TITLE_BAR_H,
+    };
+    use windows::Win32::Foundation::RECT;
+
+    /// 契约 5a：宽度 = 原宽 ×1.7（320→544 精确），`max_w` 只做上夹紧。
+    #[test]
+    fn tsync430_width_scale_exact() {
+        let w = (PREVIEW_OVERLAY_SIZE[0] as f32 * 1.7).round() as i32;
+        assert_eq!(w, 544, "320 × 1.7 须精确 544");
+        assert_eq!(preview_size(1920, 1080, 2000)[0], 544, "上限充足时取整 544");
+    }
+
+    /// 契约 5b：窄屏 / 高 DPI / 极窄 / 矮屏四组输入的期望尺寸。
+    #[test]
+    fn tsync430_size_clamps() {
+        // 窄屏：max_w=480 ⇒ 夹到 480（不到 544）。
+        assert_eq!(preview_size(1024, 600, 480), [480, 140]);
+        // 高 DPI 小工作区：max_w=400 ⇒ 夹到 400。
+        assert_eq!(preview_size(960, 540, 400), [400, 140]);
+        // 极窄：max_w=200 ⇒ 保底 max(200,320)=320 ⇒ 320。
+        assert_eq!(preview_size(800, 600, 200), [320, 140]);
+        // 矮屏：200×0.6=120 ⇒ 高压到 120（下限）。
+        assert_eq!(preview_size(1920, 180, 960), [544, 120]);
+    }
+
+    /// 契约 6a：正文区高度 = 窗高 − 标题栏 − 底部按钮区（标题栏 28+8 边距，底栏 32）。
+    #[test]
+    fn tsync430_body_height_formula() {
+        for (w, h) in [(480, 140), (544, 140), (320, 120)] {
+            let lay = preview_layout(w, h);
+            assert_eq!(lay.body_top, PREVIEW_TITLE_BAR_H + 8, "正文顶 = 标题栏+8");
+            assert_eq!(
+                preview_body_h(&lay),
+                h - (PREVIEW_TITLE_BAR_H + 8) - PREVIEW_BOTTOM_BAR_H,
+                "正文高 = 窗高−标题栏−底栏，输入 {w}×{h}"
+            );
+        }
+    }
+
+    /// 契约 6b：按钮区在底部且与正文区矩形不相交（底栏 h−32..h 内，按钮 h−28..h−10）。
+    #[test]
+    fn tsync430_buttons_below_body() {
+        for (w, h) in [(480, 140), (544, 140), (320, 120)] {
+            let lay = preview_layout(w, h);
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            };
+            let (copy, close, _tc) = preview_hit_rects(&rect);
+            // 正文底（h−32）须在按钮顶（h−28）之上，留 4px 间隙。
+            assert!(
+                lay.body_bottom <= copy.top && lay.body_bottom <= close.top,
+                "正文底 {} 须 ≤ 按钮顶 {}，输入 {w}×{h}",
+                lay.body_bottom,
+                copy.top
+            );
+            // 按钮完全落在底栏内：顶 ≥ h−32、底 ≤ h。
+            for (name, r) in [("copy", copy), ("close", close)] {
+                assert!(
+                    r.top >= h - PREVIEW_BOTTOM_BAR_H && r.bottom <= h,
+                    "{name} 按钮须在底栏内，输入 {w}×{h}"
+                );
+            }
+            // 双键水平居中且互不重叠。
+            assert!(copy.right <= close.left, "双键不得重叠");
+            let total = close.right - copy.left;
+            assert_eq!(
+                (copy.left, close.right),
+                ((w - total) / 2, (w - total) / 2 + total),
+                "双键须水平居中，输入 {w}×{h}"
+            );
+        }
+    }
+
+    /// 契约 6c：长文本滚动范围 > 0、短文本 = 0（按正文区高度推导的输入）。
+    #[test]
+    fn tsync430_scroll_range_from_body() {
+        let body = preview_body_h(&preview_layout(480, 140));
+        assert_eq!(body, 140 - 36 - 32, "480×140 正文区高应为 72");
+        assert!(preview_max_scroll(body * 3, body) > 0, "3 倍正文须可滚");
+        assert_eq!(preview_max_scroll(body - 1, body), 0, "不足一屏 ⇒ 不可滚");
+        assert_eq!(preview_clamp_scroll(body * 3, body * 2), body * 2);
+    }
+
+    /// 契约 7：标题 ✕ 键与新布局一致 —— 18×18、右对齐（right−26→right−8）、
+    /// 纵向落在标题栏内（bottom ≤ body_top），不随窗口宽度漂移。
+    #[test]
+    fn tsync430_title_close_consistent() {
+        for w in [320, 480, 544] {
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: 140,
+            };
+            let (_copy, _close, tc) = preview_hit_rects(&rect);
+            assert_eq!(tc.right - tc.left, 18, "宽 18，输入 {w}");
+            assert_eq!(tc.bottom - tc.top, 18, "高 18，输入 {w}");
+            assert_eq!((tc.left, tc.right), (w - 26, w - 8), "右对齐，输入 {w}");
+            assert_eq!((tc.top, tc.bottom), (5, 23), "标题栏内，输入 {w}");
+            let lay = preview_layout(w, 140);
+            assert!(
+                tc.bottom <= lay.body_top,
+                "标题键底须在正文顶之上，输入 {w}"
+            );
+        }
+    }
+
+    /// 契约 5/6/7（源码锚点）：FocusLost 分支走 `preview_size` + 工作区上限；
+    /// `preview_layout` 正文区止于底栏；生产区扫描 + `concat!` 拆字面量。
+    #[test]
+    fn tsync430_source_anchors() {
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"))
+            .join("\n");
+        assert!(
+            prod.contains(concat!(
+                "OverlayStatus::FocusLost { .. } => preview_size(",
+                "work_w, work_h, overlay_max_width(hwnd)),"
+            )),
+            "FocusLost 尺寸须走 preview_size + overlay_max_width"
+        );
+        assert!(
+            prod.contains(concat!(
+                "body_bottom: (h - PREVIEW_BOTTOM_BAR_H)",
+                ".max(PREVIEW_TITLE_BAR_H + 10),"
+            )),
+            "正文区底须止于底栏"
+        );
+        assert!(
+            prod.contains(concat!("const PREVIEW_WIDTH_SCALE: f32", " = 1.7;")),
+            "宽度放大倍数须为 1.7"
+        );
+    }
+}
