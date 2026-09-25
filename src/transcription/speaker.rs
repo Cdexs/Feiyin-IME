@@ -38,8 +38,19 @@ const MODEL_TAG: &str = "campplus-zh_en-16k-common-advanced-v1";
 /// v1 单档迁移到该语种键（语种未知）。
 const MIGRATED_LANG: &str = "und";
 
-/// 只判 ≥2s 的段（<2s 声纹不稳，404B 实测 1-2s 明显偏弱）。
-pub(crate) const MIN_JUDGE_SECS: f32 = 2.0;
+/// 声纹**判定**最短时长（秒）：`≥` 此值才判，`<` ⇒ `KeepShort`（保留不剔）。
+///
+/// VOICEPRINT-JUDGE-1P5S-432（Gavin 2026-09-25「A，432进包」）：2.0 → **1.5**。依据 432 报告 R1：
+/// AISHELL-1 6 人 1.5~1.8s 本人 min 0.542 > `DROP_THR` 0.45（误删 0%）、他人剔 96~100%；1.0~1.5s
+/// 交叠不做；Gavin 点名 1.60s 旁语句 score 0.086~0.157。**同时用于**：412 短段**合并目标**（凑够
+/// 1.5s 即可判）与语种不支持判定（`judge_voiceprint` 内）。
+pub(crate) const MIN_JUDGE_SECS: f32 = 1.5;
+/// **注册 / 漂移 offer** 最短时长（秒）：1.5~2.0s 片段嵌入质量差，**不得**进入声纹注册
+/// （否则拉低本人档）。故 offer 门槛**独立**于判定门槛，维持 **2.0**。
+///
+/// 🔴 拆分原因（432 主控核对）：原 `MIN_JUDGE_SECS`(2.0) 身兼三职 —— ① 判定 ② 412 合并目标
+/// ③ 注册/漂移 offer —— 不能整体下调。判定随 432 降 1.5s，offer 保持 2.0s。
+pub(crate) const MIN_OFFER_SECS: f32 = 2.0;
 /// 就绪所需的最少有效语音（秒）与段数（Gavin 定「攒够 ≥12s 且 ≥3 段」）。
 pub(crate) const ENROLL_MIN_SECS: f32 = 12.0;
 pub(crate) const ENROLL_MIN_SEGS: u32 = 3;
@@ -49,7 +60,7 @@ pub(crate) const ENROLL_OUTLIER_THR: f32 = 0.5;
 pub(crate) const UPDATE_THR: f32 = 0.75;
 /// 漂移更新单段权重上限：防被单段（哪怕很长）带偏。
 pub(crate) const UPDATE_MAX_WEIGHT: f32 = 0.25;
-/// 剔除阈：最高分 < 此值且段 ≥2s 且该语种档就绪 ⇒ 高置信非本人 ⇒ 剔除。
+/// 剔除阈：最高分 < 此值且段 ≥ [`MIN_JUDGE_SECS`](1.5s)（432 起）且该语种档就绪 ⇒ 高置信非本人 ⇒ 剔除。
 ///
 /// 依据 404B §B6：跨语言通用建议 0.45~0.65，取 **0.45 偏保守**（宁放过、不误删，守 390 教训）。
 pub(crate) const DROP_THR: f32 = 0.45;
@@ -564,9 +575,9 @@ pub(crate) struct SpeechUnit {
 ///
 /// 规则（R1 定稿）：
 /// - ① 间隔 `< MERGE_GAP_SECS`(0.8s) 才**可能**同单元；`≥` 断开（可能换人）。
-/// - ② **只为凑够 2s 才拼**：当前单元语音已 ≥ [`MIN_JUDGE_SECS`](2.0) 时，下一段另起新单元。
-/// - ③ **收尾**：最后一个单元若 <2s 且与前一单元间隔 <0.8s ⇒ 并入前一单元（免得尾段落单不判）。
-/// - ④ **≥2s 的单段各自独立**：本段自身 ≥2s 时不并入前单元（另起）。
+/// - ② **只为凑够判定门槛才拼**：当前单元语音已 ≥ [`MIN_JUDGE_SECS`](1.5s) 时，下一段另起新单元。
+/// - ③ **收尾**：最后一个单元若 <1.5s 且与前一单元间隔 <0.8s ⇒ 并入前一单元（免得尾段落单不判）。
+/// - ④ **≥1.5s 的单段各自独立**：本段自身 ≥1.5s 时不并入前单元（另起）。
 /// - 🔴 退化区间（`s>=e`）作为**零长成员**并入当前单元 ⇒ 成员与输入区间**一一对应**（回填判定不失配）；
 ///   零长成员不计时长、自然落 `KeepShort`。
 ///
@@ -623,6 +634,18 @@ pub(crate) fn merge_speech_units(ranges: &[(usize, usize)]) -> Vec<SpeechUnit> {
 /// 跨界（起点在前文、延伸进本窗新片）的单元**保守不 offer**（防把窗口前文重复计入注册/漂移）。
 fn unit_offer_allowed(unit: &SpeechUnit, new_slice_from: usize) -> bool {
     unit.members.first().map(|m| m.0).unwrap_or(0) >= new_slice_from
+}
+
+/// 432：注册 / 漂移 offer 的**总闸** —— 单元语音时长 ≥ [`MIN_OFFER_SECS`](2.0s) **且**起点在窗内。
+///
+/// 🔴 **注册语义**，独立于判定门槛 [`MIN_JUDGE_SECS`](1.5s)：1.5~2.0s 单元可判定（甚至剔除），
+/// 但**不注册**（嵌入质量差，防拉低本人档）。抽为纯函数便于单测与源码护栏。
+pub(crate) fn unit_offer_eligible(
+    unit_secs: f32,
+    unit: &SpeechUnit,
+    new_slice_from: usize,
+) -> bool {
+    unit_secs >= MIN_OFFER_SECS && unit_offer_allowed(unit, new_slice_from)
 }
 
 /// SPEAKER-VERIFY-408B ①：**解码前**判定 —— 每 ≥2s 区间与**本人所有已就绪档**逐一比、取最高分；
@@ -709,9 +732,10 @@ pub(crate) fn filter_ranges_by_voiceprint(
                     ri += 1;
                 }
             }
-            // 注册 / 漂移按**单元** offer（≥2s，时长只算语音）；`new_slice_from` 之前不 offer
-            // （单元跨越 `new_slice_from` 时按**单元起点**判定：起点在前文 ⇒ 整个单元不 offer）。
-            if unit_secs >= MIN_JUDGE_SECS && unit_offer_allowed(unit, new_slice_from) {
+            // 注册 / 漂移按**单元** offer（≥ `MIN_OFFER_SECS`=2.0s，**非判定门槛** `MIN_JUDGE_SECS`=1.5s；
+            // 时长只算语音）；`new_slice_from` 之前不 offer（单元跨越时按**单元起点**判定：起点在前文 ⇒ 整个单元不 offer）。
+            // 🔴 432：1.5~2.0s 的单元可**判定**（剔除）但**不注册**（嵌入质量差，防拉低本人档）。
+            if unit_offer_eligible(unit_secs, unit, new_slice_from) {
                 if let Some(e) = emb.as_deref() {
                     match verdict {
                         SegVerdict::KeepUser(s) => pending_offers.push(PendingOffer {
@@ -856,8 +880,9 @@ mod tests {
     #[test]
     fn judge_short_is_kept() {
         let vp = vp_ready(vec![1.0, 0.0]);
+        // 432：判定门槛降到 1.5s ⇒ 1.49s 仍 KeepShort（短段门）。
         assert_eq!(
-            judge(&vp, Some(&unit_with_cos(0.1)), 1.9, Some("zh")),
+            judge(&vp, Some(&unit_with_cos(0.1)), 1.49, Some("zh")),
             SegVerdict::KeepShort
         );
         assert_eq!(judge(&vp, None, 0.5, Some("ja")), SegVerdict::KeepShort);
@@ -1150,11 +1175,11 @@ mod testsync408a_tests {
     fn ts408a_judge_short_beats_all() {
         let vp = ready_lang("zh", unit(0, 2));
         assert_eq!(
-            judge(&vp, Some(&at_cos(0.0)), 1.9, Some("ja")),
+            judge(&vp, Some(&at_cos(0.0)), 1.49, Some("ja")),
             SegVerdict::KeepShort
         );
         assert_eq!(
-            judge(&Voiceprint::default(), None, 1.5, Some("ja")),
+            judge(&Voiceprint::default(), None, 1.49, Some("ja")),
             SegVerdict::KeepShort
         );
     }
@@ -1554,7 +1579,7 @@ mod testsync408b_tests {
 mod testsync408b_guard_tests {
     use super::{
         judge_voiceprint, partition_ranges, LangProfile, SegVerdict, Voiceprint, DROP_THR,
-        ENROLL_MIN_SECS, ENROLL_MIN_SEGS, MODEL_TAG,
+        ENROLL_MIN_SECS, ENROLL_MIN_SEGS, MIN_JUDGE_SECS, MODEL_TAG,
     };
 
     fn ready(lang: &str, centroid: Vec<f32>) -> Voiceprint {
@@ -1608,16 +1633,16 @@ mod testsync408b_guard_tests {
         let vp = ready("zh", vec![1.0, 0.0]);
         assert_eq!(judge_voiceprint(&vp, None, 3.0), SegVerdict::KeepNotReady);
         assert_eq!(
-            judge_voiceprint(&vp, Some(&[-1.0, 0.0]), 1.999),
+            judge_voiceprint(&vp, Some(&[-1.0, 0.0]), MIN_JUDGE_SECS - 0.001),
             SegVerdict::KeepShort,
-            "<2s ⇒ 永不剔"
+            "< MIN_JUDGE_SECS ⇒ 永不剔"
         );
         assert!(
             matches!(
-                judge_voiceprint(&vp, Some(&[-1.0, 0.0]), 2.0),
+                judge_voiceprint(&vp, Some(&[-1.0, 0.0]), MIN_JUDGE_SECS),
                 SegVerdict::DropNonUser(_)
             ),
-            "恰 2s 进入判定"
+            "恰 MIN_JUDGE_SECS 进入判定"
         );
     }
 
@@ -1810,21 +1835,31 @@ mod testsync412_merge_tests {
         assert_eq!(one[0].members.len(), 1);
     }
 
-    /// 契约 2（R1·规则②）：**只为凑够 2s 才拼** —— 单元一旦 ≥2s，下一段另起新单元。
+    /// 契约 2（R1·规则② / 432）：**只为凑够判定门槛才拼** —— 单元一旦 ≥ [`MIN_JUDGE_SECS`]（432 起 1.5s），
+    /// 下一段另起新单元；合并目标随判定门槛（1.5s），**非**注册门槛 [`MIN_OFFER_SECS`](2.0s)。
     #[test]
-    fn ts412_merge_only_to_reach_2s() {
-        // 1.5 + 1.5 = 3.0（≥2 封口，第三段 1.0 另起）；第四段 1.0 再拼到 2.0。
+    fn ts412_merge_only_to_reach_judge_secs() {
+        // 0.8 + 0.5 = 1.3（<1.5 继续拼）；再拼 0.5 ⇒ 1.8（≥1.5 封口）；第四段 0.5（间隔 0.8 不近邻）另起。
         let units = merge_speech_units(&[
-            (0, secs(1.5)),
-            (secs(1.7), secs(3.2)),
-            (secs(3.4), secs(4.4)),
-            (secs(4.6), secs(5.6)),
+            (0, secs(0.8)),
+            (secs(1.0), secs(1.5)),
+            (secs(1.7), secs(2.2)),
+            (secs(3.0), secs(3.5)),
         ]);
-        assert_eq!(units.len(), 2, "凑够 2s 后应封口、第三段另起");
-        assert_eq!(units[0].members.len(), 2);
-        assert!((units[0].speech_samples as f32 / SAMPLE_RATE as f32 - 3.0).abs() < 1e-3);
-        assert_eq!(units[1].members.len(), 2, "第三/四段拼成第二个单元");
-        assert!((units[1].speech_samples as f32 / SAMPLE_RATE as f32 - 2.0).abs() < 1e-3);
+        assert_eq!(units.len(), 2, "凑够 1.5s 后应封口、第四段另起");
+        assert_eq!(units[0].members.len(), 3, "前三段拼到 1.8s");
+        assert!((units[0].speech_samples as f32 / SAMPLE_RATE as f32 - 1.8).abs() < 1e-3);
+        assert_eq!(units[1].members.len(), 1, "第四段独立（间隔 0.8 不近邻）");
+        assert!((units[1].speech_samples as f32 / SAMPLE_RATE as f32 - 0.5).abs() < 1e-3);
+    }
+
+    /// 契约 2b（432 边界）：单段恰为 [`MIN_JUDGE_SECS`](1.5s) 时本身**已可判**，不再被并入前一单元（规则④）。
+    #[test]
+    fn ts412_merge_exact_judge_secs_segment_independent() {
+        let units = merge_speech_units(&[(0, secs(0.8)), (secs(1.0), secs(2.5))]);
+        assert_eq!(units.len(), 2, "1.5s 单段自身可判 ⇒ 不并入前单元");
+        assert_eq!(units[0].members.len(), 1);
+        assert!((units[1].speech_samples as f32 / SAMPLE_RATE as f32 - 1.5).abs() < 1e-3);
     }
 
     /// 契约 4（R1·规则④）：**≥2s 的单段各自独立**，不与相邻短段拼接。
@@ -1862,8 +1897,9 @@ mod testsync412_merge_tests {
         assert!((kept[1].speech_samples as f32 / SAMPLE_RATE as f32 - 0.9).abs() < 1e-3);
     }
 
-    /// 契约（R1·真实数据）：窗 #4 实测区间（1.02/1.70/1.41/0.96s，间隔 0.64/0.77/0.54）
-    /// ⇒ 应拼出 **2 个均 ≥2s** 的可判单元（原 0.5s 门槛下四段全拼不上、一段都不判）。
+    /// 契约（R1·真实数据 / 432 更新）：窗 #4 实测区间（1.02/1.70/1.41/0.96s，间隔 0.64/0.77/0.54）。
+    /// 432 合并目标随判定门槛降 1.5s ⇒ 1.70s 单段**自身可判**独立，故结果 **3 个单元**
+    /// （1.02 `<1.5` KeepShort；1.70 独立可判；1.41+0.96=2.37 合并可判）；不再是 2.0s 时代的 2 单元。
     #[test]
     fn ts412_merge_window4_real_intervals() {
         let sr = SAMPLE_RATE as f32;
@@ -1878,19 +1914,24 @@ mod testsync412_merge_tests {
             at(1.02 + g1 + 1.70 + g2 + 1.41 + g3, 0.96),
         ];
         let units = merge_speech_units(&ranges);
-        assert_eq!(units.len(), 2, "窗#4 应拼成 2 个单元");
-        for u in &units {
-            let s = u.speech_samples as f32 / sr;
-            assert!(s >= MIN_JUDGE_SECS, "每个单元应 ≥2s（可判），实测 {s}");
-        }
-        assert_eq!(units[0].members.len(), 2, "1.02s+1.70s ⇒ 2.72s");
-        assert_eq!(units[1].members.len(), 2, "1.41s+0.96s ⇒ 2.37s");
+        assert_eq!(units.len(), 3, "窗#4 应拼成 3 个单元（432·1.5s 门槛）");
+        // 1.02 独立（<1.5 ⇒ 后续 KeepShort）；1.70 独立（自身可判）；1.41+0.96 合并可判。
+        assert_eq!(units[0].members.len(), 1, "1.02s 独立（<1.5s）");
+        assert_eq!(units[1].members.len(), 1, "1.70s 自身 ≥1.5s ⇒ 独立");
+        assert_eq!(units[2].members.len(), 2, "1.41s+0.96s ⇒ 2.37s");
         let s0 = units[0].speech_samples as f32 / sr;
         let s1 = units[1].speech_samples as f32 / sr;
+        let s2 = units[2].speech_samples as f32 / sr;
         assert!(
-            (s0 - 2.72).abs() < 2e-2 && (s1 - 2.37).abs() < 2e-2,
-            "实测 {s0}/{s1}"
+            (s0 - 1.02).abs() < 2e-2 && (s1 - 1.70).abs() < 2e-2 && (s2 - 2.37).abs() < 2e-2,
+            "实测 {s0}/{s1}/{s2}"
         );
+        // 可判单元（≥ 判定门槛）恰 2 个：1.70 与 2.37。
+        let judgeable = units
+            .iter()
+            .filter(|u| u.speech_samples as f32 / sr >= MIN_JUDGE_SECS)
+            .count();
+        assert_eq!(judgeable, 2, "恰 2 个可判单元");
     }
 
     /// 契约 1：`speech_samples` 只数语音（相邻两段 1.2s+1.1s、间隔 0.3s ⇒ 2.3s 而非 2.6s）。
@@ -2108,8 +2149,9 @@ mod testsync412_merge_tests {
 #[cfg(test)]
 mod testsync412_guard_tests {
     use super::{
-        judge_voiceprint, merge_speech_units, partition_ranges, unit_offer_allowed, SegVerdict,
-        SpeechUnit, Voiceprint, MERGE_GAP_SECS, MIN_JUDGE_SECS, SAMPLE_RATE,
+        judge_voiceprint, merge_speech_units, partition_ranges, unit_offer_allowed,
+        unit_offer_eligible, SegVerdict, SpeechUnit, Voiceprint, MERGE_GAP_SECS, MIN_JUDGE_SECS,
+        MIN_OFFER_SECS, SAMPLE_RATE,
     };
 
     fn secs(x: f32) -> usize {
@@ -2278,10 +2320,11 @@ mod testsync412_guard_tests {
         assert!(!unit_offer_allowed(&empty, 1));
     }
 
-    /// 契约6（注册）：只有 **≥2s 且起点 ≥ `new_slice_from`** 的单元 offer；跨 `new_slice_from`（起点在前文）
-    /// 的单元不 offer。`unit_offer_allowed` 只管起点；≥2s 门在调用处 —— 一并以源码护栏锁死。
+    /// 契约6（注册 / 432）：只有 **≥ [`MIN_OFFER_SECS`]（2.0s）且起点 ≥ `new_slice_from`** 的单元 offer；
+    /// 1.5~2.0s（可判但嵌入差）**不 offer**；跨 `new_slice_from`（起点在前文）的单元不 offer。
+    /// `unit_offer_allowed` 只管起点；时长门由 [`unit_offer_eligible`] 承担 —— 一并以源码护栏锁死。
     #[test]
-    fn ts412b_offer_requires_ge_2s_and_in_window() {
+    fn ts412b_offer_requires_offer_secs_and_in_window() {
         let u = SpeechUnit {
             members: vec![(secs(1.0), secs(3.2))],
             speech_samples: secs(2.2),
@@ -2298,18 +2341,31 @@ mod testsync412_guard_tests {
         };
         assert!(!unit_offer_allowed(&cross, secs(1.0)), "跨界单元不 offer");
         assert!(unit_offer_allowed(&cross, secs(0.5)), "起点在窗内 ⇒ offer");
-        // 源码护栏：offer 同时要求 `unit_secs >= MIN_JUDGE_SECS`（≥2s）与起点在窗内。
+        // 432：注册门 = MIN_OFFER_SECS(2.0s)，**独立**于判定门 MIN_JUDGE_SECS(1.5s)。
+        assert!(
+            !unit_offer_eligible(MIN_JUDGE_SECS, &u, secs(1.0)),
+            "1.5s（可判）仍**不注册**"
+        );
+        assert!(
+            !unit_offer_eligible(MIN_OFFER_SECS - 0.001, &u, secs(1.0)),
+            "略低于 2.0s ⇒ 不 offer"
+        );
+        assert!(
+            unit_offer_eligible(MIN_OFFER_SECS, &u, secs(1.0)),
+            "恰 2.0s 且起点在窗内 ⇒ offer"
+        );
+        // 源码护栏：调用处用 `unit_offer_eligible`（内置 2.0s 门 + 起点门）。
         let src = include_str!("speaker.rs");
         assert!(
-            src.contains("unit_secs >= MIN_JUDGE_SECS && unit_offer_allowed(unit, new_slice_from)"),
-            "offer 必须同时满足「≥2s」与「起点 ≥ new_slice_from」"
+            src.contains("if unit_offer_eligible(unit_secs, unit, new_slice_from) {"),
+            "offer 调用处必须用 unit_offer_eligible（≥ MIN_OFFER_SECS 与起点门）"
         );
     }
 
-    /// 契约3（窗 #4 真实区间）：1.02/1.70/1.41/0.96s，间隔 0.64/0.77/0.54 ⇒ **恰 2 个单元且均 ≥2s**
-    ///（非仅「不 panic」）。
+    /// 契约3（窗 #4 真实区间 / 432 更新）：1.02/1.70/1.41/0.96s，间隔 0.64/0.77/0.54。
+    /// 432 判定/合并门槛 1.5s ⇒ **恰 3 个单元**（1.02 / 1.70 / 2.37），其中 2 个（1.70、2.37）可判。
     #[test]
-    fn ts412b_window4_exact_two_units_both_ge_2s() {
+    fn ts412b_window4_exact_three_units_two_judgeable() {
         let g1 = 0.64f32;
         let g2 = 0.77f32;
         let g3 = 0.54f32;
@@ -2321,13 +2377,15 @@ mod testsync412_guard_tests {
             at(1.02 + g1 + 1.70 + g2 + 1.41 + g3, 0.96),
         ];
         let units = merge_speech_units(&ranges);
-        assert_eq!(units.len(), 2, "窗#4 应恰 2 个单元");
-        assert_eq!(units[0].members.len(), 2, "1.02+1.70 ⇒ 2.72s");
-        assert_eq!(units[1].members.len(), 2, "1.41+0.96 ⇒ 2.37s");
-        for u in &units {
-            let s = u.speech_samples as f32 / SAMPLE_RATE as f32;
-            assert!(s >= MIN_JUDGE_SECS, "每个单元须 ≥2s（可判），实测 {s}");
-        }
+        assert_eq!(units.len(), 3, "窗#4 应恰 3 个单元（432·1.5s 门槛）");
+        assert_eq!(units[0].members.len(), 1, "1.02s 独立");
+        assert_eq!(units[1].members.len(), 1, "1.70s 独立");
+        assert_eq!(units[2].members.len(), 2, "1.41+0.96 ⇒ 2.37s");
+        let judgeable = units
+            .iter()
+            .filter(|u| u.speech_samples as f32 / SAMPLE_RATE as f32 >= MIN_JUDGE_SECS)
+            .count();
+        assert_eq!(judgeable, 2, "1.70 与 2.37 两个单元可判（≥1.5s）");
     }
 
     /// 契约2（前向累积阶段）：≥2s 单段**不被**后续**非近邻**（间隔 ≥0.8s）段拼接；单独 ≥2s 段自成
@@ -2679,5 +2737,120 @@ mod diag432r1_locate_tests {
             }
             t += 0.2;
         }
+    }
+}
+
+/// VOICEPRINT-JUDGE-1P5S-432：判定门槛 2.0→1.5s，注册/漂移 offer 保持 2.0s（拆两常数）。
+#[cfg(test)]
+mod fix432_tests {
+    use super::{
+        judge, judge_voiceprint, unit_offer_eligible, LangProfile, SegVerdict, SpeechUnit,
+        Voiceprint, DROP_THR, ENROLL_MIN_SECS, ENROLL_MIN_SEGS, MIN_JUDGE_SECS, MIN_OFFER_SECS,
+        SAMPLE_RATE,
+    };
+
+    fn secs(x: f32) -> usize {
+        (x * SAMPLE_RATE as f32) as usize
+    }
+    fn at_cos(c: f32) -> Vec<f32> {
+        vec![c, (1.0 - c * c).max(0.0).sqrt()]
+    }
+    fn ready_zh() -> Voiceprint {
+        let mut vp = Voiceprint::default();
+        vp.profiles.insert(
+            "zh".to_string(),
+            LangProfile {
+                centroid: vec![1.0, 0.0],
+                total_secs: ENROLL_MIN_SECS,
+                segments: ENROLL_MIN_SEGS,
+                candidates: Vec::new(),
+            },
+        );
+        vp
+    }
+
+    /// 常数契约：判定 1.5s / 注册 offer 2.0s / DROP_THR 不动。
+    #[test]
+    fn fix432_constants_split() {
+        assert_eq!(MIN_JUDGE_SECS, 1.5, "432：判定门槛降 1.5s");
+        assert_eq!(MIN_OFFER_SECS, 2.0, "432：注册 offer 门槛保持 2.0s");
+        assert_eq!(DROP_THR, 0.45, "DROP_THR 不动");
+        assert!(MIN_OFFER_SECS > MIN_JUDGE_SECS, "注册门须严于判定门");
+        let src = include_str!("speaker.rs");
+        assert!(
+            src.contains("pub(crate) const MIN_JUDGE_SECS: f32 = 1.5;"),
+            "MIN_JUDGE_SECS 定义应为 1.5"
+        );
+        assert!(
+            src.contains("pub(crate) const MIN_OFFER_SECS: f32 = 2.0;"),
+            "MIN_OFFER_SECS 定义应为 2.0"
+        );
+    }
+
+    /// 验收①：1.49s ⇒ KeepShort（低于判定门槛一律保留）。
+    #[test]
+    fn fix432_1p49s_is_keep_short() {
+        assert_eq!(
+            judge(&ready_zh(), Some(&at_cos(0.1)), 1.49, Some("zh")),
+            SegVerdict::KeepShort
+        );
+    }
+
+    /// 验收②：1.5s 且最高分 <0.45 ⇒ DropNonUser（判定下限生效）。
+    #[test]
+    fn fix432_1p5s_low_score_drops() {
+        match judge(&ready_zh(), Some(&at_cos(0.3)), 1.5, Some("zh")) {
+            SegVerdict::DropNonUser(s) => assert!(s < DROP_THR),
+            other => panic!("1.5s 低分应 DropNonUser，实测 {other:?}"),
+        }
+        assert!(matches!(
+            judge_voiceprint(&ready_zh(), Some(&at_cos(0.3)), 1.5),
+            SegVerdict::DropNonUser(_)
+        ));
+    }
+
+    /// 1.5s 且高分 ⇒ KeepUser（降门不误删本人）。
+    #[test]
+    fn fix432_1p5s_high_score_keeps() {
+        match judge(&ready_zh(), Some(&at_cos(0.9)), 1.5, Some("zh")) {
+            SegVerdict::KeepUser(s) => assert!(s >= DROP_THR),
+            other => panic!("1.5s 高分应 KeepUser，实测 {other:?}"),
+        }
+    }
+
+    /// 验收③：1.5~2.0s 单元**可判但不 offer 注册**；≥2.0s offer 不变。
+    #[test]
+    fn fix432_offer_gate_1p5_to_2s_excluded() {
+        let unit = SpeechUnit {
+            members: vec![(0, secs(2.0))],
+            speech_samples: secs(2.0),
+        };
+        assert!(
+            !unit_offer_eligible(MIN_JUDGE_SECS, &unit, 0),
+            "1.5s（可判）不注册"
+        );
+        assert!(!unit_offer_eligible(1.99, &unit, 0), "1.99s 仍不注册");
+        assert!(
+            unit_offer_eligible(MIN_OFFER_SECS, &unit, 0),
+            "恰 2.0s 恢复正常 offer"
+        );
+        assert!(unit_offer_eligible(2.5, &unit, 0), "≥2.0s offer 不变");
+    }
+
+    /// 验收④：412 合并目标随判定门槛 ⇒ 凑够 1.5s 即封口（下一段另起）。
+    #[test]
+    fn fix432_merge_seals_at_1p5s() {
+        let units = super::merge_speech_units(&[
+            (0, secs(0.8)),
+            (secs(1.0), secs(1.5)),
+            (secs(1.7), secs(2.2)),
+            (secs(3.0), secs(3.5)),
+        ]);
+        let s0 = units[0].speech_samples as f32 / SAMPLE_RATE as f32;
+        assert!(
+            s0 >= MIN_JUDGE_SECS && units[0].members.len() == 3,
+            "前三段拼至 1.8s 封口"
+        );
+        assert_eq!(units.len(), 2, "封口后第四段另起");
     }
 }
