@@ -9,6 +9,18 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-1 — SEAM-KEEP-PREV-TEXT-431 · R1 ✅ 交付（主控裁决 B，只改 mod.rs）
+
+- **R1**：接续点改**半全局编辑距离对齐** `semiglobal_continuation`（前一窗重叠区有效字完整对齐、后一窗开头 k+4 末端自由，回溯取前一窗最后一个**有对应**的字之后；平局取较大 j 偏替换）；`splice_keep_prev_overlap` 用该接续点。修首轮 `k` 直接换算在插入/删除时的边界 1 字重复。
+- **五例全绿**：插入「不」（无「因为为」）、插入「去」（无「基础础」）、替换世/时（保「某一世」）、纯标点替换、删除 1 字（`abcde`+`abce后续`→`abcde后续`）；`fix431_*` 5/5。
+- **验证**：fmt EXIT0 / check 0 error、warnings 91/87=基线 / 全量 test 0 failed（bin 1830P/0F/62I）。平台中立，MACOS-HANDOFF 已记。未 commit / 未 build / 版本未动 / 零凭证。
+
+## 2026-09-25 — coder-1 — SEAM-KEEP-PREV-TEXT-431 ⚠️ 首轮实现（已被 R1 取代）
+
+- **实现**：`push_inner` 对齐成功时 `last_window_text = splice_keep_prev_overlap(prev[cut..], new, k)`（strip 前一窗末句末标点 + 后一窗从 k 之后接；整窗重叠 ⇒ 保留前一窗原文）；新增纯函数 `byte_after_k_effective` / `strip_trailing_sentence_punct` / `splice_keep_prev_overlap`；concat/零重叠/首窗不变；`[DBG-416]` 追加 `keep_prev/new_head_dropped`。
+- 🔴 **实测缺陷**：21:12 `似乎与他们…因为**为**自愿`、21:16 `获取、以便…基础**础**` —— 误插字已删但边界 **1 字重复**（k 为后一窗有效字数，插入偏移时末/首字重合）。纯标点替换例正确。
+- **验证**：`fix431_*` 3/3；fmt EXIT0 / check 0 error、warnings 91/87=基线 / 全量 test 0 failed（bin 1828P/0F/62I）。候选修正待裁决；未 commit / 未 build / 版本未动 / 零凭证。
+
 ## 2026-09-25 — coder-1 — LOCALRT-PREVIEW-HIDE-NONUSER-429 ✅ 交付（方案 B1，只改 main.rs）
 
 - **范围**：`src/main.rs`：`PreviewReflow.non_user_hide` 字段；harvest `last_authoritative` + full_drop 回灌（`[DBG-429]`）；`render_authoritative_reflow` 增参 + hide 合成；`fix429_tests` 2 条。
@@ -53,6 +65,15 @@
 - **改动**：新增共用状态机 `next_top_token`/`brace_match`/`item_end`（串/原始串/字符与生命周期区分/行块注释可嵌套），`prod_lines_excluding_cfg_test` 与 `fn_body` **共用同一份**（禁两份）。
 - **碰巧通过报告**：`testsync377::main_has_no_cross_recording_ctx_cache` 命中测试模块**前的注释**（旧扫描器误剔使其未计入）⇒ 按其文档契约补注释过滤（不放宽代码不变量）。
 - **验证**：新增 `guard_prod_lines::tests` 3 条；fmt EXIT0 / check 0 error、warnings 91/87=基线 / 全量 test **0 failed**（bin 1802P/0F/55I）；`testsync421` 由红转绿。未 commit / 未 build / 版本未动 / 零凭证。
+
+## 2026-09-25 — coder-2 — DIAG-SHORT-VOICEPRINT-432 ✅ 交付（只读诊断；生产零改动、未碰 mod.rs/main.rs）
+
+- **问题**（Gavin）：1.60s 旁语句（<2s ⇒ `KeepShort` 不判）为何未被剔除。
+- **方法**：`speaker.rs::diag432_tests`（`#[ignore]` 只读），参考 `target/release/voiceprint.bin`；本人=Gavin 录音切 0.5~2s 窗、他人=150350 切窗；`max_score_ready` 余弦；RMS>0.01 滤静音。
+- **结果：完全分离**——本人 101 段 min **0.418**（1~2s 桶 min 0.631~0.741）、他人 15 段 max **0.249**。零误删门槛 0.418 ⇒ 删 15/15 他人；`DROP_THR=0.45` 套 1~2s ⇒ 他人 15/15 删、本人 0/75 误删。
+- **建议（不实施）**：`MIN_JUDGE_SECS` 2.0→**1.0s**、`DROP_THR` 0.45（<1s 仍不判）；更保守 1~2s 0.40 + 412 合并；🔴 先端测（他人仅一段、疑单声源）。
+- **残余**：211641 窗#2 的 1.60s 句未精确定位（估算 ~32.7s 为静音；win#2 无 `seg dispatch`）。
+- 产物 `collab/evidence/432/{report.md,raw.log}`。红线：未改生产 / 未碰 mod.rs·main.rs / 未 commit / 版本未动 / 零凭证。
 
 ## 2026-09-25 — coder-2 — TEST-SYNC-423-427-429 ✅ 交付（阶段三·非作者护栏 8 条；生产零改动）
 

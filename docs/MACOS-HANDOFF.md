@@ -2437,3 +2437,10 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | --- | --- | --- |
 | `main.rs`：`PreviewReflow` 加 `non_user_hide`；harvest 记 `last_authoritative`，`full_drop` 窗额外发回灌（`[DBG-429]`）；`render_authoritative_reflow` 增参，hide 分支用 `reflow_preview(acc, raw, committed)` | 声纹整窗全剔（421）后，该段精解完成即从浮层预览移除该段流式文字、保留其后已说流式（旧：等下次回灌/松键才消失） | ⚠️ **harvest（acc worker）平台中立**（仅发事件）；hide 的**渲染**走 `render_authoritative_reflow`（`#[cfg(target_os="windows")]`）⇒ **仅 Windows 浮层生效**；macOS 侧 `PreviewReflow` 现行处理不渲染该回灌（现状），本单未改 macOS 渲染 |
 | **macOS 侧需要做什么** | | 无需改动（若日后 macOS 需要同等「立即移除」，需在 macOS overlay 的分支补同款合成） |
+
+## SEAM-KEEP-PREV-TEXT-431（2026-09-25，coder-1）⚠️ 重叠区以前一窗为准（待裁决）—— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `transcription/mod.rs`：`OrderedReflow::push_inner` 对齐成功时 `last_window_text = splice_keep_prev_overlap(prev[cut..], new, k)`；接续点由**半全局编辑距离对齐** `semiglobal_continuation` 定（前一窗重叠区有效字完整对齐、后一窗开头 k+4 末端自由；平局取较大 j 偏替换）；`[DBG-416]` 追加 `keep_prev/new_head_dropped` | 重叠区文字改用**前一窗**（字与内部标点），只把前一窗窗末句末标点换成后一窗同一位置起的文本；插入/删除不再产生边界 1 字重复 | ✅ 平台中立纯逻辑（无 `cfg`），macOS 同继承 |
+| **macOS 侧需要做什么** | | 无需改动（平台中立自动继承） |
