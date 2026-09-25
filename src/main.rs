@@ -8963,8 +8963,17 @@ fn spawn_worker_thread(
                                                         win_samples.iter().sum::<usize>() as f32
                                                             / 16000.0;
                                                     let text_chars = text.chars().count();
-                                                    for authoritative in ordered.push_window(
+                                                    // SEAM-ARBITER-STREAMING-433：把本窗**预览（流式）原始文本**
+                                                    // 一并交给 `OrderedReflow` 作接缝裁判基准 R。
+                                                    // 🔴 取的是流式模型原始输出（`window_streaming_texts`），
+                                                    // 不含精解 / 浮层合成 / 回灌结果。
+                                                    let win_stream = window_streaming_texts
+                                                        .get(seq)
+                                                        .cloned()
+                                                        .unwrap_or_default();
+                                                    for authoritative in ordered.push_window_streaming(
                                                         seq, win_ws, win_we, win_samples, text,
+                                                        win_stream,
                                                     ) {
                                                         // 382（3A）：边界未到时的 fallback = 派发当刻浮层字符数。
                                                         let fallback_committed = window_committed_lens

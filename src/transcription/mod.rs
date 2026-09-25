@@ -2385,6 +2385,24 @@ pub(crate) const SEAM_DEDUPE_MIN_CHARS: usize = 4;
 /// 🔴 FIX-ALIGN-GATE-416：接缝重复片段必须出现在新窗前 `factor × e` 有效字内（`e` = 期望重叠字数）。
 pub(crate) const SEAM_DEDUPE_WINDOW_FACTOR: f32 = 1.5;
 
+/// 🔴 SEAM-ARBITER-STREAMING-433：forced 层起用的最少期望重叠有效字数（`e ≥ 此值`）。
+/// 短重叠（如接缝去重层）不做 forced，避免把偶合短串误判为同一段话。
+pub(crate) const FORCED_MIN_OVERLAP_CHARS: usize = 8;
+/// 🔴 433（Gavin「长度差太多时，选较长的那段」）：forced 层两边重叠区长度比的下界（`cont/e`）。
+/// `ratio ∈ [0.70, 1.43]` ⇒ 长度相当，交给**预览原文裁判**；超出 ⇒ 直接取**有效字更多**的一版。
+pub(crate) const FORCED_MIN_LEN_RATIO: f32 = 0.70;
+/// 见 [`FORCED_MIN_LEN_RATIO`]：上界（`1/0.70 ≈ 1.43`，与下界互为倒数，保持对称）。
+pub(crate) const FORCED_MAX_LEN_RATIO: f32 = 1.43;
+/// 🔴 433 安全网：forced 层重叠区编辑率上限 —— 近乎全替换（≈1.0）说明**完全对不上**
+///（不是同一段话）⇒ 不 forced，退回 concat（守「不丢字」P0）。真实接缝 4~5/12 字差 ≈0.4~0.6 仍可 forced。
+pub(crate) const FORCED_MAX_EDIT_RATIO: f32 = 0.90;
+/// 🔴 433 补充 2（Gavin「没有音频长度信息……这个也取相对较长那段」）：**无区间先验**时估重叠的最少有效字数。
+pub(crate) const ESTIMATE_MIN_OVERLAP_CHARS: usize = 4;
+/// 见 [`ESTIMATE_MIN_OVERLAP_CHARS`]：估重叠的**最大**有效字数上限（防长文本里偶合）。
+pub(crate) const ESTIMATE_MAX_OVERLAP_CHARS: usize = 40;
+/// 见 [`ESTIMATE_MIN_OVERLAP_CHARS`]：估重叠的编辑率上限（>此值视为「完全对不上」⇒ 保留 concat）。
+pub(crate) const ESTIMATE_MAX_EDIT_RATIO: f32 = LOOSE_ALIGN_MAX_EDIT_RATIO;
+
 /// FIX-ALIGN-GATE-416：对齐命中的层级（供 `[DBG-416] seam` 统计与快照翻转）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum AlignLayer {
@@ -2394,6 +2412,10 @@ pub(crate) enum AlignLayer {
     Loose,
     /// 层 3 接缝去重（精确相同片段只留一份）。
     Dedupe,
+    /// 层 3.5 硬对齐（SEAM-ARBITER-STREAMING-433）：前三层失败、但区间先验 e 与「前一窗末尾 e 字 ↔
+    /// 后一窗开头」的半全局对齐长度比在 [`FORCED_MIN_LEN_RATIO`]..=[`FORCED_MAX_LEN_RATIO`] 内
+    /// ⇒ 视为同一段话，走裁判取舍（不再 concat）。
+    Forced,
     /// 层 4 原样拼接（最后手段；宁可重复不丢字）。
     Concat,
 }
@@ -2404,6 +2426,7 @@ impl AlignLayer {
             AlignLayer::Strict => "strict",
             AlignLayer::Loose => "loose",
             AlignLayer::Dedupe => "dedupe",
+            AlignLayer::Forced => "forced",
             AlignLayer::Concat => "concat",
         }
     }
@@ -2736,7 +2759,41 @@ struct OverlapResolution {
     edit_ratio: f32,
 }
 
-/// FIX-ALIGN-GATE-416：**把拼接降为最后手段** —— 严格 → 宽松 → 接缝去重 → 拼接。
+/// 433 层 3.5：**硬对齐** —— 前三层都失败、但有区间先验（`e ≥ FORCED_MIN_OVERLAP_CHARS`）时，
+/// 把「前一窗末尾 `e` 个有效字」与「后一窗开头 `e+4` 个有效字」做半全局对齐；有对应（`cont > 0`）
+/// ⇒ 视为同一段话，返回 `(前一窗 cut 前前缀, cont_eff)`。长度比对/裁判在调用方做。
+/// 无对应（`cont == 0`）⇒ `None`（退回拼接，宁可重复不丢字）。纯函数，可单测。
+fn forced_overlap(prev: &str, new: &str, e: usize) -> Option<(String, usize)> {
+    if e < FORCED_MIN_OVERLAP_CHARS {
+        return None;
+    }
+    let prev_keep: Vec<(usize, char)> = prev
+        .char_indices()
+        .filter(|(_, c)| align_keep_char(*c))
+        .collect();
+    if prev_keep.len() < e {
+        return None;
+    }
+    let cut_idx = prev_keep.len() - e;
+    let prev_eff: Vec<char> = prev_keep[cut_idx..].iter().map(|(_, c)| *c).collect();
+    let new_eff: Vec<char> = new.chars().filter(|c| align_keep_char(*c)).collect();
+    if new_eff.is_empty() {
+        return None;
+    }
+    let n = new_eff.len().min(e + 4);
+    let (cont, best) = semiglobal_align(&prev_eff, &new_eff[..n]);
+    if cont == 0 {
+        return None;
+    }
+    // 安全网：半全局**最优编辑距离** ≈e（几乎全替换）⇒ 完全对不上，不是同一段话 ⇒ 退回 concat。
+    // （用半全局 best 而非定长窗口编辑距离：真接缝常是**错位**重合，定长窗口会误判为全错。）
+    if best as f32 / e as f32 > FORCED_MAX_EDIT_RATIO {
+        return None;
+    }
+    Some((prev[..prev_keep[cut_idx].0].to_string(), cont))
+}
+
+/// FIX-ALIGN-GATE-416：**把拼接降为最后手段** —— 严格 → 宽松 → 接缝去重 → 硬对齐 → 拼接。
 fn resolve_overlap(prev: &str, new: &str, prior: AlignPrior) -> OverlapResolution {
     let expected_k = prior
         .expected_ratio
@@ -2763,6 +2820,18 @@ fn resolve_overlap(prev: &str, new: &str, prior: AlignPrior) -> OverlapResolutio
             expected_k,
             edit_ratio: f32::NAN,
         };
+    }
+    // 层 3.5 硬对齐（433）：前三层失败、但有区间先验且半全局对齐有对应 ⇒ 视为同一段话。
+    if let Some(e) = expected_k {
+        if let Some((prefix, _cont)) = forced_overlap(prev, new, e) {
+            return OverlapResolution {
+                committed_prefix: Some(prefix),
+                layer: AlignLayer::Forced,
+                k: e,
+                expected_k: Some(e),
+                edit_ratio: f32::NAN,
+            };
+        }
     }
     OverlapResolution {
         committed_prefix: None,
@@ -2812,11 +2881,11 @@ fn byte_after_effective_index(new: &str, eff_idx: usize) -> usize {
 ///
 /// 🔴 不能用 `k` 直接换算：插入/删除会让两侧重叠长度不等（R1 起因：21:12 插入「不」、21:16 插入
 /// 「去」时，`prev` 末字与 `new` 第 k 字不是同一内容位置 ⇒ 边界 1 字重复）。纯函数，可单测。
-fn semiglobal_continuation(prev_eff: &[char], new_eff: &[char]) -> usize {
+fn semiglobal_align(prev_eff: &[char], new_eff: &[char]) -> (usize, usize) {
     let m = prev_eff.len();
     let n = new_eff.len();
     if m == 0 {
-        return 0;
+        return (0, 0);
     }
     // dp[i][j] = prev[..i] 对齐 new[..j] 的最小编辑距离。
     let mut dp = vec![vec![0usize; n + 1]; m + 1];
@@ -2873,7 +2942,13 @@ fn semiglobal_continuation(prev_eff: &[char], new_eff: &[char]) -> usize {
             i -= 1; // prev[i-1] 被删除
         }
     }
-    last_aligned_plus1
+    // 返回 `(接续点, 半全局最优编辑距离 best)`；`best` 供 forced 层安全网判「完全对不上」。
+    (last_aligned_plus1, best)
+}
+
+/// 见 [`semiglobal_align`]：仅取接续点（431 splice / B 候选切点用）。
+fn semiglobal_continuation(prev_eff: &[char], new_eff: &[char]) -> usize {
+    semiglobal_align(prev_eff, new_eff).0
 }
 
 /// SEAM-KEEP-PREV-TEXT-431：去掉末尾的**窗末句末标点**（`。！？…` 与 ASCII `.` `!` `?`）及其后空白。纯函数。
@@ -2889,6 +2964,198 @@ fn strip_trailing_sentence_punct(s: &str) -> &str {
     &s[..end]
 }
 
+/// SEAM-ARBITER-STREAMING-433：半全局对齐求「后一窗重叠区结束」的有效字下标（= 接续点）。
+///
+/// 取后一窗开头 `k+4` 个有效字做半全局对齐（插入/删除至多 ±4）；返回 [`semiglobal_continuation`]
+/// 结果（后一窗有效字下标）。`prev_overlap` 无有效字 ⇒ 0。纯函数。
+fn new_overlap_cont_eff(prev_overlap: &str, new: &str, k: usize) -> usize {
+    let prev_eff: Vec<char> = prev_overlap
+        .chars()
+        .filter(|c| align_keep_char(*c))
+        .collect();
+    if prev_eff.is_empty() {
+        return 0;
+    }
+    let new_eff_all: Vec<char> = new.chars().filter(|c| align_keep_char(*c)).collect();
+    let n = new_eff_all.len().min(k + 4);
+    semiglobal_continuation(&prev_eff, &new_eff_all[..n])
+}
+
+/// 见 [`new_overlap_cont_eff`]：接续点在 `new` 中的**字节位置**（重叠区结束；0 = 无对应）。纯函数。
+fn new_overlap_end_byte(prev_overlap: &str, new: &str, k: usize) -> usize {
+    let c = new_overlap_cont_eff(prev_overlap, new, k);
+    if c == 0 {
+        0
+    } else {
+        byte_after_effective_index(new, c - 1)
+    }
+}
+
+/// 去标点/空白后的有效字（433 裁判口径，复用 [`align_keep_char`]）。纯函数。
+fn effective_chars(s: &str) -> Vec<char> {
+    s.chars().filter(|c| align_keep_char(*c)).collect()
+}
+
+/// 433 相似度：`LCS(有效字) / max(两侧有效字数)` ∈ [0,1]；任一侧为空 ⇒ 0。
+/// LCS 复用 [`lcs_subseq_len`]（子序列，允许局部改写/标点差）。纯函数。
+fn lcs_sim(a: &str, b: &str) -> f32 {
+    let av = effective_chars(a);
+    let bv = effective_chars(b);
+    let denom = av.len().max(bv.len());
+    if denom == 0 {
+        return 0.0;
+    }
+    lcs_subseq_len(&av, &bv) as f32 / denom as f32
+}
+
+/// 433 裁判结论。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ArbChoice {
+    /// 前一窗重叠区更像预览原文（A）⇒ 431 splice。
+    Prev,
+    /// 后一窗重叠区更像预览原文（B）⇒ 前一窗 cut 前 + 后一窗原文。
+    New,
+    /// 两版相似度打平 ⇒ 维持 431（取 A）。
+    Tie,
+    /// 无预览原文 R（空）⇒ 维持 431（取 A）。
+    None,
+}
+
+impl ArbChoice {
+    /// `[DBG-416] seam` 的 `arb=` 值。
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ArbChoice::Prev => "A",
+            ArbChoice::New => "B",
+            ArbChoice::Tie => "tie",
+            ArbChoice::None => "none",
+        }
+    }
+}
+
+/// 433：**预览原文裁判** —— 比较重叠区两版 `a`（前一窗）/ `b`（后一窗）与预览原始文本 `r`
+/// 的相似度（[`lcs_sim`]），更像者胜；平局 / `r` 空 ⇒ 取 `a`（维持 431）。
+/// 返回 `(结论, sim_a, sim_b)`。纯函数，可单测。
+fn arbitrate_sim(a: &str, b: &str, r: &str) -> (ArbChoice, f32, f32) {
+    if effective_chars(r).is_empty() {
+        return (ArbChoice::None, 0.0, 0.0);
+    }
+    let sa = lcs_sim(a, r);
+    let sb = lcs_sim(b, r);
+    let choice = if (sa - sb).abs() < 1e-6 {
+        ArbChoice::Tie
+    } else if sa > sb {
+        ArbChoice::Prev
+    } else {
+        ArbChoice::New
+    };
+    (choice, sa, sb)
+}
+
+/// 433（Gavin「长度差太多时，选较长的那段」）：forced 层长度比 `cont/e` 超出
+/// [[`FORCED_MIN_LEN_RATIO`], [`FORCED_MAX_LEN_RATIO`]] 时按**有效字更多**的一版定夺；
+/// 长度相当（比值在带内）⇒ `None`（改由预览原文裁判）。纯函数，可单测。
+fn forced_length_choice(cont_eff: usize, e: usize) -> Option<ArbChoice> {
+    if e == 0 {
+        return None;
+    }
+    let ratio = cont_eff as f32 / e as f32;
+    if ratio > FORCED_MAX_LEN_RATIO {
+        Some(ArbChoice::New)
+    } else if ratio < FORCED_MIN_LEN_RATIO {
+        Some(ArbChoice::Prev)
+    } else {
+        None
+    }
+}
+
+/// 433 裁判模式（决定长度比超界时是否改用「较长版」）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArbMode {
+    /// 常规层：只用预览原文裁判。
+    Preview,
+    /// forced 层：长度比超 [0.70,1.43] ⇒ 取较长版（`longer_*`）。
+    Forced,
+    /// 估算层（无先验）：两版不等长即取较长版（`est_longer_*`）；等长用预览裁判。
+    Estimate,
+}
+
+/// 433：出裁判结论 + `arb=` 标签前缀 + 相似度 + `R` 截断。纯函数。
+fn arbitrate_or_longer(
+    prev_overlap: &str,
+    b_cand: &str,
+    r: &str,
+    k: usize,
+    cont: usize,
+    mode: ArbMode,
+) -> (ArbChoice, &'static str, f32, f32, String) {
+    let (mut choice, sa, sb) = arbitrate_sim(prev_overlap, b_cand, r);
+    let mut extra = "";
+    match mode {
+        ArbMode::Forced => {
+            if let Some(c) = forced_length_choice(cont, k) {
+                choice = c;
+                extra = "longer_";
+            }
+        }
+        ArbMode::Estimate => {
+            if cont != k {
+                choice = if cont > k {
+                    ArbChoice::New
+                } else {
+                    ArbChoice::Prev
+                };
+                extra = "est_longer_";
+            }
+        }
+        ArbMode::Preview => {}
+    }
+    (choice, extra, sa, sb, r.chars().take(30).collect())
+}
+
+/// 433 补充 2：**无区间先验**时估重叠 —— 在「前一窗末尾 `k` 字 ↔ 后一窗开头 `k` 字」里找
+/// **编辑率最低**的 `k`（`4 ≤ k ≤ min(两窗有效字, 40)`；打平取较大 `k`），编辑率 >
+/// [`ESTIMATE_MAX_EDIT_RATIO`] 视为「完全对不上」⇒ `None`。返回 `(前一窗 cut 前前缀, k, cont)`。
+/// 纯函数，可单测。
+fn estimate_overlap(prev: &str, new: &str) -> Option<(String, usize, usize)> {
+    let prev_keep: Vec<(usize, char)> = prev
+        .char_indices()
+        .filter(|(_, c)| align_keep_char(*c))
+        .collect();
+    let new_eff: Vec<char> = new.chars().filter(|c| align_keep_char(*c)).collect();
+    let cap = prev_keep
+        .len()
+        .min(new_eff.len())
+        .min(ESTIMATE_MAX_OVERLAP_CHARS);
+    if cap < ESTIMATE_MIN_OVERLAP_CHARS {
+        return None;
+    }
+    let mut best: Option<(f32, usize)> = None;
+    // 降序遍历 + 仅「严格更小」替换 ⇒ 打平保留**较大** k（覆盖更多、少重复）。
+    for k in (ESTIMATE_MIN_OVERLAP_CHARS..=cap).rev() {
+        let p_tail: Vec<char> = prev_keep[prev_keep.len() - k..]
+            .iter()
+            .map(|(_, c)| *c)
+            .collect();
+        let ratio = edit_distance_chars(&p_tail, &new_eff[..k]) as f32 / k as f32;
+        if best.map(|(br, _)| ratio < br).unwrap_or(true) {
+            best = Some((ratio, k));
+        }
+    }
+    let (ratio, k) = best?;
+    if ratio > ESTIMATE_MAX_EDIT_RATIO {
+        return None;
+    }
+    let cut_idx = prev_keep.len() - k;
+    let prev_eff: Vec<char> = prev_keep[cut_idx..].iter().map(|(_, c)| *c).collect();
+    let n = new_eff.len().min(k + 4);
+    let cont = semiglobal_continuation(&prev_eff, &new_eff[..n]);
+    if cont == 0 {
+        return None;
+    }
+    Some((prev[..prev_keep[cut_idx].0].to_string(), k, cont))
+}
+
 /// SEAM-KEEP-PREV-TEXT-431（Gavin 2026-09-25「重叠区文字以前一窗为准，只采纳后一窗对边界标点的修正」）：
 /// 拼接「重叠区」文本 —— **字与内部标点全用前一窗**（`prev_overlap`），只把前一窗**窗末句末标点**
 /// 换成后一窗在重叠结束位置起的文本（含该位置的标点）。
@@ -2901,19 +3168,7 @@ fn splice_keep_prev_overlap(prev_overlap: &str, new: &str, k: usize) -> String {
     if k == 0 {
         return new.to_string();
     }
-    let prev_eff: Vec<char> = prev_overlap
-        .chars()
-        .filter(|c| align_keep_char(*c))
-        .collect();
-    let new_eff_all: Vec<char> = new.chars().filter(|c| align_keep_char(*c)).collect();
-    // 只取后一窗开头 `k+4` 个有效字做半全局对齐（插入/删除至多 ±4）。
-    let n = new_eff_all.len().min(k + 4);
-    let cont_eff = semiglobal_continuation(&prev_eff, &new_eff_all[..n]);
-    let pos = if cont_eff == 0 {
-        0
-    } else {
-        byte_after_effective_index(new, cont_eff - 1)
-    };
+    let pos = new_overlap_end_byte(prev_overlap, new, k);
     if pos >= new.len() {
         // 后一窗整窗都是重叠（对应字即末字）⇒ 保留前一窗重叠区原文（含其窗末标点）。
         return prev_overlap.to_string();
@@ -2922,6 +3177,15 @@ fn splice_keep_prev_overlap(prev_overlap: &str, new: &str, k: usize) -> String {
     out.push_str(strip_trailing_sentence_punct(prev_overlap));
     out.push_str(&new[pos..]);
     out
+}
+
+/// 433：按裁判结论拼接重叠区 —— `New` ⇒ 后一窗整窗原文（前一窗 cut 前已入 `committed`）；
+/// 其余（`Prev`/`Tie`/`None`）⇒ [`splice_keep_prev_overlap`]（431）。**唯一**调 splice 的入口。
+fn splice_overlap_by_choice(prev_overlap: &str, new: &str, k: usize, choice: ArbChoice) -> String {
+    match choice {
+        ArbChoice::New => new.to_string(),
+        _ => splice_keep_prev_overlap(prev_overlap, new, k),
+    }
 }
 
 /// SLIDING-WINDOW-367（阶段四·B）/ TUNE-DECODE-SERIAL-AND-TOKEN-CAP-390：窗口解码**并发度**。
@@ -2985,14 +3249,36 @@ fn expected_overlap_ratio(
 /// 「最长重叠优先」把切点钉在最左 ⇒ 丢字（详见 [`align_overlap_with_prior`]）。
 ///
 /// 不变量：**任何非空窗的文本都不会被丢弃**（要么与旧窗去重后定稿，要么整体并入 `committed`）。
+/// SEAM-ARBITER-STREAMING-433：重叠区对应的**预览原始文本** `R` —— 用前一窗流式按
+/// 「共享片样本数 / 前窗总样本数」占比取**末尾字符**（与 `main.rs::tail_streaming_baseline`
+/// 同口径）。🔴 `prev_stream` 必须是**流式模型原始输出**（不含精解前缀 / 浮层合成 / 回灌结果）。
+/// 纯函数，可单测。
+fn streaming_overlap_region(
+    prev_stream: &str,
+    prev_samples: usize,
+    shared_samples: usize,
+) -> String {
+    if prev_stream.is_empty() || prev_samples == 0 {
+        return String::new();
+    }
+    let prev_chars = prev_stream.chars().count();
+    let ratio = (shared_samples as f32 / prev_samples as f32).clamp(0.0, 1.0);
+    let n = (((prev_chars as f32) * ratio).round() as usize).min(prev_chars);
+    prev_stream.chars().skip(prev_chars - n).collect()
+}
+
 pub(crate) struct OrderedReflow {
     next: usize,
-    /// `seq -> (start_slice, end_slice, 各片样本数, text)`；`end_slice` 为开区间端点。
-    pending: std::collections::BTreeMap<usize, (usize, usize, Vec<usize>, String)>,
+    /// `seq -> (start_slice, end_slice, 各片样本数, text, 流式原文)`；`end_slice` 为开区间端点。
+    pending: std::collections::BTreeMap<usize, (usize, usize, Vec<usize>, String, String)>,
     committed: String,
     last_window_text: String,
-    /// 与 `last_window_text` 对应的切片区间 `[start, end)`；`None` = 尚无有效前窗。
+    /// 与 `last_window_text` / `last_stream` 对应的切片区间 `[start, end)`；`None` = 尚无有效前窗。
     last_span: Option<(usize, usize)>,
+    /// 433：与 `last_window_text` 对应的**预览（流式）原始文本**（裁判基准 `R` 的来源，禁含精解/合成）。
+    last_stream: String,
+    /// 433：`last_stream` 对应窗的总样本数（算 `R` 的占比分母）。
+    last_stream_samples: usize,
 }
 
 impl OrderedReflow {
@@ -3003,6 +3289,8 @@ impl OrderedReflow {
             committed: String::new(),
             last_window_text: String::new(),
             last_span: None,
+            last_stream: String::new(),
+            last_stream_samples: 0,
         }
     }
 
@@ -3020,7 +3308,7 @@ impl OrderedReflow {
         end_slice: usize,
         text: String,
     ) -> Vec<String> {
-        self.push_inner(seq, start_slice, end_slice, Vec::new(), text)
+        self.push_inner(seq, start_slice, end_slice, Vec::new(), text, String::new())
     }
 
     /// FIX-PREFIX-AND-EAT-371（B）：带上「本窗各片样本数」的入口。
@@ -3028,6 +3316,8 @@ impl OrderedReflow {
     /// `slice_samples[i]` = 本窗第 `i` 片（全局切片号 `start_slice + i`）的样本数；
     /// 与切片区间一起算出期望重叠比例（[`expected_overlap_ratio`]），交给
     /// [`align_overlap_with_prior`] 把 `k` 锁在期望值附近（层 ① 硬约束 + 层 ② 软范围）。
+    /// 生产走 [`OrderedReflow::push_window_streaming`]（多带流式原文）；本入口供单测/无流式场景。
+    #[allow(dead_code)]
     pub(crate) fn push_window(
         &mut self,
         seq: usize,
@@ -3036,7 +3326,28 @@ impl OrderedReflow {
         slice_samples: Vec<usize>,
         text: String,
     ) -> Vec<String> {
-        self.push_inner(seq, start_slice, end_slice, slice_samples, text)
+        self.push_inner(
+            seq,
+            start_slice,
+            end_slice,
+            slice_samples,
+            text,
+            String::new(),
+        )
+    }
+
+    /// 433：同 [`OrderedReflow::push_window`]，额外带本窗**预览（流式）原始文本**（裁判基准 `R`）。
+    /// 🔴 `stream` 必须是流式模型原始输出，不得混入精解 / 浮层合成 / 回灌结果。
+    pub(crate) fn push_window_streaming(
+        &mut self,
+        seq: usize,
+        start_slice: usize,
+        end_slice: usize,
+        slice_samples: Vec<usize>,
+        text: String,
+        stream: String,
+    ) -> Vec<String> {
+        self.push_inner(seq, start_slice, end_slice, slice_samples, text, stream)
     }
 
     /// 合并规则见 [`OrderedReflow`] 文档；`next` 始终 `+=1`（否则后续 seq 卡死）。
@@ -3047,15 +3358,29 @@ impl OrderedReflow {
         end_slice: usize,
         slice_samples: Vec<usize>,
         text: String,
+        stream: String,
     ) -> Vec<String> {
         self.pending
-            .insert(seq, (start_slice, end_slice, slice_samples, text));
+            .insert(seq, (start_slice, end_slice, slice_samples, text, stream));
         let mut out = Vec::new();
-        while let Some((ws, we, samples, text)) = self.pending.remove(&self.next) {
+        while let Some((ws, we, samples, text, stream)) = self.pending.remove(&self.next) {
             // 空解码结果：不动文本状态（避免空串污染 last_window_text / 制造假重叠），仅推进 next。
             if text.is_empty() {
                 self.next += 1;
                 continue;
+            }
+            let stream_total: usize = samples.iter().sum();
+            // 433：每窗一行完整日志（acc / stream 均不截断），供以后**忠实回放**接缝判决。
+            if log::log_enabled!(log::Level::Debug) {
+                log::debug!(
+                    "[DBG-433] win: seq={} span=[{}, {}) samples={:?} acc=\"{}\" stream=\"{}\"",
+                    seq,
+                    ws,
+                    we,
+                    samples,
+                    text,
+                    stream
+                );
             }
             match self.last_span {
                 None => {
@@ -3077,37 +3402,135 @@ impl OrderedReflow {
                             //    —— VAD 片都有话音 ⇒ 那些片文本必须落在 committed_prefix 里。
                             prev_extra_slices: ws.saturating_sub(prev_start),
                         };
-                        // 🔴 FIX-ALIGN-GATE-416：严格 → 宽松 → 接缝去重 → 拼接（把拼接降为最后手段）。
+                        // 🔴 FIX-ALIGN-GATE-416：严格 → 宽松 → 接缝去重 → 硬对齐 → 拼接。
                         let res = resolve_overlap(&self.last_window_text, &text, prior);
-                        // SEAM-KEEP-PREV-TEXT-431：对齐成功时，重叠区文字用**前一窗**（保其字与内部标点），
-                        // 只把前一窗**窗末句末标点**换成后一窗在同一位置起的文本（含其标点）。
-                        let keep_prev: u8 = if res.committed_prefix.is_some() { 1 } else { 0 };
+                        // 433：重叠区候选 A（前一窗）/ B（后一窗）+ 预览原文 R 的裁判结论。
+                        let mut arb = ArbChoice::None;
+                        let mut arb_extra: &'static str = "";
+                        let mut sim_a = 0.0f32;
+                        let mut sim_b = 0.0f32;
+                        let mut r_dbg = String::new();
+                        let mut layer_dbg: String = res.layer.as_str().to_string();
+                        // R = 重叠区对应的**预览（流式）原始文本**（前一窗流式按共享片占比取末尾）。
+                        let shared = prev_end.saturating_sub(ws).min(samples.len());
+                        let shared_samples: usize = samples[..shared].iter().sum();
+                        let r = streaming_overlap_region(
+                            &self.last_stream,
+                            self.last_stream_samples,
+                            shared_samples,
+                        );
+                        let keep_prev: u8;
+                        match &res.committed_prefix {
+                            Some(p) => {
+                                // `committed_prefix` 是前一窗前缀 ⇒ `[p.len()..]` = 重叠区原文（候选 A）。
+                                let prev_overlap = &self.last_window_text[p.len()..];
+                                let cont_eff = new_overlap_cont_eff(prev_overlap, &text, res.k);
+                                let b_end = if cont_eff == 0 {
+                                    0
+                                } else {
+                                    byte_after_effective_index(&text, cont_eff - 1)
+                                };
+                                let mode = if res.layer == AlignLayer::Forced {
+                                    ArbMode::Forced
+                                } else {
+                                    ArbMode::Preview
+                                };
+                                let (choice, extra, sa, sb, r30) = arbitrate_or_longer(
+                                    prev_overlap,
+                                    &text[..b_end],
+                                    &r,
+                                    res.k,
+                                    cont_eff,
+                                    mode,
+                                );
+                                arb = choice;
+                                arb_extra = extra;
+                                sim_a = sa;
+                                sim_b = sb;
+                                r_dbg = r30;
+                                if !p.is_empty() {
+                                    self.committed.push_str(p);
+                                }
+                                // B：前一窗 cut 前 + 后一窗自重叠区起的原文（= 整窗新文本；即改前 416 行为）；
+                                // A/tie/none：431 splice（前一窗重叠区 + 后一窗接续点后的文本）。
+                                self.last_window_text =
+                                    splice_overlap_by_choice(prev_overlap, &text, res.k, choice);
+                                keep_prev = if matches!(choice, ArbChoice::New) {
+                                    0
+                                } else {
+                                    1
+                                };
+                            }
+                            None => {
+                                // 433 补充 2：无先验（或 forced 无对应）也先**估重叠** ——
+                                // 进入本分支本身说明两窗 span 有共享切片（`ws < prev_end`，确有重叠）。
+                                match estimate_overlap(&self.last_window_text, &text) {
+                                    Some((prefix, k, cont)) => {
+                                        let prev_overlap = &self.last_window_text[prefix.len()..];
+                                        let b_end = if cont == 0 {
+                                            0
+                                        } else {
+                                            byte_after_effective_index(&text, cont - 1)
+                                        };
+                                        let (choice, extra, sa, sb, r30) = arbitrate_or_longer(
+                                            prev_overlap,
+                                            &text[..b_end],
+                                            &r,
+                                            k,
+                                            cont,
+                                            ArbMode::Estimate,
+                                        );
+                                        arb = choice;
+                                        arb_extra = extra;
+                                        sim_a = sa;
+                                        sim_b = sb;
+                                        r_dbg = r30;
+                                        layer_dbg = "estimated".to_string();
+                                        if !prefix.is_empty() {
+                                            self.committed.push_str(&prefix);
+                                        }
+                                        self.last_window_text = splice_overlap_by_choice(
+                                            prev_overlap,
+                                            &text,
+                                            k,
+                                            choice,
+                                        );
+                                        keep_prev = if matches!(choice, ArbChoice::New) {
+                                            0
+                                        } else {
+                                            1
+                                        };
+                                    }
+                                    None => {
+                                        // 完全对不上（估不出 ≥4 字重叠）⇒ 保留 concat 作最后兜底。
+                                        log::warn!(
+                                            "[DBG-433] concat fallback: seq={} prev_eff={} new_eff={} span=[{}, {}) prev=[{}, {})",
+                                            seq,
+                                            effective_chars(&self.last_window_text).len(),
+                                            effective_chars(&text).len(),
+                                            ws,
+                                            we,
+                                            prev_start,
+                                            prev_end
+                                        );
+                                        self.committed.push_str(&self.last_window_text);
+                                        self.last_window_text = text.clone();
+                                        keep_prev = 0;
+                                    }
+                                }
+                            }
+                        }
+                        let arb_dbg = format!("{}{}", arb_extra, arb.as_str());
                         let new_head_dropped: String = if keep_prev == 1 {
                             let pos = byte_after_k_effective(&text, res.k);
                             text[..pos].chars().take(20).collect()
                         } else {
                             String::new()
                         };
-                        match &res.committed_prefix {
-                            Some(p) => {
-                                if !p.is_empty() {
-                                    self.committed.push_str(p);
-                                }
-                                // `committed_prefix` 是前一窗前缀 ⇒ `[p.len()..]` = 重叠区原文。
-                                let prev_overlap = &self.last_window_text[p.len()..];
-                                self.last_window_text =
-                                    splice_keep_prev_overlap(prev_overlap, &text, res.k);
-                            }
-                            None => {
-                                // 前 3 层都没能去重 ⇒ 原样拼接：宁可重复不可丢字。
-                                self.committed.push_str(&self.last_window_text);
-                                self.last_window_text = text;
-                            }
-                        }
                         if log::log_enabled!(log::Level::Debug) {
                             log::debug!(
-                                "[DBG-416] seam: layer={} k={} e={} edit={:.2} seq={} span=[{}, {}) prev=[{}, {}) m={} ratio={:?} keep_prev={} new_head_dropped=\"{}\"",
-                                res.layer.as_str(),
+                                "[DBG-416] seam: layer={} k={} e={} edit={:.2} seq={} span=[{}, {}) prev=[{}, {}) m={} ratio={:?} keep_prev={} arb={} sim_a={:.2} sim_b={:.2} R=\"{}\" new_head_dropped=\"{}\"",
+                                layer_dbg.as_str(),
                                 res.k,
                                 res.expected_k
                                     .map(|e| e.to_string())
@@ -3121,6 +3544,10 @@ impl OrderedReflow {
                                 prior.prev_extra_slices,
                                 prior.expected_ratio,
                                 keep_prev,
+                                arb_dbg.as_str(),
+                                sim_a,
+                                sim_b,
+                                r_dbg,
                                 new_head_dropped
                             );
                         }
@@ -3128,6 +3555,9 @@ impl OrderedReflow {
                     self.last_span = Some((ws, we));
                 }
             }
+            // 433：把预览原文推进到本窗（供下一窗算 R —— 必须是**本窗**的流式，不是精解）。
+            self.last_stream = stream;
+            self.last_stream_samples = stream_total;
             out.push(format!("{}{}", self.committed, self.last_window_text));
             self.next += 1;
         }
@@ -9171,6 +9601,7 @@ mod repro416_tests {
             AlignLayer::Strict => 's',
             AlignLayer::Loose => 'l',
             AlignLayer::Dedupe => 'd',
+            AlignLayer::Forced => 'f',
             AlignLayer::Concat => 'c',
         }
     }
@@ -9283,6 +9714,9 @@ mod repro416_tests {
             "\n[REPRO-416] 413 形状层级网格（层 s/l/d/c + 状态 =/D/L）：\n{}",
             layer_grid()
         );
+        for e in [0usize, 1, 2, 3] {
+            println!("[REPRO-416] status errors={e}:\n{}", status_grid(e));
+        }
     }
 
     /// 🔴 修复后快照：0/1/2 错字全 `=`（无重复无丢字）；3 错字仅 k=8 因宽松门 0.35 上限仍重复。
@@ -9294,12 +9728,10 @@ mod repro416_tests {
                 assert_eq!(row, "===", "errors={errors} 修复后应全 `=`：{line}");
             }
         }
+        // 433：forced/估算层补上后，errors=3 的重复也消除（不再有 k8 超门 ⇒ 拼接重复）。
         for line in status_grid(3).lines() {
             let row = line.rsplit(':').next().unwrap().trim();
-            assert_eq!(
-                row, "D==",
-                "errors=3 快照（k8 超宽松门上限 ⇒ 拼接）：{line}"
-            );
+            assert_eq!(row, "===", "errors=3（433 后）应无重复无丢字：{line}");
         }
     }
 
@@ -10874,7 +11306,8 @@ mod testsync431_tests {
     }
 
     /// 契约 5（源码锚点）：两纯函数存在；`splice_keep_prev_overlap(` 在生产区**恰 2 处**
-    ///（1 定义 + 1 调用，即**仅对齐成功分支**调用）⇒ concat / 零重叠 / 首窗路径不走 splice。
+    ///（1 定义 + 1 调用），且该**唯一调用**收在 [`splice_overlap_by_choice`] 内（433 后 A/B 两分支
+    /// 统一走它）⇒ concat / 零重叠 / 首窗路径不走 splice。
     #[test]
     fn ts431g_source_anchors() {
         let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("mod.rs"))
@@ -10886,14 +11319,292 @@ mod testsync431_tests {
             prod.matches(concat!("splice_keep_prev_", "overlap("))
                 .count(),
             2,
-            "splice 应恰 1 定义 + 1 调用（只对齐成功分支）"
+            "splice 应恰 1 定义 + 1 调用（唯一调用在 splice_overlap_by_choice 内）"
+        );
+        assert!(
+            prod.contains(concat!("fn splice_overlap_by_", "choice(")),
+            "433：A/B 分支须统一走 splice_overlap_by_choice"
         );
         assert!(
             prod.contains(concat!(
-                "splice_keep_prev_",
-                "overlap(prev_overlap, &text, res.k)"
+                "_ => splice_keep_prev_",
+                "overlap(prev_overlap, new, k)"
             )),
-            "splice 调用须在对齐成功分支（res.k）"
+            "splice 调用须在 splice_overlap_by_choice（431 分支）"
         );
+        assert_eq!(
+            prod.matches(concat!("splice_overlap_by_", "choice(prev_overlap"))
+                .count(),
+            2,
+            "splice_overlap_by_choice 须恰 2 处调用（对齐成功分支 + 估算分支）"
+        );
+    }
+}
+
+/// SEAM-ARBITER-STREAMING-433：预览原文裁判 + 硬对齐/估算层。
+#[cfg(test)]
+mod fix433_tests {
+    use super::{
+        arbitrate_sim, estimate_overlap, forced_length_choice, forced_overlap, lcs_sim,
+        resolve_overlap, splice_overlap_by_choice, AlignLayer, AlignPrior, ArbChoice,
+        OrderedReflow, ESTIMATE_MAX_EDIT_RATIO,
+    };
+
+    fn eff(s: &str) -> usize {
+        super::effective_chars(s).len()
+    }
+
+    /// 相似度：LCS/max，剥标点空白；空 ⇒ 0。
+    #[test]
+    fn fix433_lcs_sim_basics() {
+        assert!((lcs_sim("某一世", "某一世") - 1.0).abs() < 1e-6);
+        assert!((lcs_sim("事件，因为。", "事件因为自愿") - 4.0 / 6.0).abs() < 1e-6);
+        assert_eq!(lcs_sim("", "任意"), 0.0);
+        assert_eq!(lcs_sim("任意", ""), 0.0);
+    }
+
+    /// 裁判：更像 R 者胜；平局 / R 空 ⇒ A。
+    #[test]
+    fn fix433_arbiter_picks_closer() {
+        assert_eq!(
+            arbitrate_sim("某一世", "某一时", "某一世").0,
+            ArbChoice::Prev
+        );
+        assert_eq!(
+            arbitrate_sim("事件因为", "事件因为自愿", "事件因为自愿").0,
+            ArbChoice::New
+        );
+        assert_eq!(
+            arbitrate_sim("甲乙丙", "甲乙丙", "甲乙丙").0,
+            ArbChoice::Tie
+        );
+        assert_eq!(arbitrate_sim("甲", "乙", "").0, ArbChoice::None);
+        assert_eq!(
+            arbitrate_sim("获取、以便", "去，以便", "获取、以便").0,
+            ArbChoice::Prev
+        );
+    }
+
+    /// 长度比超界 ⇒ 取较长版；带内 ⇒ None（改由预览裁判）。
+    #[test]
+    fn fix433_forced_length_choice_bands() {
+        assert_eq!(forced_length_choice(5, 10), Some(ArbChoice::Prev)); // 0.5 < 0.70
+        assert_eq!(forced_length_choice(12, 8), Some(ArbChoice::New)); // 1.5 > 1.43
+        assert_eq!(forced_length_choice(10, 10), None); // 1.0 带内
+        assert_eq!(forced_length_choice(8, 10), None); // 0.8 带内
+    }
+
+    /// forced 层：真实接缝（有对应、编辑率 <0.90）⇒ Some；完全对不上 ⇒ None（守不丢字）。
+    #[test]
+    fn fix433_forced_overlap_gate() {
+        let prev = "前文甲乙丙丁戊己庚辛壬癸子丑寅卯";
+        let new = "丁戊己庚辛壬癸子丑寅X";
+        assert!(forced_overlap(prev, new, 8).is_some());
+        let disjoint = "一二三四五六七八九十百千万亿";
+        assert!(forced_overlap(prev, disjoint, 8).is_none());
+        assert!(forced_overlap(prev, new, 7).is_none());
+    }
+
+    /// 估算层：无先验时估重叠；完全对不上 ⇒ None。
+    #[test]
+    fn fix433_estimate_overlap() {
+        let prev = "重复的段落甲乙丙丁戊己庚辛";
+        let new = "重复的段落甲乙丙丁戊己庚辛继续";
+        let (_prefix, k, cont) = estimate_overlap(prev, new).expect("应估出重叠");
+        assert!(k >= 4 && cont > 0);
+        assert!(estimate_overlap(prev, "一二三四五六七八九十百千万亿").is_none());
+    }
+
+    /// 433 案例五（22:36）：后一窗更准 + 预览原文支持后一窗 ⇒ 取 B、无整段重复。
+    #[test]
+    fn fix433_case5_takes_new_no_dup() {
+        let a_full = "前文拥有，有步入酋长到历任总统、市市长。";
+        let b_full = "由部落酋长到历任总统、市或市长，上或小偷";
+        let stream0 = "由部落酋长到历任总统、市或市长";
+        let mut o = OrderedReflow::new();
+        let _ =
+            o.push_window_streaming(0, 0, 1, vec![100], a_full.to_string(), stream0.to_string());
+        let _ = o.push_window_streaming(
+            1,
+            0,
+            2,
+            vec![100, 120],
+            b_full.to_string(),
+            "上或小偷".to_string(),
+        );
+        let (c, l) = o.finish();
+        let out = format!("{c}{l}");
+        assert!(out.contains("前文拥有，有步入酋长由部落"), "实得 {out}");
+        assert_eq!(out.matches("由部落").count(), 1, "B 版只出现一次：{out}");
+        assert_eq!(out.matches("有步入").count(), 1, "A 版只出现一次：{out}");
+        assert!(!out.contains("市市长。由部落"), "不得整段重复：{out}");
+    }
+
+    /// 无预览原文（R 空）⇒ 常规层维持 431（取 A）。用精确重叠句（strict 层，不走 forced 长度比）。
+    #[test]
+    fn fix433_no_stream_keeps_prev() {
+        let prev = "前文某人在某一世可能是你的伴侣";
+        let new = "某人在某一世可能是你的伴侣。后续内容";
+        let mut o = OrderedReflow::new();
+        let _ = o.push(0, 0, 1, prev.to_string());
+        let _ = o.push(1, 0, 2, new.to_string());
+        let (c, l) = o.finish();
+        let out = format!("{c}{l}");
+        assert!(out.contains("某一世"), "R 空 ⇒ 取 A：{out}");
+        assert!(!out.contains("某一时"), "不得改用 B：{out}");
+    }
+
+    /// 433 补充 1（Gavin「长度差太多时，选较长的那段」）：forced 层长度比 >1.43 ⇒ 取 B（较长版），
+    /// 即使 R 为空也照取（不依赖裁判）。<0.7 对称取 A。
+    #[test]
+    fn fix433_forced_length_picks_longer() {
+        // ratio 1.5 > 1.43 ⇒ longer_b（B 有效字更多）⇒ 取后一窗、无整段重复。
+        let a_full = "前文拥有，有步入酋长到历任总统、市市长。";
+        let b_full = "由部落酋长到历任总统、市或市长，上或小偷";
+        let mut o = OrderedReflow::new();
+        let _ = o.push_window(0, 0, 1, vec![100], a_full.to_string());
+        let _ = o.push_window(1, 0, 2, vec![100, 120], b_full.to_string());
+        let (c, l) = o.finish();
+        let out = format!("{c}{l}");
+        assert!(out.contains("由部落酋长到历任总统"), "取较长版 B：{out}");
+        assert_eq!(out.matches("有步入").count(), 1, "无整段重复：{out}");
+    }
+
+    /// 433 补充 1：forced 层长度比 <0.7 ⇒ 取 A（前一窗重叠区更长），较长版字全部保留、无整段重复。
+    #[test]
+    fn fix433_forced_length_picks_prev_when_new_short() {
+        let a_full = "前缀文字甲乙丙丁戊己庚辛";
+        let b_full = "乙丙零一二三四五六七八九十兆京垓";
+        let mut o = OrderedReflow::new();
+        let _ = o.push_window(0, 0, 1, vec![100], a_full.to_string());
+        let _ = o.push_window(1, 0, 2, vec![100, 100], b_full.to_string());
+        let (c, l) = o.finish();
+        let out = format!("{c}{l}");
+        assert!(
+            out.contains("甲乙丙丁戊己庚辛"),
+            "取较长版 A（prev 重叠区 8 字全保留）：{out}"
+        );
+        assert!(!out.contains("乙丙零一"), "B 版未采用：{out}");
+    }
+
+    /// 无先验但确有重复段 ⇒ 估重叠、取较长版、无整段重复。
+    #[test]
+    fn fix433_no_prior_estimate_no_dup() {
+        let prev = "重复的段落甲乙丙丁戊己庚辛";
+        let new = "重复的段落甲乙丙丁戊己庚辛继续";
+        let mut o = OrderedReflow::new();
+        let _ = o.push(0, 0, 1, prev.to_string());
+        let _ = o.push(1, 0, 2, new.to_string());
+        let (c, l) = o.finish();
+        assert_eq!(format!("{c}{l}"), new, "只保留较长版、无重复");
+    }
+
+    /// 无先验且完全对不上 ⇒ 保留 concat（不丢字）。
+    #[test]
+    fn fix433_no_prior_disjoint_concat() {
+        let a = "甲乙丙丁戊己庚辛壬癸";
+        let b = "一二三四五六七八九十";
+        let mut o = OrderedReflow::new();
+        let _ = o.push(0, 0, 1, a.to_string());
+        let _ = o.push(1, 0, 2, b.to_string());
+        let (c, l) = o.finish();
+        assert_eq!(format!("{c}{l}"), format!("{a}{b}"), "完全对不上 ⇒ 拼接");
+    }
+
+    /// resolve_overlap：完全对不上且无先验 ⇒ Concat；splice_overlap_by_choice 分支正确。
+    #[test]
+    fn fix433_resolve_concat_and_splice_choice() {
+        assert_eq!(
+            resolve_overlap("甲乙丙丁戊己庚辛", "一二三四五六七八", AlignPrior::none()).layer,
+            AlignLayer::Concat
+        );
+        assert_eq!(
+            splice_overlap_by_choice("甲。", "乙", 1, ArbChoice::New),
+            "乙"
+        );
+        assert_eq!(
+            splice_overlap_by_choice("甲。", "甲乙", 1, ArbChoice::Prev),
+            "甲乙"
+        );
+    }
+
+    /// 源码锚点（生产区）：433 关键函数/日志/常量齐备。
+    #[test]
+    fn fix433_source_anchors() {
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("mod.rs"))
+            .join("\n");
+        for s in [
+            "fn arbitrate_sim(",
+            "fn arbitrate_or_longer(",
+            "fn forced_length_choice(",
+            "fn estimate_overlap(",
+            "fn forced_overlap(",
+            "fn streaming_overlap_region(",
+            "fn splice_overlap_by_choice(",
+            "pub(crate) fn push_window_streaming(",
+            "const FORCED_MIN_OVERLAP_CHARS",
+            "const FORCED_MAX_EDIT_RATIO",
+            "const ESTIMATE_MIN_OVERLAP_CHARS",
+            "arb={} sim_a={:.2} sim_b={:.2} R=",
+            "[DBG-433] win:",
+            "[DBG-433] concat fallback",
+        ] {
+            assert!(prod.contains(s), "生产区缺少锚点：{s}");
+        }
+    }
+
+    /// 433 验收：5 个真实接缝的裁判推演表（A/B/R + sim）。
+    /// `cargo test --bin feiyin-ime fix433_validation_table -- --nocapture`
+    #[test]
+    fn fix433_validation_table() {
+        let cases: [(&str, &str, &str, &str, ArbChoice); 5] = [
+            (
+                "175022 某一世/某一时",
+                "某一世",
+                "某一时",
+                "某一世",
+                ArbChoice::Prev,
+            ),
+            (
+                "21:12 似乎与/似乎不与",
+                "似乎与",
+                "似乎不与",
+                "似乎与",
+                ArbChoice::Prev,
+            ),
+            (
+                "21:16 获取、以便/去，以便",
+                "获取、以便",
+                "去，以便",
+                "获取、以便",
+                ArbChoice::Prev,
+            ),
+            (
+                "21:12 事件，因为。/事件，因为自愿",
+                "事件，因为。",
+                "事件，因为自愿",
+                "事件，因为自愿",
+                ArbChoice::New,
+            ),
+            (
+                "22:36 有步入…/由部落…",
+                "有步入酋长到历任总统市市长",
+                "由部落酋长到历任总统市或市长",
+                "由部落酋长到历任总统、市或市长",
+                ArbChoice::New,
+            ),
+        ];
+        println!("\n[FIX433-VALIDATION] 接缝裁判推演表（R=预览流式原文，人工构造/日志截断重建）：");
+        for (name, a, b, r, want) in cases {
+            let (got, sa, sb) = arbitrate_sim(a, b, r);
+            println!(
+                "  {name}: A={a:?} B={b:?} R={r:?} sim_a={sa:.3} sim_b={sb:.3} => {got:?} (期望 {want:?}) {}",
+                if got == want { "OK" } else { "MISMATCH" }
+            );
+            assert_eq!(got, want, "{name} 裁判结论不符");
+        }
+        assert_eq!(arbitrate_sim("甲", "乙", "").0, ArbChoice::None);
+        let _ = ESTIMATE_MAX_EDIT_RATIO;
+        let _ = eff("任意");
     }
 }
