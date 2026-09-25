@@ -1,4 +1,8 @@
 
+### 2026-09-25 · TEST-SYNC-430-434 交付（阶段三·非作者护栏，只写测试）
+
+- `testsync434_tests`（local_stream.rs，10 用例）+ `testsync430_tests`（main.rs，7 用例），独立推导、与作者用例不同输入/无重名。生产零改动。fmt EXIT0 / check 0 error、warnings 91/87=基线（未跑 test）。
+
 ### 2026-09-25 · SEAM-PINYIN-ALIGN-435 · R1 交付（切点/接续点同一回溯路径，恢复零重复）
 
 - 首轮放宽「允许 ≤1 字边界重复」被退回。根因：loose k 与真实对应错位 1 字（22:36 真正起点是前一窗「有」↔后一窗「由」）。修复：`semiglobal_dp` 一次回溯返回 `(cont,best,first)`；取 B 用加权路径求前一窗切点（切在「有」之前），取 A 用字形接续（加权会把末字对到近音字、留下真同字 ⇒ 重复）。

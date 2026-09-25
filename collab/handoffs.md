@@ -9,6 +9,10 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-1 — TEST-SYNC-430-434 ✅ 交付（阶段三·非作者护栏，只写测试）
+
+- 434 → `local_stream.rs` 新增 `testsync434_tests`（10 用例：120ms 真停顿/100ms 不算/中点精确/首轮取最早/扩展取最近/无停顿退回/短片整片/bool 兼容/381 内核锚点/门槛常量）；430 → `main.rs` 新增 `testsync430_tests`（7 用例：×1.7 精确/四组夹紧/正文高公式/按钮不重叠/滚动范围/标题键一致/源码锚点）。生产零改动，未碰 mod.rs/vad.rs。fmt EXIT0 / check 0 error、warnings 91/87=基线（阶段三未跑 test）。result 见 `collab/evidence/tsync-430-434/result.md`（outbox 写入即被清空）。
+
 ## 2026-09-25 — coder-1 — SEAM-PINYIN-ALIGN-435 · R1 ✅ 交付（切点/接续点同一回溯路径，零重复）
 
 - **退回原因**：首轮把 `ts431g` / `fix433_case5` 放宽为「允许 ≤1 字边界重复」，不接受（Gavin「尽量杜绝重复」）。
