@@ -60,10 +60,10 @@ use windows::Win32::Graphics::Gdi::{
     SelectObject, SetBkColor, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor,
     StretchBlt, UpdateWindow, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
     BLENDFUNCTION, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
-    DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
-    FF_DONTCARE, FW_NORMAL, HALFTONE, HBITMAP, HDC, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_NULL, PS_SOLID, SRCCOPY, TEXTMETRICW,
-    TRANSPARENT,
+    DRAW_TEXT_FORMAT, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOCLIP, DT_SINGLELINE,
+    DT_VCENTER, DT_WORDBREAK, FF_DONTCARE, FW_NORMAL, HALFTONE, HBITMAP, HDC, HFONT, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_NULL, PS_SOLID,
+    SRCCOPY, TEXTMETRICW, TRANSPARENT,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -104,9 +104,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CXSMICON, SM_CYSCREEN, SM_CYSMICON, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNA, TPM_NONOTIFY, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONUP, WM_NCCREATE, WM_NCPAINT, WM_PAINT, WM_PRINTCLIENT, WM_TIMER, WNDCLASSW,
-    WNDCLASS_STYLES, WS_CHILD, WS_CLIPCHILDREN, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
+    WM_LBUTTONUP, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCPAINT, WM_PAINT, WM_PRINTCLIENT, WM_TIMER,
+    WNDCLASSW, WNDCLASS_STYLES, WS_CHILD, WS_CLIPCHILDREN, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
 };
 #[derive(Debug, Clone)]
 enum PipelineEvent {
@@ -1445,6 +1445,8 @@ struct OverlayWindowState {
     cancel_btn_rect: Option<RECT>,
     close_btn_rect: Option<RECT>, // close button area (focus-lost preview)
     title_close_btn_rect: Option<RECT>, // title bar close button (focus-lost preview)
+    /// UI-FOCUSLOST-WINDOW-430: 回显窗正文纵向滚动偏移（px，0=顶部）。
+    preview_scroll: i32,
     /// ASR-038-C: 提交按钮区域（编辑态）
     submit_btn_rect: Option<RECT>,
     /// ASR-038-C: 文本点击区域（录音/流式态进入编辑态）
@@ -1656,6 +1658,7 @@ fn run_overlay_thread(
         cancel_btn_rect: None,
         close_btn_rect: None,
         title_close_btn_rect: None,
+        preview_scroll: 0,
         submit_btn_rect: None,
         text_hit_rect: None,
         shimmer_phase: 0.0,
@@ -1821,7 +1824,13 @@ fn run_overlay_thread(
                             state.last_resize_time = None;
                             state.pending_size = None;
                         }
-                        (resolved_pos, request.size)
+                        // UI-FOCUSLOST-WINDOW-430：回显窗尺寸由工作区几何现算（宽 ×1.7 夹紧）。
+                        let size = if matches!(request.status, OverlayStatus::FocusLost { .. }) {
+                            overlay_geometry(&request.status, hwnd).1
+                        } else {
+                            request.size
+                        };
+                        (resolved_pos, size)
                     };
 
                     if let Ok(mut state) = shared_state.lock() {
@@ -1855,6 +1864,8 @@ fn run_overlay_thread(
                             state.title_close_btn_rect = None;
                             state.submit_btn_rect = None;
                             state.text_hit_rect = None;
+                            // UI-FOCUSLOST-WINDOW-430：新回显窗从顶部开始。
+                            state.preview_scroll = 0;
                             // OVERLAY-051-A: preserve last_streaming_text across status changes.
                             // Only clear it on a fresh Recording session.
                             if matches!(request.status, OverlayStatus::Recording) {
@@ -2558,6 +2569,53 @@ unsafe extern "system" fn overlay_wnd_proc(
             }
             return LRESULT(0);
         }
+        WM_MOUSEWHEEL => {
+            // UI-FOCUSLOST-WINDOW-430：回显窗正文纵向滚动（底部按钮固定不动）。
+            if let Ok(mut state) = data.state.lock() {
+                let focus_text = match state.request.as_ref().map(|r| &r.status) {
+                    Some(OverlayStatus::FocusLost { text, .. }) => Some(text.clone()),
+                    _ => None,
+                };
+                if let Some(text) = focus_text {
+                    let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                    let lay = preview_layout(state.current_size[0], state.current_size[1]);
+                    let body_w = (lay.body_right - lay.body_left).max(1);
+                    let body_h = preview_body_h(&lay);
+                    let content_h = unsafe {
+                        let hdc = GetDC(hwnd);
+                        let font = create_clear_type_font(OVERLAY_FONT_SIZE);
+                        let old = SelectObject(hdc, font);
+                        let mut m = RECT {
+                            left: 0,
+                            top: 0,
+                            right: body_w,
+                            bottom: 0,
+                        };
+                        let mut wide = encode_wide(&text);
+                        let n = wide.len().saturating_sub(1);
+                        let _ = DrawTextW(
+                            hdc,
+                            &mut wide[..n],
+                            &mut m,
+                            DT_LEFT | DT_WORDBREAK | DT_CALCRECT,
+                        );
+                        let _ = SelectObject(hdc, old);
+                        let _ = DeleteObject(font);
+                        let _ = ReleaseDC(hwnd, hdc);
+                        (m.bottom - m.top).max(0)
+                    };
+                    let max = preview_max_scroll(content_h, body_h);
+                    let step = if delta > 0 {
+                        -PREVIEW_SCROLL_STEP
+                    } else {
+                        PREVIEW_SCROLL_STEP
+                    };
+                    state.preview_scroll = preview_clamp_scroll(state.preview_scroll + step, max);
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            return LRESULT(0);
+        }
         WM_CTLCOLOREDIT => {
             // ASR-038-C: customize EDIT control background/text color to match overlay theme
             if let Ok(state) = data.state.lock() {
@@ -3148,9 +3206,20 @@ fn draw_overlay_to_dc(
                 // failure the GDI path below still renders this frame, so the overlay
                 // never goes blank. 命中 rect 两条路径都从 preview_hit_rects 出
                 // （H10 单一几何源，点击口径逐位同值）。
-                if !d2d::draw_preview_overlay(hdc, rect, text, request.ui_language) {
-                    let (copy_rect, close_rect, tc_rect) =
-                        draw_preview_overlay(hdc, rect, text, request.ui_language);
+                if !d2d::draw_preview_overlay(
+                    hdc,
+                    rect,
+                    text,
+                    request.ui_language,
+                    state.preview_scroll,
+                ) {
+                    let (copy_rect, close_rect, tc_rect) = draw_preview_overlay(
+                        hdc,
+                        rect,
+                        text,
+                        request.ui_language,
+                        state.preview_scroll,
+                    );
                     cancel_btn_rect = Some(copy_rect);
                     close_btn_rect = Some(close_rect);
                     title_close_btn_rect = Some(tc_rect);
@@ -5598,6 +5667,8 @@ mod d2d {
         rect: &RECT,
         text: &str,
         ui_language: crate::config::UiLanguage,
+        // UI-FOCUSLOST-WINDOW-430：正文纵向滚动偏移（px）。
+        scroll: i32,
     ) -> bool {
         with_d2d(hdc, rect, |res, w, h| {
             // OVERLAY-141: 半径单一来源。
@@ -5680,21 +5751,86 @@ mod d2d {
                     1.0,
                     None,
                 );
-                // 正文（#F2F2F2，顶对齐 + WRAP）
-                res.brush.SetColor(&colorref_to_d2d(COLORREF(0xF2F2F2)));
+                // UI-FOCUSLOST-WINDOW-430：正文区裁剪 + 纵向滚动（滚轮）；底部按钮固定不动。
+                let lay = super::preview_layout(w as i32, h as i32);
+                let body_w = (lay.body_right - lay.body_left).max(1) as f32;
+                let body_h = super::preview_body_h(&lay);
+                let bt = lay.body_top as f32;
+                let bb = lay.body_bottom as f32;
                 let body: Vec<u16> = text.encode_utf16().collect();
+                let content_h =
+                    match res
+                        .dwrite
+                        .CreateTextLayout(&body, &res.wrap_text_format, body_w, 1.0e5)
+                    {
+                        Ok(l) => {
+                            let mut m =
+                                windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS::default(
+                                );
+                            if l.GetMetrics(&mut m).is_ok() {
+                                m.height.max(0.0)
+                            } else {
+                                0.0
+                            }
+                        }
+                        Err(_) => 0.0,
+                    };
+                let max_scroll = super::preview_max_scroll(content_h as i32, body_h);
+                let scroll = super::preview_clamp_scroll(scroll, max_scroll) as f32;
+                res.rt.PushAxisAlignedClip(
+                    &D2D_RECT_F {
+                        left: lay.body_left as f32,
+                        top: bt,
+                        right: lay.body_right as f32,
+                        bottom: bb,
+                    },
+                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                );
+                res.brush.SetColor(&colorref_to_d2d(COLORREF(0xF2F2F2)));
                 res.rt.DrawText(
                     &body,
                     &res.wrap_text_format,
                     &D2D_RECT_F {
-                        left: 14.0,
-                        top: 36.0,
-                        right: w - 14.0,
-                        bottom: h - 40.0,
+                        left: lay.body_left as f32,
+                        top: bt - scroll,
+                        right: lay.body_right as f32,
+                        bottom: bt - scroll + content_h.max(body_h as f32),
                     },
                     &res.brush,
                     windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
                     DWRITE_MEASURING_MODE_NATURAL,
+                );
+                res.rt.PopAxisAlignedClip();
+                // 滚动条（视觉指示，有溢出才画）。
+                if max_scroll > 0 && content_h > 0.0 {
+                    let track_h = body_h as f32;
+                    let thumb_h = (track_h * body_h as f32 / content_h).clamp(16.0, track_h);
+                    let thumb_top = bt + (track_h - thumb_h) * scroll / max_scroll as f32;
+                    res.brush
+                        .SetColor(&colorref_to_d2d(super::OVERLAY_BTN_BORDER));
+                    res.rt.FillRectangle(
+                        &D2D_RECT_F {
+                            left: lay.scrollbar_x as f32,
+                            top: thumb_top,
+                            right: (lay.scrollbar_x + lay.scrollbar_w) as f32,
+                            bottom: thumb_top + thumb_h,
+                        },
+                        &res.brush,
+                    );
+                }
+                // 底栏分隔线（正文区与按钮区分界）。
+                res.brush
+                    .SetColor(&colorref_to_d2d(super::OVERLAY_BORDER_GRAY));
+                let sep_y = h - super::PREVIEW_BOTTOM_BAR_H as f32;
+                res.rt.DrawLine(
+                    D2D_POINT_2F { x: 8.0, y: sep_y },
+                    D2D_POINT_2F {
+                        x: w - 8.0,
+                        y: sep_y,
+                    },
+                    &res.brush,
+                    1.0,
+                    None,
                 );
                 // 底部双键（45x18 gap10；btn_left i32 整除 = GDI (W-100)/2 逐位同值）
                 let btn_left = ((w as i32 - 100) / 2) as f32;
@@ -5905,6 +6041,65 @@ fn draw_processing_overlay(
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
     );
 }
+// =====================================================================
+// UI-FOCUSLOST-WINDOW-430：回显窗尺寸（宽度 ×1.7 + 工作区夹紧）与窗口内布局
+//   （标题栏 / 可滚动正文区 / 固定底部按钮区），GDI、D2D、滚轮三处共用。
+// =====================================================================
+/// UI-FOCUSLOST-WINDOW-430：宽度相对现宽放大倍数（Gavin「窗口宽度需要放宽 70%」）。
+const PREVIEW_WIDTH_SCALE: f32 = 1.7;
+const PREVIEW_TITLE_BAR_H: i32 = 28;
+/// 底部按钮区高度（按钮 18 + 上下留白）——正文区只到它上方，滚动时按钮不动。
+const PREVIEW_BOTTOM_BAR_H: i32 = 32;
+const PREVIEW_SCROLLBAR_W: i32 = 6;
+/// 滚轮一格的滚动步长（px）。
+const PREVIEW_SCROLL_STEP: i32 = 48;
+
+/// UI-FOCUSLOST-WINDOW-430：回显窗尺寸 —— 宽 ×1.7 并夹紧 `max_w`（工作区），
+/// 高取基准 140 且不超工作区 60%（**短文本不必占满屏**）。纯函数。
+fn preview_size(work_w: i32, work_h: i32, max_w: i32) -> [i32; 2] {
+    let target_w = (PREVIEW_OVERLAY_SIZE[0] as f32 * PREVIEW_WIDTH_SCALE).round() as i32;
+    let w = target_w.clamp(PREVIEW_OVERLAY_SIZE[0], max_w.max(PREVIEW_OVERLAY_SIZE[0]));
+    let h = PREVIEW_OVERLAY_SIZE[1]
+        .min((work_h as f32 * 0.6).round() as i32)
+        .max(120);
+    let _ = work_w; // 宽度由 max_w 表达工作区上限
+    [w, h]
+}
+
+/// UI-FOCUSLOST-WINDOW-430：回显窗窗口内布局（相对窗口坐标，单一几何源）。
+struct PreviewLayout {
+    body_left: i32,
+    body_top: i32,
+    body_right: i32,
+    body_bottom: i32,
+    scrollbar_x: i32,
+    scrollbar_w: i32,
+}
+
+/// UI-FOCUSLOST-WINDOW-430：正文区在标题栏之下、底部按钮区之上（二者不重叠，按钮固定不随滚动）。
+fn preview_layout(w: i32, h: i32) -> PreviewLayout {
+    let right_inset = 14 + PREVIEW_SCROLLBAR_W + 4;
+    PreviewLayout {
+        body_left: 14,
+        body_top: PREVIEW_TITLE_BAR_H + 8,
+        body_right: (w - right_inset).max(20),
+        body_bottom: (h - PREVIEW_BOTTOM_BAR_H).max(PREVIEW_TITLE_BAR_H + 10),
+        scrollbar_x: (w - 14 - PREVIEW_SCROLLBAR_W).max(0),
+        scrollbar_w: PREVIEW_SCROLLBAR_W,
+    }
+}
+fn preview_body_h(lay: &PreviewLayout) -> i32 {
+    (lay.body_bottom - lay.body_top).max(1)
+}
+/// 最大可滚动量（内容高度 − 视口高度，非负）。
+fn preview_max_scroll(content_h: i32, body_h: i32) -> i32 {
+    (content_h - body_h).max(0)
+}
+/// 滚动偏移夹紧到 `[0, max]`。
+fn preview_clamp_scroll(scroll: i32, max: i32) -> i32 {
+    scroll.clamp(0, max.max(0))
+}
+
 /// D2D-P2 (PLAN-108 H10): FocusLost 三个命中矩形的单一几何源（纯函数，只依赖 rect）。
 /// GDI 绘制路径与 D2D 成功路径都从这里取返回值——几何口径物理上不可分叉
 /// （centered_x 同款哲学：返回值不允许两份算术）。公式逐位照抄原
@@ -5945,6 +6140,8 @@ fn draw_preview_overlay(
     rect: &RECT,
     text: &str,
     ui_language: config::UiLanguage,
+    // UI-FOCUSLOST-WINDOW-430：正文纵向滚动偏移（px）。
+    scroll: i32,
 ) -> (RECT, RECT, RECT) {
     // UI-OPT-003: preview window with title bar, centered buttons, i18n labels
     const BRAND_ORANGE: COLORREF = COLORREF(0x006BFF); // #FF6B00
@@ -6040,12 +6237,50 @@ fn draw_preview_overlay(
         let _ = SelectObject(hdc, sep_old);
         let _ = DeleteObject(sep_pen);
     }
-    // Body text (word wrap + ellipsis)
+    // UI-FOCUSLOST-WINDOW-430：正文区按布局裁剪 + 纵向滚动（滚轮）；底部按钮固定不动。
+    let lay = preview_layout(rect.right - rect.left, rect.bottom - rect.top);
+    let body_w = (lay.body_right - lay.body_left).max(1);
+    let body_h = preview_body_h(&lay);
+    // 量正文高度（当前 DC 字体，与绘制同号）。
+    let mut measure = RECT {
+        left: 0,
+        top: 0,
+        right: body_w,
+        bottom: 0,
+    };
+    {
+        let mut wide = encode_wide(text);
+        let n = wide.len().saturating_sub(1);
+        unsafe {
+            let _ = DrawTextW(
+                hdc,
+                &mut wide[..n],
+                &mut measure,
+                DT_LEFT | DT_WORDBREAK | DT_CALCRECT,
+            );
+        }
+    }
+    let content_h = (measure.bottom - measure.top).max(0);
+    let max_scroll = preview_max_scroll(content_h, body_h);
+    let scroll = preview_clamp_scroll(scroll, max_scroll);
+    let saved = unsafe { SaveDC(hdc) };
+    let clip = unsafe {
+        CreateRectRgn(
+            rect.left + lay.body_left,
+            rect.top + lay.body_top,
+            rect.left + lay.body_right,
+            rect.top + lay.body_bottom,
+        )
+    };
+    unsafe {
+        let _ = SelectClipRgn(hdc, clip);
+        let _ = DeleteObject(clip);
+    }
     let mut text_rect = RECT {
-        left: rect.left + 14,
-        top: rect.top + title_bar_h + 8,
-        right: rect.right - 14,
-        bottom: rect.bottom - 40,
+        left: rect.left + lay.body_left,
+        top: rect.top + lay.body_top - scroll,
+        right: rect.left + lay.body_right,
+        bottom: rect.top + lay.body_top - scroll + content_h.max(body_h),
     };
     unsafe {
         let _ = SetTextColor(hdc, COLORREF(0xF2F2F2));
@@ -6054,8 +6289,42 @@ fn draw_preview_overlay(
         hdc,
         text,
         &mut text_rect,
-        DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS,
+        DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOCLIP,
     );
+    unsafe {
+        let _ = RestoreDC(hdc, saved);
+    }
+    // 滚动条（视觉指示，有溢出才画）：轨道右侧，滑块按视口/内容比例。
+    if max_scroll > 0 && content_h > 0 {
+        let sx = rect.left + lay.scrollbar_x;
+        let track_t = rect.top + lay.body_top;
+        let track_h = body_h;
+        let thumb_h =
+            ((track_h as f32 * body_h as f32 / content_h as f32).round() as i32).clamp(16, track_h);
+        let thumb_top = track_t
+            + ((track_h - thumb_h) as f32 * scroll as f32 / max_scroll as f32).round() as i32;
+        let tb = unsafe { CreateSolidBrush(OVERLAY_BTN_BORDER) };
+        let r = RECT {
+            left: sx,
+            top: thumb_top,
+            right: sx + lay.scrollbar_w,
+            bottom: thumb_top + thumb_h,
+        };
+        unsafe {
+            let _ = FillRect(hdc, &r, tb);
+            let _ = DeleteObject(tb);
+        }
+    }
+    // 底部按钮区上沿分隔线（与正文区分开）。
+    let sep2 = unsafe { CreatePen(PS_SOLID, 1, OVERLAY_BORDER_GRAY) };
+    let old2 = unsafe { SelectObject(hdc, sep2) };
+    unsafe {
+        let y = rect.bottom - PREVIEW_BOTTOM_BAR_H;
+        let _ = MoveToEx(hdc, rect.left + 8, y, None);
+        let _ = LineTo(hdc, rect.right - 8, y);
+        let _ = SelectObject(hdc, old2);
+        let _ = DeleteObject(sep2);
+    }
     // Bottom buttons (centered) — rects 来自 preview_hit_rects（45x18, gap10, 底距10）
     // FIX-006 v2: bottom buttons use brighter border to distinguish from window edge.
     // OVERLAY-054-C: use file-level OVERLAY_BTN_BORDER.
@@ -6405,7 +6674,8 @@ fn overlay_geometry(status: &OverlayStatus, hwnd: HWND) -> ([i32; 2], [i32; 2]) 
         OverlayStatus::Processing(_) | OverlayStatus::Error(_) | OverlayStatus::Info(_) => {
             STATUS_OVERLAY_SIZE
         }
-        OverlayStatus::FocusLost { .. } => PREVIEW_OVERLAY_SIZE,
+        // UI-FOCUSLOST-WINDOW-430：宽度 ×1.7（夹紧工作区），短文本不高到占满屏。
+        OverlayStatus::FocusLost { .. } => preview_size(work_w, work_h, overlay_max_width(hwnd)),
     };
     let x = centered_x(work.left, work_w, size[0]);
     let y = work.top + (work_h - size[1] - 64).max(0);
@@ -18265,6 +18535,7 @@ mod overlay_086_d2d_p1_guard_tests {
             cancel_btn_rect: None,
             close_btn_rect: None,
             title_close_btn_rect: None,
+            preview_scroll: 0,
             submit_btn_rect: None,
             text_hit_rect: None,
             shimmer_phase: 0.0,
@@ -18590,7 +18861,7 @@ mod overlay_109_d2d_p2p3_guard_tests {
         );
 
         let ok_preview =
-            d2d::draw_preview_overlay(hdc, &rect, "预览文本", config::UiLanguage::Chinese);
+            d2d::draw_preview_overlay(hdc, &rect, "预览文本", config::UiLanguage::Chinese, 0);
         assert!(
             !ok_preview,
             "FocusLost 入口：无效 HDC 必须返回 false（GDI 回落触发器）"
@@ -18889,6 +19160,7 @@ mod overlay_109_d2d_p2p3_guard_tests {
             cancel_btn_rect: None,
             close_btn_rect: None,
             title_close_btn_rect: None,
+            preview_scroll: 0,
             submit_btn_rect: None,
             text_hit_rect: None,
             shimmer_phase: 0.0,
@@ -21757,5 +22029,73 @@ mod testsync423_427_429_tests {
             prod.contains("if action == ReflowAction::Applied"),
             "回灌渲染须经 reflow_action 门（编辑态不改）"
         );
+    }
+}
+
+// =====================================================================
+// UI-FOCUSLOST-WINDOW-430：回显窗尺寸（宽 ×1.7 + 夹紧）与布局（正文本/底部按钮不重叠）纯函数护栏
+// =====================================================================
+#[cfg(all(test, target_os = "windows"))]
+mod preview430_tests {
+    use super::{
+        preview_body_h, preview_clamp_scroll, preview_hit_rects, preview_layout,
+        preview_max_scroll, preview_size, PREVIEW_BOTTOM_BAR_H,
+    };
+    use windows::Win32::Foundation::RECT;
+
+    /// 宽度 ×1.7（320→544），夹紧 `max_w`；高度 ≤ 工作区 60% 且 ≥120。
+    #[test]
+    fn preview430_width_plus70_and_clamped() {
+        let s = preview_size(1920, 1080, 960);
+        assert_eq!(s[0], 544, "320 × 1.7 = 544");
+        assert_eq!(s[1], 140, "高仍取基准 140（<60% 工作区）");
+        // 工作区上限更小 ⇒ 夹紧。
+        assert_eq!(
+            preview_size(1920, 1080, 400)[0],
+            400,
+            "max_w=400 ⇒ 夹到 400"
+        );
+        // 工作区高很小时高度压到 60%。
+        assert_eq!(preview_size(800, 200, 400)[1], 120, "200×0.6=120 ⇒ 120");
+    }
+
+    /// 正文区底 ≤ 底部按钮上沿（二者不重叠），按钮在底栏内。
+    #[test]
+    fn preview430_body_and_buttons_do_not_overlap() {
+        let (w, h) = (544, 140);
+        let lay = preview_layout(w, h);
+        assert!(lay.body_bottom <= h - PREVIEW_BOTTOM_BAR_H + 1);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        };
+        let (copy, close, tc) = preview_hit_rects(&rect);
+        assert!(
+            lay.body_bottom <= copy.top,
+            "正文区底 {} 不得侵入按钮区顶 {}",
+            lay.body_bottom,
+            copy.top
+        );
+        assert!(
+            close.left > copy.left && tc.top < lay.body_top,
+            "按钮/标题键几何健全"
+        );
+        // 滚动条在窗口右侧内。
+        assert!(lay.scrollbar_x + lay.scrollbar_w <= w);
+        assert!(lay.body_right <= lay.scrollbar_x);
+    }
+
+    /// 滚动：max = content-body（非负）；clamp 到 [0,max]。
+    #[test]
+    fn preview430_scroll_math() {
+        assert_eq!(preview_max_scroll(300, 100), 200);
+        assert_eq!(preview_max_scroll(80, 100), 0, "内容不足视口 ⇒ 不可滚");
+        assert_eq!(preview_clamp_scroll(-5, 200), 0);
+        assert_eq!(preview_clamp_scroll(999, 200), 200);
+        assert_eq!(preview_clamp_scroll(50, 200), 50);
+        let lay = preview_layout(544, 140);
+        assert_eq!(preview_body_h(&lay), lay.body_bottom - lay.body_top);
     }
 }
