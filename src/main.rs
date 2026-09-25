@@ -3752,7 +3752,9 @@ fn draw_recording_overlay_with_text(
     // The metric (text_width) comes from measure_text_width on the GDI font — the
     // single metric source agreed in D2D-P1 — so the D2D side never measures itself
     // and cannot drift from the window-sizing path (adjust_overlay_pos_size_for_text).
-    let text_width = measure_text_width(hdc, text);
+    // OVERLAY-MEASURE-CACHE-415：此处所选字体恒为 streaming_font(OVERLAY_TEXT_FONT_SIZE=-16)
+    // （见 draw_overlay_to_dc 的 streaming_text 分支），故字号传入以纳入缓存键。
+    let text_width = measure_text_width(hdc, text, OVERLAY_TEXT_FONT_SIZE);
     if d2d::draw_streaming_text_overlay(hdc, rect, state, text, text_width) {
         let text_hit = text_hit_rect_for(rect);
         let cancel = draw_stop_button_hit_rect_only(rect);
@@ -5353,51 +5355,72 @@ mod d2d {
         let text_bottom = h - super::OVERLAY_TEXT_DRAW_VERTICAL_INSET as f32;
         let visible_w = (text_right - text_left).max(1.0);
 
-        let visible: Vec<u16> = visible_text.encode_utf16().collect();
-        // LOCALRT-FIRSTCHAR-281：scroll 用 **DirectWrite 实渲宽**（与下面 DrawText 同引擎），
-        // 不再用 GDI `GetTextExtentPoint32W` 量宽 —— 两者对同一串差 143-155px（实测，随长度增长），
-        // 用 GDI 宽算 scroll_x 会多滚一截 ⇒ 右侧留白（FIX-255 未根治的真因）。
-        // `text_width`（GDI）仅留作诊断对照；GDI 兜底路径自己量自己画，不经此处（各自自洽）。
-        let scroll_width = dwrite_measure_width(res, &visible, text_width as f32);
-        let scroll_x =
-            super::streaming_scroll_offset(scroll_width.round() as i32, visible_w as i32) as f32;
-        // LOCALRT-SCROLL-277 诊断（节流 500ms，仅滚动时）：量化右侧留白。
-        if scroll_x > 0.0 {
-            log_draw_geo_277(text_width, scroll_width, visible_w, scroll_x);
-        }
-        unsafe {
-            // Clip: GDI SaveDC → SelectClipRgn(text area) → RestoreDC.
-            // D2D: PushAxisAlignedClip → DrawText → PopAxisAlignedClip.
-            res.rt.PushAxisAlignedClip(
-                &D2D_RECT_F {
-                    left: text_left,
-                    top: text_top,
-                    right: text_right,
-                    bottom: text_bottom,
-                },
-                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-            );
-            res.brush
-                .SetColor(&colorref_to_d2d(super::OVERLAY_TEXT_WHITE));
-            // FIX-OVERLAY-SCROLL-255: 排版矩形只移起点，右边界**不随 scroll_x 左移**，
-            // 保持在可视区右沿（旧写法 `text_right - scroll_x` 使矩形整体左移 ⇒ 右侧留白）。
-            // 布局宽度 = max(text_width, visible_w) ≥ 文本宽度，最新文字贴 text_right；
-            // 裁剪区 text_left..text_right 不动，保证不溢出窗口。
-            res.rt.DrawText(
-                &visible,
-                &res.streaming_text_format,
-                &D2D_RECT_F {
-                    left: text_left - scroll_x,
-                    top: text_top,
-                    right: text_right,
-                    bottom: text_bottom,
-                },
-                &res.brush,
-                windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
-            res.rt.PopAxisAlignedClip();
-        }
+        // OVERLAY-MEASURE-CACHE-415：命中缓存则不建 TextLayout、不重新编码（编码结果直接
+        // 复用给下面 DrawText）。DWrite 与 GDI **分开**缓存（281：同串差 143~155px，禁互串）。
+        let dpi = {
+            let mut dx = 0.0_f32;
+            let mut dy = 0.0_f32;
+            unsafe {
+                res.rt.GetDpi(&mut dx, &mut dy);
+            }
+            dx.max(0.0).round() as u32
+        };
+        super::LAST_DWRITE_MEASURE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            // LOCALRT-FIRSTCHAR-281：scroll 用 **DirectWrite 实渲宽**（与下面 DrawText 同引擎），
+            // 不再用 GDI `GetTextExtentPoint32W` 量宽 —— 两者对同一串差 143-155px（实测，随长度增长），
+            // 用 GDI 宽算 scroll_x 会多滚一截 ⇒ 右侧留白（FIX-255 未根治的真因）。
+            // `text_width`（GDI）仅留作诊断对照；GDI 兜底路径自己量自己画，不经此处（各自自洽）。
+            let scroll_width = match cache.hit(visible_text, super::OVERLAY_TEXT_FONT_SIZE, dpi) {
+                Some(w) => w,
+                None => {
+                    let encoded: Vec<u16> = visible_text.encode_utf16().collect();
+                    let w = dwrite_measure_width(res, &encoded, text_width as f32);
+                    cache.put(visible_text, super::OVERLAY_TEXT_FONT_SIZE, dpi, w, encoded);
+                    w
+                }
+            };
+            let scroll_x =
+                super::streaming_scroll_offset(scroll_width.round() as i32, visible_w as i32)
+                    as f32;
+            // LOCALRT-SCROLL-277 诊断（节流 500ms，仅滚动时）：量化右侧留白。
+            if scroll_x > 0.0 {
+                log_draw_geo_277(text_width, scroll_width, visible_w, scroll_x);
+            }
+            unsafe {
+                // Clip: GDI SaveDC → SelectClipRgn(text area) → RestoreDC.
+                // D2D: PushAxisAlignedClip → DrawText → PopAxisAlignedClip.
+                res.rt.PushAxisAlignedClip(
+                    &D2D_RECT_F {
+                        left: text_left,
+                        top: text_top,
+                        right: text_right,
+                        bottom: text_bottom,
+                    },
+                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                );
+                res.brush
+                    .SetColor(&colorref_to_d2d(super::OVERLAY_TEXT_WHITE));
+                // FIX-OVERLAY-SCROLL-255: 排版矩形只移起点，右边界**不随 scroll_x 左移**，
+                // 保持在可视区右沿（旧写法 `text_right - scroll_x` 使矩形整体左移 ⇒ 右侧留白）。
+                // 布局宽度 = max(text_width, visible_w) ≥ 文本宽度，最新文字贴 text_right；
+                // 裁剪区 text_left..text_right 不动，保证不溢出窗口。
+                res.rt.DrawText(
+                    cache.encoded(),
+                    &res.streaming_text_format,
+                    &D2D_RECT_F {
+                        left: text_left - scroll_x,
+                        top: text_top,
+                        right: text_right,
+                        bottom: text_bottom,
+                    },
+                    &res.brush,
+                    windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+                res.rt.PopAxisAlignedClip();
+            }
+        });
     }
 
     /// D2D-P1: `RecordingStreamingIdle`（聆听占位态）= chrome + mic indicator +
@@ -6427,7 +6450,7 @@ fn adjust_overlay_pos_size_for_text(
         // EDIT control, so measuring font always matches the drawing font.
         let font = create_clear_type_font(font_size);
         let old_font = SelectObject(hdc, font);
-        let text_w = measure_text_width(hdc, text);
+        let text_w = measure_text_width(hdc, text, font_size);
         let _ = SelectObject(hdc, old_font);
         let _ = DeleteObject(font);
         let _ = ReleaseDC(hwnd, hdc);
@@ -6450,20 +6473,237 @@ fn adjust_overlay_pos_size_for_text(
     }
 }
 
+// =====================================================================
+// OVERLAY-MEASURE-CACHE-415：浮层量宽结果缓存（RT-PERF-AUDIT-403 F-A-01）
+//   文字未变的重绘不再重量；GDI 与 DirectWrite **分开**缓存（同串差 143~155px，
+//   见 LOCALRT-FIRSTCHAR-281，禁互串）；无锁 thread_local（仅绘制线程访问）。
+// =====================================================================
+
+/// OVERLAY-MEASURE-CACHE-415：量宽缓存键 = 宽度的全部决定因素（文本 + 字号 + DPI）。
+/// 字体 face 恒为 "Segoe UI"，其变化由 `font_size` 覆盖；DPI 变化使窗口/DC 变 ⇒ 键失效。
 #[cfg(target_os = "windows")]
-fn measure_text_width(hdc: HDC, text: &str) -> i32 {
+#[derive(Clone, PartialEq, Eq)]
+struct MeasureKey {
+    text: String,
+    font_size: i32,
+    dpi: u32,
+}
+
+/// OVERLAY-MEASURE-CACHE-415：「上一次」单条量宽缓存（GDI 用，值为 `i32` 像素宽）。
+///
+/// 命中判定按字段比较（`text` 以 `&str` 比 `String`，**不分配**）；`get_or_insert_with`
+/// 只在未命中时执行量宽闭包（⇒ 命中时不编码、不调用 `GetTextExtentPoint32W`）。
+#[cfg(target_os = "windows")]
+struct LastMeasure<V: Copy + Default> {
+    key: Option<MeasureKey>,
+    value: V,
+}
+
+#[cfg(target_os = "windows")]
+impl<V: Copy + Default> Default for LastMeasure<V> {
+    fn default() -> Self {
+        Self {
+            key: None,
+            value: V::default(),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl<V: Copy + Default> LastMeasure<V> {
+    /// 命中返回上次值；未命中 `None`（不分配、不量宽）。
+    fn hit(&self, text: &str, font_size: i32, dpi: u32) -> Option<V> {
+        match &self.key {
+            Some(k) if k.font_size == font_size && k.dpi == dpi && k.text == text => {
+                Some(self.value)
+            }
+            _ => None,
+        }
+    }
+
+    /// 回填（仅未命中时调用；`text` 在此刻才被拥有）。
+    fn put(&mut self, text: &str, font_size: i32, dpi: u32, value: V) {
+        self.key = Some(MeasureKey {
+            text: text.to_string(),
+            font_size,
+            dpi,
+        });
+        self.value = value;
+    }
+
+    /// 命中直接返回；未命中才执行 `measure` 并回填（唯一「编码 / 量宽」入口）。
+    fn get_or_insert_with(
+        &mut self,
+        text: &str,
+        font_size: i32,
+        dpi: u32,
+        measure: impl FnOnce() -> V,
+    ) -> V {
+        if let Some(v) = self.hit(text, font_size, dpi) {
+            return v;
+        }
+        let v = measure();
+        self.put(text, font_size, dpi, v);
+        v
+    }
+}
+
+/// OVERLAY-MEASURE-CACHE-415：DirectWrite 量宽缓存（单条）。
+///
+/// 与 GDI 分开（`LAST_DWRITE_MEASURE` vs `LAST_GDI_MEASURE`）。额外缓存 `encode_utf16`
+/// 结果 ⇒ 命中时既不建 `CreateTextLayout`、也不重新编码，编码结果直接复用给 `DrawText`。
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct DwriteMeasure {
+    key: Option<MeasureKey>,
+    width: f32,
+    encoded: Vec<u16>,
+}
+
+#[cfg(target_os = "windows")]
+impl DwriteMeasure {
+    /// 命中返回上次宽度（不建 layout、不编码）。
+    fn hit(&self, text: &str, font_size: i32, dpi: u32) -> Option<f32> {
+        match &self.key {
+            Some(k) if k.font_size == font_size && k.dpi == dpi && k.text == text => {
+                Some(self.width)
+            }
+            _ => None,
+        }
+    }
+
+    /// 回填（仅未命中时调用）：同时存编码结果供 `DrawText` 复用。
+    fn put(&mut self, text: &str, font_size: i32, dpi: u32, width: f32, encoded: Vec<u16>) {
+        self.key = Some(MeasureKey {
+            text: text.to_string(),
+            font_size,
+            dpi,
+        });
+        self.width = width;
+        self.encoded = encoded;
+    }
+
+    /// 当前缓存中的编码结果（命中或刚 `put` 后非空）。
+    fn encoded(&self) -> &[u16] {
+        &self.encoded
+    }
+}
+
+#[cfg(target_os = "windows")]
+thread_local! {
+    /// GDI 量宽缓存（`measure_text_width` 专用）。
+    static LAST_GDI_MEASURE: std::cell::RefCell<LastMeasure<i32>> =
+        std::cell::RefCell::new(LastMeasure::default());
+    /// DirectWrite 量宽 + 编码缓存（`d2d::streaming_text` 专用）。
+    static LAST_DWRITE_MEASURE: std::cell::RefCell<DwriteMeasure> =
+        std::cell::RefCell::new(DwriteMeasure::default());
+}
+
+#[cfg(target_os = "windows")]
+fn measure_text_width(hdc: HDC, text: &str, font_size: i32) -> i32 {
     if text.is_empty() {
         return 0;
     }
-    let wide = encode_wide(text);
-    let mut size = windows::Win32::Foundation::SIZE::default();
-    unsafe {
-        let len = wide.len().saturating_sub(1);
-        if len > 0 {
-            let _ = GetTextExtentPoint32W(hdc, &wide[..len], &mut size);
-        }
+    // OVERLAY-MEASURE-CACHE-415：命中直接返回（不编码、不 GetTextExtent）；未命中才量。
+    let dpi = unsafe {
+        windows::Win32::Graphics::Gdi::GetDeviceCaps(hdc, windows::Win32::Graphics::Gdi::LOGPIXELSX)
+            as u32
+    };
+    LAST_GDI_MEASURE.with(|cell| {
+        cell.borrow_mut()
+            .get_or_insert_with(text, font_size, dpi, || {
+                let wide = encode_wide(text);
+                let mut size = windows::Win32::Foundation::SIZE::default();
+                unsafe {
+                    let len = wide.len().saturating_sub(1);
+                    if len > 0 {
+                        let _ = GetTextExtentPoint32W(hdc, &wide[..len], &mut size);
+                    }
+                }
+                size.cx
+            })
+    })
+}
+
+/// OVERLAY-MEASURE-CACHE-415：量宽缓存纯逻辑单测（无需 HDC；键比较 / 取值 / 回填）。
+#[cfg(all(test, target_os = "windows"))]
+mod overlay_measure_cache_415_tests {
+    use super::{DwriteMeasure, LastMeasure};
+    use std::cell::Cell;
+
+    /// 命中返回同值，且**不再执行量宽闭包**（编码 / GetTextExtent 被跳过）。
+    #[test]
+    fn omc415_hit_skips_measure_and_returns_same() {
+        let mut c: LastMeasure<i32> = LastMeasure::default();
+        let calls = Cell::new(0);
+        assert_eq!(
+            c.get_or_insert_with("你好", -16, 96, || {
+                calls.set(calls.get() + 1);
+                120
+            }),
+            120
+        );
+        assert_eq!(calls.get(), 1, "首次未命中 ⇒ 量宽一次");
+        // 第二次同键：闭包不得再执行，且返回值逐位相同。
+        assert_eq!(
+            c.get_or_insert_with("你好", -16, 96, || {
+                calls.set(calls.get() + 1);
+                120
+            }),
+            120
+        );
+        assert_eq!(calls.get(), 1, "命中 ⇒ 不再量宽");
     }
-    size.cx
+
+    /// 文本变 / 字号变 / DPI 变 ⇒ 键失效，必须重量。
+    #[test]
+    fn omc415_key_covers_text_font_dpi() {
+        let mut c: LastMeasure<i32> = LastMeasure::default();
+        let calls = Cell::new(0);
+        let m = |v: i32| {
+            calls.set(calls.get() + 1);
+            v
+        };
+        assert_eq!(c.get_or_insert_with("abc", -16, 96, || m(10)), 10);
+        assert_eq!(c.get_or_insert_with("abd", -16, 96, || m(11)), 11, "文本变");
+        assert_eq!(c.get_or_insert_with("abc", -14, 96, || m(12)), 12, "字号变");
+        assert_eq!(
+            c.get_or_insert_with("abc", -16, 144, || m(13)),
+            13,
+            "DPI 变"
+        );
+        // 回到原键 ⇒ 缓存只留最后一条 ⇒ 已失效 ⇒ 重量。
+        assert_eq!(c.get_or_insert_with("abc", -16, 96, || m(14)), 14);
+        assert_eq!(calls.get(), 5, "四次键变化 + 回退一次，均重量");
+    }
+
+    /// GDI 与 DirectWrite 缓存**互不串**（同键各自独立取值；281：同串差 143~155px）。
+    #[test]
+    fn omc415_gdi_and_dwrite_are_independent() {
+        let mut gdi: LastMeasure<i32> = LastMeasure::default();
+        let mut dw = DwriteMeasure::default();
+        let encoded: Vec<u16> = "同样文本".encode_utf16().collect();
+        gdi.put("同样文本", -16, 96, 220);
+        dw.put("同样文本", -16, 96, 148.5, encoded.clone());
+        // 同键：各取各值，不得互串。
+        assert_eq!(gdi.hit("同样文本", -16, 96), Some(220));
+        assert_eq!(dw.hit("同样文本", -16, 96), Some(148.5));
+        assert_eq!(dw.encoded(), encoded.as_slice(), "DWrite 缓存复用编码结果");
+    }
+
+    /// DWrite：`put` 后 `hit` 命中且编码可复用；变键失效。
+    #[test]
+    fn omc415_dwrite_put_hit_and_invalidate() {
+        let mut dw = DwriteMeasure::default();
+        assert_eq!(dw.hit("x", -16, 96), None, "空缓存不命中");
+        let enc: Vec<u16> = "x".encode_utf16().collect();
+        dw.put("x", -16, 96, 7.5, enc.clone());
+        assert_eq!(dw.hit("x", -16, 96), Some(7.5));
+        assert_eq!(dw.encoded(), enc.as_slice());
+        assert_eq!(dw.hit("x", -16, 144), None, "DPI 变失效");
+        assert_eq!(dw.hit("x", -14, 96), None, "字号变失效");
+        assert_eq!(dw.hit("y", -16, 96), None, "文本变失效");
+    }
 }
 /// OVERLAY-086 / D2D-P1 / REFACTOR-088: 流式文字横向滚动偏移。
 /// 文字宽度未超出可视区时不滚动；超出后按超出量左移，
