@@ -442,3 +442,10 @@
 - **独立**：期望值 sandbox 全端口复刻验算（裁判 sim 与证据报告逐位一致；300 组种子固定可重现）。
 - **验证（白名单）**：`rustfmt --config skip_children=true`（禁递归防扰 coder-1 在途文件）；`cargo check --all-targets` 0 error、warnings bin **91** / test **87** = 基线、新模块零 warning；🔴 **未跑 `cargo test`**（阶段三禁止；tester-1 执行）。`numstat == -w`（499/0 纯新增）。未发现生产缺陷。
 - 红线：未改生产代码 / 未 commit / 未 push / 版本未动 / 零凭证。
+
+## 2026-09-25 — coder-2 — FIX-TS433R-ANCHOR ✅ 交付（只改测试；修跨行假红）
+
+- **起因**：BUILD-435 回归唯一红 `ts433r_source_anchor`；生产正确（rustfmt 拆三行），单行 `contains` 恒找不到。
+- **改法**：三锚点统一去空白口径 + 按字符取窗（`win_stream` 域 600 / 三函数体 600/900/400）；`concat!` 照旧。
+- **验证（本单允许跑测试）**：`cargo test --bin feiyin-ime testsync433_435` **14/14 全绿**；反证改名 ⇒ 该锚点红 ⇒ 已还原（`git diff -- src/main.rs` 空）；`cargo fmt --check` EXIT 0；mod.rs 34+/25- 且 `-w` 一致。
+- 红线：未改生产代码 / 未 commit / 未 push / 版本未动 / 零凭证。
