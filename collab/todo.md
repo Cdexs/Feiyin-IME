@@ -19,7 +19,7 @@
 | 文档 | 09-23 归档 handoffs 09-22 共 31 条（404 → 48 行）；todo 移出 371 + 批次十两节至 `todo-archive.md`【归档五】（352 → 247 行）。DEC-064 两层结构：**新增条目必须 archive 与索引两边都写** |
 | Worker（09-24） | ✅ 09-24 新 session 三 Worker 全部就绪：coder-1 / coder-2 主动 ACK；tester-1 注入又停在输入框，主控补 Enter 后 ACK。三方均为 OpenCode（无需 `/permissions`），待派发 |
 | 文档（09-24） | 09-24 归档 handoffs 09-23 共 35 条（405 → 41 行） |
-| 下一步 | BUILD-410（末尾窗 × 406 配合修正）已出包（HEAD `1814baf`；九项 + 专项 A~D + 三特殊点全 PASS；回归 bin 1680P/0F/52I），等 Gavin **重启后端 + 带 `-debug` 端测**（见上「端测待办」⓪）；Worker 空闲待派发 |
+| 下一步 | 🔴 BUILD-412（411+412）回归已通过（HEAD `94ab214`；bin 1716P/0F/53I，NEW 37/GONE 0），但**出包暂停**（Gavin：别频繁出包）——**未同步 Publish、未冒烟**，`Publish/` 仍为 BUILD-410。待主控统一下达出包号令后补 Step4 + 冒烟 + 九项 |
 
 ---
 
