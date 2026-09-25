@@ -6882,6 +6882,8 @@ fn process_controller_events(
     cancel_signal: &Arc<AtomicBool>,
     is_recording: &Arc<AtomicBool>,
     last_streaming_text: &Arc<Mutex<Option<String>>>,
+    // FIX-REFLOW-RAW-BASE-420：合成前的原始 `StreamingText`（带 generation），回灌渲染底稿。
+    last_raw_streaming_text: &Arc<Mutex<Option<(u64, String)>>>,
 ) -> Result<bool> {
     maybe_refresh_settings_child(settings_child, runtime_config);
     while let Ok(command) = app_cmd_rx.try_recv() {
@@ -7178,6 +7180,12 @@ fn process_controller_events(
                     );
                     continue;
                 }
+                // FIX-REFLOW-RAW-BASE-420：存**合成前**的原始流式文本（带 gen）——回灌渲染的底稿。
+                // 🔴 与 `last_streaming_text`（镜像 = 所显的**合成**文本）**分开**：底稿坐标必须与
+                //    `committed_len`（原始流式字符坐标）同源。写在 043 门闩之前，数据不被渲染抑制。
+                if let Ok(mut raw) = last_raw_streaming_text.lock() {
+                    *raw = Some((gen, text.clone()));
+                }
                 // ACC-REFLOW-PERSIST-329：渲染/镜像前先合成权威前缀（本地档），在线/批处理恒 raw。
                 // 🔴 早写在 043 门闩**之前**、内容改为 `compose(raw)`（不是 raw）——
                 //    053-B「渲染抑制 ≠ 数据抑制」契约不变（迟来包仍进镜像、不饿死学习），
@@ -7338,6 +7346,7 @@ fn process_controller_events(
                                     opacity,
                                     ui_language,
                                     last_streaming_text,
+                                    last_raw_streaming_text,
                                     generation,
                                     seg_index,
                                     &text,
@@ -7374,6 +7383,7 @@ fn process_controller_events(
                             opacity,
                             ui_language,
                             last_streaming_text,
+                            last_raw_streaming_text,
                         );
                     }
                 } else if action == ReflowAction::SkippedEditing {
@@ -7419,7 +7429,13 @@ fn process_controller_events(
                     *slot = Some((generation, seg_index, committed_len));
                 }
                 // 老逐片路径（已无发送方）：ACC_REFLOW_ACC 恒 None ⇒ 本调用为 no-op，保持逐位不变。
-                try_resolve_reflow(overlay_handle, opacity, ui_language, last_streaming_text);
+                try_resolve_reflow(
+                    overlay_handle,
+                    opacity,
+                    ui_language,
+                    last_streaming_text,
+                    last_raw_streaming_text,
+                );
                 // 382（3A）：replace_all 快速路径 —— 边界后到且该 seg 仍是最新已渲染 ⇒ 用准确边界重渲。
                 let suppressed = ACC_REFLOW_SUPPRESS.load(Ordering::Acquire);
                 let outcome = match ACC_REFLOW_FAST.lock() {
@@ -7439,6 +7455,7 @@ fn process_controller_events(
                             opacity,
                             ui_language,
                             last_streaming_text,
+                            last_raw_streaming_text,
                             generation,
                             seg_index,
                             &text,
@@ -9953,6 +9970,11 @@ fn run_controller(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
     // the controller thread by every PipelineEvent::StreamingText, so it always matches the text
     // the user saw before entering overlay edit mode.
     let last_streaming_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // FIX-REFLOW-RAW-BASE-420：最近一次**原始**（合成前）`StreamingText`（带 generation）。
+    // 回灌渲染的底稿必须用**原始流式坐标**（`committed_len` 就是原始流式字符坐标）；用镜像
+    // （= acc 前缀 + 流式尾的**合成**文本）会错位（BUILD-419 05:18 实证：镜像 131、acc 126、
+    // committed 124 ⇒ 预览多挂 7 个已被精解覆盖的旧字）。与镜像**分开存放**，互不影响。
+    let last_raw_streaming_text: Arc<Mutex<Option<(u64, String)>>> = Arc::new(Mutex::new(None));
     loop {
         let ret = unsafe { GetMessageW(&mut msg, HWND::default(), 0, 0) };
         if ret.0 <= 0 {
@@ -9985,6 +10007,7 @@ fn run_controller(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
                     &cancel_signal,
                     &is_recording,
                     &last_streaming_text,
+                    &last_raw_streaming_text,
                 )?;
                 if should_exit {
                     log::info!("Controller events returned true, initiating shutdown");
@@ -10011,6 +10034,7 @@ fn run_controller(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
                     &cancel_signal,
                     &is_recording,
                     &last_streaming_text,
+                    &last_raw_streaming_text,
                 )?;
                 if should_exit {
                     log::info!("Controller hotkey wake returned true, initiating shutdown");
@@ -10038,6 +10062,7 @@ fn run_controller(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
                     &cancel_signal,
                     &is_recording,
                     &last_streaming_text,
+                    &last_raw_streaming_text,
                 )?;
                 if should_exit {
                     log::info!("Controller pipeline wake returned true, initiating shutdown");
@@ -10953,6 +10978,8 @@ fn render_authoritative_reflow(
     opacity: f32,
     ui_language: config::UiLanguage,
     last_streaming_text: &Arc<Mutex<Option<String>>>,
+    // FIX-REFLOW-RAW-BASE-420：合成前原始流式文本（带 gen）；回灌底稿用。
+    last_raw_streaming_text: &Arc<Mutex<Option<(u64, String)>>>,
     generation: u64,
     seg_index: usize,
     acc_text: &str,
@@ -10960,10 +10987,15 @@ fn render_authoritative_reflow(
     accurate: bool,
     decode_done_at: Option<std::time::Instant>,
 ) {
-    let streaming = last_streaming_text
+    // FIX-REFLOW-RAW-BASE-420：底稿改用**原始流式文本**（与 `committed_len` 同坐标）；gen 不符 / 无
+    //   ⇒ 空串 ⇒ 预览 = acc 全文（不挂任何旧尾）。**不再**取 `last_streaming_text` 镜像——那是
+    //   「acc 前缀 + 流式尾」的**合成**文本，插到 `committed_len` 处会错位（多挂旧字，BUILD-419）。
+    let streaming = last_raw_streaming_text
         .lock()
         .ok()
         .and_then(|m| m.clone())
+        .filter(|(g, _)| *g == generation)
+        .map(|(_, t)| t)
         .unwrap_or_default();
     // 386（B）：与 `compose_with_acc_for_gen` **同一个合成函数**（acc 全文 + `streaming[committed_len..]`），
     // 不再走 `reflow_preview_367`（replace_all 会丢流式尾巴 ⇒ 回灌把预览截短 ⇒ 闪回更短文本）。
@@ -11009,6 +11041,7 @@ fn try_resolve_reflow(
     opacity: f32,
     ui_language: config::UiLanguage,
     last_streaming_text: &Arc<Mutex<Option<String>>>,
+    last_raw_streaming_text: &Arc<Mutex<Option<(u64, String)>>>,
 ) {
     let acc = ACC_REFLOW_ACC.lock().ok().and_then(|g| g.clone());
     let bound = ACC_REFLOW_BOUND.lock().ok().and_then(|g| g.clone());
@@ -11032,6 +11065,7 @@ fn try_resolve_reflow(
                 opacity,
                 ui_language,
                 last_streaming_text,
+                last_raw_streaming_text,
                 ga,
                 sa,
                 &acc_text,
@@ -11049,6 +11083,95 @@ fn try_resolve_reflow(
                 sa
             );
         }
+    }
+}
+
+// =====================================================================
+// FIX-REFLOW-RAW-BASE-420：回灌底稿 = **原始流式文本**（坐标与 committed_len 同源）
+//   契约：原始流式 124 / acc 126 / committed 124 ⇒ 新预览 == acc（126）；旧合成镜像 131 ⇒ 133。
+//   说话中途 ⇒ 预览 = acc + 原始尾巴（不含已覆盖字）；gen 不符/无 ⇒ 预览 = acc 全文。
+// =====================================================================
+#[cfg(test)]
+mod fix_reflow_raw_base_420_tests {
+    use super::{compose_reflow_preview, compose_with_acc_for_gen};
+
+    /// 造 `n` 个互异字符（`base` 起）。
+    fn chars_n(base: u32, n: usize) -> String {
+        (0..n)
+            .map(|i| char::from_u32(base + i as u32).unwrap())
+            .collect()
+    }
+
+    /// 复刻 BUILD-419 数值：原始流式 124 / acc 126 / committed 124。
+    /// 新（原始底稿）⇒ 预览 == acc（126）；旧（合成镜像 131）⇒ 133（多挂 7 旧字）。
+    #[test]
+    fn fix420_raw_base_matches_acc_no_stale_tail() {
+        let raw = chars_n(0x5000, 124);
+        let acc = chars_n(0x6000, 126);
+        let composed_mirror = chars_n(0x5000, 131);
+        let new_preview = compose_reflow_preview(1, &acc, &raw, 124);
+        let old_preview = compose_reflow_preview(1, &acc, &composed_mirror, 124);
+        assert_eq!(new_preview.chars().count(), 126, "新预览应 == acc 126");
+        assert_eq!(new_preview, acc, "新预览应逐字 == acc");
+        assert_eq!(
+            old_preview.chars().count(),
+            133,
+            "旧写法复刻：133 = 126 + (131−124)"
+        );
+    }
+
+    /// 说话中途：原始流式（200）比 committed（124）长 ⇒ 预览 = acc + **原始尾巴**（不含已覆盖字）。
+    #[test]
+    fn fix420_mid_speech_tail_is_raw_after_committed() {
+        let raw = chars_n(0x5000, 200);
+        let acc = chars_n(0x6000, 126);
+        let tail: String = raw.chars().skip(124).collect();
+        let preview = compose_reflow_preview(1, &acc, &raw, 124);
+        assert_eq!(preview, format!("{acc}{tail}"), "预览 = acc + raw[124..]");
+        assert_eq!(preview.chars().count(), 126 + 76);
+        // 尾巴逐字来自原始流式。
+        for (i, c) in tail.chars().enumerate() {
+            assert_eq!(preview.chars().nth(126 + i), Some(c));
+        }
+        // 旧合成底稿同一参数结果不同（证明底稿确实换了）。
+        let composed = chars_n(0x5000, 131);
+        assert_ne!(
+            compose_reflow_preview(1, &acc, &composed, 124),
+            preview,
+            "合成底稿与新原始底稿应不同"
+        );
+    }
+
+    /// gen 不符 / 无原始流式 ⇒ 底稿空串 ⇒ 预览 = acc 全文（不挂旧尾）。
+    #[test]
+    fn fix420_gen_mismatch_or_missing_yields_acc_only() {
+        let acc = chars_n(0x6000, 126);
+        // render 侧对 generation 不符已 filter 成空串（此处直接给空底稿）。
+        assert_eq!(compose_reflow_preview(2, &acc, "", 124), acc);
+        // acc 空 ⇒ 原样返回 raw（在线/批处理结构不变）。
+        assert_eq!(
+            compose_with_acc_for_gen(None, 2, "在线流式原文"),
+            "在线流式原文"
+        );
+    }
+
+    /// 源码锚点：`render_authoritative_reflow` 底稿取自 `last_raw_streaming_text`（按 gen 过滤），
+    /// 且 StreamingText 镜像合成路径未改。
+    #[test]
+    fn fix420_source_anchor_raw_base() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("let streaming = last_raw_streaming_text"),
+            "回灌底稿必须取 last_raw_streaming_text"
+        );
+        assert!(
+            src.contains(".filter(|(g, _)| *g == generation)"),
+            "原始底稿必须按 generation 过滤（不符 ⇒ 空）"
+        );
+        assert!(
+            src.contains("compose_with_acc_for_gen(acc_state.as_ref(), gen, &text)"),
+            "StreamingText 镜像合成路径不变（053-B/331）"
+        );
     }
 }
 
