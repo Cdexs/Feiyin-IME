@@ -12763,6 +12763,248 @@ mod short_context_413_tests {
     }
 }
 
+// =====================================================================
+// TEST-SYNC-413（阶段三 · 非作者护栏 · coder-2）：LOCALRT-SHORT-CONTEXT-413
+//   契约（独立推导，不复用作者期望值）：常规窗只完整解 must 片 + 紧邻前一片后缀；
+//   pending 经规则 3 抬 must_start；规则 4 收尾整片；区间裁剪平移；后缀时长按字速自适应；
+//   被拒兜底只覆 must 片；BUILD-399「开心开」新送解时长明显短于旧值。
+//   🔴 白名单：只 rustfmt + cargo check；未跑 cargo test。生产零改动。
+// =====================================================================
+#[cfg(test)]
+mod testsync413_tests {
+    use super::{
+        context_tail_pending, must_start_for_window, plan_windows, shift_and_concat_ranges,
+        short_context_span, tail_backtrack_secs, take_context_suffix, trim_and_shift_ranges,
+    };
+
+    const RATE: usize = 16_000;
+
+    /// 契约 1：常态单片 `must_start = ge-1`，前文只取 `ge-2` 片后缀；首片（`gs==ge-1`）无前文。
+    #[test]
+    fn ts413g_normal_and_first_slice() {
+        // 窗 [7,12)：只有末片 11 必须完整解，前文取片 10 的后缀。
+        let ms = must_start_for_window(7, 12, None, false);
+        assert_eq!(ms, 11);
+        assert_eq!(short_context_span(7, 12, ms), Some(10));
+        // is_first 但无 pending ⇒ 同样取窗末片。
+        assert_eq!(must_start_for_window(7, 12, None, true), 11);
+        // 首片窗 [4,5)：must_start==gs ⇒ 无前文。
+        let first = must_start_for_window(4, 5, None, true);
+        assert_eq!(first, 4);
+        assert_eq!(short_context_span(4, 5, first), None);
+        // must_start==gs 的通用判据。
+        assert_eq!(short_context_span(9, 9, 9), None);
+    }
+
+    /// 契约 2：本批首窗经 `plan_windows` 规则 3 并入 `pending` ⇒ `must_start = pending`；
+    /// 非首窗不受 pending 影响（仍取窗末片）。
+    #[test]
+    fn ts413g_pending_rule3_integration() {
+        // 4 片各 4s：预算 10s ⇒ 丢最远两片，起点 2（4+4+4+4 超预算）。
+        let prev = [4.0f32, 4.0, 4.0];
+        let plain = plan_windows(&prev, &[4.0], 0, None, false);
+        assert_eq!(plain.windows, vec![(2, 4)]);
+        assert_eq!(must_start_for_window(2, 4, None, true), 3);
+        // 有 pending=1 ⇒ 规则 3 把窗首抬到 1；首窗 must_start = pending。
+        let merged = plan_windows(&prev, &[4.0], 0, Some(1), false);
+        assert_eq!(merged.windows, vec![(1, 4)], "规则 3：并入待覆盖片 1");
+        assert_eq!(
+            must_start_for_window(merged.windows[0].0, merged.windows[0].1, Some(1), true),
+            1,
+            "首窗 must_start = pending"
+        );
+        // 非首窗：即使 pending 落在窗内也不受影响。
+        assert_eq!(must_start_for_window(1, 4, Some(1), false), 3);
+        // pending 落在窗外（p<gs / p>=ge）⇒ 忽略。
+        assert_eq!(must_start_for_window(5, 9, Some(3), true), 8);
+        assert_eq!(must_start_for_window(5, 9, Some(9), true), 8);
+    }
+
+    /// 契约 3（行为）：规则 4 收尾短尾窗 `(p-1,p+1)`；调用方传 `must_start=gs` ⇒
+    /// `short_context_span` 为 `None`（整片重解）。对照误按常规窗会裁剪。
+    #[test]
+    fn ts413g_rule4_tail_window_whole_prev() {
+        // 3 片各 2s、pending=2、is_tail 且待覆盖片 <3s ⇒ 与前一并 (1,3)。
+        let plan = plan_windows(&[2.0f32, 2.0, 2.0], &[], 0, Some(2), true);
+        assert_eq!(plan.windows, vec![(1, 3)]);
+        assert!(plan.pending.is_none());
+        // 传 must_start=gs=1 ⇒ 不裁剪（整片）。
+        assert_eq!(short_context_span(1, 3, 1), None);
+        // 反例：若误按常规窗取 must_start=ge-1=2 ⇒ 会裁掉片 1（证明传 gs 必要）。
+        assert_eq!(short_context_span(1, 3, 2), Some(1));
+    }
+
+    /// 契约 3（源码锚点）：常规窗 `dispatch_window!` 第 3 参为 `must_start`；规则 4 收尾窗为 `gs`。
+    #[test]
+    fn ts413g_dispatch_call_sites_source_anchor() {
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"));
+        // 常规窗：紧跟 must_start 计算点之后的调用。
+        let reg = prod
+            .iter()
+            .position(|l| l.contains("let must_start = must_start_for_window("))
+            .expect("must_start 计算锚点缺失");
+        let reg_dw = prod[reg..]
+            .iter()
+            .position(|l| l.starts_with("dispatch_window!("))
+            .map(|i| i + reg)
+            .expect("常规窗 dispatch_window! 缺失");
+        assert_eq!(
+            prod[reg_dw + 3],
+            "must_start,",
+            "常规窗第 3 参须为 must_start（少带前文）"
+        );
+        // 收尾窗：plan.windows 循环内的调用。
+        let tail = prod
+            .iter()
+            .position(|l| l.contains("for (gs, ge) in plan.windows"))
+            .expect("收尾 plan.windows 循环锚点缺失");
+        let tail_dw = prod[tail..]
+            .iter()
+            .position(|l| l.starts_with("dispatch_window!("))
+            .map(|i| i + tail)
+            .expect("收尾窗 dispatch_window! 缺失");
+        assert_eq!(
+            prod[tail_dw + 3],
+            "gs,",
+            "规则 4 收尾窗第 3 参须为 gs（整片重解）"
+        );
+    }
+
+    /// 契约 4：区间裁剪平移 —— 跨 cut 截断 / 完全在 cut 前丢弃 / `b==cut` 丢弃 / `a>=cut` 平移 / `cut=0` 恒等。
+    #[test]
+    fn ts413g_trim_and_shift_ranges() {
+        let ranges = [(100usize, 200usize), (200, 300), (0, 50), (50, 100)];
+        assert_eq!(
+            trim_and_shift_ranges(&ranges, 150),
+            vec![(0, 50), (50, 150)],
+            "跨 150 截断 + 完全在 150 前丢弃"
+        );
+        // b == cut ⇒ 丢弃（边界）。
+        assert!(trim_and_shift_ranges(&[(0, 150)], 150).is_empty());
+        // a >= cut ⇒ 纯平移。
+        assert_eq!(trim_and_shift_ranges(&[(200, 300)], 150), vec![(50, 150)]);
+        // cut=0 ⇒ 恒等。
+        assert_eq!(trim_and_shift_ranges(&ranges, 0), ranges.to_vec());
+    }
+
+    /// 契约 4（组合）：`trim_and_shift_ranges` + `shift_and_concat_ranges` ⇒ 窗内坐标正确；
+    /// 样本表首元素 = 前文后缀样本数（must 片按此偏移）；任一源 `None` ⇒ 整窗 `None`。
+    #[test]
+    fn ts413g_ranges_concat_window_coords() {
+        let ctx = trim_and_shift_ranges(&[(100usize, 200usize), (200, 300)], 150); // [(0,50),(50,150)]
+        let must = vec![(10usize, 20usize), (30, 40)];
+        let suffix_samples = 8_000usize;
+        let samples = [suffix_samples, 16_000usize];
+        let out =
+            shift_and_concat_ranges(&[Some(ctx), Some(must)], &samples).expect("两源均有区间");
+        assert_eq!(
+            out,
+            vec![(0, 50), (50, 150), (8010, 8020), (8030, 8040)],
+            "前文后缀按 cut 平移后，must 片再按后缀样本数偏移"
+        );
+        assert_eq!(samples[0], suffix_samples, "样本表首元素 = 后缀样本数");
+        // 任一源 None ⇒ 整窗 None（不新增每窗 VAD 的前提）。
+        let none_ctx: Option<Vec<(usize, usize)>> = None;
+        assert!(shift_and_concat_ranges(&[none_ctx, Some(vec![(1, 2)])], &samples).is_none());
+    }
+
+    /// 契约 5：回溯时长按本次字速自适应（快 2s / 慢 6s / 冷启动 4s）；前片短于回溯 ⇒ 取整片。
+    #[test]
+    fn ts413g_backtrack_by_rate_and_short_prev() {
+        // 12s 恒定电平（无字缝 ⇒ 回落回溯点，suffix = back）。
+        let audio = vec![0.5f32; 12 * RATE];
+        let fast = take_context_suffix(&audio, "x", "M", 8.0);
+        assert_eq!(fast.backtrack_secs, 2.0, "8 字/秒 ⇒ max(2,12/8)=2.0s");
+        assert_eq!(fast.suffix_samples, 2 * RATE);
+        assert_eq!(fast.cut, 10 * RATE);
+        let slow = take_context_suffix(&audio, "x", "M", 2.0);
+        assert_eq!(slow.backtrack_secs, 6.0, "2 字/秒 ⇒ 12/2=6.0s");
+        assert_eq!(slow.suffix_samples, 6 * RATE);
+        assert_eq!(slow.cut, 6 * RATE);
+        // 冷启动（0 / 非有限 / 负）⇒ 按 3.0 字/秒 ⇒ 4.0s。
+        for cold_rate in [0.0f32, f32::NAN, -1.0] {
+            let cs = take_context_suffix(&audio, "x", "M", cold_rate);
+            assert_eq!(
+                cs.backtrack_secs, 4.0,
+                "冷启动回溯 4.0s（rate={cold_rate}）"
+            );
+            assert_eq!(cs.suffix_samples, 4 * RATE);
+        }
+        // 前片短于回溯 ⇒ 整片（cut=0，suffix=prev.len()，基准 = 前片流式 + must）。
+        let short = vec![0.5f32; RATE]; // 1s < 6s
+        let cs = take_context_suffix(&short, "甲乙", "丙", 2.0);
+        assert_eq!(cs.cut, 0);
+        assert_eq!(cs.suffix_samples, short.len());
+        assert_eq!(cs.baseline, "甲乙丙");
+    }
+
+    /// 契约 5：406 比对基准 = 前片流式**末尾按样本比例的字符数**（多字节按 char 切，非字节）+ must 流式。
+    #[test]
+    fn ts413g_baseline_multibyte_ratio() {
+        let audio = vec![0.5f32; 12 * RATE];
+        let prev_stream = "零一二三四五六七八九"; // 10 个 char（多字节）
+                                                  // 慢速 rate=2 ⇒ suffix 6s / 12s = 0.5 ⇒ 末尾 5 字。
+        let cs = take_context_suffix(&audio, prev_stream, "末端", 2.0);
+        assert_eq!(cs.baseline, "五六七八九末端");
+        assert_eq!(cs.baseline.chars().count(), 7);
+        // 快速 rate=8 ⇒ suffix 2s / 12s = 1/6 ⇒ 10/6≈1.67 ⇒ round=2 字。
+        let cs2 = take_context_suffix(&audio, prev_stream, "末端", 8.0);
+        assert_eq!(cs2.baseline, "八九末端");
+    }
+
+    /// 契约 6：被拒兜底只覆 must 片 —— span 起点 = `must_start`、samples = must 各片长度（不含后缀）、
+    /// streaming = must 流式；无前文窗的兜底为 `None`（源码锚点）。
+    #[test]
+    fn ts413g_fallback_covers_must_only() {
+        let tp = context_tail_pending(7, 10, vec![1000, 2000, 3000], "must-stream".to_string());
+        assert_eq!(tp.span, (7, 10), "span 起点必须是 must_start");
+        assert_eq!(tp.samples, vec![1000, 2000, 3000], "样本表 = must 各片长度");
+        assert_eq!(tp.samples.iter().sum::<usize>(), 6000, "不含前文后缀样本");
+        assert_eq!(tp.streaming, "must-stream");
+        // must_start==ge（空 must）边界不 panic。
+        let empty = context_tail_pending(5, 5, vec![], String::new());
+        assert_eq!(empty.span, (5, 5));
+        assert!(empty.samples.is_empty());
+        // 源码锚点：无前文分支整窗兜底为 None。
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"));
+        assert!(
+            prod.iter()
+                .any(|l| l.contains("(audio, samples, ranges, streaming, gs, None)")),
+            "无前文分支必须整窗兜底（tail_pending 为 None）"
+        );
+    }
+
+    /// 契约 7（数值实证）：BUILD-399 09:48:21Z「开心开」—— 末片 2.85s，旧送解 9.33s；
+    /// 413 新送解 = min(回溯, 紧邻前片) + 末片。冷启动回溯 4s、前片 2.98s ⇒ 5.83s，明显短于旧值。
+    #[test]
+    fn ts413g_build399_short_context_metric() {
+        let last_slice_secs = 2.85f32;
+        let old_secs = 9.33f32;
+        let cold_backtrack = tail_backtrack_secs(3.0);
+        assert_eq!(cold_backtrack, 4.0);
+        // 前片 2.98s < 回溯 4s ⇒ 取整片 2.98s。
+        let prev_samples = (2.98f32 * RATE as f32) as usize;
+        let back = ((cold_backtrack * RATE as f32) as usize)
+            .min(prev_samples)
+            .max(1);
+        let new_secs = back as f32 / RATE as f32 + last_slice_secs;
+        assert!(
+            (new_secs - 5.83).abs() < 0.01,
+            "新送解应 ≈5.83s，实得 {new_secs}"
+        );
+        assert!(new_secs < old_secs);
+        assert!(old_secs - new_secs > 3.0, "应明显短于旧 9.33s");
+        // 上界（前片 ≥ 回溯 4s）⇒ 6.85s，仍明显短于旧值。
+        let prev_long = (5.0f32 * RATE as f32) as usize;
+        let back2 = ((cold_backtrack * RATE as f32) as usize)
+            .min(prev_long)
+            .max(1);
+        let new_long = back2 as f32 / RATE as f32 + last_slice_secs;
+        assert!((new_long - 6.85).abs() < 0.01);
+        assert!(old_secs - new_long > 2.0);
+    }
+}
+
 #[cfg(test)]
 mod plan_windows_386_tests {
     use super::{plan_windows, WindowPlan, TAIL_MERGE_MAX_SECS};
