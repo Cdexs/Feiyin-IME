@@ -21529,3 +21529,224 @@ mod testsync411_tests {
         );
     }
 }
+
+// =====================================================================
+// TEST-SYNC-423-427-429（阶段三 · 非作者护栏 · coder-2）
+//   423 收尾统一末尾组窗：emit_tail_window! 单宏两调用 / tail_window_alone 决策 / plan_windows 去 is_tail·规则4
+//   427 所有窗带前片后缀：short_context_span(ge,must_start,buf_base) 独立下标构造 / 兜底只覆 must 片
+//   429 他人段移除：reflow_preview 三态 / compose 短路反证 / hide 源码锚点
+//   🔴 白名单：只 rustfmt + cargo check；未跑 cargo test。生产零改动。
+// =====================================================================
+#[cfg(test)]
+mod testsync423_427_429_tests {
+    use super::{
+        compose_reflow_preview, plan_windows, reflow_preview, short_context_span,
+        tail_window_alone, tail_window_span,
+    };
+
+    // ---------------- 423 ----------------
+
+    /// 契约 1：末尾窗是**同一个宏** `emit_tail_window!`，长静默 / 松键各 1 处调用（生产区）。
+    #[test]
+    fn ts423g_tail_macro_single_shared_source_anchor() {
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"))
+            .join("\n");
+        assert!(
+            prod.contains(concat!("macro_rules! emit_tail_", "window")),
+            "末尾窗须是唯一宏 emit_tail_window!"
+        );
+        assert_eq!(
+            prod.matches(concat!("emit_tail_", "window!(")).count(),
+            2,
+            "长静默 + 松键 各恰 1 处调用"
+        );
+        assert!(prod.contains("\"long_silence\""), "长静默来源标注缺失");
+        assert!(prod.contains("\"stop\""), "松键来源标注缺失");
+    }
+
+    /// 契约 2：`tail_window_alone` —— 首片 ⇒ `(p,p+1)`；越界 / p<base / 无 pending ⇒ None；
+    /// 与 `tail_window_span` 在**决策层**互斥（有前片走 span，首片走 alone）。
+    #[test]
+    fn ts423g_tail_window_alone_first_slice_and_bounds() {
+        // 首片（i==0）：alone 单独解，span 无解。
+        assert_eq!(tail_window_alone(Some(5), 5, 3), Some((5, 6)));
+        assert_eq!(tail_window_span(Some(5), 5, 3), None);
+        // 越界（i >= recent_len）。
+        assert_eq!(tail_window_alone(Some(8), 5, 3), None);
+        assert_eq!(tail_window_span(Some(8), 5, 3), None);
+        // p < base。
+        assert_eq!(tail_window_alone(Some(4), 5, 3), None);
+        // 无 pending。
+        assert_eq!(tail_window_alone(None, 5, 3), None);
+        // i>0：span 有解（决策优先），alone 亦有解但不被采用。
+        assert_eq!(tail_window_span(Some(6), 5, 3), Some((5, 7, 1)));
+        assert_eq!(tail_window_alone(Some(6), 5, 3), Some((6, 7)));
+        let decide = |p: Option<usize>, base: usize, len: usize| -> Option<(usize, usize)> {
+            if let Some((gs, ge, _)) = tail_window_span(p, base, len) {
+                Some((gs, ge))
+            } else {
+                tail_window_alone(p, base, len)
+            }
+        };
+        assert_eq!(decide(Some(5), 5, 3), Some((5, 6)), "首片 ⇒ alone");
+        assert_eq!(decide(Some(6), 5, 3), Some((5, 7)), "有前片 ⇒ span");
+    }
+
+    /// 契约 3：`plan_windows` 不再有 `is_tail` / 规则 4；多片末片延后为 pending；
+    /// 松键收尾用 `pending_slice.take()` 清空（不重复组窗）。
+    #[test]
+    fn ts423g_plan_windows_no_tail_rules_and_pending_taken() {
+        let p1 = plan_windows(&[4.0f32, 4.0, 4.0], &[4.0], 0, None);
+        assert_eq!(p1.pending, None, "单片不产生 pending");
+        assert_eq!(p1.windows.len(), 1);
+        let p2 = plan_windows(&[4.0f32, 4.0, 4.0], &[4.0, 4.0], 0, None);
+        assert!(p2.pending.is_some(), "多片（≥2）末片须延后为 pending");
+        assert_eq!(p2.windows.len(), 1, "仅倒数第二片成窗（末片延后）");
+        // 源码锚点（严格限定签名区，避开注释里出现的字面量）。
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"))
+            .join("\n");
+        let rest = prod
+            .split("fn plan_windows(")
+            .nth(1)
+            .expect("plan_windows 锚点缺失");
+        let sig = &rest[..rest
+            .find(") -> WindowPlan {")
+            .expect("plan_windows 签名尾缺失")];
+        assert!(
+            !sig.contains(concat!("is_", "tail")),
+            "plan_windows 签名不得再有 is_tail 参数"
+        );
+        assert!(
+            !sig.contains(concat!("TAIL_MERGE_", "MAX_SECS")),
+            "plan_windows 签名不得再带规则 4 阈值"
+        );
+        assert!(
+            prod.contains(concat!("pending_slice.", "take()")),
+            "松键收尾须 take() 清空 pending（不重复组窗）"
+        );
+    }
+
+    // ---------------- 427 ----------------
+
+    /// 契约 4：`short_context_span(ge, must_start, buf_base)` 独立下标构造。
+    #[test]
+    fn ts427g_short_context_span_independent_cases() {
+        // 长新片：组窗排除前片（gs==must_start=11），前片 10 仍在缓冲（buf_base=10）⇒ 仍取 10。
+        assert_eq!(short_context_span(12, 11, 10), Some(10));
+        // 首片 ⇒ None。
+        assert_eq!(short_context_span(3, 0, 0), None);
+        // 前片已出缓冲（must_start-1 < buf_base）⇒ None。
+        assert_eq!(short_context_span(9, 8, 9), None);
+        // must_start == ge（无 must 片）⇒ None。
+        assert_eq!(short_context_span(5, 5, 0), None);
+        // 老情形（窗内还有更早整片 gs < must_start-1）⇒ 仍只取紧邻前一片。
+        assert_eq!(short_context_span(20, 15, 0), Some(14));
+    }
+
+    /// 契约 5：带前文窗调用点传 `buf_base`；兜底 `context_tail_pending` span 起点 = `must_start`。
+    #[test]
+    fn ts427g_context_span_and_tail_pending_anchors() {
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"))
+            .join("\n");
+        assert!(
+            prod.contains(concat!("short_context_span(ge, must_start, ", "buf_base)")),
+            "调用点须传 buf_base 判定前片是否在缓冲"
+        );
+        assert!(
+            prod.contains(concat!("fn context_tail_", "pending(")),
+            "带前文窗兜底构造函数缺失"
+        );
+        assert!(
+            prod.contains(concat!("span: (must_start, ", "ge)")),
+            "兜底 span 起点必须 = must_start（只覆 must 片）"
+        );
+    }
+
+    // ---------------- 429 ----------------
+
+    /// 契约 6：`reflow_preview` 三态 + 多字节中文按 char 切。
+    #[test]
+    fn ts429g_reflow_preview_cases() {
+        assert_eq!(
+            reflow_preview("", "abcdef", 3),
+            "def",
+            "acc 空 ⇒ raw[committed..]"
+        );
+        assert_eq!(
+            reflow_preview("权威前缀", "abcdef", 3),
+            "权威前缀def",
+            "acc 非空 ⇒ acc + raw[committed..]"
+        );
+        assert_eq!(
+            reflow_preview("权威前缀", "abcdef", 6),
+            "权威前缀",
+            "committed ≥ raw 长 ⇒ 只剩 acc"
+        );
+        assert_eq!(
+            reflow_preview("权威前缀", "abc", 9),
+            "权威前缀",
+            "committed 超长 ⇒ 只剩 acc"
+        );
+        // 多字节中文：raw 6 字，跳过前 2 字（我们）⇒ 留「一起走吧」。
+        assert_eq!(reflow_preview("确定", "我们一起走吧", 2), "确定一起走吧");
+        assert_eq!(reflow_preview("", "我们一起走吧", 0), "我们一起走吧");
+    }
+
+    /// 契约 7（反证）：`compose_reflow_preview` 在 acc 空时**短路返回 raw** ⇒ 会把他人段留下；
+    /// 这正是 429 hide 分支改用 `reflow_preview` 的原因。
+    #[test]
+    fn ts429g_compose_shortcircuit_proof() {
+        assert_eq!(
+            compose_reflow_preview(1, "", "abcdef", 3),
+            "abcdef",
+            "acc 空 ⇒ compose 短路返回 raw（他人段仍在）"
+        );
+        assert_eq!(
+            reflow_preview("", "abcdef", 3),
+            "def",
+            "同参 reflow_preview 正确剔除前 3 字"
+        );
+    }
+
+    /// 契约 7（源码锚点）：hide 回灌仅 1 处且在 `if full_drop` 内；常规回灌显式 false；
+    /// 渲染 hide 分支用 `reflow_preview`（非 compose）。
+    #[test]
+    fn ts429g_hide_source_anchor() {
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"))
+            .join("\n");
+        assert_eq!(
+            prod.matches(concat!("non_user_", "hide: true")).count(),
+            1,
+            "hide 回灌只应 1 处"
+        );
+        assert!(
+            prod.contains(concat!("non_user_", "hide: false")),
+            "常规回灌须显式 non_user_hide: false"
+        );
+        assert!(
+            prod.contains(concat!("[DBG-429] hide", " non-user segment")),
+            "缺 [DBG-429] 埋点"
+        );
+        assert!(
+            prod.contains(concat!(
+                "reflow_preview(acc_text, &streaming, ",
+                "committed_len)"
+            )),
+            "hide 渲染分支须用 reflow_preview"
+        );
+        let at = prod
+            .find(concat!("non_user_", "hide: true"))
+            .expect("hide 发送缺失");
+        let cond = prod[..at]
+            .rfind("if full_drop")
+            .expect("hide 须在 full_drop 内");
+        assert!(
+            at - cond < 1500,
+            "hide 发送须在 full_drop 块内（{at}-{cond}）"
+        );
+        assert!(
+            prod.contains("if action == ReflowAction::Applied"),
+            "回灌渲染须经 reflow_action 门（编辑态不改）"
+        );
+    }
+}
