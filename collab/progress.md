@@ -1,4 +1,9 @@
 
+### 2026-09-25 · FIX-ACC-EMPTY-RETRY-426 交付（精解报错/空纳入重试 + 重试换条件，只改 mod.rs）
+
+- 首解 Err（`No transcription result`）改按空进 `apply_acc_disposition`（触发一次重解，`[DBG-426]`）；重解走 `decode_accuracy_allow_empty_lang` + `lang_to_sherpa` 指定本窗语种（L 未知不指定）；重解仍 1 次；碎片窗留 424。首解逐位不变、421 full_drop 不变。
+- `fix426_tests` 5/5；390 cap 护栏改写（不放松）；425 harness 重放 #10 带 `language=Chinese` 出正确句。fmt/check/全量 test 0 failed（bin 1806P/0F/57I）。平台中立，MACOS-HANDOFF 已记。未出包。
+
 ### 2026-09-25 · LOCALRT-STOP-TAIL-UNIFY-423 交付（松键收尾统一走末尾组窗，只改 main.rs）
 
 - 新增 `emit_tail_window!` 宏统一组装末尾窗（有前片 ⇒ 前片后缀 + pending；首片 ⇒ `tail_window_alone` 单独解），长静默 407 与松键收尾共用；`plan_windows` 删 `is_tail`/规则 4、删 `TAIL_MERGE_MAX_SECS`；松键 `pending_slice.take()` 防重复。

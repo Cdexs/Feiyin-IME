@@ -9,6 +9,13 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-1 — FIX-ACC-EMPTY-RETRY-426 ✅ 交付（只改 mod.rs）
+
+- **范围**：`src/transcription/mod.rs`：首解 Err→进处置（`[DBG-426]`）、`decode_accuracy_allow_empty_lang`、`lang_to_sherpa`、重解闭包传 `lang_opt`、390 护栏改写、新增 `fix426_tests`（5）+ `diag426`（`#[ignore]`）。
+- **效果**：解码 Err（`No transcription result`）不再 `?` 上抛跳过 387，改按空触发一次重解；重解指定本窗 L 的 sherpa `language`（L 未知不指定）；重解仍恰 1 次。首解逐位不变；421 full_drop 早退在解码前不变。
+- **验收**：`fix426_tests` 5/5；390 cap 护栏「首解 `_allow_empty`×1 + 重解 `_lang`×1 + `Some(token_cap)`×2」；425 harness 重放 #10 带 `language=Chinese` 出正确句（`要平常，也要注意锻炼…身体才是最重要的。`）。
+- **验证**：fmt EXIT0 / check 0 error、warnings 91/87≤基线 / 全量 test 0 failed（bin 1806P/0F/57I）。平台中立，MACOS-HANDOFF 已记。未 commit / 未 build / 版本未动 / 零凭证。
+
 ## 2026-09-25 — coder-1 — DIAG-ACC-EMPTY-425 ✅ 交付（只读诊断 + 离线重放，生产零改动）
 
 - **结论**：#5 = 解码硬 Err（`get_result()` None ⇒ `Err("No transcription result")` ⇒ `?` 上抛、跳过 387 处置）；#10 = 真·空（`Ok("")` ⇒ `kind=empty` ⇒ **已重解一次**仍空 ⇒ invalid）。🔴 更正：empty **会**触发一次无注入重解（386-D1/388-D1）。

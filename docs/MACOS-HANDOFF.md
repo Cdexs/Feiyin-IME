@@ -2416,3 +2416,10 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | --- | --- | --- |
 | `main.rs`：新增宏 `emit_tail_window!`（有前片 ⇒ `tail_window_span` + `take_context_suffix` + `dispatch_tail_window!`；首片 ⇒ `tail_window_alone` 单独解），长静默 407 与松键收尾**共用**；`plan_windows` 删 `is_tail`/规则 4、删 `TAIL_MERGE_MAX_SECS` | 松键收尾（原规则 4：pending<3s 并入**前一整片** / ≥3s 单独）→ 与 407 长静默**同一末尾组窗**（前片末尾 ≥2s/≥12 字字缝后缀 + pending）；首片 pending 单独解；1900ms 已处理 ⇒ 松键不重复 | ✅ 平台中立纯逻辑（无 `cfg`），macOS 同继承 |
 | **macOS 侧需要做什么** | | 无需改动（平台中立自动继承） |
+
+## FIX-ACC-EMPTY-RETRY-426（2026-09-25，coder-1）· 精解报错/空输出重试 + 重试换语种 —— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `transcription/mod.rs`：`transcribe_acc_ctx` 首解 `Err` 不再 `?` 上抛 ⇒ `[DBG-426]` 视作空进 `apply_acc_disposition`；新增 `decode_accuracy_allow_empty_lang` + `lang_to_sherpa`；重解传 `lang_opt`（本窗 L：zh/en/ja/ko→Chinese/English/Japanese/Korean，未知不指定） | 解码 `get_result()`=None（`No transcription result`）旧：跳过整段 387 处置直接 386-C 兜底 → 新：按空触发那一次「不带注入重解」；重解**换条件指定语种**（首解与重解**同参数**时重解也易失败）。首解逐位不变；重解仍恰 1 次；421 声纹全剔（解码前早退）不变 | ✅ 平台中立纯逻辑（无 `cfg`），macOS 同继承 |
+| **macOS 侧需要做什么** | | 无需改动（平台中立自动继承） |
