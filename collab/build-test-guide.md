@@ -832,3 +832,11 @@ LAB_ROUNDS=5 cargo test --bin feiyin-ime lab_sample -- --ignored --nocapture
 
 四个用例全部 `#[ignore]`，`cargo test` 不会跑到（实测常规回归 ignored 由 9 → 13，
 passed 数不变）。**在线用例花钱，未经明确授权不得跑。**
+
+## 🔴 debug-audio 清理规则（2026-09-25 误删事故）
+
+BUILD-420 冒烟清理用通配 `rm -f target/release/debug-audio/session-*.wav`，把 Gavin 端测录音 `session-20260925-131753.wav`（39.7s，唯一一份，无备份）一并删除，导致 424 PoC 无法用该录音复盘。
+
+- `debug-audio/` 下**只允许删除本人本次冒烟生成的文件**：冒烟前后各 `ls` 一次，按差集**逐个点名**删除；**禁止任何通配删除**。
+- `session-*` / `preroll-*` 中不是本次冒烟生成的，一律不动（那是 Gavin 端测取证数据）。
+- result.md「临时文件已清理」一栏必须列出被删文件**全名**。
