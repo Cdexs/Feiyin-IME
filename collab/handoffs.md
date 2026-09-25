@@ -433,3 +433,12 @@
 - **专项**：A CT2 `efa16d81…` 未重编；B 声纹 `aa3cfc16…` 在包内、junction 保持；D 用户数据未动、`Publish/voiceprint.bin` 不存在（只列）。三特殊点 A+B+D 全 PASS。**冒烟**：`kv_long.wav` 录制，实测 `[DBG-416] seam: layer=strict k=8 e=3 edit=0.00 seq=1 span=[0, 2) prev=[0, 1) m=0 ratio=Some(0.27627) keep_prev=1 new_head_dropped="赶紧上去，给拦住了"`（431 生效）；无 panic/crash。
 - **debug-audio（新规则）**：ls 差集**点名删除本人 3 个**（`session-20260925-222827.wav`、`preroll-20260925-222827.wav`、`preroll-20260925-222827-2s.wav`），移除 0；Gavin 既有 `session-*`/`preroll-*` 未动；测后计数回 24。
 - **红线**：未改生产代码（消融全还原）/ 版本号未动 / 未 push / 未 `cargo clean` / 零凭证。证据 `collab/evidence/432/`。
+
+## 2026-09-25 — coder-2 — TEST-SYNC-433-435 ✅ 交付（阶段三·非作者护栏 13 条；生产零改动）
+
+- **范围**：只在 `src/transcription/mod.rs` 新增 `#[cfg(test)] mod testsync433_435_tests`（`+499/0`）；**未碰生产区**、未碰 `main.rs`/`local_stream.rs`（coder-1 在途）。
+- **433**：① 裁判四态（A 胜 sim 1.0 vs 5/6、B 胜、平局 Tie 取 A、R 空取 None）；② R 来源锚点（main.rs 生产区 `window_streaming_texts.get(seq)`→`win_stream`→`push_window_streaming`，定义域 12 行无 `last_streaming_text`）；③ forced/估算/concat（`forced_length_choice` 含界 0.70/1.43 六例、`forced_overlap` e 门 + 全同/全异、`estimate_overlap` <4/全异/全同 `(prefix,8,8)`、`arbitrate_or_longer` 三模式 7 例、concat 日志 + 五阈值常量）；④ 5 真实接缝真实 R（同源 fix435：Tie/A×4，sim 容差 0.01，22:36 如实 A 不凑 B）。
+- **435**：⑤ `char_sub_cost` 分档（0/0.2×7/0.6×7/1.0/非汉字）；⑥ 300 组性质测试（bit-exact xorshift：P=12 字 + 0~2 同音替换/插入/删除 + S=8 字，真管线 + 层级复核；sandbox 复刻 Strict 185/Loose 115、0 bad）；⑦ 裁判三函数体内无拼音锚点。
+- **独立**：期望值 sandbox 全端口复刻验算（裁判 sim 与证据报告逐位一致；300 组种子固定可重现）。
+- **验证（白名单）**：`rustfmt --config skip_children=true`（禁递归防扰 coder-1 在途文件）；`cargo check --all-targets` 0 error、warnings bin **91** / test **87** = 基线、新模块零 warning；🔴 **未跑 `cargo test`**（阶段三禁止；tester-1 执行）。`numstat == -w`（499/0 纯新增）。未发现生产缺陷。
+- 红线：未改生产代码 / 未 commit / 未 push / 版本未动 / 零凭证。
