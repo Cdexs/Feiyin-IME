@@ -10283,3 +10283,161 @@ mod fix426_tests {
         assert!(prod.contains("fn lang_to_sherpa("), "须有语种映射纯函数");
     }
 }
+
+// =====================================================================
+// TEST-SYNC-426（阶段三 · 非作者护栏 · coder-2）：FIX-ACC-EMPTY-RETRY-426
+//   契约：首解成功不重解 / Err(视作空)进处置重解恰1次 / 重解 Ok 采用、Err或空 invalid 返回空 /
+//         lang_to_sherpa 四语映射与未知值 / 421 全剔仍早退 / Echo·Tag·Collapse 重解也带语种
+//   🔴 白名单：只 rustfmt + cargo check；未跑 cargo test。生产零改动、不碰 main.rs。
+// =====================================================================
+#[cfg(test)]
+mod testsync426_tests {
+    use super::{apply_acc_disposition, lang_to_sherpa, GuardKind};
+
+    /// 契约 1：首解成功（有内容、无回显/标签、产出率 ok）⇒ 不重解、guard=None。
+    #[test]
+    fn ts426g_success_no_redecode() {
+        let mut calls = 0;
+        let (out, disp) = apply_acc_disposition(
+            "周末一起出去郊游吧".to_string(),
+            None,
+            4.0,
+            Some(3.0),
+            || {
+                calls += 1;
+                Ok("不应被调用".to_string())
+            },
+        );
+        assert_eq!(calls, 0, "首解有内容 ⇒ 不得重解");
+        assert_eq!(out, "周末一起出去郊游吧");
+        assert!(!disp.redecoded);
+        assert!(!disp.invalid);
+        assert_eq!(disp.guard, GuardKind::None);
+    }
+
+    /// 契约 2a：首解「空」（Err 被 426 视作空）⇒ 进处置、重解**恰 1 次**；重解 Ok 有内容 ⇒ 采用。
+    #[test]
+    fn ts426g_empty_redecodes_once_and_adopts() {
+        let mut calls = 0;
+        let (out, disp) = apply_acc_disposition(String::new(), None, 5.0, None, || {
+            calls += 1;
+            Ok("重解以后得到的正确完整内容".to_string()) // 12 字 / 5s ⇒ 冷启动产出率过
+        });
+        assert_eq!(calls, 1, "空输出必须重解恰好一次");
+        assert!(disp.redecoded);
+        assert!(!disp.invalid);
+        assert_eq!(disp.guard, GuardKind::Empty);
+        assert_eq!(out, "重解以后得到的正确完整内容");
+    }
+
+    /// 契约 2b：重解返 Err（decode Err）⇒ invalid、返回空串、重解仍恰 1 次。
+    #[test]
+    fn ts426g_redecode_err_invalid_empty() {
+        let mut calls = 0;
+        let (out, disp) = apply_acc_disposition(String::new(), None, 6.0, None, || {
+            calls += 1;
+            anyhow::bail!("模拟 get_result None / decode Err")
+        });
+        assert_eq!(calls, 1);
+        assert!(disp.redecoded && disp.invalid);
+        assert_eq!(out, "");
+    }
+
+    /// 契约 2c：重解 Ok 但内容为空 ⇒ 同样 invalid、返回空串。
+    #[test]
+    fn ts426g_redecode_still_empty_invalid() {
+        let (out, disp) =
+            apply_acc_disposition(String::new(), None, 6.0, None, || Ok(String::new()));
+        assert!(disp.redecoded && disp.invalid);
+        assert_eq!(out, "");
+    }
+
+    /// 契约 5（Echo）：词条回显触发重解恰一次，采用重解结果。
+    #[test]
+    fn ts426g_echo_trigger_redecodes_once() {
+        let inj = "苹果,香蕉,橘子,葡萄,西瓜";
+        let echoed = "苹果，香蕉，橘子，葡萄，西瓜"; // 全角逗号，归一化后逐条命中
+        let mut calls = 0;
+        let (out, disp) =
+            apply_acc_disposition(echoed.to_string(), Some(inj), 5.0, Some(2.0), || {
+                calls += 1;
+                Ok("这是重解以后得到的正确完整文本".to_string())
+            });
+        assert_eq!(calls, 1, "回显触发 ⇒ 重解恰一次");
+        assert!(disp.redecoded);
+        assert_eq!(disp.guard, GuardKind::Echo);
+        assert_eq!(out, "这是重解以后得到的正确完整文本");
+    }
+
+    /// 契约 5（Tag）：未闭合/闭合标签且剥后无内容 ⇒ Tag 触发重解恰一次。
+    #[test]
+    fn ts426g_tag_trigger_redecodes_once() {
+        let mut calls = 0;
+        let (out, disp) = apply_acc_disposition("<foo>".to_string(), None, 5.0, None, || {
+            calls += 1;
+            Ok("正常重解文本内容".to_string())
+        });
+        assert_eq!(calls, 1);
+        assert!(disp.redecoded);
+        assert_eq!(disp.guard, GuardKind::Tag);
+        assert_eq!(out, "正常重解文本内容");
+    }
+
+    /// 契约 5（Collapse）：长音频 + 极短输出（产出率坍塌）⇒ 重解恰一次、采用重解。
+    #[test]
+    fn ts426g_collapse_trigger_redecodes_once() {
+        let long = "内容".repeat(50); // 100 字
+        let mut calls = 0;
+        let (out, disp) = apply_acc_disposition("短".to_string(), None, 20.0, Some(3.0), || {
+            calls += 1;
+            Ok(long.clone())
+        });
+        assert_eq!(calls, 1);
+        assert!(disp.redecoded);
+        assert_eq!(disp.guard, GuardKind::Collapse);
+        assert_eq!(out, long);
+    }
+
+    /// 契约 3：`lang_to_sherpa` 四语映射；未知/空/大小写异常/带区域码 ⇒ None。
+    #[test]
+    fn ts426g_lang_to_sherpa_mapping() {
+        assert_eq!(lang_to_sherpa("zh"), Some("Chinese"));
+        assert_eq!(lang_to_sherpa("en"), Some("English"));
+        assert_eq!(lang_to_sherpa("ja"), Some("Japanese"));
+        assert_eq!(lang_to_sherpa("ko"), Some("Korean"));
+        for bad in ["", "ZH", "En", "zh-CN", "en-US", "fr", "gibberish", " ch"] {
+            assert_eq!(lang_to_sherpa(bad), None, "{bad:?} 不应映射");
+        }
+    }
+
+    /// 契约 1/4/5 源码锚点（生产区 + `concat!` 拆字面量防自匹配）。
+    #[test]
+    fn ts426g_source_anchors() {
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("mod.rs"))
+            .join("\n");
+        // 契约 4：421 全剔早退在**首次解码 / 426 Err 处置之前**。
+        let early = concat!("if trimmed && n_", "ranges == 0");
+        let dbg = concat!("[DBG-426] decode", " err as empty");
+        let i_early = prod.find(early).expect("缺 421 全剔早退锚点");
+        let i_dbg = prod.find(dbg).expect("缺 426 Err 处置锚点");
+        assert!(
+            i_early < i_dbg,
+            "421 全剔早退必须早于 426 Err 处置（解码前早退不重解）"
+        );
+        // 契约 1：首解走**不带语种**的 wrapper。
+        assert!(
+            prod.contains(concat!("match decode_accuracy_allow_empty(")),
+            "首解须走 decode_accuracy_allow_empty（不带 language）"
+        );
+        // 契约 5：重解走**带语种**入口，语种由 lang_to_sherpa(L) 给出。
+        assert!(
+            prod.contains(concat!("decode_accuracy_allow_empty_lang(")),
+            "重解须走带语种入口"
+        );
+        assert!(
+            prod.contains("win_lang.as_deref().and_then(lang_to_sherpa)"),
+            "重解语种须由本窗 L 经 lang_to_sherpa 映射"
+        );
+        assert!(prod.contains("fn lang_to_sherpa("), "须有语种映射纯函数");
+    }
+}
