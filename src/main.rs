@@ -9006,14 +9006,13 @@ fn spawn_worker_thread(
                                                     let stop = ge
                                                         .saturating_sub(buf_base)
                                                         .min(recent_slices.len());
-                                                    // LOCALRT-SHORT-CONTEXT-413：常规窗「少带前文」——
-                                                    // `[gs, must_start)` 是上下文片，只保留**紧邻 must_start
-                                                    // 前一片**的后缀（与 407 末尾窗同一套 `take_context_suffix`）；
-                                                    // 更早的上下文片整片丢弃。原因：派发时无法预知是否末句，
-                                                    // 不减则末片 2.85s 也会带上整段前文送解（BUILD-399 9.33s /
-                                                    // decode 2194ms），而解码耗时随音频长度线性增长（Gavin 09-25）。
-                                                    // 首片 / 无前文（`must_start == gs`）⇒ 只解 must 片本身。
-                                                    let ctx_global = short_context_span(gs, ge, must_start);
+                                                    // LOCALRT-SHORT-CONTEXT-413 / ALWAYS-CONTEXT-427：常规窗前文
+                                                    // 只保留**紧邻 must_start 前一片**的后缀（同一套
+                                                    // `take_context_suffix`），更早的上下文片整片丢弃 —— 避免末片
+                                                    // 2.85s 也带上整段前文送解（BUILD-399 9.33s / decode 2194ms）。
+                                                    // 427（Gavin 2026-09-25）：新片长致 `gs == must_start` 时，
+                                                    // **仍**取紧邻前一片后缀（只要它还在缓冲内）⇒ 所有常规窗都带前文。
+                                                    let ctx_global = short_context_span(ge, must_start, buf_base);
                                                     let must_local =
                                                         must_start.saturating_sub(buf_base).clamp(start, stop);
                                                     let (window_audio, window_samples_vec, window_ranges, window_streaming, span_start, tail_pending) =
@@ -12820,13 +12819,19 @@ fn must_start_for_window(
     ge.saturating_sub(1)
 }
 
-/// LOCALRT-SHORT-CONTEXT-413：本窗「前文后缀」取自哪一片（纯函数，可单测）。
+/// LOCALRT-ALWAYS-CONTEXT-427：本窗「前文后缀」取自哪一片（纯函数，可单测）。
 ///
-/// 窗内 `[gs, must_start)` 原本是「上下文片」；413 只保留**紧邻 `must_start` 前一片**
-/// （下标 `must_start-1`）的后缀，更早的上下文片整片丢弃。`must_start == gs`（首片 / 无前文）
-/// ⇒ `None`。返回**全局切片下标**，调用方换算到 `recent_slices` 局部下标。
-fn short_context_span(gs: usize, ge: usize, must_start: usize) -> Option<usize> {
-    if must_start > gs && must_start < ge {
+/// Gavin 2026-09-25：「不管新句多长，只要本次录音前面还有片，就从前一片末尾切一截带上；
+/// 10s 上限只决定前面整片要不要一起重解，不再影响带不带末尾一截」。
+///
+/// 413 原判据 `must_start > gs` 在**新片长**时（`group_window_start_secs` 把前片排除 ⇒ `gs == must_start`）
+/// 返回 `None` ⇒ 长句窗无前文（日志 `[LocalRT-DBG-413] prev_cut_secs=0.00`）。427 改为：只要紧邻前一片
+/// （`must_start-1`）**仍在 `recent_slices` 缓冲内**（`>= buf_base`）就取其后缀，**不再要求它落在
+/// `[gs, ge)` 内**。首片 / 前片已被缓冲裁掉 ⇒ `None`。返回**全局切片下标**，调用方换算到局部下标。
+///
+/// `gs < must_start-1`（窗内还有更早的整片）⇒ 与 413 相同：更早整片丢弃，只留紧邻前一片后缀。
+fn short_context_span(ge: usize, must_start: usize, buf_base: usize) -> Option<usize> {
+    if must_start >= 1 && must_start < ge && must_start - 1 >= buf_base {
         Some(must_start - 1)
     } else {
         None
@@ -13562,8 +13567,8 @@ mod tail_window_407_tests {
     }
 }
 
-/// LOCALRT-SHORT-CONTEXT-413：常规窗「少带前文」纯函数（`must_start` / 前文片 / 区间裁剪 /
-/// 取后缀）。收尾短尾窗（`plan_windows` 规则 4）**不变**，见 `ts413_rule4_*`。
+/// LOCALRT-SHORT-CONTEXT-413 / ALWAYS-CONTEXT-427：常规窗「前文后缀」纯函数
+///（`must_start` / 前文片 / 区间裁剪 / 取后缀）。427 起只要紧邻前一片在缓冲内就取后缀。
 #[cfg(test)]
 mod short_context_413_tests {
     use super::{
@@ -13577,28 +13582,27 @@ mod short_context_413_tests {
         let ms = must_start_for_window(0, 5, None, true);
         assert_eq!(ms, 4, "常态：只有窗末新片必须完整解");
         assert_eq!(
-            short_context_span(0, 5, ms),
+            short_context_span(5, ms, 0),
             Some(3),
             "前文只取紧邻前一片（片 3）的后缀，片 0~2 丢弃"
         );
     }
 
-    /// 规则 3 并入 pending：首个窗口 `must_start = pending`（pending 到新片全部完整解）。
-    /// pending 被规则 3 抬为窗首（`gs==pending`）⇒ 窗内无更早上下文片；pending 落在 group 窗内部
-    /// （`gs < pending`）⇒ 前文取 pending 前一片。
+    /// 427：规则 3 并入 pending ⇒ `must_start = pending`；**即便 `gs == pending`**，只要前一片
+    /// （`pending-1`）仍在缓冲内 ⇒ 仍取其后缀（旧 413 此处为 None ⇒ 无前文）。
     #[test]
-    fn ts413_pending_merged_sets_must_start_to_pending() {
+    fn ts427_pending_merged_still_takes_prev_suffix() {
         let ms = must_start_for_window(2, 6, Some(2), true);
         assert_eq!(ms, 2, "pending 并进来后从 pending 起必须完整解");
         assert_eq!(
-            short_context_span(2, 6, ms),
-            None,
-            "pending 即窗首 ⇒ 窗内无更早上下文片（pending 到新片整片解）"
+            short_context_span(6, ms, 0),
+            Some(1),
+            "427：pending 前一片仍在缓冲内 ⇒ 取其后缀（旧 413 为 None）"
         );
 
         let ms2 = must_start_for_window(1, 6, Some(3), true);
         assert_eq!(ms2, 3);
-        assert_eq!(short_context_span(1, 6, ms2), Some(2));
+        assert_eq!(short_context_span(6, ms2, 0), Some(2));
     }
 
     /// 多片切分：首个窗口可并入 pending；后续子窗 `must_start = 自己的片`（前片已解，仅作前文）。
@@ -13606,32 +13610,38 @@ mod short_context_413_tests {
     fn ts413_multi_slice_windows() {
         let first = must_start_for_window(0, 3, Some(1), true);
         assert_eq!(first, 1, "首个窗口并入 pending=1");
-        assert_eq!(short_context_span(0, 3, first), Some(0));
+        assert_eq!(short_context_span(3, first, 0), Some(0));
 
         let later = must_start_for_window(2, 4, Some(1), false);
         assert_eq!(
             later, 3,
             "后续子窗只有自己的片必须完整解（pending 已被前窗消费）"
         );
-        assert_eq!(short_context_span(2, 4, later), Some(2));
+        assert_eq!(short_context_span(4, later, 0), Some(2));
     }
 
-    /// 首片无前片 ⇒ 只解新片本身（与现状一致，无前文后缀）。
+    /// 首片无前片 ⇒ 只解新片本身；前片已被缓冲裁掉 ⇒ 也无前文（427 边界）。
     #[test]
-    fn ts413_first_slice_has_no_context() {
+    fn ts427_first_slice_or_evicted_prev_has_no_context() {
         let ms = must_start_for_window(0, 1, None, true);
         assert_eq!(ms, 0);
-        assert_eq!(short_context_span(0, 1, ms), None);
-        // must_start == gs（窗内无上下文片）一律无前文。
-        assert_eq!(short_context_span(7, 8, 7), None);
+        assert_eq!(short_context_span(1, ms, 0), None, "首片无前片");
+        // 紧邻前一片已被缓冲裁掉（must_start-1 < buf_base）⇒ 无前文。
+        assert_eq!(short_context_span(8, 7, 7), None, "前片出缓冲");
     }
 
-    /// 无前文（`must_start == gs`）⇒ `short_context_span` 无前文后缀（首片行为不变）。
+    /// 427 核心：`gs == must_start`（新片长致前片被 10s 上限排除）时**仍有**前文后缀 —— 只要
+    /// 紧邻前一片还在缓冲内（旧 413 判据 `must_start > gs` 在此返回 None ⇒ 长句无前文）。
     #[test]
-    fn short_context_span_no_prev_is_none() {
-        for (gs, ge) in [(0usize, 2usize), (3, 5)] {
-            assert_eq!(short_context_span(gs, ge, gs), None, "({gs},{ge})");
-        }
+    fn ts427_long_new_slice_still_has_prev_context() {
+        // 窗 (gs=9, ge=12)、must_start=11 ⇒ 前文取片 10（旧 413：9<... 满足 Some(10)）；
+        // 关键：若 gs==must_start（前片被 group 窗排除），427 仍取 must_start-1。
+        assert_eq!(short_context_span(12, 11, 0), Some(10));
+        assert_eq!(
+            short_context_span(11, 10, 0),
+            Some(9),
+            "新片长致 gs==must_start ⇒ 427 仍取紧邻前一片后缀"
+        );
     }
 
     /// 🔴 423（Gavin 2026-09-25）：收尾统一走末尾组窗 ⇒ **不再有** `dispatch_window!(…, gs, …)` 收尾调用；
@@ -13758,21 +13768,18 @@ mod testsync413_tests {
 
     const RATE: usize = 16_000;
 
-    /// 契约 1：常态单片 `must_start = ge-1`，前文只取 `ge-2` 片后缀；首片（`gs==ge-1`）无前文。
+    /// 契约 1：常态单片 `must_start = ge-1`，前文只取 `ge-2` 片后缀；首片 / 前片出缓冲无前文。
     #[test]
     fn ts413g_normal_and_first_slice() {
         // 窗 [7,12)：只有末片 11 必须完整解，前文取片 10 的后缀。
         let ms = must_start_for_window(7, 12, None, false);
         assert_eq!(ms, 11);
-        assert_eq!(short_context_span(7, 12, ms), Some(10));
+        assert_eq!(short_context_span(12, ms, 0), Some(10));
         // is_first 但无 pending ⇒ 同样取窗末片。
         assert_eq!(must_start_for_window(7, 12, None, true), 11);
-        // 首片窗 [4,5)：must_start==gs ⇒ 无前文。
-        let first = must_start_for_window(4, 5, None, true);
-        assert_eq!(first, 4);
-        assert_eq!(short_context_span(4, 5, first), None);
-        // must_start==gs 的通用判据。
-        assert_eq!(short_context_span(9, 9, 9), None);
+        // 首片（must_start==0）⇒ 无前文；前片已被缓冲裁掉（must_start-1 < buf_base）⇒ 无前文。
+        assert_eq!(short_context_span(1, 0, 0), None, "首片无前片");
+        assert_eq!(short_context_span(5, 4, 4), None, "前片出缓冲");
     }
 
     /// 契约 2：本批首窗经 `plan_windows` 规则 3 并入 `pending` ⇒ `must_start = pending`；
@@ -13799,14 +13806,15 @@ mod testsync413_tests {
         assert_eq!(must_start_for_window(5, 9, Some(9), true), 8);
     }
 
-    /// 423：`plan_windows` 不再组收尾窗（收尾统一走 `emit_tail_window!`）；无前文 ⇒ `short_context_span` 为 None。
+    /// 423/427：`plan_windows` 不再组收尾窗；`short_context_span` 取紧邻前一片（缓冲内）。
     #[test]
-    fn ts423g_plan_windows_no_tail_and_no_prev_span() {
+    fn ts423g_plan_windows_no_tail_and_prev_span() {
         let plan = plan_windows(&[2.0f32, 2.0, 2.0], &[], 0, Some(2));
         assert!(plan.windows.is_empty(), "423：plan_windows 不再组收尾窗");
         assert_eq!(plan.pending, Some(2), "pending 保留待末尾窗");
-        assert_eq!(short_context_span(1, 3, 1), None, "无前文 ⇒ 不裁剪");
-        assert_eq!(short_context_span(1, 3, 2), Some(1));
+        // 427：前一片在缓冲内 ⇒ 取其后缀；前片已出缓冲 ⇒ None。
+        assert_eq!(short_context_span(3, 2, 0), Some(1));
+        assert_eq!(short_context_span(3, 1, 1), None, "前片出缓冲 ⇒ 无前文");
     }
 
     /// 423（源码锚点）：常规窗 `dispatch_window!` 第 3 参为 `must_start`；收尾统一走 `emit_tail_window!`
