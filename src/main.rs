@@ -9208,6 +9208,90 @@ fn spawn_worker_thread(
                                                     window_seq += 1;
                                                 }};
                                             }
+                                            // LOCALRT-STOP-TAIL-UNIFY-423：**末尾窗统一组装**（长静默 407 与松键
+                                            // 收尾共用，禁两份）。有前片 ⇒ 前片末尾后缀（`take_context_suffix`，
+                                            // ≥2s/≥12 字、字缝切）+ pending；无前片（pending 是首片）⇒ 单独解 pending。
+                                            // 410 pending 兜底元数据由 `dispatch_tail_window!` 统一填。
+                                            macro_rules! emit_tail_window {
+                                                ($p:expr, $pcm_pos:expr, $src:expr) => {{
+                                                    let p: usize = $p;
+                                                    let prev_base = total_slices - recent_slices.len();
+                                                    if let Some((gs, ge, i)) =
+                                                        tail_window_span(Some(p), prev_base, recent_slices.len())
+                                                    {
+                                                        let prev_slice = &recent_slices[i - 1];
+                                                        let rate_cps = transcription::acc_avg_chars_per_sec(
+                                                            rate_sum_chars,
+                                                            rate_sum_secs,
+                                                            rate_windows,
+                                                        )
+                                                        .unwrap_or(3.0);
+                                                        let cs = take_context_suffix(
+                                                            prev_slice,
+                                                            &recent_streaming[i - 1],
+                                                            &recent_streaming[i],
+                                                            rate_cps,
+                                                        );
+                                                        let mut audio: Vec<f32> =
+                                                            prev_slice[cs.cut..].to_vec();
+                                                        audio.extend_from_slice(&recent_slices[i]);
+                                                        let samples = vec![
+                                                            cs.suffix_samples,
+                                                            recent_slices[i].len(),
+                                                        ];
+                                                        let streaming = cs.baseline;
+                                                        if log::log_enabled!(log::Level::Debug) {
+                                                            let gap = if cs.gap_found { "found" } else { "no_gap" };
+                                                            log::debug!(
+                                                                "[LocalRT-DBG-407] tail window (src={}): pending={} prev_cut_secs={:.2} prev_suffix_chars={} backtrack_secs={:.2} rate_cps={:.2} gap={} window_secs={:.2} pcm_pos={}",
+                                                                $src,
+                                                                p,
+                                                                cs.cut as f32 / 16000.0,
+                                                                cs.suffix_chars,
+                                                                cs.backtrack_secs,
+                                                                rate_cps,
+                                                                gap,
+                                                                audio.len() as f32 / 16000.0,
+                                                                $pcm_pos
+                                                            );
+                                                        }
+                                                        dispatch_tail_window!(
+                                                            gs,
+                                                            ge,
+                                                            audio,
+                                                            samples,
+                                                            streaming,
+                                                            vec![recent_slices[i].len()],
+                                                            recent_streaming[i].clone()
+                                                        );
+                                                    } else if let Some((gs, ge)) =
+                                                        tail_window_alone(Some(p), prev_base, recent_slices.len())
+                                                    {
+                                                        // 423：pending 是首片（无前片）⇒ 单独解（与 407 同）。
+                                                        let i0 = p - prev_base;
+                                                        let audio: Vec<f32> = recent_slices[i0].clone();
+                                                        let samples = vec![recent_slices[i0].len()];
+                                                        let streaming = recent_streaming[i0].clone();
+                                                        if log::log_enabled!(log::Level::Debug) {
+                                                            log::debug!(
+                                                                "[LocalRT-DBG-423] tail window alone (src={}): pending={} window_secs={:.2}",
+                                                                $src,
+                                                                p,
+                                                                audio.len() as f32 / 16000.0
+                                                            );
+                                                        }
+                                                        dispatch_tail_window!(
+                                                            gs,
+                                                            ge,
+                                                            audio,
+                                                            samples,
+                                                            streaming,
+                                                            vec![recent_slices[i0].len()],
+                                                            recent_streaming[i0].clone()
+                                                        );
+                                                    }
+                                                }};
+                                            }
                                             // FIX-PREVIEW-HARVEST-380（A）：select 循环 —— 新切片与解码结果
                                             // **任一先到即处理**，不再等下一个切片（Gavin 现象①：停顿即停刷）。
                                             let mut step =
@@ -9248,7 +9332,6 @@ fn spawn_worker_thread(
                                                                 &new_durs,
                                                                 prev_base,
                                                                 pending_slice,
-                                                                false,
                                                             );
                                                             pending_slice = plan.pending;
                                                             // FIX-SPLIT-SLICE-STREAMING-411 埋点（Debug 守卫，仅多片）：
@@ -9355,62 +9438,9 @@ fn spawn_worker_thread(
                                                                     );
                                                                 }
                                                                 if let Some(p) = pending_slice {
-                                                                    let prev_base = total_slices - recent_slices.len();
-                                                                    // 407 纯决策：有 pending 且有前片 ⇒ 末尾窗 span (p-1,p+1)、前片下标 i。
-                                                                    if let Some((gs, ge, i)) =
-                                                                        tail_window_span(Some(p), prev_base, recent_slices.len())
-                                                                    {
-                                                                        let prev_slice = &recent_slices[i - 1];
-                                                                        // 407 R1：回溯时长按本次字速自适应（冷启动 3.0 字/秒），再封顶为整个前片。
-                                                                        let rate_cps = transcription::acc_avg_chars_per_sec(
-                                                                            rate_sum_chars,
-                                                                            rate_sum_secs,
-                                                                            rate_windows,
-                                                                        )
-                                                                        .unwrap_or(3.0);
-                                                                        // 410 item1：末尾窗音频只含前片**最后 `cut` 起**的后缀 ⇒ 比对基准的
-                                                                        // 前片部分也按样本占比只取末尾相应**字符数**（char 切、禁字节下标），
-                                                                        // 再接 pending 流式。否则基准含整片 ⇒ 正确精解被 406 误拒。
-                                                                        // 413：与常规窗共用同一套「取前片后缀」函数（`take_context_suffix`）。
-                                                                        let cs = take_context_suffix(
-                                                                            prev_slice,
-                                                                            &recent_streaming[i - 1],
-                                                                            &recent_streaming[i],
-                                                                            rate_cps,
-                                                                        );
-                                                                        let mut audio: Vec<f32> =
-                                                                            prev_slice[cs.cut..].to_vec();
-                                                                        audio.extend_from_slice(&recent_slices[i]);
-                                                                        let samples = vec![
-                                                                            cs.suffix_samples,
-                                                                            recent_slices[i].len(),
-                                                                        ];
-                                                                        let streaming = cs.baseline;
-                                                                        if log::log_enabled!(log::Level::Debug) {
-                                                                            let gap = if cs.gap_found { "found" } else { "no_gap" };
-                                                                            log::debug!(
-                                                                                "[LocalRT-DBG-407] tail window: pending={} prev_cut_secs={:.2} prev_suffix_chars={} backtrack_secs={:.2} rate_cps={:.2} gap={} window_secs={:.2} pcm_pos={}",
-                                                                                p,
-                                                                                cs.cut as f32 / 16000.0,
-                                                                                cs.suffix_chars,
-                                                                                cs.backtrack_secs,
-                                                                                rate_cps,
-                                                                                gap,
-                                                                                audio.len() as f32 / 16000.0,
-                                                                                pcm_pos
-                                                                            );
-                                                                        }
-                                                                        dispatch_tail_window!(
-                                                                            gs,
-                                                                            ge,
-                                                                            audio,
-                                                                            samples,
-                                                                            streaming,
-                                                                            vec![recent_slices[i].len()],
-                                                                            recent_streaming[i].clone()
-                                                                        );
-                                                                    }
-                                                                    // pending 已被末尾窗覆盖 ⇒ 清空；停止键收尾不再重复处理。
+                                                                    // 423：长静默与松键收尾**共用同一末尾窗组装**。
+                                                                    emit_tail_window!(p, pcm_pos, "long_silence");
+                                                                    // pending 已被末尾窗覆盖 ⇒ 清空；松键收尾不再重复处理。
                                                                     pending_slice = None;
                                                                 }
                                                             }
@@ -9427,39 +9457,13 @@ fn spawn_worker_thread(
                                                 &mut step,
                                             );
                                             drop(step);
-                                            // 386（A.4）：松键收尾 —— 处理仍待覆盖的片：
-                                            // <3s 且前面有片 ⇒ 与前一并重解；否则单独组窗。
-                                            if pending_slice.is_some() {
-                                                let prev_base = total_slices - recent_slices.len();
-                                                let prev_durs: Vec<f32> = recent_slices
-                                                    .iter()
-                                                    .map(|s| s.len() as f32 / 16000.0)
-                                                    .collect();
-                                                let plan = plan_windows(
-                                                    &prev_durs,
-                                                    &[],
-                                                    prev_base,
-                                                    pending_slice,
-                                                    true,
-                                                );
-                                                debug_assert!(
-                                                    plan.pending.is_none(),
-                                                    "386：收尾后不应再有待覆盖片"
-                                                );
-                                                for (gs, ge) in plan.windows {
-                                                    // 389（D3）：收尾合并窗含该次派发末片（pending）⇒ 准确边界。
-                                                    // 413（主控确认）：收尾短尾窗（规则 4，(p-1,p+1)）的
-                                                    // 「前一片重解」是 Gavin 要的语义 ⇒ `must_start = gs`，
-                                                    // 保持整片送解；只有**常规窗**少带前文。
-                                                    dispatch_window!(
-                                                        gs,
-                                                        ge,
-                                                        gs,
-                                                        last_dispatch_idx,
-                                                        last_committed_len,
-                                                        true
-                                                    );
-                                                }
+                                            // LOCALRT-STOP-TAIL-UNIFY-423：松键收尾有 pending ⇒ **一律**走与
+                                            // 407 长静默相同的末尾窗（前片末尾后缀 + pending；pending 首片 ⇒
+                                            // 单独解），不再按 <3s / ≥3s 分叉（Gavin 2026-09-25：「无论 1900ms
+                                            // 触发还是松键触发，都该走同样的末尾组窗机制」）。若 407 已在
+                                            // 1900ms 处理过 pending ⇒ 此处 `pending_slice` 已为 `None` ⇒ 不重复组窗。
+                                            if let Some(p) = pending_slice.take() {
+                                                emit_tail_window!(p, 0usize, "stop");
                                             }
                                             // 收尾：等齐所有在飞窗口（共 window_seq 条）。
                                             // select 期间已收的已计入 `done`；本段只等还没收的。
@@ -12702,10 +12706,10 @@ fn partial_win_committed(
         + (((committed_len.saturating_sub(prev_committed)) as f32) * frac).round() as usize
 }
 
-/// 386：短尾合并阈值（秒）—— 收尾时待覆盖片 < 此值且前面有片 ⇒ 与前一并重解。
-const TAIL_MERGE_MAX_SECS: f32 = 3.0;
-
 /// 386：组窗计划（纯函数输出）。
+///
+/// LOCALRT-STOP-TAIL-UNIFY-423：收尾（松键）不再走本函数 —— 统一走 `emit_tail_window!`
+/// （末尾组窗），故原「规则 4 短尾合并」与 `TAIL_MERGE_MAX_SECS` 一并删除。
 #[derive(Debug, PartialEq, Eq)]
 struct WindowPlan {
     /// 本次要**立刻派发**的窗口（全局切片区间 `[start,end)`，按序）。
@@ -12728,6 +12732,25 @@ fn tail_window_span(
     let i = p.checked_sub(prev_base)?;
     if i > 0 && i < recent_len {
         Some((p - 1, p + 1, i))
+    } else {
+        None
+    }
+}
+
+/// LOCALRT-STOP-TAIL-UNIFY-423：末尾窗「**单独解**」纯决策 —— `pending` 落在 `recent` 范围内但
+/// **是首片**（无前片）⇒ 返回单独窗 span `(p, p+1)`；越界 / 无 pending ⇒ `None`。
+///
+/// 与 [`tail_window_span`] 配合：`span` 有解 ⇒ 前片后缀 + pending；`alone` 有解 ⇒ 单独解 pending。
+/// 长静默与松键收尾**共用**（`emit_tail_window!`），不再按 pending 时长（<3s / ≥3s）分叉。
+fn tail_window_alone(
+    pending: Option<usize>,
+    prev_base: usize,
+    recent_len: usize,
+) -> Option<(usize, usize)> {
+    let p = pending?;
+    let i = p.checked_sub(prev_base)?;
+    if i < recent_len {
+        Some((p, p + 1))
     } else {
         None
     }
@@ -12895,25 +12918,25 @@ fn context_tail_pending(
     }
 }
 
-/// FIX-TAIL-WINDOW-AND-FALLBACK-386：组窗纯函数（在 382 基础上加「延后尾片 / 收尾合并」）。
+/// FIX-TAIL-WINDOW-AND-FALLBACK-386：组窗纯函数（**中途派发**用）。
 ///
 /// 输入：`prev_durs` 已派发片时长（时间序，调用方保证已按 `WINDOW_MAX_SLICES` 裁剪）；
 /// `prev_base` = `prev_durs[0]` 的全局下标；`new_durs` = 本次派发携带的新片时长（时间序）；
-/// `pending` = 上一次遗留的**待覆盖片**全局下标（`None` = 无）；`is_tail` = 是否收尾（松键、不再有新片）。
+/// `pending` = 上一次遗留的**待覆盖片**全局下标（`None` = 无）。
 ///
 /// 规则（Gavin 2026-09-23 BUILD-385 端测）：
 /// 1. 单次派发 **1 片**（常态）⇒ 与旧行为相同，立刻组窗（含把 `pending` 强制纳入）。
 /// 2. 单次派发 **≥2 片**（被切分）⇒ 除**最后一片**外每片立刻组窗；最后一片不组窗，记为待覆盖片。
 /// 3. 有 `pending` 时，**本批第一个窗口起点强制 ≤ pending**（把待覆盖片纳入，**哪怕总长超 `WINDOW_MAX_SECS`**）。
-/// 4. `is_tail` 且仍有待覆盖片：其时长 < [`TAIL_MERGE_MAX_SECS`] 且**前面有片** ⇒ 组窗 `[待覆盖片-1, 待覆盖片+1)`
-///    （**前一片重解**，Gavin 要的）；否则 ⇒ 单独组窗 `[待覆盖片, 待覆盖片+1)`。
-/// 5. 🔴 覆盖不变量：**每个已派发切片在收尾时都至少被一个窗口覆盖**（延后片由「下次首个窗」或「收尾窗」覆盖）。
+///
+/// 🔴 LOCALRT-STOP-TAIL-UNIFY-423：**收尾（松键）不再走本函数** —— 松键有 pending 时统一走
+/// `emit_tail_window!`（末尾组窗：前片后缀 + pending），与 407 长静默机制一致；原「规则 4 短尾合并」
+/// 与 `is_tail` 参数、`TAIL_MERGE_MAX_SECS` 一并删除。本函数只服务**中途切片派发**。
 fn plan_windows(
     prev_durs: &[f32],
     new_durs: &[f32],
     prev_base: usize,
     pending: Option<usize>,
-    is_tail: bool,
 ) -> WindowPlan {
     let mut buf: Vec<f32> = prev_durs.to_vec();
     let mut base = prev_base; // buf[0] 的全局下标
@@ -12929,8 +12952,8 @@ fn plan_windows(
         }
         let end = base + buf.len();
         let is_last = k + 1 == n;
-        // 规则 2：一次派发 ≥2 片 ⇒ 最后一片**延后**（不收尾时）。
-        if is_last && !is_tail && n >= 2 {
+        // 规则 2：一次派发 ≥2 片 ⇒ 最后一片**延后**（收尾由 `emit_tail_window!` 覆盖）。
+        if is_last && n >= 2 {
             pend = Some(end - 1);
             continue;
         }
@@ -12944,21 +12967,6 @@ fn plan_windows(
             pend = None;
         }
         out.push((start, end));
-    }
-
-    // 规则 4：收尾处理仍待覆盖的片。
-    if is_tail {
-        if let Some(p) = pend {
-            let idx = p.checked_sub(base);
-            let dur = idx.and_then(|i| buf.get(i).copied());
-            let has_prev = idx.map_or(false, |i| i > 0);
-            if has_prev && matches!(dur, Some(d) if d < TAIL_MERGE_MAX_SECS) {
-                out.push((p - 1, p + 1)); // 短尾与前一并（前片重解）
-            } else {
-                out.push((p, p + 1)); // 单独
-            }
-            pend = None;
-        }
     }
 
     WindowPlan {
@@ -13618,37 +13626,37 @@ mod short_context_413_tests {
         assert_eq!(short_context_span(7, 8, 7), None);
     }
 
-    /// 🔴 规则 4 收尾短尾窗 `(p-1,p+1)`：调用方传 `must_start = gs`（前一片重解）⇒
-    /// `short_context_span` 返回 `None` ⇒ 不裁剪、仍送整片（Gavin 要的语义）。
+    /// 无前文（`must_start == gs`）⇒ `short_context_span` 无前文后缀（首片行为不变）。
     #[test]
-    fn ts413_rule4_tail_merge_keeps_whole_prev() {
+    fn short_context_span_no_prev_is_none() {
         for (gs, ge) in [(0usize, 2usize), (3, 5)] {
-            assert_eq!(
-                short_context_span(gs, ge, gs),
-                None,
-                "规则 4 传入 must_start=gs ⇒ 必须不产生前文后缀（整片送解）: ({gs},{ge})"
-            );
+            assert_eq!(short_context_span(gs, ge, gs), None, "({gs},{ge})");
         }
     }
 
-    /// 🔴 源码护栏（主控要求）：规则 4 收尾短尾窗的 `dispatch_window!` 第 3 个实参是 `gs`
-    /// （整片重解），常规窗第 3 个实参是 `must_start`（少带前文）。防日后把收尾窗也改成 `must_start`。
+    /// 🔴 423（Gavin 2026-09-25）：收尾统一走末尾组窗 ⇒ **不再有** `dispatch_window!(…, gs, …)` 收尾调用；
+    /// 常规窗仍恰 1 处传 `must_start`；末尾窗统一宏 `emit_tail_window!` 必须存在。防回退。
     #[test]
-    fn ts413_rule4_call_site_passes_gs_not_must_start() {
+    fn ts423_single_dispatch_window_call_and_tail_macro() {
         let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"));
-        let (mut regular, mut tail) = (0usize, 0usize);
+        let (mut regular, mut tail_gs) = (0usize, 0usize);
         for i in 0..prod.len() {
             if prod[i].starts_with("dispatch_window!(") {
                 let arg3 = prod.get(i + 3).map(|s| s.as_str()).unwrap_or("");
-                if arg3 == "must_start," {
+                if arg3 == concat!("must", "_start,") {
                     regular += 1;
                 } else if arg3 == "gs," {
-                    tail += 1;
+                    tail_gs += 1;
                 }
             }
         }
         assert_eq!(regular, 1, "常规窗应恰有 1 处传 must_start");
-        assert_eq!(tail, 1, "收尾短尾窗应恰有 1 处传 gs（规则 4 整片重解）");
+        assert_eq!(tail_gs, 0, "423 后收尾不再用 dispatch_window!(gs,…)");
+        assert!(
+            prod.iter()
+                .any(|l| l.contains(concat!("emit_tail_", "window!("))),
+            "末尾窗统一宏 emit_tail_window! 必须存在"
+        );
     }
 
     /// 前片短于回溯 ⇒ 取整片（`cut=0`，`suffix_samples = prev.len()`，基准 = 前片流式 + must 流式）。
@@ -13773,11 +13781,11 @@ mod testsync413_tests {
     fn ts413g_pending_rule3_integration() {
         // 4 片各 4s：预算 10s ⇒ 丢最远两片，起点 2（4+4+4+4 超预算）。
         let prev = [4.0f32, 4.0, 4.0];
-        let plain = plan_windows(&prev, &[4.0], 0, None, false);
+        let plain = plan_windows(&prev, &[4.0], 0, None);
         assert_eq!(plain.windows, vec![(2, 4)]);
         assert_eq!(must_start_for_window(2, 4, None, true), 3);
         // 有 pending=1 ⇒ 规则 3 把窗首抬到 1；首窗 must_start = pending。
-        let merged = plan_windows(&prev, &[4.0], 0, Some(1), false);
+        let merged = plan_windows(&prev, &[4.0], 0, Some(1));
         assert_eq!(merged.windows, vec![(1, 4)], "规则 3：并入待覆盖片 1");
         assert_eq!(
             must_start_for_window(merged.windows[0].0, merged.windows[0].1, Some(1), true),
@@ -13791,25 +13799,21 @@ mod testsync413_tests {
         assert_eq!(must_start_for_window(5, 9, Some(9), true), 8);
     }
 
-    /// 契约 3（行为）：规则 4 收尾短尾窗 `(p-1,p+1)`；调用方传 `must_start=gs` ⇒
-    /// `short_context_span` 为 `None`（整片重解）。对照误按常规窗会裁剪。
+    /// 423：`plan_windows` 不再组收尾窗（收尾统一走 `emit_tail_window!`）；无前文 ⇒ `short_context_span` 为 None。
     #[test]
-    fn ts413g_rule4_tail_window_whole_prev() {
-        // 3 片各 2s、pending=2、is_tail 且待覆盖片 <3s ⇒ 与前一并 (1,3)。
-        let plan = plan_windows(&[2.0f32, 2.0, 2.0], &[], 0, Some(2), true);
-        assert_eq!(plan.windows, vec![(1, 3)]);
-        assert!(plan.pending.is_none());
-        // 传 must_start=gs=1 ⇒ 不裁剪（整片）。
-        assert_eq!(short_context_span(1, 3, 1), None);
-        // 反例：若误按常规窗取 must_start=ge-1=2 ⇒ 会裁掉片 1（证明传 gs 必要）。
+    fn ts423g_plan_windows_no_tail_and_no_prev_span() {
+        let plan = plan_windows(&[2.0f32, 2.0, 2.0], &[], 0, Some(2));
+        assert!(plan.windows.is_empty(), "423：plan_windows 不再组收尾窗");
+        assert_eq!(plan.pending, Some(2), "pending 保留待末尾窗");
+        assert_eq!(short_context_span(1, 3, 1), None, "无前文 ⇒ 不裁剪");
         assert_eq!(short_context_span(1, 3, 2), Some(1));
     }
 
-    /// 契约 3（源码锚点）：常规窗 `dispatch_window!` 第 3 参为 `must_start`；规则 4 收尾窗为 `gs`。
+    /// 423（源码锚点）：常规窗 `dispatch_window!` 第 3 参为 `must_start`；收尾统一走 `emit_tail_window!`
+    /// （不再有 `plan.windows` + `dispatch_window!` 收尾调用）。
     #[test]
-    fn ts413g_dispatch_call_sites_source_anchor() {
+    fn ts423g_dispatch_call_sites_source_anchor() {
         let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"));
-        // 常规窗：紧跟 must_start 计算点之后的调用。
         let reg = prod
             .iter()
             .position(|l| l.contains("let must_start = must_start_for_window("))
@@ -13824,20 +13828,10 @@ mod testsync413_tests {
             "must_start,",
             "常规窗第 3 参须为 must_start（少带前文）"
         );
-        // 收尾窗：plan.windows 循环内的调用。
-        let tail = prod
-            .iter()
-            .position(|l| l.contains("for (gs, ge) in plan.windows"))
-            .expect("收尾 plan.windows 循环锚点缺失");
-        let tail_dw = prod[tail..]
-            .iter()
-            .position(|l| l.starts_with("dispatch_window!("))
-            .map(|i| i + tail)
-            .expect("收尾窗 dispatch_window! 缺失");
-        assert_eq!(
-            prod[tail_dw + 3],
-            "gs,",
-            "规则 4 收尾窗第 3 参须为 gs（整片重解）"
+        assert!(
+            prod.iter()
+                .any(|l| l.contains(concat!("emit_tail_", "window!(p, 0usize, \"stop\")"))),
+            "松键收尾须调用 emit_tail_window!(p, 0usize, \"stop\")"
         );
     }
 
@@ -13978,7 +13972,7 @@ mod testsync413_tests {
 
 #[cfg(test)]
 mod plan_windows_386_tests {
-    use super::{plan_windows, WindowPlan, TAIL_MERGE_MAX_SECS};
+    use super::{plan_windows, tail_window_alone, tail_window_span, WindowPlan};
     use crate::transcription;
 
     fn covered(windows: &[(usize, usize)], idx: usize) -> bool {
@@ -13989,7 +13983,7 @@ mod plan_windows_386_tests {
     #[test]
     fn single_slice_no_pending_is_immediate() {
         let prev = vec![1.0f32, 1.0, 1.0];
-        let p = plan_windows(&prev, &[3.0], 0, None, false);
+        let p = plan_windows(&prev, &[3.0], 0, None);
         let mut buf = prev.clone();
         buf.push(3.0);
         let s = transcription::group_window_start_secs(&buf, transcription::WINDOW_MAX_SECS);
@@ -14006,7 +14000,7 @@ mod plan_windows_386_tests {
     /// 反例：382 旧行为会给 [10.3,5.37] 组 [0,1)、[1,2)（第二窗只含 1.12s 短尾 ⇒ 模型念词表）。
     #[test]
     fn multi_slice_defers_last() {
-        let p = plan_windows(&[], &[10.3, 5.37], 0, None, false);
+        let p = plan_windows(&[], &[10.3, 5.37], 0, None);
         assert_eq!(p.windows, vec![(0, 1)], "只有首片立刻组窗");
         assert_eq!(p.pending, Some(1), "末片延后");
     }
@@ -14016,7 +14010,7 @@ mod plan_windows_386_tests {
     fn next_dispatch_forces_pending_inclusion_even_over_max() {
         // prev=[4,4,4]（global0..2，pending=2）；新片[9]（global3）。
         // 常规组窗：buf=[4,4,4,9]=21s>10 ⇒ 逐丢到只剩新片（起点=3）；pending=2 ⇒ 强制起点=2。
-        let p = plan_windows(&[4.0, 4.0, 4.0], &[9.0], 0, Some(2), false);
+        let p = plan_windows(&[4.0, 4.0, 4.0], &[9.0], 0, Some(2));
         assert_eq!(
             p.windows,
             vec![(2, 4)],
@@ -14025,37 +14019,42 @@ mod plan_windows_386_tests {
         assert!(p.pending.is_none(), "pending 被纳入后清空");
     }
 
-    /// 收尾：待覆盖片 < 3s 且前面有片 ⇒ 与前一并重解 `[p-1, p+1)`。
+    /// 🔴 423（Gavin 2026-09-25）：松键收尾有 pending 且**有前片** ⇒ 一律走末尾组窗
+    /// `tail_window_span` = `(p-1, p+1)`（**与 pending 时长无关**：1s / 2.5s / 4s 同解）。
     #[test]
-    fn tail_merges_short_pending_with_prev() {
-        let p = plan_windows(&[10.0, 1.2], &[], 0, Some(1), true);
-        assert_eq!(p.windows, vec![(0, 2)], "短尾与前一并（前片重解）");
-        assert!(p.pending.is_none());
-        assert!(1.2 < TAIL_MERGE_MAX_SECS);
+    fn tail_pending_with_prev_uses_suffix_window_regardless_of_dur() {
+        // pending 时长不再进入决策；三种时长（1s / 2.5s / 4s）都取同一末尾窗。
+        for _dur in [1.0f32, 2.5, 4.0] {
+            assert_eq!(
+                tail_window_span(Some(1), 0, 2),
+                Some((0, 2, 1)),
+                "有前片 ⇒ 前片末尾后缀 + pending（不分时长）"
+            );
+        }
     }
 
-    /// 收尾：待覆盖片 ≥ 3s ⇒ 单独组窗。
+    /// 🔴 423：pending 是首片（无前片）⇒ 单独解 `(p, p+1)`（`tail_window_span` 无解、`alone` 有解）。
     #[test]
-    fn tail_large_pending_alone() {
-        let p = plan_windows(&[10.0, 3.5], &[], 0, Some(1), true);
-        assert_eq!(p.windows, vec![(1, 2)], "≥3s 单独组窗");
+    fn tail_pending_first_slice_alone() {
+        assert_eq!(tail_window_span(Some(0), 0, 1), None);
+        assert_eq!(tail_window_alone(Some(0), 0, 1), Some((0, 1)));
+        // 越界 / 无 pending ⇒ 不组窗。
+        assert_eq!(tail_window_alone(Some(5), 0, 1), None);
+        assert_eq!(tail_window_alone(None, 0, 3), None);
+        assert_eq!(tail_window_span(None, 0, 3), None);
     }
 
-    /// 收尾：待覆盖片是首片（无前片）⇒ 即便 <3s 也单独组窗。
+    /// 🔴 423：延后后直接收尾 ⇒ `plan_windows` **不再组收尾窗**（pending 保留），交由末尾窗覆盖。
     #[test]
-    fn tail_short_pending_without_prev_alone() {
-        let p = plan_windows(&[1.2], &[], 0, Some(0), true);
-        assert_eq!(p.windows, vec![(0, 1)]);
-    }
-
-    /// 「延后后直接收尾」链路：多片派发 ⇒ pending；无下次派发 ⇒ 直接收尾合并。
-    #[test]
-    fn defer_then_tail_directly() {
-        let p1 = plan_windows(&[], &[5.0, 2.0], 0, None, false);
-        assert_eq!(p1.pending, Some(1));
-        let p2 = plan_windows(&[5.0, 2.0], &[], 0, p1.pending, true);
-        assert_eq!(p2.windows, vec![(0, 2)], "2s<3s ⇒ 与前一并");
-        assert!(p2.pending.is_none());
+    fn defer_then_stop_key_tail() {
+        let p1 = plan_windows(&[], &[5.0, 2.0], 0, None);
+        assert_eq!(p1.pending, Some(1), "末片延后");
+        // 收尾不再走 plan_windows（423）⇒ 不产生窗口、pending 保留。
+        let p2 = plan_windows(&[5.0, 2.0], &[], 0, p1.pending);
+        assert!(p2.windows.is_empty(), "收尾不再由 plan_windows 组窗");
+        assert_eq!(p2.pending, Some(1), "pending 保留待末尾窗处理");
+        // 末尾窗覆盖它（有前片 ⇒ (0,2)）。
+        assert_eq!(tail_window_span(p2.pending, 0, 2), Some((0, 2, 1)));
     }
 
     /// 覆盖不变量（随机性质）：任意「多次派发 + 收尾」，收尾时**每个切片**都被某窗覆盖。
@@ -14086,15 +14085,23 @@ mod plan_windows_386_tests {
                 let prev_len = transcription::WINDOW_MAX_SLICES.min(all_durs.len());
                 let prev_base = all_durs.len() - prev_len;
                 let prev_durs = all_durs[prev_base..].to_vec();
-                let plan = plan_windows(&prev_durs, &new_durs, prev_base, pending, false);
+                let plan = plan_windows(&prev_durs, &new_durs, prev_base, pending);
                 windows.extend(plan.windows);
                 pending = plan.pending;
                 all_durs.extend(new_durs);
             }
-            let prev_len = transcription::WINDOW_MAX_SLICES.min(all_durs.len());
-            let prev_base = all_durs.len() - prev_len;
-            let prev_durs = all_durs[prev_base..].to_vec();
-            windows.extend(plan_windows(&prev_durs, &[], prev_base, pending, true).windows);
+            // 423：收尾由末尾窗覆盖 pending（非 plan_windows）。
+            if let Some(p) = pending {
+                let prev_len = transcription::WINDOW_MAX_SLICES.min(all_durs.len());
+                let prev_base = all_durs.len() - prev_len;
+                if let Some((gs, ge, _)) = tail_window_span(Some(p), prev_base, prev_len) {
+                    windows.push((gs, ge));
+                } else if let Some((gs, ge)) = tail_window_alone(Some(p), prev_base, prev_len) {
+                    windows.push((gs, ge));
+                } else {
+                    panic!("case {case}: pending {p} 未被末尾窗覆盖");
+                }
+            }
             for idx in 0..all_durs.len() {
                 assert!(
                     covered(&windows, idx),
@@ -14151,11 +14158,13 @@ mod testsync386_tests {
         }
     }
 
-    /// 1. 会话级性质：200 次录音，每次 3~8 次派发（每次 1~3 片、每片 0.3~12s），最后一次 is_tail=true。
+    /// 1. 会话级性质：200 次录音，每次 3~8 次派发（每次 1~3 片、每片 0.3~12s），末尾由
+    ///    **末尾窗**（423：`tail_window_span` / `tail_window_alone`，模拟 `emit_tail_window!`）覆盖 pending。
     ///    断言：① 每个切片全局下标至少被一窗覆盖 ② 会话结束无 pending 残留
     ///    ③ 每窗非空且不越界（`s < e ≤ 总片数`）。
     #[test]
     fn sync386_session_property_cover_no_pending_valid_end() {
+        use super::{tail_window_alone, tail_window_span};
         let max_prev = transcription::WINDOW_MAX_SLICES;
         let mut rng = Lcg(0x386_5E55_10AA);
         for case in 0..200usize {
@@ -14163,7 +14172,7 @@ mod testsync386_tests {
             let mut all_durs: Vec<f32> = Vec::new();
             let mut windows: Vec<(usize, usize)> = Vec::new();
             let mut pending: Option<usize> = None;
-            for d in 0..n_dispatch {
+            for _d in 0..n_dispatch {
                 let n_new = rng.n(1, 3);
                 let mut new_durs = Vec::new();
                 for _ in 0..n_new {
@@ -14172,13 +14181,25 @@ mod testsync386_tests {
                 let prev_len = max_prev.min(all_durs.len());
                 let prev_base = all_durs.len() - prev_len;
                 let prev_durs = all_durs[prev_base..].to_vec();
-                let is_tail = d + 1 == n_dispatch;
-                let plan = plan_windows(&prev_durs, &new_durs, prev_base, pending, is_tail);
+                let plan = plan_windows(&prev_durs, &new_durs, prev_base, pending);
                 windows.extend(plan.windows);
                 pending = plan.pending;
                 all_durs.extend(new_durs);
             }
             let total = all_durs.len();
+            // 423：松键收尾 —— 待覆盖片由末尾窗覆盖（与 `emit_tail_window!` 同一决策）。
+            if let Some(p) = pending {
+                let prev_len = max_prev.min(total);
+                let prev_base = total - prev_len;
+                if let Some((gs, ge, _i)) = tail_window_span(Some(p), prev_base, prev_len) {
+                    windows.push((gs, ge));
+                } else if let Some((gs, ge)) = tail_window_alone(Some(p), prev_base, prev_len) {
+                    windows.push((gs, ge));
+                } else {
+                    panic!("case {case}: pending {p} 未被末尾窗覆盖");
+                }
+                pending = None;
+            }
             assert!(pending.is_none(), "case {case}: 收尾后不得有 pending 残留");
             for idx in 0..total {
                 assert!(
@@ -14200,10 +14221,10 @@ mod testsync386_tests {
     ///    下次派发 `[4.0]` ⇒ 首窗含小片与 `4.0`（`pending` 强制纳入并清空）。
     #[test]
     fn sync386_mid_big_small_then_next_includes_pending() {
-        let p1 = plan_windows(&[], &[10.2, 1.1], 0, None, false);
+        let p1 = plan_windows(&[], &[10.2, 1.1], 0, None);
         assert_eq!(p1.windows, vec![(0, 1)], "多片非收尾 ⇒ 只有大片立刻组窗");
         assert_eq!(p1.pending, Some(1), "小片延后为 pending");
-        let p2 = plan_windows(&[10.2, 1.1], &[4.0], 0, p1.pending, false);
+        let p2 = plan_windows(&[10.2, 1.1], &[4.0], 0, p1.pending);
         assert_eq!(
             p2.windows,
             vec![(1, 3)],
@@ -14212,18 +14233,20 @@ mod testsync386_tests {
         assert!(p2.pending.is_none(), "pending 纳入后清空");
     }
 
-    /// 3. 结尾一大一小：短尾（<3s）⇒ 与前一并 `[大片, 小片]`；长尾（≥3s）⇒ 单独成窗。
+    /// 3. 结尾一大一小（423）：收尾统一走末尾窗 —— 短尾（1.1s）与长尾（3.5s）**同解**：
+    ///    有前片 ⇒ `(0,2)`（前片后缀 + pending），不再按 <3s / ≥3s 分叉。
     #[test]
-    fn sync386_tail_big_small_merge_or_alone() {
-        let p = plan_windows(&[], &[10.2, 1.1], 0, None, false);
-        let t = plan_windows(&[10.2, 1.1], &[], 0, p.pending, true);
-        assert_eq!(t.windows, vec![(0, 2)], "1.1s < 3s ⇒ 与前一并（前片重解）");
-        assert!(t.pending.is_none());
-
-        let p2 = plan_windows(&[], &[10.2, 3.5], 0, None, false);
-        let t2 = plan_windows(&[10.2, 3.5], &[], 0, p2.pending, true);
-        assert_eq!(t2.windows, vec![(1, 2)], "3.5s ≥ 3s ⇒ 单独成窗");
-        assert!(t2.pending.is_none());
+    fn sync423_tail_big_small_unified_suffix_window() {
+        use super::tail_window_span;
+        for small in [1.1f32, 3.5] {
+            let p = plan_windows(&[], &[10.2, small], 0, None);
+            assert_eq!(p.pending, Some(1));
+            // 收尾统一：有前片 ⇒ 前片后缀 + pending（(0,2)），不分时长。
+            assert_eq!(tail_window_span(p.pending, 0, 2), Some((0, 2, 1)));
+            // plan_windows 不再组收尾窗。
+            let t = plan_windows(&[10.2, small], &[], 0, p.pending);
+            assert!(t.windows.is_empty(), "收尾不由 plan_windows 组窗");
+        }
     }
 
     /// 4. 预览不回退：给定 acc、streaming 不断增长 ⇒ 回灌渲染字数 **≥** 仅 acc 字数，
@@ -14641,7 +14664,7 @@ mod testsync382_tests {
                 new.push(rng.f32_in(0.3, 12.0));
             }
             let base = rng.usize_in(0, 50);
-            let plan = super::plan_windows(&prev, &new, base, None, false);
+            let plan = super::plan_windows(&prev, &new, base, None);
             // 386：`nnew>=2` ⇒ 末片**延后**（立刻窗数 = nnew-1、pending = 末片）；`nnew==1` ⇒ 全部立刻。
             let expected_imm = if nnew >= 2 { nnew - 1 } else { nnew };
             assert_eq!(plan.windows.len(), expected_imm, "立刻组窗数");
@@ -14685,7 +14708,7 @@ mod testsync382_tests {
             }
             let x = rng.f32_in(0.3, 12.0);
             let base = rng.usize_in(0, 50);
-            let plan = super::plan_windows(&prev, &[x], base, None, false);
+            let plan = super::plan_windows(&prev, &[x], base, None);
             let mut buf = prev.clone();
             buf.push(x);
             let s = transcription::group_window_start_secs(&buf, transcription::WINDOW_MAX_SECS);
@@ -14702,12 +14725,10 @@ mod testsync382_tests {
     /// 理由：调用方若以「本次派发携带 0 片」调用（防御性），不得制造空窗或越界。
     #[test]
     fn plan_windows_empty_new_is_empty() {
-        assert!(super::plan_windows(&[1.0, 2.0], &[], 7, None, false)
+        assert!(super::plan_windows(&[1.0, 2.0], &[], 7, None)
             .windows
             .is_empty());
-        assert!(super::plan_windows(&[], &[], 0, None, false)
-            .windows
-            .is_empty());
+        assert!(super::plan_windows(&[], &[], 0, None).windows.is_empty());
     }
 
     // ---- 2. ReflowFastState 退化输入（作者未覆盖） ----
@@ -20627,32 +20648,45 @@ mod testsync407_tests {
         &code[at..]
     }
 
-    /// 407 契约5（源码）：长静默只在**有 pending** 时组末尾窗；用后清空（停止键不重复处理）。
+    /// 407/423 契约5（源码）：长静默与松键**统一**走末尾窗宏 `emit_tail_window!`；用后清空 pending。
     #[test]
     fn ts407_tail_only_when_pending_source_guard() {
-        let src = include_str!("main.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap();
-        let code: String = prod
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"))
             .join("\n");
-        let arm = code
+        let arm = prod
             .find("AccInput::LongSilence(pcm_pos) =>")
             .expect("长静默臂缺失");
-        // 🔴 截到**该 match 臂结束**（臂体括号配平），不用固定字符窗口（返修：2600 太短）。
-        let seg = arm_body(&code, arm);
+        let seg = arm_body(&prod, arm);
         assert!(
-            seg.contains("if let Some(p) = pending_slice"),
-            "末尾窗必须以 pending 存在为条件（无 pending 不产生窗口）"
-        );
-        assert!(
-            seg.contains("tail_window_span(Some(p)"),
-            "须用纯决策取 span"
+            seg.contains(concat!("emit_tail_", "window!(")),
+            "长静默臂须调用统一末尾窗宏 emit_tail_window!"
         );
         assert!(seg.contains("pending_slice = None;"), "用后须清空 pending");
-        // 臂体须显著长于旧魔数窗口（证明确实截到了 Arm 结束而非截断）。
-        assert!(seg.len() > 2600, "臂体长度 {} 应 > 2600", seg.len());
+        // 宏定义内：纯决策 tail_window_span + 复用 413 取后缀函数 + 首片 alone。
+        let m = prod
+            .find(concat!("macro_rules! emit_tail_", "window"))
+            .expect("emit_tail_window 宏缺失");
+        let mseg: String = prod[m..].chars().take(1500).collect();
+        assert!(
+            mseg.contains(concat!("tail_window_span(Some(p)")),
+            "须用纯决策取 span"
+        );
+        assert!(
+            mseg.contains("take_context_suffix("),
+            "须复用 413 take_context_suffix"
+        );
+        assert!(mseg.contains("tail_window_alone("), "首片 pending ⇒ 单独解");
+        // 松键分支：`if let Some(p) = pending_slice.take()` ⇒ 1900ms 已处理（pending 已 None）时不重复组窗。
+        let stop_at = prod
+            .find(concat!("emit_tail_", "window!(p, 0usize, \"stop\")"))
+            .expect("松键 emit 缺失");
+        let guard_at = prod[..stop_at]
+            .rfind(concat!("if let Some(p) = pending_", "slice"))
+            .expect("松键 pending 条件缺失");
+        assert!(
+            stop_at - guard_at < 120,
+            "松键 emit 须在 pending 存在条件下（None 不重复组窗）"
+        );
     }
 
     /// 407 契约5：`tail_window_span` 边界（无 pending / 首片 / 末片 / 越界 / p<base）。
@@ -20697,29 +20731,31 @@ mod testsync407_tests {
         );
     }
 
-    /// 407 契约7：长静默末尾窗（收尾）后继续说话仍**全覆盖**，且收尾后无 pending。
+    /// 407/423 契约7：末尾窗（长静默或松键统一）后继续说话仍**全覆盖**，且收尾后无 pending。
     #[test]
     fn ts407_coverage_after_tail_independent() {
+        use super::tail_window_alone;
         let durs = [2.0f32, 5.0, 1.2, 4.0, 2.5];
         // 第 1 次：单片 ⇒ 立刻 1 窗。
-        let p1 = plan_windows(&[], &[durs[0]], 0, None, false);
+        let p1 = plan_windows(&[], &[durs[0]], 0, None);
         let mut windows = p1.windows.clone();
         let pending = p1.pending;
         // 第 2 次：两片 ⇒ 末片 pending。
-        let p2 = plan_windows(&[durs[0]], &[durs[1], durs[2]], 0, pending, false);
+        let p2 = plan_windows(&[durs[0]], &[durs[1], durs[2]], 0, pending);
         windows.extend(p2.windows.clone());
         assert!(p2.pending.is_some(), "两片派发末片应 pending");
-        // 长静默触发「末尾窗」（is_tail=true 的一次性 plan）⇒ pending 被覆盖清空。
-        let prev_len = crate::transcription::WINDOW_MAX_SLICES.min(durs.len());
-        let prev_durs = durs[..prev_len].to_vec();
-        let pt = plan_windows(&prev_durs, &[], 0, p2.pending, true);
-        windows.extend(pt.windows.clone());
-        assert!(
-            pt.pending.is_none(),
-            "收尾后不得再有 pending（停止键不重复处理）"
-        );
-        // 继续说话：新片正常组窗。
-        let p3 = plan_windows(&prev_durs, &[durs[3]], 0, pt.pending, false);
+        // 423：末尾窗覆盖 pending（有前片 ⇒ (p-1,p+1)）；不再由 plan_windows 组收尾窗。
+        let tail_p = p2.pending.expect("应有 pending");
+        let prev_len = 3usize; // 当前 buffer：durs[0..3]
+        if let Some((gs, ge, _i)) = tail_window_span(Some(tail_p), 0, prev_len) {
+            windows.push((gs, ge));
+        } else if let Some((gs, ge)) = tail_window_alone(Some(tail_p), 0, prev_len) {
+            windows.push((gs, ge));
+        } else {
+            panic!("pending {tail_p} 未被末尾窗覆盖");
+        }
+        // 继续说话：新片正常组窗（pending 已由末尾窗覆盖 ⇒ None）。
+        let p3 = plan_windows(&durs[..prev_len], &[durs[3]], 0, None);
         windows.extend(p3.windows);
         for idx in 0..4 {
             assert!(
@@ -21126,7 +21162,7 @@ mod fix411_tests {
 // =====================================================================
 #[cfg(test)]
 mod testsync411_tests {
-    use super::{plan_windows, slice_streaming_text, tail_streaming_baseline};
+    use super::{plan_windows, slice_streaming_text, tail_streaming_baseline, tail_window_span};
     use crate::transcription::{acc_vs_streaming, OrderedReflow};
 
     /// BUILD-409 16:44Z 整段流式（日志 80 字截断版，与作者夹具逐字一致）。
@@ -21192,19 +21228,22 @@ mod testsync411_tests {
     fn ts411guard_regular_window_composition_real() {
         let per = per_slice(STREAM80, &SAMPLES);
         // 真实组窗：一次派发 3 片 ⇒ 实时两窗 + 收尾一窗 = [0,1)(1,2)(2,3)。
-        let live = plan_windows(&[], &DURS, 0, None, false);
+        let live = plan_windows(&[], &DURS, 0, None);
         assert_eq!(live.windows, vec![(0usize, 1usize), (1, 2)]);
         assert_eq!(live.pending, Some(2), "末片延后为待覆盖片");
-        let tail = plan_windows(&DURS, &[], 0, live.pending, true);
-        assert_eq!(tail.windows, vec![(2usize, 3usize)]);
-        assert_eq!(tail.pending, None);
+        // 423：收尾走末尾窗（有前片 ⇒ span (1,3)：前片后缀 + pending），不再单独 (2,3)。
+        let tail_span = tail_window_span(live.pending, 0, DURS.len());
+        assert_eq!(tail_span, Some((1usize, 3usize, 2usize)));
         let windows: Vec<(usize, usize)> = live
             .windows
             .iter()
             .copied()
-            .chain(tail.windows.iter().copied())
+            .chain(std::iter::once((
+                tail_span.unwrap().0,
+                tail_span.unwrap().1,
+            )))
             .collect();
-        assert_eq!(windows, vec![(0, 1), (1, 2), (2, 3)]);
+        assert_eq!(windows, vec![(0, 1), (1, 2), (1, 3)]);
 
         // 411 缺陷回归：非首片不得为空、首片不得含整段（旧逻辑首片=整段、后片=空）。
         assert!(!per[0].is_empty() && !per[1].is_empty() && !per[2].is_empty());
@@ -21319,16 +21358,9 @@ mod testsync411_tests {
             "切分后片0 基准 accept（ret={:.2}）",
             acc_vs_streaming(&acc[0], &per[0]).retention
         );
-        // 真实组窗（与契约 2 同）：三窗 span (0,1)(1,2)(2,3)。
-        let live = plan_windows(&[], &DURS, 0, None, false);
-        let tail = plan_windows(&DURS, &[], 0, live.pending, true);
-        let windows: Vec<(usize, usize)> = live
-            .windows
-            .iter()
-            .copied()
-            .chain(tail.windows.iter().copied())
-            .collect();
-        assert_eq!(windows, vec![(0, 1), (1, 2), (2, 3)]);
+        // 411（本测只验「流式按片分配」）：用三窗 (0,1)(1,2)(2,3) 的**确定性**布局，
+        // 与 423 后的末尾窗 span 解耦（423 末尾窗形状另有专门用例）。
+        let windows: Vec<(usize, usize)> = vec![(0, 1), (1, 2), (2, 3)];
 
         // 逐窗回灌：基准由 `bases` 给（生产=覆盖片分配文本 / 旧=整段记首片），406 判据定精解或兜底。
         let run = |bases: &[String]| -> String {
