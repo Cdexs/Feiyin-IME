@@ -8686,9 +8686,10 @@ fn spawn_worker_thread(
                                             // 386（A）：派发一个窗口（含 C 的流式文本记账）。`gs/ge` = 全局切片区间。
                                             // 单一定义 ⇒ 批次路径与收尾合并共用，防两份漂移。
                                             macro_rules! dispatch_window {
-                                                ($gs:expr, $ge:expr, $idx:expr, $win_committed:expr, $usable:expr) => {{
+                                                ($gs:expr, $ge:expr, $must_start:expr, $idx:expr, $win_committed:expr, $usable:expr) => {{
                                                     let gs: usize = $gs;
                                                     let ge: usize = $ge;
+                                                    let must_start: usize = $must_start;
                                                     let buf_base = total_slices - recent_slices.len();
                                                     debug_assert!(
                                                         gs >= buf_base && ge <= total_slices,
@@ -8698,10 +8699,103 @@ fn spawn_worker_thread(
                                                     let stop = ge
                                                         .saturating_sub(buf_base)
                                                         .min(recent_slices.len());
-                                                    let window_audio: Vec<f32> = recent_slices[start..stop]
-                                                        .iter()
-                                                        .flat_map(|s| s.iter().copied())
-                                                        .collect();
+                                                    // LOCALRT-SHORT-CONTEXT-413：常规窗「少带前文」——
+                                                    // `[gs, must_start)` 是上下文片，只保留**紧邻 must_start
+                                                    // 前一片**的后缀（与 407 末尾窗同一套 `take_context_suffix`）；
+                                                    // 更早的上下文片整片丢弃。原因：派发时无法预知是否末句，
+                                                    // 不减则末片 2.85s 也会带上整段前文送解（BUILD-399 9.33s /
+                                                    // decode 2194ms），而解码耗时随音频长度线性增长（Gavin 09-25）。
+                                                    // 首片 / 无前文（`must_start == gs`）⇒ 只解 must 片本身。
+                                                    let ctx_global = short_context_span(gs, ge, must_start);
+                                                    let must_local =
+                                                        must_start.saturating_sub(buf_base).clamp(start, stop);
+                                                    let (window_audio, window_samples_vec, window_ranges, window_streaming, span_start, tail_pending) =
+                                                        if let Some(ctx_global) = ctx_global {
+                                                            let ci = ctx_global.saturating_sub(buf_base);
+                                                            let must_stream: String =
+                                                                recent_streaming[must_local..stop].concat();
+                                                            let rate_cps =
+                                                                transcription::acc_avg_chars_per_sec(
+                                                                    rate_sum_chars,
+                                                                    rate_sum_secs,
+                                                                    rate_windows,
+                                                                )
+                                                                .unwrap_or(3.0);
+                                                            let cs = take_context_suffix(
+                                                                &recent_slices[ci],
+                                                                &recent_streaming[ci],
+                                                                &must_stream,
+                                                                rate_cps,
+                                                            );
+                                                            let mut audio: Vec<f32> =
+                                                                recent_slices[ci][cs.cut..].to_vec();
+                                                            let mut samples: Vec<usize> =
+                                                                Vec::with_capacity(1 + stop - must_local);
+                                                            samples.push(cs.suffix_samples);
+                                                            for s in &recent_slices[must_local..stop] {
+                                                                audio.extend_from_slice(s);
+                                                                samples.push(s.len());
+                                                            }
+                                                            // VAD 区间：前文后缀的片内区间裁剪平移后，与 must 片
+                                                            // 区间一起按样本数偏移拼成窗内坐标（任一源 None ⇒ 整窗 None）。
+                                                            let ctx_ranges = recent_slice_ranges[ci]
+                                                                .as_ref()
+                                                                .map(|r| trim_and_shift_ranges(r, cs.cut));
+                                                            let mut range_slices: Vec<
+                                                                Option<Vec<(usize, usize)>>,
+                                                            > = Vec::with_capacity(1 + stop - must_local);
+                                                            range_slices.push(ctx_ranges);
+                                                            range_slices.extend_from_slice(
+                                                                &recent_slice_ranges[must_local..stop],
+                                                            );
+                                                            let ranges =
+                                                                shift_and_concat_ranges(&range_slices, &samples);
+                                                            if log::log_enabled!(log::Level::Debug) {
+                                                                log::debug!(
+                                                                    "[LocalRT-DBG-413] prev_cut_secs={:.2} window_secs={:.2} must_slices={} gap={} rate_cps={:.2}",
+                                                                    cs.cut as f32 / 16000.0,
+                                                                    audio.len() as f32 / 16000.0,
+                                                                    stop - must_local,
+                                                                    if cs.gap_found { "found" } else { "no_gap" },
+                                                                    rate_cps
+                                                                );
+                                                            }
+                                                            // 410 item2（413 R1）：带前文的常规窗若精解被 406 拒 / 为空，
+                                                            // **只兜底 must 片**（`context_tail_pending`）；前文后缀是上一窗
+                                                            // 已精解过的准确文本，不得被流式顶掉。与 407 末尾窗同一条 410 路径。
+                                                            let tail_pending = Some(context_tail_pending(
+                                                                must_start,
+                                                                ge,
+                                                                samples[1..].to_vec(),
+                                                                must_stream,
+                                                            ));
+                                                            (audio, samples, ranges, cs.baseline, ctx_global, tail_pending)
+                                                        } else {
+                                                            let audio: Vec<f32> = recent_slices[start..stop]
+                                                                .iter()
+                                                                .flat_map(|s| s.iter().copied())
+                                                                .collect();
+                                                            let samples: Vec<usize> = recent_slices
+                                                                [start..stop]
+                                                                .iter()
+                                                                .map(|s| s.len())
+                                                                .collect();
+                                                            let ranges = shift_and_concat_ranges(
+                                                                &recent_slice_ranges[start..stop],
+                                                                &samples,
+                                                            );
+                                                            let streaming =
+                                                                recent_streaming[start..stop].concat();
+                                                            if log::log_enabled!(log::Level::Debug) {
+                                                                log::debug!(
+                                                                    "[LocalRT-DBG-413] prev_cut_secs=0.00 window_secs={:.2} must_slices={} gap=none",
+                                                                    audio.len() as f32 / 16000.0,
+                                                                    stop - start
+                                                                );
+                                                            }
+                                                            // 无前文 ⇒ 整窗兜底（行为不变）。
+                                                            (audio, samples, ranges, streaming, gs, None)
+                                                        };
                                                     if !transcription::path_b_budget_ok(
                                                         window_audio.len(),
                                                         terms,
@@ -8722,28 +8816,13 @@ fn spawn_worker_thread(
                                                             rate_sum_secs,
                                                             rate_windows,
                                                         );
-                                                    // VAD-393（A3）：把本窗各片的**片内语音区间**拼成「窗内坐标」
-                                                    //（各片偏移 = 其前所有片样本数累计）；任一源片 `None` ⇒ 整窗 `None`。
-                                                    let window_ranges = shift_and_concat_ranges(
-                                                        &recent_slice_ranges[start..stop],
-                                                        &recent_slices[start..stop]
-                                                            .iter()
-                                                            .map(|s| s.len())
-                                                            .collect::<Vec<_>>(),
-                                                    );
-                                                    let window_streaming =
-                                                        recent_streaming[start..stop].concat();
                                                     let streaming_nonempty =
                                                         !window_streaming.trim().is_empty();
-                                                    // 408B：本窗**最后一片**在窗内的起点样本下标（声纹注册只计新片）。
-                                                    let new_slice_from: usize = recent_slices
-                                                        [start..stop]
+                                                    // 408B：本窗**最后一片**在窗内的起点样本下标（声纹注册只计新片）；
+                                                    // 413 起窗内样本表已含前文后缀 ⇒ 按实际窗口样本累计，不能再用全局片长。
+                                                    let new_slice_from: usize = window_samples_vec
+                                                        [..window_samples_vec.len().saturating_sub(1)]
                                                         .iter()
-                                                        .take(
-                                                            stop.saturating_sub(start)
-                                                                .saturating_sub(1),
-                                                        )
-                                                        .map(|s| s.len())
                                                         .sum();
                                                     let _ = task_tx.send((
                                                         window_seq,
@@ -8755,17 +8834,15 @@ fn spawn_worker_thread(
                                                         streaming_nonempty,
                                                         new_slice_from,
                                                     ));
-                                                    window_spans.push((gs, ge));
-                                                    window_samples.push(
-                                                        recent_slices[start..stop]
-                                                            .iter()
-                                                            .map(|s| s.len())
-                                                            .collect(),
-                                                    );
+                                                    // 413：窗实际只含 `[must_start-1, ge)`（无前文时 = `[gs,ge)`）
+                                                    // ⇒ 对齐 span 同步收窄，`window_samples.len() == ge - span_start`。
+                                                    window_spans.push((span_start, ge));
+                                                    window_samples.push(window_samples_vec);
                                                     window_streaming_texts.push(window_streaming);
                                                     window_committed_lens.push($win_committed);
                                                     window_boundary_usable.push($usable);
-                                                    window_tail_pending.push(None); // 410：常规窗无 pending 兜底
+                                                    // 410：带前文的常规窗 = 只兜底 must 片（见上）；无前文 = None（整窗兜底）。
+                                                    window_tail_pending.push(tail_pending);
                                                     window_seq += 1;
                                                 }};
                                             }
@@ -8857,6 +8934,8 @@ fn spawn_worker_thread(
                                                                 .iter()
                                                                 .map(|s| s.len() as f32 / 16000.0)
                                                                 .collect();
+                                                            // 413：保存本批前遗留的待覆盖片（用于算首个窗口的 must_start）。
+                                                            let pending_before = pending_slice;
                                                             let plan = plan_windows(
                                                                 &prev_durs,
                                                                 &new_durs,
@@ -8890,6 +8969,8 @@ fn spawn_worker_thread(
                                                             }
                                                             let mut wi = 0usize;
                                                             let mut cum_new = 0usize;
+                                                            // 413：本批**首个**窗口可能要纳入 pending ⇒ must_start 不同。
+                                                            let mut saw_window = false;
                                                             for (k, s) in sub_segs.into_iter().enumerate() {
                                                                 cum_new += new_lens[k];
                                                                 recent_slices.push(s);
@@ -8921,6 +9002,15 @@ fn spawn_worker_thread(
                                                                 {
                                                                     let (gs, ge) = plan.windows[wi];
                                                                     wi += 1;
+                                                                    // 413：首个窗口若并入上一批待覆盖片 ⇒ must_start = 该片；
+                                                                    // 其余窗口 must_start = 窗末片（只有新片必须完整解）。
+                                                                    let must_start = must_start_for_window(
+                                                                        gs,
+                                                                        ge,
+                                                                        pending_before,
+                                                                        !saw_window,
+                                                                    );
+                                                                    saw_window = true;
                                                                     // 389（D3）：含本次派发末片 ⇒ 准确边界；
                                                                     // 部分窗 ⇒ 按前 0..=k 片样本占比折算 committed_len。
                                                                     let usable = k + 1 == n_new;
@@ -8934,7 +9024,14 @@ fn spawn_worker_thread(
                                                                             total_new,
                                                                         )
                                                                     };
-                                                                    dispatch_window!(gs, ge, idx, win_committed, usable);
+                                                                    dispatch_window!(
+                                                                        gs,
+                                                                        ge,
+                                                                        must_start,
+                                                                        idx,
+                                                                        win_committed,
+                                                                        usable
+                                                                    );
                                                                 }
                                                                 // 否则：本片是**延后的待覆盖片**（本批末片），本轮不组窗。
                                                             }
@@ -8964,46 +9061,32 @@ fn spawn_worker_thread(
                                                                             rate_windows,
                                                                         )
                                                                         .unwrap_or(3.0);
-                                                                        let backtrack_secs = tail_backtrack_secs(rate_cps);
-                                                                        let back = ((backtrack_secs * 16000.0) as usize)
-                                                                            .min(prev_slice.len())
-                                                                            .max(1);
-                                                                        let (cut, gap_found) =
-                                                                            transcription::local_stream::find_tail_cut(prev_slice, back);
-                                                                        let mut audio: Vec<f32> =
-                                                                            prev_slice[cut..].to_vec();
-                                                                        audio.extend_from_slice(&recent_slices[i]);
-                                                                        let samples =
-                                                                            vec![prev_slice.len() - cut, recent_slices[i].len()];
                                                                         // 410 item1：末尾窗音频只含前片**最后 `cut` 起**的后缀 ⇒ 比对基准的
                                                                         // 前片部分也按样本占比只取末尾相应**字符数**（char 切、禁字节下标），
                                                                         // 再接 pending 流式。否则基准含整片 ⇒ 正确精解被 406 误拒。
-                                                                        let prev_stream = &recent_streaming[i - 1];
-                                                                        let prev_chars = prev_stream.chars().count();
-                                                                        let suffix_samples = prev_slice.len() - cut;
-                                                                        let ratio = if prev_slice.is_empty() {
-                                                                            0.0
-                                                                        } else {
-                                                                            suffix_samples as f32
-                                                                                / prev_slice.len() as f32
-                                                                        };
-                                                                        let suffix_chars =
-                                                                            ((prev_chars as f32) * ratio).round() as usize;
-                                                                        let suffix_chars = suffix_chars.min(prev_chars);
-                                                                        let streaming = tail_streaming_baseline(
-                                                                            prev_stream,
-                                                                            suffix_samples,
-                                                                            prev_slice.len(),
+                                                                        // 413：与常规窗共用同一套「取前片后缀」函数（`take_context_suffix`）。
+                                                                        let cs = take_context_suffix(
+                                                                            prev_slice,
+                                                                            &recent_streaming[i - 1],
                                                                             &recent_streaming[i],
+                                                                            rate_cps,
                                                                         );
+                                                                        let mut audio: Vec<f32> =
+                                                                            prev_slice[cs.cut..].to_vec();
+                                                                        audio.extend_from_slice(&recent_slices[i]);
+                                                                        let samples = vec![
+                                                                            cs.suffix_samples,
+                                                                            recent_slices[i].len(),
+                                                                        ];
+                                                                        let streaming = cs.baseline;
                                                                         if log::log_enabled!(log::Level::Debug) {
-                                                                            let gap = if gap_found { "found" } else { "no_gap" };
+                                                                            let gap = if cs.gap_found { "found" } else { "no_gap" };
                                                                             log::debug!(
                                                                                 "[LocalRT-DBG-407] tail window: pending={} prev_cut_secs={:.2} prev_suffix_chars={} backtrack_secs={:.2} rate_cps={:.2} gap={} window_secs={:.2} pcm_pos={}",
                                                                                 p,
-                                                                                cut as f32 / 16000.0,
-                                                                                suffix_chars,
-                                                                                backtrack_secs,
+                                                                                cs.cut as f32 / 16000.0,
+                                                                                cs.suffix_chars,
+                                                                                cs.backtrack_secs,
                                                                                 rate_cps,
                                                                                 gap,
                                                                                 audio.len() as f32 / 16000.0,
@@ -9058,9 +9141,13 @@ fn spawn_worker_thread(
                                                 );
                                                 for (gs, ge) in plan.windows {
                                                     // 389（D3）：收尾合并窗含该次派发末片（pending）⇒ 准确边界。
+                                                    // 413（主控确认）：收尾短尾窗（规则 4，(p-1,p+1)）的
+                                                    // 「前一片重解」是 Gavin 要的语义 ⇒ `must_start = gs`，
+                                                    // 保持整片送解；只有**常规窗**少带前文。
                                                     dispatch_window!(
                                                         gs,
                                                         ge,
+                                                        gs,
                                                         last_dispatch_idx,
                                                         last_committed_len,
                                                         true
@@ -12060,6 +12147,129 @@ fn tail_streaming_baseline(
     s
 }
 
+/// LOCALRT-SHORT-CONTEXT-413：本窗「必须完整解的片」起点 `must_start`（纯函数，可单测）。
+///
+/// - 本批**首个**窗口且上一批遗留待覆盖片 `p` 落在窗内 `[gs,ge)` ⇒ `p`
+///   （`plan_windows` 规则 3 把 pending 并进来：pending 到本窗末片都完整解）；
+/// - 其余（常态单片 / 多片切分的后续子窗 / 无 pending）⇒ 窗末片 `ge-1`。
+///
+/// 背景：常规窗原先按 `group_window_start_secs` 把前面整片一起带上 ⇒ 末句虽只 2.85s，
+/// 送解却 9.33s（BUILD-399 09:48:21Z「开心开」，`decode_ms=2194`）。派发时**无法知道
+/// 这是不是最后一句**，故只能所有常规窗都少带前文（Gavin 2026-09-25）。
+fn must_start_for_window(
+    gs: usize,
+    ge: usize,
+    pending_before: Option<usize>,
+    is_first: bool,
+) -> usize {
+    if is_first {
+        if let Some(p) = pending_before {
+            if p >= gs && p < ge {
+                return p;
+            }
+        }
+    }
+    ge.saturating_sub(1)
+}
+
+/// LOCALRT-SHORT-CONTEXT-413：本窗「前文后缀」取自哪一片（纯函数，可单测）。
+///
+/// 窗内 `[gs, must_start)` 原本是「上下文片」；413 只保留**紧邻 `must_start` 前一片**
+/// （下标 `must_start-1`）的后缀，更早的上下文片整片丢弃。`must_start == gs`（首片 / 无前文）
+/// ⇒ `None`。返回**全局切片下标**，调用方换算到 `recent_slices` 局部下标。
+fn short_context_span(gs: usize, ge: usize, must_start: usize) -> Option<usize> {
+    if must_start > gs && must_start < ge {
+        Some(must_start - 1)
+    } else {
+        None
+    }
+}
+
+/// LOCALRT-SHORT-CONTEXT-413：把某片的片内语音区间裁剪到 `[cut, len)` 并平移 `-cut`，
+/// 得到该片**后缀**在窗内的坐标（纯函数，可单测）。
+///
+/// 跨 `cut` 的区间被截断（起点抬到 `cut`）；完全落在 `cut` 之前（`b <= cut`）的被丢。
+/// 与 [`shift_and_concat_ranges`] 配套：先裁剪平移前文后缀区间，再由后者按各片样本数偏移拼接。
+fn trim_and_shift_ranges(ranges: &[(usize, usize)], cut: usize) -> Vec<(usize, usize)> {
+    ranges
+        .iter()
+        .filter_map(|&(a, b)| {
+            if b <= cut {
+                None
+            } else {
+                Some((a.max(cut) - cut, b - cut))
+            }
+        })
+        .collect()
+}
+
+/// LOCALRT-SHORT-CONTEXT-413 / LOCALRT-TAIL-WINDOW-407 **共用**的前文后缀提取结果。
+struct ContextSuffix {
+    /// 前片内切点（`prev[cut..]` 为送入的前文后缀）。
+    cut: usize,
+    /// 后缀样本数（`prev.len() - cut`）。
+    suffix_samples: usize,
+    /// 后缀对应的流式**字符数**（仅日志）。
+    suffix_chars: usize,
+    /// 回溯时长（秒，仅日志）。
+    backtrack_secs: f32,
+    /// 是否在回溯区间内找到真「字缝」（仅日志）。
+    gap_found: bool,
+    /// 406 比对基准 = 前片流式末尾相应字数 + must 流式。
+    baseline: String,
+}
+
+/// LOCALRT-SHORT-CONTEXT-413：从**紧邻前一片**取「后缀」作为本窗前文（407 / 413 共用，
+/// **禁止复制出第二份**）。
+///
+/// 回溯时长按 [`tail_backtrack_secs`]（本次字速自适应，冷启动 3.0 字/秒）→ 换算样本并
+/// **封顶整片**；再用 [`transcription::local_stream::find_tail_cut`]（与 407 同一套字缝判据）
+/// 找切点，无字缝回落回溯点。`suffix_samples` 与 `baseline` 供常规窗 / 407 末尾窗记账。
+fn take_context_suffix(
+    prev: &[f32],
+    prev_stream: &str,
+    must_stream: &str,
+    rate_cps: f32,
+) -> ContextSuffix {
+    let backtrack_secs = tail_backtrack_secs(rate_cps);
+    let back = ((backtrack_secs * 16000.0) as usize).min(prev.len()).max(1);
+    let (cut, gap_found) = transcription::local_stream::find_tail_cut(prev, back);
+    let suffix_samples = prev.len() - cut;
+    let prev_chars = prev_stream.chars().count();
+    let ratio = if prev.is_empty() {
+        0.0
+    } else {
+        suffix_samples as f32 / prev.len() as f32
+    };
+    let suffix_chars = (((prev_chars as f32) * ratio).round() as usize).min(prev_chars);
+    let baseline = tail_streaming_baseline(prev_stream, suffix_samples, prev.len(), must_stream);
+    ContextSuffix {
+        cut,
+        suffix_samples,
+        suffix_chars,
+        backtrack_secs,
+        gap_found,
+        baseline,
+    }
+}
+
+/// LOCALRT-SHORT-CONTEXT-413（R1）：**带前文**常规窗的 410 兜底元数据 —— 只兜底 **must 片**。
+///
+/// 精解被 406 拒 / 为空时用的兜底文本/区间只覆盖 `(must_start, ge)`；前文后缀
+/// `must_start-1` 是上一窗**已精解过的准确文本**，不得被流式兜底顶掉（同 410 item2）。
+fn context_tail_pending(
+    must_start: usize,
+    ge: usize,
+    must_samples: Vec<usize>,
+    must_streaming: String,
+) -> TailPending {
+    TailPending {
+        span: (must_start, ge),
+        samples: must_samples,
+        streaming: must_streaming,
+    }
+}
+
 /// FIX-TAIL-WINDOW-AND-FALLBACK-386：组窗纯函数（在 382 基础上加「延后尾片 / 收尾合并」）。
 ///
 /// 输入：`prev_durs` 已派发片时长（时间序，调用方保证已按 `WINDOW_MAX_SLICES` 裁剪）；
@@ -12369,6 +12579,186 @@ mod tail_window_407_tests {
             format!("{committed}{last}"),
             "今天我们去了一个很大的博物馆那里展出了很多古代文物",
             "末尾窗须与已提交对齐合并：不重字、不漏字"
+        );
+    }
+}
+
+/// LOCALRT-SHORT-CONTEXT-413：常规窗「少带前文」纯函数（`must_start` / 前文片 / 区间裁剪 /
+/// 取后缀）。收尾短尾窗（`plan_windows` 规则 4）**不变**，见 `ts413_rule4_*`。
+#[cfg(test)]
+mod short_context_413_tests {
+    use super::{
+        context_tail_pending, must_start_for_window, short_context_span, take_context_suffix,
+        trim_and_shift_ranges,
+    };
+
+    /// 常态单片：`must_start = 窗末片`，前文来自紧邻前一片（更早的上下文片整片丢弃）。
+    #[test]
+    fn ts413_normal_window_takes_only_prev_slice_suffix() {
+        let ms = must_start_for_window(0, 5, None, true);
+        assert_eq!(ms, 4, "常态：只有窗末新片必须完整解");
+        assert_eq!(
+            short_context_span(0, 5, ms),
+            Some(3),
+            "前文只取紧邻前一片（片 3）的后缀，片 0~2 丢弃"
+        );
+    }
+
+    /// 规则 3 并入 pending：首个窗口 `must_start = pending`（pending 到新片全部完整解）。
+    /// pending 被规则 3 抬为窗首（`gs==pending`）⇒ 窗内无更早上下文片；pending 落在 group 窗内部
+    /// （`gs < pending`）⇒ 前文取 pending 前一片。
+    #[test]
+    fn ts413_pending_merged_sets_must_start_to_pending() {
+        let ms = must_start_for_window(2, 6, Some(2), true);
+        assert_eq!(ms, 2, "pending 并进来后从 pending 起必须完整解");
+        assert_eq!(
+            short_context_span(2, 6, ms),
+            None,
+            "pending 即窗首 ⇒ 窗内无更早上下文片（pending 到新片整片解）"
+        );
+
+        let ms2 = must_start_for_window(1, 6, Some(3), true);
+        assert_eq!(ms2, 3);
+        assert_eq!(short_context_span(1, 6, ms2), Some(2));
+    }
+
+    /// 多片切分：首个窗口可并入 pending；后续子窗 `must_start = 自己的片`（前片已解，仅作前文）。
+    #[test]
+    fn ts413_multi_slice_windows() {
+        let first = must_start_for_window(0, 3, Some(1), true);
+        assert_eq!(first, 1, "首个窗口并入 pending=1");
+        assert_eq!(short_context_span(0, 3, first), Some(0));
+
+        let later = must_start_for_window(2, 4, Some(1), false);
+        assert_eq!(
+            later, 3,
+            "后续子窗只有自己的片必须完整解（pending 已被前窗消费）"
+        );
+        assert_eq!(short_context_span(2, 4, later), Some(2));
+    }
+
+    /// 首片无前片 ⇒ 只解新片本身（与现状一致，无前文后缀）。
+    #[test]
+    fn ts413_first_slice_has_no_context() {
+        let ms = must_start_for_window(0, 1, None, true);
+        assert_eq!(ms, 0);
+        assert_eq!(short_context_span(0, 1, ms), None);
+        // must_start == gs（窗内无上下文片）一律无前文。
+        assert_eq!(short_context_span(7, 8, 7), None);
+    }
+
+    /// 🔴 规则 4 收尾短尾窗 `(p-1,p+1)`：调用方传 `must_start = gs`（前一片重解）⇒
+    /// `short_context_span` 返回 `None` ⇒ 不裁剪、仍送整片（Gavin 要的语义）。
+    #[test]
+    fn ts413_rule4_tail_merge_keeps_whole_prev() {
+        for (gs, ge) in [(0usize, 2usize), (3, 5)] {
+            assert_eq!(
+                short_context_span(gs, ge, gs),
+                None,
+                "规则 4 传入 must_start=gs ⇒ 必须不产生前文后缀（整片送解）: ({gs},{ge})"
+            );
+        }
+    }
+
+    /// 🔴 源码护栏（主控要求）：规则 4 收尾短尾窗的 `dispatch_window!` 第 3 个实参是 `gs`
+    /// （整片重解），常规窗第 3 个实参是 `must_start`（少带前文）。防日后把收尾窗也改成 `must_start`。
+    #[test]
+    fn ts413_rule4_call_site_passes_gs_not_must_start() {
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"));
+        let (mut regular, mut tail) = (0usize, 0usize);
+        for i in 0..prod.len() {
+            if prod[i].starts_with("dispatch_window!(") {
+                let arg3 = prod.get(i + 3).map(|s| s.as_str()).unwrap_or("");
+                if arg3 == "must_start," {
+                    regular += 1;
+                } else if arg3 == "gs," {
+                    tail += 1;
+                }
+            }
+        }
+        assert_eq!(regular, 1, "常规窗应恰有 1 处传 must_start");
+        assert_eq!(tail, 1, "收尾短尾窗应恰有 1 处传 gs（规则 4 整片重解）");
+    }
+
+    /// 前片短于回溯 ⇒ 取整片（`cut=0`，`suffix_samples = prev.len()`，基准 = 前片流式 + must 流式）。
+    #[test]
+    fn ts413_prev_shorter_than_backtrack_uses_whole_slice() {
+        let prev = vec![0.1f32; 16_000]; // 1s
+        let cs = take_context_suffix(&prev, "甲乙丙丁戊己庚辛壬癸", "后续文本", 3.0);
+        assert_eq!(cs.cut, 0, "前片不足回溯 ⇒ 整片");
+        assert_eq!(cs.suffix_samples, prev.len());
+        assert_eq!(cs.baseline, "甲乙丙丁戊己庚辛壬癸后续文本");
+    }
+
+    /// 正常前片：按字速回溯取后缀，基准 = 前片流式末尾相应字数 + must 流式。
+    #[test]
+    fn ts413_context_suffix_cut_and_baseline() {
+        // 6s 均匀正弦（无字缝 ⇒ 回落回溯点）。
+        let prev: Vec<f32> = (0..6 * 16_000)
+            .map(|i| (i as f32 * 0.13).sin() * 0.5)
+            .collect();
+        let cs = take_context_suffix(&prev, "abcdefghij", "MUST", 3.0);
+        // 3.0 字/秒 ⇒ 回溯 4s ⇒ 6s 片切掉前 2s，后缀 4s。
+        assert_eq!(cs.cut, 2 * 16_000);
+        assert_eq!(cs.suffix_samples, 4 * 16_000);
+        assert!(!cs.gap_found);
+        // 前片 10 字 × (4/6) ≈ 7 字 ⇒ 取末尾 7 字 "defghij"。
+        assert_eq!(cs.baseline, "defghijMUST");
+    }
+
+    /// 区间裁剪平移：跨 `cut` 的区间截断；完全在 `cut` 前的丢弃；之后整体平移 `-cut`。
+    #[test]
+    fn ts413_trim_and_shift_ranges() {
+        let ranges = vec![(0usize, 100usize), (100, 300), (300, 500)];
+        assert_eq!(
+            trim_and_shift_ranges(&ranges, 200),
+            vec![(0, 100), (100, 300)],
+            "前段丢弃 / 跨 cut 截断 / 后段平移"
+        );
+        assert_eq!(trim_and_shift_ranges(&ranges, 0), ranges, "cut=0 ⇒ 恒等");
+        assert_eq!(
+            trim_and_shift_ranges(&ranges, 10_000),
+            Vec::<(usize, usize)>::new(),
+            "全在 cut 前 ⇒ 空"
+        );
+    }
+
+    /// R1：带前文常规窗的 410 兜底只覆盖 **must 片**（span 起点 = `must_start`，不含前文后缀），
+    /// 样本表 = must 片各自长度，流式 = must 流式。前文后缀留给上一窗已精解文本。
+    #[test]
+    fn ts413r1_context_tail_pending_covers_must_only() {
+        let tp = context_tail_pending(3, 5, vec![100, 200], "must-stream".to_string());
+        assert_eq!(
+            tp.span,
+            (3, 5),
+            "span 起点必须是 must_start（不含前文后缀）"
+        );
+        assert_eq!(tp.samples, vec![100, 200], "样本表 = must 各片长度");
+        assert_eq!(tp.streaming, "must-stream");
+    }
+
+    /// R1 源码锚点：带前文分支构造 `Some(context_tail_pending(...))`；无前文分支 `None`；
+    /// 常规窗 push 用 `tail_pending` 变量（而非硬编码 None）。
+    #[test]
+    fn ts413r1_context_branch_source_anchor() {
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"));
+        assert!(
+            prod.iter().any(|l| l.contains("fn context_tail_pending(")),
+            "须有带前文 410 兜底构造函数"
+        );
+        assert!(
+            prod.iter().any(|l| l.contains("span: (must_start, ge)")),
+            "带前文兜底 span 必须锚在 must_start"
+        );
+        assert!(
+            prod.iter()
+                .any(|l| l.contains("Some(context_tail_pending(")),
+            "带前文分支须构造 Some(context_tail_pending(...))"
+        );
+        assert!(
+            prod.iter()
+                .any(|l| l.contains("window_tail_pending.push(tail_pending)")),
+            "常规窗 push 须用 tail_pending 变量"
         );
     }
 }
