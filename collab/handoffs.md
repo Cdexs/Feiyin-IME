@@ -9,6 +9,13 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-1 — SEAM-ARBITER-STREAMING-433 ✅ 交付（预览原文裁判接缝 + forced/估算层）
+
+- 重叠区取舍由「固定取前一窗（431）」升级为**预览模型原始文本裁判**：A=前一窗重叠区 / B=后一窗，与 R（流式原文）比 `LCS/max`，更像者胜；平局/R 空⇒A。胜 B ⇒ 前一窗 cut 前 + 后一窗整窗（改前 416 行为）。
+- 新层 `AlignLayer::Forced`（有先验 e≥8、半全局有对应、`best/e≤0.90`）不再 concat；长度比超 [0.70,1.43] 取**较长版**（`longer_*`）。无先验也**估重叠**取较长版（`est_longer_*`）；完全对不上才 concat+warn `[DBG-433] concat fallback`。
+- 🔴 R 来源（防混入精解/合成）：`window_streaming_texts[seq]`（流式逐片原始输出）→ `push_window_streaming` → `OrderedReflow.last_stream` → `streaming_overlap_region`；代码行见 result。
+- 日志：`[DBG-416] seam` 追加 `arb/sim_a/sim_b/R`；新增每窗 `[DBG-433] win`（acc/stream 不截断）。`fix433_tests` 14/14（含 5 接缝推演表、forced 长度比 <0.7/>1.43 各一例）；416/431 用例同步。fmt EXIT0 / check 0 error、warnings 91/87=基线 / 全量 test 0 failed（bin 1863P/0F/64I）。平台中立，MACOS-HANDOFF 已记；未 commit / 未 build / 版本未动 / 零凭证。
+
 ## 2026-09-25 — coder-1 — VOICEPRINT-JUDGE-1P5S-432 ✅ 交付（拆判定/注册门槛，只改 speaker.rs）
 
 - **判定**门槛 `MIN_JUDGE_SECS` 2.0→**1.5s**（同时供 412 合并目标、语种门）；新增 **`MIN_OFFER_SECS=2.0`** 守**注册/漂移 offer**（1.5~2s 嵌入差，防拉低本人档）；`DROP_THR=0.45` 不动。原 `MIN_JUDGE_SECS` 身兼三职，不能整体下调（Gavin 09-25「A，432进包」）。

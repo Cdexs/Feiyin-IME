@@ -1,4 +1,10 @@
 
+### 2026-09-25 · SEAM-ARBITER-STREAMING-433 交付（预览原文裁判接缝 + forced/估算层，主改 mod.rs）
+
+- 重叠区取舍升级为**预览模型原始文本裁判**（A=前一窗/B=后一窗，比 `LCS/max`，更像 R 者胜；平局/R 空⇒A、维持 431）。新层 `AlignLayer::Forced`（有先验 e≥8、半全局有对应且 `best/e≤0.90`）不再 concat；长度比超 [0.70,1.43] 取**较长版**；无先验也**估重叠**取较长版；完全对不上才 concat+warn `[DBG-433] concat fallback`。
+- R 必须为流式原文：`window_streaming_texts[seq]` → `push_window_streaming` → `last_stream` → `streaming_overlap_region`；日志 `[DBG-416] seam` 加 `arb/sim_a/sim_b/R`，新增 `[DBG-433] win`（acc/stream 不截断）。
+- `fix433_tests` 14/14（含 5 接缝裁判推演表：前三取 A、四/五取 B 且五无整段重复）；416/431 用例同步（errors=3 现全无重复）。fmt EXIT0 / check 0 error、warnings 91/87=基线 / 全量 test 0 failed（bin 1863P/0F/64I）。平台中立，MACOS-HANDOFF 已记。未出包。
+
 ### 2026-09-25 · VOICEPRINT-JUDGE-1P5S-432 交付（判定门槛 1.5s / 注册 offer 2.0s，只改 speaker.rs）
 
 - 拆常数：`MIN_JUDGE_SECS=1.5`（判定 + 412 合并目标 + 语种门）、新增 `MIN_OFFER_SECS=2.0`（注册/漂移 offer）；`DROP_THR=0.45` 不动。offer 两条件抽纯函数 `unit_offer_eligible`，调用处改调之。

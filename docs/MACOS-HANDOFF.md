@@ -2451,3 +2451,10 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | --- | --- | --- |
 | `src/transcription/speaker.rs`：`MIN_JUDGE_SECS` 2.0→**1.5**（判定 + 412 合并目标 + 语种门）；**新增** `MIN_OFFER_SECS = 2.0`（注册/漂移 offer）；**新增纯函数** `unit_offer_eligible(unit_secs, unit, new_slice_from) = unit_secs >= MIN_OFFER_SECS && unit_offer_allowed(...)`，offer 调用处改调之；`DROP_THR` 不动 | 声纹**判定**门槛降 1.5s（1.5~1.8s 本人 min 0.542 > 0.45 ⇒ 可判，他人剔 96~100%）；**注册/漂移** 仍 ≥2.0s（1.5~2s 嵌入差，不得入档）；412 合并目标随判定门槛（凑够 1.5s 封口） | ✅ 平台中立纯逻辑（无 `cfg`），macOS 同继承（`speaker.rs` 编同一份） |
 | **macOS 侧需要做什么** | | 无需改动（无新增文件/开关/env；纯常数与纯函数改动，平台中立自动继承） |
+
+## SEAM-ARBITER-STREAMING-433（2026-09-25，coder-1）· 重叠区预览原文裁判 + forced/估算层 —— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `src/transcription/mod.rs`：对齐成功后按**预览流式原文** R 裁判 A（前一窗重叠区）/B（后一窗重叠区），更像 R 者胜；新增 `AlignLayer::Forced`（有先验 e≥8、半全局有对应且 `best/e≤0.90`）与 `estimate_overlap`（无先验估重叠）；长度比超 [0.70,1.43] 取较长版；完全对不上才 concat。`src/main.rs` 收割区新增 `win_stream = window_streaming_texts[seq]` 经 `push_window_streaming` 传入 | 重叠接缝由「固定取前一窗」改为**按预览原文取舍**；后片更准时改用后片、消除整段重复；forced 层使原本 concat 的真实重叠也去重 | ✅ 平台中立纯逻辑（无 `cfg`）；`main.rs` 传参走既有 `window_streaming_texts`（流式逐片原始输出）。macOS 若走同一收割路径自动继承 |
+| **macOS 侧需要做什么** | | ① 若 macOS 侧调用 `OrderedReflow`：优先用 `push_window_streaming`（带流式原文）；仅用 `push_window` 时 R 为空 ⇒ 退回 431（安全）。② 无新增文件/开关/env |
