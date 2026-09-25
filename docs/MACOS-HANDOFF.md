@@ -2387,5 +2387,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 改动 | 行为前 → 后 | macOS 影响 |
 | --- | --- | --- |
 | `transcription/mod.rs`：`align_overlap_with_prior` 分层（严格 → 宽松）；新增 `seam_dedupe` / `resolve_overlap` / `AlignLayer`；`OrderedReflow::push_inner` 走 `resolve_overlap` | 413 后重叠只是前一片后缀（≈12 字），占新窗比例随新句变长变小 ⇒ 原门 `max(8,0.30×新窗)` 挡真实重叠 ⇒ `align_fail` ⇒ 拼接 ⇒ 后缀重复。新：① 有先验且 `e≥8` 时门只要求 `≥8`；② 宽松对齐 `[0.5e,1.5e]` 取编辑率最低、≤0.35；③ 接缝去重（≥4 有效字精确片段只留一份）；④ 拼接降为最后手段。`e<8` 不进放宽路径（防切多丢字）；Debug `[DBG-416] seam: layer=…` | ✅ 平台中立纯逻辑（无 `cfg`），macOS 同继承；底线「绝不丢字」不变 |
+| R1：宽松层候选改按**编辑距离绝对值最小**选、打平取较小 k（编辑率仅作入选门槛 ≤0.35） | 修「中段插入 1 字丢 1 字」（原按编辑率排序的分母偏置） | ✅ 平台中立自动继承 |
 | **macOS 侧需要做什么** | | 无需改动（平台中立自动继承） |
+
+## FILLER-LONG-REPEAT-419（2026-09-25，coder-1）· 后处理节点整段重复折叠 —— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `text_normalizer.rs`：`strip_fillers_conservative` 在规则 A/B 后加**规则 C**（`collapse_long_repeats`） | 紧挨着、一字不差重复的**整段**只留第一份（忽略标点/空白比较；中/日/韩 ≥6 字、英 ≥3 词；排除周期性单元与纯数字；差一字不动）。**不区分管线** —— 所有在 LLM 未接手时进入该节点的管线都适用（Gavin：「这是识别效果优化」） | ✅ 平台中立纯逻辑（无 `cfg`），macOS 同继承 |
 | **macOS 侧需要做什么** | | 无需改动（平台中立自动继承） |

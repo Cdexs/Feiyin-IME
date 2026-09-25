@@ -10,7 +10,8 @@
 | `LOCALRT-SHORT-CONTEXT-413` | #6「末段少带前文」：常规窗前文从「前面整片（≤10s）」改为「前一片末尾 ≥2s/≥12 字后缀」（复用 407 末尾窗机制）；末段解码目标 ~2.2s→~1.3s | coder-1 | main.rs 组窗/派发区 | ✅ 验收通过 `6a718c4`（含 R1：被拒兜底只覆 must 片）；✅ 阶段三 TEST-SYNC-413 交付（coder-2，8 条非作者护栏；fmt EXIT0 / check 0 error、warnings 92/87=基线；未跑 cargo test，待 tester-1） |
 | `FIX-NOSPEECH-WINDOW-414` | #9 审计②：时间线无语音但流式非空 ⇒ 不再整窗送解，改自跑 VAD 复核；仍无语音 ⇒ 直接空结果走流式兜底 | coder-2 | transcription/mod.rs | ✅ 验收通过 `696ed25`（小改动，不单派阶段三） |
 | `OVERLAY-MEASURE-CACHE-415` | #2 F-A-01：浮层量宽结果缓存（文字不变不重量）；**须 Gavin 目视** | coder-2 | main.rs 浮层区 | ✅ 阶段一交付（4 条单测；fmt EXIT0 / check 0 error、warnings 92/87=基线 / 全量 test 0 failed；🔴 端测须目视滚动贴右/随文字变宽/改字号/多屏 DPI） |
-| `REPRO-413-ALIGN-GATE-416` + `FIX-ALIGN-GATE-416` | 问题4：413 后长度门使长句前文后缀重复（复现：后缀 8/12/16 在 S2≥19/29/41 起）；Gavin 确认「尽量杜绝重复」⇒ 同单修复：严格(门≥8) → 宽松(≤0.35) → 接缝去重 → 拼接(最后手段) | coder-1 | mod.rs | ✅ 交付（首轮+修复，待验收） |
+| `REPRO-413-ALIGN-GATE-416` + `FIX-ALIGN-GATE-416` | 问题4：413 后长度门使长句前文后缀重复（复现：后缀 8/12/16 在 S2≥19/29/41 起）；Gavin 确认「尽量杜绝重复」⇒ 同单修复：严格(门≥8) → 宽松(≤0.35) → 接缝去重 → 拼接(最后手段) | coder-1 | mod.rs | ✅ 首轮+修复+R1 交付（待验收）：R1 宽松层改「编辑距离绝对值最小、打平取较小 k」；coder-2 阶段三 10 条 xfail 已去 ignore 转正（10P/0I）；repro416 9/9、全量 test 0F（bin 1775P/0F/54I） |
+| `FILLER-LONG-REPEAT-419` | 后处理节点保险：`strip_fillers_conservative` 加规则 C（紧邻完全相同整段只留第一份；中/日/韩≥6 字、英≥3 词；排除周期性/纯数字）；不区分管线 | coder-1 | text_normalizer.rs | ✅ 交付（待验收；`rule_c_*` 10 条；fmt/check/全量 test 0F；平台中立，MACOS-HANDOFF 已记） |
 | `LOCALRT-STREAM-THREADS-417` | Gavin「将预览的线程调为 4」：流式 min(核,4)，精解不动 | coder-2 | local_stream.rs | ✅ 阶段一交付（fmt EXIT0 / check 0 error、warnings 92/87=基线 / 全量 test 排除 coder-1 在途 RED 后 0 failed） |
 | `DEBUG-SESSION-WAV-418` | 问题5：-debug 下保存整段录音（Warn 级零动作、后台写、上限 10） | coder-2（417 后） | audio/mod.rs | ✅ 阶段一交付（diag418_* 2P；Warn 零动作 / 后台线程写 / session 上限 10 与 preroll 分开） |
 | BUILD-415 | 回归通过（bin 1744P/0F/54I）；Gavin 叫停打包前 Publish 已同步为 415（含疑似 413 问题），主控选保持不回滚；**下一包合并 416~418 后重出** | tester-1 | — | ⏸ |

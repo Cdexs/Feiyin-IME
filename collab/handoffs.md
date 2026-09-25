@@ -9,6 +9,29 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-1 — FILLER-LONG-REPEAT-419 ✅ 交付（后处理节点规则 C，只改 text_normalizer.rs）
+
+- **范围**：只改 `src/text_normalizer.rs` 的 `strip_fillers_conservative`（A/B 后加规则 C）+ `rule_c_*` 4 个纯函数 + 测试 10 条。未碰 `main.rs`（唯一调用方 `apply_filler_strip` 签名不变）。
+- **规则 C**：紧挨着、一字不差重复的**整段**只留第一份。忽略标点/空白比较；长度门 中/日/韩 ≥6 字、英文等空白分词 ≥3 词；排除周期性单元与纯数字/数字+符号；差一字不动；三连一次折到位；与 B 迭代到不动点。例：`我们明天去公园，我们明天去公园。`→`我们明天去公园。`；`I think we should I think we should go`→`I think we should go`。
+- **测试**：`rule_c_*` 10 条（中/英/日/韩正例、三连、短单元排除、数字排除、差一字不折、ABAB 不折、幂等）。fmt EXIT 0；check 0 error、warnings 91/87≤基线；全量 test 0 failed（bin 1775P/0F/54I，含 R1）。平台中立，MACOS-HANDOFF 已记。
+- 红线：未 commit / 未 build release / 版本 0.9.3 未动 / 零凭证。
+
+## 2026-09-25 — coder-1 — FIX-ALIGN-GATE-416 · R1 ✅ 交付（宽松层排序改绝对编辑距离，只改 mod.rs）
+
+- **起因**：coder-2 TEST-SYNC-416 发现中段插入 1 字丢 1 字（宽松层按最低编辑率，分母偏置偏大 k）。
+- **改法**：宽松层按**编辑距离绝对值最小**选、**打平取较小 k**（升序遍历、仅严格更小时替换）；编辑率仅作入选门槛 ≤0.35。`AlignResult` 加 `edit_dist`。
+- **去 ignore**：`ts416g_finding_insertion_mid_loses_one_char` 去掉 `#[ignore]`（断言未动）⇒ 转正；`testsync416_tests` 10P/0I。
+- **严格层 ③ 自查**：取第一个过门者、先小后大 ⇒ 无同类偏置。
+- **验证**：fmt EXIT 0；check 0 error、warnings 91/87≤基线；repro416 9/9、testsync416 10/10；全量 test 0 failed（bin 1775P/0F/54I）。未 commit / 未 build release / 版本未动 / 零凭证。
+
+## 2026-09-25 — coder-2 — TEST-SYNC-416 ✅ 交付（阶段三·非作者护栏 10 条；生产零改动）
+
+- **范围**：只在 `src/transcription/mod.rs` 新增 `#[cfg(test)] mod testsync416_tests`（`+275/0`，10 条）；**未碰生产区**、未碰 `main.rs`/`local_stream.rs`/`audio/mod.rs`。
+- **契约 1~8（独立推导）**：① 长句不重复 ② 各层不丢字（错字 1~4×start/mid/end + 删除 + 末尾插入）③ 同编辑率取小 k（嵌套精确 k=8/16 ⇒ 层④升序取 8）④ e<8 不放宽但精确接缝去重 ⑤ 接缝去重不误伤（口语短重复/仅 3 字相同）⑥ 全不同 ⇒ concat ⑦ 旧整片形状逐字 == S1+S2 ⑧ 源码锚点（`resolve_overlap` 调用 + `[DBG-416] seam` 在 Debug 门内）+ 阈值常量。自建字表（0x6C00/0x7000）与场景，不复用作者夹具/快照；期望值经 sandbox 复刻 416 纯逻辑逐条复算一致。
+- 🔴 **FINDING（主控裁决「必须修，派 coder-1」）**：重叠区**中段插入 1 个额外字**时宽松层取 `k=13`（编辑率 2/13 < k=12 的 2/12）⇒ `committed=prev[..47]`，丢 S1 第 48 字（1 字）。已作 `#[ignore]` xfail 用例 `ts416g_finding_insertion_mid_loses_one_char`，注释写明**「416-R1 修复后去掉 ignore（由 coder-1 在 R1 执行）」**；R1 规则 = 宽松层按「编辑距离绝对值最小、打平取较小 k」选。
+- **验证（白名单）**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` 0 error、warnings bin **91** / test **87** ≤ 基线、新增模块零 warning；🔴 **未跑 `cargo test`**（阶段三禁止；tester-1 执行）。除上述 FINDING 外未发现生产缺陷。
+- 红线：未改生产代码 / 未 commit / 未 push / 版本未动 / 零凭证。
+
 ## 2026-09-25 — coder-1 — REPRO-413-ALIGN-GATE-416 + FIX-ALIGN-GATE-416 ✅ 交付（复现 + 修复，只改 mod.rs）
 
 - **范围**：只改 `src/transcription/mod.rs` —— `align_overlap_with_prior` / `OrderedReflow::push_inner`（+ `AlignLayer`/`AlignResult` 字段、`align_try_k_ratio`、`seam_dedupe`、`resolve_overlap`）+ `repro416_tests`（9 条）。**未碰** `main.rs` / `local_stream.rs`。
