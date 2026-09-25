@@ -1047,8 +1047,12 @@ fn trim_to_speech(audio: &[f32], ranges: &[(usize, usize)], pad: usize) -> Vec<f
 enum TimelineTrim {
     /// 非空区间 ⇒ 据此剪静音。
     Apply(Vec<(usize, usize)>),
-    /// 时间线判无语音但本窗流式有文本 ⇒ **不复剪、整窗解码**（宁可多解，不吞字）。
-    WholeWindow,
+    /// FIX-NOSPEECH-WINDOW-414：时间线判无语音但本窗流式有文本 ⇒ **自跑 VAD 复核**再决定剪静音。
+    ///
+    /// 393-A4 原为「不复剪、整窗解码」（旧名 `WholeWindow`，宁可多解不吞字）；但 16:34Z 现场
+    /// 时间线在该窗无语音、流式却非空 ⇒ 整窗 11.25s 送 1.7B 白解、返回空。复核代价远小于整窗解码，
+    /// 且「不吞字」已由 386-C 流式兜底保证（精解空 ⇒ 保留流式文本），故改为复核。
+    Revad,
     /// 时间线判无语音且流式也空 ⇒ 提前返回空串。
     Empty,
 }
@@ -1064,7 +1068,7 @@ fn plan_timeline_trim(
     speech_ranges.map(|ranges| {
         if ranges.is_empty() {
             if streaming_nonempty {
-                TimelineTrim::WholeWindow
+                TimelineTrim::Revad
             } else {
                 TimelineTrim::Empty
             }
@@ -1140,6 +1144,84 @@ fn redecode_with_ranges(
         .map(|(t, _)| t)
 }
 
+/// FIX-NOSPEECH-WINDOW-414：线程级自跑 VAD 取区间（`None` 回退分支与 `Revad` 复核分支共用）。
+///
+/// 返回 `None` = VAD 模型不可用（懒建失败**记住不重试**）；`Some(ranges)` = VAD 可用
+/// （`ranges` 可为空 ⇒ 判定无语音）。抽成独立函数供两处复用，**不复制** `None` 分支逻辑。
+fn self_vad_ranges(samples: &[f32]) -> Option<Vec<(usize, usize)>> {
+    LOCALRT_TRIM_VAD.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(VadSegmenter::try_new_for_local_trim(&model_dir()));
+        }
+        slot.as_ref()
+            .and_then(|o| o.as_ref())
+            .map(|vseg| vseg.speech_ranges(samples))
+    })
+}
+
+/// FIX-NOSPEECH-WINDOW-414：自跑 VAD 剪静音的**结果**（纯数据，便于单测）。
+struct SelfVadTrim {
+    /// 送入解码的样本（剪静音后 / 空 / 原样整窗）。
+    used: Vec<f32>,
+    /// 是否经 VAD 判定（`false` 仅当 VAD 不可用 ⇒ 原样整窗）。
+    trimmed: bool,
+    /// 语音区间数（0 ⇒ 下方 `trimmed && n_ranges == 0` 早退，不进模型）。
+    n_ranges: usize,
+    /// 剪静音来源（复核 `revad` / 回退 `vad` / VAD 不可用 `none`）。
+    src: &'static str,
+    /// 原始语音区间（供 408B 解码后语种保护重解）。
+    ranges: Vec<(usize, usize)>,
+    /// 声纹过滤结果（供 406 放宽 / 注册 offer / 日志）。
+    filter: Option<speaker::VoiceprintFilter>,
+}
+
+/// FIX-NOSPEECH-WINDOW-414：给定自跑 VAD 的区间（`None` = VAD 不可用）产出剪静音结果。
+///
+/// 纯函数（不碰模型 / 线程局部），供 `None` 回退分支与 `Revad` 复核分支共用：
+/// - VAD 不可用 ⇒ 原样整窗（`trimmed=false`，不吞字的最后防线）；
+/// - VAD 可用但无语音 ⇒ 空样本（`trimmed=true, n_ranges=0` ⇒ 早退、不进模型）；
+/// - 有语音 ⇒ 声纹过滤 + `trim_to_speech`（与 388/412 一致）。
+fn plan_self_vad_trim(
+    samples: &[f32],
+    ranges: Option<Vec<(usize, usize)>>,
+    pad: usize,
+    new_slice_from: usize,
+    src: &'static str,
+) -> SelfVadTrim {
+    match ranges {
+        None => SelfVadTrim {
+            used: samples.to_vec(),
+            trimmed: false,
+            n_ranges: 0,
+            src: "none",
+            ranges: Vec::new(),
+            filter: None,
+        },
+        Some(r) if r.is_empty() => SelfVadTrim {
+            used: Vec::new(),
+            trimmed: true,
+            n_ranges: 0,
+            src,
+            ranges: r,
+            filter: None,
+        },
+        Some(r) => {
+            let f = speaker::filter_ranges_by_voiceprint(samples, &r, new_slice_from);
+            let used = trim_to_speech(samples, &f.kept, pad);
+            let n = f.kept.len();
+            SelfVadTrim {
+                used,
+                trimmed: true,
+                n_ranges: n,
+                src,
+                ranges: r,
+                filter: Some(f),
+            }
+        }
+    }
+}
+
 /// LOCALRT-CTX-INJECT-320：带「上下文 + 词库」per-stream 注入 + 长跨回显护栏的 accuracy 单段解码。
 ///
 /// - `terms`：用户词库词条（原样；调用方给）。
@@ -1176,36 +1258,44 @@ pub(crate) fn transcribe_acc_ctx(
                 vp_filter = Some(f);
                 (out, true, n, "timeline")
             }
-            // 时间线判无语音但本窗流式有文本 ⇒ 不复剪、整窗解码（宁可多解，不吞字）。
-            Some(TimelineTrim::WholeWindow) => (samples.to_vec(), false, 0usize, "timeline"),
+            // FIX-NOSPEECH-WINDOW-414：时间线判无语音但本窗流式有文本 ⇒ **自跑 VAD 复核**：
+            //   复核有语音 ⇒ 按复核区间剪静音后解码；复核无语音 ⇒ 空结果交流式兜底（不再整窗白解）；
+            //   VAD 不可用 ⇒ 原样整窗（不吞字的最后防线）。逻辑与 `None` 回退分支共用。
+            Some(TimelineTrim::Revad) => {
+                let t = plan_self_vad_trim(
+                    samples,
+                    self_vad_ranges(samples),
+                    pad,
+                    inject.new_slice_from,
+                    "revad",
+                );
+                if log::log_enabled!(log::Level::Debug) {
+                    log::debug!(
+                        "[LocalRT-DBG-414] revad: seg={} in={:.2}s ranges={} src={}",
+                        seg_idx,
+                        in_secs,
+                        t.n_ranges,
+                        t.src
+                    );
+                }
+                ranges_orig = t.ranges;
+                vp_filter = t.filter;
+                (t.used, t.trimmed, t.n_ranges, t.src)
+            }
             // 时间线判无语音且流式也空 ⇒ 空结果（下方 `trimmed && n_ranges == 0` 统一早退）。
             Some(TimelineTrim::Empty) => (Vec::new(), true, 0usize, "timeline"),
-            None => LOCALRT_TRIM_VAD.with(|cell| {
-                let mut slot = cell.borrow_mut();
-                if slot.is_none() {
-                    *slot = Some(VadSegmenter::try_new_for_local_trim(&model_dir()));
-                }
-                match slot.as_ref().and_then(|o| o.as_ref()) {
-                    Some(vseg) => {
-                        let ranges = vseg.speech_ranges(samples);
-                        if ranges.is_empty() {
-                            (Vec::new(), true, 0usize, "vad")
-                        } else {
-                            ranges_orig = ranges.clone();
-                            let f = speaker::filter_ranges_by_voiceprint(
-                                samples,
-                                &ranges,
-                                inject.new_slice_from,
-                            );
-                            let out = trim_to_speech(samples, &f.kept, pad);
-                            let n = f.kept.len();
-                            vp_filter = Some(f);
-                            (out, true, n, "vad")
-                        }
-                    }
-                    None => (samples.to_vec(), false, 0usize, "none"),
-                }
-            }),
+            None => {
+                let t = plan_self_vad_trim(
+                    samples,
+                    self_vad_ranges(samples),
+                    pad,
+                    inject.new_slice_from,
+                    "vad",
+                );
+                ranges_orig = t.ranges;
+                vp_filter = t.filter;
+                (t.used, t.trimmed, t.n_ranges, t.src)
+            }
         };
     // 408B①：解码前剔除统计（供 406 放宽 / 日志）。
     let drop_stats = vp_filter
@@ -6340,12 +6430,12 @@ mod testsync393_tests {
         );
     }
 
-    /// 空区间 + 流式非空 ⇒ `WholeWindow`（不复剪、整窗解码，防漏判吞字）。
+    /// 空区间 + 流式非空 ⇒ `Revad`（414：自跑 VAD 复核，不再整窗解码）。
     #[test]
-    fn ts393_plan_empty_with_streaming_decodes_whole_window() {
+    fn ts393_plan_empty_with_streaming_needs_revad() {
         assert_eq!(
             plan_timeline_trim(Some(&[]), true),
-            Some(TimelineTrim::WholeWindow)
+            Some(TimelineTrim::Revad)
         );
     }
 
@@ -6378,10 +6468,15 @@ mod testsync393_tests {
         assert!(trim_to_speech(&audio, &beyond, pad).is_empty());
     }
 
-    /// 393-A4 源码护栏（TEST-SYNC，非作者）：`transcribe_acc_ctx` 的 `Some(TimelineTrim::WholeWindow)`
-    /// 分支返回**原样整窗**（`samples.to_vec()`），不是空 —— 时间线空但流式有文本时不得吞掉整窗。
+    /// 414 源码护栏（原 393-A4，按新行为改写）：`transcribe_acc_ctx` 的 `Some(TimelineTrim::Revad)`
+    /// 分支**不得**再原样整窗送解，必须调共用复核（`plan_self_vad_trim` + `self_vad_ranges`，
+    /// `src=revad`）⇒ 复核无语音时靠下方 `trimmed && n_ranges == 0` 早退（不进模型）。
+    ///
+    /// FIX-NOSPEECH-WINDOW-414 按 Gavin 2026-09-25 指示改为复核，原因：16:34Z 现场时间线在该窗
+    /// 无语音、流式非空 ⇒ 整窗 11.25s 白解返回空（占 CPU、拖慢后面的窗）；「不吞字」已由 386-C
+    /// 流式兜底保证（精解空 ⇒ 保留流式文本）。
     #[test]
-    fn ts393c_whole_window_branch_returns_whole_samples_source_guard() {
+    fn ts393c_revad_branch_uses_recheck_source_guard() {
         let src = include_str!("mod.rs");
         let body = src
             .split("pub(crate) fn transcribe_acc_ctx(")
@@ -6389,9 +6484,109 @@ mod testsync393_tests {
             .expect("transcribe_acc_ctx 锚点缺失");
         // 与既有护栏同界：截到下一个函数文档前。
         let body = body.split("FIX-PREFIX-AND-EAT-371").next().unwrap();
+        let arm = body
+            .split("Some(TimelineTrim::Revad)")
+            .nth(1)
+            .expect("Revad 分支锚点缺失");
         assert!(
-            body.contains("Some(TimelineTrim::WholeWindow) => (samples.to_vec()"),
-            "WholeWindow 分支必须返回 samples.to_vec()（原样整窗），不得返回空"
+            arm.contains("plan_self_vad_trim(") && arm.contains("\"revad\""),
+            "Revad 分支必须调 plan_self_vad_trim 复核并记 src=revad"
+        );
+        // 反向：不得回到「原样整窗、trim_src=timeline」的旧行为。
+        assert!(
+            !body.contains("Some(TimelineTrim::Revad) => (samples.to_vec()"),
+            "Revad 分支不得再原样整窗（414 已改为自跑 VAD 复核）"
+        );
+    }
+}
+
+// ============================================================
+// FIX-NOSPEECH-WINDOW-414：时间线无语音的窗不再整窗送解（自跑 VAD 复核）
+//   三态：Apply（时间线有区间）｜Revad（复核）｜Empty（无语音且流式空）
+// ============================================================
+#[cfg(test)]
+mod fix414_revad_tests {
+    use super::plan_self_vad_trim;
+
+    const RATE: usize = 16000;
+
+    /// 复核路径：VAD 有语音区间（<2s ⇒ 声纹 KeepShort）⇒ 剪静音、短于输入。
+    #[test]
+    fn f414_self_vad_nonempty_trims() {
+        let audio: Vec<f32> = (0..RATE).map(|i| (i % 100) as f32 / 100.0).collect();
+        let pad = (0.2 * RATE as f32) as usize;
+        let ranges = vec![(2000usize, 6000usize)]; // 0.25s < 2s ⇒ KeepShort
+        let t = plan_self_vad_trim(&audio, Some(ranges), pad, 0, "revad");
+        assert!(t.trimmed, "VAD 可用 ⇒ trimmed");
+        assert_eq!(t.n_ranges, 1);
+        assert_eq!(t.src, "revad");
+        assert!(!t.used.is_empty());
+        assert!(t.used.len() < audio.len(), "应剪掉首尾静音");
+        assert_eq!(t.ranges, vec![(2000, 6000)]);
+    }
+
+    /// 复核路径：VAD 可用但纯静音（无区间）⇒ 空样本（下方早退、不进模型）。
+    #[test]
+    fn f414_self_vad_empty_yields_empty() {
+        let audio = vec![0.1f32; RATE];
+        let t = plan_self_vad_trim(&audio, Some(Vec::new()), 100, 0, "revad");
+        assert!(t.trimmed, "VAD 可用（即使无语音）⇒ trimmed");
+        assert_eq!(t.n_ranges, 0);
+        assert_eq!(t.src, "revad");
+        assert!(t.used.is_empty(), "复核无语音 ⇒ 空样本，交流式兜底");
+        assert!(t.filter.is_none());
+    }
+
+    /// VAD 不可用 ⇒ 原样整窗（不吞字的最后防线）。
+    #[test]
+    fn f414_self_vad_unavailable_whole_window() {
+        let audio = vec![0.3f32; 1234];
+        let t = plan_self_vad_trim(&audio, None, 100, 0, "revad");
+        assert!(!t.trimmed, "VAD 不可用 ⇒ 未判定");
+        assert_eq!(t.n_ranges, 0);
+        assert_eq!(t.src, "none");
+        assert_eq!(t.used, audio, "原样整窗");
+        assert!(t.filter.is_none());
+    }
+
+    /// 复核真模型（`#[ignore]`）：有语音 ⇒ 剪静音短于输入；纯静音 ⇒ 无区间、空样本。
+    ///
+    /// 直接按 `CARGO_MANIFEST_DIR/models` 建 VAD（生产走 `model_dir()`=exe 同级，
+    /// 测试进程 exe 在 `target/debug/deps` 下取不到模型），再喂入共用判定 `plan_self_vad_trim`。
+    #[test]
+    #[ignore = "手工：需 silero 模型 + kv_long.wav"]
+    fn f414_revad_real_model_speech_and_silence() {
+        use sherpa_onnx::Wave;
+        let pad = (0.2 * RATE as f32) as usize;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let Some(vad) = super::VadSegmenter::try_new_for_local_trim(&root.join("models")) else {
+            eprintln!("skip: silero VAD 不可用（模型缺失）");
+            return;
+        };
+        // 有语音：wav 片段前后各补 5s 静音。
+        let wav_path = root.join("models/kv259/kv_long.wav");
+        let Some(wave) = Wave::read(wav_path.to_str().expect("utf-8 path")) else {
+            eprintln!("skip: kv_long.wav 缺失");
+            return;
+        };
+        let clip_len = wave.samples().len().min(4 * RATE);
+        let pad_s = 5 * RATE;
+        let mut audio = vec![0.0f32; pad_s];
+        audio.extend_from_slice(&wave.samples()[..clip_len]);
+        audio.extend(std::iter::repeat(0.0f32).take(pad_s));
+        let ranges = vad.speech_ranges(&audio);
+        assert!(!ranges.is_empty(), "wav 片段应检出语音区间");
+        let t = plan_self_vad_trim(&audio, Some(ranges), pad, 0, "revad");
+        assert!(t.trimmed && t.n_ranges >= 1, "复核有语音 ⇒ 剪静音");
+        assert!(t.used.len() < audio.len(), "应剪掉补的静音");
+        // 纯静音：复核无区间 ⇒ 空样本（不进模型）。
+        let silence = vec![0.0f32; 5 * RATE];
+        let sr = vad.speech_ranges(&silence);
+        assert!(sr.is_empty(), "纯静音应无区间");
+        let t2 = plan_self_vad_trim(&silence, Some(sr), pad, 0, "revad");
+        assert!(
+            t2.trimmed && t2.n_ranges == 0 && t2.used.is_empty(),
+            "纯静音 ⇒ 复核无区间 ⇒ 空样本"
         );
     }
 }
