@@ -19,6 +19,11 @@
 - 新增 `emit_tail_window!` 宏统一组装末尾窗（有前片 ⇒ 前片后缀 + pending；首片 ⇒ `tail_window_alone` 单独解），长静默 407 与松键收尾共用；`plan_windows` 删 `is_tail`/规则 4、删 `TAIL_MERGE_MAX_SECS`；松键 `pending_slice.take()` 防重复。
 - 旧护栏 `ts413_rule4_*`→`ts423_*`、testsync386/407/411/413 改写；fmt EXIT0 / check 0 error、warnings 91/87≤基线 / 全量 test 0 failed（bin 1801P/0F/55I）。平台中立，MACOS-HANDOFF 已记。未出包。
 
+### 2026-09-25 · TEST-SYNC-423-427-429 交付（阶段三·非作者护栏 8 条，生产零改动）
+
+- 只加 `src/main.rs::testsync423_427_429_tests`（8 条）：423 末尾窗统一宏（单宏两调用）/ `tail_window_alone` 边界与决策 / `plan_windows` 去 is_tail·规则4 + `take()`；427 `short_context_span` 独立下标 + `context_tail_pending` 锚点；429 `reflow_preview` 三态 + `compose` 短路反证 + hide 源码锚点。
+- 白名单：fmt EXIT 0、check 0 error / warnings 91/87 ≤ 基线、新模块零 warning；未跑 `cargo test`。未出包。
+
 ### 2026-09-25 · TEST-SYNC-426 交付（空/Err 重试的非作者护栏 9 条，生产零改动）
 
 - 只加 `src/transcription/mod.rs::testsync426_tests`（9 条）：首解成功不重解 / 空·Err 重解恰 1 次（Ok 采用、Err·空 invalid 返空）/ `lang_to_sherpa` 四语+未知 / 421 全剔早退序 / Echo·Tag·Collapse 触发重解 + 带语种锚点。

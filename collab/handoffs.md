@@ -54,6 +54,15 @@
 - **碰巧通过报告**：`testsync377::main_has_no_cross_recording_ctx_cache` 命中测试模块**前的注释**（旧扫描器误剔使其未计入）⇒ 按其文档契约补注释过滤（不放宽代码不变量）。
 - **验证**：新增 `guard_prod_lines::tests` 3 条；fmt EXIT0 / check 0 error、warnings 91/87=基线 / 全量 test **0 failed**（bin 1802P/0F/55I）；`testsync421` 由红转绿。未 commit / 未 build / 版本未动 / 零凭证。
 
+## 2026-09-25 — coder-2 — TEST-SYNC-423-427-429 ✅ 交付（阶段三·非作者护栏 8 条；生产零改动）
+
+- **范围**：只在 `src/main.rs` 新增 `#[cfg(test)] mod testsync423_427_429_tests`（8 条）。
+- **423**：`emit_tail_window` 单宏 + `emit_tail_window!(` 恰 2 调用（long_silence/stop）；`tail_window_alone` 首片/越界/`p<base`/无 pending + 决策层 span 优先；`plan_windows` 签名区去 `is_tail`/规则4阈值 + `pending_slice.take()`。
+- **427**：`short_context_span(ge,must_start,buf_base)` 长新片/首片/出缓冲/`must_start==ge`/老情形；`context_tail_pending` span=`(must_start,ge)`。
+- **429**：`reflow_preview` 三态+多字节；**反证** `compose_reflow_preview(gen,"",raw,committed)==raw`（acc 空短路留他人段）；`non_user_hide: true` 恰 1 处在 `if full_drop` 内、常规 `false`、hide 渲染用 `reflow_preview`、经 `Applied` 门。
+- **验证（白名单）**：fmt EXIT 0；check --all-targets 0 error、warnings 91/87 ≤ 基线、新模块零 warning；🔴 未跑 cargo test（阶段三禁止）。
+- 红线：未改生产 / 未 commit / 未 push / 版本未动 / 零凭证。
+
 ## 2026-09-25 — coder-2 — TEST-SYNC-426 ✅ 交付（阶段三·非作者护栏 9 条；生产零改动、不碰 main.rs）
 
 - **范围**：只在 `src/transcription/mod.rs` 新增 `#[cfg(test)] mod testsync426_tests`（9 条，`+158/0`）。
