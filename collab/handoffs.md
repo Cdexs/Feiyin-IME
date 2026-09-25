@@ -121,3 +121,14 @@
 - **验证（白名单）**：`rustfmt --config skip_children=true src/transcription/speaker.rs` CLEAN；`cargo check --all-targets` **EXIT 0**、0 error、warnings **92/87** = 基线；sandbox 复刻 `merge_speech_units` 500 组性质 bad=0 + 边界 + BUILD-409 ✅。🔴 **未跑 `cargo test`**（阶段三禁止，首跑由 tester-1）。
 - **疑似生产缺陷：未发现**；**未改生产代码 / 未 commit / 未 push / 零凭证**。
 - **返修（tester-1 回归红，测试自身错误）**：`ts412b_unit_scope_three_members` 三段 0.8+0.9+0.9=2.6s，两处期望手算成 2.8 ⇒ 红；改为由数据导出 `total=Σ(e-s)/SR` 再比。sandbox 未覆盖之因：复刻只移植 `merge_speech_units`、未移植 `partition_ranges` 秒数累计，且阶段三禁 `cargo test`。复跑：`rustfmt --skip_children` CLEAN；`cargo check --all-targets` 0 error、warnings 92/87=基线。
+
+## 2026-09-25 — tester-1 — TEST-EXEC + BUILD-415（411~415 合包）✅ 回归+构建（🔴 Publish 先行同步，主控裁定保持）
+
+- **性质**：阶段四回归 + 阶段五构建（411+412+413+414+415）。源码 HEAD `8c6f1a9`，版本 0.9.3（未动）。
+- **回归**：root bin **1744P/0F/54I**（基线上轮 1716P/53I）⇒ NEW **31** / GONE **2**（GONE 均为 414 契约有意重命名：`ts393_plan_empty_with_streaming_decodes_whole_window`→`_needs_revad`、`ts393c_whole_window_branch_returns_whole_samples_source_guard`→`ts393c_revad_branch_uses_recheck_source_guard`）；`src-tauri` **92P/0F/0I**；`cargo test --bin feiyin-ime f414 -- --ignored` **1P/0F**；Vitest/Browser SKIP（ui 无 diff）。
+- **消融（过滤跑，全还原）**：413 `short_context_span` 恒 None ⇒ 5 红（`short_context_413_tests` 3 + `testsync413_tests` 2）；414 `Revad` 臂改整窗 ⇒ `ts393c_revad_branch_uses_recheck_source_guard` 1 红，`plan_self_vad_trim` 改整窗 ⇒ `f414_self_vad_empty_yields_empty`/`f414_self_vad_nonempty_trims` 2 红。`git diff -- src/` 为空、`git status` 仅 docs。
+- **构建**：Step1 清进程 0 残留；Step2 npm 1.43s（JS 资产 `index-DGCpO3OF.js` 与上包同名）+ Tauri 1m52s(17w) + cp；Step3 3m08s（main 92w / crash 9w）；Step4 三 exe + 两 toml 同步 Publish。
+- **九项核验**：全项 PASS，唯 ④冒烟「部分」——`-debug` 起、`Responding=True`、无 crash.json，浮层未验（target/release config 热键 vk=165 与脚本 F9 不符）；①时间戳 12:22–12:26 ②两副本 sha 相等且异于 BUILD-410 ③0.9.3 ⑤config `da2be5da…` 不变 ⑥92/9/17 ⑦正探针 `[LocalRT-DBG-414]`=1/`-413`=2/`-411`=1、反探针不可构造（本批无删除字面量）⑧`scene-rules`/`itn-rules` 三副本全等 ⑨VC 五件 sha 与 Redist 源三处全等。
+- **专项**：A CT2 `efa16d81…` 前后未变（未重编）；B 声纹模型 `aa3cfc16…` 源/junction/Publish 三处全等、`target/release/models` 仍 Junction；D 用户数据（config/wordbook/debug.log/version_check.json）未动、无 voiceprint.bin。
+- 🔴 **范围变更**：主控「先别打包」指令到达前已完成 Step4 同步 + 一次冒烟；主控裁定 **A：Publish 保持 BUILD-415 不回滚**，本单结束，等下一包号令。
+- **红线**：未改生产代码（消融全还原）/ 版本号未动 / 未 push / 未 `cargo clean` / 零凭证。证据 `collab/evidence/415/`。
