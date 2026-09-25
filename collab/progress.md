@@ -1,4 +1,10 @@
 
+### 2026-09-25 · TEST-SYNC-421 交付（声纹兜底的非作者护栏 10 条，生产零改动）
+
+- 只加 `src/main.rs::testsync421_tests`（10 条）：本人段窗首/尾/中全留、极短 KeepShort 段不吞、他人全删、全剔空且不兜底、dropped=0 逐位不变、模型空仍兜底、先剥后打、源码锚点。
+- 独立字表/场景（不复用作者 fix421_tests）；期望值经 sandbox 复刻 `kept_streaming_text` 逐条复算一致。
+- 白名单：fmt EXIT 0、check 0 error / warnings 91/87 ≤ 基线；未跑 `cargo test`。未发现生产缺陷。未出包。
+
 ### 2026-09-25 · FIX-VOICEPRINT-FALLBACK-421 · R1 交付（估算路径防吞本人字）
 
 - 估算路径改为把流式字**只铺在语音时间轴**（kept∪dropped 裁剪到本段）并按「**落在 dropped 才删**」，其余一律保留；时间戳路径同改；`VoiceprintFilter`/`AccDropStats` 加 `dropped_ranges`。

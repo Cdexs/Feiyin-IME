@@ -9,6 +9,14 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-2 — TEST-SYNC-421 ✅ 交付（阶段三·非作者护栏 10 条；生产零改动）
+
+- **范围**：只在 `src/main.rs` 新增 `#[cfg(test)] mod testsync421_tests`（`:13364` 起，10 条，`+184/0`）；**未碰生产区**（未碰 `mod.rs`/`speaker.rs`）。
+- **契约 1~6（独立推导）**：① 本人字不被吞：本人段在窗首/窗尾/中间（按语音时长与字数同比例，语音轴精准分离）⇒ 本人串逐字全留 ② 极短 KeepShort 段（1.5s）⇒ 3 字全留且 ≥ 比例下界 ③ 他人段全删 + 全剔 ⇒ 空且 `is_fallback=false`（decoded 非空也空 ⇒ 挡 410 pending）④ dropped=0 逐位不变（含 timestamps 早退）+ 采纳精解 ⑤ 模型空（未剔）⇒ 仍兜底（386-C 不回归）⑥ 先剥后打（`strip_punct_for_repunct` 数字内标点保留/省略号不在列；`punctuate_via_service(false)` 原样）+ 源码锚点（harvest `acc_vs_streaming(`、无 `acc_vs_streaming_after_drop`；`strip_punct_for_repunct(text)` 在）。
+- **独立**：自建字表/场景，不复用作者 `fix421_tests`；期望值经 sandbox 复刻 `kept_streaming_text` 逐条复算（四场景输出逐字=本人串、他人零残留）。
+- **验证（白名单）**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` 0 error、warnings bin **91** / test **87** ≤ 基线、新增模块零 warning；🔴 **未跑 `cargo test`**（阶段三禁止；tester-1 执行）。未发现生产缺陷。
+- 红线：未改生产代码 / 未 commit / 未 push / 版本未动 / 零凭证。
+
 ## 2026-09-25 — coder-1 — FIX-VOICEPRINT-FALLBACK-421 · R1 ✅ 交付（估算路径防吞本人字）
 
 - **起因**：估算路径把流式字均匀铺满整窗（含静音）且「在 kept 才留」⇒ 本人字落静音缝被删（吞字）。
