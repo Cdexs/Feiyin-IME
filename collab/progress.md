@@ -24,11 +24,19 @@
 - 新增 `emit_tail_window!` 宏统一组装末尾窗（有前片 ⇒ 前片后缀 + pending；首片 ⇒ `tail_window_alone` 单独解），长静默 407 与松键收尾共用；`plan_windows` 删 `is_tail`/规则 4、删 `TAIL_MERGE_MAX_SECS`；松键 `pending_slice.take()` 防重复。
 - 旧护栏 `ts413_rule4_*`→`ts423_*`、testsync386/407/411/413 改写；fmt EXIT0 / check 0 error、warnings 91/87≤基线 / 全量 test 0 failed（bin 1801P/0F/55I）。平台中立，MACOS-HANDOFF 已记。未出包。
 
+### 2026-09-25 · TEST-SYNC-431 交付（重叠区保前一窗文字的非作者护栏 7 条，生产零改动）
+
+- 只加 `src/transcription/mod.rs::testsync431_tests`（7 条）：性质 320 组（插入/替换⇒逐字 P+S）、插入首/中/末、删除首/中/近末、替换末字平局偏替换、标点三态、混合/emoji 不 panic、源码锚点（splice 生产区 1 定义+1 调用）。
+- 期望值经 sandbox 逐行复刻算法验算（插入/替换性质 0/320 bad）。
+- 白名单：fmt EXIT 0、check 0 error / warnings 91/87 ≤ 基线、新模块零 warning；未跑 `cargo test`。
+- 🔎 观察（只报告）：删除使重叠短于 k 时可能吃掉后一窗 S 首字（含删除随机 400 组 13 组；定点删除用例不受影响）。未出包。
+
 ### 2026-09-25 · DIAG-SHORT-VOICEPRINT-432 交付（1~2s 短句声纹区分，只读诊断）
 
 - `speaker.rs::diag432_tests`（`#[ignore]` 只读）：参考 `voiceprint.bin`；本人/他人切窗 → CAM++ 余弦。
 - 语音段**完全分离**：本人 min **0.418**（1~2s 桶 0.631~0.741）、他人 max **0.249**；`DROP_THR=0.45` 套 1~2s ⇒ 他人 15/15 删、本人 0/75 误删。
 - 建议（不实施）：`MIN_JUDGE_SECS` 2.0→1.0s、0.45（<1s 仍不判）；🔴 先端测（他人样本单一）。产物 `collab/evidence/432/`。未改生产。
+- **R1（多说话人 AISHELL-1 6 人）**：1.0~1.5s **交叠**（S0003 0.349 vs 0.408）⇒ 不做；**1.5~1.8s 可分**（本人 worst-min 0.542 > 他人 worst-max 0.511）。Pooled FRR/剔 0.40=0.56%/97.1%、0.45=1.11%/99.7%。**推荐 `MIN_JUDGE_SECS=1.5s`+`DROP_THR=0.45`（6/6 误删 0%）**；1.60s 旁语句定位后 score 0.086~0.157 ⇒ 必删。临时语料 497MB 已删。
 
 ### 2026-09-25 · TEST-SYNC-423-427-429 交付（阶段三·非作者护栏 8 条，生产零改动）
 

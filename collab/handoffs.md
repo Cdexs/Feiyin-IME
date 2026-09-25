@@ -66,6 +66,15 @@
 - **碰巧通过报告**：`testsync377::main_has_no_cross_recording_ctx_cache` 命中测试模块**前的注释**（旧扫描器误剔使其未计入）⇒ 按其文档契约补注释过滤（不放宽代码不变量）。
 - **验证**：新增 `guard_prod_lines::tests` 3 条；fmt EXIT0 / check 0 error、warnings 91/87=基线 / 全量 test **0 failed**（bin 1802P/0F/55I）；`testsync421` 由红转绿。未 commit / 未 build / 版本未动 / 零凭证。
 
+## 2026-09-25 — coder-2 — TEST-SYNC-431 ✅ 交付（阶段三·非作者护栏 7 条；生产零改动）
+
+- **范围**：只在 `src/transcription/mod.rs` 新增 `#[cfg(test)] mod testsync431_tests`（7 条，`+177/0`）。
+- **契约**：① 性质 320 组（插入/替换）⇒ 逐字 == P+S；② 插入首/中/末；③ 删除首/中/近末；④ 替换末字平局偏替换（`semiglobal(某一世,某一时)==3`、`splice(某一世,某一时后,3)==某一世后`）；⑤ 标点三态；⑥ 混合/emoji 不 panic；⑦ 源码锚点（生产区 `splice_keep_prev_overlap(` 恰 2 处=1 定义+1 调用）。
+- **独立**：期望值 sandbox 逐行复刻算法验算（插入/替换性质 **0/320 bad**）。
+- 🔎 **观察（只报告）**：删除使重叠短于 `k` 时 `min(len,k+4)` 让 prev 末字按替换对齐进 S 首字并吃掉它（含删除随机 400 组 13 组；定点删除用例不受影响）。
+- **验证（白名单）**：fmt EXIT 0；check --all-targets 0 error、warnings 91/87 ≤ 基线、新模块零 warning；🔴 未跑 cargo test（阶段三禁止）。
+- 红线：未改生产 / 未 commit / 未 push / 版本未动 / 零凭证。
+
 ## 2026-09-25 — coder-2 — DIAG-SHORT-VOICEPRINT-432 ✅ 交付（只读诊断；生产零改动、未碰 mod.rs/main.rs）
 
 - **问题**（Gavin）：1.60s 旁语句（<2s ⇒ `KeepShort` 不判）为何未被剔除。
@@ -74,6 +83,7 @@
 - **建议（不实施）**：`MIN_JUDGE_SECS` 2.0→**1.0s**、`DROP_THR` 0.45（<1s 仍不判）；更保守 1~2s 0.40 + 412 合并；🔴 先端测（他人仅一段、疑单声源）。
 - **残余**：211641 窗#2 的 1.60s 句未精确定位（估算 ~32.7s 为静音；win#2 无 `seg dispatch`）。
 - 产物 `collab/evidence/432/{report.md,raw.log}`。红线：未改生产 / 未碰 mod.rs·main.rs / 未 commit / 版本未动 / 零凭证。
+- **R1（多说话人）**：AISHELL-1 6 人轮流当使用人（360 本人/1800 他人）——1.0~1.5s **交叠**（S0003 0.349 vs 0.408）⇒ 不做；1.5~1.8s 本人 worst-min 0.542 > 他人 worst-max 0.511 ⇒ 可分。Pooled FRR/剔 0.30/0.35/0.40/0.45 = 0%/84.6%、0.28%/92.3%、0.56%/97.1%、1.11%/99.7%。**推荐 `MIN_JUDGE_SECS=1.5s`+`DROP_THR=0.45`**（6/6 误删 0%）。**1.60s 旁语句定位** 211641 ~23.2~27.2s score 0.086~0.157（本人同长 0.72~0.90）⇒ 必删。临时语料 497MB 已删。
 
 ## 2026-09-25 — coder-2 — TEST-SYNC-423-427-429 ✅ 交付（阶段三·非作者护栏 8 条；生产零改动）
 
