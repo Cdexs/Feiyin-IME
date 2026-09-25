@@ -1,4 +1,11 @@
 
+### 2026-09-25 · FIX-REFLOW-RAW-BASE-420 交付（回灌底稿改原始流式文本，只改 main.rs，未出包）
+
+- 根因（BUILD-419 05:18）：`render_authoritative_reflow` 底稿用 `last_streaming_text` 镜像（= 合成文本），而 `committed_len` 是原始流式坐标 ⇒ 截尾错位多挂旧字（镜像131/acc126/committed124 ⇒ 133，多 7 旧字）。
+- 改动：新增 `last_raw_streaming_text`（仅 `StreamingText` 收包时写合成前 `text`，带 gen，写于 043 门闩前）；`render_authoritative_reflow` 底稿改取它并按 gen 过滤（不符/无 ⇒ 预览=acc 全文）；形参经 `process_controller_events`/`try_resolve_reflow` 透传。镜像写入/用途与三个合成函数不动。
+- 坐标审计：`compose_with_acc_for_gen` 生产 2 处传原始 `text` 坐标正确；`last_streaming_text` 生产读取仅 7663（自学习基准，非坐标）；无同类错位。
+- 测试 `fix420_*` 4P；fmt EXIT 0 / check 0 error、warnings 91/87 ≤ 基线 / 全量 test 0 failed（bin 1779P/54I）。🔴 须 Gavin 目视末句预览与上屏一致。未出包。
+
 ### 2026-09-25 · FILLER-LONG-REPEAT-419 交付（后处理节点规则 C：整段重复只留第一份）
 
 - `strip_fillers_conservative` A/B 后加规则 C：紧挨着、一字不差重复的整段只留第一份；忽略标点/空白比较；中/日/韩 ≥6 字、英文 ≥3 词；排除周期性单元与纯数字；差一字不动；迭代到不动点。不区分管线，平台中立（MACOS-HANDOFF 已记）。

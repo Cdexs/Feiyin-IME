@@ -9,6 +9,17 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-2 — FIX-REFLOW-RAW-BASE-420 ✅ 阶段一交付（待主控验收，只改 main.rs）
+
+- **根因**（BUILD-419 05:18）：`render_authoritative_reflow` 用 `last_streaming_text` 镜像当底稿，但镜像存的是**合成后**文本（= acc 前缀 + 流式尾），而 `committed_len` 是**原始流式**坐标 ⇒ 截尾错位多挂旧字（镜像 131 / acc 126 / committed 124 ⇒ preview 133，多挂 7 旧字）。
+- **改动**（只 `src/main.rs`）：新增 `last_raw_streaming_text: Arc<Mutex<Option<(u64,String)>>>`（`:9972`），仅在 `StreamingText` 收到时写**合成前 `text`**（带 gen，`:7184`，在 043 门闩前）；`render_authoritative_reflow`（`:10976`）底稿改取它并按 `generation` 过滤（不符/无 ⇒ 空串 ⇒ 预览 = acc 全文）；形参经 `process_controller_events`（`:6884` + 三调用点）与 `try_resolve_reflow`（`:11039`）透传。
+- **不变**：`last_streaming_text` 镜像写入/用途（053-B/331/在线与批处理）逐位不变；`compose_with_acc_for_gen`/`reflow_preview`/`compose_reflow_preview` 本身未改；StreamingFinalPreview 路径未改。
+- **坐标审计（任务要求）**：`compose_with_acc_for_gen` 生产 2 处（`7194`/`7256`）传入的 `text` 均为**原始流式** ⇒ 坐标正确；`last_streaming_text` 生产读取仅 `7663`（自学习比对基准，非坐标拼接，保持不动）；除已修的 render 点外**未发现同类错位**。
+- **测试**：`fix_reflow_raw_base_420_tests` **4P/0F**（复刻 124/126/131 ⇒ 新 126 / 旧 133；说话中途 = acc + 原始尾逐字；gen 不符 ⇒ acc 全文；源码锚点）。
+- **验证**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` 0 error、warnings bin **91** / test **87** ≤ 基线；全量 `cargo test` **0 failed**（bin 1779P/54I）；numstat==-w（125/2）。
+- 🔴 端测须 Gavin 目视：末句精解回来后预览末尾与最终上屏一致（仅差剥掉的尾标点）。
+- 平台：改动在 `cfg(windows)`，`docs/MACOS-HANDOFF.md` 记「已评估对 macOS 无影响」。红线：未 commit / 未 build release / 版本未动 / 零凭证。
+
 ## 2026-09-25 — coder-1 — FILLER-LONG-REPEAT-419 ✅ 交付（后处理节点规则 C，只改 text_normalizer.rs）
 
 - **范围**：只改 `src/text_normalizer.rs` 的 `strip_fillers_conservative`（A/B 后加规则 C）+ `rule_c_*` 4 个纯函数 + 测试 10 条。未碰 `main.rs`（唯一调用方 `apply_filler_strip` 签名不变）。
