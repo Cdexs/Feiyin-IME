@@ -9,6 +9,14 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-1 — TEST-SYNC-420 ✅ 交付（阶段三·只写测试，生产零改动）
+
+- **范围**：只改 `src/main.rs` `fix_reflow_raw_base_420_tests`（测试区）。白名单仅 `cargo fmt` / `cargo check --all-targets`。
+- **修假绿**：旧锚点 `include_str!("main.rs")` 扫整文件含测试自身 ⇒ 断言串自匹配恒真（tester-1 消融坐实）。重写为**只扫生产代码**：`guard_prod_lines::prod_lines_excluding_cfg_test` + `fn_body()` 花括号配平（跳字符串/注释，防 `[GUARD-SKIP-BRACE-IN-STRING-382]`）截 `render_authoritative_reflow` 函数体 + 去注释；断言 ① 底稿取 `last_raw_streaming_text` 且按 gen 过滤 ② 函数体内 `last_streaming_text` 只能作回写镜像 ③ 否定旧写法；字面量 `concat!` 拆开。
+- **新增** `fix420_streaming_raw_write_order`：gen 门 < `*raw = Some((gen, text.clone()))`（合成前 text） < 合成 < `*mirror = Some(composed.clone())`。
+- **消融推演**（阶段三禁跑 test）：底稿改回 `last_streaming_text` ⇒ ①②③ 全 RED；交 tester-1 下一包实跑。
+- **验证**：`cargo fmt` → `--check` CLEAN；`cargo check --all-targets` 0 error、warnings 91/87=基线；生产零改动。未 commit / 未 build / 版本未动 / 零凭证。
+
 ## 2026-09-25 — coder-2 — FIX-REFLOW-RAW-BASE-420 ✅ 阶段一交付（待主控验收，只改 main.rs）
 
 - **根因**（BUILD-419 05:18）：`render_authoritative_reflow` 用 `last_streaming_text` 镜像当底稿，但镜像存的是**合成后**文本（= acc 前缀 + 流式尾），而 `committed_len` 是**原始流式**坐标 ⇒ 截尾错位多挂旧字（镜像 131 / acc 126 / committed 124 ⇒ preview 133，多挂 7 旧字）。
@@ -200,3 +208,13 @@
 - **九项**：全项 PASS。①时间戳 13:06–13:09 ②两副本 sha 全等且异于 BUILD-415（main `81b48254…` / ui `da13bfc3…` / crash `4d8ecd70…`）③0.9.3 ④冒烟两次 Responding + 无 crash.json + 零残留 ⑤config `da2be5da…` 不变 ⑥91/9/17（main -1 = `overlap_chars` 自 416 起被读，dead-code 警告消失）⑦正探针 `[DBG-418]`=3/`debug-audio`=1/`session-`=2，反探针不可构造（无删除字面量，报三证）⑧两 toml 三副本全等 ⑨VC 五件 sha 与 Redist 源三处全等。
 - **专项**：A CT2 `efa16d81…` 前后未变（未重编）；B 声纹 `aa3cfc16…` 源/junction/Publish 三处全等、junction 保持；D `Publish/` 用户数据（config/wordbook/version_check/debug.log）未动、无 voiceprint.bin；**E 418**：`-debug` 录制 4.24s ⇒ `debug-audio/session-20260925-131102.wav`(135,724B) + `[DBG-418] session dump`，不带 `-debug` 同法录制 session 数不变（仅 debug 落盘）；**F 417**：`[LocalRT-DBG-317] stream tuning: num_threads=4`（8 核，旧包 8）。
 - **红线**：未改生产代码（消融全还原）/ 版本号未动 / 未 push / 未 `cargo clean` / 零凭证。证据 `collab/evidence/419/`。
+
+## 2026-09-25 — tester-1 — TEST-EXEC + BUILD-420 ✅ 回归 + 出包（🔴 消融发现护栏自匹配假绿）
+
+- **性质**：阶段四回归 + 阶段五出包（`FIX-REFLOW-RAW-BASE-420`，`src/main.rs`）。HEAD `2a65d72`（生产改动 `1bc4f20`），版本 0.9.3 未动，基线 Publish=BUILD-419。
+- **回归**：root bin **1779P/0F/54I**（对 BUILD-419 1775P/54I）⇒ NEW **4**（`fix_reflow_raw_base_420_tests::fix420_*`）/ GONE **0**；`src-tauri` **92P/0F/0I**；Vitest/Browser SKIP（ui 无 diff）。
+- **消融（🔴 缺陷）**：按要求把 `render_authoritative_reflow` 底稿改回 `last_streaming_text` ⇒ `fix420_source_anchor_raw_base` **未变红**。根因=自匹配假绿：`src.contains("let streaming = last_raw_streaming_text")` 的串就在断言自身（`main.rs:11164`），`include_str!("main.rs")` 把测试源码读入 ⇒ 恒真；`.filter(|(g, _)| *g == generation)` 同理；另 3 条 `fix420_*` 只测 `compose_reflow_preview` 纯函数、不经调用点。**已报主控，主控确认属实并派 TEST-SYNC-420（非作者）修**（`67060ce`：只扫生产区 + 函数体截取 + `concat!` 拆字面量；经核仅 `#[cfg(test)]`，不影响 release）。消融改动已还原，`git diff -- src/` 空、`git status` 空。
+- **构建**：Step1 清进程 0 残留；Step2 npm 664ms + Tauri 1m47s(17w) + cp；Step3 3m02s（main 91w / crash 9w）；Step4 三 exe + 两 toml 同步 Publish。
+- **九项**：全项 PASS。①14:49–14:52 ②两副本 sha 全等且异于 BUILD-419（main `d43666dc…` / ui `2e400215…` / crash `bb3b94f3…`）③0.9.3 ④冒烟 Responding + 无 crash.json + 零残留 ⑤config `da2be5da…` 不变 ⑥91/9/17=基线 ⑦N-A（420 无新增/删除字面量，按降级条款报三证）⑧两 toml 三副本全等 ⑨VC 五件 sha 与 Redist 源三处全等。
+- **专项**：A CT2 `efa16d81…` 前后未变；B 声纹 `aa3cfc16…` 在包内、junction 保持；D 用户数据未动、无 voiceprint.bin；**冒烟 `-debug`**：环境噪声短录不产生 reflow（`action=pending`/`reflow suppressed`），改用 SAPI TTS 带停顿诱导成功 —— `[LocalRT-DBG-337] reflow applied: seg=1 committed_len=42 acc_len=45 preview_len=45`（末窗差 0；对比 BUILD-419 现场 `124/126/133`）。
+- **红线**：未改生产代码（消融全还原）/ 版本号未动 / 未 push / 未 `cargo clean` / 零凭证。证据 `collab/evidence/420/`。
