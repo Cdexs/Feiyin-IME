@@ -9597,3 +9597,173 @@ mod testsync416_tests {
         );
     }
 }
+
+// =====================================================================
+// DIAG-ACC-EMPTY-425：精解空输出查因（只读诊断，生产零改动）
+//   运行：cargo test --bin feiyin-ime -- --ignored --nocapture diag425
+// =====================================================================
+#[cfg(test)]
+mod diag425_tests {
+    use super::*;
+    use crate::config::ChineseScript;
+    use std::path::PathBuf;
+
+    struct Win {
+        name: &'static str,
+        pcm_pos: usize,
+        in_secs: f32,
+        ranges: &'static [(f32, f32)],
+    }
+
+    fn manifest() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn read_session_wav() -> (Vec<f32>, usize) {
+        let p = manifest().join("collab/evidence/gavin-sessions/session-20260925-173634.wav");
+        let w = sherpa_onnx::Wave::read(p.to_str().unwrap()).expect("read session wav");
+        (w.samples().to_vec(), w.sample_rate() as usize)
+    }
+
+    fn ranges_samples(ranges: &[(f32, f32)]) -> Vec<(usize, usize)> {
+        ranges
+            .iter()
+            .map(|&(s, e)| ((s * 16000.0) as usize, (e * 16000.0) as usize))
+            .collect()
+    }
+
+    /// 复刻送解窗：`[pre 零 padding]` + `wav[pcm_pos .. pcm_pos + (in_secs*16000 - pre)]`
+    ///（dispatch 当刻 pcm 游标 == 段末 ⇒ 尾部 0.2s padding 被 clamp 掉，见 `pad_and_extract_with_spans`）。
+    fn reconstruct(wav: &[f32], w: &Win) -> Vec<f32> {
+        let in_samples = (w.in_secs * 16000.0) as usize;
+        let pre = 3200usize.min(w.pcm_pos);
+        let body = in_samples.saturating_sub(pre);
+        let mut v = vec![0.0f32; pre];
+        let end = (w.pcm_pos + body).min(wav.len());
+        v.extend_from_slice(&wav[w.pcm_pos..end]);
+        v
+    }
+
+    /// 裸解码（**不剥**前缀）：看模型原始输出（空？只前缀？）。
+    fn raw_decode(
+        rec: &sherpa_onnx::OfflineRecognizer,
+        samples: &[f32],
+        lang: Option<&str>,
+    ) -> String {
+        let stream = rec.create_stream();
+        if let Some(l) = lang {
+            stream.set_option("language", l);
+        }
+        stream.accept_waveform(16000, samples);
+        rec.decode(&stream);
+        stream
+            .get_result()
+            .map(|r| r.text.trim().to_string())
+            .unwrap_or_default()
+    }
+
+    /// 生产同款解码（`decode_accuracy_allow_empty` + 390 cap，无注入）。
+    fn prod_decode(rec: &sherpa_onnx::OfflineRecognizer, samples: &[f32]) -> String {
+        let cap = max_new_tokens_for(samples.len() as f32 / 16000.0);
+        decode_accuracy_allow_empty(rec, samples, None, ChineseScript::Simplified, Some(cap))
+            .map(|(t, l)| format!("{t} (lang={l:?})"))
+            .unwrap_or_else(|e| format!("<ERR {e}>"))
+    }
+
+    #[test]
+    #[ignore = "diag425: cargo test --bin feiyin-ime -- --ignored --nocapture diag425"]
+    fn diag425_replay_windows() {
+        let (wav, rate) = read_session_wav();
+        let dir = manifest().join("models").join(QWEN3_MODEL_SUBDIR);
+        eprintln!("[DIAG425] wav samples={} rate={}", wav.len(), rate);
+        let rec = create_qwen3_recognizer_at(&dir).expect("load 1.7B recognizer");
+        // 先跑若干**生产已成功**的窗做对齐校准（expected = 日志 `[406] verdict` 的 acc）。
+        let wins = [
+            Win {
+                name: "#0",
+                pcm_pos: 0,
+                in_secs: 2.51,
+                ranges: &[(0.24, 1.30)],
+            },
+            Win {
+                name: "#1",
+                pcm_pos: 40150,
+                in_secs: 9.43,
+                ranges: &[(0.24, 1.30), (3.84, 6.17), (6.88, 8.22)],
+            },
+            Win {
+                name: "#6",
+                pcm_pos: 781590,
+                in_secs: 9.92,
+                ranges: &[(6.38, 8.71)],
+            },
+            Win {
+                name: "#7",
+                pcm_pos: 937110,
+                in_secs: 5.68,
+                ranges: &[(3.73, 4.47)],
+            },
+            Win {
+                name: "#5",
+                pcm_pos: 638230,
+                in_secs: 9.16,
+                ranges: &[(3.31, 4.46), (4.81, 7.95)],
+            },
+            Win {
+                name: "#10",
+                pcm_pos: 1200790,
+                in_secs: 10.63,
+                ranges: &[(1.46, 3.35), (4.08, 8.24), (9.04, 10.63)],
+            },
+        ];
+        for w in &wins {
+            let window = reconstruct(&wav, w);
+            let rs = ranges_samples(w.ranges);
+            let pad = (0.2f32 * 16000.0) as usize;
+            let trimmed = trim_to_speech(&window, &rs, pad);
+            eprintln!(
+                "[DIAG425] {} window={:.2}s ranges={:?} trimmed={:.2}s",
+                w.name,
+                window.len() as f32 / 16000.0,
+                rs,
+                trimmed.len() as f32 / 16000.0
+            );
+            eprintln!(
+                "[DIAG425] {} a) raw=\"{}\"",
+                w.name,
+                raw_decode(&rec, &trimmed, None)
+            );
+            eprintln!(
+                "[DIAG425] {} a) prod={}",
+                w.name,
+                prod_decode(&rec, &trimmed)
+            );
+            eprintln!(
+                "[DIAG425] {} b) whole raw=\"{}\"",
+                w.name,
+                raw_decode(&rec, &window, None)
+            );
+            eprintln!(
+                "[DIAG425] {} c) lang=Chinese raw=\"{}\"",
+                w.name,
+                raw_decode(&rec, &trimmed, Some("Chinese"))
+            );
+            let trimmed_d = trim_to_speech(&window, &rs, (0.5 * 16000.0) as usize);
+            eprintln!(
+                "[DIAG425] {} d) pad0.5 raw=\"{}\"",
+                w.name,
+                raw_decode(&rec, &trimmed_d, None)
+            );
+            let parts: Vec<String> = rs
+                .iter()
+                .map(|&(s, e)| {
+                    let se = &window[s.min(window.len())..e.min(window.len())];
+                    raw_decode(&rec, se, None)
+                })
+                .collect();
+            eprintln!("[DIAG425] {} e) per-seg={:?}", w.name, parts);
+            let reps: Vec<String> = (0..3).map(|_| raw_decode(&rec, &trimmed, None)).collect();
+            eprintln!("[DIAG425] {} f) x3={:?}", w.name, reps);
+        }
+    }
+}
