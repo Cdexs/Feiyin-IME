@@ -13354,6 +13354,190 @@ mod fix421_tests {
     }
 }
 
+// =====================================================================
+// TEST-SYNC-421（阶段三 · 非作者护栏 · coder-2）：FIX-VOICEPRINT-FALLBACK-421
+//   契约：全剔⇒空不兜底 / 模型空(未剔)⇒兜底 / 只删 dropped（字铺语音轴）/ dropped=0 逐位不变
+//   / 先剥后打 / 源码锚点。独立字表与场景，不复用作者 fix421_tests 夹具。
+//   🔴 白名单：只 rustfmt + cargo check；未跑 cargo test。生产零改动。
+// =====================================================================
+#[cfg(test)]
+mod testsync421_tests {
+    use super::{
+        kept_streaming_text, punctuate_via_service, strip_punct_for_repunct, window_final_text,
+    };
+    use std::path::Path;
+
+    const SR: usize = 16_000;
+    fn s(secs: f32) -> usize {
+        (secs * SR as f32) as usize
+    }
+    fn eff(x: &str) -> usize {
+        x.chars().count()
+    }
+
+    /// 契约 1/2：本人段在**窗首**、他人段在窗尾 ⇒ 本人全留、他人全删。
+    #[test]
+    fn ts421g_user_head_kept_other_dropped() {
+        let user = "本人说话在此"; // 6 字
+        let other = "相识一个可实"; // 6 字（等长 ⇒ 语音轴按 3s:3s 精准分离）
+        let out = kept_streaming_text(
+            &format!("{user}{other}"),
+            s(10.0),
+            0,
+            &[(s(0.5), s(3.5))],
+            &[(s(6.0), s(9.0))],
+            None,
+        );
+        assert_eq!(out, user, "本人段（窗首）必须全留、他人段（窗尾）必须全删");
+    }
+
+    /// 契约 1/2：本人段在**窗尾**、他人段在窗首 ⇒ 本人全留、他人全删。
+    #[test]
+    fn ts421g_user_tail_kept_other_dropped() {
+        let user = "本人说话在此";
+        let other = "相识一个可实";
+        let out = kept_streaming_text(
+            &format!("{other}{user}"),
+            s(10.0),
+            0,
+            &[(s(6.0), s(9.0))],
+            &[(s(0.5), s(3.5))],
+            None,
+        );
+        assert_eq!(out, user, "他人段（窗首）删、本人段（窗尾）留");
+    }
+
+    /// 契约 1/2：本人段在**中间**、两侧他人段 ⇒ 本人全留、两侧他人全删。
+    #[test]
+    fn ts421g_user_middle_kept_both_sides_dropped() {
+        let user = "本人说话在此"; // 6
+        let other_a = "甲乙丙丁"; // 4
+        let other_b = "庚辛壬癸"; // 4
+        let out = kept_streaming_text(
+            &format!("{other_a}{user}{other_b}"),
+            s(10.0),
+            0,
+            &[(s(3.0), s(6.0))],
+            &[(s(0.5), s(2.5)), (s(7.0), s(9.0))],
+            None,
+        );
+        assert_eq!(out, user, "本人（中段）全留、两侧他人全删");
+    }
+
+    /// 契约 1：kept 只有**极短 KeepShort 段**（1.5s < 2s 单元判段门）⇒ 本人的字仍不得被吞。
+    /// 独立下界：本人语音占总语音 1.5/5.5 ⇒ 期望 ≥ floor(N×0.2727)；此处 3 字全留。
+    #[test]
+    fn ts421g_short_kept_unit_keeps_all_user_chars() {
+        let user = "我在这"; // 3 字
+        let other = "相识一二三四五六"; // 8 字
+        let stream = format!("{user}{other}");
+        let out = kept_streaming_text(
+            &stream,
+            s(10.0),
+            0,
+            &[(0, s(1.5))],
+            &[(s(2.0), s(6.0))],
+            None,
+        );
+        assert_eq!(out, user, "极短 KeepShort 段内本人的字不得被吞");
+        let lb = (eff(&stream) as f32 * (1.5f32 / 5.5f32)).floor() as usize;
+        assert!(eff(&out) >= lb, "保留字数须 ≥ 按语音时长比例下界 {lb}");
+    }
+
+    /// 契约 2：**全剔** ⇒ 空且 `is_fallback=false`；即使 decoded 非空也空（不让 410 pending 接手）。
+    #[test]
+    fn ts421g_full_drop_empty_and_no_fallback() {
+        let (fb, t) = window_final_text("", "相识一个可实的地步", true, true);
+        assert!(!fb, "全剔不得兜底");
+        assert_eq!(t, "");
+        let (fb2, t2) = window_final_text("模型竟吐了点字", "他人语音", false, true);
+        assert!(!fb2 && t2.is_empty(), "全剔优先于一切 ⇒ 空且不兜底");
+    }
+
+    /// 契约 3：`dropped=0` ⇒ `kept_streaming_text` 逐位原样（含给了 timestamps 也不删）；
+    /// 406 门槛回到统一 `acc_vs_streaming`（dropped=0 ⇒ 采纳精解，与改前一致）。
+    #[test]
+    fn ts421g_no_drop_is_identity() {
+        let t = "无剔除时逐字不变，含标点。与数字3.14";
+        assert_eq!(
+            kept_streaming_text(t, s(10.0), 0, &[(0, s(5.0))], &[], None),
+            t
+        );
+        let ts: Vec<f32> = (0..eff(t)).map(|i| i as f32).collect();
+        assert_eq!(
+            kept_streaming_text(t, s(10.0), 0, &[], &[], Some(&ts)),
+            t,
+            "dropped 空 ⇒ 早退原样（时间戳也不参与）"
+        );
+        assert_eq!(
+            window_final_text("精解文本", "流式", true, false),
+            (false, "精解文本".to_string())
+        );
+    }
+
+    /// 契约 4：模型自身解码为空（**未剔除**）⇒ 仍按 386-C 用保留部分流式兜底。
+    #[test]
+    fn ts421g_model_empty_still_fallback() {
+        let (fb, t) = window_final_text("", "保留部分流式", true, false);
+        assert!(fb, "模型空（未剔）仍须兜底");
+        assert_eq!(t, "保留部分流式");
+    }
+
+    /// 契约 5：`strip_punct_for_repunct` —— 剥零星标点，保留数字内小数点 / 千分逗号。
+    #[test]
+    fn ts421g_strip_punct_for_repunct_cases() {
+        assert_eq!(strip_punct_for_repunct("你好，世界。"), "你好世界");
+        assert_eq!(strip_punct_for_repunct("第一，3.14，第二"), "第一3.14第二");
+        assert_eq!(
+            strip_punct_for_repunct("1,000元和2,500元"),
+            "1,000元和2,500元"
+        );
+        assert_eq!(strip_punct_for_repunct("a.b"), "ab", "非数字夹持的点剥掉");
+        assert_eq!(
+            strip_punct_for_repunct("等等……"),
+            "等等……",
+            "只剥列举标点（省略号不在列）"
+        );
+        // 长流式里 1 个句号 ⇒ 只剥该 1 个（不再「含任一标点整段跳过」）。
+        let long = format!("{}。", "啊".repeat(29));
+        assert_eq!(eff(&strip_punct_for_repunct(&long)), 29);
+    }
+
+    /// 契约 5：标点服务关闭 ⇒ 原样返回（不触碰服务线程）。
+    #[test]
+    fn ts421g_punctuate_disabled_passthrough() {
+        let raw = "你好，世界。3.14";
+        assert_eq!(
+            punctuate_via_service(Path::new("no-such-model-dir"), false, raw),
+            raw,
+            "enabled=false 必须原样返回（含原标点）"
+        );
+    }
+
+    /// 契约 6：源码锚点（生产区 + `concat!` 拆字面量防自匹配）。
+    #[test]
+    fn ts421g_source_anchors() {
+        let prod: Vec<String> =
+            crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"));
+        let joined = prod.join("\n");
+        assert!(
+            joined.contains("transcription::acc_vs_streaming("),
+            "harvest 406 应用统一 acc_vs_streaming"
+        );
+        let gone = concat!("acc_vs_streaming", "_after_drop");
+        assert!(
+            !joined.contains(gone),
+            "408B scale 补丁应已删（harvest 不再引用）"
+        );
+        assert!(
+            joined.contains("let stripped = strip_punct_for_repunct(text);"),
+            "punctuate_via_service 必须**先剥后打**"
+        );
+        assert!(joined.contains("let (is_fallback, text) = window_final_text("));
+        assert!(joined.contains("kept_streaming_text("));
+    }
+}
+
 /// LOCALRT-TAIL-WINDOW-407：末尾组窗纯决策 + 与已提交文本对齐合并不重不漏。
 #[cfg(test)]
 mod tail_window_407_tests {
