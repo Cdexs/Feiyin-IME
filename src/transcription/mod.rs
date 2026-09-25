@@ -930,9 +930,26 @@ fn decode_accuracy_allow_empty(
     script: ChineseScript,
     max_new_tokens: Option<i32>,
 ) -> Result<(String, Option<String>)> {
+    decode_accuracy_allow_empty_lang(recognizer, samples, system, script, max_new_tokens, None)
+}
+
+/// FIX-ACC-EMPTY-RETRY-426：同 [`decode_accuracy_allow_empty`]，但可 per-stream 指定 `language`
+///（Qwen3 官方支持，见 POC-QWEN3-355/376）。**仅「首解失败后的那一次重解」用**；首解不传 ⇒ 逐位不变。
+fn decode_accuracy_allow_empty_lang(
+    recognizer: &sherpa_onnx::OfflineRecognizer,
+    samples: &[f32],
+    system: Option<&str>,
+    script: ChineseScript,
+    max_new_tokens: Option<i32>,
+    language: Option<&str>,
+) -> Result<(String, Option<String>)> {
     let stream = recognizer.create_stream();
     if let Some(s) = system {
         stream.set_option("hotwords", s);
+    }
+    // FIX-ACC-EMPTY-RETRY-426：重解换条件 —— 指定本窗已判定的语种（L 未知则不设）。
+    if let Some(l) = language {
+        stream.set_option("language", l);
     }
     // TUNE-390：per-stream 生成长度上限（sherpa `offline-recognizer-qwen3-asr-impl.cc:774` 的
     // `GetOptionInt` 按字符串解析）。`None` ⇒ 不设，沿用全局 `max_new_tokens`。
@@ -951,6 +968,19 @@ fn decode_accuracy_allow_empty(
         text_normalizer::normalize_text_for_language(&text, script),
         lang,
     ))
+}
+
+/// FIX-ACC-EMPTY-RETRY-426：本窗语种码（`zh`/`en`/`ja`/`ko`，来自 408B 的 L）→ sherpa `language`
+/// 选项值（Qwen3 官方取值，见 355/376 实测："Chinese"/"English"/"Japanese"/"Korean"）。
+/// 未知/空 ⇒ `None`（重解不设 language、保持现行）。纯函数。
+fn lang_to_sherpa(lang: &str) -> Option<&'static str> {
+    match lang {
+        "zh" => Some("Chinese"),
+        "en" => Some("English"),
+        "ja" => Some("Japanese"),
+        "ko" => Some("Korean"),
+        _ => None,
+    }
 }
 
 /// 无注入的简版单段入口（保留兼容；生产路径已切 `transcribe_accuracy_segment_ctx`）。
@@ -1335,17 +1365,27 @@ pub(crate) fn transcribe_acc_ctx(
     let system = build_ctx_system(inject.terms);
     let inject_on = should_inject_ctx(system.as_deref());
     // 388 主控验收补：首解用 allow_empty ⇒ 空输出也进入 Empty 判据（不带注入重解一次）。
-    let (text, prefix_lang) = decode_accuracy_allow_empty(
+    // FIX-ACC-EMPTY-RETRY-426：首解**报错**（`get_result()` None ⇒ `No transcription result`）也按
+    // 「空输出」进处置 —— 不再 `?` 上抛（旧行为直接跳过整个 387 阶梯、只留 386-C 兜底）。
+    let (text, prefix_lang) = match decode_accuracy_allow_empty(
         recognizer,
         samples,
         system.as_deref().filter(|_| inject_on),
         script,
         Some(token_cap),
-    )?;
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("[DBG-426] decode err as empty: seg={} err={:#}", seg_idx, e);
+            (String::new(), None)
+        }
+    };
     // SPEAKER-VERIFY-408B②③：本窗语种 L = 模型语种前缀优先，无前缀按解码文本字符集粗判。
     let win_lang: Option<String> = prefix_lang
         .clone()
         .or_else(|| lang_from_charset(&text).map(|s| s.to_string()));
+    // FIX-ACC-EMPTY-RETRY-426：重解要指定的 sherpa `language`（L 未知 ⇒ None，保持现行不指定）。
+    let lang_opt = win_lang.as_deref().and_then(lang_to_sherpa);
     // ③ 保护判据：L=ja ｜ L 未知 ｜ **L 档未就绪** ⇒ 用原 ranges 重解（须在 commit 之前查）。
     let lang_ready = win_lang
         .as_deref()
@@ -1374,11 +1414,18 @@ pub(crate) fn transcribe_acc_ctx(
         inject.terms,
         audio_secs,
         inject.avg_chars_per_sec,
-        // TUNE-390：重解同样带 cap；用 `decode_accuracy_allow_empty`（空输出返回 Ok("")，
-        // 与原 `decode_accuracy_once(..).unwrap_or_default()` 语义一致），不改任何 pub 签名。
+        // TUNE-390：重解同样带 cap；FIX-ACC-EMPTY-RETRY-426：重解**换条件**——指定本窗 L 的
+        // sherpa `language`（L 未知则维持不指定）。重解仍空/Err ⇒ 与现有 invalid 同路径（返回空）。
         || {
-            decode_accuracy_allow_empty(recognizer, samples, None, script, Some(token_cap))
-                .map(|(t, _)| t)
+            decode_accuracy_allow_empty_lang(
+                recognizer,
+                samples,
+                None,
+                script,
+                Some(token_cap),
+                lang_opt,
+            )
+            .map(|(t, _)| t)
         },
     );
     if log::log_enabled!(log::Level::Debug) {
@@ -7193,10 +7240,17 @@ mod fix390_tests {
             .nth(1)
             .expect("transcribe_acc_ctx");
         let ctx = ctx.split("FIX-PREFIX-AND-EAT-371").next().unwrap();
+        // FIX-ACC-EMPTY-RETRY-426：首解仍走 `decode_accuracy_allow_empty`；重解改走**带语种**入口
+        // `decode_accuracy_allow_empty_lang`（换条件）。两者都必须带 per-stream token cap（不放松）。
         assert_eq!(
             ctx.matches("decode_accuracy_allow_empty(").count(),
-            2,
-            "首解 + 重解都应走 decode_accuracy_allow_empty"
+            1,
+            "首解走 decode_accuracy_allow_empty"
+        );
+        assert_eq!(
+            ctx.matches("decode_accuracy_allow_empty_lang(").count(),
+            1,
+            "重解走带语种入口 decode_accuracy_allow_empty_lang（426）"
         );
         assert_eq!(
             ctx.matches("Some(token_cap)").count(),
@@ -9765,5 +9819,121 @@ mod diag425_tests {
             let reps: Vec<String> = (0..3).map(|_| raw_decode(&rec, &trimmed, None)).collect();
             eprintln!("[DIAG425] {} f) x3={:?}", w.name, reps);
         }
+    }
+
+    /// FIX-ACC-EMPTY-RETRY-426 验收：425 复现的 #10 剪后音频，**带 `language=Chinese`** 解码应出正确句。
+    /// 运行：`cargo test --bin feiyin-ime -- --ignored --nocapture diag426_lang10`
+    #[test]
+    #[ignore = "diag426: cargo test --bin feiyin-ime -- --ignored --nocapture diag426_lang10"]
+    fn diag426_lang10_redecode_correct() {
+        let (wav, _) = read_session_wav();
+        let dir = manifest().join("models").join(QWEN3_MODEL_SUBDIR);
+        let rec = create_qwen3_recognizer_at(&dir).expect("load 1.7B recognizer");
+        let w = Win {
+            name: "#10",
+            pcm_pos: 1200790,
+            in_secs: 10.63,
+            ranges: &[(1.46, 3.35), (4.08, 8.24), (9.04, 10.63)],
+        };
+        let window = reconstruct(&wav, &w);
+        let trimmed = trim_to_speech(&window, &ranges_samples(w.ranges), (0.2 * 16000.0) as usize);
+        let out = raw_decode(&rec, &trimmed, Some("Chinese"));
+        eprintln!("[DIAG426] #10 lang=Chinese -> \"{out}\"");
+        assert!(
+            out.contains("锻炼") && out.contains("身体"),
+            "带 language=Chinese 重解应出正确句：{out}"
+        );
+    }
+}
+
+// =====================================================================
+// FIX-ACC-EMPTY-RETRY-426：精解报错/空输出纳入重试 + 重试换条件
+// =====================================================================
+#[cfg(test)]
+mod fix426_tests {
+    use super::*;
+
+    /// 语种码 → sherpa `language` 选项值；未知/空 ⇒ None（重解不指定）。
+    #[test]
+    fn fix426_lang_to_sherpa_mapping() {
+        assert_eq!(lang_to_sherpa("zh"), Some("Chinese"));
+        assert_eq!(lang_to_sherpa("en"), Some("English"));
+        assert_eq!(lang_to_sherpa("ja"), Some("Japanese"));
+        assert_eq!(lang_to_sherpa("ko"), Some("Korean"));
+        assert_eq!(lang_to_sherpa(""), None);
+        assert_eq!(lang_to_sherpa("fr"), None);
+        assert_eq!(
+            None::<&str>.and_then(lang_to_sherpa),
+            None,
+            "L 未知 ⇒ 不指定"
+        );
+    }
+
+    /// 空输出 ⇒ 进处置且重解**恰一次**（重解结果被采用）。
+    #[test]
+    fn fix426_empty_triggers_exactly_one_redecode() {
+        let mut calls = 0;
+        let (out, disp) = apply_acc_disposition(String::new(), None, 5.0, None, || {
+            calls += 1;
+            Ok("重试正确文本".to_string())
+        });
+        assert_eq!(calls, 1, "空输出必须重解恰一次");
+        assert_eq!(out, "重试正确文本");
+        assert!(!disp.invalid);
+        assert_eq!(disp.guard, GuardKind::Empty);
+    }
+
+    /// 重解仍 Err（如 `No transcription result`）⇒ 与现有 invalid 同路径（输出空）。
+    #[test]
+    fn fix426_redecode_err_is_invalid_empty() {
+        let mut calls = 0;
+        let (out, disp) = apply_acc_disposition(String::new(), None, 5.0, None, || {
+            calls += 1;
+            Err(anyhow::anyhow!("No transcription result"))
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(out, "");
+        assert!(disp.invalid);
+    }
+
+    /// 首解成功 ⇒ 不重解、参数/行为不变。
+    #[test]
+    fn fix426_first_success_no_redecode() {
+        let mut calls = 0;
+        let (out, disp) =
+            apply_acc_disposition("今天天气不错".to_string(), None, 3.0, None, || {
+                calls += 1;
+                Ok(String::new())
+            });
+        assert_eq!(calls, 0, "首解有内容 ⇒ 不得重解");
+        assert_eq!(out, "今天天气不错");
+        assert!(!disp.invalid);
+        assert_eq!(disp.guard, GuardKind::None);
+    }
+
+    /// 源码锚点：首解 Err 按空输出进处置（带 `[DBG-426]` 埋点）；重解走**带语种**入口并传 `lang_opt`。
+    #[test]
+    fn fix426_source_anchors() {
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("mod.rs"))
+            .join("\n");
+        assert!(
+            prod.contains(concat!("[DBG-426] decode err as empty")),
+            "首解 Err 必须按空输出进处置并埋点"
+        );
+        // 首解仍不带 language（system 注入过滤参数原样不变）。
+        assert!(
+            prod.contains(concat!("system.as_deref().filter(|_| inject_on),")),
+            "首解带注入过滤参数不变"
+        );
+        assert!(
+            prod.contains(concat!("decode_accuracy_allow_empty(")),
+            "首解仍走 decode_accuracy_allow_empty"
+        );
+        assert!(
+            prod.contains(concat!("decode_accuracy_allow_empty_lang(")),
+            "重解须走带语种入口"
+        );
+        assert!(prod.contains("lang_opt"), "重解须传本窗语种 lang_opt");
+        assert!(prod.contains("fn lang_to_sherpa("), "须有语种映射纯函数");
     }
 }
