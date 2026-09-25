@@ -684,6 +684,68 @@ pub(crate) fn find_gap_cut_gap_only(
     find_gap_cut_impl(audio, piece_start, lower, upper, frame).0
 }
 
+/// TAIL-CUT-REAL-PAUSE-434：在 `[lower, upper]`（帧中心样本坐标）内找**真停顿** ——
+/// **连续 ≥ `min_pause_frames`** 个低能量帧（RMS ≤ [`GAP_RMS_RATIO`] × 本片前
+/// [`SLIDING_CUT_SEARCH_START_SECS`](10s) 帧 RMS 中位数，与 [`find_gap_cut_impl`] **同一 RMS 口径**）。
+///
+/// 返回每段真停顿的 `(中点样本, 段内帧数)`，按起点升序。字内**单帧**能量低谷（韵母尾等）不足以成段 ⇒
+/// 不入选（区别于 `find_gap_cut_gap_only` 的单帧判据）。
+///
+/// 🔴 **新增**，不改 `find_gap_cut_impl` / `find_gap_cut_gap_only`（381 滑动切片逐位不变）。
+pub(crate) fn real_pause_cut_candidates(
+    audio: &[f32],
+    lower: usize,
+    upper: usize,
+    frame: usize,
+    min_pause_frames: usize,
+) -> Vec<(usize, usize)> {
+    let total = audio.len();
+    if frame == 0 || min_pause_frames == 0 || total < frame || upper <= lower {
+        return Vec::new();
+    }
+    let nf = total / frame;
+    // 中位数来源：本片前 10s 完整帧（与 `find_gap_cut_impl` 同款）。
+    let median_src_end = total.min((SLIDING_CUT_SEARCH_START_SECS * 16000.0) as usize);
+    let mut rms_vals: Vec<f32> = Vec::new();
+    let mut fs = 0usize;
+    while fs + frame <= median_src_end {
+        rms_vals.push(frame_rms(audio, fs, frame, total));
+        fs += frame;
+    }
+    rms_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = if rms_vals.is_empty() {
+        0.0
+    } else {
+        rms_vals[rms_vals.len() / 2]
+    };
+    let thr = GAP_RMS_RATIO * median;
+    let half = frame / 2;
+    let in_range = |j: usize| {
+        let c = j * frame + half;
+        c >= lower && c <= upper
+    };
+    let low = |j: usize| frame_rms(audio, j * frame, frame, total) <= thr;
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut j = 0usize;
+    while j < nf {
+        if in_range(j) && low(j) {
+            let start_j = j;
+            let mut cnt = 0usize;
+            while j < nf && in_range(j) && low(j) {
+                cnt += 1;
+                j += 1;
+            }
+            if cnt >= min_pause_frames {
+                let mid = (start_j * frame + half + (j - 1) * frame + half) / 2;
+                out.push((mid, cnt));
+            }
+        } else {
+            j += 1;
+        }
+    }
+    out
+}
+
 /// 381/407 共用的字缝搜索内核：返回 `(最早达标字缝帧中心, 区间内最低 RMS 帧中心)`。
 fn find_gap_cut_impl(
     audio: &[f32],

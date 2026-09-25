@@ -137,24 +137,94 @@ fn should_signal_long_silence(enabled: bool, acc_silent_ms: f32, done_for_pause:
     enabled && acc_silent_ms >= LONG_SILENCE_TAIL_MS && !done_for_pause
 }
 
-/// LOCALRT-TAIL-WINDOW-407：在前一片末尾**回溯 ≥2s** 的区间内找「字缝」切点，供末尾组窗
-/// 取「前片后缀」。**复用 381 的字缝判据**（[`vad::find_gap_cut_gap_only`]，同一套判据只保留一处，
-/// 主控要求不在 main 另写一份）。返回 `(片内样本切点, 是否找到真字缝)`：
-/// - `prev` 不足 `back_samples` ⇒ `(0, false)`（整片）；
-/// - 有字缝 ⇒ `(最早达标帧中心, true)`；无 ⇒ `(len-back, false)`（回落回溯 2s，Gavin 口径）。
+/// TAIL-CUT-REAL-PAUSE-434：前一片后缀切点的**三态**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TailCutKind {
+    /// 切在**真停顿**（连续 ≥ [`TAIL_CUT_MIN_PAUSE_MS`] 低能量帧）的中点。
+    RealPause,
+    /// 只有单帧能量低谷（旧 407 判据）⇒ 沿用旧切点（保守，字内低谷也可能命中）。
+    WeakGap,
+    /// 区间内无任何字缝 ⇒ 回落 `len-back` 按时长（旧行为）。
+    NoGap,
+}
+
+/// TAIL-CUT-REAL-PAUSE-434：真停顿最短时长（ms）。Gavin 2026-09-25「切点只切在真正的停顿处」
+/// ⇒ 要求**连续 ≥120ms（6×20ms 帧）**低能量，排除「获取」韵母尾这类字内单帧低谷。
+const TAIL_CUT_MIN_PAUSE_MS: u32 = 120;
+/// TAIL-CUT-REAL-PAUSE-434：首轮区间找不到真停顿时**往前扩大**搜索的倍数（最多回溯 2×back）。
+const TAIL_CUT_EXPAND_FACTOR: usize = 2;
+
+/// LOCALRT-TAIL-WINDOW-407 / TAIL-CUT-REAL-PAUSE-434：在前一片末尾**回溯 ≥2s** 的区间内找切点，
+/// 供末尾组窗取「前片后缀」。返回 `(片内样本切点, 是否找到字缝)`（三态见 [`TailCutKind`]；
+/// `gap_found = kind != NoGap`，**调用方 `take_context_suffix` 签名/语义不变**）。
+///
+/// 434 起优先取**真停顿**（连续 ≥120ms 低能量段的中点）：先在 `[len-back, len-frame/2]` 取**最早**
+/// 真停顿（与旧「最早」口径一致 ⇒ 后缀不短于回溯要求）；无则**往前扩大**到 `len-2×back`（封顶整片）
+/// 取**离 `len-back` 最近**的真停顿（后缀变长但不超整片）；再无 ⇒ 退回旧单帧字缝 [`WeakGap`] /
+/// 按时长 [`NoGap`]。
 pub(crate) fn find_tail_cut(prev: &[f32], back_samples: usize) -> (usize, bool) {
+    let (cut, kind) = find_tail_cut_ex(prev, back_samples);
+    (cut, kind != TailCutKind::NoGap)
+}
+
+/// TAIL-CUT-REAL-PAUSE-434：`find_tail_cut` 的三态版（供单测与日志区分）。
+pub(crate) fn find_tail_cut_ex(prev: &[f32], back_samples: usize) -> (usize, TailCutKind) {
     if prev.len() <= back_samples {
-        return (0, false);
+        return (0, TailCutKind::NoGap); // 整片
     }
-    let lower = prev.len() - back_samples;
     let frame = super::vad::GAP_FRAME_SAMPLES;
+    let lower = prev.len() - back_samples;
     let upper = prev.len().saturating_sub(frame / 2);
     if upper <= lower {
-        return (lower, false);
+        return (lower, TailCutKind::NoGap);
     }
+    let min_frames = ((TAIL_CUT_MIN_PAUSE_MS as usize * 16 + frame - 1) / frame).max(1); // 120ms/20ms=6
+                                                                                         // ① 首轮区间取**最早**真停顿（离 len-back 最近）。
+    let first = super::vad::real_pause_cut_candidates(prev, lower, upper, frame, min_frames);
+    if let Some(&(cut, frames)) = first.first() {
+        log_tail_cut(cut, frame, frames, back_samples, prev.len(), "real_pause");
+        return (cut, TailCutKind::RealPause);
+    }
+    // ② 往前扩大最多 2×back，取**离 len-back 最近**（首轮已确认 [lower,upper] 无 ⇒ 候选均 < lower，
+    //    取最大者）的真停顿。
+    let lower2 = prev
+        .len()
+        .saturating_sub(back_samples.saturating_mul(TAIL_CUT_EXPAND_FACTOR));
+    if lower2 < lower {
+        let wide = super::vad::real_pause_cut_candidates(prev, lower2, upper, frame, min_frames);
+        if let Some(&(cut, frames)) = wide
+            .iter()
+            .filter(|(c, _)| *c < lower)
+            .max_by_key(|(c, _)| *c)
+        {
+            log_tail_cut(cut, frame, frames, back_samples, prev.len(), "real_pause");
+            return (cut, TailCutKind::RealPause);
+        }
+    }
+    // ③ 退回旧行为：单帧字缝 ⇒ WeakGap；无 ⇒ 按时长 NoGap。
     match super::vad::find_gap_cut_gap_only(prev, 0, lower, upper, frame) {
-        Some(cut) => (cut, true),
-        None => (lower, false),
+        Some(cut) => {
+            log_tail_cut(cut, frame, 0, back_samples, prev.len(), "weak_gap");
+            (cut, TailCutKind::WeakGap)
+        }
+        None => {
+            log_tail_cut(lower, frame, 0, back_samples, prev.len(), "no_gap");
+            (lower, TailCutKind::NoGap)
+        }
+    }
+}
+
+/// TAIL-CUT-REAL-PAUSE-434：Debug 守卫日志（`gap_found` 三态）。
+fn log_tail_cut(cut: usize, frame: usize, frames: usize, back: usize, len: usize, kind: &str) {
+    if log::log_enabled!(log::Level::Debug) {
+        let pause_ms = frames * frame * 1000 / 16000;
+        log::debug!(
+            "[DBG-434] tail cut: kind={} cut_secs={:.3} pause_ms={} searched_back_secs={:.3}",
+            kind,
+            cut as f32 / 16000.0,
+            pause_ms,
+            (len - back.min(len)) as f32 / 16000.0
+        );
     }
 }
 
@@ -4491,5 +4561,231 @@ mod testsync405_407_tests {
         assert!(step(2000.0, false, &mut done), "复位后下一段可再发");
         // 未启用 ⇒ 永不发。
         assert!(!should_signal_long_silence(false, 9999.0, false));
+    }
+}
+
+// =====================================================================
+// TAIL-CUT-REAL-PAUSE-434：前片后缀切点只落在真停顿（字内单帧低谷不再算字缝）
+// =====================================================================
+#[cfg(test)]
+mod tail_cut_434_tests {
+    use super::{find_tail_cut, find_tail_cut_ex, TailCutKind};
+
+    const RATE: usize = 16000;
+
+    /// 语音段（440Hz 正弦，幅度 0.5）赋值到 `[a,b)` 秒。
+    fn tone(a: &mut [f32], a_s: f32, b_s: f32) {
+        for i in (a_s * RATE as f32) as usize..(b_s * RATE as f32) as usize {
+            let t = i as f32 / RATE as f32;
+            a[i] = (t * 440.0 * std::f32::consts::TAU).sin() * 0.5;
+        }
+    }
+    fn silence(a: &mut [f32], a_s: f32, b_s: f32) {
+        for i in (a_s * RATE as f32) as usize..(b_s * RATE as f32) as usize {
+            a[i] = 0.0;
+        }
+    }
+
+    /// 字音—40ms 低谷—字音—150ms 静音—字音 ⇒ 选 150ms 真停顿（不是 40ms 字内低谷）。
+    #[test]
+    fn tc434_prefers_real_pause_over_intra_char_dip() {
+        let mut a = vec![0f32; 4 * RATE];
+        tone(&mut a, 0.0, 1.5);
+        silence(&mut a, 1.5, 1.54); // 40ms 字内低谷（2 帧）
+        tone(&mut a, 1.54, 3.0);
+        silence(&mut a, 3.0, 3.15); // 150ms 真停顿
+        tone(&mut a, 3.15, 4.0);
+        let (cut, kind) = find_tail_cut_ex(&a, 2 * RATE);
+        assert_eq!(kind, TailCutKind::RealPause, "应取真停顿");
+        let cs = cut as f32 / RATE as f32;
+        assert!(
+            (3.0..=3.2).contains(&cs),
+            "切点应在 150ms 停顿内，实测 {cs:.3}s"
+        );
+    }
+
+    /// 只有 40ms 字内低谷（无 ≥120ms 停顿）⇒ 退回 WeakGap（旧单帧判据），不改旧切点语义。
+    #[test]
+    fn tc434_intra_char_dip_is_weak_gap() {
+        let mut a = vec![0f32; 4 * RATE];
+        tone(&mut a, 0.0, 3.0);
+        silence(&mut a, 3.0, 3.04); // 40ms 低谷
+        tone(&mut a, 3.04, 4.0);
+        let (_, kind) = find_tail_cut_ex(&a, 2 * RATE);
+        assert_eq!(kind, TailCutKind::WeakGap, "仅字内低谷 ⇒ weak_gap 退回");
+    }
+
+    /// 首轮区间无真停顿、往前扩大后找到 ⇒ RealPause，后缀变长但不超整片。
+    #[test]
+    fn tc434_expands_back_when_no_pause_in_first_range() {
+        let mut a = vec![0f32; 6 * RATE];
+        tone(&mut a, 0.0, 2.5);
+        silence(&mut a, 2.5, 2.65); // 150ms 真停顿（< len-back=4s）
+        tone(&mut a, 2.65, 6.0);
+        let back = 2 * RATE;
+        let lower = a.len() - back;
+        let (cut, kind) = find_tail_cut_ex(&a, back);
+        assert_eq!(kind, TailCutKind::RealPause, "扩大后应找到真停顿");
+        assert!(cut < lower, "切点应在 len-back 之前（后缀变长）");
+        assert!(cut >= 2 * RATE, "最多回溯 2×back（不超整片）");
+        let suffix = a.len() - cut;
+        assert!(suffix > back && suffix <= a.len(), "后缀 >back 且 ≤整片");
+    }
+
+    /// 全程有声（无任何停顿）⇒ NoGap，回落 len-back；不足 back ⇒ (0, NoGap)。
+    #[test]
+    fn tc434_no_pause_falls_back() {
+        let a: Vec<f32> = (0..6 * RATE)
+            .map(|i| (i as f32 * 0.13).sin() * 0.5)
+            .collect();
+        let back = 2 * RATE;
+        assert_eq!(
+            find_tail_cut_ex(&a, back),
+            (a.len() - back, TailCutKind::NoGap)
+        );
+        assert_eq!(find_tail_cut(&a, back), (a.len() - back, false));
+        // 兼容旧口径：不足 back ⇒ 整片、gap_found=false。
+        assert_eq!(find_tail_cut(&vec![0.3f32; RATE], 2 * RATE), (0, false));
+    }
+
+    /// `gap_found` 兼容语义：RealPause / WeakGap 均为 true（旧调用方零改动）。
+    #[test]
+    fn tc434_gap_found_compat() {
+        let mut a = vec![0f32; 4 * RATE];
+        tone(&mut a, 0.0, 3.0);
+        silence(&mut a, 3.0, 3.15);
+        tone(&mut a, 3.15, 4.0);
+        assert_eq!(
+            find_tail_cut(&a, 2 * RATE).1,
+            true,
+            "真停顿 ⇒ gap_found=true"
+        );
+        let mut b = vec![0f32; 4 * RATE];
+        tone(&mut b, 0.0, 3.0);
+        silence(&mut b, 3.0, 3.04);
+        tone(&mut b, 3.04, 4.0);
+        assert_eq!(
+            find_tail_cut(&b, 2 * RATE).1,
+            true,
+            "weak_gap ⇒ gap_found=true（兼容）"
+        );
+    }
+}
+
+// =====================================================================
+// TAIL-CUT-REAL-PAUSE-434 实测：真实录音 旧/新 切点对比（只读诊断）
+//   运行：cargo test --bin feiyin-ime -- --ignored --nocapture diag434_cut
+// =====================================================================
+#[cfg(test)]
+mod diag434_tests {
+    use super::find_tail_cut_ex;
+    use crate::transcription::vad::{find_gap_cut_gap_only, GAP_FRAME_SAMPLES, GAP_RMS_RATIO};
+    use std::path::PathBuf;
+
+    const RATE: usize = 16000;
+
+    fn frame_rms(a: &[f32], s: usize) -> f32 {
+        let e = (s + GAP_FRAME_SAMPLES).min(a.len());
+        if e <= s {
+            return 0.0;
+        }
+        let seg = &a[s..e];
+        (seg.iter().map(|x| x * x).sum::<f32>() / seg.len() as f32).sqrt()
+    }
+
+    /// 切点处连续低能量帧数（±1 帧内按含 cut 的连续段）。
+    fn pause_frames_at(a: &[f32], cut: usize, thr: f32) -> usize {
+        let half = GAP_FRAME_SAMPLES / 2;
+        let j0 = cut.saturating_sub(half) / GAP_FRAME_SAMPLES;
+        let nf = a.len() / GAP_FRAME_SAMPLES;
+        let low = |j: usize| j < nf && frame_rms(a, j * GAP_FRAME_SAMPLES) <= thr;
+        let mut j = j0.min(nf.saturating_sub(1));
+        while j > 0 && low(j - 1) {
+            j -= 1;
+        }
+        let mut cnt = 0usize;
+        while low(j) {
+            cnt += 1;
+            j += 1;
+        }
+        cnt
+    }
+
+    #[test]
+    #[ignore = "diag434: cargo test --bin feiyin-ime -- --ignored --nocapture diag434_cut"]
+    fn diag434_cut_compare() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("collab/evidence/gavin-sessions");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "wav").unwrap_or(false))
+            .collect();
+        files.sort();
+        for f in files {
+            let wav = sherpa_onnx::Wave::read(f.to_str().unwrap())
+                .unwrap()
+                .samples()
+                .to_vec();
+            let dur = wav.len() as f32 / RATE as f32;
+            // 阈值：全片前 10s 帧 RMS 中位数 ×0.3（与生产同口径）。
+            let m_end = wav.len().min(10 * RATE);
+            let mut rms: Vec<f32> = Vec::new();
+            let mut s = 0;
+            while s + GAP_FRAME_SAMPLES <= m_end {
+                rms.push(frame_rms(&wav, s));
+                s += GAP_FRAME_SAMPLES;
+            }
+            rms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let thr = GAP_RMS_RATIO
+                * if rms.is_empty() {
+                    0.0
+                } else {
+                    rms[rms.len() / 2]
+                };
+            let name = f.file_name().unwrap().to_string_lossy().to_string();
+            // 21:16 窗#1 复刻：prev = 窗#0 片(0..10.05s)，back=4s（rate 3.0 → tail_backtrack 4.0s）。
+            if name.contains("211641") {
+                let plen = (10.05 * RATE as f32) as usize;
+                if wav.len() > plen {
+                    let prev = &wav[..plen];
+                    let back = 4 * RATE;
+                    let lo = prev.len() - back;
+                    let hi = prev.len().saturating_sub(GAP_FRAME_SAMPLES / 2);
+                    let old =
+                        find_gap_cut_gap_only(prev, 0, lo, hi, GAP_FRAME_SAMPLES).unwrap_or(lo);
+                    let (nc, nk) = find_tail_cut_ex(prev, back);
+                    eprintln!(
+                        "[DIAG434-CASE] 211641 win#1 prev=0..10.05s back=4s old_cut={:.3}s(old_sil={}ms) new={:?} cut={:.3}s(new_sil={}ms) suffixΔ={:.3}s",
+                        old as f32 / RATE as f32,
+                        pause_frames_at(prev, old, thr) * GAP_FRAME_SAMPLES * 1000 / RATE,
+                        nk,
+                        nc as f32 / RATE as f32,
+                        pause_frames_at(prev, nc, thr) * GAP_FRAME_SAMPLES * 1000 / RATE,
+                        (old as f32 - nc as f32) / RATE as f32
+                    );
+                }
+            }
+            for back_s in [2.0f32, 4.0] {
+                let back = (back_s * RATE as f32) as usize;
+                if wav.len() <= back {
+                    continue;
+                }
+                let lower = wav.len() - back;
+                let upper = wav.len().saturating_sub(GAP_FRAME_SAMPLES / 2);
+                let old = find_gap_cut_gap_only(&wav, 0, lower, upper, GAP_FRAME_SAMPLES)
+                    .unwrap_or(lower);
+                let (new_cut, kind) = find_tail_cut_ex(&wav, back);
+                eprintln!(
+                    "[DIAG434] {name} dur={dur:.1}s back={back_s} old_cut={:.3}s(old_sil={}ms) | new={:?} cut={:.3}s(new_sil={}ms) suffixΔ={:.3}s",
+                    old as f32 / RATE as f32,
+                    pause_frames_at(&wav, old, thr) * GAP_FRAME_SAMPLES * 1000 / RATE,
+                    kind,
+                    new_cut as f32 / RATE as f32,
+                    pause_frames_at(&wav, new_cut, thr) * GAP_FRAME_SAMPLES * 1000 / RATE,
+                    (old as f32 - new_cut as f32) / RATE as f32
+                );
+            }
+        }
     }
 }
