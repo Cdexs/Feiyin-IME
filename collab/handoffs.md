@@ -179,3 +179,13 @@
 - **专项**：A CT2 `efa16d81…` 前后未变（未重编）；B 声纹模型 `aa3cfc16…` 源/junction/Publish 三处全等、`target/release/models` 仍 Junction；D 用户数据（config/wordbook/debug.log/version_check.json）未动、无 voiceprint.bin。
 - 🔴 **范围变更**：主控「先别打包」指令到达前已完成 Step4 同步 + 一次冒烟；主控裁定 **A：Publish 保持 BUILD-415 不回滚**，本单结束，等下一包号令。
 - **红线**：未改生产代码（消融全还原）/ 版本号未动 / 未 push / 未 `cargo clean` / 零凭证。证据 `collab/evidence/415/`。
+
+## 2026-09-25 — tester-1 — TEST-EXEC + BUILD-419（416~419 合包）✅ 回归 + 出包
+
+- **性质**：阶段四回归 + 阶段五出包（416+R1 / 417 / 418 / 419）。源码 HEAD `b29a308`，版本 0.9.3（未动），基线 Publish=BUILD-415。
+- **回归**：root bin **1775P/0F/54I**（对 BUILD-415 1744P/54I）⇒ NEW **32** / GONE **1**（`stream_num_threads_follows_machine_cores_and_caps_at_8`→`_caps_at_4`，417 有意）；`src-tauri` **92P/0F/0I**；Vitest/Browser SKIP（ui 无 diff）。
+- **消融（过滤跑，全还原）**：416a `edit_dist`→`edit_ratio` 排序 ⇒ `ts416g_finding_insertion_mid_loses_one_char` 1 红；416b 有先验长度门 `floor` 改回比例门 ⇒ `repro416` 3 红；419 `collapse_long_repeats` 直返原文 ⇒ `rule_c_*` 5 红（不折护栏仍绿）。`git diff -- src/` 为空、`git status` 空。
+- **构建**：Step1 清进程 0 残留；Step2 npm 668ms（资产 `index-DGCpO3OF.js` 同上包）+ Tauri 1m36s(17w) + cp；Step3 2m53s（main 91w / crash 9w）；Step4 三 exe + 两 toml 同步 Publish。
+- **九项**：全项 PASS。①时间戳 13:06–13:09 ②两副本 sha 全等且异于 BUILD-415（main `81b48254…` / ui `da13bfc3…` / crash `4d8ecd70…`）③0.9.3 ④冒烟两次 Responding + 无 crash.json + 零残留 ⑤config `da2be5da…` 不变 ⑥91/9/17（main -1 = `overlap_chars` 自 416 起被读，dead-code 警告消失）⑦正探针 `[DBG-418]`=3/`debug-audio`=1/`session-`=2，反探针不可构造（无删除字面量，报三证）⑧两 toml 三副本全等 ⑨VC 五件 sha 与 Redist 源三处全等。
+- **专项**：A CT2 `efa16d81…` 前后未变（未重编）；B 声纹 `aa3cfc16…` 源/junction/Publish 三处全等、junction 保持；D `Publish/` 用户数据（config/wordbook/version_check/debug.log）未动、无 voiceprint.bin；**E 418**：`-debug` 录制 4.24s ⇒ `debug-audio/session-20260925-131102.wav`(135,724B) + `[DBG-418] session dump`，不带 `-debug` 同法录制 session 数不变（仅 debug 落盘）；**F 417**：`[LocalRT-DBG-317] stream tuning: num_threads=4`（8 核，旧包 8）。
+- **红线**：未改生产代码（消融全还原）/ 版本号未动 / 未 push / 未 `cargo clean` / 零凭证。证据 `collab/evidence/419/`。
