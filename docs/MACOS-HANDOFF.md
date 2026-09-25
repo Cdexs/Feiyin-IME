@@ -2471,3 +2471,13 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | --- | --- | --- |
 | `src/transcription/mod.rs`：对齐成功后按**预览流式原文** R 裁判 A（前一窗重叠区）/B（后一窗重叠区），更像 R 者胜；新增 `AlignLayer::Forced`（有先验 e≥8、半全局有对应且 `best/e≤0.90`）与 `estimate_overlap`（无先验估重叠）；长度比超 [0.70,1.43] 取较长版；完全对不上才 concat。`src/main.rs` 收割区新增 `win_stream = window_streaming_texts[seq]` 经 `push_window_streaming` 传入 | 重叠接缝由「固定取前一窗」改为**按预览原文取舍**；后片更准时改用后片、消除整段重复；forced 层使原本 concat 的真实重叠也去重 | ✅ 平台中立纯逻辑（无 `cfg`）；`main.rs` 传参走既有 `window_streaming_texts`（流式逐片原始输出）。macOS 若走同一收割路径自动继承 |
 | **macOS 侧需要做什么** | | ① 若 macOS 侧调用 `OrderedReflow`：优先用 `push_window_streaming`（带流式原文）；仅用 `push_window` 时 R 为空 ⇒ 退回 431（安全）。② 无新增文件/开关/env |
+
+## SEAM-PINYIN-ALIGN-435（2026-09-25，coder-1）· 对齐按读音加权 —— macOS 侧影响（含依赖变化）
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| 🔴 **新增依赖** `pinyin = "0.11.0"`（`Cargo.toml`）：MIT、纯 Rust、无 C 依赖、含 `heteronym`（多音字） | 无 → 对齐替换代价按读音：同音 0.2 / 近音 0.6 / 其余 1.0（`char_sub_cost`）；`edit_distance_chars_weighted` 用于 strict/loose、431 接续点、433 B 切点、estimate 估算；插入/删除仍 1.0 | ✅ 平台中立，macOS 直接编译同一依赖（纯 Rust，无需额外系统库/构建步骤）。🔴 需 `cargo fetch` 拉取 crates.io（离线构建缓存需含 `pinyin 0.11.0`） |
+| 433 裁判（A/B 比预览原文 `LCS`）**保持逐字**、dedupe 不动、431 平局偏替换不变；阈值 0.15/0.35/0.90/0.35 未改 | 同上 | ✅ 平台中立 |
+| **macOS 侧需要做什么** | | ① 依赖同步（vendored/镜像或 `cargo fetch`）；② 无 `cfg` 分支、无新开关/env；③ 出包体积预计增加约 1~2 MB（数据表） |
+
+> 注：任务书要求「macOS 同样可编（平台中立）」⇒ ✅；本单未跑 macOS 交叉编译（Windows 端 verification）。

@@ -9,6 +9,21 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-1 — SEAM-PINYIN-ALIGN-435 · R1 ✅ 交付（切点/接续点同一回溯路径，零重复）
+
+- **退回原因**：首轮把 `ts431g` / `fix433_case5` 放宽为「允许 ≤1 字边界重复」，不接受（Gavin「尽量杜绝重复」）。
+- **根因**：loose 层的 k（22:36 为 k=12）与真实对应错位 1 字 —— 真正起点是前一窗「有」（↔后一窗「由」），k=12 切点把「有」留在已定稿区 + B 全文 ⇒ 「有」「由」各一。
+- **修复**：`semiglobal_dp(prev,new,weighted)` 一次回溯返回 `(cont,best,first)`；取 **B** 用**加权**路径上 `new` 下标最小的对角线把「后一窗开头第一个字」对回前一窗位置（22:36 切在「有」之前 ⇒ `前文拥有，`+ B 全文）；取 **A** 回退**字形**接续（加权会把末字对到近音非同字、留下真同字 ⇒ 边界重复，复现 `业一丛丢丘丝`）。
+- **严格期望恢复**：`fix433_case5` 精确 `assert_eq`(全文)；`ts431g` 320 组恢复 `got == P+S`。5 例 R1 最终全文见 result（三列对照；仅首轮第 5 例重复「有」，R1 精确）。
+- fmt EXIT0 / check 0 error、warnings 91/87=基线 / 全量 test 0 failed（bin 1872P/0F/65I）。阈值、裁判逐字、平局偏替换、dedupe 未动。未 commit / 未 build release / 版本未动。
+- ✅ R1 追加（真实 R 重算）：`fix435_real_stream_arbitration` 新增，用 debug.log 真实 stream 重算 5 接缝裁判 —— 前 4 例胜者与朗读原文一致，22:36 如实判 A 而 ref 为 B（预览与 A 同错「步入」，GIGO 上限，未改逻辑凑结果）。全量 test 0 failed（bin 1873P/0F/65I）。
+
+## 2026-09-25 — coder-1 — SEAM-PINYIN-ALIGN-435 ✅ 交付（重叠区按读音加权对齐）
+
+- 新增依赖 **pinyin v0.11.0（MIT，纯 Rust，含多音字）**；`char_sub_cost`（同音 0.2 / 近音 0.6 / 其余 1.0；近音含 n/l、zh/z、an/ang 等归一）+ `edit_distance_chars_weighted`（插删 1.0）；`align_try_k_ratio`/`semiglobal_align`/`estimate_overlap` 改用加权。
+- 🔴 433 裁判（预览原文 `LCS`）**保持逐字**、dedupe 不动、431 平局偏替换不变；阈值（0.15/0.35/0.90/0.35）未改。命中变化：22:36 由 forced → **Loose**（k=12, cont=14）。
+- `fix435_tests` 6/6；同步 431 性质（同音致 ≤1 字边界重复 ⇒ 收紧为不丢字）、433 case5、416/433 反例（改读音不相交）。fmt EXIT0 / check 0 error、warnings 91/87=基线 / 全量 test 0 failed（bin 1871P/0F/65I）。平台中立，MACOS-HANDOFF 已记（依赖变化）。未 commit / 未 build release / 版本未动。
+
 ## 2026-09-25 — coder-1 — SEAM-ARBITER-STREAMING-433 ✅ 交付（预览原文裁判接缝 + forced/估算层）
 
 - 重叠区取舍由「固定取前一窗（431）」升级为**预览模型原始文本裁判**：A=前一窗重叠区 / B=后一窗，与 R（流式原文）比 `LCS/max`，更像者胜；平局/R 空⇒A。胜 B ⇒ 前一窗 cut 前 + 后一窗整窗（改前 416 行为）。

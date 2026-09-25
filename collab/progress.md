@@ -1,4 +1,16 @@
 
+### 2026-09-25 · SEAM-PINYIN-ALIGN-435 · R1 交付（切点/接续点同一回溯路径，恢复零重复）
+
+- 首轮放宽「允许 ≤1 字边界重复」被退回。根因：loose k 与真实对应错位 1 字（22:36 真正起点是前一窗「有」↔后一窗「由」）。修复：`semiglobal_dp` 一次回溯返回 `(cont,best,first)`；取 B 用加权路径求前一窗切点（切在「有」之前），取 A 用字形接续（加权会把末字对到近音字、留下真同字 ⇒ 重复）。
+- `fix433_case5` 恢复精确全文断言；`ts431g` 320 组恢复 `got == P+S`。5 例最终全文见 result（R1 列全精确）。fmt/check 全绿，warnings 91/87=基线，全量 test 0 failed（bin 1872P/0F/65I）。
+- ✅ R1 追加：真实 R 重算 5 接缝（`fix435_real_stream_arbitration`）——前 4 例与朗读原文一致；22:36 判 A 而 ref 为 B（预览同错，GIGO 上限，如实报告）。bin 1873P/0F/65I。
+
+### 2026-09-25 · SEAM-PINYIN-ALIGN-435 交付（重叠区按读音加权对齐，mod.rs + pinyin 依赖）
+
+- 新增依赖 pinyin v0.11.0（MIT，多音字）；`char_sub_cost`（同音 0.2 / 近音 0.6 / 其余 1.0；近音含 n/l、zh/z、ch/c、sh/s、an/ang、en/eng、in/ing 归一）+ 加权编辑距离；`align_try_k_ratio`/`semiglobal_align`/`estimate_overlap` 改用加权，插删仍 1.0。
+- 433 裁判保持逐字、dedupe 不动、431 语义不变；阈值未改。命中变化：22:36 forced → **Loose**（k=12, cont=14）。
+- `fix435_tests` 6/6 + 既有 416/431/433 同步（变化逐条见 result）；fmt EXIT0 / check 0 error、warnings 91/87=基线 / 全量 test 0 failed（bin 1871P/0F/65I）。平台中立，MACOS-HANDOFF 已记。未出包。
+
 ### 2026-09-25 · SEAM-ARBITER-STREAMING-433 交付（预览原文裁判接缝 + forced/估算层，主改 mod.rs）
 
 - 重叠区取舍升级为**预览模型原始文本裁判**（A=前一窗/B=后一窗，比 `LCS/max`，更像 R 者胜；平局/R 空⇒A、维持 431）。新层 `AlignLayer::Forced`（有先验 e≥8、半全局有对应且 `best/e≤0.90`）不再 concat；长度比超 [0.70,1.43] 取**较长版**；无先验也**估重叠**取较长版；完全对不上才 concat+warn `[DBG-433] concat fallback`。
