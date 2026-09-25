@@ -9,6 +9,13 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-1 — LOCALRT-STOP-TAIL-UNIFY-423 ✅ 交付（只改 main.rs 组窗/派发区）
+
+- **范围**：`src/main.rs`：新增 `emit_tail_window!` 宏 + `tail_window_alone`；长静默分支改调宏；松键收尾删 `plan_windows(is_tail=true)` 改调宏；`plan_windows` 删 `is_tail`/规则 4、删 `TAIL_MERGE_MAX_SECS`。测试护栏 `ts413_rule4_*`→`ts423_*`、`testsync386/407/411/413` 改写。
+- **效果**：松键 + pending 一律走「前片末尾后缀（≥2s/≥12 字、字缝切）+ pending」，与 407 长静默一致（不再 <3s 并整片 / ≥3s 单独）；首片 pending ⇒ 单独解；1900ms 已处理 ⇒ `take()` 得 None 不重复。
+- **影响**：410 兜底仍只覆 pending；406 基准仍 `tail_streaming_baseline`；413/416/421 不变。
+- **验证**：fmt EXIT0 / check 0 error、warnings 91/87≤基线 / 全量 test 0 failed（bin 1801P/0F/55I）。平台中立，MACOS-HANDOFF 已记。未 commit / 未 build / 版本未动 / 零凭证。
+
 ## 2026-09-25 — coder-1 — FIX-GUARD-PRODLINES-422 ✅ 交付（测试基建根治，生产零改动）
 
 - **范围**：只改 `src/main.rs` 的 `#[cfg(test)] mod guard_prod_lines` + `fix_reflow_raw_base_420_tests::fn_body` + `testsync377` 一处注释过滤 + `collab/troubleshooting*.md`。

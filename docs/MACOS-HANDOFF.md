@@ -2409,3 +2409,10 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | `main.rs`：新增 `window_final_text`（全剔⇒空不兜底）/ `kept_streaming_text`（基准/兜底只取声纹保留区间流式；时间戳路径 + 样本占比估算）/ `strip_punct_for_repunct`；`punctuate_via_service` 先剥零星标点再整段送。`transcription/mod.rs`：`AccDropStats` 增 `kept_ranges`（窗内坐标），删 408B `acc_vs_streaming_after_drop` scale 放宽 | ① 整窗被声纹全剔（kept≤0 且 dropped>0）⇒ 该窗输出空、**不走流式兜底**（不再把他人语音放回），模型自身空(未剔)仍兜底；② 部分剔除 ⇒ 406 比对基准与兜底文本只取保留区间流式，回到统一 406 门槛（删 scale）；③ 兜底补标点不再「含任一标点就整段跳过」 | ✅ 平台中立纯逻辑（无 `cfg`），macOS 同继承；声纹模型（`speaker.rs`）与 kept 区间接口未改 |
 | R1：`speaker.rs` `VoiceprintFilter` / `AccDropStats` 增 `dropped_ranges`（窗内坐标）；`kept_streaming_text` 改为**把字只铺在语音时间轴（kept∪dropped）上、只删落在 dropped 的字**，其余（kept/无法归属）一律保留 | 修「估算把字均匀铺满整窗（含静音）⇒ 本人字落静音缝被吞」；偏保留、绝不吞字 | ✅ 平台中立纯逻辑（无 `cfg`），macOS 同继承 |
 | **macOS 侧需要做什么** | | 无需改动（平台中立自动继承） |
+
+## LOCALRT-STOP-TAIL-UNIFY-423（2026-09-25，coder-1）· 松键收尾统一走末尾组窗 —— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `main.rs`：新增宏 `emit_tail_window!`（有前片 ⇒ `tail_window_span` + `take_context_suffix` + `dispatch_tail_window!`；首片 ⇒ `tail_window_alone` 单独解），长静默 407 与松键收尾**共用**；`plan_windows` 删 `is_tail`/规则 4、删 `TAIL_MERGE_MAX_SECS` | 松键收尾（原规则 4：pending<3s 并入**前一整片** / ≥3s 单独）→ 与 407 长静默**同一末尾组窗**（前片末尾 ≥2s/≥12 字字缝后缀 + pending）；首片 pending 单独解；1900ms 已处理 ⇒ 松键不重复 | ✅ 平台中立纯逻辑（无 `cfg`），macOS 同继承 |
+| **macOS 侧需要做什么** | | 无需改动（平台中立自动继承） |

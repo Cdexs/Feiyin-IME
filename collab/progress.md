@@ -1,4 +1,9 @@
 
+### 2026-09-25 · LOCALRT-STOP-TAIL-UNIFY-423 交付（松键收尾统一走末尾组窗，只改 main.rs）
+
+- 新增 `emit_tail_window!` 宏统一组装末尾窗（有前片 ⇒ 前片后缀 + pending；首片 ⇒ `tail_window_alone` 单独解），长静默 407 与松键收尾共用；`plan_windows` 删 `is_tail`/规则 4、删 `TAIL_MERGE_MAX_SECS`；松键 `pending_slice.take()` 防重复。
+- 旧护栏 `ts413_rule4_*`→`ts423_*`、testsync386/407/411/413 改写；fmt EXIT0 / check 0 error、warnings 91/87≤基线 / 全量 test 0 failed（bin 1801P/0F/55I）。平台中立，MACOS-HANDOFF 已记。未出包。
+
 ### 2026-09-25 · TEST-SYNC-421 交付（声纹兜底的非作者护栏 10 条，生产零改动）
 
 - 只加 `src/main.rs::testsync421_tests`（10 条）：本人段窗首/尾/中全留、极短 KeepShort 段不吞、他人全删、全剔空且不兜底、dropped=0 逐位不变、模型空仍兜底、先剥后打、源码锚点。
