@@ -2401,6 +2401,8 @@ pub(crate) struct AlignResult {
     pub layer: AlignLayer,
     /// FIX-416：命中 `k` 的编辑率（`edit / k`）。
     pub edit_ratio: f32,
+    /// FIX-416-R1：命中 `k` 的**编辑距离绝对值**（宽松层排序依据；`edit_ratio` 只做入选门槛）。
+    pub edit_dist: usize,
 }
 
 fn edit_distance_chars(a: &[char], b: &[char]) -> usize {
@@ -2474,6 +2476,7 @@ fn align_try_k_ratio(
             ok: true,
             layer: AlignLayer::Strict,
             edit_ratio: ratio,
+            edit_dist: dist,
         })
     } else {
         None
@@ -2497,6 +2500,7 @@ fn align_fail() -> AlignResult {
         ok: false,
         layer: AlignLayer::Concat,
         edit_ratio: 1.0,
+        edit_dist: usize::MAX,
     }
 }
 
@@ -2617,8 +2621,12 @@ pub(crate) fn align_overlap_with_prior(prev: &str, new: &str, prior: AlignPrior)
                 }
             }
             // 🆕 层 2 宽松对齐（FIX-416，仅有区间先验时）：严格失败后，在期望重叠 `e` 的
-            // `[0.5e, 1.5e]` 内逐个 k 算编辑率，取**编辑率最低**者；≤ [`LOOSE_ALIGN_MAX_EDIT_RATIO`] 即采用。
+            // `[0.5e, 1.5e]` 内逐个 k 算编辑距离，取**编辑距离绝对值最小**者（打平取**较小 k**）；
+            // 编辑率 ≤ [`LOOSE_ALIGN_MAX_EDIT_RATIO`] 只作**入选门槛**。
             // 理由：重叠区是同一段音频两次精解，差一两个字 / 标点不同很常见；15% 对 12 字只容忍 1 字差。
+            // 🔴 **不能用编辑率排序**（`edit/k` 的分母偏置）：同样的距离下 `k` 越大比率越低 ⇒ 系统性
+            // 偏向切多 ⇒ 丢字（R1 起因：中段插入 1 字时 k=13 的 2/13 < k=12 的 2/12）。
+            // 按绝对距离、打平取小 k ⇒ 切点靠后 ⇒ 最坏重复，绝不丢字（Gavin 底线）。
             let loose_lo = (((e_raw as f32) * 0.5).ceil() as usize).max(floor).max(1);
             let loose_hi =
                 (((e_raw as f32) * LOOSE_ALIGN_RANGE_FACTOR).floor() as usize).min(hi_all);
@@ -2627,9 +2635,10 @@ pub(crate) fn align_overlap_with_prior(prev: &str, new: &str, prior: AlignPrior)
                 if let Some(r) =
                     align_try_k_ratio(prev, &prev_keep, &new_keep, k, LOOSE_ALIGN_MAX_EDIT_RATIO)
                 {
+                    // 升序遍历 ⇒ 只在**严格更小**的编辑距离上替换 ⇒ 打平自然保留较小 k。
                     let better = match &best {
                         None => true,
-                        Some(b) => r.edit_ratio < b.edit_ratio,
+                        Some(b) => r.edit_dist < b.edit_dist,
                     };
                     if better {
                         best = Some(r);
@@ -9519,16 +9528,10 @@ mod testsync416_tests {
         }
     }
 
-    /// 🔴 FINDING（非作者护栏发现，2026-09-25）→ 主控裁决「必须修，派 coder-1」：
-    /// 重叠区**中段**插入一个额外字时，宽松层取 `k=13`（其编辑率 2/13 < `k=12` 的 2/12，
-    /// 因宽松层取「最低编辑率」）⇒ `committed_prefix = prev[..47]` ⇒ **丢掉 S1 第 48 字的独有字**。
-    /// 即「新窗在重叠中段多 1 字」这一形态仍会丢 1 字（与 T2 其余形态的「绝不丢字」不符）。
-    ///
-    /// 🔧 **416-R1 修复后去掉 ignore**（由 coder-1 在 R1 执行）：R1 规则 = 宽松层改为按
-    /// 「**编辑距离绝对值最小**、打平取**较小 k**」选（偏重复不偏丢字）。修复前本断言为 RED，
-    /// 故以 `#[ignore]` 挂起，避免污染常规回归；R1 落地后删除 `/ ` 与 `#[ignore]` 属性即转正。
+    /// FINDING（非作者护栏发现，2026-09-25）→ 416-R1 已修（coder-1）：重叠区**中段**插入一个
+    /// 额外字时，宽松层原按「最低编辑率」取 `k=13`（2/13 < k=12 的 2/12，分母偏置）⇒ 丢 S1 独有字。
+    /// R1 改为按「**编辑距离绝对值最小**、打平取**较小 k**」选 ⇒ 本用例转正（不再丢字）。
     #[test]
-    #[ignore = "FINDING：重叠中段插入 1 字当前会丢 1 字；416-R1 修复后去掉 ignore（coder-1）"]
     fn ts416g_finding_insertion_mid_loses_one_char() {
         let v = s1();
         let base: String = v.iter().collect();

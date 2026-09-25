@@ -270,10 +270,11 @@ pub fn is_effective_text(text: &str) -> bool {
 /// - 全程不做「看起来像」的猜测；只在两条规则明确命中时改动。
 pub fn strip_fillers_conservative(text: &str) -> String {
     let a = strip_leading_fillers(text);
-    // 规则 B 可能折叠出新的可折叠串（4 连叠 → 2 连叠）⇒ 迭代到不动点，保证幂等。
-    let mut cur = collapse_adjacent_repeats(&a);
+    // 规则 B 可能折叠出新的可折叠串（4 连叠 → 2 连叠）；规则 C 折掉一份后可能又暴露新的相邻重复
+    // ⇒ 两条规则一起迭代到不动点，保证幂等。
+    let mut cur = collapse_long_repeats(&collapse_adjacent_repeats(&a));
     loop {
-        let next = collapse_adjacent_repeats(&cur);
+        let next = collapse_long_repeats(&collapse_adjacent_repeats(&cur));
         if next == cur {
             break;
         }
@@ -598,6 +599,131 @@ fn collapse_adjacent_repeats(text: &str) -> String {
         } else {
             out.push(c);
             i += 1;
+        }
+    }
+    out
+}
+
+/// 规则 C：整段重复折叠时，两份之间允许的分隔（全部标点 + 空白）。
+fn is_long_repeat_sep(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '，' | '。' | '、' | '！' | '？' | '；' | '：' | ',' | '.' | '!' | '?' | ';' | ':'
+        )
+}
+
+/// 规则 C：把文本切成「内容单元」——ASCII 字母数字连续段算 1 个词；CJK / 韩文每字算 1 个单元；
+/// 规则 C 分隔丢弃；其余字符（引号 / 括号 / 其他符号）各自算 1 个内容单元（保证「括号内重复」
+/// 不因括号被当分隔而误折）。返回 `(unit 文本, 结束字符下标[开])`。
+fn rule_c_units(chars: &[char]) -> Vec<(String, usize)> {
+    let n = chars.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        if c.is_ascii_alphanumeric() {
+            let mut e = i;
+            while e < n && chars[e].is_ascii_alphanumeric() {
+                e += 1;
+            }
+            out.push((chars[i..e].iter().collect(), e));
+            i = e;
+        } else if is_cjk_char(c) || is_hangul_char(c) {
+            out.push((c.to_string(), i + 1));
+            i += 1;
+        } else if is_long_repeat_sep(c) {
+            i += 1;
+        } else {
+            out.push((c.to_string(), i + 1));
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 规则 C：单元序列是否为**更短单元的重复**（「哈哈哈哈…」=「哈」×n）⇒ 是则不折。
+fn rule_c_units_periodic(units: &[String]) -> bool {
+    let l = units.len();
+    l > 0 && (1..l).any(|p| l % p == 0 && (0..l).all(|i| units[i] == units[i % p]))
+}
+
+/// 规则 C：单元序列是否含**字母 / CJK / 韩文**（纯数字或数字+符号 ⇒ 否 ⇒ 不折：电话、编号）。
+fn rule_c_has_letters(units: &[String]) -> bool {
+    units.iter().any(|t| {
+        t.chars()
+            .any(|c| c.is_alphabetic() || is_cjk_char(c) || is_hangul_char(c))
+    })
+}
+
+/// 规则 C：整段是否可折（长度门 + 排除项）。
+///
+/// - 中 / 日 / 韩内容 ≥6 个字；英文等空白分词 ≥3 个词；
+/// - 排除：纯数字 / 数字+符号；单元本身是更短单元的重复。
+fn rule_c_segment_foldable(units: &[String]) -> bool {
+    if units.is_empty() || !rule_c_has_letters(units) || rule_c_units_periodic(units) {
+        return false;
+    }
+    let cjk_units = units
+        .iter()
+        .filter(|t| t.chars().any(|c| is_cjk_char(c) || is_hangul_char(c)))
+        .count();
+    if cjk_units > 0 {
+        units.iter().map(|t| t.chars().count()).sum::<usize>() >= 6
+    } else {
+        units.len() >= 3
+    }
+}
+
+/// 规则 C：折叠**紧挨着、一字不差重复的整段**，只保留第一份。
+///
+/// 比较忽略规则 C 分隔（标点 / 空白），两份之间只允许这些分隔；只折**完全相同**（差一字不动）。
+/// 例：`我们明天去公园，我们明天去公园。` → `我们明天去公园。`；
+/// `I think we should I think we should go` → `I think we should go`。
+/// 单次调用也会把三连及以上一次折到位；迭代到不动点由 [`strip_fillers_conservative`] 负责。
+fn collapse_long_repeats(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let units = rule_c_units(&chars);
+    let m = units.len();
+    if m < 2 {
+        return text.to_string();
+    }
+    let texts: Vec<String> = units.iter().map(|(t, _)| t.clone()).collect();
+    let ends: Vec<usize> = units.iter().map(|(_, e)| *e).collect();
+    let mut deleted = vec![false; n];
+    let mut t = 0usize;
+    while t < m {
+        let max_l = (m - t) / 2;
+        // 取**最长**的相邻相同单元段（「整段」）；不可折（长度门/排除）则本位置跳过。
+        let mut chosen = 0usize;
+        for l in (1..=max_l).rev() {
+            if texts[t..t + l] == texts[t + l..t + 2 * l] {
+                chosen = l;
+                break;
+            }
+        }
+        if chosen == 0 || !rule_c_segment_foldable(&texts[t..t + chosen]) {
+            t += 1;
+            continue;
+        }
+        // 合并连续多份（三连重复一次折到位）。
+        let mut cnt = 1usize;
+        while t + (cnt + 1) * chosen <= m
+            && texts[t + cnt * chosen..t + (cnt + 1) * chosen] == texts[t..t + chosen]
+        {
+            cnt += 1;
+        }
+        // 删掉第 2..cnt 份 + 第 2 份前的分隔（[第一份末单元结束, 末份末单元结束)）。
+        for d in ends[t + chosen - 1]..ends[t + cnt * chosen - 1] {
+            deleted[d] = true;
+        }
+        t += cnt * chosen;
+    }
+    let mut out = String::with_capacity(text.len());
+    for (idx, &c) in chars.iter().enumerate() {
+        if !deleted[idx] {
+            out.push(c);
         }
     }
     out
@@ -1445,6 +1571,96 @@ mod tests {
                 "幂等失败（输入 {c:?}）：once={once:?} twice={twice:?}"
             );
         }
+    }
+
+    // ============================================================
+    // FILLER-LONG-REPEAT-419：规则 C —— 紧挨着一字不差重复的整段只留第一份
+    // ============================================================
+
+    #[test]
+    fn rule_c_chinese_exact_whole_segment_folds() {
+        assert_eq!(
+            strip_fillers_conservative("我们明天去公园，我们明天去公园。"),
+            "我们明天去公园。"
+        );
+        assert_eq!(
+            strip_fillers_conservative("我们明天去公园我们明天去公园。"),
+            "我们明天去公园。"
+        );
+    }
+
+    #[test]
+    fn rule_c_triple_repeat_keeps_one() {
+        assert_eq!(
+            strip_fillers_conservative("我们明天去公园，我们明天去公园，我们明天去公园。"),
+            "我们明天去公园。"
+        );
+    }
+
+    #[test]
+    fn rule_c_english_exact_folds() {
+        assert_eq!(
+            strip_fillers_conservative("I think we should I think we should go"),
+            "I think we should go"
+        );
+        assert_eq!(
+            strip_fillers_conservative("we should go, we should go!"),
+            "we should go!"
+        );
+    }
+
+    #[test]
+    fn rule_c_japanese_exact_folds() {
+        assert_eq!(
+            strip_fillers_conservative("あしたはあめです。あしたはあめです。"),
+            "あしたはあめです。"
+        );
+    }
+
+    #[test]
+    fn rule_c_korean_exact_folds() {
+        assert_eq!(
+            strip_fillers_conservative("우리 내일 공원에 가요 우리 내일 공원에 가요"),
+            "우리 내일 공원에 가요"
+        );
+    }
+
+    #[test]
+    fn rule_c_keeps_shorter_unit_repetition() {
+        // 单元本身是更短单元的重复 ⇒ 不折（归 B 或本就正常表达）。
+        for s in ["哈哈哈哈哈哈", "对对对对对对", "666666", "哈哈哈哈哈"] {
+            assert_eq!(strip_fillers_conservative(s), s, "不应折：{s}");
+        }
+    }
+
+    #[test]
+    fn rule_c_keeps_numbers() {
+        for s in ["138138", "138 138 138 138 138 138", "编号 1234 1234 1234"] {
+            assert_eq!(strip_fillers_conservative(s), s, "数字/编号不应折：{s}");
+        }
+    }
+
+    #[test]
+    fn rule_c_keeps_near_miss_one_char_diff() {
+        // 差一个字就不动（近似重复交给接缝层，不在这里猜）。
+        assert_eq!(
+            strip_fillers_conservative("我们明天去公园，我们明天去别的。"),
+            "我们明天去公园，我们明天去别的。"
+        );
+    }
+
+    #[test]
+    fn rule_c_keeps_abab_reduplication() {
+        assert_eq!(strip_fillers_conservative("研究研究"), "研究研究");
+        assert_eq!(strip_fillers_conservative("看看"), "看看");
+        assert_eq!(strip_fillers_conservative("讨论讨论这个"), "讨论讨论这个");
+    }
+
+    #[test]
+    fn rule_c_idempotent() {
+        let t = "我们明天去公园，我们明天去公园，我们明天去公园。";
+        let once = strip_fillers_conservative(t);
+        assert_eq!(strip_fillers_conservative(&once), once);
     }
 }
 
