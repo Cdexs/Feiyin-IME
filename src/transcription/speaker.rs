@@ -514,6 +514,8 @@ pub(crate) struct PendingOffer {
 /// 408B 声纹过滤结果（解码前判定；供调用方 trim / 日志 / 406 放宽 / 注册）。
 pub(crate) struct VoiceprintFilter {
     pub kept: Vec<(usize, usize)>,
+    /// FIX-421-R1：被剔除区间（窗内坐标）。`kept ∪ dropped` = 全部语音区间（供兜底按语音轴映射）。
+    pub dropped: Vec<(usize, usize)>,
     pub kept_secs: f32,
     pub dropped_secs: f32,
     /// 是否有任一已就绪档（无 ⇒ 全部保留）。
@@ -636,6 +638,7 @@ pub(crate) fn filter_ranges_by_voiceprint(
     if ranges.is_empty() {
         return VoiceprintFilter {
             kept: Vec::new(),
+            dropped: Vec::new(),
             kept_secs: 0.0,
             dropped_secs: 0.0,
             any_ready: false,
@@ -653,6 +656,7 @@ pub(crate) fn filter_ranges_by_voiceprint(
         let Some(verifier) = slot.as_ref().and_then(|o| o.as_ref()) else {
             return VoiceprintFilter {
                 kept: ranges.to_vec(),
+                dropped: Vec::new(),
                 kept_secs: secs_of(ranges),
                 dropped_secs: 0.0,
                 any_ready: false,
@@ -736,8 +740,16 @@ pub(crate) fn filter_ranges_by_voiceprint(
                 score: verdict_score(range_verdicts[i]),
             });
         }
+        // FIX-421-R1：剔除区间（供兜底按「语音轴」映射、只删 dropped）。
+        let mut dropped_ranges: Vec<(usize, usize)> = Vec::new();
+        for (i, &(s, e)) in ranges.iter().enumerate() {
+            if matches!(range_verdicts[i], SegVerdict::DropNonUser(_)) {
+                dropped_ranges.push((s, e));
+            }
+        }
         VoiceprintFilter {
             kept,
+            dropped: dropped_ranges,
             kept_secs,
             dropped_secs,
             any_ready: proc.vp.has_any_ready(),

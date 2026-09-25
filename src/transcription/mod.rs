@@ -525,42 +525,6 @@ pub(crate) fn acc_vs_streaming(acc: &str, streaming: &str) -> MismatchVerdict {
     }
 }
 
-/// SPEAKER-VERIFY-408B：声纹剔除后**放宽**的 406 判据。
-///
-/// 本窗剔除了 `dropped` 秒语音 ⇒ 精解相对流式的期望按保留比例 `scale = kept/(kept+dropped)` 放宽
-///（`retention` / `len_ratio` 门槛各乘 `scale`，**不低于 0.2**）。`dropped <= 0` ⇒ 与
-/// [`acc_vs_streaming`] **逐位一致**。
-pub(crate) fn acc_vs_streaming_after_drop(
-    acc: &str,
-    streaming: &str,
-    dropped: f32,
-    kept: f32,
-) -> MismatchVerdict {
-    if !(dropped > 0.0) {
-        return acc_vs_streaming(acc, streaming);
-    }
-    let scale = (kept / (kept + dropped).max(1e-6)).clamp(0.2, 1.0);
-    let acc_n = normalize_for_mismatch(acc);
-    let str_n = normalize_for_mismatch(streaming);
-    if str_n.len() < MISMATCH_MIN_STREAM_CHARS {
-        return MismatchVerdict {
-            retention: 1.0,
-            len_ratio: 1.0,
-            accept: true,
-        };
-    }
-    let lcs = lcs_subseq_len(&acc_n, &str_n);
-    let retention = lcs as f32 / str_n.len() as f32;
-    let len_ratio = acc_n.len() as f32 / str_n.len() as f32;
-    let accept =
-        retention >= MISMATCH_MIN_RETENTION * scale && len_ratio >= MISMATCH_MIN_LEN_RATIO * scale;
-    MismatchVerdict {
-        retention,
-        len_ratio,
-        accept,
-    }
-}
-
 /// FIX-ACC-OUTPUT-GUARD-387：处置阶梯的**触发类别**（供埋点 `kind=`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GuardKind {
@@ -1078,13 +1042,20 @@ fn plan_timeline_trim(
     })
 }
 
-/// SPEAKER-VERIFY-408B：本窗声纹剔除统计（供 406 守卫按保留比例放宽）。
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// SPEAKER-VERIFY-408B：本窗声纹剔除统计。
+///
+/// FIX-VOICEPRINT-FALLBACK-421：新增 [`AccDropStats::kept_ranges`]（窗内坐标）—— 收割侧据此把
+/// 406 比对基准 / 流式兜底**收窄到保留部分**，不再用含他人语音的整窗流式。
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AccDropStats {
     /// 被声纹剔除的语音秒数。
     pub dropped_speech_secs: f32,
     /// 保留（送入解码）的语音秒数。
     pub kept_speech_secs: f32,
+    /// 保留语音区间（**窗内坐标**，样本下标半开区间）。无剔除 ⇒ 空（调用方按「全保留」处理）。
+    pub kept_ranges: Vec<(usize, usize)>,
+    /// FIX-421-R1：被剔除区间（**窗内坐标**）。`kept_ranges ∪ dropped_ranges` = 全部语音区间。
+    pub dropped_ranges: Vec<(usize, usize)>,
 }
 
 /// SPEAKER-VERIFY-408B：按**字符集**粗判文本语种（无模型前缀时的兜底）：
@@ -1303,6 +1274,8 @@ pub(crate) fn transcribe_acc_ctx(
         .map(|f| AccDropStats {
             dropped_speech_secs: f.dropped_secs,
             kept_speech_secs: f.kept_secs,
+            kept_ranges: f.kept.clone(),
+            dropped_ranges: f.dropped.clone(),
         })
         .unwrap_or_default();
     let had_drop = drop_stats.dropped_speech_secs > 0.0;
@@ -8655,27 +8628,6 @@ mod fix408b_tests {
         assert_eq!(l2, Some("ja".to_string()));
     }
 
-    /// 406 放宽：`dropped=0` ⇒ 与 [`acc_vs_streaming`] 逐位一致；`dropped>0` ⇒ 门槛按比例放宽。
-    #[test]
-    fn ts408b_406_relax_scales() {
-        let acc = "天气如何会不会";
-        let stream = "最近的天气如何会不会下雨";
-        let plain = acc_vs_streaming(acc, stream);
-        let zero = acc_vs_streaming_after_drop(acc, stream, 0.0, 10.0);
-        assert_eq!(plain.retention, zero.retention);
-        assert_eq!(plain.len_ratio, zero.len_ratio);
-        assert_eq!(plain.accept, zero.accept);
-        assert!(!plain.accept, "该样本 plain 应 reject");
-        let scaled = acc_vs_streaming_after_drop(acc, stream, 6.0, 2.0); // scale=0.25
-        assert!(
-            scaled.accept,
-            "放宽后应 accept（ret={:.2} len={:.2}）",
-            scaled.retention, scaled.len_ratio
-        );
-        // 全剔（kept=0）⇒ scale 下限 0.2（不得更松）；仍按放宽判。
-        assert!(acc_vs_streaming_after_drop(acc, stream, 10.0, 0.0).accept);
-    }
-
     /// 源码护栏：`transcribe_acc_ctx` 内调用声纹过滤 + 注册落地 + L 档就绪查询。
     #[test]
     fn ts408b_transcribe_calls_speaker() {
@@ -8750,9 +8702,9 @@ mod fix408b_tests {
 #[cfg(test)]
 mod testsync406_408b_tests {
     use super::{
-        acc_vs_streaming, acc_vs_streaming_after_drop, lang_from_charset, qwen3_prefix_lang,
-        strip_angle_tags, strip_qwen3_language_prefix_lang, MISMATCH_MIN_LEN_RATIO,
-        MISMATCH_MIN_RETENTION, MISMATCH_MIN_STREAM_CHARS,
+        acc_vs_streaming, lang_from_charset, qwen3_prefix_lang, strip_angle_tags,
+        strip_qwen3_language_prefix_lang, MISMATCH_MIN_LEN_RATIO, MISMATCH_MIN_RETENTION,
+        MISMATCH_MIN_STREAM_CHARS,
     };
 
     /// 契约 1：常量与「<6 字不判」的短样本门。
@@ -8821,40 +8773,6 @@ mod testsync406_408b_tests {
             v.len_ratio >= MISMATCH_MIN_LEN_RATIO && v.len_ratio < 0.8,
             "长度比应落在 0.6~0.8"
         );
-    }
-
-    /// 契约 4：`dropped<=0` ⇒ 与 406 原判**逐位一致**；`dropped>0` 门槛按比例放宽且**不低于 0.2**。
-    #[test]
-    fn ts406_after_drop_identity_and_scaling() {
-        let pairs = [
-            (
-                "看看最近有什么好看的电影",
-                "看看最近有什么好看的电影然后有什么好看的精彩的电影大片上",
-            ),
-            ("ABCDEF", "ABCDEFGHIJ"),
-            ("我今天很开心", "嗯我今天真的很开心"),
-            ("abc", "abcdefgh"),
-        ];
-        for (acc, s) in pairs {
-            let plain = acc_vs_streaming(acc, s);
-            for dropped in [0.0f32, -1.0, -0.001] {
-                let z = acc_vs_streaming_after_drop(acc, s, dropped, 5.0);
-                assert_eq!(
-                    (plain.retention, plain.len_ratio, plain.accept),
-                    (z.retention, z.len_ratio, z.accept),
-                    "dropped={dropped} 应与 406 逐位一致：acc={acc:?}"
-                );
-            }
-        }
-        // 放宽：base reject（ret 0.4 / len 0.5），dropped=6 kept=4 ⇒ scale=0.4 ⇒ 门槛 0.2/0.24 ⇒ accept。
-        let base = acc_vs_streaming("ABCDX", "ABCDEFGHIJ");
-        assert!(!base.accept, "base 应 reject");
-        let relax = acc_vs_streaming_after_drop("ABCDX", "ABCDEFGHIJ", 6.0, 4.0);
-        assert!(relax.accept, "dropped>0 按比例放宽后应 accept");
-        // 下限 0.2：kept=1/dropped=99 ⇒ 原始 scale=0.01 会被夹到 0.2 ⇒ 门槛 0.1/0.12。
-        // acc="A" vs 20 字流式：ret=0.05、len=0.05（<0.1）⇒ reject（若下限更低则会误放行）。
-        let floored = acc_vs_streaming_after_drop("A", "ABCDEFGHIJKLMNOPQRST", 99.0, 1.0);
-        assert!(!floored.accept, "放宽不得越过 0.2 下限");
     }
 
     /// 契约 5：未闭合标签剥除 + 不该剥的负例。

@@ -8769,7 +8769,7 @@ fn spawn_worker_thread(
                                                     total_decode_ms += ms;
                                                     // SPEAKER-VERIFY-408B：本窗声纹剔除统计（供 406 放宽）。
                                                     let win_drop = match &r {
-                                                        Ok((_, _, stats)) => *stats,
+                                                        Ok((_, _, stats)) => stats.clone(),
                                                         Err(_) => {
                                                             transcription::AccDropStats::default()
                                                         }
@@ -8789,20 +8789,51 @@ fn spawn_worker_thread(
                                                     // 386（C）：解码 Err / 最终为空 ⇒ 用本窗**流式文本**兜底
                                                     //（流式也为空才保持空）；防结尾整段丢失（本次 seq7 `<location>` 丢 40+ 字）。
                                                     let decoded = text;
-                                                    let fb = window_streaming_texts
+                                                    let fb_raw = window_streaming_texts
                                                         .get(seq)
                                                         .map(|s| s.as_str())
                                                         .unwrap_or("");
-                                                    // FIX-ACC-MISMATCH-GUARD-406：精解非空时先与**同窗流式文本**
-                                                    // 比对内容保留度；不通过 ⇒ 用流式替换精解（防精解漏整句 /
-                                                    // 幻觉导致预览回缩与最终丢句）。🔴 仅本地实时滑窗路B。
-                                                    let verdict =
-                                                        transcription::acc_vs_streaming_after_drop(
-                                                            &decoded,
-                                                            fb,
+                                                    // FIX-VOICEPRINT-FALLBACK-421：① 整窗被声纹**全剔** ⇒ 该窗输出空，
+                                                    // **绝不走流式兜底**（否则把他人语音放回）。仅限「因声纹剔除而空」；
+                                                    // 模型自身解码为空（未剔除）仍按 386-C 兜底。
+                                                    let full_drop = win_drop.dropped_speech_secs > 0.0
+                                                        && win_drop.kept_speech_secs <= 0.0;
+                                                    // ② 部分剔除 ⇒ 406 基准与兜底文本都只取**保留区间**对应流式。
+                                                    let win_total: usize = window_samples
+                                                        .get(seq)
+                                                        .map(|v| v.iter().sum())
+                                                        .unwrap_or(0);
+                                                    let fb_owned = if win_drop.dropped_speech_secs > 0.0 {
+                                                        kept_streaming_text(
+                                                            fb_raw,
+                                                            win_total,
+                                                            0,
+                                                            &win_drop.kept_ranges,
+                                                            &win_drop.dropped_ranges,
+                                                            None,
+                                                        )
+                                                    } else {
+                                                        fb_raw.to_string()
+                                                    };
+                                                    if win_drop.dropped_speech_secs > 0.0
+                                                        && log::log_enabled!(log::Level::Debug)
+                                                    {
+                                                        log::debug!(
+                                                            "[LocalRT-DBG-421] kept streaming: seq={} dropped={:.2}s kept={:.2}s kept_ranges={} chars {}→{} (est, no-ts)",
+                                                            seq,
                                                             win_drop.dropped_speech_secs,
                                                             win_drop.kept_speech_secs,
+                                                            win_drop.kept_ranges.len(),
+                                                            fb_raw.chars().count(),
+                                                            fb_owned.chars().count()
                                                         );
+                                                    }
+                                                    let fb: &str = &fb_owned;
+                                                    // FIX-ACC-MISMATCH-GUARD-406：精解非空时与**同窗流式文本**
+                                                    // 比对内容保留度；不通过 ⇒ 用流式替换精解。🔴 仅本地实时滑窗路B。
+                                                    // FIX-VOICEPRINT-FALLBACK-421：基准已收窄到保留部分 ⇒ **回到统一
+                                                    // 406 门槛**（不再按剔除比例 scale 放宽，见 408B 的 clamp 已删）。
+                                                    let verdict = transcription::acc_vs_streaming(&decoded, fb);
                                                     // 406 验收补：Debug 档下**每窗**打一行 verdict + 双方原文
                                                     // （各截前 80 字），供端测校准阈值 —— 此前缺的正是 acc 字符串不落盘。
                                                     if log::log_enabled!(log::Level::Debug) {
@@ -8833,12 +8864,14 @@ fn spawn_worker_thread(
                                                             fb.chars().count()
                                                         );
                                                     }
-                                                    let is_fallback = from_streaming || decoded.is_empty();
-                                                    let text = if from_streaming {
-                                                        fb.to_string()
-                                                    } else {
-                                                        window_text_with_fallback(&decoded, fb)
-                                                    };
+                                                    // FIX-VOICEPRINT-FALLBACK-421：全剔窗 ⇒ 空且 `is_fallback=false`
+                                                    //（既不走流式兜底、也不让 410 pending 兜底接手）。
+                                                    let (is_fallback, text) = window_final_text(
+                                                        &decoded,
+                                                        fb,
+                                                        verdict.accept,
+                                                        full_drop,
+                                                    );
                                                     if decoded.is_empty() && !text.is_empty() {
                                                         log::warn!(
                                                             "[LocalRT-DBG-386] window #{} fallback to streaming text ({} chars)",
@@ -8853,17 +8886,34 @@ fn spawn_worker_thread(
                                                     let use_tail = tail_meta.is_some() && is_fallback;
                                                     let (win_ws, win_we, win_samples, text) = if use_tail {
                                                         let tp = tail_meta.unwrap();
+                                                        // 421：pending 兜底同样只取**保留部分**（pending 段在窗内
+                                                        // 偏移 = 窗总样本 − pending 样本）。
+                                                        let tp_total: usize = tp.samples.iter().sum();
+                                                        let tp_offset = win_total.saturating_sub(tp_total);
+                                                        let pending_kept = if win_drop.dropped_speech_secs > 0.0 {
+                                                            kept_streaming_text(
+                                                                &tp.streaming,
+                                                                tp_total,
+                                                                tp_offset,
+                                                                &win_drop.kept_ranges,
+                                                                &win_drop.dropped_ranges,
+                                                                None,
+                                                            )
+                                                        } else {
+                                                            tp.streaming.clone()
+                                                        };
                                                         let punct = punctuate_via_service(
                                                             &acc_punct_dir,
                                                             acc_punct_enabled,
-                                                            &tp.streaming,
+                                                            &pending_kept,
                                                         );
                                                         if log::log_enabled!(log::Level::Debug) {
                                                             log::debug!(
-                                                                "[LocalRT-DBG-410] fallback scope=pending punctuated={} seq={} chars={}",
-                                                                punct != tp.streaming,
+                                                                "[LocalRT-DBG-410] fallback scope=pending punctuated={} seq={} chars={} kept={}",
+                                                                punct != pending_kept,
                                                                 seq,
-                                                                punct.chars().count()
+                                                                punct.chars().count(),
+                                                                pending_kept.chars().count()
                                                             );
                                                         }
                                                         (tp.span.0, tp.span.1, tp.samples.clone(), punct)
@@ -12155,11 +12205,12 @@ fn punctuate_via_service(model_dir: &Path, enabled: bool, text: &str) -> String 
     if !enabled || text.trim().is_empty() {
         return text.to_string();
     }
-    if text
-        .chars()
-        .any(|c| matches!(c, '。' | '！' | '？' | '；' | '，' | '、' | '：'))
-    {
-        return text.to_string(); // 已含标点 ⇒ 不重复打
+    // FIX-VOICEPRINT-FALLBACK-421：不再「含任一标点就整段跳过」（流式里只要有 1 个停顿打的句号，
+    // 整段都不打点 ⇒ Gavin 端测「最后一句没有标点」）。改为先**剥掉**流式里零星的标点，再整段送
+    // CT-Transformer（与预览「输入始终是原始裸文本」同原则）。**失败/超时仍原样返回原文**（不丢标点）。
+    let stripped = strip_punct_for_repunct(text);
+    if stripped.trim().is_empty() {
+        return text.to_string();
     }
     let state = PUNCT_SERVICE.get_or_init(|| std::sync::Mutex::new(PunctState::default()));
     let now = std::time::Instant::now();
@@ -12170,10 +12221,14 @@ fn punctuate_via_service(model_dir: &Path, enabled: bool, text: &str) -> String 
             return text.to_string();
         }
     }
-    match run_punct_retries(|_i| punct_attempt(state, model_dir, text)) {
+    match run_punct_retries(|_i| punct_attempt(state, model_dir, &stripped)) {
         Ok(s) => {
             state.lock().unwrap_or_else(|e| e.into_inner()).last_fail = None;
-            s
+            if s.trim().is_empty() {
+                text.to_string()
+            } else {
+                s
+            }
         }
         Err(why) => {
             if why == "timeout" {
@@ -12188,6 +12243,31 @@ fn punctuate_via_service(model_dir: &Path, enabled: bool, text: &str) -> String 
             text.to_string()
         }
     }
+}
+
+/// FIX-VOICEPRINT-FALLBACK-421：剥掉标点供**重新整段打点**（含中英标点）。数字中的小数点 / 千分
+/// 逗号（两侧皆 ASCII 数字）保留，防 `3.14` → `314`。
+fn strip_punct_for_repunct(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    for (i, &c) in chars.iter().enumerate() {
+        let is_punct = matches!(
+            c,
+            '，' | '。' | '、' | '！' | '？' | '；' | '：' | ',' | '.' | '!' | '?' | ';' | ':'
+        );
+        if !is_punct {
+            out.push(c);
+            continue;
+        }
+        if matches!(c, '.' | ',') {
+            let prev_digit = i > 0 && chars[i - 1].is_ascii_digit();
+            let next_digit = i + 1 < chars.len() && chars[i + 1].is_ascii_digit();
+            if prev_digit && next_digit {
+                out.push(c); // 数字内部的小数点 / 千分逗号保留。
+            }
+        }
+    }
+    out
 }
 
 /// FIX-PREVIEW-HARVEST-380（A）：滑窗解码结果载荷
@@ -12260,19 +12340,26 @@ fn drive_acc_windows<A, R>(
 /// FIX-ACC-MISMATCH-GUARD-406：滑窗精解结果与同窗流式比对守卫的源码护栏。
 #[cfg(test)]
 mod fix406_tests {
-    /// 源码护栏：`harvest_acc_window!` 宏体内必须调用 `acc_vs_streaming`（406 主判据）。
+    /// 源码护栏：`harvest_acc_window!` 宏体内必须调用 `acc_vs_streaming`（406 主判据），
+    /// 且 FIX-VOICEPRINT-FALLBACK-421 后基准须先经 `kept_streaming_text` 收窄到保留区间。
+    /// 只扫生产区（剔 `#[cfg(test)]`），锚点用 `concat!` 拆开防自匹配假绿。
     #[test]
     fn fix406_harvest_acc_window_calls_acc_vs_streaming() {
-        let src = include_str!("main.rs");
-        let body = src
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"))
+            .join("\n");
+        let body = prod
             .split("macro_rules! harvest_acc_window")
             .nth(1)
             .expect("harvest_acc_window 锚点缺失");
         // 截到下一个 `macro_rules!`（若首段即全部则到末尾）。
         let body = body.split("macro_rules!").next().unwrap();
         assert!(
-            body.contains("acc_vs_streaming_after_drop("),
-            "406/408B：harvest_acc_window! 内必须调用 acc_vs_streaming_after_drop"
+            body.contains(&concat!("acc_vs_streaming(", "&decoded")),
+            "406：harvest_acc_window! 内必须对同窗流式调用 acc_vs_streaming"
+        );
+        assert!(
+            body.contains(&concat!("kept_", "streaming_text(")),
+            "421：harvest_acc_window! 内必须把基准收窄到声纹保留区间"
         );
         assert!(
             body.contains("from_streaming"),
@@ -12529,6 +12616,116 @@ fn window_text_with_fallback(decoded: &str, streaming: &str) -> String {
     } else {
         decoded.to_string()
     }
+}
+
+/// FIX-VOICEPRINT-FALLBACK-421：本窗最终文本决策（纯函数，可单测）。
+///
+/// - `full_drop`（声纹整窗全剔）⇒ **输出空、`is_fallback=false`**（绝不走流式兜底把他人语音放回）。
+/// - 否则：精解被 406 拒（`!accept` 且非空）⇒ 用**保留部分流式**兜底；精解为空（模型自身空，未剔除）
+///   ⇒ 仍按 386-C 用保留部分流式兜底；精解被采纳 ⇒ 用精解。
+/// 返回 `(is_fallback, 最终文本)`。
+fn window_final_text(
+    decoded: &str,
+    kept_streaming: &str,
+    accept: bool,
+    full_drop: bool,
+) -> (bool, String) {
+    if full_drop {
+        return (false, String::new());
+    }
+    let from_streaming = !decoded.is_empty() && !accept;
+    let is_fallback = from_streaming || decoded.is_empty();
+    let text = if from_streaming {
+        kept_streaming.to_string()
+    } else {
+        window_text_with_fallback(decoded, kept_streaming)
+    };
+    (is_fallback, text)
+}
+
+/// FIX-VOICEPRINT-FALLBACK-421 / R1：把**本窗流式文本**按声纹剔除区间裁剪 —— **只删被剔除的字**。
+///
+/// - `dropped_ranges` 空 ⇒ 无剔除（或仅保留）⇒ `streaming` **原样返回**（逐位不变）。
+/// - **时间戳路径**：`timestamps` 给出每个字的**窗口内秒数**且长度 == 字数 ⇒ 落在 `dropped_ranges`
+///   的字删除，其余（含无法归属）保留。
+/// - **估算路径**：无时间戳 ⇒ 把字**只铺在语音时间轴**（`kept ∪ dropped` 裁剪到本段 `[offset, offset+span)`）上，
+///   第 `i` 字落到该轴 `(i+0.5)/N` 处 → 换回窗内样本；**落在 dropped 才删，其余一律保留**。
+///
+/// 🔴 R1 要点：旧版把字**均匀铺满整个窗口时长（含静音）**，本人的字会被映射进静音缝 ⇒ 误删（吞本人字）。
+/// 铺在**语音轴**上纠正之；判定改成「**只删 dropped**」⇒ 偏保留、绝不吞字（Gavin 底线）。
+///
+/// `span_samples` = 这段流式对应音频的样本数；`offset_samples` = 其在**窗内**的起始样本
+///（常规窗 0；410 末尾窗 pending 段 = 窗总样本 − pending 样本）。纯函数，可单测。
+fn kept_streaming_text(
+    streaming: &str,
+    span_samples: usize,
+    offset_samples: usize,
+    kept_ranges: &[(usize, usize)],
+    dropped_ranges: &[(usize, usize)],
+    timestamps: Option<&[f32]>,
+) -> String {
+    if dropped_ranges.is_empty() || streaming.is_empty() {
+        return streaming.to_string();
+    }
+    let chars: Vec<char> = streaming.chars().collect();
+    let n = chars.len();
+    if n == 0 {
+        return String::new();
+    }
+    let in_dropped = |sample: usize| {
+        dropped_ranges
+            .iter()
+            .any(|&(a, b)| sample >= a && sample < b)
+    };
+    // 时间戳路径（逐字窗口内秒数）：只删落在 dropped 的字。
+    if let Some(ts) = timestamps {
+        if ts.len() == n {
+            let mut out = String::with_capacity(streaming.len());
+            for (i, &c) in chars.iter().enumerate() {
+                if !in_dropped((ts[i].max(0.0) * 16000.0) as usize) {
+                    out.push(c);
+                }
+            }
+            return out;
+        }
+    }
+    // 估算路径：字只铺在**语音轴**上（kept ∪ dropped，裁剪到本段），落在 dropped 才删。
+    let (lo, hi) = (offset_samples, offset_samples.saturating_add(span_samples));
+    let mut speech: Vec<(usize, usize)> = kept_ranges
+        .iter()
+        .chain(dropped_ranges.iter())
+        .filter_map(|&(a, b)| {
+            let (a2, b2) = (a.max(lo), b.min(hi));
+            if b2 > a2 {
+                Some((a2, b2))
+            } else {
+                None
+            }
+        })
+        .collect();
+    speech.sort_unstable();
+    let total_speech: usize = speech.iter().map(|(a, b)| b - a).sum();
+    if span_samples == 0 || total_speech == 0 {
+        return streaming.to_string(); // 无语音轴信息 ⇒ 偏保留
+    }
+    let mut out = String::with_capacity(streaming.len());
+    for (i, &c) in chars.iter().enumerate() {
+        let pos = ((i as f64 + 0.5) / n as f64 * total_speech as f64) as usize;
+        let mut acc = 0usize;
+        let mut sample = hi; // 越界 ⇒ 不属任何区间 ⇒ 保留
+        for &(a, b) in &speech {
+            let len = b - a;
+            if pos < acc + len {
+                sample = a + (pos - acc);
+                break;
+            }
+            acc += len;
+        }
+        if !in_dropped(sample) {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// FIX-NEARFIELD-BY-SEGMENT-AND-PREVIEW-389（D3）：**部分窗**（不含本次派发末片）的 `committed_len` 折算。
@@ -12991,6 +13188,168 @@ mod fix410_tail_guard_tests {
             out.chars()
                 .any(|c| matches!(c, '。' | '，' | '！' | '？' | '；' | '、')),
             "真模型应对裸文本加上标点，实测 {out:?}"
+        );
+    }
+}
+
+// =====================================================================
+// FIX-VOICEPRINT-FALLBACK-421：声纹剔除后兜底只取保留部分 + 全剔不兜底 + 兜底补标点
+// =====================================================================
+#[cfg(test)]
+mod fix421_tests {
+    use super::{kept_streaming_text, strip_punct_for_repunct, window_final_text};
+
+    #[test]
+    fn kept_streaming_no_drop_is_identity() {
+        let s = "相识一个可实的地步我们走吧";
+        assert_eq!(
+            kept_streaming_text(s, 16000, 0, &[], &[], None),
+            s,
+            "无剔除（dropped 空）必须逐字原样"
+        );
+    }
+
+    #[test]
+    fn kept_streaming_estimation_deletes_only_dropped() {
+        // 10 字铺在语音轴 [0,10000)；dropped=[5000,10000) ⇒ 删后 5 字。
+        let out = kept_streaming_text(
+            "ABCDEFGHIJ",
+            10_000,
+            0,
+            &[(0, 5_000)],
+            &[(5_000, 10_000)],
+            None,
+        );
+        assert_eq!(out, "ABCDE");
+    }
+
+    /// R1 核心：字铺在**语音轴**上（含静音不计），只删 dropped —— 本人的字不会被映射进静音缝而误删。
+    #[test]
+    fn r1_estimation_lays_chars_on_speech_axis_only() {
+        // 窗 10s：本人语音 0.5~3.5s(kept)、他人 6~9s(dropped)、其余静音。
+        let kept = [(8_000usize, 56_000usize)];
+        let dropped = [(96_000usize, 144_000usize)];
+        let user = "本人说的话在这里";
+        let other = "相识一个可实的地步";
+        let stream = format!("{user}{other}");
+        let out = kept_streaming_text(&stream, 160_000, 0, &kept, &dropped, None);
+        assert!(out.contains(user), "本人字必须全部保留：{out:?}");
+        assert!(!out.contains("相识"), "他人字必须删除：{out:?}");
+    }
+
+    #[test]
+    fn kept_streaming_timestamp_path() {
+        // 逐字窗口内秒数；dropped=[32000,160000) ⇒ 仅前 2 字（<2s）保留。
+        let ts: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        let out = kept_streaming_text(
+            "ABCDEFGHIJ",
+            10_000,
+            0,
+            &[(0, 32_000)],
+            &[(32_000, 160_000)],
+            Some(&ts),
+        );
+        assert_eq!(out, "AB");
+    }
+
+    #[test]
+    fn kept_streaming_offset_excludes_prefix() {
+        // span=2000、offset=8000；dropped=[8000,10000) ⇒ 本段全被删（该段整体是 dropped）。
+        let out = kept_streaming_text(
+            "ABCDEFGHIJ",
+            2_000,
+            8_000,
+            &[(0, 8_000)],
+            &[(8_000, 10_000)],
+            None,
+        );
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn window_final_full_drop_is_empty_no_fallback() {
+        let (fb, text) = window_final_text("", "相识一个可实的地步他人语音", true, true);
+        assert!(!fb, "声纹全剔不得兜底");
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn window_final_model_empty_still_fallbacks_kept_only() {
+        // 模型自身解码为空（未剔除）⇒ 仍按 386-C 用**保留部分**流式兜底。
+        let (fb, text) = window_final_text("", "保留部分的字", true, false);
+        assert!(fb);
+        assert_eq!(text, "保留部分的字");
+    }
+
+    #[test]
+    fn window_final_reject_uses_kept_streaming_only() {
+        // 精解被 406 拒 ⇒ 用保留部分流式（不是整窗含他人语音的流式）。
+        let (fb, text) = window_final_text("精解短", "保留部分流式", false, false);
+        assert!(fb);
+        assert_eq!(text, "保留部分流式");
+    }
+
+    #[test]
+    fn window_final_accept_keeps_decoded() {
+        let (fb, text) = window_final_text("精解文本", "保留部分流式", true, false);
+        assert!(!fb);
+        assert_eq!(text, "精解文本");
+    }
+
+    #[test]
+    fn strip_punct_removes_stray_keeps_decimal() {
+        assert_eq!(strip_punct_for_repunct("你好，世界。"), "你好世界");
+        assert_eq!(
+            strip_punct_for_repunct("3.14和1,000"),
+            "3.14和1,000",
+            "数字内小数点/千分逗号保留"
+        );
+        assert_eq!(strip_punct_for_repunct("a.b"), "ab");
+        // 60 字里 1 个句号 ⇒ 剥后 59 字（证明不再「含任一标点就整段跳过」）。
+        let sixty = format!("{}。", "啊".repeat(59));
+        assert_eq!(strip_punct_for_repunct(&sixty).chars().count(), 59);
+    }
+
+    /// 回放（2026-09-25 日志数值）：窗 #0 全剔 ⇒ 空；窗 #2/#3 部分剔除 ⇒ 最终只含本人保留段，
+    /// **不含**「相识一个可实的地步…」这类他人语音文字。
+    #[test]
+    fn replay_421_window0_empty_window2_excludes_other_speech() {
+        // 窗 #0：kept=0.00s dropped=9.36s ⇒ 全剔 ⇒ 空、不兜底（即使模型空、流式非空）。
+        let (fb, t0) = window_final_text("", "相识一个可实的地步然后我们去那个地方吧", true, true);
+        assert!(!fb && t0.is_empty(), "窗 #0 应输出空且不兜底");
+
+        // 窗 #2：dropped=12.67s kept=1.73s ⇒ 仅保留后 1.73s（约 27680/230400 样本）。
+        let total = (12.67f32 * 16000.0) as usize + (1.73 * 16000.0) as usize;
+        let keep = (1.73f32 * 16000.0) as usize;
+        let stream = format!(
+            "{}{}",
+            "相识一个可实的地步然后我们去那个地方吧", "我今天很开心"
+        );
+        let kept = kept_streaming_text(
+            &stream,
+            total,
+            0,
+            &[(total - keep, total)],
+            &[(0, total - keep)],
+            None,
+        );
+        assert!(!kept.contains("相识"), "不得含他人语音：{kept:?}");
+        assert!(kept.contains("开心"), "应保留本人尾段：{kept:?}");
+    }
+
+    /// 421 item3（真模型）：流式含 1 个句号也应**重新整段打点**（旧行为会整段跳过）。
+    /// 运行：`cargo test --bin feiyin-ime -- --ignored --nocapture poc_421_repunct`
+    #[test]
+    #[ignore = "requires punctuation model; cargo test --bin feiyin-ime -- --ignored --nocapture poc_421_repunct"]
+    fn poc_421_repunct_sixty_with_one_period() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models");
+        let input = "今天天气特别好我们一起去公园散步吧顺便看看花然后找个地方坐下来喝杯茶聊聊天说说最近发生的事情。";
+        let out = super::punctuate_via_service(&dir, true, input);
+        println!("\n[421] repunct: {out}");
+        let punct = |c: char| matches!(c, '。' | '，' | '！' | '？' | '；' | '、');
+        assert!(
+            out.chars().filter(|&c| punct(c)).count() >= 2,
+            "含 1 个句号的流式应重新打全标点，实测 {out:?}"
         );
     }
 }
