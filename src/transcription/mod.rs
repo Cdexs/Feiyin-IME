@@ -10720,3 +10720,180 @@ mod testsync426_tests {
         assert!(prod.contains("fn lang_to_sherpa("), "须有语种映射纯函数");
     }
 }
+
+// =====================================================================
+// TEST-SYNC-431（阶段三 · 非作者护栏 · coder-2）：SEAM-KEEP-PREV-TEXT-431
+//   契约：重叠区保前一窗文字（只采纳后一窗边界标点）：semiglobal_continuation / splice_keep_prev_overlap
+//   🔴 白名单：只 rustfmt + cargo check；未跑 cargo test。生产零改动。
+// =====================================================================
+#[cfg(test)]
+mod testsync431_tests {
+    use super::{align_keep_char, semiglobal_continuation, splice_keep_prev_overlap};
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn n(&mut self, lo: usize, hi: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            lo + (self.0 >> 33) as usize % (hi - lo + 1)
+        }
+    }
+
+    fn cps(s: &str) -> Vec<char> {
+        s.chars().filter(|c| align_keep_char(*c)).collect()
+    }
+
+    /// 契约 1（🔴 不丢字，性质 320 组）：P 重叠区随机做 0~2 处**插入/替换**（重叠变长或等长，
+    /// 插入/替换字属后一窗新内容） + 随机后续 S ⇒ 结果**逐字 == P + S**（保前一窗、S 一字不丢、不重复）。
+    /// S 用与 P/插入字**不相交**的码段，保证不出现边界同字歧义。
+    /// ⚠️ 本性质**不含删除**（删除会使重叠短于 k，`min(len,k+4)` 令 prev 末字按替换对齐进 S 首字而吃掉它；
+    ///    见 result.md「观察」）；删除由契约 2 的定点用例覆盖。
+    #[test]
+    fn ts431g_property_no_loss_insert_replace() {
+        let mut rng = Lcg(0x431_5EED);
+        for it in 0..320 {
+            // 6 个互异 P 字（CJK 0x4E00..）。
+            let mut pool: Vec<char> = (0..40u32)
+                .map(|i| char::from_u32(0x4E00 + i).unwrap())
+                .collect();
+            let mut p = String::new();
+            for _ in 0..6 {
+                let i = rng.n(0, pool.len() - 1);
+                p.push(pool.remove(i));
+            }
+            let mut ch: Vec<char> = p.chars().collect();
+            for _ in 0..rng.n(0, 2) {
+                if rng.n(0, 1) == 0 {
+                    // 插入（不在末尾追加）：重叠变长。
+                    let pos = rng.n(0, ch.len() - 1);
+                    ch.insert(pos, char::from_u32(0x5000 + rng.n(0, 20) as u32).unwrap());
+                } else {
+                    let pos = rng.n(0, ch.len() - 1);
+                    ch[pos] = char::from_u32(0x5000 + rng.n(0, 20) as u32).unwrap();
+                }
+            }
+            let mutated: String = ch.iter().collect();
+            let s: String = (0..rng.n(1, 6))
+                .map(|_| char::from_u32(0x6000 + rng.n(0, 30) as u32).unwrap())
+                .collect();
+            let new = format!("{mutated}{s}");
+            let got = splice_keep_prev_overlap(&p, &new, 6);
+            assert_eq!(got, format!("{p}{s}"), "it={it} P={p:?} new={new:?}");
+        }
+    }
+
+    /// 契约 2（插入）：首 / 中 / 末 各 1 例 —— 保前一窗重叠区；末插的新字保留。
+    #[test]
+    fn ts431g_insert_head_mid_tail() {
+        assert_eq!(
+            splice_keep_prev_overlap("甲乙丙丁", "X甲乙丙丁后", 4),
+            "甲乙丙丁后"
+        );
+        assert_eq!(
+            splice_keep_prev_overlap("甲乙丙丁", "甲乙X丙丁后", 4),
+            "甲乙丙丁后"
+        );
+        // 插在重叠区末尾之后 ⇒ 属后一窗新内容，保留。
+        assert_eq!(
+            splice_keep_prev_overlap("甲乙丙丁", "甲乙丙丁X后", 4),
+            "甲乙丙丁X后"
+        );
+    }
+
+    /// 契约 2（删除）：首 / 中 / 近末 各 1 例 —— 仍保前一窗重叠区 + 后一窗尾巴（不丢后一窗内容）。
+    #[test]
+    fn ts431g_delete_head_mid_near_tail() {
+        assert_eq!(
+            splice_keep_prev_overlap("甲乙丙丁", "乙丙丁后", 4),
+            "甲乙丙丁后"
+        );
+        assert_eq!(
+            splice_keep_prev_overlap("甲乙丙丁", "甲乙丁后", 4),
+            "甲乙丙丁后"
+        );
+        // 删的是倒数第二字（戊仍在）⇒ 前一窗末字有对应，后一窗「后」保留。
+        assert_eq!(
+            splice_keep_prev_overlap("甲乙丙丁戊", "甲乙丙戊后", 5),
+            "甲乙丙丁戊后"
+        );
+    }
+
+    /// 契约 2（替换在末字，平局偏替换）：`世`↔`时` 平局取较大 j（替换）⇒ 保前一窗「世」、丢「时」。
+    #[test]
+    fn ts431g_replace_last_tie_prefers_replacement() {
+        // 半全局续接点：prev 全消费、new 末端自由；平局取较大 j ⇒ 世 对齐 new 的 时（替换）。
+        assert_eq!(
+            semiglobal_continuation(&cps("某一世"), &cps("某一时")),
+            3,
+            "平局取较大 j ⇒ 世 与 时 对齐（替换）"
+        );
+        assert_eq!(
+            splice_keep_prev_overlap("某一世", "某一时后", 3),
+            "某一世后",
+            "保前一窗「世」、丢后一窗「时」、留「后」"
+        );
+    }
+
+    /// 契约 3（标点）：窗末句末标点被后一窗边界标点/内容替换；重叠区**内部**标点保前一窗；
+    /// 后一窗重叠后无内容 ⇒ 保前一窗原文（含窗末标点）。
+    #[test]
+    fn ts431g_punctuation_rules() {
+        // 窗末「。」替换为后一窗内容。
+        assert_eq!(
+            splice_keep_prev_overlap("去了。", "去了然后", 2),
+            "去了然后"
+        );
+        // 内部「、」保前一窗，窗末「。」换成后一窗「，」。
+        assert_eq!(
+            splice_keep_prev_overlap("甲、乙。", "甲，乙丁", 2),
+            "甲、乙丁"
+        );
+        assert_eq!(
+            splice_keep_prev_overlap("甲，乙。", "甲，乙，丁", 2),
+            "甲，乙，丁"
+        );
+        // 后一窗整窗都是重叠（无后续内容）⇒ 保前一窗原文含窗末标点。
+        assert_eq!(splice_keep_prev_overlap("你好。", "你好", 2), "你好。");
+    }
+
+    /// 契约 4：多字节 / 混合英文数字（`align_keep_char` 口径）不越界、不 panic。
+    #[test]
+    fn ts431g_multibyte_mixed_no_panic() {
+        // 混合 ASCII 字母数字 + 全角逗号：数字/字母算有效字，逗号不算。
+        assert_eq!(
+            splice_keep_prev_overlap("A1，b2。", "A1，b2x", 4),
+            "A1，b2x"
+        );
+        // emoji（未列入标点 ⇒ 有效字）：按 char 切，不切裂。
+        assert_eq!(splice_keep_prev_overlap("啊😀。", "啊😀哦", 2), "啊😀哦");
+        // k 大于实际重叠有效字数 / 空 new：不 panic（semiglobal 空 prev ⇒ 0）。
+        assert_eq!(semiglobal_continuation(&[], &cps("任意")), 0);
+        let _ = splice_keep_prev_overlap("重叠", "", 2);
+    }
+
+    /// 契约 5（源码锚点）：两纯函数存在；`splice_keep_prev_overlap(` 在生产区**恰 2 处**
+    ///（1 定义 + 1 调用，即**仅对齐成功分支**调用）⇒ concat / 零重叠 / 首窗路径不走 splice。
+    #[test]
+    fn ts431g_source_anchors() {
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("mod.rs"))
+            .join("\n");
+        assert!(prod.contains(concat!("fn semiglobal_", "continuation(")));
+        assert!(prod.contains(concat!("fn strip_trailing_sentence_", "punct(")));
+        assert!(prod.contains(concat!("fn splice_keep_prev_", "overlap(")));
+        assert_eq!(
+            prod.matches(concat!("splice_keep_prev_", "overlap("))
+                .count(),
+            2,
+            "splice 应恰 1 定义 + 1 调用（只对齐成功分支）"
+        );
+        assert!(
+            prod.contains(concat!(
+                "splice_keep_prev_",
+                "overlap(prev_overlap, &text, res.k)"
+            )),
+            "splice 调用须在对齐成功分支（res.k）"
+        );
+    }
+}
