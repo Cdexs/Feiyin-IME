@@ -2423,3 +2423,10 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | --- | --- | --- |
 | `transcription/mod.rs`：`transcribe_acc_ctx` 首解 `Err` 不再 `?` 上抛 ⇒ `[DBG-426]` 视作空进 `apply_acc_disposition`；新增 `decode_accuracy_allow_empty_lang` + `lang_to_sherpa`；重解传 `lang_opt`（本窗 L：zh/en/ja/ko→Chinese/English/Japanese/Korean，未知不指定） | 解码 `get_result()`=None（`No transcription result`）旧：跳过整段 387 处置直接 386-C 兜底 → 新：按空触发那一次「不带注入重解」；重解**换条件指定语种**（首解与重解**同参数**时重解也易失败）。首解逐位不变；重解仍恰 1 次；421 声纹全剔（解码前早退）不变 | ✅ 平台中立纯逻辑（无 `cfg`），macOS 同继承 |
 | **macOS 侧需要做什么** | | 无需改动（平台中立自动继承） |
+
+## LOCALRT-ALWAYS-CONTEXT-427（2026-09-25，coder-1）· 所有常规窗都带前一片后缀 —— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `main.rs`：`short_context_span` 判据由「`must_start > gs`」改为「`must_start>=1` 且 `must_start<ge` 且 **`must_start-1 >= buf_base`**」；签名 `(ge,must_start,buf_base)` + 调用点 | 新片长时 `group_window_start_secs` 把前片排除、`gs == must_start` ⇒ 旧判据返回 None ⇒ **长句窗无前文**。新：只要紧邻前一片仍在 `recent_slices` 缓冲内，就取其后缀 ⇒ **所有常规窗都带前文**。首片 / 前片已被缓冲裁掉 ⇒ 无前文。其余（样本表/406 基准/VAD 裁剪/new_slice_from/410 兜底/421 保留筛选）沿用 413 路径 | ✅ 平台中立纯逻辑（无 `cfg`），macOS 同继承 |
+| **macOS 侧需要做什么** | | 无需改动（平台中立自动继承） |

@@ -1,4 +1,9 @@
 
+### 2026-09-25 · LOCALRT-ALWAYS-CONTEXT-427 交付（所有常规窗带前一片后缀，只改 main.rs）
+
+- `short_context_span` 判据改为「紧邻前一片仍在缓冲内即取后缀」（`must_start-1 >= buf_base`），不再受 `gs`/10s 组窗上限影响；首片 / 前片出缓冲无前文。其余沿 413 路径。
+- 回放（175022 #1）：改前「母亲。」→ 改后「总会出现，比如说某人在某一事，可能母亲。」；+4s 音频 +866ms。3 条 427 单测；fmt/check/全量 test 0 failed（bin 1806P/0F/60I）。平台中立，MACOS-HANDOFF 已记。未出包。
+
 ### 2026-09-25 · FIX-ACC-EMPTY-RETRY-426 交付（精解报错/空纳入重试 + 重试换条件，只改 mod.rs）
 
 - 首解 Err（`No transcription result`）改按空进 `apply_acc_disposition`（触发一次重解，`[DBG-426]`）；重解走 `decode_accuracy_allow_empty_lang` + `lang_to_sherpa` 指定本窗语种（L 未知不指定）；重解仍 1 次；碎片窗留 424。首解逐位不变、421 full_drop 不变。
@@ -8,6 +13,12 @@
 
 - 新增 `emit_tail_window!` 宏统一组装末尾窗（有前片 ⇒ 前片后缀 + pending；首片 ⇒ `tail_window_alone` 单独解），长静默 407 与松键收尾共用；`plan_windows` 删 `is_tail`/规则 4、删 `TAIL_MERGE_MAX_SECS`；松键 `pending_slice.take()` 防重复。
 - 旧护栏 `ts413_rule4_*`→`ts423_*`、testsync386/407/411/413 改写；fmt EXIT0 / check 0 error、warnings 91/87≤基线 / 全量 test 0 failed（bin 1801P/0F/55I）。平台中立，MACOS-HANDOFF 已记。未出包。
+
+### 2026-09-25 · DIAG-FRAG-AND-PREVIEW-428 交付（碎片窗 + 浮层预览他人语音，只读诊断）
+
+- **A**：`trim_to_speech` 对 #5 的 0.35s 段间停顿**原样保留**；两变体（只剪首尾 / thr .3/.5/.8）与现状**逐字节相同**（#5 恒 5.040s）⇒ 改阈值零效果，建议不动 trim；#5 属 VAD 切碎+模型碎窗不稳，走 426。
+- **B**：流式链路无声纹、`on_segment` 有精确字符区间 ⇒ **建议 B1**（离线全剔⇒清预览段，零实时开销）；不推荐 B2（实时 CAM++）。B1 只动 main.rs。
+- 产物 `collab/evidence/428/report.md` + `diag428_tests`（2P/0F）。未改生产。未出包。
 
 ### 2026-09-25 · POC-QWEN3-PREFIX-424 交付（已识别文本作输出前缀续写，纯 PoC/研究，生产零改动）
 

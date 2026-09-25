@@ -9,6 +9,14 @@
 > 2026-09-21 归档：2026-09-20 共 57 条已移入 `handoffs-archive.md`（本文件曾达 610 行）。
 > 2026-09-20 归档：2026-09-08 / 09-17 共 26 条已移入 `handoffs-archive.md`（本文件曾达 288 行）。
 
+## 2026-09-25 — coder-1 — LOCALRT-ALWAYS-CONTEXT-427 ✅ 交付（只改 main.rs 组窗/派发区）
+
+- **范围**：`src/main.rs`：`short_context_span` 判据/签名、调用点、doc；413/423 断言同步；新增 `ts427_*` 3 条 + `diag427_context`（`#[ignore]`）。
+- **效果**：`gs == must_start`（新片长致前片被 10s 上限排除）时**仍**取紧邻前一片后缀（只要它还在缓冲内）⇒ 所有常规窗都带前文；首片 / 前片出缓冲 ⇒ 无。其余沿 413 路径。
+- **回放**（175022）：#1 改前 2.57s/799ms「母亲。」→ 改后 6.57s/1665ms「总会出现，比如说某人在某一事，可能母亲。」（恢复前文语境；+4s 音频 +866ms）。
+- **验证**：fmt EXIT0 / check 0 error、warnings 91/87≤基线 / 全量 test 0 failed（bin 1806P/0F/60I）。平台中立，MACOS-HANDOFF 已记。未 commit / 未 build / 版本未动 / 零凭证。
+- **R1（补整段回放）⚠️ 阻塞**：已补单窗前后（`diag427_context`：#1 改前「母亲。」→改后恢复前文）+ OrderedReflow 拼接（`diag427_reflow` 生产 acc 文本：175022 CER 0.239→0.094）+ 校准（改前拼接==生产 `Injecting text`）。但**忠实全窗回放**因日志不含逐窗唯一 pcm 偏移（wav 停止才落盘；`source=vad` 窗无 dispatch/`[413]`；多子切片第二子窗偏移缺；无 per-window 音频 dump）**无法可靠重建**，已报告主控裁决。`diag427_reflow` 的「改后切掉」系**合成**（重叠 span 喂无前文文本）产物，非真 427 行为，仅示风险。未猜偏移/未改算法。
+
 ## 2026-09-25 — coder-1 — FIX-ACC-EMPTY-RETRY-426 ✅ 交付（只改 mod.rs）
 
 - **范围**：`src/transcription/mod.rs`：首解 Err→进处置（`[DBG-426]`）、`decode_accuracy_allow_empty_lang`、`lang_to_sherpa`、重解闭包传 `lang_opt`、390 护栏改写、新增 `fix426_tests`（5）+ `diag426`（`#[ignore]`）。
@@ -38,6 +46,13 @@
 - **改动**：新增共用状态机 `next_top_token`/`brace_match`/`item_end`（串/原始串/字符与生命周期区分/行块注释可嵌套），`prod_lines_excluding_cfg_test` 与 `fn_body` **共用同一份**（禁两份）。
 - **碰巧通过报告**：`testsync377::main_has_no_cross_recording_ctx_cache` 命中测试模块**前的注释**（旧扫描器误剔使其未计入）⇒ 按其文档契约补注释过滤（不放宽代码不变量）。
 - **验证**：新增 `guard_prod_lines::tests` 3 条；fmt EXIT0 / check 0 error、warnings 91/87=基线 / 全量 test **0 failed**（bin 1802P/0F/55I）；`testsync421` 由红转绿。未 commit / 未 build / 版本未动 / 零凭证。
+
+## 2026-09-25 — coder-2 — DIAG-FRAG-AND-PREVIEW-428 ✅ 交付（只读诊断；生产零改动、未碰 main.rs）
+
+- **A 碎片窗 #3**：`trim_to_speech`（pad 0.2s、扩段+重叠合并）对 #5 的 0.35s 段间停顿**原样保留**（<2×pad ⇒ 合并）；合成实测 G<0.4 保留、G=1.0 只留 0.4s。任务书两变体（只剪首尾 / thr .3/.5/.8）对 #5 与 #0/#6/#7 与现状**逐字节相同**（#5 恒 5.040s）⇒ **改阈值零效果**。建议**不动 trim**；#5 根因=VAD 切碎+模型碎窗不稳（幻觉/错句/Err），走 426 换条件重解。
+- **B 浮层预览他人语音 #5**：流式链路无声纹；`on_segment` 携 `committed_len`+`seg_streaming`（精确字符区间），声纹仅在离线（408/412）。**建议 B1**：离线全剔 ⇒ 发 overlay 指令把预览截断到 `committed_len`+同步镜像（零实时开销、复用；代价=说话中短暂显示）。**不推荐 B2**（实时 CAM++：+40~120ms/段、违 DEC-066）。B1 只动 `main.rs`；B2 动 `local_stream.rs`。
+- **产物**：`collab/evidence/428/report.md`；`src/transcription/mod.rs::diag428_tests`（`#[ignore]` 纯计算 **2P/0F**，`cargo test --bin feiyin-ime -- --ignored --nocapture diag428`）。`cargo check --all-targets` 0 error。
+- 红线：未改生产逻辑 / 未碰 main.rs / 未 commit / 未 build release / 版本未动 / 零凭证。
 
 ## 2026-09-25 — coder-2 — POC-QWEN3-PREFIX-424 ✅ 交付（纯 PoC；生产零改动）
 
