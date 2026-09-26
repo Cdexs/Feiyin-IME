@@ -2502,3 +2502,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | **macOS 侧需要做什么** | | ① **无同步改动**：`plan_gap_cuts` 是纯函数，macOS 编译同一份 `vad.rs` 源码自动继承；② `vad.rs` 内 `fix437_*`/`ts381_*` 单测随 `cargo test` 同跑，无需额外配置；③ 若 macOS 侧另写切片下界常量，须保持 8s/10s/12s 与 `SLICE_CUT_MIN_PAUSE_MS` 同值 |
 
 > 结论：**已评估，平台中立（纯音频计算，无 `cfg`/依赖/文件/开关变化），macOS 无需任何编译期或运行期同步**。本单统计与实现证据见 `collab/evidence/437/stats.md`、`collab/outbox/coder-2/result.md`；未跑 macOS 交叉编译（Windows 端 verification）。
+
+## PREVIEW-PUNCT-LIVE-438（2026-09-26，coder-2）· 预览打点改 3.5s 间隔 + 冻结前缀 —— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `src/transcription/local_stream.rs`：删 1200ms 静默打点触发与显示层 `silent_ms` 计数器，新增 `PUNCT_PREVIEW_INTERVAL_MS=3500.0` + 独立 `punct_interval_ms` 间隔计时；`preview_display` 只重打已派发边界后的裸尾巴（双坐标 `committed_len`/`last_display_raw_len` 派发同刻捕获、冻结前缀逐字节不变），存缓存前经 `build_punct_prefix`→`strip_trailing_punctuation` 剥末尾句终标点 | 预览标点从「静默 ≥1200ms 整段重打」变为「每 3.5s 重打尾巴一次」；句中句点（349 事故）由「前置条件防」升级为「终止符根本不入缓存」；acc 派发恒读 `acc_silent_ms` 不受影响 | ✅ 平台中立：纯 Rust 计数/字符串拼接，无 `cfg`、无新增依赖/文件/开关；`should_repunctuate_preview`/`punct_head`/`build_punct_prefix` 等纯函数 macOS 编译同一份源码自动继承，`fix438_*` 10 条单测随 `cargo test` 同跑 |
+| **macOS 侧需要做什么** | | **无同步改动**；若 macOS 侧另写打点间隔，须与 `PUNCT_PREVIEW_INTERVAL_MS=3500.0` 同值（现无此副本） |
+
+> 结论：**已评估，平台中立（无 `cfg`/依赖/文件/开关变化），macOS 无需任何编译期或运行期同步**。证据见 `collab/outbox/coder-2/result.md`；未跑 macOS 交叉编译（Windows 端 verification）。
