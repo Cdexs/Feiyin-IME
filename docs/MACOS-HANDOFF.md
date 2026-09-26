@@ -2521,3 +2521,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | **macOS 侧需要做什么** | | **无同步改动**。唯一前瞻：`overlay_request_for_event`（:10810，`Processing → ShowProcessing` :10821）—— 若 macOS 日后引入编辑态（`EditRequested`/`EnterEditMode`），须给 `Processing→ShowProcessing` 路径同加 `OVERLAY_EDITING` 守卫 |
 
 > 结论：**已评估，macOS 无同类 bug（无编辑态），本单唯一生产改动位于平台中立共享区 ⇒ 零编译期/运行期同步**。证据见 `collab/outbox/coder-2/result.md` §五；未跑 macOS 交叉编译（Windows 端 verification）。
+
+## FILLER-RESTART-440 + REFLOW-FILLER-ONCE-441（2026-09-26，主控）
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | `src/text_normalizer.rs` 新增规则 D（`collapse_restarts`，折叠「说一半重说」）；`src/main.rs` 本地实时去重前移到回灌前，`run_pipeline_core` 新增参数 `FinalFillerNode` |
+| 行为变化 | 去重节点对所有调用它的管线新增规则 D（平台中立）；本地实时最终上屏前不再去重（已在回灌前做一遍）；在线 / 批处理最终节点逐位不变 |
+| 对 macOS 的影响 | `text_normalizer.rs` 两端共用 ⇒ macOS 自动获得规则 D；`run_pipeline_core` 签名 +1 参数，macOS 若有直接调用须补传 `FinalFillerNode::AtFinal`（本端核对：全仓 3 处调用均已补齐） |
+| 是否需要对方同步 | 否（除非 macOS 分支另有 `run_pipeline_core` 调用点） |

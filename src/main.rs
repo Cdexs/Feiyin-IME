@@ -8823,6 +8823,7 @@ fn spawn_worker_thread(
                             Some(streaming_text), // 流式文本，跳过转录
                             None,                 // PARALLEL-ACC-298: 在线路径无并行预转写
                             i18n::get(config.ui_language).overlay_transcribing,
+                            FinalFillerNode::AtFinal, // 441：在线路径最终节点去重逐位不变
                         );
                         continue;
                     }
@@ -9265,12 +9266,17 @@ fn spawn_worker_thread(
                                                             win_split
                                                         );
                                                     }
-                                                    for authoritative in ordered.push_window_streaming(
-                                                        seq, win_ws, win_we, win_samples, text,
-                                                        win_stream, win_split,
-                                                    ) {
-                                                        // 382（3A）：边界未到时的 fallback = 派发当刻浮层字符数。
-                                                        let fallback_committed = window_committed_lens
+                            for authoritative in ordered.push_window_streaming(
+                                seq, win_ws, win_we, win_samples, text,
+                                win_stream, win_split,
+                            ) {
+                                // REFLOW-FILLER-ONCE-441：回灌**前**去重（此处文本 = 对齐后的
+                                // 权威全文 `committed + last_window`）；下方 `last_authoritative`
+                                // （全剔窗复用）与 `acc_text` 同取这一份已去重文本。
+                                let authoritative =
+                                    apply_authoritative_filler_dedup(&authoritative);
+                                // 382（3A）：边界未到时的 fallback = 派发当刻浮层字符数。
+                                let fallback_committed = window_committed_lens
                                                             .get(seq)
                                                             .copied()
                                                             .unwrap_or(0);
@@ -10106,7 +10112,12 @@ fn spawn_worker_thread(
                             None
                         };
                         // 最终文本来源：路B（若成功）**整体替换**切片拼装（不再算拼接边界）。
-                        let final_src: &str = path_b_text.as_deref().unwrap_or(acc_joined.as_str());
+                        // REFLOW-FILLER-ONCE-441：最终文本与最后一次回灌取**同一份**去重结果
+                        // （同一纯函数、同一输入 `committed + last_window` ⇒ 逐字相同）；本管线最终节点不再去重。
+                        let final_src_deduped = apply_authoritative_filler_dedup(
+                            path_b_text.as_deref().unwrap_or(acc_joined.as_str()),
+                        );
+                        let final_src: &str = final_src_deduped.as_str();
                         let pretranscribed = if acc_parallel_result_usable(
                             cancel_signal.load(Ordering::Acquire),
                             final_src,
@@ -10223,6 +10234,13 @@ fn spawn_worker_thread(
                         } else if !config.punctuation.enabled {
                             cached_punctuation = None;
                         }
+                        // REFLOW-FILLER-ONCE-441（DEC-066 本管线显式声明）：用的是回灌前已去重的精解文本
+                        // ⇒ 最终节点不再去重；退回内部 accuracy 2pass（pretranscribed=None）时该文本未去重 ⇒ 照常去重。
+                        let filler_node = if pretranscribed.is_some() {
+                            FinalFillerNode::DoneUpstream
+                        } else {
+                            FinalFillerNode::AtFinal
+                        };
                         run_pipeline_core(
                             Ok(local_pcm),
                             transcriber,
@@ -10240,6 +10258,7 @@ fn spawn_worker_thread(
                             None, // 非流式：主通道 ITN 启用（B 路径由 pretranscribed 显式承载）
                             pretranscribed, // PARALLEL-ACC-298: 并行 accuracy 结果（关时 None ⇒ 原有 accuracy 2pass）
                             i18n::get(config.ui_language).overlay_processing,
+                            filler_node,
                         );
                         continue;
                     }
@@ -10324,6 +10343,7 @@ fn spawn_worker_thread(
                         None,
                         None, // PARALLEL-ACC-298: 批处理路径无并行预转写
                         i18n::get(config.ui_language).overlay_transcribing,
+                        FinalFillerNode::AtFinal, // 441：批处理路径最终节点去重逐位不变
                     );
                 }
             }
@@ -15614,6 +15634,11 @@ fn run_pipeline_core(
     // 现有三档传 `overlay_transcribing`（行为逐位零变）；本地 realtime 新管线传
     // `overlay_processing`，满足「松键后只显示『识别处理中』单状态」要求。
     transcribing_status_text: &'static str,
+    // REFLOW-FILLER-ONCE-441（DEC-066）：由调用方管线**显式声明**口水词去重节点位置 ——
+    // `AtFinal` = 在本函数最终节点去重（在线 / 批处理 / 本地实时退回 2pass）；
+    // `DoneUpstream` = 本地实时已在回灌前对权威文本去过一遍，最终节点不再重复。
+    // 🔴 本函数不得从文本或 `pretranscribed.is_some()` 反推该值。
+    filler_node: FinalFillerNode,
 ) {
     match samples_result {
         Err(e) => {
@@ -15893,7 +15918,11 @@ fn run_pipeline_core(
                     // ② 在 inject_text 之前；③ `enabled = !llm_handled` ⇒ 只有 LLM 未接手时才动，
                     // 不触 DEC-041（该条禁的是对 LLM 输出做程序化后处理，此处压根没有 LLM 输出）。
                     // 四档共用 run_pipeline_core，一处调用即全覆盖，不新增任何管线判据（DEC-066）。
-                    let final_text = apply_filler_strip(final_text, !llm_handled);
+                    // REFLOW-FILLER-ONCE-441：本地实时声明 `DoneUpstream` ⇒ 已在回灌前去过一遍，这里不再过（只过一遍）。
+                    let final_text = apply_filler_strip(
+                        final_text,
+                        !llm_handled && filler_node == FinalFillerNode::AtFinal,
+                    );
                     // PUNCT-GOVERNANCE-030-A L2 后处理补位（架构定位：L1 源头控制为主，L2 补位）
                     // 只负责两件 L1 物理上够不着的事：
                     //   (a) 开关关闭 → 全文剥标点（Qwen3 在线 ASR / 本地 native / NLLB 翻译不可控源兜底）
@@ -16296,6 +16325,46 @@ fn apply_filler_strip(final_text: String, enabled: bool) -> String {
     stripped
 }
 
+/// REFLOW-FILLER-ONCE-441：权威文本的口水词去重（本地实时**唯一**的去重过路点）。
+///
+/// 本地实时只过一遍（Gavin 2026-09-26）：在「逐窗对齐之后的权威全文」上执行，
+/// 同一份纯函数同时供两处合成用 —— ① 回灌刷新预览（`PreviewReflow.acc_text`，回灌**前**已去重）
+/// ② 松键后的最终文本 `acc_joined = committed + last_window`（与最后一条回灌同源，
+/// `OrderedReflow` 的 `push` 产出与 `finish()` 同为 `committed + last_window_text`
+/// ⇒ 预览显示与最终上屏取同一份已去重文本），`run_pipeline_core` 最终节点对本地实时
+/// 不再重复去重（DEC-066 显式节点编排，见 `FinalFillerNode`）。
+///
+/// 🔴 不得在「逐窗对齐之前」对单窗文本调用（会改 436 锚点 / 433 裁判的输入）；
+/// `committed_len` 是**流式**文本坐标，与精解文本长度无关 ⇒ 精解段变短不影响
+/// `streaming[committed_len..]` 尾巴拼接（单测 `dedup_shortening_keeps_streaming_tail`）。
+///
+/// 耗时：整段权威文本每次回灌都过一遍 ⇒ Debug 级打 `[DBG-441] filler once: chars=… ms=…`
+/// （`log_enabled!` 守卫，生产 info 级零开销）。
+/// REFLOW-FILLER-ONCE-441：口水词去重节点位置（调用方管线显式声明，DEC-066）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinalFillerNode {
+    /// 在 `run_pipeline_core` 最终节点去重（在线 / 批处理 / 本地实时退回 2pass）。
+    AtFinal,
+    /// 本地实时已在回灌前对权威文本去过一遍，最终节点不再重复。
+    DoneUpstream,
+}
+
+fn apply_authoritative_filler_dedup(text: &str) -> String {
+    let t0 = std::time::Instant::now();
+    let stripped = text_normalizer::strip_fillers_conservative(text);
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "[DBG-441] filler once: chars={} ms={:.3}",
+            text.chars().count(),
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    if stripped != text {
+        log::info!("Authoritative filler dedup: '{}' -> '{}'", text, stripped);
+    }
+    stripped
+}
+
 #[cfg(test)]
 mod filler_strip_303_tests {
     use super::apply_filler_strip;
@@ -16328,6 +16397,110 @@ mod filler_strip_303_tests {
         assert_eq!(apply_filler_strip(input.clone(), true), input);
     }
 }
+#[cfg(test)]
+mod reflow_filler_once_441_tests {
+    use super::{apply_authoritative_filler_dedup, apply_filler_strip, reflow_preview};
+
+    fn prod_src() -> String {
+        let src = include_str!("main.rs");
+        let cut = src
+            .find(concat!("mod reflow_filler_once_441", "_tests"))
+            .unwrap_or(src.len());
+        src[..cut].to_string()
+    }
+
+    /// ① 回灌前去重生效：规则 C 整段重复、规则 D 说一半重说都在权威文本上去掉。
+    #[test]
+    fn t441_dedup_applies_to_authoritative_text() {
+        assert_eq!(
+            apply_authoritative_filler_dedup("我们明天去公园，我们明天去公园。"),
+            "我们明天去公园。"
+        );
+        assert_eq!(
+            apply_authoritative_filler_dedup(
+                "你们的知，你们的知识不可能只在简单的仪式就变得完整。"
+            ),
+            "你们的知识不可能只在简单的仪式就变得完整。"
+        );
+    }
+
+    /// ② 预览权威部分与最终文本同一份：同一纯函数、同一输入 ⇒ 逐字相同；且再过一遍不变（幂等）。
+    #[test]
+    fn t441_preview_and_final_same_text() {
+        let authoritative = "你们的知，你们的知识。我觉得，我觉得可以";
+        let preview_acc = apply_authoritative_filler_dedup(authoritative);
+        let final_src = apply_authoritative_filler_dedup(authoritative);
+        assert_eq!(preview_acc, final_src);
+        assert_eq!(apply_authoritative_filler_dedup(&final_src), final_src);
+    }
+
+    /// ③ 最终节点：`DoneUpstream` ⇒ 不再去重（传 enabled=false 原样返回）；`AtFinal` ⇒ 照常。
+    #[test]
+    fn t441_final_node_gated_by_declaration() {
+        let prod = prod_src();
+        assert!(
+            prod.contains(concat!(
+                "!llm_handled && filler_node == ",
+                "FinalFillerNode::AtFinal"
+            )),
+            "最终去重节点必须按管线声明的 filler_node 门控"
+        );
+        let t = "我们明天去公园，我们明天去公园。".to_string();
+        assert_eq!(apply_filler_strip(t.clone(), false), t);
+        assert_eq!(apply_filler_strip(t, true), "我们明天去公园。");
+    }
+
+    /// ④ 管线隔离：在线 / 批处理两处调用声明 `AtFinal`；本地实时按是否用了去重后的精解文本声明。
+    #[test]
+    fn t441_pipeline_declarations() {
+        let prod = prod_src();
+        assert_eq!(
+            prod.matches(concat!("FinalFillerNode::AtFinal, // 441：", "在线路径"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            prod.matches(concat!("FinalFillerNode::AtFinal, // 441：", "批处理路径"))
+                .count(),
+            1
+        );
+        assert!(prod.contains(concat!("FinalFillerNode::", "DoneUpstream\n")));
+        assert!(prod.contains(concat!(
+            "let final_src_deduped = apply_authoritative",
+            "_filler_dedup("
+        )));
+        assert!(prod.contains(concat!(
+            "apply_authoritative_filler_dedup(&",
+            "authoritative)"
+        )));
+    }
+
+    /// ⑤ 精解段变短不影响流式尾巴：`committed_len` 是流式坐标 ⇒ 尾巴不多字不丢字。
+    #[test]
+    fn t441_dedup_shortening_keeps_streaming_tail() {
+        let streaming = "你们的知你们的知识不可能只在简单的仪式";
+        let committed_len = 9; // 精解已覆盖流式前 9 字
+        let acc = apply_authoritative_filler_dedup("你们的知，你们的知识");
+        assert_eq!(acc, "你们的知识");
+        assert_eq!(
+            reflow_preview(&acc, streaming, committed_len),
+            "你们的知识不可能只在简单的仪式"
+        );
+    }
+
+    /// 耗时：~1500 字长文本一次去重（300s 级录音的量级），结果写进交付记录。
+    #[test]
+    fn t441_long_text_cost() {
+        let unit = "今天天气很好，我们一起去公园散步，然后你们的知，你们的知识会增加。";
+        let text: String = unit.repeat(1500 / unit.chars().count() + 1);
+        let t0 = std::time::Instant::now();
+        let _ = apply_authoritative_filler_dedup(&text);
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("[T441] chars={} ms={:.3}", text.chars().count(), ms);
+        assert!(ms < 200.0, "1500 字去重耗时 {ms:.1}ms 过长");
+    }
+}
+
 // MACOS-P4-NEUTRAL-001: 原 #[cfg(target_os = "windows")] 去除——平台中立纯 Rust，run_pipeline_core 调用，对 Windows 为 no-op。
 fn should_try_llm_translate(llm_enabled: bool, connectivity_verified: bool) -> bool {
     llm_enabled && connectivity_verified

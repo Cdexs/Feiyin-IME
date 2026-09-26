@@ -270,11 +270,12 @@ pub fn is_effective_text(text: &str) -> bool {
 /// - 全程不做「看起来像」的猜测；只在两条规则明确命中时改动。
 pub fn strip_fillers_conservative(text: &str) -> String {
     let a = strip_leading_fillers(text);
-    // 规则 B 可能折叠出新的可折叠串（4 连叠 → 2 连叠）；规则 C 折掉一份后可能又暴露新的相邻重复
-    // ⇒ 两条规则一起迭代到不动点，保证幂等。
-    let mut cur = collapse_long_repeats(&collapse_adjacent_repeats(&a));
+    // 规则 B 可能折叠出新的可折叠串（4 连叠 → 2 连叠）；规则 C 折掉一份后可能又暴露新的相邻重复；
+    // 规则 D（FILLER-RESTART-440）折掉一截重说后同理 ⇒ 三条规则一起迭代到不动点，保证幂等。
+    let pass = |s: &str| collapse_restarts(&collapse_long_repeats(&collapse_adjacent_repeats(s)));
+    let mut cur = pass(&a);
     loop {
-        let next = collapse_long_repeats(&collapse_adjacent_repeats(&cur));
+        let next = pass(&cur);
         if next == cur {
             break;
         }
@@ -719,6 +720,127 @@ fn collapse_long_repeats(text: &str) -> String {
             deleted[d] = true;
         }
         t += cnt * chosen;
+    }
+    let mut out = String::with_capacity(text.len());
+    for (idx, &c) in chars.iter().enumerate() {
+        if !deleted[idx] {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// 规则 D：两段之间允许的**唯一**分隔标点（逗号 / 顿号）。句末标点（。？！等）隔开的不算重说。
+fn is_restart_sep(c: char) -> bool {
+    matches!(c, '，' | '、' | ',')
+}
+
+/// 规则 D：汉字数字字符（前段全由它们组成 ⇒ 不折，防「三百，三百五十」这类列举被误删；
+/// REFLOW-FILLER-ONCE-441 起本地实时去重在 ITN 之前执行，看到的是汉字数字）。
+fn is_cn_numeral_char(c: char) -> bool {
+    matches!(
+        c,
+        '零' | '〇'
+            | '一'
+            | '二'
+            | '两'
+            | '三'
+            | '四'
+            | '五'
+            | '六'
+            | '七'
+            | '八'
+            | '九'
+            | '十'
+            | '百'
+            | '千'
+            | '万'
+            | '亿'
+            | '点'
+            | '半'
+    )
+}
+
+/// 规则 D：前段是否可作为「说一半重说」被删（长度门 + 排除项）。
+///
+/// - 含中 / 日 / 韩字 ⇒ ≥3 个字；否则（英文等）⇒ ≥2 个词；
+/// - 排除：无字母（纯数字 / 符号）；周期串（「哈哈哈」）；全为汉字数字。
+fn rule_d_prefix_foldable(units: &[String]) -> bool {
+    if units.is_empty() || !rule_c_has_letters(units) || rule_c_units_periodic(units) {
+        return false;
+    }
+    if units.iter().all(|t| t.chars().all(is_cn_numeral_char)) {
+        return false;
+    }
+    let cjk_units = units
+        .iter()
+        .filter(|t| t.chars().any(|c| is_cjk_char(c) || is_hangul_char(c)))
+        .count();
+    if cjk_units > 0 {
+        units.iter().map(|t| t.chars().count()).sum::<usize>() >= 3
+    } else {
+        units.len() >= 2
+    }
+}
+
+/// 规则 D（FILLER-RESTART-440，Gavin 2026-09-26）：折叠「说一半重说」。
+///
+/// 把文本按标点（规则 C 分隔中除空白外的字符）切段；相邻两段之间**只隔一个逗号 / 顿号**（其后可带空白），
+/// 且前段内容单元是后段的**严格前缀**（后段更长），前段过 [`rule_d_prefix_foldable`] ⇒ 删掉前段及其后分隔。
+/// 例：`你们的知，你们的知识不可能…` → `你们的知识不可能…`；`I think, I think we should go` →
+/// `I think we should go`；`春天，春天来了`（前段 2 字）/ `你们的知。你们的知识`（句号隔开）不动。
+/// 前后两段完全相同的不归本规则（那是规则 C 的事，且有 ≥6 字门）。
+fn collapse_restarts(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let is_punct_sep = |c: char| is_long_repeat_sep(c) && !c.is_whitespace();
+    // 段 = 两个标点分隔之间的内容，去掉首尾空白：(内容起, 内容止[开], 其后第一个分隔的下标)
+    let mut segs: Vec<(usize, usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        let start = i;
+        while i < n && !is_punct_sep(chars[i]) {
+            i += 1;
+        }
+        let (mut a, mut b) = (start, i);
+        while a < b && chars[a].is_whitespace() {
+            a += 1;
+        }
+        while b > a && chars[b - 1].is_whitespace() {
+            b -= 1;
+        }
+        segs.push((a, b, i));
+        i += 1; // 跳过分隔
+    }
+    let units_of = |a: usize, b: usize| -> Vec<String> {
+        rule_c_units(&chars[a..b])
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect()
+    };
+    let mut deleted = vec![false; n];
+    for k in 0..segs.len().saturating_sub(1) {
+        let (a0, b0, sep_at) = segs[k];
+        let (a1, b1, _) = segs[k + 1];
+        if a0 >= b0 || a1 >= b1 || sep_at >= n || !is_restart_sep(chars[sep_at]) {
+            continue;
+        }
+        // 两段之间只许「一个逗号/顿号 + 空白」：前段内容止 → 分隔，全为空白；分隔 → 后段起，全为空白。
+        if !chars[b0..sep_at].iter().all(|c| c.is_whitespace())
+            || !chars[sep_at + 1..a1].iter().all(|c| c.is_whitespace())
+        {
+            continue;
+        }
+        let prev = units_of(a0, b0);
+        let next = units_of(a1, b1);
+        if next.len() > prev.len()
+            && next[..prev.len()] == prev[..]
+            && rule_d_prefix_foldable(&prev)
+        {
+            for d in &mut deleted[a0..a1] {
+                *d = true;
+            }
+        }
     }
     let mut out = String::with_capacity(text.len());
     for (idx, &c) in chars.iter().enumerate() {
@@ -1659,6 +1781,81 @@ mod tests {
     #[test]
     fn rule_c_idempotent() {
         let t = "我们明天去公园，我们明天去公园，我们明天去公园。";
+        let once = strip_fillers_conservative(t);
+        assert_eq!(strip_fillers_conservative(&once), once);
+    }
+
+    // ============================================================
+    // 规则 D（FILLER-RESTART-440）：折叠「说一半重说」
+    // ============================================================
+
+    #[test]
+    fn rule_d_folds_half_word_restart() {
+        assert_eq!(
+            strip_fillers_conservative("你们的知，你们的知识不可能只在简单的仪式就变得完整"),
+            "你们的知识不可能只在简单的仪式就变得完整"
+        );
+    }
+
+    #[test]
+    fn rule_d_folds_phrase_restart() {
+        assert_eq!(
+            strip_fillers_conservative("我觉得，我觉得这个方案可以"),
+            "我觉得这个方案可以"
+        );
+        assert_eq!(
+            strip_fillers_conservative("I think, I think we should go"),
+            "I think we should go"
+        );
+    }
+
+    #[test]
+    fn rule_d_keeps_below_length_gate() {
+        // 注：`I, I think` 由规则 B（英文白名单叠词，可隔逗号）折成 `I think`，属既有行为，不在本条验证。
+        for t in ["春天，春天来了", "看看，看看这个", "cat, cat food"] {
+            assert_eq!(strip_fillers_conservative(t), t, "{t}");
+        }
+    }
+
+    #[test]
+    fn rule_d_keeps_sentence_final_separator() {
+        let t = "你们的知。你们的知识";
+        assert_eq!(strip_fillers_conservative(t), t);
+    }
+
+    #[test]
+    fn rule_d_keeps_numbers() {
+        for t in ["123，1234", "三百，三百五十", "一二三，一二三四"] {
+            assert_eq!(strip_fillers_conservative(t), t, "{t}");
+        }
+    }
+
+    #[test]
+    fn rule_d_keeps_non_prefix_and_equal() {
+        // 后段不以前段开头 / 前后完全相同（<6 字，不归规则 C）⇒ 不动。
+        for t in ["你们的爱，他们的爱人", "你们的知，你们的知"] {
+            assert_eq!(strip_fillers_conservative(t), t, "{t}");
+        }
+    }
+
+    #[test]
+    fn rule_d_multi_restart_reaches_fixpoint() {
+        assert_eq!(
+            strip_fillers_conservative("你们的知，你们的知，你们的知识"),
+            "你们的知识"
+        );
+    }
+
+    #[test]
+    fn rule_d_gavin_full_text_only_removes_restart() {
+        let before = "轮回的目的是要学习更多，不断学更多东西，因为你不可能再一次简单的人事，就把一切通通学会。重生的主要目的，并不是为了改正，而是去增加学习和体验，你们的知，你们的知识不可能只在简单的仪式就变得完整。你必须活过许多人事，才能完全明了你给自己指定的课题";
+        let after = before.replacen("你们的知，", "", 1);
+        assert_eq!(strip_fillers_conservative(before), after);
+    }
+
+    #[test]
+    fn rule_d_idempotent() {
+        let t = "你们的知，你们的知，你们的知识。我觉得，我觉得可以";
         let once = strip_fillers_conservative(t);
         assert_eq!(strip_fillers_conservative(&once), once);
     }

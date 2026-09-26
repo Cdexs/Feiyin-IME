@@ -89,4 +89,10 @@
 - **测试**：`edit_stuck_439_tests` **4/4**（:15030 守卫先于置位/show、:15075 门先于两发送且 282 顺序不变、:15121 E 语义 cancel→Hide 无 Submit、:15180 恰一处 ESC 轮询置 cancel + `is_recording` 守卫 + Idle；`prod_lines_excluding_cfg_test` + `concat!` 拆字面量防自匹配）。过滤全绿：`439` **4P**、`382` **18P**、`038` **2P**、`edit` **28P**、`suppress` **5P**（既有 `early_preview_then_processing_before_acc_join`、`suppress_flag_only_set_inside_processing_arm` 均不受影响）；`fmt --check` EXIT 0；`check --all-targets` 0 error、warnings **91/87 = 基线**。
 - **文档**：result.md（A–E 走读 + 12 项自证表）、**本条（438 漏写教训，本单已写）**、`docs/MACOS-HANDOFF.md` 439 小节（macOS 无编辑态 ⇒ 无同类 bug；worker 门在平台中立 `spawn_worker_thread` :8295（Windows :10342 / macOS :10607 共用）⇒ 零同步）、`CHANGELOG.md` 表首行、`logs/20260926.md`。
 
+## 2026-09-26 — 主控 — 440 + 441 接手开发 + BUILD-441 出包（Worker 套餐超限）
 
+- **接手原因**：coder-1 / coder-2 / tester-1 套餐超限停止，Gavin「你直接接手他们的工作吧」「把代码开发完、补充测试用例做测试、然后出包、对齐文档」。
+- **接手时进度**：440 未开工（text_normalizer.rs 零改动）；441 半成品（回灌处调用 + 纯函数 + 临时 scratch 测试，最终节点与管线声明未做）。
+- **440**：规则 D `collapse_restarts` + `rule_d_*` 9 条。**441**：最终 `final_src` 同源去重、`FinalFillerNode` 显式声明（本地实时 DoneUpstream / 退回 2pass 与在线批处理 AtFinal）、删 scratch、`reflow_filler_once_441_tests` 6 条。
+- **测试**：全量 2039P/0F/69I；消融两处均红并逐字节还原。**出包**：Step2 跳过（ui 无改动），主程序 `c8fc64a1…`，九项要点全过，冒烟正常。
+- **待 Gavin 端测**：①录音中点浮层进编辑→改→提交上屏 ②录音中 Esc / 停止按钮直接收起不闪 ③「你们的知，你们的知识」预览与上屏都去掉前段。
