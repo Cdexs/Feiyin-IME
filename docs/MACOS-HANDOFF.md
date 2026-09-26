@@ -2481,3 +2481,24 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | **macOS 侧需要做什么** | | ① 依赖同步（vendored/镜像或 `cargo fetch`）；② 无 `cfg` 分支、无新开关/env；③ 出包体积预计增加约 1~2 MB（数据表） |
 
 > 注：任务书要求「macOS 同样可编（平台中立）」⇒ ✅；本单未跑 macOS 交叉编译（Windows 端 verification）。
+
+## SEAM-INTERIOR-ONLY-436（2026-09-26，coder-1）· 窗口重叠「锚点拼接」阶段二 + 选型实验 —— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `src/transcription/local_stream.rs`：新增纯函数 `interior_split_frac(overlap: &[f32]) -> f32`（重叠区音频中间 40%~60% 内最近真停顿，434 口径；找不到 ⇒ 0.5；**只加函数、未动旧代码**） | 无此函数 → 仅新增 | ✅ 平台中立纯计算，macOS 直接复用 |
+| `src/main.rs`：新增 `window_overlap_split` 纯函数 + `window_split_fracs: Vec<Option<f32>>`（与 `window_spans` 并行记账，两个 `dispatch_*` 宏内 push span 之前算）+ 收割侧 `[DBG-436] split` Debug 日志（`log_enabled!` 守卫，DEC-077） | 无分界比例 → 每窗多一个 `Option<f32>` 分界（日志/传参，不改音频与文本） | ✅ 平台中立；`main.rs` 该区为共享逻辑，macOS 走同一收割路径自动继承 |
+| `src/transcription/mod.rs`：`semiglobal_dp` 改 wrapper、新 `semiglobal_dp_path` **纯加法**返回对角线路径（现有 3 处调用语义不变）；`InteriorAttempt` + `interior_stitch`（锚点 ±3 内写法一致字、曼哈顿最小/打平取小 i）；`push_window_streaming` **新增末参 `split_frac: Option<f32>`**；pending 元组 +1 字段；`else` 分支内现行 433 裁判链**原样保留兜底**；seam 日志行尾追加 `interior=…` | 对齐成功后重叠区由「固定按 433 裁判取舍」→ 在**两分支**（`resolve_overlap` 有 `committed_prefix` / `estimate_overlap` 成功）先试锚点拼接，**未命中逐字节走原 433**；`push`/`push_window` 恒传 `None` ⇒ 其余管线零变化 | ✅ 平台中立纯文本逻辑（无 `cfg`、无新增依赖、无新增文件、无 env/开关） |
+| **macOS 侧需要做什么** | | ① 调用 `push_window_streaming` 的代码**必须补第 7 个参数**（不传 `Option<f32>` 会编译不过；语义上 `None` = 关闭锚点拼接 = 本单之前的行为）。② 若 macOS 侧自己实现组窗分界，可复用 `local_stream::interior_split_frac`；不实现则传 `None` 即可。③ 无依赖/构建/产物变化 |
+
+> 结论：**已评估，对 macOS 无平台特化要求，仅上述「补一个 `Option<f32>` 形参」的编译期同步**。本单**选型结论 = 建议 B（保持 433、436 不默认启用）**，若 Gavin 采纳 B，`split_frac` 生产调用方仍会传值但 interior 未命中即回落 433（详见 `collab/outbox/coder-1/result.md`）。本单未跑 macOS 交叉编译（Windows 端 verification）。
+
+## SLICE-CUT-REAL-PAUSE-437（2026-09-26，coder-2）· 强制切片优先落真停顿（R1）—— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `src/transcription/vad.rs` `plan_gap_cuts` 新增两级真停顿查找：R1-1 `[起点+8s, 起点+10s]` 从 10s **往前**取最靠近 10s 的 ≥120ms 真停顿中点（`kind=pause_in`）→ R1-2 `[起点+10s, min(+12s, end-1s)]` 最早真停顿（`kind=pause_out`）→ 都无 ⇒ 原 `find_gap_cut` **逐位不变**（`kind=gap\|lowest`） | 仅在 [10,12]s 找单帧字缝/最低 RMS ⇒ 内侧窗有真停顿时切点提前（实测 20 刀中 `pause_in` 15 / `pause_out` 1 / 兜底 4，平均提前 1.369s、最长 2.650s） | ✅ 平台中立纯音频计算：判据复用 434 已有的 `real_pause_cut_candidates`，新增常量 `SLICE_CUT_MIN_PAUSE_MS=120`、`SLICE_CUT_INNER_BACK_SECS=2.0`（与 `local_stream.rs` 私有 `TAIL_CUT_MIN_PAUSE_MS` 同值，改一处须同步另一处）；无 `cfg`、无新增依赖、无新增文件 |
+| 非末片长契约由 `[10s,12s]` 改为 **`[8s,12s]`**（末片仍 <11s、尾巴保护与严格相接不变）；每切点一条 Debug 日志 `[DBG-437] slice cut: at=… kind=pause_in\|pause_out\|gap\|lowest pause_ms=…` | 切片规划输出同为严格相接的 `(start,end)` 列表，仅切点位置更靠前 | ✅ 平台中立；调用方（`plan_sliding_cuts` 本地实时滑窗路 B）签名与语义不变 |
+| **macOS 侧需要做什么** | | ① **无同步改动**：`plan_gap_cuts` 是纯函数，macOS 编译同一份 `vad.rs` 源码自动继承；② `vad.rs` 内 `fix437_*`/`ts381_*` 单测随 `cargo test` 同跑，无需额外配置；③ 若 macOS 侧另写切片下界常量，须保持 8s/10s/12s 与 `SLICE_CUT_MIN_PAUSE_MS` 同值 |
+
+> 结论：**已评估，平台中立（纯音频计算，无 `cfg`/依赖/文件/开关变化），macOS 无需任何编译期或运行期同步**。本单统计与实现证据见 `collab/evidence/437/stats.md`、`collab/outbox/coder-2/result.md`；未跑 macOS 交叉编译（Windows 端 verification）。

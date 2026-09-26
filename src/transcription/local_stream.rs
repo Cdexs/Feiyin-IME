@@ -228,6 +228,43 @@ fn log_tail_cut(cut: usize, frame: usize, frames: usize, back: usize, len: usize
     }
 }
 
+/// SEAM-INTERIOR-ONLY-436：重叠区音频的**内部分界比例** —— 中间 40%~60% 范围内、
+/// 离中点最近的真停顿中点（相对 `overlap` 起点）；找不到真停顿 ⇒ 中点。
+/// 复用 434 口径（`GAP_FRAME_SAMPLES` 帧、连续 ≥ `TAIL_CUT_MIN_PAUSE_MS`(120ms)，
+/// 同 `real_pause_cut_candidates` 中位数口径）。返回比例 ∈ (0,1)；
+/// `overlap.len() <= 1` ⇒ 0.5。纯函数（供 main.rs 派发时计算）。
+pub(crate) fn interior_split_frac(overlap: &[f32]) -> f32 {
+    const LO_FRAC: f32 = 0.4;
+    const HI_FRAC: f32 = 0.6;
+    let n = overlap.len();
+    if n <= 1 {
+        return 0.5;
+    }
+    let frame = super::vad::GAP_FRAME_SAMPLES;
+    let min_frames = ((TAIL_CUT_MIN_PAUSE_MS as usize * 16 + frame - 1) / frame).max(1);
+    let mid = n / 2;
+    let lo = (n as f32 * LO_FRAC) as usize;
+    let hi = ((n as f32 * HI_FRAC) as usize).max(lo + 1).min(n);
+    if hi <= lo {
+        return 0.5;
+    }
+    let cands = super::vad::real_pause_cut_candidates(overlap, lo, hi, frame, min_frames);
+    // 离中点最近；打平取较小（靠前，确定性）。
+    let mut best: Option<usize> = None;
+    for &(c, _) in &cands {
+        let d = c.abs_diff(mid);
+        match best {
+            None => best = Some(c),
+            Some(b) if d < b.abs_diff(mid) => best = Some(c),
+            _ => {}
+        }
+    }
+    match best {
+        Some(c) => (c as f32 / n as f32).clamp(f32::EPSILON, 1.0 - f32::EPSILON),
+        None => mid as f32 / n as f32,
+    }
+}
+
 /// LOCALRT-SEAM-337：定界硬上限（兜底，防无限等）。
 /// 依据：`seam337_lookahead_probe` 25 点实测最大 `last_grow_after_P = 1840ms` + 余量。
 const ACC_BOUNDARY_CAP_MS: f32 = 2000.0;

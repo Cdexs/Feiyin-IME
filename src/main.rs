@@ -8954,6 +8954,9 @@ fn spawn_worker_thread(
                                         let mut window_streaming_texts: Vec<String> = Vec::new();
                                         // FIX-TAIL-GUARD-410：`window_seq -> 末尾窗 pending 回灌元数据`（非末尾窗 None）。
                                         let mut window_tail_pending: Vec<Option<TailPending>> = Vec::new();
+                                        // SEAM-INTERIOR-ONLY-436：`window_seq -> 本窗与上一窗重叠区的内部分界比例`
+                                        // （相对重叠区起点；无共享 ⇒ None）。mod.rs 接线待第二阶段，本阶段仅计算 + 日志。
+                                        let mut window_split_fracs: Vec<Option<f32>> = Vec::new();
                                         // 386（C）：与 `recent_slices` 一一对应的各片流式文本（同批 sub_seg 共享）。
                                         let mut recent_streaming: Vec<String> = Vec::new();
                                         // VAD-393（A3）：与 `recent_slices` 一一对应的各片**片内语音区间**
@@ -9241,9 +9244,20 @@ fn spawn_worker_thread(
                                                         .get(seq)
                                                         .cloned()
                                                         .unwrap_or_default();
+                                                    // SEAM-INTERIOR-ONLY-436：本窗重叠区分界（mod.rs 接线待第二阶段，
+                                                    // 本阶段仅计算 + 日志，供后续核对分界位置）。
+                                                    let win_split =
+                                                        window_split_fracs.get(seq).copied().flatten();
+                                                    if log::log_enabled!(log::Level::Debug) {
+                                                        log::debug!(
+                                                            "[DBG-436] split: seq={} split_frac={:?}",
+                                                            seq,
+                                                            win_split
+                                                        );
+                                                    }
                                                     for authoritative in ordered.push_window_streaming(
                                                         seq, win_ws, win_we, win_samples, text,
-                                                        win_stream,
+                                                        win_stream, win_split,
                                                     ) {
                                                         // 382（3A）：边界未到时的 fallback = 派发当刻浮层字符数。
                                                         let fallback_committed = window_committed_lens
@@ -9456,6 +9470,14 @@ fn spawn_worker_thread(
                                                         [..window_samples_vec.len().saturating_sub(1)]
                                                         .iter()
                                                         .sum();
+                                                    // SEAM-INTERIOR-ONLY-436：重叠区分界（`window_audio` move 进
+                                                    // task 前先算；上一窗 we 取自已派发窗）。
+                                                    let win_split_frac = window_overlap_split(
+                                                        span_start,
+                                                        window_spans.last().map(|&(_, e)| e),
+                                                        &window_audio,
+                                                        &window_samples_vec,
+                                                    );
                                                     let _ = task_tx.send((
                                                         window_seq,
                                                         $idx,
@@ -9468,6 +9490,7 @@ fn spawn_worker_thread(
                                                     ));
                                                     // 413：窗实际只含 `[must_start-1, ge)`（无前文时 = `[gs,ge)`）
                                                     // ⇒ 对齐 span 同步收窄，`window_samples.len() == ge - span_start`。
+                                                    window_split_fracs.push(win_split_frac);
                                                     window_spans.push((span_start, ge));
                                                     window_samples.push(window_samples_vec);
                                                     window_streaming_texts.push(window_streaming);
@@ -9509,6 +9532,14 @@ fn spawn_worker_thread(
                                                     // 408B：末尾窗新片 = pending（末段）；前缀部分样本数 = samples[0]。
                                                     let new_slice_from =
                                                         if samples.len() >= 2 { samples[0] } else { 0 };
+                                                    // SEAM-INTERIOR-ONLY-436：重叠区分界（`audio` move 进
+                                                    // task 前先算；上一窗 we 取自已派发窗）。
+                                                    let win_split_frac = window_overlap_split(
+                                                        gs,
+                                                        window_spans.last().map(|&(_, e)| e),
+                                                        &audio,
+                                                        &samples,
+                                                    );
                                                     let _ = task_tx.send((
                                                         window_seq,
                                                         last_dispatch_idx,
@@ -9519,6 +9550,7 @@ fn spawn_worker_thread(
                                                         streaming_nonempty,
                                                         new_slice_from,
                                                     ));
+                                                    window_split_fracs.push(win_split_frac);
                                                     window_spans.push((gs, ge));
                                                     window_samples.push(samples);
                                                     window_streaming_texts.push(streaming);
@@ -13260,6 +13292,33 @@ struct ContextSuffix {
     gap_found: bool,
     /// 406 比对基准 = 前片流式末尾相应字数 + must 流式。
     baseline: String,
+}
+
+/// SEAM-INTERIOR-ONLY-436：本窗与上一窗重叠区的内部分界比例（相对重叠区起点，∈(0,1)）。
+///
+/// 重叠区音频 = 本窗音频开头的共享切片部分（`samples[..shared]`，`shared = prev_we − span_start`）。
+/// 分界点算法见 [`transcription::local_stream::interior_split_frac`]（中间 40%~60% 最近真停顿，
+/// 无 ⇒ 中点）。无共享（首窗 / `span_start >= prev_we` / 空音频）⇒ None。
+/// 纯函数（`prev_span_end` 由调用方取上一窗 `we`）。mod.rs 接线待 436 第二阶段。
+fn window_overlap_split(
+    span_start: usize,
+    prev_span_end: Option<usize>,
+    audio: &[f32],
+    samples: &[usize],
+) -> Option<f32> {
+    let pe = prev_span_end?;
+    let shared = pe.saturating_sub(span_start).min(samples.len());
+    if shared == 0 {
+        return None;
+    }
+    let overlap: usize = samples[..shared].iter().sum();
+    let overlap = overlap.min(audio.len());
+    if overlap == 0 {
+        return None;
+    }
+    Some(transcription::local_stream::interior_split_frac(
+        &audio[..overlap],
+    ))
 }
 
 /// LOCALRT-SHORT-CONTEXT-413：从**紧邻前一片**取「后缀」作为本窗前文（407 / 413 共用，
@@ -22244,5 +22303,103 @@ mod testsync430_tests {
             prod.contains(concat!("const PREVIEW_WIDTH_SCALE: f32", " = 1.7;")),
             "宽度放大倍数须为 1.7"
         );
+    }
+}
+
+// =====================================================================
+// SEAM-INTERIOR-ONLY-436：重叠区分界（派发侧）纯函数护栏。
+// mod.rs 接线待第二阶段；本阶段只验证分界计算（中间 40%~60% 最近真停顿 / 中点）。
+// =====================================================================
+#[cfg(test)]
+mod interior436_tests {
+    use super::window_overlap_split;
+
+    const RATE: usize = 16000;
+
+    /// 定点合成：全片直流有声（0.5），`[s,e)` 置 0（静音）。
+    fn synth(len: usize, sil: &[(usize, usize)]) -> Vec<f32> {
+        let mut a = vec![0.5f32; len];
+        for &(s, e) in sil {
+            for x in a.iter_mut().take(e).skip(s) {
+                *x = 0.0;
+            }
+        }
+        a
+    }
+
+    /// 无上一窗 / 无共享 / 空音频 ⇒ None。
+    #[test]
+    fn interior436_no_overlap_is_none() {
+        let audio = synth(16000, &[]);
+        assert_eq!(window_overlap_split(0, None, &audio, &[16000]), None);
+        assert_eq!(
+            window_overlap_split(5, Some(5), &audio, &[16000]),
+            None,
+            "span 起点 == 上一窗末 ⇒ 无共享"
+        );
+        assert_eq!(
+            window_overlap_split(6, Some(5), &audio, &[16000]),
+            None,
+            "span 起点在上一窗末之后 ⇒ 无共享"
+        );
+        assert_eq!(
+            window_overlap_split(0, Some(1), &audio, &[]),
+            None,
+            "无样本表 ⇒ 无共享"
+        );
+        assert_eq!(
+            window_overlap_split(0, Some(1), &audio, &[0]),
+            None,
+            "共享 0 样本 ⇒ None"
+        );
+        assert_eq!(
+            window_overlap_split(0, Some(1), &[], &[100]),
+            None,
+            "空音频 ⇒ None"
+        );
+    }
+
+    /// 全静音短重叠（候选不足 6 帧）⇒ 中点 0.5。
+    #[test]
+    fn interior436_all_silence_is_midpoint() {
+        let audio = vec![0.0f32; 1000];
+        assert_eq!(window_overlap_split(0, Some(1), &audio, &[1000]), Some(0.5));
+    }
+
+    /// 静音段中心在 40% / 50% / 60% ⇒ 分界跟踪该比例（严格 ∈(0,1)）。
+    /// 静音宽 0.1n（50 帧，边缘各损 ~1 帧 ⇒ 检测中点偏移 ≤0.03n）。
+    #[test]
+    fn interior436_split_tracks_pause() {
+        let n = 10 * RATE;
+        for (lo_f, want) in [(0.35f32, 0.4f32), (0.45, 0.5), (0.55, 0.6)] {
+            let s = (n as f32 * lo_f) as usize;
+            let e = (n as f32 * (lo_f + 0.1)) as usize;
+            let a = synth(n, &[(s, e)]);
+            let got = window_overlap_split(0, Some(1), &a, &[n]).expect("有共享必有分界");
+            assert!(got > 0.0 && got < 1.0, "分界须严格 ∈(0,1)，实测 {got}");
+            assert!(
+                (got - want).abs() < 0.03,
+                "静音中心 {want} ⇒ 分界≈{want}，实测 {got}"
+            );
+        }
+    }
+
+    /// 共享切片数决定重叠长度（只取前 shared 片样本）。
+    #[test]
+    fn interior436_shared_slices_bound_overlap() {
+        // 两片各 8000 样本、第二片全静音：只共享第一片（全有声）⇒ 无候选 ⇒ 中点。
+        let mut a = vec![0.5f32; 16000];
+        for x in a.iter_mut().take(16000).skip(8000) {
+            *x = 0.0;
+        }
+        let one = window_overlap_split(0, Some(1), &a, &[8000, 8000]).expect("有共享");
+        assert!(
+            (one - 0.5).abs() < 1e-6,
+            "只共享有声首片 ⇒ 中点，实测 {one}"
+        );
+        // 共享两片 ⇒ 重叠含静音（静音恰在 50% 处）⇒ 分界≈0.5 附近且 ∈(0,1)。
+        // （静音 [8000,16000) 占重叠后半；中点 8000 附近若无候选则回落中点 0.5。）
+        let two = window_overlap_split(0, Some(2), &a, &[8000, 8000]).expect("有共享");
+        assert!(two > 0.0 && two < 1.0, "实测 {two}");
     }
 }
