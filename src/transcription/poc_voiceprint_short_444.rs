@@ -221,3 +221,250 @@ fn poc_voiceprint_short_444() {
     println!("{md}");
     println!("[444] 写入 {}", out.display());
 }
+
+/// POC-444b：**碎片拼接**再判（Gavin 2026-09-27「太短的碎片可以拼起来走声纹识别吗？」）。
+///
+/// 每段录音取 VAD 段中 <1.0s 的碎片，按时间顺序在 10s 跨度内贪心拼接到 ≥1.0s，拼接音频整体取分；
+/// 逐碎片标注（识别文字对原文二字组重合）⇒ 看「本人碎片组 / 他人碎片组 / 混合组」得分能否分开。
+#[test]
+#[ignore = "POC-444b：需真模型 + evidence 录音；--ignored 运行"]
+fn poc_fragment_concat_444b() {
+    let models = root().join("models");
+    let verifier = SpeakerVerifier::load(&models).expect("CAM++ 声纹模型须在位");
+    let vp = Voiceprint::load(&root().join("target/release/voiceprint.bin"));
+    let vad = VadSegmenter::try_new_for_local_trim(&models).expect("VAD 须在位");
+    let acc = create_qwen3_recognizer(&models).expect("1.7B 须在位");
+    const LANGS: &[&str] = &["zh", "en", "ko", "ja", "und"];
+    let score = |s: &[f32]| -> Option<f32> {
+        let e = verifier.embed(s)?;
+        LANGS
+            .iter()
+            .filter_map(|l| vp.ready_centroid(l).map(|c| cosine(c, &e)))
+            .fold(None, |b: Option<f32>, x| Some(b.map_or(x, |b| b.max(x))))
+    };
+    let decode = |s: &[f32]| -> String {
+        let cap = max_new_tokens_for(s.len() as f32 / RATE as f32);
+        decode_accuracy_allow_empty(&acc, s, None, ChineseScript::Simplified, Some(cap))
+            .map(|(t, _)| t)
+            .unwrap_or_default()
+    };
+    let mut sessions: Vec<(&str, &str)> = SESSIONS.to_vec();
+    sessions.push((
+        "session-20260927-001101.wav",
+        "周末天气好的话，一起出来玩吧。可以一起出来吃饭。也可以出去旅游啊，出去看看",
+    ));
+    let dir = root().join("collab/evidence/444");
+    let mut md = String::from("# POC-444b · 碎片拼接再判\n\n");
+    md.push_str("| 录音 | 组起点 s | 碎片数 | 拼接语音 s | 组得分 | 各碎片（起点/时长/单独得分/标注/文字） |\n| --- | ---: | ---: | ---: | ---: | --- |\n");
+    let mut groups: Vec<(Vec<&'static str>, f32)> = Vec::new();
+    for (file, ref_text) in &sessions {
+        let Some(w) = sherpa_onnx::Wave::read(dir.join(file).to_str().unwrap()) else {
+            continue;
+        };
+        let audio = w.samples().to_vec();
+        let ref_set: HashSet<(char, char)> = bigrams(&cjk(ref_text)).into_iter().collect();
+        let frags: Vec<(usize, usize)> = vad
+            .speech_ranges(&audio)
+            .into_iter()
+            .filter(|&(s, e)| {
+                let d = (e - s) as f32 / RATE as f32;
+                (0.2..1.0).contains(&d)
+            })
+            .collect();
+        let mut i = 0usize;
+        while i < frags.len() {
+            let start = frags[i].0;
+            let mut members = vec![frags[i]];
+            let mut total = frags[i].1 - frags[i].0;
+            let mut j = i + 1;
+            while total < RATE && j < frags.len() && frags[j].1 - start <= 10 * RATE {
+                members.push(frags[j]);
+                total += frags[j].1 - frags[j].0;
+                j += 1;
+            }
+            i = j;
+            if total < RATE {
+                continue; // 凑不够 1.0s 的尾巴不判
+            }
+            let mut cat: Vec<f32> = Vec::with_capacity(total);
+            let mut desc = String::new();
+            let mut labs: Vec<&'static str> = Vec::new();
+            for &(s, e) in &members {
+                cat.extend_from_slice(&audio[s..e]);
+                let t = decode(&audio[s..e]);
+                let lab = label(overlap(&t, &ref_set));
+                labs.push(lab);
+                let _ = write!(
+                    desc,
+                    "{:.2}/{:.2}/{}/{}/{} ; ",
+                    s as f32 / RATE as f32,
+                    (e - s) as f32 / RATE as f32,
+                    score(&audio[s..e])
+                        .map(|v| format!("{v:.3}"))
+                        .unwrap_or("-".into()),
+                    lab,
+                    t.replace('|', "/")
+                );
+            }
+            let g = score(&cat).unwrap_or(f32::NAN);
+            groups.push((labs, g));
+            let _ = writeln!(
+                md,
+                "| {} | {:.2} | {} | {:.2} | {:.3} | {} |",
+                &file[8..23],
+                start as f32 / RATE as f32,
+                members.len(),
+                total as f32 / RATE as f32,
+                g,
+                desc
+            );
+        }
+    }
+    let out = dir.join("fragments.md");
+    std::fs::write(&out, &md).expect("写 fragments.md");
+    println!("{md}");
+}
+
+/// POC-447：按 00:11 录音（session-20260927-001101）日志里 6 次派发的位置切窗（各带前 2s 上文），
+/// 用**生产同一批函数**（`merge_speech_units` → 单元 `judge_voiceprint` → `group_fragments` 碎片拼组再判）
+/// 逐窗给出保留 / 剔除区间，并用 1.7B 分别识别保留与剔除部分的文字，核对：
+/// 窗 #4 / #5 的旁人碎片被剔除、Gavin 前面的话不被误删。
+#[test]
+#[ignore = "POC-447：需真模型 + evidence 录音；--ignored 运行"]
+fn poc_window_filter_447() {
+    use super::speaker::{
+        group_fragments, judge_voiceprint, merge_speech_units, SegVerdict,
+        FRAGMENT_GROUP_SPAN_SECS, MIN_JUDGE_SECS,
+    };
+    let models = root().join("models");
+    let verifier = SpeakerVerifier::load(&models).expect("CAM++ 声纹模型须在位");
+    let vp = Voiceprint::load(&root().join("target/release/voiceprint.bin"));
+    let vad = VadSegmenter::try_new_for_local_trim(&models).expect("VAD 须在位");
+    let acc = create_qwen3_recognizer(&models).expect("1.7B 须在位");
+    let decode = |s: &[f32]| -> String {
+        if s.len() < RATE / 5 {
+            return String::new();
+        }
+        let cap = max_new_tokens_for(s.len() as f32 / RATE as f32);
+        decode_accuracy_allow_empty(&acc, s, None, ChineseScript::Simplified, Some(cap))
+            .map(|(t, _)| t)
+            .unwrap_or_default()
+    };
+    let w = sherpa_onnx::Wave::read(
+        root()
+            .join("collab/evidence/444/session-20260927-001101.wav")
+            .to_str()
+            .unwrap(),
+    )
+    .expect("录音须在 evidence/444");
+    let audio = w.samples().to_vec();
+    // (派发 pcm 位置, 派发音频秒数) —— 来自 16:11 debug.log `[LocalRT-DBG-298] seg dispatch`。
+    let dispatches: &[(usize, f32)] = &[
+        (0, 6.00),
+        (95990, 2.30),
+        (132790, 5.12),
+        (214710, 5.73),
+        (306390, 3.20),
+        (357590, 4.29),
+    ];
+    let judge_samples = (MIN_JUDGE_SECS * RATE as f32) as usize;
+    let mut md = String::from("# POC-447 · 窗口级声纹过滤（含碎片拼组）离线复核\n\n");
+    for (k, &(pos, secs)) in dispatches.iter().enumerate() {
+        let ws = pos.saturating_sub(2 * RATE);
+        let we = (pos + (secs * RATE as f32) as usize).min(audio.len());
+        let win = &audio[ws..we];
+        let ranges = vad.speech_ranges(win);
+        let units = merge_speech_units(&ranges);
+        let mut verdicts: Vec<SegVerdict> = vec![SegVerdict::KeepShort; ranges.len()];
+        let mut spans: Vec<(std::ops::Range<usize>, SegVerdict)> = Vec::new();
+        let mut ri = 0usize;
+        let _ = writeln!(
+            md,
+            "## 窗 #{k}（{:.2}–{:.2}s）\n",
+            ws as f32 / RATE as f32,
+            we as f32 / RATE as f32
+        );
+        for u in &units {
+            let us = u.speech_samples as f32 / RATE as f32;
+            let v = if us < MIN_JUDGE_SECS {
+                SegVerdict::KeepShort
+            } else {
+                let mut buf = Vec::new();
+                for &(s, e) in &u.members {
+                    buf.extend_from_slice(&win[s..e]);
+                }
+                judge_voiceprint(&vp, verifier.embed(&buf).as_deref(), us)
+            };
+            let r0 = ri;
+            for _ in &u.members {
+                verdicts[ri] = v;
+                ri += 1;
+            }
+            spans.push((r0..ri, v));
+            let _ = writeln!(md, "- 单元 {:.2}s：{:?}", us, v);
+        }
+        let frags: Vec<(usize, usize, usize)> = spans
+            .iter()
+            .enumerate()
+            .filter(|(_, (r, v))| matches!(v, SegVerdict::KeepShort) && !r.is_empty())
+            .map(|(ui, (r, _))| {
+                let sp: usize = ranges[r.clone()].iter().map(|(s, e)| e - s).sum();
+                (ui, ranges[r.start].0, sp)
+            })
+            .collect();
+        for g in group_fragments(
+            &frags
+                .iter()
+                .map(|&(_, st, sp)| (st, sp))
+                .collect::<Vec<_>>(),
+            judge_samples,
+            FRAGMENT_GROUP_SPAN_SECS,
+        ) {
+            let mut buf = Vec::new();
+            for &fi in &g {
+                for &(s, e) in &ranges[spans[frags[fi].0].0.clone()] {
+                    buf.extend_from_slice(&win[s..e]);
+                }
+            }
+            let v = judge_voiceprint(
+                &vp,
+                verifier.embed(&buf).as_deref(),
+                buf.len() as f32 / RATE as f32,
+            );
+            let _ = writeln!(
+                md,
+                "- 碎片组 {} 段 {:.2}s：{:?}",
+                g.len(),
+                buf.len() as f32 / RATE as f32,
+                v
+            );
+            if matches!(v, SegVerdict::DropNonUser(_) | SegVerdict::KeepUser(_)) {
+                for &fi in &g {
+                    for rv in &mut verdicts[spans[frags[fi].0].0.clone()] {
+                        *rv = v;
+                    }
+                }
+            }
+        }
+        let mut kept = Vec::new();
+        let mut dropped = Vec::new();
+        for (i, &(s, e)) in ranges.iter().enumerate() {
+            if matches!(verdicts[i], SegVerdict::DropNonUser(_)) {
+                dropped.extend_from_slice(&win[s..e]);
+            } else {
+                kept.extend_from_slice(&win[s..e]);
+            }
+        }
+        let _ = writeln!(
+            md,
+            "- **保留** {:.2}s：{}\n- **剔除** {:.2}s：{}\n",
+            kept.len() as f32 / RATE as f32,
+            decode(&kept),
+            dropped.len() as f32 / RATE as f32,
+            decode(&dropped)
+        );
+    }
+    let out = root().join("collab/evidence/444/window447.md");
+    std::fs::write(&out, &md).expect("写 window447.md");
+    println!("{md}");
+}

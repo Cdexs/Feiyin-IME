@@ -2566,3 +2566,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 行为变化 | 本地实时：1.0~1.5s 语音单元也做声纹判定；精解失败 / 被拒退回流式兜底时，删去远场（旁放 / 远处人声）对应的字 |
 | 对 macOS 的影响 | 三文件平台中立；🔴 `transcribe_streaming_local` 回调签名变化——macOS 若有直接调用须补第 6 参（本端核对：全仓仅 `main.rs` 与测试各 1 处，均已改） |
 | 是否需要对方同步 | 仅当 macOS 分支另有 `transcribe_streaming_local` 调用点 |
+
+## VOICEPRINT-FRAGMENT-GROUP-447（2026-09-27，主控）
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | `speaker.rs` `filter_ranges_by_voiceprint`：单元判定后，判不了的碎片按时间序拼组（≥1.0s、10s 跨度）再判 |
+| 行为变化 | 本地实时：旁人短碎片也会在解码前剔除；本人碎片组照常保留 |
+| 对 macOS 的影响 | 平台中立，macOS 编译同一份；无签名 / 依赖变化（新增 `pub(crate)` 纯函数与常量） |
+| 是否需要对方同步 | 否 |

@@ -636,6 +636,40 @@ pub(crate) fn merge_speech_units(ranges: &[(usize, usize)]) -> Vec<SpeechUnit> {
     units
 }
 
+/// VOICEPRINT-FRAGMENT-GROUP-447：碎片拼组的最大时间跨度（组首碎片起点到组内碎片起点，秒）。
+pub(crate) const FRAGMENT_GROUP_SPAN_SECS: f32 = 10.0;
+
+/// VOICEPRINT-FRAGMENT-GROUP-447：把判不了的碎片分组（**纯函数**）。
+///
+/// `frags` = 按时间序的 `(起点样本, 语音样本数)`；从第一个未用碎片起，按序贪心并入后续碎片，
+/// 直到语音 ≥ `judge_samples` 或下一碎片起点超出 `span_secs` 跨度；**凑够才成组**（返回碎片下标）。
+/// 凑不够的尾巴不返回（调用方保持保留）。不要求相邻（412 只拼间隔 <0.8s 的邻段）。
+pub(crate) fn group_fragments(
+    frags: &[(usize, usize)],
+    judge_samples: usize,
+    span_secs: f32,
+) -> Vec<Vec<usize>> {
+    let span = (span_secs * SAMPLE_RATE as f32) as usize;
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < frags.len() {
+        let start = frags[i].0;
+        let mut group = vec![i];
+        let mut total = frags[i].1;
+        let mut j = i + 1;
+        while total < judge_samples && j < frags.len() && frags[j].0.saturating_sub(start) <= span {
+            group.push(j);
+            total += frags[j].1;
+            j += 1;
+        }
+        if total >= judge_samples {
+            out.push(group);
+        }
+        i = j;
+    }
+    out
+}
+
 /// 412：单元是否参与 offer —— 单元**起点**（`members[0].0`）≥ `new_slice_from`。
 /// 跨界（起点在前文、延伸进本窗新片）的单元**保守不 offer**（防把窗口前文重复计入注册/漂移）。
 fn unit_offer_allowed(unit: &SpeechUnit, new_slice_from: usize) -> bool {
@@ -705,6 +739,8 @@ pub(crate) fn filter_ranges_by_voiceprint(
         let mut range_verdicts: Vec<SegVerdict> = vec![SegVerdict::KeepShort; ranges.len()];
         let mut pending_offers: Vec<PendingOffer> = Vec::new();
         let mut ri = 0usize; // ranges 游标（unit 的成员按序对应 ranges）
+        // 447：每个单元对应的 ranges 下标区间 + 单元判定（供之后「碎片拼组再判」回填）。
+        let mut unit_spans: Vec<(std::ops::Range<usize>, SegVerdict)> = Vec::new();
         for unit in &units {
             let unit_secs = unit.speech_samples as f32 / SAMPLE_RATE as f32;
             let (verdict, emb) = if unit_secs < MIN_JUDGE_SECS {
@@ -732,12 +768,14 @@ pub(crate) fn filter_ranges_by_voiceprint(
                     verdict_score(verdict)
                 );
             }
+            let first_ri = ri;
             for _ in &unit.members {
                 if ri < range_verdicts.len() {
                     range_verdicts[ri] = verdict;
                     ri += 1;
                 }
             }
+            unit_spans.push((first_ri..ri, verdict));
             // 注册 / 漂移按**单元** offer（≥ `MIN_OFFER_SECS`=2.0s，**非判定门槛** `MIN_JUDGE_SECS`=1.5s；
             // 时长只算语音）；`new_slice_from` 之前不 offer（单元跨越时按**单元起点**判定：起点在前文 ⇒ 整个单元不 offer）。
             // 🔴 432：1.5~2.0s 的单元可**判定**（剔除）但**不注册**（嵌入质量差，防拉低本人档）。
@@ -755,6 +793,55 @@ pub(crate) fn filter_ranges_by_voiceprint(
                             score_if_ready: None,
                         }),
                         _ => {}
+                    }
+                }
+            }
+        }
+        // VOICEPRINT-FRAGMENT-GROUP-447（Gavin 2026-09-27「太短的碎片可以拼起来走声纹识别吗？」）：
+        // 单元判定后仍 `KeepShort` 的碎片（<1.0s、与邻段间隔 ≥0.8s 拼不上 412 单元），按时间序、
+        // 10s 跨度内**不要求相邻**地拼组到 ≥1.0s，拼接音频整体判一次；非本人 ⇒ 组内全部剔除，
+        // 本人 ⇒ 全部保留；凑不够 1.0s 的剩余碎片维持保留。碎片**不参与注册 / 漂移**。
+        // 依据 POC-444b：他人碎片组（0.54+0.54s）0.356、本人碎片组（0.99+0.29s）0.749。
+        let frags: Vec<(usize, usize, usize)> = unit_spans
+            .iter()
+            .enumerate()
+            .filter(|(_, (r, v))| matches!(v, SegVerdict::KeepShort) && !r.is_empty())
+            .map(|(ui, (r, _))| {
+                let speech: usize = ranges[r.clone()].iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+                (ui, ranges[r.start].0, speech)
+            })
+            .filter(|&(_, _, sp)| sp > 0)
+            .collect();
+        let judge_samples = (MIN_JUDGE_SECS * SAMPLE_RATE as f32) as usize;
+        for group in group_fragments(
+            &frags.iter().map(|&(_, st, sp)| (st, sp)).collect::<Vec<_>>(),
+            judge_samples,
+            FRAGMENT_GROUP_SPAN_SECS,
+        ) {
+            let mut buf: Vec<f32> = Vec::new();
+            for &fi in &group {
+                let (ui, _, _) = frags[fi];
+                for &(s, e) in &ranges[unit_spans[ui].0.clone()] {
+                    buf.extend_from_slice(&samples[s..e]);
+                }
+            }
+            let secs = buf.len() as f32 / SAMPLE_RATE as f32;
+            let emb = verifier.embed(&buf);
+            let v = judge_voiceprint(&proc.vp, emb.as_deref(), secs);
+            if log::log_enabled!(log::Level::Debug) {
+                log::debug!(
+                    "[DBG-447] fragment group: frags={} speech={:.2}s verdict={:?} score={:.3}",
+                    group.len(),
+                    secs,
+                    v,
+                    verdict_score(v)
+                );
+            }
+            if matches!(v, SegVerdict::DropNonUser(_) | SegVerdict::KeepUser(_)) {
+                for &fi in &group {
+                    let (ui, _, _) = frags[fi];
+                    for rv in &mut range_verdicts[unit_spans[ui].0.clone()] {
+                        *rv = v;
                     }
                 }
             }
@@ -2894,5 +2981,80 @@ mod fix432_tests {
             3,
             "封口后第三段另起、第四段间隔 0.8 不近邻也另起"
         );
+    }
+}
+
+// =====================================================================
+// VOICEPRINT-FRAGMENT-GROUP-447：判不了的碎片拼组再判
+// =====================================================================
+#[cfg(test)]
+mod fragment_group_447_tests {
+    use super::{group_fragments, FRAGMENT_GROUP_SPAN_SECS, SAMPLE_RATE};
+
+    fn s(x: f32) -> usize {
+        (x * SAMPLE_RATE as f32) as usize
+    }
+
+    /// 16:11 端测窗 #4 形态：0.58 / 0.54 / 0.54s 三碎片，不相邻（间隔 ≥0.8s）⇒ 前两段即凑够 1.0s 成组。
+    #[test]
+    fn t447_groups_non_adjacent_fragments() {
+        let frags = [(s(0.11), s(0.58)), (s(3.73), s(0.54)), (s(7.13), s(0.54))];
+        let g = group_fragments(&frags, s(1.0), FRAGMENT_GROUP_SPAN_SECS);
+        assert_eq!(
+            g,
+            vec![vec![0, 1]],
+            "前两段 1.12s 成组；第三段单独凑不够 1.0s 不成组"
+        );
+    }
+
+    /// 凑不够 1.0s ⇒ 不成组（保持保留，与改前一致）。
+    #[test]
+    fn t447_insufficient_stays_ungrouped() {
+        let frags = [(0, s(0.4)), (s(2.0), s(0.4))];
+        assert!(group_fragments(&frags, s(1.0), FRAGMENT_GROUP_SPAN_SECS).is_empty());
+    }
+
+    /// 跨度超 10s 的碎片不拼进同组。
+    #[test]
+    fn t447_span_limit() {
+        let frags = [(0, s(0.6)), (s(10.5), s(0.6)), (s(11.0), s(0.6))];
+        let g = group_fragments(&frags, s(1.0), FRAGMENT_GROUP_SPAN_SECS);
+        assert_eq!(g, vec![vec![1, 2]], "首段与 10.5s 处碎片超跨度；后两段成组");
+    }
+
+    /// 多组：依次贪心，互不重叠。
+    #[test]
+    fn t447_multiple_groups() {
+        let frags = [
+            (0, s(0.6)),
+            (s(1.0), s(0.6)),
+            (s(3.0), s(0.5)),
+            (s(4.0), s(0.6)),
+        ];
+        assert_eq!(
+            group_fragments(&frags, s(1.0), FRAGMENT_GROUP_SPAN_SECS),
+            vec![vec![0, 1], vec![2, 3]]
+        );
+    }
+
+    /// 接线：碎片组只回填判定，**不产生注册 / 漂移 offer**（offer 只在单元循环内）。
+    #[test]
+    fn t447_fragments_never_offer() {
+        let src = include_str!("speaker.rs");
+        let prod = &src[..src
+            .find(concat!("mod fragment_group_447", "_tests"))
+            .unwrap()];
+        let start = prod
+            .find(concat!("for group in group_", "fragments("))
+            .expect("碎片拼组循环");
+        let body = &prod[start..start + 2200];
+        assert!(
+            !body.contains(concat!("pending_offers", ".push")),
+            "碎片组不得 offer"
+        );
+        assert!(body.contains(concat!(
+            "judge_voiceprint(&proc.vp, emb.as_deref(), ",
+            "secs)"
+        )));
     }
 }
