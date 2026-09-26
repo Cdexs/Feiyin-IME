@@ -1218,7 +1218,16 @@ pub fn transcribe_streaming_local(
     acc_cfg: AccDispatchConfig,
     // VAD-393（A2）：新增第 5 参 `slice_ranges`：**片内坐标**的语音区间（VAD 时间线映射而来）；
     // VAD 不可用 ⇒ `None`（调用方回退自行跑 VAD）。
-    mut on_segment: impl FnMut(usize, usize, Vec<Vec<f32>>, String, Option<Vec<Vec<(usize, usize)>>>),
+    // FALLBACK-EXCLUDE-FARFIELD-446：第 6 参 = 各子片**片内坐标**的「远场」区间（VAD 判人声但近场门判非近场），
+    // 仅供精解失败 / 被拒时的**流式兜底**剔除背景文字；不参与解码前剪裁（392：门不定内容去留）。
+    mut on_segment: impl FnMut(
+        usize,
+        usize,
+        Vec<Vec<f32>>,
+        String,
+        Option<Vec<Vec<(usize, usize)>>>,
+        Vec<Vec<(usize, usize)>>,
+    ),
     // LOCALRT-TAIL-WINDOW-407：长静默（同一段静默 ≥1900ms 且此后无新语音）**只发一次**信号，
     // 携带当刻 `pcm` 样本位置。main 侧据此把「待覆盖片 + 前一片」组末尾窗即时解码回灌，
     // 无需用户按停止键（Gavin 2026-09-24）。恢复说话即复位、可再次触发。
@@ -1322,6 +1331,8 @@ pub fn transcribe_streaming_local(
     // VAD-393（A2）：会话语音时间线（`pcm` 绝对坐标，按序）。实时 VAD 逐 chunk 产出，派发时
     // 映射为片内 ranges ⇒ **复用实时判断、不再对每个窗口重跑 VAD**（且窗口开头有前文、结论与实时一致）。
     let mut speech_timeline: Vec<(usize, usize)> = Vec::new();
+    // FALLBACK-EXCLUDE-FARFIELD-446：会话 pcm 坐标的远场区间（VAD 判人声 && 近场门判非近场，逐 chunk 合并）。
+    let mut far_timeline: Vec<(usize, usize)> = Vec::new();
     // LOCALRT-PERF-405（F-C-01）：显示文本增量缓存（替代每 chunk `state.display_text()` 的
     // 全量 join + 分配）。切句时更新 confirmed 区，当前句只替换尾部 current 区。
     let mut display_cache = DisplayCache::new();
@@ -1477,6 +1488,14 @@ pub fn transcribe_streaming_local(
             }
             // LOCALRT-ENDPOINT-EMPTY-342（392 契约变更）：本句 VAD 判有人声 ⇒ 342 后续 endpoint 文本不丢；
             // 门只管时序（见上）；门误判时最坏只是停顿判断不准，**绝不丢录音人的话**。
+        }
+        // FALLBACK-EXCLUDE-FARFIELD-446：记录本 chunk 的远场区间（pcm 此刻尚未追加本 chunk）。
+        if vad_speech && !has_speech {
+            let (a, b) = (pcm.len(), pcm.len() + chunk.len());
+            match far_timeline.last_mut() {
+                Some(last) if last.1 == a => last.1 = b,
+                _ => far_timeline.push((a, b)),
+            }
         }
         // 392 埋点：VAD 判人声但门判非近场（被门拒）的 chunk 数 ⇒ 端测观察背景占比（可观测性）。
         // F-A-02（405）：只喂 Debug 汇总（`[DBG-389] nearfield summary`）⇒ Debug 守卫。
@@ -1857,6 +1876,7 @@ pub fn transcribe_streaming_local(
                     padded,
                     seg_streaming,
                     slice_ranges,
+                    slice_ranges_from_timeline(&far_timeline, &spans),
                 );
                 // 337：派发点 P 起，等自适应边界冻结（a/b/c 最先者）。
                 bound_seg = Some(acc_seg_index);
@@ -1948,6 +1968,7 @@ pub fn transcribe_streaming_local(
                             padded,
                             seg_streaming,
                             slice_ranges,
+                            slice_ranges_from_timeline(&far_timeline, &spans),
                         );
                         // 边界已知（切点那一刻的流式文字）⇒ 直接登记，不走 337 自适应定界。
                         on_reflow_commit(acc_seg_index, Some(committed_len));
@@ -2090,6 +2111,7 @@ pub fn transcribe_streaming_local(
                 padded,
                 seg_streaming,
                 slice_ranges,
+                slice_ranges_from_timeline(&far_timeline, &spans),
             );
         }
         // 尾片是最后一次派发：函数即将返回，无需再推进 `acc_dispatched_end`/`acc_seg_index`
@@ -2716,7 +2738,7 @@ mod tests {
             "",
             |_text, _words| {},
             super::AccDispatchConfig::new(),
-            |_a, _b, _c, _d, _e| {},
+            |_a, _b, _c, _d, _e, _f| {},
             |_pcm_pos| {
                 if signal_ms.is_none() {
                     signal_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
@@ -5876,5 +5898,37 @@ mod late_stream_tail_445_tests {
         ] {
             assert!(p.contains(needle), "{needle}");
         }
+    }
+}
+
+// =====================================================================
+// FALLBACK-EXCLUDE-FARFIELD-446：流式线程记录远场区间并随每个派发点带出
+// =====================================================================
+#[cfg(test)]
+mod far_timeline_446_tests {
+    fn prod_src() -> String {
+        let src = include_str!("local_stream.rs");
+        let cut = src
+            .find(concat!("mod far_timeline_446", "_tests"))
+            .unwrap_or(src.len());
+        src[..cut].to_string()
+    }
+
+    #[test]
+    fn t446_far_recorded_and_sent_at_all_dispatch_points() {
+        let p = prod_src();
+        assert!(p.contains(concat!(
+            "if vad_speech && !has_speech {\n            let (a, b) = (pcm.len(), ",
+            "pcm.len() + chunk.len());"
+        )));
+        assert_eq!(
+            p.matches(concat!(
+                "slice_ranges_from_timeline(&far_timeline, ",
+                "&spans)"
+            ))
+            .count(),
+            3,
+            "静默 / 回看 / 尾片三个派发点都带远场区间"
+        );
     }
 }

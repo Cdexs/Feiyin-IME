@@ -8974,6 +8974,10 @@ fn spawn_worker_thread(
                                         //（`None` = VAD 不可用 / 该片未给区间 ⇒ 组窗后整窗回退自跑 VAD）。
                                         let mut recent_slice_ranges: Vec<Option<Vec<(usize, usize)>>> =
                                             Vec::new();
+                                        // FALLBACK-EXCLUDE-FARFIELD-446：与 `recent_slices` 一一对应的片内远场区间。
+                                        let mut recent_slice_far: Vec<Vec<(usize, usize)>> = Vec::new();
+                                        // 446：`window_seq -> 窗内坐标远场区间`（兜底剔除用）。
+                                        let mut window_far_ranges: Vec<Vec<(usize, usize)>> = Vec::new();
                                         // 386（A）：待覆盖片全局下标（多片派发的末片延后，等下次派发/收尾纳入）。
                                         let mut pending_slice: Option<usize> = None;
                                         // 386（A）：收尾窗用的最近 dispatch_idx / committed_len。
@@ -9161,9 +9165,35 @@ fn spawn_worker_thread(
                                                     }
                                                     // FIX-VOICEPRINT-FALLBACK-421：全剔窗 ⇒ 空且 `is_fallback=false`
                                                     //（既不走流式兜底、也不让 410 pending 兜底接手）。
+                                                    // FALLBACK-EXCLUDE-FARFIELD-446：兜底文本再剔除「远场」区间对应的流式字
+                                                    //（VAD 判人声但近场门判非近场 = 旁边播放 / 远处人声）。只作用于兜底，
+                                                    // 406 比对基准与解码前剪裁不变（392：门不定内容去留，这里只在精解已失败时用）。
+                                                    let win_far: &[(usize, usize)] = window_far_ranges
+                                                        .get(seq)
+                                                        .map(|v| v.as_slice())
+                                                        .unwrap_or(&[]);
+                                                    let fb_final: String = match fallback_ranges_with_far(
+                                                        &win_drop.kept_ranges,
+                                                        &win_drop.dropped_ranges,
+                                                        win_far,
+                                                    ) {
+                                                        Some((k2, d2)) => {
+                                                            kept_streaming_text(fb_raw, win_total, 0, &k2, &d2, None)
+                                                        }
+                                                        None => fb_owned.clone(),
+                                                    };
+                                                    if fb_final != fb_owned && log::log_enabled!(log::Level::Debug) {
+                                                        log::debug!(
+                                                            "[DBG-446] fallback far-field excluded: seq={} far_ranges={} chars {}→{}",
+                                                            seq,
+                                                            win_far.len(),
+                                                            fb_owned.chars().count(),
+                                                            fb_final.chars().count()
+                                                        );
+                                                    }
                                                     let (is_fallback, text) = window_final_text(
                                                         &decoded,
-                                                        fb,
+                                                        &fb_final,
                                                         verdict.accept,
                                                         full_drop,
                                                     );
@@ -9185,17 +9215,31 @@ fn spawn_worker_thread(
                                                         // 偏移 = 窗总样本 − pending 样本）。
                                                         let tp_total: usize = tp.samples.iter().sum();
                                                         let tp_offset = win_total.saturating_sub(tp_total);
-                                                        let pending_kept = if win_drop.dropped_speech_secs > 0.0 {
-                                                            kept_streaming_text(
+                                                        // 446：pending 兜底同样剔除远场区间（与常规窗同一函数）。
+                                                        let pending_kept = match fallback_ranges_with_far(
+                                                            &win_drop.kept_ranges,
+                                                            &win_drop.dropped_ranges,
+                                                            win_far,
+                                                        ) {
+                                                            Some((k2, d2)) => kept_streaming_text(
                                                                 &tp.streaming,
                                                                 tp_total,
                                                                 tp_offset,
-                                                                &win_drop.kept_ranges,
-                                                                &win_drop.dropped_ranges,
+                                                                &k2,
+                                                                &d2,
                                                                 None,
-                                                            )
-                                                        } else {
-                                                            tp.streaming.clone()
+                                                            ),
+                                                            None if win_drop.dropped_speech_secs > 0.0 => {
+                                                                kept_streaming_text(
+                                                                    &tp.streaming,
+                                                                    tp_total,
+                                                                    tp_offset,
+                                                                    &win_drop.kept_ranges,
+                                                                    &win_drop.dropped_ranges,
+                                                                    None,
+                                                                )
+                                                            }
+                                                            None => tp.streaming.clone(),
                                                         };
                                                         let punct = punctuate_via_service(
                                                             &acc_punct_dir,
@@ -9371,7 +9415,7 @@ fn spawn_worker_thread(
                                                     let ctx_global = short_context_span(ge, must_start, buf_base);
                                                     let must_local =
                                                         must_start.saturating_sub(buf_base).clamp(start, stop);
-                                                    let (window_audio, window_samples_vec, window_ranges, window_streaming, span_start, tail_pending) =
+                                                    let (window_audio, window_samples_vec, window_ranges, window_streaming, span_start, tail_pending, window_far) =
                                                         if let Some(ctx_global) = ctx_global {
                                                             let ci = ctx_global.saturating_sub(buf_base);
                                                             let must_stream: String =
@@ -9431,7 +9475,15 @@ fn spawn_worker_thread(
                                                                 samples[1..].to_vec(),
                                                                 must_stream,
                                                             ));
-                                                            (audio, samples, ranges, cs.baseline, ctx_global, tail_pending)
+                                                            // 446：远场区间与 VAD 区间同法拼成窗内坐标。
+                                                            let mut far_slices: Vec<Option<Vec<(usize, usize)>>> =
+                                                                vec![Some(trim_and_shift_ranges(&recent_slice_far[ci], cs.cut))];
+                                                            far_slices.extend(
+                                                                recent_slice_far[must_local..stop].iter().cloned().map(Some),
+                                                            );
+                                                            let window_far =
+                                                                shift_and_concat_ranges(&far_slices, &samples).unwrap_or_default();
+                                                            (audio, samples, ranges, cs.baseline, ctx_global, tail_pending, window_far)
                                                         } else {
                                                             let audio: Vec<f32> = recent_slices[start..stop]
                                                                 .iter()
@@ -9456,7 +9508,11 @@ fn spawn_worker_thread(
                                                                 );
                                                             }
                                                             // 无前文 ⇒ 整窗兜底（行为不变）。
-                                                            (audio, samples, ranges, streaming, gs, None)
+                                                            let far_slices: Vec<Option<Vec<(usize, usize)>>> =
+                                                                recent_slice_far[start..stop].iter().cloned().map(Some).collect();
+                                                            let window_far =
+                                                                shift_and_concat_ranges(&far_slices, &samples).unwrap_or_default();
+                                                            (audio, samples, ranges, streaming, gs, None, window_far)
                                                         };
                                                     if !transcription::path_b_budget_ok(
                                                         window_audio.len(),
@@ -9510,6 +9566,7 @@ fn spawn_worker_thread(
                                                     window_spans.push((span_start, ge));
                                                     window_samples.push(window_samples_vec);
                                                     window_streaming_texts.push(window_streaming);
+                                                    window_far_ranges.push(window_far);
                                                     window_committed_lens.push($win_committed);
                                                     window_boundary_usable.push($usable);
                                                     // 410：带前文的常规窗 = 只兜底 must 片（见上）；无前文 = None（整窗兜底）。
@@ -9522,7 +9579,7 @@ fn spawn_worker_thread(
                                             // `span` 仍以 (p-1,p+1) 交对齐；VAD 区间传 `None`（前片取部分 ⇒ 片内区间
                                             // 偏移不再成立）⇒ 该窗回退自跑 VAD。`win_samples` = [前片后缀, pending]。
                                             macro_rules! dispatch_tail_window {
-                                                ($gs:expr, $ge:expr, $audio:expr, $samples:expr, $streaming:expr, $pending_samples:expr, $pending_streaming:expr) => {{
+                                                ($gs:expr, $ge:expr, $audio:expr, $samples:expr, $streaming:expr, $pending_samples:expr, $pending_streaming:expr, $far:expr) => {{
                                                     let gs: usize = $gs;
                                                     let ge: usize = $ge;
                                                     let audio: Vec<f32> = $audio;
@@ -9570,6 +9627,7 @@ fn spawn_worker_thread(
                                                     window_spans.push((gs, ge));
                                                     window_samples.push(samples);
                                                     window_streaming_texts.push(streaming);
+                                                    window_far_ranges.push($far);
                                                     window_committed_lens.push(last_committed_len);
                                                     window_boundary_usable.push(true);
                                                     // 410：末尾窗的 pending 回灌元数据（被拒/空时只兜底 pending）。
@@ -9628,6 +9686,15 @@ fn spawn_worker_thread(
                                                                 $pcm_pos
                                                             );
                                                         }
+                                                        // 446：前片后缀远场 + pending 远场，拼成窗内坐标（samples 传入宏前先算）。
+                                                        let tail_far = shift_and_concat_ranges(
+                                                                &[
+                                                                    Some(trim_and_shift_ranges(&recent_slice_far[i - 1], cs.cut)),
+                                                                    Some(recent_slice_far[i].clone()),
+                                                                ],
+                                                                &samples,
+                                                            )
+                                                            .unwrap_or_default();
                                                         dispatch_tail_window!(
                                                             gs,
                                                             ge,
@@ -9635,7 +9702,8 @@ fn spawn_worker_thread(
                                                             samples,
                                                             streaming,
                                                             vec![recent_slices[i].len()],
-                                                            recent_streaming[i].clone()
+                                                            recent_streaming[i].clone(),
+                                                            tail_far
                                                         );
                                                     } else if let Some((gs, ge)) =
                                                         tail_window_alone(Some(p), prev_base, recent_slices.len())
@@ -9660,7 +9728,8 @@ fn spawn_worker_thread(
                                                             samples,
                                                             streaming,
                                                             vec![recent_slices[i0].len()],
-                                                            recent_streaming[i0].clone()
+                                                            recent_streaming[i0].clone(),
+                                                            recent_slice_far[i0].clone()
                                                         );
                                                     }
                                                 }};
@@ -9677,6 +9746,7 @@ fn spawn_worker_thread(
                                                                 sub_segs,
                                                                 seg_streaming,
                                                                 seg_ranges,
+                                                                seg_far,
                                                             )) => {
                                                             // 386（A）：按「中途末片延后 / 下次派发纳入 / 收尾合并」规则组窗
                                                             //（规则与不变量见 `plan_windows`）。382 旧行为「每片立刻组窗」会把
@@ -9743,6 +9813,9 @@ fn spawn_worker_thread(
                                                                         .and_then(|v| v.get(k))
                                                                         .cloned(),
                                                                 );
+                                                                recent_slice_far.push(
+                                                                    seg_far.get(k).cloned().unwrap_or_default(),
+                                                                );
                                                                 recent_streaming.push(
                                                                     slice_streaming_text(
                                                                         k,
@@ -9756,6 +9829,7 @@ fn spawn_worker_thread(
                                                                 {
                                                                     recent_slices.remove(0);
                                                                     recent_slice_ranges.remove(0);
+                                                                    recent_slice_far.remove(0);
                                                                     recent_streaming.remove(0);
                                                                 }
                                                                 // 窗口以「当前片」收尾：其 end == 推送后的 total_slices。
@@ -9881,7 +9955,12 @@ fn spawn_worker_thread(
                                         ));
                                     },
                                     acc_cfg,
-                                    |idx, committed_len, segs, seg_streaming, seg_ranges| {
+                                    |idx,
+                                     committed_len,
+                                     segs,
+                                     seg_streaming,
+                                     seg_ranges,
+                                     seg_far| {
                                         // 派发片送 accuracy worker（worker 不存在 ⇒ send 失败，忽略）。
                                         let _ = acc_tx.send(AccInput::Slice((
                                             idx,
@@ -9889,6 +9968,7 @@ fn spawn_worker_thread(
                                             segs,
                                             seg_streaming,
                                             seg_ranges,
+                                            seg_far,
                                         )));
                                     },
                                     // LOCALRT-TAIL-WINDOW-407：长静默（≥1900ms）信号 ⇒ 走同一 acc 通道。
@@ -12446,6 +12526,8 @@ type AccSliceMsg = (
     Vec<Vec<f32>>,
     String,
     Option<Vec<Vec<(usize, usize)>>>,
+    // FALLBACK-EXCLUDE-FARFIELD-446：各子片片内坐标的远场区间（只供流式兜底剔除）。
+    Vec<Vec<(usize, usize)>>,
 );
 
 /// LOCALRT-TAIL-WINDOW-407：滑窗线程的**输入**（新切片 / 长静默信号）。
@@ -13065,6 +13147,48 @@ fn window_final_text(
         window_text_with_fallback(decoded, kept_streaming)
     };
     (is_fallback, text)
+}
+
+/// FALLBACK-EXCLUDE-FARFIELD-446：兜底裁剪用的「保留 / 剔除」区间 —— 把**远场**区间并入剔除、从保留中减去。
+///
+/// Gavin 2026-09-26 端测：旁放他人语音，精解对这段只出「Imagem」被 406 拒，退回流式兜底，
+/// 流式把背景声误识别成「在才能在他的的操作搞成一务，当don't…」写进最终文字。近场门已判这些语音为远场
+///（`vad_only_speech_chunks=232`），但 392 起门不定内容去留 ⇒ 只在**兜底**这一步借用远场信息。
+/// - `far` 空 ⇒ `None`（兜底与改前逐位相同）；
+/// - `kept ∪ dropped` 空（声纹未运行、无语音轴）⇒ `None`（语音轴未知时绝不删字，宁留勿吞）；
+/// - 否则返回 `(kept − far, dropped ∪ far)`，交 [`kept_streaming_text`] 删落在远场的字。纯函数，可单测。
+fn fallback_ranges_with_far(
+    kept: &[(usize, usize)],
+    dropped: &[(usize, usize)],
+    far: &[(usize, usize)],
+) -> Option<(Vec<(usize, usize)>, Vec<(usize, usize)>)> {
+    if far.is_empty() || (kept.is_empty() && dropped.is_empty()) {
+        return None;
+    }
+    let mut kept2: Vec<(usize, usize)> = Vec::new();
+    for &(a, b) in kept {
+        let mut pieces = vec![(a, b)];
+        for &(fa, fb) in far {
+            let mut next = Vec::new();
+            for (pa, pb) in pieces {
+                if fb <= pa || fa >= pb {
+                    next.push((pa, pb));
+                } else {
+                    if fa > pa {
+                        next.push((pa, fa));
+                    }
+                    if fb < pb {
+                        next.push((fb, pb));
+                    }
+                }
+            }
+            pieces = next;
+        }
+        kept2.extend(pieces);
+    }
+    let mut dropped2 = dropped.to_vec();
+    dropped2.extend_from_slice(far);
+    Some((kept2, dropped2))
 }
 
 /// FIX-VOICEPRINT-FALLBACK-421 / R1：把**本窗流式文本**按声纹剔除区间裁剪 —— **只删被剔除的字**。
@@ -14435,7 +14559,7 @@ mod testsync413_tests {
         let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"));
         assert!(
             prod.iter()
-                .any(|l| l.contains("(audio, samples, ranges, streaming, gs, None)")),
+                .any(|l| l.contains("(audio, samples, ranges, streaming, gs, None, window_far)")),
             "无前文分支必须整窗兜底（tail_pending 为 None）"
         );
     }
@@ -21535,7 +21659,8 @@ mod testsync407_tests {
         let m = prod
             .find(concat!("macro_rules! emit_tail_", "window"))
             .expect("emit_tail_window 宏缺失");
-        let mseg: String = prod[m..].chars().take(1500).collect();
+        // 446：宏内新增远场区间拼接（约 10 行）⇒ 截取范围 1500→2500 字，检查项不变。
+        let mseg: String = prod[m..].chars().take(2500).collect();
         assert!(
             mseg.contains(concat!("tail_window_span(Some(p)")),
             "须用纯决策取 span"
@@ -22811,5 +22936,63 @@ mod interior436_tests {
         // （静音 [8000,16000) 占重叠后半；中点 8000 附近若无候选则回落中点 0.5。）
         let two = window_overlap_split(0, Some(2), &a, &[8000, 8000]).expect("有共享");
         assert!(two > 0.0 && two < 1.0, "实测 {two}");
+    }
+}
+
+// =====================================================================
+// FALLBACK-EXCLUDE-FARFIELD-446：兜底剔除远场区间对应的流式字
+// =====================================================================
+#[cfg(test)]
+mod fallback_far_446_tests {
+    use super::{fallback_ranges_with_far, kept_streaming_text};
+
+    const S: usize = 16000;
+
+    /// 无远场 / 无语音轴（声纹未运行）⇒ None（兜底逐位不变、语音轴未知绝不删字）。
+    #[test]
+    fn t446_none_when_no_far_or_no_axis() {
+        assert_eq!(fallback_ranges_with_far(&[(0, S)], &[], &[]), None);
+        assert_eq!(fallback_ranges_with_far(&[], &[], &[(0, S)]), None);
+    }
+
+    /// 远场从保留中减去、并入剔除。
+    #[test]
+    fn t446_far_subtracted_from_kept() {
+        let (k, d) = fallback_ranges_with_far(&[(0, 10 * S)], &[], &[(6 * S, 8 * S)]).unwrap();
+        assert_eq!(k, vec![(0, 6 * S), (8 * S, 10 * S)]);
+        assert_eq!(d, vec![(6 * S, 8 * S)]);
+    }
+
+    /// 15:23 端测复现形态：本人 1.33s 在前、远场背景 1.12s + 0.67s 在后，流式把两者连成一串。
+    /// 兜底裁剪后只留本人部分（前段），背景误识别字被删。
+    #[test]
+    fn t446_fallback_keeps_user_drops_far() {
+        let user = (0usize, (1.33 * S as f32) as usize);
+        let far1 = ((3.0 * S as f32) as usize, (4.12 * S as f32) as usize);
+        let far2 = ((5.0 * S as f32) as usize, (5.67 * S as f32) as usize);
+        let kept = [user, far1, far2]; // 声纹全判保留（KeepShort）
+        let streaming = "片我觉得很刺在才能在他的的操作搞成一务";
+        let (k2, d2) = fallback_ranges_with_far(&kept, &[], &[far1, far2]).unwrap();
+        let out = kept_streaming_text(streaming, 10 * S, 0, &k2, &d2, None);
+        assert!(out.starts_with("片我觉得"), "本人部分须保留：{out}");
+        assert!(!out.contains("操作"), "远场背景字须删：{out}");
+        assert!(out.chars().count() < streaming.chars().count());
+    }
+
+    /// 接线：常规窗与末尾窗 pending 两处兜底都走 446；406 比对基准仍用原 `fb`（不变）。
+    #[test]
+    fn t446_wiring() {
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"))
+            .join("\n");
+        assert_eq!(
+            prod.matches(concat!("fallback_ranges_with_far", "("))
+                .count(),
+            3,
+            "定义 + 两处调用"
+        );
+        assert!(prod.contains(concat!("transcription::acc_vs_streaming(&decoded, ", "fb)")));
+        assert!(prod.contains(concat!("&fb_", "final,")));
+        assert!(prod.contains(concat!("window_far_ranges.push(", "window_far)")));
+        assert!(prod.contains(concat!("window_far_ranges.push(", "$far)")));
     }
 }
