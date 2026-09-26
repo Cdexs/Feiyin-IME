@@ -32,6 +32,10 @@ pub const SEGMENT_PADDING_SAMPLES: usize = 3200;
 ///
 /// 🔴 必须与 `WINDOW_MAX_SECS`（`transcription/mod.rs`，组窗上限）**相等** ——
 /// 由单测 `sliding_cut_search_start_equals_window_max` 锁定，防二者再次漂移。
+///
+/// 🔴 SLICE-CUT-REAL-PAUSE-437（方案修订 R1）补充：真停顿在**内侧窗**
+/// `[起点+8s, 起点+10s]`（从 10s 往前取最靠近 10s 的一段）优先命中；本常量（10s）
+/// 仍是内侧窗的**上界**与外侧窗 `[10s, 12s]` 的下界，值不变。
 pub const SLIDING_CUT_SEARCH_START_SECS: f64 = 10.0;
 
 /// FIX-SLICE-CUT-AT-GAP-381：字缝搜索的**最远兜底偏移** = 2.0s（即最晚切到 12s）。
@@ -54,6 +58,21 @@ pub const MIN_TAIL_SECS: f64 = 1.0;
 
 /// FIX-SLICE-CUT-AT-GAP-381：字缝能量帧长 = 20ms @16kHz = 320 样本。
 pub const GAP_FRAME_SAMPLES: usize = 320;
+
+/// SLICE-CUT-REAL-PAUSE-437：滑动切片**真停顿**最短时长（ms）= 连续 ≥6×20ms 低能量帧。
+///
+/// 与 `local_stream::TAIL_CUT_MIN_PAUSE_MS`（TAIL-CUT-REAL-PAUSE-434 尾窗）**同值**：
+/// 「切点只切在真正的停顿处」是 Gavin 的统一口径，两处必须一致。
+/// 434 那份在 `local_stream.rs`（本单不改）⇒ 此处为**镜像常量**，**改一处须同步另一处**。
+pub const SLICE_CUT_MIN_PAUSE_MS: u32 = 120;
+
+/// SLICE-CUT-REAL-PAUSE-437（**方案修订 R1**，Gavin 2026-09-26）：真停顿**内侧窗**
+/// 相对起搜点往前回退的秒数 = 2s ⇒ 内侧窗 = `[片起点+8s, 片起点+10s]`。
+///
+/// Gavin 原话：「10s 向内，从尾部向前找切点」—— 往 10s **内**找切点，避免切点后移把片
+/// 拉长、拖慢解码。8s 下限是主控定的初值（片太短 ⇒ 片数与接缝增多），
+/// 由 `stats.md` 统计校验；要调整先 💬 报再改。
+pub const SLICE_CUT_INNER_BACK_SECS: f64 = 2.0;
 
 /// silero VAD 窗口大小（512 samples = 32ms @ 16kHz，silero_vad.onnx 要求）
 const VAD_WINDOW_SIZE: i32 = 512;
@@ -608,42 +627,101 @@ fn plan_sliding_cuts(
     merged
 }
 
-/// FIX-SLICE-CUT-AT-GAP-381：**纯函数** —— 把 `[start, end)` 按「字缝」切成严格相接的若干片。
+/// SLICE-CUT-REAL-PAUSE-437（**方案修订 R1**）：**纯函数** —— 把 `[start, end)`
+/// 按「切点」切成严格相接的若干片。
 ///
-/// 规则（Gavin 2026-09-23 口径，取值依据见各常量注释）：
-/// 1. 剩余长度 < 起搜点(10s) + [`MIN_TAIL_SECS`](1s) ⇒ **不切**，整段作一片（尾巴保护，最长约 11s）；
-/// 2. 否则从「本片起点 + 10s」往后搜，最远 `GAP_SEARCH_MAX_SECS`(2s)（即到 12s）：
-///    以 [`GAP_FRAME_SAMPLES`](20ms) 为一帧算 RMS，**字缝** = 该帧 RMS ≤
-///    [`GAP_RMS_RATIO`] × 本片前 10s 帧 RMS 中位数，且为局部极小（≤ 左右相邻帧）；
-///    取**最早**达标帧的**中心样本**为切点；
-/// 3. 搜不到达标帧 ⇒ 在 [10s, 12s] 内取 RMS **最低**帧的中心切（硬兜底，绝不无限变长）；
-/// 4. 切点严格相接（第 i 片 end == 第 i+1 片 start），不重不漏。
+/// 规则（Gavin 2026-09-23 口径 + 2026-09-26 R1 修订，取值依据见各常量注释）：
+/// 1. 剩余长度 < 起搜点(10s) + [`MIN_TAIL_SECS`](1s) ⇒ **不切**，整段作一片（尾巴保护，约 11s）；
+/// 2. 否则按下序**找到即切**：
+///    - **R1-1 `pause_in`** 在内侧窗 `[起点+8s, 起点+10s]` 里**从 10s 往前**找真停顿
+///      （连续 ≥ [`SLICE_CUT_MIN_PAUSE_MS`](120ms) 低能量帧，判据复用
+///      [`real_pause_cut_candidates`]，与 434 尾窗同一处），取**最靠近 10s（最晚）**那段的
+///      **中点** ⇒ 片长 ≤10s，切点不后移、不拉长解码；
+///    - **R1-2 `pause_out`** 内侧窗无 ⇒ 外侧窗 `[起点+10s, min(起点+12s, end-1s)]` 取
+///      **最早**真停顿的中点（与原方案同，落在 10~12s）；
+///    - **R1-3 原逻辑** 两级都无 ⇒ `find_gap_cut` **逐位不变**：最早达标字缝帧中心，
+///      还没有则 [10s, 12s] 内 RMS **最低**帧中心兜底（硬上限，绝不无限变长）；
+/// 3. 切点严格相接（第 i 片 end == 第 i+1 片 start），不重不漏。
 ///
-/// 用**相对阈值** ⇒ 整体增益变化不改变切点位置（单测 `gap_cut_scale_invariant`）。
+/// 非末片长 ∈ **[8s, 12s]**（R1 起内侧窗下界 8s 取代原 10s 下界），末片 <11s。
+///
+/// 用**相对阈值** + **本片起点锚定的帧网格** ⇒ 整体增益变化不改变切点位置
+/// （单测 `gap_cut_scale_invariant` / `fix437_scale_invariant_with_pause`）。
+///
+/// 每个切点打一条 Debug 日志 `[DBG-437] slice cut: at=…s kind=pause_in|pause_out|gap|lowest …`。
 pub fn plan_gap_cuts(audio: &[f32], start: usize, end: usize) -> Vec<(usize, usize)> {
     const RATE: usize = 16000;
     let frame = GAP_FRAME_SAMPLES;
-    let search_start = (SLIDING_CUT_SEARCH_START_SECS * RATE as f64) as usize;
-    let search_max = (GAP_SEARCH_MAX_SECS * RATE as f64) as usize;
-    let min_tail = (MIN_TAIL_SECS * RATE as f64) as usize;
+    let search_start = (SLIDING_CUT_SEARCH_START_SECS * RATE as f64) as usize; // 10s
+    let search_max = (GAP_SEARCH_MAX_SECS * RATE as f64) as usize; // 2s
+    let min_tail = (MIN_TAIL_SECS * RATE as f64) as usize; // 1s
+                                                           // R1-1 内侧窗下界 = 起搜点 - 2s = 8s（片内相对坐标）
+    let inner_lo = search_start - (SLICE_CUT_INNER_BACK_SECS * RATE as f64) as usize;
+    // SLICE-CUT-REAL-PAUSE-437：真停顿最少帧数（120ms ÷ 20ms/帧 ⇒ 6 帧），与 434 同算法。
+    let min_pause_frames = ((SLICE_CUT_MIN_PAUSE_MS as usize * 16 + frame - 1) / frame).max(1);
 
     let mut out: Vec<(usize, usize)> = Vec::new();
     let mut pos = start;
     while pos < end {
         let remaining = end - pos;
-        // 尾巴保护：剩余不足 10s + 1s ⇒ 不切，整段作一片
+        // 尾巴保护（R1 不变）：剩余不足 10s + 1s ⇒ 不切，整段作一片
         if remaining < search_start + min_tail {
             out.push((pos, end));
             break;
         }
-        let lower = pos + search_start;
-        // 兜底上限：最晚 12s，且至少给尾巴留 min_tail
+        // 外侧窗兜底上限：最晚 12s，且至少给尾巴留 min_tail
         let upper = (pos + search_start + search_max).min(end - min_tail);
-        let cut = find_gap_cut(audio, pos, lower, upper, frame);
+        // 判据的中位数 / 帧网格都锚在**本片起点** ⇒ 一律传片内相对坐标。
+        // `audio.get(pos..)`：调用方可能给越界 `end`（见 #2c），切片不得 panic。
+        let sub = audio.get(pos..).unwrap_or(&[]);
+        // R1-1：[8s,10s] 从 10s 往前 ⇒ 候选按升序，**最后一段**即最靠近 10s。
+        let (cut, kind, pause_ms) =
+            match real_pause_cut_candidates(sub, inner_lo, search_start, frame, min_pause_frames)
+                .last()
+            {
+                Some(&(mid, cnt)) => (pos + mid, "pause_in", pause_ms_of(cnt, frame, RATE)),
+                // R1-2：[10s,12s] 最早真停顿。
+                None => match real_pause_cut_candidates(
+                    sub,
+                    search_start,
+                    upper.saturating_sub(pos),
+                    frame,
+                    min_pause_frames,
+                )
+                .first()
+                {
+                    Some(&(mid, cnt)) => (pos + mid, "pause_out", pause_ms_of(cnt, frame, RATE)),
+                    // R1-3：原 `find_gap_cut` 逐位不变。
+                    None => {
+                        match find_gap_cut_gap_only(audio, pos, pos + search_start, upper, frame) {
+                            Some(gap) => (gap, "gap", 0u32),
+                            None => (
+                                find_gap_cut(audio, pos, pos + search_start, upper, frame),
+                                "lowest",
+                                0u32,
+                            ),
+                        }
+                    }
+                },
+            };
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "[DBG-437] slice cut: at={:.3}s kind={} pause_ms={} piece_start={:.3}s",
+                cut as f64 / RATE as f64,
+                kind,
+                pause_ms,
+                pos as f64 / RATE as f64
+            );
+        }
         out.push((pos, cut));
         pos = cut;
     }
     out
+}
+
+/// SLICE-CUT-REAL-PAUSE-437：真停顿段时长（ms）= 帧数 × 帧长 / 16k。
+fn pause_ms_of(cnt: usize, frame: usize, rate: usize) -> u32 {
+    ((cnt * frame * 1000) / rate) as u32
 }
 
 /// FIX-SLICE-CUT-AT-GAP-381：在 `[lower, upper]`（限定帧**中心**落点）内找一个字缝切点。
@@ -1818,7 +1896,12 @@ mod tests {
             .collect()
     }
 
-    /// 契约断言：严格相接 + 并集 == [start,end) + 非末片 ∈[10s,12s] + 末片 <11s（或整段 <11s）。
+    /// 契约断言：严格相接 + 并集 == [start,end) + 非末片 ∈[8s,12s] + 末片 <11s（或整段 <11s）。
+    ///
+    /// 🔴 SLICE-CUT-REAL-PAUSE-437（**方案修订 R1**）把非末片**下界 10s → 8s**：
+    /// R1-1 要求「10s 向内找切点」，命中内侧窗 `[8s,10s]` 真停顿时片长 <10s（这正是
+    /// 「切点不后移、片不拉长」的目标）。上界 12s、尾巴保护、严格相接**逐位不变**。
+    /// 上界侧的 `find_gap_cut` 用例（纯正弦/恒定能量/40ms 字缝）仍断言 ≥10s，见各用例。
     fn ts381_assert_contract(cuts: &[(usize, usize)], start: usize, end: usize, ctx: &str) {
         assert!(!cuts.is_empty(), "{ctx}: 非空区间必须至少一片");
         assert_eq!(cuts[0].0, start, "{ctx}: 首片必须从 start 起");
@@ -1836,8 +1919,8 @@ mod tests {
             }
             let len = e - s;
             assert!(
-                (10 * TS381_RATE..=12 * TS381_RATE).contains(&len),
-                "{ctx}: 非末片 #{i} 长度 {:.3}s ∉ [10,12]s：{cuts:?}",
+                (8 * TS381_RATE..=12 * TS381_RATE).contains(&len),
+                "{ctx}: 非末片 #{i} 长度 {:.3}s ∉ [8,12]s：{cuts:?}",
                 len as f64 / TS381_RATE as f64
             );
         }
@@ -1851,7 +1934,7 @@ mod tests {
     }
 
     /// #1 性质测试：100 段伪随机音频（0.5~60s，混合正弦/噪声/静音，幅度 0.001~1.0），
-    /// 断言契约四性质：①严格相接且并集==[start,end) ②非末片∈[10,12]s ③末片<11s（或整段<11s）
+    /// 断言契约四性质：①严格相接且并集==[start,end) ②非末片∈[8,12]s（R1 内侧窗 8s 起） ③末片<11s（或整段<11s）
     /// ④不 panic（能跑完即证）。
     #[test]
     fn ts381_property_plan_gap_cuts_invariants() {
@@ -1868,18 +1951,30 @@ mod tests {
         }
     }
 
-    /// #2a 全零音频：前 10s 中位数为 0 ⇒ 阈值 0 ⇒ **所有**帧并列达标，取**最早**候选帧。
-    /// 最早候选帧中心 = 10s + 半帧（不是 12s 兜底、不是任意帧）。
+    /// #2a 全零音频：前 10s 中位数为 0 ⇒ 阈值 0 ⇒ **所有**帧并列达标。
+    ///
+    /// 🔴 SLICE-CUT-REAL-PAUSE-437 **行为两次有变**（断言均按原因改写，**非放宽**）：
+    /// - 381 原断言 `10s + 半帧`（最早达标帧中心）；
+    /// - 437 初版（只有 [10,12] 外侧窗）⇒ `11.0s`；
+    /// - **方案修订 R1**：内侧窗 [8s,10s] 整段是真停顿 ⇒ 取**最靠近 10s 的中点 = 9.0s**
+    ///   （片 ≤10s，切点不后移）；第二片同样命中 ⇒ 共 3 片。契约 [8,12] 仍满足。
     #[test]
-    fn ts381_degenerate_all_zero_picks_earliest_at_threshold_zero() {
+    fn ts381_degenerate_all_zero_picks_inner_window_midpoint_at_threshold_zero() {
         let total = 20 * TS381_RATE;
         let audio = vec![0.0f32; total];
         let cuts = plan_gap_cuts(&audio, 0, total);
         ts381_assert_contract(&cuts, 0, total, "all-zero");
         assert_eq!(
             cuts[0],
-            (0, 10 * TS381_RATE + TS381_FRAME / 2),
-            "阈值 0 下必须取最早达标帧中心（10s + 半帧）"
+            (0, 9 * TS381_RATE),
+            "全零 ⇒ 内侧窗整段是真停顿 ⇒ 取最靠近 10s 的中点 9.0s（R1-1）"
+        );
+        assert_eq!(cuts.len(), 3, "第二片同样命中内侧窗 ⇒ 3 片：{cuts:?}");
+        // R1-3 原逻辑仍须逐位可用：两级都无真停顿时取最早达标帧中心。
+        assert_eq!(
+            find_gap_cut(&audio, 0, 10 * TS381_RATE, 12 * TS381_RATE, TS381_FRAME),
+            10 * TS381_RATE + TS381_FRAME / 2,
+            "无真停顿时的兜底仍取最早达标帧中心（10s + 半帧）"
         );
     }
 
@@ -1984,6 +2079,246 @@ mod tests {
         assert!(cut < deep, "不得跳到更深的 11.5s 静音：cut={cut}");
         assert_eq!(cut, shallow + TS381_FRAME / 2, "取最早达标帧的中心样本");
         assert_eq!(cuts[1], (cut, total));
+    }
+
+    // ========================================================================
+    // SLICE-CUT-REAL-PAUSE-437 · 切点优先落在 ≥120ms 真停顿（方案修订 R1）
+    //   顺序：① [8s,10s] 从 10s 往前取最靠近 10s 的真停顿（pause_in）
+    //         ② [10s,12s] 最早真停顿（pause_out） ③ 原 find_gap_cut（legacy）
+    //   真停顿判据复用 `real_pause_cut_candidates`，与 434 尾窗同一处，不复制判据
+    // ========================================================================
+
+    /// 把 `[base + j_from*FRAME, base + j_to*FRAME)` 整帧置近静音 0.001
+    /// （帧网格**锚在 `base`** —— `base` 取本片起点即片内坐标）。
+    fn fix437_quiet_frames(audio: &mut [f32], base: usize, j_from: usize, j_to: usize) {
+        for j in j_from..j_to {
+            let s = base + j * TS381_FRAME;
+            for x in &mut audio[s..s + TS381_FRAME] {
+                *x = 0.001;
+            }
+        }
+    }
+
+    /// 真停顿段（帧 `[j_first, j_last]`）的**中点样本** —— 437 的切点。
+    fn fix437_pause_mid(j_first: usize, j_last: usize) -> usize {
+        (j_first * TS381_FRAME + TS381_FRAME / 2 + j_last * TS381_FRAME + TS381_FRAME / 2) / 2
+    }
+
+    /// 437 **之前** `plan_gap_cuts` 的逐字实现（切点判据仍走 `find_gap_cut`，**不复制判据**），
+    /// 供「窗内无真停顿 ⇒ 与改前逐位相同」对照。
+    fn fix437_legacy_plan_gap_cuts(audio: &[f32], start: usize, end: usize) -> Vec<(usize, usize)> {
+        const RATE: usize = 16_000;
+        let frame = GAP_FRAME_SAMPLES;
+        let search_start = (SLIDING_CUT_SEARCH_START_SECS * RATE as f64) as usize;
+        let search_max = (GAP_SEARCH_MAX_SECS * RATE as f64) as usize;
+        let min_tail = (MIN_TAIL_SECS * RATE as f64) as usize;
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        let mut pos = start;
+        while pos < end {
+            if end - pos < search_start + min_tail {
+                out.push((pos, end));
+                break;
+            }
+            let lower = pos + search_start;
+            let upper = (pos + search_start + search_max).min(end - min_tail);
+            let cut = find_gap_cut(audio, pos, lower, upper, frame);
+            out.push((pos, cut));
+            pos = cut;
+        }
+        out
+    }
+
+    /// ①（**R1-1 `pause_in`**）[8s,10s] 内两段真停顿 ⇒ 取**最靠近 10s（最晚）**那段的中点；
+    /// 窗内的**单帧**低谷不足 120ms ⇒ 不入选；片长必须 ≤10s（切点不后移）。
+    #[test]
+    fn fix437_pause_in_takes_pause_closest_to_10s() {
+        let total = 20 * TS381_RATE;
+        let mut audio = ts381_sine(total, 0.3);
+        fix437_quiet_frames(&mut audio, 0, 450, 451); // 9.00s 单帧低谷（非真停顿）
+        fix437_quiet_frames(&mut audio, 0, 460, 467); // 9.20s 起 140ms 真停顿（较早）
+        fix437_quiet_frames(&mut audio, 0, 490, 497); // 9.80s 起 140ms 真停顿（最靠 10s）
+        let cuts = plan_gap_cuts(&audio, 0, total);
+        ts381_assert_contract(&cuts, 0, total, "fix437#1(R1-1)");
+        let early = fix437_pause_mid(460, 466); // 9.270s
+        let late = fix437_pause_mid(490, 496); // 9.870s
+        assert_eq!(
+            cuts[0],
+            (0, late),
+            "取最靠近 10s 的那段中点 9.870s（157920）"
+        );
+        assert!(cuts[0].1 > early, "不得取较早的 9.270s 停顿：{}", cuts[0].1);
+        assert!(
+            cuts[0].1 <= 10 * TS381_RATE,
+            "R1-1 片长必须 ≤10s：{}s",
+            cuts[0].1 as f64 / TS381_RATE as f64
+        );
+        assert!(
+            cuts[0].1 >= 8 * TS381_RATE,
+            "内侧窗下界 8s：{}s",
+            cuts[0].1 as f64 / TS381_RATE as f64
+        );
+    }
+
+    /// ②（**R1-2 `pause_out`**）[8s,10s] 无真停顿、[10s,12s] 有 ⇒ 取外侧窗**最早**真停顿中点，
+    /// 而非改前会命中的 10.3s **单帧**低谷（单帧不构成真停顿）。
+    #[test]
+    fn fix437_prefers_real_pause_over_single_frame_valley() {
+        let total = 20 * TS381_RATE;
+        let mut audio = ts381_sine(total, 0.3);
+        fix437_quiet_frames(&mut audio, 0, 515, 516); // 10.3s 单帧低谷（韵母尾类）
+        fix437_quiet_frames(&mut audio, 0, 560, 567); // 11.2s 起 7 帧 = 140ms 真停顿
+        let cuts = plan_gap_cuts(&audio, 0, total);
+        ts381_assert_contract(&cuts, 0, total, "fix437#1");
+        assert_eq!(
+            find_gap_cut(&audio, 0, 10 * TS381_RATE, 12 * TS381_RATE, TS381_FRAME),
+            515 * TS381_FRAME + TS381_FRAME / 2,
+            "改前口径会切在 10.3s 单帧低谷中心（164960）"
+        );
+        assert_eq!(
+            cuts[0],
+            (0, fix437_pause_mid(560, 566)),
+            "R1-2：取外侧窗最早真停顿中点 11.270s（180320）"
+        );
+        assert!(cuts[0].1 > 515 * TS381_FRAME, "不得早于 10.3s 低谷");
+        assert!(
+            cuts[0].1 >= 10 * TS381_RATE,
+            "内侧窗无停顿 ⇒ 落到 10~12s：{}s",
+            cuts[0].1 as f64 / TS381_RATE as f64
+        );
+    }
+
+    /// ② 仅 100ms（5 帧 <120ms）停顿 ⇒ 不算真停顿 ⇒ 与改前**逐位相同**（退回最早字缝）。
+    #[test]
+    fn fix437_short_pause_falls_back_to_legacy_gap_cut() {
+        let total = 20 * TS381_RATE;
+        let mut audio = ts381_sine(total, 0.3);
+        fix437_quiet_frames(&mut audio, 0, 560, 565); // 11.2s 起 5 帧 = 100ms
+        let cuts = plan_gap_cuts(&audio, 0, total);
+        assert_eq!(
+            cuts,
+            fix437_legacy_plan_gap_cuts(&audio, 0, total),
+            "100ms 不成真停顿 ⇒ 切点与 437 之前逐位相同"
+        );
+        assert_eq!(
+            cuts[0].1,
+            560 * TS381_FRAME + TS381_FRAME / 2,
+            "退回最早字缝帧中心（11.210s）"
+        );
+        ts381_assert_contract(&cuts, 0, total, "fix437#2");
+    }
+
+    /// ③ 两级都**无真停顿** ⇒ 与 `find_gap_cut`（437 之前实现）逐位相同：纯正弦 / 40ms 字缝 / 恒定能量。
+    #[test]
+    fn fix437_no_pause_bit_identical_to_legacy() {
+        let a = ts381_sine(20 * TS381_RATE, 0.3);
+        assert_eq!(
+            plan_gap_cuts(&a, 0, a.len()),
+            fix437_legacy_plan_gap_cuts(&a, 0, a.len()),
+            "纯正弦（无低能帧）须逐位相同"
+        );
+        let b = synth_speech_with_gaps(25, 0.3); // 240ms 周期内 40ms 近静音 ⇒ 2 帧
+        assert_eq!(
+            plan_gap_cuts(&b, 0, b.len()),
+            fix437_legacy_plan_gap_cuts(&b, 0, b.len()),
+            "40ms 字缝（381 原场景）须逐位相同"
+        );
+        let c = vec![0.1f32; 30 * TS381_RATE];
+        assert_eq!(
+            plan_gap_cuts(&c, 0, c.len()),
+            fix437_legacy_plan_gap_cuts(&c, 0, c.len()),
+            "恒定能量（local_stream 契约场景）须逐位相同"
+        );
+    }
+
+    /// ④（**R1-1 下界**）7.5s 处的真停顿**低于 8s 下限** ⇒ 不入选
+    /// （R1 任务书原话：「7.5s 处的停顿不算（低于下限）」）；外侧窗有停顿时仍用外侧的。
+    #[test]
+    fn fix437_pause_below_8s_is_ignored() {
+        let total = 20 * TS381_RATE;
+        // (a) 只有 7.5~8.0s 停顿（≥120ms 但在下限外）⇒ 不入选 ⇒ 与原逻辑逐位相同
+        let mut a = ts381_sine(total, 0.3);
+        fix437_quiet_frames(&mut a, 0, 375, 400); // 7.50s..8.00s（帧中心均 <8s）
+        let ca = plan_gap_cuts(&a, 0, total);
+        assert_eq!(
+            ca,
+            fix437_legacy_plan_gap_cuts(&a, 0, total),
+            "7.5s 停顿低于 8s 下限 ⇒ 与 437 之前逐位相同"
+        );
+        assert!(
+            ca[0].1 >= 10 * TS381_RATE,
+            "切点不得 <10s：{}s",
+            ca[0].1 as f64 / TS381_RATE as f64
+        );
+        // (b) 7.5s + 11.2s ⇒ 用 11.2s 的（证明确实忽略了 7.5s）
+        let mut b = ts381_sine(total, 0.3);
+        fix437_quiet_frames(&mut b, 0, 375, 400);
+        fix437_quiet_frames(&mut b, 0, 560, 567);
+        let cb = plan_gap_cuts(&b, 0, total);
+        assert_eq!(
+            cb[0],
+            (0, fix437_pause_mid(560, 566)),
+            "忽略 7.5s ⇒ 取 11.2s 外侧窗真停顿"
+        );
+        ts381_assert_contract(&cb, 0, total, "fix437#4");
+    }
+
+    /// ⑤ 相对阈值：整体增益 ×0.1 ⇒ 切点不变（覆盖 R1-1 内侧窗路径）。
+    #[test]
+    fn fix437_scale_invariant_with_pause() {
+        let total = 20 * TS381_RATE;
+        let mut audio = ts381_sine(total, 0.3);
+        fix437_quiet_frames(&mut audio, 0, 490, 497); // 9.80s 真停顿 ⇒ 走 pause_in
+        let a = plan_gap_cuts(&audio, 0, total);
+        assert_eq!(
+            a[0].1,
+            fix437_pause_mid(490, 496),
+            "前半：确认走的是 R1-1 内侧窗路径"
+        );
+        let scaled: Vec<f32> = audio.iter().map(|x| x * 0.1).collect();
+        let b = plan_gap_cuts(&scaled, 0, total);
+        assert_eq!(a, b, "相对阈值下整体增益不应改变切点（R1-1 真停顿路径）");
+    }
+
+    /// ⑥ 多次切割：严格相接、不重不漏；首片确走真停顿路径（证明 437 分支被覆盖）。
+    #[test]
+    fn fix437_multi_cut_strictly_adjacent_no_loss() {
+        let total = 35 * TS381_RATE;
+        let mut audio = ts381_sine(total, 0.3);
+        fix437_quiet_frames(&mut audio, 0, 560, 567);
+        let cuts = plan_gap_cuts(&audio, 0, total);
+        assert!(cuts.len() >= 3, "35s 应切 ≥3 片：{cuts:?}");
+        assert_eq!(
+            cuts[0],
+            (0, fix437_pause_mid(560, 566)),
+            "首片必须由真停顿中点切出（覆盖 437 分支）"
+        );
+        ts381_assert_contract(&cuts, 0, total, "fix437#6");
+        let mut rebuilt: Vec<f32> = Vec::with_capacity(total);
+        let mut pos = 0usize;
+        for &(s, e) in &cuts {
+            assert_eq!(s, pos, "必须严格相接：{cuts:?}");
+            rebuilt.extend_from_slice(&audio[s..e]);
+            pos = e;
+        }
+        assert_eq!(pos, total, "末尾必须覆盖到 total");
+        assert_eq!(rebuilt, audio, "拼接必须与原音频逐样本相等（不重不漏）");
+    }
+
+    /// ⑦ 片起点非 0 且非帧对齐：真停顿按**本片起点**的帧网格判定，中点须换算回绝对坐标。
+    #[test]
+    fn fix437_pause_with_nonzero_unaligned_start() {
+        let total = 40 * TS381_RATE;
+        let mut audio = ts381_sine(total, 0.3);
+        let start = 5 * TS381_RATE + 123; // 非 320 对齐
+        fix437_quiet_frames(&mut audio, start, 560, 567); // 片内 11.2s 起 140ms
+        let end = start + 25 * TS381_RATE;
+        let cuts = plan_gap_cuts(&audio, start, end);
+        ts381_assert_contract(&cuts, start, end, "fix437#7");
+        assert_eq!(
+            cuts[0],
+            (start, start + fix437_pause_mid(560, 566)),
+            "帧网格锚在本片起点，中点须加回 start"
+        );
     }
 
     /// 逐位相等（`to_bits`）—— 比 `f32 ==` 更严（`-0.0` 与 `0.0` 也会被区分）。
@@ -2356,6 +2691,432 @@ mod tests {
                 l.abs_diff(rl)
             );
         }
+    }
+
+    // ========================================================================
+    // SLICE-CUT-REAL-PAUSE-437 · 第一步：真实录音统计（只读诊断，不改生产行为）
+    //
+    // 判据（任务书）：强制切片每个切点的 [10s,12s] 搜索窗内是否存在连续 ≥120ms
+    // 真停顿。占比 ≥50% ⇒ 进第二步实现；<50% ⇒ 停下、报数据给主控（是否放宽到
+    // 14s 由 Gavin 定）。同时统计 [10s,14s] 作参考。
+    //
+    // 运行：cargo test --bin feiyin-ime vad::diag437 -- --ignored --nocapture
+    // 产出：collab/evidence/437/stats.md
+    // ========================================================================
+
+    /// 437 真停顿最短时长（ms）——与 434 的 `TAIL_CUT_MIN_PAUSE_MS` 同值
+    /// （该常量在 `local_stream.rs` 私有，本单不改那个文件 ⇒ 此处同值镜像）。
+    const DIAG437_MIN_PAUSE_MS: u32 = 120;
+
+    /// 437 统计行：一个「会触发 `plan_gap_cuts` 切割」的位置。
+    struct Diag437Row {
+        file: String,
+        mode: &'static str,
+        piece_start_s: f64,
+        piece_len_s: f64,
+        /// 现行切点（437 之前：单帧字缝 / 最低 RMS 兜底）
+        old_cut_s: f64,
+        /// R1 切点 = [8,10] 最靠 10s 真停顿 → [10,12] 最早真停顿 → 现行切点
+        r1_cut_s: f64,
+        /// R1 命中级：`pause_in` / `pause_out` / `legacy`
+        level: &'static str,
+        /// 命中的真停顿时长 ms（`legacy` ⇒ 0）
+        pause_ms: u32,
+        /// [pos+8s, pos+10s] 内有 ≥120ms 真停顿
+        has_pause_8: bool,
+        has_pause_12: bool,
+        has_pause_14: bool,
+    }
+
+    /// 收集待统计录音：`collab/evidence/gavin-sessions/session-*.wav` +
+    /// `target/release/debug-audio/session-*.wav`（只读，不删不移）。
+    fn diag437_wavs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        // 同名录音可能在两个目录各存一份（内容相同）⇒ 按**文件名**去重，避免重复计数。
+        let mut by_name: std::collections::BTreeMap<String, std::path::PathBuf> =
+            std::collections::BTreeMap::new();
+        for dir in [
+            root.join("collab/evidence/gavin-sessions"),
+            root.join("target/release/debug-audio"),
+        ] {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                let name = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if p.extension().and_then(|s| s.to_str()) == Some("wav")
+                    && name.starts_with("session-")
+                {
+                    by_name.entry(name).or_insert(p);
+                }
+            }
+        }
+        by_name.into_values().collect()
+    }
+
+    /// 方法 A（生产同口径派发切片）：复刻 `local_stream` 的「静默 ≥1200ms 派发」——
+    /// 10ms 块 RMS ≤ `silence_threshold`(0.01) 累加、否则清零；派发点即
+    /// `build_dispatch_segment_with_spans(acc_dispatched_end, pending, …)` 的入参边界，
+    /// 也就是 `plan_gap_cuts` 在生产里真正收到的 `[start, end)`。
+    fn diag437_dispatch_slices(audio: &[f32]) -> Vec<(usize, usize)> {
+        const SILENCE_MS: f32 = 1200.0;
+        const THRESH: f32 = 0.01;
+        const CHUNK: usize = 160; // 10ms（生产 realtime 粒度，见 local_stream.rs 喂入测试）
+        let mut slices: Vec<(usize, usize)> = Vec::new();
+        let mut dispatched_end = 0usize;
+        let mut silent_ms = 0.0f32;
+        let mut done_for_pause = false;
+        let mut pos = 0usize;
+        while pos < audio.len() {
+            let end = (pos + CHUNK).min(audio.len());
+            let c = &audio[pos..end];
+            let rms = (c.iter().map(|x| x * x).sum::<f32>() / c.len() as f32).sqrt();
+            if rms <= THRESH {
+                silent_ms += (end - pos) as f32 / 16.0; // 样本/16 = ms @16kHz
+                if silent_ms >= SILENCE_MS && !done_for_pause && end > dispatched_end {
+                    slices.push((dispatched_end, end));
+                    dispatched_end = end;
+                    done_for_pause = true;
+                }
+            } else {
+                silent_ms = 0.0;
+                done_for_pause = false;
+            }
+            pos = end;
+        }
+        if dispatched_end < audio.len() {
+            slices.push((dispatched_end, audio.len()));
+        }
+        slices
+    }
+
+    /// 对一个会触发切割的 `[start, end)` 逐切点统计（**与 `plan_gap_cuts` 同一套
+    /// lower/upper 计算**，只是不改写行为）。
+    ///
+    /// 切点遍历取**现行**（437 之前）切片规划 ⇒ 与第一批 stats 的 **20 个切点同一批**，
+    /// 便于逐刀对比；R1 切点是「同 pos 下若按 R1 会切在哪」。
+    fn diag437_analyze(
+        audio: &[f32],
+        start: usize,
+        end: usize,
+        file: &str,
+        mode: &'static str,
+        rows: &mut Vec<Diag437Row>,
+    ) {
+        const RATE: usize = 16_000;
+        let frame = GAP_FRAME_SAMPLES;
+        let search_start = (SLIDING_CUT_SEARCH_START_SECS * RATE as f64) as usize;
+        let search_max = (GAP_SEARCH_MAX_SECS * RATE as f64) as usize;
+        let min_tail = (MIN_TAIL_SECS * RATE as f64) as usize;
+        let min_frames = ((DIAG437_MIN_PAUSE_MS as usize * 16 + frame - 1) / frame).max(1); // 120ms/20ms=6
+        let inner_lo = search_start - (SLICE_CUT_INNER_BACK_SECS * RATE as f64) as usize; // 8s
+        let pieces = fix437_legacy_plan_gap_cuts(audio, start, end);
+        for w in pieces.windows(2) {
+            let pos = w[0].0;
+            if pos.saturating_add(search_start + min_tail) > end {
+                continue; // 尾巴保护下不会切 ⇒ 不该出现，防御
+            }
+            let lower = pos + search_start;
+            let upper = (pos + search_start + search_max).min(end - min_tail);
+            if upper <= lower {
+                continue;
+            }
+            // 434 口径：切片内坐标（中位数取本片前 10s），结果加回 pos
+            let sub = audio.get(pos..).unwrap_or(&[]);
+            // R1-1 内侧窗 [pos+8s, pos+10s]
+            let c8 = real_pause_cut_candidates(sub, inner_lo, search_start, frame, min_frames);
+            // R1-2 外侧窗 [pos+10s, min(pos+12s, end-1s)]
+            let c12 = real_pause_cut_candidates(sub, search_start, upper - pos, frame, min_frames);
+            // 参考窗 [10s,14s]（同一尾巴保护上限）
+            let upper14 = (pos + search_start + 4 * RATE).min(end - min_tail);
+            let c14 = real_pause_cut_candidates(
+                sub,
+                search_start,
+                upper14.saturating_sub(pos),
+                frame,
+                min_frames,
+            );
+            let old = find_gap_cut(audio, pos, lower, upper, frame);
+            let (r1, level, cnt) = if let Some(&(m, n)) = c8.last() {
+                (pos + m, "pause_in", n)
+            } else if let Some(&(m, n)) = c12.first() {
+                (pos + m, "pause_out", n)
+            } else {
+                (old, "legacy", 0usize)
+            };
+            rows.push(Diag437Row {
+                file: file.to_string(),
+                mode,
+                piece_start_s: pos as f64 / RATE as f64,
+                piece_len_s: (end - pos) as f64 / RATE as f64,
+                old_cut_s: old as f64 / RATE as f64,
+                r1_cut_s: r1 as f64 / RATE as f64,
+                level,
+                pause_ms: ((cnt * frame * 1000) / 16000) as u32,
+                has_pause_8: !c8.is_empty(),
+                has_pause_12: !c12.is_empty(),
+                has_pause_14: !c14.is_empty(),
+            });
+        }
+    }
+
+    /// 汇总成 Markdown 报告（并落盘 + stdout 摘要）。
+    fn diag437_report(
+        rows: &[Diag437Row],
+        wavs: &[(String, f64)],
+        root: &std::path::Path,
+    ) -> String {
+        let mut s = String::new();
+        s.push_str(
+            "# SLICE-CUT-REAL-PAUSE-437 · 真停顿覆盖统计（含方案修订 R1 的 [8,10] 内侧窗）\n\n",
+        );
+        s.push_str(&format!(
+            "口径：现行 `plan_gap_cuts` 每个切点 `pos` 的搜索窗 `[pos+10s, min(pos+12s, end-1s)]`；\nR1 增加内侧窗 `[pos+8s, pos+10s]`（从 10s 往前取**最靠近 10s** 的真停顿）。\n真停顿 = 连续 ≥{}ms 低能量帧（RMS ≤ 0.3×本片前 10s 中位数，与 434 同口径，`GAP_FRAME_SAMPLES`=20ms）。\n切点遍历取**现行**切片规划 ⇒ 与第一批 stats 的切点同一批，可逐刀对比。\n\n",
+            DIAG437_MIN_PAUSE_MS
+        ));
+        s.push_str("## 录音源（只读）\n\n| 文件 | 时长 s |\n| --- | --- |\n");
+        for (n, d) in wavs {
+            s.push_str(&format!("| {n} | {d:.1} |\n"));
+        }
+        s.push_str("\n## 汇总\n\n| 口径 | 切点数 | [8,10]s 有真停顿 | 占比 | [10,12]s 有真停顿 | 占比 | [10,14]s 有真停顿 | 占比 |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n");
+        for mode in ["dispatch", "vad"] {
+            let rs: Vec<&Diag437Row> = rows.iter().filter(|r| r.mode == mode).collect();
+            if rs.is_empty() {
+                continue;
+            }
+            let n = rs.len();
+            let a8 = rs.iter().filter(|r| r.has_pause_8).count();
+            let a = rs.iter().filter(|r| r.has_pause_12).count();
+            let b = rs.iter().filter(|r| r.has_pause_14).count();
+            s.push_str(&format!(
+                "| {} | {} | {} | {:.1}% | {} | {:.1}% | {} | {:.1}% |\n",
+                mode,
+                n,
+                a8,
+                a8 as f64 * 100.0 / n as f64,
+                a,
+                a as f64 * 100.0 / n as f64,
+                b,
+                b as f64 * 100.0 / n as f64
+            ));
+        }
+        let n = rows.len();
+        if n > 0 {
+            let a8 = rows.iter().filter(|r| r.has_pause_8).count();
+            let a = rows.iter().filter(|r| r.has_pause_12).count();
+            let b = rows.iter().filter(|r| r.has_pause_14).count();
+            s.push_str(&format!(
+                "| **合计** | {} | {} | **{:.1}%** | {} | {:.1}% | {} | {:.1}% |\n",
+                n,
+                a8,
+                a8 as f64 * 100.0 / n as f64,
+                a,
+                a as f64 * 100.0 / n as f64,
+                b,
+                b as f64 * 100.0 / n as f64
+            ));
+            // R1 三级命中
+            s.push_str(
+                "\n## R1 三级命中（先 [8,10] 最靠 10s → 再 [10,12] 最早 → 原逻辑）\n\n| 级 | 规则 | 刀数 | 占比 |\n| --- | --- | --- | --- |\n",
+            );
+            for (lvl, rule) in [
+                ("pause_in", "[pos+8s, pos+10s] 最靠近 10s 的真停顿中点"),
+                ("pause_out", "[pos+10s, pos+12s] 最早真停顿中点"),
+                ("legacy", "两级都无 ⇒ 原 `find_gap_cut`（字缝/最低帧兜底）"),
+            ] {
+                let c = rows.iter().filter(|r| r.level == lvl).count();
+                s.push_str(&format!(
+                    "| `{lvl}` | {rule} | {c} | {:.1}% |\n",
+                    c as f64 * 100.0 / n as f64
+                ));
+            }
+            let a8 = rows.iter().filter(|r| r.has_pause_8).count();
+            let uni = rows
+                .iter()
+                .filter(|r| r.has_pause_8 || r.has_pause_12)
+                .count();
+            s.push_str(&format!(
+                "\n**[8,10] 占比 {:.1}%、[8,10] 或 [10,12] 至少一处有 {:.1}%**（{uni}/{n} 刀）。\n",
+                a8 as f64 * 100.0 / n as f64,
+                uni as f64 * 100.0 / n as f64
+            ));
+            // 每刀相对现行切点的提前秒数（正 = 提前）
+            let earlier: Vec<f64> = rows
+                .iter()
+                .map(|r| r.old_cut_s - r.r1_cut_s)
+                .filter(|d| *d > 1e-9)
+                .collect();
+            let same = rows
+                .iter()
+                .filter(|r| (r.old_cut_s - r.r1_cut_s).abs() <= 1e-9)
+                .count();
+            let later = n - same - earlier.len();
+            let avg = if earlier.is_empty() {
+                0.0
+            } else {
+                earlier.iter().sum::<f64>() / earlier.len() as f64
+            };
+            let max = earlier.iter().cloned().fold(0.0f64, f64::max);
+            s.push_str(&format!(
+                "R1 切点相对现行切点：提前 {} 刀 / 持平 {} 刀 / 后移 {} 刀；提前刀平均 **{avg:.3}s**、最长 {max:.3}s。\n\n",
+                earlier.len(),
+                same,
+                later
+            ));
+        }
+        // 判据（第一批任务书）：≥50% ⇒ 进第二步；<50% ⇒ 停下上报主控（是否放宽到 14s 由 Gavin 定）。
+        let disp: Vec<&Diag437Row> = rows.iter().filter(|r| r.mode == "dispatch").collect();
+        let pct = if disp.is_empty() {
+            0.0
+        } else {
+            disp.iter().filter(|r| r.has_pause_12).count() as f64 * 100.0 / disp.len() as f64
+        };
+        s.push_str(&format!(
+            "\n**第一批判据（dispatch 生产口径）**：[10,12]s 有真停顿占比 **{:.1}%** ⇒ {}（R1 已在此基础上加内侧窗 [8,10]）。\n\n",
+            pct,
+            if pct >= 50.0 {
+                "≥50%，已进入第二步实现"
+            } else {
+                "<50%，需停下上报（是否放宽到 14s 由 Gavin 定）"
+            }
+        ));
+        s.push_str(
+            "> 注：`vad` 口径 = silero 语音段中 ≥10s 者（min_silence 0.3s 切分下极少 ≥10s）；\n> 生产真正送进 `plan_gap_cuts` 的是**派发切片**（静默 1200ms），故以 dispatch 口径为准。\n",
+        );
+        // 停顿长度分布（R1 实际命中的那级真停顿）
+        s.push_str(
+            "\n## R1 命中真停顿长度分布（`pause_in` + `pause_out`；`legacy` = 两级都无）\n\n| 区间 | 数量 |\n| --- | --- |\n",
+        );
+        let buckets: [(&str, u32, u32); 5] = [
+            ("120-160ms", 120, 160),
+            ("160-240ms", 160, 240),
+            ("240-400ms", 240, 400),
+            ("400-800ms", 400, 800),
+            ("≥800ms", 800, u32::MAX),
+        ];
+        for (label, lo, hi) in buckets {
+            let c = rows
+                .iter()
+                .filter(|r| r.pause_ms >= lo && r.pause_ms < hi)
+                .count();
+            s.push_str(&format!("| {label} | {c} |\n"));
+        }
+        let none = rows.iter().filter(|r| r.pause_ms == 0).count();
+        s.push_str(&format!("| 两级都无（<120ms 或无低能帧） | {none} |\n"));
+        // 逐切点明细
+        s.push_str("\n## 逐切点明细（现行切点 vs R1 切点）\n\n");
+        s.push_str("| 录音 | 口径 | 片起点 s | 片长 s | 现行切点 s | R1 切点 s | Δ秒 | 命中级 | 停顿 ms | [10,12] | [10,14] |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
+        for r in rows {
+            s.push_str(&format!(
+                "| {} | {} | {:.2} | {:.2} | {:.3} | {:.3} | {:+.3} | {} | {} | {} | {} |\n",
+                r.file,
+                r.mode,
+                r.piece_start_s,
+                r.piece_len_s,
+                r.old_cut_s,
+                r.r1_cut_s,
+                r.r1_cut_s - r.old_cut_s,
+                r.level,
+                r.pause_ms,
+                if r.has_pause_12 { "Y" } else { "-" },
+                if r.has_pause_14 { "Y" } else { "-" },
+            ));
+        }
+        let path = root.join("collab/evidence/437");
+        let _ = std::fs::create_dir_all(&path);
+        let _ = std::fs::write(path.join("stats.md"), &s);
+        // stdout 摘要（--nocapture 可见）
+        println!("--- diag437 summary ---");
+        for mode in ["dispatch", "vad"] {
+            let rs: Vec<&Diag437Row> = rows.iter().filter(|r| r.mode == mode).collect();
+            if rs.is_empty() {
+                println!("mode={mode}: no cut positions");
+                continue;
+            }
+            let n = rs.len();
+            let a8 = rs.iter().filter(|r| r.has_pause_8).count();
+            let a = rs.iter().filter(|r| r.has_pause_12).count();
+            let b = rs.iter().filter(|r| r.has_pause_14).count();
+            let uni = rs
+                .iter()
+                .filter(|r| r.has_pause_8 || r.has_pause_12)
+                .count();
+            let l_in = rs.iter().filter(|r| r.level == "pause_in").count();
+            let l_out = rs.iter().filter(|r| r.level == "pause_out").count();
+            let l_leg = rs.iter().filter(|r| r.level == "legacy").count();
+            println!(
+                "mode={mode}: cuts={n} pause8_10={a8} ({:.1}%) pause10_12={a} ({:.1}%) pause10_14={b} ({:.1}%)",
+                a8 as f64 * 100.0 / n as f64,
+                a as f64 * 100.0 / n as f64,
+                b as f64 * 100.0 / n as f64
+            );
+            println!(
+                "mode={mode}: level pause_in={l_in} pause_out={l_out} legacy={l_leg} | union[8,12)={uni} ({:.1}%)",
+                uni as f64 * 100.0 / n as f64
+            );
+            println!(
+                "mode={mode}: [8,10] 占比 {:.1}%、[8,10] 或 [10,12] 至少一处有 {:.1}%",
+                a8 as f64 * 100.0 / n as f64,
+                uni as f64 * 100.0 / n as f64
+            );
+        }
+        println!("report -> {}", path.join("stats.md").display());
+        s
+    }
+
+    /// 第一步统计（只读，不改生产行为）。
+    #[test]
+    #[ignore = "SLICE-CUT-REAL-PAUSE-437 diagnostics; run: cargo test --bin feiyin-ime vad::diag437 -- --ignored --nocapture"]
+    fn diag437_pause_coverage_on_real_recordings() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let wavs = diag437_wavs(&root);
+        assert!(!wavs.is_empty(), "未找到任何 session-*.wav");
+        let vad = VadSegmenter::try_new_for_local_silence(&root.join("models"));
+        if vad.is_none() {
+            eprintln!("WARN: silero VAD 模型不可用 ⇒ 只跑 dispatch 口径");
+        }
+        let mut rows: Vec<Diag437Row> = Vec::new();
+        let mut meta: Vec<(String, f64)> = Vec::new();
+        for p in &wavs {
+            let name = p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let Some(w) = p.to_str().and_then(|s| sherpa_onnx::Wave::read(s)) else {
+                eprintln!("skip {name}: Wave::read failed");
+                continue;
+            };
+            let audio = w.samples().to_vec();
+            if audio.is_empty() {
+                continue;
+            }
+            meta.push((name.clone(), audio.len() as f64 / 16_000.0));
+            // 口径 A：生产派发切片（静默 1200ms）
+            let slices = diag437_dispatch_slices(&audio);
+            for &(s, e) in &slices {
+                diag437_analyze(&audio, s, e, &name, "dispatch", &mut rows);
+            }
+            // 口径 B：silero VAD 语音段（≥10s 才进 plan_gap_cuts）
+            if let Some(v) = &vad {
+                for &(s, e) in &v.speech_ranges(&audio) {
+                    if e.saturating_sub(s) >= (SLIDING_CUT_SEARCH_START_SECS * 16_000.0) as usize {
+                        diag437_analyze(&audio, s, e, &name, "vad", &mut rows);
+                    }
+                }
+            }
+            println!(
+                "{name}: {:.1}s slices={} forced_cut_rows={}",
+                audio.len() as f64 / 16_000.0,
+                slices.len(),
+                rows.iter().filter(|r| r.file == name).count()
+            );
+        }
+        diag437_report(&rows, &meta, &root);
     }
 }
 
