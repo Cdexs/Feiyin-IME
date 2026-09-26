@@ -67,4 +67,15 @@
 - **验证**：`interior436` **10P/0F**（原 9 + 新 1）、`fix43` **40P**、`416` **19P**、`431` **12P**；`cargo fmt --check` **EXIT 0**（**只用单文件 `rustfmt --edition 2021 src/transcription/mod.rs`**，未跑 `cargo fmt` 以免递归改到 coder-2 的 `vad.rs`）；`cargo check --all-targets` **0 error**、warnings **bin 91 / test 87 = 基线**。全量 test 按派发**未跑**（交 tester-1）。
 - **文档**：`collab/outbox/coder-1/result.md`（原 436 阶段二报告归档为 `result-436-phase2.md`）、本条、`logs/20260926.md`。
 
+---
+
+## 2026-09-26 — coder-2 — PREVIEW-PUNCT-LIVE-438 ✅ 预览打点改「3.5s 间隔 + 冻结前缀尾巴重打」单一机制（代码验收通过，已提交 2252ce0）
+
+- **交付**：唯一改动 `src/transcription/local_stream.rs`（+567/−103）。删 1200ms 静默触发 + 显示层 `silent_ms` 计数器（DEC-077 无死代码）；新常量 `PUNCT_PREVIEW_INTERVAL_MS=3500.0` + 独立 `punct_interval_ms` 每 chunk 累加、实际打点后归零；`should_repunctuate_preview` 改纯间隔判定、无新字不打。
+- **R1 冻结前缀**：双坐标 `punct_head_chars=committed_len` + `punct_tail_start=last_display_raw_len` 在中途/尾片**两处派发同刻同源**捕获 ⇒ `punct_head` 拼出冻结前缀逐字节不变、`committed_len` 坐标不漂；引擎只见 `raw[tail_start..]` 裸尾巴。R1-2 结论：坐标系 = **带标点显示文本字符数**，改前整段重打有多字/丢字隐患（既有），冻结后不再可达。
+- **349 防线升级**：`build_punct_prefix`（存缓存唯一入口）= 冻结前缀 + `strip_trailing_punctuation(尾巴打点)` ⇒ 句终标点根本不入缓存，句中「，。」照旧；新字仍 `punct_cache_reuse` 直接接缓存后。收尾强制打点同只打尾巴（尾片已派发 ⇒ 尾巴空由回灌补；acc 关 ⇒ 坐标 0 整段打）。
+- **silent_ms 影响面（任务书必查）**：生产唯一读者即打点触发本身；`should_dispatch_acc`/`should_signal_long_silence` 恒读 `acc_silent_ms`、`endpoint_action` 无时间参、shadow 已随 DEC-086 删 ⇒ **acc 派发逐位不变**（双跑对照测试钉死）；无任何读者依赖「标点清零」。
+- **测试**：新增 `fix438_*` **10/10**（验收 ①–⑨ + 源码级接线护栏）；既有 349 测试改名换口径（严格度原样）、349 缓存测试断言一字不动、`guard346` 锚点贴 438 形态、`acc346` 只改 doc、`Flags392`/测试本地仿真零改动。过滤全绿 `fix438` 10P / `punct` 140P/0F/2I / `local_stream` 92P/0F/7I。
+- **验证**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` 0 error、warnings **91/87 = 基线**；🔴 未跑全量 test、未 build、未 commit（红线）。**文档**：`collab/outbox/coder-2/result.md`（436 报告备份 `result-436-replay.md`）、`CHANGELOG.md`、`logs/20260926.md`、`docs/MACOS-HANDOFF.md`（平台中立一行）、本条。
+
 
