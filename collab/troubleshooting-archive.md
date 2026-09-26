@@ -5346,3 +5346,10 @@ TEST-SYNC-420 给 `fix_reflow_raw_base_420_tests` 加 `fn_body` helper，内含 
 新增 `guard_prod_lines::tests` 3 条（串/字符/原始串/注释/生命周期 + 嵌套 mod + 无花括号项）。
 附带暴露并修正 `testsync377::main_has_no_cross_recording_ctx_cache` 漏过滤注释的假绿（旧扫描器把含符号的注释误剔）。
 
+## [SLICE-VS-DISPATCH-001] 切片机制挂错环节：派发后切片 ≠ 派发触发（2026-09-26）
+
+- **现象**：BUILD-441 端测，背景人声连说 17s，预览一直显示背景人声，松键后最终文字才剔除干净。
+- **取证**：日志 `seg dispatch #6 (tail): seg_audio=17.32s` —— 17s 无 1200ms 静默 ⇒ `should_dispatch_acc`（只认静默）从未触发；437 的 `plan_gap_cuts` 在 `build_dispatch_segment` 内，只切已派发片。
+- **根因**：381/437 从设计起就挂在「派发后、解码前」，文档与汇报都写「10s 找切点」，从未讲清它不触发派发；Gavin 与主控都默认它在派发时生效，两个多版本无人发现。
+- **修法**：DEC-088 / DISPATCH-LONG-SPEECH-442，派发触发补「满 10s」，切点复用同一函数。
+- **可复用规则**：任何「切片 / 定界 / 派发」类机制，方案与汇报必须写明**挂在管线哪一步、由什么触发**；只写「怎么切」不写「何时切」即视为方案不完整。

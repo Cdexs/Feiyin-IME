@@ -348,6 +348,45 @@ fn should_dispatch_acc(
     silent_ms >= silence_ms && !done_for_pause
 }
 
+/// DISPATCH-LONG-SPEECH-442（Gavin 2026-09-26：「不做派发、只做后端解码对于体验来说有啥意义？赶紧改」
+/// 「应该是 1200ms 静默、或 10s 时长都可触发切片」）：派发触发只有两个 —— 静默 ≥1200ms（346 原有），
+/// 或待派语音满此时长 ⇒ 用 437 同一函数**回看**找切点（120ms 真停顿只是找切点的内部判据）。
+const LONG_SPEECH_LOOKBACK_MS: f32 = 10000.0;
+/// DISPATCH-LONG-SPEECH-442：回看切点上限（片内 11s）⇒ 派出的片 <11s，落在派发后兜底切片的
+/// 尾巴保护内（`vad::plan_gap_cuts` 剩余 <11s 不切），**不会被二次切**。
+const LONG_SPEECH_LOOKBACK_UPPER_MS: f32 = 11000.0;
+/// DISPATCH-LONG-SPEECH-442：待派片满此时长仍无停顿 ⇒ 允许字缝 / 最低能量兜底切（在 [10s,11s) 内）。
+const LONG_SPEECH_FALLBACK_MS: f32 = 12000.0;
+/// DISPATCH-LONG-SPEECH-442：回看判定节流（每 200ms 一次）。
+const LONG_SPEECH_CHECK_EVERY_MS: f32 = 200.0;
+/// DISPATCH-LONG-SPEECH-442：回看切点对应的流式文字 = 切点后此时长那一刻的显示（流式滞后补偿）。
+const LONG_SPEECH_TEXT_LAG_MS: f32 = 400.0;
+
+/// DISPATCH-LONG-SPEECH-442：带标点的显示文本里，覆盖到「裸文本前 `raw_prefix_bytes` 字节」为止的字符数。
+///
+/// 显示文本 = 裸文本 + 标点引擎插入的标点（只插不改字；英文大小写宽松比较）⇒ 逐字对齐：
+/// 与裸文本当前字相同 ⇒ 两边都前进；不同（插入的标点）⇒ 只数显示字。裸文本前缀耗尽即停。
+fn display_chars_for_raw_prefix(display: &str, raw: &str, raw_prefix_bytes: usize) -> usize {
+    let end = raw_prefix_bytes.min(raw.len());
+    let end = (0..=end)
+        .rev()
+        .find(|&b| raw.is_char_boundary(b))
+        .unwrap_or(0);
+    let target: Vec<char> = raw[..end].chars().collect();
+    let mut ti = 0usize;
+    let mut n = 0usize;
+    for dc in display.chars() {
+        if ti >= target.len() {
+            break;
+        }
+        n += 1;
+        if dc == target[ti] || dc.to_lowercase().eq(target[ti].to_lowercase()) {
+            ti += 1;
+        }
+    }
+    n
+}
+
 /// PARALLEL-ACC-298：录音结束时是否派发尾片。
 ///
 /// 🔴 **必须有语音才派**：纯静音尾片送 accuracy 会返回空 ⇒ 上层 `all_native` 翻 false ⇒
@@ -1275,6 +1314,14 @@ pub fn transcribe_streaming_local(
     let mut long_silence_done_for_pause = false;
     // 本次未派发区间内是否出现过语音（尾片「有语音才派」的判据）。
     let mut acc_pending_has_speech = false;
+    // DISPATCH-LONG-SPEECH-442：本次未派发区间内**首个语音 chunk** 所在 pcm 位置（长段计时起点）。
+    let mut acc_pending_speech_start: Option<usize> = None;
+    // DISPATCH-LONG-SPEECH-442：上次回看判定时的 pcm 位置（节流 200ms）。
+    let mut long_lookback_checked_at: usize = 0;
+    // DISPATCH-LONG-SPEECH-442：`(pcm 位置, 当刻裸文本字节长)` 短历史（约 4s）——回看切点在过去，
+    // 按切点那一刻的流式文字定精解覆盖边界，而不是按「现在」的整段显示。
+    let mut raw_len_history: std::collections::VecDeque<(usize, usize)> =
+        std::collections::VecDeque::new();
     // 已派发片数（= 下一片的 seg_index）。
     let mut acc_seg_index: usize = 0;
     // LOCALRT-REFLOW-HOLE-344-G：上一片派发时的 `committed_len`（= 该片流式文本的起点字符）。
@@ -1401,6 +1448,9 @@ pub fn transcribe_streaming_local(
         if vad_speech {
             speech_since_last_reset = true;
             acc_pending_has_speech = true;
+            if acc_pending_speech_start.is_none() {
+                acc_pending_speech_start = Some(pcm.len());
+            }
             // LOCALRT-ENDPOINT-EMPTY-342（392 契约变更）：本句 VAD 判有人声 ⇒ 342 后续 endpoint 文本不丢；
             // 门只管时序（见上）；门误判时最坏只是停顿判断不准，**绝不丢录音人的话**。
         }
@@ -1713,7 +1763,7 @@ pub fn transcribe_streaming_local(
             if !padded.is_empty() {
                 if log::log_enabled!(log::Level::Debug) {
                     log::debug!(
-                        "[LocalRT-DBG-298] seg dispatch #{}: silence={:.0}ms seg_audio={:.2}s pcm_pos={}",
+                        "[LocalRT-DBG-298] seg dispatch #{}: silence={:.0}ms seg_audio={:.2}s pcm_pos={} reason=silence",
                         acc_seg_index,
                         acc_silent_ms,
                         pending as f32 / SAMPLE_RATE as f32,
@@ -1763,7 +1813,97 @@ pub fn transcribe_streaming_local(
             // 无论 padded 是否为空都推进起点 + 上 latch：避免同一停顿反复尝试。
             acc_dispatched_end = pcm.len();
             acc_pending_has_speech = false;
+            acc_pending_speech_start = None;
             acc_done_for_pause = true;
+        }
+
+        // DISPATCH-LONG-SPEECH-442（回看切点）：满 10s 仍未派（没等到 120ms 静默）⇒ 用派发后兜底切片
+        // **同一个函数** `vad::slice_cut_at` 在待派音频上找切点，只接受后续音频不会改变的切点：
+        // [8,10]s 真停顿（取最靠近 10s）/ [10s, min(11s, 现在-1s)] 最早真停顿 / 满 12s 才允许字缝·最低能量兜底。
+        // 切点在过去 ⇒ 只派 [已派到, 切点)，其后继续攒；精解覆盖边界按切点那一刻的流式文字定。
+        let ms_to_samples = |ms: f32| (ms * SAMPLE_RATE as f32 / 1000.0) as usize;
+        // 片起点 = 已派到位置（与派发后兜底切片同口径）；仅当前导静音 ≥8s 时改从「开口前 0.5s」起算，
+        // 免得 [8,10]s 窗落进长静音里。
+        let lookback_origin = match acc_pending_speech_start {
+            Some(s) if s.saturating_sub(acc_dispatched_end) >= ms_to_samples(8000.0) => {
+                s.saturating_sub(ms_to_samples(500.0))
+            }
+            _ => acc_dispatched_end,
+        };
+        if acc_cfg.enabled
+            && acc_pending_has_speech
+            && acc_pending_speech_start.is_some()
+            && pcm.len().saturating_sub(lookback_origin) >= ms_to_samples(LONG_SPEECH_LOOKBACK_MS)
+            && (pcm.len().saturating_sub(long_lookback_checked_at) as f32 * 1000.0
+                / SAMPLE_RATE as f32)
+                >= LONG_SPEECH_CHECK_EVERY_MS
+        {
+            long_lookback_checked_at = pcm.len();
+            let start = acc_dispatched_end;
+            let upper = (lookback_origin + ms_to_samples(LONG_SPEECH_LOOKBACK_UPPER_MS))
+                .min(pcm.len().saturating_sub(ms_to_samples(1000.0)));
+            let allow_fallback =
+                pcm.len().saturating_sub(lookback_origin) >= ms_to_samples(LONG_SPEECH_FALLBACK_MS);
+            if let Some((cut, kind, pause_ms)) =
+                super::vad::slice_cut_at(&pcm, lookback_origin, upper, allow_fallback)
+            {
+                if cut > start && cut < pcm.len() {
+                    // 切点那一刻（+流式滞后补偿）的裸文本长度 ⇒ 显示文本里的覆盖字符数。
+                    let at = (cut + ms_to_samples(LONG_SPEECH_TEXT_LAG_MS)).min(pcm.len());
+                    let raw_now = display_cache.text();
+                    let raw_at = raw_len_history
+                        .iter()
+                        .rev()
+                        .find(|(p, _)| *p <= at)
+                        .map(|(_, l)| *l)
+                        .unwrap_or(punct_tail_start)
+                        .max(punct_tail_start)
+                        .min(raw_now.len());
+                    let committed_len =
+                        display_chars_for_raw_prefix(&last_display, raw_now, raw_at)
+                            .max(acc_prev_committed);
+                    let (padded, spans) =
+                        build_dispatch_segment_with_spans(start, cut - start, pcm.len(), &pcm);
+                    if !padded.is_empty() {
+                        if log::log_enabled!(log::Level::Debug) {
+                            log::debug!(
+                                "[LocalRT-DBG-298] seg dispatch #{}: reason=lookback kind={} pause_ms={} seg_audio={:.2}s pcm_pos={} committed_len={}",
+                                acc_seg_index,
+                                kind,
+                                pause_ms,
+                                (cut - start) as f32 / SAMPLE_RATE as f32,
+                                start,
+                                committed_len
+                            );
+                        }
+                        punct_head_chars = committed_len;
+                        punct_tail_start = raw_at;
+                        let seg_streaming: String = last_display
+                            .chars()
+                            .skip(acc_prev_committed)
+                            .take(committed_len.saturating_sub(acc_prev_committed))
+                            .collect();
+                        acc_prev_committed = committed_len;
+                        // 切点在过去、VAD 可能仍在段中 ⇒ 时间线不全时回退 391 自跑 VAD（不吞字）。
+                        let slice_ranges =
+                            dispatch_slice_ranges(vad_on, vad_speech, &speech_timeline, &spans);
+                        on_segment(
+                            acc_seg_index,
+                            committed_len,
+                            padded,
+                            seg_streaming,
+                            slice_ranges,
+                        );
+                        // 边界已知（切点那一刻的流式文字）⇒ 直接登记，不走 337 自适应定界。
+                        on_reflow_commit(acc_seg_index, Some(committed_len));
+                        acc_seg_index += 1;
+                    }
+                    acc_dispatched_end = cut;
+                    // 切点之后的剩余音频仍在说话 ⇒ 仍有语音，长段计时从切点重新起算。
+                    acc_pending_has_speech = true;
+                    acc_pending_speech_start = Some(cut);
+                }
+            }
         }
 
         // LOCALRT-TAIL-WINDOW-407：长静默（≥1900ms 无新语音）**只发一次**「末尾组窗」信号。
@@ -1789,6 +1929,17 @@ pub fn transcribe_streaming_local(
         // 显示基文本（LOCALRT-PERF-405 F-C-01 增量缓存）：`confirmed` 区 + 当前句 current 区。
         // DEC-086：影子收尾已移除，不再有 main/shadow 取长切换。
         let raw_full: &str = display_cache.text();
+        // DISPATCH-LONG-SPEECH-442：记 `(pcm 位置, 裸文本字节长)` 短历史（只在长度变化时记，保留约 4s）。
+        if raw_len_history.back().map(|(_, l)| *l) != Some(raw_full.len()) {
+            raw_len_history.push_back((pcm.len(), raw_full.len()));
+        }
+        while raw_len_history
+            .front()
+            .is_some_and(|(p, _)| pcm.len().saturating_sub(*p) > 4 * SAMPLE_RATE as usize)
+            && raw_len_history.len() > 1
+        {
+            raw_len_history.pop_front();
+        }
         if !raw_full.is_empty() {
             // 有新内容 = raw 比上次打点时长（`raw_len` 初值 0 且 raw 非空 ⇒ 首次恒 true）。
             let has_new = raw_full.len() > punct_cache.raw_len;
@@ -2392,11 +2543,12 @@ mod timeline393_tests {
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
+        // 录音中的派发点有两个：静默 1200ms 派发 + 442 满 10s 回看派发，均须以 vad_speech 传入。
         assert_eq!(
             code.matches("dispatch_slice_ranges(vad_on, vad_speech,")
                 .count(),
-            1,
-            "中途派发必须恰 1 处以 vad_speech 传入（进行中段回退）"
+            2,
+            "录音中两个派发点（静默 / 442 回看）都必须以 vad_speech 传入（进行中段回退）"
         );
         assert_eq!(
             code.matches("dispatch_slice_ranges(vad_on, false,").count(),
@@ -3776,16 +3928,22 @@ mod tests {
             1,
             "438: 仅实际打点处归零 1 处"
         );
-        // 双坐标：中途派发 + 尾片派发各捕获一次（同刻同源：committed_len / last_display_raw_len）。
+        // 双坐标：每个派发点各捕获一次 —— 静默派发 + 尾片派发（同刻同源：committed_len /
+        // last_display_raw_len）+ 442 满 10s 回看派发（切点那一刻：committed_len / raw_at）。
         assert_eq!(
             count_line("punct_head_chars = committed_len;"),
-            2,
-            "438: 中途/尾片派发各捕获 committed_len"
+            3,
+            "438/442: 静默/尾片/回看三个派发点各捕获 committed_len"
         );
         assert_eq!(
             count_line("punct_tail_start = last_display_raw_len;"),
             2,
-            "438: 中途/尾片派发各捕获 raw 侧边界"
+            "438: 静默/尾片派发各捕获「当刻」raw 侧边界"
+        );
+        assert_eq!(
+            count_line("punct_tail_start = raw_at;"),
+            1,
+            "442: 回看派发捕获「切点那一刻」raw 侧边界"
         );
         // 打点归零块存在且不碰 acc 计数器（与 guard346 同口径，防有人把归零接到 acc 上）。
         assert_eq!(
@@ -5498,5 +5656,92 @@ mod testsync434_tests {
             MIN_FRAMES,
             "120ms/20ms ⇒ 6 帧，与生产公式一致"
         );
+    }
+}
+
+// =====================================================================
+// DISPATCH-LONG-SPEECH-442：满 10s 回看切点派发（与派发后兜底切片同一函数）
+// =====================================================================
+#[cfg(test)]
+mod dispatch_long_speech_442_tests {
+    use super::display_chars_for_raw_prefix;
+
+    /// 生产区源码（截到本测试模块之前，防自匹配）。
+    fn prod_src() -> String {
+        let src = include_str!("local_stream.rs");
+        let cut = src
+            .find(concat!("mod dispatch_long_speech_442", "_tests"))
+            .unwrap_or(src.len());
+        src[..cut].to_string()
+    }
+
+    /// 切点那一刻的裸文本前缀 ⇒ 带标点显示文本里的覆盖字符数（插入的标点一并计入）。
+    #[test]
+    fn t442_display_chars_skip_inserted_punct() {
+        let raw = "今天天气很好我们一起去公园散步然后";
+        let display = "今天天气很好，我们一起去公园散步然后";
+        let upto = "今天天气很好我们一起去公园散步".len();
+        // 15 个裸字 + 1 个插入的逗号 = 16
+        assert_eq!(display_chars_for_raw_prefix(display, raw, upto), 16);
+        // 「然后」不被计入 ⇒ 回灌后仍作为流式尾巴保留（不回缩）。
+        let n = display_chars_for_raw_prefix(display, raw, upto);
+        let tail: String = display.chars().skip(n).collect();
+        assert_eq!(tail, "然后");
+    }
+
+    /// 前缀为 0 / 超长 / 落在字中间（非 char 边界）都不 panic，且单调合理。
+    #[test]
+    fn t442_display_chars_boundary_safe() {
+        let raw = "你好世界";
+        let display = "你好，世界。";
+        assert_eq!(display_chars_for_raw_prefix(display, raw, 0), 0);
+        assert_eq!(display_chars_for_raw_prefix(display, raw, 999), 5);
+        // 7 字节落在「世」中间 ⇒ 退到 6（「你好」）⇒ 2 字
+        assert_eq!(display_chars_for_raw_prefix(display, raw, 7), 2);
+    }
+
+    /// 英文：标点引擎可能改大小写，宽松比较。
+    #[test]
+    fn t442_display_chars_case_insensitive() {
+        let raw = "hello world again";
+        let display = "Hello world, again.";
+        assert_eq!(
+            display_chars_for_raw_prefix(display, raw, "hello world".len()),
+            11
+        );
+    }
+
+    /// 接线：满 10s 回看、用与兜底切片同一函数、上限 11s、12s 才允许兜底、边界直接登记。
+    #[test]
+    fn t442_lookback_wiring() {
+        let p = prod_src();
+        assert!(p.contains(concat!("const LONG_SPEECH_LOOKBACK_MS: f32 = ", "10000.0")));
+        assert!(p.contains(concat!(
+            "const LONG_SPEECH_LOOKBACK_UPPER_MS: f32 = ",
+            "11000.0"
+        )));
+        assert!(p.contains(concat!("const LONG_SPEECH_FALLBACK_MS: f32 = ", "12000.0")));
+        assert!(p.contains(concat!(
+            "super::vad::slice_cut_at(&pcm, lookback_origin",
+            ", upper, allow_fallback)"
+        )));
+        assert!(p.contains(concat!(
+            "on_reflow_commit(acc_seg_index, ",
+            "Some(committed_len))"
+        )));
+        assert!(p.contains(concat!("acc_dispatched_end = ", "cut;")));
+        // 已删除的「满 8s 遇 120ms 当场派发」不得复活（120ms 只是找切点的内部判据）。
+        assert!(!p.contains(concat!("fn long_speech", "_dispatch(")));
+    }
+
+    /// 1200ms 静默派发原样保留（只认静默；与 10s 时长并列、谁先满足谁先派）。
+    #[test]
+    fn t442_silence_dispatch_kept() {
+        let p = prod_src();
+        assert!(p.contains(concat!("silent_ms >= silence_ms && ", "!done_for_pause")));
+        assert!(p.contains(concat!(
+            "const ACC_DISPATCH_SILENCE_MS_DEFAULT: f32 = ",
+            "1200.0"
+        )));
     }
 }

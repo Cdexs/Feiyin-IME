@@ -25,7 +25,7 @@
 
 | 项 | 状态 |
 | --- | --- |
-| 版本 | 0.9.3（未动）；最新包 **BUILD-441**（含 439/440/441；前一包 BUILD-438 含 438），待 Gavin 带 `-debug` 端测；未 push |
+| 版本 | 0.9.3（未动）；最新包 **BUILD-442**（含 442；前一包 BUILD-441 含 439/440/441），待 Gavin 带 `-debug` 端测；未 push |
 | Worker | 09-26 三方就绪（OpenCode `MiMo-V2.6-Flash Free`，无需 `/permissions`）；三方空闲，待派 |
 | 文档 | 09-26 归档 handoffs 09-25 共 52 条；已完成功能按版本移入 `progress.md`「v0.9.3（BUILD-398 ~ BUILD-435）」；撤销项与过程原文移入 `todo-archive.md`【归档十】 |
 

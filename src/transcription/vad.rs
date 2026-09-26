@@ -651,14 +651,9 @@ fn plan_sliding_cuts(
 /// 每个切点打一条 Debug 日志 `[DBG-437] slice cut: at=…s kind=pause_in|pause_out|gap|lowest …`。
 pub fn plan_gap_cuts(audio: &[f32], start: usize, end: usize) -> Vec<(usize, usize)> {
     const RATE: usize = 16000;
-    let frame = GAP_FRAME_SAMPLES;
     let search_start = (SLIDING_CUT_SEARCH_START_SECS * RATE as f64) as usize; // 10s
     let search_max = (GAP_SEARCH_MAX_SECS * RATE as f64) as usize; // 2s
     let min_tail = (MIN_TAIL_SECS * RATE as f64) as usize; // 1s
-                                                           // R1-1 内侧窗下界 = 起搜点 - 2s = 8s（片内相对坐标）
-    let inner_lo = search_start - (SLICE_CUT_INNER_BACK_SECS * RATE as f64) as usize;
-    // SLICE-CUT-REAL-PAUSE-437：真停顿最少帧数（120ms ÷ 20ms/帧 ⇒ 6 帧），与 434 同算法。
-    let min_pause_frames = ((SLICE_CUT_MIN_PAUSE_MS as usize * 16 + frame - 1) / frame).max(1);
 
     let mut out: Vec<(usize, usize)> = Vec::new();
     let mut pos = start;
@@ -671,39 +666,9 @@ pub fn plan_gap_cuts(audio: &[f32], start: usize, end: usize) -> Vec<(usize, usi
         }
         // 外侧窗兜底上限：最晚 12s，且至少给尾巴留 min_tail
         let upper = (pos + search_start + search_max).min(end - min_tail);
-        // 判据的中位数 / 帧网格都锚在**本片起点** ⇒ 一律传片内相对坐标。
-        // `audio.get(pos..)`：调用方可能给越界 `end`（见 #2c），切片不得 panic。
-        let sub = audio.get(pos..).unwrap_or(&[]);
-        // R1-1：[8s,10s] 从 10s 往前 ⇒ 候选按升序，**最后一段**即最靠近 10s。
+        // DISPATCH-LONG-SPEECH-442：三级找切点抽成 [`slice_cut_at`]，派发前（录音中）与本处（派发后兜底）共用。
         let (cut, kind, pause_ms) =
-            match real_pause_cut_candidates(sub, inner_lo, search_start, frame, min_pause_frames)
-                .last()
-            {
-                Some(&(mid, cnt)) => (pos + mid, "pause_in", pause_ms_of(cnt, frame, RATE)),
-                // R1-2：[10s,12s] 最早真停顿。
-                None => match real_pause_cut_candidates(
-                    sub,
-                    search_start,
-                    upper.saturating_sub(pos),
-                    frame,
-                    min_pause_frames,
-                )
-                .first()
-                {
-                    Some(&(mid, cnt)) => (pos + mid, "pause_out", pause_ms_of(cnt, frame, RATE)),
-                    // R1-3：原 `find_gap_cut` 逐位不变。
-                    None => {
-                        match find_gap_cut_gap_only(audio, pos, pos + search_start, upper, frame) {
-                            Some(gap) => (gap, "gap", 0u32),
-                            None => (
-                                find_gap_cut(audio, pos, pos + search_start, upper, frame),
-                                "lowest",
-                                0u32,
-                            ),
-                        }
-                    }
-                },
-            };
+            slice_cut_at(audio, pos, upper, true).expect("allow_fallback=true 恒有切点");
         if log::log_enabled!(log::Level::Debug) {
             log::debug!(
                 "[DBG-437] slice cut: at={:.3}s kind={} pause_ms={} piece_start={:.3}s",
@@ -717,6 +682,65 @@ pub fn plan_gap_cuts(audio: &[f32], start: usize, end: usize) -> Vec<(usize, usi
         pos = cut;
     }
     out
+}
+
+/// DISPATCH-LONG-SPEECH-442：**唯一的**切点选择函数（437 三级），派发前 / 派发后共用。
+///
+/// 在以 `pos` 为片起点的音频上找第一个切点（返回**绝对**样本坐标）：
+/// 1. `pause_in`：`[pos+8s, pos+10s]` 内 ≥120ms 真停顿，取**最靠近 10s** 的一段中点；
+/// 2. `pause_out`：`[pos+10s, upper]` 内**最早**真停顿中点；
+/// 3. `allow_fallback` 时：`[pos+10s, upper]` 内最早字缝（`gap`），再无取 RMS 最低帧（`lowest`）。
+///
+/// - 派发后兜底（[`plan_gap_cuts`]）：`upper = min(pos+12s, end-1s)`、`allow_fallback=true` —— 与 437 逐位相同；
+/// - 录音中派发前（`local_stream`）：`upper` 取到 11s 以内、音频够长才 `allow_fallback`，只接受
+///   「后续音频不会改变」的切点 ⇒ 派出的片 <11s，落在 [`plan_gap_cuts`] 尾巴保护内，不会被二次切。
+///
+/// 判据中位数 / 帧网格锚在片起点 `pos`（片内相对坐标），同 437。
+pub(crate) fn slice_cut_at(
+    audio: &[f32],
+    pos: usize,
+    upper: usize,
+    allow_fallback: bool,
+) -> Option<(usize, &'static str, u32)> {
+    const RATE: usize = 16000;
+    let frame = GAP_FRAME_SAMPLES;
+    let search_start = (SLIDING_CUT_SEARCH_START_SECS * RATE as f64) as usize; // 10s
+    let inner_lo = search_start - (SLICE_CUT_INNER_BACK_SECS * RATE as f64) as usize; // 8s
+    let min_pause_frames = ((SLICE_CUT_MIN_PAUSE_MS as usize * 16 + frame - 1) / frame).max(1);
+    // `audio.get(pos..)`：调用方可能给越界坐标，切片不得 panic。
+    let sub = audio.get(pos..).unwrap_or(&[]);
+    // R1-1：[8s,10s] 从 10s 往前 ⇒ 候选按升序，**最后一段**即最靠近 10s。
+    if let Some(&(mid, cnt)) =
+        real_pause_cut_candidates(sub, inner_lo, search_start, frame, min_pause_frames).last()
+    {
+        return Some((pos + mid, "pause_in", pause_ms_of(cnt, frame, RATE)));
+    }
+    // R1-2：[10s, upper] 最早真停顿。
+    if let Some(&(mid, cnt)) = real_pause_cut_candidates(
+        sub,
+        search_start,
+        upper.saturating_sub(pos),
+        frame,
+        min_pause_frames,
+    )
+    .first()
+    {
+        return Some((pos + mid, "pause_out", pause_ms_of(cnt, frame, RATE)));
+    }
+    if !allow_fallback {
+        return None;
+    }
+    // R1-3：原 `find_gap_cut` 逐位不变。
+    Some(
+        match find_gap_cut_gap_only(audio, pos, pos + search_start, upper, frame) {
+            Some(gap) => (gap, "gap", 0u32),
+            None => (
+                find_gap_cut(audio, pos, pos + search_start, upper, frame),
+                "lowest",
+                0u32,
+            ),
+        },
+    )
 }
 
 /// SLICE-CUT-REAL-PAUSE-437：真停顿段时长（ms）= 帧数 × 帧长 / 16k。
@@ -2319,6 +2343,97 @@ mod tests {
             (start, start + fix437_pause_mid(560, 566)),
             "帧网格锚在本片起点，中点须加回 start"
         );
+    }
+
+    // ============================================================
+    // DISPATCH-LONG-SPEECH-442：派发前回看切点（与派发后兜底切片同一函数 `slice_cut_at`）
+    // ============================================================
+
+    /// 派发前上限 11s：[8,10] 有真停顿 ⇒ `pause_in`，切点与派发后兜底切片的首刀**完全相同**（同一函数）。
+    #[test]
+    fn t442_lookback_pause_in_matches_offline_first_cut() {
+        let total = 20 * TS381_RATE;
+        let mut audio = ts381_sine(total, 0.3);
+        fix437_quiet_frames(&mut audio, 0, 475, 482); // 9.50s 起 140ms 真停顿
+        let live = slice_cut_at(&audio, 0, 11 * TS381_RATE, false);
+        let offline = plan_gap_cuts(&audio, 0, total);
+        let (cut, kind, _) = live.expect("[8,10] 有真停顿必须当场给出切点");
+        assert_eq!(kind, "pause_in");
+        assert_eq!(cut, offline[0].1, "派发前与派发后必须是同一个切点");
+        assert!(cut < 11 * TS381_RATE);
+    }
+
+    /// [8,10] 无、[10,11) 有 ⇒ `pause_out`，且 <11s（落在兜底切片尾巴保护内，不会被二次切）。
+    #[test]
+    fn t442_lookback_pause_out_below_11s() {
+        let total = 20 * TS381_RATE;
+        let mut audio = ts381_sine(total, 0.3);
+        fix437_quiet_frames(&mut audio, 0, 525, 532); // 10.50s 起 140ms
+        let (cut, kind, _) =
+            slice_cut_at(&audio, 0, 11 * TS381_RATE, false).expect("[10,11) 有真停顿");
+        assert_eq!(kind, "pause_out");
+        assert!(cut > 10 * TS381_RATE && cut < 11 * TS381_RATE);
+        // 派出的片 <11s ⇒ 兜底切片原样一片（不二次切）。
+        assert_eq!(plan_gap_cuts(&audio, 0, cut), vec![(0, cut)]);
+    }
+
+    /// 没有真停顿：未到兜底时长（allow_fallback=false）⇒ 不切，继续等；到了 ⇒ 在 [10,11) 兜底切。
+    #[test]
+    fn t442_lookback_fallback_only_when_allowed() {
+        let total = 20 * TS381_RATE;
+        let audio = ts381_sine(total, 0.3);
+        assert_eq!(slice_cut_at(&audio, 0, 11 * TS381_RATE, false), None);
+        let (cut, kind, _) = slice_cut_at(&audio, 0, 11 * TS381_RATE, true).expect("兜底恒有切点");
+        assert!(kind == "gap" || kind == "lowest", "{kind}");
+        assert!(cut >= 10 * TS381_RATE && cut <= 11 * TS381_RATE);
+    }
+
+    /// 兜底切片（派发后）改为调用 `slice_cut_at` 后与 437 旧实现**逐位相同**。
+    #[test]
+    fn t442_offline_plan_unchanged_vs_legacy() {
+        let total = 25 * TS381_RATE;
+        let mut audio = ts381_sine(total, 0.3);
+        fix437_quiet_frames(&mut audio, 0, 490, 497);
+        fix437_quiet_frames(&mut audio, 0, 1050, 1057);
+        let mut plain = ts381_sine(total, 0.3);
+        fix437_quiet_frames(&mut plain, 0, 450, 451);
+        for a in [&audio, &plain] {
+            assert_eq!(
+                plan_gap_cuts(a, 0, total),
+                fix437_plan_r1_reference(a, 0, total)
+            );
+        }
+    }
+
+    /// 437 R1 三级的独立参考实现（改为共用函数前的原逻辑逐字搬来），供逐位比对。
+    fn fix437_plan_r1_reference(audio: &[f32], start: usize, end: usize) -> Vec<(usize, usize)> {
+        let frame = GAP_FRAME_SAMPLES;
+        let r = TS381_RATE;
+        let min_frames = ((SLICE_CUT_MIN_PAUSE_MS as usize * 16 + frame - 1) / frame).max(1);
+        let mut out = Vec::new();
+        let mut pos = start;
+        while pos < end {
+            if end - pos < 11 * r {
+                out.push((pos, end));
+                break;
+            }
+            let upper = (pos + 12 * r).min(end - r);
+            let sub = &audio[pos..];
+            let cut = if let Some(&(mid, _)) =
+                real_pause_cut_candidates(sub, 8 * r, 10 * r, frame, min_frames).last()
+            {
+                pos + mid
+            } else if let Some(&(mid, _)) =
+                real_pause_cut_candidates(sub, 10 * r, upper - pos, frame, min_frames).first()
+            {
+                pos + mid
+            } else {
+                find_gap_cut(audio, pos, pos + 10 * r, upper, frame)
+            };
+            out.push((pos, cut));
+            pos = cut;
+        }
+        out
     }
 
     /// 逐位相等（`to_bits`）—— 比 `f32 ==` 更严（`-0.0` 与 `0.0` 也会被区分）。

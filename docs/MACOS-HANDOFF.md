@@ -2530,3 +2530,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 行为变化 | 去重节点对所有调用它的管线新增规则 D（平台中立）；本地实时最终上屏前不再去重（已在回灌前做一遍）；在线 / 批处理最终节点逐位不变 |
 | 对 macOS 的影响 | `text_normalizer.rs` 两端共用 ⇒ macOS 自动获得规则 D；`run_pipeline_core` 签名 +1 参数，macOS 若有直接调用须补传 `FinalFillerNode::AtFinal`（本端核对：全仓 3 处调用均已补齐） |
 | 是否需要对方同步 | 否（除非 macOS 分支另有 `run_pipeline_core` 调用点） |
+
+## DISPATCH-LONG-SPEECH-442（2026-09-26，主控）
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | `src/transcription/local_stream.rs` 本地实时派发新增「待派满 10s 回看切点」触发；`src/transcription/vad.rs` 三级切点抽成 `slice_cut_at`（`plan_gap_cuts` 改调它，逐位不变） |
+| 行为变化 | 本地实时：连续说话满 10s 即中途派发（此前只按 1200ms 静默）；精解 / 声纹剔除 / 回灌在录音中途发生 |
+| 对 macOS 的影响 | 两文件平台中立，macOS 编译同一份；若 macOS 启用本地实时管线则自动获得同样行为；无新依赖 / 无 cfg / 无签名变化（`slice_cut_at` 为 `pub(crate)` 新增） |
+| 是否需要对方同步 | 否 |

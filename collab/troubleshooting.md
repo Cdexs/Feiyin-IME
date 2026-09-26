@@ -95,6 +95,7 @@
 
 | ID | 现象 → 判据 |
 | --- | --- |
+| [SLICE-VS-DISPATCH-001] | 以为「10s 找切点」在派发时起作用，实际只在**派发后解码前**切片 → 连续说话 / 背景声不停时整段到松键才派发。判据：区分「**何时派发**」（`should_dispatch_acc`）与「**派出后怎么切**」（`plan_gap_cuts`），任何切片机制上线前先写清它挂在哪一步（2026-09-26，DEC-088） |
 | [OVERLAY-FLUSH-TEXT-DROP-001] | 松手后 overlay 预览尾字/尾段不上屏（最终注入文本完整）→ **flush 帧 StreamingText 结构性必丢**：`STREAMING_STOPPED`（`main.rs` 松手即置 true）+ `should_ignore_streaming_text`（= stopped）⇒ flush 必在松手后 ⇒ 必被丢。**已修（LOCALRT-FIRSTCHAR-282）**：**不改共享 latch**，新开本地档专用事件 `StreamingFinalPreview`（只有本地档发/收）；在线档代码路径结构上不变 |
 | [ASR-SAMPLERATE-STREAM-001] | 边录边发后识别结果变成完全不相干的客服话术 → 采样率写死 16kHz 未重采样 48kHz，看日志秒数是否恰为实际 3 倍 |
 | [ASR-LONG-AUDIO-001] / [ASR-NATIVE-LONG-001] | accuracy 长音频空输出 / 乱码 / 截断 → native `max_total_len=512` 硬限制，VAD 切段 ≤20s 逐段转录拼接根治 |
