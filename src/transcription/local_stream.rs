@@ -362,6 +362,27 @@ const LONG_SPEECH_CHECK_EVERY_MS: f32 = 200.0;
 /// DISPATCH-LONG-SPEECH-442：回看切点对应的流式文字 = 切点后此时长那一刻的显示（流式滞后补偿）。
 const LONG_SPEECH_TEXT_LAG_MS: f32 = 400.0;
 
+/// FIX-LATE-STREAM-TAIL-445：冻结边界后「迟到字」跟踪的一步（**纯函数**）。
+///
+/// - `late` = 已冻结的最近一片边界 `(seg, len)`；`None` ⇒ 不跟踪。
+/// - 开口（`pending_speech`）或已有新派发在定界（`bound_pending`）⇒ 停止跟踪，不吸收。
+/// - 否则显示字数 `cur > len` ⇒ 返回 `absorb = Some((seg, cur))`（调用方重登记边界），并把跟踪长度推到 `cur`。
+///
+/// 返回 `(新的跟踪状态, 本步要重登记的边界)`。
+fn late_bound_step(
+    late: Option<(usize, usize)>,
+    pending_speech: bool,
+    bound_pending: bool,
+    cur: usize,
+) -> (Option<(usize, usize)>, Option<(usize, usize)>) {
+    match late {
+        None => (None, None),
+        Some(_) if pending_speech || bound_pending => (None, None),
+        Some((seg, len)) if cur > len => (Some((seg, cur)), Some((seg, cur))),
+        Some(l) => (Some(l), None),
+    }
+}
+
 /// DISPATCH-LONG-SPEECH-442：带标点的显示文本里，覆盖到「裸文本前 `raw_prefix_bytes` 字节」为止的字符数。
 ///
 /// 显示文本 = 裸文本 + 标点引擎插入的标点（只插不改字；英文大小写宽松比较）⇒ 逐字对齐：
@@ -1330,6 +1351,9 @@ pub fn transcribe_streaming_local(
     // LOCALRT-SEAM-337：**自适应定界**状态（见 `on_reflow_commit` 参数文档）。
     // `bound_seg = Some(i)` ⇒ 第 i 片已派发，正在等「文本停止增长 / 有声恢复 / 硬上限」最先发生。
     let mut bound_seg: Option<usize> = None;
+    // FIX-LATE-STREAM-TAIL-445：已冻结（a / c）的最近一片边界 `(seg, len)`；此后 VAD 未再听到语音时
+    // 流式迟到吐出的字归入该片（边界后移 + 重登记），开口 / 新派发即停止跟踪。
+    let mut late_bound: Option<(usize, usize)> = None;
     let mut bound_prev_len: usize = 0;
     let mut bound_stable_ms: f32 = 0.0;
     let mut bound_waited_ms: f32 = 0.0;
@@ -1508,6 +1532,7 @@ pub fn transcribe_streaming_local(
                 }
                 on_reflow_commit(seg, None);
                 bound_seg = None;
+                late_bound = None;
             } else {
                 let cur = last_display.chars().count();
                 if cur > bound_prev_len {
@@ -1533,6 +1558,7 @@ pub fn transcribe_streaming_local(
                     }
                     on_reflow_commit(seg, Some(cur));
                     bound_seg = None;
+                    late_bound = Some((seg, cur));
                 } else if bound_waited_ms >= ACC_BOUNDARY_CAP_MS {
                     // c：硬上限兜底。
                     // F-A-02（405）：bound_hit_c 仅喂 DBG-337 日志 ⇒ Debug 守卫。
@@ -1550,9 +1576,37 @@ pub fn transcribe_streaming_local(
                     }
                     on_reflow_commit(seg, Some(cur));
                     bound_seg = None;
+                    late_bound = Some((seg, cur));
                 }
             }
         }
+
+        // FIX-LATE-STREAM-TAIL-445（Gavin 2026-09-26「最终输出文本和预览文本有差别，证明没有及时回灌刷新」）：
+        // 337 边界按「文本停止增长 500ms」冻结，但流式模型偶有更长的滞后（15:01 端测：冻结后 0.2~0.8s 又吐
+        // 「算了」）。冻结后 VAD 未再听到语音 ⇒ 这些字只能来自已派发的那片音频，精解已对它负责 ⇒
+        // 归入该片：边界后移并重登记（主线程 `on_bound` 对最新已渲染片重渲），438 打点冻结坐标与下一片
+        // 流式起点同步后移。开口（`acc_pending_has_speech`）或新派发（`bound_seg`）即停止跟踪。
+        let (next_late, absorb) = late_bound_step(
+            late_bound,
+            acc_pending_has_speech,
+            bound_seg.is_some(),
+            last_display.chars().count(),
+        );
+        if let Some((seg, cur)) = absorb {
+            if log::log_enabled!(log::Level::Debug) {
+                log::debug!(
+                    "[DBG-445] late stream chars absorbed: seg={} committed_len {}→{}",
+                    seg,
+                    late_bound.map(|(_, l)| l).unwrap_or(0),
+                    cur
+                );
+            }
+            on_reflow_commit(seg, Some(cur));
+            punct_head_chars = cur;
+            punct_tail_start = last_display_raw_len;
+            acc_prev_committed = cur;
+        }
+        late_bound = next_late;
 
         let endpoint = recognizer.is_endpoint(&stream);
 
@@ -1659,6 +1713,7 @@ pub fn transcribe_streaming_local(
                 }
                 on_reflow_commit(seg, Some(cur));
                 bound_seg = None;
+                late_bound = Some((seg, cur));
             }
             // LOCALRT-ENDPOINT-284 诊断（方案 A 取证）：每次切句打一行，行数=切句次数。
             // 342：`has_speech=false` 的假 endpoint 不推进 sentence_id（游标不动）。
@@ -3935,10 +3990,16 @@ mod tests {
             3,
             "438/442: 静默/尾片/回看三个派发点各捕获 committed_len"
         );
+        // 静默 / 尾片派发各捕获「当刻」raw 侧边界；445 迟到字归入上一片时边界后移，同刻同源再捕获一次。
         assert_eq!(
             count_line("punct_tail_start = last_display_raw_len;"),
-            2,
-            "438: 静默/尾片派发各捕获「当刻」raw 侧边界"
+            3,
+            "438/445: 静默/尾片派发 + 迟到字吸收各捕获「当刻」raw 侧边界"
+        );
+        assert_eq!(
+            count_line("punct_head_chars = cur;"),
+            1,
+            "445: 迟到字吸收时冻结前缀随边界后移（与 raw 侧同刻）"
         );
         assert_eq!(
             count_line("punct_tail_start = raw_at;"),
@@ -5743,5 +5804,77 @@ mod dispatch_long_speech_442_tests {
             "const ACC_DISPATCH_SILENCE_MS_DEFAULT: f32 = ",
             "1200.0"
         )));
+    }
+}
+
+// =====================================================================
+// FIX-LATE-STREAM-TAIL-445：冻结边界后流式迟到字归入上一片
+// =====================================================================
+#[cfg(test)]
+mod late_stream_tail_445_tests {
+    use super::late_bound_step;
+
+    fn prod_src() -> String {
+        let src = include_str!("local_stream.rs");
+        let cut = src
+            .find(concat!("mod late_stream_tail_445", "_tests"))
+            .unwrap_or(src.len());
+        src[..cut].to_string()
+    }
+
+    /// 15:01 端测复现：边界 63 冻结后静默中又吐「算」「了」⇒ 两次吸收，边界 63→64→65。
+    #[test]
+    fn t445_absorbs_late_chars_while_silent() {
+        let s0 = Some((3usize, 63usize));
+        let (s1, a1) = late_bound_step(s0, false, false, 64);
+        assert_eq!(a1, Some((3, 64)));
+        let (s2, a2) = late_bound_step(s1, false, false, 65);
+        assert_eq!(a2, Some((3, 65)));
+        assert_eq!(s2, Some((3, 65)));
+        // 无新字 ⇒ 不重登记、继续跟踪
+        let (s3, a3) = late_bound_step(s2, false, false, 65);
+        assert_eq!((s3, a3), (Some((3, 65)), None));
+    }
+
+    /// 开口（VAD 听到语音）⇒ 立即停止跟踪，新字属于新的话，不吸收。
+    #[test]
+    fn t445_stops_on_speech() {
+        assert_eq!(
+            late_bound_step(Some((3, 63)), true, false, 70),
+            (None, None)
+        );
+    }
+
+    /// 已有新派发在定界 ⇒ 停止跟踪（交给新片的 337 定界）。
+    #[test]
+    fn t445_stops_on_new_dispatch() {
+        assert_eq!(
+            late_bound_step(Some((3, 63)), false, true, 70),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn t445_idle_when_not_tracking() {
+        assert_eq!(late_bound_step(None, false, false, 99), (None, None));
+    }
+
+    /// 接线：a / c / endpoint 三处冻结都开始跟踪；b（开口）清空；吸收时同步 438 坐标与下一片起点。
+    #[test]
+    fn t445_wiring() {
+        let p = prod_src();
+        assert_eq!(
+            p.matches(concat!("late_bound = Some((seg, ", "cur));"))
+                .count(),
+            3
+        );
+        assert!(p.contains(concat!("late_bound = ", "None;")));
+        for needle in [
+            concat!("punct_head_chars = ", "cur;"),
+            concat!("punct_tail_start = last_display", "_raw_len;"),
+            concat!("acc_prev_committed = ", "cur;"),
+        ] {
+            assert!(p.contains(needle), "{needle}");
+        }
     }
 }
