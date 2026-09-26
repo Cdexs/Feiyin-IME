@@ -450,6 +450,17 @@ pub(crate) const MISMATCH_MIN_RETENTION: f32 = 0.5;
 /// 长度比不是必需的门；而当日连贯会话的代理样本有 0.758 / 0.795 两条，0.8 会把**正常纠错**误拒
 /// （精解常删掉流式里的口吃重复与语气词，天然更短）。取 0.6 只拦「严重变短」。
 pub(crate) const MISMATCH_MIN_LEN_RATIO: f32 = 0.6;
+/// FIX-ACC-GUARD-POLLUTED-STREAM-443：**第二条放行路径**的最低保留率。
+///
+/// Gavin 2026-09-26 端测（旁边播放他人语音）：流式预览被干扰带偏（「然后被周边去去找找」「放送包送车」），
+/// 精解是对的（「然后可以到周边去走走」「透透气，放松放松身心」），却因保留率 0.42 / 0.48 < 0.5 被当成幻觉
+/// 拒收 ⇒ 预览一直挂着流式错字。历史真幻觉**全部明显变短**（406 校准三例 ret/len = 0.43/0.43、0.04/0.32、
+/// 0.00/0.48），而误拒的两例长度不输流式（0.83 / 1.29）⇒ 加一条：长度比 ≥0.8 且保留率 ≥0.3 也放行。
+/// 用当日 19 条 verdict 重算：只有这两条由拒改收，其余 17 条（含拼音乱码 0.00/2.94、干扰语音 0.17/0.67、
+/// 空输出、`Mispelling`）结论不变。
+pub(crate) const MISMATCH_RELAXED_MIN_RETENTION: f32 = 0.3;
+/// FIX-ACC-GUARD-POLLUTED-STREAM-443：第二条放行路径的最低长度比（精解不明显比流式短）。
+pub(crate) const MISMATCH_RELAXED_MIN_LEN_RATIO: f32 = 0.8;
 
 /// 406：`acc_vs_streaming` 的判定结果（供埋点与测试读取）。
 pub(crate) struct MismatchVerdict {
@@ -506,7 +517,9 @@ fn lcs_subseq_len(a: &[char], b: &[char]) -> usize {
 /// 现状 `output_rate_ok` 只比「字/秒」，从不看同窗流式文本 ⇒ 精解漏整句 / 幻觉出无关短句时
 /// 照样放行（预览回缩 + 最终丢句）。本判据补「内容保留」维度：
 /// - 流式归一化后 `< MISMATCH_MIN_STREAM_CHARS` ⇒ 样本太少，`accept = true`（宁漏勿误杀）；
-/// - 否则 `accept = retention >= MISMATCH_MIN_RETENTION && len_ratio >= MISMATCH_MIN_LEN_RATIO`。
+/// - 否则 `accept` = 两条放行路径任一成立：
+///   ① `retention ≥ 0.5 && len_ratio ≥ 0.6`（406 原判据）；
+///   ② `retention ≥ 0.3 && len_ratio ≥ 0.8`（443：流式被干扰带偏、精解不变短 ⇒ 信精解）。
 pub(crate) fn acc_vs_streaming(acc: &str, streaming: &str) -> MismatchVerdict {
     let acc_n = normalize_for_mismatch(acc);
     let str_n = normalize_for_mismatch(streaming);
@@ -520,7 +533,9 @@ pub(crate) fn acc_vs_streaming(acc: &str, streaming: &str) -> MismatchVerdict {
     let lcs = lcs_subseq_len(&acc_n, &str_n);
     let retention = lcs as f32 / str_n.len() as f32;
     let len_ratio = acc_n.len() as f32 / str_n.len() as f32;
-    let accept = retention >= MISMATCH_MIN_RETENTION && len_ratio >= MISMATCH_MIN_LEN_RATIO;
+    let accept = (retention >= MISMATCH_MIN_RETENTION && len_ratio >= MISMATCH_MIN_LEN_RATIO)
+        || (retention >= MISMATCH_RELAXED_MIN_RETENTION
+            && len_ratio >= MISMATCH_RELAXED_MIN_LEN_RATIO);
     MismatchVerdict {
         retention,
         len_ratio,
@@ -13196,5 +13211,86 @@ mod interior436_tests {
             2,
             "433 裁判两条路径应各有 1 处 r_dbg = r30"
         );
+    }
+}
+
+// =====================================================================
+// FIX-ACC-GUARD-POLLUTED-STREAM-443：流式被干扰带偏时信精解（406 第二条放行路径）
+// =====================================================================
+#[cfg(test)]
+mod fix443_tests {
+    use super::acc_vs_streaming;
+
+    /// Gavin 2026-09-26 14:42 端测两条误拒：精解正确、流式被干扰带偏 ⇒ 现在放行。
+    #[test]
+    fn t443_accepts_correct_acc_over_polluted_stream() {
+        let cases = [
+            ("然后可以到周边去走走。", "去吃饭，然后被周边去去找找"),
+            (
+                "然后可以到周边去走走，嗯，看看外面的世界，透透气，放松放松身心。",
+                "周边去去找找嗯，让外面的事情偷透气，放送包送车",
+            ),
+        ];
+        for (acc, stream) in cases {
+            let v = acc_vs_streaming(acc, stream);
+            assert!(
+                v.accept,
+                "应放行：acc={acc} ret={} len={}",
+                v.retention, v.len_ratio
+            );
+            assert!(v.retention < 0.5, "这两条正是原判据误拒的样本");
+        }
+    }
+
+    /// 同日真实拒收样本：拼音乱码 / `Mispelling` / 空输出 / 干扰语音 / 只出半句 ⇒ 仍拒。
+    #[test]
+    fn t443_still_rejects_bad_acc() {
+        let cases = [
+            (
+                "língyì fàngsōng fàngsōng shēn xīn. yě kě yǐ sān wǔ hǎo yǒu jù jù.",
+                "透气，放送包送车厢你可以下五好友聚一",
+            ),
+            (
+                "Mispelling",
+                "后大有只要喜欢科幻片、精爽片作品，特别是那种科幻经十成作",
+            ),
+            ("", "然上追究了什么精彩的电影大上映不然后大"),
+            (
+                "那如果代表什么？还代表冠杀。",
+                "别好玩他如代表反派，在外观观观观然后也",
+            ),
+            (
+                "可以一起去看电影。",
+                "来理由吧，决如都可以一起去看电影他卖什么好玩的",
+            ),
+            (
+                "啊，可以一起去看电影。",
+                "影他卖什么好玩的电影然上追究了什么精彩的电影大上映",
+            ),
+        ];
+        for (acc, stream) in cases {
+            let v = acc_vs_streaming(acc, stream);
+            assert!(
+                !v.accept,
+                "应拒：acc={acc} ret={} len={}",
+                v.retention, v.len_ratio
+            );
+        }
+    }
+
+    /// 406 原判据放行的样本不受影响（只新增放行路径，不收紧）。
+    #[test]
+    fn t443_original_accepts_unchanged() {
+        let cases = [
+            ("最近有什么好看的电影？", "对近有什么好看的电"),
+            ("然后也可以挤出去，扭弯。", "观观然后也可以挤出去扭"),
+            (
+                "最近有什么好看的电影吗？我比较喜欢看那种科幻片、恐怖片、惊悚片。",
+                "对，这有什么好看的电影吗？我比较喜欢看那种动幻片恐怖片经唱",
+            ),
+        ];
+        for (acc, stream) in cases {
+            assert!(acc_vs_streaming(acc, stream).accept, "{acc}");
+        }
     }
 }
