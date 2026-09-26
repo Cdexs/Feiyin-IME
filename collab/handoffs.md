@@ -78,4 +78,15 @@
 - **测试**：新增 `fix438_*` **10/10**（验收 ①–⑨ + 源码级接线护栏）；既有 349 测试改名换口径（严格度原样）、349 缓存测试断言一字不动、`guard346` 锚点贴 438 形态、`acc346` 只改 doc、`Flags392`/测试本地仿真零改动。过滤全绿 `fix438` 10P / `punct` 140P/0F/2I / `local_stream` 92P/0F/7I。
 - **验证**：`cargo fmt --check` EXIT 0；`cargo check --all-targets` 0 error、warnings **91/87 = 基线**；🔴 未跑全量 test、未 build、未 commit（红线）。**文档**：`collab/outbox/coder-2/result.md`（436 报告备份 `result-436-replay.md`）、`CHANGELOG.md`、`logs/20260926.md`、`docs/MACOS-HANDOFF.md`（平台中立一行）、本条。
 
+---
+
+## 2026-09-26 — coder-2 — FIX-EDIT-STUCK-PROCESSING-439 ✅ 交付（编辑态卡「识别处理中」P0 · 两层修复 + A/B/C/D/E 五路走读）
+
+- **范围**：**只改 `src/main.rs`**（+256/−19，恰 3 块：controller `Processing` 臂守卫 :7749 / worker 取消门 :9944 / 新测试 mod :15016）。`destroy_edit_control` 清理逻辑零改动（改法 3）。🔴 未 commit、未 build、未跑全量 test（红线）；版本 0.9.3 未动；零凭证。结果 `collab/outbox/coder-2/result.md`（438 报告备份 `result-438.md`）。
+- **改法（两层）**：① controller `PipelineEvent::Processing` 臂加 `OVERLAY_EDITING` 守卫（:7756，与 282 预览守卫 :7524 / 038-C 压制臂 :7775 同款写法），编辑态整臂跳过 `ACC_REFLOW_SUPPRESS` 置位/托盘/`show_overlay(FallingToProcessing)`，打 info `ASR-038-C: Processing suppressed while editing`（:7757）；② worker `asr_handle.join()`（:9932）后两次早期发送（收尾预览 :9952 + 识别处理中 :9957）包 `if cancel_signal.load` 门（:9944），取消只打 info（:9946）不发。**源头不发 + controller 兜底**，竞态两向均覆盖（走读见 result §三 A 步骤 4）。
+- **E 查清（任务书 🔴 分岔不触发）**：停止按钮 = **取消**——`stop button cancels`（:2552）→ `cancel_btn_rect`（:2553）→ `CancelRequested`（:2558）→ 控制器臂 :7906–7918（cancel + stop + editing=false + Hide + 托盘 Idle，**无 Submit/注入**）；「取消 = 不出字」全仓一致（:8728/:10147/:10260）⇒ `cancel_signal` 门成立。正常松键 `HotkeyEvent::Stop`（:7330）只置 `stop_recording_signal`（:7349）**不置 cancel** ⇒ else 分支出字逐位不变（全文件 `cancel_signal.store(true` 恰 4 处 = CancelStop :7382 / Esc :7392 / 停止钮 :7912 / 编辑点击 :7931）。
+- **走读（全带行号，result §三/§四）**：**A** 录音点击 :2564 → EditRequested :7922（editing=true :7925 先于 cancel :7931）→ 门 :9944 拦 + 臂 :7756 兜底 ⇒ EDIT 不被 :1854 销毁；初值回退链 :2026–2035 + 快照 :2038；提交 Enter :1140 / 按钮 :2540 → SubmitRequested :7938 → `inject_text` :8007 **注入编辑框文字** ⇒ Idle+Hide。**B** 松键不置 cancel ⇒ :9944 发送逐位不变；点击/编辑/提交零 diff。**C** Esc 子类 :1111 / 收口 :7906 / FocusLost :7783 均不在 diff 内，与改前一致。**D** Esc 轮询 :7389–7397 走 cancel ✓；改前与点击编辑共用同一发送点会闪「识别处理中」，改后直接取消、不闪、不注入。**E** 改前闪处理态→改后不闪，仍无输出（原设计）。
+- **测试**：`edit_stuck_439_tests` **4/4**（:15030 守卫先于置位/show、:15075 门先于两发送且 282 顺序不变、:15121 E 语义 cancel→Hide 无 Submit、:15180 恰一处 ESC 轮询置 cancel + `is_recording` 守卫 + Idle；`prod_lines_excluding_cfg_test` + `concat!` 拆字面量防自匹配）。过滤全绿：`439` **4P**、`382` **18P**、`038` **2P**、`edit` **28P**、`suppress` **5P**（既有 `early_preview_then_processing_before_acc_join`、`suppress_flag_only_set_inside_processing_arm` 均不受影响）；`fmt --check` EXIT 0；`check --all-targets` 0 error、warnings **91/87 = 基线**。
+- **文档**：result.md（A–E 走读 + 12 项自证表）、**本条（438 漏写教训，本单已写）**、`docs/MACOS-HANDOFF.md` 439 小节（macOS 无编辑态 ⇒ 无同类 bug；worker 门在平台中立 `spawn_worker_thread` :8295（Windows :10342 / macOS :10607 共用）⇒ 零同步）、`CHANGELOG.md` 表首行、`logs/20260926.md`。
+
 

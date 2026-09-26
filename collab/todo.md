@@ -7,6 +7,9 @@
 
 |  | Gavin 09-26：预览只保留一个打点机制「每隔 3.5 秒用全部预览文本重打一次」，去掉 1200ms 静默打点；主控补「重打结果末尾终止符不显示」防 349 复发；句尾标点靠精解回灌 | coder-2 | local_stream.rs 预览标点区 | 🔄 已派 |
 | --- | --- | --- | --- | --- |
+| `FIX-EDIT-STUCK-PROCESSING-439` | **P0** Gavin 09-26 端测：录音中点浮层进编辑 ⇒ 卡「识别处理中」、编辑框不出现。根因：382 worker 取消时仍发提前 `Processing`（main.rs:9934），controller `Processing` 分支无 `OVERLAY_EDITING` 守卫 ⇒ show 触发 `destroy_edit_control`，随后 Cancelled 被编辑态抑制 ⇒ 永久卡住。修：controller 守卫 + worker 取消不发；核对「编辑→修改→提交注入」原路径 | coder-2 | main.rs controller + worker | 🔄 已派 |
+| `FILLER-RESTART-440` | Gavin 09-26：「你们的知，你们的知识…」开头重复没被去掉。原因：规则 A/B/C 只删犹豫词 / 白名单叠词 / 一字不差 ≥6 字整段，不覆盖「说一半重说」。新增规则 D：逗号/顿号/空白相隔、前段是后段严格前缀、前段中文 ≥3 字/英文 ≥2 词 ⇒ 删前段 | coder-1 | text_normalizer.rs | 🔄 已派 |
+| `REFLOW-FILLER-ONCE-441` | Gavin 09-26「如果现在在回灌刷新前就过一遍，那最终注入上屏前就不用过了」：去重节点只在本地实时回灌刷新前过一遍（作用于对齐拼接后的权威全文），本管线最终上屏前不再去重；其他管线逐位不变（DEC-066）；须先确认最终文本各来源都经过该点 | coder-2（439 后，同 main.rs） | main.rs | ⏳ 任务书已备，待 439 交付后派 |
 | `TEST-GAP-438-TAILSTART` | 护栏缺口（BUILD-438 消融 438b 未红）：`preview_display` 重打时忽略 `tail_start` 改为整段重打，`fix438_*` 全绿——护栏只直调纯函数、唯一进 `preview_display` 的用例 `engine=None`。主控已读码确认接线正确（不影响本包）。补：带真 CT-Transformer 或可注入打点函数的端到端用例 | 待定（非作者 coder） | local_stream.rs 测试区 | ⏳ 攒批补 |
 | `RT-STOP-LATENCY-MULTIWIN` | BUILD-398 #9 遗留：长录音切多窗串行解码，停止时队列压窗 ⇒ 松键到上屏 4.5s（16:44Z 23.85s 录音）；后半「无语音整窗送解」已由 414 修 | 待定 | — | ⏳ 待更多端测数据再定 |
 

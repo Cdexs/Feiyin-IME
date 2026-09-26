@@ -7747,17 +7747,27 @@ fn process_controller_events(
                 }
             }
             PipelineEvent::Processing(message) => {
-                // 382（问题2 防闪回）：controller **处理到本代 Processing** 时置位 ⇒ 之后到达的
-                // `replace_all` 回灌只更新状态、不重画浮层（提前发 Processing 后 acc 尾窗回灌可能后到）。
-                // 按通道实际顺序：排在 Processing **之前**入队的回灌照常渲染，不受影响。
-                ACC_REFLOW_SUPPRESS.store(true, Ordering::Release);
-                set_tray_state(tray, TrayState::Processing, ui_language);
-                show_overlay(
-                    overlay_handle,
-                    opacity,
-                    ui_language,
-                    OverlayStatus::FallingToProcessing { message },
-                );
+                // FIX-EDIT-STUCK-PROCESSING-439（P0）：编辑态下整臂跳过 —— 与 282 预览守卫
+                //（:7523）/ 038-C Done|Cancelled 压制臂（下方）同一写法。不守卫则本臂
+                // `show_overlay(FallingToProcessing)` 触发 overlay 新请求清理（:1854
+                // destroy_edit_control）销毁刚建好的 EDIT 控件，随后 Cancelled 又被下方
+                // 压制臂拦下（不回 Idle 不 Hide）⇒ 界面永久卡「识别处理中」。
+                // 真 ⇒ 连同 ACC_REFLOW_SUPPRESS / 托盘切换一并跳过（编辑态生命周期由编辑路径接管）。
+                if OVERLAY_EDITING.load(Ordering::Acquire) {
+                    log::info!("ASR-038-C: Processing suppressed while editing");
+                } else {
+                    // 382（问题2 防闪回）：controller **处理到本代 Processing** 时置位 ⇒ 之后到达的
+                    // `replace_all` 回灌只更新状态、不重画浮层（提前发 Processing 后 acc 尾窗回灌可能后到）。
+                    // 按通道实际顺序：排在 Processing **之前**入队的回灌照常渲染，不受影响。
+                    ACC_REFLOW_SUPPRESS.store(true, Ordering::Release);
+                    set_tray_state(tray, TrayState::Processing, ui_language);
+                    show_overlay(
+                        overlay_handle,
+                        opacity,
+                        ui_language,
+                        OverlayStatus::FallingToProcessing { message },
+                    );
+                }
             }
             PipelineEvent::Done | PipelineEvent::Cancelled => {
                 // ASR-038-C-REWORK-001: if the user has taken over editing, do not revert tray to Idle
@@ -9924,16 +9934,30 @@ fn spawn_worker_thread(
                             // 但路B 尾窗可能仍在解码 ⇒ **立即**推「收尾预览 + 识别处理中」，不等
                             // `acc_handle.join()`（否则界面停在录音态，用户感知卡顿）。282 顺序不变：
                             // 预览先、处理态后。文案与 `run_pipeline_core` 同源（`overlay_processing`）。
-                            if let Ok(Ok((preview_text, _pcm))) = &asr_result {
-                                if !preview_text.is_empty() {
-                                    let _ = event_tx.send(PipelineEvent::StreamingFinalPreview(
-                                        preview_text.clone(),
-                                    ));
+                            // FIX-EDIT-STUCK-PROCESSING-439（P0）：取消路径（编辑点击 / Esc /
+                            // 停止按钮 / PTT 短按 —— 四者都置 cancel_signal）不再推「收尾预览 +
+                            // 识别处理中」。否则 controller 先切处理态（销毁 EDIT 控件），随后
+                            // Cancelled 又被编辑态压制臂拦下 ⇒ 永久卡「识别处理中」。
+                            // 取消在本代码库的唯一语义 = 不出字（:8718/:10123/:10236/:15390 各取消
+                            // 点均跳过转写/注入）；正常出字（松键 stop_recording、cancel 未置位）
+                            // 逐位不变（382「松键立即识别处理中」时延不受影响）。
+                            if cancel_signal.load(Ordering::Acquire) {
+                                log::info!(
+                                    "ASR-038-C: skip StreamingFinalPreview/Processing (cancel_signal set)"
+                                );
+                            } else {
+                                if let Ok(Ok((preview_text, _pcm))) = &asr_result {
+                                    if !preview_text.is_empty() {
+                                        let _ =
+                                            event_tx.send(PipelineEvent::StreamingFinalPreview(
+                                                preview_text.clone(),
+                                            ));
+                                    }
                                 }
+                                let _ = event_tx.send(PipelineEvent::Processing(
+                                    i18n::get(config.ui_language).overlay_processing.to_string(),
+                                ));
                             }
-                            let _ = event_tx.send(PipelineEvent::Processing(
-                                i18n::get(config.ui_language).overlay_processing.to_string(),
-                            ));
                             // 382（问题2 埋点）：松键 → 处理态显示的时延（仅 Windows）。
                             #[cfg(target_os = "windows")]
                             {
@@ -14981,6 +15005,219 @@ mod problem2_order_382_tests {
                 .iter()
                 .any(|l| l.contains("send(PipelineEvent::StreamingFinalPreview(")),
             "382：acc_join 之后不得再发 StreamingFinalPreview（闪回）"
+        );
+    }
+}
+
+#[cfg(test)]
+/// FIX-EDIT-STUCK-PROCESSING-439（P0）：编辑态点 overlay 后永久卡「识别处理中」的
+/// 源码级修复护栏。只读 `prod_lines_excluding_cfg_test`（剔除 cfg(test) 项与注释行），
+/// needle 一律 `concat!` 拼接（防护栏文本在测试源里自匹配）。
+mod edit_stuck_439_tests {
+    /// 生产区（剔除 cfg(test) 与纯注释行）。
+    fn code_lines() -> Vec<String> {
+        crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"))
+            .into_iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect()
+    }
+
+    /// ① controller `Processing` 处理臂：`OVERLAY_EDITING` 编辑守卫必须**整臂包住**
+    /// `ACC_REFLOW_SUPPRESS` 置位与 `show_overlay(FallingToProcessing)` —— 缺守卫时
+    /// 浮层新请求清理会 destroy_edit_control 销毁 EDIT，随后 Cancelled 又被压制臂拦下
+    /// ⇒ 永久卡「识别处理中」（439 根因）。
+    #[test]
+    fn controller_processing_arm_editing_guard() {
+        let lines = code_lines();
+        let idx = lines
+            .iter()
+            .position(|l| l.contains(concat!("ACC_REFLOW_SUPPRESS.store(true")))
+            .expect("439: ACC_REFLOW_SUPPRESS.store(true 锚点");
+        let arm = (0..idx)
+            .rev()
+            .find(|&i| lines[i].contains("PipelineEvent::") && lines[i].contains("=>"))
+            .expect("439: 置位必须位于某个 PipelineEvent 处理臂内");
+        assert!(
+            lines[arm].contains("PipelineEvent::Processing("),
+            "439: 置位必须落在 Processing 处理臂内"
+        );
+        let arm_end = (arm + 1..lines.len())
+            .find(|&i| lines[i].contains("PipelineEvent::") && lines[i].contains("=>"))
+            .expect("439: Processing 臂必须有后继处理臂");
+        let win = &lines[arm..arm_end];
+        let guard = win
+            .iter()
+            .position(|l| l.contains(concat!("if OVERLAY_EDITING.load(Ordering::Acquire)")))
+            .expect("439: Processing 臂必须有 OVERLAY_EDITING 编辑守卫");
+        let flag = win
+            .iter()
+            .position(|l| l.contains(concat!("ACC_REFLOW_SUPPRESS.store(true")))
+            .expect("439: 置位应在 Processing 臂内");
+        let show = win
+            .iter()
+            .position(|l| l.contains(concat!("OverlayStatus::FallingToProcessing")))
+            .expect("439: show_overlay(FallingToProcessing) 应在 Processing 臂内");
+        assert!(
+            guard < flag && guard < show,
+            "439: 守卫必须先于置位与 show_overlay（编辑态整臂跳过）"
+        );
+        assert!(
+            win.iter()
+                .any(|l| l.contains(concat!("Processing suppressed while editing"))),
+            "439: 编辑态跳过 Processing 必须打 info 日志"
+        );
+    }
+
+    /// ② worker：`asr_handle.join()` 之后、两次早期发送（收尾预览 + 识别处理中）之前
+    /// 必须有 `cancel_signal` 取消门 —— 编辑点击 / Esc / 停止按钮 / PTT 短按四条取消路
+    /// 都在发之前置位；正常出字（松键 stop_recording、cancel 未置位）走 else 分支不变。
+    #[test]
+    fn worker_cancel_gate_before_early_sends() {
+        let lines = code_lines();
+        let asr = lines
+            .iter()
+            .position(|l| {
+                l.trim_start()
+                    .starts_with("let asr_result = asr_handle.join();")
+            })
+            .expect("439: asr_handle.join 锚点");
+        let acc = lines
+            .iter()
+            .position(|l| {
+                l.trim_start()
+                    .starts_with("let acc_result = acc_handle.map")
+            })
+            .expect("439: acc_handle.join 锚点");
+        assert!(asr < acc, "439: asr_join 必须先于 acc_join");
+        let win = &lines[asr..acc];
+        let gate = win
+            .iter()
+            .position(|l| l.contains(concat!("if cancel_signal.load(Ordering::Acquire)")))
+            .expect("439: asr_join..acc_join 窗口必须有 cancel_signal 取消门");
+        let fp = win
+            .iter()
+            .position(|l| l.contains(concat!("send(PipelineEvent::StreamingFinalPreview(")))
+            .expect("439: 收尾预览发送应在 asr_join..acc_join 窗口内");
+        let pr = win
+            .iter()
+            .position(|l| l.contains(concat!("send(PipelineEvent::Processing(")))
+            .expect("439: Processing 发送应在 asr_join..acc_join 窗口内");
+        assert!(
+            gate < fp && gate < pr,
+            "439: cancel_signal 取消门必须先于两次早期发送"
+        );
+        assert!(fp < pr, "282 顺序不变：预览先、处理态后");
+        assert!(
+            win.iter().any(|l| l.contains(concat!(
+                "skip StreamingFinalPreview/Processing (cancel_signal set)"
+            ))),
+            "439: 取消跳过两次发送必须打 info 日志"
+        );
+    }
+
+    /// ③ E 路线锁定：停止按钮（`cancel_btn_rect`）→ 只发 `CancelRequested`；其控制器
+    /// 处理器 = cancel + Hide + 复位编辑标志，绝不注入（无 `SubmitRequested`）。
+    #[test]
+    fn stop_button_cancel_semantics_no_injection() {
+        let lines = code_lines();
+        let edit = lines
+            .iter()
+            .position(|l| {
+                l.contains(concat!(
+                    "state.event_tx.send(OverlayUiEvent::EditRequested);"
+                ))
+            })
+            .expect("439: EditRequested 发送点锚点（唯一生产点）");
+        let win = &lines[edit.saturating_sub(30)..edit];
+        let hit = win
+            .iter()
+            .position(|l| l.contains(concat!(".cancel_btn_rect")))
+            .expect("439: 编辑入口邻域必须有 cancel_btn_rect（停止按钮）分支");
+        let cancel = win
+            .iter()
+            .position(|l| {
+                l.contains(concat!(
+                    "state.event_tx.send(OverlayUiEvent::CancelRequested)"
+                ))
+            })
+            .expect("439: 停止按钮命中必须发 CancelRequested");
+        assert!(
+            hit < cancel,
+            "439: 停止按钮分支须在 EditRequested 之前且发 CancelRequested"
+        );
+
+        let arm = lines
+            .iter()
+            .position(|l| l.contains(concat!("OverlayUiEvent::CancelRequested => {")))
+            .expect("439: CancelRequested 控制器处理器锚点");
+        let arm_end = (arm + 1..lines.len())
+            .find(|&i| lines[i].contains("OverlayUiEvent::") && lines[i].contains("=>"))
+            .expect("439: CancelRequested 臂必须有后继处理臂");
+        let hwin = &lines[arm..arm_end];
+        let cs = hwin
+            .iter()
+            .position(|l| l.contains(concat!("cancel_signal.store(true")))
+            .expect("439: CancelRequested 必须置 cancel_signal");
+        let hide = hwin
+            .iter()
+            .position(|l| l.contains(concat!("OverlayCommand::Hide")))
+            .expect("439: CancelRequested 必须 Hide");
+        assert!(cs < hide, "439: CancelRequested 先取消后隐藏");
+        assert!(
+            hwin.iter()
+                .any(|l| l.contains(concat!("OVERLAY_EDITING.store(false"))),
+            "439: CancelRequested 必须复位编辑标志"
+        );
+        assert!(
+            !hwin.iter().any(|l| l.contains(concat!("SubmitRequested"))),
+            "439: CancelRequested 处理器不得注入（无 SubmitRequested）"
+        );
+    }
+
+    /// ④ D 路线：录音中 controller 的 VK_ESCAPE 轮询必须置 cancel + stop + 托盘 Idle
+    /// （只取消、不出字），且限定 `is_recording` 内。
+    #[test]
+    fn esc_recording_poll_sets_cancel() {
+        let lines = code_lines();
+        let hits: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains(concat!("GetAsyncKeyState(VK_ESCAPE")))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!hits.is_empty(), "439: VK_ESCAPE 轮询锚点");
+        let with_cancel: Vec<usize> = hits
+            .iter()
+            .copied()
+            .filter(|&i| {
+                lines[i..(i + 10).min(lines.len())]
+                    .iter()
+                    .any(|l| l.contains(concat!("cancel_signal.store(true")))
+            })
+            .collect();
+        assert_eq!(
+            with_cancel.len(),
+            1,
+            "439: 恰一处 VK_ESCAPE 轮询直接置 cancel_signal（其余 ESC 点走 CancelRequested）"
+        );
+        let i = with_cancel[0];
+        assert!(
+            lines[i - 1].contains("is_recording.load"),
+            "439: Esc 取消必须限定录音中（is_recording 守卫）"
+        );
+        let win = &lines[i..(i + 10).min(lines.len())];
+        assert!(
+            win.iter()
+                .any(|l| l.contains(concat!("stop_recording_signal.store(true"))),
+            "439: Esc 同时停录"
+        );
+        assert!(
+            win.iter().any(|l| l.contains(concat!("TrayState::Idle"))),
+            "439: Esc 托盘回 Idle"
+        );
+        assert!(
+            !win.iter().any(|l| l.contains(concat!("SubmitRequested"))),
+            "439: Esc 不注入"
         );
     }
 }

@@ -2511,3 +2511,13 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | **macOS 侧需要做什么** | | **无同步改动**；若 macOS 侧另写打点间隔，须与 `PUNCT_PREVIEW_INTERVAL_MS=3500.0` 同值（现无此副本） |
 
 > 结论：**已评估，平台中立（无 `cfg`/依赖/文件/开关变化），macOS 无需任何编译期或运行期同步**。证据见 `collab/outbox/coder-2/result.md`；未跑 macOS 交叉编译（Windows 端 verification）。
+
+## FIX-EDIT-STUCK-PROCESSING-439（2026-09-26，coder-2）· 编辑态卡「识别处理中」P0 两层修复 —— macOS 侧影响
+
+| 改动 | 行为前 → 后 | macOS 影响 |
+| --- | --- | --- |
+| `src/main.rs` controller `PipelineEvent::Processing` 臂（:7749）加 `OVERLAY_EDITING` 守卫（:7756）：编辑态整臂跳过 `ACC_REFLOW_SUPPRESS` 置位/托盘/`show_overlay(FallingToProcessing)`，打 info（:7757） | 编辑态收到 `Processing` 也照常 show overlay ⇒ overlay 新请求清理 `destroy_edit_control`（:1854）销毁 EDIT ⇒ 永久卡「识别处理中」→ 编辑态整臂抑制，EDIT 保留 | ✅ macOS 镜像控制器臂（:10820）**只切托盘、不 show overlay**，且 `src/platform/macos/` 零命中 `OVERLAY_EDITING`/`EditRequested`/`EnterEditMode`（**macOS 无编辑态**）⇒ **无同类卡死缺陷、无需同步此守卫** |
+| `src/main.rs` worker `asr_handle.join()`（:9932）后两次早期发送（收尾预览 :9952 + 识别处理中 :9957）包 `if cancel_signal.load` 门（:9944）：取消时跳过、只打 info（:9946） | 取消（编辑点击/Esc/停止按钮/PTT 短按）后仍无条件发预览 + `Processing`（382 提前发送，与上行组合即本 P0）→ 取消不再发 | ✅ **平台中立**：发送点在去 cfg 的共用 `spawn_worker_thread`（:8295，Windows :10342 / macOS :10607 同一函数）⇒ macOS 自动继承「取消不发提前 Processing」，属纯改善（取消时不再闪处理态） |
+| **macOS 侧需要做什么** | | **无同步改动**。唯一前瞻：`overlay_request_for_event`（:10810，`Processing → ShowProcessing` :10821）—— 若 macOS 日后引入编辑态（`EditRequested`/`EnterEditMode`），须给 `Processing→ShowProcessing` 路径同加 `OVERLAY_EDITING` 守卫 |
+
+> 结论：**已评估，macOS 无同类 bug（无编辑态），本单唯一生产改动位于平台中立共享区 ⇒ 零编译期/运行期同步**。证据见 `collab/outbox/coder-2/result.md` §五；未跑 macOS 交叉编译（Windows 端 verification）。
