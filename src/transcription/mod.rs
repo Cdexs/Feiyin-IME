@@ -23,6 +23,9 @@ mod poc_speaker_verify_404;
 // REPLAY-436：433 vs 436 全量录音离线对照（单线程简化回放；整文件 `#[cfg(test)]`，只测不改生产）
 #[cfg(test)]
 mod replay436_tests;
+// POC-VOICEPRINT-SHORT-444：声纹短片段判别力离线测试（整文件 #[cfg(test)]，只测不改生产）
+#[cfg(test)]
+mod poc_voiceprint_short_444;
 // SLIDING-WINDOW-367：路A 逐片解码摘接线后，`join_segment_texts` 等 re-export 暂无人用；
 // **保留**（可回挂），故局部 allow。
 #[allow(unused_imports)]
