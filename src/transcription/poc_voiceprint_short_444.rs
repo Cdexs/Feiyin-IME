@@ -468,3 +468,252 @@ fn poc_window_filter_447() {
     std::fs::write(&out, &md).expect("写 window447.md");
     println!("{md}");
 }
+
+/// POC-448：长语音段内**滑窗**声纹（1.0s 窗、0.5s 步进）——看「干扰与本人无停顿连成一段」时，
+/// 段内干扰部分的小窗得分能否低于 0.45（16:41 端测窗 #2：4.10s 段整体 0.811 判本人，内含「定假木的话是全权的的」）。
+#[test]
+#[ignore = "POC-448：需真模型 + evidence 录音；--ignored 运行"]
+fn poc_sliding_window_448() {
+    let models = root().join("models");
+    let verifier = SpeakerVerifier::load(&models).expect("CAM++ 声纹模型须在位");
+    let vp = Voiceprint::load(&root().join("target/release/voiceprint.bin"));
+    let vad = VadSegmenter::try_new_for_local_trim(&models).expect("VAD 须在位");
+    let acc = create_qwen3_recognizer(&models).expect("1.7B 须在位");
+    const LANGS: &[&str] = &["zh", "en", "ko", "ja", "und"];
+    let score = |s: &[f32]| -> Option<f32> {
+        let e = verifier.embed(s)?;
+        LANGS
+            .iter()
+            .filter_map(|l| vp.ready_centroid(l).map(|c| cosine(c, &e)))
+            .fold(None, |b: Option<f32>, x| Some(b.map_or(x, |b| b.max(x))))
+    };
+    let decode = |s: &[f32]| -> String {
+        let cap = max_new_tokens_for(s.len() as f32 / RATE as f32);
+        decode_accuracy_allow_empty(&acc, s, None, ChineseScript::Simplified, Some(cap))
+            .map(|(t, _)| t)
+            .unwrap_or_default()
+    };
+    let mut md = String::from("# POC-448 · 长段内滑窗声纹\n\n");
+    for file in ["session-20260927-004133.wav", "session-20260927-001101.wav"] {
+        let Some(w) = sherpa_onnx::Wave::read(
+            root()
+                .join("collab/evidence/444")
+                .join(file)
+                .to_str()
+                .unwrap(),
+        ) else {
+            continue;
+        };
+        let audio = w.samples().to_vec();
+        let _ = writeln!(md, "## {file}\n");
+        for (s, e) in vad.speech_ranges(&audio) {
+            if e - s < 2 * RATE {
+                continue;
+            }
+            let seg = &audio[s..e];
+            let _ = writeln!(
+                md,
+                "### 段 {:.2}–{:.2}s（{:.2}s）整段 {:.3}：{}\n",
+                s as f32 / RATE as f32,
+                e as f32 / RATE as f32,
+                (e - s) as f32 / RATE as f32,
+                score(seg).unwrap_or(f32::NAN),
+                decode(seg)
+            );
+            let mut p = 0usize;
+            while p + RATE <= seg.len() {
+                let win = &seg[p..p + RATE];
+                let _ = writeln!(
+                    md,
+                    "- {:.2}s：{:.3} {}",
+                    (s + p) as f32 / RATE as f32,
+                    score(win).unwrap_or(f32::NAN),
+                    decode(win)
+                );
+                p += RATE / 2;
+            }
+            md.push('\n');
+        }
+    }
+    std::fs::write(root().join("collab/evidence/444/sliding448.md"), &md)
+        .expect("写 sliding448.md");
+    println!("{md}");
+}
+
+/// POC-448b：窗口级完整复核（单元判定 → 447 碎片拼组 → 448 段内滑窗子剔除），两段真录音按日志派发位置切窗。
+#[test]
+#[ignore = "POC-448b：需真模型 + evidence 录音；--ignored 运行"]
+fn poc_window_filter_448() {
+    use super::speaker::{
+        apply_sub_drops, group_fragments, judge_voiceprint, merge_speech_units,
+        sliding_drop_ranges, sliding_window_starts, SegVerdict, DROP_THR, FRAGMENT_GROUP_SPAN_SECS,
+        MIN_JUDGE_SECS, SLIDING_HOP_SECS, SLIDING_MIN_LOW_RUN, SLIDING_MIN_RANGE_SECS,
+        SLIDING_WIN_SECS,
+    };
+    let models = root().join("models");
+    let verifier = SpeakerVerifier::load(&models).expect("CAM++ 声纹模型须在位");
+    let vp = Voiceprint::load(&root().join("target/release/voiceprint.bin"));
+    let vad = VadSegmenter::try_new_for_local_trim(&models).expect("VAD 须在位");
+    let acc = create_qwen3_recognizer(&models).expect("1.7B 须在位");
+    const LANGS: &[&str] = &["zh", "en", "ko", "ja", "und"];
+    let score = |s: &[f32]| -> Option<f32> {
+        let e = verifier.embed(s)?;
+        LANGS
+            .iter()
+            .filter_map(|l| vp.ready_centroid(l).map(|c| cosine(c, &e)))
+            .fold(None, |b: Option<f32>, x| Some(b.map_or(x, |b| b.max(x))))
+    };
+    let decode = |s: &[f32]| -> String {
+        if s.len() < RATE / 5 {
+            return String::new();
+        }
+        let cap = max_new_tokens_for(s.len() as f32 / RATE as f32);
+        decode_accuracy_allow_empty(&acc, s, None, ChineseScript::Simplified, Some(cap))
+            .map(|(t, _)| t)
+            .unwrap_or_default()
+    };
+    let cases: &[(&str, &[(usize, f32)])] = &[
+        (
+            "session-20260927-004133.wav",
+            &[(0, 9.07), (145110, 10.27), (309430, 5.51), (397590, 4.06)],
+        ),
+        (
+            "session-20260927-001101.wav",
+            &[
+                (0, 6.00),
+                (95990, 2.30),
+                (132790, 5.12),
+                (214710, 5.73),
+                (306390, 3.20),
+                (357590, 4.29),
+            ],
+        ),
+    ];
+    let win = (SLIDING_WIN_SECS * RATE as f32) as usize;
+    let hop = (SLIDING_HOP_SECS * RATE as f32) as usize;
+    let min_len = (SLIDING_MIN_RANGE_SECS * RATE as f32) as usize;
+    let judge_samples = (MIN_JUDGE_SECS * RATE as f32) as usize;
+    let mut md = String::from("# POC-448b · 窗口级复核（单元 + 碎片拼组 + 段内滑窗）\n\n");
+    for (file, dispatches) in cases {
+        let audio = sherpa_onnx::Wave::read(
+            root()
+                .join("collab/evidence/444")
+                .join(file)
+                .to_str()
+                .unwrap(),
+        )
+        .expect("录音须在 evidence/444")
+        .samples()
+        .to_vec();
+        let _ = writeln!(md, "## {file}\n");
+        for (k, &(pos, secs)) in dispatches.iter().enumerate() {
+            let ws = pos.saturating_sub(2 * RATE);
+            let we = (pos + (secs * RATE as f32) as usize).min(audio.len());
+            let w = &audio[ws..we];
+            let ranges = vad.speech_ranges(w);
+            let units = merge_speech_units(&ranges);
+            let mut verdicts = vec![SegVerdict::KeepShort; ranges.len()];
+            let mut spans = Vec::new();
+            let mut subs: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
+            let mut ri = 0usize;
+            for u in &units {
+                let us = u.speech_samples as f32 / RATE as f32;
+                let v = if us < MIN_JUDGE_SECS {
+                    SegVerdict::KeepShort
+                } else {
+                    let mut b = Vec::new();
+                    for &(s, e) in &u.members {
+                        b.extend_from_slice(&w[s..e]);
+                    }
+                    judge_voiceprint(&vp, verifier.embed(&b).as_deref(), us)
+                };
+                let r0 = ri;
+                for _ in &u.members {
+                    verdicts[ri] = v;
+                    ri += 1;
+                }
+                spans.push((r0..ri, v));
+                if matches!(v, SegVerdict::KeepUser(_)) {
+                    for idx in r0..ri {
+                        let (s, e) = ranges[idx];
+                        if e - s < min_len {
+                            continue;
+                        }
+                        let wins: Option<Vec<(usize, f32)>> =
+                            sliding_window_starts(e - s, win, hop)
+                                .into_iter()
+                                .map(|p| score(&w[s + p..s + p + win]).map(|sc| (p, sc)))
+                                .collect();
+                        if let Some(wins) = wins {
+                            let d = sliding_drop_ranges(&wins, win, DROP_THR, SLIDING_MIN_LOW_RUN);
+                            if !d.is_empty() {
+                                subs.push((
+                                    idx,
+                                    d.into_iter().map(|(a, b)| (s + a, s + b)).collect(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            let frags: Vec<(usize, usize, usize)> = spans
+                .iter()
+                .enumerate()
+                .filter(|(_, (r, v))| matches!(v, SegVerdict::KeepShort) && !r.is_empty())
+                .map(|(ui, (r, _))| {
+                    (
+                        ui,
+                        ranges[r.start].0,
+                        ranges[r.clone()].iter().map(|(s, e)| e - s).sum(),
+                    )
+                })
+                .collect();
+            for g in group_fragments(
+                &frags
+                    .iter()
+                    .map(|&(_, st, sp)| (st, sp))
+                    .collect::<Vec<_>>(),
+                judge_samples,
+                FRAGMENT_GROUP_SPAN_SECS,
+            ) {
+                let mut b = Vec::new();
+                for &fi in &g {
+                    for &(s, e) in &ranges[spans[frags[fi].0].0.clone()] {
+                        b.extend_from_slice(&w[s..e]);
+                    }
+                }
+                let v = judge_voiceprint(
+                    &vp,
+                    verifier.embed(&b).as_deref(),
+                    b.len() as f32 / RATE as f32,
+                );
+                if matches!(v, SegVerdict::DropNonUser(_) | SegVerdict::KeepUser(_)) {
+                    for &fi in &g {
+                        for rv in &mut verdicts[spans[frags[fi].0].0.clone()] {
+                            *rv = v;
+                        }
+                    }
+                }
+            }
+            let (kept, dropped) = apply_sub_drops(&ranges, &verdicts, &subs);
+            let cat = |rs: &[(usize, usize)]| {
+                rs.iter()
+                    .flat_map(|&(s, e)| w[s..e].iter().copied())
+                    .collect::<Vec<f32>>()
+            };
+            let (kb, db) = (cat(&kept), cat(&dropped));
+            let _ = writeln!(
+                md,
+                "- 窗#{k}：子剔除 {} 处｜**保留** {:.2}s「{}」｜**剔除** {:.2}s「{}」",
+                subs.iter().map(|(_, v)| v.len()).sum::<usize>(),
+                kb.len() as f32 / RATE as f32,
+                decode(&kb),
+                db.len() as f32 / RATE as f32,
+                decode(&db)
+            );
+        }
+        md.push('\n');
+    }
+    std::fs::write(root().join("collab/evidence/444/window448.md"), &md).expect("写 window448.md");
+    println!("{md}");
+}
