@@ -26,6 +26,9 @@ mod replay436_tests;
 // POC-VOICEPRINT-SHORT-444：声纹短片段判别力离线测试（整文件 #[cfg(test)]，只测不改生产）
 #[cfg(test)]
 mod poc_voiceprint_short_444;
+// POC-GPU-451：GPU 加速离线测试的 CPU 基线（整文件 #[cfg(test)] + #[ignore]，只测不改生产）
+#[cfg(test)]
+mod poc_gpu_451;
 // SLIDING-WINDOW-367：路A 逐片解码摘接线后，`join_segment_texts` 等 re-export 暂无人用；
 // **保留**（可回挂），故局部 allow。
 #[allow(unused_imports)]
