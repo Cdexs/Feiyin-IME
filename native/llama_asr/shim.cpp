@@ -54,6 +54,8 @@ static void * lib_sym(lib_t h, const char * s) { return dlsym(h, s); }
 LAS_FNS(LAS_FN)
 
 typedef void (*las_log_fn)(int level, const char * text);
+// 逐字回调（ACC-452 ⑤ 流式回灌）：每轮生成后回调「预填 + 截至目前的生成内容」。
+typedef void (*las_partial_fn)(void * user, const char * text);
 static las_log_fn g_log = nullptr;
 static void log_cb(enum ggml_log_level level, const char * text, void *) {
     // 只转发 WARN / ERROR（INFO/DEBUG 刷屏）。
@@ -231,7 +233,7 @@ static std::vector<llama_token> lookup_draft(const std::vector<llama_token> & dr
 // 输出 out = prefix + 生成内容（原样，含 "language X<asr_text>" 等特殊 token 文本）。返回 0 = 成功。
 extern "C" int las_decode(las_engine * e, const float * pcm, int n_samples, const char * system, const char * prefix,
                const char * draft, int max_new_tokens, int draft_max, char * out, int out_len,
-               las_stats * st, char * err, int err_len) {
+               las_stats * st, char * err, int err_len, las_partial_fn on_partial, void * user) {
     using clk = std::chrono::steady_clock;
     las_stats s{};
     std::string prompt;
@@ -305,6 +307,7 @@ extern "C" int las_decode(las_engine * e, const float * pcm, int n_samples, cons
         // 丢弃未被接受的草稿位置的 KV。
         if (acc < d.size()) p_llama_memory_seq_rm(mem, 0, n_past, -1);
         cur = next;
+        if (on_partial) on_partial(user, gen.c_str());
     }
     p_llama_batch_free(batch);
     auto t2 = clk::now();

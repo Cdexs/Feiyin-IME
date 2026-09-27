@@ -68,7 +68,39 @@ extern "C" {
         st: *mut LasStats,
         err: *mut c_char,
         err_len: c_int,
+        on_partial: Option<extern "C" fn(*mut c_void, *const c_char)>,
+        user: *mut c_void,
     ) -> c_int;
+}
+
+/// ACC-452 ②⑤：解码辅助（不改变解码结果的两项能力）。
+/// - `draft`：草稿文字（推测解码，只省时间）；
+/// - `on_partial`：逐字回调（流式回灌），参数为「预填 + 截至目前的生成内容」原文（含 `language X<asr_text>`）。
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DecodeAssist<'a> {
+    pub draft: Option<&'a str>,
+    pub on_partial: Option<&'a (dyn Fn(&str) + Sync)>,
+}
+
+impl<'a> DecodeAssist<'a> {
+    /// 只带草稿（无逐字回调；测试 / 回放用）。
+    #[cfg(test)]
+    pub(crate) fn draft(draft: Option<&'a str>) -> Self {
+        Self {
+            draft,
+            on_partial: None,
+        }
+    }
+}
+
+extern "C" fn partial_trampoline(user: *mut c_void, text: *const c_char) {
+    if user.is_null() || text.is_null() {
+        return;
+    }
+    // SAFETY：user 指向 `decode_with_prefix` 栈上的 `&dyn Fn(&str)`，调用期间存活；text 为 NUL 结尾。
+    let f = unsafe { &*(user as *const &(dyn Fn(&str) + Sync)) };
+    let s = unsafe { CStr::from_ptr(text) }.to_string_lossy();
+    f(&s);
 }
 
 extern "C" fn forward_log(level: c_int, text: *const c_char) {
@@ -246,7 +278,7 @@ impl LlamaAsr {
         system: Option<&str>,
         language: Option<&str>,
         max_new_tokens: Option<i32>,
-        draft: Option<&str>,
+        assist: DecodeAssist<'_>,
     ) -> Result<LlamaDecodeOut> {
         if samples.is_empty() {
             return Ok(LlamaDecodeOut {
@@ -257,7 +289,7 @@ impl LlamaAsr {
         let prefix = language
             .map(|l| format!("language {l}<asr_text>"))
             .unwrap_or_default();
-        self.decode_with_prefix(samples, system, &prefix, max_new_tokens, draft)
+        self.decode_with_prefix(samples, system, &prefix, max_new_tokens, assist)
     }
 
     /// ACC-452 ④ 续写（**不采用**：452 回放 CER 8.09% vs 接缝拼接 5.20%、重复更多 ⇒ 仅供回放实验，测试编译）：assistant 预填 `language {language}<asr_text>{prior}`（`prior` = 本次录音已定稿文字末尾），
@@ -270,14 +302,14 @@ impl LlamaAsr {
         language: &str,
         prior: &str,
         max_new_tokens: Option<i32>,
-        draft: Option<&str>,
+        assist: DecodeAssist<'_>,
     ) -> Result<LlamaDecodeOut> {
         // 上文以句末标点结尾时，模型会判「已说完」直接吐结束符（452 回放：120 窗中 100 窗空）⇒ 预填前去掉末尾标点，
         // 让模型从「未完的句子」接着写（标点由模型按音频重新决定）。
         let prior = prior
             .trim_end_matches(|c: char| c.is_whitespace() || "。！？，、；：…,.!?;:".contains(c));
         let prefix = format!("language {language}<asr_text>{prior}");
-        let o = self.decode_with_prefix(samples, system, &prefix, max_new_tokens, draft)?;
+        let o = self.decode_with_prefix(samples, system, &prefix, max_new_tokens, assist)?;
         let gen = o
             .raw
             .strip_prefix(prefix.as_str())
@@ -295,15 +327,31 @@ impl LlamaAsr {
         system: Option<&str>,
         prefix: &str,
         max_new_tokens: Option<i32>,
-        draft: Option<&str>,
+        assist: DecodeAssist<'_>,
     ) -> Result<LlamaDecodeOut> {
         let sys = system.map(cstr).transpose()?;
         let pre = cstr(prefix)?;
-        let dr = draft.filter(|d| !d.is_empty()).map(cstr).transpose()?;
+        let dr = assist
+            .draft
+            .filter(|d| !d.is_empty())
+            .map(cstr)
+            .transpose()?;
         let mut out = vec![0u8; 64 * 1024];
         let mut err = [0u8; 512];
         let mut st = LasStats::default();
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        // ⑤ 逐字回调：把 `&dyn Fn` 的地址交给 shim，经 `partial_trampoline` 转回（调用期间栈上存活）。
+        let cb_ref: Option<&(dyn Fn(&str) + Sync)> = assist.on_partial;
+        let (cb_fn, cb_user): (
+            Option<extern "C" fn(*mut c_void, *const c_char)>,
+            *mut c_void,
+        ) = match cb_ref.as_ref() {
+            Some(r) => (
+                Some(partial_trampoline),
+                r as *const &(dyn Fn(&str) + Sync) as *mut c_void,
+            ),
+            None => (None, std::ptr::null_mut()),
+        };
         // SAFETY：指针均有效且在调用期间存活；out / err 为可写缓冲；空 prefix ⇒ shim 视为不预填。
         let rc = unsafe {
             las_decode(
@@ -320,6 +368,8 @@ impl LlamaAsr {
                 &mut st,
                 err.as_mut_ptr() as *mut c_char,
                 err.len() as c_int,
+                cb_fn,
+                cb_user,
             )
         };
         if rc != 0 {

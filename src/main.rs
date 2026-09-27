@@ -8986,6 +8986,8 @@ fn spawn_worker_thread(
                                         // —— `dispatch_idx`（切片下标）在窗口间并发 + 收尾 drain 下**会重复**，
                                         // 不能拿它当「过期」判据（会把后到的完整文本误杀成 stale，预览永不更新）。
                                         let mut reflow_seq: usize = 0;
+                                        // ACC-452 ⑤：本窗流式回灌已显示到的字数（分发循环收到正式结果即清零）。
+                                        let mut partial_shown_len: usize = 0;
                                         let mut ordered = transcription::OrderedReflow::new();
                                         // LOCALRT-PREVIEW-HIDE-NONUSER-429：最近一次「已定稿权威全文」
                                         //（`OrderedReflow` 产出），供 full_drop 窗剔除合成使用。
@@ -8996,6 +8998,9 @@ fn spawn_worker_thread(
                                         std::thread::scope(move |pool| {
                                             let (res_tx, res_rx) =
                                                 crossbeam_channel::unbounded::<AccDecodeResult>();
+                                            // ACC-452 ⑤：解码中的半截结果 `(seq, dispatch_idx, 原文)`（流式回灌）。
+                                            let (partial_tx, partial_rx) =
+                                                crossbeam_channel::unbounded::<(usize, usize, String)>();
                                             // 382（3B）：**一个共享任务通道**，所有 worker 从同一通道取
                                             //（crossbeam 通道天然多消费者）。旧实现 `rr % concurrency` 把第 N 窗
                                             // 固定派给第 N%2 个 worker ⇒ 一个 worker 在解长窗时下一窗仍排在它后面、
@@ -9005,6 +9010,7 @@ fn spawn_worker_thread(
                                             for _ in 0..concurrency {
                                                 let trx = task_rx.clone();
                                                 let rtx = res_tx.clone();
+                                                let ptx = partial_tx.clone();
                                                 pool.spawn(move || {
                                                     for (
                                                         seq,
@@ -9022,6 +9028,9 @@ fn spawn_worker_thread(
                                                         let queued_ms =
                                                             dispatched_at.elapsed().as_secs_f64() * 1000.0;
                                                         let t0 = std::time::Instant::now();
+                                                        // ACC-452 ⑤：本窗半截结果的限频计时（首次在解码开始后一个间隔才发）。
+                                                        let partial_last =
+                                                            std::sync::Mutex::new(std::time::Instant::now());
                                                         let r = decode_window(
                                                             recognizer,
                                                             &audio,
@@ -9033,6 +9042,16 @@ fn spawn_worker_thread(
                                                             streaming_nonempty,
                                                             new_slice_from,
                                                             &hints,
+                                                            Some(&|raw: &str| {
+                                                                // ACC-452 ⑤：限频 ≥ PARTIAL_REFLOW_INTERVAL 才发一次（每字都发会刷屏）。
+                                                                let mut last = partial_last
+                                                                    .lock()
+                                                                    .unwrap_or_else(|e| e.into_inner());
+                                                                if last.elapsed() >= PARTIAL_REFLOW_INTERVAL {
+                                                                    *last = std::time::Instant::now();
+                                                                    let _ = ptx.send((seq, dispatch_idx, raw.to_string()));
+                                                                }
+                                                            }),
                                                         );
                                                         let ms = t0.elapsed().as_secs_f64() * 1000.0;
                                                         // 382（3C）：解码完成时刻（端到端「解完 → 浮层重画」）。
@@ -9062,6 +9081,92 @@ fn spawn_worker_thread(
                                             let mut done = 0usize;
                                             // FIX-PREVIEW-HARVEST-380（A）：结果处理**单一定义** —— select 循环与
                                             // 收尾 drain 共用，保证该线程内 `push_window(` 只出现一处（防两份再漂移）。
+                                            // ACC-ENGINE-LLAMACPP-452 ⑤：流式回灌（Gavin「回灌刷新你可以直接做」）。
+                                            // 解码中的半截结果 ⇒ 在 `OrderedReflow` **副本**上试拼接（真实状态不动）；
+                                            // 仅当它是下一个待拼窗口、且试拼出的全文比当前显示更长（模型已写过重叠部分、
+                                            // 开始出新内容）才发 `PreviewReflow`。整窗结果到达后照原流程（406 / 声纹 / 兜底）
+                                            // 正式回灌覆盖；中途显示不参与任何判定，不改变最终文字。
+                                            macro_rules! stream_partial_reflow {
+                                                ($seq:expr, $idx:expr, $raw:expr) => {{
+                                                    let seq: usize = $seq;
+                                                    let dispatch_idx: usize = $idx;
+                                                    let raw: String = $raw;
+                                                    if seq == ordered.next_seq()
+                                                        && !cancel_acc.load(Ordering::Acquire)
+                                                        // 语种前缀须已完整（否则「language Chinese<asr」会被当正文，452 回放样例）。
+                                                        && raw.contains("<asr_text>")
+                                                    {
+                                                        let stripped =
+                                                            transcription::Transcriber::strip_asr_special_tokens(raw.trim());
+                                                        let partial = text_normalizer::normalize_text_for_language(
+                                                            stripped.trim(),
+                                                            acc_script,
+                                                        );
+                                                        // 窗口开头是重识的前片后缀：半截结果须已越过重叠区（有效字 > 估算 + 余量）
+                                                        // 才可能是新内容；否则试拼会把重叠字当新字追加（452 回放闪烁主因）。
+                                                        let win_stream_ref = window_streaming_texts
+                                                            .get(seq)
+                                                            .map(|s| s.as_str())
+                                                            .unwrap_or("");
+                                                        let past_overlap = window_samples.get(seq).map_or(true, |smp| {
+                                                            transcription::partial_past_overlap(&partial, win_stream_ref, smp)
+                                                        });
+                                                        if !partial.is_empty() && past_overlap {
+                                                            let (ws, we) = window_spans
+                                                                .get(seq)
+                                                                .copied()
+                                                                .unwrap_or((seq, seq + 1));
+                                                            let smp = window_samples.get(seq).cloned().unwrap_or_default();
+                                                            let win_stream = window_streaming_texts
+                                                                .get(seq)
+                                                                .cloned()
+                                                                .unwrap_or_default();
+                                                            let win_split =
+                                                                window_split_fracs.get(seq).copied().flatten();
+                                                            let mut probe = ordered.clone();
+                                                            let out = probe.push_window_streaming(
+                                                                seq, ws, we, smp, partial, win_stream, win_split,
+                                                            );
+                                                            if let Some(candidate) = out.last() {
+                                                                let candidate = apply_authoritative_filler_dedup(candidate);
+                                                                let cand_len = candidate.chars().count();
+                                                                let shown = partial_shown_len
+                                                                    .max(last_authoritative.chars().count());
+                                                                if cand_len > shown {
+                                                                    partial_shown_len = cand_len;
+                                                                    if log::log_enabled!(log::Level::Debug) {
+                                                                        log::debug!(
+                                                                            "[ACC-452] partial reflow: seq={} chars={} (shown {})",
+                                                                            seq,
+                                                                            cand_len,
+                                                                            shown
+                                                                        );
+                                                                    }
+                                                                    let _ = acc_event_tx.send(PipelineEvent::PreviewReflow {
+                                                                        generation: session_generation,
+                                                                        seg_index: dispatch_idx,
+                                                                        reflow_seq: Some(reflow_seq),
+                                                                        committed_len: window_committed_lens
+                                                                            .get(seq)
+                                                                            .copied()
+                                                                            .unwrap_or(0),
+                                                                        boundary_usable: window_boundary_usable
+                                                                            .get(seq)
+                                                                            .copied()
+                                                                            .unwrap_or(false),
+                                                                        has_hole: false,
+                                                                        acc_text: candidate,
+                                                                        replace_all: true,
+                                                                        decode_done_at: None,
+                                                                        non_user_hide: false,
+                                                                    });
+                                                                    reflow_seq += 1;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }};
+                                            }
                                             macro_rules! harvest_acc_window {
                                                 ($res:expr) => {{
                                                     let (seq, dispatch_idx, r, ms, decode_done_at) = $res;
@@ -9743,7 +9848,7 @@ fn spawn_worker_thread(
                                             // FIX-PREVIEW-HARVEST-380（A）：select 循环 —— 新切片与解码结果
                                             // **任一先到即处理**，不再等下一个切片（Gavin 现象①：停顿即停刷）。
                                             let mut step =
-                                                |ev: AccWindowStep<AccInput, AccDecodeResult>| {
+                                                |ev: AccWindowStep<AccInput, AccDecodeResult, (usize, usize, String)>| {
                                                     match ev {
                                                         AccWindowStep::Slice(input) => match input {
                                                             AccInput::Slice((
@@ -9899,13 +10004,19 @@ fn spawn_worker_thread(
                                                             }
                                                         },
                                                         AccWindowStep::Result(res) => {
+                                                            // ACC-452 ⑤：正式结果到达 ⇒ 流式回灌计数清零（以正式回灌为准）。
+                                                            partial_shown_len = 0;
                                                             harvest_acc_window!(res)
+                                                        }
+                                                        AccWindowStep::Partial((seq, idx, raw)) => {
+                                                            stream_partial_reflow!(seq, idx, raw)
                                                         }
                                                     }
                                                 };
                                             drive_acc_windows(
                                                 &acc_rx,
                                                 &res_rx,
+                                                &partial_rx,
                                                 || cancel_acc.load(Ordering::Acquire),
                                                 &mut step,
                                             );
@@ -10139,7 +10250,7 @@ fn spawn_worker_thread(
                                                     speech_ranges: None,
                                                     streaming_nonempty: false,
                                                     new_slice_from: 0,
-                                                    draft: None,
+                                                    assist: Default::default(),
                                                 };
                                                 match transcription::transcribe_acc_ctx(
                                                     rec,
@@ -11358,6 +11469,8 @@ fn decode_window(
     new_slice_from: usize,
     // ACC-452：本窗解码提示（② 预览草稿）。
     hints: &AccHints,
+    // ACC-452 ⑤：逐字回调（流式回灌；`None` = 不回调）。
+    on_partial: Option<&(dyn Fn(&str) + Sync)>,
 ) -> anyhow::Result<(String, bool, transcription::AccDropStats)> {
     transcription::transcribe_acc_ctx(
         recognizer,
@@ -11370,7 +11483,10 @@ fn decode_window(
             speech_ranges,
             streaming_nonempty,
             new_slice_from,
-            draft: (!hints.draft.is_empty()).then_some(hints.draft.as_str()),
+            assist: transcription::llama_asr::DecodeAssist {
+                draft: (!hints.draft.is_empty()).then_some(hints.draft.as_str()),
+                on_partial,
+            },
         },
     )
 }
@@ -12813,6 +12929,9 @@ type AccTaskMsg = (
     AccHints,
 );
 
+/// ACC-452 ⑤：流式回灌的半截结果最短发送间隔（每字都发会刷屏；~6 字 / 间隔）。
+const PARTIAL_REFLOW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+
 /// ACC-ENGINE-LLAMACPP-452：本窗解码提示（随任务派发）。上文注入经 452 回放未采用（加在词库之上 CER 4.63%→4.80%）。
 #[derive(Default, Clone)]
 struct AccHints {
@@ -12821,9 +12940,11 @@ struct AccHints {
 }
 
 /// FIX-PREVIEW-HARVEST-380（A）：滑窗线程的一步（新切片 / 解码结果）。
-enum AccWindowStep<A, R> {
+enum AccWindowStep<A, R, P> {
     Slice(A),
     Result(R),
+    /// ACC-452 ⑤：解码中的半截结果（流式回灌）。
+    Partial(P),
 }
 
 /// FIX-PREVIEW-HARVEST-380（A）：滑窗线程「结果到即收」驱动器。
@@ -12835,12 +12956,15 @@ enum AccWindowStep<A, R> {
 /// 不进循环体，已解出的结果要压到下一次切片或松键才回灌（用户停顿 ⇒ 预览不刷新，每次的
 /// 最后一窗都要等松键）。抽成独立函数的唯一目的，是让「结果在 `acc_rx` 仍打开时就被处理」
 /// 这条不变量**可对生产代码单测**（见 `preview_harvest_380_tests`），而不是测一份复制品。
-fn drive_acc_windows<A, R>(
+fn drive_acc_windows<A, R, P>(
     acc_rx: &crossbeam_channel::Receiver<A>,
     res_rx: &crossbeam_channel::Receiver<R>,
+    partial_rx: &crossbeam_channel::Receiver<P>,
     cancelled: impl Fn() -> bool,
-    step: &mut impl FnMut(AccWindowStep<A, R>),
+    step: &mut impl FnMut(AccWindowStep<A, R, P>),
 ) {
+    // ACC-452 ⑤：半截结果通道断开（不应发生）⇒ 换成永不就绪的通道，避免 select 空转。
+    let mut partial_rx = partial_rx.clone();
     loop {
         if cancelled() {
             break;
@@ -12856,6 +12980,10 @@ fn drive_acc_windows<A, R>(
                 // 收尾段之外 res_rx 不该断开（worker 未全部退出前持有发送端）；
                 // 真断开按「不再有结果」处理，避免死循环。
                 Err(_) => break,
+            },
+            recv(partial_rx) -> msg => match msg {
+                Ok(p) => step(AccWindowStep::Partial(p)),
+                Err(_) => partial_rx = crossbeam_channel::never(),
             },
         }
     }
@@ -13055,15 +13183,22 @@ mod preview_harvest_380_tests {
         let seen_worker = Arc::clone(&seen);
 
         let handle = std::thread::spawn(move || {
-            let mut step = |ev: AccWindowStep<u32, u32>| {
+            let mut step = |ev: AccWindowStep<u32, u32, u32>| {
                 let tag = match ev {
                     AccWindowStep::Slice(_) => "slice",
                     AccWindowStep::Result(_) => "result",
+                    AccWindowStep::Partial(_) => "partial",
                 };
                 seen_worker.lock().unwrap().push(tag);
                 let _ = step_tx.send(tag);
             };
-            drive_acc_windows(&acc_rx, &res_rx, || false, &mut step);
+            drive_acc_windows(
+                &acc_rx,
+                &res_rx,
+                &crossbeam_channel::never::<u32>(),
+                || false,
+                &mut step,
+            );
         });
 
         // 1) 派发 1 窗；阻塞等它被处理（先后由通道制造，非 sleep）。
@@ -23004,5 +23139,60 @@ mod fallback_far_446_tests {
         assert!(prod.contains(concat!("&fb_", "final,")));
         assert!(prod.contains(concat!("window_far_ranges.push(", "window_far)")));
         assert!(prod.contains(concat!("window_far_ranges.push(", "$far)")));
+    }
+}
+
+/// ACC-ENGINE-LLAMACPP-452 ⑤：流式回灌的接线护栏。
+#[cfg(test)]
+mod partial_reflow_452_tests {
+    use super::{drive_acc_windows, AccWindowStep};
+    use std::time::Duration;
+
+    /// 分发循环：半截结果通道的消息在 `acc_rx` 仍打开时即被处理（不等切片 / 松键）。
+    #[test]
+    fn t452_partial_delivered_while_recording() {
+        let (acc_tx, acc_rx) = crossbeam_channel::unbounded::<u32>();
+        let (_res_tx, res_rx) = crossbeam_channel::unbounded::<u32>();
+        let (p_tx, p_rx) = crossbeam_channel::unbounded::<u32>();
+        let (seen_tx, seen_rx) = crossbeam_channel::unbounded::<&'static str>();
+        let h = std::thread::spawn(move || {
+            let mut step = |ev: AccWindowStep<u32, u32, u32>| {
+                let _ = seen_tx.send(match ev {
+                    AccWindowStep::Slice(_) => "slice",
+                    AccWindowStep::Result(_) => "result",
+                    AccWindowStep::Partial(_) => "partial",
+                });
+            };
+            drive_acc_windows(&acc_rx, &res_rx, &p_rx, || false, &mut step);
+        });
+        p_tx.send(7).unwrap();
+        assert_eq!(
+            seen_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "partial"
+        );
+        drop(acc_tx);
+        h.join().unwrap();
+    }
+
+    /// 源码护栏：流式回灌只在 `OrderedReflow` **副本**上试拼接、只处理下一个待拼窗口、
+    /// 只在比当前显示更长时才发事件；分发循环把 Partial 交给它。
+    #[test]
+    fn t452_partial_reflow_uses_clone_only() {
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs"))
+            .join("\n");
+        let body = prod
+            .split(concat!("macro_rules! stream_partial", "_reflow"))
+            .nth(1)
+            .expect("stream_partial_reflow 缺失");
+        let body = body.split("macro_rules!").next().unwrap();
+        assert!(body.contains(concat!("let mut probe = ordered", ".clone();")));
+        assert!(body.contains(concat!("probe.push_window", "_streaming(")));
+        assert!(
+            !body.contains(concat!("ordered.push_window", "_streaming(")),
+            "流式回灌不得改动真实拼接状态"
+        );
+        assert!(body.contains(concat!("seq == ordered.", "next_seq()")));
+        assert!(body.contains(concat!("if cand_len > ", "shown")));
+        assert!(prod.contains(concat!("stream_partial_reflow!(seq, ", "idx, raw)")));
     }
 }

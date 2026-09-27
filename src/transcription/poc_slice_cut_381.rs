@@ -114,7 +114,7 @@ fn decode_cuts(
             speech_ranges: None,
             streaming_nonempty: false,
             new_slice_from: 0,
-            draft: None,
+            assist: Default::default(),
         };
         let t0 = Instant::now();
         let (text, _, _) =
@@ -232,7 +232,7 @@ fn run_windows(
                 speech_ranges: None,
                 streaming_nonempty: false,
                 new_slice_from: 0,
-                draft: None,
+                assist: Default::default(),
             },
         )
         .unwrap_or_default();

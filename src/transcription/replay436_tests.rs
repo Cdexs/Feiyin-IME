@@ -376,7 +376,7 @@ fn replay436_full_corpus_433_vs_436() {
             None,
             ChineseScript::Simplified,
             Some(cap),
-            None,
+            Default::default(),
         ) {
             Ok((t, _)) => t,
             Err(e) => {
@@ -1227,7 +1227,9 @@ fn replay452_variants() {
                     speech_ranges: None,
                     streaming_nonempty: !stream_text.trim().is_empty(),
                     new_slice_from: wsamples[..wsamples.len() - 1].iter().sum(),
-                    draft: use_draft.then_some(stream_text.as_str()),
+                    assist: crate::transcription::llama_asr::DecodeAssist::draft(
+                        use_draft.then_some(stream_text.as_str()),
+                    ),
                 };
                 let t0 = Instant::now();
                 let text = transcribe_acc_ctx(&acc, &waudio, ChineseScript::Simplified, i, inject)
@@ -1405,7 +1407,7 @@ fn replay452_continue() {
                         speech_ranges: None,
                         streaming_nonempty: !stream_text.trim().is_empty(),
                         new_slice_from: wsamples[..wsamples.len() - 1].iter().sum(),
-                        draft: None,
+                        assist: Default::default(),
                     };
                     let text =
                         transcribe_acc_ctx(&acc, &waudio, ChineseScript::Simplified, i, inject)
@@ -1474,9 +1476,17 @@ fn replay452_continue() {
                         cs[k..].iter().collect()
                     };
                     let gen = if prior.is_empty() {
-                        acc.decode(used, sys, None, Some(cap), draft_txt.as_deref())
-                            .map(|o| Transcriber::strip_asr_special_tokens(o.raw.trim()))
-                            .unwrap_or_default()
+                        acc.decode(
+                            used,
+                            sys,
+                            None,
+                            Some(cap),
+                            crate::transcription::llama_asr::DecodeAssist::draft(
+                                draft_txt.as_deref(),
+                            ),
+                        )
+                        .map(|o| Transcriber::strip_asr_special_tokens(o.raw.trim()))
+                        .unwrap_or_default()
                     } else {
                         acc.decode_continue(
                             used,
@@ -1484,7 +1494,9 @@ fn replay452_continue() {
                             "Chinese",
                             &prior,
                             Some(cap),
-                            draft_txt.as_deref(),
+                            crate::transcription::llama_asr::DecodeAssist::draft(
+                                draft_txt.as_deref(),
+                            ),
                         )
                         .map(|o| o.raw)
                         .unwrap_or_default()
@@ -1544,4 +1556,193 @@ fn replay452_continue() {
         report.push_str(&line);
     }
     std::fs::write(root.join("../poc-451/replay452c.md"), report).unwrap();
+}
+
+/// ACC-452 ⑤ 流式回灌回放：完全按生产逻辑（150ms 限频 / 副本试拼接 / 比当前显示长才显示）模拟中途显示，
+/// 统计：① 闪烁 = 中途显示的全文**不是**本窗正式全文的前缀（有效字口径）的次数；② 提前量 = 首次显示新内容
+/// 相对整窗解完提前的毫秒数。
+#[test]
+#[ignore = "ACC-452 流式回灌回放：cargo test --bin feiyin-ime replay452_stream -- --ignored --nocapture"]
+fn replay452_stream() {
+    use std::sync::Mutex as StdMutex;
+    crate::transcription::speaker::TEST_EXTRACTOR_MISSING.with(|c| c.set(true));
+    let root = manifest_dir();
+    let models = root.join("models");
+    let acc = create_qwen3_recognizer(&models).expect("Qwen3 GGUF 须在位");
+    let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
+        .expect("流式模型须在位");
+    let terms = load_real_wordbook_terms();
+    let run_stream = |audio: &[f32]| -> String {
+        let stream = st_rec.create_stream();
+        for c in audio.chunks(1600) {
+            stream.accept_waveform(RATE as i32, c);
+            while st_rec.is_ready(&stream) {
+                st_rec.decode(&stream);
+            }
+        }
+        stream.input_finished();
+        while st_rec.is_ready(&stream) {
+            st_rec.decode(&stream);
+        }
+        st_rec
+            .get_result(&stream)
+            .map(|r| r.text.clone())
+            .unwrap_or_default()
+    };
+    let (mut shown_n, mut flicker_n, mut windows_with_partial, mut windows) =
+        (0usize, 0usize, 0usize, 0usize);
+    let mut lead_ms_sum = 0f64;
+    let mut examples = String::new();
+    for wav in collect_wavs(&root) {
+        let Some((audio, rate)) = read_wav(&wav) else {
+            continue;
+        };
+        if rate as usize != RATE {
+            continue;
+        }
+        let mut pieces: Vec<(usize, usize)> = Vec::new();
+        for (s, e) in dispatch_slices(&audio) {
+            pieces.extend(vad::plan_gap_cuts(&audio, s, e));
+        }
+        let mut reflow = OrderedReflow::new();
+        let mut last_auth = String::new();
+        for (i, &(ps, pe)) in pieces.iter().enumerate() {
+            let mut waudio: Vec<f32> = Vec::new();
+            let mut wsamples: Vec<usize> = Vec::new();
+            if i >= 1 {
+                let prev = &audio[pieces[i - 1].0..pieces[i - 1].1];
+                let cs = crate::take_context_suffix(prev, "", "", RATE_CPS);
+                waudio.extend_from_slice(&prev[cs.cut.min(prev.len())..]);
+                wsamples.push(cs.suffix_samples);
+            }
+            waudio.extend_from_slice(&audio[ps..pe]);
+            wsamples.push(pe - ps);
+            let span_start = i.saturating_sub(1);
+            let split = crate::window_overlap_split(
+                span_start,
+                if i >= 1 { Some(i) } else { None },
+                &waudio,
+                &wsamples,
+            );
+            let stream_text = run_stream(&waudio);
+            // 收集半截结果（带时间戳），生产同款 150ms 限频。
+            let partials: StdMutex<Vec<(f64, String)>> = StdMutex::new(Vec::new());
+            let t0 = Instant::now();
+            let last = StdMutex::new(Instant::now());
+            let cb = |raw: &str| {
+                let mut l = last.lock().unwrap();
+                if l.elapsed() >= std::time::Duration::from_millis(150) {
+                    *l = Instant::now();
+                    partials
+                        .lock()
+                        .unwrap()
+                        .push((t0.elapsed().as_secs_f64() * 1000.0, raw.to_string()));
+                }
+            };
+            let inject = CtxInject {
+                terms: terms.as_deref(),
+                avg_chars_per_sec: None,
+                speech_ranges: None,
+                streaming_nonempty: !stream_text.trim().is_empty(),
+                new_slice_from: wsamples[..wsamples.len() - 1].iter().sum(),
+                assist: crate::transcription::llama_asr::DecodeAssist {
+                    draft: Some(stream_text.as_str()),
+                    on_partial: Some(&cb),
+                },
+            };
+            let text = transcribe_acc_ctx(&acc, &waudio, ChineseScript::Simplified, i, inject)
+                .map(|(t, _, _)| t)
+                .unwrap_or_default();
+            let done_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            windows += 1;
+            // 生产同款试拼接：副本 + 过滤 + 比当前显示长才显示。
+            let mut shown_len = last_auth.chars().count();
+            let mut displayed: Vec<String> = Vec::new();
+            let mut first_ms: Option<f64> = None;
+            for (ms, raw) in partials.lock().unwrap().iter() {
+                if !raw.contains("<asr_text>") {
+                    continue;
+                }
+                let stripped = Transcriber::strip_asr_special_tokens(raw.trim());
+                let partial = crate::text_normalizer::normalize_text_for_language(
+                    stripped.trim(),
+                    ChineseScript::Simplified,
+                );
+                if partial.is_empty() || !partial_past_overlap(&partial, &stream_text, &wsamples) {
+                    continue;
+                }
+                let mut probe = reflow.clone();
+                if let Some(c) = probe
+                    .push_window_streaming(
+                        i,
+                        span_start,
+                        i + 1,
+                        wsamples.clone(),
+                        partial,
+                        stream_text.clone(),
+                        split,
+                    )
+                    .last()
+                {
+                    let c = crate::apply_authoritative_filler_dedup(c);
+                    if c.chars().count() > shown_len {
+                        shown_len = c.chars().count();
+                        first_ms.get_or_insert(*ms);
+                        displayed.push(c);
+                    }
+                }
+            }
+            let out = reflow.push_window_streaming(
+                i,
+                span_start,
+                i + 1,
+                wsamples.clone(),
+                text,
+                stream_text,
+                split,
+            );
+            let final_full = out
+                .last()
+                .map(|f| crate::apply_authoritative_filler_dedup(f))
+                .unwrap_or_else(|| last_auth.clone());
+            let fe = effective_chars(&final_full);
+            if !displayed.is_empty() {
+                windows_with_partial += 1;
+                lead_ms_sum += done_ms - first_ms.unwrap_or(done_ms);
+            }
+            for d in &displayed {
+                shown_n += 1;
+                let de = effective_chars(d);
+                if !(de.len() <= fe.len() && fe[..de.len()] == de[..]) {
+                    flicker_n += 1;
+                    if examples.lines().count() < 20 {
+                        examples.push_str(&format!(
+                            "- 中途：…{}\n  最终：…{}\n",
+                            clip_tail(d, 30),
+                            clip_tail(&final_full, 30)
+                        ));
+                    }
+                }
+            }
+            if !final_full.is_empty() {
+                last_auth = final_full;
+            }
+        }
+    }
+    let summary = format!(
+        "窗 {windows}，有中途显示的窗 {windows_with_partial}，中途显示 {shown_n} 次，其中被最终改掉（闪烁）{flicker_n} 次（{:.1}%），新内容平均提前 {:.0}ms\n",
+        flicker_n as f64 * 100.0 / shown_n.max(1) as f64,
+        lead_ms_sum / windows_with_partial.max(1) as f64
+    );
+    print!("[452s] {summary}");
+    std::fs::write(
+        root.join("../poc-451/replay452s.md"),
+        format!("# ACC-452 流式回灌回放\n\n{summary}\n## 闪烁样例\n{examples}"),
+    )
+    .unwrap();
+}
+
+fn clip_tail(s: &str, n: usize) -> String {
+    let c: Vec<char> = s.chars().collect();
+    c[c.len().saturating_sub(n)..].iter().collect()
 }

@@ -316,9 +316,9 @@ pub struct CtxInject<'a> {
     /// 非本地实时滑窗（在线 / 精确批量 / POC）传 `0`（对它们声纹不参与，见 `filter_ranges_by_voiceprint`
     /// 仅在本地实时路径被调用）。
     pub new_slice_from: usize,
-    /// ACC-ENGINE-LLAMACPP-452 ②：本窗**预览（流式）文字**，作推测解码草稿 —— 目标模型逐位验证，
-    /// 只接受与自身贪心一致的 token ⇒ 输出不变、只省时间。`None` = 关闭（非本地实时调用方）。
-    pub draft: Option<&'a str>,
+    /// ACC-ENGINE-LLAMACPP-452 ②⑤：解码辅助 —— 本窗**预览文字**作推测解码草稿（只省时间）+ 逐字回调
+    ///（流式回灌）。非本地实时调用方传 `Default::default()`（都不开）。
+    pub assist: llama_asr::DecodeAssist<'a>,
 }
 
 /// 回显探针归一化：去空白与常见中英标点（回显是逐字文本，标点差异不应漏检）。
@@ -955,7 +955,14 @@ fn decode_accuracy_once(
     script: ChineseScript,
 ) -> Result<String> {
     // 其他调用方行为逐位不变 ⇒ 传 `None`（不设 `max_new_tokens`，沿用全局 256）。
-    let (text, _lang) = decode_accuracy_allow_empty(recognizer, samples, system, script, None, None)?;
+    let (text, _lang) = decode_accuracy_allow_empty(
+        recognizer,
+        samples,
+        system,
+        script,
+        None,
+        Default::default(),
+    )?;
     if text.is_empty() {
         // 与 transcribe_segment_detailed 一致：accuracy 空输出 ⇒ 该段失败（上层 all_native=false）
         anyhow::bail!("ASR accuracy model produced empty output");
@@ -972,10 +979,18 @@ fn decode_accuracy_allow_empty(
     system: Option<&str>,
     script: ChineseScript,
     max_new_tokens: Option<i32>,
-    // ACC-452 ②：草稿文字（本窗预览）⇒ 推测解码提速；`None` = 关闭。
-    draft: Option<&str>,
+    // ACC-452 ②⑤：解码辅助（草稿 / 逐字回调）；不改变解码结果。
+    assist: llama_asr::DecodeAssist<'_>,
 ) -> Result<(String, Option<String>)> {
-    decode_accuracy_allow_empty_lang(recognizer, samples, system, script, max_new_tokens, None, draft)
+    decode_accuracy_allow_empty_lang(
+        recognizer,
+        samples,
+        system,
+        script,
+        max_new_tokens,
+        None,
+        assist,
+    )
 }
 
 /// FIX-ACC-EMPTY-RETRY-426：同 [`decode_accuracy_allow_empty`]，但可 per-stream 指定 `language`
@@ -987,15 +1002,15 @@ fn decode_accuracy_allow_empty_lang(
     script: ChineseScript,
     max_new_tokens: Option<i32>,
     language: Option<&str>,
-    // ACC-452 ②：草稿文字（推测解码；`None` = 关闭）。
-    draft: Option<&str>,
+    // ACC-452 ②⑤：解码辅助（草稿 / 逐字回调）。
+    assist: llama_asr::DecodeAssist<'_>,
 ) -> Result<(String, Option<String>)> {
     // ACC-ENGINE-LLAMACPP-452：解码引擎由 sherpa-onnx 换为 llama.cpp（输入输出形态不变）：
     // - `system`：原 sherpa per-stream `hotwords`（Qwen3 上下文 / 词库）⇒ system 消息；
     // - `language`（426）：原 sherpa `language` ⇒ assistant 预填 `language X<asr_text>`（Qwen3 官方指定语种方式）；
     // - `max_new_tokens`（TUNE-390）：`None` ⇒ 引擎默认 256（同原 sherpa 全局值）。
     // 原始输出同为 `language X<asr_text>正文`，下游剥离 / 规整逐位沿用。
-    let out = recognizer.decode(samples, system, language, max_new_tokens, draft)?;
+    let out = recognizer.decode(samples, system, language, max_new_tokens, assist)?;
     if log::log_enabled!(log::Level::Debug) {
         let st = out.stats;
         log::debug!(
@@ -1192,9 +1207,16 @@ fn redecode_with_ranges(
         return None;
     }
     let cap = max_new_tokens_for(used.len() as f32 / 16000.0);
-    decode_accuracy_allow_empty(recognizer, &used, system, script, Some(cap), None)
-        .ok()
-        .map(|(t, _)| t)
+    decode_accuracy_allow_empty(
+        recognizer,
+        &used,
+        system,
+        script,
+        Some(cap),
+        Default::default(),
+    )
+    .ok()
+    .map(|(t, _)| t)
 }
 
 /// FIX-NOSPEECH-WINDOW-414：自跑 VAD 取区间（`None` 回退分支与 `Revad` 复核分支共用）。
@@ -1433,8 +1455,8 @@ pub(crate) fn transcribe_acc_ctx(
         system.as_deref().filter(|_| inject_on),
         script,
         Some(token_cap),
-        // ACC-452 ②：本窗预览文字作草稿（推测解码，只省时间）。
-        inject.draft,
+        // ACC-452 ②⑤：本窗预览文字作草稿 + 逐字回调（流式回灌）。
+        inject.assist,
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -1486,7 +1508,7 @@ pub(crate) fn transcribe_acc_ctx(
                 script,
                 Some(token_cap),
                 lang_opt,
-                inject.draft,
+                inject.assist,
             )
             .map(|(t, _)| t)
         },
@@ -2101,7 +2123,11 @@ impl Transcriber {
                 let result = stream.get_result().context("No transcription result")?;
                 result.text.trim().to_string()
             }
-            OfflineEngine::Qwen3(e) => e.decode(samples, None, None, None, None)?.raw.trim().to_string(),
+            OfflineEngine::Qwen3(e) => e
+                .decode(samples, None, None, None, Default::default())?
+                .raw
+                .trim()
+                .to_string(),
         };
 
         // ASR-NOSPEECH-FILTER-001: 剥离特殊 token（如 <|nospeech|>）
@@ -3637,6 +3663,26 @@ fn streaming_overlap_region(
     prev_stream.chars().skip(prev_chars - n).collect()
 }
 
+// ACC-452 ⑤：可克隆 —— 流式回灌在**副本**上试拼接半截结果，不改动真实状态。
+/// ACC-ENGINE-LLAMACPP-452 ⑤：流式回灌的半截结果是否已越过窗口开头的重叠区（纯函数）。
+///
+/// 窗口 = 前片后缀（重叠，`samples[0]`，仅当窗含 ≥2 段时）+ 新片；重叠区的字 ≈ 本窗预览有效字 × 重叠样本占比。
+/// 半截结果有效字须 **> 该估算 + [`PARTIAL_OVERLAP_MARGIN`]** 才显示，避免把重识的重叠字当新内容追加。
+pub(crate) fn partial_past_overlap(partial: &str, window_stream: &str, samples: &[usize]) -> bool {
+    let total: usize = samples.iter().sum();
+    let overlap = if samples.len() >= 2 { samples[0] } else { 0 };
+    if total == 0 || overlap == 0 {
+        return !effective_chars(partial).is_empty();
+    }
+    let est = (effective_chars(window_stream).len() as f32 * overlap as f32 / total as f32).ceil()
+        as usize;
+    effective_chars(partial).len() > est + PARTIAL_OVERLAP_MARGIN
+}
+
+/// ACC-452 ⑤：越过重叠区判据的余量（有效字）。
+pub(crate) const PARTIAL_OVERLAP_MARGIN: usize = 3;
+
+#[derive(Clone)]
 pub(crate) struct OrderedReflow {
     next: usize,
     /// `seq -> (start_slice, end_slice, 各片样本数, text, 流式原文, 重叠区分界)`；`end_slice` 为开区间端点。
@@ -3655,6 +3701,11 @@ pub(crate) struct OrderedReflow {
 }
 
 impl OrderedReflow {
+    /// ACC-452 ⑤：下一个待拼接的窗口序号（只有它的半截结果能立即试拼出新内容）。
+    pub(crate) fn next_seq(&self) -> usize {
+        self.next
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             next: 0,
@@ -4166,7 +4217,11 @@ fn build_recognizer(
     match asr_model {
         AsrModel::Performance => {
             let recognizer = create_sensevoice_recognizer(model_dir, language)?;
-            Ok((OfflineEngine::SenseVoice(recognizer), AsrModel::Performance, hotwords_version))
+            Ok((
+                OfflineEngine::SenseVoice(recognizer),
+                AsrModel::Performance,
+                hotwords_version,
+            ))
         }
         AsrModel::Accuracy => {
             // ASR-SINGLE-MODEL-001: accuracy 分支尝试加载 native 模型；失败则降级 performance
@@ -4176,7 +4231,11 @@ fn build_recognizer(
             // 🔴 `hotwords` **不塞 config** —— 词库与上下文走 accuracy worker 的 per-stream 注入（320）。
             let loaded = create_qwen3_recognizer(model_dir);
             match loaded {
-                Ok(engine) => Ok((OfflineEngine::Qwen3(engine), AsrModel::Accuracy, hotwords_version)),
+                Ok(engine) => Ok((
+                    OfflineEngine::Qwen3(engine),
+                    AsrModel::Accuracy,
+                    hotwords_version,
+                )),
                 Err(e) => {
                     log::warn!(
                         "Accuracy model load failed ({}), falling back to performance model",
@@ -4184,7 +4243,11 @@ fn build_recognizer(
                     );
                     let recognizer = create_sensevoice_recognizer(model_dir, language)?;
                     // R2: effective_model=Performance，Transcriber 存此值语义归位
-                    Ok((OfflineEngine::SenseVoice(recognizer), AsrModel::Performance, hotwords_version))
+                    Ok((
+                        OfflineEngine::SenseVoice(recognizer),
+                        AsrModel::Performance,
+                        hotwords_version,
+                    ))
                 }
             }
         }
@@ -4222,11 +4285,7 @@ fn build_local_realtime_recognizers(
     model_dir: &Path,
     _language: &str,
     hotwords: Option<&str>,
-) -> Result<(
-    sherpa_onnx::OnlineRecognizer,
-    AccEngine,
-    u64,
-)> {
+) -> Result<(sherpa_onnx::OnlineRecognizer, AccEngine, u64)> {
     let hotwords_version = match hotwords {
         Some(h) => {
             let count = h.split(',').filter(|s| !s.trim().is_empty()).count();
@@ -5224,10 +5283,16 @@ mod tests {
         assert_eq!(dir, q);
         assert!(check_accuracy_model_ready(&root).0, "accuracy 检测即 Qwen3");
         std::fs::remove_file(q.join(llama_asr::LLAMA_ASR_MMPROJ_FILE)).unwrap();
-        assert!(!check_qwen3_model_ready(&root).0, "少音频编码器应 not ready");
+        assert!(
+            !check_qwen3_model_ready(&root).0,
+            "少音频编码器应 not ready"
+        );
         std::fs::write(q.join(llama_asr::LLAMA_ASR_MMPROJ_FILE), b"x").unwrap();
         std::fs::remove_file(q.join("tokenizer/tokenizer.json")).unwrap();
-        assert!(!check_qwen3_model_ready(&root).0, "少 tokenizer.json 应 not ready");
+        assert!(
+            !check_qwen3_model_ready(&root).0,
+            "少 tokenizer.json 应 not ready"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5286,12 +5351,7 @@ mod tests {
         // 关键：第 2 个元素必须是 AsrModel（effective_model），不能省略。
         fn _type_check<F>(_f: F)
         where
-            F: Fn(
-                &Path,
-                &str,
-                AsrModel,
-                Option<&str>,
-            ) -> Result<(OfflineEngine, AsrModel, u64)>,
+            F: Fn(&Path, &str, AsrModel, Option<&str>) -> Result<(OfflineEngine, AsrModel, u64)>,
         {
         }
         _type_check(build_recognizer);
@@ -5724,7 +5784,7 @@ mod poc_qwen3_17b_351 {
                 speech_ranges: None,
                 streaming_nonempty: false,
                 new_slice_from: 0,
-                draft: None,
+                assist: Default::default(),
             };
             let t0 = Instant::now();
             let (text, _native, _stats) =
@@ -5940,7 +6000,6 @@ mod poc_qwen3_17b_351 {
         super::create_qwen3_recognizer(models).expect("create qwen3 engine")
     }
 
-
     fn raw_decode(
         rec: &crate::transcription::AccEngine,
         samples: &[f32],
@@ -6004,7 +6063,7 @@ mod poc_qwen3_17b_351 {
             speech_ranges: None,
             streaming_nonempty: false,
             new_slice_from: 0,
-            draft: None,
+            assist: Default::default(),
         };
         let seg0 = transcribe_acc_ctx(
             &rec,
@@ -6089,7 +6148,9 @@ mod poc_qwen3_17b_351 {
         language: Option<&str>,
     ) -> String {
         // ACC-452：迁至 llama.cpp 引擎（language ⇒ assistant 预填，语义同原 sherpa 选项）。
-        let r = rec.decode(samples, None, language, None, None).expect("decode");
+        let r = rec
+            .decode(samples, None, language, None, Default::default())
+            .expect("decode");
         let t = super::Transcriber::strip_asr_special_tokens(r.raw.trim());
         crate::text_normalizer::normalize_text_for_language(&t, script)
     }
@@ -6107,7 +6168,7 @@ mod poc_qwen3_17b_351 {
         system: Option<&str>,
     ) -> String {
         // ACC-452：迁至 llama.cpp 引擎（hotwords ⇒ system 消息，language ⇒ assistant 预填）。
-        rec.decode(samples, system, language, None, None)
+        rec.decode(samples, system, language, None, Default::default())
             .expect("decode")
             .raw
             .trim()
@@ -6497,7 +6558,9 @@ Terms: {terms}"
         hotwords: Option<&str>,
     ) -> String {
         // ACC-452：迁至 llama.cpp 引擎（hotwords ⇒ system 消息）。
-        let r = rec.decode(samples, hotwords, None, None, None).expect("decode");
+        let r = rec
+            .decode(samples, hotwords, None, None, Default::default())
+            .expect("decode");
         crate::text_normalizer::normalize_text_for_language(
             &super::Transcriber::strip_asr_special_tokens(r.raw.trim()),
             script,
@@ -6579,7 +6642,6 @@ Terms: {terms}"
             );
         }
     }
-
 }
 
 // ============================================================
@@ -8072,7 +8134,12 @@ mod fix390_tests {
             .next()
             .unwrap();
         assert_eq!(once.matches("decode_accuracy_allow_empty(").count(), 1);
-        assert!(once.contains(", None)"), "decode_accuracy_once 必须传 None");
+        // 去空白后比对（rustfmt 可能把实参拆成多行）。
+        let once_compact: String = once.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            once_compact.contains("script,None,"),
+            "decode_accuracy_once 必须传 max_new_tokens=None"
+        );
     }
 }
 
@@ -10515,7 +10582,7 @@ mod diag425_tests {
         lang: Option<&str>,
     ) -> String {
         // ACC-452：迁至 llama.cpp 引擎（language ⇒ assistant 预填）。
-        rec.decode(samples, None, lang, None, None)
+        rec.decode(samples, None, lang, None, Default::default())
             .map(|r| r.raw.trim().to_string())
             .unwrap_or_default()
     }
@@ -10523,9 +10590,16 @@ mod diag425_tests {
     /// 生产同款解码（`decode_accuracy_allow_empty` + 390 cap，无注入）。
     fn prod_decode(rec: &crate::transcription::AccEngine, samples: &[f32]) -> String {
         let cap = max_new_tokens_for(samples.len() as f32 / 16000.0);
-        decode_accuracy_allow_empty(rec, samples, None, ChineseScript::Simplified, Some(cap), None)
-            .map(|(t, l)| format!("{t} (lang={l:?})"))
-            .unwrap_or_else(|e| format!("<ERR {e}>"))
+        decode_accuracy_allow_empty(
+            rec,
+            samples,
+            None,
+            ChineseScript::Simplified,
+            Some(cap),
+            Default::default(),
+        )
+        .map(|(t, l)| format!("{t} (lang={l:?})"))
+        .unwrap_or_else(|e| format!("<ERR {e}>"))
     }
 
     #[test]
@@ -13079,7 +13153,8 @@ mod warm_cache_450_tests {
             "Mutex::new(None);"
         )));
         assert_eq!(
-            prod.matches(concat!("warm_localrt_decode_", "helpers();")).count(),
+            prod.matches(concat!("warm_localrt_decode_", "helpers();"))
+                .count(),
             1,
             "预热只在 LocalRealtime 加载成功路径调用一次"
         );
@@ -13099,5 +13174,35 @@ mod warm_cache_450_tests {
             !s.contains(concat!("SPEAKER_EXTRACTOR", ".with(")),
             "不得回退为线程级"
         );
+    }
+}
+
+// =====================================================================
+// ACC-ENGINE-LLAMACPP-452 ⑤：流式回灌「越过重叠区」判据
+// =====================================================================
+#[cfg(test)]
+mod partial_overlap_452_tests {
+    use super::{partial_past_overlap, PARTIAL_OVERLAP_MARGIN};
+
+    /// 首窗（无前片后缀）：有字即显示。
+    #[test]
+    fn t452_first_window_shows_any_text() {
+        assert!(partial_past_overlap("你好", "你好世界", &[16000]));
+        assert!(!partial_past_overlap("，。", "你好世界", &[16000]));
+    }
+
+    /// 重叠占一半、预览 20 字 ⇒ 估算 10 字：须 > 10 + 余量 才显示。
+    #[test]
+    fn t452_must_pass_overlap_estimate() {
+        let stream = "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸";
+        let smp = [16000usize, 16000];
+        let need = 10 + PARTIAL_OVERLAP_MARGIN;
+        let short: String = stream.chars().take(need).collect();
+        let long: String = stream.chars().take(need + 1).collect();
+        assert!(
+            !partial_past_overlap(&short, stream, &smp),
+            "未越过重叠 + 余量 ⇒ 不显示"
+        );
+        assert!(partial_past_overlap(&long, stream, &smp), "越过 ⇒ 显示");
     }
 }

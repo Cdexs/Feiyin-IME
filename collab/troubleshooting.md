@@ -90,6 +90,7 @@
 | [HAPPYDOM-ALTGR-INDISTINGUISHABLE-001] | happy-dom 把 AltGraph 直接映射到 `altKey` → 真按 Ctrl+Alt 与 AltGr 单测里无法区分，只能靠端测 |
 | [TESTER-SCREENSHOT-FAIL] / [SCREENSHOT-METHOD-001] | 连续截到桌面背景或别的窗口 → 像素统计自验不可靠；须 MoveWindow + 置顶 + ShowWindow 三连后截固定区域 |
 | [CT2-DLL-SHADOW-397] | 换 native DLL（CT2/oneDNN）后行为或性能**逐毫秒没变** → `cargo test` exe 在 `target/<profile>/deps/`，Windows 先加载 exe 同目录 ⇒ deps 里的旧 DLL 静默盖住新库。`ls -la` + `sha256sum` 两处对比即坐实；`build.rs` shared 分支须同时拷 `deps/` |
+| [BUILD-RS-RERUN-452] | 改了 build.rs 编译的 native 源码（shim.cpp）却链接旧 .lib、功能静默不生效 → winres 已输出 rerun-if-changed ⇒ cargo 只盯它声明的文件；native 源码必须自行声明 `rerun-if-changed`，怀疑没生效先比 out/ 产物时间戳 |
 
 ## ASR / overlay / 产品行为
 

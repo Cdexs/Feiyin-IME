@@ -2576,7 +2576,8 @@ mod tests {
     /// Qwen3 识别器：直接走生产 `create_qwen3_recognizer`（ACC-452 起为 llama.cpp 引擎，已对 crate 可见，
     /// 不再在此复刻一份配置）。
     fn gate335_qwen3_recognizer(model_root: &Path) -> crate::transcription::AccEngine {
-        crate::transcription::create_qwen3_recognizer(model_root).expect("create qwen3 engine failed")
+        crate::transcription::create_qwen3_recognizer(model_root)
+            .expect("create qwen3 engine failed")
     }
 
     /// 走生产解码入口（`transcribe_acc_ctx`，空上下文 ⇒ 与生产「无前文」档位同路径）。
@@ -2595,7 +2596,7 @@ mod tests {
                 speech_ranges: None,
                 streaming_nonempty: false,
                 new_slice_from: 0,
-                draft: None,
+                assist: Default::default(),
             },
         )
         .map(|(t, _, _)| t)

@@ -65,9 +65,16 @@ fn poc_gpu_451_sherpa_baseline() {
     std::fs::create_dir_all(&clip_dir).unwrap();
     let decode = |s: &[f32]| -> String {
         let cap = max_new_tokens_for(s.len() as f32 / RATE as f32);
-        decode_accuracy_allow_empty(&acc, s, None, ChineseScript::Simplified, Some(cap), None)
-            .map(|(t, _)| t)
-            .unwrap_or_default()
+        decode_accuracy_allow_empty(
+            &acc,
+            s,
+            None,
+            ChineseScript::Simplified,
+            Some(cap),
+            Default::default(),
+        )
+        .map(|(t, _)| t)
+        .unwrap_or_default()
     };
     let mut tsv = String::from("clip\taudio_secs\tms\ttext\n");
     let mut warmed = false;
@@ -135,7 +142,7 @@ fn poc_gpu_451_sherpa_lang_zh() {
                 ChineseScript::Simplified,
                 Some(cap),
                 Some("Chinese"),
-                None,
+                Default::default(),
             )
             .map(|(t, _)| t)
             .unwrap_or_default()
@@ -217,7 +224,7 @@ fn poc_gpu_451_sherpa_baseline_all() {
                     None,
                     ChineseScript::Simplified,
                     Some(cap),
-                    None,
+                    Default::default(),
                 )
                 .map(|(t, _)| t)
                 .unwrap_or_default()
@@ -263,11 +270,23 @@ fn acc452_engine_equivalence() {
             let cap = (secs * 12.0).ceil() as i32 + 16;
             let draft = if use_draft { c.get(3).copied() } else { None };
             if i == 0 {
-                let _ = eng.decode(&s, None, None, Some(cap.max(32)), draft);
+                let _ = eng.decode(
+                    &s,
+                    None,
+                    None,
+                    Some(cap.max(32)),
+                    crate::transcription::llama_asr::DecodeAssist::draft(draft),
+                );
             }
             let t0 = std::time::Instant::now();
             let o = eng
-                .decode(&s, None, None, Some(cap.max(32)), draft)
+                .decode(
+                    &s,
+                    None,
+                    None,
+                    Some(cap.max(32)),
+                    crate::transcription::llama_asr::DecodeAssist::draft(draft),
+                )
                 .expect("decode");
             let ms = t0.elapsed().as_millis();
             tot += ms;

@@ -1,7 +1,10 @@
 fn main() {
     // ACC-ENGINE-LLAMACPP-452：Qwen3-ASR 精解引擎适配层（运行时动态加载 llama.cpp 官方预编译库，
     // 头文件为同版本 b11207 官方头文件，见 native/llama_asr/）。
-    // 🔴 不输出 rerun-if-changed：保持原「包内任一文件变更即重跑」语义（winres 版本资源依赖此行为）。
+    // 🔴 必须显式声明：winres 自身已输出 rerun-if-changed，cargo 只按已声明的文件决定是否重跑本脚本
+    //（并非「包内任一文件变更即重跑」）。漏声明 ⇒ 改了 shim.cpp 却链接旧 .lib（452 实测：回调参数不生效）。
+    println!("cargo:rerun-if-changed=native/llama_asr/shim.cpp");
+    println!("cargo:rerun-if-changed=native/llama_asr/include");
     cc::Build::new()
         .cpp(true)
         .file("native/llama_asr/shim.cpp")

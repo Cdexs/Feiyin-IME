@@ -14,6 +14,8 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
+# "powershell -File ... -Targets a,b" passes one string "a,b"; split it.
+$Targets = @($Targets | ForEach-Object { $_ -split "," } | Where-Object { $_ -ne "" })
 
 $Tag = "b11207"
 $Zip = "llama-$Tag-bin-win-vulkan-x64.zip"
