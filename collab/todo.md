@@ -5,7 +5,7 @@
 
 **🚀 下一包**
 
-|  | Gavin 09-26：预览只保留一个打点机制「每隔 3.5 秒用全部预览文本重打一次」，去掉 1200ms 静默打点；主控补「重打结果末尾终止符不显示」防 349 复发；句尾标点靠精解回灌 | coder-2 | local_stream.rs 预览标点区 | 🔄 已派 |
+| 单号 | 内容 | 负责 | 文件 | 状态 |
 | --- | --- | --- | --- | --- |
 | `TEST-GAP-438-TAILSTART` | 护栏缺口（BUILD-438 消融 438b 未红）：`preview_display` 重打时忽略 `tail_start` 改为整段重打，`fix438_*` 全绿——护栏只直调纯函数、唯一进 `preview_display` 的用例 `engine=None`。主控已读码确认接线正确（不影响本包）。补：带真 CT-Transformer 或可注入打点函数的端到端用例 | 待定（非作者 coder） | local_stream.rs 测试区 | ⏳ 攒批补 |
 | `RT-STOP-LATENCY-MULTIWIN` | BUILD-398 #9 遗留：长录音切多窗串行解码，停止时队列压窗 ⇒ 松键到上屏 4.5s（16:44Z 23.85s 录音）；后半「无语音整窗送解」已由 414 修 | 待定 | — | ⏳ 待更多端测数据再定 |
@@ -25,8 +25,8 @@
 
 | 项 | 状态 |
 | --- | --- |
-| 版本 | 0.9.3（未动）；最新包 **BUILD-448**（含 448；前一包 BUILD-447 含 447），待 Gavin 带 `-debug` 端测；未 push |
-| Worker | 09-26 三方就绪（OpenCode `MiMo-V2.6-Flash Free`，无需 `/permissions`）；三方空闲，待派 |
+| 版本 | 0.9.3（未动）；最新包 **BUILD-449**（撤除 447/448，声纹回到 446，DEC-092），待 Gavin 端测；未 push |
+| Worker | 09-27 三方重启就绪（OpenCode `deepseek-v4.1-flash`，非 Codex，无需 `/permissions`）；三方空闲，待派。438 已于 `2252ce0` 入库（原「下一包」行 🔄 已派 为状态漂移，已删） |
 | 文档 | 09-26 归档 handoffs 09-25 共 52 条；已完成功能按版本移入 `progress.md`「v0.9.3（BUILD-398 ~ BUILD-435）」；撤销项与过程原文移入 `todo-archive.md`【归档十】 |
 
 ---

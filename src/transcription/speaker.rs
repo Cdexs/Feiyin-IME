@@ -636,115 +636,6 @@ pub(crate) fn merge_speech_units(ranges: &[(usize, usize)]) -> Vec<SpeechUnit> {
     units
 }
 
-/// VOICEPRINT-SLIDING-448：判为本人的长语音段（≥此秒数）做段内滑窗复核。
-pub(crate) const SLIDING_MIN_RANGE_SECS: f32 = 2.0;
-/// VOICEPRINT-SLIDING-448：滑窗长度 / 步进（秒）。
-pub(crate) const SLIDING_WIN_SECS: f32 = 1.0;
-pub(crate) const SLIDING_HOP_SECS: f32 = 0.5;
-/// VOICEPRINT-SLIDING-448：至少连续这么多个低分小窗才剔（防单窗偶然偏低误删本人）。
-pub(crate) const SLIDING_MIN_LOW_RUN: usize = 2;
-
-/// VOICEPRINT-SLIDING-448：长度 `len` 的段内滑窗起点（步进 `hop`，末窗对齐段尾补齐覆盖）。纯函数。
-pub(crate) fn sliding_window_starts(len: usize, win: usize, hop: usize) -> Vec<usize> {
-    if len < win || win == 0 || hop == 0 {
-        return Vec::new();
-    }
-    let mut v: Vec<usize> = (0..)
-        .map(|k| k * hop)
-        .take_while(|p| p + win <= len)
-        .collect();
-    if v.last().map_or(true, |&p| p + win < len) {
-        v.push(len - win);
-    }
-    v
-}
-
-/// VOICEPRINT-SLIDING-448：由各小窗得分算段内应剔除的子区间（段内相对坐标，**纯函数**）。
-///
-/// 某样本被剔除 ⇔ ① 它落在某个「≥`min_run` 个**连续**低分窗（< `thr`）」的跨度内，且 ② **覆盖它的每个窗都低分**
-///（任一覆盖窗像本人即保留 ⇒ 本人与干扰交界处偏保留）。`wins` = `(起点, 得分)`，按起点升序。
-pub(crate) fn sliding_drop_ranges(
-    wins: &[(usize, f32)],
-    win: usize,
-    thr: f32,
-    min_run: usize,
-) -> Vec<(usize, usize)> {
-    let mut out: Vec<(usize, usize)> = Vec::new();
-    let mut k = 0usize;
-    while k < wins.len() {
-        if wins[k].1 >= thr {
-            k += 1;
-            continue;
-        }
-        let mut m = k;
-        while m + 1 < wins.len() && wins[m + 1].1 < thr {
-            m += 1;
-        }
-        if m + 1 - k >= min_run {
-            let (a, b) = (wins[k].0, wins[m].0 + win);
-            // 减去所有高分窗覆盖的部分。
-            let mut pieces = vec![(a, b)];
-            for &(p, sc) in wins {
-                if sc < thr {
-                    continue;
-                }
-                let (ha, hb) = (p, p + win);
-                let mut next = Vec::new();
-                for (pa, pb) in pieces {
-                    if hb <= pa || ha >= pb {
-                        next.push((pa, pb));
-                    } else {
-                        if ha > pa {
-                            next.push((pa, ha));
-                        }
-                        if hb < pb {
-                            next.push((hb, pb));
-                        }
-                    }
-                }
-                pieces = next;
-            }
-            out.extend(pieces.into_iter().filter(|(a, b)| b > a));
-        }
-        k = m + 1;
-    }
-    out
-}
-
-/// VOICEPRINT-FRAGMENT-GROUP-447：碎片拼组的最大时间跨度（组首碎片起点到组内碎片起点，秒）。
-pub(crate) const FRAGMENT_GROUP_SPAN_SECS: f32 = 10.0;
-
-/// VOICEPRINT-FRAGMENT-GROUP-447：把判不了的碎片分组（**纯函数**）。
-///
-/// `frags` = 按时间序的 `(起点样本, 语音样本数)`；从第一个未用碎片起，按序贪心并入后续碎片，
-/// 直到语音 ≥ `judge_samples` 或下一碎片起点超出 `span_secs` 跨度；**凑够才成组**（返回碎片下标）。
-/// 凑不够的尾巴不返回（调用方保持保留）。不要求相邻（412 只拼间隔 <0.8s 的邻段）。
-pub(crate) fn group_fragments(
-    frags: &[(usize, usize)],
-    judge_samples: usize,
-    span_secs: f32,
-) -> Vec<Vec<usize>> {
-    let span = (span_secs * SAMPLE_RATE as f32) as usize;
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < frags.len() {
-        let start = frags[i].0;
-        let mut group = vec![i];
-        let mut total = frags[i].1;
-        let mut j = i + 1;
-        while total < judge_samples && j < frags.len() && frags[j].0.saturating_sub(start) <= span {
-            group.push(j);
-            total += frags[j].1;
-            j += 1;
-        }
-        if total >= judge_samples {
-            out.push(group);
-        }
-        i = j;
-    }
-    out
-}
-
 /// 412：单元是否参与 offer —— 单元**起点**（`members[0].0`）≥ `new_slice_from`。
 /// 跨界（起点在前文、延伸进本窗新片）的单元**保守不 offer**（防把窗口前文重复计入注册/漂移）。
 fn unit_offer_allowed(unit: &SpeechUnit, new_slice_from: usize) -> bool {
@@ -814,10 +705,6 @@ pub(crate) fn filter_ranges_by_voiceprint(
         let mut range_verdicts: Vec<SegVerdict> = vec![SegVerdict::KeepShort; ranges.len()];
         let mut pending_offers: Vec<PendingOffer> = Vec::new();
         let mut ri = 0usize; // ranges 游标（unit 的成员按序对应 ranges）
-        // 447：每个单元对应的 ranges 下标区间 + 单元判定（供之后「碎片拼组再判」回填）。
-        let mut unit_spans: Vec<(std::ops::Range<usize>, SegVerdict)> = Vec::new();
-        // 448：`(ranges 下标, 该段内应剔除的子区间[绝对坐标])`。
-        let mut sub_drops: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
         for unit in &units {
             let unit_secs = unit.speech_samples as f32 / SAMPLE_RATE as f32;
             let (verdict, emb) = if unit_secs < MIN_JUDGE_SECS {
@@ -845,65 +732,17 @@ pub(crate) fn filter_ranges_by_voiceprint(
                     verdict_score(verdict)
                 );
             }
-            let first_ri = ri;
             for _ in &unit.members {
                 if ri < range_verdicts.len() {
                     range_verdicts[ri] = verdict;
                     ri += 1;
                 }
             }
-            unit_spans.push((first_ri..ri, verdict));
-            // VOICEPRINT-SLIDING-448（Gavin 2026-09-27「做」）：判为本人的 ≥2s 片段做段内 1s 滑窗复核 ——
-            // 干扰与本人**无停顿连成一段**时整段得分仍高（16:41 端测 4.10s 段 0.811），段内干扰小窗却很低
-            //（POC-448：0.117~0.263 vs 本人小窗最低 0.519）⇒ 把「全被低分窗覆盖且连续 ≥2 窗」的部分剔除。
-            // 任一小窗取不到分 ⇒ 跳过该段（整段保留，不因缺窗误删）。含子剔除的单元不参与注册 / 漂移。
-            let mut unit_has_sub_drop = false;
-            if matches!(verdict, SegVerdict::KeepUser(_)) {
-                let win = (SLIDING_WIN_SECS * SAMPLE_RATE as f32) as usize;
-                let hop = (SLIDING_HOP_SECS * SAMPLE_RATE as f32) as usize;
-                let min_len = (SLIDING_MIN_RANGE_SECS * SAMPLE_RATE as f32) as usize;
-                for idx in first_ri..ri {
-                    let (s, e) = ranges[idx];
-                    if e.saturating_sub(s) < min_len || e > samples.len() {
-                        continue;
-                    }
-                    let wins: Option<Vec<(usize, f32)>> = sliding_window_starts(e - s, win, hop)
-                        .into_iter()
-                        .map(|p| {
-                            verifier
-                                .embed(&samples[s + p..s + p + win])
-                                .and_then(|em| proc.vp.max_score_ready(&em))
-                                .map(|sc| (p, sc))
-                        })
-                        .collect();
-                    let Some(wins) = wins else { continue };
-                    let d = sliding_drop_ranges(&wins, win, DROP_THR, SLIDING_MIN_LOW_RUN);
-                    if d.is_empty() {
-                        continue;
-                    }
-                    if log::log_enabled!(log::Level::Debug) {
-                        log::debug!(
-                            "[DBG-448] sliding sub-drop: range={:.2}-{:.2}s wins={:?} drop={:?}",
-                            s as f32 / SAMPLE_RATE as f32,
-                            e as f32 / SAMPLE_RATE as f32,
-                            wins.iter()
-                                .map(|(p, sc)| (((s + p) as f32 / SAMPLE_RATE as f32 * 100.0).round() / 100.0, (sc * 1000.0).round() / 1000.0))
-                                .collect::<Vec<_>>(),
-                            d.iter()
-                                .map(|(a, b)| ((s + a) as f32 / SAMPLE_RATE as f32, (s + b) as f32 / SAMPLE_RATE as f32))
-                                .collect::<Vec<_>>()
-                        );
-                    }
-                    sub_drops.push((idx, d.into_iter().map(|(a, b)| (s + a, s + b)).collect()));
-                    unit_has_sub_drop = true;
-                }
-            }
             // 注册 / 漂移按**单元** offer（≥ `MIN_OFFER_SECS`=2.0s，**非判定门槛** `MIN_JUDGE_SECS`=1.5s；
             // 时长只算语音）；`new_slice_from` 之前不 offer（单元跨越时按**单元起点**判定：起点在前文 ⇒ 整个单元不 offer）。
             // 🔴 432：1.5~2.0s 的单元可**判定**（剔除）但**不注册**（嵌入质量差，防拉低本人档）。
             if unit_offer_eligible(unit_secs, unit, new_slice_from) {
-                // 448：含滑窗子剔除的单元混有他人语音 ⇒ 不注册 / 漂移。
-                if let (false, Some(e)) = (unit_has_sub_drop, emb.as_deref()) {
+                if let Some(e) = emb.as_deref() {
                     match verdict {
                         SegVerdict::KeepUser(s) => pending_offers.push(PendingOffer {
                             emb: e.to_vec(),
@@ -920,56 +759,7 @@ pub(crate) fn filter_ranges_by_voiceprint(
                 }
             }
         }
-        // VOICEPRINT-FRAGMENT-GROUP-447（Gavin 2026-09-27「太短的碎片可以拼起来走声纹识别吗？」）：
-        // 单元判定后仍 `KeepShort` 的碎片（<1.0s、与邻段间隔 ≥0.8s 拼不上 412 单元），按时间序、
-        // 10s 跨度内**不要求相邻**地拼组到 ≥1.0s，拼接音频整体判一次；非本人 ⇒ 组内全部剔除，
-        // 本人 ⇒ 全部保留；凑不够 1.0s 的剩余碎片维持保留。碎片**不参与注册 / 漂移**。
-        // 依据 POC-444b：他人碎片组（0.54+0.54s）0.356、本人碎片组（0.99+0.29s）0.749。
-        let frags: Vec<(usize, usize, usize)> = unit_spans
-            .iter()
-            .enumerate()
-            .filter(|(_, (r, v))| matches!(v, SegVerdict::KeepShort) && !r.is_empty())
-            .map(|(ui, (r, _))| {
-                let speech: usize = ranges[r.clone()].iter().map(|(s, e)| e.saturating_sub(*s)).sum();
-                (ui, ranges[r.start].0, speech)
-            })
-            .filter(|&(_, _, sp)| sp > 0)
-            .collect();
-        let judge_samples = (MIN_JUDGE_SECS * SAMPLE_RATE as f32) as usize;
-        for group in group_fragments(
-            &frags.iter().map(|&(_, st, sp)| (st, sp)).collect::<Vec<_>>(),
-            judge_samples,
-            FRAGMENT_GROUP_SPAN_SECS,
-        ) {
-            let mut buf: Vec<f32> = Vec::new();
-            for &fi in &group {
-                let (ui, _, _) = frags[fi];
-                for &(s, e) in &ranges[unit_spans[ui].0.clone()] {
-                    buf.extend_from_slice(&samples[s..e]);
-                }
-            }
-            let secs = buf.len() as f32 / SAMPLE_RATE as f32;
-            let emb = verifier.embed(&buf);
-            let v = judge_voiceprint(&proc.vp, emb.as_deref(), secs);
-            if log::log_enabled!(log::Level::Debug) {
-                log::debug!(
-                    "[DBG-447] fragment group: frags={} speech={:.2}s verdict={:?} score={:.3}",
-                    group.len(),
-                    secs,
-                    v,
-                    verdict_score(v)
-                );
-            }
-            if matches!(v, SegVerdict::DropNonUser(_) | SegVerdict::KeepUser(_)) {
-                for &fi in &group {
-                    let (ui, _, _) = frags[fi];
-                    for rv in &mut range_verdicts[unit_spans[ui].0.clone()] {
-                        *rv = v;
-                    }
-                }
-            }
-        }
-        let (mut kept, mut kept_secs, mut dropped_secs) = partition_ranges(ranges, &range_verdicts);
+        let (kept, kept_secs, dropped_secs) = partition_ranges(ranges, &range_verdicts);
         for (i, &(start, end)) in ranges.iter().enumerate() {
             let secs = (end - start) as f32 / SAMPLE_RATE as f32;
             details.push(RangeJudgement {
@@ -986,14 +776,6 @@ pub(crate) fn filter_ranges_by_voiceprint(
             if matches!(range_verdicts[i], SegVerdict::DropNonUser(_)) {
                 dropped_ranges.push((s, e));
             }
-        }
-        // 448：有滑窗子剔除 ⇒ 按子区间重建保留 / 剔除（无子剔除时与改前逐位相同）。
-        if !sub_drops.is_empty() {
-            let (k2, d2) = apply_sub_drops(ranges, &range_verdicts, &sub_drops);
-            kept = k2;
-            dropped_ranges = d2;
-            kept_secs = secs_of(&kept);
-            dropped_secs = secs_of(&dropped_ranges);
         }
         VoiceprintFilter {
             kept,
@@ -1043,44 +825,6 @@ pub(crate) fn voiceprint_lang_ready(lang: &str) -> bool {
 /// 纯逻辑：按逐区间判定划分 keep / drop（`<2s` 的 `KeepShort` 由调用方先算好）。
 ///
 /// 返回 `(保留区间, 保留秒数, 剔除秒数)`。判定数组缺位 ⇒ 保守保留。
-/// VOICEPRINT-SLIDING-448：把段内子剔除落到保留 / 剔除两张表（**纯函数**）。
-///
-/// 整段 `DropNonUser` ⇒ 整段进剔除；有子剔除的段 ⇒ 子区间进剔除、其余切片进保留；其余 ⇒ 保留。
-pub(crate) fn apply_sub_drops(
-    ranges: &[(usize, usize)],
-    verdicts: &[SegVerdict],
-    sub_drops: &[(usize, Vec<(usize, usize)>)],
-) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
-    let mut kept = Vec::new();
-    let mut dropped = Vec::new();
-    for (i, &(s, e)) in ranges.iter().enumerate() {
-        if matches!(verdicts.get(i), Some(SegVerdict::DropNonUser(_))) {
-            dropped.push((s, e));
-            continue;
-        }
-        let Some((_, subs)) = sub_drops.iter().find(|(idx, _)| *idx == i) else {
-            kept.push((s, e));
-            continue;
-        };
-        let mut cur = s;
-        for &(a, b) in subs {
-            let (a, b) = (a.max(s), b.min(e));
-            if a >= b {
-                continue;
-            }
-            if a > cur {
-                kept.push((cur, a));
-            }
-            dropped.push((a, b));
-            cur = cur.max(b);
-        }
-        if cur < e {
-            kept.push((cur, e));
-        }
-    }
-    (kept, dropped)
-}
-
 pub(crate) fn partition_ranges(
     ranges: &[(usize, usize)],
     verdicts: &[SegVerdict],
@@ -3150,177 +2894,5 @@ mod fix432_tests {
             3,
             "封口后第三段另起、第四段间隔 0.8 不近邻也另起"
         );
-    }
-}
-
-// =====================================================================
-// VOICEPRINT-FRAGMENT-GROUP-447：判不了的碎片拼组再判
-// =====================================================================
-#[cfg(test)]
-mod fragment_group_447_tests {
-    use super::{group_fragments, FRAGMENT_GROUP_SPAN_SECS, SAMPLE_RATE};
-
-    fn s(x: f32) -> usize {
-        (x * SAMPLE_RATE as f32) as usize
-    }
-
-    /// 16:11 端测窗 #4 形态：0.58 / 0.54 / 0.54s 三碎片，不相邻（间隔 ≥0.8s）⇒ 前两段即凑够 1.0s 成组。
-    #[test]
-    fn t447_groups_non_adjacent_fragments() {
-        let frags = [(s(0.11), s(0.58)), (s(3.73), s(0.54)), (s(7.13), s(0.54))];
-        let g = group_fragments(&frags, s(1.0), FRAGMENT_GROUP_SPAN_SECS);
-        assert_eq!(
-            g,
-            vec![vec![0, 1]],
-            "前两段 1.12s 成组；第三段单独凑不够 1.0s 不成组"
-        );
-    }
-
-    /// 凑不够 1.0s ⇒ 不成组（保持保留，与改前一致）。
-    #[test]
-    fn t447_insufficient_stays_ungrouped() {
-        let frags = [(0, s(0.4)), (s(2.0), s(0.4))];
-        assert!(group_fragments(&frags, s(1.0), FRAGMENT_GROUP_SPAN_SECS).is_empty());
-    }
-
-    /// 跨度超 10s 的碎片不拼进同组。
-    #[test]
-    fn t447_span_limit() {
-        let frags = [(0, s(0.6)), (s(10.5), s(0.6)), (s(11.0), s(0.6))];
-        let g = group_fragments(&frags, s(1.0), FRAGMENT_GROUP_SPAN_SECS);
-        assert_eq!(g, vec![vec![1, 2]], "首段与 10.5s 处碎片超跨度；后两段成组");
-    }
-
-    /// 多组：依次贪心，互不重叠。
-    #[test]
-    fn t447_multiple_groups() {
-        let frags = [
-            (0, s(0.6)),
-            (s(1.0), s(0.6)),
-            (s(3.0), s(0.5)),
-            (s(4.0), s(0.6)),
-        ];
-        assert_eq!(
-            group_fragments(&frags, s(1.0), FRAGMENT_GROUP_SPAN_SECS),
-            vec![vec![0, 1], vec![2, 3]]
-        );
-    }
-
-    /// 接线：碎片组只回填判定，**不产生注册 / 漂移 offer**（offer 只在单元循环内）。
-    #[test]
-    fn t447_fragments_never_offer() {
-        let src = include_str!("speaker.rs");
-        let prod = &src[..src
-            .find(concat!("mod fragment_group_447", "_tests"))
-            .unwrap()];
-        let start = prod
-            .find(concat!("for group in group_", "fragments("))
-            .expect("碎片拼组循环");
-        let body = &prod[start..start + 2200];
-        assert!(
-            !body.contains(concat!("pending_offers", ".push")),
-            "碎片组不得 offer"
-        );
-        assert!(body.contains(concat!(
-            "judge_voiceprint(&proc.vp, emb.as_deref(), ",
-            "secs)"
-        )));
-    }
-}
-
-// =====================================================================
-// VOICEPRINT-SLIDING-448：本人长段内滑窗子剔除
-// =====================================================================
-#[cfg(test)]
-mod sliding_448_tests {
-    use super::{
-        apply_sub_drops, sliding_drop_ranges, sliding_window_starts, SegVerdict, SAMPLE_RATE,
-    };
-
-    const S: usize = SAMPLE_RATE as usize;
-    const H: usize = S / 2;
-
-    /// 窗起点：步进 0.5s，末窗对齐段尾（4.1s 段 ⇒ 0,0.5,…,3.0 再补 3.1）。
-    #[test]
-    fn t448_window_starts_cover_tail() {
-        let v = sliding_window_starts(41 * S / 10, S, H);
-        assert_eq!(v.first(), Some(&0));
-        assert_eq!(*v.last().unwrap() + S, 41 * S / 10, "末窗须对齐段尾");
-        assert!(
-            sliding_window_starts(S / 2, S, H).is_empty(),
-            "短于 1 窗 ⇒ 不滑"
-        );
-    }
-
-    /// 16:41 端测形态：前 4 窗干扰（0.12~0.26）、后 3 窗本人（0.68~0.71）⇒ 只剔「全被低分窗覆盖」的部分，
-    /// 本人起点所在的 1.5s 之后保留。
-    #[test]
-    fn t448_drops_only_fully_low_covered_part() {
-        let wins = [
-            (0, 0.263),
-            (H, 0.190),
-            (2 * H, 0.117),
-            (3 * H, 0.156),
-            (4 * H, 0.680),
-            (5 * H, 0.705),
-            (6 * H, 0.698),
-        ];
-        let d = sliding_drop_ranges(&wins, S, 0.45, 2);
-        assert_eq!(
-            d,
-            vec![(0, 4 * H)],
-            "0~2.0s 剔除；2.0s 起被高分窗 (2.0s 起) 覆盖 ⇒ 保留"
-        );
-    }
-
-    /// 单个低分窗（0.519 这种偶然偏低不算，这里构造 0.40 单窗）⇒ 不剔（需连续 ≥2 窗）。
-    #[test]
-    fn t448_single_low_window_not_dropped() {
-        let wins = [(0, 0.80), (H, 0.40), (2 * H, 0.78), (3 * H, 0.81)];
-        assert!(sliding_drop_ranges(&wins, S, 0.45, 2).is_empty());
-    }
-
-    /// 全高分 ⇒ 不剔；全低分 ⇒ 整段剔。
-    #[test]
-    fn t448_all_high_or_all_low() {
-        let hi = [(0, 0.8), (H, 0.8), (2 * H, 0.8)];
-        assert!(sliding_drop_ranges(&hi, S, 0.45, 2).is_empty());
-        let lo = [(0, 0.2), (H, 0.2), (2 * H, 0.2)];
-        assert_eq!(sliding_drop_ranges(&lo, S, 0.45, 2), vec![(0, 2 * S)]);
-    }
-
-    /// 子剔除落表：有子剔除的段拆成保留 + 剔除，整段剔除 / 无子剔除的段不变。
-    #[test]
-    fn t448_apply_sub_drops_splits_range() {
-        let ranges = [(0, 10), (20, 60), (70, 80)];
-        let verdicts = [
-            SegVerdict::KeepUser(0.8),
-            SegVerdict::KeepUser(0.81),
-            SegVerdict::DropNonUser(0.2),
-        ];
-        let (k, d) = apply_sub_drops(&ranges, &verdicts, &[(1, vec![(20, 40)])]);
-        assert_eq!(k, vec![(0, 10), (40, 60)]);
-        assert_eq!(d, vec![(20, 40), (70, 80)]);
-        // 无子剔除 ⇒ 与 partition 口径一致。
-        let (k0, d0) = apply_sub_drops(&ranges, &verdicts, &[]);
-        assert_eq!(k0, vec![(0, 10), (20, 60)]);
-        assert_eq!(d0, vec![(70, 80)]);
-    }
-
-    /// 接线：只对 KeepUser 单元滑窗；缺窗跳过；含子剔除的单元不 offer；有子剔除才重建分区。
-    #[test]
-    fn t448_wiring() {
-        let src = include_str!("speaker.rs");
-        let prod = &src[..src.find(concat!("mod sliding_448", "_tests")).unwrap()];
-        assert!(prod.contains(concat!(
-            "if matches!(verdict, SegVerdict::",
-            "KeepUser(_)) {"
-        )));
-        assert!(prod.contains(concat!("let Some(wins) = wins else { ", "continue };")));
-        assert!(prod.contains(concat!(
-            "if let (false, Some(e)) = (unit_has_sub_drop, ",
-            "emb.as_deref()) {"
-        )));
-        assert!(prod.contains(concat!("if !sub_drops.", "is_empty() {")));
     }
 }
