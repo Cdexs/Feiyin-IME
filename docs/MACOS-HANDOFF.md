@@ -2593,3 +2593,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 行为变化 | 本地实时：<1.0s 碎片回到「不判、保留」；他人语音与本人连成一段时整段判本人；精解前不再多做滑窗声纹计算。446（≥1.0s 判定 + 兜底剔远场）不变 |
 | 对 macOS 的影响 | 平台中立，macOS 编译同一份；删除的均为 `pub(crate)` 符号，无外部引用；无依赖变化 |
 | 是否需要对方同步 | 否（若 macOS 侧按 447/448 写过测试或文档，需一并删除） |
+
+## LOCALRT-WARM-CACHE-450（2026-09-27，主控）
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | `speaker.rs` 声纹提取器、`transcription/mod.rs` 剪静音 VAD：线程级缓存 → 进程级 `Mutex`；LocalRealtime 加载时 `warm_localrt_decode_helpers()` 预热 |
+| 行为变化 | 无（输出逐位不变）；每次录音首窗精解少等一次模型加载 |
+| 对 macOS 的影响 | 平台中立，macOS 编译同一份；无签名 / 依赖变化 |
+| 是否需要对方同步 | 否 |

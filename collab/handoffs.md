@@ -144,3 +144,8 @@
 - **改动**：DEC-092。`speaker.rs`、`poc_voiceprint_short_444.rs` 还原为 `8598176` ⇒ `src/`、`src-tauri/`、`ui/src` 与 BUILD-446 逐字相同；446 保留。
 - **测试**：全量 2061P/0F/70I = BUILD-446 逐项相同。**出包** `b7c6443a…` 15:18，九项全过，冒烟正常，config 未动。
 - **端测**：旁放语音时 1 秒以上干扰仍应剔除（`DBG-412` `DropNonUser`）；预览刷新与最终上屏是否不再迟滞；日志不再出现 `DBG-447` / `DBG-448`。
+
+## 2026-09-27 — 主控 — LOCALRT-WARM-CACHE-450 ✅ 已提交（随下一包出）
+
+- 剪静音 VAD + 声纹 CAM++ 改进程级缓存 + 本地实时模型加载时预热；每次录音首窗精解预计提前 ~0.4–0.55s，识别结果逐位不变。全量 2062P/0F/72I。
+- 端测：日志 `speaker: CAM++ extractor loaded` 整个运行期只出现 1 次（模型加载时）；首窗 `seg dispatch #0` → `DBG-388 trim` 间隔 ~200ms。

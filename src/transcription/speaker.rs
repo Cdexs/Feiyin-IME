@@ -497,10 +497,33 @@ struct ProcessVp {
 /// 进程级声纹（跨窗 / 跨录音复用）。
 static VOICEPRINT: Mutex<Option<ProcessVp>> = Mutex::new(None);
 
+/// 提取器**进程级**懒加载：外层 = 是否已尝试，内层 = 是否可用（失败记住不重试）。
+/// LOCALRT-WARM-CACHE-450：原为精解线程级缓存，而精解线程每次录音新建 ⇒ 每次录音首窗重载 CAM++
+///（日志 15 次录音加载 13 次、首窗多等约 0.5s）。提取器无状态（每次 `embed` 新建 stream），跨录音共用输出逐位不变。
+static SPEAKER_EXTRACTOR: Mutex<Option<Option<SpeakerVerifier>>> = Mutex::new(None);
+
+#[cfg(test)]
 thread_local! {
-    /// 提取器**线程级**懒加载（仿 `LOCALRT_TRIM_VAD`）：外层 = 是否已尝试，内层 = 是否可用。
-    static SPEAKER_EXTRACTOR: std::cell::RefCell<Option<Option<SpeakerVerifier>>> =
-        std::cell::RefCell::new(None);
+    /// 测试专用：本线程模拟「模型缺失」（不动进程级缓存，避免干扰并行测试）。
+    static TEST_EXTRACTOR_MISSING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 取提取器（首次调用加载）；`None` = 模型缺失 / 加载失败。
+fn with_speaker_extractor<R>(f: impl FnOnce(Option<&SpeakerVerifier>) -> R) -> R {
+    #[cfg(test)]
+    if TEST_EXTRACTOR_MISSING.with(|c| c.get()) {
+        return f(None);
+    }
+    let mut slot = SPEAKER_EXTRACTOR.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
+        *slot = Some(SpeakerVerifier::load(&super::model_dir()));
+    }
+    f(slot.as_ref().and_then(|o| o.as_ref()))
+}
+
+/// LOCALRT-WARM-CACHE-450：随本地实时模型加载预热提取器（首次录音首窗不再现场加载）。
+pub(crate) fn warm_speaker_extractor() {
+    with_speaker_extractor(|_| ());
 }
 
 /// 声纹存档路径：`<exe 目录>/voiceprint.bin`（与 `wordbook.sqlite` 同目录约定）。
@@ -676,13 +699,9 @@ pub(crate) fn filter_ranges_by_voiceprint(
             pending_offers: Vec::new(),
         };
     }
-    SPEAKER_EXTRACTOR.with(|cell| {
+    with_speaker_extractor(|verifier| {
         let mut details: Vec<RangeJudgement> = Vec::new();
-        let mut slot = cell.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(SpeakerVerifier::load(&super::model_dir()));
-        }
-        let Some(verifier) = slot.as_ref().and_then(|o| o.as_ref()) else {
+        let Some(verifier) = verifier else {
             return VoiceprintFilter {
                 kept: ranges.to_vec(),
                 dropped: Vec::new(),
@@ -720,8 +739,10 @@ pub(crate) fn filter_ranges_by_voiceprint(
                 (v, emb)
             };
             if log::log_enabled!(log::Level::Debug) {
-                let first = unit.members.first().map(|m| m.0).unwrap_or(0) as f32 / SAMPLE_RATE as f32;
-                let last = unit.members.last().map(|m| m.1).unwrap_or(0) as f32 / SAMPLE_RATE as f32;
+                let first =
+                    unit.members.first().map(|m| m.0).unwrap_or(0) as f32 / SAMPLE_RATE as f32;
+                let last =
+                    unit.members.last().map(|m| m.1).unwrap_or(0) as f32 / SAMPLE_RATE as f32;
                 log::debug!(
                     "[LocalRT-DBG-412] unit: win=- members={} speech={:.2}s span={:.2}-{:.2}s verdict={:?} score={:.3}",
                     unit.members.len(),
@@ -2090,16 +2111,13 @@ mod testsync412_merge_tests {
     }
 
     /// 契约（影响⑦）：声纹模型缺失 ⇒ 功能整体静默关闭：**原样保留全部语音**、dropped=0、
-    /// 不产 offer（与改前逐位一致）。用线程级提取器置 `Some(None)`（模拟「已尝试且不可用」）。
+    /// 不产 offer（与改前逐位一致）。450 起用测试专用线程开关模拟「已尝试且不可用」。
     #[test]
     fn ts412_missing_model_feature_off_unchanged() {
         let ranges = [(0usize, secs(1.0)), (secs(1.2), secs(3.4))];
-        let was_set = super::SPEAKER_EXTRACTOR.with(|c| c.borrow().is_some());
-        super::SPEAKER_EXTRACTOR.with(|c| *c.borrow_mut() = Some(None));
+        super::TEST_EXTRACTOR_MISSING.with(|c| c.set(true));
         let f = filter_ranges_by_voiceprint(&[], &ranges, 0);
-        if !was_set {
-            super::SPEAKER_EXTRACTOR.with(|c| *c.borrow_mut() = None);
-        }
+        super::TEST_EXTRACTOR_MISSING.with(|c| c.set(false));
         assert_eq!(f.kept, ranges.to_vec(), "模型缺失 ⇒ 原样保留全部区间");
         assert_eq!(f.dropped_secs, 0.0);
         assert!(

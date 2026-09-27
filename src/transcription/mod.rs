@@ -1021,12 +1021,11 @@ pub(crate) fn transcribe_accuracy_segment(
 // FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388（A）：解码前剪静音（只本地 realtime 走本函数）
 // ===========================================================================
 
-thread_local! {
-    /// FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388：解码线程级 VAD 缓存（按 `model_dir` 懒建一次，
-    /// 失败**记住不重试**）。外层 `Option` = 是否已尝试；内层 `Option` = 是否可用（`None` ⇒ 原样不剪）。
-    static LOCALRT_TRIM_VAD: std::cell::RefCell<Option<Option<VadSegmenter>>> =
-        std::cell::RefCell::new(None);
-}
+/// FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388：剪静音 VAD 缓存（懒建一次，失败**记住不重试**）。
+/// 外层 `Option` = 是否已尝试；内层 `Option` = 是否可用（`None` ⇒ 原样不剪）。
+/// LOCALRT-WARM-CACHE-450：线程级 → **进程级**（精解线程每次录音新建 ⇒ 原先每次录音首窗重建）。
+/// `speech_ranges` 调用前后各 `reset()`，跨录音复用与同录音跨窗复用同一语义，输出逐位不变。
+static LOCALRT_TRIM_VAD: Mutex<Option<Option<VadSegmenter>>> = Mutex::new(None);
 
 /// FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388（A2）：纯函数 —— 每个语音区间两侧各扩 `pad` 样本
 ///（clamp 到 `[0, audio.len())`），重叠/相接的**合并**，再按序拼接。
@@ -1169,20 +1168,28 @@ fn redecode_with_ranges(
         .map(|(t, _)| t)
 }
 
-/// FIX-NOSPEECH-WINDOW-414：线程级自跑 VAD 取区间（`None` 回退分支与 `Revad` 复核分支共用）。
+/// FIX-NOSPEECH-WINDOW-414：自跑 VAD 取区间（`None` 回退分支与 `Revad` 复核分支共用）。
 ///
 /// 返回 `None` = VAD 模型不可用（懒建失败**记住不重试**）；`Some(ranges)` = VAD 可用
 /// （`ranges` 可为空 ⇒ 判定无语音）。抽成独立函数供两处复用，**不复制** `None` 分支逻辑。
 fn self_vad_ranges(samples: &[f32]) -> Option<Vec<(usize, usize)>> {
-    LOCALRT_TRIM_VAD.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(VadSegmenter::try_new_for_local_trim(&model_dir()));
-        }
-        slot.as_ref()
-            .and_then(|o| o.as_ref())
-            .map(|vseg| vseg.speech_ranges(samples))
-    })
+    with_trim_vad(|v| v.map(|vseg| vseg.speech_ranges(samples)))
+}
+
+/// LOCALRT-WARM-CACHE-450：取进程级剪静音 VAD（首次调用加载）。
+fn with_trim_vad<R>(f: impl FnOnce(Option<&VadSegmenter>) -> R) -> R {
+    let mut slot = LOCALRT_TRIM_VAD.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
+        *slot = Some(VadSegmenter::try_new_for_local_trim(&model_dir()));
+    }
+    f(slot.as_ref().and_then(|o| o.as_ref()))
+}
+
+/// LOCALRT-WARM-CACHE-450：本地实时模型加载时预热「剪静音 VAD + 声纹提取器」，
+/// 首次录音首窗不再现场加载（两者均跨录音复用，见各自缓存注释）。
+pub(crate) fn warm_localrt_decode_helpers() {
+    with_trim_vad(|_| ());
+    speaker::warm_speaker_extractor();
 }
 
 /// FIX-NOSPEECH-WINDOW-414：自跑 VAD 剪静音的**结果**（纯数据，便于单测）。
@@ -1690,6 +1697,8 @@ impl Transcriber {
                 build_local_realtime_recognizers(model_dir, &asr_language, hotwords)?;
             // VAD 分段器：与 accuracy 同条件（2pass 最终引擎是 accuracy，长音频要分段）
             let vad_segmenter = vad::VadSegmenter::try_new(model_dir).map(Mutex::new);
+            // LOCALRT-WARM-CACHE-450：首次录音首窗不再现场加载剪静音 VAD / 声纹提取器。
+            warm_localrt_decode_helpers();
             log::info!(
                 "LocalRealtime: dual recognizers loaded (online streaming paraformer + offline accuracy)"
             );
@@ -13298,5 +13307,43 @@ mod fix443_tests {
         for (acc, stream) in cases {
             assert!(acc_vs_streaming(acc, stream).accept, "{acc}");
         }
+    }
+}
+
+// =====================================================================
+// LOCALRT-WARM-CACHE-450：剪静音 VAD + 声纹提取器进程级缓存 + 模型加载预热
+// =====================================================================
+#[cfg(test)]
+mod warm_cache_450_tests {
+    /// 接线：两处缓存均为进程级 `Mutex`（非线程级）；本地实时模型加载成功路径预热恰 1 处。
+    #[test]
+    fn t450_process_level_caches_and_warm_on_load() {
+        let m = include_str!("mod.rs");
+        let prod = &m[..m.find(concat!("mod warm_cache_450", "_tests")).unwrap()];
+        assert!(prod.contains(concat!(
+            "static LOCALRT_TRIM_VAD: Mutex<Option<Option<VadSegmenter>>> = ",
+            "Mutex::new(None);"
+        )));
+        assert_eq!(
+            prod.matches(concat!("warm_localrt_decode_", "helpers();")).count(),
+            1,
+            "预热只在 LocalRealtime 加载成功路径调用一次"
+        );
+        let load = prod
+            .find(concat!("warm_localrt_decode_", "helpers();"))
+            .unwrap();
+        let ok_log = prod
+            .find(concat!("LocalRealtime: dual recognizers ", "loaded"))
+            .unwrap();
+        assert!(load < ok_log, "预热须在加载成功日志之前、同一路径");
+        let s = include_str!("speaker.rs");
+        assert!(s.contains(concat!(
+            "static SPEAKER_EXTRACTOR: Mutex<Option<Option<SpeakerVerifier>>> = ",
+            "Mutex::new(None);"
+        )));
+        assert!(
+            !s.contains(concat!("SPEAKER_EXTRACTOR", ".with(")),
+            "不得回退为线程级"
+        );
     }
 }

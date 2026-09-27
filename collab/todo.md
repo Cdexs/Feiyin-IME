@@ -7,8 +7,9 @@
 
 | 单号 | 内容 | 负责 | 文件 | 状态 |
 | --- | --- | --- | --- | --- |
-| `LOCALRT-WARM-CACHE-450` | Gavin 09-27「仔细review本地实时管线……让预览更新和精确识别结果能更快」「但不能影响功能」。主控日志取证：每次录音首窗精解前多等 ~400–550ms（声纹 CAM++ 与剪静音 VAD 为精解线程级缓存，线程每次录音新建 ⇒ 每次重载）。方案：两者改进程级缓存 + 随本地实时模型加载预热，模型 / 参数 / 调用顺序不变 | 主控 | speaker.rs + transcription/mod.rs | ⏳ 方案待确认 |
-| `RESEARCH-GPU-ACCEL-451` | Gavin 09-27「评估下GPU加速方案」「要同时支持amd、intel、nvidia显卡」「测」。✅ PoC 完成：llama.cpp Vulkan（780M）精解 2.4×（倍率 0.340→0.140），llama CPU 也快 12%；识别不劣于现状（sherpa 首解 28 片 6 片异常 / llama 0）。建议立项换精解引擎。全文 `collab/research/gpu-accel-451.md` | 主控 | 仅离线 | ⏳ 待 Gavin 定是否立项 |
+| `LOCALRT-WARM-CACHE-450` | Gavin 09-27「仔细review本地实时管线……让预览更新和精确识别结果能更快」「但不能影响功能」。主控日志取证：每次录音首窗精解前多等 ~400–550ms（声纹 CAM++ 与剪静音 VAD 为精解线程级缓存，线程每次录音新建 ⇒ 每次重载）。方案：两者改进程级缓存 + 随本地实时模型加载预热，模型 / 参数 / 调用顺序不变 | 主控 | speaker.rs + transcription/mod.rs | 🔄 Gavin「做」，开发中 |
+| `RESEARCH-GPU-ACCEL-451` | Gavin 09-27「评估下GPU加速方案」「要同时支持amd、intel、nvidia显卡」「测」。✅ PoC 完成：llama.cpp Vulkan（780M）精解 2.4×（倍率 0.340→0.140），llama CPU 也快 12%；识别不劣于现状（sherpa 首解 28 片 6 片异常 / llama 0）。建议立项换精解引擎。全文 `collab/research/gpu-accel-451.md` | 主控 | 仅离线 | ✅ 已完成 → 立项 452 |
+| `ACC-ENGINE-LLAMACPP-452` | Gavin 09-27：「换，不保留目前的 sherpa onnx 调用方式」「要做好新模型和调用方式的调优，特别是调用线程，还有其他的调用参数啊、传入方式……一定要用最优的方式来调用，最大化的使用它的功能和性能」⇒ 1.7B 精解整体换 llama.cpp（Vulkan / Metal / CPU 自动选），删 sherpa 1.7B 调用；先做参数调优实测再定实现 | 主控 | 待方案 | 🔄 调研中 |
 | `TEST-GAP-438-TAILSTART` | 护栏缺口（BUILD-438 消融 438b 未红）：`preview_display` 重打时忽略 `tail_start` 改为整段重打，`fix438_*` 全绿——护栏只直调纯函数、唯一进 `preview_display` 的用例 `engine=None`。主控已读码确认接线正确（不影响本包）。补：带真 CT-Transformer 或可注入打点函数的端到端用例 | 待定（非作者 coder） | local_stream.rs 测试区 | ⏳ 攒批补 |
 | `RT-STOP-LATENCY-MULTIWIN` | BUILD-398 #9 遗留：长录音切多窗串行解码，停止时队列压窗 ⇒ 松键到上屏 4.5s（16:44Z 23.85s 录音）；后半「无语音整窗送解」已由 414 修 | 待定 | — | ⏳ 待更多端测数据再定 |
 
