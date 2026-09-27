@@ -85,6 +85,16 @@ Source: "..\Publish\onnxruntime_providers_shared.dll"; DestDir: "{app}"; Flags: 
 ; ---- 翻译运行库（CTranslate2 + oneDNN/OpenMP）----
 Source: "..\Publish\ctranslate2.dll"; DestDir: "{app}"; Flags: ignoreversion
 
+; ---- 精解引擎运行库（ACC-ENGINE-LLAMACPP-452：llama.cpp b11207 Vulkan 版，运行时自选 Vulkan / 最优 CPU 变体）----
+; 由 scripts\fetch-llama-runtime.ps1 同步到 Publish（sha256 校验）；缺失时主程序照常启动、精解档报错。
+Source: "..\Publish\ggml-base.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\Publish\ggml.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\Publish\llama.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\Publish\mtmd.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\Publish\ggml-vulkan.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\Publish\libomp.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\Publish\ggml-cpu-*.dll"; DestDir: "{app}"; Flags: ignoreversion
+
 ; ---- VC++ 2015-2022 x64 运行库，app-local（DEC-085 / RELEASE-VCRT-APPLOCAL-399；dumpbin 最小集）----
 Source: "..\Publish\msvcp140.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Publish\msvcp140_1.dll"; DestDir: "{app}"; Flags: ignoreversion

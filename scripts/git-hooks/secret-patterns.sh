@@ -36,7 +36,9 @@ SECRET_PLACEHOLDER='REDACTED|PLACEHOLDER|YOUR[_-]?|xxxx|EXAMPLE|CHANGE[_-]?ME|<[
 #  - gavinshare6@outlook.com  : Gavin 本人，git author 字段
 #  - noreply / users.noreply  : 第三方依赖里的自动生成地址
 #  - *.example.com            : 文档/测试示例域名
-SECRET_EMAIL_WHITELIST='cdexs@hotmail\.com|gavinshare6@outlook\.com|noreply@[A-Za-z0-9.-]+|@users\.noreply\.github\.com|@[A-Za-z0-9.-]+\.example\.com'
+#  - johannesg@5d6.de         : llama.cpp 上游 ggml-opt.h / gguf.h 官方头文件里的模块维护者公开联系地址
+#                               （ACC-452 原样入库 native/llama_asr/include，MIT 开源原文，非本项目凭证）
+SECRET_EMAIL_WHITELIST='cdexs@hotmail\.com|gavinshare6@outlook\.com|johannesg@5d6\.de|noreply@[A-Za-z0-9.-]+|@users\.noreply\.github\.com|@[A-Za-z0-9.-]+\.example\.com'
 
 # ---- 扫描函数 ---------------------------------------------------------
 

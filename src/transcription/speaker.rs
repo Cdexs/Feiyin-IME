@@ -505,7 +505,7 @@ static SPEAKER_EXTRACTOR: Mutex<Option<Option<SpeakerVerifier>>> = Mutex::new(No
 #[cfg(test)]
 thread_local! {
     /// 测试专用：本线程模拟「模型缺失」（不动进程级缓存，避免干扰并行测试）。
-    static TEST_EXTRACTOR_MISSING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static TEST_EXTRACTOR_MISSING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// 取提取器（首次调用加载）；`None` = 模型缺失 / 加载失败。

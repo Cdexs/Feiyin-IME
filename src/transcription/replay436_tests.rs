@@ -376,6 +376,7 @@ fn replay436_full_corpus_433_vs_436() {
             None,
             ChineseScript::Simplified,
             Some(cap),
+            None,
         ) {
             Ok((t, _)) => t,
             Err(e) => {
@@ -1086,4 +1087,461 @@ fn clip(s: &str, n: usize) -> String {
     let head: String = e[..n / 2].iter().collect();
     let tail: String = e[e.len() - n + n / 2..].iter().collect();
     format!("{head}…{tail}")
+}
+
+// ========================================================================
+// ACC-ENGINE-LLAMACPP-452 · 多变体回放 A/B（只测不改生产）
+//
+// Gavin 2026-09-27：「回灌刷新你可以直接做」「注入之前的文本让它续写，还有注入词库……直接接入吧」
+// 「换新的模型和调用框架一定不能影响现在的管线功能」。
+// 几何与 REPLAY-436 相同（dispatch 切片 + plan_gap_cuts + 前片后缀组窗 + 436 接缝），每窗走
+// **生产** `transcribe_acc_ctx`（剪静音 / 处置阶梯 / 426 重解全在内），只切换注入素材：
+//   base  = 无注入（= 现生产输入）            draft = + 本窗流式文字作草稿
+//   terms = + 用户真实词库（target/release/wordbook）  full = draft + terms
+//   （上文注入变体已移除：带回显护栏时 ctx 4.70% / draft+terms+ctx 4.80%，均不如 terms 4.63% ⇒ 未采用）
+// 声纹经测试开关关闭（各变体条件相同，防注册顺序污染）。
+// 输出：每变体 5 段有参考录音的全文 CER、全部录音的空窗 / ≥8 字重复 / 解码耗时。
+// 运行：cargo test --bin feiyin-ime replay452 -- --ignored --nocapture
+// ========================================================================
+
+fn load_real_wordbook_terms() -> Option<String> {
+    // Gavin 实际运行目录（debug.log / 声纹均在此）；Publish 那份为 0 条。
+    let p = manifest_dir().join("target/release/wordbook.sqlite");
+    let conn =
+        rusqlite::Connection::open_with_flags(&p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    let mut st = conn
+        .prepare("SELECT word FROM wordbook ORDER BY id DESC")
+        .ok()?;
+    let words: Vec<String> = st
+        .query_map([], |r| r.get::<_, String>(0))
+        .ok()?
+        .filter_map(|w| w.ok())
+        .collect();
+    let s = build_hotwords_string(&words);
+    (!s.is_empty()).then_some(s)
+}
+
+#[test]
+#[ignore = "ACC-452 多变体回放：需 GGUF + 流式模型 + 录音；cargo test --bin feiyin-ime replay452 -- --ignored --nocapture"]
+fn replay452_variants() {
+    crate::transcription::speaker::TEST_EXTRACTOR_MISSING.with(|c| c.set(true));
+    let root = manifest_dir();
+    let models = root.join("models");
+    let acc = create_qwen3_recognizer(&models).expect("Qwen3 GGUF 须在位");
+    let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
+        .expect("流式模型须在位");
+    let terms = load_real_wordbook_terms();
+    println!(
+        "[452] device={} wordbook_terms={} chars",
+        acc.device(),
+        terms.as_deref().map_or(0, |t| t.chars().count())
+    );
+    let run_stream = |audio: &[f32]| -> String {
+        let stream = st_rec.create_stream();
+        for c in audio.chunks(1600) {
+            stream.accept_waveform(RATE as i32, c);
+            while st_rec.is_ready(&stream) {
+                st_rec.decode(&stream);
+            }
+        }
+        stream.input_finished();
+        while st_rec.is_ready(&stream) {
+            st_rec.decode(&stream);
+        }
+        st_rec
+            .get_result(&stream)
+            .map(|r| r.text.clone())
+            .unwrap_or_default()
+    };
+    const VARIANTS: [&str; 4] = ["base", "draft", "terms", "full"];
+    struct Agg {
+        cer_sum: f32,
+        cer_n: usize,
+        empty: usize,
+        rep8: usize,
+        ms: f64,
+        windows: usize,
+    }
+    let mut agg: Vec<Agg> = VARIANTS
+        .iter()
+        .map(|_| Agg {
+            cer_sum: 0.0,
+            cer_n: 0,
+            empty: 0,
+            rep8: 0,
+            ms: 0.0,
+            windows: 0,
+        })
+        .collect();
+    let mut report = String::from("# ACC-452 多变体回放\n");
+    for wav in collect_wavs(&root) {
+        let name = wav
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string();
+        let Some((audio, rate)) = read_wav(&wav) else {
+            continue;
+        };
+        if rate as usize != RATE {
+            continue;
+        }
+        let mut pieces: Vec<(usize, usize)> = Vec::new();
+        for (s, e) in dispatch_slices(&audio) {
+            pieces.extend(vad::plan_gap_cuts(&audio, s, e));
+        }
+        let reference = read_ref_for(&name);
+        report.push_str(&format!(
+            "\n## {name}（{} 窗，参考 {}）\n",
+            pieces.len(),
+            reference.is_some()
+        ));
+        for (vi, v) in VARIANTS.iter().enumerate() {
+            let mut reflow = OrderedReflow::new();
+            let mut full_text = String::new();
+            for (i, &(ps, pe)) in pieces.iter().enumerate() {
+                let mut waudio: Vec<f32> = Vec::new();
+                let mut wsamples: Vec<usize> = Vec::new();
+                if i >= 1 {
+                    let prev = &audio[pieces[i - 1].0..pieces[i - 1].1];
+                    let cs = crate::take_context_suffix(prev, "", "", RATE_CPS);
+                    waudio.extend_from_slice(&prev[cs.cut.min(prev.len())..]);
+                    wsamples.push(cs.suffix_samples);
+                }
+                waudio.extend_from_slice(&audio[ps..pe]);
+                wsamples.push(pe - ps);
+                let span_start = i.saturating_sub(1);
+                let split = crate::window_overlap_split(
+                    span_start,
+                    if i >= 1 { Some(i) } else { None },
+                    &waudio,
+                    &wsamples,
+                );
+                let stream_text = run_stream(&waudio);
+                let use_draft = matches!(*v, "draft" | "full");
+                let use_terms = matches!(*v, "terms" | "full");
+                let inject = CtxInject {
+                    terms: if use_terms { terms.as_deref() } else { None },
+                    avg_chars_per_sec: None,
+                    speech_ranges: None,
+                    streaming_nonempty: !stream_text.trim().is_empty(),
+                    new_slice_from: wsamples[..wsamples.len() - 1].iter().sum(),
+                    draft: use_draft.then_some(stream_text.as_str()),
+                };
+                let t0 = Instant::now();
+                let text = transcribe_acc_ctx(&acc, &waudio, ChineseScript::Simplified, i, inject)
+                    .map(|(t, _, _)| t)
+                    .unwrap_or_default();
+                agg[vi].ms += t0.elapsed().as_secs_f64() * 1000.0;
+                agg[vi].windows += 1;
+                if text.trim().is_empty() {
+                    agg[vi].empty += 1;
+                }
+                let out = reflow.push_window_streaming(
+                    i,
+                    span_start,
+                    i + 1,
+                    wsamples.clone(),
+                    text,
+                    stream_text,
+                    split,
+                );
+                if let Some(f) = out.last().filter(|f| !f.is_empty()) {
+                    full_text = f.clone();
+                }
+            }
+            let (fc, lw) = reflow.finish();
+            let final_text = format!("{fc}{lw}");
+            let final_text = if final_text.trim().is_empty() {
+                full_text
+            } else {
+                final_text
+            };
+            if has_repeat8(&final_text) {
+                agg[vi].rep8 += 1;
+            }
+            let c = reference.as_deref().map(|r| cer(&final_text, r));
+            if let Some(c) = c {
+                agg[vi].cer_sum += c;
+                agg[vi].cer_n += 1;
+            }
+            report.push_str(&format!(
+                "- **{v}** CER={} | {}\n",
+                c.map_or("-".into(), |c| format!("{c:.4}")),
+                final_text
+            ));
+        }
+        println!("[452] {name} done");
+    }
+    report.push_str("\n## 汇总\n\n| 变体 | 平均 CER（有参考段） | 空窗 | ≥8 字重复录音 | 解码总耗时 | 窗数 |\n|---|---:|---:|---:|---:|---:|\n");
+    for (vi, v) in VARIANTS.iter().enumerate() {
+        let a = &agg[vi];
+        let line = format!(
+            "| {v} | {} | {} | {} | {:.1}s | {} |\n",
+            if a.cer_n > 0 {
+                format!("{:.4}", a.cer_sum / a.cer_n as f32)
+            } else {
+                "-".into()
+            },
+            a.empty,
+            a.rep8,
+            a.ms / 1000.0,
+            a.windows
+        );
+        print!("{line}");
+        report.push_str(&line);
+    }
+    let out = root.join("../poc-451/replay452.md");
+    std::fs::write(&out, report).unwrap();
+    println!("[452] 报告：{}", out.display());
+}
+
+/// ACC-452 ④ 续写 A/B：同一几何，对照「现接缝拼接（base）」与「续写」：
+/// 续写窗 = assistant 预填 `language Chinese<asr_text>` + 本变体已出全文末尾 `CONT_PRIOR_CHARS` 字，
+/// 新窗文字 = 模型接着生成的部分，直接追加（不经接缝裁判）。首窗无前文 ⇒ 普通解码。
+/// 变体：base / cont / cont+draft / cont+terms。剪静音同生产（自跑 VAD + pad）。
+#[test]
+#[ignore = "ACC-452 续写回放：cargo test --bin feiyin-ime replay452_continue -- --ignored --nocapture"]
+fn replay452_continue() {
+    const CONT_PRIOR_CHARS: usize = 60;
+    crate::transcription::speaker::TEST_EXTRACTOR_MISSING.with(|c| c.set(true));
+    let root = manifest_dir();
+    let models = root.join("models");
+    let acc = create_qwen3_recognizer(&models).expect("Qwen3 GGUF 须在位");
+    let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
+        .expect("流式模型须在位");
+    let vad = VadSegmenter::try_new_for_local_trim(&models).expect("VAD");
+    let pad = (vad::LOCALRT_TRIM_PAD_SECS * RATE as f32) as usize;
+    let terms = load_real_wordbook_terms();
+    println!(
+        "[452c] device={} wordbook_terms_chars={} entries={}",
+        acc.device(),
+        terms.as_deref().map_or(0, |t| t.chars().count()),
+        terms.as_deref().map_or(0, |t| t.split(',').count())
+    );
+    let run_stream = |audio: &[f32]| -> String {
+        let stream = st_rec.create_stream();
+        for c in audio.chunks(1600) {
+            stream.accept_waveform(RATE as i32, c);
+            while st_rec.is_ready(&stream) {
+                st_rec.decode(&stream);
+            }
+        }
+        stream.input_finished();
+        while st_rec.is_ready(&stream) {
+            st_rec.decode(&stream);
+        }
+        st_rec
+            .get_result(&stream)
+            .map(|r| r.text.clone())
+            .unwrap_or_default()
+    };
+    // cont = 重叠对齐（整窗音频 + 预填重叠文字）；cont_new = **不做重叠**（只送新片音频 + 预填上文末尾 60 字，
+    // 不经接缝裁判直接追加）—— 回答 Gavin「用续写就不用自己做窗口重叠和文字覆盖」。
+    const VARIANTS: [&str; 4] = ["base", "cont", "cont_new", "cont_new+terms"];
+    let mut cer_sum = [0f32; 4];
+    let mut cer_n = [0usize; 4];
+    let mut rep8 = [0usize; 4];
+    let mut empty = [0usize; 4];
+    let mut ms = [0f64; 4];
+    let mut report = String::from("# ACC-452 续写回放\n");
+    for wav in collect_wavs(&root) {
+        let name = wav
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string();
+        let Some((audio, rate)) = read_wav(&wav) else {
+            continue;
+        };
+        if rate as usize != RATE {
+            continue;
+        }
+        let mut pieces: Vec<(usize, usize)> = Vec::new();
+        for (s, e) in dispatch_slices(&audio) {
+            pieces.extend(vad::plan_gap_cuts(&audio, s, e));
+        }
+        let reference = read_ref_for(&name);
+        report.push_str(&format!(
+            "\n## {name}（{} 窗，参考 {}）\n",
+            pieces.len(),
+            reference.is_some()
+        ));
+        for (vi, v) in VARIANTS.iter().enumerate() {
+            let mut reflow = OrderedReflow::new();
+            let mut full = String::new();
+            let mut prev_win_text = String::new();
+            let mut prev_total = 0usize;
+            for (i, &(ps, pe)) in pieces.iter().enumerate() {
+                let mut waudio: Vec<f32> = Vec::new();
+                let mut wsamples: Vec<usize> = Vec::new();
+                if i >= 1 {
+                    let prev = &audio[pieces[i - 1].0..pieces[i - 1].1];
+                    let cs = crate::take_context_suffix(prev, "", "", RATE_CPS);
+                    waudio.extend_from_slice(&prev[cs.cut.min(prev.len())..]);
+                    wsamples.push(cs.suffix_samples);
+                }
+                waudio.extend_from_slice(&audio[ps..pe]);
+                wsamples.push(pe - ps);
+                let used = trim_to_speech(&waudio, &vad.speech_ranges(&waudio), pad);
+                let used: &[f32] = if used.is_empty() { &waudio } else { &used };
+                let cap = max_new_tokens_for(used.len() as f32 / RATE as f32);
+                let t0 = Instant::now();
+                if *v == "base" {
+                    let span_start = i.saturating_sub(1);
+                    let split = crate::window_overlap_split(
+                        span_start,
+                        if i >= 1 { Some(i) } else { None },
+                        &waudio,
+                        &wsamples,
+                    );
+                    let stream_text = run_stream(&waudio);
+                    // base 走**生产** transcribe_acc_ctx（含处置阶梯 / 426 重解），与 replay452 base 同口径。
+                    let _ = (used, cap);
+                    let inject = CtxInject {
+                        terms: None,
+                        avg_chars_per_sec: None,
+                        speech_ranges: None,
+                        streaming_nonempty: !stream_text.trim().is_empty(),
+                        new_slice_from: wsamples[..wsamples.len() - 1].iter().sum(),
+                        draft: None,
+                    };
+                    let text =
+                        transcribe_acc_ctx(&acc, &waudio, ChineseScript::Simplified, i, inject)
+                            .map(|(t, _, _)| t)
+                            .unwrap_or_default();
+                    ms[vi] += t0.elapsed().as_secs_f64() * 1000.0;
+                    if text.trim().is_empty() {
+                        empty[vi] += 1;
+                    }
+                    let out = reflow.push_window_streaming(
+                        i,
+                        span_start,
+                        i + 1,
+                        wsamples.clone(),
+                        text,
+                        stream_text,
+                        split,
+                    );
+                    if let Some(f) = out.last().filter(|f| !f.is_empty()) {
+                        full = f.clone();
+                    }
+                } else {
+                    // 续写：cont = 重叠对齐（整窗音频 + 预填前片后缀**对应的文字**）；cont_new = 只送新片 + 预填上文末尾
+                    //（按共享样本占上一窗样本比例估算字数，同 433 估算层），模型从重叠结束处接着写。
+                    let draft_txt: Option<String> = None;
+                    let sys = if v.ends_with("+terms") {
+                        terms.as_deref()
+                    } else {
+                        None
+                    };
+                    let no_overlap = v.starts_with("cont_new");
+                    let new_used =
+                        trim_to_speech(&audio[ps..pe], &vad.speech_ranges(&audio[ps..pe]), pad);
+                    let used: &[f32] = if no_overlap && i > 0 {
+                        if new_used.is_empty() {
+                            &audio[ps..pe]
+                        } else {
+                            &new_used
+                        }
+                    } else {
+                        used
+                    };
+                    let cap = max_new_tokens_for(used.len() as f32 / RATE as f32);
+                    let t0 = Instant::now();
+                    let prior: String = if no_overlap {
+                        let n = full.chars().count();
+                        full.chars()
+                            .skip(n.saturating_sub(CONT_PRIOR_CHARS))
+                            .collect()
+                    } else if i == 0 || prev_win_text.is_empty() || prev_total == 0 {
+                        String::new()
+                    } else {
+                        let shared = wsamples.first().copied().unwrap_or(0);
+                        let eff_n = effective_chars(&prev_win_text).len();
+                        let want =
+                            ((eff_n as f32) * (shared as f32 / prev_total as f32)).round() as usize;
+                        // 从 prev_win_text 末尾往前取，直到含 `want` 个有效字（保留其间标点）。
+                        let cs: Vec<char> = prev_win_text.chars().collect();
+                        let (mut k, mut got) = (cs.len(), 0usize);
+                        while k > 0 && got < want {
+                            k -= 1;
+                            if effective_chars(&cs[k].to_string()).len() == 1 {
+                                got += 1;
+                            }
+                        }
+                        cs[k..].iter().collect()
+                    };
+                    let gen = if prior.is_empty() {
+                        acc.decode(used, sys, None, Some(cap), draft_txt.as_deref())
+                            .map(|o| Transcriber::strip_asr_special_tokens(o.raw.trim()))
+                            .unwrap_or_default()
+                    } else {
+                        acc.decode_continue(
+                            used,
+                            sys,
+                            "Chinese",
+                            &prior,
+                            Some(cap),
+                            draft_txt.as_deref(),
+                        )
+                        .map(|o| o.raw)
+                        .unwrap_or_default()
+                    };
+                    ms[vi] += t0.elapsed().as_secs_f64() * 1000.0;
+                    let gen = crate::text_normalizer::normalize_text_for_language(
+                        gen.trim(),
+                        ChineseScript::Simplified,
+                    );
+                    if gen.trim().is_empty() {
+                        empty[vi] += 1;
+                    }
+                    prev_win_text = format!("{prior}{gen}");
+                    prev_total = waudio.len();
+                    full.push_str(&gen);
+                }
+            }
+            let final_text = if *v == "base" {
+                let (fc, lw) = reflow.finish();
+                let f = format!("{fc}{lw}");
+                if f.trim().is_empty() {
+                    full.clone()
+                } else {
+                    f
+                }
+            } else {
+                full.clone()
+            };
+            if has_repeat8(&final_text) {
+                rep8[vi] += 1;
+            }
+            let c = reference.as_deref().map(|r| cer(&final_text, r));
+            if let Some(c) = c {
+                cer_sum[vi] += c;
+                cer_n[vi] += 1;
+            }
+            report.push_str(&format!(
+                "- **{v}** CER={} | {}\n",
+                c.map_or("-".into(), |c| format!("{c:.4}")),
+                final_text
+            ));
+        }
+        println!("[452c] {name} done");
+    }
+    report.push_str(
+        "\n| 变体 | 平均 CER | 空窗 | ≥8 字重复录音 | 解码总耗时 |\n|---|---:|---:|---:|---:|\n",
+    );
+    for (vi, v) in VARIANTS.iter().enumerate() {
+        let line = format!(
+            "| {v} | {:.4} | {} | {} | {:.1}s |\n",
+            cer_sum[vi] / cer_n[vi].max(1) as f32,
+            empty[vi],
+            rep8[vi],
+            ms[vi] / 1000.0
+        );
+        print!("{line}");
+        report.push_str(&line);
+    }
+    std::fs::write(root.join("../poc-451/replay452c.md"), report).unwrap();
 }

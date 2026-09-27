@@ -155,3 +155,7 @@ opt-level = "s"
 cmake = { path = "vendor/cmake" }
 ctranslate2-sys = { path = "patches/ctranslate2-sys" }
 esaxx-rs = { path = "patches/esaxx-rs" }
+
+# ACC-ENGINE-LLAMACPP-452：编译 llama.cpp 适配层 native/llama_asr/shim.cpp（全平台）
+[build-dependencies]
+cc = "1.2"

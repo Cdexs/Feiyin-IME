@@ -149,3 +149,9 @@
 
 - 剪静音 VAD + 声纹 CAM++ 改进程级缓存 + 本地实时模型加载时预热；每次录音首窗精解预计提前 ~0.4–0.55s，识别结果逐位不变。全量 2062P/0F/72I。
 - 端测：日志 `speaker: CAM++ extractor loaded` 整个运行期只出现 1 次（模型加载时）；首窗 `seg dispatch #0` → `DBG-388 trim` 间隔 ~200ms。
+
+## 2026-09-27 — 主控 — ACC-ENGINE-LLAMACPP-452 ①②③ 已提交（⑤ 流式回灌进行中，未出包）
+
+- 1.7B 精解换 llama.cpp（Q8_0 + f16，Vulkan / CPU 自动选）+ 预览草稿 + 本地实时恢复词库（DEC-093）；回放 CER 7.87%→4.63%、精解 ~2.2×。
+- 出包前须 `powershell -ExecutionPolicy Bypass -File scripts\fetch-llama-runtime.ps1`（运行库 20 个 dll + GGUF 模型同步到 target / Publish，sha256 校验）。
+- 端测看：日志 `[ACC-452] Qwen3-ASR llama.cpp engine loaded: device=…`（应为显卡名）、`[ACC-452] decode: … prefill=…ms gen=…ms draft=a/p`。

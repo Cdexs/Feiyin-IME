@@ -1,4 +1,19 @@
 fn main() {
+    // ACC-ENGINE-LLAMACPP-452：Qwen3-ASR 精解引擎适配层（运行时动态加载 llama.cpp 官方预编译库，
+    // 头文件为同版本 b11207 官方头文件，见 native/llama_asr/）。
+    // 🔴 不输出 rerun-if-changed：保持原「包内任一文件变更即重跑」语义（winres 版本资源依赖此行为）。
+    cc::Build::new()
+        .cpp(true)
+        .file("native/llama_asr/shim.cpp")
+        .include("native/llama_asr/include")
+        .flag_if_supported("/std:c++17")
+        .flag_if_supported("/EHsc")
+        .flag_if_supported("/utf-8")
+        .flag_if_supported("-std=c++17")
+        .warnings(false)
+        .emit_rerun_if_env_changed(false)
+        .compile("llama_asr_shim");
+
     #[cfg(target_os = "windows")]
     {
         let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();

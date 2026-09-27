@@ -7,11 +7,13 @@ use std::sync::{Mutex, OnceLock};
 use crate::{config::ChineseScript, punctuation, text_normalizer};
 
 // Re-export SenseVoice config for convenience
-use sherpa_onnx::{OfflineQwen3ASRModelConfig, OfflineSenseVoiceModelConfig};
+use sherpa_onnx::OfflineSenseVoiceModelConfig;
 
 pub mod local_stream;
 pub mod qwen_inference;
 // SPEAKER-VERIFY-408B：声纹模块接入本地实时路B（408A 独立模块 + 408B 过滤/注册）。
+// ACC-ENGINE-LLAMACPP-452：Qwen3-ASR 1.7B 精解引擎（llama.cpp）
+pub(crate) mod llama_asr;
 pub(crate) mod speaker;
 mod vad;
 // FIX-SLICE-CUT-AT-GAP-381：§4/§5 实测 PoC（纯 `#[cfg(test)]`，无 lib target 故不能放 src/bin|tests）
@@ -144,6 +146,7 @@ impl AsrModel {
 /// 366（2026-09-22）实测对照：同音频同参数，16 线程比 8 线程 **20s 慢 1.73×、56s 慢 1.79×**
 /// （16 核机）。自回归解码**逐 token 串行**、受**内存带宽**限制，加线程只在算子内并行，
 /// 反而造成线程争抢 ⇒ 越加越慢。证据：`poc_366_threads`（`#[ignore]`）。
+#[cfg(test)] // ACC-452：生产已改用 llama_asr::thread_plan；仅剩旧测试 / 417 对照引用
 fn default_acc_num_threads() -> i32 {
     std::thread::available_parallelism()
         .map(|n| n.get().min(8) as i32)
@@ -172,8 +175,9 @@ pub struct Transcriber {
     mode: AsrMode,
     asr_language: String,
     asr_model: AsrModel,
-    /// 本地 ASR recognizer（Performance/Accuracy 模式用；QwenAudioOnline 为 None）
-    offline_recognizer: Option<sherpa_onnx::OfflineRecognizer>,
+    /// 本地离线引擎（Performance = SenseVoice / Accuracy 与 LocalRealtime = Qwen3；QwenAudioOnline 为 None）
+    /// ACC-ENGINE-LLAMACPP-452：Qwen3 1.7B 由 sherpa-onnx 换为 llama.cpp，故拆成两种引擎。
+    offline_recognizer: Option<OfflineEngine>,
     /// LOCAL-RT-ENGINE-239-A（DEC-067）：本地**流式** recognizer（streaming paraformer trilingual）。
     ///
     /// 仅 `LocalRealtime` 档位用；与 `offline_recognizer`（accuracy，2pass 最终文本 + 热词）
@@ -226,14 +230,26 @@ unsafe impl Send for Transcriber {}
 ///    且 298 携带 pretranscribed 时该分支根本不执行。
 ///
 /// 结论：全程无第二个线程访问**同一** offline recognizer，跨线程转移成立。
-pub struct SendOfflineRecognizerRef<'a>(pub &'a sherpa_onnx::OfflineRecognizer);
+/// ACC-ENGINE-LLAMACPP-452：所包引用改为 [`AccEngine`]（本身 `Sync`，内部串行）；独占论证不变。
+pub struct SendOfflineRecognizerRef<'a>(pub &'a AccEngine);
 unsafe impl<'a> Send for SendOfflineRecognizerRef<'a> {}
 
 impl<'a> SendOfflineRecognizerRef<'a> {
     /// 按值消费包装取出引用（同 `SendOnlineRecognizerRef`，破 Rust2021 disjoint capture）。
-    pub fn into_inner(self) -> &'a sherpa_onnx::OfflineRecognizer {
+    pub fn into_inner(self) -> &'a AccEngine {
         self.0
     }
+}
+
+/// ACC-ENGINE-LLAMACPP-452：Qwen3-ASR 1.7B 精解引擎（llama.cpp）。
+pub(crate) type AccEngine = llama_asr::LlamaAsr;
+
+/// ACC-ENGINE-LLAMACPP-452：本地离线引擎（二选一）。
+pub(crate) enum OfflineEngine {
+    /// Performance 档：SenseVoice（sherpa-onnx，未变）。
+    SenseVoice(sherpa_onnx::OfflineRecognizer),
+    /// Accuracy / LocalRealtime 档：Qwen3-ASR 1.7B（llama.cpp）。
+    Qwen3(AccEngine),
 }
 
 /// PARALLEL-ACC-298：用常驻 offline(accuracy) recognizer 并行转写**一个**分段。
@@ -300,6 +316,9 @@ pub struct CtxInject<'a> {
     /// 非本地实时滑窗（在线 / 精确批量 / POC）传 `0`（对它们声纹不参与，见 `filter_ranges_by_voiceprint`
     /// 仅在本地实时路径被调用）。
     pub new_slice_from: usize,
+    /// ACC-ENGINE-LLAMACPP-452 ②：本窗**预览（流式）文字**，作推测解码草稿 —— 目标模型逐位验证，
+    /// 只接受与自身贪心一致的 token ⇒ 输出不变、只省时间。`None` = 关闭（非本地实时调用方）。
+    pub draft: Option<&'a str>,
 }
 
 /// 回显探针归一化：去空白与常见中英标点（回显是逐字文本，标点差异不应漏检）。
@@ -930,13 +949,13 @@ fn max_new_tokens_for(speech_secs: f32) -> i32 {
 
 /// 一次 accuracy 解码（可选 per-stream system 段）。返回规范化后的文本。
 fn decode_accuracy_once(
-    recognizer: &sherpa_onnx::OfflineRecognizer,
+    recognizer: &AccEngine,
     samples: &[f32],
     system: Option<&str>,
     script: ChineseScript,
 ) -> Result<String> {
     // 其他调用方行为逐位不变 ⇒ 传 `None`（不设 `max_new_tokens`，沿用全局 256）。
-    let (text, _lang) = decode_accuracy_allow_empty(recognizer, samples, system, script, None)?;
+    let (text, _lang) = decode_accuracy_allow_empty(recognizer, samples, system, script, None, None)?;
     if text.is_empty() {
         // 与 transcribe_segment_detailed 一致：accuracy 空输出 ⇒ 该段失败（上层 all_native=false）
         anyhow::bail!("ASR accuracy model produced empty output");
@@ -948,43 +967,53 @@ fn decode_accuracy_once(
 /// 供 `transcribe_acc_ctx` 首解使用：空输出必须进入 `apply_acc_disposition` 的 Empty 判据
 ///（不带注入重解一次，387-D4 / 388-D1），否则 `?` 提前返回、重解永不发生。
 fn decode_accuracy_allow_empty(
-    recognizer: &sherpa_onnx::OfflineRecognizer,
+    recognizer: &AccEngine,
     samples: &[f32],
     system: Option<&str>,
     script: ChineseScript,
     max_new_tokens: Option<i32>,
+    // ACC-452 ②：草稿文字（本窗预览）⇒ 推测解码提速；`None` = 关闭。
+    draft: Option<&str>,
 ) -> Result<(String, Option<String>)> {
-    decode_accuracy_allow_empty_lang(recognizer, samples, system, script, max_new_tokens, None)
+    decode_accuracy_allow_empty_lang(recognizer, samples, system, script, max_new_tokens, None, draft)
 }
 
 /// FIX-ACC-EMPTY-RETRY-426：同 [`decode_accuracy_allow_empty`]，但可 per-stream 指定 `language`
 ///（Qwen3 官方支持，见 POC-QWEN3-355/376）。**仅「首解失败后的那一次重解」用**；首解不传 ⇒ 逐位不变。
 fn decode_accuracy_allow_empty_lang(
-    recognizer: &sherpa_onnx::OfflineRecognizer,
+    recognizer: &AccEngine,
     samples: &[f32],
     system: Option<&str>,
     script: ChineseScript,
     max_new_tokens: Option<i32>,
     language: Option<&str>,
+    // ACC-452 ②：草稿文字（推测解码；`None` = 关闭）。
+    draft: Option<&str>,
 ) -> Result<(String, Option<String>)> {
-    let stream = recognizer.create_stream();
-    if let Some(s) = system {
-        stream.set_option("hotwords", s);
+    // ACC-ENGINE-LLAMACPP-452：解码引擎由 sherpa-onnx 换为 llama.cpp（输入输出形态不变）：
+    // - `system`：原 sherpa per-stream `hotwords`（Qwen3 上下文 / 词库）⇒ system 消息；
+    // - `language`（426）：原 sherpa `language` ⇒ assistant 预填 `language X<asr_text>`（Qwen3 官方指定语种方式）；
+    // - `max_new_tokens`（TUNE-390）：`None` ⇒ 引擎默认 256（同原 sherpa 全局值）。
+    // 原始输出同为 `language X<asr_text>正文`，下游剥离 / 规整逐位沿用。
+    let out = recognizer.decode(samples, system, language, max_new_tokens, draft)?;
+    if log::log_enabled!(log::Level::Debug) {
+        let st = out.stats;
+        log::debug!(
+            "[ACC-452] decode: device={} audio={:.2}s prompt={} gen={} prefill={:.0}ms gen={:.0}ms draft={}/{} sys={} lang={:?}",
+            recognizer.device(),
+            samples.len() as f32 / 16000.0,
+            st.n_prompt,
+            st.n_gen,
+            st.prefill_ms,
+            st.gen_ms,
+            st.n_draft_accepted,
+            st.n_draft_proposed,
+            system.map_or(0, |s| s.chars().count()),
+            language
+        );
     }
-    // FIX-ACC-EMPTY-RETRY-426：重解换条件 —— 指定本窗已判定的语种（L 未知则不设）。
-    if let Some(l) = language {
-        stream.set_option("language", l);
-    }
-    // TUNE-390：per-stream 生成长度上限（sherpa `offline-recognizer-qwen3-asr-impl.cc:774` 的
-    // `GetOptionInt` 按字符串解析）。`None` ⇒ 不设，沿用全局 `max_new_tokens`。
-    if let Some(n) = max_new_tokens {
-        stream.set_option("max_new_tokens", &n.to_string());
-    }
-    stream.accept_waveform(16000, samples);
-    recognizer.decode(&stream);
-    let result = stream.get_result().context("No transcription result")?;
     // SPEAKER-VERIFY-408B：一并取出 Qwen3 自造语种前缀里的语种（日语保护用；剥离行为逐位不变）。
-    let (text, lang) = Transcriber::strip_asr_special_tokens_lang(result.text.trim());
+    let (text, lang) = Transcriber::strip_asr_special_tokens_lang(out.raw.trim());
     if text.is_empty() {
         return Ok((String::new(), lang));
     }
@@ -1010,7 +1039,7 @@ fn lang_to_sherpa(lang: &str) -> Option<&'static str> {
 /// 无注入的简版单段入口（保留兼容；生产路径已切 `transcribe_accuracy_segment_ctx`）。
 #[allow(dead_code)]
 pub(crate) fn transcribe_accuracy_segment(
-    recognizer: &sherpa_onnx::OfflineRecognizer,
+    recognizer: &AccEngine,
     samples: &[f32],
     script: ChineseScript,
 ) -> Result<(String, bool)> {
@@ -1151,7 +1180,7 @@ fn lang_from_charset(text: &str) -> Option<&'static str> {
 /// 与首解同样走 `decode_accuracy_allow_empty`（带 per-stream token cap）。单独成函数
 /// （置于 `transcribe_acc_ctx` 之外）⇒ 不改 390 源码护栏对函数体内解码调用次数的断言。
 fn redecode_with_ranges(
-    recognizer: &sherpa_onnx::OfflineRecognizer,
+    recognizer: &AccEngine,
     window_audio: &[f32],
     ranges: &[(usize, usize)],
     pad: usize,
@@ -1163,7 +1192,7 @@ fn redecode_with_ranges(
         return None;
     }
     let cap = max_new_tokens_for(used.len() as f32 / 16000.0);
-    decode_accuracy_allow_empty(recognizer, &used, system, script, Some(cap))
+    decode_accuracy_allow_empty(recognizer, &used, system, script, Some(cap), None)
         .ok()
         .map(|(t, _)| t)
 }
@@ -1260,7 +1289,7 @@ fn plan_self_vad_trim(
 /// - 命中回显 ⇒ 同音频**无上下文重解一次**，用重解码结果（不丢片）。
 /// - SPEAKER-VERIFY-408B：返回第三元 [`AccDropStats`]（本窗声纹剔除/保留秒数，供 406 放宽）。
 pub(crate) fn transcribe_acc_ctx(
-    recognizer: &sherpa_onnx::OfflineRecognizer,
+    recognizer: &AccEngine,
     samples: &[f32],
     script: ChineseScript,
     seg_idx: usize,
@@ -1404,6 +1433,8 @@ pub(crate) fn transcribe_acc_ctx(
         system.as_deref().filter(|_| inject_on),
         script,
         Some(token_cap),
+        // ACC-452 ②：本窗预览文字作草稿（推测解码，只省时间）。
+        inject.draft,
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -1455,6 +1486,7 @@ pub(crate) fn transcribe_acc_ctx(
                 script,
                 Some(token_cap),
                 lang_opt,
+                inject.draft,
             )
             .map(|(t, _)| t)
         },
@@ -1706,7 +1738,7 @@ impl Transcriber {
                 mode,
                 asr_language,
                 asr_model: AsrModel::LocalRealtime,
-                offline_recognizer: Some(offline_recognizer),
+                offline_recognizer: Some(OfflineEngine::Qwen3(offline_recognizer)),
                 online_recognizer: Some(online_recognizer),
                 hotwords_version,
                 vad_segmenter,
@@ -1763,8 +1795,12 @@ impl Transcriber {
     /// PARALLEL-ACC-298：取常驻的 accuracy offline recognizer（accuracy 引擎档位为 `Some`）。
     ///
     /// 供 `main.rs` 的 accuracy 并行 worker 经 [`SendOfflineRecognizerRef`] 在 scope 线程内使用。
-    pub fn offline_recognizer(&self) -> Option<&sherpa_onnx::OfflineRecognizer> {
-        self.offline_recognizer.as_ref()
+    /// ACC-ENGINE-LLAMACPP-452：只返回 Qwen3 精解引擎（两处调用方均在 LocalRealtime 档内）。
+    pub fn offline_recognizer(&self) -> Option<&AccEngine> {
+        match self.offline_recognizer.as_ref() {
+            Some(OfflineEngine::Qwen3(e)) => Some(e),
+            _ => None,
+        }
     }
 
     /// ASR-038-B: 在线 ASR 的 Inference API 端点
@@ -2052,16 +2088,21 @@ impl Transcriber {
         samples: &[f32],
         script: ChineseScript,
     ) -> Result<(String, bool)> {
-        let recognizer = self
+        let engine = self
             .offline_recognizer
             .as_ref()
             .context("No local ASR recognizer (qwen3_online mode should not reach here)")?;
-        let stream = recognizer.create_stream();
-        stream.accept_waveform(16000, samples);
-        recognizer.decode(&stream);
-
-        let result = stream.get_result().context("No transcription result")?;
-        let text = result.text.trim().to_string();
+        // ACC-ENGINE-LLAMACPP-452：按引擎分派；Qwen3 分支与原 sherpa 调用同参（无上下文 / 不指定语种 / 默认生成上限）。
+        let text = match engine {
+            OfflineEngine::SenseVoice(recognizer) => {
+                let stream = recognizer.create_stream();
+                stream.accept_waveform(16000, samples);
+                recognizer.decode(&stream);
+                let result = stream.get_result().context("No transcription result")?;
+                result.text.trim().to_string()
+            }
+            OfflineEngine::Qwen3(e) => e.decode(samples, None, None, None, None)?.raw.trim().to_string(),
+        };
 
         // ASR-NOSPEECH-FILTER-001: 剥离特殊 token（如 <|nospeech|>）
         let text = Self::strip_asr_special_tokens(&text);
@@ -4110,7 +4151,7 @@ fn build_recognizer(
     language: &str,
     asr_model: AsrModel,
     hotwords: Option<&str>,
-) -> Result<(sherpa_onnx::OfflineRecognizer, AsrModel, u64)> {
+) -> Result<(OfflineEngine, AsrModel, u64)> {
     let hotwords_version = match hotwords {
         Some(h) => {
             let count = h.split(',').filter(|s| !s.trim().is_empty()).count();
@@ -4125,7 +4166,7 @@ fn build_recognizer(
     match asr_model {
         AsrModel::Performance => {
             let recognizer = create_sensevoice_recognizer(model_dir, language)?;
-            Ok((recognizer, AsrModel::Performance, hotwords_version))
+            Ok((OfflineEngine::SenseVoice(recognizer), AsrModel::Performance, hotwords_version))
         }
         AsrModel::Accuracy => {
             // ASR-SINGLE-MODEL-001: accuracy 分支尝试加载 native 模型；失败则降级 performance
@@ -4135,7 +4176,7 @@ fn build_recognizer(
             // 🔴 `hotwords` **不塞 config** —— 词库与上下文走 accuracy worker 的 per-stream 注入（320）。
             let loaded = create_qwen3_recognizer(model_dir);
             match loaded {
-                Ok(recognizer) => Ok((recognizer, AsrModel::Accuracy, hotwords_version)),
+                Ok(engine) => Ok((OfflineEngine::Qwen3(engine), AsrModel::Accuracy, hotwords_version)),
                 Err(e) => {
                     log::warn!(
                         "Accuracy model load failed ({}), falling back to performance model",
@@ -4143,7 +4184,7 @@ fn build_recognizer(
                     );
                     let recognizer = create_sensevoice_recognizer(model_dir, language)?;
                     // R2: effective_model=Performance，Transcriber 存此值语义归位
-                    Ok((recognizer, AsrModel::Performance, hotwords_version))
+                    Ok((OfflineEngine::SenseVoice(recognizer), AsrModel::Performance, hotwords_version))
                 }
             }
         }
@@ -4183,7 +4224,7 @@ fn build_local_realtime_recognizers(
     hotwords: Option<&str>,
 ) -> Result<(
     sherpa_onnx::OnlineRecognizer,
-    sherpa_onnx::OfflineRecognizer,
+    AccEngine,
     u64,
 )> {
     let hotwords_version = match hotwords {
@@ -4266,106 +4307,34 @@ fn create_sensevoice_recognizer(
         .context("Failed to create SenseVoice offline recognizer")
 }
 
-/// MIGRATE-QWEN3-314（DEC-076）：创建 Qwen3-ASR 0.6B 识别器（accuracy 档新引擎）。
+/// ACC-ENGINE-LLAMACPP-452（Gavin 2026-09-27「换，不保留目前的 sherpa onnx 调用方式」）：
+/// 创建 Qwen3-ASR 1.7B 精解引擎 = llama.cpp（`llama_asr::LlamaAsr`，Vulkan / Metal 优先、CPU 回落）。
 ///
-/// 字段填法参照 `collab/evidence/20260921-qwen3-poc/poc_qwen3_compare.rs.txt`（306/310/313 已验证）。
-///
-/// - `max_total_len = 4096`（**代码实际值，见下方字段**）：310 实测配置开大**零加载内存代价、
-///   零精度退化**，上下文容量随之放大。
-///
-///   🔴🔴 **改这个数之前先读完这段。** 本注释此前写作 `2048`（Gavin 早期口径，当时的问题是
-///   「512 不够用」），与代码的 `4096` **长期不一致**；2026-09-21 主控核对后以代码为准更正。
-///
-///   **`max_total_len` 与 `HOTWORDS_MAX_TOTAL_TOKENS` 是一对耦合常量，不能单独改。**
-///   词库预算 3000 的推导（见该常量注释）就是从 **4096** 反推的。按当前真实常量核算：
-///
-///   | 扣项 | token |
-///   | --- | --- |
-///   | 20s 音频（13.0 tok/s） | 260 |
-///   | ~~上下文 500 字 + 指令句/标签 ~55~~ | ~~440~~（**FIX-INJECT-TO-SPEC-377 起不再注入**） |
-///   | 生成预留 `max_new_tokens` | 256 |
-///   | **剩给词库** | **4096 ⇒ 3580** ／ **2048 ⇒ 1532** |
-///
-///   词库预算是 **3000** ⇒ 在 4096 下余量仅 ~140，**在 2048 下超出约 1900**。
-///   超预算的后果不是截断而是**空输出**（同文件 `HOTWORDS_MAX_ENTRIES` 注释记录：
-///   220 条 hotwords 撑爆 `max_total_len=512` ⇒ **0% 全空输出**）。
-///
-///   ⇒ **若要把本值调回 2048，必须同批把 `HOTWORDS_MAX_TOTAL_TOKENS` 降到 1000 以内**，
-///     否则用户词库一旦长起来，accuracy 档会开始吐空。今天没炸只是因为实测 `terms_len=73`
-///     字符，离上限极远（BUILD-321 端测）。**这是埋着的雷，不是当下的故障。**
-/// - `max_new_tokens = 256`：**评估取值**。单片 ≤20s，音频 token ≈13/s×20≈260；生成量按 20s
-///   中文口述典型 ≤100 字（≤~130 token），256 足够覆盖且远低于 2048 KV，不引入截断
-///   （上游默认 128 对大段偏紧；官方 CLI 512 更宽松但非必需）⇒ 取 256，与现役 FunASR 一致。
-/// - `temperature = 1e-6 / top_p = 0.8 / seed = 42`：上游默认、近贪心 ⇒ 输出可复现（ASR 优先确定性）。
-/// - 🔴 `hotwords = None`：**本单 config 层留空**，词库改走 per-stream 注入（下一单）；
-///   不把词库塞进 config —— 避免 config 与 per-stream 两套并存，后面还要拆。
-fn create_qwen3_recognizer(model_dir: &Path) -> Result<sherpa_onnx::OfflineRecognizer> {
-    let model_dir_path = ensure_qwen3_model(model_dir)?;
-    create_qwen3_recognizer_at(&model_dir_path)
-}
-
-/// POC-QWEN3-1.7B-351：按**物理模型目录**建 Qwen3 recognizer（`create_qwen3_recognizer` 的
-/// 底座抽取，**零行为变更提取**）。
-///
-/// 分工：`create_qwen3_recognizer` 负责「解析出模型物理目录」（经 `ensure_qwen3_model`，其中含
-/// 硬编码子目录名）；本函数只负责「给定物理目录 → 按生产字段建 recognizer」。
-/// 抽取目的：让需要**显式指定模型目录**的调用方（如 POC-QWEN3-1.7B-351 用
-/// `models/…-1.7B-…/`）复用同一条生产配置链，而不是自己手搓 recognizer 配置
-/// （`[POC-BYPASSES-PROD-WRAPPER-001]`）。
-/// 🔴 本函数不含任何子目录解析逻辑，也不改 `check_qwen3_model_ready` 的硬编码目录名。
-fn create_qwen3_recognizer_at(model_dir_path: &Path) -> Result<sherpa_onnx::OfflineRecognizer> {
-    let conv = model_dir_path.join("conv_frontend.onnx");
-    let enc = model_dir_path.join("encoder.int8.onnx");
-    let dec = model_dir_path.join("decoder.int8.onnx");
-    let tok = model_dir_path.join("tokenizer");
-
-    // accuracy 线程数 = 常量（无 env）。
-    let num_threads = default_acc_num_threads();
-    log::debug!("[MIGRATE-QWEN3-320] accuracy num_threads={}", num_threads);
-
-    let offline_config = sherpa_onnx::OfflineRecognizerConfig {
-        model_config: sherpa_onnx::OfflineModelConfig {
-            // 与 Qwen3 口径一致：min(逻辑核数, 8)，显式 cpu。
-            num_threads,
-            provider: Some("cpu".to_string()),
-            qwen3_asr: OfflineQwen3ASRModelConfig {
-                conv_frontend: Some(conv.to_str().unwrap_or("").to_string()),
-                encoder: Some(enc.to_str().unwrap_or("").to_string()),
-                decoder: Some(dec.to_str().unwrap_or("").to_string()),
-                tokenizer: Some(tok.to_str().unwrap_or("").to_string()),
-                max_total_len: 4096,
-                max_new_tokens: 256,
-                temperature: 1e-6,
-                top_p: 0.8,
-                seed: 42,
-                // LOCALRT-CTX-INJECT-320：词库与上下文**改走 per-stream 注入**
-                //    （见 `transcribe_accuracy_segment_ctx` / main.rs accuracy worker）。
-                //    310 实证 max_total_len=4096 零加载内存代价、精度逐字不变；
-                //    预算：上下文 ≤300 字 + 词库 ≤500 字符 + 20s 音频 ~260 token + 生成 256，远低于 4096。
-                //    本 config 字段保持 None（不是漏接）。
-                hotwords: None,
-            },
-            tokens: Some(String::new()),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    sherpa_onnx::OfflineRecognizer::create(&offline_config)
-        .context("Failed to create Qwen3-ASR offline recognizer")
-}
-
-/// MIGRATE-QWEN3-314：Qwen3-ASR 模型（954MB）就位检测（四个路径）。
-fn ensure_qwen3_model(model_dir: &Path) -> Result<PathBuf> {
+/// - 模型：`models/qwen3-asr-1.7b-gguf/` 下 Q8_0 LLM + f16 音频编码器（Gavin「用 Q8+f16」）
+///   + `tokenizer/`（仅供词库 token 预算计数，与 GGUF 内置词表同一 Qwen3 tokenizer）。
+/// - 🔴 上下文总长 `N_CTX = 4096` 与原 sherpa `max_total_len=4096` 同额度：
+///   **`HOTWORDS_MAX_TOTAL_TOKENS=3000` 即由 4096 反推**（20s 音频 ~260 + 生成 256 + 词库 ≤3000），二者耦合，不得单改。
+/// - 生成默认上限 256、贪心解码，与原 sherpa 全局 `max_new_tokens=256` / 近贪心一致。
+/// - 调参依据（Flash Attention / 编码器上 GPU / KV f16 / 线程分设）见 `collab/research/gpu-accel-451.md`。
+pub(crate) fn create_qwen3_recognizer(model_dir: &Path) -> Result<AccEngine> {
     let (ready, dir) = check_qwen3_model_ready(model_dir);
-    if ready {
-        log::info!("Qwen3-ASR model found at {:?}", dir);
-        return Ok(dir);
+    if !ready {
+        anyhow::bail!(
+            "Qwen3-ASR GGUF model not found at {:?} (need {} / {} / tokenizer/tokenizer.json)",
+            dir,
+            llama_asr::LLAMA_ASR_MODEL_FILE,
+            llama_asr::LLAMA_ASR_MMPROJ_FILE
+        );
     }
-    anyhow::bail!(
-        "Qwen3-ASR model not found at {:?} (need conv_frontend.onnx / encoder.int8.onnx / decoder.int8.onnx / tokenizer/). Download from:\n  https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models",
-        dir
-    )
+    log::info!("Qwen3-ASR model found at {:?}", dir);
+    AccEngine::load(model_dir).context("Failed to create Qwen3-ASR llama.cpp engine")
+}
+
+/// ACC-452：历史测试的按「模型子目录」创建入口（仅测试编译）：取上级 `models/` 加载 llama.cpp 引擎，
+/// 旧 sherpa 目录名与新 GGUF 目录名同样解析到 `models/`，调用点无需逐个改写。
+#[cfg(test)]
+fn create_qwen3_recognizer_at(model_dir_path: &Path) -> Result<AccEngine> {
+    create_qwen3_recognizer(model_dir_path.parent().unwrap_or(model_dir_path))
 }
 
 /// Ensure SenseVoice (FunASR Nano CTC 兼容版，179MB) model is present
@@ -4403,15 +4372,14 @@ pub fn model_dir() -> PathBuf {
 /// `src-tauri` 镜像处；本批切 0.6B→1.7B 时收敛到本常量。
 /// 🔴 `src-tauri` 是独立 crate，**无法复用本常量**，仍须各自镜像同一字符串
 /// （那里有注释警示：两处判据必须逐字一致，否则 UI 显示「已就位」而主程序加载失败）。
-pub(crate) const QWEN3_MODEL_SUBDIR: &str = "sherpa-onnx-qwen3-asr-1.7B-int8-2026-09-22";
+/// ACC-ENGINE-LLAMACPP-452：改指 llama.cpp GGUF 模型目录（`src-tauri` 镜像同批更新）。
+pub(crate) const QWEN3_MODEL_SUBDIR: &str = llama_asr::LLAMA_ASR_MODEL_SUBDIR;
 
-/// MIGRATE-QWEN3-314：Qwen3-ASR 就位判据（四个路径；与 `create_qwen3_recognizer` 加载清单逐字一致）。
+/// Qwen3-ASR 就位判据（与 `create_qwen3_recognizer` 加载清单逐字一致）：
+/// GGUF 主模型 + 音频编码器 + 词库预算计数用 `tokenizer/tokenizer.json`。
 fn check_qwen3_model_ready(model_dir: &Path) -> (bool, PathBuf) {
-    let dir = model_dir.join(QWEN3_MODEL_SUBDIR);
-    let ready = dir.join("conv_frontend.onnx").exists()
-        && dir.join("encoder.int8.onnx").exists()
-        && dir.join("decoder.int8.onnx").exists()
-        && dir.join("tokenizer").exists();
+    let (engine_ready, dir) = AccEngine::model_ready(model_dir);
+    let ready = engine_ready && dir.join("tokenizer").join("tokenizer.json").exists();
     (ready, dir)
 }
 
@@ -5233,6 +5201,7 @@ mod tests {
         assert_eq!(hit2.stripped, "可以看看周边的风景。");
     }
 
+    /// ACC-452：就位判据改为 GGUF 主模型 + 音频编码器 + `tokenizer/tokenizer.json`（词库预算计数）。
     #[test]
     fn migrate320_qwen3_readiness_checks_four_paths() {
         let root = std::env::temp_dir().join(format!(
@@ -5244,18 +5213,21 @@ mod tests {
         let q = root.join(QWEN3_MODEL_SUBDIR);
         std::fs::create_dir_all(q.join("tokenizer")).unwrap();
         for f in [
-            "conv_frontend.onnx",
-            "encoder.int8.onnx",
-            "decoder.int8.onnx",
+            llama_asr::LLAMA_ASR_MODEL_FILE,
+            llama_asr::LLAMA_ASR_MMPROJ_FILE,
+            "tokenizer/tokenizer.json",
         ] {
             std::fs::write(q.join(f), b"x").unwrap();
         }
         let (ready, dir) = check_qwen3_model_ready(&root);
-        assert!(ready, "Qwen3 四件套齐全应 ready");
+        assert!(ready, "Qwen3 GGUF 三件套齐全应 ready");
         assert_eq!(dir, q);
         assert!(check_accuracy_model_ready(&root).0, "accuracy 检测即 Qwen3");
-        std::fs::remove_file(q.join("decoder.int8.onnx")).unwrap();
-        assert!(!check_qwen3_model_ready(&root).0, "少 decoder 应 not ready");
+        std::fs::remove_file(q.join(llama_asr::LLAMA_ASR_MMPROJ_FILE)).unwrap();
+        assert!(!check_qwen3_model_ready(&root).0, "少音频编码器应 not ready");
+        std::fs::write(q.join(llama_asr::LLAMA_ASR_MMPROJ_FILE), b"x").unwrap();
+        std::fs::remove_file(q.join("tokenizer/tokenizer.json")).unwrap();
+        assert!(!check_qwen3_model_ready(&root).0, "少 tokenizer.json 应 not ready");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5319,7 +5291,7 @@ mod tests {
                 &str,
                 AsrModel,
                 Option<&str>,
-            ) -> Result<(sherpa_onnx::OfflineRecognizer, AsrModel, u64)>,
+            ) -> Result<(OfflineEngine, AsrModel, u64)>,
         {
         }
         _type_check(build_recognizer);
@@ -5735,7 +5707,7 @@ mod poc_qwen3_17b_351 {
     /// 跑一个模型：逐片 `transcribe_acc_ctx`（前文累积 + 同一词表），返回
     /// `(拼接文本, 总解码秒, peak 私有 MB)`。
     fn run_model(
-        rec: &sherpa_onnx::OfflineRecognizer,
+        rec: &crate::transcription::AccEngine,
         slices: &[(usize, usize)],
         samples: &[f32],
         load_priv_mb: f64,
@@ -5752,6 +5724,7 @@ mod poc_qwen3_17b_351 {
                 speech_ranges: None,
                 streaming_nonempty: false,
                 new_slice_from: 0,
+                draft: None,
             };
             let t0 = Instant::now();
             let (text, _native, _stats) =
@@ -5955,103 +5928,21 @@ mod poc_qwen3_17b_351 {
     //   运行：cargo test --bin feiyin-ime -- --ignored --nocapture poc_355_capability
     // ============================================================
 
-    /// 与生产 `create_qwen3_recognizer_at` **逐字段一致**，仅 `max_total_len`/`max_new_tokens`
-    /// 可变的对照构造器（调用层参数扫描专用；生产值 = 4096 / 256）。
+    /// ACC-452：历史对照构造器迁至 llama.cpp 引擎（`dir` 为旧模型目录 ⇒ 取其上级 `models/`）。
+    /// 🔴 `max_total_len` / `max_new_tokens` 是 sherpa 全局配置，新引擎按次指定（默认 256）⇒ 此处不再生效，
+    /// 355 的 KV / 生成上限扫描结论只对旧引擎成立。
     fn make_qwen3(
         dir: &Path,
-        max_total_len: i32,
-        max_new_tokens: i32,
-    ) -> sherpa_onnx::OfflineRecognizer {
-        let cfg = sherpa_onnx::OfflineRecognizerConfig {
-            model_config: sherpa_onnx::OfflineModelConfig {
-                num_threads: default_acc_num_threads(),
-                provider: Some("cpu".to_string()),
-                qwen3_asr: sherpa_onnx::OfflineQwen3ASRModelConfig {
-                    conv_frontend: Some(
-                        dir.join("conv_frontend.onnx")
-                            .to_string_lossy()
-                            .into_owned(),
-                    ),
-                    encoder: Some(dir.join("encoder.int8.onnx").to_string_lossy().into_owned()),
-                    decoder: Some(dir.join("decoder.int8.onnx").to_string_lossy().into_owned()),
-                    tokenizer: Some(dir.join("tokenizer").to_string_lossy().into_owned()),
-                    max_total_len,
-                    max_new_tokens,
-                    temperature: 1e-6,
-                    top_p: 0.8,
-                    seed: 42,
-                    hotwords: None,
-                },
-                tokens: Some(String::new()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        sherpa_onnx::OfflineRecognizer::create(&cfg).expect("create qwen3")
+        _max_total_len: i32,
+        _max_new_tokens: i32,
+    ) -> crate::transcription::AccEngine {
+        let models = dir.parent().unwrap_or(dir);
+        super::create_qwen3_recognizer(models).expect("create qwen3 engine")
     }
 
-    // ---- 366-🥇：8 线程 vs 满核 实测对照（临时 recognizer，不改生产）----
-    fn make_qwen3_threads(dir: &Path, num_threads: i32) -> sherpa_onnx::OfflineRecognizer {
-        let cfg = sherpa_onnx::OfflineRecognizerConfig {
-            model_config: sherpa_onnx::OfflineModelConfig {
-                num_threads,
-                provider: Some("cpu".to_string()),
-                qwen3_asr: sherpa_onnx::OfflineQwen3ASRModelConfig {
-                    conv_frontend: Some(
-                        dir.join("conv_frontend.onnx")
-                            .to_string_lossy()
-                            .into_owned(),
-                    ),
-                    encoder: Some(dir.join("encoder.int8.onnx").to_string_lossy().into_owned()),
-                    decoder: Some(dir.join("decoder.int8.onnx").to_string_lossy().into_owned()),
-                    tokenizer: Some(dir.join("tokenizer").to_string_lossy().into_owned()),
-                    max_total_len: 4096,
-                    max_new_tokens: 256,
-                    temperature: 1e-6,
-                    top_p: 0.8,
-                    seed: 42,
-                    hotwords: None,
-                },
-                tokens: Some(String::new()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        sherpa_onnx::OfflineRecognizer::create(&cfg).expect("create qwen3")
-    }
-
-    #[test]
-    #[ignore = "PoC: cargo test --bin feiyin-ime -- --ignored --nocapture poc_366_threads"]
-    fn poc_366_threads() {
-        let root = manifest_dir();
-        let dir = root.join("models/sherpa-onnx-qwen3-asr-1.7B-int8-2026-09-22");
-        let (fs, rate) = read_wav(&root, "collab/research/audio-real-gavin/processed/full.wav");
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(0);
-        println!(
-            "POC366 cores={} default_threads={}",
-            cores,
-            default_acc_num_threads()
-        );
-        for secs in [20usize, 56] {
-            let n = (rate * secs).min(fs.len());
-            for threads in [8i32, cores as i32] {
-                let rec = make_qwen3_threads(&dir, threads);
-                // 预热一次（首次分配/池创建不计入对照）
-                let _ = decode_full_result(&rec, &fs[..(rate * 5).min(fs.len())], rate as i32);
-                let (r, ms) = decode_full_result(&rec, &fs[..n], rate as i32);
-                println!(
-                    "POC366 secs={secs} threads={threads} decode={ms:.0}ms chars={}",
-                    r.text.chars().count()
-                );
-                drop(rec);
-            }
-        }
-    }
 
     fn raw_decode(
-        rec: &sherpa_onnx::OfflineRecognizer,
+        rec: &crate::transcription::AccEngine,
         samples: &[f32],
         script: ChineseScript,
     ) -> String {
@@ -6113,6 +6004,7 @@ mod poc_qwen3_17b_351 {
             speech_ranges: None,
             streaming_nonempty: false,
             new_slice_from: 0,
+            draft: None,
         };
         let seg0 = transcribe_acc_ctx(
             &rec,
@@ -6191,19 +6083,14 @@ mod poc_qwen3_17b_351 {
     /// 生产 `decode_accuracy_once` 同款解码，但**额外**设 per-stream `language` 选项
     /// （运行时支持，见 sherpa-onnx `offline-recognizer-qwen3-asr-impl.cc:824`）。
     fn decode_with_lang(
-        rec: &sherpa_onnx::OfflineRecognizer,
+        rec: &crate::transcription::AccEngine,
         samples: &[f32],
         script: ChineseScript,
         language: Option<&str>,
     ) -> String {
-        let stream = rec.create_stream();
-        if let Some(l) = language {
-            stream.set_option("language", l);
-        }
-        stream.accept_waveform(16000, samples);
-        rec.decode(&stream);
-        let r = stream.get_result().expect("result");
-        let t = super::Transcriber::strip_asr_special_tokens(r.text.trim());
+        // ACC-452：迁至 llama.cpp 引擎（language ⇒ assistant 预填，语义同原 sherpa 选项）。
+        let r = rec.decode(samples, None, language, None, None).expect("decode");
+        let t = super::Transcriber::strip_asr_special_tokens(r.raw.trim());
         crate::text_normalizer::normalize_text_for_language(&t, script)
     }
 
@@ -6214,21 +6101,17 @@ mod poc_qwen3_17b_351 {
 
     /// POC-376：**不剥**任何前缀的裸解码（要观测 `<asr_text>` 是否出现/被模型自造）。
     fn poc376_decode_raw(
-        rec: &sherpa_onnx::OfflineRecognizer,
+        rec: &crate::transcription::AccEngine,
         samples: &[f32],
         language: Option<&str>,
         system: Option<&str>,
     ) -> String {
-        let stream = rec.create_stream();
-        if let Some(l) = language {
-            stream.set_option("language", l);
-        }
-        if let Some(s) = system {
-            stream.set_option("hotwords", s);
-        }
-        stream.accept_waveform(16000, samples);
-        rec.decode(&stream);
-        stream.get_result().expect("result").text.trim().to_string()
+        // ACC-452：迁至 llama.cpp 引擎（hotwords ⇒ system 消息，language ⇒ assistant 预填）。
+        rec.decode(samples, system, language, None, None)
+            .expect("decode")
+            .raw
+            .trim()
+            .to_string()
     }
 
     /// POC-376：输出里「**连续**注入词条且顺序与注入一致」的**最大 run 长度**
@@ -6608,20 +6491,15 @@ Terms: {terms}"
     // ---- 357：hotwords 通道 = system prompt 通道，实测指令是否被服从 ----
     /// 生产 decode 同款，但把 `hotwords` 设为任意文本（＝写进 `<|im_start|>system` 段）。
     fn decode_with_hotwords(
-        rec: &sherpa_onnx::OfflineRecognizer,
+        rec: &crate::transcription::AccEngine,
         samples: &[f32],
         script: ChineseScript,
         hotwords: Option<&str>,
     ) -> String {
-        let stream = rec.create_stream();
-        if let Some(h) = hotwords {
-            stream.set_option("hotwords", h);
-        }
-        stream.accept_waveform(16000, samples);
-        rec.decode(&stream);
-        let r = stream.get_result().expect("result");
+        // ACC-452：迁至 llama.cpp 引擎（hotwords ⇒ system 消息）。
+        let r = rec.decode(samples, hotwords, None, None, None).expect("decode");
         crate::text_normalizer::normalize_text_for_language(
-            &super::Transcriber::strip_asr_special_tokens(r.text.trim()),
+            &super::Transcriber::strip_asr_special_tokens(r.raw.trim()),
             script,
         )
     }
@@ -6702,124 +6580,6 @@ Terms: {terms}"
         }
     }
 
-    // ============================================================
-    // POC-TIMESTAMP-DECODE-CURVE-361：RP-1 时间戳可用性 + RP-3① decode 开销曲线
-    // 运行：cargo test --bin feiyin-ime -- --ignored --nocapture poc_361_timestamp_curve
-    // 只读复用生产 recognizer（create_qwen3_recognizer_at），不手搓 config。
-    // ============================================================
-    /// 一次完整解码，返回**原始** `OfflineRecognizerResult`（为了看 timestamps/durations/tokens）。
-    fn decode_full_result(
-        rec: &sherpa_onnx::OfflineRecognizer,
-        samples: &[f32],
-        rate: i32,
-    ) -> (sherpa_onnx::OfflineRecognizerResult, f64) {
-        let stream = rec.create_stream();
-        stream.accept_waveform(rate, samples);
-        let t0 = Instant::now();
-        rec.decode(&stream);
-        let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        (stream.get_result().expect("result"), ms)
-    }
-
-    #[test]
-    #[ignore = "PoC: cargo test --bin feiyin-ime -- --ignored --nocapture poc_361_timestamp_curve"]
-    fn poc_361_timestamp_curve() {
-        let root = manifest_dir();
-        let rec = create_qwen3_recognizer_at(
-            &root.join("models/sherpa-onnx-qwen3-asr-1.7B-int8-2026-09-22"),
-        )
-        .expect("1.7B");
-        let (fs, rate) = read_wav(&root, "collab/research/audio-real-gavin/processed/full.wav");
-        println!(
-            "POC361 machine cores={} acc_threads={} full_dur={:.2}s",
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(0),
-            default_acc_num_threads(),
-            fs.len() as f64 / rate as f64
-        );
-
-        // ---- RP-1：时间戳可用性（full.wav 0-20s，内容已知）----
-        println!("POC361 === RP-1 timestamps ===");
-        let n20 = (rate * 20).min(fs.len());
-        let (r, ms) = decode_full_result(&rec, &fs[..n20], rate as i32);
-        println!(
-            "POC361 ts decode={:.0}ms text_chars={} tokens_len={}",
-            ms,
-            r.text.chars().count(),
-            r.tokens.len()
-        );
-        match &r.timestamps {
-            Some(v) => {
-                let first: Vec<String> = v.iter().take(8).map(|x| format!("{x:.3}")).collect();
-                let last: Vec<String> = v.iter().rev().take(3).map(|x| format!("{x:.3}")).collect();
-                let mono = v.windows(2).all(|w| w[0] <= w[1] + 1e-6);
-                println!(
-                    "POC361 ts Some len={} monotonic={} first8={:?} last3={:?}",
-                    v.len(),
-                    mono,
-                    first,
-                    last
-                );
-            }
-            None => println!("POC361 ts None"),
-        }
-        match &r.durations {
-            Some(v) => println!(
-                "POC361 dur Some len={} first3={:?}",
-                v.len(),
-                v.iter().take(3).collect::<Vec<_>>()
-            ),
-            None => println!("POC361 dur None"),
-        }
-        println!(
-            "POC361 ts text_head={} tokens_first12={:?}",
-            head(&r.text, 40),
-            r.tokens.iter().take(12).collect::<Vec<_>>()
-        );
-
-        // ---- RP-3①：decode 开销曲线（递增前缀，每步新建 stream）----
-        println!("POC361 === RP-3 decode 开销曲线 ===");
-        let mut texts: Vec<(usize, String)> = Vec::new();
-        for secs in [1usize, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 25, 30, 40, 56] {
-            let n = (rate * secs).min(fs.len());
-            let (r, ms) = decode_full_result(&rec, &fs[..n], rate as i32);
-            println!(
-                "POC361 curve secs={} decode={:.0}ms text_chars={} head={}",
-                secs,
-                ms,
-                r.text.chars().count(),
-                head(&r.text, 30)
-            );
-            texts.push((secs, r.text));
-        }
-
-        // ---- 重解前文稳定性：短前缀文本是否为长前缀文本的前缀 ----
-        println!("POC361 === 重解前文稳定性 ===");
-        let norm = |t: &str| super::Transcriber::strip_asr_special_tokens(t.trim());
-        for w in texts.windows(2) {
-            let (s1, t1) = &w[0];
-            let (s2, t2) = &w[1];
-            let n1 = norm(t1);
-            let n2 = norm(t2);
-            println!(
-                "POC361 stable {s1}s->{s2}s is_prefix_of_next={} chars {}->{}",
-                n2.starts_with(&n1),
-                n1.chars().count(),
-                n2.chars().count()
-            );
-        }
-        // 同一前缀重复解码是否逐字稳定
-        let n10 = (rate * 10).min(fs.len());
-        let (a, _) = decode_full_result(&rec, &fs[..n10], rate as i32);
-        let (b, _) = decode_full_result(&rec, &fs[..n10], rate as i32);
-        println!(
-            "POC361 repeat 10s identical={} chars_a={} chars_b={}",
-            a.text == b.text,
-            a.text.chars().count(),
-            b.text.chars().count()
-        );
-    }
 }
 
 // ============================================================
@@ -10750,26 +10510,20 @@ mod diag425_tests {
 
     /// 裸解码（**不剥**前缀）：看模型原始输出（空？只前缀？）。
     fn raw_decode(
-        rec: &sherpa_onnx::OfflineRecognizer,
+        rec: &crate::transcription::AccEngine,
         samples: &[f32],
         lang: Option<&str>,
     ) -> String {
-        let stream = rec.create_stream();
-        if let Some(l) = lang {
-            stream.set_option("language", l);
-        }
-        stream.accept_waveform(16000, samples);
-        rec.decode(&stream);
-        stream
-            .get_result()
-            .map(|r| r.text.trim().to_string())
+        // ACC-452：迁至 llama.cpp 引擎（language ⇒ assistant 预填）。
+        rec.decode(samples, None, lang, None, None)
+            .map(|r| r.raw.trim().to_string())
             .unwrap_or_default()
     }
 
     /// 生产同款解码（`decode_accuracy_allow_empty` + 390 cap，无注入）。
-    fn prod_decode(rec: &sherpa_onnx::OfflineRecognizer, samples: &[f32]) -> String {
+    fn prod_decode(rec: &crate::transcription::AccEngine, samples: &[f32]) -> String {
         let cap = max_new_tokens_for(samples.len() as f32 / 16000.0);
-        decode_accuracy_allow_empty(rec, samples, None, ChineseScript::Simplified, Some(cap))
+        decode_accuracy_allow_empty(rec, samples, None, ChineseScript::Simplified, Some(cap), None)
             .map(|(t, l)| format!("{t} (lang={l:?})"))
             .unwrap_or_else(|e| format!("<ERR {e}>"))
     }

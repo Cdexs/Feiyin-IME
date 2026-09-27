@@ -108,7 +108,7 @@ fn poc_voiceprint_short_444() {
             return String::new();
         }
         let cap = max_new_tokens_for(s.len() as f32 / RATE as f32);
-        decode_accuracy_allow_empty(&acc, s, None, ChineseScript::Simplified, Some(cap))
+        decode_accuracy_allow_empty(&acc, s, None, ChineseScript::Simplified, Some(cap), None)
             .map(|(t, _)| t)
             .unwrap_or_default()
     };

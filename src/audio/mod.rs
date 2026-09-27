@@ -2573,44 +2573,15 @@ mod tests {
         println!("[GATE335] 下一步：用 envelope-1ms.txt 量 attack；切 A/B 片段后跑 gate335_asr_ab");
     }
 
-    /// Qwen3 识别器：与生产 `create_qwen3_recognizer` 同清单/同参
-    /// （max_total_len=4096、max_new_tokens=256、temperature=1e-6、top_p=0.8、seed=42、hotwords=None）。
-    /// 生产那份对 `audio` 模块不可见，故此处按 `src/transcription/mod.rs` 的清单复刻同一组文件与参数。
-    fn gate335_qwen3_recognizer(model_root: &Path) -> sherpa_onnx::OfflineRecognizer {
-        let d = model_root.join(crate::transcription::QWEN3_MODEL_SUBDIR);
-        assert!(
-            d.join("conv_frontend.onnx").exists()
-                && d.join("encoder.int8.onnx").exists()
-                && d.join("decoder.int8.onnx").exists()
-                && d.join("tokenizer").exists(),
-            "Qwen3 模型不齐：{}",
-            d.display()
-        );
-        let mut cfg = sherpa_onnx::OfflineRecognizerConfig::default();
-        cfg.model_config = sherpa_onnx::OfflineModelConfig {
-            num_threads: 8,
-            provider: Some("cpu".to_string()),
-            debug: false,
-            qwen3_asr: sherpa_onnx::OfflineQwen3ASRModelConfig {
-                conv_frontend: Some(d.join("conv_frontend.onnx").to_string_lossy().into_owned()),
-                encoder: Some(d.join("encoder.int8.onnx").to_string_lossy().into_owned()),
-                decoder: Some(d.join("decoder.int8.onnx").to_string_lossy().into_owned()),
-                tokenizer: Some(d.join("tokenizer").to_string_lossy().into_owned()),
-                max_total_len: 4096,
-                max_new_tokens: 256,
-                temperature: 1e-6,
-                top_p: 0.8,
-                seed: 42,
-                hotwords: None,
-            },
-            ..Default::default()
-        };
-        sherpa_onnx::OfflineRecognizer::create(&cfg).expect("create qwen3 recognizer failed")
+    /// Qwen3 识别器：直接走生产 `create_qwen3_recognizer`（ACC-452 起为 llama.cpp 引擎，已对 crate 可见，
+    /// 不再在此复刻一份配置）。
+    fn gate335_qwen3_recognizer(model_root: &Path) -> crate::transcription::AccEngine {
+        crate::transcription::create_qwen3_recognizer(model_root).expect("create qwen3 engine failed")
     }
 
     /// 走生产解码入口（`transcribe_acc_ctx`，空上下文 ⇒ 与生产「无前文」档位同路径）。
     fn gate335_decode(
-        rec: &sherpa_onnx::OfflineRecognizer,
+        rec: &crate::transcription::AccEngine,
         samples_16k: &[f32],
     ) -> Result<String, String> {
         crate::transcription::transcribe_acc_ctx(
@@ -2624,6 +2595,7 @@ mod tests {
                 speech_ranges: None,
                 streaming_nonempty: false,
                 new_slice_from: 0,
+                draft: None,
             },
         )
         .map(|(t, _, _)| t)

@@ -2602,3 +2602,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 行为变化 | 无（输出逐位不变）；每次录音首窗精解少等一次模型加载 |
 | 对 macOS 的影响 | 平台中立，macOS 编译同一份；无签名 / 依赖变化 |
 | 是否需要对方同步 | 否 |
+
+## ACC-ENGINE-LLAMACPP-452（2026-09-27，主控）· 1.7B 精解换 llama.cpp（DEC-093）
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | Qwen3-ASR 1.7B 解码由 sherpa-onnx 换 llama.cpp：`native/llama_asr/shim.cpp`（build.rs 经 cc 编译，全平台）+ `src/transcription/llama_asr.rs`；模型 `models/qwen3-asr-1.7b-gguf/`（Q8_0 + mmproj f16 + tokenizer）；本地实时恢复词库注入；词库变更不再触发重载 |
+| 行为变化 | 精解更准（回放 CER 7.87%→4.63%）、更快；输出形态不变，管线其余环节不动 |
+| 对 macOS 的影响 | 🔴 **必须同步**：shim 已写 `dlopen` 分支（加载 exe 同目录 `libggml-base/libggml/libllama/libmtmd.dylib`），需取 llama.cpp b11207 `llama-b11207-bin-macos-arm64.tar.gz`（含 Metal）放到 `.app/Contents/MacOS`，并下载同一 GGUF 模型；`LlamaAsr::runtime_dir` 在 macOS 探测 `libllama.dylib`。未在 macOS 实测 |
+| 构建 | 新增 build-dependency `cc`（全平台），macOS 需可用的 C++17 编译器（Xcode CLT） |

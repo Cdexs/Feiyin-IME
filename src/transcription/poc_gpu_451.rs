@@ -65,7 +65,7 @@ fn poc_gpu_451_sherpa_baseline() {
     std::fs::create_dir_all(&clip_dir).unwrap();
     let decode = |s: &[f32]| -> String {
         let cap = max_new_tokens_for(s.len() as f32 / RATE as f32);
-        decode_accuracy_allow_empty(&acc, s, None, ChineseScript::Simplified, Some(cap))
+        decode_accuracy_allow_empty(&acc, s, None, ChineseScript::Simplified, Some(cap), None)
             .map(|(t, _)| t)
             .unwrap_or_default()
     };
@@ -135,6 +135,7 @@ fn poc_gpu_451_sherpa_lang_zh() {
                 ChineseScript::Simplified,
                 Some(cap),
                 Some("Chinese"),
+                None,
             )
             .map(|(t, _)| t)
             .unwrap_or_default()
@@ -151,4 +152,140 @@ fn poc_gpu_451_sherpa_lang_zh() {
         let _ = writeln!(tsv, "{name}\t{secs:.2}\t{ms}\t{text}");
     }
     std::fs::write(out_dir.join("sherpa-lang.tsv"), tsv).unwrap();
+}
+
+/// 扩大样本：扫 `target/release/debug-audio` 与 `collab/evidence/**` 全部 `session-*.wav`（按文件名去重），
+/// 同 baseline 口径切片剪静音 + sherpa 基线解码。写 `../poc-451/clips-all/` 与 `sherpa-all.tsv`。
+#[test]
+#[ignore = "POC-GPU-451：需真模型 + 录音；--ignored 运行"]
+fn poc_gpu_451_sherpa_baseline_all() {
+    fn walk(d: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(d) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.file_name().is_some_and(|n| {
+                n.to_string_lossy().starts_with("session-") && n.to_string_lossy().ends_with(".wav")
+            }) {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&root().join("target/release/debug-audio"), &mut files);
+    walk(&root().join("collab/evidence"), &mut files);
+    files.sort_by_key(|p| p.file_name().unwrap().to_owned());
+    files.dedup_by_key(|p| p.file_name().unwrap().to_owned());
+    let models = root().join("models");
+    let vad = VadSegmenter::try_new_for_local_trim(&models).expect("VAD 须在位");
+    let acc = create_qwen3_recognizer(&models).expect("1.7B 须在位");
+    let out_dir = root().join("../poc-451");
+    let clip_dir = out_dir.join("clips-all");
+    std::fs::create_dir_all(&clip_dir).unwrap();
+    let mut tsv = String::from("clip\taudio_secs\tms\ttext\n");
+    let mut warmed = false;
+    for path in &files {
+        let Some(w) = sherpa_onnx::Wave::read(path.to_str().unwrap()) else {
+            continue;
+        };
+        if w.sample_rate() as usize != RATE {
+            continue;
+        }
+        let samples = w.samples().to_vec();
+        let stem = path
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .replace("session-", "");
+        for (k, chunk) in samples.chunks(CHUNK_SECS * RATE).enumerate() {
+            let used: Vec<f32> = vad
+                .speech_ranges(chunk)
+                .iter()
+                .flat_map(|&(a, b)| chunk[a..b.min(chunk.len())].iter().copied())
+                .collect();
+            if used.len() < RATE / 2 {
+                continue;
+            }
+            let name = format!("{stem}_{k:02}.wav");
+            write_wav16(&clip_dir.join(&name), &used);
+            let cap = max_new_tokens_for(used.len() as f32 / RATE as f32);
+            let run = || {
+                decode_accuracy_allow_empty(
+                    &acc,
+                    &used,
+                    None,
+                    ChineseScript::Simplified,
+                    Some(cap),
+                    None,
+                )
+                .map(|(t, _)| t)
+                .unwrap_or_default()
+            };
+            if !warmed {
+                let _ = run();
+                warmed = true;
+            }
+            let t0 = std::time::Instant::now();
+            let text = run();
+            let ms = t0.elapsed().as_millis();
+            let _ = writeln!(
+                tsv,
+                "{name}\t{:.2}\t{ms}\t{text}",
+                used.len() as f32 / RATE as f32
+            );
+        }
+    }
+    println!("files={}", files.len());
+    std::fs::write(out_dir.join("sherpa-all.tsv"), tsv).unwrap();
+}
+
+/// ACC-ENGINE-LLAMACPP-452 引擎自检：新引擎（进程内 llama.cpp）解 `clips-all`，
+/// 与 llama-server 贪心结果（`llama-g-q8mf16.tsv`）逐字比对；再以 sherpa 基线文字作草稿跑推测解码，
+/// 验证「草稿不改变输出」与提速。写 `../poc-451/engine-plain.tsv` / `engine-draft.tsv`。
+#[test]
+#[ignore = "ACC-452：需 GGUF 模型 + llama.cpp 运行库；--ignored 运行"]
+fn acc452_engine_equivalence() {
+    use super::llama_asr::LlamaAsr;
+    let eng = LlamaAsr::load(&root().join("models")).expect("engine");
+    println!("device={}", eng.device());
+    let out_dir = root().join("../poc-451");
+    let base = std::fs::read_to_string(out_dir.join("sherpa-all.tsv")).unwrap();
+    for (label, use_draft) in [("engine-plain", false), ("engine-draft", true)] {
+        let mut tsv = String::from("clip\taudio_secs\tms\ttext\n");
+        let (mut tot, mut pre, mut gen, mut acc, mut prop) = (0u128, 0f64, 0f64, 0i64, 0i64);
+        for (i, line) in base.lines().skip(1).enumerate() {
+            let c: Vec<&str> = line.split('\t').collect();
+            let w = sherpa_onnx::Wave::read(out_dir.join("clips-all").join(c[0]).to_str().unwrap())
+                .unwrap();
+            let s = w.samples().to_vec();
+            let secs: f32 = c[1].parse().unwrap();
+            let cap = (secs * 12.0).ceil() as i32 + 16;
+            let draft = if use_draft { c.get(3).copied() } else { None };
+            if i == 0 {
+                let _ = eng.decode(&s, None, None, Some(cap.max(32)), draft);
+            }
+            let t0 = std::time::Instant::now();
+            let o = eng
+                .decode(&s, None, None, Some(cap.max(32)), draft)
+                .expect("decode");
+            let ms = t0.elapsed().as_millis();
+            tot += ms;
+            pre += o.stats.prefill_ms;
+            gen += o.stats.gen_ms;
+            acc += o.stats.n_draft_accepted as i64;
+            prop += o.stats.n_draft_proposed as i64;
+            let _ = writeln!(
+                tsv,
+                "{}\t{}\t{ms}\t{}",
+                c[0],
+                c[1],
+                o.raw.replace(['\n', '\t'], " ")
+            );
+        }
+        println!(
+            "{label}: total={tot}ms prefill={pre:.0}ms gen={gen:.0}ms draft_accept={acc}/{prop}"
+        );
+        std::fs::write(out_dir.join(format!("{label}.tsv")), tsv).unwrap();
+    }
 }

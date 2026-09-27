@@ -23,6 +23,7 @@ node_modules
 /vendor/sherpa-onnx/*-shared-lib.tar.bz2
 /vendor/sherpa-onnx/*-shared-lib/
 /vendor/whisper-rs-sys/
+/vendor/llama-runtime/
 
 # ===== Python =====
 __pycache__/

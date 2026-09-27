@@ -8107,7 +8107,7 @@ fn set_auto_start(enabled: bool) -> Result<()> {
 /// ASR-DUAL-B-001: 加载 hotwords 字符串（使用 accuracy 引擎的档位需要）
 /// 从 wordbook 读取所有单词，按 id 排序保证哈希稳定，构建逗号分隔字符串
 /// performance 模式返回 None（不支持 hotwords）
-// LOCALRT-NO-HOTWORDS-396（DEC-083）：本地实时 B 路径 1.7B **不再注入词库** —— 注入时首解异常率 28%
+// LOCALRT-NO-HOTWORDS-396（DEC-083，已被 DEC-093 推翻，452 起本地实时恢复注入）：当年 sherpa 注入时首解异常率 28%
 //（窗空 / 坍塌 2 字 / 念出词条 / 截尾 / 跳到词条），不注入重解均完整。词库只在开启 LLM 优化时生效。
 // 🔴 判据：`AsrModel::LocalRealtime` 在读词库**之前**早退 `None`；`AsrModel::Accuracy` 行为逐位不变。
 // FIX-LOCALRT-ENGINE-EQ-252（已被 396 取代）：原判据「LocalRealtime 的最终转录引擎也是 accuracy（带
@@ -8115,10 +8115,9 @@ fn set_auto_start(enabled: bool) -> Result<()> {
 // MACOS-P4-NEUTRAL-002: 平台中立纯 Rust（AsrModel 判定 + wordbook 读取 + build_hotwords_string）。
 fn load_hotwords_for_accuracy(config: &AppConfig) -> Option<String> {
     let model = transcription::AsrModel::from_config(&config.audio.asr_model);
-    // LOCALRT-NO-HOTWORDS-396（DEC-083）：本地实时不注入词库（在读词库之前早退）。
-    if model == transcription::AsrModel::LocalRealtime {
-        return None;
-    }
+    // ACC-ENGINE-LLAMACPP-452（DEC-093，推翻 DEC-083）：本地实时恢复词库注入。
+    // 原 396 早退源于 sherpa 注入时 28% 异常；换 llama.cpp 后 452 回放（真实词库 19 条、120 窗）
+    // CER 5.20%→4.63%、无新增空窗 / 重复 / 念词表。Gavin「注入词库……直接接入吧」。
     if !model.uses_accuracy_engine() {
         return None;
     }
@@ -8516,12 +8515,11 @@ fn spawn_worker_thread(
                     };
                     // R2-4: transcriber.is_none() 时无条件尝试重建（启动失败自愈）
                     let needs_rebuild = transcriber.is_none() && !asr_reload_in_flight;
-                    // FIX-LOCALRT-ENGINE-EQ-252: 判据收敛到 uses_accuracy_engine()——
-                    // LocalRealtime 也用 accuracy 引擎的热词，词库变更时需同样触发重载。
-                    let needs_reload = cheap_needed
-                        || (desired_asr_model.uses_accuracy_engine()
-                            && active_hotwords_version != desired_hotwords_version)
-                        || needs_rebuild;
+                    // ACC-ENGINE-LLAMACPP-452：词库变更**不再触发引擎重载** —— Qwen3 引擎构造时不使用词库
+                    //（320 起词库随每次解码传入，每次录音开始读库，见 `acc_terms`），重载只白白重建 2.5GB 模型；
+                    // 452 起本地实时恢复词库注入，自动学习每加一词都会触发，可能与录音开始撞车。
+                    // `active_hotwords_version` / `desired_hotwords_version` 仅保留作日志。
+                    let needs_reload = cheap_needed || needs_rebuild;
                     if needs_reload && !asr_reload_in_flight {
                         log::info!(
                             "Triggering ASR transcriber hot-reload: model {:?}->{:?}, hotwords_version {}->{}, online_asr_changed={}, needs_rebuild={}",
@@ -9017,6 +9015,7 @@ fn spawn_worker_thread(
                                                         window_ranges,
                                                         streaming_nonempty,
                                                         new_slice_from,
+                                                        hints,
                                                     ) in trx
                                                     {
                                                         // 382（3C）：排队时间 = 派发 → worker 开始解码。
@@ -9033,6 +9032,7 @@ fn spawn_worker_thread(
                                                             window_ranges.as_deref(),
                                                             streaming_nonempty,
                                                             new_slice_from,
+                                                            &hints,
                                                         );
                                                         let ms = t0.elapsed().as_secs_f64() * 1000.0;
                                                         // 382（3C）：解码完成时刻（端到端「解完 → 浮层重画」）。
@@ -9559,6 +9559,9 @@ fn spawn_worker_thread(
                                                         window_ranges,
                                                         streaming_nonempty,
                                                         new_slice_from,
+                                                        AccHints {
+                                                            draft: window_streaming.clone(),
+                                                        },
                                                     ));
                                                     // 413：窗实际只含 `[must_start-1, ge)`（无前文时 = `[gs,ge)`）
                                                     // ⇒ 对齐 span 同步收窄，`window_samples.len() == ge - span_start`。
@@ -9622,6 +9625,9 @@ fn spawn_worker_thread(
                                                         None, // 407：部分前片 ⇒ 传 None 回退自跑 VAD
                                                         streaming_nonempty,
                                                         new_slice_from,
+                                                        AccHints {
+                                                            draft: streaming.clone(),
+                                                        },
                                                     ));
                                                     window_split_fracs.push(win_split_frac);
                                                     window_spans.push((gs, ge));
@@ -10133,6 +10139,7 @@ fn spawn_worker_thread(
                                                     speech_ranges: None,
                                                     streaming_nonempty: false,
                                                     new_slice_from: 0,
+                                                    draft: None,
                                                 };
                                                 match transcription::transcribe_acc_ctx(
                                                     rec,
@@ -11336,7 +11343,7 @@ fn shift_and_concat_ranges(
 /// 是判据 #3「seg_index 有序拼接」的纯函数载体（可单测，无需真模型）。
 // SLIDING-WINDOW-367：单窗口解码（窗口音频 + 注入集中一处）。
 fn decode_window(
-    recognizer: &sherpa_onnx::OfflineRecognizer,
+    recognizer: &transcription::AccEngine,
     window_audio: &[f32],
     window_seq: usize,
     script: config::ChineseScript,
@@ -11349,6 +11356,8 @@ fn decode_window(
     streaming_nonempty: bool,
     // SPEAKER-VERIFY-408B：本窗新片起点样本下标（声纹注册只计新片）。
     new_slice_from: usize,
+    // ACC-452：本窗解码提示（② 预览草稿）。
+    hints: &AccHints,
 ) -> anyhow::Result<(String, bool, transcription::AccDropStats)> {
     transcription::transcribe_acc_ctx(
         recognizer,
@@ -11361,6 +11370,7 @@ fn decode_window(
             speech_ranges,
             streaming_nonempty,
             new_slice_from,
+            draft: (!hints.draft.is_empty()).then_some(hints.draft.as_str()),
         },
     )
 }
@@ -12800,7 +12810,15 @@ type AccTaskMsg = (
     Option<Vec<(usize, usize)>>,
     bool,
     usize,
+    AccHints,
 );
+
+/// ACC-ENGINE-LLAMACPP-452：本窗解码提示（随任务派发）。上文注入经 452 回放未采用（加在词库之上 CER 4.63%→4.80%）。
+#[derive(Default, Clone)]
+struct AccHints {
+    /// ② 本窗预览（流式）文字 ⇒ 推测解码草稿（只省时间，不改输出）。
+    draft: String,
+}
 
 /// FIX-PREVIEW-HARVEST-380（A）：滑窗线程的一步（新切片 / 解码结果）。
 enum AccWindowStep<A, R> {
@@ -12874,13 +12892,14 @@ mod fix406_tests {
     }
 }
 
-/// LOCALRT-NO-HOTWORDS-396（DEC-083）：`load_hotwords_for_accuracy` 对本地实时档早退 `None`。
+/// ACC-ENGINE-LLAMACPP-452（DEC-093，推翻 DEC-083）：`load_hotwords_for_accuracy` 对本地实时档**不再早退**，
+/// 与 Accuracy 档同样读词库注入（原 396 护栏已反转）。
 #[cfg(test)]
 mod fix396_tests {
-    /// 源码护栏：`load_hotwords_for_accuracy` 函数体内，对 `AsrModel::LocalRealtime` 的早退出现在
-    /// **读词库（`Wordbook::open(`）之前**，且早退分支确实以 `LocalRealtime` 为条件。
+    /// 源码护栏：`load_hotwords_for_accuracy` 函数体内**不得**再对 `AsrModel::LocalRealtime` 早退；
+    /// 仍保留 `uses_accuracy_engine()` 门（在线 / 快速档不读词库），且在读词库之前。
     #[test]
-    fn fix396_local_realtime_returns_none_before_wordbook_read() {
+    fn fix396_local_realtime_reads_wordbook_since_452() {
         let src = include_str!("main.rs");
         let body = src
             .split("fn load_hotwords_for_accuracy(")
@@ -12893,24 +12912,15 @@ mod fix396_tests {
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        let early = code
-            .find("AsrModel::LocalRealtime")
-            .expect("396：LocalRealtime 早退判据缺失");
-        let read = code.find("Wordbook::open(").expect("396：读词库调用缺失");
         assert!(
-            early < read,
-            "396：LocalRealtime 早退必须在读词库之前（early={early} read={read}）"
+            !code.contains("AsrModel::LocalRealtime"),
+            "452：LocalRealtime 不得再早退（DEC-093 恢复本地实时词库注入）"
         );
-        // 早退条件必须绑定 LocalRealtime（而非其它变体）。
-        assert!(
-            code.contains("== transcription::AsrModel::LocalRealtime"),
-            "396：早退条件必须 `== AsrModel::LocalRealtime`"
-        );
-        // Accuracy 路径不变：仍保留 uses_accuracy_engine() 门。
-        assert!(
-            code.contains("uses_accuracy_engine()"),
-            "396：Accuracy 路径的 uses_accuracy_engine() 门不得删除"
-        );
+        let gate = code
+            .find("uses_accuracy_engine()")
+            .expect("452：uses_accuracy_engine() 门不得删除");
+        let read = code.find("Wordbook::open(").expect("读词库调用缺失");
+        assert!(gate < read, "uses_accuracy_engine() 门须在读词库之前");
     }
 }
 

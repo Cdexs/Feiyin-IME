@@ -115,15 +115,16 @@ fn check_accuracy_model_ready() -> AccuracyModelStatus {
     // 🔴 src-tauri 是独立 crate，无法复用 `transcription::QWEN3_MODEL_SUBDIR`，
     // 故此处镜像同一组文件名——两处判据必须逐字一致，否则 UI 显示「已就位」而主程序加载失败。
     // MIGRATE-1.13.8-1.7B-359：随主程序同步切到 1.7B 目录名。
-    let dir = model_dir.join("sherpa-onnx-qwen3-asr-1.7B-int8-2026-09-22");
-    let ready = dir.join("conv_frontend.onnx").exists()
-        && dir.join("encoder.int8.onnx").exists()
-        && dir.join("decoder.int8.onnx").exists()
-        && dir.join("tokenizer").exists();
+    // ACC-ENGINE-LLAMACPP-452：精解引擎换 llama.cpp ⇒ 镜像主程序 `check_qwen3_model_ready`
+    //（`llama_asr::LLAMA_ASR_MODEL_SUBDIR` / `LLAMA_ASR_MODEL_FILE` / `LLAMA_ASR_MMPROJ_FILE` + tokenizer.json）。
+    let dir = model_dir.join("qwen3-asr-1.7b-gguf");
+    let ready = dir.join("Qwen3-ASR-1.7B-Q8_0.gguf").exists()
+        && dir.join("mmproj-Qwen3-ASR-1.7B-f16.gguf").exists()
+        && dir.join("tokenizer").join("tokenizer.json").exists();
     AccuracyModelStatus {
         ready,
         model_dir: dir.display().to_string(),
-        download_url: "https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models".to_string(),
+        download_url: "https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF".to_string(),
     }
 }
 

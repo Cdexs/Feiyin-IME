@@ -98,7 +98,7 @@ fn fixed_cuts(total: usize, hard_secs: f64, offset_secs: f64) -> Vec<(usize, usi
 /// 逐片走**生产解码函数** `transcribe_acc_ctx`（与 `decode_window` 同参：Simplified / terms / avg=None），
 /// 返回 (拼接文本, 每片文本, 解码秒)。打印每片区间与文本。
 fn decode_cuts(
-    rec: &sherpa_onnx::OfflineRecognizer,
+    rec: &crate::transcription::AccEngine,
     audio: &[f32],
     cuts: &[(usize, usize)],
     terms: Option<&str>,
@@ -114,6 +114,7 @@ fn decode_cuts(
             speech_ranges: None,
             streaming_nonempty: false,
             new_slice_from: 0,
+            draft: None,
         };
         let t0 = Instant::now();
         let (text, _, _) =
@@ -184,7 +185,7 @@ fn slice_into_subsegments(audio: &[f32]) -> Vec<Vec<f32>> {
 /// §5：复刻 main.rs 逐片组窗 + `OrderedReflow::push_window` 合并（单线程串行解码）。
 /// 返回 (最终文本, 窗口数, 平均窗秒, 最大窗秒, 零重叠拼接次数)。
 fn run_windows(
-    rec: &sherpa_onnx::OfflineRecognizer,
+    rec: &crate::transcription::AccEngine,
     sub_segs: &[Vec<f32>],
     cap: f32,
     terms: Option<&str>,
@@ -231,6 +232,7 @@ fn run_windows(
                 speech_ranges: None,
                 streaming_nonempty: false,
                 new_slice_from: 0,
+                draft: None,
             },
         )
         .unwrap_or_default();
