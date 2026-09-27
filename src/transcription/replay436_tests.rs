@@ -1746,3 +1746,179 @@ fn clip_tail(s: &str, n: usize) -> String {
     let c: Vec<char> = s.chars().collect();
     c[c.len().saturating_sub(n)..].iter().collect()
 }
+
+/// ACC-452 ⑤ 回缩回放：按浮层真实合成（`reflow_preview`）模拟每次半截显示前后的显示长度。
+/// 原始预览 ≈ 各片流式文字依次拼接（生产为整段流式，近似）；整窗边界 = 截至本片的预览字数。
+/// 对照：旧做法（按整窗边界替换）vs 新做法（`partial_reflow_boundary` 现算边界）的回缩次数。
+#[test]
+#[ignore = "ACC-452 回缩回放：cargo test --bin feiyin-ime replay452_shrink -- --ignored --nocapture"]
+fn replay452_shrink() {
+    use std::sync::Mutex as StdMutex;
+    crate::transcription::speaker::TEST_EXTRACTOR_MISSING.with(|c| c.set(true));
+    let root = manifest_dir();
+    let models = root.join("models");
+    let acc = create_qwen3_recognizer(&models).expect("Qwen3 GGUF 须在位");
+    let st_rec =
+        crate::transcription::local_stream::create_local_stream_recognizer(&models).expect("流式");
+    let terms = load_real_wordbook_terms();
+    let run_stream = |audio: &[f32]| -> String {
+        let stream = st_rec.create_stream();
+        for c in audio.chunks(1600) {
+            stream.accept_waveform(RATE as i32, c);
+            while st_rec.is_ready(&stream) {
+                st_rec.decode(&stream);
+            }
+        }
+        stream.input_finished();
+        while st_rec.is_ready(&stream) {
+            st_rec.decode(&stream);
+        }
+        st_rec
+            .get_result(&stream)
+            .map(|r| r.text.clone())
+            .unwrap_or_default()
+    };
+    let (mut events, mut shrink_old, mut shrink_new, mut shown_new) =
+        (0usize, 0usize, 0usize, 0usize);
+    let (mut big_old, mut big_new, mut max_new) = (0usize, 0usize, 0usize);
+    for wav in collect_wavs(&root) {
+        let Some((audio, rate)) = read_wav(&wav) else {
+            continue;
+        };
+        if rate as usize != RATE {
+            continue;
+        }
+        let mut pieces: Vec<(usize, usize)> = Vec::new();
+        for (s, e) in dispatch_slices(&audio) {
+            pieces.extend(vad::plan_gap_cuts(&audio, s, e));
+        }
+        let mut reflow = OrderedReflow::new();
+        let (mut raw, mut state_acc, mut state_len, mut last_auth) =
+            (String::new(), String::new(), 0usize, String::new());
+        for (i, &(ps, pe)) in pieces.iter().enumerate() {
+            raw.push_str(&run_stream(&audio[ps..pe]));
+            let window_end = raw.chars().count();
+            let mut waudio: Vec<f32> = Vec::new();
+            let mut wsamples: Vec<usize> = Vec::new();
+            if i >= 1 {
+                let prev = &audio[pieces[i - 1].0..pieces[i - 1].1];
+                let cs = crate::take_context_suffix(prev, "", "", RATE_CPS);
+                waudio.extend_from_slice(&prev[cs.cut.min(prev.len())..]);
+                wsamples.push(cs.suffix_samples);
+            }
+            waudio.extend_from_slice(&audio[ps..pe]);
+            wsamples.push(pe - ps);
+            let span_start = i.saturating_sub(1);
+            let split = crate::window_overlap_split(
+                span_start,
+                if i >= 1 { Some(i) } else { None },
+                &waudio,
+                &wsamples,
+            );
+            let stream_text = run_stream(&waudio);
+            let partials: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
+            let last = StdMutex::new(Instant::now());
+            let cb = |r: &str| {
+                let mut l = last.lock().unwrap();
+                if l.elapsed() >= std::time::Duration::from_millis(150) {
+                    *l = Instant::now();
+                    partials.lock().unwrap().push(r.to_string());
+                }
+            };
+            let inject = CtxInject {
+                terms: terms.as_deref(),
+                avg_chars_per_sec: None,
+                speech_ranges: None,
+                streaming_nonempty: !stream_text.trim().is_empty(),
+                new_slice_from: wsamples[..wsamples.len() - 1].iter().sum(),
+                assist: crate::transcription::llama_asr::DecodeAssist {
+                    draft: Some(stream_text.as_str()),
+                    on_partial: Some(&cb),
+                },
+            };
+            let text = transcribe_acc_ctx(&acc, &waudio, ChineseScript::Simplified, i, inject)
+                .map(|(t, _, _)| t)
+                .unwrap_or_default();
+            let mut shown_len = last_auth.chars().count();
+            for r in partials.lock().unwrap().iter() {
+                if !r.contains("<asr_text>") {
+                    continue;
+                }
+                let p = crate::text_normalizer::normalize_text_for_language(
+                    Transcriber::strip_asr_special_tokens(r.trim()).trim(),
+                    ChineseScript::Simplified,
+                );
+                if p.is_empty() || !partial_past_overlap(&p, &stream_text, &wsamples) {
+                    continue;
+                }
+                let mut probe = reflow.clone();
+                let Some(c) = probe
+                    .push_window_streaming(
+                        i,
+                        span_start,
+                        i + 1,
+                        wsamples.clone(),
+                        p,
+                        stream_text.clone(),
+                        split,
+                    )
+                    .last()
+                    .map(|c| crate::apply_authoritative_filler_dedup(c))
+                else {
+                    continue;
+                };
+                if c.chars().count() <= shown_len {
+                    continue;
+                }
+                shown_len = c.chars().count();
+                events += 1;
+                let before = crate::reflow_preview(&state_acc, &raw, state_len)
+                    .chars()
+                    .count();
+                let after_old = crate::reflow_preview(&c, &raw, window_end).chars().count();
+                if after_old < before {
+                    shrink_old += 1;
+                    if before - after_old > 2 {
+                        big_old += 1;
+                    }
+                }
+                // 同生产最后一道保护：新显示比当前短 > 2 字 ⇒ 跳过本次。
+                if let Some(b) =
+                    crate::partial_reflow_boundary(&state_acc, state_len, &c, &raw, window_end)
+                        .filter(|&b| {
+                            crate::reflow_preview(&c, &raw, b).chars().count() + 2 >= before
+                        })
+                {
+                    shown_new += 1;
+                    let after_new = crate::reflow_preview(&c, &raw, b).chars().count();
+                    if after_new < before {
+                        shrink_new += 1;
+                        max_new = max_new.max(before - after_new);
+                        if before - after_new > 2 {
+                            big_new += 1;
+                        }
+                    }
+                    state_acc = c;
+                    state_len = b;
+                }
+            }
+            if let Some(f) = reflow
+                .push_window_streaming(
+                    i,
+                    span_start,
+                    i + 1,
+                    wsamples.clone(),
+                    text,
+                    stream_text,
+                    split,
+                )
+                .last()
+            {
+                last_auth = crate::apply_authoritative_filler_dedup(f);
+                state_acc = last_auth.clone();
+                state_len = window_end;
+            }
+        }
+    }
+    println!("[452r] 半截事件 {events}：旧做法回缩 {shrink_old} 次（>2 字 {big_old}）；新做法显示 {shown_new} 次、回缩 {shrink_new} 次（>2 字 {big_new}，最大 {max_new} 字）");
+}

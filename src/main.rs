@@ -189,6 +189,10 @@ enum PipelineEvent {
         /// **不含该段对应的流式文字**；`acc_text` 为空时也按此合成（不被 `compose_with_acc_for_gen`
         /// 的「acc 空 ⇒ 原样 raw」规则短路）。其余场景恒 `false`（逐位不变）。
         non_user_hide: bool,
+        /// ACC-ENGINE-LLAMACPP-452 ⑤：`true` ⇒ **精解半截结果**（流式回灌）。`committed_len` 为本窗替换边界上限；
+        /// 消费端按 `partial_reflow_boundary` 现算「精解写到原始预览的哪个位置」作本次替换边界，
+        /// 显示 = 半截精解 + 预览中尚未解到的部分（不回缩）；不走整窗回灌的边界配对。
+        partial: bool,
     },
     /// LOCALRT-SEAM-337（自适应定界）：本片边界冻结通知。
     ///
@@ -7552,6 +7556,7 @@ fn process_controller_events(
                 replace_all,
                 decode_done_at,
                 non_user_hide,
+                partial,
             } => {
                 // 325：本地实时档 accuracy 分片权威文本回灌（**只有本地档会发本事件**）。
                 // 代际门与 StreamingText 同源：陈旧 session 的回灌不得改本 session 浮层。
@@ -7591,7 +7596,64 @@ fn process_controller_events(
                 // 337：PreviewReflow 不再直接渲染 ⇒ preview_len 恒 0（实际渲染在 ReflowCommit 臂）。
                 let preview_len = 0usize;
                 if action == ReflowAction::Applied {
-                    if replace_all {
+                    if partial {
+                        // ACC-ENGINE-LLAMACPP-452 ⑤：流式回灌 —— 边界现算（精解写到原始预览的位置），
+                        // 显示 = 半截精解 + 预览中尚未解到的部分（不回缩）；Processing 已开始 ⇒ 不画。
+                        if !ACC_REFLOW_SUPPRESS.load(Ordering::Acquire) {
+                            let (prev_acc, prev_len) = ACC_REFLOW_STATE
+                                .lock()
+                                .ok()
+                                .and_then(|st| st.clone())
+                                .filter(|(g, _, _)| *g == generation)
+                                .map(|(_, a, l)| (a, l))
+                                .unwrap_or_default();
+                            let raw = last_raw_streaming_text
+                                .lock()
+                                .ok()
+                                .and_then(|m| m.clone())
+                                .filter(|(g, _)| *g == generation)
+                                .map(|(_, t)| t)
+                                .unwrap_or_default();
+                            if let Some(b) = partial_reflow_boundary(
+                                &prev_acc,
+                                prev_len,
+                                &acc_text,
+                                &raw,
+                                committed_len,
+                            )
+                            // 最后一道：新显示比当前短 > 容差 ⇒ 跳过本次（回放：边界估计偏差致 3% 次回缩 3~5 字）。
+                            // 少 ≤ 容差字属正常内容修正（精解去掉预览里的口水词）。
+                            .filter(|&b| {
+                                let cur = last_streaming_text
+                                    .lock()
+                                    .ok()
+                                    .and_then(|m| m.clone())
+                                    .map_or(0, |s| s.chars().count());
+                                reflow_preview(&acc_text, &raw, b).chars().count()
+                                    + PARTIAL_SHRINK_TOLERANCE
+                                    >= cur
+                            }) {
+                                ACC_REFLOW_LAST_REFLOW_SEQ.store(key, Ordering::Release);
+                                if let Ok(mut st) = ACC_REFLOW_FAST.lock() {
+                                    st.note_partial(generation, seg_index);
+                                }
+                                render_authoritative_reflow(
+                                    overlay_handle,
+                                    opacity,
+                                    ui_language,
+                                    last_streaming_text,
+                                    last_raw_streaming_text,
+                                    generation,
+                                    seg_index,
+                                    &acc_text,
+                                    b,
+                                    false,
+                                    None,
+                                    false,
+                                );
+                            }
+                        }
+                    } else if replace_all {
                         // 382（3A）：**立即渲染** —— 不再等同片 ReflowCommit 边界配对（唯一发送点恒
                         // replace_all，等边界只会白白延迟）。已知边界 ⇒ 用准确的；未知 ⇒ 用派发当刻
                         // `committed_len` 先渲染，边界后到且本 seg 仍是最新已渲染 ⇒ 再用准确值重渲一次。
@@ -9132,6 +9194,9 @@ fn spawn_worker_thread(
                                                                 let cand_len = candidate.chars().count();
                                                                 let shown = partial_shown_len
                                                                     .max(last_authoritative.chars().count());
+                                                                // 替换边界不在这里定：事件带 `partial: true`，`committed_len` 只作本窗
+                                                                // 边界**上限**；浮层按 `partial_reflow_boundary` 现算精解写到预览的位置
+                                                                //（BUILD-452 端测回缩：曾按整窗边界替换，5 字半截吞掉 21 字预览）。
                                                                 if cand_len > shown {
                                                                     partial_shown_len = cand_len;
                                                                     if log::log_enabled!(log::Level::Debug) {
@@ -9159,6 +9224,7 @@ fn spawn_worker_thread(
                                                                         replace_all: true,
                                                                         decode_done_at: None,
                                                                         non_user_hide: false,
+                                                                        partial: true,
                                                                     });
                                                                     reflow_seq += 1;
                                                                 }
@@ -9448,6 +9514,7 @@ fn spawn_worker_thread(
                                                                 // 382（3C）：本窗解码完成时刻（端到端埋点）。
                                                                 decode_done_at: Some(decode_done_at),
                                                                 non_user_hide: false,
+                                                                partial: false,
                                                             },
                                                         );
                                                         reflow_seq += 1;
@@ -9474,6 +9541,7 @@ fn spawn_worker_thread(
                                                                 replace_all: true,
                                                                 decode_done_at: Some(decode_done_at),
                                                                 non_user_hide: true,
+                                                                partial: false,
                                                             },
                                                         );
                                                         reflow_seq += 1;
@@ -11555,6 +11623,61 @@ fn reflow_preview(acc_text: &str, streaming: &str, committed_len: usize) -> Stri
     out.extend(streaming.chars().skip(committed_len));
     out
 }
+
+/// ACC-ENGINE-LLAMACPP-452 ⑤：流式回灌的替换边界（纯函数）—— 精解半截结果「写到了原始预览的哪个位置」。
+///
+/// - `prev_acc` / `prev_len`：当前已生效的权威文本及其在原始预览中的边界（上次回灌）；
+/// - `candidate`：试拼出的半截全文；`raw`：原始预览；`window_end`：本窗替换边界上限（整窗回灌的边界）。
+///
+/// 做法：从 `prev_len` 起按「半截新增有效字数」在 `raw` 中往后数得估计位置；再用 `candidate` 末尾两个有效字
+/// 在估计位置 ±[`PARTIAL_BOUNDARY_SLACK`] 字内对齐校准（取最近者）。结果须在 `(prev_len, window_end]` 内，
+/// 否则 `None`（本次不刷新）。显示 = `candidate` + `raw[边界..]` ⇒ 预览里尚未解到的字保留，不回缩。
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))] // 消费端（controller 臂）仅 Windows
+fn partial_reflow_boundary(
+    prev_acc: &str,
+    prev_len: usize,
+    candidate: &str,
+    raw: &str,
+    window_end: usize,
+) -> Option<usize> {
+    let is_eff = |c: &char| c.is_alphanumeric();
+    let raw: Vec<char> = raw.chars().collect();
+    let end = window_end.min(raw.len());
+    let start = prev_len.min(end);
+    let cand_eff: Vec<char> = candidate.chars().filter(is_eff).collect();
+    let prev_eff = prev_acc.chars().filter(is_eff).count();
+    let n_new = cand_eff.len().checked_sub(prev_eff).filter(|&n| n > 0)?;
+    // 估计位置：从 start 起数 n_new 个有效字。
+    let (mut p, mut seen) = (start, 0usize);
+    while p < end && seen < n_new {
+        if is_eff(&raw[p]) {
+            seen += 1;
+        }
+        p += 1;
+    }
+    // 校准：末尾两个有效字在估计位置附近的最近匹配（匹配终点 = 第二个字之后）。
+    if cand_eff.len() >= 2 {
+        let (a, b) = (cand_eff[cand_eff.len() - 2], cand_eff[cand_eff.len() - 1]);
+        let eff_idx: Vec<usize> = (start..end).filter(|&i| is_eff(&raw[i])).collect();
+        let best = eff_idx
+            .windows(2)
+            .filter(|w| raw[w[0]] == a && raw[w[1]] == b)
+            .map(|w| w[1] + 1)
+            .filter(|&q| q.abs_diff(p) <= PARTIAL_BOUNDARY_SLACK)
+            .min_by_key(|&q| q.abs_diff(p));
+        if let Some(q) = best {
+            p = q;
+        }
+    }
+    (p > start && p <= end).then_some(p)
+}
+
+/// ACC-452 ⑤：流式回灌允许的显示缩短（字）—— 精解去掉预览里的口水词属正常修正；超过即跳过本次刷新。
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const PARTIAL_SHRINK_TOLERANCE: usize = 2;
+
+/// ACC-452 ⑤：替换边界校准的搜索半径（字）。
+const PARTIAL_BOUNDARY_SLACK: usize = 4;
 
 /// ACC-REFLOW-PERSIST-329：流式渲染/镜像前的权威前缀合成。
 ///
@@ -15100,6 +15223,12 @@ struct ReflowFastState {
 
 #[cfg(target_os = "windows")]
 impl ReflowFastState {
+    /// ACC-452 ⑤：流式回灌渲染了 `(gen, seg)` 的半截结果 ⇒ 登记为最近渲染，
+    /// 使**上一窗**晚到的边界不再用旧全文重画（否则盖掉半截结果 = 回缩）。
+    fn note_partial(&mut self, gen: u64, seg: usize) {
+        self.rendered = Some((gen, seg));
+    }
+
     fn clear(&mut self) {
         self.latest = None;
         self.bounds.clear();
@@ -23193,6 +23322,55 @@ mod partial_reflow_452_tests {
         );
         assert!(body.contains(concat!("seq == ordered.", "next_seq()")));
         assert!(body.contains(concat!("if cand_len > ", "shown")));
+        assert!(
+            body.contains(concat!("partial: ", "true,")),
+            "半截事件须带 partial 标记（浮层按精解位置定边界）"
+        );
         assert!(prod.contains(concat!("stream_partial_reflow!(seq, ", "idx, raw)")));
+    }
+}
+
+/// ACC-452 ⑤：流式回灌替换边界（BUILD-452 端测「回缩」回归）。
+#[cfg(test)]
+mod partial_boundary_452_tests {
+    use super::{partial_reflow_boundary, reflow_preview};
+
+    /// 端测现场：预览 24 字（整窗边界 21），精解半截只出 5 字 ⇒ 边界应≈5，显示不回缩（仍 24 字）。
+    /// 旧实现按整窗边界 21 替换 ⇒ 5 + 3 = 8 字（回缩）。
+    #[test]
+    fn t452_partial_does_not_shrink_preview() {
+        let raw = "周末有空吗一起出来玩吧可以一起出去旅游然后到周边";
+        assert_eq!(raw.chars().count(), 24);
+        let cand = "周末有空吗";
+        let b = partial_reflow_boundary("", 0, cand, raw, 21).expect("有新内容应给边界");
+        assert_eq!(b, 5, "末尾两字「空吗」对齐到预览第 5 字之后");
+        let shown = reflow_preview(cand, raw, b);
+        assert_eq!(shown.chars().count(), 24, "显示不得短于回灌前（{shown}）");
+        assert!(shown.starts_with("周末有空吗一起"));
+    }
+
+    /// 精解与预览用字不同：末尾对不上 ⇒ 按新增字数估计；边界不越过整窗上限、不小于上次边界。
+    #[test]
+    fn t452_boundary_estimate_and_clamps() {
+        let raw = "今天天气很好我们出去走走吧"; // 13 字
+        let b = partial_reflow_boundary("今天", 2, "今天天汽很", raw, 10).unwrap();
+        assert_eq!(b, 5, "新增 3 字（汽≠气 对不上）⇒ 从 2 往后数 3 个");
+        assert_eq!(
+            partial_reflow_boundary("今天天气很好", 6, "今天天气很好", raw, 10),
+            None,
+            "无新增 ⇒ 不刷新"
+        );
+        let b2 = partial_reflow_boundary("", 0, "今天天气很好我们出去走走吧啊", raw, 10).unwrap();
+        assert_eq!(b2, 10, "不越过整窗边界上限");
+    }
+
+    /// 末尾两字在估计位置附近有匹配 ⇒ 以匹配为准（精解比预览多 / 少一字时不错位）。
+    #[test]
+    fn t452_tail_alignment_corrects_estimate() {
+        let raw = "嗯我们周末去公园散步吧";
+        // 精解去掉了口水词「嗯」，新增 4 有效字 ⇒ 估计停在「周」后（raw 第 4 字），末尾「周末」对齐到第 5 字后。
+        let b = partial_reflow_boundary("", 0, "我们周末", raw, 11).unwrap();
+        assert_eq!(b, 5);
+        assert_eq!(reflow_preview("我们周末", raw, b), "我们周末去公园散步吧");
     }
 }
