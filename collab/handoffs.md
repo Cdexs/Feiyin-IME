@@ -155,3 +155,9 @@
 - 1.7B 精解换 llama.cpp（Q8_0 + f16，Vulkan / CPU 自动选）+ 预览草稿 + 本地实时恢复词库（DEC-093）；回放 CER 7.87%→4.63%、精解 ~2.2×。
 - 出包前须 `powershell -ExecutionPolicy Bypass -File scripts\fetch-llama-runtime.ps1`（运行库 20 个 dll + GGUF 模型同步到 target / Publish，sha256 校验）。
 - 端测看：日志 `[ACC-452] Qwen3-ASR llama.cpp engine loaded: device=…`（应为显卡名）、`[ACC-452] decode: … prefill=…ms gen=…ms draft=a/p`。
+
+## 2026-09-27 — 主控 — BUILD-452（450 + 452 ①②③⑤）✅ 出包，待 Gavin 端测
+
+- 内容：精解换 llama.cpp（Vulkan，Q8_0 + f16）+ 预览草稿 + 本地实时恢复词库 + 流式回灌 + 首窗预热（450）。回放 CER 7.87%→4.63%、精解 ~2.2×、流式回灌平均提前 199ms（闪烁 0.7%）。
+- 端测看：① 精解结果是否更准（专有名词 / 词库词）② 预览是否更快被精解刷新、刷新是否逐步出现 ③ 有没有闪回（中途文字又被改掉）④ 日志 `[ACC-452] decode: … prefill=…ms gen=…ms draft=a/p`、`[ACC-452] partial reflow`。
+- ⚠️ 词库变更不再触发模型重载（下一次录音自动生效）；`Publish/config.toml` 当前档位为 performance（快速档，不走新引擎），target/release 为 local_realtime。
