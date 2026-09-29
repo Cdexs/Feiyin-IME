@@ -1,11 +1,11 @@
 ﻿; Voice IME Inno Setup Script
-; Version: 0.9.3
+; Version: 0.9.4
 ; Compile with: Inno Setup 6.x (https://jrsoftware.org/isinfo.php)
 ; RELEASE-ISS-FROM-PUBLISH-400：全部产物改从 ..\Publish\ 取；安装包不带模型（Gavin 定）。
 
 #define MyAppName      "飞音语音输入"
 #define MyAppNameEn    "Voice IME"
-#define MyAppVersion   "0.9.3"
+#define MyAppVersion   "0.9.4"
 #define MyAppPublisher "Feiyin Voice Input Project"
 #define MyAppURL       ""
 #define MyAppExeName   "feiyin-ime.exe"
