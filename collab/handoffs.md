@@ -195,3 +195,14 @@
 - 0.6B 强制对齐接入本地实时，窗口接缝按逐字时间拼接；删 416/431/433/435/436 估算链与旧测试、pinyin 依赖。
 - 验证：全量 bin 1904P/0F/71I；对齐器 112 窗与 CrispASR 逐字一致；回放接缝重复 5→0、CER 4.80%、闪烁 5.2%、回缩 0；显存 1.60G / 每窗 248ms。
 - 下一步：派 tester-1 TEST-EXEC + BUILD-456（Publish 须经 fetch 脚本同步对齐模型三件套）。
+
+## 2026-09-29 — tester-1 — TEST-EXEC-456 ✅ 回归全绿 + BUILD-456 ✅ 出包（版本 0.9.4）
+
+- **回归**：bin **1904P/0F/71I**（＝预期）/ root 1992P/0F/73I / src-tauri 92P/0F/0I / Vitest 100P/11skip / fmt EXIT 0；NEW 20 全绿、GONE 9 模块 0 命中。⚠️ `interior436_tests` 实际未删（4 条仍绿，`window_overlap_split` 仍被生产调用），与任务书 GONE 清单不符，如实上报，不影响 1904 计数。
+- **出包九项全 PASS**：①21:09:17 / 21:06:10 / 21:07:14 ②两副本全等、三件异于 454：main `5d60c1d8…` / ui `0dc5bd41…` / crash `24952e98…` ③0.9.4.0（ui 0.9.4）④冒烟 PID 69408 Responding / 无 crash ⑤config `da2be5da…` 三时点不变 ⑥90/9 ⑦正 `aligner-backbone-q8_0.gguf` main1/ui1 + `[ALIGN-456] aligner attached` main1，反 `[DBG-416] seam:`/`[DBG-433] win:` main0/ui0 ⑧四 toml 三副本全等 ⑨VC 五件 == Redist 14.44.35112。
+- **模型**：对齐器三件 sha `1b5ea4c2…`/`7117f45d…`/`8a3f5ed7…` 全对；1.7B 照旧；Publish 无 f16 mmproj；20 DLL 三处一致。冒烟 engine `device=AMD Radeon 780M Graphics` + `[ALIGN-456] aligner attached`、启动无 NLLB 加载；`window align` 日志因无语音输入未取到（如实说明）。
+- **红线**：未改生产代码 / 版本未动 / 未 push / 零凭证。报告 `collab/outbox/tester-1/result.md`。
+
+## 2026-09-29 — tester-1 — TEST-EXEC + BUILD-456 ✅（FORCED-ALIGN-456，v0.9.4）
+
+- 回归 1904P/0F/71I；九项全 PASS；产物 main `5d60c1d8…` / ui `0dc5bd41…` / crash `24952e98…`；主控抽查通过。待 Gavin 端测。
