@@ -2155,6 +2155,35 @@ fn replay455_timed_seam() {
                 (true, None) => ps as f32 / RATE as f32,
                 _ => win_abs,
             };
+            // DUMP455=<目录>：导出每窗音频 / 精解文字 / 几何，供外部对齐器（0.6B ForcedAligner）离线复算。
+            if let Ok(dir) = std::env::var("DUMP455") {
+                let dir = PathBuf::from(dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                let stem = format!("{name}_{i:02}");
+                write_wav16_455(&dir.join(format!("{stem}.wav")), &waudio);
+                std::fs::write(dir.join(format!("{stem}.txt")), &text).unwrap();
+                if i == 0 {
+                    if let Some(r) = reference.as_deref() {
+                        std::fs::write(dir.join(format!("{name}.ref.txt")), r).unwrap();
+                    }
+                }
+                let ov = if i >= 1 {
+                    wsamples[0] as f32 / waudio.len().max(1) as f32
+                } else {
+                    0.0
+                };
+                use std::io::Write as _;
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join("meta.jsonl"))
+                    .unwrap();
+                writeln!(
+                    f,
+                    "{{\"session\":\"{name}\",\"i\":{i},\"stem\":\"{stem}\",\"win_abs\":{win_abs},\"t_split\":{t_split},\"ov\":{ov},\"ctc_rate\":{mrate}}}"
+                )
+                .unwrap();
+            }
             if !text.trim().is_empty() {
                 let before = timed.len();
                 let tchars: Vec<char> = text.chars().collect();
@@ -2261,4 +2290,27 @@ fn replay455_timed_seam() {
     let dir = root.join("collab/evidence/455");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("replay455.md"), report).unwrap();
+}
+
+/// 16-bit PCM 单声道 16kHz WAV（DUMP455 导出用）。
+fn write_wav16_455(path: &Path, s: &[f32]) {
+    let data: Vec<u8> = s
+        .iter()
+        .flat_map(|&x| ((x.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes())
+        .collect();
+    let mut b: Vec<u8> = Vec::with_capacity(44 + data.len());
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    b.extend_from_slice(&16u32.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&(RATE as u32).to_le_bytes());
+    b.extend_from_slice(&(RATE as u32 * 2).to_le_bytes());
+    b.extend_from_slice(&2u16.to_le_bytes());
+    b.extend_from_slice(&16u16.to_le_bytes());
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    b.extend_from_slice(&data);
+    std::fs::write(path, b).unwrap();
 }
