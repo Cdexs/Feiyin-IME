@@ -174,3 +174,18 @@
 - **验证**：全量 bin 1979P/0F/74I；fmt clean；warnings 90；src-tauri check 通过。
 - **待办**：整机显存复测（工具检查报错中断）；出包等 Gavin 指令；端测看 `emb_cached=true` 命中数与显存。
 - **红线**：未 push；版本 0.9.3 未动；零凭证。
+
+## 2026-09-29 — tester-1 — TEST-EXEC-454 ✅ 阶段四全量回归（全绿）· 阶段五待令
+
+- **性质**：阶段四回归（MEM-453 + VOICEPRINT-EMB-CACHE-454），HEAD `5ed28de`，工作区无生产代码改动。阶段五 BUILD-454 🔴 挂起等主控「现在可以出包」。
+- **回归（全绿 0F）**：root `cargo test --no-fail-fast` **2067P/0F/76I**（bin `feiyin-ime` **1979P/0F/74I**）；`src-tauri` **92P/0F/0I**；Vitest **7 files / 100P / 11 skip**；`cargo fmt --check` **EXIT 0**。
+- **NEW/GONE 对账**：基线 BUILD-452b root 2069P/76I → **2067P/76I**、bin 1981P/74I → **1979P/74I**，逐位吻合。NEW 4 = `emb_cache_454_tests::{t454_same_audio_reuses_embedding,t454_changed_audio_recomputes,t454_filter_uses_cache_and_judges_fresh}` + `mem453_translation_engine_lazy_loaded`；GONE 6 = 旧 `translation_needs_reload_*` 全 0 命中。`migrate320_qwen3_readiness_checks_four_paths` 照常绿。
+- **warnings**：`cargo check` EXIT 0，`generated` main **90**（基线 91，−1）/ crash **9**；poc_halluc 1 + 依赖 ct2-sys 18 不计基线（全文件 `^warning` 125 为二者之和 + build 脚本提示，非本批新增）。
+- **失效模式**：精解引擎加载 / 翻译懒加载 / 声纹判定三条重点全部绿，无命中。
+- **阶段五 BUILD-454 出包（主控放行「现在可以出包」）**：Step2 npm 1.40s + Tauri custom-protocol 1m50s(17w) + cp；Step3 3m12s（main 90w / crash 9w）；Step4 三 exe + 四张规则 toml 同步；`fetch-llama-runtime.ps1 -Targets target\release,Publish`（20 DLL + Q8 编码器，无下载）。
+- **九项全 PASS**：①main 15:34:47/ui 15:31:26/crash 15:32:44 ②两副本全等且三件异于 452b（main `3147909227…`/ui `596e1bda…`/crash `557d6b76…`；⚠️ crash 源未改，198 B 元数据抖动 = CodeView GUID + winres 项序，已如实说明）③0.9.3.0 ④冒烟 PID 111168 Responding/无 crash ⑤config `da2be5da…` 三时点不变 ⑥90/9 ⑦正 Q8 探针 main1/ui1 + `emb_cached=` main1，反 f16 main0/ui0 ⑧四 toml 三副本全等 ⑨VC 五件 == Redist 14.44.35112。Publish 无 f16 mmproj；模型 sha Q8_0 `58e22d05…`/mmproj Q8_0 `46c1d533…`/tokenizer `aeb13307…`；llama 20 DLL 三处一致；冒烟 engine device=AMD Radeon 780M Graphics、启动无 NLLB 加载。
+- **红线**：未改生产代码、版本 0.9.3 未动、未 push、零凭证。报告 `collab/outbox/tester-1/result.md`。
+
+## 2026-09-29 — tester-1 — TEST-EXEC + BUILD-454 ✅（453 + 454）
+
+- 全量 2067P/0F/76I；九项全 PASS；产物 main `31479092…` / ui `596e1bda…` / crash `557d6b76…`；Publish 编码器仅 Q8_0；冒烟正常、启动无 NLLB 加载。结果 `collab/outbox/tester-1/result.md`。主控抽查通过。待 Gavin 端测。
