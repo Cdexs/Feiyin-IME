@@ -118,8 +118,9 @@ fn check_accuracy_model_ready() -> AccuracyModelStatus {
     // ACC-ENGINE-LLAMACPP-452：精解引擎换 llama.cpp ⇒ 镜像主程序 `check_qwen3_model_ready`
     //（`llama_asr::LLAMA_ASR_MODEL_SUBDIR` / `LLAMA_ASR_MODEL_FILE` / `LLAMA_ASR_MMPROJ_FILE` + tokenizer.json）。
     let dir = model_dir.join("qwen3-asr-1.7b-gguf");
+    // MEM-453：音频编码器 f16 → Q8_0。
     let ready = dir.join("Qwen3-ASR-1.7B-Q8_0.gguf").exists()
-        && dir.join("mmproj-Qwen3-ASR-1.7B-f16.gguf").exists()
+        && dir.join("mmproj-Qwen3-ASR-1.7B-Q8_0.gguf").exists()
         && dir.join("tokenizer").join("tokenizer.json").exists();
     AccuracyModelStatus {
         ready,

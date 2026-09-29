@@ -148,7 +148,11 @@ extern "C" las_engine * las_create(const char * model_path, const char * mmproj_
     llama_context_params cp = p_llama_context_default_params();
     cp.n_ctx = (uint32_t) n_ctx;
     cp.n_batch = 512;
-    cp.n_ubatch = 512;
+    // MEM-453：ubatch 512→128 计算缓冲 305→76MiB，KV f16→q8_0 448→238MiB（容量仍 4096）。
+    // 780M 实测预填充 ≤+3%、生成不变；28 片回放 ub128 / kvq8 均与基线逐字一致。
+    cp.n_ubatch = 128;
+    cp.type_k = GGML_TYPE_Q8_0;
+    cp.type_v = GGML_TYPE_Q8_0;
     cp.n_seq_max = 1;
     cp.n_threads = n_threads;
     cp.n_threads_batch = n_threads_batch;

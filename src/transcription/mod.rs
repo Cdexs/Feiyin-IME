@@ -4374,7 +4374,7 @@ fn create_sensevoice_recognizer(
 /// - 🔴 上下文总长 `N_CTX = 4096` 与原 sherpa `max_total_len=4096` 同额度：
 ///   **`HOTWORDS_MAX_TOTAL_TOKENS=3000` 即由 4096 反推**（20s 音频 ~260 + 生成 256 + 词库 ≤3000），二者耦合，不得单改。
 /// - 生成默认上限 256、贪心解码，与原 sherpa 全局 `max_new_tokens=256` / 近贪心一致。
-/// - 调参依据（Flash Attention / 编码器上 GPU / KV f16 / 线程分设）见 `collab/research/gpu-accel-451.md`。
+/// - 调参依据（Flash Attention / 编码器上 GPU / 线程分设）见 `collab/research/gpu-accel-451.md`；KV q8_0 / ubatch 128 / 编码器 Q8_0 见 MEM-453。
 pub(crate) fn create_qwen3_recognizer(model_dir: &Path) -> Result<AccEngine> {
     let (ready, dir) = check_qwen3_model_ready(model_dir);
     if !ready {

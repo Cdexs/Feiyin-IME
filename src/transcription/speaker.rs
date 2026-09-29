@@ -526,6 +526,49 @@ pub(crate) fn warm_speaker_extractor() {
     with_speaker_extractor(|_| ());
 }
 
+/// VOICEPRINT-EMB-CACHE-454：单元声纹向量缓存，键 = 单元拼接音频的指纹（逐样本位模式哈希 + 样本数）。
+///
+/// 滑窗重叠 ⇒ 同一段话在相邻窗里切出**边界相同**的单元，拼接音频逐位相同 ⇒ 直接复用向量
+///（CAM++ 每次约 20ms）；边界一变（窗头截断、与新话合并）音频即不同 ⇒ 自然重算。
+/// 只缓存向量、不缓存判定：`judge_voiceprint` 每次仍按**当前**声纹档案比对 ⇒ 判定与不缓存逐位相同。
+static EMB_CACHE: Mutex<Option<std::collections::HashMap<(u64, usize), Option<Vec<f32>>>>> =
+    Mutex::new(None);
+/// 缓存条数上限（满即清空；一次录音的窗内单元远少于此，跨录音音频不会重复命中）。
+const EMB_CACHE_MAX: usize = 256;
+
+fn audio_key(samples: &[f32]) -> (u64, usize) {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for s in samples {
+        h.write_u32(s.to_bits());
+    }
+    (h.finish(), samples.len())
+}
+
+/// 取单元声纹向量：命中缓存直接返回（第二元 `true`），否则调 `embed` 计算并记入。
+fn embed_cached(
+    samples: &[f32],
+    embed: impl FnOnce(&[f32]) -> Option<Vec<f32>>,
+) -> (Option<Vec<f32>>, bool) {
+    let key = audio_key(samples);
+    if let Some(hit) = EMB_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&key))
+    {
+        return (hit.clone(), true);
+    }
+    let emb = embed(samples);
+    let mut guard = EMB_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    if map.len() >= EMB_CACHE_MAX {
+        map.clear();
+    }
+    map.insert(key, emb.clone());
+    (emb, false)
+}
+
 /// 声纹存档路径：`<exe 目录>/voiceprint.bin`（与 `wordbook.sqlite` 同目录约定）。
 pub(crate) fn voiceprint_path() -> PathBuf {
     std::env::current_exe()
@@ -726,17 +769,18 @@ pub(crate) fn filter_ranges_by_voiceprint(
         let mut ri = 0usize; // ranges 游标（unit 的成员按序对应 ranges）
         for unit in &units {
             let unit_secs = unit.speech_samples as f32 / SAMPLE_RATE as f32;
-            let (verdict, emb) = if unit_secs < MIN_JUDGE_SECS {
-                (SegVerdict::KeepShort, None)
+            let (verdict, emb, emb_cached) = if unit_secs < MIN_JUDGE_SECS {
+                (SegVerdict::KeepShort, None, false)
             } else {
                 // 拼接单元内**全部语音样本**（不含间隔）算一次声纹。
                 let mut buf: Vec<f32> = Vec::with_capacity(unit.speech_samples);
                 for &(s, e) in &unit.members {
                     buf.extend_from_slice(&samples[s..e]);
                 }
-                let emb = verifier.embed(&buf);
+                // 454：相邻窗重复出现的同一单元复用向量（判定仍按当前档案现算）。
+                let (emb, cached) = embed_cached(&buf, |b| verifier.embed(b));
                 let v = judge_voiceprint(&proc.vp, emb.as_deref(), unit_secs);
-                (v, emb)
+                (v, emb, cached)
             };
             if log::log_enabled!(log::Level::Debug) {
                 let first =
@@ -744,13 +788,14 @@ pub(crate) fn filter_ranges_by_voiceprint(
                 let last =
                     unit.members.last().map(|m| m.1).unwrap_or(0) as f32 / SAMPLE_RATE as f32;
                 log::debug!(
-                    "[LocalRT-DBG-412] unit: win=- members={} speech={:.2}s span={:.2}-{:.2}s verdict={:?} score={:.3}",
+                    "[LocalRT-DBG-412] unit: win=- members={} speech={:.2}s span={:.2}-{:.2}s verdict={:?} score={:.3} emb_cached={}",
                     unit.members.len(),
                     unit_secs,
                     first,
                     last,
                     verdict,
-                    verdict_score(verdict)
+                    verdict_score(verdict),
+                    emb_cached
                 );
             }
             for _ in &unit.members {
@@ -2912,5 +2957,68 @@ mod fix432_tests {
             3,
             "封口后第三段另起、第四段间隔 0.8 不近邻也另起"
         );
+    }
+}
+
+#[cfg(test)]
+mod emb_cache_454_tests {
+    use super::embed_cached;
+    use std::cell::Cell;
+
+    /// 各用例用互不相同的音频（缓存为进程级，并行测试不互相命中）。
+    fn audio(seed: f32, n: usize) -> Vec<f32> {
+        (0..n).map(|i| seed + i as f32 * 1e-4).collect()
+    }
+
+    /// 同一音频第二次取向量 ⇒ 命中缓存、不再调提取器、结果逐位相同。
+    #[test]
+    fn t454_same_audio_reuses_embedding() {
+        let a = audio(0.454_1, 16000);
+        let calls = Cell::new(0);
+        let f = |b: &[f32]| {
+            calls.set(calls.get() + 1);
+            Some(vec![b.len() as f32, 1.0])
+        };
+        let (e1, c1) = embed_cached(&a, f);
+        let (e2, c2) = embed_cached(&a.clone(), f);
+        assert_eq!((c1, c2), (false, true));
+        assert_eq!(calls.get(), 1, "第二次不得再算");
+        assert_eq!(e1, e2);
+    }
+
+    /// 单元边界变了（音频差一个样本 / 长度不同）⇒ 重算，不复用。
+    #[test]
+    fn t454_changed_audio_recomputes() {
+        let a = audio(0.454_2, 16000);
+        let mut b = a.clone();
+        b[8000] += 1e-3;
+        let c = a[..15999].to_vec();
+        let calls = Cell::new(0);
+        let f = |_: &[f32]| {
+            calls.set(calls.get() + 1);
+            Some(vec![calls.get() as f32])
+        };
+        assert!(!embed_cached(&a, f).1);
+        assert!(!embed_cached(&b, f).1, "一个样本不同须重算");
+        assert!(!embed_cached(&c, f).1, "截短须重算");
+        assert_eq!(calls.get(), 3);
+    }
+
+    /// 源码护栏：生产判定处取向量须经缓存，判定仍现算（不缓存结论）。
+    #[test]
+    fn t454_filter_uses_cache_and_judges_fresh() {
+        let src = include_str!("speaker.rs");
+        let prod = src
+            .split(concat!("mod emb_cache", "_454_tests"))
+            .next()
+            .unwrap();
+        assert!(prod.contains("embed_cached(&buf, |b| verifier.embed(b))"));
+        assert!(!prod.contains("verifier.embed(&buf)"), "不得绕过缓存");
+        let i = prod.find("embed_cached(&buf").unwrap();
+        let j = prod[i..]
+            .find("judge_voiceprint(&proc.vp")
+            .map(|k| i + k)
+            .unwrap();
+        assert!(j - i < 300, "判定须紧随取向量现算");
     }
 }

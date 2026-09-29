@@ -1,5 +1,5 @@
 # ACC-ENGINE-LLAMACPP-452: fetch the pinned llama.cpp runtime (Vulkan build, b11207) and the
-# Qwen3-ASR 1.7B GGUF model (Q8_0 + f16 mmproj), verify sha256, and sync them next to the exe.
+# Qwen3-ASR 1.7B GGUF model (Q8_0 + Q8_0 mmproj), verify sha256, and sync them next to the exe.
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File scripts\fetch-llama-runtime.ps1
@@ -36,7 +36,8 @@ $ModelSub = "qwen3-asr-1.7b-gguf"
 $HfBase = "https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF/resolve/main"
 $Models = @(
     @{ Name = "Qwen3-ASR-1.7B-Q8_0.gguf"; Sha = "58e22d0532d4eacaf034cfac17a6fed159f37c41390c710186783be439d1fc57" },
-    @{ Name = "mmproj-Qwen3-ASR-1.7B-f16.gguf"; Sha = "5bc361e19bfdf3617c85247f9b706f7186ce0d156d9ed3c5d8bca8900b8fc3b7" }
+    # MEM-453: audio encoder Q8_0 (was f16).
+    @{ Name = "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"; Sha = "46c1d533af3f354ceb37ce855dbceff7da7fa7cf1e6a523df3b13440bd164c0d" }
 )
 
 function Get-Sha([string]$Path) { (Get-FileHash -Algorithm SHA256 -Path $Path).Hash.ToLower() }

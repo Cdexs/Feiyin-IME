@@ -2611,3 +2611,21 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 行为变化 | 精解更准（回放 CER 7.87%→4.63%）、更快；输出形态不变，管线其余环节不动 |
 | 对 macOS 的影响 | 🔴 **必须同步**：shim 已写 `dlopen` 分支（加载 exe 同目录 `libggml-base/libggml/libllama/libmtmd.dylib`），需取 llama.cpp b11207 `llama-b11207-bin-macos-arm64.tar.gz`（含 Metal）放到 `.app/Contents/MacOS`，并下载同一 GGUF 模型；`LlamaAsr::runtime_dir` 在 macOS 探测 `libllama.dylib`。未在 macOS 实测 |
 | 构建 | 新增 build-dependency `cc`（全平台），macOS 需可用的 C++17 编译器（Xcode CLT） |
+
+## MEM-453（2026-09-29，主控）· 精解省显存 + 翻译模型懒加载
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | `shim.cpp`：KV 缓存 q8_0、`n_ubatch` 128；音频编码器文件改 `mmproj-Qwen3-ASR-1.7B-Q8_0.gguf`（无 f16 回退）；`main.rs` worker 不再预加载 NLLB，只在本地翻译路径懒加载 |
+| 行为变化 | 显存约省 0.72G；回放识别基本不变（生产路径 CER 持平，较旧基线差 1 字）；首次本地翻译多一次模型加载 |
+| 对 macOS 的影响 | 🔴 **需同步模型文件**：macOS 包须下载 `mmproj-Qwen3-ASR-1.7B-Q8_0.gguf`（ggml-org 官方，sha `46c1d533…`）替代 f16，否则精解模型判为未就位。KV q8_0 需 Flash Attention，Metal 支持；代码平台中立，无签名变化 |
+| 是否需要对方同步 | 是（仅模型文件） |
+
+## VOICEPRINT-EMB-CACHE-454（2026-09-29，主控）· 声纹向量按音频指纹缓存
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | `speaker.rs` `embed_cached`：重叠窗里边界相同的单元复用 CAM++ 向量，判定仍按当前档案现算 |
+| 行为变化 | 无（判定 / 剔除 / 注册逐位不变）；每窗精解前少算重复单元 |
+| 对 macOS 的影响 | 平台中立，编译同一份；无签名 / 依赖变化 |
+| 是否需要对方同步 | 否 |

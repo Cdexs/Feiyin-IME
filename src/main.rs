@@ -8432,19 +8432,13 @@ fn spawn_worker_thread(
         // PERF-INIT-001: Pre-initialize LlmClient once; update_config() before each use.
         let mut llm_client = llm::LlmClient::new(config.llm.clone());
 
-        // PERF-INIT-001: Pre-initialize TranslationEngine once; hot-reload only on config change.
+        // MEM-453：NLLB（int8 ≈ 600MB，加载后因 CT2 析构死锁永不释放）改为**首次真正走本地翻译时**
+        // 才由 `ensure_translation_direction` 加载 —— 在线 LLM 翻译成功时不会走到本地模型，
+        // 未用翻译的会话不再常驻这 600MB。首次本地翻译多一次加载（实测约 0.3s）。
         let mut cached_translation: Option<(
             config::TranslationLanguage,
             translation::TranslationEngine,
-        )> = if config.translation.enabled {
-            translation::TranslationEngine::load_for_direction(
-                &model_dir,
-                config.translation.target_language,
-            )
-            .map(|engine| (config.translation.target_language, engine))
-        } else {
-            None
-        };
+        )> = None;
 
         // PUNCT-INTEGRATION-001: Pre-initialize PunctuationEngine once.
         let mut cached_punctuation: Option<punctuation::PunctuationEngine> =
@@ -8842,23 +8836,9 @@ fn spawn_worker_thread(
                         };
                         llm_client.update_config(config.llm.clone());
 
-                        let needs_reload = match &cached_translation {
-                            Some((lang, _)) => {
-                                !config.translation.enabled
-                                    || *lang != config.translation.target_language
-                            }
-                            None => config.translation.enabled,
-                        };
-                        if needs_reload {
-                            cached_translation = if config.translation.enabled {
-                                translation::TranslationEngine::load_for_direction(
-                                    &model_dir,
-                                    config.translation.target_language,
-                                )
-                                .map(|engine| (config.translation.target_language, engine))
-                            } else {
-                                None
-                            };
+                        // MEM-453：不再预加载；方向切换由 ensure_translation_direction 复用进程级模型。
+                        if !config.translation.enabled {
+                            cached_translation = None;
                         }
                         if config.punctuation.enabled && cached_punctuation.is_none() {
                             cached_punctuation = punctuation::PunctuationEngine::new(&model_dir);
@@ -10477,23 +10457,9 @@ fn spawn_worker_thread(
                             }
                         };
                         llm_client.update_config(config.llm.clone());
-                        let needs_reload = match &cached_translation {
-                            Some((lang, _)) => {
-                                !config.translation.enabled
-                                    || *lang != config.translation.target_language
-                            }
-                            None => config.translation.enabled,
-                        };
-                        if needs_reload {
-                            cached_translation = if config.translation.enabled {
-                                translation::TranslationEngine::load_for_direction(
-                                    &model_dir,
-                                    config.translation.target_language,
-                                )
-                                .map(|engine| (config.translation.target_language, engine))
-                            } else {
-                                None
-                            };
+                        // MEM-453：不再预加载；方向切换由 ensure_translation_direction 复用进程级模型。
+                        if !config.translation.enabled {
+                            cached_translation = None;
                         }
                         if config.punctuation.enabled && cached_punctuation.is_none() {
                             cached_punctuation = punctuation::PunctuationEngine::new(&model_dir);
@@ -10563,24 +10529,9 @@ fn spawn_worker_thread(
                     // PERF-INIT-001: Reuse pre-initialized LlmClient; update config only.
                     llm_client.update_config(config.llm.clone());
 
-                    // PERF-INIT-001: Hot-reload TranslationEngine only when enabled/direction changed.
-                    let needs_reload = match &cached_translation {
-                        Some((lang, _)) => {
-                            !config.translation.enabled
-                                || *lang != config.translation.target_language
-                        }
-                        None => config.translation.enabled,
-                    };
-                    if needs_reload {
-                        cached_translation = if config.translation.enabled {
-                            translation::TranslationEngine::load_for_direction(
-                                &model_dir,
-                                config.translation.target_language,
-                            )
-                            .map(|engine| (config.translation.target_language, engine))
-                        } else {
-                            None
-                        };
+                    // MEM-453：不再预加载 NLLB；方向切换由 ensure_translation_direction 复用进程级模型。
+                    if !config.translation.enabled {
+                        cached_translation = None;
                     }
                     // PUNCT-INTEGRATION-001: Hot-reload PunctuationEngine on config change.
                     if config.punctuation.enabled && cached_punctuation.is_none() {
@@ -16478,12 +16429,17 @@ fn run_llm_stage(
             PipelineEvent::Processing(processing_msg.to_string()),
         );
         // REFACTOR-SHARE-TRANSDIR-001: function moved to translation/mod.rs (platform-neutral)
-        let effective_engine: Option<&translation::TranslationEngine> =
-            translation::ensure_translation_direction(
-                cached_translation,
-                &model_dir,
-                derived_target,
-            );
+        // MEM-453：只在真要走本地 NLLB 时才取引擎（首次即加载）；在线 LLM 翻译成功则不加载。
+        let mut nllb_translate = |text: &str| {
+            try_nllb_translate(
+                text,
+                translation::ensure_translation_direction(
+                    cached_translation,
+                    &model_dir,
+                    derived_target,
+                ),
+            )
+        };
         let script_instruction = text_normalizer::script_instruction_for_translate(
             &raw_text,
             config.audio.chinese_script,
@@ -16515,7 +16471,7 @@ fn run_llm_stage(
                     }
                     Err(e) => {
                         log::warn!("LLM optimize+translate failed, trying offline: {}", e);
-                        try_nllb_translate(&pre_llm_text, effective_engine).unwrap_or_else(|| {
+                        nllb_translate(&pre_llm_text).unwrap_or_else(|| {
                             text_normalizer::normalize_text_for_language(
                                 &pre_llm_text,
                                 config.audio.chinese_script,
@@ -16525,7 +16481,7 @@ fn run_llm_stage(
                 }
             } else {
                 // LLM not eligible, use offline engine directly
-                try_nllb_translate(&pre_llm_text, effective_engine).unwrap_or_else(|| {
+                nllb_translate(&pre_llm_text).unwrap_or_else(|| {
                     text_normalizer::normalize_text_for_language(
                         &pre_llm_text,
                         config.audio.chinese_script,
@@ -16930,23 +16886,9 @@ fn try_nllb_translate(
         }
     }
 }
-/// PERF-INIT-001: Determine if TranslationEngine needs hot-reload based on config change.
-/// Extracted from spawn_worker_thread for testability.
-#[cfg(target_os = "windows")]
-fn translation_needs_reload(
-    cached: &Option<config::TranslationLanguage>,
-    enabled: bool,
-    target: config::TranslationLanguage,
-) -> bool {
-    match cached {
-        Some(lang) => !enabled || *lang != target,
-        None => enabled,
-    }
-}
 #[cfg(all(test, target_os = "windows"))]
 mod pipeline_logic_tests {
-    use super::{should_try_llm_translate, translation_needs_reload};
-    use crate::config::TranslationLanguage;
+    use super::should_try_llm_translate;
 
     #[test]
     fn llm_translate_requires_enabled_and_connectivity_verified() {
@@ -16957,76 +16899,31 @@ mod pipeline_logic_tests {
     }
 
     // ============================================================
-    // PERF-INIT-001: TranslationEngine hot-reload needs_reload tests
+    // MEM-453：NLLB 翻译引擎只在真正走本地翻译时加载（不预加载）
     // ============================================================
 
-    /// No cached engine + enabled = needs reload (first load)
+    /// 源码护栏：worker 启动 / 配置热重载都不得再直接加载 NLLB（600MB 常驻、CT2 析构死锁不可释放），
+    /// 本地翻译统一经 `ensure_translation_direction` 懒加载，且只在 NLLB 路径（LLM 不可用或失败）被调用。
     #[test]
-    fn translation_needs_reload_when_none_and_enabled() {
-        assert!(translation_needs_reload(
-            &None,
-            true,
-            TranslationLanguage::English
-        ));
-        assert!(translation_needs_reload(
-            &None,
-            true,
-            TranslationLanguage::Chinese
-        ));
-    }
-
-    /// No cached engine + disabled = no reload needed
-    #[test]
-    fn translation_no_reload_when_none_and_disabled() {
-        assert!(!translation_needs_reload(
-            &None,
-            false,
-            TranslationLanguage::English
-        ));
-    }
-
-    /// Cached engine + disabled = needs reload (to clear cache)
-    #[test]
-    fn translation_needs_reload_when_cached_but_disabled() {
-        let cached = Some(TranslationLanguage::English);
-        assert!(translation_needs_reload(
-            &cached,
-            false,
-            TranslationLanguage::English
-        ));
-    }
-
-    /// Cached engine + same target + enabled = no reload needed
-    #[test]
-    fn translation_no_reload_when_cached_same_target() {
-        let cached = Some(TranslationLanguage::English);
-        assert!(!translation_needs_reload(
-            &cached,
-            true,
-            TranslationLanguage::English
-        ));
-    }
-
-    /// Cached engine + different target = needs reload (direction changed)
-    #[test]
-    fn translation_needs_reload_when_cached_different_target() {
-        let cached = Some(TranslationLanguage::English);
-        assert!(translation_needs_reload(
-            &cached,
-            true,
-            TranslationLanguage::Chinese
-        ));
-    }
-
-    /// Cached Chinese + switch to English = needs reload
-    #[test]
-    fn translation_needs_reload_chinese_to_english() {
-        let cached = Some(TranslationLanguage::Chinese);
-        assert!(translation_needs_reload(
-            &cached,
-            true,
-            TranslationLanguage::English
-        ));
+    fn mem453_translation_engine_lazy_loaded() {
+        let src = include_str!("main.rs");
+        let body: String = src
+            .split("mod pipeline_logic_tests {")
+            .next()
+            .unwrap()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !body.contains("TranslationEngine::load_for_direction("),
+            "main.rs 不得再预加载 NLLB"
+        );
+        assert_eq!(
+            body.matches("letmutnllb_translate=|text:&str|{try_nllb_translate(text,translation::ensure_translation_direction(").count(),
+            1,
+            "本地翻译须经懒加载闭包"
+        );
+        assert_eq!(body.matches("nllb_translate(&pre_llm_text)").count(), 2);
     }
 }
 fn learn_llm_suggestions(

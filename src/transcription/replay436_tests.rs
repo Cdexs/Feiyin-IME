@@ -1294,7 +1294,10 @@ fn replay452_variants() {
         print!("{line}");
         report.push_str(&line);
     }
-    let out = root.join("../poc-451/replay452.md");
+    let out = root.join(format!(
+        "collab/evidence/452/replay452{}.md",
+        std::env::var("REPLAY_TAG").unwrap_or_default()
+    ));
     std::fs::write(&out, report).unwrap();
     println!("[452] 报告：{}", out.display());
 }
@@ -1555,7 +1558,7 @@ fn replay452_continue() {
         print!("{line}");
         report.push_str(&line);
     }
-    std::fs::write(root.join("../poc-451/replay452c.md"), report).unwrap();
+    std::fs::write(root.join("collab/evidence/452/replay452c.md"), report).unwrap();
 }
 
 /// ACC-452 ⑤ 流式回灌回放：完全按生产逻辑（150ms 限频 / 副本试拼接 / 比当前显示长才显示）模拟中途显示，
@@ -1736,7 +1739,7 @@ fn replay452_stream() {
     );
     print!("[452s] {summary}");
     std::fs::write(
-        root.join("../poc-451/replay452s.md"),
+        root.join("collab/evidence/452/replay452s.md"),
         format!("# ACC-452 流式回灌回放\n\n{summary}\n## 闪烁样例\n{examples}"),
     )
     .unwrap();

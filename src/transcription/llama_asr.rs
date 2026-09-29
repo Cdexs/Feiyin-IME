@@ -6,7 +6,7 @@
 //! - 适配层 `native/llama_asr/shim.cpp`（build.rs 编译进主程序）运行时动态加载 exe 同目录的 llama.cpp 官方预编译库
 //!  （b11207：`ggml-base` / `ggml` / `llama` / `mtmd` + `ggml-vulkan` / `ggml-cpu-*` / `libomp`）。
 //! - 调参依据 `collab/research/gpu-accel-451.md`（104 片实测）：Flash Attention 必开、音频编码器放 GPU、
-//!   KV f16、贪心；CPU 回落时生成 / 预填充线程分设。
+//!   KV q8_0 + ubatch 128（MEM-453 省显存）、贪心；CPU 回落时生成 / 预填充线程分设。
 //! - 对外只替换「一段音频 → 一段原始文本」这一步；输出形态与原 sherpa 相同（`language X<asr_text>正文`），
 //!   下游剥离 / 规整 / 护栏 / 拼接等管线逻辑一律不动。
 
@@ -15,10 +15,11 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// 模型目录（`models/` 下）与文件名。Gavin 定「Q8+f16」：LLM Q8_0 + 音频编码器 f16。
+/// 模型目录（`models/` 下）与文件名。LLM Q8_0；音频编码器 MEM-453 由 f16 改 Q8_0（显存 612→~340MiB）。
+/// 无 f16 存量用户（Gavin 09-29），不做回退。
 pub(crate) const LLAMA_ASR_MODEL_SUBDIR: &str = "qwen3-asr-1.7b-gguf";
 pub(crate) const LLAMA_ASR_MODEL_FILE: &str = "Qwen3-ASR-1.7B-Q8_0.gguf";
-pub(crate) const LLAMA_ASR_MMPROJ_FILE: &str = "mmproj-Qwen3-ASR-1.7B-f16.gguf";
+pub(crate) const LLAMA_ASR_MMPROJ_FILE: &str = "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf";
 
 /// 上下文长度：音频（~12.5 token/s）+ 上下文 / 词库 + 生成。与原 sherpa `max_total_len=4096` 同额度。
 const N_CTX: i32 = 4096;
