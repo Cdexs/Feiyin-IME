@@ -60,7 +60,7 @@ static void * lib_sym(lib_t h, const char * s) { return dlsym(h, s); }
     X(mtmd_input_chunks_size) X(mtmd_input_chunks_get) X(mtmd_input_chunk_get_type) \
     X(mtmd_input_chunk_get_n_tokens) X(mtmd_input_chunk_get_tokens_text) X(mtmd_input_chunk_get_n_pos) \
     X(mtmd_encode_chunk) X(mtmd_get_output_embd) X(mtmd_decode_use_non_causal) X(mtmd_support_audio) \
-    X(mtmd_helper_decode_image_chunk) X(llama_set_embeddings)
+    X(mtmd_helper_decode_image_chunk) X(llama_set_embeddings) X(mtmd_helper_eval_chunk_single)
 LAS_FNS(LAS_FN)
 
 typedef void (*las_log_fn)(int level, const char * text);
@@ -118,6 +118,12 @@ struct las_engine {
     const llama_vocab * vocab = nullptr;
     int n_vocab = 0;
     int n_batch = 512;
+    // MEM-TRIM-457 ②：上下文按需分配 —— 先按 las_create 的 n_ctx 建，放不下时重建为更大（≤ n_ctx_max）。
+    llama_context_params cp{};
+    int n_ctx_max = 4096;
+    // PIPE-SPEED-457 ③：首个文字段（system + 词库 + user 头）的 token 与其 KV 长度；下窗相同则复用，不重算。
+    std::vector<llama_token> prefix_tokens;
+    llama_pos prefix_pos = 0;
 };
 
 struct las_stats {
@@ -132,7 +138,8 @@ struct las_stats {
 // 创建引擎。gpu=1：模型与音频编码器全部放 GPU（有可用 GPU 设备时）；gpu=0：纯 CPU。
 // info 写入实际使用的设备描述。返回 nullptr = 失败（err 写原因）。
 extern "C" las_engine * las_create(const char * model_path, const char * mmproj_path, int gpu, int n_threads,
-                        int n_threads_batch, int n_ctx, char * info, int info_len, char * err, int err_len) {
+                        int n_threads_batch, int n_ctx, int n_ctx_max, char * info, int info_len, char * err,
+                        int err_len) {
     // 设备：gpu=1 时选第一块 GPU / iGPU 设备。
     ggml_backend_dev_t gpu_dev = nullptr;
     std::string dev_desc = "CPU";
@@ -168,6 +175,9 @@ extern "C" las_engine * las_create(const char * model_path, const char * mmproj_
     cp.n_threads_batch = n_threads_batch;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cp.no_perf = true;
+    // MEM-TRIM-457 ①：输出上限 = 草稿验证最大批（1 + draft_max ≤ 9）的余量 16；预填充只取末 token。
+    // 计算缓冲按上限预留 15 万维 logits ⇒ 512 → 16 省 ~65MiB，结果与速度不变。
+    cp.n_outputs_max = 16;
     llama_context * ctx = p_llama_init_from_model(model, cp);
     if (!ctx) { p_llama_model_free(model); set_err(err, err_len, "init context failed"); return nullptr; }
 
@@ -186,6 +196,8 @@ extern "C" las_engine * las_create(const char * model_path, const char * mmproj_
     }
     las_engine * e = new las_engine();
     e->model = model; e->ctx = ctx; e->mctx = mctx;
+    e->cp = cp;
+    e->n_ctx_max = n_ctx_max > n_ctx ? n_ctx_max : n_ctx;
     e->vocab = p_llama_model_get_vocab(model);
     e->n_vocab = p_llama_vocab_n_tokens(e->vocab);
     set_err(info, info_len, dev_desc);
@@ -267,13 +279,72 @@ extern "C" int las_decode(las_engine * e, const float * pcm, int n_samples, cons
         set_err(err, err_len, "mtmd_tokenize failed: " + std::to_string(rc));
         return 1;
     }
+    const size_t n_chunks = p_mtmd_input_chunks_size(chunks);
+    // MEM-TRIM-457 ②：本次所需上下文 = 提示 + 生成上限 + 草稿余量；放不下 ⇒ 重建更大的上下文（封顶 n_ctx_max，
+    // 与原固定 4096 同上限；更大仍放不下则与原来一样由解码报错）。重建会丢前缀缓存。
+    {
+        size_t need = (size_t) max_new_tokens + (size_t) draft_max + 16;
+        for (size_t i = 0; i < n_chunks; i++) need += p_mtmd_input_chunk_get_n_pos(p_mtmd_input_chunks_get(chunks, i));
+        const uint32_t cur = e->cp.n_ctx;
+        if (need > cur && cur < (uint32_t) e->n_ctx_max) {
+            uint32_t n = cur;
+            while (n < need && n < (uint32_t) e->n_ctx_max) n *= 2;
+            if (n > (uint32_t) e->n_ctx_max) n = (uint32_t) e->n_ctx_max;
+            llama_context_params cp = e->cp;
+            cp.n_ctx = n;
+            llama_context * nc = p_llama_init_from_model(e->model, cp);
+            if (nc) {
+                p_llama_free(e->ctx);
+                e->ctx = nc;
+                e->cp = cp;
+                e->prefix_tokens.clear();
+                e->prefix_pos = 0;
+                if (g_log) g_log((int) GGML_LOG_LEVEL_WARN, ("[MEM-TRIM-457] llama context grown to " + std::to_string(n) + "\n").c_str());
+            }
+        }
+    }
     llama_memory_t mem = p_llama_get_memory(e->ctx);
-    p_llama_memory_clear(mem, true);
     llama_pos n_past = 0;
-    rc = p_mtmd_helper_eval_chunks(e->mctx, e->ctx, chunks, 0, 0, e->n_batch, true, &n_past);
+    size_t first = 0;
+    // PIPE-SPEED-457 ③：首个文字段（system + 词库 + user 头）与上一窗 token 完全相同 ⇒ 保留其 KV，只删其后；
+    // 同样 token、同样位置 ⇒ KV 相同 ⇒ 结果不变，省掉该段预填充（回放 120 窗解码 −7.4%；1 窗差 1 字经取证是
+    // GPU 自身浮动：同窗不复用连解 3 次也出 2 种结果，见 replay436_tests::poc457_prefix_determinism）。
+    const mtmd_input_chunk * c0 = n_chunks > 0 ? p_mtmd_input_chunks_get(chunks, 0) : nullptr;
+    std::vector<llama_token> c0_tokens;
+    if (c0 && p_mtmd_input_chunk_get_type(c0) == MTMD_INPUT_CHUNK_TYPE_TEXT && n_chunks > 1) {
+        size_t nt = 0;
+        const llama_token * tk = p_mtmd_input_chunk_get_tokens_text(c0, &nt);
+        c0_tokens.assign(tk, tk + nt);
+    }
+    // 调试开关 LAS_NO_PREFIX_CACHE（回放 A/B 用）：每窗都从头预填充。
+    if (!c0_tokens.empty() && c0_tokens == e->prefix_tokens && e->prefix_pos > 0 && !std::getenv("LAS_NO_PREFIX_CACHE")) {
+        p_llama_memory_seq_rm(mem, 0, e->prefix_pos, -1);
+        n_past = e->prefix_pos;
+        first = 1;
+    } else {
+        p_llama_memory_clear(mem, true);
+        e->prefix_tokens.clear();
+        e->prefix_pos = 0;
+    }
+    rc = 0;
+    for (size_t i = first; i < n_chunks && rc == 0; i++) {
+        llama_pos np = n_past;
+        rc = p_mtmd_helper_eval_chunk_single(e->mctx, e->ctx, p_mtmd_input_chunks_get(chunks, i), n_past, 0, e->n_batch,
+                                             i + 1 == n_chunks, &np);
+        n_past = np;
+        if (rc == 0 && i == 0 && !c0_tokens.empty()) {
+            e->prefix_tokens = c0_tokens;
+            e->prefix_pos = n_past;
+        }
+    }
     p_mtmd_input_chunks_free(chunks);
     p_mtmd_bitmap_free(bmp);
-    if (rc != 0) { set_err(err, err_len, "eval prompt failed: " + std::to_string(rc)); return 2; }
+    if (rc != 0) {
+        e->prefix_tokens.clear();
+        e->prefix_pos = 0;
+        set_err(err, err_len, "eval prompt failed: " + std::to_string(rc));
+        return 2;
+    }
     s.n_prompt = (int32_t) n_past;
     auto t1 = clk::now();
 
@@ -658,4 +729,14 @@ extern "C" int las_align(las_aligner * a, const float * samples, int n_samples, 
         ms_out[3] = std::chrono::duration<double, std::milli>(now - th).count();
     }
     return 0;
+}
+
+// MEM-TRIM-457 ③：用已加载引擎的词表数 token（替代单独加载的 tokenizer.json，同一套 Qwen3 词表）。
+// add_special=false / parse_special=false，与原 tokenizers `encode(word, false)` 同口径。返回 < 0 = 失败。
+extern "C" int las_count_tokens(las_engine * e, const char * text) {
+    if (!e || !text) return -1;
+    const int len = (int) strlen(text);
+    if (len == 0) return 0;
+    const int n = p_llama_tokenize(e->vocab, text, len, nullptr, 0, false, false);
+    return n < 0 ? -n : n;
 }

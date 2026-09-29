@@ -9042,9 +9042,13 @@ fn spawn_worker_thread(
                                         let concurrency = transcription::WINDOW_DECODE_CONCURRENCY.max(1);
                                         let terms = acc_terms.as_deref();
 
+                                        // PIPE-SPEED-457 ②：松键收尾时写入本次窗口总数（`usize::MAX` = 仍在录音）。
+                                        // 解码线程据此认出「最后一窗」⇒ 不对齐，最终结果不等这 ~0.25s。
+                                        let final_windows =
+                                            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
                                         std::thread::scope(move |pool| {
                                             let (res_tx, res_rx) =
-                                                crossbeam_channel::unbounded::<AccDecodeResult>();
+                                                crossbeam_channel::unbounded::<AccWorkerMsg>();
                                             // ACC-452 ⑤：解码中的半截结果 `(seq, dispatch_idx, 原文)`（流式回灌）。
                                             let (partial_tx, partial_rx) =
                                                 crossbeam_channel::unbounded::<(usize, usize, String)>();
@@ -9058,6 +9062,7 @@ fn spawn_worker_thread(
                                                 let trx = task_rx.clone();
                                                 let rtx = res_tx.clone();
                                                 let ptx = partial_tx.clone();
+                                                let final_windows = final_windows.clone();
                                                 pool.spawn(move || {
                                                     for (
                                                         seq,
@@ -9100,15 +9105,43 @@ fn spawn_worker_thread(
                                                                 }
                                                             }),
                                                         );
+                                                        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                                        // 382（3C）：解码完成时刻（端到端「解完 → 浮层重画」）。
+                                                        let decode_done_at = std::time::Instant::now();
+                                                        if log::log_enabled!(log::Level::Debug) {
+                                                            log::debug!(
+                                                                "[LocalRT-DBG-382] window queue: seq={} queued_ms={:.0} decode_ms={:.0}",
+                                                                seq,
+                                                                queued_ms,
+                                                                ms
+                                                            );
+                                                        }
+                                                        // PIPE-SPEED-457 ①：先送精解结果（收割侧立即回灌，接缝暂按上一窗时间切），
+                                                        // 再对齐；对齐时间随后送达、收割侧按时间重拼（结果与先对齐再拼逐位相同）。
+                                                        let align_text = match &r {
+                                                            Ok((t, _, _)) if !t.trim().is_empty() => Some(t.clone()),
+                                                            _ => None,
+                                                        };
+                                                        let _ = rtx.send(AccWorkerMsg::Decoded((
+                                                            seq,
+                                                            dispatch_idx,
+                                                            r,
+                                                            ms,
+                                                            decode_done_at,
+                                                        )));
+                                                        let Some(t) = align_text else {
+                                                            continue;
+                                                        };
+                                                        // PIPE-SPEED-457 ②：已松键且本窗是最后一窗 ⇒ 不对齐（最终结果不等这 ~0.25s；
+                                                        // 该接缝按上一窗逐字时间切，456 半截结果同一路径）。
+                                                        if seq + 1 == final_windows.load(Ordering::Acquire) {
+                                                            log::debug!("[PIPE-457] last window: skip align seq={}", seq);
+                                                            continue;
+                                                        }
                                                         // FORCED-ALIGN-456：精解文字 × 本窗音频强制对齐（同一解码线程串行，GPU 不争抢）。
                                                         // 用整窗音频（非剪静音后）⇒ 时间直接是窗内坐标；收割侧若改用兜底文字则不用这份时间。
                                                         let t_align = std::time::Instant::now();
-                                                        let aligned = match &r {
-                                                            Ok((t, _, _)) if !t.trim().is_empty() => {
-                                                                recognizer.align(&audio, t)
-                                                            }
-                                                            _ => None,
-                                                        };
+                                                        let aligned = recognizer.align(&audio, &t);
                                                         if log::log_enabled!(log::Level::Debug) {
                                                             let st = aligned.as_ref().map_or([0.0; 4], |o| o.ms);
                                                             log::debug!(
@@ -9121,26 +9154,9 @@ fn spawn_worker_thread(
                                                                 st[3]
                                                             );
                                                         }
-                                                        let char_times = aligned.map(|o| o.char_times);
-                                                        let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                                                        // 382（3C）：解码完成时刻（端到端「解完 → 浮层重画」）。
-                                                        let decode_done_at = std::time::Instant::now();
-                                                        if log::log_enabled!(log::Level::Debug) {
-                                                            log::debug!(
-                                                                "[LocalRT-DBG-382] window queue: seq={} queued_ms={:.0} decode_ms={:.0}",
-                                                                seq,
-                                                                queued_ms,
-                                                                ms
-                                                            );
+                                                        if let Some(o) = aligned {
+                                                            let _ = rtx.send(AccWorkerMsg::Aligned(seq, o.char_times));
                                                         }
-                                                        let _ = rtx.send((
-                                                            seq,
-                                                            dispatch_idx,
-                                                            r,
-                                                            ms,
-                                                            decode_done_at,
-                                                            char_times,
-                                                        ));
                                                     }
                                                 });
                                             }
@@ -9154,6 +9170,8 @@ fn spawn_worker_thread(
                                             let mut rate_windows: usize = 0;
                                             // FIX-PREVIEW-HARVEST-380（A）：本代**已处理**的结果数（收尾按 window_seq 等齐）。
                                             let mut done = 0usize;
+                                            // PIPE-SPEED-457 ①：最近拼接、可按对齐时间重拼的窗 `(seq, dispatch_idx, 窗口绝对起点秒)`。
+                                            let mut refine_meta: Option<(usize, usize, f32)> = None;
                                             // FIX-PREVIEW-HARVEST-380（A）：结果处理**单一定义** —— select 循环与
                                             // 收尾 drain 共用，保证该线程内 `push_window(` 只出现一处（防两份再漂移）。
                                             // ACC-ENGINE-LLAMACPP-452 ⑤：流式回灌（Gavin「回灌刷新你可以直接做」）。
@@ -9245,7 +9263,7 @@ fn spawn_worker_thread(
                                             }
                                             macro_rules! harvest_acc_window {
                                                 ($res:expr) => {{
-                                                    let (seq, dispatch_idx, r, ms, decode_done_at, char_times) = $res;
+                                                    let (seq, dispatch_idx, r, ms, decode_done_at) = $res;
                                                     total_decode_ms += ms;
                                                     // SPEAKER-VERIFY-408B：本窗声纹剔除统计（供 406 放宽）。
                                                     let win_drop = match &r {
@@ -9472,23 +9490,16 @@ fn spawn_worker_thread(
                                                         win_samples.iter().sum::<usize>() as f32
                                                             / 16000.0;
                                                     let text_chars = text.chars().count();
-                                                    // FORCED-ALIGN-456：本窗文字即精解原文（非流式 / pending 兜底）⇒ 用强制对齐的逐字时间
-                                                    //（窗内秒 + 窗口绝对起点 = 录音虚拟时间轴）按时间拼接；否则无时间 ⇒ 371 比例估算。
+                                                    // FORCED-ALIGN-456 / PIPE-SPEED-457 ①：精解结果先按无时间拼接（上一窗有时间 ⇒ 按其时间切）
+                                                    // 立即回灌；本窗文字即精解原文（非流式 / pending 兜底）时，对齐时间晚到后
+                                                    //（窗内秒 + 窗口绝对起点 = 录音虚拟时间轴）经 `refine_acc_window!` 按时间重拼。
                                                     let (win_abs_start, win_split_abs) =
                                                         window_abs.get(seq).copied().unwrap_or((0.0, 0.0));
-                                                    let win_times: Option<Vec<(f32, f32)>> =
-                                                        if !is_fallback && !use_tail && text == decoded {
-                                                            char_times.as_ref().map(|ts| {
-                                                                ts.iter()
-                                                                    .map(|&(a, b)| (win_abs_start + a, win_abs_start + b))
-                                                                    .collect()
-                                                            })
-                                                        } else {
-                                                            None
-                                                        };
+                                                    refine_meta = (!is_fallback && !use_tail && text == decoded)
+                                                        .then_some((seq, dispatch_idx, win_abs_start));
                             for authoritative in ordered.push_window_timed(
                                 seq, win_ws, win_we, win_samples, text,
-                                win_times, win_abs_start, win_split_abs,
+                                None, win_abs_start, win_split_abs,
                             ) {
                                 // REFLOW-FILLER-ONCE-441：回灌**前**去重（此处文本 = 对齐后的
                                 // 权威全文 `committed + last_window`）；下方 `last_authoritative`
@@ -9566,6 +9577,55 @@ fn spawn_worker_thread(
                                                         rate_windows += 1;
                                                     }
                                                     done += 1;
+                                                }};
+                                            }
+                                            // PIPE-SPEED-457 ①：第 `seq` 窗的对齐时间到达 ⇒ 按时间重拼该窗接缝；全文有变才回灌。
+                                            // 只对「最近拼接、且文字即精解原文」的窗生效（`refine_meta` / `refine_times` 双重核对）。
+                                            macro_rules! refine_acc_window {
+                                                ($seq:expr, $times:expr) => {{
+                                                    let seq: usize = $seq;
+                                                    let times: Vec<(f32, f32)> = $times;
+                                                    if let Some((_, dispatch_idx, abs0)) =
+                                                        refine_meta.filter(|m| m.0 == seq)
+                                                    {
+                                                        refine_meta = None;
+                                                        let abs: Vec<(f32, f32)> =
+                                                            times.iter().map(|&(a, b)| (abs0 + a, abs0 + b)).collect();
+                                                        if let Some(full) = ordered.refine_times(seq, abs) {
+                                                            let full = apply_authoritative_filler_dedup(&full);
+                                                            if full != last_authoritative {
+                                                                if log::log_enabled!(log::Level::Debug) {
+                                                                    log::debug!(
+                                                                        "[PIPE-457] seam refined: seq={} chars {}→{}",
+                                                                        seq,
+                                                                        last_authoritative.chars().count(),
+                                                                        full.chars().count()
+                                                                    );
+                                                                }
+                                                                last_authoritative = full.clone();
+                                                                let _ = acc_event_tx.send(PipelineEvent::PreviewReflow {
+                                                                    generation: session_generation,
+                                                                    seg_index: dispatch_idx,
+                                                                    reflow_seq: Some(reflow_seq),
+                                                                    committed_len: window_committed_lens
+                                                                        .get(seq)
+                                                                        .copied()
+                                                                        .unwrap_or(0),
+                                                                    boundary_usable: window_boundary_usable
+                                                                        .get(seq)
+                                                                        .copied()
+                                                                        .unwrap_or(false),
+                                                                    has_hole: false,
+                                                                    acc_text: full,
+                                                                    replace_all: true,
+                                                                    decode_done_at: None,
+                                                                    non_user_hide: false,
+                                                                    partial: false,
+                                                                });
+                                                                reflow_seq += 1;
+                                                            }
+                                                        }
+                                                    }
                                                 }};
                                             }
                                             // 386（A）：派发一个窗口（含 C 的流式文本记账）。`gs/ge` = 全局切片区间。
@@ -9937,7 +9997,7 @@ fn spawn_worker_thread(
                                             // FIX-PREVIEW-HARVEST-380（A）：select 循环 —— 新切片与解码结果
                                             // **任一先到即处理**，不再等下一个切片（Gavin 现象①：停顿即停刷）。
                                             let mut step =
-                                                |ev: AccWindowStep<AccInput, AccDecodeResult, (usize, usize, String)>| {
+                                                |ev: AccWindowStep<AccInput, AccWorkerMsg, (usize, usize, String)>| {
                                                     match ev {
                                                         AccWindowStep::Slice(input) => match input {
                                                             AccInput::Slice((
@@ -10095,10 +10155,13 @@ fn spawn_worker_thread(
                                                                 }
                                                             }
                                                         },
-                                                        AccWindowStep::Result(res) => {
+                                                        AccWindowStep::Result(AccWorkerMsg::Decoded(res)) => {
                                                             // ACC-452 ⑤：正式结果到达 ⇒ 流式回灌计数清零（以正式回灌为准）。
                                                             partial_shown_len = 0;
                                                             harvest_acc_window!(res)
+                                                        }
+                                                        AccWindowStep::Result(AccWorkerMsg::Aligned(seq, times)) => {
+                                                            refine_acc_window!(seq, times)
                                                         }
                                                         AccWindowStep::Partial((seq, idx, raw)) => {
                                                             stream_partial_reflow!(seq, idx, raw)
@@ -10124,11 +10187,22 @@ fn spawn_worker_thread(
                                             // 收尾：等齐所有在飞窗口（共 window_seq 条）。
                                             // select 期间已收的已计入 `done`；本段只等还没收的。
                                             drop(task_tx);
-                                            while done < window_seq {
-                                                let Ok(res) = res_rx.recv() else {
-                                                    break;
-                                                };
-                                                harvest_acc_window!(res);
+                                            // PIPE-SPEED-457 ②：告诉解码线程本次共几窗 ⇒ 最后一窗不对齐。
+                                            final_windows.store(window_seq, Ordering::Release);
+                                            // PIPE-SPEED-457 ①：收到通道关闭为止（= 解码线程全部退出，scope 本来就要等到这一刻，
+                                            // 不额外等待）⇒ 在飞的对齐时间也一并重拼。
+                                            while let Ok(msg) = res_rx.recv() {
+                                                match msg {
+                                                    AccWorkerMsg::Decoded(res) => harvest_acc_window!(res),
+                                                    AccWorkerMsg::Aligned(seq, times) => refine_acc_window!(seq, times),
+                                                }
+                                            }
+                                            if done < window_seq {
+                                                log::warn!(
+                                                    "[PIPE-457] acc drain ended with {}/{} windows harvested",
+                                                    done,
+                                                    window_seq
+                                                );
                                             }
                                             // 380：收尾 drain 之后不再有派发 ⇒ 产出率均值无人再读（原实现
                                             // 亦不在 drain 累计）。显式消费，避免 `unused_assignments` 假红。
@@ -13029,9 +13103,16 @@ type AccDecodeResult = (
     anyhow::Result<(String, bool, transcription::AccDropStats)>,
     f64,
     std::time::Instant,
-    // FORCED-ALIGN-456：精解文字每字（起, 止）**窗内秒**（强制对齐；`None` = 未对齐 / 失败）。
-    Option<Vec<(f32, f32)>>,
 );
+
+/// PIPE-SPEED-457 ①：解码线程 → 收割线程的消息。**同一通道**：同一线程先发的先到 ⇒
+/// 第 N 窗的对齐时间必在第 N+1 窗精解结果之前被处理（重拼只针对「最近拼接的窗」）。
+enum AccWorkerMsg {
+    /// 精解结果（先送，不等对齐）。
+    Decoded(AccDecodeResult),
+    /// FORCED-ALIGN-456：该窗精解文字每字（起, 止）**窗内秒**（强制对齐，晚到）。
+    Aligned(usize, Vec<(f32, f32)>),
+}
 
 /// FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382：滑窗解码任务载荷
 /// `(window_seq, dispatch_idx, 本窗音频, 产出率均值快照, 派发时刻, 本窗语音区间, 本窗流式文本非空, 本窗新片起点样本下标)`

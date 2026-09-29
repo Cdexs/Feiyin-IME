@@ -116,14 +116,14 @@ fn check_accuracy_model_ready() -> AccuracyModelStatus {
     // 故此处镜像同一组文件名——两处判据必须逐字一致，否则 UI 显示「已就位」而主程序加载失败。
     // MIGRATE-1.13.8-1.7B-359：随主程序同步切到 1.7B 目录名。
     // ACC-ENGINE-LLAMACPP-452：精解引擎换 llama.cpp ⇒ 镜像主程序 `check_qwen3_model_ready`
-    //（`llama_asr::LLAMA_ASR_MODEL_SUBDIR` / `LLAMA_ASR_MODEL_FILE` / `LLAMA_ASR_MMPROJ_FILE` + tokenizer.json）。
+    //（`llama_asr::LLAMA_ASR_MODEL_SUBDIR` / `LLAMA_ASR_MODEL_FILE` / `LLAMA_ASR_MMPROJ_FILE`）。
+    // MEM-TRIM-457 ③：词库计数改用引擎词表，tokenizer.json 不再计入判据。
     let dir = model_dir.join("qwen3-asr-1.7b-gguf");
     // MEM-453：音频编码器 f16 → Q8_0。
     // FORCED-ALIGN-456：强制对齐模型三件套随 1.7B 标配（镜像 `llama_asr::LlamaAligner::model_ready`）。
     let al = model_dir.join("qwen3-forcedaligner-0.6b-gguf");
     let ready = dir.join("Qwen3-ASR-1.7B-Q8_0.gguf").exists()
         && dir.join("mmproj-Qwen3-ASR-1.7B-Q8_0.gguf").exists()
-        && dir.join("tokenizer").join("tokenizer.json").exists()
         && al.join("aligner-backbone-q8_0.gguf").exists()
         && al.join("aligner-mmproj-q8_0.gguf").exists()
         && al.join("aligner-head.bin").exists();

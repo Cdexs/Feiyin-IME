@@ -2638,3 +2638,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 行为变化 | 窗口接缝重复半句消除（回放 ≥8 字重复录音 1→0）；每窗正式结果多等约 0.25s（对齐）；本地实时多占显存约 1.6G（Gavin「1+2」：编码器不预留缓冲、输出上限 128） |
 | 对 macOS 的影响 | 🔴 **必须同步模型**：`models/qwen3-forcedaligner-0.6b-gguf/` 三件套（主干 Q8_0 `1b5ea4c2…`、编码器 Q8_0 `7117f45d…`、`aligner-head.bin` `8a3f5ed7…`）；缺任一件 ⇒ 精解模型判未就位（与 1.7B 同一就位判据）。构建方法见 `scripts/fetch-llama-runtime.ps1`（42ailab f16 源 + llama-quantize / crispasr-quantize 复现，sha 固定；macOS 须用对应平台的两个量化工具，产物 sha 应一致，不一致请回报）。shim 为平台中立 C++，Metal 下同一路径；**未在 macOS 实测** |
 | 是否需要对方同步 | 是（模型文件 + 冒烟确认 `[ALIGN-456] aligner attached`） |
+
+## PIPE-SPEED-457 + MEM-TRIM-457（2026-09-29，主控）· 对齐移出关键路径 / 前缀 KV 复用 / 省显存
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | ① `native/llama_asr/shim.cpp`：`las_create` **新增 `n_ctx_max` 参数**（初始 `n_ctx`=1024，某窗放不下自动重建为更大，封顶 4096）；`n_outputs_max=16`；首个文字段前缀 KV 复用（新动态解析 `mtmd_helper_eval_chunk_single`）；新增导出 `las_count_tokens`；调试环境变量 `LAS_NO_PREFIX_CACHE`；② `llama_asr.rs` 全局计数登记 `count_tokens`；③ `transcription/mod.rs` 词库计数改引擎词表、`OrderedReflow::refine_times`、本地实时 `VadSegmenter` 按需建、就位判据**去掉 `tokenizer/tokenizer.json`**；④ `main.rs` 解码线程先送结果后对齐（`AccWorkerMsg`）、松键最后一窗不对齐；⑤ `Cargo.toml` 删 `tokenizers` 直依赖（ctranslate2 仍间接依赖）；⑥ `src-tauri` 就位镜像同步去 tokenizer.json；`fetch-llama-runtime.ps1` 不再下载 tokenizer.json |
+| 行为变化 | 每窗正式结果不再等对齐（~0.28s）；预览约 6% 窗在 ~0.28s 后微调一次接缝（终稿与 456 逐位相同）；松键终稿最后一窗不等对齐；每窗解码约 −7%；1.7B 显存预计省约 0.25G |
+| 对 macOS 的影响 | 平台中立代码，macOS 编译同一份。🔴 macOS 运行时的 libmtmd 须导出 `mtmd_helper_eval_chunk_single`（b11207 已有；缺则引擎加载失败）；shim 的 `las_create` 签名变了，若 macOS 侧有自己的调用须同步加 `n_ctx_max`。`tokenizer.json` 不再需要（留着无害）。**未在 macOS 实测**（Metal 下前缀复用 / 上下文重建应同理） |
+| 是否需要对方同步 | 是（重新编译即可；冒烟确认 `[ACC-452] … ctx=1024(max 4096)` 与本地实时录音正常） |

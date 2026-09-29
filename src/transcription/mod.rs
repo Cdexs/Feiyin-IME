@@ -194,7 +194,13 @@ pub struct Transcriber {
     /// **随构造立即尝试初始化**，并非「首次长音频时才初始化」。
     /// 用 `Mutex` 包住的原因：`VadSegmenter::segment` 需要 `&mut self`，而 `Transcriber`
     /// 以共享引用被调用，故用内部可变性串行化。
-    vad_segmenter: Option<Mutex<vad::VadSegmenter>>,
+    ///
+    /// MEM-TRIM-457 ④：**本地实时改为首次长音频时才建**（`OnceLock` 空 + `vad_model_dir`）——
+    /// 本地实时按 ≤20s 窗口精解，整段分段路径极少走到，常驻一份 VAD（300s 缓冲 ≈19MB + 推理会话）白占内存。
+    /// 精确档仍随构造立即初始化（`OnceLock` 预置），行为不变。取用一律经 [`Self::vad_segmenter`]。
+    vad_segmenter: OnceLock<Option<Mutex<vad::VadSegmenter>>>,
+    /// 按需建 VAD 时的模型目录（仅本地实时用；预置档位不读）。
+    vad_model_dir: PathBuf,
     /// 在线 ASR 配置（仅 QwenAudioOnline 模式用，ASR-041-B 改名通用）
     asr_online_api_key: String,
     asr_online_url: String,
@@ -1706,10 +1712,6 @@ impl Transcriber {
         asr_online_max_sentence_silence: i64,
         asr_online_semantic_punctuation_enabled: bool,
     ) -> Result<Self> {
-        // HOTWORDS-TOKEN-268: 启动时后台预热热词 tokenizer（~数百 ms），避免首次计 token
-        // 落在「按热键→开始录音」路径上被用户感知。
-        warm_hotwords_tokenizer();
-
         let mode = if enable_streaming {
             AsrMode::Streaming
         } else {
@@ -1734,7 +1736,8 @@ impl Transcriber {
                 offline_recognizer: None,
                 online_recognizer: None,
                 hotwords_version: 0,
-                vad_segmenter: None,
+                vad_segmenter: OnceLock::from(None),
+                vad_model_dir: PathBuf::new(),
                 asr_online_api_key: asr_online_api_key.to_string(),
                 asr_online_url: asr_online_url.to_string(),
                 asr_online_model: asr_online_model.to_string(),
@@ -1751,8 +1754,8 @@ impl Transcriber {
                 build_local_realtime_recognizers(model_dir, &asr_language, hotwords)?;
             // FORCED-ALIGN-456：本地实时挂强制对齐器（窗口接缝按逐字时间拼接）。
             offline_recognizer.attach_aligner(model_dir);
-            // VAD 分段器：与 accuracy 同条件（2pass 最终引擎是 accuracy，长音频要分段）
-            let vad_segmenter = vad::VadSegmenter::try_new(model_dir).map(Mutex::new);
+            // VAD 分段器：与 accuracy 同条件（2pass 最终引擎是 accuracy，长音频要分段）。
+            // MEM-TRIM-457 ④：首次长音频分段时才建（见 `Self::vad_segmenter`）。
             // LOCALRT-WARM-CACHE-450：首次录音首窗不再现场加载剪静音 VAD / 声纹提取器。
             warm_localrt_decode_helpers();
             log::info!(
@@ -1765,7 +1768,8 @@ impl Transcriber {
                 offline_recognizer: Some(OfflineEngine::Qwen3(offline_recognizer)),
                 online_recognizer: Some(online_recognizer),
                 hotwords_version,
-                vad_segmenter,
+                vad_segmenter: OnceLock::new(),
+                vad_model_dir: model_dir.to_path_buf(),
                 asr_online_api_key: String::new(),
                 asr_online_url: String::new(),
                 asr_online_model: String::new(),
@@ -1796,7 +1800,8 @@ impl Transcriber {
             // Performance/Accuracy 无流式侧，在线档已在上面提前返回。
             online_recognizer: None,
             hotwords_version,
-            vad_segmenter,
+            vad_segmenter: OnceLock::from(vad_segmenter),
+            vad_model_dir: PathBuf::new(),
             asr_online_api_key: String::new(),
             asr_online_url: String::new(),
             asr_online_model: String::new(),
@@ -1850,6 +1855,13 @@ impl Transcriber {
     /// 当前 hotwords 版本号（外部对比用）
     pub fn hotwords_version(&self) -> u64 {
         self.hotwords_version
+    }
+
+    /// VAD 分段器（MEM-TRIM-457 ④：本地实时首次取用时才建；其余档位构造时已预置）。
+    fn vad_segmenter(&self) -> Option<&Mutex<vad::VadSegmenter>> {
+        self.vad_segmenter
+            .get_or_init(|| vad::VadSegmenter::try_new(&self.vad_model_dir).map(Mutex::new))
+            .as_ref()
     }
 
     /// 当前 ASR 语言（热重载 swap 时同步 active 状态用）
@@ -2004,7 +2016,7 @@ impl Transcriber {
         // 否则整段喂 native 撞 max_total_len=512 ⇒ 空输出）
         if self.asr_model.uses_accuracy_engine() && vad::should_segment(samples) {
             // 尝试 VAD 分段；lock poisoned / None → 降级 naive_chunk
-            let vad_segments: Option<Vec<Vec<f32>>> = match &self.vad_segmenter {
+            let vad_segments: Option<Vec<Vec<f32>>> = match self.vad_segmenter() {
                 Some(vad_lock) => match vad_lock.lock() {
                     Ok(vad) => {
                         let segs = vad.segment(samples);
@@ -2255,10 +2267,11 @@ pub const HOTWORDS_MAX_ENTRY_CHARS: usize = 10;
 /// （原 356 是从 **FunASR KV 1024** 反推的，已随 320 单引擎化删除。）
 pub const HOTWORDS_MAX_TOTAL_TOKENS: usize = 3000;
 
-/// Rust `tokenizers` 计数相对 **Qwen3** C++ tokenizer 的保守系数。
+/// 词表计数相对 **Qwen3** C++ tokenizer 的保守系数。
 ///
 /// 🔴 原 `1.85`（DEC-074）是为 **FunASR 的 C++ tokenizer** 标定的；Qwen3 是另一套 tokenizer、
 /// 该系数**不适用**（DEC-076）。本值 **2.0 = 未标定、保守取值**（未实测重标；宁可少装词，不可低估溢出）。
+/// MEM-TRIM-457 ③：计数改用引擎自身词表（已是实数），本系数**保持不变**（只省内存，不改装词行为）。
 const HOTWORDS_CPP_SAFETY_FACTOR: f64 = 2.0;
 
 /// MIGRATE-QWEN3-320：词库预算（**单引擎 Qwen3**；原 FunASR 分派 / `AccuracyEngine` 已删）。
@@ -2276,71 +2289,31 @@ const HOTWORDS_BUDGET: HotwordsBudget = HotwordsBudget {
     safety: HOTWORDS_CPP_SAFETY_FACTOR,
 };
 
-/// 惰性加载的 Qwen3 BPE tokenizer（仅计 token 用，加载一次）。
-static HOTWORDS_TOKENIZER: OnceLock<Option<tokenizers::Tokenizer>> = OnceLock::new();
+/// 数 token 的函数（`None` ⇒ 不可用，按 UTF-8 字节上界估算）。
+///
+/// MEM-TRIM-457 ③：生产 = 已加载 1.7B 引擎的词表（[`llama_asr::count_tokens`]）；原单独加载的
+/// `tokenizer/tokenizer.json`（Rust `tokenizers`，常驻数十 MB）已删 —— 同一套 Qwen3 词表，
+/// 2026-09-29 用真实词库 42 条逐条比对计数全同。引擎未加载时（启动早期）回落字节上界，
+/// 与原 tokenizer 缺失时一致；该时刻的结果只用于日志里的词库版本号，真正注入在录音开始时（引擎已在）。
+type TokenCounter<'a> = &'a dyn Fn(&str) -> Option<usize>;
 
-/// 取（必要时加载）tokenizer。路径按 DEC-011 exe 同级 models 推导。
-fn hotwords_tokenizer() -> &'static Option<tokenizers::Tokenizer> {
-    HOTWORDS_TOKENIZER.get_or_init(|| {
-        // 🔴 2026-09-21：由 FunASR Nano 目录改指 **Qwen3-ASR 自带 tokenizer**。
-        // 原路径依赖已迁移走的 nano 模型 —— 用户若只下 Qwen3，该路径会缺失，
-        // 词条计数会静默退化为「UTF-8 字节数上界」（高估约 50%，200 条上限实收约 130~150 条），
-        // 不崩不报错但词条被静默截断。tester-1 在 BUILD-321 核验时发现（我任务书里预设
-        // 「exe 不再引用 nano」，他如实报出不成立）。
-        //
-        // Qwen3-ASR 的 tokenizer 目录原本只有 vocab.json / merges.txt / tokenizer_config.json，
-        // 缺 tokenizer.json；已把 nano 那份（11.4MB）拷入。
-        // **精度零损失**：两侧 vocab.json 与 merges.txt 的 sha256 **逐字节相同**
-        // （ca10d7e9… / 8831e4f1…），是同一个 Qwen3 tokenizer，不是近似替代。
-        let p = model_dir()
-            .join(QWEN3_MODEL_SUBDIR)
-            .join("tokenizer")
-            .join("tokenizer.json");
-        let t = std::time::Instant::now();
-        match tokenizers::Tokenizer::from_file(&p) {
-            Ok(tk) => {
-                log::info!(
-                    "HOTWORDS-TOKEN-268: tokenizer loaded in {:?} ({})",
-                    t.elapsed(),
-                    p.display()
-                );
-                Some(tk)
-            }
-            Err(e) => {
-                log::warn!(
-                    "HOTWORDS-TOKEN-268: tokenizer load failed ({}): {}；将退化为字节上界",
-                    p.display(),
-                    e
-                );
-                None
-            }
-        }
-    })
+/// 生产计数器：已加载引擎的词表。
+fn engine_token_counter() -> Option<TokenCounter<'static>> {
+    Some(&llama_asr::count_tokens)
 }
 
-/// HOTWORDS-TOKEN-268：启动时预热 tokenizer，避免 ~数百 ms 加载落在「按热键→开始录音」路径上。
-pub fn warm_hotwords_tokenizer() {
-    std::thread::spawn(|| {
-        let _ = hotwords_tokenizer();
-    });
-}
-
-/// 单条词在 **C++ 口径**下的保守 token 估算（Rust 计数 × `safety`；tokenizer 不可用则用 UTF-8 字节数上界）。
-fn estimate_word_tokens_with(tk: Option<&tokenizers::Tokenizer>, word: &str, safety: f64) -> usize {
-    match tk {
-        Some(t) => match t.encode(word, false) {
-            Ok(enc) => ((enc.get_ids().len() as f64) * safety).ceil() as usize,
-            // byte-level BPE 下 token ≤ byte，字节数是安全的粗上界
-            Err(_) => word.len(),
-        },
+/// 单条词在 **C++ 口径**下的保守 token 估算（词表计数 × `safety`；计数不可用则用 UTF-8 字节数上界）。
+fn estimate_word_tokens_with(count: Option<TokenCounter>, word: &str, safety: f64) -> usize {
+    match count.and_then(|c| c(word)) {
+        Some(n) => ((n as f64) * safety).ceil() as usize,
+        // byte-level BPE 下 token ≤ byte，字节数是安全的粗上界
         None => word.len(),
     }
 }
 
-/// 兼容入口：FunASR 的 1.85 系数（测试/回滚用）。新代码走 `estimate_word_tokens_with`。
-#[allow(dead_code)] // 仅单测与 FunASR 回滚路径兼容保留
-fn estimate_word_tokens(tk: Option<&tokenizers::Tokenizer>, word: &str) -> usize {
-    estimate_word_tokens_with(tk, word, HOTWORDS_CPP_SAFETY_FACTOR)
+/// 按默认系数估算（生产注入段 / 单测）。
+fn estimate_word_tokens(count: Option<TokenCounter>, word: &str) -> usize {
+    estimate_word_tokens_with(count, word, HOTWORDS_CPP_SAFETY_FACTOR)
 }
 
 // ============================================================
@@ -2397,11 +2370,11 @@ pub(crate) fn expected_audio_tokens(num_samples: usize) -> usize {
 }
 
 /// 路B 注入段 token 数（**精确**）：对**实际要注入的 hotwords 串**（`build_ctx_system`，377 起
-/// **只剩纯词表**）用 tokenizer 实数，再乘 `HOTWORDS_CPP_SAFETY_FACTOR`(2.0)
+/// **只剩纯词表**）用引擎词表实数，再乘 `HOTWORDS_CPP_SAFETY_FACTOR`(2.0)
 /// 以覆盖「我方 tokenizer 与 C++ 手搓 BPE 的计数差异」（DEC-074）。三项一次算准，不重复扣。
 pub(crate) fn estimate_inject_tokens(terms: Option<&str>) -> usize {
     match build_ctx_system(terms) {
-        Some(s) => estimate_word_tokens(hotwords_tokenizer().as_ref(), &s),
+        Some(s) => estimate_word_tokens(engine_token_counter(), &s),
         None => 0,
     }
 }
@@ -2410,7 +2383,7 @@ pub(crate) fn estimate_inject_tokens(terms: Option<&str>) -> usize {
 ///
 /// 判据：`音频token(精确) + 注入段token(精确) + 生成预留 + 安全余量 ≤ max_total_len`。
 /// - 音频：`expected_audio_tokens`（C++ 同款降采样公式，**非** 13.0 tok/s 估算）；
-/// - 注入段：`estimate_inject_tokens`（tokenizer 实数 × C++ 差异系数，377 起**只剩纯词表**
+/// - 注入段：`estimate_inject_tokens`（词表实数 × C++ 差异系数，377 起**只剩纯词表**
 ///   + 提示词脚手架）；
 /// - 余量仅 64（取整边界），不再承担估算兜底。
 ///
@@ -2737,6 +2710,9 @@ fn ratio_cut_bytes(new: &str, ratio: Option<f32>) -> usize {
 ///    任一窗无时间 ⇒ [`ratio_cut_bytes`] 按 371 期望重叠比例估算。
 ///
 /// 不变量：非空窗文字不会整窗丢弃。
+///
+/// PIPE-SPEED-457 ①：精解结果先按「无逐字时间」拼接回灌（不等对齐），对齐时间随后经
+/// [`Self::refine_times`] 补上 ⇒ 恢复该窗拼接前状态、带时间重拼，与一开始就带时间拼接逐位相同。
 #[derive(Clone)]
 pub(crate) struct OrderedReflow {
     next: usize,
@@ -2758,6 +2734,25 @@ pub(crate) struct OrderedReflow {
     /// 与 `last_window_text` 每字对应的（起, 止）绝对秒；`None` = 该窗无可用时间戳。
     last_times: Option<Vec<(f32, f32)>>,
     last_span: Option<(usize, usize)>,
+    /// PIPE-SPEED-457 ①：最近一次按无时间拼接的窗口（供对齐时间晚到时重拼）；其后任一非空窗拼接即清掉。
+    refine: Option<RefineSlot>,
+}
+
+/// PIPE-SPEED-457 ①：某窗按无时间拼接**之前**的文字状态 + 该窗入参。
+/// `committed` 只增不减（`push_str`）⇒ 存长度即可还原。
+#[derive(Clone)]
+struct RefineSlot {
+    seq: usize,
+    committed_len: usize,
+    last_window_text: String,
+    last_times: Option<Vec<(f32, f32)>>,
+    last_span: Option<(usize, usize)>,
+    ws: usize,
+    we: usize,
+    samples: Vec<usize>,
+    text: String,
+    win_start: f32,
+    split: f32,
 }
 
 impl OrderedReflow {
@@ -2774,6 +2769,7 @@ impl OrderedReflow {
             last_window_text: String::new(),
             last_times: None,
             last_span: None,
+            refine: None,
         }
     }
 
@@ -2814,62 +2810,126 @@ impl OrderedReflow {
                 self.next += 1;
                 continue;
             }
-            match self.last_span {
-                None => {
-                    self.last_window_text = text;
-                    self.last_times = times;
-                }
-                Some((_, prev_end)) if ws >= prev_end => {
-                    self.committed.push_str(&self.last_window_text);
-                    self.last_window_text = text;
-                    self.last_times = times;
-                }
-                Some((prev_start, prev_end)) => match (&self.last_times, &times) {
-                    (Some(pt), Some(nt)) => {
-                        let (keep, new_text, new_t) =
-                            timed_stitch(&self.last_window_text, pt, &text, nt, split);
-                        log::debug!(
-                            "[DBG-456] seam: seq={seq} timed split={split:.2}s keep_prev={} drop_prev={} take_new={}/{}",
-                            self.last_window_text[..keep].chars().count(),
-                            self.last_window_text[keep..].chars().count(),
-                            new_text.chars().count(),
-                            text.chars().count()
-                        );
-                        self.committed.push_str(&self.last_window_text[..keep]);
-                        self.last_window_text = new_text;
-                        self.last_times = Some(new_t);
-                    }
-                    (Some(pt), None) => {
-                        let (keep, cut) =
-                            prev_timed_cut(&self.last_window_text, pt, &text, win_start, split);
-                        log::debug!(
-                            "[DBG-456] seam: seq={seq} prev-timed split={split:.2}s keep_prev={} drop_new_head={}",
-                            self.last_window_text[..keep].chars().count(),
-                            text[..cut].chars().count()
-                        );
-                        self.committed.push_str(&self.last_window_text[..keep]);
-                        self.last_window_text = text[cut..].to_string();
-                        self.last_times = None;
-                    }
-                    _ => {
-                        let ratio = expected_overlap_ratio(ws, we, prev_end, &samples);
-                        let cut = ratio_cut_bytes(&text, ratio);
-                        log::debug!(
-                            "[DBG-456] seam: seq={seq} ratio={ratio:?} span=[{ws}, {we}) prev=[{prev_start}, {prev_end}) drop_new_head={}",
-                            text[..cut].chars().count()
-                        );
-                        self.committed.push_str(&self.last_window_text);
-                        let n_skip = text[..cut].chars().count();
-                        self.last_times = times.map(|t| t[n_skip..].to_vec());
-                        self.last_window_text = text[cut..].to_string();
-                    }
-                },
-            }
-            self.last_span = Some((ws, we));
-            out.push(format!("{}{}", self.committed, self.last_window_text));
+            self.stitch(self.next, ws, we, samples, text, times, win_start, split);
+            out.push(self.full_text());
             self.next += 1;
         }
         out
+    }
+
+    fn full_text(&self) -> String {
+        format!("{}{}", self.committed, self.last_window_text)
+    }
+
+    /// 把非空窗 `seq` 接到当前文字状态后（接缝规则见类型注释）。
+    #[allow(clippy::too_many_arguments)]
+    fn stitch(
+        &mut self,
+        seq: usize,
+        ws: usize,
+        we: usize,
+        samples: Vec<usize>,
+        text: String,
+        times: Option<Vec<(f32, f32)>>,
+        win_start: f32,
+        split: f32,
+    ) {
+        // PIPE-SPEED-457 ①：无时间拼接 ⇒ 记下拼接前状态（对齐时间晚到时重拼）；带时间 ⇒ 无需重拼。
+        self.refine = times.is_none().then(|| RefineSlot {
+            seq,
+            committed_len: self.committed.len(),
+            last_window_text: self.last_window_text.clone(),
+            last_times: self.last_times.clone(),
+            last_span: self.last_span,
+            ws,
+            we,
+            samples: samples.clone(),
+            text: text.clone(),
+            win_start,
+            split,
+        });
+        match self.last_span {
+            None => {
+                self.last_window_text = text;
+                self.last_times = times;
+            }
+            Some((_, prev_end)) if ws >= prev_end => {
+                self.committed.push_str(&self.last_window_text);
+                self.last_window_text = text;
+                self.last_times = times;
+            }
+            Some((prev_start, prev_end)) => match (&self.last_times, &times) {
+                (Some(pt), Some(nt)) => {
+                    let (keep, new_text, new_t) =
+                        timed_stitch(&self.last_window_text, pt, &text, nt, split);
+                    log::debug!(
+                        "[DBG-456] seam: seq={seq} timed split={split:.2}s keep_prev={} drop_prev={} take_new={}/{}",
+                        self.last_window_text[..keep].chars().count(),
+                        self.last_window_text[keep..].chars().count(),
+                        new_text.chars().count(),
+                        text.chars().count()
+                    );
+                    self.committed.push_str(&self.last_window_text[..keep]);
+                    self.last_window_text = new_text;
+                    self.last_times = Some(new_t);
+                }
+                (Some(pt), None) => {
+                    let (keep, cut) =
+                        prev_timed_cut(&self.last_window_text, pt, &text, win_start, split);
+                    log::debug!(
+                        "[DBG-456] seam: seq={seq} prev-timed split={split:.2}s keep_prev={} drop_new_head={}",
+                        self.last_window_text[..keep].chars().count(),
+                        text[..cut].chars().count()
+                    );
+                    self.committed.push_str(&self.last_window_text[..keep]);
+                    self.last_window_text = text[cut..].to_string();
+                    self.last_times = None;
+                }
+                _ => {
+                    let ratio = expected_overlap_ratio(ws, we, prev_end, &samples);
+                    let cut = ratio_cut_bytes(&text, ratio);
+                    log::debug!(
+                        "[DBG-456] seam: seq={seq} ratio={ratio:?} span=[{ws}, {we}) prev=[{prev_start}, {prev_end}) drop_new_head={}",
+                        text[..cut].chars().count()
+                    );
+                    self.committed.push_str(&self.last_window_text);
+                    let n_skip = text[..cut].chars().count();
+                    self.last_times = times.map(|t| t[n_skip..].to_vec());
+                    self.last_window_text = text[cut..].to_string();
+                }
+            },
+        }
+        self.last_span = Some((ws, we));
+    }
+
+    /// PIPE-SPEED-457 ①：`seq` 的逐字对齐时间（**绝对秒**）晚到 —— 精解结果已先按无时间拼接回灌。
+    /// 恢复该窗拼接前的文字状态、带时间重拼，返回重拼后的权威全文。
+    /// `seq` 已不是最近拼接的窗 / 时间与文字字数不符 ⇒ `None`（维持原拼接，与 456 无时间路径一致）。
+    pub(crate) fn refine_times(&mut self, seq: usize, times: Vec<(f32, f32)>) -> Option<String> {
+        let ok = self
+            .refine
+            .as_ref()
+            .is_some_and(|r| r.seq == seq && r.text.chars().count() == times.len());
+        if !ok {
+            return None;
+        }
+        let r = self.refine.take()?;
+        self.committed.truncate(r.committed_len);
+        self.last_window_text = r.last_window_text;
+        self.last_times = r.last_times;
+        self.last_span = r.last_span;
+        log::debug!("[DBG-457] seam refine: seq={seq}");
+        self.stitch(
+            seq,
+            r.ws,
+            r.we,
+            r.samples,
+            r.text,
+            Some(times),
+            r.win_start,
+            r.split,
+        );
+        Some(self.full_text())
     }
 
     /// 测试便捷入口：无逐字时间（重叠走 371 比例估算）。
@@ -2940,22 +3000,19 @@ fn is_pure_ascii(s: &str) -> bool {
 /// 调用方（main.rs load_hotwords_for_accuracy）已按 hit_count DESC, id DESC 排序，
 /// 截断后保留高频/最近词条，确定性顺序保证 hotwords 版本号哈希稳定。
 pub fn curate_hotwords_entries(entries: &[String]) -> Vec<String> {
-    curate_hotwords_entries_with_budget(entries, hotwords_tokenizer().as_ref(), HOTWORDS_BUDGET)
+    curate_hotwords_entries_with_budget(entries, engine_token_counter(), HOTWORDS_BUDGET)
 }
 
 /// 测试/兼容入口（单引擎 Qwen3 预算）。生产路径直接走 `curate_hotwords_entries`。
 #[allow(dead_code)]
-fn curate_hotwords_entries_with(
-    entries: &[String],
-    tk: Option<&tokenizers::Tokenizer>,
-) -> Vec<String> {
+fn curate_hotwords_entries_with(entries: &[String], tk: Option<TokenCounter>) -> Vec<String> {
     curate_hotwords_entries_with_budget(entries, tk, HOTWORDS_BUDGET)
 }
 
-/// 可注入 tokenizer / 预算的内核（单测用真实 tokenizer 时传 Some，验证回退时传 None）。
+/// 可注入计数器 / 预算的内核（单测传固定计数器，验证回退时传 None）。
 fn curate_hotwords_entries_with_budget(
     entries: &[String],
-    tk: Option<&tokenizers::Tokenizer>,
+    tk: Option<TokenCounter>,
     budget: HotwordsBudget,
 ) -> Vec<String> {
     let mut result: Vec<String> = Vec::new();
@@ -3180,9 +3237,8 @@ fn create_sensevoice_recognizer(
 /// ACC-ENGINE-LLAMACPP-452（Gavin 2026-09-27「换，不保留目前的 sherpa onnx 调用方式」）：
 /// 创建 Qwen3-ASR 1.7B 精解引擎 = llama.cpp（`llama_asr::LlamaAsr`，Vulkan / Metal 优先、CPU 回落）。
 ///
-/// - 模型：`models/qwen3-asr-1.7b-gguf/` 下 Q8_0 LLM + f16 音频编码器（Gavin「用 Q8+f16」）
-///   + `tokenizer/`（仅供词库 token 预算计数，与 GGUF 内置词表同一 Qwen3 tokenizer）。
-/// - 🔴 上下文总长 `N_CTX = 4096` 与原 sherpa `max_total_len=4096` 同额度：
+/// - 模型：`models/qwen3-asr-1.7b-gguf/` 下 LLM + 音频编码器（词库 token 计数用引擎自身词表，MEM-TRIM-457）。
+/// - 🔴 上下文总长上限 `N_CTX = 4096`（初始 1024、按需扩，MEM-TRIM-457）与原 sherpa `max_total_len=4096` 同额度：
 ///   **`HOTWORDS_MAX_TOTAL_TOKENS=3000` 即由 4096 反推**（20s 音频 ~260 + 生成 256 + 词库 ≤3000），二者耦合，不得单改。
 /// - 生成默认上限 256、贪心解码，与原 sherpa 全局 `max_new_tokens=256` / 近贪心一致。
 /// - 调参依据（Flash Attention / 编码器上 GPU / 线程分设）见 `collab/research/gpu-accel-451.md`；KV q8_0 / ubatch 128 / 编码器 Q8_0 见 MEM-453。
@@ -3190,7 +3246,7 @@ pub(crate) fn create_qwen3_recognizer(model_dir: &Path) -> Result<AccEngine> {
     let (ready, dir) = check_qwen3_model_ready(model_dir);
     if !ready {
         anyhow::bail!(
-            "Qwen3-ASR GGUF model not found at {:?} (need {} / {} / tokenizer/tokenizer.json)",
+            "Qwen3-ASR GGUF model not found at {:?} (need {} / {} + forced aligner)",
             dir,
             llama_asr::LLAMA_ASR_MODEL_FILE,
             llama_asr::LLAMA_ASR_MMPROJ_FILE
@@ -3236,21 +3292,14 @@ pub fn model_dir() -> PathBuf {
     exe_dir.join("models")
 }
 
-/// MIGRATE-1.13.8-1.7B-359：Qwen3-ASR 模型子目录名（**唯一来源**，防多处硬编码漂移）。
-///
-/// 历史上该名字散落在 `check_qwen3_model_ready` / `hotwords_tokenizer` / 测试夹具 /
-/// `src-tauri` 镜像处；本批切 0.6B→1.7B 时收敛到本常量。
-/// 🔴 `src-tauri` 是独立 crate，**无法复用本常量**，仍须各自镜像同一字符串
-/// （那里有注释警示：两处判据必须逐字一致，否则 UI 显示「已就位」而主程序加载失败）。
-/// ACC-ENGINE-LLAMACPP-452：改指 llama.cpp GGUF 模型目录（`src-tauri` 镜像同批更新）。
-pub(crate) const QWEN3_MODEL_SUBDIR: &str = llama_asr::LLAMA_ASR_MODEL_SUBDIR;
+// MIGRATE-1.13.8-1.7B-359 的 `QWEN3_MODEL_SUBDIR`（模型子目录名唯一来源）已并入
+// `llama_asr::LLAMA_ASR_MODEL_SUBDIR`（MEM-TRIM-457 删掉 tokenizer 路径后别处不再引用）。
+// 🔴 `src-tauri` 是独立 crate，仍须镜像同一字符串（两处判据必须逐字一致）。
 
-/// Qwen3-ASR 就位判据（与 `create_qwen3_recognizer` 加载清单逐字一致）：
-/// GGUF 主模型 + 音频编码器 + 词库预算计数用 `tokenizer/tokenizer.json`。
+/// Qwen3-ASR 就位判据（与 `create_qwen3_recognizer` 加载清单逐字一致）：GGUF 主模型 + 音频编码器 + 对齐模型三件套。
+/// MEM-TRIM-457 ③：词库计数改用引擎词表，`tokenizer/tokenizer.json` 不再需要（老用户目录里留着无害）。
 fn check_qwen3_model_ready(model_dir: &Path) -> (bool, PathBuf) {
-    let (engine_ready, dir) = AccEngine::model_ready(model_dir);
-    let ready = engine_ready && dir.join("tokenizer").join("tokenizer.json").exists();
-    (ready, dir)
+    AccEngine::model_ready(model_dir)
 }
 
 /// 检测 accuracy 模型是否就位（供 Tauri command 调用）。
@@ -3510,23 +3559,15 @@ mod tests {
         assert_eq!(build_hotwords_string(&entries), "派");
     }
 
-    // ---- HOTWORDS-TOKEN-268: token 预算测试（用真实 tokenizer；不可用则跳过）----
+    // ---- HOTWORDS-TOKEN-268: token 预算测试 ----
+    // MEM-TRIM-457 ③：原用真实 tokenizer.json（缺则静默跳过）；计数改走引擎词表后，这里用固定计数器
+    //（1 字 = 1 token）专测预算算法，**始终执行**。真实词表计数与原 tokenizer.json 的一致性已实测（42/42）。
 
-    fn test_tokenizer() -> Option<tokenizers::Tokenizer> {
-        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("models")
-            .join(QWEN3_MODEL_SUBDIR)
-            .join("tokenizer")
-            .join("tokenizer.json");
-        let t = std::time::Instant::now();
-        let tk = tokenizers::Tokenizer::from_file(&p).ok();
-        if tk.is_some() {
-            eprintln!("268: Rust tokenizers load = {:?}", t.elapsed());
-        }
-        tk
+    fn test_counter(w: &str) -> Option<usize> {
+        Some(w.chars().count())
     }
 
-    fn est_of(tk: Option<&tokenizers::Tokenizer>, ws: &[String]) -> usize {
+    fn est_of(tk: Option<TokenCounter>, ws: &[String]) -> usize {
         let mut t = 0usize;
         for (i, w) in ws.iter().enumerate() {
             t += estimate_word_tokens(tk, w.trim()) + if i > 0 { 1 } else { 0 };
@@ -3545,7 +3586,7 @@ mod tests {
     }
 
     /// 268：预算不变式——截断结果必须 ≤ 356，且**再加一条必然超**（即极大致）。
-    fn assert_budget_maximal(tk: Option<&tokenizers::Tokenizer>, entries: &[String]) {
+    fn assert_budget_maximal(tk: Option<TokenCounter>, entries: &[String]) {
         let kept = curate_hotwords_entries_with(entries, tk);
         assert!(kept.len() <= entries.len());
         assert!(
@@ -3565,24 +3606,20 @@ mod tests {
 
     #[test]
     fn curate_two_char_120_report_and_budget() {
-        let Some(tk) = test_tokenizer() else {
-            return;
-        };
+        let tk: TokenCounter = &test_counter;
         let entries = two_char_common(120);
-        let kept = curate_hotwords_entries_with(&entries, Some(&tk));
+        let kept = curate_hotwords_entries_with(&entries, Some(tk));
         eprintln!(
             "268: 2 字×120 实装 {} 条（est={}）",
             kept.len(),
-            est_of(Some(&tk), &kept)
+            est_of(Some(tk), &kept)
         );
-        assert_budget_maximal(Some(&tk), &entries);
+        assert_budget_maximal(Some(tk), &entries);
     }
 
     #[test]
     fn curate_common_4char_truncated_by_token_budget() {
-        let Some(tk) = test_tokenizer() else {
-            return;
-        };
+        let tk: TokenCounter = &test_counter;
         let pool: Vec<char> = "北京上海深圳杭州成都武汉西安南京广州苏州天津重庆长沙青岛厦门中科华夏东方南方长城智能网络数据电子信息集团研究院机器人医疗健康".chars().collect();
         let entries: Vec<String> = (0..120)
             .map(|i| {
@@ -3601,35 +3638,31 @@ mod tests {
             max_total_tokens: 400,
             safety: 2.0,
         };
-        let kept = curate_hotwords_entries_with_budget(&entries, Some(&tk), small);
+        let kept = curate_hotwords_entries_with_budget(&entries, Some(tk), small);
         eprintln!(
             "268: 常用 4 字×120 实装 {} 条（est={}）",
             kept.len(),
-            est_of(Some(&tk), &kept)
+            est_of(Some(tk), &kept)
         );
         assert!(kept.len() < 120, "4 字词应被 token 预算截断（<120）");
-        assert!(est_of(Some(&tk), &kept) <= small.max_total_tokens);
+        assert!(est_of(Some(tk), &kept) <= small.max_total_tokens);
     }
 
     #[test]
     fn curate_rare_4char_truncated_by_token_budget() {
-        let Some(tk) = test_tokenizer() else {
-            return;
-        };
+        let tk: TokenCounter = &test_counter;
         let entries: Vec<String> = (0..120)
             .map(|i| {
                 let c = char::from_u32(0x4E00 + i).unwrap();
                 format!("{}{}{}{}", c, c, c, c)
             })
             .collect();
-        assert_budget_maximal(Some(&tk), &entries);
+        assert_budget_maximal(Some(tk), &entries);
     }
 
     #[test]
     fn curate_token_budget_boundary() {
-        let Some(tk) = test_tokenizer() else {
-            return;
-        };
+        let tk: TokenCounter = &test_counter;
         // 用**小预算**强制「恰好装满 / 再加一条超」；生产预算 3000 过大测不到边界。
         let small = HotwordsBudget {
             max_entries: 1000,
@@ -3637,12 +3670,12 @@ mod tests {
             safety: 2.0,
         };
         let entries: Vec<String> = (0..200).map(|_| "的".to_string()).collect();
-        let kept = curate_hotwords_entries_with_budget(&entries, Some(&tk), small);
-        let est = est_of(Some(&tk), &kept);
+        let kept = curate_hotwords_entries_with_budget(&entries, Some(tk), small);
+        let est = est_of(Some(tk), &kept);
         assert!(est <= small.max_total_tokens, "est={}", est);
         let mut kept_more = kept.clone();
         kept_more.push("的".to_string());
-        assert!(est_of(Some(&tk), &kept_more) > small.max_total_tokens);
+        assert!(est_of(Some(tk), &kept_more) > small.max_total_tokens);
     }
 
     #[test]
@@ -4071,7 +4104,8 @@ mod tests {
         assert_eq!(hit2.stripped, "可以看看周边的风景。");
     }
 
-    /// ACC-452：就位判据改为 GGUF 主模型 + 音频编码器 + `tokenizer/tokenizer.json`（词库预算计数）。
+    /// ACC-452：就位判据改为 GGUF 主模型 + 音频编码器（+ 456 对齐模型三件套）；
+    /// MEM-TRIM-457 ③：不再需要 `tokenizer/tokenizer.json`。
     #[test]
     fn migrate320_qwen3_readiness_checks_four_paths() {
         let root = std::env::temp_dir().join(format!(
@@ -4080,8 +4114,8 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let q = root.join(QWEN3_MODEL_SUBDIR);
-        std::fs::create_dir_all(q.join("tokenizer")).unwrap();
+        let q = root.join(llama_asr::LLAMA_ASR_MODEL_SUBDIR);
+        std::fs::create_dir_all(&q).unwrap();
         let al = root.join(llama_asr::ALIGNER_SUBDIR);
         std::fs::create_dir_all(&al).unwrap();
         for f in [
@@ -4094,12 +4128,14 @@ mod tests {
         for f in [
             llama_asr::LLAMA_ASR_MODEL_FILE,
             llama_asr::LLAMA_ASR_MMPROJ_FILE,
-            "tokenizer/tokenizer.json",
         ] {
             std::fs::write(q.join(f), b"x").unwrap();
         }
         let (ready, dir) = check_qwen3_model_ready(&root);
-        assert!(ready, "Qwen3 GGUF 三件套齐全应 ready");
+        assert!(
+            ready,
+            "GGUF 主模型 + 编码器 + 对齐三件套齐全（无 tokenizer.json）应 ready"
+        );
         assert_eq!(dir, q);
         assert!(check_accuracy_model_ready(&root).0, "accuracy 检测即 Qwen3");
         std::fs::remove_file(q.join(llama_asr::LLAMA_ASR_MMPROJ_FILE)).unwrap();
@@ -4121,11 +4157,7 @@ mod tests {
             b"x",
         )
         .unwrap();
-        std::fs::remove_file(q.join("tokenizer/tokenizer.json")).unwrap();
-        assert!(
-            !check_qwen3_model_ready(&root).0,
-            "少 tokenizer.json 应 not ready"
-        );
+        assert!(check_qwen3_model_ready(&root).0, "补回对齐模型应 ready");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -8896,5 +8928,149 @@ mod timed_reflow_456_tests {
             5.0,
         );
         assert_eq!(out.last().unwrap(), "甲乙丙丁", "零重叠直接拼接");
+    }
+}
+
+/// PIPE-SPEED-457 ①：精解结果先无时间拼接、对齐时间晚到再重拼 ⇒ 与一开始就带时间拼接**逐位相同**。
+#[cfg(test)]
+mod refine_reflow_457_tests {
+    use super::OrderedReflow;
+
+    fn ts(text: &str, t0: f32, step: f32) -> Vec<(f32, f32)> {
+        (0..text.chars().count())
+            .map(|i| (t0 + i as f32 * step, t0 + (i as f32 + 1.0) * step))
+            .collect()
+    }
+
+    /// 三个互相重叠的窗：`(seq, 起片, 止片, 文字, 每字绝对时间, 窗起点秒, 分界秒)`。
+    #[allow(clippy::type_complexity)]
+    fn windows() -> Vec<(usize, usize, usize, &'static str, Vec<(f32, f32)>, f32, f32)> {
+        vec![
+            (
+                0,
+                0,
+                2,
+                "今天天气很好我们",
+                ts("今天天气很好我们", 0.0, 0.25),
+                0.0,
+                0.0,
+            ),
+            (
+                1,
+                1,
+                3,
+                "很好我们去公园散步",
+                ts("很好我们去公园散步", 1.0, 0.25),
+                1.0,
+                1.5,
+            ),
+            (
+                2,
+                2,
+                4,
+                "去公园散步吧好吗",
+                ts("去公园散步吧好吗", 2.0, 0.25),
+                2.0,
+                2.5,
+            ),
+        ]
+    }
+
+    fn samples() -> Vec<usize> {
+        vec![16000, 16000]
+    }
+
+    #[test]
+    fn t457_refine_equals_timed_push() {
+        let mut a = OrderedReflow::new();
+        let mut b = OrderedReflow::new();
+        for (seq, ws, we, text, t, st, sp) in windows() {
+            let out_a =
+                a.push_window_timed(seq, ws, we, samples(), text.into(), Some(t.clone()), st, sp);
+            let out_b = b.push_window_timed(seq, ws, we, samples(), text.into(), None, st, sp);
+            assert_eq!(out_b.len(), 1, "无时间也立即定稿回灌");
+            let refined = b.refine_times(seq, t).expect("最近拼接的窗可重拼");
+            assert_eq!(
+                out_a.last().unwrap(),
+                &refined,
+                "seq={seq}：重拼结果须与带时间拼接相同"
+            );
+        }
+        let fa = a.finish();
+        assert_eq!(
+            fa,
+            b.finish(),
+            "后续窗口的接缝也须相同（重拼把时间写回状态）"
+        );
+        assert_eq!(
+            format!("{}{}", fa.0, fa.1),
+            "今天天气很好我们去公园散步吧好吗"
+        );
+    }
+
+    #[test]
+    fn t457_unrefined_last_window_uses_prev_times() {
+        // 松键最后一窗不对齐（②）⇒ 只做前两窗重拼、第三窗留无时间：接缝按上一窗时间切，文字仍完整不重复。
+        let mut b = OrderedReflow::new();
+        let w = windows();
+        for (seq, ws, we, text, t, st, sp) in w.iter().cloned() {
+            b.push_window_timed(seq, ws, we, samples(), text.into(), None, st, sp);
+            if seq < 2 {
+                b.refine_times(seq, t).unwrap();
+            }
+        }
+        let (c, l) = b.finish();
+        assert_eq!(format!("{c}{l}"), "今天天气很好我们去公园散步吧好吗");
+    }
+
+    #[test]
+    fn t457_refine_rejects_stale_seq_and_len_mismatch() {
+        let w = windows();
+        let mut b = OrderedReflow::new();
+        for (seq, ws, we, text, _, st, sp) in w.iter().cloned().take(2) {
+            b.push_window_timed(seq, ws, we, samples(), text.into(), None, st, sp);
+        }
+        let before = b.clone().finish();
+        assert!(
+            b.refine_times(0, w[0].4.clone()).is_none(),
+            "已不是最近拼接的窗 ⇒ 不重拼"
+        );
+        assert!(
+            b.refine_times(1, w[0].4.clone()).is_none(),
+            "时间与字数不符 ⇒ 不重拼"
+        );
+        assert_eq!(b.clone().finish(), before, "拒绝重拼不动状态");
+        assert!(b.refine_times(1, w[1].4.clone()).is_some());
+        assert!(
+            b.refine_times(1, w[1].4.clone()).is_none(),
+            "同一窗只重拼一次"
+        );
+    }
+
+    #[test]
+    fn t457_refine_survives_empty_window_in_between() {
+        // 空结果窗只推进序号、不动文字 ⇒ 其前一窗仍可重拼。
+        let w = windows();
+        let mut a = OrderedReflow::new();
+        let mut b = OrderedReflow::new();
+        let (seq, ws, we, text, t, st, sp) = w[0].clone();
+        a.push_window_timed(seq, ws, we, samples(), text.into(), Some(t.clone()), st, sp);
+        b.push_window_timed(seq, ws, we, samples(), text.into(), None, st, sp);
+        a.push_window_timed(1, 1, 2, vec![16000], String::new(), None, 1.0, 1.5);
+        b.push_window_timed(1, 1, 2, vec![16000], String::new(), None, 1.0, 1.5);
+        assert!(b.refine_times(0, t).is_some());
+        let (_, ws, we, text, t, st, sp) = w[2].clone();
+        let out_a = a.push_window_timed(2, ws, we, samples(), text.into(), Some(t.clone()), st, sp);
+        b.push_window_timed(2, ws, we, samples(), text.into(), None, st, sp);
+        assert_eq!(out_a.last(), b.refine_times(2, t).as_ref());
+    }
+
+    #[test]
+    fn t457_timed_push_leaves_nothing_to_refine() {
+        let w = windows();
+        let mut a = OrderedReflow::new();
+        let (seq, ws, we, text, t, st, sp) = w[0].clone();
+        a.push_window_timed(seq, ws, we, samples(), text.into(), Some(t.clone()), st, sp);
+        assert!(a.refine_times(0, t).is_none(), "已带时间拼接 ⇒ 无需重拼");
     }
 }

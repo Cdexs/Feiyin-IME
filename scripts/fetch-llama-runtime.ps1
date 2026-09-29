@@ -72,18 +72,13 @@ if (-not $SkipModel) {
     $mdir = Join-Path $Root "models\$ModelSub"
     New-Item -ItemType Directory -Force -Path $mdir | Out-Null
     foreach ($m in $Models) { Fetch "$HfBase/$($m.Name)" (Join-Path $mdir $m.Name) $m.Sha }
-    # tokenizer.json is only used to count wordbook tokens (same Qwen3 tokenizer as the GGUF vocab;
-    # byte-identical to Qwen/Qwen3-0.6B tokenizer.json, verified 2026-09-27).
-    $tok = Join-Path $mdir "tokenizer"
-    New-Item -ItemType Directory -Force -Path $tok | Out-Null
-    Fetch "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer.json" (Join-Path $tok "tokenizer.json") "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+    # MEM-TRIM-457: wordbook tokens are counted with the loaded GGUF vocab; tokenizer.json is no longer needed.
     Write-Host "model -> $mdir"
     $pub = Join-Path $Root "Publish\models"
     if ((Test-Path $pub) -and -not ((Get-Item $pub).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
         $pdir = Join-Path $pub $ModelSub
         New-Item -ItemType Directory -Force -Path $pdir | Out-Null
         foreach ($m in $Models) { Copy-Item -Force (Join-Path $mdir $m.Name) $pdir }
-        Copy-Item -Recurse -Force $tok $pdir
         Write-Host "model -> $pdir"
     }
 

@@ -6059,7 +6059,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sherpa-onnx",
- "tokenizers",
  "tokio",
  "toml 0.8.2",
  "tray-icon",

@@ -21,8 +21,11 @@ pub(crate) const LLAMA_ASR_MODEL_SUBDIR: &str = "qwen3-asr-1.7b-gguf";
 pub(crate) const LLAMA_ASR_MODEL_FILE: &str = "Qwen3-ASR-1.7B-Q8_0.gguf";
 pub(crate) const LLAMA_ASR_MMPROJ_FILE: &str = "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf";
 
-/// 上下文长度：音频（~12.5 token/s）+ 上下文 / 词库 + 生成。与原 sherpa `max_total_len=4096` 同额度。
+/// 上下文长度上限：音频（~12.5 token/s）+ 上下文 / 词库 + 生成。与原 sherpa `max_total_len=4096` 同额度。
 const N_CTX: i32 = 4096;
+/// MEM-TRIM-457 ②：初始上下文（KV 按此分配，q8_0 4096→1024 省 ~178MiB）；某窗放不下时 shim 自动重建为
+/// 更大（翻倍，封顶 [`N_CTX`]）。常规窗（词库 ~80 字 + 音频 ≤20s + 生成 ≤256）远小于 1024。
+const N_CTX_INIT: i32 = 1024;
 /// 未指定上限时的生成长度（与原 sherpa 全局 `max_new_tokens: 256` 一致）。
 pub(crate) const DEFAULT_MAX_NEW_TOKENS: i32 = 256;
 /// 草稿推测解码每步最多验证的草稿 token 数。
@@ -49,12 +52,14 @@ extern "C" {
         n_threads: c_int,
         n_threads_batch: c_int,
         n_ctx: c_int,
+        n_ctx_max: c_int,
         info: *mut c_char,
         info_len: c_int,
         err: *mut c_char,
         err_len: c_int,
     ) -> *mut c_void;
     fn las_free(e: *mut c_void);
+    fn las_count_tokens(e: *mut c_void, text: *const c_char) -> c_int;
     fn las_decode(
         e: *mut c_void,
         pcm: *const f32,
@@ -227,8 +232,34 @@ pub(crate) struct LlamaAsr {
 unsafe impl Send for LlamaAsr {}
 unsafe impl Sync for LlamaAsr {}
 
+/// MEM-TRIM-457 ③：当前已加载的 1.7B 引擎句柄，**只用于数词库 token**（读词表，不碰解码上下文）。
+/// 与解码锁 `lock` 分开 —— 录音开始时数 token 不必等正在跑的解码；`Drop` 在同一把锁下先注销再释放引擎，
+/// 数 token 期间引擎不会被释放。
+struct CountHandle(*mut c_void);
+// SAFETY：只经 `COUNT_ENGINE` 互斥访问；llama.cpp 的词表加载后只读，分词可与解码并行（llama-server 同用法）。
+unsafe impl Send for CountHandle {}
+static COUNT_ENGINE: Mutex<Option<CountHandle>> = Mutex::new(None);
+
+/// MEM-TRIM-457 ③：用已加载的 1.7B 引擎词表数 token（与原单独加载的 Qwen3 `tokenizer.json` 是同一套词表、
+/// 同口径 `add_special=false`，42 个真实词条逐个比对计数全同）。引擎未加载 / 失败 ⇒ `None`
+/// （调用方按 UTF-8 字节上界估算，与原 tokenizer 缺失时一致）。
+pub(crate) fn count_tokens(text: &str) -> Option<usize> {
+    let c = cstr(text).ok()?;
+    let g = COUNT_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+    let h = g.as_ref()?;
+    // SAFETY：句柄在锁内有效（Drop 先在同锁下注销）；c 在调用期间存活。
+    let n = unsafe { las_count_tokens(h.0, c.as_ptr()) };
+    (n >= 0).then_some(n as usize)
+}
+
 impl Drop for LlamaAsr {
     fn drop(&mut self) {
+        {
+            let mut g = COUNT_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+            if g.as_ref().is_some_and(|h| h.0 == self.ptr) {
+                *g = None;
+            }
+        }
         // SAFETY：ptr 由 las_create 返回且只在此处释放一次。
         unsafe { las_free(self.ptr) };
     }
@@ -251,12 +282,26 @@ impl LlamaAsr {
         if !ok {
             bail!("Qwen3-ASR GGUF model not found under {}", dir.display());
         }
+        Self::create(
+            &dir.join(LLAMA_ASR_MODEL_FILE),
+            &dir.join(LLAMA_ASR_MMPROJ_FILE),
+            &[true, false],
+        )
+    }
+
+    /// QUANT-AB-457：测试用 —— 指定主模型 / 编码器文件与设备（量化方案对比）。
+    #[cfg(test)]
+    pub(crate) fn load_files(model: &Path, mmproj: &Path, gpu: bool) -> Result<Self> {
+        Self::create(model, mmproj, &[gpu])
+    }
+
+    fn create(model: &Path, mmproj: &Path, devices: &[bool]) -> Result<Self> {
         ensure_runtime()?;
         let mut err;
-        let model = cstr(&dir.join(LLAMA_ASR_MODEL_FILE).to_string_lossy())?;
-        let mmproj = cstr(&dir.join(LLAMA_ASR_MMPROJ_FILE).to_string_lossy())?;
+        let model = cstr(&model.to_string_lossy())?;
+        let mmproj = cstr(&mmproj.to_string_lossy())?;
         let mut last_err = String::new();
-        for gpu in [true, false] {
+        for &gpu in devices {
             let (nt, ntb) = thread_plan(gpu);
             let mut info = [0u8; 256];
             err = [0u8; 512];
@@ -269,6 +314,7 @@ impl LlamaAsr {
                     gpu as c_int,
                     nt,
                     ntb,
+                    N_CTX_INIT,
                     N_CTX,
                     info.as_mut_ptr() as *mut c_char,
                     info.len() as c_int,
@@ -279,13 +325,15 @@ impl LlamaAsr {
             if !ptr.is_null() {
                 let device = buf_str(&info);
                 log::info!(
-                    "[ACC-452] Qwen3-ASR llama.cpp engine loaded: device={} threads={}/{} ctx={} in {}ms",
+                    "[ACC-452] Qwen3-ASR llama.cpp engine loaded: device={} threads={}/{} ctx={}(max {}) in {}ms",
                     device,
                     nt,
                     ntb,
+                    N_CTX_INIT,
                     N_CTX,
                     t0.elapsed().as_millis()
                 );
+                *COUNT_ENGINE.lock().unwrap_or_else(|e| e.into_inner()) = Some(CountHandle(ptr));
                 return Ok(Self {
                     ptr,
                     lock: Mutex::new(()),

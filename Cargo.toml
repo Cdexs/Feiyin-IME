@@ -25,7 +25,6 @@ sherpa-onnx = { version = "1.13.8", default-features = false, features = ["share
 # Offline translation via CTranslate2. Tokenization stays on the Rust side.
 ctranslate2 = { version = "2.1.1", default-features = false, features = ["tokenizers"] }
 ctranslate2-sys = { version = "0.1.5", features = ["crt-dynamic", "shared", "ruy"] }
-tokenizers = "0.22.1"
 sentencepiece = "0.13.1"
 
 # HTTP client for LLM API (cross-platform)
