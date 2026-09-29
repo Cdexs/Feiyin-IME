@@ -1,6 +1,7 @@
 # CHANGELOG - 变更日志 (voice-ime)
 
 > 任务编号 | 简要说明 | 负责人 | 完成时间
+| QUANT-AB-457 | **1.7B 量化对比：保持 Q8 + Q8，不换 Q6_K + f16 编码器**（DEC-096；Gavin「Q6K 的量化是不是比 Q8 的量化精确度要高？」）。以官方 bf16 为参考、17 段 120 窗：现行与 bf16 逐窗全同 115/120、字差 0.37%、CER 4.80%（= bf16）；Q6_K + f16 为 103/120、0.93%、5.00%，慢 9%，只省 ~0.24G。仅测试，生产零改动（`replay457_quant`） | 主控 | 2026-09-29 |
 | PIPE-SPEED-457 | **对齐移出关键路径 + 前缀 KV 复用**（DEC-095；Gavin「把这一次加对齐模型多出来的 0.25 秒能够消化掉……预览和精确的最终结果能够更快一些」「1234 都做」）。① 精解结果先回灌、对齐时间晚到按时间重拼（`OrderedReflow::refine_times`，同通道保序）② 松键最后一窗不对齐 ③ 1.7B 系统提示 / 词库前缀 KV 复用。回放 17 段 120 窗：解码 −7.4%、对齐 282ms/窗不再挡结果、终稿与 456 全同 17/17、CER 4.80% 不变；预览 7/112 窗约 0.28s 后微调接缝。新增 `refine_reflow_457_tests` 5 条 + `replay457_pipeline` / `poc457_prefix_determinism` | 主控 | 2026-09-29 |
 | MEM-TRIM-457 | **1.7B 省显存 / 内存**（DEC-095；Gavin「显存和内存的占用……不能影响功能和性能」）。① 输出上限 512→16（~65MiB）② 上下文 1024 起按需扩到 4096（KV ~178MiB）③ 词库计数改用已加载引擎词表，删 `tokenizer.json` 依赖与 `tokenizers` 直依赖（就位判据 / src-tauri 镜像 / fetch 脚本同步）④ 本地实时 VAD 分段器按需建。结果不变（回放 CER 4.80%）；全量 bin 1909P/0F/74I；fmt clean；warnings 90 | 主控 | 2026-09-29 |
 | TEST-EXEC + BUILD-456 | **FORCED-ALIGN-456 出包（tester-1，v0.9.4）**。回归 bin 1904P/0F/71I（NEW 20 / GONE 9；`main.rs` 的同名 `interior436_tests` 测 `window_overlap_split`（新逻辑仍用），应保留，任务书只写模块名致歧义）；九项全 PASS：main `5d60c1d8…` / ui `0dc5bd41…` / crash `24952e98…` 两副本等、均异于 454；0.9.4；探针正 `aligner-backbone-q8_0.gguf` main/ui 各 1、`[ALIGN-456] aligner attached` main 1，反 `[DBG-416] seam:` / `[DBG-433] win:` 0；Publish 对齐三件 sha 全对；冒烟 780M + aligner attached、启动无 NLLB 加载；window align 日志因无语音输入未取到（待 Gavin 端测） | tester-1 | 2026-09-29 |
