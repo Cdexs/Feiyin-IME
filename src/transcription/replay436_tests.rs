@@ -1925,3 +1925,340 @@ fn replay452_shrink() {
     }
     println!("[452r] 半截事件 {events}：旧做法回缩 {shrink_old} 次（>2 字 {big_old}）；新做法显示 {shown_new} 次、回缩 {shrink_new} 次（>2 字 {big_new}，最大 {max_new} 字）");
 }
+
+// ========================================================================
+// POC-ALIGN-455 第二步：按时间拼接 vs 现行接缝（回放 A/B，生产零改动）
+//
+// Gavin 2026-09-29「做吧」（对齐模型评估 → 选 CTC 路线 → 回放验值不值）。
+// 每窗精解一次（生产配置：草稿 + 词库），同一结果两种拼法：
+//   cur   = 现行 `OrderedReflow::push_window_streaming`（436 分界 + 433/435/431/371 兜底链）
+//   timed = 同窗音频跑性能档 FunASR Nano CTC 取逐字时间 → 与精解文字全局对齐把时间搬过去 →
+//           上一窗留「时间 < 分界」、新窗接「时间 ≥ 分界」（分界同 436：重叠区内部真停顿）。
+// 输出：有参考录音 CER、≥8 字重复录音数、CTC 耗时、逐录音全文对照 → collab/evidence/455/。
+// 运行：cargo test --bin feiyin-ime replay455 -- --ignored --nocapture
+// ========================================================================
+
+/// 对齐用「内容字」：汉字 / 字母 / 数字（小写），标点与空白不参与。
+fn content_char_455(c: char) -> Option<char> {
+    if c.is_alphanumeric() {
+        c.to_lowercase().next()
+    } else {
+        None
+    }
+}
+
+/// CTC 结果 → 逐内容字 (字, 窗内秒)。特殊记号（`<|…|>`）与空白丢弃；多字记号各字同一时间。
+fn ctc_chars_455(tokens: &[String], ts: &[f32]) -> Vec<(char, f32)> {
+    let mut out = Vec::new();
+    for (t, &x) in tokens.iter().zip(ts.iter()) {
+        if t.starts_with("<|") {
+            continue;
+        }
+        for c in t.chars().filter_map(content_char_455) {
+            out.push((c, x));
+        }
+    }
+    out
+}
+
+/// 全局对齐（Needleman-Wunsch，匹配 +2 / 替换 −1 / 空位 −1）把 CTC 时间搬到精解文字每个字上。
+/// 返回 (每字窗内秒, 匹配率)；未对上的内容字按前后已知时间线性插值，标点取前一字时间。
+fn qwen_char_times_455(text: &str, ctc: &[(char, f32)]) -> (Vec<f32>, f32) {
+    let chars: Vec<char> = text.chars().collect();
+    let content: Vec<(usize, char)> = chars
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &c)| content_char_455(c).map(|k| (i, k)))
+        .collect();
+    let (n, m) = (content.len(), ctc.len());
+    let mut assigned: Vec<Option<f32>> = vec![None; n];
+    let mut matched = 0usize;
+    if n > 0 && m > 0 {
+        let mut dp = vec![vec![0i32; m + 1]; n + 1];
+        for (i, row) in dp.iter_mut().enumerate() {
+            row[0] = -(i as i32);
+        }
+        for j in 0..=m {
+            dp[0][j] = -(j as i32);
+        }
+        for i in 1..=n {
+            for j in 1..=m {
+                let s = if content[i - 1].1 == ctc[j - 1].0 { 2 } else { -1 };
+                dp[i][j] = (dp[i - 1][j - 1] + s)
+                    .max(dp[i - 1][j] - 1)
+                    .max(dp[i][j - 1] - 1);
+            }
+        }
+        let (mut i, mut j) = (n, m);
+        while i > 0 && j > 0 {
+            let s = if content[i - 1].1 == ctc[j - 1].0 { 2 } else { -1 };
+            if dp[i][j] == dp[i - 1][j - 1] + s {
+                assigned[i - 1] = Some(ctc[j - 1].1);
+                if s == 2 {
+                    matched += 1;
+                }
+                i -= 1;
+                j -= 1;
+            } else if dp[i][j] == dp[i - 1][j] - 1 {
+                i -= 1;
+            } else {
+                j -= 1;
+            }
+        }
+    }
+    // 插值：未对上的内容字取前后已知时间的线性插值（两端缺则取最近已知 / 0）。
+    let known: Vec<(usize, f32)> = assigned
+        .iter()
+        .enumerate()
+        .filter_map(|(k, t)| t.map(|t| (k, t)))
+        .collect();
+    let filled: Vec<f32> = (0..n)
+        .map(|k| {
+            if let Some(t) = assigned[k] {
+                return t;
+            }
+            let prev = known.iter().rev().find(|(p, _)| *p < k);
+            let next = known.iter().find(|(p, _)| *p > k);
+            match (prev, next) {
+                (Some(&(pi, pt)), Some(&(ni, nt))) => {
+                    pt + (nt - pt) * (k - pi) as f32 / (ni - pi) as f32
+                }
+                (Some(&(_, pt)), None) => pt,
+                (None, Some(&(_, nt))) => nt,
+                (None, None) => 0.0,
+            }
+        })
+        .collect();
+    // 回到全部字符：内容字用 filled，标点 / 空白取前一内容字时间（开头取第一个内容字时间）。
+    let mut times = vec![0.0f32; chars.len()];
+    let mut ci = 0usize;
+    let mut last = filled.first().copied().unwrap_or(0.0);
+    for (i, t) in times.iter_mut().enumerate() {
+        if ci < n && content[ci].0 == i {
+            last = filled[ci];
+            ci += 1;
+        }
+        *t = last;
+    }
+    let rate = if n == 0 { 1.0 } else { matched as f32 / n as f32 };
+    (times, rate)
+}
+
+#[test]
+#[ignore = "POC-ALIGN-455 回放 A/B：需 GGUF + 流式 + FunASR Nano CTC + 录音；cargo test --bin feiyin-ime replay455 -- --ignored --nocapture"]
+fn replay455_timed_seam() {
+    crate::transcription::speaker::TEST_EXTRACTOR_MISSING.with(|c| c.set(true));
+    let root = manifest_dir();
+    let models = root.join("models");
+    let acc = create_qwen3_recognizer(&models).expect("Qwen3 GGUF 须在位");
+    let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
+        .expect("流式模型须在位");
+    let ctc = create_sensevoice_recognizer(&models, "auto").expect("FunASR Nano CTC 须在位");
+    let terms = load_real_wordbook_terms();
+    let run_stream = |audio: &[f32]| -> String {
+        let stream = st_rec.create_stream();
+        for c in audio.chunks(1600) {
+            stream.accept_waveform(RATE as i32, c);
+            while st_rec.is_ready(&stream) {
+                st_rec.decode(&stream);
+            }
+        }
+        stream.input_finished();
+        while st_rec.is_ready(&stream) {
+            st_rec.decode(&stream);
+        }
+        st_rec
+            .get_result(&stream)
+            .map(|r| r.text.clone())
+            .unwrap_or_default()
+    };
+    let (mut cer_cur, mut cer_timed, mut cer_n) = (0f32, 0f32, 0usize);
+    let (mut rep_cur, mut rep_timed) = (0usize, 0usize);
+    let (mut ctc_ms, mut windows, mut low_match, mut rate_sum) = (0f64, 0usize, 0usize, 0f32);
+    let mut report = String::from("# POC-ALIGN-455 按时间拼接 vs 现行接缝\n");
+    for wav in collect_wavs(&root) {
+        let name = wav
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string();
+        let Some((audio, rate)) = read_wav(&wav) else {
+            continue;
+        };
+        if rate as usize != RATE {
+            continue;
+        }
+        let mut pieces: Vec<(usize, usize)> = Vec::new();
+        for (s, e) in dispatch_slices(&audio) {
+            pieces.extend(vad::plan_gap_cuts(&audio, s, e));
+        }
+        let reference = read_ref_for(&name);
+        let mut reflow = OrderedReflow::new();
+        let mut cur_full = String::new();
+        // timed：已拼接的 (字, 录音绝对秒)。
+        let mut timed: Vec<(char, f32)> = Vec::new();
+        let mut seams: Vec<String> = Vec::new();
+        for (i, &(ps, pe)) in pieces.iter().enumerate() {
+            let mut waudio: Vec<f32> = Vec::new();
+            let mut wsamples: Vec<usize> = Vec::new();
+            let mut win_start = ps;
+            if i >= 1 {
+                let (pps, ppe) = pieces[i - 1];
+                let prev = &audio[pps..ppe];
+                let cs = crate::take_context_suffix(prev, "", "", RATE_CPS);
+                let cut = cs.cut.min(prev.len());
+                waudio.extend_from_slice(&prev[cut..]);
+                wsamples.push(cs.suffix_samples);
+                win_start = pps + cut;
+            }
+            waudio.extend_from_slice(&audio[ps..pe]);
+            wsamples.push(pe - ps);
+            let span_start = i.saturating_sub(1);
+            let split = crate::window_overlap_split(
+                span_start,
+                if i >= 1 { Some(i) } else { None },
+                &waudio,
+                &wsamples,
+            );
+            let stream_text = run_stream(&waudio);
+            let inject = CtxInject {
+                terms: terms.as_deref(),
+                avg_chars_per_sec: None,
+                speech_ranges: None,
+                streaming_nonempty: !stream_text.trim().is_empty(),
+                new_slice_from: wsamples[..wsamples.len() - 1].iter().sum(),
+                assist: crate::transcription::llama_asr::DecodeAssist::draft(Some(
+                    stream_text.as_str(),
+                )),
+            };
+            let text = transcribe_acc_ctx(&acc, &waudio, ChineseScript::Simplified, i, inject)
+                .map(|(t, _, _)| t)
+                .unwrap_or_default();
+            windows += 1;
+            // ---- timed：CTC 逐字时间 → 精解文字 ----
+            let s = ctc.create_stream();
+            s.accept_waveform(RATE as i32, &waudio);
+            let t0 = Instant::now();
+            ctc.decode(&s);
+            ctc_ms += t0.elapsed().as_secs_f64() * 1000.0;
+            let r = s.get_result().expect("ctc result");
+            let cc = ctc_chars_455(&r.tokens, &r.timestamps.clone().unwrap_or_default());
+            let (times, mrate) = qwen_char_times_455(&text, &cc);
+            rate_sum += mrate;
+            if mrate < 0.6 {
+                low_match += 1;
+            }
+            let win_abs = win_start as f32 / RATE as f32;
+            // 分界（绝对秒）：有重叠 ⇒ 重叠区内部真停顿（436 同款）；无重叠 ⇒ 本窗起点。
+            let t_split = match (i >= 1, split) {
+                (true, Some(f)) => win_abs + f * wsamples[0] as f32 / RATE as f32,
+                (true, None) => ps as f32 / RATE as f32,
+                _ => win_abs,
+            };
+            if !text.trim().is_empty() {
+                let before = timed.len();
+                let tchars: Vec<char> = text.chars().collect();
+                let low = mrate < 0.6;
+                let new_chars: Vec<(char, f32)> = if low && i >= 1 {
+                    // 兜底：时间搬不过去 ⇒ 上一窗全留，新窗按「非重叠占比」取尾部字数（371 同款比例估算）。
+                    let ov = wsamples[0] as f32 / waudio.len().max(1) as f32;
+                    let keep = ((tchars.len() as f32) * (1.0 - ov)).round() as usize;
+                    let from = tchars.len().saturating_sub(keep);
+                    tchars[from..]
+                        .iter()
+                        .map(|&c| (c, t_split + 0.001))
+                        .collect()
+                } else {
+                    timed.retain(|&(_, t)| t < t_split);
+                    let mut nc: Vec<(char, f32)> = tchars
+                        .iter()
+                        .copied()
+                        .zip(times.iter().map(|t| win_abs + t))
+                        .filter(|&(_, t)| t >= t_split)
+                        .collect();
+                    // 接缝抖动去重：分界两侧同一个内容字、时间差 <0.25s ⇒ 只留一个（前后窗时间误差几十 ms）。
+                    let last = timed
+                        .iter()
+                        .rev()
+                        .find_map(|&(c, t)| content_char_455(c).map(|k| (k, t)));
+                    let first = nc
+                        .iter()
+                        .position(|&(c, _)| content_char_455(c).is_some());
+                    if let (Some((lc, lt)), Some(fi)) = (last, first) {
+                        let (fc, ft) = nc[fi];
+                        if content_char_455(fc) == Some(lc) && (ft - lt).abs() < 0.25 {
+                            nc.drain(..=fi);
+                        }
+                    }
+                    nc
+                };
+                let dropped = before - timed.len();
+                seams.push(format!(
+                    "- 窗{i} 分界 {t_split:.2}s 匹配率 {mrate:.2}：上窗留 {} 字 / 删 {dropped} 字，新窗接 {} 字",
+                    timed.len(),
+                    new_chars.len()
+                ));
+                timed.extend(new_chars);
+            }
+            // ---- cur：现行接缝 ----
+            let out = reflow.push_window_streaming(
+                i,
+                span_start,
+                i + 1,
+                wsamples.clone(),
+                text,
+                stream_text,
+                split,
+            );
+            if let Some(f) = out.last().filter(|f| !f.is_empty()) {
+                cur_full = f.clone();
+            }
+        }
+        let (fc, lw) = reflow.finish();
+        let cur_text = {
+            let t = format!("{fc}{lw}");
+            if t.trim().is_empty() {
+                cur_full
+            } else {
+                t
+            }
+        };
+        let timed_text: String = timed.iter().map(|&(c, _)| c).collect();
+        if has_repeat8(&cur_text) {
+            rep_cur += 1;
+        }
+        if has_repeat8(&timed_text) {
+            rep_timed += 1;
+        }
+        let (cc, ct) = match reference.as_deref() {
+            Some(r) => {
+                let (a, b) = (cer(&cur_text, r), cer(&timed_text, r));
+                cer_cur += a;
+                cer_timed += b;
+                cer_n += 1;
+                (format!("{a:.4}"), format!("{b:.4}"))
+            }
+            None => ("-".into(), "-".into()),
+        };
+        report.push_str(&format!(
+            "\n## {name}（{} 窗）\n- **cur** CER={cc} | {cur_text}\n- **timed** CER={ct} | {timed_text}\n- 相同：{}\n{}\n",
+            pieces.len(),
+            cur_text == timed_text,
+            seams.join("\n")
+        ));
+        println!("[455] {name} done");
+    }
+    let summary = format!(
+        "\n## 汇总\n\n| 拼法 | 平均 CER（{cer_n} 段有参考） | ≥8 字重复录音 |\n|---|---:|---:|\n| cur（现行） | {:.4} | {rep_cur} |\n| timed（按时间） | {:.4} | {rep_timed} |\n\nCTC 共 {windows} 窗、总耗时 {:.1}s（{:.0}ms/窗，单线程）；平均匹配率 {:.2}，匹配率 <0.6 的窗 {low_match} 个。\n",
+        cer_cur / cer_n.max(1) as f32,
+        cer_timed / cer_n.max(1) as f32,
+        ctc_ms / 1000.0,
+        ctc_ms / windows.max(1) as f64,
+        rate_sum / windows.max(1) as f32
+    );
+    print!("{summary}");
+    report.push_str(&summary);
+    let dir = root.join("collab/evidence/455");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("replay455.md"), report).unwrap();
+}
