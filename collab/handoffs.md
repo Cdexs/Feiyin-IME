@@ -64,10 +64,12 @@
 - 对 bf16：现行 Q8 + Q8 字差 0.37%、CER 4.80%（= bf16）；Q6_K + f16 字差 0.93%、CER 5.00%、慢 9%、省 ~0.24G ⇒ 保持现行，生产零改动。
 - 本批（457）功能全部完成 ⇒ 任务书 TEST-EXEC + BUILD-457 已写好，待 tmux 会话起来后派 tester-1。
 
-## 2026-09-30 — tester-1 — TEST-EXEC-457 ✅ 回归全绿 + BUILD-457 ✅ 出包（版本 0.9.4）
+## 2026-09-30 — tester-1 — TEST-EXEC-457 ✅ 回归全绿 + BUILD-457 ✅ 出包（版本 0.9.4；重跑落档）
 
+- **背景**：上一会话回归汇总时模型接口 invalid request 中断、结果未落盘；本会话按要求从头重跑并落档，final artifacts 替换上一会话未落盘的临时值（原 `89eeb3c6…` / `a35395c5…` / `eb88a45c…`）。
 - **回归**：bin **1909P/0F/74I**（＝预期）/ root 1997P/0F/76I / src-tauri 92P/0F/0I / Vitest 100P/11skip / fmt EXIT 0；NEW 5（`refine_reflow_457_tests`）+ NEW ignored 3（`replay457_*` ×2 + `poc457_prefix_determinism`）、GONE 0；`migrate320_*` / `curate_*` 绿；warnings 90/9。
-- **出包九项全 PASS**：①00:15:07 / 00:12:40 / 00:13:41 ②两副本全等、三件异于 456：main `89eeb3c6…` / ui `a35395c5…` / crash `eb88a45c…` ③0.9.4.0（ui 0.9.4）④冒烟 PID 135264 Responding / 无 crash ⑤config `da2be5da…` 三时点不变 ⑥90/9 ⑦正 `[PIPE-457] last window: skip align` 1 / `[MEM-TRIM-457] llama context grown` 1 / `LAS_NO_PREFIX_CACHE` 1，反 `HOTWORDS-TOKEN-268: tokenizer loaded` 0 ⑧四 toml 三副本全等 ⑨VC 五件 == Redist 14.44.35112。
+- **出包九项全 PASS**：①main 00:30:54 / ui 00:18:08 / crash 00:29:38（Publish 00:31:06）②两副本全等、三件异于 456：main `ba491a57…` / ui `50b150b4…` / crash `7a176aa1…` ③0.9.4.0（ui 0.9.4）④冒烟 PID 36680 Responding / 无 crash / zero residual ⑤config `da2be5da…` 三时点不变 ⑥90/9 ⑦正 `[PIPE-457] last window: skip align` 1 / `[MEM-TRIM-457] llama context grown` 1 / `LAS_NO_PREFIX_CACHE` 1，反 `HOTWORDS-TOKEN-268: tokenizer loaded` 0 ⑧四 toml 三副本全等 ⑨VC 五件 == Redist 14.44.35112。
 - **模型**：不变，1.7B + 对齐三件 sha 全对；Publish 无 f16 mmproj、tokenizer 目录保留；20 DLL 三处一致。冒烟 `engine loaded … ctx=1024(max 4096)` + `[ALIGN-456] aligner attached`、无 tokenizer/NLLB 加载。
-- **显存/内存**（PID 135264，引擎加载后、无录音）：WorkingSet **1303.8 MB** / GPU Dedicated **3739.7 MB** / Shared **665.8 MB**（参考 456 ~1.6G / ~3.75G / ~0.905G）；`window align` 日志因无语音未取到（如实说明）。
+- **🟢 窗口路径实测取到**（麦克风 C920 拾环境音，非人工朗读）：`[ALIGN-456] window align` seq=1/2/3 + `[PIPE-457] last window: skip align seq=4` + `[DBG-457] seam refine`；新 exe 复现 `window align seq=0` + `skip align seq=1`。
+- **显存/内存**：引擎加载后 WS **1305.2 MB** / Dedicated **3739.7 MB** / Shared **665.8 MB**；录一段后（运行态）WS **1663.2 MB** / Dedicated **3780.2 MB** / Shared **841.2 MB**（参考 456 运行态 ~1.6G / ~3.75G / ~0.905G）。
 - **红线**：未改生产代码 / 版本未动 / 未 push / 零凭证。报告 `collab/outbox/tester-1/result.md`。
