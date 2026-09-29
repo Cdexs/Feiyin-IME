@@ -308,3 +308,50 @@ fn acc452_engine_equivalence() {
         std::fs::write(out_dir.join(format!("{label}.tsv")), tsv).unwrap();
     }
 }
+
+/// POC-ALIGN-455：Performance 档 FunASR Nano CTC（SenseVoice 配置）在 sherpa 1.13.8 下是否填 `timestamps`，
+/// 以及每 10s 窗 CPU 耗时 —— 决定「小模型出带时间戳文本 + 全局对齐」路线是否成立（372 立项前必验）。
+#[test]
+#[ignore = "POC-ALIGN-455：需 FunASR Nano CTC 模型 + 回放录音；--ignored 运行"]
+fn poc_align455_ctc_timestamps() {
+    let rec = super::create_sensevoice_recognizer(&root().join("models"), "auto").expect("ctc");
+    for name in [
+        "session-20260925-175022",
+        "session-20260925-175535",
+        "session-20260925-173634",
+    ] {
+        let w = sherpa_onnx::Wave::read(
+            root()
+                .join("collab/evidence/gavin-sessions")
+                .join(format!("{name}.wav"))
+                .to_str()
+                .unwrap(),
+        )
+        .expect("wav");
+        assert_eq!(w.sample_rate(), 16000);
+        let all = w.samples();
+        for (k, win) in all.chunks(16000 * 10).take(3).enumerate() {
+            let s = rec.create_stream();
+            s.accept_waveform(16000, win);
+            let t0 = std::time::Instant::now();
+            rec.decode(&s);
+            let ms = t0.elapsed().as_millis();
+            let r = s.get_result().expect("result");
+            let ts = r.timestamps.clone().unwrap_or_default();
+            let pairs: Vec<String> = r
+                .tokens
+                .iter()
+                .zip(ts.iter())
+                .map(|(t, x)| format!("{t}@{x:.2}"))
+                .collect();
+            println!(
+                "[455] {name}#{k} secs={:.1} ms={ms} tokens={} ts={} text={}\n      {}",
+                win.len() as f32 / 16000.0,
+                r.tokens.len(),
+                ts.len(),
+                r.text,
+                pairs.join(" ")
+            );
+        }
+    }
+}
