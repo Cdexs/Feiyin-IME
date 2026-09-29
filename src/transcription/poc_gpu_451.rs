@@ -355,3 +355,125 @@ fn poc_align455_ctc_timestamps() {
         }
     }
 }
+
+/// FORCED-ALIGN-456 实测：本 shim 对齐器 × DUMP455 导出的 120 窗 ⇒ 耗时、与 CrispASR（同模型）逐字起点差。
+/// 运行：ALIGN456_DIR=D:\Workspace\CodeLab\poc-455\windows cargo test --bin feiyin-ime poc_align456 -- --ignored --nocapture
+#[test]
+#[ignore = "FORCED-ALIGN-456：需对齐模型 + DUMP455 窗口；--ignored 运行"]
+fn poc_align456_shim_vs_crispasr() {
+    use super::llama_asr::LlamaAligner;
+    let _ = env_logger::builder()
+        .is_test(true)
+        .filter_level(log::LevelFilter::Warn)
+        .try_init();
+    let dir = std::path::PathBuf::from(std::env::var("ALIGN456_DIR").expect("ALIGN456_DIR"));
+    let t0 = std::time::Instant::now();
+    let al = LlamaAligner::load(&root().join("models")).expect("aligner");
+    println!(
+        "[456] device={} load={}ms",
+        al.device(),
+        t0.elapsed().as_millis()
+    );
+    let mut stems: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "wav"))
+        .collect();
+    stems.sort();
+    let (mut n, mut ms_sum, mut ms_max, mut none) = (0usize, [0f64; 4], 0f64, 0usize);
+    let mut diffs: Vec<f32> = Vec::new();
+    for wav in stems {
+        let text = std::fs::read_to_string(wav.with_extension("txt")).unwrap_or_default();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let w = sherpa_onnx::Wave::read(wav.to_str().unwrap()).unwrap();
+        let o = match al.align(w.samples(), &text) {
+            Ok(Some(o)) => o,
+            Ok(None) => {
+                none += 1;
+                continue;
+            }
+            Err(e) => panic!("{}: {e}", wav.display()),
+        };
+        n += 1;
+        for k in 0..4 {
+            ms_sum[k] += o.ms[k];
+        }
+        ms_max = ms_max.max(o.ms[0]);
+        // 与 CrispASR 同窗结果比：按内容字顺序配对起点。
+        let cj = wav.with_extension("align.json");
+        if let Ok(s) = std::fs::read_to_string(&cj) {
+            let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+            let theirs: Vec<f32> = v
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|x| {
+                    let st = x["start"].as_f64().unwrap() as f32;
+                    let k = x["word"]
+                        .as_str()
+                        .unwrap()
+                        .chars()
+                        .filter(|c| c.is_alphanumeric())
+                        .count();
+                    std::iter::repeat_n(st, k.min(1))
+                })
+                .collect();
+            let ours: Vec<f32> = super::llama_asr::align_units(&text)
+                .iter()
+                .map(|(_, r)| o.char_times[r.start].0)
+                .collect();
+            if ours.len() == theirs.len() {
+                diffs.extend(ours.iter().zip(&theirs).map(|(a, b)| (a - b).abs()));
+            }
+        }
+    }
+    // 压力：同一录音前 3 窗音频与文字首尾相接（约 30s / 150+ 字），跨多个文字批，须不崩、要么成功要么报错回落。
+    {
+        let pick = |i: usize| dir.join(format!("session-20260925-173634_{i:02}"));
+        let mut audio: Vec<f32> = Vec::new();
+        let mut text = String::new();
+        for i in 1..=4 {
+            let w =
+                sherpa_onnx::Wave::read(pick(i).with_extension("wav").to_str().unwrap()).unwrap();
+            audio.extend_from_slice(w.samples());
+            text.push_str(
+                &std::fs::read_to_string(pick(i).with_extension("txt")).unwrap_or_default(),
+            );
+        }
+        let r = al.align(&audio, &text);
+        println!(
+            "[456] stress secs={:.1} chars={} units={} => {}",
+            audio.len() as f32 / 16000.0,
+            text.chars().count(),
+            super::llama_asr::align_units(&text).len(),
+            match &r {
+                Ok(Some(o)) => format!("ok {:.0}ms", o.ms[0]),
+                Ok(None) => "invalid".into(),
+                Err(e) => format!("err {e}"),
+            }
+        );
+    }
+    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let q = |p: f32| {
+        diffs
+            .get(((diffs.len() as f32 - 1.0) * p) as usize)
+            .copied()
+            .unwrap_or(-1.0)
+    };
+    println!(
+        "[456] windows={n} invalid={none} ms avg={:.0}（编码 {:.0} / 主干 {:.0} / 头 {:.0}） max={:.0} | vs CrispASR {} 字：中位 {:.3}s P90 {:.3}s 最大 {:.3}s ≤0.1s {:.1}%",
+        ms_sum[0] / n.max(1) as f64,
+        ms_sum[1] / n.max(1) as f64,
+        ms_sum[2] / n.max(1) as f64,
+        ms_sum[3] / n.max(1) as f64,
+        ms_max,
+        diffs.len(),
+        q(0.5),
+        q(0.9),
+        q(1.0),
+        diffs.iter().filter(|d| **d <= 0.1).count() as f32 * 100.0 / diffs.len().max(1) as f32
+    );
+}

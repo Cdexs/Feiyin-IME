@@ -86,4 +86,51 @@ if (-not $SkipModel) {
         Copy-Item -Recurse -Force $tok $pdir
         Write-Host "model -> $pdir"
     }
+
+    # ---- FORCED-ALIGN-456: Qwen3-ForcedAligner-0.6B (bundled with the 1.7B model for local realtime) ----
+    # Source: 42ailab/Qwen3-ForcedAligner-0.6B-GGUF (Apache-2.0; f16 backbone + f16 audio encoder + head.bin).
+    # We ship Q8_0 of both GGUFs, rebuilt here from the public f16 files and pinned by sha256:
+    #   backbone: llama-quantize (same b11207 runtime) Q8_0
+    #   encoder : crispasr-quantize (CrispASR v0.8.38) q8_0, official ggml-org recipe
+    #             (position_embd stays f32, conv_out stays f16) - llama-quantize cannot quantize mmproj files.
+    $aSub = "qwen3-forcedaligner-0.6b-gguf"
+    $aBase = "https://huggingface.co/42ailab/Qwen3-ForcedAligner-0.6B-GGUF/resolve/main"
+    $aDir = Join-Path $Root "models\$aSub"
+    New-Item -ItemType Directory -Force -Path $aDir | Out-Null
+    $aOut = @(
+        @{ Name = "aligner-backbone-q8_0.gguf"; Sha = "1b5ea4c29aef7534798bb58f54ab9ae10c77bab6e92e59142158b001f319d97b" },
+        @{ Name = "aligner-mmproj-q8_0.gguf"; Sha = "7117f45d7d87b4714304bb82d0c43b28cec98287b81c88259a235acc347350d3" },
+        @{ Name = "aligner-head.bin"; Sha = "8a3f5ed737b36838f078e585b8844d24a1492cf18a8a32c51092f384fc706d28" }
+    )
+    $aReady = $true
+    foreach ($m in $aOut) { $p = Join-Path $aDir $m.Name; if (-not ((Test-Path $p) -and ((Get-Sha $p) -eq $m.Sha))) { $aReady = $false } }
+    if (-not $aReady) {
+        $work = Join-Path $Vendor "aligner-src"
+        New-Item -ItemType Directory -Force -Path $work | Out-Null
+        Fetch "$aBase/aligner-head.bin" (Join-Path $aDir "aligner-head.bin") $aOut[2].Sha
+        $bb = Join-Path $work "aligner-backbone-f16.gguf"
+        $mp = Join-Path $work "aligner-mmproj-f16.gguf"
+        Fetch "$aBase/aligner-backbone-f16.gguf" $bb "ceff10e4b524bf0d683bce032e035aaaeaaa265537b55d4e2e1867601638cefd"
+        Fetch "$aBase/aligner-mmproj-f16.gguf" $mp "73559b9e10132bdc97e001d5d383e6e72ebaf043fda4c4fab45c82ddbe0f2d67"
+        & (Join-Path $Extract "llama-quantize.exe") $bb (Join-Path $aDir "aligner-backbone-q8_0.gguf") Q8_0 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "llama-quantize failed" }
+        $cz = Join-Path $Vendor "crispasr-windows-x86_64-vulkan-v0.8.38.zip"
+        Fetch "https://github.com/CrispStrobe/CrispASR/releases/download/v0.8.38/crispasr-windows-x86_64-vulkan.zip" $cz "cae3f60051379eebf64330accc7c706b65eba169705b85b90d3fcd49f049fcab"
+        $cx = Join-Path $Vendor "crispasr-v0.8.38"
+        if (-not (Test-Path $cx)) { Expand-Archive -Path $cz -DestinationPath $cx -Force }
+        $cq = Get-ChildItem -Path $cx -Recurse -Filter "crispasr-quantize.exe" | Select-Object -First 1
+        & $cq.FullName $mp (Join-Path $aDir "aligner-mmproj-q8_0.gguf") q8_0 --tensor-type 'position_embd=f32' --tensor-type 'conv_out=f16' | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "crispasr-quantize failed" }
+        foreach ($m in $aOut) {
+            $got = Get-Sha (Join-Path $aDir $m.Name)
+            if ($got -ne $m.Sha) { throw "aligner sha256 mismatch for $($m.Name) ($got)" }
+        }
+    }
+    Write-Host "aligner -> $aDir"
+    if ((Test-Path $pub) -and -not ((Get-Item $pub).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        $pa = Join-Path $pub $aSub
+        New-Item -ItemType Directory -Force -Path $pa | Out-Null
+        foreach ($m in $aOut) { Copy-Item -Force (Join-Path $aDir $m.Name) $pa }
+        Write-Host "aligner -> $pa"
+    }
 }

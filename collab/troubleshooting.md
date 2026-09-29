@@ -92,6 +92,10 @@
 | [CT2-DLL-SHADOW-397] | 换 native DLL（CT2/oneDNN）后行为或性能**逐毫秒没变** → `cargo test` exe 在 `target/<profile>/deps/`，Windows 先加载 exe 同目录 ⇒ deps 里的旧 DLL 静默盖住新库。`ls -la` + `sha256sum` 两处对比即坐实；`build.rs` shared 分支须同时拷 `deps/` |
 | [BUILD-RS-RERUN-452] | 改了 build.rs 编译的 native 源码（shim.cpp）却链接旧 .lib、功能静默不生效 → winres 已输出 rerun-if-changed ⇒ cargo 只盯它声明的文件；native 源码必须自行声明 `rerun-if-changed`，怀疑没生效先比 out/ 产物时间戳 |
 | [PARTIAL-REFLOW-SHRINK-452] | 流式回灌时预览先吞后吐 → 半截结果沿用整窗替换边界、吞掉未解出的预览字；改预览的机制回放须按浮层真实合成量「显示长度回缩」，不能只量文字一致性 |
+| [ALIGN-MROPE-456] | 对齐器时间戳全部塌到第 0 档 → 42ailab 主干架构是 qwen3vl（M-RoPE），音频嵌入须经 `mtmd_helper_decode_image_chunk` 按多维位置送入；手工一维位置会错位。换模型先查 `general.architecture` |
+| [MTMD-TEXT-LEN-456] | `mtmd_tokenize` 报「media markers in text (0)」但文字里明明有标记 → b11207 的 `mtmd_input_text` 有 `text_len` 字段，只填指针 = 空串；新写 mtmd 调用照抄现有 `{ptr, len, ...}` 初始化 |
+| [EMBD-OUTPUT-ALL-456] | embeddings 模式设了 `n_outputs_max` 后偶发断言崩溃 → b11207 `output_all = cparams.embeddings`：批内**所有** token 都输出、无视 logits 标记；每批 token 数必须 ≤ 输出上限，不需要输出的段（音频）临时关 embeddings |
+| [WIN-MINMAX-456] | shim 里 `std::min(` 编译报 C2589 → windows.h 的 min/max 宏；写 `(std::min)(...)` |
 
 ## ASR / overlay / 产品行为
 

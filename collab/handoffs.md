@@ -189,3 +189,9 @@
 ## 2026-09-29 — tester-1 — TEST-EXEC + BUILD-454 ✅（453 + 454）
 
 - 全量 2067P/0F/76I；九项全 PASS；产物 main `31479092…` / ui `596e1bda…` / crash `557d6b76…`；Publish 编码器仅 Q8_0；冒烟正常、启动无 NLLB 加载。结果 `collab/outbox/tester-1/result.md`。主控抽查通过。待 Gavin 端测。
+
+## 2026-09-29 — 主控 — FORCED-ALIGN-456 ✅ 开发 + 回放完成（DEC-094）
+
+- 0.6B 强制对齐接入本地实时，窗口接缝按逐字时间拼接；删 416/431/433/435/436 估算链与旧测试、pinyin 依赖。
+- 验证：全量 bin 1904P/0F/71I；对齐器 112 窗与 CrispASR 逐字一致；回放接缝重复 5→0、CER 4.80%、闪烁 5.2%、回缩 0；显存 1.60G / 每窗 248ms。
+- 下一步：派 tester-1 TEST-EXEC + BUILD-456（Publish 须经 fetch 脚本同步对齐模型三件套）。

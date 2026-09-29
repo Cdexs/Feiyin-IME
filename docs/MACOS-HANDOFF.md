@@ -2629,3 +2629,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 行为变化 | 无（判定 / 剔除 / 注册逐位不变）；每窗精解前少算重复单元 |
 | 对 macOS 的影响 | 平台中立，编译同一份；无签名 / 依赖变化 |
 | 是否需要对方同步 | 否 |
+
+## FORCED-ALIGN-456（2026-09-29，主控）· 0.6B 强制对齐 + 接缝按逐字时间拼接
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | ① `native/llama_asr/shim.cpp` 新增对齐器 `las_align_create / las_align / las_align_free`（Qwen3-ForcedAligner-0.6B，主干 embeddings 模式 + mtmd 音频编码 + CPU 时间戳头）；② `llama_asr.rs` `LlamaAligner` + `LlamaAsr::attach_aligner/align`（**仅本地实时挂载**）；③ `transcription/mod.rs` `OrderedReflow` 改为 `push_window_timed`：两窗都有逐字时间 ⇒ 按时间拼接，否则 371 比例估算；**删除 431/433/435/436 接缝估算链（~1100 行）及 `pinyin` 依赖**；④ `main.rs` 解码线程精解后对齐、派发侧记录窗口虚拟时间轴（`window_abs_geometry`） |
+| 行为变化 | 窗口接缝重复半句消除（回放 ≥8 字重复录音 1→0）；每窗正式结果多等约 0.25s（对齐）；本地实时多占显存约 1.6G（Gavin「1+2」：编码器不预留缓冲、输出上限 128） |
+| 对 macOS 的影响 | 🔴 **必须同步模型**：`models/qwen3-forcedaligner-0.6b-gguf/` 三件套（主干 Q8_0 `1b5ea4c2…`、编码器 Q8_0 `7117f45d…`、`aligner-head.bin` `8a3f5ed7…`）；缺任一件 ⇒ 精解模型判未就位（与 1.7B 同一就位判据）。构建方法见 `scripts/fetch-llama-runtime.ps1`（42ailab f16 源 + llama-quantize / crispasr-quantize 复现，sha 固定；macOS 须用对应平台的两个量化工具，产物 sha 应一致，不一致请回报）。shim 为平台中立 C++，Metal 下同一路径；**未在 macOS 实测** |
+| 是否需要对方同步 | 是（模型文件 + 冒烟确认 `[ALIGN-456] aligner attached`） |

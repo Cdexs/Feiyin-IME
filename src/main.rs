@@ -8990,6 +8990,11 @@ fn spawn_worker_thread(
                                         // FIX-WINDOW-DISJOINT-369：累计派发片总数 ⇒ 由 `recent_slices` 长度
                                         // 反推窗口的**全局切片区间**（传给 OrderedReflow 判重叠，别再靠文本猜）。
                                         let mut total_slices: usize = 0;
+                                        // FORCED-ALIGN-456：各全局片的**累计结束样本**（虚拟时间轴：片首尾相接）。窗口音频 =
+                                        // 某片后缀 + 若干整片、总在第 `ge-1` 片末尾结束 ⇒ 窗口绝对起点 = 该累计值 − 窗口样本和。
+                                        let mut slice_cum_end: Vec<usize> = Vec::new();
+                                        // FORCED-ALIGN-456：`window_seq -> (窗口绝对起点秒, 与上一窗分界绝对秒)`。
+                                        let mut window_abs: Vec<(f32, f32)> = Vec::new();
                                         // `window_seq -> (start_slice, end_slice)`（dispatch 与 drain 同线程读写）。
                                         let mut window_spans: Vec<(usize, usize)> = Vec::new();
                                         // FIX-PREFIX-AND-EAT-371（B）：`window_seq -> 本窗各片样本数`
@@ -9095,6 +9100,28 @@ fn spawn_worker_thread(
                                                                 }
                                                             }),
                                                         );
+                                                        // FORCED-ALIGN-456：精解文字 × 本窗音频强制对齐（同一解码线程串行，GPU 不争抢）。
+                                                        // 用整窗音频（非剪静音后）⇒ 时间直接是窗内坐标；收割侧若改用兜底文字则不用这份时间。
+                                                        let t_align = std::time::Instant::now();
+                                                        let aligned = match &r {
+                                                            Ok((t, _, _)) if !t.trim().is_empty() => {
+                                                                recognizer.align(&audio, t)
+                                                            }
+                                                            _ => None,
+                                                        };
+                                                        if log::log_enabled!(log::Level::Debug) {
+                                                            let st = aligned.as_ref().map_or([0.0; 4], |o| o.ms);
+                                                            log::debug!(
+                                                                "[ALIGN-456] window align: seq={} ok={} ms={:.0}（编码 {:.0} / 主干 {:.0} / 头 {:.0}）",
+                                                                seq,
+                                                                aligned.is_some(),
+                                                                t_align.elapsed().as_secs_f64() * 1000.0,
+                                                                st[1],
+                                                                st[2],
+                                                                st[3]
+                                                            );
+                                                        }
+                                                        let char_times = aligned.map(|o| o.char_times);
                                                         let ms = t0.elapsed().as_secs_f64() * 1000.0;
                                                         // 382（3C）：解码完成时刻（端到端「解完 → 浮层重画」）。
                                                         let decode_done_at = std::time::Instant::now();
@@ -9106,8 +9133,14 @@ fn spawn_worker_thread(
                                                                 ms
                                                             );
                                                         }
-                                                        let _ =
-                                                            rtx.send((seq, dispatch_idx, r, ms, decode_done_at));
+                                                        let _ = rtx.send((
+                                                            seq,
+                                                            dispatch_idx,
+                                                            r,
+                                                            ms,
+                                                            decode_done_at,
+                                                            char_times,
+                                                        ));
                                                     }
                                                 });
                                             }
@@ -9159,15 +9192,12 @@ fn spawn_worker_thread(
                                                                 .copied()
                                                                 .unwrap_or((seq, seq + 1));
                                                             let smp = window_samples.get(seq).cloned().unwrap_or_default();
-                                                            let win_stream = window_streaming_texts
-                                                                .get(seq)
-                                                                .cloned()
-                                                                .unwrap_or_default();
-                                                            let win_split =
-                                                                window_split_fracs.get(seq).copied().flatten();
+                                                            // 半截结果无逐字时间 ⇒ 用上一窗的逐字时间切（`prev_timed_cut`，与正式结果切点一致）。
+                                                            let (win_abs_start, win_split_abs) =
+                                                                window_abs.get(seq).copied().unwrap_or((0.0, 0.0));
                                                             let mut probe = ordered.clone();
-                                                            let out = probe.push_window_streaming(
-                                                                seq, ws, we, smp, partial, win_stream, win_split,
+                                                            let out = probe.push_window_timed(
+                                                                seq, ws, we, smp, partial, None, win_abs_start, win_split_abs,
                                                             );
                                                             if let Some(candidate) = out.last() {
                                                                 let candidate = apply_authoritative_filler_dedup(candidate);
@@ -9215,7 +9245,7 @@ fn spawn_worker_thread(
                                             }
                                             macro_rules! harvest_acc_window {
                                                 ($res:expr) => {{
-                                                    let (seq, dispatch_idx, r, ms, decode_done_at) = $res;
+                                                    let (seq, dispatch_idx, r, ms, decode_done_at, char_times) = $res;
                                                     total_decode_ms += ms;
                                                     // SPEAKER-VERIFY-408B：本窗声纹剔除统计（供 406 放宽）。
                                                     let win_drop = match &r {
@@ -9442,28 +9472,23 @@ fn spawn_worker_thread(
                                                         win_samples.iter().sum::<usize>() as f32
                                                             / 16000.0;
                                                     let text_chars = text.chars().count();
-                                                    // SEAM-ARBITER-STREAMING-433：把本窗**预览（流式）原始文本**
-                                                    // 一并交给 `OrderedReflow` 作接缝裁判基准 R。
-                                                    // 🔴 取的是流式模型原始输出（`window_streaming_texts`），
-                                                    // 不含精解 / 浮层合成 / 回灌结果。
-                                                    let win_stream = window_streaming_texts
-                                                        .get(seq)
-                                                        .cloned()
-                                                        .unwrap_or_default();
-                                                    // SEAM-INTERIOR-ONLY-436：本窗重叠区分界（mod.rs 接线待第二阶段，
-                                                    // 本阶段仅计算 + 日志，供后续核对分界位置）。
-                                                    let win_split =
-                                                        window_split_fracs.get(seq).copied().flatten();
-                                                    if log::log_enabled!(log::Level::Debug) {
-                                                        log::debug!(
-                                                            "[DBG-436] split: seq={} split_frac={:?}",
-                                                            seq,
-                                                            win_split
-                                                        );
-                                                    }
-                            for authoritative in ordered.push_window_streaming(
+                                                    // FORCED-ALIGN-456：本窗文字即精解原文（非流式 / pending 兜底）⇒ 用强制对齐的逐字时间
+                                                    //（窗内秒 + 窗口绝对起点 = 录音虚拟时间轴）按时间拼接；否则无时间 ⇒ 371 比例估算。
+                                                    let (win_abs_start, win_split_abs) =
+                                                        window_abs.get(seq).copied().unwrap_or((0.0, 0.0));
+                                                    let win_times: Option<Vec<(f32, f32)>> =
+                                                        if !is_fallback && !use_tail && text == decoded {
+                                                            char_times.as_ref().map(|ts| {
+                                                                ts.iter()
+                                                                    .map(|&(a, b)| (win_abs_start + a, win_abs_start + b))
+                                                                    .collect()
+                                                            })
+                                                        } else {
+                                                            None
+                                                        };
+                            for authoritative in ordered.push_window_timed(
                                 seq, win_ws, win_we, win_samples, text,
-                                win_stream, win_split,
+                                win_times, win_abs_start, win_split_abs,
                             ) {
                                 // REFLOW-FILLER-ONCE-441：回灌**前**去重（此处文本 = 对齐后的
                                 // 权威全文 `committed + last_window`）；下方 `last_authoritative`
@@ -9718,6 +9743,14 @@ fn spawn_worker_thread(
                                                     ));
                                                     // 413：窗实际只含 `[must_start-1, ge)`（无前文时 = `[gs,ge)`）
                                                     // ⇒ 对齐 span 同步收窄，`window_samples.len() == ge - span_start`。
+                                                    window_abs.push(window_abs_geometry(
+                                                        &slice_cum_end,
+                                                        ge,
+                                                        span_start,
+                                                        window_spans.last().map(|&(_, e)| e),
+                                                        &window_samples_vec,
+                                                        win_split_frac,
+                                                    ));
                                                     window_split_fracs.push(win_split_frac);
                                                     window_spans.push((span_start, ge));
                                                     window_samples.push(window_samples_vec);
@@ -9781,6 +9814,14 @@ fn spawn_worker_thread(
                                                         AccHints {
                                                             draft: streaming.clone(),
                                                         },
+                                                    ));
+                                                    window_abs.push(window_abs_geometry(
+                                                        &slice_cum_end,
+                                                        ge,
+                                                        gs,
+                                                        window_spans.last().map(|&(_, e)| e),
+                                                        &samples,
+                                                        win_split_frac,
                                                     ));
                                                     window_split_fracs.push(win_split_frac);
                                                     window_spans.push((gs, ge));
@@ -9965,6 +10006,9 @@ fn spawn_worker_thread(
                                                             let mut saw_window = false;
                                                             for (k, s) in sub_segs.into_iter().enumerate() {
                                                                 cum_new += new_lens[k];
+                                                                slice_cum_end.push(
+                                                                    slice_cum_end.last().copied().unwrap_or(0) + s.len(),
+                                                                );
                                                                 recent_slices.push(s);
                                                                 recent_slice_ranges.push(
                                                                     seg_ranges
@@ -12985,6 +13029,8 @@ type AccDecodeResult = (
     anyhow::Result<(String, bool, transcription::AccDropStats)>,
     f64,
     std::time::Instant,
+    // FORCED-ALIGN-456：精解文字每字（起, 止）**窗内秒**（强制对齐；`None` = 未对齐 / 失败）。
+    Option<Vec<(f32, f32)>>,
 );
 
 /// FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382：滑窗解码任务载荷
@@ -13679,6 +13725,36 @@ struct ContextSuffix {
     gap_found: bool,
     /// 406 比对基准 = 前片流式末尾相应字数 + must 流式。
     baseline: String,
+}
+
+/// FORCED-ALIGN-456：窗口在录音虚拟时间轴上的 `(绝对起点秒, 与上一窗分界绝对秒)`（纯函数）。
+///
+/// 窗口音频在第 `ge-1` 片末尾结束 ⇒ 起点 = `slice_cum_end[ge-1] − Σsamples`。与上一窗共享
+/// `prev_we − span_start` 段（重叠区）；分界 = 重叠区起点 + `split_frac × 重叠样本`（436 同源），
+/// 无分界比例 ⇒ 重叠区终点（新片起点）；无重叠 ⇒ 窗口起点。
+fn window_abs_geometry(
+    slice_cum_end: &[usize],
+    ge: usize,
+    span_start: usize,
+    prev_span_end: Option<usize>,
+    samples: &[usize],
+    split_frac: Option<f32>,
+) -> (f32, f32) {
+    let end = ge
+        .checked_sub(1)
+        .and_then(|i| slice_cum_end.get(i))
+        .copied()
+        .unwrap_or(0);
+    let start = end.saturating_sub(samples.iter().sum());
+    let shared = prev_span_end
+        .map_or(0, |pe| pe.saturating_sub(span_start))
+        .min(samples.len());
+    let shared_samples: usize = samples[..shared].iter().sum();
+    let split = start as f32
+        + split_frac.map_or(shared_samples as f32, |f| {
+            f.clamp(0.0, 1.0) * shared_samples as f32
+        });
+    (start as f32 / 16000.0, split / 16000.0)
 }
 
 /// SEAM-INTERIOR-ONLY-436：本窗与上一窗重叠区的内部分界比例（相对重叠区起点，∈(0,1)）。
@@ -23212,9 +23288,9 @@ mod partial_reflow_452_tests {
             .expect("stream_partial_reflow 缺失");
         let body = body.split("macro_rules!").next().unwrap();
         assert!(body.contains(concat!("let mut probe = ordered", ".clone();")));
-        assert!(body.contains(concat!("probe.push_window", "_streaming(")));
+        assert!(body.contains(concat!("probe.push_window", "_timed(")));
         assert!(
-            !body.contains(concat!("ordered.push_window", "_streaming(")),
+            !body.contains(concat!("ordered.push_window", "_timed(")),
             "流式回灌不得改动真实拼接状态"
         );
         assert!(body.contains(concat!("seq == ordered.", "next_seq()")));
@@ -23269,5 +23345,32 @@ mod partial_boundary_452_tests {
         let b = partial_reflow_boundary("", 0, "我们周末", raw, 11).unwrap();
         assert_eq!(b, 5);
         assert_eq!(reflow_preview("我们周末", raw, b), "我们周末去公园散步吧");
+    }
+}
+
+#[cfg(test)]
+mod window_abs_456_tests {
+    use super::window_abs_geometry;
+
+    #[test]
+    fn t456_window_abs_start_and_split() {
+        // 片累计结束样本 [16000, 48000, 80000]；窗 = 片1 后缀 8000 + 片2 整片 32000，结束于片2 末（80000）。
+        let cum = [16000, 48000, 80000];
+        let (st, sp) = window_abs_geometry(&cum, 3, 1, Some(2), &[8000, 32000], Some(0.5));
+        assert!(
+            (st - 40000.0 / 16000.0).abs() < 1e-6,
+            "起点 = 80000 − 40000"
+        );
+        assert!(
+            (sp - (40000.0 + 4000.0) / 16000.0).abs() < 1e-6,
+            "分界 = 起点 + 0.5 × 重叠 8000"
+        );
+        let (_, sp) = window_abs_geometry(&cum, 3, 1, Some(2), &[8000, 32000], None);
+        assert!(
+            (sp - 48000.0 / 16000.0).abs() < 1e-6,
+            "无分界比例 ⇒ 重叠区终点（新片起点）"
+        );
+        let (st, sp) = window_abs_geometry(&cum, 1, 0, None, &[16000], None);
+        assert_eq!((st, sp), (0.0, 0.0), "首窗无重叠 ⇒ 分界 = 起点");
     }
 }

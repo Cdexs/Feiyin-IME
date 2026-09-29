@@ -72,6 +72,31 @@ extern "C" {
         on_partial: Option<extern "C" fn(*mut c_void, *const c_char)>,
         user: *mut c_void,
     ) -> c_int;
+    fn las_align_create(
+        backbone: *const c_char,
+        mmproj: *const c_char,
+        head: *const c_char,
+        gpu: c_int,
+        n_threads: c_int,
+        n_ctx: c_int,
+        info: *mut c_char,
+        info_len: c_int,
+        err: *mut c_char,
+        err_len: c_int,
+    ) -> *mut c_void;
+    fn las_align_free(a: *mut c_void);
+    fn las_align(
+        a: *mut c_void,
+        pcm: *const f32,
+        n_samples: c_int,
+        units_joined: *const c_char,
+        n_units: c_int,
+        out_start: *mut f32,
+        out_end: *mut f32,
+        ms_out: *mut f64,
+        err: *mut c_char,
+        err_len: c_int,
+    ) -> c_int;
 }
 
 /// ACC-452 ②⑤：解码辅助（不改变解码结果的两项能力）。
@@ -147,6 +172,27 @@ fn runtime_dir() -> Option<PathBuf> {
     None
 }
 
+/// 加载 llama.cpp 运行库（精解引擎与对齐器共用；shim 内幂等）。
+fn ensure_runtime() -> Result<()> {
+    let rt = runtime_dir()
+        .context("llama.cpp runtime libraries (llama.dll/mtmd.dll) not found next to exe")?;
+    let mut err = [0u8; 512];
+    // SAFETY：传入有效 NUL 结尾字符串与可写缓冲。
+    unsafe { las_set_log(forward_log) };
+    let rt_c = cstr(&rt.to_string_lossy())?;
+    let rc = unsafe {
+        las_load(
+            rt_c.as_ptr(),
+            err.as_mut_ptr() as *mut c_char,
+            err.len() as c_int,
+        )
+    };
+    if rc != 0 {
+        bail!("llama.cpp runtime load failed: {}", buf_str(&err));
+    }
+    Ok(())
+}
+
 /// 线程数（依据 451/452 实测）：
 /// - GPU：计算都在显卡，CPU 线程只做调度 / 采样 / 梅尔谱 ⇒ 4。
 /// - CPU 回落：生成取 min(逻辑核/2, 8)（≈物理核，实测 6~8 最快、16 反慢）；
@@ -173,6 +219,8 @@ pub(crate) struct LlamaAsr {
     ptr: *mut c_void,
     lock: Mutex<()>,
     device: String,
+    /// FORCED-ALIGN-456：强制对齐器（仅本地实时加载；`None` = 未加载 / 加载失败 ⇒ 接缝回落比例估算）。
+    aligner: Option<LlamaAligner>,
 }
 
 // SAFETY：引擎句柄只经 `lock` 串行访问；llama.cpp 上下文可在线程间移动（单线程使用）。
@@ -188,10 +236,12 @@ impl Drop for LlamaAsr {
 
 impl LlamaAsr {
     /// 模型文件所在目录（`<models>/qwen3-asr-1.7b-gguf/`）是否齐全。
+    /// FORCED-ALIGN-456：对齐模型与 1.7B 一起作为标配下载（Gavin 09-29）⇒ 三件套也计入就位判据。
     pub(crate) fn model_ready(models_root: &Path) -> (bool, PathBuf) {
         let dir = models_root.join(LLAMA_ASR_MODEL_SUBDIR);
-        let ok =
-            dir.join(LLAMA_ASR_MODEL_FILE).is_file() && dir.join(LLAMA_ASR_MMPROJ_FILE).is_file();
+        let ok = dir.join(LLAMA_ASR_MODEL_FILE).is_file()
+            && dir.join(LLAMA_ASR_MMPROJ_FILE).is_file()
+            && LlamaAligner::model_ready(models_root).0;
         (ok, dir)
     }
 
@@ -201,22 +251,8 @@ impl LlamaAsr {
         if !ok {
             bail!("Qwen3-ASR GGUF model not found under {}", dir.display());
         }
-        let rt = runtime_dir()
-            .context("llama.cpp runtime libraries (llama.dll/mtmd.dll) not found next to exe")?;
-        let mut err = [0u8; 512];
-        // SAFETY：传入有效 NUL 结尾字符串与可写缓冲。
-        unsafe { las_set_log(forward_log) };
-        let rt_c = cstr(&rt.to_string_lossy())?;
-        let rc = unsafe {
-            las_load(
-                rt_c.as_ptr(),
-                err.as_mut_ptr() as *mut c_char,
-                err.len() as c_int,
-            )
-        };
-        if rc != 0 {
-            bail!("llama.cpp runtime load failed: {}", buf_str(&err));
-        }
+        ensure_runtime()?;
+        let mut err;
         let model = cstr(&dir.join(LLAMA_ASR_MODEL_FILE).to_string_lossy())?;
         let mmproj = cstr(&dir.join(LLAMA_ASR_MMPROJ_FILE).to_string_lossy())?;
         let mut last_err = String::new();
@@ -254,6 +290,7 @@ impl LlamaAsr {
                     ptr,
                     lock: Mutex::new(()),
                     device,
+                    aligner: None,
                 });
             }
             last_err = buf_str(&err);
@@ -265,6 +302,33 @@ impl LlamaAsr {
     /// 实际使用的设备描述（如 `AMD Radeon 780M Graphics` / `CPU`）。
     pub(crate) fn device(&self) -> &str {
         &self.device
+    }
+
+    /// FORCED-ALIGN-456：挂载强制对齐器（只在本地实时调用；精确档批量识别不需要、不占显存）。
+    /// 加载失败只记警告（接缝回落 371 比例估算，精解不受影响）。
+    pub(crate) fn attach_aligner(&mut self, models_root: &Path) {
+        match LlamaAligner::load(models_root) {
+            Ok(a) => {
+                log::info!("[ALIGN-456] aligner attached (device={})", a.device());
+                self.aligner = Some(a);
+            }
+            Err(e) => log::warn!(
+                "[ALIGN-456] aligner unavailable, seams fall back to ratio estimate: {e:#}"
+            ),
+        }
+    }
+
+    /// FORCED-ALIGN-456：对齐一段音频与其文字 ⇒ 每个字符（与 `text.chars()` 一一对应）的（起, 止）秒。
+    /// 未挂载 / 失败 / 时间戳不合格 ⇒ `None`（调用方回落比例估算）。
+    pub(crate) fn align(&self, samples: &[f32], text: &str) -> Option<AlignOut> {
+        let al = self.aligner.as_ref()?;
+        match al.align(samples, text) {
+            Ok(o) => o,
+            Err(e) => {
+                log::warn!("[ALIGN-456] align failed: {e:#}");
+                None
+            }
+        }
     }
 
     /// 解码一段 16k 单声道 PCM。
@@ -380,5 +444,258 @@ impl LlamaAsr {
             raw: buf_str(&out),
             stats: st,
         })
+    }
+}
+
+// ============================================================================================
+// FORCED-ALIGN-456：Qwen3-ForcedAligner-0.6B 强制对齐器（音频 + 精解文字 ⇒ 每个字的起止秒）。
+//
+// Gavin 2026-09-29「就上 0.6B」「对齐模型要作为本地实时模式的标配下载（和 1.7B 模型一起）」。
+// 模型 = 42ailab/Qwen3-ForcedAligner-0.6B-GGUF 三件套（主干本地转 Q8_0）；POC-455 实测前后窗同一字时间差
+// 中位 0.03s、98.4% ≤0.1s。与精解引擎共用同一套 llama.cpp 运行库（shim `las_align_*`）。
+// ============================================================================================
+
+/// 对齐模型目录（`models/` 下）与文件名。
+pub(crate) const ALIGNER_SUBDIR: &str = "qwen3-forcedaligner-0.6b-gguf";
+pub(crate) const ALIGNER_BACKBONE_FILE: &str = "aligner-backbone-q8_0.gguf";
+pub(crate) const ALIGNER_MMPROJ_FILE: &str = "aligner-mmproj-q8_0.gguf";
+pub(crate) const ALIGNER_HEAD_FILE: &str = "aligner-head.bin";
+/// 对齐上下文：音频 12.5 token/s + 每字（字 + 2 槽）≈3 token；本地实时窗 ≤ 约 20s ⇒ 远小于 2048。
+const ALIGNER_N_CTX: i32 = 1024;
+
+/// 对齐用「单元」：汉字 / 假名等逐字；连续 ASCII 字母数字为一个词；标点与空白不入单元。
+/// 返回 (单元文字, 单元对应的字符下标区间 [起, 止))。
+pub(crate) fn align_units(text: &str) -> Vec<(String, std::ops::Range<usize>)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_ascii_alphanumeric() {
+            let s = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '\'') {
+                i += 1;
+            }
+            out.push((chars[s..i].iter().collect(), s..i));
+        } else if c.is_alphanumeric() {
+            out.push((c.to_string(), i..i + 1));
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 单元起止 → 每个字符的起止秒：单元内各字同一时间；标点 / 空白取前一内容字（开头取第一个单元）。
+pub(crate) fn char_times_from_units(
+    text: &str,
+    units: &[(String, std::ops::Range<usize>)],
+    spans: &[(f32, f32)],
+) -> Vec<(f32, f32)> {
+    let n = text.chars().count();
+    let mut out = vec![(0.0f32, 0.0f32); n];
+    let mut last = spans.first().copied().unwrap_or((0.0, 0.0));
+    let mut ui = 0usize;
+    for (i, slot) in out.iter_mut().enumerate() {
+        while ui < units.len() && units[ui].1.end <= i {
+            ui += 1;
+        }
+        if ui < units.len() && units[ui].1.contains(&i) {
+            last = spans[ui];
+        }
+        *slot = last;
+    }
+    out
+}
+
+/// 时间戳是否可用：非降（shim 已修复，这里兜底再验）且非「多数塌成零长度」。
+pub(crate) fn spans_valid(spans: &[(f32, f32)]) -> bool {
+    if spans.is_empty() {
+        return false;
+    }
+    if spans.windows(2).any(|w| w[1].0 + 1e-4 < w[0].0) {
+        return false;
+    }
+    let zero = spans.iter().filter(|(s, e)| e - s <= 1e-4).count();
+    !(spans.len() >= 4 && zero * 2 > spans.len())
+}
+
+/// 一次对齐的输出：每个字符的（起, 止）秒（与 `text.chars()` 一一对应）+ 耗时。
+pub(crate) struct AlignOut {
+    pub char_times: Vec<(f32, f32)>,
+    /// 毫秒：[总, 音频编码, 主干前向, 时间戳头]。
+    pub ms: [f64; 4],
+}
+
+/// 对齐器。内部串行（与精解同线程顺序调用）。
+pub(crate) struct LlamaAligner {
+    ptr: *mut c_void,
+    lock: Mutex<()>,
+    device: String,
+}
+
+// SAFETY：句柄只经 `lock` 串行访问；llama.cpp 上下文可在线程间移动（单线程使用）。
+unsafe impl Send for LlamaAligner {}
+unsafe impl Sync for LlamaAligner {}
+
+impl Drop for LlamaAligner {
+    fn drop(&mut self) {
+        // SAFETY：ptr 由 las_align_create 返回且只在此处释放一次。
+        unsafe { las_align_free(self.ptr) };
+    }
+}
+
+impl LlamaAligner {
+    /// 三件套是否齐全（`<models>/qwen3-forcedaligner-0.6b-gguf/`）。
+    pub(crate) fn model_ready(models_root: &Path) -> (bool, PathBuf) {
+        let dir = models_root.join(ALIGNER_SUBDIR);
+        let ok = [
+            ALIGNER_BACKBONE_FILE,
+            ALIGNER_MMPROJ_FILE,
+            ALIGNER_HEAD_FILE,
+        ]
+        .iter()
+        .all(|f| dir.join(f).is_file());
+        (ok, dir)
+    }
+
+    /// 加载：优先 GPU，失败回落 CPU（同精解引擎）。
+    pub(crate) fn load(models_root: &Path) -> Result<Self> {
+        let (ok, dir) = Self::model_ready(models_root);
+        if !ok {
+            bail!("forced aligner model not found under {}", dir.display());
+        }
+        ensure_runtime()?;
+        let backbone = cstr(&dir.join(ALIGNER_BACKBONE_FILE).to_string_lossy())?;
+        let mmproj = cstr(&dir.join(ALIGNER_MMPROJ_FILE).to_string_lossy())?;
+        let head = cstr(&dir.join(ALIGNER_HEAD_FILE).to_string_lossy())?;
+        let mut last_err = String::new();
+        for gpu in [true, false] {
+            let (_, ntb) = thread_plan(gpu);
+            let mut info = [0u8; 256];
+            let mut err = [0u8; 512];
+            let t0 = std::time::Instant::now();
+            // SAFETY：指针有效、缓冲可写；返回空指针表示失败。
+            let ptr = unsafe {
+                las_align_create(
+                    backbone.as_ptr(),
+                    mmproj.as_ptr(),
+                    head.as_ptr(),
+                    gpu as c_int,
+                    ntb,
+                    ALIGNER_N_CTX,
+                    info.as_mut_ptr() as *mut c_char,
+                    info.len() as c_int,
+                    err.as_mut_ptr() as *mut c_char,
+                    err.len() as c_int,
+                )
+            };
+            if !ptr.is_null() {
+                let al = Self {
+                    ptr,
+                    lock: Mutex::new(()),
+                    device: buf_str(&info),
+                };
+                // 预热：首次前向会现场编译 GPU 着色器（实测首窗 2.5s），加载时用 1s 静音 + 1 字先跑一次。
+                let warm = al.align(&[0.0f32; 16000], "嗯").is_ok();
+                log::info!(
+                    "[ALIGN-456] forced aligner loaded: device={} ctx={} warm={} in {}ms",
+                    al.device,
+                    ALIGNER_N_CTX,
+                    warm,
+                    t0.elapsed().as_millis()
+                );
+                return Ok(al);
+            }
+            last_err = buf_str(&err);
+            log::warn!("[ALIGN-456] aligner create failed (gpu={gpu}): {last_err}");
+        }
+        bail!("forced aligner create failed: {last_err}")
+    }
+
+    pub(crate) fn device(&self) -> &str {
+        &self.device
+    }
+
+    /// 对齐一段 16k 单声道 PCM 与其文字。无内容单元 ⇒ `Ok(None)`；时间戳不合格 ⇒ `Ok(None)`（调用方回落）。
+    pub(crate) fn align(&self, samples: &[f32], text: &str) -> Result<Option<AlignOut>> {
+        let units = align_units(text);
+        if units.is_empty() || samples.is_empty() {
+            return Ok(None);
+        }
+        let joined = cstr(
+            &units
+                .iter()
+                .map(|(u, _)| u.as_str())
+                .collect::<Vec<_>>()
+                .join("\u{1f}"),
+        )?;
+        let n = units.len();
+        let mut st = vec![0f32; n];
+        let mut en = vec![0f32; n];
+        let mut ms = [0f64; 4];
+        let mut err = [0u8; 512];
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY：缓冲长度 = n_units；指针在调用期间有效。
+        let rc = unsafe {
+            las_align(
+                self.ptr,
+                samples.as_ptr(),
+                samples.len() as c_int,
+                joined.as_ptr(),
+                n as c_int,
+                st.as_mut_ptr(),
+                en.as_mut_ptr(),
+                ms.as_mut_ptr(),
+                err.as_mut_ptr() as *mut c_char,
+                err.len() as c_int,
+            )
+        };
+        if rc != 0 {
+            bail!("forced align failed ({rc}): {}", buf_str(&err));
+        }
+        let spans: Vec<(f32, f32)> = st.into_iter().zip(en).collect();
+        if !spans_valid(&spans) {
+            return Ok(None);
+        }
+        Ok(Some(AlignOut {
+            char_times: char_times_from_units(text, &units, &spans),
+            ms,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod align456_tests {
+    use super::{align_units, char_times_from_units, spans_valid};
+
+    #[test]
+    fn t456_units_cjk_per_char_ascii_per_word_punct_skipped() {
+        let u = align_units("我用 Claude 写v2代码，OK！");
+        let words: Vec<&str> = u.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(words, ["我", "用", "Claude", "写", "v2", "代", "码", "OK"]);
+        assert_eq!(u[2].1, 3..9);
+    }
+
+    #[test]
+    fn t456_char_times_punct_takes_previous() {
+        let text = "你好，世界。";
+        let u = align_units(text);
+        let spans = [(0.1, 0.2), (0.2, 0.3), (1.0, 1.1), (1.1, 1.2)];
+        let t = char_times_from_units(text, &u, &spans);
+        assert_eq!(t.len(), 6);
+        assert_eq!(t[2], (0.2, 0.3), "逗号取前一字");
+        assert_eq!(t[5], (1.1, 1.2), "句号取前一字");
+        let lead = char_times_from_units("「好", &align_units("「好"), &[(0.5, 0.6)]);
+        assert_eq!(lead[0], (0.5, 0.6), "开头标点取第一个单元");
+    }
+
+    #[test]
+    fn t456_spans_valid_rejects_backwards_and_collapsed() {
+        assert!(spans_valid(&[(0.0, 0.1), (0.1, 0.2), (0.3, 0.4)]));
+        assert!(!spans_valid(&[(0.5, 0.6), (0.1, 0.2)]), "倒退");
+        assert!(!spans_valid(&[(1.0, 1.0); 5]), "塌成零长度");
+        assert!(!spans_valid(&[]));
     }
 }

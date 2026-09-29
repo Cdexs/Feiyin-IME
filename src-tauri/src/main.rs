@@ -119,9 +119,14 @@ fn check_accuracy_model_ready() -> AccuracyModelStatus {
     //（`llama_asr::LLAMA_ASR_MODEL_SUBDIR` / `LLAMA_ASR_MODEL_FILE` / `LLAMA_ASR_MMPROJ_FILE` + tokenizer.json）。
     let dir = model_dir.join("qwen3-asr-1.7b-gguf");
     // MEM-453：音频编码器 f16 → Q8_0。
+    // FORCED-ALIGN-456：强制对齐模型三件套随 1.7B 标配（镜像 `llama_asr::LlamaAligner::model_ready`）。
+    let al = model_dir.join("qwen3-forcedaligner-0.6b-gguf");
     let ready = dir.join("Qwen3-ASR-1.7B-Q8_0.gguf").exists()
         && dir.join("mmproj-Qwen3-ASR-1.7B-Q8_0.gguf").exists()
-        && dir.join("tokenizer").join("tokenizer.json").exists();
+        && dir.join("tokenizer").join("tokenizer.json").exists()
+        && al.join("aligner-backbone-q8_0.gguf").exists()
+        && al.join("aligner-mmproj-q8_0.gguf").exists()
+        && al.join("aligner-head.bin").exists();
     AccuracyModelStatus {
         ready,
         model_dir: dir.display().to_string(),

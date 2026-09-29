@@ -5381,3 +5381,29 @@ TEST-SYNC-420 给 `fix_reflow_raw_base_420_tests` 加 `fn_body` helper，内含 
 - **根因**：浮层回灌 = `acc_text + raw[committed_len..]`；半截结果沿用整窗边界 `committed_len`，边界内尚未解出的预览字被一并替换掉。回放 `replay452_stream` 只量了「中途文字会不会被改」，**没模拟浮层替换边界**，所以没发现（判据选错：量的是文字前缀一致性，不是显示长度单调）。
 - **修复**：事件加 `partial` 标记，浮层用 `partial_reflow_boundary` 现算「精解写到原始预览的位置」（新增有效字数估计 + 末尾两字 ±4 字对齐），显示 = 半截精解 + 预览未解部分；再加最后一道「新显示比当前短 >2 字即跳过」；半截渲染登记 `note_partial`，防上一窗晚到边界用旧全文重画。回放 `replay452_shrink`：旧做法 88/130 次明显回缩 → 新做法 0 次（最多少 2 字 = 口水词去除）。
 - **判据**：改预览显示的机制，回放必须按**浮层真实合成**量「显示长度是否回缩」，不能只量文字一致性。
+
+## [ALIGN-MROPE-456] 对齐器时间戳全部塌到第 0 档 —— 主干是 qwen3vl（M-RoPE），音频位置送错（2026-09-29）
+
+- **现象**：FORCED-ALIGN-456 shim 对齐器跑通但 120 窗 109 窗无效；逐槽位原始档位打印几乎全是 0；隐状态为正常有限数（非 NaN）。
+- **根因**：42ailab 的 `aligner-backbone-f16.gguf` `general.architecture = qwen3vl`、`rope.dimension_sections = [24,20,20,0]`（M-RoPE）。文字段 llama.cpp 会把一维位置自动展开成多维；**嵌入输入（音频）不会**，手工 `batch.pos[k] = n_past + k` 只给一维 ⇒ 位置错位 ⇒ 输出无意义。参考实现（llama.cpp-omni PR #115）用的是普通 qwen3 主干，所以没碰到。
+- **修复**：音频段改用 `mtmd_helper_decode_image_chunk`（按模型自动填多维位置）。修后 112 窗 0 无效、与 CrispASR 同模型逐字起点中位差 0。
+- **判据**：接入任何新 GGUF 先看 `general.architecture` / `rope.dimension_sections`；嵌入输入一律走 mtmd 辅助函数，不手填位置。
+
+## [MTMD-TEXT-LEN-456] mtmd_tokenize 说文字里 0 个媒体标记 —— 漏填 text_len（2026-09-29）
+
+- **现象**：`mtmd_tokenize: error: number of media markers in text (0) does not match number of bitmaps (1)`，打印送入文字开头确为 `<__media__>…`。
+- **根因**：b11207 `mtmd_input_text` 结构含 `size_t text_len`，实现 `input_text.assign(text->text, text->text_len)`；只赋 `text` 指针（`mtmd_input_text in{}` 零初始化）⇒ 长度 0 ⇒ 空串。
+- **判据**：写新的 mtmd 调用时照抄精解路径 `mtmd_input_text txt{prompt.c_str(), prompt.size(), true, true};` 的完整初始化。
+
+## [EMBD-OUTPUT-ALL-456] embeddings 模式下所有 token 都是输出 —— 超 n_outputs_max 即断言崩溃（2026-09-29）
+
+- **现象**：为省显存把对齐器 `n_outputs_max` 设 64 / 128 ⇒ `GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max) failed` 进程直接崩；设 256 时回放未崩，但只是因为测试窗文字 ≤ 270 token。
+- **根因**：b11207 `llama_context::decode`：`const bool output_all = cparams.embeddings;` ⇒ embeddings 模式下批内**每个 token 都输出**，调用方的 logits 标记被覆盖（日志 `embeddings required but some input tokens were not marked as outputs -> overriding`）；`output_reserve(n_outputs_all)` 超上限即断言。另：每个输出位置都会顺带算一遍 15 万维 logits（对齐用不到，约占主干耗时 1/4，暂无开关关掉）。
+- **修复**：文字按 `LAS_ALIGN_TEXT_BATCH = n_outputs_max = 256` 分批送入（结构上不可能超），每批解完立即拷出槽位隐状态；音频段送入前 `llama_set_embeddings(false)`、送完恢复。计算缓冲 299→150MiB，均耗 232→220ms；30.9s / 118 字压力输入 652ms 不崩。
+- **判据**：embeddings 上下文里「只标部分 token 输出」无效；上限类参数设小之前先证明每批 token 数有结构上界。
+
+## [WIN-MINMAX-456] shim 里 std::min 编译失败 —— windows.h 宏（2026-09-29）
+
+- **现象**：MSVC `error C2589: “(”:“::”右边的非法标记`。
+- **根因**：shim.cpp 包含 `<windows.h>`（未定义 `NOMINMAX`），`min` / `max` 宏展开吃掉 `std::min(`。
+- **判据**：shim 内一律写 `(std::min)(...)` / `(std::max)(...)`。
