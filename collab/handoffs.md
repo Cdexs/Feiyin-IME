@@ -97,3 +97,11 @@
 - ① 派发片开头剥静音幻字（不换流、不动预览；换流方案实测漂移已否）② 兜底窗强制对齐、按时间拼接。
 - 自测：bin 1912P/0F/80I；fmt clean；warnings 90；真录音 17 段对照 + 兜底窗回放通过。
 - 下一步：派 tester-1 TEST-EXEC-459 + BUILD-459。
+
+
+## 2026-09-30 — tester-1 — TEST-EXEC-459 + BUILD-459 ✅（回归全绿 ⇒ 出包）
+
+- 阶段四全绿：bin **1912P/0F/80I**（预期一致）、root 2000P/0F/82I、src-tauri 92P/0F/0I、Vitest 100P/11skip、fmt EXIT 0；NEW 2 + ignored 3、GONE 0；warnings 90/9；重点失效模式全绿。
+- 阶段五 BUILD-459（0.9.4）：九项全 PASS（①~⑨见 `collab/outbox/tester-1/result.md`）。main `db8c5e74…` / ui `2377357b…` 异于 458；crash `21ba6f9a…` 同 458（本批零改动）。
+- 冒烟：`-debug` PID 23180 Responding；`ctx=1024(max 4096)` + `aligner attached`；无 panic / 无 crash.json / 零残留。
+- 出包 Step 1 已结束输入法进程 ⇒ Gavin 需重启（提醒转告）。
