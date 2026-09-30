@@ -2647,3 +2647,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 行为变化 | 每窗正式结果不再等对齐（~0.28s）；预览约 6% 窗在 ~0.28s 后微调一次接缝（终稿与 456 逐位相同）；松键终稿最后一窗不等对齐；每窗解码约 −7%；1.7B 显存预计省约 0.25G |
 | 对 macOS 的影响 | 平台中立代码，macOS 编译同一份。🔴 macOS 运行时的 libmtmd 须导出 `mtmd_helper_eval_chunk_single`（b11207 已有；缺则引擎加载失败）；shim 的 `las_create` 签名变了，若 macOS 侧有自己的调用须同步加 `n_ctx_max`。`tokenizer.json` 不再需要（留着无害）。**未在 macOS 实测**（Metal 下前缀复用 / 上下文重建应同理） |
 | 是否需要对方同步 | 是（重新编译即可；冒烟确认 `[ACC-452] … ctx=1024(max 4096)` 与本地实时录音正常） |
+
+## LLAMA-TUNE-458 / DRAFT-LANG-PREV-458 / VAD-REUSE-458（2026-09-30，主控）· 草稿加速 + VAD 复用
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | ① `native/llama_asr/shim.cpp`：草稿开头补上一次模型自写的语种标记（`las_engine` 新增 `lang_draft` / `asr_text_tok`）；调试开关统一经 `las_env_get`（Windows 用 GetEnvironmentVariableA，其余平台 `getenv`）：`LAS_NO_DRAFT_LANG` / `LAS_NO_PREFIX_CACHE` / `LAS_UBATCH` / `LAS_MTMD_THREADS` / `LAS_DRAFT_MAX` / `LAS_SPLIT_ENC` / `LAS_ALIGN_UBATCH`（生产均不设）；`las_stats` 末尾新增 `double enc_ms`（Rust `LasStats` 同步，repr(C)） ② `main.rs` 精解线程把上一窗精解文字接进草稿；末尾窗 VAD 区间按常规窗拼 ③ `local_stream.rs` `dispatch_slice_ranges` 新增 `ongoing_onset` 参数，说话中途派发按判定位置保守补齐，不再返回 `None` |
+| 行为变化 | 精解每窗快 ~80ms（终稿可能个别标点不同，错字率不变）；中途片 / 末尾窗不再整窗重跑 VAD（每窗省 ~40ms） |
+| 对 macOS 的影响 | 平台中立代码，macOS 编译同一份；`las_stats` 结构体末尾加字段（C / Rust 两侧已同步，macOS 若有自建 shim 须同步）；`las_env_get` 非 Windows 走 `getenv`（进程内改环境变量在 macOS 上 `getenv` 可见，无此坑）。**未在 macOS 实测** |
+| 是否需要对方同步 | 重新编译即可 |

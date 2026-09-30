@@ -150,6 +150,9 @@ struct las_engine {
     // PIPE-SPEED-457 ③：首个文字段（system + 词库 + user 头）的 token 与其 KV 长度；下窗相同则复用，不重算。
     std::vector<llama_token> prefix_tokens;
     llama_pos prefix_pos = 0;
+    // DRAFT-LANG-PREV-458：上一次模型自写的语种标记（`language X<asr_text>` 的 token），作下一窗草稿开头。
+    std::vector<llama_token> lang_draft;
+    llama_token asr_text_tok = -1;
 };
 
 struct las_stats {
@@ -389,13 +392,21 @@ extern "C" int las_decode(las_engine * e, const float * pcm, int n_samples, cons
     auto t1 = clk::now();
 
     std::vector<llama_token> dtoks = (draft && *draft && draft_max > 0) ? tokenize(e->vocab, draft) : std::vector<llama_token>{};
-    // 调试 LAS_DRAFT_LANG：草稿前加语种前缀（特殊 token 解析）⇒ 模型自写的 `language Chinese<asr_text>` 也能被草稿命中。
-    if (!dtoks.empty() && pre.empty() && las_env_set("LAS_DRAFT_LANG")) {
-        static const char * lp = "language Chinese<asr_text>";
-        const int32_t nl = -p_llama_tokenize(e->vocab, lp, (int32_t) strlen(lp), nullptr, 0, false, true);
-        std::vector<llama_token> lt((size_t) (nl > 0 ? nl : 0));
-        if (nl > 0) p_llama_tokenize(e->vocab, lp, (int32_t) strlen(lp), lt.data(), nl, false, true);
-        dtoks.insert(dtoks.begin(), lt.begin(), lt.end());
+    // DRAFT-LANG-PREV-458：模型每窗先自写语种标记（`language Chinese<asr_text>`，3~4 个 token）⇒ 草稿开头补上它，
+    // 这几步也能被草稿命中（逐位贪心验证，猜错只是不采纳，不改输出）。用上一次实际生成的标记（说英文的用户自动
+    // 变成 English），首次默认 Chinese。回放：连同上一窗精解文字作草稿，生成步数 −28%、每窗 −80ms、CER 不变。
+    // 调试开关 LAS_NO_DRAFT_LANG 关闭（回放 A/B 用）。
+    if (!dtoks.empty() && pre.empty() && !las_env_set("LAS_NO_DRAFT_LANG")) {
+        if (e->lang_draft.empty()) {
+            static const char * lp = "language Chinese<asr_text>";
+            const int32_t nl = -p_llama_tokenize(e->vocab, lp, (int32_t) strlen(lp), nullptr, 0, false, true);
+            if (nl > 0) {
+                e->lang_draft.resize((size_t) nl);
+                p_llama_tokenize(e->vocab, lp, (int32_t) strlen(lp), e->lang_draft.data(), nl, false, true);
+                e->asr_text_tok = e->lang_draft.back();
+            }
+        }
+        dtoks.insert(dtoks.begin(), e->lang_draft.begin(), e->lang_draft.end());
     }
     std::vector<llama_token> hist;
     std::string gen = pre;
@@ -443,6 +454,15 @@ extern "C" int las_decode(las_engine * e, const float * pcm, int n_samples, cons
         if (on_partial) on_partial(user, gen.c_str());
     }
     p_llama_batch_free(batch);
+    // DRAFT-LANG-PREV-458：记下本次模型自写的语种标记（到 <asr_text> 为止，≤8 个 token），供下一窗草稿用。
+    if (pre.empty() && e->asr_text_tok >= 0) {
+        for (size_t i = 0; i < hist.size() && i < 8; i++) {
+            if (hist[i] == e->asr_text_tok) {
+                e->lang_draft.assign(hist.begin(), hist.begin() + (std::ptrdiff_t) i + 1);
+                break;
+            }
+        }
+    }
     auto t2 = clk::now();
     s.prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     s.gen_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();

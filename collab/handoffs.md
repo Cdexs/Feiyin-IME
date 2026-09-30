@@ -73,3 +73,10 @@
 - **🟢 窗口路径实测取到**（麦克风 C920 拾环境音，非人工朗读）：`[ALIGN-456] window align` seq=1/2/3 + `[PIPE-457] last window: skip align seq=4` + `[DBG-457] seam refine`；新 exe 复现 `window align seq=0` + `skip align seq=1`。
 - **显存/内存**：引擎加载后 WS **1305.2 MB** / Dedicated **3739.7 MB** / Shared **665.8 MB**；录一段后（运行态）WS **1663.2 MB** / Dedicated **3780.2 MB** / Shared **841.2 MB**（参考 456 运行态 ~1.6G / ~3.75G / ~0.905G）。
 - **红线**：未改生产代码 / 版本未动 / 未 push / 零凭证。报告 `collab/outbox/tester-1/result.md`。
+
+## 2026-09-30 — 主控 — LLAMA-TUNE-458 评估 + DRAFT-LANG-PREV-458 + VAD-REUSE-458 ✅ 开发完成（DEC-097）
+
+- 评估：`collab/research/llama-tune-458.md`；Gavin「一起做」建议①②。
+- ① 草稿加语种标记 + 上一窗精解文字：回放 −13%、CER 4.80% 不变、终稿差异仅标点 ② 中途片按开始说话判定位置补齐、末尾窗拼区间：真实录音 0 吞字。
+- 自测：bin 1910P/0F/77I；fmt clean；warnings 90；E2E `t458_mid_speech_dispatch_e2e` / `timeline393_r3` 通过。
+- 下一步：派 tester-1 TEST-EXEC-458 + BUILD-458。

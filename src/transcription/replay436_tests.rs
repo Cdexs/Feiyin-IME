@@ -2079,7 +2079,7 @@ fn poc457_prefix_determinism() {
 // Gavin 2026-09-30「你再仔细分析评估一下现在用 llama.cpp 调用 1.7B 精确模型的调用方式，看有没有可以再优化的参数，
 // 调用规格方面有没有可以再优化的地方和空间」「另外对齐模型也是，也评估分析一下」。
 // 同 replay457 几何 / 生产解码路径（草稿 + 词库），每个候选跑满 120 窗；调试开关（shim 环境变量，生产不设）：
-//   LAS_SPLIT_ENC（编码拆分计时，各变体都开）/ LAS_DRAFT_LANG / LAS_DRAFT_MAX / LAS_UBATCH / LAS_MTMD_THREADS / LAS_ALIGN_UBATCH
+//   LAS_SPLIT_ENC（编码拆分计时，各变体都开）/ LAS_NO_DRAFT_LANG（458 起语种草稿默认开） / LAS_DRAFT_MAX / LAS_UBATCH / LAS_MTMD_THREADS / LAS_ALIGN_UBATCH
 // 1.7B 变体：base / lang（草稿带语种前缀）/ lang+prev（再加上一窗精解全文）/ +draft16 / +ub256 / +ub512 / +mtmd8
 // 对齐器变体：整窗（现行）/ 剪静音后对齐再映射回窗内时间 / ubatch 256
 // 运行：cargo test --bin feiyin-ime replay458 -- --ignored --nocapture
@@ -2215,38 +2215,30 @@ fn replay458_tune() {
     // ---------------- 1.7B ----------------
     // (名称, 环境变量, 是否加上一窗精解全文作草稿, 是否需重建引擎)
     let variants: Vec<(&str, Vec<(&str, &str)>, bool)> = vec![
-        ("base（现行）", vec![], false),
         (
-            "无前缀复用（复核 457）",
-            vec![("LAS_NO_PREFIX_CACHE", "1")],
+            "base（458 前：无语种草稿）",
+            vec![("LAS_NO_DRAFT_LANG", "1")],
             false,
         ),
-        ("lang", vec![("LAS_DRAFT_LANG", "1")], false),
-        ("lang+prev", vec![("LAS_DRAFT_LANG", "1")], true),
         (
-            "lang+prev+draft16",
-            vec![("LAS_DRAFT_LANG", "1"), ("LAS_DRAFT_MAX", "16")],
-            true,
+            "无前缀复用（复核 457）",
+            vec![("LAS_NO_PREFIX_CACHE", "1"), ("LAS_NO_DRAFT_LANG", "1")],
+            false,
         ),
+        ("lang", vec![], false),
+        ("lang+prev", vec![], true),
+        ("lang+prev+draft16", vec![("LAS_DRAFT_MAX", "16")], true),
+        ("lang+prev+ub256", vec![("LAS_UBATCH", "256")], true),
+        ("lang+prev+ub512", vec![("LAS_UBATCH", "512")], true),
+        ("lang+prev+mtmd8", vec![("LAS_MTMD_THREADS", "8")], true),
         (
-            "lang+prev+ub256",
-            vec![("LAS_DRAFT_LANG", "1"), ("LAS_UBATCH", "256")],
-            true,
+            "base（复测，量 GPU 自身浮动）",
+            vec![("LAS_NO_DRAFT_LANG", "1")],
+            false,
         ),
-        (
-            "lang+prev+ub512",
-            vec![("LAS_DRAFT_LANG", "1"), ("LAS_UBATCH", "512")],
-            true,
-        ),
-        (
-            "lang+prev+mtmd8",
-            vec![("LAS_DRAFT_LANG", "1"), ("LAS_MTMD_THREADS", "8")],
-            true,
-        ),
-        ("base（复测，量 GPU 自身浮动）", vec![], false),
     ];
     let all_keys = [
-        "LAS_DRAFT_LANG",
+        "LAS_NO_DRAFT_LANG",
         "LAS_DRAFT_MAX",
         "LAS_UBATCH",
         "LAS_MTMD_THREADS",
@@ -2562,9 +2554,9 @@ fn poc458_quality() {
     let mut all: Vec<Vec<Vec<String>>> = Vec::new();
     for with_lang_prev in [false, true] {
         if with_lang_prev {
-            std::env::set_var("LAS_DRAFT_LANG", "1");
+            std::env::remove_var("LAS_NO_DRAFT_LANG");
         } else {
-            std::env::remove_var("LAS_DRAFT_LANG");
+            std::env::set_var("LAS_NO_DRAFT_LANG", "1");
         }
         let mut texts: Vec<Vec<String>> = Vec::new();
         for (_, _, wins, _) in &sessions {
@@ -2595,7 +2587,7 @@ fn poc458_quality() {
         }
         all.push(texts);
     }
-    std::env::remove_var("LAS_DRAFT_LANG");
+    std::env::remove_var("LAS_NO_DRAFT_LANG");
     drop(acc);
     let aligner =
         crate::transcription::llama_asr::LlamaAligner::load(&models).expect("对齐模型须在位");

@@ -9064,6 +9064,8 @@ fn spawn_worker_thread(
                                                 let ptx = partial_tx.clone();
                                                 let final_windows = final_windows.clone();
                                                 pool.spawn(move || {
+                                                    // DRAFT-LANG-PREV-458：上一窗精解文字（本窗开头与上一窗尾部是同一段重叠音频）。
+                                                    let mut prev_text = String::new();
                                                     for (
                                                         seq,
                                                         dispatch_idx,
@@ -9076,6 +9078,10 @@ fn spawn_worker_thread(
                                                         hints,
                                                     ) in trx
                                                     {
+                                                        // DRAFT-LANG-PREV-458：上一窗精解文字接在草稿后 ⇒ 重叠区推测解码可直接命中
+                                                        //（草稿逐位验证，不改输出；回放连同语种标记每窗 −80ms）。
+                                                        let mut hints = hints;
+                                                        hints.draft.push_str(&prev_text);
                                                         // 382（3C）：排队时间 = 派发 → worker 开始解码。
                                                         let queued_ms =
                                                             dispatched_at.elapsed().as_secs_f64() * 1000.0;
@@ -9122,6 +9128,9 @@ fn spawn_worker_thread(
                                                             Ok((t, _, _)) if !t.trim().is_empty() => Some(t.clone()),
                                                             _ => None,
                                                         };
+                                                        if let Ok((t, _, _)) = &r {
+                                                            prev_text = t.clone();
+                                                        }
                                                         let _ = rtx.send(AccWorkerMsg::Decoded((
                                                             seq,
                                                             dispatch_idx,
@@ -9825,10 +9834,11 @@ fn spawn_worker_thread(
                                             }
                                             // LOCALRT-TAIL-WINDOW-407：派发「末尾窗」——与 `dispatch_window!`
                                             // 同套记账，但**音频由调用方给定**（前片 `[cut..]` + pending，非整片），
-                                            // `span` 仍以 (p-1,p+1) 交对齐；VAD 区间传 `None`（前片取部分 ⇒ 片内区间
-                                            // 偏移不再成立）⇒ 该窗回退自跑 VAD。`win_samples` = [前片后缀, pending]。
+                                            // `span` 仍以 (p-1,p+1) 交对齐。`win_samples` = [前片后缀, pending]。
+                                            // VAD-REUSE-458：VAD 区间由调用方按常规窗同法拼好（前片区间 `trim_and_shift_ranges`
+                                            // 裁到后缀 + pending 区间）；原固定传 `None` ⇒ 每个末尾窗都整窗重跑 VAD（~39ms 挡在解码前）。
                                             macro_rules! dispatch_tail_window {
-                                                ($gs:expr, $ge:expr, $audio:expr, $samples:expr, $streaming:expr, $pending_samples:expr, $pending_streaming:expr, $far:expr) => {{
+                                                ($gs:expr, $ge:expr, $audio:expr, $samples:expr, $streaming:expr, $pending_samples:expr, $pending_streaming:expr, $far:expr, $ranges:expr) => {{
                                                     let gs: usize = $gs;
                                                     let ge: usize = $ge;
                                                     let audio: Vec<f32> = $audio;
@@ -9868,7 +9878,7 @@ fn spawn_worker_thread(
                                                         audio,
                                                         avg_snapshot,
                                                         std::time::Instant::now(),
-                                                        None, // 407：部分前片 ⇒ 传 None 回退自跑 VAD
+                                                        $ranges,
                                                         streaming_nonempty,
                                                         new_slice_from,
                                                         AccHints {
@@ -9955,6 +9965,16 @@ fn spawn_worker_thread(
                                                                 &samples,
                                                             )
                                                             .unwrap_or_default();
+                                                        // VAD-REUSE-458：前片后缀区间 + pending 区间（任一 None ⇒ 整窗 None，回退自跑 VAD）。
+                                                        let tail_ranges = shift_and_concat_ranges(
+                                                            &[
+                                                                recent_slice_ranges[i - 1]
+                                                                    .as_ref()
+                                                                    .map(|r| trim_and_shift_ranges(r, cs.cut)),
+                                                                recent_slice_ranges[i].clone(),
+                                                            ],
+                                                            &samples,
+                                                        );
                                                         dispatch_tail_window!(
                                                             gs,
                                                             ge,
@@ -9963,7 +9983,8 @@ fn spawn_worker_thread(
                                                             streaming,
                                                             vec![recent_slices[i].len()],
                                                             recent_streaming[i].clone(),
-                                                            tail_far
+                                                            tail_far,
+                                                            tail_ranges
                                                         );
                                                     } else if let Some((gs, ge)) =
                                                         tail_window_alone(Some(p), prev_base, recent_slices.len())
@@ -9989,7 +10010,8 @@ fn spawn_worker_thread(
                                                             streaming,
                                                             vec![recent_slices[i0].len()],
                                                             recent_streaming[i0].clone(),
-                                                            recent_slice_far[i0].clone()
+                                                            recent_slice_far[i0].clone(),
+                                                            recent_slice_ranges[i0].clone()
                                                         );
                                                     }
                                                 }};
