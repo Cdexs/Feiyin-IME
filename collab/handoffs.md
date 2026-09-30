@@ -90,3 +90,10 @@
 - **模型**：1.7B Q8_0 `58e22d05…` / mmproj `46c1d533…`；对齐三件 `1b5ea4c2…` / `7117f45d…` / `8a3f5ed7…` 全对（不变）；Publish 无 f16 mmproj、tokenizer 保留；32 DLL 两处一致。冒烟 `ctx=1024(max 4096)` + `[ALIGN-456] aligner attached`、无 panic。
 - 🔴 **窗口路径未取到新 decode 行**：录音尝试 7.7s（C920）但 `speech_detected=false`（环境静默），如实记录；日志中 `draft=a/b` / `source=vad|timeline` 系本构建前 04:11Z 会话，非本包证据。
 - **红线**：未改生产代码 / 版本未动 / 未 push / 零凭证；debug-audio 点名删本人 3 个、Gavin 24 个未动。报告 `collab/outbox/tester-1/result.md`。出包 Step 1 已结束输入法进程，**请主控转告 Gavin 重启**。
+
+## 2026-09-30 — 主控 — PHANTOM-406-459 ✅ 开发完成（DEC-098）
+
+- 根因（Gavin BUILD-458 端测录音 1）：静音幻字经 406 兜底进原始转写 + 兜底窗无时间致接缝比例估算多切。
+- ① 派发片开头剥静音幻字（不换流、不动预览；换流方案实测漂移已否）② 兜底窗强制对齐、按时间拼接。
+- 自测：bin 1912P/0F/80I；fmt clean；warnings 90；真录音 17 段对照 + 兜底窗回放通过。
+- 下一步：派 tester-1 TEST-EXEC-459 + BUILD-459。

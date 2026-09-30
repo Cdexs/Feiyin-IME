@@ -5427,3 +5427,20 @@ TEST-SYNC-420 给 `fix_reflow_raw_base_420_tests` 加 `fn_body` helper，内含 
 - **根因**：shim 用 `std::getenv`；MSVC CRT 的 `getenv` 读启动时拷贝的环境表，Rust `std::env::set_var` 走 `SetEnvironmentVariableW` 只改进程环境块，不更新 CRT 副本。
 - **影响**：PIPE-SPEED-457 的 `replay457_pipeline` / `poc457_prefix_determinism` 用 `LAS_NO_PREFIX_CACHE` 做的对照实际两组同配置：「−7.4%」是首遍预热差，「同窗连解 3 次出 2 种」也不是「关掉复用」的结果。正确复核：前缀复用 −11.6%；同配置复测 0 差异。
 - **判据**：shim 调试开关统一走 `las_env_get`（Windows：GetEnvironmentVariableA）；做开关 A/B 先确认开关生效（有可观测的行为差），再看耗时 / 结果。
+
+## [STREAM-RESTART-DRIFT-459] 中途换流丢字会让本句后半流式用字漂移（2026-09-30）
+
+- **现象**：PHANTOM-406-459 初版在开口时换新流、从「开口判定 − 0.5s」重喂以丢弃静音幻字；真录音 17 段中 3 段改变，除幻字消失外，本句后半「刺激过多→自激过多」「疑惑→疑或」「和规划→和规」等随之变化。按流式 paraformer 0.6s 解码块网格对齐重喂起点后仍有漂移。
+- **根因**：流式模型的解码块切分与左侧上下文都随流起点改变，后续每块看到的音频与状态不同。
+- **判据**：不要为了丢文字而重建实时流；在派发 / 下游文本层处理（DEC-098 改为从派发片开头剥幻字，预览与后续识别零改动）。
+
+## [TEST-COLDSTART-459] 流式管线 A/B 首跑冷启动干扰（2026-09-30）
+
+- **现象**：`t459_phantom_real_sessions` 中第一段录音（session-20260925-150350）两种模式派发片边界不同（「丹已经退」/「丹」），文本内容相同；加一次预热后差异消失。
+- **判据**：同进程多次跑流式管线的 A/B，先预热一遍再比。
+
+## [CFG-TEST-ANCHOR-459] 生产区加 cfg-test 属性打爆源码护栏（2026-09-30）
+
+- **现象**：在 `local_stream.rs` 生产代码上方加测试专用 `#[cfg(test)] thread_local!` 后，guard291 g1~g4、guard342、fix438 等 6 条护栏同时红。
+- **根因**：护栏以 `src.split("#[cfg(test)]").next()` 截取生产区。
+- **判据**：生产区内的测试开关写成 `cfg!(test)` 表达式（thread_local 无属性、生产里恒不生效），不出现 cfg-test 属性文本。

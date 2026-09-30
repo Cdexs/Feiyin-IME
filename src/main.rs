@@ -9181,6 +9181,9 @@ fn spawn_worker_thread(
                                             let mut done = 0usize;
                                             // PIPE-SPEED-457 ①：最近拼接、可按对齐时间重拼的窗 `(seq, dispatch_idx, 窗口绝对起点秒)`。
                                             let mut refine_meta: Option<(usize, usize, f32)> = None;
+                                            // PHANTOM-406-459 ②：已派发未收割窗口的整窗音频（兜底文本对齐用；收割即移除）。
+                                            let mut window_audio_keep: std::collections::HashMap<usize, Vec<f32>> =
+                                                std::collections::HashMap::new();
                                             // FIX-PREVIEW-HARVEST-380（A）：结果处理**单一定义** —— select 循环与
                                             // 收尾 drain 共用，保证该线程内 `push_window(` 只出现一处（防两份再漂移）。
                                             // ACC-ENGINE-LLAMACPP-452 ⑤：流式回灌（Gavin「回灌刷新你可以直接做」）。
@@ -9506,9 +9509,30 @@ fn spawn_worker_thread(
                                                         window_abs.get(seq).copied().unwrap_or((0.0, 0.0));
                                                     refine_meta = (!is_fallback && !use_tail && text == decoded)
                                                         .then_some((seq, dispatch_idx, win_abs_start));
+                                                    // PHANTOM-406-459 ②：兜底文本（流式）也做强制对齐 ⇒ 与下一窗的接缝按时间拼接（原无时间 ⇒
+                                                    // 371 比例估算，端测曾多切 13 字）。仅常规窗、兜底文本未经声纹 / 远场剔除（与整窗音频一一对应）。
+                                                    let win_audio = window_audio_keep.remove(&seq);
+                                                    let fb_times: Option<Vec<(f32, f32)>> = if is_fallback
+                                                        && !use_tail
+                                                        && fb_final == fb_raw
+                                                        && win_drop.dropped_speech_secs <= 0.0
+                                                        && !text.trim().is_empty()
+                                                    {
+                                                        win_audio.as_deref().and_then(|a| recognizer.align(a, &text)).map(|o| {
+                                                            o.char_times
+                                                                .into_iter()
+                                                                .map(|(a, b)| (win_abs_start + a, win_abs_start + b))
+                                                                .collect()
+                                                        })
+                                                    } else {
+                                                        None
+                                                    };
+                                                    if fb_times.is_some() && log::log_enabled!(log::Level::Debug) {
+                                                        log::debug!("[PHANTOM-459] fallback text aligned: seq={} chars={}", seq, text.chars().count());
+                                                    }
                             for authoritative in ordered.push_window_timed(
                                 seq, win_ws, win_we, win_samples, text,
-                                None, win_abs_start, win_split_abs,
+                                fb_times, win_abs_start, win_split_abs,
                             ) {
                                 // REFLOW-FILLER-ONCE-441：回灌**前**去重（此处文本 = 对齐后的
                                 // 权威全文 `committed + last_window`）；下方 `last_authoritative`
@@ -9797,6 +9821,7 @@ fn spawn_worker_thread(
                                                         &window_audio,
                                                         &window_samples_vec,
                                                     );
+                                                    window_audio_keep.insert(window_seq, window_audio.clone());
                                                     let _ = task_tx.send((
                                                         window_seq,
                                                         $idx,
@@ -9872,6 +9897,7 @@ fn spawn_worker_thread(
                                                         &audio,
                                                         &samples,
                                                     );
+                                                    window_audio_keep.insert(window_seq, audio.clone());
                                                     let _ = task_tx.send((
                                                         window_seq,
                                                         last_dispatch_idx,

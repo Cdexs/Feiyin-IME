@@ -2665,3 +2665,164 @@ fn poc458_quality() {
     std::fs::write(&out, report).unwrap();
     println!("[458] 报告：{}", out.display());
 }
+
+/// PHANTOM-406-459 ②：兜底窗（406 判精解不可信 / 精解空 ⇒ 用流式文本）也做强制对齐，接缝按时间拼接，
+/// 对照原「兜底窗无时间 ⇒ 下一窗 371 比例估算」。生产解码路径 + 同一 406 判据；兜底文本取整窗流式原文（回放无标点服务）。
+/// 运行：cargo test --bin feiyin-ime poc459_fallback_align -- --ignored --nocapture
+#[test]
+#[ignore = "PHANTOM-406-459 ②：--ignored 运行"]
+fn poc459_fallback_align() {
+    crate::transcription::speaker::TEST_EXTRACTOR_MISSING.with(|c| c.set(true));
+    let root = manifest_dir();
+    let models = root.join("models");
+    let mut acc = create_qwen3_recognizer(&models).expect("Qwen3 GGUF 须在位");
+    acc.attach_aligner(&models);
+    let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
+        .expect("流式模型须在位");
+    let terms = load_real_wordbook_terms();
+    let run_stream = |audio: &[f32]| -> String {
+        let stream = st_rec.create_stream();
+        for c in audio.chunks(1600) {
+            stream.accept_waveform(RATE as i32, c);
+            while st_rec.is_ready(&stream) {
+                st_rec.decode(&stream);
+            }
+        }
+        stream.input_finished();
+        while st_rec.is_ready(&stream) {
+            st_rec.decode(&stream);
+        }
+        st_rec
+            .get_result(&stream)
+            .map(|r| r.text.clone())
+            .unwrap_or_default()
+    };
+    let (mut n_fb, mut n_fb_aligned, mut n_win) = (0usize, 0usize, 0usize);
+    let (mut cer_old, mut cer_new, mut cer_n, mut rep_old, mut rep_new, mut diff) =
+        (0f32, 0f32, 0usize, 0usize, 0usize, 0usize);
+    let mut report = String::from("# PHANTOM-406-459 ② 兜底窗对齐回放\n\n");
+    for wav in collect_wavs(&root) {
+        let name = wav
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string();
+        let Some((audio, rate)) = read_wav(&wav) else {
+            continue;
+        };
+        if rate as usize != RATE {
+            continue;
+        }
+        let (cum_end, wins) = windows_457(&audio, &run_stream);
+        let n = wins.len();
+        let (mut r_old, mut r_new) = (OrderedReflow::new(), OrderedReflow::new());
+        for (i, w) in wins.iter().enumerate() {
+            n_win += 1;
+            let decoded = decode_457(&acc, w, i, terms.as_deref());
+            let verdict = crate::transcription::acc_vs_streaming(&decoded, &w.stream_text);
+            let is_fallback = decoded.is_empty() || !verdict.accept;
+            let text = if is_fallback {
+                w.stream_text.clone()
+            } else {
+                decoded.clone()
+            };
+            let prev_end = if i >= 1 { Some(i) } else { None };
+            let (abs, split_abs) = crate::window_abs_geometry(
+                &cum_end,
+                w.end,
+                w.span_start,
+                prev_end,
+                &w.wsamples,
+                w.split,
+            );
+            let to_abs = |o: crate::transcription::llama_asr::AlignOut| -> Vec<(f32, f32)> {
+                o.char_times
+                    .into_iter()
+                    .map(|(a, b)| (abs + a, abs + b))
+                    .collect()
+            };
+            if is_fallback && !text.trim().is_empty() {
+                n_fb += 1;
+                report.push_str(&format!(
+                    "- 兜底窗 {name} #{i}：精解「{decoded}」 流式「{}」 retention={:.2}\n",
+                    w.stream_text, verdict.retention
+                ));
+                // 旧：兜底窗无时间。新：兜底文本对齐后带时间拼接。
+                r_old.push_window_timed(
+                    i,
+                    w.span_start,
+                    w.end,
+                    w.wsamples.clone(),
+                    text.clone(),
+                    None,
+                    abs,
+                    split_abs,
+                );
+                let t = acc.align(&w.waudio, &text).map(to_abs);
+                n_fb_aligned += t.is_some() as usize;
+                r_new.push_window_timed(
+                    i,
+                    w.span_start,
+                    w.end,
+                    w.wsamples.clone(),
+                    text,
+                    t,
+                    abs,
+                    split_abs,
+                );
+            } else {
+                // 常规窗：两边同为 457 生产拼接（最后一窗不对齐）。
+                let t = if text.trim().is_empty() || i + 1 == n {
+                    None
+                } else {
+                    acc.align(&w.waudio, &text).map(to_abs)
+                };
+                for r in [&mut r_old, &mut r_new] {
+                    r.push_window_timed(
+                        i,
+                        w.span_start,
+                        w.end,
+                        w.wsamples.clone(),
+                        text.clone(),
+                        None,
+                        abs,
+                        split_abs,
+                    );
+                    if let Some(t) = &t {
+                        r.refine_times(i, t.clone());
+                    }
+                }
+            }
+        }
+        let fin = |r: OrderedReflow| {
+            let (c, l) = r.finish();
+            format!("{c}{l}")
+        };
+        let (fo, fnw) = (fin(r_old), fin(r_new));
+        rep_old += has_repeat8(&fo) as usize;
+        rep_new += has_repeat8(&fnw) as usize;
+        if fo != fnw {
+            diff += 1;
+            report.push_str(&format!(
+                "\n### 终稿不同：{name}\n- 旧（比例估算）：{fo}\n- 新（对齐拼接）：{fnw}\n"
+            ));
+        }
+        if let Some(rf) = read_ref_for(&name) {
+            cer_old += cer(&fo, &rf);
+            cer_new += cer(&fnw, &rf);
+            cer_n += 1;
+        }
+        println!("[459] {name} done");
+    }
+    let summary = format!(
+        "\n## 汇总\n\n- {n_win} 窗中兜底窗 {n_fb}（对齐成功 {n_fb_aligned}）；终稿不同 {diff} 段\n- 5 段 CER 旧 {:.4} / 新 {:.4}；≥8 字重复 旧 {rep_old} / 新 {rep_new}\n",
+        cer_old / cer_n.max(1) as f32,
+        cer_new / cer_n.max(1) as f32
+    );
+    print!("{summary}");
+    report.push_str(&summary);
+    let out = root.join("collab/evidence/459/fallback_align459.md");
+    let _ = std::fs::create_dir_all(out.parent().unwrap());
+    std::fs::write(&out, report).unwrap();
+    println!("[459] 报告：{}", out.display());
+}

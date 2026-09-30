@@ -755,6 +755,64 @@ fn slice_ranges_from_timeline(
         .collect()
 }
 
+// PHANTOM-406-459 ①：测试专用开关——对照「不剥幻字」的旧行为。生产构建里 `cfg!(test)` 恒 false ⇒ 恒剥。
+// 🔴 此处不写 cfg-test 属性：本文件多个源码护栏以「首个 cfg-test 属性」为生产区终点。
+thread_local! {
+    pub(crate) static TEST_NO_PHANTOM_STRIP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn phantom_strip_enabled() -> bool {
+    !(cfg!(test) && TEST_NO_PHANTOM_STRIP.with(|c| c.get()))
+}
+
+fn is_punct_or_space(c: char) -> bool {
+    c.is_whitespace() || c.is_ascii_punctuation() || "，。！？、；：…—·“”‘’（）《》【】".contains(c)
+}
+
+/// PHANTOM-406-459 ①：从派发片流式文本开头剥掉静音幻字 `phantom`。逐字比对（跳过标点 / 空白），
+/// **只有幻字整段原样出现在开头才剥**（连同其后紧跟的标点）；模型开口后改写过的不剥 ⇒ 最坏少剥，绝不多剥真话。
+fn strip_phantom_prefix(text: &str, phantom: &str) -> String {
+    let ph: Vec<char> = phantom.chars().filter(|&c| !is_punct_or_space(c)).collect();
+    if ph.is_empty() {
+        return text.to_string();
+    }
+    let mut k = 0usize;
+    for (i, c) in text.char_indices() {
+        if is_punct_or_space(c) {
+            continue;
+        }
+        if c != ph[k] {
+            return text.to_string();
+        }
+        k += 1;
+        if k == ph.len() {
+            return text[i + c.len_utf8()..]
+                .trim_start_matches(is_punct_or_space)
+                .to_string();
+        }
+    }
+    text.to_string()
+}
+
+/// 派发时取用一次：有待剥幻字 ⇒ 剥掉并清空（只作用于开口后的第一个派发片）。
+fn take_phantom_prefix(phantom: &mut String, seg_streaming: String) -> String {
+    if phantom.is_empty() {
+        return seg_streaming;
+    }
+    let p = std::mem::take(phantom);
+    if !phantom_strip_enabled() {
+        return seg_streaming;
+    }
+    let out = strip_phantom_prefix(&seg_streaming, &p);
+    if out != seg_streaming && log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "[PHANTOM-459] stripped silence-born text '{}' from dispatched slice",
+            p
+        );
+    }
+    out
+}
+
 /// VAD-REUSE-458：实时 VAD 判出「开始说话」比真实起点晚（silero 需连续 ≥0.1s 语音、窗口 32ms）⇒
 /// 进行中段起点按判定位置往前留 0.5s 余量（其后剪静音再各扩 0.2s）。
 const ONGOING_ONSET_MARGIN: usize = 8_000;
@@ -1310,6 +1368,13 @@ pub fn transcribe_streaming_local(
     let mut vad_only_speech_chunks = 0u64;
 
     let mut stream = recognizer.create_stream();
+    // PHANTOM-406-459 ①：本流在「本段尚无人声」时已吐过字（静音幻听，342 只在预览里压着）；
+    // `last_silence_text` = 最近一次被压的幻字；开口后转入 `phantom_prefix`，派发时剥掉一次。
+    let mut silence_text_seen = false;
+    let mut last_silence_text = String::new();
+    let mut phantom_prefix = String::new();
+    // 幻字最近一次变化时的音频位置（样本）⇒ 判「开口前多久就有了」。
+    let mut silence_text_changed_at: usize = 0;
     let mut state = StreamingAsrState::new();
     let mut sentence_id: i64 = 0;
     let mut last_display = String::new();
@@ -1542,6 +1607,20 @@ pub fn transcribe_streaming_local(
 
         pcm.extend_from_slice(&chunk);
         stream.accept_waveform(SAMPLE_RATE, &chunk);
+        // PHANTOM-406-459 ①：本流在「本段尚无人声」时吐过字（静音幻字，342 只在预览里压着），现在 VAD 判出开口
+        // ⇒ 记下这段幻字；下一次派发时从该片流式文本开头剥掉（406 比对基准 / 兜底文本 / 精解草稿都取自它）。
+        // 不动实时流与预览（换流实测会连带改变本句后半的流式用字）。
+        if vad_speech && silence_text_seen {
+            silence_text_seen = false;
+            phantom_prefix = std::mem::take(&mut last_silence_text);
+            if log::log_enabled!(log::Level::Debug) {
+                log::debug!(
+                    "[PHANTOM-459] speech after silence-born text: '{}' lead={:.2}s",
+                    phantom_prefix,
+                    pcm.len().saturating_sub(silence_text_changed_at) as f32 / SAMPLE_RATE as f32
+                );
+            }
+        }
         if !first_accept_seen {
             first_accept_seen = true;
             t_accept_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1774,6 +1853,8 @@ pub fn transcribe_streaming_local(
             // 影子逻辑每 400ms 就建一次，decode 0.5~0.7ms 起步，无性能顾虑）。
             // 342：假 endpoint 也换新流（清 endpoint 闩锁），但**不推进** sentence_id / sentence_pcm_start。
             stream = recognizer.create_stream();
+            silence_text_seen = false;
+            last_silence_text.clear();
             // 342：假 endpoint（本句无声）**不推进** sentence_id / sentence_pcm_start。
             sentence_id += segment_has_speech as i64;
             let next_sentence_start = if segment_has_speech {
@@ -1830,14 +1911,22 @@ pub fn transcribe_streaming_local(
                 state.on_result(sentence_id, &r.text, false, &[]);
                 // F-C-01（405）：同步增量缓存（替换 current 区；confirmed 区不变）。
                 display_cache.on_current(&r.text);
-            } else if !r.text.is_empty() && log::log_enabled!(log::Level::Debug) {
+            } else if !r.text.is_empty() {
                 // LOCALRT-ENDPOINT-EMPTY-342（F3）：静音段（自上次 endpoint 无有声 chunk）
                 // 的流式文本一律丢弃，不并入预览（幻字抑制）。
-                log::debug!(
-                    "[LocalRT-DBG-342] non-endpoint text on silence-only segment: suppressed '{}' (chars={})",
-                    r.text,
-                    r.text.chars().count()
-                );
+                // PHANTOM-406-459 ①：记下「本流已吐过静音幻字」及其内容（开口后派发时剥掉）。
+                silence_text_seen = true;
+                if r.text != last_silence_text {
+                    silence_text_changed_at = pcm.len();
+                    last_silence_text.clone_from(&r.text);
+                }
+                if log::log_enabled!(log::Level::Debug) {
+                    log::debug!(
+                        "[LocalRT-DBG-342] non-endpoint text on silence-only segment: suppressed '{}' (chars={})",
+                        r.text,
+                        r.text.chars().count()
+                    );
+                }
             }
         }
 
@@ -1882,7 +1971,10 @@ pub fn transcribe_streaming_local(
                 punct_head_chars = committed_len;
                 punct_tail_start = last_display_raw_len;
                 // 344-G：本片流式文本（失败片的填补来源），按 char 切片，字符安全。
-                let seg_streaming = segment_streaming_text(&last_display, acc_prev_committed);
+                let seg_streaming = take_phantom_prefix(
+                    &mut phantom_prefix,
+                    segment_streaming_text(&last_display, acc_prev_committed),
+                );
                 acc_prev_committed = committed_len;
                 // VAD-393（A2/R1）：派发由**静默 1200ms**（门 `has_speech`）触发，不保证派发当刻
                 // VAD 段已结束（门拒背景人声 / 误拒录音人轻声 / 本句与背景声无缝相接 ⇒ VAD 仍在段中）。
@@ -1991,6 +2083,7 @@ pub fn transcribe_streaming_local(
                             .skip(acc_prev_committed)
                             .take(committed_len.saturating_sub(acc_prev_committed))
                             .collect();
+                        let seg_streaming = take_phantom_prefix(&mut phantom_prefix, seg_streaming);
                         acc_prev_committed = committed_len;
                         // 切点在过去、VAD 可能仍在段中 ⇒ 进行中段按判定位置保守补齐（VAD-REUSE-458，不吞字）。
                         let slice_ranges = dispatch_slice_ranges(
@@ -2139,7 +2232,10 @@ pub fn transcribe_streaming_local(
             punct_head_chars = committed_len;
             punct_tail_start = last_display_raw_len;
             // 344-G：尾片流式文本（同 mid-loop，按 char 切片）。
-            let seg_streaming = segment_streaming_text(&last_display, acc_prev_committed);
+            let seg_streaming = take_phantom_prefix(
+                &mut phantom_prefix,
+                segment_streaming_text(&last_display, acc_prev_committed),
+            );
             // VAD-393（A2/R1）：尾片前已 `flush_speech` ⇒ 无进行中段 ⇒ `mid_speech=false`
             //（`vad_on=false` ⇒ None，回退 391 自跑 VAD，与中途派发同口径）。
             let slice_ranges = dispatch_slice_ranges(vad_on, false, None, &speech_timeline, &spans);
@@ -2889,6 +2985,202 @@ mod tests {
         assert_eq!(find_tail_cut(&vec![0.3f32; rate], 2 * rate), (0, false));
     }
 
+    /// PHANTOM-406-459 ①：合成「VAD 判静音但流式出字」—— 一段真实语音压到极低音量放在开头（VAD 判静音、
+    /// 流式仍可能出字），隔 0.8s 静音接正常音量语音。逐段对照「剥 / 不剥」幻字的派发片文本。
+    /// 运行：`cargo test --bin feiyin-ime -- --ignored --nocapture t459_phantom_synth`
+    #[test]
+    #[ignore = "requires streaming model + full.wav; --ignored 运行"]
+    fn t459_phantom_synth_e2e() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let Ok(recognizer) = super::create_local_stream_recognizer(&root.join("models")) else {
+            eprintln!("skip: 流式 paraformer 模型不在位");
+            return;
+        };
+        let wav = root.join("collab/research/audio-real-gavin/processed/full.wav");
+        let Some(w) = sherpa_onnx::Wave::read(wav.to_str().unwrap()) else {
+            eprintln!("skip: full.wav 不在位");
+            return;
+        };
+        let src = w.samples();
+        const R: usize = 16_000;
+        // 自然停顿切分：离线 VAD 取完整语音段，挑「A 段（作低音量幻听源）」与「其后开口的 B 段（正常音量）」。
+        let probe = super::VadSegmenter::try_new_for_local_trim(&root.join("models")).expect("vad");
+        let segs = probe.speech_ranges(&src[..(40 * R).min(src.len())]);
+        let pick: Vec<(usize, usize)> = segs
+            .iter()
+            .copied()
+            .filter(|&(a, b)| b - a >= R / 2)
+            .collect();
+        assert!(
+            pick.len() >= 3,
+            "full.wav 前 40s 应有 ≥3 段完整语音：{segs:?}"
+        );
+        let run = |audio: Vec<f32>, no_restart: bool| -> (Vec<String>, String) {
+            super::TEST_NO_PHANTOM_STRIP.with(|c| c.set(no_restart));
+            let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
+            let feeder = std::thread::spawn(move || {
+                for c in audio.chunks(1_600) {
+                    let _ = tx.send(c.to_vec());
+                }
+            });
+            let mut slices: Vec<String> = Vec::new();
+            let mut preview = String::new();
+            let _ = super::transcribe_streaming_local(
+                rx,
+                &recognizer,
+                None,
+                None,
+                0.01,
+                "",
+                |text, _words| {
+                    preview = text.to_string();
+                },
+                super::AccDispatchConfig::new(),
+                |_idx, _committed, _segs, seg_streaming, _ranges, _far| {
+                    slices.push(seg_streaming.to_string());
+                },
+                |_pcm_pos| {},
+                |_a, _b| {},
+            );
+            feeder.join().ok();
+            super::TEST_NO_PHANTOM_STRIP.with(|c| c.set(false));
+            (slices, preview)
+        };
+        let pad = 3 * R / 10;
+        let mut changed = 0usize;
+        for k in 0..pick.len() - 1 {
+            let (a0, a1) = pick[k];
+            let (b0, b1) = pick[k + 1];
+            let quiet = &src[a0.saturating_sub(pad)..(a1 + pad).min(src.len())];
+            let loud = &src[b0.saturating_sub(pad)..(b1 + pad).min(src.len())];
+            let (_, loud_alone) = run(
+                {
+                    let mut v = vec![0f32; R];
+                    v.extend_from_slice(loud);
+                    v.extend(std::iter::repeat(0f32).take(3 * R));
+                    v
+                },
+                false,
+            );
+            for scale in [0.004f32, 0.008] {
+                let mut audio: Vec<f32> = quiet.iter().map(|x| x * scale).collect();
+                audio.extend(std::iter::repeat(0f32).take(R * 8 / 10));
+                audio.extend_from_slice(loud);
+                audio.extend(std::iter::repeat(0f32).take(3 * R));
+                let (_, off_p) = run(audio.clone(), true);
+                let (_, on_p) = run(audio, false);
+                if off_p != on_p {
+                    changed += 1;
+                }
+                println!(
+                    "[459s] pair {k} scale={scale}\n   只放正常段={loud_alone}\n   不剥幻字={off_p}\n   剥幻字  ={on_p}"
+                );
+            }
+        }
+        println!("[459s] 剥幻字改变预览的组合：{changed}");
+    }
+
+    /// PHANTOM-406-459 ①：Gavin 全部真实录音（`collab/evidence/gavin-sessions` + `target/release/debug-audio`）
+    /// 走完整流式管线，「剥 / 不剥」幻字逐段对照派发片流式文本与最终预览 —— 看多常触发、改了什么。
+    /// 运行：`cargo test --bin feiyin-ime -- --ignored --nocapture t459_phantom_real`
+    #[test]
+    #[ignore = "requires streaming model + real sessions; --ignored 运行"]
+    fn t459_phantom_real_sessions() {
+        static CAP: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        struct L;
+        impl log::Log for L {
+            fn enabled(&self, m: &log::Metadata<'_>) -> bool {
+                m.level() <= log::Level::Debug
+            }
+            fn log(&self, r: &log::Record<'_>) {
+                let t = r.args().to_string();
+                if t.contains("[PHANTOM-459]") {
+                    CAP.lock().unwrap().push(t);
+                }
+            }
+            fn flush(&self) {}
+        }
+        let _ = log::set_boxed_logger(Box::new(L));
+        log::set_max_level(log::LevelFilter::Debug);
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let Ok(recognizer) = super::create_local_stream_recognizer(&root.join("models")) else {
+            eprintln!("skip: 流式 paraformer 模型不在位");
+            return;
+        };
+        let mut wavs: Vec<std::path::PathBuf> = Vec::new();
+        for d in [
+            "collab/evidence/gavin-sessions",
+            "target/release/debug-audio",
+        ] {
+            if let Ok(rd) = std::fs::read_dir(root.join(d)) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension().is_some_and(|x| x == "wav") {
+                        wavs.push(p);
+                    }
+                }
+            }
+        }
+        wavs.sort();
+        let run = |audio: Vec<f32>, no_restart: bool| -> (Vec<String>, String) {
+            super::TEST_NO_PHANTOM_STRIP.with(|c| c.set(no_restart));
+            let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
+            let feeder = std::thread::spawn(move || {
+                for c in audio.chunks(1_600) {
+                    let _ = tx.send(c.to_vec());
+                }
+            });
+            let mut slices: Vec<String> = Vec::new();
+            let mut preview = String::new();
+            let _ = super::transcribe_streaming_local(
+                rx,
+                &recognizer,
+                None,
+                None,
+                0.01,
+                "",
+                |text, _words| {
+                    preview = text.to_string();
+                },
+                super::AccDispatchConfig::new(),
+                |_idx, _committed, _segs, seg_streaming, _ranges, _far| {
+                    slices.push(seg_streaming.to_string());
+                },
+                |_pcm_pos| {},
+                |_a, _b| {},
+            );
+            feeder.join().ok();
+            super::TEST_NO_PHANTOM_STRIP.with(|c| c.set(false));
+            (slices, preview)
+        };
+        let (mut n, mut changed) = (0usize, 0usize);
+        for wav in &wavs {
+            let Some(w) = sherpa_onnx::Wave::read(wav.to_str().unwrap()) else {
+                continue;
+            };
+            if w.sample_rate() != 16_000 {
+                continue;
+            }
+            let audio = w.samples().to_vec();
+            if n == 0 {
+                let _ = run(audio.clone(), true); // 预热：首跑冷启动会改变切片边界，排除干扰
+            }
+            let (off_s, off_p) = run(audio.clone(), true);
+            CAP.lock().unwrap().clear();
+            let (on_s, on_p) = run(audio, false);
+            n += 1;
+            let name = wav.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+            for l in CAP.lock().unwrap().iter() {
+                println!("[459r] {name} {l}");
+            }
+            if off_s != on_s || off_p != on_p {
+                changed += 1;
+                println!("[459r] {name} 改变：\n   不剥幻字 preview={off_p}\n   剥幻字   preview={on_p}\n   不剥幻字 slices={off_s:?}\n   剥幻字   slices={on_s:?}");
+            }
+        }
+        println!("[459r] 真实录音 {n} 段，剥幻字改变结果 {changed} 段");
+    }
+
     /// 407 真模型：真实连续语音（>10s）+ 3s 尾静默 ⇒ 长静默信号应在**静默满 ~1900ms** 时触发一次
     /// （不依赖停止键）；打印触发时刻（wall）与静默起点（音频时间）。
     /// 运行：`cargo test --bin feiyin-ime -- --ignored --nocapture poc_tailwindow_407`
@@ -2942,6 +3234,41 @@ mod tests {
         assert!(signal_ms.is_some(), "长静默信号必须触发一次");
     }
     use std::time::Duration;
+
+    /// PHANTOM-406-459 ①：静音幻字只在整段原样出现在开头时剥掉（跳过标点），否则原样保留。
+    #[test]
+    fn t459_strip_phantom_prefix() {
+        use super::strip_phantom_prefix as st;
+        // Gavin 09-30 端测：幻字「他有这个事」+ 模型开口后多出的「儿」保留（最坏少剥）。
+        assert_eq!(
+            st("他有这个事儿，今天天气很好", "他有这个事"),
+            "儿，今天天气很好"
+        );
+        assert_eq!(st("我系你喂喂", "我系你"), "喂喂");
+        assert_eq!(st("我系你，喂喂", "我系你"), "喂喂", "紧跟的标点一并去掉");
+        assert_eq!(st("我，系你喂喂", "我系你"), "喂喂", "幻字中间的标点跳过");
+        // 开口后模型改写 ⇒ 不剥（绝不多剥真话）。
+        assert_eq!(st("他们今天去了", "他有这个事"), "他们今天去了");
+        assert_eq!(st("今天天气很好", "他有这个事"), "今天天气很好");
+        assert_eq!(st("他有", "他有这个事"), "他有", "文本比幻字短 ⇒ 不剥");
+        assert_eq!(st("你好", ""), "你好");
+        assert_eq!(st("你好", "，。"), "你好");
+    }
+
+    /// PHANTOM-406-459 ①：只作用一次（取用即清空）。
+    #[test]
+    fn t459_take_phantom_prefix_once() {
+        let mut p = String::from("我系你");
+        assert_eq!(
+            super::take_phantom_prefix(&mut p, "我系你喂喂".into()),
+            "喂喂"
+        );
+        assert!(p.is_empty());
+        assert_eq!(
+            super::take_phantom_prefix(&mut p, "我系你喂喂".into()),
+            "我系你喂喂"
+        );
+    }
 
     /// LOCALRT-REFLOW-HOLE-344-G：片段流式文本按**字符**切片，绝不字节切片（中文安全、不 panic）。
     #[test]

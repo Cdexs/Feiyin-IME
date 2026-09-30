@@ -372,6 +372,8 @@ impl LlamaAsr {
     /// 未挂载 / 失败 / 时间戳不合格 ⇒ `None`（调用方回落比例估算）。
     pub(crate) fn align(&self, samples: &[f32], text: &str) -> Option<AlignOut> {
         let al = self.aligner.as_ref()?;
+        // PHANTOM-406-459 ②：与精解共用引擎锁 ⇒ 收割线程对兜底文本对齐时与解码线程串行，GPU 不并发。
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         match al.align(samples, text) {
             Ok(o) => o,
             Err(e) => {

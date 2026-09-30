@@ -501,3 +501,6 @@ worker 返回时 drop 局部 `cached_translation` ⇒ 触发 `translator_destroy
 2. 复现「析构挂死」：**必须在真正用过的资源上试**；用 `recv_timeout` + 进程 CPU 采样区分「自旋（CPU 涨）/ 死锁（CPU 平）」；泄漏挂死线程、**不 join**，再用 `timeout` 看进程能否自行退出。
 3. 别写「生产走 `process::exit` 跳过析构故无碍」这类**未核实**的免责声明 —— 先 `grep` 调用方确认退出路径（本单即因该假设错误被验收退回）。
 | [CRT-GETENV-STALE-458] | Windows 上 C/C++ 的 `getenv` 读的是 CRT 启动时的环境副本，**进程运行中** Rust `std::env::set_var`（SetEnvironmentVariableW）改的值它看不到 ⇒ 回放里用环境变量切换 shim 行为的 A/B **两组其实是同一配置**。PIPE-SPEED-457「前缀复用 −7.4%」即因此失真（正确复核为 −11.6%）。判据：shim 调试开关一律经 `las_env_get`（Windows 用 GetEnvironmentVariableA）；A/B 结果先看开关是否真生效（如步数 / 命中率有无变化） |
+| [STREAM-RESTART-DRIFT-459] | 想丢掉流式识别里的一段文字而**中途换新流重喂**，会连带改变本句后半的流式用字（解码块网格与上下文都变；按 0.6s 块对齐后仍漂）。判据：流式文字的取舍放在**下游文本层**（如派发片剥前缀），不要重建实时流 |
+| [TEST-COLDSTART-459] | 同一进程里对同一录音跑两遍流式管线做 A/B，**首跑**的派发片边界会与后续不同（冷启动），被误读成改动效果。判据：A/B 前先对首段预热跑一遍 |
+| [CFG-TEST-ANCHOR-459] | `local_stream.rs` 多个源码护栏以**文件里第一个 `#[cfg(test)]`** 作生产区终点；在生产代码上方加任何 cfg-test 属性（如测试专用 thread_local）会让护栏把大半生产代码当测试区 ⇒ 291/342/438 等一串护栏红。判据：生产区里的测试开关用 `cfg!(test)` 表达式，不写属性 |
