@@ -2072,3 +2072,604 @@ fn poc457_prefix_determinism() {
         }
     }
 }
+
+// ========================================================================
+// LLAMA-TUNE-458 · 1.7B 精解 + 0.6B 对齐器调用参数评估（只测不改生产）
+//
+// Gavin 2026-09-30「你再仔细分析评估一下现在用 llama.cpp 调用 1.7B 精确模型的调用方式，看有没有可以再优化的参数，
+// 调用规格方面有没有可以再优化的地方和空间」「另外对齐模型也是，也评估分析一下」。
+// 同 replay457 几何 / 生产解码路径（草稿 + 词库），每个候选跑满 120 窗；调试开关（shim 环境变量，生产不设）：
+//   LAS_SPLIT_ENC（编码拆分计时，各变体都开）/ LAS_DRAFT_LANG / LAS_DRAFT_MAX / LAS_UBATCH / LAS_MTMD_THREADS / LAS_ALIGN_UBATCH
+// 1.7B 变体：base / lang（草稿带语种前缀）/ lang+prev（再加上一窗精解全文）/ +draft16 / +ub256 / +ub512 / +mtmd8
+// 对齐器变体：整窗（现行）/ 剪静音后对齐再映射回窗内时间 / ubatch 256
+// 运行：cargo test --bin feiyin-ime replay458 -- --ignored --nocapture
+// ========================================================================
+
+static DECODE_LOG_458: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+struct DecodeLogger458;
+
+impl log::Log for DecodeLogger458 {
+    fn enabled(&self, meta: &log::Metadata<'_>) -> bool {
+        meta.level() <= log::Level::Debug
+    }
+    fn log(&self, record: &log::Record<'_>) {
+        let m = record.args().to_string();
+        if m.contains("[ACC-452] decode:") {
+            DECODE_LOG_458.lock().unwrap().push(m);
+        }
+    }
+    fn flush(&self) {}
+}
+
+/// `[ACC-452] decode:` 行 ⇒ (prefill, enc, gen_ms, n_gen, 草稿接受, 草稿提出)。
+fn parse_decode_458(line: &str) -> (f64, f64, f64, f64, f64, f64) {
+    let (mut pre, mut enc, mut gms, mut ng, mut da, mut dp) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    for (i, t) in toks.iter().enumerate() {
+        if let Some(v) = t.strip_prefix("prefill=") {
+            pre = v.split("ms").next().unwrap_or("0").parse().unwrap_or(0.0);
+            if let Some(n) = toks.get(i + 1) {
+                enc = n.trim_end_matches(')').parse().unwrap_or(0.0);
+            }
+        } else if let Some(v) = t.strip_prefix("gen=") {
+            if let Some(x) = v.strip_suffix("ms") {
+                gms = x.parse().unwrap_or(0.0);
+            } else {
+                ng = v.parse().unwrap_or(0.0);
+            }
+        } else if let Some(v) = t.strip_prefix("draft=") {
+            let mut it = v.split('/');
+            da = it.next().unwrap_or("0").parse().unwrap_or(0.0);
+            dp = it.next().unwrap_or("0").parse().unwrap_or(0.0);
+        }
+    }
+    (pre, enc, gms, ng, da, dp)
+}
+
+/// 剪静音拼接（同生产 `trim_to_speech`：两侧各扩 pad、合并）后的各段 `(窗内起点, 长度)`，用于把对齐时间映射回窗内。
+fn trim_spans_458(ranges: &[(usize, usize)], pad: usize, len: usize) -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = ranges
+        .iter()
+        .map(|&(s, e)| (s.saturating_sub(pad), e.saturating_add(pad).min(len)))
+        .filter(|&(s, e)| e > s)
+        .collect();
+    spans.sort_by_key(|&(s, _)| s);
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in spans {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1 {
+                last.1 = last.1.max(e);
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+    merged.into_iter().map(|(s, e)| (s, e - s)).collect()
+}
+
+fn map_trim_time_458(spans: &[(usize, usize)], t_secs: f32) -> f32 {
+    let mut k = (t_secs.max(0.0) * RATE as f32) as usize;
+    for &(st, ln) in spans {
+        if k < ln {
+            return (st + k) as f32 / RATE as f32;
+        }
+        k -= ln;
+    }
+    spans
+        .last()
+        .map_or(t_secs, |&(st, ln)| (st + ln) as f32 / RATE as f32)
+}
+
+#[test]
+#[ignore = "LLAMA-TUNE-458：cargo test --bin feiyin-ime replay458 -- --ignored --nocapture"]
+fn replay458_tune() {
+    crate::transcription::speaker::TEST_EXTRACTOR_MISSING.with(|c| c.set(true));
+    let _ = log::set_boxed_logger(Box::new(DecodeLogger458));
+    log::set_max_level(log::LevelFilter::Debug);
+    let root = manifest_dir();
+    let models = root.join("models");
+    let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
+        .expect("流式模型须在位");
+    let terms = load_real_wordbook_terms();
+    let run_stream = |audio: &[f32]| -> String {
+        let stream = st_rec.create_stream();
+        for c in audio.chunks(1600) {
+            stream.accept_waveform(RATE as i32, c);
+            while st_rec.is_ready(&stream) {
+                st_rec.decode(&stream);
+            }
+        }
+        stream.input_finished();
+        while st_rec.is_ready(&stream) {
+            st_rec.decode(&stream);
+        }
+        st_rec
+            .get_result(&stream)
+            .map(|r| r.text.clone())
+            .unwrap_or_default()
+    };
+    let mut sessions: Vec<(String, Vec<usize>, Vec<Win457>, Option<String>)> = Vec::new();
+    for wav in collect_wavs(&root) {
+        let name = wav
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string();
+        let Some((audio, rate)) = read_wav(&wav) else {
+            continue;
+        };
+        if rate as usize != RATE {
+            continue;
+        }
+        let (cum_end, wins) = windows_457(&audio, &run_stream);
+        let r = read_ref_for(&name);
+        sessions.push((name, cum_end, wins, r));
+    }
+    let n_windows: usize = sessions.iter().map(|s| s.2.len()).sum();
+    let mut report = format!(
+        "# LLAMA-TUNE-458 · 调用参数评估（{} 段 {} 窗）\n\n",
+        sessions.len(),
+        n_windows
+    );
+    // ---------------- 1.7B ----------------
+    // (名称, 环境变量, 是否加上一窗精解全文作草稿, 是否需重建引擎)
+    let variants: Vec<(&str, Vec<(&str, &str)>, bool)> = vec![
+        ("base（现行）", vec![], false),
+        (
+            "无前缀复用（复核 457）",
+            vec![("LAS_NO_PREFIX_CACHE", "1")],
+            false,
+        ),
+        ("lang", vec![("LAS_DRAFT_LANG", "1")], false),
+        ("lang+prev", vec![("LAS_DRAFT_LANG", "1")], true),
+        (
+            "lang+prev+draft16",
+            vec![("LAS_DRAFT_LANG", "1"), ("LAS_DRAFT_MAX", "16")],
+            true,
+        ),
+        (
+            "lang+prev+ub256",
+            vec![("LAS_DRAFT_LANG", "1"), ("LAS_UBATCH", "256")],
+            true,
+        ),
+        (
+            "lang+prev+ub512",
+            vec![("LAS_DRAFT_LANG", "1"), ("LAS_UBATCH", "512")],
+            true,
+        ),
+        (
+            "lang+prev+mtmd8",
+            vec![("LAS_DRAFT_LANG", "1"), ("LAS_MTMD_THREADS", "8")],
+            true,
+        ),
+        ("base（复测，量 GPU 自身浮动）", vec![], false),
+    ];
+    let all_keys = [
+        "LAS_DRAFT_LANG",
+        "LAS_DRAFT_MAX",
+        "LAS_UBATCH",
+        "LAS_MTMD_THREADS",
+        "LAS_NO_PREFIX_CACHE",
+    ];
+    std::env::set_var("LAS_SPLIT_ENC", "1");
+    let mut base_texts: Option<Vec<Vec<String>>> = None;
+    let mut rows = String::new();
+    for (label, envs, with_prev) in &variants {
+        for k in all_keys {
+            std::env::remove_var(k);
+        }
+        for (k, v) in envs {
+            std::env::set_var(k, v);
+        }
+        let (d0, s0, w0) = proc_mem_mb_457();
+        let acc = create_qwen3_recognizer(&models).expect("Qwen3 GGUF 须在位");
+        // 预热：首段首窗解一次不计。
+        if let Some((_, _, wins, _)) = sessions.first() {
+            if let Some(w) = wins.first() {
+                let _ = decode_457(&acc, w, 0, terms.as_deref());
+            }
+        }
+        DECODE_LOG_458.lock().unwrap().clear();
+        let t0 = Instant::now();
+        let mut texts: Vec<Vec<String>> = Vec::new();
+        for (_, _, wins, _) in &sessions {
+            let mut tx: Vec<String> = Vec::new();
+            for (i, w) in wins.iter().enumerate() {
+                let draft = if *with_prev && i >= 1 {
+                    format!("{}{}", w.stream_text, tx[i - 1])
+                } else {
+                    w.stream_text.clone()
+                };
+                let inject = CtxInject {
+                    terms: terms.as_deref(),
+                    avg_chars_per_sec: None,
+                    speech_ranges: None,
+                    streaming_nonempty: !w.stream_text.trim().is_empty(),
+                    new_slice_from: w.wsamples[..w.wsamples.len() - 1].iter().sum(),
+                    assist: crate::transcription::llama_asr::DecodeAssist::draft(Some(
+                        draft.as_str(),
+                    )),
+                };
+                tx.push(
+                    transcribe_acc_ctx(&acc, &w.waudio, ChineseScript::Simplified, i, inject)
+                        .map(|(t, _, _)| t)
+                        .unwrap_or_default(),
+                );
+            }
+            texts.push(tx);
+        }
+        let wall = t0.elapsed().as_secs_f64();
+        let (d1, s1, w1) = proc_mem_mb_457();
+        drop(acc);
+        let lines = std::mem::take(&mut *DECODE_LOG_458.lock().unwrap());
+        let (mut pre, mut enc, mut gms, mut ng, mut da, mut dp) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        for l in &lines {
+            let v = parse_decode_458(l);
+            pre += v.0;
+            enc += v.1;
+            gms += v.2;
+            ng += v.3;
+            da += v.4;
+            dp += v.5;
+        }
+        let steps = ng - da;
+        let diff = match &base_texts {
+            Some(b) => {
+                let (mut nw, mut ed) = (0usize, 0usize);
+                for (a, b) in texts.iter().flatten().zip(b.iter().flatten()) {
+                    if a != b {
+                        nw += 1;
+                        ed += char_edit_457(a, b);
+                    }
+                }
+                format!("{nw} 窗 / {ed} 字")
+            }
+            None => "基线".into(),
+        };
+        let row = format!(
+            "| {label} | {:.1}s | {:.1}s | {:.1}s | {:.1}s | {:.0} | {:.0} | {:.0}% | {:.1}ms | {diff} | {:.0} / {:.0} / {:.0} |\n",
+            wall,
+            pre / 1000.0,
+            enc / 1000.0,
+            gms / 1000.0,
+            ng,
+            steps,
+            da * 100.0 / dp.max(1.0),
+            gms / steps.max(1.0),
+            d1 - d0,
+            s1 - s0,
+            w1 - w0,
+        );
+        print!("{row}");
+        rows.push_str(&row);
+        if base_texts.is_none() {
+            base_texts = Some(texts);
+        }
+    }
+    for k in all_keys {
+        std::env::remove_var(k);
+    }
+    std::env::remove_var("LAS_SPLIT_ENC");
+    report.push_str("## 1.7B 精解\n\n| 变体 | 总耗时 | 预填充 | 其中编码 | 生成 | 生成 token | 生成步数 | 草稿接受率 | 每步 | 与现行文字不同窗数 | 显存专用 / 共享 / 工作集 MB |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+    report.push_str(&rows);
+
+    // ---------------- 0.6B 对齐器 ----------------
+    let texts = base_texts.expect("基线文字");
+    let pad = (vad::LOCALRT_TRIM_PAD_SECS * RATE as f32) as usize;
+    let mut arows = String::new();
+    let mut finals: Vec<Vec<String>> = Vec::new();
+    for (label, ub, trim) in [
+        ("整窗（现行）", "512", false),
+        ("剪静音后对齐", "512", true),
+        ("整窗 ubatch256", "256", false),
+    ] {
+        std::env::set_var("LAS_ALIGN_UBATCH", ub);
+        let (d0, s0, w0) = proc_mem_mb_457();
+        let aligner =
+            crate::transcription::llama_asr::LlamaAligner::load(&models).expect("对齐模型须在位");
+        // 预热一窗。
+        if let (Some((_, _, wins, _)), Some(tx)) = (sessions.first(), texts.first()) {
+            if let (Some(w), Some(t)) = (wins.first(), tx.first()) {
+                if !t.trim().is_empty() {
+                    let _ = aligner.align(&w.waudio, t);
+                }
+            }
+        }
+        let (mut ms, mut enc, mut bb, mut n, mut audio_s) = (0.0, 0.0, 0.0, 0usize, 0.0);
+        let (mut cer_sum, mut cer_n) = (0f32, 0usize);
+        let mut fin_v: Vec<String> = Vec::new();
+        for ((name, cum_end, wins, reference), tx) in sessions.iter().zip(&texts) {
+            let nw = wins.len();
+            let mut r = OrderedReflow::new();
+            for (i, w) in wins.iter().enumerate() {
+                let text = tx[i].clone();
+                let prev_end = if i >= 1 { Some(i) } else { None };
+                let (abs, split_abs) = crate::window_abs_geometry(
+                    cum_end,
+                    w.end,
+                    w.span_start,
+                    prev_end,
+                    &w.wsamples,
+                    w.split,
+                );
+                let times = if text.trim().is_empty() || i + 1 == nw {
+                    None
+                } else {
+                    let (audio, spans) = if trim {
+                        let rs = self_vad_ranges(&w.waudio).unwrap_or_default();
+                        if rs.is_empty() {
+                            (w.waudio.clone(), vec![(0, w.waudio.len())])
+                        } else {
+                            (
+                                trim_to_speech(&w.waudio, &rs, pad),
+                                trim_spans_458(&rs, pad, w.waudio.len()),
+                            )
+                        }
+                    } else {
+                        (w.waudio.clone(), vec![(0, w.waudio.len())])
+                    };
+                    audio_s += audio.len() as f64 / RATE as f64;
+                    let o = aligner.align(&audio, &text).ok().flatten();
+                    if let Some(o) = &o {
+                        ms += o.ms[0];
+                        enc += o.ms[1];
+                        bb += o.ms[2];
+                        n += 1;
+                    }
+                    o.map(|o| {
+                        o.char_times
+                            .into_iter()
+                            .map(|(a, b)| {
+                                (
+                                    abs + map_trim_time_458(&spans, a),
+                                    abs + map_trim_time_458(&spans, b),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                };
+                r.push_window_timed(
+                    i,
+                    w.span_start,
+                    w.end,
+                    w.wsamples.clone(),
+                    text,
+                    None,
+                    abs,
+                    split_abs,
+                );
+                if let Some(t) = times {
+                    r.refine_times(i, t);
+                }
+            }
+            let (c, l) = r.finish();
+            let full = format!("{c}{l}");
+            if let Some(rf) = reference {
+                cer_sum += cer(&full, rf);
+                cer_n += 1;
+            }
+            let _ = name;
+            fin_v.push(full);
+        }
+        let (d1, s1, w1) = proc_mem_mb_457();
+        drop(aligner);
+        let diff = match finals.first() {
+            Some(b) => {
+                let d = fin_v.iter().zip(b).filter(|(a, b)| a != b).count();
+                for ((a, b), (name, ..)) in fin_v.iter().zip(b).zip(&sessions) {
+                    if a != b {
+                        report.push_str(&format!(
+                            "- 对齐「{label}」终稿不同 {name}：\n  - 现行：{b}\n  - 本变体：{a}\n"
+                        ));
+                    }
+                }
+                d.to_string()
+            }
+            None => "基线".into(),
+        };
+        let row = format!(
+            "| {label} | {n} | {:.1}s | {:.0}ms | {:.0}ms | {:.0}ms | {:.4} | {diff} | {:.0} / {:.0} / {:.0} |\n",
+            audio_s,
+            ms / n.max(1) as f64,
+            enc / n.max(1) as f64,
+            bb / n.max(1) as f64,
+            cer_sum / cer_n.max(1) as f32,
+            d1 - d0,
+            s1 - s0,
+            w1 - w0,
+        );
+        print!("{row}");
+        arows.push_str(&row);
+        finals.push(fin_v);
+    }
+    std::env::remove_var("LAS_ALIGN_UBATCH");
+    report.push_str("\n## 0.6B 对齐器（接缝按 457 生产拼接）\n\n| 变体 | 对齐窗数 | 送入音频总长 | 每窗均耗时 | 编码 | 主干 | 5 段 CER | 终稿与现行不同段数 | 显存专用 / 共享 / 工作集 MB |\n|---|---:|---:|---:|---:|---:|---:|---:|---|\n");
+    report.push_str(&arows);
+    let out = root.join(format!(
+        "collab/evidence/458/replay458{}.md",
+        std::env::var("REPLAY_TAG").unwrap_or_default()
+    ));
+    let _ = std::fs::create_dir_all(out.parent().unwrap());
+    std::fs::write(&out, report).unwrap();
+    println!("[458] 报告：{}", out.display());
+}
+
+/// LLAMA-TUNE-458 复核：现行 vs「草稿带语种前缀 + 上一窗精解全文」的终稿质量（5 段人工参考 CER、≥8 字重复），
+/// 接缝按 457 生产拼接；另计每窗「整窗重跑 VAD」（`self_vad_ranges`）耗时。
+/// 运行：cargo test --bin feiyin-ime poc458_quality -- --ignored --nocapture
+#[test]
+#[ignore = "LLAMA-TUNE-458 复核：--ignored 运行"]
+fn poc458_quality() {
+    crate::transcription::speaker::TEST_EXTRACTOR_MISSING.with(|c| c.set(true));
+    let root = manifest_dir();
+    let models = root.join("models");
+    let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
+        .expect("流式模型须在位");
+    let terms = load_real_wordbook_terms();
+    let run_stream = |audio: &[f32]| -> String {
+        let stream = st_rec.create_stream();
+        for c in audio.chunks(1600) {
+            stream.accept_waveform(RATE as i32, c);
+            while st_rec.is_ready(&stream) {
+                st_rec.decode(&stream);
+            }
+        }
+        stream.input_finished();
+        while st_rec.is_ready(&stream) {
+            st_rec.decode(&stream);
+        }
+        st_rec
+            .get_result(&stream)
+            .map(|r| r.text.clone())
+            .unwrap_or_default()
+    };
+    let mut sessions: Vec<(String, Vec<usize>, Vec<Win457>, Option<String>)> = Vec::new();
+    for wav in collect_wavs(&root) {
+        let name = wav
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string();
+        let Some((audio, rate)) = read_wav(&wav) else {
+            continue;
+        };
+        if rate as usize != RATE {
+            continue;
+        }
+        let (cum_end, wins) = windows_457(&audio, &run_stream);
+        let r = read_ref_for(&name);
+        sessions.push((name, cum_end, wins, r));
+    }
+    // 整窗重跑 VAD 的耗时（CPU，与 GPU 解码无关）。
+    let (mut vad_ms, mut vad_n, mut vad_audio) = (0f64, 0usize, 0f64);
+    for (_, _, wins, _) in &sessions {
+        for w in wins {
+            let t0 = Instant::now();
+            let _ = self_vad_ranges(&w.waudio);
+            vad_ms += t0.elapsed().as_secs_f64() * 1000.0;
+            vad_n += 1;
+            vad_audio += w.waudio.len() as f64 / RATE as f64;
+        }
+    }
+    println!(
+        "[458] 整窗重跑 VAD：{vad_n} 窗，均 {:.1}ms/窗（窗均 {:.1}s，{:.1}ms/秒音频）",
+        vad_ms / vad_n.max(1) as f64,
+        vad_audio / vad_n.max(1) as f64,
+        vad_ms / vad_audio.max(1.0)
+    );
+    let acc = create_qwen3_recognizer(&models).expect("Qwen3 GGUF 须在位");
+    let mut all: Vec<Vec<Vec<String>>> = Vec::new();
+    for with_lang_prev in [false, true] {
+        if with_lang_prev {
+            std::env::set_var("LAS_DRAFT_LANG", "1");
+        } else {
+            std::env::remove_var("LAS_DRAFT_LANG");
+        }
+        let mut texts: Vec<Vec<String>> = Vec::new();
+        for (_, _, wins, _) in &sessions {
+            let mut tx: Vec<String> = Vec::new();
+            for (i, w) in wins.iter().enumerate() {
+                let draft = if with_lang_prev && i >= 1 {
+                    format!("{}{}", w.stream_text, tx[i - 1])
+                } else {
+                    w.stream_text.clone()
+                };
+                let inject = CtxInject {
+                    terms: terms.as_deref(),
+                    avg_chars_per_sec: None,
+                    speech_ranges: None,
+                    streaming_nonempty: !w.stream_text.trim().is_empty(),
+                    new_slice_from: w.wsamples[..w.wsamples.len() - 1].iter().sum(),
+                    assist: crate::transcription::llama_asr::DecodeAssist::draft(Some(
+                        draft.as_str(),
+                    )),
+                };
+                tx.push(
+                    transcribe_acc_ctx(&acc, &w.waudio, ChineseScript::Simplified, i, inject)
+                        .map(|(t, _, _)| t)
+                        .unwrap_or_default(),
+                );
+            }
+            texts.push(tx);
+        }
+        all.push(texts);
+    }
+    std::env::remove_var("LAS_DRAFT_LANG");
+    drop(acc);
+    let aligner =
+        crate::transcription::llama_asr::LlamaAligner::load(&models).expect("对齐模型须在位");
+    let mut report = String::from("# LLAMA-TUNE-458 复核：终稿质量\n\n");
+    let mut finals: Vec<Vec<String>> = Vec::new();
+    for (vi, label) in ["现行", "语种前缀+上一窗草稿"].iter().enumerate() {
+        let (mut cer_sum, mut cer_n, mut rep) = (0f32, 0usize, 0usize);
+        let mut fv = Vec::new();
+        for ((name, cum_end, wins, reference), tx) in sessions.iter().zip(&all[vi]) {
+            let nw = wins.len();
+            let mut r = OrderedReflow::new();
+            for (i, w) in wins.iter().enumerate() {
+                let text = tx[i].clone();
+                let prev_end = if i >= 1 { Some(i) } else { None };
+                let (abs, split_abs) = crate::window_abs_geometry(
+                    cum_end,
+                    w.end,
+                    w.span_start,
+                    prev_end,
+                    &w.wsamples,
+                    w.split,
+                );
+                let times = if text.trim().is_empty() || i + 1 == nw {
+                    None
+                } else {
+                    aligner.align(&w.waudio, &text).ok().flatten().map(|o| {
+                        o.char_times
+                            .into_iter()
+                            .map(|(a, b)| (abs + a, abs + b))
+                            .collect::<Vec<_>>()
+                    })
+                };
+                r.push_window_timed(
+                    i,
+                    w.span_start,
+                    w.end,
+                    w.wsamples.clone(),
+                    text,
+                    None,
+                    abs,
+                    split_abs,
+                );
+                if let Some(t) = times {
+                    r.refine_times(i, t);
+                }
+            }
+            let (c, l) = r.finish();
+            let full = format!("{c}{l}");
+            rep += has_repeat8(&full) as usize;
+            if let Some(rf) = reference {
+                let c = cer(&full, rf);
+                cer_sum += c;
+                cer_n += 1;
+                report.push_str(&format!("- {label} · {name} CER={c:.4}\n"));
+            }
+            fv.push(full);
+        }
+        let line = format!(
+            "- **{label}**：5 段 CER {:.4}；≥8 字重复 {rep} 段\n",
+            cer_sum / cer_n.max(1) as f32
+        );
+        print!("{line}");
+        report.push_str(&line);
+        finals.push(fv);
+    }
+    for ((a, b), (name, ..)) in finals[0].iter().zip(&finals[1]).zip(&sessions) {
+        if a != b {
+            report.push_str(&format!(
+                "\n### 终稿不同：{name}\n- 现行：{a}\n- 新草稿：{b}\n"
+            ));
+        }
+    }
+    let out = root.join("collab/evidence/458/quality458.md");
+    let _ = std::fs::create_dir_all(out.parent().unwrap());
+    std::fs::write(&out, report).unwrap();
+    println!("[458] 报告：{}", out.display());
+}

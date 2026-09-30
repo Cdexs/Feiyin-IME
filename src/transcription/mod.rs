@@ -1020,12 +1020,13 @@ fn decode_accuracy_allow_empty_lang(
     if log::log_enabled!(log::Level::Debug) {
         let st = out.stats;
         log::debug!(
-            "[ACC-452] decode: device={} audio={:.2}s prompt={} gen={} prefill={:.0}ms gen={:.0}ms draft={}/{} sys={} lang={:?}",
+            "[ACC-452] decode: device={} audio={:.2}s prompt={} gen={} prefill={:.0}ms(enc {:.0}) gen={:.0}ms draft={}/{} sys={} lang={:?}",
             recognizer.device(),
             samples.len() as f32 / 16000.0,
             st.n_prompt,
             st.n_gen,
             st.prefill_ms,
+            st.enc_ms,
             st.gen_ms,
             st.n_draft_accepted,
             st.n_draft_proposed,

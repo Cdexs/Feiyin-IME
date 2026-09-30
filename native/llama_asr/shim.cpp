@@ -111,6 +111,32 @@ extern "C" int las_load(const char * dir, char * err, int err_len) {
     return 0;
 }
 
+// LLAMA-TUNE-458：调试开关（回放 A/B 用，不进配置；未设 = 生产默认值）。
+// Windows 上必须用 GetEnvironmentVariableA：进程运行中由 Rust `std::env::set_var`（SetEnvironmentVariableW）
+// 改的值，CRT `getenv` 读的是启动时的副本、看不到（[CRT-GETENV-STALE-458]）。
+static bool las_env_get(const char * k, std::string & out) {
+#ifdef _WIN32
+    char buf[64];
+    const DWORD n = GetEnvironmentVariableA(k, buf, (DWORD) sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return false;
+    out.assign(buf, n);
+    return true;
+#else
+    const char * v = std::getenv(k);
+    if (!v) return false;
+    out = v;
+    return true;
+#endif
+}
+static bool las_env_set(const char * k) {
+    std::string v;
+    return las_env_get(k, v);
+}
+static int las_env_int(const char * k, int def) {
+    std::string v;
+    return (las_env_get(k, v) && !v.empty()) ? atoi(v.c_str()) : def;
+}
+
 struct las_engine {
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
@@ -133,6 +159,8 @@ struct las_stats {
     int32_t n_gen;
     int32_t n_draft_accepted;
     int32_t n_draft_proposed;
+    // LLAMA-TUNE-458：音频编码耗时（仅 LAS_SPLIT_ENC 调试开关下拆分计时；否则 0，含在 prefill_ms 里）。
+    double enc_ms;
 };
 
 // 创建引擎。gpu=1：模型与音频编码器全部放 GPU（有可用 GPU 设备时）；gpu=0：纯 CPU。
@@ -167,7 +195,7 @@ extern "C" las_engine * las_create(const char * model_path, const char * mmproj_
     cp.n_batch = 512;
     // MEM-453：ubatch 512→128 计算缓冲 305→76MiB，KV f16→q8_0 448→238MiB（容量仍 4096）。
     // 780M 实测预填充 ≤+3%、生成不变；28 片回放 ub128 / kvq8 均与基线逐字一致。
-    cp.n_ubatch = 128;
+    cp.n_ubatch = (uint32_t) las_env_int("LAS_UBATCH", 128);
     cp.type_k = GGML_TYPE_Q8_0;
     cp.type_v = GGML_TYPE_Q8_0;
     cp.n_seq_max = 1;
@@ -177,14 +205,14 @@ extern "C" las_engine * las_create(const char * model_path, const char * mmproj_
     cp.no_perf = true;
     // MEM-TRIM-457 ①：输出上限 = 草稿验证最大批（1 + draft_max ≤ 9）的余量 16；预填充只取末 token。
     // 计算缓冲按上限预留 15 万维 logits ⇒ 512 → 16 省 ~65MiB，结果与速度不变。
-    cp.n_outputs_max = 16;
+    cp.n_outputs_max = (uint32_t) (std::max)(16, las_env_int("LAS_DRAFT_MAX", 0) + 1); // 调试 LAS_DRAFT_MAX>15 时放宽
     llama_context * ctx = p_llama_init_from_model(model, cp);
     if (!ctx) { p_llama_model_free(model); set_err(err, err_len, "init context failed"); return nullptr; }
 
     mtmd_context_params mcp = p_mtmd_context_params_default();
     mcp.use_gpu = gpu_dev != nullptr;
     mcp.device = gpu_dev;
-    mcp.n_threads = n_threads_batch;
+    mcp.n_threads = las_env_int("LAS_MTMD_THREADS", n_threads_batch);
     mcp.print_timings = false;
     mcp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     mcp.warmup = true;
@@ -262,6 +290,8 @@ extern "C" int las_decode(las_engine * e, const float * pcm, int n_samples, cons
                las_stats * st, char * err, int err_len, las_partial_fn on_partial, void * user) {
     using clk = std::chrono::steady_clock;
     las_stats s{};
+    if (draft_max > 0) draft_max = las_env_int("LAS_DRAFT_MAX", draft_max);
+    const bool split_enc = las_env_set("LAS_SPLIT_ENC");
     std::string prompt;
     if (system && *system) prompt += std::string("<|im_start|>system\n") + system + "<|im_end|>\n";
     prompt += std::string("<|im_start|>user\n") + p_mtmd_default_marker() + "<|im_end|>\n<|im_start|>assistant\n";
@@ -317,7 +347,7 @@ extern "C" int las_decode(las_engine * e, const float * pcm, int n_samples, cons
         c0_tokens.assign(tk, tk + nt);
     }
     // 调试开关 LAS_NO_PREFIX_CACHE（回放 A/B 用）：每窗都从头预填充。
-    if (!c0_tokens.empty() && c0_tokens == e->prefix_tokens && e->prefix_pos > 0 && !std::getenv("LAS_NO_PREFIX_CACHE")) {
+    if (!c0_tokens.empty() && c0_tokens == e->prefix_tokens && e->prefix_pos > 0 && !las_env_set("LAS_NO_PREFIX_CACHE")) {
         p_llama_memory_seq_rm(mem, 0, e->prefix_pos, -1);
         n_past = e->prefix_pos;
         first = 1;
@@ -329,8 +359,18 @@ extern "C" int las_decode(las_engine * e, const float * pcm, int n_samples, cons
     rc = 0;
     for (size_t i = first; i < n_chunks && rc == 0; i++) {
         llama_pos np = n_past;
-        rc = p_mtmd_helper_eval_chunk_single(e->mctx, e->ctx, p_mtmd_input_chunks_get(chunks, i), n_past, 0, e->n_batch,
-                                             i + 1 == n_chunks, &np);
+        const mtmd_input_chunk * ch = p_mtmd_input_chunks_get(chunks, i);
+        if (split_enc && p_mtmd_input_chunk_get_type(ch) != MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            // 调试：编码与写入 KV 分开计时（与 eval_chunk_single 内部同一顺序）。
+            auto te = clk::now();
+            rc = p_mtmd_encode_chunk(e->mctx, ch);
+            s.enc_ms += std::chrono::duration<double, std::milli>(clk::now() - te).count();
+            if (rc == 0)
+                rc = p_mtmd_helper_decode_image_chunk(e->mctx, e->ctx, ch, p_mtmd_get_output_embd(e->mctx), n_past, 0,
+                                                      e->n_batch, &np, nullptr, nullptr);
+        } else {
+            rc = p_mtmd_helper_eval_chunk_single(e->mctx, e->ctx, ch, n_past, 0, e->n_batch, i + 1 == n_chunks, &np);
+        }
         n_past = np;
         if (rc == 0 && i == 0 && !c0_tokens.empty()) {
             e->prefix_tokens = c0_tokens;
@@ -349,6 +389,14 @@ extern "C" int las_decode(las_engine * e, const float * pcm, int n_samples, cons
     auto t1 = clk::now();
 
     std::vector<llama_token> dtoks = (draft && *draft && draft_max > 0) ? tokenize(e->vocab, draft) : std::vector<llama_token>{};
+    // 调试 LAS_DRAFT_LANG：草稿前加语种前缀（特殊 token 解析）⇒ 模型自写的 `language Chinese<asr_text>` 也能被草稿命中。
+    if (!dtoks.empty() && pre.empty() && las_env_set("LAS_DRAFT_LANG")) {
+        static const char * lp = "language Chinese<asr_text>";
+        const int32_t nl = -p_llama_tokenize(e->vocab, lp, (int32_t) strlen(lp), nullptr, 0, false, true);
+        std::vector<llama_token> lt((size_t) (nl > 0 ? nl : 0));
+        if (nl > 0) p_llama_tokenize(e->vocab, lp, (int32_t) strlen(lp), lt.data(), nl, false, true);
+        dtoks.insert(dtoks.begin(), lt.begin(), lt.end());
+    }
     std::vector<llama_token> hist;
     std::string gen = pre;
     llama_token cur = (llama_token) argmax(p_llama_get_logits_ith(e->ctx, -1), e->n_vocab);
@@ -533,7 +581,7 @@ extern "C" las_aligner * las_align_create(const char * backbone_path, const char
     llama_context_params cp = p_llama_context_default_params();
     cp.n_ctx = (uint32_t) n_ctx;
     cp.n_batch = (uint32_t) n_ctx; // 文字段（每单元 + 两槽）一次送入
-    cp.n_ubatch = 512;
+    cp.n_ubatch = (uint32_t) las_env_int("LAS_ALIGN_UBATCH", 512);
     // 输出上限 = LAS_ALIGN_OUTPUTS_MAX（计算缓冲按上限预留 15 万维 logits；文字按同样大小分批，结构上不超）。
     cp.n_outputs_max = LAS_ALIGN_OUTPUTS_MAX;
     cp.n_seq_max = 1;

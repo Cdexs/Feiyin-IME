@@ -148,7 +148,7 @@
 | [POC-BYPASSES-PROD-WRAPPER-001] | PoC 报出「产品级严重缺陷」（如 accuracy >28s 空输出）→ **先核对它调的是不是生产同一条代码路径**，不是核对数据。数据全真但路径不同 ⇒ 结论完全无效。同批教训：判断既有模块行为前先按 ID 搜 `decisions-archive.md` 全文（`use_itn`/`itn:1` 实际无效已载于 DEC-030 背景，主控却凭字段值推断出不存在的「双重 ITN」） |
 | [ENUM-EQ-CHECK-MISSES-NEW-VARIANT-001] | 新增枚举变体后出现两个看似无关的 bug（标点重复 + 长句无输出）→ 根因是 `== Enum::Variant` **相等比较**漏改，**编译器不报错**（只有穷举 `match` 有保护）。派单只补 match arm 不够，**必须全仓 grep `==`/`!=` 逐个判断**。修法：在枚举上加语义化判定方法作收敛点（`matches!` 穷举形式），禁散落写 `== A \|\| == B`。同族 [CONFIG-MIRROR-DRIFT-001] |
 | [BINARY-PROBE-SYMBOL-INLINED-001] | 用**函数名**做 release 二进制探针，命中 0 被误判为「代码没进包」→ 小函数（尤其 `matches!` 展开的判定方法）release 下必被内联，符号根本不入二进制。**只有字符串字面量才进 .rdata**，探针必须选字面量（模型目录名、config 键名、日志前缀），禁用函数/方法/类型名。主控 2026-09-20 出题即犯此错，tester-1 发现 |
-| [GPU-NONDET-457] | A/B 对照判「结果逐位不变」前，先测**同配置自身重复性**：Vulkan（780M）上同一窗同一输入连解 3 次可出 2 种结果（近平局字「连结 / 连接」、逗号有无）。差异窗 ≤ 自身浮动 ⇒ 视为无差；PIPE-SPEED-457 前缀 KV 复用曾被 1/120 窗差异误判为改变结果 |
+| [GPU-NONDET-457] | 🔁 2026-09-30 更正：**同一配置复测 0 差异（输出确定）**；换计算路径（前缀复用开 / 关、草稿验证批大小）会让个别近乎平局的字 / 标点翻转（127 窗中 4~9 窗）。A/B 判「结果不变」须带同配置复测对照，差异再看 CER。原「GPU 自身浮动」结论所依据的对照开关其实没生效（见 [CRT-GETENV-STALE-458]） |
 | [WORKER-REBUILD-AFTER-DONE-457] | Worker 已交付出包，主控回执因其仍在执行而在 TUI 里排队（`QUEUED`）⇒ Worker 看不到回执，**自行重跑整单出包**，Step 1 结束了 Gavin 正在用的输入法。判据：出包类任务书必须写明「完成后只发完成通知、等 ACK 期间**不得重跑任何构建步骤**」；主控回执后要确认不是 `QUEUED`，否则等其空闲再发 |
 
 ## [FMT-COLLATERAL-001] rustfmt 吃 crate 根 main.rs 会递归进所有子模块（多人并行时隐性触碰他人在飞文件）
@@ -500,3 +500,4 @@ worker 返回时 drop 局部 `cached_translation` ⇒ 触发 `translator_destroy
 1. **外部 C/C++ 资源的析构若不可靠，就不要析构** —— 进程级单例 + `Box::leak`；别把「释放 600MB」当收益（释放失败 = 卡死，代价远大于内存）。
 2. 复现「析构挂死」：**必须在真正用过的资源上试**；用 `recv_timeout` + 进程 CPU 采样区分「自旋（CPU 涨）/ 死锁（CPU 平）」；泄漏挂死线程、**不 join**，再用 `timeout` 看进程能否自行退出。
 3. 别写「生产走 `process::exit` 跳过析构故无碍」这类**未核实**的免责声明 —— 先 `grep` 调用方确认退出路径（本单即因该假设错误被验收退回）。
+| [CRT-GETENV-STALE-458] | Windows 上 C/C++ 的 `getenv` 读的是 CRT 启动时的环境副本，**进程运行中** Rust `std::env::set_var`（SetEnvironmentVariableW）改的值它看不到 ⇒ 回放里用环境变量切换 shim 行为的 A/B **两组其实是同一配置**。PIPE-SPEED-457「前缀复用 −7.4%」即因此失真（正确复核为 −11.6%）。判据：shim 调试开关一律经 `las_env_get`（Windows 用 GetEnvironmentVariableA）；A/B 结果先看开关是否真生效（如步数 / 命中率有无变化） |

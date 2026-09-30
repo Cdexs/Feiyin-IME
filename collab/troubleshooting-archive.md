@@ -5420,3 +5420,10 @@ TEST-SYNC-420 给 `fix_reflow_raw_base_420_tests` 加 `fn_body` helper，内含 
 - **现象**：tester-1 00:17 交付 BUILD-457（main `89eeb3c6…`），主控 00:18 回执；00:2x 它再次发完成通知，主控再回执，TUI 显示 `QUEUED`；00:30 它**重跑整单出包**，报「重跑落档，替换上一会话中断前临时值」，最终 main `ba491a57…`。Gavin 00:27 正在用 `89eeb3c6` 包录音，被 Step 1 结束进程。
 - **根因**：回执送达时 Worker 仍在执行（等 ACK 的重试循环），消息排队未读；Worker 误判结果无效而重做。首轮会话因上下文撑爆被 `/new` 重开，它可能把自己新会话的产物当成了中断前的临时值。
 - **判据 / 做法**：① 出包任务书写明「完成后只发通知；等 ACK 期间不得重跑任何构建步骤；对结果有疑问先问主控」② 主控回执后查看 Worker 面板，若显示 `QUEUED` 就等它空闲再发一次 ③ 出包完成、通知 Gavin 重启之后，Worker 如再动构建，必须先经主控同意（出包会结束 Gavin 正在用的进程）。
+
+## [CRT-GETENV-STALE-458] 进程内改环境变量，C++ 层 getenv 看不到（2026-09-30）
+
+- **现象**：LLAMA-TUNE-458 首轮回放里「草稿带语种前缀」与现行生成步数一模一样（1588），编码拆分计时恒为 0。
+- **根因**：shim 用 `std::getenv`；MSVC CRT 的 `getenv` 读启动时拷贝的环境表，Rust `std::env::set_var` 走 `SetEnvironmentVariableW` 只改进程环境块，不更新 CRT 副本。
+- **影响**：PIPE-SPEED-457 的 `replay457_pipeline` / `poc457_prefix_determinism` 用 `LAS_NO_PREFIX_CACHE` 做的对照实际两组同配置：「−7.4%」是首遍预热差，「同窗连解 3 次出 2 种」也不是「关掉复用」的结果。正确复核：前缀复用 −11.6%；同配置复测 0 差异。
+- **判据**：shim 调试开关统一走 `las_env_get`（Windows：GetEnvironmentVariableA）；做开关 A/B 先确认开关生效（有可观测的行为差），再看耗时 / 结果。

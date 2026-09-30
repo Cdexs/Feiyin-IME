@@ -40,6 +40,8 @@ pub(crate) struct LasStats {
     pub n_gen: i32,
     pub n_draft_accepted: i32,
     pub n_draft_proposed: i32,
+    /// LLAMA-TUNE-458：音频编码耗时（仅调试开关 `LAS_SPLIT_ENC` 下拆分；否则 0）。
+    pub enc_ms: f64,
 }
 
 extern "C" {
