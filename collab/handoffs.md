@@ -80,3 +80,13 @@
 - ① 草稿加语种标记 + 上一窗精解文字：回放 −13%、CER 4.80% 不变、终稿差异仅标点 ② 中途片按开始说话判定位置补齐、末尾窗拼区间：真实录音 0 吞字。
 - 自测：bin 1910P/0F/77I；fmt clean；warnings 90；E2E `t458_mid_speech_dispatch_e2e` / `timeline393_r3` 通过。
 - 下一步：派 tester-1 TEST-EXEC-458 + BUILD-458。
+
+## 2026-09-30 — tester-1 — TEST-EXEC-458 + BUILD-458 ✅ 回归全绿 + 出包（版本 0.9.4）
+
+- **性质**：阶段四全量回归 + 阶段五出包（回归全绿即出包）。HEAD `6df6e0f`，工作区无生产代码改动（`git status --porcelain` 空）。
+- **回归（全绿 0F）**：bin **1910P/0F/77I**（＝预期）/ root 1998P/0F/79I / src-tauri 92P/0F/0I / Vitest 7 files·100P·11skip / fmt EXIT 0。
+- **NEW/GONE 对账**：NEW ok 1 `t458_mid_speech_ranges_cover_ongoing_tail`；NEW ignored 3 `replay458_tune`/`poc458_quality`/`t458_mid_speech_dispatch_e2e`；改写 2（`ts393_dispatch_slice_ranges_fallback_when_mid_speech`、`ts393c_..._source_guard`）绿；**GONE 0**（1909+1=1910、74+3=77）。重点失效模式全绿；全库 FAILED=0。
+- **出包九项全 PASS**：①main 22:26:53 / ui 22:26:54 / crash 22:25:15（Publish 22:27:10）②两副本全等、三件异于 457：main `d2b5adcf…` / ui `8d4dc3e9…` / crash `21ba6f9a…` ③0.9.4.0（ui 0.9.4）④冒烟 PID 27884 Responding / 无 crash / zero residual ⑤config `da2be5da…` 三时点不变 ⑥main 90 / crash 9 / Tauri 17 ⑦正 `LAS_NO_DRAFT_LANG` 1 / `[PIPE-457] last window: skip align` 1 / `[MEM-TRIM-457] llama context grown` 1，反 `LAS_DRAFT_LANG` 0 / `HOTWORDS-TOKEN-268: tokenizer loaded` 0 ⑧四 toml 三副本全等 ⑨VC 五件 == Redist 14.44.35112。
+- **模型**：1.7B Q8_0 `58e22d05…` / mmproj `46c1d533…`；对齐三件 `1b5ea4c2…` / `7117f45d…` / `8a3f5ed7…` 全对（不变）；Publish 无 f16 mmproj、tokenizer 保留；32 DLL 两处一致。冒烟 `ctx=1024(max 4096)` + `[ALIGN-456] aligner attached`、无 panic。
+- 🔴 **窗口路径未取到新 decode 行**：录音尝试 7.7s（C920）但 `speech_detected=false`（环境静默），如实记录；日志中 `draft=a/b` / `source=vad|timeline` 系本构建前 04:11Z 会话，非本包证据。
+- **红线**：未改生产代码 / 版本未动 / 未 push / 零凭证；debug-audio 点名删本人 3 个、Gavin 24 个未动。报告 `collab/outbox/tester-1/result.md`。出包 Step 1 已结束输入法进程，**请主控转告 Gavin 重启**。
