@@ -106,6 +106,15 @@
 - 冒烟：`-debug` PID 23180 Responding；`ctx=1024(max 4096)` + `aligner attached`；无 panic / 无 crash.json / 零残留。
 - 出包 Step 1 已结束输入法进程 ⇒ Gavin 需重启（提醒转告）。
 
+## 2026-10-03 — tester-1 — TEST-EXEC-460 + BUILD-460 ✅（回归全绿 ⇒ 出包）
+
+- **性质**：阶段四全量回归 + 阶段五出包（VOICEPRINT-LEAK-460 / DEC-099）。HEAD `58e3720`，工作区 clean。版本 **0.9.4 未动**。
+- **回归（全绿 0F）**：bin **1913P/0F/80I**（＝预期）/ root 2001P/0F/82I / src-tauri 92P/0F/0I / Vitest 7 files·100P·11skip / fmt EXIT 0。NEW 1 `t460_voiceprint_dropped_all`、GONE 0。重点失效模式（guard291/342/346、fix438、ts393、t456/457/458/459、partial_reflow_452、tail_window_407）全绿，全库 0 FAILED。
+- **出包九项全 PASS**：①main 12:39:22 / ui 12:34:07 / crash 09-30 22:25（本批零改动）②两副本全等、main `1d68bdfc…` / ui `5d988735…` 异于 459，crash `21ba6f9a…` 同 459 ③0.9.4.0（ui 0.9.4）④冒烟 PID 23544 Responding / 无 crash / 零残留 ⑤`Publish/config.toml` `da2be5da…` 三时点不变 ⑥main 90 / crash 9 / Tauri 17 ⑦正 `[VOICEPRINT-LEAK-460] all speech dropped by voiceprint`1 + `[PHANTOM-459] stripped silence-born text`1，反 `[PHANTOM-459] restart stream`0 / `LAS_DRAFT_LANG`0 ⑧四 toml 三副本全等 ⑨VC 五件 == Redist 14.44.35112。
+- **模型**：不变，1.7B Q8_0 `58e22d05…` / mmproj Q8_0 `46c1d533…`；对齐三件 `1b5ea4c2…`/`7117f45d…`/`8a3f5ed7…` 全对；Publish 无 f16 mmproj；32 DLL。冒烟 `ctx=1024(max 4096)` + `[ALIGN-456] aligner attached`、无 panic；无录音故无 decode 行（如实）。
+- **故障如实记录**：Step1 首轮残留 `feiyin-ime.exe` PID 23124（`target\release\`）持文件锁，致首次 `cargo build --release` 在删除旧 exe 处 EXIT=101（编译已通过）；补杀后 Step3 成功。
+- **红线**：未改生产代码 / 版本未动 / 未 push / 零凭证。报告 `collab/outbox/tester-1/result.md`。**出包 Step 1 已结束输入法进程 ⇒ 请主控转告 Gavin 重启。**
+
 ## 2026-10-03 — 主控 — VOICEPRINT-LEAK-460 ✅ 开发完成（DEC-099）
 
 - 声纹全剔 ⇒ 不走整段兜底解码 ⇒ 按「未检测到语音」处理。bin 1913P/0F/80I；fmt clean；warnings 90。

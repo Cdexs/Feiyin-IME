@@ -2899,3 +2899,141 @@ fn poc461_koja_406() {
         );
     }
 }
+
+/// STREAM-KOJA-462：现行流式预览模型（paraformer 三语）vs SenseVoice（产品已带，中英日韩粤）「模拟流式」对比。
+/// 按离线 VAD 语音段逐段解：paraformer 每段一条流；SenseVoice 每段整段解一次（终稿质量）+ 每 0.6s 重解已录前缀（模拟流式 CPU 开销）。
+/// 输出：5 段人工参考 CER、日韩中英测试音频文字、解码耗时 / 实时率、加载内存增量。
+/// 运行：cargo test --bin feiyin-ime poc462_stream -- --ignored --nocapture
+#[test]
+#[ignore = "STREAM-KOJA-462：--ignored 运行"]
+fn poc462_stream_models() {
+    let root = manifest_dir();
+    let models = root.join("models");
+    let probe = VadSegmenter::try_new_for_local_trim(&models).expect("VAD");
+    let (_, _, w0) = proc_mem_mb_457();
+    let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
+        .expect("流式模型须在位");
+    let (_, _, w1) = proc_mem_mb_457();
+    let sv = create_sensevoice_recognizer(&models, "auto").expect("SenseVoice 须在位");
+    let (_, _, w2) = proc_mem_mb_457();
+    println!(
+        "[462] 加载内存增量：paraformer 流式 {:.0}MB / SenseVoice {:.0}MB",
+        w1 - w0,
+        w2 - w1
+    );
+    let para = |seg: &[f32]| -> String {
+        let s = st_rec.create_stream();
+        for c in seg.chunks(1600) {
+            s.accept_waveform(RATE as i32, c);
+            while st_rec.is_ready(&s) {
+                st_rec.decode(&s);
+            }
+        }
+        s.input_finished();
+        while st_rec.is_ready(&s) {
+            st_rec.decode(&s);
+        }
+        st_rec
+            .get_result(&s)
+            .map(|r| r.text.clone())
+            .unwrap_or_default()
+    };
+    let svd = |seg: &[f32]| -> String {
+        let s = sv.create_stream();
+        s.accept_waveform(16000, seg);
+        sv.decode(&s);
+        s.get_result()
+            .map(|r| r.text.trim().to_string())
+            .unwrap_or_default()
+    };
+    let pad = (vad::LOCALRT_TRIM_PAD_SECS * RATE as f32) as usize;
+    let mut wavs: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for wav in collect_wavs(&root) {
+        let n = wav
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string();
+        wavs.push((n, wav));
+    }
+    for n in ["ja", "ko", "zh", "en"] {
+        wavs.push((
+            format!("test-{n}"),
+            models.join(format!(
+                "sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17/test_wavs/{n}.wav"
+            )),
+        ));
+    }
+    for k in 0..4 {
+        wavs.push((
+            format!("korean-{k}"),
+            models.join(format!("korean-testwavs/{k}.wav")),
+        ));
+    }
+    let (mut audio_s, mut t_para, mut t_sv_final, mut t_sv_sim) = (0f64, 0f64, 0f64, 0f64);
+    let mut worst_update_ms = 0f64;
+    let (mut cer_p, mut cer_s, mut cer_n) = (0f32, 0f32, 0usize);
+    let mut report = String::from("# STREAM-KOJA-462 本地对比\n\n");
+    for (name, wav) in &wavs {
+        let Some((audio, rate)) = read_wav(wav) else {
+            continue;
+        };
+        if rate as usize != RATE {
+            continue;
+        }
+        let mut ranges = probe.speech_ranges(&audio);
+        if ranges.is_empty() {
+            ranges = vec![(0, audio.len())];
+        }
+        let (mut tp, mut ts) = (String::new(), String::new());
+        for &(a, b) in &ranges {
+            let seg = &audio[a.saturating_sub(pad)..(b + pad).min(audio.len())];
+            audio_s += seg.len() as f64 / RATE as f64;
+            let t0 = Instant::now();
+            tp.push_str(&para(seg));
+            t_para += t0.elapsed().as_secs_f64();
+            let t0 = Instant::now();
+            ts.push_str(&svd(seg));
+            t_sv_final += t0.elapsed().as_secs_f64();
+            // 模拟流式：每 0.6s 重解已录前缀
+            let step = RATE * 6 / 10;
+            let mut end = step;
+            while end < seg.len() {
+                let t0 = Instant::now();
+                let _ = svd(&seg[..end]);
+                let dt = t0.elapsed().as_secs_f64();
+                t_sv_sim += dt;
+                worst_update_ms = worst_update_ms.max(dt * 1000.0);
+                end += step;
+            }
+        }
+        let line = if let Some(r) = read_ref_for(name) {
+            let (cp, cs) = (cer(&tp, &r), cer(&ts, &r));
+            cer_p += cp;
+            cer_s += cs;
+            cer_n += 1;
+            format!("- {name}：CER paraformer {cp:.4} / SenseVoice {cs:.4}\n")
+        } else if name.starts_with("test-") || name.starts_with("korean-") {
+            format!("- {name}\n  - paraformer：{tp}\n  - SenseVoice：{ts}\n")
+        } else {
+            String::new()
+        };
+        print!("{line}");
+        report.push_str(&line);
+    }
+    let summary = format!(
+        "\n## 汇总\n\n- 语音总长 {audio_s:.1}s\n- 5 段人工参考 CER：paraformer {:.4} / SenseVoice {:.4}\n- paraformer 流式解码 {t_para:.1}s（实时率 {:.3}）\n- SenseVoice 整段解 {t_sv_final:.1}s（实时率 {:.3}）；模拟流式（每 0.6s 重解前缀）累计 {t_sv_sim:.1}s（相当于实时率 {:.3}），单次更新最慢 {worst_update_ms:.0}ms\n- 加载内存增量：paraformer {:.0}MB / SenseVoice {:.0}MB\n",
+        cer_p / cer_n.max(1) as f32,
+        cer_s / cer_n.max(1) as f32,
+        t_para / audio_s.max(1e-9),
+        t_sv_final / audio_s.max(1e-9),
+        (t_sv_final + t_sv_sim) / audio_s.max(1e-9),
+        w1 - w0,
+        w2 - w1
+    );
+    print!("{summary}");
+    report.push_str(&summary);
+    let out = root.join("collab/evidence/462/stream462.md");
+    let _ = std::fs::create_dir_all(out.parent().unwrap());
+    std::fs::write(&out, report).unwrap();
+}
