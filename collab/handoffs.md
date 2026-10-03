@@ -182,3 +182,19 @@
 - 截图取证：运行时走 D2D、字体相同，差在渲染模式（竖笔画发虚）；修：显式 GDI 经典渲染模式 + 字号 18px。
 - 四单（470 / 471 / 472 / 473）全部开发完成 ⇒ 合包派 tester-1 回归 + 出包（BUILD-473）。
 
+## 2026-10-03 — tester-1 — TEST-EXEC-473 + BUILD-473 ✅（回归全绿 ⇒ 出包）
+
+- **性质**：阶段四全量回归 + 阶段五出包（MEM-ENC-470 / UI-HINT-471 / UI-REC-472 / UI-PREVIEW-473）。HEAD `a8ee634`。版本 **0.9.4 未动**。
+- **回归（全绿 0F）**：bin **1925P/0F/82I**（＝预期）/ root 2013P/0F/84I / src-tauri 92P/0F/0I / Vitest 7 files·100P·11skip / fmt EXIT 0。NEW 通过 9（`enc470_tests::t470_…` + `ui471_472_tests` 8 条）+ 忽略 3、GONE 0。重点失效模式（ui47/t470/overlay148/d2d25/t450/t456/t457/sv463/guard463/jako466/koja464）全绿、0 FAILED。⚠️ 任务书 `fix164*` 0 命中（无此测试名，如实上报）。
+- **Step7 真模型**：`sv463_preview_freeze_e2e` **1P/0F/12.13s** + `ui473_d2d_streaming_text_real_dc` **1P/0F/0.12s**（`[473]` 渲染模式 DWRITE_RENDERING_MODE(0)、gamma 2.2、左半区差异像素=0）。
+- **出包九项全 PASS**：①main 23:58:51 / ui 23:56:17 / crash 23:57:24 ②两副本全等、main `4e3357aa…` / ui `8be3f375…` / crash `9340ab31…` 均异于 466 ③0.9.4.0（ui 0.9.4）④冒烟见下 ⑤`Publish/config.toml` `da2be5da…` 三时点不变 ⑥90/9/17 ⑦正 `LAS_ENC_WARMUP`1 / `LAS_LOG_INFO`1 / `[ALIGN-456] forced aligner loaded`1 / `[STREAM-SV-463] preview model`1，反 PHANTOM-459 strip 0 / `streaming-paraformer-trilingual`0 ⑧四 toml 三副本全等 ⑨VC 五件 == Redist 14.44.35112。
+- **模型（如实）**：本批无新增 / 无改动。`Publish/models` 现 8 个目录；较 466 减少的 opus-mt-en-zh / opus-mt-zh-en / sense-voice-funasr-nano-2025-12-17 / streaming-paraformer-trilingual 由 **MODEL-CLEAN-467**（Gavin 确认，commit `2f0d354`）删除，**非本单操作**；`test_wavs` 未重新出现；onnxruntime 仅原有 2 文件。
+- **④冒烟**：Publish PID 21548 Responding + `SenseVoice model found`；target/release PID 16320 Responding + `[ACC-452] engine loaded … in 1198ms` + `dual recognizers loaded (preview SenseVoice + offline accuracy)` + `aligner attached`；无 panic / 无 crash.json / 零残留。
+- **红线**：未改生产代码 / 版本未动 / 未 push / 未删用户数据与模型文件 / 零凭证。报告 `collab/outbox/tester-1/result.md`。**Step1 已结束输入法进程 ⇒ 请主控转告 Gavin 重启。**
+
+## 2026-10-04 — 主控 — BUILD-473 验收通过
+
+- tester-1：回归全绿（bin 1925P/0F/82I）、九项全 PASS，main `4e3357aa…`，0.9.4。
+- 待 Gavin 重启后目视：预览字号 / 清晰度（473）、本地实时开录直接「请说话...」与加载中不弹录音窗（472）、加载提示完整（471）。
+- 主控更正：任务书 `fix164*` 测试名前缀写错（0 命中），下次按实际测试名列。
+
