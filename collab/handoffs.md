@@ -105,3 +105,9 @@
 - 阶段五 BUILD-459（0.9.4）：九项全 PASS（①~⑨见 `collab/outbox/tester-1/result.md`）。main `db8c5e74…` / ui `2377357b…` 异于 458；crash `21ba6f9a…` 同 458（本批零改动）。
 - 冒烟：`-debug` PID 23180 Responding；`ctx=1024(max 4096)` + `aligner attached`；无 panic / 无 crash.json / 零残留。
 - 出包 Step 1 已结束输入法进程 ⇒ Gavin 需重启（提醒转告）。
+
+## 2026-10-03 — 主控 — VOICEPRINT-LEAK-460 ✅ 开发完成（DEC-099）
+
+- 声纹全剔 ⇒ 不走整段兜底解码 ⇒ 按「未检测到语音」处理。bin 1913P/0F/80I；fmt clean；warnings 90。
+- 下一步：派 tester-1 TEST-EXEC-460 + BUILD-460。
+

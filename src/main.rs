@@ -8986,6 +8986,8 @@ fn spawn_worker_thread(
                                         // 结果按 window_seq **有序定稿**（对齐状态机串行）。
                                         let mut all_native = true;
                                         let mut total_decode_ms = 0.0f64;
+                                        // VOICEPRINT-LEAK-460：本次录音各窗声纹保留 / 剔除的语音秒数累计。
+                                        let (mut vp_kept_secs, mut vp_dropped_secs) = (0f32, 0f32);
                                         let mut recent_slices: Vec<Vec<f32>> = Vec::new();
                                         // FIX-WINDOW-DISJOINT-369：累计派发片总数 ⇒ 由 `recent_slices` 长度
                                         // 反推窗口的**全局切片区间**（传给 OrderedReflow 判重叠，别再靠文本猜）。
@@ -9284,6 +9286,8 @@ fn spawn_worker_thread(
                                                             transcription::AccDropStats::default()
                                                         }
                                                     };
+                                                    vp_kept_secs += win_drop.kept_speech_secs;
+                                                    vp_dropped_secs += win_drop.dropped_speech_secs;
                                                     let text = match r {
                                                         Ok((t, _np, _stats)) => t,
                                                         Err(err) => {
@@ -10256,7 +10260,13 @@ fn spawn_worker_thread(
                                             // 亦不在 drain 累计）。显式消费，避免 `unused_assignments` 假红。
                                             let _ = (rate_sum_chars, rate_sum_secs, rate_windows);
                                             let (committed, last_window_text) = ordered.finish();
-                                            (committed, last_window_text, all_native, total_decode_ms)
+                                            (
+                                                committed,
+                                                last_window_text,
+                                                all_native,
+                                                total_decode_ms,
+                                                voiceprint_dropped_all(vp_kept_secs, vp_dropped_secs),
+                                            )
                                         })
                                     }))
                             } else {
@@ -10400,15 +10410,20 @@ fn spawn_worker_thread(
                         let (asr_result, record_result, acc_result, tail_wait_ms) = scoped;
 
                         // SLIDING-WINDOW-367：worker 返回 (定稿前缀, 最新窗口文本, all_native, 总解码ms)。
-                        let (acc_committed, acc_last_window, acc_all_native, acc_total_decode_ms) =
-                            match acc_result {
-                                Some(Ok((c, lw, an, total))) => (c, lw, an, total),
-                                Some(Err(_join_err)) => {
-                                    log::error!("SLIDING-WINDOW-367 accuracy worker panicked");
-                                    (String::new(), String::new(), false, 0.0)
-                                }
-                                None => (String::new(), String::new(), false, 0.0),
-                            };
+                        let (
+                            acc_committed,
+                            acc_last_window,
+                            acc_all_native,
+                            acc_total_decode_ms,
+                            acc_vp_dropped_all,
+                        ) = match acc_result {
+                            Some(Ok((c, lw, an, total, vp))) => (c, lw, an, total, vp),
+                            Some(Err(_join_err)) => {
+                                log::error!("SLIDING-WINDOW-367 accuracy worker panicked");
+                                (String::new(), String::new(), false, 0.0, false)
+                            }
+                            None => (String::new(), String::new(), false, 0.0, false),
+                        };
                         // 最终文本 = 定稿前缀（滑出片） + 最新窗口文本。
                         let acc_joined = format!("{}{}", acc_committed, acc_last_window);
                         if log::log_enabled!(log::Level::Debug) {
@@ -10557,6 +10572,14 @@ fn spawn_worker_thread(
                             // 再跑 CT-Transformer ⇒ `。。`/`，。` 叠加（Gavin 端测报障）。
                             let native_punctuated = pretranscribed_native_punctuated(&stripped);
                             Some((stripped, native_punctuated))
+                        } else if acc_vp_dropped_all && !cancel_signal.load(Ordering::Acquire) {
+                            // VOICEPRINT-LEAK-460：滑窗结果空、原因是声纹把语音全剔（非本人）⇒ 交空文本 ⇒ 下游按
+                            // 「未检测到语音」处理，**不走**整段兜底解码（那条路不经声纹，会把他人话打出来；
+                            // Gavin 09-30 放视频端测：「刚才的这番打斗……梅姨走了进来」被打出）。
+                            log::info!(
+                                "[VOICEPRINT-LEAK-460] all speech dropped by voiceprint ⇒ no full-recording fallback"
+                            );
+                            Some((String::new(), false))
                         } else {
                             None
                         };
@@ -11689,6 +11712,12 @@ fn assemble_parallel_accuracy(mut segments: Vec<(usize, Vec<String>)>) -> Vec<St
 /// （与 BUG-119「没说话」路径一致，由旧路径给出 NoSpeech）。
 fn acc_parallel_result_usable(cancelled: bool, joined: &str) -> bool {
     !cancelled && !joined.trim().is_empty()
+}
+
+/// VOICEPRINT-LEAK-460：本次录音是否「声纹把语音全剔」——没有任何保留的本人语音、且确有被剔除的语音。
+/// 为真且滑窗结果为空 ⇒ 不走整段兜底解码（兜底不经声纹）。
+fn voiceprint_dropped_all(kept_secs: f32, dropped_secs: f32) -> bool {
+    kept_secs <= 0.0 && dropped_secs > 0.0
 }
 
 /// LOCALRT-REFLOW-HOLE-344-G：空/失败分片的填补决策（纯函数，可单测）。
@@ -12845,6 +12874,19 @@ mod parallel_acc_298_tests {
     }
 
     /// 判据 #3：取消 ⇒ 结果一律弃用（不带脏结果）；空/纯空白 ⇒ 弃用回落旧路径。
+    #[test]
+    fn t460_voiceprint_dropped_all() {
+        assert!(super::voiceprint_dropped_all(0.0, 3.79), "全剔 ⇒ 不兜底");
+        assert!(
+            !super::voiceprint_dropped_all(1.2, 3.79),
+            "有本人语音 ⇒ 照旧"
+        );
+        assert!(
+            !super::voiceprint_dropped_all(0.0, 0.0),
+            "没剔任何语音（如真没说话 / 声纹未就绪）⇒ 照旧兜底"
+        );
+    }
+
     #[test]
     fn acc_parallel_result_usable_gate() {
         assert!(!acc_parallel_result_usable(true, "有字"));
