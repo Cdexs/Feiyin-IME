@@ -2693,3 +2693,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 对 macOS 的影响 | 平台中立代码，同一份编译；macOS 最终输出同样受益。**未在 macOS 实测** |
 | 是否需要对方同步 | 重新编译即可 |
 
+## PUNCT-JAKO-466（2026-10-03，主控）· 日韩文专用标点模型（延迟加载，DEC-102）
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | 新增 `src/punctuation/jako.rs`；`Cargo.toml` 新依赖 `ort = "=2.0.0-rc.13"`（default-features 关，std + load-dynamic）；预览 `preview_display` 与最终节点 `apply_local_punctuation` 遇假名 / 谚文改用日韩标点 |
+| 行为变化 | 日韩文（预览 + 本地实时 / performance 最终输出）有标点、韩文空格保留；中英文不变 |
+| 对 macOS 的影响 | 平台中立代码 + **新依赖** + **新模型目录** `models/punct-cap-seg-47lang-int8/`（需随包）。`ort` load-dynamic 在 macOS 找 exe 同目录 `libonnxruntime*.dylib`（sherpa-onnx shared 随包那份），找不到时退回裸名 `libonnxruntime.dylib`。**未在 macOS 实测**：若 dylib 位置不同（如 Frameworks/），日韩标点加载失败只记一次警告、文本原样，不影响其他功能 |
+| 是否需要对方同步 | 换上新模型目录 + 重新编译；macOS 端测首次说日 / 韩文时看日志 `[PUNCT-JAKO-466] … loaded on first use` |
+

@@ -3220,3 +3220,15 @@ Gavin 原话：「我说的是b路径上的1.7b模型，把词库注入去掉，
 - **验证**：`koja464_ct_unsupported_script`、`koja464_local_punct_checks_script_before_engine`（护栏）、`koja464_local_punct_real_engine`（真模型：韩 / 日原样、中文加标点）、`fix464_punct_on_every_change_independent_of_silence`；`sv463_preview_freeze_e2e` 带真标点全绿（冻结区不变、韩文预览空格完好、停顿派发片以句末标点收尾）。
 - **代价 / 遗留**：标点模型对无左文的短尾巴偶有误判（实测「巴西队的淘汰。赛」），只在预览出现、精解回灌后替换；日韩预览无标点。
 
+### DEC-102 · 日韩文专用标点模型（延迟加载）（PUNCT-JAKO-466）（2026-10-03）
+
+- **背景**：PUNCT-MODEL-465 实测（`collab/evidence/465/punct-models.md`）：唯一的中英日韩候选 punct_cap_seg_47_language 中文明显不如现行 CT-Transformer（位置 F1 84.7 → 76.1，句号 85 → 56），但日韩英明显更好（韩文空格完好、`, . ?` 正确）。Gavin「那就按照你的建议来，中文英文继续用现在的标点模型，日韩文换用候选模型的压缩版。但是日韩文的标点模型要采用延迟加载，不要程序一启动就加载。如果探测到用户输入的是日文或者韩文，才会加载对应的标点模型」；追加「本地 performance 模型管线也要同步考虑……集成适配」。
+- **决策**：
+  1. 模型：原版 233MB 经 onnxruntime `quantize_dynamic(QInt8)` 得 `model.int8.onnx`（58.7MB，`fa630cad…`），随 SentencePiece 分词模型、config 放 `models/punct-cap-seg-47lang-int8/`。
+  2. 推理（`src/punctuation/jako.rs`）：小写分词（记原文字节映射）→ 每窗 126 子词、重叠 16（首尾各丢 8，同参考实现 punctuators）→ 取「子词后标点」→ **按原文位置插回**（原文大小写 / 空格逐字保留，不出 `<Unk>`；纯「▁」子词的预测按参考实现忽略；已有标点处不叠）。单线程，一句约 4~9ms。
+  3. 延迟加载：只在 `ct_unsupported_script`（假名 / 谚文）为真的分支调用；最终输出 `punctuate` 首次同步加载（约 0.5s，含 ORT 初始化，仅一次）；预览 `punctuate_if_ready` 未就绪则后台加载、本次原样显示；加载失败只记一次、此后原样。
+  4. 接入点：预览 `preview_display`（说话中 349 不挂句末、停顿 / 录音结束补句末照旧）；最终标点节点 `apply_local_punctuation`（本地实时：1.7B 结果无标点时才走到；performance 档：每次都走到）。
+  5. ONNX Runtime：`ort = "=2.0.0-rc.13"`（default-features 关，只开 std + load-dynamic）运行时加载 sherpa-onnx 自带 onnxruntime 1.28.2，不下载、不另打包。
+- **验证**：单测（分窗 / 原文映射 / 插回）+ 护栏 `jako466_only_called_after_jako_detection`；真模型 `jako466_real_model`（韩文与参考实现逐字一致；日文分词 35 子词全同，标点 34/35 同，差 1 处是 ORT 1.28.2 与 1.30 的 int8 近似并列）、`koja464_local_punct_real_engine`、`sv463_preview_freeze_e2e` 全绿。
+- **代价**：首次出现日韩文时最终输出多约 0.5s（仅一次）；加载后常驻约 80MB；int8 偶有误断（实测「学校。販売」）。
+

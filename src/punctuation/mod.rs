@@ -1,5 +1,8 @@
 use std::path::{Path, PathBuf};
 
+/// PUNCT-JAKO-466：日韩文专用标点（首次遇到日韩文才加载）。
+pub(crate) mod jako;
+
 use crate::transcription;
 
 const PUNCT_MODEL_SUBDIR: &str = "punct-ct-transformer-zh";

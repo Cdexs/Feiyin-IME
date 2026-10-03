@@ -538,7 +538,8 @@ fn should_repunctuate_preview(interval_ms: f32, has_new: bool, threshold_ms: f32
 /// - `sentence_end`（PREVIEW-PUNCT-464）：此刻句子已说完（停顿派发 / 句末冻结 / 录音结束）⇒ 不论有无新字
 ///   都把尾巴重打一次并**保留句末标点**（说话中的 349「句末终止符不入缓存」只针对没说完的半句）。
 ///
-/// KOJA-PUNCT-464：尾巴含日文假名 / 韩文 ⇒ 不送标点模型（中英词表；韩文空格会被吃光），原样显示。
+/// KOJA-PUNCT-464 / PUNCT-JAKO-466：尾巴含日文假名 / 韩文 ⇒ 不送 CT（中英词表；韩文空格会被吃光），
+/// 改用日韩专用标点 [`crate::punctuation::jako::punctuate`]（首次遇到日韩文才加载）；不可用则原样显示。
 fn preview_display(
     raw_full: &str,
     engine: Option<&mut PunctuationEngine>,
@@ -557,15 +558,22 @@ fn preview_display(
     // 尾巴起点夹紧到当前 raw 内，并要求 char 边界（raw 经 endpoint 确认可能变短再长，
     // 历史字节位置不保证仍是当前串的合法切点；不合法就本帧不打，复用路径原样显示，下周期恢复）。
     let tail_start = tail_start.min(raw_full.len());
-    let tail_ok = tail_start < raw_full.len()
-        && raw_full.is_char_boundary(tail_start)
-        && !crate::punctuation::ct_unsupported_script(&raw_full[tail_start..]);
+    let tail_ok = tail_start < raw_full.len() && raw_full.is_char_boundary(tail_start);
     if tail_ok && ((force && has_new) || sentence_end) {
         let head = punct_head(&cache.prefix, raw_full, &cache.raw, tail_start, head_chars);
         let t = Instant::now();
-        let tail = engine
-            .add_punctuation(&raw_full[tail_start..])
-            .unwrap_or_else(|| raw_full[tail_start..].to_string());
+        let tail_raw = &raw_full[tail_start..];
+        // PUNCT-JAKO-466：尾巴含日文假名 / 韩文 ⇒ 改用日韩专用标点；中英仍走 CT。首次遇到日韩文时模型在
+        // **后台**加载（约 0.5s），未就绪的这几次刷新原样显示、不卡预览；日韩模型不可用 ⇒ 原样（不送 CT：
+        // 它会吃光韩文空格，KOJA-PUNCT-464）。
+        let tail = if crate::punctuation::ct_unsupported_script(tail_raw) {
+            crate::punctuation::jako::punctuate_if_ready(tail_raw)
+                .unwrap_or_else(|| tail_raw.to_string())
+        } else {
+            engine
+                .add_punctuation(tail_raw)
+                .unwrap_or_else(|| tail_raw.to_string())
+        };
         // PUNCT-349 防复发：没说完的半句，句末终止符不进缓存（句中标点照旧保留）；
         // PREVIEW-PUNCT-464：句子已说完 ⇒ 句末标点保留。
         cache.prefix = if sentence_end {
@@ -3443,6 +3451,8 @@ mod tests {
         );
 
         // 日 / 韩：实时管线预览能出假名 / 谚文（STREAM-KOJA-462 的出发点）。
+        // PUNCT-JAKO-466：日韩尾巴走日韩专用标点（测试进程 exe 旁无 models/ ⇒ 先指定模型目录）。
+        crate::punctuation::jako::init_for_test(&root.join("models"));
         let sv_dir = root
             .join("models")
             .join(crate::transcription::SENSEVOICE_MODEL_SUBDIR);
@@ -3485,6 +3495,12 @@ mod tests {
                 assert!(
                     preview.contains(' '),
                     "KOJA-PUNCT-464：韩文预览空格不得被标点模型吃掉：{preview}"
+                );
+            }
+            if punct.is_some() {
+                assert!(
+                    preview.contains(['.', ',', '?', '。', '、', '？']),
+                    "PUNCT-JAKO-466：{lang} 预览应带日韩标点：{preview}"
                 );
             }
         }

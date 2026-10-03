@@ -155,3 +155,9 @@
 - **④冒烟**：Publish 包 PID 27288 Responding=True + `SenseVoice model found at Publish\models\…`；target/release 本地实时档 PID 22760 Responding=True + `dual recognizers loaded (preview SenseVoice + offline accuracy)` + `ctx=1024(max 4096)` + `[ALIGN-456] aligner attached`；无 panic / 无 crash.json / 零残留。
 - **红线**：未改生产代码 / 版本未动 / 未 push / 未删用户数据与模型文件 / 零凭证。报告 `collab/outbox/tester-1/result.md`。**Step1 已结束输入法进程 ⇒ 请主控转告 Gavin 重启。**
 
+## 2026-10-03 — 主控 — PUNCT-JAKO-466 ✅ 开发完成（DEC-102）
+
+- 子项 466-1~466-6、466-8 完成（见 todo）；466-7 派 tester-1；466-9 结论入 DEC 后清理临时环境。
+- 日韩标点：int8 59MB，首次判出日韩文才加载（最终输出同步 ≈0.5s 一次；预览后台加载不卡）；本地实时 + performance 同一最终节点。
+- 新依赖 `ort =2.0.0-rc.13`（load-dynamic，复用 onnxruntime 1.28.2）；新模型目录需随包（Publish/models 复制）。
+

@@ -21,6 +21,10 @@ cpal = "0.15"
 # sherpa-onnx for Paraformer ASR (v0.3.2)
 # MIGRATE-1.13.8-1.7B-359：升 1.13.8（含 Qwen3 静音幻觉修复 #3907、centered-STFT #3873、PRNG 竞态 #3912；ORT 1.28.2）
 sherpa-onnx = { version = "1.13.8", default-features = false, features = ["shared"] }
+# PUNCT-JAKO-466：日韩文专用标点模型（punct_cap_seg_47lang int8）直接走 ONNX Runtime。
+# 🔴 只开 std + load-dynamic：运行时加载 sherpa-onnx 自带的 onnxruntime（1.28.2，与 ort rc.13 目标版本一致），
+#    不下载、不另打包第二份 ORT；首次遇到日韩文才加载（DEC-102）。
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic"] }
 
 # Offline translation via CTranslate2. Tokenization stays on the Rust side.
 ctranslate2 = { version = "2.1.1", default-features = false, features = ["tokenizers"] }
