@@ -161,3 +161,13 @@
 - 日韩标点：int8 59MB，首次判出日韩文才加载（最终输出同步 ≈0.5s 一次；预览后台加载不卡）；本地实时 + performance 同一最终节点。
 - 新依赖 `ort =2.0.0-rc.13`（load-dynamic，复用 onnxruntime 1.28.2）；新模型目录需随包（Publish/models 复制）。
 
+## 2026-10-03 — tester-1 — TEST-EXEC-466 + BUILD-466 ✅（回归全绿 ⇒ 出包）
+
+- **性质**：阶段四全量回归 + 阶段五出包（PUNCT-JAKO-466 / DEC-102）。HEAD `015450e`。版本 **0.9.4 未动**。
+- **回归（全绿 0F）**：bin **1916P/0F/79I**（＝预期）/ root 2004P/0F/81I / src-tauri 92P/0F/0I / Vitest 7 files·100P·11skip / fmt EXIT 0。NEW 通过 4（`punctuation::jako::tests`）+ 忽略 1、GONE 0。重点失效模式（jako466/koja464/fix464/fix438/guard463/ts393/guard346/ts405b/t445/t456/t457/partial_reflow_452）全绿、0 FAILED。
+- **Step7 真模型**：`jako466_real_model` **1P/0F/0.56s**（加载 519ms，韩/日打点）+ `koja464_local_punct_real_engine` **1P/0F/0.86s**（ko/ja/zh）+ `sv463_preview_freeze_e2e` **1P/0F/12.17s**。
+- **出包九项全 PASS**：①main 19:40:10 / ui 19:37:45 / crash 19:38:51 ②两副本全等、main `ca0fb60b…` / ui `8113b7e8…` / crash `d427ccb3…`（crash 源码零改动，因新增 `ort` 依赖重链接而同 crate bin 变化）③0.9.4.0（ui 0.9.4）④冒烟见下 ⑤`Publish/config.toml` `da2be5da…` 三时点不变 ⑥90/9/17 ⑦正 `[PUNCT-JAKO-466] ja/ko punctuation model loaded on first use`1 + `Local ja/ko punctuation applied`1 + `[STREAM-SV-463] preview model`1，反 PHANTOM-459 strip 0 / `streaming-paraformer-trilingual`0 ⑧四 toml 三副本全等 ⑨VC 五件 == Redist 14.44.35112。
+- **模型 / 运行库**：新 `punct-cap-seg-47lang-int8` 复制到 `Publish/models/`，model.int8.onnx sha16 `fa630cad87cdf398`、spe_unigram `1bc15b6e5fd80dfa`（源=Publish）；旧目录全保留。🔴 onnxruntime 仅原有 2 文件（`onnxruntime.dll` 17,136,128 B + `onnxruntime_providers_shared.dll` 10,752 B，两处 sha 等），无第二份。
+- **④冒烟 + 延迟加载核验**：Publish PID 1332（`SenseVoice model found`）+ target/release PID 21132（`dual recognizers loaded (preview SenseVoice + offline accuracy)` + `ctx=1024(max 4096)` + `aligner attached`）；无 panic / 无 crash.json / 零残留。🔴 **两处冒烟日志 grep `[PUNCT-JAKO-466] ja/ko punctuation model loaded` = 0**（启动未加载日韩标点模型）。
+- **红线**：未改生产代码 / 版本未动 / 未 push / 未删用户数据与模型文件 / 零凭证。报告 `collab/outbox/tester-1/result.md`。**Step1 已结束输入法进程 ⇒ 请主控转告 Gavin 重启。**
+
