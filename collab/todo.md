@@ -34,9 +34,9 @@
 | ↳ `466-4` | 延迟加载：首次探测到假名 / 谚文才加载，进程内一次；失败只记一次、不重试、原样返回 | 主控 | 护栏：只在判出日韩文的分支调用；日志记首次加载耗时 | ✅ 只在判出日韩文后调用（护栏 `jako466_only_called_after_jako_detection`）；最终输出同步加载（实测约 0.5s，仅首次）；预览**后台**加载、未就绪先原样显示，不卡预览；失败只记一次 |
 | ↳ `466-5` | 本地实时预览接入：日韩尾巴改用日韩标点（说话中不挂句末、停顿补句末照旧） | 主控 | 端到端：日韩预览带标点、韩文空格完好 | ✅ `preview_display` 日韩尾巴走 `punctuate_if_ready`；端到端：韩文预览「… 편할 거야.」空格完好、日文带「、。」 |
 | ↳ `466-6` | 最终输出接入（本地实时 + **performance 档**，Gavin 追加）：`apply_local_punctuation` 遇日韩文改用日韩标点 | 主控 | 真模型：日韩带标点；中英逐位不变 | ✅ `apply_local_punctuation` 日韩文走 `punctuate`（本地实时 + performance 同一节点）；真模型：韩「봤는데, 오늘은 … 생각이에요.」、日「場合は、…買う。」、中文仍 CT「…五点，我们明天见。」 |
-| ↳ `466-7` | tester-1 全量回归 + 出包（Publish 带新模型目录） | 主控 | 回归全绿、九项 PASS | ⬜ |
+| ↳ `466-7` | tester-1 全量回归 + 出包（Publish 带新模型目录） | 主控 | 回归全绿、九项 PASS | 🔄 已派 TEST-EXEC-466 + BUILD-466（HEAD `015450e`，预期 bin 1916P/0F/79I；含启动不加载日韩模型核验） |
 | ↳ `466-8` | 文档：DEC-102 / 五文档 / MACOS-HANDOFF（新依赖 + 新模型目录 + macOS 动态库路径） | 主控 | 逐份落盘 | ✅ DEC-102、troubleshooting（INT8-ORT-NUMERICS-466）、progress / CHANGELOG / handoffs / logs / MACOS-HANDOFF |
-| ↳ `466-9` | 清理：临时 Python 环境与下载的候选模型（结论入 DEC 后，先存清单） | 主控 | 清单在、目录已删 | ⬜ |
+| ↳ `466-9` | 清理：临时 Python 环境与下载的候选模型（结论入 DEC 后，先存清单） | 主控 | 清单在、目录已删 | ✅ 清单 `collab/evidence/465/cleanup-466.txt`；poc465（280M）/ poc465hf（224M）/ venv464（878M）已删，共约 1.4G |
 | `TEST-GAP-438-TAILSTART` | 护栏缺口（BUILD-438 消融 438b 未红）：`preview_display` 重打时忽略 `tail_start` 改为整段重打，`fix438_*` 全绿——护栏只直调纯函数、唯一进 `preview_display` 的用例 `engine=None`。主控已读码确认接线正确（不影响本包）。补：带真 CT-Transformer 或可注入打点函数的端到端用例 | 待定（非作者 coder） | local_stream.rs 测试区 | ⏳ 攒批补 |
 | `RT-STOP-LATENCY-MULTIWIN` | BUILD-398 #9 遗留：长录音切多窗串行解码，停止时队列压窗 ⇒ 松键到上屏 4.5s（16:44Z 23.85s 录音）；后半「无语音整窗送解」已由 414 修 | 待定 | — | ⏳ 待更多端测数据再定 |
 
