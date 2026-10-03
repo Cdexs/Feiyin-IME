@@ -5458,4 +5458,5 @@ TEST-SYNC-420 给 `fix_reflow_raw_base_420_tests` 加 `fn_body` helper，内含 
 - **根因**：CT-Transformer 词表为中英，分词后按无空格语言拼回。
 - **判据 / 做法**：送标点模型前判 `ct_unsupported_script`（假名 / 谚文），为真则原样保留。只判假名 / 谚文，不判汉字（日文汉字与中文同区）。
 - **SenseVoice**：输入只有一个 textnorm 查询 token（withitn=14 / woitn=15），标点与 ITN 同训，sherpa 只暴露 `use_itn`；想要它的标点就得接受它的 ITN（实测「二比一」→「2B1」、「八分之一」→「8分之1」）。
+- **补充（词表取证）**：`punct-ct-transformer-zh/tokens.json` 272727 条中谚文 0、假名 0；`punc_list` = `<unk> _ ， 。 ？ 、`。日韩送进去基本全是未知词，模型不是「打错标点」而是「看不懂」——占位符 / 调参都救不了标点，只能救空格（逐字对齐插回），收益仅一个句末「。」。
 

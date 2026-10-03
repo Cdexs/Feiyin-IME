@@ -145,3 +145,13 @@
 - 定向回归全绿（local_stream 103 / punct 146 / transcription 545 / overlay 145 / guard 175）；端到端全绿。预期 bin 1912P/0F/78I。
 - 下一步：派 tester-1 TEST-EXEC-464 + BUILD-464。
 
+## 2026-10-03 — tester-1 — TEST-EXEC-464 + BUILD-464 ✅（回归全绿 ⇒ 出包）
+
+- **性质**：阶段四全量回归 + 阶段五出包（PREVIEW-PUNCT-464 + KOJA-PUNCT-464 / DEC-101）。HEAD `6c88581`，工作区 clean。版本 **0.9.4 未动**。
+- **回归（全绿 0F）**：bin **1912P/0F/78I**（＝预期）/ root 2000P/0F/80I / src-tauri 92P/0F/0I / Vitest 7 files·100P·11skip / fmt EXIT 0。NEW 通过 3（`koja464_ct_unsupported_script` / `koja464_local_punct_checks_script_before_engine` / `fix464_punct_on_every_change_independent_of_silence`）+ 忽略 1、GONE 通过 1（`fix438_silence_1200ms_no_longer_triggers` 0 命中）、改写 3（punct438_preview_only_on_interval / fix438_interval_gate_refires_after_reset / fix438_source_guards）全绿。重点失效模式全绿、0 FAILED。
+- **Step7 真模型 E2E**：`sv463_preview_freeze_e2e` **1P/0F/11.70s**（含「停顿派发补句末标点，PREVIEW-PUNCT-464」）+ `koja464_local_punct_real_engine` **1P/0F/0.26s**。
+- **出包九项全 PASS**：①main 18:45:16 / ui 18:43:07 / crash 09-30 22:25（零改动）②两副本全等、main `289b59db…` / ui `47a17f25…` 异于 463，crash `21ba6f9a…` 同 463 ③0.9.4.0（ui 0.9.4）④冒烟见下 ⑤`Publish/config.toml` `da2be5da…` 三时点不变 ⑥90/9/17 ⑦正 `Local punctuation skipped: ja/ko text not supported by punctuation model`1 / `[STREAM-SV-463] preview model`1 / VOICEPRINT-460 1，反 PHANTOM-459 strip 0 / `streaming-paraformer-trilingual`0 / `LAS_DRAFT_LANG`0 ⑧四 toml 三副本全等 ⑨VC 五件 == Redist 14.44.35112。
+- **模型**：本批无新增。sense-voice `model.int8.onnx` sha16 `c71f0ce00bec95b0` 未变；`Publish/models/sherpa-onnx-funasr-nano-int8-2025-12-30` 已按 Gavin 指示删除（未恢复，属正常）；其余旧目录（sense-voice-funasr-nano-2025-12-17 / streaming-paraformer-trilingual）保留。
+- **④冒烟**：Publish 包 PID 27288 Responding=True + `SenseVoice model found at Publish\models\…`；target/release 本地实时档 PID 22760 Responding=True + `dual recognizers loaded (preview SenseVoice + offline accuracy)` + `ctx=1024(max 4096)` + `[ALIGN-456] aligner attached`；无 panic / 无 crash.json / 零残留。
+- **红线**：未改生产代码 / 版本未动 / 未 push / 未删用户数据与模型文件 / 零凭证。报告 `collab/outbox/tester-1/result.md`。**Step1 已结束输入法进程 ⇒ 请主控转告 Gavin 重启。**
+
