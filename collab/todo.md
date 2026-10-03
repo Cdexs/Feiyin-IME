@@ -37,11 +37,11 @@
 | ↳ `466-7` | tester-1 全量回归 + 出包（Publish 带新模型目录） | 主控 | 回归全绿、九项 PASS | ✅ bin 1916P/0F/79I、root 2004P、src-tauri 92P、Vitest 100P；三条真模型全绿（加载 519ms）；九项 PASS；main `ca0fb60b…`；Publish 带新模型（`fa630cad…`）；onnxruntime 仅原有 2 个文件；冒烟日志日韩模型加载 0 次（启动不加载） |
 | ↳ `466-8` | 文档：DEC-102 / 五文档 / MACOS-HANDOFF（新依赖 + 新模型目录 + macOS 动态库路径） | 主控 | 逐份落盘 | ✅ DEC-102、troubleshooting（INT8-ORT-NUMERICS-466）、progress / CHANGELOG / handoffs / logs / MACOS-HANDOFF |
 | ↳ `466-9` | 清理：临时 Python 环境与下载的候选模型（结论入 DEC 后，先存清单） | 主控 | 清单在、目录已删 | ✅ 清单 `collab/evidence/465/cleanup-466.txt`；poc465（280M）/ poc465hf（224M）/ venv464（878M）已删，共约 1.4G |
-| `MODEL-CLEAN-467` | Gavin 10-03「你整理下目前哪些旧的的模型目前产品已经不用了，列个清单我确认下，没问题就准备清除」 | 主控 | 清理 | 🔄 清单待确认（`collab/evidence/467/model-cleanup-candidates.md`） |
+| `MODEL-CLEAN-467` | Gavin 10-03「你整理下目前哪些旧的的模型目前产品已经不用了，列个清单我确认下，没问题就准备清除」 | 主控 | 清理 | ✅ 6 项已删（74 个文件 2.32GB），在用模型校验值不变；两处 models 均 4.3G |
 | ↳ `467-1` | 盘点 models/ 与 Publish/models/ 全部目录、逐个核对正式代码引用 | 主控 | 每个目录有结论 | ✅ 6 项停用（约 2.25G）、9 项在用、3 项测试录音保留 |
-| ↳ `467-2` | 待删清单交 Gavin 确认 | 主控 | Gavin 明确同意 | 🔄 待确认 |
-| ↳ `467-3` | 删除（先存逐文件清单；等 BUILD-466 出包结束再动 Publish，避免与构建冲突） | 主控 | 清单在、目录已删、在用模型校验值不变 | ⬜ |
-| ↳ `467-4` | 文档：logs / todo / MACOS-HANDOFF（模型目录变化） | 主控 | 逐份落盘 | ⬜ |
+| ↳ `467-2` | 待删清单交 Gavin 确认 | 主控 | Gavin 明确同意 | ✅ Gavin「好，清理以上列表中的模型和文件吧」（含 funasr-nano：已解释新日期版是 Fun-ASR-Nano 拆出的轻量输出层、实测更差） |
+| ↳ `467-3` | 删除（先存逐文件清单；等 BUILD-466 出包结束再动 Publish，避免与构建冲突） | 主控 | 清单在、目录已删、在用模型校验值不变 | ✅ 清单 `collab/evidence/467/deleted-files.txt`（74 文件 2.32GB）；在用 6 个关键文件 sha 与出包记录一致（58e22d05 / 46c1d533 / 1b5ea4c2 / 7117f45d / c71f0ce0 / fa630cad） |
+| ↳ `467-4` | 文档：logs / todo / MACOS-HANDOFF（模型目录变化） | 主控 | 逐份落盘 | ✅ logs / todo / MACOS-HANDOFF；翻译代码注释同步（opus-mt 已删） |
 | `TEST-GAP-438-TAILSTART` | 护栏缺口（BUILD-438 消融 438b 未红）：`preview_display` 重打时忽略 `tail_start` 改为整段重打，`fix438_*` 全绿——护栏只直调纯函数、唯一进 `preview_display` 的用例 `engine=None`。主控已读码确认接线正确（不影响本包）。补：带真 CT-Transformer 或可注入打点函数的端到端用例 | 待定（非作者 coder） | local_stream.rs 测试区 | ⏳ 攒批补 |
 | `RT-STOP-LATENCY-MULTIWIN` | BUILD-398 #9 遗留：长录音切多窗串行解码，停止时队列压窗 ⇒ 松键到上屏 4.5s（16:44Z 23.85s 录音）；后半「无语音整窗送解」已由 414 修 | 待定 | — | ⏳ 待更多端测数据再定 |
 

@@ -2702,3 +2702,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 对 macOS 的影响 | 平台中立代码 + **新依赖** + **新模型目录** `models/punct-cap-seg-47lang-int8/`（需随包）。`ort` load-dynamic 在 macOS 找 exe 同目录 `libonnxruntime*.dylib`（sherpa-onnx shared 随包那份），找不到时退回裸名 `libonnxruntime.dylib`。**未在 macOS 实测**：若 dylib 位置不同（如 Frameworks/），日韩标点加载失败只记一次警告、文本原样，不影响其他功能 |
 | 是否需要对方同步 | 换上新模型目录 + 重新编译；macOS 端测首次说日 / 韩文时看日志 `[PUNCT-JAKO-466] … loaded on first use` |
 
+## MODEL-CLEAN-467（2026-10-03，主控）· 删除产品已不用的旧模型
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | 删除 `sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17`、`sherpa-onnx-streaming-paraformer-trilingual-zh-cantonese-en`、`opus-mt-en-zh`、`opus-mt-zh-en`、`qwen3-asr-1.7b-gguf/tokenizer/`、`qwen3-asr-1.7b-gguf/mmproj-Qwen3-ASR-1.7B-f16.gguf`（代码均已不引用） |
+| 行为变化 | 无（产品代码早已不加载这些文件） |
+| 对 macOS 的影响 | macOS 打包同样不必再带这 6 项；需要的模型目录见 STREAM-SV-463 / PUNCT-JAKO-466 两条 |
+| 是否需要对方同步 | 打包清单去掉上述目录即可 |
+

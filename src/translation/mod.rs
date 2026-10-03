@@ -21,7 +21,8 @@ use crate::text_normalizer::contains_han;
 // ===========================================================================
 // TRANS-NLLB-AND-SENTENCE-BATCH-394：离线翻译改用 NLLB-200-distilled-600M（CT2 int8）。
 //   Gavin 2026-09-23：逐句训练的 Marian 长段易「精简 / 偏离」⇒ 换 NLLB + 逐句批量 + 漏译守卫。
-//   🔴 不做对比、不留 opus-mt 回退（代码中不再加载 opus-mt）；opus-mt 目录保留（删除须 Gavin 确认）。
+//   🔴 不做对比、不留 opus-mt 回退（代码中不再加载 opus-mt）；opus-mt 目录已于 2026-10-03 经 Gavin 确认删除
+//   （MODEL-CLEAN-467，清单 `collab/evidence/467/deleted-files.txt`）。
 // ===========================================================================
 
 /// NLLB 模型子目录（下载落点；`<exe_dir>/models/<本名>`）。
