@@ -127,3 +127,13 @@
 - 定向回归全绿；`sv463_preview_freeze_e2e` 全绿。新模型已放 `models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/`（与 poc-462 下载件逐字节一致）。
 - 下一步：派 tester-1 TEST-EXEC-463 + BUILD-463；旧模型目录（funasr-nano 2025-12-17、streaming-paraformer-trilingual）待 Gavin 确认后删除。
 
+## 2026-10-03 — tester-1 — TEST-EXEC-463 + BUILD-463 ✅（回归全绿 ⇒ 出包）
+
+- **性质**：阶段四全量回归 + 阶段五出包（STREAM-SV-463 / DEC-100）。HEAD `90620ca`，工作区 clean。版本 **0.9.4 未动**。
+- **回归（全绿 0F）**：bin **1910P/0F/77I**（＝预期）/ root 1998P/0F/79I / src-tauri 92P/0F/0I / Vitest 7 files·100P·11skip / fmt EXIT 0。NEW 通过 8 + 忽略 2、GONE 通过 11 + 忽略 5（全 0 命中）、改写 3 组（ts405b/t445_wiring/fix438×10）全绿。重点失效模式（guard463/fix438/ts393/guard346/guard384/ts405b/t445/t456/457/458/partial_reflow_452/tail_window_407）全绿、0 FAILED。
+- **Step7 真模型 E2E**：`sv463_preview_freeze_e2e` **1P/0F/11.56s**（56.1s 录音 / 处理 8.6s / 6 片 6 边界 / ja+ko 预览 / 标点引擎在位）。
+- **出包九项全 PASS**：①main 17:34:15 / ui 17:31:01 / crash 09-30 22:25（零改动）②两副本全等、main `2fada242…` / ui `e862c0cd…` 异于 460，crash `21ba6f9a…` 同 460 ③0.9.4.0（ui 0.9.4）④冒烟见下 ⑤`Publish/config.toml` `da2be5da…` 三时点不变 ⑥90/9/17 ⑦正 `[STREAM-SV-463] preview model`1 / `decode win=`1 / `first_decode`1 / VOICEPRINT-460 1，反 PHANTOM-459 strip 0 / `[LocalRT-DBG-291] endpoint flush`0 / `streaming-paraformer-trilingual`0 / `LAS_DRAFT_LANG`0 ⑧四 toml 三副本全等 ⑨VC 五件 == Redist 14.44.35112。
+- **模型**：🔴 新 sense-voice 整目录复制到 `Publish/models/`；`model.int8.onnx` sha16 `c71f0ce00bec95b0`、`tokens.txt` `f449eb28dc567533`（源 = Publish 一致）。1.7B / 对齐三件不变。旧模型目录（funasr-nano / streaming-paraformer）**全保留未删**。
+- **④冒烟（如实）**：Publish 包 PID 17860 Responding=True、`SenseVoice model found at "...\Publish\models\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"`、无 panic/crash/残留。⚠️ Publish 的 config 为 `asr_model=performance`，不发 local-realtime 专属行 ⇒ 以**字节相同**的 `target/release` 二进制（config=local_realtime）补充实测 `LocalRealtime: dual recognizers loaded (preview SenseVoice + offline accuracy)` + `ctx=1024(max 4096)` + `[ALIGN-456] aligner attached`。`[STREAM-SV-463] decode` 行无麦克风语音未取到。
+- **红线**：未改生产代码 / 版本未动 / 未 push / 旧模型未删 / 零凭证。报告 `collab/outbox/tester-1/result.md`。**Step1 已结束输入法进程 ⇒ 请主控转告 Gavin 重启。**
+
