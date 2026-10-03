@@ -171,3 +171,9 @@
 - **④冒烟 + 延迟加载核验**：Publish PID 1332（`SenseVoice model found`）+ target/release PID 21132（`dual recognizers loaded (preview SenseVoice + offline accuracy)` + `ctx=1024(max 4096)` + `aligner attached`）；无 panic / 无 crash.json / 零残留。🔴 **两处冒烟日志 grep `[PUNCT-JAKO-466] ja/ko punctuation model loaded` = 0**（启动未加载日韩标点模型）。
 - **红线**：未改生产代码 / 版本未动 / 未 push / 未删用户数据与模型文件 / 零凭证。报告 `collab/outbox/tester-1/result.md`。**Step1 已结束输入法进程 ⇒ 请主控转告 Gavin 重启。**
 
+## 2026-10-03 — 主控 — MEM-469 / MEM-ENC-470 / UI-HINT-471 / UI-REC-472 开发完成，UI-PREVIEW-473 取证中
+
+- 469：内存 / 显存分项见 `collab/evidence/469/`；470：编码器不预留（DEC-103），A/B 证据 `collab/evidence/470/`。
+- 471：提示窗宽度按文字自适应；472：本地实时直接「请说话...」、未就绪只给加载提示（DEC-104）。
+- 473：离屏真绘制两种路径字号字形相同，待 Gavin 截图；四单待合包出包（473 未定前不拆包，等 Gavin 定）。
+

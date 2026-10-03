@@ -2711,3 +2711,13 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 对 macOS 的影响 | macOS 打包同样不必再带这 6 项；需要的模型目录见 STREAM-SV-463 / PUNCT-JAKO-466 两条 |
 | 是否需要对方同步 | 打包清单去掉上述目录即可 |
 
+## MEM-ENC-470 / UI-HINT-471 / UI-REC-472（2026-10-03，主控）
+
+| 项 | 内容 |
+| --- | --- |
+| 470 改了什么 | `native/llama_asr/shim.cpp` `las_create`：1.7B 音频编码器 `mcp.warmup` 默认 false（不按 30s 预留编码缓冲，DEC-103）。平台中立，macOS（Metal）同样生效；调试 `LAS_ENC_WARMUP=1` 恢复 |
+| 471 改了什么 | Windows `overlay_geometry`：信息 / 错误提示窗宽度按文字实测宽度自适应。**macOS 同样有问题**：`PipelineEvent::Info` 在 macOS 映射为 `ShowError`，`set_mode` 固定 240×36 ⇒ 长提示会截断。建议 macOS 端按同口径（文字宽 + 左 28 / 右 14 + 余量 8，下限 240、上限屏宽比例）改 `set_mode` 的 Error 尺寸 |
+| 472 改了什么 | 新增平台中立 `LOCALRT_ENGINE_READY` / `publish_localrt_ready`（worker 发布）；Windows 热键 / RecordingStarted 本地实时直接「请说话...」、未就绪只给加载提示；**macOS `handle_pipeline_event` 新增参数 `localrt_loading`**：本地实时未就绪时 RecordingStarted 不弹浮层（本端未编译 macOS 目标，请 macOS 端编译验证） |
+| 对 macOS 的影响 | 470 自动生效；471 待 macOS 端实现；472 的「请说话...」窗 macOS 浮层尚无此态，暂不适用 |
+| 是否需要对方同步 | 是：编译验证 472 的 macOS 改动；按需实现 471 |
+

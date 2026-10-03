@@ -751,3 +751,27 @@ mod align456_tests {
         assert!(!spans_valid(&[]));
     }
 }
+
+/// MEM-ENC-470：1.7B 与对齐器的音频编码器都**不按 30s 最长音频预留**计算缓冲（按需分配）。
+/// 1.7B 预留 554MiB ⇒ 改后显存省 ≈0.4G；86 窗回放文字逐字相同、每窗 +5.5ms（evidence/470）。
+#[cfg(test)]
+mod enc470_tests {
+    #[test]
+    fn t470_encoders_do_not_reserve_max_audio_buffer() {
+        let shim = include_str!("../../native/llama_asr/shim.cpp");
+        let create = shim
+            .find("extern \"C\" las_engine * las_create(")
+            .expect("las_create");
+        let align = shim
+            .find("extern \"C\" las_aligner * las_align_create(")
+            .expect("las_align_create");
+        assert!(
+            shim[create..align].contains("mcp.warmup = las_env_int(\"LAS_ENC_WARMUP\", 0) != 0;"),
+            "1.7B 编码器默认不预留（LAS_ENC_WARMUP 未设 = 0）"
+        );
+        assert!(
+            shim[align..].contains("mcp.warmup = false;"),
+            "对齐器编码器不预留（456）"
+        );
+    }
+}

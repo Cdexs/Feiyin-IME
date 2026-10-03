@@ -2868,3 +2868,78 @@ fn mem469_breakdown() {
     let _ = std::fs::create_dir_all(out.parent().unwrap());
     std::fs::write(&out, report).unwrap();
 }
+
+/// MEM-ENC-470：1.7B 音频编码器「按 30s 预留计算缓冲」(LAS_ENC_WARMUP=1，现状) vs「不预留」(=0) A/B。
+/// 每种设置**单独一个进程**跑一遍（显存口径干净）：同一批真实录音窗口（同 replay457 生产几何 + 词库 + 草稿），
+/// 记加载后 / 跑完后的显存与内存、首窗与逐窗精解耗时、逐窗文字 ⇒ `collab/evidence/470/ab-warm{0,1}.tsv`。
+/// 运行：`LAS_ENC_WARMUP=0|1 cargo test --bin feiyin-ime mem470_enc_ab -- --ignored --nocapture`（未设 = 生产默认 0）
+#[test]
+#[ignore = "MEM-ENC-470：--ignored 运行（设置由环境变量 LAS_ENC_WARMUP 决定）"]
+fn mem470_enc_ab() {
+    crate::transcription::speaker::TEST_EXTRACTOR_MISSING.with(|c| c.set(true));
+    let label = std::env::var("LAS_ENC_WARMUP").unwrap_or_else(|_| "0".into());
+    let root = manifest_dir();
+    let models = root.join("models");
+    let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
+        .expect("预览模型须在位");
+    let run_stream = |audio: &[f32]| -> String {
+        crate::transcription::local_stream::preview_decode(&st_rec, audio)
+    };
+    let terms = load_real_wordbook_terms();
+    let m0 = mem469_snap();
+    let t_load = Instant::now();
+    let acc = create_qwen3_recognizer(&models).expect("1.7B 须在位");
+    let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
+    let m1 = mem469_snap();
+    let mut rows: Vec<String> = Vec::new();
+    let mut ms_all: Vec<f64> = Vec::new();
+    for wav in collect_wavs(&root) {
+        let name = wav
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string();
+        let Some((audio, rate)) = read_wav(&wav) else {
+            continue;
+        };
+        if rate as usize != RATE {
+            continue;
+        }
+        let (_, wins) = windows_457(&audio, &run_stream);
+        for (i, w) in wins.iter().enumerate() {
+            let t0 = Instant::now();
+            let text = decode_457(&acc, w, i, terms.as_deref());
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            ms_all.push(ms);
+            rows.push(format!(
+                "{name}\t{i}\t{:.1}s\t{ms:.1}\t{text}",
+                w.waudio.len() as f64 / RATE as f64
+            ));
+        }
+    }
+    let m2 = mem469_snap();
+    let n = ms_all.len().max(1) as f64;
+    let first = ms_all.first().copied().unwrap_or(0.0);
+    let rest_mean = if ms_all.len() > 1 {
+        ms_all[1..].iter().sum::<f64>() / (ms_all.len() - 1) as f64
+    } else {
+        0.0
+    };
+    let summary = format!(
+        "# warmup={label} 加载 {load_ms:.0}ms；窗数 {}；首窗 {first:.0}ms；其余均值 {rest_mean:.1}ms；总 {:.0}ms（均 {:.1}）\n\
+         # 显存专用+共享 / 工作集（MB）：加载前 {:.0} / {:.0}；加载后 {:.0} / {:.0}；跑完 {:.0} / {:.0}\n",
+        ms_all.len(),
+        ms_all.iter().sum::<f64>(),
+        ms_all.iter().sum::<f64>() / n,
+        m0[0] + m0[1],
+        m0[2],
+        m1[0] + m1[1],
+        m1[2],
+        m2[0] + m2[1],
+        m2[2],
+    );
+    println!("[470] {summary}");
+    let out = root.join(format!("collab/evidence/470/ab-warm{label}.tsv"));
+    let _ = std::fs::create_dir_all(out.parent().unwrap());
+    std::fs::write(&out, format!("{summary}{}\n", rows.join("\n"))).unwrap();
+}

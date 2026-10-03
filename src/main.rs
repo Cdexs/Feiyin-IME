@@ -298,6 +298,18 @@ static STREAMING_STOPPED: AtomicBool = AtomicBool::new(false);
 // which is orthogonal to generation (cross-session identity). The two gates AND together.
 #[cfg(target_os = "windows")]
 static STREAMING_GENERATION: AtomicU64 = AtomicU64::new(0);
+// UI-REC-472：当前生效的识别引擎是否为「本地实时」且已加载完（worker 线程单写者：启动加载后、
+// 每次重载开始 / 落地时更新）。Gavin 10-03「正在显示模型加载提示窗口代表模型正在加载中，
+// 就先不要显示录音预览窗口，等模型加载完毕再显示」⇒ 控制器开录时：配置为本地实时但未就绪 ⇒
+// 只给加载提示、不弹录音窗；就绪后由 StreamingIdle 显示「请说话...」窗。
+static LOCALRT_ENGINE_READY: AtomicBool = AtomicBool::new(false);
+
+/// UI-REC-472：按当前引擎更新 [`LOCALRT_ENGINE_READY`]（worker 在引擎变化点调用）。
+fn publish_localrt_ready(transcriber: Option<&transcription::Transcriber>) {
+    let ready =
+        transcriber.is_some_and(|t| t.asr_model() == transcription::AsrModel::LocalRealtime);
+    LOCALRT_ENGINE_READY.store(ready, Ordering::Release);
+}
 // ACC-PREVIEW-REFLOW-325：本地实时档回灌的 **per-generation** 状态（**controller 线程单写者**：
 // 二者只在消费循环内读写；`RecordingStarted` 重置，`PreviewReflow` 处理时读/写 —— 同一线程，
 // 故无竞态，无需原子以外同步）。
@@ -1881,7 +1893,12 @@ fn run_overlay_thread(
                             state.preview_scroll = 0;
                             // OVERLAY-051-A: preserve last_streaming_text across status changes.
                             // Only clear it on a fresh Recording session.
-                            if matches!(request.status, OverlayStatus::Recording) {
+                            // UI-REC-472：本地实时开录不再经过波纹窗（Recording），直接「请说话...」窗 ⇒
+                            // 两者任一出现都是新录音起点，都要清上一代残留（该态只在开录时下发）。
+                            if matches!(
+                                request.status,
+                                OverlayStatus::Recording | OverlayStatus::RecordingStreamingIdle
+                            ) {
                                 state.last_streaming_text = None;
                                 // 331：快照 per-gen 清理（新录音不得带入上一代）。
                                 state.edit_original = None;
@@ -6764,15 +6781,48 @@ fn overlay_geometry(status: &OverlayStatus, hwnd: HWND) -> ([i32; 2], [i32; 2]) 
             // ASR-038-C: editing mode initial size; will be expanded by adjust_overlay_size_for_text
             RECORDING_OVERLAY_SIZE
         }
-        OverlayStatus::Processing(_) | OverlayStatus::Error(_) | OverlayStatus::Info(_) => {
-            STATUS_OVERLAY_SIZE
-        }
+        OverlayStatus::Processing(_) => STATUS_OVERLAY_SIZE,
+        // UI-HINT-471：单行提示（信息 / 错误）按文字实测宽度放宽，固定 240 放不下「本地流式模型加载中，约需 6 秒…」。
+        OverlayStatus::Error(message) | OverlayStatus::Info(message) => [
+            status_overlay_width(
+                measure_status_text_width(hwnd, message),
+                overlay_max_width(hwnd),
+            ),
+            STATUS_OVERLAY_SIZE[1],
+        ],
         // UI-FOCUSLOST-WINDOW-430：宽度 ×1.7（夹紧工作区），短文本不高到占满屏。
         OverlayStatus::FocusLost { .. } => preview_size(work_w, work_h, overlay_max_width(hwnd)),
     };
     let x = centered_x(work.left, work_w, size[0]);
     let y = work.top + (work_h - size[1] - 64).max(0);
     ([x, y], size)
+}
+
+/// UI-HINT-471：单行提示窗几何（D2D `draw_info_overlay` / `draw_error_overlay` 与 GDI 兜底同值）：
+/// 圆点 + 间距后文字起于 28px，右留白 14px；DirectWrite 与 GDI 量宽有细微出入，另留 8px 防贴边出省略号。
+const STATUS_TEXT_LEFT: i32 = 28;
+const STATUS_TEXT_RIGHT: i32 = 14;
+const STATUS_TEXT_SLACK: i32 = 8;
+
+/// UI-HINT-471：单行提示窗宽度 = 文字宽 + 两侧留白，下限原固定宽 240（短提示外观不变），上限屏宽比例（超长仍省略号）。
+fn status_overlay_width(text_w: i32, max_w: i32) -> i32 {
+    (STATUS_TEXT_LEFT + text_w + STATUS_TEXT_RIGHT + STATUS_TEXT_SLACK)
+        .clamp(STATUS_OVERLAY_SIZE[0], max_w.max(STATUS_OVERLAY_SIZE[0]))
+}
+
+/// UI-HINT-471：按提示窗实际绘制字号（`streaming_text_format` = `OVERLAY_TEXT_FONT_SIZE`）量文字宽。
+#[cfg(target_os = "windows")]
+fn measure_status_text_width(hwnd: HWND, text: &str) -> i32 {
+    unsafe {
+        let hdc = GetDC(hwnd);
+        let font = create_clear_type_font(OVERLAY_TEXT_FONT_SIZE);
+        let old_font = SelectObject(hdc, font);
+        let w = measure_text_width(hdc, text, OVERLAY_TEXT_FONT_SIZE);
+        let _ = SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
+        let _ = ReleaseDC(hwnd, hdc);
+        w
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -7375,12 +7425,29 @@ fn process_controller_events(
                     // OVERLAY-051-E: decide whether this is online streaming ASR. We cannot read
                     // the worker's is_streaming_asr flag yet, so infer from configured model.
                     // ASR-056: 用 is_online_streaming() 收敛判据（QwenAudioOnline | FunAsrRealtime）
-                    let is_streaming_asr = {
-                        let cfg = clone_runtime_config(runtime_config);
-                        transcription::AsrModel::from_config(&cfg.audio.asr_model)
-                            .is_online_streaming()
-                    };
-                    if is_streaming_asr {
+                    let desired_model =
+                        transcription::AsrModel::from_config(&config.audio.asr_model);
+                    let is_local_realtime = desired_model == transcription::AsrModel::LocalRealtime;
+                    if is_local_realtime && !LOCALRT_ENGINE_READY.load(Ordering::Acquire) {
+                        // UI-REC-472：本地实时模型加载中 ⇒ 只给加载提示、不弹录音窗（Gavin 10-03）。
+                        // 不自动关：加载完由 StreamingIdle 换成「请说话...」窗；等不到则 worker 发 Info / 报错替换。
+                        let hint = OverlayStatus::Info(
+                            i18n::get(config.ui_language)
+                                .local_realtime_loading_hint
+                                .to_string(),
+                        );
+                        let (pos, size) = overlay_geometry(&hint, overlay_handle.overlay_hwnd);
+                        overlay_handle.send(OverlayCommand::Show(OverlayRequest {
+                            status: hint,
+                            pos: Some(pos),
+                            size,
+                            opacity: 0.9,
+                            ui_language: config.ui_language,
+                            auto_close_ms: 0,
+                            target_hwnd,
+                        }));
+                    } else if desired_model.is_online_streaming() || is_local_realtime {
+                        // UI-REC-472：本地实时与在线流式一样，按热键即显示「请说话...」窗，不显示波纹动效。
                         show_overlay_streaming_idle(
                             overlay_handle,
                             config.audio.overlay_opacity.clamp(0.1, 1.0),
@@ -7521,12 +7588,22 @@ fn process_controller_events(
                 }
                 ACC_REFLOW_SUPPRESS.store(false, Ordering::Release);
                 set_tray_state(tray, TrayState::Recording, ui_language);
-                show_overlay(
-                    overlay_handle,
-                    opacity,
-                    ui_language,
-                    OverlayStatus::Recording,
-                );
+                if transcription::AsrModel::from_config(&config.audio.asr_model)
+                    == transcription::AsrModel::LocalRealtime
+                {
+                    // UI-REC-472：本地实时不显示波纹动效窗，直接「请说话...」窗；模型加载中则什么都不弹
+                    //（保留加载提示，加载完由 StreamingIdle 显示）。
+                    if LOCALRT_ENGINE_READY.load(Ordering::Acquire) {
+                        show_overlay_streaming_idle(overlay_handle, opacity, ui_language, 0);
+                    }
+                } else {
+                    show_overlay(
+                        overlay_handle,
+                        opacity,
+                        ui_language,
+                        OverlayStatus::Recording,
+                    );
+                }
             }
             PipelineEvent::StreamingIdle => {
                 // OVERLAY-051-E: worker confirmed online streaming ASR is waiting for first text;
@@ -8367,6 +8444,8 @@ fn spawn_asr_reload(
     let reload_asr_online_max_sentence_silence = config.audio.asr_online_max_sentence_silence;
     let reload_asr_online_semantic_punctuation_enabled =
         config.audio.asr_online_semantic_punctuation_enabled;
+    // UI-REC-472：重载在途 ⇒ 本地实时视为未就绪（落地时 apply_reload_result 按新引擎重新发布）。
+    LOCALRT_ENGINE_READY.store(false, Ordering::Release);
     std::thread::spawn(move || {
         let t_build = std::time::Instant::now();
         match transcription::Transcriber::new(
@@ -8424,6 +8503,7 @@ fn apply_reload_result(
             *transcriber = Some(new_transcriber);
             *asr_reload_in_flight = false;
             *failed_reload_key = None; // FIX-164: 成功即清失败签名，预热恢复待命
+            publish_localrt_ready(transcriber.as_ref());
         }
         Err(e) => {
             // active_* 保持旧值，下次 Start 对比仍不一致 → 自然重试
@@ -8432,6 +8512,7 @@ fn apply_reload_result(
                 e
             );
             *asr_reload_in_flight = false;
+            publish_localrt_ready(transcriber.as_ref());
             // FIX-164 D1 防风暴：见 FailedReloadKey 文档
             let cfg = clone_runtime_config(runtime_config);
             *failed_reload_key = Some((
@@ -8498,6 +8579,8 @@ fn spawn_worker_thread(
                 None
             }
         };
+        // UI-REC-472：启动同步加载完成（此前 LOCALRT_ENGINE_READY 初值 false = 加载中）。
+        publish_localrt_ready(transcriber.as_ref());
 
         // ASR-DUAL-B-001: 热重载 channel —— 后台线程构建结果（成功=新实例，失败=Err）经此送回。
         // 失败也必须回消息，用于清除 in_flight 标志，否则构建中窗口会重复 spawn 重建线程。
@@ -11241,9 +11324,14 @@ fn run_controller_macos(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
                 default(std::time::Duration::from_millis(50)) => {}
             }
             // 消费 pipeline 事件（本轮仅打日志，FocusLost 复制剪贴板）
-            let logic_ui_language = clone_runtime_config(&logic_runtime_config).ui_language;
+            let logic_cfg = clone_runtime_config(&logic_runtime_config);
+            let logic_ui_language = logic_cfg.ui_language;
+            // UI-REC-472：本地实时模型加载中（未就绪）⇒ RecordingStarted 不弹录音窗（保留加载提示）。
+            let localrt_loading = transcription::AsrModel::from_config(&logic_cfg.audio.asr_model)
+                == transcription::AsrModel::LocalRealtime
+                && !LOCALRT_ENGINE_READY.load(Ordering::Acquire);
             while let Ok(event) = pipeline_event_rx.try_recv() {
-                handle_pipeline_event(&event, logic_ui_language);
+                handle_pipeline_event(&event, logic_ui_language, localrt_loading);
             }
         }
         log::info!("macOS logic thread exiting");
@@ -11387,8 +11475,13 @@ fn overlay_request_for_event(event: &PipelineEvent) -> platform::OverlayRequest 
 /// OVERLAY-003：FocusLost → ShowPreview（失焦返显浮层，不自动关闭）；Done/Cancelled → Hide。
 /// overlay 指令由纯函数 `overlay_request_for_event` 统一计算（可单测锁死真值表）；
 /// 仅 FormatFailed 的文案在调用侧按 ui_language 补齐。
+/// UI-REC-472：`localrt_loading` = 配置为本地实时且模型尚未加载完 ⇒ RecordingStarted 不弹录音窗。
 #[cfg(target_os = "macos")]
-fn handle_pipeline_event(event: &PipelineEvent, ui_language: config::UiLanguage) {
+fn handle_pipeline_event(
+    event: &PipelineEvent,
+    ui_language: config::UiLanguage,
+    localrt_loading: bool,
+) {
     // OVERLAY-002: FormatFailed 的展示文案依赖 ui_language，纯函数拿不到，这里补齐后发请求。
     // 其余事件直接用纯函数的映射结果（overlay_request_for_event 是唯一决策源）。
     let req = match event {
@@ -11402,7 +11495,10 @@ fn handle_pipeline_event(event: &PipelineEvent, ui_language: config::UiLanguage)
         },
         _ => overlay_request_for_event(event),
     };
-    platform::request_overlay(req);
+    // UI-REC-472（Gavin 10-03「模型正在加载中，就先不要显示录音预览窗口，等模型加载完毕再显示」）。
+    if !(localrt_loading && matches!(event, PipelineEvent::RecordingStarted)) {
+        platform::request_overlay(req);
+    }
     match event {
         PipelineEvent::RecordingStarted => {
             log::info!("macOS pipeline: RecordingStarted");
@@ -19309,11 +19405,87 @@ mod overlay_086_d2d_p1_guard_tests {
         // STREAM-SV-463：带浅色尾巴的入口同样必须回落（不 panic、不吞错）。
         let ok_dim = d2d::draw_streaming_text_overlay(hdc, &rect, &state, "流式文本", 120, Some(2));
         assert!(!ok_dim, "带浅色尾巴：无效 HDC 必须返回 false");
+        // UI-PREVIEW-473 取证见 `ui473_d2d_streaming_text_real_dc`（真 DC）。
         // D2D-HANG-095: 本用例以无效 HDC 调 D2D 入口，create_resources 会成功
         //（工厂创建不依赖窗口），因此本测试线程的 thread_local 槽被填上了 D2D 资源。
         // 必须在用例体内显式释放 —— 否则测试线程退出时由 FLS 回调在 loader lock 下
         // 析构 COM，自锁死锁，整个 test 进程挂死且 kill 不掉（REPRO-094 探针 B/C 实证）。
         d2d::release_resources();
+    }
+
+    /// UI-PREVIEW-473 取证（Gavin 10-03「预览窗口中的文字被变小了，而且现在变得也不圆润了」）：
+    /// 真内存 DC 上画流式文字，带 / 不带浅色尾巴两种都必须走通 D2D（返回 true）；
+    /// 返回 false ⇒ 该帧退回 GDI（小字号 ClearType，即「变小、不圆润」）。
+    #[test]
+    #[ignore = "UI-PREVIEW-473：真 D2D 离屏绘制，--ignored 运行"]
+    fn ui473_d2d_streaming_text_real_dc() {
+        use windows::Win32::Graphics::Gdi as g;
+        let text = "今天天气不错，我们出去走走吧";
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 400,
+            bottom: 36,
+        };
+        let state = overlay_window_state_for_test();
+        let (w, h) = (400usize, 36usize);
+        // 32bpp 自顶向下 DIB：画完直接读像素，存 BMP 供目视 + 逐像素对比。
+        let render = |dim_from: Option<usize>| -> (bool, Vec<u8>) {
+            unsafe {
+                let screen = g::GetDC(None);
+                let mem = g::CreateCompatibleDC(screen);
+                let mut bi = g::BITMAPINFO::default();
+                bi.bmiHeader.biSize = std::mem::size_of::<g::BITMAPINFOHEADER>() as u32;
+                bi.bmiHeader.biWidth = w as i32;
+                bi.bmiHeader.biHeight = -(h as i32);
+                bi.bmiHeader.biPlanes = 1;
+                bi.bmiHeader.biBitCount = 32;
+                let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+                let bmp = g::CreateDIBSection(mem, &bi, g::DIB_RGB_COLORS, &mut bits, None, 0)
+                    .expect("dib");
+                let old = g::SelectObject(mem, bmp);
+                let ok = d2d::draw_streaming_text_overlay(mem, &rect, &state, text, 220, dim_from);
+                let px = std::slice::from_raw_parts(bits as *const u8, w * h * 4).to_vec();
+                g::SelectObject(mem, old);
+                let _ = g::DeleteObject(bmp);
+                let _ = g::DeleteDC(mem);
+                g::ReleaseDC(None, screen);
+                (ok, px)
+            }
+        };
+        let (plain, px_plain) = render(None);
+        let (dim, px_dim) = render(Some(9));
+        let save = |name: &str, px: &[u8]| {
+            let mut f = Vec::new();
+            let size = 54 + px.len() as u32;
+            f.extend_from_slice(b"BM");
+            f.extend_from_slice(&size.to_le_bytes());
+            f.extend_from_slice(&[0u8; 4]);
+            f.extend_from_slice(&54u32.to_le_bytes());
+            f.extend_from_slice(&40u32.to_le_bytes());
+            f.extend_from_slice(&(w as i32).to_le_bytes());
+            f.extend_from_slice(&(-(h as i32)).to_le_bytes());
+            f.extend_from_slice(&1u16.to_le_bytes());
+            f.extend_from_slice(&32u16.to_le_bytes());
+            f.extend_from_slice(&[0u8; 24]);
+            f.extend_from_slice(px);
+            let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("collab/evidence/473/{name}.bmp"));
+            let _ = std::fs::create_dir_all(p.parent().unwrap());
+            std::fs::write(p, f).unwrap();
+        };
+        save("plain", &px_plain);
+        save("dim", &px_dim);
+        // 前 9 字（未变浅区）逐像素应与整段正常色一致 ⇒ 浅色尾巴不改字形 / 字号。
+        let diff = px_plain
+            .chunks(4)
+            .zip(px_dim.chunks(4))
+            .enumerate()
+            .filter(|(i, (a, b))| (i % w) < 200 && a != b)
+            .count();
+        println!("[473] D2D streaming text: plain={plain} dim_tail={dim} 左半区差异像素={diff}");
+        d2d::release_resources();
+        assert!(plain && dim, "D2D 失败 ⇒ GDI 兜底（小字号、不圆润）");
     }
 
     /// 护栏 3：D2DERR_RECREATE_TARGET 常量值钉死 0x8899000C。
@@ -23721,5 +23893,144 @@ mod window_abs_456_tests {
         );
         let (st, sp) = window_abs_geometry(&cum, 1, 0, None, &[16000], None);
         assert_eq!((st, sp), (0.0, 0.0), "首窗无重叠 ⇒ 分界 = 起点");
+    }
+}
+
+// UI-HINT-471 / UI-REC-472（Gavin 2026-10-03）：单行提示窗宽度自适应；本地实时开录不显示波纹窗、
+// 模型加载中不弹录音窗。
+#[cfg(all(test, target_os = "windows"))]
+mod ui471_472_tests {
+    use super::*;
+
+    /// 471：短提示保持原 240；放不下的按文字宽 + 两侧留白放宽；超长夹到上限（屏宽比例）；上限比 240 小时仍取 240。
+    #[test]
+    fn ui471_status_width_fits_text_within_bounds() {
+        assert_eq!(status_overlay_width(80, 1000), STATUS_OVERLAY_SIZE[0]);
+        let w = status_overlay_width(272, 1000);
+        assert_eq!(
+            w,
+            STATUS_TEXT_LEFT + 272 + STATUS_TEXT_RIGHT + STATUS_TEXT_SLACK
+        );
+        assert!(w > STATUS_OVERLAY_SIZE[0]);
+        assert_eq!(status_overlay_width(5000, 1000), 1000);
+        assert_eq!(status_overlay_width(5000, 100), STATUS_OVERLAY_SIZE[0]);
+    }
+
+    /// 471：三语「模型加载中」提示按实际绘制字号量宽，放宽后文字区（去掉两侧留白）放得下整句；
+    /// 中文这句在原固定 240 下放不下（复现 Gavin 报的截断）。
+    #[test]
+    fn ui471_loading_hint_fits_in_all_locales() {
+        let hwnd = HWND(std::ptr::null_mut());
+        for lang in [
+            config::UiLanguage::Chinese,
+            config::UiLanguage::TraditionalChinese,
+            config::UiLanguage::English,
+        ] {
+            let hint = i18n::get(lang).local_realtime_loading_hint;
+            let text_w = measure_status_text_width(hwnd, hint);
+            assert!(text_w > 0, "{hint}：量宽失败");
+            let w = status_overlay_width(text_w, 4000);
+            assert!(
+                w - STATUS_TEXT_LEFT - STATUS_TEXT_RIGHT >= text_w,
+                "{hint}：窗宽 {w} 放不下文字 {text_w}"
+            );
+            if lang == config::UiLanguage::Chinese {
+                assert!(
+                    STATUS_OVERLAY_SIZE[0] - STATUS_TEXT_LEFT - STATUS_TEXT_RIGHT < text_w,
+                    "中文加载提示在原 240 下本应放不下（复现前提）"
+                );
+            }
+        }
+    }
+
+    fn prod() -> String {
+        crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs")).join("\n")
+    }
+
+    /// 从 `at` 起最多 `n` 字节（落在字符边界）。
+    fn seg(p: &str, at: usize, n: usize) -> &str {
+        let mut end = (at + n).min(p.len());
+        while !p.is_char_boundary(end) {
+            end -= 1;
+        }
+        &p[at..end]
+    }
+
+    /// 472：Windows「录音开始」处理：本地实时不发波纹窗（Recording），就绪才发「请说话...」窗；其他档照旧波纹窗。
+    #[test]
+    fn ui472_recording_started_local_realtime_no_waveform() {
+        let p = prod();
+        let start = p
+            .find("PipelineEvent::RecordingStarted => {\n// New recording session")
+            .expect("Windows RecordingStarted 处理");
+        let end = start
+            + p[start..]
+                .find("PipelineEvent::StreamingIdle =>")
+                .expect("下一臂");
+        let arm = &p[start..end];
+        let lr = arm.find("AsrModel::LocalRealtime").expect("本地实时分支");
+        let ready = arm.find("LOCALRT_ENGINE_READY.load").expect("就绪判定");
+        let idle = arm
+            .find("show_overlay_streaming_idle(")
+            .expect("「请说话...」窗");
+        let wave = arm.find("OverlayStatus::Recording,").expect("其他档波纹窗");
+        assert!(
+            lr < ready && ready < idle && idle < wave,
+            "本地实时分支须先判就绪再发「请说话...」，波纹窗只在 else"
+        );
+    }
+
+    /// 472：热键开录：本地实时未就绪 ⇒ 加载提示（不自动关）；就绪 ⇒ 与在线流式同发「请说话...」窗。
+    #[test]
+    fn ui472_hotkey_start_loading_hint_then_listening() {
+        let p = prod();
+        let at = p
+            .find("if is_local_realtime && !LOCALRT_ENGINE_READY.load(Ordering::Acquire)")
+            .expect("热键处未就绪判定");
+        let seg = seg(&p, at, 2500);
+        assert!(
+            seg.contains("local_realtime_loading_hint"),
+            "未就绪给加载提示"
+        );
+        assert!(
+            seg.contains("auto_close_ms: 0"),
+            "加载提示不自动关，等就绪后被「请说话...」替换"
+        );
+        assert!(
+            seg.contains("desired_model.is_online_streaming() || is_local_realtime"),
+            "就绪的本地实时与在线流式同走「请说话...」窗"
+        );
+    }
+
+    /// 472：就绪标志的发布点：启动加载后、重载开始（置 false）、重载落地成功 / 失败各一次；macOS 同判据。
+    #[test]
+    fn ui472_ready_flag_published_at_every_engine_change() {
+        let p = prod();
+        assert_eq!(
+            p.matches("publish_localrt_ready(transcriber.as_ref());")
+                .count(),
+            3
+        );
+        let spawn = p.find("fn spawn_asr_reload(").expect("spawn_asr_reload");
+        let thread = spawn + p[spawn..].find("std::thread::spawn(").unwrap();
+        assert!(
+            p[spawn..thread].contains("LOCALRT_ENGINE_READY.store(false"),
+            "重载开始即视为未就绪"
+        );
+        assert!(
+            p.contains("localrt_loading && matches!(event, PipelineEvent::RecordingStarted)"),
+            "macOS：加载中 RecordingStarted 不弹录音窗"
+        );
+    }
+
+    /// 472：新录音清上一代残留：波纹窗或「请说话...」窗任一出现都清（本地实时不再经过波纹窗）。
+    #[test]
+    fn ui472_fresh_session_cleanup_covers_listening_placeholder() {
+        let p = prod();
+        let at = p
+            .find("OverlayStatus::Recording | OverlayStatus::RecordingStreamingIdle\n) {")
+            .expect("清理判据须覆盖「请说话...」窗");
+        assert!(seg(&p, at, 600).contains("state.last_streaming_text = None;"));
+        assert!(seg(&p, at, 600).contains("state.edit_original = None;"));
     }
 }

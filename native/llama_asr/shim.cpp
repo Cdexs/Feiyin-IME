@@ -221,7 +221,9 @@ extern "C" las_engine * las_create(const char * model_path, const char * mmproj_
     mcp.n_threads = las_env_int("LAS_MTMD_THREADS", n_threads_batch);
     mcp.print_timings = false;
     mcp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    mcp.warmup = true;
+    // MEM-ENC-470（Gavin 10-03 选 A）：编码器不按 30s 最长音频预留计算缓冲（按实际音频长度按需分配，
+    // 同对齐器 456）。86 窗回放：文字逐字相同，每窗 +5.5ms（≈1%），显存省 ≈0.4G。调试 LAS_ENC_WARMUP=1 恢复预留。
+    mcp.warmup = las_env_int("LAS_ENC_WARMUP", 0) != 0;
     mtmd_context * mctx = p_mtmd_init_from_file(mmproj_path, model, mcp);
     if (!mctx) {
         p_llama_free(ctx); p_llama_model_free(model);
