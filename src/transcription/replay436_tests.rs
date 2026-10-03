@@ -2764,3 +2764,107 @@ fn poc461_koja_406() {
         );
     }
 }
+
+/// MEM-469：一次 PowerShell 取本进程 GPU 专用 / 共享、工作集、私有提交（MB）。
+fn mem469_snap() -> [f64; 4] {
+    std::thread::sleep(std::time::Duration::from_millis(1500)); // GPU 计数器约 1s 刷新
+    let pid = std::process::id();
+    let cmd = format!(
+        "$d=0;$s=0;$c=Get-Counter -Counter '\\GPU Process Memory(pid_{pid}_*)\\Dedicated Usage','\\GPU Process Memory(pid_{pid}_*)\\Shared Usage' -ErrorAction SilentlyContinue;\
+         foreach($x in $c.CounterSamples){{if($x.Path -like '*dedicated*'){{$d+=$x.CookedValue}}else{{$s+=$x.CookedValue}}}};\
+         $p=Get-Process -Id {pid};\"$d $s $($p.WorkingSet64) $($p.PrivateMemorySize64)\""
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &cmd])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let v: Vec<f64> = out
+        .split_whitespace()
+        .filter_map(|x| x.parse::<f64>().ok())
+        .map(|b| b / 1048576.0)
+        .collect();
+    [0, 1, 2, 3].map(|i| v.get(i).copied().unwrap_or(0.0))
+}
+
+/// MEM-469：本地实时各组件的内存 / 显存分项 —— 同一进程逐个加载、每步记增量。
+/// 运行：`cargo test --bin feiyin-ime mem469_breakdown -- --ignored --nocapture`
+#[test]
+#[ignore = "MEM-469：--ignored 运行"]
+fn mem469_breakdown() {
+    crate::transcription::speaker::TEST_EXTRACTOR_MISSING.with(|c| c.set(true));
+    let root = manifest_dir();
+    let models = root.join("models");
+    let (audio, _) = read_wav(&root.join("collab/research/audio-real-gavin/processed/full.wav"))
+        .expect("full.wav");
+    let mut rows: Vec<String> = Vec::new();
+    let mut last = mem469_snap();
+    let step = |name: &str, last: &mut [f64; 4], rows: &mut Vec<String>| {
+        let now = mem469_snap();
+        let row = format!(
+            "| {name} | {:+.0} | {:+.0} | {:+.0} | {:+.0} | {:.0} / {:.0} / {:.0} / {:.0} |",
+            now[0] - last[0],
+            now[1] - last[1],
+            now[2] - last[2],
+            now[3] - last[3],
+            now[0],
+            now[1],
+            now[2],
+            now[3]
+        );
+        println!("{row}");
+        rows.push(row);
+        *last = now;
+    };
+    let vad = VadSegmenter::try_new_for_local_trim(&models).expect("VAD");
+    step("VAD（silero）", &mut last, &mut rows);
+    let sv = crate::transcription::local_stream::create_local_stream_recognizer(&models)
+        .expect("SenseVoice");
+    step("预览 SenseVoice 加载", &mut last, &mut rows);
+    let _ = crate::transcription::local_stream::preview_decode(&sv, &audio[..4 * RATE]);
+    step("预览重解 4s 一次", &mut last, &mut rows);
+    let _ = crate::transcription::local_stream::preview_decode(&sv, &audio[..15 * RATE]);
+    step("预览重解 15s 一次（窗口上限）", &mut last, &mut rows);
+    let mut punct = crate::punctuation::PunctuationEngine::new(&models).expect("CT 标点");
+    let _ = punct.add_punctuation("开放时间早上九点至下午五点我们明天见");
+    step("中英标点 CT 加载 + 一次", &mut last, &mut rows);
+    crate::punctuation::jako::init_for_test(&models);
+    let _ = crate::punctuation::jako::punctuate("조금만 생각을 하면서 살면 훨씬 편할 거야");
+    step(
+        "日韩标点加载 + 一次（仅用过日韩文时）",
+        &mut last,
+        &mut rows,
+    );
+    let mut acc = create_qwen3_recognizer(&models).expect("1.7B");
+    step("1.7B 精解加载（主模型 + 音频编码器）", &mut last, &mut rows);
+    acc.attach_aligner(&models);
+    step("0.6B 对齐模型加载", &mut last, &mut rows);
+    let terms = load_real_wordbook_terms();
+    for (i, w) in [(0usize, 10usize), (10, 22)].iter().enumerate() {
+        let inject = CtxInject {
+            terms: terms.as_deref(),
+            avg_chars_per_sec: None,
+            speech_ranges: None,
+            streaming_nonempty: false,
+            new_slice_from: 0,
+            assist: Default::default(),
+        };
+        let _ = transcribe_acc_ctx(
+            &acc,
+            &audio[w.0 * RATE..w.1 * RATE],
+            ChineseScript::Simplified,
+            i,
+            inject,
+        );
+    }
+    step("1.7B 解码两窗（10s / 12s，含词库）", &mut last, &mut rows);
+    let _ = vad.speech_ranges(&audio);
+    let report = format!(
+        "# MEM-469 本地实时内存 / 显存分项（同进程逐个加载）\n\n| 步骤 | GPU 专用 Δ | GPU 共享 Δ | 工作集 Δ | 私有提交 Δ | 累计（专用 / 共享 / 工作集 / 私有）MB |\n|---|---:|---:|---:|---:|---|\n{}\n",
+        rows.join("\n")
+    );
+    let out = root.join("collab/evidence/469/mem-breakdown.md");
+    let _ = std::fs::create_dir_all(out.parent().unwrap());
+    std::fs::write(&out, report).unwrap();
+}

@@ -68,6 +68,9 @@ typedef void (*las_log_fn)(int level, const char * text);
 typedef void (*las_partial_fn)(void * user, const char * text);
 static las_log_fn g_log = nullptr;
 static void log_cb(enum ggml_log_level level, const char * text, void *) {
+    // MEM-469 调试：LAS_LOG_INFO=1（须在进程启动前设置）时 INFO / CONT 原样写 stderr（看各后端缓冲区大小）。
+    static const bool info = [] { const char * v = getenv("LAS_LOG_INFO"); return v && *v == '1'; }();
+    if (info && text && (level == GGML_LOG_LEVEL_INFO || level == GGML_LOG_LEVEL_CONT)) { fputs(text, stderr); return; }
     // 只转发 WARN / ERROR（INFO/DEBUG 刷屏）。
     if (g_log && text && (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR)) g_log((int) level, text);
 }
