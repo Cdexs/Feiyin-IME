@@ -121,6 +121,8 @@ enum PipelineEvent {
         u64,
         String,
         Vec<crate::transcription::qwen_inference::WordTiming>,
+        // STREAM-SV-463：显示文本**末尾**尚未稳定的字数（本地实时模拟流式；浮窗画浅色）。在线档恒 0。
+        usize,
     ),
     Processing(String),
     Done,
@@ -244,6 +246,8 @@ enum OverlayCommand {
     RestoreAndHide,
     /// OVERLAY-051-G: 更新 word timings 供时间戳驱动揭示
     UpdateWordTimings(Vec<crate::transcription::qwen_inference::WordTiming>),
+    /// STREAM-SV-463：流式文字末尾尚未稳定的字数（画浅色；0 = 全部正常色）。
+    UpdateTentativeTail(usize),
     Shutdown,
 }
 #[derive(Debug, Clone)]
@@ -1501,6 +1505,8 @@ struct OverlayWindowState {
     tween_start: Option<std::time::Instant>,
     /// OVERLAY-051-G: word timings from ASR for timestamp-driven reveal.
     word_timings: Vec<crate::transcription::qwen_inference::WordTiming>,
+    /// STREAM-SV-463：流式文字末尾尚未稳定的字数（浅色）；隐藏 / 进编辑即清零。
+    tentative_tail_chars: usize,
     /// OVERLAY-051-G: wall-clock time when the first word's audio began, for offset mapping.
     tween_audio_origin: Option<std::time::Instant>,
     /// OVERLAY-086 Bug 2 ③: timeline zero anchored at the same instant as
@@ -1521,6 +1527,8 @@ const OVERLAY_BRAND_ORANGE: COLORREF = COLORREF(0x006BFF); // #FF6B00
 const OVERLAY_BG_DARK: COLORREF = COLORREF(0x110F0D);
 #[cfg(target_os = "windows")]
 const OVERLAY_TEXT_WHITE: COLORREF = COLORREF(0xFFFFFF);
+/// STREAM-SV-463：流式文字末尾「尚未稳定」部分的浅色（模拟流式下一次重解可能改写的字）。
+const OVERLAY_TEXT_TENTATIVE: COLORREF = COLORREF(0x8E8E8E);
 // OVERLAY-054-C: unified window border color. Changing this one constant updates
 // every overlay variant; previously 10+ scattered local consts made it easy to miss.
 #[cfg(target_os = "windows")]
@@ -1685,6 +1693,7 @@ fn run_overlay_thread(
         tween_target_chars: 0,
         tween_start: None,
         word_timings: Vec::new(),
+        tentative_tail_chars: 0,
         tween_audio_origin: None,
         tween_timeline_origin: None,
     }));
@@ -2017,6 +2026,14 @@ fn run_overlay_thread(
                         state.needs_repaint = true;
                     }
                 }
+                OverlayCommand::UpdateTentativeTail(n) => {
+                    if let Ok(mut state) = shared_state.lock() {
+                        if state.tentative_tail_chars != n {
+                            state.tentative_tail_chars = n;
+                            state.needs_repaint = true;
+                        }
+                    }
+                }
                 OverlayCommand::EnterEditMode => {
                     // OVERLAY-121 (P2): 切模式必须发生在隐藏区间（draft §3.2）——
                     // 编辑入口从可见的录音浮层进入，先藏窗，SLWA 切换藏在不可见区间，
@@ -2046,6 +2063,7 @@ fn run_overlay_thread(
                         state.tween_deadline = None;
                         state.tween_start = None;
                         state.word_timings.clear();
+                        state.tentative_tail_chars = 0;
                         state.tween_audio_origin = None;
                         state.tween_timeline_origin = None;
                         // ESC-188: 进入编辑态前空读一次，排掉在别处按 ESC 攒下的陈旧
@@ -2149,6 +2167,7 @@ fn run_overlay_thread(
                         state.tween_deadline = None;
                         state.tween_start = None;
                         state.word_timings.clear();
+                        state.tentative_tail_chars = 0;
                         state.tween_audio_origin = None;
                         state.tween_timeline_origin = None;
                         if let Some(font) = state.cached_font.take() {
@@ -3131,12 +3150,21 @@ fn draw_overlay_to_dc(
                 } else {
                     // OVERLAY-051-G: render only the tween-visible prefix.
                     let visible_text: String = text.chars().take(state.displayed_chars).collect();
+                    // STREAM-SV-463：末尾未定字从全文的哪个字开始（落在可见前缀内才画浅色）。
+                    let tentative_from = text
+                        .chars()
+                        .count()
+                        .saturating_sub(state.tentative_tail_chars);
+                    let dim_from = (state.tentative_tail_chars > 0
+                        && tentative_from < visible_text.chars().count())
+                    .then_some(tentative_from);
                     let (cr, sr, thr) = draw_recording_overlay_with_text(
                         hdc,
                         rect,
                         state,
                         request.ui_language,
                         &visible_text,
+                        dim_from,
                     );
                     cancel_btn_rect = Some(cr);
                     submit_btn_rect = Some(sr);
@@ -3824,6 +3852,9 @@ fn draw_recording_overlay_with_text(
     state: &OverlayWindowState,
     _ui_language: config::UiLanguage,
     text: &str,
+    // STREAM-SV-463：从第几个字起画浅色（末尾未定字）；None = 全部正常色。
+    // GDI 兜底路径（D2D 失败才走）不分色，整段正常色。
+    dim_from: Option<usize>,
 ) -> (RECT, RECT, RECT) {
     // D2D-P1: RecordingWithText is drawn with D2D (DEC-055 step 2). On any D2D failure
     // the GDI path below still renders this frame, so the overlay never blanks.
@@ -3833,7 +3864,7 @@ fn draw_recording_overlay_with_text(
     // OVERLAY-MEASURE-CACHE-415：此处所选字体恒为 streaming_font(OVERLAY_TEXT_FONT_SIZE=-16)
     // （见 draw_overlay_to_dc 的 streaming_text 分支），故字号传入以纳入缓存键。
     let text_width = measure_text_width(hdc, text, OVERLAY_TEXT_FONT_SIZE);
-    if d2d::draw_streaming_text_overlay(hdc, rect, state, text, text_width) {
+    if d2d::draw_streaming_text_overlay(hdc, rect, state, text, text_width, dim_from) {
         let text_hit = text_hit_rect_for(rect);
         let cancel = draw_stop_button_hit_rect_only(rect);
         return (cancel, cancel, text_hit);
@@ -5426,7 +5457,14 @@ mod d2d {
     /// measures on its own and cannot drift from the window sizing path.
     /// `visible_text` is the tween-visible prefix (OVERLAY-051-G), precomputed by the
     /// caller exactly like the GDI path.
-    fn streaming_text(res: &D2dResources, w: f32, h: f32, visible_text: &str, text_width: i32) {
+    fn streaming_text(
+        res: &D2dResources,
+        w: f32,
+        h: f32,
+        visible_text: &str,
+        text_width: i32,
+        dim_from: Option<usize>,
+    ) {
         let text_left = super::STREAMING_TEXT_LEFT_MARGIN as f32;
         let text_right = w - super::STREAMING_TEXT_RIGHT_MARGIN as f32;
         let text_top = super::OVERLAY_TEXT_DRAW_VERTICAL_INSET as f32;
@@ -5483,19 +5521,69 @@ mod d2d {
                 // 保持在可视区右沿（旧写法 `text_right - scroll_x` 使矩形整体左移 ⇒ 右侧留白）。
                 // 布局宽度 = max(text_width, visible_w) ≥ 文本宽度，最新文字贴 text_right；
                 // 裁剪区 text_left..text_right 不动，保证不溢出窗口。
-                res.rt.DrawText(
-                    cache.encoded(),
-                    &res.streaming_text_format,
-                    &D2D_RECT_F {
-                        left: text_left - scroll_x,
-                        top: text_top,
-                        right: text_right,
-                        bottom: text_bottom,
-                    },
-                    &res.brush,
-                    windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
+                // STREAM-SV-463：有末尾未定字 ⇒ 用同一排版矩形建 TextLayout，未定区间换浅色画刷
+                //（DWrite 按区间指定画刷，字形位置与 DrawText 逐位一致）；建不出来就退回整段正常色。
+                let encoded = cache.encoded();
+                let dim_from_u16 = dim_from.map(|c| {
+                    visible_text
+                        .chars()
+                        .take(c)
+                        .map(char::len_utf16)
+                        .sum::<usize>()
+                });
+                let layout = dim_from_u16.filter(|&d| d < encoded.len()).and_then(|d| {
+                    let layout = res
+                        .dwrite
+                        .CreateTextLayout(
+                            encoded,
+                            &res.streaming_text_format,
+                            (text_right - (text_left - scroll_x)).max(1.0),
+                            (text_bottom - text_top).max(1.0),
+                        )
+                        .ok()?;
+                    let dim = res
+                        .rt
+                        .CreateSolidColorBrush(
+                            &colorref_to_d2d(super::OVERLAY_TEXT_TENTATIVE),
+                            None,
+                        )
+                        .ok()?;
+                    layout
+                        .SetDrawingEffect(
+                            &dim,
+                            windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_RANGE {
+                                startPosition: d as u32,
+                                length: (encoded.len() - d) as u32,
+                            },
+                        )
+                        .ok()?;
+                    Some(layout)
+                });
+                if let Some(layout) = layout {
+                    res.rt.DrawTextLayout(
+                        D2D_POINT_2F {
+                            x: text_left - scroll_x,
+                            y: text_top,
+                        },
+                        &layout,
+                        &res.brush,
+                        windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    );
+                } else {
+                    res.rt.DrawText(
+                        encoded,
+                        &res.streaming_text_format,
+                        &D2D_RECT_F {
+                            left: text_left - scroll_x,
+                            top: text_top,
+                            right: text_right,
+                            bottom: text_bottom,
+                        },
+                        &res.brush,
+                        windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
                 res.rt.PopAxisAlignedClip();
             }
         });
@@ -5531,13 +5619,14 @@ mod d2d {
         state: &OverlayWindowState,
         visible_text: &str,
         text_width: i32,
+        dim_from: Option<usize>,
     ) -> bool {
         with_d2d(hdc, rect, |res, w, h| {
             // OVERLAY-121 (P3): RecordingWithText 升 r=16（Gavin 拍板）。
             // OVERLAY-141: 半径单一来源。
             chrome(res, w, h, super::OVERLAY_FRAME_RADIUS_LG);
             mic_indicator(res, h, state);
-            streaming_text(res, w, h, visible_text, text_width);
+            streaming_text(res, w, h, visible_text, text_width, dim_from);
             // Right separator (主控 D2D-P1 验收要求补齐): GDI 版 :2617-2624 逐项照抄 —
             // x = width-36, 高 20 垂直居中, 2px OVERLAY_BORDER_GRAY。文字区与停止键之间。
             // D2D-P2 (PLAN-108 H4): 内联版上提为 right_separator 原语（同值替换），
@@ -7445,7 +7534,7 @@ fn process_controller_events(
                 set_tray_state(tray, TrayState::Recording, ui_language);
                 show_overlay_streaming_idle(overlay_handle, opacity, ui_language, 0);
             }
-            PipelineEvent::StreamingText(gen, text, words) => {
+            PipelineEvent::StreamingText(gen, text, words, tentative) => {
                 // OVERLAY-075: cross-session identity gate — MUST run before anything consumes
                 // the packet (overlay AND the edit-learn mirror below), so a stale session's
                 // finalize-tail text can neither render into this session's window nor pollute
@@ -7496,6 +7585,8 @@ fn process_controller_events(
                 } else {
                     // OVERLAY-051-G: store word timings for timestamp-driven reveal
                     overlay_handle.send(OverlayCommand::UpdateWordTimings(words));
+                    // STREAM-SV-463：末尾未定字数（浅色）。按「末尾字数」传 ⇒ 前缀被精解回灌合成替换也不错位。
+                    overlay_handle.send(OverlayCommand::UpdateTentativeTail(tentative));
                     if log::log_enabled!(log::Level::Debug) {
                         let committed = acc_state
                             .as_ref()
@@ -7533,6 +7624,8 @@ fn process_controller_events(
                     let gen = STREAMING_GENERATION.load(Ordering::Acquire);
                     let acc_state = ACC_REFLOW_STATE.lock().ok().and_then(|g| g.clone());
                     let display = compose_with_acc_for_gen(acc_state.as_ref(), gen, &text);
+                    // STREAM-SV-463：录音已结束 ⇒ 全部已定，浅色尾巴清零。
+                    overlay_handle.send(OverlayCommand::UpdateTentativeTail(0));
                     // 镜像恒 = 所显（缺陷 B）。
                     if let Ok(mut mirror) = last_streaming_text.lock() {
                         *mirror = Some(display.clone());
@@ -8725,6 +8818,7 @@ fn spawn_worker_thread(
                                             session_generation,
                                             display_text.to_string(),
                                             words.to_vec(),
+                                            0,
                                         ));
                                     },
                                 )
@@ -8933,10 +9027,10 @@ fn spawn_worker_thread(
 
                         let recognizer = transcriber
                             .as_ref()
-                            .and_then(|t| t.online_recognizer())
-                            .expect("LocalRealtime transcriber must hold an online recognizer");
+                            .and_then(|t| t.preview_recognizer())
+                            .expect("LocalRealtime transcriber must hold a preview recognizer");
                         let send_recognizer =
-                            transcription::local_stream::SendOnlineRecognizerRef(recognizer);
+                            transcription::local_stream::SendPreviewRecognizerRef(recognizer);
                         let cancel_clone = Arc::clone(&cancel_signal);
                         let event_tx_clone = event_tx.clone();
                         // chunk channel：record_streaming 推 chunk，ASR 线程读
@@ -10287,12 +10381,14 @@ fn spawn_worker_thread(
                                     punctuation,
                                     config.audio.silence_threshold,
                                     vad_device.as_str(),
-                                    |display_text, words| {
+                                    |display_text, words, tentative| {
                                         // OVERLAY-075：与在线流式同构，代际盖章。
+                                        // STREAM-SV-463：带上末尾未定字数（浮窗浅色）。
                                         let _ = event_tx_clone.send(PipelineEvent::StreamingText(
                                             session_generation,
                                             display_text.to_string(),
                                             words.to_vec(),
+                                            tentative,
                                         ));
                                     },
                                     acc_cfg,
@@ -11272,7 +11368,7 @@ fn overlay_request_for_event(event: &PipelineEvent) -> platform::OverlayRequest 
             auto_close_ms: 4000,
         },
         PipelineEvent::FocusLost(text) => platform::OverlayRequest::ShowPreview(text.clone()),
-        PipelineEvent::StreamingText(_, _, _) => platform::OverlayRequest::Show, // macOS 侧流式文本暂不渲染
+        PipelineEvent::StreamingText(_, _, _, _) => platform::OverlayRequest::Show, // macOS 侧流式文本暂不渲染
         // LOCALRT-FIRSTCHAR-282: 本地流式收尾预览（macOS 侧流式文本暂不渲染，同 StreamingText）
         PipelineEvent::StreamingFinalPreview(_) => platform::OverlayRequest::Show,
         // ACC-PREVIEW-REFLOW-325: 本地档 accuracy 回灌预览（macOS 侧流式文本暂不渲染，同 StreamingText）
@@ -11358,7 +11454,7 @@ fn handle_pipeline_event(event: &PipelineEvent, ui_language: config::UiLanguage)
             log::error!("macOS pipeline: ModelUnavailable({})", msg);
             platform::request_tray_state(TrayState::Error, ui_language);
         }
-        PipelineEvent::StreamingText(_, text, _) => {
+        PipelineEvent::StreamingText(_, text, _, _) => {
             // ASR-038-B: macOS 侧流式文本暂不渲染（C-overlay 批后续实现）
             log::debug!("macOS pipeline: StreamingText ({} chars)", text.len());
         }
@@ -18861,7 +18957,8 @@ mod overlay_wire_tests {
             overlay_request_for_event(&PipelineEvent::StreamingText(
                 0,
                 "测试文本".to_string(),
-                Vec::new()
+                Vec::new(),
+                0
             )),
             OverlayRequest::Show,
             "StreamingText 必须映射为 Show（macOS 侧暂不渲染流式文本）"
@@ -18990,11 +19087,12 @@ mod overlay_075_d2d_guard_tests {
     fn streaming_text_event_carries_generation_as_first_field() {
         let gen = STREAMING_GENERATION.load(Ordering::Acquire);
         // 三元解构与生产消费侧 :3991 完全同构 —— 编译期即验证字段位次
-        let event = PipelineEvent::StreamingText(gen, "文本".to_string(), Vec::new());
+        let event = PipelineEvent::StreamingText(gen, "文本".to_string(), Vec::new(), 2);
         match event {
-            PipelineEvent::StreamingText(e_gen, _text, words) => {
+            PipelineEvent::StreamingText(e_gen, _text, words, tentative) => {
                 assert_eq!(e_gen, gen, "首字段必须是代际");
                 assert!(words.is_empty());
+                assert_eq!(tentative, 2, "STREAM-SV-463：第四字段 = 末尾未定字数");
             }
             _ => panic!("StreamingText 构造后必须解构回 StreamingText"),
         }
@@ -19128,11 +19226,14 @@ mod overlay_086_d2d_p1_guard_tests {
             "RecordingStreamingIdle 入口：无效 HDC 必须返回 false（GDI 回落触发器）"
         );
 
-        let ok_text = d2d::draw_streaming_text_overlay(hdc, &rect, &state, "流式文本", 120);
+        let ok_text = d2d::draw_streaming_text_overlay(hdc, &rect, &state, "流式文本", 120, None);
         assert!(
             !ok_text,
             "RecordingWithText 入口：无效 HDC 必须返回 false（GDI 回落触发器）"
         );
+        // STREAM-SV-463：带浅色尾巴的入口同样必须回落（不 panic、不吞错）。
+        let ok_dim = d2d::draw_streaming_text_overlay(hdc, &rect, &state, "流式文本", 120, Some(2));
+        assert!(!ok_dim, "带浅色尾巴：无效 HDC 必须返回 false");
         // D2D-HANG-095: 本用例以无效 HDC 调 D2D 入口，create_resources 会成功
         //（工厂创建不依赖窗口），因此本测试线程的 thread_local 槽被填上了 D2D 资源。
         // 必须在用例体内显式释放 —— 否则测试线程退出时由 FLS 回调在 loader lock 下
@@ -19569,6 +19670,7 @@ mod overlay_086_d2d_p1_guard_tests {
             tween_target_chars: 0,
             tween_start: None,
             word_timings: Vec::new(),
+            tentative_tail_chars: 0,
             tween_audio_origin: None,
             tween_timeline_origin: None,
         }
@@ -20194,6 +20296,7 @@ mod overlay_109_d2d_p2p3_guard_tests {
             tween_target_chars: 0,
             tween_start: None,
             word_timings: Vec::new(),
+            tentative_tail_chars: 0,
             tween_audio_origin: None,
             tween_timeline_origin: None,
         }

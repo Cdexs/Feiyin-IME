@@ -120,3 +120,10 @@
 - 声纹全剔 ⇒ 不走整段兜底解码 ⇒ 按「未检测到语音」处理。bin 1913P/0F/80I；fmt clean；warnings 90。
 - 下一步：派 tester-1 TEST-EXEC-460 + BUILD-460。
 
+## 2026-10-03 — 主控 — STREAM-SV-463 ✅ 开发完成（DEC-100）
+
+- 预览 = 官方 SenseVoice-Small 2024-07-17 int8 模拟流式（每 0.6s 重解当前句、8 线程 = 物理核）；派发点即冻结；末尾未定字浅色；performance 档同一模型、关 ITN。
+- 端到端抓出并修掉「标点缓存默认文字只增不改」（PREVIEW-REWRITE-463）：缓存复用核对原文、重解挪到派发之后、442 按 token 时间切分。
+- 定向回归全绿；`sv463_preview_freeze_e2e` 全绿。新模型已放 `models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/`（与 poc-462 下载件逐字节一致）。
+- 下一步：派 tester-1 TEST-EXEC-463 + BUILD-463；旧模型目录（funasr-nano 2025-12-17、streaming-paraformer-trilingual）待 Gavin 确认后删除。
+

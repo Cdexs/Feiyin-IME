@@ -2675,3 +2675,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 对 macOS 的影响 | 平台中立代码，同一份编译；macOS 声纹管线同理。**未在 macOS 实测** |
 | 是否需要对方同步 | 重新编译即可 |
 
+## STREAM-SV-463（2026-10-03，主控）· 本地实时预览换官方 SenseVoice 模拟流式（DEC-100）
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | `local_stream.rs`：预览由 sherpa `OnlineRecognizer`（paraformer）换 `OfflineRecognizer`（SenseVoice）模拟流式；`SendOnlineRecognizerRef` → `SendPreviewRecognizerRef`；`transcribe_streaming_local` 的 `on_result` 多第三参（末尾未定字数）；预览线程 = 物理核数（macOS 走 `libc::sysctlbyname("hw.physicalcpu")`）。`mod.rs`：`SENSEVOICE_MODEL_SUBDIR`（performance + 预览共用）、`use_itn=false`、`Transcriber::preview_recognizer()`（原 `online_recognizer()`）。`main.rs`：`PipelineEvent::StreamingText` 第四字段、`OverlayCommand::UpdateTentativeTail`、Windows D2D 浮窗浅色尾巴 |
+| 行为变化 | 本地实时预览支持日 / 韩、中文错字约减半、末尾未定字浅色；performance 档换官方模型（输出形态不变：无标点、汉字数字） |
+| 对 macOS 的影响 | 平台中立部分同一份编译。**模型目录变更**：需要 `models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/`（`model.int8.onnx` + `tokens.txt`）；旧 `sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17`、`sherpa-onnx-streaming-paraformer-trilingual-zh-cantonese-en` 不再使用。macOS 浮窗当前不渲染流式文字（`StreamingText → Show`），浅色尾巴为 Windows 专属；将来 macOS 渲染流式文字时按第四字段画浅色。**未在 macOS 实测**（含 `hw.physicalcpu` 取核） |
+| 是否需要对方同步 | 换模型目录 + 重新编译 |
+

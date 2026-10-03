@@ -481,22 +481,9 @@ fn replay452_variants() {
         acc.device(),
         terms.as_deref().map_or(0, |t| t.chars().count())
     );
+    // STREAM-SV-463：流式原文 = 预览模型（SenseVoice）对该段音频整段解一次（与生产同一解码函数）。
     let run_stream = |audio: &[f32]| -> String {
-        let stream = st_rec.create_stream();
-        for c in audio.chunks(1600) {
-            stream.accept_waveform(RATE as i32, c);
-            while st_rec.is_ready(&stream) {
-                st_rec.decode(&stream);
-            }
-        }
-        stream.input_finished();
-        while st_rec.is_ready(&stream) {
-            st_rec.decode(&stream);
-        }
-        st_rec
-            .get_result(&stream)
-            .map(|r| r.text.clone())
-            .unwrap_or_default()
+        crate::transcription::local_stream::preview_decode(&st_rec, audio)
     };
     const VARIANTS: [&str; 4] = ["base", "draft", "terms", "full"];
     struct Agg {
@@ -678,22 +665,9 @@ fn replay452_stream() {
     let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
         .expect("流式模型须在位");
     let terms = load_real_wordbook_terms();
+    // STREAM-SV-463：流式原文 = 预览模型（SenseVoice）对该段音频整段解一次（与生产同一解码函数）。
     let run_stream = |audio: &[f32]| -> String {
-        let stream = st_rec.create_stream();
-        for c in audio.chunks(1600) {
-            stream.accept_waveform(RATE as i32, c);
-            while st_rec.is_ready(&stream) {
-                st_rec.decode(&stream);
-            }
-        }
-        stream.input_finished();
-        while st_rec.is_ready(&stream) {
-            st_rec.decode(&stream);
-        }
-        st_rec
-            .get_result(&stream)
-            .map(|r| r.text.clone())
-            .unwrap_or_default()
+        crate::transcription::local_stream::preview_decode(&st_rec, audio)
     };
     let (mut shown_n, mut flicker_n, mut windows_with_partial, mut windows) =
         (0usize, 0usize, 0usize, 0usize);
@@ -883,22 +857,9 @@ fn replay452_shrink() {
     let st_rec =
         crate::transcription::local_stream::create_local_stream_recognizer(&models).expect("流式");
     let terms = load_real_wordbook_terms();
+    // STREAM-SV-463：流式原文 = 预览模型（SenseVoice）对该段音频整段解一次（与生产同一解码函数）。
     let run_stream = |audio: &[f32]| -> String {
-        let stream = st_rec.create_stream();
-        for c in audio.chunks(1600) {
-            stream.accept_waveform(RATE as i32, c);
-            while st_rec.is_ready(&stream) {
-                st_rec.decode(&stream);
-            }
-        }
-        stream.input_finished();
-        while st_rec.is_ready(&stream) {
-            st_rec.decode(&stream);
-        }
-        st_rec
-            .get_result(&stream)
-            .map(|r| r.text.clone())
-            .unwrap_or_default()
+        crate::transcription::local_stream::preview_decode(&st_rec, audio)
     };
     let (mut events, mut shrink_old, mut shrink_new, mut shown_new) =
         (0usize, 0usize, 0usize, 0usize);
@@ -1200,22 +1161,9 @@ fn replay455_timed_seam() {
         .expect("流式模型须在位");
     let ctc = create_sensevoice_recognizer(&models, "auto").expect("FunASR Nano CTC 须在位");
     let terms = load_real_wordbook_terms();
+    // STREAM-SV-463：流式原文 = 预览模型（SenseVoice）对该段音频整段解一次（与生产同一解码函数）。
     let run_stream = |audio: &[f32]| -> String {
-        let stream = st_rec.create_stream();
-        for c in audio.chunks(1600) {
-            stream.accept_waveform(RATE as i32, c);
-            while st_rec.is_ready(&stream) {
-                st_rec.decode(&stream);
-            }
-        }
-        stream.input_finished();
-        while st_rec.is_ready(&stream) {
-            st_rec.decode(&stream);
-        }
-        st_rec
-            .get_result(&stream)
-            .map(|r| r.text.clone())
-            .unwrap_or_default()
+        crate::transcription::local_stream::preview_decode(&st_rec, audio)
     };
     let (mut cer_cur, mut cer_timed, mut cer_n) = (0f32, 0f32, 0usize);
     let (mut rep_cur, mut rep_timed) = (0usize, 0usize);
@@ -1496,22 +1444,9 @@ fn replay457_pipeline() {
     let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
         .expect("流式模型须在位");
     let terms = load_real_wordbook_terms();
+    // STREAM-SV-463：流式原文 = 预览模型（SenseVoice）对该段音频整段解一次（与生产同一解码函数）。
     let run_stream = |audio: &[f32]| -> String {
-        let stream = st_rec.create_stream();
-        for c in audio.chunks(1600) {
-            stream.accept_waveform(RATE as i32, c);
-            while st_rec.is_ready(&stream) {
-                st_rec.decode(&stream);
-            }
-        }
-        stream.input_finished();
-        while st_rec.is_ready(&stream) {
-            st_rec.decode(&stream);
-        }
-        st_rec
-            .get_result(&stream)
-            .map(|r| r.text.clone())
-            .unwrap_or_default()
+        crate::transcription::local_stream::preview_decode(&st_rec, audio)
     };
     let (mut n_win, mut n_diff_ab) = (0usize, 0usize);
     let mut ms_ab = [0f64; 2];
@@ -1834,22 +1769,9 @@ fn replay457_quant() {
     let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
         .expect("流式模型须在位");
     let terms = load_real_wordbook_terms();
+    // STREAM-SV-463：流式原文 = 预览模型（SenseVoice）对该段音频整段解一次（与生产同一解码函数）。
     let run_stream = |audio: &[f32]| -> String {
-        let stream = st_rec.create_stream();
-        for c in audio.chunks(1600) {
-            stream.accept_waveform(RATE as i32, c);
-            while st_rec.is_ready(&stream) {
-                st_rec.decode(&stream);
-            }
-        }
-        stream.input_finished();
-        while st_rec.is_ready(&stream) {
-            st_rec.decode(&stream);
-        }
-        st_rec
-            .get_result(&stream)
-            .map(|r| r.text.clone())
-            .unwrap_or_default()
+        crate::transcription::local_stream::preview_decode(&st_rec, audio)
     };
     // 录音 → 窗口（各组共用）。
     let mut sessions: Vec<(String, Vec<usize>, Vec<Win457>, Option<String>)> = Vec::new();
@@ -2009,22 +1931,9 @@ fn poc457_prefix_determinism() {
     let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
         .expect("流式模型须在位");
     let terms = load_real_wordbook_terms();
+    // STREAM-SV-463：流式原文 = 预览模型（SenseVoice）对该段音频整段解一次（与生产同一解码函数）。
     let run_stream = |audio: &[f32]| -> String {
-        let stream = st_rec.create_stream();
-        for c in audio.chunks(1600) {
-            stream.accept_waveform(RATE as i32, c);
-            while st_rec.is_ready(&stream) {
-                st_rec.decode(&stream);
-            }
-        }
-        stream.input_finished();
-        while st_rec.is_ready(&stream) {
-            st_rec.decode(&stream);
-        }
-        st_rec
-            .get_result(&stream)
-            .map(|r| r.text.clone())
-            .unwrap_or_default()
+        crate::transcription::local_stream::preview_decode(&st_rec, audio)
     };
     let target = std::env::var("P457_SESSION").unwrap_or_else(|_| "session-20260927-221031".into());
     for wav in collect_wavs(&root) {
@@ -2172,22 +2081,9 @@ fn replay458_tune() {
     let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
         .expect("流式模型须在位");
     let terms = load_real_wordbook_terms();
+    // STREAM-SV-463：流式原文 = 预览模型（SenseVoice）对该段音频整段解一次（与生产同一解码函数）。
     let run_stream = |audio: &[f32]| -> String {
-        let stream = st_rec.create_stream();
-        for c in audio.chunks(1600) {
-            stream.accept_waveform(RATE as i32, c);
-            while st_rec.is_ready(&stream) {
-                st_rec.decode(&stream);
-            }
-        }
-        stream.input_finished();
-        while st_rec.is_ready(&stream) {
-            st_rec.decode(&stream);
-        }
-        st_rec
-            .get_result(&stream)
-            .map(|r| r.text.clone())
-            .unwrap_or_default()
+        crate::transcription::local_stream::preview_decode(&st_rec, audio)
     };
     let mut sessions: Vec<(String, Vec<usize>, Vec<Win457>, Option<String>)> = Vec::new();
     for wav in collect_wavs(&root) {
@@ -2499,22 +2395,9 @@ fn poc458_quality() {
     let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
         .expect("流式模型须在位");
     let terms = load_real_wordbook_terms();
+    // STREAM-SV-463：流式原文 = 预览模型（SenseVoice）对该段音频整段解一次（与生产同一解码函数）。
     let run_stream = |audio: &[f32]| -> String {
-        let stream = st_rec.create_stream();
-        for c in audio.chunks(1600) {
-            stream.accept_waveform(RATE as i32, c);
-            while st_rec.is_ready(&stream) {
-                st_rec.decode(&stream);
-            }
-        }
-        stream.input_finished();
-        while st_rec.is_ready(&stream) {
-            st_rec.decode(&stream);
-        }
-        st_rec
-            .get_result(&stream)
-            .map(|r| r.text.clone())
-            .unwrap_or_default()
+        crate::transcription::local_stream::preview_decode(&st_rec, audio)
     };
     let mut sessions: Vec<(String, Vec<usize>, Vec<Win457>, Option<String>)> = Vec::new();
     for wav in collect_wavs(&root) {
@@ -2680,22 +2563,9 @@ fn poc459_fallback_align() {
     let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
         .expect("流式模型须在位");
     let terms = load_real_wordbook_terms();
+    // STREAM-SV-463：流式原文 = 预览模型（SenseVoice）对该段音频整段解一次（与生产同一解码函数）。
     let run_stream = |audio: &[f32]| -> String {
-        let stream = st_rec.create_stream();
-        for c in audio.chunks(1600) {
-            stream.accept_waveform(RATE as i32, c);
-            while st_rec.is_ready(&stream) {
-                st_rec.decode(&stream);
-            }
-        }
-        stream.input_finished();
-        while st_rec.is_ready(&stream) {
-            st_rec.decode(&stream);
-        }
-        st_rec
-            .get_result(&stream)
-            .map(|r| r.text.clone())
-            .unwrap_or_default()
+        crate::transcription::local_stream::preview_decode(&st_rec, audio)
     };
     let (mut n_fb, mut n_fb_aligned, mut n_win) = (0usize, 0usize, 0usize);
     let (mut cer_old, mut cer_new, mut cer_n, mut rep_old, mut rep_new, mut diff) =
@@ -2839,28 +2709,23 @@ fn poc461_koja_406() {
     let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
         .expect("流式模型须在位");
     let terms = load_real_wordbook_terms();
+    // STREAM-SV-463：流式原文 = 预览模型（SenseVoice）对该段音频整段解一次（与生产同一解码函数）。
     let run_stream = |audio: &[f32]| -> String {
-        let stream = st_rec.create_stream();
-        for c in audio.chunks(1600) {
-            stream.accept_waveform(RATE as i32, c);
-            while st_rec.is_ready(&stream) {
-                st_rec.decode(&stream);
-            }
-        }
-        stream.input_finished();
-        while st_rec.is_ready(&stream) {
-            st_rec.decode(&stream);
-        }
-        st_rec
-            .get_result(&stream)
-            .map(|r| r.text.clone())
-            .unwrap_or_default()
+        crate::transcription::local_stream::preview_decode(&st_rec, audio)
     };
     let mut wavs = vec![
-        models.join("sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17/test_wavs/ja.wav"),
-        models.join("sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17/test_wavs/ko.wav"),
-        models.join("sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17/test_wavs/zh.wav"),
-        models.join("sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17/test_wavs/en.wav"),
+        models
+            .join(crate::transcription::SENSEVOICE_MODEL_SUBDIR)
+            .join("test_wavs/ja.wav"),
+        models
+            .join(crate::transcription::SENSEVOICE_MODEL_SUBDIR)
+            .join("test_wavs/ko.wav"),
+        models
+            .join(crate::transcription::SENSEVOICE_MODEL_SUBDIR)
+            .join("test_wavs/zh.wav"),
+        models
+            .join(crate::transcription::SENSEVOICE_MODEL_SUBDIR)
+            .join("test_wavs/en.wav"),
     ];
     for k in 0..4 {
         wavs.push(models.join(format!("korean-testwavs/{k}.wav")));
@@ -2898,522 +2763,4 @@ fn poc461_koja_406() {
             v.accept
         );
     }
-}
-
-/// STREAM-KOJA-462：现行流式预览模型（paraformer 三语）vs SenseVoice（产品已带，中英日韩粤）「模拟流式」对比。
-/// 按离线 VAD 语音段逐段解：paraformer 每段一条流；SenseVoice 每段整段解一次（终稿质量）+ 每 0.6s 重解已录前缀（模拟流式 CPU 开销）。
-/// 输出：5 段人工参考 CER、日韩中英测试音频文字、解码耗时 / 实时率、加载内存增量。
-/// 运行：cargo test --bin feiyin-ime poc462_stream -- --ignored --nocapture
-#[test]
-#[ignore = "STREAM-KOJA-462：--ignored 运行"]
-fn poc462_stream_models() {
-    let root = manifest_dir();
-    let models = root.join("models");
-    let probe = VadSegmenter::try_new_for_local_trim(&models).expect("VAD");
-    let (_, _, w0) = proc_mem_mb_457();
-    let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
-        .expect("流式模型须在位");
-    let (_, _, w1) = proc_mem_mb_457();
-    let sv = create_sensevoice_recognizer(&models, "auto").expect("SenseVoice 须在位");
-    let (_, _, w2) = proc_mem_mb_457();
-    println!(
-        "[462] 加载内存增量：paraformer 流式 {:.0}MB / SenseVoice {:.0}MB",
-        w1 - w0,
-        w2 - w1
-    );
-    let para = |seg: &[f32]| -> String {
-        let s = st_rec.create_stream();
-        for c in seg.chunks(1600) {
-            s.accept_waveform(RATE as i32, c);
-            while st_rec.is_ready(&s) {
-                st_rec.decode(&s);
-            }
-        }
-        s.input_finished();
-        while st_rec.is_ready(&s) {
-            st_rec.decode(&s);
-        }
-        st_rec
-            .get_result(&s)
-            .map(|r| r.text.clone())
-            .unwrap_or_default()
-    };
-    let svd = |seg: &[f32]| -> String {
-        let s = sv.create_stream();
-        s.accept_waveform(16000, seg);
-        sv.decode(&s);
-        s.get_result()
-            .map(|r| r.text.trim().to_string())
-            .unwrap_or_default()
-    };
-    let pad = (vad::LOCALRT_TRIM_PAD_SECS * RATE as f32) as usize;
-    let mut wavs: Vec<(String, std::path::PathBuf)> = Vec::new();
-    for wav in collect_wavs(&root) {
-        let n = wav
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?")
-            .to_string();
-        wavs.push((n, wav));
-    }
-    for n in ["ja", "ko", "zh", "en"] {
-        wavs.push((
-            format!("test-{n}"),
-            models.join(format!(
-                "sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17/test_wavs/{n}.wav"
-            )),
-        ));
-    }
-    for k in 0..4 {
-        wavs.push((
-            format!("korean-{k}"),
-            models.join(format!("korean-testwavs/{k}.wav")),
-        ));
-    }
-    let (mut audio_s, mut t_para, mut t_sv_final, mut t_sv_sim) = (0f64, 0f64, 0f64, 0f64);
-    let mut worst_update_ms = 0f64;
-    let (mut cer_p, mut cer_s, mut cer_n) = (0f32, 0f32, 0usize);
-    let mut report = String::from("# STREAM-KOJA-462 本地对比\n\n");
-    for (name, wav) in &wavs {
-        let Some((audio, rate)) = read_wav(wav) else {
-            continue;
-        };
-        if rate as usize != RATE {
-            continue;
-        }
-        let mut ranges = probe.speech_ranges(&audio);
-        if ranges.is_empty() {
-            ranges = vec![(0, audio.len())];
-        }
-        let (mut tp, mut ts) = (String::new(), String::new());
-        for &(a, b) in &ranges {
-            let seg = &audio[a.saturating_sub(pad)..(b + pad).min(audio.len())];
-            audio_s += seg.len() as f64 / RATE as f64;
-            let t0 = Instant::now();
-            tp.push_str(&para(seg));
-            t_para += t0.elapsed().as_secs_f64();
-            let t0 = Instant::now();
-            ts.push_str(&svd(seg));
-            t_sv_final += t0.elapsed().as_secs_f64();
-            // 模拟流式：每 0.6s 重解已录前缀
-            let step = RATE * 6 / 10;
-            let mut end = step;
-            while end < seg.len() {
-                let t0 = Instant::now();
-                let _ = svd(&seg[..end]);
-                let dt = t0.elapsed().as_secs_f64();
-                t_sv_sim += dt;
-                worst_update_ms = worst_update_ms.max(dt * 1000.0);
-                end += step;
-            }
-        }
-        let line = if let Some(r) = read_ref_for(name) {
-            let (cp, cs) = (cer(&tp, &r), cer(&ts, &r));
-            cer_p += cp;
-            cer_s += cs;
-            cer_n += 1;
-            format!("- {name}：CER paraformer {cp:.4} / SenseVoice {cs:.4}\n")
-        } else if name.starts_with("test-") || name.starts_with("korean-") {
-            format!("- {name}\n  - paraformer：{tp}\n  - SenseVoice：{ts}\n")
-        } else {
-            String::new()
-        };
-        print!("{line}");
-        report.push_str(&line);
-    }
-    let summary = format!(
-        "\n## 汇总\n\n- 语音总长 {audio_s:.1}s\n- 5 段人工参考 CER：paraformer {:.4} / SenseVoice {:.4}\n- paraformer 流式解码 {t_para:.1}s（实时率 {:.3}）\n- SenseVoice 整段解 {t_sv_final:.1}s（实时率 {:.3}）；模拟流式（每 0.6s 重解前缀）累计 {t_sv_sim:.1}s（相当于实时率 {:.3}），单次更新最慢 {worst_update_ms:.0}ms\n- 加载内存增量：paraformer {:.0}MB / SenseVoice {:.0}MB\n",
-        cer_p / cer_n.max(1) as f32,
-        cer_s / cer_n.max(1) as f32,
-        t_para / audio_s.max(1e-9),
-        t_sv_final / audio_s.max(1e-9),
-        (t_sv_final + t_sv_sim) / audio_s.max(1e-9),
-        w1 - w0,
-        w2 - w1
-    );
-    print!("{summary}");
-    report.push_str(&summary);
-    let out = root.join("collab/evidence/462/stream462.md");
-    let _ = std::fs::create_dir_all(out.parent().unwrap());
-    std::fs::write(&out, report).unwrap();
-}
-
-/// STREAM-KOJA-462 ②：模拟流式原型 —— 按语音段内的时间推进模拟实时预览，对比现行流式 paraformer 与 SenseVoice
-/// （产品自带 funasr-nano 2025-12-17 / 官方 2024-07-17）：首字延迟、闪动率（新预览不是旧预览的延续）、终稿 CER、CPU 实时率。
-/// SenseVoice 每 `SIM_STEP` 重解该段已录前缀；paraformer 每 0.1s 喂一块。
-/// ③ 并发影响：1.7B 精解同一批窗口，分别在「无预览 / 现行流式预览 / SenseVoice 模拟流式」后台持续运行时计时。
-/// 官方 2024-07-17 模型放 `D:\Workspace\CodeLab\poc-462\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17`（不在则跳过）。
-/// 运行：cargo test --bin feiyin-ime poc462_simstream -- --ignored --nocapture
-#[test]
-#[ignore = "STREAM-KOJA-462：--ignored 运行"]
-fn poc462_simstream() {
-    const SIM_STEP: usize = RATE * 6 / 10;
-    crate::transcription::speaker::TEST_EXTRACTOR_MISSING.with(|c| c.set(true));
-    let root = manifest_dir();
-    let models = root.join("models");
-    let probe = VadSegmenter::try_new_for_local_trim(&models).expect("VAD");
-    let pad = (vad::LOCALRT_TRIM_PAD_SECS * RATE as f32) as usize;
-    let norm = |s: &str| -> String {
-        s.chars()
-            .filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation() && !"\u{ff0c}\u{3002}\u{ff01}\u{ff1f}\u{3001}\u{ff1b}\u{ff1a}\u{2026}\u{201c}\u{201d}\u{2018}\u{2019}\u{ff08}\u{ff09}".contains(*c))
-            .collect()
-    };
-    let mut wavs: Vec<(String, std::path::PathBuf)> = Vec::new();
-    for wav in collect_wavs(&root) {
-        let n = wav
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?")
-            .to_string();
-        if read_ref_for(&n).is_some() {
-            wavs.push((n, wav));
-        }
-    }
-    for n in ["ja", "ko", "zh", "en"] {
-        wavs.push((
-            format!("test-{n}"),
-            models.join(format!(
-                "sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17/test_wavs/{n}.wav"
-            )),
-        ));
-    }
-    for k in 0..4 {
-        wavs.push((
-            format!("korean-{k}"),
-            models.join(format!("korean-testwavs/{k}.wav")),
-        ));
-    }
-    let mut segs_all: Vec<(String, Vec<Vec<f32>>)> = Vec::new();
-    for (name, wav) in &wavs {
-        let Some((audio, rate)) = read_wav(wav) else {
-            continue;
-        };
-        if rate as usize != RATE {
-            continue;
-        }
-        let mut ranges = probe.speech_ranges(&audio);
-        if ranges.is_empty() {
-            ranges = vec![(0, audio.len())];
-        }
-        let segs = ranges
-            .iter()
-            .map(|&(a, b)| audio[a.saturating_sub(pad)..(b + pad).min(audio.len())].to_vec())
-            .collect();
-        segs_all.push((name.clone(), segs));
-    }
-    let sv_cfg = |dir: &std::path::Path, model_file: &str| sherpa_onnx::OfflineRecognizerConfig {
-        model_config: sherpa_onnx::OfflineModelConfig {
-            sense_voice: sherpa_onnx::OfflineSenseVoiceModelConfig {
-                model: Some(dir.join(model_file).to_string_lossy().to_string()),
-                language: Some("auto".into()),
-                use_itn: true,
-            },
-            tokens: Some(dir.join("tokens.txt").to_string_lossy().to_string()),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let sv_dirs: Vec<(&str, std::path::PathBuf)> = vec![
-        (
-            "SenseVoice 产品自带（funasr-nano 2025-12-17）",
-            models.join("sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17"),
-        ),
-        (
-            "SenseVoice 官方 2024-07-17",
-            std::path::PathBuf::from(
-                r"D:\Workspace\CodeLab\poc-462\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
-            ),
-        ),
-    ];
-    let model_file = |dir: &std::path::Path| -> Option<&'static str> {
-        if dir.join("model.int8.onnx").is_file() {
-            Some("model.int8.onnx")
-        } else if dir.join("model.onnx").is_file() {
-            Some("model.onnx")
-        } else {
-            None
-        }
-    };
-    let mut report = String::from("# STREAM-KOJA-462 模拟流式原型对比\n\n");
-    let mut rows = String::new();
-    let mut worst_lines = String::new();
-    // 统计一个模型：每段给出刷新序列 [(段内秒, 文字)] 与解码耗时
-    let mut eval =
-        |label: &str, decode_seg: &mut dyn FnMut(&[f32]) -> (Vec<(f32, String)>, f64)| {
-            let (mut first_sum, mut first_n, mut upd, mut flick, mut dec_s, mut aud_s) =
-                (0f64, 0usize, 0usize, 0usize, 0f64, 0f64);
-            let (mut cer_sum, mut cer_n) = (0f32, 0usize);
-            // 稳定前缀显示：只上屏「相邻两次结果的公共前缀」，已上屏的字不回改，段末以终稿收口
-            let (mut la_first_sum, mut la_first_n, mut la_upd, mut la_retract) =
-                (0f64, 0usize, 0usize, 0usize);
-            let mut samples_txt = String::new();
-            for (name, segs) in &segs_all {
-                let mut fin = String::new();
-                for seg in segs {
-                    aud_s += seg.len() as f64 / RATE as f64;
-                    let (ups, d) = decode_seg(seg);
-                    dec_s += d;
-                    let mut prev = String::new();
-                    let mut got_first = false;
-                    let mut shown = String::new();
-                    let mut prev_hyp: Option<String> = None;
-                    for (i, (t, txt)) in ups.iter().enumerate() {
-                        let n = norm(txt);
-                        if !got_first && !n.is_empty() {
-                            first_sum += (*t as f64 - pad as f64 / RATE as f64).max(0.0);
-                            first_n += 1;
-                            got_first = true;
-                        }
-                        let is_last = i + 1 == ups.len();
-                        let cand: String = if is_last {
-                            n.clone()
-                        } else if let Some(p) = &prev_hyp {
-                            p.chars()
-                                .zip(n.chars())
-                                .take_while(|(x, y)| x == y)
-                                .map(|(x, _)| x)
-                                .collect()
-                        } else {
-                            String::new()
-                        };
-                        prev_hyp = Some(n.clone());
-                        let grows = cand.starts_with(&shown) && cand.len() > shown.len();
-                        if cand != shown && (grows || is_last) {
-                            if shown.is_empty() && !cand.is_empty() {
-                                la_first_sum += (*t as f64 - pad as f64 / RATE as f64).max(0.0);
-                                la_first_n += 1;
-                            }
-                            la_upd += 1;
-                            if !cand.starts_with(&shown) {
-                                la_retract += 1;
-                            }
-                            shown = cand;
-                        }
-                        if n != prev {
-                            upd += 1;
-                            if !prev.is_empty() && !n.starts_with(&prev) {
-                                flick += 1;
-                            }
-                            prev = n;
-                        }
-                    }
-                    if let Some((_, last)) = ups.last() {
-                        fin.push_str(last);
-                    }
-                }
-                if let Some(r) = read_ref_for(name) {
-                    cer_sum += cer(&fin, &r);
-                    cer_n += 1;
-                } else {
-                    samples_txt.push_str(&format!("  - {name}：{fin}\n"));
-                }
-            }
-            let row = format!(
-                "| {label} | {:.4} | {:.2}s | {:.0}% | {:.2}s | {:.0}% | {:.3} |\n",
-                cer_sum / cer_n.max(1) as f32,
-                first_sum / first_n.max(1) as f64,
-                flick as f64 * 100.0 / upd.max(1) as f64,
-                la_first_sum / la_first_n.max(1) as f64,
-                la_retract as f64 * 100.0 / la_upd.max(1) as f64,
-                dec_s / aud_s.max(1e-9),
-            );
-            print!("{row}");
-            rows.push_str(&row);
-            report.push_str(&format!("\n### {label} 日韩中英样例\n{samples_txt}"));
-        };
-    let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
-        .expect("流式模型须在位");
-    eval("现行流式 paraformer 三语", &mut |seg: &[f32]| {
-        let s = st_rec.create_stream();
-        let mut ups = Vec::new();
-        let t0 = Instant::now();
-        for (k, c) in seg.chunks(1600).enumerate() {
-            let tc = Instant::now();
-            s.accept_waveform(RATE as i32, c);
-            while st_rec.is_ready(&s) {
-                st_rec.decode(&s);
-            }
-            let txt = st_rec
-                .get_result(&s)
-                .map(|r| r.text.clone())
-                .unwrap_or_default();
-            ups.push(((k + 1) as f32 * 0.1 + tc.elapsed().as_secs_f32(), txt));
-        }
-        s.input_finished();
-        while st_rec.is_ready(&s) {
-            st_rec.decode(&s);
-        }
-        let txt = st_rec
-            .get_result(&s)
-            .map(|r| r.text.clone())
-            .unwrap_or_default();
-        ups.push((seg.len() as f32 / RATE as f32, txt));
-        (ups, t0.elapsed().as_secs_f64())
-    });
-    for (label, dir) in &sv_dirs {
-        let Some(file) = model_file(dir) else {
-            println!("[462] 跳过 {label}：模型不在位");
-            continue;
-        };
-        let sv = sherpa_onnx::OfflineRecognizer::create(&sv_cfg(dir, file)).expect("SenseVoice");
-        let mut worst_ms = 0f64;
-        eval(label, &mut |seg: &[f32]| {
-            let mut ups = Vec::new();
-            let mut dec = 0f64;
-            let mut end = SIM_STEP.min(seg.len());
-            loop {
-                let t0 = Instant::now();
-                let s = sv.create_stream();
-                s.accept_waveform(16000, &seg[..end]);
-                sv.decode(&s);
-                let txt = s
-                    .get_result()
-                    .map(|r| r.text.trim().to_string())
-                    .unwrap_or_default();
-                let dt = t0.elapsed().as_secs_f64();
-                dec += dt;
-                worst_ms = worst_ms.max(dt * 1000.0);
-                // 出字时刻 = 已录音频末端 + 本次重解耗时
-                ups.push((end as f32 / RATE as f32 + dt as f32, txt));
-                if end >= seg.len() {
-                    break;
-                }
-                end = (end + SIM_STEP).min(seg.len());
-            }
-            (ups, dec)
-        });
-        // 长句：单次重解耗时随已录长度增长（连续说话不停顿时的最坏情况）
-        let long: Vec<f32> = segs_all
-            .iter()
-            .flat_map(|(_, s)| s.iter().flatten().copied())
-            .collect();
-        let mut long_txt = String::new();
-        for secs in [10usize, 20, 30] {
-            let n = (secs * RATE).min(long.len());
-            let t0 = Instant::now();
-            let s = sv.create_stream();
-            s.accept_waveform(16000, &long[..n]);
-            sv.decode(&s);
-            let _ = s.get_result();
-            long_txt.push_str(&format!(
-                " {secs}s→{:.0}ms",
-                t0.elapsed().as_secs_f64() * 1000.0
-            ));
-        }
-        println!("[462] {label} 单次刷新最慢 {worst_ms:.0}ms；长句单次重解{long_txt}");
-        worst_lines.push_str(&format!(
-            "\n- {label} 单次刷新最慢 {worst_ms:.0}ms；长句单次重解{long_txt}\n"
-        ));
-    }
-    let table = format!(
-        "\n## 预览对比\n\n| 模型 | 5 段 CER | 首字延迟 | 闪动率 | 稳定前缀·首字延迟 | 稳定前缀·闪动率 | CPU 实时率 |\n|---|---:|---:|---:|---:|---:|---:|\n{rows}"
-    );
-    print!("{table}");
-    report.push_str(&worst_lines);
-    report.push_str(&table);
-
-    // ③ 并发影响：后台线程按「实时」节奏持续跑预览负载，同时 1.7B 精解一批窗口，比精解耗时。
-    let acc = create_qwen3_recognizer(&models).expect("Qwen3 GGUF 须在位");
-    let terms = load_real_wordbook_terms();
-    let jobs: Vec<Vec<f32>> = segs_all
-        .iter()
-        .flat_map(|(_, s)| s.iter().cloned())
-        .take(40)
-        .collect();
-    let decode_all = |acc: &AccEngine| -> f64 {
-        let t0 = Instant::now();
-        for (i, a) in jobs.iter().enumerate() {
-            let inject = CtxInject {
-                terms: terms.as_deref(),
-                avg_chars_per_sec: None,
-                speech_ranges: None,
-                streaming_nonempty: false,
-                new_slice_from: 0,
-                assist: Default::default(),
-            };
-            let _ = transcribe_acc_ctx(acc, a, ChineseScript::Simplified, i, inject);
-        }
-        t0.elapsed().as_secs_f64()
-    };
-    let _ = decode_all(&acc); // 预热
-    let base = decode_all(&acc);
-    let mut crows = format!("| 无预览负载 | {base:.1}s | — |\n");
-    let feed: Vec<f32> = segs_all
-        .iter()
-        .flat_map(|(_, s)| s.iter().flatten().copied())
-        .collect();
-    // 现行流式：每 0.1s 喂一块（按实时节奏 sleep）
-    {
-        let stop = std::sync::atomic::AtomicBool::new(false);
-        let t = std::thread::scope(|sc| {
-            sc.spawn(|| {
-                let s = st_rec.create_stream();
-                for c in feed.chunks(1600).cycle() {
-                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
-                    }
-                    s.accept_waveform(RATE as i32, c);
-                    while st_rec.is_ready(&s) {
-                        st_rec.decode(&s);
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-            });
-            let t = decode_all(&acc);
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            t
-        });
-        crows.push_str(&format!(
-            "| 现行流式预览同时运行 | {t:.1}s | {:+.1}% |\n",
-            (t / base - 1.0) * 100.0
-        ));
-    }
-    for (label, dir) in &sv_dirs {
-        let Some(file) = model_file(dir) else {
-            continue;
-        };
-        let sv = sherpa_onnx::OfflineRecognizer::create(&sv_cfg(dir, file)).expect("SenseVoice");
-        let stop = std::sync::atomic::AtomicBool::new(false);
-        let t = std::thread::scope(|sc| {
-            sc.spawn(|| {
-                // 模拟流式：一句 8s，每 0.6s 重解已录前缀（按实时节奏），循环
-                let seg_len = 8 * RATE;
-                let mut off = 0usize;
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    let seg = &feed[off..(off + seg_len).min(feed.len())];
-                    let mut end = SIM_STEP;
-                    while end <= seg.len() && !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        let t0 = Instant::now();
-                        let s = sv.create_stream();
-                        s.accept_waveform(16000, &seg[..end]);
-                        sv.decode(&s);
-                        let _ = s.get_result();
-                        let spent = t0.elapsed();
-                        let step = std::time::Duration::from_millis(600);
-                        if spent < step {
-                            std::thread::sleep(step - spent);
-                        }
-                        end += SIM_STEP;
-                    }
-                    off = (off + seg_len) % feed.len().saturating_sub(seg_len).max(1);
-                }
-            });
-            let t = decode_all(&acc);
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            t
-        });
-        crows.push_str(&format!(
-            "| {label} 模拟流式同时运行 | {t:.1}s | {:+.1}% |\n",
-            (t / base - 1.0) * 100.0
-        ));
-    }
-    let ctable = format!(
-        "\n## 对精解（1.7B）的影响（{} 个语音段）\n\n| 后台负载 | 精解总耗时 | 相对无负载 |\n|---|---:|---:|\n{crows}",
-        jobs.len()
-    );
-    print!("{ctable}");
-    report.push_str(&ctable);
-    let out = root.join("collab/evidence/462/simstream462.md");
-    let _ = std::fs::create_dir_all(out.parent().unwrap());
-    std::fs::write(&out, report).unwrap();
 }

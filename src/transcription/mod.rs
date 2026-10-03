@@ -161,11 +161,11 @@ fn default_acc_num_threads() -> i32 {
 /// - QwenAudioOnline: 零本地 ASR 内存，DashScope Inference 协议（ASR-041-B）
 /// - Performance/Accuracy: 本地一次只加载一个模型；accuracy 不再预创建 CTC fallback
 /// - 🔴 LOCAL-RT-ENGINE-239-A（DEC-067）例外：`LocalRealtime` 档位**同时常驻两个本地模型**
-///   （online streaming paraformer 做预览 + offline accuracy 做 2pass 最终文本/热词），
+///   （SenseVoice 模拟流式做预览 + offline accuracy 做 2pass 最终文本/热词，STREAM-SV-463），
 ///   有意打破「本地一次只加载一个模型」。该档位为极客档、默认隐藏（DEC-065）。
 /// - H1 temperature 0.1 为 accuracy 唯一幻觉缓解（2026-07-08 Gavin 拍板下调 0.3→0.1，RESEARCH-ASR-ACCURACY-002 证实越低越好）；异常检测链已删除
 ///
-/// SAFETY: sherpa_onnx::OfflineRecognizer 与 sherpa_onnx::OnlineRecognizer 均内含
+/// SAFETY: sherpa_onnx::OfflineRecognizer（预览 / performance）与 llama.cpp 引擎均内含
 /// *const C++ 指针（!Send），但其 C++ 实现本身是线程安全的（create/decode/destroy
 /// 均可跨线程，只需保证同一 recognizer 实例不被并发访问）。
 /// 此处 Transcriber 通过 channel 在后台构建线程与 worker 线程间转移，
@@ -178,13 +178,12 @@ pub struct Transcriber {
     /// 本地离线引擎（Performance = SenseVoice / Accuracy 与 LocalRealtime = Qwen3；QwenAudioOnline 为 None）
     /// ACC-ENGINE-LLAMACPP-452：Qwen3 1.7B 由 sherpa-onnx 换为 llama.cpp，故拆成两种引擎。
     offline_recognizer: Option<OfflineEngine>,
-    /// LOCAL-RT-ENGINE-239-A（DEC-067）：本地**流式** recognizer（streaming paraformer trilingual）。
+    /// LOCAL-RT-ENGINE-239-A（DEC-067）/ STREAM-SV-463：本地实时**预览** recognizer
+    /// （SenseVoice 模拟流式，与 performance 档同一模型目录 [`SENSEVOICE_MODEL_SUBDIR`]）。
     ///
     /// 仅 `LocalRealtime` 档位用；与 `offline_recognizer`（accuracy，2pass 最终文本 + 热词）
     /// **并存常驻**，有意打破旧约束「本地模式一次只加载一个模型」（见结构体文档）。
-    ///
-    /// ⚠️ 阶段一：本单只落字段声明与 !Send 包装；构建接线与枚举变体见 239-A 第二阶段。
-    online_recognizer: Option<sherpa_onnx::OnlineRecognizer>,
+    preview_recognizer: Option<sherpa_onnx::OfflineRecognizer>,
     /// 当前注入的 hotwords 版本号（len + 内容哈希），用于感知词库变更
     hotwords_version: u64,
     /// VAD 分段器（仅 accuracy 长音频用）。
@@ -211,15 +210,15 @@ pub struct Transcriber {
     asr_online_semantic_punctuation_enabled: bool,
 }
 
-// SAFETY: Transcriber 持有的 OfflineRecognizer / OnlineRecognizer 内部均为 *const C++ 指针。
+// SAFETY: Transcriber 持有的 OfflineRecognizer（预览 / performance）内部为 *const C++ 指针。
 // 跨线程转移时，发送方在 send 后不再访问该实例，接收方独占所有权，
 // 满足"单一时刻单线程访问"约束。sherpa-onnx C++ 层本身支持跨线程调用。
-// LOCAL-RT-ENGINE-239-A: online_recognizer 与 offline_recognizer 共用本条 SAFETY 论证。
+// LOCAL-RT-ENGINE-239-A: preview_recognizer 与 offline_recognizer 共用本条 SAFETY 论证。
 unsafe impl Send for Transcriber {}
 
 /// PARALLEL-ACC-298：把 `&OfflineRecognizer` 送进 accuracy 并行 worker 线程的 Send 包装。
 ///
-/// 🔴 SAFETY 论证 = **对象独占**，不是「时间上不重叠」（本条与 `SendOnlineRecognizerRef`
+/// 🔴 SAFETY 论证 = **对象独占**，不是「时间上不重叠」（本条与 `SendPreviewRecognizerRef`
 /// 的论证**不同**：298 是**真并发**，streaming 线程与 accuracy worker 同时在跑，故
 /// 「scope 内串行、join 后才继续」那套时间论在此**不成立**，不得套用）。
 ///
@@ -241,7 +240,7 @@ pub struct SendOfflineRecognizerRef<'a>(pub &'a AccEngine);
 unsafe impl<'a> Send for SendOfflineRecognizerRef<'a> {}
 
 impl<'a> SendOfflineRecognizerRef<'a> {
-    /// 按值消费包装取出引用（同 `SendOnlineRecognizerRef`，破 Rust2021 disjoint capture）。
+    /// 按值消费包装取出引用（同 `SendPreviewRecognizerRef`，破 Rust2021 disjoint capture）。
     pub fn into_inner(self) -> &'a AccEngine {
         self.0
     }
@@ -1735,7 +1734,7 @@ impl Transcriber {
                 asr_language,
                 asr_model,
                 offline_recognizer: None,
-                online_recognizer: None,
+                preview_recognizer: None,
                 hotwords_version: 0,
                 vad_segmenter: OnceLock::from(None),
                 vad_model_dir: PathBuf::new(),
@@ -1751,7 +1750,7 @@ impl Transcriber {
         // 与 accuracy 不同：**不做静默降级**，任一模型缺失/加载失败即 Err（附则一），
         // 因为降级就是「用户以为用 A 实际跑 B」的不一致（ASR-UI-208 判定）。
         if asr_model == AsrModel::LocalRealtime {
-            let (online_recognizer, mut offline_recognizer, hotwords_version) =
+            let (preview_recognizer, mut offline_recognizer, hotwords_version) =
                 build_local_realtime_recognizers(model_dir, &asr_language, hotwords)?;
             // FORCED-ALIGN-456：本地实时挂强制对齐器（窗口接缝按逐字时间拼接）。
             offline_recognizer.attach_aligner(model_dir);
@@ -1760,14 +1759,14 @@ impl Transcriber {
             // LOCALRT-WARM-CACHE-450：首次录音首窗不再现场加载剪静音 VAD / 声纹提取器。
             warm_localrt_decode_helpers();
             log::info!(
-                "LocalRealtime: dual recognizers loaded (online streaming paraformer + offline accuracy)"
+                "LocalRealtime: dual recognizers loaded (preview SenseVoice + offline accuracy)"
             );
             return Ok(Self {
                 mode,
                 asr_language,
                 asr_model: AsrModel::LocalRealtime,
                 offline_recognizer: Some(OfflineEngine::Qwen3(offline_recognizer)),
-                online_recognizer: Some(online_recognizer),
+                preview_recognizer: Some(preview_recognizer),
                 hotwords_version,
                 vad_segmenter: OnceLock::new(),
                 vad_model_dir: model_dir.to_path_buf(),
@@ -1797,9 +1796,9 @@ impl Transcriber {
             asr_language,
             asr_model: effective_model,
             offline_recognizer: Some(offline_recognizer),
-            // LOCAL-RT-ENGINE-239-A（DEC-067）：仅 LocalRealtime 档并存流式 recognizer；
-            // Performance/Accuracy 无流式侧，在线档已在上面提前返回。
-            online_recognizer: None,
+            // LOCAL-RT-ENGINE-239-A（DEC-067）：仅 LocalRealtime 档并存预览 recognizer；
+            // Performance/Accuracy 无预览侧，在线档已在上面提前返回。
+            preview_recognizer: None,
             hotwords_version,
             vad_segmenter: OnceLock::from(vad_segmenter),
             vad_model_dir: PathBuf::new(),
@@ -1815,11 +1814,11 @@ impl Transcriber {
         self.asr_model
     }
 
-    /// LOCAL-RT-ENGINE-239-A（DEC-067）：取常驻的本地流式 recognizer（仅 `LocalRealtime` 档位为 `Some`）。
+    /// LOCAL-RT-ENGINE-239-A（DEC-067）：取常驻的本地预览 recognizer（仅 `LocalRealtime` 档位为 `Some`）。
     ///
     /// 供 239-B 接线 `local_stream::transcribe_streaming_local` 使用。
-    pub fn online_recognizer(&self) -> Option<&sherpa_onnx::OnlineRecognizer> {
-        self.online_recognizer.as_ref()
+    pub fn preview_recognizer(&self) -> Option<&sherpa_onnx::OfflineRecognizer> {
+        self.preview_recognizer.as_ref()
     }
 
     /// PARALLEL-ACC-298：取常驻的 accuracy offline recognizer（accuracy 引擎档位为 `Some`）。
@@ -3154,7 +3153,7 @@ fn build_local_realtime_recognizers(
     model_dir: &Path,
     _language: &str,
     hotwords: Option<&str>,
-) -> Result<(sherpa_onnx::OnlineRecognizer, AccEngine, u64)> {
+) -> Result<(sherpa_onnx::OfflineRecognizer, AccEngine, u64)> {
     let hotwords_version = match hotwords {
         Some(h) => {
             let count = h.split(',').filter(|s| !s.trim().is_empty()).count();
@@ -3166,13 +3165,13 @@ fn build_local_realtime_recognizers(
         None => 0,
     };
 
-    let online = local_stream::create_local_stream_recognizer(model_dir)
-        .context("LocalRealtime: 本地流式 (online) 模型缺失或加载失败")?;
+    let preview = local_stream::create_local_stream_recognizer(model_dir)
+        .context("LocalRealtime: 本地预览 (SenseVoice) 模型缺失或加载失败")?;
     // MIGRATE-QWEN3-320：offline（2pass 最终文本）即 accuracy=Qwen3（原 FunASR 已移除）。
     let offline = create_qwen3_recognizer(model_dir)
         .context("LocalRealtime: 本地 accuracy (offline, Qwen3) 模型缺失或加载失败")?;
 
-    Ok((online, offline, hotwords_version))
+    Ok((preview, offline, hotwords_version))
 }
 
 /// ASR-CTC-OPT-001 P2（已撤销）: 推导 ITN rule_fsts 路径（exe 同级 models/itn/itn_zh_number.fst）。
@@ -3198,8 +3197,12 @@ fn resolve_itn_fst_path(model_dir: &Path) -> Option<String> {
     }
 }
 
-/// Create SenseVoice Chinese recognizer (FunASR Nano CTC 兼容版，179MB)
-/// DEC-025 路线 A：默认 performance 模型
+/// Create SenseVoice recognizer —— performance 档模型。
+/// STREAM-SV-463（Gavin 2026-10-03「本地 performance 模型管线的模型也替换成……官方的 SenseVoice……
+/// 不用留两个版本」）：由 FunASR Nano 兼容版（2025-12-17）换成官方 SenseVoice-Small 2024-07-17，
+/// 与本地实时预览**同一份**（[`SENSEVOICE_MODEL_SUBDIR`]）。
+/// 🔴 `use_itn = false`：旧模型实际不吐标点、不转数字（ITN 开关对它无效）；官方模型开 ITN 会自带标点 +
+/// 阿拉伯数字（「七」→「7」对输入法有害，见下 P2）⇒ 关掉，输出形态与改前一致，标点 / 数字仍走产品自己的规则。
 ///
 /// ASR-CTC-OPT-001:
 /// - P1: silence head 由调用方 select_preprocessing_params 控制（本函数不涉及）
@@ -3219,7 +3222,7 @@ fn create_sensevoice_recognizer(
             sense_voice: OfflineSenseVoiceModelConfig {
                 model: Some(model_path.to_str().unwrap_or("").to_string()),
                 language: Some(language.to_string()),
-                use_itn: true,
+                use_itn: false,
             },
             tokens: Some(tokens_path.to_str().unwrap_or("").to_string()),
             ..Default::default()
@@ -3264,12 +3267,14 @@ fn create_qwen3_recognizer_at(model_dir_path: &Path) -> Result<AccEngine> {
     create_qwen3_recognizer(model_dir_path.parent().unwrap_or(model_dir_path))
 }
 
-/// Ensure SenseVoice (FunASR Nano CTC 兼容版，179MB) model is present
+/// STREAM-SV-463：SenseVoice 模型目录（performance 档 + 本地实时预览共用，全产品只留这一份）。
+/// 官方 SenseVoice-Small 2024-07-17（中英日韩粤），只需 `model.int8.onnx` + `tokens.txt`。
+pub(crate) const SENSEVOICE_MODEL_SUBDIR: &str =
+    "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17";
+
+/// Ensure SenseVoice model is present（[`SENSEVOICE_MODEL_SUBDIR`]）
 fn ensure_sensevoice_model(model_dir: &Path) -> Result<PathBuf> {
-    // FunASR Nano CTC 兼容版（179MB，2025-12-17）— DEC-025 路线 A 直换默认模型
-    // 模型文件名同为 model.int8.onnx + tokens.txt，沿用 OfflineSenseVoiceModelConfig
-    // 旧目录 sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09 保留作回滚
-    let model_dir_path = model_dir.join("sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17");
+    let model_dir_path = model_dir.join(SENSEVOICE_MODEL_SUBDIR);
 
     let model_file = model_dir_path.join("model.int8.onnx");
     let tokens_file = model_dir_path.join("tokens.txt");
@@ -3280,7 +3285,7 @@ fn ensure_sensevoice_model(model_dir: &Path) -> Result<PathBuf> {
     }
 
     anyhow::bail!(
-        "SenseVoice model not found at {:?}. Please download manually from:\n  https://huggingface.co/sherpa-onnx/sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17",
+        "SenseVoice model not found at {:?}. Please download manually from:\n  https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
         model_dir_path
     )
 }

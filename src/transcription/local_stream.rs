@@ -1,18 +1,22 @@
-//! LOCAL-RT-ENGINE-239-A / DEC-067：本地真流式 ASR（streaming paraformer trilingual）。
+//! LOCAL-RT-ENGINE-239-A / DEC-067 / STREAM-SV-463：本地实时预览 ASR。
 //!
 //! 与 [`crate::transcription::qwen_inference::transcribe_streaming_realtime`] **平行**的本地实现：
-//! 不走 WebSocket，直接把实时音频 chunk 喂给常驻的 [`sherpa_onnx::OnlineRecognizer`]。
+//! 不走 WebSocket，直接处理实时音频 chunk。
 //!
-//! 设计要点（对齐主控方案）：
-//! - 复用 [`qwen_inference::StreamingAsrState`] 做「确认句 + 当前句」状态机，
-//!   把 sherpa 的 `is_endpoint()` 映射为 `sentence_end = true`，**不另写状态机**。
-//! - 回调签名与 qwen 路径同构：`on_result(&display_text, &display_words)`。
-//! - 每次 `get_result()` 文本变化才回调（与 qwen 路径「空包不转发」同向），避免无谓刷新。
+//! STREAM-SV-463（Gavin 2026-10-03「好，那替换吧」，DEC-100）：预览模型由三语流式 paraformer
+//! （不支持日韩）换成官方 SenseVoice-Small 2024-07-17（中英日韩粤）**模拟流式** ——
+//! 说话中每 [`SIM_STEP_MS`] 把「当前句」整段重解一次（非流式模型，靠重解出增量）。
+//! - 当前句 = `pcm[sim_start..]`；句首静音不入窗（开口前只留 [`ONGOING_ONSET_MARGIN`]）。
+//! - 🔴 **每个派发点都是冻结点**：派发前当前句结果确认进显示缓存、此后不再改写 ——
+//!   下游按「字符坐标」回灌（325/337/438/442）的前提是派发点之前的预览文字不变。
+//!   另两处冻结：句末静默 [`SIM_SENTENCE_END_MS`]（精解关闭时的切句）、窗口硬上限 [`SIM_WINDOW_MAX_MS`]。
+//! - 预览末尾「相邻两次重解不一致」的字报给显示层画浅色（`on_result` 第三参），已定的字正常色。
+//!
+//! 其余设计（对齐主控方案）：
+//! - 复用 [`qwen_inference::StreamingAsrState`] 做「确认句 + 当前句」状态机，**不另写状态机**。
+//! - 文本或浅色尾巴变化才回调，避免无谓刷新。
 //! - 返回 `(final_text, pcm)`：`pcm` 为本次全部音频（16kHz f32），供 2pass 离线纠错复用。
 //! - `cancel_signal` 置位即提前收尾（`Relaxed` 读，与 qwen 路径同款）。
-//!
-//! 端点语义：paraformer streaming 在一次 endpoint 后需 `reset()` 才能开始下一句；
-//! reset 后 `get_result()` 从空串重新累积，与 `StreamingAsrState` 的句切换天然对齐。
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -20,67 +24,129 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use sherpa_onnx::{OnlineParaformerModelConfig, OnlineRecognizer, OnlineRecognizerConfig};
+use sherpa_onnx::{
+    OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineSenseVoiceModelConfig,
+};
 
 use super::qwen_inference::{StreamingAsrState, WordTiming};
 use super::vad::{VadSegmenter, LOCALRT_VAD_MIN_SILENCE_SECS};
 use crate::punctuation::{strip_trailing_punctuation, PunctuationEngine};
 
-/// 本地流式 recognizer 采样率（streaming paraformer trilingual 固定 16kHz 单声道）。
+/// 本地预览采样率（SenseVoice 固定 16kHz 单声道）。
 const SAMPLE_RATE: i32 = 16000;
 
-/// LOCAL-RT-ENGINE-239-B：把 `&OnlineRecognizer` 送进 ASR 工作线程的 Send 包装。
+/// LOCAL-RT-ENGINE-239-B：把预览 recognizer 引用送进 ASR 工作线程的 Send 包装。
 ///
-/// SAFETY：与 `Transcriber` 的 `unsafe impl Send` 同源论证——sherpa-onnx C++ OnlineRecognizer
+/// SAFETY：与 `Transcriber` 的 `unsafe impl Send` 同源论证——sherpa-onnx C++ recognizer
 /// 的 create/decode/destroy 可在不同线程调用，只需保证**同一实例不被并发访问**。
 /// 本包装仅在 `std::thread::scope` 内把引用 move 给 ASR 线程；该线程运行期间，持有者
 /// （worker 线程）阻塞在 `record_streaming`，不触碰 recognizer；ASR 线程 join 之后才继续
 /// 使用（run_pipeline_core 走 offline_recognizer，对象不同且串行）。故无并发访问。
-pub struct SendOnlineRecognizerRef<'a>(pub &'a OnlineRecognizer);
-unsafe impl<'a> Send for SendOnlineRecognizerRef<'a> {}
+pub struct SendPreviewRecognizerRef<'a>(pub &'a OfflineRecognizer);
+unsafe impl<'a> Send for SendPreviewRecognizerRef<'a> {}
 
-impl<'a> SendOnlineRecognizerRef<'a> {
+impl<'a> SendPreviewRecognizerRef<'a> {
     /// 取出内部引用。**按值消费包装**，使跨线程闭包必须捕获整个 Send 包装
     /// （Rust 2021 disjoint capture 下若直接取 `.0` 字段会退化为捕获裸引用，
     /// 绕过 `unsafe impl Send`，故以方法消费强制整体捕获）。
-    pub fn into_inner(self) -> &'a OnlineRecognizer {
+    pub fn into_inner(self) -> &'a OfflineRecognizer {
         self.0
     }
 }
 
-/// 流式解码线程数：**按运行机器的 CPU 核数取，不写死**，**封顶 4**（Gavin 2026-09-25 定）。
+/// STREAM-SV-463：预览解码线程数 = **本机物理核数**（Gavin 2026-10-03「开成跟现在 CPU 内核数一样」）。
 ///
-/// 🔴 Gavin 2026-09-25：「预览和精确识别两边抢 CPU……将预览的线程调为 4」。
-/// 根因（RT-PERF-AUDIT-403 F-F-01）：流式与精解线程各 `min(核, 8)` 并发争用。预览（流式）
-/// 实时性优先、且其模型远小于精解模型，故**预览侧封顶 4**，把余下核让给精解侧。
+/// 实测（`poc462_simstream`，7840HS 8 核 16 线程，证据 `collab/evidence/463/simstream463.md`）：
+/// 单次重解最慢 1 线程 407ms / **8 线程 173ms** / 16 线程 190ms，20s 长句 910 / **329** / 437ms ——
+/// 物理核最快，超线程反而变慢，故取物理核不取逻辑核。
 ///
-/// 口径：`available_parallelism().min(4)`，取不到时回落 4（核数不足 4 的机器不超订）。
-/// 🔴 **与 accuracy 侧 `default_acc_num_threads()`（`min(8)`）刻意不再同口径** ——
-/// 见本文件 `stream_num_threads_follows_machine_cores_and_caps_at_4` 用例。
-///
-/// 沿革：POC-LOCAL-STREAM-235 定 4（独占运行前提）→ TUNE-STREAM-317 加 env → Gavin 提到 8
-/// ⇒ 按核数动态取（`min(8)`）→ **本单改回封顶 4** 并删 env（开发端与用户端行为必须一致）。
+/// 沿革：paraformer 时代按 `available_parallelism().min(4)`（Gavin 2026-09-25 封顶 4，
+/// LOCALRT-STREAM-THREADS-417）；换 SenseVoice 后由 Gavin 改为跟核数一致。
 fn local_stream_num_threads() -> i32 {
+    physical_core_count() as i32
+}
+
+/// STREAM-SV-463：本机物理核数；系统查询失败 ⇒ 回落逻辑核数（再失败 ⇒ 4）。
+fn physical_core_count() -> usize {
+    #[cfg(target_os = "windows")]
+    if let Some(n) = win_physical_cores() {
+        return n;
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(n) = mac_physical_cores() {
+        return n;
+    }
     std::thread::available_parallelism()
-        .map(|n| n.get().min(4) as i32)
+        .map(|n| n.get())
         .unwrap_or(4)
 }
 
-// 🔴 TUNE-STREAM-317 / TEST-SWEEP-319：`blank_penalty` 对本模型**完全无效**，已撤。
-// 实测（tester-1，证据 collab/evidence/20260921-sweep319-blankpenalty/）：
-// 0 / -0.5 / -1.0 / -1.5 / +0.5 五档输出**逐字节相同**，追加极端值 ±100 仍逐字节相同；
-// 且已用临时 println 自证 env 确实被应用 ⇒ 不是没传进去，是流式 paraformer 路径不消费该字段。
-// 属 [PROVIDER-SILENT-FALLBACK-001] 同族：参数收下、静默不生效。
-// **不要再加回来**；要改流式的吐字倾向，得换别的机制。
+/// Windows：`GetLogicalProcessorInformationEx(RelationProcessorCore)` 每条记录 = 一个物理核。
+#[cfg(target_os = "windows")]
+fn win_physical_cores() -> Option<usize> {
+    use windows::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationProcessorCore,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+    let mut len = 0u32;
+    // 第一次调用只取所需缓冲长度（必然报 ERROR_INSUFFICIENT_BUFFER，忽略）。
+    unsafe {
+        let _ = GetLogicalProcessorInformationEx(RelationProcessorCore, None, &mut len);
+    }
+    if len == 0 {
+        return None;
+    }
+    // u64 缓冲保证 8 字节对齐；记录头按字节读（Relationship u32 + Size u32）。
+    let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+    unsafe {
+        GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            Some(buf.as_mut_ptr() as *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX),
+            &mut len,
+        )
+        .ok()?;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, len as usize) };
+    let (mut off, mut n) = (0usize, 0usize);
+    while off + 8 <= bytes.len() {
+        let size = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().ok()?) as usize;
+        if size == 0 {
+            break;
+        }
+        n += 1;
+        off += size;
+    }
+    (n > 0).then_some(n)
+}
 
-/// LOCAL-RT-ENGINE-239-A（DEC-067）：端点检测参数。
-///
-/// `rule1=2.4` / `rule3=20.0` 取 sherpa 默认；🔴 `rule2=2.0` 对齐 ASR-SEG-229
-/// 定的在线档 `asr_online_max_sentence_silence=2000ms` —— 官方默认 1.2 太激进，
-/// 会重现「说话稍一停顿就被判句尾、输出切碎」的端测缺陷，**勿改回 1.2**。
-const LOCAL_STREAM_RULE1_MIN_TRAILING_SILENCE: f32 = 2.4;
-const LOCAL_STREAM_RULE2_MIN_TRAILING_SILENCE: f32 = 2.0;
-const LOCAL_STREAM_RULE3_MIN_UTTERANCE_LENGTH: f32 = 20.0;
+/// macOS：`sysctlbyname("hw.physicalcpu")`。
+#[cfg(target_os = "macos")]
+fn mac_physical_cores() -> Option<usize> {
+    let mut v: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    let r = unsafe {
+        libc::sysctlbyname(
+            c"hw.physicalcpu".as_ptr(),
+            &mut v as *mut libc::c_int as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (r == 0 && v > 0).then_some(v as usize)
+}
+
+/// STREAM-SV-463：说话中重解当前句的间隔（原型测定 0.6s：首字 0.43s、单核约 0.2 实时率）。
+const SIM_STEP_MS: f32 = 600.0;
+/// STREAM-SV-463：开口后首次重解的等待（实时 VAD 判出开口比真实起点晚约 0.1s ⇒ 首解约在开口后 0.4s，
+/// 与原型「段起点 0.6s 首解、段起点含 0.2s 前留白」同口径）。
+const SIM_FIRST_MS: f32 = 300.0;
+/// STREAM-SV-463：句末冻结 —— 当前句有人声且其后连续无人声（VAD）达此时长。
+/// 精解开启时派发（静默 1200ms）先冻结，本条只在精解关闭时起作用；取原 rule2=2.0s 同值（ASR-SEG-229）。
+const SIM_SENTENCE_END_MS: f32 = 2000.0;
+/// STREAM-SV-463：重解窗口硬上限。精解开启时 442 回看最晚 12s 切片（切片即冻结），本条是兜底：
+/// 单次重解随长度超线性增长（8 线程 20s 329ms、30s 592ms），超过此长度在上次重解覆盖处冻结。
+const SIM_WINDOW_MAX_MS: f32 = 15000.0;
 
 /// PREVIEW-PUNCT-LIVE-438：预览打点的**间隔**阈值（Gavin 2026-09-26 拍板 3.5s）。
 ///
@@ -359,8 +425,11 @@ const LONG_SPEECH_LOOKBACK_UPPER_MS: f32 = 11000.0;
 const LONG_SPEECH_FALLBACK_MS: f32 = 12000.0;
 /// DISPATCH-LONG-SPEECH-442：回看判定节流（每 200ms 一次）。
 const LONG_SPEECH_CHECK_EVERY_MS: f32 = 200.0;
-/// DISPATCH-LONG-SPEECH-442：回看切点对应的流式文字 = 切点后此时长那一刻的显示（流式滞后补偿）。
-const LONG_SPEECH_TEXT_LAG_MS: f32 = 400.0;
+/// DISPATCH-LONG-SPEECH-442：回看切点对应的流式文字 = 切点后此时长那一刻的显示。
+/// STREAM-SV-463：paraformer 时代 400ms 是「吐字滞后」补偿；模拟流式每次重解覆盖到重解时刻、无吐字滞后，
+/// 改取半个重解步长（300ms）⇒ 选中的那次结果覆盖到切点前后各至多 0.3s，两侧误差对称
+///（误差只在精解回灌前短暂可见：回灌按 committed_len 替换前半，后半由新句重解）。
+const LONG_SPEECH_TEXT_LAG_MS: f32 = 300.0;
 
 /// FIX-LATE-STREAM-TAIL-445：冻结边界后「迟到字」跟踪的一步（**纯函数**）。
 ///
@@ -426,6 +495,9 @@ struct PunctPreviewCache {
     /// `prefix` 覆盖的原始字节长度（raw 的合法 char 边界）。
     /// 🔴 PUNCT-349：同时充当「是否打过点」的判据 —— `raw_full.len() > raw_len` 即「有新内容」。
     raw_len: usize,
+    /// STREAM-SV-463：`prefix` 覆盖的裸文本原文（= raw[..raw_len] 打点当刻的内容）。
+    /// 模拟流式会改写当前句 ⇒ 复用前必须核对它没变（[`punct_cache_view`]），否则会显示改写前的旧字。
+    raw: String,
 }
 
 /// PREVIEW-PUNCT-LIVE-438：预览打点是否触发 —— **距上次打点 ≥ 间隔 + 有新内容**。
@@ -469,19 +541,14 @@ fn preview_display(
     let Some(engine) = engine else {
         return raw_full.to_string();
     };
-    // 有新内容才打：raw 单调增长（greedy 0 回退），长度增长即新内容。
-    let has_new = raw_full.len() > cache.raw_len;
+    // 有新内容才打。STREAM-SV-463：模拟流式会改写当前句（长度不变也可能字变了）⇒ 按「与上次打点时
+    // 的裸文本不同」判（只追加时与原「变长」口径等价）。
+    let has_new = raw_full != cache.raw;
     // 尾巴起点夹紧到当前 raw 内，并要求 char 边界（raw 经 endpoint 确认可能变短再长，
     // 历史字节位置不保证仍是当前串的合法切点；不合法就本帧不打，复用路径原样显示，下周期恢复）。
     let tail_start = tail_start.min(raw_full.len());
     if force && has_new && tail_start < raw_full.len() && raw_full.is_char_boundary(tail_start) {
-        let head = punct_head(
-            &cache.prefix,
-            raw_full,
-            cache.raw_len,
-            tail_start,
-            head_chars,
-        );
+        let head = punct_head(&cache.prefix, raw_full, &cache.raw, tail_start, head_chars);
         let t = Instant::now();
         let tail = engine
             .add_punctuation(&raw_full[tail_start..])
@@ -489,6 +556,7 @@ fn preview_display(
         // PUNCT-349 防复发：句末终止符不进缓存（句中标点照旧保留）。
         cache.prefix = build_punct_prefix(&head, &tail);
         cache.raw_len = raw_full.len();
+        cache.raw = raw_full.to_string();
         log::debug!(
             "LOCALRT-PUNCT-LIVE-438: repunctuated tail {} chars (head={} chars) in {:.1}ms",
             raw_full[tail_start..].chars().count(),
@@ -504,7 +572,24 @@ fn preview_display(
     //    （`core::str::slice_error_fail`，BUILD-341 端测 crash.json）。
     //    原注释「raw 单调增长（greedy 0 回退）」只对**同一个串**成立，切串就不成立。
     // ⇒ 复用 `punct_cache_reuse`（内含 `is_char_boundary` O(1) 守卫）；不是字符边界就整串原样返回。
-    punct_cache_reuse(&cache.prefix, raw_full, cache.raw_len)
+    // STREAM-SV-463：复用前先核对缓存覆盖的裸文本没被改写（`punct_cache_view`）。
+    punct_cache_view(&cache.prefix, &cache.raw, raw_full)
+}
+
+/// STREAM-SV-463：标点缓存的**校验复用** —— 模拟流式会改写当前句，缓存覆盖的裸文本 `cache_raw` 可能已变：
+/// - 未变（`raw` 以它开头）⇒ 原 344 边界安全拼法 [`punct_cache_reuse`]；
+/// - 变了 ⇒ 只保留与当前裸文本**公共前缀**那段的标点文本，其后接当前裸文本（下次 3.5s 打点再补标点）。
+///
+/// 冻结区（已派发、此后不再改写）恒在公共前缀内 ⇒ 冻结前缀逐字节不变（438 R1 不受影响）。
+fn punct_cache_view(prefix: &str, cache_raw: &str, raw: &str) -> String {
+    if raw.starts_with(cache_raw) {
+        return punct_cache_reuse(prefix, raw, cache_raw.len());
+    }
+    let common = stable_prefix_bytes(cache_raw, raw);
+    let keep = display_chars_for_raw_prefix(prefix, cache_raw, common);
+    let mut s = char_prefix(prefix, keep);
+    s.push_str(&raw[common..]);
+    s
 }
 
 /// LOCALRT-CHARBOUNDARY-344：标点缓存复用的**边界安全**实现（纯函数，便于回归采样）。
@@ -527,10 +612,10 @@ fn punct_cache_reuse(prefix: &str, raw: &str, raw_len: usize) -> String {
 
 /// PREVIEW-PUNCT-LIVE-438（R1）：重打时的**冻结前缀** —— 覆盖 `raw[..tail_start]` 的已显示文本。
 ///
-/// - `tail_start >= cache_raw_len`（常态：缓存前缀只覆盖到上次打点位置）：前缀续上
-///   `raw[cache_raw_len..tail_start]` 的逐字尾巴即为冻结前缀（复用 `punct_cache_reuse` 的
-///   边界安全拼法；前缀为空时退化为裸文本前缀，与「尚未打过点」口径一致）。
-/// - `tail_start < cache_raw_len`（上次打点发生在最近一次派发**之后**）：此时缓存前缀 =
+/// - `tail_start >= cache_raw.len()`（常态：缓存前缀只覆盖到上次打点位置）：前缀续上
+///   `raw[cache_raw.len()..tail_start]` 的逐字尾巴即为冻结前缀（经 `punct_cache_view` 校验后拼；
+///   前缀为空时退化为裸文本前缀，与「尚未打过点」口径一致）。
+/// - `tail_start < cache_raw.len()`（上次打点发生在最近一次派发**之后**）：此时缓存前缀 =
 ///   冻结前缀（`head_chars` 字符）+ 其后的尾巴标点 ⇒ 按**字符**截出冻结前缀
 ///   （越界则整段保留，绝不切裂）。
 ///
@@ -539,13 +624,14 @@ fn punct_cache_reuse(prefix: &str, raw: &str, raw_len: usize) -> String {
 fn punct_head(
     prefix: &str,
     raw: &str,
-    cache_raw_len: usize,
+    cache_raw: &str,
     tail_start: usize,
     head_chars: usize,
 ) -> String {
     debug_assert!(raw.is_char_boundary(tail_start));
-    if tail_start >= cache_raw_len {
-        punct_cache_reuse(prefix, &raw[..tail_start], cache_raw_len)
+    if tail_start >= cache_raw.len() {
+        // STREAM-SV-463：缓存打在派发之前、所覆盖的字可能在冻结前被改写 ⇒ 校验后再拼。
+        punct_cache_view(prefix, cache_raw, &raw[..tail_start])
     } else {
         char_prefix(prefix, head_chars)
     }
@@ -606,60 +692,146 @@ impl DisplayCache {
     fn text(&self) -> &str {
         &self.buf
     }
+    /// STREAM-SV-463：已确认区（冻结、此后不再改写的部分）。
+    fn confirmed(&self) -> &str {
+        &self.buf[..self.confirmed_bytes]
+    }
 }
 
-/// LOCAL-RT-ENGINE-239-A：构建本地流式 paraformer recognizer（greedy_search）。
+/// STREAM-SV-463：构建本地实时预览 recognizer = 官方 SenseVoice-Small 2024-07-17（模拟流式用）。
 ///
-/// 模型目录（DEC-011，exe 同级 models）：`sherpa-onnx-streaming-paraformer-trilingual-zh-cantonese-en/`，
-/// 用 `encoder.int8.onnx` + `decoder.int8.onnx` + `tokens.txt`。
+/// 模型目录（DEC-011，exe 同级 models）：[`super::SENSEVOICE_MODEL_SUBDIR`]（与 performance 档**同一份**，
+/// Gavin 2026-10-03「不用留两个版本」），用 `model.int8.onnx` + `tokens.txt`。
+/// - `language = auto`：中英日韩粤自动判；`use_itn = false`：只要裸文本（标点 / 数字仍走产品自己的规则，
+///   406 比对 / 精解草稿的口径与改前一致）。
+/// - 线程数 = 物理核数（[`local_stream_num_threads`]）。
 ///
 /// 🔴 任一模型文件缺失 ⇒ `Err`（DEC-067 附则一：不降级，整档不可用）。
-pub fn create_local_stream_recognizer(model_dir: &Path) -> Result<OnlineRecognizer> {
-    let dir = model_dir.join("sherpa-onnx-streaming-paraformer-trilingual-zh-cantonese-en");
-    let enc = dir.join("encoder.int8.onnx");
-    let dec = dir.join("decoder.int8.onnx");
+pub fn create_local_stream_recognizer(model_dir: &Path) -> Result<OfflineRecognizer> {
+    let dir = model_dir.join(super::SENSEVOICE_MODEL_SUBDIR);
+    let model = dir.join("model.int8.onnx");
     let tok = dir.join("tokens.txt");
-    for p in [&enc, &dec, &tok] {
+    for p in [&model, &tok] {
         if !p.exists() {
-            anyhow::bail!("本地流式模型文件缺失: {}", p.display());
+            anyhow::bail!("本地预览模型文件缺失: {}", p.display());
         }
     }
-
-    let mut c = OnlineRecognizerConfig::default();
-    c.model_config.paraformer = OnlineParaformerModelConfig {
-        encoder: Some(enc.to_string_lossy().to_string()),
-        decoder: Some(dec.to_string_lossy().to_string()),
-    };
-    c.model_config.tokens = Some(tok.to_string_lossy().to_string());
-    // LOCALRT-STREAM-THREADS-417：线程数按核数取、**封顶 4**（Gavin 2026-09-25；沿革见常量处）。无 env 覆盖。
     let num_threads = local_stream_num_threads();
-    c.model_config.num_threads = num_threads;
-    c.model_config.provider = Some("cpu".to_string());
-    c.model_config.debug = false;
-    // DEC-067：本地预览用 greedy_search（streaming paraformer 仅支持 greedy）
-    c.decoding_method = Some("greedy_search".to_string());
-    // 端点：不开则 is_endpoint() 永不触发，sentence_end 分支成死代码
-    c.enable_endpoint = true;
-    // LOCALRT-ENDPOINT-284：rule2 已定案为 2.0（ASR-SEG-229 防复发值）。
-    // 原实验用的 env `LOCAL_RT_RULE2` 按「定案后移除」的约定已删除。
-    let rule2 = LOCAL_STREAM_RULE2_MIN_TRAILING_SILENCE;
-    c.rule1_min_trailing_silence = LOCAL_STREAM_RULE1_MIN_TRAILING_SILENCE;
-    c.rule2_min_trailing_silence = rule2;
-    c.rule3_min_utterance_length = LOCAL_STREAM_RULE3_MIN_UTTERANCE_LENGTH;
+    let c = OfflineRecognizerConfig {
+        model_config: OfflineModelConfig {
+            sense_voice: OfflineSenseVoiceModelConfig {
+                model: Some(model.to_string_lossy().to_string()),
+                language: Some("auto".to_string()),
+                use_itn: false,
+            },
+            tokens: Some(tok.to_string_lossy().to_string()),
+            num_threads,
+            provider: Some("cpu".to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     log::debug!(
-        "[LocalRT-DBG-284] rule1={} rule2={} rule3={}",
-        LOCAL_STREAM_RULE1_MIN_TRAILING_SILENCE,
-        rule2,
-        LOCAL_STREAM_RULE3_MIN_UTTERANCE_LENGTH
-    );
-    // TUNE-STREAM-317：启动打三个调优点的**实际取值**，供端测对账。
-    // 第三项 HomophoneReplacer 本单定性为「不做」（rule_fsts 需预编译 FST，见 result），固定 off。
-    log::debug!(
-        "[LocalRT-DBG-317] stream tuning: num_threads={} homophone_replacer=off provider=cpu decoding=greedy_search endpoint=true",
+        "[STREAM-SV-463] preview model: sensevoice num_threads={} step_ms={} provider=cpu",
         num_threads,
+        SIM_STEP_MS
     );
+    OfflineRecognizer::create(&c).context("创建本地预览 (SenseVoice) recognizer 失败")
+}
 
-    OnlineRecognizer::create(&c).context("创建本地流式 (paraformer) recognizer 失败")
+/// STREAM-SV-463：模拟流式的一次重解 —— 把当前句音频整段送 SenseVoice，取裸文本。
+/// 回放测试用（与生产同一解码，流式原文口径一致）。
+#[allow(dead_code)]
+pub(crate) fn preview_decode(recognizer: &OfflineRecognizer, audio: &[f32]) -> String {
+    preview_decode_timed(recognizer, audio).0
+}
+
+/// STREAM-SV-463：同 [`preview_decode`]，另给逐 token 的 `(起始秒, 该 token 在文本里的结束字节)`。
+/// 时间戳对不上文本（模型未给 / 拼写规则不同）⇒ 空表，调用方回退旧口径。
+fn preview_decode_timed(
+    recognizer: &OfflineRecognizer,
+    audio: &[f32],
+) -> (String, Vec<(f32, usize)>) {
+    if audio.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let s = recognizer.create_stream();
+    s.accept_waveform(SAMPLE_RATE, audio);
+    recognizer.decode(&s);
+    let Some(r) = s.get_result() else {
+        return (String::new(), Vec::new());
+    };
+    let text = r.text.trim().to_string();
+    let marks = match &r.timestamps {
+        Some(ts) if ts.len() == r.tokens.len() => token_text_ends(&text, &r.tokens, ts),
+        _ => Vec::new(),
+    };
+    (text, marks)
+}
+
+/// STREAM-SV-463：把 token 顺序对到文本上，得每个 token 的结束字节。SentencePiece 的词首 `▁` 记作空格；
+/// 任何一个对不上（间隔超过一个空格）⇒ 整体放弃（空表），绝不给出错位的切点。
+fn token_text_ends(text: &str, tokens: &[String], ts: &[f32]) -> Vec<(f32, usize)> {
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut pos = 0usize;
+    for (tok, &t) in tokens.iter().zip(ts) {
+        let piece = tok.replace('\u{2581}', " ");
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        match text[pos..].find(piece) {
+            Some(off) if text[pos..pos + off].trim().is_empty() && off <= 1 => {
+                pos += off + piece.len();
+                out.push((t, pos));
+            }
+            _ => return Vec::new(),
+        }
+    }
+    out
+}
+
+/// STREAM-SV-463：按切点时间切分当前句结果 —— 起始时刻早于 `cut_secs` 的 token 归前半，返回前半结束字节。
+/// 无时间戳 ⇒ `None`（调用方回退「切点那一刻的文字长度」旧口径）。
+fn split_bytes_at_time(marks: &[(f32, usize)], cut_secs: f32) -> Option<usize> {
+    if marks.is_empty() {
+        return None;
+    }
+    Some(
+        marks
+            .iter()
+            .take_while(|(t, _)| *t < cut_secs)
+            .last()
+            .map(|&(_, end)| end)
+            .unwrap_or(0),
+    )
+}
+
+/// STREAM-SV-463：两次重解结果的公共前缀字节长（落在 char 边界）——显示层「已定」的部分。
+fn stable_prefix_bytes(prev: &str, cur: &str) -> usize {
+    prev.char_indices()
+        .zip(cur.chars())
+        .take_while(|((_, a), b)| a == b)
+        .last()
+        .map(|((i, a), _)| i + a.len_utf8())
+        .unwrap_or(0)
+}
+
+/// STREAM-SV-463：新句文本接在已确认文本后是否要补空格（两边都是拉丁字母 / 数字 ⇒ 英文单词不粘连）。
+fn sentence_join_space(confirmed: &str, next: &str) -> bool {
+    matches!(
+        (confirmed.chars().next_back(), next.chars().next()),
+        (Some(a), Some(b)) if a.is_ascii_alphanumeric() && b.is_ascii_alphanumeric()
+    )
+}
+
+/// STREAM-SV-463：`s` 中不超过 `bytes` 的最大 char 边界。
+fn floor_char_boundary(s: &str, bytes: usize) -> usize {
+    let mut b = bytes.min(s.len());
+    while !s.is_char_boundary(b) {
+        b -= 1;
+    }
+    b
 }
 
 /// LOCALRT-REFLOW-HOLE-344-G：取「第 i 片对应的流式文本」——
@@ -669,32 +841,6 @@ pub fn create_local_stream_recognizer(model_dir: &Path) -> Result<OnlineRecogniz
 /// 见 LOCALRT-CHARBOUNDARY-344）。`chars().skip(n).collect()` 天然字符安全。
 fn segment_streaming_text(display: &str, prev_committed: usize) -> String {
     display.chars().skip(prev_committed).collect()
-}
-
-/// LOCALRT-ENDPOINT-EMPTY-342：endpoint 分支的确认决策（纯函数，便于钉死 §判据）。
-///
-/// 触发场景：主 stream 换流后只喂了静音，2s 后 rule2 又给出一个 endpoint —— 这是
-/// **静音流上的假 endpoint**，不是真正的句子边界。判据「本句自上次 endpoint 是否有声」
-/// 复用现有能量口径（`chunk_rms > silence_threshold`），此处只做纯逻辑映射。
-#[derive(Debug, PartialEq, Eq)]
-enum EndpointAction {
-    /// 真 endpoint + 有确认文本：正常确认本句。
-    Confirm,
-    /// 真 endpoint 但三方全空：只记日志，不确认（原行为）。
-    Empty,
-    /// 假 endpoint（静音段）：不确认、不推进 `sentence_id` / `sentence_pcm_start`、
-    /// 静音流文本一律丢弃（幻字抑制，F3）。
-    SuppressSilence,
-}
-
-fn endpoint_action(segment_has_speech: bool, confirm_text_empty: bool) -> EndpointAction {
-    if !segment_has_speech {
-        EndpointAction::SuppressSilence
-    } else if confirm_text_empty {
-        EndpointAction::Empty
-    } else {
-        EndpointAction::Confirm
-    }
 }
 
 /// FIX-SLICE-CUT-AT-GAP-381：滑窗（accuracy 派发）路径的片构建 —— 超限片按**字缝**切。
@@ -755,63 +901,8 @@ fn slice_ranges_from_timeline(
         .collect()
 }
 
-// PHANTOM-406-459 ①：测试专用开关——对照「不剥幻字」的旧行为。生产构建里 `cfg!(test)` 恒 false ⇒ 恒剥。
-// 🔴 此处不写 cfg-test 属性：本文件多个源码护栏以「首个 cfg-test 属性」为生产区终点。
-thread_local! {
-    pub(crate) static TEST_NO_PHANTOM_STRIP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-fn phantom_strip_enabled() -> bool {
-    !(cfg!(test) && TEST_NO_PHANTOM_STRIP.with(|c| c.get()))
-}
-
-fn is_punct_or_space(c: char) -> bool {
-    c.is_whitespace() || c.is_ascii_punctuation() || "，。！？、；：…—·“”‘’（）《》【】".contains(c)
-}
-
-/// PHANTOM-406-459 ①：从派发片流式文本开头剥掉静音幻字 `phantom`。逐字比对（跳过标点 / 空白），
-/// **只有幻字整段原样出现在开头才剥**（连同其后紧跟的标点）；模型开口后改写过的不剥 ⇒ 最坏少剥，绝不多剥真话。
-fn strip_phantom_prefix(text: &str, phantom: &str) -> String {
-    let ph: Vec<char> = phantom.chars().filter(|&c| !is_punct_or_space(c)).collect();
-    if ph.is_empty() {
-        return text.to_string();
-    }
-    let mut k = 0usize;
-    for (i, c) in text.char_indices() {
-        if is_punct_or_space(c) {
-            continue;
-        }
-        if c != ph[k] {
-            return text.to_string();
-        }
-        k += 1;
-        if k == ph.len() {
-            return text[i + c.len_utf8()..]
-                .trim_start_matches(is_punct_or_space)
-                .to_string();
-        }
-    }
-    text.to_string()
-}
-
-/// 派发时取用一次：有待剥幻字 ⇒ 剥掉并清空（只作用于开口后的第一个派发片）。
-fn take_phantom_prefix(phantom: &mut String, seg_streaming: String) -> String {
-    if phantom.is_empty() {
-        return seg_streaming;
-    }
-    let p = std::mem::take(phantom);
-    if !phantom_strip_enabled() {
-        return seg_streaming;
-    }
-    let out = strip_phantom_prefix(&seg_streaming, &p);
-    if out != seg_streaming && log::log_enabled!(log::Level::Debug) {
-        log::debug!(
-            "[PHANTOM-459] stripped silence-born text '{}' from dispatched slice",
-            p
-        );
-    }
-    out
-}
+// STREAM-SV-463：PHANTOM-406-459 ①（剥派发片开头的静音幻字）随 paraformer 一并移除 —— 模拟流式只在
+// 当前句**听到人声后**才重解、且句首静音不入窗，结构上不再有「静音里吐出的字」（DEC-077 不留死代码）。
 
 /// VAD-REUSE-458：实时 VAD 判出「开始说话」比真实起点晚（silero 需连续 ≥0.1s 语音、窗口 32ms）⇒
 /// 进行中段起点按判定位置往前留 0.5s 余量（其后剪静音再各扩 0.2s）。
@@ -1258,7 +1349,9 @@ impl SegmentGate {
 ///   （打点改按 `PUNCT_PREVIEW_INTERVAL_MS` 间隔，与静默无关）。
 /// - `vad_device`：LOCALRT-NEARFIELD-GATE-389（C2）录音设备 key（`config.audio.input_device` 原样；
 ///   空串 = 系统默认）—— 供**跨录音沿用录音人音量**（同设备、10 分钟内）。
-/// - `on_result`：文本变化回调，传 `(display_text, display_words)`，与 qwen 路径同构
+/// - `on_result`：文本变化回调，传 `(display_text, display_words, tentative_chars)`；
+///   STREAM-SV-463：`tentative_chars` = 显示文本**末尾**尚未稳定（相邻两次重解不一致）的字数，
+///   显示层画浅色；已冻结 / 已稳定的字正常色。按「末尾字数」传，前缀被精解回灌替换也不错位。
 /// - `acc_cfg`：LOCALRT-PARALLEL-ACC-298 派发配置（`enabled`/`silence_ms`；346 起无长度支）；
 ///   `enabled=false` 时本函数**完全不派发**（逐位退回串行行为）
 /// - `on_segment`：accuracy 并行派发回调，传
@@ -1287,12 +1380,12 @@ impl SegmentGate {
 /// 采用**返回值**而非出参传 PCM：2pass 的 PCM 是必需环节，出参漏传编译器抓不到。
 pub fn transcribe_streaming_local(
     chunk_rx: crossbeam_channel::Receiver<Vec<f32>>,
-    recognizer: &OnlineRecognizer,
+    recognizer: &OfflineRecognizer,
     cancel_signal: Option<&AtomicBool>,
     mut punctuation_engine: Option<&mut PunctuationEngine>,
     silence_threshold: f32,
     vad_device: &str,
-    mut on_result: impl FnMut(&str, &[WordTiming]),
+    mut on_result: impl FnMut(&str, &[WordTiming], usize),
     acc_cfg: AccDispatchConfig,
     // VAD-393（A2）：新增第 5 参 `slice_ranges`：**片内坐标**的语音区间（VAD 时间线映射而来）；
     // VAD 不可用 ⇒ `None`（调用方回退自行跑 VAD）。
@@ -1367,14 +1460,27 @@ pub fn transcribe_streaming_local(
     // GATE-TIMING-ONLY-392 埋点：VAD 判人声但门判非近场（被门拒）的 chunk 数。
     let mut vad_only_speech_chunks = 0u64;
 
-    let mut stream = recognizer.create_stream();
-    // PHANTOM-406-459 ①：本流在「本段尚无人声」时已吐过字（静音幻听，342 只在预览里压着）；
-    // `last_silence_text` = 最近一次被压的幻字；开口后转入 `phantom_prefix`，派发时剥掉一次。
-    let mut silence_text_seen = false;
-    let mut last_silence_text = String::new();
-    let mut phantom_prefix = String::new();
-    // 幻字最近一次变化时的音频位置（样本）⇒ 判「开口前多久就有了」。
-    let mut silence_text_changed_at: usize = 0;
+    // STREAM-SV-463：模拟流式「当前句」状态（当前句 = `pcm[sim_start..]`，未冻结部分）。
+    let ms_samples = |ms: f32| (ms * SAMPLE_RATE as f32 / 1000.0) as usize;
+    let mut sim_start: usize = 0;
+    // 下一次重解不早于此 pcm 位置（开口后 SIM_FIRST_MS、此后每 SIM_STEP_MS）；`None` = 本句尚无人声。
+    let mut sim_next_at: Option<usize> = None;
+    // 上次重解覆盖到的 pcm 位置（窗口硬上限在此冻结，不丢音频）。
+    let mut sim_decoded_end: usize = 0;
+    // 上次重解之后又听到人声（VAD）⇒ 值得再解；纯静音不重解。
+    let mut sim_dirty = false;
+    // 当前句最新结果（裸文本，必要时带句首分隔空格）及其「相邻两次一致」的前缀字节长。
+    let mut sim_hyp = String::new();
+    let mut sim_stable: usize = 0;
+    // 当前句结果逐 token 的 `(起始秒, 结束字节)`（442 回看按切点时间切分用；对不上 ⇒ 空）。
+    let mut sim_marks: Vec<(f32, usize)> = Vec::new();
+    // 当前句末尾连续无人声（VAD）时长 ⇒ 句末冻结。
+    let mut sim_silence_ms: f32 = 0.0;
+    // 上次回调给显示层的浅色尾巴字数（文本不变、只是尾巴变稳也要刷新）。
+    let mut last_tentative: usize = 0;
+    let mut sim_decodes: u64 = 0;
+    let mut sim_decode_ms_total = 0.0f64;
+    let mut sim_decode_ms_max = 0.0f64;
     let mut state = StreamingAsrState::new();
     let mut sentence_id: i64 = 0;
     let mut last_display = String::new();
@@ -1383,8 +1489,6 @@ pub fn transcribe_streaming_local(
     // （`committed_len` 字符数 + 本值）描述的是**同一个显示串**（不可用当刻 `display_cache.text()`：
     // 本迭代 raw 可能已先于 last_display 变长，两者会错一拍）。
     let mut last_display_raw_len: usize = 0;
-    // LOCALRT-LASTCHAR-276 诊断用：上一次 get_result 的文本（只在变化时打日志，避免每帧刷屏）。
-    let mut last_result_text = String::new();
     let mut pcm: Vec<f32> = Vec::new();
     // VAD-REUSE-458：见 `dispatch_slice_ranges` 的 `ongoing_onset`。
     let mut vad_seg_onset: Option<usize> = None;
@@ -1392,6 +1496,7 @@ pub fn transcribe_streaming_local(
     let mut punct_cache = PunctPreviewCache {
         prefix: String::new(),
         raw_len: 0,
+        raw: String::new(),
     };
     // PREVIEW-PUNCT-LIVE-438：预览打点**间隔**计时（ms）。与语音/静默无关 —— 每 chunk 按
     // `chunk_ms` 无条件累加（见下方时间推进处），仅在**实际完成一次打点**时归零。
@@ -1408,12 +1513,8 @@ pub fn transcribe_streaming_local(
     // `punct_interval_ms` ⇒ 1200ms 派发时机与改前**逐位不变**（护栏 `guard346_*`）。
     let mut acc_silent_ms: f32 = 0.0;
 
-    // 当前句音频在 `pcm` 中的起点（上次 endpoint reset 之后）。
-    let mut sentence_pcm_start: usize = 0;
-    // LOCALRT-ENDPOINT-EMPTY-342：自上次 endpoint 以来是否出现过**有声** chunk
-    // （复用现有能量判据 `chunk_rms > silence_threshold`，不另抄阈值）。
-    // 用于区分「真 endpoint（本句有语音）」与「静音流上的假 endpoint」：后者不确认、
-    // 不推进游标、不并入预览（F3 幻字抑制）。
+    // STREAM-SV-463：当前句（`pcm[sim_start..]`）是否已听到人声（VAD 原始判定，392 内容口径）。
+    // 没有人声的句子不重解、不显示（沿用 342「静音不出字」的意图）；冻结即复位。
     let mut speech_since_last_reset: bool = false;
     // VAD-393（A2）：会话语音时间线（`pcm` 绝对坐标，按序）。实时 VAD 逐 chunk 产出，派发时
     // 映射为片内 ranges ⇒ **复用实时判断、不再对每个窗口重跑 VAD**（且窗口开头有前文、结论与实时一致）。
@@ -1474,6 +1575,193 @@ pub fn transcribe_streaming_local(
     let mut t_accept_ms = 0.0f64;
     let mut t_ready_ms = 0.0f64;
     let mut t_result_ms = 0.0f64;
+
+    // STREAM-SV-463：模拟流式的三个动作（宏 = 循环内与录音结束后共用同一段代码，变量在定义处解析）。
+    // ① 重解当前句：`pcm[sim_start..]` 整段送 SenseVoice，结果替换显示缓存的当前句区。
+    //    `sim_decode_text!` 只更新文本（冻结前补解用，排期由冻结重置）；`sim_decode!` 另排下一次重解。
+    macro_rules! sim_decode_text {
+        () => {{
+            let td = Instant::now();
+            let (text, marks) = preview_decode_timed(recognizer, &pcm[sim_start..]);
+            let dt = td.elapsed().as_secs_f64() * 1000.0;
+            sim_decodes += 1;
+            sim_decode_ms_total += dt;
+            sim_decode_ms_max = sim_decode_ms_max.max(dt);
+            if !first_ready_seen {
+                first_ready_seen = true;
+                t_ready_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                log::info!(
+                    "[Latency] local_stream first_decode at +{:.1}ms (cost {:.0}ms)",
+                    t_ready_ms,
+                    dt
+                );
+            }
+            // 英文单词跨句不粘连：新句首词前补空格（随结果一起存 ⇒ 稳定前缀与坐标口径不变）。
+            let (text, marks) = if sentence_join_space(display_cache.confirmed(), &text) {
+                (
+                    format!(" {text}"),
+                    marks.into_iter().map(|(t, end)| (t, end + 1)).collect(),
+                )
+            } else {
+                (text, marks)
+            };
+            sim_marks = marks;
+            sim_stable = stable_prefix_bytes(&sim_hyp, &text);
+            if log::log_enabled!(log::Level::Debug) {
+                log::debug!(
+                    "[STREAM-SV-463] decode win={:.2}s cost={:.0}ms chars={} stable_bytes={} text='{}'",
+                    (pcm.len() - sim_start) as f32 / SAMPLE_RATE as f32,
+                    dt,
+                    text.chars().count(),
+                    sim_stable,
+                    text
+                );
+            }
+            if text != sim_hyp {
+                if !text.is_empty() && !first_result_seen {
+                    first_result_seen = true;
+                    t_result_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    log::info!(
+                        "[Latency] local_stream first_nonempty_result at +{:.1}ms ({} chars)",
+                        t_result_ms,
+                        text.chars().count()
+                    );
+                }
+                sim_hyp = text;
+                state.on_result(sentence_id, &sim_hyp, false, &[]);
+                display_cache.on_current(&sim_hyp);
+            }
+        }};
+    }
+    macro_rules! sim_decode {
+        () => {{
+            sim_decode_text!();
+            sim_decoded_end = pcm.len();
+            sim_next_at = Some(pcm.len() + ms_samples(SIM_STEP_MS));
+            sim_dirty = false;
+        }};
+    }
+    // ② 确认：当前句结果并入显示缓存的已确认区（此后不再改写）。
+    macro_rules! sim_confirm {
+        () => {{
+            if !sim_hyp.is_empty() {
+                state.on_result(sentence_id, &sim_hyp, true, &[]);
+                display_cache.on_confirm(&sim_hyp);
+                sentence_id += 1;
+            }
+        }};
+    }
+    // ③ 冻结当前句：确认后新句从 `$next` 起；`$ongoing` = 冻结时仍在说话（新句已有人声，尽快重解）。
+    macro_rules! sim_freeze {
+        ($next:expr, $ongoing:expr) => {{
+            let next: usize = $next;
+            let ongoing: bool = $ongoing;
+            sim_confirm!();
+            if log::log_enabled!(log::Level::Debug) {
+                log::debug!(
+                    "[STREAM-SV-463] freeze at {:.2}s (sentence {:.2}s) chars={} ongoing={}",
+                    next as f32 / SAMPLE_RATE as f32,
+                    next.saturating_sub(sim_start) as f32 / SAMPLE_RATE as f32,
+                    sim_hyp.chars().count(),
+                    ongoing
+                );
+            }
+            sim_hyp.clear();
+            sim_marks.clear();
+            sim_stable = 0;
+            sim_start = next;
+            sim_decoded_end = next;
+            sim_silence_ms = 0.0;
+            speech_since_last_reset = ongoing;
+            sim_dirty = ongoing;
+            sim_next_at = ongoing.then(|| next + ms_samples(SIM_FIRST_MS));
+        }};
+    }
+    // ④ 显示刷新（循环每轮末尾 + 录音结束后各一次）。
+    macro_rules! refresh_preview {
+        () => {{
+            // PREVIEW-PUNCT-LIVE-438：显示刷新 —— 打点**只按 3.5s 间隔**（`PUNCT_PREVIEW_INTERVAL_MS`，
+            // 读独立计数器 `punct_interval_ms`；1200ms 静默触发与显示层 `silent_ms` 已删，DEC-077）
+            // 且有新内容；**只重打精解尚未覆盖的裸尾巴**（起点 `punct_tail_start`，与 `committed_len`
+            // 同刻同源捕获 ⇒ 冻结前缀逐字节不变、坐标不漂移、不与精解标点打架）。
+            // 无论打不打点都**只刷新显示**，不动状态机（不 reset / 不切句 / 不改 sentence_id）。
+            // 显示基文本（LOCALRT-PERF-405 F-C-01 增量缓存）：`confirmed` 区 + 当前句 current 区。
+            // DEC-086：影子收尾已移除，不再有 main/shadow 取长切换。
+            let raw_full: &str = display_cache.text();
+            // DISPATCH-LONG-SPEECH-442：记 `(pcm 位置, 裸文本字节长)` 短历史（只在长度变化时记，保留约 4s）。
+            if raw_len_history.back().map(|(_, l)| *l) != Some(raw_full.len()) {
+                raw_len_history.push_back((pcm.len(), raw_full.len()));
+            }
+            while raw_len_history
+                .front()
+                .is_some_and(|(p, _)| pcm.len().saturating_sub(*p) > 4 * SAMPLE_RATE as usize)
+                && raw_len_history.len() > 1
+            {
+                raw_len_history.pop_front();
+            }
+            if !raw_full.is_empty() {
+                // 有新内容 = raw 比上次打点时长（`raw_len` 初值 0 且 raw 非空 ⇒ 首次恒 true）。
+                let has_new = raw_full != punct_cache.raw;
+                let repunct_due =
+                    should_repunctuate_preview(punct_interval_ms, has_new, PUNCT_PREVIEW_INTERVAL_MS);
+                let display = preview_display(
+                    raw_full,
+                    punctuation_engine.as_deref_mut(),
+                    &mut punct_cache,
+                    repunct_due,
+                    punct_tail_start,
+                    punct_head_chars,
+                );
+                if repunct_due {
+                    // 打完重置**间隔**计时（438：打点不再触碰任何静默计数器）。
+                    // 🔴 346：`acc_silent_ms` 与此完全无关（动了 accuracy 的 1200ms 就不可达）。
+                    punct_interval_ms = 0.0;
+                }
+                // STREAM-SV-463：末尾浅色字数 = 显示文本里「已确认区 + 当前句稳定前缀」之后的字数
+                //（整段都稳定 ⇒ 0，连同标点引擎补在末尾的标点也算已定）。
+                let stable_raw = display_cache.confirmed().len() + sim_stable;
+                let tentative = if stable_raw >= raw_full.len() {
+                    0
+                } else {
+                    display.chars().count()
+                        - display_chars_for_raw_prefix(&display, raw_full, stable_raw)
+                };
+                if display != last_display || tentative != last_tentative {
+                    // LOCALRT-FIRSTCHAR-272：首次回调 = 用户看到第一个字；此处打「首字延迟拆解」汇总行。
+                    if !first_callback_seen {
+                        first_callback_seen = true;
+                        let t_callback_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        log::info!(
+                            "[Latency] local_stream FIRST-CHAR breakdown: chunk=+{:.1}ms accept=+{:.1}ms ready=+{:.1}ms result=+{:.1}ms callback=+{:.1}ms | wait_audio(chunk-t0)={:.1}ms wait_infer(ready->result)={:.1}ms wait_callback(result->callback)={:.1}ms",
+                            t_chunk_ms,
+                            t_accept_ms,
+                            t_ready_ms,
+                            t_result_ms,
+                            t_callback_ms,
+                            t_chunk_ms,
+                            t_result_ms - t_ready_ms,
+                            t_callback_ms - t_result_ms
+                        );
+                        // RESEARCH-ACC-FIRSTCHAR-278 埋点（只读）：流式首字文本 + 到达时刻。
+                        // URGENT-286：降为 debug 级——默认 max_level=Warn 下连参数求值都跳过。
+                        // 参数 t_callback_ms/display 均为已有廉价值（且 t_callback_ms 被上方
+                        // [Latency] info! 复用），故无需再包 log_enabled! 守卫。
+                        log::debug!(
+                            "[LocalRT-DBG-278] local streaming first text @+{:.0}ms: {}",
+                            t_callback_ms,
+                            display
+                        );
+                    }
+                    on_result(&display, &state.display_words(), tentative);
+                    last_tentative = tentative;
+                    last_display = display;
+                    // PREVIEW-PUNCT-LIVE-438（R1）：与 last_display **同刻**记录其覆盖的 raw 字节长，
+                    // 供下次派发捕获双坐标（committed_len 字符数 + 本值必须描述同一个显示串）。
+                    last_display_raw_len = raw_full.len();
+                }
+            }
+        }};
+    }
 
     loop {
         if is_cancelled() {
@@ -1605,40 +1893,29 @@ pub fn transcribe_streaming_local(
         }
         prev_has_speech = has_speech;
 
+        let chunk_start = pcm.len();
         pcm.extend_from_slice(&chunk);
-        stream.accept_waveform(SAMPLE_RATE, &chunk);
-        // PHANTOM-406-459 ①：本流在「本段尚无人声」时吐过字（静音幻字，342 只在预览里压着），现在 VAD 判出开口
-        // ⇒ 记下这段幻字；下一次派发时从该片流式文本开头剥掉（406 比对基准 / 兜底文本 / 精解草稿都取自它）。
-        // 不动实时流与预览（换流实测会连带改变本句后半的流式用字）。
-        if vad_speech && silence_text_seen {
-            silence_text_seen = false;
-            phantom_prefix = std::mem::take(&mut last_silence_text);
-            if log::log_enabled!(log::Level::Debug) {
-                log::debug!(
-                    "[PHANTOM-459] speech after silence-born text: '{}' lead={:.2}s",
-                    phantom_prefix,
-                    pcm.len().saturating_sub(silence_text_changed_at) as f32 / SAMPLE_RATE as f32
-                );
-            }
+        // STREAM-SV-463：当前句的人声 / 静默推进（VAD 原始判定，与 speech_since_last_reset 同口径）。
+        if vad_speech {
+            sim_dirty = true;
+            sim_silence_ms = 0.0;
+            // 本句首次听到人声 ⇒ SIM_FIRST_MS 后首解。
+            sim_next_at.get_or_insert(chunk_start + ms_samples(SIM_FIRST_MS));
+        } else {
+            sim_silence_ms += chunk_ms;
+        }
+        // 句首静音不入窗：本句尚无人声时，句起点跟着往后挪，只在开口前留 ONGOING_ONSET_MARGIN
+        //（实时 VAD 判出开口比真实起点晚，458 同一余量）。
+        if !speech_since_last_reset {
+            sim_start = sim_start.max(pcm.len().saturating_sub(ONGOING_ONSET_MARGIN));
         }
         if !first_accept_seen {
             first_accept_seen = true;
             t_accept_ms = t0.elapsed().as_secs_f64() * 1000.0;
             log::info!(
-                "[Latency] local_stream first_accept_waveform at +{:.1}ms",
+                "[Latency] local_stream first_audio at +{:.1}ms",
                 t_accept_ms
             );
-        }
-        while recognizer.is_ready(&stream) {
-            if !first_ready_seen {
-                first_ready_seen = true;
-                t_ready_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                log::info!(
-                    "[Latency] local_stream first_is_ready at +{:.1}ms (audio buffered enough to decode)",
-                    t_ready_ms
-                );
-            }
-            recognizer.decode(&stream);
         }
 
         // LOCALRT-SEAM-337：自适应定界推进（派发点 P 之后，a/b/c 最先者冻结边界）。
@@ -1734,202 +2011,6 @@ pub fn transcribe_streaming_local(
         }
         late_bound = next_late;
 
-        let endpoint = recognizer.is_endpoint(&stream);
-
-        if endpoint {
-            // FIX-LOCALRT-TAILCHAR-291：endpoint 切句过去直接 `reset()`，而 reset 之前从未
-            // `input_finished()` ⇒ sherpa 解码器里压着的最后一个 token 被直接丢掉，**每一个
-            // 被 endpoint 切掉的句子都结构性少尾字**（Gavin 端测「中间句丢尾字」的根因）。
-            // 最后一句因 loop 之后的 flush 而完整，这正是「只有中间句丢」的原因。
-            //
-            // 修法：reset 之前先 flush 主 stream，取到真正完整的句子文本再确认。
-            // flush 前文本仅作**回落**用（after 空/更短则用 before，见下方 `flush_text`）。
-            let before_text = recognizer
-                .get_result(&stream)
-                .map(|r| r.text)
-                .unwrap_or_default();
-            // 🔴 input_finished() 之后的 stream 不能再喂音频 ⇒ 本句结束即换新流（见下）。
-            stream.input_finished();
-            while recognizer.is_ready(&stream) {
-                recognizer.decode(&stream);
-            }
-            let after_text = recognizer
-                .get_result(&stream)
-                .map(|r| r.text)
-                .unwrap_or_default();
-            if log::log_enabled!(log::Level::Debug) {
-                log::debug!(
-                    "[LocalRT-DBG-291] endpoint flush: before_len={} after_len={} gained={}",
-                    before_text.chars().count(),
-                    after_text.chars().count(),
-                    after_text.chars().count() as i64 - before_text.chars().count() as i64
-                );
-            }
-            // 🔴 显式回落：flush 后为空 / 更短则用 flush 前，绝不让整句消失或回退。
-            let flush_text: &str = if after_text.chars().count() >= before_text.chars().count() {
-                &after_text
-            } else {
-                &before_text
-            };
-            // LOCALRT-ROLLBACK-344：307「整句全量重解码」已移除 —— 每次断句多解一整句
-            // ~104.5ms，而 `[DBG-307]` **26/26 `gained=0`**（一个字都没捞回），属语音输入主路径
-            // 纯开销（Gavin 2026-09-22 约束）。290 的 flush 回落（`flush_text`）保留：它零额外解码，
-            // 只做「after 空/更短则用 before」的**不回退保护**。
-            // FIX-LOCALRT-TAILCHAR-291：flush 前/后取长者（`flush_text` 已在上面算好，绝不回退）。
-            // DEC-086：影子收尾已移除，原「main / shadow 两方取长」的辅助函数一并删除。
-            let confirm_text: &str = flush_text;
-            // LOCALRT-ENDPOINT-EMPTY-342（F1+F3）：自上次 endpoint 无有声 chunk ⇒ 静音流上的
-            // **假 endpoint**。不确认、不推进游标、不并入预览（静音流吐出的字一律丢弃，幻字抑制）。
-            let segment_has_speech = speech_since_last_reset;
-            let action = endpoint_action(segment_has_speech, confirm_text.is_empty());
-            if action == EndpointAction::SuppressSilence {
-                log::debug!(
-                    "[LocalRT-DBG-342] endpoint on silence-only segment: suppressed (main_len={} suppress_len={})",
-                    flush_text.chars().count(),
-                    confirm_text.chars().count()
-                );
-            } else if action == EndpointAction::Confirm {
-                // LOCALRT-FIRSTCHAR-272：首次拿到非空识别文本（首次推理产出）。
-                if !first_result_seen {
-                    first_result_seen = true;
-                    t_result_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    log::info!(
-                        "[Latency] local_stream first_nonempty_result at +{:.1}ms ({} chars)",
-                        t_result_ms,
-                        confirm_text.chars().count()
-                    );
-                }
-                // URGENT-286：诊断块仅在 Debug 级启用时执行 ⇒ 默认 Warn 下零开销。
-                if log::log_enabled!(log::Level::Debug) {
-                    // DEC-086：影子收尾已移除 ⇒ `[DBG-289]`（main/shadow 取舍）日志随之删除；只剩主解。
-                    if confirm_text != last_result_text {
-                        log::debug!(
-                            "[LocalRT-DBG-276] result='{}' (chars={}) endpoint=true will_reset=true",
-                            confirm_text,
-                            confirm_text.chars().count()
-                        );
-                        last_result_text = confirm_text.to_string();
-                    }
-                }
-                // 🔴 始终把**原始无标点**文本喂状态机，且本句**只确认这一次**（避免 FIX-252 重复打点）。
-                state.on_result(sentence_id, confirm_text, true, &[]);
-                // F-C-01（405）：同步增量缓存（confirmed 追加 confirm_text、current 清空）。
-                display_cache.on_confirm(confirm_text);
-            } else {
-                log::debug!(
-                    "[LocalRT-DBG-276] endpoint=true but result EMPTY (prev='{}')",
-                    last_result_text
-                );
-            }
-            // LOCALRT-SEAM-337：endpoint 若仍有未冻结的边界（罕见：cap 未到但已切句），
-            // 按 c 兜底冻结（用确认前的显示长度，与镜像同源），避免悬置。
-            if let Some(seg) = bound_seg {
-                let cur = last_display.chars().count();
-                // F-A-02（405）：bound_hit_c 仅喂 DBG-337 日志 ⇒ Debug 守卫。
-                if log::log_enabled!(log::Level::Debug) {
-                    bound_hit_c += 1;
-                    log::debug!(
-                        "[LocalRT-DBG-337] boundary=c (endpoint flush) seg={} committed_len={} (a/b/c={}/{}/{})",
-                        seg,
-                        cur,
-                        bound_hit_a,
-                        bound_hit_b,
-                        bound_hit_c
-                    );
-                }
-                on_reflow_commit(seg, Some(cur));
-                bound_seg = None;
-                late_bound = Some((seg, cur));
-            }
-            // LOCALRT-ENDPOINT-284 诊断（方案 A 取证）：每次切句打一行，行数=切句次数。
-            // 342：`has_speech=false` 的假 endpoint 不推进 sentence_id（游标不动）。
-            log::debug!(
-                "[LocalRT-DBG-284] endpoint fired: sentence_id {} -> {} (rule2 cut, has_speech={})",
-                sentence_id,
-                sentence_id + segment_has_speech as i64,
-                segment_has_speech
-            );
-            // 🔴 input_finished() 之后的 stream 不可复用，下一句换新流（create_stream 廉价：
-            // 影子逻辑每 400ms 就建一次，decode 0.5~0.7ms 起步，无性能顾虑）。
-            // 342：假 endpoint 也换新流（清 endpoint 闩锁），但**不推进** sentence_id / sentence_pcm_start。
-            stream = recognizer.create_stream();
-            silence_text_seen = false;
-            last_silence_text.clear();
-            // 342：假 endpoint（本句无声）**不推进** sentence_id / sentence_pcm_start。
-            sentence_id += segment_has_speech as i64;
-            let next_sentence_start = if segment_has_speech {
-                pcm.len()
-            } else {
-                sentence_pcm_start
-            };
-            // 新句从当前总音频长度起算（342：假 endpoint 保持不动）；作废影子。
-            sentence_pcm_start = next_sentence_start;
-            speech_since_last_reset = false;
-        } else if let Some(r) = recognizer.get_result(&stream) {
-            if !r.text.is_empty() && speech_since_last_reset {
-                // LOCALRT-LASTCHAR-276：诊断——每次识别文本变化时打印，用于判断「最后一个字
-                // 是否在任何一帧 get_result 里出现过」。只在变化时打，有界。
-                // URGENT-286：整块（比较 + clone + 格式化）仅在 Debug 级启用时执行 ⇒ 默认 Warn 下零开销。
-                if log::log_enabled!(log::Level::Debug) && r.text != last_result_text {
-                    log::debug!(
-                        "[LocalRT-DBG-276] result='{}' (chars={}) endpoint=false will_reset=false",
-                        r.text,
-                        r.text.chars().count()
-                    );
-                    // LOCALRT-TIMESTAMP-336：**只读探针** —— 流式模型到底给不给 token 时间戳。
-                    // 🔴 只观测：**不改 `.map(|r| r.text)` 取用行为**，本阶段不碰预览合成/切分。
-                    // 量具自检：`text_chars` 恒 >0（本块已在 `!is_empty()` 内）⇒ 行确实执行到，
-                    // 「ts=none」才是模型不给（而非日志没跑）。
-                    let ts_desc = match &r.timestamps {
-                        Some(v) => format!("len={} first_ts={:?}", v.len(), &v[..v.len().min(3)]),
-                        None => "none".to_string(),
-                    };
-                    log::debug!(
-                        "[LocalRT-DBG-336] result probe: text_chars={} tokens={} ts={} is_final={} segment={:?} start_time={:?}",
-                        r.text.chars().count(),
-                        r.tokens.len(),
-                        ts_desc,
-                        r.is_final,
-                        r.segment,
-                        r.start_time
-                    );
-                    last_result_text = r.text.clone();
-                }
-                // LOCALRT-FIRSTCHAR-272：首次拿到非空识别文本（首次推理产出）。
-                if !first_result_seen {
-                    first_result_seen = true;
-                    t_result_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    log::info!(
-                        "[Latency] local_stream first_nonempty_result at +{:.1}ms ({} chars)",
-                        t_result_ms,
-                        r.text.chars().count()
-                    );
-                }
-                // 🔴 始终把**原始无标点**文本喂状态机：confirmed/current 均保持裸文本，
-                // 杜绝「对已打点文本二次打点 / 标点重复」（FIX-252 场景）。
-                // 非 endpoint → 仅替换当前句中间结果（本函数内唯一另一处 on_result）。
-                state.on_result(sentence_id, &r.text, false, &[]);
-                // F-C-01（405）：同步增量缓存（替换 current 区；confirmed 区不变）。
-                display_cache.on_current(&r.text);
-            } else if !r.text.is_empty() {
-                // LOCALRT-ENDPOINT-EMPTY-342（F3）：静音段（自上次 endpoint 无有声 chunk）
-                // 的流式文本一律丢弃，不并入预览（幻字抑制）。
-                // PHANTOM-406-459 ①：记下「本流已吐过静音幻字」及其内容（开口后派发时剥掉）。
-                silence_text_seen = true;
-                if r.text != last_silence_text {
-                    silence_text_changed_at = pcm.len();
-                    last_silence_text.clone_from(&r.text);
-                }
-                if log::log_enabled!(log::Level::Debug) {
-                    log::debug!(
-                        "[LocalRT-DBG-342] non-endpoint text on silence-only segment: suppressed '{}' (chars={})",
-                        r.text,
-                        r.text.chars().count()
-                    );
-                }
-            }
-        }
-
         // DEC-086（LOCALRT-PERF-405）：原「静默 ≥400ms 影子收尾（另起 stream 重解当前句）」分支
         // **整段移除** —— 实测零净收益（endpoint 定稿极少采用影子结果、尾字也补不回），却在本流式
         // 解码线程内同步重解整句（单次峰值 1267ms），严重阻塞预览实时性。末字补全改由后续机制解决。
@@ -1964,6 +2045,10 @@ pub fn transcribe_streaming_local(
                 // ACC-PREVIEW-REFLOW-325：记下**派发当刻浮层已显示文本的字符数**（committed_len）。
                 // 🔴 用 `last_display`（实际已上屏、含标点的串，与镜像 `last_streaming_text` 同源），
                 //    不用 `state.display_text()`（裸文本，标点差会造成回填边界偏移）。
+                // STREAM-SV-463：派发点即冻结点 —— 当前句结果确认（此后不再改写），新句从此刻起。
+                // 停顿 1200ms 前的最后一次重解已覆盖全部人声（人声后至多 0.6s 必重解一次）；🔴 此处**不补解**：
+                // 补解会改写已显示的字，使 committed_len（按 last_display 数）与冻结内容错位。
+                sim_freeze!(pcm.len(), vad_speech);
                 let committed_len = last_display.chars().count();
                 // PREVIEW-PUNCT-LIVE-438（R1）：同刻捕获 raw 侧边界 —— 与 committed_len 描述
                 // 同一个显示串（`last_display_raw_len` 随 last_display 同赋值）⇒ 3.5s 重打
@@ -1971,10 +2056,7 @@ pub fn transcribe_streaming_local(
                 punct_head_chars = committed_len;
                 punct_tail_start = last_display_raw_len;
                 // 344-G：本片流式文本（失败片的填补来源），按 char 切片，字符安全。
-                let seg_streaming = take_phantom_prefix(
-                    &mut phantom_prefix,
-                    segment_streaming_text(&last_display, acc_prev_committed),
-                );
+                let seg_streaming = segment_streaming_text(&last_display, acc_prev_committed);
                 acc_prev_committed = committed_len;
                 // VAD-393（A2/R1）：派发由**静默 1200ms**（门 `has_speech`）触发，不保证派发当刻
                 // VAD 段已结束（门拒背景人声 / 误拒录音人轻声 / 本句与背景声无缝相接 ⇒ VAD 仍在段中）。
@@ -2051,11 +2133,35 @@ pub fn transcribe_streaming_local(
                     // 切点那一刻（+流式滞后补偿）的裸文本长度 ⇒ 显示文本里的覆盖字符数。
                     let at = (cut + ms_to_samples(LONG_SPEECH_TEXT_LAG_MS)).min(pcm.len());
                     let raw_now = display_cache.text();
-                    let raw_at = raw_len_history
-                        .iter()
-                        .rev()
-                        .find(|(p, _)| *p <= at)
-                        .map(|(_, l)| *l)
+                    // STREAM-SV-463：当前句结果带逐 token 时间 ⇒ 起始早于切点的 token 归已派发片（精确到字）；
+                    // 没有时间戳才回退「切点后 LONG_SPEECH_TEXT_LAG_MS 那一刻的文字长度」。
+                    let by_time = (cut > sim_start)
+                        .then(|| {
+                            split_bytes_at_time(
+                                &sim_marks,
+                                (cut - sim_start) as f32 / SAMPLE_RATE as f32,
+                            )
+                        })
+                        .flatten()
+                        .map(|b| display_cache.confirmed().len() + b);
+                    if log::log_enabled!(log::Level::Debug) {
+                        log::debug!(
+                            "[STREAM-SV-463] lookback split by {}",
+                            if by_time.is_some() {
+                                "token time"
+                            } else {
+                                "text length history"
+                            }
+                        );
+                    }
+                    let raw_at = by_time
+                        .or_else(|| {
+                            raw_len_history
+                                .iter()
+                                .rev()
+                                .find(|(p, _)| *p <= at)
+                                .map(|(_, l)| *l)
+                        })
                         .unwrap_or(punct_tail_start)
                         .max(punct_tail_start)
                         .min(raw_now.len());
@@ -2083,8 +2189,24 @@ pub fn transcribe_streaming_local(
                             .skip(acc_prev_committed)
                             .take(committed_len.saturating_sub(acc_prev_committed))
                             .collect();
-                        let seg_streaming = take_phantom_prefix(&mut phantom_prefix, seg_streaming);
                         acc_prev_committed = committed_len;
+                        // STREAM-SV-463：回看切点即冻结点 —— 当前句结果在 raw_at 处一分为二：前半确认
+                        //（对应已派发的 [start, cut)，此后不再改写），后半暂作新句显示、下一 chunk 按
+                        // [cut, now) 重解替换。显示文本逐字不变 ⇒ 上面按 last_display 算的坐标照样成立。
+                        let cut_in_hyp = floor_char_boundary(
+                            &sim_hyp,
+                            raw_at.saturating_sub(display_cache.confirmed().len()),
+                        );
+                        let tail = sim_hyp.split_off(cut_in_hyp);
+                        sim_stable = sim_stable.saturating_sub(cut_in_hyp).min(tail.len());
+                        sim_confirm!();
+                        sim_hyp = tail;
+                        state.on_result(sentence_id, &sim_hyp, false, &[]);
+                        display_cache.on_current(&sim_hyp);
+                        // 新句 = [cut, now)，仍在说话 ⇒ 下一 chunk 即重解。
+                        sim_start = cut;
+                        sim_dirty = true;
+                        sim_next_at = Some(pcm.len());
                         // 切点在过去、VAD 可能仍在段中 ⇒ 进行中段按判定位置保守补齐（VAD-REUSE-458，不吞字）。
                         let slice_ranges = dispatch_slice_ranges(
                             vad_on,
@@ -2128,77 +2250,39 @@ pub fn transcribe_streaming_local(
             on_long_silence(pcm.len());
         }
 
-        // PREVIEW-PUNCT-LIVE-438：显示刷新 —— 打点**只按 3.5s 间隔**（`PUNCT_PREVIEW_INTERVAL_MS`，
-        // 读独立计数器 `punct_interval_ms`；1200ms 静默触发与显示层 `silent_ms` 已删，DEC-077）
-        // 且有新内容；**只重打精解尚未覆盖的裸尾巴**（起点 `punct_tail_start`，与 `committed_len`
-        // 同刻同源捕获 ⇒ 冻结前缀逐字节不变、坐标不漂移、不与精解标点打架）。
-        // 无论打不打点都**只刷新显示**，不动状态机（不 reset / 不切句 / 不改 sentence_id）。
-        // 显示基文本（LOCALRT-PERF-405 F-C-01 增量缓存）：`confirmed` 区 + 当前句 current 区。
-        // DEC-086：影子收尾已移除，不再有 main/shadow 取长切换。
-        let raw_full: &str = display_cache.text();
-        // DISPATCH-LONG-SPEECH-442：记 `(pcm 位置, 裸文本字节长)` 短历史（只在长度变化时记，保留约 4s）。
-        if raw_len_history.back().map(|(_, l)| *l) != Some(raw_full.len()) {
-            raw_len_history.push_back((pcm.len(), raw_full.len()));
-        }
-        while raw_len_history
-            .front()
-            .is_some_and(|(p, _)| pcm.len().saturating_sub(*p) > 4 * SAMPLE_RATE as usize)
-            && raw_len_history.len() > 1
+        // STREAM-SV-463：重解 / 冻结放在本轮所有派发**之后**、刷新显示之前 —— 派发时的显示缓存与 last_display
+        // 是同一份文字（双坐标同源，438 R1）；重解若先于派发，改写过的字会让 committed_len 与切分位置错位。
+        // 句末冻结 —— 当前句有人声、其后连续无人声达 SIM_SENTENCE_END_MS（精解关闭时的切句；
+        // 精解开启时静默 1200ms 派发已先冻结，这里只剩空句）。冻结前若有未解的人声先补解一次。
+        if speech_since_last_reset && sim_silence_ms >= SIM_SENTENCE_END_MS {
+            if sim_dirty {
+                sim_decode_text!();
+            }
+            sim_freeze!(pcm.len(), false);
+        } else if speech_since_last_reset
+            && pcm.len().saturating_sub(sim_start) >= ms_samples(SIM_WINDOW_MAX_MS)
         {
-            raw_len_history.pop_front();
+            // 窗口硬上限：在上次重解覆盖处冻结（其后的音频归新句，不丢）。
+            sim_freeze!(sim_decoded_end, true);
         }
-        if !raw_full.is_empty() {
-            // 有新内容 = raw 比上次打点时长（`raw_len` 初值 0 且 raw 非空 ⇒ 首次恒 true）。
-            let has_new = raw_full.len() > punct_cache.raw_len;
-            let repunct_due =
-                should_repunctuate_preview(punct_interval_ms, has_new, PUNCT_PREVIEW_INTERVAL_MS);
-            let display = preview_display(
-                raw_full,
-                punctuation_engine.as_deref_mut(),
-                &mut punct_cache,
-                repunct_due,
-                punct_tail_start,
-                punct_head_chars,
-            );
-            if repunct_due {
-                // 打完重置**间隔**计时（438：打点不再触碰任何静默计数器）。
-                // 🔴 346：`acc_silent_ms` 与此完全无关（动了 accuracy 的 1200ms 就不可达）。
-                punct_interval_ms = 0.0;
-            }
-            if display != last_display {
-                // LOCALRT-FIRSTCHAR-272：首次回调 = 用户看到第一个字；此处打「首字延迟拆解」汇总行。
-                if !first_callback_seen {
-                    first_callback_seen = true;
-                    let t_callback_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    log::info!(
-                        "[Latency] local_stream FIRST-CHAR breakdown: chunk=+{:.1}ms accept=+{:.1}ms ready=+{:.1}ms result=+{:.1}ms callback=+{:.1}ms | wait_audio(chunk-t0)={:.1}ms wait_infer(ready->result)={:.1}ms wait_callback(result->callback)={:.1}ms",
-                        t_chunk_ms,
-                        t_accept_ms,
-                        t_ready_ms,
-                        t_result_ms,
-                        t_callback_ms,
-                        t_chunk_ms,
-                        t_result_ms - t_ready_ms,
-                        t_callback_ms - t_result_ms
-                    );
-                    // RESEARCH-ACC-FIRSTCHAR-278 埋点（只读）：流式首字文本 + 到达时刻。
-                    // URGENT-286：降为 debug 级——默认 max_level=Warn 下连参数求值都跳过。
-                    // 参数 t_callback_ms/display 均为已有廉价值（且 t_callback_ms 被上方
-                    // [Latency] info! 复用），故无需再包 log_enabled! 守卫。
-                    log::debug!(
-                        "[LocalRT-DBG-278] local streaming first text @+{:.0}ms: {}",
-                        t_callback_ms,
-                        display
-                    );
-                }
-                on_result(&display, &state.display_words());
-                last_display = display;
-                // PREVIEW-PUNCT-LIVE-438（R1）：与 last_display **同刻**记录其覆盖的 raw 字节长，
-                // 供下次派发捕获双坐标（committed_len 字符数 + 本值必须描述同一个显示串）。
-                last_display_raw_len = raw_full.len();
-            }
+        // STREAM-SV-463：说话中按步长重解当前句（纯静音不重解）。
+        if sim_dirty && sim_next_at.is_some_and(|t| pcm.len() >= t) {
+            sim_decode!();
         }
+
+        refresh_preview!();
     }
+
+    // STREAM-SV-463：录音结束 ⇒ 当前句按最后一个样本收尾重解，并按循环内同一口径刷新一次显示 ——
+    // 尾片派发捕获的 committed_len / 流式文本由此包含句末最后几个字（paraformer 时代此处是 flush）。
+    // 宏里推进的计时 / 首次标记等在函数末尾不再读取 ⇒ 仅此处豁免 unused_assignments。
+    #[allow(unused_assignments)]
+    let () = {
+        if speech_since_last_reset && sim_dirty {
+            sim_decode!();
+        }
+        refresh_preview!();
+    };
 
     // PARALLEL-ACC-298：尾片 —— 录音结束，把剩余未派发区间作为最后一片派给 accuracy。
     // 本段未在静默 1200ms 前派出的音频（含短录音全量）在此一次性交出 ⇒ 等价「单片=全量」。
@@ -2232,10 +2316,7 @@ pub fn transcribe_streaming_local(
             punct_head_chars = committed_len;
             punct_tail_start = last_display_raw_len;
             // 344-G：尾片流式文本（同 mid-loop，按 char 切片）。
-            let seg_streaming = take_phantom_prefix(
-                &mut phantom_prefix,
-                segment_streaming_text(&last_display, acc_prev_committed),
-            );
+            let seg_streaming = segment_streaming_text(&last_display, acc_prev_committed);
             // VAD-393（A2/R1）：尾片前已 `flush_speech` ⇒ 无进行中段 ⇒ `mid_speech=false`
             //（`vad_on=false` ⇒ None，回退 391 自跑 VAD，与中途派发同口径）。
             let slice_ranges = dispatch_slice_ranges(vad_on, false, None, &speech_timeline, &spans);
@@ -2252,15 +2333,8 @@ pub fn transcribe_streaming_local(
         // （推进了也无人读 ⇒ 触发 unused_assignments）。
     }
 
-    // flush 尾部：input_finished 后把剩余可解码帧吐完，再取最终结果。
-    // LOCALRT-ROLLBACK-344：340 的「收尾补 2000ms 静音」已移除 —— 与 shadow 补静音同证零收益，
-    // 且让**每次录音收尾**多解 2000ms（主路径纯开销）。
-    stream.input_finished();
-    while recognizer.is_ready(&stream) {
-        recognizer.decode(&stream);
-    }
-    // LOCALRT-SEAM-337（补 1，自适应版）：松手收尾若仍有未冻结边界，按 a 冻结（流式已 flush，
-    // 滞后补字必已吐完）⇒ 末态带 acc 前缀。已冻结或从未派发则不动。
+    // LOCALRT-SEAM-337（补 1，自适应版）：松手收尾若仍有未冻结边界，按 a 冻结（收尾重解已完成，
+    // 预览文字不会再变）⇒ 末态带 acc 前缀。已冻结或从未派发则不动。
     if let Some(seg) = bound_seg {
         let cur = last_display.chars().count();
         // F-A-02（405）：bound_hit_a 仅喂 DBG-337 日志 ⇒ Debug 守卫。
@@ -2278,22 +2352,13 @@ pub fn transcribe_streaming_local(
         on_reflow_commit(seg, Some(cur));
         // 函数即将返回，`bound_seg` 不必再清（清了也无人读 ⇒ unused_assignments）。
     }
-    let main_final = recognizer
-        .get_result(&stream)
-        .map(|r| r.text)
-        .unwrap_or_default();
-    // LOCALRT-ROLLBACK-344：307「收尾整句全量重解码」已移除（同 endpoint 分支，26/26 gained=0）。
-    // flush 结果即最终句文本；**「不得变短 / 整句消失」回落保护**由下方
-    // `final_preview = last_display.clone()` + `if !final_seg.is_empty()` 保证 ——
-    // main_final 为空/更短时预览保持已显示文本，绝不回退。
-    let final_seg = main_final;
+    // STREAM-SV-463：当前句最终结果 = 收尾重解的结果（上面已解过；空 ⇒ 预览保持已显示文本，绝不回退）。
+    let final_seg = sim_hyp.clone();
     // LOCALRT-FIRSTCHAR-282：最终（含标点）预览全文；供调用方以 `StreamingFinalPreview` 收尾显示。
     // （239-B 丢弃本预览文本、以 pcm 走 accuracy 2pass；此返回值只服务于收尾显示。）
     let mut final_preview = last_display.clone();
     if !final_seg.is_empty() {
-        state.on_result(sentence_id, &final_seg, false, &[]);
-        // F-C-01（405）：同步增量缓存（替换 current 区）。
-        display_cache.on_current(&final_seg);
+        // STREAM-SV-463：显示缓存的当前句区已是 `final_seg`（收尾重解时写入），不再重复写。
         // 收尾强制打点一次（录音结束 = 真边界，不属「句中断点」）。
         // PREVIEW-PUNCT-LIVE-438（R1）：仍然只打「精解边界之后的尾巴」—— 尾片已派发时坐标
         // 已推进到 raw 末尾 ⇒ 尾巴为空、本地不补终止符（由回灌/最终输出给出）；
@@ -2308,11 +2373,21 @@ pub fn transcribe_streaming_local(
             punct_head_chars,
         );
         if !display.is_empty() {
-            if display != last_display {
-                on_result(&display, &state.display_words());
+            // 录音结束 = 全部已定 ⇒ 浅色尾巴清零。
+            if display != last_display || last_tentative != 0 {
+                on_result(&display, &state.display_words(), 0);
             }
             final_preview = display;
         }
+    }
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "[STREAM-SV-463] preview decodes={} avg_ms={:.0} max_ms={:.0} audio_s={:.1}",
+            sim_decodes,
+            sim_decode_ms_total / sim_decodes.max(1) as f64,
+            sim_decode_ms_max,
+            pcm.len() as f32 / SAMPLE_RATE as f32
+        );
     }
 
     // LOCALRT-VAD-SILENCE-384：本次录音 VAD 开销（证明可忽略；Debug 守卫，DEC-077）。
@@ -2922,12 +2997,12 @@ mod timeline393_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_dispatch_segment, build_punct_prefix, chunk_has_speech, endpoint_action,
-        find_tail_cut, local_stream_num_threads, localrt_vad_seed_ms, preview_display,
-        punct_cache_reuse, punct_head, seed_usable, segment_streaming_text, should_dispatch_acc,
-        should_dispatch_tail, should_repunctuate_preview, should_signal_long_silence, DisplayCache,
-        EndpointAction, EnergySmoother, PunctPreviewCache, SegmentGate, SegmentPeakLevel,
-        LOCALRT_VAD_MIN_SILENCE_SECS, LONG_SILENCE_TAIL_MS, PUNCT_PREVIEW_INTERVAL_MS, SAMPLE_RATE,
+        build_dispatch_segment, build_punct_prefix, chunk_has_speech, find_tail_cut,
+        localrt_vad_seed_ms, preview_display, punct_cache_reuse, punct_head, seed_usable,
+        segment_streaming_text, should_dispatch_acc, should_dispatch_tail,
+        should_repunctuate_preview, should_signal_long_silence, DisplayCache, EnergySmoother,
+        PunctPreviewCache, SegmentGate, SegmentPeakLevel, LOCALRT_VAD_MIN_SILENCE_SECS,
+        LONG_SILENCE_TAIL_MS, PUNCT_PREVIEW_INTERVAL_MS, SAMPLE_RATE,
     };
 
     // ========================================================================
@@ -2985,211 +3060,15 @@ mod tests {
         assert_eq!(find_tail_cut(&vec![0.3f32; rate], 2 * rate), (0, false));
     }
 
-    /// PHANTOM-406-459 ①：合成「VAD 判静音但流式出字」—— 一段真实语音压到极低音量放在开头（VAD 判静音、
-    /// 流式仍可能出字），隔 0.8s 静音接正常音量语音。逐段对照「剥 / 不剥」幻字的派发片文本。
-    /// 运行：`cargo test --bin feiyin-ime -- --ignored --nocapture t459_phantom_synth`
-    #[test]
-    #[ignore = "requires streaming model + full.wav; --ignored 运行"]
-    fn t459_phantom_synth_e2e() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let Ok(recognizer) = super::create_local_stream_recognizer(&root.join("models")) else {
-            eprintln!("skip: 流式 paraformer 模型不在位");
-            return;
-        };
-        let wav = root.join("collab/research/audio-real-gavin/processed/full.wav");
-        let Some(w) = sherpa_onnx::Wave::read(wav.to_str().unwrap()) else {
-            eprintln!("skip: full.wav 不在位");
-            return;
-        };
-        let src = w.samples();
-        const R: usize = 16_000;
-        // 自然停顿切分：离线 VAD 取完整语音段，挑「A 段（作低音量幻听源）」与「其后开口的 B 段（正常音量）」。
-        let probe = super::VadSegmenter::try_new_for_local_trim(&root.join("models")).expect("vad");
-        let segs = probe.speech_ranges(&src[..(40 * R).min(src.len())]);
-        let pick: Vec<(usize, usize)> = segs
-            .iter()
-            .copied()
-            .filter(|&(a, b)| b - a >= R / 2)
-            .collect();
-        assert!(
-            pick.len() >= 3,
-            "full.wav 前 40s 应有 ≥3 段完整语音：{segs:?}"
-        );
-        let run = |audio: Vec<f32>, no_restart: bool| -> (Vec<String>, String) {
-            super::TEST_NO_PHANTOM_STRIP.with(|c| c.set(no_restart));
-            let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
-            let feeder = std::thread::spawn(move || {
-                for c in audio.chunks(1_600) {
-                    let _ = tx.send(c.to_vec());
-                }
-            });
-            let mut slices: Vec<String> = Vec::new();
-            let mut preview = String::new();
-            let _ = super::transcribe_streaming_local(
-                rx,
-                &recognizer,
-                None,
-                None,
-                0.01,
-                "",
-                |text, _words| {
-                    preview = text.to_string();
-                },
-                super::AccDispatchConfig::new(),
-                |_idx, _committed, _segs, seg_streaming, _ranges, _far| {
-                    slices.push(seg_streaming.to_string());
-                },
-                |_pcm_pos| {},
-                |_a, _b| {},
-            );
-            feeder.join().ok();
-            super::TEST_NO_PHANTOM_STRIP.with(|c| c.set(false));
-            (slices, preview)
-        };
-        let pad = 3 * R / 10;
-        let mut changed = 0usize;
-        for k in 0..pick.len() - 1 {
-            let (a0, a1) = pick[k];
-            let (b0, b1) = pick[k + 1];
-            let quiet = &src[a0.saturating_sub(pad)..(a1 + pad).min(src.len())];
-            let loud = &src[b0.saturating_sub(pad)..(b1 + pad).min(src.len())];
-            let (_, loud_alone) = run(
-                {
-                    let mut v = vec![0f32; R];
-                    v.extend_from_slice(loud);
-                    v.extend(std::iter::repeat(0f32).take(3 * R));
-                    v
-                },
-                false,
-            );
-            for scale in [0.004f32, 0.008] {
-                let mut audio: Vec<f32> = quiet.iter().map(|x| x * scale).collect();
-                audio.extend(std::iter::repeat(0f32).take(R * 8 / 10));
-                audio.extend_from_slice(loud);
-                audio.extend(std::iter::repeat(0f32).take(3 * R));
-                let (_, off_p) = run(audio.clone(), true);
-                let (_, on_p) = run(audio, false);
-                if off_p != on_p {
-                    changed += 1;
-                }
-                println!(
-                    "[459s] pair {k} scale={scale}\n   只放正常段={loud_alone}\n   不剥幻字={off_p}\n   剥幻字  ={on_p}"
-                );
-            }
-        }
-        println!("[459s] 剥幻字改变预览的组合：{changed}");
-    }
-
-    /// PHANTOM-406-459 ①：Gavin 全部真实录音（`collab/evidence/gavin-sessions` + `target/release/debug-audio`）
-    /// 走完整流式管线，「剥 / 不剥」幻字逐段对照派发片流式文本与最终预览 —— 看多常触发、改了什么。
-    /// 运行：`cargo test --bin feiyin-ime -- --ignored --nocapture t459_phantom_real`
-    #[test]
-    #[ignore = "requires streaming model + real sessions; --ignored 运行"]
-    fn t459_phantom_real_sessions() {
-        static CAP: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-        struct L;
-        impl log::Log for L {
-            fn enabled(&self, m: &log::Metadata<'_>) -> bool {
-                m.level() <= log::Level::Debug
-            }
-            fn log(&self, r: &log::Record<'_>) {
-                let t = r.args().to_string();
-                if t.contains("[PHANTOM-459]") {
-                    CAP.lock().unwrap().push(t);
-                }
-            }
-            fn flush(&self) {}
-        }
-        let _ = log::set_boxed_logger(Box::new(L));
-        log::set_max_level(log::LevelFilter::Debug);
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let Ok(recognizer) = super::create_local_stream_recognizer(&root.join("models")) else {
-            eprintln!("skip: 流式 paraformer 模型不在位");
-            return;
-        };
-        let mut wavs: Vec<std::path::PathBuf> = Vec::new();
-        for d in [
-            "collab/evidence/gavin-sessions",
-            "target/release/debug-audio",
-        ] {
-            if let Ok(rd) = std::fs::read_dir(root.join(d)) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if p.extension().is_some_and(|x| x == "wav") {
-                        wavs.push(p);
-                    }
-                }
-            }
-        }
-        wavs.sort();
-        let run = |audio: Vec<f32>, no_restart: bool| -> (Vec<String>, String) {
-            super::TEST_NO_PHANTOM_STRIP.with(|c| c.set(no_restart));
-            let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
-            let feeder = std::thread::spawn(move || {
-                for c in audio.chunks(1_600) {
-                    let _ = tx.send(c.to_vec());
-                }
-            });
-            let mut slices: Vec<String> = Vec::new();
-            let mut preview = String::new();
-            let _ = super::transcribe_streaming_local(
-                rx,
-                &recognizer,
-                None,
-                None,
-                0.01,
-                "",
-                |text, _words| {
-                    preview = text.to_string();
-                },
-                super::AccDispatchConfig::new(),
-                |_idx, _committed, _segs, seg_streaming, _ranges, _far| {
-                    slices.push(seg_streaming.to_string());
-                },
-                |_pcm_pos| {},
-                |_a, _b| {},
-            );
-            feeder.join().ok();
-            super::TEST_NO_PHANTOM_STRIP.with(|c| c.set(false));
-            (slices, preview)
-        };
-        let (mut n, mut changed) = (0usize, 0usize);
-        for wav in &wavs {
-            let Some(w) = sherpa_onnx::Wave::read(wav.to_str().unwrap()) else {
-                continue;
-            };
-            if w.sample_rate() != 16_000 {
-                continue;
-            }
-            let audio = w.samples().to_vec();
-            if n == 0 {
-                let _ = run(audio.clone(), true); // 预热：首跑冷启动会改变切片边界，排除干扰
-            }
-            let (off_s, off_p) = run(audio.clone(), true);
-            CAP.lock().unwrap().clear();
-            let (on_s, on_p) = run(audio, false);
-            n += 1;
-            let name = wav.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
-            for l in CAP.lock().unwrap().iter() {
-                println!("[459r] {name} {l}");
-            }
-            if off_s != on_s || off_p != on_p {
-                changed += 1;
-                println!("[459r] {name} 改变：\n   不剥幻字 preview={off_p}\n   剥幻字   preview={on_p}\n   不剥幻字 slices={off_s:?}\n   剥幻字   slices={on_s:?}");
-            }
-        }
-        println!("[459r] 真实录音 {n} 段，剥幻字改变结果 {changed} 段");
-    }
-
     /// 407 真模型：真实连续语音（>10s）+ 3s 尾静默 ⇒ 长静默信号应在**静默满 ~1900ms** 时触发一次
     /// （不依赖停止键）；打印触发时刻（wall）与静默起点（音频时间）。
     /// 运行：`cargo test --bin feiyin-ime -- --ignored --nocapture poc_tailwindow_407`
     #[test]
-    #[ignore = "requires streaming model; cargo test --bin feiyin-ime -- --ignored --nocapture poc_tailwindow_407"]
+    #[ignore = "requires preview model; cargo test --bin feiyin-ime -- --ignored --nocapture poc_tailwindow_407"]
     fn poc_tailwindow_407() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let Ok(recognizer) = super::create_local_stream_recognizer(&root.join("models")) else {
-            eprintln!("skip: 流式 paraformer 模型不在位");
+            eprintln!("skip: 预览 SenseVoice 模型不在位");
             return;
         };
         let wav = root.join("collab/research/audio-real-gavin/processed/full.wav");
@@ -3216,7 +3095,7 @@ mod tests {
             None,
             0.01,
             "",
-            |_text, _words| {},
+            |_text, _words, _tentative| {},
             super::AccDispatchConfig::new(),
             |_a, _b, _c, _d, _e, _f| {},
             |_pcm_pos| {
@@ -3235,39 +3114,322 @@ mod tests {
     }
     use std::time::Duration;
 
-    /// PHANTOM-406-459 ①：静音幻字只在整段原样出现在开头时剥掉（跳过标点），否则原样保留。
+    /// STREAM-SV-463：稳定前缀 = 两次重解的公共前缀，按 char 边界（中文不切半个字）。
     #[test]
-    fn t459_strip_phantom_prefix() {
-        use super::strip_phantom_prefix as st;
-        // Gavin 09-30 端测：幻字「他有这个事」+ 模型开口后多出的「儿」保留（最坏少剥）。
-        assert_eq!(
-            st("他有这个事儿，今天天气很好", "他有这个事"),
-            "儿，今天天气很好"
-        );
-        assert_eq!(st("我系你喂喂", "我系你"), "喂喂");
-        assert_eq!(st("我系你，喂喂", "我系你"), "喂喂", "紧跟的标点一并去掉");
-        assert_eq!(st("我，系你喂喂", "我系你"), "喂喂", "幻字中间的标点跳过");
-        // 开口后模型改写 ⇒ 不剥（绝不多剥真话）。
-        assert_eq!(st("他们今天去了", "他有这个事"), "他们今天去了");
-        assert_eq!(st("今天天气很好", "他有这个事"), "今天天气很好");
-        assert_eq!(st("他有", "他有这个事"), "他有", "文本比幻字短 ⇒ 不剥");
-        assert_eq!(st("你好", ""), "你好");
-        assert_eq!(st("你好", "，。"), "你好");
+    fn sv463_stable_prefix_bytes_char_safe() {
+        use super::stable_prefix_bytes as sp;
+        assert_eq!(sp("今天天气", "今天天晴"), "今天天".len());
+        assert_eq!(sp("", "abc"), 0);
+        assert_eq!(sp("abc", "abc"), 3);
+        assert_eq!(sp("我们", "你们"), 0);
+        assert_eq!(sp("hello wor", "hello world"), 9);
+        assert_eq!(sp("今天天气不错", "今天"), "今天".len());
     }
 
-    /// PHANTOM-406-459 ①：只作用一次（取用即清空）。
+    /// STREAM-SV-463：只有两侧都是拉丁字母 / 数字才补空格（中文、标点结尾都不补）。
     #[test]
-    fn t459_take_phantom_prefix_once() {
-        let mut p = String::from("我系你");
+    fn sv463_sentence_join_space_only_between_latin() {
+        use super::sentence_join_space as j;
+        assert!(j("hello", "world"));
+        assert!(j("version 2", "3 times"));
+        assert!(!j("你好", "world"));
+        assert!(!j("hello", "世界"));
+        assert!(!j("", "world"));
+        assert!(!j("hello.", "world"));
+        assert!(!j("hello", ""));
+    }
+
+    /// STREAM-SV-463：token 顺序对到文本（`▁` = 词首空格）；任何一处对不上 ⇒ 整体放弃。
+    #[test]
+    fn sv463_token_text_ends_align_or_give_up() {
+        use super::token_text_ends as te;
+        let toks = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
-            super::take_phantom_prefix(&mut p, "我系你喂喂".into()),
-            "喂喂"
+            te("今天天气", &toks(&["今", "天天", "气"]), &[0.1, 0.3, 0.5]),
+            vec![(0.1, 3), (0.3, 9), (0.5, 12)]
         );
-        assert!(p.is_empty());
         assert_eq!(
-            super::take_phantom_prefix(&mut p, "我系你喂喂".into()),
-            "我系你喂喂"
+            te(
+                "hello world",
+                &toks(&["\u{2581}hel", "lo", "\u{2581}world"]),
+                &[0.0, 0.2, 0.6]
+            ),
+            vec![(0.0, 3), (0.2, 5), (0.6, 11)]
         );
+        assert!(
+            te("今天天气", &toks(&["今", "地"]), &[0.1, 0.2]).is_empty(),
+            "对不上 ⇒ 空"
+        );
+    }
+
+    /// STREAM-SV-463：起始早于切点的 token 归前半；无时间戳 ⇒ None（回退旧口径）。
+    #[test]
+    fn sv463_split_bytes_at_time() {
+        use super::split_bytes_at_time as sp;
+        let marks = [(0.1, 3), (0.3, 9), (0.5, 12)];
+        assert_eq!(sp(&marks, 0.4), Some(9));
+        assert_eq!(sp(&marks, 0.05), Some(0), "切点在首字之前 ⇒ 前半为空");
+        assert_eq!(sp(&marks, 9.0), Some(12));
+        assert_eq!(sp(&[], 1.0), None);
+    }
+
+    #[test]
+    fn sv463_floor_char_boundary() {
+        let s = "a中b";
+        assert_eq!(
+            super::floor_char_boundary(s, 2),
+            1,
+            "落在「中」中间 ⇒ 退到其起点"
+        );
+        assert_eq!(super::floor_char_boundary(s, 4), 4);
+        assert_eq!(super::floor_char_boundary(s, 99), s.len());
+        assert_eq!(super::floor_char_boundary("", 3), 0);
+    }
+
+    /// STREAM-SV-463：预览线程数 = 物理核数（Gavin 2026-10-03「跟 CPU 内核数一样」；超线程实测更慢）。
+    #[test]
+    fn sv463_preview_threads_are_physical_cores() {
+        let n = super::local_stream_num_threads();
+        let logical = std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(4);
+        assert!(n >= 1, "至少 1");
+        assert!(
+            n as usize <= logical,
+            "物理核数不会超过逻辑核数：{n} > {logical}"
+        );
+        assert_eq!(n as usize, super::physical_core_count());
+    }
+
+    /// STREAM-SV-463 护栏：**每个派发点都是冻结点**（下游按字符坐标回灌的前提）。
+    ///
+    /// **改错怎么红**：
+    /// - 静默派发删掉 / 挪到 committed_len 之后的 `sim_freeze!` ⇒ 顺序断言红；
+    /// - 442 回看删掉切分确认（`sim_confirm!` + `sim_start = cut;`）⇒ 红；
+    /// - 尾片派发前不再收尾重解 + 刷新显示 ⇒ 红；
+    /// - 生产区重新出现 paraformer 流式接口 ⇒ 红。
+    #[test]
+    fn guard463_every_dispatch_point_freezes() {
+        let lines = ls_prod_lines();
+        let find_after = |from: usize, pred: &dyn Fn(&str) -> bool| -> usize {
+            (from..lines.len())
+                .find(|&i| pred(&lines[i]))
+                .unwrap_or(usize::MAX)
+        };
+        // ① 静默派发：should_dispatch_acc → sim_freeze → committed_len
+        let call = find_after(0, &|l| l.starts_with("if should_dispatch_acc("));
+        assert!(call != usize::MAX, "静默派发调用点缺失");
+        let freeze = find_after(call, &|l| l == "sim_freeze!(pcm.len(), vad_speech);");
+        let commit = find_after(call, &|l| {
+            l.starts_with("let committed_len = last_display.chars().count();")
+        });
+        assert!(
+            freeze < commit && commit != usize::MAX,
+            "静默派发必须先冻结当前句、再取 committed_len（freeze={freeze} commit={commit}）"
+        );
+        // ② 442 回看：slice_cut_at → sim_confirm + sim_start = cut → on_segment
+        let cut = find_after(0, &|l| l.contains("super::vad::slice_cut_at("));
+        assert!(cut != usize::MAX, "442 回看切点调用缺失");
+        let confirm = find_after(cut, &|l| l == "sim_confirm!();");
+        let restart = find_after(cut, &|l| l == "sim_start = cut;");
+        let seg = find_after(cut, &|l| l.starts_with("on_segment("));
+        assert!(
+            confirm < seg && restart < seg && seg != usize::MAX,
+            "442 回看派发前必须在切点确认前半、新句从切点起（confirm={confirm} restart={restart} on_segment={seg}）"
+        );
+        // ③ 尾片：派发前收尾重解 + 刷新显示
+        let tail = find_after(0, &|l| l.starts_with("if should_dispatch_tail("));
+        assert!(tail != usize::MAX, "尾片派发调用点缺失");
+        let lo = tail.saturating_sub(20);
+        assert!(
+            lines[lo..tail].iter().any(|l| l == "sim_decode!();")
+                && lines[lo..tail].iter().any(|l| l == "refresh_preview!();"),
+            "尾片派发前必须收尾重解并刷新显示（committed_len / 流式文本含句末最后几个字）"
+        );
+        // ④ paraformer 流式接口不得回到生产区
+        let code: Vec<&String> = lines.iter().filter(|l| !l.starts_with("//")).collect();
+        for needle in [
+            "OnlineRecognizer",
+            "is_endpoint(",
+            "input_finished(",
+            "is_ready(",
+        ] {
+            assert!(
+                !code.iter().any(|l| l.contains(needle)),
+                "STREAM-SV-463：生产区不得再出现 paraformer 流式接口 `{needle}`"
+            );
+        }
+    }
+
+    /// STREAM-SV-463 端到端（真模型 + 真录音）：派发点之前的预览文字**此后一字不变**。
+    ///
+    /// 喂 full.wav（+3s 尾静默）跑完整 `transcribe_streaming_local`：每次 `on_reflow_commit(seg, Some(len))`
+    /// 之后的所有显示文本，前 `len` 个字必须与登记当刻逐字相同（325/337/438/442 按字符坐标回灌的前提）；
+    /// 浅色尾巴字数不超过显示长度；收尾回调尾巴为 0。
+    /// 运行：`cargo test --bin feiyin-ime -- --ignored --nocapture sv463_preview_freeze_e2e`
+    #[test]
+    #[ignore = "requires preview model + full.wav; --ignored 运行"]
+    fn sv463_preview_freeze_e2e() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let Ok(recognizer) = super::create_local_stream_recognizer(&root.join("models")) else {
+            eprintln!("skip: 预览 SenseVoice 模型不在位");
+            return;
+        };
+        let wav = root.join("collab/research/audio-real-gavin/processed/full.wav");
+        let Some(w) = sherpa_onnx::Wave::read(wav.to_str().unwrap()) else {
+            eprintln!("skip: full.wav 不在位");
+            return;
+        };
+        let mut audio: Vec<f32> = w.samples().to_vec();
+        let speech_secs = audio.len() as f32 / 16_000.0;
+        // 442 按切点时间切分的前提：模型给逐 token 时间且能对上文本。
+        let (t5, m5) =
+            super::preview_decode_timed(&recognizer, &audio[..audio.len().min(5 * 16_000)]);
+        println!(
+            "[463] 前 5s 逐 token 时间 {} 个 / 文本 {} 字：{t5}",
+            m5.len(),
+            t5.chars().count()
+        );
+        assert!(!m5.is_empty(), "SenseVoice 应给出可对齐的逐 token 时间");
+        audio.extend(std::iter::repeat(0f32).take(3 * 16_000));
+        let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
+        for c in audio.chunks(1_600) {
+            let _ = tx.send(c.to_vec());
+        }
+        drop(tx);
+        let displays = std::cell::RefCell::new(Vec::<(String, usize)>::new());
+        let commits = std::cell::RefCell::new(Vec::<(usize, usize)>::new()); // (显示序号, len)
+        let dispatches = std::cell::Cell::new(0usize);
+        let events = std::cell::RefCell::new(Vec::<String>::new());
+        // 生产同款预览标点（438：3.5s 间隔重打边界之后的尾巴）—— 冻结前缀必须经得起重打。
+        let mut punct = crate::punctuation::PunctuationEngine::new(&root.join("models"));
+        println!(
+            "[463] 预览标点引擎：{}",
+            if punct.is_some() {
+                "在位"
+            } else {
+                "缺失（不打点）"
+            }
+        );
+        let t0 = std::time::Instant::now();
+        let (final_preview, _pcm) = super::transcribe_streaming_local(
+            rx,
+            &recognizer,
+            None,
+            punct.as_mut(),
+            0.01,
+            "",
+            |text, _words, tentative| {
+                assert!(
+                    tentative <= text.chars().count(),
+                    "浅色尾巴不得超过显示长度：{tentative} > {}",
+                    text.chars().count()
+                );
+                let tail: String = {
+                    let v: Vec<char> = text.chars().collect();
+                    v[v.len().saturating_sub(14)..].iter().collect()
+                };
+                events.borrow_mut().push(format!(
+                    "显示#{} 字数={} 浅色={} …{tail}",
+                    displays.borrow().len(),
+                    text.chars().count(),
+                    tentative
+                ));
+                displays.borrow_mut().push((text.to_string(), tentative));
+            },
+            super::AccDispatchConfig::new(),
+            |i, len, _segs, st, _r, _f| {
+                dispatches.set(dispatches.get() + 1);
+                events
+                    .borrow_mut()
+                    .push(format!("派发#{i} committed_len={len} 片流式文本={st}"));
+            },
+            |_pcm_pos| {},
+            |seg, len| {
+                events
+                    .borrow_mut()
+                    .push(format!("登记 seg={seg} len={len:?}"));
+                if let Some(len) = len {
+                    let at = displays.borrow().len();
+                    commits.borrow_mut().push((at, len));
+                }
+            },
+        )
+        .expect("transcribe_streaming_local");
+        let displays = displays.into_inner();
+        let commits = commits.into_inner();
+        for e in events.into_inner() {
+            println!("[463-ev] {e}");
+        }
+        println!(
+            "\n[463] 语音 {speech_secs:.1}s 处理 {:.1}s ｜ 显示刷新 {} 次 ｜ 派发 {} 片 ｜ 登记边界 {} 个",
+            t0.elapsed().as_secs_f64(),
+            displays.len(),
+            dispatches.get(),
+            commits.len()
+        );
+        println!("[463] 收尾预览：{final_preview}");
+        assert!(!displays.is_empty(), "必须有预览输出");
+        assert!(dispatches.get() >= 1, "必须至少派发一片");
+        for &(at, len) in &commits {
+            let Some((base, _)) = displays[..at].last() else {
+                continue;
+            };
+            let head: String = base.chars().take(len).collect();
+            for (later, _) in &displays[at..] {
+                let later_head: String = later.chars().take(len).collect();
+                assert_eq!(
+                    later_head, head,
+                    "登记边界 len={len} 之前的预览文字被改写（第 {at} 次显示之后）"
+                );
+            }
+        }
+        assert_eq!(
+            displays.last().map(|d| d.1),
+            Some(0),
+            "收尾回调的浅色尾巴必须为 0"
+        );
+
+        // 日 / 韩：实时管线预览能出假名 / 谚文（STREAM-KOJA-462 的出发点）。
+        let sv_dir = root
+            .join("models")
+            .join(crate::transcription::SENSEVOICE_MODEL_SUBDIR);
+        let kana = |c: char| ('\u{3040}'..='\u{30ff}').contains(&c);
+        let hangul = |c: char| ('\u{ac00}'..='\u{d7a3}').contains(&c);
+        for (lang, ok) in [("ja", &kana as &dyn Fn(char) -> bool), ("ko", &hangul)] {
+            let wav = sv_dir.join(format!("test_wavs/{lang}.wav"));
+            let Some(w) = sherpa_onnx::Wave::read(wav.to_str().unwrap()) else {
+                eprintln!("skip: {lang}.wav 不在位");
+                continue;
+            };
+            let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
+            for c in w.samples().chunks(1_600) {
+                let _ = tx.send(c.to_vec());
+            }
+            for _ in 0..20 {
+                let _ = tx.send(vec![0f32; 1_600]);
+            }
+            drop(tx);
+            let (preview, _) = super::transcribe_streaming_local(
+                rx,
+                &recognizer,
+                None,
+                None,
+                0.01,
+                "",
+                |_t, _w, _n| {},
+                super::AccDispatchConfig::new(),
+                |_i, _len, _segs, _st, _r, _f| {},
+                |_pcm_pos| {},
+                |_seg, _len| {},
+            )
+            .expect("transcribe_streaming_local");
+            println!("[463] {lang} 预览：{preview}");
+            assert!(
+                preview.chars().any(ok),
+                "{lang} 预览应含本语种文字：{preview}"
+            );
+        }
     }
 
     /// LOCALRT-REFLOW-HOLE-344-G：片段流式文本按**字符**切片，绝不字节切片（中文安全、不 panic）。
@@ -3396,127 +3558,9 @@ mod tests {
     }
 
     // ========================================================================
-    // LOCALRT-ENDPOINT-EMPTY-342 · F1+F3 决策纯函数
-    //   「假 endpoint 不确认/不推进游标 + 静音流幻字不入预览」的行为由 `endpoint_action`
-    //   纯函数钉死；端到端时序由源码护栏（下方 guard342_*）钉死。
-    // ========================================================================
-
-    /// 判据 #1：假 endpoint（本句无声）即使三方有非空文本也一律抑制（幻字抑制）。
-    #[test]
-    fn endpoint_action_342_fake_endpoint_suppressed_even_with_text() {
-        // 无声 + 有文本 ⇒ 抑制（静音流幻字绝不并入预览）。
-        assert_eq!(
-            endpoint_action(false, false),
-            EndpointAction::SuppressSilence
-        );
-        // 无声 + 空 ⇒ 同样抑制（不确认、不推进游标）。
-        assert_eq!(
-            endpoint_action(false, true),
-            EndpointAction::SuppressSilence
-        );
-    }
-
-    /// 判据 #2：真 endpoint（本句有语音）行为逐位不变 —— 有文本确认、空则只记 EMPTY。
-    #[test]
-    fn endpoint_action_342_real_endpoint_unchanged() {
-        assert_eq!(endpoint_action(true, false), EndpointAction::Confirm);
-        assert_eq!(endpoint_action(true, true), EndpointAction::Empty);
-    }
-
-    // ========================================================================
-    // LOCALRT-ENDPOINT-EMPTY-342 · 源码级结构护栏
-    // ========================================================================
-
-    /// 判据 #3：endpoint 分支「推进游标」必须被 `segment_has_speech` 门控；
-    /// 非 endpoint 分支的 `on_result` 必须被 `speech_since_last_reset` 门控；
-    /// 有声判据在函数体内**恰好一处置位**（复用现有能量分支，不另抄阈值）。
-    #[test]
-    fn guard342_silence_segment_does_not_advance_or_render() {
-        let (lines, (lo, hi), (fn_lo, fn_hi)) = endpoint_guard_regions();
-
-        // endpoint 分支：游标推进必须是条件式（假 endpoint 不推进）。
-        assert_eq!(
-            count_starts(&lines, lo, hi, "sentence_id += segment_has_speech as i64;"),
-            1,
-            "342: sentence_id 必须按 segment_has_speech 条件推进"
-        );
-        assert_eq!(
-            count_starts(
-                &lines,
-                lo,
-                hi,
-                "let next_sentence_start = if segment_has_speech {"
-            ),
-            1,
-            "342: sentence_pcm_start 必须按 segment_has_speech 条件取值"
-        );
-        assert_eq!(
-            count_starts(&lines, lo, hi, "sentence_pcm_start = next_sentence_start;"),
-            1,
-            "342: sentence_pcm_start 必须赋条件值"
-        );
-        assert_eq!(
-            count_starts(&lines, lo, hi, "sentence_id += 1;"),
-            0,
-            "342: 不得无条件推进 sentence_id"
-        );
-        assert_eq!(
-            count_starts(&lines, lo, hi, "sentence_pcm_start = pcm.len();"),
-            0,
-            "342: 不得无条件推进 sentence_pcm_start"
-        );
-
-        // 非 endpoint 分支：文本入预览必须与有声音号同条件。
-        let sup = (fn_lo..=fn_hi)
-            .find(|&i| lines[i].starts_with("if !r.text.is_empty() && speech_since_last_reset {"))
-            .expect(
-                "342: 非 endpoint 文本必须按 `!r.text.is_empty() && speech_since_last_reset` 门控",
-            );
-        let onres = (fn_lo..=fn_hi)
-            .find(|&i| lines[i].starts_with("state.on_result(sentence_id, &r.text, false"))
-            .expect("342: 非 endpoint 中间结果 on_result 行必须存在");
-        assert!(
-            sup < onres,
-            "342: 非 endpoint 的 on_result 必须被 speech_since_last_reset 门控，实测 sup={sup} onres={onres}"
-        );
-
-        let n_set = count_starts(&lines, fn_lo, fn_hi, "speech_since_last_reset = true;");
-        assert_eq!(
-            n_set, 1,
-            "342: 有声判据应恰 1 处置位（复用现有能量分支 chunk_rms>silence_threshold），实测 {n_set}"
-        );
-    }
-
-    /// 判据 #4：endpoint 分支必须走 `endpoint_action(...)` 决策，且抑制分支存在一次。
-    #[test]
-    fn guard342_uses_endpoint_action() {
-        let (lines, (lo, hi), _) = endpoint_guard_regions();
-        let n_call = count_contains(
-            &lines,
-            lo,
-            hi,
-            "endpoint_action(segment_has_speech, confirm_text.is_empty())",
-        );
-        assert_eq!(
-            n_call, 1,
-            "342: endpoint 分支应调用 endpoint_action 恰 1 次，实测 {n_call}"
-        );
-        let n_sup = count_contains(&lines, lo, hi, "EndpointAction::SuppressSilence");
-        assert_eq!(n_sup, 1, "342: 抑制分支应恰 1 处，实测 {n_sup}");
-    }
-
-    // ========================================================================
-    // GUARD-291 · FIX-LOCALRT-TAILCHAR-291 源码级结构护栏（交叉，非作者：coder-1）
-    //
-    // 行为级护栏在这里做不了：`OnlineRecognizer` 需要真模型，单测里起不来。
-    // 故照仓库既有源码结构护栏写法（`src/main.rs::overlay_121_guard_tests`）：
-    // 读本文件生产区源码 → needle 计数 → 花括号定界取块。
-    //
-    // 钉死的四条不变式（I1~I4 见 291 handoff）：
-    //   I1 endpoint 分支 `stream.input_finished()` 必须早于「取 after_text 的 get_result」
-    //   I2 endpoint 分支不得再出现 `recognizer.reset(`
-    //   I3 endpoint 分支必须用 `recognizer.create_stream()` 换新流（344 移除 307 后为 1 处：仅换流）
-    //   I4 本句 `state.on_result(..., true, ...)` 只确认一次
+    // 源码级结构护栏的公共工具（读本文件生产区源码 → needle 定位 → 花括号定界取块）。
+    // STREAM-SV-463：paraformer 专用的 342（假 endpoint）/ 291（句末 flush）护栏随旧模型移除，
+    // 新机制「每个派发点都是冻结点」由 `guard463_every_dispatch_point_freezes` 钉死。
     // ========================================================================
 
     /// 本文件生产区（首个 `#[cfg(test)]` 之前）的逐行 trim 文本。
@@ -3565,145 +3609,6 @@ mod tests {
             .iter()
             .position(|l| l.starts_with(needle))
             .unwrap_or_else(|| panic!("GUARD-291: 定位锚点不存在: {needle}"))
-    }
-
-    /// 定界 endpoint **真分支**（`if endpoint {` 到其闭合 `}` 的前一行）。
-    ///
-    /// 🔴 FIX-GUARD-297：原实现用「首个 `} else`」截断，会命中分支内**嵌套**的 `if … {} else {}`
-    /// （如 `endpoint_action` 的判据分支），把真正的 `recognizer.create_stream()` 排除出扫描区 ⇒ G3 假红。
-    ///
-    /// 现改为**单遍花括号游标**：从 `if endpoint {` 起维护相对 `depth`；当 `depth == 1`
-    /// 且行首为 `}` 时，该 `}` 就是真分支的闭合花括号（Rust 的 `} else if … {` 里第一个
-    /// `}` 正是关真分支的），分支体止于其前一行。对任意层嵌套都成立——因为嵌套的 `}`
-    /// 出现时 `depth ≥ 2`，不会被 `depth == 1` 命中。
-    fn endpoint_branch_bounds(lines: &[String], ep_anchor: usize) -> (usize, usize) {
-        let mut depth = 0i32;
-        let mut open_idx = usize::MAX;
-        for (i, line) in lines.iter().enumerate().skip(ep_anchor) {
-            if open_idx != usize::MAX && depth == 1 && line.starts_with('}') {
-                return (open_idx, i - 1);
-            }
-            depth += brace_delta_291(line);
-            if open_idx == usize::MAX && depth > 0 {
-                open_idx = i;
-            }
-        }
-        panic!("GUARD-297: 未能定界 endpoint 真分支（anchor={ep_anchor}，源码结构已变）");
-    }
-
-    /// 返回 (`生产区全部行`, `endpoint 真分支范围`, `函数体范围`)。
-    fn endpoint_guard_regions() -> (Vec<String>, (usize, usize), (usize, usize)) {
-        let lines = ls_prod_lines();
-        let fn_line = first_line(&lines, "pub fn transcribe_streaming_local(");
-        let (fn_lo, fn_hi) = block_bounds_291(&lines, fn_line);
-        let ep_anchor = fn_lo
-            + lines[fn_lo..=fn_hi]
-                .iter()
-                .position(|l| l.starts_with("if endpoint {"))
-                .expect("GUARD-291: endpoint 分支锚点 `if endpoint {` 不存在");
-        let (ep_lo, ep_hi) = endpoint_branch_bounds(&lines, ep_anchor);
-        // 自证区间「既不短也不长」：首行是 if 锚点；区间末行的下一行必须以 `}` 开头
-        // （即真分支的闭合花括号行）。任一不满足 ⇒ 区域定界又错了 ⇒ 立刻红。
-        assert!(
-            lines[ep_lo].starts_with("if endpoint {"),
-            "GUARD-297: endpoint 区间首行应为 `if endpoint {{`，实测: {}",
-            lines[ep_lo]
-        );
-        assert!(
-            ep_hi + 1 < lines.len() && lines[ep_hi + 1].starts_with('}'),
-            "GUARD-297: endpoint 区间末行的下一行应为闭合花括号，实测: {}",
-            lines.get(ep_hi + 1).map(String::as_str).unwrap_or("<EOF>")
-        );
-        (lines, (ep_lo, ep_hi), (fn_lo, fn_hi))
-    }
-
-    fn count_starts(lines: &[String], lo: usize, hi: usize, needle: &str) -> usize {
-        lines[lo..=hi]
-            .iter()
-            .filter(|l| l.starts_with(needle))
-            .count()
-    }
-
-    fn count_contains(lines: &[String], lo: usize, hi: usize, needle: &str) -> usize {
-        lines[lo..=hi].iter().filter(|l| l.contains(needle)).count()
-    }
-
-    /// G1（I1）：endpoint 分支内 `stream.input_finished()` 必须夹在两次
-    /// `.get_result(&stream)` 之间（flush 前 before_text ＜ flush ＜ flush 后 after_text）。
-    ///
-    /// **改错怎么红**：把 flush 删掉 ⇒ 找不到 `stream.input_finished()` ⇒ panic 红；
-    /// 把 flush 挪到取 after_text 之后 ⇒ after 侧不再有 get_result（计数/顺序断言红）。
-    #[test]
-    fn guard291_g1_flush_before_after_text() {
-        let (lines, (lo, hi), _) = endpoint_guard_regions();
-        let fi = (lo..=hi)
-            .find(|&i| lines[i].starts_with("stream.input_finished()"))
-            .expect("G1: endpoint 分支内必须有 stream.input_finished()（flush 被删 ⇒ 红）");
-        let grs: Vec<usize> = (lo..=hi)
-            .filter(|&i| lines[i].starts_with(".get_result(&stream)"))
-            .collect();
-        assert_eq!(
-            grs.len(),
-            2,
-            "G1: endpoint 分支内 .get_result(&stream) 应恰 2 处（before_text / after_text），实测 {:?}",
-            grs
-        );
-        assert!(
-            grs[0] < fi && fi < grs[1],
-            "G1: input_finished() 必须位于两次 get_result 之间（before<flush<after），实测 flush={fi} gets={grs:?}"
-        );
-    }
-
-    /// G2（I2）：`transcribe_streaming_local` 函数体内 `recognizer.reset(` 计数必须为 0。
-    ///
-    /// **改错怎么红**：任何地方把换新流改回 `recognizer.reset(` ⇒ 计数 ≥1 ⇒ 红。
-    #[test]
-    fn guard291_g2_no_recognizer_reset() {
-        let (lines, _, (fn_lo, fn_hi)) = endpoint_guard_regions();
-        let n = count_contains(&lines, fn_lo, fn_hi, "recognizer.reset(");
-        assert_eq!(
-            n, 0,
-            "G2: input_finished() 后旧流不可复用 ⇒ 函数体内不得出现 recognizer.reset(，实测 {n} 处"
-        );
-    }
-
-    /// G3（I3，LOCALRT-ROLLBACK-344 后修订）：endpoint 分支内 `recognizer.create_stream()`
-    /// 恰 **1** 处 —— 仅剩 291 句末换新流（`input_finished()` 后旧流不可复用）。
-    ///
-    /// 沿革：307 全量重解码引入后曾为 2 处；344 移除 307（26/26 gained=0、纯开销）⇒ 回到 1 处。
-    ///
-    /// **改错怎么红**：删换流 ⇒ 计数 0 ⇒ 红；分支内再多建流（如重新引入全量重解码）⇒ 2 ⇒ 红。
-    #[test]
-    fn guard291_g3_endpoint_creates_new_stream_once() {
-        let (lines, (lo, hi), _) = endpoint_guard_regions();
-        let n = count_contains(&lines, lo, hi, "recognizer.create_stream()");
-        assert_eq!(
-            n, 1,
-            "G3: endpoint 分支内应恰 1 处 create_stream（291 句末换流；307 已按 344 移除），实测 {n}"
-        );
-    }
-
-    /// G4（I4）：`state.on_result(` 函数体内恰 3 处 ——
-    /// ① endpoint 确认（true）② 非 endpoint 中间结果（false）③ loop 后 flush 收尾（false）；
-    /// 且带 `true` 的确认恰 1 处（防 FIX-252 重复确认）。
-    ///
-    /// **改错怎么红**：endpoint 分支再补一次确认 ⇒ 带 true 的计数变 2 ⇒ 红；
-    /// 少一路（如删收尾）⇒ 总数变 2 ⇒ 红。
-    #[test]
-    fn guard291_g4_on_result_sites() {
-        let (lines, _, (fn_lo, fn_hi)) = endpoint_guard_regions();
-        let total = count_starts(&lines, fn_lo, fn_hi, "state.on_result(");
-        assert_eq!(
-            total, 3,
-            "G4: state.on_result( 应恰 3 处（endpoint true / 非 endpoint false / 收尾 false），实测 {total}"
-        );
-        let confirms = (fn_lo..=fn_hi)
-            .filter(|&i| lines[i].starts_with("state.on_result(") && lines[i].contains(", true,"))
-            .count();
-        assert_eq!(
-            confirms, 1,
-            "G4: endpoint 确认（on_result ..., true, ...）必须恰 1 处（防重复确认），实测 {confirms}"
-        );
     }
 
     // ========================================================================
@@ -3916,264 +3821,6 @@ mod tests {
     // LOCALRT-STREAM-THREADS-417（Gavin 2026-09-25）：预览侧封顶 4，与精解侧刻意分口径。
     // ============================================================
 
-    /// 线程数须**随机器核数变化**且**封顶 4**，不得写死；核数不足 4 不超订。
-    #[test]
-    fn stream_num_threads_follows_machine_cores_and_caps_at_4() {
-        let n = local_stream_num_threads();
-        assert!(n >= 1, "至少 1；取不到核数时回落 4");
-        assert!(
-            n <= 4,
-            "封顶 4（Gavin 2026-09-25：预览与精解抢 CPU，预览侧让核）"
-        );
-        let expected = std::thread::available_parallelism()
-            .map(|c| c.get().min(4) as i32)
-            .unwrap_or(4);
-        assert_eq!(
-            n, expected,
-            "口径 = available_parallelism().min(4)，取不到回落 4"
-        );
-        // LOCALRT-STREAM-THREADS-417：与精解侧 `default_acc_num_threads()`（min(8)）
-        // **刻意不再同口径** —— 预览封顶更低以让核给精解；≥8 核时必不同（4 vs 8）。
-        let acc = crate::transcription::default_acc_num_threads();
-        let cores = std::thread::available_parallelism()
-            .map(|c| c.get())
-            .unwrap_or(4);
-        if cores >= 8 {
-            assert_ne!(n, acc, "≥8 核：预览侧 4、精解侧 8，两者刻意分口径（417）");
-        }
-    }
-
-    /// LOCALRT-SEAM-337：**lookahead（滞后量）实测** —— 针对音频位置 P 的文本，还需再喂多少
-    /// 音频才不再增长。手法：喂真实 wav 到 P，然后**喂静音**（静音不产新字）继续解码，
-    /// 观察文本何时停止增长 ⇒ 该增长即为「音频 ≤ P 的滞后补字」，其耗时即 lookahead 上界。
-    ///
-    /// 手工跑：`cargo test --bin feiyin-ime seam337_lookahead -- --ignored --nocapture`
-    /// 对照：`config.yaml` `chunk_length: 500` × `chunk_shift_ratio: 0.5` ⇒ 块 500ms / 步进 250ms
-    /// ⇒ 理论滞后上界 = 一个块长 500ms。
-    #[test]
-    #[ignore = "手工：337 lookahead 实测（需模型 + wav）"]
-    fn seam337_lookahead_probe() {
-        use sherpa_onnx::Wave;
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let rec = super::create_local_stream_recognizer(&root.join("models"))
-            .expect("create_local_stream_recognizer（模型须在位）");
-        let p = root.join("models/kv259/kv_long.wav");
-        let ps = p.to_string_lossy();
-        let wave = Wave::read(&ps).expect("kv_long.wav");
-        let rate = wave.sample_rate();
-        let samples = wave.samples();
-        let step = (rate as usize / 50).max(1); // 20ms
-        let cap_ms = 2000usize;
-        for p_ms in (2000..=50000).step_by(2000) {
-            let p_samples = rate as usize * p_ms / 1000;
-            if p_samples >= samples.len() {
-                continue;
-            }
-            let stream = rec.create_stream();
-            let mut pos = 0usize;
-            while pos < p_samples {
-                let end = (pos + step).min(p_samples);
-                stream.accept_waveform(rate, &samples[pos..end]);
-                while rec.is_ready(&stream) {
-                    rec.decode(&stream);
-                }
-                pos = end;
-            }
-            let len_at_p = rec
-                .get_result(&stream)
-                .map(|r| r.text)
-                .unwrap_or_default()
-                .chars()
-                .count();
-            let zeros = vec![0.0f32; step];
-            let mut extra_ms = 0usize;
-            let mut last_grow_ms = 0usize;
-            let mut prev = len_at_p;
-            while extra_ms < cap_ms {
-                stream.accept_waveform(rate, &zeros);
-                while rec.is_ready(&stream) {
-                    rec.decode(&stream);
-                }
-                extra_ms += 20;
-                let l = rec
-                    .get_result(&stream)
-                    .map(|r| r.text)
-                    .unwrap_or_default()
-                    .chars()
-                    .count();
-                if l > prev {
-                    last_grow_ms = extra_ms;
-                    prev = l;
-                }
-            }
-            println!(
-                "[337-LA] P={p_ms}ms len_at_P={len_at_p} final_len={prev} growth={} last_grow_after_P={last_grow_ms}ms",
-                prev - len_at_p
-            );
-        }
-    }
-
-    /// LOCALRT-SEAM-337：**尾巴流方案**可行性实测（CPU + 无左上下文质量）。
-    ///
-    /// 手工跑：`cargo test --bin feiyin-ime seam337_tail_feasibility -- --ignored --nocapture`
-    /// 做法：主流式连续喂全 wav 取增量文本；每 5s 音频模拟一次「派发」，同时**新开一条尾巴流**
-    /// 只喂该 5s 区间并计时，比较「尾巴流文本」vs「主流式同区间的增量文本」。
-    /// 🔴 只读实测，不改任何生产行为。
-    #[test]
-    #[ignore = "手工：337 尾巴流可行性实测（需模型 + wav）"]
-    fn seam337_tail_feasibility_probe() {
-        use sherpa_onnx::Wave;
-        use std::time::Instant;
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let recognizer = super::create_local_stream_recognizer(&root.join("models"))
-            .expect("create_local_stream_recognizer（模型须在位）");
-        for rel in [
-            "models/kv259/kv_long.wav",
-            "models/kv259/kv_long_204.wav",
-            "models/kv259/kv_short.wav",
-        ] {
-            let p = root.join(rel);
-            let ps = p.to_string_lossy();
-            let Some(wave) = Wave::read(&ps) else {
-                println!("[337] skip missing {rel}");
-                continue;
-            };
-            let rate = wave.sample_rate();
-            let samples = wave.samples();
-            let chunk = (rate as usize / 10).max(1); // ≈100ms
-            let seg_samples = (rate as usize * 5).max(1); // 模拟派发间隔 = 5s 音频
-            let main = recognizer.create_stream();
-            let mut tail = recognizer.create_stream();
-            let mut main_text = String::new();
-            let mut prev_main_len = 0usize;
-            let mut tail_decode_ms = 0.0f64;
-            let mut tail_audio_ms = 0.0f64;
-            let mut pos = 0usize;
-            let mut next = seg_samples;
-            let mut seg = 0usize;
-            while pos < samples.len() {
-                let end = (pos + chunk).min(samples.len());
-                main.accept_waveform(rate, &samples[pos..end]);
-                while recognizer.is_ready(&main) {
-                    recognizer.decode(&main);
-                }
-                tail.accept_waveform(rate, &samples[pos..end]);
-                let t = Instant::now();
-                while recognizer.is_ready(&tail) {
-                    recognizer.decode(&tail);
-                }
-                tail_decode_ms += t.elapsed().as_secs_f64() * 1000.0;
-                tail_audio_ms += (end - pos) as f64 / rate as f64 * 1000.0;
-                pos = end;
-                if pos >= next || pos == samples.len() {
-                    let mt = recognizer
-                        .get_result(&main)
-                        .map(|r| r.text)
-                        .unwrap_or_default();
-                    let tt = recognizer
-                        .get_result(&tail)
-                        .map(|r| r.text)
-                        .unwrap_or_default();
-                    let delta: String = mt.chars().skip(prev_main_len).collect();
-                    let head: String = tt.chars().take(8).collect();
-                    println!(
-                        "[337] {rel} seg{seg}: audio={:.0}ms tail_decode={:.0}ms rtf={:.3} tail_len={} main_delta_len={} tail_eq_delta={} delta_starts_with_tail_head={}",
-                        tail_audio_ms,
-                        tail_decode_ms,
-                        tail_decode_ms / tail_audio_ms.max(1.0),
-                        tt.chars().count(),
-                        delta.chars().count(),
-                        !tt.is_empty() && tt == delta,
-                        !head.is_empty() && delta.starts_with(&head),
-                    );
-                    println!("[337]   tail_text={tt}");
-                    println!("[337]   main_delta={delta}");
-                    prev_main_len = mt.chars().count();
-                    main_text = mt;
-                    tail = recognizer.create_stream(); // 重建：丢弃旧尾巴
-                    tail_decode_ms = 0.0;
-                    tail_audio_ms = 0.0;
-                    next += seg_samples;
-                    seg += 1;
-                }
-            }
-            println!("[337] {rel} main_total_chars={}", main_text.chars().count());
-        }
-    }
-
-    /// LOCALRT-TIMESTAMP-336：**离线**验证流式 paraformer 是否给 token 时间戳。
-    ///
-    /// 手工跑（不会进常规回归）：
-    /// `cargo test --bin feiyin-ime localrt_timestamp_336 -- --ignored --nocapture`
-    ///
-    /// 做法：复用生产建流参数 [`super::create_local_stream_recognizer`] 构造 recognizer，
-    /// 把仓库现成 wav（中文长句）按 ~100ms chunk 喂进 OnlineStream，与生产主循环同序
-    /// （`accept_waveform → while is_ready decode → get_result`），每次文本变化打印一行探针。
-    /// 🔴 **只读观测**：不改 `.map(|r| r.text)` 取用行为，不碰预览合成。
-    /// 🔴 量具自检：同一行打印 `text_chars`（此处恒 >0）⇒「ts=none」可区分「模型不给」与「行未执行」。
-    #[test]
-    #[ignore = "手工：需模型 + wav；离线验证 336（不接受麦克风）"]
-    fn localrt_timestamp_336_probe_offline() {
-        use sherpa_onnx::Wave;
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let recognizer = super::create_local_stream_recognizer(&root.join("models"))
-            .expect("create_local_stream_recognizer（模型须在位）");
-        for rel in [
-            "models/kv259/kv_long.wav",
-            "models/kv259/kv_long_204.wav",
-            "models/kv259/kv_short.wav",
-            "models/kv259/colloq.wav",
-        ] {
-            let path = root.join(rel);
-            let path_str = path.to_string_lossy();
-            let Some(wave) = Wave::read(&path_str) else {
-                println!("[336] skip missing {rel}");
-                continue;
-            };
-            let rate = wave.sample_rate();
-            let samples = wave.samples();
-            let stream = recognizer.create_stream();
-            // chunk ≈ 100ms（与生产音频回调量级一致；建流参数由 create_local_stream_recognizer 提供）
-            let chunk = (rate as usize / 10).max(1);
-            let mut last = String::new();
-            let mut printed = 0usize;
-            let mut pos = 0usize;
-            while pos < samples.len() {
-                let end = (pos + chunk).min(samples.len());
-                stream.accept_waveform(rate, &samples[pos..end]);
-                while recognizer.is_ready(&stream) {
-                    recognizer.decode(&stream);
-                }
-                pos = end;
-                if let Some(r) = recognizer.get_result(&stream) {
-                    if !r.text.is_empty() && r.text != last {
-                        let ts_desc = match &r.timestamps {
-                            Some(v) => {
-                                format!("len={} first_ts={:?}", v.len(), &v[..v.len().min(3)])
-                            }
-                            None => "none".to_string(),
-                        };
-                        println!(
-                            "[LocalRT-DBG-336] result probe: text_chars={} tokens={} ts={} is_final={} segment={:?} start_time={:?}",
-                            r.text.chars().count(),
-                            r.tokens.len(),
-                            ts_desc,
-                            r.is_final,
-                            r.segment,
-                            r.start_time
-                        );
-                        last = r.text.clone();
-                        printed += 1;
-                        if printed > 20 {
-                            break; // 有界，避免刷屏
-                        }
-                    }
-                }
-            }
-            println!("[336] {rel}: probes_printed={printed}");
-        }
-    }
-
     // ========================================================================
     // LOCALRT-ROLLBACK-344：原 LOCALRT-TAILPAD-340「补静音」两条契约**连同机制一并移除**
     //
@@ -4323,7 +3970,7 @@ mod tests {
         let head = punct_head(
             &cache_prefix,
             raw2,
-            raw1.len(),
+            raw1,
             raw1.len(),
             cache_prefix.chars().count(),
         );
@@ -4349,6 +3996,7 @@ mod tests {
         let mut cache = PunctPreviewCache {
             prefix: String::new(),
             raw_len: 0,
+            raw: String::new(),
         };
         let raw = "今天天气不错我们准备开始讨论";
         assert_eq!(preview_display(raw, None, &mut cache, true, 0, 0), raw);
@@ -4416,18 +4064,12 @@ mod tests {
         let raw1 = "今天天气不错我们准备开始讨论这个项目";
         let prefix = build_punct_prefix("", "今天天气不错，我们准备开始讨论这个项目。");
         let cache_raw_len = raw1.len();
-        let head = punct_head(
-            &prefix,
-            raw1,
-            cache_raw_len,
-            cache_raw_len,
-            prefix.chars().count(),
-        );
+        let head = punct_head(&prefix, raw1, raw1, cache_raw_len, prefix.chars().count());
         assert_eq!(head.as_bytes(), prefix.as_bytes(), "A: 冻结前缀逐字节不变");
 
         // A2：派发边界在缓存覆盖位之后 ⇒ 保留头 = 前缀 + raw 逐字尾巴（不引入任何新标点）。
         let raw2 = "今天天气不错我们准备开始讨论这个项目的具体细节";
-        let head2 = punct_head(&prefix, raw2, cache_raw_len, raw2.len(), 0);
+        let head2 = punct_head(&prefix, raw2, raw1, raw2.len(), 0);
         let expect = format!("{}{}", prefix, &raw2[cache_raw_len..]);
         assert_eq!(head2.as_bytes(), expect.as_bytes());
         assert_eq!(&head2[..prefix.len()], prefix, "A2: 前缀部分逐字节不变");
@@ -4438,12 +4080,41 @@ mod tests {
         let prefix_b = format!("{}{}", dispatch_display, "开始讨论这个项目。"); // 之后一次打点的缓存
         let raw_b = "今天天气不错我们准备开始讨论这个项目";
         let tail_start_b = "今天天气不错我们准备".len(); // 派发当刻的 raw 字节长
-        let head_b = punct_head(&prefix_b, raw_b, raw_b.len(), tail_start_b, head_chars);
+        let head_b = punct_head(&prefix_b, raw_b, raw_b, tail_start_b, head_chars);
         assert_eq!(
             head_b.as_bytes(),
             dispatch_display.as_bytes(),
             "B: 冻结前缀逐字节不变"
         );
+    }
+
+    /// STREAM-SV-463：标点缓存校验复用 —— 缓存覆盖的裸文本被改写时，只保留公共前缀那段的标点，
+    /// 其后接当前裸文本；绝不显示改写前的旧字，也不把改写后的字接在旧字后面（重复）。
+    #[test]
+    fn sv463_punct_cache_view_never_shows_rewritten_text() {
+        use super::punct_cache_view as v;
+        let cache_raw = "近期威威队内出现了疾病";
+        let prefix = "近期，威威队内出现了疾病";
+        // 未改写（只追加）⇒ 与 344 口径一致：缓存 + 新增后缀。
+        assert_eq!(
+            v(prefix, cache_raw, "近期威威队内出现了疾病传播"),
+            "近期，威威队内出现了疾病传播"
+        );
+        // 改写了「威威」→「挪威」：只保留公共前缀「近期」那段（紧跟其后的标点是按旧字打的，一并不留，
+        // 下次 3.5s 打点再补），其后全是当前裸文本。
+        assert_eq!(
+            v(prefix, cache_raw, "近期挪威队内出现了疾病传播"),
+            "近期挪威队内出现了疾病传播"
+        );
+        // 公共前缀之内的标点照常保留。
+        assert_eq!(
+            v("今天，天气不错", "今天天气不错", "今天天气真好"),
+            "今天，天气真好"
+        );
+        // 改写后变短：不留旧尾巴、不重复。
+        assert_eq!(v(prefix, cache_raw, "近期挪威"), "近期挪威");
+        // 空缓存 ⇒ 原样。
+        assert_eq!(v("", "", "你好"), "你好");
     }
 
     /// ⑨ 重打后 `reflow_preview(acc, streaming, committed_len)` 不多字、不丢字：
@@ -4455,7 +4126,7 @@ mod tests {
         let l1 = "今天天气不错我们准备".len();
         let raw2 = "今天天气不错我们准备开始讨论这个项目";
         // 首次间隔重打：冻结前缀 = display1，尾巴补打并剥尾。
-        let head = punct_head(display1, raw2, l1, l1, committed);
+        let head = punct_head(display1, raw2, &raw2[..l1], l1, committed);
         let display2 = build_punct_prefix(&head, "开始讨论这个项目。");
         assert_eq!(display2, "今天天气不错，我们准备开始讨论这个项目");
         assert!(display2.starts_with(display1), "⑧/⑨ 前缀冻结 ⇒ 切位不漂");
@@ -5662,8 +5333,9 @@ mod testsync405_407_tests {
         should_signal_long_silence, DisplayCache, StreamingAsrState, LONG_SILENCE_TAIL_MS,
     };
 
-    /// 405 契约1（源码）：生产区不得再出现「另起 stream 重解整句」——
-    /// 生产区 `create_stream()` 恰 2 处（主 stream 建立 + endpoint 换流）；无 `shadow` 影子 stream。
+    /// 405 契约1（源码）：生产区不得再出现「另起 stream 重解整句」的额外解码 ——
+    /// STREAM-SV-463 起「整句重解」本身就是模拟流式的机制，收口为：`create_stream()` 恰 1 处
+    /// （在 `preview_decode` 内），`preview_decode(` 恰 1 个调用点（`sim_decode_text!` 宏）；无 `shadow`。
     #[test]
     fn ts405b_no_extra_decode_stream_source_guard() {
         let src = include_str!("local_stream.rs");
@@ -5675,8 +5347,14 @@ mod testsync405_407_tests {
             .join("\n");
         assert_eq!(
             code.matches("create_stream()").count(),
-            2,
-            "生产区只应有 2 处 create_stream()（主 stream + endpoint 换流），影子收尾不得回归"
+            1,
+            "生产区只应有 1 处 create_stream()（preview_decode 内），影子 / 额外重解不得回归"
+        );
+        assert_eq!(
+            code.matches("preview_decode_timed(recognizer, &pcm")
+                .count(),
+            1,
+            "重解只能经 sim_decode_text! 一个入口（按步长 / 冻结前补解 / 收尾），不得另开解码点"
         );
         assert!(!code.contains("shadow"), "生产区不得出现 shadow（DEC-086）");
     }
@@ -6396,14 +6074,16 @@ mod late_stream_tail_445_tests {
         assert_eq!(late_bound_step(None, false, false, 99), (None, None));
     }
 
-    /// 接线：a / c / endpoint 三处冻结都开始跟踪；b（开口）清空；吸收时同步 438 坐标与下一片起点。
+    /// 接线：a / c 两处冻结都开始跟踪；b（开口）清空；吸收时同步 438 坐标与下一片起点。
+    /// STREAM-SV-463：原第三处（paraformer endpoint 分支的 c 兜底）随旧端点移除 —— 模拟流式的句末冻结
+    /// 不改显示文本，未冻结的边界照常由 337 的 a / c 收口。
     #[test]
     fn t445_wiring() {
         let p = prod_src();
         assert_eq!(
             p.matches(concat!("late_bound = Some((seg, ", "cur));"))
                 .count(),
-            3
+            2
         );
         assert!(p.contains(concat!("late_bound = ", "None;")));
         for needle in [
