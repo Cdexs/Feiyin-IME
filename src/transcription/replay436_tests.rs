@@ -2826,3 +2826,76 @@ fn poc459_fallback_align() {
     std::fs::write(&out, report).unwrap();
     println!("[459] 报告：{}", out.display());
 }
+
+/// KOJA-406-461 取证：日 / 韩语音频走生产精解 + 流式预览 + 406 判据，看精解是否被换成流式乱码。
+/// 运行：cargo test --bin feiyin-ime poc461_koja -- --ignored --nocapture
+#[test]
+#[ignore = "KOJA-406-461：需模型 + 日韩测试音频；--ignored 运行"]
+fn poc461_koja_406() {
+    crate::transcription::speaker::TEST_EXTRACTOR_MISSING.with(|c| c.set(true));
+    let root = manifest_dir();
+    let models = root.join("models");
+    let acc = create_qwen3_recognizer(&models).expect("Qwen3 GGUF 须在位");
+    let st_rec = crate::transcription::local_stream::create_local_stream_recognizer(&models)
+        .expect("流式模型须在位");
+    let terms = load_real_wordbook_terms();
+    let run_stream = |audio: &[f32]| -> String {
+        let stream = st_rec.create_stream();
+        for c in audio.chunks(1600) {
+            stream.accept_waveform(RATE as i32, c);
+            while st_rec.is_ready(&stream) {
+                st_rec.decode(&stream);
+            }
+        }
+        stream.input_finished();
+        while st_rec.is_ready(&stream) {
+            st_rec.decode(&stream);
+        }
+        st_rec
+            .get_result(&stream)
+            .map(|r| r.text.clone())
+            .unwrap_or_default()
+    };
+    let mut wavs = vec![
+        models.join("sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17/test_wavs/ja.wav"),
+        models.join("sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17/test_wavs/ko.wav"),
+        models.join("sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17/test_wavs/zh.wav"),
+        models.join("sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17/test_wavs/en.wav"),
+    ];
+    for k in 0..4 {
+        wavs.push(models.join(format!("korean-testwavs/{k}.wav")));
+    }
+    for wav in wavs {
+        let Some((audio, rate)) = read_wav(&wav) else {
+            println!("[461] 跳过 {}", wav.display());
+            continue;
+        };
+        if rate as usize != RATE {
+            println!("[461] 跳过（{rate}Hz）{}", wav.display());
+            continue;
+        }
+        let stream_text = run_stream(&audio);
+        let w = Win457 {
+            span_start: 0,
+            end: 1,
+            wsamples: vec![audio.len()],
+            waudio: audio,
+            split: None,
+            stream_text: stream_text.clone(),
+        };
+        let decoded = decode_457(&acc, &w, 0, terms.as_deref());
+        let v = crate::transcription::acc_vs_streaming(&decoded, &stream_text);
+        let used = if decoded.is_empty() || !v.accept {
+            "流式（兜底）"
+        } else {
+            "精解"
+        };
+        println!(
+            "[461] {}\n   精解：{decoded}\n   流式：{stream_text}\n   406：retention={:.2} len_ratio={:.2} accept={} ⇒ 该窗用 {used}",
+            wav.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+            v.retention,
+            v.len_ratio,
+            v.accept
+        );
+    }
+}
