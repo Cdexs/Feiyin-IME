@@ -1502,7 +1502,7 @@ struct OverlayWindowState {
     /// OVERLAY-051-F/G: cached ClearType font so we don't create/destroy HFONT every frame.
     cached_font: Option<HFONT>,
     /// STREAMFONT-189: 流式两态（RecordingStreamingIdle 占位 / RecordingWithText）自绘
-    /// 文字专用 HFONT（OVERLAY_TEXT_FONT_SIZE = -16）。必须独立于 cached_font（-14）：
+    /// 文字专用 HFONT（OVERLAY_TEXT_FONT_SIZE = -18）。必须独立于 cached_font（-14）：
     /// cached_font 在隐藏/退出清理臂会被 take+DeleteObject（与 edit_font 同一坑，
     /// :860 注释同源），复用会导致字体被提前删除或双删。生命周期照 edit_font/cached_font
     /// 范式：绘制选择点惰性创建、存回本字段，清理臂与 cached_font 同处 take+DeleteObject。
@@ -1558,8 +1558,10 @@ const OVERLAY_FONT_SIZE: i32 = -14;
 // desired(≈23) ≤ available，36px 窗高装得下不裁字（overlay_text_area_capacity_guard
 // 同时守护 14/16 两个字号）。处理中/箭头/Error/Info 小字仍归 OVERLAY_FONT_SIZE(-14)，
 // 逐位不变。
+// UI-PREVIEW-473（Gavin 10-03「预览窗口中的文字被变小了」「记住大小也变小了，需要调大」）：-16 → -18。
+// Segoe UI em 18 ⇒ tmHeight ≈ 24，desired ≈ 26 ≤ available 28（容量护栏：字号 + 6 ≤ 28）。
 #[cfg(target_os = "windows")]
-const OVERLAY_TEXT_FONT_SIZE: i32 = -16;
+const OVERLAY_TEXT_FONT_SIZE: i32 = -18;
 // OVERLAY-054-C: file-level button border color. Kept at 0x707070 (value unchanged).
 // Tests can now reference this constant instead of mirroring the literal.
 #[cfg(target_os = "windows")]
@@ -3092,7 +3094,7 @@ fn draw_overlay_to_dc(
     // OVERLAY-051-F: reuse a cached ClearType font instead of creating/destroying one per frame.
     // OVERLAY-054-E: use file-level OVERLAY_FONT_SIZE so cached font matches measuring font.
     // STREAMFONT-189: 流式两态（RecordingStreamingIdle 占位 / RecordingWithText）改选
-    // streaming_font（OVERLAY_TEXT_FONT_SIZE = -16），与 D2D streaming_text_format /
+    // streaming_font（OVERLAY_TEXT_FONT_SIZE = -18），与 D2D streaming_text_format /
     // EDIT 控件 / 两态测量同号；其余态（处理中/箭头/Error/Info 小字等）维持 cached_font
     // (-14) 逐位不变。选择点收在本处是刻意的：全 GDI 帧共用一次 SelectObject，
     // 流式兜底路径内的 measure_text_width（draw_recording_overlay_with_text :3579，
@@ -3878,7 +3880,7 @@ fn draw_recording_overlay_with_text(
     // The metric (text_width) comes from measure_text_width on the GDI font — the
     // single metric source agreed in D2D-P1 — so the D2D side never measures itself
     // and cannot drift from the window-sizing path (adjust_overlay_pos_size_for_text).
-    // OVERLAY-MEASURE-CACHE-415：此处所选字体恒为 streaming_font(OVERLAY_TEXT_FONT_SIZE=-16)
+    // OVERLAY-MEASURE-CACHE-415：此处所选字体恒为 streaming_font(OVERLAY_TEXT_FONT_SIZE=-18)
     // （见 draw_overlay_to_dc 的 streaming_text 分支），故字号传入以纳入缓存键。
     let text_width = measure_text_width(hdc, text, OVERLAY_TEXT_FONT_SIZE);
     if d2d::draw_streaming_text_overlay(hdc, rect, state, text, text_width, dim_from) {
@@ -4373,6 +4375,7 @@ mod d2d {
         DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
         DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL,
         DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+        DWRITE_PIXEL_GEOMETRY_FLAT, DWRITE_RENDERING_MODE_GDI_CLASSIC,
         DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP,
         DWRITE_WORD_WRAPPING_WRAP,
     };
@@ -4394,7 +4397,7 @@ mod d2d {
         pub text_format: windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
         /// D2D-P1: streaming-state text format — left-aligned (LEADING), vertical center,
         /// NO_WRAP. Face "Segoe UI" Normal, STREAMFONT-189 起字号 = OVERLAY_TEXT_FONT_SIZE
-        /// (-16 → 16px)，与 GDI 兜底的 streaming_font 同号（EDITFONT-183 曾是 14px，
+        /// (-18 → 18px，473 起；原 -16)，与 GDI 兜底的 streaming_font 同号（EDITFONT-183 曾是 14px，
         /// Gavin 2026-09-08 拍板实时上屏与编辑态同号），单一 GDI 度量源
         /// (measure_text_width) 仍以所选字体为源，测渲不漂移。
         /// (P0's format comment claimed "must match the GDI face" but used YaHei UI
@@ -4459,7 +4462,7 @@ mod d2d {
             text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             // D2D-P1: streaming-state format — same face/weight as the GDI text path
             // ("Segoe UI", FW_NORMAL), left-aligned, single line, no wrap.
-            // STREAMFONT-189: 字号归 OVERLAY_TEXT_FONT_SIZE(16px)，与 GDI 兜底
+            // STREAMFONT-189: 字号归 OVERLAY_TEXT_FONT_SIZE（473 起 18px），与 GDI 兜底
             // streaming_font / EDIT 控件同号；其余三个 format 仍绑 OVERLAY_FONT_SIZE。
             let gdi_family: Vec<u16> = "Segoe UI".encode_utf16().collect();
             let streaming_text_format = dwrite.CreateTextFormat(
@@ -4504,6 +4507,21 @@ mod d2d {
             wrap_text_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
             wrap_text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
             let _ = rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            // UI-PREVIEW-473（Gavin 10-03「预览窗口中的文字被变小了，而且现在变得也不圆润了」）：显式指定
+            // 灰度 + 横竖双向抗锯齿（NATURAL_SYMMETRIC），gamma / 对比度沿用系统值。不指定时随系统默认参数，
+            // 16px 小字号可落到「只做横向抗锯齿」：横笔画硬边、竖笔画摊成两列灰（Gavin 截图像素只有 3 档亮度）
+            // ⇒ 笔画显细、不圆润。
+            if let Ok(sys) = dwrite.CreateRenderingParams() {
+                if let Ok(p) = dwrite.CreateCustomRenderingParams(
+                    sys.GetGamma(),
+                    sys.GetEnhancedContrast(),
+                    0.0,
+                    DWRITE_PIXEL_GEOMETRY_FLAT,
+                    DWRITE_RENDERING_MODE_GDI_CLASSIC,
+                ) {
+                    rt.SetTextRenderingParams(&p);
+                }
+            }
             let brush = rt.CreateSolidColorBrush(
                 &D2D1_COLOR_F {
                     r: 1.0,
@@ -6840,7 +6858,7 @@ fn adjust_overlay_pos_size_for_text(
     current_size: &[i32; 2],
 ) -> ([i32; 2], [i32; 2]) {
     // EDITFONT-183: 测量字号按状态选择。STREAMFONT-189：RecordingWithText 的自绘文字
-    // 也已归 OVERLAY_TEXT_FONT_SIZE(16px) 渲染（D2D streaming_text_format + GDI
+    // 也已归 OVERLAY_TEXT_FONT_SIZE（473 起 18px）渲染（D2D streaming_text_format + GDI
     // streaming_font 兜底），测量必须跟随；若仍按 14px 量宽，自动宽度低估 ~14%
     // ⇒ 文字更早溢出 ⇒ ES_AUTOHSCROLL 横向滚动更频繁（FIX-172-B 依赖测渲一致，
     // 这是正确性不是外观 —— EDITFONT-183 在编辑态踩过并修过同一坑）。
@@ -18233,7 +18251,7 @@ mod overlay_shimmer_tests {
     // === OVERLAY-054-H: text-area capacity guard ===
     // The 36px recording overlay must leave enough drawing height for the ClearType
     // font plus a 6px cushion. STREAMFONT-189: the streaming text now renders at
-    // OVERLAY_TEXT_FONT_SIZE (16px), so the guard covers both font sizes. If this
+    // OVERLAY_TEXT_FONT_SIZE (18px since UI-PREVIEW-473), so the guard covers both font sizes. If this
     // trips, 054-G/H class clipping has regressed.
 
     #[cfg(target_os = "windows")]
@@ -19476,6 +19494,73 @@ mod overlay_086_d2d_p1_guard_tests {
         };
         save("plain", &px_plain);
         save("dim", &px_dim);
+        // 对照 Gavin 截图（`collab/evidence/473/gavin-shot.png`）：同一句分别走 D2D 与 GDI 兜底字体。
+        let shot = "用的是本地的十四档。";
+        let (_, px_d2d_shot) = {
+            let (ok, px) = unsafe {
+                let screen = g::GetDC(None);
+                let mem = g::CreateCompatibleDC(screen);
+                let mut bi = g::BITMAPINFO::default();
+                bi.bmiHeader.biSize = std::mem::size_of::<g::BITMAPINFOHEADER>() as u32;
+                bi.bmiHeader.biWidth = w as i32;
+                bi.bmiHeader.biHeight = -(h as i32);
+                bi.bmiHeader.biPlanes = 1;
+                bi.bmiHeader.biBitCount = 32;
+                let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+                let bmp = g::CreateDIBSection(mem, &bi, g::DIB_RGB_COLORS, &mut bits, None, 0)
+                    .expect("dib");
+                let old = g::SelectObject(mem, bmp);
+                let ok = d2d::draw_streaming_text_overlay(mem, &rect, &state, shot, 160, None);
+                let px = std::slice::from_raw_parts(bits as *const u8, w * h * 4).to_vec();
+                // GDI 兜底同字体（streaming_font = create_clear_type_font(OVERLAY_TEXT_FONT_SIZE)）画在下半张图。
+                let font = create_clear_type_font(OVERLAY_TEXT_FONT_SIZE);
+                let of = g::SelectObject(mem, font);
+                let _ = g::SetBkMode(mem, g::TRANSPARENT);
+                let _ = g::SetTextColor(mem, OVERLAY_TEXT_WHITE);
+                let mut wide: Vec<u16> = shot.encode_utf16().collect();
+                let mut r = RECT {
+                    left: 42,
+                    top: 0,
+                    right: 380,
+                    bottom: 36,
+                };
+                let _ = g::FillRect(mem, &r, g::HBRUSH(g::GetStockObject(g::BLACK_BRUSH).0));
+                let _ = g::DrawTextW(
+                    mem,
+                    &mut wide,
+                    &mut r,
+                    g::DT_LEFT | g::DT_VCENTER | g::DT_SINGLELINE,
+                );
+                let px_gdi = std::slice::from_raw_parts(bits as *const u8, w * h * 4).to_vec();
+                g::SelectObject(mem, of);
+                let _ = g::DeleteObject(font);
+                g::SelectObject(mem, old);
+                let _ = g::DeleteObject(bmp);
+                let _ = g::DeleteDC(mem);
+                g::ReleaseDC(None, screen);
+                save("shot-gdi", &px_gdi);
+                (ok, px)
+            };
+            (ok, px)
+        };
+        save("shot-d2d", &px_d2d_shot);
+        // 系统默认文字渲染参数（不显式指定时 D2D 用它）。
+        unsafe {
+            use windows::Win32::Graphics::DirectWrite as dw;
+            if let Ok(f) =
+                dw::DWriteCreateFactory::<dw::IDWriteFactory>(dw::DWRITE_FACTORY_TYPE_SHARED)
+            {
+                if let Ok(p) = f.CreateRenderingParams() {
+                    println!(
+                        "[473] 系统默认渲染参数：mode={:?} cleartype_level={} gamma={} contrast={}",
+                        p.GetRenderingMode(),
+                        p.GetClearTypeLevel(),
+                        p.GetGamma(),
+                        p.GetEnhancedContrast()
+                    );
+                }
+            }
+        }
         // 前 9 字（未变浅区）逐像素应与整段正常色一致 ⇒ 浅色尾巴不改字形 / 字号。
         let diff = px_plain
             .chunks(4)
@@ -23945,6 +24030,44 @@ mod ui471_472_tests {
 
     fn prod() -> String {
         crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs")).join("\n")
+    }
+
+    /// 473：预览字号调大（18px）后，编辑框按真实字体量出的行高仍放得进 36px 窗（tmHeight + 2 ≤ 28），不裁字；
+    /// 且字号确实比原 16px 大。
+    #[test]
+    fn ui473_bigger_preview_font_fits_overlay() {
+        assert!(
+            OVERLAY_TEXT_FONT_SIZE.unsigned_abs() > 16,
+            "Gavin：预览字号要调大"
+        );
+        let tm_h = unsafe {
+            let hdc = GetDC(None);
+            let font = create_clear_type_font(OVERLAY_TEXT_FONT_SIZE);
+            let old = SelectObject(hdc, font);
+            let mut tm = TEXTMETRICW::default();
+            let _ = GetTextMetricsW(hdc, &mut tm);
+            let _ = SelectObject(hdc, old);
+            let _ = DeleteObject(font);
+            let _ = ReleaseDC(None, hdc);
+            tm.tmHeight
+        };
+        let available = RECORDING_OVERLAY_SIZE[1] - 2 * OVERLAY_TEXT_DRAW_VERTICAL_INSET;
+        assert!(
+            tm_h > 0 && tm_h + 2 <= available,
+            "tmHeight {tm_h} + 2 须 ≤ {available}"
+        );
+    }
+
+    /// 473：D2D 文字显式用「笔画对齐像素」的 GDI 经典渲染模式（不随系统默认落到竖笔画发虚的平滑模式）。
+    #[test]
+    fn ui473_text_rendering_mode_pinned() {
+        let p = prod();
+        let at = p
+            .find("dwrite.CreateCustomRenderingParams(")
+            .expect("须显式创建文字渲染参数");
+        let s = seg(&p, at, 400);
+        assert!(s.contains("DWRITE_RENDERING_MODE_GDI_CLASSIC"));
+        assert!(s.contains("rt.SetTextRenderingParams(&p);"));
     }
 
     /// 从 `at` 起最多 `n` 字节（落在字符边界）。

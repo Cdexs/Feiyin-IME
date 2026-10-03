@@ -1,6 +1,7 @@
 # CHANGELOG - 变更日志 (voice-ime)
 
 > 任务编号 | 简要说明 | 负责人 | 完成时间
+| UI-PREVIEW-473 | **预览文字变小、不圆润**（DEC-105）：D2D 文字显式 GDI 经典渲染模式（笔画对齐像素）；字号 16 → 18px（Gavin「需要调大」）。取证测试 `ui473_d2d_streaming_text_real_dc`（忽略类，真 DC 出图）；护栏 `ui473_bigger_preview_font_fits_overlay` / `ui473_text_rendering_mode_pinned` | 主控 | 2026-10-03 |
 | UI-REC-472 | **本地实时开录直接「请说话...」窗，模型加载中不弹录音窗**（DEC-104；Gavin「不要显示那个动态波纹动效的窗口」「正在显示模型加载提示……等模型加载完毕再显示」）。新增 `LOCALRT_ENGINE_READY` / `publish_localrt_ready`；热键与 RecordingStarted 分支；新录音清理覆盖 RecordingStreamingIdle；macOS 事件处理同判据。测试：`ui472_recording_started_local_realtime_no_waveform` / `ui472_hotkey_start_loading_hint_then_listening` / `ui472_ready_flag_published_at_every_engine_change` / `ui472_fresh_session_cleanup_covers_listening_placeholder` | 主控 | 2026-10-03 |
 | UI-HINT-471 | **加载提示窗文字显示不全**：信息 / 错误单行提示窗宽度按文字实测宽度自适应（下限 240、上限屏宽比例）。`status_overlay_width` / `measure_status_text_width`。测试：`ui471_status_width_fits_text_within_bounds` / `ui471_loading_hint_fits_in_all_locales` | 主控 | 2026-10-03 |
 | MEM-ENC-470 | **1.7B 音频编码器不按 30s 预留计算缓冲**（DEC-103，Gavin 选「A」）：显存省 ≈0.4G，86 窗文字逐字相同、每窗 +5.5ms。`shim.cpp` `LAS_ENC_WARMUP` 默认 0；A/B 测试 `mem470_enc_ab`（忽略类）；护栏 `t470_encoders_do_not_reserve_max_audio_buffer` | 主控 | 2026-10-03 |

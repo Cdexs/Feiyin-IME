@@ -2721,3 +2721,11 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 对 macOS 的影响 | 470 自动生效；471 待 macOS 端实现；472 的「请说话...」窗 macOS 浮层尚无此态，暂不适用 |
 | 是否需要对方同步 | 是：编译验证 472 的 macOS 改动；按需实现 471 |
 
+## UI-PREVIEW-473（2026-10-03，主控）· 浮层文字渲染模式 + 字号 18px（DEC-105）
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | Windows `d2d::create_resources` 显式 GDI 经典渲染模式；`OVERLAY_TEXT_FONT_SIZE` -16 → -18（Windows 专属常量） |
+| 对 macOS 的影响 | 无：macOS 浮层文字由 `src/platform/macos/overlay.rs` 自绘，不经 D2D、不读该常量。若 macOS 端也觉预览字小，可参考 18px 同步 |
+| 是否需要对方同步 | 否（可选参考） |
+
