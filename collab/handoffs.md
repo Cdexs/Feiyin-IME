@@ -137,3 +137,11 @@
 - **④冒烟（如实）**：Publish 包 PID 17860 Responding=True、`SenseVoice model found at "...\Publish\models\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"`、无 panic/crash/残留。⚠️ Publish 的 config 为 `asr_model=performance`，不发 local-realtime 专属行 ⇒ 以**字节相同**的 `target/release` 二进制（config=local_realtime）补充实测 `LocalRealtime: dual recognizers loaded (preview SenseVoice + offline accuracy)` + `ctx=1024(max 4096)` + `[ALIGN-456] aligner attached`。`[STREAM-SV-463] decode` 行无麦克风语音未取到。
 - **红线**：未改生产代码 / 版本未动 / 未 push / 旧模型未删 / 零凭证。报告 `collab/outbox/tester-1/result.md`。**Step1 已结束输入法进程 ⇒ 请主控转告 Gavin 重启。**
 
+## 2026-10-03 — 主控 — PREVIEW-PUNCT-464 + KOJA-PUNCT-464 ✅ 开发完成（DEC-101）
+
+- 预览标点一变就打、停顿 / 录音结束补句末标点；含假名 / 谚文不送标点模型（预览 + 最终节点）。
+- 研究：SenseVoice 标点与 ITN 同一开关（withitn/woitn），不能单开标点。
+- 更正：本地实时最终不会剥光 1.7B 标点（DEC-080 已摘该节点），向 Gavin 的误述已更正。
+- 定向回归全绿（local_stream 103 / punct 146 / transcription 545 / overlay 145 / guard 175）；端到端全绿。预期 bin 1912P/0F/78I。
+- 下一步：派 tester-1 TEST-EXEC-464 + BUILD-464。
+

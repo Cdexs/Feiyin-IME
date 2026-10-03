@@ -12855,6 +12855,52 @@ mod punct_double_334_tests {
 }
 
 #[cfg(test)]
+mod koja464_punct_tests {
+    use super::apply_local_punctuation;
+
+    /// KOJA-PUNCT-464 护栏：最终标点节点在调标点模型**之前**先判日韩文（否则韩文空格被吃光）。
+    #[test]
+    fn koja464_local_punct_checks_script_before_engine() {
+        let src = include_str!("main.rs");
+        let body = src
+            .split("fn apply_local_punctuation(")
+            .nth(1)
+            .expect("apply_local_punctuation 锚点");
+        let check = body
+            .find("punctuation::ct_unsupported_script(&final_text)")
+            .expect("最终标点节点必须判日韩文");
+        let engine = body
+            .find("engine.add_punctuation(&final_text)")
+            .expect("标点模型调用点");
+        assert!(check < engine, "日韩文判断必须在调标点模型之前");
+    }
+
+    /// KOJA-PUNCT-464（真模型）：韩 / 日文原样（空格完好），中文照常加标点。
+    /// 运行：`cargo test --bin feiyin-ime -- --ignored koja464_local_punct_real_engine`
+    #[test]
+    #[ignore = "需标点模型；--ignored 运行"]
+    fn koja464_local_punct_real_engine() {
+        let models = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models");
+        let Some(mut engine) = crate::punctuation::PunctuationEngine::new(&models) else {
+            eprintln!("skip: 标点模型不在位");
+            return;
+        };
+        let mut run = |t: &str| {
+            apply_local_punctuation(t.to_string(), true, false, false, false, Some(&mut engine))
+        };
+        let ko = "조금만 생각을 하면서 살면 훨씬 편할 거야";
+        assert_eq!(run(ko), ko, "韩文不送标点模型，空格完好");
+        let ja = "うちの中学は弁当制で持っていけない場合は";
+        assert_eq!(run(ja), ja, "日文不送标点模型");
+        let zh = run("开放时间早上九点至下午五点我们明天见");
+        assert!(
+            zh.contains('，') || zh.contains('。'),
+            "中文照常加标点：{zh}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod punct_final_redo_350_tests {
     use super::{pretranscribed_native_punctuated, strip_punctuation_node};
     use crate::punctuation::has_effective_punctuation;
@@ -16951,6 +16997,12 @@ fn apply_local_punctuation(
     engine: Option<&mut punctuation::PunctuationEngine>,
 ) -> String {
     if enabled && !llm_handled && !translate_requested && !native_punctuated {
+        // KOJA-PUNCT-464：含日文假名 / 韩文 ⇒ 不送标点模型（中英词表，韩文空格会被吃光、日文只补句末「。」），
+        // 原样保留（本地实时 = 1.7B 自带标点；performance 档 = 无标点但空格完好）。中英文逐位不变。
+        if punctuation::ct_unsupported_script(&final_text) {
+            log::info!("Local punctuation skipped: ja/ko text not supported by punctuation model");
+            return final_text;
+        }
         if let Some(engine) = engine {
             match engine.add_punctuation(&final_text) {
                 Some(punctuated) => {

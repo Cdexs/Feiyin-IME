@@ -149,6 +149,22 @@ fn is_cjk_ideograph_or_kana(c: char) -> bool {
         || (c >= '\u{F900}' && c <= '\u{FAFF}') // CJK Compatibility Ideographs
 }
 
+/// KOJA-PUNCT-464：文本是否含标点模型（CT-Transformer，中英词表）处理不了的文字 —— 日文假名 / 韩文。
+///
+/// 实测（`poc464_preview_punct`，证据 `collab/evidence/464/preview-punct.md`）：韩文送进去**空格全被吃掉**
+/// （「조금만 생각을」→「조금만생각을」），日文只在句末补「。」、无句中标点。含这两种文字 ⇒ 不送标点模型。
+/// 只看假名 / 谚文：日文汉字与中文同区，单凭汉字判不出日文，有假名才算日文。
+pub fn ct_unsupported_script(text: &str) -> bool {
+    text.chars().any(|c| {
+        ('\u{3040}'..='\u{30FF}').contains(&c) // 平假名 + 片假名
+            || ('\u{31F0}'..='\u{31FF}').contains(&c) // 片假名音标扩展
+            || ('\u{FF66}'..='\u{FF9D}').contains(&c) // 半角片假名
+            || ('\u{AC00}'..='\u{D7A3}').contains(&c) // 谚文音节
+            || ('\u{1100}'..='\u{11FF}').contains(&c) // 谚文字母
+            || ('\u{3130}'..='\u{318F}').contains(&c) // 谚文兼容字母
+    })
+}
+
 /// 从末尾循环剥离标点直到末字符非标点（PUNCT-GOVERNANCE-030-A B2）
 ///
 /// 处理连续标点：好？！ → 好，话…… → 话
@@ -286,6 +302,25 @@ fn convert_punctuation_for_english(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KOJA-PUNCT-464：含假名 / 谚文 ⇒ 标点模型处理不了；纯中英（含日文汉字单独出现）照常送。
+    #[test]
+    fn koja464_ct_unsupported_script() {
+        assert!(ct_unsupported_script("조금만 생각을 하면서"));
+        assert!(ct_unsupported_script("うちの中学は弁当制"));
+        assert!(ct_unsupported_script("カタカナ"));
+        assert!(ct_unsupported_script("ｶﾀｶﾅ"));
+        assert!(ct_unsupported_script("今天说了一句 안녕하세요"));
+        assert!(!ct_unsupported_script("开放时间早上九点至下午五点"));
+        assert!(!ct_unsupported_script(
+            "the tribal chieftain called for the boy"
+        ));
+        assert!(
+            !ct_unsupported_script("中学"),
+            "只有汉字判不出日文 ⇒ 照常送"
+        );
+        assert!(!ct_unsupported_script(""));
+    }
 
     #[test]
     fn test_punctuation_model_subdir_constant() {

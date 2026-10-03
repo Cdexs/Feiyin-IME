@@ -3208,3 +3208,15 @@ Gavin 原话：「我说的是b路径上的1.7b模型，把词库注入去掉，
 - **验证**：`guard463_every_dispatch_point_freezes`（源码护栏）；`sv463_preview_freeze_e2e`（真模型 + 真录音 56s + 真标点：每个登记边界之前的显示此后逐字不变、浅色尾巴不超过显示长度且收尾为 0、日 / 韩预览出假名 / 谚文）；定向回归 transcription 545 / stream 166 / overlay 145 / d2d 24 / punct 143 / reflow 76 / guard 175 全绿。
 - **代价 / 遗留**：预览 CPU 约为原来 5 倍（物理核并行，单次重解 ≤0.2s）；442 切点与新句重解之间的预览文字在精解回灌前可能有 1 秒内的出入（回灌后由精解文字覆盖）；旧模型目录（funasr-nano 2025-12-17、streaming-paraformer-trilingual）待 Gavin 确认后删除。
 
+### DEC-101 · 预览标点一变就打 + 日韩文不送标点模型（PREVIEW-PUNCT-464 / KOJA-PUNCT-464）（2026-10-03）
+
+- **背景**：Gavin「现在最新的这个模拟的前端预览是不带标点符号的预览吗？能不能前端的这个模拟的流式预览带标点符号？这样看起来体验更好」。取证（`collab/evidence/464/preview-punct.md`，56s 真录音）：现行 3.5s 间隔打点刷新时末尾未打点平均 40 字、后半段几乎无标点；SenseVoice 自带标点 0 字但 ITN 把「二比一」写成「2B1」、「八分之一」写成「8分之1」，说话中 99% 刷新末尾挂「。」，442 切点处句中冒「。」；每次刷新都打 21 字、耗时 +5%。另发现标点模型（CT-Transformer，中英词表）把韩文空格全吃掉、日文只补句末「。」。Gavin「按你的方案来，但你可以研究下 SenseVoice 模型是否可以设置单独的标点、ITN 开关参数」。
+- **SenseVoice 标点 / ITN 能否分开（研究结论：不能）**：模型输入只有一个「文本规范化」查询 token，取值仅 `withitn`（14）/ `woitn`（15）两种（FunAudioLLM/SenseVoice `model.py` 的 `textnorm_dict`），训练时标点与 ITN 同属 withitn 风格；sherpa-onnx `OfflineSenseVoiceModelConfig` 也只暴露 `use_itn`（官方说明「开 ITN 时结果带标点」）。唯一变通是同段音频 withitn / woitn 各解一次再移植标点 ⇒ 重解算力翻倍，不采用。
+- **决策**：
+  1. 预览打点间隔 `PUNCT_PREVIEW_INTERVAL_MS` 3500 → 0：预览文字一变就打（模拟流式下文字只在每次重解后变，`has_new` 门 ⇒ 每次重解至多打一次），仍只打未派发尾巴；说话中句末终止符不入缓存（349）照旧。
+  2. 句子说完（静默派发 / 句末冻结 / 录音结束）⇒ `preview_display(sentence_end=true)` 把尾巴重打一次并保留句末标点，再冻结 / 数 committed_len；静默派发前若 VAD 在上次重解后又听到人声先补解。
+  3. `punctuation::ct_unsupported_script`（假名 / 谚文）为真 ⇒ 预览不送标点模型；最终输出标点节点 `apply_local_punctuation` 同判据跳过（本地实时保留 1.7B 自带标点；performance 档日韩无标点、空格完好）。中英文逐位不变。
+- **更正记录**：主控向 Gavin 汇报时曾误称「本地实时最终输出会先剥掉 1.7B 标点再重打」—— 该剥光节点自 DEC-080（`B_STRIP_WIRED_367 = false`）已摘除；实际只有 1.7B 结果完全无标点时才走标点模型。已当面更正。
+- **验证**：`koja464_ct_unsupported_script`、`koja464_local_punct_checks_script_before_engine`（护栏）、`koja464_local_punct_real_engine`（真模型：韩 / 日原样、中文加标点）、`fix464_punct_on_every_change_independent_of_silence`；`sv463_preview_freeze_e2e` 带真标点全绿（冻结区不变、韩文预览空格完好、停顿派发片以句末标点收尾）。
+- **代价 / 遗留**：标点模型对无左文的短尾巴偶有误判（实测「巴西队的淘汰。赛」），只在预览出现、精解回灌后替换；日韩预览无标点。
+

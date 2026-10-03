@@ -2684,3 +2684,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 对 macOS 的影响 | 平台中立部分同一份编译。**模型目录变更**：需要 `models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/`（`model.int8.onnx` + `tokens.txt`）；旧 `sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17`、`sherpa-onnx-streaming-paraformer-trilingual-zh-cantonese-en` 不再使用。macOS 浮窗当前不渲染流式文字（`StreamingText → Show`），浅色尾巴为 Windows 专属；将来 macOS 渲染流式文字时按第四字段画浅色。**未在 macOS 实测**（含 `hw.physicalcpu` 取核） |
 | 是否需要对方同步 | 换模型目录 + 重新编译 |
 
+## PREVIEW-PUNCT-464 + KOJA-PUNCT-464（2026-10-03，主控）· 预览标点一变就打 + 日韩文不送标点模型（DEC-101）
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | `local_stream.rs`：`PUNCT_PREVIEW_INTERVAL_MS` 0、`preview_display` 加 `sentence_end`；`punctuation/mod.rs`：新增 `ct_unsupported_script`；`main.rs`：`apply_local_punctuation` 含假名 / 谚文跳过 |
+| 行为变化 | 预览标点更跟手、停顿处有句末标点；日韩文最终输出不再被标点模型改写（韩文空格保留） |
+| 对 macOS 的影响 | 平台中立代码，同一份编译；macOS 最终输出同样受益。**未在 macOS 实测** |
+| 是否需要对方同步 | 重新编译即可 |
+

@@ -165,10 +165,15 @@ const SIM_WINDOW_MAX_MS: f32 = 15000.0;
 /// 边界之前的显示文本**冻结不重打**，3.5s 只重打边界之后的裸尾巴 ⇒ 冻结前缀逐字不变、
 /// `streaming[committed_len..]` 坐标不因标点增减漂移，也不与精解标点打架。
 ///
-/// 🔴 **与 sherpa endpoint 完全独立**：本阈值只影响**显示层**刷新（判早了只是标点早出现），
-/// 绝不 `reset()` / 切句 / `sentence_id += 1`。切句仍由 `LOCAL_STREAM_RULE2=2.0` 的
-/// sherpa endpoint 决定（说话中间换气不会被切句）。两者是不同层的东西，不要混用。
-const PUNCT_PREVIEW_INTERVAL_MS: f32 = 3500.0;
+/// 🔴 **与切句完全独立**：本阈值只影响**显示层**刷新（判早了只是标点早出现），
+/// 绝不切句 / 不改 `sentence_id`。两者是不同层的东西，不要混用。
+///
+/// PREVIEW-PUNCT-464（Gavin 2026-10-03「能不能前端的这个模拟的流式预览带标点符号？这样看起来体验更好」，
+/// 方案确认「按你的方案来」）：间隔 3.5s → **0（预览文字一变就打）**。模拟流式下文字只在每次重解
+///（≥0.6s 一次）后变化，`has_new` 门让引擎每次重解至多跑一次；实测末尾未打点平均 40 字 → 21 字，
+/// 56s 录音总耗时 +5%（证据 `collab/evidence/464/preview-punct.md`）。349「句末终止符不入缓存」照旧；
+/// 停顿派发 / 录音结束时另补句末标点（`preview_display` 的 `sentence_end`）。
+const PUNCT_PREVIEW_INTERVAL_MS: f32 = 0.0;
 
 /// LOCALRT-PARALLEL-ACC-298 / ACC-DISPATCH-SILENCE-ONLY-346：派发静音阈值默认值。
 ///
@@ -530,6 +535,10 @@ fn should_repunctuate_preview(interval_ms: f32, has_new: bool, threshold_ms: f32
 /// - `tail_start`：最近一次派发当刻的 `raw` 字节长 ⇒ 尾巴打点起点。
 /// - `head_chars`：最近一次派发当刻显示文本的字符数（= `committed_len`）⇒ 冻结前缀的字符数。
 ///   二者为 0（acc 未启用 / 尚未派发）⇒ 整段重打，与改前口径一致。
+/// - `sentence_end`（PREVIEW-PUNCT-464）：此刻句子已说完（停顿派发 / 句末冻结 / 录音结束）⇒ 不论有无新字
+///   都把尾巴重打一次并**保留句末标点**（说话中的 349「句末终止符不入缓存」只针对没说完的半句）。
+///
+/// KOJA-PUNCT-464：尾巴含日文假名 / 韩文 ⇒ 不送标点模型（中英词表；韩文空格会被吃光），原样显示。
 fn preview_display(
     raw_full: &str,
     engine: Option<&mut PunctuationEngine>,
@@ -537,6 +546,7 @@ fn preview_display(
     force: bool,
     tail_start: usize,
     head_chars: usize,
+    sentence_end: bool,
 ) -> String {
     let Some(engine) = engine else {
         return raw_full.to_string();
@@ -547,14 +557,22 @@ fn preview_display(
     // 尾巴起点夹紧到当前 raw 内，并要求 char 边界（raw 经 endpoint 确认可能变短再长，
     // 历史字节位置不保证仍是当前串的合法切点；不合法就本帧不打，复用路径原样显示，下周期恢复）。
     let tail_start = tail_start.min(raw_full.len());
-    if force && has_new && tail_start < raw_full.len() && raw_full.is_char_boundary(tail_start) {
+    let tail_ok = tail_start < raw_full.len()
+        && raw_full.is_char_boundary(tail_start)
+        && !crate::punctuation::ct_unsupported_script(&raw_full[tail_start..]);
+    if tail_ok && ((force && has_new) || sentence_end) {
         let head = punct_head(&cache.prefix, raw_full, &cache.raw, tail_start, head_chars);
         let t = Instant::now();
         let tail = engine
             .add_punctuation(&raw_full[tail_start..])
             .unwrap_or_else(|| raw_full[tail_start..].to_string());
-        // PUNCT-349 防复发：句末终止符不进缓存（句中标点照旧保留）。
-        cache.prefix = build_punct_prefix(&head, &tail);
+        // PUNCT-349 防复发：没说完的半句，句末终止符不进缓存（句中标点照旧保留）；
+        // PREVIEW-PUNCT-464：句子已说完 ⇒ 句末标点保留。
+        cache.prefix = if sentence_end {
+            format!("{head}{tail}")
+        } else {
+            build_punct_prefix(&head, &tail)
+        };
         cache.raw_len = raw_full.len();
         cache.raw = raw_full.to_string();
         log::debug!(
@@ -1502,6 +1520,8 @@ pub fn transcribe_streaming_local(
     // `chunk_ms` 无条件累加（见下方时间推进处），仅在**实际完成一次打点**时归零。
     // 取代 349 的静默触发 + 显示层 `silent_ms` 计数器（DEC-077：旧机制连根删除，不留死代码）。
     let mut punct_interval_ms: f32 = 0.0;
+    // PREVIEW-PUNCT-464：下一次显示刷新按「句子已说完」补句末标点（停顿派发 / 句末冻结 / 录音结束置位）。
+    let mut punct_sentence_end = false;
     // PREVIEW-PUNCT-LIVE-438（R1）：acc 派发边界的**双坐标**，与 `committed_len` 同刻同源捕获：
     //   *_chars = 派发当刻已显示文本的字符数（= `committed_len`；冻结前缀按字符数截取的依据）
     //   *_raw   = 派发当刻 `raw` 的字节长（3.5s 重打时尾巴的起点）
@@ -1680,13 +1700,15 @@ pub fn transcribe_streaming_local(
     // ④ 显示刷新（循环每轮末尾 + 录音结束后各一次）。
     macro_rules! refresh_preview {
         () => {{
-            // PREVIEW-PUNCT-LIVE-438：显示刷新 —— 打点**只按 3.5s 间隔**（`PUNCT_PREVIEW_INTERVAL_MS`，
-            // 读独立计数器 `punct_interval_ms`；1200ms 静默触发与显示层 `silent_ms` 已删，DEC-077）
-            // 且有新内容；**只重打精解尚未覆盖的裸尾巴**（起点 `punct_tail_start`，与 `committed_len`
+            // PREVIEW-PUNCT-LIVE-438 / PREVIEW-PUNCT-464：显示刷新 —— 打点按 `PUNCT_PREVIEW_INTERVAL_MS`
+            //（464 起 = 0：预览文字一变就打；读独立计数器 `punct_interval_ms`，DEC-077）且有新内容；
+            // **只重打精解尚未覆盖的裸尾巴**（起点 `punct_tail_start`，与 `committed_len`
             // 同刻同源捕获 ⇒ 冻结前缀逐字节不变、坐标不漂移、不与精解标点打架）。
             // 无论打不打点都**只刷新显示**，不动状态机（不 reset / 不切句 / 不改 sentence_id）。
             // 显示基文本（LOCALRT-PERF-405 F-C-01 增量缓存）：`confirmed` 区 + 当前句 current 区。
             // DEC-086：影子收尾已移除，不再有 main/shadow 取长切换。
+            // PREVIEW-PUNCT-464：调用方置位 `punct_sentence_end` ⇒ 本次刷新按「句子已说完」补句末标点（用后即清）。
+            let sentence_end = std::mem::take(&mut punct_sentence_end);
             let raw_full: &str = display_cache.text();
             // DISPATCH-LONG-SPEECH-442：记 `(pcm 位置, 裸文本字节长)` 短历史（只在长度变化时记，保留约 4s）。
             if raw_len_history.back().map(|(_, l)| *l) != Some(raw_full.len()) {
@@ -1711,6 +1733,7 @@ pub fn transcribe_streaming_local(
                     repunct_due,
                     punct_tail_start,
                     punct_head_chars,
+                    sentence_end,
                 );
                 if repunct_due {
                     // 打完重置**间隔**计时（438：打点不再触碰任何静默计数器）。
@@ -2046,9 +2069,17 @@ pub fn transcribe_streaming_local(
                 // 🔴 用 `last_display`（实际已上屏、含标点的串，与镜像 `last_streaming_text` 同源），
                 //    不用 `state.display_text()`（裸文本，标点差会造成回填边界偏移）。
                 // STREAM-SV-463：派发点即冻结点 —— 当前句结果确认（此后不再改写），新句从此刻起。
-                // 停顿 1200ms 前的最后一次重解已覆盖全部人声（人声后至多 0.6s 必重解一次）；🔴 此处**不补解**：
-                // 补解会改写已显示的字，使 committed_len（按 last_display 数）与冻结内容错位。
+                // VAD 在上次重解后又听到人声（VAD 判停比门晚）⇒ 先补解到此刻，免得句末最后一个字被劈进下一句
+                //（端到端实测「淘汰。赛。」）。补解改写的字由下面的刷新显示上屏，committed_len 在刷新**之后**数
+                // ⇒ 与冻结内容同源（PREVIEW-PUNCT-464 起派发前必刷新，463 初版不补解的顾虑不再成立）。
+                if sim_dirty {
+                    sim_decode_text!();
+                }
                 sim_freeze!(pcm.len(), vad_speech);
+                // PREVIEW-PUNCT-464：停顿 ≥1.2s = 这句说完了 ⇒ 补句末标点再派发（committed_len 按补完的显示数，
+                // 与 last_display_raw_len 同刻同源，438 R1 双坐标不变）。
+                punct_sentence_end = true;
+                refresh_preview!();
                 let committed_len = last_display.chars().count();
                 // PREVIEW-PUNCT-LIVE-438（R1）：同刻捕获 raw 侧边界 —— 与 committed_len 描述
                 // 同一个显示串（`last_display_raw_len` 随 last_display 同赋值）⇒ 3.5s 重打
@@ -2259,6 +2290,8 @@ pub fn transcribe_streaming_local(
                 sim_decode_text!();
             }
             sim_freeze!(pcm.len(), false);
+            // PREVIEW-PUNCT-464：句子说完 ⇒ 本轮刷新补句末标点。
+            punct_sentence_end = true;
         } else if speech_since_last_reset
             && pcm.len().saturating_sub(sim_start) >= ms_samples(SIM_WINDOW_MAX_MS)
         {
@@ -2281,6 +2314,8 @@ pub fn transcribe_streaming_local(
         if speech_since_last_reset && sim_dirty {
             sim_decode!();
         }
+        // PREVIEW-PUNCT-464：录音结束 = 最后一句说完 ⇒ 补句末标点。
+        punct_sentence_end = true;
         refresh_preview!();
     };
 
@@ -2371,6 +2406,7 @@ pub fn transcribe_streaming_local(
             true,
             punct_tail_start,
             punct_head_chars,
+            true,
         );
         if !display.is_empty() {
             // 录音结束 = 全部已定 ⇒ 浅色尾巴清零。
@@ -3301,7 +3337,9 @@ mod tests {
         let commits = std::cell::RefCell::new(Vec::<(usize, usize)>::new()); // (显示序号, len)
         let dispatches = std::cell::Cell::new(0usize);
         let events = std::cell::RefCell::new(Vec::<String>::new());
-        // 生产同款预览标点（438：3.5s 间隔重打边界之后的尾巴）—— 冻结前缀必须经得起重打。
+        // PREVIEW-PUNCT-464：以句末标点收尾的派发片数（停顿派发前补句末标点）。
+        let closed = std::cell::Cell::new(0usize);
+        // 生产同款预览标点（464：一变就打、停顿补句末标点；只打边界之后的尾巴）—— 冻结前缀必须经得起重打。
         let mut punct = crate::punctuation::PunctuationEngine::new(&root.join("models"));
         println!(
             "[463] 预览标点引擎：{}",
@@ -3340,6 +3378,9 @@ mod tests {
             super::AccDispatchConfig::new(),
             |i, len, _segs, st, _r, _f| {
                 dispatches.set(dispatches.get() + 1);
+                if st.ends_with(['。', '？', '！', '.', '?', '!']) {
+                    closed.set(closed.get() + 1);
+                }
                 events
                     .borrow_mut()
                     .push(format!("派发#{i} committed_len={len} 片流式文本={st}"));
@@ -3369,6 +3410,17 @@ mod tests {
             commits.len()
         );
         println!("[463] 收尾预览：{final_preview}");
+        println!(
+            "[463] 以句末标点收尾的派发片 {} / {}（停顿派发补句末标点，PREVIEW-PUNCT-464）",
+            closed.get(),
+            dispatches.get()
+        );
+        if punct.is_some() {
+            assert!(
+                closed.get() >= 1,
+                "开着标点时，停顿派发的片应以句末标点收尾"
+            );
+        }
         assert!(!displays.is_empty(), "必须有预览输出");
         assert!(dispatches.get() >= 1, "必须至少派发一片");
         for &(at, len) in &commits {
@@ -3414,7 +3466,7 @@ mod tests {
                 rx,
                 &recognizer,
                 None,
-                None,
+                punct.as_mut(),
                 0.01,
                 "",
                 |_t, _w, _n| {},
@@ -3429,6 +3481,12 @@ mod tests {
                 preview.chars().any(ok),
                 "{lang} 预览应含本语种文字：{preview}"
             );
+            if lang == "ko" {
+                assert!(
+                    preview.contains(' '),
+                    "KOJA-PUNCT-464：韩文预览空格不得被标点模型吃掉：{preview}"
+                );
+            }
         }
     }
 
@@ -3848,10 +3906,14 @@ mod tests {
     /// - 438 版：钉「距上次打点 ≥ `PUNCT_PREVIEW_INTERVAL_MS`(3.5s) 才打点」——
     ///   触发量由静默时长改为间隔时长，`has_new` 护栏原样保留；
     ///   「1.2s 静默不再触发」由 `fix438_silence_1200ms_no_longer_triggers` 单独钉死。
+    /// PREVIEW-PUNCT-464：生产阈值改为 0（预览文字一变就打，Gavin 10-03）；门槛机制本身用 3.5s 样例继续钉死。
     #[test]
     fn punct438_preview_only_on_interval() {
-        let t = PUNCT_PREVIEW_INTERVAL_MS;
-        assert_eq!(t, 3500.0, "Gavin 拍板 3.5s");
+        assert_eq!(
+            PUNCT_PREVIEW_INTERVAL_MS, 0.0,
+            "PREVIEW-PUNCT-464：Gavin 10-03 要预览带标点 ⇒ 一变就打"
+        );
+        let t = 3500.0;
         // 间隔未满 ⇒ 不打点（哪怕有新内容）。
         assert!(!should_repunctuate_preview(3499.0, true, t));
         assert!(!should_repunctuate_preview(400.0, true, t));
@@ -3890,8 +3952,8 @@ mod tests {
     /// 与生产「每 chunk `+= chunk_ms`、实际打点归零」同构）。
     #[test]
     fn fix438_interval_gate_refires_after_reset() {
-        let thr = PUNCT_PREVIEW_INTERVAL_MS;
-        assert_eq!(thr, 3500.0, "Gavin 拍板 3.5s（不进 config）");
+        // 门槛机制本身（任意阈值，此处用 438 的 3.5s 样例）；生产阈值见 `punct438_preview_only_on_interval`。
+        let thr = 3500.0;
         let mut fires: Vec<f32> = Vec::new();
         let mut t = 0.0f32; // 距上次打点的间隔计数器（生产 punct_interval_ms）
         let mut elapsed = 0.0f32; // 全程累计时间，仅用于断言复打节奏
@@ -3979,15 +4041,20 @@ mod tests {
         assert!(again.starts_with("今天天气不错，我们准备开始讨论这个项目，明天开工"));
     }
 
-    /// ⑤ 静默 1.2s **不再**触发打点（1200ms < 3500ms；机制已换成间隔，与静默无关）。
+    /// ⑤ PREVIEW-PUNCT-464：生产阈值 0 ⇒ **有新字即打**，与静默 / 间隔长短无关；没新字不打（省算力）。
     #[test]
-    fn fix438_silence_1200ms_no_longer_triggers() {
+    fn fix464_punct_on_every_change_independent_of_silence() {
         let thr = PUNCT_PREVIEW_INTERVAL_MS;
-        assert!(!should_repunctuate_preview(1200.0, true, thr));
-        assert!(!should_repunctuate_preview(1899.0, true, thr));
-        assert!(!should_repunctuate_preview(3499.0, true, thr));
-        // 反向：静默多久都不影响判定 —— 判据只看间隔计数器（此处即传入值）。
-        assert!(should_repunctuate_preview(1200.0 + 2300.0, true, thr));
+        for ms in [0.0, 10.0, 1200.0, 3499.0, 9000.0] {
+            assert!(
+                should_repunctuate_preview(ms, true, thr),
+                "{ms}ms 有新字应打"
+            );
+            assert!(
+                !should_repunctuate_preview(ms, false, thr),
+                "{ms}ms 无新字不打"
+            );
+        }
     }
 
     /// ⑥ 用户关标点（`engine = None`）⇒ 原样返回裸文本，且不写缓存（行为与改前一致）。
@@ -3999,9 +4066,15 @@ mod tests {
             raw: String::new(),
         };
         let raw = "今天天气不错我们准备开始讨论";
-        assert_eq!(preview_display(raw, None, &mut cache, true, 0, 0), raw);
+        assert_eq!(
+            preview_display(raw, None, &mut cache, true, 0, 0, false),
+            raw
+        );
         // 已派发（非零坐标）+ force 同样原样返回。
-        assert_eq!(preview_display(raw, None, &mut cache, false, 7, 3), raw);
+        assert_eq!(
+            preview_display(raw, None, &mut cache, false, 7, 3, true),
+            raw
+        );
         assert_eq!(cache.raw_len, 0, "engine=None 不写打点缓存");
         assert!(cache.prefix.is_empty());
     }
@@ -4177,9 +4250,9 @@ mod tests {
         );
         // 新常量 + 独立间隔计时：声明 / 每 chunk 推进 / 打点归零 各恰 1 处。
         assert_eq!(
-            count_code("const PUNCT_PREVIEW_INTERVAL_MS: f32 = 3500.0;"),
+            count_code("const PUNCT_PREVIEW_INTERVAL_MS: f32 = 0.0;"),
             1,
-            "438: 间隔常量须恰 1 处且 = 3500.0"
+            "438/464: 间隔常量须恰 1 处且 = 0.0（464 起一变就打）"
         );
         assert_eq!(
             count_line("punct_interval_ms += chunk_ms;"),
