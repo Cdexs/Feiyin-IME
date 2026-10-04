@@ -198,6 +198,15 @@
 - 待 Gavin 重启后目视：预览字号 / 清晰度（473）、本地实时开录直接「请说话...」与加载中不弹录音窗（472）、加载提示完整（471）。
 - 主控更正：任务书 `fix164*` 测试名前缀写错（0 命中），下次按实际测试名列。
 
+## 2026-10-04 — tester-1 — TEST-EXEC-474 + BUILD-474 ✅（回归全绿 ⇒ 出包）
+
+- **性质**：阶段四全量回归 + 阶段五出包（UI-FONT-474，DEC-106）。源码基线 `5220a2b`（构建期间主控 CLEAN-468 提交 `3e0c265` 仅动 `collab/todo.md`，无 `src/`、`ui/src/`、`src-tauri/src/` 变更）。版本 **0.9.4 未动**。
+- **回归（全绿）**：bin **1924P/0F/82I**（＝预期）/ root 2012P/0F/84I / `src-tauri` 92P/0F/0I / Vitest 7 files·100P·11skip / `cargo fmt --check` EXIT 0。NEW 通过 1（`ui474_preview_text_drawn_like_edit_box`）+ 忽略 1（`ui474_preview_text_real_dc`）；GONE 通过 2（`omc415_gdi_and_dwrite_are_independent`、`omc415_dwrite_put_hit_and_invalidate`）+ 忽略 1（`ui473_d2d_streaming_text_real_dc`）；恒等式逐位吻合。重点失效模式（`ui47*`/`overlay*`/`d2d*`/`omc415*`/`scroll*`/gdi-fallback/`g3_alpha_fixup*`）全绿、0 FAILED。
+- **专项**：`ui474_preview_text_real_dc`（--ignored）1P/0F，`[474] GDI 宽 190px；ClearType 彩边像素 1097；分界 x=156 左侧差异像素 0；尾段亮度 正常 653956 / 浅色 534400`。
+- **出包九项全 PASS**：①main 12:28:17 / ui 12:28:26 / crash 23:57:24 ②两副本全等，main `c7bfb2f7…`/ui `727b470d…` 异于 473，crash `9340ab31…` 同（本批零 crash 改动，属预期）③0.9.4.0 / 0.9.4 / 0.9.4.0 ④Publish PID 18836 + target/release PID 16300 均 Responding、无 panic、无 crash.json、零残留 ⑤`Publish/config.toml` `da2be5da…` 前后不变 ⑥90/9 ⑦正 `LAS_ENC_WARMUP`1 / `[ALIGN-456] forced aligner loaded`1 / `[STREAM-SV-463] preview model`1，反 `[LocalRT-DBG-277] gdi_width`0 / `[PHANTOM-459] stripped silence-born text`0 / `streaming-paraformer-trilingual`0 ⑧四 toml 三副本全等 ⑨VC 五件 == Redist 14.44.35112。
+- **模型（如实）**：本批无新增 / 无改动；`Publish/models/sherpa-onnx-sense-voice-…/test_wavs/` 已删未回填（`find … -name test_wavs` = 0）；1.7B / aligner 照常刷新；其余目录未删。
+- **红线**：未改生产代码 / 版本未动 / 未 push / 未删用户数据与模型文件 / 零凭证。报告 `collab/outbox/tester-1/result.md`。**Step1 已结束输入法进程 ⇒ 请主控转告 Gavin 重启。**
+
 ## 2026-10-04 — 主控 — UI-FONT-474 开发完成（DEC-106），派 BUILD-474
 
 - 预览文字改 GDI（= 编辑框字体与渲染），窗框仍 D2D；浅色尾巴两段裁剪；删 D2D 预览文字与 DWrite 量宽缓存。

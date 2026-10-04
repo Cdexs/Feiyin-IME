@@ -80,12 +80,12 @@
 | ↳ `473-2` | 按证据修（不得丢掉未定字浅色） | 主控 | 代码 | ✅ ① 显式指定 GDI 经典渲染模式（笔画对齐像素，gamma / 对比度沿用系统），所有 D2D 浮层文字生效 ② 字号 16 → 18px（Gavin「需要调大」，预览 / 编辑框 / 提示同一常量，窗宽计算同步）；浅色尾巴不变 |
 | ↳ `473-4` | 测试 | 主控 | 测试 | ✅ `ui473_bigger_preview_font_fits_overlay`（18px 行高放得进 36px 窗）/ `ui473_text_rendering_mode_pinned`；离屏前后对比图 `collab/evidence/473/before-after-x4.png` |
 | ↳ `473-3` | 出包后 Gavin 目视确认字号 / 圆润度恢复 | Gavin | 目视通过 | ⬜ |
-| `UI-FONT-474` | Gavin 10-04「本地实时管线预览窗口的文字和编辑态的文字字体样式不一样，明显的编辑态的文字的字体的样式看起来更圆润，更好看。你修改一下预览窗口的文字，和编辑态的文字保持一致」 | 主控 | 开发 | ✅ 开发完成，派 BUILD-474（DEC-106） |
+| `UI-FONT-474` | Gavin 10-04「本地实时管线预览窗口的文字和编辑态的文字字体样式不一样，明显的编辑态的文字的字体的样式看起来更圆润，更好看。你修改一下预览窗口的文字，和编辑态的文字保持一致」 | 主控 | 开发 | ✅ BUILD-474 已出包（DEC-106），待 Gavin 目视 |
 | ↳ `474-1` | 查因：两态各用什么字体 / 渲染方式（编辑态 = Win32 编辑框 GDI 字体；预览态 = D2D） | 主控 | 有结论 | ✅ 编辑态：编辑框 + GDI Segoe UI ClearType（中文走系统字体链接）；预览态：DirectWrite 灰度（Segoe UI 回落雅黑），排版与渲染器都不同 |
 | ↳ `474-2` | 改：预览文字改用与编辑态同一字体、同一渲染方式（保留滚动、末尾未定字浅色、逐字出现） | 主控 | 代码 | ✅ D2D 只画窗框，文字一律 GDI（与编辑框同一 streaming_font）；浅色尾巴 = 同一整句两段裁剪各画一遍；量宽 / 滚动 / 窗宽统一 GDI 宽；删除 D2D 预览文字绘制 + DirectWrite 量宽缓存 |
 | ↳ `474-3` | 证据：离屏出图，预览态与编辑态同句逐像素 / 目视对比 | 主控 | 证据 | ✅ `ui474_preview_text_real_dc`：ClearType 彩边像素 1097（编辑框同款），浅色分界左侧差异 0，尾段变暗；图 `collab/evidence/474/` |
 | ↳ `474-4` | 测试 + 现有浮层 / D2D 测试不破 | 主控 | 测试 | ✅ 新 `ui474_preview_text_drawn_like_edit_box`；overlay 144 / d2d 24 / local 112 / scroll 3 全绿；GONE `omc415_gdi_and_dwrite_are_independent` / `omc415_dwrite_put_hit_and_invalidate` / `ui473_d2d_streaming_text_real_dc`；warnings 90 |
-| ↳ `474-5` | 派 tester-1 回归 + 出包；Gavin 目视 | tester-1 / Gavin | 目视通过 | 🔄 已派 BUILD-474 |
+| ↳ `474-5` | 派 tester-1 回归 + 出包；Gavin 目视 | tester-1 / Gavin | 目视通过 | ✅ 出包完成（BUILD-474 九项全 PASS）；Gavin 目视 |
 | ↳ `474-6` | 文档 + macOS 结论 | 主控 | 落盘 | ✅ macOS 浮层自绘、不经此路径，无影响 |
 | `STATS-475` | Gavin 10-04「版本号升级一下 / 配置界面左侧导航栏“词库”下增加“我的”导航菜单 / 在我的配置界面，增加使用统计信息区域：本周总共使用时长：xxx分钟、输入字数：xxxx字、优化LLM调用: xxx 次 / 其中（分项统计）：本地快速模型识别 时长：xxx分钟，输入字数：xxxx字；在线ASR模型服务 时长：xxx分钟，输入字数：xxxx字；本地流式模型识别 时长：xxx分钟，输入字数：xxxx字」；规则「1、时长是以用户输入语音的长度累加 2、字数是以最终输出的文字字数（中英日韩语音，英文用单词数）3、优化LLM调用次数，是以格式化输出LLM 调用次数来统计 4、周统计是以固定本周一到周日为一个周期」 | 主控 | 开发 | 🔄 调研中（BUILD-474 构建期间不动源码） |
 | ↳ `475-1` | 版本号 0.9.4 → 0.9.5（Gavin「版本号升级一下」；Cargo.toml / src-tauri / tauri.conf.json / package.json 等全部副本） | 主控 | 各处一致 | ⬜ |
