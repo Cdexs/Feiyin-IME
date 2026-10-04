@@ -1503,7 +1503,7 @@ struct OverlayWindowState {
     /// OVERLAY-051-F/G: cached ClearType font so we don't create/destroy HFONT every frame.
     cached_font: Option<HFONT>,
     /// STREAMFONT-189: 流式两态（RecordingStreamingIdle 占位 / RecordingWithText）自绘
-    /// 文字专用 HFONT（OVERLAY_TEXT_FONT_SIZE = -18）。必须独立于 cached_font（-14）：
+    /// 文字专用 HFONT（OVERLAY_TEXT_FONT_SIZE = -17）。必须独立于 cached_font（-14）：
     /// cached_font 在隐藏/退出清理臂会被 take+DeleteObject（与 edit_font 同一坑，
     /// :860 注释同源），复用会导致字体被提前删除或双删。生命周期照 edit_font/cached_font
     /// 范式：绘制选择点惰性创建、存回本字段，清理臂与 cached_font 同处 take+DeleteObject。
@@ -1560,9 +1560,10 @@ const OVERLAY_FONT_SIZE: i32 = -14;
 // 同时守护 14/16 两个字号）。处理中/箭头/Error/Info 小字仍归 OVERLAY_FONT_SIZE(-14)，
 // 逐位不变。
 // UI-PREVIEW-473（Gavin 10-03「预览窗口中的文字被变小了」「记住大小也变小了，需要调大」）：-16 → -18。
-// Segoe UI em 18 ⇒ tmHeight ≈ 24，desired ≈ 26 ≤ available 28（容量护栏：字号 + 6 ≤ 28）。
+// UI-FONT-477（Gavin 10-04「将“请说话”提示窗口、预览窗口和编辑态窗口的文字都调小一号」）：-18 → -17。
+// Segoe UI em 17 ⇒ tmHeight ≈ 23，desired ≈ 25 ≤ available 28（容量护栏：字号 + 6 ≤ 28）。
 #[cfg(target_os = "windows")]
-const OVERLAY_TEXT_FONT_SIZE: i32 = -18;
+const OVERLAY_TEXT_FONT_SIZE: i32 = -17;
 // OVERLAY-054-C: file-level button border color. Kept at 0x707070 (value unchanged).
 // Tests can now reference this constant instead of mirroring the literal.
 #[cfg(target_os = "windows")]
@@ -3095,7 +3096,7 @@ fn draw_overlay_to_dc(
     // OVERLAY-051-F: reuse a cached ClearType font instead of creating/destroying one per frame.
     // OVERLAY-054-E: use file-level OVERLAY_FONT_SIZE so cached font matches measuring font.
     // STREAMFONT-189: 流式两态（RecordingStreamingIdle 占位 / RecordingWithText）改选
-    // streaming_font（OVERLAY_TEXT_FONT_SIZE = -18），与 D2D streaming_text_format /
+    // streaming_font（OVERLAY_TEXT_FONT_SIZE = -17），与 D2D streaming_text_format /
     // EDIT 控件 / 两态测量同号；其余态（处理中/箭头/Error/Info 小字等）维持 cached_font
     // (-14) 逐位不变。选择点收在本处是刻意的：全 GDI 帧共用一次 SelectObject，
     // 流式兜底路径内的 measure_text_width（draw_recording_overlay_with_text :3579，
@@ -3803,8 +3804,24 @@ fn draw_recording_overlay(
     // failure the GDI path below still renders this frame, so the overlay never blanks.
     // Only the placeholder variant migrates — the waveform variant (Recording) is a
     // P2 state and keeps its GDI path untouched (DEC-055 红线 4).
-    if show_placeholder && d2d::draw_streaming_idle_overlay(hdc, rect, state, ui_language) {
-        return draw_stop_button_hit_rect_only(rect);
+    // UI-FONT-476（Gavin 10-04「“请说话...”信息提示窗口的文字样式也要调整和预览窗口一致」）：
+    // 占位态窗框 / 麦克风 / 停止键仍由 D2D 画（失败回落 GDI），「请说话...」文字一律 GDI 画 ——
+    // DC 已选入 streaming_font（= 预览 / 编辑框同一字体，见 draw_overlay_to_dc 流式两态分支）。
+    if show_placeholder {
+        let d2d_chrome = d2d::draw_streaming_idle_overlay(hdc, rect, state);
+        if !d2d_chrome {
+            // OVERLAY-141: 半径单一来源。
+            draw_overlay_chrome(hdc, rect, OVERLAY_FRAME_RADIUS_LG as i32);
+            draw_recording_indicator(hdc, rect, state);
+        }
+        // OVERLAY-051-E: online streaming ASR waiting for first text shows placeholder,
+        // not waveform.
+        draw_listening_placeholder(hdc, rect, ui_language);
+        return if d2d_chrome {
+            draw_stop_button_hit_rect_only(rect)
+        } else {
+            draw_stop_button(hdc, rect)
+        };
     }
     // OVERLAY-149 (P3): Recording 系 GDI fallback r=16（Gavin 拍板；D2D 失败帧仍是
     // 方角填充 —— GDI 无 AA，方角是 fallback 的既定降级，见 result.md）。
@@ -3815,13 +3832,7 @@ fn draw_recording_overlay(
     // ~0.5px 叠画，角区灰线粗乱（Gavin 三轮端测的圆角病灶，DIAG 差异 A）。
     // 收进失败分支后：D2D 成功即 return，GDI 只在 D2D 失败时兜底（DEC-055 契约），
     // Info/Error 的干净结构与此同构。
-    if show_placeholder {
-        draw_overlay_chrome(hdc, rect, OVERLAY_FRAME_RADIUS_LG as i32);
-        // OVERLAY-051-E: online streaming ASR waiting for first text shows placeholder,
-        // not waveform. Local model continues to show waveform unchanged.
-        draw_recording_indicator(hdc, rect, state);
-        draw_listening_placeholder(hdc, rect, ui_language);
-    } else {
+    {
         // D2D-P2 (PLAN-108 H6): 波形变体迁 D2D。On any D2D failure the GDI path
         // below still renders this frame, so the overlay never blanks. 命中 rect
         // 由 P1 既有 helper 出（与 d2d::stop_button 同公式，几何单一源）。
@@ -3881,7 +3892,7 @@ fn draw_recording_overlay_with_text(
     // Win32 编辑框同一字体（streaming_font = create_clear_type_font(OVERLAY_TEXT_FONT_SIZE)，Segoe UI
     // ClearType）、同一渲染器。ULW 下 GDI 不写 alpha 的像素由 apply_alpha_fixup 视作不透明（OVERLAY-153）。
     // 量宽 / 滚动 / 窗宽三者同用 GDI 宽（measure_text_width），自洽。
-    // OVERLAY-MEASURE-CACHE-415：此处所选字体恒为 streaming_font(OVERLAY_TEXT_FONT_SIZE=-18)
+    // OVERLAY-MEASURE-CACHE-415：此处所选字体恒为 streaming_font(OVERLAY_TEXT_FONT_SIZE=-17)
     // （见 draw_overlay_to_dc 的 streaming_text 分支），故字号传入以纳入缓存键。
     let text_width = measure_text_width(hdc, text, OVERLAY_TEXT_FONT_SIZE);
     let d2d_chrome = d2d::draw_streaming_text_overlay(hdc, rect, state);
@@ -4408,7 +4419,7 @@ mod d2d {
         pub text_format: windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
         /// D2D-P1: streaming-state text format — left-aligned (LEADING), vertical center,
         /// NO_WRAP. Face "Segoe UI" Normal, STREAMFONT-189 起字号 = OVERLAY_TEXT_FONT_SIZE
-        /// (-18 → 18px，473 起；原 -16)，与 GDI 兜底的 streaming_font 同号（EDITFONT-183 曾是 14px，
+        /// (-17 → 17px，477 起；473 曾为 18、原 16)，与 GDI 兜底的 streaming_font 同号（EDITFONT-183 曾是 14px，
         /// Gavin 2026-09-08 拍板实时上屏与编辑态同号），单一 GDI 度量源
         /// (measure_text_width) 仍以所选字体为源，测渲不漂移。
         /// (P0's format comment claimed "must match the GDI face" but used YaHei UI
@@ -4473,7 +4484,7 @@ mod d2d {
             text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             // D2D-P1: streaming-state format — same face/weight as the GDI text path
             // ("Segoe UI", FW_NORMAL), left-aligned, single line, no wrap.
-            // STREAMFONT-189: 字号归 OVERLAY_TEXT_FONT_SIZE（473 起 18px），与 GDI 兜底
+            // STREAMFONT-189: 字号归 OVERLAY_TEXT_FONT_SIZE（477 起 17px），与 GDI 兜底
             // streaming_font / EDIT 控件同号；其余三个 format 仍绑 OVERLAY_FONT_SIZE。
             let gdi_family: Vec<u16> = "Segoe UI".encode_utf16().collect();
             let streaming_text_format = dwrite.CreateTextFormat(
@@ -5406,54 +5417,20 @@ mod d2d {
         })
     }
 
-    /// GDI `draw_listening_placeholder` (:2731): centered single-line hint
-    /// ("请说话..." / "Speak now...") between the mic area and the stop button.
-    fn placeholder_text(
-        res: &D2dResources,
-        w: f32,
-        h: f32,
-        ui_language: crate::config::UiLanguage,
-    ) {
-        let hint = super::i18n::get(ui_language).overlay_listening_hint;
-        let hint: Vec<u16> = hint.encode_utf16().collect();
-        unsafe {
-            res.brush
-                .SetColor(&colorref_to_d2d(super::OVERLAY_TEXT_WHITE));
-            // D2D-P1: same face/weight as the GDI text path (Segoe UI normal, streaming
-            // format) so the placeholder is visually continuous with the streaming text
-            // that replaces it — the P0 centered format is YaHei SemiBold and would
-            // visibly differ from the GDI baseline on Latin glyphs.
-            res.rt.DrawText(
-                &hint,
-                &res.streaming_text_format,
-                &D2D_RECT_F {
-                    left: super::STREAMING_TEXT_LEFT_MARGIN as f32,
-                    top: 0.0,
-                    right: w - super::STREAMING_TEXT_RIGHT_MARGIN as f32,
-                    bottom: h,
-                },
-                &res.brush,
-                windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
-        }
-    }
-
-    /// D2D-P1: `RecordingStreamingIdle`（聆听占位态）= chrome + mic indicator +
-    /// centered placeholder hint + stop button. Returns false on any D2D failure —
-    /// the caller (draw_recording_overlay) renders the same frame via GDI.
+    /// D2D-P1: `RecordingStreamingIdle`（聆听占位态）的窗框 = chrome + mic indicator +
+    /// stop button。UI-FONT-476 起「请说话...」文字由调用方（draw_recording_overlay）用 GDI
+    /// 画在其上（与预览 / 编辑态同字体同渲染）。Returns false on any D2D failure —
+    /// the caller then draws the chrome via GDI.
     pub(crate) fn draw_streaming_idle_overlay(
         hdc: HDC,
         rect: &RECT,
         state: &OverlayWindowState,
-        ui_language: crate::config::UiLanguage,
     ) -> bool {
         with_d2d(hdc, rect, |res, w, h| {
             // OVERLAY-121 (P3): RecordingStreamingIdle 升 r=16（Gavin 拍板）。
             // OVERLAY-141: 半径单一来源。
             chrome(res, w, h, super::OVERLAY_FRAME_RADIUS_LG);
             mic_indicator(res, h, state);
-            placeholder_text(res, w, h, ui_language);
             let _ = stop_button(res, w, h);
         })
     }
@@ -6669,7 +6646,7 @@ fn adjust_overlay_pos_size_for_text(
     current_size: &[i32; 2],
 ) -> ([i32; 2], [i32; 2]) {
     // EDITFONT-183: 测量字号按状态选择。STREAMFONT-189：RecordingWithText 的自绘文字
-    // 也已归 OVERLAY_TEXT_FONT_SIZE（473 起 18px）渲染（D2D streaming_text_format + GDI
+    // 也已归 OVERLAY_TEXT_FONT_SIZE（477 起 17px）渲染（D2D streaming_text_format + GDI
     // streaming_font 兜底），测量必须跟随；若仍按 14px 量宽，自动宽度低估 ~14%
     // ⇒ 文字更早溢出 ⇒ ES_AUTOHSCROLL 横向滚动更频繁（FIX-172-B 依赖测渲一致，
     // 这是正确性不是外观 —— EDITFONT-183 在编辑态踩过并修过同一坑）。
@@ -18060,7 +18037,7 @@ mod overlay_shimmer_tests {
     // === OVERLAY-054-H: text-area capacity guard ===
     // The 36px recording overlay must leave enough drawing height for the ClearType
     // font plus a 6px cushion. STREAMFONT-189: the streaming text now renders at
-    // OVERLAY_TEXT_FONT_SIZE (18px since UI-PREVIEW-473), so the guard covers both font sizes. If this
+    // OVERLAY_TEXT_FONT_SIZE (17px since UI-FONT-477), so the guard covers both font sizes. If this
     // trips, 054-G/H class clipping has regressed.
 
     #[cfg(target_os = "windows")]
@@ -19217,8 +19194,7 @@ mod overlay_086_d2d_p1_guard_tests {
         };
         let state = overlay_window_state_for_test();
 
-        let ok_idle =
-            d2d::draw_streaming_idle_overlay(hdc, &rect, &state, config::UiLanguage::Chinese);
+        let ok_idle = d2d::draw_streaming_idle_overlay(hdc, &rect, &state);
         assert!(
             !ok_idle,
             "RecordingStreamingIdle 入口：无效 HDC 必须返回 false（GDI 回落触发器）"
@@ -19254,7 +19230,8 @@ mod overlay_086_d2d_p1_guard_tests {
             bottom: h as i32,
         };
         let state = overlay_window_state_for_test();
-        let render = |dim_from: Option<usize>| -> (Vec<u8>, i32) {
+        // placeholder=true ⇒ 走生产 `draw_recording_overlay` 的「请说话...」占位态（UI-FONT-476）。
+        let render = |dim_from: Option<usize>, placeholder: bool| -> (Vec<u8>, i32) {
             unsafe {
                 let screen = g::GetDC(None);
                 let mem = g::CreateCompatibleDC(screen);
@@ -19272,14 +19249,24 @@ mod overlay_086_d2d_p1_guard_tests {
                 let font = create_clear_type_font(OVERLAY_TEXT_FONT_SIZE);
                 let of = g::SelectObject(mem, font);
                 let _ = g::SetBkMode(mem, g::TRANSPARENT);
-                let _ = draw_recording_overlay_with_text(
-                    mem,
-                    &rect,
-                    &state,
-                    config::UiLanguage::Chinese,
-                    text,
-                    dim_from,
-                );
+                if placeholder {
+                    let _ = draw_recording_overlay(
+                        mem,
+                        &rect,
+                        &state,
+                        true,
+                        config::UiLanguage::Chinese,
+                    );
+                } else {
+                    let _ = draw_recording_overlay_with_text(
+                        mem,
+                        &rect,
+                        &state,
+                        config::UiLanguage::Chinese,
+                        text,
+                        dim_from,
+                    );
+                }
                 let tw = measure_text_width(mem, text, OVERLAY_TEXT_FONT_SIZE);
                 let px = std::slice::from_raw_parts(bits as *const u8, w * h * 4).to_vec();
                 g::SelectObject(mem, of);
@@ -19291,8 +19278,9 @@ mod overlay_086_d2d_p1_guard_tests {
                 (px, tw)
             }
         };
-        let (plain, tw) = render(None);
-        let (dim, _) = render(Some(6));
+        let (plain, tw) = render(None, false);
+        let (dim, _) = render(Some(6), false);
+        let (placeholder, _) = render(None, true);
         d2d::release_resources();
         let save = |name: &str, px: &[u8]| {
             let mut f = Vec::new();
@@ -19315,6 +19303,7 @@ mod overlay_086_d2d_p1_guard_tests {
         };
         save("preview-plain", &plain);
         save("preview-dim", &dim);
+        save("placeholder", &placeholder);
         let x0 = STREAMING_TEXT_LEFT_MARGIN as usize;
         let x1 = w - STREAMING_TEXT_RIGHT_MARGIN as usize;
         let px = |v: &[u8], x: usize, y: usize| {
@@ -19363,6 +19352,19 @@ mod overlay_086_d2d_p1_guard_tests {
         assert!(fringe > 0, "预览文字须是 GDI ClearType（与编辑框同款）");
         assert_eq!(left_diff, 0, "浅色尾巴不得改动分界左侧像素");
         assert!(bright(&dim) < bright(&plain), "尾段须变暗");
+        // UI-FONT-476：「请说话...」占位文字同样是 GDI ClearType（与预览同款）。
+        let ph_fringe = (0..h)
+            .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let (r, _, b) = px(&placeholder, x, y);
+                (r - b).abs() > 30
+            })
+            .count();
+        println!("[476] 「请说话...」ClearType 彩边像素 {ph_fringe}");
+        assert!(
+            ph_fringe > 0,
+            "「请说话...」须是 GDI ClearType（与预览同款）"
+        );
     }
 
     /// 护栏 3：D2DERR_RECREATE_TARGET 常量值钉死 0x8899000C。
@@ -23824,7 +23826,7 @@ mod ui471_472_tests {
         crate::guard_prod_lines::prod_lines_excluding_cfg_test(include_str!("main.rs")).join("\n")
     }
 
-    /// 473：预览字号调大（18px）后，编辑框按真实字体量出的行高仍放得进 36px 窗（tmHeight + 2 ≤ 28），不裁字；
+    /// 473 / 477：预览字号（473 调到 18px、477 回调一号到 17px）下，编辑框按真实字体量出的行高仍放得进 36px 窗（tmHeight + 2 ≤ 28），不裁字；
     /// 且字号确实比原 16px 大。
     #[test]
     fn ui473_bigger_preview_font_fits_overlay() {
@@ -23891,6 +23893,34 @@ mod ui471_472_tests {
         assert!(
             !p.contains("streaming_text(res,"),
             "D2D 预览文字绘制已删除，不得复活"
+        );
+    }
+
+    /// 477：「请说话...」/ 预览 / 编辑态三处文字共用一个字号常量，Gavin 10-04 要求在 18px 基础上调小一号 ⇒ 17px。
+    #[test]
+    fn ui477_overlay_text_one_size_smaller() {
+        assert_eq!(OVERLAY_TEXT_FONT_SIZE, -17);
+    }
+
+    /// 476：「请说话...」占位文字与预览 / 编辑态同一字体同一渲染 —— D2D 只画占位态窗框，
+    /// 文字一律 GDI `draw_listening_placeholder`（DC 已选 streaming_font）；D2D 占位文字绘制不得复活。
+    #[test]
+    fn ui476_listening_placeholder_drawn_like_preview() {
+        let p = prod();
+        let at = p
+            .find("fn draw_recording_overlay(")
+            .expect("录音窗绘制函数");
+        let body = seg(&p, at, 4000);
+        let chrome = body
+            .find("let d2d_chrome = d2d::draw_streaming_idle_overlay(hdc, rect, state);")
+            .expect("D2D 只画占位态窗框");
+        let text = body
+            .find("draw_listening_placeholder(hdc, rect, ui_language);")
+            .expect("「请说话...」走 GDI");
+        assert!(chrome < text, "文字画在窗框之后、不分 D2D 成败");
+        assert!(
+            !p.contains("placeholder_text(res,"),
+            "D2D 占位文字绘制已删除，不得复活"
         );
     }
 

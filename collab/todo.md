@@ -98,6 +98,13 @@
 | ↳ `475-8` | 派 tester-1 回归 + 出包 0.9.5；Gavin 目视 | tester-1 / Gavin | 目视通过 | 🔄 已派 BUILD-475 |
 | ↳ `475-9` | 文档：DEC / 五文档 | 主控 | 落盘 | ✅ |
 | ↳ `475-10` | Gavin 10-04 追加「注意信息统计界面，如果某一个分享的时长（或字数是 0，也就是本周没用过），就不要显示这一项的统计信息」 | 主控 | 代码 + 测试 | ✅ 分项时长或字数为 0 不显示；三项全为 0 时「其中（分项统计）」标题也不显示；Vitest STATS-UI-005 |
+| ↳ `475-11` | tester-1 回归拦截：`Mine.tsx` 3 处裸十六进制色值违反 G1 设计令牌禁令（UITEST-137） | 主控 | 修 + 全量 Vitest | ✅ 改 `var(--system-text-secondary)` / `var(--system-text-tertiary)`；全量 Vitest 105P/11skip |
+| `UI-FONT-476` | Gavin 10-04「另外，“请说话...”信息提示窗口的文字样式也要调整和预览窗口一致」 | 主控 | 开发 | ✅ 并入 BUILD-475 |
+| ↳ `476-1` | 查因：占位态「请说话...」由 D2D 画（DirectWrite），其 GDI 兜底 `draw_listening_placeholder` 才是与预览同字体 | 主控 | 有结论 | ✅ |
+| ↳ `476-2` | 改：占位态 D2D 只画窗框，文字一律 GDI（DC 已选 streaming_font）；删 D2D `placeholder_text` | 主控 | 代码 | ✅ |
+| ↳ `476-3` | 测试：护栏 `ui476_listening_placeholder_drawn_like_preview`；离屏取证 `[476]` 彩边 364（GDI ClearType） | 主控 | 测试 | ✅ |
+| `UI-FONT-477` | Gavin 10-04「将“请说话”提示窗口、预览窗口和编辑态窗口的文字都调小一号」 | 主控 | 开发 | ✅ 并入 BUILD-475 |
+| ↳ `477-1` | 三处共用 `OVERLAY_TEXT_FONT_SIZE`：-18 → -17（单行提示同字号随之变小）；容量护栏仍过；护栏 `ui477_overlay_text_one_size_smaller` | 主控 | 代码 + 测试 | ✅ 字宽 190 → 170px |
 | `TEST-GAP-438-TAILSTART` | 护栏缺口（BUILD-438 消融 438b 未红）：`preview_display` 重打时忽略 `tail_start` 改为整段重打，`fix438_*` 全绿——护栏只直调纯函数、唯一进 `preview_display` 的用例 `engine=None`。主控已读码确认接线正确（不影响本包）。补：带真 CT-Transformer 或可注入打点函数的端到端用例 | 待定（非作者 coder） | local_stream.rs 测试区 | ⏳ 攒批补 |
 | `RT-STOP-LATENCY-MULTIWIN` | BUILD-398 #9 遗留：长录音切多窗串行解码，停止时队列压窗 ⇒ 松键到上屏 4.5s（16:44Z 23.85s 录音）；后半「无语音整窗送解」已由 414 修 | 待定 | — | ⏳ 待更多端测数据再定 |
 

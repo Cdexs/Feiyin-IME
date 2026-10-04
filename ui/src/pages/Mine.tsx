@@ -64,7 +64,7 @@ const MinePage: React.FC<Props> = ({ config }) => {
         <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: '16px' }}>
           <span style={{ fontSize: '15px', fontWeight: 600 }}>{t.mine_week_title}</span>
           {usage && (
-            <span style={{ fontSize: '12px', color: '#6b7280' }}>
+            <span style={{ fontSize: '12px', color: 'var(--system-text-secondary)' }}>
               {t.mine_week_range}{usage.week_start} ~ {usage.week_end}
             </span>
           )}
@@ -84,7 +84,7 @@ const MinePage: React.FC<Props> = ({ config }) => {
               {t.mine_llm_calls}<strong>{usage.llm_calls}</strong>{t.mine_times}
             </p>
             {rows.length > 0 && (
-              <p style={{ fontSize: '14px', color: '#6b7280', margin: '0 0 6px' }}>{t.mine_breakdown}</p>
+              <p style={{ fontSize: '14px', color: 'var(--system-text-secondary)', margin: '0 0 6px' }}>{t.mine_breakdown}</p>
             )}
             <ul style={{ listStyle: 'none', margin: 0, padding: '0 0 0 16px' }}>
               {rows.map((row) => (
@@ -96,7 +96,7 @@ const MinePage: React.FC<Props> = ({ config }) => {
                 </li>
               ))}
             </ul>
-            <p style={{ fontSize: '12px', color: '#9ca3af', margin: '16px 0 0' }}>{t.mine_rules_note}</p>
+            <p style={{ fontSize: '12px', color: 'var(--system-text-tertiary)', margin: '16px 0 0' }}>{t.mine_rules_note}</p>
           </>
         )}
       </div>
