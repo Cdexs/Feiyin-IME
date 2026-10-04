@@ -3872,36 +3872,32 @@ fn draw_recording_overlay_with_text(
     _ui_language: config::UiLanguage,
     text: &str,
     // STREAM-SV-463：从第几个字起画浅色（末尾未定字）；None = 全部正常色。
-    // GDI 兜底路径（D2D 失败才走）不分色，整段正常色。
     dim_from: Option<usize>,
 ) -> (RECT, RECT, RECT) {
-    // D2D-P1: RecordingWithText is drawn with D2D (DEC-055 step 2). On any D2D failure
-    // the GDI path below still renders this frame, so the overlay never blanks.
-    // The metric (text_width) comes from measure_text_width on the GDI font — the
-    // single metric source agreed in D2D-P1 — so the D2D side never measures itself
-    // and cannot drift from the window-sizing path (adjust_overlay_pos_size_for_text).
+    // UI-FONT-474（Gavin 10-04「预览窗口的文字和编辑态的文字字体样式不一样……编辑态……更圆润，更好看。
+    // 你修改一下预览窗口的文字，和编辑态的文字保持一致」）：
+    // 窗框 / 麦克风 / 分隔线 / 停止键仍由 D2D 画（失败回落 GDI）；**文字一律 GDI 画**，与编辑态
+    // Win32 编辑框同一字体（streaming_font = create_clear_type_font(OVERLAY_TEXT_FONT_SIZE)，Segoe UI
+    // ClearType）、同一渲染器。ULW 下 GDI 不写 alpha 的像素由 apply_alpha_fixup 视作不透明（OVERLAY-153）。
+    // 量宽 / 滚动 / 窗宽三者同用 GDI 宽（measure_text_width），自洽。
     // OVERLAY-MEASURE-CACHE-415：此处所选字体恒为 streaming_font(OVERLAY_TEXT_FONT_SIZE=-18)
     // （见 draw_overlay_to_dc 的 streaming_text 分支），故字号传入以纳入缓存键。
     let text_width = measure_text_width(hdc, text, OVERLAY_TEXT_FONT_SIZE);
-    if d2d::draw_streaming_text_overlay(hdc, rect, state, text, text_width, dim_from) {
-        let text_hit = text_hit_rect_for(rect);
-        let cancel = draw_stop_button_hit_rect_only(rect);
-        return (cancel, cancel, text_hit);
-    }
-    // OVERLAY-043: text mode uses chrome + stop button only, no waveform so text is not squeezed
-    // OVERLAY-121 (P3): RecordingWithText fallback r=16（Gavin 拍板）。
-    // OVERLAY-141: 半径单一来源。
-    draw_overlay_chrome(hdc, rect, OVERLAY_FRAME_RADIUS_LG as i32);
-    // keep the mic indicator so the user still sees the recording state
-    draw_recording_indicator(hdc, rect, state);
-    let cancel_rect = draw_stop_button(hdc, rect);
-
-    let cy = rect.top + (rect.bottom - rect.top) / 2;
+    let d2d_chrome = d2d::draw_streaming_text_overlay(hdc, rect, state);
+    let cancel_rect = if d2d_chrome {
+        draw_stop_button_hit_rect_only(rect)
+    } else {
+        // OVERLAY-043: text mode uses chrome + stop button only, no waveform so text is not squeezed
+        // OVERLAY-121 (P3): RecordingWithText fallback r=16（Gavin 拍板）。
+        // OVERLAY-141: 半径单一来源。
+        draw_overlay_chrome(hdc, rect, OVERLAY_FRAME_RADIUS_LG as i32);
+        // keep the mic indicator so the user still sees the recording state
+        draw_recording_indicator(hdc, rect, state);
+        draw_stop_button(hdc, rect)
+    };
 
     // OVERLAY-054-H: self-drawn streaming text uses a 4px vertical inset so the
-    // -14 ClearType font fits. The center is identical to the old 10/10 margin
-    // because both are symmetric around the window center, so the text has zero
-    // visual displacement; only the available height changes (16px -> 28px).
+    // ClearType font fits (capacity guard: font + 6 <= 28).
     let text_left = rect.left + STREAMING_TEXT_LEFT_MARGIN;
     let text_right = rect.right - STREAMING_TEXT_RIGHT_MARGIN;
     let text_top = rect.top + OVERLAY_TEXT_DRAW_VERTICAL_INSET;
@@ -3911,63 +3907,77 @@ fn draw_recording_overlay_with_text(
     // Scroll offset so newest text stays at the right edge once text overflows
     let scroll_x = streaming_scroll_offset(text_width, visible_w);
 
-    // OVERLAY-054-H: keep the horizontal clip region unchanged. We only relaxed the
-    // vertical text rectangle; the horizontal scroll/clipping behavior is untouched.
-    unsafe {
-        let _ = SaveDC(hdc);
-    }
-    let clip = unsafe { CreateRectRgn(text_left, text_top, text_right, text_bottom) };
-    unsafe {
-        let _ = SelectClipRgn(hdc, clip);
-        let _ = DeleteObject(clip);
+    // STREAM-SV-463 / UI-FONT-474：末尾未定字浅色 = 同一整句分两段裁剪各画一遍（左段正常色、右段浅色），
+    // 字形与字距与整句一次画出逐位相同；分界 x = 未定字之前那段的 GDI 宽（不进单条量宽缓存，免冲掉整句缓存）。
+    let dim_x = dim_from.map(|c| {
+        let prefix = encode_wide(&text.chars().take(c).collect::<String>());
+        let mut size = windows::Win32::Foundation::SIZE::default();
+        let len = prefix.len().saturating_sub(1);
+        if len > 0 {
+            unsafe {
+                let _ = GetTextExtentPoint32W(hdc, &prefix[..len], &mut size);
+            }
+        }
+        (text_left - scroll_x + size.cx).clamp(text_left, text_right)
+    });
+    let pass = |left: i32, right: i32, color: COLORREF| {
+        if right <= left {
+            return;
+        }
+        unsafe {
+            let _ = SaveDC(hdc);
+            let clip = CreateRectRgn(left, text_top, right, text_bottom);
+            let _ = SelectClipRgn(hdc, clip);
+            let _ = DeleteObject(clip);
+            let _ = SetTextColor(hdc, color);
+        }
+        let mut text_rect = RECT {
+            left: text_left - scroll_x,
+            top: text_top,
+            // FIX-OVERLAY-SCROLL-255: 右边界**不随 scroll_x 左移**，保持在可视区右沿。
+            // 旧写法 `text_right - scroll_x` 让排版矩形整体左移 ⇒ 文字溢出后右侧留白。
+            // 现布局宽度 = visible_w + scroll_x = max(text_width, visible_w) ≥ 文本宽度，
+            // 最新文字仍贴 text_right；裁剪区 text_left..text_right 不动，保证不溢出窗口。
+            right: text_right,
+            bottom: text_bottom,
+        };
+        draw_text(
+            hdc,
+            text,
+            &mut text_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+        unsafe {
+            let _ = RestoreDC(hdc, -1);
+        }
+    };
+    match dim_x {
+        Some(x) => {
+            pass(text_left, x, OVERLAY_TEXT_WHITE);
+            pass(x, text_right, OVERLAY_TEXT_TENTATIVE);
+        }
+        None => pass(text_left, text_right, OVERLAY_TEXT_WHITE),
     }
 
-    unsafe {
-        let _ = SetTextColor(hdc, OVERLAY_TEXT_WHITE);
-    }
-    let mut text_rect = RECT {
-        left: text_left - scroll_x,
-        top: text_top,
-        // FIX-OVERLAY-SCROLL-255: 右边界**不随 scroll_x 左移**，保持在可视区右沿。
-        // 旧写法 `text_right - scroll_x` 让排版矩形整体左移 ⇒ 文字溢出后右侧留白。
-        // 现布局宽度 = visible_w + scroll_x = max(text_width, visible_w) ≥ 文本宽度，
-        // 最新文字仍贴 text_right；裁剪区 text_left..text_right 不动，保证不溢出窗口。
-        right: text_right,
-        bottom: text_bottom,
-    };
-    draw_text(
-        hdc,
-        text,
-        &mut text_rect,
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-    );
-    unsafe {
-        let _ = RestoreDC(hdc, -1);
+    if !d2d_chrome {
+        // Right separator between text area and stop button
+        let cy = rect.top + (rect.bottom - rect.top) / 2;
+        let sep_r_x = rect.right - 36;
+        let sep_h = 20;
+        let sep_hh = sep_h / 2;
+        let sep_pen = unsafe { CreatePen(PS_SOLID, 2, OVERLAY_BORDER_GRAY) };
+        let sep_op = unsafe { SelectObject(hdc, sep_pen) };
+        unsafe {
+            let _ = MoveToEx(hdc, sep_r_x, cy - sep_hh, None);
+            let _ = LineTo(hdc, sep_r_x, cy + sep_hh);
+            let _ = SelectObject(hdc, sep_op);
+            let _ = DeleteObject(sep_pen);
+        }
     }
 
     // Text hit region (for entering edit mode) excludes the stop button.
-    // Keep the hit region at the old 10px margin so the editable area is not shrunk.
-    let text_hit_rect = RECT {
-        left: text_left,
-        top: rect.top + STREAMING_TEXT_TOP_MARGIN,
-        right: text_right,
-        bottom: rect.bottom - STREAMING_TEXT_BOTTOM_MARGIN,
-    };
-
-    // Right separator between text area and stop button
-    let sep_r_x = rect.right - 36;
-    let sep_h = 20;
-    let sep_hh = sep_h / 2;
-    let sep_pen = unsafe { CreatePen(PS_SOLID, 2, OVERLAY_BORDER_GRAY) };
-    let sep_op = unsafe { SelectObject(hdc, sep_pen) };
-    unsafe {
-        let _ = MoveToEx(hdc, sep_r_x, cy - sep_hh, None);
-        let _ = LineTo(hdc, sep_r_x, cy + sep_hh);
-        let _ = SelectObject(hdc, sep_op);
-        let _ = DeleteObject(sep_pen);
-    }
-
     // OVERLAY-043: the single right button serves as stop in RecordingWithText and submit in StreamingEditing
+    let text_hit_rect = text_hit_rect_for(rect);
     (cancel_rect, cancel_rect, text_hit_rect)
 }
 
@@ -5428,202 +5438,6 @@ mod d2d {
         }
     }
 
-    /// LOCALRT-FIRSTCHAR-281: 用**实际渲染引擎**（DirectWrite）量文本宽度（像素）。
-    /// 与 GDI `GetTextExtentPoint32W` 对同一串可差 143-155px（实测，随长度增长）——
-    /// D2D 绘制若用 GDI 量宽算 `scroll_x` 会多滚一截 ⇒ 右侧留白。故 D2D 侧一律用本函数。
-    /// `fallback` 在 layout 创建/取 metrics 失败时返回（退化为原 GDI 量宽，避免 0 宽不滚动）。
-    fn dwrite_measure_width(res: &D2dResources, visible: &[u16], fallback: f32) -> f32 {
-        unsafe {
-            match res
-                .dwrite
-                .CreateTextLayout(visible, &res.streaming_text_format, 1.0e6, 1.0e3)
-            {
-                Ok(layout) => {
-                    let mut m =
-                        windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS::default();
-                    if layout.GetMetrics(&mut m).is_ok() && m.width > 0.0 {
-                        m.width
-                    } else {
-                        fallback
-                    }
-                }
-                Err(_) => fallback,
-            }
-        }
-    }
-
-    /// LOCALRT-SCROLL-277 诊断：量化右侧空白。只读日志、节流 500ms、仅在滚动时打。
-    /// `gdi_width` 仅作对照（281 起**不再驱动 scroll**）；`scroll_width` = 实际驱动 scroll 的宽度
-    /// （281 修复后 = DirectWrite 实渲宽）；`right_gap = 布局宽度(visible_w+scroll_x) - scroll_width`，
-    /// 修复后应 ≈ 0。保留至 Gavin 完成「改后」实测。
-    fn log_draw_geo_277(gdi_width: i32, scroll_width: f32, visible_w: f32, scroll_x: f32) {
-        // URGENT-286：默认 Warn 下直接返回 —— 连节流计时/文本布局（最贵的那步）都不做，真正零开销。
-        if !log::log_enabled!(log::Level::Debug) {
-            return;
-        }
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static LAST_MS: AtomicU64 = AtomicU64::new(0);
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        if now_ms.saturating_sub(LAST_MS.load(Ordering::Relaxed)) < 500 {
-            return;
-        }
-        LAST_MS.store(now_ms, Ordering::Relaxed);
-        let layout_w = visible_w + scroll_x;
-        log::debug!(
-            "[LocalRT-DBG-277] gdi_width={} scroll_width={:.1} diff(gdi-scroll)={:.1} visible_w={:.1} scroll_x={:.1} layout_w={:.1} => right_gap={:.1}px",
-            gdi_width,
-            scroll_width,
-            gdi_width as f32 - scroll_width,
-            visible_w,
-            scroll_x,
-            layout_w,
-            layout_w - scroll_width
-        );
-    }
-
-    /// GDI streaming text path (:2530-2563 of draw_recording_overlay_with_text):
-    /// clip to the text band, draw the tween-visible prefix at
-    /// `x = text_left - scroll_x`, newest text pinned to the right edge once overflow.
-    /// Metrics come from the caller (GDI measure_text_width — the single metric source
-    /// agreed in D2D-P1 方案裁定 1/2), passed as `text_width` so the D2D side never
-    /// measures on its own and cannot drift from the window sizing path.
-    /// `visible_text` is the tween-visible prefix (OVERLAY-051-G), precomputed by the
-    /// caller exactly like the GDI path.
-    fn streaming_text(
-        res: &D2dResources,
-        w: f32,
-        h: f32,
-        visible_text: &str,
-        text_width: i32,
-        dim_from: Option<usize>,
-    ) {
-        let text_left = super::STREAMING_TEXT_LEFT_MARGIN as f32;
-        let text_right = w - super::STREAMING_TEXT_RIGHT_MARGIN as f32;
-        let text_top = super::OVERLAY_TEXT_DRAW_VERTICAL_INSET as f32;
-        let text_bottom = h - super::OVERLAY_TEXT_DRAW_VERTICAL_INSET as f32;
-        let visible_w = (text_right - text_left).max(1.0);
-
-        // OVERLAY-MEASURE-CACHE-415：命中缓存则不建 TextLayout、不重新编码（编码结果直接
-        // 复用给下面 DrawText）。DWrite 与 GDI **分开**缓存（281：同串差 143~155px，禁互串）。
-        let dpi = {
-            let mut dx = 0.0_f32;
-            let mut dy = 0.0_f32;
-            unsafe {
-                res.rt.GetDpi(&mut dx, &mut dy);
-            }
-            dx.max(0.0).round() as u32
-        };
-        super::LAST_DWRITE_MEASURE.with(|cell| {
-            let mut cache = cell.borrow_mut();
-            // LOCALRT-FIRSTCHAR-281：scroll 用 **DirectWrite 实渲宽**（与下面 DrawText 同引擎），
-            // 不再用 GDI `GetTextExtentPoint32W` 量宽 —— 两者对同一串差 143-155px（实测，随长度增长），
-            // 用 GDI 宽算 scroll_x 会多滚一截 ⇒ 右侧留白（FIX-255 未根治的真因）。
-            // `text_width`（GDI）仅留作诊断对照；GDI 兜底路径自己量自己画，不经此处（各自自洽）。
-            let scroll_width = match cache.hit(visible_text, super::OVERLAY_TEXT_FONT_SIZE, dpi) {
-                Some(w) => w,
-                None => {
-                    let encoded: Vec<u16> = visible_text.encode_utf16().collect();
-                    let w = dwrite_measure_width(res, &encoded, text_width as f32);
-                    cache.put(visible_text, super::OVERLAY_TEXT_FONT_SIZE, dpi, w, encoded);
-                    w
-                }
-            };
-            let scroll_x =
-                super::streaming_scroll_offset(scroll_width.round() as i32, visible_w as i32)
-                    as f32;
-            // LOCALRT-SCROLL-277 诊断（节流 500ms，仅滚动时）：量化右侧留白。
-            if scroll_x > 0.0 {
-                log_draw_geo_277(text_width, scroll_width, visible_w, scroll_x);
-            }
-            unsafe {
-                // Clip: GDI SaveDC → SelectClipRgn(text area) → RestoreDC.
-                // D2D: PushAxisAlignedClip → DrawText → PopAxisAlignedClip.
-                res.rt.PushAxisAlignedClip(
-                    &D2D_RECT_F {
-                        left: text_left,
-                        top: text_top,
-                        right: text_right,
-                        bottom: text_bottom,
-                    },
-                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                );
-                res.brush
-                    .SetColor(&colorref_to_d2d(super::OVERLAY_TEXT_WHITE));
-                // FIX-OVERLAY-SCROLL-255: 排版矩形只移起点，右边界**不随 scroll_x 左移**，
-                // 保持在可视区右沿（旧写法 `text_right - scroll_x` 使矩形整体左移 ⇒ 右侧留白）。
-                // 布局宽度 = max(text_width, visible_w) ≥ 文本宽度，最新文字贴 text_right；
-                // 裁剪区 text_left..text_right 不动，保证不溢出窗口。
-                // STREAM-SV-463：有末尾未定字 ⇒ 用同一排版矩形建 TextLayout，未定区间换浅色画刷
-                //（DWrite 按区间指定画刷，字形位置与 DrawText 逐位一致）；建不出来就退回整段正常色。
-                let encoded = cache.encoded();
-                let dim_from_u16 = dim_from.map(|c| {
-                    visible_text
-                        .chars()
-                        .take(c)
-                        .map(char::len_utf16)
-                        .sum::<usize>()
-                });
-                let layout = dim_from_u16.filter(|&d| d < encoded.len()).and_then(|d| {
-                    let layout = res
-                        .dwrite
-                        .CreateTextLayout(
-                            encoded,
-                            &res.streaming_text_format,
-                            (text_right - (text_left - scroll_x)).max(1.0),
-                            (text_bottom - text_top).max(1.0),
-                        )
-                        .ok()?;
-                    let dim = res
-                        .rt
-                        .CreateSolidColorBrush(
-                            &colorref_to_d2d(super::OVERLAY_TEXT_TENTATIVE),
-                            None,
-                        )
-                        .ok()?;
-                    layout
-                        .SetDrawingEffect(
-                            &dim,
-                            windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_RANGE {
-                                startPosition: d as u32,
-                                length: (encoded.len() - d) as u32,
-                            },
-                        )
-                        .ok()?;
-                    Some(layout)
-                });
-                if let Some(layout) = layout {
-                    res.rt.DrawTextLayout(
-                        D2D_POINT_2F {
-                            x: text_left - scroll_x,
-                            y: text_top,
-                        },
-                        &layout,
-                        &res.brush,
-                        windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    );
-                } else {
-                    res.rt.DrawText(
-                        encoded,
-                        &res.streaming_text_format,
-                        &D2D_RECT_F {
-                            left: text_left - scroll_x,
-                            top: text_top,
-                            right: text_right,
-                            bottom: text_bottom,
-                        },
-                        &res.brush,
-                        windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
-                        DWRITE_MEASURING_MODE_NATURAL,
-                    );
-                }
-                res.rt.PopAxisAlignedClip();
-            }
-        });
-    }
-
     /// D2D-P1: `RecordingStreamingIdle`（聆听占位态）= chrome + mic indicator +
     /// centered placeholder hint + stop button. Returns false on any D2D failure —
     /// the caller (draw_recording_overlay) renders the same frame via GDI.
@@ -5643,25 +5457,21 @@ mod d2d {
         })
     }
 
-    /// D2D-P1: `RecordingWithText`（流式文字态）= chrome + mic indicator +
-    /// scroll-clipped streaming text + stop button. Returns false on any D2D
-    /// failure — the caller (draw_recording_overlay_with_text) renders the same
-    /// frame via GDI. `text_width` is measured by the caller with the GDI font
-    /// (single metric source); `visible_text` is the tween-visible prefix.
+    /// D2D-P1: `RecordingWithText`（流式文字态）的窗框 = chrome + mic indicator +
+    /// right separator + stop button。UI-FONT-474 起文字由调用方
+    /// （draw_recording_overlay_with_text）用 GDI 画在其上（与编辑态同字体同渲染）。
+    /// Returns false on any D2D failure — the caller then draws the chrome via GDI.
     pub(crate) fn draw_streaming_text_overlay(
         hdc: HDC,
         rect: &RECT,
         state: &OverlayWindowState,
-        visible_text: &str,
-        text_width: i32,
-        dim_from: Option<usize>,
     ) -> bool {
         with_d2d(hdc, rect, |res, w, h| {
             // OVERLAY-121 (P3): RecordingWithText 升 r=16（Gavin 拍板）。
             // OVERLAY-141: 半径单一来源。
             chrome(res, w, h, super::OVERLAY_FRAME_RADIUS_LG);
             mic_indicator(res, h, state);
-            streaming_text(res, w, h, visible_text, text_width, dim_from);
+            // UI-FONT-474：文字不在这里画，由调用方用 GDI（与编辑态同字体同渲染）画在窗框之上。
             // Right separator (主控 D2D-P1 验收要求补齐): GDI 版 :2617-2624 逐项照抄 —
             // x = width-36, 高 20 垂直居中, 2px OVERLAY_BORDER_GRAY。文字区与停止键之间。
             // D2D-P2 (PLAN-108 H4): 内联版上提为 right_separator 原语（同值替换），
@@ -6984,55 +6794,11 @@ impl<V: Copy + Default> LastMeasure<V> {
     }
 }
 
-/// OVERLAY-MEASURE-CACHE-415：DirectWrite 量宽缓存（单条）。
-///
-/// 与 GDI 分开（`LAST_DWRITE_MEASURE` vs `LAST_GDI_MEASURE`）。额外缓存 `encode_utf16`
-/// 结果 ⇒ 命中时既不建 `CreateTextLayout`、也不重新编码，编码结果直接复用给 `DrawText`。
-#[cfg(target_os = "windows")]
-#[derive(Default)]
-struct DwriteMeasure {
-    key: Option<MeasureKey>,
-    width: f32,
-    encoded: Vec<u16>,
-}
-
-#[cfg(target_os = "windows")]
-impl DwriteMeasure {
-    /// 命中返回上次宽度（不建 layout、不编码）。
-    fn hit(&self, text: &str, font_size: i32, dpi: u32) -> Option<f32> {
-        match &self.key {
-            Some(k) if k.font_size == font_size && k.dpi == dpi && k.text == text => {
-                Some(self.width)
-            }
-            _ => None,
-        }
-    }
-
-    /// 回填（仅未命中时调用）：同时存编码结果供 `DrawText` 复用。
-    fn put(&mut self, text: &str, font_size: i32, dpi: u32, width: f32, encoded: Vec<u16>) {
-        self.key = Some(MeasureKey {
-            text: text.to_string(),
-            font_size,
-            dpi,
-        });
-        self.width = width;
-        self.encoded = encoded;
-    }
-
-    /// 当前缓存中的编码结果（命中或刚 `put` 后非空）。
-    fn encoded(&self) -> &[u16] {
-        &self.encoded
-    }
-}
-
 #[cfg(target_os = "windows")]
 thread_local! {
     /// GDI 量宽缓存（`measure_text_width` 专用）。
     static LAST_GDI_MEASURE: std::cell::RefCell<LastMeasure<i32>> =
         std::cell::RefCell::new(LastMeasure::default());
-    /// DirectWrite 量宽 + 编码缓存（`d2d::streaming_text` 专用）。
-    static LAST_DWRITE_MEASURE: std::cell::RefCell<DwriteMeasure> =
-        std::cell::RefCell::new(DwriteMeasure::default());
 }
 
 #[cfg(target_os = "windows")]
@@ -7064,7 +6830,7 @@ fn measure_text_width(hdc: HDC, text: &str, font_size: i32) -> i32 {
 /// OVERLAY-MEASURE-CACHE-415：量宽缓存纯逻辑单测（无需 HDC；键比较 / 取值 / 回填）。
 #[cfg(all(test, target_os = "windows"))]
 mod overlay_measure_cache_415_tests {
-    use super::{DwriteMeasure, LastMeasure};
+    use super::LastMeasure;
     use std::cell::Cell;
 
     /// 命中返回同值，且**不再执行量宽闭包**（编码 / GetTextExtent 被跳过）。
@@ -7111,34 +6877,6 @@ mod overlay_measure_cache_415_tests {
         // 回到原键 ⇒ 缓存只留最后一条 ⇒ 已失效 ⇒ 重量。
         assert_eq!(c.get_or_insert_with("abc", -16, 96, || m(14)), 14);
         assert_eq!(calls.get(), 5, "四次键变化 + 回退一次，均重量");
-    }
-
-    /// GDI 与 DirectWrite 缓存**互不串**（同键各自独立取值；281：同串差 143~155px）。
-    #[test]
-    fn omc415_gdi_and_dwrite_are_independent() {
-        let mut gdi: LastMeasure<i32> = LastMeasure::default();
-        let mut dw = DwriteMeasure::default();
-        let encoded: Vec<u16> = "同样文本".encode_utf16().collect();
-        gdi.put("同样文本", -16, 96, 220);
-        dw.put("同样文本", -16, 96, 148.5, encoded.clone());
-        // 同键：各取各值，不得互串。
-        assert_eq!(gdi.hit("同样文本", -16, 96), Some(220));
-        assert_eq!(dw.hit("同样文本", -16, 96), Some(148.5));
-        assert_eq!(dw.encoded(), encoded.as_slice(), "DWrite 缓存复用编码结果");
-    }
-
-    /// DWrite：`put` 后 `hit` 命中且编码可复用；变键失效。
-    #[test]
-    fn omc415_dwrite_put_hit_and_invalidate() {
-        let mut dw = DwriteMeasure::default();
-        assert_eq!(dw.hit("x", -16, 96), None, "空缓存不命中");
-        let enc: Vec<u16> = "x".encode_utf16().collect();
-        dw.put("x", -16, 96, 7.5, enc.clone());
-        assert_eq!(dw.hit("x", -16, 96), Some(7.5));
-        assert_eq!(dw.encoded(), enc.as_slice());
-        assert_eq!(dw.hit("x", -16, 144), None, "DPI 变失效");
-        assert_eq!(dw.hit("x", -14, 96), None, "字号变失效");
-        assert_eq!(dw.hit("y", -16, 96), None, "文本变失效");
     }
 }
 /// OVERLAY-086 / D2D-P1 / REFACTOR-088: 流式文字横向滚动偏移。
@@ -19415,15 +19153,12 @@ mod overlay_086_d2d_p1_guard_tests {
             "RecordingStreamingIdle 入口：无效 HDC 必须返回 false（GDI 回落触发器）"
         );
 
-        let ok_text = d2d::draw_streaming_text_overlay(hdc, &rect, &state, "流式文本", 120, None);
+        // UI-FONT-474：该入口只画窗框（文字交 GDI），失败同样必须回落。
+        let ok_text = d2d::draw_streaming_text_overlay(hdc, &rect, &state);
         assert!(
             !ok_text,
             "RecordingWithText 入口：无效 HDC 必须返回 false（GDI 回落触发器）"
         );
-        // STREAM-SV-463：带浅色尾巴的入口同样必须回落（不 panic、不吞错）。
-        let ok_dim = d2d::draw_streaming_text_overlay(hdc, &rect, &state, "流式文本", 120, Some(2));
-        assert!(!ok_dim, "带浅色尾巴：无效 HDC 必须返回 false");
-        // UI-PREVIEW-473 取证见 `ui473_d2d_streaming_text_real_dc`（真 DC）。
         // D2D-HANG-095: 本用例以无效 HDC 调 D2D 入口，create_resources 会成功
         //（工厂创建不依赖窗口），因此本测试线程的 thread_local 槽被填上了 D2D 资源。
         // 必须在用例体内显式释放 —— 否则测试线程退出时由 FLS 回调在 loader lock 下
@@ -19431,24 +19166,24 @@ mod overlay_086_d2d_p1_guard_tests {
         d2d::release_resources();
     }
 
-    /// UI-PREVIEW-473 取证（Gavin 10-03「预览窗口中的文字被变小了，而且现在变得也不圆润了」）：
-    /// 真内存 DC 上画流式文字，带 / 不带浅色尾巴两种都必须走通 D2D（返回 true）；
-    /// 返回 false ⇒ 该帧退回 GDI（小字号 ClearType，即「变小、不圆润」）。
+    /// UI-FONT-474 取证（Gavin 10-04「预览窗口的文字……和编辑态的文字保持一致」）：真内存 DC 上走
+    /// 生产 `draw_recording_overlay_with_text`（选入与编辑框同一 streaming_font），出图
+    /// `collab/evidence/474/preview-{plain,dim}.bmp`；断言：文字是 GDI ClearType（有彩边像素，
+    /// 编辑框同款）、浅色尾巴不改分界左侧任何像素、尾巴确实变暗。
     #[test]
-    #[ignore = "UI-PREVIEW-473：真 D2D 离屏绘制，--ignored 运行"]
-    fn ui473_d2d_streaming_text_real_dc() {
+    #[ignore = "UI-FONT-474：真 DC 离屏绘制，--ignored 运行"]
+    fn ui474_preview_text_real_dc() {
         use windows::Win32::Graphics::Gdi as g;
-        let text = "今天天气不错，我们出去走走吧";
+        let text = "用的是本地的十四档。";
+        let (w, h) = (420usize, 36usize);
         let rect = RECT {
             left: 0,
             top: 0,
-            right: 400,
-            bottom: 36,
+            right: w as i32,
+            bottom: h as i32,
         };
         let state = overlay_window_state_for_test();
-        let (w, h) = (400usize, 36usize);
-        // 32bpp 自顶向下 DIB：画完直接读像素，存 BMP 供目视 + 逐像素对比。
-        let render = |dim_from: Option<usize>| -> (bool, Vec<u8>) {
+        let render = |dim_from: Option<usize>| -> (Vec<u8>, i32) {
             unsafe {
                 let screen = g::GetDC(None);
                 let mem = g::CreateCompatibleDC(screen);
@@ -19462,17 +19197,32 @@ mod overlay_086_d2d_p1_guard_tests {
                 let bmp = g::CreateDIBSection(mem, &bi, g::DIB_RGB_COLORS, &mut bits, None, 0)
                     .expect("dib");
                 let old = g::SelectObject(mem, bmp);
-                let ok = d2d::draw_streaming_text_overlay(mem, &rect, &state, text, 220, dim_from);
+                // 同 draw_overlay_to_dc 流式分支：选入 streaming_font（= 编辑框字体）、透明底。
+                let font = create_clear_type_font(OVERLAY_TEXT_FONT_SIZE);
+                let of = g::SelectObject(mem, font);
+                let _ = g::SetBkMode(mem, g::TRANSPARENT);
+                let _ = draw_recording_overlay_with_text(
+                    mem,
+                    &rect,
+                    &state,
+                    config::UiLanguage::Chinese,
+                    text,
+                    dim_from,
+                );
+                let tw = measure_text_width(mem, text, OVERLAY_TEXT_FONT_SIZE);
                 let px = std::slice::from_raw_parts(bits as *const u8, w * h * 4).to_vec();
+                g::SelectObject(mem, of);
+                let _ = g::DeleteObject(font);
                 g::SelectObject(mem, old);
                 let _ = g::DeleteObject(bmp);
                 let _ = g::DeleteDC(mem);
                 g::ReleaseDC(None, screen);
-                (ok, px)
+                (px, tw)
             }
         };
-        let (plain, px_plain) = render(None);
-        let (dim, px_dim) = render(Some(9));
+        let (plain, tw) = render(None);
+        let (dim, _) = render(Some(6));
+        d2d::release_resources();
         let save = |name: &str, px: &[u8]| {
             let mut f = Vec::new();
             let size = 54 + px.len() as u32;
@@ -19488,89 +19238,60 @@ mod overlay_086_d2d_p1_guard_tests {
             f.extend_from_slice(&[0u8; 24]);
             f.extend_from_slice(px);
             let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join(format!("collab/evidence/473/{name}.bmp"));
+                .join(format!("collab/evidence/474/{name}.bmp"));
             let _ = std::fs::create_dir_all(p.parent().unwrap());
             std::fs::write(p, f).unwrap();
         };
-        save("plain", &px_plain);
-        save("dim", &px_dim);
-        // 对照 Gavin 截图（`collab/evidence/473/gavin-shot.png`）：同一句分别走 D2D 与 GDI 兜底字体。
-        let shot = "用的是本地的十四档。";
-        let (_, px_d2d_shot) = {
-            let (ok, px) = unsafe {
-                let screen = g::GetDC(None);
-                let mem = g::CreateCompatibleDC(screen);
-                let mut bi = g::BITMAPINFO::default();
-                bi.bmiHeader.biSize = std::mem::size_of::<g::BITMAPINFOHEADER>() as u32;
-                bi.bmiHeader.biWidth = w as i32;
-                bi.bmiHeader.biHeight = -(h as i32);
-                bi.bmiHeader.biPlanes = 1;
-                bi.bmiHeader.biBitCount = 32;
-                let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-                let bmp = g::CreateDIBSection(mem, &bi, g::DIB_RGB_COLORS, &mut bits, None, 0)
-                    .expect("dib");
-                let old = g::SelectObject(mem, bmp);
-                let ok = d2d::draw_streaming_text_overlay(mem, &rect, &state, shot, 160, None);
-                let px = std::slice::from_raw_parts(bits as *const u8, w * h * 4).to_vec();
-                // GDI 兜底同字体（streaming_font = create_clear_type_font(OVERLAY_TEXT_FONT_SIZE)）画在下半张图。
-                let font = create_clear_type_font(OVERLAY_TEXT_FONT_SIZE);
-                let of = g::SelectObject(mem, font);
-                let _ = g::SetBkMode(mem, g::TRANSPARENT);
-                let _ = g::SetTextColor(mem, OVERLAY_TEXT_WHITE);
-                let mut wide: Vec<u16> = shot.encode_utf16().collect();
-                let mut r = RECT {
-                    left: 42,
-                    top: 0,
-                    right: 380,
-                    bottom: 36,
-                };
-                let _ = g::FillRect(mem, &r, g::HBRUSH(g::GetStockObject(g::BLACK_BRUSH).0));
-                let _ = g::DrawTextW(
-                    mem,
-                    &mut wide,
-                    &mut r,
-                    g::DT_LEFT | g::DT_VCENTER | g::DT_SINGLELINE,
-                );
-                let px_gdi = std::slice::from_raw_parts(bits as *const u8, w * h * 4).to_vec();
-                g::SelectObject(mem, of);
-                let _ = g::DeleteObject(font);
-                g::SelectObject(mem, old);
-                let _ = g::DeleteObject(bmp);
-                let _ = g::DeleteDC(mem);
-                g::ReleaseDC(None, screen);
-                save("shot-gdi", &px_gdi);
-                (ok, px)
-            };
-            (ok, px)
+        save("preview-plain", &plain);
+        save("preview-dim", &dim);
+        let x0 = STREAMING_TEXT_LEFT_MARGIN as usize;
+        let x1 = w - STREAMING_TEXT_RIGHT_MARGIN as usize;
+        let px = |v: &[u8], x: usize, y: usize| {
+            let i = (y * w + x) * 4;
+            (v[i + 2] as i32, v[i + 1] as i32, v[i] as i32)
         };
-        save("shot-d2d", &px_d2d_shot);
-        // 系统默认文字渲染参数（不显式指定时 D2D 用它）。
-        unsafe {
-            use windows::Win32::Graphics::DirectWrite as dw;
-            if let Ok(f) =
-                dw::DWriteCreateFactory::<dw::IDWriteFactory>(dw::DWRITE_FACTORY_TYPE_SHARED)
-            {
-                if let Ok(p) = f.CreateRenderingParams() {
-                    println!(
-                        "[473] 系统默认渲染参数：mode={:?} cleartype_level={} gamma={} contrast={}",
-                        p.GetRenderingMode(),
-                        p.GetClearTypeLevel(),
-                        p.GetGamma(),
-                        p.GetEnhancedContrast()
-                    );
-                }
-            }
-        }
-        // 前 9 字（未变浅区）逐像素应与整段正常色一致 ⇒ 浅色尾巴不改字形 / 字号。
-        let diff = px_plain
-            .chunks(4)
-            .zip(px_dim.chunks(4))
-            .enumerate()
-            .filter(|(i, (a, b))| (i % w) < 200 && a != b)
+        let fringe = (0..h)
+            .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let (r, _, b) = px(&plain, x, y);
+                (r - b).abs() > 30
+            })
             .count();
-        println!("[473] D2D streaming text: plain={plain} dim_tail={dim} 左半区差异像素={diff}");
-        d2d::release_resources();
-        assert!(plain && dim, "D2D 失败 ⇒ GDI 兜底（小字号、不圆润）");
+        // 浅色分界：前 6 字的 GDI 宽。
+        let prefix_w = unsafe {
+            let screen = g::GetDC(None);
+            let font = create_clear_type_font(OVERLAY_TEXT_FONT_SIZE);
+            let of = g::SelectObject(screen, font);
+            let wide: Vec<u16> = "用的是本地的".encode_utf16().collect();
+            let mut sz = windows::Win32::Foundation::SIZE::default();
+            let _ = GetTextExtentPoint32W(screen, &wide, &mut sz);
+            g::SelectObject(screen, of);
+            let _ = g::DeleteObject(font);
+            g::ReleaseDC(None, screen);
+            sz.cx as usize
+        };
+        let split = x0 + prefix_w;
+        let left_diff = (0..h)
+            .flat_map(|y| (x0..split).map(move |x| (x, y)))
+            .filter(|&(x, y)| px(&plain, x, y) != px(&dim, x, y))
+            .count();
+        let bright = |v: &[u8]| -> i64 {
+            (0..h)
+                .flat_map(|y| (split..x1).map(move |x| (x, y)))
+                .map(|(x, y)| {
+                    let (r, g, b) = px(v, x, y);
+                    (r + g + b) as i64
+                })
+                .sum()
+        };
+        println!(
+            "[474] GDI 宽 {tw}px；ClearType 彩边像素 {fringe}；分界 x={split} 左侧差异像素 {left_diff}；尾段亮度 正常 {} / 浅色 {}",
+            bright(&plain),
+            bright(&dim)
+        );
+        assert!(fringe > 0, "预览文字须是 GDI ClearType（与编辑框同款）");
+        assert_eq!(left_diff, 0, "浅色尾巴不得改动分界左侧像素");
+        assert!(bright(&dim) < bright(&plain), "尾段须变暗");
     }
 
     /// 护栏 3：D2DERR_RECREATE_TARGET 常量值钉死 0x8899000C。
@@ -24068,6 +23789,38 @@ mod ui471_472_tests {
         let s = seg(&p, at, 400);
         assert!(s.contains("DWRITE_RENDERING_MODE_GDI_CLASSIC"));
         assert!(s.contains("rt.SetTextRenderingParams(&p);"));
+    }
+
+    /// 474：预览文字与编辑态同一字体同一渲染器 —— D2D 只画窗框，文字（含浅色尾巴两段）一律 GDI 画，
+    /// D2D 成功 / 失败两分支都走同一段文字绘制；已删除的 D2D 预览文字绘制不得复活。
+    #[test]
+    fn ui474_preview_text_drawn_like_edit_box() {
+        let p = prod();
+        let at = p
+            .find("fn draw_recording_overlay_with_text(")
+            .expect("预览文字绘制函数");
+        let body = seg(&p, at, 6000);
+        let chrome = body
+            .find("let d2d_chrome = d2d::draw_streaming_text_overlay(hdc, rect, state);")
+            .expect("D2D 只画窗框");
+        let dim = body
+            .find("pass(x, text_right, OVERLAY_TEXT_TENTATIVE);")
+            .expect("浅色尾巴走 GDI 第二段");
+        let plain = body
+            .find("None => pass(text_left, text_right, OVERLAY_TEXT_WHITE),")
+            .expect("无尾巴整段 GDI");
+        assert!(
+            chrome < dim && chrome < plain,
+            "文字在窗框之后、不分 D2D 成败"
+        );
+        assert!(
+            body.contains("draw_text(\nhdc,\ntext,"),
+            "文字由 GDI draw_text 画"
+        );
+        assert!(
+            !p.contains("streaming_text(res,"),
+            "D2D 预览文字绘制已删除，不得复活"
+        );
     }
 
     /// 从 `at` 起最多 `n` 字节（落在字符边界）。

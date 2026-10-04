@@ -2729,3 +2729,11 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 对 macOS 的影响 | 无：macOS 浮层文字由 `src/platform/macos/overlay.rs` 自绘，不经 D2D、不读该常量。若 macOS 端也觉预览字小，可参考 18px 同步 |
 | 是否需要对方同步 | 否（可选参考） |
 
+## UI-FONT-474（2026-10-04，主控）· 预览文字改 GDI（DEC-106）
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | Windows `draw_recording_overlay_with_text` 文字改 GDI；删 `d2d::streaming_text` 与 DirectWrite 量宽缓存（均 Windows 专属） |
+| 对 macOS 的影响 | 无（macOS 浮层自绘，不经此路径） |
+| 是否需要对方同步 | 否 |
+

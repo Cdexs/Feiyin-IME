@@ -3256,3 +3256,10 @@ Gavin 原话：「我说的是b路径上的1.7b模型，把词库注入去掉，
 - **决策**：① `create_resources` 用系统 gamma / 对比度 + `DWRITE_RENDERING_MODE_GDI_CLASSIC` + 灰度建自定义渲染参数并 `SetTextRenderingParams`，所有 D2D 浮层文字不再随系统默认；② `OVERLAY_TEXT_FONT_SIZE` -16 → -18（行高 tmHeight+2 ≤ 28 仍放得进 36px 窗）。
 - **影响**：预览、编辑框、单行提示（471 宽度按同字号量）同步变大；macOS 浮层另有绘制代码，不受影响。待 Gavin 出包后目视确认。
 
+### DEC-106 · 预览文字改 GDI，与编辑态同字体同渲染（UI-FONT-474）（2026-10-04）
+
+- **背景**：Gavin「你看一下本地实时管线预览窗口的文字和编辑态的文字字体样式不一样，明显的编辑态的文字的字体的样式看起来更圆润，更好看。你修改一下预览窗口的文字，和编辑态的文字保持一致」。编辑态 = Win32 编辑框（GDI Segoe UI ClearType，中文走系统字体链接）；预览态 = DirectWrite 灰度（Segoe UI 回落雅黑）——排版、字形回落、抗锯齿三者都不同。
+- **决策**：`draw_recording_overlay_with_text` 中 D2D 只画窗框 / 麦克风 / 分隔线 / 停止键（失败回落 GDI），文字一律用 GDI `draw_text`（DC 已选入 streaming_font = `create_clear_type_font(OVERLAY_TEXT_FONT_SIZE)`，与编辑框同一字体）；ULW 下 GDI 不写 alpha 的像素由 `apply_alpha_fixup` 当不透明处理（OVERLAY-153）。末尾未定字浅色：同一整句按分界 x 两段裁剪各画一遍（左白右灰），字形字距与整句一次画出逐位相同。量宽 / 滚动 / 窗宽统一 GDI 宽。删除 D2D `streaming_text` / `dwrite_measure_width` / `log_draw_geo_277` 与 DirectWrite 量宽缓存（281 的「D2D 绘制须用 DWrite 量宽」随之不再适用）。
+- **验证**：`ui474_preview_text_real_dc`（真 DC 出图 `collab/evidence/474/`）：ClearType 彩边像素 1097、浅色分界左侧差异 0、尾段变暗；护栏 `ui474_preview_text_drawn_like_edit_box`。
+- **影响**：只动本地实时 / 在线流式共用的「录音中带文字」态的文字；占位「请说话...」、单行提示、失焦预览仍 D2D（DEC-105 渲染模式）。macOS 无影响。
+

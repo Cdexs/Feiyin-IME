@@ -80,6 +80,13 @@
 | ↳ `473-2` | 按证据修（不得丢掉未定字浅色） | 主控 | 代码 | ✅ ① 显式指定 GDI 经典渲染模式（笔画对齐像素，gamma / 对比度沿用系统），所有 D2D 浮层文字生效 ② 字号 16 → 18px（Gavin「需要调大」，预览 / 编辑框 / 提示同一常量，窗宽计算同步）；浅色尾巴不变 |
 | ↳ `473-4` | 测试 | 主控 | 测试 | ✅ `ui473_bigger_preview_font_fits_overlay`（18px 行高放得进 36px 窗）/ `ui473_text_rendering_mode_pinned`；离屏前后对比图 `collab/evidence/473/before-after-x4.png` |
 | ↳ `473-3` | 出包后 Gavin 目视确认字号 / 圆润度恢复 | Gavin | 目视通过 | ⬜ |
+| `UI-FONT-474` | Gavin 10-04「本地实时管线预览窗口的文字和编辑态的文字字体样式不一样，明显的编辑态的文字的字体的样式看起来更圆润，更好看。你修改一下预览窗口的文字，和编辑态的文字保持一致」 | 主控 | 开发 | ✅ 开发完成，派 BUILD-474（DEC-106） |
+| ↳ `474-1` | 查因：两态各用什么字体 / 渲染方式（编辑态 = Win32 编辑框 GDI 字体；预览态 = D2D） | 主控 | 有结论 | ✅ 编辑态：编辑框 + GDI Segoe UI ClearType（中文走系统字体链接）；预览态：DirectWrite 灰度（Segoe UI 回落雅黑），排版与渲染器都不同 |
+| ↳ `474-2` | 改：预览文字改用与编辑态同一字体、同一渲染方式（保留滚动、末尾未定字浅色、逐字出现） | 主控 | 代码 | ✅ D2D 只画窗框，文字一律 GDI（与编辑框同一 streaming_font）；浅色尾巴 = 同一整句两段裁剪各画一遍；量宽 / 滚动 / 窗宽统一 GDI 宽；删除 D2D 预览文字绘制 + DirectWrite 量宽缓存 |
+| ↳ `474-3` | 证据：离屏出图，预览态与编辑态同句逐像素 / 目视对比 | 主控 | 证据 | ✅ `ui474_preview_text_real_dc`：ClearType 彩边像素 1097（编辑框同款），浅色分界左侧差异 0，尾段变暗；图 `collab/evidence/474/` |
+| ↳ `474-4` | 测试 + 现有浮层 / D2D 测试不破 | 主控 | 测试 | ✅ 新 `ui474_preview_text_drawn_like_edit_box`；overlay 144 / d2d 24 / local 112 / scroll 3 全绿；GONE `omc415_gdi_and_dwrite_are_independent` / `omc415_dwrite_put_hit_and_invalidate` / `ui473_d2d_streaming_text_real_dc`；warnings 90 |
+| ↳ `474-5` | 派 tester-1 回归 + 出包；Gavin 目视 | tester-1 / Gavin | 目视通过 | 🔄 已派 BUILD-474 |
+| ↳ `474-6` | 文档 + macOS 结论 | 主控 | 落盘 | ✅ macOS 浮层自绘、不经此路径，无影响 |
 | `TEST-GAP-438-TAILSTART` | 护栏缺口（BUILD-438 消融 438b 未红）：`preview_display` 重打时忽略 `tail_start` 改为整段重打，`fix438_*` 全绿——护栏只直调纯函数、唯一进 `preview_display` 的用例 `engine=None`。主控已读码确认接线正确（不影响本包）。补：带真 CT-Transformer 或可注入打点函数的端到端用例 | 待定（非作者 coder） | local_stream.rs 测试区 | ⏳ 攒批补 |
 | `RT-STOP-LATENCY-MULTIWIN` | BUILD-398 #9 遗留：长录音切多窗串行解码，停止时队列压窗 ⇒ 松键到上屏 4.5s（16:44Z 23.85s 录音）；后半「无语音整窗送解」已由 414 修 | 待定 | — | ⏳ 待更多端测数据再定 |
 
