@@ -36,6 +36,11 @@ describe("MinePage — STATS-475 本周使用统计", () => {
       "本周总共使用时长：12.5 分钟、输入字数：2345 字、优化LLM调用：17 次"
     );
     expect(mockInvoke).toHaveBeenCalledWith("get_usage_week");
+    // UI-MINE-481：统计区是带边框的分组框，标题「使用统计」嵌在边框线上。
+    const group = screen.getByTestId("mine-week-usage");
+    expect(group.tagName).toBe("FIELDSET");
+    expect(group.className).toContain("mine-group");
+    expect(group.querySelector("legend")?.textContent).toBe("使用统计");
     expect(screen.getByText("2026-09-28 ~ 2026-10-04", { exact: false })).toBeInTheDocument();
   });
 

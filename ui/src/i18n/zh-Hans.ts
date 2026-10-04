@@ -126,7 +126,7 @@ export const zhHans = {
   hotkey_dup_ack: '知道了',
   // STATS-475：「我的」页
   mine_title: '我的',
-  mine_week_title: '本周使用统计',
+  mine_usage_title: '使用统计',
   mine_week_range: '统计周期：',
   mine_total_duration: '本周总共使用时长：',
   mine_input_words: '输入字数：',

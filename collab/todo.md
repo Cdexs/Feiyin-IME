@@ -116,6 +116,7 @@
 | ↳ `478-8` | 派 tester-1 回归 + 出包；Gavin 端测 | tester-1 / Gavin | 端测通过 | 🔄 已派 BUILD-478 |
 | `UI-MINE-479` | Gavin 10-04「我的那个信息统计区域里面，把那个总的信息统计那一行下面的那个分项这一行文字去掉。然后呢，你加上那个无序列表的那个点标点符号就行。文字也调大一号」 | 主控 | 开发 | ✅ 并入 BUILD-478：去「其中（分项统计）」行（删 `mine_breakdown` 三语键）、分项 `listStyle: disc`、统计区文字 +1px（正文 15 / 标题 16 / 小字 13）；Vitest STATS-UI-005 更新 |
 | `STATS-480` | Gavin 10-04「统计使用时长的时候，是不是用送给模型的这个有效语音长度来统计的？应该是切分过静音的吧？」 | 主控 | 开发 | ✅ 并入 BUILD-478：原按整段录音长度（含停顿）⇒ 改为有效语音（进程级剪静音 VAD 语音区间总长，后台统计线程算，VAD 不可用退回整段）；三管线把 16k 录音交 `UsageSource.audio`；p480 实测 56.1s → 51.6s |
+| `UI-MINE-481` | Gavin 10-04「那一组统计信息外面，你要加一个那个区域的一个边界边框线，因为我们以后可能会加入其他的关于我的这些信息的」+「边框线上面要加个标题：使用统计」 | 主控 | 开发 | ✅ 并入 BUILD-478：统计区改分组框（`fieldset.card.mine-group`，边框 `--system-border-strong`），标题「使用统计」嵌在边框线上（`legend`，三语 `mine_usage_title`，替代框内「本周使用统计」小标题）；框内右上留统计周期；Vitest 断言 |
 | `TEST-GAP-438-TAILSTART` | 护栏缺口（BUILD-438 消融 438b 未红）：`preview_display` 重打时忽略 `tail_start` 改为整段重打，`fix438_*` 全绿——护栏只直调纯函数、唯一进 `preview_display` 的用例 `engine=None`。主控已读码确认接线正确（不影响本包）。补：带真 CT-Transformer 或可注入打点函数的端到端用例 | 待定（非作者 coder） | local_stream.rs 测试区 | ⏳ 攒批补 |
 | `RT-STOP-LATENCY-MULTIWIN` | BUILD-398 #9 遗留：长录音切多窗串行解码，停止时队列压窗 ⇒ 松键到上屏 4.5s（16:44Z 23.85s 录音）；后半「无语音整窗送解」已由 414 修 | 待定 | — | ⏳ 待更多端测数据再定 |
 

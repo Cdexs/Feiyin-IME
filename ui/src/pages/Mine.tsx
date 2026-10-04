@@ -60,15 +60,17 @@ const MinePage: React.FC<Props> = ({ config }) => {
     <div className="settings-page">
       <h2 className="page-title">{t.mine_title}</h2>
 
-      <div className="card" data-testid="mine-week-usage">
-        <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: '16px' }}>
-          <span style={{ fontSize: '16px', fontWeight: 600 }}>{t.mine_week_title}</span>
-          {usage && (
+      {/* UI-MINE-481（Gavin 10-04）：统计区是一个带边框的分组框，标题「使用统计」嵌在边框线上；
+          「我的」页以后的其他信息各自一个分组框。 */}
+      <fieldset className="card mine-group" data-testid="mine-week-usage">
+        <legend className="mine-group-title">{t.mine_usage_title}</legend>
+        {usage && (
+          <div style={{ textAlign: 'right', marginBottom: '8px' }}>
             <span style={{ fontSize: '13px', color: 'var(--system-text-secondary)' }}>
               {t.mine_week_range}{usage.week_start} ~ {usage.week_end}
             </span>
-          )}
-        </div>
+          </div>
+        )}
 
         {loadFailed && (
           <p style={{ fontSize: '15px', color: 'var(--status-error)' }}>{t.mine_load_failed}</p>
@@ -97,7 +99,7 @@ const MinePage: React.FC<Props> = ({ config }) => {
             <p style={{ fontSize: '13px', color: 'var(--system-text-tertiary)', margin: '16px 0 0' }}>{t.mine_rules_note}</p>
           </>
         )}
-      </div>
+      </fieldset>
     </div>
   );
 };

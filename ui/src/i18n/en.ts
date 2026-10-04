@@ -127,7 +127,7 @@ export const en = {
   hotkey_dup_ack: 'OK',
   // STATS-475：「我的」页
   mine_title: 'Me',
-  mine_week_title: 'This week',
+  mine_usage_title: 'Usage',
   mine_week_range: 'Period: ',
   mine_total_duration: 'Total time this week: ',
   mine_input_words: 'Words: ',
