@@ -227,8 +227,13 @@ pub fn record(
 pub fn week_usage() -> rusqlite::Result<WeekUsage> {
     let now = Local::now();
     let (start, end) = week_bounds(now);
-    let conn = open()?;
-    let mut usage = week_usage_in(&conn, start, end)?;
+    // BUILD-478 D1（主控定）：读不产生副作用 —— 库还不存在（从没输出过文字）⇒ 全 0，不建空库；
+    // 库只在主程序首次记录时创建（与 `record` 一致）。
+    let mut usage = if db_path().is_file() {
+        week_usage_in(&open()?, start, end)?
+    } else {
+        WeekUsage::default()
+    };
     let monday = Local
         .timestamp_opt(start, 0)
         .single()

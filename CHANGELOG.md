@@ -1,6 +1,7 @@
 # CHANGELOG - 变更日志 (voice-ime)
 
 > 任务编号 | 简要说明 | 负责人 | 完成时间
+| CLEAN-468 + D1 | **PoC / 测试残留清理**（Gavin「A+B1+B2+b3+b5」，约 9.7G）：删 `src/bin/poc_*.rs` 4 个、`poc_speaker_verify_404` 模块、`poc_qwen3_17b_351` 模块、gate335 识别对比一支（共 12 个依赖已删模型的 #[ignore] 测试）+ 随之无人用的 `create_qwen3_recognizer_at`；工作区外 `_poc` / 缓存 / `D:\d` 等（清单 `collab/evidence/468/`）。**D1**：「我的」页读统计时库不存在 ⇒ 全 0、不建空库 | 主控 | 2026-10-04 |
 | PUNCT-478 + UI-MINE-479 + STATS-480 + UI-MINE-481 | **接缝标点由看到后文的一方决定**（DEC-108）：本地实时 `seam_punct`（后窗覆盖接缝 ⇒ 用后窗标点）；在线 ASR `OnlineFinal.seams` + `repair_online_seams` / `punctuation::judge_seam`（本地标点模型重判服务端句间接缝）。**「我的」页**去「其中」行、分项圆点列表、文字 +1px。**使用时长改按有效语音**（VAD 去静音，`effective_speech_ms`）。**统计区改分组框**，边框线上标题「使用统计」（UI-MINE-481）。测试 p478 ×7、p480（忽略类）、Mine STATS-UI-005 更新 | 主控 | 2026-10-04 |
 | UI-FONT-476 + UI-FONT-477 | **「请说话...」文字与预览同样式 + 三处文字调小一号**（DEC-106 补充）：占位态文字改 GDI（同预览 / 编辑框字体），删 D2D `placeholder_text`；`OVERLAY_TEXT_FONT_SIZE` -18 → -17。测试 `ui476_listening_placeholder_drawn_like_preview` / `ui477_overlay_text_one_size_smaller`；离屏取证 `[476]`。另：STATS-475 `Mine.tsx` 色值改设计令牌（tester-1 回归拦截 G1） | 主控 | 2026-10-04 |
 | STATS-475 | **0.9.5：使用统计 +「我的」页**（DEC-107；Gavin「版本号升级一下」+「我的」本周统计）。新 `src/usage_stats.rs`（`usage-stats.sqlite`；字数 / 周期 / 汇总）；`run_pipeline_core` 新参 `UsageSource` + 最终文字产出后台记一条；`run_llm_stage` 计格式化 LLM 实际调用次数；设置界面 `get_usage_week` + `ui/src/pages/Mine.tsx`（「词库」下）+ 三份 locale。版本 0.9.4 → 0.9.5（6 处）。测试：Rust `stats475_*` 3 条（主程序与设置界面各跑一遍）；Vitest `Mine.test.tsx` 5 条（含「本周没用过的分项不显示」）+ App 导航断言 | 主控 | 2026-10-04 |

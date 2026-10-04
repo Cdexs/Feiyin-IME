@@ -2442,13 +2442,11 @@ mod tests {
     //   自检失败即 panic —— 防「量具坏了却拿它的读数下结论」（本项目已栽过：不存在的 strings 扫出全 0）。
     //   离线分析脚本 `collab/evidence/20260921-gate-attack-335/analyze_attack.py` 同样带合成包络自检
     //   （首版口径被它抓出一个真 bug，见该脚本内注释）。
-    // 零副作用：capture 只开默认输入设备 + 写证据文件；asr_ab 只读 WAV + CPU 推理。均不改生产路径。
+    // 零副作用：capture 只开默认输入设备 + 写证据文件，不改生产路径。
+    // CLEAN-468（Gavin 10-04 定）：asr_ab 一支依赖的 qwen3-asr-0.6B 模型已删、再也跑不起来，已移除（git 历史可找回）。
     const GATE335_CAPTURE_SECS: u64 = 45; // 采集时长：脚本 3 轮 × ~13s + 余量
     const GATE335_ENV_FRAME_MS: u64 = 1; // 包络帧长：1ms（足以看清 attack 的前沿）
     const GATE335_EVIDENCE_DIR: &str = "collab/evidence/20260921-gate-attack-335";
-    /// 自检参考音频：模型自带 `test_wavs/noise2.wav`，其 `transcript.txt` 有可核对文本。
-    const GATE335_REF_WAV: &str =
-        "models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/test_wavs/noise2.wav";
 
     /// 单帧 (RMS, dBFS)。dBFS 复用 322 的 `peak_to_dbfs`（≤0 取 `DIAG_DBFS_FLOOR`）。
     fn gate335_frame_stats(frame: &[f32]) -> (f32, f32) {
@@ -2571,104 +2569,6 @@ mod tests {
             floor_frames as f64 * 100.0 / frames.len() as f64
         );
         println!("[GATE335] 下一步：用 envelope-1ms.txt 量 attack；切 A/B 片段后跑 gate335_asr_ab");
-    }
-
-    /// Qwen3 识别器：直接走生产 `create_qwen3_recognizer`（ACC-452 起为 llama.cpp 引擎，已对 crate 可见，
-    /// 不再在此复刻一份配置）。
-    fn gate335_qwen3_recognizer(model_root: &Path) -> crate::transcription::AccEngine {
-        crate::transcription::create_qwen3_recognizer(model_root)
-            .expect("create qwen3 engine failed")
-    }
-
-    /// 走生产解码入口（`transcribe_acc_ctx`，空上下文 ⇒ 与生产「无前文」档位同路径）。
-    fn gate335_decode(
-        rec: &crate::transcription::AccEngine,
-        samples_16k: &[f32],
-    ) -> Result<String, String> {
-        crate::transcription::transcribe_acc_ctx(
-            rec,
-            samples_16k,
-            crate::config::ChineseScript::Simplified,
-            0,
-            crate::transcription::CtxInject {
-                terms: None,
-                avg_chars_per_sec: None,
-                speech_ranges: None,
-                streaming_nonempty: false,
-                new_slice_from: 0,
-                assist: Default::default(),
-            },
-        )
-        .map(|(t, _, _)| t)
-        .map_err(|e| format!("{e:#}"))
-    }
-
-    #[test]
-    #[ignore = "GATE-ATTACK-PROBE-335 ASR A/B（需 Qwen3 模型 + 已切好的 A/B 片段）：不进常规回归"]
-    fn gate335_asr_ab_manual() {
-        let project = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let rec = gate335_qwen3_recognizer(&project.join("models"));
-
-        // 量具自检（约束#3）：模型自带参考音频必须解出可核对文本，否则整套 ASR 读数作废。
-        let refwav = project.join(GATE335_REF_WAV);
-        let w = sherpa_onnx::Wave::read(refwav.to_str().expect("ref wav path must be valid UTF-8"))
-            .expect("read reference wav");
-        let ref_text = gate335_decode(&rec, w.samples()).unwrap_or_else(|e| format!("<err {e}>"));
-        println!(
-            "[GATE335-SELFTEST] 参考音频 {} ({}Hz) → '{ref_text}'",
-            refwav.display(),
-            w.sample_rate()
-        );
-        assert!(
-            ref_text.contains("拨号") || ref_text.contains("纠正") || ref_text.contains("号码"),
-            "自检失败：ASR 量具不可信（参考音频没解出预期文本），本单任何识别结论都不许采信"
-        );
-        println!("[GATE335-SELFTEST] ✅ ASR 量具自检通过");
-
-        // A/B 片段：evidence/segments/*.wav（48k 或 16k 均可，统一重采样到 16k 后送入生产解码）。
-        let seg_dir = project.join(GATE335_EVIDENCE_DIR).join("segments");
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&seg_dir)
-            .unwrap_or_else(|e| panic!("读不到片段目录 {}: {e}", seg_dir.display()))
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().map(|x| x == "wav").unwrap_or(false))
-            .collect();
-        files.sort();
-        assert!(
-            !files.is_empty(),
-            "{} 下没有 .wav 片段（先用 Python 从 capture.wav 切 A/B 变体）",
-            seg_dir.display()
-        );
-
-        println!("[GATE335] A/B 识别结果（生产解码路径，逐条）：");
-        for f in &files {
-            let w = match sherpa_onnx::Wave::read(f.to_str().expect("utf-8 path")) {
-                Some(w) => w,
-                None => {
-                    println!("  {:<36} <read err>", file_stem(f));
-                    continue;
-                }
-            };
-            let s16 = if w.sample_rate() == 16000 {
-                w.samples().to_vec()
-            } else {
-                resample_anti_alias(w.samples(), w.sample_rate() as u32, 16000)
-            };
-            let text = gate335_decode(&rec, &s16).unwrap_or_else(|e| format!("<err {e}>"));
-            let (peak, _, _) = diag_peak_nz(&s16);
-            println!(
-                "  {:<36} peak={:.1}dBFS  →  {text}",
-                file_stem(f),
-                peak_to_dbfs(peak)
-            );
-        }
-        println!("[GATE335] 判定口径：A 组（经闸）若出现首字错而 B 组（闸已开）不错 ⇒ 因果成立；两组一致 ⇒ 证伪");
-    }
-
-    fn file_stem(p: &Path) -> String {
-        p.file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| p.display().to_string())
     }
 
     // FIX-LOCALRT-FIRSTCHAR-283（方案 D）纯函数用例

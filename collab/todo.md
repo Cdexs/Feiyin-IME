@@ -42,13 +42,13 @@
 | ↳ `467-2` | 待删清单交 Gavin 确认 | 主控 | Gavin 明确同意 | ✅ Gavin「好，清理以上列表中的模型和文件吧」（含 funasr-nano：已解释新日期版是 Fun-ASR-Nano 拆出的轻量输出层、实测更差） |
 | ↳ `467-3` | 删除（先存逐文件清单；等 BUILD-466 出包结束再动 Publish，避免与构建冲突） | 主控 | 清单在、目录已删、在用模型校验值不变 | ✅ 清单 `collab/evidence/467/deleted-files.txt`（74 文件 2.32GB）；在用 6 个关键文件 sha 与出包记录一致（58e22d05 / 46c1d533 / 1b5ea4c2 / 7117f45d / c71f0ce0 / fa630cad） |
 | ↳ `467-4` | 文档：logs / todo / MACOS-HANDOFF（模型目录变化） | 主控 | 逐份落盘 | ✅ logs / todo / MACOS-HANDOFF；翻译代码注释同步（opus-mt 已删） |
-| `CLEAN-468` | Gavin 10-03「分析下之前做的各项poc、测试，是否那些程序、下载的软件包和库、或者其他临时中间文件没清理？即使清理释放」「及时清理释放」 | 主控 | 清理 | 🔄 盘点完成，待 Gavin 确认后删 |
+| `CLEAN-468` | Gavin 10-03「分析下之前做的各项poc、测试，是否那些程序、下载的软件包和库、或者其他临时中间文件没清理？即使清理释放」「及时清理释放」 | 主控 | 清理 | ✅ 完成（约 9.7G） |
 | ↳ `468-1` | 盘点仓库内原型程序 / 取证测试代码（`src/bin/poc_*`、各 PoC 测试） | 主控 | 每项有在用 / 可删结论 | ✅ 见 `collab/evidence/468/audit.md` B 组 |
 | ↳ `468-2` | 盘点仓库内临时中间文件（tester 输出日志、research 数据、构建产物） | 主控 | 列出大小与结论 | ✅ 同上 |
 | ↳ `468-3` | 盘点系统级下载与临时目录（HuggingFace / ModelScope / pip / uv / npm 缓存、%TEMP%、会话临时目录、全局 Python 包、`D:\d`） | 主控 | 列出大小与结论 | ✅ 同上（A 组约 7.8G 可再生） |
-| ↳ `468-4` | 清理「自己生成 / 可再生」的项（先存清单） | 主控 | 清单在、已释放 | 🔄 Gavin 10-04「A+B1+B2+b3+b5」。第一批 ✅（清单 `collab/evidence/468/deleted-batch1*.txt`）：`_poc` 2.6G、pip 0.3G、uv 0.4G、`research/repro140` 157M（B3）、`D:\d` 44 文件（B5，留底 `d-stray-backup.tar.gz`）≈ 3.4G；第二批待 BUILD-478 结束：`target/debug/incremental` 3.8G、npm 缓存 0.8G、B1 4 个 `src/bin/poc_*.rs`、B2（`poc_speaker_verify_404` 模块、sherpa 1.7B/0.6B PoC 测试组、gate335 依赖 0.6B 的识别对比） |
+| ↳ `468-4` | 清理「自己生成 / 可再生」的项（先存清单） | 主控 | 清单在、已释放 | ✅ Gavin「A+B1+B2+b3+b5」全部完成，约 9.7G：第一批 `_poc` 2.6G / pip 0.3G / uv 0.4G / B3 157M / B5（留底 tar.gz）；第二批 `target/debug/incremental` 5.5G / npm 0.96G / B1 4 个原型程序 / B2 12 个失效 #[ignore] 测试（清单 `collab/evidence/468/deleted-batch*.txt`）；B4 保留；源码删除待下次出包回归对账（bin 忽略数 83 → 71） |
 | ↳ `468-5` | 需确认项（源代码 / 用户数据 / 来历不明）列清单交 Gavin | 主控 | Gavin 定 | ✅ Gavin 定：B1 / B2 / B3 / B5 删，B4（`research/audio-002B` 录音）保留 |
-| ↳ `468-6` | 文档：logs / todo | 主控 | 落盘 | ⬜ |
+| ↳ `468-6` | 文档：logs / todo | 主控 | 落盘 | ✅ |
 | `MEM-469` | Gavin 10-03「我看到现在主程序内存占用达到1.8G+、GPU显存占用达5G，检查评估下为什么内存和现存占用如此高？」 | 主控 | 评估 | 🔄 469-1~3 完成，469-4 待 Gavin 定 |
 | ↳ `469-1` | 现场取证：运行中进程的内存（工作集 / 私有）与 GPU 专用 / 共享占用；确认档位、是否用过翻译 / 日韩标点 | 主控 | 有实测数 | ✅ 运行中（本地实时）工作集 1848MB / 私有工作集 1782MB；GPU 专用 3729MB + 共享 925MB；未用过翻译 / 日韩标点 |
 | ↳ `469-2` | 对照历史基线（MEM-453 / FORCED-ALIGN-456 / MEM-TRIM-457 实测）找增量 | 主控 | 增量来源有结论 | ✅ BUILD-457 基线 工作集 1663 / 专用 3780 / 共享 841：GPU 持平；内存 +185MB：新旧预览模型文件一样大（都约 228MB），差额在运行时缓冲（量级小，非主因，未再逐项拆） |
