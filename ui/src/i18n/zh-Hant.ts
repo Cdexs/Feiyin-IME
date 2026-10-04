@@ -136,7 +136,6 @@ export const zhHant = {
   mine_times: ' 次',
   mine_sep: '、',
   mine_sep_inner: '，',
-  mine_breakdown: '其中（分項統計）：',
   mine_local_fast: '本地快速模型識別',
   mine_online_asr: '線上ASR模型服務',
   mine_local_streaming: '本地串流模型識別',

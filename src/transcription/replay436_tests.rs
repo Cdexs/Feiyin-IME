@@ -2943,3 +2943,21 @@ fn mem470_enc_ab() {
     let _ = std::fs::create_dir_all(out.parent().unwrap());
     std::fs::write(&out, format!("{summary}{}\n", rows.join("\n"))).unwrap();
 }
+
+/// STATS-480（Gavin 10-04「统计使用时长……应该是切分过静音的吧？」）：有效语音时长 = VAD 去静音后的语音总长，
+/// 须明显短于含停顿的整段录音、且不为 0。运行：`cargo test --bin feiyin-ime p480 -- --ignored --nocapture`
+#[test]
+#[ignore = "STATS-480：需 VAD 模型与真实录音，--ignored 运行"]
+fn p480_effective_speech_excludes_silence() {
+    let root = manifest_dir();
+    let (audio, rate) = read_wav(&root.join("collab/research/audio-real-gavin/processed/full.wav"))
+        .expect("full.wav");
+    assert_eq!(rate as usize, RATE);
+    let full_ms = audio.len() as u64 * 1000 / RATE as u64;
+    let eff_ms = crate::transcription::effective_speech_ms(&audio).expect("VAD 可用");
+    println!(
+        "[480] 整段 {full_ms}ms → 有效语音 {eff_ms}ms（{:.0}%）",
+        eff_ms as f64 * 100.0 / full_ms as f64
+    );
+    assert!(eff_ms > 0 && eff_ms < full_ms, "有效语音须短于整段、且非 0");
+}

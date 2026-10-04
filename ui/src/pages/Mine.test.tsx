@@ -55,7 +55,7 @@ describe("MinePage — STATS-475 本周使用统计", () => {
     );
   });
 
-  it("STATS-UI-005: 本周没用过的分项（时长或字数为 0）不显示；全为 0 时连「其中」也不显示", async () => {
+  it("STATS-UI-005: 本周没用过的分项（时长或字数为 0）不显示；分项是带圆点的无序列表、无「其中」标题行（UI-MINE-479）", async () => {
     const partial: WeekUsage = {
       ...usage,
       local_fast: { speech_ms: 0, words: 0 },
@@ -70,7 +70,8 @@ describe("MinePage — STATS-475 本周使用统计", () => {
     await screen.findByTestId("mine-row-local_streaming");
     expect(screen.queryByTestId("mine-row-local_fast")).toBeNull();
     expect(screen.queryByTestId("mine-row-online_asr")).toBeNull();
-    expect(screen.getByText("其中（分项统计）：")).toBeInTheDocument();
+    expect(screen.queryByText("其中（分项统计）：")).toBeNull();
+    expect(screen.getByTestId("mine-row-local_streaming").parentElement?.style.listStyle).toBe("disc");
     unmount();
 
     const none: WeekUsage = {

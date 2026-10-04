@@ -62,33 +62,31 @@ const MinePage: React.FC<Props> = ({ config }) => {
 
       <div className="card" data-testid="mine-week-usage">
         <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: '16px' }}>
-          <span style={{ fontSize: '15px', fontWeight: 600 }}>{t.mine_week_title}</span>
+          <span style={{ fontSize: '16px', fontWeight: 600 }}>{t.mine_week_title}</span>
           {usage && (
-            <span style={{ fontSize: '12px', color: 'var(--system-text-secondary)' }}>
+            <span style={{ fontSize: '13px', color: 'var(--system-text-secondary)' }}>
               {t.mine_week_range}{usage.week_start} ~ {usage.week_end}
             </span>
           )}
         </div>
 
         {loadFailed && (
-          <p style={{ fontSize: '14px', color: 'var(--status-error)' }}>{t.mine_load_failed}</p>
+          <p style={{ fontSize: '15px', color: 'var(--status-error)' }}>{t.mine_load_failed}</p>
         )}
 
         {usage && (
           <>
-            <p data-testid="mine-total" style={{ fontSize: '14px', lineHeight: 1.8, margin: '0 0 12px' }}>
+            <p data-testid="mine-total" style={{ fontSize: '15px', lineHeight: 1.8, margin: '0 0 12px' }}>
               {t.mine_total_duration}<strong>{formatMinutes(usage.speech_ms)}</strong>{t.mine_minutes}
               {t.mine_sep}
               {t.mine_input_words}<strong>{usage.words}</strong>{t.mine_words_unit}
               {t.mine_sep}
               {t.mine_llm_calls}<strong>{usage.llm_calls}</strong>{t.mine_times}
             </p>
-            {rows.length > 0 && (
-              <p style={{ fontSize: '14px', color: 'var(--system-text-secondary)', margin: '0 0 6px' }}>{t.mine_breakdown}</p>
-            )}
-            <ul style={{ listStyle: 'none', margin: 0, padding: '0 0 0 16px' }}>
+            {/* UI-MINE-479（Gavin 10-04）：去掉「其中（分项统计）」标题行，分项用带圆点的无序列表。 */}
+            <ul style={{ listStyle: 'disc', margin: 0, padding: '0 0 0 22px' }}>
               {rows.map((row) => (
-                <li key={row.key} data-testid={`mine-row-${row.key}`} style={{ fontSize: '14px', lineHeight: 2 }}>
+                <li key={row.key} data-testid={`mine-row-${row.key}`} style={{ fontSize: '15px', lineHeight: 2 }}>
                   <span style={{ display: 'inline-block', minWidth: '140px' }}>{row.label}</span>
                   {t.mine_duration}<strong>{formatMinutes(row.data.speech_ms)}</strong>{t.mine_minutes}
                   {t.mine_sep_inner}
@@ -96,7 +94,7 @@ const MinePage: React.FC<Props> = ({ config }) => {
                 </li>
               ))}
             </ul>
-            <p style={{ fontSize: '12px', color: 'var(--system-text-tertiary)', margin: '16px 0 0' }}>{t.mine_rules_note}</p>
+            <p style={{ fontSize: '13px', color: 'var(--system-text-tertiary)', margin: '16px 0 0' }}>{t.mine_rules_note}</p>
           </>
         )}
       </div>

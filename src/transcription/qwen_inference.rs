@@ -523,6 +523,22 @@ impl StreamingAsrState {
         self.display_text()
     }
 
+    /// PUNCT-478（DEC-108）：服务端句间接缝 —— 每个已确认句在 [`Self::final_text`] 里的结束字节位置，
+    /// 只取后面还有文字的（最后一句的句末不算接缝）。服务端按停顿断句、在这些位置自动收句末标点，
+    /// 由主流程用本地标点模型按前后文重判。
+    pub fn sentence_seams(&self) -> Vec<usize> {
+        let total = self.final_text().len();
+        let mut end = 0usize;
+        let mut seams = Vec::new();
+        for s in &self.confirmed_sentences {
+            end += s.len();
+            if end < total && !s.is_empty() {
+                seams.push(end);
+            }
+        }
+        seams
+    }
+
     /// 已确认句数
     pub fn confirmed_count(&self) -> usize {
         self.confirmed_sentences.len()
@@ -939,6 +955,14 @@ pub fn transcribe_streaming(
     }
 }
 
+/// PUNCT-478（DEC-108）：在线识别最终结果 —— 全文 + 服务端句间接缝（全文内字节位置，不含末尾）。
+/// 接缝处的句末标点是服务端按停顿断句时自动加的，主流程用本地标点模型重判（`repair_online_seams`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnlineFinal {
+    pub text: String,
+    pub seams: Vec<usize>,
+}
+
 /// ASR-038-B / ASR-058: 真流式 ASR 转录 —— 边收音频边发帧边收结果。
 ///
 /// **ASR-058 关键改动**：建连从「VAD 命中后」提前到「热键按下后立即建连」，
@@ -971,7 +995,7 @@ pub fn transcribe_streaming_realtime(
     model_dir: &std::path::Path,
     cancel_signal: Option<&std::sync::atomic::AtomicBool>,
     mut on_result: impl FnMut(&str, &[WordTiming]),
-) -> Result<String> {
+) -> Result<OnlineFinal> {
     if api_key.trim().is_empty() {
         bail!("鉴权失败：API Key 为空");
     }
@@ -1617,7 +1641,10 @@ pub fn transcribe_streaming_realtime(
                     }
                     summary.outcome = "finished";
                     log::info!("{}", summary.format_summary());
-                    return Ok(final_text);
+                    return Ok(OnlineFinal {
+                        seams: state.sentence_seams(),
+                        text: final_text,
+                    });
                 }
             }
             Ok(Message::Binary(_)) => {}
@@ -2017,6 +2044,21 @@ mod tests {
         state.on_result(1, "你好世界", false, &[]);
         assert_eq!(state.display_text(), "你好世界");
         assert_eq!(state.confirmed_count(), 0);
+    }
+
+    /// PUNCT-478（DEC-108）：服务端句间接缝 = 各已确认句在全文中的结束位置（最后一句句末不算）。
+    #[test]
+    fn p478_sentence_seams_mark_server_sentence_ends() {
+        let mut state = StreamingAsrState::new();
+        state.on_result(1, "这应该都是文化之间的差异，但是。", true, &[]);
+        state.on_result(2, "根本的法则应该都是一样。", true, &[]);
+        let text = state.final_text();
+        let seams = state.sentence_seams();
+        assert_eq!(seams, vec!["这应该都是文化之间的差异，但是。".len()]);
+        assert_eq!(&text[seams[0]..], "根本的法则应该都是一样。");
+        // 还有未确认的当前句 ⇒ 最后一个已确认句的结尾也是接缝。
+        state.on_result(3, "我们", false, &[]);
+        assert_eq!(state.sentence_seams().len(), 2);
     }
 
     #[test]

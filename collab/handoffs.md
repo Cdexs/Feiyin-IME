@@ -248,3 +248,8 @@
 - 待定点②：`target/release/config.toml` 12:48 被切到在线档系 Gavin 端操作；tester 冒烟临时切本地实时后已字节级还原，正确做法。
 - 已请 Gavin 重启并目视：「请说话...」/ 预览 / 编辑态三处字体一致与字号、「我的」页。
 
+## 2026-10-04 — 主控 — PUNCT-478 + UI-MINE-479 + STATS-480 开发完成，派 BUILD-478
+
+- 478 根因与方案见 DEC-108 / `collab/evidence/478/root-cause.md`；Gavin 确认「可行、语义断句不关」。
+- 预期：bin 1936P/0F/83I（p478 +7、p480 +1I）、src-tauri 95P、Vitest 105P/11skip。
+

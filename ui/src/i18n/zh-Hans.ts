@@ -136,7 +136,6 @@ export const zhHans = {
   mine_times: ' 次',
   mine_sep: '、',
   mine_sep_inner: '，',
-  mine_breakdown: '其中（分项统计）：',
   mine_local_fast: '本地快速模型识别',
   mine_online_asr: '在线ASR模型服务',
   mine_local_streaming: '本地流式模型识别',

@@ -8615,34 +8615,35 @@ fn spawn_worker_thread(
                         let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<Vec<f32>>(256);
 
                         // spawn ASR 线程跑 transcribe_streaming_realtime
-                        let asr_handle: std::thread::JoinHandle<Result<String>> =
-                            std::thread::spawn(move || {
-                                let vocabulary = crate::transcription::load_wordbook_vocabulary();
-                                crate::transcription::qwen_inference::transcribe_streaming_realtime(
-                                    &asr_online_url,
-                                    &qwen_api_key,
-                                    &asr_online_model,
-                                    chunk_rx,
-                                    &vocabulary,
-                                    asr_online_max_sentence_silence,
-                                    asr_online_semantic_punctuation_enabled,
-                                    &model_dir_clone,
-                                    Some(&cancel_clone),
-                                    |display_text, words| {
-                                        // OVERLAY-075: stamp every packet with this session's
-                                        // generation; the consumer drops stale-session packets.
-                                        let _ = event_tx_clone.send(PipelineEvent::StreamingText(
-                                            session_generation,
-                                            display_text.to_string(),
-                                            words.to_vec(),
-                                            0,
-                                        ));
-                                    },
-                                )
-                            });
+                        let asr_handle: std::thread::JoinHandle<
+                            Result<crate::transcription::qwen_inference::OnlineFinal>,
+                        > = std::thread::spawn(move || {
+                            let vocabulary = crate::transcription::load_wordbook_vocabulary();
+                            crate::transcription::qwen_inference::transcribe_streaming_realtime(
+                                &asr_online_url,
+                                &qwen_api_key,
+                                &asr_online_model,
+                                chunk_rx,
+                                &vocabulary,
+                                asr_online_max_sentence_silence,
+                                asr_online_semantic_punctuation_enabled,
+                                &model_dir_clone,
+                                Some(&cancel_clone),
+                                |display_text, words| {
+                                    // OVERLAY-075: stamp every packet with this session's
+                                    // generation; the consumer drops stale-session packets.
+                                    let _ = event_tx_clone.send(PipelineEvent::StreamingText(
+                                        session_generation,
+                                        display_text.to_string(),
+                                        words.to_vec(),
+                                        0,
+                                    ));
+                                },
+                            )
+                        });
 
-                        // STATS-475：本次送给在线 ASR 的 16k 样本数 ⇒ 语音时长。
-                        let mut online_samples = 0usize;
+                        // STATS-475 / 480：本次送给在线 ASR 的 16k 音频（统计有效语音时长用，至多 300s ≈ 19MB）。
+                        let mut online_pcm: Vec<f32> = Vec::new();
                         // worker 线程跑 record_streaming，推 chunk 给 ASR 线程
                         let record_result = audio_capture.record_streaming(
                             Arc::clone(&stop_recording_signal),
@@ -8653,7 +8654,7 @@ fn spawn_worker_thread(
                             device_name,
                             false, // FIX-283: 在线流式路径不做 pre_roll 残尾裁剪（三档行为不变）
                             |chunk| {
-                                online_samples += chunk.len();
+                                online_pcm.extend_from_slice(chunk);
                                 // ASR-074-GUARD: bounded channel send was an unbounded
                                 // blocking send — if the ASR thread stopped consuming
                                 // (WS stuck / server silent / half-open connection),
@@ -8720,8 +8721,8 @@ fn spawn_worker_thread(
                                 continue;
                             }
                         };
-                        let streaming_text = match asr_result {
-                            Ok(text) => text,
+                        let online_final = match asr_result {
+                            Ok(f) => f,
                             Err(e) => {
                                 // BUG-119: 流式 ASR「没识别到语音」= 类型化信号 → 信息提示，
                                 // 不进 convert_to_friendly_error 错误链
@@ -8760,6 +8761,12 @@ fn spawn_worker_thread(
                             cached_punctuation = None;
                         }
 
+                        // PUNCT-478（DEC-108）：服务端按停顿断句、在句间接缝自动收句末标点 ⇒ 本地标点模型按前后文重判。
+                        let streaming_text = repair_online_seams(
+                            &online_final.text,
+                            &online_final.seams,
+                            cached_punctuation.as_mut(),
+                        );
                         run_pipeline_core(
                             Ok(Vec::new()), // 流式模式不用 samples
                             transcriber,
@@ -8780,7 +8787,7 @@ fn spawn_worker_thread(
                             FinalFillerNode::AtFinal, // 441：在线路径最终节点去重逐位不变
                             UsageSource {
                                 category: usage_stats::UsageCategory::OnlineAsr,
-                                speech_ms: speech_ms_16k(online_samples),
+                                audio: Arc::new(online_pcm),
                             },
                         );
                         continue;
@@ -10582,7 +10589,7 @@ fn spawn_worker_thread(
                         } else {
                             FinalFillerNode::AtFinal
                         };
-                        let local_speech_ms = speech_ms_16k(local_pcm.len()); // STATS-475
+                        let local_audio = Arc::new(local_pcm.clone()); // STATS-475 / 480
                         run_pipeline_core(
                             Ok(local_pcm),
                             transcriber,
@@ -10603,7 +10610,7 @@ fn spawn_worker_thread(
                             filler_node,
                             UsageSource {
                                 category: usage_stats::UsageCategory::LocalStreaming,
-                                speech_ms: local_speech_ms,
+                                audio: local_audio,
                             },
                         );
                         continue;
@@ -10657,11 +10664,9 @@ fn spawn_worker_thread(
                         "Starting run_pipeline: cancel_signal={}",
                         cancel_signal.load(Ordering::Relaxed)
                     );
-                    // STATS-475：批处理录音（16k）长度 ⇒ 语音时长。
-                    let batch_speech_ms = samples_result
-                        .as_ref()
-                        .map(|s| speech_ms_16k(s.len()))
-                        .unwrap_or(0);
+                    // STATS-475 / 480：批处理录音（16k），有效语音时长在后台统计线程里算。
+                    let batch_audio =
+                        Arc::new(samples_result.as_ref().cloned().unwrap_or_default());
                     run_pipeline_core(
                         samples_result,
                         transcriber,
@@ -10682,7 +10687,7 @@ fn spawn_worker_thread(
                         FinalFillerNode::AtFinal, // 441：批处理路径最终节点去重逐位不变
                         UsageSource {
                             category: usage_category(transcriber.asr_model()),
-                            speech_ms: batch_speech_ms,
+                            audio: batch_audio,
                         },
                     );
                 }
@@ -16571,9 +16576,12 @@ fn run_pipeline_core(
                     if !final_text.trim().is_empty() {
                         let stats_text = final_text.clone();
                         std::thread::spawn(move || {
+                            // STATS-480：时长 = 有效语音（VAD 去静音）；VAD 不可用退回整段长度。
+                            let speech_ms = transcription::effective_speech_ms(&usage.audio)
+                                .unwrap_or_else(|| speech_ms_16k(usage.audio.len()));
                             if let Err(e) = usage_stats::record(
                                 usage.category,
-                                usage.speech_ms,
+                                speech_ms,
                                 &stats_text,
                                 llm_calls,
                             ) {
@@ -16658,6 +16666,73 @@ fn run_pipeline_core(
     }
 }
 
+/// PUNCT-478（DEC-108，Gavin 10-04 端测「……差异，但是。根本的法则……」）：在线识别服务按停顿断句，
+/// 在句间接缝自动收句末标点，而那里话没说完。去掉服务端在接缝处加的句读标点，用本地标点模型
+/// （中英 CT / 日韩 jako）按接缝前后文重判（逗号 / 句号 / 不加）；其余位置标点与最后一句句末不动。
+/// 没有标点引擎（用户关了自动标点）⇒ 原样返回（后面 L2 节点本就会去标点）。
+fn repair_online_seams(
+    text: &str,
+    seams: &[usize],
+    engine: Option<&mut punctuation::PunctuationEngine>,
+) -> String {
+    let Some(engine) = engine else {
+        return text.to_string();
+    };
+    repair_seams_with(text, seams, |ctx| {
+        if punctuation::ct_unsupported_script(ctx) {
+            punctuation::jako::punctuate(ctx)
+        } else {
+            engine.add_punctuation(ctx)
+        }
+    })
+}
+
+/// PUNCT-478：接缝重判主体（`punctuate` = 给一段上下文整段打标点；测试可注入假模型）。
+fn repair_seams_with(
+    text: &str,
+    seams: &[usize],
+    mut punctuate: impl FnMut(&str) -> Option<String>,
+) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut last = 0usize;
+    for &seam in seams {
+        if seam <= last || seam >= text.len() || !text.is_char_boundary(seam) {
+            continue;
+        }
+        let left = &text[last..seam];
+        let core = left.trim_end_matches(punctuation::is_seam_mark);
+        let original = &left[core.len()..];
+        out.push_str(core);
+        let right = &text[seam..];
+        let judged = punctuation::judge_seam(&out, right, &mut punctuate);
+        match judged {
+            Some(marks) => {
+                // 英文两词之间去掉句号后补一个空格，免得粘成一个词。
+                if marks.is_empty()
+                    && core
+                        .chars()
+                        .last()
+                        .is_some_and(|c| c.is_ascii_alphanumeric())
+                    && right
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphanumeric())
+                {
+                    out.push(' ');
+                }
+                if marks != original {
+                    log::info!("PUNCT-478: online seam {original:?} -> {marks:?}");
+                }
+                out.push_str(&marks);
+            }
+            None => out.push_str(original),
+        }
+        last = seam;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
 /// PIPELINE-ORCH-238-B: N6 LLM 格式化 / 翻译整段（原 run_pipeline_core 内联块）。
 /// 含 llm_handled / format_failed 初始化 + 翻译分支 + LLM optimize 分支 + LLM 跳过分支；
 /// 两处 send_event(Processing) 与 learn_llm_suggestions 原样保留在函数内，事件时序不变。
@@ -16670,11 +16745,11 @@ struct LlmStageOutput {
 }
 
 /// STATS-475：run_pipeline_core 的统计来源（调用方管线声明）。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct UsageSource {
     category: usage_stats::UsageCategory,
-    /// 用户输入语音时长（毫秒）。
-    speech_ms: u64,
+    /// 本次录音（16k）。STATS-480：时长按其中**有效语音**（VAD 去静音）统计，在后台统计线程里算。
+    audio: Arc<Vec<f32>>,
 }
 
 /// STATS-475：16kHz 样本数 → 毫秒。
@@ -24009,5 +24084,53 @@ mod ui471_472_tests {
             .expect("清理判据须覆盖「请说话...」窗");
         assert!(seg(&p, at, 600).contains("state.last_streaming_text = None;"));
         assert!(seg(&p, at, 600).contains("state.edit_original = None;"));
+    }
+}
+
+/// PUNCT-478（DEC-108）：在线识别句间接缝重判（Gavin 10-04 端测「……差异，但是。根本的法则……」）。
+#[cfg(test)]
+mod punct478_online_tests {
+    use super::repair_seams_with;
+
+    #[test]
+    fn p478_online_seam_period_replaced_by_local_judgement() {
+        let text = "这应该都是文化之间的差异，但是。根本的法则应该都是一样。";
+        let seam = "这应该都是文化之间的差异，但是。".len();
+        // 模型认为「但是」后不该断 ⇒ 接缝句号去掉；最后一句句末保留。
+        let out = repair_seams_with(text, &[seam], |_| {
+            Some("这应该都是文化之间的差异，但是根本的法则应该都是一样。".to_string())
+        });
+        assert_eq!(
+            out,
+            "这应该都是文化之间的差异，但是根本的法则应该都是一样。"
+        );
+        // 模型认为该用逗号 ⇒ 换成逗号。
+        let out = repair_seams_with(text, &[seam], |_| {
+            Some("这应该都是文化之间的差异，但是，根本的法则应该都是一样。".to_string())
+        });
+        assert_eq!(
+            out,
+            "这应该都是文化之间的差异，但是，根本的法则应该都是一样。"
+        );
+        // 模型不可用 ⇒ 原样。
+        assert_eq!(repair_seams_with(text, &[seam], |_| None), text);
+    }
+
+    #[test]
+    fn p478_online_seam_real_sentence_end_and_english_space() {
+        // 真句末：模型仍判句号 ⇒ 不变。
+        let text = "今天先到这里。明天继续。";
+        let seam = "今天先到这里。".len();
+        let out = repair_seams_with(text, &[seam], |_| {
+            Some("今天先到这里。明天继续。".to_string())
+        });
+        assert_eq!(out, text);
+        // 英文接缝去掉句号后补空格，不粘词。
+        let text = "the rule is the same.but it depends";
+        let seam = "the rule is the same.".len();
+        let out = repair_seams_with(text, &[seam], |_| {
+            Some("the rule is the same but it depends".to_string())
+        });
+        assert_eq!(out, "the rule is the same but it depends");
     }
 }

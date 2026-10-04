@@ -137,7 +137,6 @@ export const en = {
   mine_times: '',
   mine_sep: ' · ',
   mine_sep_inner: ', ',
-  mine_breakdown: 'Breakdown:',
   mine_local_fast: 'Local fast recognition',
   mine_online_asr: 'Online ASR service',
   mine_local_streaming: 'Local streaming recognition',

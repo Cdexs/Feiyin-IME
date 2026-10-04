@@ -152,6 +152,59 @@ fn is_cjk_ideograph_or_kana(c: char) -> bool {
         || (c >= '\u{F900}' && c <= '\u{FAFF}') // CJK Compatibility Ideographs
 }
 
+/// PUNCT-478（DEC-108）：接缝处可被重判的句读标点。成对符号（引号 / 括号 / 书名号）不在内 —— 它们
+/// 不表示「话在这里停了」，接缝重判不得动。
+pub const SEAM_MARKS: &[char] = &[
+    '，', '。', '！', '？', '；', '：', '、', '…', ',', '!', '?', ';', ':', '.',
+];
+
+/// PUNCT-478：是否接缝处可重判的句读标点（见 [`SEAM_MARKS`]）。
+pub fn is_seam_mark(c: char) -> bool {
+    SEAM_MARKS.contains(&c)
+}
+
+/// PUNCT-478：`punctuated` 中第 `k` 个内容字（字母数字）之后、下一个内容字之前出现的句读标点（空白跳过）。
+fn marks_after_content(punctuated: &str, k: usize) -> String {
+    let mut seen = 0usize;
+    let mut marks = String::new();
+    for c in punctuated.chars() {
+        if c.is_alphanumeric() {
+            if seen == k {
+                break;
+            }
+            seen += 1;
+        } else if seen == k && is_seam_mark(c) {
+            marks.push(c);
+        }
+    }
+    marks
+}
+
+/// PUNCT-478（DEC-108）：判一处接缝该用什么句读标点（Gavin 10-04 端测「……差异，但是。根本的法则……」：
+/// 在线服务按停顿断句、在句末自动收句号，而那里话没说完）。
+///
+/// 取接缝前后各一段上下文（去掉其中句读标点），整段交本地标点模型 `punctuate`，读出接缝位置
+/// （左侧第 k 个内容字之后）落下的标点。返回 `Some(标点)`（空串 = 不加）；两侧缺内容字 / 模型失败 ⇒ `None`
+/// （调用方保留原标点）。
+pub fn judge_seam(
+    left: &str,
+    right: &str,
+    punctuate: impl FnOnce(&str) -> Option<String>,
+) -> Option<String> {
+    const CTX_CHARS: usize = 24;
+    let plain = |s: &str| -> Vec<char> { s.chars().filter(|c| !is_seam_mark(*c)).collect() };
+    let l = plain(left);
+    let r = plain(right);
+    let l_tail: String = l[l.len().saturating_sub(CTX_CHARS)..].iter().collect();
+    let r_head: String = r.iter().take(CTX_CHARS).collect();
+    let k = l_tail.chars().filter(|c| c.is_alphanumeric()).count();
+    if k == 0 || !r_head.chars().any(|c| c.is_alphanumeric()) {
+        return None;
+    }
+    let out = punctuate(&format!("{l_tail}{r_head}"))?;
+    Some(marks_after_content(&out, k))
+}
+
 /// KOJA-PUNCT-464：文本是否含标点模型（CT-Transformer，中英词表）处理不了的文字 —— 日文假名 / 韩文。
 ///
 /// 实测（`poc464_preview_punct`，证据 `collab/evidence/464/preview-punct.md`）：韩文送进去**空格全被吃掉**
@@ -1390,5 +1443,34 @@ mod sync352_punct_final_350_tests {
                 "输出出现替换字符（编码损坏）：{t:?} -> {s:?}"
             );
         }
+    }
+}
+
+/// PUNCT-478（DEC-108）：接缝重判 —— 读出模型在接缝位置落下的标点。
+#[cfg(test)]
+mod punct478_seam_tests {
+    use super::judge_seam;
+
+    #[test]
+    fn p478_judge_seam_reads_mark_at_seam_position() {
+        // 模型在「但是」后不打标点 ⇒ 接缝不加；上下文里的旧标点不影响定位。
+        let got = judge_seam(
+            "这应该都是文化之间的差异，但是。",
+            "根本的法则应该都是一样。",
+            |ctx| {
+                assert!(!ctx.contains('。'), "送模型的上下文去掉了句读标点：{ctx}");
+                Some("这应该都是文化之间的差异，但是根本的法则应该都是一样。".to_string())
+            },
+        );
+        assert_eq!(got.as_deref(), Some(""));
+        let got = judge_seam(
+            "今天的会议就到这里。",
+            "大家辛苦了。",
+            |_| Some("今天的会议就到这里，大家辛苦了。".to_string()),
+        );
+        assert_eq!(got.as_deref(), Some("，"));
+        // 模型失败 / 一侧没有内容字 ⇒ None（调用方保留原标点）。
+        assert_eq!(judge_seam("好的。", "下面", |_| None), None);
+        assert_eq!(judge_seam("。", "下面", |_| Some(String::new())), None);
     }
 }

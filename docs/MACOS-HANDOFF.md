@@ -2746,3 +2746,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 对 macOS 的影响 | 同代码生效。macOS 主程序若另有 `run_pipeline_core` 调用点须同步传 `UsageSource`（编译会报缺参）；数据文件位置与词库 `wordbook.sqlite` 同规则（可执行文件目录），若 .app 内不可写则与词库同样需迁到用户目录 |
 | 是否需要对方同步 | 是：编译验证 + 确认数据目录可写 |
 
+## PUNCT-478 / STATS-480 / UI-MINE-479（2026-10-04，主控）
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | 平台中立：`transcription::seam_punct`（本地实时接缝）、`qwen_inference::OnlineFinal`（**`transcribe_streaming_realtime` 返回类型由 String 改为 OnlineFinal**）、`main::repair_online_seams` / `punctuation::judge_seam` / `SEAM_MARKS`、`transcription::effective_speech_ms`、`UsageSource.audio`（替代 speech_ms）；设置界面 Mine.tsx 排版 |
+| 行为变化 | 说话中停顿处的接缝标点改由看到后文的一方决定；使用时长按有效语音统计 |
+| 对 macOS 的影响 | 同代码生效。macOS 若另有调用 `transcribe_streaming_realtime` / `run_pipeline_core` 的地方须同步改（编译会报类型 / 缺参） |
+| 是否需要对方同步 | 是：编译验证 |
+

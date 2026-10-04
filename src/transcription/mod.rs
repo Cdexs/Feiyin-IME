@@ -1233,6 +1233,18 @@ fn self_vad_ranges(samples: &[f32]) -> Option<Vec<(usize, usize)>> {
     with_trim_vad(|v| v.map(|vseg| vseg.speech_ranges(samples)))
 }
 
+/// STATS-480（Gavin 10-04「统计使用时长的时候……应该是切分过静音的吧？」）：有效语音时长（毫秒）——
+/// 进程级剪静音 VAD 判出的语音区间总长（16k 样本，与本地实时送精解前剪静音同一 VAD）。
+/// VAD 不可用 ⇒ `None`（调用方退回整段长度）。
+pub(crate) fn effective_speech_ms(samples: &[f32]) -> Option<u64> {
+    let ranges = self_vad_ranges(samples)?;
+    let speech: u64 = ranges
+        .iter()
+        .map(|(s, e)| e.saturating_sub(*s) as u64)
+        .sum();
+    Some(speech * 1000 / 16_000)
+}
+
 /// LOCALRT-WARM-CACHE-450：取进程级剪静音 VAD（首次调用加载）。
 fn with_trim_vad<R>(f: impl FnOnce(Option<&VadSegmenter>) -> R) -> R {
     let mut slot = LOCALRT_TRIM_VAD.lock().unwrap_or_else(|e| e.into_inner());
@@ -2519,13 +2531,55 @@ const SEAM_CTX_SECS: f32 = 0.3;
 /// FORCED-ALIGN-456：同一时间格判据（秒）= 半个 80ms 时间格。
 const SEAM_SAME_SLOT_SECS: f32 = 0.04;
 
+/// PUNCT-478（DEC-108，Gavin 10-04 端测「……差异，但是。根本的法则……」）：接缝处的句读标点由后窗决定。
+///
+/// 前窗在停顿处截止，模型把窗尾当整句收尾（「但是。」）；后窗从接缝前开始、看到了后文（「但是，根本」），
+/// 同一位置的标点才可信。`new_head` = 后窗与前窗重叠、被丢掉的开头；`new_rest` = 后窗接上的部分。
+/// - 后窗重识别过接缝前的字（`new_head` 含内容字）⇒ 去掉前窗保留段末尾的句读标点，换成后窗在接缝处的标点
+///   （`new_head` 末尾的句读标点；`new_rest` 开头已有标点则用它、不重复；后窗那里没有就不加）。
+/// - 否则（后窗没覆盖接缝）：`dedupe` 时沿用旧规则 —— 前窗以标点结尾 ⇒ 丢 `new_rest` 开头标点（防重复）。
+///
+/// 返回 `(前窗保留字节数, 从 new_head 末尾补回的字节数, new_rest 开头丢掉的字节数)`。纯函数。
+fn seam_punct(
+    prev_kept: &str,
+    new_head: &str,
+    new_rest: &str,
+    dedupe: bool,
+) -> (usize, usize, usize) {
+    let is_punct = |c: char| !c.is_alphanumeric() && !c.is_whitespace();
+    if new_head.chars().any(|c| c.is_alphanumeric()) {
+        let core = prev_kept.trim_end_matches(crate::punctuation::is_seam_mark);
+        let rest_has_mark = new_rest.starts_with(crate::punctuation::is_seam_mark);
+        let add = if rest_has_mark {
+            0
+        } else {
+            new_head.len()
+                - new_head
+                    .trim_end_matches(crate::punctuation::is_seam_mark)
+                    .len()
+        };
+        return (core.len(), add, 0);
+    }
+    let drop = if dedupe && prev_kept.chars().last().is_some_and(is_punct) {
+        new_rest
+            .chars()
+            .take_while(|&c| is_punct(c))
+            .map(char::len_utf8)
+            .sum()
+    } else {
+        0
+    };
+    (prev_kept.len(), 0, drop)
+}
+
 /// FORCED-ALIGN-456：按逐字时间拼接两窗（纯函数）。
 ///
 /// - `prev` / `prev_t`：上一窗文字与每字（起, 止）绝对秒；`new` / `new_t`：本窗；`split`：分界绝对秒
 ///   （重叠区内部真停顿，436 同源；无则本窗新片起点）。
 /// - 上一窗保留「起点 < 分界」的字；新窗从「上一窗最后保留内容字的**结束** − 0.1s」接起（与分界取早者）
 ///   ⇒ 上一窗在窗尾被截掉、没识别出来的字由新窗补上；两窗都有的同一字（同字且起点差 <0.1s）只留一份；
-///   上一窗以标点结尾时丢掉新窗开头的标点。上一窗一个内容字都没留 ⇒ 新窗全收。
+///   接缝处的句读标点由新窗决定（PUNCT-478，见 [`seam_punct`]；新窗没覆盖接缝时：上一窗以标点结尾 ⇒
+///   丢新窗开头的标点）。上一窗一个内容字都没留 ⇒ 新窗全收。
 /// - 返回 `(上一窗保留字节长度, 新窗接上的文字, 其每字时间)`。
 fn timed_stitch(
     prev: &str,
@@ -2535,7 +2589,6 @@ fn timed_stitch(
     split: f32,
 ) -> (usize, String, Vec<(f32, f32)>) {
     let is_content = |c: char| c.is_alphanumeric();
-    let is_punct = |c: char| !c.is_alphanumeric() && !c.is_whitespace();
     let prev_chars: Vec<(usize, char)> = prev.char_indices().collect();
     // 上一窗保留：起点 < 分界 的前缀（时间非降 ⇒ 前缀）。
     let keep_n = prev_t
@@ -2561,12 +2614,17 @@ fn timed_stitch(
     let mut out_t = Vec::new();
     let mut head = true; // 仍在「与上一窗末字时间重合」的开头段
     let mut new_ctx: Option<(char, f32)> = None; // 新窗中当前字之前的内容字（含被丢弃的）
+                                                 // PUNCT-478：新窗被丢掉的开头（接上第一个字之前），供接缝标点判定。
+    let mut skipped: Vec<(char, (f32, f32))> = Vec::new();
     for (c, &(s, e)) in new.chars().zip(new_t.iter()) {
         let ctx_here = new_ctx;
         if is_content(c) {
             new_ctx = Some((c, s));
         }
         if s < from {
+            if out.is_empty() {
+                skipped.push((c, (s, e)));
+            }
             continue;
         }
         if head {
@@ -2591,6 +2649,9 @@ fn timed_stitch(
                         s > ls
                     };
                     if !keep {
+                        if out.is_empty() {
+                            skipped.push((c, (s, e)));
+                        }
                         continue;
                     }
                 }
@@ -2601,13 +2662,23 @@ fn timed_stitch(
         out.push(c);
         out_t.push((s, e));
     }
-    // 接缝标点去重：上一窗保留部分以标点结尾 ⇒ 新窗开头的标点丢掉。
-    if prev[..keep_bytes].chars().last().is_some_and(is_punct) {
-        let skip = out.chars().take_while(|&c| is_punct(c)).count();
-        if skip > 0 {
-            out = out.chars().skip(skip).collect();
-            out_t.drain(..skip);
-        }
+    // PUNCT-478：接缝标点由后窗决定（见 seam_punct）；后窗没覆盖接缝时沿用「上一窗以标点结尾 ⇒ 丢新窗开头标点」。
+    let head: String = skipped.iter().map(|(c, _)| *c).collect();
+    let (keep_bytes, add, drop) = seam_punct(&prev[..keep_bytes], &head, &out, true);
+    if drop > 0 {
+        let n = out[..drop].chars().count();
+        out = out[drop..].to_string();
+        out_t.drain(..n);
+    }
+    if add > 0 {
+        let marks = &head[head.len() - add..];
+        let n = marks.chars().count();
+        let t: Vec<(f32, f32)> = skipped[skipped.len() - n..]
+            .iter()
+            .map(|(_, t)| *t)
+            .collect();
+        out = format!("{marks}{out}");
+        out_t.splice(0..0, t);
     }
     (keep_bytes, out, out_t)
 }
@@ -2876,6 +2947,14 @@ impl OrderedReflow {
                 (Some(pt), None) => {
                     let (keep, cut) =
                         prev_timed_cut(&self.last_window_text, pt, &text, win_start, split);
+                    // PUNCT-478：接缝标点由后窗决定（seam_punct；去重已在 prev_timed_cut 内做过）。
+                    let (keep, add, _) = seam_punct(
+                        &self.last_window_text[..keep],
+                        &text[..cut],
+                        &text[cut..],
+                        false,
+                    );
+                    let cut = cut - add;
                     log::debug!(
                         "[DBG-456] seam: seq={seq} prev-timed split={split:.2}s keep_prev={} drop_new_head={}",
                         self.last_window_text[..keep].chars().count(),
@@ -2888,6 +2967,11 @@ impl OrderedReflow {
                 _ => {
                     let ratio = expected_overlap_ratio(ws, we, prev_end, &samples);
                     let cut = ratio_cut_bytes(&text, ratio);
+                    // PUNCT-478：后窗覆盖了接缝 ⇒ 接缝标点由后窗决定（比例分支原本不去重，维持）。
+                    let (prev_keep, add, _) =
+                        seam_punct(&self.last_window_text, &text[..cut], &text[cut..], false);
+                    self.last_window_text.truncate(prev_keep);
+                    let cut = cut - add;
                     log::debug!(
                         "[DBG-456] seam: seq={seq} ratio={ratio:?} span=[{ws}, {we}) prev=[{prev_start}, {prev_end}) drop_new_head={}",
                         text[..cut].chars().count()
@@ -9078,5 +9162,76 @@ mod refine_reflow_457_tests {
         let (seq, ws, we, text, t, st, sp) = w[0].clone();
         a.push_window_timed(seq, ws, we, samples(), text.into(), Some(t.clone()), st, sp);
         assert!(a.refine_times(0, t).is_none(), "已带时间拼接 ⇒ 无需重拼");
+    }
+}
+
+/// PUNCT-478（DEC-108）：接缝标点由后窗决定（Gavin 10-04 端测「……差异，但是。根本的法则……」）。
+#[cfg(test)]
+mod punct478_tests {
+    use super::{seam_punct, timed_stitch};
+
+    #[test]
+    fn p478_seam_punct_next_window_decides_when_it_covers_seam() {
+        // 后窗重识别了「但是」并在其后打逗号 ⇒ 去掉前窗窗尾句号、接缝用后窗逗号。
+        let prev = "这应该都是文化之间的差异，但是。";
+        let (keep, add, drop) = seam_punct(prev, "但是，", "根本的法则", true);
+        assert_eq!(&prev[..keep], "这应该都是文化之间的差异，但是");
+        assert_eq!(add, "，".len());
+        assert_eq!(drop, 0);
+        // 后窗在接缝处不打标点 ⇒ 接缝不加标点。
+        let (keep, add, _) = seam_punct("我们今天。", "今天", "去公园", true);
+        assert_eq!((&"我们今天。"[..keep], add), ("我们今天", 0));
+        // 后窗也认为是句末 ⇒ 句号保留（由后窗给出）。
+        let (keep, add, _) = seam_punct("大家辛苦了。", "辛苦了。", "下面开始", true);
+        assert_eq!((&"大家辛苦了。"[..keep], add), ("大家辛苦了", "。".len()));
+        // 标点已在后窗接上部分的开头 ⇒ 不重复补。
+        let (keep, add, _) = seam_punct("差异，但是。", "但是", "，根本", true);
+        assert_eq!((&"差异，但是。"[..keep], add), ("差异，但是", 0));
+        // 引号括号不是句读标点，不动。
+        let (keep, _, _) = seam_punct("他说“好”", "好", "我们", true);
+        assert_eq!(&"他说“好”"[..keep], "他说“好”");
+    }
+
+    #[test]
+    fn p478_seam_punct_uncovered_keeps_old_dedupe() {
+        // 后窗没覆盖接缝（开头没有内容字）⇒ 前窗标点保留；去重开时丢后窗开头标点。
+        let (keep, add, drop) = seam_punct("你好。", "", "，我们走吧", true);
+        assert_eq!((keep, add, drop), ("你好。".len(), 0, "，".len()));
+        let (keep, add, drop) = seam_punct("你好。", "", "，我们走吧", false);
+        assert_eq!((keep, add, drop), ("你好。".len(), 0, 0));
+    }
+
+    /// Gavin 端测原句按时间拼接：前窗「……差异，但是。」在停顿处截止，后窗「但是，根本的法则」看到了后文。
+    #[test]
+    fn p478_timed_stitch_takes_next_window_comma_at_pause_seam() {
+        let prev = "这应该都是文化之间的差异，但是。";
+        let mut prev_t = Vec::new();
+        let mut k = 0usize;
+        for c in prev.chars() {
+            if c.is_alphanumeric() {
+                prev_t.push((k as f32 * 0.3, k as f32 * 0.3 + 0.25));
+                k += 1;
+            } else {
+                // 标点取前一字时间（同 char_times_from_units）。
+                prev_t.push(*prev_t.last().unwrap());
+            }
+        }
+        let new = "但是，根本的法则";
+        let new_t = vec![
+            (3.6, 3.85),
+            (3.9, 4.15),
+            (3.9, 4.15),
+            (6.4, 6.6),
+            (6.6, 6.8),
+            (6.8, 6.95),
+            (6.95, 7.1),
+            (7.1, 7.3),
+        ];
+        let (keep, out, out_t) = timed_stitch(prev, &prev_t, new, &new_t, 5.0);
+        assert_eq!(
+            format!("{}{}", &prev[..keep], out),
+            "这应该都是文化之间的差异，但是，根本的法则"
+        );
+        assert_eq!(out_t.len(), out.chars().count(), "时间与文字逐字对应");
     }
 }
