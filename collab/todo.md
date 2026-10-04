@@ -87,7 +87,7 @@
 | ↳ `474-4` | 测试 + 现有浮层 / D2D 测试不破 | 主控 | 测试 | ✅ 新 `ui474_preview_text_drawn_like_edit_box`；overlay 144 / d2d 24 / local 112 / scroll 3 全绿；GONE `omc415_gdi_and_dwrite_are_independent` / `omc415_dwrite_put_hit_and_invalidate` / `ui473_d2d_streaming_text_real_dc`；warnings 90 |
 | ↳ `474-5` | 派 tester-1 回归 + 出包；Gavin 目视 | tester-1 / Gavin | 目视通过 | ✅ 出包完成（BUILD-474 九项全 PASS）；Gavin 目视 |
 | ↳ `474-6` | 文档 + macOS 结论 | 主控 | 落盘 | ✅ macOS 浮层自绘、不经此路径，无影响 |
-| `STATS-475` | Gavin 10-04「版本号升级一下 / 配置界面左侧导航栏“词库”下增加“我的”导航菜单 / 在我的配置界面，增加使用统计信息区域：本周总共使用时长：xxx分钟、输入字数：xxxx字、优化LLM调用: xxx 次 / 其中（分项统计）：本地快速模型识别 时长：xxx分钟，输入字数：xxxx字；在线ASR模型服务 时长：xxx分钟，输入字数：xxxx字；本地流式模型识别 时长：xxx分钟，输入字数：xxxx字」；规则「1、时长是以用户输入语音的长度累加 2、字数是以最终输出的文字字数（中英日韩语音，英文用单词数）3、优化LLM调用次数，是以格式化输出LLM 调用次数来统计 4、周统计是以固定本周一到周日为一个周期」 | 主控 | 开发 | ✅ 开发完成，派 BUILD-475（0.9.5，DEC-107） |
+| `STATS-475` | Gavin 10-04「版本号升级一下 / 配置界面左侧导航栏“词库”下增加“我的”导航菜单 / 在我的配置界面，增加使用统计信息区域：本周总共使用时长：xxx分钟、输入字数：xxxx字、优化LLM调用: xxx 次 / 其中（分项统计）：本地快速模型识别 时长：xxx分钟，输入字数：xxxx字；在线ASR模型服务 时长：xxx分钟，输入字数：xxxx字；本地流式模型识别 时长：xxx分钟，输入字数：xxxx字」；规则「1、时长是以用户输入语音的长度累加 2、字数是以最终输出的文字字数（中英日韩语音，英文用单词数）3、优化LLM调用次数，是以格式化输出LLM 调用次数来统计 4、周统计是以固定本周一到周日为一个周期」 | 主控 | 开发 | ✅ BUILD-475 已出包（0.9.5，DEC-107），待 Gavin 目视 |
 | ↳ `475-1` | 版本号 0.9.4 → 0.9.5（Gavin「版本号升级一下」；Cargo.toml / src-tauri / tauri.conf.json / package.json 等全部副本） | 主控 | 各处一致 | ✅ 同 0.9.4 升级口径 6 处：两份 Cargo.toml / 两份 Cargo.lock / tauri.conf.json / installer/voice-ime.iss（Publish 下 .iss 与 version_check.json 为出包产物，交 tester-1 同步） |
 | ↳ `475-2` | 调研：配置界面导航结构、两进程（主程序 / 设置界面）共享数据的方式、会话结束与格式化 LLM 调用的代码位置、档位与三类统计的对应 | 主控 | 方案落盘 | ✅ 档位：Performance（含已迁移的 Accuracy）= 本地快速；QwenAudioOnline / FunAsrRealtime = 在线 ASR；LocalRealtime = 本地流式（由 run_pipeline_core 三个调用点各自声明，不从配置推断）。存储：新共享模块 `src/usage_stats.rs` + exe 同目录 `usage-stats.sqlite`（设置界面经 `#[path]` 复用，同词库做法；不碰词库建表迁移）。记录点：最终文字产出（上屏 / 失焦预览）后台线程写一条；时长 = 实际录音样本数 / 16k（在线管线由调用方传）；LLM 次数 = optimize / optimize_and_translate 实际发起次数。依赖：两端已有 chrono + rusqlite |
 | ↳ `475-3` | 记录：每次识别完成记一条（时间、档位分类、语音时长、输出字数、是否调用格式化 LLM），存用户数据目录、升级不丢 | 主控 | 代码 + 测试 | ✅ `src/usage_stats.rs`（exe 同目录 `usage-stats.sqlite`）；`run_pipeline_core` 新参 `UsageSource`，最终文字产出（上屏 / 失焦预览）后台线程记一条；三调用点各自声明档位 + 时长（在线：录音回调累加 16k 样本；本地流式 / 批处理：整段 PCM） |
@@ -95,15 +95,15 @@
 | ↳ `475-5` | 设置界面后端：读取本周统计的接口 | 主控 | 代码 + 测试 | ✅ `src-tauri/src/usage.rs` `get_usage_week`（`#[path]` 复用统计模块）；src-tauri 95P、警告 17 无新增 |
 | ↳ `475-6` | 设置界面前端：「词库」下加「我的」导航 + 页面 + 统计区域（总计 + 三项分项），三份 locale | 主控 | 代码 + 测试 | ✅ `ui/src/pages/Mine.tsx` + App 导航（词库下）+ 三份 locale `mine_*`；Vitest `Mine.test.tsx` 4 条 + App 断言 |
 | ↳ `475-7` | macOS 结论（设置界面与记录逻辑平台中立 ⇒ 同步生效）+ HANDOFF | 主控 | 落盘 | ✅ |
-| ↳ `475-8` | 派 tester-1 回归 + 出包 0.9.5；Gavin 目视 | tester-1 / Gavin | 目视通过 | 🔄 已派 BUILD-475 |
+| ↳ `475-8` | 派 tester-1 回归 + 出包 0.9.5；Gavin 目视 | tester-1 / Gavin | 目视通过 | ✅ 出包完成（BUILD-475 九项全 PASS）；Gavin 目视 |
 | ↳ `475-9` | 文档：DEC / 五文档 | 主控 | 落盘 | ✅ |
 | ↳ `475-10` | Gavin 10-04 追加「注意信息统计界面，如果某一个分享的时长（或字数是 0，也就是本周没用过），就不要显示这一项的统计信息」 | 主控 | 代码 + 测试 | ✅ 分项时长或字数为 0 不显示；三项全为 0 时「其中（分项统计）」标题也不显示；Vitest STATS-UI-005 |
 | ↳ `475-11` | tester-1 回归拦截：`Mine.tsx` 3 处裸十六进制色值违反 G1 设计令牌禁令（UITEST-137） | 主控 | 修 + 全量 Vitest | ✅ 改 `var(--system-text-secondary)` / `var(--system-text-tertiary)`；全量 Vitest 105P/11skip |
-| `UI-FONT-476` | Gavin 10-04「另外，“请说话...”信息提示窗口的文字样式也要调整和预览窗口一致」 | 主控 | 开发 | ✅ 并入 BUILD-475 |
+| `UI-FONT-476` | Gavin 10-04「另外，“请说话...”信息提示窗口的文字样式也要调整和预览窗口一致」 | 主控 | 开发 | ✅ BUILD-475 已出包，待 Gavin 目视 |
 | ↳ `476-1` | 查因：占位态「请说话...」由 D2D 画（DirectWrite），其 GDI 兜底 `draw_listening_placeholder` 才是与预览同字体 | 主控 | 有结论 | ✅ |
 | ↳ `476-2` | 改：占位态 D2D 只画窗框，文字一律 GDI（DC 已选 streaming_font）；删 D2D `placeholder_text` | 主控 | 代码 | ✅ |
 | ↳ `476-3` | 测试：护栏 `ui476_listening_placeholder_drawn_like_preview`；离屏取证 `[476]` 彩边 364（GDI ClearType） | 主控 | 测试 | ✅ |
-| `UI-FONT-477` | Gavin 10-04「将“请说话”提示窗口、预览窗口和编辑态窗口的文字都调小一号」 | 主控 | 开发 | ✅ 并入 BUILD-475 |
+| `UI-FONT-477` | Gavin 10-04「将“请说话”提示窗口、预览窗口和编辑态窗口的文字都调小一号」 | 主控 | 开发 | ✅ BUILD-475 已出包，待 Gavin 目视 |
 | ↳ `477-1` | 三处共用 `OVERLAY_TEXT_FONT_SIZE`：-18 → -17（单行提示同字号随之变小）；容量护栏仍过；护栏 `ui477_overlay_text_one_size_smaller` | 主控 | 代码 + 测试 | ✅ 字宽 190 → 170px |
 | `TEST-GAP-438-TAILSTART` | 护栏缺口（BUILD-438 消融 438b 未红）：`preview_display` 重打时忽略 `tail_start` 改为整段重打，`fix438_*` 全绿——护栏只直调纯函数、唯一进 `preview_display` 的用例 `engine=None`。主控已读码确认接线正确（不影响本包）。补：带真 CT-Transformer 或可注入打点函数的端到端用例 | 待定（非作者 coder） | local_stream.rs 测试区 | ⏳ 攒批补 |
 | `RT-STOP-LATENCY-MULTIWIN` | BUILD-398 #9 遗留：长录音切多窗串行解码，停止时队列压窗 ⇒ 松键到上屏 4.5s（16:44Z 23.85s 录音）；后半「无语音整窗送解」已由 414 修 | 待定 | — | ⏳ 待更多端测数据再定 |

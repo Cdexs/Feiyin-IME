@@ -230,3 +230,21 @@
 - Gavin 追加 476（「请说话...」同预览样式）、477（三处字号小一号 18 → 17），两度暂停 tester-1 后一并重派。
 - 预期：bin 1929P/0F/82I（stats475 3 + ui476 1 + ui477 1）、src-tauri 95P、Vitest 105P/11skip。
 
+## 2026-10-04 — tester-1 — TEST-EXEC-475 + BUILD-475 ✅（回归全绿 ⇒ 出包 0.9.5）
+
+- **性质**：阶段四全量回归 + 阶段五出包（STATS-475 + UI-FONT-476/477 + 色值修复）。HEAD `89e4a09`；版本 **0.9.5**。中间两次被主控紧急暂停（`260d7e8`/`891c027` 结果作废），报告以最终 HEAD 为准。
+- **回归（全绿）**：bin **1929P/0F/82I**（＝预期）/ root 2017P/0F/84I / `src-tauri` 95P/0F/0I / Vitest 8 files·105P·11skip / `cargo fmt --check` EXIT 0。NEW 5（`stats475_words_cjk_by_char_english_by_word`、`stats475_week_is_monday_to_sunday`、`stats475_week_usage_sums_by_category_and_window`、`ui476_listening_placeholder_drawn_like_preview`、`ui477_overlay_text_one_size_smaller`）/ GONE 0；重点失效模式（含 `design-tokens`）全绿、0 FAILED。
+- **专项**：`ui474_preview_text_real_dc`（--ignored）1P/0F，`[474] GDI 宽 170px；ClearType 彩边 979；分界 x=144 左侧差异 0`；`[476] 「请说话...」ClearType 彩边 364`。
+- **出包九项全 PASS**：①main 12:59:34 / ui 12:59:43 / crash 12:58:01 ②两副本全等，三产物均异于 474（main `28803b92…`/ui `fc958071…`/crash `2ee6423f…`）③0.9.5.0 / 0.9.5 / 0.9.5.0 ④Publish + target/release(本地实时) + 设置界面 三冒烟均 Responding、无 panic、无 crash.json、零残留 ⑤`Publish/config.toml` `da2be5da…` 不变 ⑥main 90 / crash 9 / UI 17 ⑦正 main `usage-stats.sqlite`1 / `STATS-475: usage record failed`1 / `LAS_ENC_WARMUP`1，正 ui `get_usage_week`1，反 `[LocalRT-DBG-277] gdi_width`0 / `streaming-paraformer-trilingual`0 ⑧四 toml 三副本全等 ⑨VC 五件 == Redist 14.44.35112。
+- **D1**：三处冒烟后 `Publish/`、`target/release/` **均无** `usage-stats.sqlite`（启动不建，符合预期）。
+- **如实偏差**：`target/release/config.toml` 12:48 被外部改为在线档；tester 临时切 `local_realtime` 完成本地实时冒烟后字节级还原（sha `d86e8651…` 一致，备份已删）。设置界面 standalone 启动即 `exit(1)`（`src-tauri/src/main.rs:194` 要求主进程在跑），故先起主进程再拉 UI 验证。
+- **待主控知悉**：`Publish/voice-ime.iss` 仍 `0.9.4`（guide 无 `.iss` 同步步骤，未动）；`Publish/version_check.json` 由程序冒烟自写为 `0.9.5`。
+- **红线**：未改生产代码 / 版本未动（主控改）/ 未 push / 未删用户数据与模型文件 / 零凭证。报告 `collab/outbox/tester-1/result.md`。**Step1 已结束输入法进程 ⇒ 请主控转告 Gavin 重启。**
+
+## 2026-10-04 — 主控 — BUILD-475（0.9.5）验收通过
+
+- 复核 tester-1：bin 1929P/0F/82I、src-tauri 95P、Vitest 105P/11skip、九项全 PASS；main `28803b92…` / ui `fc958071…` / crash `2ee6423f…`，0.9.5；启动不生成 `usage-stats.sqlite` ✅。
+- 待定点①：`Publish/voice-ime.iss` 主控已按 `installer/voice-ime.iss` 同步为 0.9.5（两文件除版本号外逐字相同；旧版备份在会话 scratchpad）。`Publish/version_check.json` 是设置界面运行时写的检查缓存（冒烟后已自动为 0.9.5），无需处理。
+- 待定点②：`target/release/config.toml` 12:48 被切到在线档系 Gavin 端操作；tester 冒烟临时切本地实时后已字节级还原，正确做法。
+- 已请 Gavin 重启并目视：「请说话...」/ 预览 / 编辑态三处字体一致与字号、「我的」页。
+
