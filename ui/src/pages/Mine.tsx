@@ -46,13 +46,15 @@ const MinePage: React.FC<Props> = ({ config }) => {
       });
   }, []);
 
-  const rows: Array<{ key: string; label: string; data: CategoryUsage }> = usage
+  // Gavin 2026-10-04「如果某一个分项的时长（或字数）是 0，也就是本周没用过，就不要显示这一项的统计信息」。
+  const rows: Array<{ key: string; label: string; data: CategoryUsage }> = (usage
     ? [
         { key: 'local_fast', label: t.mine_local_fast, data: usage.local_fast },
         { key: 'online_asr', label: t.mine_online_asr, data: usage.online_asr },
         { key: 'local_streaming', label: t.mine_local_streaming, data: usage.local_streaming },
       ]
-    : [];
+    : []
+  ).filter((row) => row.data.speech_ms > 0 && row.data.words > 0);
 
   return (
     <div className="settings-page">
@@ -81,7 +83,9 @@ const MinePage: React.FC<Props> = ({ config }) => {
               {t.mine_sep}
               {t.mine_llm_calls}<strong>{usage.llm_calls}</strong>{t.mine_times}
             </p>
-            <p style={{ fontSize: '14px', color: '#6b7280', margin: '0 0 6px' }}>{t.mine_breakdown}</p>
+            {rows.length > 0 && (
+              <p style={{ fontSize: '14px', color: '#6b7280', margin: '0 0 6px' }}>{t.mine_breakdown}</p>
+            )}
             <ul style={{ listStyle: 'none', margin: 0, padding: '0 0 0 16px' }}>
               {rows.map((row) => (
                 <li key={row.key} data-testid={`mine-row-${row.key}`} style={{ fontSize: '14px', lineHeight: 2 }}>

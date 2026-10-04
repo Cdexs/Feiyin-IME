@@ -55,6 +55,43 @@ describe("MinePage — STATS-475 本周使用统计", () => {
     );
   });
 
+  it("STATS-UI-005: 本周没用过的分项（时长或字数为 0）不显示；全为 0 时连「其中」也不显示", async () => {
+    const partial: WeekUsage = {
+      ...usage,
+      local_fast: { speech_ms: 0, words: 0 },
+      online_asr: { speech_ms: 4_000, words: 0 },
+    };
+    mockInvoke.mockImplementation(async (cmd: string) =>
+      cmd === "get_usage_week" ? partial : null
+    );
+    const { unmount } = render(
+      <MinePage config={{ ui_language: "Chinese" }} updateConfig={vi.fn()} />
+    );
+    await screen.findByTestId("mine-row-local_streaming");
+    expect(screen.queryByTestId("mine-row-local_fast")).toBeNull();
+    expect(screen.queryByTestId("mine-row-online_asr")).toBeNull();
+    expect(screen.getByText("其中（分项统计）：")).toBeInTheDocument();
+    unmount();
+
+    const none: WeekUsage = {
+      ...usage,
+      speech_ms: 0,
+      words: 0,
+      llm_calls: 0,
+      local_fast: { speech_ms: 0, words: 0 },
+      online_asr: { speech_ms: 0, words: 0 },
+      local_streaming: { speech_ms: 0, words: 0 },
+    };
+    mockInvoke.mockImplementation(async (cmd: string) =>
+      cmd === "get_usage_week" ? none : null
+    );
+    render(<MinePage config={{ ui_language: "Chinese" }} updateConfig={vi.fn()} />);
+    const total = await screen.findByTestId("mine-total");
+    expect(total.textContent).toBe("本周总共使用时长：0 分钟、输入字数：0 字、优化LLM调用：0 次");
+    expect(screen.queryByText("其中（分项统计）：")).toBeNull();
+    expect(screen.queryByTestId("mine-row-local_streaming")).toBeNull();
+  });
+
   it("STATS-UI-003: 读取失败显示错误、不崩", async () => {
     mockInvoke.mockRejectedValue(new Error("db locked"));
     render(<MinePage config={{ ui_language: "Chinese" }} updateConfig={vi.fn()} />);
