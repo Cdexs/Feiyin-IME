@@ -253,3 +253,18 @@
 - 478 根因与方案见 DEC-108 / `collab/evidence/478/root-cause.md`；Gavin 确认「可行、语义断句不关」。
 - 预期：bin 1936P/0F/83I（p478 +7、p480 +1I）、src-tauri 95P、Vitest 105P/11skip。
 
+## 2026-10-04 — tester-1 — TEST-EXEC-478 + BUILD-478 ✅（回归全绿 ⇒ 出包 0.9.5）
+
+- **性质**：阶段四全量回归 + 阶段五出包（PUNCT-478/DEC-108 + STATS-480 + UI-MINE-479/481）。HEAD `a34215d`；版本 **0.9.5 不变**。（主控误推的旧 TEST-EXEC-475 已作废。）
+- **回归（全绿）**：bin **1936P/0F/83I**（＝预期）/ root 2024P/0F/85I / `src-tauri` 95P/0F/0I / Vitest 8 files·105P·11skip / `cargo fmt --check` EXIT 0。NEW 7（`p478_seam_punct_next_window_decides_when_it_covers_seam`、`p478_seam_punct_uncovered_keeps_old_dedupe`、`p478_timed_stitch_takes_next_window_comma_at_pause_seam`、`p478_judge_seam_reads_mark_at_seam_position`、`p478_sentence_seams_mark_server_sentence_ends`、`p478_online_seam_period_replaced_by_local_judgement`、`p478_online_seam_real_sentence_end_and_english_space`）+ NEW ignored 1（`p480_effective_speech_excludes_silence`）/ GONE 0；重点失效模式全绿、0 FAILED。
+- **专项**：`p480`（--ignored）1P，`[480] 整段 56149ms → 有效语音 51584ms（92%）`；`sv463_preview_freeze_e2e`（--ignored）1P，`[463] 语音 56.1s 处理 9.1s ｜ 刷新 94 ｜ 派发 6`。
+- **出包九项全 PASS**：①main 14:24:33 / ui 14:21:57 / crash 12:58:01（未重编）②两副本全等，main `76487e28…`/ui `8b0c02d8…` 异于 475，crash `2ee6423f…` 同属预期 ③0.9.5.0 / 0.9.5 / 0.9.5.0 ④Publish + target/release(本地实时) + 设置界面 三冒烟均 Responding、无 panic、无 crash.json、零残留 ⑤`Publish/config.toml` `da2be5da…` 不变 ⑥main 90 / crash 9 / UI 17 ⑦正/反探针全对（正 main `PUNCT-478: online seam`1/`usage-stats.sqlite`1/`STATS-475: usage record failed`1、正 ui `get_usage_week`1）⑧四 toml 三副本全等 ⑨VC 五件 == Redist 14.44.35112。
+- **D1（如实）**：主程序启动（`-debug` 12s / 单独 30s）与 target/release 本地实时档启动**均不生成** `usage-stats.sqlite`；既有 `target/release/usage-stats.sqlite`（13:49）mtime 未被启动改写。⚠️ Settings UI 冒烟窗口内曾两次观察到 `Publish/usage-stats.sqlite` 空库出现（14:27:52 / 14:31:02），后续隔离复跑（Publish 45s / 临时目录 25s / CDP 活动页=通用）**均未复现**；代码层 `usage_stats::open()` 任何调用都建库、读路径 `week_usage()`（← `get_usage_week` ← `Mine.tsx`）故打开「我的」页会落空库，提请主控决定是否将读路径改只读。核心判据 PASS。
+- **红线**：未改生产代码 / 版本未动 / 未 push / 未删用户数据与模型文件 / 零凭证。报告 `collab/outbox/tester-1/result.md`。**Step1 已结束输入法进程 ⇒ 请主控转告 Gavin 重启。**
+
+## 2026-10-04 — 主控 — BUILD-478 验收通过
+
+- 复核：bin 1936P/0F/83I、root 2024P、src-tauri 95P、Vitest 105P/11skip、九项全 PASS；main `76487e28…` / ui `8b0c02d8…`，0.9.5；设置界面 warnings 17（474 的 18 为偶发，已回基线）。
+- D1 主控拍板：`usage_stats` 读路径改为「库不存在 ⇒ 返回全 0、不建库」（读不产生副作用，与「首次记录才建库」一致），随 CLEAN-468 第二批一并改、下次出包回归。
+- 已请 Gavin 重启并端测：本地实时 / 在线各说一句带停顿的话看接缝标点；「我的」页分组框。
+
