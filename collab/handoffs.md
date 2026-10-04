@@ -273,3 +273,18 @@
 - 源码：删 4 个 `src/bin/poc_*.rs`、12 个失效 #[ignore] 测试（bin 忽略 83 → 71）；`usage_stats::week_usage` 库不存在不建库；「我的」页统一组件样式。
 - 预期：bin 1936P/0F/71I、src-tauri 95P、Vitest 106P/11skip。
 
+## 2026-10-04 — tester-1 — TEST-EXEC-482 + BUILD-482 ✅（回归全绿 ⇒ 出包 0.9.5）
+
+- **性质**：阶段四全量回归 + 阶段五出包（CLEAN-468 + D1 + UI-MINE-482）。HEAD `9a5c0c2`；版本 **0.9.5 不变**。
+- **回归（全绿）**：bin **1936P/0F/71I**（＝预期，通过数不变、ignored 83→71）/ root 2024P/0F/73I / `src-tauri` 95P / Vitest 8 files·106P·11skip（NEW 1 STATS-UI-006）/ `cargo fmt --check` EXIT 0。GONE 忽略 12 逐一 0 命中（`poc_speaker_404_*` ×4、`poc_17b_351_fitness`、`poc_353_itn_cer`、`poc_355_capability`、`poc_376_language_separator`、`poc_355_language_option`、`poc_355_lang_none_multilingual`、`poc_357_prompt`、`gate335_asr_ab_manual`）；已删 4 个 `src/bin/poc_*`，root log 中其测试目标 = 0；0 FAILED。
+- **出包九项全 PASS**：①main 14:53:36 / ui 14:50:58 / crash 12:58:01（未重编）②两副本全等，main `ca84731d…`/ui `932916ed…` 异于 478，crash `2ee6423f…` 同属预期 ③0.9.5.0 / 0.9.5 / 0.9.5.0 ④Publish + target/release(本地实时) + 设置界面 三冒烟均 Responding、无 panic、无 crash.json、零残留 ⑤`Publish/config.toml` `da2be5da…` 不变 ⑥main 90 / crash 9 / UI 17 ⑦正/反探针全对 ⑧四 toml 三副本全等 ⑨VC 五件 == Redist 14.44.35112。
+- **D1 修复已验证（PASS）**：`Publish/usage-stats.sqlite` 冒烟前不存在；打开设置界面后 t=12/18/24/30s **始终不存在**（读路径不再建库）。
+- **临时切档**：`target/release/config.toml` 原 `performance`，临时切 `local_realtime` 完成本地实时冒烟后字节级还原（sha `d7f34b62…` 改前=还原后）。
+- **红线**：未改生产代码 / 版本未动 / 未 push / 未删用户数据与模型文件 / 零凭证。报告 `collab/outbox/tester-1/result.md`。**Step1 已结束输入法进程 ⇒ 请主控转告 Gavin 重启。**
+
+## 2026-10-04 — 主控 — BUILD-482 验收通过
+
+- 复核：bin 1936P/0F/71I（忽略 83 → 71，12 个 GONE 全符）、root 2024P/0F/73I、src-tauri 95P、Vitest 106P/11skip、九项全 PASS；main `ca84731d…` / ui `932916ed…`，0.9.5；warnings 90 / 9 / 17。
+- D1 实测：打开设置界面 30s 内不生成 `usage-stats.sqlite` ✅。tester 冒烟临时切档后已字节级还原（Gavin 当前配置为 performance 档）。
+- 已请 Gavin 重启并目视「我的」页统一样式 + 端测接缝标点。
+
