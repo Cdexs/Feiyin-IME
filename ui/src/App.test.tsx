@@ -14,6 +14,7 @@ describe("App", () => {
     expect(screen.getByText("语音输入")).toBeInTheDocument();
     expect(screen.getByText("格式化输出")).toBeInTheDocument();
     expect(screen.getByText("词库")).toBeInTheDocument();
+    expect(screen.getByText("我的")).toBeInTheDocument(); // STATS-475
     expect(screen.getByText("关于")).toBeInTheDocument();
   });
 

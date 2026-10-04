@@ -8,6 +8,7 @@ import HotkeySettingsPage from "./pages/HotkeySettings";
 import VoicePage from "./pages/Voice";
 import LlmPage from "./pages/Llm";
 import WordbookPage from "./pages/Wordbook";
+import MinePage from "./pages/Mine";
 import AboutPage from "./pages/About";
 
 function App() {
@@ -65,6 +66,7 @@ function App() {
       case "voice": return <VoicePage {...props} />;
       case "llm": return <LlmPage {...props} />;
       case "wordbook": return <WordbookPage {...props} />;
+      case "mine": return <MinePage {...props} />;
       case "about": return <AboutPage {...props} />;
       default: return <GeneralPage {...props} />;
     }
@@ -76,6 +78,7 @@ function App() {
     { id: 'voice', label: t.nav_voice },
     { id: 'llm', label: t.nav_llm },
     { id: 'wordbook', label: t.nav_wordbook },
+    { id: 'mine', label: t.nav_mine }, // STATS-475：「词库」下
     { id: 'about', label: t.nav_about },
   ];
 
@@ -104,6 +107,11 @@ function App() {
     wordbook: (
       <svg className="sidebar-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
         <path d="M4 19.5A2.5 2.5 0 016.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z"/>
+      </svg>
+    ),
+    mine: (
+      <svg className="sidebar-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+        <circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0116 0"/>
       </svg>
     ),
     about: (

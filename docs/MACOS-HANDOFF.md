@@ -2737,3 +2737,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 对 macOS 的影响 | 无（macOS 浮层自绘，不经此路径） |
 | 是否需要对方同步 | 否 |
 
+## STATS-475（2026-10-04，主控）· 使用统计 +「我的」页（0.9.5，DEC-107）
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | 新平台中立模块 `src/usage_stats.rs`；`run_pipeline_core` 新参 `UsageSource`（三调用点）；`run_llm_stage` 计次；设置界面 `get_usage_week` + `Mine.tsx`；版本 0.9.5 |
+| 行为变化 | 每次输出最终文字记一条统计到可执行文件同目录 `usage-stats.sqlite`；设置界面新增「我的」页 |
+| 对 macOS 的影响 | 同代码生效。macOS 主程序若另有 `run_pipeline_core` 调用点须同步传 `UsageSource`（编译会报缺参）；数据文件位置与词库 `wordbook.sqlite` 同规则（可执行文件目录），若 .app 内不可写则与词库同样需迁到用户目录 |
+| 是否需要对方同步 | 是：编译验证 + 确认数据目录可写 |
+

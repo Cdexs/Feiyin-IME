@@ -8,6 +8,7 @@ mod i18n;
 mod llm;
 mod overlay;
 mod qwen3;
+mod usage; // STATS-475
 mod version_check;
 mod wordbook;
 
@@ -234,6 +235,7 @@ fn main() {
             wordbook::get_wordbook_stats,
             wordbook::add_wordbook_entry,
             wordbook::delete_wordbook_entry_by_id,
+            usage::get_usage_week,
             overlay::show_recording_overlay,
             overlay::hide_recording_overlay,
             overlay::update_overlay_status

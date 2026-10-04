@@ -218,3 +218,8 @@
 - 观察项：设置界面 release 构建 warnings 17 → 18（本批未改 src-tauri），STATS-475 改 src-tauri 时一并复核。
 - CLEAN-468 盘点完成（`collab/evidence/468/audit.md`），待 Gavin 定 A / B 组。
 
+## 2026-10-04 — 主控 — STATS-475 开发完成（0.9.5，DEC-107），派 BUILD-475
+
+- 统计模块 `src/usage_stats.rs` + 设置界面「我的」页；版本 0.9.5（6 处）。
+- 预期：bin 1927P/0F/82I（+3）、src-tauri 95P（+3，同一模块测试）、Vitest 104P（+4）。
+

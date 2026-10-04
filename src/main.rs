@@ -18,6 +18,7 @@ mod text_normalizer;
 mod transcription;
 mod translation;
 mod ui;
+mod usage_stats; // STATS-475：「我的」页使用统计
 mod version_check;
 mod wordbook;
 use anyhow::{anyhow, Result};
@@ -8663,6 +8664,8 @@ fn spawn_worker_thread(
                                 )
                             });
 
+                        // STATS-475：本次送给在线 ASR 的 16k 样本数 ⇒ 语音时长。
+                        let mut online_samples = 0usize;
                         // worker 线程跑 record_streaming，推 chunk 给 ASR 线程
                         let record_result = audio_capture.record_streaming(
                             Arc::clone(&stop_recording_signal),
@@ -8673,6 +8676,7 @@ fn spawn_worker_thread(
                             device_name,
                             false, // FIX-283: 在线流式路径不做 pre_roll 残尾裁剪（三档行为不变）
                             |chunk| {
+                                online_samples += chunk.len();
                                 // ASR-074-GUARD: bounded channel send was an unbounded
                                 // blocking send — if the ASR thread stopped consuming
                                 // (WS stuck / server silent / half-open connection),
@@ -8797,6 +8801,10 @@ fn spawn_worker_thread(
                             None,                 // PARALLEL-ACC-298: 在线路径无并行预转写
                             i18n::get(config.ui_language).overlay_transcribing,
                             FinalFillerNode::AtFinal, // 441：在线路径最终节点去重逐位不变
+                            UsageSource {
+                                category: usage_stats::UsageCategory::OnlineAsr,
+                                speech_ms: speech_ms_16k(online_samples),
+                            },
                         );
                         continue;
                     }
@@ -10597,6 +10605,7 @@ fn spawn_worker_thread(
                         } else {
                             FinalFillerNode::AtFinal
                         };
+                        let local_speech_ms = speech_ms_16k(local_pcm.len()); // STATS-475
                         run_pipeline_core(
                             Ok(local_pcm),
                             transcriber,
@@ -10615,6 +10624,10 @@ fn spawn_worker_thread(
                             pretranscribed, // PARALLEL-ACC-298: 并行 accuracy 结果（关时 None ⇒ 原有 accuracy 2pass）
                             i18n::get(config.ui_language).overlay_processing,
                             filler_node,
+                            UsageSource {
+                                category: usage_stats::UsageCategory::LocalStreaming,
+                                speech_ms: local_speech_ms,
+                            },
                         );
                         continue;
                     }
@@ -10667,6 +10680,11 @@ fn spawn_worker_thread(
                         "Starting run_pipeline: cancel_signal={}",
                         cancel_signal.load(Ordering::Relaxed)
                     );
+                    // STATS-475：批处理录音（16k）长度 ⇒ 语音时长。
+                    let batch_speech_ms = samples_result
+                        .as_ref()
+                        .map(|s| speech_ms_16k(s.len()))
+                        .unwrap_or(0);
                     run_pipeline_core(
                         samples_result,
                         transcriber,
@@ -10685,6 +10703,10 @@ fn spawn_worker_thread(
                         None, // PARALLEL-ACC-298: 批处理路径无并行预转写
                         i18n::get(config.ui_language).overlay_transcribing,
                         FinalFillerNode::AtFinal, // 441：批处理路径最终节点去重逐位不变
+                        UsageSource {
+                            category: usage_category(transcriber.asr_model()),
+                            speech_ms: batch_speech_ms,
+                        },
                     );
                 }
             }
@@ -16241,6 +16263,8 @@ fn run_pipeline_core(
     // `DoneUpstream` = 本地实时已在回灌前对权威文本去过一遍，最终节点不再重复。
     // 🔴 本函数不得从文本或 `pretranscribed.is_some()` 反推该值。
     filler_node: FinalFillerNode,
+    // STATS-475：本次会话的统计来源（档位分类 + 用户输入语音时长），由调用方管线声明，不从配置反推。
+    usage: UsageSource,
 ) {
     match samples_result {
         Err(e) => {
@@ -16457,6 +16481,7 @@ fn run_pipeline_core(
                     let final_text = llm_out.text;
                     let llm_handled = llm_out.llm_handled;
                     let format_failed = llm_out.format_failed;
+                    let llm_calls = llm_out.llm_calls;
                     // REFACTOR-SHARE-TRANSDIR-001: persist via AppConfig method (platform-neutral)
                     // + runtime lock/save (Windows runtime concern, inline here in cfg(windows) run_pipeline)
                     if translate_requested
@@ -16565,6 +16590,20 @@ fn run_pipeline_core(
                         send_event(event_tx, PipelineEvent::Cancelled);
                         return;
                     }
+                    // STATS-475：最终文字产出（上屏或失焦预览）即记一条；写库丢后台线程，不挡上屏。
+                    if !final_text.trim().is_empty() {
+                        let stats_text = final_text.clone();
+                        std::thread::spawn(move || {
+                            if let Err(e) = usage_stats::record(
+                                usage.category,
+                                usage.speech_ms,
+                                &stats_text,
+                                llm_calls,
+                            ) {
+                                log::warn!("STATS-475: usage record failed: {}", e);
+                            }
+                        });
+                    }
                     let current_id = platform::foreground_window_id();
                     let focus_lost = target_hwnd != 0 && current_id != target_hwnd;
                     log::info!(
@@ -16649,6 +16688,34 @@ struct LlmStageOutput {
     text: String,
     llm_handled: bool,
     format_failed: bool,
+    /// STATS-475：本次实际发起的格式化 LLM 调用次数（optimize / optimize_and_translate，成败都算）。
+    llm_calls: u64,
+}
+
+/// STATS-475：run_pipeline_core 的统计来源（调用方管线声明）。
+#[derive(Debug, Clone, Copy)]
+struct UsageSource {
+    category: usage_stats::UsageCategory,
+    /// 用户输入语音时长（毫秒）。
+    speech_ms: u64,
+}
+
+/// STATS-475：16kHz 样本数 → 毫秒。
+fn speech_ms_16k(samples: usize) -> u64 {
+    samples as u64 * 1000 / 16_000
+}
+
+/// STATS-475：实际运行的识别引擎 → 「我的」页分项（旧 Accuracy 已迁移为 Performance，同记本地快速）。
+fn usage_category(model: transcription::AsrModel) -> usage_stats::UsageCategory {
+    match model {
+        transcription::AsrModel::Performance | transcription::AsrModel::Accuracy => {
+            usage_stats::UsageCategory::LocalFast
+        }
+        transcription::AsrModel::QwenAudioOnline | transcription::AsrModel::FunAsrRealtime => {
+            usage_stats::UsageCategory::OnlineAsr
+        }
+        transcription::AsrModel::LocalRealtime => usage_stats::UsageCategory::LocalStreaming,
+    }
 }
 
 /// 执行 LLM 格式化 / 翻译阶段，返回文本与两条状态位。
@@ -16675,6 +16742,7 @@ fn run_llm_stage(
     // surface a brief "formatting failed" overlay hint after
     // injection so the user knows to check LLM config.
     let mut format_failed = false;
+    let mut llm_calls = 0u64;
     let text = if translate_requested && config.translation.enabled && !raw_text.trim().is_empty() {
         let processing_msg = i18n::get(config.ui_language).overlay_processing;
         send_event(
@@ -16703,6 +16771,7 @@ fn run_llm_stage(
         // 避免逐路径打补丁时漏掉其中一条。
         let translated_out =
             if should_try_llm_translate(config.llm.enabled, config.llm.connectivity_verified) {
+                llm_calls += 1;
                 // B: LLM optimization failed (non-critical), continue with raw result
                 match rt.block_on(llm_client.optimize_and_translate(
                     &pre_llm_text,
@@ -16765,6 +16834,7 @@ fn run_llm_stage(
         );
         let script_instruction =
             text_normalizer::script_instruction(&raw_text, config.audio.chinese_script);
+        llm_calls += 1;
         let llm_result = rt.block_on(llm_client.optimize(
             &pre_llm_text,
             script_instruction,
@@ -16803,6 +16873,7 @@ fn run_llm_stage(
         text,
         llm_handled,
         format_failed,
+        llm_calls,
     }
 }
 /// SCENE-SENSE-001-CORE (DEC-031-⑤): 录音完成阶段采集前台窗口场景信号，
