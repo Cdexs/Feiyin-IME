@@ -212,3 +212,9 @@
 - 预览文字改 GDI（= 编辑框字体与渲染），窗框仍 D2D；浅色尾巴两段裁剪；删 D2D 预览文字与 DWrite 量宽缓存。
 - 预期 bin 1924P/0F/82I（NEW 1 + 1I；GONE 2 + 1I）。
 
+## 2026-10-04 — 主控 — BUILD-474 验收通过（主控 collect）
+
+- 复核 tester-1 报告：bin 1924P/0F/82I、九项全 PASS，main `c7bfb2f7…`，0.9.4；验收通过，已请 Gavin 重启目视 473 / 474。
+- 观察项：设置界面 release 构建 warnings 17 → 18（本批未改 src-tauri），STATS-475 改 src-tauri 时一并复核。
+- CLEAN-468 盘点完成（`collab/evidence/468/audit.md`），待 Gavin 定 A / B 组。
+
