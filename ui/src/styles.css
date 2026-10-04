@@ -327,21 +327,6 @@ input, textarea, [contenteditable="true"] {
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08), 0 8px 24px rgba(0, 0, 0, 0.04);
 }
 
-/* UI-MINE-481：「我的」页信息分组框 —— 卡片外观 + 更明显的边框，标题嵌在边框线上（以后其他「我的」信息各自一框） */
-.mine-group {
-  border: 1px solid var(--system-border-strong);
-  min-width: 0;
-  margin-left: 0;
-  margin-right: 0;
-}
-
-.mine-group-title {
-  padding: 0 8px;
-  font-size: 16px;
-  font-weight: 600;
-  color: var(--system-text-primary);
-}
-
 /* 分区标题下划线（设计图风格） */
 .section-divider {
   border-bottom: 1px solid rgba(0, 0, 0, 0.06);

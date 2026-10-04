@@ -128,7 +128,8 @@ export const en = {
   // STATS-475：「我的」页
   mine_title: 'Me',
   mine_usage_title: 'Usage',
-  mine_week_range: 'Period: ',
+  mine_paren_open: ' (',
+  mine_paren_close: ')',
   mine_total_duration: 'Total time this week: ',
   mine_input_words: 'Words: ',
   mine_llm_calls: 'LLM formatting calls: ',
@@ -142,5 +143,5 @@ export const en = {
   mine_local_streaming: 'Local streaming recognition',
   mine_duration: 'Time: ',
   mine_load_failed: 'Failed to load usage stats',
-  mine_rules_note: 'Time = length of your speech; words = final output (CJK by character, English by word); the week runs Monday to Sunday.',
+  mine_rules_note: 'Time = length of your speech; words = final output (CJK by character, English by word)',
 } as const;

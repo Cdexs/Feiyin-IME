@@ -32,6 +32,15 @@ export const formatMinutes = (ms: number): string => {
   return Number.isInteger(minutes) ? String(minutes) : minutes.toFixed(1);
 };
 
+/** UI-MINE-482：统计周期只显示月日，如 2026-09-28 / 2026-10-04 →「9.28-10.4」。 */
+export const formatPeriod = (start: string, end: string): string => {
+  const md = (d: string) => {
+    const [, m, day] = d.split('-').map((x) => parseInt(x, 10));
+    return `${m}.${day}`;
+  };
+  return `${md(start)}-${md(end)}`;
+};
+
 const MinePage: React.FC<Props> = ({ config }) => {
   const t = getTranslations(config.ui_language);
   const [usage, setUsage] = useState<WeekUsage | null>(null);
@@ -60,17 +69,14 @@ const MinePage: React.FC<Props> = ({ config }) => {
     <div className="settings-page">
       <h2 className="page-title">{t.mine_title}</h2>
 
-      {/* UI-MINE-481（Gavin 10-04）：统计区是一个带边框的分组框，标题「使用统计」嵌在边框线上；
-          「我的」页以后的其他信息各自一个分组框。 */}
-      <fieldset className="card mine-group" data-testid="mine-week-usage">
-        <legend className="mine-group-title">{t.mine_usage_title}</legend>
-        {usage && (
-          <div style={{ textAlign: 'right', marginBottom: '8px' }}>
-            <span style={{ fontSize: '13px', color: 'var(--system-text-secondary)' }}>
-              {t.mine_week_range}{usage.week_start} ~ {usage.week_end}
-            </span>
-          </div>
-        )}
+      {/* UI-MINE-482（Gavin 10-04）：与其他设置页统一 —— 分区小标题（section-title）+ 卡片（card）；
+          统计周期只显示月日，放在标题后的括号里：「使用统计（9.28-10.4）」。「我的」页以后的其他信息各自一个分区。 */}
+      <section className="settings-section">
+        <h3 className="section-title" data-testid="mine-usage-title">
+          {t.mine_usage_title}
+          {usage && `${t.mine_paren_open}${formatPeriod(usage.week_start, usage.week_end)}${t.mine_paren_close}`}
+        </h3>
+        <div className="card" data-testid="mine-week-usage">
 
         {loadFailed && (
           <p style={{ fontSize: '15px', color: 'var(--status-error)' }}>{t.mine_load_failed}</p>
@@ -99,7 +105,8 @@ const MinePage: React.FC<Props> = ({ config }) => {
             <p style={{ fontSize: '13px', color: 'var(--system-text-tertiary)', margin: '16px 0 0' }}>{t.mine_rules_note}</p>
           </>
         )}
-      </fieldset>
+        </div>
+      </section>
     </div>
   );
 };

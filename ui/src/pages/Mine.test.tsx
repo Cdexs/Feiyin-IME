@@ -1,6 +1,6 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import { vi } from "vitest";
-import MinePage, { formatMinutes, WeekUsage } from "./Mine";
+import MinePage, { formatMinutes, formatPeriod, WeekUsage } from "./Mine";
 
 // STATS-475：「我的」页本周统计。
 vi.mock("@tauri-apps/api/core", () => ({
@@ -36,12 +36,18 @@ describe("MinePage — STATS-475 本周使用统计", () => {
       "本周总共使用时长：12.5 分钟、输入字数：2345 字、优化LLM调用：17 次"
     );
     expect(mockInvoke).toHaveBeenCalledWith("get_usage_week");
-    // UI-MINE-481：统计区是带边框的分组框，标题「使用统计」嵌在边框线上。
-    const group = screen.getByTestId("mine-week-usage");
-    expect(group.tagName).toBe("FIELDSET");
-    expect(group.className).toContain("mine-group");
-    expect(group.querySelector("legend")?.textContent).toBe("使用统计");
-    expect(screen.getByText("2026-09-28 ~ 2026-10-04", { exact: false })).toBeInTheDocument();
+    // UI-MINE-482：与其他设置页统一 —— 分区小标题（section-title）+ 卡片（card）；周期只显示月日，放标题括号里。
+    const title = screen.getByTestId("mine-usage-title");
+    expect(title.tagName).toBe("H3");
+    expect(title.className).toBe("section-title");
+    expect(title.textContent).toBe("使用统计（9.28-10.4）");
+    expect(title.closest("section")?.className).toBe("settings-section");
+    expect(screen.getByTestId("mine-week-usage").className).toBe("card");
+    // 规则说明不再含「统计周期……」一句、结尾不带分号。
+    expect(screen.queryByText(/统计周期/)).toBeNull();
+    expect(
+      screen.getByText("时长按输入语音长度累加；字数按最终输出文字统计（中日韩按字，英文按单词）")
+    ).toBeInTheDocument();
   });
 
   it("STATS-UI-002: 三项分项按本地快速 / 在线 ASR / 本地流式顺序", async () => {
@@ -103,6 +109,11 @@ describe("MinePage — STATS-475 本周使用统计", () => {
     render(<MinePage config={{ ui_language: "Chinese" }} updateConfig={vi.fn()} />);
     await waitFor(() => expect(screen.getByText("读取使用统计失败")).toBeInTheDocument());
     expect(screen.queryByTestId("mine-total")).toBeNull();
+  });
+
+  it("STATS-UI-006: 统计周期只显示月日（去年份、去前导零）", () => {
+    expect(formatPeriod("2026-09-28", "2026-10-04")).toBe("9.28-10.4");
+    expect(formatPeriod("2026-12-29", "2027-01-04")).toBe("12.29-1.4");
   });
 
   it("STATS-UI-004: 分钟取 1 位小数，整数不带 .0", () => {

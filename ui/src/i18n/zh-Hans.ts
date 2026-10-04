@@ -127,7 +127,8 @@ export const zhHans = {
   // STATS-475：「我的」页
   mine_title: '我的',
   mine_usage_title: '使用统计',
-  mine_week_range: '统计周期：',
+  mine_paren_open: '（',
+  mine_paren_close: '）',
   mine_total_duration: '本周总共使用时长：',
   mine_input_words: '输入字数：',
   mine_llm_calls: '优化LLM调用：',
@@ -141,5 +142,5 @@ export const zhHans = {
   mine_local_streaming: '本地流式模型识别',
   mine_duration: '时长：',
   mine_load_failed: '读取使用统计失败',
-  mine_rules_note: '时长按输入语音长度累加；字数按最终输出文字统计（中日韩按字，英文按单词）；统计周期为本周一至周日。',
+  mine_rules_note: '时长按输入语音长度累加；字数按最终输出文字统计（中日韩按字，英文按单词）',
 } as const;

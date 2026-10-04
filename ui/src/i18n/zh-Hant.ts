@@ -127,7 +127,8 @@ export const zhHant = {
   // STATS-475：「我的」页
   mine_title: '我的',
   mine_usage_title: '使用統計',
-  mine_week_range: '統計週期：',
+  mine_paren_open: '（',
+  mine_paren_close: '）',
   mine_total_duration: '本週總共使用時長：',
   mine_input_words: '輸入字數：',
   mine_llm_calls: '優化LLM調用：',
@@ -141,5 +142,5 @@ export const zhHant = {
   mine_local_streaming: '本地串流模型識別',
   mine_duration: '時長：',
   mine_load_failed: '讀取使用統計失敗',
-  mine_rules_note: '時長按輸入語音長度累加；字數按最終輸出文字統計（中日韓按字，英文按單詞）；統計週期為本週一至週日。',
+  mine_rules_note: '時長按輸入語音長度累加；字數按最終輸出文字統計（中日韓按字，英文按單詞）',
 } as const;
