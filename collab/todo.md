@@ -36,7 +36,7 @@
 | 项 | 状态 |
 | --- | --- |
 | 版本 | **0.9.5**（10-04 Gavin「版本号升级一下」）；最新包 **BUILD-482**（main `ca84731d…`），已 push（`36d8f81`） |
-| Worker | coder-1 / coder-2 待命（未经 Gavin 授权不派）；tester-1 负责回归 + 出包 |
+| Worker | **10-14 起 coder-1 / coder-2 / tester-1 额度用尽，一律不派**（Gavin「接下来所有开发、测试和构建都由你自己完成」）；开发 + 全量回归 + 出包均由主控完成；coder-1 窗格已关 |
 | 文档 | 10-04 归档：todo 450~482 → `todo-archive.md`；handoffs 10-04 之前 → `handoffs-archive.md` |
 
 ---
