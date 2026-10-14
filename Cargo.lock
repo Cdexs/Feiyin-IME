@@ -4300,6 +4300,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "pinyin"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e225f595052d9c46045755be4b8d7950b6d9f3c33e0c0b74ba58f11bbfa8c64b"
+
+[[package]]
 name = "piper"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6102,7 +6108,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voice-ime"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "anyhow",
  "atomic-write-file",
@@ -6131,6 +6137,7 @@ dependencies = [
  "objc2-app-kit 0.2.2",
  "objc2-foundation 0.2.2",
  "ort",
+ "pinyin",
  "reqwest",
  "rusqlite",
  "rustls",

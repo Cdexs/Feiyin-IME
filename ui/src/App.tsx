@@ -1,7 +1,8 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getTranslations } from "./i18n";
+import { listen } from "@tauri-apps/api/event";
+import { getTranslations, uiLanguageFromSystem } from "./i18n";
 import "./styles.css";
 import GeneralPage from "./pages/General";
 import HotkeySettingsPage from "./pages/HotkeySettings";
@@ -32,6 +33,23 @@ function App() {
     loadConfig();
   }, []);
 
+  // SC-LLM-485：用户在别处按快捷方式切开关 → 主程序写回 config.toml → 后端推 config-changed。
+  // 界面保存的是整份配置，不跟着刷新的话下一次任意保存会把开关改回旧值。
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    listen<any>("config-changed", (e) => setConfig(e.payload))
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
 
   const loadConfig = async () => {
     try {
@@ -53,8 +71,8 @@ function App() {
     }
   };
 
-  if (loading) return <div className="loading-state">Loading...</div>;
-  if (!config) return <div className="empty-state">Error: Could not load configuration.</div>;
+  if (loading) return <div className="loading-state">{getTranslations(uiLanguageFromSystem()).app_loading}</div>;
+  if (!config) return <div className="empty-state">{getTranslations(uiLanguageFromSystem()).app_config_load_failed}</div>;
 
   const t = getTranslations(config.ui_language);
 

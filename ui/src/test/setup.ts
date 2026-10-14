@@ -9,6 +9,11 @@ vi.mock("@tauri-apps/api/window", () => ({
   }),
 }));
 
+// Mock Tauri event API（SC-LLM-485：App 监听 config-changed）
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn().mockResolvedValue(() => {}),
+}));
+
 // Mock Tauri app API for unit tests
 vi.mock("@tauri-apps/api/app", () => ({
   getVersion: vi.fn().mockResolvedValue("0.5.3"),

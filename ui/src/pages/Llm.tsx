@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { invoke } from "@tauri-apps/api/core";
 import { getTranslations } from '../i18n';
+import ShortcutSetting from '../components/ShortcutSetting';
 
 interface Props {
   config: any;
@@ -35,8 +36,7 @@ const LlmPage: React.FC<Props> = ({ config, updateConfig }) => {
     (llm.api_key || '').trim().length > 0 &&
     (llm.model || '').trim().length > 0;
 
-  const gateHintText =
-    "请先完整填写接口地址、接口密钥、模型名称，并通过连接测试。";
+  const gateHintText = t.llm_gate_hint;
 
   const handleToggleEnabled = (checked: boolean) => {
     if (checked && !canEnable) {
@@ -72,23 +72,27 @@ const LlmPage: React.FC<Props> = ({ config, updateConfig }) => {
       ? t.llm_test_success
       : llm.connectivity_verified === false
       ? t.llm_test_failed
-      : '未测试';
+      : t.llm_status_untested;
 
   return (
     <div className="settings-page">
       <h2 className="page-title">{t.llm_title}</h2>
 
       <section className="settings-section">
-        <label className="toggle-switch card" style={{ border: 'none', boxShadow: 'none', padding: '8px 0', marginBottom: 0 }}>
-          <input
-            type="checkbox"
-            checked={llm.enabled}
-            onChange={(e) => handleToggleEnabled(e.target.checked)}
-            className="toggle-input"
-          />
-          <span className="toggle-track"></span>
-          <span className="toggle-label" style={{ fontWeight: 600 }}>{t.llm_enable}</span>
-        </label>
+        {/* SC-LLM-485：快捷方式链接放在 label 外，点链接不拨动开关 */}
+        <div className="toggle-row">
+          <label className="toggle-switch card" style={{ border: 'none', boxShadow: 'none', padding: '8px 0', marginBottom: 0 }}>
+            <input
+              type="checkbox"
+              checked={llm.enabled}
+              onChange={(e) => handleToggleEnabled(e.target.checked)}
+              className="toggle-input"
+            />
+            <span className="toggle-track"></span>
+            <span className="toggle-label" style={{ fontWeight: 600 }}>{t.llm_enable}</span>
+          </label>
+          <ShortcutSetting config={config} updateConfig={updateConfig} action="llm_toggle" />
+        </div>
         {!canEnable && (
           <p className="form-hint" style={{ color: 'var(--brand-primary)', marginTop: '4px', paddingLeft: '8px' }}>{gateHintText}</p>
         )}

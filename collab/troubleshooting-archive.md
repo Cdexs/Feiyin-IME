@@ -5466,3 +5466,9 @@ TEST-SYNC-420 给 `fix_reflow_raw_base_420_tests` 加 `fn_body` helper，内含 
 - **取证**：两边分词 id 35 个逐个相同；`post_preds` 35 处 34 处相同；Python ORT 1.30 单线程 / 多线程结果一致 ⇒ 差异来自 ORT 版本（1.28.2 vs 1.30）的 int8 算子数值，在两类分数接近处翻转。
 - **判据**：对照到「分词全同 + 只差个别点」即可判为运行库数值差；真模型测试对此类句子只断言稳定部分。
 
+
+## [OVERLAY-STALE-AUTOCLOSE-485] 提示窗的自动关闭计时会关掉后来的录音窗（2026-10-14）
+
+- **现象（代码审查发现，未在端测出现）**：浮层是单个 Win32 窗口。带 `auto_close_ms > 0` 的提示（Info / Error）会 `SetTimer(hwnd, 1, …)`；之后若来一个不自动关的 Show（录音窗 / 预览 / 加载提示，`auto_close_ms == 0`），旧代码**不撤计时** ⇒ 计时到点 `WM_TIMER` 无条件 `KillTimer + 清请求 + SW_HIDE`，把录音窗关掉。触发条件：提示弹出后 1.5s 内开录。SC-LLM-485 的快捷方式提示让这个窗口期变得常见（按快捷方式 → 立刻开说）。
+- **修复**：Show 处理里 `auto_close_ms == 0` ⇒ `KillTimer(hwnd, 1)`（`src/main.rs` overlay Show 分支）。
+- **判据**：凡单窗口复用 + 计时器自动关闭的浮层，新内容出现时必须撤销旧内容的计时；新增「会自动关」的提示前先查这一条。

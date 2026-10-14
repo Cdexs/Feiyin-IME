@@ -35,7 +35,7 @@ describe("LlmPage — gate validation", () => {
     const config = makeConfig({ llm: { connectivity_verified: false } });
     render(<LlmPage config={config} updateConfig={updateConfig} />);
 
-    const checkbox = screen.getByRole("checkbox", { name: /启用格式化输出|Enable Format Output/ });
+    const checkbox = screen.getByRole("checkbox", { name: /启用识别输出优化|Enable Output Optimization/ });
     fireEvent.click(checkbox);
 
     expect(
@@ -50,7 +50,7 @@ describe("LlmPage — gate validation", () => {
     const config = makeConfig({ llm: { api_url: "" } });
     render(<LlmPage config={config} updateConfig={updateConfig} />);
 
-    const checkbox = screen.getByRole("checkbox", { name: /启用格式化输出|Enable Format Output/ });
+    const checkbox = screen.getByRole("checkbox", { name: /启用识别输出优化|Enable Output Optimization/ });
     fireEvent.click(checkbox);
 
     expect(
@@ -65,7 +65,7 @@ describe("LlmPage — gate validation", () => {
     const updateConfig = vi.fn();
     render(<LlmPage config={config} updateConfig={updateConfig} />);
 
-    const checkbox = screen.getByRole("checkbox", { name: /启用格式化输出|Enable Format Output/ });
+    const checkbox = screen.getByRole("checkbox", { name: /启用识别输出优化|Enable Output Optimization/ });
     fireEvent.click(checkbox);
 
     expect(updateConfig).toHaveBeenCalledWith(
@@ -85,7 +85,7 @@ describe("LlmPage — gate validation", () => {
     const updateConfig = vi.fn();
     render(<LlmPage config={config} updateConfig={updateConfig} />);
 
-    const checkbox = screen.getByRole("checkbox", { name: /启用格式化输出|Enable Format Output/ });
+    const checkbox = screen.getByRole("checkbox", { name: /启用识别输出优化|Enable Output Optimization/ });
     expect(checkbox).toBeChecked();
     fireEvent.click(checkbox);
 
@@ -139,5 +139,16 @@ describe("LlmPage — gate validation", () => {
         llm: expect.objectContaining({ connectivity_verified: false }),
       })
     );
+  });
+});
+
+// 10-14 Gavin「UI和提示对话框中的文字一定都要走i18n国际化」：原硬编码的前置条件提示 /「未测试」改走 i18n。
+describe("LlmPage — i18n", () => {
+  it("I18N-LLM-1: 英文界面的前置条件提示与未测试状态为英文", () => {
+    const config = { ...makeConfig({ llm: { connectivity_verified: undefined } }), ui_language: "English" };
+    render(<LlmPage config={config} updateConfig={vi.fn()} />);
+    expect(screen.getByText(/Fill in the API URL, API key and model/)).toBeInTheDocument();
+    expect(screen.getByText("Not tested")).toBeInTheDocument();
+    expect(screen.queryByText(/请先完整填写/)).not.toBeInTheDocument();
   });
 });

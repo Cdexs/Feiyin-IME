@@ -37,7 +37,12 @@
   --status-warning: #f59e0b;
   --status-error: #dc2626;
   --status-success: #22c55e;
-  
+  --status-error-subtle: rgba(220, 38, 38, 0.08);
+
+  /* 文字链接（SC-LLM-485：Gavin 指定「快捷方式」提示为蓝色；取 Fluent Light AccentText 口径） */
+  --link-color: #0067c0;
+  --link-hover: #003e92;
+
   /* 圆角（设计图标准：分级圆角） */
   --radius-control: 8px;      /* 按钮、输入框、checkbox */
   --radius-overlay: 12px;     /* 卡片、弹窗 */
@@ -1097,6 +1102,91 @@ input[type="range"]::-moz-range-thumb {
   font-size: 12px;
   color: var(--system-text-secondary);
   text-align: center;
+}
+
+/* === 功能开关快捷方式（SC-LLM-485 / SC-PUNCT-486） === */
+/* 开关 + 「（快捷方式: 右Ctrl+1）」同一行；链接在 label 之外，点它不会拨动开关 */
+.toggle-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  column-gap: 4px;
+}
+
+.shortcut-inline {
+  font-size: 13px;
+  color: var(--link-color);
+  white-space: nowrap;
+}
+
+.shortcut-link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: color var(--animation-fast);
+}
+
+.shortcut-link:hover {
+  color: var(--link-hover);
+}
+
+.shortcut-link:focus-visible {
+  outline: 2px solid var(--link-color);
+  outline-offset: 2px;
+}
+
+.shortcut-keys {
+  font-weight: 600;
+}
+
+.shortcut-inline-conflict {
+  color: var(--status-error);
+}
+
+.shortcut-dialog .modal-header {
+  border-bottom: 1px solid var(--system-border);
+}
+
+.shortcut-dialog .modal-body {
+  padding: 20px 24px 22px;
+}
+
+.shortcut-dialog-feature {
+  font-size: 13px;
+  color: var(--system-text-secondary);
+  margin-bottom: 18px;
+}
+
+.shortcut-dialog-feature strong {
+  color: var(--system-text-primary);
+  font-weight: 600;
+}
+
+.shortcut-dialog-caption {
+  font-size: 12px;
+  color: var(--system-text-secondary);
+  text-align: center;
+  margin-bottom: 10px;
+}
+
+.shortcut-dialog-key .hotkey-key-btn {
+  min-width: 240px;
+}
+
+.shortcut-dialog-error {
+  margin-top: 16px;
+  padding: 10px 12px;
+  border-radius: var(--radius-control);
+  background: var(--status-error-subtle);
+  color: var(--status-error);
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 /* === Sub-tab Bar（页内 Tab 切换） === */

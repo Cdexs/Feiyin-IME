@@ -8,6 +8,7 @@ mod i18n;
 mod llm;
 mod overlay;
 mod qwen3;
+mod shortcuts; // SC-LLM-485 / SC-PUNCT-486
 mod usage; // STATS-475
 mod version_check;
 mod wordbook;
@@ -25,7 +26,8 @@ fn get_config() -> Result<AppConfig, String> {
 
 #[tauri::command]
 fn save_config(config: AppConfig) -> Result<(), String> {
-    config.save().map_err(|e| e.to_string())
+    // SC-LLM-485：记下自己写入的内容，配置监视线程不把它当外部改动回推。
+    shortcuts::save_config_tracked(&config).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -199,6 +201,9 @@ fn main() {
 
     let app = tauri::Builder::default()
         .setup(|_app| {
+            // SC-LLM-485：主程序（快捷方式切开关）改了 config.toml ⇒ 推 `config-changed` 让界面刷新。
+            shortcuts::spawn_config_watcher(_app.handle().clone());
+
             if let Some(main) = _app.get_webview_window("main") {
                 let _ = main.set_maximizable(false);
                 if let Ok(icon) = tauri::image::Image::from_bytes(include_bytes!("../icons/128x128.png")) {
@@ -228,6 +233,7 @@ fn main() {
             get_audio_devices,
             check_hotkey_available,
             check_accuracy_model_ready,
+            shortcuts::set_shortcut_capture,
             version_check::get_version_info,
             version_check::force_check_latest_version,
             version_check::open_url_in_browser,

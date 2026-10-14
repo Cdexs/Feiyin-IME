@@ -1,6 +1,6 @@
 [package]
 name = "voice-ime"
-version = "0.9.5"
+version = "0.9.6"
 edition = "2021"
 
 [[bin]]
@@ -82,6 +82,9 @@ image = { version = "0.25", default-features = false, features = ["png", "ico"] 
 
 # Chinese script conversion (cross-platform)
 zhconv = { version = "0.4.1", default-features = false, features = ["compress", "opencc"] }
+
+# WB-ECHO-483：汉字转拼音（纯 Rust，跨平台）—— 本地实时回显护栏比「带词库 / 不带词库」两次识别的读音
+pinyin = { version = "0.11", default-features = false, features = ["plain"] }
 
 # Crash reporting (cross-platform)
 backtrace = "0.3"

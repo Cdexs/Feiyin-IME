@@ -174,12 +174,12 @@ describe('HotkeySettingsPage - HOTKEY-047', () => {
     expect(document.activeElement).toBe(listening);
   });
 
-  it('HOTKEY-047-S10: 按下左 Alt 时录制框预览立即变为 Left Alt', () => {
+  it('HOTKEY-047-S10: 按下左 Alt 时录制框预览立即变为 左Alt（中文界面显示走 i18n）', () => {
     const { container } = renderPage();
     const rec = startRecording(container);
     expect(rec.textContent).toBe(zhHans.hotkey_press_new);
     fireEvent.keyDown(rec, { code: 'AltLeft' });
-    expect(rec.textContent).toBe('Left Alt');
+    expect(rec.textContent).toBe(zhHans.shortcut_mod_left_alt);
   });
 
   it('HOTKEY-047-S11: Escape 退出录制态且 updateConfig 零调用', () => {
@@ -204,7 +204,7 @@ describe('HotkeySettingsPage - HOTKEY-047', () => {
     fireEvent.keyUp(rec, { code: 'ControlLeft' });
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument());
     expect(updateConfig).not.toHaveBeenCalled();
-    expect(screen.getByText(/Right Alt/)).toBeInTheDocument();
+    expect(screen.getByText(new RegExp(zhHans.shortcut_mod_right_alt))).toBeInTheDocument();
     expect(screen.getByText(zhHans.hotkey_conflict)).toBeInTheDocument();
   });
 
@@ -429,5 +429,21 @@ describe('HotkeySettingsPage - HOTKEY-049 纯函数护栏', () => {
     const allModKeys = [0xA2, 0xA3, 0xA4, 0xA5, 0xA0, 0xA1];
     for (const vk of allModKeys) expect(set.has(vk)).toBe(true);
     expect(set.has(0x4D)).toBe(true);
+  });
+});
+
+// 10-14 Gavin「UI和提示对话框中的文字一定都要走i18n国际化」：按键名显示走 i18n，写入配置的规范名不变。
+describe('HotkeySettings — 键名 i18n', () => {
+  it('HOTKEY-I18N-1: 英文界面显示 Right Ctrl，中文界面显示 右Ctrl；配置里的 display_name 不随界面语言变', () => {
+    const base = {
+      auto_start: false,
+      hotkey: { mode: 'Toggle', vk_code: 0xA3, modifiers: 0, display_name: 'Right Ctrl' },
+      translation: { enabled: true, vk_code: 0xA4, display_name: 'Left Alt', target_language: 'Chinese' },
+    };
+    const { unmount } = render(<HotkeySettingsPage config={{ ...base, ui_language: 'English' }} updateConfig={vi.fn()} />);
+    expect(screen.getByRole('button', { name: 'Right Ctrl' })).toBeInTheDocument();
+    unmount();
+    render(<HotkeySettingsPage config={{ ...base, ui_language: 'Chinese' }} updateConfig={vi.fn()} />);
+    expect(screen.getByRole('button', { name: zhHans.shortcut_mod_right_ctrl })).toBeInTheDocument();
   });
 });

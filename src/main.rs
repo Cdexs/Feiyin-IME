@@ -141,7 +141,8 @@ enum PipelineEvent {
     /// LOCAL-RT-ENGINE-239-B: 本地流式档位双模型加载提示（Info 态，文案携带在 payload）。
     Info(String),
     /// LOCAL-RT-ENGINE-239-B: 本地流式档位模型缺失/加载失败 → 直接报错不降级（DEC-067 附则一）。
-    /// 与 Error 的区别：**不过 convert_to_friendly_error**，保留「具体缺哪个模型」的原始上下文。
+    /// 与 Error 的区别：**不过 convert_to_friendly_error**，payload 即 i18n 文案原样上屏；
+    /// 「具体缺哪个模型」的内部原文只进日志（10-14 i18n 收口）。
     ModelUnavailable(String),
     /// LOCALRT-FIRSTCHAR-282: 本地流式**松手 flush 的最终预览全文**。
     /// 🔴 专用通道：`STREAMING_STOPPED` + `should_ignore_streaming_text` 是本地/在线共用 latch，
@@ -286,6 +287,13 @@ struct OverlayRequest {
 // StreamingEditing guard in the Hide handler.
 #[cfg(target_os = "windows")]
 static OVERLAY_EDITING: AtomicBool = AtomicBool::new(false);
+// SC-LLM-485：录音 / 识别处理中（托盘 Recording | Processing）。此时浮层正被会话占用，
+// 快捷方式的「已启用 / 已关闭」提示先挂起，会话结束（回 Idle）后再弹，免得打断录音窗 / 被其自动关闭计时误关。
+#[cfg(target_os = "windows")]
+static SESSION_BUSY: AtomicBool = AtomicBool::new(false);
+// SC-LLM-485：会话中按快捷方式时挂起的提示（文案, 是否错误样式）；只留最后一次。
+#[cfg(target_os = "windows")]
+static PENDING_SHORTCUT_INFO: Mutex<Option<(String, bool)>> = Mutex::new(None);
 // OVERLAY-043: latch that prevents late StreamingText events from reverting the overlay back to Recording
 // after the user has released the hotkey. Reset on each RecordingStarted.
 #[cfg(target_os = "windows")]
@@ -2015,6 +2023,11 @@ fn run_overlay_thread(
                         // Set auto-close timer if needed
                         if request.auto_close_ms > 0 {
                             let _ = SetTimer(hwnd, 1, request.auto_close_ms, None);
+                        } else {
+                            // SC-LLM-485：不自动关的新浮层（录音 / 预览 / 加载提示等）撤掉上一个提示残留的
+                            // 自动关闭计时 —— 否则「按快捷方式弹提示 → 1.5s 内开录」时，提示的计时到点会把
+                            // 录音窗关掉（WM_TIMER 无条件隐藏浮层）。
+                            let _ = KillTimer(hwnd, 1);
                         }
                     }
                 }
@@ -6931,22 +6944,38 @@ fn advance_width(current: i32, target: i32) -> i32 {
         next
     }
 }
-#[cfg(target_os = "windows")]
+/// 内部错误串 → 浮层提示文案（三语 i18n）。
+///
+/// 10-14 Gavin「UI和提示对话框中的文字一定都要走i18n国际化」：内部错误串有中有英，
+/// 原样上屏会让英文界面冒中文。中文关键词与英文同表归类；**未归类一律显示
+/// `error_unexpected`，不再原文直出**（调用方发 Error 前均已 log::error 记下原文）。
+/// 🔴 「没说话」不在此嗅探（H3 护栏）：它走 NoSpeechError 类型化信号，不进本函数。
 fn convert_to_friendly_error(message: &str, ui_language: config::UiLanguage) -> String {
     let strings = i18n::get(ui_language);
-    let m = message.to_ascii_lowercase();
-    if m.contains("timeout") || m.contains("timed out") {
+    let m = message.to_lowercase();
+    let has = |keys: &[&str]| keys.iter().any(|k| m.contains(k));
+    if has(&["timeout", "timed out", "超时"]) {
         strings.error_network_timeout.to_string()
-    } else if m.contains("api") || m.contains("http") || m.contains("401") || m.contains("403") {
+    } else if has(&[
+        "api",
+        "http",
+        "401",
+        "403",
+        "网络",
+        "服务端",
+        "鉴权",
+        "连接",
+        "tls",
+    ]) {
         strings.error_api_unavailable.to_string()
-    } else if m.contains("model") || m.contains("recognizer") {
+    } else if has(&["model", "recognizer", "transcriber", "模型"]) {
         strings.error_model_init.to_string()
-    } else if m.contains("audio") || m.contains("microphone") {
+    } else if has(&["audio", "microphone", "麦克风", "音频", "录音"]) {
         strings.error_microphone.to_string()
-    } else if m.contains("mic_muted") {
+    } else if has(&["mic_muted"]) {
         strings.error_mic_muted.to_string()
     } else {
-        message.to_string()
+        strings.error_unexpected.to_string()
     }
 }
 #[cfg(target_os = "windows")]
@@ -7011,6 +7040,11 @@ fn maybe_refresh_settings_child(
     }
 }
 fn set_tray_state(tray: &mut Option<TrayIcon>, state: TrayState, ui_language: config::UiLanguage) {
+    #[cfg(target_os = "windows")]
+    SESSION_BUSY.store(
+        matches!(state, TrayState::Recording | TrayState::Processing),
+        Ordering::Release,
+    );
     let Some(tray) = tray.as_mut() else {
         return;
     };
@@ -7277,6 +7311,9 @@ fn process_controller_events(
                 stop_recording_signal.store(true, Ordering::Release);
                 STREAMING_STOPPED.store(true, Ordering::Release);
                 platform::notify_translate_poll_stop();
+            }
+            HotkeyEvent::Shortcut(action) => {
+                handle_shortcut_event(action, runtime_config, overlay_handle, is_recording);
             }
         }
     }
@@ -7844,7 +7881,7 @@ fn process_controller_events(
                 }));
             }
             // LOCAL-RT-ENGINE-239-B: 模型缺失 → 错误态；🔴 不走 convert_to_friendly_error，
-            // 保留「缺哪个模型」的具体上下文（DEC-067 附则一：不降级、明确报错）。
+            // payload 已是 i18n「所选模型不可用」（DEC-067 附则一：不降级、明确报错；细节见日志）。
             PipelineEvent::ModelUnavailable(message) => {
                 OVERLAY_EDITING.store(false, Ordering::Release);
                 log::error!("Pipeline: model unavailable: {}", message);
@@ -8014,7 +8051,103 @@ fn process_controller_events(
             }
         }
     }
+    // SC-LLM-485：会话期间挂起的快捷方式提示，会话一结束（本轮已回 Idle、未在编辑）就补弹。
+    if !shortcut_overlay_busy(is_recording) {
+        let pending = PENDING_SHORTCUT_INFO
+            .lock()
+            .map(|mut p| p.take())
+            .unwrap_or(None);
+        if let Some((message, is_error)) = pending {
+            let ui_language = clone_runtime_config(runtime_config).ui_language;
+            show_shortcut_info(overlay_handle, message, is_error, ui_language);
+        }
+    }
     Ok(false)
+}
+
+/// SC-LLM-485：浮层是否正被会话占用（录音 / 识别处理中 / 编辑态）。
+#[cfg(target_os = "windows")]
+fn shortcut_overlay_busy(is_recording: &AtomicBool) -> bool {
+    is_recording.load(Ordering::Acquire)
+        || SESSION_BUSY.load(Ordering::Acquire)
+        || OVERLAY_EDITING.load(Ordering::Acquire)
+}
+
+/// SC-LLM-485 / SC-PUNCT-486：快捷方式切换开关 —— 与设置界面点开关同一规则（`AppConfig::apply_shortcut`），
+/// 写回 config.toml（配置监视会重载；设置界面若开着会跟随刷新），再按状态弹提示窗
+/// （Gavin「识别输出优化已启用 or 识别输出优化已关闭」）。会话中先挂起提示，结束后补弹。
+#[cfg(target_os = "windows")]
+fn handle_shortcut_event(
+    action: config::ShortcutAction,
+    runtime_config: &Arc<RwLock<AppConfig>>,
+    overlay_handle: &OverlayThreadHandle,
+    is_recording: &AtomicBool,
+) {
+    let (outcome, ui_language, save_result) = {
+        let mut cfg = match runtime_config.write() {
+            Ok(cfg) => cfg,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let outcome = cfg.apply_shortcut(action);
+        let save_result = if outcome == config::ShortcutOutcome::Blocked {
+            Ok(())
+        } else {
+            cfg.save()
+        };
+        (outcome, cfg.ui_language, save_result)
+    };
+    log::info!("[SC-485] shortcut {:?} -> {:?}", action, outcome);
+    if let Err(e) = save_result {
+        // 内存里已切换（本次运行即生效）；落盘失败只影响重启后的状态。
+        log::warn!("[SC-485] failed to persist shortcut toggle: {}", e);
+    }
+    let s = i18n::get(ui_language);
+    let message = match (action, outcome) {
+        (_, config::ShortcutOutcome::Blocked) => s.shortcut_llm_blocked,
+        (config::ShortcutAction::LlmToggle, config::ShortcutOutcome::Enabled) => s.shortcut_llm_on,
+        (config::ShortcutAction::LlmToggle, config::ShortcutOutcome::Disabled) => {
+            s.shortcut_llm_off
+        }
+        (config::ShortcutAction::StripTrailingToggle, config::ShortcutOutcome::Enabled) => {
+            s.shortcut_strip_on
+        }
+        (config::ShortcutAction::StripTrailingToggle, config::ShortcutOutcome::Disabled) => {
+            s.shortcut_strip_off
+        }
+    }
+    .to_string();
+    let is_error = outcome == config::ShortcutOutcome::Blocked;
+    if shortcut_overlay_busy(is_recording) {
+        if let Ok(mut pending) = PENDING_SHORTCUT_INFO.lock() {
+            *pending = Some((message, is_error));
+        }
+    } else {
+        show_shortcut_info(overlay_handle, message, is_error, ui_language);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn show_shortcut_info(
+    overlay_handle: &OverlayThreadHandle,
+    message: String,
+    is_error: bool,
+    ui_language: config::UiLanguage,
+) {
+    let status = if is_error {
+        OverlayStatus::Error(message)
+    } else {
+        OverlayStatus::Info(message)
+    };
+    let (pos, size) = overlay_geometry(&status, overlay_handle.overlay_hwnd);
+    overlay_handle.send(OverlayCommand::Show(OverlayRequest {
+        status,
+        pos: Some(pos),
+        size,
+        opacity: 0.95,
+        ui_language,
+        auto_close_ms: if is_error { 2500 } else { 1500 },
+        target_hwnd: 0,
+    }));
 }
 /// Set or cancel auto-start on boot (via Windows registry)
 #[cfg(target_os = "windows")]
@@ -8823,19 +8956,17 @@ fn spawn_worker_thread(
                             continue;
                         }
                         // DEC-067 附则一：模型缺失/加载失败 → 明确报错，**绝不静默降级**到其他档位。
-                        let base = i18n::get(config.ui_language).local_realtime_unavailable;
-                        let detail = last_reload_error
-                            .as_deref()
-                            .and_then(|s| s.lines().next())
-                            .unwrap_or("");
-                        let message = if detail.is_empty() {
-                            base.to_string()
-                        } else {
-                            format!("{}：{}", base, detail)
-                        };
+                        // 浮层只显示 i18n 文案（DEC-067 附则一原文即「所选模型不可用」）；具体缺哪个
+                        // 模型是内部错误原文（中文 / 英文不定），10-14 起只进日志不上屏（Gavin「提示对话框
+                        // 文字一定都要走i18n」）。
+                        let message = i18n::get(config.ui_language)
+                            .local_realtime_unavailable
+                            .to_string();
                         log::error!(
                             "LocalRealtime unavailable, refusing to degrade to another tier: {}",
-                            message
+                            last_reload_error
+                                .as_deref()
+                                .unwrap_or("(no reload error recorded)")
                         );
                         is_recording.store(false, Ordering::Release);
                         send_event(&event_tx, PipelineEvent::ModelUnavailable(message));
@@ -11234,7 +11365,7 @@ fn overlay_request_for_event(event: &PipelineEvent) -> platform::OverlayRequest 
 /// Error/FormatFailed → ShowError（Error 2000ms / FormatFailed 2500ms 自动关闭）。
 /// OVERLAY-003：FocusLost → ShowPreview（失焦返显浮层，不自动关闭）；Done/Cancelled → Hide。
 /// overlay 指令由纯函数 `overlay_request_for_event` 统一计算（可单测锁死真值表）；
-/// 仅 FormatFailed 的文案在调用侧按 ui_language 补齐。
+/// FormatFailed / NoSpeech / Error 的文案在调用侧按 ui_language 补齐（Error 经 convert_to_friendly_error）。
 /// UI-REC-472：`localrt_loading` = 配置为本地实时且模型尚未加载完 ⇒ RecordingStarted 不弹录音窗。
 #[cfg(target_os = "macos")]
 fn handle_pipeline_event(
@@ -11245,6 +11376,11 @@ fn handle_pipeline_event(
     // OVERLAY-002: FormatFailed 的展示文案依赖 ui_language，纯函数拿不到，这里补齐后发请求。
     // 其余事件直接用纯函数的映射结果（overlay_request_for_event 是唯一决策源）。
     let req = match event {
+        // 10-14 i18n 收口：内部错误串不原文上屏，与 Windows 同走 convert_to_friendly_error。
+        PipelineEvent::Error(message) => platform::OverlayRequest::ShowError {
+            message: convert_to_friendly_error(message, ui_language),
+            auto_close_ms: 2000,
+        },
         PipelineEvent::FormatFailed => platform::OverlayRequest::ShowError {
             message: i18n::get(ui_language).format_failed_hint.to_string(),
             auto_close_ms: 2500,
@@ -20943,12 +21079,13 @@ mod nospeech_122_guard_tests {
     }
 
     /// H2: 产出源计数 —— src/transcription/ 下 bail!(NoSpeechError) /
-    /// bail!(super::NoSpeechError) 恰为 5 处（qwen:921 / qwen:1605 / mod:373 / mod:331 / mod:453）。
+    /// bail!(super::NoSpeechError) 恰为 6 处（qwen:921 / qwen:1605 / mod:373 / mod:331 / mod:453，
+    /// 10-14 新增 qwen 在线实时「VAD 未命中即松手」源，原为中文错误串「转录已取消：未检测到语音输入」）。
     /// 只数**代码行**（注释里的同名字面量以 `///`/`//` 开头被 startswith 排除）。
     /// 数量变化必须让人主动来改这条护栏（新增源是有意识行为）。
-    /// 消融路径：删任一真实 bail 处 → 计数 4 → 本测试红。
+    /// 消融路径：删任一真实 bail 处 → 计数 5 → 本测试红。
     #[test]
-    fn h2_nospeech_bail_sources_count_is_five() {
+    fn h2_nospeech_bail_sources_count_is_six() {
         let lines = transcription_prod_lines();
         let needles: [&str; 4] = [
             concat!("anyhow::bail!(NoSpeech", "Error)"),
@@ -20962,8 +21099,8 @@ mod nospeech_122_guard_tests {
             .sum::<usize>();
         assert_eq!(
             count,
-            5,
-            "H2: 产出源 bail!(NoSpeechError) 计数必须恰为 5（qwen:921/1605 + mod:331/373/453）；数量变化须主动改此护栏"
+            6,
+            "H2: 产出源 bail!(NoSpeechError) 计数必须恰为 6（qwen 三处 + mod:331/373/453）；数量变化须主动改此护栏"
         );
     }
 
@@ -24132,5 +24269,121 @@ mod punct478_online_tests {
             Some("the rule is the same but it depends".to_string())
         });
         assert_eq!(out, "the rule is the same but it depends");
+    }
+}
+
+// =====================================================================
+// I18N-ERR-485（10-14 Gavin「UI和提示对话框中的文字一定都要走i18n国际化」）：
+// 浮层错误提示不得原文直出内部错误串。锁两件事：
+//   1) 各模块真实的中文 / 英文内部错误串归到对应 i18n 文案；
+//   2) 英文界面下，任何内部错误（含未归类）显示的文案都不含中日韩字符。
+// 消融路径：把 convert_to_friendly_error 末尾改回 `message.to_string()` → E2 红。
+// =====================================================================
+#[cfg(test)]
+mod friendly_error_i18n_tests {
+    use super::convert_to_friendly_error;
+    use crate::config::UiLanguage;
+    use crate::i18n;
+
+    /// 各模块真实抛出的错误串（取自 transcription/qwen_inference.rs、local_stream.rs、
+    /// punctuation、worker 兜底等），中英混杂是常态。
+    const REAL_ERRORS: &[&str] = &[
+        "超时：服务端 10s 无响应",
+        "超时：等待 task-started 超时",
+        "网络失败：连接失败 - os error 10061",
+        "网络失败：发送音频帧失败 - broken pipe",
+        "网络失败：TLS 握手意外中断",
+        "服务端错误：InvalidParameter",
+        "鉴权失败：API Key 为空",
+        "在线 ASR 配置失败：API Key 为空（请在设置中配置 API Key）",
+        "日韩标点模型文件缺失: D:/models/punct.onnx",
+        "本地预览模型文件缺失: D:/models/paraformer.onnx",
+        "转录失败：音频样本为空",
+        "Transcriber unavailable",
+        "ASR thread panicked",
+        "ASR accuracy model produced empty output",
+        "Recording error: device lost",
+        "发送消息失败 - closed",
+        "某个从未见过的内部错误",
+    ];
+
+    fn has_cjk(s: &str) -> bool {
+        s.chars().any(|c| {
+            ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c)
+        })
+    }
+
+    /// E1: 中文内部错误串按语义归类（此前只认英文关键词，中文串全部原文上屏）。
+    #[test]
+    fn e1_chinese_internal_errors_are_classified() {
+        let s = i18n::get(UiLanguage::Chinese);
+        let cases: &[(&str, &str)] = &[
+            ("超时：服务端 10s 无响应", s.error_network_timeout),
+            ("网络失败：连接失败 - x", s.error_api_unavailable),
+            ("网络失败：发送音频帧失败 - x", s.error_api_unavailable),
+            ("鉴权失败：API Key 为空", s.error_api_unavailable),
+            ("服务端错误：InvalidParameter", s.error_api_unavailable),
+            ("日韩标点模型文件缺失: a.onnx", s.error_model_init),
+            ("Transcriber unavailable", s.error_model_init),
+            ("转录失败：音频样本为空", s.error_microphone),
+            ("ASR thread panicked", s.error_unexpected),
+            ("某个从未见过的内部错误", s.error_unexpected),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(
+                convert_to_friendly_error(raw, UiLanguage::Chinese),
+                *want,
+                "E1: {raw:?} 归类错误"
+            );
+        }
+    }
+
+    /// E2: 英文界面下，所有真实内部错误显示的文案都不含中文（原文直出即红）。
+    #[test]
+    fn e2_english_ui_never_shows_cjk() {
+        for raw in REAL_ERRORS {
+            let shown = convert_to_friendly_error(raw, UiLanguage::English);
+            assert!(
+                !has_cjk(&shown),
+                "E2: 英文界面显示了中文：{raw:?} → {shown:?}"
+            );
+        }
+    }
+
+    /// E3: 显示的文案一定是当前语言 i18n 表里的某一条，绝不是内部原文。
+    #[test]
+    fn e3_shown_text_always_comes_from_i18n_table() {
+        for lang in [
+            UiLanguage::Chinese,
+            UiLanguage::TraditionalChinese,
+            UiLanguage::English,
+        ] {
+            let s = i18n::get(lang);
+            let table = [
+                s.error_network_timeout,
+                s.error_api_unavailable,
+                s.error_model_init,
+                s.error_microphone,
+                s.error_mic_muted,
+                s.error_unexpected,
+            ];
+            for raw in REAL_ERRORS {
+                let shown = convert_to_friendly_error(raw, lang);
+                assert!(
+                    table.contains(&shown.as_str()),
+                    "E3: {lang:?} 下 {raw:?} 显示了表外文案 {shown:?}"
+                );
+            }
+        }
+    }
+
+    /// E4: 新增的通用文案三份 locale 齐全、各自语种正确。
+    #[test]
+    fn e4_error_unexpected_three_locales() {
+        let zh = i18n::get(UiLanguage::Chinese).error_unexpected;
+        let tw = i18n::get(UiLanguage::TraditionalChinese).error_unexpected;
+        let en = i18n::get(UiLanguage::English).error_unexpected;
+        assert!(has_cjk(zh) && has_cjk(tw) && !has_cjk(en));
+        assert_ne!(zh, tw, "E4: 繁体须独立文案，不得照抄简体");
     }
 }

@@ -613,6 +613,50 @@ pub(crate) struct AccDispositionOutcome {
     pub guard: GuardKind,
     /// FIX-ACC-OUTPUT-GUARD-387：重解后仍无效（已返回空串）。
     pub invalid: bool,
+    /// WB-ECHO-483：整句恰为词条、且不带词库重解的读音与之相近 ⇒ **保留带词库结果**（词库纠对了同音 / 近音字）。
+    pub kept_biased: bool,
+}
+
+/// WB-ECHO-483：「整句恰为词条」时，带词库结果与不带词库重解的**读音相似度**下限（0~1）。
+///
+/// Gavin 10-14 端测三例（只说词条「八方思见说」「八方思见说频道」）：重解「八方思建说 / 八方世界说 /
+/// 八方四界说频道」与词条读音相似度 1.00 / 0.81 / 0.91；真回显（模型对着别的话冒出一个词条）
+/// 两者读音几乎无关（≈0.1~0.3）。取 0.6，两侧都留足余量。
+const ECHO_SOUNDALIKE_MIN_SIM: f32 = 0.6;
+
+/// WB-ECHO-483：读音键 —— 汉字转无调拼音（`八方` → `bafang`），字母数字转小写，标点 / 空白略去。
+/// 汉字一字一音节，「隋变 / 随便」这类字形全异的同音词也能比出来。
+fn phonetic_key(text: &str) -> Vec<char> {
+    use pinyin::ToPinyin;
+    let mut key = Vec::with_capacity(text.len());
+    for c in text.chars() {
+        if let Some(p) = c.to_pinyin() {
+            key.extend(p.plain().chars());
+        } else if c.is_alphanumeric() {
+            key.extend(c.to_lowercase());
+        }
+    }
+    key
+}
+
+/// WB-ECHO-483：两段文字的读音相似度 = 1 − 读音键编辑距离 / 较长读音键长度（任一为空 ⇒ 0）。
+fn phonetic_similarity(a: &str, b: &str) -> f32 {
+    let (ka, kb) = (phonetic_key(a), phonetic_key(b));
+    let longest = ka.len().max(kb.len());
+    if ka.is_empty() || kb.is_empty() {
+        return 0.0;
+    }
+    let mut prev: Vec<usize> = (0..=kb.len()).collect();
+    let mut cur = vec![0usize; kb.len() + 1];
+    for (i, ca) in ka.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in kb.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != cb);
+            cur[j + 1] = sub.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    1.0 - prev[kb.len()] as f32 / longest as f32
 }
 
 /// FIX-WINDOW-TRIM-AND-OUTPUT-FLOOR-388（D1）：文本是否**含实质内容** —— 至少 1 个
@@ -729,6 +773,10 @@ fn all_segments_are_terms(text: &str, terms: Option<&str>) -> bool {
 ///
 /// 重解结果校验：非空 **且** 无连续 ≥4 条词条回显 **且**（非坍塌触发 或 产出率通过）⇒ 用它；
 /// 否则 ⇒ 返回空串（由 386-C 用流式文本兜底；`outcome.invalid=true`）。
+///
+/// WB-ECHO-483：**只**因「整句恰为词条」触发（无连续 ≥4 条回显）时，重解结果先当读音参照 ——
+/// 与带词库结果读音相近（[`ECHO_SOUNDALIKE_MIN_SIM`]）⇒ 保留带词库结果（`kept_biased=true`）；
+/// 否则走上面的原校验。连续 ≥4 条的列表回显不受影响。
 fn apply_acc_disposition(
     text: String,
     terms: Option<&str>,
@@ -750,6 +798,9 @@ fn apply_acc_disposition(
     let residual_all_terms =
         !stripped.trim().is_empty() && all_segments_are_terms(&stripped, terms);
     let echo_hit = matched_terms > 0 || residual_all_terms;
+    // WB-ECHO-483：**只**因「整句恰为词条」触发（没有连续 ≥4 条的列表回显）—— 用户本来就可能
+    // 只说一个词条（Gavin 10-14「八方思见说」被判回显、改用重解「八方思建说」）⇒ 重解后比读音再定。
+    let terms_only_output = matched_terms == 0 && residual_all_terms;
 
     let mut outcome = AccDispositionOutcome {
         matched_terms,
@@ -759,6 +810,7 @@ fn apply_acc_disposition(
         collapse: false,
         guard: GuardKind::None,
         invalid: false,
+        kept_biased: false,
     };
 
     let trigger = if echo_hit {
@@ -793,6 +845,27 @@ fn apply_acc_disposition(
     let acceptable = has_content(&recovered)
         && !still_echo
         && output_rate_ok(recovered.chars().count(), audio_secs, avg_chars_per_sec);
+    // WB-ECHO-483：护栏触发时记两次原文（下次端测可直接看到带 / 不带词库各出了什么）。
+    log::debug!(
+        "[LocalRT-DBG-483] guard={} first={:?} redecode={:?}",
+        kind.as_str(),
+        text,
+        raw
+    );
+    // WB-ECHO-483：整句恰为词条 ⇒ 不带词库的重解当「读音参照」：读音相近 ⇒ 词库纠的是同音 / 近音字，
+    // 保留带词库结果；读音不同（重解为空 / 说的是别的话）⇒ 才是真回显，维持 387-2 原处置。
+    if terms_only_output && has_content(&recovered) {
+        let sim = phonetic_similarity(&stripped, &recovered);
+        log::debug!(
+            "[LocalRT-DBG-483] terms-only output: sim={:.2} keep_biased={}",
+            sim,
+            sim >= ECHO_SOUNDALIKE_MIN_SIM
+        );
+        if sim >= ECHO_SOUNDALIKE_MIN_SIM {
+            outcome.kept_biased = true;
+            return (stripped, outcome);
+        }
+    }
     if acceptable {
         (recovered, outcome)
     } else {
@@ -1580,6 +1653,8 @@ pub(crate) fn transcribe_acc_ctx(
     if log::log_enabled!(log::Level::Debug) {
         let action387 = if !disp.redecoded {
             "keep"
+        } else if disp.kept_biased {
+            "keep-biased" // WB-ECHO-483：读音相近 ⇒ 保留带词库结果
         } else if text.is_empty() {
             "empty"
         } else {
@@ -8194,5 +8269,120 @@ mod punct478_tests {
             "这应该都是文化之间的差异，但是，根本的法则"
         );
         assert_eq!(out_t.len(), out.chars().count(), "时间与文字逐字对应");
+    }
+}
+
+// WB-ECHO-483：「整句恰为词条」时按读音裁决（Gavin 10-14「在用户词库添加了词条：八方思见说、八方思见说频道，
+// 为啥在语音录入时精确模型没有根据词库注入准确识别修正输出？」——带词库那次认对了，被回显护栏判成复读词库作废）。
+#[cfg(test)]
+mod wb483_tests {
+    use super::{apply_acc_disposition, phonetic_similarity, GuardKind, ECHO_SOUNDALIKE_MIN_SIM};
+    use std::cell::Cell;
+
+    /// Gavin 词库原样（10-14 `target/release/wordbook.sqlite`，39 条，按 id DESC 逗号连接）。
+    const GAVIN_TERMS: &str = "M2,coder1,coder2,workbuddy,囚牢,思见频道,LLM,维生素B12,tester1,YouTube,WhatsApp,MCP,漫剧,风无心,摄氏度,隋变,派安盈,主控,罗斯柴尔德,低质,子未穿害,费曼学习法,未戌刑,Blender,采编,文案,八方思见说频道,Cloud,铭印,艾丁湖,ud,你好,朵洛莉丝,银线,八方思见说,思见说,挂毯,灵界";
+
+    fn run(first: &str, redecode: &str) -> (String, super::AccDispositionOutcome, usize) {
+        let calls = Cell::new(0usize);
+        let (out, oc) =
+            apply_acc_disposition(first.to_string(), Some(GAVIN_TERMS), 1.9, None, || {
+                calls.set(calls.get() + 1);
+                Ok(redecode.to_string())
+            });
+        (out, oc, calls.get())
+    }
+
+    /// Gavin 端测三例原样（debug.log 20:16:38 / 20:16:44 / 20:16:56）：带词库认对 → 重解认错 ⇒ 现在保留带词库结果。
+    #[test]
+    fn wb483_gavin_three_cases_keep_biased_output() {
+        for (first, redecode) in [
+            ("八方思见说。", "八方思建说。"),
+            ("八方思见说。", "八方世界说。"),
+            ("八方思见说频道。", "八方四界说频道。"),
+        ] {
+            let (out, oc, calls) = run(first, redecode);
+            assert_eq!(
+                out, first,
+                "读音相近 ⇒ 必须保留带词库结果（重解={redecode}）"
+            );
+            assert_eq!(oc.guard, GuardKind::Echo);
+            assert!(oc.redecoded && oc.kept_biased && !oc.invalid);
+            assert_eq!(calls, 1, "仍只重解一次");
+        }
+    }
+
+    /// 字形全异的同音词（`隋变` / `随便`）同样保留 —— 比的是读音不是字。
+    #[test]
+    fn wb483_homophone_with_different_characters_kept() {
+        let (out, oc, _) = run("隋变。", "随便。");
+        assert_eq!(out, "隋变。");
+        assert!(oc.kept_biased);
+        // 两个词条之间停顿的整句（用户连说两个词条）同理。
+        let (out2, oc2, _) = run(
+            "八方思见说，八方思见说频道。",
+            "八方思建说，八方世界说频道。",
+        );
+        assert_eq!(out2, "八方思见说，八方思见说频道。");
+        assert!(oc2.kept_biased);
+    }
+
+    /// 真回显（说的是别的话，模型冒出一个词条）⇒ 读音不同 ⇒ 维持 387-2 原处置：用重解。
+    #[test]
+    fn wb483_lone_term_over_unrelated_speech_still_uses_redecode() {
+        let (out, oc, calls) = run("灵界。", "好的呀。");
+        assert_eq!(out, "好的呀。");
+        assert_eq!(oc.guard, GuardKind::Echo);
+        assert!(oc.redecoded && !oc.kept_biased && !oc.invalid);
+        assert_eq!(calls, 1);
+    }
+
+    /// 真回显且重解为空（静音上冒词条）⇒ 维持原处置：无效、返回空（交流式兜底）。
+    #[test]
+    fn wb483_lone_term_with_empty_redecode_stays_invalid() {
+        let (out, oc, _) = run("灵界", "");
+        assert_eq!(out, "");
+        assert!(oc.invalid && !oc.kept_biased);
+    }
+
+    /// 连续 ≥4 条的列表回显不走读音裁决（即使重解读音相近也不保留带词库结果）。
+    #[test]
+    fn wb483_list_echo_unaffected() {
+        let (out, oc, _) = run("M2，coder1，coder2，workbuddy，囚牢", "真实内容");
+        assert!(oc.matched_terms >= 4);
+        assert!(!oc.kept_biased);
+        assert_eq!(out, "真实内容");
+    }
+
+    /// 句中带词条（还有别的话）本就不触发护栏 —— 行为不变。
+    #[test]
+    fn wb483_term_inside_sentence_untouched() {
+        let (out, oc, calls) = run("我的YouTube频道是八方思见说频道。", "x");
+        assert_eq!(out, "我的YouTube频道是八方思见说频道。");
+        assert_eq!(oc.guard, GuardKind::None);
+        assert_eq!(calls, 0);
+    }
+
+    /// 读音相似度：Gavin 三例远高于阈值，无关内容远低于阈值；标点 / 大小写不影响。
+    #[test]
+    fn wb483_phonetic_similarity_margins() {
+        let near = [
+            phonetic_similarity("八方思见说", "八方思建说"),
+            phonetic_similarity("八方思见说", "八方世界说"),
+            phonetic_similarity("八方思见说频道", "八方四界说频道"),
+        ];
+        assert!((near[0] - 1.0).abs() < 1e-6, "{near:?}");
+        for s in near {
+            assert!(
+                s >= ECHO_SOUNDALIKE_MIN_SIM + 0.15,
+                "相近例须留足余量：{near:?}"
+            );
+        }
+        let far = phonetic_similarity("灵界", "好的呀");
+        assert!(
+            far < ECHO_SOUNDALIKE_MIN_SIM - 0.2,
+            "无关例须远低于阈值：{far}"
+        );
+        assert!((phonetic_similarity("WhatsApp。", "whats app") - 1.0).abs() < 1e-6);
+        assert_eq!(phonetic_similarity("", "八方"), 0.0);
     }
 }

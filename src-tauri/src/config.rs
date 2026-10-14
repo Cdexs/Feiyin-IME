@@ -305,6 +305,49 @@ pub struct AppConfig {
     pub punctuation: PunctuationConfig,
     #[serde(default)]
     pub scene: SceneConfig,
+    /// SC-LLM-485 / SC-PUNCT-486: feature-toggle shortcuts. Mirrors `src/config/mod.rs`;
+    /// must stay in sync or the UI save path silently drops the table.
+    #[serde(default)]
+    pub shortcuts: ShortcutsConfig,
+}
+
+/// SC-LLM-485 / SC-PUNCT-486: one sided Ctrl/Alt (VK 0xA2..=0xA5) + one letter/digit; 0 = unset.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShortcutBinding {
+    pub modifier: u32,
+    pub key: u32,
+}
+
+/// Defaults (modifier, key): 右Ctrl+1 / 右Ctrl+2 — same values as the main config
+/// (`src/config/mod.rs` guard `settings_ui_mirror_uses_same_defaults` greps these two lines).
+pub const DEFAULT_LLM_TOGGLE_SHORTCUT: (u32, u32) = (0xA3, 0x31);
+pub const DEFAULT_STRIP_TRAILING_SHORTCUT: (u32, u32) = (0xA3, 0x32);
+
+fn default_llm_toggle_shortcut() -> ShortcutBinding {
+    let (modifier, key) = DEFAULT_LLM_TOGGLE_SHORTCUT;
+    ShortcutBinding { modifier, key }
+}
+
+fn default_strip_trailing_shortcut() -> ShortcutBinding {
+    let (modifier, key) = DEFAULT_STRIP_TRAILING_SHORTCUT;
+    ShortcutBinding { modifier, key }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShortcutsConfig {
+    #[serde(default = "default_llm_toggle_shortcut")]
+    pub llm_toggle: ShortcutBinding,
+    #[serde(default = "default_strip_trailing_shortcut")]
+    pub strip_trailing_toggle: ShortcutBinding,
+}
+
+impl Default for ShortcutsConfig {
+    fn default() -> Self {
+        Self {
+            llm_toggle: default_llm_toggle_shortcut(),
+            strip_trailing_toggle: default_strip_trailing_shortcut(),
+        }
+    }
 }
 
 fn default_scene_enabled() -> bool {
@@ -341,6 +384,7 @@ impl Default for AppConfig {
             translation: TranslationConfig::default(),
             punctuation: PunctuationConfig::default(),
             scene: SceneConfig::default(),
+            shortcuts: ShortcutsConfig::default(),
         }
     }
 }
@@ -447,6 +491,7 @@ mod tests {
             translation: TranslationConfig::default(),
             punctuation: PunctuationConfig::default(),
             scene: SceneConfig::default(),
+            shortcuts: ShortcutsConfig::default(),
         }
     }
 

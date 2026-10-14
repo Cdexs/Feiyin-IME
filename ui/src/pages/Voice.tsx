@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from "@tauri-apps/api/core";
 import { getTranslations } from '../i18n';
+import ShortcutSetting from '../components/ShortcutSetting';
 
 interface Props {
   config: any;
@@ -373,19 +374,23 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
             <span className="toggle-label">{t.voice_auto_punctuation}</span>
           </label>
           {/* V091-PUNCT-TAIL-214: 句尾不显示标点符号（默认关，绑 punctuation.strip_trailing） */}
-          <label className="toggle-switch" style={{ border: 'none', boxShadow: 'none', padding: '8px 0', marginBottom: '4px' }}>
-            <input
-              type="checkbox"
-              checked={config.punctuation?.strip_trailing ?? false}
-              onChange={(e) => updateConfig({
-                ...config,
-                punctuation: { ...config.punctuation, strip_trailing: e.target.checked }
-              })}
-              className="toggle-input"
-            />
-            <span className="toggle-track"></span>
-            <span className="toggle-label">{t.voice_strip_trailing_punct}</span>
-          </label>
+          {/* SC-PUNCT-486：后接快捷方式链接（在 label 外，点链接不拨动开关） */}
+          <div className="toggle-row">
+            <label className="toggle-switch" style={{ border: 'none', boxShadow: 'none', padding: '8px 0', marginBottom: '4px' }}>
+              <input
+                type="checkbox"
+                checked={config.punctuation?.strip_trailing ?? false}
+                onChange={(e) => updateConfig({
+                  ...config,
+                  punctuation: { ...config.punctuation, strip_trailing: e.target.checked }
+                })}
+                className="toggle-input"
+              />
+              <span className="toggle-track"></span>
+              <span className="toggle-label">{t.voice_strip_trailing_punct}</span>
+            </label>
+            <ShortcutSetting config={config} updateConfig={updateConfig} action="strip_trailing_toggle" />
+          </div>
           <p className="form-hint" style={{ marginBottom: '12px' }}>{t.voice_strip_trailing_punct_hint}</p>
           <div className="form-group" style={{ marginTop: '16px' }}>
             <span className="form-label">{t.voice_chinese_output}</span>

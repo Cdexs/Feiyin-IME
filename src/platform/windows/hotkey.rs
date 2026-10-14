@@ -7,21 +7,26 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::core::w;
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::SystemInformation::GetTickCount64;
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::System::Threading::{
+    GetCurrentThreadId, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
-    MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    GetAsyncKeyState, RegisterHotKey, SendInput, UnregisterHotKey, HOT_KEY_MODIFIERS, INPUT,
+    INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
+    MOD_SHIFT, MOD_WIN, VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LWIN, VK_MENU,
+    VK_RCONTROL, VK_RMENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, KillTimer, MsgWaitForMultipleObjects, PeekMessageW, PostMessageW,
     PostThreadMessageW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
-    MSG, PM_REMOVE, QS_ALLINPUT, WH_KEYBOARD_LL, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_QUIT,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+    LLKHF_INJECTED, MSG, PM_REMOVE, QS_ALLINPUT, WH_KEYBOARD_LL, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
+    WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
 };
 
-use crate::config::{AppConfig, HotkeyMode};
+use crate::config::{AppConfig, HotkeyMode, ShortcutAction, ShortcutBinding};
 
 const HOTKEY_ID: i32 = 1;
 const CONFIG_TIMER_ID: usize = 1;
@@ -222,6 +227,12 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
         let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         let target_vk = TARGET_VK.load(Ordering::Relaxed);
 
+        // SC-LLM-485-2：设置界面正在录快捷方式 ⇒ 录音热键原样放行（不开录、不吞键），
+        // 设置界面才能看到这个功能键并标红「已设置为录音热键」。只在目标键事件上查，开销可忽略。
+        if kb.vkCode == target_vk && shortcut_capture_active() {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+
         if kb.vkCode == target_vk {
             // FIX-PREVIEW-HARVEST-380（B）：记录**本事件的**系统 tick（DOWN/UP 都记，
             // 见 LAST_HOOK_EVENT_TICK 注释）——PTT 的 Stop 在 KEYUP、Toggle 在二次 DOWN，
@@ -395,12 +406,222 @@ fn uninstall_keyboard_hook() {
     TRANSLATE_POLL_STOP.store(true, Ordering::Relaxed);
 }
 
+// ===========================================================================
+// SC-LLM-485 / SC-PUNCT-486（Gavin 10-14）：功能开关快捷方式（分左右的 Ctrl/Alt + 字母/数字）
+// ===========================================================================
+
+/// 快捷方式顺序（与 [`SC_BINDINGS`] 下标一一对应）。
+const SC_ACTIONS: [ShortcutAction; 2] = [
+    ShortcutAction::LlmToggle,
+    ShortcutAction::StripTrailingToggle,
+];
+/// 生效中的快捷方式打包值 `modifier << 8 | key`（0 = 不生效）。由 [`sync_shortcuts`] 按配置写入。
+static SC_BINDINGS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+static SC_HOOK: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+static SC_SENDER: AtomicPtr<crossbeam_channel::Sender<HotkeyEvent>> =
+    AtomicPtr::new(std::ptr::null_mut());
+static SC_WAKE_HWND: AtomicIsize = AtomicIsize::new(0);
+static SC_WAKE_MSG: AtomicU32 = AtomicU32::new(0);
+/// 已被快捷方式吃掉、尚未松开的主键：其 auto-repeat 与 KEYUP 一并吞掉（不让目标窗口收到半个按键、
+/// 也不因长按反复切换）。
+static SC_HELD_KEY: AtomicU32 = AtomicU32::new(0);
+/// Alt 菜单屏蔽键（未分配 VK，AutoHotkey 同款做法）：Alt+键被吞后补一对它，
+/// 防止目标窗口把「Alt 按下→松开」当成单击 Alt 激活菜单栏。
+const MENU_MASK_VK: u16 = 0xE8;
+
+/// 设置界面录快捷方式时按住的四个功能键 + Shift / Win 的物理状态。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ModState {
+    lctrl: bool,
+    rctrl: bool,
+    lalt: bool,
+    ralt: bool,
+    shift: bool,
+    win: bool,
+}
+
+fn pack_shortcut(b: ShortcutBinding) -> u32 {
+    (b.modifier << 8) | b.key
+}
+
+/// 按下 `vk` 时命中第几个快捷方式：主键相同，且**恰好**按住该功能键（另三个 Ctrl/Alt、Shift、Win 都没按）。
+/// AltGr（系统同时报 左Ctrl + 右Alt）因此不会误触 右Alt 快捷方式。纯函数，可单测。
+fn match_shortcut(vk: u32, mods: ModState, packed: &[u32; 2]) -> Option<usize> {
+    if !matches!(vk, 0x30..=0x39 | 0x41..=0x5A) || mods.shift || mods.win {
+        return None;
+    }
+    let have = [mods.lctrl, mods.rctrl, mods.lalt, mods.ralt];
+    packed.iter().position(|&p| {
+        let m = p >> 8;
+        p != 0 && (p & 0xFF) == vk && have == [m == 0xA2, m == 0xA3, m == 0xA4, m == 0xA5]
+    })
+}
+
+fn key_down(vk: VIRTUAL_KEY) -> bool {
+    unsafe { (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0 }
+}
+
+fn current_mod_state() -> ModState {
+    ModState {
+        lctrl: key_down(VK_LCONTROL),
+        rctrl: key_down(VK_RCONTROL),
+        lalt: key_down(VK_LMENU),
+        ralt: key_down(VK_RMENU),
+        shift: key_down(VK_SHIFT),
+        win: key_down(VK_LWIN) || key_down(VK_RWIN),
+    }
+}
+
+/// 设置界面是否正在录快捷方式（它持有命名互斥量 `Local\FeiyinIME.ShortcutCapture`，
+/// 见 src-tauri `set_shortcut_capture`）。设置进程退出 / 崩溃时系统自动释放 ⇒ 拦截不会被永久关掉。
+fn shortcut_capture_active() -> bool {
+    unsafe {
+        match OpenMutexW(
+            SYNCHRONIZATION_SYNCHRONIZE,
+            false,
+            w!("Local\\FeiyinIME.ShortcutCapture"),
+        ) {
+            Ok(handle) => {
+                let _ = CloseHandle(handle);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+fn send_menu_mask_key() {
+    let mk = |flags| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(MENU_MASK_VK),
+                dwFlags: flags,
+                ..Default::default()
+            },
+        },
+    };
+    let inputs = [mk(Default::default()), mk(KEYEVENTF_KEYUP)];
+    unsafe {
+        let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+/// 快捷方式钩子：只认真实按键（忽略注入事件，含自己补发的菜单屏蔽键）。
+unsafe extern "system" fn shortcut_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 {
+        let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        let msg = wparam.0 as u32;
+        let vk = kb.vkCode;
+        if (kb.flags.0 & LLKHF_INJECTED.0) == 0 {
+            if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
+                if vk != 0 && SC_HELD_KEY.load(Ordering::Relaxed) == vk {
+                    return LRESULT(1); // 长按的 auto-repeat：吞掉、不重复切换
+                }
+                let packed = [
+                    SC_BINDINGS[0].load(Ordering::Relaxed),
+                    SC_BINDINGS[1].load(Ordering::Relaxed),
+                ];
+                if let Some(idx) = match_shortcut(vk, current_mod_state(), &packed) {
+                    if !shortcut_capture_active() {
+                        SC_HELD_KEY.store(vk, Ordering::Relaxed);
+                        if packed[idx] >> 8 >= 0xA4 {
+                            send_menu_mask_key();
+                        }
+                        let sender_ptr = SC_SENDER.load(Ordering::Relaxed);
+                        if !sender_ptr.is_null() {
+                            let hwnd = SC_WAKE_HWND.load(Ordering::Relaxed);
+                            let message = SC_WAKE_MSG.load(Ordering::Relaxed);
+                            send_hotkey_event(
+                                &*sender_ptr,
+                                HotkeyEvent::Shortcut(SC_ACTIONS[idx]),
+                                (hwnd != 0 && message != 0).then_some(WakeTarget { hwnd, message }),
+                            );
+                        }
+                        return LRESULT(1);
+                    }
+                }
+            } else if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
+                && vk != 0
+                && SC_HELD_KEY
+                    .compare_exchange(vk, 0, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return LRESULT(1);
+            }
+        }
+    }
+    CallNextHookEx(None, code, wparam, lparam)
+}
+
+/// 按配置刷新快捷方式（启动 + 每次配置变更）：写入生效绑定；有任一生效 ⇒ 装钩子，全无 ⇒ 卸钩子。
+/// 与热键冲突 / 未设置 / 重复的绑定由 [`AppConfig::active_shortcuts`] 剔除（冲突的按了也不生效）。
+fn sync_shortcuts(
+    shared_config: &Arc<RwLock<AppConfig>>,
+    sender: &crossbeam_channel::Sender<HotkeyEvent>,
+    wake_target: Option<WakeTarget>,
+) {
+    let active = match shared_config.read() {
+        Ok(cfg) => cfg.active_shortcuts(),
+        Err(poisoned) => poisoned.into_inner().active_shortcuts(),
+    };
+    let mut packed = [0u32; 2];
+    for (action, binding) in active {
+        if let Some(i) = SC_ACTIONS.iter().position(|a| *a == action) {
+            packed[i] = pack_shortcut(binding);
+        }
+    }
+    let mut changed = false;
+    for (slot, value) in SC_BINDINGS.iter().zip(packed) {
+        changed |= slot.swap(value, Ordering::Relaxed) != value;
+    }
+    SC_SENDER.store(sender as *const _ as *mut _, Ordering::Relaxed);
+    SC_WAKE_HWND.store(wake_target.map(|t| t.hwnd).unwrap_or(0), Ordering::Relaxed);
+    SC_WAKE_MSG.store(
+        wake_target.map(|t| t.message).unwrap_or(0),
+        Ordering::Relaxed,
+    );
+
+    let want_hook = packed.iter().any(|p| *p != 0);
+    let has_hook = !SC_HOOK.load(Ordering::Relaxed).is_null();
+    if want_hook && !has_hook {
+        match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(shortcut_hook_proc), None, 0) } {
+            Ok(hook) => SC_HOOK.store(hook.0, Ordering::Relaxed),
+            Err(e) => log::warn!("[SC-485] shortcut hook install failed: {}", e),
+        }
+    } else if !want_hook && has_hook {
+        uninstall_shortcut_hook();
+    }
+    if changed || want_hook != has_hook {
+        log::info!(
+            "[SC-485] shortcuts: llm={:#06x} strip={:#06x} hook={}",
+            packed[0],
+            packed[1],
+            want_hook
+        );
+    }
+}
+
+fn uninstall_shortcut_hook() {
+    let hook_ptr = SC_HOOK.swap(std::ptr::null_mut(), Ordering::Relaxed);
+    if !hook_ptr.is_null() {
+        unsafe {
+            let _ = UnhookWindowsHookEx(HHOOK(hook_ptr));
+        }
+    }
+    SC_HELD_KEY.store(0, Ordering::Relaxed);
+}
+
 /// Hotkey event types
 #[derive(Debug, Clone)]
 pub enum HotkeyEvent {
-    Start { translate: Arc<AtomicBool> },
+    Start {
+        translate: Arc<AtomicBool>,
+    },
     Stop,
     CancelStop,
+    /// SC-LLM-485 / SC-PUNCT-486：功能开关快捷方式被按下（控制器切换开关 + 提示窗）。
+    Shortcut(ShortcutAction),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -547,6 +768,9 @@ fn run_listener(
     unsafe {
         let _ = KillTimer(HWND::default(), CONFIG_TIMER_ID);
     }
+    // SC-LLM-485：先摘快捷方式钩子再丢 sender（钩子持有 tx 的裸指针）。
+    uninstall_shortcut_hook();
+    SC_SENDER.store(std::ptr::null_mut(), Ordering::Relaxed);
     if let Some(binding) = state.current_binding.take() {
         if state.uses_hook {
             uninstall_keyboard_hook();
@@ -564,6 +788,8 @@ fn sync_binding(
     state: &mut ListenerState,
     wake_target: Option<WakeTarget>,
 ) -> Result<()> {
+    // SC-LLM-485：快捷方式随每次配置同步刷新（必须在下面「录音热键未变 ⇒ 早退」之前）。
+    sync_shortcuts(shared_config, sender, wake_target);
     let (binding, translation_vk) = clone_hotkey_binding(shared_config);
     TRANSLATION_VK.store(translation_vk, Ordering::Relaxed);
 
@@ -1577,5 +1803,85 @@ mod tests {
             block_contains(&lines, anchor, "notify_translate_poll_stop()"),
             "G7: mic-muted rejection exit must call notify_translate_poll_stop() before continue (B3 residual)"
         );
+    }
+}
+
+/// SC-LLM-485 / SC-PUNCT-486：快捷方式按键匹配（纯函数）。
+#[cfg(test)]
+mod sc485_tests {
+    use super::*;
+
+    const RCTRL_1: u32 = (0xA3 << 8) | 0x31;
+    const RCTRL_2: u32 = (0xA3 << 8) | 0x32;
+    const RALT_K: u32 = (0xA5 << 8) | 0x4B;
+
+    fn mods(lctrl: bool, rctrl: bool, lalt: bool, ralt: bool) -> ModState {
+        ModState {
+            lctrl,
+            rctrl,
+            lalt,
+            ralt,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn exact_sided_modifier_matches_its_slot() {
+        let packed = [RCTRL_1, RCTRL_2];
+        let rctrl = mods(false, true, false, false);
+        assert_eq!(match_shortcut(0x31, rctrl, &packed), Some(0));
+        assert_eq!(match_shortcut(0x32, rctrl, &packed), Some(1));
+        assert_eq!(match_shortcut(0x33, rctrl, &packed), None);
+    }
+
+    #[test]
+    fn other_side_or_extra_modifier_does_not_match() {
+        let packed = [RCTRL_1, 0];
+        // 左Ctrl+1（浏览器切标签）不能被 右Ctrl+1 吃掉
+        assert_eq!(
+            match_shortcut(0x31, mods(true, false, false, false), &packed),
+            None
+        );
+        // 两个 Ctrl 一起按
+        assert_eq!(
+            match_shortcut(0x31, mods(true, true, false, false), &packed),
+            None
+        );
+        // 夹带 Shift / Win
+        let mut m = mods(false, true, false, false);
+        m.shift = true;
+        assert_eq!(match_shortcut(0x31, m, &packed), None);
+        let mut m = mods(false, true, false, false);
+        m.win = true;
+        assert_eq!(match_shortcut(0x31, m, &packed), None);
+        // 没按功能键
+        assert_eq!(match_shortcut(0x31, ModState::default(), &packed), None);
+    }
+
+    #[test]
+    fn altgr_does_not_trigger_right_alt_shortcut() {
+        // AltGr 布局下系统同时报 左Ctrl + 右Alt —— AltGr+键是在打字（如德语 AltGr+Q = @），不能拦。
+        let packed = [RALT_K, 0];
+        assert_eq!(
+            match_shortcut(0x4B, mods(false, false, false, true), &packed),
+            Some(0)
+        );
+        assert_eq!(
+            match_shortcut(0x4B, mods(true, false, false, true), &packed),
+            None
+        );
+    }
+
+    #[test]
+    fn unset_slot_and_non_alnum_key_never_match() {
+        let packed = [0, RCTRL_2];
+        let rctrl = mods(false, true, false, false);
+        assert_eq!(match_shortcut(0x31, rctrl, &packed), None);
+        assert_eq!(match_shortcut(0x70, rctrl, &[(0xA3 << 8) | 0x70, 0]), None);
+    }
+
+    #[test]
+    fn pack_matches_config_binding() {
+        assert_eq!(pack_shortcut(ShortcutBinding::new(0xA3, 0x31)), RCTRL_1);
     }
 }

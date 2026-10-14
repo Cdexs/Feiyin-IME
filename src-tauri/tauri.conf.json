@@ -6,7 +6,7 @@
     "frontendDist": "../ui/dist"
   },
   "productName": "飞音智能语音输入",
-  "version": "0.9.5",
+  "version": "0.9.6",
   "identifier": "com.feiyin.voice-ime",
   "app": {
     "withGlobalTauri": true,

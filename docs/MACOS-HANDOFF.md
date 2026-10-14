@@ -2755,3 +2755,21 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 对 macOS 的影响 | 同代码生效。macOS 若另有调用 `transcribe_streaming_realtime` / `run_pipeline_core` 的地方须同步改（编译会报类型 / 缺参） |
 | 是否需要对方同步 | 是：编译验证 |
 
+
+## 0.9.6 · WB-ECHO-483 / UI-RENAME-484 / SC-LLM-485 / SC-PUNCT-486（2026-10-14，主控）
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | ① 平台中立 `src/transcription/mod.rs`：本地实时回显护栏「整句恰为词条」改读音仲裁（`phonetic_key` / `phonetic_similarity` / `ECHO_SOUNDALIKE_MIN_SIM`，DEC-109）；**新依赖 `pinyin = 0.11`（纯 Rust，`default-features = false, features = ["plain"]`）** ② 设置界面文案「格式化输出」→「识别输出优化」（三语 i18n）③ 平台中立 `src/config/mod.rs`：新 `[shortcuts]` 段（`ShortcutBinding` / `ShortcutsConfig` / `ShortcutAction` / `ShortcutConflict` / `ShortcutOutcome` / `AppConfig::active_shortcuts` / `apply_shortcut`），src-tauri `config.rs` 镜像同结构 ④ `src/i18n.rs` 新增 5 条提示窗文案 ⑤ Windows 专属：`src/platform/windows/hotkey.rs` 新低级键盘钩子 + **`HotkeyEvent::Shortcut(ShortcutAction)` 新变体（只在 Windows 枚举）**；`src/main.rs` 控制器处理（`#[cfg(windows)]`）⑥ src-tauri 新模块 `shortcuts.rs`：`set_shortcut_capture` 命令（Windows 具名互斥量，非 Windows 空实现）+ 配置文件监视推 `config-changed` 事件（平台中立）⑦ 前端新组件 `ui/src/components/ShortcutSetting.tsx`，Llm / Voice 页接入；App 监听 `config-changed` ⑧ 版本 0.9.6 |
+| 行为变化 | 本地实时只说词条时保留带词库结果（读音与重解相近时）；两个开关可用快捷方式切换（默认 右Ctrl+1 / 右Ctrl+2），按下弹提示窗「已启用 / 已关闭」；设置界面在主程序改配置后自动刷新 |
+| 对 macOS 的影响 | **编译**：需能拉取 `pinyin` crate；`HotkeyEvent::Shortcut` 只在 Windows 枚举，macOS 的 `process_controller_events` 若有对等实现不受影响（Windows 版是 `#[cfg(windows)]`）。**配置**：`[shortcuts]` 段两端同读同写，macOS 不实现监听也会原样保留该段（serde 默认值）。**功能缺口**：macOS 设置界面会显示「快捷方式」链接和对话框（前端平台中立），但主程序**没有监听** ⇒ 按了无效。macOS 实现要点：CGEventTap 监听，用 `kCGEventFlagMaskControl/Alternate` 配合设备相关标志 `NX_DEVICELCTLKEYMASK(0x01)` / `NX_DEVICERCTLKEYMASK(0x2000)` / `NX_DEVICELALTKEYMASK(0x20)` / `NX_DEVICERALTKEYMASK(0x40)` 区分左右；VK 值沿用 Windows 口径（0xA2 左Ctrl / 0xA3 右Ctrl / 0xA4 左Alt=Option / 0xA5 右Alt=Option，主键 0x30–0x39 / 0x41–0x5A），需自行映射 macOS keycode；规则见 DEC-110（恰好一个功能键、冲突不生效、开 LLM 前置条件 = `apply_shortcut`）。录制期间放行：`set_shortcut_capture` 在 macOS 是空实现，macOS 监听上线时需提供对等信号。 |
+| 是否需要对方同步 | 是：① 编译验证（pinyin 依赖）② 若要在 macOS 上提供快捷方式功能，需实现监听 + 录制放行；暂不实现则建议在 macOS 设置界面隐藏「快捷方式」链接，避免用户设置了却无效 |
+
+### 0.9.6 追加 · I18N-ERR-485 提示文字全量走 i18n（2026-10-14，主控）
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | ① 平台中立 `src/i18n.rs` 新增字段 `error_unexpected`（三语）② `src/main.rs` 的 `convert_to_friendly_error` **去掉 `#[cfg(windows)]`**，补中文关键词（超时 / 网络 / 服务端 / 鉴权 / 连接 / 模型 / 麦克风 / 音频 / 录音），**未归类不再原文直出**，显示 `error_unexpected` ③ 平台中立 worker：本地实时「所选模型不可用」浮层只显示三语文案，内部原文只进日志 ④ 平台中立 `src/transcription/qwen_inference.rs`：在线实时「VAD 未命中就松手」由中文错误串改为 `bail!(super::NoSpeechError)`（H2 护栏计数 5→6）⑤ **macOS 专属** `handle_pipeline_event`：`PipelineEvent::Error` 改在调用侧经 `convert_to_friendly_error(message, ui_language)` 补文案（纯函数 `overlay_request_for_event` 不变，仍原样透传，原有真值表测试不受影响）⑥ 设置界面：`App.tsx` 加载中 / 加载失败、`Llm.tsx` 门槛提示 / 「未测试」、热键页左右修饰键名改走三份 locale |
+| 行为变化 | 错误提示：以前内部错误原文直接上屏（如「网络失败：连接失败 - …」、英文界面也显示中文），现在一律是当前界面语言的友好文案；未知错误显示「处理出错，请重试（详情见日志）」。在线实时按了热键没说话：以前弹错误「转录已取消：未检测到语音输入」，现在走「没说话」信息提示（与其他档位一致）。模型不可用：以前「所选模型不可用：<内部原文>」，现在只显示「所选模型不可用」 |
+| 对 macOS 的影响 | **编译**：⑤ 是 macOS 专属代码，Windows 端未编译验证（改动只有一个 match 分支，调用的函数已去掉平台限制）；**行为**：macOS 错误浮层文案从原文变为友好文案，与 Windows 一致 |
+| 是否需要对方同步 | 是：macOS 端编译一次确认 ⑤；若 macOS 有断言「错误浮层显示原文」的端测需改为断言 i18n 文案 |

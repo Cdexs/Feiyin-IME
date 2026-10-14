@@ -127,8 +127,18 @@ pub struct Strings {
     pub no_speech_hint: &'static str,
     /// LOCAL-RT-ENGINE-239-B: 切换到本地流式档位时的双模型加载提示（Info 态，短暂自动关闭）。
     pub local_realtime_loading_hint: &'static str,
+    /// SC-LLM-485 / SC-PUNCT-486：快捷方式切换开关后的提示窗文案（Gavin 10-14「识别输出优化已启用 or 识别输出优化已关闭」）。
+    pub shortcut_llm_on: &'static str,
+    pub shortcut_llm_off: &'static str,
+    /// 「识别输出优化」接口未配好 / 未通过连接测试 ⇒ 快捷方式不打开（与设置界面开关同规则）。
+    pub shortcut_llm_blocked: &'static str,
+    pub shortcut_strip_on: &'static str,
+    pub shortcut_strip_off: &'static str,
     /// LOCAL-RT-ENGINE-239-B: 本地流式档位模型缺失，直接报错不降级（DEC-067 附则一）。
     pub local_realtime_unavailable: &'static str,
+    /// 10-14 Gavin「UI和提示对话框中的文字一定都要走i18n国际化」：未归类的错误不再原文直出，
+    /// 显示本条，原文只进 debug.log。
+    pub error_unexpected: &'static str,
 }
 
 static ZH: Strings = Strings {
@@ -244,7 +254,13 @@ static ZH: Strings = Strings {
     format_failed_hint: "优化失败，已输出原文。",
     no_speech_hint: "请说话哦..",
     local_realtime_loading_hint: "本地流式模型加载中，约需 6 秒…",
+    shortcut_llm_on: "识别输出优化已启用",
+    shortcut_llm_off: "识别输出优化已关闭",
+    shortcut_llm_blocked: "识别输出优化未就绪：请先在设置中填写接口并通过连接测试",
+    shortcut_strip_on: "句尾不显示标点符号已启用",
+    shortcut_strip_off: "句尾不显示标点符号已关闭",
     local_realtime_unavailable: "所选模型不可用",
+    error_unexpected: "处理出错，请重试（详情见日志）",
 };
 
 static ZH_TW: Strings = Strings {
@@ -360,7 +376,13 @@ static ZH_TW: Strings = Strings {
     format_failed_hint: "優化失敗，已輸出原文。",
     no_speech_hint: "請說話喔..",
     local_realtime_loading_hint: "本地串流模型載入中，約需 6 秒…",
+    shortcut_llm_on: "識別輸出優化已啟用",
+    shortcut_llm_off: "識別輸出優化已關閉",
+    shortcut_llm_blocked: "識別輸出優化尚未就緒：請先在設定中填寫介面並通過連線測試",
+    shortcut_strip_on: "句尾不顯示標點符號已啟用",
+    shortcut_strip_off: "句尾不顯示標點符號已關閉",
     local_realtime_unavailable: "所選模型不可用",
+    error_unexpected: "處理出錯，請重試（詳情見日誌）",
 };
 
 static EN: Strings = Strings {
@@ -475,7 +497,13 @@ static EN: Strings = Strings {
     format_failed_hint: "Optimization failed, original text used.",
     no_speech_hint: "Please say something..",
     local_realtime_loading_hint: "Loading local streaming models, ~6s…",
+    shortcut_llm_on: "Output optimization enabled",
+    shortcut_llm_off: "Output optimization disabled",
+    shortcut_llm_blocked: "Output optimization not ready: fill in the API settings and pass the connection test first",
+    shortcut_strip_on: "Hide trailing punctuation enabled",
+    shortcut_strip_off: "Hide trailing punctuation disabled",
     local_realtime_unavailable: "Selected model unavailable",
+    error_unexpected: "Something went wrong. Please try again (details in the log).",
 };
 
 pub fn get(lang: UiLanguage) -> &'static Strings {

@@ -107,3 +107,10 @@
 - D1 实测：打开设置界面 30s 内不生成 `usage-stats.sqlite` ✅。tester 冒烟临时切档后已字节级还原（Gavin 当前配置为 performance 档）。
 - 已请 Gavin 重启并目视「我的」页统一样式 + 端测接缝标点。
 
+## 2026-10-14 — 主控 — 0.9.6 开发 + 回归 + BUILD-096 出包（Worker 额度用尽，主控包办）
+
+- 内容：WB-ECHO-483（DEC-109）、UI-RENAME-484、SC-LLM-485 / SC-PUNCT-486（DEC-110）、I18N-ERR-485、VER-096。
+- 回归：root 全量 0 失败（bin 1961P/0F/71I）、src-tauri 98P、Vitest 127P/11skip、tsc 干净、fmt --check 干净。
+- 出包九项全过：main `91a2022c…` / ui `46be1b5d…` / crash-reporter `d63d9421…`，0.9.6；warnings 90 / 17 / 6。
+- 待 Gavin：重启输入法 → 按 todo 0.9.6 表逐项验收（快捷方式对话框目视、右Ctrl+1/2 提示窗、只说词条端测）。本地已 commit，未 push。
+

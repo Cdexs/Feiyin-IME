@@ -50,19 +50,32 @@ const MOD_LABELS: { [key: number]: string } = {
   0x0008: 'Win',
 };
 
-function getHotkeyDisplayName(vkCode: number, modifiers: number): string {
+type T = ReturnType<typeof getTranslations>;
+
+/** 界面显示用键名：分左右的修饰键走 i18n（左Ctrl / Right Ctrl …，Gavin 10-14「UI……文字一定都要走i18n」）；
+ *  F1、A、1 这类键帽名各语言通用。🔴 写进配置的 display_name 仍用 VK_TO_LABEL 英文规范名（数据格式不变）。 */
+function keyLabel(vk: number, t?: T): string {
+  if (t) {
+    switch (vk) {
+      case 0xA2: return t.shortcut_mod_left_ctrl;
+      case 0xA3: return t.shortcut_mod_right_ctrl;
+      case 0xA4: return t.shortcut_mod_left_alt;
+      case 0xA5: return t.shortcut_mod_right_alt;
+      case 0xA0: return t.key_left_shift;
+      case 0xA1: return t.key_right_shift;
+    }
+  }
+  return VK_TO_LABEL[vk] ?? vk.toString();
+}
+
+/** 传 `t` = 界面显示（本地化）；不传 = 写入配置的规范名。 */
+function getHotkeyDisplayName(vkCode: number, modifiers: number, t?: T): string {
   const parts: string[] = [];
   if (modifiers & 0x0002) parts.push(MOD_LABELS[0x0002]);
   if (modifiers & 0x0001) parts.push(MOD_LABELS[0x0001]);
   if (modifiers & 0x0004) parts.push(MOD_LABELS[0x0004]);
   if (modifiers & 0x0008) parts.push(MOD_LABELS[0x0008]);
-
-  const keyName = VK_TO_LABEL[vkCode];
-  if (keyName) {
-    parts.push(keyName);
-  } else {
-    parts.push(vkCode.toString());
-  }
+  parts.push(keyLabel(vkCode, t));
   return parts.join('+');
 }
 
@@ -104,12 +117,12 @@ const MODIFIER_DISPLAY_ORDER = [
   'MetaLeft', 'MetaRight',
 ];
 
-function pressedModifierLabels(pressed: Set<string>): string {
+function pressedModifierLabels(pressed: Set<string>, t: T): string {
   const labels: string[] = [];
   for (const c of MODIFIER_DISPLAY_ORDER) {
     if (pressed.has(c)) {
       const vk = CODE_TO_VK[c];
-      if (vk !== undefined && VK_TO_LABEL[vk]) labels.push(VK_TO_LABEL[vk]);
+      if (vk !== undefined && VK_TO_LABEL[vk]) labels.push(keyLabel(vk, t));
     }
   }
   return labels.join('+');
@@ -181,8 +194,8 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
     if (keysOverlap(vSet, tSet)) {
       setRecording(false);
       setDupConflict({
-        voice: getHotkeyDisplayName(voiceVkCode, voiceModifiers),
-        translation: translation.display_name || VK_TO_LABEL[translationVkCode] || translationVkCode.toString(),
+        voice: getHotkeyDisplayName(voiceVkCode, voiceModifiers, t),
+        translation: keyLabel(translationVkCode, t),
       });
       resetRecording();
       return;
@@ -260,7 +273,7 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
       }
       if (!pressedModsRef.current.has(code)) {
         pressedModsRef.current.add(code);
-        setVoiceRecordingPreview(pressedModifierLabels(pressedModsRef.current));
+        setVoiceRecordingPreview(pressedModifierLabels(pressedModsRef.current, t));
       }
       return;
     }
@@ -310,7 +323,7 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
 
     pressedModsRef.current.delete(code);
     if (pressedModsRef.current.size > 0) {
-      setVoiceRecordingPreview(pressedModifierLabels(pressedModsRef.current));
+      setVoiceRecordingPreview(pressedModifierLabels(pressedModsRef.current, t));
       return;
     }
 
@@ -439,10 +452,13 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
 
   const currentVoiceDisplayName = getHotkeyDisplayName(
     config.hotkey.vk_code,
-    config.hotkey.modifiers
+    config.hotkey.modifiers,
+    t
   );
 
-  const currentTranslationDisplayName = translation.display_name || t.hotkey_not_set;
+  const currentTranslationDisplayName = translation.vk_code
+    ? keyLabel(translation.vk_code, t)
+    : translation.display_name || t.hotkey_not_set;
 
   return (
     <div className="settings-page">
@@ -551,7 +567,7 @@ const HotkeySettingsPage: React.FC<Props> = ({ config, updateConfig }) => {
             </div>
             <div className="modal-body">
               <p style={{ margin: 0, lineHeight: '1.6' }}>
-                {t.hotkey_conflict_prefix}{getHotkeyDisplayName(pendingHotkey.vk, pendingHotkey.mod)}{t.hotkey_conflict_suffix}
+                {t.hotkey_conflict_prefix}{getHotkeyDisplayName(pendingHotkey.vk, pendingHotkey.mod, t)}{t.hotkey_conflict_suffix}
               </p>
             </div>
             <div className="modal-footer">

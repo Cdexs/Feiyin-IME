@@ -1238,7 +1238,9 @@ pub fn transcribe_streaming_realtime(
                     let _ = ws_socket.close(None);
                     summary.outcome = "cancelled";
                     log::info!("{}", summary.format_summary());
-                    bail!("转录已取消：未检测到语音输入");
+                    // BUG-119: 没说话 = 类型化信息信号（同 941/1640）。旧写法是中文错误串，
+                    // 会被当错误弹出原文；10-14 起错误提示未归类即显示通用文案，必须类型化。
+                    bail!(super::NoSpeechError);
                 }
                 // 有 pre-roll 但没命中 VAD —— 用 2s 保底逻辑发完
                 log::info!(

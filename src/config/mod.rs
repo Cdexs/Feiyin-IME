@@ -415,6 +415,172 @@ impl Default for PunctuationConfig {
     }
 }
 
+/// SC-LLM-485 / SC-PUNCT-486（Gavin 10-14）：功能开关的全局快捷方式 =
+/// **分左右**的一个 Ctrl / Alt + 一个字母或数字（「功能键支持左右Ctrl、Alt键 + 字母/数字」）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShortcutBinding {
+    /// 功能键 VK：`0xA2` 左Ctrl / `0xA3` 右Ctrl / `0xA4` 左Alt / `0xA5` 右Alt；0 = 未设置。
+    pub modifier: u32,
+    /// 字母 `0x41..=0x5A` / 数字 `0x30..=0x39`；0 = 未设置。
+    pub key: u32,
+}
+
+pub const VK_LCONTROL: u32 = 0xA2;
+pub const VK_RCONTROL: u32 = 0xA3;
+pub const VK_LMENU: u32 = 0xA4;
+pub const VK_RMENU: u32 = 0xA5;
+
+impl ShortcutBinding {
+    pub const fn new(modifier: u32, key: u32) -> Self {
+        Self { modifier, key }
+    }
+
+    /// 功能键是左右 Ctrl / Alt 之一、主键是字母或数字 ⇒ 可用；否则视为未设置。
+    pub fn is_valid(&self) -> bool {
+        matches!(
+            self.modifier,
+            VK_LCONTROL | VK_RCONTROL | VK_LMENU | VK_RMENU
+        ) && matches!(self.key, 0x30..=0x39 | 0x41..=0x5A)
+    }
+
+    /// 与热键冲突的原因（Gavin「要判断，当前用户设置的功能键（左右Ctrl、Alt键）是否已经设置为热键」）。
+    /// 冲突的快捷方式不生效：功能键被录音热键钩子吞掉、按了也只会开始录音。
+    pub fn conflict_with(
+        &self,
+        hotkey: &HotkeyConfig,
+        translation: &TranslationConfig,
+    ) -> Option<ShortcutConflict> {
+        if !self.is_valid() {
+            return None;
+        }
+        if hotkey.vk_code == self.modifier {
+            return Some(ShortcutConflict::RecordingKey);
+        }
+        if translation.enabled && translation.vk_code != 0 && translation.vk_code == self.modifier {
+            return Some(ShortcutConflict::TranslationKey);
+        }
+        let mod_flag = if self.modifier <= VK_RCONTROL {
+            0x0002
+        } else {
+            0x0001
+        };
+        if hotkey.vk_code == self.key && hotkey.modifiers == mod_flag {
+            return Some(ShortcutConflict::SameAsRecording);
+        }
+        None
+    }
+}
+
+/// [`ShortcutBinding::conflict_with`] 的冲突类别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutConflict {
+    /// 功能键本身就是录音热键（如录音热键 = 右Alt，快捷方式 = 右Alt+1）。
+    RecordingKey,
+    /// 功能键本身就是（已启用的）翻译热键。
+    TranslationKey,
+    /// 整个组合与录音热键相同（录音热键 = Ctrl+1 这类组合键）。
+    SameAsRecording,
+}
+
+/// 哪个功能开关的快捷方式（主程序按键监听 → 控制器）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutAction {
+    /// 「启用识别输出优化」（`llm.enabled`）。
+    LlmToggle,
+    /// 「句尾不显示标点符号」（`punctuation.strip_trailing`）。
+    StripTrailingToggle,
+}
+
+fn default_llm_toggle_shortcut() -> ShortcutBinding {
+    // 默认 右Ctrl+1：左Ctrl+1 / 左Ctrl+2 是浏览器切标签、Excel 设置格式等常用组合，全局拦截会把它们吃掉。
+    ShortcutBinding::new(VK_RCONTROL, 0x31)
+}
+
+fn default_strip_trailing_shortcut() -> ShortcutBinding {
+    ShortcutBinding::new(VK_RCONTROL, 0x32)
+}
+
+/// SC-LLM-485 / SC-PUNCT-486：功能开关快捷方式。字段定义与 src-tauri/src/config.rs 保持一致。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShortcutsConfig {
+    #[serde(default = "default_llm_toggle_shortcut")]
+    pub llm_toggle: ShortcutBinding,
+    #[serde(default = "default_strip_trailing_shortcut")]
+    pub strip_trailing_toggle: ShortcutBinding,
+}
+
+impl Default for ShortcutsConfig {
+    fn default() -> Self {
+        Self {
+            llm_toggle: default_llm_toggle_shortcut(),
+            strip_trailing_toggle: default_strip_trailing_shortcut(),
+        }
+    }
+}
+
+impl AppConfig {
+    /// 当前**生效**的快捷方式（未设置 / 与热键冲突的剔除；两者相同时只留前者）。
+    pub fn active_shortcuts(&self) -> Vec<(ShortcutAction, ShortcutBinding)> {
+        let mut out: Vec<(ShortcutAction, ShortcutBinding)> = Vec::new();
+        for (action, binding) in [
+            (ShortcutAction::LlmToggle, self.shortcuts.llm_toggle),
+            (
+                ShortcutAction::StripTrailingToggle,
+                self.shortcuts.strip_trailing_toggle,
+            ),
+        ] {
+            if binding.is_valid()
+                && binding
+                    .conflict_with(&self.hotkey, &self.translation)
+                    .is_none()
+                && !out.iter().any(|(_, b)| *b == binding)
+            {
+                out.push((action, binding));
+            }
+        }
+        out
+    }
+
+    /// 快捷方式切换开关 —— 与设置界面点开关**同一规则**（Gavin「效果等同于用户点击"启用识别输出优化"按钮」）：
+    /// 打开「识别输出优化」须接口地址 / 密钥 / 模型齐全且通过连接测试（界面 `canEnable`），否则不动、返回 `Blocked`。
+    pub fn apply_shortcut(&mut self, action: ShortcutAction) -> ShortcutOutcome {
+        match action {
+            ShortcutAction::LlmToggle => {
+                if self.llm.enabled {
+                    self.llm.enabled = false;
+                    ShortcutOutcome::Disabled
+                } else if self.llm.connectivity_verified
+                    && !self.llm.api_url.trim().is_empty()
+                    && !self.llm.api_key.trim().is_empty()
+                    && !self.llm.model.trim().is_empty()
+                {
+                    self.llm.enabled = true;
+                    ShortcutOutcome::Enabled
+                } else {
+                    ShortcutOutcome::Blocked
+                }
+            }
+            ShortcutAction::StripTrailingToggle => {
+                self.punctuation.strip_trailing = !self.punctuation.strip_trailing;
+                if self.punctuation.strip_trailing {
+                    ShortcutOutcome::Enabled
+                } else {
+                    ShortcutOutcome::Disabled
+                }
+            }
+        }
+    }
+}
+
+/// [`AppConfig::apply_shortcut`] 的结果（决定提示窗文案）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutOutcome {
+    Enabled,
+    Disabled,
+    /// 「识别输出优化」接口未配好 / 未通过连接测试 ⇒ 不打开（与界面开关同规则）。
+    Blocked,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppConfig {
     pub llm: LlmConfig,
@@ -436,6 +602,9 @@ pub struct AppConfig {
     /// 字段定义与 src-tauri/src/config.rs 的 SceneConfig 保持一致。
     #[serde(default)]
     pub scene: SceneConfig,
+    /// SC-LLM-485 / SC-PUNCT-486：功能开关快捷方式（旧配置无此表 ⇒ 默认 右Ctrl+1 / 右Ctrl+2）。
+    #[serde(default)]
+    pub shortcuts: ShortcutsConfig,
 }
 
 /// SCENE-SENSE-001-CORE (DEC-031-⑤): 场景感知配置。
@@ -479,6 +648,7 @@ impl Default for AppConfig {
             translation: TranslationConfig::default(),
             punctuation: PunctuationConfig::default(),
             scene: SceneConfig::default(),
+            shortcuts: ShortcutsConfig::default(),
         }
     }
 }
@@ -1855,5 +2025,220 @@ clipboard_delay_ms = 150
             loaded.audio.asr_online_semantic_punctuation_enabled, true,
             "hidden field must survive save→load roundtrip (main config side, ASR-SEG-229 axis 2)"
         );
+    }
+}
+
+/// SC-LLM-485 / SC-PUNCT-486：功能开关快捷方式的配置规则。
+#[cfg(test)]
+mod sc485_tests {
+    use super::*;
+
+    const RCTRL_1: ShortcutBinding = ShortcutBinding::new(VK_RCONTROL, 0x31);
+    const RCTRL_2: ShortcutBinding = ShortcutBinding::new(VK_RCONTROL, 0x32);
+
+    fn ready_llm(cfg: &mut AppConfig) {
+        cfg.llm.api_url = "https://api.example.com/v1".into();
+        cfg.llm.api_key = "sk-test".into();
+        cfg.llm.model = "m".into();
+        cfg.llm.connectivity_verified = true;
+    }
+
+    #[test]
+    fn defaults_are_right_ctrl_1_and_2() {
+        let s = ShortcutsConfig::default();
+        assert_eq!(s.llm_toggle, RCTRL_1);
+        assert_eq!(s.strip_trailing_toggle, RCTRL_2);
+    }
+
+    #[test]
+    fn old_config_without_shortcuts_table_gets_defaults() {
+        // 升级用户的 config.toml 没有 [shortcuts] 段 —— 必须能读、且拿到默认值。
+        let mut cfg = AppConfig::default();
+        cfg.shortcuts.llm_toggle = ShortcutBinding::new(VK_LMENU, 0x41);
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let start = text.find("[shortcuts").expect("shortcuts serialized");
+        let rest = &text[start..];
+        // 去掉 [shortcuts] 及其子表（直到下一个非 shortcuts 表头）
+        let end = rest
+            .match_indices("\n[")
+            .map(|(i, _)| i + 1)
+            .find(|&i| !rest[i..].starts_with("[shortcuts"))
+            .unwrap_or(rest.len());
+        let stripped = format!("{}{}", &text[..start], &rest[end..]);
+        assert!(!stripped.contains("shortcuts"));
+        let loaded: AppConfig = toml::from_str(&stripped).expect("old config must parse");
+        assert_eq!(loaded.shortcuts, ShortcutsConfig::default());
+    }
+
+    #[test]
+    fn shortcuts_roundtrip() {
+        let mut cfg = AppConfig::default();
+        cfg.shortcuts.strip_trailing_toggle = ShortcutBinding::new(VK_RMENU, 0x39);
+        let loaded: AppConfig = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert_eq!(loaded.shortcuts, cfg.shortcuts);
+    }
+
+    #[test]
+    fn validity_requires_sided_ctrl_alt_plus_alnum() {
+        assert!(RCTRL_1.is_valid());
+        assert!(ShortcutBinding::new(VK_LMENU, 0x5A).is_valid());
+        assert!(!ShortcutBinding::new(0, 0).is_valid());
+        assert!(!ShortcutBinding::new(0x11, 0x31).is_valid()); // 不分左右的 Ctrl
+        assert!(!ShortcutBinding::new(0xA0, 0x31).is_valid()); // Shift
+        assert!(!ShortcutBinding::new(VK_RCONTROL, 0x70).is_valid()); // F1
+    }
+
+    #[test]
+    fn conflict_rules() {
+        let mut hk = HotkeyConfig::default();
+        let mut tr = TranslationConfig::default();
+        hk.vk_code = 0x78;
+        hk.modifiers = 0;
+        assert_eq!(RCTRL_1.conflict_with(&hk, &tr), None);
+        // 功能键本身是录音热键
+        hk.vk_code = VK_RCONTROL;
+        assert_eq!(
+            RCTRL_1.conflict_with(&hk, &tr),
+            Some(ShortcutConflict::RecordingKey)
+        );
+        // 另一侧的 Ctrl 是录音热键 ⇒ 不冲突
+        hk.vk_code = VK_LCONTROL;
+        assert_eq!(RCTRL_1.conflict_with(&hk, &tr), None);
+        // 已启用的翻译热键
+        hk.vk_code = 0x78;
+        tr.enabled = true;
+        tr.vk_code = VK_RCONTROL;
+        assert_eq!(
+            RCTRL_1.conflict_with(&hk, &tr),
+            Some(ShortcutConflict::TranslationKey)
+        );
+        tr.enabled = false;
+        assert_eq!(RCTRL_1.conflict_with(&hk, &tr), None);
+        // 组合与录音热键 Ctrl+1 相同；Ctrl+Shift+1 不同
+        hk.vk_code = 0x31;
+        hk.modifiers = 0x0002;
+        assert_eq!(
+            RCTRL_1.conflict_with(&hk, &tr),
+            Some(ShortcutConflict::SameAsRecording)
+        );
+        hk.modifiers = 0x0006;
+        assert_eq!(RCTRL_1.conflict_with(&hk, &tr), None);
+        // Alt 组合对 Alt 标志
+        hk.modifiers = 0x0001;
+        assert_eq!(
+            ShortcutBinding::new(VK_LMENU, 0x31).conflict_with(&hk, &tr),
+            Some(ShortcutConflict::SameAsRecording)
+        );
+    }
+
+    #[test]
+    fn active_shortcuts_drops_conflicting_unset_and_duplicate() {
+        let mut cfg = AppConfig::default();
+        cfg.hotkey.vk_code = 0x78;
+        cfg.hotkey.modifiers = 0;
+        assert_eq!(
+            cfg.active_shortcuts(),
+            vec![
+                (ShortcutAction::LlmToggle, RCTRL_1),
+                (ShortcutAction::StripTrailingToggle, RCTRL_2)
+            ]
+        );
+        // 重复 ⇒ 只留「识别输出优化」
+        cfg.shortcuts.strip_trailing_toggle = RCTRL_1;
+        assert_eq!(
+            cfg.active_shortcuts(),
+            vec![(ShortcutAction::LlmToggle, RCTRL_1)]
+        );
+        // 录音热键 = 右Ctrl ⇒ 两个都失效
+        cfg.shortcuts.strip_trailing_toggle = RCTRL_2;
+        cfg.hotkey.vk_code = VK_RCONTROL;
+        assert!(cfg.active_shortcuts().is_empty());
+        // 未设置
+        cfg.hotkey.vk_code = 0x78;
+        cfg.shortcuts.llm_toggle = ShortcutBinding::new(0, 0);
+        assert_eq!(
+            cfg.active_shortcuts(),
+            vec![(ShortcutAction::StripTrailingToggle, RCTRL_2)]
+        );
+    }
+
+    #[test]
+    fn llm_toggle_uses_same_gate_as_settings_switch() {
+        let mut cfg = AppConfig::default();
+        cfg.llm.enabled = false;
+        cfg.llm.connectivity_verified = false;
+        // 未通过连接测试 ⇒ 打不开，配置不动
+        assert_eq!(
+            cfg.apply_shortcut(ShortcutAction::LlmToggle),
+            ShortcutOutcome::Blocked
+        );
+        assert!(!cfg.llm.enabled);
+        ready_llm(&mut cfg);
+        cfg.llm.model = "  ".into();
+        assert_eq!(
+            cfg.apply_shortcut(ShortcutAction::LlmToggle),
+            ShortcutOutcome::Blocked
+        );
+        ready_llm(&mut cfg);
+        assert_eq!(
+            cfg.apply_shortcut(ShortcutAction::LlmToggle),
+            ShortcutOutcome::Enabled
+        );
+        assert!(cfg.llm.enabled);
+        // 关闭不设闸门
+        cfg.llm.connectivity_verified = false;
+        assert_eq!(
+            cfg.apply_shortcut(ShortcutAction::LlmToggle),
+            ShortcutOutcome::Disabled
+        );
+        assert!(!cfg.llm.enabled);
+    }
+
+    #[test]
+    fn strip_trailing_toggles_freely() {
+        let mut cfg = AppConfig::default();
+        let before = cfg.punctuation.strip_trailing;
+        let first = cfg.apply_shortcut(ShortcutAction::StripTrailingToggle);
+        assert_eq!(cfg.punctuation.strip_trailing, !before);
+        assert_eq!(
+            first,
+            if before {
+                ShortcutOutcome::Disabled
+            } else {
+                ShortcutOutcome::Enabled
+            }
+        );
+        cfg.apply_shortcut(ShortcutAction::StripTrailingToggle);
+        assert_eq!(cfg.punctuation.strip_trailing, before);
+    }
+
+    #[test]
+    fn settings_ui_mirror_uses_same_defaults() {
+        // src-tauri 是独立 crate、整份保存配置：默认值不一致会让「界面显示」与「实际生效」分叉。
+        let ui = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src-tauri/src/config.rs"
+        ));
+        let line = |name: &str, b: ShortcutBinding| {
+            // `{:#04X}` ⇒ `0xA3`（Rust 的 # 前缀恒为小写 0x）
+            format!(
+                "pub const {name}: (u32, u32) = ({:#04X}, {:#04X});",
+                b.modifier, b.key
+            )
+        };
+        let defaults = ShortcutsConfig::default();
+        for expected in [
+            line("DEFAULT_LLM_TOGGLE_SHORTCUT", defaults.llm_toggle),
+            line(
+                "DEFAULT_STRIP_TRAILING_SHORTCUT",
+                defaults.strip_trailing_toggle,
+            ),
+        ] {
+            assert!(
+                ui.contains(&expected),
+                "settings UI default drifted: {expected}"
+            );
+        }
+        assert!(ui.contains("pub shortcuts: ShortcutsConfig"));
     }
 }
