@@ -8101,21 +8101,7 @@ fn handle_shortcut_event(
         // 内存里已切换（本次运行即生效）；落盘失败只影响重启后的状态。
         log::warn!("[SC-485] failed to persist shortcut toggle: {}", e);
     }
-    let s = i18n::get(ui_language);
-    let message = match (action, outcome) {
-        (_, config::ShortcutOutcome::Blocked) => s.shortcut_llm_blocked,
-        (config::ShortcutAction::LlmToggle, config::ShortcutOutcome::Enabled) => s.shortcut_llm_on,
-        (config::ShortcutAction::LlmToggle, config::ShortcutOutcome::Disabled) => {
-            s.shortcut_llm_off
-        }
-        (config::ShortcutAction::StripTrailingToggle, config::ShortcutOutcome::Enabled) => {
-            s.shortcut_strip_on
-        }
-        (config::ShortcutAction::StripTrailingToggle, config::ShortcutOutcome::Disabled) => {
-            s.shortcut_strip_off
-        }
-    }
-    .to_string();
+    let message = shortcut_info_text(action, outcome, ui_language).to_string();
     let is_error = outcome == config::ShortcutOutcome::Blocked;
     if shortcut_overlay_busy(is_recording) {
         if let Ok(mut pending) = PENDING_SHORTCUT_INFO.lock() {
@@ -8123,6 +8109,30 @@ fn handle_shortcut_event(
         }
     } else {
         show_shortcut_info(overlay_handle, message, is_error, ui_language);
+    }
+}
+
+/// 快捷方式结果 → 提示窗文案（三语 i18n）。纯函数，可单测。
+/// SC-SCRIPT-489：中文输出提示切换后的结果（「中文输出已切换为简体 / 繁体」）。
+#[cfg(target_os = "windows")]
+fn shortcut_info_text(
+    action: config::ShortcutAction,
+    outcome: config::ShortcutOutcome,
+    ui_language: config::UiLanguage,
+) -> &'static str {
+    use config::{ChineseScript, ShortcutAction as A, ShortcutOutcome as O};
+    let s = i18n::get(ui_language);
+    match (action, outcome) {
+        (_, O::Blocked) => s.shortcut_llm_blocked,
+        (_, O::Switched(ChineseScript::Simplified)) => s.shortcut_script_simplified,
+        (_, O::Switched(ChineseScript::Traditional)) => s.shortcut_script_traditional,
+        (A::LlmToggle, O::Enabled) => s.shortcut_llm_on,
+        (A::LlmToggle, O::Disabled) => s.shortcut_llm_off,
+        (A::StripTrailingToggle, O::Enabled) => s.shortcut_strip_on,
+        (A::StripTrailingToggle, O::Disabled) => s.shortcut_strip_off,
+        // 中文输出只产出 Switched（apply_shortcut 保证）；兜底按当前语义给「已切换」。
+        (A::ChineseScriptToggle, O::Enabled) => s.shortcut_script_traditional,
+        (A::ChineseScriptToggle, O::Disabled) => s.shortcut_script_simplified,
     }
 }
 
@@ -24385,5 +24395,58 @@ mod friendly_error_i18n_tests {
         let en = i18n::get(UiLanguage::English).error_unexpected;
         assert!(has_cjk(zh) && has_cjk(tw) && !has_cjk(en));
         assert_ne!(zh, tw, "E4: 繁体须独立文案，不得照抄简体");
+    }
+}
+
+// =====================================================================
+// SC-SCRIPT-489 / UI-RENAME-487：快捷方式提示窗文案（三语）。
+// =====================================================================
+#[cfg(all(test, target_os = "windows"))]
+mod sc489_tests {
+    use super::shortcut_info_text;
+    use crate::config::{ChineseScript, ShortcutAction as A, ShortcutOutcome as O, UiLanguage};
+
+    #[test]
+    fn script_switch_shows_result_in_three_languages() {
+        let cases = [
+            (
+                UiLanguage::Chinese,
+                "中文输出已切换为简体",
+                "中文输出已切换为繁体",
+            ),
+            (
+                UiLanguage::TraditionalChinese,
+                "中文輸出已切換為簡體",
+                "中文輸出已切換為繁體",
+            ),
+            (
+                UiLanguage::English,
+                "Chinese output switched to Simplified",
+                "Chinese output switched to Traditional",
+            ),
+        ];
+        for (lang, simp, trad) in cases {
+            let to = |s| shortcut_info_text(A::ChineseScriptToggle, O::Switched(s), lang);
+            assert_eq!(to(ChineseScript::Simplified), simp);
+            assert_eq!(to(ChineseScript::Traditional), trad);
+        }
+    }
+
+    #[test]
+    fn llm_prompts_use_new_name() {
+        // UI-RENAME-487：功能名「识别输出优化」→「输出优化」，提示窗同步
+        let on = shortcut_info_text(A::LlmToggle, O::Enabled, UiLanguage::Chinese);
+        let off = shortcut_info_text(A::LlmToggle, O::Disabled, UiLanguage::Chinese);
+        let blocked = shortcut_info_text(A::LlmToggle, O::Blocked, UiLanguage::Chinese);
+        assert_eq!(on, "输出优化已启用");
+        assert_eq!(off, "输出优化已关闭");
+        assert!(blocked.starts_with("输出优化未就绪"));
+        for s in [on, off, blocked] {
+            assert!(!s.contains("识别输出优化"), "{s}");
+        }
+        assert_eq!(
+            shortcut_info_text(A::LlmToggle, O::Enabled, UiLanguage::TraditionalChinese),
+            "輸出優化已啟用"
+        );
     }
 }

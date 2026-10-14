@@ -411,12 +411,10 @@ fn uninstall_keyboard_hook() {
 // ===========================================================================
 
 /// 快捷方式顺序（与 [`SC_BINDINGS`] 下标一一对应）。
-const SC_ACTIONS: [ShortcutAction; 2] = [
-    ShortcutAction::LlmToggle,
-    ShortcutAction::StripTrailingToggle,
-];
+const SC_ACTIONS: [ShortcutAction; SC_COUNT] = ShortcutAction::ALL;
+const SC_COUNT: usize = ShortcutAction::ALL.len();
 /// 生效中的快捷方式打包值 `modifier << 8 | key`（0 = 不生效）。由 [`sync_shortcuts`] 按配置写入。
-static SC_BINDINGS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+static SC_BINDINGS: [AtomicU32; SC_COUNT] = [const { AtomicU32::new(0) }; SC_COUNT];
 static SC_HOOK: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 static SC_SENDER: AtomicPtr<crossbeam_channel::Sender<HotkeyEvent>> =
     AtomicPtr::new(std::ptr::null_mut());
@@ -446,7 +444,7 @@ fn pack_shortcut(b: ShortcutBinding) -> u32 {
 
 /// 按下 `vk` 时命中第几个快捷方式：主键相同，且**恰好**按住该功能键（另三个 Ctrl/Alt、Shift、Win 都没按）。
 /// AltGr（系统同时报 左Ctrl + 右Alt）因此不会误触 右Alt 快捷方式。纯函数，可单测。
-fn match_shortcut(vk: u32, mods: ModState, packed: &[u32; 2]) -> Option<usize> {
+fn match_shortcut(vk: u32, mods: ModState, packed: &[u32]) -> Option<usize> {
     if !matches!(vk, 0x30..=0x39 | 0x41..=0x5A) || mods.shift || mods.win {
         return None;
     }
@@ -518,10 +516,8 @@ unsafe extern "system" fn shortcut_hook_proc(code: i32, wparam: WPARAM, lparam: 
                 if vk != 0 && SC_HELD_KEY.load(Ordering::Relaxed) == vk {
                     return LRESULT(1); // 长按的 auto-repeat：吞掉、不重复切换
                 }
-                let packed = [
-                    SC_BINDINGS[0].load(Ordering::Relaxed),
-                    SC_BINDINGS[1].load(Ordering::Relaxed),
-                ];
+                let packed: [u32; SC_COUNT] =
+                    std::array::from_fn(|i| SC_BINDINGS[i].load(Ordering::Relaxed));
                 if let Some(idx) = match_shortcut(vk, current_mod_state(), &packed) {
                     if !shortcut_capture_active() {
                         SC_HELD_KEY.store(vk, Ordering::Relaxed);
@@ -565,7 +561,7 @@ fn sync_shortcuts(
         Ok(cfg) => cfg.active_shortcuts(),
         Err(poisoned) => poisoned.into_inner().active_shortcuts(),
     };
-    let mut packed = [0u32; 2];
+    let mut packed = [0u32; SC_COUNT];
     for (action, binding) in active {
         if let Some(i) = SC_ACTIONS.iter().position(|a| *a == action) {
             packed[i] = pack_shortcut(binding);
@@ -594,9 +590,9 @@ fn sync_shortcuts(
     }
     if changed || want_hook != has_hook {
         log::info!(
-            "[SC-485] shortcuts: llm={:#06x} strip={:#06x} hook={}",
-            packed[0],
-            packed[1],
+            "[SC-485] shortcuts: {:?} = {:?} hook={}",
+            SC_ACTIONS,
+            packed.map(|p| format!("{p:#06x}")),
             want_hook
         );
     }
@@ -1883,5 +1879,16 @@ mod sc485_tests {
     #[test]
     fn pack_matches_config_binding() {
         assert_eq!(pack_shortcut(ShortcutBinding::new(0xA3, 0x31)), RCTRL_1);
+    }
+
+    #[test]
+    fn third_slot_is_chinese_script_toggle() {
+        // SC-SCRIPT-489：槽位数跟随 ShortcutAction::ALL，第三个槽 = 中文输出切换
+        assert_eq!(SC_COUNT, 3);
+        assert_eq!(SC_ACTIONS[2], ShortcutAction::ChineseScriptToggle);
+        let packed = [RCTRL_1, RCTRL_2, (0xA3 << 8) | 0x33];
+        let rctrl = mods(false, true, false, false);
+        let idx = match_shortcut(0x33, rctrl, &packed).expect("右Ctrl+3");
+        assert_eq!(SC_ACTIONS[idx], ShortcutAction::ChineseScriptToggle);
     }
 }

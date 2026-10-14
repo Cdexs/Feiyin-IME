@@ -157,6 +157,7 @@ export const en = {
   shortcut_press_new: 'Press the new shortcut…',
   shortcut_rule_hint: 'Click the button above, hold Left/Right Ctrl or Left/Right Alt, then press a letter or digit',
   shortcut_need_modifier: 'Hold exactly one of Left/Right Ctrl or Left/Right Alt, then press a letter or digit',
+  shortcut_need_alnum: 'Only letter or digit keys are allowed (not F1-F12, Space, symbols, etc.). Please try again',
   shortcut_err_recording_prefix: '"',
   shortcut_err_recording_suffix: '" is already the recording hotkey. Please choose another shortcut.',
   shortcut_err_translation_suffix: '" is already the translation hotkey. Please choose another shortcut.',

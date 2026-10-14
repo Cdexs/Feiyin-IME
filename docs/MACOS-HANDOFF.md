@@ -2773,3 +2773,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 行为变化 | 错误提示：以前内部错误原文直接上屏（如「网络失败：连接失败 - …」、英文界面也显示中文），现在一律是当前界面语言的友好文案；未知错误显示「处理出错，请重试（详情见日志）」。在线实时按了热键没说话：以前弹错误「转录已取消：未检测到语音输入」，现在走「没说话」信息提示（与其他档位一致）。模型不可用：以前「所选模型不可用：<内部原文>」，现在只显示「所选模型不可用」 |
 | 对 macOS 的影响 | **编译**：⑤ 是 macOS 专属代码，Windows 端未编译验证（改动只有一个 match 分支，调用的函数已去掉平台限制）；**行为**：macOS 错误浮层文案从原文变为友好文案，与 Windows 一致 |
 | 是否需要对方同步 | 是：macOS 端编译一次确认 ⑤；若 macOS 有断言「错误浮层显示原文」的端测需改为断言 i18n 文案 |
+
+### 0.9.6 追加 · UI-RENAME-487 / SC-BOLD-488 / SC-SCRIPT-489 / SC-ALIGN-490（2026-10-14，主控）
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | ① 平台中立 `src/config/mod.rs`：`ShortcutAction` 加 `ChineseScriptToggle`、新增 `ShortcutAction::ALL`（顺序即重复优先级）、`ShortcutsConfig.chinese_script_toggle`（默认 右Ctrl+3，serde 缺省补默认）、`ShortcutsConfig::binding()`、`ShortcutOutcome::Switched(ChineseScript)`；`ChineseScript` 加派生 `Eq` ② `src-tauri/src/config.rs` 镜像同步 ③ `src/i18n.rs`：`shortcut_llm_*` 文案改「输出优化」，新增 `shortcut_script_simplified / traditional` ④ Windows `hotkey.rs` 槽位数跟随 `ShortcutAction::ALL`；Windows `main.rs` 新增纯函数 `shortcut_info_text` ⑤ 设置界面：「识别输出优化」→「输出优化」、快捷方式文字 14px / 700 与标签中线对齐、「中文输出」后加快捷方式、录制时非字母数字键红字 |
+| 行为变化 | 按 右Ctrl+3 在简体 / 繁体之间切换并保存，提示窗「中文输出已切换为简体 / 繁体」，下一次录音起生效 |
+| 对 macOS 的影响 | **编译**：macOS 若有对 `ShortcutOutcome` 或 `ShortcutAction` 的穷举 match 需补新变体（Windows 侧全部在 `#[cfg(windows)]` 里，平台中立代码无穷举）。**功能**：快捷方式监听仍只有 Windows；macOS 实现监听时按 `ShortcutAction::ALL` 遍历即可覆盖三项，提示文案可直接复用 `shortcut_info_text` 的映射规则 |
+| 是否需要对方同步 | 是：编译验证；设置界面若在 macOS 隐藏快捷方式链接，「中文输出」后的链接一并隐藏 |

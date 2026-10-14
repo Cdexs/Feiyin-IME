@@ -35,7 +35,7 @@ describe("LlmPage — gate validation", () => {
     const config = makeConfig({ llm: { connectivity_verified: false } });
     render(<LlmPage config={config} updateConfig={updateConfig} />);
 
-    const checkbox = screen.getByRole("checkbox", { name: /启用识别输出优化|Enable Output Optimization/ });
+    const checkbox = screen.getByRole("checkbox", { name: /启用输出优化|Enable Output Optimization/ });
     fireEvent.click(checkbox);
 
     expect(
@@ -50,7 +50,7 @@ describe("LlmPage — gate validation", () => {
     const config = makeConfig({ llm: { api_url: "" } });
     render(<LlmPage config={config} updateConfig={updateConfig} />);
 
-    const checkbox = screen.getByRole("checkbox", { name: /启用识别输出优化|Enable Output Optimization/ });
+    const checkbox = screen.getByRole("checkbox", { name: /启用输出优化|Enable Output Optimization/ });
     fireEvent.click(checkbox);
 
     expect(
@@ -65,7 +65,7 @@ describe("LlmPage — gate validation", () => {
     const updateConfig = vi.fn();
     render(<LlmPage config={config} updateConfig={updateConfig} />);
 
-    const checkbox = screen.getByRole("checkbox", { name: /启用识别输出优化|Enable Output Optimization/ });
+    const checkbox = screen.getByRole("checkbox", { name: /启用输出优化|Enable Output Optimization/ });
     fireEvent.click(checkbox);
 
     expect(updateConfig).toHaveBeenCalledWith(
@@ -85,7 +85,7 @@ describe("LlmPage — gate validation", () => {
     const updateConfig = vi.fn();
     render(<LlmPage config={config} updateConfig={updateConfig} />);
 
-    const checkbox = screen.getByRole("checkbox", { name: /启用识别输出优化|Enable Output Optimization/ });
+    const checkbox = screen.getByRole("checkbox", { name: /启用输出优化|Enable Output Optimization/ });
     expect(checkbox).toBeChecked();
     fireEvent.click(checkbox);
 

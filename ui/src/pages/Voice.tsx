@@ -375,8 +375,9 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
           </label>
           {/* V091-PUNCT-TAIL-214: 句尾不显示标点符号（默认关，绑 punctuation.strip_trailing） */}
           {/* SC-PUNCT-486：后接快捷方式链接（在 label 外，点链接不拨动开关） */}
-          <div className="toggle-row">
-            <label className="toggle-switch" style={{ border: 'none', boxShadow: 'none', padding: '8px 0', marginBottom: '4px' }}>
+          {/* SC-ALIGN-490：行距放在行容器上，label 不带 margin，否则标签文字比快捷方式高 2px */}
+          <div className="toggle-row" style={{ marginBottom: '4px' }}>
+            <label className="toggle-switch" style={{ border: 'none', boxShadow: 'none', padding: '8px 0', marginBottom: 0 }}>
               <input
                 type="checkbox"
                 checked={config.punctuation?.strip_trailing ?? false}
@@ -393,7 +394,11 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
           </div>
           <p className="form-hint" style={{ marginBottom: '12px' }}>{t.voice_strip_trailing_punct_hint}</p>
           <div className="form-group" style={{ marginTop: '16px' }}>
-            <span className="form-label">{t.voice_chinese_output}</span>
+            {/* SC-SCRIPT-489：「中文输出」后接快捷方式（按下在简体 / 繁体之间切换） */}
+            <div className="toggle-row" style={{ marginBottom: '4px' }}>
+              <span className="form-label">{t.voice_chinese_output}</span>
+              <ShortcutSetting config={config} updateConfig={updateConfig} action="chinese_script_toggle" />
+            </div>
             <div className="radio-group" style={{ marginTop: '8px' }}>
               <label className={`radio-card ${config.audio.chinese_script === 'Simplified' ? 'active' : ''}`}>
                 <input

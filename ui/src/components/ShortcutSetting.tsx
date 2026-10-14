@@ -1,10 +1,11 @@
-// SC-LLM-485 / SC-PUNCT-486（Gavin 10-14）：功能开关后面的「（快捷方式: 右Ctrl+1）」+ 设置对话框。
+// SC-LLM-485 / SC-PUNCT-486 / SC-SCRIPT-489（Gavin 10-14）：功能开关后面的「（快捷方式: 右Ctrl+1）」+ 设置对话框。
 //
 // 规则与主程序逐条对应（改一边必须改另一边）：
 //   - 合法组合：左右 Ctrl / Alt 中**恰好一个** + 字母或数字   ↔ src/config/mod.rs `ShortcutBinding::is_valid`
+//     （不支持 Shift：Shift+字母/数字 是打大写和符号，Gavin 10-14 确认不做）
 //   - 与热键冲突                                            ↔ `ShortcutBinding::conflict_with`
-//   - 两个快捷方式相同时只有「识别输出优化」生效             ↔ `AppConfig::active_shortcuts`
-//   - 默认 右Ctrl+1 / 右Ctrl+2                              ↔ `default_llm_toggle_shortcut` / `default_strip_trailing_shortcut`
+//   - 快捷方式相同时只有 SHORTCUT_ACTIONS 里靠前的生效      ↔ `AppConfig::active_shortcuts` / `ShortcutAction::ALL`
+//   - 默认 右Ctrl+1 / 2 / 3                                 ↔ `default_*_shortcut`
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getTranslations } from '../i18n';
@@ -14,11 +15,15 @@ export interface ShortcutBinding {
   key: number;
 }
 
-export type ShortcutAction = 'llm_toggle' | 'strip_trailing_toggle';
+export type ShortcutAction = 'llm_toggle' | 'strip_trailing_toggle' | 'chinese_script_toggle';
+
+/** 顺序即重复时的优先级（与 Rust `ShortcutAction::ALL` 同序）。 */
+export const SHORTCUT_ACTIONS: ShortcutAction[] = ['llm_toggle', 'strip_trailing_toggle', 'chinese_script_toggle'];
 
 export const DEFAULT_SHORTCUTS: Record<ShortcutAction, ShortcutBinding> = {
   llm_toggle: { modifier: 0xa3, key: 0x31 },
   strip_trailing_toggle: { modifier: 0xa3, key: 0x32 },
+  chinese_script_toggle: { modifier: 0xa3, key: 0x33 },
 };
 
 /** 浏览器 KeyboardEvent.code → 分左右的功能键 VK。 */
@@ -87,13 +92,12 @@ export function shortcutConflict(b: ShortcutBinding, config: any): ShortcutConfl
   return null;
 }
 
-const OTHER_ACTION: Record<ShortcutAction, ShortcutAction> = {
-  llm_toggle: 'strip_trailing_toggle',
-  strip_trailing_toggle: 'llm_toggle',
-};
-
-function actionLabel(action: ShortcutAction, t: T): string {
-  return action === 'llm_toggle' ? t.llm_enable : t.voice_strip_trailing_punct;
+export function actionLabel(action: ShortcutAction, t: T): string {
+  switch (action) {
+    case 'llm_toggle': return t.llm_enable;
+    case 'strip_trailing_toggle': return t.voice_strip_trailing_punct;
+    case 'chinese_script_toggle': return t.voice_chinese_output;
+  }
 }
 
 /** 对话框里的红色错误：热键冲突 / 与另一个快捷方式重复。无问题返回 null。 */
@@ -109,19 +113,20 @@ export function shortcutError(b: ShortcutBinding, config: any, action: ShortcutA
     default:
       break;
   }
-  const other = OTHER_ACTION[action];
-  if (sameBinding(b, bindingOf(config, other))) {
+  const other = SHORTCUT_ACTIONS.find((a) => a !== action && sameBinding(b, bindingOf(config, a)));
+  if (other) {
     return `${t.shortcut_err_dup_prefix}${actionLabel(other, t)}${t.shortcut_err_dup_suffix}`;
   }
   return null;
 }
 
-/** 当前配置下此快捷方式是否**不生效**（与 Rust `active_shortcuts` 同一判据）。 */
+/** 当前配置下此快捷方式是否**不生效**（与 Rust `active_shortcuts` 同一判据：冲突，或与排在前面的重复）。 */
 export function shortcutInactive(config: any, action: ShortcutAction): boolean {
   const b = bindingOf(config, action);
   if (!isValidBinding(b)) return false; // 未设置单独显示「未设置」
   if (shortcutConflict(b, config)) return true;
-  return action === 'strip_trailing_toggle' && sameBinding(b, bindingOf(config, 'llm_toggle'));
+  const earlier = SHORTCUT_ACTIONS.slice(0, SHORTCUT_ACTIONS.indexOf(action));
+  return earlier.some((a) => sameBinding(b, bindingOf(config, a)));
 }
 
 function setCapture(active: boolean) {
@@ -216,7 +221,11 @@ const ShortcutSetting: React.FC<Props> = ({ config, updateConfig, action }) => {
       return;
     }
     const key = mainKeyVk(code);
-    if (key === undefined) return;
+    if (key === undefined) {
+      // 合规检查（Gavin 10-14「不符合规范要在设置界面用红色错误信息提示用户」）：F 键 / 空格 / 符号等不可用。
+      setCaptureError(t.shortcut_need_alnum);
+      return;
+    }
     const held = [...pressedRef.current];
     const sided = held.filter((c) => c in SIDED_MODIFIER_VK);
     const extra = held.some((c) => OTHER_MODIFIER_CODES.has(c));

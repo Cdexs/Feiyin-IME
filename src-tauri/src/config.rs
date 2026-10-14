@@ -318,10 +318,11 @@ pub struct ShortcutBinding {
     pub key: u32,
 }
 
-/// Defaults (modifier, key): 右Ctrl+1 / 右Ctrl+2 — same values as the main config
-/// (`src/config/mod.rs` guard `settings_ui_mirror_uses_same_defaults` greps these two lines).
+/// Defaults (modifier, key): 右Ctrl+1 / 右Ctrl+2 / 右Ctrl+3 — same values as the main config
+/// (`src/config/mod.rs` guard `settings_ui_mirror_uses_same_defaults` greps these lines).
 pub const DEFAULT_LLM_TOGGLE_SHORTCUT: (u32, u32) = (0xA3, 0x31);
 pub const DEFAULT_STRIP_TRAILING_SHORTCUT: (u32, u32) = (0xA3, 0x32);
+pub const DEFAULT_CHINESE_SCRIPT_SHORTCUT: (u32, u32) = (0xA3, 0x33);
 
 fn default_llm_toggle_shortcut() -> ShortcutBinding {
     let (modifier, key) = DEFAULT_LLM_TOGGLE_SHORTCUT;
@@ -333,12 +334,20 @@ fn default_strip_trailing_shortcut() -> ShortcutBinding {
     ShortcutBinding { modifier, key }
 }
 
+fn default_chinese_script_shortcut() -> ShortcutBinding {
+    let (modifier, key) = DEFAULT_CHINESE_SCRIPT_SHORTCUT;
+    ShortcutBinding { modifier, key }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShortcutsConfig {
     #[serde(default = "default_llm_toggle_shortcut")]
     pub llm_toggle: ShortcutBinding,
     #[serde(default = "default_strip_trailing_shortcut")]
     pub strip_trailing_toggle: ShortcutBinding,
+    /// SC-SCRIPT-489: 中文输出 简体 ↔ 繁体（0.9.6 首包配置无此项 ⇒ 默认）。
+    #[serde(default = "default_chinese_script_shortcut")]
+    pub chinese_script_toggle: ShortcutBinding,
 }
 
 impl Default for ShortcutsConfig {
@@ -346,6 +355,7 @@ impl Default for ShortcutsConfig {
         Self {
             llm_toggle: default_llm_toggle_shortcut(),
             strip_trailing_toggle: default_strip_trailing_shortcut(),
+            chinese_script_toggle: default_chinese_script_shortcut(),
         }
     }
 }

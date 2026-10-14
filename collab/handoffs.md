@@ -114,3 +114,9 @@
 - 出包九项全过：main `91a2022c…` / ui `46be1b5d…` / crash-reporter `d63d9421…`，0.9.6；warnings 90 / 17 / 6。
 - 待 Gavin：重启输入法 → 按 todo 0.9.6 表逐项验收（快捷方式对话框目视、右Ctrl+1/2 提示窗、只说词条端测）。本地已 commit，未 push。
 
+## 2026-10-14 — 主控 — 0.9.6 追加 487~490 + BUILD-096b 出包
+
+- 内容：输出优化改名（UI-RENAME-487）、快捷方式文字加粗（SC-BOLD-488）、「中文输出」快捷方式简繁切换 + 非字母数字键红字（SC-SCRIPT-489，DEC-110 附则一；Shift 支持 Gavin 撤回）、快捷方式文字与标签同字号中线对齐（SC-ALIGN-490）。
+- 回归：bin 1967P/0F/71I、src-tauri 98P、Vitest 133P/11skip、真实浏览器 7P、tsc / fmt 干净。
+- 出包九项全过：main `5ce6be19…` / ui `7f21b8ab…` / crash-reporter `1c40e3e1…`。待 Gavin 重启输入法后目视 + 端测 右Ctrl+3。本地已 commit，未 push。
+

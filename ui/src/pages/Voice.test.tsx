@@ -718,3 +718,34 @@ describe('VoicePage - PUNCT-UI-001', () => {
     });
   });
 });
+
+describe('VoicePage - 中文输出快捷方式（SC-SCRIPT-489）', () => {
+  const config = {
+    ui_language: 'Chinese' as const,
+    hotkey: { mode: 'Toggle', vk_code: 0x78, modifiers: 0 },
+    translation: { enabled: false, vk_code: 0 },
+    audio: { device: 'default', asr_model: 'performance', chinese_script: 'Simplified', asr_online_api_key: '' },
+    llm: { enabled: false, api_url: '', api_key: '', model: '' },
+    punctuation: { enabled: true, strip_trailing: false },
+  };
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(async (cmd: string) => (cmd === 'check_accuracy_model_ready' ? true : null));
+  });
+
+  it('SC-UI-055: 「中文输出」后显示快捷方式 右Ctrl+3；点链接只开对话框，不改简繁', async () => {
+    const updateConfig = vi.fn();
+    render(<VoicePage config={config} updateConfig={updateConfig} />);
+    const title = screen.getByText(zhHans.voice_chinese_output as string);
+    const row = title.closest('.toggle-row') as HTMLElement;
+    expect(row).toBeTruthy();
+    expect(row.textContent).toContain('右Ctrl+3');
+    const links = screen.getAllByRole('button', { name: zhHans.shortcut_link as string });
+    expect(links.length).toBe(2); // 句尾标点 + 中文输出
+    fireEvent.click(row.querySelector('.shortcut-link') as HTMLElement);
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect(updateConfig).not.toHaveBeenCalled();
+    expect(screen.getByRole('radio', { name: zhHans.voice_simplified as string })).toBeChecked();
+  });
+});

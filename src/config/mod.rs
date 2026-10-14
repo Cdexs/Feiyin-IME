@@ -360,7 +360,7 @@ impl Default for InjectionConfig {
 }
 
 /// Which Chinese character script to output (only used when transcription_language is "zh").
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChineseScript {
     Simplified,
     Traditional,
@@ -485,10 +485,22 @@ pub enum ShortcutConflict {
 /// 哪个功能开关的快捷方式（主程序按键监听 → 控制器）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShortcutAction {
-    /// 「启用识别输出优化」（`llm.enabled`）。
+    /// 「启用输出优化」（`llm.enabled`）。
     LlmToggle,
     /// 「句尾不显示标点符号」（`punctuation.strip_trailing`）。
     StripTrailingToggle,
+    /// SC-SCRIPT-489：「中文输出」简体 ↔ 繁体（`audio.chinese_script`）。
+    ChineseScriptToggle,
+}
+
+impl ShortcutAction {
+    /// 全部快捷方式，**顺序即重复时的优先级**（相同组合只有排在前面的生效）。
+    /// 设置界面 `SHORTCUT_ACTIONS` 同序。
+    pub const ALL: [ShortcutAction; 3] = [
+        ShortcutAction::LlmToggle,
+        ShortcutAction::StripTrailingToggle,
+        ShortcutAction::ChineseScriptToggle,
+    ];
 }
 
 fn default_llm_toggle_shortcut() -> ShortcutBinding {
@@ -500,13 +512,20 @@ fn default_strip_trailing_shortcut() -> ShortcutBinding {
     ShortcutBinding::new(VK_RCONTROL, 0x32)
 }
 
-/// SC-LLM-485 / SC-PUNCT-486：功能开关快捷方式。字段定义与 src-tauri/src/config.rs 保持一致。
+fn default_chinese_script_shortcut() -> ShortcutBinding {
+    ShortcutBinding::new(VK_RCONTROL, 0x33)
+}
+
+/// SC-LLM-485 / SC-PUNCT-486 / SC-SCRIPT-489：功能开关快捷方式。字段定义与 src-tauri/src/config.rs 保持一致。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShortcutsConfig {
     #[serde(default = "default_llm_toggle_shortcut")]
     pub llm_toggle: ShortcutBinding,
     #[serde(default = "default_strip_trailing_shortcut")]
     pub strip_trailing_toggle: ShortcutBinding,
+    /// 0.9.6 首包没有此项 ⇒ 读到旧配置补默认 右Ctrl+3。
+    #[serde(default = "default_chinese_script_shortcut")]
+    pub chinese_script_toggle: ShortcutBinding,
 }
 
 impl Default for ShortcutsConfig {
@@ -514,21 +533,27 @@ impl Default for ShortcutsConfig {
         Self {
             llm_toggle: default_llm_toggle_shortcut(),
             strip_trailing_toggle: default_strip_trailing_shortcut(),
+            chinese_script_toggle: default_chinese_script_shortcut(),
+        }
+    }
+}
+
+impl ShortcutsConfig {
+    pub fn binding(&self, action: ShortcutAction) -> ShortcutBinding {
+        match action {
+            ShortcutAction::LlmToggle => self.llm_toggle,
+            ShortcutAction::StripTrailingToggle => self.strip_trailing_toggle,
+            ShortcutAction::ChineseScriptToggle => self.chinese_script_toggle,
         }
     }
 }
 
 impl AppConfig {
-    /// 当前**生效**的快捷方式（未设置 / 与热键冲突的剔除；两者相同时只留前者）。
+    /// 当前**生效**的快捷方式（未设置 / 与热键冲突的剔除；组合相同时只留 [`ShortcutAction::ALL`] 里靠前的）。
     pub fn active_shortcuts(&self) -> Vec<(ShortcutAction, ShortcutBinding)> {
         let mut out: Vec<(ShortcutAction, ShortcutBinding)> = Vec::new();
-        for (action, binding) in [
-            (ShortcutAction::LlmToggle, self.shortcuts.llm_toggle),
-            (
-                ShortcutAction::StripTrailingToggle,
-                self.shortcuts.strip_trailing_toggle,
-            ),
-        ] {
+        for action in ShortcutAction::ALL {
+            let binding = self.shortcuts.binding(action);
             if binding.is_valid()
                 && binding
                     .conflict_with(&self.hotkey, &self.translation)
@@ -542,7 +567,8 @@ impl AppConfig {
     }
 
     /// 快捷方式切换开关 —— 与设置界面点开关**同一规则**（Gavin「效果等同于用户点击"启用识别输出优化"按钮」）：
-    /// 打开「识别输出优化」须接口地址 / 密钥 / 模型齐全且通过连接测试（界面 `canEnable`），否则不动、返回 `Blocked`。
+    /// 打开「输出优化」须接口地址 / 密钥 / 模型齐全且通过连接测试（界面 `canEnable`），否则不动、返回 `Blocked`。
+    /// 「中文输出」在简体 / 繁体两项之间切换（与界面点另一个单选项相同，无前置条件）。
     pub fn apply_shortcut(&mut self, action: ShortcutAction) -> ShortcutOutcome {
         match action {
             ShortcutAction::LlmToggle => {
@@ -568,6 +594,13 @@ impl AppConfig {
                     ShortcutOutcome::Disabled
                 }
             }
+            ShortcutAction::ChineseScriptToggle => {
+                self.audio.chinese_script = match self.audio.chinese_script {
+                    ChineseScript::Simplified => ChineseScript::Traditional,
+                    ChineseScript::Traditional => ChineseScript::Simplified,
+                };
+                ShortcutOutcome::Switched(self.audio.chinese_script)
+            }
         }
     }
 }
@@ -577,8 +610,10 @@ impl AppConfig {
 pub enum ShortcutOutcome {
     Enabled,
     Disabled,
-    /// 「识别输出优化」接口未配好 / 未通过连接测试 ⇒ 不打开（与界面开关同规则）。
+    /// 「输出优化」接口未配好 / 未通过连接测试 ⇒ 不打开（与界面开关同规则）。
     Blocked,
+    /// 「中文输出」切换后的结果（Gavin「提示切换的结果」）。
+    Switched(ChineseScript),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -602,7 +637,7 @@ pub struct AppConfig {
     /// 字段定义与 src-tauri/src/config.rs 的 SceneConfig 保持一致。
     #[serde(default)]
     pub scene: SceneConfig,
-    /// SC-LLM-485 / SC-PUNCT-486：功能开关快捷方式（旧配置无此表 ⇒ 默认 右Ctrl+1 / 右Ctrl+2）。
+    /// SC-LLM-485 / SC-PUNCT-486 / SC-SCRIPT-489：功能开关快捷方式（旧配置无此表 ⇒ 默认 右Ctrl+1 / 2 / 3）。
     #[serde(default)]
     pub shortcuts: ShortcutsConfig,
 }
@@ -2035,6 +2070,7 @@ mod sc485_tests {
 
     const RCTRL_1: ShortcutBinding = ShortcutBinding::new(VK_RCONTROL, 0x31);
     const RCTRL_2: ShortcutBinding = ShortcutBinding::new(VK_RCONTROL, 0x32);
+    const RCTRL_3: ShortcutBinding = ShortcutBinding::new(VK_RCONTROL, 0x33);
 
     fn ready_llm(cfg: &mut AppConfig) {
         cfg.llm.api_url = "https://api.example.com/v1".into();
@@ -2044,10 +2080,38 @@ mod sc485_tests {
     }
 
     #[test]
-    fn defaults_are_right_ctrl_1_and_2() {
+    fn defaults_are_right_ctrl_1_2_3() {
         let s = ShortcutsConfig::default();
         assert_eq!(s.llm_toggle, RCTRL_1);
         assert_eq!(s.strip_trailing_toggle, RCTRL_2);
+        assert_eq!(s.chinese_script_toggle, RCTRL_3);
+        // binding() 与字段一一对应，ALL 覆盖全部动作
+        for action in ShortcutAction::ALL {
+            assert!(s.binding(action).is_valid(), "{action:?}");
+        }
+        assert_eq!(s.binding(ShortcutAction::ChineseScriptToggle), RCTRL_3);
+    }
+
+    #[test]
+    fn first_096_config_without_script_shortcut_gets_default() {
+        // 0.9.6 首包写出的 [shortcuts] 只有两项 —— 读入后第三项补默认 右Ctrl+3，前两项保持用户值。
+        let mut cfg = AppConfig::default();
+        cfg.shortcuts.llm_toggle = ShortcutBinding::new(VK_LMENU, 0x41);
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let start = text
+            .find("[shortcuts.chinese_script_toggle]")
+            .expect("serialized");
+        let rest = &text[start..];
+        let end = rest[1..].find("\n[").map(|i| i + 2).unwrap_or(rest.len());
+        let stripped = format!("{}{}", &text[..start], &rest[end..]);
+        assert!(!stripped.contains("chinese_script_toggle"));
+        let loaded: AppConfig = toml::from_str(&stripped).expect("0.9.6 config must parse");
+        assert_eq!(
+            loaded.shortcuts.llm_toggle,
+            ShortcutBinding::new(VK_LMENU, 0x41)
+        );
+        assert_eq!(loaded.shortcuts.strip_trailing_toggle, RCTRL_2);
+        assert_eq!(loaded.shortcuts.chinese_script_toggle, RCTRL_3);
     }
 
     #[test]
@@ -2140,16 +2204,20 @@ mod sc485_tests {
             cfg.active_shortcuts(),
             vec![
                 (ShortcutAction::LlmToggle, RCTRL_1),
-                (ShortcutAction::StripTrailingToggle, RCTRL_2)
+                (ShortcutAction::StripTrailingToggle, RCTRL_2),
+                (ShortcutAction::ChineseScriptToggle, RCTRL_3)
             ]
         );
-        // 重复 ⇒ 只留「识别输出优化」
+        // 重复 ⇒ 只留「输出优化」
         cfg.shortcuts.strip_trailing_toggle = RCTRL_1;
         assert_eq!(
             cfg.active_shortcuts(),
-            vec![(ShortcutAction::LlmToggle, RCTRL_1)]
+            vec![
+                (ShortcutAction::LlmToggle, RCTRL_1),
+                (ShortcutAction::ChineseScriptToggle, RCTRL_3)
+            ]
         );
-        // 录音热键 = 右Ctrl ⇒ 两个都失效
+        // 录音热键 = 右Ctrl ⇒ 全部失效
         cfg.shortcuts.strip_trailing_toggle = RCTRL_2;
         cfg.hotkey.vk_code = VK_RCONTROL;
         assert!(cfg.active_shortcuts().is_empty());
@@ -2158,8 +2226,56 @@ mod sc485_tests {
         cfg.shortcuts.llm_toggle = ShortcutBinding::new(0, 0);
         assert_eq!(
             cfg.active_shortcuts(),
-            vec![(ShortcutAction::StripTrailingToggle, RCTRL_2)]
+            vec![
+                (ShortcutAction::StripTrailingToggle, RCTRL_2),
+                (ShortcutAction::ChineseScriptToggle, RCTRL_3)
+            ]
         );
+    }
+
+    #[test]
+    fn duplicate_priority_follows_all_order() {
+        // 三个相同 ⇒ 只有排最前的生效；前一个失效（冲突 / 未设置）时让给下一个
+        let mut cfg = AppConfig::default();
+        cfg.hotkey.vk_code = 0x78;
+        cfg.hotkey.modifiers = 0;
+        cfg.shortcuts.strip_trailing_toggle = RCTRL_3;
+        assert_eq!(
+            cfg.active_shortcuts(),
+            vec![
+                (ShortcutAction::LlmToggle, RCTRL_1),
+                (ShortcutAction::StripTrailingToggle, RCTRL_3)
+            ]
+        );
+        cfg.shortcuts.strip_trailing_toggle = ShortcutBinding::new(0, 0);
+        assert_eq!(
+            cfg.active_shortcuts(),
+            vec![
+                (ShortcutAction::LlmToggle, RCTRL_1),
+                (ShortcutAction::ChineseScriptToggle, RCTRL_3)
+            ]
+        );
+    }
+
+    #[test]
+    fn chinese_script_toggles_between_simplified_and_traditional() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(cfg.audio.chinese_script, ChineseScript::Simplified);
+        assert_eq!(
+            cfg.apply_shortcut(ShortcutAction::ChineseScriptToggle),
+            ShortcutOutcome::Switched(ChineseScript::Traditional)
+        );
+        assert_eq!(cfg.audio.chinese_script, ChineseScript::Traditional);
+        assert_eq!(
+            cfg.apply_shortcut(ShortcutAction::ChineseScriptToggle),
+            ShortcutOutcome::Switched(ChineseScript::Simplified)
+        );
+        assert_eq!(cfg.audio.chinese_script, ChineseScript::Simplified);
+        // 只动中文输出一项
+        let before = cfg.clone();
+        cfg.apply_shortcut(ShortcutAction::ChineseScriptToggle);
+        cfg.audio.chinese_script = before.audio.chinese_script;
+        assert_eq!(cfg, before);
     }
 
     #[test]
@@ -2232,6 +2348,10 @@ mod sc485_tests {
             line(
                 "DEFAULT_STRIP_TRAILING_SHORTCUT",
                 defaults.strip_trailing_toggle,
+            ),
+            line(
+                "DEFAULT_CHINESE_SCRIPT_SHORTCUT",
+                defaults.chinese_script_toggle,
             ),
         ] {
             assert!(

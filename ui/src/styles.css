@@ -1104,7 +1104,7 @@ input[type="range"]::-moz-range-thumb {
   text-align: center;
 }
 
-/* === 功能开关快捷方式（SC-LLM-485 / SC-PUNCT-486） === */
+/* === 功能开关快捷方式（SC-LLM-485 / SC-PUNCT-486 / SC-SCRIPT-489） === */
 /* 开关 + 「（快捷方式: 右Ctrl+1）」同一行；链接在 label 之外，点它不会拨动开关 */
 .toggle-row {
   display: flex;
@@ -1113,8 +1113,19 @@ input[type="range"]::-moz-range-thumb {
   column-gap: 4px;
 }
 
+/* SC-SCRIPT-489：「中文输出」标题与快捷方式同一行，去掉标题自带的下边距以免上下错位 */
+.toggle-row > .form-label {
+  margin-bottom: 0;
+}
+
+/* SC-BOLD-488（Gavin「快捷键显示文字……都要加粗」）：整段加粗。
+   此前只有按键名 600，Segoe UI Variable 下 600 是半粗，看上去与正文几乎无差。
+   字号与前面的开关标签 / 表单标题同为 14px（Gavin「字号要一样大」）；行高继承同一值，
+   配合 .toggle-row 的 align-items: center 与标签文字中线对齐。
+   🔴 行内的开关 label 不得再带 margin（会把标签文字顶偏，见 SC-ALIGN-490），行距加在 .toggle-row 上。 */
 .shortcut-inline {
-  font-size: 13px;
+  font-size: 14px;
+  font-weight: 700;
   color: var(--link-color);
   white-space: nowrap;
 }
@@ -1139,10 +1150,6 @@ input[type="range"]::-moz-range-thumb {
 .shortcut-link:focus-visible {
   outline: 2px solid var(--link-color);
   outline-offset: 2px;
-}
-
-.shortcut-keys {
-  font-weight: 600;
 }
 
 .shortcut-inline-conflict {

@@ -7,6 +7,7 @@ import ShortcutSetting, {
   shortcutInactive,
   shortcutDisplay,
   mainKeyVk,
+  type ShortcutAction,
 } from "./ShortcutSetting";
 import LlmPage from "../pages/Llm";
 import { zhHans } from "../i18n/zh-Hans";
@@ -32,7 +33,7 @@ function makeConfig(overrides: Record<string, any> = {}) {
   };
 }
 
-function renderSetting(config: any, action: "llm_toggle" | "strip_trailing_toggle" = "llm_toggle") {
+function renderSetting(config: any, action: ShortcutAction = "llm_toggle") {
   const updateConfig = vi.fn();
   render(<ShortcutSetting config={config} updateConfig={updateConfig} action={action} />);
   return { updateConfig };
@@ -104,6 +105,7 @@ describe("ShortcutSetting — 设置对话框", () => {
         shortcuts: {
           llm_toggle: { modifier: 0xa2, key: 0x35 },
           strip_trailing_toggle: { modifier: 0xa3, key: 0x32 },
+          chinese_script_toggle: { modifier: 0xa3, key: 0x33 },
         },
       })
     );
@@ -232,10 +234,10 @@ describe("ShortcutSetting — 与主程序同一判据", () => {
 describe("LlmPage — 快捷方式集成", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it("SC-UI-040: 启用识别输出优化开关后显示快捷方式；点链接只开对话框、不拨动开关", () => {
+  it("SC-UI-040: 启用输出优化开关后显示快捷方式；点链接只开对话框、不拨动开关", () => {
     const updateConfig = vi.fn();
     render(<LlmPage config={makeConfig()} updateConfig={updateConfig} />);
-    const checkbox = screen.getByRole("checkbox", { name: /启用识别输出优化/ });
+    const checkbox = screen.getByRole("checkbox", { name: /启用输出优化/ });
     expect(checkbox).not.toBeChecked();
     fireEvent.click(screen.getByRole("button", { name: "快捷方式" }));
     expect(screen.getByRole("dialog")).toBeInTheDocument();
@@ -252,5 +254,68 @@ describe("uiLanguageFromSystem — 配置未读到时的界面语言", () => {
     expect(uiLanguageFromSystem("zh-Hant-HK")).toBe("TraditionalChinese");
     expect(uiLanguageFromSystem("en-US")).toBe("English");
     expect(uiLanguageFromSystem("")).toBe("English");
+  });
+});
+
+describe("ShortcutSetting — 中文输出快捷方式 + 合规检查（SC-SCRIPT-489）", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("SC-UI-050: 中文输出默认 右Ctrl+3；对话框点名功能「中文输出」", () => {
+    renderSetting(makeConfig(), "chinese_script_toggle");
+    expect(screen.getByText("右Ctrl+3")).toBeInTheDocument();
+    const dialog = openDialog();
+    expect(within(dialog).getByText(zhHans.voice_chinese_output)).toBeInTheDocument();
+  });
+
+  it("SC-UI-051: 录成别的开关已用的组合 → 红字点名对方（三个之间互查）", () => {
+    renderSetting(makeConfig(), "llm_toggle");
+    const dialog = openDialog();
+    const box = startCapture(dialog);
+    fireEvent.keyDown(box, { code: "ControlRight" });
+    fireEvent.keyDown(box, { code: "Digit3" });
+    expect(within(dialog).getByRole("alert")).toHaveTextContent(`与「${zhHans.voice_chinese_output}」的快捷方式重复`);
+    expect(saveButton(dialog)).toBeDisabled();
+  });
+
+  it("SC-UI-052: 重复时只有排在前面的生效（镜像 Rust ShortcutAction::ALL 顺序）", () => {
+    const same = { modifier: 0xa3, key: 0x31 };
+    const all = makeConfig({ shortcuts: { llm_toggle: same, strip_trailing_toggle: same, chinese_script_toggle: same } });
+    expect(shortcutInactive(all, "llm_toggle")).toBe(false);
+    expect(shortcutInactive(all, "strip_trailing_toggle")).toBe(true);
+    expect(shortcutInactive(all, "chinese_script_toggle")).toBe(true);
+    // 句尾那个未设置 ⇒ 中文输出只和输出优化比
+    const mid = makeConfig({
+      shortcuts: { llm_toggle: { modifier: 0xa3, key: 0x31 }, strip_trailing_toggle: { modifier: 0, key: 0 }, chinese_script_toggle: { modifier: 0xa3, key: 0x32 } },
+    });
+    expect(shortcutInactive(mid, "chinese_script_toggle")).toBe(false);
+  });
+
+  it("SC-UI-053: 合规检查 —— F5 / 空格 / 符号键 → 红字提示只能用字母或数字，继续录制；随后按对即清除", () => {
+    renderSetting(makeConfig(), "chinese_script_toggle");
+    const dialog = openDialog();
+    const box = startCapture(dialog);
+    fireEvent.keyDown(box, { code: "ControlRight" });
+    for (const code of ["F5", "Space", "Minus"]) {
+      fireEvent.keyDown(box, { code });
+      expect(within(dialog).getByRole("alert")).toHaveTextContent(zhHans.shortcut_need_alnum);
+      expect(within(dialog).getByRole("textbox")).toBeInTheDocument();
+    }
+    fireEvent.keyDown(box, { code: "KeyJ" });
+    expect(within(dialog).queryByRole("alert")).toBeNull();
+    expect(within(dialog).getByRole("button", { name: "右Ctrl+J" })).toBeInTheDocument();
+    expect(saveButton(dialog)).not.toBeDisabled();
+  });
+
+  it("SC-UI-054: 保存写回 shortcuts.chinese_script_toggle，其余两项补默认", () => {
+    const { updateConfig } = renderSetting(makeConfig(), "chinese_script_toggle");
+    const dialog = openDialog();
+    const box = startCapture(dialog);
+    fireEvent.keyDown(box, { code: "AltLeft" });
+    fireEvent.keyDown(box, { code: "KeyT" });
+    fireEvent.click(saveButton(dialog));
+    const saved = updateConfig.mock.calls[0][0];
+    expect(saved.shortcuts.chinese_script_toggle).toEqual({ modifier: 0xa4, key: 0x54 });
+    expect(saved.shortcuts.llm_toggle).toEqual({ modifier: 0xa3, key: 0x31 });
+    expect(saved.shortcuts.strip_trailing_toggle).toEqual({ modifier: 0xa3, key: 0x32 });
   });
 });

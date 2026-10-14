@@ -12,7 +12,7 @@ describe("App", () => {
 
     // Verify sidebar navigation items
     expect(screen.getByText("语音输入")).toBeInTheDocument();
-    expect(screen.getByText("识别输出优化")).toBeInTheDocument();
+    expect(screen.getByText("输出优化")).toBeInTheDocument();
     expect(screen.getByText("词库")).toBeInTheDocument();
     expect(screen.getByText("我的")).toBeInTheDocument(); // STATS-475
     expect(screen.getByText("关于")).toBeInTheDocument();
