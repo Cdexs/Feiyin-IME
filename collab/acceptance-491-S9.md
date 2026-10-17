@@ -45,7 +45,7 @@
 
 | 项 | 结论 |
 | --- | --- |
-| 新增单测（子 Agent） | 共 58 个：`char_times.rs` 37 个；`transcription/mod.rs` 4 个（字数不变量覆盖零重叠 / 双时间 / 仅前窗时间 / 比例估算 / `refine_times` 五条拼接路径，`finish_timed` 文字 == `finish`，`timed_snapshot` 只认当前全文）；`compose.rs` 6 个（每次事件后 `display_times` 字数 == 显示字数）；`local_stream.rs` 5 个；`session.rs` 4 个（成词拼接不变量、估算来源）；网关 `ws.rs` 2 个；`frame.rs` 2 个（旧内核无 `words` 字段照常解析、空表不序列化） |
+| 新增单测（子 Agent） | 共 60 个：`char_times.rs` 37 个；`transcription/mod.rs` 4 个（字数不变量覆盖零重叠 / 双时间 / 仅前窗时间 / 比例估算 / `refine_times` 五条拼接路径，`finish_timed` 文字 == `finish`，`timed_snapshot` 只认当前全文）；`compose.rs` 6 个（每次事件后 `display_times` 字数 == 显示字数）；`local_stream.rs` 5 个；`session.rs` 4 个（成词拼接不变量、估算来源）；网关 `ws.rs` 2 个；`frame.rs` 2 个（旧内核无 `words` 字段照常解析、空表不序列化） |
 | 首轮全量 | 2044 过 / **4 失败**：① `t441_pipeline_declarations` **本批引起**：护栏锚点 `apply_authoritative_filler_dedup(&authoritative)` 被改名打断 ⇒ **改生产代码恢复原写法**（只在远程时另存一份去重前原文），护栏不放宽；②③ `ts423_single_dispatch_window_call_and_tail_macro` / `ts423g_dispatch_call_sites_source_anchor`、④ `g7_mic_muted_reject_exit_resets_poll_stop` 是 **S1 遗留的护栏漂移**（S1 搬迁后 rustfmt 把宏调用排成单行、`let must_start =` 折行；`main.rs` 第 34 行单项 `#[cfg(test)] const MAIN_RS_SRC` 让 G7 读生产区时提前截断）⇒ 修护栏的**读法**（新增 `guard_prod_lines::macro_call_arg` 单行 / 多行同口径取实参；G7 只在测试**模块**处截断），断言内容不变 |
 | 复跑 | 4 个原失败全过；全量 `feiyin-ime` **2048 过 / 0 失败** / 48 忽略；网关 **26 过 / 0 失败**；rustfmt 全部干净 |
 | 正式回归 | 本批不出包；S10、S11 完成后统一交 tester-1 |

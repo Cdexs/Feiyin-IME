@@ -2836,3 +2836,13 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 行为变化 | 档位选「自家识别服务」前**无变化**：阿里在线识别行为不变（只是建连一段挪成函数，逻辑原样），本地识别路径未动。选了之后：不要 API Key、不加载本地模型，走在线流式管线，音频经 `wss://` 发到另一台装了飞音、开了识别服务的电脑；证书只认配对时的指纹；`run-task` 多带 `parameters.feiyin = {device_id, device_name, postprocess}`。没配对就离开语音页 ⇒ 档位回落上一个（与无 API Key 同） |
 | 对 macOS 的影响 | **编译**：全部改动在平台中立模块，无 `src/platform` 改动，macOS 编译同一份代码；**新增依赖：无**（rustls / ring 已在依赖里）。**取计算机名**：macOS 走 `scutil --get ComputerName`（进程内只取一次），Windows 走 `COMPUTERNAME`；该分支**未在 macOS 编译 / 实测**。`asr_model` 若有穷举 match 须补 `FeiyinServer`。设置页为共用 React，macOS 同一份。**未验证**：端到端（需两台电脑，S11 参考客户端） |
 | 是否需要对方同步 | 是：macOS 编译验证（重点 `scutil` 取名分支、`asr_model` 穷举 match、`tls_pin.rs` 的 rustls 自定义校验器）；设置界面配对卡片目视；两台电脑端到端待 S11。对方（服务端）数字规整 `postprocess` 待 S10 |
+
+## ASR-SERVER-491 一期 S9（2026-10-17，主控）· 远程会话逐字时间戳（提交 `0f00283`）
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | 全部落在平台中立模块：新模块 `src/transcription/char_times.rs`（`TsSource` / `CharTime` / `transfer` / `fill_missing` / `SliceMap` / `rough_from_marks` / `group_words`）；`src/transcription/mod.rs`（`OrderedReflow` 加 `committed_times`，新增 `full_times` / `timed_snapshot` / `finish_timed`）；`src/transcription/local_stream.rs`（`PreviewRole::Remote` 加 `slices`，`record_slices`，预览粗略时间）；`src/localrt_session.rs`；`src/main.rs`（事件定义与解构）；`src/asr_service/{compose,frame,session}.rs`；网关 `src/bin/feiyin-asr-gateway/ws.rs`。**平台契约（`src/platform`）无变化**；唯一触及 `src/platform/` 的是 `src/platform/windows/hotkey.rs` 里测试函数 `main_prod_lines` 的读法（Windows 专用文件、仅测试代码，护栏断言不变），macOS 不编译该文件 |
+| 契约变化（macOS 侧必须知道） | ① `PipelineEvent::PreviewReflow` **新增字段 `acc_times`**：每个构造处都必须填（本机一律 `None`），匹配处用 `..` 或补 `acc_times: _`；② `run_acc_windows` **返回值改为 6 元组**，第 6 项是远程每字时间（本机恒 `None`），调用处解构要补一个 `_`；③ `PreviewRole::Remote` **新增字段 `slices`**（片映射，派发前登记）；④ `OrderedReflow::finish` **变为仅测试使用**，生产代码走 `finish_timed`（取前两项）；⑤ 新增模块 `src/transcription/char_times.rs`（须在 `transcription/mod.rs` 声明，macOS 同一份）；⑥ 网关结果 JSON：`sentence.words` 现在**非空**（阿里格式：`begin_time` / `end_time` 毫秒、相对会话第一帧，`text` + `punctuation`，各词拼起来等于原文），`output.feiyin.ts_source` 按 `words` 顺序给每词来源（`aligned` / `rough` / `estimated`）；结果帧 `ResultPayload` 新增 `words`（旧内核无此字段照常解析，空表不序列化） |
+| 行为变化 | **本机识别路径逐位不变**（`is_remote()` 为假时不算时间、不分配，回灌事件个数 / 内容 / 节奏同前）。**仅远程会话**：最后一窗照常对齐 ⇒ 终稿多等约 0.25s；最后一道接缝按时间拼（与中间各窗同一规则），终稿文字可能比改前略准。无新增依赖，无 `cfg(target_os)` 分支 |
+| 对 macOS 的影响 | macOS 编译同一份代码，**未在 macOS 编译 / 实测**。重点核对：所有 `PipelineEvent::PreviewReflow { .. }` 的构造与解构、`run_acc_windows` 调用处、`PreviewRole::Remote` 构造处（若 macOS 侧另有构造点，须补 `acc_times` / `slices`）。测试侧：`t441_pipeline_declarations` 等源码锚点护栏读 `main.rs` 文本，S9 已改成单行 / 多行同口径取实参，macOS 若有同类护栏按同一读法 |
+| 是否需要对方同步 | 是：macOS 编译验证（上列四处构造 / 解构点）；远程会话端到端待 S10、S11 后统一回归 |
