@@ -28,6 +28,7 @@ if %ERRORLEVEL% EQU 0 (
     copy /Y target\release\feiyin-ime.exe Publish\
     copy /Y target\release\feiyin-ime-ui.exe Publish\
     copy /Y target\release\crash-reporter.exe Publish\
+    copy /Y target\release\feiyin-asr-gateway.exe Publish\
     REM 同步运行时 DLL
     copy /Y target\release\sherpa-onnx-c-api.dll Publish\ 2>nul
     copy /Y target\release\sherpa-onnx-cxx-api.dll Publish\ 2>nul

@@ -190,7 +190,7 @@ if (-not (Test-Path $Models)) {
 # Step 5: Copy current EXEs to Publish/
 Write-Host "`n[Step 5] Copy EXEs to Publish/" -ForegroundColor Yellow
 # RELEASE-ISS-FROM-PUBLISH-400/405：实际产物名为 feiyin-ime*.exe（旧 voice-ime.exe 已作废，见 .iss）。
-$exes = @("feiyin-ime.exe", "feiyin-ime-ui.exe", "crash-reporter.exe")
+$exes = @("feiyin-ime.exe", "feiyin-ime-ui.exe", "crash-reporter.exe", "feiyin-asr-gateway.exe")
 foreach ($exe in $exes) {
     $src = Join-Path $TargetRelease $exe
     $dst = Join-Path $Publish $exe

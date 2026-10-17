@@ -2866,3 +2866,11 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 行为变化 | 无 |
 | 对 macOS 的影响 | 协议文档平台无关。macOS 侧可用同一 Python 脚本对本机服务冒烟：`python3 tools/asr-client/feiyin_asr_client.py --code "<连接码>" --wav <16k 单声道 wav>`（仅需 Python 3 标准库） |
 | 是否需要对方同步 | 否。**对 macOS 无影响、无需同步改动** |
+
+### ASR-SERVER-491 打包补漏（2026-10-18，Windows 端）
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | Windows 打包链加入网关程序 `feiyin-asr-gateway.exe`（`build.bat` / `scripts/init-publish.ps1` / 安装器 `[Files]`、卸载结束进程）；安装器（管理员模式）加防火墙入站规则「Feiyin ASR Gateway」，按程序放行、仅专用网络 |
+| 对 macOS 的影响 | 🔴 **需要同步**：macOS 的 `.app` 打包须把 `feiyin-asr-gateway` 二进制放进与主程序同一目录（内核看护线程按「同目录 `feiyin-asr-gateway`」拉起，缺了则识别服务开关打开后网关起不来，`asr-gateway.log` 无输出）。macOS 防火墙为应用级弹窗授权，无需安装期规则 |
+| 是否需对方改动 | 是：`scripts/build-macos.sh` 打包步骤加网关二进制 |

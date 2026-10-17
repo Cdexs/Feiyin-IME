@@ -75,6 +75,8 @@ Name: "autostart"; Description: "{cm:AutoStartProgram,{#MyAppName}}"; GroupDescr
 Source: "..\Publish\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Publish\feiyin-ime-ui.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Publish\crash-reporter.exe"; DestDir: "{app}"; Flags: ignoreversion
+; ASR-SERVER-491：识别服务网关（内核按设置页总开关拉起；关闭时不运行）
+Source: "..\Publish\feiyin-asr-gateway.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 ; ---- ASR 运行库 ----
 Source: "..\Publish\sherpa-onnx-c-api.dll"; DestDir: "{app}"; Flags: ignoreversion
@@ -146,6 +148,14 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--settings"; \
     Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; \
     Flags: nowait postinstall skipifsilent
+; ASR-SERVER-491（设计 §8.8）：识别服务网关入站规则，**只放行专用网络**（端口映射进来的流量走家里网卡，属专用网络；
+; 公共 Wi-Fi 下不开放）。按程序放行而非按端口：端口可在设置页改。先删同名旧规则，重装不重复。
+; 写防火墙要管理员：只在「为所有用户安装」（管理员模式）时执行；按用户安装时由 Windows 在网关首次监听时
+; 弹出系统的「允许访问」对话框，用户勾「专用网络」即可。
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Feiyin ASR Gateway"""; \
+    Flags: runhidden; Check: IsAdminInstallMode
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""Feiyin ASR Gateway"" dir=in action=allow program=""{app}\feiyin-asr-gateway.exe"" protocol=TCP profile=private enable=yes"; \
+    Flags: runhidden; Check: IsAdminInstallMode
 
 [UninstallRun]
 ; Kill running processes before uninstall (main / settings UI / crash reporter)
@@ -155,6 +165,10 @@ Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM feiyin-ime-ui.exe"; \
     Flags: runhidden; RunOnceId: "KillVoiceIMEUI"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM crash-reporter.exe"; \
     Flags: runhidden; RunOnceId: "KillCrashReporter"
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM feiyin-asr-gateway.exe"; \
+    Flags: runhidden; RunOnceId: "KillAsrGateway"
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Feiyin ASR Gateway"""; \
+    Flags: runhidden; RunOnceId: "DelAsrGatewayFirewall"; Check: IsAdminInstallMode
 
 [UninstallDelete]
 ; Remove user data (optional, commented out by default to preserve user settings)

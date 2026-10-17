@@ -22,7 +22,7 @@
 #### Step 1 — 退出运行中进程
 
 ```bash
-powershell -Command "Get-Process feiyin-ime,feiyin-ime-nor,voice-ime-ui,feiyin-ime-ui,crash-reporter -ErrorAction SilentlyContinue | Stop-Process -Force"
+powershell -Command "Get-Process feiyin-ime,feiyin-ime-nor,voice-ime-ui,feiyin-ime-ui,crash-reporter,feiyin-asr-gateway -ErrorAction SilentlyContinue | Stop-Process -Force"
 ```
 
 > 名单含 `feiyin-ime-nor`：BUILD-017 实测发现该 8-9 遗留构建会持单实例 mutex，导致新包启动报
@@ -63,6 +63,7 @@ cargo build --release
 cp target/release/feiyin-ime.exe Publish/
 cp target/release/feiyin-ime-ui.exe Publish/
 cp target/release/crash-reporter.exe Publish/
+cp target/release/feiyin-asr-gateway.exe Publish/
 # 🔴 规则 toml 必须一并同步（见下方「toml 三副本」强制项）
 cp scene-rules.toml Publish/ && cp scene-rules.toml target/release/
 cp itn-rules.toml   Publish/ && cp itn-rules.toml   target/release/
@@ -99,6 +100,7 @@ sha256sum ./itn-rules.toml   Publish/itn-rules.toml   target/release/itn-rules.t
 Copy-Item -Path "target\release\feiyin-ime.exe" -Destination "Publish\" -Force
 Copy-Item -Path "target\release\feiyin-ime-ui.exe" -Destination "Publish\" -Force
 Copy-Item -Path "target\release\crash-reporter.exe" -Destination "Publish\" -Force
+Copy-Item -Path "target\release\feiyin-asr-gateway.exe" -Destination "Publish\" -Force
 Get-ChildItem -Path "Publish\*.exe" | Select-Object Name, LastWriteTime, Length
 ```
 
@@ -497,7 +499,7 @@ ls -la target/release/feiyin-ime-ui.exe
 
 ```bash
 # 0. 【必须先构建】确保 feiyin-ime-ui.exe 包含最新前端修改
-powershell -Command "Get-Process feiyin-ime,feiyin-ime-nor,voice-ime-ui,feiyin-ime-ui,crash-reporter -ErrorAction SilentlyContinue | Stop-Process -Force"
+powershell -Command "Get-Process feiyin-ime,feiyin-ime-nor,voice-ime-ui,feiyin-ime-ui,crash-reporter,feiyin-asr-gateway -ErrorAction SilentlyContinue | Stop-Process -Force"
 cd /d/Workspace/CodeLab/voice-ime/ui && npm run build
 cargo build --release --manifest-path src-tauri/Cargo.toml --features custom-protocol
 cp src-tauri/target/release/feiyin-ime-ui.exe target/release/  # 同步产物
