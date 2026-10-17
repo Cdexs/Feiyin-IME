@@ -464,8 +464,13 @@ impl LlamaAsr {
     pub(crate) fn create_slot(&self) -> Result<LlamaSlot<'_>> {
         let mut err = [0u8; 512];
         // SAFETY：self.ptr 有效；slot 借用 self ⇒ 必先于引擎释放。
-        let ptr =
-            unsafe { las_create_slot(self.ptr, err.as_mut_ptr() as *mut c_char, err.len() as c_int) };
+        let ptr = unsafe {
+            las_create_slot(
+                self.ptr,
+                err.as_mut_ptr() as *mut c_char,
+                err.len() as c_int,
+            )
+        };
         if ptr.is_null() {
             bail!("slot create failed: {}", buf_str(&err));
         }
@@ -541,56 +546,56 @@ fn decode_on(
     max_new_tokens: Option<i32>,
     assist: DecodeAssist<'_>,
 ) -> Result<LlamaDecodeOut> {
-        let sys = system.map(cstr).transpose()?;
-        let pre = cstr(prefix)?;
-        let dr = assist
-            .draft
-            .filter(|d| !d.is_empty())
-            .map(cstr)
-            .transpose()?;
-        let mut out = vec![0u8; 64 * 1024];
-        let mut err = [0u8; 512];
-        let mut st = LasStats::default();
-        let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
-        // ⑤ 逐字回调：把 `&dyn Fn` 的地址交给 shim，经 `partial_trampoline` 转回（调用期间栈上存活）。
-        let cb_ref: Option<&(dyn Fn(&str) + Sync)> = assist.on_partial;
-        let (cb_fn, cb_user): (
-            Option<extern "C" fn(*mut c_void, *const c_char)>,
-            *mut c_void,
-        ) = match cb_ref.as_ref() {
-            Some(r) => (
-                Some(partial_trampoline),
-                r as *const &(dyn Fn(&str) + Sync) as *mut c_void,
-            ),
-            None => (None, std::ptr::null_mut()),
-        };
-        // SAFETY：指针均有效且在调用期间存活；out / err 为可写缓冲；空 prefix ⇒ shim 视为不预填。
-        let rc = unsafe {
-            las_decode(
-                ptr,
-                samples.as_ptr(),
-                samples.len() as c_int,
-                sys.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
-                pre.as_ptr(),
-                dr.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
-                max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS),
-                if dr.is_some() { DRAFT_MAX } else { 0 },
-                out.as_mut_ptr() as *mut c_char,
-                out.len() as c_int,
-                &mut st,
-                err.as_mut_ptr() as *mut c_char,
-                err.len() as c_int,
-                cb_fn,
-                cb_user,
-            )
-        };
-        if rc != 0 {
-            bail!("llama.cpp decode failed ({rc}): {}", buf_str(&err));
-        }
-        Ok(LlamaDecodeOut {
-            raw: buf_str(&out),
-            stats: st,
-        })
+    let sys = system.map(cstr).transpose()?;
+    let pre = cstr(prefix)?;
+    let dr = assist
+        .draft
+        .filter(|d| !d.is_empty())
+        .map(cstr)
+        .transpose()?;
+    let mut out = vec![0u8; 64 * 1024];
+    let mut err = [0u8; 512];
+    let mut st = LasStats::default();
+    let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+    // ⑤ 逐字回调：把 `&dyn Fn` 的地址交给 shim，经 `partial_trampoline` 转回（调用期间栈上存活）。
+    let cb_ref: Option<&(dyn Fn(&str) + Sync)> = assist.on_partial;
+    let (cb_fn, cb_user): (
+        Option<extern "C" fn(*mut c_void, *const c_char)>,
+        *mut c_void,
+    ) = match cb_ref.as_ref() {
+        Some(r) => (
+            Some(partial_trampoline),
+            r as *const &(dyn Fn(&str) + Sync) as *mut c_void,
+        ),
+        None => (None, std::ptr::null_mut()),
+    };
+    // SAFETY：指针均有效且在调用期间存活；out / err 为可写缓冲；空 prefix ⇒ shim 视为不预填。
+    let rc = unsafe {
+        las_decode(
+            ptr,
+            samples.as_ptr(),
+            samples.len() as c_int,
+            sys.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+            pre.as_ptr(),
+            dr.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+            max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS),
+            if dr.is_some() { DRAFT_MAX } else { 0 },
+            out.as_mut_ptr() as *mut c_char,
+            out.len() as c_int,
+            &mut st,
+            err.as_mut_ptr() as *mut c_char,
+            err.len() as c_int,
+            cb_fn,
+            cb_user,
+        )
+    };
+    if rc != 0 {
+        bail!("llama.cpp decode failed ({rc}): {}", buf_str(&err));
+    }
+    Ok(LlamaDecodeOut {
+        raw: buf_str(&out),
+        stats: st,
+    })
 }
 
 // ============================================================================================
