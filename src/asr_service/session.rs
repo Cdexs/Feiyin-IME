@@ -224,8 +224,12 @@ pub(crate) fn run_remote_session(
                 emit(ResultPayload {
                     is_final: false,
                     words: result_words(&text, &times, known_end(&times)),
+                    tentative: text_stage::preview_tentative(
+                        composer.display(),
+                        composer.tentative(),
+                        &opts,
+                    ),
                     text,
-                    tentative: composer.tentative(),
                     translation: None,
                 });
             }

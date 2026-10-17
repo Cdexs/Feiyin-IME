@@ -69,6 +69,32 @@ pub(crate) fn apply_preview(
     }
 }
 
+/// 预览的「末尾未稳定字数」换算到处理后的文字（数字规整等会改字数，如「一百二十」⇒「120」）。
+/// 做法：每个原字的「时间」记成它的下标，过一遍同样的节点，处理后末尾那些落在未稳定区的字即未稳定。
+/// 被替换的一组字按比例分摊原字位置（`transfer` 均分），落点在未稳定区的算未稳定：「我有一百二十」
+/// 末 2 字未稳 ⇒「我有120」末 2 字（「20」）未稳。末尾无位置的字（插入）一律算未稳。
+pub(crate) fn preview_tentative(text: &str, tentative: usize, o: &TextOpts) -> usize {
+    if tentative == 0 {
+        return 0;
+    }
+    let n = text.chars().count();
+    let stable = n.saturating_sub(tentative) as f32;
+    let marks: Times = (0..n)
+        .map(|i| {
+            Some(CharTime {
+                begin: i as f32,
+                end: i as f32,
+                src: char_times::TsSource::Aligned,
+            })
+        })
+        .collect();
+    let (_, m) = apply_preview(text, &marks, o);
+    m.iter()
+        .rev()
+        .take_while(|t| t.map_or(true, |t| t.end >= stable))
+        .count()
+}
+
 /// 终稿：全部节点。只有口水词 ⇒ 空文本。
 pub(crate) fn apply_final(text: &str, times: &[Option<CharTime>], o: &TextOpts) -> (String, Times) {
     if !text_normalizer::is_effective_text(text) {
@@ -389,6 +415,96 @@ mod tests {
                 if punctuation::has_effective_punctuation(text) {
                     let (f, ft) = apply_final(text, &t, &opts(itn_on, true));
                     assert_aligned(&f, &ft);
+                }
+            }
+        }
+    }
+
+    fn out_len(text: &str, o: &TextOpts) -> usize {
+        apply_preview(text, &times_for(text), o).0.chars().count()
+    }
+
+    #[test]
+    fn preview_tentative_zero_is_zero() {
+        for text in [NUM, "我有一百二十", "今天天气很好", ""] {
+            for itn_on in [true, false] {
+                assert_eq!(preview_tentative(text, 0, &opts(itn_on, true)), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn preview_tentative_unchanged_text_keeps_value() {
+        let text = "今天天气很好我们出去玩";
+        let o = opts(true, true);
+        assert_eq!(
+            apply_preview(text, &times_for(text), &o).0,
+            text,
+            "前提：文字不变"
+        );
+        for tent in 1..=text.chars().count() {
+            assert_eq!(preview_tentative(text, tent, &o), tent, "tentative={tent}");
+        }
+    }
+
+    #[test]
+    fn preview_tentative_number_in_stable_zone() {
+        let text = "一百二十个苹果";
+        let o = opts(true, true);
+        assert_eq!(
+            itn::normalize_numbers(text),
+            "120个苹果",
+            "前提：itn 把数字规整成 120"
+        );
+        // 末尾「苹果」未稳定，「一百二十个」稳定 ⇒ 处理后仍是「苹果」2 字。
+        assert_eq!(preview_tentative(text, 2, &o), 2);
+    }
+
+    #[test]
+    fn preview_tentative_number_fully_unstable() {
+        let text = "我有一百二十";
+        let o = opts(true, true);
+        assert_eq!(
+            itn::normalize_numbers(text),
+            "我有120",
+            "前提：itn 把数字规整成 120"
+        );
+        // 「一百二十」4 字全部未稳定 ⇒ 处理后「120」3 字全部未稳定。
+        assert_eq!(preview_tentative(text, 4, &o), 3);
+    }
+
+    #[test]
+    fn preview_tentative_number_across_boundary() {
+        let text = "我有一百二十";
+        let o = opts(true, true);
+        let out = out_len(text, &o); // 「我有120」= 5
+        let r = preview_tentative(text, 2, &o);
+        // 「一百二十」⇒「120」按比例分摊：未稳的「二十」对应「20」⇒ 2（out = 5，「我有120」）。
+        assert_eq!(r, 2, "out={out}");
+    }
+
+    #[test]
+    fn preview_tentative_never_exceeds_output_len() {
+        let samples = [
+            NUM,
+            "一百二十个苹果",
+            "我有一百二十",
+            "今天天气很好，我们出去玩吧。",
+            "温度二十五度，湿度百分之五十。",
+        ];
+        for text in samples {
+            let n = text.chars().count();
+            for itn_on in [true, false] {
+                for punc_on in [true, false] {
+                    let o = opts(itn_on, punc_on);
+                    let out = out_len(text, &o);
+                    for tent in 0..=n + 2 {
+                        let r = preview_tentative(text, tent, &o);
+                        assert!(
+                            r <= out,
+                            "{text:?} itn={itn_on} punc={punc_on} tent={tent}: {r} > {out}"
+                        );
+                    }
                 }
             }
         }
