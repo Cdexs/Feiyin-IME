@@ -66,3 +66,7 @@
 ## F. 跨平台
 
 全部改动在平台中立模块（`asr_service/` / 网关 / `audio/feiyin_remote.rs`），无 `cfg(target_os)` 分支 ⇒ Windows / macOS 同一行为。macOS 侧需知：`OpenParams` 多三字段、`ResultPayload` 多 `translation`、远程翻译线程。写入 `docs/MACOS-HANDOFF.md`。
+
+## G. 验收后追加修正（`35e928a`）
+
+写 S11 协议文档核对字段时发现：预览经数字规整后字数会变（「一百二十」⇒「120」），`feiyin.tentative` 仍按原文计数 ⇒ 终端标灰位置错。修：`text_stage::preview_tentative`（原字下标当时间过同一批节点，末尾落在未稳定区的字计为未稳定；替换组按 `transfer` 比例分摊，「我有一百二十」末 2 字未稳 ⇒「我有120」末 2 字未稳）。会话 `session.rs` 预览帧改用它。单测 6 个（子 Agent），`asr_service` 31 过。
