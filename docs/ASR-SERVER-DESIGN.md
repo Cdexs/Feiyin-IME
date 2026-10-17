@@ -120,6 +120,8 @@ pub fn run_session(
 
 ### 5.1 主协议：DashScope `run-task`（WebSocket，PCM 或 Opus 二进制帧）
 
+> **对外契约以 `docs/ASR-PROTOCOL.md` 为准**（S11，给手机端等另起项目的终端照着对接；参考客户端 `tools/asr-client/feiyin_asr_client.py`）。本节是设计过程记录。
+
 | 方向 | 消息 | 说明 |
 | --- | --- | --- |
 | 客户端 → | `run-task` | `parameters.format` = `pcm` / `opus`，`sample_rate` = 16000，可带 `vocabulary`；鉴权放在 `Authorization: Bearer <访问码>` |
