@@ -128,6 +128,9 @@ pub(crate) struct OpenParams {
     /// 终端名称（展示用）。
     #[serde(default)]
     pub device_name: String,
+    /// 终端内部编号（网关鉴权后填；统计库 `terminal_id`，S5）。
+    #[serde(default)]
+    pub terminal_id: String,
     /// 客户端追加词表（阿里协议 `vocabulary`）；追加在本机词库之后。
     #[serde(default)]
     pub vocabulary: Vec<String>,

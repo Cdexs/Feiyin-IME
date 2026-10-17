@@ -2791,3 +2791,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 行为变化 | 服务未启动时**无变化**：本机路径只多一次无竞争的计数 / 锁（预览解码锁、本机优先计数）。服务（S4 起由网关拉起）启动后，远程终端各开一路推理通道，本机每生成一个 token 都优先 |
 | 对 macOS 的影响 | **编译**：macOS 若另有 `transcribe_streaming_local` 调用点须补最后一个参数 `PreviewRole::Local`；若有 `plan_self_vad_trim` 调用须补 `true`。**shim**：macOS 构建同一份 `shim.cpp`（Metal 下 `las_dev_memory` 同样走 `ggml_backend_dev_memory`）。**传输**：`asr_service::transport` 的 macOS 分支（`$TMPDIR` 下 Unix socket，0600）已写好但**未在 macOS 上编译 / 实测**；Windows 分支（命名管道 + 仅当前用户 DACL）只在 Windows 编译 |
 | 是否需要对方同步 | 是：macOS 编译验证（重点 `asr_service/transport.rs` 的 `cfg(unix)` 分支与 shim 新符号）；网关（S4）与设置页（S6）落地后再做端到端 |
+
+## ASR-SERVER-491 一期 S4（2026-10-17，主控）· 识别服务网关进程
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | 新增第三个可执行文件 `feiyin-asr-gateway`（`src/bin/feiyin-asr-gateway/`：`main.rs` / `core_link.rs` / `tls.rs` / `ws.rs`）；新增平台中立模块 `src/asr_shared/`（`settings.rs` / `pairing.rs`，网关用 `#[path]` 引入，S4c / S6 起内核与设置界面同样引入）；`asr_service/frame.rs` 的 `OpenParams` 加 `terminal_id`（serde 默认空，旧帧兼容）。`Cargo.toml` 通用依赖新增 tokio-tungstenite 0.26、tokio-rustls 0.26、rcgen 0.13、ring 0.17、futures-util 0.3（全部 `default-features = false`，加密走 ring） |
+| 行为变化 | 内核尚未拉起网关（S4c），**现阶段运行时无变化**；构建多产出一个 exe |
+| 对 macOS 的影响 | **编译**：新依赖都是纯 Rust + ring，macOS 可直接编；`core_link.rs` 的 `cfg(unix)` 分支（连内核 Unix socket）与 `tls.rs` 私钥 0600 分支**未在 macOS 编译 / 实测**。`main.rs` 的 `windows_subsystem` 只在 Windows 生效。**监听**：macOS 默认双栈，`[::]` 绑定成功后 `0.0.0.0` 绑定失败属预期（日志 info，不是错误）。**打包**：macOS 安装包需把 `feiyin-asr-gateway` 放在主程序同目录（数据文件按可执行文件目录定位）；签名 / 公证要把它一并签上；首次监听会触发系统「允许传入连接」弹窗 |
+| 是否需要对方同步 | 是：macOS 编译验证 `cargo check --bin feiyin-asr-gateway`；打包脚本加入网关 exe 与签名；S4c 落地后实测内核拉起网关 |

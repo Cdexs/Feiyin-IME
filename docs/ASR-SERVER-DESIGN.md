@@ -134,6 +134,20 @@ pub fn run_session(
 
 **扩展字段**一律放在 `payload.output.feiyin.*` 下，标准客户端会自动忽略：续传序号、本机忙闲提示等。
 
+**一期实现（S4，网关 `src/bin/feiyin-asr-gateway/`）**——以代码为准：
+
+| 项 | 实际做法 |
+| --- | --- |
+| 鉴权 | WebSocket 升级请求带 `Authorization: Bearer <key>`；key 不存在 / 已撤销 / 未绑定且超 10 分钟 ⇒ HTTP 401，正文为错误码（`InvalidKey` / `KeyRevoked` / `KeyExpired`） |
+| 终端身份 | `run-task` 的 `payload.parameters.feiyin.device_id` / `device_name` 必填（缺 ⇒ `MissingDeviceInfo`）；首次使用绑定设备代码，之后不一致 ⇒ `DeviceMismatch` 并断开 |
+| 音频 | 一期只收 `format=pcm`、`sample_rate=16000`（单声道 16 位小端），否则 `UnsupportedFormat`；Opus 随二期 |
+| 词表 | `parameters.vocabulary` 收百炼的 `{词: 权重}` 对象或字符串数组，追加在本机词库之后 |
+| 结果 | 一期整段一句：`sentence_id` 恒 1，`text` 为**本次识别至今的全文**（整段替换显示），`sentence_end=true` 即终稿；未稳定字数在 `output.feiyin.tentative`；`words` 暂空（S9 补时间戳） |
+| 结束 | `task-finished` 带 `usage.duration`（音频秒数，向上取整）；出错 `task-failed`：`ModelNotReady`（本机没开本地实时模型）/ `ServiceBusy`（推理通道满）/ `ServicePaused` / `InvalidParameter` / `InternalError` |
+| 连接 | 同一连接可依次跑多段 `run-task`（同时只一段）；60 秒无任何消息断开；握手 10 秒超时；单条消息 ≤ 1MB；同时在线连接 ≤ 64 |
+| 防护 | 同一来源 IP 连续 5 次鉴权失败锁 10 分钟（锁定期内连 TLS 都不做） |
+| 进程 | 内核拉起：`feiyin-asr-gateway --core <IPC 端点>`，口令经环境变量 `FEIYIN_ASR_TOKEN`（读后立即清除）；内核断开 ⇒ 网关退出；单线程异步运行时，无模型 |
+
 ### 5.2 兼容协议（第二期）：千问实时识别风格
 
 给已经接过 `qwen3-asr-flash-realtime` 的第三方程序用：`session.update` / `input_audio_buffer.append`（base64）/ `session.finish`，回 `conversation.item.input_audio_transcription.text` / `.completed`。在网关里做一层格式翻译，内核不感知。
@@ -229,6 +243,7 @@ key 在公网上明文传输等于把 key 交给沿途的人。所以网关内�
 ### 8.8 存储与防火墙
 
 - 已配对终端、外网地址、证书存**独立数据文件**，不进 `config.toml`（用户升级时可能整份替换配置，配对不能因此丢）。
+  一期落地（`src/asr_shared/`，内核 / 网关 / 设置界面共用一份源码）：可执行文件同目录下 `asr-service.json`（总开关、端口默认 7860、外网主机 / 端口）、`asr-terminals.json`（每终端：内部编号、key 的 SHA-256、绑定的设备代码、名称、创建 / 登录 / 登出时间、最近内外网、是否撤销；**key 明文不落盘**，只在添加终端时显示一次）、`asr-cert.der` / `asr-key.der`（自签 ECDSA P-256 证书与私钥；指纹 = 证书 DER 的 SHA-256）。key 为 16 字节随机数的 base32（26 字符，手输时忽略大小写、空格、连字符）。
 - 防火墙：安装包加规则，**只放行「专用网络」**（端口映射进来的流量走家里网卡，属专用网络），公共 Wi-Fi 下不开放。
 - 局域网自动发现（mDNS）：有了二维码后不再必需，降为可选。
 
