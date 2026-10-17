@@ -250,6 +250,12 @@ fn main() {
             asr_server::asr_server_add_terminal,
             asr_server::asr_server_revoke,
             asr_server::asr_server_sessions,
+            asr_server::asr_remote_get,
+            asr_server::asr_remote_pair_code,
+            asr_server::asr_remote_probe,
+            asr_server::asr_remote_pair_manual,
+            asr_server::asr_remote_update,
+            asr_server::asr_remote_test,
             overlay::show_recording_overlay,
             overlay::hide_recording_overlay,
             overlay::update_overlay_status

@@ -146,13 +146,14 @@ describe('VoicePage - PUNCT-UI-001', () => {
     });
 
     // ASR-UI-208（Gavin 2026-09-10）：UI 移除「在线语音识别模型」(qwen_audio_online) 选项
-    it('ASR-UI-002: select has two options (performance / fun-asr)', async () => {
+    // ASR-SERVER-491 S8：新增「自家识别服务」(feiyin_server)；qwen 仍不出现、本地实时仍默认隐藏。
+    it('ASR-UI-002: select options are performance / fun-asr / feiyin-server', async () => {
       render(<VoicePage config={baseConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
         const select = screen.getAllByRole('combobox')[1];
         expect(select).toBeInTheDocument();
-        const options = select.querySelectorAll('option');
-        expect(options.length).toBe(2);
+        const values = Array.from(select.querySelectorAll('option')).map(o => o.value);
+        expect(values).toEqual(['performance', 'fun_asr_realtime', 'feiyin_server']);
       });
     });
 

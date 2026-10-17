@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getTranslations } from '../i18n';
 import { formatMinutes } from './Mine';
+import { formatFingerprint } from '../components/FeiyinServerPairing';
 
 // ASR-SERVER-491 S6（设计 §16）：「识别服务」页 —— 服务状态 / 终端概况 / 终端列表三块卡片。
 // 启动 / 停止 = 总开关（DEC-031，写 asr-service.json，内核看护线程跟上；托盘同此）；
@@ -373,7 +374,7 @@ const AsrServerPage: React.FC<Props> = ({ config }) => {
                 <div>{t.asr_lan_label}{t.asr_colon}{added.lan || dash}</div>
                 <div>{t.asr_wan_label}{t.asr_colon}{added.wan || dash}</div>
                 <div>{t.asr_key}{t.asr_colon}<strong>{added.key}</strong></div>
-                <div>{t.asr_fingerprint}{t.asr_colon}{added.fingerprint || dash}</div>
+                <div>{t.asr_fingerprint}{t.asr_colon}{added.fingerprint ? formatFingerprint(added.fingerprint) : dash}</div>
               </div>
               <div className="modal-hint">
                 <span className="modal-hint-icon">ⓘ</span>

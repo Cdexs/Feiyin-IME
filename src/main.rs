@@ -6992,6 +6992,23 @@ fn convert_to_friendly_error(message: &str, ui_language: config::UiLanguage) -> 
     let strings = i18n::get(ui_language);
     let m = message.to_lowercase();
     let has = |keys: &[&str]| keys.iter().any(|k| m.contains(k));
+    // ASR-SERVER-491 S8：自家识别服务的错误码（设计 §5.1）先认，否则会被下面的「服务端」归成接口不可用。
+    if has(&["modelnotready"]) {
+        return strings.error_feiyin_not_ready.to_string();
+    }
+    if has(&["servicebusy", "servicepaused"]) {
+        return strings.error_feiyin_busy.to_string();
+    }
+    if has(&[
+        "invalidkey",
+        "keyrevoked",
+        "keyexpired",
+        "devicemismatch",
+        "fingerprintmismatch",
+        "notpaired",
+    ]) {
+        return strings.error_feiyin_repair.to_string();
+    }
     if has(&["timeout", "timed out", "超时"]) {
         strings.error_network_timeout.to_string()
     } else if has(&[
@@ -8803,6 +8820,28 @@ fn spawn_worker_thread(
                             Result<crate::transcription::qwen_inference::OnlineFinal>,
                         > = std::thread::spawn(move || {
                             let vocabulary = crate::transcription::load_wordbook_vocabulary();
+                            let on_result = |display_text: &str,
+                                             words: &[crate::transcription::qwen_inference::WordTiming]| {
+                                // OVERLAY-075: stamp every packet with this session's
+                                // generation; the consumer drops stale-session packets.
+                                let _ = event_tx_clone.send(PipelineEvent::StreamingText(
+                                    session_generation,
+                                    display_text.to_string(),
+                                    words.to_vec(),
+                                    0,
+                                ));
+                            };
+                            // ASR-SERVER-491 S8：连自家识别服务 —— 配对信息每次录音现读（设置里重新配对立即生效）。
+                            if desired_asr_model_check == transcription::AsrModel::FeiyinServer {
+                                return crate::transcription::qwen_inference::transcribe_streaming_feiyin(
+                                    &crate::asr_shared::remote::RemotePairing::load(),
+                                    chunk_rx,
+                                    &vocabulary,
+                                    &model_dir_clone,
+                                    Some(&cancel_clone),
+                                    on_result,
+                                );
+                            }
                             crate::transcription::qwen_inference::transcribe_streaming_realtime(
                                 &asr_online_url,
                                 &qwen_api_key,
@@ -8813,16 +8852,7 @@ fn spawn_worker_thread(
                                 asr_online_semantic_punctuation_enabled,
                                 &model_dir_clone,
                                 Some(&cancel_clone),
-                                |display_text, words| {
-                                    // OVERLAY-075: stamp every packet with this session's
-                                    // generation; the consumer drops stale-session packets.
-                                    let _ = event_tx_clone.send(PipelineEvent::StreamingText(
-                                        session_generation,
-                                        display_text.to_string(),
-                                        words.to_vec(),
-                                        0,
-                                    ));
-                                },
+                                on_result,
                             )
                         });
 
@@ -10465,7 +10495,9 @@ fn select_preprocessing_params(asr_model: transcription::AsrModel) -> (usize, us
         transcription::AsrModel::LocalRealtime => {
             (ACC_SILENCE_HEAD_SAMPLES, ACC_ONSET_BACKTRACK_SAMPLES)
         }
-        transcription::AsrModel::QwenAudioOnline | transcription::AsrModel::FunAsrRealtime => {
+        transcription::AsrModel::QwenAudioOnline
+        | transcription::AsrModel::FunAsrRealtime
+        | transcription::AsrModel::FeiyinServer => {
             // DEC-028 / RESEARCH-ASR-038 / ASR-038-B / ASR-041-B / ASR-056: 在线 ASR 模型
             // （在线模型对前导静音不敏感，保持与 CTC 一致的前处理行为）
             //
@@ -15681,9 +15713,10 @@ fn usage_category(model: transcription::AsrModel) -> usage_stats::UsageCategory 
         transcription::AsrModel::Performance | transcription::AsrModel::Accuracy => {
             usage_stats::UsageCategory::LocalFast
         }
-        transcription::AsrModel::QwenAudioOnline | transcription::AsrModel::FunAsrRealtime => {
-            usage_stats::UsageCategory::OnlineAsr
-        }
+        // ASR-SERVER-491 S8：连自家识别服务也是联网识别，记在线项。
+        transcription::AsrModel::QwenAudioOnline
+        | transcription::AsrModel::FunAsrRealtime
+        | transcription::AsrModel::FeiyinServer => usage_stats::UsageCategory::OnlineAsr,
         transcription::AsrModel::LocalRealtime => usage_stats::UsageCategory::LocalStreaming,
     }
 }
@@ -23087,6 +23120,11 @@ mod friendly_error_i18n_tests {
         "Recording error: device lost",
         "发送消息失败 - closed",
         "某个从未见过的内部错误",
+        // ASR-SERVER-491 S8：自家识别服务
+        "服务端错误：KeyRevoked (HTTP 401)",
+        "服务端错误：FingerprintMismatch",
+        "服务端错误：ModelNotReady: 本机未加载本地实时模型",
+        "服务端错误：ServicePaused (HTTP 503)",
     ];
 
     fn has_cjk(s: &str) -> bool {
@@ -23110,6 +23148,16 @@ mod friendly_error_i18n_tests {
             ("转录失败：音频样本为空", s.error_microphone),
             ("ASR thread panicked", s.error_unexpected),
             ("某个从未见过的内部错误", s.error_unexpected),
+            // ASR-SERVER-491 S8：自家识别服务错误码不能被「服务端」吞成接口不可用
+            ("服务端错误：ModelNotReady", s.error_feiyin_not_ready),
+            ("服务端错误：ServiceBusy", s.error_feiyin_busy),
+            ("服务端错误：ServicePaused (HTTP 503)", s.error_feiyin_busy),
+            ("服务端错误：InvalidKey (HTTP 401)", s.error_feiyin_repair),
+            ("服务端错误：KeyRevoked", s.error_feiyin_repair),
+            ("服务端错误：KeyExpired (HTTP 401)", s.error_feiyin_repair),
+            ("服务端错误：DeviceMismatch", s.error_feiyin_repair),
+            ("服务端错误：FingerprintMismatch", s.error_feiyin_repair),
+            ("服务端错误：NotPaired", s.error_feiyin_repair),
         ];
         for (raw, want) in cases {
             assert_eq!(
@@ -23148,6 +23196,10 @@ mod friendly_error_i18n_tests {
                 s.error_microphone,
                 s.error_mic_muted,
                 s.error_unexpected,
+                // ASR-SERVER-491 S8：自家识别服务三条（也在 i18n 表内）
+                s.error_feiyin_not_ready,
+                s.error_feiyin_busy,
+                s.error_feiyin_repair,
             ];
             for raw in REAL_ERRORS {
                 let shown = convert_to_friendly_error(raw, lang);

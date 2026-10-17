@@ -84,7 +84,7 @@ fn sha256_hex_bytes(b: &[u8]) -> String {
 }
 
 /// RFC 4648 base32（大写、无填充）。16 字节 ⇒ 26 字符：手输也不至于太长。
-fn base32(bytes: &[u8]) -> String {
+pub(super) fn base32(bytes: &[u8]) -> String {
     const A: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     let mut out = String::new();
     let (mut buf, mut bits) = (0u32, 0u32);
@@ -102,7 +102,7 @@ fn base32(bytes: &[u8]) -> String {
     out
 }
 
-fn random_bytes<const N: usize>() -> std::io::Result<[u8; N]> {
+pub(super) fn random_bytes<const N: usize>() -> std::io::Result<[u8; N]> {
     let mut b = [0u8; N];
     SystemRandom::new()
         .fill(&mut b)

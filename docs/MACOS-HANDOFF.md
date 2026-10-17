@@ -2827,3 +2827,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 行为变化 | 托盘多一项（服务关 + 模型未加载时置灰）；设置界面多一页 |
 | 对 macOS 的影响 | macOS 托盘代码**未在 macOS 编译**：重点核对 `NSMenu::setAutoenablesItems`、`NSMenuItem::setTitle / setEnabled` 在 objc2-app-kit 0.2 的签名（是否需 `unsafe`、是否需额外 feature）；`asr_shown` 用 `&'static str` 指针比较文案。设置页为共用 React，macOS 同一份 |
 | 是否需要对方同步 | 是：macOS 编译 + 托盘目视（三态：可启动 / 可停止 / 置灰） |
+
+## ASR-SERVER-491 一期 S8（2026-10-17，主控）· 电脑客户端连自家识别服务
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | 平台中立：`src/asr_shared/remote.rs`（新，配对存储 `asr-remote.json`，内核 / 设置界面共用）、`src/asr_shared/tls_pin.rs`（新，rustls 证书指纹钉扎，内核 / 网关 / 设置界面共用）、`src/transcription/feiyin_remote.rs`（新，内外网自动连接）；`src/audio/qwen_inference.rs`：`transcribe_streaming_realtime` 对外签名不变，建连一段原样抽成 `connect_dashscope`，会话循环改名 `realtime_session` 两条线共用，新增 `transcribe_streaming_feiyin`；`AsrModel::FeiyinServer`（配置值 `asr_model = "feiyin_server"`）；`convert_to_friendly_error` 先认 `error_feiyin_*`；三语文案 `error_feiyin_not_ready / _busy / _repair`。设置界面：语音页档位下拉加「自家识别服务（另一台电脑）」、新组件 `ui/src/components/FeiyinServerPairing.tsx`；`src-tauri/src/asr_server.rs` 新增 `asr_remote_get / pair_code / probe / pair_manual / update / test` 六个命令；识别服务页「添加终端」窗口的证书指纹改为每 4 位一组显示；三份 locale 同步 |
+| 行为变化 | 档位选「自家识别服务」前**无变化**：阿里在线识别行为不变（只是建连一段挪成函数，逻辑原样），本地识别路径未动。选了之后：不要 API Key、不加载本地模型，走在线流式管线，音频经 `wss://` 发到另一台装了飞音、开了识别服务的电脑；证书只认配对时的指纹；`run-task` 多带 `parameters.feiyin = {device_id, device_name, postprocess}`。没配对就离开语音页 ⇒ 档位回落上一个（与无 API Key 同） |
+| 对 macOS 的影响 | **编译**：全部改动在平台中立模块，无 `src/platform` 改动，macOS 编译同一份代码；**新增依赖：无**（rustls / ring 已在依赖里）。**取计算机名**：macOS 走 `scutil --get ComputerName`（进程内只取一次），Windows 走 `COMPUTERNAME`；该分支**未在 macOS 编译 / 实测**。`asr_model` 若有穷举 match 须补 `FeiyinServer`。设置页为共用 React，macOS 同一份。**未验证**：端到端（需两台电脑，S11 参考客户端） |
+| 是否需要对方同步 | 是：macOS 编译验证（重点 `scutil` 取名分支、`asr_model` 穷举 match、`tls_pin.rs` 的 rustls 自定义校验器）；设置界面配对卡片目视；两台电脑端到端待 S11。对方（服务端）数字规整 `postprocess` 待 S10 |

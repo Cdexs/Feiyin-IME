@@ -1,11 +1,13 @@
-//! ASR-SERVER-491：内核、网关、设置界面三方共用的识别服务数据（平台中立，只依赖 std + serde + ring）。
+//! ASR-SERVER-491：内核、网关、设置界面三方共用的识别服务数据（平台中立，只依赖 std + serde + ring + rustls）。
 //!
 //! 各方用 `#[path]` 引入同一份源码（网关、设置界面是独立程序）。数据放可执行文件同目录
 //!（与词库、使用统计同规则），**不进 `config.toml`**（设计 §8.8：用户升级可能整份替换配置）。
 
 pub mod control;
 pub mod pairing;
+pub mod remote;
 pub mod settings;
+pub mod tls_pin;
 
 use std::path::PathBuf;
 

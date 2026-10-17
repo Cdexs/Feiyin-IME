@@ -994,7 +994,7 @@ pub fn transcribe_streaming_realtime(
     semantic_punctuation_enabled: bool,
     model_dir: &std::path::Path,
     cancel_signal: Option<&std::sync::atomic::AtomicBool>,
-    mut on_result: impl FnMut(&str, &[WordTiming]),
+    on_result: impl FnMut(&str, &[WordTiming]),
 ) -> Result<OnlineFinal> {
     if api_key.trim().is_empty() {
         bail!("鉴权失败：API Key 为空");
@@ -1005,34 +1005,55 @@ pub fn transcribe_streaming_realtime(
     } else {
         model
     };
-    let task_id = generate_task_id();
-    let t_start = std::time::Instant::now();
-
-    // ASR-058 ③: A/B 对比埋点——收集各段耗时
-    // 🔴 first_text_ms 的起点必须是「首个音频字节发出」而不是热键按下，
-    // 否则会把人的反应时间算到服务端头上、两个模型没法公平比。
-    let mut summary = AsrSummary::new(model, task_id.clone());
-
-    log::info!(
-        "Online realtime streaming ASR: url={}, model={}, task_id={}",
-        url,
+    realtime_session(
+        OnlineTarget::DashScope { url, api_key },
         model,
-        task_id,
-    );
+        chunk_rx,
+        vocabulary,
+        max_sentence_silence,
+        semantic_punctuation_enabled,
+        model_dir,
+        cancel_signal,
+        on_result,
+    )
+}
 
-    let is_cancelled = || {
-        cancel_signal
-            .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(false)
-    };
+/// ASR-SERVER-491 S8：连另一台电脑上的飞音识别服务（`run-task` 同协议，设计 §5.1 / §8）。
+///
+/// 与 [`transcribe_streaming_realtime`] 走同一个会话循环，只有建连不同：地址 / key / 证书指纹取自配对文件，
+/// 内外网按配对里的模式挑（[`super::feiyin_remote::connect`]），`run-task` 多带 `parameters.feiyin`。
+/// 断句静音 / 语义断句两个参数对方服务端不用（断句由对方本地实时管线决定），按 DashScope 默认值填。
+pub fn transcribe_streaming_feiyin(
+    pairing: &crate::asr_shared::remote::RemotePairing,
+    chunk_rx: crossbeam_channel::Receiver<Vec<f32>>,
+    vocabulary: &serde_json::Value,
+    model_dir: &std::path::Path,
+    cancel_signal: Option<&std::sync::atomic::AtomicBool>,
+    on_result: impl FnMut(&str, &[WordTiming]),
+) -> Result<OnlineFinal> {
+    realtime_session(
+        OnlineTarget::Feiyin(pairing),
+        super::feiyin_remote::MODEL_NAME,
+        chunk_rx,
+        vocabulary,
+        DEFAULT_MAX_SENTENCE_SILENCE,
+        false,
+        model_dir,
+        cancel_signal,
+        on_result,
+    )
+}
 
-    // =========================================================================
-    // ASR-058 ①: 阶段 1 —— 热键按下即建连（DNS→TCP→TLS→WS→run-task→task-started）
-    // 建连期间 chunk_rx 积攒 chunk（不读不丢），108ms 被 VAD 前时间吸收
-    // 🔴 建连≠发音频：run-task 不含音频字节，VAD 命中前一个音频字节都不许发
-    // =========================================================================
+/// 在线流式识别的服务端。
+enum OnlineTarget<'a> {
+    /// 阿里百炼（URL + API Key，系统 CA 校验证书）。
+    DashScope { url: &'a str, api_key: &'a str },
+    /// 自家识别服务（配对信息，证书按指纹认）。
+    Feiyin(&'a crate::asr_shared::remote::RemotePairing),
+}
 
-    let t_connect_start = std::time::Instant::now();
+/// ASR-058 阶段 1 的建连（DashScope）：DNS → TCP → TLS → WS。原样从 `transcribe_streaming_realtime` 搬出。
+fn connect_dashscope(url: &str, api_key: &str) -> Result<WebSocket<MaybeTlsStream<TcpStream>>> {
     let uri: Uri = url.parse().context("无效的 ASR URL")?;
     let host = uri.host().context("URL 缺少 host")?;
     let port = uri.port_u16().unwrap_or(443);
@@ -1065,7 +1086,7 @@ pub fn transcribe_streaming_realtime(
     let t_tls_start = std::time::Instant::now();
     let request =
         ClientRequestBuilder::new(uri).with_header("Authorization", format!("Bearer {}", api_key));
-    let (mut ws_socket, response) =
+    let (ws_socket, response) =
         client_tls_with_config(request, tcp, None, None).map_err(|e| match e {
             HandshakeError::Failure(e) => map_connect_error(&e),
             HandshakeError::Interrupted(_) => anyhow!("网络失败：TLS 握手意外中断"),
@@ -1081,6 +1102,57 @@ pub fn transcribe_streaming_realtime(
         "post-handshake status must be 101"
     );
     let _ = &response;
+    Ok(ws_socket)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn realtime_session(
+    target: OnlineTarget<'_>,
+    model: &str,
+    chunk_rx: crossbeam_channel::Receiver<Vec<f32>>,
+    vocabulary: &serde_json::Value,
+    max_sentence_silence: i64,
+    semantic_punctuation_enabled: bool,
+    model_dir: &std::path::Path,
+    cancel_signal: Option<&std::sync::atomic::AtomicBool>,
+    mut on_result: impl FnMut(&str, &[WordTiming]),
+) -> Result<OnlineFinal> {
+    let task_id = generate_task_id();
+    let t_start = std::time::Instant::now();
+
+    // ASR-058 ③: A/B 对比埋点——收集各段耗时
+    // 🔴 first_text_ms 的起点必须是「首个音频字节发出」而不是热键按下，
+    // 否则会把人的反应时间算到服务端头上、两个模型没法公平比。
+    let mut summary = AsrSummary::new(model, task_id.clone());
+
+    log::info!(
+        "Online realtime streaming ASR: target={}, model={}, task_id={}",
+        match &target {
+            OnlineTarget::DashScope { url, .. } => url.to_string(),
+            OnlineTarget::Feiyin(p) =>
+                format!("feiyin lan={} wan={} mode={:?}", p.lan, p.wan, p.mode),
+        },
+        model,
+        task_id,
+    );
+
+    let is_cancelled = || {
+        cancel_signal
+            .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false)
+    };
+
+    // =========================================================================
+    // ASR-058 ①: 阶段 1 —— 热键按下即建连（DNS→TCP→TLS→WS→run-task→task-started）
+    // 建连期间 chunk_rx 积攒 chunk（不读不丢），108ms 被 VAD 前时间吸收
+    // 🔴 建连≠发音频：run-task 不含音频字节，VAD 命中前一个音频字节都不许发
+    // =========================================================================
+
+    let t_connect_start = std::time::Instant::now();
+    let mut ws_socket = match &target {
+        OnlineTarget::DashScope { url, api_key } => connect_dashscope(url, api_key)?,
+        OnlineTarget::Feiyin(p) => super::feiyin_remote::connect(p, CONNECT_TIMEOUT)?,
+    };
 
     set_socket_timeouts(
         &mut ws_socket,
@@ -1095,13 +1167,16 @@ pub fn transcribe_streaming_realtime(
 
     // send run-task（不含音频，只含 model/parameters/input）
     // 🔴 红线：run-task 不含音频字节，VAD 命中前一个音频字节都不许发
-    let run_task = build_run_task_message(
+    let mut run_task = build_run_task_message(
         &task_id,
         model,
         vocabulary,
         max_sentence_silence,
         semantic_punctuation_enabled,
     );
+    if let OnlineTarget::Feiyin(p) = &target {
+        run_task["payload"]["parameters"]["feiyin"] = super::feiyin_remote::run_task_ext(p);
+    }
     send_json(&mut ws_socket, &run_task)?;
 
     // 等 task-started

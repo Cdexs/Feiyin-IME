@@ -9,6 +9,7 @@ use crate::{config::ChineseScript, punctuation, text_normalizer};
 // Re-export SenseVoice config for convenience
 use sherpa_onnx::OfflineSenseVoiceModelConfig;
 
+pub mod feiyin_remote;
 pub mod local_stream;
 pub mod qwen_inference;
 // SPEAKER-VERIFY-408B：声纹模块接入本地实时路B（408A 独立模块 + 408B 过滤/注册）。
@@ -90,6 +91,9 @@ pub enum AsrModel {
     ///
     /// DEC-067 附则一：任一模型缺失/加载失败 ⇒ 整档 `Err`，**禁止静默降级**。
     LocalRealtime,
+    /// ASR-SERVER-491 S8：连另一台电脑上的飞音识别服务（`run-task` 同协议，设计 §8）。
+    /// 走在线流式管线；地址 / key / 证书指纹取自配对文件 `asr-remote.json`，不用 API Key，不加载本地模型。
+    FeiyinServer,
 }
 
 impl AsrModel {
@@ -102,6 +106,8 @@ impl AsrModel {
             AsrModel::FunAsrRealtime
         } else if s.eq_ignore_ascii_case("local_realtime") {
             AsrModel::LocalRealtime
+        } else if s.eq_ignore_ascii_case("feiyin_server") {
+            AsrModel::FeiyinServer
         } else {
             AsrModel::Performance
         }
@@ -112,7 +118,10 @@ impl AsrModel {
     /// 新增在线模型时只改这一处，不必逐个更新 main.rs 的 12 处引用点。
     /// QwenAudioOnline 和 FunAsrRealtime 都走真流式管线（共用 qwen_inference.rs 实现）。
     pub fn is_online_streaming(&self) -> bool {
-        matches!(self, AsrModel::QwenAudioOnline | AsrModel::FunAsrRealtime)
+        matches!(
+            self,
+            AsrModel::QwenAudioOnline | AsrModel::FunAsrRealtime | AsrModel::FeiyinServer
+        )
     }
 
     /// FIX-LOCALRT-ENGINE-EQ-252: 是否使用 **accuracy 引擎**（FunASR Nano native）。
@@ -1879,7 +1888,8 @@ impl Transcriber {
         // DEC-028 / ASR-038-B / ASR-041-B / ASR-056: 在线 ASR 模式不加载本地模型
         // ASR-056: QwenAudioOnline 与 FunAsrRealtime 都走此路径（is_online_streaming 收敛判据）
         if asr_model.is_online_streaming() {
-            if asr_online_api_key.trim().is_empty() {
+            // ASR-SERVER-491 S8：自家识别服务不用 API Key（凭配对文件里的 key），没配对在建连时报「去配对」。
+            if asr_model != AsrModel::FeiyinServer && asr_online_api_key.trim().is_empty() {
                 anyhow::bail!("在线 ASR 配置失败：API Key 为空（请在设置中配置 API Key）");
             }
             log::info!(
@@ -2129,17 +2139,35 @@ impl Transcriber {
         // 此分支仅用于非流式回退（如模型切换过渡期）
         if self.asr_model.is_online_streaming() {
             let vocabulary = crate::transcription::load_wordbook_vocabulary();
-            let text = qwen_inference::transcribe_streaming(
-                &self.asr_online_url,
-                &self.asr_online_api_key,
-                &self.asr_online_model,
-                samples,
-                &vocabulary,
-                self.asr_online_max_sentence_silence,
-                self.asr_online_semantic_punctuation_enabled,
-                None,
-                |_| {},
-            )?;
+            let text = if self.asr_model == AsrModel::FeiyinServer {
+                // ASR-SERVER-491 S8：整段切 100ms 小块喂同一个会话函数（不另写一套批量协议）。
+                let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
+                for c in samples.chunks(1600) {
+                    let _ = tx.send(c.to_vec());
+                }
+                drop(tx);
+                qwen_inference::transcribe_streaming_feiyin(
+                    &crate::asr_shared::remote::RemotePairing::load(),
+                    rx,
+                    &vocabulary,
+                    &self.vad_model_dir,
+                    None,
+                    |_, _| {},
+                )?
+                .text
+            } else {
+                qwen_inference::transcribe_streaming(
+                    &self.asr_online_url,
+                    &self.asr_online_api_key,
+                    &self.asr_online_model,
+                    samples,
+                    &vocabulary,
+                    self.asr_online_max_sentence_silence,
+                    self.asr_online_semantic_punctuation_enabled,
+                    None,
+                    |_| {},
+                )?
+            };
             let cleaned = Self::strip_asr_special_tokens(&text);
             let trimmed = cleaned.trim();
             if trimmed.is_empty() {
@@ -3365,7 +3393,7 @@ fn build_recognizer(
                 "LocalRealtime requires dual-model construction; handled in Transcriber::new()"
             )
         }
-        AsrModel::QwenAudioOnline | AsrModel::FunAsrRealtime => {
+        AsrModel::QwenAudioOnline | AsrModel::FunAsrRealtime | AsrModel::FeiyinServer => {
             // ASR-041-B / ASR-056: 在线 ASR 模式不加载本地模型，
             // Transcriber::new() 已提前返回，此分支不应被触达
             unreachable!(
@@ -4666,7 +4694,8 @@ mod tests {
             | AsrModel::Accuracy
             | AsrModel::QwenAudioOnline
             | AsrModel::FunAsrRealtime
-            | AsrModel::LocalRealtime => (),
+            | AsrModel::LocalRealtime
+            | AsrModel::FeiyinServer => (),
         };
 
         // from_config 正反向映射（大小写不敏感）
@@ -4679,6 +4708,11 @@ mod tests {
         assert_eq!(
             AsrModel::from_config("QwEn_AuDiO_oNlInE"),
             AsrModel::QwenAudioOnline
+        );
+        // ASR-SERVER-491 S8
+        assert_eq!(
+            AsrModel::from_config("feiyin_server"),
+            AsrModel::FeiyinServer
         );
         // ASR-056: fun_asr_realtime 映射
         assert_eq!(

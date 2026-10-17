@@ -80,7 +80,7 @@
 
 ### 🔄 ASR-SERVER-491 一期 · 本地实时识别对外服务（Gavin 10-17「根据我们确认好的方案，开始动工吧」，DEC-111）
 
-方案全文 `docs/ASR-SERVER-DESIGN.md`。开发主控做（低复杂度子任务可派 Sonnet 子 Agent），测试 + 出包派 tester-1（五阶段串行）；功能全做完才出包。
+方案全文 `docs/ASR-SERVER-DESIGN.md`。**手机端（安卓 / iOS）客户端 Gavin 另起项目开发（10-17）**：本仓库只做服务端 + 电脑客户端，S11 协议文档要写成另一个项目可直接照着对接的契约。开发主控做（低复杂度子任务可派 Sonnet 子 Agent），测试 + 出包派 tester-1（五阶段串行）；功能全做完才出包。
 
 | 子项 | 内容 | 状态 |
 | --- | --- | --- |
@@ -94,7 +94,10 @@
 | S5 | 统计加终端一维：`usage_sessions.terminal_id`（旧数据默认 local）+ `terminal_sessions` 登录 / 退出表；「我的」页仍只看本机 | ✅ 编译通过（主程序 / poc / 设置界面）：迁移按列存在与否加列（新旧库同一路径，并发首开忽略重复列）；内核每条网关连接一个统计线程写库（IPC 新帧 `Login` / `Logout`；终稿时长用会话自己的剪静音 VAD，不碰本机锁）；设置界面读接口 `terminal_usage` / `terminal_sessions` 供 S6 |
 | S6 | 设置界面「识别服务」页（§16，i18n 三份，复用 card 风格） | ✅ 编译 + 类型检查通过：`ui/src/pages/AsrServer.tsx`（三块卡片 + 添加终端弹窗：二维码 / 连接码 / 手输 + 撤销确认弹窗），导航在「我的」后；后端 `src-tauri/src/asr_server.rs`（7 个命令；二维码用 qrcode SVG）；i18n 三份。**待 Gavin 目视确认** |
 | S7 | 托盘菜单单项「启动识别服务 / 停止识别服务」按状态自动切换（§16.7，i18n） | ✅ 编译通过：Windows `TrackPopupMenu` 首项 / macOS `NSMenuItem`（15ms 轮询变化才改）；文案与可点状态由平台中立 `supervisor::tray_item` 给出；未就绪置灰且文案带原因（菜单项无悬停提示，偏离设计「悬停说明」）。macOS 未编译。**待 Gavin 目视确认** |
-| S8 | 我们的电脑客户端：连接码 / 手输配对，在线识别连自家服务（内外网自动切换） | ⬜ |
+| S8 | 我们的电脑客户端：连接码 / 手输配对，在线识别连自家服务（内外网自动切换） | ✅ 编译 + 类型检查通过；**界面待 Gavin 目视确认**；端到端待两台电脑实测（S11 参考客户端 / 两台电脑）。全部在平台中立模块，无 `src/platform` 改动，macOS 未编译 |
+| S8a | 配对存储 `asr_shared/remote.rs`：`asr-remote.json`（不进 config.toml）、解析连接码 / 手输、本机设备代码首次生成后固定、单测 | ✅ `asr-remote.json`（lan / wan / key / fingerprint / mode / device_id / device_name）；连接码须 v=1 且带指纹，手输指纹可空（先取回确认）；缺端口补 7860；计算机名 Windows 读 COMPUTERNAME、macOS 用 scutil |
+| S8b | 连接：识别档位新值 `feiyin_server`；证书指纹钉死（rustls 自定义校验）；内外网「自动」= 内网优先、并发试连；`run-task` 带 `feiyin.device_id/device_name/postprocess["homophone","itn"]`；网关错误码转人话 | ✅ `asr_model = "feiyin_server"`（走在线流式管线，不要 API Key）；`asr_shared/tls_pin.rs` 只认配对指纹、只走 TLS 1.3；「自动」同时试 TCP，外网先通则再等内网 300ms；`qwen_inference` 抽出 `connect_dashscope` / `realtime_session` 两条线共用，新增 `transcribe_streaming_feiyin`，阿里行为不变；三条错误文案 `error_feiyin_*`。对方做数字规整待 S10 |
+| S8c | 设置界面：语音页档位加「自家识别服务」+ 配对表单（粘贴连接码 / 手输 + 首次确认指纹、内网 / 外网 / 自动），i18n 三份 | ✅ 语音页档位加「自家识别服务（另一台电脑）」；`ui/src/components/FeiyinServerPairing.tsx`（粘贴连接码 / 手输 → 取回指纹 → 核对 → 保存；已配对可选连接方式、改本机名称、测试连接、重新配对）；没配对离开语音页回落上一档位；后端命令在 `src-tauri/src/asr_server.rs`；指纹每 4 位分组显示。**待 Gavin 目视确认** |
 | S9 | 逐字时间补齐 T1~T6（§12） | ⬜ |
 | S10 | 文字节点包装 `TextStage` + `feiyin.postprocess` + 单独文字处理接口（§13） | ⬜ |
 | S11 | 协议文档 + Python 参考客户端；MACOS-HANDOFF；五文档 | ⬜ |

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from "@tauri-apps/api/core";
 import { getTranslations } from '../i18n';
 import ShortcutSetting from '../components/ShortcutSetting';
+import FeiyinServerPairing from '../components/FeiyinServerPairing';
 
 interface Props {
   config: any;
@@ -24,6 +25,8 @@ const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
   const [qwen3TestMessage, setQwen3TestMessage] = useState('');
   const prevModelRef = useRef<string>('performance');
   const latestRef = useRef({ asrModel: '', config: {} as any });
+  // ASR-SERVER-491 S8：自家识别服务是否已配对（没配对就离开本页 ⇒ 同无 key 一样回落上一个档位）。
+  const remotePairedRef = useRef(false);
   // ASR-UI-208（Gavin 2026-09-10）：UI 不再提供「在线语音识别模型」(qwen_audio_online) 选项，
   // 只留「本地模型」与「在线语音识别模型-FunASR」。后端能力与配置字段保留不动。
   // 🔴 存量用户处理走「grandfathered option」：仅当配置值本就是 qwen_audio_online 时
@@ -75,8 +78,9 @@ const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
     return () => {
       const { asrModel: lastModel, config: lastConfig } = latestRef.current;
       // ASR-056: 两族在线 ASR 无 key 退出时都回落到 prevModel
-      if ((lastModel === 'qwen_audio_online' || lastModel === 'fun_asr_realtime')
-          && !lastConfig.audio?.asr_online_api_key) {
+      if (((lastModel === 'qwen_audio_online' || lastModel === 'fun_asr_realtime')
+          && !lastConfig.audio?.asr_online_api_key)
+          || (lastModel === 'feiyin_server' && !remotePairedRef.current)) {
         updateConfig({
           ...lastConfig,
           audio: { ...lastConfig.audio, asr_model: prevModelRef.current }
@@ -113,7 +117,7 @@ const loadDevices = async () => {
 
   const handleAsrModelChange = (value: string) => {
     // ASR-056: 两族在线 ASR 切换时都记录 prevModel（cleanup 回落用）
-    if ((value === 'qwen_audio_online' || value === 'fun_asr_realtime')
+    if ((value === 'qwen_audio_online' || value === 'fun_asr_realtime' || value === 'feiyin_server')
         && asrModel !== value) {
       prevModelRef.current = asrModel;
     }
@@ -214,6 +218,7 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
       case 'qwen_audio_online': return t.voice_asr_model_qwen3_desc;
       case 'fun_asr_realtime': return t.voice_asr_model_fun_asr_desc;
       case 'local_realtime': return t.voice_asr_model_local_realtime_desc;
+      case 'feiyin_server': return t.voice_asr_model_feiyin_desc;
       default: return '';
     }
   };
@@ -255,6 +260,7 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
             {localRealtimeUnlocked && (
               <option value="local_realtime">{t.voice_asr_model_local_realtime}</option>
             )}
+            <option value="feiyin_server">{t.voice_asr_model_feiyin}</option>
           </select>
 
           <p className="asr-model-desc" style={{ marginTop: '8px' }}>
@@ -304,6 +310,13 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
                 {t.voice_asr_model_manual_download}
               </p>
             </div>
+          )}
+
+          {asrModel === 'feiyin_server' && (
+            <FeiyinServerPairing
+              t={t}
+              onPairedChange={(paired) => { remotePairedRef.current = paired; }}
+            />
           )}
 
           {(asrModel === 'qwen_audio_online' || asrModel === 'fun_asr_realtime') && (
