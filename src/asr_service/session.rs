@@ -472,4 +472,80 @@ mod tests {
         ];
         assert_eq!(known_end(&t), 2.25, "取最大终点，不看顺序");
     }
+
+    // ─── TEST-SYNC-491 / S10 护栏 4-5 ──────────────────────────────────────
+
+    /// S10 护栏 4（源码）：`session.rs` 生产区参数接线 + 节点调用次数。
+    /// - `acc_punct_enabled = params.punctuation`（补标点跟终端参数，不跟本机 config）；
+    /// - `apply_preview` 恰 1 次、`preview_tentative` 恰 1 次、`apply_final` 恰 1 次；
+    /// - `translate` 只出现在 `if params.translate` 分支内。
+    #[test]
+    fn s10_session_param_wiring_and_call_counts() {
+        let src = include_str!("session.rs");
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(src);
+
+        // 1. acc_punct_enabled = params.punctuation（锚点拆开防自匹配）。
+        let acc_punct = concat!("let acc_punct_enabled = ", "params.punctuation");
+        assert!(
+            prod.iter().any(|l| l.contains(acc_punct)),
+            "生产区应有 {acc_punct}"
+        );
+
+        // 2. 节点调用次数：apply_preview / preview_tentative / apply_final 各恰 1 次。
+        let apply_preview = concat!("text_stage::", "apply_preview", "(");
+        let preview_tentative = concat!("text_stage::", "preview_tentative", "(");
+        let apply_final = concat!("text_stage::", "apply_final", "(");
+        let n_preview = prod.iter().filter(|l| l.contains(apply_preview)).count();
+        let n_tentative = prod
+            .iter()
+            .filter(|l| l.contains(preview_tentative))
+            .count();
+        let n_final = prod.iter().filter(|l| l.contains(apply_final)).count();
+        assert_eq!(n_preview, 1, "{apply_preview} 应恰 1 次，实际 {n_preview}");
+        assert_eq!(
+            n_tentative, 1,
+            "{preview_tentative} 应恰 1 次，实际 {n_tentative}"
+        );
+        assert_eq!(n_final, 1, "{apply_final} 应恰 1 次，实际 {n_final}");
+
+        // 3. translate 只在 `if params.translate` 分支内：
+        //    找到 translate 调用行，向上回溯应能看到 `if params.translate`。
+        let translate_call = concat!("text_stage::", "translate", "(");
+        let lines: Vec<&String> = prod.iter().collect();
+        let pos = lines
+            .iter()
+            .position(|l| l.contains(translate_call))
+            .expect("生产区应有 translate 调用");
+        // 回溯 10 行找 if params.translate。
+        let lo = pos.saturating_sub(10);
+        let found = lines[lo..=pos]
+            .iter()
+            .any(|l| l.contains("if") && l.contains("params.translate"));
+        assert!(
+            found,
+            "{translate_call} 必须在 if params.translate 分支内（向上回溯 10 行未找到）"
+        );
+    }
+
+    /// S10 护栏 5（源码）：`session.rs` 生产区不得引用 `run_pipeline_core`。
+    /// 该名字出现在文件顶部 doc 注释里 —— 扫描时先剔除 `//` 注释行。
+    #[test]
+    fn s10_session_prod_no_run_pipeline_core() {
+        let src = include_str!("session.rs");
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(src);
+        let needle = concat!("run_", "pipeline_", "core");
+        let code_only: Vec<&String> = prod
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        let hits: Vec<&String> = code_only
+            .iter()
+            .copied()
+            .filter(|l| l.contains(needle))
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "session.rs 生产区代码不得引用 {needle}，命中行: {hits:?}"
+        );
+    }
 }

@@ -517,4 +517,119 @@ mod tests {
         assert!(translate("", &cfg, &o).is_none());
         assert!(translate("   \n", &cfg, &o).is_none());
     }
+
+    // ─── TEST-SYNC-491 / S10 护栏 1-3 ──────────────────────────────────────
+
+    /// S10 护栏 1：`apply_final` 与「本机同一批函数逐位串联」零变更。
+    /// 5 组样例 × (itn on/off)，每组断言 `apply_final(text).0` == 手工串联结果。
+    /// 手工链：`apply_homophone_fix(_, true)` → [`itn::normalize_numbers`] →
+    /// [`text_normalizer::normalize_text_for_language`] → [`punctuation::apply_l2_postprocess`]。
+    /// 样例均带有效标点 ⇒ `punctuate()` 早退不加载模型。
+    #[test]
+    fn s10_final_matches_manual_node_chain() {
+        use crate::transcription::char_times::transfer as ct_transfer;
+
+        fn manual_final(text: &str, o: &TextOpts) -> String {
+            let t1 = homophone::apply_homophone_fix(text.to_string(), true);
+            let t2 = if o.itn {
+                itn::normalize_numbers(&t1)
+            } else {
+                t1
+            };
+            let t3 = text_normalizer::normalize_text_for_language(&t2, o.script);
+            // 样例带有效标点 ⇒ punctuate() 早退，等价恒等。
+            punctuation::apply_l2_postprocess(&t3, o.punctuation, false).0
+        }
+
+        let samples = [
+            "重量三点五公斤。",               // 中文数字 → ITN
+            "他很满头大汉。",                 // 同音纠错：满头大汉 → 满头大汗
+            "我用Python写代码，很高效。",     // 混排 CN/EN
+            "今天天气很好，我们出去玩吧。",   // 长句，带，和。
+            "温度二十五度，湿度百分之五十。", // 数字 + 多标点
+        ];
+        for text in samples {
+            for itn_on in [true, false] {
+                for punc_on in [true, false] {
+                    let o = opts(itn_on, punc_on);
+                    let times = times_for(text);
+                    let (actual, actual_times) = apply_final(text, &times, &o);
+                    let expected = manual_final(text, &o);
+                    assert_eq!(
+                        actual, expected,
+                        "apply_final != manual chain: text={text:?} itn={itn_on} punc={punc_on}"
+                    );
+                    // 时间长度与输出文字对齐（零变更时 transfer 不搬）。
+                    let expected_times: Times = if actual == text {
+                        times.to_vec()
+                    } else {
+                        ct_transfer(text, &times, &expected)
+                    };
+                    assert_eq!(
+                        actual_times.len(),
+                        actual.chars().count(),
+                        "times len mismatch: text={text:?} itn={itn_on} punc={punc_on}"
+                    );
+                    // 只对 itn=false 且 punc=true 且未触发同音/繁简时逐项比对时间。
+                    if itn_on == false && punc_on == true && actual == text {
+                        assert_eq!(actual_times, expected_times);
+                    }
+                }
+            }
+        }
+    }
+
+    /// S10 护栏 2（源码）：`text_stage.rs` 生产区不得引用 `apply_filler_strip`；
+    /// `apply_homophone_fix` 的第二参（enabled）必须恒为 `true`（内置固定开）。
+    #[test]
+    fn s10_text_stage_prod_no_filler_strip_and_homophone_always_true() {
+        let src = include_str!("text_stage.rs");
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(src);
+
+        // 1. 生产区不得出现 apply_filler_strip（锚点用 concat! 拆防自匹配假绿）。
+        let filler = concat!("apply_", "filler", "_strip");
+        assert!(
+            !prod.iter().any(|l| l.contains(filler)),
+            "text_stage.rs 生产区不得引用 {filler}"
+        );
+
+        // 2. apply_homophone_fix 第二参恒 true：所有调用行包含 apply_homophone_fix，
+        //    且该行（去空白）包含 ", true)" 或 "true"。
+        let call = concat!("apply_", "homophone", "_fix");
+        let calls: Vec<&String> = prod.iter().filter(|l| l.contains(call)).collect();
+        assert!(!calls.is_empty(), "生产区应有 {call} 调用");
+        for line in calls {
+            let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+            // 期望形如 apply_homophone_fix(t.to_string(), true)
+            assert!(
+                compact.contains(",true)") || compact.contains("true"),
+                "{call} 第二参必须恒 true，实际行: {line}"
+            );
+            assert!(!compact.contains(",false)"), "{call} 不得传 false: {line}");
+        }
+    }
+
+    /// S10 护栏 3：`apply_final` 输出行为。
+    /// (a) `punctuation=false` ⇒ 输出无有效标点；
+    /// (b) 短句（≤5 字）带 `punctuation=true` ⇒ 句末标点被剥（L2 短句规则）。
+    #[test]
+    fn s10_apply_final_punctuation_behavior() {
+        // (a) punc=false 全剥标点。
+        for text in ["你好，世界。", "OK，好的。"] {
+            let o = opts(true, false);
+            let times = times_for(text);
+            let (out, _) = apply_final(text, &times, &o);
+            assert!(
+                !punctuation::has_effective_punctuation(&out),
+                "punc=false 仍含有效标点: text={text:?} out={out:?}"
+            );
+        }
+        // (b) 短句 punc=true ⇒ 句末标点剥掉。
+        let short = "好的。";
+        assert_eq!(punctuation::count_units(short), 2, "好的。 应为 2 个单位");
+        let o = opts(true, true);
+        let times = times_for(short);
+        let (out, _) = apply_final(short, &times, &o);
+        assert_eq!(out, "好的", "短句 punc=true 应剥句末标点: {out:?}");
+    }
 }

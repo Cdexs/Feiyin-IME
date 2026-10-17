@@ -879,4 +879,102 @@ mod tests {
         let v = result_json(&r);
         assert!(v["output"].get("translations").is_none(), "{v}");
     }
+
+    // ─── TEST-SYNC-491 / S10 护栏 6-7 ──────────────────────────────────────
+
+    /// 取 ws.rs 生产区（`#[cfg(test)]` 之前）——网关是独立 binary，没有 crate::guard_prod_lines。
+    fn prod_src() -> &'static str {
+        let src = include_str!("ws.rs");
+        let at = src
+            .find("#[cfg(test)]")
+            .expect("ws.rs 应有 #[cfg(test)] 测试模块");
+        &src[..at]
+    }
+
+    /// S10 护栏 6（源码）：OpenParams 三项参数解析内联在 `run_task`，顺序固定、默认值：
+    /// ITN 默认 `true`、补标点默认 `true`、翻译默认 `false`。无独立函数（内联三项）。
+    #[test]
+    fn s10_param_parsing_defaults() {
+        let prod = prod_src();
+        // 去掉全部空白，把跨行链式调用压成一行再匹配。
+        let compact: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // 三项依次出现，各自默认值正确（锚点拆开防自匹配）。
+        let itn_key = concat!("p[\"", "inverse_text_normalization_enabled", "\"]");
+        let itn_default = concat!(
+            "p[\"",
+            "inverse_text_normalization_enabled",
+            "\"].as_bool().unwrap_or(true)"
+        );
+        let punct_key = concat!("p[\"", "punctuation_prediction_enabled", "\"]");
+        let punct_default = concat!(
+            "p[\"",
+            "punctuation_prediction_enabled",
+            "\"].as_bool().unwrap_or(true)"
+        );
+        let trans_key = concat!("p[\"", "translation_enabled", "\"]");
+        let trans_default = concat!(
+            "p[\"",
+            "translation_enabled",
+            "\"].as_bool().unwrap_or(false)"
+        );
+
+        assert!(compact.contains(itn_key), "生产区应解析 {itn_key}");
+        assert!(compact.contains(itn_default), "{itn_default} 应出现");
+        assert!(compact.contains(punct_key), "生产区应解析 {punct_key}");
+        assert!(compact.contains(punct_default), "{punct_default} 应出现");
+        assert!(compact.contains(trans_key), "生产区应解析 {trans_key}");
+        assert!(compact.contains(trans_default), "{trans_default} 应出现");
+
+        // 顺序：ITN → 标点 → 翻译。
+        let i_itn = compact.find(itn_default).expect("itn_default 位置");
+        let i_punct = compact.find(punct_default).expect("punct_default 位置");
+        let i_trans = compact.find(trans_default).expect("trans_default 位置");
+        assert!(
+            i_itn < i_punct && i_punct < i_trans,
+            "三项解析顺序应为 ITN → 标点 → 翻译"
+        );
+    }
+
+    /// S10 护栏 7：`result_json` 行为。
+    /// (a) 预览（is_final=false）即使 translation 为 Some 也照实输出（网关不做过滤，过滤在内核）；
+    /// (b) words 为空 ⇒ sentence.end_time 为 null、begin_time 为 0。
+    #[test]
+    fn s10_result_json_preview_with_translation_still_outputs() {
+        use crate::frame::TranslationPayload;
+
+        // (a) is_final=false + 有译文 ⇒ translations 键照实出现，sentence_end=false。
+        let r = ResultPayload {
+            translation: Some(TranslationPayload {
+                lang: "en".into(),
+                text: "Hello".into(),
+            }),
+            is_final: false,
+            text: "你好".into(),
+            tentative: 2,
+            words: Vec::new(),
+        };
+        let v = result_json(&r);
+        assert!(
+            v["output"].get("translations").is_some(),
+            "预览帧即使 is_final=false 也应输出 translations（网关不过滤）: {v}"
+        );
+        assert_eq!(v["output"]["sentence"]["sentence_end"], false);
+        assert_eq!(v["output"]["translations"][0]["text"], "Hello");
+
+        // (b) words 为空 ⇒ begin_time=0、end_time=null。
+        let r2 = ResultPayload {
+            translation: None,
+            is_final: true,
+            text: String::new(),
+            tentative: 0,
+            words: Vec::new(),
+        };
+        let v2 = result_json(&r2);
+        assert_eq!(v2["output"]["sentence"]["begin_time"], 0, "{v2}");
+        assert!(
+            v2["output"]["sentence"]["end_time"].is_null(),
+            "words 为空时 end_time 应为 null: {v2}"
+        );
+    }
 }

@@ -23318,3 +23318,31 @@ mod sc489_tests {
         );
     }
 }
+
+// ─── TEST-SYNC-491 / S10 护栏 9 ────────────────────────────────────────────
+
+/// S10 护栏 9（源码）：main.rs 生产区不得引用 `asr_service::text_stage`
+/// （内置文字处理节点只在远程会话 `asr_service/session.rs` 里用，本机路径不经过它）。
+#[cfg(test)]
+mod s10_main_no_text_stage_ref {
+    #[test]
+    fn s10_main_prod_no_asr_service_text_stage() {
+        let src = crate::MAIN_RS_SRC;
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(src);
+        // 剔除注释行后查锚点（锚点拆开防自匹配）。
+        let code_only: Vec<&String> = prod
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        let needle = concat!("asr_service::", "text_stage");
+        let hits: Vec<&String> = code_only
+            .iter()
+            .copied()
+            .filter(|l| l.contains(needle))
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "main.rs 生产区代码不得引用 {needle}，命中行: {hits:?}"
+        );
+    }
+}

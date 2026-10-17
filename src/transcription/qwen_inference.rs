@@ -3078,4 +3078,99 @@ mod tests {
             "空 batch 不得发空音频帧"
         );
     }
+
+    // ─── TEST-SYNC-491 / S10 护栏 8 ────────────────────────────────────────
+
+    /// S10 护栏 8（源码）：`feiyin_remote::text_params()` 在 qwen_inference.rs 生产区
+    /// 恰好出现 1 次，且与 `run_task_ext` 在同一个函数体内（Feiyin 分支内）；
+    /// `build_run_task_message` 函数体内不得出现 `text_params`（三项参数只在 Feiyin 分支注入）。
+    #[test]
+    fn s10_text_params_wiring_in_feiyin_branch() {
+        let src = include_str!("qwen_inference.rs");
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(src);
+        let code_only: Vec<&String> = prod
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+
+        // 1. text_params() 恰好 1 次（锚点拆开防自匹配）。
+        let text_params = concat!("feiyin_remote::", "text_params", "()");
+        let n = code_only.iter().filter(|l| l.contains(text_params)).count();
+        assert_eq!(n, 1, "{text_params} 应恰 1 次，实际 {n}");
+
+        // 2. run_task_ext 至少 1 次。
+        let run_task_ext = concat!("feiyin_remote::", "run_task_ext", "(");
+        let n_ext = code_only
+            .iter()
+            .filter(|l| l.contains(run_task_ext))
+            .count();
+        assert!(n_ext >= 1, "{run_task_ext} 应至少 1 次，实际 {n_ext}");
+
+        // 3. text_params 与 run_task_ext 在同一函数体内：
+        //    找到各自所在行，向上回溯到最近的 fn 定义，应是同一个。
+        fn enclosing_fn(lines: &[&String], pos: usize) -> String {
+            for l in lines[..=pos].iter().rev() {
+                let t = l.trim_start();
+                if t.starts_with("fn ")
+                    || t.starts_with("pub fn ")
+                    || t.starts_with("pub(crate) fn ")
+                    || t.starts_with("async fn ")
+                    || t.starts_with("pub async fn ")
+                {
+                    // 截取 fn 名（到 '(' 或 '{' 或空格）。
+                    let name: String = t
+                        .chars()
+                        .skip_while(|c| !c.is_ascii_alphabetic() && *c != '_')
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    return name;
+                }
+            }
+            String::new()
+        }
+        let pos_tp = code_only
+            .iter()
+            .position(|l| l.contains(text_params))
+            .expect("text_params 位置");
+        let pos_ext = code_only
+            .iter()
+            .position(|l| l.contains(run_task_ext))
+            .expect("run_task_ext 位置");
+        let fn_tp = enclosing_fn(&code_only, pos_tp);
+        let fn_ext = enclosing_fn(&code_only, pos_ext);
+        assert_eq!(
+            fn_tp, fn_ext,
+            "text_params 与 run_task_ext 应在同一函数体内，实际 {fn_tp:?} vs {fn_ext:?}"
+        );
+        assert!(!fn_tp.is_empty(), "应能回溯到 enclosing fn");
+
+        // 4. build_run_task_message 函数体内不得出现 text_params。
+        //    定位 pub fn build_run_task_message，用花括号配平取函数体。
+        let lines_str: Vec<&str> = prod.iter().map(|s| s.as_str()).collect();
+        let bt_fn = lines_str
+            .iter()
+            .position(|l| l.contains("pub fn build_run_task_message"))
+            .expect("build_run_task_message 定义");
+        // 找该函数的左花括号所在行，然后配平。
+        let open_line = (bt_fn..lines_str.len())
+            .find(|&i| lines_str[i].contains('{'))
+            .expect("函数体左花括号");
+        let mut depth = 0i32;
+        let mut close_line = lines_str.len() - 1;
+        for i in open_line..lines_str.len() {
+            depth += lines_str[i].matches('{').count() as i32;
+            depth -= lines_str[i].matches('}').count() as i32;
+            if depth == 0 {
+                close_line = i;
+                break;
+            }
+        }
+        let body: String = lines_str[bt_fn..=close_line].join("\n");
+        let compact_body: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        let needle = concat!("text_", "params");
+        assert!(
+            !compact_body.contains(needle),
+            "build_run_task_message 函数体内不得出现 {needle}"
+        );
+    }
 }
