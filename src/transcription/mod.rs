@@ -28,6 +28,9 @@ mod poc_voiceprint_short_444;
 // POC-GPU-451：GPU 加速离线测试的 CPU 基线（整文件 #[cfg(test)] + #[ignore]，只测不改生产）
 #[cfg(test)]
 mod poc_gpu_451;
+// POC-ASR-SERVER-491：本机 + 远程并发占用实测（整文件 #[cfg(test)] + #[ignore]，只测不改生产）
+#[cfg(test)]
+mod poc_asr_server_491;
 // SLIDING-WINDOW-367：路A 逐片解码摘接线后，`join_segment_texts` 等 re-export 暂无人用；
 // **保留**（可回挂），故局部 allow。
 #[allow(unused_imports)]
