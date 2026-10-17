@@ -564,6 +564,14 @@ impl Conn {
             device_name: device_name.trim().to_string(),
             terminal_id: terminal,
             vocabulary: vocabulary(p.get("vocabulary")),
+            // S10：终端可控的三项（阿里同名字段；缺省 = 数字规整开、补标点开、不翻译）。
+            itn: p["inverse_text_normalization_enabled"]
+                .as_bool()
+                .unwrap_or(true),
+            punctuation: p["punctuation_prediction_enabled"]
+                .as_bool()
+                .unwrap_or(true),
+            translate: p["translation_enabled"].as_bool().unwrap_or(false),
         };
         let (session, rx) = self.shared.core.open(&params);
         self.task = Some(Task {
@@ -679,7 +687,7 @@ fn result_json(r: &ResultPayload) -> Value {
         })
         .collect();
     let sources: Vec<&str> = r.words.iter().map(|w| w.source.as_str()).collect();
-    json!({
+    let mut v = json!({
         "output": {
             "sentence": {
                 "sentence_id": 1,
@@ -692,7 +700,17 @@ fn result_json(r: &ResultPayload) -> Value {
             "feiyin": { "tentative": r.tentative, "ts_source": sources },
         },
         "usage": null,
-    })
+    });
+    // S10：终稿译文（阿里 Gummy 同形 `output.translations[]`）；没有译文 ⇒ 不出现该键。
+    if let Some(t) = &r.translation {
+        v["output"]["translations"] = json!([{
+            "sentence_id": 1,
+            "lang": t.lang,
+            "text": t.text,
+            "sentence_end": true,
+        }]);
+    }
+    v
 }
 
 #[cfg(test)]
@@ -757,6 +775,7 @@ mod tests {
     #[test]
     fn s9_result_json_with_words() {
         let r = ResultPayload {
+            translation: None,
             is_final: true,
             text: "你好，hello".into(),
             tentative: 0,
@@ -803,6 +822,7 @@ mod tests {
     #[test]
     fn s9_result_json_without_words() {
         let r = ResultPayload {
+            translation: None,
             is_final: false,
             text: "你好".into(),
             tentative: 2,
@@ -817,5 +837,46 @@ mod tests {
         assert_eq!(v["output"]["feiyin"]["ts_source"], json!([]));
         assert_eq!(v["output"]["feiyin"]["tentative"], 2);
         assert!(v["usage"].is_null());
+        assert!(v["output"].get("translations").is_none());
+    }
+
+    /// S10：终稿带译文 ⇒ `output.translations[0]` 四个字段齐全（阿里 Gummy 同形）。
+    #[test]
+    fn s10_result_json_with_translation() {
+        let r = ResultPayload {
+            translation: Some(crate::frame::TranslationPayload {
+                lang: "en".into(),
+                text: "Hello, world.".into(),
+            }),
+            is_final: true,
+            text: "你好，世界。".into(),
+            tentative: 0,
+            words: Vec::new(),
+        };
+        let v = result_json(&r);
+        let ts = v["output"]["translations"]
+            .as_array()
+            .expect("translations 是数组");
+        assert_eq!(ts.len(), 1);
+        assert_eq!(ts[0]["sentence_id"], 1);
+        assert_eq!(ts[0]["lang"], "en");
+        assert_eq!(ts[0]["text"], "Hello, world.");
+        assert_eq!(ts[0]["sentence_end"], true);
+        // 原文字段不受影响。
+        assert_eq!(v["output"]["sentence"]["text"], "你好，世界。");
+    }
+
+    /// S10：没有译文 ⇒ 键不出现（不是 null / 空数组）。
+    #[test]
+    fn s10_result_json_without_translation_has_no_key() {
+        let r = ResultPayload {
+            translation: None,
+            is_final: true,
+            text: "你好".into(),
+            tentative: 0,
+            words: Vec::new(),
+        };
+        let v = result_json(&r);
+        assert!(v["output"].get("translations").is_none(), "{v}");
     }
 }

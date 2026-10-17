@@ -125,7 +125,7 @@ pub(crate) fn pcm_i16le_to_f32(body: &[u8]) -> Vec<f32> {
 }
 
 /// `Open` 帧参数。终端名称 / 设备代码由终端传来（§16.3），其余可缺省。
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct OpenParams {
     /// 终端设备代码（配对时绑定；统计按它归属）。
     #[serde(default)]
@@ -139,6 +139,41 @@ pub(crate) struct OpenParams {
     /// 客户端追加词表（阿里协议 `vocabulary`）；追加在本机词库之后。
     #[serde(default)]
     pub vocabulary: Vec<String>,
+    /// S10：数字规整（阿里 `inverse_text_normalization_enabled`，默认开）。
+    #[serde(default = "yes")]
+    pub itn: bool,
+    /// S10：自动补标点（阿里 `punctuation_prediction_enabled`，默认开；关 ⇒ 输出去掉全部标点）。
+    #[serde(default = "yes")]
+    pub punctuation: bool,
+    /// S10：终稿另给译文（阿里 `translation_enabled`，默认关；方向按内容自动判定）。
+    #[serde(default)]
+    pub translate: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// 手写而非派生：开关的缺省值必须与 serde 缺省（旧网关不带字段时）一致。
+impl Default for OpenParams {
+    fn default() -> Self {
+        Self {
+            device_id: String::new(),
+            device_name: String::new(),
+            terminal_id: String::new(),
+            vocabulary: Vec::new(),
+            itn: true,
+            punctuation: true,
+            translate: false,
+        }
+    }
+}
+
+/// S10：终稿译文（`lang` = `en` / `zh`）。
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub(crate) struct TranslationPayload {
+    pub lang: String,
+    pub text: String,
 }
 
 /// `Result` 帧内容。`text` 恒为**本会话至今的完整文本**（不是增量），终端整段替换显示即可。
@@ -154,6 +189,9 @@ pub(crate) struct ResultPayload {
     /// 空 = 本帧无时间（如空文本）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub words: Vec<ResultWord>,
+    /// S10：终稿且终端要了翻译、翻译成功 ⇒ 译文；否则 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translation: Option<TranslationPayload>,
 }
 
 /// S9：一个词（阿里 `sentence.words[]` 同形）+ 时间来源。时间为毫秒，相对本会话第一帧音频。
@@ -198,6 +236,7 @@ mod tests {
                 Kind::Result,
                 7,
                 &ResultPayload {
+                    translation: None,
                     is_final: true,
                     text: "你好".into(),
                     tentative: 0,
@@ -257,6 +296,7 @@ mod tests {
     #[test]
     fn s9_empty_words_not_serialized_and_roundtrip() {
         let empty = ResultPayload {
+            translation: None,
             is_final: false,
             text: "你".into(),
             tentative: 1,
@@ -267,6 +307,7 @@ mod tests {
         assert_eq!(v["text"], "你");
 
         let full = ResultPayload {
+            translation: None,
             words: vec![ResultWord {
                 begin_time: 10,
                 end_time: 20,
@@ -280,6 +321,56 @@ mod tests {
         assert!(v.get("words").is_some());
         let back: ResultPayload = serde_json::from_value(v).unwrap();
         assert_eq!(back, full);
+    }
+
+    /// S10 向后兼容：旧内核 / 旧网关的 `Open` JSON 不带三项 ⇒ 默认 itn 开、标点开、不翻译。
+    #[test]
+    fn s10_open_params_missing_fields_use_defaults() {
+        let p: OpenParams = serde_json::from_str(r#"{"device_id":"d1"}"#).unwrap();
+        assert_eq!(p.device_id, "d1");
+        assert!(p.itn);
+        assert!(p.punctuation);
+        assert!(!p.translate);
+        let p: OpenParams = serde_json::from_str("{}").unwrap();
+        assert!(p.itn && p.punctuation && !p.translate);
+        // 显式值照用。
+        let p: OpenParams =
+            serde_json::from_str(r#"{"itn":false,"punctuation":false,"translate":true}"#).unwrap();
+        assert!(!p.itn && !p.punctuation && p.translate);
+    }
+
+    #[test]
+    fn s10_open_params_default_matches_serde_default() {
+        let d = OpenParams::default();
+        assert!(d.itn && d.punctuation && !d.translate);
+        let from_empty: OpenParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(d, from_empty, "手写 Default 必须与 serde 缺省一致");
+    }
+
+    /// S10：`translation` 为 `None` ⇒ 不序列化出键；有值可往返；旧 JSON 无该键 ⇒ `None`。
+    #[test]
+    fn s10_translation_none_not_serialized_and_roundtrip() {
+        let mut r = ResultPayload {
+            translation: None,
+            is_final: true,
+            text: "你好".into(),
+            tentative: 0,
+            words: Vec::new(),
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("translation").is_none(), "{v}");
+        let old: ResultPayload = serde_json::from_value(v).unwrap();
+        assert!(old.translation.is_none());
+
+        r.translation = Some(TranslationPayload {
+            lang: "en".into(),
+            text: "Hello".into(),
+        });
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["translation"]["lang"], "en");
+        assert_eq!(v["translation"]["text"], "Hello");
+        let back: ResultPayload = serde_json::from_value(v).unwrap();
+        assert_eq!(back, r);
     }
 
     #[test]

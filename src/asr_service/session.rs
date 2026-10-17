@@ -7,8 +7,8 @@
 //! - 精解用该终端自己的**远程推理通道**（`create_slot`）⇒ 本机优先让行、不做声纹剔除 / 注册
 //!  （`transcribe_acc_ctx` 按通道角色判）；
 //! - 预览 `PreviewRole::Remote` ⇒ 自己一份 VAD、关近场门、不读写本机音量沿用；
-//! - 不进 `run_pipeline_core` ⇒ 不写本机使用统计、不自动学习词库、不上屏、不做 LLM 后处理
-//!  （后处理按节点由终端点选，S10）。
+//! - 不进 `run_pipeline_core` ⇒ 不写本机使用统计、不自动学习词库、不上屏、不做 LLM 格式化
+//!  （文字处理见 `text_stage`：内置节点固定开，终端只开关数字规整 / 补标点 / 翻译，S10）。
 //! - S9 逐字时间：精解时间在「虚拟时间轴」（各派发片首尾相接，含补零）⇒ 按片映射换算成录音时间；
 //!   文字处理（去口水重复 / 繁简规整）改了字 ⇒ `char_times::transfer` 搬运；补不出的标 `estimated`。
 
@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use super::compose::{RemoteComposer, REMOTE_GEN};
 use super::frame::{EndPayload, OpenParams, ResultPayload, ResultWord};
+use super::text_stage::{self, TextOpts};
 use crate::config::AppConfig;
 use crate::transcription::char_times::{self, CharTime, SliceMap, TsSource};
 use crate::transcription::{self, AccEngine, RemoteEngines};
@@ -95,7 +96,14 @@ pub(crate) fn run_remote_session(
     // 终稿用 1.7B 原生标点 / 精解线程的进程级标点服务，与本机一致。
     let acc_cfg = transcription::local_stream::AccDispatchConfig::new();
     let acc_terms = session_terms(config, &params.vocabulary);
-    let acc_punct_enabled = config.punctuation.enabled;
+    // S10：补标点跟终端参数（精解失败片的兜底打点也一样），不跟本机设置。
+    let acc_punct_enabled = params.punctuation;
+    let opts = TextOpts {
+        itn: params.itn,
+        punctuation: params.punctuation,
+        script,
+        model_dir: model_dir.clone(),
+    };
     // 预览线程「设备」标识：只用于近场门的音量沿用判据，远程已关门；带上设备代码便于日志区分。
     let vad_device = format!("remote:{}", params.device_id);
 
@@ -210,12 +218,15 @@ pub(crate) fn run_remote_session(
                 }
             };
             if push {
-                let times = composer.display_times();
+                // S10：预览也过内置节点（同音 / 数字规整 / 关标点全剥）。
+                let (text, times) =
+                    text_stage::apply_preview(composer.display(), composer.display_times(), &opts);
                 emit(ResultPayload {
                     is_final: false,
-                    text: composer.display().to_string(),
+                    words: result_words(&text, &times, known_end(&times)),
+                    text,
                     tentative: composer.tentative(),
-                    words: result_words(composer.display(), times, known_end(times)),
+                    translation: None,
                 });
             }
         }
@@ -277,12 +288,20 @@ pub(crate) fn run_remote_session(
     };
     let text = text_normalizer::normalize_text_for_language(final_src.trim(), script);
     let times = char_times::transfer(&final_src, &src_times, &text);
+    // S10：内置节点 + 终端三项参数；要了翻译 ⇒ 另出一份译文（失败不给）。
+    let (text, times) = text_stage::apply_final(&text, &times, &opts);
+    let translation = if params.translate {
+        text_stage::translate(&text, config, &opts)
+    } else {
+        None
+    };
     let chars = text.chars().filter(|c| !c.is_whitespace()).count();
     emit(ResultPayload {
         is_final: true,
         text: text.clone(),
         tentative: 0,
         words: result_words(&text, &times, pcm_secs),
+        translation,
     });
     RemoteOutcome {
         end: EndPayload {

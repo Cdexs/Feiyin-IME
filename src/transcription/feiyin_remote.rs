@@ -35,15 +35,22 @@ pub const ERR_NOT_PAIRED: &str = "NotPaired";
 /// 对方证书与配对时记下的指纹不一致（对方重装 / 被冒充 ⇒ 重新配对）。
 pub const ERR_FINGERPRINT: &str = "FingerprintMismatch";
 
-/// `run-task` 的 `parameters.feiyin`：本机身份 + 请对方做的文字节点。
-///
-/// `postprocess`：本机走在线识别时跳过数字规整主通道（V091-ITN-SKIP-ONLINE-215，默认服务端做过），
-/// 所以请对方做同音纠错 + 数字规整，与对阿里服务的假设一致（设计 §13.3 第 4 条）。
+/// `run-task` 的 `parameters.feiyin`：本机身份。
 pub fn run_task_ext(p: &RemotePairing) -> serde_json::Value {
     serde_json::json!({
         "device_id": p.device_id,
         "device_name": p.effective_device_name(),
-        "postprocess": ["homophone", "itn"],
+    })
+}
+
+/// S10：文字处理三项（阿里同名字段，放 `parameters` 顶层，不在 `feiyin` 里）。
+/// 本机走在线识别时跳过数字规整主通道（V091-ITN-SKIP-ONLINE-215，默认服务端做过），
+/// 所以请对方做数字规整 + 补标点；翻译由本机客户端自己的开关处理，这里恒不请对方翻译。
+pub fn text_params() -> serde_json::Value {
+    serde_json::json!({
+        "inverse_text_normalization_enabled": true,
+        "punctuation_prediction_enabled": true,
+        "translation_enabled": false,
     })
 }
 
@@ -161,7 +168,7 @@ mod tests {
     use std::net::TcpListener;
 
     #[test]
-    fn run_task_ext_carries_identity_and_postprocess() {
+    fn run_task_ext_carries_identity_and_text_params_at_top_level() {
         let p = RemotePairing {
             device_id: "dev1".into(),
             device_name: "书房".into(),
@@ -170,7 +177,19 @@ mod tests {
         let v = run_task_ext(&p);
         assert_eq!(v["device_id"], "dev1");
         assert_eq!(v["device_name"], "书房");
-        assert_eq!(v["postprocess"], serde_json::json!(["homophone", "itn"]));
+        assert!(v.get("postprocess").is_none(), "S10 起不再发 postprocess");
+        // 三项在 parameters 顶层（经 Feiyin 分支合并），不在 feiyin 里。
+        for k in [
+            "inverse_text_normalization_enabled",
+            "punctuation_prediction_enabled",
+            "translation_enabled",
+        ] {
+            assert!(v.get(k).is_none(), "{k} 不应在 feiyin 里");
+        }
+        let t = text_params();
+        assert_eq!(t["inverse_text_normalization_enabled"], true);
+        assert_eq!(t["punctuation_prediction_enabled"], true);
+        assert_eq!(t["translation_enabled"], false);
     }
 
     #[test]

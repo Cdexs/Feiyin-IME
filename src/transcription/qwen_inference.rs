@@ -1176,6 +1176,13 @@ fn realtime_session(
     );
     if let OnlineTarget::Feiyin(p) = &target {
         run_task["payload"]["parameters"]["feiyin"] = super::feiyin_remote::run_task_ext(p);
+        // S10：文字处理三项（阿里同名字段）放 parameters 顶层；只改 Feiyin 分支，阿里云行为不变。
+        if let (Some(dst), Some(src)) = (
+            run_task["payload"]["parameters"].as_object_mut(),
+            super::feiyin_remote::text_params().as_object().cloned(),
+        ) {
+            dst.extend(src);
+        }
     }
     send_json(&mut ws_socket, &run_task)?;
 
