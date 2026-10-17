@@ -2809,3 +2809,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 行为变化 | `asr-service.json` 不存在或 `enabled=false`（默认）⇒ 只多一个每秒读一次文件修改时间的线程，其余无变化。`enabled=true` ⇒ 内核建 IPC 并拉起同目录网关程序 |
 | 对 macOS 的影响 | **共用代码**：看护线程在 macOS 同样启动（`main` 里平台无关调用）；网关程序名 macOS 为 `feiyin-asr-gateway`（无扩展名），须与主程序同目录（.app 包内 `Contents/MacOS/`）。**未编译 / 未实测**：`CtlListener` 的 unix 分支、`control.rs` 的 unix `connect`、看护线程拉起子进程（沙盒 / 签名环境下子进程须同签名） |
 | 是否需要对方同步 | 是：macOS 编译；打包时把网关放进 `Contents/MacOS/` 并签名；S6 设置页落地后实测启停 / 暂停 / 撤销 |
+
+## ASR-SERVER-491 一期 S5（2026-10-17，主控）· 统计加终端一维
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | `src/usage_stats.rs`（平台中立，主程序与设置界面共用）：表迁移 + 远程终端读写接口；`src/transcription/mod.rs` 新增 `effective_speech_ms_isolated`；`src/asr_service/stats.rs`（新）；IPC 帧新增 `Login` / `Logout` |
+| 行为变化 | 首次打开统计库时给 `usage_sessions` 加列 `terminal_id`（默认 `local`）并建 `terminal_sessions` 表——**旧数据不动**；「我的」页数字只算本机（远程终端出现前与之前完全一致） |
+| 对 macOS 的影响 | 同一份代码，macOS「我的」页走同一迁移；无平台分支 |
+| 是否需要对方同步 | 否（随常规 macOS 编译验证即可） |

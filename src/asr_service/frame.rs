@@ -8,6 +8,7 @@
 //! | 网关 → 内核 | `Open` | 会话参数 JSON（[`OpenParams`]） |
 //! | 网关 → 内核 | `Audio` | 16kHz 单声道 PCM，i16 LE |
 //! | 网关 → 内核 | `Finish` / `Cancel` | 说完了 / 取消（无内容） |
+//! | 网关 → 内核 | `Login` / `Logout` | 终端连接通过鉴权 / 断开（会话号 = 网关连接号；`Login` 内容为终端编号 UTF-8；S5 统计） |
 //! | 内核 → 网关 | `Result` | 识别结果 JSON（[`ResultPayload`]） |
 //! | 内核 → 网关 | `End` | 会话结束 JSON（[`EndPayload`]；出错也走这里） |
 
@@ -28,6 +29,8 @@ pub(crate) enum Kind {
     Audio = 0x03,
     Finish = 0x04,
     Cancel = 0x05,
+    Login = 0x06,
+    Logout = 0x07,
     Result = 0x81,
     End = 0x82,
 }
@@ -40,6 +43,8 @@ impl Kind {
             0x03 => Self::Audio,
             0x04 => Self::Finish,
             0x05 => Self::Cancel,
+            0x06 => Self::Login,
+            0x07 => Self::Logout,
             0x81 => Self::Result,
             0x82 => Self::End,
             _ => return None,

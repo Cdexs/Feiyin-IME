@@ -61,7 +61,7 @@ pub(crate) fn run_remote_session(
     audio_rx: crossbeam_channel::Receiver<Vec<f32>>,
     cancel: Arc<AtomicBool>,
     mut emit: impl FnMut(ResultPayload),
-) -> EndPayload {
+) -> RemoteOutcome {
     let model_dir = transcription::model_dir();
     let script = config.audio.chinese_script;
     let silence_threshold = config.audio.silence_threshold;
@@ -177,7 +177,7 @@ pub(crate) fn run_remote_session(
     });
 
     if cancel.load(Ordering::Acquire) {
-        return EndPayload::default();
+        return EndPayload::default().into();
     }
     let (preview_text, pcm) = match preview_result {
         Ok(Ok(v)) => v,
@@ -187,14 +187,16 @@ pub(crate) fn run_remote_session(
             return EndPayload {
                 error: ERR_INTERNAL.into(),
                 ..Default::default()
-            };
+            }
+            .into();
         }
         Err(_) => {
             log::error!("[ASR-SERVER-491] remote preview thread panicked");
             return EndPayload {
                 error: ERR_INTERNAL.into(),
                 ..Default::default()
-            };
+            }
+            .into();
         }
     };
     let (committed, last_window, vp_dropped_all) = match acc_result {
@@ -218,12 +220,33 @@ pub(crate) fn run_remote_session(
     let chars = text.chars().filter(|c| !c.is_whitespace()).count();
     emit(ResultPayload {
         is_final: true,
-        text,
+        text: text.clone(),
         tentative: 0,
     });
-    EndPayload {
-        error: String::new(),
-        audio_secs: pcm.len() as f32 / 16000.0,
-        chars,
+    RemoteOutcome {
+        end: EndPayload {
+            error: String::new(),
+            audio_secs: pcm.len() as f32 / 16000.0,
+            chars,
+        },
+        text,
+        pcm,
+    }
+}
+
+/// 一路远程会话的结果：`end` 回网关；终稿文本与整段音频留给统计（S5）。
+pub(crate) struct RemoteOutcome {
+    pub end: EndPayload,
+    pub text: String,
+    pub pcm: Vec<f32>,
+}
+
+impl From<EndPayload> for RemoteOutcome {
+    fn from(end: EndPayload) -> Self {
+        Self {
+            end,
+            text: String::new(),
+            pcm: Vec::new(),
+        }
     }
 }

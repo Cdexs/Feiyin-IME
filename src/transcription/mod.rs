@@ -1350,12 +1350,22 @@ fn self_vad_ranges(samples: &[f32]) -> Option<Vec<(usize, usize)>> {
 /// 进程级剪静音 VAD 判出的语音区间总长（16k 样本，与本地实时送精解前剪静音同一 VAD）。
 /// VAD 不可用 ⇒ `None`（调用方退回整段长度）。
 pub(crate) fn effective_speech_ms(samples: &[f32]) -> Option<u64> {
-    let ranges = self_vad_ranges(samples)?;
+    Some(ranges_ms(&self_vad_ranges(samples)?))
+}
+
+/// ASR-SERVER-491 S5：同 [`effective_speech_ms`] 口径（同一剪静音 VAD 配置），但现建一份自己的 VAD——
+/// 远程会话统计不碰本机进程级缓存与它的锁（本机优先）。
+pub(crate) fn effective_speech_ms_isolated(samples: &[f32]) -> Option<u64> {
+    let vad = VadSegmenter::try_new_for_local_trim(&model_dir())?;
+    Some(ranges_ms(&vad.speech_ranges(samples)))
+}
+
+fn ranges_ms(ranges: &[(usize, usize)]) -> u64 {
     let speech: u64 = ranges
         .iter()
         .map(|(s, e)| e.saturating_sub(*s) as u64)
         .sum();
-    Some(speech * 1000 / 16_000)
+    speech * 1000 / 16_000
 }
 
 /// LOCALRT-WARM-CACHE-450：取进程级剪静音 VAD（首次调用加载）。

@@ -133,9 +133,37 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              words INTEGER NOT NULL,
              llm_calls INTEGER NOT NULL
          );
-         CREATE INDEX IF NOT EXISTS idx_usage_sessions_ts ON usage_sessions(ts);",
+         CREATE INDEX IF NOT EXISTS idx_usage_sessions_ts ON usage_sessions(ts);
+         CREATE TABLE IF NOT EXISTS terminal_sessions (
+             id INTEGER PRIMARY KEY,
+             terminal_id TEXT NOT NULL,
+             login_ts INTEGER NOT NULL,
+             logout_ts INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS idx_terminal_sessions ON terminal_sessions(terminal_id, login_ts);",
+    )?;
+    // ASR-SERVER-491 S5（设计 §16.4）：加「终端」一维。旧库与新库走同一条迁移：列不存在就加，
+    // 默认值 `local` ⇒ 已有记录原样算本机，本机写入路径（不带该列）一行不改。
+    let has_terminal: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('usage_sessions') WHERE name = 'terminal_id'")?
+        .exists([])?;
+    if !has_terminal {
+        if let Err(e) = conn.execute_batch(&format!(
+            "ALTER TABLE usage_sessions ADD COLUMN terminal_id TEXT NOT NULL DEFAULT '{LOCAL_TERMINAL}'"
+        )) {
+            // 主程序与设置界面同时首开旧库：另一方刚加上 ⇒ 忽略「重复列」。
+            if !e.to_string().contains("duplicate column") {
+                return Err(e);
+            }
+        }
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_usage_sessions_terminal ON usage_sessions(terminal_id, ts);",
     )
 }
+
+/// 本机记录的终端编号（`usage_sessions.terminal_id` 默认值）。
+pub const LOCAL_TERMINAL: &str = "local";
 
 fn open() -> rusqlite::Result<Connection> {
     let conn = Connection::open(db_path())?;
@@ -171,7 +199,8 @@ fn week_usage_in(conn: &Connection, start: i64, end: i64) -> rusqlite::Result<We
     let mut usage = WeekUsage::default();
     let mut stmt = conn.prepare(
         "SELECT category, SUM(speech_ms), SUM(words), SUM(llm_calls)
-         FROM usage_sessions WHERE ts >= ?1 AND ts < ?2 GROUP BY category",
+         FROM usage_sessions WHERE ts >= ?1 AND ts < ?2 AND terminal_id = 'local'
+         GROUP BY category",
     )?;
     let rows = stmt.query_map(params![start, end], |r| {
         Ok((
@@ -220,6 +249,151 @@ pub fn record(
         count_output_words(final_text),
         llm_calls,
     )
+}
+
+// ---------------------------------------------------------------------------
+// ASR-SERVER-491 S5：远程终端统计（设计 §16.4）。「我的」页只看本机（上面按 `local` 过滤），
+// 远程终端只在「识别服务」页看。字数 / 时长口径与本机同一套函数。
+// ---------------------------------------------------------------------------
+
+/// 远程终端出一次终稿记一条（内核统计线程调用）。
+#[allow(dead_code)] // 设置界面只读
+pub fn record_terminal(
+    conn: &Connection,
+    terminal_id: &str,
+    speech_ms: u64,
+    final_text: &str,
+) -> rusqlite::Result<()> {
+    record_terminal_in(
+        conn,
+        Local::now().timestamp(),
+        terminal_id,
+        speech_ms,
+        count_output_words(final_text),
+    )
+}
+
+fn record_terminal_in(
+    conn: &Connection,
+    ts: i64,
+    terminal_id: &str,
+    speech_ms: u64,
+    words: u64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO usage_sessions (ts, category, speech_ms, words, llm_calls, terminal_id)
+         VALUES (?1, 'remote', ?2, ?3, 0, ?4)",
+        params![ts, speech_ms as i64, words as i64, terminal_id],
+    )?;
+    Ok(())
+}
+
+/// 终端登录（连接通过鉴权）：返回记录号，退出时用它补退出时间。
+#[allow(dead_code)]
+pub fn terminal_login(conn: &Connection, terminal_id: &str, ts: i64) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO terminal_sessions (terminal_id, login_ts) VALUES (?1, ?2)",
+        params![terminal_id, ts],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+#[allow(dead_code)]
+pub fn terminal_logout(conn: &Connection, row: i64, ts: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE terminal_sessions SET logout_ts = ?2 WHERE id = ?1 AND logout_ts IS NULL",
+        params![row, ts],
+    )?;
+    Ok(())
+}
+
+/// 内核统计线程用：打开（必要时创建）统计库。
+#[allow(dead_code)]
+pub fn open_for_write() -> rusqlite::Result<Connection> {
+    open()
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct TerminalUsage {
+    pub terminal_id: String,
+    /// 本周（周一 ~ 周日）。
+    pub week: CategoryUsage,
+    /// 累计。
+    pub total: CategoryUsage,
+}
+
+fn terminal_usage_in(
+    conn: &Connection,
+    start: i64,
+    end: i64,
+) -> rusqlite::Result<Vec<TerminalUsage>> {
+    let mut stmt = conn.prepare(
+        "SELECT terminal_id,
+                SUM(CASE WHEN ts >= ?1 AND ts < ?2 THEN speech_ms ELSE 0 END),
+                SUM(CASE WHEN ts >= ?1 AND ts < ?2 THEN words ELSE 0 END),
+                SUM(speech_ms), SUM(words)
+         FROM usage_sessions WHERE terminal_id <> 'local'
+         GROUP BY terminal_id ORDER BY terminal_id",
+    )?;
+    let u = |v: i64| v.max(0) as u64;
+    let rows = stmt.query_map(params![start, end], |r| {
+        Ok(TerminalUsage {
+            terminal_id: r.get(0)?,
+            week: CategoryUsage {
+                speech_ms: u(r.get(1)?),
+                words: u(r.get(2)?),
+            },
+            total: CategoryUsage {
+                speech_ms: u(r.get(3)?),
+                words: u(r.get(4)?),
+            },
+        })
+    })?;
+    rows.collect()
+}
+
+/// 设置界面「识别服务」页：每个远程终端的本周 / 累计时长与字数（库不存在 ⇒ 空，不建库）。
+#[allow(dead_code)]
+pub fn terminal_usage() -> rusqlite::Result<Vec<TerminalUsage>> {
+    if !db_path().is_file() {
+        return Ok(Vec::new());
+    }
+    let (start, end) = week_bounds(Local::now());
+    terminal_usage_in(&open()?, start, end)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct TerminalSession {
+    pub login_ts: i64,
+    /// `None` = 仍在线，或上次内核异常退出没记到退出时间。
+    pub logout_ts: Option<i64>,
+}
+
+fn terminal_sessions_in(
+    conn: &Connection,
+    terminal_id: &str,
+    limit: u32,
+) -> rusqlite::Result<Vec<TerminalSession>> {
+    let mut stmt = conn.prepare(
+        "SELECT login_ts, logout_ts FROM terminal_sessions WHERE terminal_id = ?1
+         ORDER BY login_ts DESC, id DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![terminal_id, limit], |r| {
+        Ok(TerminalSession {
+            login_ts: r.get(0)?,
+            logout_ts: r.get(1)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// 设置界面：某终端最近若干次登录 / 退出（新的在前）。
+#[allow(dead_code)]
+pub fn terminal_sessions(terminal_id: &str, limit: u32) -> rusqlite::Result<Vec<TerminalSession>> {
+    if !db_path().is_file() {
+        return Ok(Vec::new());
+    }
+    terminal_sessions_in(&open()?, terminal_id, limit)
 }
 
 /// 设置界面：本周（周一 ~ 周日）汇总。
@@ -302,6 +476,72 @@ mod stats475_tests {
         let monday = Local.with_ymd_and_hms(2026, 10, 5, 0, 0, 0).unwrap();
         assert_eq!(week_bounds(monday).0, e);
         assert!(sunday_night.timestamp() < e && sunday_night.timestamp() >= s);
+    }
+
+    /// ASR-SERVER-491 S5：旧库迁移不丢数据；「我的」页只算本机；远程终端分开汇总；登录 / 退出成对。
+    #[test]
+    fn asr491_terminal_dimension_migrates_and_isolates() {
+        let conn = Connection::open_in_memory().unwrap();
+        // 旧库：只有 S5 之前的表结构与一条本机记录。
+        conn.execute_batch(
+            "CREATE TABLE usage_sessions (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL,
+               category TEXT NOT NULL, speech_ms INTEGER NOT NULL, words INTEGER NOT NULL,
+               llm_calls INTEGER NOT NULL);
+             INSERT INTO usage_sessions (ts, category, speech_ms, words, llm_calls)
+               VALUES (1000100, 'local_fast', 4000, 7, 1);",
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        init_schema(&conn).unwrap(); // 重复打开不再加列
+        let (s, e) = (1_000_000, 1_604_800);
+        record_in(&conn, s + 1, UsageCategory::LocalStreaming, 1_000, 2, 0).unwrap();
+        record_terminal_in(&conn, s + 2, "t1", 5_000, 9).unwrap();
+        record_terminal_in(&conn, s - 5, "t1", 1_000, 1).unwrap(); // 上周
+        record_terminal_in(&conn, s + 3, "t2", 2_000, 3).unwrap();
+
+        let mine = week_usage_in(&conn, s, e).unwrap();
+        assert_eq!(
+            (mine.speech_ms, mine.words),
+            (5_000, 9),
+            "旧记录算本机，远程不进「我的」"
+        );
+
+        let t = terminal_usage_in(&conn, s, e).unwrap();
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].terminal_id, "t1");
+        assert_eq!(
+            t[0].week,
+            CategoryUsage {
+                speech_ms: 5_000,
+                words: 9
+            }
+        );
+        assert_eq!(
+            t[0].total,
+            CategoryUsage {
+                speech_ms: 6_000,
+                words: 10
+            }
+        );
+
+        let r1 = terminal_login(&conn, "t1", 10).unwrap();
+        terminal_login(&conn, "t1", 20).unwrap(); // 仍在线
+        terminal_logout(&conn, r1, 15).unwrap();
+        terminal_logout(&conn, r1, 99).unwrap(); // 已记过不覆盖
+        let ss = terminal_sessions_in(&conn, "t1", 10).unwrap();
+        assert_eq!(
+            ss,
+            vec![
+                TerminalSession {
+                    login_ts: 20,
+                    logout_ts: None
+                },
+                TerminalSession {
+                    login_ts: 10,
+                    logout_ts: Some(15)
+                },
+            ]
+        );
     }
 
     #[test]

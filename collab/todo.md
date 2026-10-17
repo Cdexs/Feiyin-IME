@@ -91,7 +91,7 @@
 | S4 | 网关进程 `feiyin-asr-gateway`：WebSocket `run-task`、内置加密（自签证书 + 指纹）、配对存储（key 10 分钟首次绑定 + 设备代码绑定）、终端名称 / 设备代码、暂停 | ✅ 编译通过：`src/asr_shared/`（设置 + 配对，三方共用）+ `src/bin/feiyin-asr-gateway/`（内核连接 / 证书 / wss 会话）；协议落地细节见设计 §5.1「一期实现」 |
 | S4b | 本机控制通道（设置界面 ↔ 网关）：在线终端列表、暂停 / 恢复、添加终端、撤销即断开；网关运行期间终端表只由网关写 | ✅ 编译通过：`asr_shared/control.rs`（协议 + 客户端 `call`，S6 设置界面直接用）+ 网关 `ctl.rs`；暂停语义按 §16.2 改正（进行中做完、新请求 / 新连接拒绝） |
 | S4c | 内核拉起网关：口令走环境变量、异常退出 5 秒重拉、按 `asr-service.json` 总开关启停；`AsrService::start` 接线 | ✅ 编译通过：`asr_service/supervisor.rs`，`main` 进入主循环前起看护线程。不用 Job 对象（网关读到 IPC 断开自退）。停服务先杀网关再停 IPC；`wake()` 补连 `.out` 防卡死。**端到端实测待 S11 参考客户端** |
-| S5 | 统计加终端一维：`usage_sessions.terminal_id`（旧数据默认 local）+ `terminal_sessions` 登录 / 退出表；「我的」页仍只看本机 | ⬜ |
+| S5 | 统计加终端一维：`usage_sessions.terminal_id`（旧数据默认 local）+ `terminal_sessions` 登录 / 退出表；「我的」页仍只看本机 | ✅ 编译通过（主程序 / poc / 设置界面）：迁移按列存在与否加列（新旧库同一路径，并发首开忽略重复列）；内核每条网关连接一个统计线程写库（IPC 新帧 `Login` / `Logout`；终稿时长用会话自己的剪静音 VAD，不碰本机锁）；设置界面读接口 `terminal_usage` / `terminal_sessions` 供 S6 |
 | S6 | 设置界面「识别服务」页（§16，i18n 三份，复用 card 风格） | ⬜ |
 | S7 | 托盘菜单单项「启动识别服务 / 停止识别服务」按状态自动切换（§16.7，i18n） | ⬜ |
 | S8 | 我们的电脑客户端：连接码 / 手输配对，在线识别连自家服务（内外网自动切换） | ⬜ |

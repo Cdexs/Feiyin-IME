@@ -13,6 +13,7 @@
 mod compose;
 mod frame;
 mod session;
+mod stats;
 pub(crate) mod supervisor;
 mod transport;
 
@@ -148,6 +149,8 @@ struct Live {
 fn serve_conn(conn: transport::Conn, runtime_config: &Arc<RwLock<AppConfig>>) {
     let transport::Conn { mut reader, writer } = conn;
     let writer: Writer = Arc::new(Mutex::new(writer));
+    // 先建后删：会话线程在下面 join 完才轮到它 drop（drop 时补记仍在线终端的退出时间）。
+    let stats = stats::Stats::start();
     let mut live: HashMap<u64, Live> = HashMap::new();
     loop {
         let f = match frame::read_frame(&mut reader) {
@@ -173,7 +176,14 @@ fn serve_conn(conn: transport::Conn, runtime_config: &Arc<RwLock<AppConfig>>) {
                         continue;
                     }
                 };
-                match open_session(f.session, params, live.len(), &writer, runtime_config) {
+                match open_session(
+                    f.session,
+                    params,
+                    live.len(),
+                    &writer,
+                    runtime_config,
+                    stats.sender(),
+                ) {
                     Ok(s) => {
                         live.insert(f.session, s);
                     }
@@ -202,6 +212,11 @@ fn serve_conn(conn: transport::Conn, runtime_config: &Arc<RwLock<AppConfig>>) {
                     s.audio_tx = None;
                 }
             }
+            Kind::Login => stats.send(stats::StatsOp::Login {
+                conn: f.session,
+                terminal: String::from_utf8_lossy(&f.body).into_owned(),
+            }),
+            Kind::Logout => stats.send(stats::StatsOp::Logout { conn: f.session }),
             Kind::Hello | Kind::Result | Kind::End => {
                 log::warn!("[ASR-SERVER-491] unexpected frame {:?}", f.kind);
             }
@@ -223,6 +238,7 @@ fn open_session(
     active: usize,
     writer: &Writer,
     runtime_config: &Arc<RwLock<AppConfig>>,
+    stats_tx: Option<crossbeam_channel::Sender<stats::StatsOp>>,
 ) -> Result<Live, &'static str> {
     let engines = transcription::remote_engines().ok_or(ERR_NOT_READY)?;
     // 空闲显存是「此刻」的：已开的通道已经占掉了，故直接看还能不能再开一路。
@@ -251,7 +267,7 @@ fn open_session(
                 let vad = transcription::VadSegmenter::try_new_for_local_silence(
                     &transcription::model_dir(),
                 );
-                let end = session::run_remote_session(
+                let out = session::run_remote_session(
                     &engines,
                     &slot,
                     vad.as_ref(),
@@ -261,13 +277,26 @@ fn open_session(
                     cancel,
                     |r| send(&writer, &Frame::json(Kind::Result, id, &r)),
                 );
+                // 推理通道（约 73MB）先还，再回网关、记统计。
+                drop(slot);
+                drop(engines);
+                let end = &out.end;
                 log::info!(
                     "[ASR-SERVER-491] remote session {id} end: error={:?} audio={:.1}s chars={}",
                     end.error,
                     end.audio_secs,
                     end.chars
                 );
-                send(&writer, &Frame::json(Kind::End, id, &end));
+                send(&writer, &Frame::json(Kind::End, id, end));
+                if let Some(tx) = stats_tx {
+                    if !out.text.trim().is_empty() && !params.terminal_id.is_empty() {
+                        let _ = tx.send(stats::StatsOp::Final {
+                            terminal: params.terminal_id.clone(),
+                            text: out.text,
+                            pcm: out.pcm,
+                        });
+                    }
+                }
             })
             .map_err(|_| session::ERR_INTERNAL)?
     };

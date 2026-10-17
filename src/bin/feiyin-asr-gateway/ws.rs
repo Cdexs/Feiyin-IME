@@ -448,6 +448,9 @@ impl Conn {
         let _ = ws.close(None).await;
         lock(&self.shared.online).remove(&self.conn_id);
         if let Some(id) = &self.terminal {
+            self.shared
+                .core
+                .send(Frame::new(Kind::Logout, self.conn_id, Vec::new()));
             self.shared.with_store(|st| match st.get_mut(id) {
                 Some(t) => {
                     t.last_logout_ts = now_ts();
@@ -611,6 +614,14 @@ impl Conn {
                     return Err(AuthError::DeviceMismatch);
                 }
                 self.shared.succeed(self.ip);
+                if first {
+                    // 统计「登录 / 退出」记录由内核写（§16.4）；会话号字段放连接号。
+                    self.shared.core.send(Frame::new(
+                        Kind::Login,
+                        self.conn_id,
+                        id.clone().into_bytes(),
+                    ));
+                }
                 self.terminal = Some(id.clone());
             }
             Err(_) => self.shared.fail(self.ip),
