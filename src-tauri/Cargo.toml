@@ -25,6 +25,9 @@ atomic-write-file = "0.3.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
+# ASR-SERVER-491 S6：「识别服务」页——共用 src/asr_shared（key 哈希 / 随机数用 ring，与 rustls 同一份）+ 配对二维码（只要 SVG 渲染，不拉图像库）。
+ring = "0.17"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 # BUG-QWEN3-CRYPTO-001: 显式安装 rustls ring provider，解决 aws-lc-rs/ring 冲突 panic
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

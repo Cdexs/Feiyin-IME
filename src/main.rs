@@ -117,10 +117,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassW, RemovePropW, SetForegroundWindow, SetLayeredWindowAttributes, SetMenuItemInfoW,
     SetPropW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowCaret, ShowWindow, TrackPopupMenu,
     TranslateMessage, UpdateLayeredWindow, CREATESTRUCTW, CW_USEDEFAULT, GUITHREADINFO,
-    GWLP_USERDATA, GWL_EXSTYLE, HMENU, IDC_ARROW, LWA_ALPHA, MENUITEMINFOW, MF_SEPARATOR,
-    MF_STRING, MIIM_BITMAP, MSG, PM_REMOVE, PRF_CLIENT, PRF_ERASEBKGND, QS_ALLINPUT, SM_CXSCREEN,
-    SM_CXSMICON, SM_CYSCREEN, SM_CYSMICON, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNA, TPM_NONOTIFY, TPM_RETURNCMD,
+    GWLP_USERDATA, GWL_EXSTYLE, HMENU, IDC_ARROW, LWA_ALPHA, MENUITEMINFOW, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, MIIM_BITMAP, MSG, PM_REMOVE, PRF_CLIENT, PRF_ERASEBKGND, QS_ALLINPUT,
+    SM_CXSCREEN, SM_CXSMICON, SM_CYSCREEN, SM_CYSMICON, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNA, TPM_NONOTIFY, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
     WM_LBUTTONUP, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCPAINT, WM_PAINT, WM_PRINTCLIENT, WM_TIMER,
     WNDCLASSW, WNDCLASS_STYLES, WS_CHILD, WS_CLIPCHILDREN, WS_EX_LAYERED, WS_EX_NOACTIVATE,
@@ -244,7 +244,12 @@ fn send_event(tx: &crossbeam_channel::Sender<PipelineEvent>, event: PipelineEven
 enum AppCommand {
     OpenSettings,
     Exit,
-    ShowTrayMenu { x: i32, y: i32 },
+    /// ASR-SERVER-491 S7：托盘「启动 / 停止识别服务」。
+    ToggleAsrService,
+    ShowTrayMenu {
+        x: i32,
+        y: i32,
+    },
 }
 #[derive(Debug)]
 // MACOS-P4-NEUTRAL-002: 去 cfg——run_pipeline_core 已中立，worker 线程需在 macOS 起来。
@@ -423,6 +428,8 @@ const MENU_CMD_SETTINGS: u32 = 1001;
 #[cfg(target_os = "windows")]
 const MENU_CMD_EXIT: u32 = 1002;
 #[cfg(target_os = "windows")]
+const MENU_CMD_ASR_TOGGLE: u32 = 1003;
+#[cfg(target_os = "windows")]
 static MENU_VISIBLE: AtomicBool = AtomicBool::new(false);
 // ASR-074-GUARD: process-wide count of audio chunks dropped because the ASR consumer
 // stopped draining chunk_tx (send_timeout hit 200ms). Warn-visible per drop, counted
@@ -577,9 +584,22 @@ fn show_tray_popup_menu(
     let (settings_label, exit_label) = tray_menu_labels(ui_language);
     let settings_w = encode_wide(settings_label);
     let exit_w = encode_wide(exit_label);
+    // ASR-SERVER-491 S7（§16.7）：识别服务单项，文案随总开关切换，未就绪置灰。
+    let (asr_label, asr_enabled) = asr_service::supervisor::tray_item(ui_language);
+    let asr_w = encode_wide(asr_label);
     unsafe {
         let menu = CreatePopupMenu().ok()?;
         MENU_VISIBLE.store(true, Ordering::SeqCst);
+        let _ = AppendMenuW(
+            menu,
+            if asr_enabled {
+                MF_STRING
+            } else {
+                MF_STRING | MF_GRAYED
+            },
+            MENU_CMD_ASR_TOGGLE as usize,
+            PCWSTR(asr_w.as_ptr()),
+        );
         let _ = AppendMenuW(
             menu,
             MF_STRING,
@@ -617,6 +637,7 @@ fn show_tray_popup_menu(
         match cmd_id {
             MENU_CMD_SETTINGS => Some(AppCommand::OpenSettings),
             MENU_CMD_EXIT => Some(AppCommand::Exit),
+            MENU_CMD_ASR_TOGGLE => Some(AppCommand::ToggleAsrService),
             _ => None,
         }
     }
@@ -7113,11 +7134,14 @@ fn process_controller_events(
                 log::info!("Exit command received, returning true");
                 return Ok(true);
             }
+            AppCommand::ToggleAsrService => asr_service::supervisor::toggle_from_tray(),
             AppCommand::ShowTrayMenu { x, y } => {
                 let ui_language = clone_runtime_config(runtime_config).ui_language;
                 if let Some(next_cmd) = show_tray_popup_menu(controller_hwnd, x, y, ui_language) {
                     let should_exit = matches!(next_cmd, AppCommand::Exit);
-                    if !should_exit {
+                    if let AppCommand::ToggleAsrService = next_cmd {
+                        asr_service::supervisor::toggle_from_tray();
+                    } else if !should_exit {
                         // route settings through the same command path
                         if let AppCommand::OpenSettings = next_cmd {
                             if settings_child
@@ -9939,6 +9963,10 @@ fn run_controller_macos(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
                 }
                 recv(logic_tray_cmd_rx) -> cmd => {
                     match cmd {
+                        // ASR-SERVER-491 S7：与 Windows 同一开关逻辑（平台中立）。
+                        Ok(platform::TrayCommand::ToggleAsrService) => {
+                            asr_service::supervisor::toggle_from_tray();
+                        }
                         Ok(platform::TrayCommand::OpenSettings) => {
                             log::info!("macOS tray: open settings requested");
                             match spawn_settings_process() {

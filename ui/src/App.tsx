@@ -10,6 +10,7 @@ import VoicePage from "./pages/Voice";
 import LlmPage from "./pages/Llm";
 import WordbookPage from "./pages/Wordbook";
 import MinePage from "./pages/Mine";
+import AsrServerPage from "./pages/AsrServer";
 import AboutPage from "./pages/About";
 
 function App() {
@@ -85,6 +86,7 @@ function App() {
       case "llm": return <LlmPage {...props} />;
       case "wordbook": return <WordbookPage {...props} />;
       case "mine": return <MinePage {...props} />;
+      case "asr_server": return <AsrServerPage {...props} />;
       case "about": return <AboutPage {...props} />;
       default: return <GeneralPage {...props} />;
     }
@@ -97,6 +99,7 @@ function App() {
     { id: 'llm', label: t.nav_llm },
     { id: 'wordbook', label: t.nav_wordbook },
     { id: 'mine', label: t.nav_mine }, // STATS-475：「词库」下
+    { id: 'asr_server', label: t.nav_asr_server }, // ASR-SERVER-491 §16.1：「我的」后、「关于」前
     { id: 'about', label: t.nav_about },
   ];
 
@@ -130,6 +133,11 @@ function App() {
     mine: (
       <svg className="sidebar-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
         <circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0116 0"/>
+      </svg>
+    ),
+    asr_server: (
+      <svg className="sidebar-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+        <rect x="3" y="3" width="18" height="7" rx="2"/><rect x="3" y="14" width="18" height="7" rx="2"/><path d="M7 6.5h.01M7 17.5h.01M11 6.5h6M11 17.5h6"/>
       </svg>
     ),
     about: (

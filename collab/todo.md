@@ -92,8 +92,8 @@
 | S4b | 本机控制通道（设置界面 ↔ 网关）：在线终端列表、暂停 / 恢复、添加终端、撤销即断开；网关运行期间终端表只由网关写 | ✅ 编译通过：`asr_shared/control.rs`（协议 + 客户端 `call`，S6 设置界面直接用）+ 网关 `ctl.rs`；暂停语义按 §16.2 改正（进行中做完、新请求 / 新连接拒绝） |
 | S4c | 内核拉起网关：口令走环境变量、异常退出 5 秒重拉、按 `asr-service.json` 总开关启停；`AsrService::start` 接线 | ✅ 编译通过：`asr_service/supervisor.rs`，`main` 进入主循环前起看护线程。不用 Job 对象（网关读到 IPC 断开自退）。停服务先杀网关再停 IPC；`wake()` 补连 `.out` 防卡死。**端到端实测待 S11 参考客户端** |
 | S5 | 统计加终端一维：`usage_sessions.terminal_id`（旧数据默认 local）+ `terminal_sessions` 登录 / 退出表；「我的」页仍只看本机 | ✅ 编译通过（主程序 / poc / 设置界面）：迁移按列存在与否加列（新旧库同一路径，并发首开忽略重复列）；内核每条网关连接一个统计线程写库（IPC 新帧 `Login` / `Logout`；终稿时长用会话自己的剪静音 VAD，不碰本机锁）；设置界面读接口 `terminal_usage` / `terminal_sessions` 供 S6 |
-| S6 | 设置界面「识别服务」页（§16，i18n 三份，复用 card 风格） | ⬜ |
-| S7 | 托盘菜单单项「启动识别服务 / 停止识别服务」按状态自动切换（§16.7，i18n） | ⬜ |
+| S6 | 设置界面「识别服务」页（§16，i18n 三份，复用 card 风格） | ✅ 编译 + 类型检查通过：`ui/src/pages/AsrServer.tsx`（三块卡片 + 添加终端弹窗：二维码 / 连接码 / 手输 + 撤销确认弹窗），导航在「我的」后；后端 `src-tauri/src/asr_server.rs`（7 个命令；二维码用 qrcode SVG）；i18n 三份。**待 Gavin 目视确认** |
+| S7 | 托盘菜单单项「启动识别服务 / 停止识别服务」按状态自动切换（§16.7，i18n） | ✅ 编译通过：Windows `TrackPopupMenu` 首项 / macOS `NSMenuItem`（15ms 轮询变化才改）；文案与可点状态由平台中立 `supervisor::tray_item` 给出；未就绪置灰且文案带原因（菜单项无悬停提示，偏离设计「悬停说明」）。macOS 未编译。**待 Gavin 目视确认** |
 | S8 | 我们的电脑客户端：连接码 / 手输配对，在线识别连自家服务（内外网自动切换） | ⬜ |
 | S9 | 逐字时间补齐 T1~T6（§12） | ⬜ |
 | S10 | 文字节点包装 `TextStage` + `feiyin.postprocess` + 单独文字处理接口（§13） | ⬜ |

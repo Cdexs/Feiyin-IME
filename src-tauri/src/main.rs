@@ -1,6 +1,7 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod asr_server; // ASR-SERVER-491 S6：「识别服务」页
 mod audio;
 mod config;
 mod crash;
@@ -242,6 +243,13 @@ fn main() {
             wordbook::add_wordbook_entry,
             wordbook::delete_wordbook_entry_by_id,
             usage::get_usage_week,
+            asr_server::asr_server_overview,
+            asr_server::asr_server_set_enabled,
+            asr_server::asr_server_save_wan,
+            asr_server::asr_server_set_paused,
+            asr_server::asr_server_add_terminal,
+            asr_server::asr_server_revoke,
+            asr_server::asr_server_sessions,
             overlay::show_recording_overlay,
             overlay::hide_recording_overlay,
             overlay::update_overlay_status

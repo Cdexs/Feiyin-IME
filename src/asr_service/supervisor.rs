@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -27,6 +28,32 @@ const RESPAWN_DELAY: Duration = Duration::from_secs(5);
 const GATEWAY_EXE: &str = "feiyin-asr-gateway.exe";
 #[cfg(not(target_os = "windows"))]
 const GATEWAY_EXE: &str = "feiyin-asr-gateway";
+
+/// 总开关当前值（看护线程每次读设置文件后更新；托盘读它定文案，不碰文件）。
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// S7 托盘单项（设计 §16.7）：`(文案, 可点)`。开着（含暂停中）⇒「停止识别服务」；关着 ⇒「启动识别服务」，
+/// 本机没加载本地实时模型（服务未就绪）时置灰并在文案里说明原因（Win32 / macOS 菜单项都没有悬停提示）。
+pub(crate) fn tray_item(ui_language: crate::config::UiLanguage) -> (&'static str, bool) {
+    let s = crate::i18n::get(ui_language);
+    if ENABLED.load(Ordering::Relaxed) {
+        (s.tray_menu_asr_stop, true)
+    } else if crate::transcription::remote_engines_ready() {
+        (s.tray_menu_asr_start, true)
+    } else {
+        (s.tray_menu_asr_unavailable, false)
+    }
+}
+
+/// 托盘点击：翻转总开关并写回设置文件（与设置页同一个开关，看护线程 1 秒内跟上）。
+pub(crate) fn toggle_from_tray() {
+    let mut s = ServiceSettings::load();
+    s.enabled = !s.enabled;
+    match s.save() {
+        Ok(()) => ENABLED.store(s.enabled, Ordering::Relaxed),
+        Err(e) => log::warn!("[ASR-SERVER-491] save service switch failed: {e}"),
+    }
+}
 
 /// 起看护线程（进程生命周期内常驻；进程退出时网关随 IPC 断开自行退出）。
 pub(crate) fn spawn(runtime_config: Arc<RwLock<AppConfig>>) {
@@ -59,6 +86,7 @@ fn run(runtime_config: Arc<RwLock<AppConfig>>) {
         if seen != Some(mtime) {
             seen = Some(mtime);
             want = ServiceSettings::load();
+            ENABLED.store(want.enabled, Ordering::Relaxed);
         }
         // 端口变了 ⇒ 停掉重来。
         if running

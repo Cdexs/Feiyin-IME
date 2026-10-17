@@ -285,6 +285,14 @@ pub(crate) fn remote_engines() -> Option<RemoteEngines> {
         .clone()
 }
 
+/// 识别服务是否就绪（本机已加载本地实时模型）；只看有无，不克隆（托盘高频轮询用）。
+pub(crate) fn remote_engines_ready() -> bool {
+    REMOTE_ENGINES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+}
+
 impl Drop for Transcriber {
     fn drop(&mut self) {
         let Some(OfflineEngine::Qwen3(acc)) = self.offline_recognizer.as_ref() else {

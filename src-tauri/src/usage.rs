@@ -3,7 +3,7 @@
 
 #[allow(dead_code)] // 写入接口只在主程序用
 #[path = "../../src/usage_stats.rs"]
-mod usage_stats_core;
+pub(crate) mod usage_stats_core; // ASR-SERVER-491 S6：「识别服务」页也读（终端统计）
 
 pub use usage_stats_core::WeekUsage;
 

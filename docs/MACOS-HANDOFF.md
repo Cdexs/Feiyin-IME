@@ -2818,3 +2818,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 行为变化 | 首次打开统计库时给 `usage_sessions` 加列 `terminal_id`（默认 `local`）并建 `terminal_sessions` 表——**旧数据不动**；「我的」页数字只算本机（远程终端出现前与之前完全一致） |
 | 对 macOS 的影响 | 同一份代码，macOS「我的」页走同一迁移；无平台分支 |
 | 是否需要对方同步 | 否（随常规 macOS 编译验证即可） |
+
+## ASR-SERVER-491 一期 S6 / S7（2026-10-17，主控）· 设置页「识别服务」+ 托盘单项
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | 设置界面：`ui/src/pages/AsrServer.tsx`（新）、`ui/src/App.tsx` 导航加 `asr_server`、三份 locale 加 `nav_asr_server` / `asr_*`；`src-tauri/src/asr_server.rs`（新，`#[path]` 引入 `src/asr_shared`），`src-tauri/Cargo.toml` 加 `ring 0.17` 与 `qrcode 0.14`（svg）。主程序：`src/i18n.rs` 加 `tray_menu_asr_start / _stop / _unavailable`；`asr_service::supervisor::{tray_item, toggle_from_tray}`；`transcription::remote_engines_ready`；Windows 托盘菜单首项；**`src/platform/macos/tray.rs`：`TrayCommand::ToggleAsrService`、`build_tray_menu` 改返回三元组、`StatusBarTray` 加 `asr_item / asr_shown / ui_language`、菜单 `setAutoenablesItems(false)`、`poll_pending_tray_states` 每 tick 比对后更新该项**；`main.rs` macOS 逻辑线程处理 `ToggleAsrService` |
+| 行为变化 | 托盘多一项（服务关 + 模型未加载时置灰）；设置界面多一页 |
+| 对 macOS 的影响 | macOS 托盘代码**未在 macOS 编译**：重点核对 `NSMenu::setAutoenablesItems`、`NSMenuItem::setTitle / setEnabled` 在 objc2-app-kit 0.2 的签名（是否需 `unsafe`、是否需额外 feature）；`asr_shown` 用 `&'static str` 指针比较文案。设置页为共用 React，macOS 同一份 |
+| 是否需要对方同步 | 是：macOS 编译 + 托盘目视（三态：可启动 / 可停止 / 置灰） |
