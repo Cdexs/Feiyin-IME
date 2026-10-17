@@ -2846,3 +2846,13 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 行为变化 | **本机识别路径逐位不变**（`is_remote()` 为假时不算时间、不分配，回灌事件个数 / 内容 / 节奏同前）。**仅远程会话**：最后一窗照常对齐 ⇒ 终稿多等约 0.25s；最后一道接缝按时间拼（与中间各窗同一规则），终稿文字可能比改前略准。无新增依赖，无 `cfg(target_os)` 分支 |
 | 对 macOS 的影响 | macOS 编译同一份代码，**未在 macOS 编译 / 实测**。重点核对：所有 `PipelineEvent::PreviewReflow { .. }` 的构造与解构、`run_acc_windows` 调用处、`PreviewRole::Remote` 构造处（若 macOS 侧另有构造点，须补 `acc_times` / `slices`）。测试侧：`t441_pipeline_declarations` 等源码锚点护栏读 `main.rs` 文本，S9 已改成单行 / 多行同口径取实参，macOS 若有同类护栏按同一读法 |
 | 是否需要对方同步 | 是：macOS 编译验证（上列四处构造 / 解构点）；远程会话端到端待 S10、S11 后统一回归 |
+
+## ASR-SERVER-491 一期 S10（2026-10-17，主控）· 服务端文字处理（终端三项参数 + 翻译）
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | 全部落在平台中立模块：新模块 `src/asr_service/text_stage.rs`（无效文本 → 同音纠错 → ITN → 繁简 → 补标点 → 收尾；翻译另出）；`src/asr_service/{session,frame,mod}.rs`；网关 `src/bin/feiyin-asr-gateway/ws.rs`；`src/transcription/feiyin_remote.rs`、`src/transcription/qwen_inference.rs`（S8 客户端）。无 `cfg(target_os)` 分支，**平台契约（`src/platform`）无变化，新增依赖：无** |
+| 契约变化（macOS 侧必须知道） | ① `OpenParams` 新增 `itn` / `punctuation` / `translate`（serde 缺省 true / true / false，手写 `Default` 同值），所有构造点须补（或用 `..Default::default()`）；② `ResultPayload` 新增 `translation: Option<TranslationPayload>`，**每个构造处须补 `translation: None`**（`None` 不序列化，旧网关 / 内核互通）；③ 网关读阿里同名参数 `inverse_text_normalization_enabled` / `punctuation_prediction_enabled`（缺省 true）、`translation_enabled`（缺省 false），译文输出 `output.translations = [{sentence_id, lang, text, sentence_end}]`，无译文不出键；④ S8 客户端 `run-task` 不再发 `feiyin.postprocess`，改把三项阿里同名参数发到 `parameters` 顶层（`text_params()`），阿里云路径 `build_run_task_message` 未动 |
+| 行为变化 | 本机识别路径一行未改。仅远程会话：同音纠错、去口水固定内置；ITN、补标点、翻译由终端参数决定。翻译引擎跟随服务端本机设置：配了大模型走大模型，否则走进程级 `remote-nllb` 线程（仅「服务端没配大模型且终端要翻译」时才首次加载 NLLB，约 600MB 内存），本机 worker 的 `thread_local` 缓存不受影响；方向自动判定（DEC-082） |
+| 对 macOS 的影响 | **平台中立，macOS 无需额外平台代码。** macOS 编译同一份代码，**未在 macOS 编译 / 实测**；只需核对上列 `OpenParams` / `ResultPayload` 构造点是否齐全。若 macOS 作为服务端且未配大模型，终端要翻译时会多占约 600MB（NLLB） |
+| 是否需要对方同步 | 否（无平台代码）；仅需 macOS 编译验证构造点。端到端待 S11 Python 参考客户端冒烟 |

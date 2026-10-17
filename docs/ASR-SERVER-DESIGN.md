@@ -244,7 +244,7 @@ key 在公网上明文传输等于把 key 交给沿途的人。所以网关内�
 | 证书钉扎 | `src/asr_shared/tls_pin.rs`（内核 / 网关 / 设置界面三方共用）：rustls 自定义校验器**只认配对时的指纹**（证书 DER 的 SHA-256），签名仍按 TLS 规范校验；只走 TLS 1.3。`probe_fingerprint` 只做 TLS 握手取指纹；`check_access` 做 TLS + WebSocket 升级握手（带 key） |
 | 内外网自动 | `src/transcription/feiyin_remote.rs`：「自动」= 内外网两个地址**同时**试 TCP（只试 TCP，不带 key）；内网通了直接用；外网先通则再等内网 300ms。⚠️ 与 §8.3 原文「先试内网，连不上再试外网」的差别：串行在出门时要干等内网超时（5 秒），改并发试，「内网优先」不变；每次录音重新挑，所以进出家门自动切换 |
 | 指纹确认时机 | ⚠️ 与 §8.5 原文「第一次连接时显示指纹让用户确认」的差别：提前到**配对保存时**确认（热键录音路径上不能弹确认框）。未确认的指纹不落盘，没确认就不会连 |
-| run-task 扩展字段 | `parameters.feiyin = {device_id, device_name, postprocess: ["homophone","itn"]}`。本机走在线识别会跳过数字规整主通道（V091-ITN-SKIP-ONLINE-215），所以请对方做；**对方处理 `postprocess` 在 S10 实现，S10 之前对方不做数字规整** |
+| run-task 扩展字段 | `parameters.feiyin = {device_id, device_name}`；S10 起 `parameters` 顶层另带阿里同名三项 `inverse_text_normalization_enabled: true` / `punctuation_prediction_enabled: true` / `translation_enabled: false`（原 `postprocess` 删除，见 §13.4）。本机走在线识别会跳过数字规整主通道（V091-ITN-SKIP-ONLINE-215），所以请对方做 |
 | 测试连接 | `check_access` 拿到 101（升级成功）即断开。网关在握手里验 key，登录记录在 `run-task` 才产生，所以「测试连接」**不会记一次登录** |
 | 错误提示 | 三条新文案（三语）：`error_feiyin_not_ready`（对方没切到本地流式实时模型）/ `error_feiyin_busy`（对方忙或已暂停）/ `error_feiyin_repair`（key 失效、被撤销、过期、设备不符、证书变了、没配对 ⇒ 重新配对）。`convert_to_friendly_error` 先认这些错误码 |
 
