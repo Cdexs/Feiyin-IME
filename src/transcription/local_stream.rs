@@ -54,6 +54,46 @@ impl<'a> SendPreviewRecognizerRef<'a> {
     }
 }
 
+/// ASR-SERVER-491：预览线程的会话角色。
+pub(crate) enum PreviewRole<'a> {
+    /// 本机录音：进程级 VAD 缓存、近场门、跨录音音量沿用 —— 与改前逐位相同。
+    Local,
+    /// 远程终端：自带 VAD（`None` = 音量兜底）、关近场门、不读写本机音量沿用；
+    /// 本机正在录音时重解间隔放宽一倍（让 CPU 给本机）。
+    Remote { vad: Option<&'a VadSegmenter> },
+}
+
+/// ASR-SERVER-491：预览模型解码锁（本机与远程共用同一实例）。
+static PREVIEW_DECODE_LOCK: Mutex<()> = Mutex::new(());
+
+/// ASR-SERVER-491：正在进行的本机预览会话数（远程据此放宽重解间隔）。
+static LOCAL_PREVIEW_ACTIVE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+struct LocalPreviewActive;
+
+impl LocalPreviewActive {
+    fn enter() -> Self {
+        LOCAL_PREVIEW_ACTIVE.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for LocalPreviewActive {
+    fn drop(&mut self) {
+        LOCAL_PREVIEW_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// ASR-SERVER-491：当前句重解间隔。本机恒为 [`SIM_STEP_MS`]；远程在本机录音时放宽一倍。
+fn sim_step_ms(remote: bool) -> f32 {
+    if remote && LOCAL_PREVIEW_ACTIVE.load(Ordering::Relaxed) > 0 {
+        SIM_STEP_MS * 2.0
+    } else {
+        SIM_STEP_MS
+    }
+}
+
 /// STREAM-SV-463：预览解码线程数 = **本机物理核数**（Gavin 2026-10-03「开成跟现在 CPU 内核数一样」）。
 ///
 /// 实测（`poc462_simstream`，7840HS 8 核 16 线程，证据 `collab/evidence/463/simstream463.md`）：
@@ -781,10 +821,18 @@ fn preview_decode_timed(
     if audio.is_empty() {
         return (String::new(), Vec::new());
     }
-    let s = recognizer.create_stream();
-    s.accept_waveform(SAMPLE_RATE, audio);
-    recognizer.decode(&s);
-    let Some(r) = s.get_result() else {
+    // ASR-SERVER-491：预览模型全进程一份，本机与远程会话共用 ⇒ 同一实例不得并发解码（见
+    // `SendPreviewRecognizerRef` 的 SAFETY）。无远程时这把锁从不竞争。
+    let r = {
+        let _g = PREVIEW_DECODE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let s = recognizer.create_stream();
+        s.accept_waveform(SAMPLE_RATE, audio);
+        recognizer.decode(&s);
+        s.get_result()
+    };
+    let Some(r) = r else {
         return (String::new(), Vec::new());
     };
     let text = r.text.trim().to_string();
@@ -1284,6 +1332,8 @@ struct SegmentGate {
     /// 389 主控验收补：本次录音中 seed 因连续被拒而丢弃过 ⇒ 录音结束时清掉进程级 carry，
     /// 否则下次录音还会拿同一个坏 seed、再被拒两句。
     seed_dropped: bool,
+    /// ASR-SERVER-491：`true` = 远程会话，近场门不判（按本机麦克风标定，远程设备不适用）⇒ 原样用 VAD 判定。
+    bypass: bool,
 }
 
 impl SegmentGate {
@@ -1298,11 +1348,15 @@ impl SegmentGate {
             confirmed: 0,
             rejected: 0,
             seed_dropped: false,
+            bypass: false,
         }
     }
 
     /// 推进一帧，返回本 chunk 最终 `has_speech`。`smooth_rms` = 300ms 平滑音量。
     fn update(&mut self, vad_speech: bool, smooth_rms: f32, now_ms: f32) -> bool {
+        if self.bypass {
+            return vad_speech;
+        }
         self.level.prune(now_ms);
         if vad_speech && !self.in_seg {
             // 段起始：未就绪 ⇒ 整句直接确认（保开头不丢字）。
@@ -1435,17 +1489,26 @@ pub fn transcribe_streaming_local(
     //   c. 硬上限 `ACC_BOUNDARY_CAP_MS` ⇒ 同 a（兜底）并记日志。
     // 参数：`(seg_index, Option<committed_len>)`。
     mut on_reflow_commit: impl FnMut(usize, Option<usize>),
+    // ASR-SERVER-491：本机录音 / 远程终端（差异见 [`PreviewRole`]）。
+    role: PreviewRole<'_>,
 ) -> Result<(String, Vec<f32>)> {
     let is_cancelled = || {
         cancel_signal
             .map(|s| s.load(Ordering::Relaxed))
             .unwrap_or(false)
     };
+    let is_remote = matches!(role, PreviewRole::Remote { .. });
+    // 491：本机预览进行中标记（远程据此放宽重解间隔）。
+    let _local_active = (!is_remote).then(LocalPreviewActive::enter);
 
     // LOCALRT-VAD-SILENCE-384：本地 realtime VAD（进程级缓存，只加载一次、跨录音复用）。
     // guard 持有缓存到本函数结束；`session_vad=None` ⇒ 音量阈值兜底（逐位同改前）。
-    let _vad_guard = localrt_vad_session(&super::model_dir());
-    let session_vad: Option<&VadSegmenter> = _vad_guard.vad.as_ref();
+    // 491：远程会话用自己那份 VAD（不碰进程级缓存 —— 缓存锁会整段占住，远程会卡住本机）。
+    let _vad_guard = (!is_remote).then(|| localrt_vad_session(&super::model_dir()));
+    let session_vad: Option<&VadSegmenter> = match role {
+        PreviewRole::Local => _vad_guard.as_ref().and_then(|g| g.vad.as_ref()),
+        PreviewRole::Remote { vad } => vad,
+    };
     let vad_on = session_vad.is_some();
     if log::log_enabled!(log::Level::Debug) {
         log::debug!(
@@ -1455,19 +1518,26 @@ pub fn transcribe_streaming_local(
     }
     let mut prev_has_speech = false;
     // LOCALRT-NEARFIELD-GATE-389（C2）：跨录音沿用录音人音量（同设备、10 分钟内）。
-    let (carry_seed, carry_age_s) = LOCALRT_CARRY_LEVEL
-        .lock()
-        .ok()
-        .and_then(|c| {
-            c.as_ref().map(|cl| {
-                let age = cl.updated.elapsed();
-                let usable = seed_usable(&cl.device, age, vad_device);
-                (usable.then_some(cl.level), Some(age.as_secs_f32()))
+    // 491：远程会话不读本机录音人的音量。
+    let (carry_seed, carry_age_s) = if is_remote {
+        (None, None)
+    } else {
+        LOCALRT_CARRY_LEVEL
+            .lock()
+            .ok()
+            .and_then(|c| {
+                c.as_ref().map(|cl| {
+                    let age = cl.updated.elapsed();
+                    let usable = seed_usable(&cl.device, age, vad_device);
+                    (usable.then_some(cl.level), Some(age.as_secs_f32()))
+                })
             })
-        })
-        .unwrap_or((None, None));
+            .unwrap_or((None, None))
+    };
     // LOCALRT-NEARFIELD-GATE-389：近场段门状态机（整句判定；段峰值估计在其内；C2 可选 seed）。
     let mut segment_gate = SegmentGate::with_seed(carry_seed);
+    // 491：远程会话关近场门（按本机麦克风标定）。
+    segment_gate.bypass = is_remote;
     if log::log_enabled!(log::Level::Debug) {
         log::debug!(
             "[LocalRT-DBG-389] carry level: seed={:?} device={:?} age_s={:?}",
@@ -1665,7 +1735,7 @@ pub fn transcribe_streaming_local(
         () => {{
             sim_decode_text!();
             sim_decoded_end = pcm.len();
-            sim_next_at = Some(pcm.len() + ms_samples(SIM_STEP_MS));
+            sim_next_at = Some(pcm.len() + ms_samples(sim_step_ms(is_remote)));
             sim_dirty = false;
         }};
     }
@@ -2460,7 +2530,8 @@ pub fn transcribe_streaming_local(
     // 389 主控验收补（C2-5）：只有**本次录音自己学到**（段峰值样本 ≥2）才写回；
     // 仅靠 seed 就绪时不写回（否则旧 seed 被刷新时间戳、永不过 10 分钟期）。
     // seed 本次被丢弃且没学到新值 ⇒ 清掉 carry（防下次录音重复使用同一坏 seed）。
-    if vad_on {
+    // 491：远程会话不写（近场门关、本机沿用值不得被远程设备的音量覆盖）。
+    if vad_on && !is_remote {
         if segment_gate.level.samples_ready() {
             let level = segment_gate.level.estimate();
             if let Ok(mut c) = LOCALRT_CARRY_LEVEL.lock() {
@@ -3148,6 +3219,7 @@ mod tests {
                 }
             },
             |_a, _b| {},
+            super::PreviewRole::Local,
         );
         feeder.join().ok();
         println!(
@@ -3403,6 +3475,7 @@ mod tests {
                     commits.borrow_mut().push((at, len));
                 }
             },
+            super::PreviewRole::Local,
         )
         .expect("transcribe_streaming_local");
         let displays = displays.into_inner();
@@ -3484,6 +3557,7 @@ mod tests {
                 |_i, _len, _segs, _st, _r, _f| {},
                 |_pcm_pos| {},
                 |_seg, _len| {},
+                super::PreviewRole::Local,
             )
             .expect("transcribe_streaming_local");
             println!("[463] {lang} 预览：{preview}");

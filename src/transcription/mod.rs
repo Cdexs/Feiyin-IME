@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{config::ChineseScript, punctuation, text_normalizer};
 
@@ -181,7 +181,8 @@ pub struct Transcriber {
     ///
     /// 仅 `LocalRealtime` 档位用；与 `offline_recognizer`（accuracy，2pass 最终文本 + 热词）
     /// **并存常驻**，有意打破旧约束「本地模式一次只加载一个模型」（见结构体文档）。
-    preview_recognizer: Option<sherpa_onnx::OfflineRecognizer>,
+    /// ASR-SERVER-491：`Arc` —— 远程会话共用同一份（见 [`remote_engines`]）。
+    preview_recognizer: Option<Arc<PreviewModel>>,
     /// 当前注入的 hotwords 版本号（len + 内容哈希），用于感知词库变更
     hotwords_version: u64,
     /// VAD 分段器（仅 accuracy 长音频用）。
@@ -252,7 +253,48 @@ pub(crate) enum OfflineEngine {
     /// Performance 档：SenseVoice（sherpa-onnx，未变）。
     SenseVoice(sherpa_onnx::OfflineRecognizer),
     /// Accuracy / LocalRealtime 档：Qwen3-ASR 1.7B（llama.cpp）。
-    Qwen3(AccEngine),
+    /// ASR-SERVER-491：`Arc` —— 远程会话从它开推理通道（见 [`remote_engines`]）。
+    Qwen3(Arc<AccEngine>),
+}
+
+/// ASR-SERVER-491：本地实时预览模型（SenseVoice）。本机与远程会话共用同一实例。
+pub(crate) struct PreviewModel(pub(crate) sherpa_onnx::OfflineRecognizer);
+
+// SAFETY：sherpa-onnx recognizer 的 create/decode 可在不同线程调用，只要同一实例不被并发解码；
+// 生产唯一解码点 `local_stream::preview_decode_timed` 在进程级 `PREVIEW_DECODE_LOCK` 内调用。
+unsafe impl Send for PreviewModel {}
+unsafe impl Sync for PreviewModel {}
+
+/// ASR-SERVER-491：远程会话所需的已加载模型（本机本地实时档在用的那一份，不另加载）。
+#[derive(Clone)]
+pub(crate) struct RemoteEngines {
+    pub(crate) preview: Arc<PreviewModel>,
+    pub(crate) acc: Arc<AccEngine>,
+}
+
+/// ASR-SERVER-491：当前本地实时档的模型登记处。本地实时 `Transcriber` 构造时登记、释放时注销
+///（只注销自己那份 —— 重载时新实例先登记、旧实例后释放）。
+static REMOTE_ENGINES: Mutex<Option<RemoteEngines>> = Mutex::new(None);
+
+/// ASR-SERVER-491：取当前可供远程会话使用的模型；本机不在本地实时档 / 模型未加载 ⇒ `None`
+///（服务回「未就绪」，不为远程单独加载模型 —— 设计 §7）。
+pub(crate) fn remote_engines() -> Option<RemoteEngines> {
+    REMOTE_ENGINES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+impl Drop for Transcriber {
+    fn drop(&mut self) {
+        let Some(OfflineEngine::Qwen3(acc)) = self.offline_recognizer.as_ref() else {
+            return;
+        };
+        let mut g = REMOTE_ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+        if g.as_ref().is_some_and(|r| Arc::ptr_eq(&r.acc, acc)) {
+            *g = None;
+        }
+    }
 }
 
 /// PARALLEL-ACC-298：用常驻 offline(accuracy) recognizer 并行转写**一个**分段。
@@ -1360,6 +1402,8 @@ fn plan_self_vad_trim(
     pad: usize,
     new_slice_from: usize,
     src: &'static str,
+    // ASR-SERVER-491：`false` = 远程会话（不做声纹，见 `speaker::keep_all_ranges`）。
+    voiceprint: bool,
 ) -> SelfVadTrim {
     match ranges {
         None => SelfVadTrim {
@@ -1379,7 +1423,11 @@ fn plan_self_vad_trim(
             filter: None,
         },
         Some(r) => {
-            let f = speaker::filter_ranges_by_voiceprint(samples, &r, new_slice_from);
+            let f = if voiceprint {
+                speaker::filter_ranges_by_voiceprint(samples, &r, new_slice_from)
+            } else {
+                speaker::keep_all_ranges(&r)
+            };
             let used = trim_to_speech(samples, &f.kept, pad);
             let n = f.kept.len();
             SelfVadTrim {
@@ -1418,13 +1466,18 @@ pub(crate) fn transcribe_acc_ctx(
     // 本窗语音区间（时间线优先 / 自跑 VAD 回退）。408B①：**解码前**按所有已就绪档最高分剔除。
     let mut ranges_orig: Vec<(usize, usize)> = Vec::new();
     let mut vp_filter: Option<speaker::VoiceprintFilter> = None;
+    // ASR-SERVER-491：远程推理通道 = 远程会话 ⇒ 不做声纹剔除、不注册（声纹只属于本机主人）。
+    let voiceprint = !recognizer.is_remote();
     // 返回 `(解码用样本, 是否经 VAD 判定, 区间数, 剪静音来源)`；`source` ∈ {timeline, vad, none}。
     let (samples_used, trimmed, n_ranges, trim_src) =
         match plan_timeline_trim(inject.speech_ranges, inject.streaming_nonempty) {
             Some(TimelineTrim::Apply(ranges)) => {
                 ranges_orig = ranges.clone();
-                let f =
-                    speaker::filter_ranges_by_voiceprint(samples, &ranges, inject.new_slice_from);
+                let f = if voiceprint {
+                    speaker::filter_ranges_by_voiceprint(samples, &ranges, inject.new_slice_from)
+                } else {
+                    speaker::keep_all_ranges(&ranges)
+                };
                 let out = trim_to_speech(samples, &f.kept, pad);
                 let n = f.kept.len();
                 vp_filter = Some(f);
@@ -1440,6 +1493,7 @@ pub(crate) fn transcribe_acc_ctx(
                     pad,
                     inject.new_slice_from,
                     "revad",
+                    voiceprint,
                 );
                 if log::log_enabled!(log::Level::Debug) {
                     log::debug!(
@@ -1463,6 +1517,7 @@ pub(crate) fn transcribe_acc_ctx(
                     pad,
                     inject.new_slice_from,
                     "vad",
+                    voiceprint,
                 );
                 ranges_orig = t.ranges;
                 vp_filter = t.filter;
@@ -1846,6 +1901,13 @@ impl Transcriber {
             log::info!(
                 "LocalRealtime: dual recognizers loaded (preview SenseVoice + offline accuracy)"
             );
+            // ASR-SERVER-491：登记给远程会话（共用同一份模型）。
+            let offline_recognizer = Arc::new(offline_recognizer);
+            let preview_recognizer = Arc::new(PreviewModel(preview_recognizer));
+            *REMOTE_ENGINES.lock().unwrap_or_else(|e| e.into_inner()) = Some(RemoteEngines {
+                preview: Arc::clone(&preview_recognizer),
+                acc: Arc::clone(&offline_recognizer),
+            });
             return Ok(Self {
                 mode,
                 asr_language,
@@ -1903,7 +1965,7 @@ impl Transcriber {
     ///
     /// 供 239-B 接线 `local_stream::transcribe_streaming_local` 使用。
     pub fn preview_recognizer(&self) -> Option<&sherpa_onnx::OfflineRecognizer> {
-        self.preview_recognizer.as_ref()
+        self.preview_recognizer.as_deref().map(|p| &p.0)
     }
 
     /// PARALLEL-ACC-298：取常驻的 accuracy offline recognizer（accuracy 引擎档位为 `Some`）。
@@ -1912,7 +1974,7 @@ impl Transcriber {
     /// ACC-ENGINE-LLAMACPP-452：只返回 Qwen3 精解引擎（两处调用方均在 LocalRealtime 档内）。
     pub fn offline_recognizer(&self) -> Option<&AccEngine> {
         match self.offline_recognizer.as_ref() {
-            Some(OfflineEngine::Qwen3(e)) => Some(e),
+            Some(OfflineEngine::Qwen3(e)) => Some(e.as_ref()),
             _ => None,
         }
     }
@@ -3257,7 +3319,7 @@ fn build_recognizer(
             let loaded = create_qwen3_recognizer(model_dir);
             match loaded {
                 Ok(engine) => Ok((
-                    OfflineEngine::Qwen3(engine),
+                    OfflineEngine::Qwen3(Arc::new(engine)),
                     AsrModel::Accuracy,
                     hotwords_version,
                 )),
@@ -5603,7 +5665,7 @@ mod fix414_revad_tests {
         let audio: Vec<f32> = (0..RATE).map(|i| (i % 100) as f32 / 100.0).collect();
         let pad = (0.2 * RATE as f32) as usize;
         let ranges = vec![(2000usize, 6000usize)]; // 0.25s < 2s ⇒ KeepShort
-        let t = plan_self_vad_trim(&audio, Some(ranges), pad, 0, "revad");
+        let t = plan_self_vad_trim(&audio, Some(ranges), pad, 0, "revad", true);
         assert!(t.trimmed, "VAD 可用 ⇒ trimmed");
         assert_eq!(t.n_ranges, 1);
         assert_eq!(t.src, "revad");
@@ -5616,7 +5678,7 @@ mod fix414_revad_tests {
     #[test]
     fn f414_self_vad_empty_yields_empty() {
         let audio = vec![0.1f32; RATE];
-        let t = plan_self_vad_trim(&audio, Some(Vec::new()), 100, 0, "revad");
+        let t = plan_self_vad_trim(&audio, Some(Vec::new()), 100, 0, "revad", true);
         assert!(t.trimmed, "VAD 可用（即使无语音）⇒ trimmed");
         assert_eq!(t.n_ranges, 0);
         assert_eq!(t.src, "revad");
@@ -5628,7 +5690,7 @@ mod fix414_revad_tests {
     #[test]
     fn f414_self_vad_unavailable_whole_window() {
         let audio = vec![0.3f32; 1234];
-        let t = plan_self_vad_trim(&audio, None, 100, 0, "revad");
+        let t = plan_self_vad_trim(&audio, None, 100, 0, "revad", true);
         assert!(!t.trimmed, "VAD 不可用 ⇒ 未判定");
         assert_eq!(t.n_ranges, 0);
         assert_eq!(t.src, "none");
@@ -5663,14 +5725,14 @@ mod fix414_revad_tests {
         audio.extend(std::iter::repeat(0.0f32).take(pad_s));
         let ranges = vad.speech_ranges(&audio);
         assert!(!ranges.is_empty(), "wav 片段应检出语音区间");
-        let t = plan_self_vad_trim(&audio, Some(ranges), pad, 0, "revad");
+        let t = plan_self_vad_trim(&audio, Some(ranges), pad, 0, "revad", true);
         assert!(t.trimmed && t.n_ranges >= 1, "复核有语音 ⇒ 剪静音");
         assert!(t.used.len() < audio.len(), "应剪掉补的静音");
         // 纯静音：复核无区间 ⇒ 空样本（不进模型）。
         let silence = vec![0.0f32; 5 * RATE];
         let sr = vad.speech_ranges(&silence);
         assert!(sr.is_empty(), "纯静音应无区间");
-        let t2 = plan_self_vad_trim(&silence, Some(sr), pad, 0, "revad");
+        let t2 = plan_self_vad_trim(&silence, Some(sr), pad, 0, "revad", true);
         assert!(
             t2.trimmed && t2.n_ranges == 0 && t2.used.is_empty(),
             "纯静音 ⇒ 复核无区间 ⇒ 空样本"

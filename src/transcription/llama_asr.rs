@@ -428,6 +428,14 @@ impl LlamaAsr {
         &self.device
     }
 
+    /// ASR-SERVER-491：远程通道数硬顶（与显存无关）。
+    pub(crate) const SLOT_MAX: usize = SLOT_MAX;
+
+    /// ASR-SERVER-491：是否远程通道（= 远程会话：不做声纹、不学习，见 `transcribe_acc_ctx`）。
+    pub(crate) fn is_remote(&self) -> bool {
+        self.remote
+    }
+
     /// FORCED-ALIGN-456：挂载强制对齐器（只在本地实时调用；精确档批量识别不需要、不占显存）。
     /// 加载失败只记警告（接缝回落 371 比例估算，精解不受影响）。
     pub(crate) fn attach_aligner(&mut self, models_root: &Path) {

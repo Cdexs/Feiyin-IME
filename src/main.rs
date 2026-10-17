@@ -12,6 +12,9 @@ mod i18n;
 mod itn;
 mod llm;
 mod localrt_session; // ASR-SERVER-491 S1：本地实时精解窗口线程（本机 / 远程会话共用）
+                     // ASR-SERVER-491 S3：识别服务内核侧（本机 IPC + 远程会话）。S4（网关拉起时 `AsrService::start`）接线前暂无调用方。
+#[allow(dead_code)]
+mod asr_service;
 mod platform; // MAC-001+003: Platform abstraction layer
 mod punctuation;
 mod scene;
@@ -9128,6 +9131,7 @@ fn spawn_worker_thread(
                                                 committed_len,
                                             });
                                     },
+                                    transcription::local_stream::PreviewRole::Local,
                                 )
                             });
 
@@ -14278,7 +14282,7 @@ mod testsync386_tests {
 // ============================================================
 
 /// 382（3A）：一次状态机推进的结果。
-#[cfg(target_os = "windows")]
+// ASR-SERVER-491：去 Windows 限定 —— 远程会话（两端内核都有）复用本状态机。
 #[derive(Debug, PartialEq, Eq)]
 enum ReflowFastOutcome {
     /// 无动作（例如边界到、但对应 seg 已不是最新已渲染）。
@@ -14298,7 +14302,7 @@ enum ReflowFastOutcome {
 /// 现在唯一发送点恒 `replace_all=true`（整段替换），「等边界」只会**白白延迟**（日志：1 次多等 0.4s、
 /// 2 次单槽被覆盖永不配对、1 次 `boundary=b` 整次扣下）。本状态机：全文一到**立即**用「已知边界 or
 /// 派发当刻 `committed_len`」渲染；边界后到且该 seg 仍是最新已渲染 ⇒ 用准确边界再渲染一次。
-#[cfg(target_os = "windows")]
+// ASR-SERVER-491：去 Windows 限定（同上：`ReflowFastOutcome`）。
 #[derive(Default)]
 struct ReflowFastState {
     /// 最新登记全文 + 派发当刻 fallback：`(gen, seg, text, fallback_len, boundary_usable)`。
@@ -14310,7 +14314,7 @@ struct ReflowFastState {
     rendered: Option<(u64, usize)>,
 }
 
-#[cfg(target_os = "windows")]
+// ASR-SERVER-491：去 Windows 限定（同上）。
 impl ReflowFastState {
     /// ACC-452 ⑤：流式回灌渲染了 `(gen, seg)` 的半截结果 ⇒ 登记为最近渲染，
     /// 使**上一窗**晚到的边界不再用旧全文重画（否则盖掉半截结果 = 回缩）。

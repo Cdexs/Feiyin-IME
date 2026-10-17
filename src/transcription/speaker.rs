@@ -720,6 +720,21 @@ pub(crate) fn unit_offer_eligible(
     unit_secs >= MIN_OFFER_SECS && unit_offer_allowed(unit, new_slice_from)
 }
 
+/// ASR-SERVER-491：远程会话不做声纹（声纹是本机主人的，远程是别人）⇒ 区间全部保留、不判定、
+/// 不产生注册 / 漂移 offer（不读也不写本机声纹档）。形状同模型缺失时的「功能关闭」返回。
+pub(crate) fn keep_all_ranges(ranges: &[(usize, usize)]) -> VoiceprintFilter {
+    VoiceprintFilter {
+        kept: ranges.to_vec(),
+        dropped: Vec::new(),
+        kept_secs: secs_of(ranges),
+        dropped_secs: 0.0,
+        any_ready: false,
+        enrolled_secs: 0.0,
+        details: Vec::new(),
+        pending_offers: Vec::new(),
+    }
+}
+
 /// SPEAKER-VERIFY-408B ①：**解码前**判定 —— 每 ≥2s 区间与**本人所有已就绪档**逐一比、取最高分；
 /// ≥一档就绪且最高分 < [`DROP_THR`] ⇒ 剔除（无就绪档 ⇒ 全部保留）。
 ///

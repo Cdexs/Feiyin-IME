@@ -2782,3 +2782,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 行为变化 | 按 右Ctrl+3 在简体 / 繁体之间切换并保存，提示窗「中文输出已切换为简体 / 繁体」，下一次录音起生效 |
 | 对 macOS 的影响 | **编译**：macOS 若有对 `ShortcutOutcome` 或 `ShortcutAction` 的穷举 match 需补新变体（Windows 侧全部在 `#[cfg(windows)]` 里，平台中立代码无穷举）。**功能**：快捷方式监听仍只有 Windows；macOS 实现监听时按 `ShortcutAction::ALL` 遍历即可覆盖三项，提示文案可直接复用 `shortcut_info_text` 的映射规则 |
 | 是否需要对方同步 | 是：编译验证；设置界面若在 macOS 隐藏快捷方式链接，「中文输出」后的链接一并隐藏 |
+
+## ASR-SERVER-491 一期 S1–S3（2026-10-17，主控）· 识别服务内核侧（DEC-111）
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | **S1**：本地实时精解窗口线程原样搬到平台中立模块 `src/localrt_session.rs::run_acc_windows`（逐字相同）；源码护栏改读 `crate::MAIN_RS_SRC`（合并源码）。**S2**：`native/llama_asr/shim.cpp` 新增 `las_create_slot`（共用权重 / 编码器，只多一份上下文）、`las_dev_memory`（查空闲显存）、编码段 `mtmd_mu` 锁；`LlamaAsr` 改为「推理通道」：`create_slot` / `is_remote` / `max_remote_slots`，本机优先闸门内置。**S3**：新平台中立模块 `src/asr_service/`（帧格式 / 远程会话 / 显示合成 / 传输）；`transcribe_streaming_local` 末尾新增参数 `PreviewRole`（本机传 `Local`）；`plan_self_vad_trim` 新增 `voiceprint` 参数；`speaker::keep_all_ranges`；`Transcriber` 的预览模型与精解引擎改 `Arc` 并登记到 `transcription::remote_engines()`；`main.rs` 的 `ReflowFastState` / `ReflowFastOutcome` 去掉 Windows 限定；Windows `Cargo.toml` 的 `windows` 依赖加 4 个特性（Pipes / IO / Storage_FileSystem / Security_Authorization） |
+| 行为变化 | 服务未启动时**无变化**：本机路径只多一次无竞争的计数 / 锁（预览解码锁、本机优先计数）。服务（S4 起由网关拉起）启动后，远程终端各开一路推理通道，本机每生成一个 token 都优先 |
+| 对 macOS 的影响 | **编译**：macOS 若另有 `transcribe_streaming_local` 调用点须补最后一个参数 `PreviewRole::Local`；若有 `plan_self_vad_trim` 调用须补 `true`。**shim**：macOS 构建同一份 `shim.cpp`（Metal 下 `las_dev_memory` 同样走 `ggml_backend_dev_memory`）。**传输**：`asr_service::transport` 的 macOS 分支（`$TMPDIR` 下 Unix socket，0600）已写好但**未在 macOS 上编译 / 实测**；Windows 分支（命名管道 + 仅当前用户 DACL）只在 Windows 编译 |
+| 是否需要对方同步 | 是：macOS 编译验证（重点 `asr_service/transport.rs` 的 `cfg(unix)` 分支与 shim 新符号）；网关（S4）与设置页（S6）落地后再做端到端 |

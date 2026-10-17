@@ -125,6 +125,11 @@ windows = { version = "0.58", features = [
     "Win32_System_SystemInformation",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
+    # ASR-SERVER-491：内核 ↔ 网关 IPC 命名管道（仅当前用户 DACL）。
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_Security_Authorization",
 ] }
 
 # macOS dependencies (Phase 3 placeholder)

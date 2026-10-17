@@ -87,7 +87,7 @@
 | S0 | 决策落盘 DEC-111；设计补托盘菜单 §16.7 | ✅ |
 | S1 | 会话引擎抽取（§4）：精解窗口线程（约 1290 行）原样搬到 `localrt_session::run_acc_windows`，去空白比对逐字相同；预览线程本就是独立函数 `transcribe_streaming_local`，录音线程留在本机；35 处源码护栏改读合并源码 | ✅ `f6c1eea`（全量回归待 tester-1） |
 | S2 | 推理通道正式化：远程通道与本机引擎同类型（`create_slot` 返回 `LlamaAsr`，整条精解窗口路径原样复用）；本体由最后一个通道释放；本机优先闸门内置（本机解码 / 对齐登记，远程开解前 + 每生成一个 token 后 + 对齐前让行）；`max_remote_slots` 按空闲显存（留 1GB、每路 150MB、封顶 8；CPU=1）| ✅ 编译通过（调用方在 S3） |
-| S3 | 内核 IPC 服务：命名管道 / Unix socket、6 种帧、远程会话（`SessionOpts` 远程差异：关声纹 / 近场门 / 学习 / 本机统计） | ⬜ |
+| S3 | 内核 IPC 服务：命名管道 / Unix socket、帧格式、远程会话（远程差异：关声纹 / 近场门 / 学习 / 本机统计） | ✅ 编译通过；`AsrService::start` 由 S4 接线。差异全部由「角色」带出：远程推理通道 ⇒ 不做声纹；`PreviewRole::Remote` ⇒ 自带 VAD / 关近场门 / 不碰音量沿用 / 本机录音时预览间隔 ×2；不进 `run_pipeline_core` ⇒ 不写统计不学习。模型共享：`Transcriber` 两模型改 `Arc` 登记到 `remote_engines()`；预览解码加进程级锁 |
 | S4 | 网关进程 `feiyin-asr-gateway`：WebSocket `run-task`、内置加密（自签证书 + 指纹）、配对存储（key 10 分钟首次绑定 + 设备代码绑定）、终端名称 / 设备代码、暂停、本机控制通道 | ⬜ |
 | S5 | 统计加终端一维：`usage_sessions.terminal_id`（旧数据默认 local）+ `terminal_sessions` 登录 / 退出表；「我的」页仍只看本机 | ⬜ |
 | S6 | 设置界面「识别服务」页（§16，i18n 三份，复用 card 风格） | ⬜ |
