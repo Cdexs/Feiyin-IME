@@ -20,15 +20,15 @@ mod vad;
 // 文件只在本地（.gitignore 排除），声明受 `poc` 特性控制 —— 不开特性时编译器不读这些文件，
 // 全新 clone 照常编译。本地跑：`cargo test --features poc --bin feiyin-ime <名字> -- --ignored --nocapture`。
 #[cfg(all(test, feature = "poc"))]
-mod poc_slice_cut_381;
-#[cfg(all(test, feature = "poc"))]
-mod replay436_tests;
-#[cfg(all(test, feature = "poc"))]
-mod poc_voiceprint_short_444;
+mod poc_asr_server_491;
 #[cfg(all(test, feature = "poc"))]
 mod poc_gpu_451;
 #[cfg(all(test, feature = "poc"))]
-mod poc_asr_server_491;
+mod poc_slice_cut_381;
+#[cfg(all(test, feature = "poc"))]
+mod poc_voiceprint_short_444;
+#[cfg(all(test, feature = "poc"))]
+mod replay436_tests;
 // SLIDING-WINDOW-367：路A 逐片解码摘接线后，`join_segment_texts` 等 re-export 暂无人用；
 // **保留**（可回挂），故局部 allow。
 #[allow(unused_imports)]

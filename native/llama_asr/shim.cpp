@@ -48,7 +48,7 @@ static void * lib_sym(lib_t h, const char * s) { return dlsym(h, s); }
 #define LAS_FN(name) static decltype(&name) p_##name = nullptr;
 #define LAS_FNS(X) \
     X(ggml_backend_load_all_from_path) X(ggml_backend_dev_count) X(ggml_backend_dev_get) \
-    X(ggml_backend_dev_type) X(ggml_backend_dev_description) X(ggml_log_set) \
+    X(ggml_backend_dev_type) X(ggml_backend_dev_description) X(ggml_backend_dev_memory) X(ggml_log_set) \
     X(llama_backend_init) X(llama_log_set) X(llama_model_default_params) X(llama_context_default_params) \
     X(llama_model_load_from_file) X(llama_model_free) X(llama_init_from_model) X(llama_free) \
     X(llama_model_get_vocab) X(llama_vocab_n_tokens) X(llama_vocab_is_eog) X(llama_token_to_piece) \
@@ -163,6 +163,8 @@ struct las_engine {
     // （无远程通道时锁无人争抢，本机路径行为不变）。slot = true 的引擎释放时只释放自己的上下文。
     std::shared_ptr<std::mutex> mtmd_mu = std::make_shared<std::mutex>();
     bool slot = false;
+    // ASR-SERVER-491 S2：所用 GPU 设备（CPU 回落 = nullptr），供查询显存余量决定可开几路远程通道。
+    ggml_backend_dev_t dev = nullptr;
 };
 
 struct las_stats {
@@ -239,6 +241,7 @@ extern "C" las_engine * las_create(const char * model_path, const char * mmproj_
     }
     las_engine * e = new las_engine();
     e->model = model; e->ctx = ctx; e->mctx = mctx;
+    e->dev = gpu_dev;
     e->cp = cp;
     e->n_ctx_max = n_ctx_max > n_ctx ? n_ctx_max : n_ctx;
     e->vocab = p_llama_model_get_vocab(model);
@@ -258,8 +261,19 @@ extern "C" las_engine * las_create_slot(las_engine * base, char * err, int err_l
     s->vocab = base->vocab; s->n_vocab = base->n_vocab; s->n_batch = base->n_batch;
     s->cp = base->cp; s->n_ctx_max = base->n_ctx_max;
     s->mtmd_mu = base->mtmd_mu;
+    s->dev = base->dev;
     s->slot = true;
     return s;
+}
+
+// ASR-SERVER-491 S2：引擎所在 GPU 的显存（字节）。返回 0 = 成功；1 = CPU 回落（无 GPU 设备）。
+extern "C" int las_dev_memory(las_engine * e, uint64_t * free_b, uint64_t * total_b) {
+    if (!e || !e->dev) return 1;
+    size_t f = 0, t = 0;
+    p_ggml_backend_dev_memory(e->dev, &f, &t);
+    if (free_b) *free_b = (uint64_t) f;
+    if (total_b) *total_b = (uint64_t) t;
+    return 0;
 }
 
 extern "C" void las_free(las_engine * e) {

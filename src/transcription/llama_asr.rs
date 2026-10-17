@@ -13,7 +13,7 @@
 use anyhow::{bail, Context, Result};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
 
 /// 模型目录（`models/` 下）与文件名。LLM Q8_0；音频编码器 MEM-453 由 f16 改 Q8_0（显存 612→~340MiB）。
 /// 无 f16 存量用户（Gavin 09-29），不做回退。
@@ -61,8 +61,8 @@ extern "C" {
         err_len: c_int,
     ) -> *mut c_void;
     fn las_free(e: *mut c_void);
-    #[cfg(test)]
     fn las_create_slot(base: *mut c_void, err: *mut c_char, err_len: c_int) -> *mut c_void;
+    fn las_dev_memory(e: *mut c_void, free_b: *mut u64, total_b: *mut u64) -> c_int;
     fn las_count_tokens(e: *mut c_void, text: *const c_char) -> c_int;
     fn las_decode(
         e: *mut c_void,
@@ -223,18 +223,90 @@ pub(crate) struct LlamaDecodeOut {
     pub stats: LasStats,
 }
 
-/// Qwen3-ASR 精解引擎。内部串行（`Mutex`）：同一时刻只解一窗（生产 `WINDOW_DECODE_CONCURRENCY=1`）。
+/// Qwen3-ASR 精解推理通道。内部串行（`Mutex`）：同一时刻只解一窗（生产 `WINDOW_DECODE_CONCURRENCY=1`）。
+///
+/// ASR-SERVER-491 B（DEC-111）：`load` 得到的是**本机通道**（引擎本体）；[`Self::create_slot`] 为每个远程终端
+/// 另开一路**远程通道** —— 同一类型，共用权重与音频编码器，只多一份上下文 / KV / 前缀缓存（780M 实测约 73MB），
+/// 因此远程会话可原样复用整条精解窗口路径。本机优先内置在通道里：本机每次解码 / 对齐期间登记，
+/// 远程通道在开始前、每生成一个 token 后、对齐前遇本机在跑就等。没有远程终端时只多一次无竞争的计数加减。
 pub(crate) struct LlamaAsr {
+    /// 本通道的句柄（本机 = 引擎本体，远程 = slot）。
     ptr: *mut c_void,
     lock: Mutex<()>,
     device: String,
     /// FORCED-ALIGN-456：强制对齐器（仅本地实时加载；`None` = 未加载 / 加载失败 ⇒ 接缝回落比例估算）。
-    aligner: Option<LlamaAligner>,
+    /// 远程通道共用本机那一份（对齐器自身有锁）。
+    aligner: Option<Arc<LlamaAligner>>,
+    /// 引擎本体（权重 + 编码器）；最后一个通道释放时才释放。
+    core: Arc<EngineCore>,
+    /// `true` = 远程通道（slot）。
+    remote: bool,
+    prio: Arc<LocalPriority>,
 }
 
-// SAFETY：引擎句柄只经 `lock` 串行访问；llama.cpp 上下文可在线程间移动（单线程使用）。
+// SAFETY：通道句柄只经 `lock` 串行访问；共用的音频编码器在 shim 内另有锁；llama.cpp 上下文可在线程间移动。
 unsafe impl Send for LlamaAsr {}
 unsafe impl Sync for LlamaAsr {}
+
+/// ASR-SERVER-491：引擎本体句柄（`las_create` 所得）。所有通道释放后才释放。
+struct EngineCore(*mut c_void);
+// SAFETY：只在 Drop 中使用（释放一次）；解码经各通道自己的锁。
+unsafe impl Send for EngineCore {}
+unsafe impl Sync for EngineCore {}
+
+impl Drop for EngineCore {
+    fn drop(&mut self) {
+        {
+            let mut g = COUNT_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+            if g.as_ref().is_some_and(|h| h.0 == self.0) {
+                *g = None;
+            }
+        }
+        // SAFETY：ptr 由 las_create 返回；所有 slot 已先释放（各持本 Arc）；只在此处释放一次。
+        unsafe { las_free(self.0) };
+    }
+}
+
+/// ASR-SERVER-491 B：本机优先闸门（计数 = 正在跑的本机解码 / 对齐数）。
+#[derive(Default)]
+struct LocalPriority {
+    active: Mutex<usize>,
+    idle: Condvar,
+}
+
+impl LocalPriority {
+    fn enter(&self) -> LocalTurn<'_> {
+        *self.active.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        LocalTurn(self)
+    }
+
+    /// 远程通道调用：本机在跑就等它跑完。
+    fn wait_idle(&self) {
+        let mut g = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        while *g > 0 {
+            g = self.idle.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+struct LocalTurn<'a>(&'a LocalPriority);
+
+impl Drop for LocalTurn<'_> {
+    fn drop(&mut self) {
+        let mut g = self.0.active.lock().unwrap_or_else(|e| e.into_inner());
+        *g = g.saturating_sub(1);
+        if *g == 0 {
+            self.0.idle.notify_all();
+        }
+    }
+}
+
+/// ASR-SERVER-491：每路远程通道按此估算显存（上下文 / KV / 计算缓冲 ≈73MB 实测，留一倍余量应对长窗）。
+const SLOT_VRAM_BYTES: u64 = 150 * 1024 * 1024;
+/// 开远程通道后至少给本机留的空闲显存。
+const SLOT_VRAM_RESERVE: u64 = 1024 * 1024 * 1024;
+/// 远程通道数上限（与显存无关的硬顶）。
+const SLOT_MAX: usize = 8;
 
 /// MEM-TRIM-457 ③：当前已加载的 1.7B 引擎句柄，**只用于数词库 token**（读词表，不碰解码上下文）。
 /// 与解码锁 `lock` 分开 —— 录音开始时数 token 不必等正在跑的解码；`Drop` 在同一把锁下先注销再释放引擎，
@@ -258,14 +330,11 @@ pub(crate) fn count_tokens(text: &str) -> Option<usize> {
 
 impl Drop for LlamaAsr {
     fn drop(&mut self) {
-        {
-            let mut g = COUNT_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
-            if g.as_ref().is_some_and(|h| h.0 == self.ptr) {
-                *g = None;
-            }
+        // 远程通道：只释放自己的上下文（shim 对 slot 只释放 ctx）；本机通道的本体由 `core` 在最后一个通道释放后释放。
+        if self.remote {
+            // SAFETY：ptr 由 las_create_slot 返回且只在此处释放一次；本体仍由 self.core 持有。
+            unsafe { las_free(self.ptr) };
         }
-        // SAFETY：ptr 由 las_create 返回且只在此处释放一次。
-        unsafe { las_free(self.ptr) };
     }
 }
 
@@ -343,6 +412,9 @@ impl LlamaAsr {
                     lock: Mutex::new(()),
                     device,
                     aligner: None,
+                    core: Arc::new(EngineCore(ptr)),
+                    remote: false,
+                    prio: Arc::new(LocalPriority::default()),
                 });
             }
             last_err = buf_str(&err);
@@ -362,7 +434,7 @@ impl LlamaAsr {
         match LlamaAligner::load(models_root) {
             Ok(a) => {
                 log::info!("[ALIGN-456] aligner attached (device={})", a.device());
-                self.aligner = Some(a);
+                self.aligner = Some(Arc::new(a));
             }
             Err(e) => log::warn!(
                 "[ALIGN-456] aligner unavailable, seams fall back to ratio estimate: {e:#}"
@@ -374,8 +446,13 @@ impl LlamaAsr {
     /// 未挂载 / 失败 / 时间戳不合格 ⇒ `None`（调用方回落比例估算）。
     pub(crate) fn align(&self, samples: &[f32], text: &str) -> Option<AlignOut> {
         let al = self.aligner.as_ref()?;
-        // PHANTOM-406-459 ②：与精解共用引擎锁 ⇒ 收割线程对兜底文本对齐时与解码线程串行，GPU 不并发。
+        // PHANTOM-406-459 ②：与精解共用通道锁 ⇒ 收割线程对兜底文本对齐时与解码线程串行，GPU 不并发。
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        // ASR-SERVER-491 B：本机登记；远程先让本机（对齐器自身有锁，与本机对齐串行）。
+        let _turn = (!self.remote).then(|| self.prio.enter());
+        if self.remote {
+            self.prio.wait_idle();
+        }
         match al.align(samples, text) {
             Ok(o) => o,
             Err(e) => {
@@ -448,25 +525,81 @@ impl LlamaAsr {
         max_new_tokens: Option<i32>,
         assist: DecodeAssist<'_>,
     ) -> Result<LlamaDecodeOut> {
-        decode_on(
-            self.ptr,
-            &self.lock,
-            samples,
-            system,
-            prefix,
-            max_new_tokens,
-            assist,
-        )
+        let sys = system.map(cstr).transpose()?;
+        let pre = cstr(prefix)?;
+        let dr = assist
+            .draft
+            .filter(|d| !d.is_empty())
+            .map(cstr)
+            .transpose()?;
+        let mut out = vec![0u8; 64 * 1024];
+        let mut err = [0u8; 512];
+        let mut st = LasStats::default();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        // ASR-SERVER-491 B：本机登记（远程见此让行）；远程开解前先让本机，生成中每个 token 后再让一次。
+        let _turn = (!self.remote).then(|| self.prio.enter());
+        let user_cb = assist.on_partial;
+        let yield_cb = |s: &str| {
+            self.prio.wait_idle();
+            if let Some(f) = user_cb {
+                f(s);
+            }
+        };
+        let cb_ref: Option<&(dyn Fn(&str) + Sync)> = if self.remote {
+            self.prio.wait_idle();
+            Some(&yield_cb)
+        } else {
+            user_cb
+        };
+        let ptr = self.ptr;
+        // ⑤ 逐字回调：把 `&dyn Fn` 的地址交给 shim，经 `partial_trampoline` 转回（调用期间栈上存活）。
+        let (cb_fn, cb_user): (
+            Option<extern "C" fn(*mut c_void, *const c_char)>,
+            *mut c_void,
+        ) = match cb_ref.as_ref() {
+            Some(r) => (
+                Some(partial_trampoline),
+                r as *const &(dyn Fn(&str) + Sync) as *mut c_void,
+            ),
+            None => (None, std::ptr::null_mut()),
+        };
+        // SAFETY：指针均有效且在调用期间存活；out / err 为可写缓冲；空 prefix ⇒ shim 视为不预填。
+        let rc = unsafe {
+            las_decode(
+                ptr,
+                samples.as_ptr(),
+                samples.len() as c_int,
+                sys.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                pre.as_ptr(),
+                dr.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS),
+                if dr.is_some() { DRAFT_MAX } else { 0 },
+                out.as_mut_ptr() as *mut c_char,
+                out.len() as c_int,
+                &mut st,
+                err.as_mut_ptr() as *mut c_char,
+                err.len() as c_int,
+                cb_fn,
+                cb_user,
+            )
+        };
+        if rc != 0 {
+            bail!("llama.cpp decode failed ({rc}): {}", buf_str(&err));
+        }
+        Ok(LlamaDecodeOut {
+            raw: buf_str(&out),
+            stats: st,
+        })
     }
 
-    /// ASR-SERVER-491 B（PoC）：开一路独立推理（远程终端各一路），共用本引擎的权重与音频编码器。
-    #[cfg(test)]
-    pub(crate) fn create_slot(&self) -> Result<LlamaSlot<'_>> {
+    /// ASR-SERVER-491 B：为一个远程终端开一路推理通道（共用本引擎的权重 / 音频编码器 / 对齐器 / 本机优先闸门）。
+    /// 可从任一通道调用；新通道总是远程角色。
+    pub(crate) fn create_slot(&self) -> Result<Self> {
         let mut err = [0u8; 512];
-        // SAFETY：self.ptr 有效；slot 借用 self ⇒ 必先于引擎释放。
+        // SAFETY：core.0 为有效本体句柄；新通道持有 core 的 Arc ⇒ 本体必晚于它释放。
         let ptr = unsafe {
             las_create_slot(
-                self.ptr,
+                self.core.0,
                 err.as_mut_ptr() as *mut c_char,
                 err.len() as c_int,
             )
@@ -474,128 +607,37 @@ impl LlamaAsr {
         if ptr.is_null() {
             bail!("slot create failed: {}", buf_str(&err));
         }
-        Ok(LlamaSlot {
+        Ok(Self {
             ptr,
             lock: Mutex::new(()),
-            base: self,
+            device: self.device.clone(),
+            aligner: self.aligner.clone(),
+            core: self.core.clone(),
+            remote: true,
+            prio: self.prio.clone(),
         })
     }
 
-    /// ASR-SERVER-491 B（PoC）：对齐不经精解引擎锁（对齐器自身仍有锁）—— 远程通道对齐时不必等本机精解。
-    #[cfg(test)]
-    pub(crate) fn align_unlocked(&self, samples: &[f32], text: &str) -> Option<AlignOut> {
-        self.aligner.as_ref()?.align(samples, text).ok().flatten()
+    /// ASR-SERVER-491 B：按当前空闲显存算还能开几路远程通道（含已开的不算 —— 调用方减去已开数）。
+    /// CPU 推理 ⇒ 1（CPU 上并发只会互相拖慢）；查询失败 ⇒ 2（保守）。
+    pub(crate) fn max_remote_slots(&self) -> usize {
+        let (mut free, mut total) = (0u64, 0u64);
+        // SAFETY：core.0 有效；两个输出指针可写。
+        let rc = unsafe { las_dev_memory(self.core.0, &mut free, &mut total) };
+        if rc != 0 {
+            return if self.device.eq_ignore_ascii_case("cpu") {
+                1
+            } else {
+                2
+            };
+        }
+        slots_for_free_vram(free)
     }
 }
 
-/// ASR-SERVER-491 B（PoC）：一路独立推理（自己的上下文 / KV / 前缀缓存），权重与音频编码器借用 `base`。
-#[cfg(test)]
-pub(crate) struct LlamaSlot<'a> {
-    ptr: *mut c_void,
-    lock: Mutex<()>,
-    #[allow(dead_code)]
-    base: &'a LlamaAsr,
-}
-
-// SAFETY：同 LlamaAsr —— 句柄只经 `lock` 串行访问；共用的编码器在 shim 内另有锁。
-#[cfg(test)]
-unsafe impl Send for LlamaSlot<'_> {}
-#[cfg(test)]
-unsafe impl Sync for LlamaSlot<'_> {}
-
-#[cfg(test)]
-impl LlamaSlot<'_> {
-    pub(crate) fn decode(
-        &self,
-        samples: &[f32],
-        system: Option<&str>,
-        language: Option<&str>,
-        max_new_tokens: Option<i32>,
-        assist: DecodeAssist<'_>,
-    ) -> Result<LlamaDecodeOut> {
-        let prefix = language
-            .map(|l| format!("language {l}<asr_text>"))
-            .unwrap_or_default();
-        decode_on(
-            self.ptr,
-            &self.lock,
-            samples,
-            system,
-            &prefix,
-            max_new_tokens,
-            assist,
-        )
-    }
-}
-
-#[cfg(test)]
-impl Drop for LlamaSlot<'_> {
-    fn drop(&mut self) {
-        // SAFETY：ptr 由 las_create_slot 返回且只释放一次；shim 对 slot 只释放其上下文。
-        unsafe { las_free(self.ptr) };
-    }
-}
-
-/// 在指定推理通道（引擎本体或 slot）上解码；`lock` 是该通道自己的锁。
-fn decode_on(
-    ptr: *mut c_void,
-    lock: &Mutex<()>,
-    samples: &[f32],
-    system: Option<&str>,
-    prefix: &str,
-    max_new_tokens: Option<i32>,
-    assist: DecodeAssist<'_>,
-) -> Result<LlamaDecodeOut> {
-    let sys = system.map(cstr).transpose()?;
-    let pre = cstr(prefix)?;
-    let dr = assist
-        .draft
-        .filter(|d| !d.is_empty())
-        .map(cstr)
-        .transpose()?;
-    let mut out = vec![0u8; 64 * 1024];
-    let mut err = [0u8; 512];
-    let mut st = LasStats::default();
-    let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
-    // ⑤ 逐字回调：把 `&dyn Fn` 的地址交给 shim，经 `partial_trampoline` 转回（调用期间栈上存活）。
-    let cb_ref: Option<&(dyn Fn(&str) + Sync)> = assist.on_partial;
-    let (cb_fn, cb_user): (
-        Option<extern "C" fn(*mut c_void, *const c_char)>,
-        *mut c_void,
-    ) = match cb_ref.as_ref() {
-        Some(r) => (
-            Some(partial_trampoline),
-            r as *const &(dyn Fn(&str) + Sync) as *mut c_void,
-        ),
-        None => (None, std::ptr::null_mut()),
-    };
-    // SAFETY：指针均有效且在调用期间存活；out / err 为可写缓冲；空 prefix ⇒ shim 视为不预填。
-    let rc = unsafe {
-        las_decode(
-            ptr,
-            samples.as_ptr(),
-            samples.len() as c_int,
-            sys.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
-            pre.as_ptr(),
-            dr.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
-            max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS),
-            if dr.is_some() { DRAFT_MAX } else { 0 },
-            out.as_mut_ptr() as *mut c_char,
-            out.len() as c_int,
-            &mut st,
-            err.as_mut_ptr() as *mut c_char,
-            err.len() as c_int,
-            cb_fn,
-            cb_user,
-        )
-    };
-    if rc != 0 {
-        bail!("llama.cpp decode failed ({rc}): {}", buf_str(&err));
-    }
-    Ok(LlamaDecodeOut {
-        raw: buf_str(&out),
-        stats: st,
-    })
+/// 空闲显存 ⇒ 可开远程通道数：先给本机留 [`SLOT_VRAM_RESERVE`]，余下按每路 [`SLOT_VRAM_BYTES`] 算，封顶 [`SLOT_MAX`]。
+fn slots_for_free_vram(free: u64) -> usize {
+    ((free.saturating_sub(SLOT_VRAM_RESERVE) / SLOT_VRAM_BYTES) as usize).min(SLOT_MAX)
 }
 
 // ============================================================================================
