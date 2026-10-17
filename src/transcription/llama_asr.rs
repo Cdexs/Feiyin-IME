@@ -61,6 +61,8 @@ extern "C" {
         err_len: c_int,
     ) -> *mut c_void;
     fn las_free(e: *mut c_void);
+    #[cfg(test)]
+    fn las_create_slot(base: *mut c_void, err: *mut c_char, err_len: c_int) -> *mut c_void;
     fn las_count_tokens(e: *mut c_void, text: *const c_char) -> c_int;
     fn las_decode(
         e: *mut c_void,
@@ -446,6 +448,99 @@ impl LlamaAsr {
         max_new_tokens: Option<i32>,
         assist: DecodeAssist<'_>,
     ) -> Result<LlamaDecodeOut> {
+        decode_on(
+            self.ptr,
+            &self.lock,
+            samples,
+            system,
+            prefix,
+            max_new_tokens,
+            assist,
+        )
+    }
+
+    /// ASR-SERVER-491 B（PoC）：开一路独立推理（远程终端各一路），共用本引擎的权重与音频编码器。
+    #[cfg(test)]
+    pub(crate) fn create_slot(&self) -> Result<LlamaSlot<'_>> {
+        let mut err = [0u8; 512];
+        // SAFETY：self.ptr 有效；slot 借用 self ⇒ 必先于引擎释放。
+        let ptr =
+            unsafe { las_create_slot(self.ptr, err.as_mut_ptr() as *mut c_char, err.len() as c_int) };
+        if ptr.is_null() {
+            bail!("slot create failed: {}", buf_str(&err));
+        }
+        Ok(LlamaSlot {
+            ptr,
+            lock: Mutex::new(()),
+            base: self,
+        })
+    }
+
+    /// ASR-SERVER-491 B（PoC）：对齐不经精解引擎锁（对齐器自身仍有锁）—— 远程通道对齐时不必等本机精解。
+    #[cfg(test)]
+    pub(crate) fn align_unlocked(&self, samples: &[f32], text: &str) -> Option<AlignOut> {
+        self.aligner.as_ref()?.align(samples, text).ok().flatten()
+    }
+}
+
+/// ASR-SERVER-491 B（PoC）：一路独立推理（自己的上下文 / KV / 前缀缓存），权重与音频编码器借用 `base`。
+#[cfg(test)]
+pub(crate) struct LlamaSlot<'a> {
+    ptr: *mut c_void,
+    lock: Mutex<()>,
+    #[allow(dead_code)]
+    base: &'a LlamaAsr,
+}
+
+// SAFETY：同 LlamaAsr —— 句柄只经 `lock` 串行访问；共用的编码器在 shim 内另有锁。
+#[cfg(test)]
+unsafe impl Send for LlamaSlot<'_> {}
+#[cfg(test)]
+unsafe impl Sync for LlamaSlot<'_> {}
+
+#[cfg(test)]
+impl LlamaSlot<'_> {
+    pub(crate) fn decode(
+        &self,
+        samples: &[f32],
+        system: Option<&str>,
+        language: Option<&str>,
+        max_new_tokens: Option<i32>,
+        assist: DecodeAssist<'_>,
+    ) -> Result<LlamaDecodeOut> {
+        let prefix = language
+            .map(|l| format!("language {l}<asr_text>"))
+            .unwrap_or_default();
+        decode_on(
+            self.ptr,
+            &self.lock,
+            samples,
+            system,
+            &prefix,
+            max_new_tokens,
+            assist,
+        )
+    }
+}
+
+#[cfg(test)]
+impl Drop for LlamaSlot<'_> {
+    fn drop(&mut self) {
+        // SAFETY：ptr 由 las_create_slot 返回且只释放一次；shim 对 slot 只释放其上下文。
+        unsafe { las_free(self.ptr) };
+    }
+}
+
+/// 在指定推理通道（引擎本体或 slot）上解码；`lock` 是该通道自己的锁。
+fn decode_on(
+    ptr: *mut c_void,
+    lock: &Mutex<()>,
+    samples: &[f32],
+    system: Option<&str>,
+    prefix: &str,
+    max_new_tokens: Option<i32>,
+    assist: DecodeAssist<'_>,
+) -> Result<LlamaDecodeOut> {
         let sys = system.map(cstr).transpose()?;
         let pre = cstr(prefix)?;
         let dr = assist
@@ -456,7 +551,7 @@ impl LlamaAsr {
         let mut out = vec![0u8; 64 * 1024];
         let mut err = [0u8; 512];
         let mut st = LasStats::default();
-        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
         // ⑤ 逐字回调：把 `&dyn Fn` 的地址交给 shim，经 `partial_trampoline` 转回（调用期间栈上存活）。
         let cb_ref: Option<&(dyn Fn(&str) + Sync)> = assist.on_partial;
         let (cb_fn, cb_user): (
@@ -472,7 +567,7 @@ impl LlamaAsr {
         // SAFETY：指针均有效且在调用期间存活；out / err 为可写缓冲；空 prefix ⇒ shim 视为不预填。
         let rc = unsafe {
             las_decode(
-                self.ptr,
+                ptr,
                 samples.as_ptr(),
                 samples.len() as c_int,
                 sys.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
@@ -496,7 +591,6 @@ impl LlamaAsr {
             raw: buf_str(&out),
             stats: st,
         })
-    }
 }
 
 // ============================================================================================

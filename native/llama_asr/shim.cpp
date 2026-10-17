@@ -15,6 +15,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -156,6 +158,11 @@ struct las_engine {
     // DRAFT-LANG-PREV-458：上一次模型自写的语种标记（`language X<asr_text>` 的 token），作下一窗草稿开头。
     std::vector<llama_token> lang_draft;
     llama_token asr_text_tok = -1;
+    // ASR-SERVER-491 B：远程终端各开一路推理（las_create_slot）—— 与本引擎共用模型权重和音频编码器 mctx，
+    // 只各有自己的上下文 / KV / 前缀缓存。mctx 不保证多线程同时用 ⇒ 分词 + 音频段编码经这把共用锁串行
+    // （无远程通道时锁无人争抢，本机路径行为不变）。slot = true 的引擎释放时只释放自己的上下文。
+    std::shared_ptr<std::mutex> mtmd_mu = std::make_shared<std::mutex>();
+    bool slot = false;
 };
 
 struct las_stats {
@@ -240,8 +247,28 @@ extern "C" las_engine * las_create(const char * model_path, const char * mmproj_
     return e;
 }
 
+// ASR-SERVER-491 B：基于已加载引擎开一路独立推理（每个远程终端一路）。共用 base 的模型权重与音频编码器，
+// 新建自己的上下文（同参数）。返回 nullptr = 失败。必须先于 base 释放（las_free 对 slot 只释放其上下文）。
+extern "C" las_engine * las_create_slot(las_engine * base, char * err, int err_len) {
+    if (!base || base->slot) { set_err(err, err_len, "invalid base engine"); return nullptr; }
+    llama_context * ctx = p_llama_init_from_model(base->model, base->cp);
+    if (!ctx) { set_err(err, err_len, "init slot context failed"); return nullptr; }
+    las_engine * s = new las_engine();
+    s->model = base->model; s->ctx = ctx; s->mctx = base->mctx;
+    s->vocab = base->vocab; s->n_vocab = base->n_vocab; s->n_batch = base->n_batch;
+    s->cp = base->cp; s->n_ctx_max = base->n_ctx_max;
+    s->mtmd_mu = base->mtmd_mu;
+    s->slot = true;
+    return s;
+}
+
 extern "C" void las_free(las_engine * e) {
     if (!e) return;
+    if (e->slot) {
+        if (e->ctx) p_llama_free(e->ctx);
+        delete e;
+        return;
+    }
     if (e->mctx) p_mtmd_free(e->mctx);
     if (e->ctx) p_llama_free(e->ctx);
     if (e->model) p_llama_model_free(e->model);
@@ -311,7 +338,11 @@ extern "C" int las_decode(las_engine * e, const float * pcm, int n_samples, cons
     mtmd_input_chunks * chunks = p_mtmd_input_chunks_init();
     mtmd_input_text txt{prompt.c_str(), prompt.size(), true, true};
     const mtmd_bitmap * bmps[1] = {bmp};
-    int32_t rc = p_mtmd_tokenize(e->mctx, chunks, &txt, bmps, 1);
+    int32_t rc;
+    {
+        std::lock_guard<std::mutex> lk(*e->mtmd_mu);
+        rc = p_mtmd_tokenize(e->mctx, chunks, &txt, bmps, 1);
+    }
     if (rc != 0) {
         p_mtmd_input_chunks_free(chunks); p_mtmd_bitmap_free(bmp);
         set_err(err, err_len, "mtmd_tokenize failed: " + std::to_string(rc));
@@ -368,6 +399,9 @@ extern "C" int las_decode(las_engine * e, const float * pcm, int n_samples, cons
     for (size_t i = first; i < n_chunks && rc == 0; i++) {
         llama_pos np = n_past;
         const mtmd_input_chunk * ch = p_mtmd_input_chunks_get(chunks, i);
+        // 音频段要用共用编码器 ⇒ 持共用锁（文字段只写本引擎自己的上下文，不持锁）。
+        std::unique_lock<std::mutex> lk(*e->mtmd_mu, std::defer_lock);
+        if (p_mtmd_input_chunk_get_type(ch) != MTMD_INPUT_CHUNK_TYPE_TEXT) lk.lock();
         if (split_enc && p_mtmd_input_chunk_get_type(ch) != MTMD_INPUT_CHUNK_TYPE_TEXT) {
             // 调试：编码与写入 KV 分开计时（与 eval_chunk_single 内部同一顺序）。
             auto te = clk::now();

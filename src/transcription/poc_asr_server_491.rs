@@ -174,14 +174,105 @@ impl Gate {
     }
 }
 
-/// 一路会话：墙钟回放；返回统计。`gate` = `Some((闸门, 是否本机))` ⇒ 每窗精解 + 对齐经闸门。
-fn run_session(
-    audio: &[f32],
-    start: Instant,
-    acc: &super::AccEngine,
-    prev: &Mutex<Rec>,
-    gate: Option<(&Gate, bool)>,
-) -> Stats {
+/// 491-B「让行」闸门：本机一窗（精解 + 对齐）开始前登记、结束后注销；远程在**解码开始前、每生成一步后、
+/// 对齐前**检查 —— 本机有窗在解就停下等（远程之间不互相等，各走各的推理通道）。
+#[derive(Default)]
+struct YieldGate {
+    m: Mutex<usize>, // 本机进行中的窗数
+    cv: std::sync::Condvar,
+}
+
+impl YieldGate {
+    fn local_begin(&self) {
+        *self.m.lock().unwrap() += 1;
+    }
+    fn local_end(&self) {
+        *self.m.lock().unwrap() -= 1;
+        self.cv.notify_all();
+    }
+    fn remote_yield(&self) {
+        let mut g = self.m.lock().unwrap();
+        while *g > 0 {
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+}
+
+/// 一窗工作：返回（精解耗时, 对齐耗时）ms，均含排队。
+type Work<'a> = dyn Fn(&[f32]) -> (f64, f64) + Sync + 'a;
+
+/// 原方式（M0~M3）：在共用引擎上精解 + 对齐；`gate` = `Some((闸门, 是否本机))` ⇒ 整窗经闸门。
+fn base_work<'a>(acc: &'a super::AccEngine, gate: Option<(&'a Gate, bool)>) -> impl Fn(&[f32]) -> (f64, f64) + Sync + 'a {
+    move |win: &[f32]| {
+        let t0 = Instant::now();
+        if let Some((g, local)) = gate {
+            g.acquire(local);
+        }
+        let cap = max_new_tokens_for(win.len() as f32 / RATE as f32);
+        let text = decode_accuracy_allow_empty(acc, win, None, ChineseScript::Simplified, Some(cap), Default::default())
+            .map(|(t, _)| t)
+            .unwrap_or_default();
+        let t1 = Instant::now();
+        if !text.trim().is_empty() {
+            let _ = acc.align(win, &text);
+        }
+        if let Some((g, _)) = gate {
+            g.release();
+        }
+        ((t1 - t0).as_secs_f64() * 1000.0, t1.elapsed().as_secs_f64() * 1000.0)
+    }
+}
+
+/// 491-B 本机：仍走共用引擎本体；有让行闸门时整窗登记为「本机进行中」。
+fn local_b_work<'a>(acc: &'a super::AccEngine, yg: Option<&'a YieldGate>) -> impl Fn(&[f32]) -> (f64, f64) + Sync + 'a {
+    move |win: &[f32]| {
+        if let Some(y) = yg {
+            y.local_begin();
+        }
+        let r = base_work(acc, None)(win);
+        if let Some(y) = yg {
+            y.local_end();
+        }
+        r
+    }
+}
+
+/// 491-B 远程：在自己的推理通道（slot）上解；有让行闸门时开始前 / 每步后 / 对齐前让本机。
+/// 对齐器全进程一份（自身有锁），不经精解引擎锁。
+fn remote_b_work<'a>(
+    acc: &'a super::AccEngine,
+    slot: &'a super::llama_asr::LlamaSlot<'a>,
+    yg: Option<&'a YieldGate>,
+) -> impl Fn(&[f32]) -> (f64, f64) + Sync + 'a {
+    move |win: &[f32]| {
+        let t0 = Instant::now();
+        let yield_now = || {
+            if let Some(y) = yg {
+                y.remote_yield();
+            }
+        };
+        yield_now();
+        let cap = max_new_tokens_for(win.len() as f32 / RATE as f32);
+        let on_partial = |_: &str| yield_now();
+        let assist = super::llama_asr::DecodeAssist {
+            draft: None,
+            on_partial: Some(&on_partial),
+        };
+        let text = slot
+            .decode(win, None, None, Some(cap), assist)
+            .map(|o| o.raw.rsplit("<asr_text>").next().unwrap_or("").trim().to_string())
+            .unwrap_or_default();
+        let t1 = Instant::now();
+        if !text.is_empty() {
+            yield_now();
+            let _ = acc.align_unlocked(win, &text);
+        }
+        ((t1 - t0).as_secs_f64() * 1000.0, t1.elapsed().as_secs_f64() * 1000.0)
+    }
+}
+
+/// 一路会话：墙钟回放；返回统计。每窗精解 + 对齐由 `work` 完成。
+fn run_session(audio: &[f32], start: Instant, work: &Work<'_>, prev: &Mutex<Rec>) -> Stats {
     let slices = dispatch_slices(audio);
     let stats = Mutex::new(Stats::default());
     let at = |samples: usize| start + Duration::from_secs_f64(samples as f64 / RATE as f64);
@@ -196,32 +287,11 @@ fn run_session(
                 let ws = if i > 0 { slices[i - 1].0 } else { st };
                 let ws = ws.max(en.saturating_sub(WINDOW_MAX_SECS * RATE));
                 let win = &audio[ws..en];
-                let t0 = Instant::now();
-                if let Some((g, local)) = gate {
-                    g.acquire(local);
-                }
-                let cap = max_new_tokens_for(win.len() as f32 / RATE as f32);
-                let text = decode_accuracy_allow_empty(
-                    acc,
-                    win,
-                    None,
-                    ChineseScript::Simplified,
-                    Some(cap),
-                    Default::default(),
-                )
-                .map(|(t, _)| t)
-                .unwrap_or_default();
-                let t1 = Instant::now();
-                if !text.trim().is_empty() {
-                    let _ = acc.align(win, &text);
-                }
-                if let Some((g, _)) = gate {
-                    g.release();
-                }
+                let (dm, am) = work(win);
                 let t2 = Instant::now();
                 let mut g = stats.lock().unwrap();
-                g.decode_ms.push((t1 - t0).as_secs_f64() * 1000.0);
-                g.align_ms.push((t2 - t1).as_secs_f64() * 1000.0);
+                g.decode_ms.push(dm);
+                g.align_ms.push(am);
                 g.win_latency.push((t2 - due).as_secs_f64() * 1000.0);
             }
         });
@@ -487,36 +557,51 @@ fn poc491_concurrency() {
     let ri: Vec<usize> = (0..3).filter(|&i| i != li).collect();
     let _ = writeln!(md, "\n本机 = 第 {li} 段，远程 = 第 {:?} 段", ri);
     let gate = Gate::default();
+    let yg = YieldGate::default();
     // `POC491_MODES`：逗号分隔要跑的场景（默认 M0,M1,M2）。
     let modes = std::env::var("POC491_MODES").unwrap_or_else(|_| "M0,M1,M2".into());
-    for (key, mode, remotes, remote_own_prev, prio) in [
-        ("M0", "M0 本机单独", 0usize, false, false),
-        ("M1", "M1 本机+2路远程（共用预览模型）", 2, false, false),
-        (
-            "M2",
-            "M2 本机+2路远程（远程另开 2 线程预览模型）",
-            2,
-            true,
-            false,
-        ),
-        (
-            "M3",
-            "M3 本机+2路远程（共用预览模型 + 本机优先闸门）",
-            2,
-            false,
-            true,
-        ),
+    // 491-B：每个远程终端各开一路推理（共用权重 / 编码器，只多一份上下文）。
+    let slots: Vec<super::llama_asr::LlamaSlot<'_>> = if modes.contains("M4") || modes.contains("M5") {
+        (0..2).map(|_| acc.create_slot().expect("开推理通道")).collect()
+    } else {
+        Vec::new()
+    };
+    for s in &slots {
+        let _ = s.decode(warm, None, None, Some(16), Default::default());
+    }
+    // (键, 名称, 远程路数, 远程另开预览模型, 方式：0=共用引擎 1=共用引擎+本机优先闸门 2=各开通道+让行 3=各开通道无闸门)
+    for (key, mode, remotes, remote_own_prev, how) in [
+        ("M0", "M0 本机单独", 0usize, false, 0u8),
+        ("M1", "M1 本机+2路远程（共用预览模型）", 2, false, 0),
+        ("M2", "M2 本机+2路远程（远程另开 2 线程预览模型）", 2, true, 0),
+        ("M3", "M3 本机+2路远程（共用预览模型 + 本机优先闸门）", 2, false, 1),
+        ("M4", "M4 本机+2路远程（每个远程各开一路推理 + 每生成一步让本机）", 2, false, 2),
+        ("M5", "M5 本机+2路远程（每个远程各开一路推理，不让行、完全并行）", 2, false, 3),
     ] {
         if !modes.split(',').any(|m| m == key) {
             continue;
         }
         let start = Instant::now() + Duration::from_millis(200);
-        let g = prio.then_some(&gate);
+        let g = (how == 1).then_some(&gate);
+        let y = (how == 2).then_some(&yg);
+        let local_work: Box<Work<'_>> = if how >= 2 {
+            Box::new(local_b_work(&acc, y))
+        } else {
+            Box::new(base_work(&acc, g.map(|g| (g, true))))
+        };
+        let remote_works: Vec<Box<Work<'_>>> = (0..remotes)
+            .map(|r| -> Box<Work<'_>> {
+                if how >= 2 {
+                    Box::new(remote_b_work(&acc, &slots[r], y))
+                } else {
+                    Box::new(base_work(&acc, g.map(|g| (g, false))))
+                }
+            })
+            .collect();
         let results: Vec<Stats> = std::thread::scope(|s| {
             let la = &wavs[li].1;
-            let (accr, lp) = (&acc, &local_prev);
-            let mut hs =
-                vec![s.spawn(move || run_session(la, start, accr, lp, g.map(|g| (g, true))))];
+            let (lw, lp) = (&*local_work, &local_prev);
+            let mut hs = vec![s.spawn(move || run_session(la, start, lw, lp))];
             for (r, &idx) in ri.iter().enumerate().take(remotes) {
                 let a = &wavs[idx].1;
                 let pv = if remote_own_prev {
@@ -524,9 +609,9 @@ fn poc491_concurrency() {
                 } else {
                     &local_prev
                 };
-                let acc = &acc;
+                let w = &*remote_works[r];
                 let st = start + Duration::from_millis(300 + 400 * r as u64);
-                hs.push(s.spawn(move || run_session(a, st, acc, pv, g.map(|g| (g, false)))));
+                hs.push(s.spawn(move || run_session(a, st, w, pv)));
             }
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
@@ -550,6 +635,43 @@ fn poc491_concurrency() {
     }
     let out = root().join("collab/evidence/491");
     std::fs::create_dir_all(&out).unwrap();
-    std::fs::write(out.join("poc491-concurrency.md"), &md).unwrap();
+    // `POC491_OUT`：结果文件名（默认 poc491-concurrency.md；B 方案另存，不覆盖 M0~M3 原始结果）。
+    let name = std::env::var("POC491_OUT").unwrap_or_else(|_| "poc491-concurrency.md".into());
+    std::fs::write(out.join(name), &md).unwrap();
+    println!("{md}");
+}
+
+/// 491-B：同一窗在「引擎本体」与「新开的推理通道」上解出的文字是否一致（通道只是另一份上下文，结果应相同；
+/// GPU 自身有极少量浮动，见 poc457_prefix_determinism）。
+#[test]
+#[ignore = "POC-ASR-SERVER-491：需真模型 + 录音；--ignored 运行"]
+fn poc491_slot_same() {
+    let models = root().join("models");
+    let acc = create_qwen3_recognizer(&models).expect("1.7B 须在位");
+    let slot = acc.create_slot().expect("开推理通道");
+    let wavs = pick_wavs(3);
+    let (mut same, mut n) = (0, 0);
+    let mut md = String::from("\n# 491-B 推理通道 vs 引擎本体 逐窗文字比对\n\n");
+    for (_, a) in &wavs {
+        let sl = dispatch_slices(a);
+        for i in 0..sl.len() {
+            let ws = if i > 0 { sl[i - 1].0 } else { sl[i].0 };
+            let ws = ws.max(sl[i].1.saturating_sub(WINDOW_MAX_SECS * RATE));
+            let w = &a[ws..sl[i].1];
+            let cap = max_new_tokens_for(w.len() as f32 / RATE as f32);
+            let x = acc.decode(w, None, None, Some(cap), Default::default()).map(|o| o.raw).unwrap_or_default();
+            let y = slot.decode(w, None, None, Some(cap), Default::default()).map(|o| o.raw).unwrap_or_default();
+            n += 1;
+            if x == y {
+                same += 1;
+            } else {
+                let _ = writeln!(md, "- 窗 {n} 不同：\n  - 本体：{x}\n  - 通道：{y}");
+            }
+        }
+    }
+    let _ = writeln!(md, "\n{same}/{n} 窗逐字相同");
+    let out = root().join("collab/evidence/491");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("poc491-slot-same.md"), &md).unwrap();
     println!("{md}");
 }
