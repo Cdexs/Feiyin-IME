@@ -127,3 +127,11 @@
 - 回归：首轮 2044 过 / 4 失败 ⇒ 1 个本批引起（恢复生产写法）、3 个 S1 遗留护栏漂移（改读法，断言不变）；复跑全量 **2048 过 / 0 失败 / 48 忽略**、网关 **26 过**、fmt 干净。未交 tester-1（S10、S11 完成后统一回归出包）。
 - 新方向：Gavin 10-17 修正 S10（客户端参数只有 ITN / 自动补标点 / 翻译，其余纯文字节点服务端固定开；翻译引擎跟随服务端本机设置）。S10 以设计 §13.1 前修正块为准。本地已 commit，未 push。遗留：长文本时间搬运改 Myers 差分。
 
+
+## 2026-10-17 — 主控 — ASR-SERVER-491 S10 服务端文字处理验收通过（未出包）
+
+- 内容：按 Gavin 10-17 修正，终端只传 ITN / 自动补标点 / 翻译三项参数，其余纯文字节点服务端固定内置。任务书 `collab/spec-491-S10.md`，验收清单 `collab/acceptance-491-S10.md`（含偏离留档），设计 §13.4。
+- 改动文件：`src/asr_service/text_stage.rs`（新增）、`src/asr_service/session.rs`、`src/asr_service/frame.rs`、`src/asr_service/mod.rs`、网关 `src/bin/feiyin-asr-gateway/ws.rs`、`src/transcription/feiyin_remote.rs`、`src/transcription/qwen_inference.rs`。
+- 要点：翻译引擎跟随服务端本机设置（大模型优先，否则进程级 NLLB 线程）；`OpenParams` 三字段 serde 缺省互通；S8 客户端删 `postprocess` 改发三项阿里同名参数到 `parameters` 顶层；本机管线一行未改。
+- 回归：全量 **2061 过 / 0 失败 / 48 忽略**、网关 **31 过**、fmt / `cargo check --all-targets` 干净。未交 tester-1（S11 完成后统一回归出包）。
+- 遗留：网关参数解析（`ws.rs:568`–`:574`）与 Feiyin 分支合并无独立单测，已人工逐行核对，由 S11 Python 参考客户端冒烟覆盖。下一步 S11。
