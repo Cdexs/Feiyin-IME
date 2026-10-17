@@ -12,9 +12,12 @@ mod i18n;
 mod itn;
 mod llm;
 mod localrt_session; // ASR-SERVER-491 S1：本地实时精解窗口线程（本机 / 远程会话共用）
-                     // ASR-SERVER-491 S3：识别服务内核侧（本机 IPC + 远程会话）。S4（网关拉起时 `AsrService::start`）接线前暂无调用方。
+                     // ASR-SERVER-491：识别服务内核侧（本机 IPC + 远程会话 + 看护网关进程）。
 #[allow(dead_code)]
 mod asr_service;
+// ASR-SERVER-491：内核 / 网关 / 设置界面共用的服务设置与终端配对数据（内核只用其中一部分）。
+#[allow(dead_code)]
+mod asr_shared;
 mod platform; // MAC-001+003: Platform abstraction layer
 mod punctuation;
 mod scene;
@@ -10355,6 +10358,8 @@ fn main() -> Result<()> {
             let _ = std::mem::ManuallyDrop::new(file);
         }
     }
+    // ASR-SERVER-491 S4c：识别服务看护（总开关关着时只每秒看一次设置文件的修改时间，不建管道不起进程）。
+    asr_service::supervisor::spawn(Arc::clone(&runtime_config));
     #[cfg(target_os = "windows")]
     run_controller(runtime_config)?;
     #[cfg(target_os = "macos")]

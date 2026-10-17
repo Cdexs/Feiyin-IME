@@ -51,6 +51,15 @@ impl ServiceSettings {
         super::write_atomic(&Self::path(), &bytes)
     }
 
+    /// 内网 `本机地址:端口`（取不到 ⇒ `None`）。本机地址 = 默认路由所在网卡的地址：
+    /// 对公网地址做一次 UDP `connect`（只选路由，不发包）再读本端地址。
+    pub fn lan_endpoint(&self) -> Option<String> {
+        let s = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+        s.connect(("8.8.8.8", 53)).ok()?;
+        let ip = s.local_addr().ok()?.ip();
+        (!ip.is_unspecified()).then(|| format!("{ip}:{}", self.port))
+    }
+
     /// 外网 `主机:端口`（未填 ⇒ `None`）。
     pub fn wan_endpoint(&self) -> Option<String> {
         let host = self.wan_host.trim();

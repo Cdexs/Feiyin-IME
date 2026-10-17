@@ -147,6 +147,12 @@ pub fn run_session(
 | 连接 | 同一连接可依次跑多段 `run-task`（同时只一段）；60 秒无任何消息断开；握手 10 秒超时；单条消息 ≤ 1MB；同时在线连接 ≤ 64 |
 | 防护 | 同一来源 IP 连续 5 次鉴权失败锁 10 分钟（锁定期内连 TLS 都不做） |
 | 进程 | 内核拉起：`feiyin-asr-gateway --core <IPC 端点>`，口令经环境变量 `FEIYIN_ASR_TOKEN`（读后立即清除）；内核断开 ⇒ 网关退出；单线程异步运行时，无模型 |
+| 暂停 | 进行中的识别做完；新的 `run-task` 回 `ServicePaused`；新连接握手回 HTTP 503 `ServicePaused`（不计鉴权失败）；已连接的终端保持连接 |
+| 撤销 | 终端表置撤销 + 该终端所有在线连接立即断开（进行中的识别回 `KeyRevoked` 后断开）。在线登记与撤销在同一把终端表锁下互斥，不会漏踢 |
+
+**内核看护（S4c，`src/asr_service/supervisor.rs`）**：常驻线程每秒看一次 `asr-service.json` 的修改时间。总开关开 ⇒ 建 IPC + 拉起网关（同目录 `feiyin-asr-gateway[.exe]`，Windows 无窗口，网关日志写 `asr-gateway.log`）；网关意外退出 ⇒ 5 秒后重拉；端口改了 ⇒ 整体重启；总开关关 ⇒ 先结束网关再停 IPC，并删 `asr-gateway.json`。不用 Job 对象：网关读到 IPC 断开即退出，内核崩溃不留孤儿进程。
+
+**本机控制通道（S4b，`src/asr_shared/control.rs` + 网关 `ctl.rs`）**：网关启动时把控制端点写进 `asr-gateway.json`（`pid` + 端点；Windows 管道 `\\.\pipe\FeiyinIME.AsrGateway.<pid>`、macOS `$TMPDIR/feiyin-asrgateway-<pid>.sock`，安全措施同 §3）。一次连接一问一答（各一行 JSON）：`status`（暂停否 / 端口 / 指纹 / 在线终端）、`pause`、`resume`、`add_terminal`（回 key、内外网地址、二维码内容）、`revoke{terminal_id}`。**网关运行期间终端表只由网关写**；网关没在运行时设置界面直接读写文件（此时无并发写者）。
 
 ### 5.2 兼容协议（第二期）：千问实时识别风格
 

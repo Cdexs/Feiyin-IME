@@ -14,8 +14,13 @@ mod asr_shared;
 #[allow(dead_code)]
 #[path = "../../asr_service/frame.rs"]
 mod frame;
+// 内核端 IPC 传输（网关只用其中的本机控制通道 `CtlListener`）。
+#[allow(dead_code)]
+#[path = "../../asr_service/transport.rs"]
+mod transport;
 
 mod core_link;
+mod ctl;
 mod tls;
 mod ws;
 
@@ -56,8 +61,9 @@ fn run() -> std::io::Result<()> {
     let (tls, fp) = tls::load_or_create()?;
     log::info!("[asr-gateway] 证书指纹 {fp}");
     let link = core_link::CoreLink::connect(&core, &token)?;
-    let shared = Arc::new(ws::Shared::new(link));
+    let shared = Arc::new(ws::Shared::new(link, settings.port, fp));
     shared.prune();
+    ctl::start(shared.clone())?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

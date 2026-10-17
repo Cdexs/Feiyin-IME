@@ -13,6 +13,7 @@
 mod compose;
 mod frame;
 mod session;
+pub(crate) mod supervisor;
 mod transport;
 
 use std::collections::HashMap;

@@ -89,8 +89,8 @@
 | S2 | 推理通道正式化：远程通道与本机引擎同类型（`create_slot` 返回 `LlamaAsr`，整条精解窗口路径原样复用）；本体由最后一个通道释放；本机优先闸门内置（本机解码 / 对齐登记，远程开解前 + 每生成一个 token 后 + 对齐前让行）；`max_remote_slots` 按空闲显存（留 1GB、每路 150MB、封顶 8；CPU=1）| ✅ 编译通过（调用方在 S3） |
 | S3 | 内核 IPC 服务：命名管道 / Unix socket、帧格式、远程会话（远程差异：关声纹 / 近场门 / 学习 / 本机统计） | ✅ 编译通过；`AsrService::start` 由 S4 接线。差异全部由「角色」带出：远程推理通道 ⇒ 不做声纹；`PreviewRole::Remote` ⇒ 自带 VAD / 关近场门 / 不碰音量沿用 / 本机录音时预览间隔 ×2；不进 `run_pipeline_core` ⇒ 不写统计不学习。模型共享：`Transcriber` 两模型改 `Arc` 登记到 `remote_engines()`；预览解码加进程级锁 |
 | S4 | 网关进程 `feiyin-asr-gateway`：WebSocket `run-task`、内置加密（自签证书 + 指纹）、配对存储（key 10 分钟首次绑定 + 设备代码绑定）、终端名称 / 设备代码、暂停 | ✅ 编译通过：`src/asr_shared/`（设置 + 配对，三方共用）+ `src/bin/feiyin-asr-gateway/`（内核连接 / 证书 / wss 会话）；协议落地细节见设计 §5.1「一期实现」 |
-| S4b | 本机控制通道（设置界面 ↔ 网关）：在线终端列表、暂停 / 恢复、撤销即断开；终端表收口为网关单写者（现为文件读-改-写 + 进程内锁） | ⬜ |
-| S4c | 内核拉起网关：生成口令走环境变量、Windows Job 对象 / macOS 父进程退出联动、异常退出 5 秒重启、按 `asr-service.json` 总开关启停；`AsrService::start` 接线（停服务须先结束网关，否则 `stop()` 等连接） | ⬜ |
+| S4b | 本机控制通道（设置界面 ↔ 网关）：在线终端列表、暂停 / 恢复、添加终端、撤销即断开；网关运行期间终端表只由网关写 | ✅ 编译通过：`asr_shared/control.rs`（协议 + 客户端 `call`，S6 设置界面直接用）+ 网关 `ctl.rs`；暂停语义按 §16.2 改正（进行中做完、新请求 / 新连接拒绝） |
+| S4c | 内核拉起网关：口令走环境变量、异常退出 5 秒重拉、按 `asr-service.json` 总开关启停；`AsrService::start` 接线 | ✅ 编译通过：`asr_service/supervisor.rs`，`main` 进入主循环前起看护线程。不用 Job 对象（网关读到 IPC 断开自退）。停服务先杀网关再停 IPC；`wake()` 补连 `.out` 防卡死。**端到端实测待 S11 参考客户端** |
 | S5 | 统计加终端一维：`usage_sessions.terminal_id`（旧数据默认 local）+ `terminal_sessions` 登录 / 退出表；「我的」页仍只看本机 | ⬜ |
 | S6 | 设置界面「识别服务」页（§16，i18n 三份，复用 card 风格） | ⬜ |
 | S7 | 托盘菜单单项「启动识别服务 / 停止识别服务」按状态自动切换（§16.7，i18n） | ⬜ |

@@ -2800,3 +2800,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 行为变化 | 内核尚未拉起网关（S4c），**现阶段运行时无变化**；构建多产出一个 exe |
 | 对 macOS 的影响 | **编译**：新依赖都是纯 Rust + ring，macOS 可直接编；`core_link.rs` 的 `cfg(unix)` 分支（连内核 Unix socket）与 `tls.rs` 私钥 0600 分支**未在 macOS 编译 / 实测**。`main.rs` 的 `windows_subsystem` 只在 Windows 生效。**监听**：macOS 默认双栈，`[::]` 绑定成功后 `0.0.0.0` 绑定失败属预期（日志 info，不是错误）。**打包**：macOS 安装包需把 `feiyin-asr-gateway` 放在主程序同目录（数据文件按可执行文件目录定位）；签名 / 公证要把它一并签上；首次监听会触发系统「允许传入连接」弹窗 |
 | 是否需要对方同步 | 是：macOS 编译验证 `cargo check --bin feiyin-asr-gateway`；打包脚本加入网关 exe 与签名；S4c 落地后实测内核拉起网关 |
+
+## ASR-SERVER-491 一期 S4b / S4c（2026-10-17，主控）· 控制通道 + 内核拉起网关
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | `src/asr_shared/control.rs`（控制通道协议 + 客户端，设置界面 S6 用）；网关 `ctl.rs`；`asr_service/transport.rs` 新增 `CtlListener`（Windows 双工管道 / macOS `$TMPDIR/feiyin-asrgateway-<pid>.sock` 0600）；`Listener::wake` 在 Windows 上多连一次 `.out`；新文件 `asr_service/supervisor.rs`；`main.rs` 新增 `mod asr_shared;`，并在进入 `run_controller` / `run_controller_macos` **之前**调用 `asr_service::supervisor::spawn` |
+| 行为变化 | `asr-service.json` 不存在或 `enabled=false`（默认）⇒ 只多一个每秒读一次文件修改时间的线程，其余无变化。`enabled=true` ⇒ 内核建 IPC 并拉起同目录网关程序 |
+| 对 macOS 的影响 | **共用代码**：看护线程在 macOS 同样启动（`main` 里平台无关调用）；网关程序名 macOS 为 `feiyin-asr-gateway`（无扩展名），须与主程序同目录（.app 包内 `Contents/MacOS/`）。**未编译 / 未实测**：`CtlListener` 的 unix 分支、`control.rs` 的 unix `connect`、看护线程拉起子进程（沙盒 / 签名环境下子进程须同签名） |
+| 是否需要对方同步 | 是：macOS 编译；打包时把网关放进 `Contents/MacOS/` 并签名；S6 设置页落地后实测启停 / 暂停 / 撤销 |

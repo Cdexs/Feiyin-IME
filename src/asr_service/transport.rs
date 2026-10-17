@@ -30,7 +30,8 @@ fn handshake(reader: &mut dyn Read, token: &str) -> io::Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) use win::Listener;
+#[allow(unused_imports)] // CtlListener 只有网关用（网关以 #[path] 引入本文件）
+pub(crate) use win::{CtlListener, Listener};
 
 #[cfg(target_os = "windows")]
 mod win {
@@ -50,8 +51,8 @@ mod win {
         TOKEN_USER,
     };
     use windows::Win32::Storage::FileSystem::{
-        FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_INBOUND,
-        PIPE_ACCESS_OUTBOUND,
+        FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
+        PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND,
     };
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
@@ -94,11 +95,40 @@ mod win {
             })
         }
 
-        /// 叫醒阻塞在 `accept` 的线程（停服务时用）：自己连一次 `.in`，握手失败即返回。
+        /// 叫醒阻塞在 `accept` 的线程（停服务时用）：自己连一次 `.in`（在等它 ⇒ 握手失败返回），
+        /// 再连一次 `.out`（网关连了 `.in` 后、连 `.out` 前被结束 ⇒ 卡在等 `.out`，靠这一下返回）。
         pub(crate) fn wake(&self) {
             let _ = std::fs::OpenOptions::new()
                 .write(true)
                 .open(format!("{}.in", self.base));
+            let _ = std::fs::OpenOptions::new()
+                .read(true)
+                .open(format!("{}.out", self.base));
+        }
+    }
+
+    /// 本机控制通道（S4b，网关 ↔ 设置界面）：双工管道，一次连接一问一答。安全措施同上。
+    pub(crate) struct CtlListener {
+        name: String,
+    }
+
+    impl CtlListener {
+        pub(crate) fn bind(tag: &str) -> io::Result<Self> {
+            Ok(Self {
+                name: format!(r"\\.\pipe\FeiyinIME.{tag}.{}", std::process::id()),
+            })
+        }
+
+        pub(crate) fn endpoint(&self) -> &str {
+            &self.name
+        }
+
+        /// 建一个管道实例并等客户端连上（同一时刻只一个实例，客户端忙时重试）。
+        pub(crate) fn accept(&self) -> io::Result<File> {
+            let sa = OwnerOnly::new()?;
+            let p = create_pipe(&self.name, PIPE_ACCESS_DUPLEX, &sa)?;
+            wait_client(&p)?;
+            Ok(p)
         }
     }
 
@@ -220,7 +250,8 @@ mod win {
 }
 
 #[cfg(unix)]
-pub(crate) use unix::Listener;
+#[allow(unused_imports)] // CtlListener 只有网关用（网关以 #[path] 引入本文件）
+pub(crate) use unix::{CtlListener, Listener};
 
 #[cfg(unix)]
 mod unix {
@@ -265,6 +296,40 @@ mod unix {
     }
 
     impl Drop for Listener {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// 本机控制通道（S4b）：`$TMPDIR/feiyin-<tag>-<pid>.sock`，0600。
+    pub(crate) struct CtlListener {
+        path: PathBuf,
+        inner: UnixListener,
+    }
+
+    impl CtlListener {
+        pub(crate) fn bind(tag: &str) -> io::Result<Self> {
+            let path = std::env::temp_dir().join(format!(
+                "feiyin-{}-{}.sock",
+                tag.to_ascii_lowercase(),
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            let inner = UnixListener::bind(&path)?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            Ok(Self { path, inner })
+        }
+
+        pub(crate) fn endpoint(&self) -> &str {
+            self.path.to_str().unwrap_or_default()
+        }
+
+        pub(crate) fn accept(&self) -> io::Result<UnixStream> {
+            Ok(self.inner.accept()?.0)
+        }
+    }
+
+    impl Drop for CtlListener {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);
         }

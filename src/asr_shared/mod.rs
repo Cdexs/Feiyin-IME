@@ -3,6 +3,7 @@
 //! 各方用 `#[path]` 引入同一份源码（网关、设置界面是独立程序）。数据放可执行文件同目录
 //!（与词库、使用统计同规则），**不进 `config.toml`**（设计 §8.8：用户升级可能整份替换配置）。
 
+pub mod control;
 pub mod pairing;
 pub mod settings;
 

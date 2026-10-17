@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -18,15 +19,17 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::watch;
+use tokio::sync::Notify;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::asr_shared::control::{Added, Online, Status};
 use crate::asr_shared::now_ts;
-use crate::asr_shared::pairing::{AuthError, TerminalStore};
+use crate::asr_shared::pairing::{pair_uri, AuthError, TerminalStore};
+use crate::asr_shared::settings::ServiceSettings;
 use crate::core_link::CoreLink;
 use crate::frame::{EndPayload, Frame, Kind, OpenParams, ResultPayload, MAX_FRAME};
 
@@ -39,11 +42,26 @@ const FAILS_CAP: usize = 4096;
 
 pub struct Shared {
     pub core: CoreLink,
-    /// 暂停（设计 §16.2：只在内存里，重启恢复运行）。S4b 控制通道改它。
-    pub paused: watch::Sender<bool>,
+    /// 监听端口与证书指纹（控制通道「状态」/「添加终端」用）。
+    pub port: u16,
+    pub fingerprint: String,
+    /// 暂停（设计 §16.2：只在内存里，重启恢复运行）：进行中的识别做完；新的 `run-task` 回
+    /// `ServicePaused`；新连接握手回 503。
+    paused: AtomicBool,
     lockout: Lockout,
-    /// 终端表「读-改-写」串行（文件同时被设置界面写，S4b 再收口到单写者）。
+    /// 终端表「读-改-写」串行。网关运行期间终端表只由网关写（设置界面经控制通道）。
     store: Mutex<()>,
+    /// 已通过终端鉴权的在线连接（连接号 ⇒ 信息）。
+    online: Mutex<HashMap<u64, OnlineConn>>,
+    next_conn: AtomicU64,
+}
+
+struct OnlineConn {
+    terminal_id: String,
+    net: &'static str,
+    login_ts: i64,
+    /// 撤销时叫醒该连接让它断开。
+    kick: Arc<Notify>,
 }
 
 #[derive(Default)]
@@ -88,13 +106,93 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl Shared {
-    pub fn new(core: CoreLink) -> Self {
+    pub fn new(core: CoreLink, port: u16, fingerprint: String) -> Self {
         Self {
             core,
-            paused: watch::channel(false).0,
+            port,
+            fingerprint,
+            paused: AtomicBool::new(false),
             lockout: Lockout::default(),
             store: Mutex::default(),
+            online: Mutex::default(),
+            next_conn: AtomicU64::new(1),
         }
+    }
+
+    fn paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    pub fn set_paused(&self, p: bool) {
+        self.paused.store(p, Ordering::Relaxed);
+        log::info!("[asr-gateway] {}", if p { "已暂停" } else { "已继续" });
+    }
+
+    /// 在线终端（同一终端多条连接只列一次，取最早登录）。
+    pub fn status(&self) -> Status {
+        let mut by_id: HashMap<&str, Online> = HashMap::new();
+        let map = lock(&self.online);
+        for c in map.values() {
+            let e = by_id.entry(&c.terminal_id).or_insert_with(|| Online {
+                terminal_id: c.terminal_id.clone(),
+                net: c.net.to_string(),
+                login_ts: c.login_ts,
+            });
+            if c.login_ts < e.login_ts {
+                e.login_ts = c.login_ts;
+                e.net = c.net.to_string();
+            }
+        }
+        let mut online: Vec<Online> = by_id.into_values().collect();
+        online.sort_by_key(|o| o.login_ts);
+        Status {
+            paused: self.paused(),
+            port: self.port,
+            fingerprint: self.fingerprint.clone(),
+            online,
+        }
+    }
+
+    /// 添加终端：生成 key 并给出二维码内容（外网地址每次从设置文件现读，设置页改了立即生效）。
+    pub fn add_terminal(&self) -> std::io::Result<Added> {
+        let now = now_ts();
+        let (terminal_id, key) = self.with_store_io(|st| {
+            st.prune_expired(now);
+            st.create(now)
+        })?;
+        let settings = ServiceSettings {
+            port: self.port,
+            ..ServiceSettings::load()
+        };
+        let lan = settings.lan_endpoint().unwrap_or_default();
+        let wan = settings.wan_endpoint().unwrap_or_default();
+        let uri = pair_uri(
+            &lan,
+            (!wan.is_empty()).then_some(wan.as_str()),
+            &key,
+            &self.fingerprint,
+        );
+        Ok(Added {
+            terminal_id,
+            key,
+            lan,
+            wan,
+            uri,
+        })
+    }
+
+    /// 撤销：key 作废 + 该终端所有在线连接断开。返回是否找到该终端。
+    pub fn revoke(&self, terminal_id: &str) -> bool {
+        let found = self.with_store(|st| {
+            let exists = st.get_mut(terminal_id).is_some();
+            (exists, st.revoke(terminal_id))
+        });
+        for c in lock(&self.online).values() {
+            if c.terminal_id == terminal_id {
+                c.kick.notify_one();
+            }
+        }
+        found
     }
 
     fn locked_out(&self, ip: IpAddr) -> bool {
@@ -122,6 +220,18 @@ impl Shared {
             }
         }
         r
+    }
+
+    /// 同上，但修改步骤可能失败（失败不落盘）。
+    fn with_store_io<R>(
+        &self,
+        f: impl FnOnce(&mut TerminalStore) -> std::io::Result<R>,
+    ) -> std::io::Result<R> {
+        let _g = lock(&self.store);
+        let mut st = TerminalStore::load();
+        let r = f(&mut st)?;
+        st.save()?;
+        Ok(r)
     }
 
     /// 启动时清掉过期未绑定的 key。
@@ -182,6 +292,10 @@ pub async fn serve_conn(
         tokio_tungstenite::accept_hdr_async_with_config(
             tls,
             |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+                if sh.paused() {
+                    // 暂停中不接受新终端接入（§16.2）；不算鉴权失败。
+                    return Err(reject(StatusCode::SERVICE_UNAVAILABLE, "ServicePaused"));
+                }
                 let Some(k) = bearer(req) else {
                     sh.fail(ip);
                     return Err(reject(
@@ -214,10 +328,13 @@ pub async fn serve_conn(
         _ => return,
     };
     let Some(key) = key else { return };
+    let conn_id = shared.next_conn.fetch_add(1, Ordering::Relaxed);
     Conn {
         shared,
         ip,
         key,
+        conn_id,
+        kick: Arc::new(Notify::new()),
         terminal: None,
         task: None,
     }
@@ -235,6 +352,8 @@ struct Conn {
     shared: Arc<Shared>,
     ip: IpAddr,
     key: String,
+    conn_id: u64,
+    kick: Arc<Notify>,
     /// 鉴权通过后的终端内部编号（首个 `run-task` 时确定；之后同一连接沿用）。
     terminal: Option<String>,
     task: Option<Task>,
@@ -297,7 +416,7 @@ async fn next_core(task: &mut Option<Task>) -> Option<Frame> {
 
 impl Conn {
     async fn run(mut self, mut ws: Ws) {
-        let mut paused = self.shared.paused.subscribe();
+        let kick = self.kick.clone();
         let mut deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
         loop {
             let ok = tokio::select! {
@@ -312,12 +431,12 @@ impl Conn {
                     Some(f) => self.on_core(&mut ws, f).await,
                     None => false, // 路由没了（内核那边出问题）
                 },
-                Ok(()) = paused.changed() => {
-                    if *paused.borrow_and_update() {
-                        self.abort(&mut ws, "ServicePaused", "service paused").await
-                    } else {
-                        true
+                // 撤销配对：立即断开（进行中的识别一并取消）。
+                _ = kick.notified() => {
+                    if let Some(t) = &self.task {
+                        let _ = ws.send(failed(&t.id, AuthError::Revoked.code(), "terminal revoked")).await;
                     }
+                    false
                 }
                 _ = tokio::time::sleep_until(deadline) => false,
             };
@@ -327,6 +446,7 @@ impl Conn {
         }
         self.cancel_task();
         let _ = ws.close(None).await;
+        lock(&self.shared.online).remove(&self.conn_id);
         if let Some(id) = &self.terminal {
             self.shared.with_store(|st| match st.get_mut(id) {
                 Some(t) => {
@@ -345,15 +465,6 @@ impl Conn {
                 .send(Frame::new(Kind::Cancel, t.session, Vec::new()));
             self.shared.core.close(t.session);
         }
-    }
-
-    /// 取消进行中的任务并回 `task-failed`（连接保留）。
-    async fn abort(&mut self, ws: &mut Ws, code: &str, msg: &str) -> bool {
-        let Some(id) = self.task.as_ref().map(|t| t.id.clone()) else {
-            return true;
-        };
-        self.cancel_task();
-        ws.send(failed(&id, code, msg)).await.is_ok()
     }
 
     async fn on_client(&mut self, ws: &mut Ws, m: Message) -> bool {
@@ -418,7 +529,7 @@ impl Conn {
                 .await
                 .is_ok();
         }
-        if *self.shared.paused.borrow() {
+        if self.shared.paused() {
             return ws
                 .send(fail("ServicePaused", "service paused"))
                 .await
@@ -467,7 +578,9 @@ impl Conn {
         let now = now_ts();
         let net = net_kind(self.ip);
         let first = self.terminal.is_none();
-        let r = self.shared.with_store(|st| {
+        let shared = &self.shared;
+        let (conn_id, kick) = (self.conn_id, &self.kick);
+        let r = shared.with_store(|st| {
             match st.authorize(&self.key, device_id, device_name, now) {
                 Ok((id, mut dirty)) => {
                     if first {
@@ -476,6 +589,16 @@ impl Conn {
                             t.last_net = net.to_string();
                             dirty = true;
                         }
+                        // 在终端表锁内登记在线：与「撤销」互斥，不会出现撤销后才登记、踢不掉的连接。
+                        lock(&shared.online).insert(
+                            conn_id,
+                            OnlineConn {
+                                terminal_id: id.clone(),
+                                net,
+                                login_ts: now,
+                                kick: kick.clone(),
+                            },
+                        );
                     }
                     (Ok(id), dirty)
                 }
