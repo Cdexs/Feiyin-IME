@@ -508,3 +508,4 @@ worker 返回时 drop 局部 `cached_translation` ⇒ 触发 `translator_destroy
 | [CT-PUNCT-KOJA-464] | 产品标点模型 CT-Transformer（中英词表）对韩文会**吃光空格**、对日文只补句末「。」。凡把识别结果送它之前，含假名 / 谚文一律跳过（`punctuation::ct_unsupported_script`）。另：SenseVoice 的标点与 ITN 是同一个开关（withitn/woitn），开标点必然开 ITN（「二比一」→「2B1」），不能单开标点 |
 | [INT8-ORT-NUMERICS-466] | 同一 int8 量化 ONNX 模型、同一输入，ONNX Runtime 1.28.2 与 1.30 在**分数接近**的位置可能给出不同类别（日韩标点 35 处差 1 处）。判据：移植对照先逐个比分词 id 与每处预测，只差个别近似并列点 ⇒ 运行库数值差而非移植偏差；测试只断言稳定部分，勿逐字死比 |
 | [OVERLAY-STALE-AUTOCLOSE-485] | 浮层是单窗口：自动关的提示 `SetTimer` 后，不自动关的新浮层（录音 / 预览）若不 `KillTimer`，计时到点会把新浮层关掉（提示后 1.5s 内开录必现）。判据：Show `auto_close_ms == 0` 必撤旧计时 |
+| [BUILD-ENV-SHERPA-491] | `build.bat` 设 `SHERPA_ONNX_LIB_DIR`（vendor sherpa 1.12.38），出包指南的 `cargo build --release` 不设（crate 实际 1.13.8）。两种环境交替跑 ⇒ 构建脚本输入变化，sherpa-onnx-sys + 全部 bin 重编，target 与 Publish 脱钩，且可能链接到版本不符的库。判据：出包与任何复跑**只按指南、不设该变量**；「重放告警」前先确认环境与出包时完全一致 |

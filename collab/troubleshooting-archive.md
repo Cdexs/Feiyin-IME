@@ -5472,3 +5472,9 @@ TEST-SYNC-420 给 `fix_reflow_raw_base_420_tests` 加 `fn_body` helper，内含 
 - **现象（代码审查发现，未在端测出现）**：浮层是单个 Win32 窗口。带 `auto_close_ms > 0` 的提示（Info / Error）会 `SetTimer(hwnd, 1, …)`；之后若来一个不自动关的 Show（录音窗 / 预览 / 加载提示，`auto_close_ms == 0`），旧代码**不撤计时** ⇒ 计时到点 `WM_TIMER` 无条件 `KillTimer + 清请求 + SW_HIDE`，把录音窗关掉。触发条件：提示弹出后 1.5s 内开录。SC-LLM-485 的快捷方式提示让这个窗口期变得常见（按快捷方式 → 立刻开说）。
 - **修复**：Show 处理里 `auto_close_ms == 0` ⇒ `KillTimer(hwnd, 1)`（`src/main.rs` overlay Show 分支）。
 - **判据**：凡单窗口复用 + 计时器自动关闭的浮层，新内容出现时必须撤销旧内容的计时；新增「会自动关」的提示前先查这一条。
+
+## [BUILD-ENV-SHERPA-491] build.bat 与出包指南的 sherpa 环境变量不一致，复跑触发整体重编（2026-10-18）
+
+- **现象**：BUILD-491 由 tester-1 按指南构建并同步 Publish 后，主控为统计告警数照 `build.bat` 设 `SHERPA_ONNX_LIB_DIR=vendor\sherpa-onnx-v1.12.38…\lib` 再跑 `cargo build --release`，本以为是零编译「重放」，实际 sherpa-onnx-sys 1.13.8 + voice-ime 全部重编（3 分钟），target/release 三个 exe 被覆盖、与 Publish 不一致；且该次链接的库版本（1.12.38）与 crate（1.13.8）不符，产物不可用。
+- **处理**：子 Agent 在清空该变量的环境下按指南重编，重新同步 Publish 并完整复核九项。
+- **判据**：出包、复跑、统计告警一律按 `collab/build-test-guide.md` 的命令与环境，**不设** `SHERPA_ONNX_LIB_DIR`；`build.bat` 的该行属历史遗留（待 Gavin 定是否删改）。cargo 的构建脚本对 `rerun-if-env-changed` 变量敏感，环境任何差异都不是「重放」。
