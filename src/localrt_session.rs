@@ -2,7 +2,8 @@
 //!
 //! 职责：收 `transcribe_streaming_local` 派发的切片 / 长静默信号 ⇒ 组窗（含前文后缀、末尾窗）⇒ 投解码池
 //! （1.7B 精解 + 0.6B 强制对齐）⇒ 406 / 声纹 / 远场兜底 ⇒ `OrderedReflow` 有序拼接（按逐字时间）⇒
-//! 经 `acc_event_tx` 发 `PreviewReflow` 回灌 ⇒ 结束时返回（定稿前缀, 最新窗口文本, all_native, 总解码 ms, 声纹全剔）。
+//! 经 `acc_event_tx` 发 `PreviewReflow` 回灌 ⇒ 结束时返回（定稿前缀, 最新窗口文本, all_native, 总解码 ms, 声纹全剔,
+//! 远程会话的全文逐字时间）。
 //!
 //! 搬出的目的：本机录音会话与远程终端会话（DEC-111）共用**同一份**窗口逻辑，禁止复制第二份。
 //! 函数体与搬出前逐字相同（只把闭包捕获改成参数），本机路径行为不变。
@@ -21,7 +22,7 @@ pub(crate) fn run_acc_windows(
     acc_script: config::ChineseScript,
     acc_event_tx: crossbeam_channel::Sender<PipelineEvent>,
     session_generation: u64,
-) -> (String, String, bool, f64, bool) {
+) -> (String, String, bool, f64, bool, AccTimes) {
     // ── SLIDING-WINDOW-367：滑动窗口（当前片+前1~3，12s 封顶）──
     // （阶段四·B）窗口解码投**并发池**（默认并发度 2，设 1 退顺序），
     // 结果按 window_seq **有序定稿**（对齐状态机串行）。
@@ -81,6 +82,10 @@ pub(crate) fn run_acc_windows(
     // LOCALRT-PREVIEW-HIDE-NONUSER-429：最近一次「已定稿权威全文」
     //（`OrderedReflow` 产出），供 full_drop 窗剔除合成使用。
     let mut last_authoritative = String::new();
+    // ASR-SERVER-491 S9：远程会话才算逐字时间（随回灌带出、收尾返回）；本机恒不算 ⇒ 行为与开销不变。
+    let timed = recognizer.is_remote();
+    // S9：与 `last_authoritative` 逐字对应的时间（full_drop 窗复用上一份权威全文时一并复用）。
+    let mut last_authoritative_times: AccTimes = None;
     let concurrency = transcription::WINDOW_DECODE_CONCURRENCY.max(1);
     let terms = acc_terms.as_deref();
 
@@ -181,7 +186,10 @@ pub(crate) fn run_acc_windows(
                                                         };
                                                         // PIPE-SPEED-457 ②：已松键且本窗是最后一窗 ⇒ 不对齐（最终结果不等这 ~0.25s；
                                                         // 该接缝按上一窗逐字时间切，456 半截结果同一路径）。
-                                                        if seq + 1 == final_windows.load(Ordering::Acquire) {
+                                                        // ASR-SERVER-491 S9（T2）：远程会话要最后一句的逐字时间 ⇒ 照常对齐（本机不变）。
+                                                        if !recognizer.is_remote()
+                                                            && seq + 1 == final_windows.load(Ordering::Acquire)
+                                                        {
                                                             log::debug!("[PIPE-457] last window: skip align seq={}", seq);
                                                             continue;
                                                         }
@@ -267,8 +275,8 @@ pub(crate) fn run_acc_windows(
                                                             let out = probe.push_window_timed(
                                                                 seq, ws, we, smp, partial, None, win_abs_start, win_split_abs,
                                                             );
-                                                            if let Some(candidate) = out.last() {
-                                                                let candidate = apply_authoritative_filler_dedup(candidate);
+                                                            if let Some(raw_candidate) = out.last() {
+                                                                let candidate = apply_authoritative_filler_dedup(raw_candidate);
                                                                 let cand_len = candidate.chars().count();
                                                                 let shown = partial_shown_len
                                                                     .max(last_authoritative.chars().count());
@@ -298,6 +306,10 @@ pub(crate) fn run_acc_windows(
                                                                             .copied()
                                                                             .unwrap_or(false),
                                                                         has_hole: false,
+                                                                        // S9：半截结果本身无时间（`None` 字由会话侧估算）。
+                                                                        acc_times: timed.then(|| {
+                                                                            acc_times_for(raw_candidate, probe.full_times(), &candidate)
+                                                                        }),
                                                                         acc_text: candidate,
                                                                         replace_all: true,
                                                                         decode_done_at: None,
@@ -577,8 +589,22 @@ pub(crate) fn run_acc_windows(
                                 // REFLOW-FILLER-ONCE-441：回灌**前**去重（此处文本 = 对齐后的
                                 // 权威全文 `committed + last_window`）；下方 `last_authoritative`
                                 // （全剔窗复用）与 `acc_text` 同取这一份已去重文本。
+                                // S9：只有「拼接器当前全文」才取得到时间（一次排空多窗时，中间几条无时间）。
+                                // 只有远程才留一份去重前原文（本机不多一次拷贝）。
+                                let raw = if timed {
+                                    ordered
+                                        .timed_snapshot(&authoritative)
+                                        .map(|t| (authoritative.clone(), t))
+                                } else {
+                                    None
+                                };
                                 let authoritative =
                                     apply_authoritative_filler_dedup(&authoritative);
+                                let acc_times = timed.then(|| match raw {
+                                    Some((r, t)) => acc_times_for(&r, t, &authoritative),
+                                    None => vec![None; authoritative.chars().count()],
+                                });
+                                last_authoritative_times = acc_times.clone();
                                 // 382（3A）：边界未到时的 fallback = 派发当刻浮层字符数。
                                 let fallback_committed = window_committed_lens
                                                             .get(seq)
@@ -599,6 +625,7 @@ pub(crate) fn run_acc_windows(
                                                                         .unwrap_or(false),
                                                                 has_hole: false,
                                                                 acc_text: authoritative,
+                                                                acc_times,
                                                                 replace_all: true,
                                                                 // 382（3C）：本窗解码完成时刻（端到端埋点）。
                                                                 decode_done_at: Some(decode_done_at),
@@ -627,6 +654,7 @@ pub(crate) fn run_acc_windows(
                                                                 boundary_usable: true,
                                                                 has_hole: false,
                                                                 acc_text: last_authoritative.clone(),
+                                                                acc_times: last_authoritative_times.clone(),
                                                                 replace_all: true,
                                                                 decode_done_at: Some(decode_done_at),
                                                                 non_user_hide: true,
@@ -662,8 +690,16 @@ pub(crate) fn run_acc_windows(
                     refine_meta = None;
                     let abs: Vec<(f32, f32)> =
                         times.iter().map(|&(a, b)| (abs0 + a, abs0 + b)).collect();
-                    if let Some(full) = ordered.refine_times(seq, abs) {
-                        let full = apply_authoritative_filler_dedup(&full);
+                    if let Some(raw_full) = ordered.refine_times(seq, abs) {
+                        let full = apply_authoritative_filler_dedup(&raw_full);
+                        // S9：重拼后时间才齐。文字没变不另发回灌（回灌节奏逐位不变），
+                        // 时间留到下一次回灌 / 收尾 `finish_timed` 带出。
+                        let acc_times =
+                            timed.then(|| acc_times_for(&raw_full, ordered.full_times(), &full));
+                        if timed {
+                            // 同一段文字的更准时间 ⇒ full_drop 窗复用时也拿这份。
+                            last_authoritative_times = acc_times.clone();
+                        }
                         if full != last_authoritative {
                             if log::log_enabled!(log::Level::Debug) {
                                 log::debug!(
@@ -685,6 +721,7 @@ pub(crate) fn run_acc_windows(
                                     .unwrap_or(false),
                                 has_hole: false,
                                 acc_text: full,
+                                acc_times,
                                 replace_all: true,
                                 decode_done_at: None,
                                 non_user_hide: false,
@@ -1251,13 +1288,49 @@ pub(crate) fn run_acc_windows(
         // 380：收尾 drain 之后不再有派发 ⇒ 产出率均值无人再读（原实现
         // 亦不在 drain 累计）。显式消费，避免 `unused_assignments` 假红。
         let _ = (rate_sum_chars, rate_sum_secs, rate_windows);
-        let (committed, last_window_text) = ordered.finish();
+        // S9：远程会话带出全文逐字时间（虚拟时间轴；会话侧换算成录音时间、搬运到终稿）。
+        let (committed, last_window_text, raw_times) = ordered.finish_timed();
+        let final_times: AccTimes = timed.then(|| {
+            raw_times
+                .into_iter()
+                .map(|o| o.map(aligned_char_time))
+                .collect()
+        });
         (
             committed,
             last_window_text,
             all_native,
             total_decode_ms,
             voiceprint_dropped_all(vp_kept_secs, vp_dropped_secs),
+            final_times,
         )
     })
+}
+
+/// ASR-SERVER-491 S9：远程会话随回灌 / 收尾带出的逐字时间（虚拟时间轴；本机恒 `None`）。
+pub(crate) type AccTimes = Option<Vec<Option<transcription::char_times::CharTime>>>;
+
+fn aligned_char_time((begin, end): (f32, f32)) -> transcription::char_times::CharTime {
+    transcription::char_times::CharTime {
+        begin,
+        end,
+        src: transcription::char_times::TsSource::Aligned,
+    }
+}
+
+/// S9（T6）：拼接器全文 `raw` 的逐字对齐时间 ⇒ 回灌文本 `shown`（去口水重复后）的逐字时间。
+fn acc_times_for(
+    raw: &str,
+    times: Vec<Option<(f32, f32)>>,
+    shown: &str,
+) -> Vec<Option<transcription::char_times::CharTime>> {
+    let t: Vec<_> = times
+        .into_iter()
+        .map(|o| o.map(aligned_char_time))
+        .collect();
+    if raw == shown {
+        t
+    } else {
+        transcription::char_times::transfer(raw, &t, shown)
+    }
 }

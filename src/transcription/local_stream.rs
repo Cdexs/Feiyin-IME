@@ -28,6 +28,7 @@ use sherpa_onnx::{
     OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineSenseVoiceModelConfig,
 };
 
+use super::char_times::{CharTime, SliceMap};
 use super::qwen_inference::{StreamingAsrState, WordTiming};
 use super::vad::{VadSegmenter, LOCALRT_VAD_MIN_SILENCE_SECS};
 use crate::punctuation::{strip_trailing_punctuation, PunctuationEngine};
@@ -60,7 +61,57 @@ pub(crate) enum PreviewRole<'a> {
     Local,
     /// 远程终端：自带 VAD（`None` = 音量兜底）、关近场门、不读写本机音量沿用；
     /// 本机正在录音时重解间隔放宽一倍（让 CPU 给本机）。
-    Remote { vad: Option<&'a VadSegmenter> },
+    /// S9：`slices` 逐片记下派发片的录音位置（精解时间换算成录音时间用）；预览另带每字粗略时间。
+    Remote {
+        vad: Option<&'a VadSegmenter>,
+        slices: &'a Mutex<SliceMap>,
+    },
+}
+
+/// ASR-SERVER-491 S9：登记一次派发的各片录音位置（`spans[k] = (pcm_start, pcm_end, pad_before)`，与 `padded` 一一对应）。
+/// 必须在 `on_segment` **之前**调用 ⇒ 精解回灌到达会话时映射已就绪。本机 `None` ⇒ 不记。
+fn record_slices(
+    log: Option<&Mutex<SliceMap>>,
+    padded: &[Vec<f32>],
+    spans: &[(usize, usize, usize)],
+) {
+    let Some(log) = log else { return };
+    let mut m = log.lock().unwrap_or_else(|e| e.into_inner());
+    for (seg, &(ps, pe, pb)) in padded.iter().zip(spans) {
+        m.push(seg.len(), ps, pe, pb);
+    }
+}
+
+/// ASR-SERVER-491 S9（T5）：远程预览每字一条 `WordTiming`（SenseVoice 粗略时间，录音毫秒）。
+/// `raw` = 显示缓存裸文本（已确认区 + 当前句），`display` = 实际显示（远程无标点模型 ⇒ 通常同 `raw`）。
+/// 时间与 `raw` 字数对不上 ⇒ 空表（会话侧按估算补）。
+fn rough_preview_words(
+    raw: &str,
+    display: &str,
+    confirmed: &[CharTime],
+    current: &[CharTime],
+) -> Vec<WordTiming> {
+    use super::char_times::{fill_missing, transfer};
+    if confirmed.len() + current.len() != raw.chars().count() {
+        return Vec::new();
+    }
+    let times: Vec<Option<CharTime>> = confirmed.iter().chain(current).copied().map(Some).collect();
+    let hi = times.last().and_then(|t| t.as_ref()).map_or(0.0, |t| t.end);
+    let times = if raw == display {
+        times
+    } else {
+        transfer(raw, &times, display)
+    };
+    display
+        .chars()
+        .zip(fill_missing(&times, 0.0, hi))
+        .map(|(c, t)| WordTiming {
+            begin_time: (t.begin * 1000.0).round() as i64,
+            end_time: (t.end * 1000.0).round() as i64,
+            text: c.to_string(),
+            punctuation: String::new(),
+        })
+        .collect()
 }
 
 /// ASR-SERVER-491：预览模型解码锁（本机与远程共用同一实例）。
@@ -1507,7 +1558,12 @@ pub fn transcribe_streaming_local(
     let _vad_guard = (!is_remote).then(|| localrt_vad_session(&super::model_dir()));
     let session_vad: Option<&VadSegmenter> = match role {
         PreviewRole::Local => _vad_guard.as_ref().and_then(|g| g.vad.as_ref()),
-        PreviewRole::Remote { vad } => vad,
+        PreviewRole::Remote { vad, .. } => vad,
+    };
+    // ASR-SERVER-491 S9：派发片录音位置登记处（本机 `None` ⇒ 不记）。
+    let slice_log = match &role {
+        PreviewRole::Remote { slices, .. } => Some(*slices),
+        PreviewRole::Local => None,
     };
     let vad_on = session_vad.is_some();
     if log::log_enabled!(log::Level::Debug) {
@@ -1570,6 +1626,9 @@ pub fn transcribe_streaming_local(
     let mut sim_stable: usize = 0;
     // 当前句结果逐 token 的 `(起始秒, 结束字节)`（442 回看按切点时间切分用；对不上 ⇒ 空）。
     let mut sim_marks: Vec<(f32, usize)> = Vec::new();
+    // ASR-SERVER-491 S9（T5，仅远程）：当前句 / 已确认区每字粗略时间（录音秒），与 `sim_hyp` / 显示缓存已确认区逐字对应。
+    let mut sim_times: Vec<CharTime> = Vec::new();
+    let mut rough_confirmed: Vec<CharTime> = Vec::new();
     // 当前句末尾连续无人声（VAD）时长 ⇒ 句末冻结。
     let mut sim_silence_ms: f32 = 0.0;
     // 上次回调给显示层的浅色尾巴字数（文本不变、只是尾巴变稳也要刷新）。
@@ -1726,6 +1785,14 @@ pub fn transcribe_streaming_local(
                     );
                 }
                 sim_hyp = text;
+                if is_remote {
+                    sim_times = super::char_times::rough_from_marks(
+                        &sim_hyp,
+                        &sim_marks,
+                        sim_start as f32 / SAMPLE_RATE as f32,
+                        (pcm.len() - sim_start) as f32 / SAMPLE_RATE as f32,
+                    );
+                }
                 state.on_result(sentence_id, &sim_hyp, false, &[]);
                 display_cache.on_current(&sim_hyp);
             }
@@ -1745,6 +1812,7 @@ pub fn transcribe_streaming_local(
             if !sim_hyp.is_empty() {
                 state.on_result(sentence_id, &sim_hyp, true, &[]);
                 display_cache.on_confirm(&sim_hyp);
+                rough_confirmed.append(&mut sim_times);
                 sentence_id += 1;
             }
         }};
@@ -1766,6 +1834,7 @@ pub fn transcribe_streaming_local(
             }
             sim_hyp.clear();
             sim_marks.clear();
+            sim_times.clear();
             sim_stable = 0;
             sim_start = next;
             sim_decoded_end = next;
@@ -1853,7 +1922,12 @@ pub fn transcribe_streaming_local(
                             display
                         );
                     }
-                    on_result(&display, &state.display_words(), tentative);
+                    let words = if is_remote {
+                        rough_preview_words(raw_full, &display, &rough_confirmed, &sim_times)
+                    } else {
+                        state.display_words()
+                    };
+                    on_result(&display, &words, tentative);
                     last_tentative = tentative;
                     last_display = display;
                     // PREVIEW-PUNCT-LIVE-438（R1）：与 last_display **同刻**记录其覆盖的 raw 字节长，
@@ -2186,6 +2260,7 @@ pub fn transcribe_streaming_local(
                         );
                     }
                 }
+                record_slices(slice_log, &padded, &spans);
                 on_segment(
                     acc_seg_index,
                     committed_len,
@@ -2306,10 +2381,14 @@ pub fn transcribe_streaming_local(
                             &sim_hyp,
                             raw_at.saturating_sub(display_cache.confirmed().len()),
                         );
+                        // S9（T5）：粗略时间随文字一分为二（本机 `sim_times` 恒空）。
+                        let tail_times = sim_times
+                            .split_off(sim_hyp[..cut_in_hyp].chars().count().min(sim_times.len()));
                         let tail = sim_hyp.split_off(cut_in_hyp);
                         sim_stable = sim_stable.saturating_sub(cut_in_hyp).min(tail.len());
                         sim_confirm!();
                         sim_hyp = tail;
+                        sim_times = tail_times;
                         state.on_result(sentence_id, &sim_hyp, false, &[]);
                         display_cache.on_current(&sim_hyp);
                         // 新句 = [cut, now)，仍在说话 ⇒ 下一 chunk 即重解。
@@ -2324,6 +2403,7 @@ pub fn transcribe_streaming_local(
                             &speech_timeline,
                             &spans,
                         );
+                        record_slices(slice_log, &padded, &spans);
                         on_segment(
                             acc_seg_index,
                             committed_len,
@@ -2433,6 +2513,7 @@ pub fn transcribe_streaming_local(
             // VAD-393（A2/R1）：尾片前已 `flush_speech` ⇒ 无进行中段 ⇒ `mid_speech=false`
             //（`vad_on=false` ⇒ None，回退 391 自跑 VAD，与中途派发同口径）。
             let slice_ranges = dispatch_slice_ranges(vad_on, false, None, &speech_timeline, &spans);
+            record_slices(slice_log, &padded, &spans);
             on_segment(
                 acc_seg_index,
                 committed_len,
@@ -2489,7 +2570,12 @@ pub fn transcribe_streaming_local(
         if !display.is_empty() {
             // 录音结束 = 全部已定 ⇒ 浅色尾巴清零。
             if display != last_display || last_tentative != 0 {
-                on_result(&display, &state.display_words(), 0);
+                let words = if is_remote {
+                    rough_preview_words(raw_full, &display, &rough_confirmed, &sim_times)
+                } else {
+                    state.display_words()
+                };
+                on_result(&display, &words, 0);
             }
             final_preview = display;
         }
@@ -5083,6 +5169,100 @@ mod tests {
             !seed_usable("mic", Duration::from_secs(1), "other"),
             "换设备 ⇒ false"
         );
+    }
+
+    // ========================================================================
+    // ASR-SERVER-491 S9：预览粗略逐字时间 / 派发片录音位置登记
+    // ========================================================================
+
+    fn rough(b: f32, e: f32) -> super::CharTime {
+        super::CharTime {
+            begin: b,
+            end: e,
+            src: super::super::char_times::TsSource::Rough,
+        }
+    }
+
+    /// S9（T5）：字数对得上 ⇒ 每个显示字一条 `WordTiming`，毫秒 = round(秒 × 1000)，一字一词、无标点。
+    #[test]
+    fn s9_rough_preview_words_one_per_display_char() {
+        let confirmed = [rough(0.0, 0.2504), rough(0.2504, 0.5)];
+        let current = [rough(0.5, 0.7496)];
+        let w = super::rough_preview_words("你好吗", "你好吗", &confirmed, &current);
+        assert_eq!(w.len(), 3);
+        assert_eq!((w[0].begin_time, w[0].end_time), (0, 250));
+        assert_eq!((w[1].begin_time, w[1].end_time), (250, 500));
+        assert_eq!((w[2].begin_time, w[2].end_time), (500, 750));
+        assert_eq!(w[0].text, "你");
+        assert_eq!(w[2].text, "吗");
+        assert!(w.iter().all(|x| x.punctuation.is_empty()));
+    }
+
+    /// S9（T5）：已确认区 + 当前句的时间条数与 `raw` 字数对不上 ⇒ 空表（会话侧按估算补）。
+    #[test]
+    fn s9_rough_preview_words_count_mismatch_is_empty() {
+        let confirmed = [rough(0.0, 0.2)];
+        let current = [rough(0.2, 0.4)];
+        assert!(super::rough_preview_words("你好吗", "你好吗", &confirmed, &current).is_empty());
+        assert!(super::rough_preview_words("你", "你", &confirmed, &current).is_empty());
+        // 空 raw + 空时间：对得上，显示也空 ⇒ 空表（无字可给）。
+        assert!(super::rough_preview_words("", "", &[], &[]).is_empty());
+    }
+
+    /// S9（T5）：显示文本比 `raw` 多一个标点（如「，」）⇒ 仍是每个显示字一条；多出的字时间补估算，且夹在邻字之间。
+    #[test]
+    fn s9_rough_preview_words_display_with_extra_punct() {
+        let confirmed = [rough(0.0, 0.2), rough(0.2, 0.4)];
+        let current = [rough(0.4, 0.6)];
+        let w = super::rough_preview_words("你好吗", "你好，吗", &confirmed, &current);
+        assert_eq!(w.len(), 4, "每个显示字一条");
+        let texts: String = w.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(texts, "你好，吗");
+        // 原有字的时间保持。
+        assert_eq!((w[0].begin_time, w[0].end_time), (0, 200));
+        assert_eq!((w[1].begin_time, w[1].end_time), (200, 400));
+        assert_eq!((w[3].begin_time, w[3].end_time), (400, 600));
+        // 新增标点时间不越过相邻字。
+        assert!(
+            w[2].begin_time >= 400 && w[2].end_time <= 400 + 1,
+            "{:?}",
+            w[2]
+        );
+        // 时间单调不降。
+        assert!(w.windows(2).all(|p| p[0].begin_time <= p[1].begin_time));
+    }
+
+    /// S9：`record_slices(None, ..)`（本机）是空操作，不 panic。
+    #[test]
+    fn s9_record_slices_none_is_noop() {
+        super::record_slices(None, &[vec![0.0; 100]], &[(0, 80, 10)]);
+    }
+
+    /// S9：`record_slices(Some(..))` 按派发顺序登记各片 ⇒ `SliceMap` 把虚拟时间换算到正确的录音时间。
+    /// 片 1：虚拟 0..1.0s（16000 样本），录音 [0, 12000)，前补零 2000；
+    /// 片 2：虚拟 1.0..2.0s，录音 [40000, 52000)，前补零 1000。
+    #[test]
+    fn s9_record_slices_builds_slice_map() {
+        let log = std::sync::Mutex::new(super::SliceMap::default());
+        let padded = vec![vec![0.0f32; 16000], vec![0.0f32; 16000]];
+        let spans = [(0usize, 12000usize, 2000usize), (40000, 52000, 1000)];
+        super::record_slices(Some(&log), &padded, &spans);
+        let m = log.lock().unwrap();
+        assert!(!m.is_empty());
+        // 虚拟 1.5s = 片 2 内偏移 8000 样本 ⇒ 录音 40000 + (8000 - 1000) = 47000 样本 = 2.9375s。
+        assert!((m.to_real(1.5) - 2.9375).abs() < 1e-4, "{}", m.to_real(1.5));
+        // 片 2 前补零内（虚拟 1.03s ≈ 偏移 480 < 1000）⇒ 贴到片 2 录音起点 40000 样本 = 2.5s。
+        assert!((m.to_real(1.03) - 2.5).abs() < 1e-4);
+        // 片 1 内：虚拟 0.5s = 偏移 8000 ⇒ 录音 8000 - 2000 = 6000 样本 = 0.375s。
+        assert!((m.to_real(0.5) - 0.375).abs() < 1e-4);
+        drop(m);
+
+        // 再追加一次派发（第 3 片）⇒ 接在后面，不覆盖前面的映射。
+        super::record_slices(Some(&log), &[vec![0.0f32; 8000]], &[(60000, 67000, 0)]);
+        let m = log.lock().unwrap();
+        // 虚拟 2.25s = 第 3 片偏移 4000 ⇒ 录音 60000 + 4000 = 64000 样本 = 4.0s。
+        assert!((m.to_real(2.25) - 4.0).abs() < 1e-4, "{}", m.to_real(2.25));
+        assert!((m.to_real(1.5) - 2.9375).abs() < 1e-4, "旧片映射不变");
     }
 }
 

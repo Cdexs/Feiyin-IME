@@ -150,6 +150,22 @@ pub(crate) struct ResultPayload {
     /// 末尾尚未稳定的字数（预览浅色；终稿恒 0）。
     #[serde(default)]
     pub tentative: usize,
+    /// ASR-SERVER-491 S9：逐词时间（与 `text` 逐字对齐：各词 `text + punctuation` 依次拼接 == `text`）。
+    /// 空 = 本帧无时间（如空文本）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<ResultWord>,
+}
+
+/// S9：一个词（阿里 `sentence.words[]` 同形）+ 时间来源。时间为毫秒，相对本会话第一帧音频。
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub(crate) struct ResultWord {
+    pub begin_time: i64,
+    pub end_time: i64,
+    pub text: String,
+    #[serde(default)]
+    pub punctuation: String,
+    /// `aligned`（强制对齐）/ `estimated`（估算）/ `rough`（预览粗略）。
+    pub source: String,
 }
 
 /// `End` 帧内容。`error` 为空 = 正常结束。
@@ -185,6 +201,13 @@ mod tests {
                     is_final: true,
                     text: "你好".into(),
                     tentative: 0,
+                    words: vec![ResultWord {
+                        begin_time: 0,
+                        end_time: 120,
+                        text: "你".into(),
+                        punctuation: String::new(),
+                        source: "aligned".into(),
+                    }],
                 },
             ),
         ];
@@ -207,6 +230,56 @@ mod tests {
         bad.push(0x7f);
         bad.extend_from_slice(&0u64.to_le_bytes());
         assert!(read_frame(&mut bad.as_slice()).is_err(), "未知类型");
+    }
+
+    /// S9 向后兼容：老内核发的 `Result` JSON 没有 `words` 字段 ⇒ 仍能解析，`words` 为空。
+    #[test]
+    fn s9_result_payload_without_words_field_deserializes() {
+        let p: ResultPayload =
+            serde_json::from_str(r#"{"is_final":true,"text":"你好","tentative":0}"#).unwrap();
+        assert!(p.words.is_empty());
+        assert_eq!(p.text, "你好");
+        // tentative 也缺省 ⇒ 0（老字段缺省行为不变）。
+        let p: ResultPayload = serde_json::from_str(r#"{"is_final":false,"text":"a"}"#).unwrap();
+        assert!(p.words.is_empty());
+        assert_eq!(p.tentative, 0);
+        // 词里缺 punctuation ⇒ 空串。
+        let p: ResultPayload = serde_json::from_str(
+            r#"{"is_final":true,"text":"你","words":[{"begin_time":1,"end_time":2,"text":"你","source":"rough"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(p.words.len(), 1);
+        assert_eq!(p.words[0].punctuation, "");
+        assert_eq!(p.words[0].source, "rough");
+    }
+
+    /// S9：`words` 为空时序列化不带 `words` 键（新内核发给老网关 / 老终端不多字段）；非空时带且可往返。
+    #[test]
+    fn s9_empty_words_not_serialized_and_roundtrip() {
+        let empty = ResultPayload {
+            is_final: false,
+            text: "你".into(),
+            tentative: 1,
+            words: Vec::new(),
+        };
+        let v = serde_json::to_value(&empty).unwrap();
+        assert!(v.get("words").is_none(), "空 words 不序列化：{v}");
+        assert_eq!(v["text"], "你");
+
+        let full = ResultPayload {
+            words: vec![ResultWord {
+                begin_time: 10,
+                end_time: 20,
+                text: "你".into(),
+                punctuation: "，".into(),
+                source: "estimated".into(),
+            }],
+            ..empty
+        };
+        let v = serde_json::to_value(&full).unwrap();
+        assert!(v.get("words").is_some());
+        let back: ResultPayload = serde_json::from_value(v).unwrap();
+        assert_eq!(back, full);
     }
 
     #[test]

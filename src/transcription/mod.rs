@@ -9,6 +9,7 @@ use crate::{config::ChineseScript, punctuation, text_normalizer};
 // Re-export SenseVoice config for convenience
 use sherpa_onnx::OfflineSenseVoiceModelConfig;
 
+pub(crate) mod char_times;
 pub mod feiyin_remote;
 pub mod local_stream;
 pub mod qwen_inference;
@@ -2982,6 +2983,9 @@ pub(crate) struct OrderedReflow {
         ),
     >,
     committed: String,
+    /// ASR-SERVER-491 S9（T1）：与 `committed` 逐字对应的（起, 止）绝对秒；`None` = 该字无对齐时间。
+    /// 只随 `committed` 增删，不参与任何拼接判定 ⇒ 文字逐位不变。
+    committed_times: Vec<Option<(f32, f32)>>,
     last_window_text: String,
     /// 与 `last_window_text` 每字对应的（起, 止）绝对秒；`None` = 该窗无可用时间戳。
     last_times: Option<Vec<(f32, f32)>>,
@@ -3018,10 +3022,25 @@ impl OrderedReflow {
             next: 0,
             pending: std::collections::BTreeMap::new(),
             committed: String::new(),
+            committed_times: Vec::new(),
             last_window_text: String::new(),
             last_times: None,
             last_span: None,
             refine: None,
+        }
+    }
+
+    /// S9（T1）：`last_window_text` 的前 `chars` 字即将并入 `committed` ⇒ 先把同位时间并入
+    ///（必须在 `last_times` 被改写之前调用）。无时间 ⇒ 补 `None`。
+    fn commit_times(&mut self, chars: usize) {
+        match &self.last_times {
+            Some(t) if t.len() >= chars => {
+                self.committed_times
+                    .extend(t[..chars].iter().copied().map(Some));
+            }
+            _ => self
+                .committed_times
+                .extend(std::iter::repeat(None).take(chars)),
         }
     }
 
@@ -3106,6 +3125,7 @@ impl OrderedReflow {
                 self.last_times = times;
             }
             Some((_, prev_end)) if ws >= prev_end => {
+                self.commit_times(self.last_window_text.chars().count());
                 self.committed.push_str(&self.last_window_text);
                 self.last_window_text = text;
                 self.last_times = times;
@@ -3121,6 +3141,7 @@ impl OrderedReflow {
                         new_text.chars().count(),
                         text.chars().count()
                     );
+                    self.commit_times(self.last_window_text[..keep].chars().count());
                     self.committed.push_str(&self.last_window_text[..keep]);
                     self.last_window_text = new_text;
                     self.last_times = Some(new_t);
@@ -3141,6 +3162,7 @@ impl OrderedReflow {
                         self.last_window_text[..keep].chars().count(),
                         text[..cut].chars().count()
                     );
+                    self.commit_times(self.last_window_text[..keep].chars().count());
                     self.committed.push_str(&self.last_window_text[..keep]);
                     self.last_window_text = text[cut..].to_string();
                     self.last_times = None;
@@ -3157,6 +3179,8 @@ impl OrderedReflow {
                         "[DBG-456] seam: seq={seq} ratio={ratio:?} span=[{ws}, {we}) prev=[{prev_start}, {prev_end}) drop_new_head={}",
                         text[..cut].chars().count()
                     );
+                    // `last_window_text` 刚被截成前缀 ⇒ `last_times` 同位前缀仍对得上。
+                    self.commit_times(self.last_window_text.chars().count());
                     self.committed.push_str(&self.last_window_text);
                     let n_skip = text[..cut].chars().count();
                     self.last_times = times.map(|t| t[n_skip..].to_vec());
@@ -3180,6 +3204,9 @@ impl OrderedReflow {
         }
         let r = self.refine.take()?;
         self.committed.truncate(r.committed_len);
+        // S9（T1）：时间随文字一起回退。
+        let n = self.committed.chars().count();
+        self.committed_times.truncate(n);
         self.last_window_text = r.last_window_text;
         self.last_times = r.last_times;
         self.last_span = r.last_span;
@@ -3240,9 +3267,36 @@ impl OrderedReflow {
         )
     }
 
-    /// 收尾：返回 `(committed, last_window_text)`。
+    /// 收尾：返回 `(committed, last_window_text)`。S9 起生产路径改用 [`Self::finish_timed`]，本入口只留给测试。
+    #[cfg(test)]
     pub(crate) fn finish(self) -> (String, String) {
         (self.committed, self.last_window_text)
+    }
+
+    /// S9（T1）：当前权威全文（`committed + last_window_text`）的逐字（起, 止）绝对秒，与全文 `chars()` 一一对应；
+    /// `None` = 该字无对齐时间（比例估算 / 兜底未对齐 / 对齐晚到前）。
+    pub(crate) fn full_times(&self) -> Vec<Option<(f32, f32)>> {
+        let n = self.last_window_text.chars().count();
+        let mut out = self.committed_times.clone();
+        match &self.last_times {
+            Some(t) if t.len() == n => out.extend(t.iter().copied().map(Some)),
+            _ => out.extend(std::iter::repeat(None).take(n)),
+        }
+        out
+    }
+
+    /// S9（T1）：`text` 恰为当前权威全文 ⇒ 其逐字时间；否则 `None`（一次排空多窗时，较早几条全文已被覆盖）。
+    pub(crate) fn timed_snapshot(&self, text: &str) -> Option<Vec<Option<(f32, f32)>>> {
+        (self.committed.len() + self.last_window_text.len() == text.len()
+            && text.starts_with(&self.committed)
+            && text.ends_with(&self.last_window_text))
+        .then(|| self.full_times())
+    }
+
+    /// S9（T1）：同 [`Self::finish`]，另给全文逐字时间（见 [`Self::full_times`]）。
+    pub(crate) fn finish_timed(self) -> (String, String, Vec<Option<(f32, f32)>>) {
+        let times = self.full_times();
+        (self.committed, self.last_window_text, times)
     }
 }
 
@@ -8169,6 +8223,203 @@ mod timed_reflow_456_tests {
             5.0,
         );
         assert_eq!(out.last().unwrap(), "甲乙丙丁", "零重叠直接拼接");
+    }
+
+    /// S9 不变量：任何时刻 `full_times().len()` == 拼接器当前全文（committed + last_window）字数。
+    fn assert_times_len(o: &OrderedReflow, tag: &str) {
+        let (c, l) = o.clone().finish();
+        assert_eq!(
+            o.full_times().len(),
+            c.chars().count() + l.chars().count(),
+            "S9 不变量破坏 @{tag}：committed={c:?} last={l:?}"
+        );
+    }
+
+    /// S9（T1）：覆盖零重叠 / 双方有时间 / 仅上一窗有时间 / 比例估算 / `refine_times` 重拼五条接缝路径，
+    /// 每步之后 `full_times().len()` 都等于全文字数；`finish_timed` 的文字与 `finish` 逐位一致。
+    #[test]
+    fn s9_full_times_len_invariant_across_all_stitch_paths() {
+        let mut o = OrderedReflow::new();
+        // 零重叠（首窗 + ws >= prev_end）。
+        let a = "今天天气很好我们去公园";
+        o.push_window_timed(
+            0,
+            0,
+            1,
+            vec![100],
+            a.into(),
+            Some(ts(a, 0.0, 0.2)),
+            0.0,
+            0.0,
+        );
+        assert_times_len(&o, "seq0 首窗带时间");
+        let b = "散步回家";
+        o.push_window_timed(
+            1,
+            1,
+            2,
+            vec![100],
+            b.into(),
+            Some(ts(b, 2.2, 0.2)),
+            2.2,
+            2.2,
+        );
+        assert_times_len(&o, "seq1 零重叠");
+        // 双方有时间的重叠（timed_stitch）。
+        let c = "回家吃饭休息";
+        o.push_window_timed(
+            2,
+            1,
+            3,
+            vec![50, 50],
+            c.into(),
+            Some(ts(c, 2.6, 0.2)),
+            2.6,
+            2.7,
+        );
+        assert_times_len(&o, "seq2 双方有时间");
+        // 仅上一窗有时间（本窗无时间，prev_timed_cut）。
+        o.push_window_timed(
+            3,
+            2,
+            4,
+            vec![50, 50],
+            "吃饭休息好好睡觉".into(),
+            None,
+            3.2,
+            3.3,
+        );
+        assert_times_len(&o, "seq3 仅上一窗有时间");
+        // 比例估算（上一窗已无时间 + 本窗无时间，带样本数）。
+        o.push_window_timed(
+            4,
+            3,
+            5,
+            vec![50, 50],
+            "好好睡觉明天见".into(),
+            None,
+            4.0,
+            4.1,
+        );
+        assert_times_len(&o, "seq4 比例估算");
+        // 比例估算（上一窗无时间 + 本窗有时间）。
+        let d = "明天见再会";
+        o.push_window_timed(
+            5,
+            4,
+            6,
+            vec![50, 50],
+            d.into(),
+            Some(ts(d, 5.0, 0.2)),
+            5.0,
+            5.1,
+        );
+        assert_times_len(&o, "seq5 上一窗无时间 + 本窗有时间");
+
+        // refine_times 重拼：先无时间拼接，再带时间重拼（回退 committed_times 并重新拼）。
+        let e = "你好世界再见";
+        o.push_window_timed(
+            6,
+            6,
+            7,
+            vec![100],
+            e.into(),
+            Some(ts(e, 10.0, 0.2)),
+            10.0,
+            10.0,
+        );
+        assert_times_len(&o, "seq6 零重叠");
+        let f = "世界再见朋友";
+        o.push_window_timed(7, 6, 8, vec![50, 50], f.into(), None, 10.4, 10.5);
+        assert_times_len(&o, "seq7 无时间拼接");
+        assert!(
+            o.refine_times(7, ts(f, 10.4, 0.2)).is_some(),
+            "最近拼接的窗可重拼"
+        );
+        assert_times_len(&o, "seq7 refine 重拼后");
+
+        // 收尾：文字与 finish() 一致，时间条数 == 全文字数。
+        let (fc, fl) = o.clone().finish();
+        let (tc, tl, times) = o.finish_timed();
+        assert_eq!(
+            (fc.clone(), fl.clone()),
+            (tc, tl),
+            "finish_timed 文字须与 finish 逐位一致"
+        );
+        assert_eq!(times.len(), fc.chars().count() + fl.chars().count());
+    }
+
+    /// S9（T1）：无时间的首窗 ⇒ 经 refine 补时间再重拼后，`full_times()` 条数仍等于全文字数（单窗 refine 回退路径）。
+    #[test]
+    fn s9_refine_on_first_window_keeps_len_invariant() {
+        let mut o = OrderedReflow::new();
+        let a = "甲乙丙丁";
+        o.push_window_timed(0, 0, 1, vec![100], a.into(), None, 0.0, 0.0);
+        assert_times_len(&o, "无时间首窗");
+        assert!(
+            o.full_times().iter().all(|t| t.is_none()),
+            "无时间 ⇒ 全 None"
+        );
+        assert!(o.refine_times(0, ts(a, 0.0, 0.2)).is_some());
+        assert_times_len(&o, "refine 后");
+        assert!(
+            o.full_times().iter().all(|t| t.is_some()),
+            "refine 补上时间后每字都有"
+        );
+    }
+
+    /// S9（T1）：零重叠拼接时，前一窗的时间原样并入 committed 前缀；无时间的窗对应字为 `None`。
+    #[test]
+    fn s9_zero_overlap_keeps_first_window_times_and_untimed_is_none() {
+        let mut o = OrderedReflow::new();
+        let a = "甲乙丙丁";
+        let b = "戊己庚辛";
+        o.push_window_timed(0, 0, 1, vec![1], a.into(), Some(ts(a, 0.0, 0.2)), 0.0, 0.0);
+        o.push_window_timed(1, 1, 2, vec![1], b.into(), Some(ts(b, 5.0, 0.2)), 5.0, 5.0);
+        let full = o.full_times();
+        let expect_a: Vec<Option<(f32, f32)>> = ts(a, 0.0, 0.2).into_iter().map(Some).collect();
+        let expect_b: Vec<Option<(f32, f32)>> = ts(b, 5.0, 0.2).into_iter().map(Some).collect();
+        assert_eq!(&full[..4], &expect_a[..], "committed 前缀 = 首窗时间原样");
+        assert_eq!(&full[4..], &expect_b[..], "last 窗 = 本窗时间");
+
+        // 第三窗无时间（零重叠）⇒ 它的字是 None，前两窗的时间不变。
+        o.push_window_timed(2, 2, 3, vec![1], "壬癸".into(), None, 0.0, 0.0);
+        let full = o.full_times();
+        assert_eq!(full.len(), 10);
+        assert_eq!(&full[..4], &expect_a[..]);
+        assert_eq!(&full[4..8], &expect_b[..]);
+        assert_eq!(&full[8..], &[None, None], "无时间窗 ⇒ None");
+
+        // 首窗无时间：committed 里对应字 None。
+        let mut o = OrderedReflow::new();
+        o.push_window_timed(0, 0, 1, vec![1], a.into(), None, 0.0, 0.0);
+        o.push_window_timed(1, 1, 2, vec![1], b.into(), Some(ts(b, 5.0, 0.2)), 5.0, 5.0);
+        let full = o.full_times();
+        assert_eq!(&full[..4], &[None, None, None, None]);
+        assert_eq!(&full[4..], &expect_b[..]);
+    }
+
+    /// S9（T1）：`timed_snapshot` 只认「恰为当前权威全文」；一次排空多窗时较早几条全文已被覆盖 ⇒ `None`。
+    #[test]
+    fn s9_timed_snapshot_only_for_exact_current_text() {
+        let mut o = OrderedReflow::new();
+        let a = "甲乙";
+        let b = "丙丁";
+        // seq1 先到被暂存；seq0 到齐后一次排空两窗，返回 [全文@seq0, 全文@seq1]。
+        assert!(o
+            .push_window_timed(1, 1, 2, vec![1], b.into(), Some(ts(b, 2.0, 0.2)), 2.0, 2.0)
+            .is_empty());
+        let out = o.push_window_timed(0, 0, 1, vec![1], a.into(), Some(ts(a, 0.0, 0.2)), 0.0, 0.0);
+        assert_eq!(out, vec!["甲乙".to_string(), "甲乙丙丁".to_string()]);
+        assert!(
+            o.timed_snapshot(&out[0]).is_none(),
+            "较早一条全文已被覆盖 ⇒ 不得返回当前时间"
+        );
+        let snap = o.timed_snapshot(&out[1]).expect("当前全文应取得到时间");
+        assert_eq!(snap, o.full_times());
+        assert_eq!(snap.len(), 4);
+        assert!(o.timed_snapshot("").is_none());
+        assert!(o.timed_snapshot("甲乙丙丁戊").is_none());
     }
 }
 

@@ -98,8 +98,8 @@
 | S8a | 配对存储 `asr_shared/remote.rs`：`asr-remote.json`（不进 config.toml）、解析连接码 / 手输、本机设备代码首次生成后固定、单测 | ✅ `asr-remote.json`（lan / wan / key / fingerprint / mode / device_id / device_name）；连接码须 v=1 且带指纹，手输指纹可空（先取回确认）；缺端口补 7860；计算机名 Windows 读 COMPUTERNAME、macOS 用 scutil |
 | S8b | 连接：识别档位新值 `feiyin_server`；证书指纹钉死（rustls 自定义校验）；内外网「自动」= 内网优先、并发试连；`run-task` 带 `feiyin.device_id/device_name/postprocess["homophone","itn"]`；网关错误码转人话 | ✅ `asr_model = "feiyin_server"`（走在线流式管线，不要 API Key）；`asr_shared/tls_pin.rs` 只认配对指纹、只走 TLS 1.3；「自动」同时试 TCP，外网先通则再等内网 300ms；`qwen_inference` 抽出 `connect_dashscope` / `realtime_session` 两条线共用，新增 `transcribe_streaming_feiyin`，阿里行为不变；三条错误文案 `error_feiyin_*`。对方做数字规整待 S10 |
 | S8c | 设置界面：语音页档位加「自家识别服务」+ 配对表单（粘贴连接码 / 手输 + 首次确认指纹、内网 / 外网 / 自动），i18n 三份 | ✅ 语音页档位加「自家识别服务（另一台电脑）」；`ui/src/components/FeiyinServerPairing.tsx`（粘贴连接码 / 手输 → 取回指纹 → 核对 → 保存；已配对可选连接方式、改本机名称、测试连接、重新配对）；没配对离开语音页回落上一档位；后端命令在 `src-tauri/src/asr_server.rs`；指纹每 4 位分组显示。**待 Gavin 目视确认** |
-| S9 | 逐字时间补齐 T1~T6（§12） | ⬜ |
-| S10 | 文字节点包装 `TextStage` + `feiyin.postprocess` + 单独文字处理接口（§13） | ⬜ |
+| S9 | 逐字时间补齐 T1~T6（§12） | ✅ 验收 `collab/acceptance-491-S9.md`；全量 2048 过 / 网关 26 过；顺带修 S1 遗留护栏漂移 3 处。偏离：T3 不补对齐改插值标估算（设计 §12.5）；§12.1「坐标系是对的」更正为虚拟时间轴 + 片映射。遗留：长文本时间搬运改 Myers 差分 |
+| S10 | 文字节点包装 `TextStage` + 客户端参数 + 单独文字处理接口（§13） | ⬜ **方案按 Gavin 10-17 修正重定**（原话：「这里面 i t n 和自动补标点是在连接的客户端，可以通过传参告诉服务端是否启用，还有一个就是翻译功能，也是通过参数传给服务端。其他的，比如同音纠错啊啊，去口水啊，这些应该是默认的内置的，不应该交给客户端通过开关参开关参数来决定，来是否开启」）⇒ 客户端参数只有 ITN / 自动补标点 / 翻译三项；同音纠错、去口水等服务端固定开。原设计 §13.1「翻译服务端一期不提供」被推翻；S8 客户端的 `postprocess` 字段随之改 |
 | S11 | 协议文档 + Python 参考客户端；MACOS-HANDOFF；五文档 | ⬜ |
 | T | tester-1：TEST-SYNC → 全量回归 → 出包 | ⬜ |
 

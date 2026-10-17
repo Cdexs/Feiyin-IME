@@ -288,6 +288,7 @@ key 在公网上明文传输等于把 key 交给沿途的人。所以网关内�
 
 - 每个精解窗口出来后，0.6B 强制对齐器给**每个字的起止时间**：`llama_asr.rs:578` `AlignOut.char_times`，跟 `text.chars()` 一一对应。
 - 对齐用的是**整窗原始音频**，不是剪掉静音后的音频（`main.rs:9218` 注释「用整窗音频（非剪静音后）⇒ 时间直接是窗内坐标」）。拼接器再加上窗口起点，换算成**整段录音的绝对秒**（`mod.rs:2920` `push_window_timed` 的 `times` 参数）。坐标系是对的，精度来自强制对齐，不是估算。
+- ⚠️ **更正（S9 实施时核实，2026-10-17）**：上一条「整段录音的绝对秒」不准确。这个时间轴是「**虚拟时间轴**」：各派发片**首尾相接**（`localrt_session.rs` `slice_cum_end`），而每片前后各补了 ≤200ms 的**静音零值**（`vad.rs` `pad_and_extract_with_spans`）。对内拼接接缝没问题（两窗用的是同一把尺子），**对外输出不能直接用**：每过一片就比真实录音多出这片的补零，长句累积偏几百毫秒到几秒。S9 的修法见 12.5「片映射」。
 
 ### 12.2 缺口（逐条对代码）
 
@@ -313,6 +314,27 @@ key 在公网上明文传输等于把 key 交给沿途的人。所以网关内�
 ### 12.4 对外格式
 
 `result-generated` 的 `words` 按阿里格式给每字 `begin_time` / `end_time`（毫秒，相对本次会话第一帧音频）/ `text` / `punctuation`。来源标记放在扩展字段 `feiyin.ts_source`。**定稿句（`sentence_end=true`）里的每个字都保证有时间**，补不出的才标 `estimated`。
+
+### 12.5 一期实现（S9，2026-10-17）
+
+任务书：`collab/spec-491-S9.md`；验收：`collab/acceptance-491-S9.md`。**只动远程会话，本机文字 / 时间 / 回灌逐位不变。**
+
+| # | 实现 | 代码位置 |
+| --- | --- | --- |
+| T1 | 拼接器加 `committed_times`，与 `committed` 逐字同步（各 `push_str` 分支先 `commit_times`；`refine_times` 回退同步截断）；新增 `full_times` / `timed_snapshot` / `finish_timed`；原 `finish` 只留给测试 | `transcription/mod.rs` `OrderedReflow` |
+| T2 | 跳过最后一窗对齐的条件加 `!recognizer.is_remote()` | `localrt_session.rs` 解码线程 |
+| T3 | ⚠️ **偏离**：不补对齐，没时间的字按两侧已知字插值、标 `estimated`。理由：拼接时没时间的字只有三类 ——（a）对齐器判不合格，同一段音频 + 文字再对一次结果相同；（b）兜底文字经声纹 / 远场剔除或末尾 pending 兜底，文字与整窗音频已不一一对应，硬对齐给出的是错时间；（c）半截结果，终稿时会被正式结果替换。都不是「再对一次就能对上」 | `char_times::fill_missing` |
+| T4 | 精解为空、退回预览收尾文本：录音 ≤30s ⇒ 整段对齐一次（录音时间轴，无需换算）；失败 / 更长 ⇒ 用预览粗略时间搬过来；再不行标估算 | `asr_service/session.rs` `whole_fallback_times` |
+| T5 | 仅远程：当前句重解时把 SenseVoice token 起点折成每字粗略时间，确认时并入已确认区，442 回看切分时随文字一分为二；预览帧每字一条 `WordTiming`（本机仍传空） | `local_stream.rs` `sim_times` / `rough_confirmed` / `rough_preview_words` |
+| T6 | 纯函数 `transfer`（字符级 diff：没变的搬、替换串均分旧串起止、插入标点取前字终点、删除即消失），套在去口水重复、繁简规整、预览收尾上 | `transcription/char_times.rs` |
+| 片映射 | 派发前登记每片录音位置（`record_slices`，在 `on_segment` 之前 ⇒ 回灌到达时映射已就绪）；会话把精解时间按 `真实 = pcm_start + clamp(片内偏移 − pad_before, 0, 片长)` 换算后再合成 / 输出 | `local_stream.rs` `record_slices`；`char_times::SliceMap` |
+| 回灌带时间 | `PipelineEvent::PreviewReflow` 加 `acc_times`（虚拟轴，与 `acc_text` 逐字对应；本机恒 `None`）；收尾 `run_acc_windows` 第 6 项返回全文时间 | `main.rs` 事件定义；`localrt_session.rs` |
+| 合成 | `RemoteComposer` 同步维护显示文本逐字时间（显示 = 精解前缀 + 预览尾巴，时间同样拼接） | `asr_service/compose.rs` |
+| 对外 | `ResultPayload.words`（内核 → 网关）；网关放进 `sentence.words`，`sentence.begin_time/end_time` 取首末词，来源按序放 `output.feiyin.ts_source` | `asr_service/frame.rs`；`feiyin-asr-gateway/ws.rs` `result_json` |
+
+**成词规则**：汉字一字一词；连续 ASCII 字母数字合成一词（「2026」「hello」）；标点 / 空白挂前一词 `punctuation`，开头的标点并进第一个词。**不变量**：各词 `text + punctuation` 依次拼接 == 原文（我们的电脑客户端 `StreamingAsrState` 要求词表与文本逐字对齐）。
+
+**行为变化（远程，预期内）**：最后一窗照常对齐 ⇒ 远程终稿多等约 0.25s；最后一道接缝改按时间拼接（与中间各窗同一规则），终稿文字可能与改前略有不同（更准）。预览帧里尚未对齐的字（最新一窗在对齐结果到达前）标 `estimated`，对齐结果到达后不另发一帧（回灌节奏不变），下一帧 / 终稿带上。
 
 ---
 
@@ -349,6 +371,14 @@ key 在公网上明文传输等于把 key 交给沿途的人。所以网关内�
 | 10 | 使用统计 | `main.rs:16728` `usage_stats::record` | 写本机库 | **调用端**（远程会话不写本机统计） |
 | 11 | 上屏 / 剪贴板 / 焦点检查 | `main.rs:16752` `platform::inject_text` | 本机窗口 | **调用端** |
 | 12 | 词库命中计数 | `main.rs:16788` `wordbook::db::record_hits` | 写本机词库 | **调用端**（远程不写本机词库） |
+
+> ⚠️ **Gavin 10-17 修正（S10 以此为准，覆盖 13.1「归属」列与 13.3 第 3、4 条的可选节点设计）**，原话：
+> 「这里面 i t n 和自动补标点是在连接的客户端，可以通过传参告诉服务端是否启用，还有一个就是翻译功能，也是通过参数传给服务端。其他的，比如同音纠错啊啊，去口水啊，这些应该是默认的内置的，不应该交给客户端通过开关参开关参数来决定，来是否开启」
+>
+> - **客户端传参控制的只有三项**：数字规整（ITN）、自动补标点、翻译。
+> - **服务端默认内置、固定开、不给开关**：同音纠错、去口水词等其余纯文字节点。
+> - 13.1 的「5′ 离线翻译 opus-mt：服务端第一期不提供」**作废**，翻译改为一期按参数提供。**引擎跟随服务端本机设置**（Gavin 10-17 选定）：本机配了大模型就用大模型（花服务端机主的 API 额度），没配就用离线翻译；终端只传「要不要翻译」，不选引擎。
+> - S8 电脑客户端发的 `feiyin.postprocess: ["homophone","itn"]` 随 S10 改成新参数格式。
 
 ### 13.2 归属原则
 

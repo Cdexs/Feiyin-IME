@@ -638,22 +638,7 @@ impl Conn {
                 let Ok(r) = serde_json::from_slice::<ResultPayload>(&f.body) else {
                     return true;
                 };
-                let payload = json!({
-                    // 一期整段一句（sentence_id 恒 1，text 为全文）；扩展字段按设计 §5.1 放 output.feiyin。
-                    "output": {
-                        "sentence": {
-                            "sentence_id": 1,
-                            "begin_time": 0,
-                            "end_time": null,
-                            "text": r.text,
-                            "sentence_end": r.is_final,
-                            "words": [],
-                        },
-                        "feiyin": { "tentative": r.tentative },
-                    },
-                    "usage": null,
-                });
-                ws.send(event(&task_id, "result-generated", payload))
+                ws.send(event(&task_id, "result-generated", result_json(&r)))
                     .await
                     .is_ok()
             }
@@ -675,6 +660,39 @@ impl Conn {
             _ => true,
         }
     }
+}
+
+/// `result-generated` 的 `payload`。一期整段一句（sentence_id 恒 1，text 为全文）；扩展字段按设计 §5.1
+/// 放 `output.feiyin`。S9：`words` 按阿里格式（毫秒，相对本会话第一帧音频），句子起止取首末词；
+/// 各词时间来源按序放 `feiyin.ts_source`（与 `words` 一一对应）。
+fn result_json(r: &ResultPayload) -> Value {
+    let words: Vec<Value> = r
+        .words
+        .iter()
+        .map(|w| {
+            json!({
+                "begin_time": w.begin_time,
+                "end_time": w.end_time,
+                "text": w.text,
+                "punctuation": w.punctuation,
+            })
+        })
+        .collect();
+    let sources: Vec<&str> = r.words.iter().map(|w| w.source.as_str()).collect();
+    json!({
+        "output": {
+            "sentence": {
+                "sentence_id": 1,
+                "begin_time": r.words.first().map_or(0, |w| w.begin_time),
+                "end_time": r.words.last().map(|w| w.end_time),
+                "text": r.text,
+                "sentence_end": r.is_final,
+                "words": words,
+            },
+            "feiyin": { "tentative": r.tentative, "ts_source": sources },
+        },
+        "usage": null,
+    })
 }
 
 #[cfg(test)]
@@ -723,5 +741,81 @@ mod tests {
         let after = t0 + LOCKOUT;
         assert!(!lo.locked(ip, after), "10 分钟后解锁");
         assert!(!lo.fail(ip, after), "解锁后重新计数");
+    }
+
+    fn word(b: i64, e: i64, t: &str, p: &str, s: &str) -> crate::frame::ResultWord {
+        crate::frame::ResultWord {
+            begin_time: b,
+            end_time: e,
+            text: t.into(),
+            punctuation: p.into(),
+            source: s.into(),
+        }
+    }
+
+    /// S9：带逐词时间 ⇒ `sentence.words[i]` 字段齐全、句子起止取首末词、来源按序放 `feiyin.ts_source`。
+    #[test]
+    fn s9_result_json_with_words() {
+        let r = ResultPayload {
+            is_final: true,
+            text: "你好，hello".into(),
+            tentative: 0,
+            words: vec![
+                word(120, 300, "你", "", "aligned"),
+                word(300, 520, "好", "，", "rough"),
+                word(600, 900, "hello", "", "estimated"),
+            ],
+        };
+        let v = result_json(&r);
+        let s = &v["output"]["sentence"];
+        assert_eq!(s["begin_time"], 120, "句子起点 = 首词 begin");
+        assert_eq!(s["end_time"], 900, "句子终点 = 末词 end");
+        assert_eq!(s["text"], "你好，hello");
+        assert_eq!(s["sentence_end"], true);
+        let words = s["words"].as_array().expect("words 是数组");
+        assert_eq!(words.len(), 3);
+        assert_eq!(words[1]["begin_time"], 300);
+        assert_eq!(words[1]["end_time"], 520);
+        assert_eq!(words[1]["text"], "好");
+        assert_eq!(words[1]["punctuation"], "，");
+        assert_eq!(words[2]["text"], "hello");
+        assert_eq!(
+            v["output"]["feiyin"]["ts_source"],
+            json!(["aligned", "rough", "estimated"]),
+            "来源与 words 一一对应、保持顺序"
+        );
+        assert_eq!(v["output"]["feiyin"]["tentative"], 0);
+        // 词表拼回原文（电脑客户端逐字对齐的前提）。
+        let joined: String = words
+            .iter()
+            .map(|w| {
+                format!(
+                    "{}{}",
+                    w["text"].as_str().unwrap(),
+                    w["punctuation"].as_str().unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(joined, "你好，hello");
+    }
+
+    /// S9：无词（空文本 / 老内核）⇒ `words` 空数组、`begin_time` 0、`end_time` null、`ts_source` 空数组。
+    #[test]
+    fn s9_result_json_without_words() {
+        let r = ResultPayload {
+            is_final: false,
+            text: "你好".into(),
+            tentative: 2,
+            words: Vec::new(),
+        };
+        let v = result_json(&r);
+        let s = &v["output"]["sentence"];
+        assert_eq!(s["words"], json!([]));
+        assert_eq!(s["begin_time"], 0);
+        assert!(s["end_time"].is_null());
+        assert_eq!(s["sentence_end"], false);
+        assert_eq!(v["output"]["feiyin"]["ts_source"], json!([]));
+        assert_eq!(v["output"]["feiyin"]["tentative"], 2);
+        assert!(v["usage"].is_null());
     }
 }

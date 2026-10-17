@@ -1471,10 +1471,13 @@ mod tests {
     /// mic-muted 锚点 5080 恒在生产区）。
     fn main_prod_lines() -> Vec<String> {
         let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let lines: Vec<&str> = src.lines().map(str::trim).collect();
         let mut out = Vec::new();
-        for line in src.lines() {
-            let t = line.trim();
-            if t.starts_with("#[cfg(test)]") {
+        for (i, t) in lines.iter().enumerate() {
+            // 只在测试**模块**处截断：单项 `#[cfg(test)]`（如 S1 的 `MAIN_RS_SRC` 常量）不是生产区终点。
+            if t.starts_with("#[cfg(test)]")
+                && (t.contains("mod ") || lines.get(i + 1).is_some_and(|n| n.starts_with("mod ")))
+            {
                 break;
             }
             out.push(t.to_string());

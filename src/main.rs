@@ -214,6 +214,9 @@ enum PipelineEvent {
         /// 消费端按 `partial_reflow_boundary` 现算「精解写到原始预览的哪个位置」作本次替换边界，
         /// 显示 = 半截精解 + 预览中尚未解到的部分（不回缩）；不走整窗回灌的边界配对。
         partial: bool,
+        /// ASR-SERVER-491 S9：与 `acc_text` 逐字对应的时间（**虚拟时间轴**秒，见 `char_times::SliceMap`）。
+        /// 只有远程会话填（本机恒 `None`，浮层不读）。
+        acc_times: Option<Vec<Option<transcription::char_times::CharTime>>>,
     },
     /// LOCALRT-SEAM-337（自适应定界）：本片边界冻结通知。
     ///
@@ -7556,6 +7559,7 @@ fn process_controller_events(
                 decode_done_at,
                 non_user_hide,
                 partial,
+                acc_times: _,
             } => {
                 // 325：本地实时档 accuracy 分片权威文本回灌（**只有本地档会发本事件**）。
                 // 代际门与 StreamingText 同源：陈旧 session 的回灌不得改本 session 浮层。
@@ -9281,7 +9285,7 @@ fn spawn_worker_thread(
                             acc_total_decode_ms,
                             acc_vp_dropped_all,
                         ) = match acc_result {
-                            Some(Ok((c, lw, an, total, vp))) => (c, lw, an, total, vp),
+                            Some(Ok((c, lw, an, total, vp, _))) => (c, lw, an, total, vp),
                             Some(Err(_join_err)) => {
                                 log::error!("SLIDING-WINDOW-367 accuracy worker panicked");
                                 (String::new(), String::new(), false, 0.0, false)
@@ -13695,10 +13699,11 @@ mod short_context_413_tests {
         let (mut regular, mut tail_gs) = (0usize, 0usize);
         for i in 0..prod.len() {
             if prod[i].starts_with("dispatch_window!(") {
-                let arg3 = prod.get(i + 3).map(|s| s.as_str()).unwrap_or("");
-                if arg3 == concat!("must", "_start,") {
+                // 单行 / 多行调用同一口径（rustfmt 视长度二选一）：取第 3 个实参。
+                let arg3 = crate::guard_prod_lines::macro_call_arg(&prod, i, 2);
+                if arg3 == concat!("must", "_start") {
                     regular += 1;
-                } else if arg3 == "gs," {
+                } else if arg3 == "gs" {
                     tail_gs += 1;
                 }
             }
@@ -13865,9 +13870,15 @@ mod testsync413_tests {
     #[test]
     fn ts423g_dispatch_call_sites_source_anchor() {
         let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC);
-        let reg = prod
-            .iter()
-            .position(|l| l.contains("let must_start = must_start_for_window("))
+        // `let must_start =` 与 `must_start_for_window(` 可能被 rustfmt 折成两行。
+        let reg = (0..prod.len())
+            .find(|&i| {
+                prod[i].contains("let must_start = must_start_for_window(")
+                    || (prod[i] == "let must_start ="
+                        && prod
+                            .get(i + 1)
+                            .is_some_and(|l| l.starts_with("must_start_for_window(")))
+            })
             .expect("must_start 计算锚点缺失");
         let reg_dw = prod[reg..]
             .iter()
@@ -13875,8 +13886,8 @@ mod testsync413_tests {
             .map(|i| i + reg)
             .expect("常规窗 dispatch_window! 缺失");
         assert_eq!(
-            prod[reg_dw + 3],
-            "must_start,",
+            crate::guard_prod_lines::macro_call_arg(&prod, reg_dw, 2),
+            "must_start",
             "常规窗第 3 参须为 must_start（少带前文）"
         );
         assert!(
@@ -19633,6 +19644,39 @@ mod guard_prod_lines {
     /// 返回 `src` 的「生产区」逐行 trim 文本：**剔除所有 test-gated 项**
     /// （`mod` / `fn` / 任意项），保留其余全文 —— 不再「截断到首个标记」。
     ///
+    /// 宏调用 `prod[i]` 起（`name!(`）的第 `n` 个实参（0 起，去空白、不含逗号）。rustfmt 视长度把调用排成单行或
+    /// 一参一行，两种排法同一口径。只按顶层逗号切（实参里的括号 / 方括号不切）。
+    pub(crate) fn macro_call_arg(prod: &[String], i: usize, n: usize) -> String {
+        let mut call = String::new();
+        for l in prod.iter().skip(i).take(16) {
+            call.push_str(l);
+            if l.ends_with(");") || l.ends_with("}};") {
+                break;
+            }
+        }
+        let Some(open) = call.find('(') else {
+            return String::new();
+        };
+        let (mut depth, mut args, mut cur) = (0i32, Vec::new(), String::new());
+        for c in call[open + 1..].chars() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' if depth == 0 => break,
+                ')' | ']' | '}' => depth -= 1,
+                ',' if depth == 0 => {
+                    args.push(std::mem::take(&mut cur));
+                    continue;
+                }
+                _ => {}
+            }
+            cur.push(c);
+        }
+        args.push(cur);
+        args.get(n)
+            .map(|a| a.trim().to_string())
+            .unwrap_or_default()
+    }
+
     /// 🔴 FIX-GUARD-PRODLINES-422：项体定界改用 [`item_end`]（字符串 / 字符 / 注释感知），
     /// 不再朴素逐字数花括号 ⇒ 测试模块内字符串 / 字符 / 原始串 / 注释里的 `{`/`}` 不再带偏、
     /// 不再把其后生产区整段当测试剔除（`[GUARD-SKIP-BRACE-IN-STRING-382]` 第二次复发的根治）。
