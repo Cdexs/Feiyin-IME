@@ -162,7 +162,7 @@
 
 | 事项 | 一句话 | 详情 |
 | --- | --- | --- |
-| ASR-SERVER-491 | 本地实时识别对外服务（Gavin 10-17）：输入法进程当内核 + 独立网关进程 + IPC；移动端跨网络用 LiveKit（不自建协议）。Gavin「Poc 吧」⇒ PoC 子项：**491-P1** 现状串行下本机 + 2 路远程并发延迟（🔄 运行中，`poc_asr_server_491.rs`）· **491-P2** llama.cpp 一份权重多推理通道并行 vs 串行（编排层并发接口现成：`WINDOW_DECODE_CONCURRENCY`，TUNE-390 改为 1；引擎层 `shim.cpp:207` 单通道）· **491-P3** LiveKit Server Windows 自部署资源占用 · **491-P4** LiveKit Rust SDK Windows 构建 + 识别代理原型 · **491-P5** 许可证核对 · **491-P6** 切网 / 弱网实测（需 Gavin 手机配合） | `docs/ASR-SERVER-DESIGN.md`；证据 `collab/evidence/491/` |
+| ASR-SERVER-491 | 本地实时识别对外服务（Gavin 10-17）：输入法进程当内核 + 独立网关进程 + IPC；移动端跨网络用 LiveKit（不自建协议）。Gavin「Poc 吧」⇒ PoC 子项：**491-P1** 并发延迟 ✅（本机优先：本机定稿中位 1.8→2.3s，最慢 4.9→3.3s）· **491-P2** 多通道并行 ✅（780M 上 1.04 倍，无用；生成占 58%，只有批量能提速）· **491-P3** LiveKit 空载 ✅ 52MB · **491-P4** Rust SDK + 识别代理 ✅（须静态 CRT ⇒ 只能独立进程；端到端 64ms；网关 2 路约 90MB）· **491-P5** 许可证 ✅ 全 Apache-2.0 · **491-P6** 真机切网 ⏸ 待 Gavin 配合 · 临时目录 `poc-491\`（3.5GB）待清理 | `docs/ASR-SERVER-DESIGN.md`；证据 `collab/evidence/491/` |
 | ITN-FIX-BIGNUM-027 遗留三条 | `一万亿`→`10000亿` 是否改；`十万个为什么`→`10万个为什么` 专名被改写是否开单；`两万五百`→`20500` 备查 | §「ITN-FIX-BIGNUM-027」 |
 | RESEARCH-SCENE-COVERAGE-001 | 场景词表扩展研究，三项已拍板落地，剩余争议项待定 | §「RESEARCH-SCENE-COVERAGE-001」 |
 | 领域级泛化关键词第二批 | `思维导图` / `白板` / `表格` 是否收进词表 | §「领域级泛化关键词第二批」 |
