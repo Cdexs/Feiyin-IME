@@ -74,9 +74,15 @@ enum Op {
     Ins(usize),
 }
 
-/// LCS 的格子数上限（中段 old × new）；超过则整段当一次替换，防止长文本 O(n·m) 爆内存 / 耗时。
-const LCS_CELL_CAP: usize = 4_000_000;
+/// Myers 允许的最大编辑距离 D（删 + 插的总数）；超过则整段中间当一次替换。
+///
+/// 真实输入是「同一段转写在节点前后的小改动」：去口水词删几个字、ITN 替换短串、简繁 1:1 替换、插标点，
+/// D 通常是个位数到几十。2000 已远超这类改动；再大说明两串基本不相干，逐字对位本来就没有意义。
+/// 同时它把耗时压在 O((N+M)·D)，把回溯用的 V 快照内存压在 O(D²)（上限约 2000² × 4 字节 ≈ 16 MB）。
+const MYERS_MAX_D: usize = 2000;
 
+/// 字符级 diff：先去掉公共前缀 / 后缀，中段用 Myers O((N+M)·D) 贪心求最短编辑脚本。
+/// 输出的 `Eq` / `Del` / `Ins` 下标均为绝对下标；中段编辑距离超过 `MYERS_MAX_D` 时整段当一次替换。
 fn diff_ops(old: &[char], new: &[char]) -> Vec<Op> {
     let mut pre = 0;
     while pre < old.len() && pre < new.len() && old[pre] == new[pre] {
@@ -93,42 +99,102 @@ fn diff_ops(old: &[char], new: &[char]) -> Vec<Op> {
     let (mo, mn) = (o.len(), n.len());
 
     let mut ops: Vec<Op> = (0..pre).map(|i| Op::Eq(i, i)).collect();
-    if mo == 0 || mn == 0 || mo * mn > LCS_CELL_CAP {
-        ops.extend((0..mo).map(|i| Op::Del(pre + i)));
-        ops.extend((0..mn).map(|j| Op::Ins(pre + j)));
+    let mid = if mo == 0 || mn == 0 {
+        None
     } else {
-        // dp[i][j] = o[i..] 与 n[j..] 的 LCS 长度
-        let w = mn + 1;
-        let mut dp = vec![0u32; (mo + 1) * w];
-        for i in (0..mo).rev() {
-            for j in (0..mn).rev() {
-                dp[i * w + j] = if o[i] == n[j] {
-                    dp[(i + 1) * w + j + 1] + 1
-                } else {
-                    dp[(i + 1) * w + j].max(dp[i * w + j + 1])
-                };
-            }
+        myers_middle(o, n, pre)
+    };
+    match mid {
+        Some(mid) => ops.extend(mid),
+        None => {
+            ops.extend((0..mo).map(|i| Op::Del(pre + i)));
+            ops.extend((0..mn).map(|j| Op::Ins(pre + j)));
         }
-        let (mut i, mut j) = (0, 0);
-        while i < mo && j < mn {
-            if o[i] == n[j] {
-                ops.push(Op::Eq(pre + i, pre + j));
-                i += 1;
-                j += 1;
-            } else if dp[(i + 1) * w + j] >= dp[i * w + j + 1] {
-                ops.push(Op::Del(pre + i));
-                i += 1;
-            } else {
-                ops.push(Op::Ins(pre + j));
-                j += 1;
-            }
-        }
-        ops.extend((i..mo).map(|x| Op::Del(pre + x)));
-        ops.extend((j..mn).map(|x| Op::Ins(pre + x)));
     }
     let (ol, nl) = (old.len(), new.len());
     ops.extend((0..suf).map(|k| Op::Eq(ol - suf + k, nl - suf + k)));
     ops
+}
+
+/// Myers 贪心最短编辑脚本（`o` / `n` 均非空，且首尾字符已不相同）。`pre` 为中段在原文里的起点偏移，
+/// 输出下标已加上它。编辑距离超过 `MYERS_MAX_D` 返回 `None`，由调用方整段当替换。
+///
+/// 正向逐轮 d = 0, 1, …：对角线 k = x − y ∈ {−d, −d+2, …, d}，`v[k]` 记该对角线上走得最远的 x。
+/// 每轮结束把 `v` 在 [−d, d] 的切片（2d+1 项）存进 `trace`，回溯时用它还原每一步是删还是插。
+/// 平局（两个来源 x 相同）时取「右移 = 删」，即删除排在插入前面。
+fn myers_middle(o: &[char], n: &[char], pre: usize) -> Option<Vec<Op>> {
+    let (mo, mn) = (o.len(), n.len());
+    // 快照用 u32 存 x，字数超出 u32 的极端输入直接放弃（走整段替换）
+    if u32::try_from(mo + mn + 2).is_err() {
+        return None;
+    }
+    let max_d = MYERS_MAX_D.min(mo + mn);
+    let off = max_d + 1;
+    // v[off + k] = 对角线 k 上最远的 x；v[off + 1] = 0 让 d = 0 一轮从 (0, 0) 出发
+    let mut v = vec![0usize; 2 * max_d + 3];
+    let mut trace: Vec<Vec<u32>> = Vec::new();
+    let mut found = None;
+    'rounds: for d in 0..=max_d {
+        let di = d as isize;
+        let mut k = -di;
+        while k <= di {
+            let idx = (off as isize + k) as usize;
+            // 下移 = 插入（x 不变）；右移 = 删除（x + 1）。平局取右移
+            let mut x = if k == -di || (k != di && v[idx - 1] < v[idx + 1]) {
+                v[idx + 1]
+            } else {
+                v[idx - 1] + 1
+            };
+            let mut y = (x as isize - k) as usize;
+            while x < mo && y < mn && o[x] == n[y] {
+                x += 1;
+                y += 1;
+            }
+            v[idx] = x;
+            if x >= mo && y >= mn {
+                found = Some(d);
+                break 'rounds;
+            }
+            k += 2;
+        }
+        trace.push(v[off - d..=off + d].iter().map(|&x| x as u32).collect());
+    }
+    let d_total = found?;
+
+    // 回溯：从 (mo, mn) 倒着走，每轮先吃掉末尾的对角线（Eq），再还原那一步编辑
+    let mut rev: Vec<Op> = Vec::new();
+    let (mut x, mut y) = (mo, mn);
+    for d in (1..=d_total).rev() {
+        let prev = &trace[d - 1];
+        let di = d as isize;
+        let at = |kk: isize| prev[(kk + di - 1) as usize] as usize;
+        let k = x as isize - y as isize;
+        let down = k == -di || (k != di && at(k - 1) < at(k + 1));
+        let pk = if down { k + 1 } else { k - 1 };
+        let px = at(pk);
+        let py = (px as isize - pk) as usize;
+        // 这一步编辑之后的落点
+        let (mx, my) = if down { (px, py + 1) } else { (px + 1, py) };
+        while x > mx && y > my {
+            x -= 1;
+            y -= 1;
+            rev.push(Op::Eq(pre + x, pre + y));
+        }
+        rev.push(if down {
+            Op::Ins(pre + py)
+        } else {
+            Op::Del(pre + px)
+        });
+        (x, y) = (px, py);
+    }
+    // d = 0：开头那段对角线
+    while x > 0 && y > 0 {
+        x -= 1;
+        y -= 1;
+        rev.push(Op::Eq(pre + x, pre + y));
+    }
+    rev.reverse();
+    Some(rev)
 }
 
 /// 把 `old` 的逐字时间搬到 `new` 上。输出长度恒等于 `new` 的字数。
@@ -646,39 +712,152 @@ mod tests {
         assert_eq!(r[3].unwrap().end, 5.0);
     }
 
-    #[test]
-    fn transfer_lcs_cap_path_returns_right_len_fast() {
-        // 中段 3001 × 3002 > 4M ⇒ 整段当一次替换，不跑 DP
-        let old: String = std::iter::once('x')
-            .chain(std::iter::repeat('a').take(3000))
-            .collect();
-        let new: String = std::iter::once('q')
-            .chain(std::iter::repeat('a').take(3000))
-            .chain(std::iter::once('w'))
-            .collect();
-        let t = unit(old.chars().count());
-        let start = std::time::Instant::now();
-        let r = transfer(&old, &t, &new);
-        assert_eq!(r.len(), new.chars().count());
-        assert!(r.iter().all(|x| x.is_some()));
-        assert!(start.elapsed().as_secs() < 5);
-        assert_eq!(r[0].unwrap().begin, 0.0);
-        assert!(close(r.last().unwrap().unwrap().end, 3001.0));
+    /// 第 i 个唯一汉字（0x4E00 起），避免重复字造成对位歧义。
+    fn uniq(i: usize) -> char {
+        char::from_u32(0x4E00 + i as u32).unwrap()
     }
 
     #[test]
-    fn transfer_lcs_boundary_runs_dp() {
-        // 2000 × 2000 = 4M，恰好走 DP：交替字符，长度正确且大部分字保留原时间
-        let old: String = (0..2000)
-            .map(|i| if i % 2 == 0 { 'a' } else { 'b' })
-            .collect();
-        let new: String = (0..2000)
-            .map(|i| if i % 2 == 0 { 'b' } else { 'a' })
-            .collect();
-        let t = unit(2000);
+    fn transfer_long_text_edits_at_both_ends_keep_exact_times() {
+        // 5000 字，开头附近删 1 字、末尾附近 1:1 替换 1 字：中段又长又有两端编辑，
+        // 旧 LCS 格子数超上限会退化成整段均分；Myers 下每个没变的字都必须保持原时间
+        let old_chars: Vec<char> = (0..5000).map(uniq).collect();
+        let old: String = old_chars.iter().collect();
+        let mut new_chars = old_chars.clone();
+        new_chars[4900] = 'X';
+        new_chars.remove(10);
+        let new: String = new_chars.iter().collect();
+        let t = unit(5000);
         let r = transfer(&old, &t, &new);
-        assert_eq!(r.len(), 2000);
+        assert_eq!(r.len(), 4999);
+        for (j, got) in r.iter().enumerate() {
+            // 新下标 j 对应的旧下标：删掉第 10 个字后整体前移 1
+            let src = if j < 10 { j } else { j + 1 };
+            // 被 1:1 替换的字（旧 4900 → 新 4899）也恰好继承原来那一格
+            assert_eq!(*got, t[src], "j={j}");
+        }
+    }
+
+    #[test]
+    fn transfer_myers_cap_boundary() {
+        // 4000 字里每隔 3 字替换 1 字：D = 2 × 替换数。1000 处 ⇒ D = 2000，恰好在上限内，没变的字逐个保留
+        let replace = |count: usize| -> (String, String) {
+            let old: Vec<char> = (0..4000).map(uniq).collect();
+            let mut new = old.clone();
+            for i in 0..count {
+                new[1 + i * 3] = 'X';
+            }
+            (old.iter().collect(), new.iter().collect())
+        };
+        let (old, new) = replace(1000);
+        let t = unit(4000);
+        let r = transfer(&old, &t, &new);
+        assert_eq!(r, t);
+        // 1001 处 ⇒ D = 2002 > 上限：整段当一次替换，长度仍正确且全有时间
+        let (old, new) = replace(1001);
+        let r = transfer(&old, &t, &new);
+        assert_eq!(r.len(), 4000);
         assert!(r.iter().all(|x| x.is_some()));
+        assert_eq!(r[0].unwrap().begin, 0.0);
+        assert!(close(r[3999].unwrap().end, 4000.0));
+    }
+
+    #[test]
+    fn transfer_fully_different_long_pair_is_fast_and_even() {
+        // 5000 × 5000 全不相同：D = 10000 > 上限，直接整段均分，必须很快返回
+        let old: String = (0..5000).map(uniq).collect();
+        let new: String = (0..5000).map(|i| uniq(6000 + i)).collect();
+        let t = unit(5000);
+        let start = std::time::Instant::now();
+        let r = transfer(&old, &t, &new);
+        assert!(start.elapsed().as_secs() < 5);
+        assert_eq!(r.len(), 5000);
+        assert!(r.iter().all(|x| x.is_some()));
+        assert_eq!(r[0].unwrap().begin, 0.0);
+        assert!(close(r[4999].unwrap().end, 5000.0));
+        // 新旧等长 ⇒ 均分后每字恰好一格
+        assert!(close(r[2500].unwrap().begin, 2500.0));
+    }
+
+    /// 两串的 LCS 长度（朴素 DP，仅测试用）。
+    fn lcs_len(a: &[char], b: &[char]) -> usize {
+        let mut dp = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+        for i in 0..a.len() {
+            for j in 0..b.len() {
+                dp[i + 1][j + 1] = if a[i] == b[j] {
+                    dp[i][j] + 1
+                } else {
+                    dp[i][j + 1].max(dp[i + 1][j])
+                };
+            }
+        }
+        dp[a.len()][b.len()]
+    }
+
+    /// 校验脚本合法（Eq 两字相同、下标严格递增、旧新每个下标恰好被覆盖一次），返回 Eq 个数。
+    fn check_script(a: &[char], b: &[char]) -> usize {
+        let ops = diff_ops(a, b);
+        let (mut i, mut j, mut eq) = (0, 0, 0);
+        for op in &ops {
+            match *op {
+                Op::Eq(x, y) => {
+                    assert_eq!((x, y), (i, j));
+                    assert_eq!(a[x], b[y]);
+                    i += 1;
+                    j += 1;
+                    eq += 1;
+                }
+                Op::Del(x) => {
+                    assert_eq!(x, i);
+                    i += 1;
+                }
+                Op::Ins(y) => {
+                    assert_eq!(y, j);
+                    j += 1;
+                }
+            }
+        }
+        assert_eq!((i, j), (a.len(), b.len()));
+        eq
+    }
+
+    #[test]
+    fn myers_script_is_minimal_on_small_cases() {
+        // (旧, 新, 手算 LCS 长度)：Eq 个数必须等于 LCS（脚本最短）
+        let cases = [
+            ("abcabba", "cbabac", 4), // Myers 论文例子
+            ("kitten", "sitting", 4), // i t t n
+            ("abcdef", "azced", 3),   // a c e
+            ("ab", "ba", 1),
+            ("aaaa", "aa", 2),
+            ("abc", "", 0),
+            ("", "abc", 0),
+            ("abc", "abc", 3),
+            ("abc", "xyz", 0),
+        ];
+        for (a, b, lcs) in cases {
+            let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+            assert_eq!(check_script(&a, &b), lcs, "{a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn myers_matches_dp_lcs_on_pseudo_random_pairs() {
+        // 小字母表（3 种字）随机对：Eq 个数 == 朴素 DP 的 LCS 长度
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move |m: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % m
+        };
+        for _ in 0..300 {
+            let la = next(30) as usize;
+            let lb = next(30) as usize;
+            let a: Vec<char> = (0..la).map(|_| (b'a' + next(3) as u8) as char).collect();
+            let b: Vec<char> = (0..lb).map(|_| (b'a' + next(3) as u8) as char).collect();
+            assert_eq!(check_script(&a, &b), lcs_len(&a, &b), "{a:?} vs {b:?}");
+        }
     }
 
     // ---- fill_missing ----

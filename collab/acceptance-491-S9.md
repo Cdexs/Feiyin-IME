@@ -52,4 +52,4 @@
 
 ## F. 遗留
 
-- `transfer` 超限分支改 Myers O(ND) 差分（派子 Agent，单独提交）。
+- ✅ `transfer` 中段改 Myers O((N+M)·D) 差分（编辑距离上限 2000，超限才整段替换）；41 个 char_times 测试过（含 300 组随机对与朴素 DP 对拍），rustfmt 干净。
