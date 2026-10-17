@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "crash-reporter"
 path = "src/bin/crash-reporter.rs"
 
+[features]
+# 本地 PoC / 离线实验测试（文件不入库，见 .gitignore「PoC 不入库」段）；默认关，构建产物不受影响。
+poc = []
+
 [dependencies]
 # Async runtime (cross-platform)
 tokio = { version = "1", features = ["rt", "time"] }

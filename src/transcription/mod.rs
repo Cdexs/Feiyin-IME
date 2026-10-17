@@ -16,20 +16,18 @@ pub mod qwen_inference;
 pub(crate) mod llama_asr;
 pub(crate) mod speaker;
 mod vad;
-// FIX-SLICE-CUT-AT-GAP-381：§4/§5 实测 PoC（纯 `#[cfg(test)]`，无 lib target 故不能放 src/bin|tests）
-#[cfg(test)]
+// PoC / 离线实验代码不入库（Gavin 2026-10-17「以后 POC 方案和相关的代码不要推送到库里」）：
+// 文件只在本地（.gitignore 排除），声明受 `poc` 特性控制 —— 不开特性时编译器不读这些文件，
+// 全新 clone 照常编译。本地跑：`cargo test --features poc --bin feiyin-ime <名字> -- --ignored --nocapture`。
+#[cfg(all(test, feature = "poc"))]
 mod poc_slice_cut_381;
-// REPLAY-436：433 vs 436 全量录音离线对照（单线程简化回放；整文件 `#[cfg(test)]`，只测不改生产）
-#[cfg(test)]
+#[cfg(all(test, feature = "poc"))]
 mod replay436_tests;
-// POC-VOICEPRINT-SHORT-444：声纹短片段判别力离线测试（整文件 #[cfg(test)]，只测不改生产）
-#[cfg(test)]
+#[cfg(all(test, feature = "poc"))]
 mod poc_voiceprint_short_444;
-// POC-GPU-451：GPU 加速离线测试的 CPU 基线（整文件 #[cfg(test)] + #[ignore]，只测不改生产）
-#[cfg(test)]
+#[cfg(all(test, feature = "poc"))]
 mod poc_gpu_451;
-// POC-ASR-SERVER-491：本机 + 远程并发占用实测（整文件 #[cfg(test)] + #[ignore]，只测不改生产）
-#[cfg(test)]
+#[cfg(all(test, feature = "poc"))]
 mod poc_asr_server_491;
 // SLIDING-WINDOW-367：路A 逐片解码摘接线后，`join_segment_texts` 等 re-export 暂无人用；
 // **保留**（可回挂），故局部 allow。

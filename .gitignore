@@ -159,3 +159,8 @@ ui/src/test/browser/__screenshots__/
 # exe 同级 debug-audio/ 下的 WAV 载荷是用户真实口述录音（隐私非密钥），
 # 内容正则永久盲区（[GATE-MATCHES-SHAPE-NOT-CONTENT-001]），必须靠路径拦截。
 debug-audio/
+# ===== PoC 不入库（Gavin 2026-10-17「以后 POC 方案和相关的代码不要推送到库里。已经推送到库里的，要把它删除掉」）=====
+# PoC / 离线实验代码只留本地：文件名一律 `poc_*.rs`（或下列历史文件），声明用 `#[cfg(all(test, feature = "poc"))]`。
+# PoC 方案、实测记录写 collab/evidence/（已整目录忽略），设计文档只留结论。
+/src/**/poc_*.rs
+/src/transcription/replay436_tests.rs

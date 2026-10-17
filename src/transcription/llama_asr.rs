@@ -293,8 +293,8 @@ impl LlamaAsr {
         )
     }
 
-    /// QUANT-AB-457：测试用 —— 指定主模型 / 编码器文件与设备（量化方案对比）。
-    #[cfg(test)]
+    /// QUANT-AB-457：测试用 —— 指定主模型 / 编码器文件与设备（量化方案对比；仅本地 PoC 用）。
+    #[cfg(all(test, feature = "poc"))]
     pub(crate) fn load_files(model: &Path, mmproj: &Path, gpu: bool) -> Result<Self> {
         Self::create(model, mmproj, &[gpu])
     }
@@ -413,7 +413,7 @@ impl LlamaAsr {
 
     /// ACC-452 ④ 续写（**不采用**：452 回放 CER 8.09% vs 接缝拼接 5.20%、重复更多 ⇒ 仅供回放实验，测试编译）：assistant 预填 `language {language}<asr_text>{prior}`（`prior` = 本次录音已定稿文字末尾），
     /// 模型从音频中「prior 之后」的位置接着写。返回**只含新生成部分**的文本（去掉预填）+ 统计。
-    #[cfg(test)]
+    #[cfg(all(test, feature = "poc"))]
     pub(crate) fn decode_continue(
         &self,
         samples: &[f32],
