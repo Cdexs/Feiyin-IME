@@ -135,3 +135,12 @@
 - 要点：翻译引擎跟随服务端本机设置（大模型优先，否则进程级 NLLB 线程）；`OpenParams` 三字段 serde 缺省互通；S8 客户端删 `postprocess` 改发三项阿里同名参数到 `parameters` 顶层；本机管线一行未改。
 - 回归：全量 **2061 过 / 0 失败 / 48 忽略**、网关 **31 过**、fmt / `cargo check --all-targets` 干净。未交 tester-1（S11 完成后统一回归出包）。
 - 遗留：网关参数解析（`ws.rs:568`–`:574`）与 Feiyin 分支合并无独立单测，已人工逐行核对，由 S11 Python 参考客户端冒烟覆盖。下一步 S11。
+
+## 2026-10-17 — 主控 — ASR-SERVER-491 S11 协议文档 + Python 参考客户端验收通过（未出包）
+
+- 内容：对外协议文档做成独立契约（Gavin 10-17：安卓 / iOS 端另起项目），并配纯标准库 Python 参考客户端。验收清单 `collab/acceptance-491-S11.md`，提交 `b1463de`。另含 S10 追加修正（预览 tentative 换算，`35e928a`，6 单测，网关 31 过）。
+- 新增文件：`docs/ASR-PROTOCOL.md`、`tools/asr-client/feiyin_asr_client.py`、`tools/asr-client/test_feiyin_asr_client.py`、`tools/asr-client/.gitignore`。无 Rust 改动。
+- 测试：`py -3 -m unittest discover -s tools/asr-client` 45 过 / 0 失败，含本地 TLS 1.3 假网关集成测试 7 个。
+- 客户端注意点：音频发送线程与收事件线程共用一个 SSLSocket，**必须走同一把锁**，否则 Windows 偶发 `WinError 10035`。
+- 遗留：真实服务端冒烟未跑：`py -3 tools/asr-client/feiyin_asr_client.py --code "<连接码>" --wav <16k 单声道 wav>`。
+- 下一步：T，交 tester-1 做 TEST-SYNC → 全量回归 → 出包（五阶段串行，出包须主控明确下达）。待 Gavin：S6/S7/S8 界面目视、两台电脑实测。

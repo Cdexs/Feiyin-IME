@@ -2856,3 +2856,13 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 行为变化 | 本机识别路径一行未改。仅远程会话：同音纠错、去口水固定内置；ITN、补标点、翻译由终端参数决定。翻译引擎跟随服务端本机设置：配了大模型走大模型，否则走进程级 `remote-nllb` 线程（仅「服务端没配大模型且终端要翻译」时才首次加载 NLLB，约 600MB 内存），本机 worker 的 `thread_local` 缓存不受影响；方向自动判定（DEC-082） |
 | 对 macOS 的影响 | **平台中立，macOS 无需额外平台代码。** macOS 编译同一份代码，**未在 macOS 编译 / 实测**；只需核对上列 `OpenParams` / `ResultPayload` 构造点是否齐全。若 macOS 作为服务端且未配大模型，终端要翻译时会多占约 600MB（NLLB） |
 | 是否需要对方同步 | 否（无平台代码）；仅需 macOS 编译验证构造点。端到端待 S11 Python 参考客户端冒烟 |
+
+## ASR-SERVER-491 一期 S11（2026-10-17，主控）· 协议文档 + Python 参考客户端
+
+| 项 | 内容 |
+| --- | --- |
+| 改了什么 | 新增 `docs/ASR-PROTOCOL.md`（v1 对外协议，独立契约）、`tools/asr-client/feiyin_asr_client.py`（纯标准库参考客户端）、`tools/asr-client/test_feiyin_asr_client.py`（45 单测）、`tools/asr-client/.gitignore`。**无 Rust 改动** |
+| 契约变化 | 无。协议文档只是把现有网关行为写成文字，字段与行为未变 |
+| 行为变化 | 无 |
+| 对 macOS 的影响 | 协议文档平台无关。macOS 侧可用同一 Python 脚本对本机服务冒烟：`python3 tools/asr-client/feiyin_asr_client.py --code "<连接码>" --wav <16k 单声道 wav>`（仅需 Python 3 标准库） |
+| 是否需要对方同步 | 否。**对 macOS 无影响、无需同步改动** |
