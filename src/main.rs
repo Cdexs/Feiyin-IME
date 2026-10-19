@@ -533,7 +533,7 @@ fn create_menu_item_bitmap(size: i32, rgba: &[u8]) -> Option<HBITMAP> {
     Some(hbmp)
 }
 #[cfg(target_os = "windows")]
-fn attach_menu_icons(menu: HMENU) -> Vec<HBITMAP> {
+fn attach_menu_icons(menu: HMENU, asr_running: bool) -> Vec<HBITMAP> {
     // 尺寸取系统小图标规格（SM_CXSMICON 走已启用的 WindowsAndMessaging，
     // 不用 GetDpiForWindow —— 需 Win32_UI_HiDpi feature，红线禁改 Cargo.toml）。
     let size = unsafe {
@@ -541,8 +541,13 @@ fn attach_menu_icons(menu: HMENU) -> Vec<HBITMAP> {
             .min(GetSystemMetrics(SM_CYSMICON))
             .clamp(16, 64)
     };
-    let mut attached = Vec::with_capacity(2);
+    let mut attached = Vec::with_capacity(3);
     for (cmd_id, rgba) in [
+        // TRAY-ICON-500：识别服务项 —— 未运行 = 播放三角，运行中 = 停止方块（跟文案走）。
+        (
+            MENU_CMD_ASR_TOGGLE,
+            ui::menu_icons::service_icon_rgba(size as u32, asr_running),
+        ),
         (
             MENU_CMD_SETTINGS,
             ui::menu_icons::settings_icon_rgba(size as u32),
@@ -574,7 +579,7 @@ fn attach_menu_icons(menu: HMENU) -> Vec<HBITMAP> {
     }
     // FIX-164 Part C: 成功路径只记一条 debug（不刷屏），含挂载数量与尺寸供 debug.log 核对
     log::debug!(
-        "menu icon: attached {}/2 bitmaps at {}px (settings={}, exit={})",
+        "menu icon: attached {}/3 bitmaps at {}px (settings={}, exit={})",
         attached.len(),
         size,
         MENU_CMD_SETTINGS,
@@ -621,11 +626,14 @@ fn show_tray_popup_menu(
             MENU_CMD_EXIT as usize,
             PCWSTR(exit_w.as_ptr()),
         );
-        // TRAY-ICON-158：两项挂品牌橙图标。句柄现建现删，不缓存进
+        // TRAY-ICON-158：设置 / 退出挂品牌橙图标（TRAY-ICON-500 起识别服务项也挂）。句柄现建现删，不缓存进
         // thread_local/OnceLock（[D2D-HANG-001] 教训：跨线程/退出期释放句柄自找
         // 麻烦）；DeleteObject 必须在 DestroyMenu 之后——TrackPopupMenu 模态期间
         // 菜单还在读这些位图，提前删会让图标空白。
-        let menu_bitmaps = attach_menu_icons(menu);
+        let menu_bitmaps = attach_menu_icons(
+            menu,
+            asr_service::supervisor::tray_item_is_stop(asr_label, ui_language),
+        );
         let _ = SetForegroundWindow(controller_hwnd);
         let cmd = TrackPopupMenu(
             menu,

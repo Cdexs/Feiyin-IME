@@ -162,3 +162,4 @@
 - PIPE-REVIEW-498：`main.rs` 路B 词条读库挪进 `if PATH_B_WIRED_367`；其余节点复查结论见 CHANGELOG。
 - 测试：feiyin-ime 2083 过 / 0 失败；fmt 0。未出包。
 - UI-NOTICE-FONT-499：信息 / 错误提示窗文字改 GDI ClearType（streaming_font），统一入口 `draw_status_overlay`；D2D `draw_info_overlay` / `draw_error_overlay` 去掉 message 参数只画窗框圆点。2084 过 / 0 失败。待 Gavin 出包后目视。
+- TRAY-ICON-500：托盘识别服务项图标（启动 = 播放三角 / 停止 = 停止方块），`menu_icons::service_icon_rgba` + `rasterize_coverage`；Windows `attach_menu_icons` 多一参，macOS `set_asr_item_icon`。预览 `collab/outbox/coder-1/icons/service-*.png`。2085 过。

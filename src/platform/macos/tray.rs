@@ -179,6 +179,7 @@ pub fn poll_pending_tray_states() {
                 tray.asr_item.setTitle(&NSString::from_str(want.0));
                 tray.asr_item.setEnabled(want.1);
             }
+            set_asr_item_icon(&tray.asr_item, want.0, tray.ui_language);
             tray.asr_shown = want;
         }
     });
@@ -267,8 +268,18 @@ fn build_tray_menu(
             unsafe { item.setImage(Some(&img)) };
         }
     }
+    set_asr_item_icon(&asr_item, asr_shown.0, ui_language);
 
     (menu, asr_item, asr_shown)
+}
+
+/// TRAY-ICON-500：识别服务项图标跟文案走（未运行 = 播放三角，运行中 = 停止方块），与 Windows 同一光栅。
+fn set_asr_item_icon(item: &NSMenuItem, label: &str, ui_language: UiLanguage) {
+    let running = crate::asr_service::supervisor::tray_item_is_stop(label, ui_language);
+    let rgba = crate::ui::menu_icons::service_icon_rgba(18, running);
+    if let Some(img) = nsimage_from_rgba(18, 18, &rgba) {
+        unsafe { item.setImage(Some(&img)) };
+    }
 }
 
 // ============================================================================

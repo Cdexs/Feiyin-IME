@@ -45,6 +45,12 @@ pub(crate) fn tray_item(ui_language: crate::config::UiLanguage) -> (&'static str
     }
 }
 
+/// TRAY-ICON-500：菜单项当前是否为「停止识别服务」——图标跟 `tray_item` 给出的文案同源判定，
+/// 不另读开关（避免两次读之间开关翻转导致图标与文案不一致）。
+pub(crate) fn tray_item_is_stop(label: &str, ui_language: crate::config::UiLanguage) -> bool {
+    label == crate::i18n::get(ui_language).tray_menu_asr_stop
+}
+
 /// 托盘点击：翻转总开关并写回设置文件（与设置页同一个开关，看护线程 1 秒内跟上）。
 pub(crate) fn toggle_from_tray() {
     let mut s = ServiceSettings::load();

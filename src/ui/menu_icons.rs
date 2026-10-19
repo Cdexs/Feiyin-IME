@@ -24,6 +24,48 @@ pub fn exit_icon_rgba(size: u32) -> Vec<u8> {
     rasterize(size, power_covered)
 }
 
+/// TRAY-ICON-500：识别服务菜单项图标，跟菜单文案走 —— 未运行（「启动识别服务」）= 播放三角，
+/// 运行中（「停止识别服务」）= 停止方块。电源符号已给「退出」用，不复用以免两项同图。
+pub fn service_icon_rgba(size: u32, running: bool) -> Vec<u8> {
+    if running {
+        rasterize_coverage(size, stop_covered)
+    } else {
+        rasterize_coverage(size, play_covered)
+    }
+}
+
+/// TRAY-ICON-500：按真实覆盖率写 alpha（hits / 16 × 255）。
+/// ⚠️ 既有 `rasterize` 的 alpha 公式除以 SSAA（4）而非 SSAA²（16），5 个子样本以上命中即溢出回绕
+/// （hits 5→63、8→254、9→62 …），斜边抗锯齿实际失效；设置 / 退出 / 编辑三图标是 Gavin 按现状
+/// 目视定稿的，不在本单改动，新图标走本函数。
+fn rasterize_coverage(size: u32, covered: impl Fn(f32, f32) -> bool) -> Vec<u8> {
+    let s = size as f32;
+    let half = s / 2.0;
+    let sub = SSAA as f32;
+    let total = SSAA * SSAA;
+    let mut px = vec![0u8; (size * size * 4) as usize];
+    for y in 0..size {
+        for x in 0..size {
+            let mut hits = 0u32;
+            for sy in 0..SSAA {
+                for sx in 0..SSAA {
+                    let fx = (x as f32 + (sx as f32 + 0.5) / sub - half) / s;
+                    let fy = (y as f32 + (sy as f32 + 0.5) / sub - half) / s;
+                    if covered(fx, fy) {
+                        hits += 1;
+                    }
+                }
+            }
+            let i = ((y * size + x) * 4) as usize;
+            px[i] = BRAND_ORANGE[0];
+            px[i + 1] = BRAND_ORANGE[1];
+            px[i + 2] = BRAND_ORANGE[2];
+            px[i + 3] = ((hits * 255 + total / 2) / total) as u8;
+        }
+    }
+    px
+}
+
 // edit_icon_rgba 见本文件下方 EDITICON-190 实现（纯几何 SSAA：铅笔 + 单条下划线，定稿 A2）。
 
 /// EDITICON-176：直通 alpha BGRA（GDI `AlphaBlend` `AC_SRC_ALPHA` 输入格式）。
@@ -134,6 +176,38 @@ fn power_covered(fx: f32, fy: f32) -> bool {
     // 顶部缺口：以正上方向为零，±35° 内的环带不画
     let ang_from_up = fx.atan2(-fy);
     ang_from_up.abs() >= POWER_GAP_HALF_RAD
+}
+
+// —— TRAY-ICON-500 播放三角：顶点 (-0.20,-0.32) / (-0.20,0.32) / (0.34,0)，
+//      视觉重心略偏左于几何中心，整体右移 0.02S 使光学居中 ——
+const PLAY_LEFT_X: f32 = -0.20;
+const PLAY_HALF_H: f32 = 0.32;
+const PLAY_TIP_X: f32 = 0.34;
+
+fn play_covered(fx: f32, fy: f32) -> bool {
+    if fx < PLAY_LEFT_X || fx > PLAY_TIP_X {
+        return false;
+    }
+    // 上下两条斜边：|y| ≤ 半高 × (尖点距离 / 底到尖总长)
+    let t = (PLAY_TIP_X - fx) / (PLAY_TIP_X - PLAY_LEFT_X);
+    fy.abs() <= PLAY_HALF_H * t
+}
+
+// —— TRAY-ICON-500 停止方块：半边 0.25S（16/20/24px 下边缘正落像素格线，边缘锐利），圆角 0.04S ——
+const STOP_HALF: f32 = 0.25;
+const STOP_CORNER_R: f32 = 0.04;
+
+fn stop_covered(fx: f32, fy: f32) -> bool {
+    let (ax, ay) = (fx.abs(), fy.abs());
+    if ax > STOP_HALF || ay > STOP_HALF {
+        return false;
+    }
+    let inner = STOP_HALF - STOP_CORNER_R;
+    if ax <= inner || ay <= inner {
+        return true;
+    }
+    let (dx, dy) = (ax - inner, ay - inner);
+    dx * dx + dy * dy <= STOP_CORNER_R * STOP_CORNER_R
 }
 
 // —— EDITICON-190：编辑图标定稿 = 候选 A2「铅笔 + 单条下划线」（Gavin 2026-09-08 目视
@@ -442,6 +516,8 @@ mod tests {
             for (name, rgba) in [
                 ("settings", settings_icon_rgba(size)),
                 ("exit", exit_icon_rgba(size)),
+                ("service-start", service_icon_rgba(size, false)),
+                ("service-stop", service_icon_rgba(size, true)),
             ] {
                 let path = dir.join(format!("{name}-{size}.png"));
                 image::save_buffer(&path, &rgba, size, size, image::ExtendedColorType::Rgba8)
@@ -474,5 +550,27 @@ mod tests {
         assert_eq!(gear[3], 0, "gear corner must be empty");
         let power = exit_icon_rgba(32);
         assert_eq!(power[3], 0, "power corner must be empty");
+    }
+
+    /// TRAY-ICON-500：播放三角 / 停止方块形态抽检（中心实心、角落透明、三角尖朝右）。
+    #[test]
+    fn service_icons_shape() {
+        let alpha = |px: &[u8], x: usize, y: usize| px[(y * 32 + x) * 4 + 3];
+        let play = service_icon_rgba(32, false);
+        assert_eq!(alpha(&play, 16, 16), 255, "play center must be solid");
+        assert_eq!(alpha(&play, 0, 0), 0, "play corner must be empty");
+        // 三角尖朝右：左侧近底边处高、右侧近尖点处矮
+        let col_h = |x: usize| (0..32).filter(|&y| alpha(&play, x, y) > 127).count();
+        assert!(col_h(11) > col_h(24), "play triangle must point right");
+        let stop = service_icon_rgba(32, true);
+        assert_eq!(alpha(&stop, 16, 16), 255, "stop center must be solid");
+        assert_eq!(alpha(&stop, 0, 0), 0, "stop corner must be empty");
+        // 方块左右对称
+        for y in 0..32 {
+            for x in 0..16 {
+                assert_eq!(alpha(&stop, x, y), alpha(&stop, 31 - x, y));
+            }
+        }
+        assert_ne!(play, stop, "start / stop icons must differ");
     }
 }
