@@ -23,7 +23,7 @@ const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
 
   const [qwen3TestStatus, setQwen3TestStatus] = useState<'idle' | 'testing' | 'success' | 'failed'>('idle');
   const [qwen3TestMessage, setQwen3TestMessage] = useState('');
-  const prevModelRef = useRef<string>('performance');
+  const prevModelRef = useRef<string>('local_realtime');
   const latestRef = useRef({ asrModel: '', config: {} as any });
   // ASR-SERVER-491 S8：自家识别服务是否已配对（没配对就离开本页 ⇒ 同无 key 一样回落上一个档位）。
   const remotePairedRef = useRef(false);
@@ -35,34 +35,12 @@ const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
   // 静默迁移会改变用户实际使用的 ASR 引擎（在线→本地），属功能变更；显示层回落则会
   // 造成「显示 performance 实际跑 qwen」的不一致。两者都不可取，故按存量保留、
   // 新用户不可见处理：切走之后就再也切不回来。
-  const asrModel = config.audio?.asr_model ?? "performance";
-  // LOCAL-RT-UI-240: 本地 realtime 极客档（DEC-065），默认隐藏，本页按 Ctrl+M 解锁
-  const localRealtimeUnlocked = config.audio?.asr_local_realtime_unlocked === true;
+  // ASR-DEFAULT-LRT-506（Gavin 10-19「新装默认改成「本地流式实时模型」，并且去掉 Ctrl+M 才能看到的限制」）：
+  // 本地流式实时模型恒显示（原 LOCAL-RT-UI-240 Ctrl+M 解锁已删），缺值回落同新装默认。
+  const asrModel = config.audio?.asr_model ?? "local_realtime";
 
   useEffect(() => {
     loadDevices();
-  }, []);
-
-  // LOCAL-RT-UI-240: 本页内 Ctrl+M 解锁本地 realtime 档位。
-  // - 只开不关（A：避免「下拉显示 performance 实际跑 local_realtime」的显示/行为不一致，
-  //   同 ASR-UI-208 注释判定）
-  // - window keydown 天然只在设置窗口有焦点、且本页挂载时生效，不注册全局热键（不碰 DEC-004）
-  // - 仅在确认 Ctrl+M 时处理，其余按键不拦截（不 preventDefault 无关事件）
-  // - 复用 updateConfig → save_config 落盘持久化（重启不丢）
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === 'm' || e.key === 'M')) {
-        e.preventDefault();
-        const cur = latestRef.current.config;
-        if (cur?.audio?.asr_local_realtime_unlocked === true) return;
-        updateConfig({
-          ...cur,
-          audio: { ...cur.audio, asr_local_realtime_unlocked: true }
-        });
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
   }, []);
 
   useEffect(() => {
@@ -258,13 +236,11 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
             {asrModel === "performance" && (
               <option value="performance">{t.voice_asr_model_performance}</option>
             )}
+            <option value="local_realtime">{t.voice_asr_model_local_realtime}</option>
             {asrModel === "qwen_audio_online" && (
               <option value="qwen_audio_online">{t.voice_asr_model_qwen3}</option>
             )}
             <option value="fun_asr_realtime">{t.voice_asr_model_fun_asr}</option>
-            {localRealtimeUnlocked && (
-              <option value="local_realtime">{t.voice_asr_model_local_realtime}</option>
-            )}
             <option value="feiyin_server">{t.voice_asr_model_feiyin}</option>
           </select>
 

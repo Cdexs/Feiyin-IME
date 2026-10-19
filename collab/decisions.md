@@ -94,7 +94,7 @@
 | DEC-060 | L0 保真规则收窄为只保护「内容单元」，话语标记（比如 / 再比如等）允许在格式化时移除 | 现行 |
 | DEC-062 | 模型切换预热（D1）+ 1.5s 有界等待（D2），修「切模型后首次录音仍用旧引擎」 | 现行 |
 | DEC-063 | LLM `temperature` 维持 0.3 不动 —— 实测 30 次证明温度不是格式化稳定性的杠杆，根因在提示词基座 | 现行 |
-| DEC-065 | 本地实时流式 ASR 定位「极客档」：默认完全隐藏，设置界面 `Ctrl+M` 才解锁；**否决 FunASR Runtime 独立服务形态**（与 tray-first 免安装冲突），走 sherpa-onnx 进程内 | 现行 |
+| DEC-065 | ~~（10-19 前半句被 DEC-113 推翻：恒显示、新装默认）~~ 本地实时流式 ASR 定位「极客档」：默认完全隐藏，设置界面 `Ctrl+M` 才解锁；**否决 FunASR Runtime 独立服务形态**（与 tray-first 免安装冲突），走 sherpa-onnx 进程内 | 现行 |
 | DEC-067 | 本地 realtime 选型：**streaming-paraformer-trilingual（228MB, greedy）做流式预览 + accuracy（972MB）做 2pass 最终文本与热词**。否决 zipformer——热词强制 beam，beam 必产生改写/回退，与 DEC-054 前缀单调前提冲突 | 现行 |
 | DEC-068 | accuracy KV 512 是「音频+prompt+热词+生成」**四者共享的零和总预算**，生成 token 计入其中；评估精度必须四者一起算 | 现行 |
 | DEC-069 | 🔴 撞 KV 顶**不报错**：静默 `Truncating`（截音频）或 `Falling back`（跳过音频注入，最坏）。**判越界看日志关键字 `Truncating`/`Falling back`，不是看有没有输出** | 现行 |
@@ -153,3 +153,4 @@
 **DEC-052（本地 VAD 计费门控）在 `decisions-archive.md` 里没有独立小节**，只在 DEC-055 一带被引用过。
 要引用它时先去 `logs/` 与 `troubleshooting-archive.md` 找原始记录，别当它已正式立档。
 | DEC-112 | 本地实时最终文本**剥光标点后由标点模型（CT-Transformer，只看文字）整段重打**（PUNCT-REDO-493，推翻 DEC-080）：最终文本 = 定稿前缀 + 最新窗口，每窗在停顿处切，实为多片拼装，精解模型按停顿打标点、窗尾必补 ⇒ 句子被切碎（Gavin 10-19 端测）。门 = 开标点 && 非翻译；开 LLM 时剥光文本交 LLM。只动本地实时一条管线 | 现行 |
+| DEC-113 | **本地流式实时模型成为新装默认、设置页恒显示**（ASR-DEFAULT-LRT-506，推翻 DEC-065 的「极客档隐藏 + Ctrl+M 解锁」，否决独立服务形态那半句不变）；「本地模型 - 快速」不再支持，只对存量配置显示（504）。新装 = `default-config.toml` + `AudioConfig::default()`；存量配置缺 `asr_model` 字段仍回落 performance，老用户零变化 | 现行 |

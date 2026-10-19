@@ -36,7 +36,7 @@ export const en = {
   voice_asr_model_qwen3_desc: 'Runs via cloud, uses Alibaba Cloud API for speech recognition.',
   voice_asr_model_fun_asr: 'Online Speech Recognition - FunASR',
   voice_asr_model_fun_asr_desc: 'Runs via cloud, FunASR Realtime model, low latency, suitable for real-time voice input.',
-  // LOCAL-RT-UI-240: hidden geek tier (DEC-065), unlocked via Ctrl+M in this page
+  // ASR-DEFAULT-LRT-506: always shown, new-install default
   voice_asr_model_local_realtime: 'Local Streaming Realtime',
   voice_asr_model_local_realtime_desc: 'Runs locally, shows text as you speak, works offline.',
   voice_asr_model_download_required: 'This model requires downloading before use',

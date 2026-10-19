@@ -147,13 +147,14 @@ describe('VoicePage - PUNCT-UI-001', () => {
 
     // ASR-UI-208（Gavin 2026-09-10）：UI 移除「在线语音识别模型」(qwen_audio_online) 选项
     // ASR-SERVER-491 S8：新增「自家识别服务」(feiyin_server)；qwen 仍不出现、本地实时仍默认隐藏。
-    it('ASR-UI-002: select options are performance / fun-asr / feiyin-server', async () => {
+    // ASR-DEFAULT-LRT-506：本地流式实时模型恒显示（无需 Ctrl+M 解锁）。
+    it('ASR-UI-002: select options are performance / local-realtime / fun-asr / feiyin-server', async () => {
       render(<VoicePage config={baseConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {
         const select = screen.getAllByRole('combobox')[1];
         expect(select).toBeInTheDocument();
         const values = Array.from(select.querySelectorAll('option')).map(o => o.value);
-        expect(values).toEqual(['performance', 'fun_asr_realtime', 'feiyin_server']);
+        expect(values).toEqual(['performance', 'local_realtime', 'fun_asr_realtime', 'feiyin_server']);
       });
     });
 
@@ -162,7 +163,7 @@ describe('VoicePage - PUNCT-UI-001', () => {
       for (const model of ['fun_asr_realtime', 'feiyin_server', 'local_realtime']) {
         const cfg = {
           ...baseConfig,
-          audio: { ...baseConfig.audio, asr_model: model, asr_local_realtime_unlocked: true },
+          audio: { ...baseConfig.audio, asr_model: model },
         };
         const { unmount } = render(<VoicePage config={cfg} updateConfig={vi.fn()} />);
         await waitFor(() => {

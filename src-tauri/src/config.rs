@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
 
-
 /// 最大录音时长（秒），硬编码，不可通过 config 修改。
 /// 🔴 FIX-REMOVE-HARDSPLIT-370：与主程序 `src/config/mod.rs` 的
 /// `MAX_RECORD_SECONDS` **保持同值**（180 → 300，Gavin 定）；本文件当前无引用点，
@@ -12,7 +11,6 @@ use std::path::PathBuf;
 pub const MAX_RECORD_SECONDS: u64 = 300;
 /// 最长静默间隔（毫秒），超过此时长无声音则自动停止录音
 pub const SILENCE_DURATION_MS: u64 = 8_000;
-
 
 fn default_auto_learn_threshold() -> u32 {
     2
@@ -97,7 +95,7 @@ pub struct AudioConfig {
     #[serde(default)]
     pub enable_streaming: bool,
     /// ASR 模型选择（DEC-025 / DEC-028 / ASR-041 / ASR-056）：
-    /// "performance"(默认) | "accuracy" | "qwen_audio_online" | "fun_asr_realtime"
+    /// "performance" | "accuracy" | "qwen_audio_online" | "fun_asr_realtime" | "local_realtime"（新装默认，ASR-DEFAULT-LRT-506）
     /// 必须与主程序 src/config/mod.rs AudioConfig.asr_model 同步，
     /// 否则配置界面保存时会静默丢弃主程序写入的 asr_model（round-trip 数据丢失）
     #[serde(default = "default_asr_model")]
@@ -140,9 +138,13 @@ fn default_overlay_opacity() -> f32 {
     0.75
 }
 
+/// 存量配置缺 `asr_model` 字段时的回落值（与主程序 `src/config/mod.rs` 同步）。
 fn default_asr_model() -> String {
     "performance".to_string()
 }
+
+/// ASR-DEFAULT-LRT-506：新装默认模型（与主程序 `NEW_INSTALL_ASR_MODEL` 同步）。
+const NEW_INSTALL_ASR_MODEL: &str = "local_realtime";
 
 fn default_asr_online_url() -> String {
     "wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference".to_string()
@@ -170,14 +172,14 @@ impl Default for AudioConfig {
             overlay_opacity: default_overlay_opacity(),
             input_device: String::new(),
             enable_streaming: false, // 默认使用 offline 模式
-            asr_model: default_asr_model(),
+            asr_model: NEW_INSTALL_ASR_MODEL.to_string(),
             asr_online_api_key: String::new(),
             asr_online_url: default_asr_online_url(),
             asr_online_model: default_asr_online_model(),
             asr_online_max_sentence_silence: default_asr_online_max_sentence_silence(),
             // ASR-SEG-229: 默认 false = VAD 断句（保持既有行为）
             asr_online_semantic_punctuation_enabled: false,
-            // LOCAL-RT-UI-240: 极客档默认隐藏，Ctrl+M 解锁后置 true 并落盘
+            // LOCAL-RT-UI-240：ASR-DEFAULT-LRT-506 起界面不再读取，保留字段兼容。
             asr_local_realtime_unlocked: false,
         }
     }
@@ -560,18 +562,19 @@ mod tests {
     fn mirror_asr_fields_match_main_config_literals() {
         let cfg = AppConfig::default();
         // 字段默认值（对应主程序 src/config/mod.rs 的 default_asr_model / default_asr_online_url / default_asr_online_model）
+        // ASR-DEFAULT-LRT-506：新装默认 = 主程序 NEW_INSTALL_ASR_MODEL；缺字段回落仍是 performance。
         assert_eq!(
-            cfg.audio.asr_model, "performance",
+            cfg.audio.asr_model, "local_realtime",
             "mirror asr_model default must match main config"
         );
+        assert_eq!(default_asr_model(), "performance");
         assert_eq!(
             cfg.audio.asr_online_url,
             "wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference",
             "mirror asr_online_url default must match main config (round-trip data loss guard)"
         );
         assert_eq!(
-            cfg.audio.asr_online_model,
-            "qwen-audio-3.0-asr-flash-streaming",
+            cfg.audio.asr_online_model, "qwen-audio-3.0-asr-flash-streaming",
             "mirror asr_online_model default must match main config"
         );
         assert_eq!(

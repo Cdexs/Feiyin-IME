@@ -137,7 +137,7 @@ pub struct AudioConfig {
     #[serde(default)]
     pub enable_streaming: bool,
     /// ASR 模型选择（DEC-025 + DEC-028 + ASR-041 + ASR-056）：
-    /// "performance"(默认,179MB CTC) | "accuracy"(972MB native+hotwords)
+    /// "performance"(179MB CTC；新装默认自 ASR-DEFAULT-LRT-506 起为 "local_realtime") | "accuracy"(972MB native+hotwords)
     /// | "qwen_audio_online"(在线流式 ASR, qwen-audio-3.0-asr-flash-streaming)
     /// | "fun_asr_realtime"(在线流式 ASR, fun-asr-realtime)
     /// 旧配置无此字段时 serde default 等效于 "performance"，行为与直换前完全一致
@@ -181,12 +181,9 @@ pub struct AudioConfig {
     /// 与 `asr_online_max_sentence_silence` 同属在线 ASR 隐藏调参。
     #[serde(default)]
     pub asr_online_semantic_punctuation_enabled: bool,
-    /// LOCAL-RT-UI-240: 本地 realtime 档位解锁开关（DEC-065 极客档，默认隐藏）。
-    ///
-    /// false（默认）= 设置界面不渲染 `local_realtime` 选项；
-    /// true = 渲染。由设置窗口内按 Ctrl+M 解锁并**落盘持久化**
-    /// （仅窗口焦点内 keydown，非全局热键，不碰 DEC-004）。
-    /// 必须先解锁才能选到该档位，故默认隐藏不影响任何现有用户。
+    /// LOCAL-RT-UI-240: 本地 realtime 档位解锁开关（原 DEC-065 极客档，Ctrl+M 解锁）。
+    /// ASR-DEFAULT-LRT-506 起设置界面**不再读取**（`local_realtime` 恒显示、Ctrl+M 已删）；
+    /// 字段保留只为存量配置读写不丢（[CONFIG-MIRROR-DRIFT-001]）。
     #[serde(default)]
     pub asr_local_realtime_unlocked: bool,
 }
@@ -195,9 +192,15 @@ fn default_overlay_opacity() -> f32 {
     1.0
 }
 
+/// 存量配置缺 `asr_model` 字段时的回落值（老用户行为不变，见 `NEW_INSTALL_ASR_MODEL`）。
 fn default_asr_model() -> String {
     "performance".to_string()
 }
+
+/// ASR-DEFAULT-LRT-506（Gavin 10-19「新装默认改成「本地流式实时模型」」）：**新装**默认模型。
+/// 只用于 `AudioConfig::default()`（无配置文件 = 新装）与 `assets/default-config.toml`；
+/// 存量配置缺 `asr_model` 字段时仍走 serde 的 `default_asr_model()`（"performance"），老用户行为不变。
+pub(crate) const NEW_INSTALL_ASR_MODEL: &str = "local_realtime";
 
 fn default_asr_online_url() -> String {
     // ASR-038-B: Inference API 端点主机名须为 {WorkspaceId}.{region}.maas.aliyuncs.com
@@ -329,14 +332,14 @@ impl Default for AudioConfig {
             overlay_opacity: default_overlay_opacity(),
             input_device: String::new(),
             enable_streaming: false, // 默认使用 offline 模式
-            asr_model: default_asr_model(),
+            asr_model: NEW_INSTALL_ASR_MODEL.to_string(),
             asr_online_api_key: String::new(),
             asr_online_url: default_asr_online_url(),
             asr_online_model: default_asr_online_model(),
             asr_online_max_sentence_silence: default_asr_online_max_sentence_silence(),
             // ASR-SEG-229: 默认 false = VAD 断句（保持既有行为），A/B 走 config.toml
             asr_online_semantic_punctuation_enabled: false,
-            // LOCAL-RT-UI-240: 极客档默认隐藏，Ctrl+M 解锁后置 true 并落盘
+            // LOCAL-RT-UI-240：ASR-DEFAULT-LRT-506 起界面不再读取，保留字段兼容。
             asr_local_realtime_unlocked: false,
         }
     }
@@ -1332,14 +1335,22 @@ clipboard_delay_ms = 150
     // ASR-DUAL-B-001 双模型配置兼容性测试
     // ============================================================
 
-    /// ASR-CONFIG-001: 默认 asr_model 为 "performance"
+    /// ASR-CONFIG-001 → ASR-DEFAULT-LRT-506：新装（无配置文件）默认 asr_model 为 "local_realtime"
     #[test]
-    fn asr_model_default_is_performance() {
+    fn asr_model_default_is_local_realtime_for_new_install() {
         let cfg = AppConfig::default();
         assert_eq!(
-            cfg.audio.asr_model, "performance",
-            "default asr_model must be 'performance'"
+            cfg.audio.asr_model, "local_realtime",
+            "new-install default asr_model must be 'local_realtime'"
         );
+    }
+
+    /// ASR-DEFAULT-LRT-506：安装包随附的默认配置（安装器复制为用户 config.toml）必须是本地流式实时模型。
+    #[test]
+    fn shipped_default_config_uses_local_realtime() {
+        let cfg: AppConfig = toml::from_str(include_str!("../../assets/default-config.toml"))
+            .expect("default-config.toml 须可解析");
+        assert_eq!(cfg.audio.asr_model, NEW_INSTALL_ASR_MODEL);
     }
 
     /// ASR-CONFIG-002: 旧 config.toml（无 asr_model 字段）加载时使用默认 "performance"

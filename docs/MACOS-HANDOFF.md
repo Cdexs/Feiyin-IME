@@ -2900,3 +2900,4 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 12. **TRAY-ASR-503**（`src/asr_service/supervisor.rs` + `src/i18n.rs`，平台中立）：托盘识别服务项可点判据改为「配置选了本地流式实时模型」，置灰时文案也是「启动识别服务」；macOS 托盘同一函数，自动生效，无需另改。
 13. **ASR-UI-HIDE-FAST-504**（`ui/src/pages/Voice.tsx`，设置界面两端共用）：「本地模型 - 快速」选项只对存量配置显示；macOS 设置界面同一份前端，自动生效。
 14. **BUILD-505**（Windows 出包 + push）：无新增依赖 / 工具链变化；macOS 拉取后请 `cargo check`（getifaddrs、托盘图标、托盘判据三处）。
+15. **ASR-DEFAULT-LRT-506 / DEC-113 · 新装默认本地流式实时模型**（`src/config/mod.rs`、`src-tauri/src/config.rs`、`assets/default-config.toml`、`ui/src/pages/Voice.tsx`，平台中立）：设置页恒显示该模型（删 Ctrl+M）；无配置文件时默认 `local_realtime`。**macOS**：若 macOS 本地实时档尚未接通，新装默认会落到不可用模型 —— 接手时须确认 macOS 本地实时可用，否则需在 macOS 侧给出回落方案后再发版。
