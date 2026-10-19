@@ -940,6 +940,7 @@ dependencies = [
  "crossbeam-channel",
  "dirs 5.0.1",
  "futures-util",
+ "libc",
  "log",
  "qrcode",
  "reqwest 0.12.28",

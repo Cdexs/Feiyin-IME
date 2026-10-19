@@ -141,6 +141,10 @@ windows = { version = "0.58", features = [
     "Win32_System_IO",
     "Win32_Storage_FileSystem",
     "Win32_Security_Authorization",
+    # 内网地址选网卡：GetAdaptersAddresses 枚举。
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
 ] }
 
 # macOS dependencies (Phase 3 placeholder)

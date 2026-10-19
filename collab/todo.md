@@ -103,6 +103,15 @@
 | S11 | 协议文档 + Python 参考客户端；MACOS-HANDOFF；五文档 | ✅ 验收 `collab/acceptance-491-S11.md`，提交 `b1463de`。`docs/ASR-PROTOCOL.md`（v1 独立契约，逐条对网关代码核实）；`tools/asr-client/feiyin_asr_client.py`（纯标准库，指纹先验再升级，退出码 0/2–8）；45 单测过（含本地 TLS 1.3 假网关集成测试 7 个）。无 Rust 改动。一期 S1–S11 开发全部完成 |
 | T | tester-1：TEST-SYNC → 全量回归 → 出包 | ✅ TEST-SYNC-491（9 护栏）· TEST-EXEC-491（2074 过 / 0 失败）· BUILD-491 出包（0.9.7，HEAD `aa2f2bc`）：tester-1 构建并同步 Publish 后额度触顶，主控接手核验；主控复跑告警时误设 `SHERPA_ONNX_LIB_DIR` 触发整体重编（见 [BUILD-ENV-SHERPA-491]），改由 Sonnet 子 Agent 按指南环境重编并复核。最终 sha（target = Publish）：feiyin-ime `5c3f22607ecf7bf1`、feiyin-ime-ui `4075e0f8aa99b1cb`（00:08 tester-1 构建，未重编）、crash-reporter `98a62541b643a4c5`、feiyin-asr-gateway `01c943b1b0e246e9`（3.8MB）。九项全 PASS：版本 0.9.7（Rust 三件显示 0.9.7.0）；告警 feiyin-ime 89 / crash 6（上次 0.9.6 为 90 / 6）；探针 main `[ASR-SERVER-491]` 3、`feiyin-asr-gateway` 1，ui `asr-service.json` 1，网关 `run-task` / `task-started` 各 1；网关 dumpbin 只依赖系统库 + VCRUNTIME140，无模型库；网关无参运行报 missing --core、退出码 2、不驻留；主程序 -debug 冒烟 Responding、无 panic、无 crash.json，已清理；config.toml 三时点不变；toml 四件三副本、VC++ 五件三处全等；iss 两份逐字相同。本机无 Inno Setup，未编安装包。结果 `collab/outbox/tester-1/result.md`。待 Gavin：重启输入法；S6/S7/S8 界面目视；两台电脑端测；Python 客户端对真服务冒烟。 |
 
+### 🔄 10-19 优化批（Gavin 10-19；**出包等 Gavin 指令，全部完成后一起出**）
+
+| 单号 | 内容 | 状态 |
+| --- | --- | --- |
+| LAN-ADDR-492 | 连接码内网地址选真实网卡（xray TUN 劫持默认路由 ⇒ 选成 172.18.0.1）。网关监听本就是 0.0.0.0 + [::]，不改 | ✅ 代码 + 测试（asr_shared 20 / 网关 37 / src-tauri 119 过）；⚠️ 11:25 已误构建进 Publish（Gavin 喊停前跑完），未冒烟 |
+| PUNCT-REDO-493 | 本地实时最终文本：精解全文剥光标点 ⇒ 标点模型整段重打（Gavin：「不用再做这个标点的测试了，就把精简输出的全部文本，把标点去掉，然后重新走一遍标点模型打标点」）；推翻 DEC-080；并核实标点模型是否按语义打 | ✅ DEC-112；`B_STRIP_WIRED_367 = true`，门 = 开标点 && 非翻译；CT 实测纯语义（44 处命中 36 / 漏 8 / 多 4，17~38ms） |
+| LOCALTEST-495 | 本地临时测试 / PoC 一律放 `localtest/`（不入库、用完清理；Gavin 10-19）。`main.rs` 以 `--features poc` 挂 `mod localtest` | ✅ |
+| ITN-ORDINAL-494 | 「第一点、第二点、这一处、那一处、这一点、那一点」中间的数字保留汉字，不转阿拉伯数字（Gavin 原话：「中间的这个数字，一二三之类的这个数字，不应该转换成阿拉伯数字，应该显示成汉字的数字」） | ✅ `itn.rs` `enum_point_run` / `enum_point_arabic`：第 / 这 / 那 / 哪 + 数字 + 点 / 处 保持汉字，模型给的「第1点」还原；钟点（两点钟 / 两点半）与其它序数（第35章 / 第1条）不变；+4 单测，ITN 284 过 |
+
 ### ⏸ v0.9.3 收尾三件 · 等 Gavin 拍板
 
 | 事项 | 说明 |

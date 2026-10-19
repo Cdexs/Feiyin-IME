@@ -2142,6 +2142,19 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
             i += 1;
             continue;
         }
+        // ITN-ORDINAL-494：「这两点 / 那三处」的数字保持汉字（「第」字头在下方序数分支处理）。
+        if i > 0 && matches!(shadow[i - 1], '这' | '那' | '哪') {
+            if let Some(len) = enum_point_run(&shadow, i) {
+                result.extend(&orig[i..i + len]);
+                i += len;
+                continue;
+            }
+            if let Some((hanzi, len)) = enum_point_arabic(&shadow, i) {
+                result.push_str(&hanzi);
+                i += len;
+                continue;
+            }
+        }
         // ITN-V2-003 (P3 甲型文法)：余数后缀（半/刻）匹配。
         if is_cn_num_char(shadow[i]) || shadow[i] == '零' || shadow[i] == '〇' {
             if let Some(rs) = try_parse_remainder_suffix(&shadow, &orig, i, r) {
@@ -2200,6 +2213,19 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
         if !r.ordinal_prefix.is_empty() && shadow[i] == r.ordinal_prefix.chars().next().unwrap() {
             // "第" 后面跟数字
             let after = i + 1;
+            // ITN-ORDINAL-494：「第一点 / 第二处」是列举要点，数字保持汉字（识别模型直接给出的
+            // 「第1点」也还原成汉字）；其余序数（第35章 / 第8名）照旧转。
+            if let Some(len) = enum_point_run(&shadow, after) {
+                result.extend(&orig[i..after + len]);
+                i = after + len;
+                continue;
+            }
+            if let Some((hanzi, len)) = enum_point_arabic(&shadow, after) {
+                result.push(orig[i]);
+                result.push_str(&hanzi);
+                i = after + len;
+                continue;
+            }
             if let Some((num_str, consumed)) = parse_cn_number(&shadow, after, Some(r)) {
                 if consumed > 0 {
                     result.push(r.ordinal_prefix.chars().next().unwrap());
@@ -2785,6 +2811,63 @@ fn is_demonstrative_yi(chars: &[char], i: usize, r: &CompiledRules) -> bool {
     // ③ 后一字是时间后缀（同时保证「一」是孤立单字，见函数注释）
     let after: String = chars[i + 1..].iter().collect();
     r.is_date_suffix(&after)
+}
+
+/// ITN-ORDINAL-494（Gavin 10-19「第一点、第二点，或者说这一处、那一处、这一点、那一点……中间的这个数字，
+/// 一二三之类的这个数字，不应该转换成阿拉伯数字，应该显示成汉字的数字」）：列举要点的量词。
+const ENUM_POINT_COUNTERS: [char; 2] = ['点', '处'];
+
+/// 「点」后跟这些 ⇒ 是钟点 / 小数读法（两点钟、两点半、两点十分、第三点五），不算列举要点。
+fn is_clock_tail(c: char) -> bool {
+    matches!(c, '钟' | '半' | '整' | '刻' | '多' | '过' | '两')
+        || is_cn_num_char(c)
+        || c.is_ascii_digit()
+}
+
+/// 量词位置 `at` 是否构成列举要点（「处」恒是；「点」后不能接钟点 / 小数读法）。
+fn is_enum_counter_at(chars: &[char], at: usize) -> bool {
+    match chars.get(at) {
+        Some(&'点') => !chars.get(at + 1).is_some_and(|&c| is_clock_tail(c)),
+        Some(c) => ENUM_POINT_COUNTERS.contains(c),
+        None => false,
+    }
+}
+
+/// ITN-ORDINAL-494：从 `start` 起的汉字数字串后紧跟列举量词 ⇒ 返回数字串长度（调用方原样输出）。
+fn enum_point_run(chars: &[char], start: usize) -> Option<usize> {
+    let len = chars[start..]
+        .iter()
+        .take_while(|&&c| is_cn_num_char(c) || c == '两')
+        .count();
+    (len > 0 && is_enum_counter_at(chars, start + len)).then_some(len)
+}
+
+/// ITN-ORDINAL-494：识别模型直接给出阿拉伯数字（「第1点」「这2处」）⇒ 1~99 还原成汉字。
+fn enum_point_arabic(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let len = chars[start..]
+        .iter()
+        .take_while(|c| c.is_ascii_digit())
+        .count();
+    if !(1..=2).contains(&len) || !is_enum_counter_at(chars, start + len) {
+        return None;
+    }
+    let n: u32 = chars[start..start + len]
+        .iter()
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    const D: [&str; 10] = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
+    let hanzi = match (n / 10, n % 10) {
+        (0, 0) => return None,
+        (0, u) => D[u as usize].to_string(),
+        (1, u) => format!("十{}", if u == 0 { "" } else { D[u as usize] }),
+        (t, u) => format!(
+            "{}十{}",
+            D[t as usize],
+            if u == 0 { "" } else { D[u as usize] }
+        ),
+    };
+    Some((hanzi, len))
 }
 
 /// 检查保护白名单，返回匹配长度（0=未匹配）
@@ -6097,5 +6180,48 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
         // 句中上下文
         assert_eq!(normalize_test("梅开二度帮助球队"), "梅开二度帮助球队");
         assert_eq!(normalize_test("凭借哈兰德梅开二度"), "凭借哈兰德梅开二度");
+    }
+}
+
+/// ITN-ORDINAL-494：列举要点「第一点 / 这两处」数字保持汉字；钟点与其它序数不受影响。
+#[cfg(test)]
+mod itn494_tests {
+    use super::normalize_numbers as n;
+
+    #[test]
+    fn itn494_ordinal_points_keep_hanzi() {
+        assert_eq!(n("第一点是成本第二点是效率"), "第一点是成本第二点是效率");
+        assert_eq!(n("第十二点"), "第十二点");
+        assert_eq!(n("第一处和第二处"), "第一处和第二处");
+        assert_eq!(n("第三點"), "第三點", "繁中原字形输出");
+    }
+
+    #[test]
+    fn itn494_demonstrative_points_keep_hanzi() {
+        assert_eq!(
+            n("这一点很重要那一点也要注意"),
+            "这一点很重要那一点也要注意"
+        );
+        assert_eq!(n("这一处和那一处"), "这一处和那一处");
+        assert_eq!(n("这两点我同意"), "这两点我同意");
+        assert_eq!(n("哪三处"), "哪三处");
+    }
+
+    #[test]
+    fn itn494_arabic_from_model_restored() {
+        assert_eq!(n("第1点是成本第2点是效率"), "第一点是成本第二点是效率");
+        assert_eq!(n("第12点和第20处"), "第十二点和第二十处");
+        assert_eq!(n("这2点"), "这二点");
+    }
+
+    #[test]
+    fn itn494_clock_and_other_ordinals_unchanged() {
+        assert_eq!(n("下午两点钟出发"), "下午2点钟出发");
+        assert_eq!(n("两点半"), "2:30");
+        assert_eq!(n("下午三点"), "下午3点");
+        assert_eq!(n("第三十五章第八名"), "第35章第8名");
+        assert_eq!(n("第一条第二项"), "第1条第2项");
+        assert_eq!(n("第1章"), "第1章");
+        assert_eq!(n("一点半"), "1:30");
     }
 }

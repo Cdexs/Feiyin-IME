@@ -11,8 +11,13 @@ mod hotkey; // Deprecated: use platform::HotkeyListener instead
 mod i18n;
 mod itn;
 mod llm;
-mod localrt_session; // ASR-SERVER-491 S1：本地实时精解窗口线程（本机 / 远程会话共用）
-                     // ASR-SERVER-491：识别服务内核侧（本机 IPC + 远程会话 + 看护网关进程）。
+// ASR-SERVER-491 S1：本地实时精解窗口线程（本机 / 远程会话共用）。
+mod localrt_session;
+// 本地临时测试 / PoC 目录（不入库，见 .gitignore `/localtest`）；只在 `--features poc` 测试构建编译。
+#[cfg(all(test, feature = "poc"))]
+#[path = "../localtest/mod.rs"]
+mod localtest;
+// ASR-SERVER-491：识别服务内核侧（本机 IPC + 远程会话 + 看护网关进程）。
 #[allow(dead_code)]
 mod asr_service;
 // ASR-SERVER-491：内核 / 网关 / 设置界面共用的服务设置与终端配对数据（内核只用其中一部分）。
@@ -9422,17 +9427,19 @@ fn spawn_worker_thread(
                                 config.audio.chinese_script,
                             );
                             // ── PUNCT-FINAL-REDO-350 节点（重打前先剥光标点）──
-                            // 🔴 SLIDING-WINDOW-367 + DEC-080（2026-09-22）：**该节点无条件摘除**
-                            //    （`B_STRIP_WIRED_367 = false`，接线保留、非删代码）。
-                            //  · 为何无条件摘：滑窗输出同样是**模型一次解出的完整文本、无拼接接缝**
-                            //    ⇒ 「剥光重打」前提消失；357 实测重打会**反噬**（把「二比一」改成「2比1」）。
-                            //    Gavin 已拍 DEC-080：当前管线不走「全量剥标点 + 二次打点」。
-                            //  · 何时回挂：若未来最终文本来源又改回「多片拼装」（无滑窗），接缝标点问题会回来，
-                            //    把 `B_STRIP_WIRED_367` 置 `true` 即可（节点代码/7 单测/共享谓词/顺序护栏全部保留）。
-                            // 🔴 334 老 bug 不复发：`apply_local_punctuation` 的 `!native_punctuated` 门**仍在**
-                            //    （334 防的是「对已带标点文本再打一遍 ⇒ 。。 叠加」）；摘本节点后模型标点原样保留，天然免疫。
-                            const B_STRIP_WIRED_367: bool = false;
-                            let b_strip_enabled = B_STRIP_WIRED_367;
+                            // 🔴 PUNCT-REDO-493（DEC-112，推翻 DEC-080；Gavin 2026-10-19「就把精简输出的全部文本，
+                            //    把标点去掉，然后重新走一遍标点模型打标点」）：**重新挂上**。
+                            //  · 为何回挂：最终文本 = 定稿前缀 + 最新窗口，而每窗只含「上一片尾巴 + 新片」、
+                            //    片在停顿处切（442）⇒ 实为多片拼装；精解模型按音频停顿打标点、窗尾必补标点
+                            //    ⇒ 句子被切碎（Gavin 端测）。剥光后交标点模型（只看文字）整段按语义重打。
+                            //  · 门：用户开标点且非翻译（翻译路径下游不重打标点，剥了就丢）。开 LLM 时剥光文本交 LLM，
+                            //    LLM 失败退回时 `apply_local_punctuation` 照常重打。
+                            //  · 剥离只动「有效标点」：数字 / 字母夹持的 `3.14`、`1,000` 保留（`is_effective_punctuation`）。
+                            // 🔴 334 老 bug 不复发：剥光后 `native_punctuated` 恒 false ⇒ 引擎吃的是无标点文本，不会 `。。` 叠加。
+                            const B_STRIP_WIRED_367: bool = true;
+                            let b_strip_enabled = B_STRIP_WIRED_367
+                                && config.punctuation.enabled
+                                && !start.translate.load(Ordering::Acquire);
                             let stripped = strip_punctuation_node(normalized, b_strip_enabled);
                             // PUNCT-DOUBLE-334：第二元 = 「文本**实际**是否已有有效标点」（DEC-047 口径，
                             // 与 :9855 的 Qwen3 分支同一 detector），**不是**「各分片是否都解码成功」。
@@ -20931,14 +20938,19 @@ mod sync352_punct_node_guard_tests {
         let def_at = s
             .find(concat!("let b_strip_enabled", " ="))
             .expect("`b_strip_enabled` 定义必须存在");
-        let def = &s[def_at..(def_at + 120).min(s.len())];
+        // 🔴 PUNCT-REDO-493（DEC-112，2026-10-19）：节点重新挂上，门 = 常量 && 开标点 && 非翻译。
+        let def = &s[def_at..(def_at + 200).min(s.len())];
         assert!(
             def.contains("B_STRIP_WIRED_367"),
-            "367/DEC-080：门必须由显式常量 `B_STRIP_WIRED_367` 控制（可一键回挂）"
+            "门必须由显式常量 `B_STRIP_WIRED_367` 控制（可一键摘除）"
         );
         assert!(
-            s.contains("const B_STRIP_WIRED_367: bool = false;"),
-            "367/DEC-080：`B_STRIP_WIRED_367` 必须为 false（无条件摘除 350 节点）"
+            def.contains("config.punctuation.enabled") && def.contains("!start.translate"),
+            "493：门必须含开标点与非翻译两项（翻译路径剥了无人重打 ⇒ 标点丢失）"
+        );
+        assert!(
+            s.contains("const B_STRIP_WIRED_367: bool = true;"),
+            "493/DEC-112：`B_STRIP_WIRED_367` 必须为 true（最终文本剥光后交标点模型重打）"
         );
     }
 

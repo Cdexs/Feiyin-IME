@@ -148,3 +148,12 @@
 ## 2026-10-18 — 主控 — BUILD-491 出包核验通过（0.9.7）
 
 - BUILD-491 出包（0.9.7，HEAD `aa2f2bc`）：tester-1 构建并同步 Publish 后额度触顶，主控接手核验；主控复跑告警时误设 `SHERPA_ONNX_LIB_DIR` 触发整体重编（见 [BUILD-ENV-SHERPA-491]），改由 Sonnet 子 Agent 按指南环境重编并复核。最终 sha（target = Publish）：feiyin-ime `5c3f22607ecf7bf1`、feiyin-ime-ui `4075e0f8aa99b1cb`（00:08 tester-1 构建，未重编）、crash-reporter `98a62541b643a4c5`、feiyin-asr-gateway `01c943b1b0e246e9`（3.8MB）。九项全 PASS：版本 0.9.7（Rust 三件显示 0.9.7.0）；告警 feiyin-ime 89 / crash 6（上次 0.9.6 为 90 / 6）；探针 main `[ASR-SERVER-491]` 3、`feiyin-asr-gateway` 1，ui `asr-service.json` 1，网关 `run-task` / `task-started` 各 1；网关 dumpbin 只依赖系统库 + VCRUNTIME140，无模型库；网关无参运行报 missing --core、退出码 2、不驻留；主程序 -debug 冒烟 Responding、无 panic、无 crash.json，已清理；config.toml 三时点不变；toml 四件三副本、VC++ 五件三处全等；iss 两份逐字相同。本机无 Inno Setup，未编安装包。结果 `collab/outbox/tester-1/result.md`。待 Gavin：重启输入法；S6/S7/S8 界面目视；两台电脑端测；Python 客户端对真服务冒烟。
+
+## 2026-10-19 — 主控 — 10-19 优化批三项完成（未出包，等 Gavin 指令）
+
+- LAN-ADDR-492（子 Agent 写、主控逐行验收）：`settings.rs` `pick_lan_ip` + Windows `GetAdaptersAddresses` / unix `getifaddrs`；本机实测 `192.168.1.10:7860`。⚠️ 11:25 已构建进 Publish（Gavin「先不要构建」到达前跑完），四件 sha：main `bd56617c` / ui `fff29ea9` / crash `497ce45b` / gw `5992d092`，未冒烟。
+- PUNCT-REDO-493 / DEC-112：`B_STRIP_WIRED_367 = true`，门 = 开标点 && 非翻译；护栏 sync352 同步改断言。
+- ITN-ORDINAL-494：`enum_point_run` / `enum_point_arabic`，4 单测。
+- LOCALTEST-495：`localtest/`（.gitignore），`--features poc` 挂载；CT 语义对照测试与结果在内。
+- 回答 Gavin：WB-ECHO-483 的拼音相似度检查只在「整句恰为词条」且已触发重解时才算，正常窗口不算；拼音比对本身微秒级。
+- 测试：feiyin-ime 2082 过 / 0 失败 / 49 忽略；网关 37；src-tauri 119；fmt 0。

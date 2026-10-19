@@ -164,3 +164,6 @@ debug-audio/
 # PoC 方案、实测记录写 collab/evidence/（已整目录忽略），设计文档只留结论。
 /src/**/poc_*.rs
 /src/transcription/replay436_tests.rs
+
+# ===== 本地临时测试目录（Gavin 2026-10-19：本地测试 / PoC 的代码与文档都放这里，不推送，用完及时清理）=====
+/localtest/

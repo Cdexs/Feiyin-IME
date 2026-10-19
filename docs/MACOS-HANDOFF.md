@@ -2874,3 +2874,19 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 | 改了什么 | Windows 打包链加入网关程序 `feiyin-asr-gateway.exe`（`build.bat` / `scripts/init-publish.ps1` / 安装器 `[Files]`、卸载结束进程）；安装器（管理员模式）加防火墙入站规则「Feiyin ASR Gateway」，按程序放行、仅专用网络 |
 | 对 macOS 的影响 | 🔴 **需要同步**：macOS 的 `.app` 打包须把 `feiyin-asr-gateway` 二进制放进与主程序同一目录（内核看护线程按「同目录 `feiyin-asr-gateway`」拉起，缺了则识别服务开关打开后网关起不来，`asr-gateway.log` 无输出）。macOS 防火墙为应用级弹窗授权，无需安装期规则 |
 | 是否需对方改动 | 是：`scripts/build-macos.sh` 打包步骤加网关二进制 |
+
+
+## 10-19 优化批（2026-10-19，主控）· 连接码地址 / 最终文本标点重打 / 列举要点数字
+
+1. **LAN-ADDR-492 · 连接码内网地址选真实网卡**（`src/asr_shared/settings.rs`，三方共用：内核 / 网关 / 设置界面）
+   - 前：UDP 路由法取默认路由网卡地址；全局 TUN 代理（xray / Clash TUN 等）会把它劫持成虚拟网卡地址（实测 172.18.0.1）⇒ 另一台电脑连不上。
+   - 后：先枚举网卡挑（纯函数 `pick_lan_ip`：已启用 + 真实网卡 + 非 169.254 / 127，优先「有网关 / 名字 en 开头」，同级优先等于路由法结果），挑不出再退回路由法。
+   - **macOS**：走 `#[cfg(unix)]` 的 `libc::getifaddrs` 分支（`IFF_LOOPBACK` / `IFF_POINTOPOINT` 判虚拟 ⇒ 排除 utun；`IFF_UP && IFF_RUNNING`；`en*` 优先）。🔴 **Windows 端无法编译验证此分支，macOS 端须 `cargo check` 一次**，并在开 VPN 时看设置页「内网地址」是否为 en0 的地址。
+   - 构建：`src-tauri/Cargo.toml` 新增 `[target.'cfg(target_os = "macos")'.dependencies] libc = "0.2"`；Windows 两个 crate 的 `windows` 依赖加 `Win32_NetworkManagement_IpHelper` / `_Ndis` / `Win32_Networking_WinSock`。
+   - 网关监听不变（本就是 `0.0.0.0` + `[::]`）。
+2. **PUNCT-REDO-493 / DEC-112 · 本地实时最终文本剥光标点由标点模型重打**（`src/main.rs`，平台中立）
+   - 前：最终文本用精解模型自带标点（按停顿打，窗尾必补）；后：剥光后 CT 整段按语义重打（开标点且非翻译）。
+   - macOS 本地实时档接通后同一行为，无需另改；行为变更，macOS 若有按旧标点写的测试需同步。
+3. **ITN-ORDINAL-494 · 列举要点数字保持汉字**（`src/itn.rs`，平台中立）
+   - 「第一点 / 第二处 / 这两点 / 那三处」不再转阿拉伯数字；模型直接给出的「第1点」还原为「第一点」（1~99）。钟点（两点钟 / 两点半）与其它序数（第35章 / 第1条）不变。
+4. **本地临时测试目录 `localtest/`**（不入库）：`main.rs` 以 `#[cfg(all(test, feature = "poc"))] #[path = "../localtest/mod.rs"]` 挂载；目录不存在时只要不开 `poc` 特性就不受影响。
