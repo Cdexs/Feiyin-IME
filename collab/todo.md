@@ -123,6 +123,7 @@
 | ASR-UI-HIDE-FAST-504 | 设置页「语音输入 / ASR 模型」隐藏「本地模型 - 快速」（Gavin 10-19「今后将不再支持该选项」）⇒ 只对存量 performance 配置显示，切走后不再出现（同 ASR-UI-208） | ✅ |
 | BUILD-505 | 出包 + push（Gavin「push 、出包」），九项核验全 PASS | ✅ |
 | ASR-DEFAULT-LRT-506 | 新装默认 ASR 模型改「本地流式实时模型」+ 去掉 Ctrl+M 才能看到的限制（Gavin 10-19「新装默认改成「本地流式实时模型」，并且去掉 Ctrl+M 才能看到的限制」）；推翻 DEC-065 极客档隐藏 |✅ |
+| BUILD-507 | 506 出包，九项全 PASS（子 agent 核验）；**push 待 Gavin 明示** | ✅ |
 ### ⏸ v0.9.3 收尾三件 · 等 Gavin 拍板
 
 | 事项 | 说明 |
