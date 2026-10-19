@@ -167,3 +167,4 @@
 - BUILD-502：10-19 优化批出包，九项全 PASS；feiyin-ime `639a287b8989b93e`，其余三件同 11:25 包。待 Gavin 重启输入法目视。
 - TRAY-ASR-503：`supervisor::tray_item` 判据改为配置选了本地流式实时模型（`CONFIG` OnceLock 由 `spawn` 登记），删 `tray_menu_asr_unavailable`；2087 过。未出包。
 - ASR-UI-HIDE-FAST-504：`ui/src/pages/Voice.tsx` performance 选项改 grandfathered；Vitest 134 过。
+- BUILD-505：出包九项全 PASS（feiyin-ime `f606a11f44ebbda4` / ui `18ead272c637b3de` / crash `a4d3acd29169ebb4` / 网关同上一包），已 push。待 Gavin 重启输入法。

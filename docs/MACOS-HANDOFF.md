@@ -2899,3 +2899,4 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 11. **BUILD-502**（Windows 出包）：无新增依赖 / 工具链变化（本批 Cargo 变化仅 LAN-ADDR-492 已记的 windows features + src-tauri macOS `libc`）。macOS 接手须 `cargo check` getifaddrs 分支与 TRAY-ICON-500 的 `set_asr_item_icon`。
 12. **TRAY-ASR-503**（`src/asr_service/supervisor.rs` + `src/i18n.rs`，平台中立）：托盘识别服务项可点判据改为「配置选了本地流式实时模型」，置灰时文案也是「启动识别服务」；macOS 托盘同一函数，自动生效，无需另改。
 13. **ASR-UI-HIDE-FAST-504**（`ui/src/pages/Voice.tsx`，设置界面两端共用）：「本地模型 - 快速」选项只对存量配置显示；macOS 设置界面同一份前端，自动生效。
+14. **BUILD-505**（Windows 出包 + push）：无新增依赖 / 工具链变化；macOS 拉取后请 `cargo check`（getifaddrs、托盘图标、托盘判据三处）。
