@@ -28,42 +28,10 @@ pub fn exit_icon_rgba(size: u32) -> Vec<u8> {
 /// 运行中（「停止识别服务」）= 停止方块。电源符号已给「退出」用，不复用以免两项同图。
 pub fn service_icon_rgba(size: u32, running: bool) -> Vec<u8> {
     if running {
-        rasterize_coverage(size, stop_covered)
+        rasterize(size, stop_covered)
     } else {
-        rasterize_coverage(size, play_covered)
+        rasterize(size, play_covered)
     }
-}
-
-/// TRAY-ICON-500：按真实覆盖率写 alpha（hits / 16 × 255）。
-/// ⚠️ 既有 `rasterize` 的 alpha 公式除以 SSAA（4）而非 SSAA²（16），5 个子样本以上命中即溢出回绕
-/// （hits 5→63、8→254、9→62 …），斜边抗锯齿实际失效；设置 / 退出 / 编辑三图标是 Gavin 按现状
-/// 目视定稿的，不在本单改动，新图标走本函数。
-fn rasterize_coverage(size: u32, covered: impl Fn(f32, f32) -> bool) -> Vec<u8> {
-    let s = size as f32;
-    let half = s / 2.0;
-    let sub = SSAA as f32;
-    let total = SSAA * SSAA;
-    let mut px = vec![0u8; (size * size * 4) as usize];
-    for y in 0..size {
-        for x in 0..size {
-            let mut hits = 0u32;
-            for sy in 0..SSAA {
-                for sx in 0..SSAA {
-                    let fx = (x as f32 + (sx as f32 + 0.5) / sub - half) / s;
-                    let fy = (y as f32 + (sy as f32 + 0.5) / sub - half) / s;
-                    if covered(fx, fy) {
-                        hits += 1;
-                    }
-                }
-            }
-            let i = ((y * size + x) * 4) as usize;
-            px[i] = BRAND_ORANGE[0];
-            px[i + 1] = BRAND_ORANGE[1];
-            px[i + 2] = BRAND_ORANGE[2];
-            px[i + 3] = ((hits * 255 + total / 2) / total) as u8;
-        }
-    }
-    px
 }
 
 // edit_icon_rgba 见本文件下方 EDITICON-190 实现（纯几何 SSAA：铅笔 + 单条下划线，定稿 A2）。
@@ -114,7 +82,10 @@ fn rasterize(size: u32, covered: impl Fn(f32, f32) -> bool) -> Vec<u8> {
             px[i] = BRAND_ORANGE[0];
             px[i + 1] = BRAND_ORANGE[1];
             px[i + 2] = BRAND_ORANGE[2];
-            px[i + 3] = ((hits as u32 * 255 + SSAA / 2) / SSAA) as u8;
+            // ICON-AA-501：alpha = 覆盖率 hits / SSAA²（16）× 255。原公式除以 SSAA（4），5 个子样本以上
+            // 命中即溢出回绕（5→63、8→254、9→62 …），斜边 / 圆弧抗锯齿实际失效（Gavin 10-19「一起修吧」）。
+            let total = SSAA * SSAA;
+            px[i + 3] = ((hits * 255 + total / 2) / total) as u8;
         }
     }
     px
@@ -257,7 +228,7 @@ fn pencil_covered(fx: f32, fy: f32) -> bool {
 }
 
 fn underline_covered(fx: f32, fy: f32) -> bool {
-    let half = 0.055 / 2.0; // 线厚 ≈1px @18px（alpha 公式注：≥4 子样本命中即渲染为实条）
+    let half = 0.055 / 2.0; // 线厚 ≈1px @18px（ICON-AA-501 起按真实覆盖率出 alpha）
     let (y, x0, x1) = UNDERLINE;
     (y - half..=y + half).contains(&fy) && (x0..=x1).contains(&fx)
 }
@@ -331,18 +302,19 @@ mod tests {
         // 笔杆满覆盖像素 (6,12)
         assert_eq!(
             icon[(6 * 18 + 12) * 4 + 3],
-            252,
+            255,
             "pencil shaft must be full coverage"
         );
         // 单条下划线存在（行 15；y=0.361 档案原值带宽恰落行 15 子采样网格 → 干净单行）
         assert_eq!(
             icon[(15 * 18 + 5) * 4 + 3],
-            252,
+            255,
             "A2 underline must be a single clean row (archive y=0.361)"
         );
         // 下划线右端端像素 (15,16)：距分割线 7px 无粘连；分割线侧（col17）无墨
+        // ICON-AA-501：x1=0.40 只覆盖该像素约 0.2px ⇒ 按真实覆盖率是浅色过渡像素，有墨即可。
         assert!(
-            icon[(15 * 18 + 16) * 4 + 3] >= 128,
+            icon[(15 * 18 + 16) * 4 + 3] > 0,
             "A2 underline right end pixel (7px clear of divider)"
         );
         assert_eq!(icon[(15 * 18 + 17) * 4 + 3], 0, "no ink beyond A2 x1=0.40");
@@ -441,17 +413,16 @@ mod tests {
         }
         assert_eq!(
             icon[(6 * 18 + 12) * 4 + 3],
-            252,
+            255,
             "A1 pencil shaft must be full coverage"
         );
         assert_eq!(
             icon[(13 * 18 + 5) * 4 + 3],
-            252,
+            255,
             "A1 underline must be a single clean row (y=0.25)"
         );
-        assert_eq!(
-            icon[(13 * 18 + 16) * 4 + 3],
-            255,
+        assert!(
+            icon[(13 * 18 + 16) * 4 + 3] > 0,
             "A1 underline right end pixel (7px clear of divider)"
         );
         assert_eq!(icon[(13 * 18 + 17) * 4 + 3], 0, "no ink beyond A1 x1=0.40");
