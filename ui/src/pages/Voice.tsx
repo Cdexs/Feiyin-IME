@@ -252,7 +252,12 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
             onChange={(e) => handleAsrModelChange(e.target.value)}
             className="select-input"
           >
-            <option value="performance">{t.voice_asr_model_performance}</option>
+            {/* ASR-UI-HIDE-FAST-503（Gavin 10-19「将UI 语音输入/ASR模型 中的 “本地模型-快速” 选项隐藏，
+                今后将不再支持该选项」）：同 ASR-UI-208 的 grandfathered 处理 —— 只在配置值本就是
+                performance 时渲染（否则下拉显示空白 / 显示与实际引擎不一致），切走后不再出现。 */}
+            {asrModel === "performance" && (
+              <option value="performance">{t.voice_asr_model_performance}</option>
+            )}
             {asrModel === "qwen_audio_online" && (
               <option value="qwen_audio_online">{t.voice_asr_model_qwen3}</option>
             )}

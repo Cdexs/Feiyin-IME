@@ -157,6 +157,24 @@ describe('VoicePage - PUNCT-UI-001', () => {
       });
     });
 
+    // ASR-UI-HIDE-FAST-503（Gavin 10-19）：「本地模型 - 快速」只对存量 performance 配置显示，切走后不再出现。
+    it('ASR-UI-HIDE-FAST-503: performance option hidden when not currently selected', async () => {
+      for (const model of ['fun_asr_realtime', 'feiyin_server', 'local_realtime']) {
+        const cfg = {
+          ...baseConfig,
+          audio: { ...baseConfig.audio, asr_model: model, asr_local_realtime_unlocked: true },
+        };
+        const { unmount } = render(<VoicePage config={cfg} updateConfig={vi.fn()} />);
+        await waitFor(() => {
+          const select = screen.getAllByRole('combobox')[1] as HTMLSelectElement;
+          const values = Array.from(select.querySelectorAll('option')).map(o => o.value);
+          expect(values).not.toContain('performance');
+          expect(select.value).toBe(model);
+        });
+        unmount();
+      }
+    });
+
     it('ASR-UI-003: default selected value is "performance"', async () => {
       render(<VoicePage config={baseConfig} updateConfig={vi.fn()} />);
       await waitFor(() => {

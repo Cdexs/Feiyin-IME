@@ -166,3 +166,4 @@
 - ICON-AA-501：`menu_icons::rasterize` alpha = hits/16×255（原 /4 溢出回绕）；四个菜单 / 编辑图标边缘平滑，形状不变。
 - BUILD-502：10-19 优化批出包，九项全 PASS；feiyin-ime `639a287b8989b93e`，其余三件同 11:25 包。待 Gavin 重启输入法目视。
 - TRAY-ASR-503：`supervisor::tray_item` 判据改为配置选了本地流式实时模型（`CONFIG` OnceLock 由 `spawn` 登记），删 `tray_menu_asr_unavailable`；2087 过。未出包。
+- ASR-UI-HIDE-FAST-504：`ui/src/pages/Voice.tsx` performance 选项改 grandfathered；Vitest 134 过。
