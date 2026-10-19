@@ -2897,3 +2897,4 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 9. **TRAY-ICON-500 · 托盘识别服务项图标**（`src/ui/menu_icons.rs` 平台中立 + `src/platform/macos/tray.rs`）：macOS 已同步接线（`set_asr_item_icon`，建菜单与文案切换时都设图标，18pt，不设 template 保品牌橙）。⚠️ Windows 端无法编译 macOS 分支，macOS 接手请先 `cargo check`。
 10. **ICON-AA-501 · 菜单图标抗锯齿修复**（`src/ui/menu_icons.rs`，平台中立）：macOS 托盘菜单图标同样受益，无需另改。
 11. **BUILD-502**（Windows 出包）：无新增依赖 / 工具链变化（本批 Cargo 变化仅 LAN-ADDR-492 已记的 windows features + src-tauri macOS `libc`）。macOS 接手须 `cargo check` getifaddrs 分支与 TRAY-ICON-500 的 `set_asr_item_icon`。
+12. **TRAY-ASR-503**（`src/asr_service/supervisor.rs` + `src/i18n.rs`，平台中立）：托盘识别服务项可点判据改为「配置选了本地流式实时模型」，置灰时文案也是「启动识别服务」；macOS 托盘同一函数，自动生效，无需另改。

@@ -23,7 +23,6 @@ pub struct Strings {
     /// ASR-SERVER-491 S7：托盘单项「启动 / 停止识别服务」；未就绪时置灰的文案带原因。
     pub tray_menu_asr_start: &'static str,
     pub tray_menu_asr_stop: &'static str,
-    pub tray_menu_asr_unavailable: &'static str,
     // General tab
     pub general_section: &'static str,
     pub auto_start: &'static str,
@@ -172,7 +171,6 @@ static ZH: Strings = Strings {
     tray_menu_exit: "退出 (Exit)",
     tray_menu_asr_start: "启动识别服务",
     tray_menu_asr_stop: "停止识别服务",
-    tray_menu_asr_unavailable: "启动识别服务（需本地流式实时模型）",
     general_section: "通用设置",
     auto_start: "开机自动启动",
     hotkey_current_label: "当前快捷键",
@@ -302,7 +300,6 @@ static ZH_TW: Strings = Strings {
     tray_menu_exit: "退出 (Exit)",
     tray_menu_asr_start: "啟動識別服務",
     tray_menu_asr_stop: "停止識別服務",
-    tray_menu_asr_unavailable: "啟動識別服務（需本地串流即時模型）",
     general_section: "通用設定",
     auto_start: "開機自動啟動",
     hotkey_current_label: "當前快捷鍵",
@@ -432,7 +429,6 @@ static EN: Strings = Strings {
     tray_menu_exit: "Exit",
     tray_menu_asr_start: "Start ASR Service",
     tray_menu_asr_stop: "Stop ASR Service",
-    tray_menu_asr_unavailable: "Start ASR Service (needs local streaming model)",
     general_section: "General Settings",
     auto_start: "Auto-start on boot",
     hotkey_current_label: "Current hotkey",
