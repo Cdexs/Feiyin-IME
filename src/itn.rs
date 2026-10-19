@@ -29,6 +29,9 @@ struct Rules {
     date_time: DateTime,
     #[serde(default)]
     ordinal: Ordinal,
+    /// ITN-ENUM-496：列举结构。外置旧版规则表没有这一节 ⇒ `None` ⇒ 编译时取内置表的这一节（不静默失效）。
+    #[serde(default)]
+    enumeration: Option<Enumeration>,
     #[serde(default)]
     percentage: Percentage,
     #[serde(default)]
@@ -127,6 +130,15 @@ struct Ordinal {
     prefix: String,
 }
 
+/// ITN-ENUM-496：列举结构 `<前缀><数字>[个]<列举量词>` ⇒ 数字保持汉字（「第一条」「这两方面」）。
+#[derive(Debug, Clone, Deserialize, Default)]
+struct Enumeration {
+    #[serde(default)]
+    prefixes: Vec<String>,
+    #[serde(default)]
+    counters: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 struct Percentage {
     #[serde(default)]
@@ -214,6 +226,9 @@ struct CompiledRules {
     date_specials: HashSet<String>,
     date_prefixes: HashSet<String>,
     ordinal_prefix: String,
+    /// ITN-ENUM-496：列举结构前缀 / 量词（最长匹配）。
+    enum_prefixes: Vec<Vec<char>>,
+    enum_counters: Vec<Vec<char>>,
     percentage_prefix: String,
     fraction_pattern: String,
     idiom_set: HashSet<String>,
@@ -387,6 +402,20 @@ impl CompiledRules {
         let date_prefixes = rep.set(&r.date_time.triggers.prefix);
 
         let ordinal_prefix = rep.norm(&r.ordinal.prefix);
+        let enumeration = r.enumeration.clone().unwrap_or_else(|| {
+            toml::from_str::<Rules>(BUILTIN_RULES)
+                .ok()
+                .and_then(|b| b.enumeration)
+                .unwrap_or_default()
+        });
+        let mut chars_of = |ws: &[String]| -> Vec<Vec<char>> {
+            ws.iter()
+                .map(|w| rep.norm(w).chars().collect::<Vec<char>>())
+                .filter(|w| !w.is_empty())
+                .collect()
+        };
+        let enum_prefixes = chars_of(&enumeration.prefixes);
+        let enum_counters = chars_of(&enumeration.counters);
         let percentage_prefix = rep.norm(&r.percentage.prefix);
         let fraction_pattern = rep.norm(&r.fraction.pattern);
 
@@ -471,6 +500,8 @@ impl CompiledRules {
             date_specials,
             date_prefixes,
             ordinal_prefix,
+            enum_prefixes,
+            enum_counters,
             percentage_prefix,
             fraction_pattern,
             idiom_set,
@@ -2142,18 +2173,13 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
             i += 1;
             continue;
         }
-        // ITN-ORDINAL-494：「这两点 / 那三处」的数字保持汉字（「第」字头在下方序数分支处理）。
-        if i > 0 && matches!(shadow[i - 1], '这' | '那' | '哪') {
-            if let Some(len) = enum_point_run(&shadow, i) {
-                result.extend(&orig[i..i + len]);
-                i += len;
-                continue;
-            }
-            if let Some((hanzi, len)) = enum_point_arabic(&shadow, i) {
-                result.push_str(&hanzi);
-                i += len;
-                continue;
-            }
+        // ITN-ENUM-496：列举结构 `<前缀><数字>[个]<列举量词>` ⇒ 数字保持汉字（「第一条」「这两方面」
+        // 「另一方面」）；模型给的阿拉伯数字（「第1点」）还原成汉字。词表在 itn-rules.toml `[enumeration]`。
+        // 位置在甲型 / 序数之前：否则「第一点」被序数分支吃成「第1点」、「这两点」被时间吃成「这2点」。
+        if let Some((out, consumed)) = match_enumeration(&shadow, &orig, i, r) {
+            result.push_str(&out);
+            i += consumed;
+            continue;
         }
         // ITN-V2-003 (P3 甲型文法)：余数后缀（半/刻）匹配。
         if is_cn_num_char(shadow[i]) || shadow[i] == '零' || shadow[i] == '〇' {
@@ -2213,19 +2239,6 @@ fn normalize_with_rules(text: &str, r: &CompiledRules) -> String {
         if !r.ordinal_prefix.is_empty() && shadow[i] == r.ordinal_prefix.chars().next().unwrap() {
             // "第" 后面跟数字
             let after = i + 1;
-            // ITN-ORDINAL-494：「第一点 / 第二处」是列举要点，数字保持汉字（识别模型直接给出的
-            // 「第1点」也还原成汉字）；其余序数（第35章 / 第8名）照旧转。
-            if let Some(len) = enum_point_run(&shadow, after) {
-                result.extend(&orig[i..after + len]);
-                i = after + len;
-                continue;
-            }
-            if let Some((hanzi, len)) = enum_point_arabic(&shadow, after) {
-                result.push(orig[i]);
-                result.push_str(&hanzi);
-                i = after + len;
-                continue;
-            }
             if let Some((num_str, consumed)) = parse_cn_number(&shadow, after, Some(r)) {
                 if consumed > 0 {
                     result.push(r.ordinal_prefix.chars().next().unwrap());
@@ -2813,61 +2826,87 @@ fn is_demonstrative_yi(chars: &[char], i: usize, r: &CompiledRules) -> bool {
     r.is_date_suffix(&after)
 }
 
-/// ITN-ORDINAL-494（Gavin 10-19「第一点、第二点，或者说这一处、那一处、这一点、那一点……中间的这个数字，
-/// 一二三之类的这个数字，不应该转换成阿拉伯数字，应该显示成汉字的数字」）：列举要点的量词。
-const ENUM_POINT_COUNTERS: [char; 2] = ['点', '处'];
-
-/// 「点」后跟这些 ⇒ 是钟点 / 小数读法（两点钟、两点半、两点十分、第三点五），不算列举要点。
-fn is_clock_tail(c: char) -> bool {
-    matches!(c, '钟' | '半' | '整' | '刻' | '多' | '过' | '两')
+/// ITN-ENUM-496：「点」这类同时是时间后缀的量词，后面接这些 ⇒ 钟点 / 小数读法（两点钟、两点半、
+/// 两点十分、第三点五），不算列举。「半 / 刻」来自规则表 `date_time.triggers.special`。
+fn is_clock_tail(c: char, r: &CompiledRules) -> bool {
+    matches!(c, '钟' | '整' | '多' | '过')
+        || r.date_specials.contains(&c.to_string())
         || is_cn_num_char(c)
         || c.is_ascii_digit()
 }
 
-/// 量词位置 `at` 是否构成列举要点（「处」恒是；「点」后不能接钟点 / 小数读法）。
-fn is_enum_counter_at(chars: &[char], at: usize) -> bool {
-    match chars.get(at) {
-        Some(&'点') => !chars.get(at + 1).is_some_and(|&c| is_clock_tail(c)),
-        Some(c) => ENUM_POINT_COUNTERS.contains(c),
-        None => false,
-    }
+/// 在 `at` 处最长匹配 `words` 之一，返回匹配字数。
+fn longest_at(chars: &[char], at: usize, words: &[Vec<char>]) -> Option<usize> {
+    words
+        .iter()
+        .filter(|w| chars.get(at..at + w.len()) == Some(w.as_slice()))
+        .map(|w| w.len())
+        .max()
 }
 
-/// ITN-ORDINAL-494：从 `start` 起的汉字数字串后紧跟列举量词 ⇒ 返回数字串长度（调用方原样输出）。
-fn enum_point_run(chars: &[char], start: usize) -> Option<usize> {
-    let len = chars[start..]
-        .iter()
-        .take_while(|&&c| is_cn_num_char(c) || c == '两')
-        .count();
-    (len > 0 && is_enum_counter_at(chars, start + len)).then_some(len)
-}
-
-/// ITN-ORDINAL-494：识别模型直接给出阿拉伯数字（「第1点」「这2处」）⇒ 1~99 还原成汉字。
-fn enum_point_arabic(chars: &[char], start: usize) -> Option<(String, usize)> {
-    let len = chars[start..]
-        .iter()
-        .take_while(|c| c.is_ascii_digit())
-        .count();
-    if !(1..=2).contains(&len) || !is_enum_counter_at(chars, start + len) {
-        return None;
-    }
-    let n: u32 = chars[start..start + len]
-        .iter()
-        .collect::<String>()
-        .parse()
-        .ok()?;
+/// 1~99 ⇒ 汉字（「12」⇒「十二」）；其余 ⇒ `None`（不还原）。
+fn small_int_to_hanzi(digits: &[char]) -> Option<String> {
     const D: [&str; 10] = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
-    let hanzi = match (n / 10, n % 10) {
+    let n: u32 = digits.iter().collect::<String>().parse().ok()?;
+    let unit = |u: u32| if u == 0 { "" } else { D[u as usize] };
+    Some(match (n / 10, n % 10) {
         (0, 0) => return None,
         (0, u) => D[u as usize].to_string(),
-        (1, u) => format!("十{}", if u == 0 { "" } else { D[u as usize] }),
-        (t, u) => format!(
-            "{}十{}",
-            D[t as usize],
-            if u == 0 { "" } else { D[u as usize] }
-        ),
+        (1, u) => format!("十{}", unit(u)),
+        (t, u) if t < 10 => format!("{}十{}", D[t as usize], unit(u)),
+        _ => return None,
+    })
+}
+
+/// ITN-ENUM-496（Gavin 10-19：「第一条、第二项、第三步」「这一方面、那一方面、这两方面」保持汉字，
+/// 「你不要补丁式的添加，需要建立这类ITN处理的规则」）：列举结构
+/// `<前缀><数字>[个]<列举量词>` ⇒ 数字保持汉字。
+///
+/// - 前缀 / 量词：规则表 `[enumeration]`（最长匹配；增删说法只改表）。
+/// - 数字：汉字数字串原样保留；1~2 位阿拉伯数字（识别模型直接给的「第1点」）还原成汉字。
+/// - 量词同时是时间后缀（「点」）且后接钟点读法 ⇒ 不算列举（「这两点钟」「两点半」照时间规则走）。
+///
+/// 返回 `(输出, 消费字数)`：输出 = 前缀 + 数字（+「个」），量词留给主循环原样输出。
+fn match_enumeration(
+    shadow: &[char],
+    orig: &[char],
+    i: usize,
+    r: &CompiledRules,
+) -> Option<(String, usize)> {
+    let p = longest_at(shadow, i, &r.enum_prefixes)?;
+    let start = i + p;
+    let cn = shadow[start..]
+        .iter()
+        .take_while(|&&c| is_cn_num_char(c))
+        .count();
+    let (number, n) = if cn > 0 {
+        (orig[start..start + cn].iter().collect::<String>(), cn)
+    } else {
+        let ar = shadow[start..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        if !(1..=2).contains(&ar) {
+            return None;
+        }
+        (small_int_to_hanzi(&shadow[start..start + ar])?, ar)
     };
-    Some((hanzi, len))
+    let mut at = start + n;
+    let ge = shadow.get(at) == Some(&'个');
+    if ge {
+        at += 1;
+    }
+    let c = longest_at(shadow, at, &r.enum_counters)?;
+    let counter: String = shadow[at..at + c].iter().collect();
+    if r.is_date_suffix(&counter) && shadow.get(at + c).is_some_and(|&t| is_clock_tail(t, r)) {
+        return None;
+    }
+    let mut out: String = orig[i..start].iter().collect();
+    out.push_str(&number);
+    if ge {
+        out.push(orig[at - 1]);
+    }
+    Some((out, at - i))
 }
 
 /// 检查保护白名单，返回匹配长度（0=未匹配）
@@ -6183,45 +6222,72 @@ words = ["个", "件", "位", "名", "次", "只", "条", "张", "份", "台", "
     }
 }
 
-/// ITN-ORDINAL-494：列举要点「第一点 / 这两处」数字保持汉字；钟点与其它序数不受影响。
+/// ITN-ENUM-496（含 494）：列举结构 `<前缀><数字>[个]<列举量词>` 数字保持汉字；钟点与其它序数不受影响。
 #[cfg(test)]
-mod itn494_tests {
+mod itn496_tests {
     use super::normalize_numbers as n;
 
     #[test]
-    fn itn494_ordinal_points_keep_hanzi() {
+    fn itn496_ordinal_enumeration_keeps_hanzi() {
         assert_eq!(n("第一点是成本第二点是效率"), "第一点是成本第二点是效率");
         assert_eq!(n("第十二点"), "第十二点");
         assert_eq!(n("第一处和第二处"), "第一处和第二处");
+        assert_eq!(n("第一条第二项第三步"), "第一条第二项第三步");
+        assert_eq!(
+            n("第一部分第二阶段第三个环节"),
+            "第一部分第二阶段第三个环节"
+        );
+        assert_eq!(n("第一种第二类"), "第一种第二类");
+        assert_eq!(n("第一个方面"), "第一个方面");
         assert_eq!(n("第三點"), "第三點", "繁中原字形输出");
     }
 
     #[test]
-    fn itn494_demonstrative_points_keep_hanzi() {
+    fn itn496_demonstrative_enumeration_keeps_hanzi() {
         assert_eq!(
             n("这一点很重要那一点也要注意"),
             "这一点很重要那一点也要注意"
         );
         assert_eq!(n("这一处和那一处"), "这一处和那一处");
         assert_eq!(n("这两点我同意"), "这两点我同意");
+        assert_eq!(n("这一方面那一方面这两方面"), "这一方面那一方面这两方面");
+        assert_eq!(n("这三个方面"), "这三个方面");
+        assert_eq!(n("另一方面"), "另一方面");
+        assert_eq!(n("其中两点"), "其中两点");
+        assert_eq!(n("前三条和后两项"), "前三条和后两项");
+        assert_eq!(n("下一步"), "下一步");
         assert_eq!(n("哪三处"), "哪三处");
     }
 
     #[test]
-    fn itn494_arabic_from_model_restored() {
+    fn itn496_arabic_from_model_restored() {
         assert_eq!(n("第1点是成本第2点是效率"), "第一点是成本第二点是效率");
-        assert_eq!(n("第12点和第20处"), "第十二点和第二十处");
-        assert_eq!(n("这2点"), "这二点");
+        assert_eq!(n("第12条和第20项"), "第十二条和第二十项");
+        assert_eq!(n("这2方面"), "这二方面");
+        assert_eq!(n("第100条"), "第100条", "3 位以上不还原");
     }
 
     #[test]
-    fn itn494_clock_and_other_ordinals_unchanged() {
+    fn itn496_clock_and_other_ordinals_unchanged() {
         assert_eq!(n("下午两点钟出发"), "下午2点钟出发");
         assert_eq!(n("两点半"), "2:30");
         assert_eq!(n("下午三点"), "下午3点");
         assert_eq!(n("第三十五章第八名"), "第35章第8名");
-        assert_eq!(n("第一条第二项"), "第1条第2项");
+        assert_eq!(n("第一次第一个人"), "第1次第1个人");
         assert_eq!(n("第1章"), "第1章");
         assert_eq!(n("一点半"), "1:30");
+        assert_eq!(n("三条鱼十二条鱼"), "三条鱼12条鱼", "无前缀不属列举，照旧");
+    }
+
+    /// 外置旧版规则表没有 `[enumeration]` ⇒ 取内置表的这一节，不静默失效（[TOML-STALE-001] 同族）。
+    #[test]
+    fn itn496_old_rules_file_without_section_falls_back_to_builtin() {
+        let r = super::compile_rules_from_content(
+            "[ordinal]
+prefix = \"第\"
+",
+        );
+        assert!(r.enum_counters.iter().any(|w| w.as_slice() == ['方', '面']));
+        assert!(r.enum_prefixes.iter().any(|w| w.as_slice() == ['第']));
     }
 }

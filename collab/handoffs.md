@@ -157,3 +157,7 @@
 - LOCALTEST-495：`localtest/`（.gitignore），`--features poc` 挂载；CT 语义对照测试与结果在内。
 - 回答 Gavin：WB-ECHO-483 的拼音相似度检查只在「整句恰为词条」且已触发重解时才算，正常窗口不算；拼音比对本身微秒级。
 - 测试：feiyin-ime 2082 过 / 0 失败 / 49 忽略；网关 37；src-tauri 119；fmt 0。
+- ITN-ENUM-496：`itn-rules.toml` `[enumeration]` 规则族（前缀×量词×可选「个」），`itn.rs` `match_enumeration`；494 硬编码删除；`itn496_tests`。出包时 itn-rules.toml 三副本须同步。
+- TAIL-WIN-497：`LONG_SILENCE_TAIL_MS` 1900 → 1500，ts407 两条边界测试同步。
+- PIPE-REVIEW-498：`main.rs` 路B 词条读库挪进 `if PATH_B_WIRED_367`；其余节点复查结论见 CHANGELOG。
+- 测试：feiyin-ime 2083 过 / 0 失败；fmt 0。未出包。

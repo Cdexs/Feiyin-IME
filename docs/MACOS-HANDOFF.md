@@ -2890,3 +2890,6 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 3. **ITN-ORDINAL-494 · 列举要点数字保持汉字**（`src/itn.rs`，平台中立）
    - 「第一点 / 第二处 / 这两点 / 那三处」不再转阿拉伯数字；模型直接给出的「第1点」还原为「第一点」（1~99）。钟点（两点钟 / 两点半）与其它序数（第35章 / 第1条）不变。
 4. **本地临时测试目录 `localtest/`**（不入库）：`main.rs` 以 `#[cfg(all(test, feature = "poc"))] #[path = "../localtest/mod.rs"]` 挂载；目录不存在时只要不开 `poc` 特性就不受影响。
+5. **ITN-ENUM-496 · 列举结构规则族**（`src/itn.rs` + `itn-rules.toml`，平台中立）：替换第 3 条的硬编码；行为扩展到 条/项/步/方面/部分 等量词与 另/每/其中/前/后/上/下 等前缀。macOS 打包须带新版 `itn-rules.toml`（旧文件缺段会回落内置，不报错）。
+6. **TAIL-WIN-497 · 尾窗静默 1.9s → 1.5s**（`src/transcription/local_stream.rs`，平台中立）：macOS 本地实时档接通后同一行为，无需另改。
+7. **PIPE-REVIEW-498**（`src/main.rs`，平台中立）：路B 已摘线分支外的无用读库挪进分支，无行为变化。已评估，对 macOS 无需同步改动。

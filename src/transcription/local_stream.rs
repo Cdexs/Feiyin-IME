@@ -302,7 +302,11 @@ const ACC_BOUNDARY_STABLE_MS: f32 = 500.0;
 /// 将末尾一片和前一片（2s+）组窗来解码」「现在有两种静默间隔触发组窗：常规 1200ms 触发常规派发，
 /// 长时静默 1900ms 触发末尾组窗机制」。二者并存：1200ms 已把片派出，1900ms 再让 main 侧据
 /// 遗留的**待覆盖片**组「末尾窗」并即时回灌。仅本地实时流式路B 使用。
-pub(crate) const LONG_SILENCE_TAIL_MS: f32 = 1900.0;
+///
+/// TAIL-WIN-497（Gavin 2026-10-19「把这个静默间隔改为1.5s，否则最后一段语音精解出来的等待有点长」）：
+/// 1900 ⇒ 1500ms。时序安全：1200ms 派发时末片已经 `acc_tx` 送出，本信号走同一通道、必排其后
+/// ⇒ 到达时 `pending_slice` 已就位；337 定界（+500ms）只管显示冻结，不影响组尾窗。
+pub(crate) const LONG_SILENCE_TAIL_MS: f32 = 1500.0;
 
 /// LOCALRT-TAIL-WINDOW-407：是否发「长静默」信号 —— 启用 acc 派发、静默 ≥1900ms、且本段静默未发过。
 /// 纯函数，便于单测「只发一次 / 1200~1900 不发 / 恢复说话后复位」。
@@ -3210,18 +3214,18 @@ mod tests {
     // LOCALRT-TAIL-WINDOW-407：长静默触发（只发一次 / 恢复复位）+ 尾部字缝切点
     // ========================================================================
 
-    /// 407 触发：<1900 不发；≥1900 且未发过 ⇒ 发；已发过 ⇒ 不再发；未启用 ⇒ 不发。
+    /// 407 触发（497 起阈值 1500）：<1500 不发；≥1500 且未发过 ⇒ 发；已发过 ⇒ 不再发；未启用 ⇒ 不发。
     #[test]
     fn ts407_long_silence_triggers_once_then_resets() {
         assert!(!should_signal_long_silence(true, 1200.0, false));
-        assert!(!should_signal_long_silence(true, 1899.0, false));
-        assert!(should_signal_long_silence(true, 1900.0, false));
+        assert!(!should_signal_long_silence(true, 1499.0, false));
+        assert!(should_signal_long_silence(true, 1500.0, false));
         assert!(should_signal_long_silence(true, 5000.0, false));
         // 同一停顿已发过 ⇒ 不再发（只发一次）。
         assert!(!should_signal_long_silence(true, 5000.0, true));
         // 未启用 ⇒ 不发。
         assert!(!should_signal_long_silence(false, 5000.0, false));
-        assert_eq!(LONG_SILENCE_TAIL_MS, 1900.0);
+        assert_eq!(LONG_SILENCE_TAIL_MS, 1500.0);
     }
 
     /// 407 字缝：有字缝 ⇒ (中心, true)（落在回溯区间内的静音处）；无字缝 ⇒ (len-back, false)；
@@ -3309,7 +3313,7 @@ mod tests {
         );
         feeder.join().ok();
         println!(
-            "\n[407] 语音 {speech_secs:.1}s + 尾静默 3s ⇒ 长静默信号于喂入后 {:.0}ms（音频时间≈静默起点+1900ms）",
+            "\n[407] 语音 {speech_secs:.1}s + 尾静默 3s ⇒ 长静默信号于喂入后 {:.0}ms（音频时间≈静默起点+LONG_SILENCE_TAIL_MS）",
             signal_ms.unwrap_or(f64::NAN)
         );
         assert!(signal_ms.is_some(), "长静默信号必须触发一次");
@@ -5824,19 +5828,19 @@ mod testsync405_407_tests {
             fire
         };
         assert!(!step(1200.0, false, &mut done));
-        assert!(!step(1800.0, false, &mut done));
-        assert_eq!(LONG_SILENCE_TAIL_MS, 1900.0);
+        assert!(!step(1400.0, false, &mut done));
+        assert_eq!(LONG_SILENCE_TAIL_MS, 1500.0);
         assert!(
             step(LONG_SILENCE_TAIL_MS, false, &mut done),
-            "恰 1900 发一次"
+            "恰 1500 发一次"
         );
-        assert!(!step(1899.0, false, &mut done));
+        assert!(!step(1800.0, false, &mut done));
         assert!(!step(5000.0, false, &mut done), "同段静默只发一次");
         // 恢复说话 ⇒ 复位。
         assert!(!step(0.0, true, &mut done));
         // 下一段静默可再发。
-        assert!(!step(1899.0, false, &mut done));
-        assert!(step(2000.0, false, &mut done), "复位后下一段可再发");
+        assert!(!step(1499.0, false, &mut done));
+        assert!(step(1600.0, false, &mut done), "复位后下一段可再发");
         // 未启用 ⇒ 永不发。
         assert!(!should_signal_long_silence(false, 9999.0, false));
     }

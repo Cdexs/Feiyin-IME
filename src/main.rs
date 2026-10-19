@@ -9317,8 +9317,9 @@ fn spawn_worker_thread(
                         // 🔴 SLIDING-WINDOW-367：路B（松手全量解码）+ 364 预算闸门**已摘接线**（保留代码可回挂）；
                         //    最终文本改由滑动窗口（committed + 最新窗口）产出。恢复：把本 const 置 `true`。
                         const PATH_B_WIRED_367: bool = false;
-                        let path_b_terms = load_hotwords_for_accuracy(&config);
                         let path_b_text: Option<String> = if PATH_B_WIRED_367 {
+                            // PIPE-REVIEW-498：词条只在路B 接线时读（原先无条件读库，白占松手关键路径）。
+                            let path_b_terms = load_hotwords_for_accuracy(&config);
                             // 借用 `local_pcm`，不消费 `asr_result`（后面还要 destructure）。
                             let pcm_opt: Option<&[f32]> = match &asr_result {
                                 Ok(Ok((_, pcm))) => Some(pcm.as_slice()),

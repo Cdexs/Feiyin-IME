@@ -1224,7 +1224,7 @@ pub(crate) fn run_acc_windows(
                         let has_pending = pending_slice.is_some();
                         if log::log_enabled!(log::Level::Debug) {
                             log::debug!(
-                                "[LocalRT-DBG-407] long silence 1900ms: pending={}",
+                                "[LocalRT-DBG-407] long silence: pending={}",
                                 if has_pending { "yes" } else { "no" }
                             );
                         }
