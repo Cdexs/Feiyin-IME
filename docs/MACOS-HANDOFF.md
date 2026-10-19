@@ -2896,3 +2896,4 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 8. **UI-NOTICE-FONT-499 · 提示 / 报错浮层文字同预览窗字体**（`src/main.rs` Windows 浮层绘制，平台代码）：Windows 改为 GDI ClearType 画字。**macOS**：Gavin 定为长期规则「所有报错窗口、提示窗口的字体都必须要和预览窗口字体保持一致」——macOS 浮层的提示 / 报错态须与其预览态用同一字体、字号与渲染方式，接手时核对。
 9. **TRAY-ICON-500 · 托盘识别服务项图标**（`src/ui/menu_icons.rs` 平台中立 + `src/platform/macos/tray.rs`）：macOS 已同步接线（`set_asr_item_icon`，建菜单与文案切换时都设图标，18pt，不设 template 保品牌橙）。⚠️ Windows 端无法编译 macOS 分支，macOS 接手请先 `cargo check`。
 10. **ICON-AA-501 · 菜单图标抗锯齿修复**（`src/ui/menu_icons.rs`，平台中立）：macOS 托盘菜单图标同样受益，无需另改。
+11. **BUILD-502**（Windows 出包）：无新增依赖 / 工具链变化（本批 Cargo 变化仅 LAN-ADDR-492 已记的 windows features + src-tauri macOS `libc`）。macOS 接手须 `cargo check` getifaddrs 分支与 TRAY-ICON-500 的 `set_asr_item_icon`。
