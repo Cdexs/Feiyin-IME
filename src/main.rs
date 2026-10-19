@@ -4478,16 +4478,8 @@ mod d2d {
         /// Processing-state text format (D2D-073-P0): centered paragraph, NO_WRAP.
         /// Face is "Microsoft YaHei UI" SemiBold — see the note on the field below.
         pub text_format: windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
-        /// D2D-P1: streaming-state text format — left-aligned (LEADING), vertical center,
-        /// NO_WRAP. Face "Segoe UI" Normal, STREAMFONT-189 起字号 = OVERLAY_TEXT_FONT_SIZE
-        /// (-17 → 17px，477 起；473 曾为 18、原 16)，与 GDI 兜底的 streaming_font 同号（EDITFONT-183 曾是 14px，
-        /// Gavin 2026-09-08 拍板实时上屏与编辑态同号），单一 GDI 度量源
-        /// (measure_text_width) 仍以所选字体为源，测渲不漂移。
-        /// (P0's format comment claimed "must match the GDI face" but used YaHei UI
-        /// SemiBold; for the processing state that was an intentional standalone choice —
-        /// Chinese-only text falls back to the same glyph engine either way, and Gavin has
-        /// visually accepted it. The streaming states need the real GDI face.)
-        pub streaming_text_format: windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
+        // UI-NOTICE-FONT-499：原 streaming_text_format（D2D 画流式 / 提示文字）已无读者 —— 流式文字
+        // （UI-FONT-474/476）与提示 / 报错文字（499）一律 GDI streaming_font 画，故删除。
         /// D2D-P2 (PLAN-108 H2): 居中小文本 format（⏎/✕/标题/按钮标签）。
         /// Segoe UI Normal 14，CENTER + 段落垂直居中 + NO_WRAP，
         /// 对应 GDI draw_text(DT_CENTER|DT_VCENTER|SINGLELINE) 的缓存字体。
@@ -4527,8 +4519,7 @@ mod d2d {
             // D2D-P1 correction of this comment: the GDI face is "Segoe UI" FW_NORMAL
             // (create_clear_type_font), NOT YaHei UI SemiBold. The P0 processing format
             // below is a deliberate standalone choice (Chinese-only string; Gavin accepted
-            // it visually). The D2D-P1 streaming format (streaming_text_format) is the one
-            // that actually matches the GDI face/weight.
+            // it visually). 流式 / 提示文字自 UI-FONT-474 / UI-NOTICE-FONT-499 起由 GDI 画。
             let family: Vec<u16> = "Microsoft YaHei UI".encode_utf16().collect();
             let locale: Vec<u16> = "zh-CN".encode_utf16().collect();
             let text_format = dwrite.CreateTextFormat(
@@ -4543,23 +4534,7 @@ mod d2d {
             text_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             text_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            // D2D-P1: streaming-state format — same face/weight as the GDI text path
-            // ("Segoe UI", FW_NORMAL), left-aligned, single line, no wrap.
-            // STREAMFONT-189: 字号归 OVERLAY_TEXT_FONT_SIZE（477 起 17px），与 GDI 兜底
-            // streaming_font / EDIT 控件同号；其余三个 format 仍绑 OVERLAY_FONT_SIZE。
             let gdi_family: Vec<u16> = "Segoe UI".encode_utf16().collect();
-            let streaming_text_format = dwrite.CreateTextFormat(
-                PCWSTR(gdi_family.as_ptr()),
-                None,
-                DWRITE_FONT_WEIGHT_NORMAL,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                -OVERLAY_TEXT_FONT_SIZE as f32, // GDI negative height (em) → D2D positive size
-                PCWSTR(locale.as_ptr()),
-            )?;
-            streaming_text_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
-            streaming_text_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-            streaming_text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             // D2D-P2 (H2): 居中小文本 format —— 同 GDI face（Segoe UI Normal 14），
             // 对应 draw_text 的 DT_CENTER|DT_VCENTER|SINGLELINE 三连。
             let centered_text_format = dwrite.CreateTextFormat(
@@ -4619,7 +4594,6 @@ mod d2d {
                 dwrite,
                 rt,
                 text_format,
-                streaming_text_format,
                 centered_text_format,
                 wrap_text_format,
                 brush,
@@ -6677,7 +6651,7 @@ fn status_overlay_width(text_w: i32, max_w: i32) -> i32 {
         .clamp(STATUS_OVERLAY_SIZE[0], max_w.max(STATUS_OVERLAY_SIZE[0]))
 }
 
-/// UI-HINT-471：按提示窗实际绘制字号（`streaming_text_format` = `OVERLAY_TEXT_FONT_SIZE`）量文字宽。
+/// UI-HINT-471：按提示窗实际绘制字号（GDI streaming_font = `OVERLAY_TEXT_FONT_SIZE`，UI-NOTICE-FONT-499）量文字宽。
 #[cfg(target_os = "windows")]
 fn measure_status_text_width(hwnd: HWND, text: &str) -> i32 {
     unsafe {
