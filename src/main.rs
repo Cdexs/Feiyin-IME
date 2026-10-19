@@ -3162,9 +3162,13 @@ fn draw_overlay_to_dc(
     // D2D 成败都消费）与 draw_text 全部继承此处所选字体 ⇒ 测渲必然同号（EDITFONT-183
     // 的宽度低估教训在此结构性排除）。生命周期照 edit_font/cached_font 范式：
     // 惰性创建 + 存回字段，DeleteObject 配对在隐藏/退出清理臂（cached_font 同臂）。
+    // UI-NOTICE-FONT-499：信息 / 错误提示窗文字同样走 streaming_font（与预览窗同字体同渲染）。
     let streaming_text = matches!(
         state.request.as_ref().map(|r| &r.status),
-        Some(OverlayStatus::RecordingStreamingIdle) | Some(OverlayStatus::RecordingWithText { .. })
+        Some(OverlayStatus::RecordingStreamingIdle)
+            | Some(OverlayStatus::RecordingWithText { .. })
+            | Some(OverlayStatus::Info(_))
+            | Some(OverlayStatus::Error(_))
     );
     let font = if streaming_text {
         state
@@ -3343,20 +3347,10 @@ fn draw_overlay_to_dc(
                 }
             }
             OverlayStatus::Error(message) => {
-                // D2D-P2 (PLAN-108 H12): error 态 redrawn with D2D. On any D2D failure
-                // the GDI path below still renders this frame, so the overlay never
-                // goes blank. GDI fallback keeps DT_END_ELLIPSIS (U1 裁决).
-                if !d2d::draw_error_overlay(hdc, rect, message) {
-                    draw_error_overlay(hdc, rect, message, request.ui_language);
-                }
+                draw_status_overlay(hdc, rect, message, true, request.ui_language);
             }
             OverlayStatus::Info(message) => {
-                // BUG-119: 信息提示态。圆角掩码沿用 Error 现值 Some(10)
-                //（OVERLAY-121 per-pixel alpha 才动圆角，本单不碰）。
-                // D2D 优先，失败回落 GDI（与 Error 态同一兜底结构）。
-                if !d2d::draw_info_overlay(hdc, rect, message) {
-                    draw_info_overlay(hdc, rect, message, request.ui_language);
-                }
+                draw_status_overlay(hdc, rect, message, false, request.ui_language);
             }
         }
     } else {
@@ -5523,12 +5517,11 @@ mod d2d {
     /// 底色 #211D1A / 边 r10（:4032-4034）、红点 d=8 圆心 (left+16, 垂直中)
     /// （:4061-4075，Ellipse → FillEllipse r4 直译）、文本带相对 28 → w-14、
     /// 上下 4px（:4082-4087，left = circ_x + circ_d/2 + 8 = 28）。
-    /// 文本复用 streaming_text_format（Segoe UI Normal 14, LEADING + 垂直居中 +
-    /// NO_WRAP，与 GDI DT_LEFT|DT_VCENTER|SINGLELINE 逐项对应）——U1 裁决：
-    /// DT_END_ELLIPSIS 不迁移，NO_WRAP 硬裁剪，GDI 兜底保留省略号。
+    /// UI-NOTICE-FONT-499 起本原语**只画窗框 + 圆点**，文字由调用方 `draw_status_overlay`
+    /// 用 GDI ClearType（预览窗同款 streaming_font）画，保留省略号。
     /// 无命中矩形（GDI 版无返回值，五元组全 None）。
     /// Returns false on any D2D failure — the caller renders the same frame via GDI.
-    pub(crate) fn draw_error_overlay(hdc: HDC, rect: &RECT, message: &str) -> bool {
+    pub(crate) fn draw_error_overlay(hdc: HDC, rect: &RECT) -> bool {
         with_d2d(hdc, rect, |res, w, h| {
             // OVERLAY-141: 半径单一来源。
             chrome_with(
@@ -5552,22 +5545,7 @@ mod d2d {
                     },
                     &res.brush,
                 );
-                let msg: Vec<u16> = message.encode_utf16().collect();
-                res.brush
-                    .SetColor(&colorref_to_d2d(super::OVERLAY_BRAND_ORANGE));
-                res.rt.DrawText(
-                    &msg,
-                    &res.streaming_text_format,
-                    &D2D_RECT_F {
-                        left: 12.0 + circ_d + circ_d + 8.0, // GDI: circ_x + circ_d/2 + 8
-                        top: 4.0,
-                        right: w - 14.0,
-                        bottom: h - 4.0,
-                    },
-                    &res.brush,
-                    windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
+                // UI-NOTICE-FONT-499：文字不在这里画，由调用方 draw_status_overlay 用 GDI（预览窗同款）画。
             }
         })
     }
@@ -5575,9 +5553,9 @@ mod d2d {
     /// BUG-119: Info 态。几何逐位照抄 D2D `draw_error_overlay`（即 GDI
     /// `draw_info_overlay` 的 D2D 直译）：chrome bg #211D1A / 边 r10，
     /// 蓝点（COLORREF 0xFF9933 = RGB #3399FF，错误态是红点 0x0033CC），
-    /// 文本白色（OVERLAY_TEXT_WHITE，错误态是 BRAND_ORANGE）。其余逐位同源。
+    /// 文字（白色；错误态橙色）自 UI-NOTICE-FONT-499 起由调用方用 GDI 画。其余逐位同源。
     /// Returns false on any D2D failure — the caller renders the same frame via GDI.
-    pub(crate) fn draw_info_overlay(hdc: HDC, rect: &RECT, message: &str) -> bool {
+    pub(crate) fn draw_info_overlay(hdc: HDC, rect: &RECT) -> bool {
         with_d2d(hdc, rect, |res, w, h| {
             // OVERLAY-141: 半径单一来源。
             chrome_with(
@@ -5601,22 +5579,7 @@ mod d2d {
                     },
                     &res.brush,
                 );
-                let msg: Vec<u16> = message.encode_utf16().collect();
-                res.brush
-                    .SetColor(&colorref_to_d2d(super::OVERLAY_TEXT_WHITE));
-                res.rt.DrawText(
-                    &msg,
-                    &res.streaming_text_format,
-                    &D2D_RECT_F {
-                        left: 12.0 + circ_d + circ_d + 8.0, // GDI: circ_x + circ_d/2 + 8
-                        top: 4.0,
-                        right: w - 14.0,
-                        bottom: h - 4.0,
-                    },
-                    &res.brush,
-                    windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
+                // UI-NOTICE-FONT-499：文字不在这里画，由调用方 draw_status_overlay 用 GDI（预览窗同款）画。
             }
         })
     }
@@ -6355,6 +6318,65 @@ fn draw_preview_overlay(
     );
     (copy_rect, close_rect, title_close_rect)
 }
+/// UI-NOTICE-FONT-499（Gavin 10-19「overlay提示窗中的文字比较丑，应该统一成和预览窗口一样的字体
+/// （样式、大小、圆滑无锯齿）」）：信息 / 错误提示窗 = 窗框 + 圆点由 D2D 画（失败回落 GDI 整帧），
+/// **文字一律 GDI 画** —— DC 已选入 streaming_font（预览窗 / 编辑框同一 ClearType 字体，见
+/// draw_overlay_to_dc），与 UI-FONT-474 / 476 同一做法。
+#[cfg(target_os = "windows")]
+fn draw_status_overlay(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: &RECT,
+    message: &str,
+    is_error: bool,
+    ui_language: config::UiLanguage,
+) {
+    // D2D 优先，失败回落 GDI 整帧（含文字）—— 保持 `if !d2d::draw_*` 骨架（G4 结构护栏）。
+    if is_error {
+        if !d2d::draw_error_overlay(hdc, rect) {
+            draw_error_overlay(hdc, rect, message, ui_language);
+            return;
+        }
+    } else {
+        #[allow(clippy::collapsible_else_if)]
+        if !d2d::draw_info_overlay(hdc, rect) {
+            draw_info_overlay(hdc, rect, message, ui_language);
+            return;
+        }
+    }
+    let color = if is_error {
+        OVERLAY_BRAND_ORANGE
+    } else {
+        OVERLAY_TEXT_WHITE
+    };
+    draw_status_text(hdc, rect, message, color);
+}
+
+/// 信息 / 错误提示文字：圆点右侧起、左对齐单行、超长省略号（几何与 D2D 圆点同源：左 28、右 14、上下 4）。
+#[cfg(target_os = "windows")]
+fn draw_status_text(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: &RECT,
+    message: &str,
+    color: COLORREF,
+) {
+    let circ_d = 8;
+    let mut text_rect = RECT {
+        left: rect.left + 12 + circ_d / 2 + circ_d / 2 + 8,
+        top: rect.top + 4,
+        right: rect.right - 14,
+        bottom: rect.bottom - 4,
+    };
+    unsafe {
+        let _ = SetTextColor(hdc, color);
+    }
+    draw_text(
+        hdc,
+        message,
+        &mut text_rect,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+}
+
 #[cfg(target_os = "windows")]
 fn draw_error_overlay(
     hdc: windows::Win32::Graphics::Gdi::HDC,
@@ -6415,21 +6437,7 @@ fn draw_error_overlay(
         let _ = DeleteObject(null_pen);
     }
     // Error text (orange, left-aligned with margin for circle)
-    let mut text_rect = RECT {
-        left: circ_x + circ_d / 2 + 8,
-        top: rect.top + 4,
-        right: rect.right - 14,
-        bottom: rect.bottom - 4,
-    };
-    unsafe {
-        let _ = SetTextColor(hdc, BRAND_ORANGE);
-    }
-    draw_text(
-        hdc,
-        message,
-        &mut text_rect,
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-    );
+    draw_status_text(hdc, rect, message, BRAND_ORANGE);
 }
 /// BUG-119: 信息提示态（如「请说话哦..」）。布局逐位照抄 draw_error_overlay，
 /// 仅点色（蓝）与文字色（白）与错误态区分 —— 信息级不再是红色告警。
@@ -6492,21 +6500,7 @@ fn draw_info_overlay(
         let _ = DeleteObject(null_pen);
     }
     // Info text (white, left-aligned with margin for circle)
-    let mut text_rect = RECT {
-        left: circ_x + circ_d / 2 + 8,
-        top: rect.top + 4,
-        right: rect.right - 14,
-        bottom: rect.bottom - 4,
-    };
-    unsafe {
-        let _ = SetTextColor(hdc, OVERLAY_TEXT_WHITE);
-    }
-    draw_text(
-        hdc,
-        message,
-        &mut text_rect,
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-    );
+    draw_status_text(hdc, rect, message, OVERLAY_TEXT_WHITE);
 }
 /// OVERLAY-043-B: per-frame size interpolation step.
 ///
@@ -18412,6 +18406,119 @@ mod overlay_086_d2d_p1_guard_tests {
         );
     }
 
+    /// UI-NOTICE-FONT-499 护栏（Gavin 10-19「overlay提示窗中的文字……应该统一成和预览窗口一样的字体」）：
+    /// D2D 信息 / 错误原语不得再画文字；提示窗两态选入 streaming_font；分派走 draw_status_overlay。
+    #[test]
+    fn ui499_status_text_drawn_by_gdi_like_preview() {
+        let src = include_str!("main.rs");
+        for name in ["draw_error_overlay", "draw_info_overlay"] {
+            let head = format!("pub(crate) fn {name}(hdc: HDC, rect: &RECT) -> bool {{");
+            let body = src
+                .split(head.as_str())
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} D2D 锚点缺失"));
+            let body = &body[..body.find("\n    }\n").expect("函数尾")];
+            assert!(!body.contains("DrawText"), "{name}：D2D 原语不得画文字");
+        }
+        let sel = src
+            .split("let streaming_text = matches!(")
+            .nth(1)
+            .expect("streaming_text 锚点缺失");
+        let sel = &sel[..sel.find(");").unwrap()];
+        assert!(sel.contains("OverlayStatus::Info(_)") && sel.contains("OverlayStatus::Error(_)"));
+        assert!(
+            src.contains("draw_status_overlay(hdc, rect, message, false, request.ui_language);")
+        );
+        assert!(src.contains("draw_status_overlay(hdc, rect, message, true, request.ui_language);"));
+    }
+
+    /// UI-NOTICE-FONT-499 取证：真内存 DC 上走生产 `draw_status_overlay`（选入 streaming_font），
+    /// 出图 `collab/evidence/499/{info,error}.bmp`；断言文字是 GDI ClearType（有彩边像素，预览窗同款）。
+    #[test]
+    #[ignore = "UI-NOTICE-FONT-499：真 DC 离屏绘制，--ignored 运行"]
+    fn ui499_status_text_real_dc() {
+        use windows::Win32::Graphics::Gdi as g;
+        let (w, h) = (300usize, 36usize);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: w as i32,
+            bottom: h as i32,
+        };
+        let render = |is_error: bool| -> Vec<u8> {
+            unsafe {
+                let screen = g::GetDC(None);
+                let mem = g::CreateCompatibleDC(screen);
+                let mut bi = g::BITMAPINFO::default();
+                bi.bmiHeader.biSize = std::mem::size_of::<g::BITMAPINFOHEADER>() as u32;
+                bi.bmiHeader.biWidth = w as i32;
+                bi.bmiHeader.biHeight = -(h as i32);
+                bi.bmiHeader.biPlanes = 1;
+                bi.bmiHeader.biBitCount = 32;
+                let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+                let bmp = g::CreateDIBSection(mem, &bi, g::DIB_RGB_COLORS, &mut bits, None, 0)
+                    .expect("dib");
+                let old = g::SelectObject(mem, bmp);
+                let font = create_clear_type_font(OVERLAY_TEXT_FONT_SIZE);
+                let of = g::SelectObject(mem, font);
+                let _ = g::SetBkMode(mem, g::TRANSPARENT);
+                draw_status_overlay(
+                    mem,
+                    &rect,
+                    "输出优化已启用",
+                    is_error,
+                    config::UiLanguage::Chinese,
+                );
+                let px = std::slice::from_raw_parts(bits as *const u8, w * h * 4).to_vec();
+                g::SelectObject(mem, of);
+                let _ = g::DeleteObject(font);
+                g::SelectObject(mem, old);
+                let _ = g::DeleteObject(bmp);
+                let _ = g::DeleteDC(mem);
+                g::ReleaseDC(None, screen);
+                px
+            }
+        };
+        let info = render(false);
+        let error = render(true);
+        d2d::release_resources();
+        for (name, px) in [("info", &info), ("error", &error)] {
+            let mut f = Vec::new();
+            f.extend_from_slice(b"BM");
+            f.extend_from_slice(&(54 + px.len() as u32).to_le_bytes());
+            f.extend_from_slice(&[0u8; 4]);
+            f.extend_from_slice(&54u32.to_le_bytes());
+            f.extend_from_slice(&40u32.to_le_bytes());
+            f.extend_from_slice(&(w as i32).to_le_bytes());
+            f.extend_from_slice(&(-(h as i32)).to_le_bytes());
+            f.extend_from_slice(&1u16.to_le_bytes());
+            f.extend_from_slice(&32u16.to_le_bytes());
+            f.extend_from_slice(&[0u8; 24]);
+            f.extend_from_slice(px);
+            let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("collab/evidence/499/{name}.bmp"));
+            let _ = std::fs::create_dir_all(p.parent().unwrap());
+            std::fs::write(p, f).unwrap();
+            // 文字区（圆点右侧）彩边像素：GDI ClearType 才有 R/B 分量明显不等的边缘。
+            let fringe = (0..h)
+                .flat_map(|y| (28..w - 14).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let i = (y * w + x) * 4;
+                    let (r, gg, b) = (px[i + 2] as i32, px[i + 1] as i32, px[i] as i32);
+                    // 橙色字本身 R≫B，按与字色无关的「R、G、B 三者两两差异」判彩边会误判；
+                    // 只数白字（info）。错误态只要求有字。
+                    if name == "info" {
+                        (r - b).abs() > 30
+                    } else {
+                        r + gg + b > 200
+                    }
+                })
+                .count();
+            println!("[499] {name} 文字区像素 {fringe}");
+            assert!(fringe > 0, "{name}：提示文字须由 GDI 画出（ClearType）");
+        }
+    }
+
     /// 护栏 3：D2DERR_RECREATE_TARGET 常量值钉死 0x8899000C。
     /// 看似琐碎但实在：设备丢失（睡眠唤醒/驱动更新/RDP 切换）场景端测不可复现，
     /// 常量抄错一位 → with_d2d 的 EndDraw 错误码比对永不命中 → 资源永不重建，
@@ -19138,7 +19245,7 @@ mod overlay_109_d2d_p2p3_guard_tests {
             "Recording/FallingToProcessing 共用入口：无效 HDC 必须返回 false（GDI 回落触发器）"
         );
 
-        let ok_error = d2d::draw_error_overlay(hdc, &rect, "错误消息");
+        let ok_error = d2d::draw_error_overlay(hdc, &rect);
         assert!(
             !ok_error,
             "Error 入口：无效 HDC 必须返回 false（GDI 回落触发器）"

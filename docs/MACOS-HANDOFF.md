@@ -2893,3 +2893,4 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 5. **ITN-ENUM-496 · 列举结构规则族**（`src/itn.rs` + `itn-rules.toml`，平台中立）：替换第 3 条的硬编码；行为扩展到 条/项/步/方面/部分 等量词与 另/每/其中/前/后/上/下 等前缀。macOS 打包须带新版 `itn-rules.toml`（旧文件缺段会回落内置，不报错）。
 6. **TAIL-WIN-497 · 尾窗静默 1.9s → 1.5s**（`src/transcription/local_stream.rs`，平台中立）：macOS 本地实时档接通后同一行为，无需另改。
 7. **PIPE-REVIEW-498**（`src/main.rs`，平台中立）：路B 已摘线分支外的无用读库挪进分支，无行为变化。已评估，对 macOS 无需同步改动。
+8. **UI-NOTICE-FONT-499 · 提示 / 报错浮层文字同预览窗字体**（`src/main.rs` Windows 浮层绘制，平台代码）：Windows 改为 GDI ClearType 画字。**macOS**：Gavin 定为长期规则「所有报错窗口、提示窗口的字体都必须要和预览窗口字体保持一致」——macOS 浮层的提示 / 报错态须与其预览态用同一字体、字号与渲染方式，接手时核对。

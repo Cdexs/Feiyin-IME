@@ -161,3 +161,4 @@
 - TAIL-WIN-497：`LONG_SILENCE_TAIL_MS` 1900 → 1500，ts407 两条边界测试同步。
 - PIPE-REVIEW-498：`main.rs` 路B 词条读库挪进 `if PATH_B_WIRED_367`；其余节点复查结论见 CHANGELOG。
 - 测试：feiyin-ime 2083 过 / 0 失败；fmt 0。未出包。
+- UI-NOTICE-FONT-499：信息 / 错误提示窗文字改 GDI ClearType（streaming_font），统一入口 `draw_status_overlay`；D2D `draw_info_overlay` / `draw_error_overlay` 去掉 message 参数只画窗框圆点。2084 过 / 0 失败。待 Gavin 出包后目视。
