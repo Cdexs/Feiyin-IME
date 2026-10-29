@@ -154,3 +154,4 @@
 要引用它时先去 `logs/` 与 `troubleshooting-archive.md` 找原始记录，别当它已正式立档。
 | DEC-112 | 本地实时最终文本**剥光标点后由标点模型（CT-Transformer，只看文字）整段重打**（PUNCT-REDO-493，推翻 DEC-080）：最终文本 = 定稿前缀 + 最新窗口，每窗在停顿处切，实为多片拼装，精解模型按停顿打标点、窗尾必补 ⇒ 句子被切碎（Gavin 10-19 端测）。门 = 开标点 && 非翻译；开 LLM 时剥光文本交 LLM。只动本地实时一条管线 | 现行 |
 | DEC-113 | **本地流式实时模型成为新装默认、设置页恒显示**（ASR-DEFAULT-LRT-506，推翻 DEC-065 的「极客档隐藏 + Ctrl+M 解锁」，否决独立服务形态那半句不变）；「本地模型 - 快速」不再支持，只对存量配置显示（504）。新装 = `default-config.toml` + `AudioConfig::default()`；存量配置缺 `asr_model` 字段仍回落 performance，老用户零变化 | 现行 |
+| DEC-114 | **输入法与识别服务剥离为两个独立应用**：识别服务 = flashasr（`CodeLab/FlashASR`，独立仓库），只留本地实时 + 在线 FunASR；输入法不带模型，连 flashasr 或直连阿里 FunASR；处理环节开关（输出优化 / 翻译 / ITN / 标点 / 繁简 / 去句末标点）由前端每次请求传参；服务端终端档案只存声纹与近场标定；服务端大模型统一配置；首次使用弹连接向导。方案 `FlashASR/docs/SPLIT-PLAN.md` | 现行 |
