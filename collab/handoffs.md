@@ -178,3 +178,4 @@
 - 声纹按归属 `speaker::VpOwner`（Local / Terminal），`AccEngine::create_slot(terminal_id)`；`finish_terminal_voiceprint` 会话收尾；`asr_shared::purge_terminal_voiceprint` 两处吊销调用。
 - 测试 2099 / 42 / 121 全过。未出包、未 push。
 - FLASH-P0-513：`text_stage::translate` 多参 `via_llm`（= 终端 optimize）；会话 `optimize: params.optimize && !params.translate`。2100 / 42 过。
+- FLASH-P1：flashasr 建仓搬家完成（`FlashASR` 仓库 `6772c80`）。本仓库代码未改。过渡期识别代码两边各一份，改动须同步。
