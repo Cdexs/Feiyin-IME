@@ -103,6 +103,17 @@
 | S11 | 协议文档 + Python 参考客户端；MACOS-HANDOFF；五文档 | ✅ 验收 `collab/acceptance-491-S11.md`，提交 `b1463de`。`docs/ASR-PROTOCOL.md`（v1 独立契约，逐条对网关代码核实）；`tools/asr-client/feiyin_asr_client.py`（纯标准库，指纹先验再升级，退出码 0/2–8）；45 单测过（含本地 TLS 1.3 假网关集成测试 7 个）。无 Rust 改动。一期 S1–S11 开发全部完成 |
 | T | tester-1：TEST-SYNC → 全量回归 → 出包 | ✅ TEST-SYNC-491（9 护栏）· TEST-EXEC-491（2074 过 / 0 失败）· BUILD-491 出包（0.9.7，HEAD `aa2f2bc`）：tester-1 构建并同步 Publish 后额度触顶，主控接手核验；主控复跑告警时误设 `SHERPA_ONNX_LIB_DIR` 触发整体重编（见 [BUILD-ENV-SHERPA-491]），改由 Sonnet 子 Agent 按指南环境重编并复核。最终 sha（target = Publish）：feiyin-ime `5c3f22607ecf7bf1`、feiyin-ime-ui `4075e0f8aa99b1cb`（00:08 tester-1 构建，未重编）、crash-reporter `98a62541b643a4c5`、feiyin-asr-gateway `01c943b1b0e246e9`（3.8MB）。九项全 PASS：版本 0.9.7（Rust 三件显示 0.9.7.0）；告警 feiyin-ime 89 / crash 6（上次 0.9.6 为 90 / 6）；探针 main `[ASR-SERVER-491]` 3、`feiyin-asr-gateway` 1，ui `asr-service.json` 1，网关 `run-task` / `task-started` 各 1；网关 dumpbin 只依赖系统库 + VCRUNTIME140，无模型库；网关无参运行报 missing --core、退出码 2、不驻留；主程序 -debug 冒烟 Responding、无 panic、无 crash.json，已清理；config.toml 三时点不变；toml 四件三副本、VC++ 五件三处全等；iss 两份逐字相同。本机无 Inno Setup，未编安装包。结果 `collab/outbox/tester-1/result.md`。待 Gavin：重启输入法；S6/S7/S8 界面目视；两台电脑端测；Python 客户端对真服务冒烟。 |
 
+### ✅ MIC-ON-DEMAND · 麦克风只在按热键时打开（Gavin 10-30）
+
+> Gavin 原话：「另外修改一下，麦克风设备打开使用应该是在按下热键的时候，现在是输入法程序运行就一直占用麦克风设备」
+
+- 现状：`src/main.rs:8462` 工作线程启动即 `audio_capture.prewarm(None)`；`src/audio/mod.rs` `ensure_stream` 建好的输入流常驻（`warm_stream`），回调持续写 1 秒环形预录（`PRE_ROLL_CAPACITY_MS`）；按热键时把按键前 0.6~1 秒（`PRE_ROLL_MS` / `PRE_ROLL_LOCAL_RT_MS`）一并送识别 —— 这是 FIX-LOCALRT-FIRSTCHAR-293 修首字丢失（「输入你」→「输入按」）的手段。
+- **Gavin 选定**：「按下才开，录完立即关」（三选一；另两项为「用完留 1 分钟再关」「设置里给开关」）。代价：每一句都没有按键前预录，边按边说可能削首字。
+- **Gavin 追加**：「你要研究下，现在打开麦克风设备后到开始准备录音前的处理有无可以再优化更快的地方」。
+- 已改（编译通过，测试中）：① 启动不预开（main.rs 工作线程）② `record` / `record_streaming` 包一层，结束（含出错）即 `release_stream` 关麦克风 ③ 现开的流 `fresh` ⇒ 不取 pre-roll（回调同一块音频进 pre_roll 和 rx 两处，现开流再取会把开头重复送一遍）④ 分段计时 `[Latency] mic open:`（找设备 / 查格式 / 建流 / 启动）+ `[Latency] mic first audio` ⑤ 手工探针 `mic_cold_open_latency_probe`（#[ignore]）。
+- 旧日志实测（常开时）：热键→浮层 0.2ms、→工作线程 ~4ms、取流 1.3ms、**清空闲积压 11ms**（现开后这段自然消失）。
+- ✅ 实测后：① 缓存按名字找到的设备 + 启动只预热（不开流）⇒ 稳态 59.7→51.6ms、首按 68.7→62.0ms ② 不加「麦克风打开中」提示（50~60ms 远短于开口反应时间）。全量 2100 / 0 / 51。DEC-115。未出包。
+
 ### 🔄 FLASH-P0 · flashasr 剥离第一期（在 voice-ime 内补齐服务端；Gavin 10-29「开工」，DEC-114）
 
 > 方案 `D:\Workspace\CodeLab\FlashASR\docs\SPLIT-PLAN.md` §8 P0。只动**远程会话 / 识别服务**一条管线，本机识别逐位不变。出包 / push 等 Gavin 指令。
@@ -116,6 +127,7 @@
 | FLASH-P0-512 | 测试（派低成本子 agent）+ 五文档 + 跨端交接 + 提交 |✅ |
 | FLASH-P0-513 | 翻译引擎跟终端输出优化开关（Gavin 10-29「如果开了输出优化，那翻译不是应该是用输出优化的l l m来做吗？」）：开 ⇒ 大模型一次「优化 + 翻译」、原文不再单独过大模型；关 ⇒ 离线翻译。每段最多一次大模型调用 | ✅ |
 
+> ✅ **flashasr 进度（10-30）**：P1 建仓、P2a 服务能力、P2b 管理界面 + 安装脚本已完成（详见 FlashASR `collab/todo.md`）；连接码前缀改为 `flash-asr://`，P3 输入法按新前缀解析。下一步 P3 输入法变薄。
 > ✅ **FLASH-P1 建仓搬家已完成（10-29）**：识别服务代码已复制到 `D:\Workspace\CodeLab\FlashASR`（待办在其 `collab/todo.md`）。
 > 🔴 **过渡期（P1~P3）识别代码在本仓库与 flashasr 各有一份 —— 改识别 / 服务端代码必须两边同步**；P3 输入法删除识别代码后只剩 flashasr。
 

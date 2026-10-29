@@ -179,3 +179,4 @@
 - 测试 2099 / 42 / 121 全过。未出包、未 push。
 - FLASH-P0-513：`text_stage::translate` 多参 `via_llm`（= 终端 optimize）；会话 `optimize: params.optimize && !params.translate`。2100 / 42 过。
 - FLASH-P1：flashasr 建仓搬家完成（`FlashASR` 仓库 `6772c80`）。本仓库代码未改。过渡期识别代码两边各一份，改动须同步。
+- MIC-ON-DEMAND（DEC-115）：`src/audio/mod.rs` `record` / `record_streaming` 外包 `release_stream`；`WarmInputStream.fresh` + `take_pre_roll`；`resolve_device` 缓存 `named_device`；`warm_up`（不开流）；分段计时 `[Latency] mic open:` / `mic first audio`；探针 `mic_cold_open_latency_probe`（#[ignore]，环境变量 VOICE_IME_MIC / VOICE_IME_MIC_ROUNDS / VOICE_IME_MIC_WARMUP）。main.rs 工作线程启动改调 `warm_up`。2100 / 0 / 51。未出包、未 push。

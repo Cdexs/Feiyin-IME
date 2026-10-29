@@ -2908,3 +2908,9 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 2. **词库**（`src/transcription/mod.rs` `load_wordbook_word_array`、`qwen_inference.rs`，平台中立）：连识别服务时发完整词库数组；服务端不再读机主词库。行为变更：macOS 作服务端时同样只用终端词表。
 3. **声纹按终端**（`speaker.rs` / `llama_asr.rs` / `asr_shared/mod.rs` / `src-tauri/src/asr_server.rs`，平台中立）：远程会话按终端声纹剔除；终端声纹存 `<数据目录>/voiceprints/<编号>.bin`；吊销删档。`create_slot` 签名多一参（终端编号）。macOS 侧无平台代码改动；macOS 接手须 `cargo check`。
 4. **FLASH-P0-513**（`src/asr_service/*`，平台中立）：服务端翻译引擎跟终端 `output_optimization_enabled`，同本机规则；无平台影响。
+
+## 10-30 · MIC-ON-DEMAND（DEC-115，主控）· 麦克风按需打开
+
+- **改了什么**：`src/audio/mod.rs`（平台中立，macOS 编同一份）：启动不再开输入流；每次录音现开、录完即关；现开流不取 pre-roll；按名字的设备缓存；`warm_up` 启动预热（找设备 + 查格式，不开流）。`src/main.rs` 工作线程启动把 `prewarm(None)` 换成 `warm_up(设置里的设备)`。
+- **行为前后**：之前程序运行即占麦克风（macOS 菜单栏橙色指示常亮）、按键前 0.6~1s 预录进识别；之后只在录音时占用、无按键前预录。
+- **对 macOS 的影响**：无需改平台代码；`run_controller_macos` 若有单独的预开流调用需同样去掉（Windows 侧排查只在 main.rs 工作线程一处）。macOS CoreAudio 冷开耗时未实测，接手时请跑 `VOICE_IME_MIC= RUST_LOG=info cargo test --bin feiyin-ime mic_cold_open_latency_probe -- --ignored --nocapture` 记一组数。
