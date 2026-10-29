@@ -8458,9 +8458,13 @@ fn spawn_worker_thread(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let model_dir = transcription::model_dir();
+        // MIC-ON-DEMAND（Gavin 10-30）：启动时不再预开麦克风；每次按热键现开、录完即关（见 audio::AudioCapture::record*）。
+        // 只预热音频子系统（找设备 + 查格式，不开流）：首次按热键少等 ~50ms 的系统组件初始化。
         let mut audio_capture = audio::AudioCapture::new();
-        if let Err(err) = audio_capture.prewarm(None) {
-            log::warn!("Startup prewarm failed: {}", err);
+        {
+            let cfg = clone_runtime_config(&runtime_config);
+            let device = cfg.audio.input_device.trim().to_string();
+            audio_capture.warm_up((!device.is_empty()).then_some(device.as_str()));
         }
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()

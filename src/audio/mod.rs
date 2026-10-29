@@ -674,6 +674,9 @@ pub struct AudioCapture {
     #[allow(dead_code)]
     pub sample_rate: u32,
     warm_stream: Option<WarmInputStream>,
+    /// MIC-ON-DEMAND：按名字找到的设备（名字, 设备）。按名字找要枚举全部输入设备（实测 ~7.5ms，冷 15ms），
+    /// 现开现关后每次按热键都要走 ⇒ 缓存复用。系统默认设备不缓存（用户可能随时换默认设备，取默认只要 ~1.3ms）。
+    named_device: Option<(String, cpal::Device)>,
 }
 
 struct WarmInputStream {
@@ -687,6 +690,9 @@ struct WarmInputStream {
     stream_failed: Arc<AtomicBool>,
     /// ASR-074 Step 1: 队列满时静默丢帧计数（永久埋点）
     dropped_chunks: Arc<AtomicU64>,
+    /// MIC-ON-DEMAND：本次录音现开的流（按热键之后才建）。这种流里没有「按键前」的声音：
+    /// 回调同一块音频既进 `pre_roll` 又进 `rx`，若再取 pre-roll 会把开头重复送一遍 ⇒ 只用 `rx`。
+    fresh: bool,
     _stream: Stream,
 }
 
@@ -695,11 +701,60 @@ impl AudioCapture {
         Self {
             sample_rate: 16000,
             warm_stream: None,
+            named_device: None,
+        }
+    }
+
+    /// 找输入设备 ⇒ `(设备, 实际名称, 是否来自缓存)`。指定名字的走缓存（见 `named_device`）。
+    fn resolve_device(&mut self, requested: Option<&str>) -> Result<(cpal::Device, String, bool)> {
+        let host = cpal::default_host();
+        let Some(name) = requested else {
+            let device = host
+                .default_input_device()
+                .context("No default input device found")?;
+            let actual = device.name()?;
+            return Ok((device, actual, false));
+        };
+        if let Some((cached_name, device)) = self.named_device.as_ref() {
+            if cached_name == name {
+                return Ok((device.clone(), cached_name.clone(), true));
+            }
+        }
+        let device = host
+            .input_devices()
+            .context("Failed to enumerate input devices")?
+            .find(|d| d.name().ok().as_deref() == Some(name))
+            .with_context(|| format!("Device '{}' not found", name))?;
+        self.named_device = Some((name.to_string(), device.clone()));
+        Ok((device, name.to_string(), false))
+    }
+
+    /// MIC-ON-DEMAND：启动时预热音频子系统但**不打开麦克风**：找设备（填缓存）+ 查一次格式。
+    /// 实测第一次开流比之后慢 ~50ms（系统音频组件首次初始化），这一步把它挪到启动时付掉。
+    pub fn warm_up(&mut self, device_name: Option<&str>) {
+        let t0 = Instant::now();
+        let requested = normalize_device_name(device_name);
+        let r = self
+            .resolve_device(requested.as_deref())
+            .and_then(|(d, n, _)| {
+                d.default_input_config()
+                    .map(|_| n)
+                    .context("No supported input config")
+            });
+        match r {
+            Ok(n) => log::info!(
+                "[Latency] audio warm-up (no stream opened) in {:.1}ms (device='{}')",
+                t0.elapsed().as_secs_f64() * 1000.0,
+                n
+            ),
+            Err(e) => log::warn!("Audio warm-up failed: {e:#}"),
         }
     }
 
     /// Start and keep the input stream hot so first speech is not lost while
     /// CPAL/WASAPI creates the stream on the hotkey path.
+    /// MIC-ON-DEMAND：主程序已不再启动时预开（空闲不占麦克风）；只剩硬件探针测试使用。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn prewarm(&mut self, device_name: Option<&str>) -> Result<()> {
         self.ensure_stream(device_name).map(|_| ())
     }
@@ -741,10 +796,40 @@ impl AudioCapture {
         }
     }
 
+    /// MIC-ON-DEMAND（Gavin 10-30「麦克风设备打开使用应该是在按下热键的时候」）：录音结束（含出错）即关麦克风。
+    /// 下次按热键 `ensure_stream` 现开 —— 空闲时不占用麦克风设备。
+    fn release_stream(&mut self) {
+        if let Some(w) = self.warm_stream.take() {
+            log::info!("Input stream closed (device='{}')", w.actual_device_name);
+        }
+    }
+
     /// Record audio until VAD detects sustained silence or stop_signal is set.
     /// Returns raw PCM samples (f32, mono, 16kHz).
     /// If device_name is empty, uses system default device.
+    /// 麦克风按热键现开、录完即关（MIC-ON-DEMAND）。
     pub fn record(
+        &mut self,
+        stop_signal: Arc<AtomicBool>,
+        silence_threshold: f32,
+        silence_duration_ms: u64,
+        max_seconds: u64,
+        level_buf: Option<AudioLevelBuf>,
+        device_name: Option<&str>,
+    ) -> Result<Vec<f32>> {
+        let r = self.record_inner(
+            stop_signal,
+            silence_threshold,
+            silence_duration_ms,
+            max_seconds,
+            level_buf,
+            device_name,
+        );
+        self.release_stream();
+        r
+    }
+
+    fn record_inner(
         &mut self,
         stop_signal: Arc<AtomicBool>,
         silence_threshold: f32,
@@ -759,7 +844,7 @@ impl AudioCapture {
             "[Latency] ensure_stream completed at +{:.1}ms",
             t_record.elapsed().as_secs_f64() * 1000.0
         );
-        let pre_roll_chunks = warm.drain_pre_roll(PRE_ROLL_MS);
+        let pre_roll_chunks = warm.take_pre_roll(PRE_ROLL_MS);
         log::info!(
             "[Latency] drain_pre_roll completed at +{:.1}ms",
             t_record.elapsed().as_secs_f64() * 1000.0
@@ -833,6 +918,8 @@ impl AudioCapture {
     /// 只决定「何时建连」，不影响「何时开始采集」。采集从热键按下瞬间就开始。
     ///
     /// **不改 record() 行为**：平行方法，record() 零改动。
+    /// MIC-ON-DEMAND：麦克风按热键现开、录完即关（同 `record`）。
+    #[allow(clippy::too_many_arguments)]
     pub fn record_streaming(
         &mut self,
         stop_signal: Arc<AtomicBool>,
@@ -846,6 +933,32 @@ impl AudioCapture {
         // B 先按键 / C 上句尾音），同时把取用长度切到 `PRE_ROLL_LOCAL_RT_MS`(1000ms)。
         // 在线流式三档传 false ⇒ 取 `PRE_ROLL_MS`(600ms) 且不进裁剪函数，行为完全不变。
         trim_pre_roll_residual: bool,
+        on_chunk: impl FnMut(&[f32]),
+    ) -> Result<()> {
+        let r = self.record_streaming_inner(
+            stop_signal,
+            silence_threshold,
+            silence_duration_ms,
+            max_seconds,
+            level_buf,
+            device_name,
+            trim_pre_roll_residual,
+            on_chunk,
+        );
+        self.release_stream();
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_streaming_inner(
+        &mut self,
+        stop_signal: Arc<AtomicBool>,
+        silence_threshold: f32,
+        silence_duration_ms: u64,
+        max_seconds: u64,
+        level_buf: Option<AudioLevelBuf>,
+        device_name: Option<&str>,
+        trim_pre_roll_residual: bool,
         mut on_chunk: impl FnMut(&[f32]),
     ) -> Result<()> {
         let t_record = std::time::Instant::now();
@@ -857,8 +970,8 @@ impl AudioCapture {
 
         // pre-roll：从 VecDeque drain 出热键前的音频，作为首批 chunk 推给回调
         // 这是「建连后补发」的 pre-roll 来源 —— 热键前的音频不丢
-        let pre_roll_chunks =
-            warm.drain_pre_roll(pre_roll_ms_for_streaming(trim_pre_roll_residual));
+        // MIC-ON-DEMAND：现开的流没有热键前的音频 ⇒ 空（见 `take_pre_roll`）。
+        let pre_roll_chunks = warm.take_pre_roll(pre_roll_ms_for_streaming(trim_pre_roll_residual));
         log::info!(
             "[Latency] record_streaming drain_pre_roll: {} chunks at +{:.1}ms",
             pre_roll_chunks.len(),
@@ -913,6 +1026,14 @@ impl AudioCapture {
             post_hotkey_chunks.len(),
             t_record.elapsed().as_secs_f64() * 1000.0
         );
+        // MIC-ON-DEMAND：麦克风第一块声音到达时刻（= 按热键到真正能录到声音的时间）。
+        let mut first_audio_logged = !post_hotkey_chunks.is_empty();
+        if first_audio_logged {
+            log::info!(
+                "[Latency] mic first audio already queued at +{:.1}ms",
+                t_record.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         warm.stream_failed.store(false, Ordering::Release);
 
         log::info!(
@@ -1060,6 +1181,13 @@ impl AudioCapture {
 
             match warm.rx.recv_timeout(recv_timeout) {
                 Ok((_ts, chunk)) if !chunk.is_empty() => {
+                    if !first_audio_logged {
+                        first_audio_logged = true;
+                        log::info!(
+                            "[Latency] mic first audio at +{:.1}ms",
+                            t_record.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
                     // DIAG-LOCALRT-FIRSTCHAR-292：只读旁路，喂 ASR 前顺手抄一份原始 chunk
                     if let Some(dump) = preroll_dump.as_mut() {
                         dump.push(&chunk);
@@ -1142,18 +1270,10 @@ impl AudioCapture {
 
     fn ensure_stream(&mut self, device_name: Option<&str>) -> Result<&mut WarmInputStream> {
         let requested_device_name = normalize_device_name(device_name);
-        let host = cpal::default_host();
-
-        let device = if let Some(name) = requested_device_name.as_deref() {
-            host.input_devices()
-                .context("Failed to enumerate input devices")?
-                .find(|d| d.name().ok().as_deref() == Some(name))
-                .with_context(|| format!("Device '{}' not found", name))?
-        } else {
-            host.default_input_device()
-                .context("No default input device found")?
-        };
-        let actual_device_name = device.name()?;
+        // MIC-ON-DEMAND：分段计时（找设备 / 查格式 / 建流 / 启动），找出按热键到能录音之间慢在哪。
+        let t_open = Instant::now();
+        let (device, actual_device_name, from_cache) =
+            self.resolve_device(requested_device_name.as_deref())?;
 
         if self
             .warm_stream
@@ -1167,10 +1287,23 @@ impl AudioCapture {
         }
 
         log::info!("Prewarming input device: {}", actual_device_name);
+        let resolve_ms = t_open.elapsed().as_secs_f64() * 1000.0;
 
-        let supported_config = device
-            .default_input_config()
-            .context("No supported input config")?;
+        // 缓存的设备查格式失败（拔掉 / 换了设备）⇒ 丢缓存、重新按名字找一次。
+        let (device, actual_device_name, supported_config) = match device.default_input_config() {
+            Ok(c) => (device, actual_device_name, c),
+            Err(e) if from_cache => {
+                log::info!("Cached input device unusable ({e}); re-resolving by name");
+                self.named_device = None;
+                let (d, n, _) = self.resolve_device(requested_device_name.as_deref())?;
+                let c = d
+                    .default_input_config()
+                    .context("No supported input config")?;
+                (d, n, c)
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context("No supported input config")),
+        };
+        let config_ms = t_open.elapsed().as_secs_f64() * 1000.0;
         let sample_format = supported_config.sample_format();
         let config: cpal::StreamConfig = supported_config.into();
         let sample_rate = config.sample_rate.0;
@@ -1302,12 +1435,22 @@ impl AudioCapture {
             }
         };
 
+        let build_ms = t_open.elapsed().as_secs_f64() * 1000.0;
         stream.play()?;
         log::info!(
             "Input stream prewarmed ({}Hz, {} ch, {:?})",
             sample_rate,
             channels,
             sample_format
+        );
+        log::info!(
+            "[Latency] mic open: resolve_device={:.1}ms default_config={:.1}ms build_stream={:.1}ms play={:.1}ms (per step; device='{}', by_name={})",
+            resolve_ms,
+            config_ms - resolve_ms,
+            build_ms - config_ms,
+            t_open.elapsed().as_secs_f64() * 1000.0 - build_ms,
+            actual_device_name,
+            requested_device_name.is_some()
         );
 
         self.warm_stream = Some(WarmInputStream {
@@ -1320,6 +1463,7 @@ impl AudioCapture {
             rx,
             stream_failed,
             dropped_chunks,
+            fresh: true,
             _stream: stream,
         });
 
@@ -1343,6 +1487,17 @@ impl WarmInputStream {
             requested_device_name,
             actual_device_name,
         )
+    }
+
+    /// MIC-ON-DEMAND：取 pre-roll。现开的流（`fresh`）⇒ 清空并返回空：里面的音频全是按键之后的、
+    /// 同时也在 `rx` 里（时间戳 ≥ 按键时刻，会被当作 post-hotkey 保留），再取一遍就把开头重复送了。
+    fn take_pre_roll(&mut self, pre_roll_ms: u64) -> Vec<Vec<f32>> {
+        if std::mem::take(&mut self.fresh) {
+            self.pre_roll.lock().unwrap().clear();
+            log::info!("Audio pre-roll skipped: stream opened on hotkey (no pre-hotkey audio)");
+            return Vec::new();
+        }
+        self.drain_pre_roll(pre_roll_ms)
     }
 
     fn drain_pre_roll(&self, pre_roll_ms: u64) -> Vec<Vec<f32>> {
@@ -2141,6 +2296,50 @@ pub fn is_mic_muted() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =================== MIC-ON-DEMAND 冷开麦克风耗时探针（#[ignore]，不进常规回归）===================
+    // 量「按热键 → 麦克风第一块声音到达」：现开现关后这段是首字能不能录到的关键。
+    // 设备名取环境变量 `VOICE_IME_MIC`（空 = 系统默认设备），连开连关 N 次（`VOICE_IME_MIC_ROUNDS`，缺省 6）。
+    // 分段耗时看 `RUST_LOG=info` 下的 `[Latency] mic open:` 行；本测试打印「建好流」与「第一块声音」两个时刻。
+    #[test]
+    #[ignore = "MIC-ON-DEMAND 手工硬件探针（会打开麦克风）：不进常规回归"]
+    fn mic_cold_open_latency_probe() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let name = std::env::var("VOICE_IME_MIC").unwrap_or_default();
+        let device = (!name.trim().is_empty()).then_some(name.as_str());
+        let rounds: usize = std::env::var("VOICE_IME_MIC_ROUNDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6);
+        let mut cap = AudioCapture::new();
+        // `VOICE_IME_MIC_WARMUP=1` ⇒ 先走启动预热（同主程序），看第 0 轮是否不再偏慢。
+        if std::env::var("VOICE_IME_MIC_WARMUP").is_ok_and(|v| v == "1") {
+            cap.warm_up(device);
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        for i in 0..rounds {
+            let t0 = Instant::now();
+            let rx = {
+                let w = cap.ensure_stream(device).expect("open failed");
+                w.rx.clone()
+            };
+            let opened = t0.elapsed().as_secs_f64() * 1000.0;
+            let first = loop {
+                match rx.recv_timeout(Duration::from_secs(3)) {
+                    Ok((_, c)) if !c.is_empty() => break Some(t0.elapsed().as_secs_f64() * 1000.0),
+                    Ok(_) => continue,
+                    Err(_) => break None,
+                }
+            };
+            cap.release_stream();
+            let release = t0.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "[MIC-OPEN] round {i}: stream_ready={opened:.1}ms first_audio={} closed_at={release:.1}ms",
+                first.map_or("timeout".to_string(), |f| format!("{f:.1}ms"))
+            );
+            std::thread::sleep(Duration::from_millis(400));
+        }
+    }
 
     // =================== PREROLL-DEAD-322 手工硬件探针（#[ignore]，不进常规回归）===================
     //
