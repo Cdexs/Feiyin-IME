@@ -228,19 +228,26 @@ fn punctuate(model_dir: &Path, text: &str) -> String {
     crate::punctuate_via_service(model_dir, true, text)
 }
 
-/// 终稿译文（方向按内容自动判定，DEC-082）。引擎跟随本机设置：大模型启用且连通已验证 ⇒ 大模型
-/// （失败退离线）；否则离线 NLLB。都失败 ⇒ `None`（不给译文，原文照常）。
+/// 终稿译文（方向按内容自动判定，DEC-082）。都失败 ⇒ `None`（不给译文，原文照常）。
+///
+/// FLASH-P0-513（Gavin 10-29「如果开了输出优化，那翻译不是应该是用输出优化的l l m来做吗？」）：
+/// 引擎由**该终端的输出优化开关**决定，与本机输入法同一规则（本机「启用输出优化」即 `llm.enabled`）——
+/// `via_llm`（终端开了输出优化）⇒ 服务端统一大模型**一次**做「优化 + 翻译」（失败 / 服务端未配 ⇒ 退离线）；
+/// 否则 ⇒ 离线 NLLB。开翻译时原文不再单独过大模型（调用方关掉原文的输出优化），每段最多一次大模型调用。
 pub(crate) fn translate(
     text: &str,
     config: &AppConfig,
     o: &TextOpts,
+    via_llm: bool,
 ) -> Option<TranslationPayload> {
     if text.trim().is_empty() {
         return None;
     }
     let target = translation::derive_translation_target(text);
     let mut out = None;
-    if crate::should_try_llm_translate(config.llm.enabled, config.llm.connectivity_verified) {
+    if via_llm
+        && crate::should_try_llm_translate(config.llm.enabled, config.llm.connectivity_verified)
+    {
         out = llm_translate(text, target, config, o);
     }
     if out.is_none() {
@@ -684,8 +691,10 @@ mod tests {
     fn translate_empty_text_is_none() {
         let cfg = AppConfig::default();
         let o = opts(true, true);
-        assert!(translate("", &cfg, &o).is_none());
-        assert!(translate("   \n", &cfg, &o).is_none());
+        for via_llm in [true, false] {
+            assert!(translate("", &cfg, &o, via_llm).is_none());
+            assert!(translate("   \n", &cfg, &o, via_llm).is_none());
+        }
     }
 
     // ─── TEST-SYNC-491 / S10 护栏 1-3 ──────────────────────────────────────

@@ -136,7 +136,7 @@ Authorization: Bearer <key>
 | `parameters.sample_rate` | | `16000` | 一期**只收** 16000，其它 ⇒ `UnsupportedFormat` |
 | `parameters.inverse_text_normalization_enabled` | | `true` | 数字规整（「三点五公斤」⇒「3.5公斤」） |
 | `parameters.punctuation_prediction_enabled` | | `true` | 补标点；`false` ⇒ 预览、终稿、译文**全部去标点** |
-| `parameters.translation_enabled` | | `false` | 终稿另给一份译文（§5.3）。方向按内容自动：含汉字 ⇒ 译成英文，否则译成中文；`translation_target_languages` 忽略 |
+| `parameters.translation_enabled` | | `false` | 终稿另给一份译文（§5.3）。方向按内容自动：含汉字 ⇒ 译成英文，否则译成中文；`translation_target_languages` 忽略。**翻译引擎跟输出优化开关**：开了输出优化 ⇒ 大模型一次完成「优化 + 翻译」（此时原文不再单独优化）；没开 ⇒ 服务端离线翻译模型 |
 | `parameters.vocabulary` | | 无 | 热词：字符串数组（推荐，按数组顺序取优先级），或百炼的 `{"词": 权重}` 对象（权重忽略）。**词库每个终端单独**：服务端只用这里给的词，不掺服务端本机词库 |
 | `parameters.feiyin.output_optimization_enabled` | | `false` | 输出优化（大模型整理文字）。大模型用服务端统一配置；服务端没配 ⇒ 跳过此步、照常出结果 |
 | `parameters.feiyin.strip_trailing_punct` | | `false` | 去掉句末标点（句中标点保留） |

@@ -2907,3 +2907,4 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 1. **服务端文字处理 / 协议**（`src/asr_service/*`、网关 `ws.rs`，平台中立）：终稿与本机同序；`run-task` 新增 `parameters.feiyin.output_optimization_enabled / strip_trailing_punct / chinese_script`（见 `docs/ASR-PROTOCOL.md`）。macOS 若跑识别服务，同一份代码，无需另改。
 2. **词库**（`src/transcription/mod.rs` `load_wordbook_word_array`、`qwen_inference.rs`，平台中立）：连识别服务时发完整词库数组；服务端不再读机主词库。行为变更：macOS 作服务端时同样只用终端词表。
 3. **声纹按终端**（`speaker.rs` / `llama_asr.rs` / `asr_shared/mod.rs` / `src-tauri/src/asr_server.rs`，平台中立）：远程会话按终端声纹剔除；终端声纹存 `<数据目录>/voiceprints/<编号>.bin`；吊销删档。`create_slot` 签名多一参（终端编号）。macOS 侧无平台代码改动；macOS 接手须 `cargo check`。
+4. **FLASH-P0-513**（`src/asr_service/*`，平台中立）：服务端翻译引擎跟终端 `output_optimization_enabled`，同本机规则；无平台影响。

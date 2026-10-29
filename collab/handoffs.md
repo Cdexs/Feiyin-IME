@@ -177,3 +177,4 @@
 - 会话词表只用终端 `vocabulary`；客户端 `load_wordbook_word_array` 发完整词库数组。
 - 声纹按归属 `speaker::VpOwner`（Local / Terminal），`AccEngine::create_slot(terminal_id)`；`finish_terminal_voiceprint` 会话收尾；`asr_shared::purge_terminal_voiceprint` 两处吊销调用。
 - 测试 2099 / 42 / 121 全过。未出包、未 push。
+- FLASH-P0-513：`text_stage::translate` 多参 `via_llm`（= 终端 optimize）；会话 `optimize: params.optimize && !params.translate`。2100 / 42 过。

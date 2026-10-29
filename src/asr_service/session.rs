@@ -101,7 +101,8 @@ pub(crate) fn run_remote_session(
         script,
         model_dir: model_dir.clone(),
         strip_trailing: params.strip_trailing,
-        optimize: params.optimize,
+        // FLASH-P0-513：开翻译时大模型一次做「优化 + 翻译」（见 `text_stage::translate`），原文不再单独过大模型。
+        optimize: params.optimize && !params.translate,
     };
     // 预览线程「设备」标识：只用于近场门的音量沿用判据，远程已关门；带上设备代码便于日志区分。
     let vad_device = format!("remote:{}", params.device_id);
@@ -294,7 +295,7 @@ pub(crate) fn run_remote_session(
     // S10：内置节点 + 终端三项参数；要了翻译 ⇒ 另出一份译文（失败不给）。
     let (text, times) = text_stage::apply_final(&text, &times, &opts, config);
     let translation = if params.translate {
-        text_stage::translate(&text, config, &opts)
+        text_stage::translate(&text, config, &opts, params.optimize)
     } else {
         None
     };
@@ -568,6 +569,34 @@ mod tests {
         assert_eq!(
             got,
             transcription::build_hotwords_string(&["飞音".to_string(), "LiveKit".to_string()])
+        );
+    }
+
+    /// FLASH-P0-513（源码）：每段最多一次大模型调用 —— 开翻译时原文不过大模型（`optimize` 让给译文）；
+    /// 译文引擎跟终端输出优化开关（开 ⇒ 大模型一次「优化 + 翻译」，关 ⇒ 离线）。
+    #[test]
+    fn translation_uses_optimize_switch_single_llm_call() {
+        let src = include_str!("session.rs");
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(src).join(
+            "
+",
+        );
+        let compact: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("optimize:params.optimize&&!params.translate,"));
+        assert!(compact.contains("text_stage::translate(&text,config,&opts,params.optimize)"));
+        let ts = include_str!("text_stage.rs");
+        let body = ts
+            .split("pub(crate) fn translate(")
+            .nth(1)
+            .expect("translate 锚点");
+        let body: String = body
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .take(600)
+            .collect();
+        assert!(
+            body.contains("ifvia_llm&&crate::should_try_llm_translate("),
+            "{body}"
         );
     }
 }
