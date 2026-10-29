@@ -8804,7 +8804,6 @@ fn spawn_worker_thread(
                         let asr_handle: std::thread::JoinHandle<
                             Result<crate::transcription::qwen_inference::OnlineFinal>,
                         > = std::thread::spawn(move || {
-                            let vocabulary = crate::transcription::load_wordbook_vocabulary();
                             let on_result = |display_text: &str,
                                              words: &[crate::transcription::qwen_inference::WordTiming]| {
                                 // OVERLAY-075: stamp every packet with this session's
@@ -8818,6 +8817,8 @@ fn spawn_worker_thread(
                             };
                             // ASR-SERVER-491 S8：连自家识别服务 —— 配对信息每次录音现读（设置里重新配对立即生效）。
                             if desired_asr_model_check == transcription::AsrModel::FeiyinServer {
+                                // FLASH-P0-509：词库每个前端单独 ⇒ 带完整词库数组（对方不再掺它自己的词库）。
+                                let vocabulary = crate::transcription::load_wordbook_word_array();
                                 return crate::transcription::qwen_inference::transcribe_streaming_feiyin(
                                     &crate::asr_shared::remote::RemotePairing::load(),
                                     chunk_rx,
@@ -8827,6 +8828,7 @@ fn spawn_worker_thread(
                                     on_result,
                                 );
                             }
+                            let vocabulary = crate::transcription::load_wordbook_vocabulary();
                             crate::transcription::qwen_inference::transcribe_streaming_realtime(
                                 &asr_online_url,
                                 &qwen_api_key,

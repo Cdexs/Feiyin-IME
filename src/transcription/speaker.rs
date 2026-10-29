@@ -494,8 +494,64 @@ struct ProcessVp {
     saved_total_secs: f32,
 }
 
-/// 进程级声纹（跨窗 / 跨录音复用）。
-static VOICEPRINT: Mutex<Option<ProcessVp>> = Mutex::new(None);
+/// FLASH-P0-511：声纹归属 —— 本机主人一份（`voiceprint.bin`，与改前逐位相同），每个远程终端各一份
+///（`voiceprints/<终端编号>.bin`）。互不混用：终端的声纹只按该终端使用人自己的说话累积。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum VpOwner {
+    Local,
+    Terminal(String),
+}
+
+impl VpOwner {
+    /// 远程终端的归属；终端编号不合规（不该出现）⇒ `None`（该会话不做声纹）。
+    pub(crate) fn terminal(terminal_id: &str) -> Option<Self> {
+        crate::asr_shared::terminal_voiceprint_path(terminal_id)
+            .map(|_| Self::Terminal(terminal_id.trim().to_string()))
+    }
+
+    fn path(&self) -> PathBuf {
+        match self {
+            Self::Local => voiceprint_path(),
+            // `terminal()` 已校验编号 ⇒ 必有路径；兜底落到不存在的文件（读空、不写坏本机档）。
+            Self::Terminal(id) => crate::asr_shared::terminal_voiceprint_path(id)
+                .unwrap_or_else(|| PathBuf::from("voiceprints").join("invalid.bin")),
+        }
+    }
+}
+
+/// 进程级声纹（跨窗 / 跨录音复用），按归属各一份。
+static VOICEPRINT: Mutex<Option<std::collections::HashMap<VpOwner, ProcessVp>>> = Mutex::new(None);
+
+/// 取某归属的进程级声纹（首次用到才读档）。
+fn with_process_vp<R>(owner: &VpOwner, f: impl FnOnce(&mut ProcessVp) -> R) -> R {
+    let mut guard = VOICEPRINT.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    let proc = map.entry(owner.clone()).or_insert_with(|| ProcessVp {
+        vp: Voiceprint::load(&owner.path()),
+        saved_total_secs: 0.0,
+    });
+    f(proc)
+}
+
+/// FLASH-P0-511：远程会话结束。正常说完 ⇒ 把就绪档的新增部分落盘（远程每段识别一个会话，等不到 5s 节流）；
+/// 被取消（含终端被吊销后踢下线）⇒ **不落盘并丢掉内存里这份**，免得把刚删掉的声纹写回来。本机主人不走这里。
+pub(crate) fn finish_terminal_voiceprint(owner: &VpOwner, completed: bool) {
+    if *owner == VpOwner::Local {
+        return;
+    }
+    let mut guard = VOICEPRINT.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = guard.as_mut() else { return };
+    if !completed {
+        map.remove(owner);
+        return;
+    }
+    if let Some(proc) = map.get_mut(owner) {
+        if proc.vp.has_any_ready() && proc.vp.total_ready_secs() > proc.saved_total_secs {
+            proc.vp.save(&owner.path());
+            proc.saved_total_secs = proc.vp.total_ready_secs();
+        }
+    }
+}
 
 /// 提取器**进程级**懒加载：外层 = 是否已尝试，内层 = 是否可用（失败记住不重试）。
 /// LOCALRT-WARM-CACHE-450：原为精解线程级缓存，而精解线程每次录音新建 ⇒ 每次录音首窗重载 CAM++
@@ -741,6 +797,7 @@ pub(crate) fn keep_all_ranges(ranges: &[(usize, usize)]) -> VoiceprintFilter {
 /// 模型缺失 ⇒ 原样返回（功能静默关闭）。注册/漂移延后到解码后（需 L）⇒ 只收集本窗新片的
 /// **保留**区间 `pending_offers`。
 pub(crate) fn filter_ranges_by_voiceprint(
+    owner: &VpOwner,
     samples: &[f32],
     ranges: &[(usize, usize)],
     new_slice_from: usize,
@@ -757,25 +814,13 @@ pub(crate) fn filter_ranges_by_voiceprint(
             pending_offers: Vec::new(),
         };
     }
-    with_speaker_extractor(|verifier| {
+    // FLASH-P0-511：提取器锁 / 声纹锁只包**单次**计算（原先整窗持锁）。远程终端也做声纹后，本机录音
+    // 最多等一次单元计算（约 20ms），不会被远程整窗卡住（本机优先）。提取器无状态，逐次加锁输出逐位不变。
+    if !with_speaker_extractor(|v| v.is_some()) {
+        return keep_all_ranges(ranges);
+    }
+    {
         let mut details: Vec<RangeJudgement> = Vec::new();
-        let Some(verifier) = verifier else {
-            return VoiceprintFilter {
-                kept: ranges.to_vec(),
-                dropped: Vec::new(),
-                kept_secs: secs_of(ranges),
-                dropped_secs: 0.0,
-                any_ready: false,
-                enrolled_secs: 0.0,
-                details,
-                pending_offers: Vec::new(),
-            };
-        };
-        let mut guard = VOICEPRINT.lock().unwrap_or_else(|e| e.into_inner());
-        let proc = guard.get_or_insert_with(|| ProcessVp {
-            vp: Voiceprint::load(&voiceprint_path()),
-            saved_total_secs: 0.0,
-        });
         // 412：先按「连续说话单元」合并相邻短段（大量 <2s 段原本 KeepShort 漏判），再**按单元**判定。
         // 判定结果作用于单元**全部成员**（全留 / 全剔）；间隔 ≥ MERGE_GAP_SECS 不合并（可能换人）。
         let units = merge_speech_units(ranges);
@@ -793,8 +838,12 @@ pub(crate) fn filter_ranges_by_voiceprint(
                     buf.extend_from_slice(&samples[s..e]);
                 }
                 // 454：相邻窗重复出现的同一单元复用向量（判定仍按当前档案现算）。
-                let (emb, cached) = embed_cached(&buf, |b| verifier.embed(b));
-                let v = judge_voiceprint(&proc.vp, emb.as_deref(), unit_secs);
+                let (emb, cached) = embed_cached(&buf, |b| {
+                    with_speaker_extractor(|v| v.and_then(|v| v.embed(b)))
+                });
+                let v = with_process_vp(owner, |proc| {
+                    judge_voiceprint(&proc.vp, emb.as_deref(), unit_secs)
+                });
                 (v, emb, cached)
             };
             if log::log_enabled!(log::Level::Debug) {
@@ -858,49 +907,48 @@ pub(crate) fn filter_ranges_by_voiceprint(
                 dropped_ranges.push((s, e));
             }
         }
+        let (any_ready, enrolled_secs) = with_process_vp(owner, |proc| {
+            (proc.vp.has_any_ready(), proc.vp.total_ready_secs())
+        });
         VoiceprintFilter {
             kept,
             dropped: dropped_ranges,
             kept_secs,
             dropped_secs,
-            any_ready: proc.vp.has_any_ready(),
-            enrolled_secs: proc.vp.total_ready_secs(),
+            any_ready,
+            enrolled_secs,
             details,
             pending_offers,
         }
-    })
+    }
 }
 
 /// SPEAKER-VERIFY-408B ④：把本窗 offer 落地进 **L 档**（带窗口语种），并节流写盘。
 ///
 /// 延后到解码后调用（L 来自模型前缀或解码文本字符集）。
-pub(crate) fn commit_voiceprint_offers(offers: &[PendingOffer], lang: Option<&str>) {
+pub(crate) fn commit_voiceprint_offers(
+    owner: &VpOwner,
+    offers: &[PendingOffer],
+    lang: Option<&str>,
+) {
     if offers.is_empty() {
         return;
     }
-    let mut guard = VOICEPRINT.lock().unwrap_or_else(|e| e.into_inner());
-    let proc = guard.get_or_insert_with(|| ProcessVp {
-        vp: Voiceprint::load(&voiceprint_path()),
-        saved_total_secs: 0.0,
-    });
-    for o in offers {
-        proc.vp.offer(&o.emb, o.secs, o.score_if_ready, lang);
-    }
-    if proc.vp.has_any_ready() && proc.vp.total_ready_secs() - proc.saved_total_secs >= 5.0 {
-        proc.vp.save(&voiceprint_path());
-        proc.saved_total_secs = proc.vp.total_ready_secs();
-    }
+    with_process_vp(owner, |proc| {
+        for o in offers {
+            proc.vp.offer(&o.emb, o.secs, o.score_if_ready, lang);
+        }
+        if proc.vp.has_any_ready() && proc.vp.total_ready_secs() - proc.saved_total_secs >= 5.0 {
+            proc.vp.save(&owner.path());
+            proc.saved_total_secs = proc.vp.total_ready_secs();
+        }
+    })
 }
 
 /// SPEAKER-VERIFY-408B ③：进程级声纹**该语种档是否已就绪**。须在**本窗 offer 之前**查询
 ///（用于「L 档未就绪 ⇒ 原 ranges 重解」）。
-pub(crate) fn voiceprint_lang_ready(lang: &str) -> bool {
-    let mut guard = VOICEPRINT.lock().unwrap_or_else(|e| e.into_inner());
-    let proc = guard.get_or_insert_with(|| ProcessVp {
-        vp: Voiceprint::load(&voiceprint_path()),
-        saved_total_secs: 0.0,
-    });
-    proc.vp.lang_ready(lang)
+pub(crate) fn voiceprint_lang_ready(owner: &VpOwner, lang: &str) -> bool {
+    with_process_vp(owner, |proc| proc.vp.lang_ready(lang))
 }
 
 /// 纯逻辑：按逐区间判定划分 keep / drop（`<2s` 的 `KeepShort` 由调用方先算好）。
@@ -2176,7 +2224,7 @@ mod testsync412_merge_tests {
     fn ts412_missing_model_feature_off_unchanged() {
         let ranges = [(0usize, secs(1.0)), (secs(1.2), secs(3.4))];
         super::TEST_EXTRACTOR_MISSING.with(|c| c.set(true));
-        let f = filter_ranges_by_voiceprint(&[], &ranges, 0);
+        let f = filter_ranges_by_voiceprint(&super::VpOwner::Local, &[], &ranges, 0);
         super::TEST_EXTRACTOR_MISSING.with(|c| c.set(false));
         assert_eq!(f.kept, ranges.to_vec(), "模型缺失 ⇒ 原样保留全部区间");
         assert_eq!(f.dropped_secs, 0.0);
@@ -2393,15 +2441,20 @@ mod testsync412_guard_tests {
             judge_voiceprint(&vp, Some(&[1.0, 0.0]), MIN_JUDGE_SECS),
             SegVerdict::KeepNotReady
         );
-        // 源码护栏：filter 在提取器不可用时 `kept: ranges.to_vec()`（原样保留，功能整体关闭）。
+        // 源码护栏：filter 在提取器不可用时早退 `keep_all_ranges(ranges)`（原样保留，功能整体关闭）；
+        // FLASH-P0-511 起早退改为调 `keep_all_ranges`（其内 `kept: ranges.to_vec()`），语义不变。
         let src = include_str!("speaker.rs");
         let i = src
             .find("pub(crate) fn filter_ranges_by_voiceprint(")
             .expect("filter_ranges_by_voiceprint 锚点缺失");
         let body: String = src[i..].chars().take(1400).collect();
         assert!(
-            body.contains("kept: ranges.to_vec()"),
+            body.contains("return keep_all_ranges(ranges);"),
             "缺模型 / 提取器不可用 ⇒ 必须原样保留 ranges（功能关闭）"
+        );
+        assert!(
+            crate::transcription::speaker::keep_all_ranges(&[(0, 16000)]).kept == vec![(0, 16000)],
+            "keep_all_ranges 必须原样保留"
         );
     }
 
@@ -3027,7 +3080,11 @@ mod emb_cache_454_tests {
             .split(concat!("mod emb_cache", "_454_tests"))
             .next()
             .unwrap();
-        assert!(prod.contains("embed_cached(&buf, |b| verifier.embed(b))"));
+        // FLASH-P0-511 起提取器逐次加锁：`embed_cached(&buf, |b| { with_speaker_extractor(|v| v.and_then(|v| v.embed(b))) })`。
+        let compact: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains(
+            "embed_cached(&buf,|b|{with_speaker_extractor(|v|v.and_then(|v|v.embed(b)))})"
+        ));
         assert!(!prod.contains("verifier.embed(&buf)"), "不得绕过缓存");
         let i = prod.find("embed_cached(&buf").unwrap();
         let j = prod[i..]
@@ -3035,5 +3092,81 @@ mod emb_cache_454_tests {
             .map(|k| i + k)
             .unwrap();
         assert!(j - i < 300, "判定须紧随取向量现算");
+    }
+}
+
+/// FLASH-P0-511：声纹按归属隔离（本机主人 / 各终端互不影响）+ 会话结束落盘规则。
+#[cfg(test)]
+mod flash_p0_511_tests {
+    use super::*;
+
+    /// 让某归属的某语种档就绪（合成向量，同方向、≥12s、≥3 段）。
+    fn enroll(owner: &VpOwner, lang: &str) {
+        let emb: Vec<f32> = (0..8).map(|i| 1.0 + i as f32 * 0.01).collect();
+        with_process_vp(owner, |p| {
+            for _ in 0..4 {
+                p.vp.offer(&emb, 4.0, None, Some(lang));
+            }
+        });
+    }
+
+    #[test]
+    fn terminal_owner_requires_valid_id() {
+        assert_eq!(
+            VpOwner::terminal("abc23"),
+            Some(VpOwner::Terminal("abc23".into()))
+        );
+        for bad in ["", "  ", "../x", "a/b", "a.b"] {
+            assert_eq!(VpOwner::terminal(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn owners_are_isolated() {
+        let a = VpOwner::terminal("flashp0isoa").unwrap();
+        let b = VpOwner::terminal("flashp0isob").unwrap();
+        enroll(&a, "zh");
+        assert!(voiceprint_lang_ready(&a, "zh"), "前提：a 档就绪");
+        assert!(!voiceprint_lang_ready(&b, "zh"), "b 不受 a 影响");
+        // 清理内存（不落盘）。
+        finish_terminal_voiceprint(&a, false);
+        finish_terminal_voiceprint(&b, false);
+    }
+
+    /// 取消（含吊销踢线）⇒ 不落盘、丢掉内存那份；正常结束 ⇒ 就绪档落到该终端自己的文件。
+    #[test]
+    fn finish_saves_only_when_completed() {
+        let id = "flashp0save";
+        let owner = VpOwner::terminal(id).unwrap();
+        let path = crate::asr_shared::terminal_voiceprint_path(id).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        enroll(&owner, "zh");
+        finish_terminal_voiceprint(&owner, false);
+        assert!(!path.exists(), "取消不得落盘");
+        assert!(
+            !voiceprint_lang_ready(&owner, "zh"),
+            "取消后内存那份已丢（重新读档 = 空）"
+        );
+
+        enroll(&owner, "zh");
+        finish_terminal_voiceprint(&owner, true);
+        assert!(path.exists(), "正常结束应落盘：{}", path.display());
+        assert_ne!(path, voiceprint_path(), "不得写本机主人档");
+
+        crate::asr_shared::purge_terminal_voiceprint(id).expect("删除");
+        assert!(!path.exists(), "吊销删档");
+        finish_terminal_voiceprint(&owner, false);
+    }
+
+    /// 本机主人不走会话结束逻辑（原有节流写盘不变）。
+    #[test]
+    fn finish_ignores_local_owner() {
+        finish_terminal_voiceprint(&VpOwner::Local, false);
+        let guard = VOICEPRINT.lock().unwrap_or_else(|e| e.into_inner());
+        // 本机那份若已加载，仍在。
+        if let Some(map) = guard.as_ref() {
+            let _ = map.get(&VpOwner::Local);
+        }
     }
 }

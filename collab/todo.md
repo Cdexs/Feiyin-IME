@@ -103,6 +103,18 @@
 | S11 | 协议文档 + Python 参考客户端；MACOS-HANDOFF；五文档 | ✅ 验收 `collab/acceptance-491-S11.md`，提交 `b1463de`。`docs/ASR-PROTOCOL.md`（v1 独立契约，逐条对网关代码核实）；`tools/asr-client/feiyin_asr_client.py`（纯标准库，指纹先验再升级，退出码 0/2–8）；45 单测过（含本地 TLS 1.3 假网关集成测试 7 个）。无 Rust 改动。一期 S1–S11 开发全部完成 |
 | T | tester-1：TEST-SYNC → 全量回归 → 出包 | ✅ TEST-SYNC-491（9 护栏）· TEST-EXEC-491（2074 过 / 0 失败）· BUILD-491 出包（0.9.7，HEAD `aa2f2bc`）：tester-1 构建并同步 Publish 后额度触顶，主控接手核验；主控复跑告警时误设 `SHERPA_ONNX_LIB_DIR` 触发整体重编（见 [BUILD-ENV-SHERPA-491]），改由 Sonnet 子 Agent 按指南环境重编并复核。最终 sha（target = Publish）：feiyin-ime `5c3f22607ecf7bf1`、feiyin-ime-ui `4075e0f8aa99b1cb`（00:08 tester-1 构建，未重编）、crash-reporter `98a62541b643a4c5`、feiyin-asr-gateway `01c943b1b0e246e9`（3.8MB）。九项全 PASS：版本 0.9.7（Rust 三件显示 0.9.7.0）；告警 feiyin-ime 89 / crash 6（上次 0.9.6 为 90 / 6）；探针 main `[ASR-SERVER-491]` 3、`feiyin-asr-gateway` 1，ui `asr-service.json` 1，网关 `run-task` / `task-started` 各 1；网关 dumpbin 只依赖系统库 + VCRUNTIME140，无模型库；网关无参运行报 missing --core、退出码 2、不驻留；主程序 -debug 冒烟 Responding、无 panic、无 crash.json，已清理；config.toml 三时点不变；toml 四件三副本、VC++ 五件三处全等；iss 两份逐字相同。本机无 Inno Setup，未编安装包。结果 `collab/outbox/tester-1/result.md`。待 Gavin：重启输入法；S6/S7/S8 界面目视；两台电脑端测；Python 客户端对真服务冒烟。 |
 
+### 🔄 FLASH-P0 · flashasr 剥离第一期（在 voice-ime 内补齐服务端；Gavin 10-29「开工」，DEC-114）
+
+> 方案 `D:\Workspace\CodeLab\FlashASR\docs\SPLIT-PLAN.md` §8 P0。只动**远程会话 / 识别服务**一条管线，本机识别逐位不变。出包 / push 等 Gavin 指令。
+
+| 单号 | 子项 | 状态 |
+| --- | --- | --- |
+| FLASH-P0-508 | 服务端终稿文字处理与本机对齐：① DEC-112 剥光标点再由标点模型重打 ② 繁简规整移到最前（同本机顺序）③ 补「单位补丁」节点 ④ 新参数 `feiyin.strip_trailing_punct`（去句末标点）与 `feiyin.chinese_script`（繁简）由终端传 |✅ |
+| FLASH-P0-509 | 词库每个前端单独（Gavin 10-29「词库也是每个前段单独的」）：服务端会话**只用终端 `vocabulary`**，不再掺服务端机主词库；输入法连识别服务时改发**完整词库数组**（按原顺序、不过阿里长度限制） |✅ |
+| FLASH-P0-510 | 输出优化接进服务端：新参数 `feiyin.output_optimization_enabled`，大模型用服务端统一配置（Gavin 10-29「统一的配置的秘钥」）；未配置 ⇒ 跳过不报错 |✅ |
+| FLASH-P0-511 | 声纹按终端：远程会话用该终端自己的声纹（`voiceprints/<终端编号>.bin`），本机仍 `voiceprint.bin`；吊销终端删其声纹。近场门远程仍关（阈值按电脑麦克风标定，待远程实测） |✅ |
+| FLASH-P0-512 | 测试（派低成本子 agent）+ 五文档 + 跨端交接 + 提交 |✅ |
+
 ### 🔄 10-19 优化批（Gavin 10-19；**出包等 Gavin 指令，全部完成后一起出**）
 
 | 单号 | 内容 | 状态 |

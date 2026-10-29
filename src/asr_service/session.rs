@@ -18,29 +18,21 @@ use std::sync::{Arc, Mutex};
 use super::compose::{RemoteComposer, REMOTE_GEN};
 use super::frame::{EndPayload, OpenParams, ResultPayload, ResultWord};
 use super::text_stage::{self, TextOpts};
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ChineseScript};
 use crate::transcription::char_times::{self, CharTime, SliceMap, TsSource};
 use crate::transcription::{self, AccEngine, RemoteEngines};
-use crate::{apply_authoritative_filler_dedup, localrt_session, text_normalizer, wordbook};
+use crate::{apply_authoritative_filler_dedup, localrt_session, text_normalizer};
 use crate::{AccInput, PipelineEvent};
 
 /// 会话结束错误码（见 [`EndPayload::error`]）。
 pub(crate) const ERR_INTERNAL: &str = "internal";
 
-/// 本地词库词条 + 终端追加词表（追加在后；去重保序）⇒ 精解注入串。
-fn session_terms(config: &AppConfig, vocabulary: &[String]) -> Option<String> {
-    let model = transcription::AsrModel::from_config(&config.audio.asr_model);
-    let mut words: Vec<String> = if model.uses_accuracy_engine() {
-        wordbook::Wordbook::open()
-            .and_then(|wb| wb.list_all())
-            .map(|v| v.into_iter().map(|e| e.word).collect())
-            .unwrap_or_else(|e| {
-                log::warn!("[ASR-SERVER-491] wordbook unavailable for remote session: {e}");
-                Vec::new()
-            })
-    } else {
-        Vec::new()
-    };
+/// 终端词表（去重保序）⇒ 精解注入串。
+///
+/// FLASH-P0-509（Gavin 10-29「词库也是每个前段单独的」）：词库属于各终端的使用人，**只用终端
+/// `vocabulary`**，不再掺服务端机主的本机词库（原先每路远程会话都注入机主词库）。
+fn session_terms(vocabulary: &[String]) -> Option<String> {
+    let mut words: Vec<String> = Vec::new();
     for v in vocabulary {
         let v = v.trim();
         if !v.is_empty() && !words.iter().any(|w| w == v) {
@@ -90,12 +82,17 @@ pub(crate) fn run_remote_session(
     mut emit: impl FnMut(ResultPayload),
 ) -> RemoteOutcome {
     let model_dir = transcription::model_dir();
-    let script = config.audio.chinese_script;
+    // FLASH-P0-508：繁简跟终端参数；终端没传 ⇒ 跟服务端本机设置（精解解码与文字收尾同用）。
+    let script = match params.traditional {
+        Some(true) => ChineseScript::Traditional,
+        Some(false) => ChineseScript::Simplified,
+        None => config.audio.chinese_script,
+    };
     let silence_threshold = config.audio.silence_threshold;
     // 预览打点：远程不另开一份标点模型（CT-Transformer 常驻实例由本机录音线程独占）⇒ 预览无标点；
     // 终稿用 1.7B 原生标点 / 精解线程的进程级标点服务，与本机一致。
     let acc_cfg = transcription::local_stream::AccDispatchConfig::new();
-    let acc_terms = session_terms(config, &params.vocabulary);
+    let acc_terms = session_terms(&params.vocabulary);
     // S10：补标点跟终端参数（精解失败片的兜底打点也一样），不跟本机设置。
     let acc_punct_enabled = params.punctuation;
     let opts = TextOpts {
@@ -103,6 +100,8 @@ pub(crate) fn run_remote_session(
         punctuation: params.punctuation,
         script,
         model_dir: model_dir.clone(),
+        strip_trailing: params.strip_trailing,
+        optimize: params.optimize,
     };
     // 预览线程「设备」标识：只用于近场门的音量沿用判据，远程已关门；带上设备代码便于日志区分。
     let vad_device = format!("remote:{}", params.device_id);
@@ -293,7 +292,7 @@ pub(crate) fn run_remote_session(
     let text = text_normalizer::normalize_text_for_language(final_src.trim(), script);
     let times = char_times::transfer(&final_src, &src_times, &text);
     // S10：内置节点 + 终端三项参数；要了翻译 ⇒ 另出一份译文（失败不给）。
-    let (text, times) = text_stage::apply_final(&text, &times, &opts);
+    let (text, times) = text_stage::apply_final(&text, &times, &opts, config);
     let translation = if params.translate {
         text_stage::translate(&text, config, &opts)
     } else {
@@ -546,6 +545,29 @@ mod tests {
         assert!(
             hits.is_empty(),
             "session.rs 生产区代码不得引用 {needle}，命中行: {hits:?}"
+        );
+    }
+
+    /// FLASH-P0-509（源码 + 行为）：会话词表只来自终端 `vocabulary`，生产区不再打开服务端本机词库；
+    /// 去重保序、空白忽略。
+    #[test]
+    fn session_terms_only_terminal_vocabulary() {
+        let src = include_str!("session.rs");
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(src);
+        let open = concat!("Wordbook::", "open");
+        assert!(
+            !prod.iter().any(|l| l.contains(open)),
+            "会话不得读服务端本机词库"
+        );
+        assert_eq!(session_terms(&[]), None);
+        let v: Vec<String> = ["飞音", " ", "飞音", "LiveKit"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let got = session_terms(&v).expect("有词条");
+        assert_eq!(
+            got,
+            transcription::build_hotwords_string(&["飞音".to_string(), "LiveKit".to_string()])
         );
     }
 }

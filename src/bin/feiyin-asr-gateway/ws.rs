@@ -192,6 +192,12 @@ impl Shared {
                 c.kick.notify_one();
             }
         }
+        // FLASH-P0-511：吊销 = 连该终端的声纹一起删（内核在被吊销会话结束时也不会再写回，见 speaker.rs）。
+        if found {
+            if let Err(e) = crate::asr_shared::purge_terminal_voiceprint(terminal_id) {
+                log::warn!("[asr-gateway] FLASH-P0-511 删除终端 {terminal_id} 的声纹失败：{e}");
+            }
+        }
         found
     }
 
@@ -395,6 +401,16 @@ fn end_code(e: &str) -> &'static str {
     }
 }
 
+/// FLASH-P0-508：`feiyin.chinese_script`：`"simplified"` / `"traditional"`（大小写不限）；
+/// 缺省或认不出 ⇒ `None`（跟服务端本机设置）。
+fn chinese_script(v: &Value) -> Option<bool> {
+    match v.as_str()?.trim().to_ascii_lowercase().as_str() {
+        "simplified" => Some(false),
+        "traditional" => Some(true),
+        _ => None,
+    }
+}
+
 /// `vocabulary` 两种写法都收：百炼的 `{词: 权重}` 对象，或字符串数组。
 fn vocabulary(v: Option<&Value>) -> Vec<String> {
     match v {
@@ -572,6 +588,14 @@ impl Conn {
                 .as_bool()
                 .unwrap_or(true),
             translate: p["translation_enabled"].as_bool().unwrap_or(false),
+            // FLASH-P0-508 / 510：飞音自加的三项放 `parameters.feiyin`（阿里同名的才放顶层）。
+            strip_trailing: p["feiyin"]["strip_trailing_punct"]
+                .as_bool()
+                .unwrap_or(false),
+            traditional: chinese_script(&p["feiyin"]["chinese_script"]),
+            optimize: p["feiyin"]["output_optimization_enabled"]
+                .as_bool()
+                .unwrap_or(false),
         };
         let (session, rx) = self.shared.core.open(&params);
         self.task = Some(Task {
@@ -975,6 +999,52 @@ mod tests {
         assert!(
             v2["output"]["sentence"]["end_time"].is_null(),
             "words 为空时 end_time 应为 null: {v2}"
+        );
+    }
+
+    /// FLASH-P0-508：`feiyin.chinese_script` 解析（大小写 / 空白不限；认不出 ⇒ 跟服务端设置）。
+    #[test]
+    fn chinese_script_param() {
+        assert_eq!(chinese_script(&json!("simplified")), Some(false));
+        assert_eq!(chinese_script(&json!(" Traditional ")), Some(true));
+        assert_eq!(chinese_script(&json!("klingon")), None);
+        assert_eq!(chinese_script(&json!(1)), None);
+        assert_eq!(chinese_script(&Value::Null), None);
+    }
+
+    /// FLASH-P0-508 / 510（源码）：飞音自加的三项从 `parameters.feiyin` 取、缺省全关 / 跟服务端；
+    /// 阿里同名三项仍在顶层（老终端不改也能用）。
+    #[test]
+    fn flash_p0_feiyin_params_parsed_from_feiyin_object() {
+        let compact: String = prod_src().chars().filter(|c| !c.is_whitespace()).collect();
+        for needle in [
+            r#"strip_trailing:p["feiyin"]["strip_trailing_punct"].as_bool().unwrap_or(false)"#,
+            r#"traditional:chinese_script(&p["feiyin"]["chinese_script"])"#,
+            r#"optimize:p["feiyin"]["output_optimization_enabled"].as_bool().unwrap_or(false)"#,
+            r#"translate:p["translation_enabled"].as_bool().unwrap_or(false)"#,
+        ] {
+            assert!(compact.contains(needle), "缺少：{needle}");
+        }
+    }
+
+    /// FLASH-P0-511（源码）：网关吊销终端时删其声纹。
+    #[test]
+    fn revoke_purges_terminal_voiceprint() {
+        let prod = prod_src();
+        let body = prod
+            .split("pub fn revoke(&self, terminal_id: &str) -> bool {")
+            .nth(1)
+            .expect("revoke 锚点");
+        let body = &body[..body
+            .find(
+                "
+    }
+",
+            )
+            .expect("函数尾")];
+        assert!(
+            body.contains("purge_terminal_voiceprint(terminal_id)"),
+            "{body}"
         );
     }
 }

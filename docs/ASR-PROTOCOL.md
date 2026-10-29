@@ -137,11 +137,16 @@ Authorization: Bearer <key>
 | `parameters.inverse_text_normalization_enabled` | | `true` | 数字规整（「三点五公斤」⇒「3.5公斤」） |
 | `parameters.punctuation_prediction_enabled` | | `true` | 补标点；`false` ⇒ 预览、终稿、译文**全部去标点** |
 | `parameters.translation_enabled` | | `false` | 终稿另给一份译文（§5.3）。方向按内容自动：含汉字 ⇒ 译成英文，否则译成中文；`translation_target_languages` 忽略 |
-| `parameters.vocabulary` | | 无 | 热词：字符串数组，或百炼的 `{"词": 权重}` 对象（权重忽略）。追加在服务端本机词库之后 |
+| `parameters.vocabulary` | | 无 | 热词：字符串数组（推荐，按数组顺序取优先级），或百炼的 `{"词": 权重}` 对象（权重忽略）。**词库每个终端单独**：服务端只用这里给的词，不掺服务端本机词库 |
+| `parameters.feiyin.output_optimization_enabled` | | `false` | 输出优化（大模型整理文字）。大模型用服务端统一配置；服务端没配 ⇒ 跳过此步、照常出结果 |
+| `parameters.feiyin.strip_trailing_punct` | | `false` | 去掉句末标点（句中标点保留） |
+| `parameters.feiyin.chinese_script` | | 服务端设置 | `"simplified"` / `"traditional"`；其它值 ⇒ 跟服务端设置 |
 | `parameters.feiyin.device_id` / `device_name` | ✅ | — | §1.4。缺 ⇒ `MissingDeviceInfo` 并断开 |
 | `header.streaming`、`payload.task_group / task / function / model / input` | | — | 服务端忽略，照百炼写即可（方便同一份代码对接百炼） |
 
-**固定内置、不可关**：同音字纠错、去口水词与口吃重复、无效文本判定（只有「嗯啊」之类 ⇒ 终稿为空）、繁简（跟服务端本机设置）。
+**固定内置、不可关**：同音字纠错、去口水词与口吃重复、无效文本判定（只有「嗯啊」之类 ⇒ 终稿为空）。
+
+**声纹**：服务端为每个终端单独累积使用人的声纹，攒够后自动剔除别人的声音（如旁边的人说话、视频声音）。终端被吊销时声纹一并删除。
 
 成功 ⇒ 服务端回 `task-started`（§5.1），**之后**才能发音频。失败 ⇒ `task-failed`（§5.4）；其中 `KeyRevoked` / `KeyExpired` / `InvalidKey` / `DeviceMismatch` / `MissingDeviceInfo` 之后服务端**断开连接**。
 

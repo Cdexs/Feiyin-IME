@@ -194,7 +194,9 @@ pub fn asr_server_revoke(terminal_id: String) -> Result<(), String> {
             if !st.revoke(&terminal_id) {
                 return Err(ERR_NOT_FOUND.to_string());
             }
-            st.save().map_err(|_| ERR_IO.to_string())
+            st.save().map_err(|_| ERR_IO.to_string())?;
+            // FLASH-P0-511：吊销 = 连该终端的声纹一起删（网关在跑时由网关删，见 ws.rs `revoke`）。
+            asr_shared::purge_terminal_voiceprint(&terminal_id).map_err(|_| ERR_IO.to_string())
         }
     }
 }

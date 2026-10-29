@@ -148,6 +148,16 @@ pub(crate) struct OpenParams {
     /// S10：终稿另给译文（阿里 `translation_enabled`，默认关；方向按内容自动判定）。
     #[serde(default)]
     pub translate: bool,
+    /// FLASH-P0-508：去句末标点（`feiyin.strip_trailing_punct`，同本机快捷方式开关；默认关）。
+    #[serde(default)]
+    pub strip_trailing: bool,
+    /// FLASH-P0-508：繁简（`feiyin.chinese_script`）：`None` = 跟服务端本机设置，`Some(true)` = 繁体。
+    /// 帧与网关共用、网关不含配置模块 ⇒ 不用 `config::ChineseScript`，由内核换算。
+    #[serde(default)]
+    pub traditional: Option<bool>,
+    /// FLASH-P0-510：输出优化（`feiyin.output_optimization_enabled`；默认关）。大模型用服务端统一配置。
+    #[serde(default)]
+    pub optimize: bool,
 }
 
 fn yes() -> bool {
@@ -165,6 +175,9 @@ impl Default for OpenParams {
             itn: true,
             punctuation: true,
             translate: false,
+            strip_trailing: false,
+            traditional: None,
+            optimize: false,
         }
     }
 }

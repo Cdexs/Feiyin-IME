@@ -247,7 +247,8 @@ fn open_session(
         log::warn!("[ASR-SERVER-491] remote capacity reached (active={active})");
         return Err(ERR_CAPACITY);
     }
-    let slot = engines.acc.create_slot().map_err(|e| {
+    // FLASH-P0-511：通道带上终端编号 ⇒ 本会话用该终端自己的声纹。
+    let slot = engines.acc.create_slot(&params.terminal_id).map_err(|e| {
         log::warn!("[ASR-SERVER-491] create slot failed: {e:#}");
         ERR_CAPACITY
     })?;
@@ -268,6 +269,7 @@ fn open_session(
                 let vad = transcription::VadSegmenter::try_new_for_local_silence(
                     &transcription::model_dir(),
                 );
+                let cancelled = Arc::clone(&cancel);
                 let out = session::run_remote_session(
                     &engines,
                     &slot,
@@ -278,6 +280,11 @@ fn open_session(
                     cancel,
                     |r| send(&writer, &Frame::json(Kind::Result, id, &r)),
                 );
+                // FLASH-P0-511：正常说完 ⇒ 该终端声纹落盘；被取消（含吊销踢线）⇒ 不落盘、丢掉内存那份。
+                if let Some(owner) = slot.voiceprint_owner() {
+                    let completed = !cancelled.load(Ordering::Acquire) && out.end.error.is_empty();
+                    transcription::speaker::finish_terminal_voiceprint(owner, completed);
+                }
                 // 推理通道（约 73MB）先还，再回网关、记统计。
                 drop(slot);
                 drop(engines);

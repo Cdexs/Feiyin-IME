@@ -170,3 +170,10 @@
 - BUILD-505：出包九项全 PASS（feiyin-ime `f606a11f44ebbda4` / ui `18ead272c637b3de` / crash `a4d3acd29169ebb4` / 网关同上一包），已 push。待 Gavin 重启输入法。
 - ASR-DEFAULT-LRT-506 / DEC-113：新装默认 local_realtime（`NEW_INSTALL_ASR_MODEL` 两处 + `assets/default-config.toml`），设置页删 Ctrl+M；serde 缺字段回落仍 performance。全量测试过。
 - BUILD-507：出包九项全 PASS（Sonnet 子 agent 核验），feiyin-ime `c7021e27055c5d1f`；未 push，等 Gavin。工作区另有 src-tauri 三文件纯格式化改动未提交（主控 cargo fmt 带出），待 Gavin 定。
+
+## 2026-10-29 — 主控 — FLASH-P0 完成（DEC-114 第一期）
+
+- 服务端 `text_stage::apply_final` 与本机同序（剥光重打、单位补丁、去句末标点 / 繁简 / 输出优化三参数）；`OpenParams` 加 `strip_trailing / traditional / optimize`，网关从 `parameters.feiyin` 解析。
+- 会话词表只用终端 `vocabulary`；客户端 `load_wordbook_word_array` 发完整词库数组。
+- 声纹按归属 `speaker::VpOwner`（Local / Terminal），`AccEngine::create_slot(terminal_id)`；`finish_terminal_voiceprint` 会话收尾；`asr_shared::purge_terminal_voiceprint` 两处吊销调用。
+- 测试 2099 / 42 / 121 全过。未出包、未 push。

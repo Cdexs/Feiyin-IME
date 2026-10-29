@@ -2901,3 +2901,9 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 13. **ASR-UI-HIDE-FAST-504**（`ui/src/pages/Voice.tsx`，设置界面两端共用）：「本地模型 - 快速」选项只对存量配置显示；macOS 设置界面同一份前端，自动生效。
 14. **BUILD-505**（Windows 出包 + push）：无新增依赖 / 工具链变化；macOS 拉取后请 `cargo check`（getifaddrs、托盘图标、托盘判据三处）。
 15. **ASR-DEFAULT-LRT-506 / DEC-113 · 新装默认本地流式实时模型**（`src/config/mod.rs`、`src-tauri/src/config.rs`、`assets/default-config.toml`、`ui/src/pages/Voice.tsx`，平台中立）：设置页恒显示该模型（删 Ctrl+M）；无配置文件时默认 `local_realtime`。**macOS**：若 macOS 本地实时档尚未接通，新装默认会落到不可用模型 —— 接手时须确认 macOS 本地实时可用，否则需在 macOS 侧给出回落方案后再发版。
+
+## 10-29 · FLASH-P0（DEC-114 flashasr 剥离第一期，主控）
+
+1. **服务端文字处理 / 协议**（`src/asr_service/*`、网关 `ws.rs`，平台中立）：终稿与本机同序；`run-task` 新增 `parameters.feiyin.output_optimization_enabled / strip_trailing_punct / chinese_script`（见 `docs/ASR-PROTOCOL.md`）。macOS 若跑识别服务，同一份代码，无需另改。
+2. **词库**（`src/transcription/mod.rs` `load_wordbook_word_array`、`qwen_inference.rs`，平台中立）：连识别服务时发完整词库数组；服务端不再读机主词库。行为变更：macOS 作服务端时同样只用终端词表。
+3. **声纹按终端**（`speaker.rs` / `llama_asr.rs` / `asr_shared/mod.rs` / `src-tauri/src/asr_server.rs`，平台中立）：远程会话按终端声纹剔除；终端声纹存 `<数据目录>/voiceprints/<编号>.bin`；吊销删档。`create_slot` 签名多一参（终端编号）。macOS 侧无平台代码改动；macOS 接手须 `cargo check`。

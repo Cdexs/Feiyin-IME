@@ -6,13 +6,18 @@
 //!
 //! | 顺序 | 节点 | 预览 | 终稿 |
 //! | --- | --- | --- | --- |
+//! | 0 | 剥光标点（DEC-112，参数开标点时；FLASH-P0-508） | — | ✅ |
 //! | 1 | 无效文本（只有口水词 ⇒ 空） | — | ✅ |
 //! | 2 | 同音纠错 | ✅ | ✅ |
 //! | 3 | 数字规整（参数） | ✅ | ✅ |
-//! | 4 | 繁简 / 英文大小写规整（本机无大模型分支同款） | — | ✅ |
-//! | 5 | 补标点（参数开且文字无有效标点） | — | ✅ |
-//! | 6 | 标点收尾（关 ⇒ 全剥；开 ⇒ 短句剥句末） | 只做「关 ⇒ 全剥」 | ✅ |
+//! | 4 | 输出优化（参数，大模型；FLASH-P0-510）／ 否则繁简 + 英文大小写规整 | — | ✅ |
+//! | 5 | 单位补丁（数字规整补丁通道，DEC-036；FLASH-P0-508） | — | ✅ |
+//! | 6 | 补标点（参数开、大模型未接手）—— 剥光后由标点模型整段按语义重打 | — | ✅ |
+//! | 7 | 标点收尾（关 ⇒ 全剥；开 ⇒ 短句剥句末；参数 `strip_trailing` ⇒ 剥句末） | 只做「关 ⇒ 全剥」 | ✅ |
 //!
+//! FLASH-P0-508：终稿顺序与本机 `run_pipeline_core` 本地实时分支逐项对齐（本机：会话收尾繁简 ⇒
+//! `strip_punctuation_node` ⇒ 有效文本 ⇒ 同音 ⇒ 数字规整 ⇒ `run_llm_stage` ⇒ 单位补丁 ⇒
+//! `apply_local_punctuation` ⇒ L2）。繁简已由会话收尾先做一遍（`session.rs`），与本机同。
 //! 去口水：本地实时管线回灌前已过一遍（441 `DoneUpstream`），远程同一路径 ⇒ 不再过第二遍。
 //! 翻译另出一份（[`translate`]），不改原文。
 
@@ -31,6 +36,10 @@ pub(crate) struct TextOpts {
     pub punctuation: bool,
     pub script: ChineseScript,
     pub model_dir: PathBuf,
+    /// FLASH-P0-508：去句末标点（终端参数）。
+    pub strip_trailing: bool,
+    /// FLASH-P0-510：输出优化（终端参数；大模型用服务端统一配置）。
+    pub optimize: bool,
 }
 
 type Times = Vec<Option<CharTime>>;
@@ -95,34 +104,115 @@ pub(crate) fn preview_tentative(text: &str, tentative: usize, o: &TextOpts) -> u
         .count()
 }
 
-/// 终稿：全部节点。只有口水词 ⇒ 空文本。
-pub(crate) fn apply_final(text: &str, times: &[Option<CharTime>], o: &TextOpts) -> (String, Times) {
-    if !text_normalizer::is_effective_text(text) {
-        if !text.trim().is_empty() {
+/// 终稿：全部节点（顺序见模块头）。只有口水词 ⇒ 空文本。`config` 只供输出优化取服务端统一大模型配置。
+pub(crate) fn apply_final(
+    text: &str,
+    times: &[Option<CharTime>],
+    o: &TextOpts,
+    config: &AppConfig,
+) -> (String, Times) {
+    // FLASH-P0-508（DEC-112）：开标点 ⇒ 先剥光，交下游标点模型整段按语义重打（同本机 `strip_punctuation_node`）。
+    let cur = if o.punctuation {
+        step(text.to_string(), times.to_vec(), |t| {
+            punctuation::strip_effective_punctuation(t)
+        })
+    } else {
+        (text.to_string(), times.to_vec())
+    };
+    if !text_normalizer::is_effective_text(&cur.0) {
+        if !cur.0.trim().is_empty() {
             log::info!("[ASR-SERVER-491] remote final not effective (filler only): {text:?}");
         }
         return (String::new(), Vec::new());
     }
-    let cur = (text.to_string(), times.to_vec());
     let cur = step(cur.0, cur.1, |t| {
         homophone::apply_homophone_fix(t.to_string(), true)
     });
+    // 输出优化的繁简指令按「同音纠错后、数字规整前」的文字定（同本机 `run_llm_stage` 的 `raw_text`）。
+    let raw_text = cur.0.clone();
     let cur = if o.itn {
         step(cur.0, cur.1, itn::normalize_numbers)
     } else {
         cur
     };
-    let cur = step(cur.0, cur.1, |t| {
-        text_normalizer::normalize_text_for_language(t, o.script)
-    });
-    let cur = if o.punctuation {
+    let optimized = o
+        .optimize
+        .then(|| llm_optimize(&cur.0, &raw_text, config, o))
+        .flatten();
+    let llm_handled = optimized.is_some();
+    let cur = match optimized {
+        Some(t) => step(cur.0, cur.1, |_| t),
+        None => step(cur.0, cur.1, |t| {
+            text_normalizer::normalize_text_for_language(t, o.script)
+        }),
+    };
+    let cur = if o.itn {
+        step(cur.0, cur.1, itn::normalize_unit_symbols_only)
+    } else {
+        cur
+    };
+    let cur = if o.punctuation && !llm_handled {
         step(cur.0, cur.1, |t| punctuate(&o.model_dir, t))
     } else {
         cur
     };
     step(cur.0, cur.1, |t| {
-        punctuation::apply_l2_postprocess(t, o.punctuation, false).0
+        punctuation::apply_l2_postprocess(t, o.punctuation, o.strip_trailing).0
     })
+}
+
+/// FLASH-P0-510：输出优化（同本机 `run_llm_stage` 非翻译分支）：大模型用服务端统一配置；场景未知、
+/// 不多行（远程不知道落点窗口）、不外发窗口标题；学习建议不写服务端本机词库（P2 起随结果回给终端）。
+/// 服务端没开大模型 / 调用失败 ⇒ `None`（调用方照常走繁简规整 + 标点模型，同本机失败兜底）。
+fn llm_optimize(
+    pre_llm_text: &str,
+    raw_text: &str,
+    config: &AppConfig,
+    o: &TextOpts,
+) -> Option<String> {
+    if !config.llm.enabled {
+        log::info!(
+            "[FLASH-P0-510] output optimization requested but server LLM not enabled; skipped"
+        );
+        return None;
+    }
+    if pre_llm_text.trim().is_empty() {
+        return None;
+    }
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            log::warn!("[FLASH-P0-510] remote LLM optimize: runtime failed: {e}");
+            return None;
+        }
+    };
+    let client = crate::llm::LlmClient::new(config.llm.clone());
+    let script_instruction = text_normalizer::script_instruction(raw_text, o.script);
+    let scene = crate::scene::SceneContext::unknown();
+    match rt.block_on(client.optimize(
+        pre_llm_text,
+        script_instruction,
+        o.punctuation,
+        Some(&scene),
+        scene.multiline_safe,
+        false,
+    )) {
+        Ok(r) if !r.text.trim().is_empty() => {
+            // 同本机 FMT-LLM-005：大模型输出只做繁简（不动大小写）。
+            Some(text_normalizer::normalize_script_only(&r.text, o.script))
+        }
+        Ok(_) => {
+            log::warn!("[FLASH-P0-510] remote LLM optimize returned empty text");
+            None
+        }
+        Err(e) => {
+            log::warn!("[FLASH-P0-510] remote LLM optimize failed, falling back: {e}");
+            None
+        }
+    }
 }
 
 /// 补标点：已有有效标点（1.7B 原生 / 精解线程补过）⇒ 不动（防 334 `。。` 叠加，同本机
@@ -291,7 +381,16 @@ mod tests {
             script: ChineseScript::Simplified,
             // 不存在的路径：本组测试不得走到加载标点 / 翻译模型。
             model_dir: std::env::temp_dir().join("feiyin-text-stage-test-no-such-models"),
+            strip_trailing: false,
+            optimize: false,
         }
+    }
+
+    /// 服务端配置：大模型显式关（输出优化请求一律跳过，不发网络请求；缺省配置本身是开的）。
+    fn cfg() -> AppConfig {
+        let mut c = AppConfig::default();
+        c.llm.enabled = false;
+        c
     }
 
     /// 每字一个时间（等宽 100ms），用于校验「时间与字数一一对应」。
@@ -335,10 +434,10 @@ mod tests {
         // 终稿：用已带标点的文本避开补标点模型。
         let text = format!("{NUM}。");
         let t = times_for(&text);
-        let (on, on_t) = apply_final(&text, &t, &opts(true, true));
+        let (on, on_t) = apply_final(&text, &t, &opts(true, true), &cfg());
         assert!(on.contains(&norm), "{on:?}");
         assert_aligned(&on, &on_t);
-        let (off, off_t) = apply_final(&text, &t, &opts(false, true));
+        let (off, off_t) = apply_final(&text, &t, &opts(false, true), &cfg());
         assert!(off.contains("三点五"), "{off:?}");
         assert_aligned(&off, &off_t);
     }
@@ -350,7 +449,7 @@ mod tests {
         let (p, pt) = apply_preview(text, &t, &opts(true, false));
         assert!(!p.contains('，') && !p.contains('。'), "{p:?}");
         assert_aligned(&p, &pt);
-        let (f, ft) = apply_final(text, &t, &opts(true, false));
+        let (f, ft) = apply_final(text, &t, &opts(true, false), &cfg());
         assert!(!f.contains('，') && !f.contains('。'), "{f:?}");
         assert!(f.contains("今天天气很好"), "{f:?}");
         assert_aligned(&f, &ft);
@@ -365,30 +464,101 @@ mod tests {
         assert_aligned(&p, &pt);
     }
 
-    /// 已带有效标点 ⇒ 终稿不再补标点（不叠加 `。。`，也不去加载标点模型）。
+    /// FLASH-P0-508（DEC-112）：开标点 ⇒ 终稿先剥光已有标点、再交标点模型整段重打
+    ///（同本机 `strip_punctuation_node`）。不叠加 `。。`；结果 == 「剥光 ⇒ 补标点」手工串联。
     #[test]
-    fn final_with_existing_punctuation_not_repunctuated() {
+    fn final_strips_then_repunctuates_like_local() {
         let text = "今天天气很好，我们出去玩吧。";
         let t = times_for(text);
-        let (f, ft) = apply_final(text, &t, &opts(true, true));
-        assert_eq!(f, text, "标点不叠加、不改动");
-        assert_eq!(f.matches('。').count(), 1);
-        assert_eq!(f.matches('，').count(), 1);
+        let (f, ft) = apply_final(text, &t, &opts(true, true), &cfg());
+        let stripped = punctuation::strip_effective_punctuation(text);
+        assert!(
+            !punctuation::has_effective_punctuation(&stripped),
+            "前提：剥光"
+        );
+        let o = opts(true, true);
+        let expected =
+            punctuation::apply_l2_postprocess(&punctuate(&o.model_dir, &stripped), true, false).0;
+        assert_eq!(f, expected);
+        assert!(!f.contains("。。") && !f.contains("，。"), "{f:?}");
         assert_aligned(&f, &ft);
+    }
+
+    /// FLASH-P0-508：`strip_trailing` ⇒ 去句末标点（同本机快捷方式开关）；不影响句中标点。
+    #[test]
+    fn strip_trailing_param_strips_final_mark() {
+        let text = "今天天气很好，我们出去玩吧。";
+        let mut o = opts(true, false);
+        o.strip_trailing = true;
+        // 标点关 ⇒ 全剥（strip_trailing 无从生效，与本机 L2 同）。
+        let (f, _) = apply_final(text, &times_for(text), &o, &cfg());
+        assert!(!punctuation::has_effective_punctuation(&f), "{f:?}");
+        // 标点开：L2 与本机同参 ⇒ 结果 == apply_l2_postprocess(_, true, true)。
+        let mut o = opts(true, true);
+        o.strip_trailing = true;
+        let (f, ft) = apply_final(text, &times_for(text), &o, &cfg());
+        let stripped = punctuation::strip_effective_punctuation(text);
+        let expected =
+            punctuation::apply_l2_postprocess(&punctuate(&o.model_dir, &stripped), true, true).0;
+        assert_eq!(f, expected);
+        assert_aligned(&f, &ft);
+    }
+
+    /// FLASH-P0-510：服务端没开大模型 ⇒ 输出优化请求被跳过，终稿与不请求时逐位相同。
+    #[test]
+    fn optimize_without_server_llm_is_noop() {
+        for text in [
+            NUM,
+            "今天天气很好，我们出去玩吧。",
+            "他很满头大汉。",
+            "好的。",
+        ] {
+            for punc in [true, false] {
+                let base = opts(true, punc);
+                let mut opt = opts(true, punc);
+                opt.optimize = true;
+                let t = times_for(text);
+                assert_eq!(
+                    apply_final(text, &t, &base, &cfg()),
+                    apply_final(text, &t, &opt, &cfg()),
+                    "{text:?} punc={punc}"
+                );
+            }
+        }
+    }
+
+    /// FLASH-P0-508：单位补丁节点在线（数字规整补丁通道，DEC-036），且只在数字规整开时跑。
+    #[test]
+    fn unit_patch_node_follows_itn_switch() {
+        let src = include_str!("text_stage.rs");
+        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(src);
+        let call = concat!("itn::", "normalize_unit_symbols_only");
+        let idx: Vec<usize> = prod
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains(call))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(idx.len(), 1, "{call} 应恰 1 处");
+        let before = prod[idx[0].saturating_sub(2)..idx[0]].join(
+            "
+",
+        );
+        assert!(before.contains("if o.itn"), "{call} 必须在 `if o.itn` 内");
     }
 
     #[test]
     fn filler_only_final_is_empty() {
         for text in ["嗯嗯啊", "嗯。", "   "] {
             let t = times_for(text);
-            let (f, ft) = apply_final(text, &t, &opts(true, true));
+            let (f, ft) = apply_final(text, &t, &opts(true, true), &cfg());
             if text_normalizer::is_effective_text(text) {
                 continue; // 词表若认为有效，不属于本断言范围
             }
             assert!(f.is_empty(), "{text:?} ⇒ {f:?}");
             assert!(ft.is_empty());
         }
-        let (f, _) = apply_final("嗯嗯啊", &times_for("嗯嗯啊"), &opts(true, true));
+        let (f, _) = apply_final("嗯嗯啊", &times_for("嗯嗯啊"), &opts(true, true), &cfg());
         assert!(f.is_empty(), "只有口水词 ⇒ 终稿为空");
     }
 
@@ -410,10 +580,10 @@ mod tests {
                 let (p, pt) = apply_preview(text, &t, &opts(itn_on, true));
                 assert_aligned(&p, &pt);
                 // 终稿只用带标点或标点关的组合，避免触发补标点模型。
-                let (f, ft) = apply_final(text, &t, &opts(itn_on, false));
+                let (f, ft) = apply_final(text, &t, &opts(itn_on, false), &cfg());
                 assert_aligned(&f, &ft);
                 if punctuation::has_effective_punctuation(text) {
-                    let (f, ft) = apply_final(text, &t, &opts(itn_on, true));
+                    let (f, ft) = apply_final(text, &t, &opts(itn_on, true), &cfg());
                     assert_aligned(&f, &ft);
                 }
             }
@@ -522,23 +692,36 @@ mod tests {
 
     /// S10 护栏 1：`apply_final` 与「本机同一批函数逐位串联」零变更。
     /// 5 组样例 × (itn on/off)，每组断言 `apply_final(text).0` == 手工串联结果。
-    /// 手工链：`apply_homophone_fix(_, true)` → [`itn::normalize_numbers`] →
-    /// [`text_normalizer::normalize_text_for_language`] → [`punctuation::apply_l2_postprocess`]。
-    /// 样例均带有效标点 ⇒ `punctuate()` 早退不加载模型。
+    /// FLASH-P0-508 起手工链与本机本地实时同序（见 `manual_final`）；补标点在手工链里调同一个 `punctuate`。
     #[test]
     fn s10_final_matches_manual_node_chain() {
         use crate::transcription::char_times::transfer as ct_transfer;
 
+        // FLASH-P0-508：本机本地实时同序（剥光 ⇒ 同音 ⇒ 数字规整 ⇒ 繁简 ⇒ 单位补丁 ⇒ 补标点 ⇒ L2）。
         fn manual_final(text: &str, o: &TextOpts) -> String {
-            let t1 = homophone::apply_homophone_fix(text.to_string(), true);
+            let t0 = if o.punctuation {
+                punctuation::strip_effective_punctuation(text)
+            } else {
+                text.to_string()
+            };
+            let t1 = homophone::apply_homophone_fix(t0, true);
             let t2 = if o.itn {
                 itn::normalize_numbers(&t1)
             } else {
                 t1
             };
             let t3 = text_normalizer::normalize_text_for_language(&t2, o.script);
-            // 样例带有效标点 ⇒ punctuate() 早退，等价恒等。
-            punctuation::apply_l2_postprocess(&t3, o.punctuation, false).0
+            let t4 = if o.itn {
+                itn::normalize_unit_symbols_only(&t3)
+            } else {
+                t3
+            };
+            let t5 = if o.punctuation {
+                punctuate(&o.model_dir, &t4)
+            } else {
+                t4
+            };
+            punctuation::apply_l2_postprocess(&t5, o.punctuation, o.strip_trailing).0
         }
 
         let samples = [
@@ -553,7 +736,7 @@ mod tests {
                 for punc_on in [true, false] {
                     let o = opts(itn_on, punc_on);
                     let times = times_for(text);
-                    let (actual, actual_times) = apply_final(text, &times, &o);
+                    let (actual, actual_times) = apply_final(text, &times, &o, &cfg());
                     let expected = manual_final(text, &o);
                     assert_eq!(
                         actual, expected,
@@ -618,7 +801,7 @@ mod tests {
         for text in ["你好，世界。", "OK，好的。"] {
             let o = opts(true, false);
             let times = times_for(text);
-            let (out, _) = apply_final(text, &times, &o);
+            let (out, _) = apply_final(text, &times, &o, &cfg());
             assert!(
                 !punctuation::has_effective_punctuation(&out),
                 "punc=false 仍含有效标点: text={text:?} out={out:?}"
@@ -629,7 +812,7 @@ mod tests {
         assert_eq!(punctuation::count_units(short), 2, "好的。 应为 2 个单位");
         let o = opts(true, true);
         let times = times_for(short);
-        let (out, _) = apply_final(short, &times, &o);
+        let (out, _) = apply_final(short, &times, &o, &cfg());
         assert_eq!(out, "好的", "短句 punc=true 应剥句末标点: {out:?}");
     }
 }

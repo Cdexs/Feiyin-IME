@@ -1430,8 +1430,8 @@ fn plan_self_vad_trim(
     pad: usize,
     new_slice_from: usize,
     src: &'static str,
-    // ASR-SERVER-491：`false` = 远程会话（不做声纹，见 `speaker::keep_all_ranges`）。
-    voiceprint: bool,
+    // FLASH-P0-511：声纹归属；`None` = 不做声纹（见 `speaker::keep_all_ranges`）。
+    voiceprint: Option<&speaker::VpOwner>,
 ) -> SelfVadTrim {
     match ranges {
         None => SelfVadTrim {
@@ -1451,10 +1451,11 @@ fn plan_self_vad_trim(
             filter: None,
         },
         Some(r) => {
-            let f = if voiceprint {
-                speaker::filter_ranges_by_voiceprint(samples, &r, new_slice_from)
-            } else {
-                speaker::keep_all_ranges(&r)
+            let f = match voiceprint {
+                Some(owner) => {
+                    speaker::filter_ranges_by_voiceprint(owner, samples, &r, new_slice_from)
+                }
+                None => speaker::keep_all_ranges(&r),
             };
             let used = trim_to_speech(samples, &f.kept, pad);
             let n = f.kept.len();
@@ -1494,17 +1495,21 @@ pub(crate) fn transcribe_acc_ctx(
     // 本窗语音区间（时间线优先 / 自跑 VAD 回退）。408B①：**解码前**按所有已就绪档最高分剔除。
     let mut ranges_orig: Vec<(usize, usize)> = Vec::new();
     let mut vp_filter: Option<speaker::VoiceprintFilter> = None;
-    // ASR-SERVER-491：远程推理通道 = 远程会话 ⇒ 不做声纹剔除、不注册（声纹只属于本机主人）。
-    let voiceprint = !recognizer.is_remote();
+    // FLASH-P0-511：声纹按归属 —— 本机通道用本机主人的，远程通道用该终端自己的（原先远程一律不做）。
+    let vp_owner = recognizer.voiceprint_owner();
     // 返回 `(解码用样本, 是否经 VAD 判定, 区间数, 剪静音来源)`；`source` ∈ {timeline, vad, none}。
     let (samples_used, trimmed, n_ranges, trim_src) =
         match plan_timeline_trim(inject.speech_ranges, inject.streaming_nonempty) {
             Some(TimelineTrim::Apply(ranges)) => {
                 ranges_orig = ranges.clone();
-                let f = if voiceprint {
-                    speaker::filter_ranges_by_voiceprint(samples, &ranges, inject.new_slice_from)
-                } else {
-                    speaker::keep_all_ranges(&ranges)
+                let f = match vp_owner {
+                    Some(owner) => speaker::filter_ranges_by_voiceprint(
+                        owner,
+                        samples,
+                        &ranges,
+                        inject.new_slice_from,
+                    ),
+                    None => speaker::keep_all_ranges(&ranges),
                 };
                 let out = trim_to_speech(samples, &f.kept, pad);
                 let n = f.kept.len();
@@ -1521,7 +1526,7 @@ pub(crate) fn transcribe_acc_ctx(
                     pad,
                     inject.new_slice_from,
                     "revad",
-                    voiceprint,
+                    vp_owner,
                 );
                 if log::log_enabled!(log::Level::Debug) {
                     log::debug!(
@@ -1545,7 +1550,7 @@ pub(crate) fn transcribe_acc_ctx(
                     pad,
                     inject.new_slice_from,
                     "vad",
-                    voiceprint,
+                    vp_owner,
                 );
                 ranges_orig = t.ranges;
                 vp_filter = t.filter;
@@ -1645,10 +1650,10 @@ pub(crate) fn transcribe_acc_ctx(
     // ③ 保护判据：L=ja ｜ L 未知 ｜ **L 档未就绪** ⇒ 用原 ranges 重解（须在 commit 之前查）。
     let lang_ready = win_lang
         .as_deref()
-        .is_some_and(speaker::voiceprint_lang_ready);
+        .is_some_and(|l| vp_owner.is_some_and(|o| speaker::voiceprint_lang_ready(o, l)));
     // ④ 注册/漂移进 L 档（本窗新片 offer）。
-    if let Some(f) = vp_filter.as_ref() {
-        speaker::commit_voiceprint_offers(&f.pending_offers, win_lang.as_deref());
+    if let (Some(f), Some(owner)) = (vp_filter.as_ref(), vp_owner) {
+        speaker::commit_voiceprint_offers(owner, &f.pending_offers, win_lang.as_deref());
     }
     if log::log_enabled!(log::Level::Debug) {
         log::debug!(
@@ -3669,6 +3674,25 @@ pub fn load_wordbook_vocabulary() -> serde_json::Value {
             serde_json::json!({})
         }
     }
+}
+
+/// FLASH-P0-509：连自家识别服务时的词表 = **完整词库字符串数组**，顺序同 `list_all`（id 倒序，
+/// 与本机本地实时 `load_hotwords_for_accuracy` 同源同序）。不走阿里长度过滤 / 权重 ——
+/// 对方用的是同一套本地实时精解（预算裁剪在对方 `build_hotwords_string` 里做，与本机一致）。
+/// 只查 `wordbook` 表（不含候选表），同 [`load_wordbook_vocabulary`]。
+pub fn load_wordbook_word_array() -> serde_json::Value {
+    let words: Vec<String> = match crate::wordbook::Wordbook::open().and_then(|wb| wb.list_all()) {
+        Ok(entries) => entries.into_iter().map(|e| e.word).collect(),
+        Err(e) => {
+            log::warn!("Failed to load wordbook for remote ASR vocabulary: {}", e);
+            Vec::new()
+        }
+    };
+    log::info!(
+        "Remote ASR vocabulary loaded from wordbook table: {} entries",
+        words.len()
+    );
+    serde_json::json!(words)
 }
 
 #[cfg(test)]
@@ -5771,7 +5795,14 @@ mod fix414_revad_tests {
         let audio: Vec<f32> = (0..RATE).map(|i| (i % 100) as f32 / 100.0).collect();
         let pad = (0.2 * RATE as f32) as usize;
         let ranges = vec![(2000usize, 6000usize)]; // 0.25s < 2s ⇒ KeepShort
-        let t = plan_self_vad_trim(&audio, Some(ranges), pad, 0, "revad", true);
+        let t = plan_self_vad_trim(
+            &audio,
+            Some(ranges),
+            pad,
+            0,
+            "revad",
+            Some(&crate::transcription::speaker::VpOwner::Local),
+        );
         assert!(t.trimmed, "VAD 可用 ⇒ trimmed");
         assert_eq!(t.n_ranges, 1);
         assert_eq!(t.src, "revad");
@@ -5784,7 +5815,14 @@ mod fix414_revad_tests {
     #[test]
     fn f414_self_vad_empty_yields_empty() {
         let audio = vec![0.1f32; RATE];
-        let t = plan_self_vad_trim(&audio, Some(Vec::new()), 100, 0, "revad", true);
+        let t = plan_self_vad_trim(
+            &audio,
+            Some(Vec::new()),
+            100,
+            0,
+            "revad",
+            Some(&crate::transcription::speaker::VpOwner::Local),
+        );
         assert!(t.trimmed, "VAD 可用（即使无语音）⇒ trimmed");
         assert_eq!(t.n_ranges, 0);
         assert_eq!(t.src, "revad");
@@ -5796,7 +5834,14 @@ mod fix414_revad_tests {
     #[test]
     fn f414_self_vad_unavailable_whole_window() {
         let audio = vec![0.3f32; 1234];
-        let t = plan_self_vad_trim(&audio, None, 100, 0, "revad", true);
+        let t = plan_self_vad_trim(
+            &audio,
+            None,
+            100,
+            0,
+            "revad",
+            Some(&crate::transcription::speaker::VpOwner::Local),
+        );
         assert!(!t.trimmed, "VAD 不可用 ⇒ 未判定");
         assert_eq!(t.n_ranges, 0);
         assert_eq!(t.src, "none");
@@ -5831,14 +5876,28 @@ mod fix414_revad_tests {
         audio.extend(std::iter::repeat(0.0f32).take(pad_s));
         let ranges = vad.speech_ranges(&audio);
         assert!(!ranges.is_empty(), "wav 片段应检出语音区间");
-        let t = plan_self_vad_trim(&audio, Some(ranges), pad, 0, "revad", true);
+        let t = plan_self_vad_trim(
+            &audio,
+            Some(ranges),
+            pad,
+            0,
+            "revad",
+            Some(&crate::transcription::speaker::VpOwner::Local),
+        );
         assert!(t.trimmed && t.n_ranges >= 1, "复核有语音 ⇒ 剪静音");
         assert!(t.used.len() < audio.len(), "应剪掉补的静音");
         // 纯静音：复核无区间 ⇒ 空样本（不进模型）。
         let silence = vec![0.0f32; 5 * RATE];
         let sr = vad.speech_ranges(&silence);
         assert!(sr.is_empty(), "纯静音应无区间");
-        let t2 = plan_self_vad_trim(&silence, Some(sr), pad, 0, "revad", true);
+        let t2 = plan_self_vad_trim(
+            &silence,
+            Some(sr),
+            pad,
+            0,
+            "revad",
+            Some(&crate::transcription::speaker::VpOwner::Local),
+        );
         assert!(
             t2.trimmed && t2.n_ranges == 0 && t2.used.is_empty(),
             "纯静音 ⇒ 复核无区间 ⇒ 空样本"

@@ -265,10 +265,15 @@ pub fn build_run_task_message(
     });
     // 仅当 vocabulary 非空对象时注入
     // ASR-056: vocabulary 两族都支持即时热词（同 Inference 协议），权重口径一致
-    if let Some(obj) = vocabulary.as_object() {
-        if !obj.is_empty() {
-            parameters["vocabulary"] = vocabulary.clone();
-        }
+    // FLASH-P0-509：连自家识别服务时传**字符串数组**（完整词库、保序），非空数组同样注入；
+    // 阿里路径恒传对象（`load_wordbook_vocabulary`），行为不变。
+    let non_empty = match vocabulary {
+        serde_json::Value::Object(obj) => !obj.is_empty(),
+        serde_json::Value::Array(arr) => !arr.is_empty(),
+        _ => false,
+    };
+    if non_empty {
+        parameters["vocabulary"] = vocabulary.clone();
     }
     serde_json::json!({
         "header": {
@@ -1766,6 +1771,21 @@ mod tests {
     use super::*;
 
     // --- 消息构造 ---
+
+    /// FLASH-P0-509：连自家识别服务传字符串数组（完整词库、保序）⇒ 原样注入；空数组 / 空对象 ⇒ 省略。
+    #[test]
+    fn build_run_task_injects_word_array_in_order() {
+        let arr = serde_json::json!(["飞音", "LiveKit", "八方思见说"]);
+        let msg = build_run_task_message("t", "m", &arr, DEFAULT_MAX_SENTENCE_SILENCE, false);
+        assert_eq!(msg["payload"]["parameters"]["vocabulary"], arr);
+        for empty in [serde_json::json!([]), serde_json::json!({})] {
+            let msg = build_run_task_message("t", "m", &empty, DEFAULT_MAX_SENTENCE_SILENCE, false);
+            assert!(
+                msg["payload"]["parameters"].get("vocabulary").is_none(),
+                "{empty}"
+            );
+        }
+    }
 
     #[test]
     fn build_run_task_has_correct_schema() {

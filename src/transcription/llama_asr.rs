@@ -241,6 +241,8 @@ pub(crate) struct LlamaAsr {
     core: Arc<EngineCore>,
     /// `true` = 远程通道（slot）。
     remote: bool,
+    /// FLASH-P0-511：本通道用谁的声纹（本机 = 本机主人；远程 = 开通道的那个终端；`None` = 不做声纹）。
+    vp_owner: Option<super::speaker::VpOwner>,
     prio: Arc<LocalPriority>,
 }
 
@@ -414,6 +416,7 @@ impl LlamaAsr {
                     aligner: None,
                     core: Arc::new(EngineCore(ptr)),
                     remote: false,
+                    vp_owner: Some(super::speaker::VpOwner::Local),
                     prio: Arc::new(LocalPriority::default()),
                 });
             }
@@ -431,9 +434,14 @@ impl LlamaAsr {
     /// ASR-SERVER-491：远程通道数硬顶（与显存无关）。
     pub(crate) const SLOT_MAX: usize = SLOT_MAX;
 
-    /// ASR-SERVER-491：是否远程通道（= 远程会话：不做声纹、不学习，见 `transcribe_acc_ctx`）。
+    /// ASR-SERVER-491：是否远程通道（= 远程会话：不学习，见 `transcribe_acc_ctx`）。
     pub(crate) fn is_remote(&self) -> bool {
         self.remote
+    }
+
+    /// FLASH-P0-511：本通道的声纹归属（`None` = 本会话不做声纹剔除 / 注册）。
+    pub(crate) fn voiceprint_owner(&self) -> Option<&super::speaker::VpOwner> {
+        self.vp_owner.as_ref()
     }
 
     /// FORCED-ALIGN-456：挂载强制对齐器（只在本地实时调用；精确档批量识别不需要、不占显存）。
@@ -602,7 +610,8 @@ impl LlamaAsr {
 
     /// ASR-SERVER-491 B：为一个远程终端开一路推理通道（共用本引擎的权重 / 音频编码器 / 对齐器 / 本机优先闸门）。
     /// 可从任一通道调用；新通道总是远程角色。
-    pub(crate) fn create_slot(&self) -> Result<Self> {
+    /// FLASH-P0-511：`terminal_id` = 该终端的编号 ⇒ 本通道用该终端自己的声纹（编号不合规 ⇒ 不做声纹）。
+    pub(crate) fn create_slot(&self, terminal_id: &str) -> Result<Self> {
         let mut err = [0u8; 512];
         // SAFETY：core.0 为有效本体句柄；新通道持有 core 的 Arc ⇒ 本体必晚于它释放。
         let ptr = unsafe {
@@ -622,6 +631,7 @@ impl LlamaAsr {
             aligner: self.aligner.clone(),
             core: self.core.clone(),
             remote: true,
+            vp_owner: super::speaker::VpOwner::terminal(terminal_id),
             prio: self.prio.clone(),
         })
     }
