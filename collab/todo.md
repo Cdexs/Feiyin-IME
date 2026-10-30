@@ -129,7 +129,7 @@
 
 > ✅ **flashasr 进度（10-30）**：P1 建仓、P2a 服务能力、P2b 管理界面 + 安装脚本已完成（详见 FlashASR `collab/todo.md`）；连接码前缀改为 `flash-asr://`，P3 输入法按新前缀解析。下一步 P3 输入法变薄。
 > ✅ **FLASH-P1 建仓搬家已完成（10-29）**：识别服务代码已复制到 `D:\Workspace\CodeLab\FlashASR`（待办在其 `collab/todo.md`）。
-> 🔴 **过渡期（P1~P3）识别代码在本仓库与 flashasr 各有一份 —— 改识别 / 服务端代码必须两边同步**；P3 输入法删除识别代码后只剩 flashasr。
+> ✅ **FLASH-P3 输入法变薄已完成（10-30）**：识别代码只在 flashasr；本仓库只剩直连阿里 / 连 flashasr 客户端与规则类文字处理。**规则类文字处理（ITN / 同音 / 去口水 / 繁简 / 去句末标点）与 flashasr 各一份，改动要两边同步。** 剩 P4 出包（等 Gavin 指令；出包前先按 FlashASR `collab/cleanup-manifest.md` B 类清理编译输出）。
 
 ### 🔄 10-19 优化批（Gavin 10-19；**出包等 Gavin 指令，全部完成后一起出**）
 
