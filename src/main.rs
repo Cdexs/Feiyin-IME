@@ -11,16 +11,12 @@ mod hotkey; // Deprecated: use platform::HotkeyListener instead
 mod i18n;
 mod itn;
 mod llm;
-// ASR-SERVER-491 S1：本地实时精解窗口线程（本机 / 远程会话共用）。
-mod localrt_session;
 // 本地临时测试 / PoC 目录（不入库，见 .gitignore `/localtest`）；只在 `--features poc` 测试构建编译。
 #[cfg(all(test, feature = "poc"))]
 #[path = "../localtest/mod.rs"]
 mod localtest;
-// ASR-SERVER-491：识别服务内核侧（本机 IPC + 远程会话 + 看护网关进程）。
-#[allow(dead_code)]
-mod asr_service;
-// ASR-SERVER-491：内核 / 网关 / 设置界面共用的服务设置与终端配对数据（内核只用其中一部分）。
+// ASR-SERVER-491：连识别服务（flashasr）的配对数据（与设置界面共用同一份源码）。
+// FLASH-P3-A：本机当识别服务的内核侧（asr_service）已删除，识别服务在 flashasr。
 #[allow(dead_code)]
 mod asr_shared;
 mod platform; // MAC-001+003: Platform abstraction layer
@@ -34,14 +30,9 @@ mod usage_stats; // STATS-475：「我的」页使用统计
 mod version_check;
 mod wordbook;
 
-/// ASR-SERVER-491 S1：精解窗口线程已从本文件原样搬到 `localrt_session.rs`。读「本文件源码」的护栏测试一律读
-/// 这份合并源码（搬出部分 + 本文件）—— 内容与搬出前的本文件相同，只是搬出部分排在前面。
+/// 读「本文件源码」的护栏测试统一用这份常量（FLASH-P3-A：localrt_session.rs 已删，只剩本文件）。
 #[cfg(test)]
-const MAIN_RS_SRC: &str = concat!(
-    include_str!("localrt_session.rs"),
-    "\n",
-    include_str!("main.rs")
-);
+const MAIN_RS_SRC: &str = include_str!("main.rs");
 
 use anyhow::{anyhow, Result};
 use config::AppConfig;
@@ -51,7 +42,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::{
-    atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex, RwLock,
 };
 use std::thread::{self, JoinHandle};
@@ -122,10 +113,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassW, RemovePropW, SetForegroundWindow, SetLayeredWindowAttributes, SetMenuItemInfoW,
     SetPropW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowCaret, ShowWindow, TrackPopupMenu,
     TranslateMessage, UpdateLayeredWindow, CREATESTRUCTW, CW_USEDEFAULT, GUITHREADINFO,
-    GWLP_USERDATA, GWL_EXSTYLE, HMENU, IDC_ARROW, LWA_ALPHA, MENUITEMINFOW, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, MIIM_BITMAP, MSG, PM_REMOVE, PRF_CLIENT, PRF_ERASEBKGND, QS_ALLINPUT,
-    SM_CXSCREEN, SM_CXSMICON, SM_CYSCREEN, SM_CYSMICON, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNA, TPM_NONOTIFY, TPM_RETURNCMD,
+    GWLP_USERDATA, GWL_EXSTYLE, HMENU, IDC_ARROW, LWA_ALPHA, MENUITEMINFOW, MF_SEPARATOR,
+    MF_STRING, MIIM_BITMAP, MSG, PM_REMOVE, PRF_CLIENT, PRF_ERASEBKGND, QS_ALLINPUT, SM_CXSCREEN,
+    SM_CXSMICON, SM_CYSCREEN, SM_CYSMICON, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNA, TPM_NONOTIFY, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
     WM_LBUTTONUP, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCPAINT, WM_PAINT, WM_PRINTCLIENT, WM_TIMER,
     WNDCLASSW, WNDCLASS_STYLES, WS_CHILD, WS_CLIPCHILDREN, WS_EX_LAYERED, WS_EX_NOACTIVATE,
@@ -160,79 +151,8 @@ enum PipelineEvent {
     /// 产出源：transcription::NoSpeechError 类型化错误在 worker 边界下探转成本事件，
     /// 新增第三个产出源只需复用该类型，无需改任何分类器。
     NoSpeech,
-    /// LOCAL-RT-ENGINE-239-B: 本地流式档位双模型加载提示（Info 态，文案携带在 payload）。
-    Info(String),
-    /// LOCAL-RT-ENGINE-239-B: 本地流式档位模型缺失/加载失败 → 直接报错不降级（DEC-067 附则一）。
-    /// 与 Error 的区别：**不过 convert_to_friendly_error**，payload 即 i18n 文案原样上屏；
-    /// 「具体缺哪个模型」的内部原文只进日志（10-14 i18n 收口）。
-    ModelUnavailable(String),
-    /// LOCALRT-FIRSTCHAR-282: 本地流式**松手 flush 的最终预览全文**。
-    /// 🔴 专用通道：`STREAMING_STOPPED` + `should_ignore_streaming_text` 是本地/在线共用 latch，
-    /// 动它会影响在线档 + 可能复活 OVERLAY-043 闪烁 ⇒ **新开本事件，只有本地档发/只有本地档消费**，
-    /// 在线档代码路径结构上不变（它永不发也永不收本事件）。
-    /// 消费：在 `RecordingWithText` 态下展示收尾预览（不 auto-close、不改状态机）。
-    StreamingFinalPreview(String),
-    /// ACC-PREVIEW-REFLOW-325：本地实时档 **accuracy 分片的权威文本回灌预览**。
-    ///
-    /// 296/307 已证伪「在流式模型上补尾字」（`gained` 恒 0）；本单换层面：298 的 accuracy
-    /// 分片结果在录音过程中陆续回来，用它对**已完成片**的覆盖区做权威替换，尾字自然补齐。
-    ///
-    /// 字段：`generation` 代际（防串场，同 `StreamingText`）；`seg_index` 该片序号
-    /// （**单调键**，worker 按序产生、构造上严格递增）；`committed_len` 派发当刻浮层已显示
-    /// 文本的**字符数**（回灌边界）；`has_hole` 本片覆盖范围内是否含**无法填补**的 accuracy
-    /// 失败片（344-G 后：失败片一律用该片**流式文本填补**，故 `has_hole` 只在流式也为空等
-    /// 真·无法填补时为 true；含则**不得回灌**，否则会把带洞文本灌上浮层）；
-    /// `acc_text` 覆盖区内的权威文本（含流式填补，**连续无洞**）。
-    ///
-    /// 🔴 只有 LocalRealtime 会发；在线/批处理结构上永不发（同 282 专用通道先例）。
-    PreviewReflow {
-        generation: u64,
-        seg_index: usize,
-        /// FIX-PREVIEW-STALE-AND-COLLAPSE-375（A）：**滑窗权威快照自有**的单调序号（仅
-        /// `replace_all=true` 时给；发送方 = 滑窗 acc worker 的递增计数器，与 `OrderedReflow`
-        /// 的快照顺序一致）。过期判据用它而非 `seg_index` —— 后者是切片下标，**会重复**（窗口间
-        /// 并发 + 收尾 drain 可让多窗撞同一下标）⇒ 会把后到的完整文本误判成 stale。
-        reflow_seq: Option<usize>,
-        committed_len: usize,
-        /// FIX-NEARFIELD-BY-SEGMENT-AND-PREVIEW-389（D3）：`committed_len` 是否为**准确边界**。
-        /// `true` = 本窗**含该次派发的末片**（或收尾合并窗）⇒ `committed_len` 已覆盖整次派发；
-        /// `false` = **部分窗**（一次多片派发被延后末片前的中间窗）⇒ `committed_len` 按片样本占比
-        /// 折算，**不得**用 `ReflowCommit` 的整次派发边界（否则会截掉被延后末片那段流式文字）。
-        boundary_usable: bool,
-        has_hole: bool,
-        acc_text: String,
-        /// SLIDING-WINDOW-367：`true` ⇒ 消费端**整段替换**预览为 `acc_text`（滑窗权威全文，
-        /// 非前缀关系，不能按 `committed_len` 切；Gavin 方案「整体替换」）；`false` ⇒ 沿用 325
-        /// 原语义（替换前 `committed_len` 字符、保留流式尾巴）。**显式声明节点行为（DEC-066）**，
-        /// 不靠长度关系反推。
-        replace_all: bool,
-        /// FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382（3C）：本窗**解码完成**时刻
-        /// （worker `Instant::now()`，随解码结果一路带到事件）。消费端在**实际 `show_overlay` 渲染**时
-        /// 打 `decode_done→render_ms`（端到端口径：解完 → 浮层重画）。`None` = 老发送方 / 非滑窗路径。
-        decode_done_at: Option<std::time::Instant>,
-        /// LOCALRT-PREVIEW-HIDE-NONUSER-429：`true` ⇒ 本窗被声纹**整窗全剔**（421 full_drop），
-        /// 预览合成 = **已定稿权威文本** + `streaming[committed_len..]`（该段之后的流式尾巴），
-        /// **不含该段对应的流式文字**；`acc_text` 为空时也按此合成（不被 `compose_with_acc_for_gen`
-        /// 的「acc 空 ⇒ 原样 raw」规则短路）。其余场景恒 `false`（逐位不变）。
-        non_user_hide: bool,
-        /// ACC-ENGINE-LLAMACPP-452 ⑤：`true` ⇒ **精解半截结果**（流式回灌）。`committed_len` 为本窗替换边界上限；
-        /// 消费端按 `partial_reflow_boundary` 现算「精解写到原始预览的哪个位置」作本次替换边界，
-        /// 显示 = 半截精解 + 预览中尚未解到的部分（不回缩）；不走整窗回灌的边界配对。
-        partial: bool,
-        /// ASR-SERVER-491 S9：与 `acc_text` 逐字对应的时间（**虚拟时间轴**秒，见 `char_times::SliceMap`）。
-        /// 只有远程会话填（本机恒 `None`，浮层不读）。
-        acc_times: Option<Vec<Option<transcription::char_times::CharTime>>>,
-    },
-    /// LOCALRT-SEAM-337（自适应定界）：本片边界冻结通知。
-    ///
-    /// `committed_len = Some(n)`（分支 a 文本停止增长 / c 硬上限）⇒ 用该片 pending `acc_text`
-    /// 覆盖流式显示前 n 字符并渲染；`None`（分支 b 有声恢复）⇒ 该片**不回灌**，保持纯流式。
-    /// 只有本地实时档会发（在线/批处理结构上不发）。
-    ReflowCommit {
-        generation: u64,
-        seg_index: usize,
-        committed_len: Option<usize>,
-    },
+    // FLASH-P3-A：本地实时专用事件（Info 加载提示 / ModelUnavailable / StreamingFinalPreview /
+    // PreviewReflow / ReflowCommit）随本地识别引擎删除。
 }
 // LATENCY-001: send event and immediately wake controller via PostMessageW
 fn send_event(tx: &crossbeam_channel::Sender<PipelineEvent>, event: PipelineEvent) {
@@ -252,12 +172,8 @@ fn send_event(tx: &crossbeam_channel::Sender<PipelineEvent>, event: PipelineEven
 enum AppCommand {
     OpenSettings,
     Exit,
-    /// ASR-SERVER-491 S7：托盘「启动 / 停止识别服务」。
-    ToggleAsrService,
-    ShowTrayMenu {
-        x: i32,
-        y: i32,
-    },
+    // FLASH-P3-A：托盘「启动 / 停止识别服务」随本机识别服务（asr_service）删除。
+    ShowTrayMenu { x: i32, y: i32 },
 }
 #[derive(Debug)]
 // MACOS-P4-NEUTRAL-002: 去 cfg——run_pipeline_core 已中立，worker 线程需在 macOS 起来。
@@ -337,65 +253,6 @@ static STREAMING_STOPPED: AtomicBool = AtomicBool::new(false);
 // which is orthogonal to generation (cross-session identity). The two gates AND together.
 #[cfg(target_os = "windows")]
 static STREAMING_GENERATION: AtomicU64 = AtomicU64::new(0);
-// UI-REC-472：当前生效的识别引擎是否为「本地实时」且已加载完（worker 线程单写者：启动加载后、
-// 每次重载开始 / 落地时更新）。Gavin 10-03「正在显示模型加载提示窗口代表模型正在加载中，
-// 就先不要显示录音预览窗口，等模型加载完毕再显示」⇒ 控制器开录时：配置为本地实时但未就绪 ⇒
-// 只给加载提示、不弹录音窗；就绪后由 StreamingIdle 显示「请说话...」窗。
-static LOCALRT_ENGINE_READY: AtomicBool = AtomicBool::new(false);
-
-/// UI-REC-472：按当前引擎更新 [`LOCALRT_ENGINE_READY`]（worker 在引擎变化点调用）。
-fn publish_localrt_ready(transcriber: Option<&transcription::Transcriber>) {
-    let ready =
-        transcriber.is_some_and(|t| t.asr_model() == transcription::AsrModel::LocalRealtime);
-    LOCALRT_ENGINE_READY.store(ready, Ordering::Release);
-}
-// ACC-PREVIEW-REFLOW-325：本地实时档回灌的 **per-generation** 状态（**controller 线程单写者**：
-// 二者只在消费循环内读写；`RecordingStarted` 重置，`PreviewReflow` 处理时读/写 —— 同一线程，
-// 故无竞态，无需原子以外同步）。
-// - `ACC_REFLOW_LAST_SEG`：已应用回灌的最大 `seg_index`（**单调键 = seg_index**，不是
-//   committed_len —— 后者是长度，句边界丢影子/punctuation 重打可使其合法回落，见 325 端测日志）。
-// - `ACC_REFLOW_EDIT_LATCH`：本次录音内**只要进过一次编辑态**即上闩，后续回灌一律停到下一代
-//   （防「编辑退出后迟到的回灌把用户刚打的字冲掉」）。
-#[cfg(target_os = "windows")]
-static ACC_REFLOW_LAST_SEG: AtomicI64 = AtomicI64::new(-1);
-/// FIX-PREVIEW-STALE-AND-COLLAPSE-375（A）：`replace_all=true` 路径**专用**的单调键 = 滑窗快照的
-/// `reflow_seq`（`seg_index` 在滑窗路径会重复，见事件字段注释）。两条路径各用一个计数器，
-/// 互不干扰 ⇒ 老逐片路径行为逐位不变。
-#[cfg(target_os = "windows")]
-static ACC_REFLOW_LAST_REFLOW_SEQ: AtomicI64 = AtomicI64::new(-1);
-#[cfg(target_os = "windows")]
-static ACC_REFLOW_EDIT_LATCH: AtomicBool = AtomicBool::new(false);
-// ACC-REFLOW-PERSIST-329：本代已确定的**权威前缀**状态 `(generation, acc_text, committed_len)`。
-// - 只在 `PreviewReflow`(Applied) 时写（唯一发送点 = 本地实时档）⇒ 在线/批处理恒 None；
-// - `RecordingStarted` 清空；流式渲染时按 gen 匹配取用；
-// - **闩锁之后保留**（只停止更新，不丢弃）⇒ 画面不倒退。
-// - controller 单线程读写；`Mutex` 仅因是 `static`（同 `last_streaming_text` 先例）。
-#[cfg(target_os = "windows")]
-static ACC_REFLOW_STATE: Mutex<Option<(u64, String, usize)>> = Mutex::new(None);
-// LOCALRT-SEAM-337（自适应定界）：两个 pending 槽，**跨事件配对**（acc 文本与边界到达顺序不定）：
-// - `ACC_REFLOW_ACC`   = `(generation, seg_index, acc_text, replace_all)`（由 PreviewReflow 写）；
-// - `ACC_REFLOW_BOUND` = `(generation, seg_index, committed_len: Option<usize>)`（由 ReflowCommit 写）。
-// 两者 seg/gen 匹配时 `try_resolve_reflow` 合成并渲染（`Some`）/ 作废（`None`），随后清空两槽。
-// `RecordingStarted` 清空。
-#[cfg(target_os = "windows")]
-static ACC_REFLOW_ACC: Mutex<Option<(u64, usize, String, bool)>> = Mutex::new(None);
-#[cfg(target_os = "windows")]
-static ACC_REFLOW_BOUND: Mutex<Option<(u64, usize, Option<usize>)>> = Mutex::new(None);
-/// FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382（3A）：`replace_all` 回灌的快速路径状态机
-///（最新全文 / `(gen,seg)` 边界小 map / 最新已渲染 seg）。按代清空。
-#[cfg(target_os = "windows")]
-static ACC_REFLOW_FAST: Mutex<ReflowFastState> = Mutex::new(ReflowFastState {
-    latest: None,
-    bounds: Vec::new(),
-    rendered: None,
-});
-/// FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382（问题2 防闪回）：本代浮层**已进入处理态**。
-/// controller **处理到本代 `Processing` 事件时**由 controller 线程置位（按通道实际顺序：排在
-/// Processing 之前入队的回灌照常渲染，之后的只更新状态、不重画）⇒ 提前发 Processing 后，acc
-/// 尾窗的迟到回灌不会把浮层拉回预览态。`RecordingStarted` 复位。只作用于本地实时档
-///（只有它会发 `PreviewReflow`）。
-#[cfg(target_os = "windows")]
-static ACC_REFLOW_SUPPRESS: AtomicBool = AtomicBool::new(false);
 /// FIX-PREVIEW-HARVEST-380（B）：controller 收到 `HotkeyEvent::Stop` 当刻的
 /// `GetTickCount64()` tick，供 worker 走到 `Injection completed` 时算 `stop_to_inject_ms`
 ///（松键 → 最终上屏）。`0` = 本代没有 hotkey stop（如 VAD 自动停），注入完成侧据此不打点。
@@ -435,8 +292,6 @@ const WM_APP_PIPELINE_EVENT: u32 = WM_APP + 4;
 const MENU_CMD_SETTINGS: u32 = 1001;
 #[cfg(target_os = "windows")]
 const MENU_CMD_EXIT: u32 = 1002;
-#[cfg(target_os = "windows")]
-const MENU_CMD_ASR_TOGGLE: u32 = 1003;
 #[cfg(target_os = "windows")]
 static MENU_VISIBLE: AtomicBool = AtomicBool::new(false);
 // ASR-074-GUARD: process-wide count of audio chunks dropped because the ASR consumer
@@ -533,7 +388,7 @@ fn create_menu_item_bitmap(size: i32, rgba: &[u8]) -> Option<HBITMAP> {
     Some(hbmp)
 }
 #[cfg(target_os = "windows")]
-fn attach_menu_icons(menu: HMENU, asr_running: bool) -> Vec<HBITMAP> {
+fn attach_menu_icons(menu: HMENU) -> Vec<HBITMAP> {
     // 尺寸取系统小图标规格（SM_CXSMICON 走已启用的 WindowsAndMessaging，
     // 不用 GetDpiForWindow —— 需 Win32_UI_HiDpi feature，红线禁改 Cargo.toml）。
     let size = unsafe {
@@ -541,13 +396,8 @@ fn attach_menu_icons(menu: HMENU, asr_running: bool) -> Vec<HBITMAP> {
             .min(GetSystemMetrics(SM_CYSMICON))
             .clamp(16, 64)
     };
-    let mut attached = Vec::with_capacity(3);
+    let mut attached = Vec::with_capacity(2);
     for (cmd_id, rgba) in [
-        // TRAY-ICON-500：识别服务项 —— 未运行 = 播放三角，运行中 = 停止方块（跟文案走）。
-        (
-            MENU_CMD_ASR_TOGGLE,
-            ui::menu_icons::service_icon_rgba(size as u32, asr_running),
-        ),
         (
             MENU_CMD_SETTINGS,
             ui::menu_icons::settings_icon_rgba(size as u32),
@@ -579,7 +429,7 @@ fn attach_menu_icons(menu: HMENU, asr_running: bool) -> Vec<HBITMAP> {
     }
     // FIX-164 Part C: 成功路径只记一条 debug（不刷屏），含挂载数量与尺寸供 debug.log 核对
     log::debug!(
-        "menu icon: attached {}/3 bitmaps at {}px (settings={}, exit={})",
+        "menu icon: attached {}/2 bitmaps at {}px (settings={}, exit={})",
         attached.len(),
         size,
         MENU_CMD_SETTINGS,
@@ -597,22 +447,10 @@ fn show_tray_popup_menu(
     let (settings_label, exit_label) = tray_menu_labels(ui_language);
     let settings_w = encode_wide(settings_label);
     let exit_w = encode_wide(exit_label);
-    // ASR-SERVER-491 S7（§16.7）：识别服务单项，文案随总开关切换，未就绪置灰。
-    let (asr_label, asr_enabled) = asr_service::supervisor::tray_item(ui_language);
-    let asr_w = encode_wide(asr_label);
+    // FLASH-P3-A：「启动 / 停止识别服务」菜单项随本机识别服务删除（识别服务在 flashasr，有自己的托盘）。
     unsafe {
         let menu = CreatePopupMenu().ok()?;
         MENU_VISIBLE.store(true, Ordering::SeqCst);
-        let _ = AppendMenuW(
-            menu,
-            if asr_enabled {
-                MF_STRING
-            } else {
-                MF_STRING | MF_GRAYED
-            },
-            MENU_CMD_ASR_TOGGLE as usize,
-            PCWSTR(asr_w.as_ptr()),
-        );
         let _ = AppendMenuW(
             menu,
             MF_STRING,
@@ -626,14 +464,11 @@ fn show_tray_popup_menu(
             MENU_CMD_EXIT as usize,
             PCWSTR(exit_w.as_ptr()),
         );
-        // TRAY-ICON-158：设置 / 退出挂品牌橙图标（TRAY-ICON-500 起识别服务项也挂）。句柄现建现删，不缓存进
+        // TRAY-ICON-158：设置 / 退出挂品牌橙图标。句柄现建现删，不缓存进
         // thread_local/OnceLock（[D2D-HANG-001] 教训：跨线程/退出期释放句柄自找
         // 麻烦）；DeleteObject 必须在 DestroyMenu 之后——TrackPopupMenu 模态期间
         // 菜单还在读这些位图，提前删会让图标空白。
-        let menu_bitmaps = attach_menu_icons(
-            menu,
-            asr_service::supervisor::tray_item_is_stop(asr_label, ui_language),
-        );
+        let menu_bitmaps = attach_menu_icons(menu);
         let _ = SetForegroundWindow(controller_hwnd);
         let cmd = TrackPopupMenu(
             menu,
@@ -653,7 +488,6 @@ fn show_tray_popup_menu(
         match cmd_id {
             MENU_CMD_SETTINGS => Some(AppCommand::OpenSettings),
             MENU_CMD_EXIT => Some(AppCommand::Exit),
-            MENU_CMD_ASR_TOGGLE => Some(AppCommand::ToggleAsrService),
             _ => None,
         }
     }
@@ -7107,8 +6941,6 @@ fn process_controller_events(
     cancel_signal: &Arc<AtomicBool>,
     is_recording: &Arc<AtomicBool>,
     last_streaming_text: &Arc<Mutex<Option<String>>>,
-    // FIX-REFLOW-RAW-BASE-420：合成前的原始 `StreamingText`（带 generation），回灌渲染底稿。
-    last_raw_streaming_text: &Arc<Mutex<Option<(u64, String)>>>,
 ) -> Result<bool> {
     maybe_refresh_settings_child(settings_child, runtime_config);
     while let Ok(command) = app_cmd_rx.try_recv() {
@@ -7135,14 +6967,11 @@ fn process_controller_events(
                 log::info!("Exit command received, returning true");
                 return Ok(true);
             }
-            AppCommand::ToggleAsrService => asr_service::supervisor::toggle_from_tray(),
             AppCommand::ShowTrayMenu { x, y } => {
                 let ui_language = clone_runtime_config(runtime_config).ui_language;
                 if let Some(next_cmd) = show_tray_popup_menu(controller_hwnd, x, y, ui_language) {
                     let should_exit = matches!(next_cmd, AppCommand::Exit);
-                    if let AppCommand::ToggleAsrService = next_cmd {
-                        asr_service::supervisor::toggle_from_tray();
-                    } else if !should_exit {
+                    if !should_exit {
                         // route settings through the same command path
                         if let AppCommand::OpenSettings = next_cmd {
                             if settings_child
@@ -7232,55 +7061,14 @@ fn process_controller_events(
                     // HOTKEY-LATENCY-FIX-001: 立即显示录音 overlay，不等 RecordingStarted 事件
                     let config = clone_runtime_config(runtime_config);
                     let target_hwnd = hwnd.0 as usize;
-                    // OVERLAY-051-E: decide whether this is online streaming ASR. We cannot read
-                    // the worker's is_streaming_asr flag yet, so infer from configured model.
-                    // ASR-056: 用 is_online_streaming() 收敛判据（QwenAudioOnline | FunAsrRealtime）
-                    let desired_model =
-                        transcription::AsrModel::from_config(&config.audio.asr_model);
-                    let is_local_realtime = desired_model == transcription::AsrModel::LocalRealtime;
-                    if is_local_realtime && !LOCALRT_ENGINE_READY.load(Ordering::Acquire) {
-                        // UI-REC-472：本地实时模型加载中 ⇒ 只给加载提示、不弹录音窗（Gavin 10-03）。
-                        // 不自动关：加载完由 StreamingIdle 换成「请说话...」窗；等不到则 worker 发 Info / 报错替换。
-                        let hint = OverlayStatus::Info(
-                            i18n::get(config.ui_language)
-                                .local_realtime_loading_hint
-                                .to_string(),
-                        );
-                        let (pos, size) = overlay_geometry(&hint, overlay_handle.overlay_hwnd);
-                        overlay_handle.send(OverlayCommand::Show(OverlayRequest {
-                            status: hint,
-                            pos: Some(pos),
-                            size,
-                            opacity: 0.9,
-                            ui_language: config.ui_language,
-                            auto_close_ms: 0,
-                            target_hwnd,
-                        }));
-                    } else if desired_model.is_online_streaming() || is_local_realtime {
-                        // UI-REC-472：本地实时与在线流式一样，按热键即显示「请说话...」窗，不显示波纹动效。
-                        show_overlay_streaming_idle(
-                            overlay_handle,
-                            config.audio.overlay_opacity.clamp(0.1, 1.0),
-                            config.ui_language,
-                            target_hwnd,
-                        );
-                    } else {
-                        // OVERLAY-054-B: use overlay_geometry for the initial Recording position so the
-                        // first Show matches the later RecordingStarted Show; avoids a flash at (0,0).
-                        let (pos, size) = overlay_geometry(
-                            &OverlayStatus::Recording,
-                            overlay_handle.overlay_hwnd,
-                        );
-                        overlay_handle.send(OverlayCommand::Show(OverlayRequest {
-                            status: OverlayStatus::Recording,
-                            pos: Some(pos),
-                            size,
-                            opacity: config.audio.overlay_opacity.clamp(0.1, 1.0),
-                            ui_language: config.ui_language,
-                            auto_close_ms: 0,
-                            target_hwnd,
-                        }));
-                    }
+                    // OVERLAY-051-E / FLASH-P3-A：两条识别路径（直连阿里 / 连识别服务）都是在线流式 ⇒
+                    // 按热键即显示「请说话...」窗。本地实时的「模型加载中不弹录音窗」门随本地引擎删除。
+                    show_overlay_streaming_idle(
+                        overlay_handle,
+                        config.audio.overlay_opacity.clamp(0.1, 1.0),
+                        config.ui_language,
+                        target_hwnd,
+                    );
                     log::info!(
                         "[Latency] overlay shown at +{:.1}ms",
                         t_hotkey.elapsed().as_secs_f64() * 1000.0
@@ -7326,25 +7114,17 @@ fn process_controller_events(
                 OVERLAY_EDITING.store(false, Ordering::Release);
                 if is_recording.load(Ordering::Acquire) {
                     let config = clone_runtime_config(runtime_config);
-                    // LOCALRT-FIRSTCHAR-282：本地流式档**不在此处切 FallingToProcessing**——
-                    // 留在 RecordingWithText，等 flush 的 `StreamingFinalPreview` 收尾（完整预览）
-                    // 与 worker 的 Processing 再切换，避免预览尾段被 `STREAMING_STOPPED` latch 丢掉。
-                    // 在线档 / performance / accuracy 走原路，行为逐位不变。
-                    let is_local_realtime =
-                        transcription::AsrModel::from_config(&config.audio.asr_model)
-                            == transcription::AsrModel::LocalRealtime;
-                    if !is_local_realtime {
-                        show_overlay(
-                            overlay_handle,
-                            config.audio.overlay_opacity,
-                            config.ui_language,
-                            OverlayStatus::FallingToProcessing {
-                                message: i18n::get(config.ui_language)
-                                    .overlay_transcribing
-                                    .to_string(),
-                            },
-                        );
-                    }
+                    // FLASH-P3-A：本地实时「留在 RecordingWithText 等收尾预览」的例外随本地引擎删除。
+                    show_overlay(
+                        overlay_handle,
+                        config.audio.overlay_opacity,
+                        config.ui_language,
+                        OverlayStatus::FallingToProcessing {
+                            message: i18n::get(config.ui_language)
+                                .overlay_transcribing
+                                .to_string(),
+                        },
+                    );
                 }
             }
             HotkeyEvent::CancelStop => {
@@ -7379,44 +7159,13 @@ fn process_controller_events(
                 // New recording session resets any stale editing state from a previous session.
                 OVERLAY_EDITING.store(false, Ordering::Release);
                 STREAMING_STOPPED.store(false, Ordering::Release);
-                // 325：回灌状态按代重置（新代重新开始回灌、编辑闩锁解除）。
-                ACC_REFLOW_LAST_SEG.store(-1, Ordering::Release);
-                // 375-A：滑窗路径的单调键计数器同样按代重置。
-                ACC_REFLOW_LAST_REFLOW_SEQ.store(-1, Ordering::Release);
-                ACC_REFLOW_EDIT_LATCH.store(false, Ordering::Release);
-                // 329（边界 3）：权威前缀状态 per-gen，随录音开始清空，旧代残留不得污染新录音。
-                if let Ok(mut st) = ACC_REFLOW_STATE.lock() {
-                    *st = None;
-                }
-                // 337：两 pending 槽（acc / boundary）同样 per-gen 清空。
-                if let Ok(mut slot) = ACC_REFLOW_ACC.lock() {
-                    *slot = None;
-                }
-                if let Ok(mut slot) = ACC_REFLOW_BOUND.lock() {
-                    *slot = None;
-                }
-                // 382：快速路径状态机 + 处理态抑制闩锁按代清空。
-                if let Ok(mut st) = ACC_REFLOW_FAST.lock() {
-                    st.clear();
-                }
-                ACC_REFLOW_SUPPRESS.store(false, Ordering::Release);
                 set_tray_state(tray, TrayState::Recording, ui_language);
-                if transcription::AsrModel::from_config(&config.audio.asr_model)
-                    == transcription::AsrModel::LocalRealtime
-                {
-                    // UI-REC-472：本地实时不显示波纹动效窗，直接「请说话...」窗；模型加载中则什么都不弹
-                    //（保留加载提示，加载完由 StreamingIdle 显示）。
-                    if LOCALRT_ENGINE_READY.load(Ordering::Acquire) {
-                        show_overlay_streaming_idle(overlay_handle, opacity, ui_language, 0);
-                    }
-                } else {
-                    show_overlay(
-                        overlay_handle,
-                        opacity,
-                        ui_language,
-                        OverlayStatus::Recording,
-                    );
-                }
+                show_overlay(
+                    overlay_handle,
+                    opacity,
+                    ui_language,
+                    OverlayStatus::Recording,
+                );
             }
             PipelineEvent::StreamingIdle => {
                 // OVERLAY-051-E: worker confirmed online streaming ASR is waiting for first text;
@@ -7438,18 +7187,8 @@ fn process_controller_events(
                     );
                     continue;
                 }
-                // FIX-REFLOW-RAW-BASE-420：存**合成前**的原始流式文本（带 gen）——回灌渲染的底稿。
-                // 🔴 与 `last_streaming_text`（镜像 = 所显的**合成**文本）**分开**：底稿坐标必须与
-                //    `committed_len`（原始流式字符坐标）同源。写在 043 门闩之前，数据不被渲染抑制。
-                if let Ok(mut raw) = last_raw_streaming_text.lock() {
-                    *raw = Some((gen, text.clone()));
-                }
-                // ACC-REFLOW-PERSIST-329：渲染/镜像前先合成权威前缀（本地档），在线/批处理恒 raw。
-                // 🔴 早写在 043 门闩**之前**、内容改为 `compose(raw)`（不是 raw）——
-                //    053-B「渲染抑制 ≠ 数据抑制」契约不变（迟来包仍进镜像、不饿死学习），
-                //    只是写进去的已是带权威前缀的版本（见 053-B 测试 + ACC-REFLOW-PERSIST-329）。
-                let acc_state = ACC_REFLOW_STATE.lock().ok().and_then(|g| g.clone());
-                let composed = compose_with_acc_for_gen(acc_state.as_ref(), gen, &text);
+                // FLASH-P3-A：本地实时「精解回灌合成」删除 ⇒ 镜像 / 渲染直接用流式原文。
+                let composed = text.clone();
                 if let Ok(mut mirror) = last_streaming_text.lock() {
                     *mirror = Some(composed.clone());
                 }
@@ -7475,321 +7214,14 @@ fn process_controller_events(
                 } else {
                     // OVERLAY-051-G: store word timings for timestamp-driven reveal
                     overlay_handle.send(OverlayCommand::UpdateWordTimings(words));
-                    // STREAM-SV-463：末尾未定字数（浅色）。按「末尾字数」传 ⇒ 前缀被精解回灌合成替换也不错位。
+                    // STREAM-SV-463：末尾未定字数（浅色）。FLASH-P3-A 起两条在线路径恒 0（浮层画法保留）。
                     overlay_handle.send(OverlayCommand::UpdateTentativeTail(tentative));
-                    if log::log_enabled!(log::Level::Debug) {
-                        let committed = acc_state
-                            .as_ref()
-                            .filter(|(g, _, _)| *g == gen)
-                            .map(|(_, _, c)| *c)
-                            .unwrap_or(0);
-                        log::debug!(
-                            "[LocalRT-DBG-325] streaming render: gen={} raw_len={} committed_len={} display_len={} has_acc_prefix={}",
-                            gen,
-                            text.chars().count(),
-                            committed,
-                            composed.chars().count(),
-                            composed != text
-                        );
-                    }
                     show_overlay(
                         overlay_handle,
                         opacity,
                         ui_language,
                         OverlayStatus::RecordingWithText { text: composed },
                     );
-                }
-            }
-            // LOCALRT-FIRSTCHAR-282：本地流式松手 flush 的最终预览全文。
-            // 🔴 只有本地档会发本事件 ⇒ 在线档结构上永不进入（`STREAMING_STOPPED` latch 未动、
-            // 在线行为逐位不变）。在 `RecordingWithText` 态下展示收尾预览：更新文本、不 auto-close、
-            // 不切状态机；随后 worker 的 `Processing` 事件把 overlay 切到「识别处理中」
-            // （无闪烁、不延迟最终文本）。
-            PipelineEvent::StreamingFinalPreview(text) => {
-                if OVERLAY_EDITING.load(Ordering::Acquire) {
-                    log::debug!("LOCALRT-282: final preview skipped while editing");
-                } else {
-                    // 329（边界 2）：收尾也用**权威合成**（acc 前缀 + 流式收尾全文尾巴）⇒
-                    // 尾字修复在收尾这一刻同样生效。本事件只有本地档发 ⇒ 在线无影响。
-                    let gen = STREAMING_GENERATION.load(Ordering::Acquire);
-                    let acc_state = ACC_REFLOW_STATE.lock().ok().and_then(|g| g.clone());
-                    let display = compose_with_acc_for_gen(acc_state.as_ref(), gen, &text);
-                    // STREAM-SV-463：录音已结束 ⇒ 全部已定，浅色尾巴清零。
-                    overlay_handle.send(OverlayCommand::UpdateTentativeTail(0));
-                    // 镜像恒 = 所显（缺陷 B）。
-                    if let Ok(mut mirror) = last_streaming_text.lock() {
-                        *mirror = Some(display.clone());
-                    }
-                    show_overlay(
-                        overlay_handle,
-                        opacity,
-                        ui_language,
-                        OverlayStatus::RecordingWithText { text: display },
-                    );
-                }
-            }
-            PipelineEvent::PreviewReflow {
-                generation,
-                seg_index,
-                reflow_seq,
-                committed_len,
-                boundary_usable,
-                has_hole,
-                acc_text,
-                replace_all,
-                decode_done_at,
-                non_user_hide,
-                partial,
-                acc_times: _,
-            } => {
-                // 325：本地实时档 accuracy 分片权威文本回灌（**只有本地档会发本事件**）。
-                // 代际门与 StreamingText 同源：陈旧 session 的回灌不得改本 session 浮层。
-                let current_gen = STREAMING_GENERATION.load(Ordering::Acquire);
-                if generation != current_gen {
-                    log::debug!(
-                        "325: dropping PreviewReflow from stale session (gen {} != current {})",
-                        generation,
-                        current_gen
-                    );
-                    continue;
-                }
-                // 🔴 controller 线程单写者：这三个状态只在消费循环内读写，无竞态。
-                // 342-A：停止语义三态 —— 取消（cancel_signal）/ 编辑（OVERLAY_EDITING）/
-                // 松手完成；**不再用 STREAMING_STOPPED 一刀切**（松手完成也要回灌）。
-                let edit_latched = ACC_REFLOW_EDIT_LATCH.load(Ordering::Acquire);
-                let editing = OVERLAY_EDITING.load(Ordering::Acquire);
-                let cancelled = cancel_signal.load(Ordering::Acquire);
-                let stop_state = reflow_stop_state(cancelled, editing);
-                // 375-A：过期判据的单调键按路径选 —— `replace_all=true`（滑窗权威全文）用
-                // `reflow_seq`（快照自有序号，严格递增）；`replace_all=false` 仍用 `seg_index`
-                // （逐片严格递增）⇒ 老路径行为逐位不变。
-                let key = reflow_monotonic_key(replace_all, seg_index, reflow_seq);
-                let last_key = if replace_all {
-                    ACC_REFLOW_LAST_REFLOW_SEQ.load(Ordering::Acquire)
-                } else {
-                    ACC_REFLOW_LAST_SEG.load(Ordering::Acquire)
-                };
-                let action = reflow_action(
-                    edit_latched,
-                    stop_state,
-                    key,
-                    last_key,
-                    has_hole,
-                    acc_text.is_empty(),
-                );
-                // 337：PreviewReflow 不再直接渲染 ⇒ preview_len 恒 0（实际渲染在 ReflowCommit 臂）。
-                let preview_len = 0usize;
-                if action == ReflowAction::Applied {
-                    if partial {
-                        // ACC-ENGINE-LLAMACPP-452 ⑤：流式回灌 —— 边界现算（精解写到原始预览的位置），
-                        // 显示 = 半截精解 + 预览中尚未解到的部分（不回缩）；Processing 已开始 ⇒ 不画。
-                        if !ACC_REFLOW_SUPPRESS.load(Ordering::Acquire) {
-                            let (prev_acc, prev_len) = ACC_REFLOW_STATE
-                                .lock()
-                                .ok()
-                                .and_then(|st| st.clone())
-                                .filter(|(g, _, _)| *g == generation)
-                                .map(|(_, a, l)| (a, l))
-                                .unwrap_or_default();
-                            let raw = last_raw_streaming_text
-                                .lock()
-                                .ok()
-                                .and_then(|m| m.clone())
-                                .filter(|(g, _)| *g == generation)
-                                .map(|(_, t)| t)
-                                .unwrap_or_default();
-                            if let Some(b) = partial_reflow_boundary(
-                                &prev_acc,
-                                prev_len,
-                                &acc_text,
-                                &raw,
-                                committed_len,
-                            )
-                            // 最后一道：新显示比当前短 > 容差 ⇒ 跳过本次（回放：边界估计偏差致 3% 次回缩 3~5 字）。
-                            // 少 ≤ 容差字属正常内容修正（精解去掉预览里的口水词）。
-                            .filter(|&b| {
-                                let cur = last_streaming_text
-                                    .lock()
-                                    .ok()
-                                    .and_then(|m| m.clone())
-                                    .map_or(0, |s| s.chars().count());
-                                reflow_preview(&acc_text, &raw, b).chars().count()
-                                    + PARTIAL_SHRINK_TOLERANCE
-                                    >= cur
-                            }) {
-                                ACC_REFLOW_LAST_REFLOW_SEQ.store(key, Ordering::Release);
-                                if let Ok(mut st) = ACC_REFLOW_FAST.lock() {
-                                    st.note_partial(generation, seg_index);
-                                }
-                                render_authoritative_reflow(
-                                    overlay_handle,
-                                    opacity,
-                                    ui_language,
-                                    last_streaming_text,
-                                    last_raw_streaming_text,
-                                    generation,
-                                    seg_index,
-                                    &acc_text,
-                                    b,
-                                    false,
-                                    None,
-                                    false,
-                                );
-                            }
-                        }
-                    } else if replace_all {
-                        // 382（3A）：**立即渲染** —— 不再等同片 ReflowCommit 边界配对（唯一发送点恒
-                        // replace_all，等边界只会白白延迟）。已知边界 ⇒ 用准确的；未知 ⇒ 用派发当刻
-                        // `committed_len` 先渲染，边界后到且本 seg 仍是最新已渲染 ⇒ 再用准确值重渲一次。
-                        ACC_REFLOW_LAST_REFLOW_SEQ.store(key, Ordering::Release);
-                        // 382（防闪回）：Processing 已开始 ⇒ 只更新状态、不重画浮层。
-                        let suppressed = ACC_REFLOW_SUPPRESS.load(Ordering::Acquire);
-                        let outcome = match ACC_REFLOW_FAST.lock() {
-                            Ok(mut st) => st.on_text(
-                                generation,
-                                seg_index,
-                                acc_text.clone(),
-                                committed_len,
-                                boundary_usable,
-                                suppressed,
-                            ),
-                            Err(_) => ReflowFastOutcome::None,
-                        };
-                        if let ReflowFastOutcome::Apply {
-                            text,
-                            committed_len: len,
-                            accurate,
-                            render,
-                        } = outcome
-                        {
-                            if render {
-                                render_authoritative_reflow(
-                                    overlay_handle,
-                                    opacity,
-                                    ui_language,
-                                    last_streaming_text,
-                                    last_raw_streaming_text,
-                                    generation,
-                                    seg_index,
-                                    &text,
-                                    len,
-                                    accurate,
-                                    decode_done_at,
-                                    non_user_hide,
-                                );
-                            } else {
-                                set_acc_reflow_state_only(generation, &text, len);
-                                if log::log_enabled!(log::Level::Debug) {
-                                    log::debug!(
-                                        "[LocalRT-DBG-382] reflow suppressed after processing: seg={} acc_len={}",
-                                        seg_index,
-                                        text.chars().count()
-                                    );
-                                }
-                            }
-                        }
-                    } else {
-                        // 老逐片路径（382 起已无发送方）：保持逐位不变。
-                        ACC_REFLOW_LAST_SEG.store(key, Ordering::Release);
-                        if let Ok(mut slot) = ACC_REFLOW_ACC.lock() {
-                            *slot = Some((generation, seg_index, acc_text.clone(), replace_all));
-                        }
-                        if log::log_enabled!(log::Level::Debug) {
-                            log::debug!(
-                                "[LocalRT-DBG-337] reflow acc ready: seg={} acc_len={} (等 boundary)",
-                                seg_index,
-                                acc_text.chars().count()
-                            );
-                        }
-                        try_resolve_reflow(
-                            overlay_handle,
-                            opacity,
-                            ui_language,
-                            last_streaming_text,
-                            last_raw_streaming_text,
-                        );
-                    }
-                } else if action == ReflowAction::SkippedEditing {
-                    // 编辑态一旦出现（含已退出）⇒ 本代永久上闩，后续回灌不再改用户文本。
-                    ACC_REFLOW_EDIT_LATCH.store(true, Ordering::Release);
-                }
-                if log::log_enabled!(log::Level::Debug) {
-                    let action_str = match action {
-                        // 337：Applied 现在只表示「登记 pending」，渲染推迟到 ReflowCommit。
-                        ReflowAction::Applied => "pending",
-                        ReflowAction::SkippedEditing => "skipped-editing",
-                        ReflowAction::SkippedCancel => "skipped-cancel",
-                        ReflowAction::SkippedStale => "skipped-stale",
-                        ReflowAction::SkippedHole => "skipped-hole",
-                        ReflowAction::SkippedEmpty => "skipped-empty",
-                    };
-                    log::debug!(
-                        "[LocalRT-DBG-325] acc reflow: seg={} committed_len={} acc_len={} preview_len={} action={}",
-                        seg_index,
-                        committed_len,
-                        acc_text.chars().count(),
-                        preview_len,
-                        action_str
-                    );
-                }
-            }
-            PipelineEvent::ReflowCommit {
-                generation,
-                seg_index,
-                committed_len,
-            } => {
-                // LOCALRT-SEAM-337（自适应定界）：登记该片边界，与 acc 槽配对后解析。
-                let current_gen = STREAMING_GENERATION.load(Ordering::Acquire);
-                if generation != current_gen {
-                    log::debug!(
-                        "337: dropping ReflowCommit from stale session (gen {} != current {})",
-                        generation,
-                        current_gen
-                    );
-                    continue;
-                }
-                if let Ok(mut slot) = ACC_REFLOW_BOUND.lock() {
-                    *slot = Some((generation, seg_index, committed_len));
-                }
-                // 老逐片路径（已无发送方）：ACC_REFLOW_ACC 恒 None ⇒ 本调用为 no-op，保持逐位不变。
-                try_resolve_reflow(
-                    overlay_handle,
-                    opacity,
-                    ui_language,
-                    last_streaming_text,
-                    last_raw_streaming_text,
-                );
-                // 382（3A）：replace_all 快速路径 —— 边界后到且该 seg 仍是最新已渲染 ⇒ 用准确边界重渲。
-                let suppressed = ACC_REFLOW_SUPPRESS.load(Ordering::Acquire);
-                let outcome = match ACC_REFLOW_FAST.lock() {
-                    Ok(mut st) => st.on_bound(generation, seg_index, committed_len, suppressed),
-                    Err(_) => ReflowFastOutcome::None,
-                };
-                if let ReflowFastOutcome::Apply {
-                    text,
-                    committed_len: len,
-                    accurate,
-                    render,
-                } = outcome
-                {
-                    if render {
-                        render_authoritative_reflow(
-                            overlay_handle,
-                            opacity,
-                            ui_language,
-                            last_streaming_text,
-                            last_raw_streaming_text,
-                            generation,
-                            seg_index,
-                            &text,
-                            len,
-                            accurate,
-                            None,
-                            false,
-                        );
-                    } else {
-                        set_acc_reflow_state_only(generation, &text, len);
-                    }
                 }
             }
             PipelineEvent::Processing(message) => {
@@ -7802,10 +7234,6 @@ fn process_controller_events(
                 if OVERLAY_EDITING.load(Ordering::Acquire) {
                     log::info!("ASR-038-C: Processing suppressed while editing");
                 } else {
-                    // 382（问题2 防闪回）：controller **处理到本代 Processing** 时置位 ⇒ 之后到达的
-                    // `replace_all` 回灌只更新状态、不重画浮层（提前发 Processing 后 acc 尾窗回灌可能后到）。
-                    // 按通道实际顺序：排在 Processing **之前**入队的回灌照常渲染，不受影响。
-                    ACC_REFLOW_SUPPRESS.store(true, Ordering::Release);
                     set_tray_state(tray, TrayState::Processing, ui_language);
                     show_overlay(
                         overlay_handle,
@@ -7905,45 +7333,6 @@ fn process_controller_events(
                     target_hwnd: 0,
                 }));
             }
-            // LOCAL-RT-ENGINE-239-B: 模型加载中的信息提示（Info 态，蓝点白字，短暂后自动关闭）。
-            PipelineEvent::Info(message) => {
-                platform::notify_translate_poll_stop();
-                set_tray_state(tray, TrayState::Idle, ui_language);
-                let (pos, size) = overlay_geometry(
-                    &OverlayStatus::Info(message.clone()),
-                    overlay_handle.overlay_hwnd,
-                );
-                overlay_handle.send(OverlayCommand::Show(OverlayRequest {
-                    status: OverlayStatus::Info(message),
-                    pos: Some(pos),
-                    size,
-                    opacity: 0.9,
-                    ui_language,
-                    auto_close_ms: 2500,
-                    target_hwnd: 0,
-                }));
-            }
-            // LOCAL-RT-ENGINE-239-B: 模型缺失 → 错误态；🔴 不走 convert_to_friendly_error，
-            // payload 已是 i18n「所选模型不可用」（DEC-067 附则一：不降级、明确报错；细节见日志）。
-            PipelineEvent::ModelUnavailable(message) => {
-                OVERLAY_EDITING.store(false, Ordering::Release);
-                log::error!("Pipeline: model unavailable: {}", message);
-                platform::notify_translate_poll_stop();
-                set_tray_state(tray, TrayState::Error, ui_language);
-                let (pos, size) = overlay_geometry(
-                    &OverlayStatus::Error(message.clone()),
-                    overlay_handle.overlay_hwnd,
-                );
-                overlay_handle.send(OverlayCommand::Show(OverlayRequest {
-                    status: OverlayStatus::Error(message),
-                    pos: Some(pos),
-                    size,
-                    opacity: 0.95,
-                    ui_language,
-                    auto_close_ms: 4000,
-                    target_hwnd: 0,
-                }));
-            }
         }
     }
     while let Ok(event) = overlay_event_rx.try_recv() {
@@ -7969,9 +7358,6 @@ fn process_controller_events(
                 // ASR-038-C-REWORK-001: set controller-side editing flag BEFORE cancel_signal, so the
                 // inevitable PipelineEvent::Cancelled from the worker does not hide the overlay.
                 OVERLAY_EDITING.store(true, Ordering::Release);
-                // 325：编辑态一出现即上闩（**per-gen**）——此后本次录音的 accuracy 回灌一律停，
-                // 直到下一代（防「编辑退出后迟到回灌把用户刚打的字冲掉」）。
-                ACC_REFLOW_EDIT_LATCH.store(true, Ordering::Release);
                 // ASR-038-C: 用户点击 overlay 文本区进入编辑态
                 // 停录音 + 取消 pipeline（关 WebSocket 由 ASR 线程检测 cancel_signal 处理）
                 cancel_signal.store(true, Ordering::Relaxed);
@@ -7981,22 +7367,13 @@ fn process_controller_events(
                 // 通知 overlay 线程切换到 StreamingEditing 态并创建 EDIT 控件
                 overlay_handle.send(OverlayCommand::EnterEditMode);
             }
-            OverlayUiEvent::SubmitRequested(text, target_hwnd, overlay_original) => {
+            OverlayUiEvent::SubmitRequested(text, target_hwnd, _overlay_original) => {
                 OVERLAY_EDITING.store(false, Ordering::Release);
                 STREAMING_STOPPED.store(true, Ordering::Release);
                 // WORDBOOK-053-B: learn the explicit user correction (original ASR text vs submitted
                 // edited text) in a detached thread.
-                // 331：基准来源按**档位**选择（不是「回灌是否活跃」——零回灌短录音同样有 gap）：
-                //   本地实时档 ⇒ 编辑入口快照 `overlay_original`（与所见/EDIT 初值同源），缺失回落镜像；
-                //   在线 / 批处理档 ⇒ 恒 `mirror`（逐位不变）。
-                let is_local_realtime_tier = {
-                    let cfg = clone_runtime_config(&runtime_config);
-                    transcription::AsrModel::from_config(&cfg.audio.asr_model)
-                        == transcription::AsrModel::LocalRealtime
-                };
-                let mirror = last_streaming_text.lock().ok().and_then(|m| m.clone());
-                let original_text =
-                    select_learning_baseline(is_local_realtime_tier, overlay_original, mirror);
+                // FLASH-P3-A：331「本地实时档用编辑入口快照」的分支随本地引擎删除 ⇒ 基准恒为镜像（在线档原行为）。
+                let original_text = last_streaming_text.lock().ok().and_then(|m| m.clone());
                 if let Some(original) = original_text {
                     let runtime_config = Arc::clone(runtime_config);
                     let edited = text.clone();
@@ -8257,73 +7634,20 @@ fn set_auto_start(enabled: bool) -> Result<()> {
     Ok(())
 }
 /// ASR-DUAL-B-001: 加载 hotwords 字符串（使用 accuracy 引擎的档位需要）
-/// 从 wordbook 读取所有单词，按 id 排序保证哈希稳定，构建逗号分隔字符串
-/// performance 模式返回 None（不支持 hotwords）
-// LOCALRT-NO-HOTWORDS-396（DEC-083，已被 DEC-093 推翻，452 起本地实时恢复注入）：当年 sherpa 注入时首解异常率 28%
-//（窗空 / 坍塌 2 字 / 念出词条 / 截尾 / 跳到词条），不注入重解均完整。词库只在开启 LLM 优化时生效。
-// 🔴 判据：`AsrModel::LocalRealtime` 在读词库**之前**早退 `None`；`AsrModel::Accuracy` 行为逐位不变。
-// FIX-LOCALRT-ENGINE-EQ-252（已被 396 取代）：原判据「LocalRealtime 的最终转录引擎也是 accuracy（带
-// hotwords）」不再成立 —— 本地实时 B 路径的滑窗精解不再带热词，改词库不再触发 1.7B 重载。
-// MACOS-P4-NEUTRAL-002: 平台中立纯 Rust（AsrModel 判定 + wordbook 读取 + build_hotwords_string）。
-fn load_hotwords_for_accuracy(config: &AppConfig) -> Option<String> {
-    let model = transcription::AsrModel::from_config(&config.audio.asr_model);
-    // ACC-ENGINE-LLAMACPP-452（DEC-093，推翻 DEC-083）：本地实时恢复词库注入。
-    // 原 396 早退源于 sherpa 注入时 28% 异常；换 llama.cpp 后 452 回放（真实词库 19 条、120 窗）
-    // CER 5.20%→4.63%、无新增空窗 / 重复 / 念词表。Gavin「注入词库……直接接入吧」。
-    if !model.uses_accuracy_engine() {
-        return None;
-    }
-    match wordbook::Wordbook::open() {
-        Ok(wb) => match wb.list_all() {
-            Ok(entries) => {
-                // list_all 已按 id DESC 排序，确定性顺序
-                let words: Vec<String> = entries.into_iter().map(|e| e.word).collect();
-                let s = transcription::build_hotwords_string(&words);
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s)
-                }
-            }
-            Err(e) => {
-                log::warn!("Failed to load wordbook for hotwords: {}", e);
-                None
-            }
-        },
-        Err(e) => {
-            log::warn!("Failed to open wordbook for hotwords: {}", e);
-            None
-        }
-    }
-}
-
-/// ASR-DUAL-B-001: 计算 hotwords 字符串的版本号（用于对比是否需要重建）
-// MACOS-P4-NEUTRAL-002: 原 #[cfg(target_os = "windows")] 去除——平台中立纯 Rust（DefaultHasher 哈希），spawn_worker_thread（已去 cfg）调用，对 Windows 为 no-op。
-fn compute_hotwords_version(hotwords: &str) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    let count = hotwords.split(',').filter(|s| !s.trim().is_empty()).count();
-    count.hash(&mut hasher);
-    hotwords.hash(&mut hasher);
-    hasher.finish()
-}
-
 // FIX-164 D2: Start 决策管线前等待重载完成的上限。超时/失败/停止信号 ⇒ 退回旧行为
-// （旧实例继续），🔴 硬红线：绝不挂死热键路径。1500ms 覆盖在线模型重建（秒级内）；
-// 本地 972MB 模型重建更久时会退回旧实例——但 D1 预热已把绝大多数场景提前完成。
+// （旧实例继续），🔴 硬红线：绝不挂死热键路径。
+// FLASH-P3-A：Transcriber 已不加载模型（只存在线配置），重建是毫秒级，此等待基本不会触发，保留作兜底。
 const ASR_RELOAD_START_WAIT_MS: u64 = 1500;
 
 /// FIX-164 D1: 失败签名 —— (期望模型, 在线 key, url, model)。空闲预热对同一签名不
 /// 自动重试（防重试风暴：失败后 active_* 保持旧值，若无签名记忆每 500ms tick 都会
 /// 重 spawn 一次重建）；配置再变签名即变，预热恢复；Start 主动路径不受限（用户显式
-/// 触发，重试合理）。词库版本不进签名：预热廉价层不读词库（主控拍板取舍）。
+/// 触发，重试合理）。
 type FailedReloadKey = (transcription::AsrModel, String, String, String);
 
-/// FIX-164 D1: 重载判定「廉价层」——模型身份 + 在线 ASR 配置对比，不读词库（词库
-/// 版本判定要开 SQLite，只留在 Start 完整判定里）。预热（空闲 tick）与 Start 完整
-/// 判定共用本函数，杜绝两份判定漂移（任务书红线：判定不许复制粘贴两份）。
-/// 返回 (是否需要重载, 期望模型, 在线配置是否变更)。
+/// FIX-164 D1: 重载判定 —— 模型身份 + 在线 ASR 配置对比。预热（空闲 tick）与 Start 判定
+/// 共用本函数，杜绝两份判定漂移。返回 (是否需要重载, 期望模型, 在线配置是否变更)。
+/// FLASH-P3-A：两条路径都是在线流式，在线配置变更（key/url/model）对两者都触发重建（重建只是存参数）。
 fn asr_cheap_reload_needed(
     config: &AppConfig,
     active_asr_model: transcription::AsrModel,
@@ -8333,12 +7657,10 @@ fn asr_cheap_reload_needed(
 ) -> (bool, transcription::AsrModel, bool) {
     let desired_asr_model = transcription::AsrModel::from_config(&config.audio.asr_model);
     let identity_changed = active_asr_model != desired_asr_model;
-    // ASR-041-B / ASR-056: 在线 ASR 配置变更检测（key/url/model 变更），
-    // is_online_streaming() 收敛判据（QwenAudioOnline | FunAsrRealtime）
-    let online_asr_changed = desired_asr_model.is_online_streaming()
-        && (active_asr_online_api_key != config.audio.asr_online_api_key
-            || active_asr_online_url != config.audio.asr_online_url
-            || active_asr_online_model != config.audio.asr_online_model);
+    // ASR-041-B / ASR-056: 在线 ASR 配置变更检测（key/url/model 变更）
+    let online_asr_changed = active_asr_online_api_key != config.audio.asr_online_api_key
+        || active_asr_online_url != config.audio.asr_online_url
+        || active_asr_online_model != config.audio.asr_online_model;
     (
         identity_changed || online_asr_changed,
         desired_asr_model,
@@ -8347,33 +7669,21 @@ fn asr_cheap_reload_needed(
 }
 
 /// FIX-164 D1/D2: 重载 spawn 收口 —— 预热与 Start 共用同一 spawn（判定+spawn 都不许
-/// 两份）。行为与原 Start 内联版逐位一致：后台线程构建，成功/失败都经 reload_tx 送回。
+/// 两份）。后台线程构建，成功/失败都经 reload_tx 送回。
 fn spawn_asr_reload(
-    model_dir: &std::path::Path,
     config: &AppConfig,
     desired_asr_model: transcription::AsrModel,
-    desired_hotwords: Option<String>,
     reload_tx: crossbeam_channel::Sender<Result<transcription::Transcriber, String>>,
 ) {
-    let reload_model_dir = model_dir.to_path_buf();
-    let reload_streaming = config.audio.enable_streaming;
-    let reload_language = "auto".to_string();
     let reload_asr_online_key = config.audio.asr_online_api_key.clone();
     let reload_asr_online_url = config.audio.asr_online_url.clone();
     let reload_asr_online_model = config.audio.asr_online_model.clone();
     let reload_asr_online_max_sentence_silence = config.audio.asr_online_max_sentence_silence;
     let reload_asr_online_semantic_punctuation_enabled =
         config.audio.asr_online_semantic_punctuation_enabled;
-    // UI-REC-472：重载在途 ⇒ 本地实时视为未就绪（落地时 apply_reload_result 按新引擎重新发布）。
-    LOCALRT_ENGINE_READY.store(false, Ordering::Release);
     std::thread::spawn(move || {
-        let t_build = std::time::Instant::now();
         match transcription::Transcriber::new(
-            &reload_model_dir,
-            reload_streaming,
-            reload_language,
             desired_asr_model,
-            desired_hotwords.as_deref(),
             &reload_asr_online_key,
             &reload_asr_online_url,
             &reload_asr_online_model,
@@ -8381,10 +7691,6 @@ fn spawn_asr_reload(
             reload_asr_online_semantic_punctuation_enabled,
         ) {
             Ok(new_t) => {
-                log::info!(
-                    "ASR transcriber rebuild completed in {:.1}s",
-                    t_build.elapsed().as_secs_f64()
-                );
                 let _ = reload_tx.send(Ok(new_t));
             }
             Err(e) => {
@@ -8403,7 +7709,6 @@ fn apply_reload_result(
     runtime_config: &Arc<RwLock<AppConfig>>,
     transcriber: &mut Option<transcription::Transcriber>,
     active_asr_model: &mut transcription::AsrModel,
-    active_hotwords_version: &mut u64,
     active_asr_online_api_key: &mut String,
     active_asr_online_url: &mut String,
     active_asr_online_model: &mut String,
@@ -8414,7 +7719,6 @@ fn apply_reload_result(
         Ok(new_transcriber) => {
             log::info!("ASR transcriber hot-reload completed, swapping instance");
             *active_asr_model = new_transcriber.asr_model();
-            *active_hotwords_version = new_transcriber.hotwords_version();
             // ASR-041-B: 同步在线 ASR 配置跟踪值
             let fresh = clone_runtime_config(runtime_config);
             *active_asr_online_api_key = fresh.audio.asr_online_api_key;
@@ -8423,7 +7727,6 @@ fn apply_reload_result(
             *transcriber = Some(new_transcriber);
             *asr_reload_in_flight = false;
             *failed_reload_key = None; // FIX-164: 成功即清失败签名，预热恢复待命
-            publish_localrt_ready(transcriber.as_ref());
         }
         Err(e) => {
             // active_* 保持旧值，下次 Start 对比仍不一致 → 自然重试
@@ -8432,7 +7735,6 @@ fn apply_reload_result(
                 e
             );
             *asr_reload_in_flight = false;
-            publish_localrt_ready(transcriber.as_ref());
             // FIX-164 D1 防风暴：见 FailedReloadKey 文档
             let cfg = clone_runtime_config(runtime_config);
             *failed_reload_key = Some((
@@ -8457,7 +7759,6 @@ fn spawn_worker_thread(
     is_recording: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let model_dir = transcription::model_dir();
         // MIC-ON-DEMAND（Gavin 10-30）：启动时不再预开麦克风；每次按热键现开、录完即关（见 audio::AudioCapture::record*）。
         // 只预热音频子系统（找设备 + 查格式，不开流）：首次按热键少等 ~50ms 的系统组件初始化。
         let mut audio_capture = audio::AudioCapture::new();
@@ -8477,20 +7778,12 @@ fn spawn_worker_thread(
             }
         };
 
-        // PERF-BATCH-001 TASK-1: Pre-initialize Transcriber at startup.
-        // Previously created inside the Start handler, loading ONNX models on every recording (~1-2s delay).
-        // Now created once and reused across all recording sessions.
-        //
-        // DEC-025 双模型架构：transcriber 可热重载（asr_model 变更或词库变更触发）。
-        // 重建异步进行，期间继续用旧实例不阻塞录音。
+        // DEC-025 / FLASH-P3-A：transcriber 只存在线配置（不加载模型），配置变更时热重载。
         let config = clone_runtime_config(&runtime_config);
-        let initial_hotwords = load_hotwords_for_accuracy(&config);
+        // 最近一次构建失败原因（构建失败时录音即报错用，如「API Key 为空」）。
+        let mut last_reload_error: Option<String> = None;
         let mut transcriber = match transcription::Transcriber::new(
-            &model_dir,
-            config.audio.enable_streaming,
-            "auto".to_string(),
             transcription::AsrModel::from_config(&config.audio.asr_model),
-            initial_hotwords.as_deref(),
             &config.audio.asr_online_api_key,
             &config.audio.asr_online_url,
             &config.audio.asr_online_model,
@@ -8500,53 +7793,29 @@ fn spawn_worker_thread(
             Ok(t) => Some(t),
             Err(err) => {
                 log::error!("Failed to initialize transcriber at startup: {}", err);
+                last_reload_error = Some(err.to_string());
                 None
             }
         };
-        // UI-REC-472：启动同步加载完成（此前 LOCALRT_ENGINE_READY 初值 false = 加载中）。
-        publish_localrt_ready(transcriber.as_ref());
 
         // ASR-DUAL-B-001: 热重载 channel —— 后台线程构建结果（成功=新实例，失败=Err）经此送回。
         // 失败也必须回消息，用于清除 in_flight 标志，否则构建中窗口会重复 spawn 重建线程。
         let (asr_reload_tx, asr_reload_rx) =
             crossbeam_channel::bounded::<Result<transcription::Transcriber, String>>(1);
         // 重建进行中标志：spawn 时置 true，收到成功/失败消息时清除。
-        // 防止 ~6s 构建窗口内每次 Start 都重复 spawn（并发加载多个 972MB 模型）。
         let mut asr_reload_in_flight = false;
         // FIX-164 D1: 失败签名，见 FailedReloadKey 文档（防空闲预热重试风暴）
         let mut failed_reload_key: Option<FailedReloadKey> = None;
-        // 当前已生效的 asr_model + hotwords_version，用于对比是否需要重建
+        // 当前已生效的 asr_model，用于对比是否需要重建
         let mut active_asr_model: transcription::AsrModel =
             transcription::AsrModel::from_config(&config.audio.asr_model);
-        let mut active_hotwords_version: u64 = transcriber
-            .as_ref()
-            .map(|t| t.hotwords_version())
-            .unwrap_or(0);
         // ASR-041-B: 在线 ASR 配置跟踪，用于热重载对比
         let mut active_asr_online_api_key: String = config.audio.asr_online_api_key.clone();
         let mut active_asr_online_url: String = config.audio.asr_online_url.clone();
         let mut active_asr_online_model: String = config.audio.asr_online_model.clone();
-        // LOCAL-RT-ENGINE-239-B：最近一次 ASR 热重载失败原因（供模型缺失报错附「具体缺哪个」）。
-        let mut last_reload_error: Option<String> = None;
 
         // PERF-INIT-001: Pre-initialize LlmClient once; update_config() before each use.
         let mut llm_client = llm::LlmClient::new(config.llm.clone());
-
-        // MEM-453：NLLB（int8 ≈ 600MB，加载后因 CT2 析构死锁永不释放）改为**首次真正走本地翻译时**
-        // 才由 `ensure_translation_direction` 加载 —— 在线 LLM 翻译成功时不会走到本地模型，
-        // 未用翻译的会话不再常驻这 600MB。首次本地翻译多一次加载（实测约 0.3s）。
-        let mut cached_translation: Option<(
-            config::TranslationLanguage,
-            translation::TranslationEngine,
-        )> = None;
-
-        // PUNCT-INTEGRATION-001: Pre-initialize PunctuationEngine once.
-        let mut cached_punctuation: Option<punctuation::PunctuationEngine> =
-            if config.punctuation.enabled {
-                punctuation::PunctuationEngine::new(&model_dir)
-            } else {
-                None
-            };
 
         loop {
             let cmd = match worker_rx.recv_timeout(Duration::from_millis(500)) {
@@ -8555,7 +7824,6 @@ fn spawn_worker_thread(
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             };
             // ASR-DUAL-B-001: 非阻塞检查热重载结果（后台线程构建完成后送回）。
-            // FIX-164: 应用逻辑收口进 apply_reload_result（与 D2 有界等待共用）。
             if let Ok(result) = asr_reload_rx.try_recv() {
                 match &result {
                     Ok(_) => last_reload_error = None,
@@ -8566,7 +7834,6 @@ fn spawn_worker_thread(
                     &runtime_config,
                     &mut transcriber,
                     &mut active_asr_model,
-                    &mut active_hotwords_version,
                     &mut active_asr_online_api_key,
                     &mut active_asr_online_url,
                     &mut active_asr_online_model,
@@ -8574,11 +7841,8 @@ fn spawn_worker_thread(
                     &mut failed_reload_key,
                 );
             }
-            // FIX-164 D1: 空闲预热 —— 配置变更后 ≤500ms（tick 周期）即在后台启动重载，
-            // 消除「切完模型第一次录音用旧引擎」（DEC-025 遗留缺口，DIAG-163 Q3 实锤）。
-            // 只在 idle tick（cmd=None）判定：录音期间 loop 顶不执行，天然不会中途换引擎；
-            // Start 处理器占用 loop 时本 tick 也轮不到。判定用廉价层（不读词库，主控拍板）；
-            // in_flight 防重复 spawn + 失败签名防重试风暴，双保险。
+            // FIX-164 D1: 空闲预热 —— 配置变更后 ≤500ms（tick 周期）即在后台启动重载。
+            // 只在 idle tick（cmd=None）判定：录音期间 loop 顶不执行，天然不会中途换引擎。
             if cmd.is_none() && !asr_reload_in_flight {
                 let config_now = clone_runtime_config(&runtime_config);
                 let (cheap_needed, desired_now, _) = asr_cheap_reload_needed(
@@ -8600,26 +7864,8 @@ fn spawn_worker_thread(
                         active_asr_model,
                         desired_now
                     );
-                    let desired_hotwords = load_hotwords_for_accuracy(&config_now);
-                    // LOCAL-RT-ENGINE-239-B：切到本地流式档位时用 Info 态提示双模型加载中（短暂自动关）。
-                    if desired_now == transcription::AsrModel::LocalRealtime {
-                        send_event(
-                            &event_tx,
-                            PipelineEvent::Info(
-                                i18n::get(config_now.ui_language)
-                                    .local_realtime_loading_hint
-                                    .to_string(),
-                            ),
-                        );
-                    }
                     asr_reload_in_flight = true;
-                    spawn_asr_reload(
-                        &model_dir,
-                        &config_now,
-                        desired_now,
-                        desired_hotwords,
-                        asr_reload_tx.clone(),
-                    );
+                    spawn_asr_reload(&config_now, desired_now, asr_reload_tx.clone());
                 }
             }
             match cmd {
@@ -8636,7 +7882,7 @@ fn spawn_worker_thread(
                     is_recording.store(true, Ordering::Release);
                     // OVERLAY-075: a new recording session claims the next generation.
                     // Everything this session's ASR thread emits is stamped with this value;
-                    // the consumer (:3682 area) drops stamps that no longer match, so a
+                    // the consumer drops stamps that no longer match, so a
                     // finalize-tail from a previous session can never reach a newer session's
                     // overlay. Bump BEFORE the ASR closure below captures `session_generation`.
                     let session_generation =
@@ -8648,14 +7894,9 @@ fn spawn_worker_thread(
                     } else {
                         Some(config.audio.input_device.as_str())
                     };
-                    // FIX-NEARFIELD-BY-SEGMENT-AND-PREVIEW-389（C2）：跨录音沿用录音人音量的设备 key。
-                    let vad_device = config.audio.input_device.clone();
 
                     // ASR-DUAL-B-001: 检查是否需要热重载 transcriber
-                    // 触发条件：asr_model 变更 / transcription_language 变更 /
-                    // accuracy 模式下词库变更 / qwen3 配置变更 / transcriber 未初始化自愈
-                    // FIX-164: 廉价层判定抽为 asr_cheap_reload_needed（预热与 Start 共用，
-                    // 不许两份）；词库版本 + 自愈只属于 Start 完整层（词库判定要读库）。
+                    // 触发条件：asr_model 变更 / 在线配置变更 / transcriber 未初始化自愈
                     let (cheap_needed, desired_asr_model, online_asr_changed) =
                         asr_cheap_reload_needed(
                             &config,
@@ -8664,58 +7905,26 @@ fn spawn_worker_thread(
                             &active_asr_online_url,
                             &active_asr_online_model,
                         );
-                    let desired_hotwords = load_hotwords_for_accuracy(&config);
-                    let desired_hotwords_version = match &desired_hotwords {
-                        Some(h) => compute_hotwords_version(h),
-                        None => 0,
-                    };
                     // R2-4: transcriber.is_none() 时无条件尝试重建（启动失败自愈）
                     let needs_rebuild = transcriber.is_none() && !asr_reload_in_flight;
-                    // ACC-ENGINE-LLAMACPP-452：词库变更**不再触发引擎重载** —— Qwen3 引擎构造时不使用词库
-                    //（320 起词库随每次解码传入，每次录音开始读库，见 `acc_terms`），重载只白白重建 2.5GB 模型；
-                    // 452 起本地实时恢复词库注入，自动学习每加一词都会触发，可能与录音开始撞车。
-                    // `active_hotwords_version` / `desired_hotwords_version` 仅保留作日志。
                     let needs_reload = cheap_needed || needs_rebuild;
                     if needs_reload && !asr_reload_in_flight {
                         log::info!(
-                            "Triggering ASR transcriber hot-reload: model {:?}->{:?}, hotwords_version {}->{}, online_asr_changed={}, needs_rebuild={}",
+                            "Triggering ASR transcriber hot-reload: model {:?}->{:?}, online_asr_changed={}, needs_rebuild={}",
                             active_asr_model,
                             desired_asr_model,
-                            active_hotwords_version,
-                            desired_hotwords_version,
                             online_asr_changed,
                             needs_rebuild,
                         );
                         asr_reload_in_flight = true;
-                        // LOCAL-RT-ENGINE-239-B：切到本地流式档位时用 Info 态提示双模型加载中（短暂自动关）。
-                        if desired_asr_model == transcription::AsrModel::LocalRealtime {
-                            send_event(
-                                &event_tx,
-                                PipelineEvent::Info(
-                                    i18n::get(config.ui_language)
-                                        .local_realtime_loading_hint
-                                        .to_string(),
-                                ),
-                            );
-                        }
-                        spawn_asr_reload(
-                            &model_dir,
-                            &config,
-                            desired_asr_model,
-                            desired_hotwords,
-                            asr_reload_tx.clone(),
-                        );
+                        spawn_asr_reload(&config, desired_asr_model, asr_reload_tx.clone());
                     }
 
                     log::info!("[Latency] worker received Start command");
 
-                    // FIX-164 D2: 有界等待兜底 —— 模型身份/在线配置已变更且重载仍在途时，
-                    // 最多等 ASR_RELOAD_START_WAIT_MS 让新实例落地，堵住「切完立刻按热键
-                    // 仍用旧引擎」（DIAG-163 Q3：输出是旧模型质量，用户以为在用新引擎——
-                    // 静默的功能性错误）。超时/失败/停止信号 ⇒ 退回旧行为（旧实例继续），
-                    // 🔴 硬红线：绝不挂死热键路径。等待逐 ≤100ms 切片，随时可被
-                    // stop/cancel 信号打断（用户连按两下热键的后悔场景）。
-                    // hotwords 版本变更不等待（主控拍板：Q3 病根是引擎身份，词库走原路径）。
+                    // FIX-164 D2: 有界等待兜底 —— 模型身份/在线配置已变更（或 transcriber 未就绪）且重载
+                    // 仍在途时，最多等 ASR_RELOAD_START_WAIT_MS 让新实例落地。超时/失败/停止信号 ⇒
+                    // 退回旧行为（旧实例继续），🔴 硬红线：绝不挂死热键路径。
                     let (cheap_needed_now, _, _) = asr_cheap_reload_needed(
                         &config,
                         active_asr_model,
@@ -8723,7 +7932,7 @@ fn spawn_worker_thread(
                         &active_asr_online_url,
                         &active_asr_online_model,
                     );
-                    if cheap_needed_now && asr_reload_in_flight {
+                    if (cheap_needed_now || transcriber.is_none()) && asr_reload_in_flight {
                         let wait_deadline = std::time::Instant::now()
                             + Duration::from_millis(ASR_RELOAD_START_WAIT_MS);
                         log::info!(
@@ -8761,7 +7970,6 @@ fn spawn_worker_thread(
                                         &runtime_config,
                                         &mut transcriber,
                                         &mut active_asr_model,
-                                        &mut active_hotwords_version,
                                         &mut active_asr_online_api_key,
                                         &mut active_asr_online_url,
                                         &mut active_asr_online_model,
@@ -8775,850 +7983,189 @@ fn spawn_worker_thread(
                         }
                     }
 
-                    // ASR-038-B / ASR-056: 在线流式 ASR 走真流式管线（边录边发边收边上屏）
-                    // 其他模式走现有 record() + run_pipeline_core（零行为变更）
-                    // ASR-056: 用 is_online_streaming() 收敛判据（QwenAudioOnline | FunAsrRealtime）
+                    // FLASH-P3-A：两条路径（直连阿里 / 连识别服务）都走真流式管线（边录边发边收边上屏）。
+                    // 原「本地实时 / 批处理 record() + 本地转录」分支随本地引擎删除。
+                    // transcriber 不可用（如直连阿里但 API Key 为空）⇒ 不录音、直接报错（原因进日志 + 错误文案分类）。
+                    let Some(transcriber_ref) = transcriber.as_ref() else {
+                        is_recording.store(false, Ordering::Release);
+                        let reason = last_reload_error
+                            .clone()
+                            .unwrap_or_else(|| "Transcriber unavailable".to_string());
+                        log::error!("Transcriber not initialized: {}", reason);
+                        send_event(&event_tx, PipelineEvent::Error(reason));
+                        continue;
+                    };
                     let desired_asr_model_check =
                         transcription::AsrModel::from_config(&config.audio.asr_model);
-                    let is_streaming_asr = desired_asr_model_check.is_online_streaming()
-                        && transcriber
-                            .as_ref()
-                            .is_some_and(|t| t.asr_model().is_online_streaming());
 
-                    if is_streaming_asr {
-                        // OVERLAY-051-E: notify controller that online streaming ASR is waiting for first text
-                        send_event(&event_tx, PipelineEvent::StreamingIdle);
+                    // OVERLAY-051-E: notify controller that online streaming ASR is waiting for first text
+                    send_event(&event_tx, PipelineEvent::StreamingIdle);
 
-                        let transcriber_ref = transcriber.as_ref().expect("checked above");
-                        let asr_online_url = transcriber_ref.asr_online_url().to_string();
-                        let asr_online_model = transcriber_ref.asr_online_model().to_string();
-                        let asr_online_max_sentence_silence =
-                            transcriber_ref.asr_online_max_sentence_silence();
-                        let asr_online_semantic_punctuation_enabled =
-                            transcriber_ref.asr_online_semantic_punctuation_enabled();
-                        let qwen_api_key = config.audio.asr_online_api_key.clone();
-                        let model_dir_clone = model_dir.clone();
-                        let cancel_clone = Arc::clone(&cancel_signal);
-                        let event_tx_clone = event_tx.clone();
+                    let asr_online_url = transcriber_ref.asr_online_url().to_string();
+                    let asr_online_model = transcriber_ref.asr_online_model().to_string();
+                    let asr_online_max_sentence_silence =
+                        transcriber_ref.asr_online_max_sentence_silence();
+                    let asr_online_semantic_punctuation_enabled =
+                        transcriber_ref.asr_online_semantic_punctuation_enabled();
+                    let qwen_api_key = config.audio.asr_online_api_key.clone();
+                    let cancel_clone = Arc::clone(&cancel_signal);
+                    let event_tx_clone = event_tx.clone();
 
-                        // chunk channel：record_streaming 推 chunk，ASR 线程读
-                        let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<Vec<f32>>(256);
+                    // chunk channel：record_streaming 推 chunk，ASR 线程读
+                    let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<Vec<f32>>(256);
 
-                        // spawn ASR 线程跑 transcribe_streaming_realtime
-                        let asr_handle: std::thread::JoinHandle<
-                            Result<crate::transcription::qwen_inference::OnlineFinal>,
-                        > = std::thread::spawn(move || {
-                            let on_result = |display_text: &str,
-                                             words: &[crate::transcription::qwen_inference::WordTiming]| {
-                                // OVERLAY-075: stamp every packet with this session's
-                                // generation; the consumer drops stale-session packets.
-                                let _ = event_tx_clone.send(PipelineEvent::StreamingText(
-                                    session_generation,
-                                    display_text.to_string(),
-                                    words.to_vec(),
-                                    0,
-                                ));
-                            };
-                            // ASR-SERVER-491 S8：连自家识别服务 —— 配对信息每次录音现读（设置里重新配对立即生效）。
-                            if desired_asr_model_check == transcription::AsrModel::FeiyinServer {
-                                // FLASH-P0-509：词库每个前端单独 ⇒ 带完整词库数组（对方不再掺它自己的词库）。
-                                let vocabulary = crate::transcription::load_wordbook_word_array();
-                                return crate::transcription::qwen_inference::transcribe_streaming_feiyin(
-                                    &crate::asr_shared::remote::RemotePairing::load(),
-                                    chunk_rx,
-                                    &vocabulary,
-                                    &model_dir_clone,
-                                    Some(&cancel_clone),
-                                    on_result,
-                                );
-                            }
-                            let vocabulary = crate::transcription::load_wordbook_vocabulary();
-                            crate::transcription::qwen_inference::transcribe_streaming_realtime(
-                                &asr_online_url,
-                                &qwen_api_key,
-                                &asr_online_model,
+                    // spawn ASR 线程跑 transcribe_streaming_realtime / transcribe_streaming_feiyin
+                    let asr_handle: std::thread::JoinHandle<
+                        Result<crate::transcription::qwen_inference::OnlineFinal>,
+                    > = std::thread::spawn(move || {
+                        let on_result = |display_text: &str,
+                                         words: &[crate::transcription::qwen_inference::WordTiming]| {
+                            // OVERLAY-075: stamp every packet with this session's
+                            // generation; the consumer drops stale-session packets.
+                            let _ = event_tx_clone.send(PipelineEvent::StreamingText(
+                                session_generation,
+                                display_text.to_string(),
+                                words.to_vec(),
+                                0,
+                            ));
+                        };
+                        // ASR-SERVER-491 S8：连识别服务 —— 配对信息每次录音现读（设置里重新配对立即生效）。
+                        if desired_asr_model_check == transcription::AsrModel::FeiyinServer {
+                            // FLASH-P0-509：词库每个前端单独 ⇒ 带完整词库数组（对方不再掺它自己的词库）。
+                            let vocabulary = crate::transcription::load_wordbook_word_array();
+                            return crate::transcription::qwen_inference::transcribe_streaming_feiyin(
+                                &crate::asr_shared::remote::RemotePairing::load(),
                                 chunk_rx,
                                 &vocabulary,
-                                asr_online_max_sentence_silence,
-                                asr_online_semantic_punctuation_enabled,
-                                &model_dir_clone,
                                 Some(&cancel_clone),
                                 on_result,
-                            )
-                        });
-
-                        // STATS-475 / 480：本次送给在线 ASR 的 16k 音频（统计有效语音时长用，至多 300s ≈ 19MB）。
-                        let mut online_pcm: Vec<f32> = Vec::new();
-                        // worker 线程跑 record_streaming，推 chunk 给 ASR 线程
-                        let record_result = audio_capture.record_streaming(
-                            Arc::clone(&stop_recording_signal),
-                            config.audio.silence_threshold,
-                            config::SILENCE_DURATION_MS,
-                            config::MAX_RECORD_SECONDS,
-                            Some(Arc::clone(&audio_buf)),
-                            device_name,
-                            false, // FIX-283: 在线流式路径不做 pre_roll 残尾裁剪（三档行为不变）
-                            |chunk| {
-                                online_pcm.extend_from_slice(chunk);
-                                // ASR-074-GUARD: bounded channel send was an unbounded
-                                // blocking send — if the ASR thread stopped consuming
-                                // (WS stuck / server silent / half-open connection),
-                                // chunk_tx fills and the recording thread never returns:
-                                // release-hotkey presents as a frozen app. 200ms cap:
-                                // a healthy consumer drains 256 chunks in milliseconds,
-                                // so 200ms is 20x headroom above normal send latency;
-                                // at worst the recording thread stalls 200ms per chunk
-                                // instead of forever. Timeout = drop the chunk with a
-                                // counted warn (same drop-visibility principle as
-                                // ASR-074 Step 2-C's [ASR-DROP] tag) — never silently.
-                                match chunk_tx.send_timeout(
-                                    chunk.to_vec(),
-                                    Duration::from_millis(200),
-                                ) {
-                                    Ok(()) => {}
-                                    Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
-                                        ASR_CHUNK_DROPS.fetch_add(1, Ordering::Relaxed);
-                                        log::warn!(
-                                            "[ASR-DROP] chunk send timed out after 200ms (ASR consumer stuck?); total dropped: {}",
-                                            ASR_CHUNK_DROPS.load(Ordering::Relaxed)
-                                        );
-                                    }
-                                    Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
-                                        // ASR thread gone: drop silently, the recording
-                                        // session is being torn down anyway.
-                                    }
-                                }
-                            },
-                        );
-                        // drop chunk_tx 让 ASR 线程的 channel 断开（触发 finish-task）
-                        drop(chunk_tx);
-
-                        log::info!(
-                            "[Latency] record_streaming() completed after +{:.1}ms",
-                            t_worker.elapsed().as_secs_f64() * 1000.0
-                        );
-                        is_recording.store(false, Ordering::Release);
-
-                        if cancel_signal.load(Ordering::Acquire) {
-                            log::warn!(
-                                "Streaming recording ended with cancel_signal=true, skipping ASR join"
-                            );
-                            send_event(&event_tx, PipelineEvent::Cancelled);
-                            continue;
-                        }
-
-                        if let Err(e) = record_result {
-                            log::error!("Streaming recording error: {}", e);
-                            send_event(&event_tx, PipelineEvent::Error(e.to_string()));
-                            // ASR 线程会因 channel 断开自行退出
-                            continue;
-                        }
-
-                        // join ASR 线程拿最终文本
-                        let asr_result = match asr_handle.join() {
-                            Ok(r) => r,
-                            Err(_) => {
-                                log::error!("ASR thread panicked");
-                                send_event(
-                                    &event_tx,
-                                    PipelineEvent::Error("ASR thread panicked".into()),
-                                );
-                                continue;
-                            }
-                        };
-                        let online_final = match asr_result {
-                            Ok(f) => f,
-                            Err(e) => {
-                                // BUG-119: 流式 ASR「没识别到语音」= 类型化信号 → 信息提示，
-                                // 不进 convert_to_friendly_error 错误链
-                                if e.is::<transcription::NoSpeechError>() {
-                                    log::info!("Streaming ASR: no speech detected");
-                                    send_event(&event_tx, PipelineEvent::NoSpeech);
-                                } else {
-                                    log::error!("Streaming ASR error: {}", e);
-                                    send_event(&event_tx, PipelineEvent::Error(e.to_string()));
-                                }
-                                continue;
-                            }
-                        };
-
-                        // 流式文本走 LLM 后半段（跳过转录）
-                        let transcriber = match &transcriber {
-                            Some(t) => t,
-                            None => {
-                                log::error!("Transcriber not initialized");
-                                send_event(
-                                    &event_tx,
-                                    PipelineEvent::Error("Transcriber unavailable".into()),
-                                );
-                                continue;
-                            }
-                        };
-                        llm_client.update_config(config.llm.clone());
-
-                        // MEM-453：不再预加载；方向切换由 ensure_translation_direction 复用进程级模型。
-                        if !config.translation.enabled {
-                            cached_translation = None;
-                        }
-                        if config.punctuation.enabled && cached_punctuation.is_none() {
-                            cached_punctuation = punctuation::PunctuationEngine::new(&model_dir);
-                        } else if !config.punctuation.enabled {
-                            cached_punctuation = None;
-                        }
-
-                        // PUNCT-478（DEC-108）：服务端按停顿断句、在句间接缝自动收句末标点 ⇒ 本地标点模型按前后文重判。
-                        let streaming_text = repair_online_seams(
-                            &online_final.text,
-                            &online_final.seams,
-                            cached_punctuation.as_mut(),
-                        );
-                        run_pipeline_core(
-                            Ok(Vec::new()), // 流式模式不用 samples
-                            transcriber,
-                            &rt,
-                            &llm_client,
-                            &cancel_signal,
-                            &config,
-                            &runtime_config,
-                            &mut cached_translation,
-                            &model_dir,
-                            cached_punctuation.as_mut(),
-                            start.target_hwnd,
-                            &event_tx,
-                            start.translate,
-                            Some(streaming_text), // 流式文本，跳过转录
-                            None,                 // PARALLEL-ACC-298: 在线路径无并行预转写
-                            i18n::get(config.ui_language).overlay_transcribing,
-                            FinalFillerNode::AtFinal, // 441：在线路径最终节点去重逐位不变
-                            UsageSource {
-                                category: usage_stats::UsageCategory::OnlineAsr,
-                                audio: Arc::new(online_pcm),
-                            },
-                        );
-                        continue;
-                    }
-
-                    // LOCAL-RT-ENGINE-239-B（DEC-066/067）：本地 realtime 独立编排。
-                    // 与在线流式并列：录音期发流式预览（streaming paraformer，识别即上屏）；
-                    // 松键后**丢弃预览文本**，把完整 PCM 交给 run_pipeline_core 走 accuracy 2pass
-                    // （initial_text=None ⇒ from_online_streaming=false，主通道 ITN 启用、标点由
-                    //  accuracy 实际产出决定）。这是本管线与在线档的关键差异。
-                    let is_local_realtime_desired =
-                        desired_asr_model_check == transcription::AsrModel::LocalRealtime;
-                    let active_is_local_realtime = transcriber
-                        .as_ref()
-                        .is_some_and(|t| t.asr_model() == transcription::AsrModel::LocalRealtime);
-
-                    if is_local_realtime_desired && !active_is_local_realtime {
-                        if asr_reload_in_flight {
-                            // 双模型仍在加载（~6s，D2 有界等待仅 1.5s，可能尚未落地）：
-                            // 提示加载中，本次不录音、**不降级**，等加载完成后再按热键即可。
-                            log::info!(
-                                "LocalRealtime still loading; skipping this recording without degrading"
-                            );
-                            is_recording.store(false, Ordering::Release);
-                            send_event(
-                                &event_tx,
-                                PipelineEvent::Info(
-                                    i18n::get(config.ui_language)
-                                        .local_realtime_loading_hint
-                                        .to_string(),
-                                ),
-                            );
-                            continue;
-                        }
-                        // DEC-067 附则一：模型缺失/加载失败 → 明确报错，**绝不静默降级**到其他档位。
-                        // 浮层只显示 i18n 文案（DEC-067 附则一原文即「所选模型不可用」）；具体缺哪个
-                        // 模型是内部错误原文（中文 / 英文不定），10-14 起只进日志不上屏（Gavin「提示对话框
-                        // 文字一定都要走i18n」）。
-                        let message = i18n::get(config.ui_language)
-                            .local_realtime_unavailable
-                            .to_string();
-                        log::error!(
-                            "LocalRealtime unavailable, refusing to degrade to another tier: {}",
-                            last_reload_error
-                                .as_deref()
-                                .unwrap_or("(no reload error recorded)")
-                        );
-                        is_recording.store(false, Ordering::Release);
-                        send_event(&event_tx, PipelineEvent::ModelUnavailable(message));
-                        continue;
-                    }
-
-                    if is_local_realtime_desired {
-                        // OVERLAY-051-E：流式 ASR 已启动、等待首个文本
-                        send_event(&event_tx, PipelineEvent::StreamingIdle);
-
-                        // LOCALRT-PREVIEW-PUNCT-256：预览打点复用已常驻的 CT-Transformer。
-                        // 录音前按 config 就绪（引擎由调用方传入，**不在 local_stream 内新建**，
-                        // 否则重复加载模型；与 run_pipeline_core 的传法一致）。
-                        if config.punctuation.enabled && cached_punctuation.is_none() {
-                            cached_punctuation = punctuation::PunctuationEngine::new(&model_dir);
-                        } else if !config.punctuation.enabled {
-                            cached_punctuation = None;
-                        }
-                        let punctuation = cached_punctuation.as_mut();
-
-                        let recognizer = transcriber
-                            .as_ref()
-                            .and_then(|t| t.preview_recognizer())
-                            .expect("LocalRealtime transcriber must hold a preview recognizer");
-                        let send_recognizer =
-                            transcription::local_stream::SendPreviewRecognizerRef(recognizer);
-                        let cancel_clone = Arc::clone(&cancel_signal);
-                        let event_tx_clone = event_tx.clone();
-                        // chunk channel：record_streaming 推 chunk，ASR 线程读
-                        let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<Vec<f32>>(256);
-
-                        // PARALLEL-ACC-298：accuracy 并行派发。总开关关 / offline recognizer 缺失
-                        // ⇒ acc_enabled=false ⇒ 不建 worker、不派发，**逐位退回今天的串行行为**。
-                        let acc_cfg = transcription::local_stream::AccDispatchConfig::new();
-                        let acc_offline = transcriber.as_ref().and_then(|t| t.offline_recognizer());
-                        let acc_enabled = acc_cfg.enabled && acc_offline.is_some();
-                        let acc_cfg = transcription::local_stream::AccDispatchConfig {
-                            enabled: acc_enabled,
-                            ..acc_cfg
-                        };
-                        let send_offline = acc_offline.map(transcription::SendOfflineRecognizerRef);
-                        // 325：载荷加 `committed_len`（派发当刻浮层显示字符数，回灌边界）。
-                        // 344-G：载荷加 `seg_streaming`（本片流式文本，失败片的填补来源）。
-                        // VAD-393（A3）：载荷再加班 `seg_ranges`（各片内语音区间，见 `AccSliceMsg`）。
-                        let (acc_tx, acc_rx) = crossbeam_channel::bounded::<AccInput>(64);
-                        let acc_script = config.audio.chinese_script;
-                        // 325：acc worker 逐片回灌预览所用的事件发送端（代际在 worker 内捕获）。
-                        let acc_event_tx = event_tx.clone();
-                        // 337：ASR 线程在句子确认时经此发 ReflowCommit（提交/作废回灌边界）。
-                        let reflow_commit_tx = event_tx.clone();
-
-                        // scoped：ASR 线程借 online recognizer，worker 线程跑 record_streaming，
-                        // accuracy worker 借 **offline** recognizer 并行转写派发片。
-                        // 🔴 298 是真并发：streaming 线程与 accuracy worker 同时在跑。两 recognizer
-                        // 是**不同对象**且各自**独占**（见 SendOfflineRecognizerRef 的 SAFETY 论证）。
-                        let scoped = std::thread::scope(|scope| {
-                            // accuracy 并行 worker：对象独占，唯一使用者（streaming 线程只用 online）。
-                            let acc_handle = if acc_enabled {
-                                let send_offline =
-                                    send_offline.expect("acc_enabled 蕴含 offline recognizer 存在");
-                                let cancel_acc = Arc::clone(&cancel_signal);
-                                let acc_rx = acc_rx;
-                                // LOCALRT-CTX-INJECT-320：词库词条随 per-stream 注入
-                                // （读 DB + 按引擎预算裁剪，每段录音一次，毫秒级）。
-                                let acc_terms = load_hotwords_for_accuracy(&config);
-                                // 410 item3：标点服务所需（进程级常驻服务线程；acc worker **不共享** ASR 的引擎）。
-                                let acc_punct_dir = model_dir.clone();
-                                let acc_punct_enabled = config.punctuation.enabled;
-                                Some(scope.spawn(move || {
-                                    let recognizer = send_offline.into_inner();
-                                    localrt_session::run_acc_windows(
-                                        recognizer,
-                                        cancel_acc,
-                                        acc_rx,
-                                        acc_terms,
-                                        acc_punct_dir,
-                                        acc_punct_enabled,
-                                        acc_script,
-                                        acc_event_tx,
-                                        session_generation,
-                                    )
-                                }))
-                            } else {
-                                None
-                            };
-
-                            let asr_handle = scope.spawn(move || {
-                                // into_inner 按值消费包装，强制闭包捕获整个 Send 包装
-                                // （Rust 2021 disjoint capture 若只取 .0 字段会退化为
-                                // 捕获裸引用，绕过 unsafe impl Send）。
-                                let recognizer = send_recognizer.into_inner();
-                                // LOCALRT-TAIL-WINDOW-407：长静默信号与切片共用同一 acc 通道（另一份发送端）。
-                                let acc_tx_long = acc_tx.clone();
-                                transcription::local_stream::transcribe_streaming_local(
-                                    chunk_rx,
-                                    recognizer,
-                                    Some(&cancel_clone),
-                                    punctuation,
-                                    config.audio.silence_threshold,
-                                    vad_device.as_str(),
-                                    |display_text, words, tentative| {
-                                        // OVERLAY-075：与在线流式同构，代际盖章。
-                                        // STREAM-SV-463：带上末尾未定字数（浮窗浅色）。
-                                        let _ = event_tx_clone.send(PipelineEvent::StreamingText(
-                                            session_generation,
-                                            display_text.to_string(),
-                                            words.to_vec(),
-                                            tentative,
-                                        ));
-                                    },
-                                    acc_cfg,
-                                    |idx,
-                                     committed_len,
-                                     segs,
-                                     seg_streaming,
-                                     seg_ranges,
-                                     seg_far| {
-                                        // 派发片送 accuracy worker（worker 不存在 ⇒ send 失败，忽略）。
-                                        let _ = acc_tx.send(AccInput::Slice((
-                                            idx,
-                                            committed_len,
-                                            segs,
-                                            seg_streaming,
-                                            seg_ranges,
-                                            seg_far,
-                                        )));
-                                    },
-                                    // LOCALRT-TAIL-WINDOW-407：长静默（≥1900ms）信号 ⇒ 走同一 acc 通道。
-                                    |pcm_pos| {
-                                        let _ = acc_tx_long.send(AccInput::LongSilence(pcm_pos));
-                                    },
-                                    |seg_index, committed_len| {
-                                        // 337：自适应边界冻结（a 文本停止增长 / b 有声恢复 / c 硬上限）。
-                                        let _ =
-                                            reflow_commit_tx.send(PipelineEvent::ReflowCommit {
-                                                generation: session_generation,
-                                                seg_index,
-                                                committed_len,
-                                            });
-                                    },
-                                    transcription::local_stream::PreviewRole::Local,
-                                )
-                            });
-
-                            let record_result = audio_capture.record_streaming(
-                                Arc::clone(&stop_recording_signal),
-                                config.audio.silence_threshold,
-                                config::SILENCE_DURATION_MS,
-                                config::MAX_RECORD_SECONDS,
-                                Some(Arc::clone(&audio_buf)),
-                                device_name,
-                                true, // FIX-283（方案 D）：仅本地流式裁剪 pre_roll 上一句残尾
-                                |chunk| match chunk_tx.send_timeout(
-                                    chunk.to_vec(),
-                                    Duration::from_millis(200),
-                                ) {
-                                    Ok(()) => {}
-                                    Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
-                                        ASR_CHUNK_DROPS.fetch_add(1, Ordering::Relaxed);
-                                        log::warn!(
-                                            "[ASR-DROP] chunk send timed out after 200ms (local streaming consumer stuck?); total dropped: {}",
-                                            ASR_CHUNK_DROPS.load(Ordering::Relaxed)
-                                        );
-                                    }
-                                    Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {}
-                                },
-                            );
-                            // drop chunk_tx 让 ASR 线程的 channel 断开（触发 flush 收尾）
-                            drop(chunk_tx);
-                            // tail_wait = 松键之后到「最终文本就绪」的等待（Gavin 要看的效果判据）。
-                            // 含 ASR flush + accuracy 尾片解码（中间片已在说话时并行算完）。
-                            let t_stop = std::time::Instant::now();
-                            let asr_result = asr_handle.join();
-                            // FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382（问题2）：路A（ASR flush）已结束，
-                            // 但路B 尾窗可能仍在解码 ⇒ **立即**推「收尾预览 + 识别处理中」，不等
-                            // `acc_handle.join()`（否则界面停在录音态，用户感知卡顿）。282 顺序不变：
-                            // 预览先、处理态后。文案与 `run_pipeline_core` 同源（`overlay_processing`）。
-                            // FIX-EDIT-STUCK-PROCESSING-439（P0）：取消路径（编辑点击 / Esc /
-                            // 停止按钮 / PTT 短按 —— 四者都置 cancel_signal）不再推「收尾预览 +
-                            // 识别处理中」。否则 controller 先切处理态（销毁 EDIT 控件），随后
-                            // Cancelled 又被编辑态压制臂拦下 ⇒ 永久卡「识别处理中」。
-                            // 取消在本代码库的唯一语义 = 不出字（:8718/:10123/:10236/:15390 各取消
-                            // 点均跳过转写/注入）；正常出字（松键 stop_recording、cancel 未置位）
-                            // 逐位不变（382「松键立即识别处理中」时延不受影响）。
-                            if cancel_signal.load(Ordering::Acquire) {
-                                log::info!(
-                                    "ASR-038-C: skip StreamingFinalPreview/Processing (cancel_signal set)"
-                                );
-                            } else {
-                                if let Ok(Ok((preview_text, _pcm))) = &asr_result {
-                                    if !preview_text.is_empty() {
-                                        let _ =
-                                            event_tx.send(PipelineEvent::StreamingFinalPreview(
-                                                preview_text.clone(),
-                                            ));
-                                    }
-                                }
-                                let _ = event_tx.send(PipelineEvent::Processing(
-                                    i18n::get(config.ui_language).overlay_processing.to_string(),
-                                ));
-                            }
-                            // 382（问题2 埋点）：松键 → 处理态显示的时延（仅 Windows）。
-                            #[cfg(target_os = "windows")]
-                            {
-                                if log::log_enabled!(log::Level::Debug) {
-                                    let stop_tick = STOP_RECEIVED_TICK.load(Ordering::Acquire);
-                                    if stop_tick != 0 {
-                                        log::debug!(
-                                            "[LocalRT-DBG-380] stop_to_processing_ms={}",
-                                            (unsafe { GetTickCount64() } as u32)
-                                                .wrapping_sub(stop_tick as u32)
-                                        );
-                                    }
-                                }
-                            }
-                            let acc_result = acc_handle.map(|h| h.join());
-                            (
-                                asr_result,
-                                record_result,
-                                acc_result,
-                                t_stop.elapsed().as_secs_f64() * 1000.0,
-                            )
-                        });
-                        let (asr_result, record_result, acc_result, tail_wait_ms) = scoped;
-
-                        // SLIDING-WINDOW-367：worker 返回 (定稿前缀, 最新窗口文本, all_native, 总解码ms)。
-                        let (
-                            acc_committed,
-                            acc_last_window,
-                            acc_all_native,
-                            acc_total_decode_ms,
-                            acc_vp_dropped_all,
-                        ) = match acc_result {
-                            Some(Ok((c, lw, an, total, vp, _))) => (c, lw, an, total, vp),
-                            Some(Err(_join_err)) => {
-                                log::error!("SLIDING-WINDOW-367 accuracy worker panicked");
-                                (String::new(), String::new(), false, 0.0, false)
-                            }
-                            None => (String::new(), String::new(), false, 0.0, false),
-                        };
-                        // 最终文本 = 定稿前缀（滑出片） + 最新窗口文本。
-                        let acc_joined = format!("{}{}", acc_committed, acc_last_window);
-                        if log::log_enabled!(log::Level::Debug) {
-                            log::debug!(
-                                "[SLIDING-WINDOW-367] join: committed={} window={} all_native={} total_decode={:.0}ms tail_wait={:.0}ms",
-                                acc_committed.chars().count(),
-                                acc_last_window.chars().count(),
-                                acc_all_native,
-                                acc_total_decode_ms,
-                                tail_wait_ms
                             );
                         }
-                        // ── DUAL-PATH-ACC-363：路B（累积全量解码，松手后**一次**）──
-                        // 全量音频 = ASR 线程返回的 `local_pcm`（`local_stream.rs:462` 第二元），
-                        // 无需在采集/回调路径额外累积 ⇒ **路A 主路径零新增开销**。
-                        // 路B 在 `acc_handle.join()` 之后才跑（路A worker 已结束）⇒ 不与预览刷新竞争。
-                        // 预算够且解码成功 ⇒ 用路B 全文；否则**降级**退回现有切片拼装（绝不硬塞，DEC-069）。
-                        // 🔴 SLIDING-WINDOW-367：路B（松手全量解码）+ 364 预算闸门**已摘接线**（保留代码可回挂）；
-                        //    最终文本改由滑动窗口（committed + 最新窗口）产出。恢复：把本 const 置 `true`。
-                        const PATH_B_WIRED_367: bool = false;
-                        let path_b_text: Option<String> = if PATH_B_WIRED_367 {
-                            // PIPE-REVIEW-498：词条只在路B 接线时读（原先无条件读库，白占松手关键路径）。
-                            let path_b_terms = load_hotwords_for_accuracy(&config);
-                            // 借用 `local_pcm`，不消费 `asr_result`（后面还要 destructure）。
-                            let pcm_opt: Option<&[f32]> = match &asr_result {
-                                Ok(Ok((_, pcm))) => Some(pcm.as_slice()),
-                                _ => None,
-                            };
-                            match pcm_opt {
-                                Some(pcm) if !pcm.is_empty() => {
-                                    let audio_secs = pcm.len() as f32 / 16000.0;
-                                    let audio_tokens =
-                                        transcription::expected_audio_tokens(pcm.len());
-                                    let inject_tokens = transcription::estimate_inject_tokens(
-                                        path_b_terms.as_deref(),
-                                    );
-                                    if transcription::path_b_budget_ok(
-                                        pcm.len(),
-                                        path_b_terms.as_deref(),
-                                    ) {
-                                        match transcriber
-                                            .as_ref()
-                                            .and_then(|t| t.offline_recognizer())
-                                        {
-                                            Some(rec) => {
-                                                // FIX-INJECT-TO-SPEC-377：注入只剩**纯词表**（上下文段已按
-                                                // sherpa 规格移除，见 `build_ctx_system`）。本块（366 起摘接线）
-                                                // 保留为可回挂路径，但不再传任何前文。
-                                                let inject = transcription::CtxInject {
-                                                    terms: path_b_terms.as_deref(),
-                                                    // 路B（367 起已摘接线）：无滑窗产出率均值 ⇒ 不判坍塌
-                                                    avg_chars_per_sec: None,
-                                                    // VAD-393：路B 无实时时间线 ⇒ 回退自跑 VAD 剪静音。
-                                                    speech_ranges: None,
-                                                    streaming_nonempty: false,
-                                                    new_slice_from: 0,
-                                                    assist: Default::default(),
-                                                };
-                                                match transcription::transcribe_acc_ctx(
-                                                    rec,
-                                                    pcm,
-                                                    config.audio.chinese_script,
-                                                    0,
-                                                    inject,
-                                                ) {
-                                                    Ok((t, _, _)) if !t.trim().is_empty() => {
-                                                        log::info!(
-                                                            "DUAL-PATH-363 路B 全量解成功：audio={:.1}s audio_tok={} inject_tok={} chars={}",
-                                                            audio_secs,
-                                                            audio_tokens,
-                                                            inject_tokens,
-                                                            t.chars().count()
-                                                        );
-                                                        Some(t)
-                                                    }
-                                                    Ok(_) => {
-                                                        log::info!(
-                                                            "DUAL-PATH-363 路B 全量解为空，退回切片拼装（audio={:.1}s）",
-                                                            audio_secs
-                                                        );
-                                                        None
-                                                    }
-                                                    Err(e) => {
-                                                        log::info!(
-                                                            "DUAL-PATH-363 路B 全量解失败，退回切片拼装：{}（audio={:.1}s）",
-                                                            e,
-                                                            audio_secs
-                                                        );
-                                                        None
-                                                    }
-                                                }
-                                            }
-                                            None => {
-                                                log::info!(
-                                                    "DUAL-PATH-363 路B 无 offline recognizer，退回切片拼装"
-                                                );
-                                                None
-                                            }
-                                        }
-                                    } else {
-                                        log::info!(
-                                            "DUAL-PATH-363 路B 降级（预算不足）：退回切片拼装；audio={:.1}s audio_tok={} inject_tok={} max_total_len={}",
-                                            audio_secs,
-                                            audio_tokens,
-                                            inject_tokens,
-                                            transcription::PATH_B_MAX_TOTAL_LEN
-                                        );
-                                        None
-                                    }
-                                }
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
-                        // 最终文本来源：路B（若成功）**整体替换**切片拼装（不再算拼接边界）。
-                        // REFLOW-FILLER-ONCE-441：最终文本与最后一次回灌取**同一份**去重结果
-                        // （同一纯函数、同一输入 `committed + last_window` ⇒ 逐字相同）；本管线最终节点不再去重。
-                        let final_src_deduped = apply_authoritative_filler_dedup(
-                            path_b_text.as_deref().unwrap_or(acc_joined.as_str()),
-                        );
-                        let final_src: &str = final_src_deduped.as_str();
-                        let pretranscribed = if acc_parallel_result_usable(
-                            cancel_signal.load(Ordering::Acquire),
-                            final_src,
-                        ) {
-                            let normalized = text_normalizer::normalize_text_for_language(
-                                final_src,
-                                config.audio.chinese_script,
-                            );
-                            // ── PUNCT-FINAL-REDO-350 节点（重打前先剥光标点）──
-                            // 🔴 PUNCT-REDO-493（DEC-112，推翻 DEC-080；Gavin 2026-10-19「就把精简输出的全部文本，
-                            //    把标点去掉，然后重新走一遍标点模型打标点」）：**重新挂上**。
-                            //  · 为何回挂：最终文本 = 定稿前缀 + 最新窗口，而每窗只含「上一片尾巴 + 新片」、
-                            //    片在停顿处切（442）⇒ 实为多片拼装；精解模型按音频停顿打标点、窗尾必补标点
-                            //    ⇒ 句子被切碎（Gavin 端测）。剥光后交标点模型（只看文字）整段按语义重打。
-                            //  · 门：用户开标点且非翻译（翻译路径下游不重打标点，剥了就丢）。开 LLM 时剥光文本交 LLM，
-                            //    LLM 失败退回时 `apply_local_punctuation` 照常重打。
-                            //  · 剥离只动「有效标点」：数字 / 字母夹持的 `3.14`、`1,000` 保留（`is_effective_punctuation`）。
-                            // 🔴 334 老 bug 不复发：剥光后 `native_punctuated` 恒 false ⇒ 引擎吃的是无标点文本，不会 `。。` 叠加。
-                            const B_STRIP_WIRED_367: bool = true;
-                            let b_strip_enabled = B_STRIP_WIRED_367
-                                && config.punctuation.enabled
-                                && !start.translate.load(Ordering::Acquire);
-                            let stripped = strip_punctuation_node(normalized, b_strip_enabled);
-                            // PUNCT-DOUBLE-334：第二元 = 「文本**实际**是否已有有效标点」（DEC-047 口径，
-                            // 与 :9855 的 Qwen3 分支同一 detector），**不是**「各分片是否都解码成功」。
-                            // 旧值 `acc_all_native` 语义错配：任一片失败 ⇒ 误判「无标点」⇒ 对已带标点全文
-                            // 再跑 CT-Transformer ⇒ `。。`/`，。` 叠加（Gavin 端测报障）。
-                            let native_punctuated = pretranscribed_native_punctuated(&stripped);
-                            Some((stripped, native_punctuated))
-                        } else if acc_vp_dropped_all && !cancel_signal.load(Ordering::Acquire) {
-                            // VOICEPRINT-LEAK-460：滑窗结果空、原因是声纹把语音全剔（非本人）⇒ 交空文本 ⇒ 下游按
-                            // 「未检测到语音」处理，**不走**整段兜底解码（那条路不经声纹，会把他人话打出来；
-                            // Gavin 09-30 放视频端测：「刚才的这番打斗……梅姨走了进来」被打出）。
-                            log::info!(
-                                "[VOICEPRINT-LEAK-460] all speech dropped by voiceprint ⇒ no full-recording fallback"
-                            );
-                            Some((String::new(), false))
-                        } else {
-                            None
-                        };
+                        let vocabulary = crate::transcription::load_wordbook_vocabulary();
+                        crate::transcription::qwen_inference::transcribe_streaming_realtime(
+                            &asr_online_url,
+                            &qwen_api_key,
+                            &asr_online_model,
+                            chunk_rx,
+                            &vocabulary,
+                            asr_online_max_sentence_silence,
+                            asr_online_semantic_punctuation_enabled,
+                            Some(&cancel_clone),
+                            on_result,
+                        )
+                    });
 
-                        log::info!(
-                            "[Latency] local realtime record_streaming() completed after +{:.1}ms",
-                            t_worker.elapsed().as_secs_f64() * 1000.0
-                        );
-                        is_recording.store(false, Ordering::Release);
-
-                        if cancel_signal.load(Ordering::Acquire) {
-                            log::warn!(
-                                "LocalRealtime recording ended with cancel_signal=true, skipping ASR join"
-                            );
-                            send_event(&event_tx, PipelineEvent::Cancelled);
-                            continue;
-                        }
-                        if let Err(e) = record_result {
-                            log::error!("LocalRealtime recording error: {}", e);
-                            send_event(&event_tx, PipelineEvent::Error(e.to_string()));
-                            continue;
-                        }
-
-                        // 382（问题2）：收尾预览已在 `acc_handle.join()` **之前**发出（见上，
-                        // `StreamingFinalPreview` 立刻上屏、不等路B 尾窗）⇒ 这里的预览文本不再重复发送
-                        //（否则会把已切到处理态的浮层拉回预览态 = 闪回）。最终文本仍由 accuracy 2pass 重打。
-                        let (_final_preview, local_pcm) = match asr_result {
-                            // 预览文本本用于收尾显示（282）；最终文本仍由 accuracy 2pass 重打（DEC-067）。
-                            Ok(Ok((preview_text, pcm))) => (preview_text, pcm),
-                            Ok(Err(e)) => {
-                                if e.is::<transcription::NoSpeechError>() {
-                                    log::info!("LocalRealtime ASR: no speech detected");
-                                    send_event(&event_tx, PipelineEvent::NoSpeech);
-                                } else {
-                                    log::error!("LocalRealtime ASR error: {}", e);
-                                    send_event(&event_tx, PipelineEvent::Error(e.to_string()));
-                                }
-                                continue;
-                            }
-                            Err(_) => {
-                                log::error!("LocalRealtime ASR thread panicked");
-                                send_event(
-                                    &event_tx,
-                                    PipelineEvent::Error("ASR thread panicked".into()),
-                                );
-                                continue;
-                            }
-                        };
-
-                        // LOCALRT-FIRSTCHAR-282 的 `StreamingFinalPreview` 发送已上移到
-                        // `acc_handle.join()` 之前（382 问题2）⇒ 此处不再发送，避免把已切到处理态的浮层
-                        // 拉回预览态（闪回）。`StreamingText` 仍会被 `STREAMING_STOPPED` latch 丢掉。
-
-                        // 下游与批处理路径同构：PCM 作 samples，initial_text=None。
-                        let transcriber = match &transcriber {
-                            Some(t) => t,
-                            None => {
-                                log::error!("Transcriber not initialized");
-                                send_event(
-                                    &event_tx,
-                                    PipelineEvent::Error("Transcriber unavailable".into()),
-                                );
-                                continue;
-                            }
-                        };
-                        llm_client.update_config(config.llm.clone());
-                        // MEM-453：不再预加载；方向切换由 ensure_translation_direction 复用进程级模型。
-                        if !config.translation.enabled {
-                            cached_translation = None;
-                        }
-                        if config.punctuation.enabled && cached_punctuation.is_none() {
-                            cached_punctuation = punctuation::PunctuationEngine::new(&model_dir);
-                        } else if !config.punctuation.enabled {
-                            cached_punctuation = None;
-                        }
-                        // REFLOW-FILLER-ONCE-441（DEC-066 本管线显式声明）：用的是回灌前已去重的精解文本
-                        // ⇒ 最终节点不再去重；退回内部 accuracy 2pass（pretranscribed=None）时该文本未去重 ⇒ 照常去重。
-                        let filler_node = if pretranscribed.is_some() {
-                            FinalFillerNode::DoneUpstream
-                        } else {
-                            FinalFillerNode::AtFinal
-                        };
-                        let local_audio = Arc::new(local_pcm.clone()); // STATS-475 / 480
-                        run_pipeline_core(
-                            Ok(local_pcm),
-                            transcriber,
-                            &rt,
-                            &llm_client,
-                            &cancel_signal,
-                            &config,
-                            &runtime_config,
-                            &mut cached_translation,
-                            &model_dir,
-                            cached_punctuation.as_mut(),
-                            start.target_hwnd,
-                            &event_tx,
-                            start.translate,
-                            None, // 非流式：主通道 ITN 启用（B 路径由 pretranscribed 显式承载）
-                            pretranscribed, // PARALLEL-ACC-298: 并行 accuracy 结果（关时 None ⇒ 原有 accuracy 2pass）
-                            i18n::get(config.ui_language).overlay_processing,
-                            filler_node,
-                            UsageSource {
-                                category: usage_stats::UsageCategory::LocalStreaming,
-                                audio: local_audio,
-                            },
-                        );
-                        continue;
-                    }
-
-                    let samples_result = audio_capture.record(
+                    // STATS-475 / FLASH-P3-A：本次送出的 16k 音频样本数（统计时长 = 整段送出音频时长）。
+                    let mut sent_samples: usize = 0;
+                    // worker 线程跑 record_streaming，推 chunk 给 ASR 线程
+                    let record_result = audio_capture.record_streaming(
                         Arc::clone(&stop_recording_signal),
                         config.audio.silence_threshold,
                         config::SILENCE_DURATION_MS,
                         config::MAX_RECORD_SECONDS,
                         Some(Arc::clone(&audio_buf)),
                         device_name,
+                        false, // FIX-283: 在线流式路径不做 pre_roll 残尾裁剪
+                        |chunk| {
+                            sent_samples += chunk.len();
+                            // ASR-074-GUARD: bounded channel send was an unbounded
+                            // blocking send — if the ASR thread stopped consuming
+                            // (WS stuck / server silent / half-open connection),
+                            // chunk_tx fills and the recording thread never returns:
+                            // release-hotkey presents as a frozen app. 200ms cap:
+                            // a healthy consumer drains 256 chunks in milliseconds,
+                            // so 200ms is 20x headroom above normal send latency;
+                            // at worst the recording thread stalls 200ms per chunk
+                            // instead of forever. Timeout = drop the chunk with a
+                            // counted warn (same drop-visibility principle as
+                            // ASR-074 Step 2-C's [ASR-DROP] tag) — never silently.
+                            match chunk_tx.send_timeout(chunk.to_vec(), Duration::from_millis(200))
+                            {
+                                Ok(()) => {}
+                                Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
+                                    ASR_CHUNK_DROPS.fetch_add(1, Ordering::Relaxed);
+                                    log::warn!(
+                                        "[ASR-DROP] chunk send timed out after 200ms (ASR consumer stuck?); total dropped: {}",
+                                        ASR_CHUNK_DROPS.load(Ordering::Relaxed)
+                                    );
+                                }
+                                Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                                    // ASR thread gone: drop silently, the recording
+                                    // session is being torn down anyway.
+                                }
+                            }
+                        },
                     );
+                    // drop chunk_tx 让 ASR 线程的 channel 断开（触发 finish-task）
+                    drop(chunk_tx);
+
                     log::info!(
-                        "[Latency] record() completed after +{:.1}ms",
+                        "[Latency] record_streaming() completed after +{:.1}ms",
                         t_worker.elapsed().as_secs_f64() * 1000.0
                     );
                     is_recording.store(false, Ordering::Release);
+
                     if cancel_signal.load(Ordering::Acquire) {
-                        log::warn!("Recording ended with cancel_signal=true, skipping transcription (user cancelled or race condition)");
+                        log::warn!(
+                            "Streaming recording ended with cancel_signal=true, skipping ASR join"
+                        );
                         send_event(&event_tx, PipelineEvent::Cancelled);
                         continue;
                     }
 
-                    let transcriber = match &transcriber {
-                        Some(t) => t,
-                        None => {
-                            log::error!("Transcriber not initialized at startup");
+                    if let Err(e) = record_result {
+                        log::error!("Streaming recording error: {}", e);
+                        send_event(&event_tx, PipelineEvent::Error(e.to_string()));
+                        // ASR 线程会因 channel 断开自行退出
+                        continue;
+                    }
+
+                    // join ASR 线程拿最终文本
+                    let asr_result = match asr_handle.join() {
+                        Ok(r) => r,
+                        Err(_) => {
+                            log::error!("ASR thread panicked");
                             send_event(
                                 &event_tx,
-                                PipelineEvent::Error("Transcriber unavailable".into()),
+                                PipelineEvent::Error("ASR thread panicked".into()),
                             );
                             continue;
                         }
                     };
+                    let online_final = match asr_result {
+                        Ok(f) => f,
+                        Err(e) => {
+                            // BUG-119: 流式 ASR「没识别到语音」= 类型化信号 → 信息提示，
+                            // 不进 convert_to_friendly_error 错误链
+                            if e.is::<transcription::NoSpeechError>() {
+                                log::info!("Streaming ASR: no speech detected");
+                                send_event(&event_tx, PipelineEvent::NoSpeech);
+                            } else {
+                                log::error!("Streaming ASR error: {}", e);
+                                send_event(&event_tx, PipelineEvent::Error(e.to_string()));
+                            }
+                            continue;
+                        }
+                    };
 
-                    // PERF-INIT-001: Reuse pre-initialized LlmClient; update config only.
                     llm_client.update_config(config.llm.clone());
 
-                    // MEM-453：不再预加载 NLLB；方向切换由 ensure_translation_direction 复用进程级模型。
-                    if !config.translation.enabled {
-                        cached_translation = None;
-                    }
-                    // PUNCT-INTEGRATION-001: Hot-reload PunctuationEngine on config change.
-                    if config.punctuation.enabled && cached_punctuation.is_none() {
-                        cached_punctuation = punctuation::PunctuationEngine::new(&model_dir);
-                    } else if !config.punctuation.enabled {
-                        cached_punctuation = None;
-                    }
-                    log::debug!(
-                        "Starting run_pipeline: cancel_signal={}",
-                        cancel_signal.load(Ordering::Relaxed)
-                    );
-                    // STATS-475 / 480：批处理录音（16k），有效语音时长在后台统计线程里算。
-                    let batch_audio =
-                        Arc::new(samples_result.as_ref().cloned().unwrap_or_default());
+                    // FLASH-P3-A：PUNCT-478 接缝标点重判（repair_online_seams，用本地 CT / 日韩标点模型）删除 ——
+                    // 文字原样进后续处理。连 flashasr 时服务端已整段重打标点；直连阿里的接缝误句号交给
+                    // 阿里「语义断句」（隐藏配置）或输出优化大模型。`online_final.seams` 不再使用。
                     run_pipeline_core(
-                        samples_result,
-                        transcriber,
+                        online_final.text,
                         &rt,
                         &llm_client,
                         &cancel_signal,
                         &config,
                         &runtime_config,
-                        &mut cached_translation,
-                        &model_dir,
-                        cached_punctuation.as_mut(),
                         start.target_hwnd,
                         &event_tx,
                         start.translate,
-                        None,
-                        None, // PARALLEL-ACC-298: 批处理路径无并行预转写
-                        i18n::get(config.ui_language).overlay_transcribing,
-                        FinalFillerNode::AtFinal, // 441：批处理路径最终节点去重逐位不变
                         UsageSource {
-                            category: usage_category(transcriber.asr_model()),
-                            audio: batch_audio,
+                            category: usage_stats::UsageCategory::OnlineAsr,
+                            speech_ms: speech_ms_16k(sent_samples),
                         },
                     );
                 }
@@ -9701,11 +8248,6 @@ fn run_controller(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
     // the controller thread by every PipelineEvent::StreamingText, so it always matches the text
     // the user saw before entering overlay edit mode.
     let last_streaming_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    // FIX-REFLOW-RAW-BASE-420：最近一次**原始**（合成前）`StreamingText`（带 generation）。
-    // 回灌渲染的底稿必须用**原始流式坐标**（`committed_len` 就是原始流式字符坐标）；用镜像
-    // （= acc 前缀 + 流式尾的**合成**文本）会错位（BUILD-419 05:18 实证：镜像 131、acc 126、
-    // committed 124 ⇒ 预览多挂 7 个已被精解覆盖的旧字）。与镜像**分开存放**，互不影响。
-    let last_raw_streaming_text: Arc<Mutex<Option<(u64, String)>>> = Arc::new(Mutex::new(None));
     loop {
         let ret = unsafe { GetMessageW(&mut msg, HWND::default(), 0, 0) };
         if ret.0 <= 0 {
@@ -9738,7 +8280,6 @@ fn run_controller(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
                     &cancel_signal,
                     &is_recording,
                     &last_streaming_text,
-                    &last_raw_streaming_text,
                 )?;
                 if should_exit {
                     log::info!("Controller events returned true, initiating shutdown");
@@ -9765,7 +8306,6 @@ fn run_controller(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
                     &cancel_signal,
                     &is_recording,
                     &last_streaming_text,
-                    &last_raw_streaming_text,
                 )?;
                 if should_exit {
                     log::info!("Controller hotkey wake returned true, initiating shutdown");
@@ -9793,7 +8333,6 @@ fn run_controller(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
                     &cancel_signal,
                     &is_recording,
                     &last_streaming_text,
-                    &last_raw_streaming_text,
                 )?;
                 if should_exit {
                     log::info!("Controller pipeline wake returned true, initiating shutdown");
@@ -9987,10 +8526,6 @@ fn run_controller_macos(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
                 }
                 recv(logic_tray_cmd_rx) -> cmd => {
                     match cmd {
-                        // ASR-SERVER-491 S7：与 Windows 同一开关逻辑（平台中立）。
-                        Ok(platform::TrayCommand::ToggleAsrService) => {
-                            asr_service::supervisor::toggle_from_tray();
-                        }
                         Ok(platform::TrayCommand::OpenSettings) => {
                             log::info!("macOS tray: open settings requested");
                             match spawn_settings_process() {
@@ -10021,12 +8556,9 @@ fn run_controller_macos(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
             // 消费 pipeline 事件（本轮仅打日志，FocusLost 复制剪贴板）
             let logic_cfg = clone_runtime_config(&logic_runtime_config);
             let logic_ui_language = logic_cfg.ui_language;
-            // UI-REC-472：本地实时模型加载中（未就绪）⇒ RecordingStarted 不弹录音窗（保留加载提示）。
-            let localrt_loading = transcription::AsrModel::from_config(&logic_cfg.audio.asr_model)
-                == transcription::AsrModel::LocalRealtime
-                && !LOCALRT_ENGINE_READY.load(Ordering::Acquire);
+            // FLASH-P3-A：UI-REC-472「本地实时模型加载中不弹录音窗」门随本地引擎删除。
             while let Ok(event) = pipeline_event_rx.try_recv() {
-                handle_pipeline_event(&event, logic_ui_language, localrt_loading);
+                handle_pipeline_event(&event, logic_ui_language);
             }
         }
         log::info!("macOS logic thread exiting");
@@ -10140,24 +8672,8 @@ fn overlay_request_for_event(event: &PipelineEvent) -> platform::OverlayRequest 
             message: String::new(), // 文案由 handle_pipeline_event 按 ui_language 补齐
             auto_close_ms: 2500,
         },
-        // LOCAL-RT-ENGINE-239-B: macOS 侧无独立 Info 视觉样式，复用 ShowError 承载（同 NoSpeech 先例）。
-        PipelineEvent::Info(message) => platform::OverlayRequest::ShowError {
-            message: message.clone(),
-            auto_close_ms: 2500,
-        },
-        // LOCAL-RT-ENGINE-239-B: 模型缺失 → 错误提示（文案携带在 payload）。
-        PipelineEvent::ModelUnavailable(message) => platform::OverlayRequest::ShowError {
-            message: message.clone(),
-            auto_close_ms: 4000,
-        },
         PipelineEvent::FocusLost(text) => platform::OverlayRequest::ShowPreview(text.clone()),
         PipelineEvent::StreamingText(_, _, _, _) => platform::OverlayRequest::Show, // macOS 侧流式文本暂不渲染
-        // LOCALRT-FIRSTCHAR-282: 本地流式收尾预览（macOS 侧流式文本暂不渲染，同 StreamingText）
-        PipelineEvent::StreamingFinalPreview(_) => platform::OverlayRequest::Show,
-        // ACC-PREVIEW-REFLOW-325: 本地档 accuracy 回灌预览（macOS 侧流式文本暂不渲染，同 StreamingText）
-        PipelineEvent::PreviewReflow { .. } => platform::OverlayRequest::Show,
-        // LOCALRT-SEAM-337: 回灌边界提交/作废（macOS 侧暂不渲染，同上）
-        PipelineEvent::ReflowCommit { .. } => platform::OverlayRequest::Show,
         PipelineEvent::Done | PipelineEvent::Cancelled => platform::OverlayRequest::Hide,
     }
 }
@@ -10170,13 +8686,8 @@ fn overlay_request_for_event(event: &PipelineEvent) -> platform::OverlayRequest 
 /// OVERLAY-003：FocusLost → ShowPreview（失焦返显浮层，不自动关闭）；Done/Cancelled → Hide。
 /// overlay 指令由纯函数 `overlay_request_for_event` 统一计算（可单测锁死真值表）；
 /// FormatFailed / NoSpeech / Error 的文案在调用侧按 ui_language 补齐（Error 经 convert_to_friendly_error）。
-/// UI-REC-472：`localrt_loading` = 配置为本地实时且模型尚未加载完 ⇒ RecordingStarted 不弹录音窗。
 #[cfg(target_os = "macos")]
-fn handle_pipeline_event(
-    event: &PipelineEvent,
-    ui_language: config::UiLanguage,
-    localrt_loading: bool,
-) {
+fn handle_pipeline_event(event: &PipelineEvent, ui_language: config::UiLanguage) {
     // OVERLAY-002: FormatFailed 的展示文案依赖 ui_language，纯函数拿不到，这里补齐后发请求。
     // 其余事件直接用纯函数的映射结果（overlay_request_for_event 是唯一决策源）。
     let req = match event {
@@ -10195,10 +8706,7 @@ fn handle_pipeline_event(
         },
         _ => overlay_request_for_event(event),
     };
-    // UI-REC-472（Gavin 10-03「模型正在加载中，就先不要显示录音预览窗口，等模型加载完毕再显示」）。
-    if !(localrt_loading && matches!(event, PipelineEvent::RecordingStarted)) {
-        platform::request_overlay(req);
-    }
+    platform::request_overlay(req);
     match event {
         PipelineEvent::RecordingStarted => {
             log::info!("macOS pipeline: RecordingStarted");
@@ -10241,44 +8749,9 @@ fn handle_pipeline_event(
             log::info!("macOS pipeline: NoSpeech (信息提示：请说话哦..)");
             platform::request_tray_state(TrayState::Idle, ui_language);
         }
-        // LOCAL-RT-ENGINE-239-B: 本地流式档位加载提示 / 模型缺失
-        PipelineEvent::Info(msg) => {
-            log::info!("macOS pipeline: Info({})", msg);
-            platform::request_tray_state(TrayState::Idle, ui_language);
-        }
-        PipelineEvent::ModelUnavailable(msg) => {
-            log::error!("macOS pipeline: ModelUnavailable({})", msg);
-            platform::request_tray_state(TrayState::Error, ui_language);
-        }
         PipelineEvent::StreamingText(_, text, _, _) => {
             // ASR-038-B: macOS 侧流式文本暂不渲染（C-overlay 批后续实现）
             log::debug!("macOS pipeline: StreamingText ({} chars)", text.len());
-        }
-        // LOCALRT-FIRSTCHAR-282: 本地流式收尾预览（macOS 侧流式文本暂不渲染）
-        PipelineEvent::StreamingFinalPreview(text) => {
-            log::debug!(
-                "macOS pipeline: StreamingFinalPreview ({} chars)",
-                text.len()
-            );
-        }
-        // ACC-PREVIEW-REFLOW-325: 本地档 accuracy 回灌预览（macOS 侧流式文本暂不渲染）
-        PipelineEvent::PreviewReflow { acc_text, .. } => {
-            log::debug!(
-                "macOS pipeline: PreviewReflow ({} chars, 本地档专用，暂不渲染)",
-                acc_text.chars().count()
-            );
-        }
-        // LOCALRT-SEAM-337: 回灌边界提交/作废（macOS 侧暂不渲染）
-        PipelineEvent::ReflowCommit {
-            seg_index,
-            committed_len,
-            ..
-        } => {
-            log::debug!(
-                "macOS pipeline: ReflowCommit(seg={}, {:?}, 本地档专用，暂不渲染)",
-                seg_index,
-                committed_len
-            );
         }
     }
 }
@@ -10410,8 +8883,7 @@ fn main() -> Result<()> {
             let _ = std::mem::ManuallyDrop::new(file);
         }
     }
-    // ASR-SERVER-491 S4c：识别服务看护（总开关关着时只每秒看一次设置文件的修改时间，不建管道不起进程）。
-    asr_service::supervisor::spawn(Arc::clone(&runtime_config));
+    // FLASH-P3-A：识别服务看护（asr_service::supervisor）随本机识别服务删除（识别服务在 flashasr）。
     #[cfg(target_os = "windows")]
     run_controller(runtime_config)?;
     #[cfg(target_os = "macos")]
@@ -10423,4167 +8895,6 @@ fn main() -> Result<()> {
         log::warn!("Non-Windows/non-macOS platform is not supported in controller mode yet");
     }
     Ok(())
-}
-
-/// FIRSTCHAR-FIX-006 (R3): Find the effective keep-start point in 16kHz samples
-/// by locating speech onset and backtracking a margin to preserve weak aspirated
-/// consonants.  Returns the sample index at which to begin keeping audio;
-/// everything before this index is leading silence to be trimmed.
-///
-/// - Scans in 160-sample (10ms@16kHz) windows for RMS exceeding `threshold`
-/// - Backtracks `backtrack_samples` from the onset to include consonant attack
-/// - If no speech is detected, returns 0 (keep everything — "speak before key" case)
-/// - If speech starts before `backtrack_samples`, returns 0 (no trimming needed)
-fn find_speech_onset_with_backtrack(
-    samples: &[f32],
-    threshold: f32,
-    backtrack_samples: usize,
-) -> usize {
-    let window_size = 160; // 10ms @ 16kHz
-    let mut onset: Option<usize> = None;
-    let mut idx = 0;
-    while idx + window_size <= samples.len() {
-        let window = &samples[idx..idx + window_size];
-        let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
-        if rms > threshold {
-            onset = Some(idx);
-            break;
-        }
-        idx += window_size;
-    }
-
-    match onset {
-        Some(on) => on.saturating_sub(backtrack_samples),
-        None => 0,
-    }
-}
-
-/// ASR-ACC-OPT-001 方案 B + ASR-CTC-OPT-001 P1：根据 ASR 模型选择前处理参数。
-///
-/// 返回 (silence_head_samples, onset_backtrack_samples)。
-/// - Performance: 0ms head / 200ms backtrack（ASR-CTC-OPT-001 P1：50→0ms，
-///   研究 RESEARCH-ASR-CTC-OPT-001 C1 证实 0ms 比 50ms 高 2.5pp，50ms 是旧
-///   SenseVoice 遗产，FunASR Nano CTC 是 offline 模型不需 frame alignment padding）
-/// - Accuracy: 0ms head / 100ms backtrack（native decoder 对前导静音敏感，
-///   研究 RESEARCH-ASR-ACCURACY-001 R1 证实 50ms 静音头让 native 掉 10pp）
-///
-/// 提取为纯函数便于单测分支选择逻辑。
-// MACOS-P4-NEUTRAL-001: 原 #[cfg(target_os = "windows")] 去除——此函数为平台中立纯 Rust 逻辑，
-// run_pipeline_core（无 cfg）调用之，macOS 需可见。对 Windows 构建该 cfg 恒为真，删除为 no-op。
-fn select_preprocessing_params(asr_model: transcription::AsrModel) -> (usize, usize) {
-    const PERF_SILENCE_HEAD_SAMPLES: usize = 0; // 0ms @ 16kHz (performance, ASR-CTC-OPT-001 P1)
-    const PERF_ONSET_BACKTRACK_SAMPLES: usize = 3200; // 200ms @ 16kHz (performance, 不动)
-    const ACC_SILENCE_HEAD_SAMPLES: usize = 0; // 0ms @ 16kHz (accuracy)
-    const ACC_ONSET_BACKTRACK_SAMPLES: usize = 1600; // 100ms @ 16kHz (accuracy)
-
-    match asr_model {
-        transcription::AsrModel::Accuracy => {
-            (ACC_SILENCE_HEAD_SAMPLES, ACC_ONSET_BACKTRACK_SAMPLES)
-        }
-        transcription::AsrModel::Performance => {
-            (PERF_SILENCE_HEAD_SAMPLES, PERF_ONSET_BACKTRACK_SAMPLES)
-        }
-        // LOCAL-RT-ENGINE-239-A（DEC-067）：前处理跟 **Accuracy** 走。
-        // 本管线 2pass 的最终转录引擎就是 accuracy，前处理必须与实际引擎匹配，
-        // 配错直接吃首字（FIRSTCHAR-FIX-006）。非 online 档，走完整 samples 前处理。
-        transcription::AsrModel::LocalRealtime => {
-            (ACC_SILENCE_HEAD_SAMPLES, ACC_ONSET_BACKTRACK_SAMPLES)
-        }
-        transcription::AsrModel::QwenAudioOnline
-        | transcription::AsrModel::FunAsrRealtime
-        | transcription::AsrModel::FeiyinServer => {
-            // DEC-028 / RESEARCH-ASR-038 / ASR-038-B / ASR-041-B / ASR-056: 在线 ASR 模型
-            // （在线模型对前导静音不敏感，保持与 CTC 一致的前处理行为）
-            //
-            // ASR-038-B 真流式拍板后更新：
-            // silence_head / onset_backtrack 是批处理前处理概念，在 run_pipeline_core
-            // 用于 trim/pad 完整 samples 数组后送转录。真流式路径（QwenAudioOnline /
-            // FunAsrRealtime 走 record_streaming + transcribe_streaming_realtime）【绕过】本前处理，
-            // 原因是边录边发无完整 samples 可 trim。真流式的前导静音由 VAD 入口门控
-            // 处理（VAD 命中前的 chunk 缓冲后补发，不裁剪），详见 transcribe_streaming_realtime。
-            // 本 match 分支仅对非流式回退路径（transcribe_with_punct_info 内的
-            // QwenAudioOnline/FunAsrRealtime 分支）生效，真流式主路径不走这里。
-            (PERF_SILENCE_HEAD_SAMPLES, PERF_ONSET_BACKTRACK_SAMPLES)
-        }
-    }
-}
-
-// MACOS-P4-NEUTRAL-001/002: run_pipeline 薄封装已删除（零调用者，自证见 result.md）。
-// macOS 侧的调用者由 run_controller_macos 经 spawn_worker_thread 间接调用本函数（NEUTRAL-002 接线）。
-// ASR-045: 流式模式（initial_text = Some）下 samples 为空是正常情况——音频已逐块直传
-// ASR 线程（record_streaming → chunk channel → transcribe_streaming_realtime），finish-task
-// 后以文本落回 initial_text，管线无需也不再消费 samples（见 :3409 调用侧「流式模式不用 samples」）。
-// 只有「既无音频样本、也无流式文本」才真正没录到东西，需要取消管线。
-// 判定为纯函数：护栏测试直接断言，回滚修复（判空条件还原）时测试即红。
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn should_cancel_on_empty(samples: &[f32], initial_text: &Option<String>) -> bool {
-    samples.is_empty() && initial_text.is_none()
-}
-/// BUG-119: 转录失败三分类。载体必须是本枚举而非 String —— 拦截点在 map_err，
-/// 此刻 anyhow::Error 还带类型，downcast NoSpeechError 是「没说话」与
-/// 「设备/模型异常」的唯一区分手段；转成 String 后一切只能靠关键词嗅探。
-#[derive(Debug)]
-enum TranscriptionFailure {
-    /// 「用户没说话」类型化信号 → 上层发 PipelineEvent::NoSpeech 信息提示。
-    /// 新增第三个产出源（transcription 内 bail!(NoSpeechError)）零改此处。
-    NoSpeech,
-    /// 其余错误转字符串，走既有 convert_to_friendly_error 显示链。
-    Other(String),
-}
-
-/// VAD-393（A3）：把「窗内各片的片内语音区间」按各片样本数偏移，拼成**窗内坐标**的合并区间表。
-///
-/// `slices[k]` 为第 k 片的 `Option<区间表>`（`None` = 该片无实时时间线）；`lens[k]` 为第 k 片样本数。
-/// 任一源片为 `None` ⇒ 返回 `None`（整窗回退自跑 VAD）；全为 `Some` ⇒ 拼接（不做合并，语义上
-/// 各片区间本就不重叠）。纯函数，可单测。
-fn shift_and_concat_ranges(
-    slices: &[Option<Vec<(usize, usize)>>],
-    lens: &[usize],
-) -> Option<Vec<(usize, usize)>> {
-    let mut out: Vec<(usize, usize)> = Vec::new();
-    let mut offset = 0usize;
-    for (i, s) in slices.iter().enumerate() {
-        let ranges = s.as_ref()?;
-        for &(a, b) in ranges {
-            out.push((a + offset, b + offset));
-        }
-        offset += lens.get(i).copied().unwrap_or(0);
-    }
-    Some(out)
-}
-
-/// PARALLEL-ACC-298：把 accuracy 并行各片的子段文本按 `seg_index` **升序**拼接成扁平列表。
-///
-/// 单 worker + channel FIFO 已保证顺序，这里仍显式排序（乱序/缺号输入也稳定），
-/// 是判据 #3「seg_index 有序拼接」的纯函数载体（可单测，无需真模型）。
-// SLIDING-WINDOW-367：单窗口解码（窗口音频 + 注入集中一处）。
-fn decode_window(
-    recognizer: &transcription::AccEngine,
-    window_audio: &[f32],
-    window_seq: usize,
-    script: config::ChineseScript,
-    terms: Option<&str>,
-    // FIX-PREVIEW-STALE-AND-COLLAPSE-375（B）：本次录音已定稿窗口的产出率均值快照（冷启动 None）。
-    avg_chars_per_sec: Option<f32>,
-    // VAD-393（A3）：本窗**窗内坐标**的语音区间（实时 VAD 时间线映射而来）；`None` ⇒ 回退自跑 VAD。
-    speech_ranges: Option<&[(usize, usize)]>,
-    // VAD-393（A4）：本窗流式文本是否非空（区间为空串时决定「整窗解码 vs 提前返回」）。
-    streaming_nonempty: bool,
-    // SPEAKER-VERIFY-408B：本窗新片起点样本下标（声纹注册只计新片）。
-    new_slice_from: usize,
-    // ACC-452：本窗解码提示（② 预览草稿）。
-    hints: &AccHints,
-    // ACC-452 ⑤：逐字回调（流式回灌；`None` = 不回调）。
-    on_partial: Option<&(dyn Fn(&str) + Sync)>,
-) -> anyhow::Result<(String, bool, transcription::AccDropStats)> {
-    transcription::transcribe_acc_ctx(
-        recognizer,
-        window_audio,
-        script,
-        window_seq,
-        transcription::CtxInject {
-            terms,
-            avg_chars_per_sec,
-            speech_ranges,
-            streaming_nonempty,
-            new_slice_from,
-            assist: transcription::llama_asr::DecodeAssist {
-                draft: (!hints.draft.is_empty()).then_some(hints.draft.as_str()),
-                on_partial,
-            },
-        },
-    )
-}
-
-// SLIDING-WINDOW-367：路A 逐片拼装摘接线后暂无人用（**保留可回挂**）。
-#[allow(dead_code)]
-fn assemble_parallel_accuracy(mut segments: Vec<(usize, Vec<String>)>) -> Vec<String> {
-    segments.sort_by_key(|(idx, _)| *idx);
-    segments.into_iter().flat_map(|(_, texts)| texts).collect()
-}
-
-/// PARALLEL-ACC-298：并行 accuracy 结果是否可用作 `pretranscribed`。
-///
-/// 🔴 取消 ⇒ 一律弃用（判据 #3「取消时不带脏结果」）；拼接后为空 ⇒ 弃用回落旧路径
-/// （与 BUG-119「没说话」路径一致，由旧路径给出 NoSpeech）。
-fn acc_parallel_result_usable(cancelled: bool, joined: &str) -> bool {
-    !cancelled && !joined.trim().is_empty()
-}
-
-/// VOICEPRINT-LEAK-460：本次录音是否「声纹把语音全剔」——没有任何保留的本人语音、且确有被剔除的语音。
-/// 为真且滑窗结果为空 ⇒ 不走整段兜底解码（兜底不经声纹）。
-fn voiceprint_dropped_all(kept_secs: f32, dropped_secs: f32) -> bool {
-    kept_secs <= 0.0 && dropped_secs > 0.0
-}
-
-/// LOCALRT-REFLOW-HOLE-344-G：空/失败分片的填补决策（纯函数，可单测）。
-///
-/// 返回 `(填补文本, 是否记洞)`：
-/// - `can_fill && !seg_streaming.is_empty()` ⇒ **用该段流式文本填补，不记洞**（回灌不中断）；
-/// - 否则（流式也为空 / 多子段保守 / 本片已填过）⇒ `("", true)`，走 `SkippedHole` 兜底。
-///
-/// 🔴 修的是 325 的设计硬伤：累积 `acc_text` 一旦留空 ⇒ `has_hole` 永不复位 ⇒ 一片失败后
-/// 本次录音**后续回灌全废**。失败片用流式文本填满即无洞。
-// SLIDING-WINDOW-367：路A 失败片填补摘接线后暂无人用（**保留可回挂**）。
-#[allow(dead_code)]
-fn hole_fill_decision(can_fill: bool, seg_streaming: &str) -> (String, bool) {
-    if can_fill && !seg_streaming.is_empty() {
-        (seg_streaming.to_string(), false)
-    } else {
-        (String::new(), true)
-    }
-}
-
-/// PUNCT-DOUBLE-334：本地并行 accuracy 文本的 `native_punctuated` 判定。
-///
-/// DEC-047 口径 = **文本实测**：`punctuation::has_effective_punctuation`（词内嵌标点豁免，
-/// `3.14`/`3:30`/`example.com` 不算真标点），与 `main.rs` 的 Qwen3 `initial_text` 分支同一 detector。
-///
-/// 🔴 为什么不能用「各分片是否都解码成功」（原 `acc_all_native` 的语义）：分片失败 ≠ 文本无标点。
-/// 任一片 Err ⇒ 旧值 false ⇒ `apply_local_punctuation` 的 `!native_punctuated` 门通过 ⇒
-/// CT-Transformer 对**已带标点**的全文再打一遍 ⇒ 位置重合处 `。。`、不重合处各占一个（叠加指纹）。
-///
-/// 已知取舍（**记录在案，不得当 bug 重修**）：
-/// 1. 带洞（失败片留空串）且其余已带标点 ⇒ 判 true ⇒ 跳过引擎 ⇒ 洞那段不补标点。
-///    可接受：洞（缺整段文字）是更大缺陷；**为补洞而补跑会把旁边已打标点的好段二次打点**
-///    （正是本单要消除的 `。。` 叠加）；且预览侧 `SkippedHole`（325/329）已拦住带洞回灌。
-/// 2. `has_effective_punctuation` 口径是「任一无 ASCII 夹持的标点出现即 true」，**不要求句末标点**：
-///    文本只有一个逗号、没有句号 ⇒ true ⇒ 跳过引擎 ⇒ **最终输出没有句号**。
-///    这**不是新缺陷**，是 DEC-047 白纸黑字记录过的「已知接受边界」
-///    （`decisions-archive.md:1174` 表格：「`他说“好”`（中文引号，无句号）→ 本决策口径 true →
-///    跳过标点引擎 → **接受** —— 引号无句号不是用户会报的缺陷」，该表开头即「不得当 bug 重修」）。
-///    🔴 放宽此判据会直接把重复标点带回来 ⇒ 见到「少个句号」**不要动判据**。
-fn pretranscribed_native_punctuated(text: &str) -> bool {
-    punctuation::has_effective_punctuation(text)
-}
-
-/// ACC-PREVIEW-REFLOW-325：合成回灌预览 —— `acc_text` 替换 `streaming` 的前 `committed_len`
-/// 个**字符**，其余保留流式尾巴。按**字符**（非字节）切，避免 UTF-8 切裂。
-fn reflow_preview(acc_text: &str, streaming: &str, committed_len: usize) -> String {
-    let mut out = String::with_capacity(acc_text.len() + streaming.len());
-    out.push_str(acc_text);
-    out.extend(streaming.chars().skip(committed_len));
-    out
-}
-
-/// ACC-ENGINE-LLAMACPP-452 ⑤：流式回灌的替换边界（纯函数）—— 精解半截结果「写到了原始预览的哪个位置」。
-///
-/// - `prev_acc` / `prev_len`：当前已生效的权威文本及其在原始预览中的边界（上次回灌）；
-/// - `candidate`：试拼出的半截全文；`raw`：原始预览；`window_end`：本窗替换边界上限（整窗回灌的边界）。
-///
-/// 做法：从 `prev_len` 起按「半截新增有效字数」在 `raw` 中往后数得估计位置；再用 `candidate` 末尾两个有效字
-/// 在估计位置 ±[`PARTIAL_BOUNDARY_SLACK`] 字内对齐校准（取最近者）。结果须在 `(prev_len, window_end]` 内，
-/// 否则 `None`（本次不刷新）。显示 = `candidate` + `raw[边界..]` ⇒ 预览里尚未解到的字保留，不回缩。
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))] // 消费端（controller 臂）仅 Windows
-fn partial_reflow_boundary(
-    prev_acc: &str,
-    prev_len: usize,
-    candidate: &str,
-    raw: &str,
-    window_end: usize,
-) -> Option<usize> {
-    let is_eff = |c: &char| c.is_alphanumeric();
-    let raw: Vec<char> = raw.chars().collect();
-    let end = window_end.min(raw.len());
-    let start = prev_len.min(end);
-    let cand_eff: Vec<char> = candidate.chars().filter(is_eff).collect();
-    let prev_eff = prev_acc.chars().filter(is_eff).count();
-    let n_new = cand_eff.len().checked_sub(prev_eff).filter(|&n| n > 0)?;
-    // 估计位置：从 start 起数 n_new 个有效字。
-    let (mut p, mut seen) = (start, 0usize);
-    while p < end && seen < n_new {
-        if is_eff(&raw[p]) {
-            seen += 1;
-        }
-        p += 1;
-    }
-    // 校准：末尾两个有效字在估计位置附近的最近匹配（匹配终点 = 第二个字之后）。
-    if cand_eff.len() >= 2 {
-        let (a, b) = (cand_eff[cand_eff.len() - 2], cand_eff[cand_eff.len() - 1]);
-        let eff_idx: Vec<usize> = (start..end).filter(|&i| is_eff(&raw[i])).collect();
-        let best = eff_idx
-            .windows(2)
-            .filter(|w| raw[w[0]] == a && raw[w[1]] == b)
-            .map(|w| w[1] + 1)
-            .filter(|&q| q.abs_diff(p) <= PARTIAL_BOUNDARY_SLACK)
-            .min_by_key(|&q| q.abs_diff(p));
-        if let Some(q) = best {
-            p = q;
-        }
-    }
-    (p > start && p <= end).then_some(p)
-}
-
-/// ACC-452 ⑤：流式回灌允许的显示缩短（字）—— 精解去掉预览里的口水词属正常修正；超过即跳过本次刷新。
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-const PARTIAL_SHRINK_TOLERANCE: usize = 2;
-
-/// ACC-452 ⑤：替换边界校准的搜索半径（字）。
-const PARTIAL_BOUNDARY_SLACK: usize = 4;
-
-/// ACC-REFLOW-PERSIST-329：流式渲染/镜像前的权威前缀合成。
-///
-/// `state` = 本代已确定的 `(generation, acc_text, committed_len)`（见 [`ACC_REFLOW_STATE`]）。
-/// - gen 匹配 **且** `acc_text` 非空 ⇒ `reflow_preview(acc, raw, committed)`（权威前缀 + 流式尾巴）；
-/// - 其余（state 为 None / gen 不匹配 / acc 空）⇒ **原样返回 `raw`**
-///   ⇒ 在线 / 批处理结构上恒走此分支，行为逐位不变。
-///
-/// 🔴 **滚动分界线口径（Gavin 2026-09-21 明确，勿改）**：
-/// `preview = accuracy 权威前缀（已完成分片） + 流式尾巴（正在说的那段）`。
-/// 正在说的那段 accuracy 还没拿到（要攒够 `min_seg_ms` 且静默 800ms 才派片），
-/// 所以**流式尾巴在每一刻都存在**，不是「第一句才用流式」的特例；分界线随分片完成不断右移。
-/// BUILD-321 实测：第一片在 ~5.65s 派发、解码 1.2~1.9s ⇒ **前 6~8 秒全是流式文字**，
-/// 之后才有回灌。⇒ **`acc_text` 为空时必须原样返回流式全文**（否则开口后前 6~8 秒会是空白，
-/// 属致命回归；见 `compose_empty_acc_passthrough` 单测锁定）。
-fn compose_with_acc_for_gen(
-    state: Option<&(u64, String, usize)>,
-    raw_gen: u64,
-    raw: &str,
-) -> String {
-    match state {
-        Some((g, acc, committed)) if *g == raw_gen && !acc.is_empty() => {
-            reflow_preview(acc, raw, *committed)
-        }
-        _ => raw.to_string(),
-    }
-}
-
-/// FIX-TAIL-WINDOW-AND-FALLBACK-386（B）：回灌渲染与后续 `StreamingText` 渲染用**同一个合成函数**
-///（acc 全文 + `streaming[committed_len..]` 流式尾巴）。
-///
-/// 🔴 不得再走已删除的 `reflow_preview_367`：它对 `replace_all` 只返回 `acc_text`、**丢掉流式尾巴** ⇒
-/// 说话中途回灌会把预览截短（实测 31→28、78→69、191→146），下一次 `StreamingText` 才拼回 ⇒ 闪回。
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn compose_reflow_preview(
-    generation: u64,
-    acc_text: &str,
-    streaming: &str,
-    committed_len: usize,
-) -> String {
-    let state = (generation, acc_text.to_string(), committed_len);
-    compose_with_acc_for_gen(Some(&state), generation, streaming)
-}
-
-// =====================================================================
-// LOCALRT-PREVIEW-HIDE-NONUSER-429：声纹整窗全剔 ⇒ 立即从预览移除该段
-// =====================================================================
-#[cfg(test)]
-mod fix429_tests {
-    use super::reflow_preview;
-
-    /// 全剔窗预览合成 = 已定稿权威文本 + `streaming[committed_len..]`（剔除本段流式文字）；
-    /// **acc 为空也成立**（不被 `compose_with_acc_for_gen` 的「acc 空 ⇒ 原样 raw」短路）。
-    #[test]
-    fn fix429_hide_preview_removes_segment_keeps_tail() {
-        // acc 空、段尾在 3：剔除前 3 字，保留尾巴「def」。
-        assert_eq!(reflow_preview("", "abcdef", 3), "def");
-        // 有权威前缀：前缀 + 尾巴。
-        assert_eq!(reflow_preview("权威", "abcdef", 3), "权威def");
-        // committed 到末尾 ⇒ 只剩权威前缀（本段之后的流式也为空）。
-        assert_eq!(reflow_preview("权威", "abcdef", 6), "权威");
-        // 本人段（dropped=0）不改：committed=0 时保留全部流式。
-        assert_eq!(reflow_preview("", "abc", 0), "abc");
-    }
-
-    /// 源码锚点：全剔窗在 `if full_drop` 内发 `non_user_hide: true` 的回灌 + `[DBG-429]`；
-    /// 常规回灌恒 `non_user_hide: false`；触发经 `reflow_action`（编辑态/取消照旧拦截）。
-    #[test]
-    fn fix429_source_anchors() {
-        let prod =
-            crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC).join("\n");
-        assert!(
-            prod.contains(concat!("[DBG-429] hide non-user segment")),
-            "须有 DBG-429 埋点"
-        );
-        assert_eq!(
-            prod.matches("non_user_hide: true").count(),
-            1,
-            "hide 回灌只应 1 处"
-        );
-        assert!(
-            prod.contains("non_user_hide: false"),
-            "常规回灌须显式 false"
-        );
-        let at = prod.find("non_user_hide: true").expect("hide 发送缺失");
-        let cond = prod[..at]
-            .rfind("if full_drop")
-            .expect("hide 须在 full_drop 条件内");
-        assert!(
-            at - cond < 1500,
-            "hide 发送须在 full_drop 块内（{at}-{cond}）"
-        );
-        // 渲染前经 `if action == ReflowAction::Applied`（编辑态/取消由 reflow_action 拦截）。
-        assert!(
-            prod.contains("if action == ReflowAction::Applied"),
-            "回灌渲染须经 reflow_action 门（编辑态不改）"
-        );
-    }
-}
-
-/// AUTOLEARN-EDIT-SNAPSHOT-331：自学习比对基准的选择（纯函数）。
-///
-/// - **本地实时档** ⇒ 用「编辑入口快照」`overlay_original`（用户开始编辑时屏幕上那份；
-///   与 EDIT 初值/渲染字段同源），缺失才回落 `mirror`；
-/// - **在线 / 批处理档** ⇒ **恒用 `mirror`**（逐位不变，守住红线）。
-///
-/// 🔴 闸门是**档位**（`is_local_realtime_tier`），**不是**「回灌是否活跃」：
-/// gap 的成因是「迟到包推进镜像 + 043 门抑制渲染」，**零回灌（一片未派）时同样发生**，
-/// 用回灌状态当闸门会漏掉短录音这一常见场景。快照本就只在 EnterEditMode 产生，
-/// 「有快照就用」天然对齐语义。
-fn select_learning_baseline(
-    is_local_realtime_tier: bool,
-    overlay_original: Option<String>,
-    mirror: Option<String>,
-) -> Option<String> {
-    if is_local_realtime_tier {
-        overlay_original.or(mirror)
-    } else {
-        mirror
-    }
-}
-
-/// 382：只更新权威状态（`ACC_REFLOW_STATE`），**不重画浮层**。用于「本代 Processing 已开始 ⇒
-/// 回灌只更新状态、不重画」的抑制路径（防闪回）。
-#[cfg(target_os = "windows")]
-fn set_acc_reflow_state_only(generation: u64, acc_text: &str, committed_len: usize) {
-    if let Ok(mut st) = ACC_REFLOW_STATE.lock() {
-        *st = Some((generation, acc_text.to_string(), committed_len));
-    }
-}
-
-/// 382：权威回灌的**渲染**（更新权威状态 + 镜像 + 重画浮层）。`accurate` 仅用于埋点标注
-/// `boundary=known|fallback`；`decode_done_at` 用于 3C 的端到端 `decode_done→render_ms`。
-#[cfg(target_os = "windows")]
-#[allow(clippy::too_many_arguments)]
-fn render_authoritative_reflow(
-    overlay_handle: &OverlayThreadHandle,
-    opacity: f32,
-    ui_language: config::UiLanguage,
-    last_streaming_text: &Arc<Mutex<Option<String>>>,
-    // FIX-REFLOW-RAW-BASE-420：合成前原始流式文本（带 gen）；回灌底稿用。
-    last_raw_streaming_text: &Arc<Mutex<Option<(u64, String)>>>,
-    generation: u64,
-    seg_index: usize,
-    acc_text: &str,
-    committed_len: usize,
-    accurate: bool,
-    decode_done_at: Option<std::time::Instant>,
-    // LOCALRT-PREVIEW-HIDE-NONUSER-429：整窗全剔 ⇒ 预览剔除本段流式文字。
-    non_user_hide: bool,
-) {
-    // FIX-REFLOW-RAW-BASE-420：底稿改用**原始流式文本**（与 `committed_len` 同坐标）；gen 不符 / 无
-    //   ⇒ 空串 ⇒ 预览 = acc 全文（不挂任何旧尾）。**不再**取 `last_streaming_text` 镜像——那是
-    //   「acc 前缀 + 流式尾」的**合成**文本，插到 `committed_len` 处会错位（多挂旧字，BUILD-419）。
-    let streaming = last_raw_streaming_text
-        .lock()
-        .ok()
-        .and_then(|m| m.clone())
-        .filter(|(g, _)| *g == generation)
-        .map(|(_, t)| t)
-        .unwrap_or_default();
-    // 386（B）：与 `compose_with_acc_for_gen` **同一个合成函数**（acc 全文 + `streaming[committed_len..]`），
-    // 不再走 `reflow_preview_367`（replace_all 会丢流式尾巴 ⇒ 回灌把预览截短 ⇒ 闪回更短文本）。
-    // 429：整窗全剔时改用 `reflow_preview`（同式，但 `acc_text` 为空也成立，不被「acc 空 ⇒ raw」短路）。
-    let preview = if non_user_hide {
-        reflow_preview(acc_text, &streaming, committed_len)
-    } else {
-        compose_reflow_preview(generation, acc_text, &streaming, committed_len)
-    };
-    set_acc_reflow_state_only(generation, acc_text, committed_len);
-    if let Ok(mut mirror) = last_streaming_text.lock() {
-        *mirror = Some(preview.clone());
-    }
-    if let Some(t0) = decode_done_at {
-        if log::log_enabled!(log::Level::Debug) {
-            log::debug!(
-                "[LocalRT-DBG-382] reflow latency: seq={} decode_done→render_ms={:.0} boundary={}",
-                seg_index,
-                t0.elapsed().as_secs_f64() * 1000.0,
-                if accurate { "known" } else { "fallback" }
-            );
-        }
-    }
-    if log::log_enabled!(log::Level::Debug) {
-        log::debug!(
-            "[LocalRT-DBG-337] reflow applied: seg={} committed_len={} acc_len={} preview_len={}",
-            seg_index,
-            committed_len,
-            acc_text.chars().count(),
-            preview.chars().count()
-        );
-    }
-    show_overlay(
-        overlay_handle,
-        opacity,
-        ui_language,
-        OverlayStatus::RecordingWithText { text: preview },
-    );
-}
-
-/// LOCALRT-SEAM-337：当某片的 `acc_text` 与 `boundary` 都到齐时解析——合成并渲染（`Some`），
-/// 或作废（`None`，保持纯流式）。两槽一次消费，防重复应用。
-/// 🔴 382 起 `replace_all` 不再走本函数（改走 [`ReflowFastState`] 立即渲染）；本函数仅供
-/// **老逐片路径**（已无发送方），逐位不变。
-#[cfg(target_os = "windows")]
-fn try_resolve_reflow(
-    overlay_handle: &OverlayThreadHandle,
-    opacity: f32,
-    ui_language: config::UiLanguage,
-    last_streaming_text: &Arc<Mutex<Option<String>>>,
-    last_raw_streaming_text: &Arc<Mutex<Option<(u64, String)>>>,
-) {
-    let acc = ACC_REFLOW_ACC.lock().ok().and_then(|g| g.clone());
-    let bound = ACC_REFLOW_BOUND.lock().ok().and_then(|g| g.clone());
-    let (Some((ga, sa, acc_text, _replace_all)), Some((gb, sb, bound_opt))) = (acc, bound) else {
-        return;
-    };
-    if ga != gb || sa != sb {
-        return; // 尚未配对（另一槽未到或属不同片）
-    }
-    if let Ok(mut g) = ACC_REFLOW_ACC.lock() {
-        *g = None;
-    }
-    if let Ok(mut g) = ACC_REFLOW_BOUND.lock() {
-        *g = None;
-    }
-    match bound_opt {
-        Some(len) if !acc_text.is_empty() => {
-            // 老逐片路径：边界已配对 ⇒ 用准确边界渲染（accurate=true），无 3C 埋点。
-            render_authoritative_reflow(
-                overlay_handle,
-                opacity,
-                ui_language,
-                last_streaming_text,
-                last_raw_streaming_text,
-                ga,
-                sa,
-                &acc_text,
-                len,
-                true,
-                None,
-                false,
-            );
-        }
-        _ => {
-            if let Ok(mut st) = ACC_REFLOW_STATE.lock() {
-                *st = None;
-            }
-            log::debug!(
-                "[LocalRT-DBG-337] reflow withheld: seg={} (boundary=b 或 acc 空 ⇒ 保持纯流式)",
-                sa
-            );
-        }
-    }
-}
-
-// =====================================================================
-// FIX-REFLOW-RAW-BASE-420：回灌底稿 = **原始流式文本**（坐标与 committed_len 同源）
-//   契约：原始流式 124 / acc 126 / committed 124 ⇒ 新预览 == acc（126）；旧合成镜像 131 ⇒ 133。
-//   说话中途 ⇒ 预览 = acc + 原始尾巴（不含已覆盖字）；gen 不符/无 ⇒ 预览 = acc 全文。
-// =====================================================================
-#[cfg(test)]
-mod fix_reflow_raw_base_420_tests {
-    use super::{compose_reflow_preview, compose_with_acc_for_gen};
-
-    /// 造 `n` 个互异字符（`base` 起）。
-    fn chars_n(base: u32, n: usize) -> String {
-        (0..n)
-            .map(|i| char::from_u32(base + i as u32).unwrap())
-            .collect()
-    }
-
-    /// 复刻 BUILD-419 数值：原始流式 124 / acc 126 / committed 124。
-    /// 新（原始底稿）⇒ 预览 == acc（126）；旧（合成镜像 131）⇒ 133（多挂 7 旧字）。
-    #[test]
-    fn fix420_raw_base_matches_acc_no_stale_tail() {
-        let raw = chars_n(0x5000, 124);
-        let acc = chars_n(0x6000, 126);
-        let composed_mirror = chars_n(0x5000, 131);
-        let new_preview = compose_reflow_preview(1, &acc, &raw, 124);
-        let old_preview = compose_reflow_preview(1, &acc, &composed_mirror, 124);
-        assert_eq!(new_preview.chars().count(), 126, "新预览应 == acc 126");
-        assert_eq!(new_preview, acc, "新预览应逐字 == acc");
-        assert_eq!(
-            old_preview.chars().count(),
-            133,
-            "旧写法复刻：133 = 126 + (131−124)"
-        );
-    }
-
-    /// 说话中途：原始流式（200）比 committed（124）长 ⇒ 预览 = acc + **原始尾巴**（不含已覆盖字）。
-    #[test]
-    fn fix420_mid_speech_tail_is_raw_after_committed() {
-        let raw = chars_n(0x5000, 200);
-        let acc = chars_n(0x6000, 126);
-        let tail: String = raw.chars().skip(124).collect();
-        let preview = compose_reflow_preview(1, &acc, &raw, 124);
-        assert_eq!(preview, format!("{acc}{tail}"), "预览 = acc + raw[124..]");
-        assert_eq!(preview.chars().count(), 126 + 76);
-        // 尾巴逐字来自原始流式。
-        for (i, c) in tail.chars().enumerate() {
-            assert_eq!(preview.chars().nth(126 + i), Some(c));
-        }
-        // 旧合成底稿同一参数结果不同（证明底稿确实换了）。
-        let composed = chars_n(0x5000, 131);
-        assert_ne!(
-            compose_reflow_preview(1, &acc, &composed, 124),
-            preview,
-            "合成底稿与新原始底稿应不同"
-        );
-    }
-
-    /// gen 不符 / 无原始流式 ⇒ 底稿空串 ⇒ 预览 = acc 全文（不挂旧尾）。
-    #[test]
-    fn fix420_gen_mismatch_or_missing_yields_acc_only() {
-        let acc = chars_n(0x6000, 126);
-        // render 侧对 generation 不符已 filter 成空串（此处直接给空底稿）。
-        assert_eq!(compose_reflow_preview(2, &acc, "", 124), acc);
-        // acc 空 ⇒ 原样返回 raw（在线/批处理结构不变）。
-        assert_eq!(
-            compose_with_acc_for_gen(None, 2, "在线流式原文"),
-            "在线流式原文"
-        );
-    }
-
-    /// TEST-SYNC-420：源码锚点**只扫生产代码**（复用 `guard_prod_lines` 剔除所有 `#[cfg(test)]` 项），
-    /// 并截取 `fn render_authoritative_reflow` 函数体；断言字面量用 `concat!` 拆开 ⇒ 测试源码里
-    /// 不出现完整串，杜绝 `include_str!` 自匹配假绿（[FILTERED-TEST-BLINDSPOT-001]；tester-1 消融发现：
-    /// 底稿改回 `last_streaming_text` 后旧断言仍 PASS，因为锚点串就写在测试自身里）。
-    #[test]
-    fn fix420_source_anchor_raw_base() {
-        let prod = prod_src();
-        let body = strip_line_comments(&fn_body(
-            &prod,
-            concat!("fn render_authoritative_reflow", "("),
-        ));
-        // ① 底稿取自 last_raw_streaming_text（按 generation 过滤）。
-        assert!(
-            body.contains(&concat!("let streaming = last_raw", "_streaming_text")),
-            "回灌底稿必须取 last_raw_streaming_text（生产区函数体内）"
-        );
-        assert!(
-            body.contains(&concat!(".filter(|(g, _)| *g == ", "generation)")),
-            "原始底稿必须按 generation 过滤（不符 ⇒ 空）"
-        );
-        // ② render 内 last_streaming_text 只能作**回写镜像**（该行同现 `mirror`），不得读底稿。
-        for l in body.lines() {
-            if l.contains(concat!("last", "_streaming_text")) {
-                assert!(
-                    l.contains("mirror"),
-                    "render_authoritative_reflow 内 last_streaming_text 只能作回写镜像：{l}"
-                );
-            }
-        }
-        // ③ 明确否定旧写法（防回退）。
-        assert!(
-            !body.contains(&concat!("let streaming = last", "_streaming_text")),
-            "底稿不得取 last_streaming_text（合成镜像，坐标与 committed_len 不符）"
-        );
-    }
-
-    /// TEST-SYNC-420：StreamingText 分支 —— `last_raw_streaming_text` 写在 generation 门**之后**、
-    /// 合成**之前**，写入的是合成前 `text`；合成后再写镜像。
-    #[test]
-    fn fix420_streaming_raw_write_order() {
-        let prod = prod_src();
-        let gen_gate = concat!("if gen != ", "current_gen");
-        let raw_write = concat!("*raw = Some((gen, ", "text.clone()))");
-        let compose = concat!(
-            "compose_with_acc_for_gen(acc_state.as_ref(), gen, &",
-            "text)"
-        );
-        let mirror_write = concat!("*mirror = Some(composed.", "clone())");
-        let p_gate = prod.find(gen_gate).expect("generation 门缺失");
-        let p_raw = prod.find(raw_write).expect("原始流式写入缺失");
-        let p_cmp = prod.find(compose).expect("合成调用缺失");
-        let p_mirror = prod.find(mirror_write).expect("镜像写入缺失");
-        assert!(p_gate < p_raw, "generation 门必须在 raw 写入之前");
-        assert!(p_raw < p_cmp, "raw（合成前 text）必须在合成之前写入");
-        assert!(p_cmp < p_mirror, "合成必须在镜像写入之前");
-    }
-
-    /// 生产区正文（剔除所有 `#[cfg(test)]` 项）。
-    fn prod_src() -> String {
-        crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC).join("\n")
-    }
-
-    /// 逐行去掉 `//` 之后内容（提取出的函数体内这些行无「字符串内 `//`」）。
-    fn strip_line_comments(code: &str) -> String {
-        code.lines()
-            .map(|l| l.split("//").next().unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// 取 `sig` 之后的函数体（花括号配平，跳过字符串 / 字符 / 注释内的括号）。
-    /// FIX-GUARD-PRODLINES-422：复用 `guard_prod_lines::brace_match` 的**唯一状态机**（禁两份），
-    /// 根治 `[GUARD-SKIP-BRACE-IN-STRING-382]`（本 helper 的 `.find('{')` / `.expect("…{…")` 曾把
-    /// `prod_lines_excluding_cfg_test` 的朴素计数带偏）。
-    fn fn_body(code: &str, sig: &str) -> String {
-        let at = code.find(sig).unwrap_or_else(|| panic!("生产区缺 `{sig}`"));
-        let open = code[at..]
-            .find('{')
-            .map(|d| at + d)
-            .expect("函数体 `{` 缺失");
-        let close = crate::guard_prod_lines::brace_match(code, open).expect("函数体未闭合");
-        code[open..=close].to_string()
-    }
-}
-
-/// LOCALRT-RELEASE-REFLOW-342-A：停止语义**三态**（消费端 controller 线程判定）。
-///
-/// 329 曾把 `STREAMING_STOPPED` 一刀切当「取消」⇒ 把**松手完成**与**取消**混为一谈。
-/// 该 latch 实际被三种情形置位，语义完全不同：
-/// - **取消**（ESC / PTT < 300ms，`cancel_signal`）⇒ 内容丢弃，**不回灌**；
-/// - **编辑**（`OVERLAY_EDITING`，进编辑时也置 `STREAMING_STOPPED`）⇒ 跳过，保护用户文本；
-/// - **松手完成**（正常 PTT 松手 / 仍在录音）⇒ 内容要用（最终文本本就走 accuracy），
-///   **允许回灌刷新预览**。
-///
-/// 🔴 判据用 `cancel_signal`（取消专用信号），**不再用 `STREAMING_STOPPED` 一刀切**。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReflowStopState {
-    /// ESC / 短按取消：丢弃，不回灌。
-    Cancelled,
-    /// 编辑中（本代编辑闩锁另由 `edit_latched` 持久）。
-    Editing,
-    /// 松手完成 / 仍在录音：都允许回灌。
-    Released,
-}
-
-fn reflow_stop_state(cancelled: bool, editing: bool) -> ReflowStopState {
-    if cancelled {
-        ReflowStopState::Cancelled
-    } else if editing {
-        ReflowStopState::Editing
-    } else {
-        ReflowStopState::Released
-    }
-}
-
-/// ACC-PREVIEW-REFLOW-325：回灌决策（纯函数，消费端 controller 线程调用）。
-///
-/// 优先级（高 → 低）：
-/// 1. **编辑**（本代编辑闩锁 `edit_latched`，或当前正在编辑 `stop_state=Editing`）——
-///    防「编辑退出后迟到的回灌把用户刚打的字冲掉」；
-/// 2. **取消**（`stop_state=Cancelled`，仅 ESC / 短按）—— 松手完成**不**在此列（342-A）；
-/// 3. **陈旧 seg**（`seg_index <= 已应用`）—— 单调键是 seg_index，不是 committed_len；
-/// 4. **覆盖区有洞**（该片覆盖范围内含 accuracy 失败片）—— 带洞文本比空串更糟；
-/// 5. **acc 空**（不能把已显示前缀抹白）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReflowAction {
-    Applied,
-    SkippedEditing,
-    SkippedCancel,
-    SkippedStale,
-    SkippedHole,
-    SkippedEmpty,
-}
-
-/// FIX-PREVIEW-STALE-AND-COLLAPSE-375（A）：回灌「过期」判据的**单调键**选择。
-///
-/// - `replace_all=true`（滑窗权威全文，语义 = 整段替换、每条取代前一条）⇒ 用**滑窗快照自有**的
-///   `reflow_seq`（严格递增）。🔴 **不得**用 `seg_index`：滑窗路径传的是切片下标，窗口间
-///   （滑窗调度 + 收尾 drain）会让多个窗口带**同一个下标** ⇒ 后到的那个
-///   （= `OrderedReflow` 合并后的完整文本）被误判 stale 丢掉 ⇒ 预览永远停在纯流式文本。
-/// - `replace_all=false`（老逐片路径）⇒ 仍用 `seg_index`（逐片严格递增），**行为逐位不变**。
-///
-/// `reflow_seq` 缺失（老发送方/异常）⇒ 退回 `seg_index`（保守：沿用旧行为，不至于整片不回灌）。
-fn reflow_monotonic_key(replace_all: bool, seg_index: usize, reflow_seq: Option<usize>) -> i64 {
-    if replace_all {
-        reflow_seq.unwrap_or(seg_index) as i64
-    } else {
-        seg_index as i64
-    }
-}
-
-fn reflow_action(
-    edit_latched: bool,
-    stop_state: ReflowStopState,
-    key: i64,
-    last_applied_key: i64,
-    has_hole: bool,
-    acc_empty: bool,
-) -> ReflowAction {
-    if edit_latched || stop_state == ReflowStopState::Editing {
-        return ReflowAction::SkippedEditing;
-    }
-    if stop_state == ReflowStopState::Cancelled {
-        return ReflowAction::SkippedCancel;
-    }
-    if key <= last_applied_key {
-        return ReflowAction::SkippedStale;
-    }
-    if has_hole {
-        return ReflowAction::SkippedHole;
-    }
-    if acc_empty {
-        return ReflowAction::SkippedEmpty;
-    }
-    ReflowAction::Applied
-}
-
-#[cfg(test)]
-mod preview_reflow_325_tests {
-    use super::{
-        reflow_action, reflow_monotonic_key, reflow_preview, reflow_stop_state, ReflowAction,
-        ReflowStopState,
-    };
-
-    /// 硬点 1 边界：committed_len 之前用 acc、之后保留流式尾巴。
-    #[test]
-    fn reflow_preview_boundary() {
-        // acc 覆盖前 2 字，保留尾巴「CD」
-        assert_eq!(reflow_preview("Xy", "ABCD", 2), "XyCD");
-        // committed_len = 0 ⇒ acc + 全部流式
-        assert_eq!(reflow_preview("Xy", "ABCD", 0), "XyABCD");
-        // committed_len = 流式长度 ⇒ 只剩 acc
-        assert_eq!(reflow_preview("Xy", "ABCD", 4), "Xy");
-        // committed_len 超过流式长度 ⇒ 仍只剩 acc（不 panic、不越界）
-        assert_eq!(reflow_preview("Xy", "AB", 9), "Xy");
-        // acc 空 ⇒ 等于「砍掉前缀」，本身不由本函数负责（调用方 SkippedEmpty）；此处只锁行为
-        assert_eq!(reflow_preview("", "ABCD", 2), "CD");
-    }
-
-    /// 硬点 2：编辑闩锁 —— 一旦上闩，即便 `STREAMING_STOPPED` 已复位也一律 SkippedEditing。
-    /// 这覆盖「进编辑 → 退出编辑 → 再来回灌」的序列（闩锁在 controller 线程置位，不随退出清）。
-    #[test]
-    fn reflow_action_edit_latch_persists() {
-        // 编辑中：编辑态（编辑也置 STREAMING_STOPPED，但 342 后由 Editing 三态表达）
-        assert_eq!(
-            reflow_action(false, ReflowStopState::Editing, 3, 1, false, false),
-            ReflowAction::SkippedEditing
-        );
-        // 退出编辑后（OVERLAY_EDITING 复位、STREAMING_STOPPED 也复位）——闩锁仍在 ⇒ 仍跳
-        assert_eq!(
-            reflow_action(true, ReflowStopState::Released, 4, 1, false, false),
-            ReflowAction::SkippedEditing
-        );
-    }
-
-    /// 342-A：停止语义三态纯函数 —— 取消 / 编辑 / 松手完成（含仍在录音）。
-    #[test]
-    fn reflow_stop_state_342_tri_state() {
-        // 取消优先于编辑（ESC 时若仍在编辑态，按取消处理）。
-        assert_eq!(reflow_stop_state(true, true), ReflowStopState::Cancelled);
-        assert_eq!(reflow_stop_state(true, false), ReflowStopState::Cancelled);
-        assert_eq!(reflow_stop_state(false, true), ReflowStopState::Editing);
-        // 松手完成 / 仍在录音 ⇒ Released（都允许回灌）。
-        assert_eq!(reflow_stop_state(false, false), ReflowStopState::Released);
-    }
-
-    /// 🔴 342-A 核心回归：**松手完成必须回灌**（不再是 329 的 skipped-cancel）。
-    #[test]
-    fn reflow_action_342_release_still_reflows() {
-        assert_eq!(
-            reflow_action(false, ReflowStopState::Released, 3, 1, false, false),
-            ReflowAction::Applied,
-            "松手完成（非取消/非编辑）必须 Applied —— 尾字回灌不能因松手被丢"
-        );
-    }
-
-    /// 342-A：取消 ⇒ SkippedCancel（内容丢弃，不回灌）。
-    #[test]
-    fn reflow_action_cancel() {
-        assert_eq!(
-            reflow_action(false, ReflowStopState::Cancelled, 3, 1, false, false),
-            ReflowAction::SkippedCancel
-        );
-    }
-
-    /// 单调键 = seg_index：`seg <= 已应用` ⇒ SkippedStale（防迟到回灌回退预览）。
-    /// 🔴 反例锁定：即便 committed_len/内容不同，只要 seg 不增即跳。
-    #[test]
-    fn reflow_action_stale_by_seg_not_len() {
-        assert_eq!(
-            reflow_action(false, ReflowStopState::Released, 2, 2, false, false),
-            ReflowAction::SkippedStale
-        );
-        assert_eq!(
-            reflow_action(false, ReflowStopState::Released, 1, 5, false, false),
-            ReflowAction::SkippedStale
-        );
-        // seg 前进 ⇒ 通过（即便 has_hole 之后再判）
-        assert_eq!(
-            reflow_action(false, ReflowStopState::Released, 6, 5, false, false),
-            ReflowAction::Applied
-        );
-    }
-
-    /// 🔴 FIX-PREVIEW-STALE-AND-COLLAPSE-375（A）：单调键选择 —— `replace_all=true` 必须用
-    /// **滑窗快照自有**的 `reflow_seq`，**不得**用 `seg_index`（后者在滑窗路径会重复）。
-    #[test]
-    fn reflow_monotonic_key_prefers_reflow_seq_for_replace_all() {
-        assert_eq!(
-            reflow_monotonic_key(true, 7, Some(0)),
-            0,
-            "replace_all ⇒ 用 reflow_seq（忽略切片下标）"
-        );
-        assert_eq!(reflow_monotonic_key(true, 7, Some(9)), 9);
-        assert_eq!(
-            reflow_monotonic_key(true, 7, None),
-            7,
-            "缺失 ⇒ 保守退回 seg_index（沿用旧行为，不至于整片不回灌）"
-        );
-        assert_eq!(
-            reflow_monotonic_key(false, 7, Some(0)),
-            7,
-            "老逐片路径行为逐位不变（仍用 seg_index）"
-        );
-    }
-
-    /// 🔴 375（A）核心：**同一 `dispatch_idx` 的两次 replace_all 都不得被判 stale**。
-    ///
-    /// 现场：`seg=0 acc_len=37 pending` → `seg=0 acc_len=45 skipped-stale`（完整文本被丢）。
-    /// 修法后两条事件的键是 **0、1**（滑窗自有计数器）⇒ 第二条按 Applied 通过。
-    #[test]
-    fn same_dispatch_idx_twice_not_stale_for_replace_all() {
-        let seg = 0usize; // 两窗撞同一切片下标
-        let key1 = reflow_monotonic_key(true, seg, Some(0));
-        let key2 = reflow_monotonic_key(true, seg, Some(1));
-        assert_eq!(
-            reflow_action(false, ReflowStopState::Released, key1, -1, false, false),
-            ReflowAction::Applied,
-            "第一条（37 字）应回灌"
-        );
-        assert_eq!(
-            reflow_action(false, ReflowStopState::Released, key2, key1, false, false),
-            ReflowAction::Applied,
-            "第二条（45 字完整文本）**不得**被判 stale（375-A 的 P0）"
-        );
-        // 对照：沿用旧行为（键=seg_index）⇒ 第二条必被误杀（复现现场日志）
-        assert_eq!(
-            reflow_action(
-                false,
-                ReflowStopState::Released,
-                seg as i64,
-                seg as i64,
-                false,
-                false
-            ),
-            ReflowAction::SkippedStale,
-            "旧键（切片下标）在同下标时会误杀 ⇒ 证明本修复必要"
-        );
-    }
-
-    /// 覆盖区有洞（accuracy 失败片）⇒ SkippedHole（带洞文本不得上屏，保留流式预览）。
-    #[test]
-    fn reflow_action_hole() {
-        assert_eq!(
-            reflow_action(false, ReflowStopState::Released, 6, 5, true, false),
-            ReflowAction::SkippedHole
-        );
-        // 洞优先于空（都成立时报洞，语义更准）
-        assert_eq!(
-            reflow_action(false, ReflowStopState::Released, 6, 5, true, true),
-            ReflowAction::SkippedHole
-        );
-    }
-
-    /// acc 空 ⇒ SkippedEmpty（约束 4：不得把已显示预览抹白）。
-    #[test]
-    fn reflow_action_empty() {
-        assert_eq!(
-            reflow_action(false, ReflowStopState::Released, 6, 5, false, true),
-            ReflowAction::SkippedEmpty
-        );
-    }
-}
-
-#[cfg(test)]
-mod reflow_persist_329_tests {
-    use super::{compose_with_acc_for_gen, reflow_preview};
-
-    /// 判据 1（不变式）：一次回灌后，后续任意次流式更新渲染出的文本**都带同一权威前缀**。
-    /// 证明缺陷 A 已修（修正不会被下一个流式包冲掉）。
-    #[test]
-    fn compose_prefix_persists_across_streaming_updates() {
-        // state = (gen=1, acc="指导灵", committed=3)
-        let state = (1u64, "指导灵".to_string(), 3usize);
-        let raws = [
-            "指导领",
-            "指导领的信息",
-            "指导领的信息吗",
-            "指导领的信息吗？",
-        ];
-        for raw in raws {
-            let display = compose_with_acc_for_gen(Some(&state), 1, raw);
-            assert!(
-                display.starts_with("指导灵"),
-                "每次流式渲染都必须带权威前缀，实测 {display:?}"
-            );
-            // 尾巴 = raw 从 committed 起的部分
-            assert_eq!(display, reflow_preview("指导灵", raw, 3));
-        }
-    }
-
-    /// 🔴 Gavin 口径 + 致命回归锁：acc 为空（第一片尚未回来）⇒ **原样返回流式全文**。
-    /// 前 6~8 秒全靠流式文字；若改成「acc 空就不显示」会开口即空白。
-    #[test]
-    fn compose_empty_acc_passthrough() {
-        let empty_acc = (1u64, String::new(), 0usize);
-        assert_eq!(
-            compose_with_acc_for_gen(Some(&empty_acc), 1, "第一句话的流式文字"),
-            "第一句话的流式文字"
-        );
-    }
-
-    /// 边界 3/4：gen 不匹配（旧代残留）⇒ 原样 raw；闩锁后 state 保留 ⇒ 仍带前缀。
-    #[test]
-    fn compose_gen_mismatch_passthrough_but_same_gen_keeps_prefix() {
-        let state = (2u64, "权威前缀".to_string(), 2usize);
-        assert_eq!(
-            compose_with_acc_for_gen(Some(&state), 3, "新录音raw"),
-            "新录音raw"
-        );
-        // 同 gen（闩锁后 state 未被清）⇒ 继续带前缀，画面不倒退
-        assert_eq!(
-            compose_with_acc_for_gen(Some(&state), 2, "后续raw尾"),
-            reflow_preview("权威前缀", "后续raw尾", 2)
-        );
-    }
-
-    /// 边界 1：编辑态（stopped）⇒ 包在第一道闸被丢，不进渲染（不会冲 EDIT 用户输入）。
-    /// editing⇒stopped 由既有 F3 护栏锁定；此处锁「闸门第一道即 stopped」。
-    #[test]
-    fn editing_implies_render_dropped() {
-        assert!(
-            super::should_ignore_streaming_text(true),
-            "stopped(含编辑态) 必须丢渲染"
-        );
-        assert!(!super::should_ignore_streaming_text(false));
-    }
-
-    /// 边界 5：非本地档 state 恒 None ⇒ 逐位 raw passthrough（在线/批处理结构上不进合成）。
-    #[test]
-    fn non_local_tiers_passthrough() {
-        assert_eq!(
-            compose_with_acc_for_gen(None, 42, "在线流式原文"),
-            "在线流式原文"
-        );
-    }
-
-    /// 🔴 残留 gap（053-B 既定契约「渲染抑制 ≠ 数据抑制」）。
-    ///
-    /// **AUTOLEARN-EDIT-SNAPSHOT-331 已收口此 gap ⇒ 断言语义随之变更**（由「钉住缺陷」改为
-    /// 「钉住收口后的新契约」；非静默删除）：镜像仍会因迟到包领先于最后所见（053-B 要求），
-    /// 但**自学习基准改用编辑入口快照**，不再取被推进的镜像 ⇒ gap 不再产生伪候选。
-    #[test]
-    fn stopped_late_packet_advances_mirror_but_baseline_uses_snapshot() {
-        let state = (1u64, "权威".to_string(), 2usize);
-        let last_displayed = compose_with_acc_for_gen(Some(&state), 1, "早年");
-        let mirror_after_late = compose_with_acc_for_gen(Some(&state), 1, "晚年更长尾");
-        // 053-B 事实不变：迟到包推进镜像（渲染仍被抑制）
-        assert_ne!(
-            last_displayed, mirror_after_late,
-            "迟到包仍推进镜像（053-B 渲染抑制≠数据抑制，勿改）"
-        );
-        // 331 收口：本地实时档的学习基准 = 最后渲染文本，而非被推进的镜像
-        let expected = Some(last_displayed.clone());
-        assert_eq!(
-            super::select_learning_baseline(true, Some(last_displayed), Some(mirror_after_late)),
-            expected,
-            "331：基准必须取编辑入口快照（所见），不得取被迟到包推进的镜像"
-        );
-    }
-}
-
-#[cfg(test)]
-mod seam_337_tests {
-    use super::{compose_with_acc_for_gen, reflow_preview, select_learning_baseline};
-
-    /// §六-1 重复消解：commit 合成 = acc 覆盖前 `confirmed_len` 字符 + 流式尾巴，无重叠。
-    #[test]
-    fn commit_compose_has_no_duplication() {
-        // 已确认权威文本 4 字；流式显示（含同句更多字）—— 只保留 confirmed_len 之后的尾巴
-        assert_eq!(
-            reflow_preview("甲乙丙丁", "甲乙丙丁戊己", 4),
-            "甲乙丙丁戊己"
-        );
-        // 若按旧的 last_display 总长切，则会重复；此处只验证 C 的切点语义
-        assert_eq!(reflow_preview("权威", "权威新句", 2), "权威新句");
-    }
-
-    /// §六-3 回修/缩短：流式文本短于 confirmed_len ⇒ 不 panic、尾巴为空。
-    #[test]
-    fn shrink_safe() {
-        assert_eq!(reflow_preview("权威前缀", "短", 5), "权威前缀");
-        assert_eq!(reflow_preview("权威前缀", "", 5), "权威前缀");
-    }
-
-    /// 未 commit（无 ACC_REFLOW_STATE / 非对齐作废后）⇒ 纯流式 passthrough（不空白、不回退）。
-    #[test]
-    fn not_committed_is_pure_streaming_passthrough() {
-        assert_eq!(
-            compose_with_acc_for_gen(None, 1, "纯流式全文"),
-            "纯流式全文"
-        );
-    }
-
-    /// §六-3 acc 为空（首片未回 / 未 commit）⇒ 原样流式全文（保留 325 契约）。
-    #[test]
-    fn empty_acc_passthrough() {
-        let empty = (1u64, String::new(), 0usize);
-        assert_eq!(
-            compose_with_acc_for_gen(Some(&empty), 1, "开口前几秒的流式文字"),
-            "开口前几秒的流式文字"
-        );
-    }
-
-    /// §六-5 学习基准不变式（331）在新时序下不变：本地档仍取编辑入口快照。
-    #[test]
-    fn learning_baseline_invariant_unchanged() {
-        assert_eq!(
-            select_learning_baseline(true, Some("所见".to_string()), Some("镜像".to_string())),
-            Some("所见".to_string())
-        );
-        assert_eq!(
-            select_learning_baseline(false, Some("快照".to_string()), Some("镜像".to_string())),
-            Some("镜像".to_string())
-        );
-    }
-}
-
-#[cfg(test)]
-mod edit_snapshot_331_tests {
-    use super::select_learning_baseline;
-
-    /// 🔴 收口核心（任务 §五-1）：停止后迟到包推进镜像 ⇒ 随后进编辑 ⇒ 基准 = **最后渲染文本**。
-    #[test]
-    fn baseline_uses_snapshot_not_advanced_mirror() {
-        let snapshot = Some("屏幕上最后那份".to_string());
-        let advanced_mirror = Some("被迟到包推进过的更完整文本".to_string());
-        assert_eq!(
-            select_learning_baseline(true, snapshot.clone(), advanced_mirror),
-            snapshot
-        );
-    }
-
-    /// 🔴 主控补的场景：**本地档 + 零回灌（一片未派）** + 迟到包推进镜像 ⇒ 基准仍取快照。
-    /// （用「回灌是否活跃」当闸门会漏掉这条 —— 故闸门必须是档位。）
-    #[test]
-    fn baseline_local_zero_reflow_still_uses_snapshot() {
-        // 零回灌 ⇒ ACC_REFLOW_STATE 为 None（本函数无该入参，正体现闸门与回灌状态解耦）
-        let snapshot = Some("短录音屏幕上那份".to_string());
-        let advanced_mirror = Some("停后迟到包推进的文本".to_string());
-        assert_eq!(
-            select_learning_baseline(true, snapshot.clone(), advanced_mirror),
-            snapshot
-        );
-    }
-
-    /// 边界 5：在线 / 批处理 ⇒ **恒 mirror**（逐位不变），即便带了快照也忽略。
-    #[test]
-    fn baseline_online_batch_uses_mirror_only() {
-        assert_eq!(
-            select_learning_baseline(false, Some("快照".to_string()), Some("镜像".to_string())),
-            Some("镜像".to_string())
-        );
-        assert_eq!(
-            select_learning_baseline(false, Some("快照".to_string()), None),
-            None
-        );
-    }
-
-    /// 本地档无快照（理论不发生）⇒ 回落镜像；代际清空后等价于此。
-    #[test]
-    fn baseline_local_falls_back_to_mirror_without_snapshot() {
-        assert_eq!(
-            select_learning_baseline(true, None, Some("镜像".to_string())),
-            Some("镜像".to_string())
-        );
-    }
-
-    /// 未编辑不学习：快照 == 提交文本 ⇒ `original == edited` ⇒ diff 为空（wordbook 对相同串返回 None）。
-    #[test]
-    fn unedited_submit_yields_equal_baseline_and_edited() {
-        let displayed = "这是一条来自指导灵的信息吗？".to_string();
-        let baseline = select_learning_baseline(true, Some(displayed.clone()), Some("别的".into()));
-        // 零修改提交时 edited 就是 EDIT 初值 == 快照
-        let edited = displayed.clone();
-        assert_eq!(baseline, Some(edited));
-    }
-}
-
-#[cfg(test)]
-mod punct_double_334_tests {
-    use super::{pretranscribed_native_punctuated, transcription};
-
-    /// 🔴 回归核心（§五-1）：构造「部分分片失败 + 其余已带标点」⇒ 必须 true ⇒ 不再二次打标点。
-    /// 失败片贡献空串（`texts.push(String::new())`），拼出来带洞但已带标点。
-    #[test]
-    fn partial_failed_segment_with_punctuated_text_skips_engine() {
-        let joined = transcription::join_segment_texts(&[
-            "下台进行另一次人生时。".to_string(),
-            String::new(), // 失败片留下的空洞
-            "灵魂自愿经历某些事件。".to_string(),
-        ]);
-        assert!(
-            pretranscribed_native_punctuated(&joined),
-            "带洞但文本已带标点 ⇒ native_punctuated=true ⇒ 跳过引擎（旧实现误判 false ⇒ 。。 叠加）"
-        );
-    }
-
-    /// §五-2：全部分片成功且带标点 ⇒ 行为不变（仍跳过引擎）。
-    #[test]
-    fn all_segments_success_punctuated_unchanged() {
-        let joined = transcription::join_segment_texts(&["甲。".to_string(), "乙。".to_string()]);
-        assert!(pretranscribed_native_punctuated(&joined));
-    }
-
-    /// 🔴 §五-3 反向：文本**确实没有标点**（模型未输出）⇒ false ⇒ 引擎**必须**跑。
-    /// 这是 DEC-047 当初要解决的原始缺陷，别修回去。
-    #[test]
-    fn text_without_punctuation_still_runs_engine() {
-        let joined = transcription::join_segment_texts(&[
-            "今天天气不错".to_string(),
-            "我们出去走走".to_string(),
-        ]);
-        assert!(
-            !pretranscribed_native_punctuated(&joined),
-            "模型未输出标点 ⇒ false ⇒ CT-Transformer 必须跑（DEC-047 原始缺陷不复现）"
-        );
-    }
-
-    /// §五-4 口径：词内嵌标点豁免（与 :9855 Qwen3 分支同一 detector）。
-    #[test]
-    fn inline_punctuation_is_not_effective() {
-        assert!(!pretranscribed_native_punctuated("圆周率是3.14"));
-        assert!(!pretranscribed_native_punctuated("3:30 开会"));
-        assert!(!pretranscribed_native_punctuated("example.com"));
-        assert!(pretranscribed_native_punctuated("今天天气不错。"));
-    }
-}
-
-#[cfg(test)]
-mod koja464_punct_tests {
-    use super::apply_local_punctuation;
-
-    /// KOJA-PUNCT-464 护栏：最终标点节点在调标点模型**之前**先判日韩文（否则韩文空格被吃光）。
-    #[test]
-    fn koja464_local_punct_checks_script_before_engine() {
-        let src = crate::MAIN_RS_SRC;
-        let body = src
-            .split("fn apply_local_punctuation(")
-            .nth(1)
-            .expect("apply_local_punctuation 锚点");
-        let check = body
-            .find("punctuation::ct_unsupported_script(&final_text)")
-            .expect("最终标点节点必须判日韩文");
-        let engine = body
-            .find("engine.add_punctuation(&final_text)")
-            .expect("标点模型调用点");
-        assert!(check < engine, "日韩文判断必须在调标点模型之前");
-    }
-
-    /// KOJA-PUNCT-464 / PUNCT-JAKO-466（真模型）：韩 / 日文走日韩专用标点（韩文空格完好、用 `, . ?`），
-    /// 中文照常走 CT。performance 档与本地实时的最终标点都经本节点。
-    /// 运行：`cargo test --bin feiyin-ime -- --ignored --nocapture koja464_local_punct_real_engine`
-    #[test]
-    #[ignore = "需标点模型；--ignored 运行"]
-    fn koja464_local_punct_real_engine() {
-        let models = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models");
-        let Some(mut engine) = crate::punctuation::PunctuationEngine::new(&models) else {
-            eprintln!("skip: 标点模型不在位");
-            return;
-        };
-        crate::punctuation::jako::init_for_test(&models);
-        let mut run = |t: &str| {
-            apply_local_punctuation(t.to_string(), true, false, false, false, Some(&mut engine))
-        };
-        let ko =
-            run("어제는 비가 와서 집에서 영화를 봤는데 오늘은 날씨가 좋아서 공원에 갈 생각이에요");
-        println!("[466] ko ⇒ {ko}");
-        assert_eq!(
-            ko, "어제는 비가 와서 집에서 영화를 봤는데, 오늘은 날씨가 좋아서 공원에 갈 생각이에요.",
-            "韩文走日韩标点：空格完好、句读正确"
-        );
-        let ja = run("うちの中学は弁当制で持っていけない場合は五十円の学校販売のパンを買う");
-        println!("[466] ja ⇒ {ja}");
-        assert!(
-            ja.ends_with('。') && ja.contains("場合は"),
-            "日文走日韩标点：{ja}"
-        );
-        let zh = run("开放时间早上九点至下午五点我们明天见");
-        println!("[466] zh ⇒ {zh}");
-        assert!(
-            zh.contains('，') || zh.contains('。'),
-            "中文照常加标点：{zh}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod punct_final_redo_350_tests {
-    use super::{pretranscribed_native_punctuated, strip_punctuation_node};
-    use crate::punctuation::has_effective_punctuation;
-
-    /// 节点关闭（`enabled=false`）⇒ 输入逐字返回（用户关标点时不介入）。
-    #[test]
-    fn strip_node_disabled_returns_input_verbatim() {
-        assert_eq!(
-            strip_punctuation_node("你好。。".to_string(), false),
-            "你好。。"
-        );
-        assert_eq!(strip_punctuation_node(String::new(), false), "");
-    }
-
-    /// 节点开启 ⇒ 剥光所有有效标点，词内嵌标点保留。
-    #[test]
-    fn strip_node_strips_effective_only() {
-        assert_eq!(strip_punctuation_node("你好。。".to_string(), true), "你好");
-        assert_eq!(
-            strip_punctuation_node("今天天气不错，。".to_string(), true),
-            "今天天气不错"
-        );
-        // 词内嵌（小数 / 时间 / 域名 / 英文缩写 / 中文量级）不被剥
-        for t in ["3.14", "3:30 开会", "example.com", "don't", "3.5亿"] {
-            assert_eq!(strip_punctuation_node(t.to_string(), true), t);
-        }
-    }
-
-    /// 🔴 「剥光了必定打得回来」不变式（Gavin 的担忧，350 核心）：
-    /// 只要剥离节点真的动手（`enabled=true` 且非翻译），剥光文本的 `native_punctuated`
-    /// 必为 false ⇒ 下游 `apply_local_punctuation` 的门
-    /// `enabled && !translate_requested && !native_punctuated` 必定放行
-    /// ⇒ 不会出现「剥光了没打回来」。
-    /// （`llm_handled=true` 是 LLM 路径，由 LLM 自带标点；见 result.md 核实结论。）
-    #[test]
-    fn strip_node_implies_downstream_punctuation_gate() {
-        for t in [
-            "你好。。",
-            "今天天气不错，。",
-            "甲。乙。",
-            "3:30 开会。",
-            "Hello, world.",
-        ] {
-            let stripped = strip_punctuation_node(t.to_string(), true);
-            assert!(
-                !has_effective_punctuation(&stripped),
-                "剥光后仍含有效标点 ⇒ 下游门不成立：{t} -> {stripped}"
-            );
-            // 节点门（enabled=true 且非翻译）⇒ 下游门的三项条件齐备
-            let enabled = true;
-            let translate_requested = false;
-            let native_punctuated = pretranscribed_native_punctuated(&stripped);
-            assert!(
-                enabled && !translate_requested && !native_punctuated,
-                "不变式破坏：剥光后下游门不成立，用户会拿到无标点文本：{t} -> {stripped}"
-            );
-        }
-    }
-
-    /// 🔴 回归：本地 realtime 路径不再出现重复标点（`PUNCT-DOUBLE-334` 老 bug 不复发）。
-    /// 本节点保证进引擎的文本**无有效标点**；此处用「末尾补句号」的最简引擎模型验证不叠加
-    /// （真实引擎效果留端测）。
-    #[test]
-    fn strip_node_no_double_punctuation_regression() {
-        for (input, engine_input, redone) in [
-            ("你好。。", "你好", "你好。"),
-            ("今天天气不错，。", "今天天气不错", "今天天气不错。"),
-            ("甲。乙。", "甲乙", "甲乙。"),
-        ] {
-            let staged = strip_punctuation_node(input.to_string(), true);
-            assert_eq!(staged, engine_input, "进引擎文本不符预期：{input}");
-            assert!(
-                !has_effective_punctuation(&staged),
-                "进引擎文本仍含有效标点：{staged}"
-            );
-            let out = format!("{staged}。");
-            assert_eq!(out, redone);
-            assert!(
-                !out.contains("。。") && !out.contains("，。"),
-                "重复标点复发：{out}"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod parallel_acc_298_tests {
-    use super::{acc_parallel_result_usable, assemble_parallel_accuracy, hole_fill_decision};
-
-    /// 判据 #3：seg_index 乱序输入 ⇒ 按序号升序拼接；片内子段顺序保持。
-    #[test]
-    fn assemble_parallel_accuracy_orders_by_seg_index() {
-        let got = assemble_parallel_accuracy(vec![
-            (2, vec!["c".to_string(), "d".to_string()]),
-            (0, vec!["a".to_string()]),
-            (1, vec!["b".to_string()]),
-        ]);
-        assert_eq!(got, vec!["a", "b", "c", "d"]);
-    }
-
-    #[test]
-    fn assemble_parallel_accuracy_empty_and_single() {
-        assert!(assemble_parallel_accuracy(vec![]).is_empty());
-        assert_eq!(
-            assemble_parallel_accuracy(vec![(0, vec!["only".to_string()])]),
-            vec!["only"]
-        );
-        // 空子段列表（该片整体失败）不影响其它片
-        assert_eq!(
-            assemble_parallel_accuracy(vec![(0, vec![]), (1, vec!["x".to_string()])]),
-            vec!["x"]
-        );
-    }
-
-    /// 判据 #3：取消 ⇒ 结果一律弃用（不带脏结果）；空/纯空白 ⇒ 弃用回落旧路径。
-    #[test]
-    fn t460_voiceprint_dropped_all() {
-        assert!(super::voiceprint_dropped_all(0.0, 3.79), "全剔 ⇒ 不兜底");
-        assert!(
-            !super::voiceprint_dropped_all(1.2, 3.79),
-            "有本人语音 ⇒ 照旧"
-        );
-        assert!(
-            !super::voiceprint_dropped_all(0.0, 0.0),
-            "没剔任何语音（如真没说话 / 声纹未就绪）⇒ 照旧兜底"
-        );
-    }
-
-    #[test]
-    fn acc_parallel_result_usable_gate() {
-        assert!(!acc_parallel_result_usable(true, "有字"));
-        assert!(!acc_parallel_result_usable(false, ""));
-        assert!(!acc_parallel_result_usable(false, "   \n"));
-        assert!(acc_parallel_result_usable(false, "有字"));
-    }
-
-    /// LOCALRT-REFLOW-HOLE-344-G：空/失败片用流式文本填补 ⇒ **不记洞**（回灌不中断）；
-    /// 流式也为空 / 不可填补 ⇒ 记洞兜底（`SkippedHole` 仍保留）。
-    #[test]
-    fn reflow_hole_344_fill_by_streaming_not_a_hole() {
-        // 有流式文本可填 ⇒ 填补、不记洞。
-        assert_eq!(
-            hole_fill_decision(true, "多认识几个朋友"),
-            ("多认识几个朋友".to_string(), false)
-        );
-        // 流式也为空 ⇒ 真·无法填补、记洞。
-        assert_eq!(hole_fill_decision(true, ""), (String::new(), true));
-        // 多子段/已填过（can_fill=false）⇒ 保守记洞。
-        assert_eq!(hole_fill_decision(false, "有文本"), (String::new(), true));
-    }
-
-    /// 344-G 端到端拼接口径：失败片填补后 `assemble_parallel_accuracy` 仍输出连续文本（无空片）。
-    #[test]
-    fn reflow_hole_344_assembled_text_stays_continuous() {
-        // seg0 成功；seg1 失败 ⇒ 用流式填补；seg2 成功。
-        let (fill, is_hole) = hole_fill_decision(true, "第二句流式");
-        assert!(!is_hole);
-        let got = assemble_parallel_accuracy(vec![
-            (0, vec!["第一句".to_string()]),
-            (1, vec![fill]),
-            (2, vec!["第三句".to_string()]),
-        ]);
-        assert_eq!(got.join(""), "第一句第二句流式第三句");
-    }
-}
-
-/// FIX-PREVIEW-HARVEST-380（A）：accuracy 滑窗线程的切片载荷
-/// `(切片下标, 派发当刻浮层字符数, 本片音频, 本片流式文本, 各片内语音区间)`。
-/// VAD-393（A3）：第 5 元为**片内坐标**的语音区间（实时 VAD 时间线映射）；VAD 不可用 ⇒ `None`。
-type AccSliceMsg = (
-    usize,
-    usize,
-    Vec<Vec<f32>>,
-    String,
-    Option<Vec<Vec<(usize, usize)>>>,
-    // FALLBACK-EXCLUDE-FARFIELD-446：各子片片内坐标的远场区间（只供流式兜底剔除）。
-    Vec<Vec<(usize, usize)>>,
-);
-
-/// LOCALRT-TAIL-WINDOW-407：滑窗线程的**输入**（新切片 / 长静默信号）。
-///
-/// 380 起 `acc_tx` 只传切片元组；407 追加「长静默」信号（本地流式在静默 ≥1900ms 且无新语音时
-/// **只发一次**），main 侧据此把「待覆盖片 + 前一片后缀」组末尾窗并即时回灌，**无需按停止键**。
-/// `drive_acc_windows` 仍是泛型（380/406 守卫与单测不受影响）。
-enum AccInput {
-    Slice(AccSliceMsg),
-    /// 长静默信号，载荷 = 当刻 `pcm` 样本位置（仅日志/诊断用）。
-    LongSilence(usize),
-}
-
-/// FIX-TAIL-GUARD-410：末尾窗的「pending 片」回灌元数据。
-///
-/// 末尾窗音频含前片后缀 + pending；若精解被 406 拒 / 为空，**只兜底 pending 片**
-///（span `(p,p+1)`、文本 = pending 片流式 + 标点），**前片已回灌结果一字不动**。
-struct TailPending {
-    span: (usize, usize),
-    samples: Vec<usize>,
-    streaming: String,
-}
-
-/// FIX-TAIL-GUARD-410 item3：兜底打点的**同步超时**（ms）。超时 ⇒ 原样用未打标点文本，绝不卡回灌。
-const PUNCT_FALLBACK_TIMEOUT_MS: u64 = 500;
-/// 410：服务线程**异常退出**后重建 + 重发，最多连续重试次数。
-const PUNCT_START_MAX_RETRIES: usize = 2;
-/// 410：连续启动失败后的**冷却**（秒）——冷却期内不再尝试启动，防模型缺失时每段都反复加载拖慢回灌。
-const PUNCT_RESTART_COOLDOWN_SECS: u64 = 30;
-
-/// 410 item3：标点服务线程的请求（文本 + 回执通道；回执 `None` = 引擎不可用）。
-struct PunctReq {
-    text: String,
-    reply: crossbeam_channel::Sender<Option<String>>,
-}
-
-/// 410 item3：**进程级常驻**标点服务状态。
-#[derive(Default)]
-struct PunctState {
-    /// 服务请求发送端（`None` = 未启动 / 已异常退出）。
-    tx: Option<crossbeam_channel::Sender<PunctReq>>,
-    /// 服务线程句柄（`is_finished()` ⇒ 已退出，可据此在发送前判异常退出）。
-    join: Option<std::thread::JoinHandle<()>>,
-    /// 上次「启动/重试全失败」时刻（冷却用）。
-    last_fail: Option<std::time::Instant>,
-}
-
-static PUNCT_SERVICE: std::sync::OnceLock<std::sync::Mutex<PunctState>> =
-    std::sync::OnceLock::new();
-
-/// 单次调用的结果分类。
-enum PunctTry {
-    /// 成功打点。
-    Ok(String),
-    /// 引擎不可用（模型缺失 / 加载失败）——属启动失败，计入重试/冷却。
-    Unavailable,
-    /// 线程已退出 / panic（send / recv 断开）——需重启。
-    AbnormalExit,
-    /// 线程活着但处理太慢 —— **不算异常退出、不重启**。
-    Timeout,
-}
-
-/// 410：冷却是否生效（距上次失败 < [`PUNCT_RESTART_COOLDOWN_SECS`] ⇒ 本次不尝试启动）。纯函数。
-fn punct_cooldown_active(last_fail: Option<std::time::Instant>, now: std::time::Instant) -> bool {
-    last_fail.is_some_and(|t| {
-        now.saturating_duration_since(t)
-            < std::time::Duration::from_secs(PUNCT_RESTART_COOLDOWN_SECS)
-    })
-}
-
-/// 410：调用→重试循环（与 I/O 解耦，便于单测「异常退出后重启成功 / 两次失败走无标点 / 超时不重启」）。
-///
-/// - `Ok(s)` ⇒ 成功返回；
-/// - `Timeout` ⇒ 立即 `Err("timeout")`（**不重试**，④）；
-/// - `AbnormalExit` / `Unavailable` ⇒ **重启重试**，最多 [`PUNCT_START_MAX_RETRIES`] 次，全失败 ⇒ `Err("startup-failed")`。
-fn run_punct_retries<F: FnMut(usize) -> PunctTry>(mut attempt: F) -> Result<String, &'static str> {
-    for i in 0..=PUNCT_START_MAX_RETRIES {
-        match attempt(i) {
-            PunctTry::Ok(s) => return Ok(s),
-            PunctTry::Timeout => return Err("timeout"),
-            PunctTry::AbnormalExit | PunctTry::Unavailable => {}
-        }
-    }
-    Err("startup-failed")
-}
-
-/// 410：确保服务线程在跑（已退出 ⇒ 重启；引擎在**服务线程内**加载 ⇒ 不要求 `PunctuationEngine: Send`）。
-fn ensure_punct_service(state: &std::sync::Mutex<PunctState>, model_dir: &Path) {
-    let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
-    // 发送前判异常退出：线程句柄已完成 ⇒ 清掉发送端，下面重建。
-    if g.join.as_ref().is_some_and(|h| h.is_finished()) {
-        g.tx = None;
-        g.join = None;
-    }
-    if g.tx.is_some() {
-        return;
-    }
-    let (tx, rx) = crossbeam_channel::unbounded::<PunctReq>();
-    let dir = model_dir.to_path_buf();
-    let spawned = std::thread::Builder::new()
-        .name("punct-fallback-service".to_string())
-        .spawn(move || {
-            let t0 = std::time::Instant::now();
-            let mut engine = punctuation::PunctuationEngine::new(&dir);
-            log::info!(
-                "[LocalRT-DBG-410] punct fallback service: model load={:.1}ms status={}",
-                t0.elapsed().as_secs_f64() * 1000.0,
-                if engine.is_some() {
-                    "ok"
-                } else {
-                    "unavailable"
-                }
-            );
-            for req in rx {
-                let out = engine.as_mut().and_then(|e| {
-                    let t = std::time::Instant::now();
-                    let r = e.add_punctuation(&req.text);
-                    if log::log_enabled!(log::Level::Debug) {
-                        log::debug!(
-                            "[LocalRT-DBG-410] punct service call: {} chars in {:.1}ms ok={}",
-                            req.text.chars().count(),
-                            t.elapsed().as_secs_f64() * 1000.0,
-                            r.is_some()
-                        );
-                    }
-                    r
-                });
-                let _ = req.reply.send(out);
-            }
-        });
-    match spawned {
-        Ok(h) => {
-            g.tx = Some(tx);
-            g.join = Some(h);
-        }
-        Err(_) => {
-            log::warn!("[LocalRT-DBG-410] punct fallback service spawn failed");
-            g.tx = None;
-            g.join = None;
-        }
-    }
-}
-
-/// 410：单次尝试（确保服务在跑 → 发送 → 同步收结果）。
-fn punct_attempt(state: &std::sync::Mutex<PunctState>, model_dir: &Path, text: &str) -> PunctTry {
-    ensure_punct_service(state, model_dir);
-    let tx = state.lock().unwrap_or_else(|e| e.into_inner()).tx.clone();
-    let Some(tx) = tx else {
-        return PunctTry::Unavailable; // 启动失败
-    };
-    let (reply_tx, reply_rx) = crossbeam_channel::bounded::<Option<String>>(1);
-    let req = PunctReq {
-        text: text.to_string(),
-        reply: reply_tx,
-    };
-    if tx.send(req).is_err() {
-        // 线程已退出（含 panic）⇒ 标记，下一轮 ensure 重建。
-        let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
-        g.tx = None;
-        g.join = None;
-        return PunctTry::AbnormalExit;
-    }
-    match reply_rx.recv_timeout(std::time::Duration::from_millis(PUNCT_FALLBACK_TIMEOUT_MS)) {
-        Ok(Some(s)) => PunctTry::Ok(s),
-        Ok(None) => PunctTry::Unavailable, // 引擎加载失败（线程活着但引擎 None）
-        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-            // 线程在本次请求中 panic ⇒ 标记，下一轮重建。
-            let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
-            g.tx = None;
-            g.join = None;
-            PunctTry::AbnormalExit
-        }
-        Err(crossbeam_channel::RecvTimeoutError::Timeout) => PunctTry::Timeout,
-    }
-}
-
-/// 410 item3：经进程级标点服务线程打点（同步、超时、异常退出自动重启，最多 2 次）。
-///
-/// `enabled=false` / 已含句读标点 / 冷却期内 / 重试全失败 / 超时 ⇒ 原样返回（并 warn），**绝不阻塞回灌**。
-fn punctuate_via_service(model_dir: &Path, enabled: bool, text: &str) -> String {
-    if !enabled || text.trim().is_empty() {
-        return text.to_string();
-    }
-    // FIX-VOICEPRINT-FALLBACK-421：不再「含任一标点就整段跳过」（流式里只要有 1 个停顿打的句号，
-    // 整段都不打点 ⇒ Gavin 端测「最后一句没有标点」）。改为先**剥掉**流式里零星的标点，再整段送
-    // CT-Transformer（与预览「输入始终是原始裸文本」同原则）。**失败/超时仍原样返回原文**（不丢标点）。
-    let stripped = strip_punct_for_repunct(text);
-    if stripped.trim().is_empty() {
-        return text.to_string();
-    }
-    let state = PUNCT_SERVICE.get_or_init(|| std::sync::Mutex::new(PunctState::default()));
-    let now = std::time::Instant::now();
-    {
-        let g = state.lock().unwrap_or_else(|e| e.into_inner());
-        if punct_cooldown_active(g.last_fail, now) {
-            log::warn!("[LocalRT-DBG-410] punct service in cooldown; using raw fallback text");
-            return text.to_string();
-        }
-    }
-    match run_punct_retries(|_i| punct_attempt(state, model_dir, &stripped)) {
-        Ok(s) => {
-            state.lock().unwrap_or_else(|e| e.into_inner()).last_fail = None;
-            if s.trim().is_empty() {
-                text.to_string()
-            } else {
-                s
-            }
-        }
-        Err(why) => {
-            if why == "timeout" {
-                log::warn!("[LocalRT-DBG-410] punct fallback timeout; using raw fallback text");
-            } else {
-                // 启动/重试全失败 ⇒ 设冷却（③：下次仍需重试，但 30s 内不反复加载）。
-                state.lock().unwrap_or_else(|e| e.into_inner()).last_fail = Some(now);
-                log::warn!(
-                    "[LocalRT-DBG-410] punct service failed after retries ({why}); using raw fallback text"
-                );
-            }
-            text.to_string()
-        }
-    }
-}
-
-/// FIX-VOICEPRINT-FALLBACK-421：剥掉标点供**重新整段打点**（含中英标点）。数字中的小数点 / 千分
-/// 逗号（两侧皆 ASCII 数字）保留，防 `3.14` → `314`。
-fn strip_punct_for_repunct(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    for (i, &c) in chars.iter().enumerate() {
-        let is_punct = matches!(
-            c,
-            '，' | '。' | '、' | '！' | '？' | '；' | '：' | ',' | '.' | '!' | '?' | ';' | ':'
-        );
-        if !is_punct {
-            out.push(c);
-            continue;
-        }
-        if matches!(c, '.' | ',') {
-            let prev_digit = i > 0 && chars[i - 1].is_ascii_digit();
-            let next_digit = i + 1 < chars.len() && chars[i + 1].is_ascii_digit();
-            if prev_digit && next_digit {
-                out.push(c); // 数字内部的小数点 / 千分逗号保留。
-            }
-        }
-    }
-    out
-}
-
-/// FIX-PREVIEW-HARVEST-380（A）：滑窗解码结果载荷
-/// `(window_seq, dispatch_idx, 解码结果, 解码耗时 ms, 解码完成时刻)`。
-/// 382（3C）：末元 `Instant` 随 `PreviewReflow.decode_done_at` 带到消费端，测「解完 → 浮层重画」。
-type AccDecodeResult = (
-    usize,
-    usize,
-    anyhow::Result<(String, bool, transcription::AccDropStats)>,
-    f64,
-    std::time::Instant,
-);
-
-/// PIPE-SPEED-457 ①：解码线程 → 收割线程的消息。**同一通道**：同一线程先发的先到 ⇒
-/// 第 N 窗的对齐时间必在第 N+1 窗精解结果之前被处理（重拼只针对「最近拼接的窗」）。
-enum AccWorkerMsg {
-    /// 精解结果（先送，不等对齐）。
-    Decoded(AccDecodeResult),
-    /// FORCED-ALIGN-456：该窗精解文字每字（起, 止）**窗内秒**（强制对齐，晚到）。
-    Aligned(usize, Vec<(f32, f32)>),
-}
-
-/// FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382：滑窗解码任务载荷
-/// `(window_seq, dispatch_idx, 本窗音频, 产出率均值快照, 派发时刻, 本窗语音区间, 本窗流式文本非空, 本窗新片起点样本下标)`
-/// （派发时刻供 3C `queued_ms`）。VAD-393（A3）：第 6 元为**窗内坐标**的合并语音区间；
-/// `None` ⇒ 回退 391 自跑 VAD。SPEAKER-VERIFY-408B：第 8 元 `new_slice_from`（声纹注册只计新片）。
-type AccTaskMsg = (
-    usize,
-    usize,
-    Vec<f32>,
-    Option<f32>,
-    std::time::Instant,
-    Option<Vec<(usize, usize)>>,
-    bool,
-    usize,
-    AccHints,
-);
-
-/// ACC-452 ⑤：流式回灌的半截结果最短发送间隔（每字都发会刷屏；~6 字 / 间隔）。
-const PARTIAL_REFLOW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
-
-/// ACC-ENGINE-LLAMACPP-452：本窗解码提示（随任务派发）。上文注入经 452 回放未采用（加在词库之上 CER 4.63%→4.80%）。
-#[derive(Default, Clone)]
-struct AccHints {
-    /// ② 本窗预览（流式）文字 ⇒ 推测解码草稿（只省时间，不改输出）。
-    draft: String,
-}
-
-/// FIX-PREVIEW-HARVEST-380（A）：滑窗线程的一步（新切片 / 解码结果）。
-enum AccWindowStep<A, R, P> {
-    Slice(A),
-    Result(R),
-    /// ACC-452 ⑤：解码中的半截结果（流式回灌）。
-    Partial(P),
-}
-
-/// FIX-PREVIEW-HARVEST-380（A）：滑窗线程「结果到即收」驱动器。
-///
-/// 同时等 `acc_rx`（新切片）与 `res_rx`（解码结果），**任一先到即处理**；`acc_rx` 关闭
-///（松键）或 `cancelled()` 为真即返回，由调用方做收尾 drain（复用同一 `step` 闭包）。
-///
-/// 缺陷本体（Gavin 2026-09-23 端测 BUILD-379）：原实现是 `for … in acc_rx` —— 没有新切片时
-/// 不进循环体，已解出的结果要压到下一次切片或松键才回灌（用户停顿 ⇒ 预览不刷新，每次的
-/// 最后一窗都要等松键）。抽成独立函数的唯一目的，是让「结果在 `acc_rx` 仍打开时就被处理」
-/// 这条不变量**可对生产代码单测**（见 `preview_harvest_380_tests`），而不是测一份复制品。
-fn drive_acc_windows<A, R, P>(
-    acc_rx: &crossbeam_channel::Receiver<A>,
-    res_rx: &crossbeam_channel::Receiver<R>,
-    partial_rx: &crossbeam_channel::Receiver<P>,
-    cancelled: impl Fn() -> bool,
-    step: &mut impl FnMut(AccWindowStep<A, R, P>),
-) {
-    // ACC-452 ⑤：半截结果通道断开（不应发生）⇒ 换成永不就绪的通道，避免 select 空转。
-    let mut partial_rx = partial_rx.clone();
-    loop {
-        if cancelled() {
-            break;
-        }
-        crossbeam_channel::select! {
-            recv(acc_rx) -> msg => match msg {
-                Ok(slice) => step(AccWindowStep::Slice(slice)),
-                // 发送端关闭 = 松键 ⇒ 退出，交给收尾 drain 收齐在飞窗口。
-                Err(_) => break,
-            },
-            recv(res_rx) -> msg => match msg {
-                Ok(result) => step(AccWindowStep::Result(result)),
-                // 收尾段之外 res_rx 不该断开（worker 未全部退出前持有发送端）；
-                // 真断开按「不再有结果」处理，避免死循环。
-                Err(_) => break,
-            },
-            recv(partial_rx) -> msg => match msg {
-                Ok(p) => step(AccWindowStep::Partial(p)),
-                Err(_) => partial_rx = crossbeam_channel::never(),
-            },
-        }
-    }
-}
-
-/// FIX-ACC-MISMATCH-GUARD-406：滑窗精解结果与同窗流式比对守卫的源码护栏。
-#[cfg(test)]
-mod fix406_tests {
-    /// 源码护栏：`harvest_acc_window!` 宏体内必须调用 `acc_vs_streaming`（406 主判据），
-    /// 且 FIX-VOICEPRINT-FALLBACK-421 后基准须先经 `kept_streaming_text` 收窄到保留区间。
-    /// 只扫生产区（剔 `#[cfg(test)]`），锚点用 `concat!` 拆开防自匹配假绿。
-    #[test]
-    fn fix406_harvest_acc_window_calls_acc_vs_streaming() {
-        let prod =
-            crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC).join("\n");
-        let body = prod
-            .split("macro_rules! harvest_acc_window")
-            .nth(1)
-            .expect("harvest_acc_window 锚点缺失");
-        // 截到下一个 `macro_rules!`（若首段即全部则到末尾）。
-        let body = body.split("macro_rules!").next().unwrap();
-        assert!(
-            body.contains(&concat!("acc_vs_streaming(", "&decoded")),
-            "406：harvest_acc_window! 内必须对同窗流式调用 acc_vs_streaming"
-        );
-        assert!(
-            body.contains(&concat!("kept_", "streaming_text(")),
-            "421：harvest_acc_window! 内必须把基准收窄到声纹保留区间"
-        );
-        assert!(
-            body.contains("from_streaming"),
-            "406：harvest_acc_window! 内必须按 406 判定用流式替换精解"
-        );
-    }
-}
-
-/// ACC-ENGINE-LLAMACPP-452（DEC-093，推翻 DEC-083）：`load_hotwords_for_accuracy` 对本地实时档**不再早退**，
-/// 与 Accuracy 档同样读词库注入（原 396 护栏已反转）。
-#[cfg(test)]
-mod fix396_tests {
-    /// 源码护栏：`load_hotwords_for_accuracy` 函数体内**不得**再对 `AsrModel::LocalRealtime` 早退；
-    /// 仍保留 `uses_accuracy_engine()` 门（在线 / 快速档不读词库），且在读词库之前。
-    #[test]
-    fn fix396_local_realtime_reads_wordbook_since_452() {
-        let src = crate::MAIN_RS_SRC;
-        let body = src
-            .split("fn load_hotwords_for_accuracy(")
-            .nth(1)
-            .expect("load_hotwords_for_accuracy 锚点缺失");
-        // 函数体：截到下一次顶层 `}\n`（顶层 fn 闭合）。
-        let body = body.split("\n}\n").next().unwrap();
-        let code: String = body
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            !code.contains("AsrModel::LocalRealtime"),
-            "452：LocalRealtime 不得再早退（DEC-093 恢复本地实时词库注入）"
-        );
-        let gate = code
-            .find("uses_accuracy_engine()")
-            .expect("452：uses_accuracy_engine() 门不得删除");
-        let read = code.find("Wordbook::open(").expect("读词库调用缺失");
-        assert!(gate < read, "uses_accuracy_engine() 门须在读词库之前");
-    }
-}
-
-/// VAD-393（A3）：窗口语音区间拼接（片内坐标 → 窗内坐标）纯函数。
-#[cfg(test)]
-mod vad393_window_ranges_tests {
-    use super::shift_and_concat_ranges;
-
-    #[test]
-    fn ts393_all_some_offsets_by_cumulative_lens() {
-        let slices = vec![
-            Some(vec![(10usize, 20usize)]),
-            Some(vec![(5, 15), (30, 40)]),
-        ];
-        let lens = [100usize, 200usize];
-        // 第 0 片偏移 0；第 1 片偏移 100。
-        assert_eq!(
-            shift_and_concat_ranges(&slices, &lens),
-            Some(vec![(10, 20), (105, 115), (130, 140)])
-        );
-    }
-
-    #[test]
-    fn ts393_empty_slices_yield_some_empty() {
-        let slices: Vec<Option<Vec<(usize, usize)>>> = vec![Some(vec![]), Some(vec![])];
-        assert_eq!(shift_and_concat_ranges(&slices, &[10, 20]), Some(vec![]));
-    }
-
-    #[test]
-    fn ts393_any_none_yields_none() {
-        let slices = vec![Some(vec![(1usize, 2usize)]), None];
-        assert_eq!(shift_and_concat_ranges(&slices, &[10, 20]), None);
-    }
-
-    /// 393-A3⑥a（TEST-SYNC）：`lens` 比 `slices` 短（缺长度）⇒ 不 panic，缺长度按 0 偏移。
-    #[test]
-    fn ts393c_lens_shorter_than_slices_uses_zero_offset_no_panic() {
-        let slices = vec![Some(vec![(1usize, 2usize)]), Some(vec![(3, 4)])];
-        // 主控修正期望：片 k 的偏移 = lens[0..k] 之和。第 0 片长 10 已给出 ⇒ 第 1 片偏移 10；
-        // 缺的是第 1 片自己的长度，只影响其后的片（此处没有）。原期望 (3,4) 把偏移算错了。
-        assert_eq!(
-            shift_and_concat_ranges(&slices, &[10usize]),
-            Some(vec![(1, 2), (13, 14)]),
-            "第 1 片缺长度 ⇒ 不 panic；第 1 片偏移仍为第 0 片长度 10"
-        );
-        assert_eq!(
-            shift_and_concat_ranges(&slices, &[]),
-            Some(vec![(1, 2), (3, 4)]),
-            "空 lens ⇒ 全部按 0 偏移"
-        );
-    }
-
-    /// 393-A3⑥b（TEST-SYNC）：三片全 `Some` ⇒ 偏移逐片累计（片 k 偏移 = 前 k 片长度之和）。
-    #[test]
-    fn ts393c_three_some_cumulative_offsets() {
-        let slices = vec![
-            Some(vec![(2usize, 5usize)]),
-            Some(vec![(1, 2)]),
-            Some(vec![(0, 4)]),
-        ];
-        let lens = [100usize, 200, 300];
-        assert_eq!(
-            shift_and_concat_ranges(&slices, &lens),
-            Some(vec![(2, 5), (101, 102), (300, 304)])
-        );
-    }
-
-    /// 393-A3⑦ 源码护栏（TEST-SYNC，非作者；剔除 `#[cfg(test)]` 区）：`recent_slice_ranges.remove(0)`
-    /// 与 `recent_slices.remove(0)` 各恰 1 处且**相邻**（三数组同步，防以后只删一个导致区间错位）。
-    #[test]
-    fn ts393c_three_arrays_remove_adjacent_source_guard() {
-        let lines = crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC);
-        let idx = |needle: &str| -> Vec<usize> {
-            lines
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| l.as_str() == needle)
-                .map(|(i, _)| i)
-                .collect()
-        };
-        let a = idx("recent_slices.remove(0);");
-        let b = idx("recent_slice_ranges.remove(0);");
-        assert_eq!(a.len(), 1, "recent_slices.remove(0) 应恰 1 处，实测 {a:?}");
-        assert_eq!(
-            b.len(),
-            1,
-            "recent_slice_ranges.remove(0) 应恰 1 处，实测 {b:?}"
-        );
-        assert_eq!(
-            (a[0] as isize - b[0] as isize).abs(),
-            1,
-            "两数组 remove(0) 必须相邻（同一 while 块内同步）"
-        );
-    }
-
-    /// 393-A3⑧ 源码护栏（TEST-SYNC，非作者；剔除 `#[cfg(test)]` 区）：路B 的 `CtxInject` 仍为
-    /// `speech_ranges: None`（路B 无实时时间线，不得误接时间线剪静音）。全局恰 1 处。
-    #[test]
-    fn ts393c_path_b_speech_ranges_none_source_guard() {
-        let lines = crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC);
-        let n = lines
-            .iter()
-            .filter(|l| l.as_str() == "speech_ranges: None,")
-            .count();
-        assert_eq!(
-            n, 1,
-            "路B CtxInject 的 speech_ranges 必须恒为 None，实测 {n} 处"
-        );
-    }
-}
-
-#[cfg(test)]
-mod preview_harvest_380_tests {
-    use super::{drive_acc_windows, AccWindowStep};
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-
-    /// FIX-PREVIEW-HARVEST-380（A）：结果必须在 `acc_rx` **仍打开**时就被处理，
-    /// 不得等 `acc_rx` 关闭（旧 `for … in acc_rx` 的缺陷）。
-    ///
-    /// 先后由通道制造、不用 sleep 定时序：先派 1 片、阻塞等它被处理（此时 driver 已回到
-    /// select 等下一件事，`acc_tx` 仍被本测试持有 ⇒ `acc_rx` 恒打开）；再送 1 个结果，
-    /// 它必须在 `acc_tx` 关闭之前被 `step` 消费。若 driver 退回「只在收到切片时才收结果」，
-    /// 第 2 次 `recv` 必然超时 ⇒ 红。`recv_timeout` 仅作挂死兜底，不承担排序职责。
-    #[test]
-    fn drive_acc_windows_harvests_result_while_acc_open() {
-        let (acc_tx, acc_rx) = crossbeam_channel::unbounded::<u32>();
-        let (res_tx, res_rx) = crossbeam_channel::unbounded::<u32>();
-        // step 每处理一步即回执，供测试线程按先后推进。
-        let (step_tx, step_rx) = crossbeam_channel::unbounded::<&'static str>();
-        let seen = Arc::new(Mutex::new(Vec::<&'static str>::new()));
-        let seen_worker = Arc::clone(&seen);
-
-        let handle = std::thread::spawn(move || {
-            let mut step = |ev: AccWindowStep<u32, u32, u32>| {
-                let tag = match ev {
-                    AccWindowStep::Slice(_) => "slice",
-                    AccWindowStep::Result(_) => "result",
-                    AccWindowStep::Partial(_) => "partial",
-                };
-                seen_worker.lock().unwrap().push(tag);
-                let _ = step_tx.send(tag);
-            };
-            drive_acc_windows(
-                &acc_rx,
-                &res_rx,
-                &crossbeam_channel::never::<u32>(),
-                || false,
-                &mut step,
-            );
-        });
-
-        // 1) 派发 1 窗；阻塞等它被处理（先后由通道制造，非 sleep）。
-        acc_tx.send(0).expect("send slice");
-        assert_eq!(
-            step_rx
-                .recv_timeout(Duration::from_secs(10))
-                .expect("slice step"),
-            "slice"
-        );
-        // 2) 结果回来 —— 此刻 acc_tx 仍被本测试持有 ⇒ acc_rx 恒打开。
-        res_tx.send(1).expect("send result");
-        assert_eq!(
-            step_rx
-                .recv_timeout(Duration::from_secs(10))
-                .expect("结果必须在 acc_rx 仍打开时被处理（不得等 acc_rx 关闭）"),
-            "result"
-        );
-        // 关切片通道，driver 退出。
-        drop(acc_tx);
-        drop(res_tx);
-        handle.join().expect("driver thread");
-        assert_eq!(&*seen.lock().unwrap(), &["slice", "result"]);
-    }
-}
-
-// ============================================================
-// FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382（问题1）：逐片组窗（纯函数）
-// ============================================================
-
-/// FIX-TAIL-WINDOW-AND-FALLBACK-386（C）：窗口文本选择 —— 解码文本为空（含解码 Err）⇒ 用**本窗流式文本**
-/// 兜底；流式也为空才保持空。防结尾整段丢失（本次 seq7 `<location>` 丢 40+ 字）。纯函数，可单测。
-/// FIX-SPLIT-SLICE-STREAMING-411：一次派发切成多片时，整段流式文本按**各片样本占比**分配到各片。
-///
-/// 旧实现（386 补）「`k == 0` 返回整段、其余返回空」会让**只含第一片**的窗口拿到整段文本 ⇒
-/// 406 比对基准含窗口外内容 ⇒ 正确精解被误拒（BUILD-409 16:44Z：窗#0 retention 0.38 误拒），
-/// 且整段被兜底回灌 ⇒ 最终文本**重复**。
-///
-/// 分配口径（与 `tail_streaming_baseline` 一致）：
-/// - 边界 `boundary(cum) = round(total_chars × cum / total_samples)`，对**同一累计样本单一定义**
-///   ⇒ 各片 `end == 下一片 start`、首 0、末 `total_chars` ⇒ 各片字数**求和恒等于总字数**（不丢不重）；
-/// - **按 char 切**（`chars().skip/take`），禁字节下标（`LOCALRT-CHARBOUNDARY-344`）。
-///
-/// `slice_samples` = 本次派发各片的**样本数**（时间序），`k` 为片下标；总样本 0 / 空文本 / k 越界 ⇒ 空串。
-fn slice_streaming_text(k: usize, seg_streaming: &str, slice_samples: &[usize]) -> String {
-    let total: u64 = slice_samples.iter().map(|s| *s as u64).sum();
-    let total_chars = seg_streaming.chars().count();
-    if total == 0 || total_chars == 0 || k >= slice_samples.len() {
-        return String::new();
-    }
-    let cum_before: u64 = slice_samples[..k].iter().map(|s| *s as u64).sum();
-    let cum_after = cum_before + slice_samples[k] as u64;
-    let boundary =
-        |cum: u64| -> usize { ((total_chars as u64 * cum + total / 2) / total) as usize };
-    let (start, end) = (boundary(cum_before), boundary(cum_after));
-    seg_streaming
-        .chars()
-        .skip(start)
-        .take(end - start)
-        .collect()
-}
-
-fn window_text_with_fallback(decoded: &str, streaming: &str) -> String {
-    if decoded.is_empty() {
-        streaming.to_string()
-    } else {
-        decoded.to_string()
-    }
-}
-
-/// FIX-VOICEPRINT-FALLBACK-421：本窗最终文本决策（纯函数，可单测）。
-///
-/// - `full_drop`（声纹整窗全剔）⇒ **输出空、`is_fallback=false`**（绝不走流式兜底把他人语音放回）。
-/// - 否则：精解被 406 拒（`!accept` 且非空）⇒ 用**保留部分流式**兜底；精解为空（模型自身空，未剔除）
-///   ⇒ 仍按 386-C 用保留部分流式兜底；精解被采纳 ⇒ 用精解。
-/// 返回 `(is_fallback, 最终文本)`。
-fn window_final_text(
-    decoded: &str,
-    kept_streaming: &str,
-    accept: bool,
-    full_drop: bool,
-) -> (bool, String) {
-    if full_drop {
-        return (false, String::new());
-    }
-    let from_streaming = !decoded.is_empty() && !accept;
-    let is_fallback = from_streaming || decoded.is_empty();
-    let text = if from_streaming {
-        kept_streaming.to_string()
-    } else {
-        window_text_with_fallback(decoded, kept_streaming)
-    };
-    (is_fallback, text)
-}
-
-/// FALLBACK-EXCLUDE-FARFIELD-446：兜底裁剪用的「保留 / 剔除」区间 —— 把**远场**区间并入剔除、从保留中减去。
-///
-/// Gavin 2026-09-26 端测：旁放他人语音，精解对这段只出「Imagem」被 406 拒，退回流式兜底，
-/// 流式把背景声误识别成「在才能在他的的操作搞成一务，当don't…」写进最终文字。近场门已判这些语音为远场
-///（`vad_only_speech_chunks=232`），但 392 起门不定内容去留 ⇒ 只在**兜底**这一步借用远场信息。
-/// - `far` 空 ⇒ `None`（兜底与改前逐位相同）；
-/// - `kept ∪ dropped` 空（声纹未运行、无语音轴）⇒ `None`（语音轴未知时绝不删字，宁留勿吞）；
-/// - 否则返回 `(kept − far, dropped ∪ far)`，交 [`kept_streaming_text`] 删落在远场的字。纯函数，可单测。
-fn fallback_ranges_with_far(
-    kept: &[(usize, usize)],
-    dropped: &[(usize, usize)],
-    far: &[(usize, usize)],
-) -> Option<(Vec<(usize, usize)>, Vec<(usize, usize)>)> {
-    if far.is_empty() || (kept.is_empty() && dropped.is_empty()) {
-        return None;
-    }
-    let mut kept2: Vec<(usize, usize)> = Vec::new();
-    for &(a, b) in kept {
-        let mut pieces = vec![(a, b)];
-        for &(fa, fb) in far {
-            let mut next = Vec::new();
-            for (pa, pb) in pieces {
-                if fb <= pa || fa >= pb {
-                    next.push((pa, pb));
-                } else {
-                    if fa > pa {
-                        next.push((pa, fa));
-                    }
-                    if fb < pb {
-                        next.push((fb, pb));
-                    }
-                }
-            }
-            pieces = next;
-        }
-        kept2.extend(pieces);
-    }
-    let mut dropped2 = dropped.to_vec();
-    dropped2.extend_from_slice(far);
-    Some((kept2, dropped2))
-}
-
-/// FIX-VOICEPRINT-FALLBACK-421 / R1：把**本窗流式文本**按声纹剔除区间裁剪 —— **只删被剔除的字**。
-///
-/// - `dropped_ranges` 空 ⇒ 无剔除（或仅保留）⇒ `streaming` **原样返回**（逐位不变）。
-/// - **时间戳路径**：`timestamps` 给出每个字的**窗口内秒数**且长度 == 字数 ⇒ 落在 `dropped_ranges`
-///   的字删除，其余（含无法归属）保留。
-/// - **估算路径**：无时间戳 ⇒ 把字**只铺在语音时间轴**（`kept ∪ dropped` 裁剪到本段 `[offset, offset+span)`）上，
-///   第 `i` 字落到该轴 `(i+0.5)/N` 处 → 换回窗内样本；**落在 dropped 才删，其余一律保留**。
-///
-/// 🔴 R1 要点：旧版把字**均匀铺满整个窗口时长（含静音）**，本人的字会被映射进静音缝 ⇒ 误删（吞本人字）。
-/// 铺在**语音轴**上纠正之；判定改成「**只删 dropped**」⇒ 偏保留、绝不吞字（Gavin 底线）。
-///
-/// `span_samples` = 这段流式对应音频的样本数；`offset_samples` = 其在**窗内**的起始样本
-///（常规窗 0；410 末尾窗 pending 段 = 窗总样本 − pending 样本）。纯函数，可单测。
-fn kept_streaming_text(
-    streaming: &str,
-    span_samples: usize,
-    offset_samples: usize,
-    kept_ranges: &[(usize, usize)],
-    dropped_ranges: &[(usize, usize)],
-    timestamps: Option<&[f32]>,
-) -> String {
-    if dropped_ranges.is_empty() || streaming.is_empty() {
-        return streaming.to_string();
-    }
-    let chars: Vec<char> = streaming.chars().collect();
-    let n = chars.len();
-    if n == 0 {
-        return String::new();
-    }
-    let in_dropped = |sample: usize| {
-        dropped_ranges
-            .iter()
-            .any(|&(a, b)| sample >= a && sample < b)
-    };
-    // 时间戳路径（逐字窗口内秒数）：只删落在 dropped 的字。
-    if let Some(ts) = timestamps {
-        if ts.len() == n {
-            let mut out = String::with_capacity(streaming.len());
-            for (i, &c) in chars.iter().enumerate() {
-                if !in_dropped((ts[i].max(0.0) * 16000.0) as usize) {
-                    out.push(c);
-                }
-            }
-            return out;
-        }
-    }
-    // 估算路径：字只铺在**语音轴**上（kept ∪ dropped，裁剪到本段），落在 dropped 才删。
-    let (lo, hi) = (offset_samples, offset_samples.saturating_add(span_samples));
-    let mut speech: Vec<(usize, usize)> = kept_ranges
-        .iter()
-        .chain(dropped_ranges.iter())
-        .filter_map(|&(a, b)| {
-            let (a2, b2) = (a.max(lo), b.min(hi));
-            if b2 > a2 {
-                Some((a2, b2))
-            } else {
-                None
-            }
-        })
-        .collect();
-    speech.sort_unstable();
-    let total_speech: usize = speech.iter().map(|(a, b)| b - a).sum();
-    if span_samples == 0 || total_speech == 0 {
-        return streaming.to_string(); // 无语音轴信息 ⇒ 偏保留
-    }
-    let mut out = String::with_capacity(streaming.len());
-    for (i, &c) in chars.iter().enumerate() {
-        let pos = ((i as f64 + 0.5) / n as f64 * total_speech as f64) as usize;
-        let mut acc = 0usize;
-        let mut sample = hi; // 越界 ⇒ 不属任何区间 ⇒ 保留
-        for &(a, b) in &speech {
-            let len = b - a;
-            if pos < acc + len {
-                sample = a + (pos - acc);
-                break;
-            }
-            acc += len;
-        }
-        if !in_dropped(sample) {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// FIX-NEARFIELD-BY-SEGMENT-AND-PREVIEW-389（D3）：**部分窗**（不含本次派发末片）的 `committed_len` 折算。
-///
-/// `frac = 前 0..=k 片样本数 / 本次派发全部片样本数`；`win = prev_committed + round((committed_len −
-/// prev_committed) × frac)`。部分窗若用整次派发的边界（覆盖被延后末片）会把预览截短。
-fn partial_win_committed(
-    prev_committed: usize,
-    committed_len: usize,
-    cum_samples: usize,
-    total_samples: usize,
-) -> usize {
-    let frac = if total_samples > 0 {
-        cum_samples as f32 / total_samples as f32
-    } else {
-        1.0
-    };
-    prev_committed
-        + (((committed_len.saturating_sub(prev_committed)) as f32) * frac).round() as usize
-}
-
-/// 386：组窗计划（纯函数输出）。
-///
-/// LOCALRT-STOP-TAIL-UNIFY-423：收尾（松键）不再走本函数 —— 统一走 `emit_tail_window!`
-/// （末尾组窗），故原「规则 4 短尾合并」与 `TAIL_MERGE_MAX_SECS` 一并删除。
-#[derive(Debug, PartialEq, Eq)]
-struct WindowPlan {
-    /// 本次要**立刻派发**的窗口（全局切片区间 `[start,end)`，按序）。
-    windows: Vec<(usize, usize)>,
-    /// 更新后的「待覆盖片」全局下标（`None` = 无待覆盖）。
-    pending: Option<usize>,
-}
-
-/// LOCALRT-TAIL-WINDOW-407：长静默末尾窗的**纯决策**。
-///
-/// `pending` = 待覆盖片全局下标；`prev_base` = `recent_slices[0]` 的全局下标；`recent_len` = 片数。
-/// 有 pending 且换算到 `recent` 后**存在前片**（下标 `i > 0`）⇒ 返回
-/// `(窗口 span 起点, 终点, 前片下标 i)` = `(p-1, p+1, i)`；否则 `None`（无 pending / 该片是首片）。
-fn tail_window_span(
-    pending: Option<usize>,
-    prev_base: usize,
-    recent_len: usize,
-) -> Option<(usize, usize, usize)> {
-    let p = pending?;
-    let i = p.checked_sub(prev_base)?;
-    if i > 0 && i < recent_len {
-        Some((p - 1, p + 1, i))
-    } else {
-        None
-    }
-}
-
-/// LOCALRT-STOP-TAIL-UNIFY-423：末尾窗「**单独解**」纯决策 —— `pending` 落在 `recent` 范围内但
-/// **是首片**（无前片）⇒ 返回单独窗 span `(p, p+1)`；越界 / 无 pending ⇒ `None`。
-///
-/// 与 [`tail_window_span`] 配合：`span` 有解 ⇒ 前片后缀 + pending；`alone` 有解 ⇒ 单独解 pending。
-/// 长静默与松键收尾**共用**（`emit_tail_window!`），不再按 pending 时长（<3s / ≥3s）分叉。
-fn tail_window_alone(
-    pending: Option<usize>,
-    prev_base: usize,
-    recent_len: usize,
-) -> Option<(usize, usize)> {
-    let p = pending?;
-    let i = p.checked_sub(prev_base)?;
-    if i < recent_len {
-        Some((p, p + 1))
-    } else {
-        None
-    }
-}
-
-/// LOCALRT-TAIL-WINDOW-407（R1）：末尾窗的**回溯时长**。
-///
-/// R1 起因（主控）：固定回溯 2s 在**慢速语音**下只覆盖 6~9 字，**低于对齐质量门
-/// `ALIGN_MIN_OVERLAP_CHARS`（8）** ⇒ 对齐直接 fail ⇒ 末尾窗接缝**重复字**（历史反复出现的接缝重复）。
-/// 改为按**本次录音已有字速**（[`transcription::acc_avg_chars_per_sec`] 的运行均值；冷启动无均值按
-/// **3.0 字/秒**）估算出「至少 `ALIGN_MIN_OVERLAP_CHARS + 4` 个字」所需时长：
-/// `max(2.0, (ALIGN_MIN_OVERLAP_CHARS + 4) / rate)`。Gavin 口径是「不短于 2s」，更长符合要求。
-/// 调用方再把时长换算为样本并**封顶为整个前片**（前片不够取整片）。
-fn tail_backtrack_secs(rate_cps: f32) -> f32 {
-    let need = (transcription::ALIGN_MIN_OVERLAP_CHARS + 4) as f32; // 8 + 4 = 12 字
-    let rate = if rate_cps.is_finite() && rate_cps > 0.0 {
-        rate_cps
-    } else {
-        3.0
-    };
-    (need / rate).max(2.0)
-}
-
-/// FIX-TAIL-GUARD-410 item1：末尾窗的 **406 比对基准** = 前片流式的**末尾相应字符数**（按
-/// `suffix_samples / prev_samples` 比例、**按 char 切**，禁字节下标，见 `LOCALRT-CHARBOUNDARY-344`）
-/// + pending 流式。**不得**用整个前片流式（否则基准含窗口外内容 ⇒ 正确精解被 406 误拒）。
-fn tail_streaming_baseline(
-    prev_streaming: &str,
-    suffix_samples: usize,
-    prev_samples: usize,
-    pending_streaming: &str,
-) -> String {
-    let prev_chars = prev_streaming.chars().count();
-    let ratio = if prev_samples == 0 {
-        0.0
-    } else {
-        suffix_samples as f32 / prev_samples as f32
-    };
-    let n = (((prev_chars as f32) * ratio).round() as usize).min(prev_chars);
-    let mut s: String = prev_streaming.chars().skip(prev_chars - n).collect();
-    s.push_str(pending_streaming);
-    s
-}
-
-/// LOCALRT-SHORT-CONTEXT-413：本窗「必须完整解的片」起点 `must_start`（纯函数，可单测）。
-///
-/// - 本批**首个**窗口且上一批遗留待覆盖片 `p` 落在窗内 `[gs,ge)` ⇒ `p`
-///   （`plan_windows` 规则 3 把 pending 并进来：pending 到本窗末片都完整解）；
-/// - 其余（常态单片 / 多片切分的后续子窗 / 无 pending）⇒ 窗末片 `ge-1`。
-///
-/// 背景：常规窗原先按 `group_window_start_secs` 把前面整片一起带上 ⇒ 末句虽只 2.85s，
-/// 送解却 9.33s（BUILD-399 09:48:21Z「开心开」，`decode_ms=2194`）。派发时**无法知道
-/// 这是不是最后一句**，故只能所有常规窗都少带前文（Gavin 2026-09-25）。
-fn must_start_for_window(
-    gs: usize,
-    ge: usize,
-    pending_before: Option<usize>,
-    is_first: bool,
-) -> usize {
-    if is_first {
-        if let Some(p) = pending_before {
-            if p >= gs && p < ge {
-                return p;
-            }
-        }
-    }
-    ge.saturating_sub(1)
-}
-
-/// LOCALRT-ALWAYS-CONTEXT-427：本窗「前文后缀」取自哪一片（纯函数，可单测）。
-///
-/// Gavin 2026-09-25：「不管新句多长，只要本次录音前面还有片，就从前一片末尾切一截带上；
-/// 10s 上限只决定前面整片要不要一起重解，不再影响带不带末尾一截」。
-///
-/// 413 原判据 `must_start > gs` 在**新片长**时（`group_window_start_secs` 把前片排除 ⇒ `gs == must_start`）
-/// 返回 `None` ⇒ 长句窗无前文（日志 `[LocalRT-DBG-413] prev_cut_secs=0.00`）。427 改为：只要紧邻前一片
-/// （`must_start-1`）**仍在 `recent_slices` 缓冲内**（`>= buf_base`）就取其后缀，**不再要求它落在
-/// `[gs, ge)` 内**。首片 / 前片已被缓冲裁掉 ⇒ `None`。返回**全局切片下标**，调用方换算到局部下标。
-///
-/// `gs < must_start-1`（窗内还有更早的整片）⇒ 与 413 相同：更早整片丢弃，只留紧邻前一片后缀。
-fn short_context_span(ge: usize, must_start: usize, buf_base: usize) -> Option<usize> {
-    if must_start >= 1 && must_start < ge && must_start - 1 >= buf_base {
-        Some(must_start - 1)
-    } else {
-        None
-    }
-}
-
-/// LOCALRT-SHORT-CONTEXT-413：把某片的片内语音区间裁剪到 `[cut, len)` 并平移 `-cut`，
-/// 得到该片**后缀**在窗内的坐标（纯函数，可单测）。
-///
-/// 跨 `cut` 的区间被截断（起点抬到 `cut`）；完全落在 `cut` 之前（`b <= cut`）的被丢。
-/// 与 [`shift_and_concat_ranges`] 配套：先裁剪平移前文后缀区间，再由后者按各片样本数偏移拼接。
-fn trim_and_shift_ranges(ranges: &[(usize, usize)], cut: usize) -> Vec<(usize, usize)> {
-    ranges
-        .iter()
-        .filter_map(|&(a, b)| {
-            if b <= cut {
-                None
-            } else {
-                Some((a.max(cut) - cut, b - cut))
-            }
-        })
-        .collect()
-}
-
-/// LOCALRT-SHORT-CONTEXT-413 / LOCALRT-TAIL-WINDOW-407 **共用**的前文后缀提取结果。
-struct ContextSuffix {
-    /// 前片内切点（`prev[cut..]` 为送入的前文后缀）。
-    cut: usize,
-    /// 后缀样本数（`prev.len() - cut`）。
-    suffix_samples: usize,
-    /// 后缀对应的流式**字符数**（仅日志）。
-    suffix_chars: usize,
-    /// 回溯时长（秒，仅日志）。
-    backtrack_secs: f32,
-    /// 是否在回溯区间内找到真「字缝」（仅日志）。
-    gap_found: bool,
-    /// 406 比对基准 = 前片流式末尾相应字数 + must 流式。
-    baseline: String,
-}
-
-/// FORCED-ALIGN-456：窗口在录音虚拟时间轴上的 `(绝对起点秒, 与上一窗分界绝对秒)`（纯函数）。
-///
-/// 窗口音频在第 `ge-1` 片末尾结束 ⇒ 起点 = `slice_cum_end[ge-1] − Σsamples`。与上一窗共享
-/// `prev_we − span_start` 段（重叠区）；分界 = 重叠区起点 + `split_frac × 重叠样本`（436 同源），
-/// 无分界比例 ⇒ 重叠区终点（新片起点）；无重叠 ⇒ 窗口起点。
-fn window_abs_geometry(
-    slice_cum_end: &[usize],
-    ge: usize,
-    span_start: usize,
-    prev_span_end: Option<usize>,
-    samples: &[usize],
-    split_frac: Option<f32>,
-) -> (f32, f32) {
-    let end = ge
-        .checked_sub(1)
-        .and_then(|i| slice_cum_end.get(i))
-        .copied()
-        .unwrap_or(0);
-    let start = end.saturating_sub(samples.iter().sum());
-    let shared = prev_span_end
-        .map_or(0, |pe| pe.saturating_sub(span_start))
-        .min(samples.len());
-    let shared_samples: usize = samples[..shared].iter().sum();
-    let split = start as f32
-        + split_frac.map_or(shared_samples as f32, |f| {
-            f.clamp(0.0, 1.0) * shared_samples as f32
-        });
-    (start as f32 / 16000.0, split / 16000.0)
-}
-
-/// SEAM-INTERIOR-ONLY-436：本窗与上一窗重叠区的内部分界比例（相对重叠区起点，∈(0,1)）。
-///
-/// 重叠区音频 = 本窗音频开头的共享切片部分（`samples[..shared]`，`shared = prev_we − span_start`）。
-/// 分界点算法见 [`transcription::local_stream::interior_split_frac`]（中间 40%~60% 最近真停顿，
-/// 无 ⇒ 中点）。无共享（首窗 / `span_start >= prev_we` / 空音频）⇒ None。
-/// 纯函数（`prev_span_end` 由调用方取上一窗 `we`）。mod.rs 接线待 436 第二阶段。
-fn window_overlap_split(
-    span_start: usize,
-    prev_span_end: Option<usize>,
-    audio: &[f32],
-    samples: &[usize],
-) -> Option<f32> {
-    let pe = prev_span_end?;
-    let shared = pe.saturating_sub(span_start).min(samples.len());
-    if shared == 0 {
-        return None;
-    }
-    let overlap: usize = samples[..shared].iter().sum();
-    let overlap = overlap.min(audio.len());
-    if overlap == 0 {
-        return None;
-    }
-    Some(transcription::local_stream::interior_split_frac(
-        &audio[..overlap],
-    ))
-}
-
-/// LOCALRT-SHORT-CONTEXT-413：从**紧邻前一片**取「后缀」作为本窗前文（407 / 413 共用，
-/// **禁止复制出第二份**）。
-///
-/// 回溯时长按 [`tail_backtrack_secs`]（本次字速自适应，冷启动 3.0 字/秒）→ 换算样本并
-/// **封顶整片**；再用 [`transcription::local_stream::find_tail_cut`]（与 407 同一套字缝判据）
-/// 找切点，无字缝回落回溯点。`suffix_samples` 与 `baseline` 供常规窗 / 407 末尾窗记账。
-fn take_context_suffix(
-    prev: &[f32],
-    prev_stream: &str,
-    must_stream: &str,
-    rate_cps: f32,
-) -> ContextSuffix {
-    let backtrack_secs = tail_backtrack_secs(rate_cps);
-    let back = ((backtrack_secs * 16000.0) as usize).min(prev.len()).max(1);
-    let (cut, gap_found) = transcription::local_stream::find_tail_cut(prev, back);
-    let suffix_samples = prev.len() - cut;
-    let prev_chars = prev_stream.chars().count();
-    let ratio = if prev.is_empty() {
-        0.0
-    } else {
-        suffix_samples as f32 / prev.len() as f32
-    };
-    let suffix_chars = (((prev_chars as f32) * ratio).round() as usize).min(prev_chars);
-    let baseline = tail_streaming_baseline(prev_stream, suffix_samples, prev.len(), must_stream);
-    ContextSuffix {
-        cut,
-        suffix_samples,
-        suffix_chars,
-        backtrack_secs,
-        gap_found,
-        baseline,
-    }
-}
-
-/// LOCALRT-SHORT-CONTEXT-413（R1）：**带前文**常规窗的 410 兜底元数据 —— 只兜底 **must 片**。
-///
-/// 精解被 406 拒 / 为空时用的兜底文本/区间只覆盖 `(must_start, ge)`；前文后缀
-/// `must_start-1` 是上一窗**已精解过的准确文本**，不得被流式兜底顶掉（同 410 item2）。
-fn context_tail_pending(
-    must_start: usize,
-    ge: usize,
-    must_samples: Vec<usize>,
-    must_streaming: String,
-) -> TailPending {
-    TailPending {
-        span: (must_start, ge),
-        samples: must_samples,
-        streaming: must_streaming,
-    }
-}
-
-/// FIX-TAIL-WINDOW-AND-FALLBACK-386：组窗纯函数（**中途派发**用）。
-///
-/// 输入：`prev_durs` 已派发片时长（时间序，调用方保证已按 `WINDOW_MAX_SLICES` 裁剪）；
-/// `prev_base` = `prev_durs[0]` 的全局下标；`new_durs` = 本次派发携带的新片时长（时间序）；
-/// `pending` = 上一次遗留的**待覆盖片**全局下标（`None` = 无）。
-///
-/// 规则（Gavin 2026-09-23 BUILD-385 端测）：
-/// 1. 单次派发 **1 片**（常态）⇒ 与旧行为相同，立刻组窗（含把 `pending` 强制纳入）。
-/// 2. 单次派发 **≥2 片**（被切分）⇒ 除**最后一片**外每片立刻组窗；最后一片不组窗，记为待覆盖片。
-/// 3. 有 `pending` 时，**本批第一个窗口起点强制 ≤ pending**（把待覆盖片纳入，**哪怕总长超 `WINDOW_MAX_SECS`**）。
-///
-/// 🔴 LOCALRT-STOP-TAIL-UNIFY-423：**收尾（松键）不再走本函数** —— 松键有 pending 时统一走
-/// `emit_tail_window!`（末尾组窗：前片后缀 + pending），与 407 长静默机制一致；原「规则 4 短尾合并」
-/// 与 `is_tail` 参数、`TAIL_MERGE_MAX_SECS` 一并删除。本函数只服务**中途切片派发**。
-fn plan_windows(
-    prev_durs: &[f32],
-    new_durs: &[f32],
-    prev_base: usize,
-    pending: Option<usize>,
-) -> WindowPlan {
-    let mut buf: Vec<f32> = prev_durs.to_vec();
-    let mut base = prev_base; // buf[0] 的全局下标
-    let mut out: Vec<(usize, usize)> = Vec::new();
-    let mut pend = pending;
-    let n = new_durs.len();
-
-    for (k, nd) in new_durs.iter().enumerate() {
-        buf.push(*nd);
-        while buf.len() > transcription::WINDOW_MAX_SLICES {
-            buf.remove(0);
-            base += 1;
-        }
-        let end = base + buf.len();
-        let is_last = k + 1 == n;
-        // 规则 2：一次派发 ≥2 片 ⇒ 最后一片**延后**（收尾由 `emit_tail_window!` 覆盖）。
-        if is_last && n >= 2 {
-            pend = Some(end - 1);
-            continue;
-        }
-        let mut start =
-            base + transcription::group_window_start_secs(&buf, transcription::WINDOW_MAX_SECS);
-        // 规则 3：本批第一个窗口强制纳入待覆盖片（允许超 WINDOW_MAX_SECS）。
-        if let Some(p) = pend {
-            if p < start {
-                start = p;
-            }
-            pend = None;
-        }
-        out.push((start, end));
-    }
-
-    WindowPlan {
-        windows: out,
-        pending: pend,
-    }
-}
-
-// =====================================================================
-// FIX-TAIL-GUARD-410：末尾窗 × 406 守卫配合（比对基准只取前片后缀 / 兜底只覆 pending / 兜底打点）
-// =====================================================================
-#[cfg(test)]
-mod fix410_tail_guard_tests {
-    use super::{
-        punct_cooldown_active, punctuate_via_service, run_punct_retries, tail_streaming_baseline,
-        PunctTry, PUNCT_START_MAX_RETRIES,
-    };
-
-    /// 410 item1：真实数据构造 —— 整前片基准会**误拒**正确精解；比例基准（前片末尾相应字数 + pending）⇒ accept。
-    #[test]
-    fn f410_tail_baseline_ratio_corrects_false_reject() {
-        let prev = "周末天气好的话一起出来玩吧我们一起可以出去看看电影也可以挤出去吃饭然后也可以到郊外去旅游旅游";
-        let pending = "或者到附进去旅游";
-        let jie = "然后也可以到郊外去旅游旅游，或者到附近去旅游。";
-        // 旧基准 = 整个前片 + pending ⇒ 含窗口外内容 ⇒ 误拒（BUILD-409 现场 retention 0.39）。
-        let old = format!("{prev}{pending}");
-        assert!(
-            !crate::transcription::acc_vs_streaming(jie, &old).accept,
-            "整前片基准应误拒（复现缺陷）"
-        );
-        // 新基准：前片 6.91s，回溯 4.0s ⇒ 前片末尾 4.0/6.91 比例字数。
-        let prev_chars = prev.chars().count();
-        let suffix_samples = 64_000usize; // 4.0s @16k
-        let prev_samples = 110_560usize; // 6.91s @16k
-        let baseline = tail_streaming_baseline(prev, suffix_samples, prev_samples, pending);
-        let expect_suffix =
-            ((prev_chars as f32) * (suffix_samples as f32 / prev_samples as f32)).round() as usize;
-        assert_eq!(
-            baseline.chars().count(),
-            expect_suffix + pending.chars().count(),
-            "基准字数应 = 比例字数 + pending 字数"
-        );
-        assert!(
-            crate::transcription::acc_vs_streaming(jie, &baseline).accept,
-            "比例基准应 accept 正确精解（retention={:.2} len={:.2}）",
-            crate::transcription::acc_vs_streaming(jie, &baseline).retention,
-            crate::transcription::acc_vs_streaming(jie, &baseline).len_ratio
-        );
-    }
-
-    /// 410 item2：末尾窗被拒后**只**以 span `(p,p+1)` + pending 文本回灌 ⇒ 前片已回灌文本逐字不变。
-    #[test]
-    fn f410_tail_fallback_keeps_prev_and_appends_pending() {
-        let mut o = crate::transcription::OrderedReflow::new();
-        let prev = "周末天气好的话一起出来玩吧";
-        let pending_punct = "或者到附近去旅游。";
-        // 窗0：前片已回灌。
-        let _ = o.push_window(0, 0, 1, vec![100], prev.to_string());
-        // 末尾窗被拒 ⇒ 兜底 pending 片：span (1,2)、文本 = 加标点 pending。
-        let _ = o.push_window(1, 1, 2, vec![50], pending_punct.to_string());
-        let (committed, last) = o.finish();
-        let full = format!("{committed}{last}");
-        assert_eq!(
-            full,
-            format!("{prev}{pending_punct}"),
-            "前片须一字不动、pending 追加"
-        );
-        assert!(full.starts_with(prev), "前片已回灌文本必须逐字不变");
-    }
-
-    /// 410 item1：按 char 切片 —— 中英混合 + emoji 不 panic、字数正确。
-    #[test]
-    fn f410_tail_baseline_char_safe_mixed_emoji() {
-        let prev = "hello你好😀世界"; // 10 chars
-        let pending = "再见👋"; // 3 chars
-        let b = tail_streaming_baseline(prev, 5, 10, pending); // 后 5 字 + pending
-        assert!(b.ends_with(pending));
-        assert_eq!(b.chars().count(), 5 + pending.chars().count());
-        // 比例 0 / 超界 均不 panic。
-        let _ = tail_streaming_baseline(prev, 0, 10, pending);
-        let _ = tail_streaming_baseline(prev, 999, 10, pending);
-        let _ = tail_streaming_baseline("", 0, 0, "");
-    }
-
-    /// 410 item3：标点服务不带模型的两条守卫 —— 关闭 ⇒ 原样；已含句读标点 ⇒ 不重复打。
-    #[test]
-    fn f410_punctuate_guards_no_model() {
-        let dir = std::path::Path::new(".");
-        assert_eq!(
-            punctuate_via_service(dir, false, "你好世界"),
-            "你好世界",
-            "关闭 ⇒ 原样"
-        );
-        assert_eq!(
-            punctuate_via_service(dir, true, "你好，世界。"),
-            "你好，世界。",
-            "已含标点 ⇒ 不重复打（早退、不加载模型）"
-        );
-    }
-
-    /// 410 补充①②：异常退出（panic / 断开）⇒ 重启重试；首次异常、次次成功 ⇒ 返回成功。
-    #[test]
-    fn f410_punct_retry_after_abnormal_then_ok() {
-        let mut calls = 0usize;
-        let r = run_punct_retries(|i| {
-            calls += 1;
-            if i == 0 {
-                PunctTry::AbnormalExit
-            } else {
-                PunctTry::Ok("你好，世界。".to_string())
-            }
-        });
-        assert_eq!(r, Ok("你好，世界。".to_string()), "异常退出后重启应成功");
-        assert_eq!(calls, 2, "应恰重启重试 1 次");
-        // 连续多次异常退出 ⇒ 重试到上限；首两次异常、第三次成功。
-        let mut calls2 = 0usize;
-        let r2 = run_punct_retries(|i| {
-            calls2 += 1;
-            if i < 2 {
-                PunctTry::AbnormalExit
-            } else {
-                PunctTry::Ok("ok".to_string())
-            }
-        });
-        assert_eq!(r2, Ok("ok".to_string()));
-        assert_eq!(calls2, PUNCT_START_MAX_RETRIES + 1);
-    }
-
-    /// 410 补充②：连续两次启动失败（Unavailable）⇒ 本次走无标点（`Err("startup-failed")`）。
-    #[test]
-    fn f410_punct_two_startup_failures_give_raw() {
-        let mut calls = 0usize;
-        let r = run_punct_retries(|_| {
-            calls += 1;
-            PunctTry::Unavailable
-        });
-        assert_eq!(r, Err("startup-failed"), "连续失败应放弃、走无标点");
-        assert_eq!(
-            calls,
-            PUNCT_START_MAX_RETRIES + 1,
-            "尝试次数 = 1 + 2 次重试"
-        );
-    }
-
-    /// 410 补充④：超时（线程活着但慢）**不算异常退出、不重启** ⇒ 立即走无标点。
-    #[test]
-    fn f410_punct_timeout_no_restart() {
-        let mut calls = 0usize;
-        let r = run_punct_retries(|_| {
-            calls += 1;
-            PunctTry::Timeout
-        });
-        assert_eq!(r, Err("timeout"));
-        assert_eq!(calls, 1, "超时不得重试");
-    }
-
-    /// 410 补充③：冷却窗口 —— 失败后 `[0, 30s)` 内不再尝试，`≥30s` 可再试。
-    #[test]
-    fn f410_punct_cooldown_window() {
-        let base = std::time::Instant::now();
-        assert!(!punct_cooldown_active(None, base), "无失败记录 ⇒ 无冷却");
-        assert!(punct_cooldown_active(Some(base), base), "刚失败 ⇒ 冷却中");
-        assert!(punct_cooldown_active(
-            Some(base),
-            base + std::time::Duration::from_secs(29)
-        ));
-        assert!(
-            !punct_cooldown_active(Some(base), base + std::time::Duration::from_secs(30)),
-            "满 30s ⇒ 冷却结束、可重试"
-        );
-    }
-
-    /// 410 item3（真模型）：标点服务实际给裸流式文本加上标点。
-    /// 运行：`cargo test --bin feiyin-ime -- --ignored --nocapture f410_real_punctuate`
-    #[test]
-    #[ignore = "requires punctuation model; cargo test --bin feiyin-ime -- --ignored --nocapture f410_real_punctuate"]
-    fn f410_real_punctuate() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models");
-        let out = punctuate_via_service(&dir, true, "今天天气不错我们出去玩吧");
-        println!("\n[410] punctuated: {out}");
-        assert!(
-            out.chars()
-                .any(|c| matches!(c, '。' | '，' | '！' | '？' | '；' | '、')),
-            "真模型应对裸文本加上标点，实测 {out:?}"
-        );
-    }
-}
-
-// =====================================================================
-// FIX-VOICEPRINT-FALLBACK-421：声纹剔除后兜底只取保留部分 + 全剔不兜底 + 兜底补标点
-// =====================================================================
-#[cfg(test)]
-mod fix421_tests {
-    use super::{kept_streaming_text, strip_punct_for_repunct, window_final_text};
-
-    #[test]
-    fn kept_streaming_no_drop_is_identity() {
-        let s = "相识一个可实的地步我们走吧";
-        assert_eq!(
-            kept_streaming_text(s, 16000, 0, &[], &[], None),
-            s,
-            "无剔除（dropped 空）必须逐字原样"
-        );
-    }
-
-    #[test]
-    fn kept_streaming_estimation_deletes_only_dropped() {
-        // 10 字铺在语音轴 [0,10000)；dropped=[5000,10000) ⇒ 删后 5 字。
-        let out = kept_streaming_text(
-            "ABCDEFGHIJ",
-            10_000,
-            0,
-            &[(0, 5_000)],
-            &[(5_000, 10_000)],
-            None,
-        );
-        assert_eq!(out, "ABCDE");
-    }
-
-    /// R1 核心：字铺在**语音轴**上（含静音不计），只删 dropped —— 本人的字不会被映射进静音缝而误删。
-    #[test]
-    fn r1_estimation_lays_chars_on_speech_axis_only() {
-        // 窗 10s：本人语音 0.5~3.5s(kept)、他人 6~9s(dropped)、其余静音。
-        let kept = [(8_000usize, 56_000usize)];
-        let dropped = [(96_000usize, 144_000usize)];
-        let user = "本人说的话在这里";
-        let other = "相识一个可实的地步";
-        let stream = format!("{user}{other}");
-        let out = kept_streaming_text(&stream, 160_000, 0, &kept, &dropped, None);
-        assert!(out.contains(user), "本人字必须全部保留：{out:?}");
-        assert!(!out.contains("相识"), "他人字必须删除：{out:?}");
-    }
-
-    #[test]
-    fn kept_streaming_timestamp_path() {
-        // 逐字窗口内秒数；dropped=[32000,160000) ⇒ 仅前 2 字（<2s）保留。
-        let ts: Vec<f32> = (0..10).map(|i| i as f32).collect();
-        let out = kept_streaming_text(
-            "ABCDEFGHIJ",
-            10_000,
-            0,
-            &[(0, 32_000)],
-            &[(32_000, 160_000)],
-            Some(&ts),
-        );
-        assert_eq!(out, "AB");
-    }
-
-    #[test]
-    fn kept_streaming_offset_excludes_prefix() {
-        // span=2000、offset=8000；dropped=[8000,10000) ⇒ 本段全被删（该段整体是 dropped）。
-        let out = kept_streaming_text(
-            "ABCDEFGHIJ",
-            2_000,
-            8_000,
-            &[(0, 8_000)],
-            &[(8_000, 10_000)],
-            None,
-        );
-        assert_eq!(out, "");
-    }
-
-    #[test]
-    fn window_final_full_drop_is_empty_no_fallback() {
-        let (fb, text) = window_final_text("", "相识一个可实的地步他人语音", true, true);
-        assert!(!fb, "声纹全剔不得兜底");
-        assert_eq!(text, "");
-    }
-
-    #[test]
-    fn window_final_model_empty_still_fallbacks_kept_only() {
-        // 模型自身解码为空（未剔除）⇒ 仍按 386-C 用**保留部分**流式兜底。
-        let (fb, text) = window_final_text("", "保留部分的字", true, false);
-        assert!(fb);
-        assert_eq!(text, "保留部分的字");
-    }
-
-    #[test]
-    fn window_final_reject_uses_kept_streaming_only() {
-        // 精解被 406 拒 ⇒ 用保留部分流式（不是整窗含他人语音的流式）。
-        let (fb, text) = window_final_text("精解短", "保留部分流式", false, false);
-        assert!(fb);
-        assert_eq!(text, "保留部分流式");
-    }
-
-    #[test]
-    fn window_final_accept_keeps_decoded() {
-        let (fb, text) = window_final_text("精解文本", "保留部分流式", true, false);
-        assert!(!fb);
-        assert_eq!(text, "精解文本");
-    }
-
-    #[test]
-    fn strip_punct_removes_stray_keeps_decimal() {
-        assert_eq!(strip_punct_for_repunct("你好，世界。"), "你好世界");
-        assert_eq!(
-            strip_punct_for_repunct("3.14和1,000"),
-            "3.14和1,000",
-            "数字内小数点/千分逗号保留"
-        );
-        assert_eq!(strip_punct_for_repunct("a.b"), "ab");
-        // 60 字里 1 个句号 ⇒ 剥后 59 字（证明不再「含任一标点就整段跳过」）。
-        let sixty = format!("{}。", "啊".repeat(59));
-        assert_eq!(strip_punct_for_repunct(&sixty).chars().count(), 59);
-    }
-
-    /// 回放（2026-09-25 日志数值）：窗 #0 全剔 ⇒ 空；窗 #2/#3 部分剔除 ⇒ 最终只含本人保留段，
-    /// **不含**「相识一个可实的地步…」这类他人语音文字。
-    #[test]
-    fn replay_421_window0_empty_window2_excludes_other_speech() {
-        // 窗 #0：kept=0.00s dropped=9.36s ⇒ 全剔 ⇒ 空、不兜底（即使模型空、流式非空）。
-        let (fb, t0) = window_final_text("", "相识一个可实的地步然后我们去那个地方吧", true, true);
-        assert!(!fb && t0.is_empty(), "窗 #0 应输出空且不兜底");
-
-        // 窗 #2：dropped=12.67s kept=1.73s ⇒ 仅保留后 1.73s（约 27680/230400 样本）。
-        let total = (12.67f32 * 16000.0) as usize + (1.73 * 16000.0) as usize;
-        let keep = (1.73f32 * 16000.0) as usize;
-        let stream = format!(
-            "{}{}",
-            "相识一个可实的地步然后我们去那个地方吧", "我今天很开心"
-        );
-        let kept = kept_streaming_text(
-            &stream,
-            total,
-            0,
-            &[(total - keep, total)],
-            &[(0, total - keep)],
-            None,
-        );
-        assert!(!kept.contains("相识"), "不得含他人语音：{kept:?}");
-        assert!(kept.contains("开心"), "应保留本人尾段：{kept:?}");
-    }
-
-    /// 421 item3（真模型）：流式含 1 个句号也应**重新整段打点**（旧行为会整段跳过）。
-    /// 运行：`cargo test --bin feiyin-ime -- --ignored --nocapture poc_421_repunct`
-    #[test]
-    #[ignore = "requires punctuation model; cargo test --bin feiyin-ime -- --ignored --nocapture poc_421_repunct"]
-    fn poc_421_repunct_sixty_with_one_period() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models");
-        let input = "今天天气特别好我们一起去公园散步吧顺便看看花然后找个地方坐下来喝杯茶聊聊天说说最近发生的事情。";
-        let out = super::punctuate_via_service(&dir, true, input);
-        println!("\n[421] repunct: {out}");
-        let punct = |c: char| matches!(c, '。' | '，' | '！' | '？' | '；' | '、');
-        assert!(
-            out.chars().filter(|&c| punct(c)).count() >= 2,
-            "含 1 个句号的流式应重新打全标点，实测 {out:?}"
-        );
-    }
-}
-
-// =====================================================================
-// TEST-SYNC-421（阶段三 · 非作者护栏 · coder-2）：FIX-VOICEPRINT-FALLBACK-421
-//   契约：全剔⇒空不兜底 / 模型空(未剔)⇒兜底 / 只删 dropped（字铺语音轴）/ dropped=0 逐位不变
-//   / 先剥后打 / 源码锚点。独立字表与场景，不复用作者 fix421_tests 夹具。
-//   🔴 白名单：只 rustfmt + cargo check；未跑 cargo test。生产零改动。
-// =====================================================================
-#[cfg(test)]
-mod testsync421_tests {
-    use super::{
-        kept_streaming_text, punctuate_via_service, strip_punct_for_repunct, window_final_text,
-    };
-    use std::path::Path;
-
-    const SR: usize = 16_000;
-    fn s(secs: f32) -> usize {
-        (secs * SR as f32) as usize
-    }
-    fn eff(x: &str) -> usize {
-        x.chars().count()
-    }
-
-    /// 契约 1/2：本人段在**窗首**、他人段在窗尾 ⇒ 本人全留、他人全删。
-    #[test]
-    fn ts421g_user_head_kept_other_dropped() {
-        let user = "本人说话在此"; // 6 字
-        let other = "相识一个可实"; // 6 字（等长 ⇒ 语音轴按 3s:3s 精准分离）
-        let out = kept_streaming_text(
-            &format!("{user}{other}"),
-            s(10.0),
-            0,
-            &[(s(0.5), s(3.5))],
-            &[(s(6.0), s(9.0))],
-            None,
-        );
-        assert_eq!(out, user, "本人段（窗首）必须全留、他人段（窗尾）必须全删");
-    }
-
-    /// 契约 1/2：本人段在**窗尾**、他人段在窗首 ⇒ 本人全留、他人全删。
-    #[test]
-    fn ts421g_user_tail_kept_other_dropped() {
-        let user = "本人说话在此";
-        let other = "相识一个可实";
-        let out = kept_streaming_text(
-            &format!("{other}{user}"),
-            s(10.0),
-            0,
-            &[(s(6.0), s(9.0))],
-            &[(s(0.5), s(3.5))],
-            None,
-        );
-        assert_eq!(out, user, "他人段（窗首）删、本人段（窗尾）留");
-    }
-
-    /// 契约 1/2：本人段在**中间**、两侧他人段 ⇒ 本人全留、两侧他人全删。
-    #[test]
-    fn ts421g_user_middle_kept_both_sides_dropped() {
-        let user = "本人说话在此"; // 6
-        let other_a = "甲乙丙丁"; // 4
-        let other_b = "庚辛壬癸"; // 4
-        let out = kept_streaming_text(
-            &format!("{other_a}{user}{other_b}"),
-            s(10.0),
-            0,
-            &[(s(3.0), s(6.0))],
-            &[(s(0.5), s(2.5)), (s(7.0), s(9.0))],
-            None,
-        );
-        assert_eq!(out, user, "本人（中段）全留、两侧他人全删");
-    }
-
-    /// 契约 1：kept 只有**极短 KeepShort 段**（1.5s < 2s 单元判段门）⇒ 本人的字仍不得被吞。
-    /// 独立下界：本人语音占总语音 1.5/5.5 ⇒ 期望 ≥ floor(N×0.2727)；此处 3 字全留。
-    #[test]
-    fn ts421g_short_kept_unit_keeps_all_user_chars() {
-        let user = "我在这"; // 3 字
-        let other = "相识一二三四五六"; // 8 字
-        let stream = format!("{user}{other}");
-        let out = kept_streaming_text(
-            &stream,
-            s(10.0),
-            0,
-            &[(0, s(1.5))],
-            &[(s(2.0), s(6.0))],
-            None,
-        );
-        assert_eq!(out, user, "极短 KeepShort 段内本人的字不得被吞");
-        let lb = (eff(&stream) as f32 * (1.5f32 / 5.5f32)).floor() as usize;
-        assert!(eff(&out) >= lb, "保留字数须 ≥ 按语音时长比例下界 {lb}");
-    }
-
-    /// 契约 2：**全剔** ⇒ 空且 `is_fallback=false`；即使 decoded 非空也空（不让 410 pending 接手）。
-    #[test]
-    fn ts421g_full_drop_empty_and_no_fallback() {
-        let (fb, t) = window_final_text("", "相识一个可实的地步", true, true);
-        assert!(!fb, "全剔不得兜底");
-        assert_eq!(t, "");
-        let (fb2, t2) = window_final_text("模型竟吐了点字", "他人语音", false, true);
-        assert!(!fb2 && t2.is_empty(), "全剔优先于一切 ⇒ 空且不兜底");
-    }
-
-    /// 契约 3：`dropped=0` ⇒ `kept_streaming_text` 逐位原样（含给了 timestamps 也不删）；
-    /// 406 门槛回到统一 `acc_vs_streaming`（dropped=0 ⇒ 采纳精解，与改前一致）。
-    #[test]
-    fn ts421g_no_drop_is_identity() {
-        let t = "无剔除时逐字不变，含标点。与数字3.14";
-        assert_eq!(
-            kept_streaming_text(t, s(10.0), 0, &[(0, s(5.0))], &[], None),
-            t
-        );
-        let ts: Vec<f32> = (0..eff(t)).map(|i| i as f32).collect();
-        assert_eq!(
-            kept_streaming_text(t, s(10.0), 0, &[], &[], Some(&ts)),
-            t,
-            "dropped 空 ⇒ 早退原样（时间戳也不参与）"
-        );
-        assert_eq!(
-            window_final_text("精解文本", "流式", true, false),
-            (false, "精解文本".to_string())
-        );
-    }
-
-    /// 契约 4：模型自身解码为空（**未剔除**）⇒ 仍按 386-C 用保留部分流式兜底。
-    #[test]
-    fn ts421g_model_empty_still_fallback() {
-        let (fb, t) = window_final_text("", "保留部分流式", true, false);
-        assert!(fb, "模型空（未剔）仍须兜底");
-        assert_eq!(t, "保留部分流式");
-    }
-
-    /// 契约 5：`strip_punct_for_repunct` —— 剥零星标点，保留数字内小数点 / 千分逗号。
-    #[test]
-    fn ts421g_strip_punct_for_repunct_cases() {
-        assert_eq!(strip_punct_for_repunct("你好，世界。"), "你好世界");
-        assert_eq!(strip_punct_for_repunct("第一，3.14，第二"), "第一3.14第二");
-        assert_eq!(
-            strip_punct_for_repunct("1,000元和2,500元"),
-            "1,000元和2,500元"
-        );
-        assert_eq!(strip_punct_for_repunct("a.b"), "ab", "非数字夹持的点剥掉");
-        assert_eq!(
-            strip_punct_for_repunct("等等……"),
-            "等等……",
-            "只剥列举标点（省略号不在列）"
-        );
-        // 长流式里 1 个句号 ⇒ 只剥该 1 个（不再「含任一标点整段跳过」）。
-        let long = format!("{}。", "啊".repeat(29));
-        assert_eq!(eff(&strip_punct_for_repunct(&long)), 29);
-    }
-
-    /// 契约 5：标点服务关闭 ⇒ 原样返回（不触碰服务线程）。
-    #[test]
-    fn ts421g_punctuate_disabled_passthrough() {
-        let raw = "你好，世界。3.14";
-        assert_eq!(
-            punctuate_via_service(Path::new("no-such-model-dir"), false, raw),
-            raw,
-            "enabled=false 必须原样返回（含原标点）"
-        );
-    }
-
-    /// 契约 6：源码锚点（生产区 + `concat!` 拆字面量防自匹配）。
-    #[test]
-    fn ts421g_source_anchors() {
-        let prod: Vec<String> =
-            crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC);
-        let joined = prod.join("\n");
-        assert!(
-            joined.contains("transcription::acc_vs_streaming("),
-            "harvest 406 应用统一 acc_vs_streaming"
-        );
-        let gone = concat!("acc_vs_streaming", "_after_drop");
-        assert!(
-            !joined.contains(gone),
-            "408B scale 补丁应已删（harvest 不再引用）"
-        );
-        assert!(
-            joined.contains("let stripped = strip_punct_for_repunct(text);"),
-            "punctuate_via_service 必须**先剥后打**"
-        );
-        assert!(joined.contains("let (is_fallback, text) = window_final_text("));
-        assert!(joined.contains("kept_streaming_text("));
-    }
-}
-
-/// LOCALRT-TAIL-WINDOW-407：末尾组窗纯决策 + 与已提交文本对齐合并不重不漏。
-#[cfg(test)]
-mod tail_window_407_tests {
-    use super::{tail_backtrack_secs, tail_window_span};
-
-    /// R1：慢速（2 字/秒）与快速（6 字/秒）下，回溯时长估算字数都 ≥ 对齐门+4（12），
-    /// 且都不短于 2s（Gavin 口径）；冷启动无均值按 3.0 字/秒。
-    #[test]
-    fn tw407_backtrack_covers_align_min_chars_at_slow_and_fast_rates() {
-        let need = (crate::transcription::ALIGN_MIN_OVERLAP_CHARS + 4) as f32;
-        for rate in [2.0f32, 3.0, 6.0] {
-            let secs = tail_backtrack_secs(rate);
-            assert!(secs >= 2.0, "回溯不短于 2s：rate={rate} secs={secs}");
-            assert!(
-                secs * rate >= need,
-                "回溯估算字数须 ≥{need}（对齐门+余量）：rate={rate} est={}",
-                secs * rate
-            );
-        }
-        // 慢速 2 字/秒 ⇒ 6s（12 字）；快速 6 字/秒 ⇒ 2s（12 字），均 > 对齐门 8。
-        assert_eq!(tail_backtrack_secs(2.0), 6.0);
-        assert_eq!(tail_backtrack_secs(6.0), 2.0);
-        // 冷启动 / 非法字速 ⇒ 按 3.0 字/秒。
-        assert_eq!(tail_backtrack_secs(3.0), 4.0);
-        assert_eq!(tail_backtrack_secs(f32::NAN), tail_backtrack_secs(3.0));
-        assert_eq!(tail_backtrack_secs(0.0), tail_backtrack_secs(3.0));
-    }
-
-    #[test]
-    fn tw407_span_requires_prev() {
-        // 无 pending ⇒ 无动作。
-        assert_eq!(tail_window_span(None, 0, 3), None);
-        // 有 pending 且有前片 ⇒ (p-1, p+1, i)。
-        assert_eq!(tail_window_span(Some(4), 1, 5), Some((3, 5, 3)));
-        // pending 是首片（i==0）⇒ None（无可回溯前片）。
-        assert_eq!(tail_window_span(Some(1), 1, 5), None);
-        // pending 越界 ⇒ None。
-        assert_eq!(tail_window_span(Some(9), 1, 5), None);
-    }
-
-    /// 末尾窗（前片后缀 + pending）与已提交的「前片全文」对齐合并 ⇒ 不重字、不漏字。
-    ///
-    /// 注：`ALIGN_MIN_OVERLAP_CHARS = 8` ⇒ 构造的重叠后缀须 ≥8 字（否则对齐层直接 fail，落「宁重复不丢字」兜底）。
-    #[test]
-    fn tw407_alignment_no_dup_no_loss() {
-        let mut ordered = crate::transcription::OrderedReflow::new();
-        let prev = "今天我们去了一个很大的博物馆";
-        // 窗0（常规）：覆盖片 [0,1)，文本 = 片0 全文。
-        let _ = ordered.push_window(0, 0, 1, vec![130], prev.to_string());
-        // 窗1（末尾窗）：span [0,2)，samples [前片后缀, 片1]，文本 = 前片后缀（8 字）+ 片1。
-        let tail = "一个很大的博物馆那里展出了很多古代文物";
-        let _ = ordered.push_window(1, 0, 2, vec![80, 110], tail.to_string());
-        let (committed, last) = ordered.finish();
-        assert_eq!(
-            format!("{committed}{last}"),
-            "今天我们去了一个很大的博物馆那里展出了很多古代文物",
-            "末尾窗须与已提交对齐合并：不重字、不漏字"
-        );
-    }
-}
-
-/// LOCALRT-SHORT-CONTEXT-413 / ALWAYS-CONTEXT-427：常规窗「前文后缀」纯函数
-///（`must_start` / 前文片 / 区间裁剪 / 取后缀）。427 起只要紧邻前一片在缓冲内就取后缀。
-#[cfg(test)]
-mod short_context_413_tests {
-    use super::{
-        context_tail_pending, must_start_for_window, short_context_span, take_context_suffix,
-        trim_and_shift_ranges,
-    };
-
-    /// 常态单片：`must_start = 窗末片`，前文来自紧邻前一片（更早的上下文片整片丢弃）。
-    #[test]
-    fn ts413_normal_window_takes_only_prev_slice_suffix() {
-        let ms = must_start_for_window(0, 5, None, true);
-        assert_eq!(ms, 4, "常态：只有窗末新片必须完整解");
-        assert_eq!(
-            short_context_span(5, ms, 0),
-            Some(3),
-            "前文只取紧邻前一片（片 3）的后缀，片 0~2 丢弃"
-        );
-    }
-
-    /// 427：规则 3 并入 pending ⇒ `must_start = pending`；**即便 `gs == pending`**，只要前一片
-    /// （`pending-1`）仍在缓冲内 ⇒ 仍取其后缀（旧 413 此处为 None ⇒ 无前文）。
-    #[test]
-    fn ts427_pending_merged_still_takes_prev_suffix() {
-        let ms = must_start_for_window(2, 6, Some(2), true);
-        assert_eq!(ms, 2, "pending 并进来后从 pending 起必须完整解");
-        assert_eq!(
-            short_context_span(6, ms, 0),
-            Some(1),
-            "427：pending 前一片仍在缓冲内 ⇒ 取其后缀（旧 413 为 None）"
-        );
-
-        let ms2 = must_start_for_window(1, 6, Some(3), true);
-        assert_eq!(ms2, 3);
-        assert_eq!(short_context_span(6, ms2, 0), Some(2));
-    }
-
-    /// 多片切分：首个窗口可并入 pending；后续子窗 `must_start = 自己的片`（前片已解，仅作前文）。
-    #[test]
-    fn ts413_multi_slice_windows() {
-        let first = must_start_for_window(0, 3, Some(1), true);
-        assert_eq!(first, 1, "首个窗口并入 pending=1");
-        assert_eq!(short_context_span(3, first, 0), Some(0));
-
-        let later = must_start_for_window(2, 4, Some(1), false);
-        assert_eq!(
-            later, 3,
-            "后续子窗只有自己的片必须完整解（pending 已被前窗消费）"
-        );
-        assert_eq!(short_context_span(4, later, 0), Some(2));
-    }
-
-    /// 首片无前片 ⇒ 只解新片本身；前片已被缓冲裁掉 ⇒ 也无前文（427 边界）。
-    #[test]
-    fn ts427_first_slice_or_evicted_prev_has_no_context() {
-        let ms = must_start_for_window(0, 1, None, true);
-        assert_eq!(ms, 0);
-        assert_eq!(short_context_span(1, ms, 0), None, "首片无前片");
-        // 紧邻前一片已被缓冲裁掉（must_start-1 < buf_base）⇒ 无前文。
-        assert_eq!(short_context_span(8, 7, 7), None, "前片出缓冲");
-    }
-
-    /// 427 核心：`gs == must_start`（新片长致前片被 10s 上限排除）时**仍有**前文后缀 —— 只要
-    /// 紧邻前一片还在缓冲内（旧 413 判据 `must_start > gs` 在此返回 None ⇒ 长句无前文）。
-    #[test]
-    fn ts427_long_new_slice_still_has_prev_context() {
-        // 窗 (gs=9, ge=12)、must_start=11 ⇒ 前文取片 10（旧 413：9<... 满足 Some(10)）；
-        // 关键：若 gs==must_start（前片被 group 窗排除），427 仍取 must_start-1。
-        assert_eq!(short_context_span(12, 11, 0), Some(10));
-        assert_eq!(
-            short_context_span(11, 10, 0),
-            Some(9),
-            "新片长致 gs==must_start ⇒ 427 仍取紧邻前一片后缀"
-        );
-    }
-
-    /// 🔴 423（Gavin 2026-09-25）：收尾统一走末尾组窗 ⇒ **不再有** `dispatch_window!(…, gs, …)` 收尾调用；
-    /// 常规窗仍恰 1 处传 `must_start`；末尾窗统一宏 `emit_tail_window!` 必须存在。防回退。
-    #[test]
-    fn ts423_single_dispatch_window_call_and_tail_macro() {
-        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC);
-        let (mut regular, mut tail_gs) = (0usize, 0usize);
-        for i in 0..prod.len() {
-            if prod[i].starts_with("dispatch_window!(") {
-                // 单行 / 多行调用同一口径（rustfmt 视长度二选一）：取第 3 个实参。
-                let arg3 = crate::guard_prod_lines::macro_call_arg(&prod, i, 2);
-                if arg3 == concat!("must", "_start") {
-                    regular += 1;
-                } else if arg3 == "gs" {
-                    tail_gs += 1;
-                }
-            }
-        }
-        assert_eq!(regular, 1, "常规窗应恰有 1 处传 must_start");
-        assert_eq!(tail_gs, 0, "423 后收尾不再用 dispatch_window!(gs,…)");
-        assert!(
-            prod.iter()
-                .any(|l| l.contains(concat!("emit_tail_", "window!("))),
-            "末尾窗统一宏 emit_tail_window! 必须存在"
-        );
-    }
-
-    /// 前片短于回溯 ⇒ 取整片（`cut=0`，`suffix_samples = prev.len()`，基准 = 前片流式 + must 流式）。
-    #[test]
-    fn ts413_prev_shorter_than_backtrack_uses_whole_slice() {
-        let prev = vec![0.1f32; 16_000]; // 1s
-        let cs = take_context_suffix(&prev, "甲乙丙丁戊己庚辛壬癸", "后续文本", 3.0);
-        assert_eq!(cs.cut, 0, "前片不足回溯 ⇒ 整片");
-        assert_eq!(cs.suffix_samples, prev.len());
-        assert_eq!(cs.baseline, "甲乙丙丁戊己庚辛壬癸后续文本");
-    }
-
-    /// 正常前片：按字速回溯取后缀，基准 = 前片流式末尾相应字数 + must 流式。
-    #[test]
-    fn ts413_context_suffix_cut_and_baseline() {
-        // 6s 均匀正弦（无字缝 ⇒ 回落回溯点）。
-        let prev: Vec<f32> = (0..6 * 16_000)
-            .map(|i| (i as f32 * 0.13).sin() * 0.5)
-            .collect();
-        let cs = take_context_suffix(&prev, "abcdefghij", "MUST", 3.0);
-        // 3.0 字/秒 ⇒ 回溯 4s ⇒ 6s 片切掉前 2s，后缀 4s。
-        assert_eq!(cs.cut, 2 * 16_000);
-        assert_eq!(cs.suffix_samples, 4 * 16_000);
-        assert!(!cs.gap_found);
-        // 前片 10 字 × (4/6) ≈ 7 字 ⇒ 取末尾 7 字 "defghij"。
-        assert_eq!(cs.baseline, "defghijMUST");
-    }
-
-    /// 区间裁剪平移：跨 `cut` 的区间截断；完全在 `cut` 前的丢弃；之后整体平移 `-cut`。
-    #[test]
-    fn ts413_trim_and_shift_ranges() {
-        let ranges = vec![(0usize, 100usize), (100, 300), (300, 500)];
-        assert_eq!(
-            trim_and_shift_ranges(&ranges, 200),
-            vec![(0, 100), (100, 300)],
-            "前段丢弃 / 跨 cut 截断 / 后段平移"
-        );
-        assert_eq!(trim_and_shift_ranges(&ranges, 0), ranges, "cut=0 ⇒ 恒等");
-        assert_eq!(
-            trim_and_shift_ranges(&ranges, 10_000),
-            Vec::<(usize, usize)>::new(),
-            "全在 cut 前 ⇒ 空"
-        );
-    }
-
-    /// R1：带前文常规窗的 410 兜底只覆盖 **must 片**（span 起点 = `must_start`，不含前文后缀），
-    /// 样本表 = must 片各自长度，流式 = must 流式。前文后缀留给上一窗已精解文本。
-    #[test]
-    fn ts413r1_context_tail_pending_covers_must_only() {
-        let tp = context_tail_pending(3, 5, vec![100, 200], "must-stream".to_string());
-        assert_eq!(
-            tp.span,
-            (3, 5),
-            "span 起点必须是 must_start（不含前文后缀）"
-        );
-        assert_eq!(tp.samples, vec![100, 200], "样本表 = must 各片长度");
-        assert_eq!(tp.streaming, "must-stream");
-    }
-
-    /// R1 源码锚点：带前文分支构造 `Some(context_tail_pending(...))`；无前文分支 `None`；
-    /// 常规窗 push 用 `tail_pending` 变量（而非硬编码 None）。
-    #[test]
-    fn ts413r1_context_branch_source_anchor() {
-        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC);
-        assert!(
-            prod.iter().any(|l| l.contains("fn context_tail_pending(")),
-            "须有带前文 410 兜底构造函数"
-        );
-        assert!(
-            prod.iter().any(|l| l.contains("span: (must_start, ge)")),
-            "带前文兜底 span 必须锚在 must_start"
-        );
-        assert!(
-            prod.iter()
-                .any(|l| l.contains("Some(context_tail_pending(")),
-            "带前文分支须构造 Some(context_tail_pending(...))"
-        );
-        assert!(
-            prod.iter()
-                .any(|l| l.contains("window_tail_pending.push(tail_pending)")),
-            "常规窗 push 须用 tail_pending 变量"
-        );
-    }
-}
-
-// =====================================================================
-// TEST-SYNC-413（阶段三 · 非作者护栏 · coder-2）：LOCALRT-SHORT-CONTEXT-413
-//   契约（独立推导，不复用作者期望值）：常规窗只完整解 must 片 + 紧邻前一片后缀；
-//   pending 经规则 3 抬 must_start；规则 4 收尾整片；区间裁剪平移；后缀时长按字速自适应；
-//   被拒兜底只覆 must 片；BUILD-399「开心开」新送解时长明显短于旧值。
-//   🔴 白名单：只 rustfmt + cargo check；未跑 cargo test。生产零改动。
-// =====================================================================
-#[cfg(test)]
-mod testsync413_tests {
-    use super::{
-        context_tail_pending, must_start_for_window, plan_windows, shift_and_concat_ranges,
-        short_context_span, tail_backtrack_secs, take_context_suffix, trim_and_shift_ranges,
-    };
-
-    const RATE: usize = 16_000;
-
-    /// 契约 1：常态单片 `must_start = ge-1`，前文只取 `ge-2` 片后缀；首片 / 前片出缓冲无前文。
-    #[test]
-    fn ts413g_normal_and_first_slice() {
-        // 窗 [7,12)：只有末片 11 必须完整解，前文取片 10 的后缀。
-        let ms = must_start_for_window(7, 12, None, false);
-        assert_eq!(ms, 11);
-        assert_eq!(short_context_span(12, ms, 0), Some(10));
-        // is_first 但无 pending ⇒ 同样取窗末片。
-        assert_eq!(must_start_for_window(7, 12, None, true), 11);
-        // 首片（must_start==0）⇒ 无前文；前片已被缓冲裁掉（must_start-1 < buf_base）⇒ 无前文。
-        assert_eq!(short_context_span(1, 0, 0), None, "首片无前片");
-        assert_eq!(short_context_span(5, 4, 4), None, "前片出缓冲");
-    }
-
-    /// 契约 2：本批首窗经 `plan_windows` 规则 3 并入 `pending` ⇒ `must_start = pending`；
-    /// 非首窗不受 pending 影响（仍取窗末片）。
-    #[test]
-    fn ts413g_pending_rule3_integration() {
-        // 4 片各 4s：预算 10s ⇒ 丢最远两片，起点 2（4+4+4+4 超预算）。
-        let prev = [4.0f32, 4.0, 4.0];
-        let plain = plan_windows(&prev, &[4.0], 0, None);
-        assert_eq!(plain.windows, vec![(2, 4)]);
-        assert_eq!(must_start_for_window(2, 4, None, true), 3);
-        // 有 pending=1 ⇒ 规则 3 把窗首抬到 1；首窗 must_start = pending。
-        let merged = plan_windows(&prev, &[4.0], 0, Some(1));
-        assert_eq!(merged.windows, vec![(1, 4)], "规则 3：并入待覆盖片 1");
-        assert_eq!(
-            must_start_for_window(merged.windows[0].0, merged.windows[0].1, Some(1), true),
-            1,
-            "首窗 must_start = pending"
-        );
-        // 非首窗：即使 pending 落在窗内也不受影响。
-        assert_eq!(must_start_for_window(1, 4, Some(1), false), 3);
-        // pending 落在窗外（p<gs / p>=ge）⇒ 忽略。
-        assert_eq!(must_start_for_window(5, 9, Some(3), true), 8);
-        assert_eq!(must_start_for_window(5, 9, Some(9), true), 8);
-    }
-
-    /// 423/427：`plan_windows` 不再组收尾窗；`short_context_span` 取紧邻前一片（缓冲内）。
-    #[test]
-    fn ts423g_plan_windows_no_tail_and_prev_span() {
-        let plan = plan_windows(&[2.0f32, 2.0, 2.0], &[], 0, Some(2));
-        assert!(plan.windows.is_empty(), "423：plan_windows 不再组收尾窗");
-        assert_eq!(plan.pending, Some(2), "pending 保留待末尾窗");
-        // 427：前一片在缓冲内 ⇒ 取其后缀；前片已出缓冲 ⇒ None。
-        assert_eq!(short_context_span(3, 2, 0), Some(1));
-        assert_eq!(short_context_span(3, 1, 1), None, "前片出缓冲 ⇒ 无前文");
-    }
-
-    /// 423（源码锚点）：常规窗 `dispatch_window!` 第 3 参为 `must_start`；收尾统一走 `emit_tail_window!`
-    /// （不再有 `plan.windows` + `dispatch_window!` 收尾调用）。
-    #[test]
-    fn ts423g_dispatch_call_sites_source_anchor() {
-        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC);
-        // `let must_start =` 与 `must_start_for_window(` 可能被 rustfmt 折成两行。
-        let reg = (0..prod.len())
-            .find(|&i| {
-                prod[i].contains("let must_start = must_start_for_window(")
-                    || (prod[i] == "let must_start ="
-                        && prod
-                            .get(i + 1)
-                            .is_some_and(|l| l.starts_with("must_start_for_window(")))
-            })
-            .expect("must_start 计算锚点缺失");
-        let reg_dw = prod[reg..]
-            .iter()
-            .position(|l| l.starts_with("dispatch_window!("))
-            .map(|i| i + reg)
-            .expect("常规窗 dispatch_window! 缺失");
-        assert_eq!(
-            crate::guard_prod_lines::macro_call_arg(&prod, reg_dw, 2),
-            "must_start",
-            "常规窗第 3 参须为 must_start（少带前文）"
-        );
-        assert!(
-            prod.iter()
-                .any(|l| l.contains(concat!("emit_tail_", "window!(p, 0usize, \"stop\")"))),
-            "松键收尾须调用 emit_tail_window!(p, 0usize, \"stop\")"
-        );
-    }
-
-    /// 契约 4：区间裁剪平移 —— 跨 cut 截断 / 完全在 cut 前丢弃 / `b==cut` 丢弃 / `a>=cut` 平移 / `cut=0` 恒等。
-    #[test]
-    fn ts413g_trim_and_shift_ranges() {
-        let ranges = [(100usize, 200usize), (200, 300), (0, 50), (50, 100)];
-        assert_eq!(
-            trim_and_shift_ranges(&ranges, 150),
-            vec![(0, 50), (50, 150)],
-            "跨 150 截断 + 完全在 150 前丢弃"
-        );
-        // b == cut ⇒ 丢弃（边界）。
-        assert!(trim_and_shift_ranges(&[(0, 150)], 150).is_empty());
-        // a >= cut ⇒ 纯平移。
-        assert_eq!(trim_and_shift_ranges(&[(200, 300)], 150), vec![(50, 150)]);
-        // cut=0 ⇒ 恒等。
-        assert_eq!(trim_and_shift_ranges(&ranges, 0), ranges.to_vec());
-    }
-
-    /// 契约 4（组合）：`trim_and_shift_ranges` + `shift_and_concat_ranges` ⇒ 窗内坐标正确；
-    /// 样本表首元素 = 前文后缀样本数（must 片按此偏移）；任一源 `None` ⇒ 整窗 `None`。
-    #[test]
-    fn ts413g_ranges_concat_window_coords() {
-        let ctx = trim_and_shift_ranges(&[(100usize, 200usize), (200, 300)], 150); // [(0,50),(50,150)]
-        let must = vec![(10usize, 20usize), (30, 40)];
-        let suffix_samples = 8_000usize;
-        let samples = [suffix_samples, 16_000usize];
-        let out =
-            shift_and_concat_ranges(&[Some(ctx), Some(must)], &samples).expect("两源均有区间");
-        assert_eq!(
-            out,
-            vec![(0, 50), (50, 150), (8010, 8020), (8030, 8040)],
-            "前文后缀按 cut 平移后，must 片再按后缀样本数偏移"
-        );
-        assert_eq!(samples[0], suffix_samples, "样本表首元素 = 后缀样本数");
-        // 任一源 None ⇒ 整窗 None（不新增每窗 VAD 的前提）。
-        let none_ctx: Option<Vec<(usize, usize)>> = None;
-        assert!(shift_and_concat_ranges(&[none_ctx, Some(vec![(1, 2)])], &samples).is_none());
-    }
-
-    /// 契约 5：回溯时长按本次字速自适应（快 2s / 慢 6s / 冷启动 4s）；前片短于回溯 ⇒ 取整片。
-    #[test]
-    fn ts413g_backtrack_by_rate_and_short_prev() {
-        // 12s 恒定电平（无字缝 ⇒ 回落回溯点，suffix = back）。
-        let audio = vec![0.5f32; 12 * RATE];
-        let fast = take_context_suffix(&audio, "x", "M", 8.0);
-        assert_eq!(fast.backtrack_secs, 2.0, "8 字/秒 ⇒ max(2,12/8)=2.0s");
-        assert_eq!(fast.suffix_samples, 2 * RATE);
-        assert_eq!(fast.cut, 10 * RATE);
-        let slow = take_context_suffix(&audio, "x", "M", 2.0);
-        assert_eq!(slow.backtrack_secs, 6.0, "2 字/秒 ⇒ 12/2=6.0s");
-        assert_eq!(slow.suffix_samples, 6 * RATE);
-        assert_eq!(slow.cut, 6 * RATE);
-        // 冷启动（0 / 非有限 / 负）⇒ 按 3.0 字/秒 ⇒ 4.0s。
-        for cold_rate in [0.0f32, f32::NAN, -1.0] {
-            let cs = take_context_suffix(&audio, "x", "M", cold_rate);
-            assert_eq!(
-                cs.backtrack_secs, 4.0,
-                "冷启动回溯 4.0s（rate={cold_rate}）"
-            );
-            assert_eq!(cs.suffix_samples, 4 * RATE);
-        }
-        // 前片短于回溯 ⇒ 整片（cut=0，suffix=prev.len()，基准 = 前片流式 + must）。
-        let short = vec![0.5f32; RATE]; // 1s < 6s
-        let cs = take_context_suffix(&short, "甲乙", "丙", 2.0);
-        assert_eq!(cs.cut, 0);
-        assert_eq!(cs.suffix_samples, short.len());
-        assert_eq!(cs.baseline, "甲乙丙");
-    }
-
-    /// 契约 5：406 比对基准 = 前片流式**末尾按样本比例的字符数**（多字节按 char 切，非字节）+ must 流式。
-    #[test]
-    fn ts413g_baseline_multibyte_ratio() {
-        let audio = vec![0.5f32; 12 * RATE];
-        let prev_stream = "零一二三四五六七八九"; // 10 个 char（多字节）
-                                                  // 慢速 rate=2 ⇒ suffix 6s / 12s = 0.5 ⇒ 末尾 5 字。
-        let cs = take_context_suffix(&audio, prev_stream, "末端", 2.0);
-        assert_eq!(cs.baseline, "五六七八九末端");
-        assert_eq!(cs.baseline.chars().count(), 7);
-        // 快速 rate=8 ⇒ suffix 2s / 12s = 1/6 ⇒ 10/6≈1.67 ⇒ round=2 字。
-        let cs2 = take_context_suffix(&audio, prev_stream, "末端", 8.0);
-        assert_eq!(cs2.baseline, "八九末端");
-    }
-
-    /// 契约 6：被拒兜底只覆 must 片 —— span 起点 = `must_start`、samples = must 各片长度（不含后缀）、
-    /// streaming = must 流式；无前文窗的兜底为 `None`（源码锚点）。
-    #[test]
-    fn ts413g_fallback_covers_must_only() {
-        let tp = context_tail_pending(7, 10, vec![1000, 2000, 3000], "must-stream".to_string());
-        assert_eq!(tp.span, (7, 10), "span 起点必须是 must_start");
-        assert_eq!(tp.samples, vec![1000, 2000, 3000], "样本表 = must 各片长度");
-        assert_eq!(tp.samples.iter().sum::<usize>(), 6000, "不含前文后缀样本");
-        assert_eq!(tp.streaming, "must-stream");
-        // must_start==ge（空 must）边界不 panic。
-        let empty = context_tail_pending(5, 5, vec![], String::new());
-        assert_eq!(empty.span, (5, 5));
-        assert!(empty.samples.is_empty());
-        // 源码锚点：无前文分支整窗兜底为 None。
-        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC);
-        assert!(
-            prod.iter()
-                .any(|l| l.contains("(audio, samples, ranges, streaming, gs, None, window_far)")),
-            "无前文分支必须整窗兜底（tail_pending 为 None）"
-        );
-    }
-
-    /// 契约 7（数值实证）：BUILD-399 09:48:21Z「开心开」—— 末片 2.85s，旧送解 9.33s；
-    /// 413 新送解 = min(回溯, 紧邻前片) + 末片。冷启动回溯 4s、前片 2.98s ⇒ 5.83s，明显短于旧值。
-    #[test]
-    fn ts413g_build399_short_context_metric() {
-        let last_slice_secs = 2.85f32;
-        let old_secs = 9.33f32;
-        let cold_backtrack = tail_backtrack_secs(3.0);
-        assert_eq!(cold_backtrack, 4.0);
-        // 前片 2.98s < 回溯 4s ⇒ 取整片 2.98s。
-        let prev_samples = (2.98f32 * RATE as f32) as usize;
-        let back = ((cold_backtrack * RATE as f32) as usize)
-            .min(prev_samples)
-            .max(1);
-        let new_secs = back as f32 / RATE as f32 + last_slice_secs;
-        assert!(
-            (new_secs - 5.83).abs() < 0.01,
-            "新送解应 ≈5.83s，实得 {new_secs}"
-        );
-        assert!(new_secs < old_secs);
-        assert!(old_secs - new_secs > 3.0, "应明显短于旧 9.33s");
-        // 上界（前片 ≥ 回溯 4s）⇒ 6.85s，仍明显短于旧值。
-        let prev_long = (5.0f32 * RATE as f32) as usize;
-        let back2 = ((cold_backtrack * RATE as f32) as usize)
-            .min(prev_long)
-            .max(1);
-        let new_long = back2 as f32 / RATE as f32 + last_slice_secs;
-        assert!((new_long - 6.85).abs() < 0.01);
-        assert!(old_secs - new_long > 2.0);
-    }
-}
-
-#[cfg(test)]
-mod plan_windows_386_tests {
-    use super::{plan_windows, tail_window_alone, tail_window_span, WindowPlan};
-    use crate::transcription;
-
-    fn covered(windows: &[(usize, usize)], idx: usize) -> bool {
-        windows.iter().any(|(s, e)| *s <= idx && idx < *e)
-    }
-
-    /// 常态单片（无 pending）：与旧行为相同 —— 立刻 1 窗、无待覆盖。
-    #[test]
-    fn single_slice_no_pending_is_immediate() {
-        let prev = vec![1.0f32, 1.0, 1.0];
-        let p = plan_windows(&prev, &[3.0], 0, None);
-        let mut buf = prev.clone();
-        buf.push(3.0);
-        let s = transcription::group_window_start_secs(&buf, transcription::WINDOW_MAX_SECS);
-        assert_eq!(
-            p,
-            WindowPlan {
-                windows: vec![(s, 4)],
-                pending: None
-            }
-        );
-    }
-
-    /// 中途多片：除最后一片外立刻组窗；**最后一片延后**（pending）。
-    /// 反例：382 旧行为会给 [10.3,5.37] 组 [0,1)、[1,2)（第二窗只含 1.12s 短尾 ⇒ 模型念词表）。
-    #[test]
-    fn multi_slice_defers_last() {
-        let p = plan_windows(&[], &[10.3, 5.37], 0, None);
-        assert_eq!(p.windows, vec![(0, 1)], "只有首片立刻组窗");
-        assert_eq!(p.pending, Some(1), "末片延后");
-    }
-
-    /// 下次派发：首个窗口**必须含待覆盖片**（起点 ≤ pending），哪怕总长超 `WINDOW_MAX_SECS`。
-    #[test]
-    fn next_dispatch_forces_pending_inclusion_even_over_max() {
-        // prev=[4,4,4]（global0..2，pending=2）；新片[9]（global3）。
-        // 常规组窗：buf=[4,4,4,9]=21s>10 ⇒ 逐丢到只剩新片（起点=3）；pending=2 ⇒ 强制起点=2。
-        let p = plan_windows(&[4.0, 4.0, 4.0], &[9.0], 0, Some(2));
-        assert_eq!(
-            p.windows,
-            vec![(2, 4)],
-            "首个窗口必须含 pending(2)，可超 10s"
-        );
-        assert!(p.pending.is_none(), "pending 被纳入后清空");
-    }
-
-    /// 🔴 423（Gavin 2026-09-25）：松键收尾有 pending 且**有前片** ⇒ 一律走末尾组窗
-    /// `tail_window_span` = `(p-1, p+1)`（**与 pending 时长无关**：1s / 2.5s / 4s 同解）。
-    #[test]
-    fn tail_pending_with_prev_uses_suffix_window_regardless_of_dur() {
-        // pending 时长不再进入决策；三种时长（1s / 2.5s / 4s）都取同一末尾窗。
-        for _dur in [1.0f32, 2.5, 4.0] {
-            assert_eq!(
-                tail_window_span(Some(1), 0, 2),
-                Some((0, 2, 1)),
-                "有前片 ⇒ 前片末尾后缀 + pending（不分时长）"
-            );
-        }
-    }
-
-    /// 🔴 423：pending 是首片（无前片）⇒ 单独解 `(p, p+1)`（`tail_window_span` 无解、`alone` 有解）。
-    #[test]
-    fn tail_pending_first_slice_alone() {
-        assert_eq!(tail_window_span(Some(0), 0, 1), None);
-        assert_eq!(tail_window_alone(Some(0), 0, 1), Some((0, 1)));
-        // 越界 / 无 pending ⇒ 不组窗。
-        assert_eq!(tail_window_alone(Some(5), 0, 1), None);
-        assert_eq!(tail_window_alone(None, 0, 3), None);
-        assert_eq!(tail_window_span(None, 0, 3), None);
-    }
-
-    /// 🔴 423：延后后直接收尾 ⇒ `plan_windows` **不再组收尾窗**（pending 保留），交由末尾窗覆盖。
-    #[test]
-    fn defer_then_stop_key_tail() {
-        let p1 = plan_windows(&[], &[5.0, 2.0], 0, None);
-        assert_eq!(p1.pending, Some(1), "末片延后");
-        // 收尾不再走 plan_windows（423）⇒ 不产生窗口、pending 保留。
-        let p2 = plan_windows(&[5.0, 2.0], &[], 0, p1.pending);
-        assert!(p2.windows.is_empty(), "收尾不再由 plan_windows 组窗");
-        assert_eq!(p2.pending, Some(1), "pending 保留待末尾窗处理");
-        // 末尾窗覆盖它（有前片 ⇒ (0,2)）。
-        assert_eq!(tail_window_span(p2.pending, 0, 2), Some((0, 2, 1)));
-    }
-
-    /// 覆盖不变量（随机性质）：任意「多次派发 + 收尾」，收尾时**每个切片**都被某窗覆盖。
-    #[test]
-    fn property_every_slice_covered() {
-        struct Lcg(u64);
-        impl Lcg {
-            fn n(&mut self, lo: usize, hi: usize) -> usize {
-                self.0 = self
-                    .0
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                (lo as u64 + (self.0 >> 33) % ((hi - lo + 1) as u64)) as usize
-            }
-        }
-        let mut rng = Lcg(0x386_2026_5eed);
-        for case in 0..200 {
-            let n_dispatch = rng.n(1, 5);
-            let mut all_durs: Vec<f32> = Vec::new();
-            let mut windows: Vec<(usize, usize)> = Vec::new();
-            let mut pending: Option<usize> = None;
-            for _ in 0..n_dispatch {
-                let n_new = rng.n(1, 4);
-                let mut new_durs = Vec::new();
-                for _ in 0..n_new {
-                    new_durs.push(rng.n(1, 120) as f32 / 10.0);
-                }
-                let prev_len = transcription::WINDOW_MAX_SLICES.min(all_durs.len());
-                let prev_base = all_durs.len() - prev_len;
-                let prev_durs = all_durs[prev_base..].to_vec();
-                let plan = plan_windows(&prev_durs, &new_durs, prev_base, pending);
-                windows.extend(plan.windows);
-                pending = plan.pending;
-                all_durs.extend(new_durs);
-            }
-            // 423：收尾由末尾窗覆盖 pending（非 plan_windows）。
-            if let Some(p) = pending {
-                let prev_len = transcription::WINDOW_MAX_SLICES.min(all_durs.len());
-                let prev_base = all_durs.len() - prev_len;
-                if let Some((gs, ge, _)) = tail_window_span(Some(p), prev_base, prev_len) {
-                    windows.push((gs, ge));
-                } else if let Some((gs, ge)) = tail_window_alone(Some(p), prev_base, prev_len) {
-                    windows.push((gs, ge));
-                } else {
-                    panic!("case {case}: pending {p} 未被末尾窗覆盖");
-                }
-            }
-            for idx in 0..all_durs.len() {
-                assert!(
-                    covered(&windows, idx),
-                    "case {case}: 切片 {idx} 未被覆盖（durs={all_durs:?} windows={windows:?}）"
-                );
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod slice_streaming_386_review_tests {
-    use super::{slice_streaming_text, window_text_with_fallback};
-
-    /// 同次派发切 2 片、收尾合并窗 [大片, 短尾] 解码失败 ⇒ 兜底文本只出现一次（不重复）。
-    #[test]
-    fn merged_window_fallback_not_duplicated() {
-        let seg = "如果有机会开这个会我们都会好好把握"; // 17 chars
-        let per_slice: Vec<String> = (0..2)
-            .map(|k| slice_streaming_text(k, seg, &[100, 100]))
-            .collect();
-        let window_fallback = per_slice.concat();
-        assert_eq!(
-            window_text_with_fallback("", &window_fallback),
-            seg,
-            "两片拼接正好等于整段（不重不漏，411 按样本占比）"
-        );
-        assert_eq!(per_slice[0].chars().count(), 9);
-        assert_eq!(per_slice[1].chars().count(), 8);
-        assert!(!per_slice[1].is_empty(), "非首片不再为空（411）");
-    }
-}
-
-// =====================================================================
-// TEST-SYNC-386（阶段三 · 非作者护栏，coder-2）：组窗契约 / 预览回灌 / 兜底
-//   被测：FIX-TAIL-WINDOW-AND-FALLBACK-386（契约见任务书）。
-//   按契约写、不照实现反推；白名单只 `cargo fmt` / `cargo check --all-targets`（首跑阶段四）。
-// =====================================================================
-#[cfg(test)]
-mod testsync386_tests {
-    use super::{
-        compose_reflow_preview, compose_with_acc_for_gen, plan_windows, window_text_with_fallback,
-    };
-    use crate::transcription;
-
-    struct Lcg(u64);
-    impl Lcg {
-        fn n(&mut self, lo: usize, hi: usize) -> usize {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (lo as u64 + (self.0 >> 33) % ((hi - lo + 1) as u64)) as usize
-        }
-    }
-
-    /// 1. 会话级性质：200 次录音，每次 3~8 次派发（每次 1~3 片、每片 0.3~12s），末尾由
-    ///    **末尾窗**（423：`tail_window_span` / `tail_window_alone`，模拟 `emit_tail_window!`）覆盖 pending。
-    ///    断言：① 每个切片全局下标至少被一窗覆盖 ② 会话结束无 pending 残留
-    ///    ③ 每窗非空且不越界（`s < e ≤ 总片数`）。
-    #[test]
-    fn sync386_session_property_cover_no_pending_valid_end() {
-        use super::{tail_window_alone, tail_window_span};
-        let max_prev = transcription::WINDOW_MAX_SLICES;
-        let mut rng = Lcg(0x386_5E55_10AA);
-        for case in 0..200usize {
-            let n_dispatch = rng.n(3, 8);
-            let mut all_durs: Vec<f32> = Vec::new();
-            let mut windows: Vec<(usize, usize)> = Vec::new();
-            let mut pending: Option<usize> = None;
-            for _d in 0..n_dispatch {
-                let n_new = rng.n(1, 3);
-                let mut new_durs = Vec::new();
-                for _ in 0..n_new {
-                    new_durs.push(0.3 + rng.n(0, 117) as f32 / 10.0); // 0.3..12.0
-                }
-                let prev_len = max_prev.min(all_durs.len());
-                let prev_base = all_durs.len() - prev_len;
-                let prev_durs = all_durs[prev_base..].to_vec();
-                let plan = plan_windows(&prev_durs, &new_durs, prev_base, pending);
-                windows.extend(plan.windows);
-                pending = plan.pending;
-                all_durs.extend(new_durs);
-            }
-            let total = all_durs.len();
-            // 423：松键收尾 —— 待覆盖片由末尾窗覆盖（与 `emit_tail_window!` 同一决策）。
-            if let Some(p) = pending {
-                let prev_len = max_prev.min(total);
-                let prev_base = total - prev_len;
-                if let Some((gs, ge, _i)) = tail_window_span(Some(p), prev_base, prev_len) {
-                    windows.push((gs, ge));
-                } else if let Some((gs, ge)) = tail_window_alone(Some(p), prev_base, prev_len) {
-                    windows.push((gs, ge));
-                } else {
-                    panic!("case {case}: pending {p} 未被末尾窗覆盖");
-                }
-                pending = None;
-            }
-            assert!(pending.is_none(), "case {case}: 收尾后不得有 pending 残留");
-            for idx in 0..total {
-                assert!(
-                    windows.iter().any(|(s, e)| *s <= idx && idx < *e),
-                    "case {case}: 切片 {idx} 未被任何窗口覆盖（windows={windows:?}）"
-                );
-            }
-            for (s, e) in &windows {
-                assert!(*s < *e, "case {case}: 窗口不得为空");
-                assert!(
-                    *e <= total,
-                    "case {case}: end 不得越界（end={e} ≤ total={total}）"
-                );
-            }
-        }
-    }
-
-    /// 2. 中途一大一小：派发 `[10.2, 1.1]` ⇒ 1 窗（大片）+ `pending`=小片；
-    ///    下次派发 `[4.0]` ⇒ 首窗含小片与 `4.0`（`pending` 强制纳入并清空）。
-    #[test]
-    fn sync386_mid_big_small_then_next_includes_pending() {
-        let p1 = plan_windows(&[], &[10.2, 1.1], 0, None);
-        assert_eq!(p1.windows, vec![(0, 1)], "多片非收尾 ⇒ 只有大片立刻组窗");
-        assert_eq!(p1.pending, Some(1), "小片延后为 pending");
-        let p2 = plan_windows(&[10.2, 1.1], &[4.0], 0, p1.pending);
-        assert_eq!(
-            p2.windows,
-            vec![(1, 3)],
-            "首窗必须含小片(index1)与 4.0(index2)"
-        );
-        assert!(p2.pending.is_none(), "pending 纳入后清空");
-    }
-
-    /// 3. 结尾一大一小（423）：收尾统一走末尾窗 —— 短尾（1.1s）与长尾（3.5s）**同解**：
-    ///    有前片 ⇒ `(0,2)`（前片后缀 + pending），不再按 <3s / ≥3s 分叉。
-    #[test]
-    fn sync423_tail_big_small_unified_suffix_window() {
-        use super::tail_window_span;
-        for small in [1.1f32, 3.5] {
-            let p = plan_windows(&[], &[10.2, small], 0, None);
-            assert_eq!(p.pending, Some(1));
-            // 收尾统一：有前片 ⇒ 前片后缀 + pending（(0,2)），不分时长。
-            assert_eq!(tail_window_span(p.pending, 0, 2), Some((0, 2, 1)));
-            // plan_windows 不再组收尾窗。
-            let t = plan_windows(&[10.2, small], &[], 0, p.pending);
-            assert!(t.windows.is_empty(), "收尾不由 plan_windows 组窗");
-        }
-    }
-
-    /// 4. 预览不回退：给定 acc、streaming 不断增长 ⇒ 回灌渲染字数 **≥** 仅 acc 字数，
-    ///    且与**同参数** StreamingText 渲染逐字相等（同一合成函数）。
-    #[test]
-    fn sync386_preview_grows_with_streaming_and_never_shorter_than_acc() {
-        let g = 0x386u64;
-        let acc = "权威前缀文本";
-        let committed = 3usize;
-        let base = "原始流式文本从这继续";
-        for extra in 0..=12usize {
-            let streaming: String = base
-                .chars()
-                .chain("不断增长的内容尾巴".chars().take(extra))
-                .collect();
-            let reflow = compose_reflow_preview(g, acc, &streaming, committed);
-            let state = (g, acc.to_string(), committed);
-            let same = compose_with_acc_for_gen(Some(&state), g, &streaming);
-            assert_eq!(
-                reflow, same,
-                "回灌必须与同参数 StreamingText 渲染逐字相等（extra={extra}）"
-            );
-            assert!(
-                reflow.chars().count() >= acc.chars().count(),
-                "回灌字数不得少于仅 acc（不回退，extra={extra}）"
-            );
-        }
-    }
-
-    /// 5. 兜底：解码空 ⇒ 流式文本；解码非空 ⇒ 原文不变；两者都空 ⇒ 空；
-    ///    解码为纯空白（非空）⇒ 仍以解码为准（不做 trim 判定）。
-    #[test]
-    fn sync386_fallback_decoded_empty_uses_streaming() {
-        assert_eq!(window_text_with_fallback("", "流式文本"), "流式文本");
-        assert_eq!(
-            window_text_with_fallback("解码文本", "流式文本"),
-            "解码文本"
-        );
-        assert_eq!(window_text_with_fallback("", ""), "");
-        assert_eq!(window_text_with_fallback(" ", "流式"), " ");
-    }
-}
-
-// ============================================================
-// FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382（3A）：replace_all 回灌
-// 「立即渲染」状态机（纯函数；controller 线程侧只做 I/O 转接）
-// ============================================================
-
-/// 382（3A）：一次状态机推进的结果。
-// ASR-SERVER-491：去 Windows 限定 —— 远程会话（两端内核都有）复用本状态机。
-#[derive(Debug, PartialEq, Eq)]
-enum ReflowFastOutcome {
-    /// 无动作（例如边界到、但对应 seg 已不是最新已渲染）。
-    None,
-    /// 应更新权威状态；`render=true` 才重画浮层（`false` = Processing 已开始，只更新状态不重画）。
-    Apply {
-        text: String,
-        committed_len: usize,
-        accurate: bool,
-        render: bool,
-    },
-}
-
-/// 382（3A）：`replace_all=true` 回灌的快速路径状态机。
-///
-/// 背景：325/337 时代 `PreviewReflow` 只登记全文、必须等同片 `ReflowCommit` 边界配对才渲染；
-/// 现在唯一发送点恒 `replace_all=true`（整段替换），「等边界」只会**白白延迟**（日志：1 次多等 0.4s、
-/// 2 次单槽被覆盖永不配对、1 次 `boundary=b` 整次扣下）。本状态机：全文一到**立即**用「已知边界 or
-/// 派发当刻 `committed_len`」渲染；边界后到且该 seg 仍是最新已渲染 ⇒ 用准确边界再渲染一次。
-// ASR-SERVER-491：去 Windows 限定（同上：`ReflowFastOutcome`）。
-#[derive(Default)]
-struct ReflowFastState {
-    /// 最新登记全文 + 派发当刻 fallback：`(gen, seg, text, fallback_len, boundary_usable)`。
-    /// `boundary_usable=false`（部分窗）⇒ 不用 `bound_of` 的整次派发边界、且晚到边界不重渲。
-    latest: Option<(u64, usize, String, usize, bool)>,
-    /// 边界登记 `(gen, seg) -> Option<usize>`（`None` = b 类「本片无准确边界」）。小 map，按代清空。
-    bounds: Vec<((u64, usize), Option<usize>)>,
-    /// 最近一次**应渲染**的 `(gen, seg)`（判断晚到边界是否该重渲染）。
-    rendered: Option<(u64, usize)>,
-}
-
-// ASR-SERVER-491：去 Windows 限定（同上）。
-impl ReflowFastState {
-    /// ACC-452 ⑤：流式回灌渲染了 `(gen, seg)` 的半截结果 ⇒ 登记为最近渲染，
-    /// 使**上一窗**晚到的边界不再用旧全文重画（否则盖掉半截结果 = 回缩）。
-    fn note_partial(&mut self, gen: u64, seg: usize) {
-        self.rendered = Some((gen, seg));
-    }
-
-    fn clear(&mut self) {
-        self.latest = None;
-        self.bounds.clear();
-        self.rendered = None;
-    }
-
-    fn bound_of(&self, gen: u64, seg: usize) -> Option<Option<usize>> {
-        self.bounds
-            .iter()
-            .rev()
-            .find(|((g, s), _)| *g == gen && *s == seg)
-            .map(|(_, v)| *v)
-    }
-
-    /// 收到一条权威全文（已过 `reflow_action` 的编辑/取消/陈旧/洞/空判据）。
-    /// `boundary_usable`：见 `PreviewReflow`——`false`（部分窗）时**不用** `bound_of` 的整次派发边界，
-    /// 直接用 `fallback_len`（按片样本占比折算的 `win_committed`）。
-    /// `suppressed` = 本代已进入 Processing（只跳过重画，权威状态照常更新）。
-    fn on_text(
-        &mut self,
-        gen: u64,
-        seg: usize,
-        text: String,
-        fallback_len: usize,
-        boundary_usable: bool,
-        suppressed: bool,
-    ) -> ReflowFastOutcome {
-        self.latest = Some((gen, seg, text.clone(), fallback_len, boundary_usable));
-        self.rendered = Some((gen, seg));
-        let (len, accurate) = if boundary_usable {
-            match self.bound_of(gen, seg) {
-                Some(Some(l)) => (l, true),
-                _ => (fallback_len, false),
-            }
-        } else {
-            // 部分窗：`bound_of` 若为整次派发边界（覆盖被延后末片）会截短预览 ⇒ 用折算值。
-            (fallback_len, false)
-        };
-        ReflowFastOutcome::Apply {
-            text,
-            committed_len: len,
-            accurate,
-            render: !suppressed,
-        }
-    }
-
-    /// 收到一条边界。若对应 seg 是**最新已渲染**全文 **且该次渲染边界可用**（非部分窗）⇒ 用准确边界再渲染一次。
-    fn on_bound(
-        &mut self,
-        gen: u64,
-        seg: usize,
-        len: Option<usize>,
-        suppressed: bool,
-    ) -> ReflowFastOutcome {
-        if let Some(e) = self
-            .bounds
-            .iter_mut()
-            .find(|((g, s), _)| *g == gen && *s == seg)
-        {
-            e.1 = len;
-        } else {
-            self.bounds.push(((gen, seg), len));
-        }
-        if self.rendered == Some((gen, seg)) {
-            if let (Some(l), Some((g2, s2, text, _, usable))) = (len, self.latest.as_ref()) {
-                // 🔴 D3：部分窗的最新渲染**不得**用整次派发边界重渲（否则截短预览）。
-                if (*g2, *s2) == (gen, seg) && *usable {
-                    return ReflowFastOutcome::Apply {
-                        text: text.clone(),
-                        committed_len: l,
-                        accurate: true,
-                        render: !suppressed,
-                    };
-                }
-            }
-        }
-        ReflowFastOutcome::None
-    }
-}
-
-#[cfg(all(test, target_os = "windows"))]
-mod reflow_fast_382_tests {
-    use super::{ReflowFastOutcome, ReflowFastState};
-
-    fn apply(o: ReflowFastOutcome) -> (String, usize, bool, bool) {
-        match o {
-            ReflowFastOutcome::Apply {
-                text,
-                committed_len,
-                accurate,
-                render,
-            } => (text, committed_len, accurate, render),
-            ReflowFastOutcome::None => panic!("expected Apply, got None"),
-        }
-    }
-
-    /// 边界**后到**：全文先渲染（fallback），边界到后用准确值再渲染一次。
-    #[test]
-    fn text_then_bound_renders_twice_final_accurate() {
-        let mut st = ReflowFastState::default();
-        let a = apply(st.on_text(1, 5, "acc".into(), 3, true, false));
-        assert_eq!(a, ("acc".into(), 3, false, true));
-        let b = apply(st.on_bound(1, 5, Some(7), false));
-        assert_eq!(b, ("acc".into(), 7, true, true));
-    }
-
-    /// 边界**先到**：全文一到即用准确边界渲染（只渲染一次）。
-    #[test]
-    fn bound_then_text_renders_once_accurate() {
-        let mut st = ReflowFastState::default();
-        assert_eq!(st.on_bound(1, 5, Some(7), false), ReflowFastOutcome::None);
-        let a = apply(st.on_text(1, 5, "acc".into(), 3, true, false));
-        assert_eq!(a, ("acc".into(), 7, true, true));
-    }
-
-    /// b 类边界（`None`）：全文用 fallback 渲染；边界到**不**重渲染（无准确值）。
-    #[test]
-    fn b_bound_uses_fallback_and_no_rerender() {
-        let mut st = ReflowFastState::default();
-        let a = apply(st.on_text(1, 5, "acc".into(), 3, true, false));
-        assert_eq!(a, ("acc".into(), 3, false, true));
-        assert_eq!(st.on_bound(1, 5, None, false), ReflowFastOutcome::None);
-    }
-
-    /// 两个 seg 交错：旧 seg 的边界到不改浮层；最新 seg 的边界到才重渲染。
-    #[test]
-    fn interleaved_segs_only_latest_rerenders() {
-        let mut st = ReflowFastState::default();
-        apply(st.on_text(1, 5, "five".into(), 1, true, false));
-        apply(st.on_text(1, 6, "six".into(), 1, true, false));
-        assert_eq!(st.on_bound(1, 5, Some(9), false), ReflowFastOutcome::None);
-        let b = apply(st.on_bound(1, 6, Some(4), false));
-        assert_eq!(b, ("six".into(), 4, true, true));
-    }
-
-    /// Processing 之后到达的 PreviewReflow：只更新状态、不重画（render=false）；之前正常（render=true）。
-    #[test]
-    fn suppressed_after_processing_skips_render_only() {
-        let mut st = ReflowFastState::default();
-        let before = apply(st.on_text(1, 5, "a".into(), 2, true, false));
-        assert!(before.3, "Processing 之前的回灌必须正常渲染");
-        let after = apply(st.on_text(1, 6, "b".into(), 2, true, true));
-        assert!(!after.3, "Processing 之后的回灌不得重画浮层");
-        assert_eq!(after.0, "b", "但权威状态照常更新");
-    }
-}
-
-#[cfg(test)]
-mod problem2_order_382_tests {
-    /// 生产区（剔除 cfg(test) 与纯注释行）。
-    fn code_lines() -> Vec<String> {
-        crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC)
-            .into_iter()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect()
-    }
-
-    /// 382（问题2）源码级顺序护栏：`StreamingFinalPreview` 发送 < `Processing` 发送 < `acc_handle` 的
-    /// join；且 join 之后不得再发 `StreamingFinalPreview`（防把已切处理态的浮层拉回预览态 = 闪回）。
-    #[test]
-    fn early_preview_then_processing_before_acc_join() {
-        let lines = code_lines();
-        let asr = lines
-            .iter()
-            .position(|l| {
-                l.trim_start()
-                    .starts_with("let asr_result = asr_handle.join();")
-            })
-            .expect("382: asr_handle.join 锚点");
-        let acc = lines
-            .iter()
-            .position(|l| {
-                l.trim_start()
-                    .starts_with("let acc_result = acc_handle.map")
-            })
-            .expect("382: acc_handle.join 锚点");
-        assert!(asr < acc, "382: asr_handle.join 必须先于 acc_handle.join");
-        let fp = lines[asr..acc]
-            .iter()
-            .position(|l| l.contains("send(PipelineEvent::StreamingFinalPreview("))
-            .expect("382: StreamingFinalPreview 必须在 acc_join 之前发（问题2）");
-        let pr = lines[asr..acc]
-            .iter()
-            .position(|l| l.contains("send(PipelineEvent::Processing("))
-            .expect("382: Processing 必须在 acc_join 之前发（问题2）");
-        assert!(
-            fp < pr,
-            "282 顺序：StreamingFinalPreview 必须先于 Processing"
-        );
-        assert!(
-            !lines[acc..]
-                .iter()
-                .any(|l| l.contains("send(PipelineEvent::StreamingFinalPreview(")),
-            "382：acc_join 之后不得再发 StreamingFinalPreview（闪回）"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -14605,19 +8916,13 @@ mod edit_stuck_439_tests {
     /// ⇒ 永久卡「识别处理中」（439 根因）。
     #[test]
     fn controller_processing_arm_editing_guard() {
+        // FLASH-P3-A：原锚点 `ACC_REFLOW_SUPPRESS.store(true`（本地实时回灌抑制）随本地引擎删除，
+        // 改为直接定位 controller 的 Processing 处理臂；守卫须先于 show_overlay 的断言不变。
         let lines = code_lines();
-        let idx = lines
+        let arm = lines
             .iter()
-            .position(|l| l.contains(concat!("ACC_REFLOW_SUPPRESS.store(true")))
-            .expect("439: ACC_REFLOW_SUPPRESS.store(true 锚点");
-        let arm = (0..idx)
-            .rev()
-            .find(|&i| lines[i].contains("PipelineEvent::") && lines[i].contains("=>"))
-            .expect("439: 置位必须位于某个 PipelineEvent 处理臂内");
-        assert!(
-            lines[arm].contains("PipelineEvent::Processing("),
-            "439: 置位必须落在 Processing 处理臂内"
-        );
+            .position(|l| l.contains(concat!("PipelineEvent::Processing(message) =", ">")))
+            .expect("439: controller Processing 处理臂锚点");
         let arm_end = (arm + 1..lines.len())
             .find(|&i| lines[i].contains("PipelineEvent::") && lines[i].contains("=>"))
             .expect("439: Processing 臂必须有后继处理臂");
@@ -14626,69 +8931,18 @@ mod edit_stuck_439_tests {
             .iter()
             .position(|l| l.contains(concat!("if OVERLAY_EDITING.load(Ordering::Acquire)")))
             .expect("439: Processing 臂必须有 OVERLAY_EDITING 编辑守卫");
-        let flag = win
-            .iter()
-            .position(|l| l.contains(concat!("ACC_REFLOW_SUPPRESS.store(true")))
-            .expect("439: 置位应在 Processing 臂内");
         let show = win
             .iter()
             .position(|l| l.contains(concat!("OverlayStatus::FallingToProcessing")))
             .expect("439: show_overlay(FallingToProcessing) 应在 Processing 臂内");
         assert!(
-            guard < flag && guard < show,
-            "439: 守卫必须先于置位与 show_overlay（编辑态整臂跳过）"
+            guard < show,
+            "439: 守卫必须先于 show_overlay（编辑态整臂跳过）"
         );
         assert!(
             win.iter()
                 .any(|l| l.contains(concat!("Processing suppressed while editing"))),
             "439: 编辑态跳过 Processing 必须打 info 日志"
-        );
-    }
-
-    /// ② worker：`asr_handle.join()` 之后、两次早期发送（收尾预览 + 识别处理中）之前
-    /// 必须有 `cancel_signal` 取消门 —— 编辑点击 / Esc / 停止按钮 / PTT 短按四条取消路
-    /// 都在发之前置位；正常出字（松键 stop_recording、cancel 未置位）走 else 分支不变。
-    #[test]
-    fn worker_cancel_gate_before_early_sends() {
-        let lines = code_lines();
-        let asr = lines
-            .iter()
-            .position(|l| {
-                l.trim_start()
-                    .starts_with("let asr_result = asr_handle.join();")
-            })
-            .expect("439: asr_handle.join 锚点");
-        let acc = lines
-            .iter()
-            .position(|l| {
-                l.trim_start()
-                    .starts_with("let acc_result = acc_handle.map")
-            })
-            .expect("439: acc_handle.join 锚点");
-        assert!(asr < acc, "439: asr_join 必须先于 acc_join");
-        let win = &lines[asr..acc];
-        let gate = win
-            .iter()
-            .position(|l| l.contains(concat!("if cancel_signal.load(Ordering::Acquire)")))
-            .expect("439: asr_join..acc_join 窗口必须有 cancel_signal 取消门");
-        let fp = win
-            .iter()
-            .position(|l| l.contains(concat!("send(PipelineEvent::StreamingFinalPreview(")))
-            .expect("439: 收尾预览发送应在 asr_join..acc_join 窗口内");
-        let pr = win
-            .iter()
-            .position(|l| l.contains(concat!("send(PipelineEvent::Processing(")))
-            .expect("439: Processing 发送应在 asr_join..acc_join 窗口内");
-        assert!(
-            gate < fp && gate < pr,
-            "439: cancel_signal 取消门必须先于两次早期发送"
-        );
-        assert!(fp < pr, "282 顺序不变：预览先、处理态后");
-        assert!(
-            win.iter().any(|l| l.contains(concat!(
-                "skip StreamingFinalPreview/Processing (cancel_signal set)"
-            ))),
-            "439: 取消跳过两次发送必须打 info 日志"
         );
     }
 
@@ -14799,889 +9053,214 @@ mod edit_stuck_439_tests {
     }
 }
 
-#[cfg(test)]
-mod shared_queue_382_tests {
-    /// 382（3B）：单个共享任务通道的**多消费者**语义 —— 一个 worker 卡在长任务时，下一个任务被
-    /// 空闲 worker 立刻取走（旧 `rr % concurrency` 会把它排在忙的 worker 后面）。先后由通道制造、
-    /// 不用 sleep 定时序；`recv_timeout` 仅作挂死兜底。
-    #[test]
-    fn idle_worker_takes_next_while_other_busy() {
-        let (task_tx, task_rx) = crossbeam_channel::unbounded::<u32>();
-        let (started_tx, started_rx) = crossbeam_channel::unbounded::<u32>();
-        let (release_tx, release_rx) = crossbeam_channel::unbounded::<()>();
-        let (done_tx, done_rx) = crossbeam_channel::unbounded::<u32>();
-        for _ in 0..2 {
-            let trx = task_rx.clone();
-            let stx = started_tx.clone();
-            let rrx = release_rx.clone();
-            let dtx = done_tx.clone();
-            std::thread::spawn(move || {
-                for id in trx {
-                    let _ = stx.send(id);
-                    if id == 1 {
-                        let _ = rrx.recv(); // 任务 1 = 长任务：卡住该 worker
-                    }
-                    let _ = dtx.send(id);
-                }
-            });
-        }
-        drop(started_tx);
-        drop(done_tx);
-        let dl = std::time::Duration::from_secs(5);
-        task_tx.send(1).expect("send task1");
-        assert_eq!(started_rx.recv_timeout(dl).expect("task1 taken"), 1);
-        task_tx.send(2).expect("send task2");
-        assert_eq!(
-            started_rx
-                .recv_timeout(dl)
-                .expect("task2 must be taken by the idle worker"),
-            2
-        );
-        release_tx.send(()).expect("release task1");
-        let mut got = vec![
-            done_rx.recv_timeout(dl).expect("task done"),
-            done_rx.recv_timeout(dl).expect("task done"),
-        ];
-        got.sort_unstable();
-        assert_eq!(got, vec![1, 2]);
-    }
-
-    /// 生产侧结构护栏：必须用**单一共享** task 通道（`task_rx.clone()` 给每个 worker），
-    /// 不得退回「每 worker 一个发送端 + `rr % concurrency`」。
-    #[test]
-    fn production_uses_single_shared_task_queue() {
-        let lines: Vec<String> =
-            crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC)
-                .into_iter()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .collect();
-        assert_eq!(
-            lines
-                .iter()
-                .filter(|l| l.contains("let (task_tx, task_rx) ="))
-                .count(),
-            1,
-            "382(3B): 必须恰有一处单一共享 task 通道 `let (task_tx, task_rx)`"
-        );
-        assert!(
-            lines.iter().any(|l| l.contains("for _ in 0..concurrency")),
-            "382(3B): 必须有并发 worker 循环"
-        );
-        assert!(
-            lines.iter().any(|l| l.contains("task_rx.clone()")),
-            "382(3B): worker 必须 clone 同一个 task_rx（共享队列）"
-        );
-        assert!(
-            !lines
-                .iter()
-                .any(|l| l.contains("task_txs") || l.contains("% concurrency")),
-            "382(3B): 不得退回每 worker 一个发送端 / `rr % concurrency`"
-        );
-    }
-}
-
-// ============================================================
-// TEST-SYNC-382（阶段三 · 非作者护栏，coder-2）
-//   被测 FIX-WINDOW-COVER-AND-EARLY-PROCESSING-382（HEAD 1af7212）。
-//   按**设计契约**写用例，不照实现反推；补作者（plan_windows_382_tests /
-//   reflow_fast_382_tests / problem2_order_382_tests / shared_queue_382_tests）照不到的边界。
-//   🔴 全部为测试代码，不改生产逻辑。
-// ============================================================
-#[cfg(test)]
-mod testsync382_tests {
-    use crate::transcription;
-
-    /// 确定性伪随机（无外部依赖）：64-bit LCG（Knuth MMIX 常数）。
-    struct Lcg(u64);
-    impl Lcg {
-        fn new(seed: u64) -> Self {
-            Lcg(seed | 1)
-        }
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            self.0
-        }
-        fn usize_in(&mut self, lo: usize, hi: usize) -> usize {
-            debug_assert!(hi >= lo);
-            lo + (self.next_u64() % (hi - lo + 1) as u64) as usize
-        }
-        fn f32_in(&mut self, lo: f32, hi: f32) -> f32 {
-            let t = (self.next_u64() >> 11) as f32 / (1u64 << 53) as f32;
-            lo + t * (hi - lo)
-        }
-    }
-
-    // ---- 1. plan_windows 覆盖不变量的**性质测试** ----
-
-    /// 200 组随机 (prev_durs, new_durs, prev_base)：
-    /// ① 每个新片全局下标被某窗覆盖 ② 第 k 窗以第 k 新片收尾
-    /// ③ `start >= prev_base` 且 `end - start <= WINDOW_MAX_SLICES`
-    #[test]
-    fn plan_windows_property_cover_and_shape() {
-        let max_prev = transcription::WINDOW_MAX_SLICES;
-        let mut rng = Lcg::new(0x0381_0382_u64);
-        for _case in 0..200usize {
-            let nprev = rng.usize_in(0, max_prev);
-            let mut prev: Vec<f32> = Vec::with_capacity(nprev);
-            for _ in 0..nprev {
-                prev.push(rng.f32_in(0.3, 12.0));
-            }
-            let nnew = rng.usize_in(1, 4);
-            let mut new: Vec<f32> = Vec::with_capacity(nnew);
-            for _ in 0..nnew {
-                new.push(rng.f32_in(0.3, 12.0));
-            }
-            let base = rng.usize_in(0, 50);
-            let plan = super::plan_windows(&prev, &new, base, None);
-            // 386：`nnew>=2` ⇒ 末片**延后**（立刻窗数 = nnew-1、pending = 末片）；`nnew==1` ⇒ 全部立刻。
-            let expected_imm = if nnew >= 2 { nnew - 1 } else { nnew };
-            assert_eq!(plan.windows.len(), expected_imm, "立刻组窗数");
-            for (k, (s, e)) in plan.windows.iter().enumerate() {
-                let gidx = base + nprev + k; // 第 k 个新片的全局下标
-                assert_eq!(*e - 1, gidx, "第 k 个立刻窗口必须以第 k 个新片收尾");
-                assert!(*s >= base, "窗起点不得早于 prev_base");
-                assert!(*e > *s, "窗必须非空");
-                assert!(
-                    *e - *s <= max_prev,
-                    "无 pending 时窗宽不得超过 WINDOW_MAX_SLICES"
-                );
-                assert!(*s <= gidx && gidx < *e, "新片全局下标必须被本窗覆盖");
-            }
-            if nnew >= 2 {
-                assert_eq!(
-                    plan.pending,
-                    Some(base + nprev + nnew - 1),
-                    "末片必须延后为待覆盖片"
-                );
-            } else {
-                assert_eq!(plan.pending, None, "单片派发不延后");
-            }
-        }
-    }
-
-    /// 常态**单片**派发（`prev_durs` 未满 `WINDOW_MAX_SLICES` ⇒ 不触发裁片）：
-    /// 结果必须等于旧算法「pre+new 后直接 `group_window_start_secs`」。
-    ///
-    /// 说明：`prev` 已满 `WINDOW_MAX_SLICES` 时 plan 会先裁最远片再组窗（382 设计），
-    /// 与「不裁直接 group」不同 —— 那一条由上面 shape 性质覆盖，不在本用例范围。
-    #[test]
-    fn plan_windows_single_matches_legacy_property() {
-        let max_prev = transcription::WINDOW_MAX_SLICES;
-        let mut rng = Lcg::new(0x0381_0383_u64);
-        for _case in 0..200usize {
-            let nprev = rng.usize_in(0, max_prev - 1); // 保证 push 后不裁片
-            let mut prev: Vec<f32> = Vec::with_capacity(nprev);
-            for _ in 0..nprev {
-                prev.push(rng.f32_in(0.3, 12.0));
-            }
-            let x = rng.f32_in(0.3, 12.0);
-            let base = rng.usize_in(0, 50);
-            let plan = super::plan_windows(&prev, &[x], base, None);
-            let mut buf = prev.clone();
-            buf.push(x);
-            let s = transcription::group_window_start_secs(&buf, transcription::WINDOW_MAX_SECS);
-            assert_eq!(
-                plan.windows,
-                vec![(base + s, base + prev.len() + 1)],
-                "常态单片必须等于旧组窗算法"
-            );
-            assert_eq!(plan.pending, None, "单片不延后");
-        }
-    }
-
-    /// 边界：`new_durs` 为空 ⇒ 返回空计划（不 panic、不产出窗口）。
-    /// 理由：调用方若以「本次派发携带 0 片」调用（防御性），不得制造空窗或越界。
-    #[test]
-    fn plan_windows_empty_new_is_empty() {
-        assert!(super::plan_windows(&[1.0, 2.0], &[], 7, None)
-            .windows
-            .is_empty());
-        assert!(super::plan_windows(&[], &[], 0, None).windows.is_empty());
-    }
-
-    // ---- 2. ReflowFastState 退化输入（作者未覆盖） ----
-    #[cfg(target_os = "windows")]
-    mod reflow {
-        use crate::{ReflowFastOutcome, ReflowFastState};
-
-        fn apply(o: ReflowFastOutcome) -> (String, usize, bool, bool) {
-            match o {
-                ReflowFastOutcome::Apply {
-                    text,
-                    committed_len,
-                    accurate,
-                    render,
-                } => (text, committed_len, accurate, render),
-                ReflowFastOutcome::None => panic!("expected Apply, got None"),
-            }
-        }
-
-        /// 跨代：gen1 的准确边界**不得**被 gen2 同 seg 复用（须回退 fallback）。
-        #[test]
-        fn cross_gen_bound_not_reused() {
-            let mut st = ReflowFastState::default();
-            let _ = apply(st.on_text(1, 5, "one".into(), 3, true, false));
-            let b = apply(st.on_bound(1, 5, Some(7), false));
-            assert_eq!(b, ("one".into(), 7, true, true));
-            // gen2 同 seg ⇒ 不得拿 gen1 的 7
-            let a = apply(st.on_text(2, 5, "two".into(), 9, true, false));
-            assert_eq!(a, ("two".into(), 9, false, true), "旧代边界必须失效");
-        }
-
-        /// 同 seg 边界 `None`（b 类）先到、随后升为 `Some`：应补一次准确渲染。
-        #[test]
-        fn same_seg_bound_none_then_some_rerenders() {
-            let mut st = ReflowFastState::default();
-            let a = apply(st.on_text(1, 5, "acc".into(), 3, true, false));
-            assert_eq!(a, ("acc".into(), 3, false, true));
-            assert_eq!(st.on_bound(1, 5, None, false), ReflowFastOutcome::None);
-            let b = apply(st.on_bound(1, 5, Some(7), false));
-            assert_eq!(b, ("acc".into(), 7, true, true), "升级为准确边界应重渲");
-        }
-
-        /// 两个 seg 交错 + 边界**乱序**到达：只有「最新已渲染 seg」的边界才重渲；
-        /// 预先登记的边界（seg 尚未渲染）在 text 到达时应被采用。
-        #[test]
-        fn out_of_order_bounds_only_latest_seg_renders() {
-            let mut st = ReflowFastState::default();
-            // seg6 边界先到（seg6 尚未渲染）⇒ None，但被登记
-            assert_eq!(st.on_bound(1, 6, Some(4), false), ReflowFastOutcome::None);
-            let _ = apply(st.on_text(1, 5, "five".into(), 1, true, false));
-            // seg6 全文到：应直接用先前登记的边界 4（accurate）
-            let six = apply(st.on_text(1, 6, "six".into(), 1, true, false));
-            assert_eq!(six, ("six".into(), 4, true, true));
-            // seg5 边界后到：它已不是最新已渲染 ⇒ None
-            assert_eq!(st.on_bound(1, 5, Some(9), false), ReflowFastOutcome::None);
-            // seg6 边界更新：仍是最新已渲染 ⇒ 重渲准确值
-            let upd = apply(st.on_bound(1, 6, Some(8), false));
-            assert_eq!(upd, ("six".into(), 8, true, true));
-        }
-
-        /// `suppressed=true`：边界重渲也必须 `render=false`，但状态（committed_len）照常更新。
-        #[test]
-        fn suppressed_on_bound_renders_state_only() {
-            let mut st = ReflowFastState::default();
-            let _ = apply(st.on_text(1, 5, "acc".into(), 3, true, true));
-            let b = apply(st.on_bound(1, 5, Some(7), true));
-            assert_eq!(
-                (b.1, b.2, b.3),
-                (7, true, false),
-                "suppressed 下仍以准确边界更新状态，但不得重画浮层"
-            );
-        }
-
-        /// 作者未覆盖的**会话复位点**：`clear()` 必须清空 latest/bounds/rendered，
-        /// 否则跨会话会复用陈旧边界（新代同 seg 拿到旧值）。
-        #[test]
-        fn clear_resets_all_state() {
-            let mut st = ReflowFastState::default();
-            let _ = apply(st.on_text(1, 5, "acc".into(), 3, true, false));
-            let _ = apply(st.on_bound(1, 5, Some(7), false));
-            st.clear();
-            // clear 后同 gen 同 seg 也不得复用 7 ⇒ 用 fallback
-            let a = apply(st.on_text(1, 5, "new".into(), 4, true, false));
-            assert_eq!(a, ("new".into(), 4, false, true), "clear 后旧边界必须失效");
-        }
-    }
-
-    // ---- 3. 源码级护栏 ----
-
-    fn prod_lines() -> Vec<String> {
-        crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC)
-            .into_iter()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect()
-    }
-
-    /// 滑窗派发**区域**不得退回「每 worker 一个发送端 / 轮询取模」，
-    /// 且必须 clone **同一** `task_rx`（单一队列多消费者）。
-    ///
-    /// 与作者全局护栏的分工：本用例把负面断言**限定在派发点邻域**（旧 `rr % concurrency`
-    /// 就写在 worker 循环旁），并补正向「共享 task_rx 被 clone」。
-    #[test]
-    fn window_dispatch_single_shared_queue_no_round_robin() {
-        let lines = prod_lines();
-        let idx = lines
-            .iter()
-            .position(|l| l.contains("task_tx.send("))
-            .expect("382: 滑窗派发锚点 task_tx.send 缺失");
-        let lo = idx.saturating_sub(300);
-        let hi = (idx + 20).min(lines.len());
-        for l in &lines[lo..hi] {
-            assert!(
-                !l.contains("task_txs"),
-                "382: 滑窗派发区不得出现多发送端 task_txs"
-            );
-            assert!(
-                !l.contains("% concurrency") && !l.contains("rr %"),
-                "382: 滑窗派发区不得出现轮询取模派发"
-            );
-        }
-        assert!(
-            lines.iter().any(|l| l.contains("task_rx.clone()")),
-            "382: worker 必须 clone 共享 task_rx（单一队列多消费者）"
-        );
-    }
-
-    /// `ACC_REFLOW_SUPPRESS` 置位**只**允许出现在 `PipelineEvent::Processing` 处理臂内
-    /// （防闪回机制的唯一开关；散落到别处会把正常回灌也静默掉）。
-    #[test]
-    fn suppress_flag_only_set_inside_processing_arm() {
-        let lines = prod_lines();
-        let stores: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.contains("ACC_REFLOW_SUPPRESS.store(true"))
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(
-            stores.len(),
-            1,
-            "382: ACC_REFLOW_SUPPRESS.store(true 必须恰一处（本代 Processing 时置位）"
-        );
-        let idx = stores[0];
-        let arm = (0..idx)
-            .rev()
-            .find(|&i| lines[i].contains("PipelineEvent::") && lines[i].contains("=>"))
-            .expect("382: 置位必须位于某个 PipelineEvent 处理臂内");
-        assert!(
-            lines[arm].contains("PipelineEvent::Processing("),
-            "382: ACC_REFLOW_SUPPRESS 置位必须落在 Processing 处理臂内，实际最近臂为其它事件"
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("ACC_REFLOW_SUPPRESS.store(false")),
-            "382: 必须有复位点（新代 RecordingStarted），否则一旦置位永不回灌"
-        );
-    }
-}
-
+/// 终稿后文字处理主流程（ITN 补丁 / 同音 / 大模型优化或翻译 / 去口水 / L2 标点 / 统计 / 注入）。
+///
+/// FLASH-P3-A（DEC-114）：识别只剩两条在线流式路径 ⇒ 入参直接是**在线终稿文本**；原「录音样本 + 本地转录 /
+/// 并行精解预转写 / 本地实时去重节点声明 / 本地标点引擎 / 离线翻译引擎」相关参数与分支随本地引擎删除。
+/// 在线终稿已由服务端做过数字规整与标点（直连阿里由阿里加；连 flashasr 由服务端加），
+/// 故主通道 ITN 恒跳过（V091-ITN-SKIP-ONLINE-215 在线口径）、本地加标点节点删除。
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 fn run_pipeline_core(
-    samples_result: anyhow::Result<Vec<f32>>,
-    transcriber: &transcription::Transcriber,
+    text: String,
     rt: &tokio::runtime::Runtime,
     llm_client: &llm::LlmClient,
     cancel_signal: &AtomicBool,
     config: &AppConfig,
     runtime_config: &Arc<RwLock<AppConfig>>,
-    cached_translation: &mut Option<(config::TranslationLanguage, translation::TranslationEngine)>,
-    model_dir: &Path,
-    mut punctuation_engine: Option<&mut punctuation::PunctuationEngine>,
     target_hwnd: platform::WindowId,
     event_tx: &crossbeam_channel::Sender<PipelineEvent>,
     translate: Arc<AtomicBool>,
-    // ASR-038-B: 流式模式传入已转录文本，跳过转录步骤直接走 LLM 后半段。
-    // None = 正常模式（run_pipeline_core 内部转录）；Some(text) = 流式模式（跳过转录）
-    initial_text: Option<String>,
-    // PARALLEL-ACC-298: 本地流式「并行 accuracy」整段结果 `(text, native_punctuated)`。
-    // Some ⇒ 跳过内部转录，直接用该文本走 LLM 后半段。🔴 与 initial_text **分开**：
-    // `from_online_streaming` 仍只由 `initial_text.is_some()` 决定（本路径 initial_text=None
-    // ⇒ false ⇒ 主通道 ITN 启用），**不得**用本参数反推来源（DEC-066）。
-    // 🔴 native_punctuated 是**文本实测**：`punctuation::has_effective_punctuation(&text)`
-    // （DEC-047 的结论正是「实测文本，而非假设/外推」；原注释把它引反了，PUNCT-DOUBLE-334 订正）。
-    // 由调用方在构造时用 `pretranscribed_native_punctuated` 算好，本参数只接收结果。
-    pretranscribed: Option<(String, bool)>,
-    // PIPELINE-ORCH-239-B（DEC-066 附则一）：本地转录步骤的状态文案。
-    // 现有三档传 `overlay_transcribing`（行为逐位零变）；本地 realtime 新管线传
-    // `overlay_processing`，满足「松键后只显示『识别处理中』单状态」要求。
-    transcribing_status_text: &'static str,
-    // REFLOW-FILLER-ONCE-441（DEC-066）：由调用方管线**显式声明**口水词去重节点位置 ——
-    // `AtFinal` = 在本函数最终节点去重（在线 / 批处理 / 本地实时退回 2pass）；
-    // `DoneUpstream` = 本地实时已在回灌前对权威文本去过一遍，最终节点不再重复。
-    // 🔴 本函数不得从文本或 `pretranscribed.is_some()` 反推该值。
-    filler_node: FinalFillerNode,
-    // STATS-475：本次会话的统计来源（档位分类 + 用户输入语音时长），由调用方管线声明，不从配置反推。
+    // STATS-475：本次会话的统计来源（档位分类 + 时长），由调用方管线声明，不从配置反推。
     usage: UsageSource,
 ) {
-    match samples_result {
-        Err(e) => {
-            log::error!("Recording error: {}", e);
-            send_event(event_tx, PipelineEvent::Error(e.to_string()));
-        }
-        // ASR-045: 判空取消仅在「无样本 且 无流式文本」时成立。
-        // 流式模式（samples 空 + initial_text Some）属正常情况，落入 Ok(samples) 分支走 LLM 后半段。
-        Ok(s) if should_cancel_on_empty(&s, &initial_text) => {
-            log::warn!("No audio samples recorded");
-            send_event(event_tx, PipelineEvent::Cancelled);
-        }
-        Ok(samples) => {
-            if cancel_signal.load(Ordering::Relaxed) {
-                log::warn!("Pipeline skipped: cancel_signal was true after recording completed (possible race condition)");
-                send_event(event_tx, PipelineEvent::Cancelled);
-                return;
+    if cancel_signal.load(Ordering::Relaxed) {
+        log::warn!("Pipeline skipped: cancel_signal was true after recording completed (possible race condition)");
+        send_event(event_tx, PipelineEvent::Cancelled);
+        return;
+    }
+    let raw_text = text;
+    log::info!("Transcribed: {}", raw_text);
+    // BUG-119: 在线终稿空文本（含只剩空白）= 没识别到语音 → 信息提示（用户可见反馈，不是静默取消）。
+    if raw_text.trim().is_empty() {
+        log::info!("No speech detected, showing info hint");
+        send_event(event_tx, PipelineEvent::NoSpeech);
+        return;
+    }
+    // OPT-002: Skip if text is not effective (empty or filler-only).
+    if !text_normalizer::is_effective_text(&raw_text) {
+        log::info!("Skipping pipeline: transcription not effective (empty or filler only)");
+        send_event(event_tx, PipelineEvent::Cancelled);
+        return;
+    }
+    // HOMOPHONE-NODE-318：ASR 同音纠错节点。**转录之后、LLM 之前**：修的是 ASR **听错**，
+    // 越早修正下游越干净；在 LLM 前也不触 DEC-041（该条禁的是对 LLM 输出做程序化后处理）。
+    // 恒 `enabled=true`，表内只放无歧义项，不新增用户可见开关（DEC-031）。
+    let raw_text = homophone::apply_homophone_fix(raw_text, true);
+    // V091-ITN-SKIP-ONLINE-215：在线流式 ASR 已由服务端做过数字/单位规整，主通道 ITN 跳过，
+    // 避免二次处理（Gavin 2026-09-17）。FLASH-P3-A 起只剩在线路径 ⇒ 恒跳过。
+    // 🔴 只跳主通道；补丁通道 normalize_unit_symbols_only 仍在 LLM 后保留（DEC-036 双通道）。
+    log::info!("V091-ITN-SKIP-ONLINE-215: online ASR output, skipping main-channel ITN");
+    let pre_llm_text = raw_text.clone();
+    // SCENE-SENSE-001-CORE (DEC-031-⑤): 录音完成阶段采集前台窗口场景信号，
+    // 供 LLM prompt F4 段注入 + multiline_safe 格式安全裁决。
+    let scene_context = capture_pipeline_scene(config, target_hwnd);
+    let multiline_safe = scene_context.multiline_safe;
+    let send_window_title = config.scene.send_window_title;
+    // TRANS-008 B方案: translate=true 时走 LLM optimize+translate；translate=false 走 LLM optimize
+    let translate_requested = translate.load(Ordering::Acquire);
+    // TRANS-BIDIR-001: 翻译方向由内容自动判定（translation::derive_translation_target，平台中立，可单测）。
+    let derived_target = translation::derive_translation_target(&raw_text);
+    if translate_requested && config.translation.enabled {
+        log::info!(
+            "Translation direction derived: {:?} (target_language cache={:?})",
+            derived_target,
+            config.translation.target_language
+        );
+    }
+    // PIPELINE-ORCH-238-B: N6 全量块（初始化 + Processing 事件 + learn_llm_suggestions）。
+    let llm_out = run_llm_stage(
+        rt,
+        llm_client,
+        config,
+        runtime_config,
+        event_tx,
+        &raw_text,
+        &pre_llm_text,
+        &scene_context,
+        multiline_safe,
+        send_window_title,
+        translate_requested,
+        derived_target,
+    );
+    let final_text = llm_out.text;
+    let llm_handled = llm_out.llm_handled;
+    let format_failed = llm_out.format_failed;
+    let llm_calls = llm_out.llm_calls;
+    // REFACTOR-SHARE-TRANSDIR-001: persist via AppConfig method (platform-neutral)
+    if translate_requested && config.translation.enabled && !raw_text.trim().is_empty() {
+        let needs_save = match runtime_config.write() {
+            Ok(mut cfg) => cfg.remember_translation_direction(derived_target),
+            Err(poisoned) => {
+                let mut cfg = poisoned.into_inner();
+                cfg.remember_translation_direction(derived_target)
             }
-            // ASR-038-B: 流式模式跳过转录步骤，直接用 transcribe_streaming_realtime
-            // 返回的文本走 LLM 后半段（ITN→LLM→注入）。转录已在 ASR 线程完成。
-            // initial_text = Some → 流式；None → 正常转录
-            //
-            // BUG-119: 错误载体从 String 升为 TranscriptionFailure —— 拦截点必须在
-            // map_err 处（anyhow::Error 还带类型的最后时机）下探 NoSpeechError；
-            // 一旦 to_string() 就永远无法与普通错误区分（本 bug 成因链一环）。
-            // 新增第三个「没说话」产出源只需 bail!(NoSpeechError)，此处零改动。
-            // V091-ITN-SKIP-ONLINE-215: 记录文本是否产自在线流式 ASR。
-            // 在线 ASR 服务端已完成数字/单位规整，主通道再跑一遍属二次处理。
-            // 🔴 用 initial_text.is_some() 而非 config.audio.asr_model 判据：后者与
-            // transcriber 热重载存在瞬态不同步（config 已切在线但引擎仍为本地），
-            // 按 config 判会把本地 ASR 输出也误跳过 ITN。
-            let from_online_streaming = initial_text.is_some();
-            let transcription_result: Result<(String, bool), TranscriptionFailure> = if let Some(
-                text,
-            ) =
-                initial_text
+        };
+        if needs_save {
+            if let Ok(cfg) = runtime_config.read() {
+                log::info!(
+                    "Persisting translation direction cache to {:?}",
+                    derived_target
+                );
+                if let Err(e) = cfg.save() {
+                    log::warn!("Failed to persist translation direction cache: {}", e);
+                }
+            }
+        }
+    }
+    // ITN-V2-001 (R1 补丁通道)：LLM 之后仅运行 normalize_unit_symbols_only，捞回 LLM 纠正 ASR
+    // 同音错字后的单位符号（如「摄息」→「摄氏」后「40摄氏度」→「40℃」）。幂等；英文输出 no-op。
+    let final_text = itn::normalize_unit_symbols_only(&final_text);
+    // FLASH-P3-A：本地加标点节点（apply_local_punctuation，CT / 日韩标点模型）删除 ——
+    // 直连阿里由阿里自己加标点，连 flashasr 由服务端加。「自动标点」开关「关 ⇒ 去掉标点」由下方 L2 节点照旧负责。
+    // FORMAT-FALLBACK-303 / WIRE-FF303-305：本地免费口水词过滤。
+    // 🔴 位置条件（勿挪）：① 文本此刻已带标点（服务端标点；规则 A 的「句首」要有句读可依）；
+    // ② 在 inject_text 之前；③ `enabled = !llm_handled` ⇒ 只有 LLM 未接手时才动（不触 DEC-041）。
+    let final_text = apply_filler_strip(final_text, !llm_handled);
+    // PUNCT-GOVERNANCE-030-A L2 后处理补位：
+    //   (a) 开关关闭 → 全文剥标点（在线 ASR / LLM 翻译不可控源兜底）
+    //   (b) 开关开启且字/词数 <= 5 → 剥末尾标点（Gavin 2026-08-08 短句规则）
+    // 🔴 本块不含任何来源判据，对全部产出源一视同仁。判定逻辑在纯函数 apply_l2_postprocess。
+    let (l2_text, l2_action) = punctuation::apply_l2_postprocess(
+        &final_text,
+        config.punctuation.enabled,
+        config.punctuation.strip_trailing,
+    );
+    match l2_action {
+        punctuation::L2Action::StripAll => {
+            if l2_text != final_text {
+                log::info!(
+                    "Stripped native punctuation (auto_punct=false): '{}' -> '{}'",
+                    final_text,
+                    l2_text
+                );
+            }
+        }
+        punctuation::L2Action::StripTrailing => {
+            if l2_text != final_text {
+                log::info!(
+                    "Stripped trailing punctuation (<=5 units): '{}' -> '{}'",
+                    final_text,
+                    l2_text
+                );
+            }
+        }
+        punctuation::L2Action::NoOp => {}
+    }
+    let final_text = l2_text;
+    if cancel_signal.load(Ordering::Relaxed) {
+        send_event(event_tx, PipelineEvent::Cancelled);
+        return;
+    }
+    // STATS-475：最终文字产出（上屏或失焦预览）即记一条；写库丢后台线程，不挡上屏。
+    if !final_text.trim().is_empty() {
+        let stats_text = final_text.clone();
+        std::thread::spawn(move || {
+            // FLASH-P3-A：时长 = 调用方给的整段送出音频时长（STATS-480 的 VAD 有效语音口径随本地模型删除）。
+            if let Err(e) =
+                usage_stats::record(usage.category, usage.speech_ms, &stats_text, llm_calls)
             {
-                if text.trim().is_empty() {
-                    // BUG-119: 流式结果空文本 = 没说话，同样走信息提示
-                    // （护栏契约不变：仍是用户可见反馈，不是第一层静默取消）
-                    Err(TranscriptionFailure::NoSpeech)
-                } else {
-                    let native_punctuated = punctuation::has_effective_punctuation(&text);
-                    Ok((text, native_punctuated))
-                }
-            } else if let Some((text, native_punctuated)) = pretranscribed {
-                // PARALLEL-ACC-298：本地流式「并行 accuracy」结果。路由与 accuracy 2pass
-                // **完全一致**：`from_online_streaming` 仍由 `initial_text`（本路径为 None）
-                // 决定 = false ⇒ 主通道 ITN 启用；标点标记用**文本实测**
-                // `has_effective_punctuation`（DEC-047 口径，见 `pretranscribed_native_punctuated`；
-                // 原「各段 all_native 的与」是语义错配，PUNCT-DOUBLE-334 已订正）。
-                // 不在此再对全量 pcm 跑一次 accuracy（并行 worker 已逐片转写完）。
-                // 保持本地档单状态：仍发 `Processing(transcribing_status_text)`（文案同 :9127）。
-                send_event(
-                    event_tx,
-                    PipelineEvent::Processing(transcribing_status_text.to_string()),
-                );
-                log::info!(
-                    "PARALLEL-ACC-298: using parallel accuracy transcript ({} chars), skipping re-transcription",
-                    text.chars().count()
-                );
-                if text.trim().is_empty() {
-                    Err(TranscriptionFailure::NoSpeech)
-                } else {
-                    Ok((text, native_punctuated))
-                }
-            } else {
-                // 正常转录路径（FIRSTCHAR-FIX-006 前处理 + transcribe_with_punct_info）
-                const SPEECH_ENERGY_THRESHOLD: f32 = 0.008;
-                let (silence_head_samples, onset_backtrack_samples) =
-                    select_preprocessing_params(transcriber.asr_model());
-                let keep_start = find_speech_onset_with_backtrack(
-                    &samples,
-                    SPEECH_ENERGY_THRESHOLD,
-                    onset_backtrack_samples,
-                );
-                let trimmed = &samples[keep_start..];
-                let mut padded = Vec::with_capacity(silence_head_samples + trimmed.len());
-                padded.resize(silence_head_samples, 0.0f32);
-                padded.extend_from_slice(trimmed);
-                log::info!(
-                    "Transcribing {} samples (silence_head={}ms, trimmed leading silence by {} samples / {:.0}ms, asr_model={})",
-                    padded.len(),
-                    silence_head_samples as f64 / 16.0,
-                    keep_start,
-                    keep_start as f64 / 16.0,
-                    // FIX-LOCALRT-ENGINE-EQ-252: 收敛到 uses_accuracy_engine()——LocalRealtime 的
-                    // 前处理/引擎按 accuracy 走，日志如实反映（否则被误标 performance）。
-                    if transcriber.asr_model().uses_accuracy_engine() { "accuracy" } else { "performance" },
-                );
-                let transcribing_msg = transcribing_status_text;
-                send_event(
-                    event_tx,
-                    PipelineEvent::Processing(transcribing_msg.to_string()),
-                );
-                transcriber
-                    .transcribe_with_punct_info(&padded, config.audio.chinese_script)
-                    .map_err(|e| {
-                        if e.is::<transcription::NoSpeechError>() {
-                            TranscriptionFailure::NoSpeech
-                        } else {
-                            TranscriptionFailure::Other(e.to_string())
-                        }
-                    })
-            };
-
-            match transcription_result {
-                Err(TranscriptionFailure::NoSpeech) => {
-                    // BUG-119: 没识别到语音 → 信息提示（i18n no_speech_hint），非错误样式
-                    log::info!("No speech detected, showing info hint");
-                    send_event(event_tx, PipelineEvent::NoSpeech);
-                }
-                Err(TranscriptionFailure::Other(e)) => {
-                    log::error!("Transcription error: {}", e);
-                    send_event(event_tx, PipelineEvent::Error(e));
-                }
-                Ok((raw_text, native_punctuated)) => {
-                    if cancel_signal.load(Ordering::Relaxed) {
-                        send_event(event_tx, PipelineEvent::Cancelled);
-                        return;
-                    }
-                    log::info!(
-                        "Transcribed: {} (native_punctuated={})",
-                        raw_text,
-                        native_punctuated
-                    );
-                    // Skip downstream processing when transcription output is empty.
-                    // BUG-119: 空文本（含 <|nospeech|> token 剥离后仅剩空白）= 没识别到语音
-                    // → 信息提示。护栏契约不变：仍是用户可见反馈，不是静默取消。
-                    if raw_text.trim().is_empty() {
-                        log::warn!("Transcription result is empty (no speech content)");
-                        send_event(event_tx, PipelineEvent::NoSpeech);
-                        return;
-                    }
-                    // OPT-002: Skip if text is not effective (empty or filler-only).
-                    // Note: previously fed ITN output here; ITN moved post-LLM (ITN-REORDER-001),
-                    // so raw_text is used now. ITN only converts Chinese numerals to Arabic and
-                    // adds ℃ etc. — it never adds/removes semantic characters, so filler detection
-                    // results are identical (fillers 啊呃嗯… are not numerals).
-                    if !text_normalizer::is_effective_text(&raw_text) {
-                        log::info!(
-                            "Skipping pipeline: transcription not effective (empty or filler only)"
-                        );
-                        send_event(event_tx, PipelineEvent::Cancelled);
-                        return;
-                    }
-                    // HOMOPHONE-NODE-318：ASR 同音纠错节点。**转录之后、ITN 主通道之前**：
-                    // 修的是 ASR **听错**，越早修正下游（ITN/LLM/标点）越干净；在 LLM 前也不触
-                    // DEC-041（该条禁的是对 LLM 输出做程序化后处理）。恒 `enabled=true`，
-                    // 表内只放无歧义项，不新增用户可见开关（DEC-031）。
-                    // 四档共用 run_pipeline_core ⇒ 一处调用即覆盖 local_realtime/accuracy/performance/qwen3。
-                    let raw_text = homophone::apply_homophone_fix(raw_text, true);
-                    // ITN-V2-001 (R1 主通道)：ITN 从「LLM 后」回移到「LLM 前」。
-                    // Gavin 2026-07-31 指令：LLM 会曲解原始数字表达（如「四点三刻」→「4:30」，
-                    // 信息被销毁），故主通道在 LLM 之前先把中文数字→阿拉伯 + 单位符号定型，
-                    // LLM 拿到的已是成形数字，UNIT_SYMBOL_PROTECTION 指令恢复生效。
-                    // 补丁通道（normalize_unit_symbols_only）仍在 LLM 后兜底（见 :3124），
-                    // 捞回 LLM 纠正 ASR 同音错字后的「40摄氏度」→「40℃」。
-                    // 放在 is_effective_text 之后：ITN 不增删语义字符，filler 判定不变。
-                    //
-                    // V091-ITN-SKIP-ONLINE-215：在线流式 ASR 已由服务端做过数字/单位规整，
-                    // 主通道跳过，避免二次处理（Gavin 2026-09-17）。判据用 from_online_streaming
-                    // （数据路径事实），不用 config.audio.asr_model（与引擎热重载有竞态）。
-                    // 🔴 只跳主通道；补丁通道 normalize_unit_symbols_only 仍在 LLM 后保留
-                    //    （DEC-036 双通道：补丁通道处理的是 LLM 输出方向，不属二次处理）。
-                    let pre_llm_text = if from_online_streaming {
-                        log::info!(
-                            "V091-ITN-SKIP-ONLINE-215: online ASR output, skipping main-channel ITN"
-                        );
-                        raw_text.clone()
-                    } else {
-                        itn::normalize_numbers(&raw_text)
-                    };
-                    // SCENE-SENSE-001-CORE (DEC-031-⑤): 录音完成阶段采集前台窗口场景信号，
-                    // 供 LLM prompt F4 段注入 + multiline_safe 格式安全裁决。
-                    // target_hwnd 即录音启动时捕获的前台窗口，此处复用同一 HWND 采集。
-                    // 失败一律降级为 Unknown（不注入 F4，multiline_safe=false 保守）。
-                    // PIPELINE-ORCH-238: 采集 + 观测日志已抽为 capture_pipeline_scene（行为逐位不变）。
-                    let scene_context = capture_pipeline_scene(config, target_hwnd);
-                    let multiline_safe = scene_context.multiline_safe;
-                    let send_window_title = config.scene.send_window_title;
-                    // TRANS-008 B方案: translate=true 时走 LLM optimize+translate；translate=false 走 LLM optimize
-                    // translate=false 閺冭绱濋崢鐔告箒 LLM optimize 鐠侯垰绶炴稉宥呭綁
-                    let translate_requested = translate.load(Ordering::Acquire);
-                    // TRANS-BIDIR-001: 翻译方向由内容自动判定，不再由 config.translation.target_language 门控。
-                    // target_language 字段保留仅为「上次使用方向缓存」（启动时据此预载引擎）。
-                    // REFACTOR-DERIVE-TARGET-001: 提取为 translation::derive_translation_target（平台中立，可单测）
-                    let derived_target = translation::derive_translation_target(&raw_text);
-                    if translate_requested && config.translation.enabled {
-                        log::info!(
-                            "Translation direction derived: {:?} (target_language cache={:?})",
-                            derived_target,
-                            config.translation.target_language
-                        );
-                    }
-                    // PIPELINE-ORCH-238-B: N6 全量块（初始化 + 两条 Processing 事件 +
-                    // learn_llm_suggestions）已抽为 run_llm_stage（行为逐位不变，时序保持）。
-                    let llm_out = run_llm_stage(
-                        rt,
-                        llm_client,
-                        config,
-                        runtime_config,
-                        event_tx,
-                        &raw_text,
-                        &pre_llm_text,
-                        &scene_context,
-                        multiline_safe,
-                        send_window_title,
-                        translate_requested,
-                        derived_target,
-                        cached_translation,
-                        &model_dir,
-                    );
-                    let final_text = llm_out.text;
-                    let llm_handled = llm_out.llm_handled;
-                    let format_failed = llm_out.format_failed;
-                    let llm_calls = llm_out.llm_calls;
-                    // REFACTOR-SHARE-TRANSDIR-001: persist via AppConfig method (platform-neutral)
-                    // + runtime lock/save (Windows runtime concern, inline here in cfg(windows) run_pipeline)
-                    if translate_requested
-                        && config.translation.enabled
-                        && !raw_text.trim().is_empty()
-                    {
-                        let needs_save = match runtime_config.write() {
-                            Ok(mut cfg) => cfg.remember_translation_direction(derived_target),
-                            Err(poisoned) => {
-                                let mut cfg = poisoned.into_inner();
-                                cfg.remember_translation_direction(derived_target)
-                            }
-                        };
-                        if needs_save {
-                            if let Ok(cfg) = runtime_config.read() {
-                                log::info!(
-                                    "Persisting translation direction cache to {:?}",
-                                    derived_target
-                                );
-                                if let Err(e) = cfg.save() {
-                                    log::warn!(
-                                        "Failed to persist translation direction cache: {}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    // ITN-V2-001 (R1 补丁通道)：三分支产出 final_text 之后、本地标点之前。
-                    // 主通道已在 LLM 之前跑过完整 normalize_numbers（见上方 pre_llm_text），
-                    // 此处仅运行第二阶段 normalize_unit_symbols_only，捞回 LLM 纠正 ASR
-                    // 同音错字后的单位符号（如「摄息」→「摄氏」后「40摄氏度」→「40℃」）。
-                    // 不重跑 normalize_with_rules（第一阶段）：中文数字已在主通道定型，且 LLM
-                    // 输出可能含阿拉伯数字，重跑中文数字转换是 no-op；单位符号规整才是补丁价值。
-                    // 幂等安全：主通道产出「40℃」，补丁通道对「℃」不匹配任何 trigger → 不变。
-                    // 对翻译路径（英文输出）：本函数是 no-op（英文无中文单位词）。
-                    let final_text = itn::normalize_unit_symbols_only(&final_text);
-                    // PUNCT-INTEGRATION-001 + ASR-PUNCT-OPT-001: 标点决策
-                    // 条件：auto_punct=true && LLM 未处理 && 非翻译 && 非native自带标点
-                    // - native_punctuated=true（accuracy native 成功）→ 跳过标点引擎（省一次推理）
-                    // - native_punctuated=false（performance/兜底/混合）→ 照常走标点引擎
-                    // - 本分支只负责「加标点」；「剥离」职责已移交下方 L2 后处理补位块
-                    //   （PUNCT-GOVERNANCE-030-A），对全部产出源一视同仁，无来源判据。
-                    // PIPELINE-ORCH-238: 判定体已抽为 apply_local_punctuation（行为逐位不变）。
-                    let final_text = apply_local_punctuation(
-                        final_text,
-                        config.punctuation.enabled,
-                        llm_handled,
-                        translate_requested,
-                        native_punctuated,
-                        punctuation_engine.as_deref_mut(),
-                    );
-                    // FORMAT-FALLBACK-303 / WIRE-FF303-305：本地免费口水词过滤。
-                    // 🔴 位置三条件（勿挪）：① **文本此刻必须已带标点**（规则 A 的「句首」要有句读可依）。
-                    //    ⚠️ FIX-FILLER-NODE-COMMENT-378：标点的**实际来源有两条**，勿以为是上游节点供给 ——
-                    //    本地 realtime 滑窗路径 `native_punctuated=true`（日志恒 `all_native=true`）⇒
-                    //    `apply_local_punctuation` 的门 `!native_punctuated` 不成立 ⇒ **引擎整块跳过、常态空转**，
-                    //    标点全部来自 acc 模型自带；只有 native 失败时才轮到引擎补。两条路都保证「此刻有标点」，
-                    //    故本节点仍须排在其后。**已知边界**（非本批引入、概率低、暂不修）：
-                    //    `native_punctuated=false` 且 `punctuation.enabled=false` ⇒ 文本无任何标点 ⇒ 规则 A 失依据。
-                    // ② 在 inject_text 之前；③ `enabled = !llm_handled` ⇒ 只有 LLM 未接手时才动，
-                    // 不触 DEC-041（该条禁的是对 LLM 输出做程序化后处理，此处压根没有 LLM 输出）。
-                    // 四档共用 run_pipeline_core，一处调用即全覆盖，不新增任何管线判据（DEC-066）。
-                    // REFLOW-FILLER-ONCE-441：本地实时声明 `DoneUpstream` ⇒ 已在回灌前去过一遍，这里不再过（只过一遍）。
-                    let final_text = apply_filler_strip(
-                        final_text,
-                        !llm_handled && filler_node == FinalFillerNode::AtFinal,
-                    );
-                    // PUNCT-GOVERNANCE-030-A L2 后处理补位（架构定位：L1 源头控制为主，L2 补位）
-                    // 只负责两件 L1 物理上够不着的事：
-                    //   (a) 开关关闭 → 全文剥标点（Qwen3 在线 ASR / 本地 native / NLLB 翻译不可控源兜底）
-                    //   (b) 开关开启且字/词数 <= 5 → 剥末尾标点（Gavin 2026-08-08 短句规则）
-                    // 🔴 本块不含任何来源判据（llm_handled/native_punctuated）/（LLM 翻译），
-                    //    对 6 个产出源一视同仁，将来新增产出源自动受控。
-                    // PUNCT-GOVERNANCE-030-E：判定逻辑已抽为纯函数 apply_l2_postprocess
-                    //   （src/punctuation/mod.rs，可单测）；本侧只保留日志（日志方案 C：
-                    //   按 L2Action 分支打对应文案，且沿用「输出变化才打」的 != 判定）。
-                    let (l2_text, l2_action) = punctuation::apply_l2_postprocess(
-                        &final_text,
-                        config.punctuation.enabled,
-                        config.punctuation.strip_trailing,
-                    );
-                    match l2_action {
-                        punctuation::L2Action::StripAll => {
-                            if l2_text != final_text {
-                                log::info!(
-                                    "Stripped native punctuation (auto_punct=false): '{}' -> '{}'",
-                                    final_text,
-                                    l2_text
-                                );
-                            }
-                        }
-                        punctuation::L2Action::StripTrailing => {
-                            if l2_text != final_text {
-                                log::info!(
-                                    "Stripped trailing punctuation (<=5 units): '{}' -> '{}'",
-                                    final_text,
-                                    l2_text
-                                );
-                            }
-                        }
-                        punctuation::L2Action::NoOp => {}
-                    }
-                    let final_text = l2_text;
-                    if cancel_signal.load(Ordering::Relaxed) {
-                        send_event(event_tx, PipelineEvent::Cancelled);
-                        return;
-                    }
-                    // STATS-475：最终文字产出（上屏或失焦预览）即记一条；写库丢后台线程，不挡上屏。
-                    if !final_text.trim().is_empty() {
-                        let stats_text = final_text.clone();
-                        std::thread::spawn(move || {
-                            // STATS-480：时长 = 有效语音（VAD 去静音）；VAD 不可用退回整段长度。
-                            let speech_ms = transcription::effective_speech_ms(&usage.audio)
-                                .unwrap_or_else(|| speech_ms_16k(usage.audio.len()));
-                            if let Err(e) = usage_stats::record(
-                                usage.category,
-                                speech_ms,
-                                &stats_text,
-                                llm_calls,
-                            ) {
-                                log::warn!("STATS-475: usage record failed: {}", e);
-                            }
-                        });
-                    }
-                    let current_id = platform::foreground_window_id();
-                    let focus_lost = target_hwnd != 0 && current_id != target_hwnd;
-                    log::info!(
-                        "Injecting text: '{}', focus_lost={}, target_hwnd={}, current_id={}",
-                        final_text,
-                        focus_lost,
-                        target_hwnd,
-                        current_id
-                    );
-                    if focus_lost {
-                        log::info!("Focus lost, showing preview");
-                        send_event(event_tx, PipelineEvent::FocusLost(final_text));
-                    } else {
-                        log::info!("Injecting text...");
-                        if let Err(e) = platform::inject_text(
-                            &final_text,
-                            config.injection.use_clipboard,
-                            config.injection.clipboard_delay_ms,
-                        ) {
-                            log::error!("Injection failed: {}", e);
-                        } else {
-                            log::info!("Injection completed successfully");
-                            // FIX-PREVIEW-HARVEST-380（B）：松键(stop) → 最终上屏的时延。
-                            // 🔴 run_pipeline_core 是平台中立共享代码，只有 Windows 有该埋点
-                            //（macOS 无 hook tick，结论「不适用」）。
-                            #[cfg(target_os = "windows")]
-                            {
-                                if log::log_enabled!(log::Level::Debug) {
-                                    let stop_tick = STOP_RECEIVED_TICK.load(Ordering::Acquire);
-                                    if stop_tick != 0 {
-                                        log::debug!(
-                                            "[LocalRT-DBG-380] stop_to_inject_ms={}",
-                                            (unsafe { GetTickCount64() } as u32)
-                                                .wrapping_sub(stop_tick as u32)
-                                        );
-                                    }
-                                }
-                            }
-                            // WORDBOOK-HITCOUNT-263: 上屏后用**最终文本**记词频（仅使用 hotwords
-                            // 的 accuracy 引擎档位：Accuracy / LocalRealtime）。放在注入成功之后，
-                            // 不挡输入法延迟；用 final_text 而非 raw_text（常说但常认错的词最该占额度）。
-                            if transcription::AsrModel::from_config(&config.audio.asr_model)
-                                .uses_accuracy_engine()
-                            {
-                                // WORDBOOK-HITCOUNT-263（主控增补）：写库丢**后台线程**，
-                                // 绝不挡住 worker 回到待命。db.rs BUSY_TIMEOUT_MS=3000，若与设置
-                                // 界面读并发撞 SQLITE_BUSY 最坏同步卡 3s（用户感受：连续说话时第二次
-                                // 按热键没反应）。统计丢一次无所谓，故 fire-and-forget、失败仅记日志。
-                                let hit_text = final_text.clone();
-                                std::thread::spawn(move || {
-                                    match wordbook::db::record_hits(&hit_text) {
-                                        Ok(n) if n > 0 => log::info!(
-                                            "WORDBOOK-HITCOUNT-263: recorded {} word hits",
-                                            n
-                                        ),
-                                        Ok(_) => {}
-                                        Err(e) => log::warn!(
-                                            "WORDBOOK-HITCOUNT-263: record_hits failed: {}",
-                                            e
-                                        ),
-                                    }
-                                });
-                            }
-                        }
-                        send_event(event_tx, PipelineEvent::Done);
-                        // FORMAT-LLM-001-CORE (DEC-031-③): LLM 格式化失败 → 注入兜底原文后
-                        // 发 FormatFailed overlay 提示（2500ms），让用户知道检查 LLM 配置。
-                        if format_failed {
-                            send_event(event_tx, PipelineEvent::FormatFailed);
-                        }
-                    }
-                }
+                log::warn!("STATS-475: usage record failed: {}", e);
             }
-        }
+        });
     }
-}
-
-/// PUNCT-478（DEC-108，Gavin 10-04 端测「……差异，但是。根本的法则……」）：在线识别服务按停顿断句，
-/// 在句间接缝自动收句末标点，而那里话没说完。去掉服务端在接缝处加的句读标点，用本地标点模型
-/// （中英 CT / 日韩 jako）按接缝前后文重判（逗号 / 句号 / 不加）；其余位置标点与最后一句句末不动。
-/// 没有标点引擎（用户关了自动标点）⇒ 原样返回（后面 L2 节点本就会去标点）。
-fn repair_online_seams(
-    text: &str,
-    seams: &[usize],
-    engine: Option<&mut punctuation::PunctuationEngine>,
-) -> String {
-    let Some(engine) = engine else {
-        return text.to_string();
-    };
-    repair_seams_with(text, seams, |ctx| {
-        if punctuation::ct_unsupported_script(ctx) {
-            punctuation::jako::punctuate(ctx)
+    let current_id = platform::foreground_window_id();
+    let focus_lost = target_hwnd != 0 && current_id != target_hwnd;
+    log::info!(
+        "Injecting text: '{}', focus_lost={}, target_hwnd={}, current_id={}",
+        final_text,
+        focus_lost,
+        target_hwnd,
+        current_id
+    );
+    if focus_lost {
+        log::info!("Focus lost, showing preview");
+        send_event(event_tx, PipelineEvent::FocusLost(final_text));
+    } else {
+        log::info!("Injecting text...");
+        if let Err(e) = platform::inject_text(
+            &final_text,
+            config.injection.use_clipboard,
+            config.injection.clipboard_delay_ms,
+        ) {
+            log::error!("Injection failed: {}", e);
         } else {
-            engine.add_punctuation(ctx)
-        }
-    })
-}
-
-/// PUNCT-478：接缝重判主体（`punctuate` = 给一段上下文整段打标点；测试可注入假模型）。
-fn repair_seams_with(
-    text: &str,
-    seams: &[usize],
-    mut punctuate: impl FnMut(&str) -> Option<String>,
-) -> String {
-    let mut out = String::with_capacity(text.len() + 8);
-    let mut last = 0usize;
-    for &seam in seams {
-        if seam <= last || seam >= text.len() || !text.is_char_boundary(seam) {
-            continue;
-        }
-        let left = &text[last..seam];
-        let core = left.trim_end_matches(punctuation::is_seam_mark);
-        let original = &left[core.len()..];
-        out.push_str(core);
-        let right = &text[seam..];
-        let judged = punctuation::judge_seam(&out, right, &mut punctuate);
-        match judged {
-            Some(marks) => {
-                // 英文两词之间去掉句号后补一个空格，免得粘成一个词。
-                if marks.is_empty()
-                    && core
-                        .chars()
-                        .last()
-                        .is_some_and(|c| c.is_ascii_alphanumeric())
-                    && right
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_ascii_alphanumeric())
-                {
-                    out.push(' ');
+            log::info!("Injection completed successfully");
+            // FIX-PREVIEW-HARVEST-380（B）：松键(stop) → 最终上屏的时延。
+            // 🔴 run_pipeline_core 是平台中立共享代码，只有 Windows 有该埋点
+            //（macOS 无 hook tick，结论「不适用」）。
+            #[cfg(target_os = "windows")]
+            {
+                if log::log_enabled!(log::Level::Debug) {
+                    let stop_tick = STOP_RECEIVED_TICK.load(Ordering::Acquire);
+                    if stop_tick != 0 {
+                        log::debug!(
+                            "[LocalRT-DBG-380] stop_to_inject_ms={}",
+                            (unsafe { GetTickCount64() } as u32).wrapping_sub(stop_tick as u32)
+                        );
+                    }
                 }
-                if marks != original {
-                    log::info!("PUNCT-478: online seam {original:?} -> {marks:?}");
-                }
-                out.push_str(&marks);
             }
-            None => out.push_str(original),
+            // FLASH-P3-A：WORDBOOK-HITCOUNT-263 上屏后记词频只服务本地精解档（Accuracy / LocalRealtime 的热词排序），
+            // 随本地引擎删除；连 flashasr 的词库命中回传属 P3-B。
         }
-        last = seam;
+        send_event(event_tx, PipelineEvent::Done);
+        // FORMAT-LLM-001-CORE (DEC-031-③): LLM 格式化失败 → 注入兜底原文后
+        // 发 FormatFailed overlay 提示（2500ms），让用户知道检查 LLM 配置。
+        if format_failed {
+            send_event(event_tx, PipelineEvent::FormatFailed);
+        }
     }
-    out.push_str(&text[last..]);
-    out
 }
 
 /// PIPELINE-ORCH-238-B: N6 LLM 格式化 / 翻译整段（原 run_pipeline_core 内联块）。
@@ -15699,27 +9278,14 @@ struct LlmStageOutput {
 #[derive(Debug, Clone)]
 struct UsageSource {
     category: usage_stats::UsageCategory,
-    /// 本次录音（16k）。STATS-480：时长按其中**有效语音**（VAD 去静音）统计，在后台统计线程里算。
-    audio: Arc<Vec<f32>>,
+    /// FLASH-P3-A：本次送出的整段音频时长（毫秒）。原 STATS-480 用本地 VAD 去静音算「有效语音」，
+    /// 输入法不再带 VAD 模型 ⇒ 改为整段时长（口径变化：含按住不说话的静音）。
+    speech_ms: u64,
 }
 
 /// STATS-475：16kHz 样本数 → 毫秒。
 fn speech_ms_16k(samples: usize) -> u64 {
     samples as u64 * 1000 / 16_000
-}
-
-/// STATS-475：实际运行的识别引擎 → 「我的」页分项（旧 Accuracy 已迁移为 Performance，同记本地快速）。
-fn usage_category(model: transcription::AsrModel) -> usage_stats::UsageCategory {
-    match model {
-        transcription::AsrModel::Performance | transcription::AsrModel::Accuracy => {
-            usage_stats::UsageCategory::LocalFast
-        }
-        // ASR-SERVER-491 S8：连自家识别服务也是联网识别，记在线项。
-        transcription::AsrModel::QwenAudioOnline
-        | transcription::AsrModel::FunAsrRealtime
-        | transcription::AsrModel::FeiyinServer => usage_stats::UsageCategory::OnlineAsr,
-        transcription::AsrModel::LocalRealtime => usage_stats::UsageCategory::LocalStreaming,
-    }
 }
 
 /// 执行 LLM 格式化 / 翻译阶段，返回文本与两条状态位。
@@ -15737,8 +9303,6 @@ fn run_llm_stage(
     send_window_title: bool,
     translate_requested: bool,
     derived_target: config::TranslationLanguage,
-    cached_translation: &mut Option<(config::TranslationLanguage, translation::TranslationEngine)>,
-    model_dir: &Path,
 ) -> LlmStageOutput {
     let mut llm_handled = false;
     // FORMAT-LLM-001-CORE (DEC-031): set when LLM formatting call
@@ -15753,78 +9317,53 @@ fn run_llm_stage(
             event_tx,
             PipelineEvent::Processing(processing_msg.to_string()),
         );
-        // REFACTOR-SHARE-TRANSDIR-001: function moved to translation/mod.rs (platform-neutral)
-        // MEM-453：只在真要走本地 NLLB 时才取引擎（首次即加载）；在线 LLM 翻译成功则不加载。
-        let mut nllb_translate = |text: &str| {
-            try_nllb_translate(
-                text,
-                translation::ensure_translation_direction(
-                    cached_translation,
-                    &model_dir,
-                    derived_target,
-                ),
-            )
-        };
         let script_instruction = text_normalizer::script_instruction_for_translate(
-            &raw_text,
+            raw_text,
             config.audio.chinese_script,
         );
-        // TRANS-SAFE-196: 三条子路径（LLM 成功 / LLM 失败转 NLLB / LLM 不合格直接
-        // 走 NLLB，后两者各自还带 normalize_text_for_language 兜底）先汇合到
-        // translated_out，再由下方统一做格式安全裁决 —— 一处覆盖全部子路径，
-        // 避免逐路径打补丁时漏掉其中一条。
-        let translated_out =
-            if should_try_llm_translate(config.llm.enabled, config.llm.connectivity_verified) {
-                llm_calls += 1;
-                // B: LLM optimization failed (non-critical), continue with raw result
-                match rt.block_on(llm_client.optimize_and_translate(
-                    &pre_llm_text,
-                    derived_target,
-                    script_instruction,
-                    config.punctuation.enabled,
-                    // TRANS-SCENE-197: 这两个参数此前没传 —— scene_context / send_window_title
-                    // 就在同作用域（:8717/:8718）且主路径 optimize 一直在用，翻译路径漏传，
-                    // 导致场景风格（含 VERBOSE-195 冗余压缩）与用户基座一开翻译就全部失效。
-                    Some(&scene_context),
-                    send_window_title,
-                    multiline_safe,
-                )) {
-                    Ok(result) => {
-                        log::info!("LLM optimize+translate done: {}", result.text);
-                        learn_llm_suggestions(&result.suggestions, runtime_config);
-                        llm_handled = true;
-                        result.text
-                    }
-                    Err(e) => {
-                        log::warn!("LLM optimize+translate failed, trying offline: {}", e);
-                        nllb_translate(&pre_llm_text).unwrap_or_else(|| {
-                            text_normalizer::normalize_text_for_language(
-                                &pre_llm_text,
-                                config.audio.chinese_script,
-                            )
-                        })
-                    }
+        // FLASH-P3-A（DEC-114 10-30：直连翻译只走大模型）：离线 NLLB / opus-mt 回退删除。
+        // 没开大模型（或未验证连通）/ 大模型失败 ⇒ **不出译文**，输出原文（经同一份简繁规整）并记日志。
+        let translated_out = if should_try_llm_translate(
+            config.llm.enabled,
+            config.llm.connectivity_verified,
+        ) {
+            llm_calls += 1;
+            match rt.block_on(llm_client.optimize_and_translate(
+                pre_llm_text,
+                derived_target,
+                script_instruction,
+                config.punctuation.enabled,
+                // TRANS-SCENE-197: 场景风格与用户基座在翻译路径同样生效。
+                Some(scene_context),
+                send_window_title,
+                multiline_safe,
+            )) {
+                Ok(result) => {
+                    log::info!("LLM optimize+translate done: {}", result.text);
+                    learn_llm_suggestions(&result.suggestions, runtime_config);
+                    llm_handled = true;
+                    result.text
                 }
-            } else {
-                // LLM not eligible, use offline engine directly
-                nllb_translate(&pre_llm_text).unwrap_or_else(|| {
+                Err(e) => {
+                    log::warn!(
+                            "LLM optimize+translate failed, no offline fallback (P3-A), outputting original text: {}",
+                            e
+                        );
                     text_normalizer::normalize_text_for_language(
-                        &pre_llm_text,
+                        pre_llm_text,
                         config.audio.chinese_script,
                     )
-                })
-            };
-        // TRANS-SAFE-196 格式安全裁决 —— 补齐翻译路径此前完全缺失的 multiline_safe 保护。
-        // 主路径在 llm::try_once 内做同款裁决，翻译路径走 try_once_raw 直接返回，
-        // 整个绕过（llm/mod.rs 内「注：translate 路径不通过 try_once……不受影响」即指此）。
-        // 后果：multiline_safe=false 的终端 / vim 等，翻译产生的多行结果换行原样注入，
-        // 在模态编辑器里会被当命令键执行（scene-rules.toml 对 vim/gvim 的注释已警示该风险）。
-        //
+                }
+            }
+        } else {
+            log::warn!(
+                    "Translation requested but LLM not enabled/verified, no offline fallback (P3-A), outputting original text"
+                );
+            text_normalizer::normalize_text_for_language(pre_llm_text, config.audio.chinese_script)
+        };
+        // TRANS-SAFE-196 格式安全裁决 —— 翻译路径的 multiline_safe 保护（汇合后统一裁决，覆盖全部子路径）。
         // 🔴 只照搬 flatten 分支，刻意不照搬主路径 multiline_safe=true 那侧的
-        // strip_fabricated_email_lines：该守卫用 input_contains_line 拿「输出行」去
-        // 「输入原文」做字面包含匹配，翻译场景输入输出跨语言 ⇒ 字面永不匹配 ⇒ 判定条件
-        // 恒真 ⇒ 用户真说了的称呼反被当成 LLM 编造删掉。与 llm/mod.rs 既有判例
-        // 「判据 B 不扩展到翻译路径（英译中可合法大幅压缩，15% 会误伤）」同源。
+        // strip_fabricated_email_lines（跨语言字面匹配恒不中，会误删真称呼）。
         if multiline_safe {
             translated_out.trim().to_string()
         } else {
@@ -15837,13 +9376,13 @@ fn run_llm_stage(
             PipelineEvent::Processing(processing_msg.to_string()),
         );
         let script_instruction =
-            text_normalizer::script_instruction(&raw_text, config.audio.chinese_script);
+            text_normalizer::script_instruction(raw_text, config.audio.chinese_script);
         llm_calls += 1;
         let llm_result = rt.block_on(llm_client.optimize(
-            &pre_llm_text,
+            pre_llm_text,
             script_instruction,
             config.punctuation.enabled,
-            Some(&scene_context),
+            Some(scene_context),
             multiline_safe,
             send_window_title,
         ));
@@ -15853,16 +9392,14 @@ fn run_llm_stage(
                 learn_llm_suggestions(&result.suggestions, runtime_config);
                 llm_handled = true;
                 // FMT-LLM-005: LLM 成功路径用 normalize_script_only（仅简繁，不动大小写）。
-                // LLM 输出大小写是正确意图（如"Dear Mr. Wang,"），fix_asr_english_case 会打回小写破坏。
                 text_normalizer::normalize_script_only(&result.text, config.audio.chinese_script)
             }
             Err(e) => {
                 log::warn!("LLM optimization error: {}", e);
                 format_failed = true;
-                // ITN-V2-001 (R1)：兜底用主通道产物（已含数字转换），
-                // 与 DEC-035 之前行为一致（属改进）。
+                // ITN-V2-001 (R1)：兜底用主通道产物。
                 text_normalizer::normalize_text_for_language(
-                    &pre_llm_text,
+                    pre_llm_text,
                     config.audio.chinese_script,
                 )
             }
@@ -15870,7 +9407,7 @@ fn run_llm_stage(
     } else {
         // LLM optimization skipped
         log::info!("LLM disabled or text empty, using transcription result directly");
-        text_normalizer::normalize_text_for_language(&pre_llm_text, config.audio.chinese_script)
+        text_normalizer::normalize_text_for_language(pre_llm_text, config.audio.chinese_script)
     };
 
     LlmStageOutput {
@@ -15920,90 +9457,6 @@ fn capture_pipeline_scene(
     );
     scene_context
 }
-/// PUNCT-INTEGRATION-001 + ASR-PUNCT-OPT-001: 本地标点决策（加标点）。
-/// 条件：auto_punct=true && LLM 未处理 && 非翻译 && 非 native 自带标点。
-/// - native_punctuated=true（accuracy native 成功）→ 跳过标点引擎（省一次推理）
-/// - native_punctuated=false（performance/兜底/混合）→ 照常走标点引擎
-/// - 本函数只负责「加标点」；「剥离」职责在下游 L2 后处理补位块
-///   （PUNCT-GOVERNANCE-030-A），对全部产出源一视同仁，无来源判据。
-/// PIPELINE-ORCH-238: 从 run_pipeline_core 内联块原样提取，行为逐位不变。
-fn apply_local_punctuation(
-    final_text: String,
-    enabled: bool,
-    llm_handled: bool,
-    translate_requested: bool,
-    native_punctuated: bool,
-    engine: Option<&mut punctuation::PunctuationEngine>,
-) -> String {
-    if enabled && !llm_handled && !translate_requested && !native_punctuated {
-        // KOJA-PUNCT-464：含日文假名 / 韩文 ⇒ 不送 CT（中英词表，韩文空格会被吃光、日文只补句末「。」）。
-        // PUNCT-JAKO-466（Gavin 10-03，含 performance 档）：改用日韩专用标点（首次遇到日韩文才加载）；
-        // 模型不可用 / 出错 ⇒ 原样保留。中英文逐位不变（仍走下方 CT）。
-        if punctuation::ct_unsupported_script(&final_text) {
-            log::info!("Local punctuation skipped: ja/ko text not supported by punctuation model");
-            return match punctuation::jako::punctuate(&final_text) {
-                Some(punctuated) => {
-                    log::info!(
-                        "Local ja/ko punctuation applied: '{}' -> '{}'",
-                        final_text,
-                        punctuated
-                    );
-                    punctuated
-                }
-                None => final_text,
-            };
-        }
-        if let Some(engine) = engine {
-            match engine.add_punctuation(&final_text) {
-                Some(punctuated) => {
-                    log::info!(
-                        "Local punctuation applied: '{}' -> '{}'",
-                        final_text,
-                        punctuated
-                    );
-                    punctuated
-                }
-                None => {
-                    log::warn!("Local punctuation returned None, keeping original text");
-                    final_text
-                }
-            }
-        } else {
-            log::debug!("Punctuation engine not available, skipping");
-            final_text
-        }
-    } else {
-        final_text
-    }
-}
-/// PUNCT-FINAL-REDO-350：标点剥离**节点**（独立、管线无关、谁要谁挂）。
-///
-/// 形态照 [`apply_filler_strip`]（自由函数、显式传参、管线无关）；判定体是
-/// `punctuation::strip_effective_punctuation`（可单测的纯函数）。
-/// 🔴 **只挂本地 realtime 一条管线**（Gavin 2026-09-22 细化设计），在线 realtime 与
-/// 本地离线**不挂**，序列一字不变 ⇒ 结构上不可能受影响（DEC-066：节点各自编排、谁要谁挂）。
-///
-/// 语义：把整段已有标点剥光，交给下游**既有的**标点节点（`apply_local_punctuation`）
-/// 全量重打。剥光后 `native_punctuated` 恒 false ⇒ 下游 `!native_punctuated` 门自己放行；
-/// 而该门本身**一行都不改**，`PUNCT-DOUBLE-334` 对其它两档的保护原样保留。
-/// 先剥光 ⇒ 进引擎的文本无标点 ⇒ 结构上不可能再出现 `。。`/`，。` 叠加。
-///
-/// - `enabled == false` ⇒ **原样返回**（用户关闭标点：本节点无意义，下游 L2 会全文剥）
-/// - `enabled == true`  ⇒ `strip_effective_punctuation(&final_text)`
-///
-/// ⚠️ 仅在「下游必定重打标点」时才可挂：见调用点关于 `!translate_requested` 的门注释。
-/// 变化时打一行 `log::info!`（与 [`apply_local_punctuation`] / [`apply_filler_strip`] 同风格）。
-fn strip_punctuation_node(final_text: String, enabled: bool) -> String {
-    if !enabled {
-        return final_text;
-    }
-    let stripped = punctuation::strip_effective_punctuation(&final_text);
-    if stripped != final_text {
-        log::info!("Punctuation strip node: '{}' -> '{}'", final_text, stripped);
-    }
-    stripped
-}
-
 /// FORMAT-FALLBACK-303：本地免费口水词过滤节点（**管线无关**，谁要谁挂）。
 ///
 /// 仅在 LLM **未接手**时执行：开了 LLM 时 F1 Filler Removal 做得比规则层好，
@@ -16020,46 +9473,6 @@ fn apply_filler_strip(final_text: String, enabled: bool) -> String {
     let stripped = text_normalizer::strip_fillers_conservative(&final_text);
     if stripped != final_text {
         log::info!("Filler strip applied: '{}' -> '{}'", final_text, stripped);
-    }
-    stripped
-}
-
-/// REFLOW-FILLER-ONCE-441：权威文本的口水词去重（本地实时**唯一**的去重过路点）。
-///
-/// 本地实时只过一遍（Gavin 2026-09-26）：在「逐窗对齐之后的权威全文」上执行，
-/// 同一份纯函数同时供两处合成用 —— ① 回灌刷新预览（`PreviewReflow.acc_text`，回灌**前**已去重）
-/// ② 松键后的最终文本 `acc_joined = committed + last_window`（与最后一条回灌同源，
-/// `OrderedReflow` 的 `push` 产出与 `finish()` 同为 `committed + last_window_text`
-/// ⇒ 预览显示与最终上屏取同一份已去重文本），`run_pipeline_core` 最终节点对本地实时
-/// 不再重复去重（DEC-066 显式节点编排，见 `FinalFillerNode`）。
-///
-/// 🔴 不得在「逐窗对齐之前」对单窗文本调用（会改 436 锚点 / 433 裁判的输入）；
-/// `committed_len` 是**流式**文本坐标，与精解文本长度无关 ⇒ 精解段变短不影响
-/// `streaming[committed_len..]` 尾巴拼接（单测 `dedup_shortening_keeps_streaming_tail`）。
-///
-/// 耗时：整段权威文本每次回灌都过一遍 ⇒ Debug 级打 `[DBG-441] filler once: chars=… ms=…`
-/// （`log_enabled!` 守卫，生产 info 级零开销）。
-/// REFLOW-FILLER-ONCE-441：口水词去重节点位置（调用方管线显式声明，DEC-066）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FinalFillerNode {
-    /// 在 `run_pipeline_core` 最终节点去重（在线 / 批处理 / 本地实时退回 2pass）。
-    AtFinal,
-    /// 本地实时已在回灌前对权威文本去过一遍，最终节点不再重复。
-    DoneUpstream,
-}
-
-fn apply_authoritative_filler_dedup(text: &str) -> String {
-    let t0 = std::time::Instant::now();
-    let stripped = text_normalizer::strip_fillers_conservative(text);
-    if log::log_enabled!(log::Level::Debug) {
-        log::debug!(
-            "[DBG-441] filler once: chars={} ms={:.3}",
-            text.chars().count(),
-            t0.elapsed().as_secs_f64() * 1000.0
-        );
-    }
-    if stripped != text {
-        log::info!("Authoritative filler dedup: '{}' -> '{}'", text, stripped);
     }
     stripped
 }
@@ -16096,140 +9509,9 @@ mod filler_strip_303_tests {
         assert_eq!(apply_filler_strip(input.clone(), true), input);
     }
 }
-#[cfg(test)]
-mod reflow_filler_once_441_tests {
-    use super::{apply_authoritative_filler_dedup, apply_filler_strip, reflow_preview};
-
-    fn prod_src() -> String {
-        let src = crate::MAIN_RS_SRC;
-        let cut = src
-            .find(concat!("mod reflow_filler_once_441", "_tests"))
-            .unwrap_or(src.len());
-        src[..cut].to_string()
-    }
-
-    /// ① 回灌前去重生效：规则 C 整段重复、规则 D 说一半重说都在权威文本上去掉。
-    #[test]
-    fn t441_dedup_applies_to_authoritative_text() {
-        assert_eq!(
-            apply_authoritative_filler_dedup("我们明天去公园，我们明天去公园。"),
-            "我们明天去公园。"
-        );
-        assert_eq!(
-            apply_authoritative_filler_dedup(
-                "你们的知，你们的知识不可能只在简单的仪式就变得完整。"
-            ),
-            "你们的知识不可能只在简单的仪式就变得完整。"
-        );
-    }
-
-    /// ② 预览权威部分与最终文本同一份：同一纯函数、同一输入 ⇒ 逐字相同；且再过一遍不变（幂等）。
-    #[test]
-    fn t441_preview_and_final_same_text() {
-        let authoritative = "你们的知，你们的知识。我觉得，我觉得可以";
-        let preview_acc = apply_authoritative_filler_dedup(authoritative);
-        let final_src = apply_authoritative_filler_dedup(authoritative);
-        assert_eq!(preview_acc, final_src);
-        assert_eq!(apply_authoritative_filler_dedup(&final_src), final_src);
-    }
-
-    /// ③ 最终节点：`DoneUpstream` ⇒ 不再去重（传 enabled=false 原样返回）；`AtFinal` ⇒ 照常。
-    #[test]
-    fn t441_final_node_gated_by_declaration() {
-        let prod = prod_src();
-        assert!(
-            prod.contains(concat!(
-                "!llm_handled && filler_node == ",
-                "FinalFillerNode::AtFinal"
-            )),
-            "最终去重节点必须按管线声明的 filler_node 门控"
-        );
-        let t = "我们明天去公园，我们明天去公园。".to_string();
-        assert_eq!(apply_filler_strip(t.clone(), false), t);
-        assert_eq!(apply_filler_strip(t, true), "我们明天去公园。");
-    }
-
-    /// ④ 管线隔离：在线 / 批处理两处调用声明 `AtFinal`；本地实时按是否用了去重后的精解文本声明。
-    #[test]
-    fn t441_pipeline_declarations() {
-        let prod = prod_src();
-        assert_eq!(
-            prod.matches(concat!("FinalFillerNode::AtFinal, // 441：", "在线路径"))
-                .count(),
-            1
-        );
-        assert_eq!(
-            prod.matches(concat!("FinalFillerNode::AtFinal, // 441：", "批处理路径"))
-                .count(),
-            1
-        );
-        assert!(prod.contains(concat!("FinalFillerNode::", "DoneUpstream\n")));
-        assert!(prod.contains(concat!(
-            "let final_src_deduped = apply_authoritative",
-            "_filler_dedup("
-        )));
-        assert!(prod.contains(concat!(
-            "apply_authoritative_filler_dedup(&",
-            "authoritative)"
-        )));
-    }
-
-    /// ⑤ 精解段变短不影响流式尾巴：`committed_len` 是流式坐标 ⇒ 尾巴不多字不丢字。
-    #[test]
-    fn t441_dedup_shortening_keeps_streaming_tail() {
-        let streaming = "你们的知你们的知识不可能只在简单的仪式";
-        let committed_len = 9; // 精解已覆盖流式前 9 字
-        let acc = apply_authoritative_filler_dedup("你们的知，你们的知识");
-        assert_eq!(acc, "你们的知识");
-        assert_eq!(
-            reflow_preview(&acc, streaming, committed_len),
-            "你们的知识不可能只在简单的仪式"
-        );
-    }
-
-    /// 耗时：~1500 字长文本一次去重（300s 级录音的量级），结果写进交付记录。
-    #[test]
-    fn t441_long_text_cost() {
-        let unit = "今天天气很好，我们一起去公园散步，然后你们的知，你们的知识会增加。";
-        let text: String = unit.repeat(1500 / unit.chars().count() + 1);
-        let t0 = std::time::Instant::now();
-        let _ = apply_authoritative_filler_dedup(&text);
-        let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("[T441] chars={} ms={:.3}", text.chars().count(), ms);
-        assert!(ms < 200.0, "1500 字去重耗时 {ms:.1}ms 过长");
-    }
-}
-
 // MACOS-P4-NEUTRAL-001: 原 #[cfg(target_os = "windows")] 去除——平台中立纯 Rust，run_pipeline_core 调用，对 Windows 为 no-op。
 fn should_try_llm_translate(llm_enabled: bool, connectivity_verified: bool) -> bool {
     llm_enabled && connectivity_verified
-}
-/// LANG-AUTO-001: 翻译方向按内容（contains_han）判定，不依赖 transcription_language 配置。
-/// - target=English → 含汉字才需翻译；纯英文文本无需翻译。
-/// - target=Chinese → 不含汉字才需翻译；纯英文文本需翻译。
-// MACOS-P4-NEUTRAL-001: 原 #[cfg(target_os = "windows")] 去除——平台中立纯 Rust，run_pipeline_core 调用，对 Windows 为 no-op。
-fn try_nllb_translate(
-    text: &str,
-    engine: Option<&translation::TranslationEngine>,
-) -> Option<String> {
-    let Some(engine) = engine else {
-        log::info!("NLLB translation skipped: offline engine unavailable");
-        return None;
-    };
-    match engine.translate(text) {
-        Ok(translated) if !translated.trim().is_empty() => {
-            log::info!("NLLB translation done: {}", translated);
-            Some(translated)
-        }
-        Ok(_) => {
-            log::warn!("NLLB translation returned empty text");
-            None
-        }
-        Err(err) => {
-            log::warn!("NLLB translation failed: {}", err);
-            None
-        }
-    }
 }
 #[cfg(all(test, target_os = "windows"))]
 mod pipeline_logic_tests {
@@ -16241,34 +9523,6 @@ mod pipeline_logic_tests {
         assert!(!should_try_llm_translate(true, false));
         assert!(!should_try_llm_translate(false, true));
         assert!(!should_try_llm_translate(false, false));
-    }
-
-    // ============================================================
-    // MEM-453：NLLB 翻译引擎只在真正走本地翻译时加载（不预加载）
-    // ============================================================
-
-    /// 源码护栏：worker 启动 / 配置热重载都不得再直接加载 NLLB（600MB 常驻、CT2 析构死锁不可释放），
-    /// 本地翻译统一经 `ensure_translation_direction` 懒加载，且只在 NLLB 路径（LLM 不可用或失败）被调用。
-    #[test]
-    fn mem453_translation_engine_lazy_loaded() {
-        let src = crate::MAIN_RS_SRC;
-        let body: String = src
-            .split("mod pipeline_logic_tests {")
-            .next()
-            .unwrap()
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        assert!(
-            !body.contains("TranslationEngine::load_for_direction("),
-            "main.rs 不得再预加载 NLLB"
-        );
-        assert_eq!(
-            body.matches("letmutnllb_translate=|text:&str|{try_nllb_translate(text,translation::ensure_translation_direction(").count(),
-            1,
-            "本地翻译须经懒加载闭包"
-        );
-        assert_eq!(body.matches("nllb_translate(&pre_llm_text)").count(), 2);
     }
 }
 fn learn_llm_suggestions(
@@ -16352,7 +9606,6 @@ mod rustls_provider_tests {
 
 #[cfg(test)]
 mod overlay_shimmer_tests {
-    use super::find_speech_onset_with_backtrack;
     #[test]
     fn shimmer_triangle_wave_midpoint() {
         let phase: f32 = 0.5;
@@ -16524,114 +9777,6 @@ mod overlay_shimmer_tests {
         );
         assert_eq!(circ_size, 18, "circ_size must be 18px after ENLARGE-001");
     }
-
-    #[test]
-    fn asr_silence_head_prepended() {
-        // ASR-CTC-OPT-001 P1: run_pipeline prepends 0 zero-samples (0ms@16kHz)
-        // for performance (CTC). Offline models don't need frame alignment padding.
-        // ASR-ACC-OPT-001: accuracy also uses 0ms head.
-        let silence_head_len: usize = 0;
-        let original_samples: usize = 3200;
-        let mut padded = Vec::with_capacity(silence_head_len + original_samples);
-        padded.resize(silence_head_len, 0.0f32);
-        padded.extend_from_slice(&vec![1.0f32; original_samples]);
-        assert_eq!(
-            padded.len(),
-            silence_head_len + original_samples,
-            "Padded length must be silence_head + original"
-        );
-        if silence_head_len > 0 {
-            assert!(
-                padded.iter().take(silence_head_len).all(|&s| s == 0.0),
-                "First {} samples must be silence (zero)",
-                silence_head_len
-            );
-        }
-        assert_eq!(
-            padded[silence_head_len], 1.0,
-            "Original audio must begin after silence head"
-        );
-    }
-
-    #[test]
-    fn asr_silence_head_is_0ms_at_16khz() {
-        // ASR-CTC-OPT-001 P1: 0 samples = 0ms @ 16kHz (performance/CTC)
-        // 原 50ms (800 samples) 是旧 SenseVoice 遗产，研究 C1 证实 0ms 高 2.5pp
-        let sample_rate: u32 = 16000;
-        let silence_head: usize = 0;
-        let duration_ms = (silence_head as f64 / sample_rate as f64) * 1000.0;
-        assert!(
-            (duration_ms - 0.0).abs() < 1.0,
-            "0 samples at 16kHz must be ~0ms (got {:.1}ms)",
-            duration_ms
-        );
-    }
-
-    #[test]
-    fn speech_onset_with_backtrack_trims_leading_silence() {
-        // FIRSTCHAR-FIX-006 (R3): find_speech_onset_with_backtrack trims silence
-        // before the speech onset while preserving 200ms backtrack margin.
-        // Construct: 4800-sample silence + 3200-sample speech = 8000 total @ 16kHz
-        let mut samples = vec![0.0f32; 8000];
-        for i in 4800..8000 {
-            samples[i] = 0.1;
-        }
-        // Energy onset at ~4800, backtrack 3200 (200ms) → keep_start = 1600
-        let keep_start = find_speech_onset_with_backtrack(&samples, 0.008, 3200);
-        assert_eq!(
-            keep_start, 1600,
-            "should trim silence before backtrack margin, got {}",
-            keep_start
-        );
-        // Verify speech is preserved
-        assert!(
-            samples[keep_start..].iter().any(|&s| s > 0.05),
-            "speech must be present after trimming"
-        );
-    }
-
-    #[test]
-    fn speech_onset_with_backtrack_preserves_aspirated_consonant() {
-        // FIRSTCHAR-FIX-006 (R3): weak consonant at onset must not be trimmed.
-        // Simulate: silence → weak breath (aspirated consonant ~100ms) → strong vowel
-        let mut samples = vec![0.0f32; 9600]; // 600ms @ 16kHz
-                                              // Weak breath from sample 3200–4800 (100ms of low-energy consonant)
-        for i in 3200..4800 {
-            samples[i] = 0.005; // below threshold 0.008 — aspirated consonant is very quiet
-        }
-        // Strong vowel from sample 4800 onward
-        for i in 4800..9600 {
-            samples[i] = 0.1;
-        }
-        // Energy onset should detect at ~4800 (strong vowel), backtrack 3200 → keep_start = 1600
-        let keep_start = find_speech_onset_with_backtrack(&samples, 0.008, 3200);
-        assert!(
-            keep_start <= 3200,
-            "keep_start must include weak breath consonant, got {} (consonant starts at 3200)",
-            keep_start
-        );
-    }
-
-    #[test]
-    fn speech_onset_with_backtrack_keeps_all_when_no_silence() {
-        // FIRSTCHAR-FIX-006 (R3): "speak before key" — pre_roll already has speech
-        let samples = vec![0.1f32; 3200]; // all speech, no silence
-        let keep_start = find_speech_onset_with_backtrack(&samples, 0.008, 3200);
-        assert_eq!(
-            keep_start, 0,
-            "no leading silence: must keep everything (saturating_sub to 0)"
-        );
-    }
-
-    #[test]
-    fn speech_onset_with_backtrack_no_speech_returns_zero() {
-        // FIRSTCHAR-FIX-006 (R3): no speech detected → keep everything
-        let samples = vec![0.0f32; 3200]; // all silence
-        let keep_start = find_speech_onset_with_backtrack(&samples, 0.008, 3200);
-        assert_eq!(keep_start, 0, "no speech detected: must not trim anything");
-    }
-
-    // === OVERLAY-FIX-005: Processing phase stepping + Preview window layout ===
 
     #[test]
     fn processing_phase_step_increment() {
@@ -17412,95 +10557,6 @@ mod overlay_shimmer_tests {
         assert_eq!(btn_r, btn_g, "BTN_BORDER must be neutral gray (R=G)");
         assert_eq!(btn_g, btn_b, "BTN_BORDER must be neutral gray (G=B)");
     }
-
-    // ============================================================
-    // ASR-ACC-OPT-001 方案 B + ASR-CTC-OPT-001 P1: select_preprocessing_params 分支测试
-    // ============================================================
-
-    // MACOS-P4-NEUTRAL-001: 函数已平台中立，解除 cfg(windows) 门控使 macOS 侧编译可见。
-    use super::select_preprocessing_params;
-    #[allow(unused_imports)]
-    use super::transcription;
-
-    #[test]
-    fn preprocessing_params_performance_uses_0ms_head_200ms_backtrack() {
-        // ASR-CTC-OPT-001 P1: performance silence head 50→0ms（研究 C1 证实 0ms 高 2.5pp）
-        let (head, backtrack) = select_preprocessing_params(transcription::AsrModel::Performance);
-        assert_eq!(
-            head, 0,
-            "performance silence head = 0 samples (0ms @ 16kHz, ASR-CTC-OPT-001 P1)"
-        );
-        assert_eq!(
-            backtrack, 3200,
-            "performance onset backtrack = 3200 samples (200ms @ 16kHz, 不动)"
-        );
-    }
-
-    #[test]
-    fn preprocessing_params_accuracy_uses_0ms_head_100ms_backtrack() {
-        // 方案 B：accuracy 用 0ms head / 100ms backtrack
-        let (head, backtrack) = select_preprocessing_params(transcription::AsrModel::Accuracy);
-        assert_eq!(
-            head, 0,
-            "accuracy silence head = 0 samples (0ms, LLM decoder needs no frame padding)"
-        );
-        assert_eq!(
-            backtrack, 1600,
-            "accuracy onset backtrack = 1600 samples (100ms @ 16kHz)"
-        );
-    }
-
-    #[test]
-    fn preprocessing_params_both_models_use_0ms_head() {
-        // ASR-CTC-OPT-001 P1: 两模型都用 0ms head（offline 模型不需 frame alignment padding）
-        let (perf_head, _) = select_preprocessing_params(transcription::AsrModel::Performance);
-        let (acc_head, _) = select_preprocessing_params(transcription::AsrModel::Accuracy);
-        assert_eq!(perf_head, 0, "performance head must be 0");
-        assert_eq!(acc_head, 0, "accuracy head must be 0");
-    }
-
-    #[test]
-    fn preprocessing_params_accuracy_backtrack_less_than_performance() {
-        // native 对送气声母不如 CTC 敏感，少留 backtrack 减少前导静音
-        let (_, perf_bt) = select_preprocessing_params(transcription::AsrModel::Performance);
-        let (_, acc_bt) = select_preprocessing_params(transcription::AsrModel::Accuracy);
-        assert!(
-            acc_bt < perf_bt,
-            "accuracy backtrack ({}) must be less than performance backtrack ({})",
-            acc_bt,
-            perf_bt
-        );
-    }
-
-    #[test]
-    fn preprocessing_params_online_asr_follows_performance() {
-        // ASR-041-B / ASR-056: 在线 ASR（两族）沿用 performance 前处理参数（0ms head / 200ms backtrack）
-        let (online_head, online_bt) =
-            select_preprocessing_params(transcription::AsrModel::QwenAudioOnline);
-        let (fun_asr_head, fun_asr_bt) =
-            select_preprocessing_params(transcription::AsrModel::FunAsrRealtime);
-        let (perf_head, perf_bt) =
-            select_preprocessing_params(transcription::AsrModel::Performance);
-        assert_eq!(
-            online_head, perf_head,
-            "online ASR silence head ({}) must equal performance head ({})",
-            online_head, perf_head
-        );
-        assert_eq!(
-            online_bt, perf_bt,
-            "online ASR backtrack ({}) must equal performance backtrack ({})",
-            online_bt, perf_bt
-        );
-        // ASR-056: FunAsrRealtime 与 QwenAudioOnline 前处理参数一致
-        assert_eq!(
-            fun_asr_head, online_head,
-            "FunAsrRealtime head must equal QwenAudioOnline head"
-        );
-        assert_eq!(
-            fun_asr_bt, online_bt,
-            "FunAsrRealtime backtrack must equal QwenAudioOnline backtrack"
-        );
-    }
 }
 
 // ============================================================
@@ -17538,88 +10594,6 @@ mod focus_lost_logic_tests {
     fn focus_lost_different_nonzero() {
         // target=123, current=456 → true（焦点确实丢失）
         assert!(focus_lost(123, 456));
-    }
-}
-
-/// ASR-045: 流式模式「samples 空」判空取消决策护栏。
-/// 判定源：run_pipeline_core 判空分支调用 should_cancel_on_empty（纯函数）。
-#[cfg(test)]
-mod streaming_empty_samples_tests {
-    use super::should_cancel_on_empty;
-
-    /// ASR-045 验收#4: 流式模式（samples 空 + initial_text 有值）必须进入正常管线而非 Cancelled。
-    /// 回滚修复（把判空条件还原成只看 s.is_empty()）本测试即红。
-    #[test]
-    fn streaming_empty_samples_with_text_must_proceed() {
-        assert!(
-            !should_cancel_on_empty(&[], &Some("你好今天过得怎么样".to_string())),
-            "流式模式下 samples 为空是正常情况，不得触发 Cancelled"
-        );
-    }
-
-    /// ASR-045 验收#5: samples 空 且 initial_text 为 None（正常模式真空录）仍走 Cancelled（原行为保留）。
-    #[test]
-    fn normal_empty_samples_without_text_still_cancels() {
-        assert!(
-            should_cancel_on_empty(&[], &None),
-            "真空录（无样本且无流式文本）必须保持原 Cancelled 行为"
-        );
-    }
-
-    /// 正常模式非空样本 + None → 不取消（绝大多数正常转录路径，防止误伤）。
-    #[test]
-    fn normal_nonempty_samples_without_text_proceeds() {
-        assert!(
-            !should_cancel_on_empty(&[0.0f32, 0.01, -0.01], &None),
-            "有音频样本的正常转录不得触发空输入取消"
-        );
-    }
-
-    /// ASR-045 真值表第 4 格：非空 samples + Some 文本 → 不取消。
-    ///
-    /// ⚠️ 诚实标注：本格判别力弱于前三条——多数错误变体（如把条件还原成只看
-    /// `samples.is_empty()`）会先被前三条用例抓住。它的价值只在两点：
-    /// ① 真值表完备性（2×2 全格）；② 防止未来被改成含 `initial_text.is_some()`
-    /// 这类错误形态（对条件做镜像翻转/取反时误把「文本存在」写成「文本缺失」）。
-    /// 不是强护栏，不要据此宣称调用侧已被保护。
-    #[test]
-    fn nonempty_samples_with_text_truth_table_cell() {
-        assert!(
-            !should_cancel_on_empty(&[0.01f32, -0.01], &Some("文本".to_string())),
-            "非空样本 + 有流式文本不得触发空输入取消"
-        );
-    }
-
-    /// ASR-045 两层职责划分护栏：空/纯空白流式文本**不在第一层**取消。
-    ///
-    /// 职责划分（修复后行为契约，:4288 与 :4334 两层各司其职）：
-    /// - 第一层 `should_cancel_on_empty`（:4288）：只管「有没有东西可处理」——
-    ///   空 samples 且无文本才取消；只要有流式文本（**哪怕内容是空串或纯空白**），
-    ///   一律落 `Ok(samples)` 走后半段，不在此层取消。
-    /// - 第二层 `run_pipeline_core`（`text.trim().is_empty()`）：管「文本内容
-    ///   是否有效」——空/纯空白文本在此产出 `TranscriptionFailure::NoSpeech`
-    ///   → `PipelineEvent::NoSpeech` → overlay 弹 i18n no_speech_hint 信息提示
-    ///   2500ms（BUG-119 起，从错误样式改为信息提示；**仍是用户可见反馈**，
-    ///   不是静默消失）。
-    ///
-    /// 🔴 为什么必须钉死这条：若未来有人在 `should_cancel_on_empty` 里加
-    /// `trim().is_empty()` 判断（看似「合并同类项」的优化），会把「空文本时的
-    /// 可见提示」又变回「静默取消」，P0 类回归复发，且前三条用例**全部不会红**。
-    /// 本条用例 + 这段注释是钉死该分层的唯一手段。
-    #[test]
-    fn empty_string_text_not_cancelled_at_first_layer() {
-        assert!(
-            !should_cancel_on_empty(&[], &Some(String::new())),
-            "空字符串流式文本属第二层 Error 分支，不得在第一层静默取消"
-        );
-    }
-
-    #[test]
-    fn whitespace_only_text_not_cancelled_at_first_layer() {
-        assert!(
-            !should_cancel_on_empty(&[], &Some("   \t\n".to_string())),
-            "纯空白流式文本属第二层 Error 分支，不得在第一层静默取消"
-        );
     }
 }
 
@@ -19747,39 +12721,7 @@ mod guard_prod_lines {
     /// 返回 `src` 的「生产区」逐行 trim 文本：**剔除所有 test-gated 项**
     /// （`mod` / `fn` / 任意项），保留其余全文 —— 不再「截断到首个标记」。
     ///
-    /// 宏调用 `prod[i]` 起（`name!(`）的第 `n` 个实参（0 起，去空白、不含逗号）。rustfmt 视长度把调用排成单行或
-    /// 一参一行，两种排法同一口径。只按顶层逗号切（实参里的括号 / 方括号不切）。
-    pub(crate) fn macro_call_arg(prod: &[String], i: usize, n: usize) -> String {
-        let mut call = String::new();
-        for l in prod.iter().skip(i).take(16) {
-            call.push_str(l);
-            if l.ends_with(");") || l.ends_with("}};") {
-                break;
-            }
-        }
-        let Some(open) = call.find('(') else {
-            return String::new();
-        };
-        let (mut depth, mut args, mut cur) = (0i32, Vec::new(), String::new());
-        for c in call[open + 1..].chars() {
-            match c {
-                '(' | '[' | '{' => depth += 1,
-                ')' | ']' | '}' if depth == 0 => break,
-                ')' | ']' | '}' => depth -= 1,
-                ',' if depth == 0 => {
-                    args.push(std::mem::take(&mut cur));
-                    continue;
-                }
-                _ => {}
-            }
-            cur.push(c);
-        }
-        args.push(cur);
-        args.get(n)
-            .map(|a| a.trim().to_string())
-            .unwrap_or_default()
-    }
-
+    /// FLASH-P3-A：原夹在此处的 `macro_call_arg`（只给已删的本地实时窗口护栏用）删除。
     /// 🔴 FIX-GUARD-PRODLINES-422：项体定界改用 [`item_end`]（字符串 / 字符 / 注释感知），
     /// 不再朴素逐字数花括号 ⇒ 测试模块内字符串 / 字符 / 原始串 / 注释里的 `{`/`}` 不再带偏、
     /// 不再把其后生产区整段当测试剔除（`[GUARD-SKIP-BRACE-IN-STRING-382]` 第二次复发的根治）。
@@ -19932,7 +12874,7 @@ mod nospeech_122_guard_tests {
         )))
     }
 
-    /// src/transcription/ 全部 .rs 文件生产区行合并（现为 mod/qwen_inference/vad 三文件）。
+    /// src/transcription/ 生产区行合并（FLASH-P3-A 起为 mod/qwen_inference 两文件；vad.rs 已删）。
     /// 判别力边界：若未来新增「没说话」产出源放进**新文件**，本计数扫不到该文件；
     /// 放进现有三文件必被计到，护栏红会要求主动更新。
     fn transcription_prod_lines() -> Vec<String> {
@@ -19945,10 +12887,6 @@ mod nospeech_122_guard_tests {
             include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/src/transcription/qwen_inference.rs"
-            )),
-            include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/transcription/vad.rs"
             )),
         ] {
             out.extend(crate::guard_prod_lines::prod_lines_excluding_cfg_test(src));
@@ -20047,7 +12985,7 @@ mod nospeech_122_guard_tests {
     /// 数量变化必须让人主动来改这条护栏（新增源是有意识行为）。
     /// 消融路径：删任一真实 bail 处 → 计数 5 → 本测试红。
     #[test]
-    fn h2_nospeech_bail_sources_count_is_six() {
+    fn h2_nospeech_bail_sources_count_is_three() {
         let lines = transcription_prod_lines();
         let needles: [&str; 4] = [
             concat!("anyhow::bail!(NoSpeech", "Error)"),
@@ -20059,10 +12997,11 @@ mod nospeech_122_guard_tests {
             .iter()
             .map(|n| count_startswith(&lines, n))
             .sum::<usize>();
+        // FLASH-P3-A：mod.rs 三处本地转录产出源（VAD 无段 / 分段全空 / 在线回退空输出）随本地档删除 ⇒ 6 → 3。
         assert_eq!(
             count,
-            6,
-            "H2: 产出源 bail!(NoSpeechError) 计数必须恰为 6（qwen 三处 + mod:331/373/453）；数量变化须主动改此护栏"
+            3,
+            "H2: 产出源 bail!(NoSpeechError) 计数必须恰为 3（qwen_inference 三处）；数量变化须主动改此护栏"
         );
     }
 
@@ -20090,34 +13029,16 @@ mod nospeech_122_guard_tests {
         );
     }
 
-    /// H4: TranscriptionFailure 枚举存在且有 NoSpeech 变体；run_pipeline_core 的
-    /// map_err 闭包含 `is::<transcription::NoSpeechError>()` 下探 ——
-    /// 守「拦截点必须在 to_string() 之前」（to_string 后无法再与普通错误区分）。
-    /// 消融路径：把 map_err 改回 `|e| e.to_string()` → is:: 行消失 → 本测试红。
+    /// H4（FLASH-P3-A 改写）：原守「TranscriptionFailure + map_err 下探」—— 本地转录分支与该枚举已删。
+    /// 现守 run_pipeline_core 对在线终稿空文本仍发 `PipelineEvent::NoSpeech`（用户可见信息提示，非静默取消）。
     #[test]
-    fn h4_transcription_failure_nospeech_and_downcast_before_tostring() {
+    fn h4_pipeline_core_empty_text_emits_nospeech() {
         let lines = main_prod_lines();
-        let enum_anchor = find_line(&lines, concat!("enum Transcription", "Failure"))
-            .expect("H4 anchor: enum TranscriptionFailure");
+        let anchor = find_line(&lines, concat!("fn run_pipeline_", "core("))
+            .expect("H4 anchor: run_pipeline_core");
         assert!(
-            block_contains(&lines, enum_anchor, concat!("NoSpeech", ",")),
-            "H4: TranscriptionFailure 枚举必须含 NoSpeech 变体"
-        );
-        let map_anchor = find_line(
-            &lines,
-            concat!(
-                "let transcription_result: Result<(String, bool), Transcription",
-                "Failure>"
-            ),
-        )
-        .expect("H4 anchor: transcription_result in run_pipeline_core");
-        assert!(
-            block_contains(
-                &lines,
-                map_anchor,
-                concat!("if e.is::<transcription::NoSpeech", "Error>()")
-            ),
-            "H4: run_pipeline_core map_err 必须含 is::<transcription::NoSpeechError>() 下探（拦截点必须在 to_string() 之前）"
+            block_contains_any(&lines, anchor, &[concat!("PipelineEvent::No", "Speech")]),
+            "H4: run_pipeline_core 对空终稿必须发 PipelineEvent::NoSpeech"
         );
     }
 
@@ -20456,43 +13377,6 @@ mod flicker_130_guard_tests {
             "F3: EditRequested 臂必须同时置 OVERLAY_EDITING.store(true) 与 STREAMING_STOPPED.store(true)—— editing⇒stopped 不变量，破坏=复活 (false,true) 不可达组合=复活闪烁"
         );
     }
-
-    /// LOCALRT-RELEASE-REFLOW-342-A：PreviewReflow 臂的停止语义必须来自 `cancel_signal`
-    /// 三态判定，**不得再用 `STREAMING_STOPPED` 一刀切**（否则松手完成被误判为取消 ⇒
-    /// 尾字回灌被丢 = Gavin 报的「等 7 秒预览不刷新」）。
-    ///
-    /// 消融：把 `let cancelled = cancel_signal.load(` 改回 `STREAMING_STOPPED.load(` ⇒ 红。
-    #[test]
-    fn a342_reflow_uses_cancel_signal_tri_state() {
-        let lines = main_prod_lines();
-        let anchor = find_line(&lines, "PipelineEvent::PreviewReflow {")
-            .expect("342-A: PreviewReflow 匹配臂锚点不存在");
-        assert!(
-            block_contains(&lines, anchor, "let cancelled = cancel_signal.load("),
-            "342-A: PreviewReflow 臂必须读 cancel_signal 判定「取消」"
-        );
-        assert!(
-            block_contains(
-                &lines,
-                anchor,
-                "let stop_state = reflow_stop_state(cancelled, editing);"
-            ),
-            "342-A: 必须经 reflow_stop_state(cancelled, editing) 三态判定"
-        );
-        assert!(
-            !block_contains(&lines, anchor, "let stopped = STREAMING_STOPPED.load("),
-            "342-A: PreviewReflow 臂不得再用 STREAMING_STOPPED 一刀切当取消"
-        );
-    }
-
-    // F4 行为真值表**有意不在此重复**：should_ignore_streaming_text 的行为断言唯一
-    // 权威份在 overlay_043_interpolate_tests::ignore_streaming_text_truth_table
-    // (main.rs:9190)。本模块 F2 守签名/调用点唯一性，与 :9190 成对 —— 函数改回双参
-    // 语义时签名一变 F2 红、行为一错 :9190 红，删任一条另一条即失效。不要在这里
-    // 再加行为断言副本（主控 2026-09-06 裁定：逐字相同的断言让两条同时红，零增量信息）。
-    //
-    // 🔴 阶段四消融验证（主控指定）：把函数改回双参 `(stopped: bool, editing: bool)`
-    // → **F2 必须红**。若实测不红，说明主控以 F2 替代 F4 的推断错误，须回报重开 F4。
 }
 
 // ==================== OVERLAY-121 (per-pixel alpha) 护栏 ====================
@@ -20978,1480 +13862,6 @@ mod overlay_121_guard_tests {
     }
 }
 
-// ============================================================================
-// TEST-SYNC-352（阶段三，非作者 coder-2）：PUNCT-FINAL-REDO-350 接线护栏
-//
-// 只读 main.rs 源码做结构断言，不改生产代码。350 的剥离节点必须：
-//   ① 唯一挂载（只本地 realtime 一条管线 —— Gavin 红线「其他管线不能动」）；
-//   ② 门含 `!start.translate`（翻译时整段跳过 ⇒ 逐字返回原文）；
-//   ③ 顺序在 `pretranscribed_native_punctuated` **之前**（先剥光再判，否则 native 判定
-//      读到未剥离文本 ⇒ 「剥光了必定打得回来」的不变量失效）。
-// 字面量一律用 `concat!` 拆开，避免护栏源码自命中（[FILTERED-TEST-BLINDSPOT-001] 教训）。
-// ============================================================================
-#[cfg(test)]
-mod sync352_punct_node_guard_tests {
-    use super::strip_punctuation_node;
-
-    fn main_src() -> String {
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).to_string()
-    }
-
-    /// sync352-4：节点唯一挂载 + 门含 `punctuation.enabled` / `!start.translate`
-    /// （+ 365 新增 `path_b_text.is_none()`）。
-    ///
-    /// **防的退化**：a. 把节点也挂到在线 realtime / 本地离线档（Gavin 红线：只动本地 realtime）；
-    /// b. 丢掉 `!translate_requested` 门 ⇒ 翻译路径被剥光后无节点重打 ⇒ 标点丢失。
-    ///
-    /// 🔴 锚点同步（365，2026-09-22）：门由「调用实参内联表达式」改为「先算的 `b_strip_enabled`」
-    /// （条件挂载：路B 成功即摘、降级才挂）。**断言语义不变** —— 仍是「本地 realtime 唯一挂载、
-    /// 门含 `punctuation.enabled` + `!translate`」，另按 365 新增 `path_b_text.is_none()` 一项。
-    #[test]
-    fn sync352_node_wired_once_with_translate_gate() {
-        let s = main_src();
-        // 注意：该调用文本在**作者测试**里也出现（传 `t.to_string()`），不能直接数全文件；
-        // 用生产调用独有的首参（变量 `normalized` 后跟逗号）过滤出真实挂载点。
-        let call = concat!("let stripped = strip_punctuation_node", "(");
-        let mounts: Vec<usize> = s
-            .match_indices(call)
-            .map(|(i, _)| i)
-            .filter(|&i| s[i..(i + 200).min(s.len())].contains("normalized,"))
-            .collect();
-        assert_eq!(
-            mounts.len(),
-            1,
-            "剥离节点必须恰好挂载一次（只本地 realtime 一条管线；Gavin 红线）"
-        );
-        let at = mounts[0];
-        let window = &s[at..(at + 200).min(s.len())];
-        assert!(
-            window.contains("b_strip_enabled"),
-            "365：调用点必须传门变量 `b_strip_enabled`"
-        );
-        // 门变量定义必须含三项。
-        // 🔴 锚点同步（367 + DEC-080，2026-09-22）：门由「路B 条件」改为**无条件摘**常量
-        //    `B_STRIP_WIRED_367 = false`。断言语义更新为「节点仍唯一挂载、且由显式常量控制
-        //    （可一键回挂）」，不再断言 365 的条件门。
-        let def_at = s
-            .find(concat!("let b_strip_enabled", " ="))
-            .expect("`b_strip_enabled` 定义必须存在");
-        // 🔴 PUNCT-REDO-493（DEC-112，2026-10-19）：节点重新挂上，门 = 常量 && 开标点 && 非翻译。
-        let def = &s[def_at..(def_at + 200).min(s.len())];
-        assert!(
-            def.contains("B_STRIP_WIRED_367"),
-            "门必须由显式常量 `B_STRIP_WIRED_367` 控制（可一键摘除）"
-        );
-        assert!(
-            def.contains("config.punctuation.enabled") && def.contains("!start.translate"),
-            "493：门必须含开标点与非翻译两项（翻译路径剥了无人重打 ⇒ 标点丢失）"
-        );
-        assert!(
-            s.contains("const B_STRIP_WIRED_367: bool = true;"),
-            "493/DEC-112：`B_STRIP_WIRED_367` 必须为 true（最终文本剥光后交标点模型重打）"
-        );
-    }
-
-    /// sync352-5：接线顺序 —— 剥离节点必须在 `pretranscribed_native_punctuated` **之前**。
-    ///
-    /// **防的退化**：把顺序调换（先判 native 再剥）⇒ `native_punctuated` 读到**未剥离**文本，
-    /// 剥光后下游 `!native_punctuated` 门可能不放行 ⇒「剥光了没打回来」。
-    #[test]
-    fn sync352_strip_node_before_native_punctuated() {
-        let s = main_src();
-        let strip_at = s
-            .find(concat!("let stripped = strip_punctuation_node", "("))
-            .expect("剥离节点调用点必须存在");
-        let punct_at = s
-            .find(concat!(
-                "let native_punctuated = pretranscribed_native_punctuated(&stripped)",
-                ";"
-            ))
-            .expect("下游 native_punctuated 判定必须存在");
-        assert!(
-            strip_at < punct_at,
-            "接线顺序错误：必须先 `strip_punctuation_node` 再算 `native_punctuated`"
-        );
-        // 同一 block：两者相距很近（防「生产中 strip 存在但 punct 命中别处」的假绿）。
-        assert!(
-            punct_at - strip_at < 1500,
-            "两处调用距离异常（{} 字节），接线可能已被拆散",
-            punct_at - strip_at
-        );
-    }
-
-    /// sync352-6：门关（`enabled=false`）⇒ 逐字返回原文（含空串）。
-    ///
-    /// 本条**同时覆盖「`translate_requested=true`」分支**：调用点的门是 `b_strip_enabled`
-    /// （`path_b_text.is_none() && punctuation.enabled && !start.translate`，见 sync352-4），
-    /// 翻译时 `!start.translate` 为 false ⇒ 实参 false ⇒ 走的就是本分支。
-    /// **防的退化**：门关时仍动手（用户关标点 / 走翻译却看到文本被改）。
-    #[test]
-    fn sync352_gate_off_returns_verbatim() {
-        for t in ["你好。。", "今天天气不错，。", "3.14", "", "中。"] {
-            assert_eq!(
-                strip_punctuation_node(t.to_string(), false),
-                t,
-                "门关闭时必须逐字返回原文：{t:?}"
-            );
-        }
-        // 反向 sanity：门开且确有有效标点 ⇒ 必须真的剥（防「恒返回原文」的假实现）。
-        assert_eq!(strip_punctuation_node("你好。。".to_string(), true), "你好");
-        assert_eq!(
-            strip_punctuation_node("3.14 不错".to_string(), true),
-            "3.14 不错"
-        );
-    }
-}
-
-// ============================================================
-// FIX-TAIL-WINDOW-AND-FALLBACK-386（阶段一）：B 回灌合成 / C 流式兜底
-//   （原 SLIDING-WINDOW-367 的 `reflow_preview_367` 两分支单测随该函数一并删除：
-//   386-B 起 `replace_all` 也不丢流式尾巴，两分支统一走 `compose_with_acc_for_gen`。）
-// ============================================================
-#[cfg(test)]
-mod fix386_tests {
-    use super::{compose_reflow_preview, compose_with_acc_for_gen, window_text_with_fallback};
-
-    /// B：回灌渲染结果 == 后续 `StreamingText` 渲染结果（**同一合成函数**），
-    /// 且**保留流式尾巴**（不得截短为纯 acc —— 382 回归）。
-    #[test]
-    fn reflow_preview_reuses_streaming_compose_and_keeps_tail() {
-        let g = 7u64;
-        let acc = "权威改写A";
-        let streaming = "原始流式文本B";
-        let len = 2usize;
-        let reflow = compose_reflow_preview(g, acc, streaming, len);
-        let state = (g, acc.to_string(), len);
-        let subsequent = compose_with_acc_for_gen(Some(&state), g, streaming);
-        assert_eq!(
-            reflow, subsequent,
-            "回灌必须与 StreamingText 用同一合成函数"
-        );
-        assert_eq!(reflow, "权威改写A流式文本B", "必须保留流式尾巴");
-        assert_ne!(reflow, acc, "不得截短为纯 acc（382 回归）");
-    }
-
-    /// C：解码空（含 Err 置空）⇒ 用本窗流式文本兜底；流式也空 ⇒ 保持空；解码非空 ⇒ 原样。
-    #[test]
-    fn window_text_fallback_semantics() {
-        assert_eq!(window_text_with_fallback("", "流式兜底"), "流式兜底");
-        assert_eq!(window_text_with_fallback("", ""), "");
-        assert_eq!(window_text_with_fallback("解码文本", "流式"), "解码文本");
-    }
-}
-
-// =====================================================================
-// FIX-NEARFIELD-BY-SEGMENT-AND-PREVIEW-389（D3）：部分窗 committed_len 折算 + 状态机不截短
-// =====================================================================
-#[cfg(all(test, target_os = "windows"))]
-mod fix389_partial_window_tests {
-    use super::{partial_win_committed, ReflowFastOutcome, ReflowFastState};
-
-    fn apply(o: ReflowFastOutcome) -> (String, usize, bool, bool) {
-        match o {
-            ReflowFastOutcome::Apply {
-                text,
-                committed_len,
-                accurate,
-                render,
-            } => (text, committed_len, accurate, render),
-            ReflowFastOutcome::None => panic!("expected Apply, got None"),
-        }
-    }
-
-    /// 契约数值：派发 `[10.55s, 5.56s]`、`prev_committed=0`、`committed_len=71`
-    /// ⇒ 首窗（含第 0 片）`win_committed ≈ 47`（= round(71 × 10.55/16.11)）。
-    #[test]
-    fn fix389_partial_committed_matches_sample_fraction() {
-        // 16kHz 样本数（与生产 `sub_segs.len()` 同口径）。
-        let s0 = (10.55f32 * 16000.0) as usize;
-        let s1 = (5.56f32 * 16000.0) as usize;
-        let total = s0 + s1;
-        let win = partial_win_committed(0, 71, s0, total);
-        assert_eq!(win, 46, "round(71×10.55/16.11)=46（任务书 ≈47）");
-        assert!(
-            (win as f32 - 47.0).abs() <= 1.0,
-            "应与 47 相差 ≤1，实测 {win}"
-        );
-        assert!(
-            win > 0 && win < 71,
-            "必须落在 (prev_committed, committed_len) 内"
-        );
-        // 含末片窗：k=1 ⇒ cum=total ⇒ frac=1 ⇒ = committed_len(71)。
-        assert_eq!(
-            partial_win_committed(0, 71, total, total),
-            71,
-            "含末片窗折算应等于 committed_len"
-        );
-        // prev_committed 非 0：从 prev 起算增量。
-        assert_eq!(partial_win_committed(30, 71, total, total), 71);
-    }
-
-    /// 部分窗：即便该 seg 的**整次派发边界已到（71）**，`on_text` 也必须用折算值(46)，不得用 71；
-    /// 且晚到边界**不得**对部分窗重渲（否则截短预览）。
-    #[test]
-    fn fix389_partial_window_uses_fallback_and_bound_does_not_rerender() {
-        let mut st = ReflowFastState::default();
-        // 先登记整次派发边界 = 71（这是被延后末片所属派发的边界）。
-        assert_eq!(st.on_bound(1, 5, Some(71), false), ReflowFastOutcome::None);
-        // 部分窗全文到：boundary_usable=false ⇒ 用 fallback(46)，忽略已到的 71。
-        let o = apply(st.on_text(1, 5, "acc".into(), 46, false, false));
-        assert_eq!(
-            o,
-            ("acc".into(), 46, false, true),
-            "部分窗必须用折算值 46，不得用整次派发边界 71"
-        );
-        // 晚到边界（同 seg 仍最新）⇒ 部分窗不重渲。
-        assert_eq!(
-            st.on_bound(1, 5, Some(71), false),
-            ReflowFastOutcome::None,
-            "部分窗的最新渲染不得被整次派发边界重渲"
-        );
-    }
-
-    /// 对照（含末片窗 = 准确边界）：`boundary_usable=true` ⇒ 用登记边界、晚到边界可重渲。
-    #[test]
-    fn fix389_usable_window_uses_bound_and_rerenders() {
-        let mut st = ReflowFastState::default();
-        assert_eq!(st.on_bound(1, 6, Some(71), false), ReflowFastOutcome::None);
-        let o = apply(st.on_text(1, 6, "acc".into(), 46, true, false));
-        assert_eq!(o, ("acc".into(), 71, true, true), "含末片窗用准确边界 71");
-        let r = apply(st.on_bound(1, 6, Some(72), false));
-        assert_eq!(r, ("acc".into(), 72, true, true), "含末片窗晚到边界可重渲");
-    }
-
-    /// TEST-SYNC-389-5（非作者性质）：随机 500 组 `(prev ≤ cur、cum ≤ total)`：
-    /// ① 结果恒 ∈ `[prev, cur]` ② 随 `cum` **单调不减** ③ `cum=total ⇒ cur` ④ `total=0 ⇒ cur`。
-    #[test]
-    fn ts389n_partial_committed_property_bounds_and_monotone() {
-        struct Lcg(u64);
-        impl Lcg {
-            fn next(&mut self) -> u64 {
-                self.0 = self
-                    .0
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                self.0
-            }
-        }
-        let mut rng = Lcg(0x389_D3_2026);
-        for case in 0..500usize {
-            let total = (rng.next() % 50_000) as usize; // 可能为 0
-            let cur = (rng.next() % 10_000) as usize;
-            let prev = (rng.next() % (cur as u64 + 1)) as usize; // 保证 prev ≤ cur
-                                                                 // ③ cum=total ⇒ cur
-            assert_eq!(
-                partial_win_committed(prev, cur, total, total),
-                cur,
-                "case {case}: cum=total 必须等于 cur"
-            );
-            // ④ total=0 ⇒ cur
-            if total == 0 {
-                assert_eq!(partial_win_committed(prev, cur, 0, 0), cur, "total=0 ⇒ cur");
-            }
-            // ① 界 + ② 单调（cum 分 11 档递增）
-            let mut last = prev;
-            for k in 0..=10u64 {
-                let cum = ((total as u64) * k / 10) as usize;
-                let w = partial_win_committed(prev, cur, cum.min(total), total);
-                assert!(
-                    w >= prev && w <= cur,
-                    "case {case}: {w} 越界 [{prev}, {cur}]（total={total} cum={cum}）"
-                );
-                assert!(
-                    w >= last,
-                    "case {case}: cum 增大结果不得减（{last} -> {w}）"
-                );
-                last = w;
-            }
-        }
-    }
-}
-
-// =====================================================================
-// TEST-SYNC-371（阶段三 · 非作者视角，tester-1）：C 接线护栏
-// ---------------------------------------------------------------------
-// Gavin 明确要求「计数器在松开录音键后一定要重置」。`window_spans` /
-// `window_samples` 必须**每次录音新建的局部 `let mut Vec::new()`**（per-recording，
-// 松手即失效），且不得退化为 static/全局（否则跨录音累积 ⇒ 污染下一次对齐）。
-// 生产区扫描用 `guard_prod_lines`（剔除所有 test-gated 项，位置无关）。
-// =====================================================================
-#[cfg(test)]
-mod testsync371_window_counter_guard_tests {
-    fn prod_lines() -> Vec<String> {
-        crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC)
-    }
-
-    /// 设计 C：两计数器必须是 per-recording 局部（`let mut ... = Vec::new()`），不得 static。
-    #[test]
-    fn counters_are_per_recording_locals() {
-        let p = prod_lines();
-        let starts = |pre: &str| p.iter().filter(|l| l.starts_with(pre)).count();
-        assert_eq!(
-            starts("let mut window_spans:"),
-            1,
-            "window_spans 应恰有 1 处 `let mut` 局部声明"
-        );
-        assert_eq!(
-            starts("let mut window_samples:"),
-            1,
-            "window_samples 应恰有 1 处 `let mut` 局部声明"
-        );
-        assert!(
-            p.iter()
-                .any(|l| l.starts_with("let mut window_spans:") && l.contains("Vec::new()")),
-            "window_spans 必须每次录音从空表起（Vec::new）"
-        );
-        assert!(
-            p.iter()
-                .any(|l| l.starts_with("let mut window_samples:") && l.contains("Vec::new()")),
-            "window_samples 必须每次录音从空表起（Vec::new）"
-        );
-        assert!(
-            !p.iter()
-                .any(|l| l.starts_with("static") && l.contains("window_spans")),
-            "window_spans 不得是 static/全局（否则跨录音泄漏）"
-        );
-        assert!(
-            !p.iter()
-                .any(|l| l.starts_with("static") && l.contains("window_samples")),
-            "window_samples 不得是 static/全局（否则跨录音泄漏）"
-        );
-    }
-
-    /// 设计 C：两表必须**同批 push**（区间 ↔ 样本数一一对应，否则期望比例算错）。
-    ///
-    /// 🔴 386：组窗改走 `dispatch_window!` 宏后，`window_spans.push((gs, ge));` 与
-    /// `window_samples.push(` 仍**同处成对**（相邻两行）。
-    /// 🔴 407：新增 `dispatch_tail_window!`（末尾窗）后 push 有 **2 处**（常规窗 / 末尾窗）。
-    /// **断言强度不放宽**：两表 push **数量必须一致**，且**每一处** samples 都紧邻其 spans。
-    #[test]
-    fn counters_are_pushed_together() {
-        let p = prod_lines();
-        let spans: Vec<usize> = p
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.contains("window_spans.push("))
-            .map(|(i, _)| i)
-            .collect();
-        let samples: Vec<usize> = p
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.contains("window_samples.push("))
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(
-            spans.len(),
-            samples.len(),
-            "window_spans / window_samples 的 push 调用点数量必须一致"
-        );
-        assert!(!spans.is_empty(), "至少应有 1 处组窗 push");
-        for (i, s) in samples.iter().enumerate() {
-            assert_eq!(
-                *s,
-                spans[i] + 1,
-                "第 {i} 处 window_samples.push 必须紧随 window_spans.push（同批成对，防一一对应错位）"
-            );
-        }
-    }
-}
-
-// =====================================================================
-// TEST-SYNC-377（阶段三 · 非作者视角，tester-1）：源码级护栏
-// ---------------------------------------------------------------------
-// 设计 377：被删的注入符号（CLEANUP_INSTR_EN / CTX_INSTR_EN / CTX_DEFAULT_CHARS）
-// 与跨录音上下文缓存（ctx_prev1 / ctx_prev2）不得在生产区复活。
-// 生产区扫描用 `guard_prod_lines`（剔除所有 test-gated 项），注释行一并剔除。
-// =====================================================================
-#[cfg(test)]
-mod testsync377_source_guard_tests {
-    fn prod(src: &'static str) -> Vec<String> {
-        crate::guard_prod_lines::prod_lines_excluding_cfg_test(src)
-    }
-
-    /// 377：`transcription/mod.rs` 生产区（注释不计）不得再出现被删注入符号。
-    #[test]
-    fn source_has_no_removed_inject_symbols() {
-        let p = prod(include_str!("transcription/mod.rs"));
-        for sym in ["CLEANUP_INSTR_EN", "CTX_INSTR_EN", "CTX_DEFAULT_CHARS"] {
-            let hit: Vec<&String> = p
-                .iter()
-                .filter(|l| !l.starts_with("//"))
-                .filter(|l| l.contains(sym))
-                .collect();
-            assert!(hit.is_empty(), "生产区不得再出现 `{sym}`：{hit:?}");
-        }
-    }
-
-    /// 377：`main.rs` 生产区不得再有跨录音上下文缓存 `ctx_prev1`/`ctx_prev2`（计数 0）。
-    ///
-    /// FIX-GUARD-PRODLINES-422：本模块顶部**注释**（非 cfg(test) 项）按文档契约「注释行一并剔除」
-    /// 需过滤 —— 旧扫描器把该区域整段误剔 ⇒ 注释没被计入 ⇒ 碰巧绿；422 修正扫描面后暴露本测试
-    /// 漏过滤注释。**只过滤注释、不放宽代码不变量**（与上方 `source_has_no_removed_inject_symbols` 同口径）。
-    #[test]
-    fn main_has_no_cross_recording_ctx_cache() {
-        let p = prod(crate::MAIN_RS_SRC);
-        for sym in ["ctx_prev1", "ctx_prev2"] {
-            let n = p
-                .iter()
-                .filter(|l| !l.starts_with("//"))
-                .filter(|l| l.contains(sym))
-                .count();
-            assert_eq!(
-                n, 0,
-                "main.rs 生产区（注释不计）`{sym}` 计数必须为 0，实得 {n}"
-            );
-        }
-    }
-}
-
-// =====================================================================
-// TEST-SYNC-405-407（阶段三 · 非作者护栏，coder-2）—— 407 1900ms 末尾组窗
-// =====================================================================
-#[cfg(test)]
-mod testsync407_tests {
-    use super::{plan_windows, tail_backtrack_secs, tail_window_span};
-
-    /// 取源码里 `match` 臂 `pat => { ... }` 的**完整臂体**：从 `at` 起找第一个 `{`，再括号配平到
-    /// 与之配对的 `}`。配平时**跳过字符串 / 字符 / 行注释 / 块注释**内的括号
-    ///（防 [GUARD-SKIP-BRACE-IN-STRING-382] 的「字符串内花括号」计数坑）。
-    fn arm_body(code: &str, at: usize) -> &str {
-        let bytes = code.as_bytes();
-        let open = code[at..].find('{').map(|d| at + d).expect("臂体 `{` 缺失");
-        let mut depth = 0i32;
-        let mut i = open;
-        let (mut string, mut ch, mut line_c, mut block_c) = (false, false, false, false);
-        while i < bytes.len() {
-            let c = bytes[i] as char;
-            let next = bytes.get(i + 1).copied().map(|b| b as char);
-            if line_c {
-                if c == '\n' {
-                    line_c = false;
-                }
-            } else if block_c {
-                if c == '*' && next == Some('/') {
-                    block_c = false;
-                    i += 1;
-                }
-            } else if string {
-                if c == '\\' {
-                    i += 1;
-                } else if c == '"' {
-                    string = false;
-                }
-            } else if ch {
-                if c == '\\' {
-                    i += 1;
-                } else if c == '\'' {
-                    ch = false;
-                }
-            } else if c == '"' {
-                string = true;
-            } else if c == '\'' {
-                ch = true;
-            } else if c == '/' && next == Some('/') {
-                line_c = true;
-                i += 1;
-            } else if c == '/' && next == Some('*') {
-                block_c = true;
-                i += 1;
-            } else if c == '{' {
-                depth += 1;
-            } else if c == '}' {
-                depth -= 1;
-                if depth == 0 {
-                    return &code[at..=i];
-                }
-            }
-            i += 1;
-        }
-        &code[at..]
-    }
-
-    /// 407/423 契约5（源码）：长静默与松键**统一**走末尾窗宏 `emit_tail_window!`；用后清空 pending。
-    #[test]
-    fn ts407_tail_only_when_pending_source_guard() {
-        let prod =
-            crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC).join("\n");
-        let arm = prod
-            .find("AccInput::LongSilence(pcm_pos) =>")
-            .expect("长静默臂缺失");
-        let seg = arm_body(&prod, arm);
-        assert!(
-            seg.contains(concat!("emit_tail_", "window!(")),
-            "长静默臂须调用统一末尾窗宏 emit_tail_window!"
-        );
-        assert!(seg.contains("pending_slice = None;"), "用后须清空 pending");
-        // 宏定义内：纯决策 tail_window_span + 复用 413 取后缀函数 + 首片 alone。
-        let m = prod
-            .find(concat!("macro_rules! emit_tail_", "window"))
-            .expect("emit_tail_window 宏缺失");
-        // 446：宏内新增远场区间拼接（约 10 行）⇒ 截取范围 1500→2500 字，检查项不变。
-        let mseg: String = prod[m..].chars().take(2500).collect();
-        assert!(
-            mseg.contains(concat!("tail_window_span(Some(p)")),
-            "须用纯决策取 span"
-        );
-        assert!(
-            mseg.contains("take_context_suffix("),
-            "须复用 413 take_context_suffix"
-        );
-        assert!(mseg.contains("tail_window_alone("), "首片 pending ⇒ 单独解");
-        // 松键分支：`if let Some(p) = pending_slice.take()` ⇒ 1900ms 已处理（pending 已 None）时不重复组窗。
-        let stop_at = prod
-            .find(concat!("emit_tail_", "window!(p, 0usize, \"stop\")"))
-            .expect("松键 emit 缺失");
-        let guard_at = prod[..stop_at]
-            .rfind(concat!("if let Some(p) = pending_", "slice"))
-            .expect("松键 pending 条件缺失");
-        assert!(
-            stop_at - guard_at < 120,
-            "松键 emit 须在 pending 存在条件下（None 不重复组窗）"
-        );
-    }
-
-    /// 407 契约5：`tail_window_span` 边界（无 pending / 首片 / 末片 / 越界 / p<base）。
-    #[test]
-    fn ts407_span_boundaries_independent() {
-        assert_eq!(tail_window_span(None, 0, 3), None);
-        // i == recent_len-1（末片）⇒ Some((p-1,p+1,i))。
-        assert_eq!(tail_window_span(Some(4), 1, 4), Some((3, 5, 3)));
-        // p < prev_base ⇒ None。
-        assert_eq!(tail_window_span(Some(0), 1, 5), None);
-        // i == recent_len ⇒ None。
-        assert_eq!(tail_window_span(Some(6), 1, 5), None);
-    }
-
-    /// 407 契约6：回溯时长对 2 / 3(冷启动) / 6 字每秒分别 ≥ 6.0 / 4.0 / 2.0，单调不增，
-    /// 且估计字数 ≥ `ALIGN_MIN_OVERLAP_CHARS + 4`（或已达 2s 下限）。
-    #[test]
-    fn ts407_backtrack_property_independent() {
-        for (rate, want) in [(2.0f32, 6.0f32), (3.0, 4.0), (6.0, 2.0)] {
-            assert!(tail_backtrack_secs(rate) >= want, "rate={rate}");
-        }
-        let need = (crate::transcription::ALIGN_MIN_OVERLAP_CHARS + 4) as f32;
-        let mut prev = f32::INFINITY;
-        let mut r = 1.0f32;
-        while r <= 12.0 {
-            let s = tail_backtrack_secs(r);
-            assert!(
-                s >= 2.0 && s <= prev + 1e-6,
-                "单调不增且 ≥2s：rate={r} s={s}"
-            );
-            assert!(
-                s * r >= need || s <= 2.0 + 1e-6,
-                "估计字数 ≥{need}（或已触下限）：rate={r} est={}",
-                s * r
-            );
-            prev = s;
-            r += 0.5;
-        }
-        assert!(
-            tail_backtrack_secs(1.0e9) <= 2.0 + 1e-6,
-            "极快语速 ⇒ 落 2s 下限"
-        );
-    }
-
-    /// 407/423 契约7：末尾窗（长静默或松键统一）后继续说话仍**全覆盖**，且收尾后无 pending。
-    #[test]
-    fn ts407_coverage_after_tail_independent() {
-        use super::tail_window_alone;
-        let durs = [2.0f32, 5.0, 1.2, 4.0, 2.5];
-        // 第 1 次：单片 ⇒ 立刻 1 窗。
-        let p1 = plan_windows(&[], &[durs[0]], 0, None);
-        let mut windows = p1.windows.clone();
-        let pending = p1.pending;
-        // 第 2 次：两片 ⇒ 末片 pending。
-        let p2 = plan_windows(&[durs[0]], &[durs[1], durs[2]], 0, pending);
-        windows.extend(p2.windows.clone());
-        assert!(p2.pending.is_some(), "两片派发末片应 pending");
-        // 423：末尾窗覆盖 pending（有前片 ⇒ (p-1,p+1)）；不再由 plan_windows 组收尾窗。
-        let tail_p = p2.pending.expect("应有 pending");
-        let prev_len = 3usize; // 当前 buffer：durs[0..3]
-        if let Some((gs, ge, _i)) = tail_window_span(Some(tail_p), 0, prev_len) {
-            windows.push((gs, ge));
-        } else if let Some((gs, ge)) = tail_window_alone(Some(tail_p), 0, prev_len) {
-            windows.push((gs, ge));
-        } else {
-            panic!("pending {tail_p} 未被末尾窗覆盖");
-        }
-        // 继续说话：新片正常组窗（pending 已由末尾窗覆盖 ⇒ None）。
-        let p3 = plan_windows(&durs[..prev_len], &[durs[3]], 0, None);
-        windows.extend(p3.windows);
-        for idx in 0..4 {
-            assert!(
-                windows.iter().any(|(s, e)| *s <= idx && idx < *e),
-                "片 {idx} 未被任何窗覆盖：windows={windows:?}"
-            );
-        }
-    }
-
-    /// 407 契约8：末尾窗文本与前片后缀有 1 字差异时，对齐合并不丢尾部独有内容、长度不无限重复。
-    #[test]
-    fn ts407_alignment_small_diff_no_loss() {
-        let mut ordered = crate::transcription::OrderedReflow::new();
-        let prev = "今天下午我们一起去市中心的那个大公园散步看花";
-        let _ = ordered.push_window(0, 0, 1, vec![200], prev.to_string());
-        // 与前片后缀（≥8 字重叠）**有 1 字不同**（公园 → 花园）。
-        let tail = "一起去市中心的那个大花园散步看花还看到了很多游客";
-        let _ = ordered.push_window(1, 0, 2, vec![120, 140], tail.to_string());
-        let (committed, last) = ordered.finish();
-        let full = format!("{committed}{last}");
-        assert!(
-            full.contains("还看到了很多游客"),
-            "尾部独有内容不得丢：{full}"
-        );
-        assert!(
-            full.chars().count() <= prev.chars().count() + tail.chars().count(),
-            "不得无限重复：{full}"
-        );
-    }
-}
-
-// =====================================================================
-// TEST-SYNC-410（阶段三 · 非作者护栏，coder-2）：末尾窗 × 406 守卫**配合**
-//   作者 coder-1（`fix410_tail_guard_tests`）；本模块只补独立护栏，不照抄实现。
-// =====================================================================
-#[cfg(test)]
-mod testsync410_tests {
-    use super::{
-        punct_cooldown_active, run_punct_retries, tail_streaming_baseline, PunctTry,
-        PUNCT_RESTART_COOLDOWN_SECS, PUNCT_START_MAX_RETRIES,
-    };
-    use crate::transcription::{acc_vs_streaming, OrderedReflow};
-
-    /// 契约1（真实数据 · BUILD-409 16:34Z）：整前片基准误拒；真实比例（4.0s/6.91s）基准 accept；
-    /// 基准字数随 suffix 单调不减且恒 ≤ 前片+pending。
-    #[test]
-    fn ts410_real_data_ratio_and_monotonic() {
-        let prev = "周末天气好的话一起出来玩吧我们一起可以出去看看电影也可以挤出去吃饭然后也可以到郊外去旅游旅游";
-        let pending = "或者到附进去旅游";
-        let jie = "然后也可以到郊外去旅游旅游，或者到附近去旅游。";
-        let old = format!("{prev}{pending}");
-        assert!(
-            !acc_vs_streaming(jie, &old).accept,
-            "整前片基准应误拒（复现 BUILD-409 缺陷）"
-        );
-        let prev_samples = 110_560usize; // 6.91s @16k
-        let baseline = tail_streaming_baseline(prev, 64_000, prev_samples, pending); // 4.0s
-        assert!(
-            acc_vs_streaming(jie, &baseline).accept,
-            "真实比例基准应 accept（ret={:.2} len={:.2}）",
-            acc_vs_streaming(jie, &baseline).retention,
-            acc_vs_streaming(jie, &baseline).len_ratio
-        );
-        // 单调 + 上界。
-        let total = prev.chars().count() + pending.chars().count();
-        let mut last = 0usize;
-        for ratio in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
-            let suffix = (prev_samples as f32 * ratio) as usize;
-            let n = tail_streaming_baseline(prev, suffix, prev_samples, pending)
-                .chars()
-                .count();
-            assert!(n >= last, "基准字数应随 suffix 单调不减");
-            assert!(n <= total, "基准不得超出 前片+pending");
-            last = n;
-        }
-    }
-
-    /// 契约2（反例）：幻觉（近零重合）/ 空精解 ⇒ 被 406 拒。
-    #[test]
-    fn ts410_hallucination_and_empty_rejected() {
-        let prev = "周末天气好的话一起出来玩吧";
-        let pending = "或者到附近去旅游";
-        let b = tail_streaming_baseline(prev, 64_000, 110_560, pending);
-        assert!(
-            !acc_vs_streaming("完全无关的另一段幻觉内容", &b).accept,
-            "幻觉应拒"
-        );
-        assert!(!acc_vs_streaming("", &b).accept, "空应拒");
-    }
-
-    /// 契约2+3（配合）：窗#0 已回灌带标点前片 → 末尾窗被拒 ⇒ 只以 span(p,p+1) 追加「加标点 pending」；
-    /// 前片文本**逐字不变**。
-    #[test]
-    fn ts410_reject_fallback_appends_pending_only_keeps_prev() {
-        let mut o = OrderedReflow::new();
-        let prev_punct = "周末天气好的话，一起出来玩吧。";
-        let pending_punct = "或者到附近去旅游。";
-        let _ = o.push_window(0, 0, 1, vec![120], prev_punct.to_string()); // 窗0 带标点
-        let _ = o.push_window(1, 1, 2, vec![60], pending_punct.to_string()); // 末尾窗被拒 ⇒ 兜底 pending
-        let (committed, last) = o.finish();
-        let full = format!("{committed}{last}");
-        assert!(
-            full.starts_with(prev_punct),
-            "前片已回灌文本须逐字不变：{full}"
-        );
-        assert_eq!(
-            full,
-            format!("{prev_punct}{pending_punct}"),
-            "只追加加标点 pending"
-        );
-    }
-
-    /// 契约4（边界语义）：suffix=0 ⇒ 仅 pending；suffix≥prev ⇒ 整前片+pending；prev 空 / prev_samples=0
-    /// ⇒ 仅 pending；比例四舍五入；多字节（emoji/中英）字数精确、不 panic。
-    #[test]
-    fn ts410_baseline_boundary_semantics() {
-        let prev = "一二三四五六七八九十"; // 10 chars
-        let pending = "尾";
-        assert_eq!(
-            tail_streaming_baseline(prev, 0, 100, pending),
-            pending.to_string()
-        );
-        assert_eq!(
-            tail_streaming_baseline(prev, 100, 100, pending),
-            format!("{prev}{pending}")
-        );
-        assert_eq!(
-            tail_streaming_baseline(prev, 999, 100, pending),
-            format!("{prev}{pending}"),
-            "suffix > 前片 ⇒ 封顶整前片"
-        );
-        assert_eq!(
-            tail_streaming_baseline("", 5, 10, pending),
-            pending.to_string()
-        );
-        assert_eq!(
-            tail_streaming_baseline(prev, 5, 10, pending),
-            format!("{}{pending}", "六七八九十"),
-            "10×0.5=5 字"
-        );
-        assert_eq!(
-            tail_streaming_baseline(prev, 5, 0, pending),
-            pending.to_string(),
-            "prev_samples=0 ⇒ 比例 0"
-        );
-        let multi = "hello你好😀世界"; // 10 chars
-        let b = tail_streaming_baseline(multi, 5, 10, "👋");
-        assert_eq!(b.chars().count(), 5 + 1, "多字节按 char 切、不越界");
-        assert!(b.ends_with("👋"));
-    }
-
-    /// 契约5：`run_punct_retries` 分类 —— Ok 短路；**Timeout 不重启（仅 1 次）**；
-    /// Unavailable/AbnormalExit 重启重试至多 `PUNCT_START_MAX_RETRIES` 次；中途成功即返回。
-    #[test]
-    fn ts410_punct_retries_classification() {
-        use std::cell::Cell;
-        let n = Cell::new(0);
-        let r = run_punct_retries(|_| {
-            n.set(n.get() + 1);
-            PunctTry::Ok("x".to_string())
-        });
-        assert_eq!((r.as_deref(), n.get()), (Ok("x"), 1));
-
-        let n = Cell::new(0);
-        let r = run_punct_retries(|_| {
-            n.set(n.get() + 1);
-            PunctTry::Timeout
-        });
-        assert_eq!((r, n.get()), (Err("timeout"), 1), "超时不得重启");
-
-        let n = Cell::new(0);
-        let r = run_punct_retries(|_| {
-            n.set(n.get() + 1);
-            PunctTry::Unavailable
-        });
-        assert_eq!(
-            (r, n.get()),
-            (Err("startup-failed"), PUNCT_START_MAX_RETRIES + 1),
-            "连续启动失败 ⇒ 无标点"
-        );
-
-        let k = Cell::new(0);
-        let r = run_punct_retries(|_| {
-            k.set(k.get() + 1);
-            if k.get() == 1 {
-                PunctTry::AbnormalExit
-            } else {
-                PunctTry::Ok("y".to_string())
-            }
-        });
-        assert_eq!((r.as_deref(), k.get()), (Ok("y"), 2), "异常退出后重启成功");
-    }
-
-    /// 契约5：冷却窗口 —— 距上次失败 < `PUNCT_RESTART_COOLDOWN_SECS` ⇒ 生效；到点 / 无记录 ⇒ 不生效。
-    #[test]
-    fn ts410_punct_cooldown_window() {
-        use std::time::{Duration, Instant};
-        let now = Instant::now();
-        assert!(!punct_cooldown_active(None, now), "无失败记录 ⇒ 不冷却");
-        assert!(punct_cooldown_active(Some(now), now), "刚失败 ⇒ 冷却");
-        assert!(
-            punct_cooldown_active(
-                Some(now),
-                now + Duration::from_secs(PUNCT_RESTART_COOLDOWN_SECS - 1)
-            ),
-            "冷却期内"
-        );
-        assert!(
-            !punct_cooldown_active(
-                Some(now),
-                now + Duration::from_secs(PUNCT_RESTART_COOLDOWN_SECS)
-            ),
-            "冷却到点 ⇒ 可重试"
-        );
-    }
-}
-
-// =====================================================================
-// FIX-SPLIT-SLICE-STREAMING-411：多片切分流式文本按占比分配（含影响面 4 处消费）
-// =====================================================================
-#[cfg(test)]
-mod fix411_tests {
-    use super::{slice_streaming_text, tail_streaming_baseline};
-    use crate::transcription::{acc_vs_streaming, OrderedReflow};
-
-    const STREAM80: &str = "啊周周末周周周末有空吗可一起出来见个面吧我们可以一起喝杯咖啡一起出去吃个饭也可以起出来求政这样大家说来透透气这样挺好也不用整天待在家里面是不是我觉得这样可以你可";
-
-    fn per_slice(seg: &str, samples: &[usize]) -> Vec<String> {
-        (0..samples.len())
-            .map(|k| slice_streaming_text(k, seg, samples))
-            .collect()
-    }
-
-    /// 纯函数：各片字数求和 == 总字数（不丢不重）；1 片 == 整段；总样本 0 / k 越界 ⇒ 空；char 安全。
-    #[test]
-    fn ts411_split_property_sum_equals_total() {
-        // ASCII 精确：10 chars / 3 片等样本 ⇒ 边界 0,3,7,10。
-        let seg = "abcdefghij";
-        let s = [1usize, 1, 1];
-        let per = per_slice(seg, &s);
-        assert_eq!(per[0], "abc", "边界须单一定义、无缝");
-        assert_eq!(per[1], "defg");
-        assert_eq!(per[2], "hij");
-        assert_eq!(per.concat(), seg, "各片拼接 == 整段（不丢不重）");
-        assert_eq!(slice_streaming_text(0, seg, &[123]), seg, "1 片 ⇒ 整段");
-        assert_eq!(slice_streaming_text(0, seg, &[]), "", "总样本 0 ⇒ 空");
-        assert_eq!(slice_streaming_text(0, seg, &[0, 0]), "");
-        assert_eq!(slice_streaming_text(0, "", &[1, 1]), "", "空文本 ⇒ 空");
-        assert_eq!(slice_streaming_text(9, seg, &[1, 1]), "", "k 越界 ⇒ 空");
-        let multi = "a你😀b好👋c"; // 7 chars
-        let per = per_slice(multi, &[1, 1]);
-        assert_eq!(per.concat(), multi, "多字节按 char、不丢不重");
-        assert_eq!(per[0].chars().count() + per[1].chars().count(), 7);
-    }
-
-    /// 影响面①（常规窗 `recent_streaming[start..stop].concat()`）：切分后每窗基准 = **其覆盖片**的
-    /// 分配文本拼接 ⇒ 不撑大（旧逻辑首片含整段）也不缺字（旧逻辑后片为空）。
-    #[test]
-    fn ts411_regular_window_baseline_per_slice() {
-        let seg = STREAM80;
-        let samples = [160_000usize, 160_000, 61_600]; // 10s/10s/3.85s
-        let per = per_slice(seg, &samples);
-        let c0 = per[0].chars().count();
-        let c1 = per[1].chars().count();
-        assert_eq!(per[0], seg.chars().take(c0).collect::<String>());
-        assert_eq!(
-            format!("{}{}", per[0], per[1]),
-            seg.chars().take(c0 + c1).collect::<String>()
-        );
-        assert_eq!(
-            format!("{}{}{}", per[0], per[1], per[2]),
-            seg,
-            "全窗拼接 == 整段"
-        );
-        assert!(
-            !per[1].is_empty() && !per[2].is_empty(),
-            "非首片不得为空（旧逻辑缺陷）"
-        );
-        assert!(c0 < seg.chars().count(), "首片不得含整段（旧逻辑缺陷）");
-    }
-
-    /// 影响面②（末尾窗比对基准 `tail_streaming_baseline`）+ 真实数据：切分后窗#0（仅片0）基准 accept；
-    /// 整段基准仍误拒。
-    #[test]
-    fn ts411_real_data_window0_accept_and_tail_baseline() {
-        let acc0 =
-            "你周末这周周末有空吗？可以一起出来见个面吗？我们可以一起喝杯咖啡，一起出去吃个饭。";
-        let samples = [160_000usize, 160_000, 61_600];
-        let per = per_slice(STREAM80, &samples);
-        assert!(
-            !acc_vs_streaming(acc0, STREAM80).accept,
-            "整段基准应误拒（复现 BUILD-409）"
-        );
-        assert!(
-            acc_vs_streaming(acc0, &per[0]).accept,
-            "片0 基准应 accept（ret={:.2} len={:.2}）",
-            acc_vs_streaming(acc0, &per[0]).retention,
-            acc_vs_streaming(acc0, &per[0]).len_ratio
-        );
-        let b = tail_streaming_baseline(&per[1], samples[1], samples[1], &per[2]);
-        assert!(
-            b.starts_with(&per[1]) && b.ends_with(&per[2]),
-            "末尾窗基准 = 前片全 + pending 片"
-        );
-        assert!(!per[2].is_empty());
-    }
-
-    /// 影响面③（🔴 关键）：切分 + 末尾窗**被拒** ⇒ pending 兜底文本 = 该 pending 片的分配文本（非空）；
-    /// 经 OrderedReflow 回灌后最终文本**不重复不缺失**。（旧逻辑：非首片 recent_streaming 为空 ⇒ 兜底为空 ⇒ 丢字。）
-    #[test]
-    fn ts411_split_tail_reject_pending_fallback_nonempty_no_loss() {
-        let samples = [160_000usize, 160_000, 61_600];
-        let per = per_slice(STREAM80, &samples);
-        assert!(
-            !per[2].is_empty(),
-            "切分后 pending 片分配文本不得为空（旧逻辑缺陷）"
-        );
-        let tail_baseline = tail_streaming_baseline(&per[1], samples[1], samples[1], &per[2]);
-        assert!(
-            !acc_vs_streaming("完全无关的幻觉文本", &tail_baseline).accept,
-            "幻觉应拒"
-        );
-        let prev_punct = "你周末这周周末有空吗？可以一起出来见个面吗？";
-        let pending_punct = format!("{}。", per[2]);
-        let mut o = OrderedReflow::new();
-        let _ = o.push_window(0, 0, 2, vec![160_000, 160_000], prev_punct.to_string());
-        let _ = o.push_window(1, 2, 3, vec![61_600], pending_punct.clone());
-        let (committed, last) = o.finish();
-        let full = format!("{committed}{last}");
-        assert_eq!(
-            full,
-            format!("{prev_punct}{pending_punct}"),
-            "前片不重、pending 只能追加一次"
-        );
-        assert!(full.contains(per[2].trim()), "pending 片内容不得丢失");
-    }
-
-    /// 影响面③（被拒兜底、空文本）：pending 兜底文本为空时不得 panic、不产生孤立标点。
-    #[test]
-    fn ts411_pending_fallback_empty_text_no_panic() {
-        let mut o = OrderedReflow::new();
-        let _ = o.push_window(0, 0, 1, vec![100], "前文。".to_string());
-        let _ = o.push_window(1, 1, 2, vec![50], String::new());
-        let (c, l) = o.finish();
-        assert_eq!(format!("{c}{l}"), "前文。");
-    }
-
-    /// 影响面④ + partial_win_committed：344-G `hole_fill_decision` 生产区**无调用点**（保留可回挂）⇒
-    /// 411 不影响；`partial_win_committed` 只用样本/字数、不读流式文本 ⇒ 不受影响（源码护栏）。
-    #[test]
-    fn ts411_hole_fill_and_partial_win_unaffected_source_guard() {
-        // 注：main.rs 的 `#[cfg(test)]` 模块与生产代码**交错**，不能用 `split("#[cfg(test)]")` 取「生产区」
-        //（会把函数定义截掉）⇒ 改为**定位具体函数体**（该体自身不含测试）。
-        let src = crate::MAIN_RS_SRC;
-        // 344-G：保留但已摘接线（`#[allow(dead_code)]` + 生产无调用点）。
-        assert!(
-            src.contains("#[allow(dead_code)]\nfn hole_fill_decision("),
-            "hole_fill_decision 应保留为 dead-code（344-G 摘接线）"
-        );
-        let i = src
-            .find("fn partial_win_committed(")
-            .expect("partial_win_committed 锚点缺失");
-        // 🔴 按 char 取（`src` 含中文，字节切片会落在多字节中间 panic）。
-        let body: String = src[i..].chars().take(900).collect();
-        assert!(
-            !body.contains("slice_streaming_text") && !body.contains("streaming"),
-            "partial_win_committed 不得依赖流式文本分配（389 预览边界不受 411 影响）"
-        );
-    }
-
-    /// 源码护栏：`slice_streaming_text` 不再有「k==0 返回整段、其余返回空」旧逻辑；生产调用传样本。
-    #[test]
-    fn ts411_no_k0_whole_legacy_source_guard() {
-        // 注：main.rs 测试模块与生产代码**交错**，不能按 `#[cfg(test)]` 前缀切分（会截掉函数定义）
-        // ⇒ 按**函数体**定位。
-        let src = crate::MAIN_RS_SRC;
-        let i = src
-            .find("fn slice_streaming_text(")
-            .expect("slice_streaming_text 锚点缺失");
-        // 🔴 按 char 取（`src` 含中文，字节切片会落在多字节中间 panic）。
-        let body: String = src[i..].chars().take(700).collect();
-        assert!(body.contains("slice_samples"), "新实现须按各片样本数分配");
-        assert!(
-            !body.contains("if k == 0"),
-            "不得再有 `if k == 0` 整段旧逻辑"
-        );
-        assert!(src.contains("&new_lens"), "生产调用须传各片样本数 new_lens");
-    }
-}
-
-// =====================================================================
-// TEST-SYNC-411（阶段三 · 非作者护栏 · coder-1）：给 FIX-SPLIT-SLICE-STREAMING-411
-// （作者 coder-2）按**设计契约**补独立用例。重点是**组合**（切片分配 × 组窗 × 406 ×
-// 410 末尾窗 × OrderedReflow 回灌），不复用作者 `fix411_tests` 的夹具与断言。
-//
-// 契约出处：`collab/inbox/coder-1/task.md`（TEST-SYNC-411）与 411 result.md / 任务书。
-// 真实数据：BUILD-409 16:44Z 23.85s 录音（`target/release/debug.log:1212+`）——
-//   - 整段流式 86 字（日志按 80 字截断 ⇒ 夹具 `STREAM80` 为前 80 字，与作者一致）；
-//   - 三窗真实精解（日志 DBG-406 verdict #0/#1/#2）：ACC0/ACC1/ACC2；
-//   - 片样本 [10s,10s,3.85s] = [160000,160000,61600]。
-// 🔴 白名单：只 `rustfmt --config skip_children=true src/main.rs` + `cargo check --all-targets`；
-//    **未跑 `cargo test`**（阶段三禁止；由 tester-1 执行）。期望值经**沙箱复刻** 406 判据与
-//    `plan_windows` 逐条验算（ret/len 与生产一致：win0 accept 0.882/1.088、整段 reject 0.412/0.463）。
-// =====================================================================
-#[cfg(test)]
-mod testsync411_tests {
-    use super::{plan_windows, slice_streaming_text, tail_streaming_baseline, tail_window_span};
-    use crate::transcription::{acc_vs_streaming, OrderedReflow};
-
-    /// BUILD-409 16:44Z 整段流式（日志 80 字截断版，与作者夹具逐字一致）。
-    const STREAM80: &str = "啊周周末周周周末有空吗可一起出来见个面吧我们可以一起喝杯咖啡一起出去吃个饭也可以起出来求政这样大家说来透透气这样挺好也不用整天待在家里面是不是我觉得这样可以你可";
-    /// 三窗真实精解（DBG-406 verdict #0/#1/#2，acc_chars=41/49/28）。
-    const ACC0: &str =
-        "你周末这周周末有空吗？可以一起出来见个面吗？我们可以一起喝杯咖啡，一起出去吃个饭。";
-    const ACC1: &str = "也可以一起出来走走，这样大家出来透透气，这样挺好。也不用整天待在家里面，是不是？我觉得这样可以吧。";
-    const ACC2: &str = "待在家里面，是不是？我觉得这样可以吧？你可以出来见面吗？";
-    /// 本次派发三片样本数（10s / 10s / 3.85s @16k）。
-    const SAMPLES: [usize; 3] = [160_000, 160_000, 61_600];
-    /// 对应片时长（秒），供 `plan_windows`。
-    const DURS: [f32; 3] = [10.0, 10.0, 3.85];
-
-    fn per_slice(seg: &str, samples: &[usize]) -> Vec<String> {
-        (0..samples.len())
-            .map(|k| slice_streaming_text(k, seg, samples))
-            .collect()
-    }
-
-    /// 契约 1（性质）：任意片数 / 任意样本分布（含 0 样本片、极不均匀）下**各片拼接逐字等于整段**；
-    /// 单片 == 整段；空文本 / 总样本 0 / k 越界 ⇒ 空且不 panic；多字节按 char 安全。
-    #[test]
-    fn ts411guard_split_property_all_distributions() {
-        let seg = STREAM80;
-        let dists: [&[usize]; 6] = [
-            &[1, 1, 1],
-            &[5, 1, 1, 1, 0, 0, 3], // 含 0 样本片
-            &[0, 0, 1],             // 前两片 0（极不均匀）
-            &[1, 0, 0, 2],          // 中间 0
-            &[7, 7, 7, 7, 7],       // 5 片
-            &[381_600],             // 单片
-        ];
-        for d in dists {
-            let per = per_slice(seg, d);
-            assert_eq!(per.len(), d.len());
-            assert_eq!(per.concat(), seg, "任意分布各片拼接==整段：{d:?}");
-        }
-        // 极不均匀：0 样本片为空、末片承载全部，仍不丢不重。
-        let per = per_slice(seg, &[0, 0, 1]);
-        assert!(per[0].is_empty() && per[1].is_empty(), "0 样本片应为空");
-        assert_eq!(per[2], seg, "0 样本片不占字、末片承载全部");
-        // 边界：空文本 / 总样本 0 / k 越界 ⇒ 空串（不 panic）；单片 ⇒ 整段。
-        assert_eq!(slice_streaming_text(0, "", &[1, 1]), "");
-        assert_eq!(slice_streaming_text(0, seg, &[0, 0]), "");
-        assert_eq!(slice_streaming_text(5, seg, &[1, 1]), "", "k 越界 ⇒ 空");
-        assert_eq!(slice_streaming_text(0, seg, &[123]), seg, "单片 ⇒ 整段");
-        // 多字节（含 emoji）：按 char 切、不落在字节中间。
-        let multi = "a你😀b好👋c"; // 7 chars
-        let per = per_slice(multi, &[1, 1]);
-        assert_eq!(per.concat(), multi, "多字节按 char、不丢不重");
-        assert_eq!(
-            per[0].chars().count() + per[1].chars().count(),
-            7,
-            "各片字数之和 == 总字数"
-        );
-        assert_eq!(per[0].chars().count(), 4, "边界 round(7×1/2)=4");
-    }
-
-    /// 契约 2（常规滑窗组合）：切成 3 片后，按**真实组窗规则**（`plan_windows`）组出的每窗，
-    /// 其流式基准 = 该窗**覆盖各片**的分配文本拼接 —— 不含未覆盖片、也不缺覆盖片。
-    #[test]
-    fn ts411guard_regular_window_composition_real() {
-        let per = per_slice(STREAM80, &SAMPLES);
-        // 真实组窗：一次派发 3 片 ⇒ 实时两窗 + 收尾一窗 = [0,1)(1,2)(2,3)。
-        let live = plan_windows(&[], &DURS, 0, None);
-        assert_eq!(live.windows, vec![(0usize, 1usize), (1, 2)]);
-        assert_eq!(live.pending, Some(2), "末片延后为待覆盖片");
-        // 423：收尾走末尾窗（有前片 ⇒ span (1,3)：前片后缀 + pending），不再单独 (2,3)。
-        let tail_span = tail_window_span(live.pending, 0, DURS.len());
-        assert_eq!(tail_span, Some((1usize, 3usize, 2usize)));
-        let windows: Vec<(usize, usize)> = live
-            .windows
-            .iter()
-            .copied()
-            .chain(std::iter::once((
-                tail_span.unwrap().0,
-                tail_span.unwrap().1,
-            )))
-            .collect();
-        assert_eq!(windows, vec![(0, 1), (1, 2), (1, 3)]);
-
-        // 411 缺陷回归：非首片不得为空、首片不得含整段（旧逻辑首片=整段、后片=空）。
-        assert!(!per[0].is_empty() && !per[1].is_empty() && !per[2].is_empty());
-        assert!(
-            per[0].chars().count() < STREAM80.chars().count(),
-            "首片不得含整段（撑大基准）"
-        );
-        // 每窗基准 = 其覆盖片的分配文本拼接；三片合起来恰为整段（不缺不重）。
-        // 结构：首片=整段前缀、末片=整段后缀、窗 0+1 = 整段前缀。
-        assert!(STREAM80.starts_with(&per[0]), "首片应为整段前缀");
-        assert!(STREAM80.ends_with(&per[2]), "末片应为整段后缀");
-        assert!(
-            STREAM80.starts_with(&format!("{}{}", per[0], per[1])),
-            "窗 0+1 应为整段前缀"
-        );
-        assert_eq!(
-            format!("{}{}{}", per[0], per[1], per[2]),
-            STREAM80,
-            "窗 0+1+2 覆盖全部片 ⇒ 拼接 == 整段"
-        );
-        // 反向：任一窗基准不得吞并未覆盖片（与下一片拼接后长度严格增大）。
-        for k in 0..2 {
-            let mut joined = per[k].clone();
-            joined.push_str(&per[k + 1]);
-            assert!(
-                per[k].chars().count() < joined.chars().count(),
-                "窗 {k} 基准不得已含下一片"
-            );
-        }
-    }
-
-    /// 契约 3（切分 + 末尾窗 accept）：pending 为**非首片**时，410 基准（`tail_streaming_baseline`）
-    /// 两部分均非空，真实精解 accept；411 前该 pending 片为空 ⇒ 基准信息缺失。
-    #[test]
-    fn ts411guard_tail_window_baseline_split_accept() {
-        let per = per_slice(STREAM80, &SAMPLES);
-        assert!(
-            !per[1].is_empty() && !per[2].is_empty(),
-            "非首片（末尾窗前片/pending）不得为空（411 前为空）"
-        );
-        // 末尾窗：前片=片1（整片后缀）、pending=片2；410 基准 = 前片末尾相应字数 + pending 片。
-        let b = tail_streaming_baseline(&per[1], SAMPLES[1], SAMPLES[1], &per[2]);
-        assert!(
-            b.starts_with(&per[1]) && b.ends_with(&per[2]),
-            "基准 = 前片全 + pending 片"
-        );
-        // 末尾窗真实精解（片1+片2 的带标点结果）对切分后基准 accept。
-        let tail_acc = format!("{ACC1}{ACC2}");
-        let v = acc_vs_streaming(&tail_acc, &b);
-        assert!(
-            v.accept,
-            "真实精解对切分后基准应 accept（ret={:.2} len={:.2}）",
-            v.retention, v.len_ratio
-        );
-        // 411 前对照：pending 片为空 ⇒ 基准只剩前片（信息缺失）。
-        let stale = tail_streaming_baseline(&per[1], SAMPLES[1], SAMPLES[1], "");
-        assert_eq!(stale, per[1], "411 前 pending 为空 ⇒ 基准缺 pending 内容");
-    }
-
-    /// 契约 4（切分 + 末尾窗被拒）：幻觉仍被拒；被拒 ⇒ **只替 pending 片**兜底、文本非空、前片不动；
-    /// 411 前 pending 片为空 ⇒ 该片内容丢失（对照）。
-    #[test]
-    fn ts411guard_tail_reject_pending_only_no_loss() {
-        let per = per_slice(STREAM80, &SAMPLES);
-        let b = tail_streaming_baseline(&per[1], SAMPLES[1], SAMPLES[1], &per[2]);
-        assert!(
-            !acc_vs_streaming("完全无关的幻觉文本", &b).accept,
-            "幻觉对切分后基准仍应被拒"
-        );
-        let prev_punct = ACC1;
-        let pending_fallback = per[2].clone();
-        assert!(
-            !pending_fallback.is_empty(),
-            "pending 兜底文本不得为空（411 前为空 ⇒ 丢字）"
-        );
-        // 回灌：前窗（span 1..2）= 已通过精解；末尾窗（span 2..3）= pending 兜底。
-        let mut o = OrderedReflow::new();
-        let _ = o.push_window(0, 1, 2, vec![SAMPLES[1]], prev_punct.to_string());
-        let _ = o.push_window(1, 2, 3, vec![SAMPLES[2]], pending_fallback.clone());
-        let (committed, last) = o.finish();
-        assert_eq!(
-            format!("{committed}{last}"),
-            format!("{prev_punct}{pending_fallback}"),
-            "前片一字不动 + pending 只追加一次"
-        );
-        // 对照：411 前 pending 兜底为空 ⇒ 该片内容丢失。
-        let mut o_old = OrderedReflow::new();
-        let _ = o_old.push_window(0, 1, 2, vec![SAMPLES[1]], prev_punct.to_string());
-        let _ = o_old.push_window(1, 2, 3, vec![SAMPLES[2]], String::new());
-        let (c2, l2) = o_old.finish();
-        assert!(
-            !format!("{c2}{l2}").contains(pending_fallback.trim()),
-            "411 前 pending 为空 ⇒ 丢字（对照）"
-        );
-    }
-
-    /// 契约 5（端到端无重复）：BUILD-409 16:44Z 真实三窗文本走真实组窗 + 406 判据 + `OrderedReflow`
-    /// 回灌 —— 新逻辑（411）最终文本 == 三窗精解**各一次**、无整段流式兜底；旧逻辑（整段记首片）
-    /// 复现「整段原文重复一遍」。
-    #[test]
-    fn ts411guard_e2e_build409_no_duplication() {
-        let per = per_slice(STREAM80, &SAMPLES);
-        let acc = [ACC0.to_string(), ACC1.to_string(), ACC2.to_string()];
-        // 真实性复现：窗0 精解对**整段**基准误拒（BUILD-409），对**切分片0** accept。
-        assert!(
-            !acc_vs_streaming(&acc[0], STREAM80).accept,
-            "复现：整段基准误拒（ret={:.2}）",
-            acc_vs_streaming(&acc[0], STREAM80).retention
-        );
-        assert!(
-            acc_vs_streaming(&acc[0], &per[0]).accept,
-            "切分后片0 基准 accept（ret={:.2}）",
-            acc_vs_streaming(&acc[0], &per[0]).retention
-        );
-        // 411（本测只验「流式按片分配」）：用三窗 (0,1)(1,2)(2,3) 的**确定性**布局，
-        // 与 423 后的末尾窗 span 解耦（423 末尾窗形状另有专门用例）。
-        let windows: Vec<(usize, usize)> = vec![(0, 1), (1, 2), (2, 3)];
-
-        // 逐窗回灌：基准由 `bases` 给（生产=覆盖片分配文本 / 旧=整段记首片），406 判据定精解或兜底。
-        let run = |bases: &[String]| -> String {
-            let mut o = OrderedReflow::new();
-            for (i, (ws, we)) in windows.iter().enumerate() {
-                let base = &bases[i];
-                let chosen = if acc_vs_streaming(&acc[i], base).accept {
-                    acc[i].clone()
-                } else {
-                    base.clone()
-                };
-                o.push_window(i, *ws, *we, SAMPLES[*ws..*we].to_vec(), chosen);
-            }
-            let (c, l) = o.finish();
-            format!("{c}{l}")
-        };
-        // NEW（411）：各窗基准 = 覆盖片分配文本。
-        let new_bases: Vec<String> = per.clone();
-        let new_final = run(&new_bases);
-        // OLD（411 前）：整段只记首片、其余为空 ⇒ 窗0 整段基准误拒 ⇒ 整段兜底。
-        let old_bases: Vec<String> = vec![STREAM80.to_string(), String::new(), String::new()];
-        let old_final = run(&old_bases);
-
-        // 无重复：新最终文本 == 三窗精解按序各一次。
-        assert_eq!(
-            new_final,
-            format!("{}{}{}", acc[0], acc[1], acc[2]),
-            "三窗精解拼接恰各一次（411 消除的是**整段流式**重复；相邻窗精解间同人短语重叠属组窗粒度、非 411）"
-        );
-        // 无缺失：三窗精解内容均在。
-        for a in &acc {
-            assert!(new_final.contains(a.trim()), "不得缺字：{a}");
-        }
-        // 411 后不得再把整段流式当兜底。
-        let head: String = STREAM80.chars().take(30).collect();
-        assert!(!new_final.contains(&head), "411 后不得含整段流式兜底");
-        // 旧逻辑对照：整段流式被当窗0 兜底 ⇒ 原文重复、更长。
-        assert!(
-            old_final.contains(&head),
-            "旧逻辑含整段流式兜底（复现重复）"
-        );
-        assert!(
-            old_final.chars().count() > new_final.chars().count(),
-            "旧逻辑因重复而更长（old={} new={}）",
-            old_final.chars().count(),
-            new_final.chars().count()
-        );
-    }
-}
-
-// =====================================================================
-// TEST-SYNC-423-427-429（阶段三 · 非作者护栏 · coder-2）
-//   423 收尾统一末尾组窗：emit_tail_window! 单宏两调用 / tail_window_alone 决策 / plan_windows 去 is_tail·规则4
-//   427 所有窗带前片后缀：short_context_span(ge,must_start,buf_base) 独立下标构造 / 兜底只覆 must 片
-//   429 他人段移除：reflow_preview 三态 / compose 短路反证 / hide 源码锚点
-//   🔴 白名单：只 rustfmt + cargo check；未跑 cargo test。生产零改动。
-// =====================================================================
-#[cfg(test)]
-mod testsync423_427_429_tests {
-    use super::{
-        compose_reflow_preview, plan_windows, reflow_preview, short_context_span,
-        tail_window_alone, tail_window_span,
-    };
-
-    // ---------------- 423 ----------------
-
-    /// 契约 1：末尾窗是**同一个宏** `emit_tail_window!`，长静默 / 松键各 1 处调用（生产区）。
-    #[test]
-    fn ts423g_tail_macro_single_shared_source_anchor() {
-        let prod =
-            crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC).join("\n");
-        assert!(
-            prod.contains(concat!("macro_rules! emit_tail_", "window")),
-            "末尾窗须是唯一宏 emit_tail_window!"
-        );
-        assert_eq!(
-            prod.matches(concat!("emit_tail_", "window!(")).count(),
-            2,
-            "长静默 + 松键 各恰 1 处调用"
-        );
-        assert!(prod.contains("\"long_silence\""), "长静默来源标注缺失");
-        assert!(prod.contains("\"stop\""), "松键来源标注缺失");
-    }
-
-    /// 契约 2：`tail_window_alone` —— 首片 ⇒ `(p,p+1)`；越界 / p<base / 无 pending ⇒ None；
-    /// 与 `tail_window_span` 在**决策层**互斥（有前片走 span，首片走 alone）。
-    #[test]
-    fn ts423g_tail_window_alone_first_slice_and_bounds() {
-        // 首片（i==0）：alone 单独解，span 无解。
-        assert_eq!(tail_window_alone(Some(5), 5, 3), Some((5, 6)));
-        assert_eq!(tail_window_span(Some(5), 5, 3), None);
-        // 越界（i >= recent_len）。
-        assert_eq!(tail_window_alone(Some(8), 5, 3), None);
-        assert_eq!(tail_window_span(Some(8), 5, 3), None);
-        // p < base。
-        assert_eq!(tail_window_alone(Some(4), 5, 3), None);
-        // 无 pending。
-        assert_eq!(tail_window_alone(None, 5, 3), None);
-        // i>0：span 有解（决策优先），alone 亦有解但不被采用。
-        assert_eq!(tail_window_span(Some(6), 5, 3), Some((5, 7, 1)));
-        assert_eq!(tail_window_alone(Some(6), 5, 3), Some((6, 7)));
-        let decide = |p: Option<usize>, base: usize, len: usize| -> Option<(usize, usize)> {
-            if let Some((gs, ge, _)) = tail_window_span(p, base, len) {
-                Some((gs, ge))
-            } else {
-                tail_window_alone(p, base, len)
-            }
-        };
-        assert_eq!(decide(Some(5), 5, 3), Some((5, 6)), "首片 ⇒ alone");
-        assert_eq!(decide(Some(6), 5, 3), Some((5, 7)), "有前片 ⇒ span");
-    }
-
-    /// 契约 3：`plan_windows` 不再有 `is_tail` / 规则 4；多片末片延后为 pending；
-    /// 松键收尾用 `pending_slice.take()` 清空（不重复组窗）。
-    #[test]
-    fn ts423g_plan_windows_no_tail_rules_and_pending_taken() {
-        let p1 = plan_windows(&[4.0f32, 4.0, 4.0], &[4.0], 0, None);
-        assert_eq!(p1.pending, None, "单片不产生 pending");
-        assert_eq!(p1.windows.len(), 1);
-        let p2 = plan_windows(&[4.0f32, 4.0, 4.0], &[4.0, 4.0], 0, None);
-        assert!(p2.pending.is_some(), "多片（≥2）末片须延后为 pending");
-        assert_eq!(p2.windows.len(), 1, "仅倒数第二片成窗（末片延后）");
-        // 源码锚点（严格限定签名区，避开注释里出现的字面量）。
-        let prod =
-            crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC).join("\n");
-        let rest = prod
-            .split("fn plan_windows(")
-            .nth(1)
-            .expect("plan_windows 锚点缺失");
-        let sig = &rest[..rest
-            .find(") -> WindowPlan {")
-            .expect("plan_windows 签名尾缺失")];
-        assert!(
-            !sig.contains(concat!("is_", "tail")),
-            "plan_windows 签名不得再有 is_tail 参数"
-        );
-        assert!(
-            !sig.contains(concat!("TAIL_MERGE_", "MAX_SECS")),
-            "plan_windows 签名不得再带规则 4 阈值"
-        );
-        assert!(
-            prod.contains(concat!("pending_slice.", "take()")),
-            "松键收尾须 take() 清空 pending（不重复组窗）"
-        );
-    }
-
-    // ---------------- 427 ----------------
-
-    /// 契约 4：`short_context_span(ge, must_start, buf_base)` 独立下标构造。
-    #[test]
-    fn ts427g_short_context_span_independent_cases() {
-        // 长新片：组窗排除前片（gs==must_start=11），前片 10 仍在缓冲（buf_base=10）⇒ 仍取 10。
-        assert_eq!(short_context_span(12, 11, 10), Some(10));
-        // 首片 ⇒ None。
-        assert_eq!(short_context_span(3, 0, 0), None);
-        // 前片已出缓冲（must_start-1 < buf_base）⇒ None。
-        assert_eq!(short_context_span(9, 8, 9), None);
-        // must_start == ge（无 must 片）⇒ None。
-        assert_eq!(short_context_span(5, 5, 0), None);
-        // 老情形（窗内还有更早整片 gs < must_start-1）⇒ 仍只取紧邻前一片。
-        assert_eq!(short_context_span(20, 15, 0), Some(14));
-    }
-
-    /// 契约 5：带前文窗调用点传 `buf_base`；兜底 `context_tail_pending` span 起点 = `must_start`。
-    #[test]
-    fn ts427g_context_span_and_tail_pending_anchors() {
-        let prod =
-            crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC).join("\n");
-        assert!(
-            prod.contains(concat!("short_context_span(ge, must_start, ", "buf_base)")),
-            "调用点须传 buf_base 判定前片是否在缓冲"
-        );
-        assert!(
-            prod.contains(concat!("fn context_tail_", "pending(")),
-            "带前文窗兜底构造函数缺失"
-        );
-        assert!(
-            prod.contains(concat!("span: (must_start, ", "ge)")),
-            "兜底 span 起点必须 = must_start（只覆 must 片）"
-        );
-    }
-
-    // ---------------- 429 ----------------
-
-    /// 契约 6：`reflow_preview` 三态 + 多字节中文按 char 切。
-    #[test]
-    fn ts429g_reflow_preview_cases() {
-        assert_eq!(
-            reflow_preview("", "abcdef", 3),
-            "def",
-            "acc 空 ⇒ raw[committed..]"
-        );
-        assert_eq!(
-            reflow_preview("权威前缀", "abcdef", 3),
-            "权威前缀def",
-            "acc 非空 ⇒ acc + raw[committed..]"
-        );
-        assert_eq!(
-            reflow_preview("权威前缀", "abcdef", 6),
-            "权威前缀",
-            "committed ≥ raw 长 ⇒ 只剩 acc"
-        );
-        assert_eq!(
-            reflow_preview("权威前缀", "abc", 9),
-            "权威前缀",
-            "committed 超长 ⇒ 只剩 acc"
-        );
-        // 多字节中文：raw 6 字，跳过前 2 字（我们）⇒ 留「一起走吧」。
-        assert_eq!(reflow_preview("确定", "我们一起走吧", 2), "确定一起走吧");
-        assert_eq!(reflow_preview("", "我们一起走吧", 0), "我们一起走吧");
-    }
-
-    /// 契约 7（反证）：`compose_reflow_preview` 在 acc 空时**短路返回 raw** ⇒ 会把他人段留下；
-    /// 这正是 429 hide 分支改用 `reflow_preview` 的原因。
-    #[test]
-    fn ts429g_compose_shortcircuit_proof() {
-        assert_eq!(
-            compose_reflow_preview(1, "", "abcdef", 3),
-            "abcdef",
-            "acc 空 ⇒ compose 短路返回 raw（他人段仍在）"
-        );
-        assert_eq!(
-            reflow_preview("", "abcdef", 3),
-            "def",
-            "同参 reflow_preview 正确剔除前 3 字"
-        );
-    }
-
-    /// 契约 7（源码锚点）：hide 回灌仅 1 处且在 `if full_drop` 内；常规回灌显式 false；
-    /// 渲染 hide 分支用 `reflow_preview`（非 compose）。
-    #[test]
-    fn ts429g_hide_source_anchor() {
-        let prod =
-            crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC).join("\n");
-        assert_eq!(
-            prod.matches(concat!("non_user_", "hide: true")).count(),
-            1,
-            "hide 回灌只应 1 处"
-        );
-        assert!(
-            prod.contains(concat!("non_user_", "hide: false")),
-            "常规回灌须显式 non_user_hide: false"
-        );
-        assert!(
-            prod.contains(concat!("[DBG-429] hide", " non-user segment")),
-            "缺 [DBG-429] 埋点"
-        );
-        assert!(
-            prod.contains(concat!(
-                "reflow_preview(acc_text, &streaming, ",
-                "committed_len)"
-            )),
-            "hide 渲染分支须用 reflow_preview"
-        );
-        let at = prod
-            .find(concat!("non_user_", "hide: true"))
-            .expect("hide 发送缺失");
-        let cond = prod[..at]
-            .rfind("if full_drop")
-            .expect("hide 须在 full_drop 内");
-        assert!(
-            at - cond < 1500,
-            "hide 发送须在 full_drop 块内（{at}-{cond}）"
-        );
-        assert!(
-            prod.contains("if action == ReflowAction::Applied"),
-            "回灌渲染须经 reflow_action 门（编辑态不改）"
-        );
-    }
-}
-
 // =====================================================================
 // UI-FOCUSLOST-WINDOW-430：回显窗尺寸（宽 ×1.7 + 夹紧）与布局（正文本/底部按钮不重叠）纯函数护栏
 // =====================================================================
@@ -22667,293 +14077,6 @@ mod testsync430_tests {
     }
 }
 
-// =====================================================================
-// SEAM-INTERIOR-ONLY-436：重叠区分界（派发侧）纯函数护栏。
-// mod.rs 接线待第二阶段；本阶段只验证分界计算（中间 40%~60% 最近真停顿 / 中点）。
-// =====================================================================
-#[cfg(test)]
-mod interior436_tests {
-    use super::window_overlap_split;
-
-    const RATE: usize = 16000;
-
-    /// 定点合成：全片直流有声（0.5），`[s,e)` 置 0（静音）。
-    fn synth(len: usize, sil: &[(usize, usize)]) -> Vec<f32> {
-        let mut a = vec![0.5f32; len];
-        for &(s, e) in sil {
-            for x in a.iter_mut().take(e).skip(s) {
-                *x = 0.0;
-            }
-        }
-        a
-    }
-
-    /// 无上一窗 / 无共享 / 空音频 ⇒ None。
-    #[test]
-    fn interior436_no_overlap_is_none() {
-        let audio = synth(16000, &[]);
-        assert_eq!(window_overlap_split(0, None, &audio, &[16000]), None);
-        assert_eq!(
-            window_overlap_split(5, Some(5), &audio, &[16000]),
-            None,
-            "span 起点 == 上一窗末 ⇒ 无共享"
-        );
-        assert_eq!(
-            window_overlap_split(6, Some(5), &audio, &[16000]),
-            None,
-            "span 起点在上一窗末之后 ⇒ 无共享"
-        );
-        assert_eq!(
-            window_overlap_split(0, Some(1), &audio, &[]),
-            None,
-            "无样本表 ⇒ 无共享"
-        );
-        assert_eq!(
-            window_overlap_split(0, Some(1), &audio, &[0]),
-            None,
-            "共享 0 样本 ⇒ None"
-        );
-        assert_eq!(
-            window_overlap_split(0, Some(1), &[], &[100]),
-            None,
-            "空音频 ⇒ None"
-        );
-    }
-
-    /// 全静音短重叠（候选不足 6 帧）⇒ 中点 0.5。
-    #[test]
-    fn interior436_all_silence_is_midpoint() {
-        let audio = vec![0.0f32; 1000];
-        assert_eq!(window_overlap_split(0, Some(1), &audio, &[1000]), Some(0.5));
-    }
-
-    /// 静音段中心在 40% / 50% / 60% ⇒ 分界跟踪该比例（严格 ∈(0,1)）。
-    /// 静音宽 0.1n（50 帧，边缘各损 ~1 帧 ⇒ 检测中点偏移 ≤0.03n）。
-    #[test]
-    fn interior436_split_tracks_pause() {
-        let n = 10 * RATE;
-        for (lo_f, want) in [(0.35f32, 0.4f32), (0.45, 0.5), (0.55, 0.6)] {
-            let s = (n as f32 * lo_f) as usize;
-            let e = (n as f32 * (lo_f + 0.1)) as usize;
-            let a = synth(n, &[(s, e)]);
-            let got = window_overlap_split(0, Some(1), &a, &[n]).expect("有共享必有分界");
-            assert!(got > 0.0 && got < 1.0, "分界须严格 ∈(0,1)，实测 {got}");
-            assert!(
-                (got - want).abs() < 0.03,
-                "静音中心 {want} ⇒ 分界≈{want}，实测 {got}"
-            );
-        }
-    }
-
-    /// 共享切片数决定重叠长度（只取前 shared 片样本）。
-    #[test]
-    fn interior436_shared_slices_bound_overlap() {
-        // 两片各 8000 样本、第二片全静音：只共享第一片（全有声）⇒ 无候选 ⇒ 中点。
-        let mut a = vec![0.5f32; 16000];
-        for x in a.iter_mut().take(16000).skip(8000) {
-            *x = 0.0;
-        }
-        let one = window_overlap_split(0, Some(1), &a, &[8000, 8000]).expect("有共享");
-        assert!(
-            (one - 0.5).abs() < 1e-6,
-            "只共享有声首片 ⇒ 中点，实测 {one}"
-        );
-        // 共享两片 ⇒ 重叠含静音（静音恰在 50% 处）⇒ 分界≈0.5 附近且 ∈(0,1)。
-        // （静音 [8000,16000) 占重叠后半；中点 8000 附近若无候选则回落中点 0.5。）
-        let two = window_overlap_split(0, Some(2), &a, &[8000, 8000]).expect("有共享");
-        assert!(two > 0.0 && two < 1.0, "实测 {two}");
-    }
-}
-
-// =====================================================================
-// FALLBACK-EXCLUDE-FARFIELD-446：兜底剔除远场区间对应的流式字
-// =====================================================================
-#[cfg(test)]
-mod fallback_far_446_tests {
-    use super::{fallback_ranges_with_far, kept_streaming_text};
-
-    const S: usize = 16000;
-
-    /// 无远场 / 无语音轴（声纹未运行）⇒ None（兜底逐位不变、语音轴未知绝不删字）。
-    #[test]
-    fn t446_none_when_no_far_or_no_axis() {
-        assert_eq!(fallback_ranges_with_far(&[(0, S)], &[], &[]), None);
-        assert_eq!(fallback_ranges_with_far(&[], &[], &[(0, S)]), None);
-    }
-
-    /// 远场从保留中减去、并入剔除。
-    #[test]
-    fn t446_far_subtracted_from_kept() {
-        let (k, d) = fallback_ranges_with_far(&[(0, 10 * S)], &[], &[(6 * S, 8 * S)]).unwrap();
-        assert_eq!(k, vec![(0, 6 * S), (8 * S, 10 * S)]);
-        assert_eq!(d, vec![(6 * S, 8 * S)]);
-    }
-
-    /// 15:23 端测复现形态：本人 1.33s 在前、远场背景 1.12s + 0.67s 在后，流式把两者连成一串。
-    /// 兜底裁剪后只留本人部分（前段），背景误识别字被删。
-    #[test]
-    fn t446_fallback_keeps_user_drops_far() {
-        let user = (0usize, (1.33 * S as f32) as usize);
-        let far1 = ((3.0 * S as f32) as usize, (4.12 * S as f32) as usize);
-        let far2 = ((5.0 * S as f32) as usize, (5.67 * S as f32) as usize);
-        let kept = [user, far1, far2]; // 声纹全判保留（KeepShort）
-        let streaming = "片我觉得很刺在才能在他的的操作搞成一务";
-        let (k2, d2) = fallback_ranges_with_far(&kept, &[], &[far1, far2]).unwrap();
-        let out = kept_streaming_text(streaming, 10 * S, 0, &k2, &d2, None);
-        assert!(out.starts_with("片我觉得"), "本人部分须保留：{out}");
-        assert!(!out.contains("操作"), "远场背景字须删：{out}");
-        assert!(out.chars().count() < streaming.chars().count());
-    }
-
-    /// 接线：常规窗与末尾窗 pending 两处兜底都走 446；406 比对基准仍用原 `fb`（不变）。
-    #[test]
-    fn t446_wiring() {
-        let prod =
-            crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC).join("\n");
-        assert_eq!(
-            prod.matches(concat!("fallback_ranges_with_far", "("))
-                .count(),
-            3,
-            "定义 + 两处调用"
-        );
-        assert!(prod.contains(concat!("transcription::acc_vs_streaming(&decoded, ", "fb)")));
-        assert!(prod.contains(concat!("&fb_", "final,")));
-        assert!(prod.contains(concat!("window_far_ranges.push(", "window_far)")));
-        assert!(prod.contains(concat!("window_far_ranges.push(", "$far)")));
-    }
-}
-
-/// ACC-ENGINE-LLAMACPP-452 ⑤：流式回灌的接线护栏。
-#[cfg(test)]
-mod partial_reflow_452_tests {
-    use super::{drive_acc_windows, AccWindowStep};
-    use std::time::Duration;
-
-    /// 分发循环：半截结果通道的消息在 `acc_rx` 仍打开时即被处理（不等切片 / 松键）。
-    #[test]
-    fn t452_partial_delivered_while_recording() {
-        let (acc_tx, acc_rx) = crossbeam_channel::unbounded::<u32>();
-        let (_res_tx, res_rx) = crossbeam_channel::unbounded::<u32>();
-        let (p_tx, p_rx) = crossbeam_channel::unbounded::<u32>();
-        let (seen_tx, seen_rx) = crossbeam_channel::unbounded::<&'static str>();
-        let h = std::thread::spawn(move || {
-            let mut step = |ev: AccWindowStep<u32, u32, u32>| {
-                let _ = seen_tx.send(match ev {
-                    AccWindowStep::Slice(_) => "slice",
-                    AccWindowStep::Result(_) => "result",
-                    AccWindowStep::Partial(_) => "partial",
-                });
-            };
-            drive_acc_windows(&acc_rx, &res_rx, &p_rx, || false, &mut step);
-        });
-        p_tx.send(7).unwrap();
-        assert_eq!(
-            seen_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
-            "partial"
-        );
-        drop(acc_tx);
-        h.join().unwrap();
-    }
-
-    /// 源码护栏：流式回灌只在 `OrderedReflow` **副本**上试拼接、只处理下一个待拼窗口、
-    /// 只在比当前显示更长时才发事件；分发循环把 Partial 交给它。
-    #[test]
-    fn t452_partial_reflow_uses_clone_only() {
-        let prod =
-            crate::guard_prod_lines::prod_lines_excluding_cfg_test(crate::MAIN_RS_SRC).join("\n");
-        let body = prod
-            .split(concat!("macro_rules! stream_partial", "_reflow"))
-            .nth(1)
-            .expect("stream_partial_reflow 缺失");
-        let body = body.split("macro_rules!").next().unwrap();
-        assert!(body.contains(concat!("let mut probe = ordered", ".clone();")));
-        assert!(body.contains(concat!("probe.push_window", "_timed(")));
-        assert!(
-            !body.contains(concat!("ordered.push_window", "_timed(")),
-            "流式回灌不得改动真实拼接状态"
-        );
-        assert!(body.contains(concat!("seq == ordered.", "next_seq()")));
-        assert!(body.contains(concat!("if cand_len > ", "shown")));
-        assert!(
-            body.contains(concat!("partial: ", "true,")),
-            "半截事件须带 partial 标记（浮层按精解位置定边界）"
-        );
-        assert!(prod.contains(concat!("stream_partial_reflow!(seq, ", "idx, raw)")));
-    }
-}
-
-/// ACC-452 ⑤：流式回灌替换边界（BUILD-452 端测「回缩」回归）。
-#[cfg(test)]
-mod partial_boundary_452_tests {
-    use super::{partial_reflow_boundary, reflow_preview};
-
-    /// 端测现场：预览 24 字（整窗边界 21），精解半截只出 5 字 ⇒ 边界应≈5，显示不回缩（仍 24 字）。
-    /// 旧实现按整窗边界 21 替换 ⇒ 5 + 3 = 8 字（回缩）。
-    #[test]
-    fn t452_partial_does_not_shrink_preview() {
-        let raw = "周末有空吗一起出来玩吧可以一起出去旅游然后到周边";
-        assert_eq!(raw.chars().count(), 24);
-        let cand = "周末有空吗";
-        let b = partial_reflow_boundary("", 0, cand, raw, 21).expect("有新内容应给边界");
-        assert_eq!(b, 5, "末尾两字「空吗」对齐到预览第 5 字之后");
-        let shown = reflow_preview(cand, raw, b);
-        assert_eq!(shown.chars().count(), 24, "显示不得短于回灌前（{shown}）");
-        assert!(shown.starts_with("周末有空吗一起"));
-    }
-
-    /// 精解与预览用字不同：末尾对不上 ⇒ 按新增字数估计；边界不越过整窗上限、不小于上次边界。
-    #[test]
-    fn t452_boundary_estimate_and_clamps() {
-        let raw = "今天天气很好我们出去走走吧"; // 13 字
-        let b = partial_reflow_boundary("今天", 2, "今天天汽很", raw, 10).unwrap();
-        assert_eq!(b, 5, "新增 3 字（汽≠气 对不上）⇒ 从 2 往后数 3 个");
-        assert_eq!(
-            partial_reflow_boundary("今天天气很好", 6, "今天天气很好", raw, 10),
-            None,
-            "无新增 ⇒ 不刷新"
-        );
-        let b2 = partial_reflow_boundary("", 0, "今天天气很好我们出去走走吧啊", raw, 10).unwrap();
-        assert_eq!(b2, 10, "不越过整窗边界上限");
-    }
-
-    /// 末尾两字在估计位置附近有匹配 ⇒ 以匹配为准（精解比预览多 / 少一字时不错位）。
-    #[test]
-    fn t452_tail_alignment_corrects_estimate() {
-        let raw = "嗯我们周末去公园散步吧";
-        // 精解去掉了口水词「嗯」，新增 4 有效字 ⇒ 估计停在「周」后（raw 第 4 字），末尾「周末」对齐到第 5 字后。
-        let b = partial_reflow_boundary("", 0, "我们周末", raw, 11).unwrap();
-        assert_eq!(b, 5);
-        assert_eq!(reflow_preview("我们周末", raw, b), "我们周末去公园散步吧");
-    }
-}
-
-#[cfg(test)]
-mod window_abs_456_tests {
-    use super::window_abs_geometry;
-
-    #[test]
-    fn t456_window_abs_start_and_split() {
-        // 片累计结束样本 [16000, 48000, 80000]；窗 = 片1 后缀 8000 + 片2 整片 32000，结束于片2 末（80000）。
-        let cum = [16000, 48000, 80000];
-        let (st, sp) = window_abs_geometry(&cum, 3, 1, Some(2), &[8000, 32000], Some(0.5));
-        assert!(
-            (st - 40000.0 / 16000.0).abs() < 1e-6,
-            "起点 = 80000 − 40000"
-        );
-        assert!(
-            (sp - (40000.0 + 4000.0) / 16000.0).abs() < 1e-6,
-            "分界 = 起点 + 0.5 × 重叠 8000"
-        );
-        let (_, sp) = window_abs_geometry(&cum, 3, 1, Some(2), &[8000, 32000], None);
-        assert!(
-            (sp - 48000.0 / 16000.0).abs() < 1e-6,
-            "无分界比例 ⇒ 重叠区终点（新片起点）"
-        );
-        let (st, sp) = window_abs_geometry(&cum, 1, 0, None, &[16000], None);
-        assert_eq!((st, sp), (0.0, 0.0), "首窗无重叠 ⇒ 分界 = 起点");
-    }
-}
-
 // UI-HINT-471 / UI-REC-472（Gavin 2026-10-03）：单行提示窗宽度自适应；本地实时开录不显示波纹窗、
 // 模型加载中不弹录音窗。
 #[cfg(all(test, target_os = "windows"))]
@@ -22972,33 +14095,6 @@ mod ui471_472_tests {
         assert!(w > STATUS_OVERLAY_SIZE[0]);
         assert_eq!(status_overlay_width(5000, 1000), 1000);
         assert_eq!(status_overlay_width(5000, 100), STATUS_OVERLAY_SIZE[0]);
-    }
-
-    /// 471：三语「模型加载中」提示按实际绘制字号量宽，放宽后文字区（去掉两侧留白）放得下整句；
-    /// 中文这句在原固定 240 下放不下（复现 Gavin 报的截断）。
-    #[test]
-    fn ui471_loading_hint_fits_in_all_locales() {
-        let hwnd = HWND(std::ptr::null_mut());
-        for lang in [
-            config::UiLanguage::Chinese,
-            config::UiLanguage::TraditionalChinese,
-            config::UiLanguage::English,
-        ] {
-            let hint = i18n::get(lang).local_realtime_loading_hint;
-            let text_w = measure_status_text_width(hwnd, hint);
-            assert!(text_w > 0, "{hint}：量宽失败");
-            let w = status_overlay_width(text_w, 4000);
-            assert!(
-                w - STATUS_TEXT_LEFT - STATUS_TEXT_RIGHT >= text_w,
-                "{hint}：窗宽 {w} 放不下文字 {text_w}"
-            );
-            if lang == config::UiLanguage::Chinese {
-                assert!(
-                    STATUS_OVERLAY_SIZE[0] - STATUS_TEXT_LEFT - STATUS_TEXT_RIGHT < text_w,
-                    "中文加载提示在原 240 下本应放不下（复现前提）"
-                );
-            }
-        }
     }
 
     fn prod() -> String {
@@ -23112,71 +14208,26 @@ mod ui471_472_tests {
         &p[at..end]
     }
 
-    /// 472：Windows「录音开始」处理：本地实时不发波纹窗（Recording），就绪才发「请说话...」窗；其他档照旧波纹窗。
+    /// FLASH-P3-A（替换 472 三条本地实时护栏：录音开始 / 热键开录的加载门、就绪标志发布点）：
+    /// 两条在线路径按热键即发「请说话...」窗；本地实时加载门与就绪标志已整体删除，不得复活。
     #[test]
-    fn ui472_recording_started_local_realtime_no_waveform() {
-        let p = prod();
-        let start = p
-            .find("PipelineEvent::RecordingStarted => {\n// New recording session")
-            .expect("Windows RecordingStarted 处理");
-        let end = start
-            + p[start..]
-                .find("PipelineEvent::StreamingIdle =>")
-                .expect("下一臂");
-        let arm = &p[start..end];
-        let lr = arm.find("AsrModel::LocalRealtime").expect("本地实时分支");
-        let ready = arm.find("LOCALRT_ENGINE_READY.load").expect("就绪判定");
-        let idle = arm
-            .find("show_overlay_streaming_idle(")
-            .expect("「请说话...」窗");
-        let wave = arm.find("OverlayStatus::Recording,").expect("其他档波纹窗");
-        assert!(
-            lr < ready && ready < idle && idle < wave,
-            "本地实时分支须先判就绪再发「请说话...」，波纹窗只在 else"
-        );
-    }
-
-    /// 472：热键开录：本地实时未就绪 ⇒ 加载提示（不自动关）；就绪 ⇒ 与在线流式同发「请说话...」窗。
-    #[test]
-    fn ui472_hotkey_start_loading_hint_then_listening() {
+    fn p3a_hotkey_start_listening_and_no_localrt_gate() {
         let p = prod();
         let at = p
-            .find("if is_local_realtime && !LOCALRT_ENGINE_READY.load(Ordering::Acquire)")
-            .expect("热键处未就绪判定");
-        let seg = seg(&p, at, 2500);
+            .find("HotkeyEvent::Start { translate } => {")
+            .expect("热键开录处理");
+        let s = seg(&p, at, 6000);
         assert!(
-            seg.contains("local_realtime_loading_hint"),
-            "未就绪给加载提示"
+            s.contains("show_overlay_streaming_idle("),
+            "热键开录即发「请说话...」窗"
         );
-        assert!(
-            seg.contains("auto_close_ms: 0"),
-            "加载提示不自动关，等就绪后被「请说话...」替换"
-        );
-        assert!(
-            seg.contains("desired_model.is_online_streaming() || is_local_realtime"),
-            "就绪的本地实时与在线流式同走「请说话...」窗"
-        );
-    }
-
-    /// 472：就绪标志的发布点：启动加载后、重载开始（置 false）、重载落地成功 / 失败各一次；macOS 同判据。
-    #[test]
-    fn ui472_ready_flag_published_at_every_engine_change() {
-        let p = prod();
-        assert_eq!(
-            p.matches("publish_localrt_ready(transcriber.as_ref());")
-                .count(),
-            3
-        );
-        let spawn = p.find("fn spawn_asr_reload(").expect("spawn_asr_reload");
-        let thread = spawn + p[spawn..].find("std::thread::spawn(").unwrap();
-        assert!(
-            p[spawn..thread].contains("LOCALRT_ENGINE_READY.store(false"),
-            "重载开始即视为未就绪"
-        );
-        assert!(
-            p.contains("localrt_loading && matches!(event, PipelineEvent::RecordingStarted)"),
-            "macOS：加载中 RecordingStarted 不弹录音窗"
-        );
+        for gone in [
+            concat!("LOCALRT_ENGINE", "_READY"),
+            concat!("publish_localrt", "_ready"),
+            concat!("local_realtime_loading", "_hint"),
+        ] {
+            assert!(!p.contains(gone), "本地实时加载门已删除：{gone}");
+        }
     }
 
     /// 472：新录音清上一代残留：波纹窗或「请说话...」窗任一出现都清（本地实时不再经过波纹窗）。
@@ -23188,54 +14239,6 @@ mod ui471_472_tests {
             .expect("清理判据须覆盖「请说话...」窗");
         assert!(seg(&p, at, 600).contains("state.last_streaming_text = None;"));
         assert!(seg(&p, at, 600).contains("state.edit_original = None;"));
-    }
-}
-
-/// PUNCT-478（DEC-108）：在线识别句间接缝重判（Gavin 10-04 端测「……差异，但是。根本的法则……」）。
-#[cfg(test)]
-mod punct478_online_tests {
-    use super::repair_seams_with;
-
-    #[test]
-    fn p478_online_seam_period_replaced_by_local_judgement() {
-        let text = "这应该都是文化之间的差异，但是。根本的法则应该都是一样。";
-        let seam = "这应该都是文化之间的差异，但是。".len();
-        // 模型认为「但是」后不该断 ⇒ 接缝句号去掉；最后一句句末保留。
-        let out = repair_seams_with(text, &[seam], |_| {
-            Some("这应该都是文化之间的差异，但是根本的法则应该都是一样。".to_string())
-        });
-        assert_eq!(
-            out,
-            "这应该都是文化之间的差异，但是根本的法则应该都是一样。"
-        );
-        // 模型认为该用逗号 ⇒ 换成逗号。
-        let out = repair_seams_with(text, &[seam], |_| {
-            Some("这应该都是文化之间的差异，但是，根本的法则应该都是一样。".to_string())
-        });
-        assert_eq!(
-            out,
-            "这应该都是文化之间的差异，但是，根本的法则应该都是一样。"
-        );
-        // 模型不可用 ⇒ 原样。
-        assert_eq!(repair_seams_with(text, &[seam], |_| None), text);
-    }
-
-    #[test]
-    fn p478_online_seam_real_sentence_end_and_english_space() {
-        // 真句末：模型仍判句号 ⇒ 不变。
-        let text = "今天先到这里。明天继续。";
-        let seam = "今天先到这里。".len();
-        let out = repair_seams_with(text, &[seam], |_| {
-            Some("今天先到这里。明天继续。".to_string())
-        });
-        assert_eq!(out, text);
-        // 英文接缝去掉句号后补空格，不粘词。
-        let text = "the rule is the same.but it depends";
-        let seam = "the rule is the same.".len();
-        let out = repair_seams_with(text, &[seam], |_| {
-            Some("the rule is the same but it depends".to_string())
-        });
-        assert_eq!(out, "the rule is the same but it depends");
     }
 }
 
@@ -23428,29 +14431,3 @@ mod sc489_tests {
 }
 
 // ─── TEST-SYNC-491 / S10 护栏 9 ────────────────────────────────────────────
-
-/// S10 护栏 9（源码）：main.rs 生产区不得引用 `asr_service::text_stage`
-/// （内置文字处理节点只在远程会话 `asr_service/session.rs` 里用，本机路径不经过它）。
-#[cfg(test)]
-mod s10_main_no_text_stage_ref {
-    #[test]
-    fn s10_main_prod_no_asr_service_text_stage() {
-        let src = crate::MAIN_RS_SRC;
-        let prod = crate::guard_prod_lines::prod_lines_excluding_cfg_test(src);
-        // 剔除注释行后查锚点（锚点拆开防自匹配）。
-        let code_only: Vec<&String> = prod
-            .iter()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect();
-        let needle = concat!("asr_service::", "text_stage");
-        let hits: Vec<&String> = code_only
-            .iter()
-            .copied()
-            .filter(|l| l.contains(needle))
-            .collect();
-        assert!(
-            hits.is_empty(),
-            "main.rs 生产区代码不得引用 {needle}，命中行: {hits:?}"
-        );
-    }
-}

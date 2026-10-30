@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use super::pairing::{base32, normalize_key, random_bytes};
-use super::settings::DEFAULT_PORT;
+/// 识别服务默认端口（TCP；连接码 / 手输地址没写端口时用）。FLASH-P3-A：原定义在服务端设置
+/// `settings.rs`（随本机识别服务删除），移到这里。
+pub const DEFAULT_PORT: u16 = 7860;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

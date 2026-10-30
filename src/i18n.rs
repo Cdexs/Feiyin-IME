@@ -20,9 +20,6 @@ pub struct Strings {
     // Tray menu items
     pub tray_menu_settings: &'static str,
     pub tray_menu_exit: &'static str,
-    /// ASR-SERVER-491 S7：托盘单项「启动 / 停止识别服务」；未就绪时置灰的文案带原因。
-    pub tray_menu_asr_start: &'static str,
-    pub tray_menu_asr_stop: &'static str,
     // General tab
     pub general_section: &'static str,
     pub auto_start: &'static str,
@@ -134,8 +131,6 @@ pub struct Strings {
     pub format_failed_hint: &'static str,
     /// BUG-119: 「用户没说话」信息提示（信息级，非错误样式）。
     pub no_speech_hint: &'static str,
-    /// LOCAL-RT-ENGINE-239-B: 切换到本地流式档位时的双模型加载提示（Info 态，短暂自动关闭）。
-    pub local_realtime_loading_hint: &'static str,
     /// SC-LLM-485 / SC-PUNCT-486：快捷方式切换开关后的提示窗文案（Gavin 10-14「识别输出优化已启用 or 识别输出优化已关闭」；
     /// UI-RENAME-487 起功能名改「输出优化」）。
     pub shortcut_llm_on: &'static str,
@@ -147,8 +142,6 @@ pub struct Strings {
     /// SC-SCRIPT-489：快捷方式切换「中文输出」后的结果（Gavin「提示切换的结果」）。
     pub shortcut_script_simplified: &'static str,
     pub shortcut_script_traditional: &'static str,
-    /// LOCAL-RT-ENGINE-239-B: 本地流式档位模型缺失，直接报错不降级（DEC-067 附则一）。
-    pub local_realtime_unavailable: &'static str,
     /// 10-14 Gavin「UI和提示对话框中的文字一定都要走i18n国际化」：未归类的错误不再原文直出，
     /// 显示本条，原文只进 debug.log。
     pub error_unexpected: &'static str,
@@ -169,8 +162,6 @@ static ZH: Strings = Strings {
     tray_error: "飞音语音输入 - 错误",
     tray_menu_settings: "设置 (Settings)",
     tray_menu_exit: "退出 (Exit)",
-    tray_menu_asr_start: "启动识别服务",
-    tray_menu_asr_stop: "停止识别服务",
     general_section: "通用设置",
     auto_start: "开机自动启动",
     hotkey_current_label: "当前快捷键",
@@ -271,7 +262,6 @@ static ZH: Strings = Strings {
     error_transcription_empty: "识别结果为空。",
     format_failed_hint: "优化失败，已输出原文。",
     no_speech_hint: "请说话哦..",
-    local_realtime_loading_hint: "本地流式模型加载中，约需 6 秒…",
     shortcut_llm_on: "输出优化已启用",
     shortcut_llm_off: "输出优化已关闭",
     shortcut_llm_blocked: "输出优化未就绪：请先在设置中填写接口并通过连接测试",
@@ -279,7 +269,6 @@ static ZH: Strings = Strings {
     shortcut_strip_off: "句尾不显示标点符号已关闭",
     shortcut_script_simplified: "中文输出已切换为简体",
     shortcut_script_traditional: "中文输出已切换为繁体",
-    local_realtime_unavailable: "所选模型不可用",
     error_unexpected: "处理出错，请重试（详情见日志）",
 };
 
@@ -298,8 +287,6 @@ static ZH_TW: Strings = Strings {
     tray_error: "飛音語音輸入 - 錯誤",
     tray_menu_settings: "設定 (Settings)",
     tray_menu_exit: "退出 (Exit)",
-    tray_menu_asr_start: "啟動識別服務",
-    tray_menu_asr_stop: "停止識別服務",
     general_section: "通用設定",
     auto_start: "開機自動啟動",
     hotkey_current_label: "當前快捷鍵",
@@ -400,7 +387,6 @@ static ZH_TW: Strings = Strings {
     error_transcription_empty: "識別結果為空。",
     format_failed_hint: "優化失敗，已輸出原文。",
     no_speech_hint: "請說話喔..",
-    local_realtime_loading_hint: "本地串流模型載入中，約需 6 秒…",
     shortcut_llm_on: "輸出優化已啟用",
     shortcut_llm_off: "輸出優化已關閉",
     shortcut_llm_blocked: "輸出優化尚未就緒：請先在設定中填寫介面並通過連線測試",
@@ -408,7 +394,6 @@ static ZH_TW: Strings = Strings {
     shortcut_strip_off: "句尾不顯示標點符號已關閉",
     shortcut_script_simplified: "中文輸出已切換為簡體",
     shortcut_script_traditional: "中文輸出已切換為繁體",
-    local_realtime_unavailable: "所選模型不可用",
     error_unexpected: "處理出錯，請重試（詳情見日誌）",
 };
 
@@ -427,8 +412,6 @@ static EN: Strings = Strings {
     tray_error: "Feiyin Voice Input - Error",
     tray_menu_settings: "Settings",
     tray_menu_exit: "Exit",
-    tray_menu_asr_start: "Start ASR Service",
-    tray_menu_asr_stop: "Stop ASR Service",
     general_section: "General Settings",
     auto_start: "Auto-start on boot",
     hotkey_current_label: "Current hotkey",
@@ -528,7 +511,6 @@ static EN: Strings = Strings {
     error_transcription_empty: "Transcription result is empty.",
     format_failed_hint: "Optimization failed, original text used.",
     no_speech_hint: "Please say something..",
-    local_realtime_loading_hint: "Loading local streaming models, ~6s…",
     shortcut_llm_on: "Output optimization enabled",
     shortcut_llm_off: "Output optimization disabled",
     shortcut_llm_blocked: "Output optimization not ready: fill in the API settings and pass the connection test first",
@@ -536,7 +518,6 @@ static EN: Strings = Strings {
     shortcut_strip_off: "Hide trailing punctuation disabled",
     shortcut_script_simplified: "Chinese output switched to Simplified",
     shortcut_script_traditional: "Chinese output switched to Traditional",
-    local_realtime_unavailable: "Selected model unavailable",
     error_unexpected: "Something went wrong. Please try again (details in the log).",
 };
 

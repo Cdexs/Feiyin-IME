@@ -1,7 +1,7 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod asr_server; // ASR-SERVER-491 S6：「识别服务」页
+mod asr_server; // ASR-SERVER-491 S8 / FLASH-P3-A：只剩「连识别服务」配对命令
 mod audio;
 mod config;
 mod crash;
@@ -17,7 +17,6 @@ mod wordbook;
 use audio::get_input_devices;
 use config::{AppConfig, LlmConfig};
 use llm::LlmClient;
-use serde::Serialize;
 use tauri::Manager;
 
 #[tauri::command]
@@ -105,45 +104,7 @@ async fn test_qwen3_asr_connection(api_key: String) -> Result<String, String> {
     .await
 }
 
-/// ASR-DUAL-B-003: 检测 accuracy 模型是否已就位（供前端下载引导用）
-/// 返回 JSON: { ready, model_dir, download_url }
-/// 与 coder-2 前端接口契约，command 名与字段名不得擅改
-#[tauri::command]
-fn check_accuracy_model_ready() -> AccuracyModelStatus {
-    let model_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("models");
-    // MIGRATE-QWEN3-320：accuracy 就是 Qwen3，单一路径（原按引擎分派已删）。
-    // 🔴 src-tauri 是独立 crate，无法复用 `transcription::QWEN3_MODEL_SUBDIR`，
-    // 故此处镜像同一组文件名——两处判据必须逐字一致，否则 UI 显示「已就位」而主程序加载失败。
-    // MIGRATE-1.13.8-1.7B-359：随主程序同步切到 1.7B 目录名。
-    // ACC-ENGINE-LLAMACPP-452：精解引擎换 llama.cpp ⇒ 镜像主程序 `check_qwen3_model_ready`
-    //（`llama_asr::LLAMA_ASR_MODEL_SUBDIR` / `LLAMA_ASR_MODEL_FILE` / `LLAMA_ASR_MMPROJ_FILE`）。
-    // MEM-TRIM-457 ③：词库计数改用引擎词表，tokenizer.json 不再计入判据。
-    let dir = model_dir.join("qwen3-asr-1.7b-gguf");
-    // MEM-453：音频编码器 f16 → Q8_0。
-    // FORCED-ALIGN-456：强制对齐模型三件套随 1.7B 标配（镜像 `llama_asr::LlamaAligner::model_ready`）。
-    let al = model_dir.join("qwen3-forcedaligner-0.6b-gguf");
-    let ready = dir.join("Qwen3-ASR-1.7B-Q8_0.gguf").exists()
-        && dir.join("mmproj-Qwen3-ASR-1.7B-Q8_0.gguf").exists()
-        && al.join("aligner-backbone-q8_0.gguf").exists()
-        && al.join("aligner-mmproj-q8_0.gguf").exists()
-        && al.join("aligner-head.bin").exists();
-    AccuracyModelStatus {
-        ready,
-        model_dir: dir.display().to_string(),
-        download_url: "https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF".to_string(),
-    }
-}
-
-#[derive(Serialize)]
-struct AccuracyModelStatus {
-    ready: bool,
-    model_dir: String,
-    download_url: String,
-}
+// FLASH-P3-A：`check_accuracy_model_ready`（本地精解模型就位检测，供模型下载引导）随本地模型删除。
 
 #[cfg(target_os = "windows")]
 fn is_main_process_running() -> bool {
@@ -207,7 +168,9 @@ fn main() {
 
             if let Some(main) = _app.get_webview_window("main") {
                 let _ = main.set_maximizable(false);
-                if let Ok(icon) = tauri::image::Image::from_bytes(include_bytes!("../icons/128x128.png")) {
+                if let Ok(icon) =
+                    tauri::image::Image::from_bytes(include_bytes!("../icons/128x128.png"))
+                {
                     let _ = main.set_icon(icon);
                 }
             }
@@ -233,7 +196,6 @@ fn main() {
             test_qwen3_asr_connection,
             get_audio_devices,
             check_hotkey_available,
-            check_accuracy_model_ready,
             shortcuts::set_shortcut_capture,
             version_check::get_version_info,
             version_check::force_check_latest_version,
@@ -243,13 +205,6 @@ fn main() {
             wordbook::add_wordbook_entry,
             wordbook::delete_wordbook_entry_by_id,
             usage::get_usage_week,
-            asr_server::asr_server_overview,
-            asr_server::asr_server_set_enabled,
-            asr_server::asr_server_save_wan,
-            asr_server::asr_server_set_paused,
-            asr_server::asr_server_add_terminal,
-            asr_server::asr_server_revoke,
-            asr_server::asr_server_sessions,
             asr_server::asr_remote_get,
             asr_server::asr_remote_pair_code,
             asr_server::asr_remote_probe,

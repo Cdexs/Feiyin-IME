@@ -1,22 +1,6 @@
 fn main() {
-    // ACC-ENGINE-LLAMACPP-452：Qwen3-ASR 精解引擎适配层（运行时动态加载 llama.cpp 官方预编译库，
-    // 头文件为同版本 b11207 官方头文件，见 native/llama_asr/）。
-    // 🔴 必须显式声明：winres 自身已输出 rerun-if-changed，cargo 只按已声明的文件决定是否重跑本脚本
-    //（并非「包内任一文件变更即重跑」）。漏声明 ⇒ 改了 shim.cpp 却链接旧 .lib（452 实测：回调参数不生效）。
-    println!("cargo:rerun-if-changed=native/llama_asr/shim.cpp");
-    println!("cargo:rerun-if-changed=native/llama_asr/include");
-    cc::Build::new()
-        .cpp(true)
-        .file("native/llama_asr/shim.cpp")
-        .include("native/llama_asr/include")
-        .flag_if_supported("/std:c++17")
-        .flag_if_supported("/EHsc")
-        .flag_if_supported("/utf-8")
-        .flag_if_supported("-std=c++17")
-        .warnings(false)
-        .emit_rerun_if_env_changed(false)
-        .compile("llama_asr_shim");
-
+    // FLASH-P3-A（DEC-114）：llama.cpp 适配层（native/llama_asr/shim.cpp）随本地识别引擎删除；
+    // macOS rpath（只为运行时找 sherpa-onnx / onnxruntime / CT2 dylib）一并删除。只剩 Windows 图标与版本资源。
     #[cfg(target_os = "windows")]
     {
         let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
@@ -35,21 +19,5 @@ fn main() {
         res.set("ProductVersion", &win_ver);
         res.set("OriginalFilename", "feiyin-ime.exe");
         res.compile().expect("winres compile failed");
-    }
-
-    // MACOS-P4-RPATH-001: 主程序缺 LC_RPATH，直接执行二进制时 dyld 无法按 @rpath 展开
-    // 动态库路径，必然终止（cargo run 自动注入 DYLD_FALLBACK_LIBRARY_PATH 才掩盖了它；
-    // .app 打包后双击即直接执行二进制，是致命缺陷）。
-    // 链接期注入 rpath，dyld 在二进制所在目录（@executable_path）查找 dylib：
-    // - target/debug|release/ 直接执行：dylib 已与二进制同级
-    // - .app 打包：dylib 若放 Contents/MacOS（当前 BUNDLE 布局）或 Contents/Frameworks
-    //   （未来布局），两条 rpath 并存覆盖两者
-    // 用 build.rs 而非共享的 .cargo/config.toml（根 crate + src-tauri 双项目共用，
-    // DEC-033 附则三高风险文件）：cargo:rustc-link-arg 仅作用于本 package 全部 target
-    // （feiyin-ime / crash-reporter / tests），作用域精确且对 Windows 是 cfg 级 no-op。
-    #[cfg(target_os = "macos")]
-    {
-        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path");
-        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../Frameworks");
     }
 }

@@ -3,14 +3,13 @@
 # Run after: cargo build --release (DLLs must exist in target/release/)
 
 param(
-    [switch]$SkipModels,  # Skip model junction creation
+    [switch]$SkipModels,  # FLASH-P3-A：无模型可链，参数保留只为旧调用方式不报错
     [switch]$RuntimeOnly  # Only run Step 2 (copy VC++ runtime DLLs) then exit — RELEASE-VCRT-APPLOCAL-399
 )
 
 $ProjectRoot = Split-Path $PSScriptRoot -Parent
 $TargetRelease = Join-Path $ProjectRoot "target\release"
 $Publish = Join-Path $ProjectRoot "Publish"
-$Models = Join-Path $ProjectRoot "models"
 
 Write-Host "=== voice-ime init-publish ===" -ForegroundColor Cyan
 Write-Host "Project root: $ProjectRoot"
@@ -76,13 +75,7 @@ function Copy-VcRuntime {
         Write-Host "  OK $($item.Name) <- $($item.Src)"
     }
 
-    # ctranslate2.dll 必须在 Step 1 的列表里（397 起 CT2 依赖 vcomp140；漏拷则翻译必挂）
-    if (Test-Path (Join-Path $Publish "ctranslate2.dll")) {
-        Write-Host "  OK ctranslate2.dll present in Publish (Step 1)"
-    } else {
-        Write-Host "  ERROR: ctranslate2.dll missing in Publish (Step 1 list incomplete)" -ForegroundColor Red
-        exit 1
-    }
+    # FLASH-P3-A：原「ctranslate2.dll 必须在 Publish」检查随离线翻译（CT2）删除。
 }
 
 if ($RuntimeOnly) {
@@ -92,27 +85,8 @@ if ($RuntimeOnly) {
     exit 0
 }
 
-# Step 1: Copy DLLs to Publish/
-Write-Host "`n[Step 1] Copy DLLs to Publish/" -ForegroundColor Yellow
-$dlls = @(
-    "sherpa-onnx-c-api.dll",
-    "sherpa-onnx-cxx-api.dll",
-    "onnxruntime.dll",
-    "onnxruntime_providers_shared.dll",
-    "ctranslate2.dll",
-    "libiomp5md.dll",
-    "cudnn64_9.dll"        # optional: GPU inference
-)
-foreach ($dll in $dlls) {
-    $src = Join-Path $TargetRelease $dll
-    $dst = Join-Path $Publish $dll
-    if (Test-Path $src) {
-        Copy-Item -Path $src -Destination $dst -Force
-        Write-Host "  OK $dll"
-    } else {
-        Write-Host "  MISSING $dll (run cargo build --release first)" -ForegroundColor Red
-    }
-}
+# Step 1（FLASH-P3-A 删除）：原复制 sherpa-onnx / onnxruntime / CTranslate2 等模型运行库 DLL ——
+# 输入法不再带任何本地模型，无 DLL 可复制。
 
 # Step 2: Copy VC++ 2015-2022 x64 runtime DLLs app-local (DEC-085 / RELEASE-VCRT-APPLOCAL-399)
 # 实现见上方 `function Copy-VcRuntime`；可用 `-RuntimeOnly` 单独运行本步。
@@ -150,47 +124,13 @@ if (Test-Path $debugDir) {
     }
 }
 
-# Step 4: Create models directory junctions (avoid 640MB+ copy)
-Write-Host "`n[Step 4] Create models directory junctions" -ForegroundColor Yellow
-
-if (-not (Test-Path $Models)) {
-    Write-Host "  ERROR: models/ not found. Download models first." -ForegroundColor Red
-} elseif ($SkipModels) {
-    Write-Host "  SKIP (-SkipModels flag)"
-} else {
-    # Publish/models junction
-    $publishModels = Join-Path $Publish "models"
-    if (Test-Path $publishModels) {
-        Write-Host "  SKIP Publish/models (exists)"
-    } else {
-        try {
-            New-Item -ItemType Junction -Path $publishModels -Target $Models -ErrorAction Stop | Out-Null
-            Write-Host "  OK Publish/models -> models/ (junction)"
-        } catch {
-            Write-Host "  WARN: junction failed, copying instead..." -ForegroundColor Yellow
-            Copy-Item -Path $Models -Destination $publishModels -Recurse -Force
-            Write-Host "  OK Publish/models (full copy)"
-        }
-    }
-
-    # target/release/models junction
-    $devModels = Join-Path $TargetRelease "models"
-    if (Test-Path $devModels) {
-        Write-Host "  SKIP target/release/models (exists)"
-    } else {
-        try {
-            New-Item -ItemType Junction -Path $devModels -Target $Models -ErrorAction Stop | Out-Null
-            Write-Host "  OK target/release/models -> models/ (junction)"
-        } catch {
-            Write-Host "  ERROR: Could not create target/release/models junction: $_" -ForegroundColor Red
-        }
-    }
-}
+# Step 4（FLASH-P3-A 删除）：原为 Publish/ 与 target/release/ 建 models 目录联接 —— 输入法不再带模型。
 
 # Step 5: Copy current EXEs to Publish/
 Write-Host "`n[Step 5] Copy EXEs to Publish/" -ForegroundColor Yellow
 # RELEASE-ISS-FROM-PUBLISH-400/405：实际产物名为 feiyin-ime*.exe（旧 voice-ime.exe 已作废，见 .iss）。
-$exes = @("feiyin-ime.exe", "feiyin-ime-ui.exe", "crash-reporter.exe", "feiyin-asr-gateway.exe")
+# FLASH-P3-A：识别服务网关 feiyin-asr-gateway.exe 随本机识别服务删除。
+$exes = @("feiyin-ime.exe", "feiyin-ime-ui.exe", "crash-reporter.exe")
 foreach ($exe in $exes) {
     $src = Join-Path $TargetRelease $exe
     $dst = Join-Path $Publish $exe

@@ -130,31 +130,32 @@ pub async fn test_qwen3_asr_connection(
 
     let result = timeout(TEST_TIMEOUT, async {
         // 1. Connect WebSocket
-        let (mut ws_stream, response) = connect_async(request)
-            .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("401")
-                    || msg.contains("403")
-                    || msg.contains("Unauthorized")
-                    || msg.contains("Forbidden")
-                {
-                    "API key 无效或鉴权失败：服务端拒绝连接（HTTP 401/403）".to_string()
-                } else if msg.contains("dns") || msg.contains("DNS") || msg.contains("resolve") {
-                    format!("网络不通：无法解析域名 - {msg}")
-                } else if msg.contains("timeout") || msg.contains("Timeout") || msg.contains("timed out") {
-                    format!("网络不通：连接超时 - {msg}")
-                } else if msg.contains("connect")
-                    || msg.contains("Connect")
-                    || msg.contains("connection refused")
-                {
-                    format!("网络不通：无法连接到服务端 - {msg}")
-                } else if msg.contains("tls") || msg.contains("TLS") || msg.contains("certificate") {
-                    format!("网络不通：TLS 握手失败 - {msg}")
-                } else {
-                    format!("网络不通：WebSocket 连接失败 - {msg}")
-                }
-            })?;
+        let (mut ws_stream, response) = connect_async(request).await.map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("401")
+                || msg.contains("403")
+                || msg.contains("Unauthorized")
+                || msg.contains("Forbidden")
+            {
+                "API key 无效或鉴权失败：服务端拒绝连接（HTTP 401/403）".to_string()
+            } else if msg.contains("dns") || msg.contains("DNS") || msg.contains("resolve") {
+                format!("网络不通：无法解析域名 - {msg}")
+            } else if msg.contains("timeout")
+                || msg.contains("Timeout")
+                || msg.contains("timed out")
+            {
+                format!("网络不通：连接超时 - {msg}")
+            } else if msg.contains("connect")
+                || msg.contains("Connect")
+                || msg.contains("connection refused")
+            {
+                format!("网络不通：无法连接到服务端 - {msg}")
+            } else if msg.contains("tls") || msg.contains("TLS") || msg.contains("certificate") {
+                format!("网络不通：TLS 握手失败 - {msg}")
+            } else {
+                format!("网络不通：WebSocket 连接失败 - {msg}")
+            }
+        })?;
 
         // Verify handshake success (HTTP 101 Switching Protocols)
         if response.status().as_u16() != 101 {
@@ -167,8 +168,8 @@ pub async fn test_qwen3_asr_connection(
 
         // 2. Send run-task (model in payload, not URL)
         let run_task = build_run_task_message(&task_id, model);
-        let run_task_str =
-            serde_json::to_string(&run_task).map_err(|e| format!("内部错误：序列化 run-task 失败 - {e}"))?;
+        let run_task_str = serde_json::to_string(&run_task)
+            .map_err(|e| format!("内部错误：序列化 run-task 失败 - {e}"))?;
         ws_stream
             .send(Message::Text(run_task_str.into()))
             .await
@@ -232,7 +233,8 @@ mod tests {
 
     #[test]
     fn build_inference_ws_request_generates_auth_header() {
-        let req = build_inference_ws_request("wss://example.com/api-ws/v1/inference", "sk-test-key");
+        let req =
+            build_inference_ws_request("wss://example.com/api-ws/v1/inference", "sk-test-key");
         assert!(req.is_ok());
         let req = req.unwrap();
         assert!(req.headers().get("Authorization").is_some());

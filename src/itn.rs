@@ -1269,6 +1269,9 @@ fn parse_negative_prefix(chars: &[char], start: usize) -> Option<(bool, usize)> 
 /// 注意：自 ITN-CELSIUS-003 起，已是阿拉伯数字的文本仍会做单位符号规整
 /// （如 `40摄氏度` → `40℃`），故「逐字节不变」不再字面成立。幂等性保持
 /// （`40℃` 再跑一遍仍 `40℃`，因 `℃` 不匹配任何 unit_symbols trigger）。
+// FLASH-P3-A：输入法只剩在线识别路径，主通道 ITN 恒跳过（V091-ITN-SKIP-ONLINE-215 在线口径），生产暂无调用点。
+// 规则引擎按 DEC-114「直连模式保留规则类文字处理」保留（测试仍全覆盖），后续若直连 / 识别服务参数需要可直接回挂。
+#[allow(dead_code)]
 pub fn normalize_numbers(text: &str) -> String {
     let r = rules();
     let after_cn = normalize_with_rules(text, r);

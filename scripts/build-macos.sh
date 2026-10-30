@@ -3,7 +3,9 @@
 #
 #   bash scripts/build-macos.sh                 # 完整 release 构建 + .app 打包 + 自签名证书签名
 #   bash scripts/build-macos.sh --no-app        # 只构建不打包（老行为）
-#   bash scripts/build-macos.sh --copy-models   # 复制 models 进 bundle（默认 symlink，节省磁盘）
+#
+# FLASH-P3-A（DEC-114）：输入法不再带本地模型 ⇒ 不再打包 sherpa-onnx / onnxruntime / CTranslate2 动态库、
+# 不再注入 @loader_path rpath、不再带 models（原 --copy-models 选项删除）。
 #
 # 产物：dist/飞音智能语音输入.app/
 # 签名：自签名证书（默认证书名 "Feiyin Dev"，可用 CODESIGN_IDENTITY 覆盖），本地调试用，不做公证。
@@ -22,18 +24,16 @@ CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-Feiyin Dev}"
 
 # ---- 参数解析 ----
 PACK_APP=1
-COPY_MODELS=0
 for arg in "$@"; do
   case "$arg" in
     --no-app) PACK_APP=0 ;;
-    --copy-models) COPY_MODELS=1 ;;
-    *) echo "未知参数: $arg（支持 --no-app / --copy-models）" >&2; exit 1 ;;
+    *) echo "未知参数: $arg（支持 --no-app）" >&2; exit 1 ;;
   esac
 done
 
 echo "=== voice-ime macOS Build ==="
 
-# 载入 Rust PATH 与 SHERPA_ONNX_LIB_DIR（覆盖 .cargo/config.toml 里的 Windows 路径）
+# 载入 Rust PATH
 # shellcheck source=./env-macos.sh
 source "$REPO_ROOT/scripts/env-macos.sh"
 
@@ -102,22 +102,6 @@ HINT
   cp target/release/feiyin-ime-ui "$MACOS_DIR/feiyin-ime-ui"
   cp target/release/crash-reporter "$MACOS_DIR/crash-reporter"
 
-  # 动态库（主程序 @rpath 链接，需与主程序同目录并注入 @loader_path）
-  for d in libctranslate2.dylib libctranslate2.4.dylib libctranslate2.4.6.0.dylib \
-           libsherpa-onnx-c-api.dylib libsherpa-onnx-cxx-api.dylib \
-           libonnxruntime.dylib libonnxruntime.1.24.4.dylib; do
-    if [ -f "target/release/$d" ]; then
-      cp "target/release/$d" "$MACOS_DIR/$d"
-    else
-      echo "  [警告] 缺少动态库 target/release/$d" >&2
-    fi
-  done
-
-  # 主程序注入 @loader_path rpath（@rpath/lib*.dylib → 同目录解析）
-  # codesign 需在 install_name_tool 之后执行，否则签名失效
-  install_name_tool -add_rpath @loader_path "$MACOS_DIR/feiyin-ime" \
-    && echo "  @loader_path rpath injected"
-
   # 运行时从 exe_dir 加载的数据文件。
   # 注意：必须放 Contents/Resources/（标准布局），并在 MacOS/ 内做相对 symlink——
   # 若直接放 MacOS/ 下，codesign 会把 .toml 当嵌套代码组件，外层签名报
@@ -127,18 +111,6 @@ HINT
   ln -s ../Resources/itn-rules.toml "$MACOS_DIR/itn-rules.toml"
   ln -s ../Resources/scene-rules.toml "$MACOS_DIR/scene-rules.toml"
 
-  # models：默认 symlink 指向仓库（本地调试快速，节省 1.8G 磁盘，仅宽松验证）；
-  # --copy-models 复制进 bundle 内 Resources 并做相对 symlink（严格验证通过，可分发）
-  if [ "$COPY_MODELS" = "1" ]; then
-    echo "  copying models ($(du -sh models | awk '{print $1}'))..."
-    cp -R models "$RES_DIR/models"
-    ln -s ../Resources/models "$MACOS_DIR/models"
-    echo "  models -> bundle Resources/models"
-  else
-    ln -sfn "$REPO_ROOT/models" "$MACOS_DIR/models"
-    echo "  models -> symlink $REPO_ROOT/models（本地调试模式）"
-  fi
-
   # 图标
   cp src-tauri/icons/icon.icns "$RES_DIR/icon.icns"
 
@@ -146,30 +118,13 @@ HINT
   cp scripts/Info.plist "$APP_DIR/Contents/Info.plist"
   /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" -c "Set :CFBundleVersion $VERSION" "$APP_DIR/Contents/Info.plist"
 
-  # 签名（BUNDLE-002）：先内后外，去掉已废弃的 --deep（Apple 官方不推荐，嵌套代码应各自签名）
-  # 顺序：dylib → 外层 app。codesign 必须在 install_name_tool 之后执行（改二进制会使签名失效）。
-  echo "  codesign nested dylibs..."
-  for f in "$MACOS_DIR"/*.dylib; do
-    [ -e "$f" ] || continue
-    codesign --force --timestamp=none --sign "$CODESIGN_IDENTITY" "$f"
-  done
+  # 签名（BUNDLE-002）：去掉已废弃的 --deep（Apple 官方不推荐）。FLASH-P3-A：已无嵌套 dylib。
   echo "  codesign app bundle..."
   codesign --force --timestamp=none --sign "$CODESIGN_IDENTITY" "$APP_DIR"
 
-  # 验证签名：--copy-models 时 models 全部在 bundle 内，可严格验证；
-  # 默认 symlink 指向仓库，codesign 严格验证会对 bundle 外 symlink 报
-  # "invalid destination for symbolic link in bundle"，此时降级宽松验证（本地调试可接受）。
-  if [ "$COPY_MODELS" = "1" ]; then
-    codesign --verify --deep --strict "$APP_DIR" \
-      && echo "  codesign strict verify OK" || { echo "  [错误] 签名验证失败" >&2; exit 1; }
-  else
-    if codesign --verify --deep --strict "$APP_DIR" 2>/dev/null; then
-      echo "  codesign strict verify OK"
-    else
-      codesign --verify --deep "$APP_DIR" \
-        && echo "  codesign verify OK（宽松；models 为仓库 symlink，strict 对本场景无意义）"
-    fi
-  fi
+  # 验证签名：bundle 内已无指向仓库的 models symlink（FLASH-P3-A），严格验证。
+  codesign --verify --deep --strict "$APP_DIR" \
+    && echo "  codesign strict verify OK" || { echo "  [错误] 签名验证失败" >&2; exit 1; }
   codesign -dv --verbose=4 "$APP_DIR" 2>&1 | grep -E "Signature|Identifier|Authority" || true
 
   echo "  ✅ 产物: $APP_DIR"

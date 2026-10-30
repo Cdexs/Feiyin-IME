@@ -51,9 +51,6 @@ vi.mock("@tauri-apps/api/core", () => ({
       }
       throw new Error("Invalid API key");
     }
-    if (cmd === "check_accuracy_model_ready") {
-      return true;
-    }
     return null;
   }),
 }));

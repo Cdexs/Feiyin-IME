@@ -75,29 +75,14 @@ Name: "autostart"; Description: "{cm:AutoStartProgram,{#MyAppName}}"; GroupDescr
 Source: "..\Publish\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Publish\feiyin-ime-ui.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Publish\crash-reporter.exe"; DestDir: "{app}"; Flags: ignoreversion
-; ASR-SERVER-491：识别服务网关（内核按设置页总开关拉起；关闭时不运行）
-Source: "..\Publish\feiyin-asr-gateway.exe"; DestDir: "{app}"; Flags: ignoreversion
 
-; ---- ASR 运行库 ----
-Source: "..\Publish\sherpa-onnx-c-api.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\Publish\sherpa-onnx-cxx-api.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\Publish\onnxruntime.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\Publish\onnxruntime_providers_shared.dll"; DestDir: "{app}"; Flags: ignoreversion
-
-; ---- 翻译运行库（CTranslate2 + oneDNN/OpenMP）----
-Source: "..\Publish\ctranslate2.dll"; DestDir: "{app}"; Flags: ignoreversion
-
-; ---- 精解引擎运行库（ACC-ENGINE-LLAMACPP-452：llama.cpp b11207 Vulkan 版，运行时自选 Vulkan / 最优 CPU 变体）----
-; 由 scripts\fetch-llama-runtime.ps1 同步到 Publish（sha256 校验）；缺失时主程序照常启动、精解档报错。
-Source: "..\Publish\ggml-base.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\Publish\ggml.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\Publish\llama.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\Publish\mtmd.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\Publish\ggml-vulkan.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\Publish\libomp.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\Publish\ggml-cpu-*.dll"; DestDir: "{app}"; Flags: ignoreversion
+; FLASH-P3-A（DEC-114）：输入法不再带任何本地模型 ⇒ ASR 运行库（sherpa-onnx / onnxruntime）、
+; 翻译运行库（CTranslate2）、精解引擎运行库（llama.cpp / ggml / mtmd / libomp）与识别服务网关
+; feiyin-asr-gateway.exe 全部删除（识别服务已是独立应用 flashasr，有自己的安装包）。
 
 ; ---- VC++ 2015-2022 x64 运行库，app-local（DEC-085 / RELEASE-VCRT-APPLOCAL-399；dumpbin 最小集）----
+; FLASH-P3-A：debug 构建 dumpbin /dependents 显示三个 exe 只导入 VCRUNTIME140.dll；msvcp140 / msvcp140_1（C++ 模型库用）
+; 与 vcomp140（CT2 OpenMP）大概率已不需要，待 release 包 dumpbin 复核后再删，本次保留。
 Source: "..\Publish\msvcp140.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Publish\msvcp140_1.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Publish\vcruntime140.dll"; DestDir: "{app}"; Flags: ignoreversion
@@ -148,13 +133,8 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--settings"; \
     Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; \
     Flags: nowait postinstall skipifsilent
-; ASR-SERVER-491（设计 §8.8）：识别服务网关入站规则，**只放行专用网络**（端口映射进来的流量走家里网卡，属专用网络；
-; 公共 Wi-Fi 下不开放）。按程序放行而非按端口：端口可在设置页改。先删同名旧规则，重装不重复。
-; 写防火墙要管理员：只在「为所有用户安装」（管理员模式）时执行；按用户安装时由 Windows 在网关首次监听时
-; 弹出系统的「允许访问」对话框，用户勾「专用网络」即可。
+; FLASH-P3-A：识别服务网关随本机识别服务删除 ⇒ 不再添加防火墙规则；只删旧版本留下的同名规则（升级清理）。
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Feiyin ASR Gateway"""; \
-    Flags: runhidden; Check: IsAdminInstallMode
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""Feiyin ASR Gateway"" dir=in action=allow program=""{app}\feiyin-asr-gateway.exe"" protocol=TCP profile=private enable=yes"; \
     Flags: runhidden; Check: IsAdminInstallMode
 
 [UninstallRun]
@@ -165,8 +145,7 @@ Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM feiyin-ime-ui.exe"; \
     Flags: runhidden; RunOnceId: "KillVoiceIMEUI"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM crash-reporter.exe"; \
     Flags: runhidden; RunOnceId: "KillCrashReporter"
-Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM feiyin-asr-gateway.exe"; \
-    Flags: runhidden; RunOnceId: "KillAsrGateway"
+; FLASH-P3-A：网关已删，只保留旧版本防火墙规则的清理。
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Feiyin ASR Gateway"""; \
     Flags: runhidden; RunOnceId: "DelAsrGatewayFirewall"; Check: IsAdminInstallMode
 

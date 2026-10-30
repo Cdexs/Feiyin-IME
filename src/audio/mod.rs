@@ -808,6 +808,9 @@ impl AudioCapture {
     /// Returns raw PCM samples (f32, mono, 16kHz).
     /// If device_name is empty, uses system default device.
     /// 麦克风按热键现开、录完即关（MIC-ON-DEMAND）。
+    // FLASH-P3-A：批处理录音（record → 本地整段转录）的唯一调用方随本地识别引擎删除；
+    // 录音能力本身与模型无关，且采集 / 重采样测试以它为对照基准，保留。
+    #[allow(dead_code)]
     pub fn record(
         &mut self,
         stop_signal: Arc<AtomicBool>,
@@ -3167,6 +3170,44 @@ mod tests {
         )
     }
 
+    /// FLASH-P3-A：原用 `sherpa_onnx::Wave::read` 做「独立解码」，sherpa-onnx 依赖删除后改为本函数 ——
+    /// 按 RIFF 规范逐块遍历（不假设 44 字节固定头，与写入端 / `read_wav_header` 的写法无关），
+    /// 校验 PCM 16bit 单声道后返回 (采样率, 样本)。
+    fn decode_wav_chunked(path: &Path) -> (u32, Vec<i16>) {
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        let riff_len = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+        assert_eq!(riff_len + 8, bytes.len(), "RIFF 长度须与文件长度一致");
+        let mut pos = 12;
+        let mut rate = None;
+        let mut samples = None;
+        while pos + 8 <= bytes.len() {
+            let id = &bytes[pos..pos + 4];
+            let len = u32::from_le_bytes([
+                bytes[pos + 4],
+                bytes[pos + 5],
+                bytes[pos + 6],
+                bytes[pos + 7],
+            ]) as usize;
+            let body = &bytes[pos + 8..pos + 8 + len];
+            if id == b"fmt " {
+                assert_eq!(u16::from_le_bytes([body[0], body[1]]), 1, "PCM");
+                assert_eq!(u16::from_le_bytes([body[2], body[3]]), 1, "单声道");
+                assert_eq!(u16::from_le_bytes([body[14], body[15]]), 16, "16bit");
+                rate = Some(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+            } else if id == b"data" {
+                samples = Some(
+                    body.chunks_exact(2)
+                        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            pos += 8 + len + (len & 1);
+        }
+        (rate.expect("缺 fmt 块"), samples.expect("缺 data 块"))
+    }
+
     #[test]
     fn diag292_dump_quiet_at_warn_and_writes_valid_wav_at_debug() {
         let _level_guard = LOG_LEVEL_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -3207,20 +3248,11 @@ mod tests {
         assert_eq!(align, 2);
         assert_eq!(data_len as usize, 12000 * 2, "12000 样本 × i16");
 
-        // 独立解码验证（硬要求③）：用 sherpa-onnx 的 Wave 解析器**真实读回**我们写的
-        // 文件，等价于「系统播放器能打开」——只验字节数不算数。
-        let decoded = sherpa_onnx::Wave::read(
-            dir.join(file1)
-                .to_str()
-                .expect("temp WAV 路径应为有效 UTF-8"),
-        )
-        .expect("sherpa Wave 必须能解析我们写的 WAV");
-        assert_eq!(decoded.sample_rate(), 48000, "解码采样率须对得上");
-        assert_eq!(
-            decoded.samples().len(),
-            12000,
-            "解码样本数须对得上（250ms@48k）"
-        );
+        // 独立解码验证（硬要求③）：按 RIFF 逐块**真实读回**我们写的文件（FLASH-P3-A：原用
+        // sherpa-onnx Wave 解析器，依赖已删），等价于「系统播放器能打开」——只验字节数不算数。
+        let (dec_rate, dec_samples) = decode_wav_chunked(&dir.join(file1));
+        assert_eq!(dec_rate, 48000, "解码采样率须对得上");
+        assert_eq!(dec_samples.len(), 12000, "解码样本数须对得上（250ms@48k）");
 
         // head_clipped 判据（写死 100ms > 40ms 窗口 ⇒ false）
         let flat: Vec<f32> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
@@ -3304,14 +3336,9 @@ mod tests {
         assert_eq!(align, 2);
         assert_eq!(data_len as usize, 4800 * 2, "4800 样本 × i16");
         // 独立解码（等价「系统播放器能打开」）
-        let decoded = sherpa_onnx::Wave::read(
-            dir.join(&files[0])
-                .to_str()
-                .expect("temp WAV 路径应为有效 UTF-8"),
-        )
-        .expect("sherpa Wave 必须能解析 session WAV");
-        assert_eq!(decoded.sample_rate(), 16000);
-        assert_eq!(decoded.samples().len(), 4800, "时长/样本数须与输入一致");
+        let (dec_rate, dec_samples) = decode_wav_chunked(&dir.join(&files[0]));
+        assert_eq!(dec_rate, 16000);
+        assert_eq!(dec_samples.len(), 4800, "时长/样本数须与输入一致");
         // 只读性：dump 不得改动喂给管线的样本
         assert_eq!(chunks, original, "dump 不得改动一个 bit");
         log::set_max_level(log::LevelFilter::Warn);

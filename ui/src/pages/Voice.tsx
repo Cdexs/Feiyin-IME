@@ -9,43 +9,24 @@ interface Props {
   updateConfig: (cfg: any) => void;
 }
 
-interface AccuracyModelInfo {
-  ready: boolean;
-  model_dir: string;
-  download_url: string;
-}
-
 const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
   const [devices, setDevices] = useState<string[]>([]);
-  const [modelInfo, setModelInfo] = useState<AccuracyModelInfo | null>(null);
-  const [copiedField, setCopiedField] = useState<string | null>(null);
   const t = getTranslations(config.ui_language);
 
   const [qwen3TestStatus, setQwen3TestStatus] = useState<'idle' | 'testing' | 'success' | 'failed'>('idle');
   const [qwen3TestMessage, setQwen3TestMessage] = useState('');
-  const prevModelRef = useRef<string>('local_realtime');
+  const prevModelRef = useRef<string>('feiyin_server');
   const latestRef = useRef({ asrModel: '', config: {} as any });
-  // ASR-SERVER-491 S8：自家识别服务是否已配对（没配对就离开本页 ⇒ 同无 key 一样回落上一个档位）。
+  // ASR-SERVER-491 S8：识别服务是否已配对（没配对就离开本页 ⇒ 同无 key 一样回落上一个档位）。
   const remotePairedRef = useRef(false);
-  // ASR-UI-208（Gavin 2026-09-10）：UI 不再提供「在线语音识别模型」(qwen_audio_online) 选项，
-  // 只留「本地模型」与「在线语音识别模型-FunASR」。后端能力与配置字段保留不动。
-  // 🔴 存量用户处理走「grandfathered option」：仅当配置值本就是 qwen_audio_online 时
-  // 才渲染该 option（见下方 select）。理由：qwen 与 accuracy 不同 —— accuracy 是废弃
-  // 不可用的模型故可静默迁移，qwen 是**可用功能**，Gavin 只要求隐藏 UI 入口而非废弃。
-  // 静默迁移会改变用户实际使用的 ASR 引擎（在线→本地），属功能变更；显示层回落则会
-  // 造成「显示 performance 实际跑 qwen」的不一致。两者都不可取，故按存量保留、
-  // 新用户不可见处理：切走之后就再也切不回来。
-  // ASR-DEFAULT-LRT-506（Gavin 10-19「新装默认改成「本地流式实时模型」，并且去掉 Ctrl+M 才能看到的限制」）：
-  // 本地流式实时模型恒显示（原 LOCAL-RT-UI-240 Ctrl+M 解锁已删），缺值回落同新装默认。
-  const asrModel = config.audio?.asr_model ?? "local_realtime";
+  // FLASH-P3-A（DEC-114）：输入法不再带本地模型，模型下拉只剩两项 ——「连识别服务」（flashasr，新装默认）
+  // 与「直连阿里 FunASR」。本地档（快速 / 本地流式实时）、在线 Qwen Audio 的选项、描述与模型下载提示整体删除；
+  // 旧配置值由主程序 / 设置界面加载时迁移为 feiyin_server，缺值回落同新装默认。
+  const asrModel = config.audio?.asr_model ?? "feiyin_server";
 
   useEffect(() => {
     loadDevices();
   }, []);
-
-  useEffect(() => {
-    checkAccuracyModelReady();
-  }, [asrModel]);
 
   // Keep latest values in ref for cleanup closure
   useEffect(() => {
@@ -55,10 +36,11 @@ const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
   useEffect(() => {
     return () => {
       const { asrModel: lastModel, config: lastConfig } = latestRef.current;
-      // ASR-056: 两族在线 ASR 无 key 退出时都回落到 prevModel
-      if (((lastModel === 'qwen_audio_online' || lastModel === 'fun_asr_realtime')
-          && !lastConfig.audio?.asr_online_api_key)
-          || (lastModel === 'feiyin_server' && !remotePairedRef.current)) {
+      // 直连阿里无 key / 连识别服务未配对就离开本页 ⇒ 回落到 prevModel
+      // （回落目标与当前相同 ⇒ 不写，免得新装默认「连识别服务」未配对时每次离开都白存一次）
+      if (prevModelRef.current !== lastModel
+          && ((lastModel === 'fun_asr_realtime' && !lastConfig.audio?.asr_online_api_key)
+            || (lastModel === 'feiyin_server' && !remotePairedRef.current))) {
         updateConfig({
           ...lastConfig,
           audio: { ...lastConfig.audio, asr_model: prevModelRef.current }
@@ -76,16 +58,6 @@ const loadDevices = async () => {
     }
   };
 
-  const checkAccuracyModelReady = async () => {
-    try {
-      const info = await invoke<AccuracyModelInfo>("check_accuracy_model_ready");
-      setModelInfo(info);
-    } catch (e) {
-      console.warn("Failed to check accuracy model readiness:", e);
-      setModelInfo(null);
-    }
-  };
-
   const handleAudioChange = (field: string, value: any) => {
     updateConfig({
       ...config,
@@ -94,28 +66,21 @@ const loadDevices = async () => {
   };
 
   const handleAsrModelChange = (value: string) => {
-    // ASR-056: 两族在线 ASR 切换时都记录 prevModel（cleanup 回落用）
-    if ((value === 'qwen_audio_online' || value === 'fun_asr_realtime' || value === 'feiyin_server')
-        && asrModel !== value) {
+    // ASR-056: 切换档位时记录 prevModel（cleanup 回落用）
+    if ((value === 'fun_asr_realtime' || value === 'feiyin_server') && asrModel !== value) {
       prevModelRef.current = asrModel;
     }
-    if ((value === 'qwen_audio_online' || value === 'fun_asr_realtime')
-        && !config.audio?.asr_online_api_key) {
+    if (value === 'fun_asr_realtime' && !config.audio?.asr_online_api_key) {
       setQwen3TestStatus('idle');
     }
-    // ASR-056: 切换在线族时同步 asr_online_model 为该族默认串。
+    // ASR-056: 切到直连阿里时同步 asr_online_model 为 fun-asr 默认串。
     // 前缀守卫在主程序 load 时已兜底，这里主动同步避免守卫 warn 噪音。
     //
     // 🔴 必须一次 updateConfig 写两个字段（FUN-UI-004，tester-1 阶段三查出）：
     // handleAudioChange 每次都从**本次渲染捕获的** config 展开，连续调用两次时
     // 第二次会用同一份陈旧 config 覆盖第一次的结果 —— asr_online_model 的同步
     // 直接丢失。改为单次 patch 提交。
-    const familyModelId =
-      value === 'qwen_audio_online'
-        ? 'qwen-audio-3.0-asr-flash-streaming'
-        : value === 'fun_asr_realtime'
-          ? 'fun-asr-realtime'
-          : null;
+    const familyModelId = value === 'fun_asr_realtime' ? 'fun-asr-realtime' : null;
     updateConfig({
       ...config,
       audio: {
@@ -139,69 +104,13 @@ const loadDevices = async () => {
     }
   };
 
-const copyToClipboard = async (text: string): Promise<boolean> => {
-    try {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        await navigator.clipboard.writeText(text);
-        return true;
-      }
-    } catch (e) {
-      console.warn("Clipboard API failed:", e);
-    }
-
-    const textarea = document.createElement("textarea");
-    textarea.value = text;
-    textarea.style.position = "fixed";
-    textarea.style.opacity = "0";
-    textarea.style.pointerEvents = "none";
-    document.body.appendChild(textarea);
-    textarea.select();
-    try {
-      const ok = document.execCommand("copy");
-      return ok;
-    } catch (e) {
-      console.warn("execCommand copy failed:", e);
-      return false;
-    } finally {
-      document.body.removeChild(textarea);
-    }
-  };
-
-  const handleCopyUrl = async () => {
-    const url = modelInfo?.download_url;
-    if (!url) return;
-    const ok = await copyToClipboard(url);
-    if (ok) {
-      setCopiedField('url');
-      setTimeout(() => setCopiedField(null), 2000);
-    }
-  };
-
-  const handleCopyPath = async () => {
-    const path = modelInfo?.model_dir;
-    if (!path) return;
-    const ok = await copyToClipboard(path);
-    if (ok) {
-      setCopiedField('dir');
-      setTimeout(() => setCopiedField(null), 2000);
-    } else {
-      window.alert(t.voice_asr_model_manual_download);
-    }
-  };
-
   const getAsrDesc = () => {
     switch (asrModel) {
-      case 'performance': return t.voice_asr_model_performance_desc;
-      case 'accuracy': return t.voice_asr_model_accuracy_desc;
-      case 'qwen_audio_online': return t.voice_asr_model_qwen3_desc;
       case 'fun_asr_realtime': return t.voice_asr_model_fun_asr_desc;
-      case 'local_realtime': return t.voice_asr_model_local_realtime_desc;
       case 'feiyin_server': return t.voice_asr_model_feiyin_desc;
       default: return '';
     }
   };
-
-  const showAccuracyAlert = asrModel === "accuracy" && modelInfo && !modelInfo.ready;
 
   return (
     <div className="settings-page">
@@ -230,68 +139,13 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
             onChange={(e) => handleAsrModelChange(e.target.value)}
             className="select-input"
           >
-            {/* ASR-UI-HIDE-FAST-503（Gavin 10-19「将UI 语音输入/ASR模型 中的 “本地模型-快速” 选项隐藏，
-                今后将不再支持该选项」）：同 ASR-UI-208 的 grandfathered 处理 —— 只在配置值本就是
-                performance 时渲染（否则下拉显示空白 / 显示与实际引擎不一致），切走后不再出现。 */}
-            {asrModel === "performance" && (
-              <option value="performance">{t.voice_asr_model_performance}</option>
-            )}
-            <option value="local_realtime">{t.voice_asr_model_local_realtime}</option>
-            {asrModel === "qwen_audio_online" && (
-              <option value="qwen_audio_online">{t.voice_asr_model_qwen3}</option>
-            )}
-            <option value="fun_asr_realtime">{t.voice_asr_model_fun_asr}</option>
             <option value="feiyin_server">{t.voice_asr_model_feiyin}</option>
+            <option value="fun_asr_realtime">{t.voice_asr_model_fun_asr}</option>
           </select>
 
           <p className="asr-model-desc" style={{ marginTop: '8px' }}>
             {getAsrDesc()}
           </p>
-
-          {showAccuracyAlert && (
-            <div className="asr-model-alert">
-              <p className="asr-model-alert-title">{t.voice_asr_model_download_required}</p>
-              <div className="asr-model-field">
-                <span className="asr-model-label">{t.voice_asr_model_download_url}</span>
-                <button
-                  type="button"
-                  onClick={() => invoke('open_url_in_browser', { url: modelInfo!.download_url }).catch(() => {})}
-                  className="btn btn-primary btn-sm"
-                >
-                  {t.voice_asr_model_open_download}
-                </button>
-              </div>
-              <div className="asr-model-field">
-                <span className="asr-model-label">{t.voice_asr_model_download_url}</span>
-                <div className="asr-model-path-row">
-                  <code className="asr-model-path">{modelInfo!.download_url}</code>
-                  <button
-                    type="button"
-                    onClick={handleCopyUrl}
-                    className="btn btn-secondary btn-sm"
-                  >
-                    {copiedField === 'url' ? t.voice_copied : t.voice_copy}
-                  </button>
-                </div>
-              </div>
-              <div className="asr-model-field">
-                <span className="asr-model-label">{t.voice_asr_model_target_dir}</span>
-                <div className="asr-model-path-row">
-                  <code className="asr-model-path">{modelInfo!.model_dir}</code>
-                  <button
-                    type="button"
-                    onClick={handleCopyPath}
-                    className="btn btn-secondary btn-sm"
-                  >
-                    {copiedField === 'dir' ? t.voice_copied : t.voice_copy}
-                  </button>
-                </div>
-              </div>
-              <p className="form-hint" style={{ marginTop: '8px' }}>
-                {t.voice_asr_model_manual_download}
-              </p>
-            </div>
-          )}
 
           {asrModel === 'feiyin_server' && (
             <FeiyinServerPairing
@@ -300,7 +154,7 @@ const copyToClipboard = async (text: string): Promise<boolean> => {
             />
           )}
 
-          {(asrModel === 'qwen_audio_online' || asrModel === 'fun_asr_realtime') && (
+          {asrModel === 'fun_asr_realtime' && (
             <div className="qwen3-section" style={{ marginTop: '16px' }}>
               {!config.audio?.asr_online_api_key && (
                 <p className="form-hint" style={{ color: 'var(--brand-primary)', marginBottom: '8px' }}>

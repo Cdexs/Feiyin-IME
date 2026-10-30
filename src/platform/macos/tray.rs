@@ -30,8 +30,7 @@ use crate::ui::tray::TrayState;
 pub enum TrayCommand {
     OpenSettings,
     Exit,
-    /// ASR-SERVER-491 S7：「启动 / 停止识别服务」单项。
-    ToggleAsrService,
+    // FLASH-P3-A：「启动 / 停止识别服务」单项随本机识别服务（asr_service）删除。
 }
 
 /// A pending tray state update requested from any thread, applied on the main
@@ -61,10 +60,6 @@ thread_local! {
 pub struct StatusBarTray {
     status_item: Retained<NSStatusItem>,
     _bridge: Retained<TrayBridge>,
-    /// ASR-SERVER-491 S7：识别服务单项 + 当前已显示的（文案, 可点），变了才改（15ms 轮询里只比一次指针与布尔）。
-    asr_item: Retained<NSMenuItem>,
-    asr_shown: (&'static str, bool),
-    ui_language: UiLanguage,
 }
 
 impl Drop for StatusBarTray {
@@ -103,8 +98,8 @@ pub fn build_tray(
         status_item.setDoubleAction(Some(sel!(openSettings:)));
     }
 
-    // Menu: ASR service / Settings / Separator / Exit.
-    let (menu, asr_item, asr_shown) = build_tray_menu(ui_language, &bridge, mtm);
+    // Menu: Settings / Separator / Exit.
+    let menu = build_tray_menu(ui_language, &bridge, mtm);
     unsafe {
         status_item.setMenu(Some(&menu));
         status_item.setVisible(true);
@@ -118,9 +113,6 @@ pub fn build_tray(
     Ok(StatusBarTray {
         status_item,
         _bridge: bridge,
-        asr_item,
-        asr_shown,
-        ui_language,
     })
 }
 
@@ -170,17 +162,6 @@ pub fn poll_pending_tray_states() {
         };
         while let Ok(update) = rx.try_recv() {
             set_tray_state(tray, update.state, update.ui_language);
-            tray.ui_language = update.ui_language;
-        }
-        // ASR-SERVER-491 S7：识别服务单项随总开关 / 就绪状态切换（只在变化时改菜单项）。
-        let want = crate::asr_service::supervisor::tray_item(tray.ui_language);
-        if want != tray.asr_shown {
-            unsafe {
-                tray.asr_item.setTitle(&NSString::from_str(want.0));
-                tray.asr_item.setEnabled(want.1);
-            }
-            set_asr_item_icon(&tray.asr_item, want.0, tray.ui_language);
-            tray.asr_shown = want;
         }
     });
 }
@@ -207,27 +188,11 @@ fn build_tray_menu(
     ui_language: UiLanguage,
     bridge: &Retained<TrayBridge>,
     mtm: MainThreadMarker,
-) -> (Retained<NSMenu>, Retained<NSMenuItem>, (&'static str, bool)) {
+) -> Retained<NSMenu> {
     let strings = i18n::get(ui_language);
     let menu = NSMenu::new(mtm);
     // 菜单项可点与否由我们自己设（关掉 NSMenu 按 target/action 自动判定）。
     unsafe { menu.setAutoenablesItems(false) };
-
-    // ASR-SERVER-491 S7（§16.7）：识别服务单项，文案随总开关切换，未就绪置灰。
-    let asr_shown = crate::asr_service::supervisor::tray_item(ui_language);
-    let asr_item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            mtm.alloc::<NSMenuItem>(),
-            &NSString::from_str(asr_shown.0),
-            Some(sel!(toggleAsrService:)),
-            &NSString::from_str(""),
-        )
-    };
-    unsafe {
-        asr_item.setTarget(Some(&**bridge));
-        asr_item.setEnabled(asr_shown.1);
-    }
-    menu.addItem(&asr_item);
 
     let settings = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -268,18 +233,8 @@ fn build_tray_menu(
             unsafe { item.setImage(Some(&img)) };
         }
     }
-    set_asr_item_icon(&asr_item, asr_shown.0, ui_language);
 
-    (menu, asr_item, asr_shown)
-}
-
-/// TRAY-ICON-500：识别服务项图标跟文案走（未运行 = 播放三角，运行中 = 停止方块），与 Windows 同一光栅。
-fn set_asr_item_icon(item: &NSMenuItem, label: &str, ui_language: UiLanguage) {
-    let running = crate::asr_service::supervisor::tray_item_is_stop(label, ui_language);
-    let rgba = crate::ui::menu_icons::service_icon_rgba(18, running);
-    if let Some(img) = nsimage_from_rgba(18, 18, &rgba) {
-        unsafe { item.setImage(Some(&img)) };
-    }
+    menu
 }
 
 // ============================================================================
@@ -406,11 +361,6 @@ declare_class!(
         #[method(exit:)]
         fn exit(&self, _sender: *mut objc2::runtime::AnyObject) {
             self.ivars().tx.send(TrayCommand::Exit).ok();
-        }
-
-        #[method(toggleAsrService:)]
-        fn toggle_asr_service(&self, _sender: *mut objc2::runtime::AnyObject) {
-            self.ivars().tx.send(TrayCommand::ToggleAsrService).ok();
         }
     }
 );

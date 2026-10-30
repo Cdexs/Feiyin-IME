@@ -15,6 +15,9 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 /// 「我的」页三项分项：本地快速 / 在线 ASR / 本地流式。
+/// FLASH-P3-A：输入法只剩在线路径（新记录恒 `OnlineAsr`）；本地两项保留 —— 历史统计库里仍有这两类记录，
+/// 设置界面经 `#[path]` 复用本文件读汇总。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageCategory {
     LocalFast,

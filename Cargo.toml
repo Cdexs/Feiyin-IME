@@ -11,11 +11,6 @@ path = "src/main.rs"
 name = "crash-reporter"
 path = "src/bin/crash-reporter.rs"
 
-# ASR-SERVER-491 S4：识别服务网关（对外协议 + 加密 + 终端配对；不加载模型，经本机 IPC 调内核）。
-[[bin]]
-name = "feiyin-asr-gateway"
-path = "src/bin/feiyin-asr-gateway/main.rs"
-
 [features]
 # 本地 PoC / 离线实验测试（文件不入库，见 .gitignore「PoC 不入库」段）；默认关，构建产物不受影响。
 poc = []
@@ -23,28 +18,15 @@ poc = []
 [dependencies]
 # Async runtime (cross-platform)
 tokio = { version = "1", features = ["rt", "time", "net", "io-util", "sync", "macros"] }
-# ASR-SERVER-491 S4（只有网关用）：wss 服务端 + 自签证书。与已有 tungstenite 0.26 / rustls 0.23 / ring 0.17 同版本线。
-tokio-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+# 连识别服务的配对码 / 证书指纹（asr_shared::pairing）。
+# FLASH-P3-A：识别服务网关已移到 flashasr，只给网关用的 tokio-tungstenite / tokio-rustls / rcgen / futures-util 一并删除。
 ring = "0.17"
-futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
 # Audio capture (cross-platform)
 cpal = "0.15"
 
-# sherpa-onnx for Paraformer ASR (v0.3.2)
-# MIGRATE-1.13.8-1.7B-359：升 1.13.8（含 Qwen3 静音幻觉修复 #3907、centered-STFT #3873、PRNG 竞态 #3912；ORT 1.28.2）
-sherpa-onnx = { version = "1.13.8", default-features = false, features = ["shared"] }
-# PUNCT-JAKO-466：日韩文专用标点模型（punct_cap_seg_47lang int8）直接走 ONNX Runtime。
-# 🔴 只开 std + load-dynamic：运行时加载 sherpa-onnx 自带的 onnxruntime（1.28.2，与 ort rc.13 目标版本一致），
-#    不下载、不另打包第二份 ORT；首次遇到日韩文才加载（DEC-102）。
-ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic"] }
-
-# Offline translation via CTranslate2. Tokenization stays on the Rust side.
-ctranslate2 = { version = "2.1.1", default-features = false, features = ["tokenizers"] }
-ctranslate2-sys = { version = "0.1.5", features = ["crt-dynamic", "shared", "ruy"] }
-sentencepiece = "0.13.1"
+# FLASH-P3-A（DEC-114）：输入法不再带任何本地模型 ⇒ sherpa-onnx / ort / ctranslate2 / ctranslate2-sys /
+# sentencepiece 删除（本地识别、标点、离线翻译都已移出：识别在 flashasr 或阿里，翻译只走大模型）。
 
 # HTTP client for LLM API (cross-platform)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
@@ -98,9 +80,6 @@ image = { version = "0.25", default-features = false, features = ["png", "ico"] 
 # Chinese script conversion (cross-platform)
 zhconv = { version = "0.4.1", default-features = false, features = ["compress", "opencc"] }
 
-# WB-ECHO-483：汉字转拼音（纯 Rust，跨平台）—— 本地实时回显护栏比「带词库 / 不带词库」两次识别的读音
-pinyin = { version = "0.11", default-features = false, features = ["plain"] }
-
 # Crash reporting (cross-platform)
 backtrace = "0.3"
 chrono = "0.4"
@@ -110,11 +89,6 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 
 # Windows-specific dependencies
 [target.'cfg(target_os = "windows")'.dependencies]
-# TRANS-CT2-DNNL-THREADS-397：Windows 下给 CT2 追加 oneDNN（x86 int8 GEMM 加速）+ MSVC OpenMP 运行时。
-# Cargo 特性合并：通用 [dependencies] 的 crt-dynamic/shared/ruy 保留，Windows 额外拿到 dnnl/openmp-runtime-comp；
-# macOS 只拿通用三项，行为不变（验收 6）。oneDNN 3.1.1 由 ctranslate2-src-build-support 自编为静态库，
-# 由 patches/ctranslate2-sys/build.rs 的 CMAKE_PREFIX_PATH 补丁让 CT2 的 find_package 命中。
-ctranslate2-sys = { version = "0.1.5", features = ["dnnl", "openmp-runtime-comp"] }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -136,15 +110,8 @@ windows = { version = "0.58", features = [
     "Win32_System_SystemInformation",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
-    # ASR-SERVER-491：内核 ↔ 网关 IPC 命名管道（仅当前用户 DACL）。
-    "Win32_System_Pipes",
-    "Win32_System_IO",
-    "Win32_Storage_FileSystem",
-    "Win32_Security_Authorization",
-    # 内网地址选网卡：GetAdaptersAddresses 枚举。
-    "Win32_NetworkManagement_IpHelper",
-    "Win32_NetworkManagement_Ndis",
-    "Win32_Networking_WinSock",
+    # FLASH-P3-A：内核 ↔ 网关 IPC（Pipes / IO / Storage_FileSystem / Security_Authorization）与内网选网卡
+    #（IpHelper / Ndis / WinSock）特性只为本机识别服务存在，随 asr_service 删除。
 ] }
 
 # macOS dependencies (Phase 3 placeholder)
@@ -180,11 +147,5 @@ opt-level = 1
 inherits = "release"
 opt-level = "s"
 
-[patch.crates-io]
-cmake = { path = "vendor/cmake" }
-ctranslate2-sys = { path = "patches/ctranslate2-sys" }
-esaxx-rs = { path = "patches/esaxx-rs" }
-
-# ACC-ENGINE-LLAMACPP-452：编译 llama.cpp 适配层 native/llama_asr/shim.cpp（全平台）
-[build-dependencies]
-cc = "1.2"
+# FLASH-P3-A：[patch.crates-io]（cmake / ctranslate2-sys / esaxx-rs）只为 CT2 / sentencepiece 存在，随之删除；
+# [build-dependencies] cc 只为编译 llama.cpp 适配层，随之删除。

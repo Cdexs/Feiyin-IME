@@ -1,11 +1,7 @@
-use std::path::{Path, PathBuf};
-
-/// PUNCT-JAKO-466：日韩文专用标点（首次遇到日韩文才加载）。
-pub(crate) mod jako;
+//! 标点纯规则函数（FLASH-P3-A：CT-Transformer 标点模型 `PunctuationEngine`、日韩标点 `jako`、
+//! 在线接缝重判 `judge_seam` 随本地模型删除；标点由识别服务端加，本模块只留判定 / 剥离规则）。
 
 use crate::transcription;
-
-const PUNCT_MODEL_SUBDIR: &str = "punct-ct-transformer-zh";
 
 /// 短句阈值：字/词数 <= 5 时不加末尾标点（Gavin 2026-08-08 拍板）
 ///
@@ -80,6 +76,8 @@ fn is_effective_punctuation(c: char, prev: char, next: char) -> bool {
 ///   主控裁定接受；与句子级方案的差异已钉测试）
 /// - 全角数字（`３.１４`）两侧非 ASCII 字母数字 → 不豁免 → `true`，与半角行为
 ///   不一致（已实测钉测试，只报不改）
+// FLASH-P3-A：生产调用方（本地转录的 native_punctuated 判定）随本地档删除；纯规则保留（DEC-114）。
+#[allow(dead_code)]
 pub fn has_effective_punctuation(text: &str) -> bool {
     let chars: Vec<char> = text.chars().collect();
     for (i, &c) in chars.iter().enumerate() {
@@ -105,6 +103,8 @@ pub fn has_effective_punctuation(text: &str) -> bool {
 /// 用途：CT-Transformer 重打标点前先清空已有标点，从结构上根除
 /// 「对已带标点文本二次打点 ⇒ `。。` 叠加」（PUNCT-DOUBLE-334 的老 bug）——
 /// 输入无标点 ⇒ 不可能叠加。
+// FLASH-P3-A：生产调用方（本地实时剥光重打节点）随本地档删除；纯规则保留（DEC-114）。
+#[allow(dead_code)]
 pub fn strip_effective_punctuation(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
@@ -150,75 +150,6 @@ fn is_cjk_ideograph_or_kana(c: char) -> bool {
         || (c >= '\u{4E00}' && c <= '\u{9FFF}') // CJK Unified Ideographs
         || (c >= '\u{3400}' && c <= '\u{4DBF}') // CJK Extension A
         || (c >= '\u{F900}' && c <= '\u{FAFF}') // CJK Compatibility Ideographs
-}
-
-/// PUNCT-478（DEC-108）：接缝处可被重判的句读标点。成对符号（引号 / 括号 / 书名号）不在内 —— 它们
-/// 不表示「话在这里停了」，接缝重判不得动。
-pub const SEAM_MARKS: &[char] = &[
-    '，', '。', '！', '？', '；', '：', '、', '…', ',', '!', '?', ';', ':', '.',
-];
-
-/// PUNCT-478：是否接缝处可重判的句读标点（见 [`SEAM_MARKS`]）。
-pub fn is_seam_mark(c: char) -> bool {
-    SEAM_MARKS.contains(&c)
-}
-
-/// PUNCT-478：`punctuated` 中第 `k` 个内容字（字母数字）之后、下一个内容字之前出现的句读标点（空白跳过）。
-fn marks_after_content(punctuated: &str, k: usize) -> String {
-    let mut seen = 0usize;
-    let mut marks = String::new();
-    for c in punctuated.chars() {
-        if c.is_alphanumeric() {
-            if seen == k {
-                break;
-            }
-            seen += 1;
-        } else if seen == k && is_seam_mark(c) {
-            marks.push(c);
-        }
-    }
-    marks
-}
-
-/// PUNCT-478（DEC-108）：判一处接缝该用什么句读标点（Gavin 10-04 端测「……差异，但是。根本的法则……」：
-/// 在线服务按停顿断句、在句末自动收句号，而那里话没说完）。
-///
-/// 取接缝前后各一段上下文（去掉其中句读标点），整段交本地标点模型 `punctuate`，读出接缝位置
-/// （左侧第 k 个内容字之后）落下的标点。返回 `Some(标点)`（空串 = 不加）；两侧缺内容字 / 模型失败 ⇒ `None`
-/// （调用方保留原标点）。
-pub fn judge_seam(
-    left: &str,
-    right: &str,
-    punctuate: impl FnOnce(&str) -> Option<String>,
-) -> Option<String> {
-    const CTX_CHARS: usize = 24;
-    let plain = |s: &str| -> Vec<char> { s.chars().filter(|c| !is_seam_mark(*c)).collect() };
-    let l = plain(left);
-    let r = plain(right);
-    let l_tail: String = l[l.len().saturating_sub(CTX_CHARS)..].iter().collect();
-    let r_head: String = r.iter().take(CTX_CHARS).collect();
-    let k = l_tail.chars().filter(|c| c.is_alphanumeric()).count();
-    if k == 0 || !r_head.chars().any(|c| c.is_alphanumeric()) {
-        return None;
-    }
-    let out = punctuate(&format!("{l_tail}{r_head}"))?;
-    Some(marks_after_content(&out, k))
-}
-
-/// KOJA-PUNCT-464：文本是否含标点模型（CT-Transformer，中英词表）处理不了的文字 —— 日文假名 / 韩文。
-///
-/// 实测（`poc464_preview_punct`，证据 `collab/evidence/464/preview-punct.md`）：韩文送进去**空格全被吃掉**
-/// （「조금만 생각을」→「조금만생각을」），日文只在句末补「。」、无句中标点。含这两种文字 ⇒ 不送标点模型。
-/// 只看假名 / 谚文：日文汉字与中文同区，单凭汉字判不出日文，有假名才算日文。
-pub fn ct_unsupported_script(text: &str) -> bool {
-    text.chars().any(|c| {
-        ('\u{3040}'..='\u{30FF}').contains(&c) // 平假名 + 片假名
-            || ('\u{31F0}'..='\u{31FF}').contains(&c) // 片假名音标扩展
-            || ('\u{FF66}'..='\u{FF9D}').contains(&c) // 半角片假名
-            || ('\u{AC00}'..='\u{D7A3}').contains(&c) // 谚文音节
-            || ('\u{1100}'..='\u{11FF}').contains(&c) // 谚文字母
-            || ('\u{3130}'..='\u{318F}').contains(&c) // 谚文兼容字母
-    })
 }
 
 /// 从末尾循环剥离标点直到末字符非标点（PUNCT-GOVERNANCE-030-A B2）
@@ -288,179 +219,9 @@ pub fn apply_l2_postprocess(
     }
 }
 
-pub struct PunctuationEngine {
-    punct: sherpa_onnx::OfflinePunctuation,
-}
-
-impl PunctuationEngine {
-    pub fn new(model_dir: &Path) -> Option<Self> {
-        let punct_dir = model_dir.join(PUNCT_MODEL_SUBDIR);
-        let model_path = punct_dir.join("model.onnx");
-
-        if !model_path.exists() {
-            log::warn!(
-                "Punctuation model not found at {:?}, disabling punctuation",
-                model_path
-            );
-            return None;
-        }
-
-        let model_path_str = model_path.to_str()?.to_string();
-
-        let mut config = sherpa_onnx::OfflinePunctuationConfig::default();
-        config.model.ct_transformer = Some(model_path_str);
-        config.model.num_threads = 1;
-        config.model.debug = false;
-        config.model.provider = Some("cpu".to_string());
-
-        match sherpa_onnx::OfflinePunctuation::create(&config) {
-            Some(punct) => {
-                log::info!("Punctuation model loaded from {:?}", punct_dir);
-                Some(Self { punct })
-            }
-            None => {
-                log::error!("Failed to create OfflinePunctuation from {:?}", punct_dir);
-                None
-            }
-        }
-    }
-
-    pub fn add_punctuation(&mut self, text: &str) -> Option<String> {
-        let result = self.punct.add_punctuation(text);
-        result.map(|s| convert_punctuation_for_english(&s))
-    }
-
-    pub fn model_dir() -> PathBuf {
-        transcription::model_dir()
-    }
-}
-
-fn convert_punctuation_for_english(text: &str) -> String {
-    let ascii_letter_count = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
-    let total_chars = text
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == ' ')
-        .count();
-    if total_chars == 0 {
-        return text.to_string();
-    }
-    let ratio = ascii_letter_count as f64 / total_chars as f64;
-    if ratio > 0.5 {
-        text.replace('，', ",")
-            .replace('。', ".")
-            .replace('？', "?")
-            .replace('、', ",")
-    } else {
-        text.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// KOJA-PUNCT-464：含假名 / 谚文 ⇒ 标点模型处理不了；纯中英（含日文汉字单独出现）照常送。
-    #[test]
-    fn koja464_ct_unsupported_script() {
-        assert!(ct_unsupported_script("조금만 생각을 하면서"));
-        assert!(ct_unsupported_script("うちの中学は弁当制"));
-        assert!(ct_unsupported_script("カタカナ"));
-        assert!(ct_unsupported_script("ｶﾀｶﾅ"));
-        assert!(ct_unsupported_script("今天说了一句 안녕하세요"));
-        assert!(!ct_unsupported_script("开放时间早上九点至下午五点"));
-        assert!(!ct_unsupported_script(
-            "the tribal chieftain called for the boy"
-        ));
-        assert!(
-            !ct_unsupported_script("中学"),
-            "只有汉字判不出日文 ⇒ 照常送"
-        );
-        assert!(!ct_unsupported_script(""));
-    }
-
-    #[test]
-    fn test_punctuation_model_subdir_constant() {
-        assert_eq!(PUNCT_MODEL_SUBDIR, "punct-ct-transformer-zh");
-    }
-
-    #[test]
-    fn test_model_dir_delegates_to_transcription() {
-        let dir = PunctuationEngine::model_dir();
-        assert!(dir.ends_with("models") || dir.to_string_lossy().contains("models"));
-    }
-
-    #[test]
-    fn test_convert_punctuation_pure_english() {
-        let input = "Hello world，this is a test。How are you？";
-        let output = convert_punctuation_for_english(input);
-        assert_eq!(output, "Hello world,this is a test.How are you?");
-    }
-
-    #[test]
-    fn test_convert_punctuation_mixed_chinese_no_convert() {
-        let input = "今天天气真好，我们去公园玩吧。";
-        let output = convert_punctuation_for_english(input);
-        assert_eq!(output, input);
-    }
-
-    #[test]
-    fn test_convert_punctuation_mixed_english_heavy() {
-        let input = "We used Python，built an API，and deployed it。OK？";
-        let output = convert_punctuation_for_english(input);
-        assert_eq!(output, "We used Python,built an API,and deployed it.OK?");
-    }
-
-    #[test]
-    fn test_convert_punctuation_boundary_ratio_exactly_50() {
-        // 2 ASCII letters + 2 Chinese chars = 4 alphanumeric total, ratio = 2/4 = 0.5
-        // Threshold is > 0.5, so exactly 0.5 should NOT convert
-        let input = "ab中文";
-        // First add some punctuation marks to verify they stay
-        let input_punct = "ab，中文。";
-        let output = convert_punctuation_for_english(input_punct);
-        assert_eq!(
-            output, input_punct,
-            "Exactly 50% ratio should NOT convert (threshold is >0.5)"
-        );
-    }
-
-    #[test]
-    fn test_convert_punctuation_empty_text() {
-        let input = "";
-        let output = convert_punctuation_for_english(input);
-        assert_eq!(output, "", "Empty text should return empty");
-    }
-
-    #[test]
-    fn test_convert_punctuation_only_punctuation() {
-        // Only punctuation marks: total_chars == 0, ratio would divide by zero
-        // Function should return text as-is
-        let input = "，。？！";
-        let output = convert_punctuation_for_english(input);
-        assert_eq!(
-            output, input,
-            "Punctuation-only text should be returned unchanged"
-        );
-    }
-
-    #[test]
-    fn test_convert_punctuation_just_above_threshold() {
-        // 7 letters + 1 number + 1 space + 2 punct = 11 chars, 7 letters = 63.6%
-        let input = "abcdefg，h1。";
-        let output = convert_punctuation_for_english(input);
-        assert_eq!(
-            output, "abcdefg,h1.",
-            "Ratio > 0.5 should convert to half-width"
-        );
-    }
-
-    #[test]
-    fn test_convert_punctuation_numbers_not_counted_as_letters() {
-        // Numbers don't count as ASCII letters in the ratio
-        let input = "123，456。789？";
-        let output = convert_punctuation_for_english(input);
-        assert_eq!(output, input, "Numbers-only should not trigger conversion");
-    }
 
     // ============================================================
     // PUNCT-GOVERNANCE-030-A B1/B2: count_units / strip_trailing_punctuation
@@ -941,42 +702,7 @@ mod tests {
             lines.iter().position(|l| l.starts_with(needle))
         }
 
-        fn brace_delta(line: &str) -> i32 {
-            line.matches('{').count() as i32 - line.matches('}').count() as i32
-        }
-
-        /// 花括号定界：以 anchor 行为起点返回 (open_idx, close_idx)。
-        fn block_bounds(lines: &[String], anchor: usize) -> Option<(usize, usize)> {
-            let mut depth = 0i32;
-            let mut opened = false;
-            let mut open_idx = usize::MAX;
-            for (i, line) in lines.iter().enumerate().skip(anchor) {
-                depth += brace_delta(line);
-                if depth > 0 && !opened {
-                    opened = true;
-                    open_idx = i;
-                }
-                if opened && depth == 0 {
-                    return Some((open_idx, i));
-                }
-            }
-            None
-        }
-
-        /// `if` **真分支体**：anchor 行之后、到第一个以 `}` 开头的行之前（不含两端）。
-        ///
-        /// 🔴 FIX-222 A：**不能用花括号定界取真分支** —— `} else {` 一行 `{`/`}` 净差为 0，
-        /// 深度不归零，`block_bounds` 的窗口会一直延伸到整个 `if/else` 的 `};`，
-        /// 于是 else 分支体也被算进「真分支内」→ 反向断言必然误报（首跑 guard_215_g10 即此）。
-        /// 改为按「首个以 `}` 开头的行」截断，天然的 else / 嵌套 if 都能正确断开。
-        fn if_true_body<'a>(lines: &'a [String], anchor: usize) -> &'a [String] {
-            let tail = &lines[anchor + 1..];
-            let n = tail
-                .iter()
-                .position(|l| l.starts_with('}'))
-                .unwrap_or(tail.len());
-            &tail[..n]
-        }
+        // FLASH-P3-A：`brace_delta` / `block_bounds` / `if_true_body` 只服务已改写的 G10/G11（在线 / 本地两分支），随之删除。
 
         /// 语句窗口：anchor 行到首个恰好等于 `end` 的行（含首尾）。
         ///
@@ -1214,67 +940,26 @@ mod tests {
         // 215 · 在线 ASR 跳 ITN 的判据与通道边界
         // ---------------------------------------------------------------------
 
-        /// G9 · 🔴 判据必须是数据路径事实（`initial_text`），不得回退成 config。
-        /// `config.audio.asr_model` 与 transcriber 热重载存在瞬态不同步，
-        /// 按 config 判会把**本地** ASR 输出也误跳 ITN（main.rs 注释已声明该理由）。
-        /// 时序（必须在 `initial_text` 被 move 之前取值）由借用检查器保证，无需额外断言。
+        /// G9–G11（FLASH-P3-A 改写）：原守「`from_online_streaming = initial_text.is_some()` 判据来自数据路径、
+        /// 在线跳主通道 / 本地走主通道」。本地转录分支删除后只剩在线终稿 ⇒ 判据与 offline 分支一并删除，
+        /// 主通道 ITN 恒跳过。现守两件事：① 主通道恒为原文（生产区不得再调 `itn::normalize_numbers`，
+        /// 防有人把在线服务端已规整过的文本再规整一遍 = 二次处理）；② 补丁通道（DEC-036 双通道另一半）保留且在其后。
         #[test]
-        fn guard_215_g9_judge_is_data_path_not_config() {
+        fn guard_215_p3a_main_channel_always_skipped() {
             let lines = main_prod_lines();
-            let anchor = find_line(
-                &lines,
-                "let from_online_streaming = initial_text.is_some();",
-            )
-            .expect("215 判据行必须存在（数据路径事实 initial_text）");
             assert!(
-                !lines[anchor].contains("config"),
-                "判据不得来自 config（与引擎热重载有瞬态不同步）"
+                find_line(&lines, "let pre_llm_text = raw_text.clone();").is_some(),
+                "主通道恒为原文（在线服务端已做数字规整）"
             );
             assert!(
-                !lines[anchor].contains("asr_model"),
-                "判据不得来自 asr_model"
-            );
-            // 全生产区非注释出现次数必须恰为 2：1 次定义 + 1 次使用（只跳主通道）。
-            // 出现第 3 处 = 有人给它加了第二个门控（例如把补丁通道也跳掉）= 回归。
-            let uses = lines
-                .iter()
-                .filter(|l| !l.starts_with("//") && l.contains("from_online_streaming"))
-                .count();
-            assert_eq!(
-                uses, 2,
-                "from_online_streaming 只允许「定义 1 处 + 主通道使用 1 处」；多出即新增门控"
-            );
-        }
-
-        /// G10 · 主通道两条分支都必须存在：online → 逐字 `raw_text`；offline → 主通道 ITN。
-        #[test]
-        fn guard_215_g10_main_channel_both_branches() {
-            let lines = main_prod_lines();
-            let anchor = find_line(&lines, "let pre_llm_text = if from_online_streaming {")
-                .expect("主通道 skip 判定必须存在");
-            // 🔴 FIX-222 A：只扫**真分支体**（`} else {` 之前），不把 else 分支算进来。
-            let online = if_true_body(&lines, anchor);
-            // 非恒真自证：若有人把 `itn::normalize_numbers(&raw_text)` **挪进 online 分支**
-            // （即挪到这行 `}` 之前），`online` 就会包含它 → 下面第二条断言立刻变红。
-            // 反之，原实现把 else 分支也纳入窗口，所以它对**正确的**代码也报红（首跑假阳性根因）。
-            assert!(
-                online.iter().any(|l| l.starts_with("raw_text.clone()")),
-                "online 分支必须原样使用 raw_text（真分支体为空或分支被删都会红）"
-            );
-            assert!(
-                !online
+                !lines
                     .iter()
-                    .any(|l| l.starts_with("itn::normalize_numbers")),
-                "online 分支内不得再跑主通道 ITN（否则 gate 形同虚设）"
-            );
-            assert!(
-                find_line(&lines, "itn::normalize_numbers(&raw_text)").is_some(),
-                "offline 分支必须保留主通道 normalize_numbers"
+                    .any(|l| !l.starts_with("//") && l.contains("itn::normalize_numbers(")),
+                "生产区不得再调主通道 itn::normalize_numbers（在线文本二次规整）"
             );
         }
 
-        /// G11 · 🔴 补丁通道刻意保留（DEC-036 双通道的另一半），且不被 skip 门控 ——
-        /// 「只跳主通道」是决定不是漏。若有人把补丁通道也塞进门控块，本组必红。
+        /// G11 · 🔴 补丁通道刻意保留（DEC-036 双通道的另一半），且位于主通道赋值之后（LLM 之后）。
         #[test]
         fn guard_215_g11_patch_channel_survives_and_not_gated() {
             let lines = main_prod_lines();
@@ -1283,17 +968,9 @@ mod tests {
                 "let final_text = itn::normalize_unit_symbols_only(&final_text);",
             )
             .expect("补丁通道调用必须保留（只跳主通道，不是两条都跳）");
-            let gate = find_line(&lines, "let pre_llm_text = if from_online_streaming {")
-                .expect("主通道门控必须存在");
-            let (_, gate_end) = block_bounds(&lines, gate).expect("门控块必须闭合");
-            assert!(
-                patch > gate_end,
-                "补丁通道必须在门控块之外（块内 = 被 online 门控吞掉）"
-            );
-            assert!(
-                !lines[patch].contains("from_online_streaming"),
-                "补丁通道调用不得挂在 online 门控上"
-            );
+            let main = find_line(&lines, "let pre_llm_text = raw_text.clone();")
+                .expect("主通道赋值必须存在");
+            assert!(patch > main, "补丁通道必须在主通道之后（LLM 之后兜底）");
         }
 
         /// G12 · 补丁通道的「价值」与「边界」（语义旁证，证明只跳主通道不是漏跳）：
@@ -1443,34 +1120,5 @@ mod sync352_punct_final_350_tests {
                 "输出出现替换字符（编码损坏）：{t:?} -> {s:?}"
             );
         }
-    }
-}
-
-/// PUNCT-478（DEC-108）：接缝重判 —— 读出模型在接缝位置落下的标点。
-#[cfg(test)]
-mod punct478_seam_tests {
-    use super::judge_seam;
-
-    #[test]
-    fn p478_judge_seam_reads_mark_at_seam_position() {
-        // 模型在「但是」后不打标点 ⇒ 接缝不加；上下文里的旧标点不影响定位。
-        let got = judge_seam(
-            "这应该都是文化之间的差异，但是。",
-            "根本的法则应该都是一样。",
-            |ctx| {
-                assert!(!ctx.contains('。'), "送模型的上下文去掉了句读标点：{ctx}");
-                Some("这应该都是文化之间的差异，但是根本的法则应该都是一样。".to_string())
-            },
-        );
-        assert_eq!(got.as_deref(), Some(""));
-        let got = judge_seam(
-            "今天的会议就到这里。",
-            "大家辛苦了。",
-            |_| Some("今天的会议就到这里，大家辛苦了。".to_string()),
-        );
-        assert_eq!(got.as_deref(), Some("，"));
-        // 模型失败 / 一侧没有内容字 ⇒ None（调用方保留原标点）。
-        assert_eq!(judge_seam("好的。", "下面", |_| None), None);
-        assert_eq!(judge_seam("。", "下面", |_| Some(String::new())), None);
     }
 }

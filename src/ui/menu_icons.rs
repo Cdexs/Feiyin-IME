@@ -24,16 +24,6 @@ pub fn exit_icon_rgba(size: u32) -> Vec<u8> {
     rasterize(size, power_covered)
 }
 
-/// TRAY-ICON-500：识别服务菜单项图标，跟菜单文案走 —— 未运行（「启动识别服务」）= 播放三角，
-/// 运行中（「停止识别服务」）= 停止方块。电源符号已给「退出」用，不复用以免两项同图。
-pub fn service_icon_rgba(size: u32, running: bool) -> Vec<u8> {
-    if running {
-        rasterize(size, stop_covered)
-    } else {
-        rasterize(size, play_covered)
-    }
-}
-
 // edit_icon_rgba 见本文件下方 EDITICON-190 实现（纯几何 SSAA：铅笔 + 单条下划线，定稿 A2）。
 
 /// EDITICON-176：直通 alpha BGRA（GDI `AlphaBlend` `AC_SRC_ALPHA` 输入格式）。
@@ -149,37 +139,7 @@ fn power_covered(fx: f32, fy: f32) -> bool {
     ang_from_up.abs() >= POWER_GAP_HALF_RAD
 }
 
-// —— TRAY-ICON-500 播放三角：顶点 (-0.20,-0.32) / (-0.20,0.32) / (0.34,0)，
-//      视觉重心略偏左于几何中心，整体右移 0.02S 使光学居中 ——
-const PLAY_LEFT_X: f32 = -0.20;
-const PLAY_HALF_H: f32 = 0.32;
-const PLAY_TIP_X: f32 = 0.34;
-
-fn play_covered(fx: f32, fy: f32) -> bool {
-    if fx < PLAY_LEFT_X || fx > PLAY_TIP_X {
-        return false;
-    }
-    // 上下两条斜边：|y| ≤ 半高 × (尖点距离 / 底到尖总长)
-    let t = (PLAY_TIP_X - fx) / (PLAY_TIP_X - PLAY_LEFT_X);
-    fy.abs() <= PLAY_HALF_H * t
-}
-
-// —— TRAY-ICON-500 停止方块：半边 0.25S（16/20/24px 下边缘正落像素格线，边缘锐利），圆角 0.04S ——
-const STOP_HALF: f32 = 0.25;
-const STOP_CORNER_R: f32 = 0.04;
-
-fn stop_covered(fx: f32, fy: f32) -> bool {
-    let (ax, ay) = (fx.abs(), fy.abs());
-    if ax > STOP_HALF || ay > STOP_HALF {
-        return false;
-    }
-    let inner = STOP_HALF - STOP_CORNER_R;
-    if ax <= inner || ay <= inner {
-        return true;
-    }
-    let (dx, dy) = (ax - inner, ay - inner);
-    dx * dx + dy * dy <= STOP_CORNER_R * STOP_CORNER_R
-}
+// FLASH-P3-A：TRAY-ICON-500 识别服务项图标（播放三角 / 停止方块）随托盘「启动 / 停止识别服务」项删除。
 
 // —— EDITICON-190：编辑图标定稿 = 候选 A2「铅笔 + 单条下划线」（Gavin 2026-09-08 目视
 // edit-A vs edit-A2 预览后拍板「图标选a2」，按预览原样定稿，不再调笔矢量）——
@@ -487,8 +447,6 @@ mod tests {
             for (name, rgba) in [
                 ("settings", settings_icon_rgba(size)),
                 ("exit", exit_icon_rgba(size)),
-                ("service-start", service_icon_rgba(size, false)),
-                ("service-stop", service_icon_rgba(size, true)),
             ] {
                 let path = dir.join(format!("{name}-{size}.png"));
                 image::save_buffer(&path, &rgba, size, size, image::ExtendedColorType::Rgba8)
@@ -521,27 +479,5 @@ mod tests {
         assert_eq!(gear[3], 0, "gear corner must be empty");
         let power = exit_icon_rgba(32);
         assert_eq!(power[3], 0, "power corner must be empty");
-    }
-
-    /// TRAY-ICON-500：播放三角 / 停止方块形态抽检（中心实心、角落透明、三角尖朝右）。
-    #[test]
-    fn service_icons_shape() {
-        let alpha = |px: &[u8], x: usize, y: usize| px[(y * 32 + x) * 4 + 3];
-        let play = service_icon_rgba(32, false);
-        assert_eq!(alpha(&play, 16, 16), 255, "play center must be solid");
-        assert_eq!(alpha(&play, 0, 0), 0, "play corner must be empty");
-        // 三角尖朝右：左侧近底边处高、右侧近尖点处矮
-        let col_h = |x: usize| (0..32).filter(|&y| alpha(&play, x, y) > 127).count();
-        assert!(col_h(11) > col_h(24), "play triangle must point right");
-        let stop = service_icon_rgba(32, true);
-        assert_eq!(alpha(&stop, 16, 16), 255, "stop center must be solid");
-        assert_eq!(alpha(&stop, 0, 0), 0, "stop corner must be empty");
-        // 方块左右对称
-        for y in 0..32 {
-            for x in 0..16 {
-                assert_eq!(alpha(&stop, x, y), alpha(&stop, 31 - x, y));
-            }
-        }
-        assert_ne!(play, stop, "start / stop icons must differ");
     }
 }

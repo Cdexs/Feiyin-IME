@@ -94,8 +94,9 @@ pub struct AudioConfig {
     /// Enable streaming ASR mode (2-pass: streaming + offline correction)
     #[serde(default)]
     pub enable_streaming: bool,
-    /// ASR 模型选择（DEC-025 / DEC-028 / ASR-041 / ASR-056）：
-    /// "performance" | "accuracy" | "qwen_audio_online" | "fun_asr_realtime" | "local_realtime"（新装默认，ASR-DEFAULT-LRT-506）
+    /// ASR 模型选择（FLASH-P3-A，DEC-114 起只剩两项）：
+    /// "feiyin_server"（连识别服务 flashasr，新装默认）| "fun_asr_realtime"（直连阿里 FunASR）。
+    /// 旧值（performance / accuracy / local_realtime / qwen_audio_online 等）加载时迁移为 "feiyin_server"。
     /// 必须与主程序 src/config/mod.rs AudioConfig.asr_model 同步，
     /// 否则配置界面保存时会静默丢弃主程序写入的 asr_model（round-trip 数据丢失）
     #[serde(default = "default_asr_model")]
@@ -126,35 +127,39 @@ pub struct AudioConfig {
     /// 必须与主程序 src/config/mod.rs 同步（round-trip 数据丢失防护）。
     #[serde(default)]
     pub asr_online_semantic_punctuation_enabled: bool,
-    /// LOCAL-RT-UI-240: 本地 realtime 档位解锁开关（DEC-065 极客档，默认隐藏）。
-    /// 必须与主程序 src/config/mod.rs AudioConfig.asr_local_realtime_unlocked 同步，
-    /// 否则设置界面一保存（Ctrl+M 解锁后）该字段会被镜像结构体静默蒸发
-    /// （[CONFIG-MIRROR-DRIFT-001]：serde default 只兜读不兜写）。
-    #[serde(default)]
-    pub asr_local_realtime_unlocked: bool,
+    // FLASH-P3-A：`asr_local_realtime_unlocked` 随本地档删除（与主程序同步；旧字段 serde 忽略）。
 }
 
 fn default_overlay_opacity() -> f32 {
     0.75
 }
 
-/// 存量配置缺 `asr_model` 字段时的回落值（与主程序 `src/config/mod.rs` 同步）。
+/// 存量配置缺 `asr_model` 字段时的回落值（与主程序 `src/config/mod.rs` 同步；FLASH-P3-A 起同新装默认）。
 fn default_asr_model() -> String {
-    "performance".to_string()
+    NEW_INSTALL_ASR_MODEL.to_string()
 }
 
-/// ASR-DEFAULT-LRT-506：新装默认模型（与主程序 `NEW_INSTALL_ASR_MODEL` 同步）。
-const NEW_INSTALL_ASR_MODEL: &str = "local_realtime";
+/// FLASH-P3-A：新装默认模型（与主程序 `NEW_INSTALL_ASR_MODEL` 同步）。
+const NEW_INSTALL_ASR_MODEL: &str = "feiyin_server";
+
+/// FLASH-P3-A：合法取值（与主程序 `VALID_ASR_MODELS` 同步），其余一律迁移为新装默认。
+const VALID_ASR_MODELS: [&str; 2] = ["feiyin_server", "fun_asr_realtime"];
+
+/// FLASH-P3-A：旧档位迁移（镜像主程序 `migrate_legacy_asr_model`；镜像侧只改内存，落盘由主程序负责）。
+fn migrate_legacy_asr_model(cfg: &mut AppConfig) {
+    if !VALID_ASR_MODELS.contains(&cfg.audio.asr_model.as_str()) {
+        cfg.audio.asr_model = NEW_INSTALL_ASR_MODEL.to_string();
+    }
+}
 
 fn default_asr_online_url() -> String {
     "wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference".to_string()
 }
 
 fn default_asr_online_model() -> String {
-    // ASR-056: 此默认值是 qwen_audio_online 族的默认模型串。
-    // fun_asr_realtime 族的默认模型串见主程序 src/config/mod.rs::default_online_model_for_family。
+    // FLASH-P3-A：qwen_audio_online 族已删，默认改为 fun-asr-realtime（与主程序 default_asr_online_model 同步）。
     // 镜像侧不重复族判定逻辑（主程序 load 时已落盘回写已守卫的值）。
-    "qwen-audio-3.0-asr-flash-streaming".to_string()
+    "fun-asr-realtime".to_string()
 }
 
 /// ASR-056: VAD 断句静音阈值默认值（ms），与主程序 default_asr_online_max_sentence_silence 同步
@@ -179,8 +184,6 @@ impl Default for AudioConfig {
             asr_online_max_sentence_silence: default_asr_online_max_sentence_silence(),
             // ASR-SEG-229: 默认 false = VAD 断句（保持既有行为）
             asr_online_semantic_punctuation_enabled: false,
-            // LOCAL-RT-UI-240：ASR-DEFAULT-LRT-506 起界面不再读取，保留字段兼容。
-            asr_local_realtime_unlocked: false,
         }
     }
 }
@@ -424,11 +427,8 @@ impl AppConfig {
         if cfg.auto_learn_threshold == 0 {
             cfg.auto_learn_threshold = default_auto_learn_threshold();
         }
-        // ASR-HIDE-ACCURACY-001-UI: deprecated "accuracy" model is no longer exposed in UI.
-        // Migrate any existing config silently to "performance" so that UI and main process agree.
-        if cfg.audio.asr_model == "accuracy" {
-            cfg.audio.asr_model = default_asr_model();
-        }
+        // FLASH-P3-A：本地档 / 已删在线档的旧值迁移为 feiyin_server（界面与主程序一致）。
+        migrate_legacy_asr_model(&mut cfg);
 
         Ok(cfg)
     }
@@ -464,10 +464,8 @@ impl AppConfig {
         if cfg.auto_learn_threshold == 0 {
             cfg.auto_learn_threshold = default_auto_learn_threshold();
         }
-        // ASR-HIDE-ACCURACY-001-UI: mirror migration for load_from path.
-        if cfg.audio.asr_model == "accuracy" {
-            cfg.audio.asr_model = default_asr_model();
-        }
+        // FLASH-P3-A：mirror migration for load_from path.
+        migrate_legacy_asr_model(&mut cfg);
 
         Ok(cfg)
     }
@@ -492,7 +490,6 @@ mod tests {
                 asr_online_model: default_asr_online_model(),
                 asr_online_max_sentence_silence: default_asr_online_max_sentence_silence(),
                 asr_online_semantic_punctuation_enabled: false,
-                asr_local_realtime_unlocked: false,
             },
             llm: LlmConfig::default(),
             hotkey: HotkeyConfig::default(),
@@ -517,40 +514,27 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// FLASH-P3-A（替换 accuracy→performance / qwen3_online 原样两条）：旧档位迁移为 feiyin_server，
+    /// 两个合法值原样保留（与主程序 `migrate_legacy_asr_model` 同口径）。
     #[test]
-    fn load_from_migrates_accuracy_to_performance() {
-        let path = temp_config_path("accuracy");
-        cleanup(&path);
-        let mut cfg = make_minimal_cfg_with_asr_model("accuracy");
-        cfg.save_to(&path).unwrap();
-
-        let loaded = AppConfig::load_from(&path).unwrap();
-        cleanup(&path);
-        assert_eq!(loaded.audio.asr_model, "performance");
-    }
-
-    #[test]
-    fn load_from_keeps_performance_untouched() {
-        let path = temp_config_path("performance");
-        cleanup(&path);
-        let mut cfg = make_minimal_cfg_with_asr_model("performance");
-        cfg.save_to(&path).unwrap();
-
-        let loaded = AppConfig::load_from(&path).unwrap();
-        cleanup(&path);
-        assert_eq!(loaded.audio.asr_model, "performance");
-    }
-
-    #[test]
-    fn load_from_keeps_qwen3_online_untouched() {
-        let path = temp_config_path("qwen3_online");
-        cleanup(&path);
-        let mut cfg = make_minimal_cfg_with_asr_model("qwen3_online");
-        cfg.save_to(&path).unwrap();
-
-        let loaded = AppConfig::load_from(&path).unwrap();
-        cleanup(&path);
-        assert_eq!(loaded.audio.asr_model, "qwen3_online");
+    fn p3a_load_from_migrates_legacy_asr_models() {
+        for (old, want) in [
+            ("performance", "feiyin_server"),
+            ("accuracy", "feiyin_server"),
+            ("local_realtime", "feiyin_server"),
+            ("qwen_audio_online", "feiyin_server"),
+            ("qwen3_online", "feiyin_server"),
+            ("feiyin_server", "feiyin_server"),
+            ("fun_asr_realtime", "fun_asr_realtime"),
+        ] {
+            let path = temp_config_path(&format!("p3a-{old}"));
+            cleanup(&path);
+            let cfg = make_minimal_cfg_with_asr_model(old);
+            cfg.save_to(&path).unwrap();
+            let loaded = AppConfig::load_from(&path).unwrap();
+            cleanup(&path);
+            assert_eq!(loaded.audio.asr_model, want, "{old}");
+        }
     }
 
     /// TEST-SYNC-038-B: src-tauri 镜像与主程序 config 字段一致性护栏。
@@ -562,19 +546,19 @@ mod tests {
     fn mirror_asr_fields_match_main_config_literals() {
         let cfg = AppConfig::default();
         // 字段默认值（对应主程序 src/config/mod.rs 的 default_asr_model / default_asr_online_url / default_asr_online_model）
-        // ASR-DEFAULT-LRT-506：新装默认 = 主程序 NEW_INSTALL_ASR_MODEL；缺字段回落仍是 performance。
+        // FLASH-P3-A：新装默认 = 主程序 NEW_INSTALL_ASR_MODEL = feiyin_server；缺字段回落同新装默认。
         assert_eq!(
-            cfg.audio.asr_model, "local_realtime",
+            cfg.audio.asr_model, "feiyin_server",
             "mirror asr_model default must match main config"
         );
-        assert_eq!(default_asr_model(), "performance");
+        assert_eq!(default_asr_model(), "feiyin_server");
         assert_eq!(
             cfg.audio.asr_online_url,
             "wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference",
             "mirror asr_online_url default must match main config (round-trip data loss guard)"
         );
         assert_eq!(
-            cfg.audio.asr_online_model, "qwen-audio-3.0-asr-flash-streaming",
+            cfg.audio.asr_online_model, "fun-asr-realtime",
             "mirror asr_online_model default must match main config"
         );
         assert_eq!(
@@ -619,7 +603,7 @@ mod tests {
     fn mirror_asr_online_max_sentence_silence_roundtrip() {
         let path = temp_config_path("silence_roundtrip");
         cleanup(&path);
-        let mut cfg = make_minimal_cfg_with_asr_model("performance");
+        let mut cfg = make_minimal_cfg_with_asr_model("feiyin_server");
         cfg.audio.asr_online_max_sentence_silence = 500;
         cfg.save_to(&path).unwrap();
 
@@ -637,7 +621,7 @@ mod tests {
     fn mirror_asr_online_semantic_punctuation_roundtrip() {
         let path = temp_config_path("semantic_punctuation_roundtrip");
         cleanup(&path);
-        let mut cfg = make_minimal_cfg_with_asr_model("performance");
+        let mut cfg = make_minimal_cfg_with_asr_model("feiyin_server");
         cfg.audio.asr_online_semantic_punctuation_enabled = true;
         cfg.save_to(&path).unwrap();
 
@@ -655,7 +639,7 @@ mod tests {
     fn mirror_asr_online_url_model_serde_alias_reads_legacy_fields() {
         let path = temp_config_path("mirror_alias");
         cleanup(&path);
-        let mut cfg = make_minimal_cfg_with_asr_model("qwen_audio_online");
+        let mut cfg = make_minimal_cfg_with_asr_model("fun_asr_realtime");
         cfg.save_to(&path).unwrap();
 
         let toml_content = std::fs::read_to_string(&path).unwrap();
@@ -671,8 +655,9 @@ mod tests {
             "wss://llm-kudx4dj2bfqn4gr2.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference",
             "mirror serde alias must read legacy 'qwen_asr_url'"
         );
+        // FLASH-P3-A：默认模型串改为 fun-asr-realtime（存进去的就是它）。
         assert_eq!(
-            loaded.audio.asr_online_model, "qwen-audio-3.0-asr-flash-streaming",
+            loaded.audio.asr_online_model, "fun-asr-realtime",
             "mirror serde alias must read legacy 'qwen_asr_model'"
         );
     }

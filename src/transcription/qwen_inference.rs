@@ -62,8 +62,7 @@ const SILENCE_TIMEOUT: Duration = Duration::from_secs(10);
 /// - 保持四语，利准确率（覆盖用户可能说的语言），不拖慢速度
 const ASR_LANGUAGE_HINTS: &[&str] = &["zh", "en", "ja", "ko"];
 
-/// 默认模型名（qwen_audio_online 族）
-const DEFAULT_MODEL: &str = "qwen-audio-3.0-asr-flash-streaming";
+// FLASH-P3-A：qwen_audio_online 族默认模型名（DEFAULT_MODEL）随该档删除。
 
 /// ASR-056: fun_asr_realtime 族默认模型名
 const DEFAULT_FUN_ASR_MODEL: &str = "fun-asr-realtime";
@@ -82,8 +81,7 @@ const DEFAULT_MAX_SENTENCE_SILENCE: i64 = 2000;
 /// ASR-056: speech_noise_threshold 服务端噪声门限
 ///
 /// 调优结论：**不设置**（保持默认）
-/// - 我们已有本地 VAD 前置（transcribe_streaming_realtime 阶段 1），
-///   VAD 命中前的 chunk 缓冲后补发，已过滤纯静音段
+/// - （FLASH-P3-A 起本地 VAD 前置已删，静音段也会发出；本结论未重新评估，仍保持默认）
 /// - 服务端 speech_noise_threshold 是额外的一道门，设了可能在低信噪比环境下吞字
 /// - 依据：官方文档 speech_noise_threshold 默认值未知，且功能描述为「过滤背景噪声」，
 ///   与本地 VAD 功能重叠。拿不准保持默认（不显式设置 = 用服务端默认），不瞎调
@@ -94,7 +92,7 @@ const DEFAULT_MAX_SENTENCE_SILENCE: i64 = 2000;
 /// 调优结论：**不设置**（保持默认）
 /// - 我们录音最长 300s（MAX_RECORD_SECONDS），finish-task 后 10s 静音超时已覆盖
 /// - 录音期间持续发送音频帧（每 100ms 一片），本身就是「心跳」，服务端不会因静音断开
-/// - 长静音场景：用户按住热键不说话，本地 VAD 2s 保底建连后会发 pre-roll + 环境噪声帧
+/// - 长静音场景：用户按住热键不说话，建连后即持续发环境噪声帧（FLASH-P3-A 起无本地 VAD 门控）
 /// - 依据：官方文档 heartbeat 字段功能描述为「维持连接」，我们音频流本身就是持续信号
 /// - 不设置此字段，不引入额外心跳负担
 
@@ -714,6 +712,8 @@ fn percentile(samples: &[u64], p: u64) -> u64 {
 /// - 鉴权失败（401/403）→ "鉴权失败"
 /// - 网络失败 → "网络失败"
 /// - 超时 → "超时"
+// FLASH-P3-A：原唯一调用方（Transcriber 非流式回退）随本地档删除；在线整段识别能力保留（测试覆盖协议细节）。
+#[allow(dead_code)]
 pub fn transcribe_streaming(
     url: &str,
     api_key: &str,
@@ -970,25 +970,14 @@ pub struct OnlineFinal {
 
 /// ASR-038-B / ASR-058: 真流式 ASR 转录 —— 边收音频边发帧边收结果。
 ///
-/// **ASR-058 关键改动**：建连从「VAD 命中后」提前到「热键按下后立即建连」，
-/// VAD 门控与已建连接并行。收益 ~108ms（实测连接耗时稳定 108-117ms）。
+/// **ASR-058**：热键按下即建连（DNS→TCP→TLS→WS→run-task→task-started），
+/// 建连期间 chunk_rx 积攒 chunk（channel bounded 256，108ms ≈ 5-6 chunks 不溢出）。
 ///
-/// **与 `transcribe_streaming`（伪流式）的差异**：
-/// - 输入是 `chunk_rx: Receiver<Vec<f32>>`（实时音频流），非完整 `&[f32]`
-/// - ASR-058: 热键按下即建连（DNS→TCP→TLS→WS→run-task→task-started），
-///   建连期间 chunk_rx 积攒 chunk（channel bounded 256，108ms ≈ 5-6 chunks 不溢出）
-/// - 建连完成后跑 VAD 门控循环（从 chunk_rx 读积攒 + 新到的 chunk）
-///   - VAD 命中 → 发 pre-roll + 实时 chunk
-///   - 2s 保底 → 发 pre-roll + 实时 chunk
-///   - channel 断开 → 正常关闭连接 + bail（未说话）
-/// - 🔴 红线：VAD 命中前一个音频字节都不许发（建连≠发音频，run-task 不含音频可先发）
+/// **FLASH-P3-A（DEC-114）**：原「VAD 命中才发音频」的本地开口门控已删（输入法不再带模型）——
+/// task-started 后按原顺序发出积攒的音频，后续音频随到随发；channel 断开前一块音频都没有 ⇒ `NoSpeechError`。
 /// - 🔴 只在本次录音内提前建连，禁止跨录音复用（040-C 雷区）
-/// - VAD 缺失 → 建连后立即发音频（降级保底，宁可多花钱不可吞字）
 ///
-/// **不吞字保证（硬性自证②）**：
-/// - 音频采集在热键按下即开始（record_streaming 的 on_chunk 回调）
-/// - 建连期间（~108ms）的 chunk 在 channel 里积攒，不丢
-/// - VAD 命中前的 chunk 全部缓冲，命中后补发
+/// **不吞字保证**：音频采集在热键按下即开始；建连期间的 chunk 在 channel 里积攒，不丢、顺序不变。
 pub fn transcribe_streaming_realtime(
     url: &str,
     api_key: &str,
@@ -997,7 +986,6 @@ pub fn transcribe_streaming_realtime(
     vocabulary: &serde_json::Value,
     max_sentence_silence: i64,
     semantic_punctuation_enabled: bool,
-    model_dir: &std::path::Path,
     cancel_signal: Option<&std::sync::atomic::AtomicBool>,
     on_result: impl FnMut(&str, &[WordTiming]),
 ) -> Result<OnlineFinal> {
@@ -1005,8 +993,9 @@ pub fn transcribe_streaming_realtime(
         bail!("鉴权失败：API Key 为空");
     }
 
+    // FLASH-P3-A：qwen_audio_online 族已删，空模型串回落 fun-asr 默认（与 config 默认一致）。
     let model = if model.trim().is_empty() {
-        DEFAULT_MODEL
+        DEFAULT_FUN_ASR_MODEL
     } else {
         model
     };
@@ -1017,7 +1006,6 @@ pub fn transcribe_streaming_realtime(
         vocabulary,
         max_sentence_silence,
         semantic_punctuation_enabled,
-        model_dir,
         cancel_signal,
         on_result,
     )
@@ -1032,7 +1020,6 @@ pub fn transcribe_streaming_feiyin(
     pairing: &crate::asr_shared::remote::RemotePairing,
     chunk_rx: crossbeam_channel::Receiver<Vec<f32>>,
     vocabulary: &serde_json::Value,
-    model_dir: &std::path::Path,
     cancel_signal: Option<&std::sync::atomic::AtomicBool>,
     on_result: impl FnMut(&str, &[WordTiming]),
 ) -> Result<OnlineFinal> {
@@ -1043,7 +1030,6 @@ pub fn transcribe_streaming_feiyin(
         vocabulary,
         DEFAULT_MAX_SENTENCE_SILENCE,
         false,
-        model_dir,
         cancel_signal,
         on_result,
     )
@@ -1118,7 +1104,6 @@ fn realtime_session(
     vocabulary: &serde_json::Value,
     max_sentence_silence: i64,
     semantic_punctuation_enabled: bool,
-    model_dir: &std::path::Path,
     cancel_signal: Option<&std::sync::atomic::AtomicBool>,
     mut on_result: impl FnMut(&str, &[WordTiming]),
 ) -> Result<OnlineFinal> {
@@ -1242,33 +1227,19 @@ fn realtime_session(
     }
 
     // =========================================================================
-    // ASR-058 ①: 阶段 2 —— VAD 门控（连接已就绪，VAD 命中即发音频）
-    // 建连期间积攒的 chunk 在 channel 里，现在读取喂 VAD
-    // 🔴 命中前一个音频字节都不许发（连接已建但不发音频）
+    // 阶段 2（FLASH-P3-A，DEC-114）：输入法不再带任何本地模型 ⇒ 去掉 Silero VAD 开口门控。
+    // task-started 之后**按原顺序**把建连期间积攒的音频立即发出，后续音频随到随发
+    // （等同旧代码「VAD 模型缺失 ⇒ 建连后立即发音频」的降级分支）。代价：按住不说话的
+    // 那段静音也会送给服务端（直连阿里计费略增）；连 flashasr 时开口检测由服务端自己做。
+    // `summary.vad_hit_ms` 不再有来源，保持 -1。
     // =========================================================================
 
-    let mut vad = crate::transcription::vad::VadSegmenter::try_new_for_streaming(model_dir);
     let mut pre_roll_buffer: Vec<Vec<f32>> = Vec::new();
-    let mut vad_hit = false;
-
-    if vad.is_none() {
-        log::warn!("VAD model missing, falling back to immediate send (no gate, cost more)");
-    }
-
-    let vad_window = crate::transcription::vad::vad_window_size();
-    let vad_2s_deadline = t_start + Duration::from_secs(2);
-
-    // ASR-058 ②: task-started 已收到，pre-roll 编码可与 VAD 门控并行
-    // （pre-roll 编码是纯 CPU，VAD 门控是读 channel + 喂模型，天然可交替）
-    // 实际上 pre-roll 在 VAD 命中后才确定内容，所以编码在 VAD 命中后做——
-    // 但 task-started 的 35ms 已在建连阶段被吸收（建连提前到 VAD 之前）。
-
-    // VAD 门控循环：读 chunk → 喂 VAD → 命中或 2s 保底即跳出
-    while !vad_hit {
+    // 等第一块非空音频（建连期间积攒的会立刻读到）；随后把 channel 里已到的全部取出，顺序不变。
+    loop {
         if is_cancelled() {
-            // ASR-058 ①: 未说话就松手——正常关闭已建连接并写出关闭时序
             log::info!(
-                "Online ASR cancelled during VAD gate, closing connection gracefully (+{:.0}ms)",
+                "Online ASR cancelled before first audio chunk, closing connection gracefully (+{:.0}ms)",
                 t_start.elapsed().as_millis()
             );
             let _ = ws_socket.close(None);
@@ -1276,66 +1247,29 @@ fn realtime_session(
             log::info!("{}", summary.format_summary());
             bail!("转录已取消");
         }
-
-        // 2s 保底：VAD 2s 未命中无条件发音频
-        if std::time::Instant::now() >= vad_2s_deadline {
-            log::info!("VAD gate 2s deadline reached without detection, forcing send (safety net)");
-            vad_hit = true;
-            break;
-        }
-
         match chunk_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(chunk) if !chunk.is_empty() => {
-                pre_roll_buffer.push(chunk.clone());
-
-                if let Some(ref vad_seg) = vad {
-                    let mut offset = 0;
-                    while offset < chunk.len() {
-                        let end = (offset + vad_window).min(chunk.len());
-                        if vad_seg.accept_and_check(&chunk[offset..end]) {
-                            let vad_ms = t_start.elapsed().as_millis();
-                            log::info!(
-                                "VAD gate: speech detected at +{:.0}ms, sending audio (pre-roll buffer: {} chunks)",
-                                vad_ms,
-                                pre_roll_buffer.len()
-                            );
-                            summary.vad_hit_ms = vad_ms as i64;
-                            vad_hit = true;
-                            break;
-                        }
-                        offset = end;
+                pre_roll_buffer.push(chunk);
+                while let Ok(more) = chunk_rx.try_recv() {
+                    if !more.is_empty() {
+                        pre_roll_buffer.push(more);
                     }
                 }
-                if vad.is_none() {
-                    let vad_ms = t_start.elapsed().as_millis();
-                    summary.vad_hit_ms = vad_ms as i64;
-                    vad_hit = true;
-                    break;
-                }
+                break;
             }
             Ok(_) => { /* empty chunk, skip */ }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                // ASR-058 ①: 音频 channel 断开（录音结束）但还没命中 VAD —— 用户按了热键没说话
-                if pre_roll_buffer.is_empty() {
-                    log::info!(
-                        "Audio channel closed before VAD detected speech (+{:.0}ms), closing connection gracefully — likely user pressed hotkey without speaking",
-                        t_start.elapsed().as_millis()
-                    );
-                    let _ = ws_socket.close(None);
-                    summary.outcome = "cancelled";
-                    log::info!("{}", summary.format_summary());
-                    // BUG-119: 没说话 = 类型化信息信号（同 941/1640）。旧写法是中文错误串，
-                    // 会被当错误弹出原文；10-14 起错误提示未归类即显示通用文案，必须类型化。
-                    bail!(super::NoSpeechError);
-                }
-                // 有 pre-roll 但没命中 VAD —— 用 2s 保底逻辑发完
+                // 录音结束前一块音频都没收到 —— 用户按了热键没说话（或录音极短）
                 log::info!(
-                    "Audio channel closed during VAD gate with {} chunks buffered, forcing send to flush",
-                    pre_roll_buffer.len()
+                    "Audio channel closed before any audio chunk (+{:.0}ms), closing connection gracefully",
+                    t_start.elapsed().as_millis()
                 );
-                vad_hit = true;
-                break;
+                let _ = ws_socket.close(None);
+                summary.outcome = "cancelled";
+                log::info!("{}", summary.format_summary());
+                // BUG-119: 没说话 = 类型化信息信号
+                bail!(super::NoSpeechError);
             }
         }
     }
@@ -2457,7 +2391,6 @@ mod tests {
             &serde_json::json!({}),
             800,
             false,
-            std::path::Path::new("nonexistent-model-dir"),
             None,
             |_, _| {},
         );
@@ -2471,9 +2404,10 @@ mod tests {
     /// C-3: 流式常量钉住 —— 模型默认值必须与 config 默认一致，防两端点/两模型配置漂移
     #[test]
     fn streaming_inference_constants_match_defaults() {
+        // FLASH-P3-A：qwen_audio_online 族删除后，空模型串回落 fun-asr 默认（与 config 默认一致）。
         assert_eq!(
-            DEFAULT_MODEL, "qwen-audio-3.0-asr-flash-streaming",
-            "DEFAULT_MODEL must match config default (ASR-038-B-002)"
+            DEFAULT_FUN_ASR_MODEL, "fun-asr-realtime",
+            "DEFAULT_FUN_ASR_MODEL must match config default"
         );
         assert_eq!(
             AUDIO_CHUNK_BYTES, 3200,
