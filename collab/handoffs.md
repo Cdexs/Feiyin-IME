@@ -180,3 +180,4 @@
 - FLASH-P0-513：`text_stage::translate` 多参 `via_llm`（= 终端 optimize）；会话 `optimize: params.optimize && !params.translate`。2100 / 42 过。
 - FLASH-P1：flashasr 建仓搬家完成（`FlashASR` 仓库 `6772c80`）。本仓库代码未改。过渡期识别代码两边各一份，改动须同步。
 - MIC-ON-DEMAND（DEC-115）：`src/audio/mod.rs` `record` / `record_streaming` 外包 `release_stream`；`WarmInputStream.fresh` + `take_pre_roll`；`resolve_device` 缓存 `named_device`；`warm_up`（不开流）；分段计时 `[Latency] mic open:` / `mic first audio`；探针 `mic_cold_open_latency_probe`（#[ignore]，环境变量 VOICE_IME_MIC / VOICE_IME_MIC_ROUNDS / VOICE_IME_MIC_WARMUP）。main.rs 工作线程启动改调 `warm_up`。2100 / 0 / 51。未出包、未 push。
+- FLASH-P3-A（`540e817` + `9b20542`）：详见 FlashASR `collab/p3-survey.md` 与本条 CHANGELOG。PoC 文件（未入库）挪到 `localtest/p3a-removed-poc/`。待 P3-D：VC 运行库 dumpbin 复核、`Publish/voice-ime.iss` 同步、残留脚本 fetch-*.ps1、pairing.rs 的 TerminalStore 等网关遗留。注意：`src-tauri/src/qwen3.rs` 先前的纯格式改动随本提交入库（agent 同时改了 src-tauri/src）。

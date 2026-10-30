@@ -2914,3 +2914,9 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 - **改了什么**：`src/audio/mod.rs`（平台中立，macOS 编同一份）：启动不再开输入流；每次录音现开、录完即关；现开流不取 pre-roll；按名字的设备缓存；`warm_up` 启动预热（找设备 + 查格式，不开流）。`src/main.rs` 工作线程启动把 `prewarm(None)` 换成 `warm_up(设置里的设备)`。
 - **行为前后**：之前程序运行即占麦克风（macOS 菜单栏橙色指示常亮）、按键前 0.6~1s 预录进识别；之后只在录音时占用、无按键前预录。
 - **对 macOS 的影响**：无需改平台代码；`run_controller_macos` 若有单独的预开流调用需同样去掉（Windows 侧排查只在 main.rs 工作线程一处）。macOS CoreAudio 冷开耗时未实测，接手时请跑 `VOICE_IME_MIC= RUST_LOG=info cargo test --bin feiyin-ime mic_cold_open_latency_probe -- --ignored --nocapture` 记一组数。
+
+## 10-30 · FLASH-P3-A（DEC-114，主控 + 实现 agent）· 输入法变薄
+
+- **改了什么**：平台中立代码大删（transcription / punctuation / translation / asr_service / localrt_session / main.rs）；`AsrModel` 只剩 `FunAsrRealtime` + `FeiyinServer`；配置新装默认 `feiyin_server`、旧值迁移；Cargo 去 sherpa-onnx / ort / ctranslate2 / sentencepiece / cc / patch 段；build.rs 去 macOS rpath；`scripts/build-macos.sh` / `env-macos.sh` / `setup-macos.sh` 去 sherpa / ct2 / onnxruntime 步骤；macOS 侧 `tray.rs`、`run_controller_macos`、`handle_pipeline_event` 去本地实时加载门与识别服务托盘项。
+- **行为前后**：macOS 输入法不再带任何模型 / dylib；识别只能直连阿里或连 flashasr（flashasr 本期只出 Windows 版，macOS 输入法连 Windows 上的 flashasr）。
+- **对 macOS 的影响**：**Windows 侧无法编译验证 macOS 代码**，接手第一件事 `cargo check` + `cargo test`，修编译错误；打包脚本不再拷 dylib，签名步骤里对嵌套 dylib 的处理一并去掉后确认 .app 能启动。
