@@ -37,12 +37,15 @@ pub struct RemotePairing {
     pub device_id: String,
     /// 本机名称（空 ⇒ 取计算机名）。
     pub device_name: String,
+    /// FLASH-P3-B：连的是本机 flashasr（来自它写的本机配对文件，见 [`local_flashasr_pairing`]）。
+    /// 是 ⇒ 每次用前重读那份文件（flashasr 重装 / 改端口后 key、地址、指纹会变）。
+    pub local: bool,
 }
 
 /// 连接码 / 手输内容不合格的原因（界面按码取 i18n 文案）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairError {
-    /// 不是 `feiyin-asr://pair?` 开头，或版本不认识。
+    /// 不是 `flash-asr://pair?` 开头，或版本不认识。
     BadCode,
     /// 内网、外网地址一个都没有 / 格式不对。
     BadAddress,
@@ -149,6 +152,40 @@ impl RemotePairing {
             .unwrap_or_default()
     }
 
+    /// FLASH-P3-B：录音前取配对：没配过 ⇒ 用本机 flashasr（有本机配对文件就自动连，落盘记为本机）；
+    /// 配的是本机 ⇒ 按本机配对文件刷新地址 / key / 指纹。其余原样。
+    pub fn load_for_use() -> Self {
+        let cur = Self::load();
+        if cur.is_paired() && !cur.local {
+            return cur;
+        }
+        let Some(local) = local_flashasr_pairing() else {
+            return cur;
+        };
+        if cur.local
+            && cur.lan == local.lan
+            && cur.key == local.key
+            && cur.fingerprint == local.fingerprint
+        {
+            return cur;
+        }
+        match local.adopt_identity(&cur) {
+            Ok(mut p) => {
+                p.local = true;
+                p.mode = NetMode::Lan;
+                if let Err(e) = p.save() {
+                    log::warn!("FLASH-P3-B: save local flashasr pairing failed: {e}");
+                }
+                log::info!("FLASH-P3-B: using local flashasr ({})", p.lan);
+                p
+            }
+            Err(e) => {
+                log::warn!("FLASH-P3-B: adopt identity failed: {e}");
+                cur
+            }
+        }
+    }
+
     pub fn save(&self) -> std::io::Result<()> {
         let bytes = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
         super::write_atomic(&Self::path(), &bytes)
@@ -165,7 +202,7 @@ impl RemotePairing {
     pub fn from_pair_uri(code: &str) -> Result<Self, PairError> {
         let query = code
             .trim()
-            .strip_prefix("feiyin-asr://pair?")
+            .strip_prefix("flash-asr://pair?")
             .ok_or(PairError::BadCode)?;
         let mut p = Self::default();
         let mut version_ok = false;
@@ -277,6 +314,22 @@ fn read_computer_name() -> String {
         .unwrap_or_else(|| "Feiyin".to_string())
 }
 
+/// FLASH-P3-B：本机 flashasr 写的本机配对文件（协议 §1.5）：`<用户配置目录>/flashasr/local-pairing.json`。
+pub fn local_flashasr_pairing_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("flashasr").join("local-pairing.json"))
+}
+
+/// FLASH-P3-B：读本机 flashasr 的配对（没装 / 没运行过 / 文件坏 ⇒ `None`）。只有地址 / key / 指纹。
+pub fn local_flashasr_pairing() -> Option<RemotePairing> {
+    let bytes = std::fs::read(local_flashasr_pairing_path()?).ok()?;
+    parse_local_pairing(&bytes)
+}
+
+fn parse_local_pairing(bytes: &[u8]) -> Option<RemotePairing> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    RemotePairing::from_pair_uri(v.get("uri")?.as_str()?).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,20 +359,20 @@ mod tests {
             Err(PairError::BadCode)
         );
         assert_eq!(
-            RemotePairing::from_pair_uri("feiyin-asr://pair?v=2&lan=a:1&key=K&fp=00"),
+            RemotePairing::from_pair_uri("flash-asr://pair?v=2&lan=a:1&key=K&fp=00"),
             Err(PairError::BadCode),
             "不认识的版本"
         );
         assert_eq!(
-            RemotePairing::from_pair_uri(&format!("feiyin-asr://pair?v=1&key=K&fp={FP}")),
+            RemotePairing::from_pair_uri(&format!("flash-asr://pair?v=1&key=K&fp={FP}")),
             Err(PairError::BadAddress)
         );
         assert_eq!(
-            RemotePairing::from_pair_uri(&format!("feiyin-asr://pair?v=1&lan=a&fp={FP}")),
+            RemotePairing::from_pair_uri(&format!("flash-asr://pair?v=1&lan=a&fp={FP}")),
             Err(PairError::MissingKey)
         );
         assert_eq!(
-            RemotePairing::from_pair_uri("feiyin-asr://pair?v=1&lan=a&key=K&fp=12"),
+            RemotePairing::from_pair_uri("flash-asr://pair?v=1&lan=a&key=K&fp=12"),
             Err(PairError::BadFingerprint)
         );
     }
@@ -373,6 +426,28 @@ mod tests {
         assert_eq!(
             auto.candidates(),
             vec![("10.0.0.2:7860", "lan"), ("a.com:7860", "wan")]
+        );
+    }
+
+    /// FLASH-P3-B：本机配对文件按连接码解析；坏文件 ⇒ None。
+    #[test]
+    fn local_pairing_file_parsed_as_pair_uri() {
+        let fp = "a".repeat(64);
+        let json = format!(
+            r#"{{"terminal_id":"t1","uri":"flash-asr://pair?v=1&lan=127.0.0.1:7861&key=ABCD-EFGH&fp={fp}","port":7861}}"#
+        );
+        let p = parse_local_pairing(json.as_bytes()).expect("应能解析");
+        assert_eq!(p.lan, "127.0.0.1:7861");
+        assert_eq!(p.key, "ABCDEFGH");
+        assert!(p.is_paired());
+        assert!(parse_local_pairing(b"{}").is_none());
+        assert!(parse_local_pairing(b"garbage").is_none());
+        assert!(
+            parse_local_pairing(
+                format!(r#"{{"uri":"feiyin-asr://pair?v=1&lan=a:1&key=K&fp={fp}"}}"#).as_bytes()
+            )
+            .is_none(),
+            "旧前缀不认"
         );
     }
 }

@@ -966,6 +966,63 @@ pub fn transcribe_streaming(
 pub struct OnlineFinal {
     pub text: String,
     pub seams: Vec<usize>,
+    /// FLASH-P3-B：连 flashasr 时为 `Some` —— 文字已在服务端做完全部处理，附带译文 / 词库命中等。
+    pub server: Option<ServerFinal>,
+}
+
+/// FLASH-P3-B：flashasr 终稿附带的东西（协议 §5.2 / §5.3 / §5.4）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerFinal {
+    /// 译文（`output.translations[0].text`；没请求 / 失败 ⇒ `None`）。
+    pub translation: Option<String>,
+    /// 终端词库里出现在终稿中的词。
+    pub wordbook_hits: Vec<String>,
+    /// 输出优化给的词库学习建议。
+    pub learn_suggestions: Vec<String>,
+    /// 要了输出优化但没做成的原因（`llm_not_configured` / `llm_failed`；空 = 没这回事）。
+    pub optimization_skipped: String,
+    /// 有效语音毫秒（`task-finished` 的 `usage.speech_ms`）。
+    pub speech_ms: Option<u64>,
+}
+
+fn str_list(v: &serde_json::Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// FLASH-P3-B：从 flashasr 的终稿（`sentence_end = true`）里取译文与扩展字段（纯函数，可单测）。
+pub fn merge_flash_final(msg: &serde_json::Value, out: &mut ServerFinal) {
+    if extract_event_type(msg) != Some("result-generated") {
+        return;
+    }
+    let output = &msg["payload"]["output"];
+    if output["sentence"]["sentence_end"].as_bool() != Some(true) {
+        return;
+    }
+    out.translation = output["translations"][0]["text"]
+        .as_str()
+        .map(str::to_string)
+        .filter(|t| !t.trim().is_empty());
+    let ext = &output["feiyin"];
+    out.wordbook_hits = str_list(&ext["wordbook_hits"]);
+    out.learn_suggestions = str_list(&ext["learn_suggestions"]);
+    out.optimization_skipped = ext["optimization_skipped"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+}
+
+/// FLASH-P3-B：`task-finished` 的 `usage.speech_ms`（纯函数）。
+pub fn flash_speech_ms(msg: &serde_json::Value) -> Option<u64> {
+    if extract_event_type(msg) != Some("task-finished") {
+        return None;
+    }
+    msg["payload"]["usage"]["speech_ms"].as_u64()
 }
 
 /// ASR-038-B / ASR-058: 真流式 ASR 转录 —— 边收音频边发帧边收结果。
@@ -1018,13 +1075,14 @@ pub fn transcribe_streaming_realtime(
 /// 断句静音 / 语义断句两个参数对方服务端不用（断句由对方本地实时管线决定），按 DashScope 默认值填。
 pub fn transcribe_streaming_feiyin(
     pairing: &crate::asr_shared::remote::RemotePairing,
+    opts: &super::feiyin_remote::FlashOptions,
     chunk_rx: crossbeam_channel::Receiver<Vec<f32>>,
     vocabulary: &serde_json::Value,
     cancel_signal: Option<&std::sync::atomic::AtomicBool>,
     on_result: impl FnMut(&str, &[WordTiming]),
 ) -> Result<OnlineFinal> {
     realtime_session(
-        OnlineTarget::Feiyin(pairing),
+        OnlineTarget::Feiyin(pairing, opts),
         super::feiyin_remote::MODEL_NAME,
         chunk_rx,
         vocabulary,
@@ -1039,8 +1097,11 @@ pub fn transcribe_streaming_feiyin(
 enum OnlineTarget<'a> {
     /// 阿里百炼（URL + API Key，系统 CA 校验证书）。
     DashScope { url: &'a str, api_key: &'a str },
-    /// 自家识别服务（配对信息，证书按指纹认）。
-    Feiyin(&'a crate::asr_shared::remote::RemotePairing),
+    /// 自家识别服务 flashasr（配对信息，证书按指纹认；FLASH-P3-B：带本次处理开关）。
+    Feiyin(
+        &'a crate::asr_shared::remote::RemotePairing,
+        &'a super::feiyin_remote::FlashOptions,
+    ),
 }
 
 /// ASR-058 阶段 1 的建连（DashScope）：DNS → TCP → TLS → WS。原样从 `transcribe_streaming_realtime` 搬出。
@@ -1119,7 +1180,7 @@ fn realtime_session(
         "Online realtime streaming ASR: target={}, model={}, task_id={}",
         match &target {
             OnlineTarget::DashScope { url, .. } => url.to_string(),
-            OnlineTarget::Feiyin(p) =>
+            OnlineTarget::Feiyin(p, _) =>
                 format!("feiyin lan={} wan={} mode={:?}", p.lan, p.wan, p.mode),
         },
         model,
@@ -1141,7 +1202,7 @@ fn realtime_session(
     let t_connect_start = std::time::Instant::now();
     let mut ws_socket = match &target {
         OnlineTarget::DashScope { url, api_key } => connect_dashscope(url, api_key)?,
-        OnlineTarget::Feiyin(p) => super::feiyin_remote::connect(p, CONNECT_TIMEOUT)?,
+        OnlineTarget::Feiyin(p, _) => super::feiyin_remote::connect(p, CONNECT_TIMEOUT)?,
     };
 
     set_socket_timeouts(
@@ -1164,17 +1225,19 @@ fn realtime_session(
         max_sentence_silence,
         semantic_punctuation_enabled,
     );
-    if let OnlineTarget::Feiyin(p) = &target {
-        run_task["payload"]["parameters"]["feiyin"] = super::feiyin_remote::run_task_ext(p);
+    if let OnlineTarget::Feiyin(p, o) = &target {
+        run_task["payload"]["parameters"]["feiyin"] = super::feiyin_remote::run_task_ext(p, o);
         // S10：文字处理三项（阿里同名字段）放 parameters 顶层；只改 Feiyin 分支，阿里云行为不变。
         if let (Some(dst), Some(src)) = (
             run_task["payload"]["parameters"].as_object_mut(),
-            super::feiyin_remote::text_params().as_object().cloned(),
+            super::feiyin_remote::text_params(o).as_object().cloned(),
         ) {
             dst.extend(src);
         }
     }
     send_json(&mut ws_socket, &run_task)?;
+    // FLASH-P3-B：连 flashasr 才收服务端附带的东西（直连阿里没有）。
+    let mut server_final = matches!(target, OnlineTarget::Feiyin(..)).then(ServerFinal::default);
 
     // 等 task-started
     let t_task_started = std::time::Instant::now();
@@ -1466,7 +1529,12 @@ fn realtime_session(
                 Ok(_) => {}
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     if !finish_task_sent {
-                        let finish_task = build_finish_task_message(&task_id);
+                        let mut finish_task = build_finish_task_message(&task_id);
+                        // FLASH-P3-B：翻译热键可在录音中途按下 ⇒ 说完时把最终的翻译开关带上（协议 §4.3）。
+                        if let OnlineTarget::Feiyin(_, o) = &target {
+                            finish_task["payload"]["parameters"] =
+                                serde_json::json!({ "translation_enabled": o.translate_now() });
+                        }
                         // 先发完 batch 里已有的 chunk，再发 finish-task
                         if !batch_samples.is_empty() {
                             let pcm = f32_to_pcm16_le(&batch_samples);
@@ -1574,6 +1642,13 @@ fn realtime_session(
                 last_ws_activity = std::time::Instant::now();
                 let parsed: serde_json::Value =
                     serde_json::from_str(&text).context("服务端返回非 JSON 文本")?;
+                // FLASH-P3-B：flashasr 终稿的译文 / 扩展字段、结束时的有效语音时长。
+                if let Some(sf) = server_final.as_mut() {
+                    merge_flash_final(&parsed, sf);
+                    if let Some(ms) = flash_speech_ms(&parsed) {
+                        sf.speech_ms = Some(ms);
+                    }
+                }
                 if let Some(err) = extract_task_error(&parsed) {
                     log::info!("{}", summary.format_summary());
                     summary.outcome = "failed";
@@ -1667,6 +1742,7 @@ fn realtime_session(
                     return Ok(OnlineFinal {
                         seams: state.sentence_seams(),
                         text: final_text,
+                        server: server_final.take(),
                     });
                 }
             }
@@ -3047,8 +3123,8 @@ mod tests {
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect();
 
-        // 1. text_params() 恰好 1 次（锚点拆开防自匹配）。
-        let text_params = concat!("feiyin_remote::", "text_params", "()");
+        // 1. text_params(o) 恰好 1 次（锚点拆开防自匹配；FLASH-P3-B 起带本次处理开关）。
+        let text_params = concat!("feiyin_remote::", "text_params", "(o)");
         let n = code_only.iter().filter(|l| l.contains(text_params)).count();
         assert_eq!(n, 1, "{text_params} 应恰 1 次，实际 {n}");
 
@@ -3126,5 +3202,47 @@ mod tests {
             !compact_body.contains(needle),
             "build_run_task_message 函数体内不得出现 {needle}"
         );
+    }
+
+    /// FLASH-P3-B：flashasr 终稿扩展字段 / 译文 / 有效语音时长的解析。
+    #[test]
+    fn flash_final_extras_parsed_only_from_final() {
+        let preview = serde_json::json!({
+            "header": {"event": "result-generated"},
+            "payload": {"output": {"sentence": {"sentence_end": false, "text": "a"},
+                "feiyin": {"wordbook_hits": ["x"]}}}
+        });
+        let mut sf = ServerFinal::default();
+        merge_flash_final(&preview, &mut sf);
+        assert_eq!(sf, ServerFinal::default(), "预览不取");
+
+        let fin = serde_json::json!({
+            "header": {"event": "result-generated"},
+            "payload": {"output": {
+                "sentence": {"sentence_end": true, "text": "开放时间"},
+                "translations": [{"sentence_id": 1, "lang": "en", "text": "Opening hours", "sentence_end": true}],
+                "feiyin": {"wordbook_hits": ["开放时间"], "learn_suggestions": ["飞音"],
+                           "optimization_skipped": "llm_not_configured"}}}
+        });
+        merge_flash_final(&fin, &mut sf);
+        assert_eq!(sf.translation.as_deref(), Some("Opening hours"));
+        assert_eq!(sf.wordbook_hits, vec!["开放时间".to_string()]);
+        assert_eq!(sf.learn_suggestions, vec!["飞音".to_string()]);
+        assert_eq!(sf.optimization_skipped, "llm_not_configured");
+
+        let bare = serde_json::json!({
+            "header": {"event": "result-generated"},
+            "payload": {"output": {"sentence": {"sentence_end": true, "text": "好"}}}
+        });
+        let mut sf2 = ServerFinal::default();
+        merge_flash_final(&bare, &mut sf2);
+        assert_eq!(sf2, ServerFinal::default(), "没有扩展字段 ⇒ 全空");
+
+        let done = serde_json::json!({
+            "header": {"event": "task-finished"},
+            "payload": {"output": {}, "usage": {"duration": 6, "speech_ms": 4448}}
+        });
+        assert_eq!(flash_speech_ms(&done), Some(4448));
+        assert_eq!(flash_speech_ms(&fin), None);
     }
 }

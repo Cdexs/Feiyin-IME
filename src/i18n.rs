@@ -119,6 +119,8 @@ pub struct Strings {
     pub error_api_unavailable: &'static str,
     /// ASR-SERVER-491 S8：连自家识别服务——对方没开本地实时模型。
     pub error_feiyin_not_ready: &'static str,
+    /// FLASH-P3-B：识别中途 flashasr 的引擎崩溃重启（`EngineRestarted`）。
+    pub error_feiyin_restarted: &'static str,
     /// 对方忙（推理通道满）或已暂停服务。
     pub error_feiyin_busy: &'static str,
     /// key 失效 / 被撤销 / 设备不符 / 证书变了 / 本机没配对 ⇒ 要重新配对。
@@ -253,7 +255,8 @@ static ZH: Strings = Strings {
     overlay_error: "识别出错",
     error_network_timeout: "网络超时，请重试。",
     error_api_unavailable: "服务不可用，请检查网络或 API 设置。",
-    error_feiyin_not_ready: "识别服务那台电脑没切到「本地流式实时模型」。",
+    error_feiyin_not_ready: "识别服务的模型还在加载，请稍后再试。",
+    error_feiyin_restarted: "识别服务刚刚重启，请再说一遍。",
     error_feiyin_busy: "识别服务正忙或已暂停，请稍后再试。",
     error_feiyin_repair: "识别服务需要重新配对，请到设置里粘贴新的连接码。",
     error_model_init: "语音模型初始化失败。",
@@ -378,7 +381,8 @@ static ZH_TW: Strings = Strings {
     overlay_error: "識別出錯",
     error_network_timeout: "網路超時，請重試。",
     error_api_unavailable: "服務不可用，請檢查網路或 API 設定。",
-    error_feiyin_not_ready: "識別服務那台電腦沒切到「本地串流即時模型」。",
+    error_feiyin_not_ready: "識別服務的模型還在載入，請稍後再試。",
+    error_feiyin_restarted: "識別服務剛剛重新啟動，請再說一遍。",
     error_feiyin_busy: "識別服務正忙或已暫停，請稍後再試。",
     error_feiyin_repair: "識別服務需要重新配對，請到設定裡貼上新的連線碼。",
     error_model_init: "語音模型初始化失敗。",
@@ -502,7 +506,8 @@ static EN: Strings = Strings {
     overlay_error: "Recognition error",
     error_network_timeout: "Network timeout. Please try again.",
     error_api_unavailable: "Service unavailable. Check network/API settings.",
-    error_feiyin_not_ready: "The recognition server is not using the Local Streaming Realtime model.",
+    error_feiyin_not_ready: "The recognition service is still loading its models. Please try again shortly.",
+    error_feiyin_restarted: "The recognition service just restarted. Please say it again.",
     error_feiyin_busy: "The recognition server is busy or paused. Try again later.",
     error_feiyin_repair: "Please pair with the recognition server again in Settings.",
     error_model_init: "Speech model initialization failed.",

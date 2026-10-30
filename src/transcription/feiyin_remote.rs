@@ -35,22 +35,78 @@ pub const ERR_NOT_PAIRED: &str = "NotPaired";
 /// 对方证书与配对时记下的指纹不一致（对方重装 / 被冒充 ⇒ 重新配对）。
 pub const ERR_FINGERPRINT: &str = "FingerprintMismatch";
 
-/// `run-task` 的 `parameters.feiyin`：本机身份。
-pub fn run_task_ext(p: &RemotePairing) -> serde_json::Value {
-    serde_json::json!({
+/// FLASH-P3-B：连 flashasr 时本次识别的处理开关（每段录音按当时设置现算，见 FlashASR `collab/p3b-design.md` §1）。
+/// 文字处理全在服务端做，输入法只传开关、不再自己处理。
+#[derive(Debug, Clone, Default)]
+pub struct FlashOptions {
+    /// 补标点（关 ⇒ 服务端全去标点，同本机「自动标点」关）。
+    pub punctuation: bool,
+    /// 输出优化（服务端统一大模型）。
+    pub optimize: bool,
+    /// 繁简：`"simplified"` / `"traditional"`。
+    pub chinese_script: &'static str,
+    /// 去句末标点。
+    pub strip_trailing: bool,
+    /// 场景（`{kind, style_hint, multiline_safe}`）；场景感知关 ⇒ `None` 不传。窗口标题 / 程序名不传。
+    pub scene: Option<serde_json::Value>,
+    /// 设置里开了翻译功能（翻译热键可用）。
+    pub translation_enabled: bool,
+    /// 本次是否按了翻译热键 —— 可在录音中途才按，**说完时**读（随 `finish-task` 发，见 [`Self::translate_now`]）。
+    pub translate_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl FlashOptions {
+    /// 此刻是否要翻译（开始时 = `run-task` 的初值；说完时 = `finish-task` 带的终值）。
+    pub fn translate_now(&self) -> bool {
+        self.translation_enabled
+            && self
+                .translate_flag
+                .as_ref()
+                .is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire))
+    }
+}
+
+/// `run-task` 的 `parameters.feiyin`：本机身份 + flashasr 扩展开关。
+pub fn run_task_ext(p: &RemotePairing, o: &FlashOptions) -> serde_json::Value {
+    let mut v = serde_json::json!({
         "device_id": p.device_id,
         "device_name": p.effective_device_name(),
+        "output_optimization_enabled": o.optimize,
+        "strip_trailing_punct": o.strip_trailing,
+        "chinese_script": o.chinese_script,
+    });
+    if let Some(scene) = &o.scene {
+        v["scene"] = scene.clone();
+    }
+    v
+}
+
+/// 文字处理开关里与阿里同名的三项（放 `parameters` 顶层，不在 `feiyin` 里）。
+/// 输入法没有数字规整开关 ⇒ 恒请服务端做；翻译是开始时的初值，说完时以 `finish-task` 为准。
+pub fn text_params(o: &FlashOptions) -> serde_json::Value {
+    serde_json::json!({
+        "inverse_text_normalization_enabled": true,
+        "punctuation_prediction_enabled": o.punctuation,
+        "translation_enabled": o.translate_now(),
     })
 }
 
-/// S10：文字处理三项（阿里同名字段，放 `parameters` 顶层，不在 `feiyin` 里）。
-/// 本机走在线识别时跳过数字规整主通道（V091-ITN-SKIP-ONLINE-215，默认服务端做过），
-/// 所以请对方做数字规整 + 补标点；翻译由本机客户端自己的开关处理，这里恒不请对方翻译。
-pub fn text_params() -> serde_json::Value {
+/// 场景 ⇒ 协议取值（`kind` 用 flashasr 认的名字；输入法内部名字是给大模型看的，不能直接发）。
+pub fn scene_param(s: &crate::scene::SceneContext) -> serde_json::Value {
+    use crate::scene::SceneKind;
+    let kind = match s.scene {
+        SceneKind::Chat => "chat",
+        SceneKind::Agent => "agent",
+        SceneKind::Email => "email",
+        SceneKind::Doc => "doc",
+        SceneKind::IdeTerminal => "ide_terminal",
+        SceneKind::Browser => "browser",
+        SceneKind::Unknown => "unknown",
+    };
     serde_json::json!({
-        "inverse_text_normalization_enabled": true,
-        "punctuation_prediction_enabled": true,
-        "translation_enabled": false,
+        "kind": kind,
+        "style_hint": s.style_hint,
+        "multiline_safe": s.multiline_safe,
     })
 }
 
@@ -174,9 +230,23 @@ mod tests {
             device_name: "书房".into(),
             ..Default::default()
         };
-        let v = run_task_ext(&p);
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let o = FlashOptions {
+            punctuation: false,
+            optimize: true,
+            chinese_script: "traditional",
+            strip_trailing: true,
+            scene: None,
+            translation_enabled: true,
+            translate_flag: Some(Arc::clone(&flag)),
+        };
+        let v = run_task_ext(&p, &o);
         assert_eq!(v["device_id"], "dev1");
         assert_eq!(v["device_name"], "书房");
+        assert_eq!(v["output_optimization_enabled"], true);
+        assert_eq!(v["strip_trailing_punct"], true);
+        assert_eq!(v["chinese_script"], "traditional");
+        assert!(v.get("scene").is_none(), "场景感知关 ⇒ 不传");
         assert!(v.get("postprocess").is_none(), "S10 起不再发 postprocess");
         // 三项在 parameters 顶层（经 Feiyin 分支合并），不在 feiyin 里。
         for k in [
@@ -186,10 +256,35 @@ mod tests {
         ] {
             assert!(v.get(k).is_none(), "{k} 不应在 feiyin 里");
         }
-        let t = text_params();
+        let t = text_params(&o);
         assert_eq!(t["inverse_text_normalization_enabled"], true);
-        assert_eq!(t["punctuation_prediction_enabled"], true);
-        assert_eq!(t["translation_enabled"], false);
+        assert_eq!(t["punctuation_prediction_enabled"], false);
+        assert_eq!(t["translation_enabled"], false, "开始时还没按翻译键");
+        // 录音中途按了翻译键 ⇒ 说完时为真。
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        assert!(o.translate_now());
+        // 设置里没开翻译 ⇒ 按了也不翻。
+        let off = FlashOptions {
+            translation_enabled: false,
+            ..o.clone()
+        };
+        assert!(!off.translate_now());
+    }
+
+    #[test]
+    fn scene_param_uses_protocol_kind_names() {
+        let mut s = crate::scene::SceneContext::unknown();
+        s.scene = crate::scene::SceneKind::IdeTerminal;
+        s.multiline_safe = true;
+        s.style_hint = "简洁".into();
+        let v = scene_param(&s);
+        assert_eq!(v["kind"], "ide_terminal");
+        assert_eq!(v["multiline_safe"], true);
+        assert_eq!(v["style_hint"], "简洁");
+        assert!(
+            v.get("window_title").is_none() && v.get("app_exe").is_none(),
+            "不外发窗口信息"
+        );
     }
 
     #[test]

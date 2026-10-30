@@ -242,7 +242,7 @@ pub fn cert_fingerprint() -> Option<String> {
 
 /// 二维码 / 连接码内容（设计 §8.2）。`lan` / `wan` 为 `主机:端口`；`fp` = 证书 SHA-256 指纹（十六进制）。
 pub fn pair_uri(lan: &str, wan: Option<&str>, key: &str, fp: &str) -> String {
-    let mut s = format!("feiyin-asr://pair?v=1&lan={lan}");
+    let mut s = format!("flash-asr://pair?v=1&lan={lan}");
     if let Some(w) = wan {
         s.push_str("&wan=");
         s.push_str(w);
@@ -314,11 +314,11 @@ mod tests {
     fn pair_uri_shape() {
         assert_eq!(
             pair_uri("192.168.1.5:7860", Some("a.com:7860"), "KEY", "ab"),
-            "feiyin-asr://pair?v=1&lan=192.168.1.5:7860&wan=a.com:7860&key=KEY&fp=ab"
+            "flash-asr://pair?v=1&lan=192.168.1.5:7860&wan=a.com:7860&key=KEY&fp=ab"
         );
         assert_eq!(
             pair_uri("10.0.0.2:7860", None, "K", "f"),
-            "feiyin-asr://pair?v=1&lan=10.0.0.2:7860&key=K&fp=f"
+            "flash-asr://pair?v=1&lan=10.0.0.2:7860&key=K&fp=f"
         );
     }
 }

@@ -6814,6 +6814,10 @@ fn convert_to_friendly_error(message: &str, ui_language: config::UiLanguage) -> 
     if has(&["modelnotready"]) {
         return strings.error_feiyin_not_ready.to_string();
     }
+    // FLASH-P3-B：识别中途 flashasr 引擎崩溃（约 5 秒后自动拉起）。
+    if has(&["enginerestarted"]) {
+        return strings.error_feiyin_restarted.to_string();
+    }
     if has(&["servicebusy", "servicepaused"]) {
         return strings.error_feiyin_busy.to_string();
     }
@@ -8011,6 +8015,11 @@ fn spawn_worker_thread(
                     let cancel_clone = Arc::clone(&cancel_signal);
                     let event_tx_clone = event_tx.clone();
 
+                    // FLASH-P3-B：连 flashasr 时本次的处理开关（文字处理全在服务端做；翻译以说完时为准）。
+                    let flash_opts = (desired_asr_model_check
+                        == transcription::AsrModel::FeiyinServer)
+                        .then(|| flash_options(&config, start.target_hwnd, &start.translate));
+
                     // chunk channel：record_streaming 推 chunk，ASR 线程读
                     let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<Vec<f32>>(256);
 
@@ -8030,11 +8039,13 @@ fn spawn_worker_thread(
                             ));
                         };
                         // ASR-SERVER-491 S8：连识别服务 —— 配对信息每次录音现读（设置里重新配对立即生效）。
-                        if desired_asr_model_check == transcription::AsrModel::FeiyinServer {
+                        if let Some(flash_opts) = flash_opts.as_ref() {
                             // FLASH-P0-509：词库每个前端单独 ⇒ 带完整词库数组（对方不再掺它自己的词库）。
                             let vocabulary = crate::transcription::load_wordbook_word_array();
                             return crate::transcription::qwen_inference::transcribe_streaming_feiyin(
-                                &crate::asr_shared::remote::RemotePairing::load(),
+                                // FLASH-P3-B：没配过 ⇒ 自动用本机 flashasr；配的是本机 ⇒ 按本机配对文件刷新。
+                                &crate::asr_shared::remote::RemotePairing::load_for_use(),
+                                flash_opts,
                                 chunk_rx,
                                 &vocabulary,
                                 Some(&cancel_clone),
@@ -8155,6 +8166,7 @@ fn spawn_worker_thread(
                     // 阿里「语义断句」（隐藏配置）或输出优化大模型。`online_final.seams` 不再使用。
                     run_pipeline_core(
                         online_final.text,
+                        online_final.server,
                         &rt,
                         &llm_client,
                         &cancel_signal,
@@ -9061,8 +9073,11 @@ mod edit_stuck_439_tests {
 /// 故主通道 ITN 恒跳过（V091-ITN-SKIP-ONLINE-215 在线口径）、本地加标点节点删除。
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_pipeline_core(
     text: String,
+    // FLASH-P3-B：连 flashasr ⇒ `Some`（服务端已做完全部文字处理，附带译文 / 词库命中等）；直连阿里 ⇒ `None`。
+    server: Option<transcription::qwen_inference::ServerFinal>,
     rt: &tokio::runtime::Runtime,
     llm_client: &llm::LlmClient,
     cancel_signal: &AtomicBool,
@@ -9085,6 +9100,22 @@ fn run_pipeline_core(
     if raw_text.trim().is_empty() {
         log::info!("No speech detected, showing info hint");
         send_event(event_tx, PipelineEvent::NoSpeech);
+        return;
+    }
+    // FLASH-P3-B：连 flashasr ⇒ 服务端已做完全部文字处理（剥标点重打、有效文本、同音、ITN、大模型优化 / 繁简、
+    // 单位补丁、标点、去句末标点、翻译）。本机不再重复任何文字处理，只做上屏、词库、统计。
+    if let Some(server) = server {
+        deliver_server_processed(
+            raw_text,
+            server,
+            cancel_signal,
+            config,
+            runtime_config,
+            target_hwnd,
+            event_tx,
+            &translate,
+            usage,
+        );
         return;
     }
     // OPT-002: Skip if text is not effective (empty or filler-only).
@@ -9202,6 +9233,28 @@ fn run_pipeline_core(
         send_event(event_tx, PipelineEvent::Cancelled);
         return;
     }
+    deliver_final(
+        final_text,
+        llm_calls,
+        format_failed,
+        usage,
+        config,
+        target_hwnd,
+        event_tx,
+    );
+}
+
+/// FLASH-P3-B：最终文字的收尾 —— 记使用统计、上屏（失焦则预览）、发 Done / FormatFailed。
+/// 直连阿里（本机处理完）与连 flashasr（服务端处理完）共用。
+fn deliver_final(
+    final_text: String,
+    llm_calls: u64,
+    format_failed: bool,
+    usage: UsageSource,
+    config: &AppConfig,
+    target_hwnd: platform::WindowId,
+    event_tx: &crossbeam_channel::Sender<PipelineEvent>,
+) {
     // STATS-475：最终文字产出（上屏或失焦预览）即记一条；写库丢后台线程，不挡上屏。
     if !final_text.trim().is_empty() {
         let stats_text = final_text.clone();
@@ -9261,6 +9314,101 @@ fn run_pipeline_core(
             send_event(event_tx, PipelineEvent::FormatFailed);
         }
     }
+}
+
+/// FLASH-P3-B：连 flashasr 时组本次请求的处理开关（见 FlashASR `collab/p3b-design.md` §1）。
+/// 场景按录音开始时的目标窗口采（只发类别 / 风格提示 / 能否多行，不发窗口标题与程序名）。
+fn flash_options(
+    config: &AppConfig,
+    target_hwnd: platform::WindowId,
+    translate: &Arc<AtomicBool>,
+) -> transcription::feiyin_remote::FlashOptions {
+    transcription::feiyin_remote::FlashOptions {
+        punctuation: config.punctuation.enabled,
+        optimize: config.llm.enabled,
+        chinese_script: match config.audio.chinese_script {
+            config::ChineseScript::Traditional => "traditional",
+            config::ChineseScript::Simplified => "simplified",
+        },
+        strip_trailing: config.punctuation.strip_trailing,
+        scene: config.scene.enabled.then(|| {
+            transcription::feiyin_remote::scene_param(&capture_pipeline_scene(config, target_hwnd))
+        }),
+        translation_enabled: config.translation.enabled,
+        translate_flag: Some(Arc::clone(translate)),
+    }
+}
+
+/// FLASH-P3-B：flashasr 已处理完的终稿 ⇒ 选上屏文字（要翻译且有译文 ⇒ 译文）、记词库命中、
+/// 学习建议入词库、统计用服务端有效语音时长，然后走共用收尾。
+#[allow(clippy::too_many_arguments)]
+fn deliver_server_processed(
+    text: String,
+    server: transcription::qwen_inference::ServerFinal,
+    cancel_signal: &AtomicBool,
+    config: &AppConfig,
+    runtime_config: &Arc<RwLock<AppConfig>>,
+    target_hwnd: platform::WindowId,
+    event_tx: &crossbeam_channel::Sender<PipelineEvent>,
+    translate: &Arc<AtomicBool>,
+    usage: UsageSource,
+) {
+    let translate_requested = config.translation.enabled && translate.load(Ordering::Acquire);
+    let final_text = match (&server.translation, translate_requested) {
+        (Some(t), true) => t.clone(),
+        (None, true) => {
+            log::warn!(
+                "FLASH-P3-B: translation requested but server returned none; injecting original"
+            );
+            text.clone()
+        }
+        _ => text.clone(),
+    };
+    if !server.learn_suggestions.is_empty() {
+        let suggestions: Vec<llm::SuggestionEntry> = server
+            .learn_suggestions
+            .iter()
+            .map(|w| llm::SuggestionEntry { word: w.clone() })
+            .collect();
+        learn_llm_suggestions(&suggestions, runtime_config);
+    }
+    // 词库命中计数：输入法按命中排序把词库发给服务端（排在前面的优先），所以连 flashasr 也要记。
+    // 用原文（不是译文）记；写库丢后台线程，不挡上屏。
+    if !server.wordbook_hits.is_empty() {
+        let hit_text = text.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = wordbook::db::record_hits(&hit_text) {
+                log::warn!("FLASH-P3-B: record_hits failed: {}", e);
+            }
+        });
+    }
+    let format_failed = match server.optimization_skipped.as_str() {
+        "llm_failed" => true,
+        "llm_not_configured" => {
+            // 不弹窗（每句都弹会打扰）；设置页显示服务端大模型状态（P3-C）。
+            log::warn!("FLASH-P3-B: output optimization skipped: server LLM not configured");
+            false
+        }
+        _ => false,
+    };
+    let usage = UsageSource {
+        speech_ms: server.speech_ms.unwrap_or(usage.speech_ms),
+        ..usage
+    };
+    if cancel_signal.load(Ordering::Relaxed) {
+        send_event(event_tx, PipelineEvent::Cancelled);
+        return;
+    }
+    // 大模型调用发生在服务端，不计入本机的调用次数。
+    deliver_final(
+        final_text,
+        0,
+        format_failed,
+        usage,
+        config,
+        target_hwnd,
+        event_tx,
+    );
 }
 
 /// PIPELINE-ORCH-238-B: N6 LLM 格式化 / 翻译整段（原 run_pipeline_core 内联块）。
