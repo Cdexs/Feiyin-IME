@@ -172,6 +172,6 @@ begin
 
     // Only copy if user doesn't already have a config (preserve existing settings on upgrade)
     if not FileExists(ConfigFile) then
-      FileCopy(DefaultConfig, ConfigFile, False);
+      CopyFile(DefaultConfig, ConfigFile, False);
   end;
 end;
