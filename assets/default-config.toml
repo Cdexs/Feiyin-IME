@@ -27,8 +27,8 @@ chinese_script = "Simplified"
 overlay_opacity = 1.0
 input_device = ""
 enable_streaming = true
-# 新装默认：本地流式实时模型（ASR-DEFAULT-LRT-506）
-asr_model = "local_realtime"
+# 新装默认：连识别服务 flashasr（FLASH-P3-A，DEC-114：输入法不再带本地模型）
+asr_model = "feiyin_server"
 
 [injection]
 use_clipboard = true
