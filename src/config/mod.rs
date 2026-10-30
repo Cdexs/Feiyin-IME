@@ -17,6 +17,11 @@ pub const MAX_RECORD_SECONDS: u64 = 300;
 /// 最长静默间隔（毫秒），超过此时长无声音则自动停止录音
 pub const SILENCE_DURATION_MS: u64 = 30_000;
 
+/// serde 缺省 `true`（FLASH-P3-E）。
+fn default_true() -> bool {
+    true
+}
+
 fn default_auto_learn_threshold() -> u32 {
     2
 }
@@ -172,9 +177,10 @@ pub struct AudioConfig {
     ///
     /// 官方 `semantic_punctuation_enabled`：true=服务端按语义断句（更准但延迟高）、
     /// false=按 `asr_online_max_sentence_silence` 静音阈值做 VAD 断句。
-    /// ASR-SEG-229 两轴的第二轴：默认 false 保持既有行为，A/B 时改 config.toml 独立验证。
-    /// 与 `asr_online_max_sentence_silence` 同属在线 ASR 隐藏调参。
-    #[serde(default)]
+    /// ASR-SEG-229 两轴的第二轴；与 `asr_online_max_sentence_silence` 同属在线 ASR 隐藏调参。
+    /// FLASH-P3-E（Gavin 10-30「直连阿里直接采用语义断句，这个不必要再测试了，以前测试过」）：缺省改 true ——
+    /// 按停顿断句会在话没说完的停顿处收句号（DEC-108），输入法已无本地标点模型做接缝重判。
+    #[serde(default = "default_true")]
     pub asr_online_semantic_punctuation_enabled: bool,
     // FLASH-P3-A：`asr_local_realtime_unlocked`（本地实时档解锁开关）随本地档删除；
     // 存量 config.toml 里的该字段由 serde 忽略（未设 deny_unknown_fields），下次保存时自然消失。
@@ -345,7 +351,7 @@ impl Default for AudioConfig {
             asr_online_model: default_asr_online_model(),
             asr_online_max_sentence_silence: default_asr_online_max_sentence_silence(),
             // ASR-SEG-229: 默认 false = VAD 断句（保持既有行为），A/B 走 config.toml
-            asr_online_semantic_punctuation_enabled: false,
+            asr_online_semantic_punctuation_enabled: true,
         }
     }
 }

@@ -12,6 +12,11 @@ pub const MAX_RECORD_SECONDS: u64 = 300;
 /// 最长静默间隔（毫秒），超过此时长无声音则自动停止录音
 pub const SILENCE_DURATION_MS: u64 = 8_000;
 
+/// FLASH-P3-E：语义断句缺省开（与主程序 `default_true` 同值）。
+fn default_semantic_punctuation() -> bool {
+    true
+}
+
 fn default_auto_learn_threshold() -> u32 {
     2
 }
@@ -123,9 +128,9 @@ pub struct AudioConfig {
     #[serde(default = "default_asr_online_max_sentence_silence")]
     pub asr_online_max_sentence_silence: i64,
     /// ASR-SEG-229: 在线 ASR 语义断句/标点开关（隐藏字段，不进 UI，DEC-031）。
-    /// 官方 `semantic_punctuation_enabled`，默认 false = VAD 断句（保持既有行为）。
+    /// 官方 `semantic_punctuation_enabled`；FLASH-P3-E 起缺省 true = 语义断句（Gavin 10-30）。
     /// 必须与主程序 src/config/mod.rs 同步（round-trip 数据丢失防护）。
-    #[serde(default)]
+    #[serde(default = "default_semantic_punctuation")]
     pub asr_online_semantic_punctuation_enabled: bool,
     // FLASH-P3-A：`asr_local_realtime_unlocked` 随本地档删除（与主程序同步；旧字段 serde 忽略）。
 }
@@ -182,8 +187,8 @@ impl Default for AudioConfig {
             asr_online_url: default_asr_online_url(),
             asr_online_model: default_asr_online_model(),
             asr_online_max_sentence_silence: default_asr_online_max_sentence_silence(),
-            // ASR-SEG-229: 默认 false = VAD 断句（保持既有行为）
-            asr_online_semantic_punctuation_enabled: false,
+            // ASR-SEG-229 / FLASH-P3-E: 默认 true = 语义断句（Gavin 10-30）
+            asr_online_semantic_punctuation_enabled: true,
         }
     }
 }
@@ -566,10 +571,10 @@ mod tests {
             2000,
             "mirror asr_online_max_sentence_silence default must match main config (2000ms, ASR-SEG-229)"
         );
-        // ASR-SEG-229: 语义断句开关镜像默认值必须 false（与主程序一致）
+        // ASR-SEG-229 / FLASH-P3-E: 语义断句开关镜像默认值必须 true（与主程序一致）
         assert_eq!(
-            cfg.audio.asr_online_semantic_punctuation_enabled, false,
-            "mirror asr_online_semantic_punctuation_enabled default must match main config (false)"
+            cfg.audio.asr_online_semantic_punctuation_enabled, true,
+            "mirror asr_online_semantic_punctuation_enabled default must match main config (true)"
         );
         // alias 字段名同步（镜像缺 alias 也会静默丢数据，041-B 已补）
         assert_eq!(cfg.audio.asr_online_api_key, "");
