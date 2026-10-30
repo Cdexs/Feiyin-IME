@@ -1,12 +1,13 @@
 // ASR-SERVER-491 S8：语音页「自家识别服务」档位的配对卡片（设计 §8.2 / §8.3 / §8.5）。
 // 两种配对：粘贴连接码（自带证书指纹）/ 手动输入（先取回对方指纹让用户核对一次，同 SSH 首次连接）。
 // 配对信息存 asr-remote.json（不进 config.toml），后端命令见 src-tauri/src/asr_server.rs。
+// FLASH-P3-C：显示连的是「本机」flashasr 还是另一台电脑；本机装了 flashasr 时可一键改用本机。
 import React, { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 
 type NetMode = 'auto' | 'lan' | 'wan';
 
-interface RemoteView {
+export interface RemoteView {
   paired: boolean;
   lan: string;
   wan: string;
@@ -14,6 +15,8 @@ interface RemoteView {
   mode: NetMode;
   device_name: string;
   computer_name: string;
+  /** FLASH-P3-C：连的是本机 flashasr。 */
+  local?: boolean;
 }
 
 interface Probed {
@@ -32,8 +35,8 @@ export function formatFingerprint(fp: string): string {
   return (fp.match(/.{1,4}/g) || []).join(' ');
 }
 
-/** 后端错误码 → 文案键（不把内部错误原文上屏）。 */
-function errorText(t: Record<string, string>, code: string): string {
+/** 后端错误码 → 文案键（不把内部错误原文上屏）。FLASH-P3-C：导出给首次连接向导 / 输出优化页共用。 */
+export function errorText(t: Record<string, string>, code: string): string {
   switch (code) {
     case 'bad_code': return t.feiyin_err_bad_code;
     case 'bad_address': return t.feiyin_err_bad_address;
@@ -46,6 +49,7 @@ function errorText(t: Record<string, string>, code: string): string {
     case 'KeyExpired': return t.feiyin_err_key;
     case 'ServicePaused': return t.feiyin_err_paused;
     case 'not_paired': return t.feiyin_not_paired;
+    case 'no_local': return t.feiyin_err_no_local;
     default: return t.feiyin_err_io;
   }
 }
@@ -63,6 +67,8 @@ const FeiyinServerPairing: React.FC<Props> = ({ t, onPairedChange }) => {
   const [err, setErr] = useState('');
   const [deviceName, setDeviceName] = useState('');
   const [testMsg, setTestMsg] = useState('');
+  // FLASH-P3-C：本机是否装了 flashasr（装了且当前连的不是本机 ⇒ 显示「改用本机」）。
+  const [localAvailable, setLocalAvailable] = useState(false);
 
   const apply = (v: RemoteView) => {
     setView(v);
@@ -71,7 +77,11 @@ const FeiyinServerPairing: React.FC<Props> = ({ t, onPairedChange }) => {
   };
 
   useEffect(() => {
-    invoke<RemoteView>('asr_remote_get').then(apply).catch(() => {});
+    invoke<RemoteView>('asr_remote_get').then((v) => { if (v) apply(v); }).catch(() => {});
+    Promise.resolve()
+      .then(() => invoke<boolean>('asr_local_detect'))
+      .then((b) => setLocalAvailable(b === true))
+      .catch(() => {});
   }, []);
 
   const run = async (fn: () => Promise<void>) => {
@@ -116,13 +126,18 @@ const FeiyinServerPairing: React.FC<Props> = ({ t, onPairedChange }) => {
   const test = () => run(async () => {
     setTestMsg('');
     const r = await invoke<{ net: string; ms: number }>('asr_remote_test');
-    setTestMsg(t.feiyin_test_ok
-      .replace('{net}', r.net === 'lan' ? t.asr_net_lan : t.asr_net_wan)
-      .replace('{ms}', String(r.ms)));
+    const net = view?.local ? t.feiyin_local : r.net === 'lan' ? t.asr_net_lan : t.asr_net_wan;
+    setTestMsg(t.feiyin_test_ok.replace('{net}', net).replace('{ms}', String(r.ms)));
+  });
+
+  // FLASH-P3-C：改用本机 flashasr（不管之前配的是哪台电脑）。
+  const switchToLocal = () => run(async () => {
+    finishPairing(await invoke<RemoteView>('asr_local_use'));
   });
 
   if (!view) return null;
   const showForm = !view.paired || repairing;
+  const canUseLocal = localAvailable && !view.local;
 
   const netOptions: [NetMode, string][] = [
     ['auto', t.feiyin_net_auto],
@@ -135,15 +150,19 @@ const FeiyinServerPairing: React.FC<Props> = ({ t, onPairedChange }) => {
       {!showForm && (
         <>
           <div className="form-group">
-            <span className="form-label">{t.feiyin_paired}</span>
-            <p className="form-hint" style={{ wordBreak: 'break-all' }}>
-              {view.lan && <>{t.feiyin_lan}{t.asr_colon}{view.lan}<br /></>}
-              {view.wan && <>{t.feiyin_wan}{t.asr_colon}{view.wan}<br /></>}
-              {t.asr_fingerprint}{t.asr_colon}<code>{formatFingerprint(view.fingerprint)}</code>
-            </p>
+            {/* FLASH-P3-C：连的是本机 flashasr 还是另一台电脑（另一台显示它的内网 / 外网地址） */}
+            <span className="form-label">{view.local ? t.feiyin_local_paired : t.feiyin_remote_paired}</span>
+            {!view.local && (
+              <p className="form-hint" style={{ wordBreak: 'break-all' }}>
+                {view.lan && <>{t.feiyin_lan}{t.asr_colon}{view.lan}<br /></>}
+                {view.wan && <>{t.feiyin_wan}{t.asr_colon}{view.wan}<br /></>}
+                {t.asr_fingerprint}{t.asr_colon}<code>{formatFingerprint(view.fingerprint)}</code>
+              </p>
+            )}
           </div>
 
-          <div className="form-group" style={{ marginTop: '12px' }}>
+          {/* FLASH-P3-C：本机 flashasr 固定走回环地址，不需要选内网 / 外网 */}
+          {!view.local && <div className="form-group" style={{ marginTop: '12px' }}>
             <span className="form-label">{t.feiyin_net_mode}</span>
             <div className="radio-group" style={{ marginTop: '8px' }}>
               {netOptions.map(([m, label]) => (
@@ -162,7 +181,7 @@ const FeiyinServerPairing: React.FC<Props> = ({ t, onPairedChange }) => {
                 </label>
               ))}
             </div>
-          </div>
+          </div>}
 
           <div className="form-group" style={{ marginTop: '12px' }}>
             <span className="form-label">{t.feiyin_device_name}</span>
@@ -189,6 +208,17 @@ const FeiyinServerPairing: React.FC<Props> = ({ t, onPairedChange }) => {
             >
               {t.feiyin_repair}
             </button>
+            {canUseLocal && (
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                style={{ marginLeft: '8px' }}
+                onClick={switchToLocal}
+                disabled={busy}
+              >
+                {t.feiyin_use_local}
+              </button>
+            )}
             {testMsg && (
               <span className="qwen3-test-result qwen3-test-success">{testMsg}</span>
             )}
@@ -202,6 +232,18 @@ const FeiyinServerPairing: React.FC<Props> = ({ t, onPairedChange }) => {
             <p className="form-hint" style={{ color: 'var(--brand-primary)', marginBottom: '8px' }}>
               {t.feiyin_not_paired}
             </p>
+          )}
+          {/* FLASH-P3-C：没配上 / 重新配对时，本机装了 flashasr 也可直接改用本机 */}
+          {canUseLocal && (
+            <button
+              type="button"
+              className="btn btn-primary btn-sm"
+              style={{ marginBottom: '12px' }}
+              onClick={switchToLocal}
+              disabled={busy}
+            >
+              {t.feiyin_use_local}
+            </button>
           )}
           <div className="radio-group">
             {(['code', 'manual'] as const).map((k) => (

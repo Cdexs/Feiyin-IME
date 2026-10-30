@@ -1,7 +1,24 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { invoke } from "@tauri-apps/api/core";
 import { getTranslations } from '../i18n';
 import ShortcutSetting from '../components/ShortcutSetting';
+
+/** FLASH-P3-C：服务端大模型状态（`asr_remote_status` → flashasr `GET /v1/status` 的 `llm_configured`）。 */
+type ServerLlm = 'checking' | 'configured' | 'unconfigured' | 'unknown';
+
+/**
+ * FLASH-P3-C：「启用输出优化」开关的门槛。
+ * - 连 flashasr（feiyin_server）：大模型在服务端统一配置 ⇒ 不要求本机填 Key / 通过测试；
+ * - 直连阿里：维持现有门槛（接口地址 / 密钥 / 模型齐全且通过连接测试）。
+ * 与主程序快捷方式 `AppConfig::apply_shortcut(LlmToggle)` 同一规则。
+ */
+export function llmCanEnable(asrModel: string, llm: any): boolean {
+  if (asrModel === 'feiyin_server') return true;
+  return (llm.connectivity_verified === true) &&
+    (llm.api_url || '').trim().length > 0 &&
+    (llm.api_key || '').trim().length > 0 &&
+    (llm.model || '').trim().length > 0;
+}
 
 interface Props {
   config: any;
@@ -30,11 +47,29 @@ const LlmPage: React.FC<Props> = ({ config, updateConfig }) => {
     });
   };
 
-  const canEnable =
-    (llm.connectivity_verified === true) &&
-    (llm.api_url || '').trim().length > 0 &&
-    (llm.api_key || '').trim().length > 0 &&
-    (llm.model || '').trim().length > 0;
+  // FLASH-P3-C：连 flashasr 时本机 API 配置不参与（缺省档位同语音页 = 新装默认 feiyin_server）。
+  const asrModel = config.audio?.asr_model ?? 'feiyin_server';
+  const viaServer = asrModel === 'feiyin_server';
+  const canEnable = llmCanEnable(asrModel, llm);
+  const [serverLlm, setServerLlm] = useState<ServerLlm>('checking');
+  // 连 flashasr 时 API 配置卡默认收起（点「展开配置」仍可编辑，供以后切回直连阿里用）。
+  const [apiExpanded, setApiExpanded] = useState(false);
+
+  useEffect(() => {
+    if (!viaServer) return;
+    let alive = true;
+    setServerLlm('checking');
+    // Promise.resolve 包一层：调用方 / 测试桩的 invoke 同步返回非 Promise 时也不崩。
+    Promise.resolve()
+      .then(() => invoke<{ llm_configured?: boolean } | null>('asr_remote_status'))
+      .then((st) => {
+        if (!alive) return;
+        if (!st) setServerLlm('unknown');
+        else setServerLlm(st.llm_configured ? 'configured' : 'unconfigured');
+      })
+      .catch(() => { if (alive) setServerLlm('unknown'); });
+    return () => { alive = false; };
+  }, [viaServer]);
 
   const gateHintText = t.llm_gate_hint;
 
@@ -96,11 +131,42 @@ const LlmPage: React.FC<Props> = ({ config, updateConfig }) => {
         {!canEnable && (
           <p className="form-hint" style={{ color: 'var(--brand-primary)', marginTop: '4px', paddingLeft: '8px' }}>{gateHintText}</p>
         )}
+        {/* FLASH-P3-C：连 flashasr ⇒ 显示服务端大模型状态（未配置 ⇒ 开了也会跳过） */}
+        {viaServer && (
+          <div style={{ marginTop: '8px', paddingLeft: '8px' }}>
+            <div
+              className={`llm-status-bar ${serverLlm === 'configured' ? 'success' : serverLlm === 'unconfigured' ? 'failed' : ''}`}
+            >
+              <span className="llm-status-dot"></span>
+              <span>
+                {t.llm_server_llm}{t.asr_colon}
+                {serverLlm === 'checking' ? t.llm_server_llm_checking
+                  : serverLlm === 'configured' ? t.llm_server_llm_configured
+                  : serverLlm === 'unconfigured' ? t.llm_server_llm_unconfigured
+                  : t.llm_server_llm_unknown}
+              </span>
+            </div>
+            {serverLlm === 'unconfigured' && (
+              <p className="form-hint" style={{ color: 'var(--brand-primary)', marginTop: '4px' }}>
+                {t.llm_server_llm_unconfigured_hint}
+              </p>
+            )}
+          </div>
+        )}
       </section>
 
       <section className="settings-section">
         <h3 className="section-title">{t.llm_api_config}</h3>
         <div className="card llm-api-card">
+          {viaServer && (
+            <div>
+              <p className="form-hint">{t.llm_server_mode_hint}</p>
+              <button type="button" className="btn btn-link" onClick={() => setApiExpanded(!apiExpanded)}>
+                {apiExpanded ? t.llm_api_hide : t.llm_api_show}
+              </button>
+            </div>
+          )}
+          {(!viaServer || apiExpanded) && (<>
           <div className="llm-form-grid">
             <div className="llm-form-field">
               <label className="llm-form-label">{t.llm_api_url}</label>
@@ -158,6 +224,7 @@ const LlmPage: React.FC<Props> = ({ config, updateConfig }) => {
               {testResult.msg}
             </div>
           )}
+          </>)}
         </div>
       </section>
     </div>

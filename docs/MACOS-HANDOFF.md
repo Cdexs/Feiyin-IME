@@ -2920,3 +2920,12 @@ performance/accuracy/在线行为**；新增两个 `PipelineEvent` 变体若 mac
 - **改了什么**：平台中立代码大删（transcription / punctuation / translation / asr_service / localrt_session / main.rs）；`AsrModel` 只剩 `FunAsrRealtime` + `FeiyinServer`；配置新装默认 `feiyin_server`、旧值迁移；Cargo 去 sherpa-onnx / ort / ctranslate2 / sentencepiece / cc / patch 段；build.rs 去 macOS rpath；`scripts/build-macos.sh` / `env-macos.sh` / `setup-macos.sh` 去 sherpa / ct2 / onnxruntime 步骤；macOS 侧 `tray.rs`、`run_controller_macos`、`handle_pipeline_event` 去本地实时加载门与识别服务托盘项。
 - **行为前后**：macOS 输入法不再带任何模型 / dylib；识别只能直连阿里或连 flashasr（flashasr 本期只出 Windows 版，macOS 输入法连 Windows 上的 flashasr）。
 - **对 macOS 的影响**：**Windows 侧无法编译验证 macOS 代码**，接手第一件事 `cargo check` + `cargo test`，修编译错误；打包脚本不再拷 dylib，签名步骤里对嵌套 dylib 的处理一并去掉后确认 .app 能启动。
+
+## 10-30 · FLASH-P3-C（DEC-114，实现 agent）· 首次连接向导 + 设置页连接方式
+
+- **改了什么**：
+  - 平台中立：`src/asr_shared/remote.rs` 新增 `connection_ready` / `connection_ready_now`（向导弹不弹的判据）、`RemotePairing::use_local`（用户确认后写本机配对）、`refreshed_local`；`load_for_use` **删除「没配过 ⇒ 自动连本机 flashasr」**（Gavin 10-30：「如果发现本机有 Flash ASR 服务，不要自动连接，要让用户确认再连接」），只保留「已确认本机 ⇒ 按本机配对文件刷新」。`src/asr_shared/tls_pin.rs` 新增 `fetch_status`（flashasr `GET /v1/status`，先钉扎再发 key）。`src/config/mod.rs` `apply_shortcut(LlmToggle)`：连 flashasr 时不要求本机大模型 Key / 测试。
+  - `src/main.rs`：`spawn_settings_process_with_args` / `needs_connection_wizard` / `spawn_connection_wizard_if_needed`；Windows `run_controller` 启动时调用（子进程记进 `settings_child`）；**macOS `run_controller_macos` 在托盘建好后同样调用（只记日志，同 macOS 托盘「设置」不跟踪子进程）**。设置界面启动参数 `--wizard`。
+  - 设置界面（src-tauri + ui，平台中立）：新命令 `asr_local_detect` / `asr_local_use` / `asr_connection_state` / `asr_launch_wizard` / `asr_remote_status`；首次连接向导 `ConnectionWizard.tsx`；语音页提示卡 + 显示本机 / 另一台电脑；输出优化页连 flashasr 时不要求本机 Key 并显示服务端大模型状态。
+- **行为前后**：之前新装默认「连 flashasr」未配对时录音直接报错（P3-B 期间有本机 flashasr 会自动连）；之后启动判连接不可用（直连阿里没 Key / 连 flashasr 未配对，本机有 flashasr 但没确认也算不可用）⇒ 自动弹设置界面向导；本机 flashasr 只在用户点「使用」后才连。
+- **对 macOS 的影响**：`run_controller_macos` 的向导拉起 **未编译验证**；macOS 本机配对文件路径 `~/Library/Application Support/flashasr/local-pairing.json`（`dirs::config_dir`）同协议 §1.5。接手时 `cargo check` + 启动一次确认未配对时设置界面带 `--wizard` 打开向导。

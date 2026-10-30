@@ -7,9 +7,13 @@ import FeiyinServerPairing from '../components/FeiyinServerPairing';
 interface Props {
   config: any;
   updateConfig: (cfg: any) => void;
+  /** FLASH-P3-C：打开首次连接向导（由 App 持有）。 */
+  onOpenWizard?: () => void;
+  /** FLASH-P3-C：向导每关一次 +1 ⇒ 重判连接状态、刷新配对卡片。 */
+  wizardEpoch?: number;
 }
 
-const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
+const VoicePage: React.FC<Props> = ({ config, updateConfig, onOpenWizard, wizardEpoch = 0 }) => {
   const [devices, setDevices] = useState<string[]>([]);
   const t = getTranslations(config.ui_language);
 
@@ -23,6 +27,19 @@ const VoicePage: React.FC<Props> = ({ config, updateConfig }) => {
   // 与「直连阿里 FunASR」。本地档（快速 / 本地流式实时）、在线 Qwen Audio 的选项、描述与模型下载提示整体删除；
   // 旧配置值由主程序 / 设置界面加载时迁移为 feiyin_server，缺值回落同新装默认。
   const asrModel = config.audio?.asr_model ?? "feiyin_server";
+  const asrKey = config.audio?.asr_online_api_key ?? '';
+
+  // FLASH-P3-C：连接不可用 ⇒ 页顶显示向导入口（提示卡 +「设置连接」），不强制弹。判据与主程序启动弹向导同一个
+  // 纯函数（后端 asr_connection_state）。取不到（旧后端 / 测试桩）⇒ 不显示，免得误报。
+  const [connReady, setConnReady] = useState<boolean | null>(null);
+  useEffect(() => {
+    let alive = true;
+    Promise.resolve()
+      .then(() => invoke<{ ready: boolean } | null>('asr_connection_state', { asrModel, apiKey: asrKey }))
+      .then((st) => { if (alive) setConnReady(st ? st.ready === true : null); })
+      .catch(() => { if (alive) setConnReady(null); });
+    return () => { alive = false; };
+  }, [asrModel, asrKey, wizardEpoch]);
 
   useEffect(() => {
     loadDevices();
@@ -116,6 +133,19 @@ const loadDevices = async () => {
     <div className="settings-page">
       <h2 className="page-title">{t.voice_title}</h2>
 
+      {connReady === false && onOpenWizard && (
+        <section className="settings-section">
+          <div className="card">
+            <p className="form-hint" style={{ color: 'var(--brand-primary)', marginBottom: '8px' }}>
+              {t.voice_conn_not_ready}
+            </p>
+            <button type="button" className="btn btn-primary btn-sm" onClick={onOpenWizard}>
+              {t.voice_conn_setup}
+            </button>
+          </div>
+        </section>
+      )}
+
       <section className="settings-section">
         <h3 className="section-title">{t.voice_input_device}</h3>
         <div className="card">
@@ -149,8 +179,13 @@ const loadDevices = async () => {
 
           {asrModel === 'feiyin_server' && (
             <FeiyinServerPairing
+              key={wizardEpoch}
               t={t}
-              onPairedChange={(paired) => { remotePairedRef.current = paired; }}
+              onPairedChange={(paired) => {
+                remotePairedRef.current = paired;
+                // FLASH-P3-C：在本卡片里配对 / 改用本机后提示卡即时消失。
+                setConnReady(paired);
+              }}
             />
           )}
 

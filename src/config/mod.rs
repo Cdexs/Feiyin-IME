@@ -576,6 +576,7 @@ impl AppConfig {
 
     /// 快捷方式切换开关 —— 与设置界面点开关**同一规则**（Gavin「效果等同于用户点击"启用识别输出优化"按钮」）：
     /// 打开「输出优化」须接口地址 / 密钥 / 模型齐全且通过连接测试（界面 `canEnable`），否则不动、返回 `Blocked`。
+    /// FLASH-P3-C：连 flashasr（`feiyin_server`）时大模型在服务端统一配置 ⇒ 不要求本机 Key / 测试（同界面）。
     /// 「中文输出」在简体 / 繁体两项之间切换（与界面点另一个单选项相同，无前置条件）。
     pub fn apply_shortcut(&mut self, action: ShortcutAction) -> ShortcutOutcome {
         match action {
@@ -583,10 +584,11 @@ impl AppConfig {
                 if self.llm.enabled {
                     self.llm.enabled = false;
                     ShortcutOutcome::Disabled
-                } else if self.llm.connectivity_verified
-                    && !self.llm.api_url.trim().is_empty()
-                    && !self.llm.api_key.trim().is_empty()
-                    && !self.llm.model.trim().is_empty()
+                } else if self.audio.asr_model == "feiyin_server"
+                    || (self.llm.connectivity_verified
+                        && !self.llm.api_url.trim().is_empty()
+                        && !self.llm.api_key.trim().is_empty()
+                        && !self.llm.model.trim().is_empty())
                 {
                     self.llm.enabled = true;
                     ShortcutOutcome::Enabled
@@ -2179,6 +2181,8 @@ mod sc485_tests {
     #[test]
     fn llm_toggle_uses_same_gate_as_settings_switch() {
         let mut cfg = AppConfig::default();
+        // FLASH-P3-C：本机闸门只在直连阿里时生效（连 flashasr 见下一条）。
+        cfg.audio.asr_model = "fun_asr_realtime".into();
         cfg.llm.enabled = false;
         cfg.llm.connectivity_verified = false;
         // 未通过连接测试 ⇒ 打不开，配置不动
@@ -2206,6 +2210,21 @@ mod sc485_tests {
             ShortcutOutcome::Disabled
         );
         assert!(!cfg.llm.enabled);
+    }
+
+    /// FLASH-P3-C：连 flashasr 时大模型在服务端 ⇒ 本机没填接口也能用快捷方式打开（同设置界面）。
+    #[test]
+    fn llm_toggle_no_local_gate_when_connected_to_flashasr() {
+        let mut cfg = AppConfig::default();
+        cfg.audio.asr_model = "feiyin_server".into();
+        cfg.llm.enabled = false;
+        cfg.llm.connectivity_verified = false;
+        cfg.llm.api_key = String::new();
+        assert_eq!(
+            cfg.apply_shortcut(ShortcutAction::LlmToggle),
+            ShortcutOutcome::Enabled
+        );
+        assert!(cfg.llm.enabled);
     }
 
     #[test]

@@ -152,38 +152,62 @@ impl RemotePairing {
             .unwrap_or_default()
     }
 
-    /// FLASH-P3-B：录音前取配对：没配过 ⇒ 用本机 flashasr（有本机配对文件就自动连，落盘记为本机）；
-    /// 配的是本机 ⇒ 按本机配对文件刷新地址 / key / 指纹。其余原样。
+    /// 录音前取配对。FLASH-P3-B 起：配的是本机 flashasr ⇒ 按本机配对文件刷新地址 / key / 指纹
+    ///（flashasr 重装 / 改端口后会变）。其余原样。
+    ///
+    /// FLASH-P3-C（Gavin 10-30：「如果发现本机有 Flash ASR 服务，不要自动连接，要让用户确认再连接」）：
+    /// 删除 P3-B「没配过 ⇒ 有本机配对文件就自动连」—— 没配过 ⇒ 原样返回（录音报「还没配对」），
+    /// 连本机只走用户确认后的 [`Self::use_local`]（向导「使用」/ 语音页「改用本机」）。
     pub fn load_for_use() -> Self {
         let cur = Self::load();
-        if cur.is_paired() && !cur.local {
+        if !cur.local {
             return cur;
         }
-        let Some(local) = local_flashasr_pairing() else {
-            return cur;
-        };
-        if cur.local
-            && cur.lan == local.lan
-            && cur.key == local.key
-            && cur.fingerprint == local.fingerprint
-        {
-            return cur;
-        }
-        match local.adopt_identity(&cur) {
-            Ok(mut p) => {
-                p.local = true;
-                p.mode = NetMode::Lan;
+        match cur.refreshed_local(local_flashasr_pairing()) {
+            Ok(Some(p)) => {
                 if let Err(e) = p.save() {
                     log::warn!("FLASH-P3-B: save local flashasr pairing failed: {e}");
                 }
-                log::info!("FLASH-P3-B: using local flashasr ({})", p.lan);
+                log::info!("FLASH-P3-B: refreshed local flashasr pairing ({})", p.lan);
                 p
             }
+            Ok(None) => cur,
             Err(e) => {
                 log::warn!("FLASH-P3-B: adopt identity failed: {e}");
                 cur
             }
         }
+    }
+
+    /// FLASH-P3-C：已确认连本机（`self.local`）时，按本机配对文件算出刷新后的配对；不用刷新
+    ///（不是本机 / 本机文件没了 / 地址 key 指纹都没变）⇒ `Ok(None)`。纯函数，不读写文件。
+    fn refreshed_local(&self, local: Option<Self>) -> std::io::Result<Option<Self>> {
+        let Some(local) = local.filter(|_| self.local) else {
+            return Ok(None);
+        };
+        if self.lan == local.lan && self.key == local.key && self.fingerprint == local.fingerprint {
+            return Ok(None);
+        }
+        Ok(Some(local.adopt_identity(self)?.into_local()))
+    }
+
+    /// FLASH-P3-C：用户**确认**连本机 flashasr（向导「使用」/ 语音页「改用本机」）：读本机配对文件，
+    /// 沿用本机设备代码 / 名称，记为本机（只走内网）并落盘 —— 不管之前配的是哪台电脑。本机没装 ⇒ `Ok(None)`。
+    pub fn use_local() -> std::io::Result<Option<Self>> {
+        let Some(local) = local_flashasr_pairing() else {
+            return Ok(None);
+        };
+        let p = local.adopt_identity(&Self::load())?.into_local();
+        p.save()?;
+        log::info!("FLASH-P3-C: user confirmed local flashasr ({})", p.lan);
+        Ok(Some(p))
+    }
+
+    /// 标记为「本机 flashasr」：本机地址固定回环，只走内网。
+    fn into_local(mut self) -> Self {
+        self.local = true;
+        self.mode = NetMode::Lan;
+        self
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -330,6 +354,29 @@ fn parse_local_pairing(bytes: &[u8]) -> Option<RemotePairing> {
     RemotePairing::from_pair_uri(v.get("uri")?.as_str()?).ok()
 }
 
+/// FLASH-P3-C：「连接能不能用」（首次连接向导弹不弹的判据；由现状推导，不新增配置项）。
+/// - 直连阿里（`fun_asr_realtime`）：填了 API Key ⇒ 可用；
+/// - 连 flashasr（`feiyin_server`）：已配对（含用户确认过的本机）⇒ 可用。
+///   本机装了 flashasr 但用户还没确认 **不算**（Gavin 10-30：不自动连，要让用户确认）⇒ 弹向导，由向导显示
+///   「已检测到本机的 flashasr」让用户点「使用」；
+/// - 其余取值（加载时已迁移，正常不会出现）⇒ 不可用。
+pub fn connection_ready(asr_model: &str, asr_api_key: &str, remote_paired: bool) -> bool {
+    match asr_model {
+        "fun_asr_realtime" => !asr_api_key.trim().is_empty(),
+        "feiyin_server" => remote_paired,
+        _ => false,
+    }
+}
+
+/// FLASH-P3-C：按当前文件现判 [`connection_ready`]（只在连 flashasr 时才读配对文件）。
+pub fn connection_ready_now(asr_model: &str, asr_api_key: &str) -> bool {
+    connection_ready(
+        asr_model,
+        asr_api_key,
+        asr_model == "feiyin_server" && RemotePairing::load().is_paired(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +474,68 @@ mod tests {
             auto.candidates(),
             vec![("10.0.0.2:7860", "lan"), ("a.com:7860", "wan")]
         );
+    }
+
+    /// FLASH-P3-C：连接可用判定（向导弹不弹）。
+    #[test]
+    fn connection_ready_rules() {
+        // 直连阿里：只看 Key（配对不相干）。
+        assert!(connection_ready("fun_asr_realtime", "sk-1", false));
+        assert!(!connection_ready("fun_asr_realtime", "  ", true));
+        // 连 flashasr：只认已配对（本机 flashasr 没经用户确认不算，见 connection_ready_now 只读 asr-remote.json）；Key 不相干。
+        assert!(connection_ready("feiyin_server", "", true));
+        assert!(!connection_ready("feiyin_server", "sk-1", false));
+        // 不认识的取值 ⇒ 不可用。
+        assert!(!connection_ready("performance", "sk-1", true));
+    }
+
+    #[test]
+    fn into_local_marks_local_lan() {
+        let p = RemotePairing::manual("127.0.0.1:7861", "", "k", FP)
+            .unwrap()
+            .into_local();
+        assert!(p.local);
+        assert_eq!(p.mode, NetMode::Lan);
+    }
+
+    /// FLASH-P3-C：录音前刷新只对「用户已确认的本机」生效；没配过 / 配的是别的电脑 ⇒ 不碰本机文件（不自动连）。
+    #[test]
+    fn refreshed_local_only_for_confirmed_local() {
+        let local_file = RemotePairing::manual("127.0.0.1:7861", "", "NEWKEY", FP).unwrap();
+        // 没配过：有本机配对文件也不自动连。
+        let none = RemotePairing::default();
+        assert_eq!(
+            none.refreshed_local(Some(local_file.clone())).unwrap(),
+            None
+        );
+        // 配的是另一台电脑：不动。
+        let remote = RemotePairing::manual("10.0.0.2", "", "k", FP).unwrap();
+        assert_eq!(
+            remote.refreshed_local(Some(local_file.clone())).unwrap(),
+            None
+        );
+        // 已确认本机、文件没变：不用刷新。
+        let mut confirmed = local_file
+            .clone()
+            .adopt_identity(&RemotePairing::default())
+            .unwrap()
+            .into_local();
+        assert_eq!(
+            confirmed.refreshed_local(Some(local_file.clone())).unwrap(),
+            None
+        );
+        // 已确认本机、本机文件没了：原样（不清空）。
+        assert_eq!(confirmed.refreshed_local(None).unwrap(), None);
+        // 已确认本机、flashasr 改了端口 / key：按文件刷新，沿用设备代码与名称，仍记为本机。
+        confirmed.device_name = "书房".into();
+        let moved = RemotePairing::manual("127.0.0.1:7999", "", "OTHER", FP).unwrap();
+        let p = confirmed.refreshed_local(Some(moved)).unwrap().unwrap();
+        assert_eq!(p.lan, "127.0.0.1:7999");
+        assert_eq!(p.key, "OTHER");
+        assert_eq!(p.device_id, confirmed.device_id);
+        assert_eq!(p.device_name, "书房");
+        assert!(p.local);
+        assert_eq!(p.mode, NetMode::Lan);
     }
 
     /// FLASH-P3-B：本机配对文件按连接码解析；坏文件 ⇒ None。

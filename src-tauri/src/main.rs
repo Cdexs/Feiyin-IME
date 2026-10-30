@@ -211,6 +211,11 @@ fn main() {
             asr_server::asr_remote_pair_manual,
             asr_server::asr_remote_update,
             asr_server::asr_remote_test,
+            asr_server::asr_remote_status, // FLASH-P3-C
+            asr_server::asr_local_detect,
+            asr_server::asr_local_use,
+            asr_server::asr_connection_state,
+            asr_server::asr_launch_wizard,
             overlay::show_recording_overlay,
             overlay::hide_recording_overlay,
             overlay::update_overlay_status

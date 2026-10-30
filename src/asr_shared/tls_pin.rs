@@ -222,6 +222,112 @@ pub fn check_access(
     Ok(AccessCheck::Rejected(code, body))
 }
 
+/// FLASH-P3-C：flashasr `GET /v1/status` 返回的服务状态（协议 §5.5）。缺字段按默认值（`false` / 空串）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ServerStatus {
+    pub engine_online: bool,
+    pub local_realtime_ready: bool,
+    /// 服务端开了大模型且填了地址和 key（输出优化 / 翻译在服务端可用）。
+    pub llm_configured: bool,
+    pub paused: bool,
+    pub version: String,
+}
+
+/// FLASH-P3-C：「取服务状态」的结果（与 [`AccessCheck`] 同口径）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusCheck {
+    Ok(ServerStatus),
+    /// 证书与配对时记下的不一致。
+    FingerprintMismatch,
+    /// 服务端拒绝：HTTP 状态 + 正文 `{"error":"…"}` 里的错误码（如 401 `InvalidKey`；取不到 ⇒ 空串）。
+    Rejected(u16, String),
+}
+
+/// 状态响应最长字节数（正常不到 200 字节；超出说明对方不是 flashasr，读到这里就停）。
+const MAX_STATUS_RESPONSE: usize = 64 * 1024;
+
+/// FLASH-P3-C：取服务状态：证书钉扎通过后才发 key（协议 §2.2 / §5.5，`Authorization: Bearer <key>`），
+/// 读完头部与 `Content-Length` 正文（服务端回完即断开，读到 EOF 也算完），解析 JSON。
+/// 写法照 [`check_access`]。网络不通 / 响应不认识 ⇒ `Err`。
+pub fn fetch_status(
+    endpoint: &str,
+    fingerprint: &str,
+    key: &str,
+    timeout: Duration,
+) -> io::Result<StatusCheck> {
+    use std::io::{Read, Write};
+    let verifier = PinnedCert::new(Some(fingerprint));
+    let mut s = match tls_connect(endpoint, &verifier, timeout) {
+        Ok(s) => s,
+        Err(_) if verifier.mismatched() => return Ok(StatusCheck::FingerprintMismatch),
+        Err(e) => return Err(e),
+    };
+    let req = format!(
+        "GET /v1/status HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {key}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    s.write_all(req.as_bytes())?;
+    s.flush()?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        match s.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if buf.is_empty() => return Err(e),
+            // 对方回完直接断开（没发 close_notify）⇒ 已读到的照样解析。
+            Err(_) => break,
+        }
+        if buf.len() > MAX_STATUS_RESPONSE {
+            break;
+        }
+        if let Some(end) = find_header_end(&buf) {
+            if matches!(content_length(&buf[..end]), Some(n) if buf.len() >= end + n) {
+                break;
+            }
+        }
+    }
+    s.conn.send_close_notify();
+    let _ = s.conn.complete_io(&mut s.sock);
+    parse_status_response(&buf).ok_or_else(|| io::Error::other("bad response"))
+}
+
+/// 头部里的 `Content-Length`（不区分大小写；没有 / 不合法 ⇒ `None`）。
+fn content_length(head: &[u8]) -> Option<usize> {
+    String::from_utf8_lossy(head).lines().find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        k.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| v.trim().parse().ok())
+            .flatten()
+    })
+}
+
+/// 解析 `/v1/status` 的 HTTP 响应：200 ⇒ 状态 JSON；其它 ⇒ 状态码 + 正文里的错误码。
+/// 状态行 / 头部不完整、200 但正文不是状态 JSON ⇒ `None`。
+fn parse_status_response(buf: &[u8]) -> Option<StatusCheck> {
+    let code = status_code(buf)?;
+    let end = find_header_end(buf)?;
+    let mut body = &buf[end..];
+    if let Some(n) = content_length(&buf[..end]) {
+        body = &body[..n.min(body.len())];
+    }
+    if code == 200 {
+        let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+        // 必须是对象（`null` / 数组等说明对方不是 flashasr）。
+        v.is_object()
+            .then(|| serde_json::from_value(v).ok().map(StatusCheck::Ok))
+            .flatten()
+    } else {
+        let err = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("error")?.as_str().map(str::to_string))
+            .unwrap_or_default();
+        Some(StatusCheck::Rejected(code, err))
+    }
+}
+
 fn find_header_end(b: &[u8]) -> Option<usize> {
     b.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
@@ -252,6 +358,60 @@ mod tests {
         );
         assert_eq!(status_code(b"garbage"), None);
         assert_eq!(find_header_end(b"HTTP/1.1 101\r\n"), None);
+    }
+
+    /// FLASH-P3-C：`/v1/status` 响应解析（协议 §5.5 的样例原文）。
+    #[test]
+    fn status_response_parsing() {
+        let body = r#"{"service":"flashasr","version":"0.1.0","protocol":1,"engine_online":true,"local_realtime_ready":true,"llm_configured":false,"paused":false}"#;
+        let ok = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\ncontent-length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(
+            parse_status_response(ok.as_bytes()),
+            Some(StatusCheck::Ok(ServerStatus {
+                engine_online: true,
+                local_realtime_ready: true,
+                llm_configured: false,
+                paused: false,
+                version: "0.1.0".into(),
+            }))
+        );
+        // 没有 Content-Length（读到 EOF）、缺字段 ⇒ 默认值。
+        let st = parse_status_response(
+            b"HTTP/1.1 200 OK\r\n\r\n{\"llm_configured\":true,\"paused\":true}",
+        );
+        assert!(
+            matches!(st, Some(StatusCheck::Ok(s)) if s.llm_configured && s.paused && !s.engine_online)
+        );
+        // Content-Length 之后的多余字节不参与解析。
+        assert!(matches!(
+            parse_status_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}garbage"),
+            Some(StatusCheck::Ok(_))
+        ));
+        let rej =
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 22\r\n\r\n{\"error\":\"InvalidKey\"}";
+        assert_eq!(
+            parse_status_response(rej),
+            Some(StatusCheck::Rejected(401, "InvalidKey".into()))
+        );
+        assert_eq!(
+            parse_status_response(b"HTTP/1.1 500 X\r\n\r\noops"),
+            Some(StatusCheck::Rejected(500, String::new()))
+        );
+        assert_eq!(parse_status_response(b"HTTP/1.1 200 OK\r\n\r\nnull"), None);
+        assert_eq!(
+            parse_status_response(b"HTTP/1.1 200 OK\r\n"),
+            None,
+            "头部不完整"
+        );
+        assert_eq!(parse_status_response(b"garbage"), None);
+        assert_eq!(
+            content_length(b"HTTP/1.1 200 OK\r\nCONTENT-LENGTH: 7\r\n"),
+            Some(7)
+        );
+        assert_eq!(content_length(b"HTTP/1.1 200 OK\r\n"), None);
     }
 
     #[test]

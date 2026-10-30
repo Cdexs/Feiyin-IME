@@ -11,12 +11,17 @@ import LlmPage from "./pages/Llm";
 import WordbookPage from "./pages/Wordbook";
 import MinePage from "./pages/Mine";
 import AboutPage from "./pages/About";
+import ConnectionWizard from "./components/ConnectionWizard";
 
 function App() {
   const appWindow = getCurrentWindow();
   const [activeTab, setActiveTab] = useState("general");
   const [config, setConfig] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+  // FLASH-P3-C：首次连接向导。主程序以 `--wizard` 拉起时（连接不可用）启动即打开；语音页提示卡也能打开。
+  // wizardEpoch：向导每关一次 +1，语音页据此重判连接状态、刷新配对卡片。
+  const [wizardOpen, setWizardOpen] = useState(false);
+  const [wizardEpoch, setWizardEpoch] = useState(0);
 
   useEffect(() => {
     const disableMaximize = async () => {
@@ -53,12 +58,30 @@ function App() {
 
   const loadConfig = async () => {
     try {
-      const cfg = await invoke("get_config");
+      const cfg: any = await invoke("get_config");
       setConfig(cfg);
+      if (cfg) openWizardOnLaunch(cfg);
     } catch (e) {
       console.error("Failed to load config:", e);
     } finally {
       setLoading(false);
+    }
+  };
+
+  // FLASH-P3-C：带 `--wizard` 启动且此刻连接仍不可用（防主程序判完到界面起来之间已被设好）⇒ 切到语音页并打开向导。
+  const openWizardOnLaunch = async (cfg: any) => {
+    try {
+      if (!(await invoke<boolean>("asr_launch_wizard"))) return;
+      const st = await invoke<{ ready: boolean } | null>("asr_connection_state", {
+        asrModel: cfg.audio?.asr_model ?? "feiyin_server",
+        apiKey: cfg.audio?.asr_online_api_key ?? "",
+      });
+      if (st && !st.ready) {
+        setActiveTab("voice");
+        setWizardOpen(true);
+      }
+    } catch (e) {
+      console.error("Failed to check connection wizard:", e);
     }
   };
 
@@ -81,7 +104,9 @@ function App() {
     switch (activeTab) {
       case "general": return <GeneralPage {...props} />;
       case "hotkey": return <HotkeySettingsPage {...props} />;
-      case "voice": return <VoicePage {...props} />;
+      case "voice": return (
+        <VoicePage {...props} onOpenWizard={() => setWizardOpen(true)} wizardEpoch={wizardEpoch} />
+      );
       case "llm": return <LlmPage {...props} />;
       case "wordbook": return <WordbookPage {...props} />;
       case "mine": return <MinePage {...props} />;
@@ -175,6 +200,17 @@ function App() {
         </div>
       </div>
 
+      {wizardOpen && (
+        <ConnectionWizard
+          t={t}
+          config={config}
+          updateConfig={updateConfig}
+          onClose={() => {
+            setWizardOpen(false);
+            setWizardEpoch((n) => n + 1);
+          }}
+        />
+      )}
     </div>
   );
 }

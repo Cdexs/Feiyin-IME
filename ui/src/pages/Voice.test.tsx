@@ -619,3 +619,53 @@ describe('VoicePage - 中文输出快捷方式（SC-SCRIPT-489）', () => {
     expect(screen.getByRole('radio', { name: zhHans.voice_simplified as string })).toBeChecked();
   });
 });
+
+// FLASH-P3-C：连接不可用 ⇒ 页顶向导入口；本机 flashasr 只提示「改用本机」，用户点了才连（Gavin 10-30）。
+describe('VoicePage - 首次连接向导入口（FLASH-P3-C）', () => {
+  const config = {
+    ui_language: 'Chinese' as const,
+    hotkey: { mode: 'Toggle', vk_code: 0x78, modifiers: 0 },
+    translation: { enabled: false, vk_code: 0 },
+    audio: { device: 'default', asr_model: 'feiyin_server', chinese_script: 'Simplified', asr_online_api_key: '' },
+    llm: { enabled: false, api_url: '', api_key: '', model: '' },
+    punctuation: { enabled: true, strip_trailing: false },
+  };
+  const unpaired = { paired: false, lan: '', wan: '', fingerprint: '', mode: 'auto', device_name: '', computer_name: 'PC', local: false };
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'asr_connection_state') return { ready: false, local_available: true };
+      if (cmd === 'asr_remote_get') return unpaired;
+      if (cmd === 'asr_local_detect') return true;
+      if (cmd === 'asr_local_use') return { ...unpaired, paired: true, lan: '127.0.0.1:7860', local: true };
+      return null;
+    });
+  });
+
+  it('P3C-VOICE-1: 连接不可用 ⇒ 显示提示卡，点「设置连接」打开向导', async () => {
+    const onOpenWizard = vi.fn();
+    render(<VoicePage config={config} updateConfig={vi.fn()} onOpenWizard={onOpenWizard} />);
+    fireEvent.click(await screen.findByRole('button', { name: zhHans.voice_conn_setup as string }));
+    expect(onOpenWizard).toHaveBeenCalled();
+    expect(screen.getByText(zhHans.voice_conn_not_ready as string)).toBeInTheDocument();
+  });
+
+  it('P3C-VOICE-2: 本机有 flashasr 不自动连；点「改用本机」后显示已连接本机、提示卡消失', async () => {
+    render(<VoicePage config={config} updateConfig={vi.fn()} onOpenWizard={vi.fn()} />);
+    const btn = await screen.findByRole('button', { name: zhHans.feiyin_use_local as string });
+    expect(mockInvoke).not.toHaveBeenCalledWith('asr_local_use');
+    fireEvent.click(btn);
+    expect(await screen.findByText(zhHans.feiyin_local_paired as string)).toBeInTheDocument();
+    expect(mockInvoke).toHaveBeenCalledWith('asr_local_use');
+    expect(screen.queryByText(zhHans.voice_conn_not_ready as string)).not.toBeInTheDocument();
+  });
+
+  it('P3C-VOICE-3: 连接可用 ⇒ 不显示提示卡', async () => {
+    mockInvoke.mockImplementation(async (cmd: string) =>
+      cmd === 'asr_connection_state' ? { ready: true, local_available: false } : null);
+    render(<VoicePage config={config} updateConfig={vi.fn()} onOpenWizard={vi.fn()} />);
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('asr_connection_state', { asrModel: 'feiyin_server', apiKey: '' }));
+    expect(screen.queryByText(zhHans.voice_conn_not_ready as string)).not.toBeInTheDocument();
+  });
+});

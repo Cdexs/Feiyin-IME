@@ -1212,6 +1212,35 @@ fn destroy_edit_control(state: &mut OverlayWindowState) {
     }
 }
 fn spawn_settings_process() -> Result<Child> {
+    spawn_settings_process_with_args(&[])
+}
+
+/// FLASH-P3-C：设置界面启动参数「直接打开首次连接向导」（设置界面 `asr_launch_wizard` 读它）。
+const SETTINGS_WIZARD_ARG: &str = "--wizard";
+
+/// FLASH-P3-C：首次连接向导要不要弹 —— 连接不可用（直连阿里没填 Key / 连 flashasr 还没配对）。
+/// 本机装了 flashasr 但用户还没确认也算不可用（Gavin 10-30：不自动连，要让用户确认）⇒ 弹向导让用户点「使用」。
+/// 由现状推导，不新增配置项；「稍后设置」关掉后下次启动照样判、照样弹，直到连接可用。
+fn needs_connection_wizard(cfg: &AppConfig) -> bool {
+    !asr_shared::remote::connection_ready_now(&cfg.audio.asr_model, &cfg.audio.asr_online_api_key)
+}
+
+/// FLASH-P3-C：主程序启动时判一次，连接不可用 ⇒ 拉起设置界面并直接打开向导（Windows / macOS 控制器共用）。
+fn spawn_connection_wizard_if_needed(runtime_config: &Arc<RwLock<AppConfig>>) -> Option<Child> {
+    if !needs_connection_wizard(&clone_runtime_config(runtime_config)) {
+        return None;
+    }
+    log::info!("FLASH-P3-C: ASR connection not ready, opening connection wizard");
+    match spawn_settings_process_with_args(&[SETTINGS_WIZARD_ARG]) {
+        Ok(child) => Some(child),
+        Err(e) => {
+            log::error!("FLASH-P3-C: failed to spawn connection wizard: {}", e);
+            None
+        }
+    }
+}
+
+fn spawn_settings_process_with_args(args: &[&str]) -> Result<Child> {
     // DEC-013: 启动 Tauri Settings 子进程。二进制名平台化：Windows=feiyin-ime-ui.exe,
     // macOS=feiyin-ime-ui（TRAY-001 修复硬编码 .exe）。
     let exe_path = std::env::current_exe()?;
@@ -1261,7 +1290,7 @@ fn spawn_settings_process() -> Result<Child> {
         ));
     };
     log::info!("Spawning Tauri Settings UI from: {}", target_exe.display());
-    let child = Command::new(&target_exe).spawn()?;
+    let child = Command::new(&target_exe).args(args).spawn()?;
     Ok(child)
 }
 #[cfg(target_os = "windows")]
@@ -8043,7 +8072,7 @@ fn spawn_worker_thread(
                             // FLASH-P0-509：词库每个前端单独 ⇒ 带完整词库数组（对方不再掺它自己的词库）。
                             let vocabulary = crate::transcription::load_wordbook_word_array();
                             return crate::transcription::qwen_inference::transcribe_streaming_feiyin(
-                                // FLASH-P3-B：没配过 ⇒ 自动用本机 flashasr；配的是本机 ⇒ 按本机配对文件刷新。
+                                // FLASH-P3-B / P3-C：配的是本机（用户确认过）⇒ 按本机配对文件刷新；没配过不再自动连本机（Gavin 10-30）。
                                 &crate::asr_shared::remote::RemotePairing::load_for_use(),
                                 flash_opts,
                                 chunk_rx,
@@ -8254,7 +8283,9 @@ fn run_controller(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
     });
     log::info!("Controller initialized, entering message loop");
     let mut tray: Option<TrayIcon> = None;
-    let mut settings_child: Option<Child> = None;
+    // FLASH-P3-C：连接不可用 ⇒ 启动即拉起设置界面并打开首次连接向导。记进 settings_child：
+    // 托盘再点「设置」不会重复开窗；向导关掉（设置界面退出）时照现有流程重读配置。
+    let mut settings_child: Option<Child> = spawn_connection_wizard_if_needed(&runtime_config);
     let mut msg = MSG::default();
     // WORDBOOK-053-B: controller-side mirror of the last streaming ASR text. It is updated on
     // the controller thread by every PipelineEvent::StreamingText, so it always matches the text
@@ -8498,6 +8529,12 @@ fn run_controller_macos(runtime_config: Arc<RwLock<AppConfig>>) -> Result<()> {
             log::error!("Failed to build macOS tray: {}", e);
         }
     };
+
+    // FLASH-P3-C：同 Windows —— 连接不可用 ⇒ 启动即拉起设置界面并打开首次连接向导。
+    // macOS 托盘「设置」本就不跟踪子进程（见下方 OpenSettings），这里同样只记日志；配置变更由 config watcher 生效。
+    if let Some(child) = spawn_connection_wizard_if_needed(&runtime_config) {
+        log::info!("macOS connection wizard spawned, pid={}", child.id());
+    }
 
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_secs(5));
@@ -8907,6 +8944,30 @@ fn main() -> Result<()> {
         log::warn!("Non-Windows/non-macOS platform is not supported in controller mode yet");
     }
     Ok(())
+}
+
+// FLASH-P3-C：放在第一个既有测试模块之前不行 —— hotkey.rs 等源码护栏的 `main_prod_lines` 在第一个
+// `#[cfg(test)] mod` 处截断「生产区」，测试模块放进前段会把后面的生产代码截掉。
+#[cfg(test)]
+mod connection_wizard_tests {
+    use super::*;
+
+    /// FLASH-P3-C：直连阿里只看 Key（不读配对文件，结果与本机环境无关）。
+    #[test]
+    fn direct_aliyun_wizard_depends_on_key_only() {
+        let mut cfg = AppConfig::default();
+        cfg.audio.asr_model = "fun_asr_realtime".to_string();
+        cfg.audio.asr_online_api_key = String::new();
+        assert!(needs_connection_wizard(&cfg));
+        cfg.audio.asr_online_api_key = "sk-1".to_string();
+        assert!(!needs_connection_wizard(&cfg));
+    }
+
+    #[test]
+    fn wizard_arg_spelling() {
+        // 设置界面 src-tauri `asr_launch_wizard` 按同一字面量判断，改这里要两边一起改。
+        assert_eq!(SETTINGS_WIZARD_ARG, "--wizard");
+    }
 }
 
 #[cfg(test)]
