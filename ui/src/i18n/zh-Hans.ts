@@ -170,7 +170,7 @@ export const zhHans = {
   voice_asr_model_feiyin_desc: '连接 flashasr 识别服务进行识别（可装在本机或另一台电脑上），输入法本身不加载模型。本机装了 flashasr 可直接选用；连另一台电脑时，请在那台电脑的 flashasr 里添加本机为终端，再把连接码粘贴到下方。',
   feiyin_tab_code: '粘贴连接码',
   feiyin_tab_manual: '手动输入',
-  feiyin_code_placeholder: '在那台电脑「识别服务 → 添加终端」里复制连接码，粘贴到这里',
+  feiyin_code_placeholder: '在那台电脑 flashasr 管理界面「终端 → 添加终端」里复制连接码，粘贴到这里',
   feiyin_pair: '配对',
   feiyin_lan: '内网地址',
   feiyin_wan: '外网地址',

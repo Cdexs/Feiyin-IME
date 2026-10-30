@@ -169,7 +169,7 @@ export const zhHant = {
   voice_asr_model_feiyin_desc: '連接 flashasr 識別服務進行識別（可裝在本機或另一台電腦上），輸入法本身不載入模型。本機裝了 flashasr 可直接選用；連另一台電腦時，請在那台電腦的 flashasr 裡新增本機為終端，再把連線碼貼到下方。',
   feiyin_tab_code: '貼上連線碼',
   feiyin_tab_manual: '手動輸入',
-  feiyin_code_placeholder: '在那台電腦「識別服務 → 新增終端」裡複製連線碼，貼到這裡',
+  feiyin_code_placeholder: '在那台電腦 flashasr 管理介面「終端 → 新增終端」裡複製連線碼，貼到這裡',
   feiyin_pair: '配對',
   feiyin_lan: '內網位址',
   feiyin_wan: '外網位址',

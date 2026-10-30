@@ -170,7 +170,7 @@ export const en = {
   voice_asr_model_feiyin_desc: 'Recognize with the flashasr service (installed on this or another computer); the input method itself loads no model. If flashasr is installed on this computer you can choose to use it; for another computer, add this computer as a device in its flashasr, then paste the connection code below.',
   feiyin_tab_code: 'Paste connection code',
   feiyin_tab_manual: 'Enter manually',
-  feiyin_code_placeholder: 'Copy the connection code from "ASR Service → Add device" on that computer and paste it here',
+  feiyin_code_placeholder: 'Copy the connection code from "Terminals → Add terminal" in flashasr on that computer and paste it here',
   feiyin_pair: 'Pair',
   feiyin_lan: 'LAN address',
   feiyin_wan: 'Internet address',
