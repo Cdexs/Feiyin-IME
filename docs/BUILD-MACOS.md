@@ -2,6 +2,9 @@
 
 > 对应 Windows 版 `BUILD-DEPS.md`。本文档记录 macOS（Apple Silicon）上的依赖安装、环境变量与当前可编译状态。
 > 验证环境：macOS 15.7.8 / arm64 / 2026-07-29。
+>
+> ⚠️ 2026-10-30：FLASH-P3-A 后输入法已不依赖 sherpa-onnx / CTranslate2 / sentencepiece；下文提到的
+> `patches/ctranslate2-sys`、`patches/esaxx-rs`、`scripts/fetch-sherpa-onnx.ps1` 已迁到 flashasr 仓库（`FlashASR/`），本仓库不再有。
 
 ---
 
